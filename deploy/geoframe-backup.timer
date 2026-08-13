@@ -1,0 +1,28 @@
+[Unit]
+Description=Run GEOFRAME catalog.db backup every 6 hours
+Documentation=file:///opt/geoframe/deploy/README.md
+
+[Timer]
+Unit=geoframe-backup.service
+
+# 6時間ごと。分を :17 にずらしてあるのは、:00 ちょうどに他のcron/timer
+# （logrotate・apt・Drive同期の定時処理など）と重なるのを避けるため。
+# 注意: OnCalendar= はサービス側の Environment=TZ ではなく
+#   「システムのタイムゾーン」で評価される。コンテナが UTC のままなら
+#   実際の発火は JST 09/15/21/03 時台になるが、6時間間隔という要件は
+#   満たされるので実害はない。JSTに揃えたい場合はコンテナ側で
+#   `sudo timedatectl set-timezone Asia/Tokyo` を実行する（README §7.2）。
+OnCalendar=*-*-* 00,06,12,18:17:00
+
+# コンテナ停止・ホスト再起動などで発火時刻を跨いだ場合、
+# 起動後に「取り逃した回」を1度だけ実行して追いつく。
+# （systemd は /var/lib/systemd/timers/ に最終実行時刻のスタンプを持つ。
+#   このためコンテナ起動直後にバックアップが1回走ることがあるが正常動作）
+Persistent=true
+
+# 発火時刻の丸め幅。既定（1分）だと他のtimerと合流して同時に走ることがあるため
+# 明示しておく。バックアップは数秒で終わるので精度はこれで十分。
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

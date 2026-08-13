@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GEOFRAME AI PHOTO SEARCH</title>
+<link rel="stylesheet" href="/vendor/fonts.css">
+<link rel="stylesheet" href="/static/ai-search.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span>GEO</span>FRAME <b>AI PHOTO SEARCH</b></div>
+  <nav><a href="/admin">← 管理画面</a><a href="/">表示画面</a></nav>
+</header>
+
+<main>
+  <section class="hero">
+    <p class="eyebrow">MULTIMODAL PHOTO CATALOG / PoC</p>
+    <h1>言葉で、思い出を探す。</h1>
+    <p class="lead">人物・犬猫・風景・状況を自然な文章で検索し、同じ場面ごとに比較できます。</p>
+    <form id="search-form">
+      <input id="query" maxlength="300" autocomplete="off"
+             placeholder="例：海辺を走っている犬、夕暮れの家族写真">
+      <button id="search-button" type="submit">検索</button>
+    </form>
+    <div class="examples" aria-label="検索例">
+      <button type="button" data-query="犬が元気に走っている写真">走っている犬</button>
+      <button type="button" data-query="猫の顔がよく見える写真">猫の顔</button>
+      <button type="button" data-query="人が笑っていて目を開けている写真">笑顔の人物</button>
+      <button type="button" data-query="美しい風景や夕焼け">風景・夕焼け</button>
+    </div>
+    <div class="search-options">
+      <label><input id="include-hidden" type="checkbox"> hiddenも検索する</label>
+      <span id="coverage">SQLiteを確認中…</span>
+    </div>
+  </section>
+
+  <section class="results-head">
+    <div><p class="eyebrow">SEARCH RESULT</p><h2 id="result-title">おすすめ写真</h2></div>
+    <div id="result-meta"></div>
+  </section>
+  <div id="message" class="message hidden"></div>
+  <div id="groups" aria-live="polite"></div>
+</main>
+
+<template id="group-template">
+  <section class="photo-group">
+    <div class="group-head">
+      <div><span class="kind"></span><h3 class="summary"></h3></div>
+      <div class="group-tools">
+        <div class="match"></div>
+        <div class="cluster-stat"></div>
+        <button class="group-expand" type="button"></button>
+      </div>
+    </div>
+    <div class="photo-grid"></div>
+  </section>
+</template>
+
+<template id="photo-template">
+  <article class="photo-card">
+    <div class="image-wrap">
+      <img loading="lazy" alt=""><span class="score"></span>
+      <span class="visual-similarity"></span>
+    </div>
+    <div class="photo-body">
+      <div class="badges"></div>
+      <p class="photo-name"></p>
+      <p class="photo-meta"></p>
+      <p class="reason"></p>
+      <button class="cluster-more hidden" type="button"></button>
+    </div>
+    <div class="actions">
+      <button class="favorite" type="button" title="お気に入り">☆ favorite</button>
+      <button class="hidden-button" type="button" title="表示から除外">○ hidden</button>
+    </div>
+  </article>
+</template>
+
+<div id="photo-modal" class="photo-modal hidden" role="dialog" aria-modal="true"
+     aria-labelledby="modal-photo-title">
+  <section class="modal-shell">
+    <button id="modal-close" class="modal-close" type="button" aria-label="詳細を閉じる">×</button>
+    <button id="modal-prev" class="modal-nav modal-prev" type="button" aria-label="前の写真">‹</button>
+    <div id="modal-media" class="modal-media">
+      <img id="modal-image" alt="">
+      <div id="modal-image-score" class="modal-image-score"></div>
+      <div class="swipe-hint">SWIPE / ← →</div>
+    </div>
+    <aside class="modal-detail">
+      <div class="modal-overline">
+        <span id="modal-counter"></span><span id="modal-group-kind"></span>
+      </div>
+      <h2 id="modal-photo-title"></h2>
+      <p id="modal-photo-meta" class="modal-photo-meta"></p>
+      <div id="modal-location" class="modal-location"></div>
+      <div id="modal-badges" class="badges modal-badges"></div>
+
+      <div id="modal-scores" class="modal-scores"></div>
+      <dl id="modal-analysis" class="modal-analysis"></dl>
+
+      <section class="modal-copy">
+        <h3>AI評価理由</h3>
+        <ul id="modal-reasons"></ul>
+      </section>
+      <section id="modal-concerns-wrap" class="modal-copy concern-copy">
+        <h3>懸念</h3>
+        <ul id="modal-concerns"></ul>
+      </section>
+      <section class="modal-copy group-copy">
+        <h3>場面グループ</h3>
+        <p id="modal-group-summary"></p>
+      </section>
+
+      <div class="modal-actions">
+        <button id="modal-favorite" class="favorite" type="button">☆ favorite</button>
+        <button id="modal-hidden" class="hidden-button" type="button">○ hidden</button>
+      </div>
+    </aside>
+    <button id="modal-next" class="modal-nav modal-next" type="button" aria-label="次の写真">›</button>
+  </section>
+</div>
+
+<div id="toast"></div>
+<script src="/static/js/ai-search.js"></script>
+</body>
+</html>

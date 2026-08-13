@@ -1,0 +1,132 @@
+{
+  "schema_version": "1.0",
+  "trip_id": "uzbekistan-silk-road-2025",
+  "title": "ウズベキスタン・シルクロード 2025",
+  "subtitle": "タシケント、ブハラ、サマルカンドを巡る7日間",
+  "status": "completed",
+  "default_timezone": "Asia/Tashkent",
+  "source": {
+    "type": "legacy_itinerary_html",
+    "file": "ウズベキスタン・シルクロード完全旅行ガイド 2025年6月.html",
+    "notes": "2025年に別環境で作成した旅のしおりの日程欄を機械可読化。実際の行動は写真とユーザー確認で補正する。"
+  },
+  "date_range": {
+    "start": "2025-06-06",
+    "end": "2025-06-12"
+  },
+  "privacy_defaults": {
+    "publish_exact_gps": false,
+    "strip_exif_from_exported_images": true,
+    "manual_approval_before_publish": true
+  },
+  "segments": [
+    {
+      "id": "d1-tashkent-arrival",
+      "day": 1,
+      "date": "2025-06-06",
+      "timezone": "Asia/Tashkent",
+      "title": "成田からタシケントへ",
+      "locations": ["成田空港", "タシケント"],
+      "start_local": "00:00",
+      "end_local": "23:59",
+      "activities": [
+        {"time": "20:00", "title": "タシケント到着", "detail": "SIMカード購入など到着後の準備"},
+        {"time": "21:00", "title": "チョルスー・バザール", "detail": "夜の市場散策"},
+        {"time": "22:00", "title": "タシケント地下鉄駅巡り", "detail": "駅装飾を見学"}
+      ]
+    },
+    {
+      "id": "d2-tashkent-night-train",
+      "day": 2,
+      "date": "2025-06-07",
+      "timezone": "Asia/Tashkent",
+      "title": "タシケント観光と夜行列車",
+      "locations": ["タシケント", "ブハラ行き夜行列車"],
+      "start_local": "00:00",
+      "end_local": "23:59",
+      "activities": [
+        {"time": "09:00", "title": "ハズラティ・イマーム複合体", "detail": "モスクとコーランを見学"},
+        {"time": "11:30", "title": "ナボイ劇場", "detail": "日本人抑留者が建設に携わった劇場"},
+        {"time": "14:00", "title": "応用美術館・アミール・ティムール博物館", "detail": "工芸と歴史を見学"},
+        {"time": "16:00", "title": "独立広場", "detail": "現代タシケントを散策"},
+        {"time": "22:48", "title": "ブハラ行き列車", "detail": "夜行列車で移動"}
+      ]
+    },
+    {
+      "id": "d3-bukhara",
+      "day": 3,
+      "date": "2025-06-08",
+      "timezone": "Asia/Tashkent",
+      "title": "ブハラ到着・旧市街散策",
+      "locations": ["ブハラ"],
+      "start_local": "00:00",
+      "end_local": "23:59",
+      "activities": [
+        {"time": "10:00", "title": "イスマイール・サマーニー廟", "detail": "煉瓦細工の廟を見学"},
+        {"time": "11:30", "title": "アルク城塞", "detail": "城塞と市街の眺望"},
+        {"time": "14:00", "title": "交易ドーム巡り", "detail": "旧市街のタキを散策"},
+        {"time": "18:00", "title": "リャビ・ハウズ地区", "detail": "貯水池周辺と夕食"}
+      ]
+    },
+    {
+      "id": "d4-bukhara-samarkand",
+      "day": 4,
+      "date": "2025-06-09",
+      "timezone": "Asia/Tashkent",
+      "title": "ブハラからサマルカンドへ",
+      "locations": ["ブハラ", "サマルカンド"],
+      "start_local": "00:00",
+      "end_local": "23:59",
+      "activities": [
+        {"time": "10:00", "title": "ポイ・カリャン複合体", "detail": "ミナレット、モスク、マドラサを見学"},
+        {"time": "16:46", "title": "サマルカンド行き列車", "detail": "鉄道で移動"},
+        {"time": "20:00", "title": "レギスタン広場", "detail": "夜のライトアップ"}
+      ]
+    },
+    {
+      "id": "d5-samarkand",
+      "day": 5,
+      "date": "2025-06-10",
+      "timezone": "Asia/Tashkent",
+      "title": "サマルカンド終日観光",
+      "locations": ["サマルカンド"],
+      "start_local": "00:00",
+      "end_local": "23:59",
+      "activities": [
+        {"time": "05:30", "title": "レギスタン広場", "detail": "日の出の広場を撮影"},
+        {"time": "09:00", "title": "シャーヒ・ジンダ廟群", "detail": "霊廟群のタイル装飾"},
+        {"time": "10:30", "title": "ビビハニム・モスク", "detail": "ティムール期のモスク"},
+        {"time": "14:00", "title": "アフラシアブ博物館・ウルグ・ベク天文台", "detail": "古代都市と天文学の史跡"},
+        {"time": "17:00", "title": "グーリ・アミール廟", "detail": "ティムールの霊廟"}
+      ]
+    },
+    {
+      "id": "d6-return-flight",
+      "day": 6,
+      "date": "2025-06-11",
+      "timezone": "Asia/Tashkent",
+      "title": "サマルカンドからタシケント、帰国便へ",
+      "locations": ["サマルカンド", "タシケント"],
+      "start_local": "00:00",
+      "end_local": "23:59",
+      "activities": [
+        {"time": "08:07", "title": "タシケント行き列車", "detail": "サマルカンドから移動"},
+        {"time": "15:00", "title": "最後の買い物", "detail": "チョルスー・バザール"},
+        {"time": "21:40", "title": "帰国便出発", "detail": "旅程上の出発時刻。実績は要確認"}
+      ]
+    },
+    {
+      "id": "d7-transit-arrival",
+      "day": 7,
+      "date": "2025-06-12",
+      "timezone": "Asia/Seoul",
+      "title": "乗り継ぎ・帰国",
+      "locations": ["乗り継ぎ地", "帰国"],
+      "start_local": "00:00",
+      "end_local": "23:59",
+      "activities": [
+        {"time": "未確認", "title": "乗り継ぎ・到着", "detail": "元のしおりに詳細がないため写真と記憶で確認する"}
+      ]
+    }
+  ]
+}

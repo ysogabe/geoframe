@@ -1,0 +1,51 @@
+[Unit]
+Description=GEOFRAME catalog.db backup (sqlite3 .backup snapshot)
+Documentation=file:///opt/geoframe/deploy/README.md
+
+# geoframe-server が動いていなくてもバックアップ自体は取りたいので
+# Requires= や After= でサーバーunitに依存させない。
+# ただし backup-catalog.sh のコメントにあるとおり、WALモードのDBを
+# read-only で開くにはサーバー稼働中のほうが確実（-shm が存在するため）。
+
+[Service]
+Type=oneshot
+User=geoframe
+Group=geoframe
+ExecStart=/opt/geoframe/deploy/backup-catalog.sh
+
+# geoframe-server.service と同じデータルートを見る必要がある
+# （既定値も同じだが、片方だけ変えたときに事故らないよう明示する）。
+Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe
+
+# バックアップのファイル名（catalog-YYYYmmdd-HHMMSS.db.gz）に使う時刻を
+# 他のログ・撮影時刻表示と揃えるため JST を明示する。
+# systemd のタイマー発火時刻（.timer の OnCalendar=）はシステムのタイムゾーンで
+# 評価されるためこの指定の影響を受けない点に注意（README §7.2 参照）。
+Environment=TZ=Asia/Tokyo
+
+# --- ハードニング ---
+# ProtectSystem=strict はファイルシステム全体を読み取り専用にするため、
+# 書き込みが要る場所は ReadWritePaths= で明示的に開ける必要がある。
+# これを書き忘れると「unitは成功しているように見えて実際は毎回失敗」
+# という一番気付きにくい壊れ方をするので、必ずセットで維持すること。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+SystemCallFilter=@system-service
+
+# /var/backups/geoframe … スナップショット・一時ファイルの書き込み先（必須）
+# /var/lib/geoframe   … catalog.db の読み取りに加え、WALモードDBを
+#                       read-only で開く際に SQLite が catalog.db-shm を
+#                       開く必要があるため RW で通す。
+#                       （データを書き換えないためのガードは systemd 側ではなく
+#                         backup-catalog.sh の "file:...?mode=ro" が担っている）
+ReadWritePaths=/var/backups/geoframe /var/lib/geoframe
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=geoframe-backup
+
+# [Install] は意図的に持たない。
+# このunitは geoframe-backup.timer から起動される oneshot であり、
+# 単体で enable するものではない（enable するのは .timer のほう）。

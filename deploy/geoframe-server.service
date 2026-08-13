@@ -1,0 +1,72 @@
+[Unit]
+Description=GEOFRAME server (server.py, http://localhost:8080/)
+Documentation=file:///opt/geoframe/deploy/README.md
+
+# 以前は time-sync.target も待っていたが、本番運用先のLXCコンテナは
+# ホストの時刻を共有しsystemd-timesyncdが動いていないことが多く、
+# 待っても到達しないだけで起動が遅延する。時刻精度は下記Environment=TZで
+# 別途担保する（TZの理由は[Service]側のコメント参照）。
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=geoframe
+WorkingDirectory=/opt/geoframe/app
+ExecStart=/opt/geoframe/app/.venv/bin/python server.py
+
+# StateDirectory=geoframe … /var/lib/geoframe を存在しなければ自動作成し、
+# User=（geoframe:geoframe）に書き込み許可する。パーミッションは
+# StateDirectoryMode= で明示（既定755のままだと他ユーザーからも読める）。
+StateDirectory=geoframe
+StateDirectoryMode=0750
+
+# --- データルート・秘密の配置 ---
+# コード配布（rsync）とデータ（catalog.db・derivatives/・photos/等）を分離するため、
+# データルートを /var/lib/geoframe に切り出す（未設定時の既定は app/var/）。
+# drive_key.json も同じ理由でデータ側に置く。
+Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe
+Environment=GEOFRAME_DRIVE_KEY=/var/lib/geoframe/drive_key.json
+
+# このアプリはnaive datetime（ローカル時刻前提）で撮影時刻の比較・日付表示を行う。
+# TZ未設定（=UTC）だとエラーは出ずに「今日の写真」「記念日」等が9時間ずれる。
+# コンテナの/etc/timezoneに依存せず、必ずここで明示指定すること。
+Environment=TZ=Asia/Tokyo
+
+# 必須。systemd配下ではstdoutがパイプになりPythonがブロックバッファリング
+# （約8KB）に切り替わるため、これが無いとサイクルログもエラーも journal に
+# 出てこない（実測: 起動メッセージすら数分間出ず、移行時のG4判定が不能になった）。
+Environment=PYTHONUNBUFFERED=1
+
+# 運用トグル（Drive同期ON/OFF・AI ON/OFF等の段階的有効化に使う）。
+# 先頭の"-"はファイルが存在しなくても起動失敗にしない指定。
+# systemdはEnvironment=/EnvironmentFile=を記載順に評価し後勝ちなので、
+# ここは上記Environment=より後に置くこと（/etc/default/geoframe側で
+# 同名キーを指定すれば意図的に上書きできる。順序を入れ替えないこと）。
+EnvironmentFile=-/etc/default/geoframe
+
+Restart=always
+RestartSec=5
+
+# --- ハードニング ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+# GEOFRAME_SLEEP_CMD/WAKE_CMD（kiosk/screen-ctl.sh）が同一機体のXディスプレイを
+# 操作できるよう、PrivateTmpは維持したままXソケットだけ名前空間に持ち込む。
+# Xauthorityへのアクセスは不要（キオスク側でxhost +SI:localuser:geoframeにより
+# UID単位で許可する運用。deploy/kiosk/kiosk.sh・README §4.2参照）。
+# サーバー/キオスクが別機体の構成では効果が無いだけで無害。
+BindPaths=/tmp/.X11-unix
+SystemCallFilter=@system-service
+# MemoryDenyWriteExecuteは付けない: Pillow（画像デコード）のC拡張が
+# 実行可能メモリへの書き込みを行うため、有効にすると起動時/画像処理時に落ちる。
+
+# ログはjournalへ集約（確認: journalctl -u geoframe-server -f）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=geoframe-server
+
+[Install]
+WantedBy=multi-user.target

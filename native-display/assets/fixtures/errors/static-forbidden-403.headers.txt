@@ -1,0 +1,6 @@
+HTTP/1.0 403 Forbidden
+Server: SimpleHTTP/0.6 Python/3.14.2
+Date: Mon, 01 Jan 2024 00:00:00 GMT
+Connection: close
+Content-Type: text/html;charset=utf-8
+Content-Length: 474

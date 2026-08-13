@@ -1,0 +1,41 @@
+{
+  "ok": true,
+  "items": [
+    {
+      "entity": "sensor.fixture_temperature_01",
+      "value": "22.50",
+      "unit": "°C",
+      "class": "temperature",
+      "name": "サンプルセンサー 温度"
+    },
+    {
+      "entity": "sensor.fixture_humidity_02",
+      "value": "48.00",
+      "unit": "%",
+      "class": "humidity",
+      "name": "サンプルセンサー 湿度"
+    },
+    {
+      "entity": "sensor.fixture_carbon_dioxide_03",
+      "value": "650",
+      "unit": "ppm",
+      "class": "carbon_dioxide",
+      "name": "サンプルセンサー 二酸化炭素"
+    },
+    {
+      "entity": "sensor.fixture_volatile_organic_compounds_04",
+      "value": "120",
+      "unit": "μg/m³",
+      "class": "volatile_organic_compounds",
+      "name": "サンプルセンサー 揮発性有機化合物"
+    },
+    {
+      "entity": "sensor.fixture_pressure_05",
+      "value": "1013.20",
+      "unit": "mbar",
+      "class": "pressure",
+      "name": "サンプルセンサー 気圧"
+    }
+  ],
+  "ts": 1705309200.0
+}

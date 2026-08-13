@@ -1,0 +1,25 @@
+[Unit]
+Description=GeoFrame Chromium kiosk display
+Documentation=file:///opt/geoframe/deploy/README.md
+# ユーザー unit（systemctl --user）として、グラフィカルセッション確立後に
+# 起動する想定。デスクトップ環境がgraphical-session.targetを正しく
+# アクティブにする場合にのみ機能する（動かない場合はREADMEのautostart方式を使う）。
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+
+# インストール先ディレクトリ（プレースホルダ。例: /opt/geoframe）。
+# README の手順に従って実際のパスに置換すること。
+ExecStart=/opt/geoframe/deploy/kiosk.sh
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=geoframe-kiosk
+
+[Install]
+WantedBy=graphical-session.target

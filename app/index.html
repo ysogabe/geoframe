@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GEOFRAME — Cyber GIS Photo Display [Phase 0 Prototype]</title>
+<!--
+  ============================================================
+  GEOFRAME Phase 0 プロトタイプ（モックデータ / APIキー不要）
+  ------------------------------------------------------------
+  - 背景地図: 地理院タイル(pale) をCSSフィルタでダーク化（出典表示必須）
+  - 写真: PHOTOS 配列を編集。photos/p1.jpg 等を置けば実写真を表示
+    （EXIF自動抽出は Phase 1。ここでは座標を手書きで指定）
+  - GIS属性値: server.py稼働時は不動産情報ライブラリの実データ（/api/intel）。
+    file://直開き（usingMock）のときだけ従来のモック値を[MOCK]付きで表示する。
+    実写真に対しては擬似値を出さない（未取得は「—」）
+  - Raspberry Pi: chromium --kiosk file:///home/pi/geoframe/index.html
+  ============================================================
+-->
+<!-- 依存はすべて vendor/ にセルフホスト（回線断のキオスクでも起動する）。
+     file:// のモックモードでも動くよう相対パスで参照すること。取得元は vendor/README.md -->
+<link rel="stylesheet" href="vendor/maplibre-gl-4.7.1.min.css">
+<link rel="stylesheet" href="vendor/fonts.css">
+<script src="vendor/maplibre-gl-4.7.1.min.js"></script>
+<link rel="stylesheet" href="static/app.css">
+</head>
+<body>
+<div id="map"></div>
+<div id="marker"><div class="cross"></div><div class="cross h"></div><div class="ring"></div><div class="ring"></div><div class="ring"></div><div class="core"></div></div>
+
+<div id="sleep"></div>
+<div id="eqlayer"></div>
+<div id="scatter"></div>
+<div id="aclayer"></div>
+<div id="hud-root">
+  <div class="fx fx-grid"></div>
+  <div class="fx fx-scan"></div>
+  <div class="fx fx-vignette"></div>
+  <div class="fx"><div class="fx-sweep"></div></div>
+  <div class="corner c-tl"></div><div class="corner c-tr"></div><div class="corner c-bl"></div><div class="corner c-br"></div>
+
+  <div id="topbar">
+    <div class="logo">GEO<b>FRAME</b></div>
+    <div class="divider"></div>
+    <div id="sysstat"><span class="status-dot"></span> SYS NOMINAL<br><span id="mode">MODE: PHOTO JOURNEY</span></div>
+    <div style="text-align:right">
+      <div id="clock">--:--:--</div>
+      <div id="dateline">----.--.-- ---</div>
+      <div id="weather" style="font-family:var(--mono);font-size:11px;color:var(--ink-2);letter-spacing:.08em;margin-top:2px"></div>
+    </div>
+  </div>
+
+  <div id="photocard" class="hidden">
+    <div class="pc-head"><span>▸ PHOTO LOG</span><span class="idx" id="pc-idx">00/00</span></div>
+    <div class="pc-img" id="pc-img"></div>
+    <div class="pc-title" id="pc-title">—</div>
+    <div class="pc-exif" id="pc-exif"></div>
+  </div>
+
+  <div id="intel">
+    <div class="in-head"><span>▸ AREA INTEL</span><span class="mock-badge" id="intel-badge">MOCK</span></div>
+    <div class="tile"><span class="k">ELEVATION</span><span class="v"><span id="v-elev">--</span><small>m</small></span></div>
+    <div class="tile"><span class="k"><span class="sw" style="background:var(--cyan)"></span>用途地域</span><span class="v" id="v-youto" style="font-size:12px">--</span></div>
+    <div class="tile"><span class="k"><span class="sw" style="background:var(--cyan)"></span>容積率/建蔽率</span><span class="v" id="v-ratio" style="font-size:13px">--</span></div>
+    <div class="tile"><span class="k"><span class="sw" style="background:var(--amber)"></span>地価公示</span><span class="v" id="v-price" style="font-size:13px">--</span></div>
+    <div class="tile"><span class="k"><span class="sw" style="background:var(--magenta)"></span>洪水浸水想定</span><span class="v" id="v-flood">--</span></div>
+    <div class="tile"><span class="k">将来推計人口<small style="color:var(--ink-3)"> 250m・2050年</small></span><span class="v"><span id="v-pop">--</span><small>人</small></span></div>
+  </div>
+
+  <!-- 統計カットと週間予報カットは同じパネルを使い回す（.wk クラスで中身を差し替える）。
+       別パネルにすると goTo / showTripIntro / showOnThisDay の「隠す」処理を
+       全て二重に書く必要があり、片方を書き忘れた瞬間に出っぱなしになるため -->
+  <div id="statspanel" class="hidden">
+    <div class="pc-head"><span id="sp-head">▸ TRAVEL STATS</span><span class="real-badge">REAL DATA</span></div>
+    <div class="st-body">
+      <div class="st-hero"><span class="big" id="st-pref">--</span><span class="of">/47</span><span class="cap">都道府県を訪問</span></div>
+      <div class="st-row">
+        <div class="st-cell"><div class="v" id="st-total">--</div><div class="k">GEOTAGGED PHOTOS</div></div>
+        <div class="st-cell"><div class="v"><span id="st-dist">--</span><small>km</small></div><div class="k">TOTAL JOURNEY</div></div>
+        <div class="st-cell"><div class="v" id="st-span" style="font-size:11px">--</div><div class="k">PERIOD</div></div>
+      </div>
+      <div class="st-conquer" id="st-conquer"></div>
+      <div class="st-bars" id="st-bars"></div>
+      <div class="st-mlabels"><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span><span>10</span><span>11</span><span>12</span></div>
+      <div class="st-top" id="st-top"></div>
+    </div>
+    <div class="wk-body" id="wk-body"></div>
+  </div>
+  <div id="alertbar"></div>
+  <div id="hzlegend"></div>
+  <div id="airpanel">
+    <div class="in-head"><span>▸ AIR TRAFFIC</span><span id="ac-count">0</span></div>
+    <div id="ac-list"></div>
+  </div>
+
+  <div id="envpanel">
+    <div class="in-head"><span>▸ ROOM ENV</span><span class="real-badge">REAL DATA</span></div>
+    <div id="env-rows"></div>
+  </div>
+
+  <div id="legend">
+    <div class="row"><span class="sw" style="background:var(--cyan);opacity:.7"></span>URBAN — 都市計画</div>
+    <div class="row"><span class="sw" style="background:var(--magenta);opacity:.7"></span>HAZARD — 防災</div>
+    <div class="row"><span class="sw" style="background:var(--amber);opacity:.7"></span>ECON — 地価</div>
+    <div class="row"><span class="sw" style="background:var(--green);opacity:.7"></span>NATURE — 自然</div>
+  </div>
+
+  <div id="ticker"><div class="inner" id="ticker-inner"></div></div>
+</div>
+
+<script src="static/js/config.js"></script>
+<script src="static/js/util.js"></script>
+<script src="static/js/data.js"></script>
+<script src="static/js/map.js"></script>
+<script src="static/js/photocard.js"></script>
+<script src="static/js/events.js"></script>
+<script src="static/js/panels.js"></script>
+<script src="static/js/scheduler.js"></script>
+<script src="static/js/main.js"></script>
+</body>
+</html>

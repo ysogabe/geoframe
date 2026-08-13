@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GEOFRAME ADMIN</title>
+<!--
+  ============================================================
+  GeoFrame 管理ページ（Phase 4a/4b/4c）
+  ------------------------------------------------------------
+  - 本体のキオスク画面（index.html）とは独立。本体からここへの導線は張っていない
+  - server.py 稼働時のみ動く（/admin → static/admin.html に内部マッピング）。
+    そのためアセットは絶対パスで参照する（index.html の file:// 直開き対応は不要）
+  - 認証なし（家庭内LAN前提）。更新系POSTは Content-Type と Origin で保護する
+    （詳細は geoframe/handlers.py の do_POST 節のコメント）
+  ============================================================
+-->
+<link rel="stylesheet" href="/vendor/maplibre-gl-4.7.1.min.css">
+<link rel="stylesheet" href="/vendor/fonts.css">
+<script src="/vendor/maplibre-gl-4.7.1.min.js"></script>
+<link rel="stylesheet" href="/static/admin.css">
+</head>
+<body>
+
+<header>
+  <div class="hd-top">
+    <div class="logo">GEO<b>FRAME</b></div>
+    <div class="sub">ADMIN CONSOLE</div>
+    <div id="servertime">--</div>
+  </div>
+  <nav>
+    <button class="tab on" data-tab="status">▸ STATUS</button>
+    <button class="tab" data-tab="noloc">▸ 位置なし</button>
+    <button class="tab" data-tab="photos">▸ 全写真</button>
+    <button class="tab" data-tab="home">▸ 自宅設定</button>
+    <a class="tab" href="/blog-admin">▸ TRAVEL BLOG</a>
+    <a class="tab" href="/ai-search">▸ AI写真検索</a>
+  </nav>
+</header>
+
+<main>
+  <!-- ==== STATUS ==== -->
+  <section id="v-status">
+    <div class="panel">
+      <h2>▸ SYNC — 同期状態</h2>
+      <div class="grid" id="s-sync"></div>
+    </div>
+    <div class="panel">
+      <h2>▸ CATALOG — DB件数内訳</h2>
+      <div class="grid" id="s-db"></div>
+      <div class="grid" style="margin-top:12px">
+        <div class="cell"><span class="k">LOC SOURCE 別</span><table class="kv" id="s-locsrc"></table></div>
+        <div class="cell"><span class="k">推定の段階窓 別</span><table class="kv" id="s-buckets"></table></div>
+        <div class="cell"><span class="k">SOURCE 別</span><table class="kv" id="s-source"></table></div>
+      </div>
+    </div>
+    <div class="panel">
+      <h2>▸ DISK — ディスク使用量</h2>
+      <div class="grid" id="s-disk"></div>
+    </div>
+    <div class="panel">
+      <h2>▸ HOME ASSISTANT — 接続状態</h2>
+      <div class="grid" id="s-ha"></div>
+    </div>
+  </section>
+
+  <!-- ==== 写真一覧（位置なし / 全写真 で共用） ==== -->
+  <section id="v-list" class="hidden">
+    <div class="toolbar">
+      <button class="btn flt on" data-filter="all">ALL</button>
+      <button class="btn flt" data-filter="noloc">位置なし</button>
+      <button class="btn flt" data-filter="inferred">推定</button>
+      <button class="btn flt" data-filter="manual">手動</button>
+      <button class="btn flt" data-filter="fav">★お気に入り</button>
+      <button class="btn flt" data-filter="hidden">🚫除外</button>
+      <span class="spacer"></span>
+      <button class="btn" id="prev">◀ PREV</button>
+      <span class="count" id="pageinfo">--</span>
+      <button class="btn" id="next">NEXT ▶</button>
+    </div>
+    <div id="cards"></div>
+    <div class="empty hidden" id="empty">該当する写真がありません</div>
+  </section>
+
+  <!-- ==== 自宅設定 ==== -->
+  <section id="v-home" class="hidden">
+    <div class="panel">
+      <h2>▸ HOME — 自宅の都道府県</h2>
+      <p class="hint">行き先空港がこの都道府県と同じ地方（8地方区分）の場合、
+        ADS-B連動の MEMORY LINK 演出をスキップします。未設定なら従来どおりスキップは行いません
+        （都道府県内からランダムに1枚を選ぶ方式自体は、設定の有無にかかわらず常に有効です）。</p>
+      <div class="homerow">
+        <select id="home-pref"></select>
+        <button class="btn" id="home-save">SAVE</button>
+        <span class="count" id="home-region"></span>
+      </div>
+    </div>
+  </section>
+</main>
+
+<!-- ==== 位置指定モーダル ==== -->
+<div id="modal" class="hidden">
+  <div class="mbox">
+    <div class="mhead">
+      <span class="t">▸ SET LOCATION</span>
+      <span class="s" id="m-title">—</span>
+      <button class="btn x" id="m-close">CLOSE</button>
+    </div>
+    <div class="msearch">
+      <input type="text" id="m-q" placeholder="地名で検索（例: 東京都渋谷区。国内のみ対応）" autocomplete="off">
+      <button class="btn" id="m-search">検索</button>
+    </div>
+    <div id="m-results" class="hidden"></div>
+    <div id="minimap"></div>
+    <div class="mfoot">
+      <span class="hint" id="m-hint">地図をクリックして位置を指定してください</span>
+      <span class="pick" id="m-pick"></span>
+      <span class="spacer"></span>
+      <button class="btn" id="m-save" disabled>SAVE</button>
+    </div>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script src="/static/js/admin.js"></script>
+</body>
+</html>

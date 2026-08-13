@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GeoFrame Travel Blog Studio</title>
+<link rel="stylesheet" href="/static/blog-admin.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/"><span>GEOFRAME</span><b>TRAVEL BLOG STUDIO</b></a>
+  <div class="trip-picker">
+    <label for="trip-select">旅を選ぶ</label>
+    <select id="trip-select"></select>
+  </div>
+  <div class="actions">
+    <button id="reload" class="button ghost">写真候補を再評価</button>
+    <button id="save" class="button">下書き保存</button>
+    <button id="export" class="button primary">HTMLを書き出す</button>
+  </div>
+</header>
+
+<main>
+  <section class="hero">
+    <div>
+      <div class="kicker">PHOTO DATABASE × ITINERARY</div>
+      <h1 id="title">旅行ブログを準備中…</h1>
+      <p id="subtitle"></p>
+    </div>
+    <div class="stats" id="stats"></div>
+  </section>
+
+  <section class="notice">
+    <b>公開前レビュー</b>
+    <span>GPSは候補APIへ出していません。<mark>[要確認]</mark> の事実と文章を確認してから書き出してください。</span>
+  </section>
+
+  <div class="workspace">
+    <aside>
+      <div class="aside-title">CHAPTERS</div>
+      <nav id="chapter-nav"></nav>
+    </aside>
+    <section id="chapters" class="chapters"></section>
+  </div>
+</main>
+
+<div id="busy" class="busy"><div class="spinner"></div><span>写真DBを照合しています…</span></div>
+<div id="toast" class="toast"></div>
+
+<template id="chapter-template">
+  <article class="chapter">
+    <header class="chapter-head">
+      <div><div class="chapter-day"></div><h2></h2><p class="chapter-meta"></p></div>
+      <span class="photo-count"></span>
+    </header>
+    <label class="field"><span>本文下書き</span><textarea class="body" rows="5"></textarea></label>
+    <div class="section-label"><span>代表写真候補</span><small>チェックした写真だけを書き出します</small></div>
+    <div class="photo-grid"></div>
+  </article>
+</template>
+
+<script src="/static/js/blog-admin.js"></script>
+</body>
+</html>

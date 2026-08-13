@@ -1,0 +1,151 @@
+/* ============================================================
+   admin.css — 管理ページ /admin 専用スタイル
+   ※本体画面の app.css は流用しない（あちらはキオスク全画面・overflow:hidden 前提で、
+     スクロールする管理UIには噛み合わないため）。配色だけ揃えている
+   ============================================================ */
+:root{
+  --bg:#05080f;
+  --panel:rgba(8,14,26,.86);
+  --panel-border:rgba(0,229,255,.28);
+  --ink:#d8e6f3;
+  --ink-2:#7d93ab;
+  --ink-3:#46586e;
+  --cyan:#00e5ff;
+  --magenta:#ff2d95;
+  --amber:#ffb300;
+  --green:#3ef08c;
+  --mono:'Share Tech Mono','Courier New',monospace;
+  --jp:'Zen Kaku Gothic New','Hiragino Kaku Gothic ProN',sans-serif;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--jp);
+     min-height:100vh;padding:0 0 60px}
+
+/* ==== ヘッダ / タブ ==== */
+header{position:sticky;top:0;z-index:20;background:rgba(5,8,15,.96);
+       border-bottom:1px solid var(--panel-border);padding:14px 20px 0}
+.hd-top{display:flex;align-items:baseline;gap:16px;flex-wrap:wrap}
+.logo{font-family:var(--mono);font-size:20px;letter-spacing:.18em;color:var(--cyan)}
+.logo b{color:var(--ink)}
+.sub{font-family:var(--mono);font-size:11px;color:var(--ink-3);letter-spacing:.1em}
+#servertime{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--ink-2)}
+nav{display:flex;gap:4px;margin-top:12px;flex-wrap:wrap}
+nav button,nav a{background:transparent;border:1px solid transparent;border-bottom:none;
+  color:var(--ink-2);font-family:var(--mono);font-size:12px;letter-spacing:.08em;
+  padding:8px 14px;cursor:pointer;border-radius:4px 4px 0 0;text-decoration:none}
+nav button:hover,nav a:hover{color:var(--ink)}
+nav button.on{color:var(--cyan);border-color:var(--panel-border);
+  background:var(--panel);border-bottom:1px solid var(--bg);margin-bottom:-1px}
+
+/* ==== 汎用パネル ==== */
+main{padding:20px}
+.panel{background:var(--panel);border:1px solid var(--panel-border);
+       border-radius:6px;padding:16px;margin-bottom:16px}
+.panel h2{font-family:var(--mono);font-size:13px;letter-spacing:.12em;color:var(--cyan);
+          font-weight:normal;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:10px}
+.cell{background:rgba(0,229,255,.04);border:1px solid rgba(0,229,255,.12);
+      border-radius:4px;padding:10px 12px}
+.cell .k{display:block;font-family:var(--mono);font-size:10px;color:var(--ink-3);
+         letter-spacing:.1em;margin-bottom:4px}
+.cell .v{font-family:var(--mono);font-size:20px;color:var(--ink)}
+.cell .v small{font-size:11px;color:var(--ink-2);margin-left:4px}
+.cell.warn .v{color:var(--amber)}
+.cell.bad .v{color:var(--magenta)}
+.cell.good .v{color:var(--green)}
+.bar{height:5px;background:rgba(255,255,255,.08);border-radius:3px;margin-top:8px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--cyan)}
+.bar i.warn{background:var(--amber)}
+.bar i.bad{background:var(--magenta)}
+table.kv{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px}
+table.kv td{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.05)}
+table.kv td:first-child{color:var(--ink-3)}
+table.kv td:last-child{text-align:right;color:var(--ink)}
+
+/* ==== 写真グリッド ==== */
+.toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
+.toolbar .spacer{flex:1}
+button.btn{background:rgba(0,229,255,.08);border:1px solid var(--panel-border);
+  color:var(--ink);font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+  padding:6px 12px;border-radius:4px;cursor:pointer}
+button.btn:hover{background:rgba(0,229,255,.18)}
+button.btn.on{background:var(--cyan);color:#04202a;border-color:var(--cyan)}
+button.btn:disabled{opacity:.35;cursor:default}
+.count{font-family:var(--mono);font-size:11px;color:var(--ink-2)}
+
+#cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--panel-border);border-radius:6px;
+      overflow:hidden;display:flex;flex-direction:column}
+.card.is-hidden{opacity:.45}
+.card .ph{position:relative;aspect-ratio:4/3;background:#0a1220;overflow:hidden}
+.card .ph img{width:100%;height:100%;object-fit:cover;display:block}
+.card .ph .noimg{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-family:var(--mono);font-size:10px;color:var(--ink-3);text-align:center;padding:8px;
+  border:1px dashed rgba(125,147,171,.25);letter-spacing:.06em}
+.card .meta{padding:8px 10px;font-size:11px;line-height:1.5;flex:1}
+.card .nm{font-family:var(--mono);font-size:10px;color:var(--ink-2);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.card .dt{font-family:var(--mono);font-size:11px;color:var(--ink)}
+.card .loc{color:var(--ink-2);font-size:11px;margin-top:2px}
+.card .tag{display:inline-block;font-family:var(--mono);font-size:9px;letter-spacing:.06em;
+  padding:1px 5px;border-radius:3px;margin-top:4px}
+.tag.t-exif,.tag.t-drive_meta{background:rgba(62,240,140,.14);color:var(--green)}
+.tag.t-inferred{background:rgba(255,179,0,.14);color:var(--amber)}
+.tag.t-manual{background:rgba(0,229,255,.16);color:var(--cyan)}
+.tag.t-none{background:rgba(255,45,149,.14);color:var(--magenta)}
+.card .acts{display:flex;border-top:1px solid rgba(0,229,255,.14)}
+.card .acts button{flex:1;background:transparent;border:0;border-right:1px solid rgba(0,229,255,.14);
+  color:var(--ink-3);font-size:14px;padding:7px 0;cursor:pointer;font-family:var(--mono)}
+.card .acts button:last-child{border-right:0}
+.card .acts button:hover{background:rgba(0,229,255,.1);color:var(--ink)}
+.card .acts button.on.fav{color:var(--amber)}
+.card .acts button.on.hid{color:var(--magenta)}
+.card .acts button.setloc{font-size:10px;letter-spacing:.06em;color:var(--cyan)}
+
+/* ==== 位置指定モーダル ==== */
+#modal{position:fixed;inset:0;z-index:50;background:rgba(3,5,10,.86);
+       display:flex;align-items:center;justify-content:center;padding:20px}
+#modal.hidden{display:none}
+.mbox{background:var(--bg);border:1px solid var(--panel-border);border-radius:8px;
+      width:min(960px,100%);max-height:92vh;display:flex;flex-direction:column;overflow:hidden}
+.mhead{display:flex;align-items:center;gap:12px;padding:12px 16px;
+       border-bottom:1px solid var(--panel-border)}
+.mhead .t{font-family:var(--mono);font-size:13px;color:var(--cyan);letter-spacing:.1em}
+.mhead .s{font-size:11px;color:var(--ink-2)}
+.mhead .x{margin-left:auto}
+.msearch{display:flex;gap:8px;padding:10px 16px;border-bottom:1px solid var(--panel-border)}
+.msearch input{flex:1;background:rgba(0,229,255,.05);border:1px solid var(--panel-border);
+  border-radius:4px;color:var(--ink);font-family:var(--jp);font-size:13px;padding:7px 10px}
+.msearch input::placeholder{color:var(--ink-3)}
+.msearch input:focus{outline:none;border-color:var(--cyan)}
+#m-results{max-height:160px;overflow-y:auto;border-bottom:1px solid var(--panel-border)}
+#m-results.hidden{display:none}
+.m-result{padding:8px 16px;font-size:13px;color:var(--ink);cursor:pointer;
+  border-bottom:1px solid rgba(255,255,255,.05)}
+.m-result:last-child{border-bottom:0}
+.m-result:hover{background:rgba(0,229,255,.1);color:var(--cyan)}
+.m-noresult{padding:8px 16px;font-size:12px;color:var(--ink-3)}
+#minimap{height:min(52vh,460px);width:100%}
+#minimap .maplibregl-ctrl-attrib{font-size:9px}
+.mfoot{display:flex;align-items:center;gap:12px;padding:12px 16px;
+       border-top:1px solid var(--panel-border);flex-wrap:wrap}
+.mfoot .pick{font-family:var(--mono);font-size:12px;color:var(--ink)}
+.mfoot .hint{font-size:11px;color:var(--ink-2)}
+.mfoot .spacer{flex:1}
+
+/* ==== トースト ==== */
+#toast{position:fixed;left:50%;bottom:24px;transform:translateX(-50%);z-index:80;
+  background:rgba(8,14,26,.96);border:1px solid var(--panel-border);border-radius:4px;
+  padding:10px 18px;font-family:var(--mono);font-size:12px;color:var(--ink);
+  opacity:0;pointer-events:none;transition:opacity .2s}
+#toast.show{opacity:1}
+#toast.err{border-color:var(--magenta);color:var(--magenta)}
+.hidden{display:none}
+.empty{padding:40px;text-align:center;color:var(--ink-3);font-family:var(--mono);font-size:12px}
+
+/* ==== 自宅設定 ==== */
+.panel p.hint{font-size:12px;color:var(--ink-2);margin-bottom:12px;line-height:1.6}
+.homerow{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.homerow select{background:rgba(0,229,255,.05);border:1px solid var(--panel-border);
+  border-radius:4px;color:var(--ink);font-family:var(--jp);font-size:13px;padding:7px 10px}
+.homerow select:focus{outline:none;border-color:var(--cyan)}
