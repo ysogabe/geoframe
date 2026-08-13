@@ -90,7 +90,14 @@ sudo git fetch origin
 > cloneではなく既存ディレクトリをそのままgit管理下に置いてください。この手順なら
 > 未追跡の仮想環境を作り直さずに済みます。
 >
+> rsync方式では`/opt/geoframe`は`geoframe:geoframe`所有でした。**`git init`より先に
+> 所有者を`root:root`へ揃えてください。** 順序を逆にすると、`root`が`geoframe`所有の
+> ツリーに対してgitを実行することになり`fatal: detected dubious ownership`で止まり、
+> 対処のつもりでトラブルシュートの`safe.directory`例外登録に頼りたくなりますが、
+> それは所有者を直さない限り安全な代替にはなりません（トラブルシュート参照）。
+>
 > ```sh
+> sudo chown -R root:root /opt/geoframe
 > cd /opt/geoframe
 > sudo git init
 > sudo git remote add origin git@github.com:ysogabe/geoframe-ambient-display.git
@@ -348,11 +355,16 @@ sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements.t
 - `fatal: detected dubious ownership in repository at '/opt/geoframe'`: リポジトリの所有者と
   gitを実行しているユーザーが一致していないときに出ます。`/opt/geoframe`は`root:root`所有、
   更新は`root`実行が前提です（§1.2）。まず`ls -ld /opt/geoframe`で所有者を確認し、
-  意図せず変わっていれば`sudo chown -R root:root /opt/geoframe`で戻してください。
-  所有者が正しいのに出る場合だけ、例外として登録します。
+  意図せず変わっていれば`sudo chown -R root:root /opt/geoframe`で戻してください
+  （所有者を直すのが本筋です）。所有者が正しいのに出る場合だけ、例外として登録します。
+  **`--system`（マシン全体・全ユーザーに適用）ではなく`--global`（root専用の
+  `/root/.gitconfig`にのみ書き込む）を使ってください。** `--system`にすると、
+  `geoframe`ユーザーが何らかの理由で所有者に戻った場合でも例外が効いたままになり、
+  root実行の`git fetch`が`geoframe`所有下の`.git/hooks/*`や`core.sshCommand`を
+  root権限で実行してしまう経路が残ります。
 
   ```sh
-  sudo git config --system --add safe.directory /opt/geoframe
+  sudo git config --global --add safe.directory /opt/geoframe
   ```
 
 - `git@github.com: Permission denied (publickey).`: Deploy Keyが使われていません。

@@ -153,6 +153,20 @@ main() {
     [ -d "$REPO_DIR" ]      || die "デプロイ先が存在しない: ${REPO_DIR}"
     [ -d "$REPO_DIR/.git" ] || die "${REPO_DIR} が git リポジトリではない。README §1 の初回セットアップを実施すること。"
 
+    # このスクリプトのセキュリティモデルは「/opt/geoframe が root:root 所有」に
+    # 全面的に依存している。所有者がずれたまま root で git を叩くと、
+    # .git/hooks/* や .git/config の core.sshCommand を非rootユーザーが
+    # 書き換えておくだけで、その内容が root 権限で実行されうる。
+    # 前提が崩れていないことを、サービスに触る前にここで実際に検証する。
+    [ "$(stat -c '%u:%g' "$REPO_DIR/.git")" = "0:0" ] \
+        || die "${REPO_DIR}/.git が root:root 所有ではない。sudo chown -R root:root ${REPO_DIR} を実行すること。"
+
+    # venv の pip の存在もここで確認しておく。この確認が無いと、venv が欠けた機体で
+    # requirements.txt に差分があった場合、サービスを停止して reset まで済ませた
+    # 後に初めて pip install が落ちる。停止済みサービスの復旧がその分だけ遅れる。
+    [ -x "$VENV_PIP" ] \
+        || die "venv の pip が無い: ${VENV_PIP}（README §1 の初期セットアップを実施すること）"
+
     cd "$REPO_DIR" || die "cd できない: ${REPO_DIR}"
 
     [ "$dry_run" -eq 1 ] && log "*** DRY-RUN: 停止・適用・起動は一切行わない ***"
@@ -205,6 +219,14 @@ main() {
     # 読み込まれうる（Restart=always なのでクラッシュ→再起動で拾ってしまう）。
     log "stopping ${SERVICE} ..."
     systemctl stop "$SERVICE" || die "サービスを停止できない。適用は行っていない。"
+
+    # ここから起動確認が終わるまでが「サービスが止まっている区間」。
+    # trap が無いと、SSH 断（HUP）や操作者の Ctrl-C（INT）でスクリプトが即死し、
+    # die_rollback が呼ばれないまま復旧コマンドも出ずにサービスが停止したまま
+    # 放置される。しかもこの区間には pip install（Pillow の再ビルドで数分かかりうる）
+    # が含まれるため、最も踏みやすい区間が最も長いという最悪の組み合わせになる。
+    # die_rollback は自身が exit 1 するので、ハンドラは1回だけ走って終わる。
+    trap 'die_rollback "シグナルにより中断された"' INT TERM HUP
 
     # --- 7) 適用 ---
     # pull --ff-only ではなく reset --hard を採用する理由:
@@ -266,6 +288,11 @@ main() {
         journalctl -u "$SERVICE" -n 50 --no-pager || true
         die_rollback "適用は済んだがサーバーが正常応答していない。上のログを確認すること。"
     fi
+
+    # ここまで来ればサービスは起動して正常応答している。
+    # 以降でシグナルを受けても die_rollback（＝サービス停止中を前提とした復旧案内）は
+    # もう妥当ではないので、既定の挙動に戻す。
+    trap - INT TERM HUP
 
     log "更新完了: ${OLD_HEAD} -> ${NEW_HEAD}"
     log "この更新を取り消すには:"
