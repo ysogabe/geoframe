@@ -22,7 +22,7 @@ StateDirectory=geoframe
 StateDirectoryMode=0750
 
 # --- データルート・秘密の配置 ---
-# コード配布（rsync）とデータ（catalog.db・derivatives/・photos/等）を分離するため、
+# コード配布（git pull）とデータ（catalog.db・derivatives/・photos/等）を分離するため、
 # データルートを /var/lib/geoframe に切り出す（未設定時の既定は app/var/）。
 # drive_key.json も同じ理由でデータ側に置く。
 Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe
