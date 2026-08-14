@@ -278,10 +278,19 @@
     :root{
       --fs-xs:16px; --fs-sm:20px; --fs-md:22px; --fs-lg:26px; --fs-2xl:56px;
       --panel-w:420px; --intel-top:165px; --envpanel-gap:588px; --alertbar-top:130px;
-      --envpanel-bottom-margin:170px; /* #legend(右下レイヤ凡例)との重なりを避ける実測値 */
+      --envpanel-bottom-margin:160px; /* #legend(右下レイヤ凡例)との重なりを避ける実測値。
+        #envpanelをrow表示に変更後の再実測値（2026-08-14）。この制約下でも
+        HAセンサー5個中2個までしか表示できない（Issue #8で根本対応予定） */
       --fs-xl:32px;
       --fs-2xs:14px; --fs-hero:68px; /* 未消費・将来拡張用 */
     }
-    .tile{flex-direction:column;align-items:stretch;gap:3px;padding:14px 20px}
-    .tile .v{text-align:right}
+    /* AREA INTELの長文日本語値（例:「第一種中高層住居専用地域」）向けの縦積み化。
+       #envpanelは値が短い（例:「24.5℃」）ため横並びのままにする — column化すると
+       1タイルの高さが約91pxに増え、右カラムの限られた高さ（画面下端の#legendまで）で
+       表示できるセンサー数が5個中1〜2個まで落ちる（2026-08-14実測、advisorレビューで
+       本番の実データにより発覚）。#intel は6タイル固定なのでcolumn化しても収まるが、
+       #envpanelはHome Assistant側の設定次第でタイル数が可変のため、row表示で
+       密度を優先する。関連: Issue #8（画面右側パネルの動的レイアウト） */
+    #intel .tile{flex-direction:column;align-items:stretch;gap:3px;padding:14px 20px}
+    #intel .tile .v{text-align:right}
   }
