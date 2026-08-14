@@ -74,4 +74,10 @@ log "remote : sudo ${REMOTE_SCRIPT} ${REMOTE_ARGS}"
 # -t（tty割り当て）は sudo のパスワードプロンプトを通すために必要。
 # exec で置き換え、リモート側の終了コードをそのままこのスクリプトの
 # 終了コードにする（CI やシェルの && 連結から使えるようにするため）。
-exec ssh -t "$SSH_TARGET" "sudo ${REMOTE_SCRIPT} ${REMOTE_ARGS}"
+#
+# -- で ssh のオプション解析を打ち切る。SSH_TARGET は GEOFRAME_SSH_TARGET
+# 経由でも入るため中身を検査していない。'-oProxyCommand=...' のような
+# '-' 始まりの値が渡ると ssh のオプションとして解釈され、接続先ではなく
+# 「このMac上」で任意コマンドが実行されてしまう。-- を置けば以降は
+# ホスト名として扱われ、その経路が塞がれる。
+exec ssh -t -- "$SSH_TARGET" "sudo ${REMOTE_SCRIPT} ${REMOTE_ARGS}"

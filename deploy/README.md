@@ -104,6 +104,9 @@ sudo git fetch origin
 > # 上記の core.sshCommand / gc.auto を設定してから
 > sudo git fetch origin
 > sudo git reset --hard origin/main
+> # rsync方式で配布された旧update-app.shは追跡外のため`reset --hard`では消えません。
+> # 実行するとGEOFRAMEのデータを削除しうる`--delete`付きrsyncが走るため、移行時に削除します。
+> sudo rm -f /opt/geoframe/deploy/update-app.sh
 > ```
 
 所有者は`root:root`に揃えます。**更新スクリプトは`root`で動くため、リポジトリの
@@ -253,7 +256,10 @@ sudo /opt/geoframe/deploy/deploy-pull.sh
 
 `--dry-run`は取り込まれるコミットと変更ファイルを表示するだけで、サービスの停止・起動、
 `git reset --hard`、`pip install`のいずれも行いません。`HEAD`が既に`origin/main`と
-同一の場合は「変更なし」と表示してサービスに触れずに終了します。
+同一で、**かつ追跡ファイルが直接編集されていない場合**は「変更なし」と表示してサービスに
+触れずに終了します。サーバー上で直接編集された追跡ファイルがある場合は、取り込むコミットが
+無くても「変更なし」とは扱わず、該当ファイルを一覧表示したうえで`git reset --hard`で正規の
+状態へ戻します（`--dry-run`では一覧表示までで、`reset --hard`は行いません）。
 
 `deploy-pull.sh`は仮想環境そのものを作りません。§1で`.venv`と依存を作成済みであることが
 前提で、以降は`requirements.txt`に差分があるときだけ`pip install`を実行します。
@@ -265,7 +271,9 @@ sudo /opt/geoframe/deploy/deploy-pull.sh
   たびに失敗して手作業を要求します。サーバーはデプロイ専用でローカル編集を持たない
   （持ってはいけない）ため、「originが常に正、手元の差分は捨てる」という運用と
   `reset --hard`の意味が一致します。**サーバー上で`/opt/geoframe`のファイルを直接
-  編集しないでください。次の更新で無言のうちに捨てられます。**
+  編集しないでください。次の更新で無言のうちに捨てられます。**これは`origin/main`側に
+  新しいコミットが無い場合も同じです（スクリプトは作業ツリーの汚れも検出し、
+  `reset --hard`で戻します）。
 - **本番データは影響を受けません。** `git reset --hard`が触るのは追跡下のファイルだけで、
   `git clean`は実行しません。`app/.venv/`、`app/var/`、`.env`、`drive_key.json`はいずれも
   `.gitignore`済みで追跡されておらず、そのまま残ります。実データは`/var/lib/geoframe`にあり、
@@ -275,8 +283,10 @@ sudo /opt/geoframe/deploy/deploy-pull.sh
   してから`*.sh`へ`+x`を付け直す」後処理は不要です。むしろ有害で、実行すると
   `backup-catalog.sh`の実行ビットを潰して`geoframe-backup.service`が`203/EXEC`で
   失敗します。スクリプトが正規化するのは**ディレクトリの755のみ**です。
-- **`requirements.txt`が変わったときだけ`pip install`が走ります。** 適用前後のコミットを
-  比較して判定し、変更が無ければスキップした旨をログへ出します。
+- **`requirements.txt`が変わったときだけ`pip install`が走ります。** 適用前後のコミットの
+  比較に加えて、作業ツリーでの直接編集も判定に含めます。差分の確認自体に失敗した場合は
+  安全側へ倒して再インストールします（判定を誤ってスキップすると、古い`.venv`のまま起動して
+  後から`ImportError`としてしか露見しないためです）。変更が無ければスキップした旨をログへ出します。
 - **`git gc` / `git prune`は実行しません。** ロールバック用に古いコミットオブジェクトを
   残すためです（§7）。
 - 適用に失敗した場合は、サービスが停止したままになる可能性があります。スクリプトは

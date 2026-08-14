@@ -136,6 +136,9 @@ wait_for_health() {
 main() {
     local dry_run=0
     local req_changed=0
+    local worktree_dirty=0
+    local diff_output=""
+    local git_path=""
 
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -158,8 +161,20 @@ main() {
     # .git/hooks/* や .git/config の core.sshCommand を非rootユーザーが
     # 書き換えておくだけで、その内容が root 権限で実行されうる。
     # 前提が崩れていないことを、サービスに触る前にここで実際に検証する。
-    [ "$(stat -c '%u:%g' "$REPO_DIR/.git")" = "0:0" ] \
-        || die "${REPO_DIR}/.git が root:root 所有ではない。sudo chown -R root:root ${REPO_DIR} を実行すること。"
+    #
+    # .git ディレクトリだけでなく .git/config も見る理由:
+    #   ディレクトリの所有者と、その中のファイルの所有者は独立している。
+    #   rsync 時代の geoframe:geoframe 所有から chown し損ねた、あるいは .git の
+    #   モード次第で後から中身だけ差し替えられた、といった経路で
+    #   「.git は root:root だが .git/config は非root所有」という状態が成立しうる。
+    #   core.sshCommand（README §1.2 で必須としている設定）はまさにその
+    #   .git/config に書かれており、下の git fetch がその内容を root 権限で
+    #   実行する。入口のディレクトリだけを見ていては、この assert が塞ごうと
+    #   している経路そのものを迂回されてしまう。
+    for git_path in "$REPO_DIR/.git" "$REPO_DIR/.git/config"; do
+        [ "$(stat -c '%u:%g' "$git_path")" = "0:0" ] \
+            || die "${git_path} が root:root 所有であることを確認できない。sudo chown -R root:root ${REPO_DIR} を実行すること。"
+    done
 
     # venv の pip の存在もここで確認しておく。この確認が無いと、venv が欠けた機体で
     # requirements.txt に差分があった場合、サービスを停止して reset まで済ませた
@@ -194,9 +209,40 @@ main() {
     # GitHub 側は squash merge / force-push 運用が続く前提なので、force-push で
     # コミットが落ちた場合 HEAD..origin/main が空でもツリーの中身は違いうる。
     # 「同じものが入っている」ことを証明できるのは SHA の一致だけ。
-    if [ "$OLD_HEAD" = "$NEW_HEAD" ]; then
-        log "変更なし（HEAD は既に origin/main と同一）。サービスには一切触れずに終了する。"
+    #
+    # ただし SHA の一致だけでは足りない。README §6 は「サーバー上の
+    # /opt/geoframe を直接編集するな、次の更新で無言のうちに捨てられる」と
+    # 宣言しているが、SHA しか見ないと、origin に新しいコミットが無い限り
+    # 「変更なし」で即終了してしまい、直接編集は reset --hard を通らずに
+    # そのまま残り続ける。宣言した不変条件が実際には成立せず、
+    # 「本番に何が入っているかは SHA で説明できる」というこの方式の唯一の
+    # 拠り所が崩れる。よって作業ツリーに汚れが無いことも併せて確認し、
+    # 汚れていれば「変更なし」とは扱わず、SHA が同じでも reset --hard を
+    # 実行して正規状態へ強制的に戻す。
+    #
+    # git diff --quiet HEAD -- は index と作業ツリーの両方を HEAD と比較し、
+    # 差があれば終了コード 1 を返す。見るのは追跡下のファイルだけなので、
+    # 残す運用の未追跡ファイル（app/.venv/・app/var/・.env・drive_key.json）が
+    # 汚れとして数えられることはない。
+    if ! git diff --quiet HEAD --; then
+        worktree_dirty=1
+    fi
+
+    if [ "$OLD_HEAD" = "$NEW_HEAD" ] && [ "$worktree_dirty" -eq 0 ]; then
+        log "変更なし（HEAD は既に origin/main と同一、作業ツリーにも汚れなし）。サービスには一切触れずに終了する。"
         exit 0
+    fi
+
+    if [ "$worktree_dirty" -eq 1 ]; then
+        log "--- サーバー上で直接編集された追跡ファイル（git diff --name-only HEAD --）---"
+        git --no-pager diff --name-only HEAD -- || true
+        # SHA が一致していると、上の「取り込まれるコミット」「変更されるファイル」が
+        # どちらも空で表示される。何も起きないように見えるのに適用へ進む理由を
+        # ここで明示しないと、ログだけを見た運用者が「変更なし」と読み違える。
+        if [ "$OLD_HEAD" = "$NEW_HEAD" ]; then
+            log "取り込むコミットは無いが、上の直接編集があるため「変更なし」とは扱わず適用対象とする。"
+        fi
+        log "これらの直接編集は reset --hard で破棄される（README §6）。"
     fi
 
     # --- 4) dry-run はここまで ---
@@ -210,23 +256,50 @@ main() {
     # reset 後は HEAD が origin/main と一致して比較の基準を失う。
     # （OLD_HEAD のオブジェクトは残るので後からでも比較できるが、
     #   判定を前に固めておくほうが失敗時に何が起きたかを読みやすい。）
-    if [ -n "$(git diff --name-only "$OLD_HEAD" "$NEW_HEAD" -- app/requirements.txt)" ]; then
+    #
+    # git diff の成否は明示的に判定する。$(...) の中でコマンドが失敗しても
+    # set -e には捕捉されない（if の条件式の中ならなおさら）ため、
+    # 「出力が空」と「コマンドが落ちた」が区別できない。取りこぼすと、新しい
+    # 依存を要するコミットへ切り替わったのに古い venv のまま起動し、デプロイ時
+    # ではなく後から ImportError としてしか露見しない。失敗時は安全側
+    # （変更ありとみなして再インストール）へ倒す。
+    if ! diff_output="$(git diff --name-only "$OLD_HEAD" "$NEW_HEAD" -- app/requirements.txt)"; then
+        log "requirements.txt の差分確認に失敗した。安全側に倒して依存を再インストールする。"
+        req_changed=1
+    elif [ -n "$diff_output" ]; then
+        req_changed=1
+    fi
+
+    # コミット間の比較では作業ツリーの汚れを見られない。サーバー上で
+    # requirements.txt が直接編集されていた場合（OLD_HEAD = NEW_HEAD でも
+    # 上の汚れ判定でここへ来る）、下の reset --hard がその編集を巻き戻すため、
+    # venv だけが正規の requirements.txt と食い違ったまま残る。これも同じく
+    # 安全側へ倒す。
+    if ! git diff --quiet HEAD -- app/requirements.txt; then
         req_changed=1
     fi
 
     # --- 6) サービス停止 ---
     # 稼働中に .py を差し替えると、更新途中の中途半端な状態でモジュールが
     # 読み込まれうる（Restart=always なのでクラッシュ→再起動で拾ってしまう）。
-    log "stopping ${SERVICE} ..."
-    systemctl stop "$SERVICE" || die "サービスを停止できない。適用は行っていない。"
-
+    #
     # ここから起動確認が終わるまでが「サービスが止まっている区間」。
     # trap が無いと、SSH 断（HUP）や操作者の Ctrl-C（INT）でスクリプトが即死し、
     # die_rollback が呼ばれないまま復旧コマンドも出ずにサービスが停止したまま
     # 放置される。しかもこの区間には pip install（Pillow の再ビルドで数分かかりうる）
     # が含まれるため、最も踏みやすい区間が最も長いという最悪の組み合わせになる。
     # die_rollback は自身が exit 1 するので、ハンドラは1回だけ走って終わる。
+    #
+    # trap は systemctl stop の「前」に張る。stop の実行中にシグナルが来る窓が
+    # あり、そこだけ無防備だと、サービスが実際に止まった直後かもしれないのに
+    # 復旧案内なしで即死する。先に張っても下の die は素通りする
+    # （exit は INT/TERM/HUP のいずれでもないので、このハンドラは起動しない）。
     trap 'die_rollback "シグナルにより中断された"' INT TERM HUP
+
+    log "stopping ${SERVICE} ..."
+    # stop 自体に失敗した場合はサービスがまだ動いている可能性が高く、
+    # 巻き戻すものも無いので、復旧案内付きの die_rollback ではなく通常の die でよい。
+    systemctl stop "$SERVICE" || die "サービスを停止できない。適用は行っていない。"
 
     # --- 7) 適用 ---
     # pull --ff-only ではなく reset --hard を採用する理由:
