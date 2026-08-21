@@ -388,12 +388,18 @@ for (const sel of ['#intel', '#envpanel', '#legend', '#hzlegend']) {
 // 不成立と確認済み（LH=1.2で導出するとtileColumnHeightPxが 87.2px vs 実測91pxで
 // 3.8pxも外れる。.tileの縦積みは.k側に.sw(9px)を含むflex行があり、
 // 単純な係数では説明できない）。よってこの4値はそのまま実測定数として持つ。
+//
+// tileColumnHeightPx(91px)は「#intel .tile{gap:3px;padding:14px 20px}」を
+// 前提とした実測値であり、padding/gapの異なる .tile へそのまま流用できない。
+// 91を宣言値で分解し、内容部(2行分)だけを実測定数として残す:
+// 91 - gap(3) - padding上下(28) - border(1) = 59。gap/padding/borderは
+// CSSの宣言値から実行時に読んで足す（resolveTileStyle/computeTileHeight）。
 // ============================================================
 
 const MEASURED_KIOSK = {
   inHeadHeightPx: 45, // .in-head: --fs-sm(20px)1行 + padding 10px上下 + border 1px
   tileRowHeightPx: 49, // .tile 横並び: --fs-lg(26px) + padding 9px上下 + border 1px
-  tileColumnHeightPx: 91, // #intel .tile 縦積み(@media限定): 2行 + gap 3px + padding 14px上下 + border 1px
+  tileColumnContentPx: 59, // .tile 縦積みの内容部(2行分)のみ。gap/padding/borderはCSSから加算する
 };
 // legendRowHeightPx だけは他の3つと性質が異なる: #legend の font-size は10pxの
 // リテラルで@mediaに上書きされないため、この値は両プロファイル共通
@@ -402,6 +408,18 @@ const PROFILE_INDEPENDENT_METRICS = {
   legendRowHeightPx: 12, // 推定値（実測なし）: 10px × 1.2
 };
 const ALL_TUNABLE_METRICS = { ...MEASURED_KIOSK, ...PROFILE_INDEPENDENT_METRICS };
+
+// ============================================================
+// EXPECTED_GAPS: 既知の未解決ギャップ3件をラチェットとして保持する。
+// 到達値を下回ったら失敗（悪化検知）、targetを満たしても失敗（エントリ削除を促す）。
+// INV-1/INV-2は大きいほど良い、INV-5は超過量なので小さいほど良い（target:0）。
+// ============================================================
+
+const EXPECTED_GAPS = {
+  'kiosk/INV-1': { target: 5, ratchetedTo: 2, direction: 'biggerIsBetter', unit: 'センサー表示数', closesWith: '#8' },
+  'kiosk/INV-2': { target: 8, ratchetedTo: -2, direction: 'biggerIsBetter', unit: 'px クリアランス', closesWith: '#8' },
+  'desktop/INV-5': { target: 0, ratchetedTo: 132, direction: 'smallerIsBetter', unit: 'px キャップ超過', closesWith: '#8' },
+};
 
 // ============================================================
 // #legend の高さ（フォントメトリクス非依存: font-sizeはリテラルなので
@@ -435,6 +453,94 @@ function parseGap(value) {
   return parseFloat(m[1]);
 }
 
+function parseBorderBottomWidth(value) {
+  // border-bottom は1辺のみなので、#legend用のparseBorderWidthVerticalとは
+  // 異なり2倍しない
+  const m = /^([\d.]+)px/.exec(value.trim());
+  must(m, `border-bottom の幅を解釈できない: "${value}"`);
+  return parseFloat(m[1]);
+}
+
+// ============================================================
+// .tile の flex-direction(row/column)判定と、column時のタイル高さ算出。
+// app.cssだけでなく任意のCSS文字列に対して適用できる純関数として実装し、
+// 同ファイル内の自己検証（下記フィクスチャF1〜F6）で検知能力を確認する。
+// ============================================================
+
+// テキストからトップレベルの{...}ブロック列を取り、@mediaの中身を
+// 「その@media条件式」付きで再帰展開する（入れ子@mediaが無い前提）。
+function collectBlocksWithMediaCond(text, mediaCondition) {
+  const out = [];
+  for (const block of parseBlocks(text)) {
+    if (block.selector.startsWith('@media')) {
+      const cond = block.selector.replace(/^@media\s*/, '').trim();
+      out.push(...collectBlocksWithMediaCond(block.body, cond));
+    } else {
+      out.push({ selector: block.selector, body: block.body, mediaCondition });
+    }
+  }
+  return out;
+}
+
+// セレクタが「.tile自身」を指すか判定する（子孫セレクタ(.tile .v等)は対象外）。
+// scope: 直前のID(#intel/#envpanel等)。無ければnull(全.tileに適用される汎用ルール)。
+function tileSelfScope(selector) {
+  const compounds = selector.trim().split(/\s+/);
+  const last = compounds[compounds.length - 1];
+  if (last !== '.tile') return undefined;
+  let scope = null;
+  for (let i = compounds.length - 2; i >= 0; i--) {
+    if (compounds[i].startsWith('#')) { scope = compounds[i]; break; }
+  }
+  return { scope };
+}
+
+// 指定scope(#intel/#envpanel等)の .tile に適用される宣言をCSSカスケードに
+// 従って解決する。IDスコープを持つセレクタ(#envpanel .tile)は、汎用セレクタ
+// (.tile)より常に優先される（特異度）。同じ優先度内では記述順で後勝ち。
+function resolveTileStyle(cssText, scope, viewport) {
+  const blocks = collectBlocksWithMediaCond(stripComments(cssText), null);
+  const applicable = [];
+  for (const block of blocks) {
+    if (block.mediaCondition !== null && !evalMediaQuery(block.mediaCondition, viewport)) continue;
+    for (const rawSelector of block.selector.split(',')) {
+      const info = tileSelfScope(rawSelector.trim());
+      if (!info) continue;
+      if (info.scope !== null && info.scope !== scope) continue;
+      applicable.push({ idScoped: info.scope === scope, decls: declMap(block.body) });
+    }
+  }
+  const ordered = [...applicable.filter(a => !a.idScoped), ...applicable.filter(a => a.idScoped)];
+  const style = new Map();
+  for (const entry of ordered) {
+    for (const [prop, value] of entry.decls) style.set(prop, value);
+  }
+  return style;
+}
+
+function detectTileFlexDirection(cssText, scope, viewport) {
+  const style = resolveTileStyle(cssText, scope, viewport);
+  const fd = style.get('flex-direction');
+  return fd && fd.trim() === 'column' ? 'column' : 'row';
+}
+
+// row: 実測定数tileRowHeightPxをそのまま使う。
+// column: 内容部(tileColumnContentPx)にCSSの宣言値(gap/padding/border)を
+// 実行時に加算する（DECISION-3: tileColumnHeightPx(91px)の分解）。
+function computeTileHeight(cssText, mode, scope, viewport, metrics) {
+  if (mode === 'row') return metrics.tileRowHeightPx;
+  const style = resolveTileStyle(cssText, scope, viewport);
+  const gap = style.has('gap') ? parseGap(style.get('gap')) : 0;
+  const paddingV = parsePaddingVertical(
+    must(style.get('padding'), `${scope} .tile (column mode) に padding が無い`)
+  );
+  let borderV;
+  if (style.has('border-bottom')) borderV = parseBorderBottomWidth(style.get('border-bottom'));
+  else if (style.has('border')) borderV = parseBorderWidthVertical(style.get('border'));
+  else throw new Error(`${scope} .tile (column mode) に border情報が無い`);
+  return metrics.tileColumnContentPx + gap + paddingV + borderV;
+}
+
 function computeLegendGeometry(metrics, viewport) {
   const paddingV = parsePaddingVertical(must(legendDecls.get('padding'), '#legend に padding が無い'));
   const borderV = parseBorderWidthVertical(must(legendDecls.get('border'), '#legend に border が無い'));
@@ -453,7 +559,7 @@ function computeLegendGeometry(metrics, viewport) {
 const intelDecls = declMap(findBlock('#intel', 'default').body);
 const envpanelDecls = declMap(findBlock('#envpanel', 'default').body);
 
-function computeGeometry(profile, metrics) {
+function computeGeometry(cssText, profile, metrics) {
   const viewport = PROFILES[profile].viewport;
   const vars = effectiveVars(profile);
   const ctx = { vars, viewport };
@@ -466,6 +572,11 @@ function computeGeometry(profile, metrics) {
   );
   const legend = computeLegendGeometry(metrics, viewport);
 
+  // #envpanelの容量計算に使う1タイルの高さは、row/columnどちらで並んでいるかを
+  // app.cssから判定した結果に応じて選ぶ（無条件にtileRowHeightPxを使わない）。
+  const intelMode = detectTileFlexDirection(cssText, '#intel', viewport);
+  const envMode = detectTileFlexDirection(cssText, '#envpanel', viewport);
+
   const metricsAvailable = PROFILES[profile].metricsConfidence === 'measured';
 
   let intelHeight = null;
@@ -476,12 +587,14 @@ function computeGeometry(profile, metrics) {
   let envBottom = null;
 
   if (metricsAvailable) {
+    const intelTileHeight = computeTileHeight(cssText, intelMode, '#intel', viewport, metrics);
+    const envTileHeight = computeTileHeight(cssText, envMode, '#envpanel', viewport, metrics);
     // .tile:last-child{border-bottom:0} のぶん、N枚合計は N*tileH - 1px になる
-    intelHeight = metrics.inHeadHeightPx + intelTileCount * metrics.tileColumnHeightPx - 1;
+    intelHeight = metrics.inHeadHeightPx + intelTileCount * intelTileHeight - 1;
     intelBottom = intelTop + intelHeight;
     clearance = envTop - intelBottom;
-    capacity = Math.floor((envMaxHeight - metrics.inHeadHeightPx) / metrics.tileRowHeightPx);
-    envActualHeight = metrics.inHeadHeightPx + capacity * metrics.tileRowHeightPx;
+    capacity = Math.floor((envMaxHeight - metrics.inHeadHeightPx) / envTileHeight);
+    envActualHeight = metrics.inHeadHeightPx + capacity * envTileHeight;
     envBottom = envTop + envActualHeight;
   }
 
@@ -492,6 +605,8 @@ function computeGeometry(profile, metrics) {
     profile,
     viewport,
     metricsAvailable,
+    intelMode,
+    envMode,
     intelTop,
     intelHeight,
     intelBottom,
@@ -508,9 +623,86 @@ function computeGeometry(profile, metrics) {
 }
 
 const nominalGeom = {
-  desktop: computeGeometry('desktop', ALL_TUNABLE_METRICS),
-  kiosk: computeGeometry('kiosk', ALL_TUNABLE_METRICS),
+  desktop: computeGeometry(cleanCss, 'desktop', ALL_TUNABLE_METRICS),
+  kiosk: computeGeometry(cleanCss, 'kiosk', ALL_TUNABLE_METRICS),
 };
+
+// ============================================================
+// 欠陥1・自己検証: tileSelfScope/resolveTileStyle/detectTileFlexDirection/
+// computeTileHeightは、モジュール先頭で読み込んだapp.cssだけでなく任意のCSS
+// 文字列に対して適用できる純関数である。app.css自体は変更禁止のため、この
+// 自己検証が「退行CSSを検知できること」を確認できる唯一の手段になる。
+// ============================================================
+
+const KIOSK_VIEWPORT = PROFILES.kiosk.viewport;
+const FIXTURE_MEDIA_COND = '(min-width:2200px) and (min-aspect-ratio:2/1)';
+const FIXTURE_BASE_TILE =
+  '.tile{display:flex;padding:9px 14px;border-bottom:1px solid rgba(125,147,171,.1)}\n' +
+  '.tile:last-child{border-bottom:0}\n';
+
+// F1: base_commitと同形（@media内に#intel .tile{flex-direction:column}のみ）
+const FIXTURE_F1 =
+  FIXTURE_BASE_TILE +
+  `@media ${FIXTURE_MEDIA_COND}{#intel .tile{flex-direction:column;gap:3px;padding:14px 20px}}`;
+// F2: @media内に#envpanel .tile{flex-direction:column;...}を追加した形（本ジョブが検知すべき退行）
+const FIXTURE_F2 =
+  FIXTURE_BASE_TILE +
+  `@media ${FIXTURE_MEDIA_COND}{#intel .tile{flex-direction:column;gap:3px;padding:14px 20px}` +
+  `#envpanel .tile{flex-direction:column;gap:3px;padding:14px 20px}}`;
+// F2b: #envpanel .tile{flex-direction:column}のみ（padding/gapは基底.tileを継承）。
+// KNOWLEDGE_SNAPSHOTの「78px」シナリオに対応する最小形の退行
+const FIXTURE_F2_MINIMAL =
+  FIXTURE_BASE_TILE + `@media ${FIXTURE_MEDIA_COND}{#envpanel .tile{flex-direction:column}}`;
+// F3: @media内に素の.tile{flex-direction:column;...}（PR #5が起こした形。#intel限定でない）
+const FIXTURE_F3 =
+  FIXTURE_BASE_TILE + `@media ${FIXTURE_MEDIA_COND}{.tile{flex-direction:column;gap:3px;padding:14px 20px}}`;
+// F4: カンマ区切りのgroupセレクタ
+const FIXTURE_F4 =
+  FIXTURE_BASE_TILE +
+  `@media ${FIXTURE_MEDIA_COND}{#intel .tile,#envpanel .tile{flex-direction:column;gap:3px;padding:14px 20px}}`;
+// F6: .tileの子孫であって.tile自身ではない（深い子孫セレクタに釣られないことの確認）
+const FIXTURE_F6 =
+  FIXTURE_BASE_TILE + `@media ${FIXTURE_MEDIA_COND}{#envpanel .tile .v{flex-direction:column}}`;
+
+function assertMode(label, cssText, scope, expected) {
+  const mode = detectTileFlexDirection(cssText, scope, KIOSK_VIEWPORT);
+  assert.strictEqual(
+    mode,
+    expected,
+    `[self-test ${label}] ${scope} の判定は${expected}のはずが${mode}だった`
+  );
+}
+
+assertMode('F1', FIXTURE_F1, '#envpanel', 'row');
+assertMode('F1', FIXTURE_F1, '#intel', 'column');
+assertMode('F2', FIXTURE_F2, '#envpanel', 'column');
+assertMode('F3', FIXTURE_F3, '#envpanel', 'column');
+assertMode('F3', FIXTURE_F3, '#intel', 'column');
+assertMode('F4', FIXTURE_F4, '#envpanel', 'column');
+assertMode('F6', FIXTURE_F6, '#envpanel', 'row');
+
+// 欠陥1・実効性: 「モードを読めるようになった」だけで終わらせず、読んだモードが
+// 実際に#envpanelの表示容量に効いていることを確認する。定数の選び方（78px/91px
+// いずれの退行CSSでも floor(122/x)=1）に依存しないことも合わせて確認する。
+for (const [label, fixtureCss] of [
+  ['F2', FIXTURE_F2],
+  ['F2b', FIXTURE_F2_MINIMAL],
+  ['F3', FIXTURE_F3],
+  ['F4', FIXTURE_F4],
+]) {
+  const mode = detectTileFlexDirection(fixtureCss, '#envpanel', KIOSK_VIEWPORT);
+  assert.strictEqual(mode, 'column', `[self-test ${label}] #envpanelがcolumn判定になっていない`);
+  const tileHeight = computeTileHeight(fixtureCss, mode, '#envpanel', KIOSK_VIEWPORT, ALL_TUNABLE_METRICS);
+  const capacity = Math.floor(
+    (nominalGeom.kiosk.envMaxHeight - ALL_TUNABLE_METRICS.inHeadHeightPx) / tileHeight
+  );
+  const ratchetedTo = EXPECTED_GAPS['kiosk/INV-1'].ratchetedTo;
+  assert.ok(
+    capacity < ratchetedTo,
+    `[self-test ${label}] #envpanelがcolumn化した退行CSSでcapacityが` +
+      `${ratchetedTo}未満に落ちることを検知できていない (capacity=${capacity})`
+  );
+}
 
 // ============================================================
 // 不変条件の判定（PASS/FAIL/INFO）
@@ -537,18 +729,6 @@ const INV_DEFS = {
   'INV-2': { verdictFn: verdictInv2, valueFn: g => g.clearance, direction: 'biggerIsBetter' },
   'INV-3': { verdictFn: verdictInv3, valueFn: g => (g.metricsAvailable ? g.envBottom : null) },
   'INV-5': { verdictFn: verdictInv5, valueFn: g => g.inv5Excess, direction: 'smallerIsBetter' },
-};
-
-// ============================================================
-// EXPECTED_GAPS: 既知の未解決ギャップ3件をラチェットとして保持する。
-// 到達値を下回ったら失敗（悪化検知）、targetを満たしても失敗（エントリ削除を促す）。
-// INV-1/INV-2は大きいほど良い、INV-5は超過量なので小さいほど良い（target:0）。
-// ============================================================
-
-const EXPECTED_GAPS = {
-  'kiosk/INV-1': { target: 5, ratchetedTo: 2, direction: 'biggerIsBetter', unit: 'センサー表示数', closesWith: '#8' },
-  'kiosk/INV-2': { target: 8, ratchetedTo: -2, direction: 'biggerIsBetter', unit: 'px クリアランス', closesWith: '#8' },
-  'desktop/INV-5': { target: 0, ratchetedTo: 132, direction: 'smallerIsBetter', unit: 'px キャップ超過', closesWith: '#8' },
 };
 
 function checkRatchet(key, currentValue) {
@@ -588,7 +768,7 @@ for (const key of METRIC_KEYS) {
 
 function perturbedGeometry(profile, key, delta) {
   const metrics = { ...ALL_TUNABLE_METRICS, [key]: ALL_TUNABLE_METRICS[key] + delta };
-  return computeGeometry(profile, metrics);
+  return computeGeometry(cleanCss, profile, metrics);
 }
 
 const perturbedGeomCache = {};
@@ -658,13 +838,16 @@ for (const profile of Object.keys(PROFILES)) {
   }
 }
 
-// 幾何の数値表（top/height/bottom/max-height/容量/クリアランス）
+// 幾何の数値表（top/height/bottom/max-height/容量/クリアランス）。
+// mode列は.tileがrow/columnどちらで並んでいるとCSSから判定したかを示す
+// （判定が壊れても人間が目視で気づけるようにするため明示的に出す）。
 const geomTable = [];
 for (const profile of Object.keys(PROFILES)) {
   const g = nominalGeom[profile];
   geomTable.push({
     profile,
     panel: '#intel',
+    mode: g.intelMode,
     top: Math.round(g.intelTop),
     height: g.intelHeight === null ? 'N/A (INFO)' : Math.round(g.intelHeight),
     bottom: g.intelBottom === null ? 'N/A (INFO)' : Math.round(g.intelBottom),
@@ -672,6 +855,7 @@ for (const profile of Object.keys(PROFILES)) {
   geomTable.push({
     profile,
     panel: '#envpanel',
+    mode: g.envMode,
     top: Math.round(g.envTop),
     height: g.envActualHeight === null ? 'N/A (INFO)' : Math.round(g.envActualHeight),
     bottom: g.envBottom === null ? 'N/A (INFO)' : Math.round(g.envBottom),
@@ -682,6 +866,7 @@ for (const profile of Object.keys(PROFILES)) {
   geomTable.push({
     profile,
     panel: '#legend',
+    mode: '-',
     top: Math.round(g.legendTop),
     height: Math.round(g.legendHeight),
     bottom: g.legendTop + g.legendHeight,
@@ -692,6 +877,21 @@ console.log('=== right column layout: geometry (px) ===');
 console.table(geomTable);
 console.log('=== right column layout: invariant verdicts ===');
 console.table(table);
+
+// ============================================================
+// 終了コード決定の第一段階: blockingFailures（ラチェット違反・未登録FAIL）を
+// EXPECTED_NOMINALとの突き合わせより先に判定する。順序が逆だと、本物のCSS
+// 退行によるラチェット違反があっても「パーサまたは高さモデルに誤りがある
+// 可能性が高い」という誤誘導メッセージだけが出て、どの層が原因か分からなく
+// なる（実際に起きた欠陥）。ここでラチェット違反があれば、それ以降の
+// EXPECTED_NOMINALループと3つのassert.strictEqualは実行されずexit 1になる。
+// ============================================================
+
+if (blockingFailures.length > 0) {
+  console.error('=== BLOCKING FAILURES ===');
+  for (const f of blockingFailures) console.error('- ' + f);
+  process.exit(1);
+}
 
 // ============================================================
 // 期待される算出結果との突き合わせ（契約 knowledge_snapshot 記載値）。
@@ -736,15 +936,5 @@ assert.strictEqual(
   590,
   'kiosk系統の#intel高さは590pxになるはず'
 );
-
-// ============================================================
-// 終了コードの決定（rule a/b/c 以外では落ちない）
-// ============================================================
-
-if (blockingFailures.length > 0) {
-  console.error('=== BLOCKING FAILURES ===');
-  for (const f of blockingFailures) console.error('- ' + f);
-  process.exit(1);
-}
 
 console.log('right column layout: OK (既知ギャップ3件はEXPECTED_GAPSのラチェット内、Issue #8待ち)');
