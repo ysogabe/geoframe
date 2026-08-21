@@ -19,8 +19,6 @@ const css = fs.readFileSync('static/app.css', 'utf8');
 const html = fs.readFileSync('index.html', 'utf8');
 const panelsJs = fs.readFileSync('static/js/panels.js', 'utf8');
 
-const structuralFailures = [];
-
 function must(cond, message) {
   if (!cond) {
     throw new Error('[structural] ' + message);
@@ -744,7 +742,7 @@ function checkRatchet(key, currentValue) {
 }
 
 // ============================================================
-// INV-6（感度チェック）: MEASURED_KIOSK/PROFILE_INDEPENDENT_METRICS の4定数を
+// INV-6（感度チェック）: MEASURED_KIOSK の4定数を
 // それぞれ±2px振ってPASS/FAILが反転するかを見る。反転したらSENSITIVITY-LIMITEDと
 // 分類するだけで、それ自体では失敗にしない。ラチェット比較には必ずnominal値を使う。
 // ============================================================
@@ -862,12 +860,13 @@ console.log('=== right column layout: invariant verdicts ===');
 console.table(table);
 
 // ============================================================
-// 終了コード決定の第一段階: blockingFailures（ラチェット違反・未登録FAIL）を
-// EXPECTED_NOMINALとの突き合わせより先に判定する。順序が逆だと、本物のCSS
-// 退行によるラチェット違反があっても「パーサまたは高さモデルに誤りがある
-// 可能性が高い」という誤誘導メッセージだけが出て、どの層が原因か分からなく
-// なる（実際に起きた欠陥）。ここでラチェット違反があれば、それ以降の
-// EXPECTED_NOMINALループと3つのassert.strictEqualは実行されずexit 1になる。
+// 終了コード決定の第一段階: blockingFailures（ラチェット違反・未登録FAIL）を、
+// INV-1/INV-2の直接assertや#ticker構造ガードより先に判定する。順序が逆だと、
+// 本物のCSS退行によるラチェット違反があっても「パーサまたは高さモデルに誤りが
+// ある可能性が高い」という誤誘導メッセージだけが出て、どの層が原因か分からなく
+// なる（実際に起きた欠陥。旧版ではこの判定対象はEXPECTED_NOMINALとの突き合わせ
+// だったが、Issue #8根本対応でINV-1/INV-2のPASS直接assertに置き換えた）。
+// ここでラチェット違反があれば、それ以降のassertは実行されずexit 1になる。
 // ============================================================
 
 if (blockingFailures.length > 0) {

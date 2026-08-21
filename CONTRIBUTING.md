@@ -10,6 +10,7 @@ python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m unittest discover -s tests
 node tests/js/scheduler-quality.test.js
+node tests/js/right-column-layout.test.js
 ```
 
 ネイティブクライアントを変更する場合は、

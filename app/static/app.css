@@ -292,7 +292,7 @@
        row表示のまま余裕(capacity 7)をもって収容できる。関連: Issue #8
        （画面右側パネルの動的レイアウト） */
     #intel .tile{flex-direction:column;align-items:stretch;gap:2px;padding:8px 20px}
-    #intel .tile .k{font-size:16px}
-    #intel .tile .v{text-align:right;font-size:20px}
-    #intel .tile .v.v-compact{font-size:18px}
+    #intel .tile .k{font-size:var(--fs-xs)}
+    #intel .tile .v{text-align:right;font-size:var(--fs-sm)}
+    #intel .tile .v.v-compact{font-size:18px} /* --fs-*に対応するトークンが無い専用サイズ */
   }
