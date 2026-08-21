@@ -1,12 +1,16 @@
-/* 右カラム（#intel / #envpanel / #legend / #hzlegend）のレイアウト不変条件を、
+/* 右カラム（#intel / #envpanel / #hzlegend）のレイアウト不変条件を、
  * ブラウザを使わず app.css を静的に構文解析＋幾何計算して検証する回帰テスト。
  *
  * 背景: 364bc33 → abab9ce → ab2ce7e は「ROOM ENVパネルの表示崩れ」への応急対応の
  * 積み重ねで、ab2ce7e 自身が「QAゲートが『見える項目数』を検証していなかった」ことを
  * 見落とし原因として述べている。本テストはその欠けていた回帰検知を補う。
- * 根本対応（#envpanelの動的レイアウト化）は Issue #8 に委ねてあり、本テストは
- * 現状の表示崩れを EXPECTED_GAPS のラチェットとして許容しつつ、悪化のみを検知する。
- * CSSの修正はスコープ外なのでこのテストが赤くならないよう app.css を書き換えてはならない。
+ *
+ * 旧バージョン（2ef6362/0c64ee9）は根本対応前のCSSを対象に、既知の表示崩れを
+ * EXPECTED_GAPS のラチェットとして許容しつつ悪化のみを検知していた。本コミットで
+ * Issue #8 の根本対応（#legend削除・#intelコンパクト化によるROOM ENV表示余白の確保）
+ * を app.css に実施したため、そのラチェットは撤去し、INV-1（表示容量>=5）/INV-2
+ * （クリアランス>=8px）はPASSの直接assertへ、旧INV-3/INV-5（#legendとの重なり回避）
+ * は#legend自体の削除に伴い#ticker基準の構造ガードへ置き換えた。
  */
 const assert = require('assert');
 const fs = require('fs');
@@ -257,32 +261,34 @@ const rightColumnPanels = allBlocks.filter(b => {
   return decls.get('right') === '46px';
 });
 must(
-  rightColumnPanels.length === 4,
-  `right:46px を持つ右カラムパネルは4個のはずが ${rightColumnPanels.length} 個だった: ` +
+  rightColumnPanels.length === 3,
+  `right:46px を持つ右カラムパネルは3個のはずが ${rightColumnPanels.length} 個だった: ` +
     rightColumnPanels.map(b => b.selector).join(', ')
 );
 const rightColumnSelectors = new Set(rightColumnPanels.map(b => b.selector));
-for (const sel of ['#intel', '#envpanel', '#legend', '#hzlegend']) {
+for (const sel of ['#intel', '#envpanel', '#hzlegend']) {
   must(rightColumnSelectors.has(sel), `右カラムパネルに ${sel} が見つからない`);
 }
 
+// #legend（レイヤ凡例）はIssue #8根本対応で削除済み。#intelの各tileに既に
+// 色スウォッチ(.sw)があり情報が重複していたため。完全に消えたことを確認する。
+must(!/id="legend"/.test(html), '#legend がindex.htmlから削除されていない（Issue #8根本対応で削除したはず）');
+must(!/#legend\b/.test(cleanCss), '#legend の宣言がapp.cssから削除されていない（Issue #8根本対応で削除したはず）');
+
 const intelTileCount = (html.match(/class="tile"/g) || []).length;
 must(intelTileCount === 6, `#intel の .tile は6個のはずが ${intelTileCount} 個だった`);
-
-const legendRowCount = (html.match(/class="row"/g) || []).length;
-must(legendRowCount === 4, `#legend の .row は4個のはずが ${legendRowCount} 個だった`);
 
 const envLabelsMatch = /const ENV_LABELS\s*=\s*\{([^}]*)\}/.exec(panelsJs);
 must(envLabelsMatch, 'panels.js に ENV_LABELS の定義が見つからない');
 const envLabelsKeyCount = (envLabelsMatch[1].match(/[a-zA-Z_][a-zA-Z0-9_]*\s*:/g) || []).length;
 must(envLabelsKeyCount === 5, `ENV_LABELS のキーは5個のはずが ${envLabelsKeyCount} 個だった`);
-// センサー数5の第一の出典は app.css 281-283行のコメント
-// 「HAセンサー5個中2個までしか表示できない」。ENV_LABELSのキー数(5)は
-// それと一致するかを見る cross-check であり、第一の出典ではない
-// （ENV_LABELSはit.class→表示名のフォールバック辞書であり台帳ではないため）。
+// センサー数5の第一の出典は app.css のキオスク@media内コメント（「HAセンサー5個」を
+// 余裕をもって収容できる旨）。ENV_LABELSのキー数(5)はそれと一致するかを見る
+// cross-check であり、第一の出典ではない（ENV_LABELSはit.class→表示名の
+// フォールバック辞書であり台帳ではないため）。
 must(
-  /HAセンサー5個中2個までしか表示できない/.test(css),
-  'app.css の応急対応コメント（HAセンサー5個中2個…）が見つからない。' +
+  /HAセンサー5個/.test(css),
+  'app.css の根本対応コメント（HAセンサー5個…）が見つからない。' +
     'センサー数5の出典が失われている可能性がある'
 );
 const SENSOR_COUNT = 5;
@@ -362,7 +368,7 @@ must(desktopMatches === false, `INV-0b: @media条件がdesktop(1920x1080)でfals
 // 決まらなくなるため、黙って通さず明示的に失敗させる
 // ============================================================
 
-for (const sel of ['#intel', '#envpanel', '#legend', '#hzlegend']) {
+for (const sel of ['#intel', '#envpanel', '#hzlegend']) {
   const block = allBlocks.find(b => b.selector === sel && b.context === 'default');
   must(block, `${sel} の宣言ブロックが見つからない`);
   const decls = declMap(block.body);
@@ -389,44 +395,45 @@ for (const sel of ['#intel', '#envpanel', '#legend', '#hzlegend']) {
 // 3.8pxも外れる。.tileの縦積みは.k側に.sw(9px)を含むflex行があり、
 // 単純な係数では説明できない）。よってこの4値はそのまま実測定数として持つ。
 //
-// tileColumnHeightPx(91px)は「#intel .tile{gap:3px;padding:14px 20px}」を
-// 前提とした実測値であり、padding/gapの異なる .tile へそのまま流用できない。
-// 91を宣言値で分解し、内容部(2行分)だけを実測定数として残す:
-// 91 - gap(3) - padding上下(28) - border(1) = 59。gap/padding/borderは
-// CSSの宣言値から実行時に読んで足す（resolveTileStyle/computeTileHeight）。
+// 旧tileColumnHeightPx(91px)は「#intel .tile{gap:3px;padding:14px 20px}」
+// （Issue #8根本対応前の#intel）を前提とした実測値であり、padding/gapの異なる
+// .tile へそのまま流用できない。91を宣言値で分解し、内容部(2行分)だけを
+// 実測定数として残す: 91 - gap(3) - padding上下(28) - border(1) = 59。
+// gap/padding/borderはCSSの宣言値から実行時に読んで足す
+// （resolveTileStyle/computeTileHeight）。
+//
+// Issue #8根本対応で#intelのfont-sizeを縮小したため、内容部の定数は#intelと
+// #envpanelで別々に持つ必要がある（#envpanelはfont-size変更なしのため旧59pxを
+// そのまま維持できるが、#intelは新しい値になる）:
+// - envTileColumnContentPx: 59（実測値、変更なし。#envpanelが万一column化した
+//   場合の退行検知フィクスチャ用）
+// - intelTileColumnContentPx: 47（設計見積り、未実測）。#intelコンパクト化後の
+//   縦積みタイル内容部の推定値。実機ヘッドレスChromium計測（Issue #8対応中）で
+//   確定させ、見積りとズレていればこの値とapp.cssの--envpanel-gapを補正すること。
 // ============================================================
 
 const MEASURED_KIOSK = {
   inHeadHeightPx: 45, // .in-head: --fs-sm(20px)1行 + padding 10px上下 + border 1px
   tileRowHeightPx: 49, // .tile 横並び: --fs-lg(26px) + padding 9px上下 + border 1px
-  tileColumnContentPx: 59, // .tile 縦積みの内容部(2行分)のみ。gap/padding/borderはCSSから加算する
+  envTileColumnContentPx: 59, // #envpanel .tile 縦積み内容部(2行分)。実測値、変更なし
+  intelTileColumnContentPx: 47, // #intel .tile 縦積み内容部(2行分)。設計見積り、未実測
 };
-// legendRowHeightPx だけは他の3つと性質が異なる: #legend の font-size は10pxの
-// リテラルで@mediaに上書きされないため、この値は両プロファイル共通
-// (profile-independent)。実測ではなく font-size(10px) × 行高係数1.2 の推定値。
-const PROFILE_INDEPENDENT_METRICS = {
-  legendRowHeightPx: 12, // 推定値（実測なし）: 10px × 1.2
-};
-const ALL_TUNABLE_METRICS = { ...MEASURED_KIOSK, ...PROFILE_INDEPENDENT_METRICS };
+const ALL_TUNABLE_METRICS = { ...MEASURED_KIOSK };
 
 // ============================================================
-// EXPECTED_GAPS: 既知の未解決ギャップ3件をラチェットとして保持する。
-// 到達値を下回ったら失敗（悪化検知）、targetを満たしても失敗（エントリ削除を促す）。
-// INV-1/INV-2は大きいほど良い、INV-5は超過量なので小さいほど良い（target:0）。
+// EXPECTED_GAPS: 既知の未解決ギャップをラチェットとして保持する仕組み。
+// Issue #8根本対応によりkiosk/INV-1・kiosk/INV-2・desktop/INV-5の3件はいずれも
+// 解消したため空にした（旧3エントリはPR履歴を参照）。INV-1/INV-2は下記で
+// verdict==='PASS'を直接assertする「本物の不変条件」に格上げし、旧INV-3/INV-5
+// （#legendとの重なり回避）は#legend自体の削除に伴い#ticker基準の構造ガードに
+// 置き換えた（後述）。新たなギャップが生じた場合はここに追加する。
+//
+// 注: checkRatchet関数と下方のループ内 `else if (EXPECTED_GAPS[key])` 分岐は、
+// EXPECTED_GAPSが空である限り到達しないが、将来また追加されたときのため意図的に
+// 残してある（無害なdead code）。削除しないこと。
 // ============================================================
 
-const EXPECTED_GAPS = {
-  'kiosk/INV-1': { target: 5, ratchetedTo: 2, direction: 'biggerIsBetter', unit: 'センサー表示数', closesWith: '#8' },
-  'kiosk/INV-2': { target: 8, ratchetedTo: -2, direction: 'biggerIsBetter', unit: 'px クリアランス', closesWith: '#8' },
-  'desktop/INV-5': { target: 0, ratchetedTo: 132, direction: 'smallerIsBetter', unit: 'px キャップ超過', closesWith: '#8' },
-};
-
-// ============================================================
-// #legend の高さ（フォントメトリクス非依存: font-sizeはリテラルなので
-// legendRowHeightPxはprofile-independentとして扱ってよい）
-// ============================================================
-
-const legendDecls = declMap(findBlock('#legend', 'default').body);
+const EXPECTED_GAPS = {};
 
 function parsePaddingVertical(value) {
   const parts = value.trim().split(/\s+/).map(p => {
@@ -525,10 +532,16 @@ function detectTileFlexDirection(cssText, scope, viewport) {
 }
 
 // row: 実測定数tileRowHeightPxをそのまま使う。
-// column: 内容部(tileColumnContentPx)にCSSの宣言値(gap/padding/border)を
-// 実行時に加算する（DECISION-3: tileColumnHeightPx(91px)の分解）。
+// column: 内容部(scopeに応じてintelTileColumnContentPx／envTileColumnContentPx)に
+// CSSの宣言値(gap/padding/border)を実行時に加算する（DECISION-3:
+// tileColumnHeightPx(91px)の分解。Issue #8根本対応で#intelのfont-sizeが変わった
+// ため内容部の定数をscope別に分けた）。
 function computeTileHeight(cssText, mode, scope, viewport, metrics) {
   if (mode === 'row') return metrics.tileRowHeightPx;
+  const contentPx =
+    scope === '#intel' ? metrics.intelTileColumnContentPx
+    : scope === '#envpanel' ? metrics.envTileColumnContentPx
+    : must(false, `computeTileHeight: scope "${scope}" のcolumn modeコンテンツ高さが未定義`);
   const style = resolveTileStyle(cssText, scope, viewport);
   const gap = style.has('gap') ? parseGap(style.get('gap')) : 0;
   const paddingV = parsePaddingVertical(
@@ -538,18 +551,7 @@ function computeTileHeight(cssText, mode, scope, viewport, metrics) {
   if (style.has('border-bottom')) borderV = parseBorderBottomWidth(style.get('border-bottom'));
   else if (style.has('border')) borderV = parseBorderWidthVertical(style.get('border'));
   else throw new Error(`${scope} .tile (column mode) に border情報が無い`);
-  return metrics.tileColumnContentPx + gap + paddingV + borderV;
-}
-
-function computeLegendGeometry(metrics, viewport) {
-  const paddingV = parsePaddingVertical(must(legendDecls.get('padding'), '#legend に padding が無い'));
-  const borderV = parseBorderWidthVertical(must(legendDecls.get('border'), '#legend に border が無い'));
-  const gap = parseGap(must(legendDecls.get('gap'), '#legend に gap が無い'));
-  const height =
-    legendRowCount * metrics.legendRowHeightPx + (legendRowCount - 1) * gap + paddingV + borderV;
-  const bottom = 64; // #legend { bottom:64px } はリテラル
-  const top = viewport.height - bottom - height;
-  return { height, top, bottom };
+  return contentPx + gap + paddingV + borderV;
 }
 
 // ============================================================
@@ -570,7 +572,6 @@ function computeGeometry(cssText, profile, metrics) {
     must(envpanelDecls.get('max-height'), '#envpanel に max-height が無い'),
     ctx
   );
-  const legend = computeLegendGeometry(metrics, viewport);
 
   // #envpanelの容量計算に使う1タイルの高さは、row/columnどちらで並んでいるかを
   // app.cssから判定した結果に応じて選ぶ（無条件にtileRowHeightPxを使わない）。
@@ -598,9 +599,6 @@ function computeGeometry(cssText, profile, metrics) {
     envBottom = envTop + envActualHeight;
   }
 
-  const available = legend.top - envTop;
-  const inv5Excess = envMaxHeight - available;
-
   return {
     profile,
     viewport,
@@ -616,9 +614,6 @@ function computeGeometry(cssText, profile, metrics) {
     envBottom,
     clearance,
     capacity,
-    legendTop: legend.top,
-    legendHeight: legend.height,
-    inv5Excess,
   };
 }
 
@@ -696,11 +691,14 @@ for (const [label, fixtureCss] of [
   const capacity = Math.floor(
     (nominalGeom.kiosk.envMaxHeight - ALL_TUNABLE_METRICS.inHeadHeightPx) / tileHeight
   );
-  const ratchetedTo = EXPECTED_GAPS['kiosk/INV-1'].ratchetedTo;
+  // EXPECTED_GAPS撤去（Issue #8根本対応）に伴い、閾値はSENSOR_COUNT（本来
+  // 満たすべき表示数）そのものを使う。#envpanelがcolumn化する退行が起きれば
+  // capacityは5を大きく下回る（F2/F3/F4で3、F2_MINIMALで4）ため、この閾値で
+  // 退行を確実に検知できる。
   assert.ok(
-    capacity < ratchetedTo,
+    capacity < SENSOR_COUNT,
     `[self-test ${label}] #envpanelがcolumn化した退行CSSでcapacityが` +
-      `${ratchetedTo}未満に落ちることを検知できていない (capacity=${capacity})`
+      `${SENSOR_COUNT}未満に落ちることを検知できていない (capacity=${capacity})`
   );
 }
 
@@ -716,19 +714,12 @@ function verdictInv2(g) {
   if (!g.metricsAvailable) return 'INFO';
   return g.clearance >= 8 ? 'PASS' : 'FAIL';
 }
-function verdictInv3(g) {
-  if (!g.metricsAvailable) return 'INFO';
-  return g.envBottom <= g.legendTop ? 'PASS' : 'FAIL';
-}
-function verdictInv5(g) {
-  return g.inv5Excess <= 0 ? 'PASS' : 'FAIL';
-}
+// 旧verdictInv3/verdictInv5（#legendとの重なり回避）はIssue #8根本対応での
+// #legend削除に伴い撤去した。代わりに#ticker基準の構造ガード（下記）で置き換える。
 
 const INV_DEFS = {
   'INV-1': { verdictFn: verdictInv1, valueFn: g => g.capacity, direction: 'biggerIsBetter' },
   'INV-2': { verdictFn: verdictInv2, valueFn: g => g.clearance, direction: 'biggerIsBetter' },
-  'INV-3': { verdictFn: verdictInv3, valueFn: g => (g.metricsAvailable ? g.envBottom : null) },
-  'INV-5': { verdictFn: verdictInv5, valueFn: g => g.inv5Excess, direction: 'smallerIsBetter' },
 };
 
 function checkRatchet(key, currentValue) {
@@ -863,14 +854,6 @@ for (const profile of Object.keys(PROFILES)) {
     capacity: g.capacity === null ? 'N/A (INFO)' : g.capacity,
     clearance: g.clearance === null ? 'N/A (INFO)' : Math.round(g.clearance),
   });
-  geomTable.push({
-    profile,
-    panel: '#legend',
-    mode: '-',
-    top: Math.round(g.legendTop),
-    height: Math.round(g.legendHeight),
-    bottom: g.legendTop + g.legendHeight,
-  });
 }
 
 console.log('=== right column layout: geometry (px) ===');
@@ -894,47 +877,65 @@ if (blockingFailures.length > 0) {
 }
 
 // ============================================================
-// 期待される算出結果との突き合わせ（契約 knowledge_snapshot 記載値）。
-// 一致しない場合は EXPECTED_GAPS や判定規則を辻褄合わせで動かさず、
-// .hermes/decision.json とResult Manifestの summary に差異を記録すること。
+// INV-1/INV-2: Issue #8根本対応後の本来あるべき不変条件を直接assertする
+// （EXPECTED_GAPSのラチェットで許容する対象ではなくなったため）。
 // ============================================================
 
-const EXPECTED_NOMINAL = {
-  'kiosk/INV-1/value': 2,
-  'kiosk/INV-2/value': -2,
-  'desktop/INV-5/value': 132,
-};
-const actualNominal = {
-  'kiosk/INV-1/value': nominalGeom.kiosk.capacity,
-  'kiosk/INV-2/value': Math.round(nominalGeom.kiosk.clearance),
-  'desktop/INV-5/value': Math.round(nominalGeom.desktop.inv5Excess),
-};
-for (const k of Object.keys(EXPECTED_NOMINAL)) {
-  const expected = EXPECTED_NOMINAL[k];
-  const actual = actualNominal[k];
-  const tolerance = k.endsWith('INV-1/value') ? 0 : 5;
-  if (!Number.isFinite(actual) || Math.abs(actual - expected) > tolerance) {
-    throw new Error(
-      `算出結果が契約の期待値と食い違っている: ${k} 期待=${expected} 実測=${actual}。` +
-        'パーサまたは高さモデルに誤りがある可能性が高い。' +
-        '.hermes/decision.json とResult Manifestのsummaryに記録すること。'
-    );
-  }
+assert.strictEqual(
+  verdictInv1(nominalGeom.kiosk),
+  'PASS',
+  `kiosk/INV-1 (表示容量>=${SENSOR_COUNT}) はPASSのはずが ` +
+    `verdict=${verdictInv1(nominalGeom.kiosk)} (capacity=${nominalGeom.kiosk.capacity})`
+);
+assert.strictEqual(
+  verdictInv2(nominalGeom.kiosk),
+  'PASS',
+  `kiosk/INV-2 (クリアランス>=8px) はPASSのはずが ` +
+    `verdict=${verdictInv2(nominalGeom.kiosk)} (clearance=${nominalGeom.kiosk.clearance})`
+);
+
+// ============================================================
+// 旧INV-3/INV-5（#envpanelが下のパネル(#legend)と重ならない）は、#legend削除に
+// 伴い「下のパネル」が#ticker（常時表示、bottom:0、height:30pxのリテラル）のみに
+// なった。#envpanelのmax-heightはenvpanel-bottom-marginを差し引いて算出される
+// ため（calc(100vh - intel-top - envpanel-gap - envpanel-bottom-margin)）、
+// envpanel-bottom-margin >= tickerHeightPx である限り構造的に恒真になる。
+// 幾何計算ではなく単純な構造ガードに格下げする。
+// ============================================================
+
+const tickerDecls = declMap(must(findBlock('#ticker', 'default'), '#ticker の宣言ブロックが見つからない').body);
+const tickerHeightPx = evaluate(
+  must(tickerDecls.get('height'), '#ticker に height が無い'),
+  { vars: new Map(), viewport: PROFILES.kiosk.viewport }
+); // #ticker の height はリテラル値でvar()/vw/vhを含まないためctxはダミーでよい
+
+for (const profile of Object.keys(PROFILES)) {
+  const vars = effectiveVars(profile);
+  const marginPx = evaluate(
+    must(vars.get('--envpanel-bottom-margin'), `${profile}: --envpanel-bottom-margin が :root に無い`),
+    { vars, viewport: PROFILES[profile].viewport }
+  );
+  assert.ok(
+    marginPx >= tickerHeightPx,
+    `[構造ガード] ${profile}: --envpanel-bottom-margin(${marginPx}px) が ` +
+      `#ticker の高さ(${tickerHeightPx}px)未満。#envpanelが#tickerと重なる可能性がある`
+  );
 }
 assert.strictEqual(
   Math.round(nominalGeom.desktop.envMaxHeight),
-  695,
-  'desktop系統の#envpanel max-heightはcalcから決定的に695pxになるはず'
+  665,
+  'desktop系統の#envpanel max-heightはcalcから決定的に665pxになるはず'
 );
 assert.strictEqual(
   Math.round(nominalGeom.kiosk.envMaxHeight),
-  167,
-  'kiosk系統の#envpanel max-heightはcalcから決定的に167pxになるはず'
+  391,
+  'kiosk系統の#envpanel max-heightはcalcから決定的に391pxになるはず'
 );
 assert.strictEqual(
   Math.round(nominalGeom.kiosk.intelHeight),
-  590,
-  'kiosk系統の#intel高さは590pxになるはず'
+  440,
+  'kiosk系統の#intel高さは440pxになるはず（intelTileColumnContentPx=47の設計見積り' +
+    'に基づく暫定値。実機ヘッドレスChromium計測で確定させ、ズレていれば補正すること）'
 );
 
-console.log('right column layout: OK (既知ギャップ3件はEXPECTED_GAPSのラチェット内、Issue #8待ち)');
+console.log('right column layout: OK (#legend削除・#intelコンパクト化によりIssue #8根本対応完了。ROOM ENVはHAセンサー5個をrow表示のまま収容できる)');

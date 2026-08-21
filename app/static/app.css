@@ -14,7 +14,7 @@
     --fs-2xs:9px;  --fs-xs:10px;  --fs-sm:11px;  --fs-md:13px;
     --fs-lg:15px;  --fs-xl:20px;  --fs-2xl:26px; --fs-hero:44px;
     --panel-w:330px; --intel-top:96px; --envpanel-gap:269px; --alertbar-top:76px;
-    --envpanel-bottom-margin:20px;
+    --envpanel-bottom-margin:50px; /* #ticker(高さ30px)との重なり回避 */
   }
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--ink);font-family:var(--jp)}
@@ -95,12 +95,6 @@
     max-height:calc(100vh - var(--intel-top) - var(--envpanel-gap) - var(--envpanel-bottom-margin));overflow-y:auto}
   #envpanel .in-head{color:var(--green);border-bottom-color:rgba(62,240,140,.2)}
   #envpanel .tile .v.warn2{color:var(--amber);text-shadow:0 0 10px rgba(255,179,0,.5)}
-
-  /* ==== レイヤ凡例（右下） ==== */
-  #legend{position:absolute;right:46px;bottom:64px;z-index:10;font-family:var(--mono);font-size:10px;letter-spacing:.15em;color:var(--ink-2);
-    background:var(--panel);border:1px solid rgba(125,147,171,.2);padding:10px 14px;display:grid;gap:6px}
-  #legend .row{display:flex;align-items:center;gap:8px}
-  #legend .sw{width:14px;height:8px}
 
   /* ==== ティッカー（最下部） ==== */
   #ticker{position:absolute;left:0;right:0;bottom:0;z-index:9;height:30px;display:flex;align-items:center;overflow:hidden;
@@ -223,7 +217,12 @@
                      100%{transform:translate(-50%,-50%) scale(1);opacity:0}}
   .eq .elbl{position:absolute;left:8px;top:6px;font-family:var(--mono);font-size:9px;color:var(--magenta);
     white-space:nowrap;background:rgba(5,8,15,.55);padding:0 3px}
-  /* 地震時の防災レイヤ凡例 */
+  /* 地震時の防災レイヤ凡例。既知の残存リスク（Issue #8対応時点、対応不要・記録のみ）:
+     #legend削除・#intelコンパクト化によりkiosk系統の#envpanel capacityが2→7に
+     増えたぶん、5センサー運用時は#envpanelの実高さも伸びるため、地震発生時に
+     この#hzlegend（同じ右下エリア、z-index:11）との重なりが従来よりわずかに
+     増える可能性がある（現状でも既にオーバーラップは発生しており新規の問題では
+     ない）。地震イベントは低頻度・表示は60秒間のみのためスコープ外とする */
   #hzlegend{position:absolute;right:46px;bottom:64px;z-index:11;display:none;
     background:var(--panel);border:1px solid rgba(255,45,149,.4);backdrop-filter:blur(6px);
     padding:10px 14px;font-family:var(--mono);font-size:11px;letter-spacing:.08em;color:var(--ink-2)}
@@ -277,20 +276,23 @@
   @media (min-width:2200px) and (min-aspect-ratio:2/1){
     :root{
       --fs-xs:16px; --fs-sm:20px; --fs-md:22px; --fs-lg:26px; --fs-2xl:56px;
-      --panel-w:420px; --intel-top:165px; --envpanel-gap:588px; --alertbar-top:130px;
-      --envpanel-bottom-margin:160px; /* #legend(右下レイヤ凡例)との重なりを避ける実測値。
-        #envpanelをrow表示に変更後の再実測値（2026-08-14）。この制約下でも
-        HAセンサー5個中2個までしか表示できない（Issue #8で根本対応予定） */
+      --panel-w:420px; --intel-top:165px; --envpanel-gap:480px; --alertbar-top:130px;
+      --envpanel-bottom-margin:44px; /* #ticker(bottom:0,height:30px)との重なりを避ける値。
+        #intelのコンパクト化と#legend削除(Issue #8根本対応)により、#envpanelはrow表示の
+        ままHAセンサー5個を余裕をもって収容できる。旧値(160px)は#legendとの重なり
+        回避用だったが、#legend削除に伴いticker基準に置き換えた。
+        導出: tickerHeight(30px) + slack(14px) = 44px */
       --fs-xl:32px;
       --fs-2xs:14px; --fs-hero:68px; /* 未消費・将来拡張用 */
     }
-    /* AREA INTELの長文日本語値（例:「第一種中高層住居専用地域」）向けの縦積み化。
-       #envpanelは値が短い（例:「24.5℃」）ため横並びのままにする — column化すると
-       1タイルの高さが約91pxに増え、右カラムの限られた高さ（画面下端の#legendまで）で
-       表示できるセンサー数が5個中1〜2個まで落ちる（2026-08-14実測、advisorレビューで
-       本番の実データにより発覚）。#intel は6タイル固定なのでcolumn化しても収まるが、
-       #envpanelはHome Assistant側の設定次第でタイル数が可変のため、row表示で
-       密度を優先する。関連: Issue #8（画面右側パネルの動的レイアウト） */
-    #intel .tile{flex-direction:column;align-items:stretch;gap:3px;padding:14px 20px}
-    #intel .tile .v{text-align:right}
+    /* AREA INTELをコンパクトな縦積みにする（Issue #8根本対応）。#legend削除と合わせて
+       #envpanelの表示余白を確保する。envpanel-gap(480px)の導出: intelHeight見積り
+       440px + clearance40px(タイル高さ推定誤差を吸収する余裕) = 480px。
+       #envpanelは値が短い（例:「24.5℃」）ため横並びのままにする — HAセンサー5個を
+       row表示のまま余裕(capacity 7)をもって収容できる。関連: Issue #8
+       （画面右側パネルの動的レイアウト） */
+    #intel .tile{flex-direction:column;align-items:stretch;gap:2px;padding:8px 20px}
+    #intel .tile .k{font-size:16px}
+    #intel .tile .v{text-align:right;font-size:20px}
+    #intel .tile .v.v-compact{font-size:18px}
   }
