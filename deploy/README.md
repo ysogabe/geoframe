@@ -199,6 +199,27 @@ GEOFRAME_URL=http://geoframe.example.test:8080/ /opt/geoframe/deploy/kiosk/kiosk
 画面のスリープ・復帰制御は任意です。`GEOFRAME_SLEEP_CMD`と`GEOFRAME_WAKE_CMD`を設定する前に、
 `kiosk/screen-ctl.sh`を手動で確認してください。
 
+画面ON/OFFのHA経由手動オーバーライドも任意です。以下の環境変数で挙動を調整します
+（詳細は`app/.env.example`を参照）。
+
+- `GEOFRAME_HA_SCREEN_MODE_ENTITY` — 手動オーバーライド用のHAヘルパーエンティティID
+  （例: `input_select.geoframe_screen_mode`）。未設定時はこの機能全体が無効化され、
+  既存のauto専用の自動スリープロジックのみにフォールバックします。
+- `GEOFRAME_HA_SCREEN_DECAY_MIN`（既定値5分）— HAへの疎通が失敗し続けた場合に、
+  `force_on`/`force_off`から`auto`へ自動的に減衰するまでの時間。
+- `GEOFRAME_SCREEN_STATUS_CMD`（既定値なし、未設定なら照合機能自体が無効）— 実機の画面電源状態
+  （on/off）を標準出力で返すコマンド。`screen-ctl.sh status`相当を指定し、GEOFRAME側の
+  意図した状態と実機状態を定期的に照合します。
+- `GEOFRAME_HA_SCREEN_RECONCILE_SEC`（既定値90秒）— 上記照合の実行間隔。
+
+> [!IMPORTANT]
+> `GEOFRAME_SCREEN_STATUS_CMD`は**必ず絶対パスで指定してください。** systemd unitの
+> `WorkingDirectory`（`/opt/geoframe/app`）基準の相対パスでは動作しません。
+>
+> ```sh
+> GEOFRAME_SCREEN_STATUS_CMD=/opt/geoframe/deploy/kiosk/screen-ctl.sh status
+> ```
+
 ## 5. バックアップ
 
 `catalog.db`には、有料生成したAI埋め込み、手動GPS修正、お気に入りなどが含まれます。

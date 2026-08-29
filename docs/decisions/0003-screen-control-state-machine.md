@@ -1,7 +1,7 @@
 # ADR: 画面制御の状態機械は新モジュールに切り出し、意図の真実はHA・解除は明示操作のみとする
 
 - 日付: 2026-08-29
-- 状態: 提案（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。ユーザー承認待ち）
+- 状態: 採用（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。2026-08-30 実装完了により採用）
 
 ## 文脈
 
@@ -12,7 +12,8 @@
 1. 新モジュール `app/geoframe/screen_control.py` を新設し、画面電源の判定ロジックを`ha.py`から分離する。中核は純関数 `decide(mode, ha_ok, idle_s, ...) -> desired_screen` とし、コマンド発火は従来どおり状態が変化した瞬間のみ行う（エッジ駆動を維持）。
 2. **意図（mode）の永続な真実はHAの`input_select`に置く。** GEOFRAME側はメモリ上に現在値をキャッシュするのみで、`catalog.db`には一切書き込まない。
 3. `force_off`/`force_on`は人感反応やタイムアウトで自動解除しない。**解除は`auto`への明示的な切り戻しのみ。** 安全弁として、`force_off`が24時間以上継続した場合はログにWARNを出す（自動解除はしない）。時刻・日照ベースの自動復帰（例: 日の出でauto復帰）が欲しくなった場合は、GEOFRAME側にポリシーを持ち込まずHA automation側に実装する。
-4. サーバーが「指示した状態」（`desired_screen`）と実機の状態を分離し、`deploy/kiosk/screen-ctl.sh status`（実装済みだが現状`ha.py`から未参照）を用いた低頻度の照合（reconciliation）を追加する。帯域外のDPMS変化（手動ssh操作、デプロイ、想定外の外部要因）や、`subprocess.Popen`の実行失敗を検知できるようにする。
+4. サーバーが「指示した状態」と実機の状態を突き合わせる、`deploy/kiosk/screen-ctl.sh status`を用いた低頻度の照合（reconciliation）を追加する。帯域外のDPMS変化（手動ssh操作、デプロイ、想定外の外部要因）や、`subprocess.Popen`の実行失敗を検知できるようにする。
+   - **実装上の意味論**（当初案の「`desired_screen`と実機状態を分離した別フィールド」ではなく、`_presence["screen"]`（意図）1本に`screen_confirmed`（実測で確認済みか）を添える統合方式を採用）: `screen_confirmed: True`は実測して意図と一致したことが確認された状態、`None`は未確認（意図を書き換えた直後を含む）。reconcileが不一致を検出した場合は実機の値へ`_presence["screen"]`を追従させ`screen_confirmed`を`None`に戻し、直後のポリシー再評価（`decide()`）に新しい意図の計算を委ねる。コマンド発火はこのポリシー再評価にのみ一本化し、reconcile自体はコマンドを発火しない。
 
 ## 理由
 
@@ -24,4 +25,4 @@
 
 - `SLEEP_CMD`/`WAKE_CMD`は既存どおり固定の設定文字列のまま実行する。エンティティの値やモード名を`shell=True`のコマンド文字列へ結合しない（絶対条件）。
 - 実装時に必須のテストケース: `force_off`中に人感が反応するケース／HA疎通断からの`auto`減衰／プロセス再起動後にHAから意図を再取得して収束するケース／`screen-ctl.sh`のDPMSコマンドが失敗するケース。
-- 次段階: `/api/presence`のレスポンスに`mode`と`screen_confirmed`（実機照合済みかどうか）を追加公開し、フロントおよびFAQ LPの「現在の状態」表示に使えるようにする。
+- `/api/presence`のレスポンスに`mode`と`screen_confirmed`（実機照合済みかどうか）を追加公開済み（実装により実現）。次段階はフロント側（`modes.js`、[[0004-frontend-display-mode-arbitration]]）でこれらを「現在の状態」表示に使うこと。
