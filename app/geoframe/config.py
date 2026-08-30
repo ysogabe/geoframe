@@ -184,6 +184,24 @@ WAKE_CMD = os.environ.get("GEOFRAME_WAKE_CMD", "")            # 例: xset dpms f
 HA_ENV_ENTITIES = [e.strip() for e in
                    os.environ.get("GEOFRAME_HA_ENV_ENTITIES", "").split(",") if e.strip()]
 
+# ------------------------------------------------------------
+# 画面ON/OFFの手動オーバーライド
+# ------------------------------------------------------------
+# HA側の input_select（選択肢: auto / force_on / force_off）を既存のポーリングで
+# 読むだけの構成にしている。こちら側に書き込み用のHTTPエンドポイントは足さない
+# （このサーバーは無認証なので、外から画面を消せる口を増やしたくない）。
+# 未設定なら常に auto 相当＝従来の人感センサー任せの挙動に戻る（rollback経路）。
+# 例: GEOFRAME_HA_SCREEN_MODE_ENTITY=input_select.geoframe_screen_mode
+HA_SCREEN_MODE_ENTITY = os.environ.get("GEOFRAME_HA_SCREEN_MODE_ENTITY", "")
+# HAへ疎通できないままこの分数を超えたら、オーバーライドを捨てて auto へ戻す。
+# 外出先で force_off にした直後にHAが落ちて画面が二度と点かない、を避ける保険
+HA_SCREEN_DECAY_MIN = float(os.environ.get("GEOFRAME_HA_SCREEN_DECAY_MIN", "5"))
+# 実機の画面状態を読むコマンド（例: /opt/geoframe/deploy/kiosk/screen-ctl.sh status）。
+# ※標準出力の on/off だけを見る。あのスクリプトは正常な「off」判定でも exit 1 を
+#   返す仕様なので、終了コードで成否を判定してはいけない
+SCREEN_STATUS_CMD = os.environ.get("GEOFRAME_SCREEN_STATUS_CMD", "")
+HA_SCREEN_RECONCILE_SEC = float(os.environ.get("GEOFRAME_HA_SCREEN_RECONCILE_SEC", "90"))
+
 # 気象庁（無認証）。GEOFRAME_JMA_AREA: 予報区コード（既定120000=千葉県）
 JMA_AREA = os.environ.get("GEOFRAME_JMA_AREA", "120000")
 JMA_FORECAST = f"https://www.jma.go.jp/bosai/forecast/data/forecast/{JMA_AREA}.json"
