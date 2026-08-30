@@ -25,4 +25,5 @@
 
 - `SLEEP_CMD`/`WAKE_CMD`は既存どおり固定の設定文字列のまま実行する。エンティティの値やモード名を`shell=True`のコマンド文字列へ結合しない（絶対条件）。
 - 実装時に必須のテストケース: `force_off`中に人感が反応するケース／HA疎通断からの`auto`減衰／プロセス再起動後にHAから意図を再取得して収束するケース／`screen-ctl.sh`のDPMSコマンドが失敗するケース。
+  - 前2件は`app/tests/test_screen_control.py`に実装済み。後2件は`screen_control.py`の純粋関数の範囲外（`ha.py`の`ha_loop()`に対する統合テストが必要）のため未実装。Issue #14で追跡する。
 - `/api/presence`のレスポンスに`mode`と`screen_confirmed`（実機照合済みかどうか）を追加公開済み（実装により実現）。次段階はフロント側（`modes.js`、[[0004-frontend-display-mode-arbitration]]）でこれらを「現在の状態」表示に使うこと。

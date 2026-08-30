@@ -203,13 +203,18 @@ GEOFRAME_URL=http://geoframe.example.test:8080/ /opt/geoframe/deploy/kiosk/kiosk
 （詳細は`app/.env.example`を参照）。
 
 - `GEOFRAME_HA_SCREEN_MODE_ENTITY` — 手動オーバーライド用のHAヘルパーエンティティID
-  （例: `input_select.geoframe_screen_mode`）。未設定時はこの機能全体が無効化され、
-  既存のauto専用の自動スリープロジックのみにフォールバックします。
+  （例: `input_select.geoframe_screen_mode`）。未設定時は`force_on`/`force_off`の判定が
+  無効化され、常に`auto`（既存の自動スリープロジックのみ）として扱われます。
+  **`GEOFRAME_SCREEN_STATUS_CMD`を設定している場合、実機との照合（reconciliation）
+  自体はこの変数の設定有無に関わらず動作します。** 両方の機能を完全に無効化したい
+  場合は両方の変数を未設定に戻してください。
 - `GEOFRAME_HA_SCREEN_DECAY_MIN`（既定値5分）— HAへの疎通が失敗し続けた場合に、
   `force_on`/`force_off`から`auto`へ自動的に減衰するまでの時間。
 - `GEOFRAME_SCREEN_STATUS_CMD`（既定値なし、未設定なら照合機能自体が無効）— 実機の画面電源状態
   （on/off）を標準出力で返すコマンド。`screen-ctl.sh status`相当を指定し、GEOFRAME側の
-  意図した状態と実機状態を定期的に照合します。
+  意図した状態と実機状態を定期的に照合します。**未設定のままだと、コマンド発火が実際には
+  失敗していても画面が「切り替わった」ことになってしまう既存の弱点がそのまま残るため、
+  N100実機では設定を推奨します。**
 - `GEOFRAME_HA_SCREEN_RECONCILE_SEC`（既定値90秒）— 上記照合の実行間隔。
 
 > [!IMPORTANT]
@@ -219,6 +224,11 @@ GEOFRAME_URL=http://geoframe.example.test:8080/ /opt/geoframe/deploy/kiosk/kiosk
 > ```sh
 > GEOFRAME_SCREEN_STATUS_CMD=/opt/geoframe/deploy/kiosk/screen-ctl.sh status
 > ```
+
+> [!NOTE]
+> reconciliationは「サーバー側の意図」を実機へ追従させる設計です。`force_off`中に
+> ssh経由で`screen-ctl.sh on`等の手動操作を行っても、次の照合サイクルで再び消灯します。
+> 保守作業の前は`input_select`を`auto`へ切り替えてください。
 
 ## 5. バックアップ
 

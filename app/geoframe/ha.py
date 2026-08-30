@@ -51,6 +51,11 @@ _screen_state = {
     "force_off_warned": False,  # 24時間超過WARNの1回だけフラグ
     # 直近コマンドを発火した desired_screen 値。同じ値への再発火でログを出さないため
     "last_cmd_screen": None,
+    "reconcile_warned": False,  # reconcile失敗ログの1回だけフラグ（_sun["warned"]と同型）
+    # 直前ループのeffective_mode。オーバーライドがHA疎通断で減衰してautoに
+    # 落ちた瞬間を検知するために使う（減衰後はmode自体が"auto"になるため、
+    # mode単体では人感起因の遷移と区別できない）
+    "prev_mode": "auto",
 }
 
 
@@ -165,12 +170,20 @@ def reconcile_screen():
         r = subprocess.run(SCREEN_STATUS_CMD, shell=True, capture_output=True,
                            text=True, timeout=5)
     except Exception as e:
-        # 実機の状態が読めなかっただけ。意図は書き換えない（勝手に諦めない）
-        print(f"[ha] 画面状態の取得に失敗（意図は保持します）: {e}")
+        # 実機の状態が読めなかっただけ。意図は書き換えない（勝手に諦めない）。
+        # ただし「実測して一致確認済み」を意味する screen_confirmed は
+        # True のまま放置すると嘘になるので、確認できていない状態へ戻す
+        _presence["screen_confirmed"] = None
+        if not _screen_state["reconcile_warned"]:
+            _screen_state["reconcile_warned"] = True
+            print(f"[ha] 画面状態の取得に失敗（意図は保持します。解消するまで再通知しません）: {e}")
         return
+    _screen_state["reconcile_warned"] = False   # 成功したら次の失敗でまた1回だけ通知する
     actual, matched = screen_control.reconcile(_presence["screen"], r.stdout)
     if actual is None:
-        return                              # unknown・空文字列など解釈不能
+        # unknown・空文字列など解釈不能。ここも実測で確認できていない
+        _presence["screen_confirmed"] = None
+        return
     if matched:
         _presence["screen_confirmed"] = True
         return
@@ -234,6 +247,11 @@ def ha_loop():
         mode_stale_s = time.time() - _screen_state["mode_last_ok_ts"]
         mode = screen_control.effective_mode(_screen_state["raw_mode"],
                                              mode_stale_s, decay_after_s)
+        # 直前ループのmodeと比較し、オーバーライドがHA疎通断で減衰してautoに
+        # 落ちた瞬間かどうかを判定する（減衰後はmode自体が"auto"になるため、
+        # 下のログ分岐でmode単体を見ると人感起因の遷移と区別が付かない）
+        decayed_from_override = (_screen_state["prev_mode"] != "auto" and mode == "auto")
+        _screen_state["prev_mode"] = mode
         _presence["mode"] = mode
         new_screen = screen_control.decide(mode, _presence["ha_ok"], idle,
                                            ha_motion_configured=bool(HA_MOTION),
@@ -247,7 +265,10 @@ def ha_loop():
             # なりうる。コマンドはべき等なので送り続けてよいが、ログは遷移が
             # 実際に変わった時だけにする
             if _screen_state["last_cmd_screen"] != new_screen:
-                if mode == "auto":
+                if decayed_from_override:
+                    print(f"[ha] 画面{'スリープ' if new_screen == 'off' else '復帰'}"
+                          "（手動オーバーライドがHA疎通断で減衰しautoへ）")
+                elif mode == "auto":
                     print(f"[ha] 画面{'スリープ' if new_screen == 'off' else '復帰'}"
                           f"（無人{int(idle // 60)}分）")
                 else:
