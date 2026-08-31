@@ -66,19 +66,38 @@
 
     let view;
     let layerState;
+    const first = nextQueueIdx();
     try{
       view = mod.createPhotoJourneyView(container, { low: settings.low });
       await view.init();               // WebGLコンテキスト生成（失敗時はthrow→フォールバック）
       const { points, route } = toPoints();
+
+      /* raster layer は追加時点のカメラから可視タイルを選ぶ。ThreeView の既定カメラの
+         まま先に layer を追加すると、animation:false の on-demand mode では最初の
+         flyTo 後も白い楕円体だけが残ることがある。初回地点へ即時配置してから layer
+         を追加し、初期タイル選択を実際の表示地点に固定する。 */
+      if(first >= 0){
+        const p = PHOTOS[first];
+        mod.setPhotoJourneyCamera(view, {
+          lng: p.lon,
+          lat: p.lat,
+          height: settings.height,
+          pitch: settings.pitch,
+          heading: settings.headingStep ? (first * settings.headingStep) % 360 : 0,
+        });
+      }
       layerState = mod.addPhotoJourneyLayers(view, { points, route });
+      view.forceUpdate?.();
     }catch(e){ return fallbackToMapLibre(e); }
 
-    const first = nextQueueIdx();
-    if(first >= 0) tick(view, mod, first, layerState);
+    // The initial setCamera above is intentionally the first frame. Calling
+    // flyTo synchronously in the same turn can replace the not-yet-processed
+    // camera change and restart from Navara's default globe camera.
+    if(first >= 0) tick(view, mod, first, layerState, true);
     else setTimeout(() => tick(view, mod, nextQueueIdx(), layerState), 1000);
   }
 
-  function tick(view, mod, i, layerState){
+  function tick(view, mod, i, layerState, initial = false){
     if(i < 0){ setTimeout(() => tick(view, mod, nextQueueIdx(), layerState), 1000); return; }
     markShown(i);
     const p = PHOTOS[i];
@@ -89,6 +108,13 @@
     const heading = settings.headingStep ? (i * settings.headingStep) % 360 : 0;
     if(layerState && mod.updatePhotoJourneyBasemap){
       mod.updatePhotoJourneyBasemap(layerState.basemap, p);
+      view.forceUpdate?.();
+    }
+    if(initial){
+      // Let the camera placed before layer registration own the first view.
+      // Subsequent points use flyTo as usual.
+      setTimeout(() => tick(view, mod, nextQueueIdx(), layerState), settings.dwellMs);
+      return;
     }
     Promise.resolve(
       mod.flyPhotoJourneyCamera(

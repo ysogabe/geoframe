@@ -84,8 +84,10 @@ GSI/OSMを同時に全面fetchしないため、2560x1080での初期tile burst�
    `syncSchedule()` → `playQueue` が空なら `buildPlayOrder()`。
    （再生キュー・全網羅・記念日加味・localStorage永続化は 2D と完全に共用）
 2. `import('/static/navara/photo-journey-lite.js')` で Navara バンドルを遅延ロード。
-3. `createPhotoJourneyView(#modelayer)` → `await view.init()` →
-   `addPhotoJourneyLayers(view, {points, route})`。
+3. `createPhotoJourneyView(#modelayer)` → `await view.init()`。初回キュー地点へ
+   `setCamera()` を先に適用してから `addPhotoJourneyLayers(view, {points, route})` を呼び、
+   `forceUpdate()` で最初の可視タイル選択・描画を要求する。初回は同一ターンの
+   `flyTo()` を省略し、Navara既定カメラへの上書きを防ぐ。
 4. 巡回ループ: `nextQueueIdx()` → `markShown(i)` → `showPhoto(i)`（既存の写真カード +
    AREA INTEL を再利用）→ `setMode('3D PHOTO JOURNEY LITE')` →
    `flyPhotoJourneyCamera(...)`。通常滞在は約16秒、カメラ移動は5秒。低電力時は最低30秒滞在、

@@ -174,6 +174,15 @@ assert.strictEqual(lowView.options.animation, false, 'LOW_POWERでもon-demand�
 assert.strictEqual(lowView.options.cacheBytes, LOW_POWER_LITE_OPTIONS.cacheBytes, 'LOW_POWER設定をThreeViewへ渡す');
 assert.strictEqual(lowView.plugins.length, 1, 'DefaultPluginを1つだけ登録');
 
+const setPhotoJourneyCamera = vm.runInContext('setPhotoJourneyCamera', feContext);
+let initialCamera = null;
+setPhotoJourneyCamera({ setCamera: cam => { initialCamera = cam; } }, {
+  lng: 139.7454, lat: 35.6586, height: 4200, pitch: -24, heading: 0,
+});
+assert.strictEqual(JSON.stringify(initialCamera), JSON.stringify({
+  lng: 139.7454, lat: 35.6586, height: 4200, heading: 0, pitch: -24, roll: 0,
+}), '初回地点へ即時配置できる');
+
 /* static/js/photo-journey-settings.js — 低頻度巡回設定を実値で検証 */
 const settingsSrc = fs.readFileSync('static/js/photo-journey-settings.js', 'utf8');
 function loadSettings(low) {
@@ -261,5 +270,13 @@ assert.ok(controllerSrc.includes('settings.dwellMs'), '設定値で低頻度の�
 assert.ok(controllerSrc.includes('showPhoto(i)'), '既存の写真カードを再利用する');
 assert.ok(controllerSrc.includes("setMode('3D PHOTO JOURNEY LITE')"), '3D表示ラベルを明示する');
 assert.ok(!controllerSrc.includes("setMode('PHOTO JOURNEY')"), '3Dで旧ラベルを使わない');
+assert.ok(controllerSrc.indexOf('mod.setPhotoJourneyCamera(view') < controllerSrc.indexOf('mod.addPhotoJourneyLayers(view'),
+  '初期カメラを配置してからraster layerを追加する');
+assert.ok(controllerSrc.includes('view.forceUpdate?.()'), 'on-demand描画で初期レイヤ追加後に再描画する');
+assert.ok(controllerSrc.includes('tick(view, mod, first, layerState, true)'),
+  '初回はsetCameraを維持し、同一ターンのflyToで上書きしない');
+assert.ok(controllerSrc.includes('function tick(view, mod, i, layerState, initial = false)'),
+  '初回カメラと通常のflyToを区別する');
+assert.ok(controllerSrc.includes('if(initial){'), '初回はflyToをスキップしてタイル選択を安定させる');
 
 console.log('photo-journey-lite: OK');
