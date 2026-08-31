@@ -6,7 +6,7 @@
 
    宣言する主なグローバル: なし（IIFE に閉じる。GEOFRAME_MODE_3D は bootstrap.js）
    依存する他ファイルのグローバル: GEOFRAME_MODE_3D (bootstrap.js),
-       DWELL_MS (config.js), PHOTOS/usingMock/manifestReady/reindexPhotos (data.js),
+       DWELL_MS/LOW_POWER (config.js), PHOTOS/usingMock/manifestReady/reindexPhotos (data.js),
        playQueue/loadPlayState/syncSchedule/buildPlayOrder/nextQueueIdx/markShown
        (scheduler-core.js), showPhoto (photocard.js), setMode (modes.js),
        buildTicker (panels.js)
@@ -25,8 +25,10 @@
 (function(){
   if(!window.GEOFRAME_MODE_3D) return;
 
-  const DWELL_3D_MS = DWELL_MS || 16000;  // 1地点の滞在（低頻度遷移の基準）
-  const FLY_3D_MS   = 5000;               // カメラ移動アニメーション時間
+  const settings = window.GEOFRAME_PHOTO_JOURNEY_SETTINGS || {
+    low: !!window.LOW_POWER, dwellMs: DWELL_MS || 16000, flyMs: 5000,
+    height: 1800, pitch: -32, headingStep: 47,
+  };
 
   /* Navara/WASM/worker/WebGL の初期化失敗時の一度きりのフォールバック。
      bootstrap.js は geoframe.3d.fallback==='1' を検知すると mode=3d を剥がして
@@ -51,6 +53,7 @@
     syncSchedule();
     if(!playQueue.length) buildPlayOrder();
     buildTicker();   // HUDティッカーは通常モードと共通
+    setMode('3D PHOTO JOURNEY LITE');
 
     // Navara バンドルを遅延ロード（通常URLではここに到達しない）
     let mod;
@@ -62,35 +65,39 @@
     if(!container) return fallbackToMapLibre(new Error('#modelayer が見つからない'));
 
     let view;
+    let layerState;
     try{
-      view = mod.createPhotoJourneyView(container);
+      view = mod.createPhotoJourneyView(container, { low: settings.low });
       await view.init();               // WebGLコンテキスト生成（失敗時はthrow→フォールバック）
       const { points, route } = toPoints();
-      mod.addPhotoJourneyLayers(view, { points, route });
+      layerState = mod.addPhotoJourneyLayers(view, { points, route });
     }catch(e){ return fallbackToMapLibre(e); }
 
     const first = nextQueueIdx();
-    if(first >= 0) tick(view, mod, first);
-    else setTimeout(() => tick(view, mod, nextQueueIdx()), 1000);
+    if(first >= 0) tick(view, mod, first, layerState);
+    else setTimeout(() => tick(view, mod, nextQueueIdx(), layerState), 1000);
   }
 
-  function tick(view, mod, i){
-    if(i < 0){ setTimeout(() => tick(view, mod, nextQueueIdx()), 1000); return; }
+  function tick(view, mod, i, layerState){
+    if(i < 0){ setTimeout(() => tick(view, mod, nextQueueIdx(), layerState), 1000); return; }
     markShown(i);
     const p = PHOTOS[i];
     showPhoto(i);                 // 写真カード + AREA INTEL（通常モードと共通）
-    setMode('PHOTO JOURNEY');
-    // 撮影地点を中心に低高度・やや俯角で見る。heading は地点ごとに回して変化を付ける。
-    const height  = 1600 + (i % 3) * 400;
-    const heading = (i * 47) % 360;
+    setMode('3D PHOTO JOURNEY LITE');
+    // LOW_POWERは高めの高度・固定方位・長い滞在でLOD選択と更新回数を抑える。
+    const height  = settings.height + (settings.low ? 0 : (i % 3) * 400);
+    const heading = settings.headingStep ? (i * settings.headingStep) % 360 : 0;
+    if(layerState && mod.updatePhotoJourneyBasemap){
+      mod.updatePhotoJourneyBasemap(layerState.basemap, p);
+    }
     Promise.resolve(
       mod.flyPhotoJourneyCamera(
         view,
-        { lng: p.lon, lat: p.lat, height, pitch: -32, heading },
-        { duration: FLY_3D_MS }
+        { lng: p.lon, lat: p.lat, height, pitch: settings.pitch, heading },
+        { duration: settings.flyMs }
       )
     ).catch(()=>{}).finally(()=>{
-      setTimeout(() => tick(view, mod, nextQueueIdx()), DWELL_3D_MS);
+      setTimeout(() => tick(view, mod, nextQueueIdx(), layerState), settings.dwellMs);
     });
   }
 

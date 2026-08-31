@@ -53,17 +53,27 @@ Navara アダプタ `frontend/photo-journey-lite.js` が唯一の構成点。`LI
 | `multisampling` | 0 | MSAA無効 |
 | `halfFloat` | false | ポスト処理は低精度で十分 |
 | `picking` | false | タップ対象が無い |
-| `animation` | true | カメラ遷移があるため常時描画 |
+| `animation` | false | Navaraのon-demand render（flyTo/変更時のみ描画） |
 | `mobileOptimization` | true | モバイル向け軽量化を有効化 |
+| `cacheBytes` | 128 MiB | N100のタイルキャッシュ上限 |
+| `lodFog` / `dynamicSse` | 有効・粗め | 遠景を低LODにして可視タイルを抑制 |
+| `maxPendingRequests` | 4（`?low`: 2） | カメラ移動時のdecode/fetch burstを抑制 |
+
+`?low` では cacheBytes を64 MiB、worker heapを64 MiB、最大同時リクエストを2、
+LOD/SSEをさらに粗くし、カメラ高度を4,200m、飛行時間を1,200ms、地点の滞在を最低30秒
+（通常は16秒）にする。方位変更も止める。高度を上げるのは近景を拡大するためではなく、
+遠景LODを選ばせてN100のタイル数と更新回数を抑えるためである。
 
 **除外する効果（Lite では呼ばない）**: `DefaultPlugin.addDefaultPhotorealScene()`
 （SSR / SSAO / DOF / 大気散乱 / 雲 / ボリューム / 水面テクスチャ）。これらが参照する
 `@navaramap/three/dist/assets/`（大気・雲・ノイズ・水、計約38MB）はビルド成果物に
 **同梱しない**（バンドル内に `assets/` 参照は0件であることをテストで保証）。
 
-**タイル**: CDN（unpkg/jsdelivr/esm.sh）を使わず、既存の server.py プロキシ
-`{location.origin}/tiles/gsi/{z}/{x}/{y}.png` と `{location.origin}/tiles/osm/{z}/{x}/{y}.png`
-を使う。出典（GSI / OpenStreetMap）は `view.attribution.add()` で表示する。
+**タイル**: CDN（unpkg/jsdelivr/esm.sh）を使わず、既存の server.py プロキシを使う。
+同一地点ではraster basemapを**常に1層だけ**生成する。日本の経緯度範囲ならGSI、国外なら
+OSMを選び、巡回先が国境を跨ぐときは同じraster sourceのURLを`Source.update()`して切り替える。
+GSI/OSMを同時に全面fetchしないため、2560x1080での初期tile burstと240 tiles/min上流制限への
+到達を抑える。出典（GSI / OpenStreetMap）は `view.attribution.add()` で表示する。
 
 ## 5. 巡回（3dコントローラ）
 
@@ -77,8 +87,9 @@ Navara アダプタ `frontend/photo-journey-lite.js` が唯一の構成点。`LI
 3. `createPhotoJourneyView(#modelayer)` → `await view.init()` →
    `addPhotoJourneyLayers(view, {points, route})`。
 4. 巡回ループ: `nextQueueIdx()` → `markShown(i)` → `showPhoto(i)`（既存の写真カード +
-   AREA INTEL を再利用）→ `setMode('PHOTO JOURNEY')` → `flyPhotoJourneyCamera(...)`。
-   滞在は `DWELL_MS || 16000`（**約16秒周期の低頻度遷移**）、カメラ移動は約5秒。
+   AREA INTEL を再利用）→ `setMode('3D PHOTO JOURNEY LITE')` →
+   `flyPhotoJourneyCamera(...)`。通常滞在は約16秒、カメラ移動は5秒。低電力時は最低30秒滞在、
+   1.2秒移動、4,200mの高高度・固定方位とし、LODと更新頻度を下げる。
 
 **失敗時のフォールバック**: Navara / WASM / worker / WebGL の初期化に失敗したら
 `sessionStorage['geoframe.3d.fallback'] = '1'` を立てて `location.reload()` する。
@@ -93,15 +104,19 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
 
 - 依存はすべて**完全固定**（caret/tilde 無し）: `@navaramap/three@0.1.1`、
   `@navaramap/three-default-plugin@0.1.1`、`three@0.185.1`、`postprocessing@6.39.4`、
-  `vite@6.3.5`。
-- 生成物はコミット済み（`app/static/navara/`、計6ファイル・約45MB）:
-  - `photo-journey-lite.js`（エントリ/facade。5つの公開APIを再輸出）
+  `vite@6.4.3`。
+- 生成物はコミット済み（`app/static/navara/`、計9ファイル・約48MB）:
+  - `photo-journey-lite.js`（エントリ/facade。Liteの公開APIを再輸出）
   - `photo-journey-lite2.js`（メインバンドル。エンジンWASMをbase64内包）
   - `spark.module-*.js`（workerチャンク。動的importでロード）
-  - `navara_wasm_bg.wasm` / `navara_wasm_api_bg.wasm` / `navara_wasm_worker_bg.wasm`
+  - `navara-worker.js` / `navara-font-worker.js`（relative WASM URLを解決する実ファイルworker）
+  - `navara_wasm_bg.wasm` / `navara_wasm_api_bg.wasm` / `navara_wasm_worker_bg.wasm` /
+    `navara_wasm_font_worker_bg.wasm`
     （`\0asm` マジックを持つ実体。実行時の安全網を兼ねる）
-- ハッシュ付きファイル名を排し（`chunkFileNames: "[name].js"`）、2回ビルドして
-  md5 が一致することを確認済み（決定的）。
+- ハッシュ付きファイル名を排し（`chunkFileNames: "[name].js"`）、Navara 0.1.1に
+  内蔵されたdata: workerを`navara-worker.js`/`navara-font-worker.js`へ外出しする。
+  worker内のrelative WASM URLを実ファイルの`self.location.href`から解決できるようにする。
+  2回ビルドしてmd5が一致することを確認する（決定的）。
 
 `app/package.json` は `{"type": "commonjs"}` を宣言する。ルート `package.json` が
 `"type": "module"` を持つため、`app/tests/js/*.test.js`（CommonJS）が ESM 扱いされて

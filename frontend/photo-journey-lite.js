@@ -18,34 +18,77 @@
      - view.addLayer({ type: "raster" | "vector", source, ... })
      - view.setCamera({ lng, lat, height, heading, pitch, roll })
      - view.flyTo({ lng, lat, height, pitch, heading }, { duration })
+     - source.update({ type: "raster-tile", url, ... })
      - view.attribution?.add([{ attribution, attributionUrl }])
    ============================================================ */
 import ThreeView from "@navaramap/three";
 import { DefaultPlugin } from "@navaramap/three-default-plugin";
 
-/* 軽量構成。N100 実機の 30fps / 24fps ターゲットを守るための上限値。 */
-export const LITE_OPTIONS = Object.freeze({
+/* 軽量構成。N100相当の内蔵GPUでタイルの先読みと常時描画を抑える上限値。 */
+const NORMAL_OPTIONS = Object.freeze({
   pixelRatio: 1,        // devicePixelRatio の上限（高DPIでも1に固定）
   shadow: false,        // 影は初期化時オプション。N100 では無効
   multisampling: 0,     // MSAA 無効（0）
   halfFloat: false,     // ポスト処理は低精度で十分
   picking: false,       // フィーチャーピッキング無効（タップ対象が無い）
-  animation: true,      // 常時描画（カメラ遷移があるため）
+  animation: false,     // flyTo/forceUpdate時だけ描画（Navaraのon-demand mode）
   mobileOptimization: true, // 低画素比などのモバイル向け軽量化を有効化
+  cacheBytes: 128 * 1024 * 1024,
+  lodFog: { enabled: true, density: 5e-4, sseFactor: 4 },
+  dynamicSse: {
+    enabled: true, density: 2e-4, sseFactor: 32,
+    heightFalloff: 0.25, minHeight: 0, maxHeight: 8000,
+  },
+  memoryBudget: {
+    maxWorkerHeapBytes: 128 * 1024 * 1024,
+    fontBudgetBytes: 8 * 1024 * 1024,
+    maxPendingRequests: 4,
+    sseMultiplierMin: 2,
+    sseMultiplierMax: 24,
+  },
 });
+
+const LOW_POWER_OPTIONS = Object.freeze({
+  ...NORMAL_OPTIONS,
+  cacheBytes: 64 * 1024 * 1024,
+  lodFog: { enabled: true, density: 1e-1, sseFactor: 12 },
+  dynamicSse: {
+    enabled: true, density: 5e-4, sseFactor: 48,
+    heightFalloff: 0.15, minHeight: 0, maxHeight: 6000,
+  },
+  memoryBudget: {
+    maxWorkerHeapBytes: 64 * 1024 * 1024,
+    fontBudgetBytes: 4 * 1024 * 1024,
+    maxPendingRequests: 2,
+    sseMultiplierMin: 8,
+    sseMultiplierMax: 48,
+  },
+});
+
+export const LITE_OPTIONS = NORMAL_OPTIONS;
+export const LOW_POWER_LITE_OPTIONS = LOW_POWER_OPTIONS;
+
+export function getLiteOptions({ low = false } = {}) {
+  return low ? LOW_POWER_OPTIONS : NORMAL_OPTIONS;
+}
 
 /* ThreeView を生成し DefaultPlugin を登録する。init() は呼び出し側で await する。
    ※ addDefaultPhotorealScene() は意図的に呼ばない（大気・雲・SSR/SSAO/DOF を排除）。 */
 export function createPhotoJourneyView(container, opts = {}) {
+  const defaults = getLiteOptions({ low: opts.low });
   const view = new ThreeView({
     container,
-    pixelRatio: Math.min(opts.pixelRatio ?? LITE_OPTIONS.pixelRatio, 1),
-    shadow: opts.shadow ?? LITE_OPTIONS.shadow,
-    multisampling: opts.multisampling ?? LITE_OPTIONS.multisampling,
-    halfFloat: opts.halfFloat ?? LITE_OPTIONS.halfFloat,
-    picking: opts.picking ?? LITE_OPTIONS.picking,
-    animation: opts.animation ?? LITE_OPTIONS.animation,
-    mobileOptimization: opts.mobileOptimization ?? LITE_OPTIONS.mobileOptimization,
+    pixelRatio: Math.min(opts.pixelRatio ?? defaults.pixelRatio, 1),
+    shadow: opts.shadow ?? defaults.shadow,
+    multisampling: opts.multisampling ?? defaults.multisampling,
+    halfFloat: opts.halfFloat ?? defaults.halfFloat,
+    picking: opts.picking ?? defaults.picking,
+    animation: opts.animation ?? defaults.animation,
+    mobileOptimization: opts.mobileOptimization ?? defaults.mobileOptimization,
+    cacheBytes: opts.cacheBytes ?? defaults.cacheBytes,
+    lodFog: opts.lodFog ?? defaults.lodFog,
+    dynamicSse: opts.dynamicSse ?? defaults.dynamicSse,
+    memoryBudget: opts.memoryBudget ?? defaults.memoryBudget,
   });
   view.addPlugin(new DefaultPlugin());
   return view;
@@ -53,25 +96,41 @@ export function createPhotoJourneyView(container, opts = {}) {
 
 /* 写真ポイント・ライトルート線・背景タイルをレイヤとして追加する。
    tileUrls は server.py の /tiles/{gsi,osm}/ プロキシを指す（CDN は使わない）。 */
-export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls = {} } = {}) {
+function isDomesticPoint(point) {
+  return !!point && point.lon >= 122.5 && point.lon <= 154.5 &&
+    point.lat >= 20.0 && point.lat <= 46.5;
+}
+
+export function selectPhotoJourneyBasemap(point) {
+  return isDomesticPoint(point) ? "gsi" : "osm";
+}
+
+function rasterDefinition(kind, urls) {
+  return {
+    type: "raster-tile",
+    url: urls[kind],
+    minZoom: kind === "gsi" ? 5 : 0,
+    maxZoom: kind === "gsi" ? 18 : 19,
+  };
+}
+
+export function updatePhotoJourneyBasemap(state, point) {
+  const next = selectPhotoJourneyBasemap(point);
+  if (!state || state.kind === next) return state;
+  state.source.update(rasterDefinition(next, state.urls));
+  state.kind = next;
+  return state;
+}
+
+export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls = {}, basemap } = {}) {
   const origin = typeof location !== "undefined" ? location.origin : "";
-  const gsiUrl = tileUrls.gsi || `${origin}/tiles/gsi/{z}/{x}/{y}.png`;
-  const osmUrl = tileUrls.osm || `${origin}/tiles/osm/{z}/{x}/{y}.png`;
-
-  const gsi = view.addSource({
-    type: "raster-tile",
-    url: gsiUrl,
-    minZoom: 5,
-    maxZoom: 18,
-  });
-  view.addLayer({ type: "raster", source: gsi });
-
-  const osm = view.addSource({
-    type: "raster-tile",
-    url: osmUrl,
-    maxZoom: 19,
-  });
-  view.addLayer({ type: "raster", source: osm });
+  const urls = {
+    gsi: tileUrls.gsi || `${origin}/tiles/gsi/{z}/{x}/{y}.png`,
+    osm: tileUrls.osm || `${origin}/tiles/osm/{z}/{x}/{y}.png`,
+  };
+  const kind = basemap || selectPhotoJourneyBasemap(points[0] || route[0]);
+  const raster = view.addSource(rasterDefinition(kind, urls));
+  view.addLayer({ type: "raster", source: raster });
 
   const features = points.map((p) => ({
     type: "Feature",
@@ -105,6 +164,8 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
       },
     ]);
   }
+
+  return { basemap: { kind, source: raster, urls } };
 }
 
 /* カメラを即時配置する。height はメートル（楕円体からの高度）。 */
@@ -114,5 +175,5 @@ export function setPhotoJourneyCamera(view, { lng, lat, height = 2000, pitch = -
 
 /* カメラを指定地点へ低頻度で飛ばす。完了時に true（別カメラ操作で割り込まれたら false）。 */
 export function flyPhotoJourneyCamera(view, { lng, lat, height = 2000, pitch = -30, heading = 0 }, options = {}) {
-  return view.flyTo({ lng, lat, height, pitch, heading }, { duration: options.duration || 4000 });
+  return view.flyTo({ lng, lat, height, pitch, heading }, { duration: options.duration ?? 4000 });
 }
