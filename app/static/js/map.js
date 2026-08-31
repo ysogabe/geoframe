@@ -42,7 +42,29 @@ function wantOsm(lon, lat, zoom){ return !(inJapan(lon, lat) && zoom>=GSI_MINZOO
 /* 初期表示分もここで決める（起動直後に国内OSMを1画面分取りに行くのを防ぐ） */
 let osmVisible = wantOsm(PHOTOS[0].lon, PHOTOS[0].lat, 14.2);
 
-const map = new maplibregl.Map({
+/* 3D PHOTO JOURNEY Lite（?mode=3d）では MapLibre を生成せず、Navara の
+   ThreeView が #modelayer に描画する。他の全ファイルがトップレベルで
+   map.on(...) / map.project(...) 等を呼ぶため、同じ呼び出し面を満たす
+   スタブを返す（実体は無いので全メソッドは no-op / 固定値）。 */
+function makeMapStub(){
+  const noop = () => {};
+  const canvasStub = { addEventListener: noop, removeEventListener: noop };
+  return {
+    on: noop, off: noop,
+    project: () => ({ x: 0, y: 0 }),
+    getBearing: () => 0,
+    getZoom: () => 14.2,
+    getCenter: () => ({ lng: PHOTOS[0].lon, lat: PHOTOS[0].lat }),
+    flyTo: noop, jumpTo: noop, fitBounds: noop,
+    addSource: noop, addLayer: noop,
+    getLayer: () => undefined,
+    getSource: () => null,
+    setLayoutProperty: noop, setPaintProperty: noop,
+    getCanvas: () => canvasStub,
+  };
+}
+
+const map = window.GEOFRAME_MODE_3D ? makeMapStub() : new maplibregl.Map({
   container:'map',
   style:{ version:8, sources:{
       osm:{ type:'raster', tiles:[OSM_TILES],

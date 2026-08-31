@@ -98,7 +98,7 @@ function triggerEvent(a){
       : `<div class="ph" style="background:linear-gradient(135deg,#3a0a22,#12060f)"><span class="label">NO IMAGE</span></div>`;
     eventCard('▸ RARE AIRCRAFT', img, `${a.callsign||a.hex} ${a.type?'['+a.type+']':''}`,
       `REG ${a.reg||'?'}  ALT ${a.alt??'?'}ft  GS ${a.gs??'?'}kt\n${a.owner||'OPERATOR UNKNOWN'}`);
-    document.getElementById('mode').textContent='MODE: INTERCEPT';
+    setMode('INTERCEPT');
   }else if(a.match){
     bar.className='match'; bar.style.display='block';
     bar.textContent = `MEMORY LINK: ${a.callsign} → ${a.route.to.iata} ${a.route.to.city}`;
@@ -106,10 +106,10 @@ function triggerEvent(a){
     eventCard('▸ MEMORY LINK', `<img src="${m.file}" onerror="this.remove()">`,
       m.title,
       `${a.callsign} は ${a.route.to.city} 行き\nあなたの写真: ${m.place||m.title}（${m.time||'—'}）  空港から${m.km}km`);
-    document.getElementById('mode').textContent='MODE: MEMORY LINK';
+    setMode('MEMORY LINK');
   }
   setTimeout(()=>{ bar.style.display='none';
-    document.getElementById('mode').textContent='MODE: PHOTO JOURNEY'; }, EVENT_MS);
+    setMode('PHOTO JOURNEY'); }, EVENT_MS);
   return true;
 }
 
@@ -221,10 +221,10 @@ async function loadEnv(){
       eventCard('▸ SEISMIC EVENT',
         `<div class="ph" style="background:linear-gradient(135deg,#3a0a22,#12060f)"><span class="label">JMA QUAKE FEED</span></div>`,
         `${q.place}`, `M${q.mag}  最大震度${q.maxi}  ${q.time}\n出典: 気象庁`);
-      document.getElementById('mode').textContent='MODE: SEISMIC WATCH';
+      setMode('SEISMIC WATCH');
       showHazard(q.lat, q.lon);   // 防災レイヤ（洪水・津波・土砂・液状化等）を重畳
       setTimeout(()=>{ bar.style.display='none';
-        document.getElementById('mode').textContent='MODE: PHOTO JOURNEY'; }, EQ_EVENT_MS);
+        setMode('PHOTO JOURNEY'); }, EQ_EVENT_MS);
     }
   }
   envFirst=false;

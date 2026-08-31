@@ -54,3 +54,22 @@
 背景地図タイル（OpenStreetMap / 地理院タイル）はここには置かない。
 `server.py` の `/tiles/{osm,gsi}/{z}/{x}/{y}.png` プロキシが取得し、
 `GEOFRAME_DATA_DIR/tile_cache/`（開発時の既定は `app/var/tile_cache/`） にファイルキャッシュする（版管理対象外）。
+
+## Navara（3D PHOTO JOURNEY Lite）の生成物について
+
+`?mode=3d` 用の Navara（@navaramap/three）は **vendor/ には置かず**、
+npm 依存（ルート `package.json`、全バージョン完全固定）から `npm run build:navara`
+（vite）で `app/static/navara/` へ**決定的に生成しコミットする**（計6ファイル・約45MB）。
+
+| 依存 | バージョン | 備考 |
+|---|---|---|
+| `@navaramap/three` | 0.1.1 | ThreeView（Rust/WASMコア） |
+| `@navaramap/three-default-plugin` | 0.1.1 | DefaultPlugin。`addDefaultPhotorealScene()` は呼ばない |
+| `three` | 0.185.1 | three 本体 |
+| `postprocessing` | 6.39.4 | ポスト処理（LiteではhalfFloat無効で使用） |
+
+- タイルは CDN を使わず、上記 `/tiles/{gsi,osm}/` プロキシを指す（出典は
+  `view.attribution` に GSI / OSM を登録）。
+- `@navaramap/three/dist/assets/`（大気・雲・ノイズ・水のテクスチャ）は参照されない
+  ため**同梱しない**（バンドル内に `assets/` 参照0件をテストで保証）。
+- 詳細は `docs/roadmap/3d-photo-journey-lite.md` を参照。

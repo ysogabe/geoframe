@@ -20,6 +20,9 @@ map.on('load', ()=>{ tryAddLayers(); startOnce(); });
 map.on('styledata', tryAddLayers);
 setTimeout(()=>{ tryAddLayers(); startOnce(); }, 4500);
 function start(){
+  // 3D PHOTO JOURNEY Lite（?mode=3d）では MapLibre の巡回・イベント・パネルを
+  // 起動しない。初期化と巡回は static/js/photo-journey-lite.js（3dコントローラ）が行う。
+  if(window.GEOFRAME_MODE_3D) return;
   // manifest反映後のデータでレイヤ・カメラ・ティッカーを整える
   if(!usingMock && layersAdded){
     try{ map.getSource('mock').setData(mockPolys()); map.getSource('pts').setData(ptsData()); }catch(e){}

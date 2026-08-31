@@ -138,7 +138,7 @@ async function pollPresence(){
   if(off!==sleeping){
     sleeping=off;
     document.getElementById('sleep').classList.toggle('on', off);
-    document.getElementById('mode').textContent = off?'MODE: SLEEP':'MODE: PHOTO JOURNEY';
+    setMode(off?'SLEEP':'PHOTO JOURNEY');
   }
 }
 
@@ -150,7 +150,7 @@ function showTripIntro(tid){
   markerEl.style.display='none';
   document.getElementById('statspanel').classList.add('hidden');
   setPrefVisible(false);     // 制覇マップは統計カットの間だけ出す
-  document.getElementById('mode').textContent='MODE: TRIP REPLAY';
+  setMode('TRIP REPLAY');
   const b=tr.bounds;
   armBase((b[0]+b[2])/2, (b[1]+b[3])/2, fitZoom(b, 11));
   map.fitBounds([[b[0],b[1]],[b[2],b[3]]],
@@ -184,7 +184,7 @@ function statsCamera(){
 function showStats(){
   if(!STATS || !STATS.total) return false;
   statsCamera();
-  document.getElementById('mode').textContent='MODE: TRAVEL STATS';
+  setMode('TRAVEL STATS');
   const sp=document.getElementById('statspanel');
   sp.classList.remove('hidden');
   // ★週間予報カットと同じパネルを使い回しているので、必ず .wk を外して見出しも戻す
@@ -235,7 +235,7 @@ function showWeekly(){
   if(!wk.length) return false;
   statsCamera();
   setPrefVisible(false);      // 制覇マップは統計カット専用
-  document.getElementById('mode').textContent='MODE: WEEKLY FORECAST';
+  setMode('WEEKLY FORECAST');
   const sp=document.getElementById('statspanel');
   sp.classList.remove('hidden');
   sp.classList.add('wk');
