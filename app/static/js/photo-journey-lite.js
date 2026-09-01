@@ -70,6 +70,9 @@
     try{
       view = mod.createPhotoJourneyView(container, { low: settings.low });
       await view.init();               // WebGLコンテキスト生成（失敗時はthrow→フォールバック）
+      // ライトを省いたLite構成でlitのまま描くとLambert BRDFにより航空写真が約1/πまで
+      // 暗くなる。地表は照明演出より判読性を優先し、テクスチャ本来の色で表示する。
+      view.lit = false;
       const { points, route } = toPoints();
 
       /* raster layer は追加時点のカメラから可視タイルを選ぶ。ThreeView の既定カメラの

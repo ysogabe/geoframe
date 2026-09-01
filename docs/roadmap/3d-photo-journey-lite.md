@@ -56,13 +56,17 @@ Navara アダプタ `frontend/photo-journey-lite.js` が唯一の構成点。`LI
 | `animation` | false | Navaraのon-demand render（flyTo/変更時のみ描画） |
 | `mobileOptimization` | true | モバイル向け軽量化を有効化 |
 | `cacheBytes` | 128 MiB | N100のタイルキャッシュ上限 |
-| `lodFog` / `dynamicSse` | 有効・粗め | 遠景を低LODにして可視タイルを抑制 |
+| `lodFog` / `dynamicSse` | 通常: 無効、`?low`: 有効・粗め | 通常は地点判読、lowは負荷削減を優先 |
 | `maxPendingRequests` | 4（`?low`: 2） | カメラ移動時のdecode/fetch burstを抑制 |
 
 `?low` では cacheBytes を64 MiB、worker heapを64 MiB、最大同時リクエストを2、
 LOD/SSEをさらに粗くし、カメラ高度を4,200m、飛行時間を1,200ms、地点の滞在を最低30秒
 （通常は16秒）にする。方位変更も止める。高度を上げるのは近景を拡大するためではなく、
 遠景LODを選ばせてN100のタイル数と更新回数を抑えるためである。
+
+通常表示では航空写真から撮影地点を判別できることを優先し、距離・傾斜によるLOD緩和と
+常時SSE倍率を無効化する。またLite構成はライトを追加しないため、地表を`unlit`にして
+Lambert BRDFによる暗化を避け、航空写真テクスチャ本来の色で表示する。
 
 **除外する効果（Lite では呼ばない）**: `DefaultPlugin.addDefaultPhotorealScene()`
 （SSR / SSAO / DOF / 大気散乱 / 雲 / ボリューム / 水面テクスチャ）。これらが参照する

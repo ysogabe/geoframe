@@ -106424,11 +106424,13 @@ const eU = Object.freeze({
   mobileOptimization: !0,
   // 低画素比などのモバイル向け軽量化を有効化
   cacheBytes: 128 * 1024 * 1024,
-  lodFog: { enabled: !0, density: 5e-4, sseFactor: 4 },
+  // 通常表示は撮影地点を判別できる航空写真LODを優先する。
+  // 低スペック向けの粗いLODはLOW_POWER_OPTIONSだけで有効にする。
+  lodFog: { enabled: !1, density: 0, sseFactor: 0 },
   dynamicSse: {
-    enabled: !0,
-    density: 2e-4,
-    sseFactor: 32,
+    enabled: !1,
+    density: 0,
+    sseFactor: 0,
     heightFalloff: 0.25,
     minHeight: 0,
     maxHeight: 8e3
@@ -106437,8 +106439,8 @@ const eU = Object.freeze({
     maxWorkerHeapBytes: 128 * 1024 * 1024,
     fontBudgetBytes: 8 * 1024 * 1024,
     maxPendingRequests: 4,
-    sseMultiplierMin: 2,
-    sseMultiplierMax: 24
+    sseMultiplierMin: 1,
+    sseMultiplierMax: 8
   }
 }), ql = Object.freeze({
   ...eU,
@@ -106518,7 +106520,17 @@ function OyA(g, { points: A = [], route: B = [], tileUrls: I = {}, basemap: Q } 
     type: "geojson",
     data: { type: "FeatureCollection", features: t }
   });
-  return g.addLayer({ type: "vector", source: e, point: { color: 58879 } }), g.addLayer({ type: "vector", source: e, polyline: { color: 58879 } }), g.attribution && g.attribution.add([
+  return g.addLayer({ type: "vector", source: e, point: { color: 58879 } }), g.addLayer({
+    type: "vector",
+    source: e,
+    polyline: {
+      color: 58879,
+      width: 1.5,
+      maxWidth: 2,
+      opacity: 0.35,
+      transparent: !0
+    }
+  }), g.attribution && g.attribution.add([
     {
       attribution: "航空・衛星画像: 国土地理院 / データソース: Landsat8画像（GSI, TSIC, GEO Grid/AIST）、Landsat8画像（courtesy of the U.S. Geological Survey）、海底地形（GEBCO）",
       attributionUrl: "https://maps.gsi.go.jp/development/ichiran.html"

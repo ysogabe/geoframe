@@ -34,17 +34,19 @@ const NORMAL_OPTIONS = Object.freeze({
   animation: false,     // flyTo/forceUpdate時だけ描画（Navaraのon-demand mode）
   mobileOptimization: true, // 低画素比などのモバイル向け軽量化を有効化
   cacheBytes: 128 * 1024 * 1024,
-  lodFog: { enabled: true, density: 5e-4, sseFactor: 4 },
+  // 通常表示は撮影地点を判別できる航空写真LODを優先する。
+  // 低スペック向けの粗いLODはLOW_POWER_OPTIONSだけで有効にする。
+  lodFog: { enabled: false, density: 0, sseFactor: 0 },
   dynamicSse: {
-    enabled: true, density: 2e-4, sseFactor: 32,
+    enabled: false, density: 0, sseFactor: 0,
     heightFalloff: 0.25, minHeight: 0, maxHeight: 8000,
   },
   memoryBudget: {
     maxWorkerHeapBytes: 128 * 1024 * 1024,
     fontBudgetBytes: 8 * 1024 * 1024,
     maxPendingRequests: 4,
-    sseMultiplierMin: 2,
-    sseMultiplierMax: 24,
+    sseMultiplierMin: 1,
+    sseMultiplierMax: 8,
   },
 });
 
@@ -149,7 +151,14 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
     data: { type: "FeatureCollection", features },
   });
   view.addLayer({ type: "vector", source: geo, point: { color: 0x00e5ff } });
-  view.addLayer({ type: "vector", source: geo, polyline: { color: 0x00e5ff } });
+  view.addLayer({
+    type: "vector",
+    source: geo,
+    polyline: {
+      color: 0x00e5ff, width: 1.5, maxWidth: 2,
+      opacity: 0.35, transparent: true,
+    },
+  });
 
   // 出典表示（地理院タイル / OSM）。CDN に頼らずサーバー由来のタイルでも出典は必須。
   if (view.attribution) {

@@ -162,11 +162,15 @@ assert.strictEqual(LITE_OPTIONS.multisampling, 0, 'MSAA無効');
 assert.strictEqual(LITE_OPTIONS.halfFloat, false, 'halfFloat無効');
 assert.strictEqual(LITE_OPTIONS.animation, false, '常時60fpsではなく変更時描画');
 assert.strictEqual(LITE_OPTIONS.cacheBytes, 128 * 1024 * 1024, '通常cacheBytesに上限を設定');
-assert.ok(LITE_OPTIONS.lodFog.sseFactor > 2, '通常LODを粗くして遠景タイルを抑制');
+assert.strictEqual(LITE_OPTIONS.lodFog.enabled, false, '通常表示は航空写真の詳細LODを維持する');
+assert.strictEqual(LITE_OPTIONS.dynamicSse.enabled, false, '通常表示では傾斜時も航空写真を粗くしない');
+assert.strictEqual(LITE_OPTIONS.memoryBudget.sseMultiplierMin, 1, '通常表示の基礎SSEを劣化させない');
 const LOW_POWER_LITE_OPTIONS = vm.runInContext('LOW_POWER_LITE_OPTIONS', feContext);
 assert.ok(LOW_POWER_LITE_OPTIONS.cacheBytes < LITE_OPTIONS.cacheBytes, 'LOW_POWERはcacheBytesをさらに下げる');
 assert.ok(LOW_POWER_LITE_OPTIONS.memoryBudget.maxPendingRequests < LITE_OPTIONS.memoryBudget.maxPendingRequests,
   'LOW_POWERは同時リクエスト数をさらに下げる');
+assert.strictEqual(LOW_POWER_LITE_OPTIONS.lodFog.enabled, true, 'LOW_POWERだけLOD緩和を有効にする');
+assert.ok(LOW_POWER_LITE_OPTIONS.memoryBudget.sseMultiplierMin > 1, 'LOW_POWERは基礎SSEを粗くする');
 
 const createPhotoJourneyView = vm.runInContext('createPhotoJourneyView', feContext);
 const lowView = createPhotoJourneyView({ id: 'modelayer' }, { low: true });
@@ -262,6 +266,7 @@ runInContext(controllerSrc, { window: { GEOFRAME_MODE_3D: false } });
 assert.ok(/if\(!window\.GEOFRAME_MODE_3D\) return;/.test(controllerSrc), '3Dでなければ即returnする');
 // Navara バンドルを遅延ロード（通常URLではこの行に到達しない）
 assert.ok(controllerSrc.includes("import('/static/navara/photo-journey-lite.js')"), 'Navaraを遅延ロードする');
+assert.ok(controllerSrc.includes('view.lit = false'), 'ライト無しLiteでは航空写真を原色表示する');
 // 一度きりのフォールバックガード（フラグを立ててリロード。bootstrap.jsがmodeを剥がす）
 assert.ok(controllerSrc.includes("sessionStorage.setItem('geoframe.3d.fallback', '1')"), 'フォールバックフラグを立てる');
 assert.ok(/location\.reload\(\)/.test(controllerSrc), '失敗時はリロードする');
