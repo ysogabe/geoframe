@@ -88624,7 +88624,7 @@ void main() {
     float intensity = pow( max(coefficient - facing_ratio, 0.0), exponent );
 
     gl_FragColor = vec4(glowColor.rgb, glowColor.a * intensity);
-}`, JFA = `out vec3 vNormal;
+}`, JFA = `out vec3 vNormal; 
 out vec3 vPos; 
 
 void main() {
@@ -92513,7 +92513,7 @@ var fQ = {
   onDestroy() {
     this.pickWrapper && (this.pickWrapper = (this.ctx.unregisterPickableMesh(this.id), void 0)), super.onDestroy();
   }
-}, $MA = `const float ATMOSPHERE_CUTOFF_ALTITUDE_LOW = 100000.0;
+}, $MA = `const float ATMOSPHERE_CUTOFF_ALTITUDE_LOW = 100000.0; 
 const float ATMOSPHERE_CUTOFF_ALTITUDE_HIGH = ATMOSPHERE_CUTOFF_ALTITUDE_LOW + 90000.0; 
 
 uniform vec3 uDayColor;
