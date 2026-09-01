@@ -267,6 +267,8 @@ assert.ok(/if\(!window\.GEOFRAME_MODE_3D\) return;/.test(controllerSrc), '3Dで�
 // Navara バンドルを遅延ロード（通常URLではこの行に到達しない）
 assert.ok(controllerSrc.includes("import('/static/navara/photo-journey-lite.js')"), 'Navaraを遅延ロードする');
 assert.ok(controllerSrc.includes('view.lit = false'), 'ライト無しLiteでは航空写真を原色表示する');
+assert.ok(controllerSrc.includes('requestLodRefinement(view)'), 'on-demand描画でも航空写真LODを精細化する');
+assert.ok(controllerSrc.includes('setInterval'), '常時描画ではなく期限付きの精細化バーストを使う');
 // 一度きりのフォールバックガード（フラグを立ててリロード。bootstrap.jsがmodeを剥がす）
 assert.ok(controllerSrc.includes("sessionStorage.setItem('geoframe.3d.fallback', '1')"), 'フォールバックフラグを立てる');
 assert.ok(/location\.reload\(\)/.test(controllerSrc), '失敗時はリロードする');

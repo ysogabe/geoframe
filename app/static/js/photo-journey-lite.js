@@ -29,6 +29,24 @@
     low: !!window.LOW_POWER, dwellMs: DWELL_MS || 16000, flyMs: 5000,
     height: 1800, pitch: -32, headingStep: 47,
   };
+  let refinementTimer = null;
+
+  /* animation:falseでは、非同期で親タイルが届いた後の次LOD選択が自動で進まない場合がある。
+     常時描画には戻さず、カメラ配置・到着後だけ低頻度で更新してZ14以上まで精細化する。 */
+  function requestLodRefinement(view){
+    if(refinementTimer) clearInterval(refinementTimer);
+    const duration = settings.low ? 1200 : 8000;
+    const interval = settings.low ? 400 : 200;
+    const endAt = performance.now() + duration;
+    view.forceUpdate?.();
+    refinementTimer = setInterval(()=>{
+      view.forceUpdate?.();
+      if(performance.now() >= endAt){
+        clearInterval(refinementTimer);
+        refinementTimer = null;
+      }
+    }, interval);
+  }
 
   /* Navara/WASM/worker/WebGL の初期化失敗時の一度きりのフォールバック。
      bootstrap.js は geoframe.3d.fallback==='1' を検知すると mode=3d を剥がして
@@ -90,7 +108,7 @@
         });
       }
       layerState = mod.addPhotoJourneyLayers(view, { points, route });
-      view.forceUpdate?.();
+      requestLodRefinement(view);
     }catch(e){ return fallbackToMapLibre(e); }
 
     // The initial setCamera above is intentionally the first frame. Calling
@@ -111,7 +129,7 @@
     const heading = settings.headingStep ? (i * settings.headingStep) % 360 : 0;
     if(layerState && mod.updatePhotoJourneyBasemap){
       mod.updatePhotoJourneyBasemap(layerState.basemap, p);
-      view.forceUpdate?.();
+      requestLodRefinement(view);
     }
     if(initial){
       // Let the camera placed before layer registration own the first view.
@@ -125,7 +143,7 @@
         { lng: p.lon, lat: p.lat, height, pitch: settings.pitch, heading },
         { duration: settings.flyMs }
       )
-    ).catch(()=>{}).finally(()=>{
+    ).then(()=> requestLodRefinement(view)).catch(()=>{}).finally(()=>{
       setTimeout(() => tick(view, mod, nextQueueIdx(), layerState), settings.dwellMs);
     });
   }

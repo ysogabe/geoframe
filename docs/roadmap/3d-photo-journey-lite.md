@@ -67,6 +67,8 @@ LOD/SSEをさらに粗くし、カメラ高度を4,200m、飛行時間を1,200ms
 通常表示では航空写真から撮影地点を判別できることを優先し、距離・傾斜によるLOD緩和と
 常時SSE倍率を無効化する。またLite構成はライトを追加しないため、地表を`unlit`にして
 Lambert BRDFによる暗化を避け、航空写真テクスチャ本来の色で表示する。
+`animation:false`のon-demand描画で親タイル到着後のLOD更新が止まらないよう、カメラ配置・
+到着後だけ8秒間、200ms間隔で`forceUpdate()`する。常時描画は行わず、精細化後は停止する。
 
 **除外する効果（Lite では呼ばない）**: `DefaultPlugin.addDefaultPhotorealScene()`
 （SSR / SSAO / DOF / 大気散乱 / 雲 / ボリューム / 水面テクスチャ）。これらが参照する
