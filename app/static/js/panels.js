@@ -4,7 +4,7 @@
    ※読み込み順が契約: events.js の後（ENV を参照する buildTicker を含むため）
    宣言する主なグローバル: DAYS, buildTicker, eventCard, ENV_LABELS, fmtEnvVal,
                            pollRoomEnv, sleeping, nightMode, isNightByClock,
-                           applyNight, pollPresence, lastIntroTrip,
+                           applyNight, pollPresence, startLivePanels, lastIntroTrip,
                            showTripIntro, STATS_EVERY, STATS, loadStats,
                            statsCamera, showStats, WK_DAYS, WX_ICON, WX_TEXT,
                            wxIcon, wxText, showWeekly
@@ -140,6 +140,19 @@ async function pollPresence(){
     document.getElementById('sleep').classList.toggle('on', off);
     setMode(off?'SLEEP':'PHOTO JOURNEY');
   }
+}
+
+/* ==== 常時更新するライブHUD ====
+   MapLibreと3Dのどちらでも、ADS-B・天気・在不在・HA室内環境は同じDOMカードを使う。
+   起動経路が複数あってもintervalを二重登録しないよう、この入口で一度だけ開始する。 */
+let livePanelsStarted = false;
+function startLivePanels(){
+  if(livePanelsStarted) return;
+  livePanelsStarted = true;
+  pollAircraft(); setInterval(pollAircraft, ADSB_POLL);
+  loadEnv(); setInterval(loadEnv, 300000);
+  pollPresence(); setInterval(pollPresence, 15000);
+  pollRoomEnv(); setInterval(pollRoomEnv, 60000);
 }
 
 /* ==== TRIP REPLAY（旅行クラスタのイントロ） ==== */

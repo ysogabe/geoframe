@@ -273,6 +273,8 @@ assert.ok(/location\.reload\(\)/.test(controllerSrc), '失敗時はリロード�
 // 低頻度カメラ遷移と、既存HUD/写真カードの再利用
 assert.ok(controllerSrc.includes('settings.dwellMs'), '設定値で低頻度の滞在時間を制御する');
 assert.ok(controllerSrc.includes('showPhoto(i)'), '既存の写真カードを再利用する');
+assert.ok(controllerSrc.includes('startLivePanels()'),
+  '3DでもHA室内環境・ADS-B・天気・在不在のライブHUDを開始する');
 assert.ok(controllerSrc.includes("setMode('3D PHOTO JOURNEY LITE')"), '3D表示ラベルを明示する');
 assert.ok(!controllerSrc.includes("setMode('PHOTO JOURNEY')"), '3Dで旧ラベルを使わない');
 assert.ok(controllerSrc.indexOf('mod.setPhotoJourneyCamera(view') < controllerSrc.indexOf('mod.addPhotoJourneyLayers(view'),
@@ -284,5 +286,20 @@ assert.ok(controllerSrc.includes('tick(view, mod, first, layerState, true)'),
 assert.ok(controllerSrc.includes('function tick(view, mod, i, layerState, initial = false)'),
   '初回カメラと通常のflyToを区別する');
 assert.ok(controllerSrc.includes('if(initial){'), '初回はflyToをスキップしてタイル選択を安定させる');
+
+// MapLibreを持たない3Dで機影・地震リングを左上(0,0)へ誤投影しない。
+const eventsSrc = fs.readFileSync('static/js/events.js', 'utf8');
+assert.ok(/function syncAircraft\(\)\{\s*\/\/[^]*?if\(window\.GEOFRAME_MODE_3D\) return;/.test(eventsSrc),
+  '3DではMapLibre用の航空機マーカーを描画しない');
+assert.ok(/function syncQuakes\(\)\{\s*\/\/[^]*?if\(window\.GEOFRAME_MODE_3D\) return;/.test(eventsSrc),
+  '3DではMapLibre用の地震リングを描画しない');
+
+// 通常/3Dの両起動経路が同じ一度きりのライブHUD入口を使う。
+const panelsSrc = fs.readFileSync('static/js/panels.js', 'utf8');
+const mainSrc = fs.readFileSync('static/js/main.js', 'utf8');
+assert.ok(/let livePanelsStarted = false;/.test(panelsSrc), 'ライブHUD開始処理に二重起動ガードがある');
+for(const call of ['pollAircraft()', 'loadEnv()', 'pollPresence()', 'pollRoomEnv()'])
+  assert.ok(panelsSrc.includes(call), `ライブHUD入口が${call}を開始する`);
+assert.ok(mainSrc.includes('startLivePanels()'), '通常モードも共通のライブHUD入口を使う');
 
 console.log('photo-journey-lite: OK');

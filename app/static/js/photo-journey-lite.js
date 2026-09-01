@@ -9,7 +9,7 @@
        DWELL_MS/LOW_POWER (config.js), PHOTOS/usingMock/manifestReady/reindexPhotos (data.js),
        playQueue/loadPlayState/syncSchedule/buildPlayOrder/nextQueueIdx/markShown
        (scheduler-core.js), showPhoto (photocard.js), setMode (modes.js),
-       buildTicker (panels.js)
+       buildTicker/startLivePanels (panels.js)
 
    役割:
      - ?mode=3d のときだけ Navara ThreeView（app/static/navara/ の自己完結バンドル）を
@@ -71,6 +71,7 @@
     syncSchedule();
     if(!playQueue.length) buildPlayOrder();
     buildTicker();   // HUDティッカーは通常モードと共通
+    startLivePanels(); // HA室内環境・ADS-B・天気・在不在も通常モードと共通
     setMode('3D PHOTO JOURNEY LITE');
 
     // Navara バンドルを遅延ロード（通常URLではここに到達しない）

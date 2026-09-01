@@ -41,6 +41,9 @@ function pruneCooldown(){
 }
 
 function syncAircraft(){
+  // 3DではMapLibreの投影座標が存在しない。AIR TRAFFICカードは表示するが、
+  // 機影DOMを(0,0)へ重ねて誤表示しないよう地図上マーカーだけを止める。
+  if(window.GEOFRAME_MODE_3D) return;
   const layer = document.getElementById('aclayer');
   const seen = new Set();
   aircraft.forEach(a=>{
@@ -180,6 +183,9 @@ function rememberEq(eid){
   for(const k of seenEq){ if(seenEq.size <= SEEN_EQ_MAX) break; seenEq.delete(k); }
 }
 function syncQuakes(){
+  // 3Dの背景はNavaraなのでMapLibre用の画面座標へ投影できない。
+  // 天気・地震イベントのデータ更新は継続し、地図上リングだけを省く。
+  if(window.GEOFRAME_MODE_3D) return;
   const layer=document.getElementById('eqlayer');
   const qs=(ENV&&ENV.quakes)||[]; const keep=new Set();
   qs.forEach(q=>{
