@@ -308,7 +308,6 @@ function aircraftFeature(aircraft, options = {}) {
   const heightM = aircraftAltitudeMeters(aircraft);
   return {
     type: "Feature",
-    id: aircraft.hex || aircraft.callsign || undefined,
     properties: {
       hex: aircraft.hex || "",
       callsign: aircraft.callsign || "",
@@ -479,6 +478,9 @@ function aircraftLayerDefinition(source, color) {
       color,
       perPositionHeight: true,
       clampToGround: false,
+      // These are small, dynamic world-space polygons.  GeoJSON-VT tiling can
+      // quantize/drop their Z coordinates and also disables polygon outlines.
+      tiled: false,
       // Keep the aircraft legible against both bright imagery and dark HUD
       // edges.  The unlit path is supported by PolygonMaterial and avoids a
       // directional-light/normal dependency on the N100; it still writes the
@@ -494,25 +496,144 @@ function aircraftLayerDefinition(source, color) {
   };
 }
 
-export function addPhotoJourneyAircraftLayer(view) {
-  const sources = {};
-  const layers = {};
+function aircraftFeatureSetKey(status, params) {
+  const featureSetId = params && params.featureSetId;
+  if (featureSetId === undefined || featureSetId === null) return null;
+  return `${status}:${String(featureSetId)}`;
+}
+
+function notifyAircraftFeatureDiagnostics(state) {
+  if (typeof state.onFeatureDiagnostics !== "function") return;
+  try {
+    state.onFeatureDiagnostics({
+      renderedFeatureCount: state.renderedFeatureCount,
+      featureCreatedCount: state.featureCreatedCount,
+      featureRemovedCount: state.featureRemovedCount,
+      featureEventsAvailable: state.featureEventsAvailable,
+    });
+  } catch (error) {
+    // A diagnostics/UI callback must never interrupt Navara's feature event.
+  }
+}
+
+function bindAircraftFeatureEvents(state, status, layer) {
+  if (!layer || typeof layer.on !== "function" || typeof layer.off !== "function") {
+    return false;
+  }
+  const onCreated = params => {
+    const key = aircraftFeatureSetKey(status, params);
+    if (key !== null) state.renderedFeatureKeys.add(key);
+    state.featureCreatedCount += 1;
+    state.renderedFeatureCount = state.renderedFeatureKeys.size;
+    // Feature creation is asynchronous after source.update().  Request a
+    // frame at the point the worker has actually produced renderable geometry.
+    try { state.view?.forceUpdate?.(); } catch (error) { /* best effort */ }
+    notifyAircraftFeatureDiagnostics(state);
+  };
+  const onRemoved = params => {
+    const key = aircraftFeatureSetKey(status, params);
+    if (key !== null) state.renderedFeatureKeys.delete(key);
+    state.featureRemovedCount += 1;
+    state.renderedFeatureCount = state.renderedFeatureKeys.size;
+    try { state.view?.forceUpdate?.(); } catch (error) { /* best effort */ }
+    notifyAircraftFeatureDiagnostics(state);
+  };
+  try {
+    layer.on("featureCreated", onCreated);
+    layer.on("featureRemoved", onRemoved);
+  } catch (error) {
+    try { layer.off("featureCreated", onCreated); } catch (e) { /* best effort */ }
+    try { layer.off("featureRemoved", onRemoved); } catch (e) { /* best effort */ }
+    return false;
+  }
+  state.featureListeners.push({ layer, onCreated, onRemoved });
+  return true;
+}
+
+function disposeAircraftFeatureEvents(state) {
+  for (const listener of state.featureListeners || []) {
+    try { listener.layer?.off?.("featureCreated", listener.onCreated); } catch (e) { /* best effort */ }
+    try { listener.layer?.off?.("featureRemoved", listener.onRemoved); } catch (e) { /* best effort */ }
+  }
+  if (state.featureListeners) state.featureListeners.length = 0;
+  state.renderedFeatureKeys?.clear?.();
+  state.renderedFeatureCount = 0;
+  state.featureEventsAvailable = false;
+  notifyAircraftFeatureDiagnostics(state);
+}
+
+function deleteAircraftLayerHandles(state) {
+  // Remove event handlers before deleting the layer.  Navara may synchronously
+  // emit featureRemoved while tearing down a source.
+  disposeAircraftFeatureEvents(state);
+  for (const status of Object.keys(state.layers || {})) {
+    try { state.layers[status]?.delete?.(); } catch (e) { /* best effort */ }
+    delete state.layers[status];
+  }
+  for (const status of Object.keys(state.sources || {})) {
+    try { state.sources[status]?.delete?.(); } catch (e) { /* best effort */ }
+    delete state.sources[status];
+  }
+}
+
+function createAircraftLayerHandles(state, dataByStatus = {}) {
+  const createdSources = [];
+  const createdLayers = [];
   try {
     for (const [status, definition] of Object.entries(AIRCRAFT_LAYER_DEFS)) {
-      const source = view.addSource({ type: "geojson", data: emptyAircraftGeoJSON() });
-      sources[status] = source;
-      layers[status] = view.addLayer(aircraftLayerDefinition(source, definition.color));
+      const source = state.view.addSource({
+        type: "geojson",
+        data: dataByStatus[status] || emptyAircraftGeoJSON(),
+        // Keep the small dynamic collection in world coordinates.  The
+        // GeoJSON-VT path is intended for large datasets and can lose Z.
+        tiled: false,
+      });
+      state.sources[status] = source;
+      createdSources.push({ status, source });
+      const layer = state.view.addLayer(aircraftLayerDefinition(source, definition.color));
+      state.layers[status] = layer;
+      createdLayers.push({ status, layer });
+      bindAircraftFeatureEvents(state, status, layer);
     }
+    state.featureEventsAvailable = state.featureListeners.length ===
+      Object.keys(AIRCRAFT_LAYER_DEFS).length;
   } catch (error) {
-    for (const status of Object.keys(layers)) {
-      try { layers[status]?.delete?.(); } catch (e) { /* best effort */ }
+    disposeAircraftFeatureEvents(state);
+    for (const { status, layer } of createdLayers) {
+      try { layer?.delete?.(); } catch (e) { /* best effort */ }
+      delete state.layers[status];
     }
-    for (const status of Object.keys(sources)) {
-      try { sources[status]?.delete?.(); } catch (e) { /* best effort */ }
+    for (const { status, source } of createdSources) {
+      try { source?.delete?.(); } catch (e) { /* best effort */ }
+      delete state.sources[status];
     }
     throw error;
   }
-  return { view, sources, layers, disposed: false };
+}
+
+export function addPhotoJourneyAircraftLayer(view, options = {}) {
+  const sources = {};
+  const layers = {};
+  const state = {
+    view,
+    sources,
+    layers,
+    disposed: false,
+    visibleCount: 0,
+    renderedFeatureCount: 0,
+    featureCreatedCount: 0,
+    featureRemovedCount: 0,
+    featureEventsAvailable: false,
+    featureListeners: [],
+    renderedFeatureKeys: new Set(),
+    needsInitialRebuild: true,
+    onFeatureDiagnostics: typeof options?.onFeatureDiagnostics === "function"
+      ? options.onFeatureDiagnostics
+      : null,
+  };
+  createAircraftLayerHandles(state);
+  notifyAircraftFeatureDiagnostics(state);
+  return state;
 }
 
 export function updatePhotoJourneyAircraftLayer(state, aircraft, options = {}) {
@@ -541,9 +662,24 @@ export function updatePhotoJourneyAircraftLayer(state, aircraft, options = {}) {
   for (const feature of all.features) {
     grouped[feature.properties.layerStatus]?.features.push(feature);
   }
+  let rebuiltInitial = false;
+  if (state.needsInitialRebuild && all.features.length > 0) {
+    // Navara 0.1.1 can retain the empty inline GeoJSON traversal created at
+    // addSource/addLayer time.  Recreate once with real data so the first
+    // aircraft snapshot enters the feature pipeline; later updates are cheap
+    // in-place source updates.
+    deleteAircraftLayerHandles(state);
+    createAircraftLayerHandles(state, grouped);
+    state.needsInitialRebuild = false;
+    rebuiltInitial = true;
+  }
   for (const status of Object.keys(AIRCRAFT_LAYER_DEFS)) {
     const data = grouped[status] || emptyAircraftGeoJSON();
-    state.sources[status]?.update?.({ type: "geojson", data });
+    // The initial rebuild already supplied inline data to addSource.  Avoid
+    // immediately replacing those new sources before Navara can traverse them.
+    if (!rebuiltInitial) {
+      state.sources[status]?.update?.({ type: "geojson", data, tiled: false });
+    }
   }
   // animation:false means a source mutation must explicitly request a frame.
   state.view?.forceUpdate?.();
@@ -552,13 +688,8 @@ export function updatePhotoJourneyAircraftLayer(state, aircraft, options = {}) {
 
 export function removePhotoJourneyAircraftLayer(state) {
   if (!state || state.disposed) return false;
-  for (const status of Object.keys(state.layers || {})) {
-    try { state.layers[status]?.delete?.(); } catch (e) { /* best effort */ }
-  }
-  for (const status of Object.keys(state.sources || {})) {
-    try { state.sources[status]?.delete?.(); } catch (e) { /* best effort */ }
-  }
   state.disposed = true;
+  deleteAircraftLayerHandles(state);
   return true;
 }
 

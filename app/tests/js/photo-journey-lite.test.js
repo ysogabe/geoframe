@@ -233,6 +233,8 @@ aircraft[24].seen_pos = 99;
 const aircraftGJ = aircraftGeoJSON(aircraft, { now: 1700000000 });
 assert.strictEqual(aircraftGJ.features.length, 20, '新鮮な機体を最大20機に制限する');
 assert.strictEqual(aircraftGJ.features[0].geometry.type, 'Polygon', '機影をPolygonで作る');
+assert.strictEqual(Object.prototype.hasOwnProperty.call(aircraftGJ.features[0], 'id'), false,
+  'Navara互換のためFeature.idへ文字列を渡さない');
 const ring = aircraftGJ.features[0].geometry.coordinates[0];
 assert.ok(ring.length >= 8 && ring.length <= 12, '機影Polygonは8〜12頂点');
 assert.ok(ring.every(coord => coord.length === 3 && Number.isFinite(coord[2])),
@@ -282,6 +284,7 @@ assert.strictEqual(aircraftChasePose({ lat: 35, lon: 139, alt_geom: 1000,
 
 const aircraftSources = [];
 const aircraftLayers = [];
+const aircraftLayerHandles = [];
 let aircraftForceUpdates = 0;
 const aircraftView = {
   addSource: source => {
@@ -291,21 +294,44 @@ const aircraftView = {
     aircraftSources.push(handle);
     return handle;
   },
-  addLayer: layer => { aircraftLayers.push(layer); return {
-    delete: () => true,
-  }; },
+  addLayer: layer => {
+    aircraftLayers.push(layer);
+    const handlers = new Map();
+    const handle = {
+      deleted: false,
+      delete: () => { handle.deleted = true; return true; },
+      on: (name, callback) => {
+        if (!handlers.has(name)) handlers.set(name, new Set());
+        handlers.get(name).add(callback);
+      },
+      off: (name, callback) => handlers.get(name)?.delete(callback),
+      emit: (name, params) => {
+        for (const callback of [...(handlers.get(name) || [])]) callback(params);
+      },
+      handlerCount: name => (handlers.get(name) || new Set()).size,
+    };
+    aircraftLayerHandles.push(handle);
+    return handle;
+  },
   forceUpdate: () => { aircraftForceUpdates++; },
 };
 const addPhotoJourneyAircraftLayer = vm.runInContext('addPhotoJourneyAircraftLayer', feContext);
 const updatePhotoJourneyAircraftLayer = vm.runInContext('updatePhotoJourneyAircraftLayer', feContext);
 const removePhotoJourneyAircraftLayer = vm.runInContext('removePhotoJourneyAircraftLayer', feContext);
-const aircraftLayerState = addPhotoJourneyAircraftLayer(aircraftView);
+const aircraftDiagnostics = [];
+const aircraftLayerState = addPhotoJourneyAircraftLayer(aircraftView, {
+  onFeatureDiagnostics: snapshot => aircraftDiagnostics.push(snapshot),
+});
 assert.strictEqual(aircraftSources.length, 4, '通常/マッチ/rare/emergencyの固定GeoJSON sourceを作る');
 assert.strictEqual(aircraftLayers.length, 4, '航空機vector polygon layerを4層作る');
+assert.ok(aircraftSources.every(s => s.type === 'geojson' && s.tiled === false),
+  '全航空機GeoJSON sourceでtiled:falseを明示する');
 assert.ok(aircraftLayers.every(l => l.type === 'vector' && l.polygon.perPositionHeight),
   '全航空機layerをperPositionHeightのvector polygonにする');
 assert.ok(aircraftLayers.every(l => l.polygon.clampToGround === false),
   '航空機layerを地形クランプせず実高度で描画する');
+assert.ok(aircraftLayers.every(l => l.polygon.tiled === false),
+  '全航空機polygon materialでtiled:falseを明示する');
 assert.ok(aircraftLayers.every(l => l.polygon.lit === false &&
   l.polygon.transparent === false && l.polygon.opacity === 1),
   '航空機layerを照明非依存・不透明で描画する');
@@ -314,20 +340,70 @@ assert.ok(aircraftLayers.every(l => l.polygon.outline === true &&
   'GeoJSON専用の初期アウトラインを有効化する');
 assert.strictEqual(new Set(aircraftLayers.map(l => l.polygon.color)).size, 4,
   'normal/match/rare/emergencyを別色で表示する');
-updatePhotoJourneyAircraftLayer(aircraftLayerState, [{ hex: 'normal', lat: 35, lon: 139,
+const initialAircraftSources = aircraftSources.slice();
+const initialAircraftLayerHandles = aircraftLayerHandles.slice();
+const aircraftRows = [{ hex: 'normal', lat: 35, lon: 139,
   seen_pos: 1, alt_geom: 1000 }, { hex: 'match', lat: 35, lon: 139.1,
   seen_pos: 1, alt_geom: 2000, match: {} }, { hex: 'rare', lat: 35, lon: 139.2,
   seen_pos: 1, alt_geom: 3000, rare: true }, { hex: 'emergency', lat: 35, lon: 139.3,
-  seen_pos: 1, alt_geom: 4000, emergency: true }], { now: 1700000000 });
-assert.ok(aircraftSources.every(s => s.updates.length === 1), 'source.updateで各statusを同期する');
-assert.strictEqual(aircraftForceUpdates, 1, 'source更新後にforceUpdateを1回だけ要求する');
-assert.ok(aircraftSources.every(s => s.updates[0].type === 'geojson'),
+  seen_pos: 1, alt_geom: 4000, emergency: true }];
+updatePhotoJourneyAircraftLayer(aircraftLayerState, [], { now: 1700000000 });
+assert.ok(initialAircraftSources.every(s => s.updates.length === 1 &&
+  s.updates[0].data.features.length === 0),
+  '初期空sourceも空FeatureCollectionで同期する');
+assert.strictEqual(aircraftLayerState.needsInitialRebuild, true,
+  '空source更新後も最初の実データで再構築できる状態を保持する');
+assert.strictEqual(aircraftForceUpdates, 1, '空source更新後にforceUpdateを1回だけ要求する');
+updatePhotoJourneyAircraftLayer(aircraftLayerState, aircraftRows, { now: 1700000000 });
+assert.strictEqual(aircraftSources.length, 8, '初回の実データで4 sourceを安全に再生成する');
+assert.strictEqual(aircraftLayers.length, 8, '初回の実データで4 layerを安全に再生成する');
+assert.ok(initialAircraftSources.every(s => s.deleted), '再構築時に初期空sourceを削除する');
+assert.ok(initialAircraftLayerHandles.every(l => l.deleted &&
+  l.handlerCount('featureCreated') === 0 && l.handlerCount('featureRemoved') === 0),
+  '再構築時に初期layerのfeature listenerを解除する');
+const rebuiltAircraftSources = aircraftSources.slice(4);
+const rebuiltAircraftLayerHandles = aircraftLayerHandles.slice(4);
+assert.ok(rebuiltAircraftSources.every(s => s.type === 'geojson' && s.tiled === false &&
+  s.data.type === 'FeatureCollection' && s.data.features.length === 1),
+  '再生成sourceへstatus別の実GeoJSONを直接渡す');
+assert.ok(rebuiltAircraftLayerHandles.every(l => l.handlerCount('featureCreated') === 1 &&
+  l.handlerCount('featureRemoved') === 1),
+  '再生成layerへfeature listenerを再接続する');
+assert.strictEqual(aircraftLayerState.needsInitialRebuild, false,
+  '実データsourceへ切り替えた後は通常更新へ移行する');
+assert.strictEqual(aircraftForceUpdates, 2, '初回source再構築後にもforceUpdateを要求する');
+updatePhotoJourneyAircraftLayer(aircraftLayerState, aircraftRows, { now: 1700000000 });
+assert.ok(rebuiltAircraftSources.every(s => s.updates.length === 1), 'source.updateで各statusを同期する');
+assert.strictEqual(aircraftForceUpdates, 3, 'source更新後にforceUpdateを1回だけ要求する');
+assert.ok(rebuiltAircraftSources.every(s => s.updates[0].type === 'geojson'),
   'source.updateへGeoJSON型を明示する');
+assert.ok(rebuiltAircraftSources.every(s => s.updates[0].tiled === false),
+  'source.updateでもtiled:falseを維持する');
 assert.strictEqual(aircraftLayerState.visibleCount, 4,
   'source更新後の鮮度・座標・最大数フィルタ済み表示数を保持する');
+assert.strictEqual(aircraftLayerState.featureEventsAvailable, true,
+  '4 layerすべてでfeature eventを購読できる');
+rebuiltAircraftLayerHandles[0].emit('featureCreated', { featureSetId: 1n });
+assert.strictEqual(aircraftLayerState.renderedFeatureCount, 1,
+  'featureCreatedで実際に生成済みのfeature数を保持する');
+assert.strictEqual(aircraftLayerState.featureCreatedCount, 1,
+  'featureCreated診断イベント数を保持する');
+assert.strictEqual(aircraftForceUpdates, 4,
+  '非同期featureCreated後にも追加forceUpdateを要求する');
+rebuiltAircraftLayerHandles[0].emit('featureRemoved', { featureSetId: 1n });
+assert.strictEqual(aircraftLayerState.renderedFeatureCount, 0,
+  'featureRemovedで描画済みfeature数を減らす');
+assert.strictEqual(aircraftLayerState.featureRemovedCount, 1,
+  'featureRemoved診断イベント数を保持する');
 updatePhotoJourneyAircraftLayer(aircraftLayerState, [], { now: 1700000000 });
 assert.strictEqual(aircraftLayerState.visibleCount, 0, '空feedでstale機影を全statusから除去する');
+assert.strictEqual(aircraftDiagnostics.at(-1).renderedFeatureCount, 0,
+  'feature event診断snapshotをcontroller向けcallbackへ渡す');
 assert.strictEqual(removePhotoJourneyAircraftLayer(aircraftLayerState), true, 'layer/sourceを削除できる');
+assert.strictEqual(aircraftLayerState.featureEventsAvailable, false,
+  'disposeでfeature event監視を無効化する');
+assert.ok(aircraftLayerHandles.every(l => l.handlerCount('featureCreated') === 0 &&
+  l.handlerCount('featureRemoved') === 0), 'disposeでfeature listenerを解除する');
 assert.strictEqual(removePhotoJourneyAircraftLayer(aircraftLayerState), false, '削除は冪等に扱う');
 
 const setPhotoJourneyCamera = vm.runInContext('setPhotoJourneyCamera', feContext);
@@ -440,6 +516,12 @@ assert.ok(/function tick\([^)]*initial=false\)/.test(controllerSrc),
 assert.ok(controllerSrc.includes('if(initial){'), '初回はflyToをスキップしてタイル選択を安定させる');
 assert.ok(controllerSrc.includes('addPhotoJourneyAircraftLayer'), '3D起動時に航空機Polygonレイヤーを登録する');
 assert.ok(controllerSrc.includes('updatePhotoJourneyAircraftLayer'), 'ADS-B更新を3Dレイヤーへ渡す');
+assert.ok(controllerSrc.includes('renderedFeatureCount'),
+  'aircraft-visible判定にNavaraのrenderedFeatureCountを使う');
+assert.ok(controllerSrc.includes('featureEventsAvailable') && controllerSrc.includes('visibleCount'),
+  'feature event非対応環境だけvisibleCountへ明示fallbackする');
+assert.ok(controllerSrc.includes('onFeatureDiagnostics'),
+  '非同期feature eventでcontrollerの可視状態を再同期する');
 assert.ok(controllerSrc.includes('aircraftCameraPoseAt'), 'MEMORY LINKで実高度の機上視点を使う');
 assert.ok(controllerSrc.includes('aircraftChasePose'), 'rare/emergencyでchase/focus視点を使う');
 assert.ok(controllerSrc.includes('geoframe:presence-state'), '在席スリープイベントで3D巡回を停止・再開する');

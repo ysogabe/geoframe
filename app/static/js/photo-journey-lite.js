@@ -68,6 +68,27 @@
       lon >= -180 && lon <= 180;
   }
 
+  function updateAircraftVisibility(){
+    if(!aircraftLayerState || disposed) return;
+    const hasFeatureEvents = aircraftLayerState.featureEventsAvailable === true;
+    const renderedCount = finite(aircraftLayerState.renderedFeatureCount);
+    // Navara layers expose featureCreated/featureRemoved.  Minimal test shims
+    // and older adapters may not, so only those environments use visibleCount.
+    const visible = hasFeatureEvents
+      ? renderedCount !== null && renderedCount > 0
+      : (finite(aircraftLayerState.visibleCount) || 0) > 0;
+    document.body?.classList.toggle('aircraft-visible', visible);
+    // Keep the async render proof inspectable from N100/CDP without exposing
+    // the Navara view globally.
+    if(document.body?.dataset){
+      document.body.dataset.aircraftFeatureEvents = hasFeatureEvents ? 'true' : 'false';
+      document.body.dataset.aircraftRenderedFeatureCount = String(
+        hasFeatureEvents && renderedCount !== null ? renderedCount : 0);
+      document.body.dataset.aircraftFeatureCreatedCount = String(
+        finite(aircraftLayerState.featureCreatedCount) || 0);
+    }
+  }
+
   function eventState(){
     return window.GEOFRAME_EVENT_STATE || {};
   }
@@ -171,8 +192,7 @@
         // camera height to survive pixelRatio=0.5 on N100.
         sizeMeters: settings.low ? 125 : 140,
       });
-      document.body?.classList.toggle('aircraft-visible',
-        (aircraftLayerState.visibleCount || 0) > 0);
+      updateAircraftVisibility();
     }catch(e){ handleNavaraError(e); }
   }
 
@@ -434,7 +454,9 @@
           pitch:settings.pitch,heading:settings.headingStep?(first*settings.headingStep)%360:0});
       }
       layerState=mod.addPhotoJourneyLayers(view,{points,route:[]});
-      aircraftLayerState=mod.addPhotoJourneyAircraftLayer(view);
+      aircraftLayerState=mod.addPhotoJourneyAircraftLayer(view, {
+        onFeatureDiagnostics: updateAircraftVisibility,
+      });
       updateAircraftLayer();
       requestLodRefinement(view);
     }catch(e){ return handleNavaraError(e); }
