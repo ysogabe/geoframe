@@ -70,10 +70,11 @@ LOD/SSEをさらに粗くし、カメラ高度を4,200m、飛行時間を1,200ms
 **同梱しない**（バンドル内に `assets/` 参照は0件であることをテストで保証）。
 
 **タイル**: CDN（unpkg/jsdelivr/esm.sh）を使わず、既存の server.py プロキシを使う。
-同一地点ではraster basemapを**常に1層だけ**生成する。日本の経緯度範囲ならGSI、国外なら
-OSMを選び、巡回先が国境を跨ぐときは同じraster sourceのURLを`Source.update()`して切り替える。
-GSI/OSMを同時に全面fetchしないため、2560x1080での初期tile burstと240 tiles/min上流制限への
-到達を抑える。出典（GSI / OpenStreetMap）は `view.attribution.add()` で表示する。
+同一地点ではraster basemapを**常に1層だけ**生成する。日本の経緯度範囲ではGSIの航空・衛星写真
+（Z2〜13はLandsat 8、Z14〜18は全国最新写真（シームレス））、国外ではOSMを選ぶ。巡回先が
+国境を跨ぐときは同じraster sourceのURLを`Source.update()`して切り替える。GSI/OSMを同時に
+全面fetchしないため、2560x1080での初期tile burstと240 tiles/min上流制限への到達を抑える。
+出典（GSI・Landsat / OpenStreetMap）は `view.attribution.add()` で表示する。
 
 ## 5. 巡回（3dコントローラ）
 

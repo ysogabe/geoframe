@@ -106484,14 +106484,14 @@ function T8A(g) {
   return !!g && g.lon >= 122.5 && g.lon <= 154.5 && g.lat >= 20 && g.lat <= 46.5;
 }
 function Vl(g) {
-  return T8A(g) ? "gsi" : "osm";
+  return T8A(g) ? "gsi-photo" : "osm";
 }
 function _l(g, A) {
   return {
     type: "raster-tile",
     url: A[g],
-    minZoom: g === "gsi" ? 5 : 0,
-    maxZoom: g === "gsi" ? 18 : 19
+    minZoom: g === "gsi-photo" ? 2 : 0,
+    maxZoom: g === "gsi-photo" ? 18 : 19
   };
 }
 function SyA(g, A) {
@@ -106500,7 +106500,7 @@ function SyA(g, A) {
 }
 function OyA(g, { points: A = [], route: B = [], tileUrls: I = {}, basemap: Q } = {}) {
   const C = typeof location < "u" ? location.origin : "", E = {
-    gsi: I.gsi || `${C}/tiles/gsi/{z}/{x}/{y}.png`,
+    "gsi-photo": I.gsiPhoto || `${C}/tiles/gsi-photo/{z}/{x}/{y}.png`,
     osm: I.osm || `${C}/tiles/osm/{z}/{x}/{y}.png`
   }, w = Q || Vl(A[0] || B[0]), D = g.addSource(_l(w, E));
   g.addLayer({ type: "raster", source: D });
@@ -106520,7 +106520,7 @@ function OyA(g, { points: A = [], route: B = [], tileUrls: I = {}, basemap: Q } 
   });
   return g.addLayer({ type: "vector", source: e, point: { color: 58879 } }), g.addLayer({ type: "vector", source: e, polyline: { color: 58879 } }), g.attribution && g.attribution.add([
     {
-      attribution: "地図データ 出典: 国土地理院（地理院タイル）",
+      attribution: "航空・衛星画像: 国土地理院 / データソース: Landsat8画像（GSI, TSIC, GEO Grid/AIST）、Landsat8画像（courtesy of the U.S. Geological Survey）、海底地形（GEBCO）",
       attributionUrl: "https://maps.gsi.go.jp/development/ichiran.html"
     },
     {

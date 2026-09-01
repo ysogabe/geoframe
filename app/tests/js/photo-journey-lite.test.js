@@ -123,11 +123,11 @@ const frontendPath = '../frontend/photo-journey-lite.js';
 const frontendSrc = fs.readFileSync(frontendPath, 'utf8');
 
 // CDN（unpkg / jsdelivr / esm.sh / 一般CDN）由来の実行時コードを一切含まないこと。
-// タイルは server.py の /tiles/{gsi,osm}/ プロキシを指す。
+// タイルは server.py の /tiles/{gsi-photo,osm}/ プロキシを指す。
 for (const bad of ['unpkg', 'jsdelivr', 'esm.sh', 'cdn.']) {
   assert.ok(!frontendSrc.toLowerCase().includes(bad), `frontendソースにCDN参照が混入: ${bad}`);
 }
-assert.ok(frontendSrc.includes('/tiles/gsi/{z}/{x}/{y}.png'), 'GSIタイルをプロキシから取得する');
+assert.ok(frontendSrc.includes('/tiles/gsi-photo/{z}/{x}/{y}.png'), 'GSI航空・衛星写真をプロキシから取得する');
 assert.ok(frontendSrc.includes('/tiles/osm/{z}/{x}/{y}.png'), 'OSMタイルをプロキシから取得する');
 
 // ThreeView を実際に new し、DefaultPlugin を登録する。ただし addDefaultPhotorealScene
@@ -220,14 +220,14 @@ const route = points;
 const layerState = addPhotoJourneyLayers(mockView, {
   points,
   route,
-  tileUrls: { gsi: 'http://h/tiles/gsi/{z}/{x}/{y}.png', osm: 'http://h/tiles/osm/{z}/{x}/{y}.png' },
+  tileUrls: { gsiPhoto: 'http://h/tiles/gsi-photo/{z}/{x}/{y}.png', osm: 'http://h/tiles/osm/{z}/{x}/{y}.png' },
 });
 
 const raster = sources.filter(s => s.type === 'raster-tile');
 assert.strictEqual(raster.length, 1, '同時に描画するraster-tile basemapは1つだけ');
-assert.strictEqual(raster[0].url, 'http://h/tiles/gsi/{z}/{x}/{y}.png', '国内地点ではGSIを選ぶ');
+assert.strictEqual(raster[0].url, 'http://h/tiles/gsi-photo/{z}/{x}/{y}.png', '国内地点ではGSI航空・衛星写真を選ぶ');
 assert.strictEqual(layers.filter(l => l.type === 'raster').length, 1, 'raster layerも1つだけ');
-assert.strictEqual(layerState.basemap.kind, 'gsi', '初期basemapの選択状態を返す');
+assert.strictEqual(layerState.basemap.kind, 'gsi-photo', '初期basemapの選択状態を返す');
 
 const updatePhotoJourneyBasemap = vm.runInContext('updatePhotoJourneyBasemap', feContext);
 updatePhotoJourneyBasemap(layerState.basemap, { lon: -73.9857, lat: 40.7484 });

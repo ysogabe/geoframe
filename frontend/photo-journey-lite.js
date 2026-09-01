@@ -95,22 +95,22 @@ export function createPhotoJourneyView(container, opts = {}) {
 }
 
 /* 写真ポイント・ライトルート線・背景タイルをレイヤとして追加する。
-   tileUrls は server.py の /tiles/{gsi,osm}/ プロキシを指す（CDN は使わない）。 */
+   tileUrls は server.py の /tiles/{gsi-photo,osm}/ プロキシを指す（CDN は使わない）。 */
 function isDomesticPoint(point) {
   return !!point && point.lon >= 122.5 && point.lon <= 154.5 &&
     point.lat >= 20.0 && point.lat <= 46.5;
 }
 
 export function selectPhotoJourneyBasemap(point) {
-  return isDomesticPoint(point) ? "gsi" : "osm";
+  return isDomesticPoint(point) ? "gsi-photo" : "osm";
 }
 
 function rasterDefinition(kind, urls) {
   return {
     type: "raster-tile",
     url: urls[kind],
-    minZoom: kind === "gsi" ? 5 : 0,
-    maxZoom: kind === "gsi" ? 18 : 19,
+    minZoom: kind === "gsi-photo" ? 2 : 0,
+    maxZoom: kind === "gsi-photo" ? 18 : 19,
   };
 }
 
@@ -125,7 +125,7 @@ export function updatePhotoJourneyBasemap(state, point) {
 export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls = {}, basemap } = {}) {
   const origin = typeof location !== "undefined" ? location.origin : "";
   const urls = {
-    gsi: tileUrls.gsi || `${origin}/tiles/gsi/{z}/{x}/{y}.png`,
+    "gsi-photo": tileUrls.gsiPhoto || `${origin}/tiles/gsi-photo/{z}/{x}/{y}.png`,
     osm: tileUrls.osm || `${origin}/tiles/osm/{z}/{x}/{y}.png`,
   };
   const kind = basemap || selectPhotoJourneyBasemap(points[0] || route[0]);
@@ -155,7 +155,7 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
   if (view.attribution) {
     view.attribution.add([
       {
-        attribution: "地図データ 出典: 国土地理院（地理院タイル）",
+        attribution: "航空・衛星画像: 国土地理院 / データソース: Landsat8画像（GSI, TSIC, GEO Grid/AIST）、Landsat8画像（courtesy of the U.S. Geological Survey）、海底地形（GEBCO）",
         attributionUrl: "https://maps.gsi.go.jp/development/ichiran.html",
       },
       {
