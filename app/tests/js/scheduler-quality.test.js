@@ -14,7 +14,7 @@ const context = vm.createContext({
     setItem: (key, value) => storage.set(key, value),
   },
 });
-vm.runInContext(fs.readFileSync('static/js/scheduler.js', 'utf8'), context);
+vm.runInContext(fs.readFileSync('static/js/scheduler-core.js', 'utf8'), context);
 
 const result = vm.runInContext(`(() => {
   const base = {id:'p', time:'', fetchedAt:'', fav:false};

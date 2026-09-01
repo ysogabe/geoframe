@@ -1,0 +1,19 @@
+{
+  "name": "geoframe-photo-journey-lite",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "3D PHOTO JOURNEY Lite 用の Navara バンドル生成（app/static/navara/ を決定的に生成する）",
+  "scripts": {
+    "build:navara": "vite build"
+  },
+  "dependencies": {
+    "@navaramap/three": "0.1.1",
+    "@navaramap/three-default-plugin": "0.1.1",
+    "postprocessing": "6.39.4",
+    "three": "0.185.1"
+  },
+  "devDependencies": {
+    "vite": "6.4.3"
+  }
+}

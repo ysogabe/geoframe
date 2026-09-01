@@ -140,7 +140,7 @@ class Handler(SimpleHTTPRequestHandler):
             return True
         return False
 
-    TILE_RE = re.compile(r"^/tiles/(osm|gsi)/(\d{1,2})/(\d+)/(\d+)\.png$")
+    TILE_RE = re.compile(r"^/tiles/(osm|gsi|gsi-photo)/(\d{1,2})/(\d+)/(\d+)\.png$")
 
     # ============================================================
     # Host ヘッダ検証（DNSリバインディング対策。詳しい攻撃の説明は config.py 側）

@@ -9,14 +9,15 @@ from collections import deque
 
 from PIL import Image
 
-from .config import (TILE_CACHE_MAX_MB, TILE_DIR, TILE_FETCH_PER_MIN,
-                     TILE_SOURCES, TILE_UA)
+from .config import (GSI_PHOTO_TILE_BANDS, TILE_CACHE_MAX_MB, TILE_DIR,
+                     TILE_FETCH_PER_MIN, TILE_SOURCES, TILE_UA)
 
 
 # ============================================================
 # 背景地図タイルのプロキシ（ファイル永続キャッシュ）
 # ============================================================
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
 # ソースごとに上流への同時接続数を絞る（OSMのtile usage policy配慮）
 _tile_sems = {k: threading.Semaphore(v[2]) for k, v in TILE_SOURCES.items()}
 _blank_tile = None
@@ -26,6 +27,31 @@ _tile_prune_at = 0.0
 _tile_fetch_win = deque()
 _tile_fetch_lock = threading.Lock()
 _tile_throttled = False      # 抑制中フラグ。開始時と解除時に1行ずつだけログを出すために持つ
+
+
+def _upstream_tile_url(layer, z, x, y):
+    """layerとzoomから上流URLを決める。3D写真はGSIの公式ズーム帯を継ぎ合わせる。"""
+    if layer == "gsi-photo":
+        for min_zoom, max_zoom, template in GSI_PHOTO_TILE_BANDS:
+            if min_zoom <= z <= max_zoom:
+                return template.format(z=z, x=x, y=y)
+        raise ValueError(f"gsi-photoの提供ズーム外: z{z}")
+    return TILE_SOURCES[layer][0].format(z=z, x=x, y=y)
+
+
+def _normalise_tile_bytes(data):
+    """クライアント向けPNGへ正規化する。GSIシームレス写真のJPEGも受け入れる。"""
+    if data.startswith(PNG_MAGIC):
+        return data
+    if not data.startswith(JPEG_MAGIC):
+        raise ValueError(f"画像ではない応答 ({len(data)}B)")
+    with Image.open(io.BytesIO(data)) as image:
+        image.load()
+        if image.size != (256, 256):
+            raise ValueError(f"想定外のタイルサイズ: {image.size[0]}x{image.size[1]}")
+        buf = io.BytesIO()
+        image.convert("RGB").save(buf, format="PNG", compress_level=3)
+        return buf.getvalue()
 
 
 def _transparent_tile():
@@ -70,7 +96,6 @@ def fetch_tile(layer, z, x, y):
       "miss"      上流から取得してキャッシュに保存した（404の透明タイル永続化を含む）
       "error"     上流エラー。透明タイルを返すがキャッシュしない（次回再試行させる）
       "throttled" 流量上限に達したため上流へ行かなかった。透明タイルを返しキャッシュしない"""
-    tmpl = TILE_SOURCES[layer][0]
     f = TILE_DIR / layer / str(z) / str(x) / f"{y}.png"
     if f.exists():
         try:
@@ -80,21 +105,23 @@ def fetch_tile(layer, z, x, y):
     if not _tile_fetch_allowed():
         # 上限超過。404にするとMapLibreがリトライを連発するので200＋透明PNGで返しきる
         return _transparent_tile(), "throttled"
-    url = tmpl.format(z=z, x=x, y=y)
+    try:
+        url = _upstream_tile_url(layer, z, x, y)
+    except ValueError:
+        return _transparent_tile(), "error"
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": TILE_UA, "Accept": "image/png,image/*;q=0.8"})
+            "User-Agent": TILE_UA, "Accept": "image/jpeg,image/png,image/*;q=0.8"})
         with _tile_sems[layer]:
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = r.read()
-        # キャプティブポータル等がHTMLを返すことがあるためマジックバイトで検証
-        if not data.startswith(PNG_MAGIC):
-            raise ValueError(f"PNGではない応答 ({len(data)}B)")
+        # キャプティブポータル等のHTMLを拒否し、JPEG配信の航空写真もPNGへ統一する。
+        data = _normalise_tile_bytes(data)
     except urllib.error.HTTPError as e:
         if e.code != 404:
             print(f"[tile] {layer} z{z}/{x}/{y}: {e}")
             return _transparent_tile(), "error"
-        # 提供範囲外は恒久的（例: 地理院paleの海外域）→ 透明タイルを永続化して以後問い合わせない
+        # 提供範囲外は恒久的 → 透明タイルを永続化して以後問い合わせない
         data = _transparent_tile()
     except Exception as e:
         print(f"[tile] {layer} z{z}/{x}/{y}: {e}")

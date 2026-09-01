@@ -4,7 +4,7 @@
    ※読み込み順が契約: events.js の後（ENV を参照する buildTicker を含むため）
    宣言する主なグローバル: DAYS, buildTicker, eventCard, ENV_LABELS, fmtEnvVal,
                            pollRoomEnv, sleeping, nightMode, isNightByClock,
-                           applyNight, pollPresence, lastIntroTrip,
+                           applyNight, pollPresence, startLivePanels, lastIntroTrip,
                            showTripIntro, STATS_EVERY, STATS, loadStats,
                            statsCamera, showStats, WK_DAYS, WX_ICON, WX_TEXT,
                            wxIcon, wxText, showWeekly
@@ -112,6 +112,10 @@ async function pollRoomEnv(){
 /* ==== 在/不在スリープ（HA人感センサー）＋ナイトモード（減光） ==== */
 let sleeping=false;
 let nightMode=null;     // null=未判定。body.night の現在状態と一致させる
+if(typeof window!=='undefined'){
+  window.GEOFRAME_EVENT_STATE = window.GEOFRAME_EVENT_STATE || {};
+  window.GEOFRAME_EVENT_STATE.isSleeping = () => sleeping;
+}
 /* HAのsun.sunが取れないとき（/api/presence の night が null）の時刻フォールバック */
 function isNightByClock(){
   const h = new Date().getHours();
@@ -138,8 +142,30 @@ async function pollPresence(){
   if(off!==sleeping){
     sleeping=off;
     document.getElementById('sleep').classList.toggle('on', off);
-    document.getElementById('mode').textContent = off?'MODE: SLEEP':'MODE: PHOTO JOURNEY';
+    // The 3D controller owns its journey label and resumes its own camera
+    // after wake.  Keep the ordinary MapLibre mode behavior unchanged.
+    if(off) setMode('SLEEP');
+    else if(!window.GEOFRAME_MODE_3D) setMode('PHOTO JOURNEY');
   }
+  if(typeof window!=='undefined' && typeof window.dispatchEvent==='function'){
+    const EventCtor = window.CustomEvent || (typeof CustomEvent==='function' ? CustomEvent : null);
+    if(EventCtor) try{ window.dispatchEvent(new EventCtor('geoframe:presence-state', {
+      detail:{sleeping, night:nightMode},
+    })); }catch(e){}
+  }
+}
+
+/* ==== 常時更新するライブHUD ====
+   MapLibreと3Dのどちらでも、ADS-B・天気・在不在・HA室内環境は同じDOMカードを使う。
+   起動経路が複数あってもintervalを二重登録しないよう、この入口で一度だけ開始する。 */
+let livePanelsStarted = false;
+function startLivePanels(){
+  if(livePanelsStarted) return;
+  livePanelsStarted = true;
+  pollAircraft(); setInterval(pollAircraft, ADSB_POLL);
+  loadEnv(); setInterval(loadEnv, 300000);
+  pollPresence(); setInterval(pollPresence, 15000);
+  pollRoomEnv(); setInterval(pollRoomEnv, 60000);
 }
 
 /* ==== TRIP REPLAY（旅行クラスタのイントロ） ==== */
@@ -150,7 +176,7 @@ function showTripIntro(tid){
   markerEl.style.display='none';
   document.getElementById('statspanel').classList.add('hidden');
   setPrefVisible(false);     // 制覇マップは統計カットの間だけ出す
-  document.getElementById('mode').textContent='MODE: TRIP REPLAY';
+  setMode('TRIP REPLAY');
   const b=tr.bounds;
   armBase((b[0]+b[2])/2, (b[1]+b[3])/2, fitZoom(b, 11));
   map.fitBounds([[b[0],b[1]],[b[2],b[3]]],
@@ -184,7 +210,7 @@ function statsCamera(){
 function showStats(){
   if(!STATS || !STATS.total) return false;
   statsCamera();
-  document.getElementById('mode').textContent='MODE: TRAVEL STATS';
+  setMode('TRAVEL STATS');
   const sp=document.getElementById('statspanel');
   sp.classList.remove('hidden');
   // ★週間予報カットと同じパネルを使い回しているので、必ず .wk を外して見出しも戻す
@@ -235,7 +261,7 @@ function showWeekly(){
   if(!wk.length) return false;
   statsCamera();
   setPrefVisible(false);      // 制覇マップは統計カット専用
-  document.getElementById('mode').textContent='MODE: WEEKLY FORECAST';
+  setMode('WEEKLY FORECAST');
   const sp=document.getElementById('statspanel');
   sp.classList.remove('hidden');
   sp.classList.add('wk');

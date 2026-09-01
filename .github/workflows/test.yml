@@ -41,6 +41,8 @@ jobs:
         run: |
           node tests/js/scheduler-quality.test.js
           node tests/js/right-column-layout.test.js
+          node tests/js/photo-journey-lite.test.js
+          node tests/js/navara-build-integrity.test.js
 
       - name: Markdown相対リンク検査
         run: python tools/check_markdown_links.py

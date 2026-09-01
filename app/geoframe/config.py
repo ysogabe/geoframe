@@ -159,7 +159,16 @@ TILE_DIR = DATA_DIR / "tile_cache"
 TILE_SOURCES = {
     "osm": ("https://tile.openstreetmap.org/{z}/{x}/{y}.png", 19, 2),
     "gsi": ("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", 18, 4),
+    # 3D PHOTO JOURNEY専用。実URLはズームに応じてGSI_PHOTO_TILE_BANDSから選ぶ。
+    # 淡色地図の既存キャッシュと混ざらないよう、独立したlayer名を使う。
+    "gsi-photo": ("", 18, 4),
 }
+# 国土地理院の公式提供ズームに合わせた航空・衛星写真ピラミッド。
+# Z2-13: Landsat 8、Z14-18: 全国最新写真（シームレス）。
+GSI_PHOTO_TILE_BANDS = (
+    (2, 13, "https://cyberjapandata.gsi.go.jp/xyz/lndst/{z}/{x}/{y}.png"),
+    (14, 18, "https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"),
+)
 # OSM tile usage policy 準拠に必須。実運用では連絡先入り（例 "GeoFrame/0.1 (me@example.com)"）を
 # GEOFRAME_TILE_UA に設定しておくこと。既定値のままだとブロックされうる
 TILE_UA = os.environ.get("GEOFRAME_TILE_UA", "GeoFrame/0.1 (personal photo frame)")

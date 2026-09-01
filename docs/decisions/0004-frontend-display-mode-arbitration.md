@@ -1,7 +1,7 @@
 # ADR: 表示モードのアービトレーションはフロント新モジュールに一元化する
 
-- 日付: 2026-08-29
-- 状態: 提案（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。ユーザー承認待ち）
+- 日付: 2026-08-29（決定）/ 2026-08-31（実装反映）
+- 状態: 承認済み・実装済み（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。modes.js と #modelayer は 3D PHOTO JOURNEY Lite 実装で着地）
 
 ## 文脈
 
@@ -44,3 +44,26 @@ SLEEP（画面off中は何も描かない）
 - 全画面テイクオーバー方式により、新モードは右カラム（`#intel`/`#envpanel`/`#hzlegend`）のDOM構造に触れない（[[0006-implementation-sequencing]]の前提）。
 - 実証モードとして「夜間時計（NIGHT CLOCK）」を最初に実装する。判定入力は既存の`night`事実をそのまま流用し、新規のデータ経路を追加しない。
 - 受け入れ条件（必須・再掲）: `git grep -n "getElementById('mode')" app/static/js/` の一致が`modes.js`以外で0件になること。
+
+## 実装状況（2026-08-31）
+
+3D PHOTO JOURNEY Lite（[[3d-photo-journey-lite]]、`docs/roadmap/3d-photo-journey-lite.md`）
+の実装に合わせて、本ADRの決定事項を着地させた。
+
+- `app/static/js/modes.js` を新設し、`setMode(label)` を `#mode` の唯一の writer とした。
+  既存12箇所の直接書き込み（events.js 5・panels.js 4・scheduler.js 3）は `setMode()` へ
+  置き換え、受け入れ条件（`modes.js` 以外で0件）を満たした。表示ラベル
+  （TRANSIT / PHOTO JOURNEY / INTERCEPT / MEMORY LINK / SEISMIC WATCH / SLEEP /
+  TRIP REPLAY / TRAVEL STATS / WEEKLY FORECAST / ON THIS DAY）は全て従来どおり。
+- `pickMode()` は優先度ラダー（SLEEP > ALERT > PINNED > AMBIENT > ROTATION）の
+  文書化された参照点として保持。現行の呼び出し順（eventUntil / sleeping ガード）で
+  既にラダーが成立しており、新モード追加時に唯一の判定点へ昇格させる。
+- `#modelayer`（全画面テイクオーバー層）を `app/index.html` に追加し、`#hud-root` の
+  drift（240秒周期・焼き付き対策）を継承させた。右カラム（`#intel`/`#envpanel`/
+  `#hzlegend` の `right:46px`）とは独立で、右カラム回帰テストの不変条件を壊さない。
+- 実証モードは当初の「NIGHT CLOCK」ではなく「3D PHOTO JOURNEY Lite（`?mode=3d`）」を
+  最初の消費者とした。いずれも `modes.js` を唯一の writer とし `#modelayer` を使う点で
+  本ADRの決定を変えない。
+- 純ロジック分離の副次効果として、`app/static/js/scheduler.js` の再生スケジューラ
+  （キュー構築・永続化・差分同期）を `app/static/js/scheduler-core.js` へ切り出し、
+  Node/vm で検証可能にした（`app/tests/js/scheduler-quality.test.js`）。

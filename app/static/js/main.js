@@ -6,8 +6,7 @@
    依存する他ファイルのグローバル: ほぼ全ファイル
      （DWELL_MS/config.js, manifestReady/data.js, map・tryAddLayers・mockPolys・
        ptsData・armBase/map.js, showPhoto・syncMarker/photocard.js,
-       pollAircraft・loadEnv/events.js, buildTicker・loadStats・showStats・
-       showWeekly/panels.js,
+       buildTicker・loadStats・showStats・showWeekly・startLivePanels/panels.js,
        nextQueueIdx・markShown・goTo・INTERLUDE_KINDS・showInterlude/scheduler.js）
    ※先頭の startOnce / map.on('load') / map.on('styledata') / setTimeout(4500) は
      元 index.html では map.js 相当の位置（519〜523行）にあったが、start() を参照する
@@ -20,6 +19,9 @@ map.on('load', ()=>{ tryAddLayers(); startOnce(); });
 map.on('styledata', tryAddLayers);
 setTimeout(()=>{ tryAddLayers(); startOnce(); }, 4500);
 function start(){
+  // 3D PHOTO JOURNEY Lite（?mode=3d）では MapLibre の巡回・イベント・パネルを
+  // 起動しない。初期化と巡回は static/js/photo-journey-lite.js（3dコントローラ）が行う。
+  if(window.GEOFRAME_MODE_3D) return;
   // manifest反映後のデータでレイヤ・カメラ・ティッカーを整える
   if(!usingMock && layersAdded){
     try{ map.getSource('mock').setData(mockPolys()); map.getSource('pts').setData(ptsData()); }catch(e){}
@@ -61,10 +63,7 @@ function start(){
       return;
     }
     idx=nxt; markShown(idx); goTo(idx); }, DWELL_MS);   // 表示するのでここで消費
-  pollAircraft(); setInterval(pollAircraft, ADSB_POLL);
-  loadEnv(); setInterval(loadEnv, 300000);
-  pollPresence(); setInterval(pollPresence, 15000);
-  pollRoomEnv(); setInterval(pollRoomEnv, 60000);
+  startLivePanels();
   // 稼働中に追加された写真を拾う（5分毎にmanifest再取得。Drive同期運用向け）
   // 併せてサーバー疎通のウォッチドッグも兼ねる（無人キオスク運用のため自力復帰させる）
   setInterval(async()=>{
