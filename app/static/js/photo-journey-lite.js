@@ -15,7 +15,7 @@
      - ?mode=3d のときだけ Navara ThreeView（app/static/navara/ の自己完結バンドル）を
        動的 import で遅延ロードする。通常URLではこの import 文に到達しないため
        Navara の JS/WASM/worker 資産は一切読み込まれない。
-     - manifest（PHOTOS）→ 写真ポイント + ライトルート線へ変換し、約16秒周期の
+     - manifest（PHOTOS）の初回地点だけで航空写真basemapを初期化し、最低30秒周期の
        低頻度カメラ遷移を回す。写真カード・AREA INTEL・HUD は通常モードと同じ
        showPhoto / buildTicker / setMode を再利用する。
      - Navara / WASM / worker / WebGL の初期化に失敗したら sessionStorage に
@@ -26,8 +26,8 @@
   if(!window.GEOFRAME_MODE_3D) return;
 
   const settings = window.GEOFRAME_PHOTO_JOURNEY_SETTINGS || {
-    low: !!window.LOW_POWER, dwellMs: DWELL_MS || 16000, flyMs: 5000,
-    height: 1800, pitch: -32, headingStep: 47,
+    low: !!window.LOW_POWER, dwellMs: Math.max(DWELL_MS || 16000, 30000), flyMs: 5000,
+    height: 1800, pitch: -50, headingStep: 47,
   };
   let refinementTimer = null;
 
@@ -35,7 +35,7 @@
      常時描画には戻さず、カメラ配置・到着後だけ低頻度で更新してZ14以上まで精細化する。 */
   function requestLodRefinement(view){
     if(refinementTimer) clearInterval(refinementTimer);
-    const duration = settings.low ? 1200 : 8000;
+    const duration = settings.low ? 1200 : 12000;
     const interval = settings.low ? 400 : 200;
     const endAt = performance.now() + duration;
     view.forceUpdate?.();
@@ -57,10 +57,10 @@
     location.reload();
   }
 
-  /* manifest（PHOTOS）→ Navara レイヤ用の points / route（同一配列を順序のまま使う） */
-  function toPoints(){
-    const points = PHOTOS.map(p => ({ lon: p.lon, lat: p.lat, title: p.title || '' }));
-    return { points, route: points };
+  /* 初回地点だけをNavaraへ渡す。全3,099地点のGeoJSON化は航空写真LODを圧迫する。 */
+  function toInitialPoint(index){
+    const p = PHOTOS[index] || PHOTOS[0];
+    return p ? [{ lon: p.lon, lat: p.lat, title: p.title || '' }] : [];
   }
 
   async function boot(){
@@ -88,10 +88,10 @@
     try{
       view = mod.createPhotoJourneyView(container, { low: settings.low });
       await view.init();               // WebGLコンテキスト生成（失敗時はthrow→フォールバック）
-      // ライトを省いたLite構成でlitのまま描くとLambert BRDFにより航空写真が約1/πまで
-      // 暗くなる。地表は照明演出より判読性を優先し、テクスチャ本来の色で表示する。
-      view.lit = false;
-      const { points, route } = toPoints();
+      // Navara公式の軽量GIS例と同じく、ラスタ追加前にアンビエント光を置く。
+      // unlitへの切替はラスタ合成を失わせるため使用しない。
+      view.addLight({ ambient: { intensity: 1 } });
+      const points = toInitialPoint(first);
 
       /* raster layer は追加時点のカメラから可視タイルを選ぶ。ThreeView の既定カメラの
          まま先に layer を追加すると、animation:false の on-demand mode では最初の
@@ -107,7 +107,7 @@
           heading: settings.headingStep ? (first * settings.headingStep) % 360 : 0,
         });
       }
-      layerState = mod.addPhotoJourneyLayers(view, { points, route });
+      layerState = mod.addPhotoJourneyLayers(view, { points, route: [] });
       requestLodRefinement(view);
     }catch(e){ return fallbackToMapLibre(e); }
 

@@ -5,7 +5,7 @@
    app/static/navara/ に自己完結の ES バンドルを生成する。
 
    N100（低スペック）向けの「軽量構成」をここで唯一の形に固定する:
-     - devicePixelRatio は 1 以下（画素を4倍にしない）
+     - 内部描画倍率は 0.5（固定GPU領域を抑え、航空写真LODへ予算を回す）
      - shadow 無効、MSAA 無効、halfFloat 無効
      - DefaultPlugin は addPlugin() で登録するのみ。addDefaultPhotorealScene() は
        呼ばない（SSR/SSAO/DOF/大気/雲/ボリュームを一切有効化しない）
@@ -26,14 +26,16 @@ import { DefaultPlugin } from "@navaramap/three-default-plugin";
 
 /* 軽量構成。N100相当の内蔵GPUでタイルの先読みと常時描画を抑える上限値。 */
 const NORMAL_OPTIONS = Object.freeze({
-  pixelRatio: 1,        // devicePixelRatio の上限（高DPIでも1に固定）
+  pixelRatio: 0.5,      // 2560x1080実機では1280x540。固定GPU領域を約1/4へ削減
   shadow: false,        // 影は初期化時オプション。N100 では無効
   multisampling: 0,     // MSAA 無効（0）
   halfFloat: false,     // ポスト処理は低精度で十分
   picking: false,       // フィーチャーピッキング無効（タップ対象が無い）
   animation: false,     // flyTo/forceUpdate時だけ描画（Navaraのon-demand mode）
   mobileOptimization: true, // 低画素比などのモバイル向け軽量化を有効化
-  cacheBytes: 128 * 1024 * 1024,
+  // 2560x1080/pixelRatio=1では固定領域だけで予算超過し、画像がZ3で停止した。
+  // 0.5倍と512MiB上限の組合せでN95実測Z15まで到達する。
+  cacheBytes: 512 * 1024 * 1024,
   // 通常表示は撮影地点を判別できる航空写真LODを優先する。
   // 低スペック向けの粗いLODはLOW_POWER_OPTIONSだけで有効にする。
   lodFog: { enabled: false, density: 0, sseFactor: 0 },
@@ -96,7 +98,9 @@ export function createPhotoJourneyView(container, opts = {}) {
   return view;
 }
 
-/* 写真ポイント・ライトルート線・背景タイルをレイヤとして追加する。
+/* 背景タイルをレイヤとして追加する。
+   3,099地点を1本のGeoJSONルートにすると全世界の線が画面を覆い、GPU予算も
+   航空写真から奪うため、地点情報は既存PHOTO LOG/HUDへ任せる。
    tileUrls は server.py の /tiles/{gsi-photo,osm}/ プロキシを指す（CDN は使わない）。 */
 function isDomesticPoint(point) {
   return !!point && point.lon >= 122.5 && point.lon <= 154.5 &&
@@ -133,32 +137,6 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
   const kind = basemap || selectPhotoJourneyBasemap(points[0] || route[0]);
   const raster = view.addSource(rasterDefinition(kind, urls));
   view.addLayer({ type: "raster", source: raster });
-
-  const features = points.map((p) => ({
-    type: "Feature",
-    properties: { title: p.title || "" },
-    geometry: { type: "Point", coordinates: [p.lon, p.lat] },
-  }));
-  if (route.length > 1) {
-    features.push({
-      type: "Feature",
-      properties: {},
-      geometry: { type: "LineString", coordinates: route.map((p) => [p.lon, p.lat]) },
-    });
-  }
-  const geo = view.addSource({
-    type: "geojson",
-    data: { type: "FeatureCollection", features },
-  });
-  view.addLayer({ type: "vector", source: geo, point: { color: 0x00e5ff } });
-  view.addLayer({
-    type: "vector",
-    source: geo,
-    polyline: {
-      color: 0x00e5ff, width: 1.5, maxWidth: 2,
-      opacity: 0.35, transparent: true,
-    },
-  });
 
   // 出典表示（地理院タイル / OSM）。CDN に頼らずサーバー由来のタイルでも出典は必須。
   if (view.attribution) {

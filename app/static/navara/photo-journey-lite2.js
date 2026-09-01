@@ -106409,8 +106409,8 @@ var U8A = /* @__PURE__ */ new N(), N8A = /* @__PURE__ */ new N(), z8A = /* @__PU
   }
 };
 const eU = Object.freeze({
-  pixelRatio: 1,
-  // devicePixelRatio の上限（高DPIでも1に固定）
+  pixelRatio: 0.5,
+  // 2560x1080実機では1280x540。固定GPU領域を約1/4へ削減
   shadow: !1,
   // 影は初期化時オプション。N100 では無効
   multisampling: 0,
@@ -106423,7 +106423,9 @@ const eU = Object.freeze({
   // flyTo/forceUpdate時だけ描画（Navaraのon-demand mode）
   mobileOptimization: !0,
   // 低画素比などのモバイル向け軽量化を有効化
-  cacheBytes: 128 * 1024 * 1024,
+  // 2560x1080/pixelRatio=1では固定領域だけで予算超過し、画像がZ3で停止した。
+  // 0.5倍と512MiB上限の組合せでN95実測Z15まで到達する。
+  cacheBytes: 512 * 1024 * 1024,
   // 通常表示は撮影地点を判別できる航空写真LODを優先する。
   // 低スペック向けの粗いLODはLOW_POWER_OPTIONSだけで有効にする。
   lodFog: { enabled: !1, density: 0, sseFactor: 0 },
@@ -106505,32 +106507,7 @@ function OyA(g, { points: A = [], route: B = [], tileUrls: I = {}, basemap: Q } 
     "gsi-photo": I.gsiPhoto || `${C}/tiles/gsi-photo/{z}/{x}/{y}.png`,
     osm: I.osm || `${C}/tiles/osm/{z}/{x}/{y}.png`
   }, w = Q || Vl(A[0] || B[0]), D = g.addSource(_l(w, E));
-  g.addLayer({ type: "raster", source: D });
-  const t = A.map((s) => ({
-    type: "Feature",
-    properties: { title: s.title || "" },
-    geometry: { type: "Point", coordinates: [s.lon, s.lat] }
-  }));
-  B.length > 1 && t.push({
-    type: "Feature",
-    properties: {},
-    geometry: { type: "LineString", coordinates: B.map((s) => [s.lon, s.lat]) }
-  });
-  const e = g.addSource({
-    type: "geojson",
-    data: { type: "FeatureCollection", features: t }
-  });
-  return g.addLayer({ type: "vector", source: e, point: { color: 58879 } }), g.addLayer({
-    type: "vector",
-    source: e,
-    polyline: {
-      color: 58879,
-      width: 1.5,
-      maxWidth: 2,
-      opacity: 0.35,
-      transparent: !0
-    }
-  }), g.attribution && g.attribution.add([
+  return g.addLayer({ type: "raster", source: D }), g.attribution && g.attribution.add([
     {
       attribution: "航空・衛星画像: 国土地理院 / データソース: Landsat8画像（GSI, TSIC, GEO Grid/AIST）、Landsat8画像（courtesy of the U.S. Geological Survey）、海底地形（GEBCO）",
       attributionUrl: "https://maps.gsi.go.jp/development/ichiran.html"

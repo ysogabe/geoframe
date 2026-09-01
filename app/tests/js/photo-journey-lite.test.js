@@ -3,11 +3,11 @@
  * 検証対象と方式:
  *  - bootstrap.js（起動分岐・一度きりのフォールバックガード）: vm 上で実実行
  *  - modes.js（#mode の唯一の writer）: vm 上で実実行
- *  - frontend/photo-journey-lite.js（軽量構成・manifest→ポイント/ルート変換・ThreeView
+ *  - frontend/photo-journey-lite.js（軽量構成・単一raster basemap・ThreeView
  *    実利用）: import 文と export 接頭辞を除去して vm 上で関数を実呼び出し
  *     （バンドル本体は WebGL/DOM を要するため navara-build-integrity.test.js が静的に検証）
  *  - static/js/photo-journey-lite.js（3dコントローラ）: 遅延ロード・フォールバック・
- *    ~16s周期・showPhoto/setMode 再利用の構造をソース上で検証
+ *    30s周期・showPhoto/setMode 再利用の構造をソース上で検証
  */
 const assert = require('assert');
 const fs = require('fs');
@@ -117,7 +117,7 @@ function loadBootstrap({ search = '', fallback = null } = {}) {
 }
 
 /* ============================================================
- * frontend/photo-journey-lite.js — 軽量構成・変換・ThreeView実利用
+ * frontend/photo-journey-lite.js — 軽量構成・basemap変換・ThreeView実利用
  * ============================================================ */
 const frontendPath = '../frontend/photo-journey-lite.js';
 const frontendSrc = fs.readFileSync(frontendPath, 'utf8');
@@ -156,12 +156,12 @@ runInContext(stripped, feContext);
 
 const LITE_OPTIONS = vm.runInContext('LITE_OPTIONS', feContext);
 assert.ok(Object.isFrozen(LITE_OPTIONS), 'LITE_OPTIONSは凍結されている');
-assert.strictEqual(LITE_OPTIONS.pixelRatio, 1, 'devicePixelRatio上限は1');
+assert.strictEqual(LITE_OPTIONS.pixelRatio, 0.5, 'N95実機では内部描画倍率0.5で航空写真LODを確保');
 assert.strictEqual(LITE_OPTIONS.shadow, false, '影は無効');
 assert.strictEqual(LITE_OPTIONS.multisampling, 0, 'MSAA無効');
 assert.strictEqual(LITE_OPTIONS.halfFloat, false, 'halfFloat無効');
 assert.strictEqual(LITE_OPTIONS.animation, false, '常時60fpsではなく変更時描画');
-assert.strictEqual(LITE_OPTIONS.cacheBytes, 128 * 1024 * 1024, '通常cacheBytesに上限を設定');
+assert.strictEqual(LITE_OPTIONS.cacheBytes, 512 * 1024 * 1024, '実測Z15へ到達する通常cacheBytes上限');
 assert.strictEqual(LITE_OPTIONS.lodFog.enabled, false, '通常表示は航空写真の詳細LODを維持する');
 assert.strictEqual(LITE_OPTIONS.dynamicSse.enabled, false, '通常表示では傾斜時も航空写真を粗くしない');
 assert.strictEqual(LITE_OPTIONS.memoryBudget.sseMultiplierMin, 1, '通常表示の基礎SSEを劣化させない');
@@ -196,13 +196,14 @@ function loadSettings(low) {
 }
 const normalSettings = loadSettings(false);
 const lowSettings = loadSettings(true);
-assert.strictEqual(normalSettings.dwellMs, 16000, '通常の巡回周期は既定値を維持');
+assert.strictEqual(normalSettings.dwellMs, 30000, '航空写真を読み切れるよう通常も30秒滞在する');
 assert.ok(lowSettings.dwellMs > normalSettings.dwellMs, 'LOW_POWERは巡回更新頻度を下げる');
 assert.ok(lowSettings.flyMs < normalSettings.flyMs, 'LOW_POWERはflyTo時間を短縮');
 assert.ok(lowSettings.height > normalSettings.height, 'LOW_POWERは高高度で遠景LODにする');
+assert.strictEqual(normalSettings.pitch, -50, '通常表示は位置を把握しやすい俯瞰角度にする');
 assert.strictEqual(lowSettings.headingStep, 0, 'LOW_POWERは方位更新を止める');
 
-// manifest（points/route）→ Navara レイヤ変換の実呼び出し。
+// 初回地点→単一Navara raster basemap変換の実呼び出し。
 const addPhotoJourneyLayers = vm.runInContext('addPhotoJourneyLayers', feContext);
 const sources = [];
 const layers = [];
@@ -230,6 +231,7 @@ const layerState = addPhotoJourneyLayers(mockView, {
 const raster = sources.filter(s => s.type === 'raster-tile');
 assert.strictEqual(raster.length, 1, '同時に描画するraster-tile basemapは1つだけ');
 assert.strictEqual(raster[0].url, 'http://h/tiles/gsi-photo/{z}/{x}/{y}.png', '国内地点ではGSI航空・衛星写真を選ぶ');
+assert.strictEqual(raster[0].minZoom, 2, 'GSIシームレス写真の提供下限Z2を使う');
 assert.strictEqual(layers.filter(l => l.type === 'raster').length, 1, 'raster layerも1つだけ');
 assert.strictEqual(layerState.basemap.kind, 'gsi-photo', '初期basemapの選択状態を返す');
 
@@ -239,16 +241,10 @@ assert.strictEqual(sourceUpdates.length, 1, '国外へ移動したときだけ�
 assert.strictEqual(sourceUpdates[0].url, 'http://h/tiles/osm/{z}/{x}/{y}.png', '国外ではOSMへ切り替える');
 assert.strictEqual(layerState.basemap.kind, 'osm', 'basemap状態を更新する');
 
-const geo = sources.find(s => s.type === 'geojson');
-assert.ok(geo, '写真ポイント/ルートのgeojsonソースを足す');
-assert.strictEqual(geo.data.type, 'FeatureCollection');
-const features = geo.data.features;
-assert.strictEqual(features.filter(f => f.geometry.type === 'Point').length, 2, '写真ポイントを2点入れる');
-const line = features.find(f => f.geometry.type === 'LineString');
-assert.ok(line, 'ライトルート線（LineString）を入れる');
-// vm レルムで生成された配列はNode側のArrayとプロトタイプが異なるため、JSONで比較する
-assert.strictEqual(JSON.stringify(line.geometry.coordinates), JSON.stringify([[139.7454, 35.6586], [135.5013, 34.6687]]), 'ルートは地点順');
-assert.strictEqual(JSON.stringify(features[0].geometry.coordinates), JSON.stringify([139.7454, 35.6586]), 'ポイント座標は[lon,lat]');
+assert.strictEqual(sources.filter(s => s.type === 'geojson').length, 0,
+  '全地点ルートは描かず航空写真へGPU予算を集中する');
+assert.strictEqual(layers.filter(l => l.type === 'vector').length, 0,
+  '全世界を覆う地点・経路線を追加しない');
 
 assert.ok(Array.isArray(attributions) && attributions.length === 2, '選択可能なGSI/OSMの出典を登録する');
 assert.ok(attributions.some(a => a.attributionUrl.includes('maps.gsi.go.jp')), 'GSI出典を表示する');
@@ -266,7 +262,9 @@ runInContext(controllerSrc, { window: { GEOFRAME_MODE_3D: false } });
 assert.ok(/if\(!window\.GEOFRAME_MODE_3D\) return;/.test(controllerSrc), '3Dでなければ即returnする');
 // Navara バンドルを遅延ロード（通常URLではこの行に到達しない）
 assert.ok(controllerSrc.includes("import('/static/navara/photo-journey-lite.js')"), 'Navaraを遅延ロードする');
-assert.ok(controllerSrc.includes('view.lit = false'), 'ライト無しLiteでは航空写真を原色表示する');
+assert.ok(controllerSrc.includes('view.addLight({ ambient: { intensity: 1 } })'),
+  '航空写真レイヤ追加前に軽量アンビエント光を置く');
+assert.ok(!controllerSrc.includes('view.lit = false'), 'unlit切替でラスタ合成を失わせない');
 assert.ok(controllerSrc.includes('requestLodRefinement(view)'), 'on-demand描画でも航空写真LODを精細化する');
 assert.ok(controllerSrc.includes('setInterval'), '常時描画ではなく期限付きの精細化バーストを使う');
 // 一度きりのフォールバックガード（フラグを立ててリロード。bootstrap.jsがmodeを剥がす）
@@ -280,6 +278,7 @@ assert.ok(!controllerSrc.includes("setMode('PHOTO JOURNEY')"), '3Dで旧ラベ�
 assert.ok(controllerSrc.indexOf('mod.setPhotoJourneyCamera(view') < controllerSrc.indexOf('mod.addPhotoJourneyLayers(view'),
   '初期カメラを配置してからraster layerを追加する');
 assert.ok(controllerSrc.includes('view.forceUpdate?.()'), 'on-demand描画で初期レイヤ追加後に再描画する');
+assert.ok(controllerSrc.includes('toInitialPoint(first)'), 'Navaraへ全地点ではなく初回地点だけを渡す');
 assert.ok(controllerSrc.includes('tick(view, mod, first, layerState, true)'),
   '初回はsetCameraを維持し、同一ターンのflyToで上書きしない');
 assert.ok(controllerSrc.includes('function tick(view, mod, i, layerState, initial = false)'),

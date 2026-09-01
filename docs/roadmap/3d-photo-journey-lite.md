@@ -7,7 +7,7 @@
 ## 1. 目的
 
 既存の MapLibre（2Dタイル）表示を維持したまま、URL に `?mode=3d` を付けたときだけ
-Navara（@navaramap/three）の ThreeView に切り替え、写真ポイントとライトルート線を
+Navara（@navaramap/three）の ThreeView に切り替え、高解像度の航空・衛星写真上を
 低頻度のカメラ遷移で流す「3D PHOTO JOURNEY Lite」起動モードを追加する。
 
 N100 で 30fps / 24fps を維持するため、Navara の重い演出（SSR/SSAO/DOF/大気/雲/ボリューム/
@@ -48,27 +48,27 @@ Navara アダプタ `frontend/photo-journey-lite.js` が唯一の構成点。`LI
 
 | 項目 | 値 | 理由 |
 |---|---|---|
-| `pixelRatio` | 1（上限） | 高DPIで画素を4倍にしない |
+| `pixelRatio` | 0.5 | 2560x1080実機の固定GPU領域を約1/4へ削減し、航空写真LODへ予算を回す |
 | `shadow` | false | 影はN100に重い |
 | `multisampling` | 0 | MSAA無効 |
 | `halfFloat` | false | ポスト処理は低精度で十分 |
 | `picking` | false | タップ対象が無い |
 | `animation` | false | Navaraのon-demand render（flyTo/変更時のみ描画） |
 | `mobileOptimization` | true | モバイル向け軽量化を有効化 |
-| `cacheBytes` | 128 MiB | N100のタイルキャッシュ上限 |
+| `cacheBytes` | 512 MiB | 予約量ではなく保護上限。N95実測でZ3停止を解消しZ15へ到達 |
 | `lodFog` / `dynamicSse` | 通常: 無効、`?low`: 有効・粗め | 通常は地点判読、lowは負荷削減を優先 |
 | `maxPendingRequests` | 4（`?low`: 2） | カメラ移動時のdecode/fetch burstを抑制 |
 
 `?low` では cacheBytes を64 MiB、worker heapを64 MiB、最大同時リクエストを2、
-LOD/SSEをさらに粗くし、カメラ高度を4,200m、飛行時間を1,200ms、地点の滞在を最低30秒
-（通常は16秒）にする。方位変更も止める。高度を上げるのは近景を拡大するためではなく、
+LOD/SSEをさらに粗くし、カメラ高度を4,200m、飛行時間を1,200ms、地点の滞在を最低45秒
+（通常は最低30秒）にする。方位変更も止める。高度を上げるのは近景を拡大するためではなく、
 遠景LODを選ばせてN100のタイル数と更新回数を抑えるためである。
 
 通常表示では航空写真から撮影地点を判別できることを優先し、距離・傾斜によるLOD緩和と
-常時SSE倍率を無効化する。またLite構成はライトを追加しないため、地表を`unlit`にして
-Lambert BRDFによる暗化を避け、航空写真テクスチャ本来の色で表示する。
+常時SSE倍率を無効化する。Navara公式の軽量GIS例と同じく、raster追加前に
+`ambient: {intensity: 1}`を置く。`unlit`切替はこの構成でラスタ合成を失うため使用しない。
 `animation:false`のon-demand描画で親タイル到着後のLOD更新が止まらないよう、カメラ配置・
-到着後だけ8秒間、200ms間隔で`forceUpdate()`する。常時描画は行わず、精細化後は停止する。
+到着後だけ12秒間、200ms間隔で`forceUpdate()`する。常時描画は行わず、精細化後は停止する。
 
 **除外する効果（Lite では呼ばない）**: `DefaultPlugin.addDefaultPhotorealScene()`
 （SSR / SSAO / DOF / 大気散乱 / 雲 / ボリューム / 水面テクスチャ）。これらが参照する
@@ -81,6 +81,8 @@ Lambert BRDFによる暗化を避け、航空写真テクスチャ本来の色�
 国境を跨ぐときは同じraster sourceのURLを`Source.update()`して切り替える。GSI/OSMを同時に
 全面fetchしないため、2560x1080での初期tile burstと240 tiles/min上流制限への到達を抑える。
 出典（GSI・Landsat / OpenStreetMap）は `view.attribution.add()` で表示する。
+全3,099地点のポイントと1本の全世界ルート線は、画面を覆って位置判読を妨げ、GPU予算も
+消費したためNavaraへ渡さない。地点名・座標は既存PHOTO LOG / AREA INTELで表示する。
 
 ## 5. 巡回（3dコントローラ）
 
@@ -92,12 +94,12 @@ Lambert BRDFによる暗化を避け、航空写真テクスチャ本来の色�
    （再生キュー・全網羅・記念日加味・localStorage永続化は 2D と完全に共用）
 2. `import('/static/navara/photo-journey-lite.js')` で Navara バンドルを遅延ロード。
 3. `createPhotoJourneyView(#modelayer)` → `await view.init()`。初回キュー地点へ
-   `setCamera()` を先に適用してから `addPhotoJourneyLayers(view, {points, route})` を呼び、
+   `setCamera()` を先に適用してから初回地点1件だけで`addPhotoJourneyLayers()`を呼び、
    `forceUpdate()` で最初の可視タイル選択・描画を要求する。初回は同一ターンの
    `flyTo()` を省略し、Navara既定カメラへの上書きを防ぐ。
 4. 巡回ループ: `nextQueueIdx()` → `markShown(i)` → `showPhoto(i)`（既存の写真カード +
    AREA INTEL を再利用）→ `setMode('3D PHOTO JOURNEY LITE')` →
-   `flyPhotoJourneyCamera(...)`。通常滞在は約16秒、カメラ移動は5秒。低電力時は最低30秒滞在、
+   `flyPhotoJourneyCamera(...)`。通常滞在は最低30秒、カメラ移動は5秒。低電力時は最低45秒滞在、
    1.2秒移動、4,200mの高高度・固定方位とし、LODと更新頻度を下げる。
 
 **失敗時のフォールバック**: Navara / WASM / worker / WebGL の初期化に失敗したら
@@ -136,7 +138,7 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
 - `app/tests/js/scheduler-quality.test.js` — `scheduler-core.js` を読むよう変更。
   純ロジックを scheduler.js から分離したこと以外、アサーションは同一。
 - `app/tests/js/photo-journey-lite.test.js`（新規）— 起動分岐（bootstrap.js）・
-  フォールバックガード・軽量構成（LITE_OPTIONS）・manifest→ポイント/ルート変換・
+  フォールバックガード・軽量構成（LITE_OPTIONS）・単一raster basemap変換・
   ThreeView 実利用（`new ThreeView` + `DefaultPlugin`、`addDefaultPhotorealScene` を
   呼ばない）を vm 上で実実行。
 - `app/tests/js/navara-build-integrity.test.js`（新規）— `app/static/navara/` の
@@ -152,14 +154,20 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
   `deploy/deploy-pull.sh` 経由でデプロイし直す。
 - `npm run build:navara` は決定的なので、`app/static/navara/` はいつでも再生成できる。
 
-## 9. 残る実機検証（スコープ外）
+## 9. 実機検証
 
-以下は N100 実機での目視・計測が必要で、本実装のスコープ外（自動テストでは検出不能）。
+N95実機（`geoframe-n100.local`）で航空写真単独の隔離ページを計測した。
 
-1. 実機 N100 で 30fps / 24fps が維持されること（フレーム計測）。
-2. 長時間（数時間〜数日）表示後の焼き付き痕（drift の実効性を目視確認）。
-3. Navara 初期化失敗時のフォールバックが実機ブラウザで一度だけ発動すること
+- 2560x1080 CSS表示、内部canvas 1280x540（pixelRatio 0.5）
+- カメラ高度1,800m、俯角-50°、Navara算出zoom 16.32
+- GSI航空写真131枚、最大Z15、GPU推定約440MiB
+- 3秒計測60fps、p95 16.7ms、50ms超フレーム0
+
+以下は長時間運用で継続確認する。
+
+1. 長時間（数時間〜数日）表示後の焼き付き痕（drift の実効性を目視確認）。
+2. Navara 初期化失敗時のフォールバックが実機ブラウザで一度だけ発動すること
    （WebGL 無効化ブラウザ等での確認）。
-4. `?mode=3d` と `?low` の併用時の挙動（drift 停止を含む）。
-5. 実データ（server.py 稼働・写真多数）での再生キュー引継ぎ（2D↔3D で再生位置が
+3. `?mode=3d` と `?low` の併用時の挙動（drift 停止を含む）。
+4. 実データ（server.py 稼働・写真多数）での再生キュー引継ぎ（2D↔3D で再生位置が
    共有されることの確認）。
