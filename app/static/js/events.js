@@ -25,6 +25,77 @@
 const ADSB_POLL = LOW_POWER ? 9000 : 5000;
 const EVENT_MS = 20000;
 let aircraft = [], eventUntil = 0;
+const AIRCRAFT_UPDATE_EVENT = 'geoframe:aircraft-update';
+const AIRCRAFT_ALERT_EVENT = 'geoframe:aircraft-alert';
+const AIRCRAFT_ALERT_END_EVENT = 'geoframe:aircraft-alert-end';
+/* One end timer is shared by aircraft and seismic events.  Replacing an
+   event cancels the old callback before arming the new one, so a stale
+   timeout cannot end a newer alert. */
+let eventEndTimer = null;
+let eventEndToken = 0;
+let activeAircraftAlertUntil = 0;
+let activeAircraftAlertKey = '';
+
+function aircraftIdentity(a){
+  return a && (a.hex || a.callsign) ? String(a.hex || a.callsign) : '';
+}
+
+/* 3D controllerとの境界。viewやNavaraオブジェクトはここへ渡さず、
+   APIデータとイベントの小さなdetailだけをCustomEventで通知する。 */
+function dispatchGeoFrameEvent(name, detail){
+  if(typeof window==='undefined' || typeof window.dispatchEvent!=='function') return;
+  const EventCtor = window.CustomEvent || (typeof CustomEvent==='function' ? CustomEvent : null);
+  if(!EventCtor) return;
+  try{ window.dispatchEvent(new EventCtor(name, {detail})); }catch(e){}
+}
+if(typeof window!=='undefined'){
+  window.GEOFRAME_AIRCRAFT_EVENT = AIRCRAFT_UPDATE_EVENT;
+  window.GEOFRAME_AIRCRAFT_ALERT_EVENT = AIRCRAFT_ALERT_EVENT;
+  window.GEOFRAME_AIRCRAFT_ALERT_END_EVENT = AIRCRAFT_ALERT_END_EVENT;
+  window.GEOFRAME_EVENT_STATE = window.GEOFRAME_EVENT_STATE || {};
+  window.GEOFRAME_EVENT_STATE.isEventActive = () => Date.now() < eventUntil;
+  window.GEOFRAME_EVENT_STATE.getEventUntil = () => eventUntil;
+}
+
+function clearEventEndTimer(){
+  if(eventEndTimer !== null){ clearTimeout(eventEndTimer); eventEndTimer=null; }
+  eventEndToken++;
+}
+
+function scheduleEventEnd(until, callback){
+  clearEventEndTimer();
+  const token = eventEndToken;
+  eventEndTimer = setTimeout(()=>{
+    if(token !== eventEndToken || eventUntil !== until) return;
+    eventEndTimer = null;
+    callback();
+  }, Math.max(0, until-Date.now()));
+}
+
+/* Notify the 3D controller when an aircraft alert ends or is superseded.
+   The old `until` is retained in detail so the controller can reject stale
+   end notifications after a replacement alert has already started. */
+function finishAircraftAlert(reason='replaced'){
+  if(!activeAircraftAlertUntil) return false;
+  const until = activeAircraftAlertUntil;
+  const ownsEventState = eventUntil === until;
+  activeAircraftAlertUntil = 0;
+  activeAircraftAlertKey = '';
+  if(ownsEventState) eventUntil = 0;
+  clearEventEndTimer();
+  /* Replacement is immediately followed by triggerEvent/loadEnv setting the
+     new bar and mode.  Only a real terminal path may touch the ordinary DOM;
+     this guard prevents a delayed old callback from hiding a replacement
+     aircraft or seismic event. */
+  if(ownsEventState && (reason === 'timeout' || reason === 'target-disappeared' || reason === 'ended')){
+    const bar = document.getElementById('alertbar');
+    if(bar) bar.style.display='none';
+    if(typeof setMode === 'function')
+      setMode(window.GEOFRAME_MODE_3D ? '3D PHOTO JOURNEY LITE' : 'PHOTO JOURNEY');
+  }
+  dispatchGeoFrameEvent(AIRCRAFT_ALERT_END_EVENT, {until, reason});
+  return true;
+}
 const cooldown = {};   // hex/callsign → 次回演出可能時刻
 const acEls = {};      // hex → DOM要素
 /* 常時稼働で機体キーが溜まり続けないよう、期限切れを掃除しつつ上限を切る */
@@ -82,12 +153,17 @@ function renderAirPanel(){
 }
 
 function triggerEvent(a){
+  if(!a || !Number.isFinite(Number(a.lat)) || !Number.isFinite(Number(a.lon))) return false;
   const key = a.match ? 'm:'+(a.callsign||a.hex) : 'r:'+a.hex;
   const now = Date.now();
   if(now < (cooldown[key]||0)) return false;
   cooldown[key] = now + (a.match ? 2*3600e3 : 30*60e3);
   pruneCooldown();
+  if(activeAircraftAlertUntil) finishAircraftAlert();
+  else clearEventEndTimer();
   eventUntil = now + EVENT_MS;
+  activeAircraftAlertUntil = eventUntil;
+  activeAircraftAlertKey = aircraftIdentity(a);
   const bar = document.getElementById('alertbar');
   armBase(a.lon, a.lat, 9.5);
   map.flyTo({center:[a.lon,a.lat], zoom:9.5, pitch:0, bearing:0,
@@ -111,19 +187,37 @@ function triggerEvent(a){
       `${a.callsign} は ${a.route.to.city} 行き\nあなたの写真: ${m.place||m.title}（${m.time||'—'}）  空港から${m.km}km`);
     setMode('MEMORY LINK');
   }
-  setTimeout(()=>{ bar.style.display='none';
-    setMode('PHOTO JOURNEY'); }, EVENT_MS);
+  const kind = a.emergency ? 'emergency' : a.rare ? 'rare' : a.match ? 'match' : 'normal';
+  dispatchGeoFrameEvent(AIRCRAFT_ALERT_EVENT, {aircraft:{...a}, kind, until:eventUntil});
+  const alertUntil = eventUntil;
+  scheduleEventEnd(alertUntil, ()=>{
+    if(activeAircraftAlertUntil !== alertUntil) return;
+    finishAircraftAlert('timeout');
+  });
   return true;
 }
 
 async function pollAircraft(){
+  let feedNow = Date.now()/1000;
+  let feedAvailable = false;
   try{
     const r = await fetch('/api/aircraft'); if(!r.ok) throw 0;
     const d = await r.json(); if(!d.ok) throw 0;
-    aircraft = d.aircraft;
-  }catch(e){ aircraft = []; }
+    aircraft = Array.isArray(d.aircraft) ? d.aircraft : [];
+    feedAvailable = true;
+    const parsedNow = Number(d.now);
+    if(Number.isFinite(parsedNow)) feedNow = parsedNow;
+  }catch(e){ /* Preserve the last good snapshot; this is not disappearance. */ }
   syncAircraft(); renderAirPanel();
-  if(Date.now() >= eventUntil){
+  dispatchGeoFrameEvent(AIRCRAFT_UPDATE_EVENT, {
+    aircraft: aircraft.map(a => ({...a})), now: feedNow,
+    ok: feedAvailable, feedAvailable,
+  });
+  if(feedAvailable && activeAircraftAlertUntil && activeAircraftAlertKey &&
+     !aircraft.some(a => aircraftIdentity(a) === activeAircraftAlertKey)){
+    finishAircraftAlert('target-disappeared');
+  }
+  if(feedAvailable && Date.now() >= eventUntil){
     const cand = aircraft.find(a=>a.emergency) || aircraft.find(a=>a.rare) || aircraft.find(a=>a.match);
     if(cand) triggerEvent(cand);
   }
@@ -217,6 +311,8 @@ async function loadEnv(){
     if(parseInt(q.maxi)>=3 && Date.now()>=eventUntil
        && Date.now()-lastEqEvent > 10*60e3){   // 群発地震でイベントが連鎖しないよう10分空ける
       lastEqEvent=Date.now();
+      if(activeAircraftAlertUntil) finishAircraftAlert();
+      else clearEventEndTimer();
       eventUntil=Date.now()+EQ_EVENT_MS;
       const bar=document.getElementById('alertbar');
       bar.className=''; bar.style.display='block';
@@ -229,8 +325,9 @@ async function loadEnv(){
         `${q.place}`, `M${q.mag}  最大震度${q.maxi}  ${q.time}\n出典: 気象庁`);
       setMode('SEISMIC WATCH');
       showHazard(q.lat, q.lon);   // 防災レイヤ（洪水・津波・土砂・液状化等）を重畳
-      setTimeout(()=>{ bar.style.display='none';
-        setMode('PHOTO JOURNEY'); }, EQ_EVENT_MS);
+      const quakeUntil = eventUntil;
+      scheduleEventEnd(quakeUntil, ()=>{ bar.style.display='none';
+        setMode(window.GEOFRAME_MODE_3D ? '3D PHOTO JOURNEY LITE' : 'PHOTO JOURNEY'); });
     }
   }
   envFirst=false;

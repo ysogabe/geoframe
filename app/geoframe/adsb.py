@@ -1,5 +1,7 @@
 """ADS-B 連携（server.py L1399-L1401 / L1403 / L1413-L1502 より移動）"""
+import math
 import random
+import time
 
 from .config import (ADSBDB, ADSB_RECEIVER_URL, ADSB_URL, EMERGENCY_SQUAWKS,
                      MATCH_KM, MAX_AIRPORT_LOOKUPS_PER_POLL, MAX_LOOKUPS_PER_POLL,
@@ -14,6 +16,32 @@ from .util import haversine_km, http_json
 # ADS-B 連携
 # ============================================================
 _receiver = None
+
+
+def _finite_number(value):
+    """ADS-Bの任意数値をJSONへ安全に渡す（ground/NaN/欠損はNone）。"""
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _optional_number(value):
+    """整数値は整数のまま、その他の有限値はfloatへ正規化する。"""
+    number = _finite_number(value)
+    if number is None:
+        return None
+    return int(number) if number.is_integer() else number
+
+
+def _altitude_value(value):
+    """Keep readsb's ``ground`` sentinel while rejecting invalid JSON numbers."""
+    if isinstance(value, str) and value.strip().lower() == "ground":
+        return "ground"
+    return _optional_number(value)
 
 
 def get_receiver():
@@ -47,26 +75,64 @@ def adsbdb_lookup(kind, key, budget):
 
 
 def api_aircraft():
+    request_now = time.time()
     try:
         raw = http_json(ADSB_URL)
     except Exception as e:
-        return {"ok": False, "error": f"ADS-B feed unreachable: {e}"}
+        return {"ok": False, "now": request_now,
+                "error": f"ADS-B feed unreachable: {e}"}
+    if not isinstance(raw, dict):
+        return {"ok": False, "now": request_now,
+                "error": "ADS-B feed returned an invalid document"}
+    # readsb/tar1090の aircraft.json には観測フィード生成時刻 now がある。
+    # 古い受信機やモックが持たない場合はリクエスト時刻へ安全にfallbackする。
+    feed_now = _finite_number(raw.get("now"))
+    if feed_now is None:
+        feed_now = request_now
     photos = get_manifest_cached()
     budget = [MAX_LOOKUPS_PER_POLL]
     airport_budget = [MAX_AIRPORT_LOOKUPS_PER_POLL]
     home_pref = setting_get("home_pref")   # 未設定なら None（従来どおり除外なし）
     out = []
-    for a in raw.get("aircraft", []):
-        if "lat" not in a or "lon" not in a or a.get("seen_pos", 99) > 60:
+    rows = raw.get("aircraft", [])
+    if not isinstance(rows, (list, tuple)):
+        rows = []
+    for a in rows:
+        if not isinstance(a, dict):
             continue
-        hexid = a.get("hex", "").strip()
-        callsign = (a.get("flight") or "").strip()
+        lat = _finite_number(a.get("lat"))
+        lon = _finite_number(a.get("lon"))
+        seen_pos = _finite_number(a.get("seen_pos"))
+        # 3Dレイヤが「最後に位置を観測した時刻」を判定できるよう、
+        # seen_pos欠損も新鮮とはみなさず除外する。通常モードのDOM表示と
+        # 同じAPI応答なので、従来の60秒上限も維持する。
+        if (lat is None or lon is None or seen_pos is None or
+                seen_pos < 0 or seen_pos > 60):
+            continue
+        hexid = str(a.get("hex") or "").strip()
+        callsign = str(a.get("flight") or "").strip()
+        track = _optional_number(a.get("track"))
+        if track is None:
+            track = 0
+        r_dst = _finite_number(a.get("r_dst"))
+        alt_baro = _altitude_value(a.get("alt_baro"))
         item = {
             "hex": hexid, "callsign": callsign,
-            "lat": a["lat"], "lon": a["lon"],
-            "alt": a.get("alt_baro"), "gs": a.get("gs"),
-            "track": a.get("track", 0),
-            "dist_km": round(a["r_dst"] * 1.852, 1) if "r_dst" in a else None,
+            "lat": lat, "lon": lon,
+            "alt": alt_baro, "gs": _optional_number(a.get("gs")),
+            # altは既存クライアント互換。alt_baroも明示して新クライアントの
+            # ground判定と、将来のAPI利用者の移行を容易にする。
+            "alt_baro": alt_baro,
+            "alt_geom": _optional_number(a.get("alt_geom")),
+            "track": track,
+            "true_heading": _optional_number(a.get("true_heading")),
+            "mag_heading": _optional_number(a.get("mag_heading")),
+            "track_rate": _optional_number(a.get("track_rate")),
+            "roll": _optional_number(a.get("roll")),
+            "geom_rate": _optional_number(a.get("geom_rate")),
+            "baro_rate": _optional_number(a.get("baro_rate")),
+            "seen_pos": seen_pos,
+            "dist_km": round(r_dst * 1.852, 1) if r_dst is not None else None,
             "squawk": a.get("squawk", ""),
             "type": a.get("t", ""), "reg": a.get("r", ""),
             "owner": "", "photo_thumb": None, "route": None,
@@ -121,4 +187,6 @@ def api_aircraft():
     # ここでのsave_cacheは行わない（5秒毎ポーリング×全量書き込みでSD/eMMCを消耗させるため）。
     # 新規に引いたadsbdb結果は cache_put でdirty化され、cache_saverが60秒間隔で書き出す
     out.sort(key=lambda x: x["dist_km"] if x["dist_km"] is not None else 9e9)
-    return {"ok": True, "receiver": get_receiver(), "aircraft": out}
+    # nowはフィード生成時刻。各機体のseen_pos（秒）と組み合わせることで、
+    # 3D側が古い位置を除外しつつ、アラート中の補間基準を持てる。
+    return {"ok": True, "now": feed_now, "receiver": get_receiver(), "aircraft": out}

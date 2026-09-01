@@ -106,6 +106,39 @@ LOD/SSEをさらに粗くし、カメラ高度を4,200m、飛行時間を1,200ms
 `sessionStorage['geoframe.3d.fallback'] = '1'` を立てて `location.reload()` する。
 bootstrap.js が `mode=3d` を剥がして一度だけ通常モードへ戻す（ループしない）。
 
+## 5.1 ADS-B航空機Polygonとアラート視点
+
+`/api/aircraft` は従来の `alt` / `track` を維持しつつ、readsbの `alt_geom`（WGS84楕円体
+基準の幾何高度）、`alt_baro`、`true_heading`、`mag_heading`、`track_rate`、`roll`、
+`geom_rate`、`baro_rate`、`seen_pos` とフィード時刻 `now` を返す。3D表示では
+`alt_geom` → `alt_baro` → `alt` の順に採用し、ftをmへ変換する。`ground`、欠損値、NaN/∞は
+地表高度0または安全な既定値へ正規化する。
+
+航空機はGeoJSONの8〜12頂点Polygonとして作り、全頂点に同じ実高度を持たせる。
+Navaraのvector layerで `polygon.perPositionHeight: true` を指定するため、地表へクランプせず
+上空の平面機影として描画できる。通常は緑、行き先マッチは琥珀、rareはマゼンタ、emergencyは
+赤橙の4層に分け、位置の鮮度60秒以内・最大20機に制限する。
+
+MEMORY LINKではCustomEvent経由で3D controllerが巡回を止め、対象のbasemapへ切り替え、
+まず上空のfocus/chaseへ `flyTo` した後、幾何高度・true heading優先・上昇率/速度から推定した
+pitch・roll clampを使う再構成機上視点へ移る。これはコックピット映像や実際の機内視点ではなく、
+ADS-Bの位置・速度・姿勢から作る近似である。地形・建物・雲は取得せず、機影の高度も楕円体基準
+なので、山岳地や高度基準の差による見え方は残る。rare/emergencyは少なくともchase/focusを
+表示し、対象Polygonはカメラが機体内へ入らないよう一時的に除外する。
+
+フィード更新の間だけ4〜5Hz（通常5Hz、LOW_POWER 4Hz）で最大8秒の短いデッドレコニングを行う。
+常時 `requestAnimationFrame` は使わず、アラート終了、対象消失、別アラートへの置換、スリープ、
+Navaraエラー時にタイマーとリスナーを破棄して巡回へ戻す。N100では航空機Polygonの数、
+更新周波数、タイル同時取得数を増やさず、SSR/SSAO/DOF、影、雲、完全な地形再構成をLiteの
+対象外とする。
+
+対象消失は、成功したfeed（`feedAvailable: true`）で対象キーが無くなった場合だけ即時終了と
+判定する。HTTP/JSON取得失敗（`feedAvailable: false`）は直前のfeedと最終成功時刻を保持し、
+誤ってアラートを終了させない。一方、通常機影の鮮度は `seen_pos` に最終成功feedからの
+wall-clock経過時間を加算して判定するため、transport outageが続けばcombined ageが60秒を
+超えた時点で凍結Polygonも消える。終了時は航空機Polygonを再表示し、アラート用interval・
+dwell timerを破棄して巡回を再開する。
+
 ## 6. ビルド
 
 ```
@@ -140,7 +173,10 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
 - `app/tests/js/photo-journey-lite.test.js`（新規）— 起動分岐（bootstrap.js）・
   フォールバックガード・軽量構成（LITE_OPTIONS）・単一raster basemap変換・
   ThreeView 実利用（`new ThreeView` + `DefaultPlugin`、`addDefaultPhotorealScene` を
-  呼ばない）を vm 上で実実行。
+  呼ばない）・ADS-B純関数・Polygon layer lifecycle・CustomEvent置換競合・3D controllerの
+  alert pause/resumeとtransport outage agingをvm上で実実行。
+- `app/tests/test_adsb.py` — `/api/aircraft` の旧フィールド互換、追加姿勢フィールド、
+  feed `now`、ground/欠損/非有限値の正規化をモックフィードで検証。
 - `app/tests/js/navara-build-integrity.test.js`（新規）— `app/static/navara/` の
   生成物整合性（公開API・WASM内包・`assets/` デッドウェイト排除・`\0asm` マジック・
   workerチャンク1個）。

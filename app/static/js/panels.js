@@ -112,6 +112,10 @@ async function pollRoomEnv(){
 /* ==== 在/不在スリープ（HA人感センサー）＋ナイトモード（減光） ==== */
 let sleeping=false;
 let nightMode=null;     // null=未判定。body.night の現在状態と一致させる
+if(typeof window!=='undefined'){
+  window.GEOFRAME_EVENT_STATE = window.GEOFRAME_EVENT_STATE || {};
+  window.GEOFRAME_EVENT_STATE.isSleeping = () => sleeping;
+}
 /* HAのsun.sunが取れないとき（/api/presence の night が null）の時刻フォールバック */
 function isNightByClock(){
   const h = new Date().getHours();
@@ -138,7 +142,16 @@ async function pollPresence(){
   if(off!==sleeping){
     sleeping=off;
     document.getElementById('sleep').classList.toggle('on', off);
-    setMode(off?'SLEEP':'PHOTO JOURNEY');
+    // The 3D controller owns its journey label and resumes its own camera
+    // after wake.  Keep the ordinary MapLibre mode behavior unchanged.
+    if(off) setMode('SLEEP');
+    else if(!window.GEOFRAME_MODE_3D) setMode('PHOTO JOURNEY');
+  }
+  if(typeof window!=='undefined' && typeof window.dispatchEvent==='function'){
+    const EventCtor = window.CustomEvent || (typeof CustomEvent==='function' ? CustomEvent : null);
+    if(EventCtor) try{ window.dispatchEvent(new EventCtor('geoframe:presence-state', {
+      detail:{sleeping, night:nightMode},
+    })); }catch(e){}
   }
 }
 

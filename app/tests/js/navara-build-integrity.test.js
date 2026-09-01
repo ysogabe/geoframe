@@ -31,7 +31,9 @@ for (const wasm of ['navara_wasm_bg.wasm', 'navara_wasm_api_bg.wasm', 'navara_wa
 // ---- エントリ（facade）の公開APIと固定名 ----
 const facade = read('photo-journey-lite.js').toString('utf8');
 for (const sym of ['LITE_OPTIONS', 'addPhotoJourneyLayers', 'createPhotoJourneyView',
-                   'flyPhotoJourneyCamera', 'setPhotoJourneyCamera']) {
+                   'flyPhotoJourneyCamera', 'setPhotoJourneyCamera',
+                   'addPhotoJourneyAircraftLayer', 'aircraftGeoJSON',
+                   'aircraftCameraPoseAt', 'aircraftChasePose']) {
   assert.ok(facade.includes(sym), `エントリが ${sym} を再輸出していない`);
 }
 assert.ok(facade.includes('./photo-journey-lite2.js'), 'エントリがメインバンドルを相対importしていない');
@@ -52,6 +54,7 @@ for (const worker of ['navara-worker.js', 'navara-font-worker.js']) {
 assert.ok(bundle.includes('navara-worker.js'), 'メインバンドルがtile workerを実ファイル参照する');
 assert.ok(bundle.includes('navara-font-worker.js'), 'メインバンドルがfont workerを実ファイル参照する');
 assert.ok(!bundle.includes('navara_wasm_worker_bg-'), 'tile workerのhashed WASM参照をメインbundleに残さない');
+assert.ok(bundle.includes('perPositionHeight'), '航空機Polygonの高度を頂点ごとに描画する設定がbundleに含まれる');
 
 // ---- spark worker チャンク（1つだけ） ----
 const sparkFiles = entries.filter(f => /^spark\.module-.*\.js$/.test(f));

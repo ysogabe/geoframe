@@ -128,6 +128,420 @@ export function updatePhotoJourneyBasemap(state, point) {
   return state;
 }
 
+/* ============================================================
+   ADS-B 3D aircraft overlay
+
+   The functions in this section are deliberately pure until the three small
+   Navara layer helpers at the bottom.  The feed uses feet, knots and feet per
+   minute, while GeoJSON positions use metres.  Keeping the conversion and
+   geometry here makes the browser-side bridge testable without WebGL.
+   ============================================================ */
+const FEET_TO_METERS = 0.3048;
+const KNOT_TO_METERS_PER_SECOND = 0.514444;
+const VERTICAL_FEET_PER_MINUTE_TO_METERS_PER_SECOND = 0.00508;
+const EARTH_LAT_METERS = 111320;
+const AIRCRAFT_MAX_AGE_SECONDS = 60;
+const AIRCRAFT_MAX_COUNT = 20;
+const AIRCRAFT_PITCH_LIMIT = 25;
+const AIRCRAFT_ROLL_LIMIT = 60;
+
+function finiteNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "string" && value.trim().toLowerCase() === "ground") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+export function feetToMeters(value) {
+  const feet = finiteNumber(value);
+  return feet === null ? 0 : feet * FEET_TO_METERS;
+}
+
+function altitudeFeet(value) {
+  const feet = finiteNumber(value);
+  return feet === null || feet < 0 ? null : feet;
+}
+
+/* alt_geom is the WGS84 geometric altitude.  alt_baro/alt are compatibility
+   fallbacks; a literal "ground" and malformed values become sea-level 0m. */
+export function aircraftAltitudeMeters(aircraft) {
+  const a = aircraft || {};
+  const geometric = altitudeFeet(a.alt_geom);
+  if (geometric !== null) return feetToMeters(geometric);
+  const fallback = altitudeFeet(a.alt_baro) ?? altitudeFeet(a.alt);
+  return fallback === null ? 0 : feetToMeters(fallback);
+}
+
+function normalizedHeading(value) {
+  const heading = finiteNumber(value);
+  if (heading === null) return null;
+  return ((heading % 360) + 360) % 360;
+}
+
+/* true heading is the best camera orientation; track is the motion fallback,
+   then magnetic heading for old feeds that omit both. */
+export function aircraftHeading(aircraft) {
+  const a = aircraft || {};
+  return normalizedHeading(a.true_heading) ??
+    normalizedHeading(a.track) ??
+    normalizedHeading(a.mag_heading) ?? 0;
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+/* Estimate flight-path pitch from vertical rate and ground speed.  Both
+   conversions are intentionally explicit so a missing/ground speed cannot
+   create Infinity or NaN camera values. */
+export function aircraftPitch(aircraft) {
+  const a = aircraft || {};
+  const verticalRate = finiteNumber(a.geom_rate) ?? finiteNumber(a.baro_rate);
+  const groundSpeed = finiteNumber(a.gs);
+  if (verticalRate === null || groundSpeed === null || groundSpeed <= 0) return 0;
+  const verticalMps = verticalRate * VERTICAL_FEET_PER_MINUTE_TO_METERS_PER_SECOND;
+  const horizontalMps = groundSpeed * KNOT_TO_METERS_PER_SECOND;
+  return clamp(Math.atan2(verticalMps, horizontalMps) * 180 / Math.PI,
+    -AIRCRAFT_PITCH_LIMIT, AIRCRAFT_PITCH_LIMIT);
+}
+
+export function aircraftRoll(aircraft) {
+  return clamp(finiteNumber((aircraft || {}).roll) ?? 0,
+    -AIRCRAFT_ROLL_LIMIT, AIRCRAFT_ROLL_LIMIT);
+}
+
+/* readsb's seen_pos is seconds since the last position message.  Accept an
+   epoch timestamp too, which keeps the helper compatible with alternate
+   gateways that already materialise the feed timestamp. */
+function seenPositionAgeSeconds(aircraft, now) {
+  const seen = finiteNumber((aircraft || {}).seen_pos);
+  if (seen === null || seen < 0) return null;
+  if (seen <= 100000000) return seen;
+  const feedNow = finiteNumber(now);
+  return feedNow !== null && feedNow >= seen ? feedNow - seen : null;
+}
+
+/* A failed transport leaves the last good readsb object in memory.  Add the
+   wall-clock outage age separately so a frozen seen_pos cannot stay visible
+   forever.  This remains pure and is therefore easy to exercise without WebGL. */
+export function aircraftFreshnessAge(aircraft, now = Date.now() / 1000,
+  feedAgeSeconds = 0) {
+  const seenAge = seenPositionAgeSeconds(aircraft, now);
+  if (seenAge === null) return null;
+  const outageAge = Math.max(0, finiteNumber(feedAgeSeconds) ?? 0);
+  return seenAge + outageAge;
+}
+
+export function isFreshAircraft(aircraft, now = Date.now() / 1000,
+  maxAgeSeconds = AIRCRAFT_MAX_AGE_SECONDS, feedAgeSeconds = 0) {
+  const maxAge = finiteNumber(maxAgeSeconds);
+  const age = aircraftFreshnessAge(aircraft, now, feedAgeSeconds);
+  return maxAge !== null && maxAge >= 0 && age !== null && age <= maxAge;
+}
+
+function validCoordinate(aircraft) {
+  const lat = finiteNumber((aircraft || {}).lat);
+  const lon = finiteNumber((aircraft || {}).lon);
+  return lat !== null && lon !== null && lat >= -90 && lat <= 90 &&
+    lon >= -180 && lon <= 180 ? { lat, lon } : null;
+}
+
+export function aircraftVisualStatus(aircraft) {
+  const a = aircraft || {};
+  if (a.emergency) return "emergency";
+  if (a.rare) return "rare";
+  if (a.match) return "match";
+  return "normal";
+}
+
+/* 10 unique vertices + the closing vertex.  The local x axis is along the
+   nose (metres north at heading 0) and y is the right wing. */
+const AIRCRAFT_SILHOUETTE = [
+  [58, 0], [17, 10], [11, 32], [-7, 21], [-37, 8],
+  [-55, 0], [-37, -8], [-7, -21], [11, -32], [17, -10],
+];
+
+export function aircraftPolygon(aircraft, options = {}) {
+  const position = validCoordinate(aircraft);
+  if (!position) return null;
+  const heading = aircraftHeading(aircraft);
+  const radians = heading * Math.PI / 180;
+  const forward = Math.sin(radians);
+  const north = Math.cos(radians);
+  const east = Math.cos(radians);
+  const rightNorth = -Math.sin(radians);
+  // The default silhouette is 113m nose-to-tail.  sizeMeters is the desired
+  // exaggerated display length, not a multiplier, and is bounded to keep one
+  // bad caller from producing a world-sized polygon.
+  const displayLengthM = clamp(finiteNumber(options.sizeMeters) ?? 113, 80, 150);
+  const size = displayLengthM / 113;
+  const heightScale = finiteNumber(options.heightScale) ?? 1;
+  const heightM = aircraftAltitudeMeters(aircraft) * Math.max(0, heightScale);
+  const cosLat = Math.max(0.05, Math.abs(Math.cos(position.lat * Math.PI / 180)));
+
+  const ring = AIRCRAFT_SILHOUETTE.map(([along, lateral]) => {
+    const northM = (along * north + lateral * rightNorth) * size;
+    const eastM = (along * forward + lateral * east) * size;
+    return [
+      position.lon + eastM / (EARTH_LAT_METERS * cosLat),
+      position.lat + northM / EARTH_LAT_METERS,
+      heightM,
+    ];
+  });
+  ring.push(ring[0].slice());
+  return ring;
+}
+
+function aircraftFeature(aircraft, options = {}) {
+  const ring = aircraftPolygon(aircraft, options);
+  if (!ring) return null;
+  const status = aircraftVisualStatus(aircraft);
+  const heightM = aircraftAltitudeMeters(aircraft);
+  return {
+    type: "Feature",
+    id: aircraft.hex || aircraft.callsign || undefined,
+    properties: {
+      hex: aircraft.hex || "",
+      callsign: aircraft.callsign || "",
+      status,
+      layerStatus: status,
+      heightM,
+      heading: aircraftHeading(aircraft),
+      pitch: aircraftPitch(aircraft),
+      roll: aircraftRoll(aircraft),
+    },
+    geometry: { type: "Polygon", coordinates: [ring] },
+  };
+}
+
+/* Build at most twenty fresh polygons.  excludeHex is used during the
+   first-person alert so the selected aircraft is not drawn through the camera. */
+export function aircraftGeoJSON(aircraft = [], options = {}) {
+  const now = options.now === undefined ? Date.now() / 1000 : options.now;
+  const maxAge = options.maxAgeSeconds ?? AIRCRAFT_MAX_AGE_SECONDS;
+  const requestedCount = finiteNumber(options.maxAircraft) ?? AIRCRAFT_MAX_COUNT;
+  const maxCount = Math.max(0, Math.min(Math.floor(requestedCount), AIRCRAFT_MAX_COUNT));
+  const exclude = options.excludeHex;
+  const wantedStatus = options.status;
+  if (maxCount === 0) return { type: "FeatureCollection", features: [] };
+  const seenKeys = new Set();
+  const features = [];
+  const rows = (Array.isArray(aircraft) ? aircraft : []).slice().sort((a, b) => {
+    const rank = { emergency: 0, rare: 1, match: 2, normal: 3 };
+    return (rank[aircraftVisualStatus(a)] ?? 3) - (rank[aircraftVisualStatus(b)] ?? 3);
+  });
+  for (const a of rows) {
+    const key = a && (a.hex || a.callsign);
+    if (exclude && key === exclude) continue;
+    if (key && seenKeys.has(key)) continue;
+    if (!isFreshAircraft(a, now, maxAge, options.feedAgeSeconds) || !validCoordinate(a)) continue;
+    if (wantedStatus && aircraftVisualStatus(a) !== wantedStatus &&
+      !(wantedStatus === "alert" &&
+        (aircraftVisualStatus(a) === "rare" || aircraftVisualStatus(a) === "emergency"))) continue;
+    const feature = aircraftFeature(a, options);
+    if (!feature) continue;
+    if (key) seenKeys.add(key);
+    features.push(feature);
+    if (features.length >= maxCount) break;
+  }
+  return { type: "FeatureCollection", features };
+}
+
+export function aircraftGeoJSONByStatus(aircraft, status, options = {}) {
+  const all = aircraftGeoJSON(aircraft, { ...options, status });
+  return {
+    type: "FeatureCollection",
+    features: all.features,
+  };
+}
+
+/* Camera coordinates are geodetic: height is metres above the ellipsoid.  Navara
+   uses the same sign as the aircraft attitude convention: positive pitch is
+   nose-up and negative pitch looks toward the surface.  The default 8m eye
+   offset leaves the camera above the flat aircraft polygon; the polygon is
+   intentionally a display silhouette, not a solid aircraft. */
+export function aircraftCameraPose(aircraft, options = {}) {
+  const position = validCoordinate(aircraft) || { lon: 0, lat: 0 };
+  const eyeOffset = Math.max(1, finiteNumber(options.eyeOffsetM) ?? 8);
+  return {
+    lng: position.lon,
+    lat: position.lat,
+    height: aircraftAltitudeMeters(aircraft) + eyeOffset,
+    heading: aircraftHeading(aircraft),
+    pitch: clamp(aircraftPitch(aircraft), -AIRCRAFT_PITCH_LIMIT, AIRCRAFT_PITCH_LIMIT),
+    roll: aircraftRoll(aircraft),
+  };
+}
+
+function offsetGeodetic(position, eastM, northM) {
+  const cosLat = Math.max(0.05, Math.abs(Math.cos(position.lat * Math.PI / 180)));
+  const lat = clamp(position.lat + northM / EARTH_LAT_METERS, -89.9, 89.9);
+  const rawLon = position.lon + eastM / (EARTH_LAT_METERS * cosLat);
+  return {
+    lat,
+    lon: ((rawLon + 180) % 360 + 360) % 360 - 180,
+  };
+}
+
+function aircraftVelocity(aircraft) {
+  const speed = finiteNumber((aircraft || {}).gs);
+  if (speed === null || speed < 0) return null;
+  const heading = aircraftHeading(aircraft) * Math.PI / 180;
+  const verticalRate = finiteNumber((aircraft || {}).geom_rate) ??
+    finiteNumber((aircraft || {}).baro_rate) ?? 0;
+  return {
+    eastMps: Math.sin(heading) * speed * KNOT_TO_METERS_PER_SECOND,
+    northMps: Math.cos(heading) * speed * KNOT_TO_METERS_PER_SECOND,
+    upMps: verticalRate * VERTICAL_FEET_PER_MINUTE_TO_METERS_PER_SECOND,
+  };
+}
+
+/* Dead-reckoning is deliberately short-lived and only used during an alert.
+   It keeps the camera moving between the feed's roughly five-second updates;
+   it is never used to keep a permanent animation loop alive. */
+export function advanceAircraft(aircraft, seconds = 0) {
+  const a = { ...(aircraft || {}) };
+  const position = validCoordinate(a);
+  const velocity = aircraftVelocity(a);
+  const duration = clamp(finiteNumber(seconds) ?? 0, -8, 8);
+  if (!position || !velocity || duration === 0) return a;
+  const cosLat = Math.max(0.05, Math.abs(Math.cos(position.lat * Math.PI / 180)));
+  a.lat = position.lat + velocity.northMps * duration / EARTH_LAT_METERS;
+  a.lon = position.lon + velocity.eastMps * duration / (EARTH_LAT_METERS * cosLat);
+  const altitudeM = Math.max(0, aircraftAltitudeMeters(a) + velocity.upMps * duration);
+  // Keep the original altitude source visible to callers while making the
+  // derived height usable by aircraftCameraPose without introducing NaN.
+  a.alt_geom = altitudeM / FEET_TO_METERS;
+  return a;
+}
+
+export function aircraftCameraPoseAt(aircraft, seconds = 0, options = {}) {
+  return aircraftCameraPose(advanceAircraft(aircraft, seconds), options);
+}
+
+export function aircraftChasePose(aircraft, options = {}) {
+  const position = validCoordinate(aircraft) || { lon: 0, lat: 0 };
+  const heading = aircraftHeading(aircraft);
+  const radians = heading * Math.PI / 180;
+  const chaseDistance = clamp(finiteNumber(options.distanceM) ?? 700, 300, 2500);
+  const aboveM = clamp(finiteNumber(options.aboveM) ?? 180, 80, 600);
+  // Place the camera behind the aircraft along the reciprocal flight vector.
+  // Heading remains the aircraft heading so the view looks forward through the
+  // flight path, while the modest vertical offset keeps the chase readable.
+  const chase = offsetGeodetic(position,
+    -Math.sin(radians) * chaseDistance,
+    -Math.cos(radians) * chaseDistance);
+  return {
+    lng: chase.lon,
+    lat: chase.lat,
+    height: aircraftAltitudeMeters(aircraft) + aboveM,
+    heading,
+    pitch: clamp(finiteNumber(options.pitch) ?? -12, -AIRCRAFT_PITCH_LIMIT, AIRCRAFT_PITCH_LIMIT),
+    roll: 0,
+  };
+}
+
+export function aircraftApproachPose(aircraft) {
+  const eye = aircraftCameraPose(aircraft, { eyeOffsetM: 8 });
+  return {
+    ...eye,
+    height: Math.max(eye.height + 400, 1200),
+    pitch: -28,
+    roll: 0,
+  };
+}
+
+const AIRCRAFT_LAYER_DEFS = Object.freeze({
+  normal: Object.freeze({ color: 0x21f39a }),
+  match: Object.freeze({ color: 0xffb000 }),
+  rare: Object.freeze({ color: 0xff2d95 }),
+  emergency: Object.freeze({ color: 0xff5a36 }),
+});
+
+function emptyAircraftGeoJSON() {
+  return { type: "FeatureCollection", features: [] };
+}
+
+function aircraftLayerDefinition(source, color) {
+  return {
+    type: "vector",
+    source,
+    polygon: {
+      color,
+      perPositionHeight: true,
+      transparent: true,
+      opacity: 0.88,
+      outline: true,
+      outlineShow: true,
+      outlineColor: color,
+      outlineWidth: 1.5,
+    },
+  };
+}
+
+export function addPhotoJourneyAircraftLayer(view) {
+  const sources = {};
+  const layers = {};
+  try {
+    for (const [status, definition] of Object.entries(AIRCRAFT_LAYER_DEFS)) {
+      const source = view.addSource({ type: "geojson", data: emptyAircraftGeoJSON() });
+      sources[status] = source;
+      layers[status] = view.addLayer(aircraftLayerDefinition(source, definition.color));
+    }
+  } catch (error) {
+    for (const status of Object.keys(layers)) {
+      try { layers[status]?.delete?.(); } catch (e) { /* best effort */ }
+    }
+    for (const status of Object.keys(sources)) {
+      try { sources[status]?.delete?.(); } catch (e) { /* best effort */ }
+    }
+    throw error;
+  }
+  return { view, sources, layers, disposed: false };
+}
+
+export function updatePhotoJourneyAircraftLayer(state, aircraft, options = {}) {
+  if (!state || state.disposed) return state;
+  const common = {
+    now: options.now,
+    maxAgeSeconds: options.maxAgeSeconds,
+    feedAgeSeconds: options.feedAgeSeconds,
+    maxAircraft: options.maxAircraft,
+    sizeMeters: options.sizeMeters,
+    heightScale: options.heightScale,
+    excludeHex: options.excludeHex,
+  };
+  const all = aircraftGeoJSON(aircraft, common);
+  const grouped = {
+    normal: emptyAircraftGeoJSON(),
+    match: emptyAircraftGeoJSON(),
+    rare: emptyAircraftGeoJSON(),
+    emergency: emptyAircraftGeoJSON(),
+  };
+  for (const feature of all.features) {
+    grouped[feature.properties.layerStatus]?.features.push(feature);
+  }
+  for (const status of Object.keys(AIRCRAFT_LAYER_DEFS)) {
+    const data = grouped[status] || emptyAircraftGeoJSON();
+    state.sources[status]?.update?.({ type: "geojson", data });
+  }
+  // animation:false means a source mutation must explicitly request a frame.
+  state.view?.forceUpdate?.();
+  return state;
+}
+
+export function removePhotoJourneyAircraftLayer(state) {
+  if (!state || state.disposed) return false;
+  for (const status of Object.keys(state.layers || {})) {
+    try { state.layers[status]?.delete?.(); } catch (e) { /* best effort */ }
+  }
+  for (const status of Object.keys(state.sources || {})) {
+    try { state.sources[status]?.delete?.(); } catch (e) { /* best effort */ }
+  }
+  state.disposed = true;
+  return true;
+}
+
 export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls = {}, basemap } = {}) {
   const origin = typeof location !== "undefined" ? location.origin : "";
   const urls = {
