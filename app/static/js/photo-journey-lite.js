@@ -139,6 +139,7 @@
     }
     listeners.length=0;
     try{ mod?.removePhotoJourneyAircraftLayer?.(aircraftLayerState); }catch(e){}
+    document.body?.classList.remove('aircraft-visible');
   }
 
   function handleNavaraError(err){
@@ -165,8 +166,13 @@
         maxAircraft: 20,
         maxAgeSeconds: 60,
         excludeHex: target ? aircraftKey(target) : undefined,
-        sizeMeters: settings.low ? 100 : 113,
+        // Keep the real altitude and world-space placement, but give an
+        // 80–150m silhouette enough projected area at the fixed 2560x1080
+        // camera height to survive pixelRatio=0.5 on N100.
+        sizeMeters: settings.low ? 125 : 140,
       });
+      document.body?.classList.toggle('aircraft-visible',
+        (aircraftLayerState.visibleCount || 0) > 0);
     }catch(e){ handleNavaraError(e); }
   }
 

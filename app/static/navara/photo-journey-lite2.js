@@ -106598,7 +106598,7 @@ function FyA(g, A = {}) {
       i
     ];
   });
-  return M.push(M[0].slice()), M;
+  return M.reverse(), M.push(M[0].slice()), M;
 }
 function MyA(g, A = {}) {
   const B = FyA(g, A);
@@ -106721,12 +106721,18 @@ function oyA(g, A) {
     polygon: {
       color: A,
       perPositionHeight: !0,
-      transparent: !0,
-      opacity: 0.88,
+      clampToGround: !1,
+      // Keep the aircraft legible against both bright imagery and dark HUD
+      // edges.  The unlit path is supported by PolygonMaterial and avoids a
+      // directional-light/normal dependency on the N100; it still writes the
+      // normal/depth buffers in Navara's deferred renderer.
+      lit: !1,
+      transparent: !1,
+      opacity: 1,
       outline: !0,
       outlineShow: !0,
       outlineColor: A,
-      outlineWidth: 1.5
+      outlineWidth: 2.5
     }
   };
 }
@@ -106762,7 +106768,9 @@ function z0A(g, A, B = {}) {
     sizeMeters: B.sizeMeters,
     heightScale: B.heightScale,
     excludeHex: B.excludeHex
-  }, Q = ox(A, I), C = {
+  }, Q = ox(A, I);
+  g.visibleCount = Q.features.length;
+  const C = {
     normal: be(),
     match: be(),
     rare: be(),

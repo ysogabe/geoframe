@@ -288,6 +288,15 @@ export function aircraftPolygon(aircraft, options = {}) {
       heightM,
     ];
   });
+  // GeoJSON exterior rings are counter-clockwise in lon/lat space.  The
+  // silhouette is authored nose -> right wing -> tail -> left wing in the
+  // local north/east frame, but that order becomes clockwise after the
+  // north/east values are written as [lon, lat].  Navara's worker keeps the
+  // resulting triangle indices and PolygonMesh uses front-face culling, so a
+  // clockwise ring makes the entire aircraft disappear from an overhead POV.
+  // Reverse only the ring order; positions, altitude and attitude metadata
+  // remain unchanged.
+  ring.reverse();
   ring.push(ring[0].slice());
   return ring;
 }
@@ -469,12 +478,18 @@ function aircraftLayerDefinition(source, color) {
     polygon: {
       color,
       perPositionHeight: true,
-      transparent: true,
-      opacity: 0.88,
+      clampToGround: false,
+      // Keep the aircraft legible against both bright imagery and dark HUD
+      // edges.  The unlit path is supported by PolygonMaterial and avoids a
+      // directional-light/normal dependency on the N100; it still writes the
+      // normal/depth buffers in Navara's deferred renderer.
+      lit: false,
+      transparent: false,
+      opacity: 1,
       outline: true,
       outlineShow: true,
       outlineColor: color,
-      outlineWidth: 1.5,
+      outlineWidth: 2.5,
     },
   };
 }
@@ -512,6 +527,11 @@ export function updatePhotoJourneyAircraftLayer(state, aircraft, options = {}) {
     excludeHex: options.excludeHex,
   };
   const all = aircraftGeoJSON(aircraft, common);
+  // Expose the post-filter count to the controller so an opaque HTML photo
+  // card can yield a little transparency while real 3D aircraft are present.
+  // This is only a HUD occlusion mitigation; aircraft remain world-space
+  // polygons at their feed altitude.
+  state.visibleCount = all.features.length;
   const grouped = {
     normal: emptyAircraftGeoJSON(),
     match: emptyAircraftGeoJSON(),

@@ -283,6 +283,10 @@
   body.mode3d #map{display:none}            /* 3DではMapLibre地図を出さない */
   body.mode3d #modelayer{display:block}
   body.low #modelayer{animation:none}       /* 軽量モードはdriftを止める（#hud-rootと同じ） */
+  /* Aircraft stay in the Navara world layer.  When one is present, make the
+     opaque photo card slightly translucent so a nearby in-world silhouette
+     is not hidden by HTML compositing at the lower-left. */
+  body.mode3d.aircraft-visible #photocard{opacity:.34;pointer-events:none}
 
   /* ==== キオスク壁掛け21:9モニター向け拡大（LG 29UM59-P 2560×1080等） ==== */
   @media (min-width:2200px) and (min-aspect-ratio:2/1){

@@ -237,6 +237,11 @@ const ring = aircraftGJ.features[0].geometry.coordinates[0];
 assert.ok(ring.length >= 8 && ring.length <= 12, '機影Polygonは8〜12頂点');
 assert.ok(ring.every(coord => coord.length === 3 && Number.isFinite(coord[2])),
   '全座標に高度を含める');
+const ringArea = ring.slice(0, -1).reduce((sum, point, i, points) => {
+  const next = points[(i + 1) % points.length];
+  return sum + point[0] * next[1] - next[0] * point[1];
+}, 0);
+assert.ok(ringArea > 0, 'GeoJSON外周はNavaraのFrontSide向けに反時計回り');
 assert.strictEqual(aircraftGeoJSON(aircraft, { now: 1700000000, maxAircraft: 0 }).features.length, 0,
   'maxAircraft=0では機影を生成しない');
 const rotated = aircraftGeoJSON([{ hex: 'rotation', lat: 35, lon: 139,
@@ -299,6 +304,14 @@ assert.strictEqual(aircraftSources.length, 4, '通常/マッチ/rare/emergency�
 assert.strictEqual(aircraftLayers.length, 4, '航空機vector polygon layerを4層作る');
 assert.ok(aircraftLayers.every(l => l.type === 'vector' && l.polygon.perPositionHeight),
   '全航空機layerをperPositionHeightのvector polygonにする');
+assert.ok(aircraftLayers.every(l => l.polygon.clampToGround === false),
+  '航空機layerを地形クランプせず実高度で描画する');
+assert.ok(aircraftLayers.every(l => l.polygon.lit === false &&
+  l.polygon.transparent === false && l.polygon.opacity === 1),
+  '航空機layerを照明非依存・不透明で描画する');
+assert.ok(aircraftLayers.every(l => l.polygon.outline === true &&
+  l.polygon.outlineShow === true && l.polygon.outlineWidth >= 2),
+  'GeoJSON専用の初期アウトラインを有効化する');
 assert.strictEqual(new Set(aircraftLayers.map(l => l.polygon.color)).size, 4,
   'normal/match/rare/emergencyを別色で表示する');
 updatePhotoJourneyAircraftLayer(aircraftLayerState, [{ hex: 'normal', lat: 35, lon: 139,
@@ -310,6 +323,10 @@ assert.ok(aircraftSources.every(s => s.updates.length === 1), 'source.updateで�
 assert.strictEqual(aircraftForceUpdates, 1, 'source更新後にforceUpdateを1回だけ要求する');
 assert.ok(aircraftSources.every(s => s.updates[0].type === 'geojson'),
   'source.updateへGeoJSON型を明示する');
+assert.strictEqual(aircraftLayerState.visibleCount, 4,
+  'source更新後の鮮度・座標・最大数フィルタ済み表示数を保持する');
+updatePhotoJourneyAircraftLayer(aircraftLayerState, [], { now: 1700000000 });
+assert.strictEqual(aircraftLayerState.visibleCount, 0, '空feedでstale機影を全statusから除去する');
 assert.strictEqual(removePhotoJourneyAircraftLayer(aircraftLayerState), true, 'layer/sourceを削除できる');
 assert.strictEqual(removePhotoJourneyAircraftLayer(aircraftLayerState), false, '削除は冪等に扱う');
 
