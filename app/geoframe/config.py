@@ -162,12 +162,28 @@ TILE_SOURCES = {
     # 3D PHOTO JOURNEY専用。実URLはズームに応じてGSI_PHOTO_TILE_BANDSから選ぶ。
     # 淡色地図の既存キャッシュと混ざらないよう、独立したlayer名を使う。
     "gsi-photo": ("", 18, 4),
+    # 3D地形（Navara raster-dem）専用。実URLはズームに応じてGSI_DEM_TILE_BANDSから選ぶ。
+    # 同時接続数はgsi-photoと同枠（4）。上流フェッチの分/枚上限は全layer共有のまま増やさない。
+    "gsi-dem": ("", 14, 4),
 }
 # 国土地理院の公式提供ズームに合わせた航空・衛星写真ピラミッド。
 # Z2-13: Landsat 8、Z14-18: 全国最新写真（シームレス）。
 GSI_PHOTO_TILE_BANDS = (
     (2, 13, "https://cyberjapandata.gsi.go.jp/xyz/lndst/{z}/{x}/{y}.png"),
     (14, 18, "https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"),
+)
+# 国土地理院の公式標高タイル（Navara raster-dem用）。Z0-8: 全球DEM（demgm_png、
+# GMTED2010等由来・世界規模だが粗い）、Z9-14: 数値標高モデル（dem_png、国内10mメッシュ
+# 相当・海外や海上は欠測)。エンコードはdemgm_png/dem_pngで共通:
+#   x = 65536*R + 256*G + B
+#   x <  2^23            => 標高 = x * 0.01m
+#   x == 2^23 (=RGB 128,0,0) => 欠測（データなし）
+#   x >  2^23            => 標高 = (x - 2^24) * 0.01m
+# 欠測はfetch_tileがRGB(128,0,0)で塗り潰したPNGを返す（透明PNGにはしない。
+# raster-demデコーダは透明ピクセルを標高0mの実データと区別できないため）。
+GSI_DEM_TILE_BANDS = (
+    (0, 8, "https://cyberjapandata.gsi.go.jp/xyz/demgm_png/{z}/{x}/{y}.png"),
+    (9, 14, "https://cyberjapandata.gsi.go.jp/xyz/dem_png/{z}/{x}/{y}.png"),
 )
 # OSM tile usage policy 準拠に必須。実運用では連絡先入り（例 "GeoFrame/0.1 (me@example.com)"）を
 # GEOFRAME_TILE_UA に設定しておくこと。既定値のままだとブロックされうる

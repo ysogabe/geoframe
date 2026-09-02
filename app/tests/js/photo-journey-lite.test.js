@@ -146,11 +146,18 @@ class FakeThreeView {
   addPlugin(plugin) { this.plugins.push(plugin); }
 }
 class FakeDefaultPlugin {}
+const gsiDemDecoderCalls = [];
+function FakeJapanGsiElevationDecoder() {
+  const decoder = { kind: 'japanGSI' };
+  gsiDemDecoderCalls.push(decoder);
+  return decoder;
+}
 const feContext = {
   console,
   location: { origin: 'http://localhost:8080' },
   ThreeView: FakeThreeView,
   DefaultPlugin: FakeDefaultPlugin,
+  JAPAN_GSI_ELEVATION_DECODER: FakeJapanGsiElevationDecoder,
 };
 runInContext(stripped, feContext);
 
@@ -460,8 +467,14 @@ const raster = sources.filter(s => s.type === 'raster-tile');
 assert.strictEqual(raster.length, 1, '同時に描画するraster-tile basemapは1つだけ');
 assert.strictEqual(raster[0].url, 'http://h/tiles/gsi-photo/{z}/{x}/{y}.png', '国内地点ではGSI航空・衛星写真を選ぶ');
 assert.strictEqual(raster[0].minZoom, 2, 'GSIシームレス写真の提供下限Z2を使う');
-assert.strictEqual(layers.filter(l => l.type === 'raster').length, 1, 'raster layerも1つだけ');
+// GSI DEM terrain trial: raster layerはimagery(1)とDEM hillshade overlay(1)の計2つになる。
+// 個々の内訳・順序・decoder呼び出しはgsi-dem-terrain.test.jsで詳しく検証する。
+const imageryRasterLayers = layers.filter(l => l.type === 'raster' && !l.hillshade);
+assert.strictEqual(imageryRasterLayers.length, 1, 'imagery raster layerも1つだけ');
 assert.strictEqual(layerState.basemap.kind, 'gsi-photo', '初期basemapの選択状態を返す');
+assert.strictEqual(layers.filter(l => l.type === 'terrain').length, 1,
+  'GSI DEM地形layerを1つ追加する');
+assert.ok(gsiDemDecoderCalls.length >= 1, 'raster-dem sourceでJAPAN_GSI_ELEVATION_DECODERを使う');
 
 const updatePhotoJourneyBasemap = vm.runInContext('updatePhotoJourneyBasemap', feContext);
 updatePhotoJourneyBasemap(layerState.basemap, { lon: -73.9857, lat: 40.7484 });
@@ -490,8 +503,10 @@ runInContext(controllerSrc, { window: { GEOFRAME_MODE_3D: false } });
 assert.ok(/if\(!window\.GEOFRAME_MODE_3D\) return;/.test(controllerSrc), '3Dでなければ即returnする');
 // Navara バンドルを遅延ロード（通常URLではこの行に到達しない）
 assert.ok(controllerSrc.includes("import('/static/navara/photo-journey-lite.js')"), 'Navaraを遅延ロードする');
-assert.ok(/view\.addLight\(\{\s*ambient:\s*\{\s*intensity:\s*1\s*\}\s*\}\)/.test(controllerSrc),
-  '航空写真レイヤ追加前に軽量アンビエント光を置く');
+assert.ok(/view\.addLight\(\{\s*ambient:\s*\{\s*intensity:\s*0\.78\s*\}\s*\}\)/.test(controllerSrc),
+  '航空写真レイヤ追加前に抑制したアンビエント光(0.78)を置く');
+assert.ok(/view\.addLight\(\{\s*sun:\s*\{\s*intensity:\s*0\.28,\s*applyColor:\s*true,\s*castShadow:\s*false\s*\}\s*\}\)/
+  .test(controllerSrc), 'GSI DEM地形を抑制した太陽光(0.28)で照らし、シャドウマップは作らない');
 assert.ok(!controllerSrc.includes('view.lit = false'), 'unlit切替でラスタ合成を失わせない');
 assert.ok(/requestLodRefinement\((view|targetView)\)/.test(controllerSrc), 'on-demand描画でも航空写真LODを精細化する');
 assert.ok(controllerSrc.includes('setInterval'), '常時描画ではなく期限付きの精細化バーストを使う');
