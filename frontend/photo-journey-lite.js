@@ -123,6 +123,52 @@ export function selectPhotoJourneyBasemap(point) {
   return isDomesticPoint(point) ? "gsi-photo" : "osm";
 }
 
+/*
+ * 巡回中の投機取得用タイル列。Navara本体の可視タイル選択とは分離し、
+ * 「現在地点の周囲」と「次の巡回地点」の小さな3x3リングだけを返す。
+ * 通常時は国内のz15/z16（z16は一段先の精細化）、国外はOSMのz15、
+ * ?lowでは全地域z14に抑える。実際の取得レートと停止条件はcontroller側で管理する。
+ */
+const PHOTO_PREFETCH_RADIUS = 1;
+const PHOTO_PREFETCH_NORMAL_ZOOMS = Object.freeze([15, 16]);
+const PHOTO_PREFETCH_LOW_ZOOMS = Object.freeze([14]);
+
+function photoJourneyTileXY(point, zoom) {
+  const lon = Number(point?.lon ?? point?.lng);
+  const lat = Number(point?.lat);
+  if (!Number.isFinite(lon) || !Number.isFinite(lat) ||
+      lon < -180 || lon > 180 || lat < -90 || lat > 90) return null;
+  const clippedLat = Math.max(-85.05112878, Math.min(85.05112878, lat));
+  const n = 2 ** zoom;
+  const x = Math.floor(n * ((lon + 180) / 360));
+  const radians = clippedLat * Math.PI / 180;
+  const y = Math.floor(n * (1 - Math.log(Math.tan(radians) + 1 / Math.cos(radians)) / Math.PI) / 2);
+  return { x: Math.max(0, Math.min(n - 1, x)), y: Math.max(0, Math.min(n - 1, y)), n };
+}
+
+export function getPhotoJourneyPrefetchTiles(point, { low = false, origin = "" } = {}) {
+  const tile = photoJourneyTileXY(point, PHOTO_PREFETCH_NORMAL_ZOOMS[0]);
+  if (!tile) return [];
+  const layer = selectPhotoJourneyBasemap(point);
+  const zooms = low ? PHOTO_PREFETCH_LOW_ZOOMS :
+    (layer === "gsi-photo" ? PHOTO_PREFETCH_NORMAL_ZOOMS : [15]);
+  const base = String(origin || "").replace(/\/+$/, "");
+  const urls = [];
+  for (const zoom of zooms) {
+    const center = photoJourneyTileXY(point, zoom);
+    if (!center) continue;
+    for (let dy = -PHOTO_PREFETCH_RADIUS; dy <= PHOTO_PREFETCH_RADIUS; dy++) {
+      for (let dx = -PHOTO_PREFETCH_RADIUS; dx <= PHOTO_PREFETCH_RADIUS; dx++) {
+        const x = (center.x + dx + center.n) % center.n;
+        const y = center.y + dy;
+        if (y < 0 || y >= center.n) continue;
+        urls.push(`${base}/tiles/${layer}/${zoom}/${x}/${y}.png`);
+      }
+    }
+  }
+  return urls;
+}
+
 function rasterDefinition(kind, urls) {
   return {
     type: "raster-tile",

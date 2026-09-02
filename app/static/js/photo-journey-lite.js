@@ -6,6 +6,7 @@
 
    重要な負荷制御:
      - 通常巡回は写真のflyToと30秒以上の滞在だけ
+     - 可視タイルが落ち着いた後だけ、現在/次地点の小さなタイルリングを低速先読み
      - Navaraはanimation:false。タイル精細化は期限付きforceUpdateのみ
      - 航空機アラート中だけ、4〜5HzのsetIntervalで短時間デッドレコニング
      - requestAnimationFrame、常時描画、重いポストエフェクトは使わない
@@ -39,6 +40,12 @@
   let alertTimer = null;
   let alertGeneration = 0;
   let refinementTimer = null;
+  let prefetchPlanTimer = null;
+  let prefetchRateTimer = null;
+  let prefetchInFlight = 0;
+  const prefetchQueue = [];
+  const prefetchKnown = new Set();
+  const prefetchStarts = [];
   let disposed = false;
   let navaraFailed = false;
   const listeners = [];
@@ -119,6 +126,129 @@
     listeners.push([name, handler]);
   }
 
+  /* speculative tile warm-up is deliberately a browser-side consumer of the
+     existing /tiles/ proxy.  This keeps GSI attribution, persistent cache, and
+     the server's shared upstream budget in one path; no bulk-download endpoint
+     is added. */
+  const PREFETCH_NORMAL_PER_MINUTE = 60;
+  const PREFETCH_LOW_PER_MINUTE = 24;
+  const PREFETCH_NORMAL_GAP_MS = 1000;
+  const PREFETCH_LOW_GAP_MS = 2500;
+  const PREFETCH_CONCURRENCY = 2;
+  const PREFETCH_LOW_CONCURRENCY = 1;
+  const PREFETCH_MAX_QUEUE = 128;
+  const PREFETCH_KNOWN_MAX = 1024;
+
+  function prefetchFetcher(){
+    if(typeof window.fetch === 'function') return window.fetch.bind(window);
+    if(typeof fetch === 'function') return fetch;
+    return null;
+  }
+
+  function clearPrefetchWork(){
+    if(prefetchPlanTimer){ clearTimeout(prefetchPlanTimer); prefetchPlanTimer=null; }
+    if(prefetchRateTimer){ clearTimeout(prefetchRateTimer); prefetchRateTimer=null; }
+    for(const url of prefetchQueue) prefetchKnown.delete(url);
+    prefetchQueue.length=0;
+  }
+
+  function trimPrefetchStarts(now){
+    while(prefetchStarts.length && now-prefetchStarts[0] >= 60000) prefetchStarts.shift();
+  }
+
+  function schedulePrefetchRatePump(delay){
+    if(prefetchRateTimer || disposed) return;
+    prefetchRateTimer=setTimeout(()=>{
+      prefetchRateTimer=null;
+      pumpPrefetch();
+    }, Math.max(100, delay));
+  }
+
+  function pumpPrefetch(){
+    const fetcher=prefetchFetcher();
+    if(disposed || !fetcher) return;
+    if(isPaused()){
+      clearPrefetchWork();
+      return;
+    }
+    const now=Date.now();
+    trimPrefetchStarts(now);
+    const limit=settings.low ? PREFETCH_LOW_PER_MINUTE : PREFETCH_NORMAL_PER_MINUTE;
+    const gap=settings.low ? PREFETCH_LOW_GAP_MS : PREFETCH_NORMAL_GAP_MS;
+    const concurrency=settings.low ? PREFETCH_LOW_CONCURRENCY : PREFETCH_CONCURRENCY;
+    while(prefetchQueue.length && prefetchInFlight < concurrency){
+      const current=Date.now();
+      trimPrefetchStarts(current);
+      if(prefetchStarts.length >= limit){
+        schedulePrefetchRatePump(60000-(current-prefetchStarts[0])+50);
+        return;
+      }
+      const last=prefetchStarts.at(-1);
+      if(last !== undefined && current-last < gap){
+        schedulePrefetchRatePump(gap-(current-last)+20);
+        return;
+      }
+      const url=prefetchQueue.shift();
+      prefetchInFlight++;
+      prefetchStarts.push(current);
+      Promise.resolve()
+        .then(()=>fetcher(url,{cache:'force-cache'}))
+        .then(response=>{
+          const cacheStatus=response?.headers?.get?.('X-Tile-Cache');
+          if(!response?.ok || cacheStatus === 'error' || cacheStatus === 'throttled')
+            prefetchKnown.delete(url);
+          // Consume the body so the server-side cache write is not abandoned by
+          // the browser even though the decoded image is not displayed here.
+          return response?.arrayBuffer?.();
+        })
+        .catch(()=>{ prefetchKnown.delete(url); })
+        .finally(()=>{
+          prefetchInFlight=Math.max(0,prefetchInFlight-1);
+          pumpPrefetch();
+        });
+    }
+  }
+
+  function enqueuePrefetchUrls(urls){
+    if(!prefetchFetcher() || !Array.isArray(urls)) return;
+    for(const url of urls){
+      if(typeof url !== 'string' || !url || prefetchKnown.has(url)) continue;
+      if(prefetchQueue.length >= PREFETCH_MAX_QUEUE) break;
+      prefetchKnown.add(url);
+      prefetchQueue.push(url);
+      // Keep the in-memory de-duplication bounded even during an all-day kiosk run.
+      if(prefetchKnown.size > PREFETCH_KNOWN_MAX){
+        const oldest=prefetchKnown.values().next().value;
+        if(oldest) prefetchKnown.delete(oldest);
+      }
+    }
+    pumpPrefetch();
+  }
+
+  function schedulePhotoPrefetch(targetMod, current, next){
+    if(disposed || isPaused() || !prefetchFetcher() ||
+       typeof targetMod?.getPhotoJourneyPrefetchTiles !== 'function') return;
+    if(prefetchPlanTimer) clearTimeout(prefetchPlanTimer);
+    // Let the visible Navara burst/refinement finish before spending the shared
+    // upstream budget on speculative work.
+    const delay=settings.low ? 5000 : 12500;
+    prefetchPlanTimer=setTimeout(()=>{
+      prefetchPlanTimer=null;
+      if(disposed || isPaused()) return;
+      const origin=typeof location !== 'undefined' ? location.origin : '';
+      for(const point of [current,next]){
+        if(!point) continue;
+        try{
+          enqueuePrefetchUrls(targetMod.getPhotoJourneyPrefetchTiles(point, {
+            low:settings.low, origin,
+          }));
+        }catch(error){
+          console.warn('[3d] speculative tile prefetch skipped',error);
+        }
+      }
+    }, delay);
+  }
+
   function clearRefinement(){
     if(refinementTimer){ clearInterval(refinementTimer); refinementTimer=null; }
   }
@@ -153,6 +283,7 @@
     if(journeyTimer){ clearTimeout(journeyTimer); journeyTimer=null; }
     clearRefinement();
     if(alertTimer){ clearInterval(alertTimer); alertTimer=null; }
+    clearPrefetchWork();
     journeyGeneration++;
     alertGeneration++;
     for(const [name, handler] of listeners){
@@ -296,6 +427,7 @@
     cancelJourney();
     clearAlertAnimation();
     clearRefinement();
+    clearPrefetchWork();
     const target = alertTarget(alert);
     const next = {
       aircraft: target,
@@ -379,6 +511,7 @@
       cancelJourney();
       clearRefinement();
       clearAlertAnimation();
+      clearPrefetchWork();
       if(activeAlert) activeAlert.suspended=true;
       return;
     }
@@ -401,6 +534,8 @@
     const token=journeyGeneration;
     markShown(i);
     const p=PHOTOS[i];
+    const nextIndex=nextQueueIdx();
+    schedulePhotoPrefetch(targetMod,p,nextIndex >= 0 ? PHOTOS[nextIndex] : null);
     showPhoto(i);
     setMode('3D PHOTO JOURNEY LITE');
     const height=settings.height+(settings.low?0:(i%3)*400);
