@@ -189,7 +189,9 @@ GSI_DEM_TILE_BANDS = (
 # OSM tile usage policy 準拠に必須。実運用では連絡先入り（例 "GeoFrame/0.1 (me@example.com)"）を
 # GEOFRAME_TILE_UA に設定しておくこと。既定値のままだとブロックされうる
 TILE_UA = os.environ.get("GEOFRAME_TILE_UA", "GeoFrame/0.1 (personal photo frame)")
-TILE_CACHE_MAX_MB = int(os.environ.get("GEOFRAME_TILE_CACHE_MAX_MB", "2048"))
+# 3D PHOTO JOURNEYの高ズーム航空写真を保持できるよう、全レイヤー共有で16GiB。
+# 実機で容量を抑えたい場合は GEOFRAME_TILE_CACHE_MAX_MB で上書きする。
+TILE_CACHE_MAX_MB = int(os.environ.get("GEOFRAME_TILE_CACHE_MAX_MB", "16384"))
 # 上流フェッチ（＝キャッシュミス）だけを対象にした流量上限（枚/分）。キャッシュヒットは無制限。
 # /tiles/ は無認証なので、LAN内の任意のWebページが <img src="http://<frame-ip>:8080/tiles/…">
 # を大量に並べるだけで上流を叩かせられる（クロスオリジンの<img>はSOPで止まらない）。
