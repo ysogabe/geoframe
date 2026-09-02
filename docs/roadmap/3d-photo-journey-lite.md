@@ -125,20 +125,21 @@ raster-dem loaderが非200応答のbodyをデコードせず初期化を失敗�
 
 **フロント（`frontend/photo-journey-lite.js`）**: `addPhotoJourneyLayers()`が
 raster-dem source（`JAPAN_GSI_ELEVATION_DECODER()`でデコード、Z0-14）を`terrain` layer→
-抑制した`hillshade` raster layer（同じsourceを再利用・`raster.show:false`で疑似カラーは
+地形の面が読める`hillshade` raster layer（同じsourceを再利用・`raster.show:false`で疑似カラーは
 出さない）→航空写真`raster` layerの順で追加する。terrainをimageryより先に追加しないと
 後続レイヤのドレープ先が無いため、この順序を保つ。
 
-**N100設定（最初の抑制値）**:
+**N100設定（地形の立体感を優先した軽量値）**:
 
 | 項目 | 通常 | `?low` | 理由 |
 |---|---|---|---|
 | terrain segments | 32 | 16 | メッシュ分割コスト。`?low`でも地形自体は無効化しない |
 | terrain maxSse | 4 | 8 | 許容screen-space-error（px）。粗いほど早く安定する |
 | 標高スケール | 1.0（設定項目なし） | 同左 | `@navaramap/three@0.1.1`にterrain用の乗算スケールAPIが無いことを型定義で確認済み。デコード結果の実測メートルをそのまま使う＝素の1.0 |
-| hillshade exaggeration | 0.65 | 同左 | `HillshadeMaterial.exaggeration`（既定1.0）を検証済みの最も近い等価パラメータとして採用し、抑制した値にする |
-| ambient intensity | 0.78 | 同左 | 従来の1.0から地形の陰影が見える程度まで落とす |
-| sun intensity / applyColor / castShadow | 0.28 / true / false | 同左 | `applyColor:true`で大気散乱計算を経ず指定色をそのまま使う。`castShadow:false`でシャドウマップを一切生成しない（N100向けの既存`shadow:false`初期化オプションと合わせて二重に無効化） |
+| hillshade exaggeration | 1.35 | 同左 | `HillshadeMaterial.exaggeration`で斜面の明暗を読めるようにする。係数変更だけでメッシュ量は増やさない |
+| ambient intensity | 0.68 | 同左 | 環境光を抑え、斜面の明暗を残す |
+| sun intensity / applyColor / castShadow | 0.52 / true / false | 同左 | `applyColor:true`で大気散乱計算を経ず指定色をそのまま使う。`castShadow:false`でシャドウマップを一切生成しない（N100向けの既存`shadow:false`初期化オプションと合わせて二重に無効化） |
+| camera height / pitch | 2400m / -32° | 4200m / -28° | 真下寄りの俯瞰を避け、地平線・斜面・遠近感を同時に見せる。heightは楕円体からの実高度 |
 | pixelRatio | 0.5（既存のまま） | 0.5 | 変更しない |
 
 `addDefaultPhotorealScene()` / SSR / SSAO / DOF / 雲 / 大気散乱エフェクト / 常時描画
@@ -157,7 +158,7 @@ DEM専用の別エントリは追加せず、同一発行元（国土地理院�
 - N100実機でのfps/GPUメモリへの実測影響（本ロードマップの§9「実機検証」と同様、後日の
   長時間運用確認に含める）。
 - 見た目の最終的な良し悪し（陰影の強さ・地形の誇張度など）の主観評価。今回の数値
-  （hillshade 0.65・ambient 0.78・sun 0.28）は「抑制した最初の試行値」であり、
+  （hillshade 1.35・ambient 0.68・sun 0.52）は「立体感を優先した軽量値」であり、
   実機での見え方を見て調整する前提の暫定値。
 - 山岳地・崖などextreme reliefでのterrain skirt/tile境界の視覚的な破綻有無。
 
@@ -264,7 +265,7 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
   config.py/tiles.py/handlers.pyのgsi-demルーティング契約のソーステキスト照合・
   `addPhotoJourneyLayers`のraster-dem source登録とterrain→hillshade→imageryの追加順序・
   normal(32/4)/low(16/8)のquality設定・3D controllerの`boot()`をvm実行して
-  `view.addLight`へ渡るambient(0.78)/sun(0.28, applyColor, castShadow:false)の実値・
+  `view.addLight`へ渡るambient(0.68)/sun(0.52, applyColor, castShadow:false)の実値・
   重い演出（addDefaultPhotorealScene/addEffect/shadow:true）が無いこと・
   航空機のperPositionHeight/clampToGround:falseが地形追加後も変わらないことを実実行で検証。
 - `app/tests/test_tiles.py` — gsi-photoの既存テストに加え、gsi-demのURL選択（z0-8=demgm_png/
@@ -286,7 +287,7 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
 N95実機（`geoframe-n100.local`）で航空写真単独の隔離ページを計測した。
 
 - 2560x1080 CSS表示、内部canvas 1280x540（pixelRatio 0.5）
-- カメラ高度1,800m、俯角-50°、Navara算出zoom 16.32
+- カメラ高度2,400m、俯角-32°（lowは4,200m/-28°）で地平線と斜面を見せる
 - GSI航空写真131枚、最大Z15、GPU推定約440MiB
 - 3秒計測60fps、p95 16.7ms、50ms超フレーム0
 
