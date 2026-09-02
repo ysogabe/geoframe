@@ -482,6 +482,23 @@ assert.strictEqual(sourceUpdates.length, 1, '国外へ移動したときだけ�
 assert.strictEqual(sourceUpdates[0].url, 'http://h/tiles/osm/{z}/{x}/{y}.png', '国外ではOSMへ切り替える');
 assert.strictEqual(layerState.basemap.kind, 'osm', 'basemap状態を更新する');
 
+// 投機取得は国内gsi-photo、国外OSMの小さな3x3リングだけを生成する。
+const getPhotoJourneyPrefetchTiles = vm.runInContext('getPhotoJourneyPrefetchTiles', feContext);
+const domesticWarm = getPhotoJourneyPrefetchTiles({ lon: 139.7454, lat: 35.6586 }, { origin: 'http://h' });
+assert.strictEqual(domesticWarm.length, 18, '国内通常時はz15/z16の3x3リングだけを先読みする');
+assert.strictEqual(domesticWarm.filter(url => url.includes('/gsi-photo/15/')).length, 9,
+  '国内先読みの第一段はGSI写真z15');
+assert.strictEqual(domesticWarm.filter(url => url.includes('/gsi-photo/16/')).length, 9,
+  '国内先読みの精細化段はGSI写真z16');
+const foreignWarm = getPhotoJourneyPrefetchTiles({ lon: -73.9857, lat: 40.7484 }, { origin: 'http://h' });
+assert.strictEqual(foreignWarm.length, 9, '国外通常時はOSMのz15 3x3だけを先読みする');
+assert.ok(foreignWarm.every(url => url.includes('/tiles/osm/15/')), '国外先読みでGSI写真を要求しない');
+const lowWarm = getPhotoJourneyPrefetchTiles({ lon: 139.7454, lat: 35.6586 }, { low: true, origin: 'http://h' });
+assert.strictEqual(lowWarm.length, 9, 'LOW_POWERはz14の3x3だけを先読みする');
+assert.ok(lowWarm.every(url => url.includes('/gsi-photo/14/')), 'LOW_POWERの先読みズームを抑える');
+assert.strictEqual(getPhotoJourneyPrefetchTiles({ lon: 999, lat: 35 }, { origin: 'http://h' }).length, 0,
+  '不正座標は先読みしない');
+
 assert.strictEqual(sources.filter(s => s.type === 'geojson').length, 0,
   '全地点ルートは描かず航空写真へGPU予算を集中する');
 assert.strictEqual(layers.filter(l => l.type === 'vector').length, 0,
@@ -510,6 +527,12 @@ assert.ok(/view\.addLight\(\{\s*sun:\s*\{\s*intensity:\s*0\.28,\s*applyColor:\s*
 assert.ok(!controllerSrc.includes('view.lit = false'), 'unlit切替でラスタ合成を失わせない');
 assert.ok(/requestLodRefinement\((view|targetView)\)/.test(controllerSrc), 'on-demand描画でも航空写真LODを精細化する');
 assert.ok(controllerSrc.includes('setInterval'), '常時描画ではなく期限付きの精細化バーストを使う');
+assert.ok(controllerSrc.includes('getPhotoJourneyPrefetchTiles'), 'Navara側の国内/国外判定済み先読み計画を使う');
+assert.ok(controllerSrc.includes("cache:'force-cache'"), '先読み画像の本文を取得してサーバーキャッシュへ流す');
+assert.ok(controllerSrc.includes('PREFETCH_NORMAL_PER_MINUTE = 60'), '先読みを毎分60枚へ制限する');
+assert.ok(controllerSrc.includes('PREFETCH_LOW_PER_MINUTE = 24'), 'LOW_POWERの先読みを毎分24枚へ制限する');
+assert.ok(controllerSrc.includes("X-Tile-Cache"), 'サーバーのthrottled/errorを検知して先読み重複を解除する');
+assert.ok(controllerSrc.includes('clearPrefetchWork'), 'アラート/スリープ/破棄時に投機取得を停止する');
 // 一度きりのフォールバックガード（フラグを立ててリロード。bootstrap.jsがmodeを剥がす）
 assert.ok(controllerSrc.includes("sessionStorage.setItem('geoframe.3d.fallback', '1')"), 'フォールバックフラグを立てる');
 assert.ok(/location\.reload\(\)/.test(controllerSrc), '失敗時はリロードする');
