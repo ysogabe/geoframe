@@ -17,7 +17,7 @@
   const settings = window.GEOFRAME_PHOTO_JOURNEY_SETTINGS || {
     low: !!window.LOW_POWER,
     dwellMs: Math.max(typeof DWELL_MS !== 'undefined' ? DWELL_MS : 16000, 30000), flyMs: 5000,
-    height: 1800, pitch: -50, headingStep: 47,
+    height: 2400, pitch: -32, headingStep: 47,
   };
   const AIRCRAFT_UPDATE_EVENT = window.GEOFRAME_AIRCRAFT_EVENT || 'geoframe:aircraft-update';
   const AIRCRAFT_ALERT_EVENT = window.GEOFRAME_AIRCRAFT_ALERT_EVENT || 'geoframe:aircraft-alert';
@@ -581,11 +581,11 @@
     try{
       view=mod.createPhotoJourneyView(container,{low:settings.low});
       await view.init();
-      // 地形(GSI DEM)を抑制したDEM由来シェーディングで照らす最初の試行値。
+      // 地形(GSI DEM)の斜面が読めるように、陰影を可視性優先で調整した値。
       // sunはapplyColor:trueで大気散乱の計算を経ずに指定色をそのまま使い、
       // castShadow:falseでN100向けにシャドウマップを一切生成しない。
-      view.addLight({ambient:{intensity:0.78}});
-      view.addLight({sun:{intensity:0.28,applyColor:true,castShadow:false}});
+      view.addLight({ambient:{intensity:0.68}});
+      view.addLight({sun:{intensity:0.52,applyColor:true,castShadow:false}});
       const points=toInitialPoint(first);
       if(first>=0){
         const p=PHOTOS[first];

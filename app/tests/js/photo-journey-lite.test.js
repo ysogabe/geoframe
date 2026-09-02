@@ -435,7 +435,9 @@ assert.strictEqual(normalSettings.dwellMs, 30000, '航空写真を読み切れ�
 assert.ok(lowSettings.dwellMs > normalSettings.dwellMs, 'LOW_POWERは巡回更新頻度を下げる');
 assert.ok(lowSettings.flyMs < normalSettings.flyMs, 'LOW_POWERはflyTo時間を短縮');
 assert.ok(lowSettings.height > normalSettings.height, 'LOW_POWERは高高度で遠景LODにする');
-assert.strictEqual(normalSettings.pitch, -50, '通常表示は位置を把握しやすい俯瞰角度にする');
+assert.strictEqual(normalSettings.height, 2400, '通常表示は地形を見渡せる実高度にする');
+assert.strictEqual(normalSettings.pitch, -32, '通常表示は地平線と斜面が読める斜め視点にする');
+assert.strictEqual(lowSettings.pitch, -28, '?lowでも地形が読める斜め視点を維持する');
 assert.strictEqual(lowSettings.headingStep, 0, 'LOW_POWERは方位更新を止める');
 
 // 初回地点→単一Navara raster basemap変換の実呼び出し。
@@ -520,10 +522,10 @@ runInContext(controllerSrc, { window: { GEOFRAME_MODE_3D: false } });
 assert.ok(/if\(!window\.GEOFRAME_MODE_3D\) return;/.test(controllerSrc), '3Dでなければ即returnする');
 // Navara バンドルを遅延ロード（通常URLではこの行に到達しない）
 assert.ok(controllerSrc.includes("import('/static/navara/photo-journey-lite.js')"), 'Navaraを遅延ロードする');
-assert.ok(/view\.addLight\(\{\s*ambient:\s*\{\s*intensity:\s*0\.78\s*\}\s*\}\)/.test(controllerSrc),
-  '航空写真レイヤ追加前に抑制したアンビエント光(0.78)を置く');
-assert.ok(/view\.addLight\(\{\s*sun:\s*\{\s*intensity:\s*0\.28,\s*applyColor:\s*true,\s*castShadow:\s*false\s*\}\s*\}\)/
-  .test(controllerSrc), 'GSI DEM地形を抑制した太陽光(0.28)で照らし、シャドウマップは作らない');
+assert.ok(/view\.addLight\(\{\s*ambient:\s*\{\s*intensity:\s*0\.68\s*\}\s*\}\)/.test(controllerSrc),
+  '航空写真レイヤ追加前に地形の陰影を残すアンビエント光(0.68)を置く');
+assert.ok(/view\.addLight\(\{\s*sun:\s*\{\s*intensity:\s*0\.52,\s*applyColor:\s*true,\s*castShadow:\s*false\s*\}\s*\}\)/
+  .test(controllerSrc), 'GSI DEM地形を太陽光(0.52)で照らし、シャドウマップは作らない');
 assert.ok(!controllerSrc.includes('view.lit = false'), 'unlit切替でラスタ合成を失わせない');
 assert.ok(/requestLodRefinement\((view|targetView)\)/.test(controllerSrc), 'on-demand描画でも航空写真LODを精細化する');
 assert.ok(controllerSrc.includes('setInterval'), '常時描画ではなく期限付きの精細化バーストを使う');
@@ -718,7 +720,7 @@ async function runControllerBridgeRuntimeRegression(){
     GEOFRAME_MODE_3D: true,
     LOW_POWER: true,
     GEOFRAME_PHOTO_JOURNEY_SETTINGS: {
-      low: true, dwellMs: 30000, flyMs: 1, height: 1800, pitch: -50, headingStep: 0,
+      low: true, dwellMs: 30000, flyMs: 1, height: 4200, pitch: -28, headingStep: 0,
     },
     GEOFRAME_EVENT_STATE: {
       isSleeping: () => false,

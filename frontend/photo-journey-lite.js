@@ -179,7 +179,7 @@ function rasterDefinition(kind, urls) {
 }
 
 /* ============================================================
-   GSI DEM terrain（raster-dem）+ 抑制したDEM由来シェーディングの試行第一弾。
+   GSI DEM terrain（raster-dem）+ 地形の立体感を優先したDEM由来シェーディング。
    server.py の /tiles/gsi-dem/ プロキシ（z0-8: demgm_png、z9-14: dem_png）を
    JAPAN_GSI_ELEVATION_DECODER() でデコードし、実地形として立ち上げる。
    terrain layer を imagery layer（rasterDefinition）より先に addLayer することで、
@@ -193,8 +193,9 @@ const DEM_MAX_ZOOM = 14;
 // そのまま使うことが「実高度スケール1.0」であり、追加設定は不要。
 // HillshadeMaterial.exaggeration（既定1.0）だけが検証済みの陰影強調パラメータ。
 // terrain mesh自体（segments=32/16）の頂点法線は粗いため、同じraster-demソースを
-// 参照する薄いhillshade raster layerで、抑制した（0.65倍）陰影を追加する。
-const DEM_HILLSHADE_EXAGGERATION = 0.65;
+// 参照する薄いhillshade raster layerで、地形の面が読める（1.35倍）陰影を追加する。
+// Hillshadeの係数変更はメッシュ数を増やさず、N100でも地形の立体感だけを改善する。
+const DEM_HILLSHADE_EXAGGERATION = 1.35;
 
 function demSourceDefinition(url) {
   return {
@@ -207,7 +208,7 @@ function demSourceDefinition(url) {
   };
 }
 
-/* raster-dem sourceを1つ登録し、terrain layer→抑制hillshade layerの順で追加する。
+/* raster-dem sourceを1つ登録し、terrain layer→hillshade layerの順で追加する。
    影は初期化オプション（LITE_OPTIONS.shadow=false）に加え、terrain/hillshadeの
    どちらでも castShadow/receiveShadow を明示的に false のままにする。 */
 function addTerrain(view, demUrl) {
@@ -218,7 +219,7 @@ function addTerrain(view, demUrl) {
     terrain: { lit: true, skirt: true, castShadow: false, receiveShadow: false },
   });
   // raster.show:false でDEMの疑似カラー（生の標高エンコード色）は出さない。
-  // hillshadeだけがterrain上のimageryへ抑制した陰影を与える。
+  // hillshadeだけがterrain上のimageryへ地形の面を読める陰影を与える。
   view.addLayer({
     type: "raster",
     source,

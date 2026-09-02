@@ -1,4 +1,4 @@
-/* GSI DEM terrain + 抑制したDEM由来シェーディングの試行第一弾を、ブラウザ無しで
+/* GSI DEM terrain + 地形の立体感を優先したDEM由来シェーディングを、ブラウザ無しで
  * 実挙動ベースに検証する。
  *
  * 検証対象と方式:
@@ -203,10 +203,10 @@ assert.strictEqual(terrainLayers[0].terrain.castShadow, false, 'terrainはシャ
 assert.strictEqual(terrainLayers[0].terrain.receiveShadow, false, 'terrainはシャドウマップを受けない');
 
 const hillshadeLayers = normalMock.layers.filter(l => l.type === 'raster' && l.hillshade);
-assert.strictEqual(hillshadeLayers.length, 1, '抑制したhillshade overlayは1つだけ');
+assert.strictEqual(hillshadeLayers.length, 1, 'hillshade overlayは1つだけ');
 assert.strictEqual(hillshadeLayers[0].source, demSources[0], 'hillshade layerも同じDEM sourceを参照する（二重フェッチさせない）');
-assert.strictEqual(hillshadeLayers[0].hillshade.exaggeration, 0.65,
-  'DEM由来シェーディングの強調係数は抑制した0.65（HillshadeMaterial既定1.0より弱める）');
+assert.strictEqual(hillshadeLayers[0].hillshade.exaggeration, 1.35,
+  'DEM由来シェーディングの強調係数は地形を読める1.35（メッシュ量は増やさない）');
 assert.strictEqual(hillshadeLayers[0].raster.show, false,
   '生の標高疑似カラーは出さず、陰影だけをimageryへ重ねる');
 
@@ -264,7 +264,7 @@ async function runLightingRegression() {
     window: {
       GEOFRAME_MODE_3D: true,
       GEOFRAME_PHOTO_JOURNEY_SETTINGS: {
-        low: false, dwellMs: 30000, flyMs: 1, height: 1800, pitch: -50, headingStep: 0,
+        low: false, dwellMs: 30000, flyMs: 1, height: 2400, pitch: -32, headingStep: 0,
       },
       GEOFRAME_EVENT_STATE: { isSleeping: () => false, isEventActive: () => false, getEventUntil: () => 0 },
       addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => true,
@@ -293,11 +293,11 @@ async function runLightingRegression() {
   assert.strictEqual(lightCalls.length, 2, 'ambientとsunの2回だけaddLightを呼ぶ（他の光源は追加しない）');
   // vmサンドボックス越しのオブジェクトはOutward Objectと[[Prototype]]が異なるため、
   // deepStrictEqualではなくJSON表現で比較する（既存のsetPhotoJourneyCameraテストと同じ手法）。
-  assert.strictEqual(JSON.stringify(lightCalls[0]), JSON.stringify({ ambient: { intensity: 0.78 } }),
-    '抑制したambient光0.78を最初に置く');
+  assert.strictEqual(JSON.stringify(lightCalls[0]), JSON.stringify({ ambient: { intensity: 0.68 } }),
+    '地形の陰影を残すambient光0.68を最初に置く');
   assert.strictEqual(JSON.stringify(lightCalls[1]),
-    JSON.stringify({ sun: { intensity: 0.28, applyColor: true, castShadow: false } }),
-    '抑制した太陽光0.28・applyColor有効・シャドウマップ無効を実際にaddLightへ渡す');
+    JSON.stringify({ sun: { intensity: 0.52, applyColor: true, castShadow: false } }),
+    '地形の面を照らす太陽光0.52・applyColor有効・シャドウマップ無効を実際にaddLightへ渡す');
 }
 
 /* ============================================================

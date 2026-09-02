@@ -106530,7 +106530,7 @@ function ox(g, A) {
     maxZoom: g === "gsi-photo" ? 18 : 19
   };
 }
-const ayA = 0, PyA = 14, yyA = 0.65;
+const ayA = 0, PyA = 14, yyA = 1.35;
 function dyA(g) {
   return {
     type: "raster-dem",
