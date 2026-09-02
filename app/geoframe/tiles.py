@@ -137,13 +137,16 @@ def fetch_tile(layer, z, x, y):
             return f.read_bytes(), "hit"      # ヒットは無制限（正常な再描画・リロードを妨げない）
         except Exception:
             pass
-    if not _tile_fetch_allowed():
-        # 上限超過。404にするとMapLibreがリトライを連発するので200＋代替タイルで返しきる
-        return _placeholder_tile(layer), "throttled"
     try:
         url = _upstream_tile_url(layer, z, x, y)
     except ValueError:
+        # 提供ズーム外（gsi-demならz>14など）は上流へ行けない恒久欠測。
+        # 分/枚の共有予算チェックより先に返すことで、上流へ行かない要求が
+        # 予算を消費しないようにする（スライディング窓の枯渇を防ぐ）。
         return _placeholder_tile(layer), "error"
+    if not _tile_fetch_allowed():
+        # 上限超過。404にするとMapLibreがリトライを連発するので200＋代替タイルで返しきる
+        return _placeholder_tile(layer), "throttled"
     try:
         req = urllib.request.Request(url, headers={
             "User-Agent": TILE_UA, "Accept": "image/jpeg,image/png,image/*;q=0.8"})

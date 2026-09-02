@@ -59,8 +59,9 @@ const tilesSrc = fs.readFileSync('geoframe/tiles.py', 'utf8');
 const handlersSrc = fs.readFileSync('geoframe/handlers.py', 'utf8');
 
 // 陽性対照: gsi-demはband方式（gsi-photoと同型）で、demgm_png(z0-8)/dem_png(z9-14)を持つ。
-assert.ok(/"gsi-dem":\s*\("",\s*14,\s*\d+\)/.test(configSrc),
-  'TILE_SOURCESのgsi-demはband選択方式（空URL・maxzoom14）で登録される');
+// 上流同時接続数はN100試行のため2へ絞る（共有240枚/分の予算は据え置き）。
+assert.ok(/"gsi-dem":\s*\("",\s*14,\s*2\)/.test(configSrc),
+  'TILE_SOURCESのgsi-demはband選択方式（空URL・maxzoom14・上流並列2）で登録される');
 assert.ok(/GSI_DEM_TILE_BANDS\s*=\s*\(\s*\(\s*0,\s*8,\s*"[^"]*demgm_png[^"]*"\s*\)/.test(configSrc),
   'z0-8は全球DEM(demgm_png)を使う');
 assert.ok(/\(\s*9,\s*14,\s*"[^"]*\/dem_png\/[^"]*"\s*\)/.test(configSrc),
@@ -80,6 +81,20 @@ assert.ok(!tilesSrc.includes('_dem_no_data_tile_bytes() if layer == "gsi-photo"'
 
 assert.ok(/TILE_RE = re\.compile\(r"\^\/tiles\/\(osm\|gsi\|gsi-photo\|gsi-dem\)/.test(handlersSrc),
   'handlersのtileルートがgsi-demを認識する');
+
+// 陽性対照: ズーム範囲外404の判定からgsi-demを除外する。z>14はfetch_tileへ委譲して
+// RGB(128,0,0)欠測タイルを200で返す（404だとNavara raster-dem loaderがbodyを
+// デコードせず初期化を失敗させるため）。
+assert.ok(/if\s+z\s*>\s*TILE_SOURCES\[layer\]\[1\]\s+and\s+layer\s*!=\s*["']gsi-dem["']/
+  .test(handlersSrc),
+  'handlersはズーム範囲外404の判定からgsi-demを除外する（z15+もfetch_tileへ委譲）');
+
+// 陽性対照: fetch_tileは上流URL解決（提供ズーム外のValueError）を分/枚の共有予算チェック
+// より先に行う。上流へ行かない要求が240枚/分のスライディング窓を消費しない。
+const urlResolveIdx = tilesSrc.indexOf('url = _upstream_tile_url(layer, z, x, y)');
+const budgetCheckIdx = tilesSrc.indexOf('if not _tile_fetch_allowed():');
+assert.ok(urlResolveIdx !== -1 && budgetCheckIdx !== -1 && urlResolveIdx < budgetCheckIdx,
+  'fetch_tileは上流URL解決を共有予算チェックより先に行う（提供ズーム外が予算を消費しない）');
 
 /* ============================================================
  * 3. frontend/photo-journey-lite.js — raster-dem登録・terrain順序・quality設定

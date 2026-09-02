@@ -163,6 +163,18 @@ class FetchTileDemAbsenceTest(unittest.TestCase):
         self.assertEqual(status, "throttled")
         self.assertEqual(body, tiles._dem_no_data_tile_bytes())
 
+    def test_unsupported_zoom_returns_no_data_without_upstream_or_budget(self):
+        """z>14（提供ズーム外）は上流へ行かず、分/枚の共有予算も消費せずno-dataを返す。
+        上流URL解決を予算チェックより先に行う回帰テスト。urlopen/_tile_fetch_allowed
+        のどちらかが呼ばれたらAssertionErrorで検出する。"""
+        with patch.object(tiles.urllib.request, "urlopen",
+                          side_effect=AssertionError("提供ズーム外で上流へ行った")), \
+             patch.object(tiles, "_tile_fetch_allowed",
+                          side_effect=AssertionError("提供ズーム外でfetch予算を消費した")):
+            body, status = tiles.fetch_tile("gsi-dem", 15, 0, 0)
+        self.assertEqual(status, "error")
+        self.assertEqual(body, tiles._dem_no_data_tile_bytes())
+
     def test_real_elevation_png_bytes_pass_through_unmodified(self):
         """24bit標高PNGはJPEG写真と違い、再エンコードせず生バイト列をそのまま配信する。"""
         source = io.BytesIO()
@@ -187,6 +199,46 @@ class FetchTileDemAbsenceTest(unittest.TestCase):
             body, status = tiles.fetch_tile("gsi-dem", 9, 3, 3)
         self.assertEqual(status, "miss")
         self.assertEqual(body, raw, "標高PNGは非可逆な再圧縮をしない")
+
+
+class ServeTileDemUnsupportedZoomTest(unittest.TestCase):
+    """handlers._serve_tile が gsi-dem の提供ズーム外（z>14）を404ではなく
+    200 + RGB(128,0,0) で返す回帰テスト。404だとNavaraのraster-dem loaderが
+    応答bodyをデコードせず初期化を失敗させる（AbortableImageLoaderが非200を拒否）。"""
+
+    def _serve(self, path):
+        from geoframe import handlers
+
+        class _FakeRequest:
+            def makefile(self, mode, bufsize=-1):
+                return io.BytesIO()
+
+        h = handlers.Handler(_FakeRequest(), ("127.0.0.1", 0), None)
+        # __init__はfinish()でwfile/rfileを閉じてしまうため、応答先を差し替える。
+        # 空rfileのままhandle_one_requestは即returnするので、requestline等の
+        # リクエスト由来属性もsend_response/send_error/end_headersが参照する分だけ設定する。
+        h.wfile = io.BytesIO()
+        h.path = path
+        h.requestline = ""
+        h.request_version = "HTTP/1.0"
+        h.command = "GET"
+        h._serve_tile(path)
+        return h.wfile.getvalue()
+
+    def test_unsupported_zoom_gsi_dem_returns_200_no_data(self):
+        raw = self._serve("/tiles/gsi-dem/15/0/0.png")
+        head, _, body = raw.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n")[0]
+        self.assertIn(b" 200 ", status_line,
+                      "z15+は404ではなく200で返す（404はraster-dem loaderの初期化を失敗させる）")
+        self.assertEqual(body, tiles._dem_no_data_tile_bytes())
+
+    def test_invalid_tile_coordinates_still_404(self):
+        """陰性対照: タイル座標範囲外（x>=2^z）は従来どおり404のまま。"""
+        raw = self._serve("/tiles/gsi-dem/5/64/0.png")   # z=5 → xは0..31のはず
+        head, _, _ = raw.partition(b"\r\n\r\n")
+        status_line = head.split(b"\r\n")[0]
+        self.assertIn(b" 404 ", status_line)
 
 
 if __name__ == "__main__":
