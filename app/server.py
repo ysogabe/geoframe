@@ -40,7 +40,7 @@ GeoFrame ローカルサーバー（M1+M2: SQLiteカタログ + Drive直接参�
     GEOFRAME_AI_SEARCH_PER_MIN(30) … /api/ai/search の流量上限（超過分は429）
     GEOFRAME_INFER_MIN(15) GEOFRAME_INFER_OFFSET_MIN(0)
     GEOFRAME_ADSB_URL GEOFRAME_MATCH_KM(80)
-    GEOFRAME_TILE_UA(GeoFrame/0.1 …) GEOFRAME_TILE_CACHE_MAX_MB(2048)
+    GEOFRAME_TILE_UA(GeoFrame/0.1 …) GEOFRAME_TILE_CACHE_MAX_MB(16384)
     GEOFRAME_TILE_FETCH_PER_MIN(240) … 上流タイル取得の流量上限（キャッシュヒットは無制限）
     GEOFRAME_HA_URL(http://homeassistant.local:8123) … 平文httpならIP直指定が必須（後述）
     GEOFRAME_DEBUG_API(未設定) … 1で /api/ha/entities・/api/mlit/probe を開放（開発時のみ）
