@@ -12,22 +12,28 @@
      - 出典表示は view.attribution へ GSI / OSM を登録する
 
    依存する Navara API（@navaramap/three 0.1.1）:
-     - new ThreeView({ container, pixelRatio, shadow, ... })
+     - new ThreeView({ container, pixelRatio, shadow, segments, maxSse, ... })
      - view.addPlugin(new DefaultPlugin()) → await view.init()
-     - view.addSource({ type: "raster-tile" | "geojson", ... }) → Source ハンドル
-     - view.addLayer({ type: "raster" | "vector", source, ... })
+     - view.addSource({ type: "raster-tile" | "raster-dem" | "geojson", ... }) → Source ハンドル
+     - view.addLayer({ type: "terrain" | "raster" | "vector", source, ... })
+     - JAPAN_GSI_ELEVATION_DECODER() → raster-dem source の elevationDecoder
      - view.setCamera({ lng, lat, height, heading, pitch, roll })
      - view.flyTo({ lng, lat, height, pitch, heading }, { duration })
      - source.update({ type: "raster-tile", url, ... })
      - view.attribution?.add([{ attribution, attributionUrl }])
    ============================================================ */
-import ThreeView from "@navaramap/three";
+import ThreeView, { JAPAN_GSI_ELEVATION_DECODER } from "@navaramap/three";
 import { DefaultPlugin } from "@navaramap/three-default-plugin";
 
 /* 軽量構成。N100相当の内蔵GPUでタイルの先読みと常時描画を抑える上限値。 */
 const NORMAL_OPTIONS = Object.freeze({
   pixelRatio: 0.5,      // 2560x1080実機では1280x540。固定GPU領域を約1/4へ削減
   shadow: false,        // 影は初期化時オプション。N100 では無効
+  // view.globe（terrain mesh）のLOD品質。segmentsはタイルあたりの分割数、
+  // maxSseは許容screen-space-error（px、大きいほど粗く早く安定する）。
+  // GSI DEM地形の初回トライアルはN100を優先し、通常表示でも控えめな値にする。
+  segments: 32,
+  maxSse: 4,
   multisampling: 0,     // MSAA 無効（0）
   halfFloat: false,     // ポスト処理は低精度で十分
   picking: false,       // フィーチャーピッキング無効（タップ対象が無い）
@@ -54,6 +60,10 @@ const NORMAL_OPTIONS = Object.freeze({
 
 const LOW_POWER_OPTIONS = Object.freeze({
   ...NORMAL_OPTIONS,
+  // 地形は?lowでも無効化しない（GOALの「low でも terrain を維持」）。
+  // segments/maxSseだけ粗くしてメッシュ分割・タイル選択のコストを下げる。
+  segments: 16,
+  maxSse: 8,
   cacheBytes: 64 * 1024 * 1024,
   lodFog: { enabled: true, density: 1e-1, sseFactor: 12 },
   dynamicSse: {
@@ -84,6 +94,8 @@ export function createPhotoJourneyView(container, opts = {}) {
     container,
     pixelRatio: Math.min(opts.pixelRatio ?? defaults.pixelRatio, 1),
     shadow: opts.shadow ?? defaults.shadow,
+    segments: opts.segments ?? defaults.segments,
+    maxSse: opts.maxSse ?? defaults.maxSse,
     multisampling: opts.multisampling ?? defaults.multisampling,
     halfFloat: opts.halfFloat ?? defaults.halfFloat,
     picking: opts.picking ?? defaults.picking,
@@ -118,6 +130,56 @@ function rasterDefinition(kind, urls) {
     minZoom: kind === "gsi-photo" ? 2 : 0,
     maxZoom: kind === "gsi-photo" ? 18 : 19,
   };
+}
+
+/* ============================================================
+   GSI DEM terrain（raster-dem）+ 抑制したDEM由来シェーディングの試行第一弾。
+   server.py の /tiles/gsi-dem/ プロキシ（z0-8: demgm_png、z9-14: dem_png）を
+   JAPAN_GSI_ELEVATION_DECODER() でデコードし、実地形として立ち上げる。
+   terrain layer を imagery layer（rasterDefinition）より先に addLayer することで、
+   Navara が後続レイヤをこの地形へドレープできる（順序が逆だとドレープ先が無い）。
+   ============================================================ */
+// server.py 側 GSI_DEM_TILE_BANDS と一致させること（z0-8 demgm_png / z9-14 dem_png）。
+const DEM_MIN_ZOOM = 0;
+const DEM_MAX_ZOOM = 14;
+// TerrainMaterial/RasterDemSourceDescriptionには標高への乗算スケールが存在しない
+// （@navaramap/three 0.1.1 の型定義で確認済み）。デコード結果の実測メートルを
+// そのまま使うことが「実高度スケール1.0」であり、追加設定は不要。
+// HillshadeMaterial.exaggeration（既定1.0）だけが検証済みの陰影強調パラメータ。
+// terrain mesh自体（segments=32/16）の頂点法線は粗いため、同じraster-demソースを
+// 参照する薄いhillshade raster layerで、抑制した（0.65倍）陰影を追加する。
+const DEM_HILLSHADE_EXAGGERATION = 0.65;
+
+function demSourceDefinition(url) {
+  return {
+    type: "raster-dem",
+    url,
+    minZoom: DEM_MIN_ZOOM,
+    maxZoom: DEM_MAX_ZOOM,
+    tileSize: 256,
+    elevationDecoder: JAPAN_GSI_ELEVATION_DECODER(),
+  };
+}
+
+/* raster-dem sourceを1つ登録し、terrain layer→抑制hillshade layerの順で追加する。
+   影は初期化オプション（LITE_OPTIONS.shadow=false）に加え、terrain/hillshadeの
+   どちらでも castShadow/receiveShadow を明示的に false のままにする。 */
+function addTerrain(view, demUrl) {
+  const source = view.addSource(demSourceDefinition(demUrl));
+  view.addLayer({
+    type: "terrain",
+    source,
+    terrain: { lit: true, skirt: true, castShadow: false, receiveShadow: false },
+  });
+  // raster.show:false でDEMの疑似カラー（生の標高エンコード色）は出さない。
+  // hillshadeだけがterrain上のimageryへ抑制した陰影を与える。
+  view.addLayer({
+    type: "raster",
+    source,
+    raster: { show: false },
+    hillshade: { exaggeration: DEM_HILLSHADE_EXAGGERATION },
+  });
+  return source;
 }
 
 export function updatePhotoJourneyBasemap(state, point) {
@@ -698,7 +760,10 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
   const urls = {
     "gsi-photo": tileUrls.gsiPhoto || `${origin}/tiles/gsi-photo/{z}/{x}/{y}.png`,
     osm: tileUrls.osm || `${origin}/tiles/osm/{z}/{x}/{y}.png`,
+    "gsi-dem": tileUrls.gsiDem || `${origin}/tiles/gsi-dem/{z}/{x}/{y}.png`,
   };
+  // terrainをimageryより先に追加する（drape対象を確保してから航空写真を載せる）。
+  const demSource = addTerrain(view, urls["gsi-dem"]);
   const kind = basemap || selectPhotoJourneyBasemap(points[0] || route[0]);
   const raster = view.addSource(rasterDefinition(kind, urls));
   view.addLayer({ type: "raster", source: raster });
@@ -707,7 +772,7 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
   if (view.attribution) {
     view.attribution.add([
       {
-        attribution: "航空・衛星画像: 国土地理院 / データソース: Landsat8画像（GSI, TSIC, GEO Grid/AIST）、Landsat8画像（courtesy of the U.S. Geological Survey）、海底地形（GEBCO）",
+        attribution: "航空・衛星画像・地形: 国土地理院 / データソース: Landsat8画像（GSI, TSIC, GEO Grid/AIST）、Landsat8画像（courtesy of the U.S. Geological Survey）、海底地形（GEBCO）、標高タイル（基盤地図情報数値標高モデル・全球数値地図）",
         attributionUrl: "https://maps.gsi.go.jp/development/ichiran.html",
       },
       {
@@ -717,7 +782,7 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
     ]);
   }
 
-  return { basemap: { kind, source: raster, urls } };
+  return { basemap: { kind, source: raster, urls }, terrain: { source: demSource } };
 }
 
 /* カメラを即時配置する。height はメートル（楕円体からの高度）。 */

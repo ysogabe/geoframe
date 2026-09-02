@@ -55,6 +55,8 @@ assert.ok(bundle.includes('navara-worker.js'), 'メインバンドルがtile wor
 assert.ok(bundle.includes('navara-font-worker.js'), 'メインバンドルがfont workerを実ファイル参照する');
 assert.ok(!bundle.includes('navara_wasm_worker_bg-'), 'tile workerのhashed WASM参照をメインbundleに残さない');
 assert.ok(bundle.includes('perPositionHeight'), '航空機Polygonの高度を頂点ごとに描画する設定がbundleに含まれる');
+assert.ok(bundle.includes('raster-dem'), 'GSI DEM terrain(raster-dem source)がbundleに含まれる');
+assert.ok(bundle.includes('"hillshade"'), '抑制したDEM由来hillshadeシェーディングがbundleに含まれる');
 
 // ---- spark worker チャンク（1つだけ） ----
 const sparkFiles = entries.filter(f => /^spark\.module-.*\.js$/.test(f));

@@ -140,7 +140,7 @@ class Handler(SimpleHTTPRequestHandler):
             return True
         return False
 
-    TILE_RE = re.compile(r"^/tiles/(osm|gsi|gsi-photo)/(\d{1,2})/(\d+)/(\d+)\.png$")
+    TILE_RE = re.compile(r"^/tiles/(osm|gsi|gsi-photo|gsi-dem)/(\d{1,2})/(\d+)/(\d+)\.png$")
 
     # ============================================================
     # Host ヘッダ検証（DNSリバインディング対策。詳しい攻撃の説明は config.py 側）
@@ -272,15 +272,21 @@ class Handler(SimpleHTTPRequestHandler):
         return True
 
     def _serve_tile(self, path, head_only=False):
-        """背景地図タイルを配信（上流取得はfetch_tile、失敗しても200＋透明PNG）
-        ※404を返すとMapLibreがリトライを連発するため、取得失敗も200で返しきる"""
+        """背景地図タイルを配信（上流取得はfetch_tile、失敗しても200＋代替タイル）
+        ※404を返すとMapLibreがリトライを連発するため、取得失敗も200で返しきる。
+        gsi-demは提供ズーム外（z>14）も404にしない。Navaraのraster-dem loaderは
+        非200応答のbodyをデコードせず初期化を失敗させるため、fetch_tileが返す
+        RGB(128,0,0)の欠測タイルを200で返す（詳細はtiles.fetch_tile）"""
         m = self.TILE_RE.match(path)
         if not m:
             self.send_error(404)
             return
         layer, z, x, y = m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4))
-        if z > TILE_SOURCES[layer][1] or x >= 2 ** z or y >= 2 ** z:
-            self.send_error(404)      # ズーム範囲外・タイル座標範囲外
+        if x >= 2 ** z or y >= 2 ** z:
+            self.send_error(404)      # タイル座標範囲外（常に不正）
+            return
+        if z > TILE_SOURCES[layer][1] and layer != "gsi-dem":
+            self.send_error(404)      # ズーム範囲外（gsi-demはfetch_tileが欠測タイルを返す）
             return
         body, status = fetch_tile(layer, z, x, y)
         self.send_response(200)

@@ -446,7 +446,11 @@
     try{
       view=mod.createPhotoJourneyView(container,{low:settings.low});
       await view.init();
-      view.addLight({ambient:{intensity:1}});
+      // 地形(GSI DEM)を抑制したDEM由来シェーディングで照らす最初の試行値。
+      // sunはapplyColor:trueで大気散乱の計算を経ずに指定色をそのまま使い、
+      // castShadow:falseでN100向けにシャドウマップを一切生成しない。
+      view.addLight({ambient:{intensity:0.78}});
+      view.addLight({sun:{intensity:0.28,applyColor:true,castShadow:false}});
       const points=toInitialPoint(first);
       if(first>=0){
         const p=PHOTOS[first];
