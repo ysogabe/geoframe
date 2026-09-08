@@ -185,6 +185,11 @@ assert.strictEqual(lowView.options.animation, false, 'LOW_POWERでもon-demand�
 assert.strictEqual(lowView.options.cacheBytes, LOW_POWER_LITE_OPTIONS.cacheBytes, 'LOW_POWER設定をThreeViewへ渡す');
 assert.strictEqual(lowView.plugins.length, 1, 'DefaultPluginを1つだけ登録');
 
+// Controller VMではNavaraの代わりに、同じfrontend純関数を実際に接続する。
+const photoJourneyCameraPose = vm.runInContext('photoJourneyCameraPose', feContext);
+const photoJourneyElevation = vm.runInContext('photoJourneyElevation', feContext);
+const updatePhotoJourneyLighting = vm.runInContext('updatePhotoJourneyLighting', feContext);
+
 /* ADS-B純関数 — Navara/DOMに依存しない高度・姿勢・機影生成 */
 const feetToMeters = vm.runInContext('feetToMeters', feContext);
 const aircraftAltitudeMeters = vm.runInContext('aircraftAltitudeMeters', feContext);
@@ -228,10 +233,10 @@ assert.strictEqual(aircraftFreshnessAge({ seen_pos: 50 }, 1700000000, 11), 61,
 assert.strictEqual(isFreshAircraft({ seen_pos: 50 }, 1700000000, 60, 9), true,
   'combined ageが鮮度上限以内なら機体を残す');
 assert.strictEqual(isFreshAircraft({ seen_pos: 50 }, 1700000000, 60, 11), false,
-  'combined ageが60秒を超えたら機体を除外する');
+  'combined ageが90秒を超えたら機体を除外する');
 assert.strictEqual(aircraftGeoJSON([{ hex: 'outage', lat: 35, lon: 139, seen_pos: 50,
   alt_geom: 1000 }], { now: 1700000000, feedAgeSeconds: 11 }).features.length, 0,
-  'transport outage中も凍結seen_posの機影を60秒後に消す');
+  'transport outage中も凍結seen_posの機影を90秒後に消す');
 const aircraft = Array.from({ length: 25 }, (_, i) => ({
   hex: `h${i}`, lat: 35 + i / 1000, lon: 139 + i / 1000,
   seen_pos: 1, alt_geom: 1000 + i, track: i,
@@ -431,12 +436,17 @@ function loadSettings(low) {
 }
 const normalSettings = loadSettings(false);
 const lowSettings = loadSettings(true);
-assert.strictEqual(normalSettings.dwellMs, 30000, '航空写真を読み切れるよう通常も30秒滞在する');
-assert.ok(lowSettings.dwellMs > normalSettings.dwellMs, 'LOW_POWERは巡回更新頻度を下げる');
+const NORMAL_DWELL_MS = 90000;
+const LOW_DWELL_MS = 90000;
+const PHOTO_ORBIT_DELAY_MS = 45000;
+assert.strictEqual(normalSettings.dwellMs, NORMAL_DWELL_MS, '冷えたDEMを待てるよう通常も90秒滞在する');
+assert.strictEqual(lowSettings.dwellMs, LOW_DWELL_MS, 'LOW_POWERは巡回を90秒滞在へ下げる');
+assert.strictEqual(normalSettings.orbitDelayMs, PHOTO_ORBIT_DELAY_MS, '通常周回はDEM待ち後の45秒で開始する');
+assert.strictEqual(lowSettings.orbitDelayMs, PHOTO_ORBIT_DELAY_MS, 'LOW_POWERもDEM待ち後の45秒で周回判定する');
 assert.ok(lowSettings.flyMs < normalSettings.flyMs, 'LOW_POWERはflyTo時間を短縮');
 assert.ok(lowSettings.height > normalSettings.height, 'LOW_POWERは高高度で遠景LODにする');
-assert.strictEqual(normalSettings.height, 2400, '通常表示は地形を見渡せる実高度にする');
-assert.strictEqual(normalSettings.pitch, -32, '通常表示は地平線と斜面が読める斜め視点にする');
+assert.strictEqual(normalSettings.height, 1400, '通常表示は地形を見渡せる実高度にする');
+assert.strictEqual(normalSettings.pitch, -24, '通常表示は地平線と斜面が読める斜め視点にする');
 assert.strictEqual(lowSettings.pitch, -28, '?lowでも地形が読める斜め視点を維持する');
 assert.strictEqual(lowSettings.headingStep, 0, 'LOW_POWERは方位更新を止める');
 
@@ -484,20 +494,34 @@ assert.strictEqual(sourceUpdates.length, 1, '国外へ移動したときだけ�
 assert.strictEqual(sourceUpdates[0].url, 'http://h/tiles/osm/{z}/{x}/{y}.png', '国外ではOSMへ切り替える');
 assert.strictEqual(layerState.basemap.kind, 'osm', 'basemap状態を更新する');
 
-// 投機取得は国内gsi-photo、国外OSMの小さな3x3リングだけを生成する。
+// 投機取得はDEM親タイルを先に置き、国内gsi-photo／国外OSMの小さな3x3リングを続ける。
 const getPhotoJourneyPrefetchTiles = vm.runInContext('getPhotoJourneyPrefetchTiles', feContext);
 const domesticWarm = getPhotoJourneyPrefetchTiles({ lon: 139.7454, lat: 35.6586 }, { origin: 'http://h' });
-assert.strictEqual(domesticWarm.length, 18, '国内通常時はz15/z16の3x3リングだけを先読みする');
+assert.strictEqual(domesticWarm.length, 22, '国内通常時はDEM親4枚とz15/z16の3x3リングを先読みする');
+assert.strictEqual(JSON.stringify(domesticWarm.slice(0, 4).map(url => url.match(/\/gsi-dem\/(\d+)\//)[1])),
+  JSON.stringify(['8', '10', '12', '14']), '国内通常時はDEMをz8/z10/z12/z14の順で先読みする');
+assert.ok(domesticWarm.slice(0, 4).every(url => url.startsWith('http://h/tiles/gsi-dem/') && url.endsWith('.png')),
+  '国内DEM先読みURLは同一プロキシのPNGを指す');
 assert.strictEqual(domesticWarm.filter(url => url.includes('/gsi-photo/15/')).length, 9,
   '国内先読みの第一段はGSI写真z15');
 assert.strictEqual(domesticWarm.filter(url => url.includes('/gsi-photo/16/')).length, 9,
   '国内先読みの精細化段はGSI写真z16');
 const foreignWarm = getPhotoJourneyPrefetchTiles({ lon: -73.9857, lat: 40.7484 }, { origin: 'http://h' });
-assert.strictEqual(foreignWarm.length, 9, '国外通常時はOSMのz15 3x3だけを先読みする');
-assert.ok(foreignWarm.every(url => url.includes('/tiles/osm/15/')), '国外先読みでGSI写真を要求しない');
+assert.strictEqual(foreignWarm.length, 11, '国外通常時は全球DEM2枚とOSMのz15 3x3を先読みする');
+assert.strictEqual(JSON.stringify(foreignWarm.slice(0, 2).map(url => url.match(/\/gsi-dem\/(\d+)\//)[1])),
+  JSON.stringify(['6', '8']), '国外DEM先読みは全球DEMのz6/z8に上限を置く');
+assert.ok(foreignWarm.slice(0, 2).every(url => url.startsWith('http://h/tiles/gsi-dem/') && url.endsWith('.png')),
+  '国外DEM先読みURLもgsi-demプロキシのPNGを指す');
+assert.ok(foreignWarm.filter(url => url.includes('/gsi-dem/')).every(url => {
+  const zoom = Number(url.match(/\/gsi-dem\/(\d+)\//)[1]);
+  return zoom <= 8;
+}), '国外DEM先読みでz8を超える標高タイルを要求しない');
+assert.ok(foreignWarm.slice(2).every(url => url.includes('/tiles/osm/15/')), '国外先読みでGSI写真を要求しない');
 const lowWarm = getPhotoJourneyPrefetchTiles({ lon: 139.7454, lat: 35.6586 }, { low: true, origin: 'http://h' });
-assert.strictEqual(lowWarm.length, 9, 'LOW_POWERはz14の3x3だけを先読みする');
-assert.ok(lowWarm.every(url => url.includes('/gsi-photo/14/')), 'LOW_POWERの先読みズームを抑える');
+assert.strictEqual(lowWarm.length, 12, 'LOW_POWERはDEM親3枚とz14の3x3を先読みする');
+assert.strictEqual(JSON.stringify(lowWarm.slice(0, 3).map(url => url.match(/\/gsi-dem\/(\d+)\//)[1])),
+  JSON.stringify(['8', '10', '12']), 'LOW_POWERはDEMをz8/z10/z12へ抑える');
+assert.ok(lowWarm.slice(3).every(url => url.includes('/gsi-photo/14/')), 'LOW_POWERの画像先読みズームを抑える');
 assert.strictEqual(getPhotoJourneyPrefetchTiles({ lon: 999, lat: 35 }, { origin: 'http://h' }).length, 0,
   '不正座標は先読みしない');
 
@@ -522,13 +546,19 @@ runInContext(controllerSrc, { window: { GEOFRAME_MODE_3D: false } });
 assert.ok(/if\(!window\.GEOFRAME_MODE_3D\) return;/.test(controllerSrc), '3Dでなければ即returnする');
 // Navara バンドルを遅延ロード（通常URLではこの行に到達しない）
 assert.ok(controllerSrc.includes("import('/static/navara/photo-journey-lite.js')"), 'Navaraを遅延ロードする');
-assert.ok(/view\.addLight\(\{\s*ambient:\s*\{\s*intensity:\s*0\.68\s*\}\s*\}\)/.test(controllerSrc),
-  '航空写真レイヤ追加前に地形の陰影を残すアンビエント光(0.68)を置く');
-assert.ok(/view\.addLight\(\{\s*sun:\s*\{\s*intensity:\s*0\.52,\s*applyColor:\s*true,\s*castShadow:\s*false\s*\}\s*\}\)/
-  .test(controllerSrc), 'GSI DEM地形を太陽光(0.52)で照らし、シャドウマップは作らない');
+assert.ok(/view\.addLight\(\{\s*ambient:\s*\{\s*intensity:\s*0\.48\s*\}\s*\}\)/.test(controllerSrc),
+  '航空写真レイヤ追加前に地形の陰影を残すアンビエント光(0.48)を置く');
+assert.ok(/view\.addLight\(\{\s*sun:\s*\{\s*intensity:\s*1\.15,\s*applyColor:\s*true,\s*castShadow:\s*false\s*\}\s*\}\)/
+  .test(controllerSrc), 'GSI DEM地形を太陽光(1.15)で照らし、シャドウマップは作らない');
 assert.ok(!controllerSrc.includes('view.lit = false'), 'unlit切替でラスタ合成を失わせない');
 assert.ok(/requestLodRefinement\((view|targetView)\)/.test(controllerSrc), 'on-demand描画でも航空写真LODを精細化する');
 assert.ok(controllerSrc.includes('setInterval'), '常時描画ではなく期限付きの精細化バーストを使う');
+assert.ok(/const duration = settings\.low \? 60000 : 55000/.test(controllerSrc),
+  '冷えたDEMを待てるよう精細化の通常/LOW_POWER期限を55/90秒にする');
+assert.ok(/const interval = settings\.low \? 800 : 400/.test(controllerSrc),
+  '精細化更新を通常400ms/LOW_POWER800msへ抑える');
+assert.ok(/const delay=settings\.low \? 60000 : 45000/.test(controllerSrc),
+  'DEM親タイルを待ってから通常45秒/LOW_POWER90秒で画像先読みする');
 assert.ok(controllerSrc.includes('getPhotoJourneyPrefetchTiles'), 'Navara側の国内/国外判定済み先読み計画を使う');
 assert.ok(controllerSrc.includes("cache:'force-cache'"), '先読み画像の本文を取得してサーバーキャッシュへ流す');
 assert.ok(controllerSrc.includes('PREFETCH_NORMAL_PER_MINUTE = 60'), '先読みを毎分60枚へ制限する');
@@ -720,7 +750,8 @@ async function runControllerBridgeRuntimeRegression(){
     GEOFRAME_MODE_3D: true,
     LOW_POWER: true,
     GEOFRAME_PHOTO_JOURNEY_SETTINGS: {
-      low: true, dwellMs: 30000, flyMs: 1, height: 4200, pitch: -28, headingStep: 0,
+      low: true, dwellMs: LOW_DWELL_MS, flyMs: 1, height: 4200, pitch: -28,
+      headingStep: 0, orbitDelayMs: PHOTO_ORBIT_DELAY_MS,
     },
     GEOFRAME_EVENT_STATE: {
       isSleeping: () => false,
@@ -738,11 +769,14 @@ async function runControllerBridgeRuntimeRegression(){
     },
   };
   const cameraCalls = [];
+  let terrainSamples = 0;
   const fakeView = {
     init: () => Promise.resolve(true),
     addLight: () => {},
     setCamera: pose => cameraCalls.push(pose),
     forceUpdate: () => {},
+    sampleTerrainHeight: () => { terrainSamples++; return 123.5; },
+    atmosphere: {},
   };
   const target = {
     hex: 'runtime-target', lat: 35, lon: 139, seen_pos: 10,
@@ -756,6 +790,9 @@ async function runControllerBridgeRuntimeRegression(){
   const fakeMod = {
     createPhotoJourneyView: () => fakeView,
     setPhotoJourneyCamera: (view, pose) => view.setCamera(pose),
+    photoJourneyCameraPose,
+    photoJourneyElevation,
+    updatePhotoJourneyLighting,
     addPhotoJourneyLayers: () => ({ basemap: {} }),
     addPhotoJourneyAircraftLayer: () => ({ id: 'aircraft-layer' }),
     updatePhotoJourneyAircraftLayer: (state, rows, options = {}) => {
@@ -790,7 +827,7 @@ async function runControllerBridgeRuntimeRegression(){
     manifestReady: Promise.resolve(),
     PHOTOS: [{ lon: 139, lat: 35, title: 'Runtime point' }],
     playQueue,
-    DWELL_MS: 30000,
+    DWELL_MS: LOW_DWELL_MS,
     LOW_POWER: true,
     fakeMod,
     sessionStorage: { setItem: () => {} },
@@ -815,7 +852,18 @@ async function runControllerBridgeRuntimeRegression(){
   await flushControllerMicrotasks();
   assert.ok(cameraCalls.length >= 1, 'controller VMが初期カメラを設定する');
   assert.strictEqual(intervals.size, 1, '初期LOD精細化だけがintervalを持つ');
-  assert.strictEqual(timeouts.size, 1, '通常巡回のdwell timerを持つ');
+  assert.strictEqual(timeouts.size, 2, '通常巡回はdwell timerと遅延標高再評価timerを持つ');
+  assert.ok([...timeouts.values()].some(timer => timer.delay === LOW_DWELL_MS),
+    '通常巡回のdwell timerを設定する');
+  assert.ok([...timeouts.values()].some(timer => timer.delay === PHOTO_ORBIT_DELAY_MS),
+    '通常巡回の標高再評価を45秒後へ遅延する');
+  const lowOrbitDelayEntry = [...timeouts.entries()].find(([, timer]) => timer.delay === PHOTO_ORBIT_DELAY_MS);
+  timeouts.delete(lowOrbitDelayEntry[0]);
+  lowOrbitDelayEntry[1].fn();
+  await flushControllerMicrotasks();
+  assert.ok(terrainSamples >= 2, '初期配置後にDEM標高を再評価する');
+  assert.strictEqual([...intervals.values()].filter(timer => timer.delay === 50).length, 0,
+    'LOW_POWERでは遅延標高再評価後も周回intervalを作らない');
 
   const dispatch = (type, detail) => fakeWindow.dispatchEvent({ type, detail });
   dispatch('geoframe:aircraft-update', {
@@ -877,7 +925,296 @@ async function runControllerBridgeRuntimeRegression(){
   assert.strictEqual(removed, true, 'disposeで航空機layerを安全に削除する');
 }
 
+/* 写真滞在のライフサイクルを実タイマー相当のVMで検証する。単なる文字列検査ではなく、
+ * 通常時の20Hz/8秒周回、LOW_POWER・reduced-motionの周回抑止、途中pause、dispose後の
+ * 遅延callback無効化までを、実際のphotoJourneyCameraPose/Elevationへ接続して確認する。 */
+async function runPhotoDwellLifecycleRegression(){
+  async function createScenario({ low = false, reduced = false, deferredFly = false, knownElevation = false } = {}){
+    const clock = { ms: 1700000000000 };
+    const listeners = new Map();
+    const timeouts = new Map();
+    const intervals = new Map();
+    const state = { eventActive: false };
+    const pendingFlights = [];
+    let timerId = 0;
+    const timerSet = (fn, delay) => {
+      const id = ++timerId;
+      timeouts.set(id, { fn, delay });
+      return id;
+    };
+    const timerClear = id => { timeouts.delete(id); };
+    const intervalSet = (fn, delay) => {
+      const id = ++timerId;
+      intervals.set(id, { fn, delay });
+      return id;
+    };
+    const intervalClear = id => { intervals.delete(id); };
+    const body = {
+      classList: { toggle: () => {}, remove: () => {} },
+      dataset: {},
+    };
+    const fakeWindow = {
+      GEOFRAME_MODE_3D: true,
+      LOW_POWER: low,
+      GEOFRAME_PHOTO_JOURNEY_SETTINGS: {
+        low, dwellMs: low ? LOW_DWELL_MS : NORMAL_DWELL_MS, flyMs: 1, height: low ? 3200 : 1400,
+        pitch: low ? -28 : -24, headingStep: 0,
+        orbitDelayMs: PHOTO_ORBIT_DELAY_MS, orbitMs: 8000, orbitDegrees: 22,
+      },
+      GEOFRAME_EVENT_STATE: {
+        isSleeping: () => false,
+        isEventActive: () => state.eventActive,
+        getEventUntil: () => 0,
+      },
+      matchMedia: () => ({ matches: reduced }),
+      addEventListener: (name, handler) => {
+        if (!listeners.has(name)) listeners.set(name, new Set());
+        listeners.get(name).add(handler);
+      },
+      removeEventListener: (name, handler) => listeners.get(name)?.delete(handler),
+      dispatchEvent: event => {
+        for (const handler of [...(listeners.get(event.type) || [])]) handler(event);
+        return true;
+      },
+    };
+    const cameraCalls = [];
+    let terrainSamples = 0;
+    let removed = false;
+    const fakeView = {
+      init: () => Promise.resolve(true),
+      addLight: () => {},
+      setCamera: pose => cameraCalls.push(pose),
+      forceUpdate: () => {},
+      sampleTerrainHeight: () => { terrainSamples++; return 111; },
+      atmosphere: {},
+    };
+    const fakeMod = {
+      createPhotoJourneyView: () => fakeView,
+      setPhotoJourneyCamera: (view, pose) => view.setCamera(pose),
+      photoJourneyCameraPose,
+      photoJourneyElevation,
+      updatePhotoJourneyLighting,
+      addPhotoJourneyLayers: () => ({ basemap: {}, terrain: {} }),
+      addPhotoJourneyAircraftLayer: () => ({ id: 'aircraft-layer' }),
+      updatePhotoJourneyAircraftLayer: () => {},
+      removePhotoJourneyAircraftLayer: () => { removed = true; },
+      updatePhotoJourneyBasemap: () => {},
+      flyPhotoJourneyCamera: () => deferredFly
+        ? new Promise(resolve => pendingFlights.push(resolve))
+        : Promise.resolve(true),
+      advanceAircraft: aircraft => ({ ...aircraft }),
+      aircraftApproachPose: aircraft => ({ lng: aircraft.lon, lat: aircraft.lat,
+        height: 700, heading: 0, pitch: -25, roll: 0 }),
+      aircraftChasePose: aircraft => ({ lng: aircraft.lon, lat: aircraft.lat,
+        height: 500, heading: 0, pitch: -12, roll: 0 }),
+    };
+    const playQueue = [];
+    const runtimeContext = {
+      console,
+      Date: { now: () => clock.ms },
+      Number, Math, Promise,
+      performance: { now: () => clock.ms },
+      setTimeout: timerSet, clearTimeout: timerClear,
+      setInterval: intervalSet, clearInterval: intervalClear,
+      window: fakeWindow,
+      document: {
+        body,
+        getElementById: id => id === 'modelayer' ? { id } : null,
+      },
+      manifestReady: Promise.resolve(),
+      PHOTOS: [{ lon: 139, lat: 35, title: 'Dwell point', realElev: knownElevation, intel: { elev: 88 } }],
+      playQueue,
+      DWELL_MS: low ? LOW_DWELL_MS : NORMAL_DWELL_MS,
+      LOW_POWER: low,
+      fakeMod,
+      reindexPhotos: () => {},
+      loadPlayState: () => {},
+      syncSchedule: () => {},
+      buildPlayOrder: () => { if (!playQueue.length) playQueue.push(0); },
+      nextQueueIdx: () => 0,
+      markShown: () => {},
+      showPhoto: () => {},
+      setMode: () => {},
+      buildTicker: () => {},
+      startLivePanels: () => {},
+    };
+    const runtimeVm = vm.createContext(runtimeContext);
+    const runtimeSource = controllerSrc.replace(
+      "import('/static/navara/photo-journey-lite.js')",
+      'Promise.resolve(fakeMod)',
+    );
+    vm.runInContext(runtimeSource, runtimeVm);
+    await flushControllerMicrotasks();
+
+    const invokeTimeout = predicate => {
+      const entry = [...timeouts.entries()].find(([, timer]) => predicate(timer));
+      assert.ok(entry, '期待する遅延timerを登録する');
+      timeouts.delete(entry[0]);
+      entry[1].fn();
+      return entry[1];
+    };
+    const invokeInterval = predicate => {
+      const entry = [...intervals.entries()].find(([, timer]) => predicate(timer));
+      assert.ok(entry, '期待するintervalを登録する');
+      entry[1].fn();
+      return entry[1];
+    };
+    const dispatch = (type, detail) => fakeWindow.dispatchEvent({ type, detail });
+    const resolveNextFlight = (value = true) => {
+      const resolve = pendingFlights.shift();
+      assert.ok(resolve, '未完了flyToのresolve待ちを保持する');
+      resolve(value);
+    };
+    return {
+      clock, timeouts, intervals, cameraCalls, terrainSamples: () => terrainSamples,
+      removed: () => removed, invokeTimeout, invokeInterval, dispatch,
+      setEventActive: value => { state.eventActive = value; },
+      pendingFlights, resolveNextFlight,
+    };
+  }
+
+  const known = await createScenario({ knownElevation: true });
+  known.invokeTimeout(timer => timer.delay === PHOTO_ORBIT_DELAY_MS);
+  assert.strictEqual(known.terrainSamples(), 0,
+    '実標高のある写真は初期配置・周回とも粗いDEMで高度を上書きしない');
+  assert.strictEqual(known.cameraCalls.at(-1).height, 1488,
+    '標高88mの撮影地点から1400m上空を保つ');
+  known.dispatch('pagehide', null);
+
+  const low = await createScenario({ low: true });
+  assert.strictEqual(low.timeouts.size, 2, 'LOW_POWERでもdwellと標高再評価の2 timerを持つ');
+  low.invokeTimeout(timer => timer.delay === PHOTO_ORBIT_DELAY_MS);
+  assert.ok(low.terrainSamples() >= 2, 'LOW_POWERでも遅延DEM標高再評価を実行する');
+  assert.strictEqual([...low.intervals.values()].filter(timer => timer.delay === 50).length, 0,
+    'LOW_POWERでは遅延処理後も周回を開始しない');
+  low.dispatch('pagehide', null);
+  assert.strictEqual(low.timeouts.size, 0, 'LOW_POWERのdisposeで残りのdwell timerを破棄する');
+  assert.strictEqual(low.intervals.size, 0, 'LOW_POWERのdisposeでLOD intervalを破棄する');
+
+  const normal = await createScenario();
+  const normalBeforeOrbit = normal.cameraCalls.length;
+  normal.invokeTimeout(timer => timer.delay === PHOTO_ORBIT_DELAY_MS);
+  assert.ok(normal.terrainSamples() >= 2, '通常時も遅延DEM標高再評価を実行する');
+  const orbit = normal.invokeInterval(timer => timer.delay === 50);
+  assert.strictEqual(orbit.delay, 50, '通常周回は20Hz（50ms）で更新する');
+  assert.ok(normal.cameraCalls.length > normalBeforeOrbit, '周回開始時に再計算したカメラ姿勢を設定する');
+  normal.clock.ms += 4000;
+  normal.invokeInterval(timer => timer.delay === 50);
+  assert.ok(normal.intervals.size >= 2, '8秒周回の途中ではLODと周回intervalを維持する');
+  normal.clock.ms += 4000;
+  normal.invokeInterval(timer => timer.delay === 50);
+  assert.strictEqual([...normal.intervals.values()].filter(timer => timer.delay === 50).length, 0,
+    '通常周回は8秒で終了し、周回intervalを残さない');
+  normal.dispatch('pagehide', null);
+  assert.strictEqual(normal.timeouts.size, 0, '通常時のdisposeでdwell timerを破棄する');
+  assert.strictEqual(normal.intervals.size, 0, '通常時のdisposeでLOD intervalを破棄する');
+  assert.strictEqual(normal.removed(), true, '通常時のdisposeで航空機layerを削除する');
+
+  const reduced = await createScenario({ reduced: true });
+  reduced.invokeTimeout(timer => timer.delay === PHOTO_ORBIT_DELAY_MS);
+  assert.strictEqual([...reduced.intervals.values()].filter(timer => timer.delay === 50).length, 0,
+    'prefers-reduced-motionでは通常設定でも周回intervalを開始しない');
+  reduced.dispatch('pagehide', null);
+
+  const paused = await createScenario();
+  paused.invokeTimeout(timer => timer.delay === PHOTO_ORBIT_DELAY_MS);
+  assert.ok([...paused.intervals.values()].some(timer => timer.delay === 50),
+    'pause前は通常周回intervalが稼働している');
+  const staleOrbitTick = [...paused.intervals.values()].find(timer => timer.delay === 50).fn;
+  paused.dispatch('geoframe:presence-state', { sleeping: true });
+  assert.strictEqual(paused.timeouts.size, 0, '途中pauseで残りのdwell timerを破棄する');
+  assert.strictEqual(paused.intervals.size, 0, '途中pauseで周回とLOD intervalを停止する');
+  const pausedCameraCount = paused.cameraCalls.length;
+  staleOrbitTick();
+  assert.strictEqual(paused.cameraCalls.length, pausedCameraCount,
+    'pause後に遅れて到着した周回tickはカメラを動かさない');
+  paused.dispatch('geoframe:presence-state', { sleeping: false });
+  assert.strictEqual(paused.timeouts.size, 1, 'wake後はjourney再開deadlineだけを作る');
+  assert.strictEqual([...paused.timeouts.values()][0].delay, 150, 'wake後の再開deadlineを150msへ抑える');
+  paused.dispatch('pagehide', null);
+  assert.strictEqual(paused.timeouts.size, 0, 'wake後disposeでも再開deadlineを破棄する');
+
+  const disposedDuringOrbit = await createScenario();
+  disposedDuringOrbit.invokeTimeout(timer => timer.delay === PHOTO_ORBIT_DELAY_MS);
+  const staleDisposedTick = [...disposedDuringOrbit.intervals.values()]
+    .find(timer => timer.delay === 50).fn;
+  const disposedCameraCount = disposedDuringOrbit.cameraCalls.length;
+  disposedDuringOrbit.dispatch('pagehide', null);
+  assert.strictEqual(disposedDuringOrbit.timeouts.size, 0,
+    '周回中のdisposeでdwell timerを破棄する');
+  assert.strictEqual(disposedDuringOrbit.intervals.size, 0,
+    '周回中のdisposeで周回とLOD intervalを停止する');
+  assert.strictEqual(disposedDuringOrbit.removed(), true,
+    '周回中のdisposeで航空機layerを削除する');
+  staleDisposedTick();
+  assert.strictEqual(disposedDuringOrbit.cameraCalls.length, disposedCameraCount,
+    'dispose後に遅れて到着した周回tickはカメラを動かさない');
+
+  /* 通常flyTo完了時のstartPhotoDwellを、未完了Promiseでイベント境界ごとに検証する。 */
+  const genericEvent = await createScenario({ deferredFly: true });
+  genericEvent.invokeTimeout(timer => timer.delay === NORMAL_DWELL_MS);
+  assert.strictEqual(genericEvent.pendingFlights.length, 1,
+    '通常巡回の非初回flyToを未完了Promiseとして保持する');
+  genericEvent.setEventActive(true);
+  genericEvent.resolveNextFlight();
+  await flushControllerMicrotasks();
+  assert.strictEqual(genericEvent.timeouts.size, 1,
+    'generic event中のfly完了でも巡回再開用journey timerを保持する');
+  assert.strictEqual([...genericEvent.timeouts.values()][0].delay, 1000,
+    'generic event中は周回を始めず、1秒後のevent再確認deadlineを残す');
+  assert.strictEqual([...genericEvent.timeouts.values()].filter(timer => timer.delay === PHOTO_ORBIT_DELAY_MS).length, 0,
+    'generic event中に遅延orbit timerを作らない');
+  genericEvent.setEventActive(false);
+  genericEvent.invokeTimeout(timer => timer.delay === 1000);
+  genericEvent.invokeTimeout(timer => timer.delay === 0);
+  assert.strictEqual(genericEvent.pendingFlights.length, 1,
+    'generic event解除後に保留したjourney timerから新しいflyToを開始する');
+  genericEvent.resolveNextFlight();
+  await flushControllerMicrotasks();
+  assert.strictEqual([...genericEvent.timeouts.values()].filter(timer => timer.delay === PHOTO_ORBIT_DELAY_MS).length, 1,
+    'generic event解除後の新しいfly完了で周回準備を再開する');
+  genericEvent.dispatch('pagehide', null);
+
+  const alertDuringFlight = await createScenario({ deferredFly: true });
+  alertDuringFlight.invokeTimeout(timer => timer.delay === NORMAL_DWELL_MS);
+  alertDuringFlight.dispatch('geoframe:aircraft-alert', {
+    aircraft: { hex: 'deferred-alert', lat: 35, lon: 139, seen_pos: 1 },
+    kind: 'rare', until: 1700000030000,
+  });
+  assert.strictEqual(alertDuringFlight.pendingFlights.length, 2,
+    'alert開始時に旧flyToとalert focus flyToを別々に保持する');
+  alertDuringFlight.resolveNextFlight();
+  await flushControllerMicrotasks();
+  assert.strictEqual(alertDuringFlight.timeouts.size, 0,
+    'alert開始後に遅れて完了した旧flyToがdwell/orbitを再起動しない');
+  alertDuringFlight.resolveNextFlight();
+  await flushControllerMicrotasks();
+  assert.ok([...alertDuringFlight.intervals.values()].some(timer => timer.delay === 200),
+    '新しいalertのfocus flyTo完了後だけalert補間を開始する');
+  alertDuringFlight.dispatch('geoframe:aircraft-alert-end', { until: 1700000030000 });
+  assert.strictEqual([...alertDuringFlight.timeouts.values()].filter(timer => timer.delay === NORMAL_DWELL_MS).length, 0,
+    'alert終了後に旧flyTo由来のdwell timerを残さない');
+  alertDuringFlight.dispatch('pagehide', null);
+
+  const sleepDuringFlight = await createScenario({ deferredFly: true });
+  sleepDuringFlight.invokeTimeout(timer => timer.delay === NORMAL_DWELL_MS);
+  sleepDuringFlight.dispatch('geoframe:presence-state', { sleeping: true });
+  sleepDuringFlight.resolveNextFlight();
+  await flushControllerMicrotasks();
+  assert.strictEqual(sleepDuringFlight.timeouts.size, 0,
+    'sleep中に遅れて完了した旧flyToがdwell/orbitを再起動しない');
+  assert.strictEqual(sleepDuringFlight.intervals.size, 0,
+    'sleep中は旧flyTo完了後もLOD intervalを再起動しない');
+  sleepDuringFlight.dispatch('geoframe:presence-state', { sleeping: false });
+  assert.strictEqual(sleepDuringFlight.timeouts.size, 1,
+    'wake後は新規journey再開deadlineだけを作る');
+  assert.strictEqual([...sleepDuringFlight.timeouts.values()][0].delay, 150,
+    'wake後のjourney再開deadlineを150msへ設定する');
+  sleepDuringFlight.dispatch('pagehide', null);
+}
+
 runControllerBridgeRuntimeRegression()
+  .then(() => runPhotoDwellLifecycleRegression())
   .then(() => console.log('photo-journey-lite: OK'))
   .catch(error => {
     console.error(error && error.stack ? error.stack : error);

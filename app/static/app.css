@@ -282,6 +282,10 @@
   #modelayer canvas{display:block;width:100%;height:100%}
   body.mode3d #map{display:none}            /* 3DではMapLibre地図を出さない */
   body.mode3d #modelayer{display:block}
+  /* 画面に固定された格子・走査線は地形を平面に見せるため、3Dでは控える。 */
+  body.mode3d .fx-grid{display:none}
+  body.mode3d .fx-scan{opacity:.2}
+  body.mode3d .fx-vignette{background:radial-gradient(ellipse at center,transparent 60%,rgba(3,5,10,.55) 100%)}
   body.low #modelayer{animation:none}       /* 軽量モードはdriftを止める（#hud-rootと同じ） */
   /* Aircraft stay in the Navara world layer.  When one is present, make the
      opaque photo card slightly translucent so a nearby in-world silhouette

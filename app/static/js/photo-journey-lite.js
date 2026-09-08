@@ -5,7 +5,7 @@
    とはCustomEventの小さな境界で接続し、windowへviewを公開しない。
 
    重要な負荷制御:
-     - 通常巡回は写真のflyToと30秒以上の滞在だけ
+     - 通常巡回は写真のflyTo、期限付きの短い周回、90秒以上の滞在
      - 可視タイルが落ち着いた後だけ、現在/次地点の小さなタイルリングを低速先読み
      - Navaraはanimation:false。タイル精細化は期限付きforceUpdateのみ
      - 航空機アラート中だけ、4〜5HzのsetIntervalで短時間デッドレコニング
@@ -16,8 +16,9 @@
 
   const settings = window.GEOFRAME_PHOTO_JOURNEY_SETTINGS || {
     low: !!window.LOW_POWER,
-    dwellMs: Math.max(typeof DWELL_MS !== 'undefined' ? DWELL_MS : 16000, 30000), flyMs: 5000,
-    height: 2400, pitch: -32, headingStep: 47,
+    dwellMs: Math.max(typeof DWELL_MS !== 'undefined' ? DWELL_MS : 16000, 90000), flyMs: 5000,
+    height: 1400, pitch: -24, headingStep: 47,
+    orbitDelayMs: 45000, orbitMs: 8000, orbitDegrees: 22,
   };
   const AIRCRAFT_UPDATE_EVENT = window.GEOFRAME_AIRCRAFT_EVENT || 'geoframe:aircraft-update';
   const AIRCRAFT_ALERT_EVENT = window.GEOFRAME_AIRCRAFT_ALERT_EVENT || 'geoframe:aircraft-alert';
@@ -36,6 +37,8 @@
   let sleeping = !!(window.GEOFRAME_EVENT_STATE &&
     window.GEOFRAME_EVENT_STATE.isSleeping && window.GEOFRAME_EVENT_STATE.isSleeping());
   let journeyTimer = null;
+  let orbitDelayTimer = null;
+  let orbitTimer = null;
   let journeyGeneration = 0;
   let alertTimer = null;
   let alertGeneration = 0;
@@ -229,9 +232,9 @@
     if(disposed || isPaused() || !prefetchFetcher() ||
        typeof targetMod?.getPhotoJourneyPrefetchTiles !== 'function') return;
     if(prefetchPlanTimer) clearTimeout(prefetchPlanTimer);
-    // Let the visible Navara burst/refinement finish before spending the shared
-    // upstream budget on speculative work.
-    const delay=settings.low ? 5000 : 12500;
+    // Give visible terrain a head start before sharing the upstream budget
+    // with the next photo. The normal refinement can still be finishing.
+    const delay=settings.low ? 60000 : 45000;
     prefetchPlanTimer=setTimeout(()=>{
       prefetchPlanTimer=null;
       if(disposed || isPaused()) return;
@@ -258,8 +261,10 @@
   function requestLodRefinement(targetView){
     clearRefinement();
     if(!targetView || disposed) return;
-    const duration = settings.low ? 1200 : 12000;
-    const interval = settings.low ? 400 : 200;
+    // 冷えたDEMは親→子タイルの到着に数十秒かかる。12秒で打ち切ると、
+    // 標高を取得できていても平らな親メッシュのまま次の写真へ移ってしまう。
+    const duration = settings.low ? 60000 : 55000;
+    const interval = settings.low ? 800 : 400;
     const endAt = nowMs() + duration;
     try{ targetView.forceUpdate?.(); }catch(e){ return handleNavaraError(e); }
     refinementTimer = setInterval(()=>{
@@ -281,6 +286,7 @@
     if(disposed) return;
     disposed=true;
     if(journeyTimer){ clearTimeout(journeyTimer); journeyTimer=null; }
+    clearPhotoOrbit();
     clearRefinement();
     if(alertTimer){ clearInterval(alertTimer); alertTimer=null; }
     clearPrefetchWork();
@@ -339,6 +345,51 @@
   function cancelJourney(){
     journeyGeneration++;
     if(journeyTimer){ clearTimeout(journeyTimer); journeyTimer=null; }
+    clearPhotoOrbit();
+  }
+
+  function clearPhotoOrbit(){
+    if(orbitDelayTimer){ clearTimeout(orbitDelayTimer); orbitDelayTimer=null; }
+    if(orbitTimer){ clearInterval(orbitTimer); orbitTimer=null; }
+  }
+
+  function photoCamera(point, heading, elevation){
+    const options={height:settings.height,pitch:settings.pitch,heading,elevation};
+    // 古いバンドルがキャッシュに残った場合も、次の通常更新まで巡回を維持する。
+    return mod.photoJourneyCameraPose?.(point,options) ||
+      {lng:point.lon,lat:point.lat,...options};
+  }
+
+  function startPhotoDwell(point, heading, token){
+    if(token!==journeyGeneration || disposed || isSleeping() || activeAlert) return;
+    scheduleJourney(settings.dwellMs);
+    clearPhotoOrbit();
+    if(isEventActive()) return;
+    // LOD精細化が進んだ時点で、実標高がない写真の地面高度を再評価する。
+    orbitDelayTimer=setTimeout(()=>{
+      orbitDelayTimer=null;
+      if(token!==journeyGeneration || disposed || isPaused()) return;
+      const elevation=mod.photoJourneyElevation?.(view,point) ?? 0;
+      const reduced=window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+      const duration=settings.low || reduced ? 0 : Math.min(settings.orbitMs || 0,8000);
+      try{ mod.setPhotoJourneyCamera(view,photoCamera(point,heading,elevation)); }
+      catch(e){ handleNavaraError(e); return; }
+      if(duration<=0) return;
+      const start=nowMs();
+      // 8秒・20Hzを上限にし、終了後はon-demand描画へ戻る。
+      orbitTimer=setInterval(()=>{
+        if(token!==journeyGeneration || disposed || isPaused() ||
+           window.matchMedia?.('(prefers-reduced-motion: reduce)').matches){
+          clearPhotoOrbit(); return;
+        }
+        const progress=Math.min(1,(nowMs()-start)/duration);
+        const eased=progress*progress*(3-2*progress);
+        const angle=Math.min(30,Math.max(0,settings.orbitDegrees || 22));
+        try{ mod.setPhotoJourneyCamera(view,photoCamera(point,heading+angle*eased,elevation)); }
+        catch(e){ handleNavaraError(e); return; }
+        if(progress>=1) clearPhotoOrbit();
+      },50);
+    },Math.min(settings.orbitDelayMs || 45000,Math.max(0,settings.dwellMs-9000)));
   }
 
   function clearAlertAnimation(){
@@ -531,6 +582,7 @@
       return;
     }
     if(i < 0){ scheduleJourney(1000); return; }
+    clearPhotoOrbit();
     const token=journeyGeneration;
     markShown(i);
     const p=PHOTOS[i];
@@ -538,19 +590,20 @@
     schedulePhotoPrefetch(targetMod,p,nextIndex >= 0 ? PHOTOS[nextIndex] : null);
     showPhoto(i);
     setMode('3D PHOTO JOURNEY LITE');
-    const height=settings.height+(settings.low?0:(i%3)*400);
     const heading=settings.headingStep ? (i*settings.headingStep)%360 : 0;
+    const elevation=targetMod.photoJourneyElevation?.(targetView,p) ?? 0;
+    targetMod.updatePhotoJourneyLighting?.(targetView,p);
     if(targetLayer && targetMod.updatePhotoJourneyBasemap){
       try{
         targetMod.updatePhotoJourneyBasemap(targetLayer.basemap,p);
         requestLodRefinement(targetView);
       }catch(e){ handleNavaraError(e); return; }
     }
-    if(initial){ scheduleJourney(settings.dwellMs); return; }
+    if(initial){ startPhotoDwell(p,heading,token); return; }
     let flight;
     try{
       flight=targetMod.flyPhotoJourneyCamera(targetView,
-        {lng:p.lon,lat:p.lat,height,pitch:settings.pitch,heading},
+        photoCamera(p,heading,elevation),
         {duration:settings.flyMs});
     }catch(e){ handleNavaraError(e); return; }
     Promise.resolve(flight)
@@ -558,7 +611,7 @@
       .catch(err=>{ if(!activeAlert && !disposed) console.warn('[3d] photo fly interrupted',err); })
       .finally(()=>{
         if(token===journeyGeneration && !disposed && !activeAlert && !isSleeping())
-          scheduleJourney(settings.dwellMs);
+          startPhotoDwell(p,heading,token);
       });
   }
 
@@ -584,13 +637,15 @@
       // 地形(GSI DEM)の斜面が読めるように、陰影を可視性優先で調整した値。
       // sunはapplyColor:trueで大気散乱の計算を経ずに指定色をそのまま使い、
       // castShadow:falseでN100向けにシャドウマップを一切生成しない。
-      view.addLight({ambient:{intensity:0.68}});
-      view.addLight({sun:{intensity:0.52,applyColor:true,castShadow:false}});
+      view.addLight({ambient:{intensity:0.48}});
+      view.addLight({sun:{intensity:1.15,applyColor:true,castShadow:false}});
       const points=toInitialPoint(first);
       if(first>=0){
         const p=PHOTOS[first];
-        mod.setPhotoJourneyCamera(view,{lng:p.lon,lat:p.lat,height:settings.height,
-          pitch:settings.pitch,heading:settings.headingStep?(first*settings.headingStep)%360:0});
+        const heading=settings.headingStep?(first*settings.headingStep)%360:0;
+        const elevation=mod.photoJourneyElevation?.(view,p) ?? 0;
+        mod.updatePhotoJourneyLighting?.(view,p);
+        mod.setPhotoJourneyCamera(view,photoCamera(p,heading,elevation));
       }
       layerState=mod.addPhotoJourneyLayers(view,{points,route:[]});
       aircraftLayerState=mod.addPhotoJourneyAircraftLayer(view, {

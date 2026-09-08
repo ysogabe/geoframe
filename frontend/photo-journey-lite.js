@@ -29,7 +29,7 @@ import { DefaultPlugin } from "@navaramap/three-default-plugin";
 const NORMAL_OPTIONS = Object.freeze({
   pixelRatio: 0.5,      // 2560x1080実機では1280x540。固定GPU領域を約1/4へ削減
   shadow: false,        // 影は初期化時オプション。N100 では無効
-  // view.globe（terrain mesh）のLOD品質。segmentsはタイルあたりの分割数、
+  // view.globeのLOD品質。segmentsは初期地球面の分割数（DEMは別途適応分割）、
   // maxSseは許容screen-space-error（px、大きいほど粗く早く安定する）。
   // GSI DEM地形の初回トライアルはN100を優先し、通常表示でも控えめな値にする。
   segments: 32,
@@ -125,7 +125,7 @@ export function selectPhotoJourneyBasemap(point) {
 
 /*
  * 巡回中の投機取得用タイル列。Navara本体の可視タイル選択とは分離し、
- * 「現在地点の周囲」と「次の巡回地点」の小さな3x3リングだけを返す。
+ * 地形の親タイルと「現在地点の周囲」「次の巡回地点」の画像3x3リングを返す。
  * 通常時は国内のz15/z16（z16は一段先の精細化）、国外はOSMのz15、
  * ?lowでは全地域z14に抑える。実際の取得レートと停止条件はcontroller側で管理する。
  */
@@ -154,6 +154,13 @@ export function getPhotoJourneyPrefetchTiles(point, { low = false, origin = "" }
     (layer === "gsi-photo" ? PHOTO_PREFETCH_NORMAL_ZOOMS : [15]);
   const base = String(origin || "").replace(/\/+$/, "");
   const urls = [];
+  // 地形の親タイルも温める。DEMを先に用意してから写真へ予算を回す。
+  // 国内はZ14、海外は全球DEMの上限Z8まで。既存の取得レート/キュー上限内で処理する。
+  const demZooms = layer === "gsi-photo" ? (low ? [8, 10, 12] : [8, 10, 12, 14]) : [6, 8];
+  for (const zoom of demZooms) {
+    const center = photoJourneyTileXY(point, zoom);
+    urls.push(`${base}/tiles/gsi-dem/${zoom}/${center.x}/${center.y}.png`);
+  }
   for (const zoom of zooms) {
     const center = photoJourneyTileXY(point, zoom);
     if (!center) continue;
@@ -192,7 +199,7 @@ const DEM_MAX_ZOOM = 14;
 // （@navaramap/three 0.1.1 の型定義で確認済み）。デコード結果の実測メートルを
 // そのまま使うことが「実高度スケール1.0」であり、追加設定は不要。
 // HillshadeMaterial.exaggeration（既定1.0）だけが検証済みの陰影強調パラメータ。
-// terrain mesh自体（segments=32/16）の頂点法線は粗いため、同じraster-demソースを
+// 遠方や読み込み中の粗い地形にも陰影を補うため、同じraster-demソースを
 // 参照する薄いhillshade raster layerで、地形の面が読める（1.35倍）陰影を追加する。
 // Hillshadeの係数変更はメッシュ数を増やさず、N100でも地形の立体感だけを改善する。
 const DEM_HILLSHADE_EXAGGERATION = 1.35;
@@ -830,6 +837,62 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
   }
 
   return { basemap: { kind, source: raster, urls }, terrain: { source: demSource } };
+}
+
+/* 写真の座標はカメラ位置ではなく注視点。地面からの高さと俯角で後退距離を
+   決める。日付変更線・極付近でも破綻しない球面移動でカメラ座標を求める。
+   航空機の絶対高度カメラはこの変換を通さない。 */
+export function photoJourneyCameraPose(point, {
+  height = 1400, pitch = -24, heading = 0, elevation = 0,
+} = {}) {
+  const lng = finiteNumber(point?.lon ?? point?.lng);
+  const lat = finiteNumber(point?.lat);
+  if (lng === null || lat === null || Math.abs(lng) > 180 || Math.abs(lat) > 90)
+    return null;
+  const rad = Math.PI / 180;
+  const clearance = clamp(finiteNumber(height) ?? 1400, 400, 8000);
+  const tilt = clamp(finiteNumber(pitch) ?? -24, -70, -18);
+  const bearing = (normalizedHeading(heading) ?? 0) * rad;
+  const distance = clearance / Math.tan(-tilt * rad);
+  const arc = distance / 6378137;
+  const phi = lat * rad;
+  const back = bearing + Math.PI;
+  const cameraLat = Math.asin(clamp(Math.sin(phi) * Math.cos(arc) +
+    Math.cos(phi) * Math.sin(arc) * Math.cos(back), -1, 1));
+  const deltaLng = Math.atan2(Math.sin(back) * Math.sin(arc) * Math.cos(phi),
+    Math.cos(arc) - Math.sin(phi) * Math.sin(cameraLat));
+  const cameraLng = ((lng + deltaLng / rad + 540) % 360) - 180;
+  // 移動先から注視点への方位（高緯度では出発時の方位と一致しない）。
+  const toTarget = Math.atan2(Math.sin(-deltaLng) * Math.cos(phi),
+    Math.cos(cameraLat) * Math.sin(phi) -
+    Math.sin(cameraLat) * Math.cos(phi) * Math.cos(deltaLng)) / rad;
+  return {
+    lng: cameraLng, lat: cameraLat / rad,
+    height: clamp(finiteNumber(elevation) ?? 0, -500, 9000) + clearance,
+    pitch: tilt, heading: ((toTarget % 360) + 360) % 360, roll: 0,
+  };
+}
+
+export function photoJourneyElevation(view, point) {
+  // applyManifestの擬似標高は除外。実標高があれば、粗い親DEMによる低い推定値で
+  // 上書きしない（読み込み中の山でカメラが地面へ沈むことを防ぐ）。
+  const known = point.realElev === true ? finiteNumber(point.intel?.elev) : null;
+  if (known !== null) return clamp(known, -500, 9000);
+  let sampled = null;
+  try {
+    sampled = finiteNumber(view.sampleTerrainHeight?.({
+      lng: point.lon ?? point.lng, lat: point.lat,
+    }));
+  } catch (error) { /* DEM未準備でも巡回を続ける。 */ }
+  return clamp(sampled ?? 0, -500, 9000);
+}
+
+/* 鑑賞用の斜光。実時刻の太陽は夜側では地面の下に入り、斜面の陰影が消える。
+   巡回地点の地方太陽時を春分の15時へ揃える。大気テクスチャは読み込まない。 */
+export function updatePhotoJourneyLighting(view, point) {
+  const lng = finiteNumber(point?.lon ?? point?.lng);
+  if (!view.atmosphere || lng === null) return;
+  view.atmosphere.date = new Date(Date.UTC(2026, 2, 20, 15) - lng * 240000);
 }
 
 /* カメラを即時配置する。height はメートル（楕円体からの高度）。 */

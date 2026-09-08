@@ -4,13 +4,17 @@
 
   window.GEOFRAME_PHOTO_JOURNEY_SETTINGS = Object.freeze({
     low: !!LOW_POWER,
-    dwellMs: LOW_POWER ? Math.max(baseDwell, 45000) : Math.max(baseDwell, 30000),
+    // 冷えた地形が細かくなった後にも鑑賞時間を確保する。
+    dwellMs: Math.max(baseDwell, 90000),
     flyMs: LOW_POWER ? 1200 : 5000,
-    // 真下寄りの俯瞰（-50°）ではDEMの起伏が写真の傾きに埋もれるため、
-    // 地平線と斜面が読める斜め視点に固定する。heightは楕円体からの実高度。
-    height: LOW_POWER ? 4200 : 2400,
-    pitch: LOW_POWER ? -28 : -32,
+    // heightは撮影地点の地面からの距離。カメラ位置へ変換するときに標高を加える。
+    height: LOW_POWER ? 3200 : 1400,
+    pitch: LOW_POWER ? -28 : -24,
     headingStep: LOW_POWER ? 0 : 47,
+    // タイルが揃ってから短い周回で視差を見せ、その後は静止する。
+    orbitDelayMs: 45000,
+    orbitMs: LOW_POWER ? 0 : 8000,
+    orbitDegrees: 22,
     presencePollMs: LOW_POWER ? 30000 : 15000,
   });
 })();

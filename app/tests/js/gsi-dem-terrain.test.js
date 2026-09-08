@@ -264,7 +264,8 @@ async function runLightingRegression() {
     window: {
       GEOFRAME_MODE_3D: true,
       GEOFRAME_PHOTO_JOURNEY_SETTINGS: {
-        low: false, dwellMs: 30000, flyMs: 1, height: 2400, pitch: -32, headingStep: 0,
+        low: false, dwellMs: 60000, flyMs: 1, height: 1400, pitch: -24, headingStep: 0,
+        orbitDelayMs: 45000, orbitMs: 8000, orbitDegrees: 22,
       },
       GEOFRAME_EVENT_STATE: { isSleeping: () => false, isEventActive: () => false, getEventUntil: () => 0 },
       addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => true,
@@ -273,7 +274,7 @@ async function runLightingRegression() {
     manifestReady: Promise.resolve(),
     PHOTOS: [{ lon: 139, lat: 35, title: 'Lighting regression point' }],
     playQueue,
-    DWELL_MS: 30000,
+    DWELL_MS: 60000,
     LOW_POWER: false,
     sessionStorage: { setItem: () => {} },
     location: { reload: () => {} },
@@ -293,11 +294,11 @@ async function runLightingRegression() {
   assert.strictEqual(lightCalls.length, 2, 'ambientとsunの2回だけaddLightを呼ぶ（他の光源は追加しない）');
   // vmサンドボックス越しのオブジェクトはOutward Objectと[[Prototype]]が異なるため、
   // deepStrictEqualではなくJSON表現で比較する（既存のsetPhotoJourneyCameraテストと同じ手法）。
-  assert.strictEqual(JSON.stringify(lightCalls[0]), JSON.stringify({ ambient: { intensity: 0.68 } }),
-    '地形の陰影を残すambient光0.68を最初に置く');
+  assert.strictEqual(JSON.stringify(lightCalls[0]), JSON.stringify({ ambient: { intensity: 0.48 } }),
+    '地形の陰影を残すambient光0.48を最初に置く');
   assert.strictEqual(JSON.stringify(lightCalls[1]),
-    JSON.stringify({ sun: { intensity: 0.52, applyColor: true, castShadow: false } }),
-    '地形の面を照らす太陽光0.52・applyColor有効・シャドウマップ無効を実際にaddLightへ渡す');
+    JSON.stringify({ sun: { intensity: 1.15, applyColor: true, castShadow: false } }),
+    '地形の面を照らす太陽光1.15・applyColor有効・シャドウマップ無効を実際にaddLightへ渡す');
 }
 
 /* ============================================================

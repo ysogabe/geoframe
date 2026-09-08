@@ -46,6 +46,7 @@
 実装を約束するものではない、将来案や検討メモです。
 
 - [Google連携と追加表示コンテンツ](roadmap/content-integrations.md)
+- [3Dの奥行き改善とサイバー表示の比較](roadmap/3d-depth-and-cyber-display.md)
 
 ### `archive/` — 履歴資料
 
