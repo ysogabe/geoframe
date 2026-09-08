@@ -553,14 +553,14 @@ assert.ok(/view\.addLight\(\{\s*sun:\s*\{\s*intensity:\s*1\.15,\s*applyColor:\s*
 assert.ok(!controllerSrc.includes('view.lit = false'), 'unlit切替でラスタ合成を失わせない');
 assert.ok(/requestLodRefinement\((view|targetView)\)/.test(controllerSrc), 'on-demand描画でも航空写真LODを精細化する');
 assert.ok(controllerSrc.includes('setInterval'), '常時描画ではなく期限付きの精細化バーストを使う');
-assert.ok(/const duration = settings\.low \? 60000 : 55000/.test(controllerSrc),
-  '冷えたDEMを待てるよう精細化の通常/LOW_POWER期限を55/90秒にする');
+assert.ok(/const duration = settings\.low \? 60000 : \(settings\.terrainStyle === 'hybrid' \? 75000 : 55000\)/.test(controllerSrc),
+  '冷えたDEMを待ち、hybridは写真フェード後も75秒まで精細化する');
 assert.ok(/const interval = settings\.low \? 800 : 400/.test(controllerSrc),
   '精細化更新を通常400ms/LOW_POWER800msへ抑える');
-assert.ok(/const delay=settings\.low \? 60000 : 45000/.test(controllerSrc),
-  'DEM親タイルを待ってから通常45秒/LOW_POWER90秒で画像先読みする');
+assert.ok(/const delay=settings\.low \? 60000 : 15000/.test(controllerSrc),
+  '通常15秒/LOW_POWER60秒から上限付き先読みを開始する');
 assert.ok(controllerSrc.includes('getPhotoJourneyPrefetchTiles'), 'Navara側の国内/国外判定済み先読み計画を使う');
-assert.ok(controllerSrc.includes("cache:'force-cache'"), '先読み画像の本文を取得してサーバーキャッシュへ流す');
+assert.ok(controllerSrc.includes("'force-cache'") && controllerSrc.includes("response?.arrayBuffer?.()"), '先読み画像の本文を取得してサーバーキャッシュへ流す');
 assert.ok(controllerSrc.includes('PREFETCH_NORMAL_PER_MINUTE = 60'), '先読みを毎分60枚へ制限する');
 assert.ok(controllerSrc.includes('PREFETCH_LOW_PER_MINUTE = 24'), 'LOW_POWERの先読みを毎分24枚へ制限する');
 assert.ok(controllerSrc.includes("X-Tile-Cache"), 'サーバーのthrottled/errorを検知して先読み重複を解除する');

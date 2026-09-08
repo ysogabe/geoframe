@@ -39,6 +39,66 @@ class GsiPhotoTileTest(unittest.TestCase):
             self.assertEqual(image.size, (256, 256))
             self.assertEqual(image.format, "PNG")
 
+    def test_photo_content_classification_uses_known_empty_bytes(self):
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", tiles._transparent_tile()), "empty")
+        source = io.BytesIO()
+        Image.new("RGB", (256, 256), (20, 80, 140)).save(source, format="PNG")
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", source.getvalue()), "imagery")
+        self.assertIsNone(tiles.photo_tile_content("gsi-dem", tiles._transparent_tile()))
+
+    def test_alternate_compression_transparent_png_is_empty(self):
+        source = io.BytesIO()
+        Image.new("RGBA", (256, 256), (0, 0, 0, 0)).save(
+            source, format="PNG", optimize=True, compress_level=9)
+        data = source.getvalue()
+        self.assertNotEqual(data, tiles._transparent_tile())
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", data), "empty")
+
+    def test_palette_transparency_is_empty_but_visible_pixel_is_imagery(self):
+        empty = Image.new("P", (256, 256), 0)
+        empty.putpalette([0, 0, 0, 20, 80, 140] + [0] * (256 * 3 - 6))
+        empty_source = io.BytesIO()
+        empty.save(empty_source, format="PNG", transparency=0)
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", empty_source.getvalue()), "empty")
+
+        visible = empty.copy()
+        visible.putpixel((0, 0), 1)
+        visible_source = io.BytesIO()
+        visible.save(visible_source, format="PNG", transparency=0)
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", visible_source.getvalue()), "imagery")
+
+    def test_invalid_or_wrong_size_png_is_empty(self):
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", b"not a png"), "empty")
+        source = io.BytesIO()
+        Image.new("RGB", (128, 128), (20, 80, 140)).save(source, format="PNG")
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", source.getvalue()), "empty")
+        valid = io.BytesIO()
+        Image.new("RGB", (256, 256), (20, 80, 140)).save(valid, format="PNG")
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", valid.getvalue()[:-20]), "empty")
+
+    def test_rgb_png_fast_path_does_not_decode_with_pil(self):
+        tiles._photo_content_cache.clear()
+        source = io.BytesIO()
+        Image.new("RGB", (256, 256), (20, 80, 140)).save(source, format="PNG")
+        with patch.object(tiles.Image, "open", side_effect=AssertionError("RGB PNGをPIL decodeした")):
+            self.assertEqual(tiles.photo_tile_content("gsi-photo", source.getvalue()), "imagery")
+
+    def test_alpha_classification_is_cached_and_cache_is_bounded(self):
+        tiles._photo_content_cache.clear()
+        source = io.BytesIO()
+        Image.new("RGBA", (256, 256), (0, 0, 0, 0)).save(source, format="PNG", compress_level=1)
+        data = source.getvalue()
+        with patch.object(tiles.Image, "open", wraps=tiles.Image.open) as open_mock:
+            self.assertEqual(tiles.photo_tile_content("gsi-photo", data), "empty")
+            self.assertEqual(tiles.photo_tile_content("gsi-photo", data), "empty")
+            self.assertEqual(open_mock.call_count, 1, "同じalpha PNGを2回decodeしない")
+
+        for red in range(tiles._PHOTO_CONTENT_CACHE_MAX + 4):
+            image = io.BytesIO()
+            Image.new("RGB", (256, 256), (red % 256, 80, 140)).save(image, format="PNG")
+            tiles.photo_tile_content("gsi-photo", image.getvalue())
+        self.assertLessEqual(len(tiles._photo_content_cache), tiles._PHOTO_CONTENT_CACHE_MAX)
+
     def test_unexpected_payload_is_rejected(self):
         with self.assertRaises(ValueError):
             tiles._normalise_tile_bytes(b"<html>not a tile</html>")
@@ -142,7 +202,36 @@ class FetchTileDemAbsenceTest(unittest.TestCase):
             body, status = tiles.fetch_tile("gsi-photo", 14, 1, 1)
         self.assertEqual(status, "miss")
         self.assertEqual(body, tiles._transparent_tile())
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", body), "empty")
         self.assertNotEqual(body, tiles._dem_no_data_tile_bytes())
+
+        with patch.object(tiles.urllib.request, "urlopen",
+                          side_effect=AssertionError("404代替タイルのキャッシュから上流へ行った")):
+            cached_body, cached_status = tiles.fetch_tile("gsi-photo", 14, 1, 1)
+        self.assertEqual(cached_status, "hit")
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", cached_body), "empty")
+
+    def test_photo_imagery_is_classified_after_jpeg_normalisation(self):
+        source = io.BytesIO()
+        Image.new("RGB", (256, 256), (20, 80, 140)).save(source, format="JPEG")
+        raw = source.getvalue()
+
+        def fake_urlopen(*a, **k):
+            class Resp:
+                def __enter__(self_):
+                    return self_
+
+                def __exit__(self_, *exc):
+                    return False
+
+                def read(self_):
+                    return raw
+            return Resp()
+
+        with patch.object(tiles.urllib.request, "urlopen", side_effect=fake_urlopen):
+            body, status = tiles.fetch_tile("gsi-photo", 14, 2, 2)
+        self.assertEqual(status, "miss")
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", body), "imagery")
 
     def test_upstream_5xx_returns_no_data_without_caching_for_gsi_dem(self):
         def fake_urlopen(*a, **k):
@@ -154,6 +243,22 @@ class FetchTileDemAbsenceTest(unittest.TestCase):
         self.assertEqual(body, tiles._dem_no_data_tile_bytes())
         cached = tiles.TILE_DIR / "gsi-dem" / "10" / "2" / "2.png"
         self.assertFalse(cached.exists(), "5xx/一時エラーは永続キャッシュしない（次回再試行させる）")
+
+    def test_photo_error_and_throttled_are_empty_content(self):
+        def fake_urlopen(*a, **k):
+            raise urllib.error.HTTPError("http://example", 503, "busy", {}, None)
+
+        with patch.object(tiles.urllib.request, "urlopen", side_effect=fake_urlopen):
+            body, status = tiles.fetch_tile("gsi-photo", 14, 3, 3)
+        self.assertEqual(status, "error")
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", body), "empty")
+
+        with patch.object(tiles, "_tile_fetch_allowed", return_value=False), \
+             patch.object(tiles.urllib.request, "urlopen",
+                          side_effect=AssertionError("流量制限中に上流へ行った")):
+            body, status = tiles.fetch_tile("gsi-photo", 14, 4, 4)
+        self.assertEqual(status, "throttled")
+        self.assertEqual(tiles.photo_tile_content("gsi-photo", body), "empty")
 
     def test_throttled_gsi_dem_request_returns_no_data_without_network(self):
         with patch.object(tiles, "_tile_fetch_allowed", return_value=False), \
@@ -239,6 +344,112 @@ class ServeTileDemUnsupportedZoomTest(unittest.TestCase):
         head, _, _ = raw.partition(b"\r\n\r\n")
         status_line = head.split(b"\r\n")[0]
         self.assertIn(b" 404 ", status_line)
+
+
+class ServeTilePhotoContentHeaderTest(unittest.TestCase):
+    """写真タイルだけが画像有無をX-Tile-Contentで通知する。"""
+
+    def _serve(self, body, status, path="/tiles/gsi-photo/14/1/1.png", head_only=False):
+        from geoframe import handlers
+
+        class _FakeRequest:
+            def makefile(self, mode, bufsize=-1):
+                return io.BytesIO()
+
+        h = handlers.Handler(_FakeRequest(), ("127.0.0.1", 0), None)
+        h.wfile = io.BytesIO()
+        h.path = path
+        h.requestline = ""
+        h.request_version = "HTTP/1.0"
+        h.command = "GET"
+        with patch.object(handlers, "fetch_tile", return_value=(body, status)) as fetch:
+            h._serve_tile(h.path.split("?")[0], head_only=head_only)
+            self.fetch_call = fetch.call_args
+        return h.wfile.getvalue()
+
+    def test_empty_photo_has_empty_content_header(self):
+        raw = self._serve(tiles._transparent_tile(), "hit")
+        head, _, body = raw.partition(b"\r\n\r\n")
+        self.assertIn(b" 200 ", head.split(b"\r\n")[0])
+        self.assertIn(b"X-Tile-Cache: hit", head)
+        self.assertIn(b"X-Tile-Content: empty", head)
+        self.assertEqual(body, tiles._transparent_tile())
+
+    def test_imagery_has_imagery_content_header(self):
+        source = io.BytesIO()
+        Image.new("RGB", (256, 256), (20, 80, 140)).save(source, format="PNG")
+        raw = self._serve(source.getvalue(), "miss")
+        head, _, _ = raw.partition(b"\r\n\r\n")
+        self.assertIn(b"X-Tile-Cache: miss", head)
+        self.assertIn(b"X-Tile-Content: imagery", head)
+
+    def test_error_and_throttled_statuses_report_empty(self):
+        body = b"placeholder body"
+        for status in ("error", "throttled"):
+            raw = self._serve(body, status)
+            head, _, _ = raw.partition(b"\r\n\r\n")
+            self.assertIn(f"X-Tile-Cache: {status}".encode(), head)
+            self.assertIn(b"X-Tile-Content: empty", head)
+
+    def test_non_photo_layers_do_not_receive_photo_content_header(self):
+        raw = self._serve(tiles._dem_no_data_tile_bytes(), "hit",
+                          "/tiles/gsi-dem/10/1/1.png")
+        head, _, _ = raw.partition(b"\r\n\r\n")
+        self.assertNotIn(b"X-Tile-Content:", head)
+
+    def test_detail_query_is_forwarded_and_head_has_no_body(self):
+        raw = self._serve(tiles._transparent_tile(), "skipped",
+                          "/tiles/gsi-photo/13/1/1.png?detail=1", head_only=True)
+        head, _, body = raw.partition(b"\r\n\r\n")
+        self.assertIn(b" 200 ", head.split(b"\r\n")[0])
+        self.assertIn(b"X-Tile-Content: empty", head)
+        self.assertIn(b"X-Tile-Cache: skipped", head)
+        self.assertEqual(body, b"")
+        self.assertEqual(self.fetch_call.kwargs, {"detail": True})
+
+    def test_detail_query_does_not_change_other_layers_or_opt_out(self):
+        for path in ("/tiles/gsi-dem/13/1/1.png?detail=1",
+                     "/tiles/gsi-photo/13/1/1.png?detail=0"):
+            self._serve(tiles._transparent_tile(), "hit", path)
+            self.assertEqual(self.fetch_call.kwargs, {})
+
+
+class DetailPhotoTileTest(unittest.TestCase):
+    """粗い写真の省略は、通常モードのキャッシュと取得上限に影響させない。"""
+
+    def test_low_zoom_skips_cache_upstream_and_budget(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(tiles, "TILE_DIR", Path(root)):
+            with patch.object(tiles, "_tile_fetch_allowed") as budget, \
+                    patch.object(tiles.urllib.request, "urlopen") as upstream:
+                body, status = tiles.fetch_tile("gsi-photo", 13, 1, 1, detail=True)
+                self.assertEqual((body, status), (tiles._transparent_tile(), "skipped"))
+                budget.assert_not_called()
+                upstream.assert_not_called()
+                self.assertEqual(list(Path(root).rglob("*.png")), [])
+
+    def test_detail_preserves_normal_photo_and_dem_cache(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(tiles, "TILE_DIR", Path(root)):
+            for layer, zoom in (("gsi-photo", 13), ("gsi-photo", 14), ("gsi-dem", 13)):
+                target = Path(root) / layer / str(zoom) / "1" / "1.png"
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"existing-tile")
+                body, status = tiles.fetch_tile(layer, zoom, 1, 1, detail=True)
+                self.assertEqual(status, "skipped" if layer == "gsi-photo" and zoom < 14 else "hit")
+                self.assertEqual(target.read_bytes(), b"existing-tile")
+                self.assertEqual(tiles.fetch_tile(layer, zoom, 1, 1), (b"existing-tile", "hit"))
+
+    def test_detail_zoom14_uses_the_normal_upstream_path(self):
+        with tempfile.TemporaryDirectory() as root, patch.object(tiles, "TILE_DIR", Path(root)), \
+                patch.object(tiles, "_tile_fetch_allowed", return_value=True) as budget, \
+                patch.object(tiles.urllib.request, "urlopen") as upstream:
+            source = io.BytesIO()
+            Image.new("RGB", (256, 256), (20, 80, 140)).save(source, format="JPEG")
+            upstream.return_value.__enter__.return_value.read.return_value = source.getvalue()
+            body, status = tiles.fetch_tile("gsi-photo", 14, 1, 1, detail=True)
+            self.assertEqual(status, "miss")
+            self.assertEqual(tiles.photo_tile_content("gsi-photo", body), "imagery")
+            budget.assert_called_once()
+            self.assertIn("/seamlessphoto/14/1/1.jpg", upstream.call_args.args[0].full_url)
 
 
 if __name__ == "__main__":

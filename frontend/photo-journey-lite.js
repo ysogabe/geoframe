@@ -95,10 +95,13 @@ export function createPhotoJourneyView(container, opts = {}) {
     pixelRatio: Math.min(opts.pixelRatio ?? defaults.pixelRatio, 1),
     shadow: opts.shadow ?? defaults.shadow,
     segments: opts.segments ?? defaults.segments,
-    maxSse: opts.maxSse ?? defaults.maxSse,
+    // 粗い写真を隠すhybridでは注視点の詳細写真へLODを進める。
+    // 通常のphoto、省電力は従来のLOD設定を維持する。
+    maxSse: opts.maxSse ?? (opts.terrainStyle === "hybrid" && !opts.low ? 3 : defaults.maxSse),
     multisampling: opts.multisampling ?? defaults.multisampling,
     halfFloat: opts.halfFloat ?? defaults.halfFloat,
     picking: opts.picking ?? defaults.picking,
+    useNormal: true,
     animation: opts.animation ?? defaults.animation,
     mobileOptimization: opts.mobileOptimization ?? defaults.mobileOptimization,
     cacheBytes: opts.cacheBytes ?? defaults.cacheBytes,
@@ -146,11 +149,11 @@ function photoJourneyTileXY(point, zoom) {
   return { x: Math.max(0, Math.min(n - 1, x)), y: Math.max(0, Math.min(n - 1, y)), n };
 }
 
-export function getPhotoJourneyPrefetchTiles(point, { low = false, origin = "" } = {}) {
+export function getPhotoJourneyPrefetchTiles(point, { low = false, origin = "", imagery = true, detail = false } = {}) {
   const tile = photoJourneyTileXY(point, PHOTO_PREFETCH_NORMAL_ZOOMS[0]);
   if (!tile) return [];
   const layer = selectPhotoJourneyBasemap(point);
-  const zooms = low ? PHOTO_PREFETCH_LOW_ZOOMS :
+  const zooms = low || detail ? PHOTO_PREFETCH_LOW_ZOOMS :
     (layer === "gsi-photo" ? PHOTO_PREFETCH_NORMAL_ZOOMS : [15]);
   const base = String(origin || "").replace(/\/+$/, "");
   const urls = [];
@@ -161,7 +164,7 @@ export function getPhotoJourneyPrefetchTiles(point, { low = false, origin = "" }
     const center = photoJourneyTileXY(point, zoom);
     urls.push(`${base}/tiles/gsi-dem/${zoom}/${center.x}/${center.y}.png`);
   }
-  for (const zoom of zooms) {
+  for (const zoom of imagery ? zooms : []) {
     const center = photoJourneyTileXY(point, zoom);
     if (!center) continue;
     for (let dy = -PHOTO_PREFETCH_RADIUS; dy <= PHOTO_PREFETCH_RADIUS; dy++) {
@@ -169,17 +172,18 @@ export function getPhotoJourneyPrefetchTiles(point, { low = false, origin = "" }
         const x = (center.x + dx + center.n) % center.n;
         const y = center.y + dy;
         if (y < 0 || y >= center.n) continue;
-        urls.push(`${base}/tiles/${layer}/${zoom}/${x}/${y}.png`);
+        urls.push(`${base}/tiles/${layer}/${zoom}/${x}/${y}.png${detail && layer === "gsi-photo" ? "?detail=1" : ""}`);
       }
     }
   }
   return urls;
 }
 
-function rasterDefinition(kind, urls) {
+function rasterDefinition(kind, urls, style = "photo") {
   return {
     type: "raster-tile",
-    url: urls[kind],
+    url: style === "hybrid" && kind === "gsi-photo"
+      ? `${urls[kind]}${urls[kind].includes("?") ? "&" : "?"}detail=1` : urls[kind],
     minZoom: kind === "gsi-photo" ? 2 : 0,
     maxZoom: kind === "gsi-photo" ? 18 : 19,
   };
@@ -225,23 +229,121 @@ function addTerrain(view, demUrl) {
     source,
     terrain: { lit: true, skirt: true, castShadow: false, receiveShadow: false },
   });
-  // raster.show:false でDEMの疑似カラー（生の標高エンコード色）は出さない。
-  // hillshadeだけがterrain上のimageryへ地形の面を読める陰影を与える。
+  // Navara 0.1.1はshow:falseのスロットをhillshadeも含めて合成から除外する。
+  // show:trueで陰影を有効にし、opacity:0で生のDEM色を隠す。陰影の法線は
+  // opacityから独立して合成されるため、写真なしでも斜面が読める。
   view.addLayer({
     type: "raster",
     source,
-    raster: { show: false },
+    raster: { show: true, opacity: 0 },
     hillshade: { exaggeration: DEM_HILLSHADE_EXAGGERATION },
   });
   return source;
 }
 
 export function updatePhotoJourneyBasemap(state, point) {
+  if (!state) return state;
   const next = selectPhotoJourneyBasemap(point);
-  if (!state || state.kind === next) return state;
-  state.source.update(rasterDefinition(next, state.urls));
-  state.kind = next;
+  if (state.kind !== next) {
+    if (state.style === "hybrid" && next !== "gsi-photo") {
+      // 海外の通常地図を衛星写真扱いにしない。見えない画像も取得しない。
+      state.layer?.delete();
+      state.source?.delete();
+      state.layer = state.source = null;
+    } else if (state.style === "hybrid" && !state.source && state.imageryEnabled) {
+      state.source = state.view.addSource(rasterDefinition(next, state.urls, state.style));
+      state.layer = state.view.addLayer({ type: "raster", source: state.source,
+        raster: { show: true, opacity: 0 } });
+      state.opacity = 0;
+    } else state.source?.update(rasterDefinition(next, state.urls, state.style));
+    state.kind = next;
+  }
+  if (state.style === "hybrid") setPhotoJourneyImageryOpacity(state, 0);
   return state;
+}
+
+export function setPhotoJourneyImageryOpacity(state, value) {
+  if (!state?.layer) return;
+  const opacity = Math.max(0, Math.min(1, Number(value) || 0));
+  if (state.opacity === opacity) return;
+  state.opacity = opacity;
+  state.layer.update({ type: "raster", source: state.source, raster: { show: true, opacity } });
+  state.view?.forceUpdate?.();
+}
+
+/* 写真判定は高精細写真へ切り替わるZ14の、注視点を囲む3×3のみ。
+   全画面の読み込み完了を表すものではない。遠方のZ13以下はhybridでは描かない。 */
+export function getPhotoJourneyRevealTiles(point, { origin = "" } = {}) {
+  if (selectPhotoJourneyBasemap(point) !== "gsi-photo") return [];
+  const zoom = 14;
+  const center = photoJourneyTileXY(point, zoom);
+  if (!center) return [];
+  const base = String(origin || "").replace(/\/+$/, "");
+  const urls = [];
+  for (let dy = -1; dy <= 1; dy++) {
+    for (let dx = -1; dx <= 1; dx++) {
+      const x = (center.x + dx + center.n) % center.n;
+      const y = center.y + dy;
+      if (y >= 0 && y < center.n) urls.push(`${base}/tiles/gsi-photo/${zoom}/${x}/${y}.png?detail=1`);
+    }
+  }
+  return urls;
+}
+
+/* 撮影地点の周りだけに置く途切れた距離リング。等高線ではない。
+   地形標高を持つ細い帯にする。テクスチャへ焼く線は祖先LODで幅が変わり、
+   通常のpolylineは頂点の標高を保持しないため、perPositionHeightのpolygonを使う。 */
+export function photoJourneyGroundLines(view, point, { low = false } = {}) {
+  if (!photoJourneyTileXY(point, 14)) return emptyAircraftGeoJSON();
+  const features = [];
+  const origin = { lon: point.lon ?? point.lng, lat: point.lat };
+  for (const radius of low ? [500, 1000] : [400, 800, 1200]) {
+    for (let quadrant = 0; quadrant < 4; quadrant++) {
+      const inner = [], outer = [];
+      for (let degrees = 10; degrees <= 80; degrees += 2.5) {
+        const angle = (quadrant * 90 + degrees) * Math.PI / 180;
+        const pos = offsetGeodetic(origin, Math.sin(angle) * radius, Math.cos(angle) * radius);
+        const elevation = finiteNumber(view?.sampleTerrainHeight?.({ lng: pos.lon, lat: pos.lat }));
+        if (elevation === null) { inner.length = 0; break; }
+        for (const [edge, distance] of [[inner, radius - 4], [outer, radius + 4]]) {
+          const p = offsetGeodetic(origin, Math.sin(angle) * distance, Math.cos(angle) * distance);
+          edge.push([p.lon, p.lat, elevation + 12]);
+        }
+      }
+      if (!inner.length) continue;
+      const ring = [...inner, ...outer.reverse(), inner[0]];
+      features.push({ type: "Feature", properties: {},
+        geometry: { type: "Polygon", coordinates: [ring] } });
+    }
+  }
+  return { type: "FeatureCollection", features };
+}
+
+function groundLinesLayer(source, show = true) {
+  // Layer.updateは設定を置換する。表示切替時も標高・描画設定を含めて渡す。
+  return { type: "vector", source,
+    polygon: { show, clampToGround: false, perPositionHeight: true, tiled: false, color: 0x39cad8,
+      opacity: 0.55, transparent: true, depthWrite: false,
+      lit: false, castShadow: false, receiveShadow: false } };
+}
+
+export function updatePhotoJourneyGroundLines(state, point) {
+  if (!state) return;
+  const data = photoJourneyGroundLines(state.view, point, { low: state.low });
+  if (!data.features.length) return;
+  // 空GeoJSONからの初回更新を取りこぼすNavaraの経路を避け、有効な頂点で初めて作る。
+  if (!state.source) {
+    state.source = state.view.addSource({ type: "geojson", data, tiled: false });
+    state.layer = state.view.addLayer(groundLinesLayer(state.source));
+  } else {
+    state.source.update({ type: "geojson", data, tiled: false });
+    state.layer.update(groundLinesLayer(state.source));
+  }
+  state.view.forceUpdate?.();
+}
+
+export function hidePhotoJourneyGroundLines(state) {
+  state?.layer?.update(groundLinesLayer(state.source, false));
 }
 
 /* ============================================================
@@ -809,7 +911,8 @@ export function removePhotoJourneyAircraftLayer(state) {
   return true;
 }
 
-export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls = {}, basemap } = {}) {
+export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls = {}, basemap,
+  terrainStyle = "photo", low = false } = {}) {
   const origin = typeof location !== "undefined" ? location.origin : "";
   const urls = {
     "gsi-photo": tileUrls.gsiPhoto || `${origin}/tiles/gsi-photo/{z}/{x}/{y}.png`,
@@ -817,10 +920,17 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
     "gsi-dem": tileUrls.gsiDem || `${origin}/tiles/gsi-dem/{z}/{x}/{y}.png`,
   };
   // terrainをimageryより先に追加する（drape対象を確保してから航空写真を載せる）。
+  const style = ["hybrid", "cyber"].includes(terrainStyle) ? terrainStyle : "photo";
+  if (style !== "photo" && view.globe?.color)
+    view.globe.color = view.globe.color.clone().setHex(0x304c64);
   const demSource = addTerrain(view, urls["gsi-dem"]);
   const kind = basemap || selectPhotoJourneyBasemap(points[0] || route[0]);
-  const raster = view.addSource(rasterDefinition(kind, urls));
-  view.addLayer({ type: "raster", source: raster });
+  const photoEnabled = style === "photo" || (style === "hybrid" && !low);
+  const raster = photoEnabled && (style === "photo" || kind === "gsi-photo")
+    ? view.addSource(rasterDefinition(kind, urls, style)) : null;
+  const opacity = style === "photo" ? 1 : 0;
+  const layer = raster ? view.addLayer({ type: "raster", source: raster,
+    raster: { show: true, opacity } }) : null;
 
   // 出典表示（地理院タイル / OSM）。CDN に頼らずサーバー由来のタイルでも出典は必須。
   if (view.attribution) {
@@ -836,7 +946,9 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
     ]);
   }
 
-  return { basemap: { kind, source: raster, urls }, terrain: { source: demSource } };
+  return { basemap: { kind, source: raster, urls, layer, opacity, style, view, imageryEnabled: photoEnabled },
+    terrain: { source: demSource },
+    groundLines: style === "photo" ? null : { view, low, source: null, layer: null } };
 }
 
 /* 写真の座標はカメラ位置ではなく注視点。地面からの高さと俯角で後退距離を

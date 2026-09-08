@@ -22,7 +22,7 @@ from .ha import ha_get
 from .jma import api_env
 from .mlit import api_hazard, api_intel, hazard_tile
 from .photos import api_onthisday, api_photos, api_stats
-from .tiles import fetch_tile
+from .tiles import fetch_tile, photo_tile_content
 from .travel_blog import (BlogBadRequest, BlogExportBusy, BlogNotFound,
                           api_blog_candidates, api_blog_draft, api_blog_trip,
                           api_blog_trips, export_blog, save_blog_draft)
@@ -288,15 +288,24 @@ class Handler(SimpleHTTPRequestHandler):
         if z > TILE_SOURCES[layer][1] and layer != "gsi-dem":
             self.send_error(404)      # ズーム範囲外（gsi-demはfetch_tileが欠測タイルを返す）
             return
-        body, status = fetch_tile(layer, z, x, y)
+        detail = (layer == "gsi-photo" and
+                  urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("detail") == ["1"])
+        body, status = (fetch_tile(layer, z, x, y, detail=True) if detail
+                        else fetch_tile(layer, z, x, y))
         self.send_response(200)
         self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control",
                          "no-store" if status in ("error", "throttled")
                          else "public, max-age=86400")
-        # デバッグ用（hit|miss|error|throttled）。throttledは流量上限で上流へ行かなかった印
+        # デバッグ用。throttledは流量上限、skippedは粗い写真を意図的に省略した印。
         self.send_header("X-Tile-Cache", status)
+        content = None
+        if layer == "gsi-photo":
+            content = ("empty" if status in ("error", "throttled")
+                       else photo_tile_content(layer, body))
+        if content is not None:
+            self.send_header("X-Tile-Content", content)
         self.end_headers()
         if not head_only:
             self.wfile.write(body)

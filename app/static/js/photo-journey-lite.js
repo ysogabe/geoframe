@@ -16,6 +16,8 @@
 
   const settings = window.GEOFRAME_PHOTO_JOURNEY_SETTINGS || {
     low: !!window.LOW_POWER,
+    terrainStyle: window.LOW_POWER ? 'cyber' : 'hybrid',
+    imageryFadeMs: 1800, imageryMinDwellMs: 55000,
     dwellMs: Math.max(typeof DWELL_MS !== 'undefined' ? DWELL_MS : 16000, 90000), flyMs: 5000,
     height: 1400, pitch: -24, headingStep: 47,
     orbitDelayMs: 45000, orbitMs: 8000, orbitDegrees: 22,
@@ -37,6 +39,11 @@
   let sleeping = !!(window.GEOFRAME_EVENT_STATE &&
     window.GEOFRAME_EVENT_STATE.isSleeping && window.GEOFRAME_EVENT_STATE.isSleeping());
   let journeyTimer = null;
+  let photoReveal = null;
+  let revealDelayTimer = null;
+  let revealFadeTimer = null;
+  let groundLineTimer = null;
+  const tileImagery = new Map();
   let orbitDelayTimer = null;
   let orbitTimer = null;
   let journeyGeneration = 0;
@@ -195,16 +202,24 @@
       prefetchInFlight++;
       prefetchStarts.push(current);
       Promise.resolve()
-        .then(()=>fetcher(url,{cache:'force-cache'}))
+        .then(()=>fetcher(url,{cache:photoReveal?.urls.includes(url) ? 'no-cache' : 'force-cache'}))
         .then(response=>{
           const cacheStatus=response?.headers?.get?.('X-Tile-Cache');
           if(!response?.ok || cacheStatus === 'error' || cacheStatus === 'throttled')
             prefetchKnown.delete(url);
-          // Consume the body so the server-side cache write is not abandoned by
-          // the browser even though the decoded image is not displayed here.
-          return response?.arrayBuffer?.();
+          const content=response?.headers?.get?.('X-Tile-Content');
+          // 完全に受信してから判定を保存する。途中で切れた応答を次の写真へ持ち越さない。
+          return Promise.resolve(response?.arrayBuffer?.()).then(()=>{
+            if(content === 'imagery' || content === 'empty'){
+              tileImagery.delete(url);
+              tileImagery.set(url,response.ok && cacheStatus !== 'error' &&
+                cacheStatus !== 'throttled' && content === 'imagery');
+              if(tileImagery.size > PREFETCH_KNOWN_MAX) tileImagery.delete(tileImagery.keys().next().value);
+            }
+            maybeRevealImagery();
+          });
         })
-        .catch(()=>{ prefetchKnown.delete(url); })
+        .catch(()=>{ prefetchKnown.delete(url); tileImagery.delete(url); })
         .finally(()=>{
           prefetchInFlight=Math.max(0,prefetchInFlight-1);
           pumpPrefetch();
@@ -234,16 +249,25 @@
     if(prefetchPlanTimer) clearTimeout(prefetchPlanTimer);
     // Give visible terrain a head start before sharing the upstream budget
     // with the next photo. The normal refinement can still be finishing.
-    const delay=settings.low ? 60000 : 45000;
+    const delay=settings.low ? 60000 : 15000;
     prefetchPlanTimer=setTimeout(()=>{
       prefetchPlanTimer=null;
       if(disposed || isPaused()) return;
       const origin=typeof location !== 'undefined' ? location.origin : '';
+      const style=layerState?.basemap?.style || settings.terrainStyle || 'photo';
+      if(style === 'hybrid' && !settings.low && targetMod.getPhotoJourneyRevealTiles){
+        const required=targetMod.getPhotoJourneyRevealTiles(current,{origin});
+        // 過去の先読み/旧サーバー応答に判定がなければ、同じURLでも再検証する。
+        for(const url of required) if(tileImagery.get(url) !== true) prefetchKnown.delete(url);
+        enqueuePrefetchUrls(required);
+      }
       for(const point of [current,next]){
         if(!point) continue;
         try{
           enqueuePrefetchUrls(targetMod.getPhotoJourneyPrefetchTiles(point, {
-            low:settings.low, origin,
+            low:settings.low, origin, detail:style === 'hybrid',
+            imagery:style === 'photo' || (style === 'hybrid' && !settings.low &&
+              targetMod.selectPhotoJourneyBasemap?.(point) === 'gsi-photo'),
           }));
         }catch(error){
           console.warn('[3d] speculative tile prefetch skipped',error);
@@ -263,7 +287,7 @@
     if(!targetView || disposed) return;
     // 冷えたDEMは親→子タイルの到着に数十秒かかる。12秒で打ち切ると、
     // 標高を取得できていても平らな親メッシュのまま次の写真へ移ってしまう。
-    const duration = settings.low ? 60000 : 55000;
+    const duration = settings.low ? 60000 : (settings.terrainStyle === 'hybrid' ? 75000 : 55000);
     const interval = settings.low ? 800 : 400;
     const endAt = nowMs() + duration;
     try{ targetView.forceUpdate?.(); }catch(e){ return handleNavaraError(e); }
@@ -273,6 +297,81 @@
       catch(e){ clearRefinement(); handleNavaraError(e); return; }
       if(nowMs() >= endAt) clearRefinement();
     }, interval);
+  }
+
+  function terrainPhase(phase){
+    if(document.body?.dataset) document.body.dataset.terrainPhase=phase;
+  }
+
+  function clearPhotoReveal(hide=true){
+    if(revealDelayTimer){ clearTimeout(revealDelayTimer); revealDelayTimer=null; }
+    if(revealFadeTimer){ clearInterval(revealFadeTimer); revealFadeTimer=null; }
+    photoReveal=null;
+    if(hide && layerState?.basemap?.style === 'hybrid'){
+      try{ mod?.setPhotoJourneyImageryOpacity?.(layerState.basemap,0); }catch(e){ /* 終了済みレイヤー */ }
+      terrainPhase('cyber');
+    }
+  }
+
+  function startPhotoReveal(point){
+    clearPhotoReveal();
+    const state=layerState?.basemap;
+    if(state?.style !== 'hybrid' || settings.low || !state.layer ||
+       !mod.getPhotoJourneyRevealTiles) return;
+    const origin=typeof location !== 'undefined' ? location.origin : '';
+    const urls=mod.getPhotoJourneyRevealTiles(point,{origin});
+    if(!urls.length) return;
+    photoReveal={urls,notBefore:nowMs()+(settings.imageryMinDwellMs ?? 55000),fading:false};
+    // 可視タイルの読み込み完了APIはないため、周辺の実写真9枚の取得と最低滞在を条件にする。
+    // 遠景の未取得領域は暗い地形が残る。detail=1の経路は粗いZ13以下を透明で返す。
+    revealDelayTimer=setTimeout(()=>{ revealDelayTimer=null; maybeRevealImagery(); },
+      Math.max(0,photoReveal.notBefore-nowMs()));
+  }
+
+  function maybeRevealImagery(){
+    const current=photoReveal;
+    if(!current || current.fading || disposed || isPaused() || nowMs()<current.notBefore ||
+       !current.urls.every(url=>tileImagery.get(url) === true)) return;
+    current.fading=true;
+    const reduced=window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    const duration=reduced ? 0 : Math.min(2000,Math.max(0,settings.imageryFadeMs ?? 1800));
+    const started=nowMs();
+    terrainPhase('revealing');
+    const frame=()=>{
+      if(photoReveal !== current || disposed || isPaused()){
+        clearPhotoReveal(); return;
+      }
+      const progress=duration ? Math.min(1,(nowMs()-started)/duration) : 1;
+      const eased=progress*progress*(3-2*progress);
+      try{ mod.setPhotoJourneyImageryOpacity(layerState.basemap,eased); }
+      catch(e){ clearPhotoReveal(false); handleNavaraError(e); return; }
+      if(progress>=1){
+        if(revealFadeTimer) clearInterval(revealFadeTimer);
+        revealFadeTimer=null;
+        terrainPhase('photo');
+      }
+    };
+    if(duration) revealFadeTimer=setInterval(frame,50);
+    frame();
+  }
+
+  function clearGroundLines(){
+    if(groundLineTimer){ clearInterval(groundLineTimer); groundLineTimer=null; }
+    mod?.hidePhotoJourneyGroundLines?.(layerState?.groundLines);
+  }
+
+  function startGroundLines(point,token){
+    clearGroundLines();
+    if(!layerState?.groundLines || !mod?.updatePhotoJourneyGroundLines) return;
+    let updates=0;
+    const update=()=>{
+      if(disposed || token!==journeyGeneration || isPaused()) return clearGroundLines();
+      try{ mod.updatePhotoJourneyGroundLines(layerState.groundLines,point); }
+      catch(e){ clearGroundLines(); console.warn('[3d] ground guide skipped',e); }
+      if(++updates>=6 && groundLineTimer){ clearInterval(groundLineTimer); groundLineTimer=null; }
+    };
+    groundLineTimer=setInterval(update,15000);
+    update();
   }
 
   /* Navara/WASM/worker/WebGL の初期化失敗時の一度きりのフォールバック。 */
@@ -285,6 +384,8 @@
   function disposeController(){
     if(disposed) return;
     disposed=true;
+    clearPhotoReveal();
+    clearGroundLines();
     if(journeyTimer){ clearTimeout(journeyTimer); journeyTimer=null; }
     clearPhotoOrbit();
     clearRefinement();
@@ -344,6 +445,8 @@
 
   function cancelJourney(){
     journeyGeneration++;
+    clearPhotoReveal();
+    clearGroundLines();
     if(journeyTimer){ clearTimeout(journeyTimer); journeyTimer=null; }
     clearPhotoOrbit();
   }
@@ -365,6 +468,8 @@
     scheduleJourney(settings.dwellMs);
     clearPhotoOrbit();
     if(isEventActive()) return;
+    startPhotoReveal(point);
+    startGroundLines(point,token);
     // LOD精細化が進んだ時点で、実標高がない写真の地面高度を再評価する。
     orbitDelayTimer=setTimeout(()=>{
       orbitDelayTimer=null;
@@ -583,6 +688,8 @@
     }
     if(i < 0){ scheduleJourney(1000); return; }
     clearPhotoOrbit();
+    clearPhotoReveal();
+    clearGroundLines();
     const token=journeyGeneration;
     markShown(i);
     const p=PHOTOS[i];
@@ -632,7 +739,7 @@
     if(!container) return handleNavaraError(new Error('#modelayer が見つからない'));
     const first=nextQueueIdx();
     try{
-      view=mod.createPhotoJourneyView(container,{low:settings.low});
+      view=mod.createPhotoJourneyView(container,{low:settings.low,terrainStyle:settings.terrainStyle});
       await view.init();
       // 地形(GSI DEM)の斜面が読めるように、陰影を可視性優先で調整した値。
       // sunはapplyColor:trueで大気散乱の計算を経ずに指定色をそのまま使い、
@@ -647,7 +754,9 @@
         mod.updatePhotoJourneyLighting?.(view,p);
         mod.setPhotoJourneyCamera(view,photoCamera(p,heading,elevation));
       }
-      layerState=mod.addPhotoJourneyLayers(view,{points,route:[]});
+      layerState=mod.addPhotoJourneyLayers(view,{points,route:[],
+        terrainStyle:settings.terrainStyle || (settings.low ? 'cyber' : 'hybrid'),low:settings.low});
+      terrainPhase(layerState.basemap?.style === 'photo' ? 'photo' : 'cyber');
       aircraftLayerState=mod.addPhotoJourneyAircraftLayer(view, {
         onFeatureDiagnostics: updateAircraftVisibility,
       });

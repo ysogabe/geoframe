@@ -1,11 +1,13 @@
 """背景地図タイルのプロキシ（server.py L923-L1051 より移動）"""
 import io
+import hashlib
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
-from collections import deque
+import zlib
+from collections import OrderedDict, deque
 
 from PIL import Image
 
@@ -99,6 +101,117 @@ def _placeholder_tile(layer):
     return _dem_no_data_tile_bytes() if layer == "gsi-dem" else _transparent_tile()
 
 
+# 再試行時の同じ画像のデコードだけを省く、小さな判定キャッシュ。
+_PHOTO_CONTENT_CACHE_MAX = 256
+_photo_content_cache = OrderedDict()
+_photo_content_lock = threading.Lock()
+
+
+def _photo_png_metadata(data):
+    """ピクセルをデコードせず、PNGチャンクから（alphaの有無, 形式の妥当性）を返す。"""
+    if not isinstance(data, (bytes, bytearray)) or not data.startswith(PNG_MAGIC):
+        return False, False
+    offset = len(PNG_MAGIC)
+    ihdr = None
+    has_trns = False
+    saw_plte = False
+    saw_idat = False
+    saw_iend = False
+    while offset + 12 <= len(data):
+        length = int.from_bytes(data[offset:offset + 4], "big")
+        chunk_start = offset + 8
+        chunk_end = chunk_start + length
+        crc_end = chunk_end + 4
+        if crc_end > len(data):
+            return False, False
+        chunk_type = data[offset + 4:offset + 8]
+        chunk = data[chunk_start:chunk_end]
+        expected_crc = int.from_bytes(data[chunk_end:crc_end], "big")
+        if zlib.crc32(chunk_type + chunk) & 0xffffffff != expected_crc:
+            return False, False
+        if ihdr is None:
+            if chunk_type != b"IHDR" or length != 13:
+                return False, False
+            width = int.from_bytes(chunk[0:4], "big")
+            height = int.from_bytes(chunk[4:8], "big")
+            bit_depth = chunk[8]
+            color_type = chunk[9]
+            valid_depths = {
+                0: {1, 2, 4, 8, 16},
+                2: {8, 16},
+                3: {1, 2, 4, 8},
+                4: {8, 16},
+                6: {8, 16},
+            }
+            if (width != 256 or height != 256 or
+                    bit_depth not in valid_depths.get(color_type, set())):
+                return False, False
+            ihdr = (color_type in (4, 6), color_type)
+        elif chunk_type == b"tRNS":
+            has_trns = True
+        elif chunk_type == b"PLTE":
+            saw_plte = True
+        elif chunk_type == b"IDAT":
+            saw_idat = True
+        elif chunk_type == b"IEND":
+            if length != 0:
+                return False, False
+            saw_iend = True
+            break
+        offset = crc_end
+    if not saw_iend or ihdr is None or not saw_idat:
+        return False, False
+    if ihdr[1] == 3 and not saw_plte:
+        return False, False
+    return ihdr[0] or has_trns, True
+
+
+def _photo_content_cache_get(digest):
+    with _photo_content_lock:
+        value = _photo_content_cache.get(digest)
+        if value is not None:
+            _photo_content_cache.move_to_end(digest)
+        return value
+
+
+def _photo_content_cache_put(digest, value):
+    with _photo_content_lock:
+        _photo_content_cache[digest] = value
+        _photo_content_cache.move_to_end(digest)
+        while len(_photo_content_cache) > _PHOTO_CONTENT_CACHE_MAX:
+            _photo_content_cache.popitem(last=False)
+
+
+def _classify_photo_png(data, has_alpha):
+    if not has_alpha:
+        return "imagery"
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            alpha = image.convert("RGBA").getchannel("A")
+            return "empty" if alpha.getextrema() == (0, 0) else "imagery"
+    except Exception:
+        return "empty"
+
+
+def photo_tile_content(layer, data):
+    """通常のRGB PNGをデコードせず、gsi-photoの実画像/透明代替を判別する。"""
+    if layer != "gsi-photo":
+        return None
+    if data == _transparent_tile():
+        return "empty"
+    digest = hashlib.sha256(data).digest() if isinstance(data, (bytes, bytearray)) else None
+    if digest is not None:
+        cached = _photo_content_cache_get(digest)
+        if cached is not None:
+            return cached
+    has_alpha, valid = _photo_png_metadata(data)
+    result = _classify_photo_png(data, has_alpha) if valid else "empty"
+    if digest is not None:
+        _photo_content_cache_put(digest, result)
+    return result
+
+
 def _tile_fetch_allowed():
     """上流フェッチを1件許可してよいか（直近60秒のスライディング窓）
     ※osm/gsiで枠を分けず全体で1つの窓にする。分けると層を交互に叩くだけで上限が倍になるため。
@@ -122,7 +235,7 @@ def _tile_fetch_allowed():
         return True
 
 
-def fetch_tile(layer, z, x, y):
+def fetch_tile(layer, z, x, y, *, detail=False):
     """地図タイル1枚を取得（ファイル永続キャッシュ。エラーは代替タイル扱いでログ）
     代替タイルはlayerが gsi-dem かどうかで変わる（_placeholder_tile）:
     通常layerは透明PNG、gsi-demはRGB(128,0,0)のDEM欠測エンコード。
@@ -130,7 +243,13 @@ def fetch_tile(layer, z, x, y):
       "hit"       キャッシュから返した
       "miss"      上流から取得してキャッシュに保存した（404の代替タイル永続化を含む）
       "error"     上流エラー。代替タイルを返すがキャッシュしない（次回再試行させる）
-      "throttled" 流量上限に達したため上流へ行かなかった。代替タイルを返しキャッシュしない"""
+      "throttled" 流量上限に達したため上流へ行かなかった。代替タイルを返しキャッシュしない
+      "skipped"   detail指定で低ズーム写真を省略した。キャッシュも上流予算も使わない"""
+    # サイバー表示へ重ねる写真は高精細帯だけ。エンジン側minZoomを14へ上げると
+    # 親LODの探索が重くなるため、通常の探索を維持し低ズームだけ透明で返す。
+    # 通常写真のキャッシュを汚さず、上流の取得予算も消費しない。
+    if detail and layer == "gsi-photo" and z < 14:
+        return _transparent_tile(), "skipped"
     f = TILE_DIR / layer / str(z) / str(x) / f"{y}.png"
     if f.exists():
         try:

@@ -157,6 +157,11 @@ assert.strictEqual(normalView.options.pixelRatio, 0.5, '通常表示のpixelRati
 assert.strictEqual(normalView.options.segments, 32, '通常表示はThreeViewへsegments=32を渡す');
 assert.strictEqual(normalView.options.maxSse, 4, '通常表示はThreeViewへmaxSse=4を渡す');
 assert.strictEqual(normalView.options.shadow, false, '通常表示でもshadowは無効のまま');
+assert.strictEqual(normalView.options.useNormal, true, '初期化時に地形法線を有効化する');
+const hybridView = createPhotoJourneyView({ id: 'modelayer' }, { terrainStyle: 'hybrid' });
+assert.strictEqual(hybridView.options.maxSse, 3, 'hybridは注視点の詳細写真LODを優先する');
+const lowHybridView = createPhotoJourneyView({ id: 'modelayer' }, { terrainStyle: 'hybrid', low: true });
+assert.strictEqual(lowHybridView.options.maxSse, 8, '省電力のLOD上限を維持する');
 
 const lowView = createPhotoJourneyView({ id: 'modelayer' }, { low: true });
 assert.strictEqual(lowView.options.pixelRatio, 0.5, '?lowでもpixelRatioは0.5のまま（変更しない）');
@@ -207,8 +212,10 @@ assert.strictEqual(hillshadeLayers.length, 1, 'hillshade overlayは1つだけ');
 assert.strictEqual(hillshadeLayers[0].source, demSources[0], 'hillshade layerも同じDEM sourceを参照する（二重フェッチさせない）');
 assert.strictEqual(hillshadeLayers[0].hillshade.exaggeration, 1.35,
   'DEM由来シェーディングの強調係数は地形を読める1.35（メッシュ量は増やさない）');
-assert.strictEqual(hillshadeLayers[0].raster.show, false,
-  '生の標高疑似カラーは出さず、陰影だけをimageryへ重ねる');
+assert.strictEqual(hillshadeLayers[0].raster.show, true,
+  'hillshadeのスロットを非表示にして陰影まで除外しない');
+assert.strictEqual(hillshadeLayers[0].raster.opacity, 0,
+  '生の標高色だけを隠し、hillshadeの法線は維持する');
 
 const imageryLayers = normalMock.layers.filter(l => l.type === 'raster' && !l.hillshade);
 assert.strictEqual(imageryLayers.length, 1, '航空写真imagery layerは従来どおり1つだけ');
