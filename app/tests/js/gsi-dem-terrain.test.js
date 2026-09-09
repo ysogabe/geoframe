@@ -141,7 +141,7 @@ const feContext = {
 };
 runInContext(stripped, feContext);
 
-/* ---- quality設定: normal 32/4, low 16/8, pixelRatio 0.5固定 ---- */
+/* ---- quality設定: normal 32/4/0.6, low 16/8/0.5 ---- */
 const LITE_OPTIONS = vm.runInContext('LITE_OPTIONS', feContext);
 const LOW_POWER_LITE_OPTIONS = vm.runInContext('LOW_POWER_LITE_OPTIONS', feContext);
 assert.strictEqual(LITE_OPTIONS.segments, 32, '通常表示のterrain segmentsは32');
@@ -153,7 +153,7 @@ assert.ok(Object.isFrozen(LITE_OPTIONS) && Object.isFrozen(LOW_POWER_LITE_OPTION
 
 const createPhotoJourneyView = vm.runInContext('createPhotoJourneyView', feContext);
 const normalView = createPhotoJourneyView({ id: 'modelayer' }, {});
-assert.strictEqual(normalView.options.pixelRatio, 0.5, '通常表示のpixelRatioは0.5');
+assert.strictEqual(normalView.options.pixelRatio, 0.6, '通常表示のpixelRatioは0.6');
 assert.strictEqual(normalView.options.segments, 32, '通常表示はThreeViewへsegments=32を渡す');
 assert.strictEqual(normalView.options.maxSse, 4, '通常表示はThreeViewへmaxSse=4を渡す');
 assert.strictEqual(normalView.options.shadow, false, '通常表示でもshadowは無効のまま');
@@ -164,7 +164,7 @@ const lowHybridView = createPhotoJourneyView({ id: 'modelayer' }, { terrainStyle
 assert.strictEqual(lowHybridView.options.maxSse, 8, '省電力のLOD上限を維持する');
 
 const lowView = createPhotoJourneyView({ id: 'modelayer' }, { low: true });
-assert.strictEqual(lowView.options.pixelRatio, 0.5, '?lowでもpixelRatioは0.5のまま（変更しない）');
+assert.strictEqual(lowView.options.pixelRatio, 0.5, '?lowのpixelRatioは0.5のまま（変更しない）');
 assert.strictEqual(lowView.options.segments, 16, '?lowはThreeViewへsegments=16を渡す');
 assert.strictEqual(lowView.options.maxSse, 8, '?lowはThreeViewへmaxSse=8を渡す');
 

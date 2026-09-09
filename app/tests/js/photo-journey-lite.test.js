@@ -163,7 +163,7 @@ runInContext(stripped, feContext);
 
 const LITE_OPTIONS = vm.runInContext('LITE_OPTIONS', feContext);
 assert.ok(Object.isFrozen(LITE_OPTIONS), 'LITE_OPTIONSは凍結されている');
-assert.strictEqual(LITE_OPTIONS.pixelRatio, 0.5, 'N95実機では内部描画倍率0.5で航空写真LODを確保');
+assert.strictEqual(LITE_OPTIONS.pixelRatio, 0.6, '通常表示は第一段階として内部描画倍率0.6へ上げる');
 assert.strictEqual(LITE_OPTIONS.shadow, false, '影は無効');
 assert.strictEqual(LITE_OPTIONS.multisampling, 0, 'MSAA無効');
 assert.strictEqual(LITE_OPTIONS.halfFloat, false, 'halfFloat無効');

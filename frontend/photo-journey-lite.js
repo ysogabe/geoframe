@@ -27,7 +27,7 @@ import { DefaultPlugin } from "@navaramap/three-default-plugin";
 
 /* 軽量構成。N100相当の内蔵GPUでタイルの先読みと常時描画を抑える上限値。 */
 const NORMAL_OPTIONS = Object.freeze({
-  pixelRatio: 0.5,      // 2560x1080実機では1280x540。固定GPU領域を約1/4へ削減
+  pixelRatio: 0.6,      // 2560x1080実機では1536x648。第一段階として描画密度を上げる
   shadow: false,        // 影は初期化時オプション。N100 では無効
   // view.globeのLOD品質。segmentsは初期地球面の分割数（DEMは別途適応分割）、
   // maxSseは許容screen-space-error（px、大きいほど粗く早く安定する）。
@@ -60,6 +60,8 @@ const NORMAL_OPTIONS = Object.freeze({
 
 const LOW_POWER_OPTIONS = Object.freeze({
   ...NORMAL_OPTIONS,
+  // 省電力表示は従来の内部倍率を維持し、通常表示だけを段階的に精細化する。
+  pixelRatio: 0.5,
   // 地形は?lowでも無効化しない（GOALの「low でも terrain を維持」）。
   // segments/maxSseだけ粗くしてメッシュ分割・タイル選択のコストを下げる。
   segments: 16,
