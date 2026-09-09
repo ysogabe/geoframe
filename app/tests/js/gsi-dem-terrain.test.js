@@ -141,7 +141,7 @@ const feContext = {
 };
 runInContext(stripped, feContext);
 
-/* ---- quality設定: normal 32/4/0.6, low 16/8/0.5 ---- */
+/* ---- quality設定: normal 32/4/0.65, low 16/8/0.5 ---- */
 const LITE_OPTIONS = vm.runInContext('LITE_OPTIONS', feContext);
 const LOW_POWER_LITE_OPTIONS = vm.runInContext('LOW_POWER_LITE_OPTIONS', feContext);
 assert.strictEqual(LITE_OPTIONS.segments, 32, '通常表示のterrain segmentsは32');
@@ -153,7 +153,7 @@ assert.ok(Object.isFrozen(LITE_OPTIONS) && Object.isFrozen(LOW_POWER_LITE_OPTION
 
 const createPhotoJourneyView = vm.runInContext('createPhotoJourneyView', feContext);
 const normalView = createPhotoJourneyView({ id: 'modelayer' }, {});
-assert.strictEqual(normalView.options.pixelRatio, 0.6, '通常表示のpixelRatioは0.6');
+assert.strictEqual(normalView.options.pixelRatio, 0.65, '通常表示のpixelRatioは0.65');
 assert.strictEqual(normalView.options.segments, 32, '通常表示はThreeViewへsegments=32を渡す');
 assert.strictEqual(normalView.options.maxSse, 4, '通常表示はThreeViewへmaxSse=4を渡す');
 assert.strictEqual(normalView.options.shadow, false, '通常表示でもshadowは無効のまま');

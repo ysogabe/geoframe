@@ -106409,8 +106409,8 @@ var QyA = /* @__PURE__ */ new N(), CyA = /* @__PURE__ */ new N(), EyA = /* @__PU
   }
 };
 const bU = Object.freeze({
-  pixelRatio: 0.6,
-  // 2560x1080実機では1536x648。第一段階として描画密度を上げる
+  pixelRatio: 0.65,
+  // 2560x1080実機では1664x702。第二段階として描画密度を上げる
   shadow: !1,
   // 影は初期化時オプション。N100 では無効
   // view.globeのLOD品質。segmentsは初期地球面の分割数（DEMは別途適応分割）、

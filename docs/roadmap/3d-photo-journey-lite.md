@@ -48,7 +48,7 @@ Navara アダプタ `frontend/photo-journey-lite.js` が唯一の構成点。`LI
 
 | 項目 | 値 | 理由 |
 |---|---|---|
-| `pixelRatio` | 0.6（`?low`: 0.5） | 通常表示は2560x1080実機で1536x648へ上げ、`?low`は従来の固定GPU領域を維持 |
+| `pixelRatio` | 0.65（`?low`: 0.5） | 通常表示は2560x1080実機で1664x702へ上げ、`?low`は従来の固定GPU領域を維持 |
 | `shadow` | false | 影はN100に重い |
 | `multisampling` | 0 | MSAA無効 |
 | `halfFloat` | false | ポスト処理は低精度で十分 |
@@ -140,7 +140,7 @@ raster-dem source（`JAPAN_GSI_ELEVATION_DECODER()`でデコード、Z0-14）を
 | ambient intensity | 0.68 | 同左 | 環境光を抑え、斜面の明暗を残す |
 | sun intensity / applyColor / castShadow | 0.52 / true / false | 同左 | `applyColor:true`で大気散乱計算を経ず指定色をそのまま使う。`castShadow:false`でシャドウマップを一切生成しない（N100向けの既存`shadow:false`初期化オプションと合わせて二重に無効化） |
 | camera height / pitch | 2400m / -32° | 4200m / -28° | 真下寄りの俯瞰を避け、地平線・斜面・遠近感を同時に見せる。heightは楕円体からの実高度 |
-| pixelRatio | 0.6（第一段階） | 0.5 | 通常表示だけ描画密度を上げ、`?low`は変更しない |
+| pixelRatio | 0.65（第二段階） | 0.5 | 通常表示だけ描画密度を上げ、`?low`は変更しない |
 
 `addDefaultPhotorealScene()` / SSR / SSAO / DOF / 雲 / 大気散乱エフェクト / 常時描画
 （`animation:true`）は今回も一切使わない。terrain layerも`castShadow:false`・
@@ -286,7 +286,7 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
 
 N95実機（`geoframe-n100.local`）で航空写真単独の隔離ページを計測した。
 
-- 2560x1080 CSS表示、通常の内部canvas 1536x648（pixelRatio 0.6）、`?low`は1280x540
+- 2560x1080 CSS表示、通常の内部canvas 1664x702（pixelRatio 0.65）、`?low`は1280x540
 - カメラ高度2,400m、俯角-32°（lowは4,200m/-28°）で地平線と斜面を見せる
 - GSI航空写真131枚、最大Z15、GPU推定約440MiB
 - 3秒計測60fps、p95 16.7ms、50ms超フレーム0
@@ -298,6 +298,13 @@ N95実機（`geoframe-n100.local`）で航空写真単独の隔離ページを�
 - 60/80秒（写真フェード後）: `gpuBytesEst` 385.2MiB、`fixedGpuBytes` 30.6MiB、破棄498件
 - GPU予算512MiBの79%以内で推移し、SSE倍率は4.77のまま。WebGL初期化エラーはなく、40秒の
   暗い地形＋シアン線と60/80秒の詳細写真を実機スクリーンショットで確認した。
+
+第二段階として通常表示を`pixelRatio=0.65`へ上げ、同じ条件で再計測した。
+
+- 40秒（サイバー地形）: `gpuBytesEst` 368.9MiB、`fixedGpuBytes` 35.9MiB、破棄485件
+- 60/80秒（写真フェード後）: `gpuBytesEst` 406.4MiB、`fixedGpuBytes` 35.9MiB、破棄485件
+- GPU予算512MiBの79.4%以内で推移し、SSE倍率は4.77のまま。GPU描画と写真フェードは正常で、
+  ChromiumログにWebGLエラーはなく、実機スクリーンショットでも表示崩れはなかった。
 
 以下は長時間運用で継続確認する。
 

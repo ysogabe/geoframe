@@ -27,7 +27,7 @@ import { DefaultPlugin } from "@navaramap/three-default-plugin";
 
 /* 軽量構成。N100相当の内蔵GPUでタイルの先読みと常時描画を抑える上限値。 */
 const NORMAL_OPTIONS = Object.freeze({
-  pixelRatio: 0.6,      // 2560x1080実機では1536x648。第一段階として描画密度を上げる
+  pixelRatio: 0.65,     // 2560x1080実機では1664x702。第二段階として描画密度を上げる
   shadow: false,        // 影は初期化時オプション。N100 では無効
   // view.globeのLOD品質。segmentsは初期地球面の分割数（DEMは別途適応分割）、
   // maxSseは許容screen-space-error（px、大きいほど粗く早く安定する）。
