@@ -19,7 +19,6 @@ assert.strictEqual(actualSettings().imageryMinDwellMs,55000,'暗い地形の精�
 const api = vm.runInNewContext(adapterSource + `;({addPhotoJourneyLayers,
  updatePhotoJourneyBasemap,setPhotoJourneyImageryOpacity,getPhotoJourneyRevealTiles,
  getPhotoJourneyPrefetchTiles,selectPhotoJourneyBasemap,photoJourneyGroundLines,
- photoJourneyTerrainMesh,
  updatePhotoJourneyGroundLines,hidePhotoJourneyGroundLines,photoJourneyCameraPose,
  photoJourneyElevation,updatePhotoJourneyLighting})`, {
  console, location, JAPAN_GSI_ELEVATION_DECODER:()=>({}),
@@ -86,14 +85,16 @@ for(const line of grid.features) for(const p of line.geometry.coordinates[0]){
 assert.ok(vertexCount<=720,'局所線の頂点数を固定上限に抑える');
 assert.strictEqual(api.photoJourneyGroundLines({sampleTerrainHeight:()=>undefined},point).features.length,0);
 assert.strictEqual(api.photoJourneyGroundLines(makeView(),null).features.length,0);
-const mesh=api.photoJourneyTerrainMesh(makeView(),point,{low:true});
-assert.strictEqual(mesh.features.length,16,'cyber/Lowの局所メッシュは4x4セルに抑える');
-assert.ok(mesh.features.every(feature => feature.properties.terrainMesh === true),
-  '局所メッシュは識別用プロパティを持つ');
-assert.ok(mesh.features.every(feature => feature.geometry.coordinates[0].every(p => p.length === 3 &&
-  p[2] === 66)), '局所メッシュも標高付き頂点を使う');
-assert.strictEqual(api.photoJourneyTerrainMesh({sampleTerrainHeight:()=>undefined},point,{low:true}).features.length,0,
-  'DEM未到着時は局所メッシュを作らない');
+const circles=api.photoJourneyGroundLines(makeView(),point,{low:true,circular:true});
+assert.strictEqual(circles.features.length,6,'cyber/Lowは中心が密な6本の同心円に抑える');
+assert.ok(circles.features.every(feature => feature.properties.terrainRing === true),
+  '同心円は識別用プロパティを持つ');
+assert.ok(circles.features.every(feature => feature.geometry.coordinates[0].length === 97),
+  '同心円は全周を細かく近似する');
+assert.ok(circles.features.every(feature => feature.geometry.coordinates[0].every(p => p.length === 3 &&
+  p[2] === 62)), '同心円も標高付き頂点を使う');
+assert.strictEqual(api.photoJourneyGroundLines({sampleTerrainHeight:()=>undefined},point,
+  {low:true,circular:true}).features.length,0, 'DEM未到着時は同心円を作らない');
 const lines=hybrid.groundLines;
 api.updatePhotoJourneyGroundLines(lines,point);
 assert.strictEqual(lines.layer.polygon.perPositionHeight,true,'頂点の地形標高を保持する');
@@ -104,13 +105,14 @@ api.updatePhotoJourneyGroundLines(lines,point);
 assert.strictEqual(lines.layer.updates.at(-1).polygon.perPositionHeight,true,'再表示でも標高を保持する');
 assert.strictEqual(lines.layer.updates.at(-1).source,lines.source);
 const cyber=api.addPhotoJourneyLayers(makeView(),{points:[point],terrainStyle:'cyber',low:true});
-assert.strictEqual(cyber.groundLines.mesh,true,'cyberだけ局所メッシュを有効にする');
+assert.strictEqual(cyber.groundLines.circular,true,'cyberだけ同心円を有効にする');
 api.updatePhotoJourneyGroundLines(cyber.groundLines,point);
-assert.ok(cyber.groundLines.meshLayer && cyber.groundLines.meshLayer.polygon.wireframe,
-  '局所メッシュはwireframe Polygonレイヤーで描画する');
+assert.ok(cyber.groundLines.layer && cyber.groundLines.layer.polygon.perPositionHeight,
+  '同心円は標高付きPolygonレイヤーで描画する');
+assert.strictEqual(cyber.groundLines.meshLayer,undefined,'四角いメッシュレイヤーは作らない');
 api.hidePhotoJourneyGroundLines(cyber.groundLines);
-assert.strictEqual(cyber.groundLines.meshLayer.updates.at(-1).polygon.show,false,
-  '局所メッシュも巡回停止時に隠す');
+assert.strictEqual(cyber.groundLines.layer.updates.at(-1).polygon.show,false,
+  '同心円も巡回停止時に隠す');
 
 const controller=fs.readFileSync('static/js/photo-journey-lite.js','utf8')
  .replace("import('/static/navara/photo-journey-lite.js')",'Promise.resolve(fakeMod)');

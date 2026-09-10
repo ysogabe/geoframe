@@ -747,7 +747,7 @@
       // 経ず指定色をそのまま使い、castShadow:falseでN100向けのシャドウマップを作らない。
       const cyberLighting = settings.low || settings.terrainStyle === 'cyber';
       const lighting = cyberLighting
-        ? { ambient: 0.78, sun: 1.35 }
+        ? { ambient: 0.92, sun: 1.50 }
         : { ambient: 0.48, sun: 1.15 };
       view.addLight({ambient:{intensity:lighting.ambient}});
       view.addLight({sun:{intensity:lighting.sun,applyColor:true,castShadow:false}});

@@ -246,7 +246,7 @@ addPhotoJourneyLayers(cyberMock.view, {
   points: [{ lon: 139.7, lat: 35.6 }], route: [], terrainStyle: 'cyber', low: true,
 });
 assert.strictEqual(cyberMock.view.globe.wireframe, false,
-  'サイバー/Low表示でも全地球ワイヤーフレームは使わず、局所メッシュだけを重ねる');
+  'サイバー/Low表示でも全地球ワイヤーフレームは使わず、局所リングだけを重ねる');
 
 /* ============================================================
  * 4. static/js/photo-journey-lite.js — ambient/sunの実値をboot()実行で捕捉する
@@ -313,12 +313,12 @@ async function runLightingRegression({ low = false } = {}) {
   // vmサンドボックス越しのオブジェクトはOutward Objectと[[Prototype]]が異なるため、
   // deepStrictEqualではなくJSON表現で比較する（既存のsetPhotoJourneyCameraテストと同じ手法）。
   const expected = low
-    ? { ambient: { intensity: 0.78 } }
+    ? { ambient: { intensity: 0.92 } }
     : { ambient: { intensity: 0.48 } };
   assert.strictEqual(JSON.stringify(lightCalls[0]), JSON.stringify(expected),
-    low ? 'サイバー地形はambient光0.78で暗部を持ち上げる' :
+    low ? 'サイバー地形はambient光0.92で暗部を持ち上げる' :
       '写真表示は陰影を残すambient光0.48を置く');
-  const expectedSun = low ? 1.35 : 1.15;
+  const expectedSun = low ? 1.5 : 1.15;
   assert.strictEqual(JSON.stringify(lightCalls[1]),
     JSON.stringify({ sun: { intensity: expectedSun, applyColor: true, castShadow: false } }),
     `地形の面を照らす太陽光${expectedSun}・applyColor有効・シャドウマップ無効を実際にaddLightへ渡す`);

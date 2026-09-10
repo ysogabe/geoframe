@@ -554,7 +554,7 @@ assert.ok(/if\(!window\.GEOFRAME_MODE_3D\) return;/.test(controllerSrc), '3Dで�
 assert.ok(controllerSrc.includes("import('/static/navara/photo-journey-lite.js')"), 'Navaraを遅延ロードする');
 assert.ok(controllerSrc.includes("const cyberLighting = settings.low || settings.terrainStyle === 'cyber'"),
   'サイバー地形だけ照明を明るくする分岐を持つ');
-assert.ok(controllerSrc.includes('{ ambient: 0.78, sun: 1.35 }') &&
+assert.ok(controllerSrc.includes('{ ambient: 0.92, sun: 1.50 }') &&
   controllerSrc.includes('{ ambient: 0.48, sun: 1.15 }'),
   'サイバー/写真表示の照明値をそれぞれ固定する');
 assert.ok(/view\.addLight\(\{ambient:\{intensity:lighting\.ambient\}\}\)/.test(controllerSrc),
