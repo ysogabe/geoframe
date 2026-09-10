@@ -1,6 +1,8 @@
 # 3D PHOTO JOURNEY Lite（Navara）実装計画と設計メモ
 
 作成日: 2026-08-31
+ステータス: 実装済み（`main` に取り込み済み）。表示の現行仕様と調整値は
+[3D PHOTO JOURNEY: 奥行きとサイバー地形](3d-depth-and-cyber-display.md)にまとめています。
 前提文書: [[0004-frontend-display-mode-arbitration]]（`docs/decisions/0004`）
 対象ハード: N100 相当（非力な内蔵GPU・無風ファンレス小型機を想定）
 
