@@ -11,7 +11,16 @@ python3 -m venv .venv
 .venv/bin/python -m unittest discover -s tests
 node tests/js/scheduler-quality.test.js
 node tests/js/right-column-layout.test.js
+node tests/js/photo-journey-lite.test.js
+node tests/js/gsi-dem-terrain.test.js
+node tests/js/photo-journey-depth.test.js
+node tests/js/photo-journey-reveal.test.js
+node tests/js/navara-build-integrity.test.js
 ```
+
+文書を追加・移動した場合は、リポジトリルートで
+`python3 tools/check_markdown_links.py`を実行し、[ドキュメント索引](docs/README.md)も
+同じ変更で更新してください。
 
 ネイティブクライアントを変更する場合は、
 [`native-display/README.md`](native-display/README.md)のビルド・テスト・移植性ゲートも実行します。

@@ -16,7 +16,9 @@ GEOFRAMEは、個人の写真を地図・気象・地震・航空機などの地
 - SQLiteによる写真カタログと、ローカルフォルダ・Google Driveからの取り込み
 - 地図上のフォトジャーニーと国土交通省の地理空間データ表示
 - 気象庁の天気予報・地震情報
-- Home Assistantによる在宅判定と室内環境表示（任意）
+- Navara（`@navaramap/three`）による3Dフォトジャーニー（`?mode=3d`、省電力構成）
+- 写真カタログからの旅行ブログ下書き生成と、静的HTMLの書き出し
+- Home Assistantによる在宅判定、室内環境表示、画面ON/OFFの手動オーバーライド（任意）
 - ADS-B航空機連携とAIによる写真検索・選定（任意）
 - ブラウザキオスク、macOS WKWebView、実験的なSDL2クライアント
 
@@ -42,9 +44,14 @@ ADS-B、AIの各連携は任意です。
 |---|---|
 | [`app/`](app/) | Pythonサーバー、Web UI、テスト |
 | [`docs/`](docs/) | アーキテクチャ、意思決定、外部連携、ロードマップ、履歴資料 |
+| [`frontend/`](frontend/) | 3Dフォトジャーニー（Navara）アダプタのソース |
 | [`deploy/`](deploy/) | systemd、キオスク、更新、バックアップの構成例 |
 | [`native-display/`](native-display/) | 実験的なC++/SDL2表示クライアント |
 | [`mac-wkwebview/`](mac-wkwebview/) | macOS向けの薄いWKWebViewキオスククライアント |
+| [`tools/`](tools/) | リポジトリ横断の検査スクリプト |
+
+3D表示のWASMバンドル（`app/static/navara/`）は生成物をコミットしており、ルートで
+`npm ci && npm run build:navara`を実行すると決定的に再生成できます。
 
 最初に[ドキュメント索引](docs/README.md)を参照してください。本番環境の構築方法は
 [デプロイガイド](deploy/README.md)にあります。
@@ -64,7 +71,18 @@ ADS-B、AIの各連携は任意です。
 ```sh
 cd app
 .venv/bin/python -m unittest discover -s tests
+node tests/js/scheduler-quality.test.js
+node tests/js/right-column-layout.test.js
+node tests/js/photo-journey-lite.test.js
+node tests/js/gsi-dem-terrain.test.js
+node tests/js/photo-journey-depth.test.js
+node tests/js/photo-journey-reveal.test.js
+node tests/js/navara-build-integrity.test.js
 ```
+
+`app/tests/js/navara-build-integrity.test.js`は`app/static/navara/`の生成物を検査するため、
+`npm run build:navara`実行後か、生成物を含むチェックアウトで実行してください。文書の相対リンクは
+リポジトリルートで`python3 tools/check_markdown_links.py`を実行して検査します。
 
 ネイティブクライアントのビルドとテストは
 [`native-display/README.md`](native-display/README.md)を参照してください。

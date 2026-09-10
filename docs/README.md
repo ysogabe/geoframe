@@ -34,6 +34,11 @@
 書き換えず、置き換える新しいADRを追加します。
 
 - [ADR 0001: 旅行ブログ生成](decisions/0001-travel-blog-generation.md)
+- [ADR 0002: 画面電源の手動オーバーライド](decisions/0002-screen-power-override-via-ha.md)
+- [ADR 0003: 画面制御の状態機械](decisions/0003-screen-control-state-machine.md)
+- [ADR 0004: 表示モードのアービトレーション](decisions/0004-frontend-display-mode-arbitration.md)
+- [ADR 0005: エージェント稼働データのHAバス](decisions/0005-agent-status-via-ha-bus.md)
+- [ADR 0006: 実装順序（Wave構成）](decisions/0006-implementation-sequencing.md)
 
 ### `reference/` — リファレンス
 
@@ -54,6 +59,8 @@
 実装を約束するものではない、将来案や検討メモです。
 
 - [Google連携と追加表示コンテンツ](roadmap/content-integrations.md)
+- [表示モード拡張の実装プラン（Wave構成）](roadmap/display-mode-expansion-plan.md)
+- [3D PHOTO JOURNEY Lite（Navara）実装計画と設計メモ](roadmap/3d-photo-journey-lite.md)
 - [3Dの奥行き改善とサイバー表示の比較](roadmap/3d-depth-and-cyber-display.md)
 
 ### `archive/` — 履歴資料
@@ -74,3 +81,7 @@
   認証情報、本番環境の台帳はコミットしません。
 - 日付付き進捗メモや機体固有runbookは、Git管理外の`local-notes/`へ置きます。
 - 過去資料には履歴資料であることを明記し、計画上の挙動を現行仕様として説明しません。
+- 新しい文書を追加したら、この索引（`docs/README.md`）の該当節にも追加します。
+- 索引に載せた文書の状態（現行・参照・計画）は、実装の進行に合わせて更新します。
+- 相対リンクはCIの`tools/check_markdown_links.py`で検査されます。文書を移動したら、索引と
+  参照元のリンクも同じ変更で更新します。
