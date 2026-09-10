@@ -126,7 +126,9 @@ raster-dem loaderが非200応答のbodyをデコードせず初期化を失敗�
 **フロント（`frontend/photo-journey-lite.js`）**: `addPhotoJourneyLayers()`が
 raster-dem source（`JAPAN_GSI_ELEVATION_DECODER()`でデコード、Z0-14）を`terrain` layer→
 地形の面が読める`hillshade` raster layer（同じsourceを再利用・`raster.show:false`で疑似カラーは
-出さない）→航空写真`raster` layerの順で追加する。terrainをimageryより先に追加しないと
+出さない）→航空写真`raster` layerの順で追加する。cyber/Lowでは注視点周辺700mを
+4×4の標高付きpolygon wireframeで補助表示し、全面ワイヤーフレームによるノイズを避ける。
+terrainをimageryより先に追加しないと
 後続レイヤのドレープ先が無いため、この順序を保つ。
 
 **N100設定（地形の立体感を優先した軽量値）**:
@@ -156,8 +158,8 @@ DEM専用の別エントリは追加せず、同一発行元（国土地理院�
 
 **N100隔離実機での確認結果:**
 - 2560×1080 / Intel GPU / X11 の空プロファイルで、`?mode=3d&low` を40秒表示して
-  地形の起伏とシアン線を確認した。`retainedTerrain=13`、`gpuBytesEst` 約435MB / 512MiBで、
-  WebGL初期化エラーは発生しなかった。
+  地形の起伏とシアン線を確認した。局所メッシュ追加後は`retainedTerrain=20`、
+  `gpuBytesEst` 約454MB / 512MiBで、WebGL初期化エラーは発生しなかった。
 - 旧Lowの粗いLOD設定では `retainedTerrain=0` となり平坦な背景に見えたため、Lowも地形の
   segments・SSE・キャッシュ上限を通常値にそろえ、内部画素倍率だけ0.5に維持した。
 - 山岳地・崖などextreme reliefでのterrain skirt/tile境界の視覚的な破綻有無は、長時間運用時に

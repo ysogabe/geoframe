@@ -178,6 +178,7 @@ function mockLayerView() {
     view: {
       addSource: s => { const handle = { ...s, update: () => {} }; sources.push(handle); return handle; },
       addLayer: l => { layers.push(l); },
+      globe: { wireframe: false },
       attribution: { add: () => {} },
     },
   };
@@ -189,6 +190,8 @@ const normalLayerState = addPhotoJourneyLayers(normalMock.view, {
   points: [{ lon: 139.7454, lat: 35.6586, title: 'Tokyo Tower' }],
   route: [],
 });
+assert.strictEqual(normalMock.view.globe.wireframe, false,
+  '写真表示では全面ワイヤーを出さず、写真の可読性を守る');
 
 const demSources = normalMock.sources.filter(s => s.type === 'raster-dem');
 assert.strictEqual(demSources.length, 1, 'raster-dem sourceは1つだけ登録する');
@@ -237,6 +240,13 @@ assert.strictEqual(lowMock.layers.filter(l => l.type === 'terrain').length, 1,
   'terrainは?low相当でも無効化されない（GSI地形は常時有効）');
 assert.strictEqual(lowMock.layers.filter(l => l.type === 'raster' && l.hillshade).length, 1,
   '?low相当でも抑制hillshadeを維持する');
+
+const cyberMock = mockLayerView();
+addPhotoJourneyLayers(cyberMock.view, {
+  points: [{ lon: 139.7, lat: 35.6 }], route: [], terrainStyle: 'cyber', low: true,
+});
+assert.strictEqual(cyberMock.view.globe.wireframe, false,
+  'サイバー/Low表示でも全地球ワイヤーフレームは使わず、局所メッシュだけを重ねる');
 
 /* ============================================================
  * 4. static/js/photo-journey-lite.js — ambient/sunの実値をboot()実行で捕捉する

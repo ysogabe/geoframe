@@ -106597,6 +106597,26 @@ function HyA(g, A, { low: B = !1 } = {}) {
     }
   return { type: "FeatureCollection", features: I };
 }
+function I3A(g, A, { low: B = !1 } = {}) {
+  if (!tF(A, 14)) return mD();
+  const I = { lon: A.lon ?? A.lng, lat: A.lat }, Q = B ? 4 : 5, C = B ? 700 : 850, E = C * 2 / Q, w = [];
+  for (let D = 0; D <= Q; D++) {
+    const t = [];
+    for (let e = 0; e <= Q; e++) {
+      const s = y3(I, -C + e * E, -C + D * E), i = Eg(g?.sampleTerrainHeight?.({ lng: s.lon, lat: s.lat }));
+      t.push(i === null ? null : [s.lon, s.lat, i + 16]);
+    }
+    w.push(t);
+  }
+  const D = [];
+  for (let t = 0; t < Q; t++)
+    for (let e = 0; e < Q; e++) {
+      const s = w[t][e], i = w[t][e + 1], F = w[t + 1][e + 1], M = w[t + 1][e];
+      if (!s || !i || !F || !M) continue;
+      D.push({ type: "Feature", properties: { terrainMesh: !0 }, geometry: { type: "Polygon", coordinates: [[s, i, F, M, s]] } });
+    }
+  return { type: "FeatureCollection", features: D };
+}
 function a3(g, A = !0) {
   return {
     type: "vector",
@@ -106616,13 +106636,20 @@ function a3(g, A = !0) {
     }
   };
 }
+function r3A(g, A = !0) {
+  return { type: "vector", source: g, polygon: { show: A, clampToGround: !1, perPositionHeight: !0, tiled: !1,
+    color: 5432813, opacity: 0.48, transparent: !0, depthWrite: !1,
+    lit: !1, castShadow: !1, receiveShadow: !1, wireframe: !0, wireframeLinewidth: 1,
+    outline: !0, outlineShow: !0, outlineColor: 5432813, outlineWidth: 1.2 } };
+}
 function O0A(g, A) {
   if (!g) return;
   const B = HyA(g.view, A, { low: g.low });
-  B.features.length && (g.source ? (g.source.update({ type: "geojson", data: B, tiled: !1 }), g.layer.update(a3(g.source))) : (g.source = g.view.addSource({ type: "geojson", data: B, tiled: !1 }), g.layer = g.view.addLayer(a3(g.source))), g.view.forceUpdate?.());
+  const I = g.mesh ? I3A(g.view, A, { low: g.low }) : null;
+  !B.features.length && !I?.features.length || (B.features.length && (g.source ? (g.source.update({ type: "geojson", data: B, tiled: !1 }), g.layer.update(a3(g.source))) : (g.source = g.view.addSource({ type: "geojson", data: B, tiled: !1 }), g.layer = g.view.addLayer(a3(g.source)))), I?.features.length && (g.meshSource ? (g.meshSource.update({ type: "geojson", data: I, tiled: !1 }), g.meshLayer.update(r3A(g.meshSource))) : (g.meshSource = g.view.addSource({ type: "geojson", data: I, tiled: !1 }), g.meshLayer = g.view.addLayer(r3A(g.meshSource)))), g.view.forceUpdate?.());
 }
 function R0A(g) {
-  g?.layer?.update(a3(g.source, !1));
+  g?.layer?.update(a3(g.source, !1)), g?.meshLayer?.update(r3A(g.meshSource, !1));
 }
 const yx = 0.3048, P3 = 0.514444, dx = 508e-5, oi = 111320, Ux = 60, hh = 20, ai = 25, Xh = 60;
 function Eg(g) {
@@ -107038,7 +107065,7 @@ function V0A(g, {
     osm: I.osm || `${w}/tiles/osm/{z}/{x}/{y}.png`,
     "gsi-dem": I.gsiDem || `${w}/tiles/gsi-dem/{z}/{x}/{y}.png`
   }, t = ["hybrid", "cyber"].includes(C) ? C : "photo";
-  t !== "photo" && g.globe?.color && (g.globe.color = g.globe.color.clone().setHex(3165284));
+  g.globe && (g.globe.wireframe = !1, t !== "photo" && g.globe.color && (g.globe.color = g.globe.color.clone().setHex(3895685)));
   const e = zyA(g, D["gsi-dem"]), s = Q || ua(A[0] || B[0]), i = t === "photo" || t === "hybrid" && !E, F = i && (t === "photo" || s === "gsi-photo") ? g.addSource(o3(s, D, t)) : null, M = t === "photo" ? 1 : 0, r = F ? g.addLayer({
     type: "raster",
     source: F,
@@ -107056,7 +107083,7 @@ function V0A(g, {
   ]), {
     basemap: { kind: s, source: F, urls: D, layer: r, opacity: M, style: t, view: g, imageryEnabled: i },
     terrain: { source: e },
-    groundLines: t === "photo" ? null : { view: g, low: E, source: null, layer: null }
+    groundLines: t === "photo" ? null : { view: g, low: E, mesh: t === "cyber", source: null, layer: null, meshSource: null, meshLayer: null }
   };
 }
 function _0A(g, {

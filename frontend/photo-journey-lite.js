@@ -306,6 +306,42 @@ export function photoJourneyGroundLines(view, point, { low = false } = {}) {
   return { type: "FeatureCollection", features };
 }
 
+/* 全面ワイヤーフレームはDEMの細かい分割まで画面へ出てしまい、暗部の
+   読みやすさよりノイズが勝つ。cyber/Lowの注視点周辺だけ、粗い標高付き
+   セルをwireframe描画して、地形の面の向きを示す。写真表示には追加しない。 */
+function photoJourneyTerrainMesh(view, point, { low = false } = {}) {
+  if (!photoJourneyTileXY(point, 14)) return emptyAircraftGeoJSON();
+  const origin = { lon: point.lon ?? point.lng, lat: point.lat };
+  const divisions = low ? 4 : 5;
+  const radius = low ? 700 : 850;
+  const step = (radius * 2) / divisions;
+  const rows = [];
+  for (let row = 0; row <= divisions; row++) {
+    const samples = [];
+    for (let column = 0; column <= divisions; column++) {
+      const pos = offsetGeodetic(origin, -radius + column * step, -radius + row * step);
+      const elevation = finiteNumber(view?.sampleTerrainHeight?.({ lng: pos.lon, lat: pos.lat }));
+      samples.push(elevation === null ? null : [pos.lon, pos.lat, elevation + 16]);
+    }
+    rows.push(samples);
+  }
+  const features = [];
+  for (let row = 0; row < divisions; row++) {
+    for (let column = 0; column < divisions; column++) {
+      const southwest = rows[row][column];
+      const southeast = rows[row][column + 1];
+      const northeast = rows[row + 1][column + 1];
+      const northwest = rows[row + 1][column];
+      if (!southwest || !southeast || !northeast || !northwest) continue;
+      features.push({ type: "Feature", properties: { terrainMesh: true },
+        geometry: { type: "Polygon", coordinates: [[
+          southwest, southeast, northeast, northwest, southwest,
+        ]] } });
+    }
+  }
+  return { type: "FeatureCollection", features };
+}
+
 function groundLinesLayer(source, show = true) {
   // Layer.updateは設定を置換する。表示切替時も標高・描画設定を含めて渡す。
   return { type: "vector", source,
@@ -314,23 +350,45 @@ function groundLinesLayer(source, show = true) {
       lit: false, castShadow: false, receiveShadow: false } };
 }
 
+function groundMeshLayer(source, show = true) {
+  return { type: "vector", source,
+    polygon: { show, clampToGround: false, perPositionHeight: true, tiled: false,
+      color: 0x52e5ed, opacity: 0.48, transparent: true, depthWrite: false,
+      lit: false, castShadow: false, receiveShadow: false,
+      wireframe: true, wireframeLinewidth: 1,
+      outline: true, outlineShow: true, outlineColor: 0x52e5ed, outlineWidth: 1.2 } };
+}
+
 export function updatePhotoJourneyGroundLines(state, point) {
   if (!state) return;
   const data = photoJourneyGroundLines(state.view, point, { low: state.low });
-  if (!data.features.length) return;
+  const mesh = state.mesh ? photoJourneyTerrainMesh(state.view, point, { low: state.low }) : null;
+  if (!data.features.length && !mesh?.features.length) return;
   // 空GeoJSONからの初回更新を取りこぼすNavaraの経路を避け、有効な頂点で初めて作る。
-  if (!state.source) {
-    state.source = state.view.addSource({ type: "geojson", data, tiled: false });
-    state.layer = state.view.addLayer(groundLinesLayer(state.source));
-  } else {
-    state.source.update({ type: "geojson", data, tiled: false });
-    state.layer.update(groundLinesLayer(state.source));
+  if (data.features.length) {
+    if (!state.source) {
+      state.source = state.view.addSource({ type: "geojson", data, tiled: false });
+      state.layer = state.view.addLayer(groundLinesLayer(state.source));
+    } else {
+      state.source.update({ type: "geojson", data, tiled: false });
+      state.layer.update(groundLinesLayer(state.source));
+    }
+  }
+  if (mesh?.features.length) {
+    if (!state.meshSource) {
+      state.meshSource = state.view.addSource({ type: "geojson", data: mesh, tiled: false });
+      state.meshLayer = state.view.addLayer(groundMeshLayer(state.meshSource));
+    } else {
+      state.meshSource.update({ type: "geojson", data: mesh, tiled: false });
+      state.meshLayer.update(groundMeshLayer(state.meshSource));
+    }
   }
   state.view.forceUpdate?.();
 }
 
 export function hidePhotoJourneyGroundLines(state) {
   state?.layer?.update(groundLinesLayer(state.source, false));
+  state?.meshLayer?.update(groundMeshLayer(state.meshSource, false));
 }
 
 /* ============================================================
@@ -908,8 +966,13 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
   };
   // terrainをimageryより先に追加する（drape対象を確保してから航空写真を載せる）。
   const style = ["hybrid", "cyber"].includes(terrainStyle) ? terrainStyle : "photo";
-  if (style !== "photo" && view.globe?.color)
-    view.globe.color = view.globe.color.clone().setHex(0x304c64);
+  // 全面ワイヤーフレームはDEMの細かい分割まで画面へ出てノイズになるため、
+  // 注視点周辺の局所メッシュだけを別レイヤーで描画する。
+  if (view.globe) {
+    view.globe.wireframe = false;
+    if (style !== "photo" && view.globe.color)
+      view.globe.color = view.globe.color.clone().setHex(0x3b7185);
+  }
   const demSource = addTerrain(view, urls["gsi-dem"]);
   const kind = basemap || selectPhotoJourneyBasemap(points[0] || route[0]);
   const photoEnabled = style === "photo" || (style === "hybrid" && !low);
@@ -935,7 +998,10 @@ export function addPhotoJourneyLayers(view, { points = [], route = [], tileUrls 
 
   return { basemap: { kind, source: raster, urls, layer, opacity, style, view, imageryEnabled: photoEnabled },
     terrain: { source: demSource },
-    groundLines: style === "photo" ? null : { view, low, source: null, layer: null } };
+    groundLines: style === "photo" ? null : {
+      view, low, mesh: style === "cyber", source: null, layer: null,
+      meshSource: null, meshLayer: null,
+    } };
 }
 
 /* 写真の座標はカメラ位置ではなく注視点。地面からの高さと俯角で後退距離を
