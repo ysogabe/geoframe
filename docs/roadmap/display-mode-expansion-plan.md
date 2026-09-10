@@ -14,7 +14,7 @@
 - **命名の注意**: フロントのJSは`app/static/js/`配下（`static/js/`ではない）。テストは`app/tests/`（Python）と`app/tests/js/`（Node、package.json無し、`node <file>`で直接実行）。
 - **PRごとの検証コマンド（現状確認済み、実在する）**:
   - Python: `cd app && .venv/bin/python -m unittest discover -s tests`
-  - JS回帰テスト: `node app/tests/js/right-column-layout.test.js` / `node app/tests/js/scheduler-quality.test.js`
+  - JS回帰テスト: `cd app && for t in tests/js/*.test.js; do node "$t" || exit 1; done`（`app/tests/js/`の全テスト）
   - N100実機での見た目確認は、各Waveの受け入れ条件に個別に記載する（自動テストでは検出できないレイアウト崩れ・焼き付き・DPMS実機挙動を含むため）。
 
 ## Wave 0a: 画面手動オーバーライド
@@ -23,6 +23,14 @@
 **Issue起票**: 要（このWave着手前に起票し、ブランチ名の`<issue番号>`を確定する）
 **ブランチ例**: `feat/<issue番号>-screen-override`
 **依存Wave**: なし。単独で着手可能。
+
+> [!NOTE]
+> **実装状況: 完了**（PR #13 マージ済み、Issue #12 クローズ済み）。以下の記述は着手前の
+> プランであり、現行仕様の説明ではありません。`app/geoframe/screen_control.py` の新設と
+> `GEOFRAME_HA_SCREEN_MODE_ENTITY`・`GEOFRAME_HA_SCREEN_RECONCILE_SEC` は実装済みで、
+> 判断の根拠は [[0002-screen-power-override-via-ha]] と
+> [[0003-screen-control-state-machine]]、現行の設定手順は
+> [Home Assistant連携](../integrations/home-assistant.md) にあります。
 
 ### 目的
 Home Assistant経由でGEOFRAMEキオスクの画面ON/OFFを外部（iPhone含む）から手動制御できるようにする。人感センサーによる自動スリープと矛盾なく共存させる。
@@ -36,7 +44,7 @@ Home Assistant経由でGEOFRAMEキオスクの画面ON/OFFを外部（iPhone含�
 
 ### 追加する環境変数
 - `GEOFRAME_HA_SCREEN_MODE_ENTITY`（例: `input_select.geoframe_screen_mode`）— 未設定時は本機能全体を無効化し、従来のauto専用ロジックにフォールバックする。
-- `GEOFRAME_HA_SCREEN_RECONCILE_SEC`（既定値は実装時に決める。目安60〜120秒）— `screen-ctl.sh status`との照合間隔。
+- `GEOFRAME_HA_SCREEN_RECONCILE_SEC`（実装済みの既定値は90秒）— `screen-ctl.sh status`との照合間隔。
 
 ### 受け入れ条件
 1. Python単体テスト: `decide()`に対し、`(mode=auto, idle超過)→off`、`(mode=force_off, 人感反応)→off`（人感で解除されないこと）、`(mode=force_on, idle超過)→on`、`(ha_ok=False継続, mode=force_off)→一定時間後にautoへ減衰`の各ケースをカバーする。

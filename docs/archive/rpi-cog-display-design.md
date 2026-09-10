@@ -9,7 +9,7 @@
 開発・動作確認表示器: 一般的なFHDモニター（1920×1080、16:9、60Hz）
 最終表示器: LG 29UM59-P（29インチ、2560×1080、21:9）
 表示ランタイム: Cog + WPE WebKit + DRM/KMS
-比較対象: [`../architecture/native-display.md`](../architecture/native-display.md)
+比較対象: [`native-display-concept.md`](native-display-concept.md)
 
 ---
 

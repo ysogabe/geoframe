@@ -2,7 +2,8 @@
 
 ## 位置づけ
 
-これは [native display design](../docs/architecture/native-display.md) の実装です。
+これは[企画案（2026-07-30）](../docs/archive/native-display-concept.md)を出発点にした実装です。
+実装契約と手順は [`docs/`](docs/) にあります。
 
 **企画**: GeoFrame（写真・気象・地震・Home Assistant）と hogo-meter（保護猫のお世話記録）を
 1台のアンビエント端末へ統合する。普段は家族の写真が流れ、必要な瞬間だけ生活の操作盤になる。

@@ -73,7 +73,7 @@ npm 依存（ルート `package.json`、全バージョン完全固定）から 
   `view.attribution` に GSI / OSM を登録）。
 - `@navaramap/three/dist/assets/`（大気・雲・ノイズ・水のテクスチャ）は参照されない
   ため**同梱しない**（バンドル内に `assets/` 参照0件をテストで保証）。
-- 詳細は `docs/roadmap/3d-photo-journey-lite.md` を参照。
+- 詳細は `docs/architecture/3d-photo-journey-lite.md` を参照。
 - `navara-worker.js` / `navara-font-worker.js` は、Navara 0.1.1に内蔵されたdata: workerを
   実ファイル化したもの。worker内のrelative WASM URLを壊さず、tile/polyline生成時の
   `Invalid URL`を防ぐ。

@@ -10,7 +10,7 @@
 | [写真パイプライン](architecture/photo-pipeline.md) | 現行 | 写真の取り込みからUI表示までの流れ |
 | [写真カタログ](architecture/photo-catalog.md) | 参照 | SQLiteとメタデータ分離の設計・設計履歴 |
 | [3Dフォトジャーニー](architecture/3d-photo-journey-lite.md) | 現行 | Navara 3D表示の実装契約と調整値 |
-| [ネイティブ表示設計](architecture/native-display.md) | 参照 | C++/SDL2クライアントの設計 |
+| [ネイティブ表示の契約](../native-display/docs/CORE_CONTRACTS.md) | 参照 | C++/SDL2クライアントの実装契約 |
 | [Home Assistant連携](integrations/home-assistant.md) | 現行 | 安全な連携設定 |
 | [地理空間MCP](integrations/geospatial-mcp.md) | 参照 | 国土交通省APIとMCPの調査記録 |
 | [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（`config.py`から自動生成） |
@@ -26,7 +26,6 @@
 - [現行の写真パイプライン](architecture/photo-pipeline.md)
 - [3D PHOTO JOURNEY Lite（Navara）の実装契約](architecture/3d-photo-journey-lite.md)
 - [3D PHOTO JOURNEY の奥行きとサイバー地形](architecture/3d-depth-and-cyber-display.md)
-- [ネイティブ表示設計（実装前の企画案）](architecture/native-display.md)
 
 ネイティブクライアント固有の詳細な契約は
 [`native-display/docs/`](../native-display/docs/)にあります。
@@ -72,6 +71,7 @@
 
 - [初期スマートディスプレイ構想](archive/smart-display-concept.md)
 - [Raspberry Pi 400 / Cog-WPE構成案](archive/rpi-cog-display-design.md)
+- [ネイティブ表示の企画案（実装前の概要設計）](archive/native-display-concept.md)
 
 ## 文書作成ルール
 

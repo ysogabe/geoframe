@@ -76,8 +76,28 @@ def _env_calls(text):
                     break
                 depth -= 1
             j += 1
-        out.append((name, _default(rest[alt.end():j])))
+        # この形の変数自体に既定値は無く、未設定なら別の値へ委ねる。
+        # 「既定値 X」と書くと X が既定値だと誤読されるため、委譲先として示す
+        out.append((name, f"なし（未設定時は {_default(rest[alt.end():j])}）"))
     return out
+
+
+def collect_external(known):
+    """config.py 以外が直接読む環境変数を {変数名: [モジュール名]} で返す。
+
+    `config.py` を経由しない変数は上の一覧に構造的に現れず、文書から漏れる。
+    モジュール名だけを載せる（行番号は編集のたびに動くため、同期検査が
+    無意味に失敗するのを避ける）。"""
+    found = {}
+    for path in sorted((ROOT / "app" / "geoframe").glob("*.py")):
+        if path.name == "config.py":
+            continue
+        text = path.read_text(encoding="utf-8")
+        for name in set(ENV_GET.findall(text)):
+            if name in known:
+                continue
+            found.setdefault(name, set()).add(path.name)
+    return {k: sorted(v) for k, v in sorted(found.items())}
 
 
 def _default(raw):
@@ -209,6 +229,18 @@ def render(entries):
         if note:
             line += "。" + note
         body.append(line)
+    external = collect_external({e["name"] for e in entries})
+    if external:
+        body += [
+            "",
+            "## `config.py` 以外が読む環境変数",
+            "",
+            "以下は各モジュールが直接読みます（`config.py` を経由しないため上の一覧には現れません）。",
+            "設定方法と既定の挙動は、それぞれの変数の説明先を参照してください。",
+            "",
+        ]
+        for name, modules in external.items():
+            body.append(f"- `{name}` — {', '.join(f'`{m}`' for m in modules)}")
     body.append("")
     return "\n".join(body)
 

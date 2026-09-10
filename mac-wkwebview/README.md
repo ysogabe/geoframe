@@ -6,7 +6,7 @@
 ## 位置づけ（どの企画に属するか）
 
 これは **Cog/WPE + RPi400 企画（[`docs/archive/rpi-cog-display-design.md`](../docs/archive/rpi-cog-display-design.md)）の Mac 上での
-先行検証**であり、[`docs/architecture/native-display.md`](../docs/architecture/native-display.md)（C++ Core + SDL、Tab5 移植を目的とする）
+先行検証**であり、[`docs/archive/native-display-concept.md`](../docs/archive/native-display-concept.md)（C++ Core + SDL、Tab5 移植を目的とする）
 とは**別系統**である。両者を混同しないこと。
 
 - 本ディレクトリ: WKWebView で既存 Web UI を出す。最終ターゲットは Pi 400 の WPE WebKit/DRM
