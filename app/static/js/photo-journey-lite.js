@@ -741,11 +741,16 @@
     try{
       view=mod.createPhotoJourneyView(container,{low:settings.low,terrainStyle:settings.terrainStyle});
       await view.init();
-      // 地形(GSI DEM)の斜面が読めるように、陰影を可視性優先で調整した値。
-      // sunはapplyColor:trueで大気散乱の計算を経ずに指定色をそのまま使い、
-      // castShadow:falseでN100向けにシャドウマップを一切生成しない。
-      view.addLight({ambient:{intensity:0.48}});
-      view.addLight({sun:{intensity:1.15,applyColor:true,castShadow:false}});
+      // 地形(GSI DEM)の斜面が読めるように、陰影を可視性優先で調整する。
+      // サイバー地形は暗いベース色を使うためambientを持ち上げる。通常のhybrid/photoは
+      // 写真のコントラストを守る既存値を使う。sunはapplyColor:trueで大気散乱の計算を
+      // 経ず指定色をそのまま使い、castShadow:falseでN100向けのシャドウマップを作らない。
+      const cyberLighting = settings.low || settings.terrainStyle === 'cyber';
+      const lighting = cyberLighting
+        ? { ambient: 0.78, sun: 1.35 }
+        : { ambient: 0.48, sun: 1.15 };
+      view.addLight({ambient:{intensity:lighting.ambient}});
+      view.addLight({sun:{intensity:lighting.sun,applyColor:true,castShadow:false}});
       const points=toInitialPoint(first);
       if(first>=0){
         const p=PHOTOS[first];

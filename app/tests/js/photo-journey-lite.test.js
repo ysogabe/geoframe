@@ -173,11 +173,16 @@ assert.strictEqual(LITE_OPTIONS.lodFog.enabled, false, '通常表示は航空写
 assert.strictEqual(LITE_OPTIONS.dynamicSse.enabled, false, '通常表示では傾斜時も航空写真を粗くしない');
 assert.strictEqual(LITE_OPTIONS.memoryBudget.sseMultiplierMin, 1, '通常表示の基礎SSEを劣化させない');
 const LOW_POWER_LITE_OPTIONS = vm.runInContext('LOW_POWER_LITE_OPTIONS', feContext);
-assert.ok(LOW_POWER_LITE_OPTIONS.cacheBytes < LITE_OPTIONS.cacheBytes, 'LOW_POWERはcacheBytesをさらに下げる');
-assert.ok(LOW_POWER_LITE_OPTIONS.memoryBudget.maxPendingRequests < LITE_OPTIONS.memoryBudget.maxPendingRequests,
-  'LOW_POWERは同時リクエスト数をさらに下げる');
-assert.strictEqual(LOW_POWER_LITE_OPTIONS.lodFog.enabled, true, 'LOW_POWERだけLOD緩和を有効にする');
-assert.ok(LOW_POWER_LITE_OPTIONS.memoryBudget.sseMultiplierMin > 1, 'LOW_POWERは基礎SSEを粗くする');
+assert.ok(LOW_POWER_LITE_OPTIONS.pixelRatio < LITE_OPTIONS.pixelRatio,
+  'LOW_POWERは内部画素倍率だけを下げる');
+assert.strictEqual(LOW_POWER_LITE_OPTIONS.segments, LITE_OPTIONS.segments,
+  'LOW_POWERでも地形メッシュ分割を通常値で維持する');
+assert.strictEqual(LOW_POWER_LITE_OPTIONS.maxSse, LITE_OPTIONS.maxSse,
+  'LOW_POWERでも地形LODを通常値で維持する');
+assert.strictEqual(LOW_POWER_LITE_OPTIONS.lodFog.enabled, false,
+  'LOW_POWERでも地形LODを過度に粗くするfogを使わない');
+assert.strictEqual(LOW_POWER_LITE_OPTIONS.dynamicSse.enabled, false,
+  'LOW_POWERでも地形の動的SSEを無効にして斜面を保持する');
 
 const createPhotoJourneyView = vm.runInContext('createPhotoJourneyView', feContext);
 const lowView = createPhotoJourneyView({ id: 'modelayer' }, { low: true });
@@ -444,7 +449,8 @@ assert.strictEqual(lowSettings.dwellMs, LOW_DWELL_MS, 'LOW_POWERは巡回を90�
 assert.strictEqual(normalSettings.orbitDelayMs, PHOTO_ORBIT_DELAY_MS, '通常周回はDEM待ち後の45秒で開始する');
 assert.strictEqual(lowSettings.orbitDelayMs, PHOTO_ORBIT_DELAY_MS, 'LOW_POWERもDEM待ち後の45秒で周回判定する');
 assert.ok(lowSettings.flyMs < normalSettings.flyMs, 'LOW_POWERはflyTo時間を短縮');
-assert.ok(lowSettings.height > normalSettings.height, 'LOW_POWERは高高度で遠景LODにする');
+assert.strictEqual(lowSettings.height, normalSettings.height,
+  'LOW_POWERでも地形を読めるカメラ高度を維持する');
 assert.strictEqual(normalSettings.height, 1400, '通常表示は地形を見渡せる実高度にする');
 assert.strictEqual(normalSettings.pitch, -24, '通常表示は地平線と斜面が読める斜め視点にする');
 assert.strictEqual(lowSettings.pitch, -28, '?lowでも地形が読める斜め視点を維持する');
@@ -546,10 +552,15 @@ runInContext(controllerSrc, { window: { GEOFRAME_MODE_3D: false } });
 assert.ok(/if\(!window\.GEOFRAME_MODE_3D\) return;/.test(controllerSrc), '3Dでなければ即returnする');
 // Navara バンドルを遅延ロード（通常URLではこの行に到達しない）
 assert.ok(controllerSrc.includes("import('/static/navara/photo-journey-lite.js')"), 'Navaraを遅延ロードする');
-assert.ok(/view\.addLight\(\{\s*ambient:\s*\{\s*intensity:\s*0\.48\s*\}\s*\}\)/.test(controllerSrc),
-  '航空写真レイヤ追加前に地形の陰影を残すアンビエント光(0.48)を置く');
-assert.ok(/view\.addLight\(\{\s*sun:\s*\{\s*intensity:\s*1\.15,\s*applyColor:\s*true,\s*castShadow:\s*false\s*\}\s*\}\)/
-  .test(controllerSrc), 'GSI DEM地形を太陽光(1.15)で照らし、シャドウマップは作らない');
+assert.ok(controllerSrc.includes("const cyberLighting = settings.low || settings.terrainStyle === 'cyber'"),
+  'サイバー地形だけ照明を明るくする分岐を持つ');
+assert.ok(controllerSrc.includes('{ ambient: 0.78, sun: 1.35 }') &&
+  controllerSrc.includes('{ ambient: 0.48, sun: 1.15 }'),
+  'サイバー/写真表示の照明値をそれぞれ固定する');
+assert.ok(/view\.addLight\(\{ambient:\{intensity:lighting\.ambient\}\}\)/.test(controllerSrc),
+  'ambient照明を選択した値で追加する');
+assert.ok(/view\.addLight\(\{sun:\{intensity:lighting\.sun,applyColor:true,castShadow:false\}\}\)/
+  .test(controllerSrc), 'GSI DEM地形を選択した太陽光で照らし、シャドウマップは作らない');
 assert.ok(!controllerSrc.includes('view.lit = false'), 'unlit切替でラスタ合成を失わせない');
 assert.ok(/requestLodRefinement\((view|targetView)\)/.test(controllerSrc), 'on-demand描画でも航空写真LODを精細化する');
 assert.ok(controllerSrc.includes('setInterval'), '常時描画ではなく期限付きの精細化バーストを使う');
@@ -750,7 +761,7 @@ async function runControllerBridgeRuntimeRegression(){
     GEOFRAME_MODE_3D: true,
     LOW_POWER: true,
     GEOFRAME_PHOTO_JOURNEY_SETTINGS: {
-      low: true, dwellMs: LOW_DWELL_MS, flyMs: 1, height: 4200, pitch: -28,
+      low: true, dwellMs: LOW_DWELL_MS, flyMs: 1, height: 1400, pitch: -28,
       headingStep: 0, orbitDelayMs: PHOTO_ORBIT_DELAY_MS,
     },
     GEOFRAME_EVENT_STATE: {
@@ -957,7 +968,7 @@ async function runPhotoDwellLifecycleRegression(){
       GEOFRAME_MODE_3D: true,
       LOW_POWER: low,
       GEOFRAME_PHOTO_JOURNEY_SETTINGS: {
-        low, dwellMs: low ? LOW_DWELL_MS : NORMAL_DWELL_MS, flyMs: 1, height: low ? 3200 : 1400,
+        low, dwellMs: low ? LOW_DWELL_MS : NORMAL_DWELL_MS, flyMs: 1, height: 1400,
         pitch: low ? -28 : -24, headingStep: 0,
         orbitDelayMs: PHOTO_ORBIT_DELAY_MS, orbitMs: 8000, orbitDegrees: 22,
       },

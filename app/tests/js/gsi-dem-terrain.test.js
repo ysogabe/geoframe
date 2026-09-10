@@ -141,13 +141,13 @@ const feContext = {
 };
 runInContext(stripped, feContext);
 
-/* ---- quality設定: normal 32/4/0.65, low 16/8/0.5 ---- */
+/* ---- quality設定: normal 32/4/0.65, low 32/4/0.5（地形品質を維持） ---- */
 const LITE_OPTIONS = vm.runInContext('LITE_OPTIONS', feContext);
 const LOW_POWER_LITE_OPTIONS = vm.runInContext('LOW_POWER_LITE_OPTIONS', feContext);
 assert.strictEqual(LITE_OPTIONS.segments, 32, '通常表示のterrain segmentsは32');
 assert.strictEqual(LITE_OPTIONS.maxSse, 4, '通常表示のterrain maxSseは4');
-assert.strictEqual(LOW_POWER_LITE_OPTIONS.segments, 16, '?lowのterrain segmentsは16');
-assert.strictEqual(LOW_POWER_LITE_OPTIONS.maxSse, 8, '?lowのterrain maxSseは8');
+assert.strictEqual(LOW_POWER_LITE_OPTIONS.segments, 32, '?lowでもterrain segmentsは32');
+assert.strictEqual(LOW_POWER_LITE_OPTIONS.maxSse, 4, '?lowでもterrain maxSseは4');
 assert.ok(Object.isFrozen(LITE_OPTIONS) && Object.isFrozen(LOW_POWER_LITE_OPTIONS),
   'quality設定を含むLITE_OPTIONSは凍結されたまま');
 
@@ -161,12 +161,12 @@ assert.strictEqual(normalView.options.useNormal, true, '初期化時に地形法
 const hybridView = createPhotoJourneyView({ id: 'modelayer' }, { terrainStyle: 'hybrid' });
 assert.strictEqual(hybridView.options.maxSse, 3, 'hybridは注視点の詳細写真LODを優先する');
 const lowHybridView = createPhotoJourneyView({ id: 'modelayer' }, { terrainStyle: 'hybrid', low: true });
-assert.strictEqual(lowHybridView.options.maxSse, 8, '省電力のLOD上限を維持する');
+assert.strictEqual(lowHybridView.options.maxSse, 4, '省電力でも地形LOD上限を維持する');
 
 const lowView = createPhotoJourneyView({ id: 'modelayer' }, { low: true });
 assert.strictEqual(lowView.options.pixelRatio, 0.5, '?lowのpixelRatioは0.5のまま（変更しない）');
-assert.strictEqual(lowView.options.segments, 16, '?lowはThreeViewへsegments=16を渡す');
-assert.strictEqual(lowView.options.maxSse, 8, '?lowはThreeViewへmaxSse=8を渡す');
+assert.strictEqual(lowView.options.segments, 32, '?lowはThreeViewへsegments=32を渡す');
+assert.strictEqual(lowView.options.maxSse, 4, '?lowはThreeViewへmaxSse=4を渡す');
 
 /* ---- raster-dem source・terrain/hillshade layerの追加順序（normal） ---- */
 function mockLayerView() {
@@ -247,7 +247,7 @@ async function flushMicrotasks() {
   for (let i = 0; i < 8; i++) await Promise.resolve();
 }
 
-async function runLightingRegression() {
+async function runLightingRegression({ low = false } = {}) {
   const lightCalls = [];
   const fakeView = {
     init: () => Promise.resolve(true),
@@ -271,8 +271,9 @@ async function runLightingRegression() {
     window: {
       GEOFRAME_MODE_3D: true,
       GEOFRAME_PHOTO_JOURNEY_SETTINGS: {
-        low: false, dwellMs: 60000, flyMs: 1, height: 1400, pitch: -24, headingStep: 0,
-        orbitDelayMs: 45000, orbitMs: 8000, orbitDegrees: 22,
+        low, terrainStyle: low ? 'cyber' : 'hybrid', dwellMs: 60000, flyMs: 1,
+        height: 1400, pitch: low ? -28 : -24, headingStep: low ? 0 : 47,
+        orbitDelayMs: 45000, orbitMs: low ? 0 : 8000, orbitDegrees: 22,
       },
       GEOFRAME_EVENT_STATE: { isSleeping: () => false, isEventActive: () => false, getEventUntil: () => 0 },
       addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => true,
@@ -282,7 +283,7 @@ async function runLightingRegression() {
     PHOTOS: [{ lon: 139, lat: 35, title: 'Lighting regression point' }],
     playQueue,
     DWELL_MS: 60000,
-    LOW_POWER: false,
+    LOW_POWER: low,
     sessionStorage: { setItem: () => {} },
     location: { reload: () => {} },
     reindexPhotos: () => {}, loadPlayState: () => {}, syncSchedule: () => {},
@@ -301,11 +302,16 @@ async function runLightingRegression() {
   assert.strictEqual(lightCalls.length, 2, 'ambientとsunの2回だけaddLightを呼ぶ（他の光源は追加しない）');
   // vmサンドボックス越しのオブジェクトはOutward Objectと[[Prototype]]が異なるため、
   // deepStrictEqualではなくJSON表現で比較する（既存のsetPhotoJourneyCameraテストと同じ手法）。
-  assert.strictEqual(JSON.stringify(lightCalls[0]), JSON.stringify({ ambient: { intensity: 0.48 } }),
-    '地形の陰影を残すambient光0.48を最初に置く');
+  const expected = low
+    ? { ambient: { intensity: 0.78 } }
+    : { ambient: { intensity: 0.48 } };
+  assert.strictEqual(JSON.stringify(lightCalls[0]), JSON.stringify(expected),
+    low ? 'サイバー地形はambient光0.78で暗部を持ち上げる' :
+      '写真表示は陰影を残すambient光0.48を置く');
+  const expectedSun = low ? 1.35 : 1.15;
   assert.strictEqual(JSON.stringify(lightCalls[1]),
-    JSON.stringify({ sun: { intensity: 1.15, applyColor: true, castShadow: false } }),
-    '地形の面を照らす太陽光1.15・applyColor有効・シャドウマップ無効を実際にaddLightへ渡す');
+    JSON.stringify({ sun: { intensity: expectedSun, applyColor: true, castShadow: false } }),
+    `地形の面を照らす太陽光${expectedSun}・applyColor有効・シャドウマップ無効を実際にaddLightへ渡す`);
 }
 
 /* ============================================================
@@ -327,6 +333,7 @@ assert.ok(aircraftMock.layers.every(l => l.polygon.clampToGround === false),
   '航空機layerは新しいterrainへクランプされない（絶対高度のまま浮遊表示を維持）');
 
 runLightingRegression()
+  .then(() => runLightingRegression({ low: true }))
   .then(() => console.log('gsi-dem-terrain: OK'))
   .catch(error => {
     console.error(error && error.stack ? error.stack : error);

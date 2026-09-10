@@ -106451,29 +106451,10 @@ const bU = Object.freeze({
   }
 }), Px = Object.freeze({
   ...bU,
-  // 省電力表示は従来の内部倍率を維持し、通常表示だけを段階的に精細化する。
-  pixelRatio: 0.5,
-  // 地形は?lowでも無効化しない（GOALの「low でも terrain を維持」）。
-  // segments/maxSseだけ粗くしてメッシュ分割・タイル選択のコストを下げる。
-  segments: 16,
-  maxSse: 8,
-  cacheBytes: 64 * 1024 * 1024,
-  lodFog: { enabled: !0, density: 0.1, sseFactor: 12 },
-  dynamicSse: {
-    enabled: !0,
-    density: 5e-4,
-    sseFactor: 48,
-    heightFalloff: 0.15,
-    minHeight: 0,
-    maxHeight: 6e3
-  },
-  memoryBudget: {
-    maxWorkerHeapBytes: 64 * 1024 * 1024,
-    fontBudgetBytes: 4 * 1024 * 1024,
-    maxPendingRequests: 2,
-    sseMultiplierMin: 8,
-    sseMultiplierMax: 48
-  }
+  // 省電力表示は内部画素倍率とコントローラ側の動きを抑える。
+  // 地形のLODを粗くするとN100ではDEMメッシュが保持されず、照明を強めても
+  // 平坦な背景に見えるため、地形品質は通常表示と同じ値を使う。
+  pixelRatio: 0.5
 }), x0A = bU, j0A = Px;
 function oyA({ low: g = !1 } = {}) {
   return g ? Px : bU;

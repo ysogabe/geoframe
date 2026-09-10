@@ -56,13 +56,13 @@ Navara アダプタ `frontend/photo-journey-lite.js` が唯一の構成点。`LI
 | `animation` | false | Navaraのon-demand render（flyTo/変更時のみ描画） |
 | `mobileOptimization` | true | モバイル向け軽量化を有効化 |
 | `cacheBytes` | 512 MiB | 予約量ではなく保護上限。N95実測でZ3停止を解消しZ15へ到達 |
-| `lodFog` / `dynamicSse` | 通常: 無効、`?low`: 有効・粗め | 通常は地点判読、lowは負荷削減を優先 |
-| `maxPendingRequests` | 4（`?low`: 2） | カメラ移動時のdecode/fetch burstを抑制 |
+| `lodFog` / `dynamicSse` | 無効（通常・`?low`共通） | DEMメッシュの斜面を遠景まで保持する |
+| `maxPendingRequests` | 4（通常・`?low`共通） | 地形のdecode/fetchを途切れさせない |
 
-`?low` では cacheBytes を64 MiB、worker heapを64 MiB、最大同時リクエストを2、
-LOD/SSEをさらに粗くし、カメラ高度を4,200m、飛行時間を1,200ms、地点の滞在を最低45秒
-（通常は最低30秒）にする。方位変更も止める。高度を上げるのは近景を拡大するためではなく、
-遠景LODを選ばせてN100のタイル数と更新回数を抑えるためである。
+`?low` では内部画素倍率を0.5に固定し、周回・写真フェード・方位変更を止める。
+地形のcache、LOD、SSEは通常値を使う。N100では地形LODを粗くするとDEMメッシュが
+保持されず、照明を上げても平坦な背景に見えるためである。カメラ高度は通常と同じ1,400m、
+俯角だけを-28度にして斜面を画面へ残す。
 
 通常表示では航空写真から撮影地点を判別できることを優先し、距離・傾斜によるLOD緩和と
 常時SSE倍率を無効化する。Navara公式の軽量GIS例と同じく、raster追加前に
@@ -133,13 +133,13 @@ raster-dem source（`JAPAN_GSI_ELEVATION_DECODER()`でデコード、Z0-14）を
 
 | 項目 | 通常 | `?low` | 理由 |
 |---|---|---|---|
-| terrain segments | 32 | 16 | メッシュ分割コスト。`?low`でも地形自体は無効化しない |
-| terrain maxSse | 4 | 8 | 許容screen-space-error（px）。粗いほど早く安定する |
+| terrain segments | 32 | 32 | `?low`でもDEMメッシュの斜面を保持する |
+| terrain maxSse | 4 | 4 | 許容screen-space-error（px）。通常と同じ詳細度で地形を選ぶ |
 | 標高スケール | 1.0（設定項目なし） | 同左 | `@navaramap/three@0.1.1`にterrain用の乗算スケールAPIが無いことを型定義で確認済み。デコード結果の実測メートルをそのまま使う＝素の1.0 |
 | hillshade exaggeration | 1.35 | 同左 | `HillshadeMaterial.exaggeration`で斜面の明暗を読めるようにする。係数変更だけでメッシュ量は増やさない |
-| ambient intensity | 0.68 | 同左 | 環境光を抑え、斜面の明暗を残す |
-| sun intensity / applyColor / castShadow | 0.52 / true / false | 同左 | `applyColor:true`で大気散乱計算を経ず指定色をそのまま使う。`castShadow:false`でシャドウマップを一切生成しない（N100向けの既存`shadow:false`初期化オプションと合わせて二重に無効化） |
-| camera height / pitch | 2400m / -32° | 4200m / -28° | 真下寄りの俯瞰を避け、地平線・斜面・遠近感を同時に見せる。heightは楕円体からの実高度 |
+| ambient intensity | 0.48（hybrid/photo） / 0.78（cyber・`?low`） | 同左 | 写真のコントラストを守り、暗いサイバー地形の暗部だけを持ち上げる |
+| sun intensity / applyColor / castShadow | 1.15（hybrid/photo） / 1.35（cyber・`?low`） / true / false | 同左 | `applyColor:true`で指定色を使い、`castShadow:false`でシャドウマップを生成しない |
+| camera height / pitch | 1400m / -24° | 1400m / -28° | 地平線・斜面・遠近感を同時に見せる。heightは楕円体からの実高度 |
 | pixelRatio | 0.65（第二段階） | 0.5 | 通常表示だけ描画密度を上げ、`?low`は変更しない |
 
 `addDefaultPhotorealScene()` / SSR / SSAO / DOF / 雲 / 大気散乱エフェクト / 常時描画
@@ -154,13 +154,14 @@ MEMORY LINKの機上視点・アラートカメラも変更しない。
 attribution文言へ「標高タイル（基盤地図情報数値標高モデル・全球数値地図）」を追記した。
 DEM専用の別エントリは追加せず、同一発行元（国土地理院）の1エントリへ統合している。
 
-**このトライアルで確認しないこと（実機QA・orchestrator側）**:
-- N100実機でのfps/GPUメモリへの実測影響（本ロードマップの§9「実機検証」と同様、後日の
-  長時間運用確認に含める）。
-- 見た目の最終的な良し悪し（陰影の強さ・地形の誇張度など）の主観評価。今回の数値
-  （hillshade 1.35・ambient 0.68・sun 0.52）は「立体感を優先した軽量値」であり、
-  実機での見え方を見て調整する前提の暫定値。
-- 山岳地・崖などextreme reliefでのterrain skirt/tile境界の視覚的な破綻有無。
+**N100隔離実機での確認結果:**
+- 2560×1080 / Intel GPU / X11 の空プロファイルで、`?mode=3d&low` を40秒表示して
+  地形の起伏とシアン線を確認した。`retainedTerrain=13`、`gpuBytesEst` 約435MB / 512MiBで、
+  WebGL初期化エラーは発生しなかった。
+- 旧Lowの粗いLOD設定では `retainedTerrain=0` となり平坦な背景に見えたため、Lowも地形の
+  segments・SSE・キャッシュ上限を通常値にそろえ、内部画素倍率だけ0.5に維持した。
+- 山岳地・崖などextreme reliefでのterrain skirt/tile境界の視覚的な破綻有無は、長時間運用時に
+  追加確認する。
 
 ## 5. 巡回（3dコントローラ）
 
@@ -178,7 +179,7 @@ DEM専用の別エントリは追加せず、同一発行元（国土地理院�
 4. 巡回ループ: `nextQueueIdx()` → `markShown(i)` → `showPhoto(i)`（既存の写真カード +
    AREA INTEL を再利用）→ `setMode('3D PHOTO JOURNEY LITE')` →
    `flyPhotoJourneyCamera(...)`。通常滞在は最低30秒、カメラ移動は5秒。低電力時は最低45秒滞在、
-   1.2秒移動、4,200mの高高度・固定方位とし、LODと更新頻度を下げる。可視LODの精細化後、
+   1.2秒移動、1,400m・固定方位とし、周回と写真フェードを止める。可視LODの精細化後、
    現在地点と次地点の背景タイル先読みを低頻度で開始する。
 
 **失敗時のフォールバック**: Navara / WASM / worker / WebGL の初期化に失敗したら
@@ -264,8 +265,9 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
   GSI標高エンコード式の素のJS再実装（no-data閾値2^23の陽性/陰性対照）・
   config.py/tiles.py/handlers.pyのgsi-demルーティング契約のソーステキスト照合・
   `addPhotoJourneyLayers`のraster-dem source登録とterrain→hillshade→imageryの追加順序・
-  normal(32/4)/low(16/8)のquality設定・3D controllerの`boot()`をvm実行して
-  `view.addLight`へ渡るambient(0.68)/sun(0.52, applyColor, castShadow:false)の実値・
+  normal(32/4)/low(32/4)のquality設定・3D controllerの`boot()`をvm実行して
+  `view.addLight`へ渡るnormal ambient(0.48)/sun(1.15)、cyber/low ambient(0.78)/sun(1.35、
+  applyColor、castShadow:false)の実値・
   重い演出（addDefaultPhotorealScene/addEffect/shadow:true）が無いこと・
   航空機のperPositionHeight/clampToGround:falseが地形追加後も変わらないことを実実行で検証。
 - `app/tests/test_tiles.py` — gsi-photoの既存テストに加え、gsi-demのURL選択（z0-8=demgm_png/
@@ -284,11 +286,11 @@ npm run build:navara   # vite build → app/static/navara/ を決定的に生成
 
 ## 9. 実機検証
 
-N95実機（`geoframe-n100.local`）で航空写真単独の隔離ページを計測した。
+N100実機（`geoframe-n100.local`）で航空写真・DEMの隔離ページを計測した。
 
 - 2560x1080 CSS表示、通常の内部canvas 1664x702（pixelRatio 0.65）、`?low`は1280x540
-- カメラ高度2,400m、俯角-32°（lowは4,200m/-28°）で地平線と斜面を見せる
-- GSI航空写真131枚、最大Z15、GPU推定約440MiB
+- カメラ高度1,400m、俯角-24°（lowは1,400m/-28°）で地平線と斜面を見せる
+- GSI航空写真とGSI DEM、最大Z15、GPU推定約440MiB
 - 3秒計測60fps、p95 16.7ms、50ms超フレーム0
 
 第一段階として通常表示の`pixelRatio`を0.6へ上げ、2026-09-09にN100のIntel GPU経路
