@@ -249,7 +249,7 @@ HTTP を投げるのは transport の `HogoSync` です。
 
 | | 挙動 |
 |---|---|
-| 上流 | `http://` を「開発・復旧用の平文フォールバック」として**許可**する（`net_client.h` の `makeClient()` の節、`server_sync.cpp:15`）。既定値も `SERVER_BASE_URL "http://192.168.1.10:3000"`（`app_config_defaults.h:16`）。`X-Device-Secret` は**スキームに関わらず無条件で送る**（`server_sync.cpp:227`）。https ゲートが掛かっているのは CF-Access トークンだけ（`server_sync.cpp:241-244`） |
+| 上流 | `http://` を「開発・復旧用の平文フォールバック」として**許可**する（`net_client.h` の `makeClient()` の節、`server_sync.cpp:15`）。既定値も `SERVER_BASE_URL "http://192.168.1.10:3000"`（`app_config_defaults.h:16`。hogo-meter firmware 側の既定値であり、GEOFRAMEの設定値ではありません）。`X-Device-Secret` は**スキームに関わらず無条件で送る**（`server_sync.cpp:227`）。https ゲートが掛かっているのは CF-Access トークンだけ（`server_sync.cpp:241-244`） |
 | Mac | `hogoValidateBaseUrl()` が `http://` を**エラーとして返す**。加えて `addCommonHeaders()` が **https 以外では `X-Device-Secret` を積まない** |
 
 理由:
