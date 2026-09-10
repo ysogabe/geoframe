@@ -67,35 +67,48 @@ DERIV_DIR = DATA_DIR / "derivatives"
 #   将来 os.replace でderivativeへ差し替える実装にした際に跨デバイスで失敗する
 TMP_DIR = DATA_DIR / "tmp"
 CACHE_FILE = DATA_DIR / ".cache.json"      # adsbdb・地理院ジオコーダ結果の永続キャッシュ
+# HTTPの待ち受けポート。キオスク端末は http://<機体IP>:<この値>/ を開く
 PORT = int(os.environ.get("GEOFRAME_PORT", "8080"))
 # 開発時は GEOFRAME_HOST=127.0.0.1 でこの端末だけに限定できる。
 # 実機の家庭内LAN配信は従来互換の 0.0.0.0 を既定とする。
 HOST = os.environ.get("GEOFRAME_HOST", "0.0.0.0")
 EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"} | ({".heic", ".heif"} if HEIC else set())
 DERIV_PX = 2560
+# 同期1サイクルで取り込む写真の枚数。初回のDrive全件取り込みもこの数ずつ進む
 FETCH_PER_CYCLE = int(os.environ.get("GEOFRAME_FETCH_PER_CYCLE", "25"))
 # 品質解析も同期1サイクルで処理量を制限する。未指定時はderivative生成数と揃え、
 # 通常運用では新しく取り込んだ分を同じサイクル内で追いつけるようにする。
 QUALITY_PER_CYCLE = int(os.environ.get("GEOFRAME_QUALITY_PER_CYCLE", str(FETCH_PER_CYCLE)))
 # AI写真選定はDrive同期と別スレッドで少量ずつ進める。無効化する場合だけ0を指定する。
 AI_ENABLED = os.environ.get("GEOFRAME_AI_ENABLED", "1") == "1"
+# AI選定の1サイクルでembeddingする枚数
 AI_EMBED_PER_CYCLE = int(os.environ.get("GEOFRAME_AI_EMBED_PER_CYCLE", "12"))
+# AI選定の1サイクルでGemini比較まで進めるグループ数
 AI_JUDGE_PER_CYCLE = int(os.environ.get("GEOFRAME_AI_JUDGE_PER_CYCLE", "2"))
+# ai_workerが次のサイクルまで待つ秒数。30秒未満は30秒へ切り上げる
 AI_POLL_S = max(30.0, float(os.environ.get("GEOFRAME_AI_POLL_S", "60")))
+# 同一場面候補とみなす撮影時刻の窓（分）。この範囲内の写真だけを類似比較する
 AI_TIME_WINDOW_MIN = float(os.environ.get("GEOFRAME_AI_TIME_WINDOW_MIN", "15"))
+# 同一場面候補とみなすembeddingのcosine類似度しきい値
 AI_SIMILARITY = float(os.environ.get("GEOFRAME_AI_SIMILARITY", "0.82"))
+# 1グループでGemini比較に回す最大枚数（2〜6へクランプ）
 AI_SHORTLIST_MAX = max(2, min(6, int(os.environ.get("GEOFRAME_AI_SHORTLIST_MAX", "6"))))
 # /api/ai/search の流量上限（分あたり）。LAN内の任意ページから連打GETで
 # 全embedding行の毎回フルスキャン（3テーブルJOIN、グローバルDBロック内）を
 # 誘発できるため、tiles.pyのスライディング窓と同型で抑制する。
 AI_SEARCH_PER_MIN = int(os.environ.get("GEOFRAME_AI_SEARCH_PER_MIN", "30"))
 
+# Google Driveサービスアカウント鍵JSONのパス（ROOT＝app/ からの相対）
 DRIVE_KEY = ROOT / os.environ.get("GEOFRAME_DRIVE_KEY", "drive_key.json")
+# 取り込み対象のDriveフォルダ名
 DRIVE_FOLDER = os.environ.get("GEOFRAME_DRIVE_FOLDER", "GeoFrame")
+# Driveの変更確認間隔（分）。値は秒へ換算して使う
 DRIVE_POLL_S = float(os.environ.get("GEOFRAME_DRIVE_POLL_MIN", "10")) * 60
 DRIVE_MIMES = ("image/jpeg", "image/png", "image/heic", "image/heif", "image/tiff")
 
+# 位置推定の錨に使う撮影時刻の窓（分）。この範囲内の位置つき写真から推定する
 INFER_WINDOW_S = float(os.environ.get("GEOFRAME_INFER_MIN", "15")) * 60
+# カメラ時計のずれ補正（分）。撮影時刻が恒常的にずれる機体で調整する
 INFER_OFFSET_S = float(os.environ.get("GEOFRAME_INFER_OFFSET_MIN", "0")) * 60
 # 位置推定の段階窓（秒）。近い窓ほど信頼できる推定。
 # 1段目は従来どおり GEOFRAME_INFER_MIN で調整可能、2段目以降を固定で足している。
@@ -104,6 +117,7 @@ INFER_OFFSET_S = float(os.environ.get("GEOFRAME_INFER_OFFSET_MIN", "0")) * 60
 # /admin で内訳を確認できる（loc_source は 'inferred' のまま＝表示側の互換を壊さない）。
 INFER_WINDOWS_S = sorted({INFER_WINDOW_S, 2 * 3600, 12 * 3600})
 
+# 航空機情報の取得先（readsb/tar1090互換のaircraft.json）
 ADSB_URL = os.environ.get("GEOFRAME_ADSB_URL",
                           "https://ads-b.dam-lab.work/tar1090/data/aircraft.json")
 ADSB_RECEIVER_URL = ADSB_URL.rsplit("/", 1)[0] + "/receiver.json"
@@ -203,6 +217,7 @@ TILE_FETCH_PER_MIN = int(os.environ.get("GEOFRAME_TILE_FETCH_PER_MIN", "240"))
 
 # Home Assistant連携（.envのHOME_ASSISTANT_API_KEY または GEOFRAME_HA_TOKEN）
 HA_URL = os.environ.get("GEOFRAME_HA_URL", "http://homeassistant.local:8123").rstrip("/")
+# HAの長期アクセストークン。GEOFRAME_HA_TOKEN を優先し、無ければ HOME_ASSISTANT_API_KEY を読む
 HA_TOKEN = os.environ.get("GEOFRAME_HA_TOKEN") or os.environ.get("HOME_ASSISTANT_API_KEY", "")
 HA_MOTION = os.environ.get("GEOFRAME_HA_MOTION_ENTITY", "")   # 例: binary_sensor.display_motion
 IDLE_MIN = float(os.environ.get("GEOFRAME_IDLE_MIN", "10"))   # 無人この分数で画面スリープ
@@ -228,6 +243,7 @@ HA_SCREEN_DECAY_MIN = float(os.environ.get("GEOFRAME_HA_SCREEN_DECAY_MIN", "5"))
 # ※標準出力の on/off だけを見る。あのスクリプトは正常な「off」判定でも exit 1 を
 #   返す仕様なので、終了コードで成否を判定してはいけない
 SCREEN_STATUS_CMD = os.environ.get("GEOFRAME_SCREEN_STATUS_CMD", "")
+# 画面の意図と実機状態を照合する間隔（秒）
 HA_SCREEN_RECONCILE_SEC = float(os.environ.get("GEOFRAME_HA_SCREEN_RECONCILE_SEC", "90"))
 
 # 気象庁（無認証）。GEOFRAME_JMA_AREA: 予報区コード（既定120000=千葉県）

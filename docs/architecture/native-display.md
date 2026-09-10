@@ -1,5 +1,12 @@
 # GEOFRAMEアンビエント表示 — 企画案・概要設計
 
+> [!NOTE]
+> これは2026-07-30時点の、実装前の企画・概要設計です。本文の `/api/device/v1/*` は設計案であり、
+> 現在のコード（`app/`・`native-display/`）には実装されていません。実装済みクライアントの契約は
+> [`native-display/docs/CORE_CONTRACTS.md`](../../native-display/docs/CORE_CONTRACTS.md)、ビルド手順と
+> 移植性のゲートは [`native-display/docs/PORTABILITY.md`](../../native-display/docs/PORTABILITY.md) を
+> 参照してください。本文中の `01-MLIT-Project` はリポジトリの旧名です。
+
 作成日: 2026-07-30
 対象リポジトリ: `01-MLIT-Project`（スマートディスプレイ）
 先行実装環境: macOS + SDL2

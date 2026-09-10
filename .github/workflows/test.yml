@@ -45,7 +45,10 @@ jobs:
           node tests/js/navara-build-integrity.test.js
 
       - name: Markdown相対リンク検査
-        run: python tools/check_markdown_links.py
+        run: python3 tools/check_markdown_links.py
+
+      - name: 設定リファレンスの同期検査
+        run: python3 tools/gen_env_reference.py --check
 
   mac-wkwebview:
     name: macOS WKWebView

@@ -12,6 +12,7 @@
 | [ネイティブ表示設計](architecture/native-display.md) | 参照 | C++/SDL2クライアントの設計 |
 | [Home Assistant連携](integrations/home-assistant.md) | 現行 | 安全な連携設定 |
 | [地理空間MCP](integrations/geospatial-mcp.md) | 参照 | 国土交通省APIとMCPの調査記録 |
+| [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（`config.py`から自動生成） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、キオスク、更新、バックアップ |
 
 ## ディレクトリ構成
@@ -33,6 +34,13 @@
 書き換えず、置き換える新しいADRを追加します。
 
 - [ADR 0001: 旅行ブログ生成](decisions/0001-travel-blog-generation.md)
+
+### `reference/` — リファレンス
+
+コードから機械的に導ける一覧です。手で書き写さず、生成コマンドで更新します。生成結果が
+古い場合はCI（`tools/gen_env_reference.py --check`）が失敗します。
+
+- [設定リファレンス（環境変数）](reference/configuration.md) — `app/geoframe/config.py` から生成
 
 ### `integrations/` — 外部連携
 
