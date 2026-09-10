@@ -17,7 +17,7 @@
 （`ROOT` は `app/`、`DATA_DIR` はデータルートを指します）。定義順（＝機能のまとまり順）に
 並べています。外部連携を有効にする手順は [外部連携](../integrations/) を参照してください。
 
-- `GEOFRAME_DATA_DIR`（`config.py`: `DATA_DIR`） — 既定値 `ROOT / "var"`。ソース（geoframe/ static/ vendor/）は ROOT 配下、書き換わるデータ （catalog.db・derivatives/・photos/・各種キャッシュ）は DATA_DIR 配下に置く。本番では GEOFRAME_DATA_DIR=/var/lib/geoframe のようにデータだけ別の場所へ移せる。※.env の読み込みは ROOT 側のまま。DATA_DIR は .env で指定できる必要があり、 .env を DATA_DIR 配下に置くと「読むために DATA_DIR が要る」鶏卵になるため。※derivatives/ photos/ blog_exports/ というディレクトリ名は変更しないこと。DBの display 列が「DATA_DIR/display＝実ファイル」かつ「/display＝配信URL」の 二重の意味を持っており、名前を変えると既存の全行が解決不能になる。
+- `GEOFRAME_DATA_DIR`（`config.py`: `DATA_DIR`） — 既定値 なし（未設定時は `ROOT / "var"`）。ソース（geoframe/ static/ vendor/）は ROOT 配下、書き換わるデータ （catalog.db・derivatives/・photos/・各種キャッシュ）は DATA_DIR 配下に置く。本番では GEOFRAME_DATA_DIR=/var/lib/geoframe のようにデータだけ別の場所へ移せる。※.env の読み込みは ROOT 側のまま。DATA_DIR は .env で指定できる必要があり、 .env を DATA_DIR 配下に置くと「読むために DATA_DIR が要る」鶏卵になるため。※derivatives/ photos/ blog_exports/ というディレクトリ名は変更しないこと。DBの display 列が「DATA_DIR/display＝実ファイル」かつ「/display＝配信URL」の 二重の意味を持っており、名前を変えると既存の全行が解決不能になる。
 - `GEOFRAME_PHOTOS_DIR`（`config.py`: `PHOTOS_DIR`） — 既定値 `photos`。※PHOTOS_DIR は DATA_DIR 配下であること（drive.py が relative_to(DATA_DIR) で DBに入れる相対パスを作るため、外に出すと索引できない）
 - `GEOFRAME_PORT`（`config.py`: `PORT`） — 既定値 `8080`。HTTPの待ち受けポート。キオスク端末は http://<機体IP>:<この値>/ を開く
 - `GEOFRAME_HOST`（`config.py`: `HOST`） — 既定値 `0.0.0.0`。開発時は GEOFRAME_HOST=127.0.0.1 でこの端末だけに限定できる。実機の家庭内LAN配信は従来互換の 0.0.0.0 を既定とする。
@@ -42,8 +42,8 @@
 - `GEOFRAME_TILE_UA`（`config.py`: `TILE_UA`） — 既定値 `GeoFrame/0.1 (personal photo frame)`。OSM tile usage policy 準拠に必須。実運用では連絡先入り（例 "GeoFrame/0.1 (me@example.com)"）を GEOFRAME_TILE_UA に設定しておくこと。既定値のままだとブロックされうる
 - `GEOFRAME_TILE_CACHE_MAX_MB`（`config.py`: `TILE_CACHE_MAX_MB`） — 既定値 `16384`。3D PHOTO JOURNEYの高ズーム航空写真を保持できるよう、全レイヤー共有で16GiB。実機で容量を抑えたい場合は GEOFRAME_TILE_CACHE_MAX_MB で上書きする。
 - `GEOFRAME_TILE_FETCH_PER_MIN`（`config.py`: `TILE_FETCH_PER_MIN`） — 既定値 `240`。上流フェッチ（＝キャッシュミス）だけを対象にした流量上限（枚/分）。キャッシュヒットは無制限。/tiles/ は無認証なので、LAN内の任意のWebページが <img src="http://<frame-ip>:8080/tiles/…"> を大量に並べるだけで上流を叩かせられる（クロスオリジンの<img>はSOPで止まらない）。上限に達したら上流へ行かず透明PNGを返すことで、OSM tile usage policy上の bulk downloading とみなされて自宅グローバルIPがBANされる事態とディスク枯渇を防ぐ。既定240の根拠: コールド起動時の1画面が実測116枚。通常の初回描画＋パン1回分に 約2倍の余裕を持たせた値（gsiの上流同時接続4でも詰まらない）。
-- `GEOFRAME_HA_URL`（`config.py`: `HA_URL`） — 既定値 `http://homeassistant.local:8123`。Home Assistant連携（.envのHOME_ASSISTANT_API_KEY または GEOFRAME_HA_TOKEN）
-- `GEOFRAME_HA_TOKEN`（`config.py`: `HA_TOKEN`） — 既定値 `HOME_ASSISTANT_API_KEY`。HAの長期アクセストークン。GEOFRAME_HA_TOKEN を優先し、無ければ HOME_ASSISTANT_API_KEY を読む
+- `GEOFRAME_HA_URL`（`config.py`: `HA_URL`） — 既定値 `http://homeassistant.local:8123`。Home Assistant連携（.envのHOME_ASSISTANT_API_KEY または GEOFRAME_HA_TOKEN）※平文のままホスト名を指定した場合（下の既定値の homeassistant.local など）は、 mDNS/DNS応答を偽装されてトークンを盗まれる経路になるため起動時に拒否し、連携を開始しない。https か、名前解決を伴わないIPリテラル（127.0.0.1 等）なら許可する
+- `GEOFRAME_HA_TOKEN`（`config.py`: `HA_TOKEN`） — 既定値 なし（未設定時は `HOME_ASSISTANT_API_KEY`）。HAの長期アクセストークン。GEOFRAME_HA_TOKEN を優先し、無ければ HOME_ASSISTANT_API_KEY を読む
 - `HOME_ASSISTANT_API_KEY`（`config.py`: `HA_TOKEN`） — 既定値 （空文字）。HAの長期アクセストークン。GEOFRAME_HA_TOKEN を優先し、無ければ HOME_ASSISTANT_API_KEY を読む
 - `GEOFRAME_HA_MOTION_ENTITY`（`config.py`: `HA_MOTION`） — 既定値 （空文字）。例: binary_sensor.display_motion
 - `GEOFRAME_IDLE_MIN`（`config.py`: `IDLE_MIN`） — 既定値 `10`。無人この分数で画面スリープ
@@ -57,3 +57,13 @@
 - `GEOFRAME_JMA_AREA`（`config.py`: `JMA_AREA`） — 既定値 `120000`。気象庁（無認証）。GEOFRAME_JMA_AREA: 予報区コード（既定120000=千葉県）
 - `GEOFRAME_DEBUG_API`（`config.py`: `DEBUG_API`） — 既定値 （空文字）。開発用API（/api/ha/entities・/api/mlit/probe）のガード。既定は無効
 - `GEOFRAME_ALLOWED_HOSTS`（`config.py`: `ALLOWED_HOST_NAMES`） — 既定値 （空文字）。許可するホスト名。IPリテラル宛（192.0.2.7等）は_host_ok側で無条件に許可するため、 ここには名前だけを入れる。GEOFRAME_ALLOWED_HOSTS はTailscaleや固定DNS名で 運用する場合の追加指定用（例: GEOFRAME_ALLOWED_HOSTS=geoframe.local:8080,frame.lan）
+
+## `config.py` 以外が読む環境変数
+
+以下は各モジュールが直接読みます（`config.py` を経由しないため上の一覧には現れません）。
+設定方法と既定の挙動は、それぞれの変数の説明先を参照してください。
+
+- `GOOGLE_APPLICATION_CREDENTIALS` — `ai_search.py`
+- `GOOGLE_CLOUD_LOCATION` — `ai_search.py`
+- `GOOGLE_CLOUD_PROJECT` — `ai_search.py`
+- `GOOGLE_CLOUD_PROJECT_ID` — `ai_search.py`

@@ -39,10 +39,10 @@ jobs:
       - name: JavaScriptテスト
         working-directory: app
         run: |
-          node tests/js/scheduler-quality.test.js
-          node tests/js/right-column-layout.test.js
-          node tests/js/photo-journey-lite.test.js
-          node tests/js/navara-build-integrity.test.js
+          for t in tests/js/*.test.js; do
+            echo "== $t"
+            node "$t" || exit 1
+          done
 
       - name: Markdown相対リンク検査
         run: python3 tools/check_markdown_links.py

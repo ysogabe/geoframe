@@ -18,6 +18,10 @@ node tests/js/photo-journey-reveal.test.js
 node tests/js/navara-build-integrity.test.js
 ```
 
+環境変数を追加・変更した場合は、リポジトリルートで
+`python3 tools/gen_env_reference.py`を実行して[設定リファレンス](docs/reference/configuration.md)を
+更新してください（CIが`--check`で同期を検査します）。
+
 文書を追加・移動した場合は、リポジトリルートで
 `python3 tools/check_markdown_links.py`を実行し、[ドキュメント索引](docs/README.md)も
 同じ変更で更新してください。

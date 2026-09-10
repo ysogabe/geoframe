@@ -1,7 +1,8 @@
 # GEOFRAMEアンビエント表示 — 企画案・概要設計
 
 > [!NOTE]
-> これは2026-07-30時点の、実装前の企画・概要設計です。本文の `/api/device/v1/*` は設計案であり、
+> 2026-07-30時点の、実装前の企画・概要設計を保存した**アーカイブ**です。本文の
+> `/api/device/v1/*` は設計案であり、
 > 現在のコード（`app/`・`native-display/`）には実装されていません。実装済みクライアントの契約は
 > [`native-display/docs/CORE_CONTRACTS.md`](../../native-display/docs/CORE_CONTRACTS.md)、ビルド手順と
 > 移植性のゲートは [`native-display/docs/PORTABILITY.md`](../../native-display/docs/PORTABILITY.md) を
@@ -462,7 +463,7 @@ thread-safe queueでメインスレッドへ渡す。Tab5では上流コード�
 │   └── vendor/
 │       └── hogo_common/               # 上流未改変スナップショット
 └── docs/
-    └── architecture/native-display.md
+    └── archive/native-display-concept.md
 ```
 
 Mac版はSDL2、SDL2_image、SDL2_ttf、libcurlを使用する。JSONライブラリはhost adapter内部に閉じ込め、

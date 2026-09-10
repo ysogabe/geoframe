@@ -216,6 +216,9 @@ TILE_CACHE_MAX_MB = int(os.environ.get("GEOFRAME_TILE_CACHE_MAX_MB", "16384"))
 TILE_FETCH_PER_MIN = int(os.environ.get("GEOFRAME_TILE_FETCH_PER_MIN", "240"))
 
 # Home Assistant連携（.envのHOME_ASSISTANT_API_KEY または GEOFRAME_HA_TOKEN）
+# ※平文のままホスト名を指定した場合（下の既定値の homeassistant.local など）は、
+#   mDNS/DNS応答を偽装されてトークンを盗まれる経路になるため起動時に拒否し、連携を開始しない。
+#   https か、名前解決を伴わないIPリテラル（127.0.0.1 等）なら許可する
 HA_URL = os.environ.get("GEOFRAME_HA_URL", "http://homeassistant.local:8123").rstrip("/")
 # HAの長期アクセストークン。GEOFRAME_HA_TOKEN を優先し、無ければ HOME_ASSISTANT_API_KEY を読む
 HA_TOKEN = os.environ.get("GEOFRAME_HA_TOKEN") or os.environ.get("HOME_ASSISTANT_API_KEY", "")
