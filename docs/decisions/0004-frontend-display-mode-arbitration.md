@@ -47,7 +47,7 @@ SLEEP（画面off中は何も描かない）
 
 ## 実装状況（2026-08-31）
 
-3D PHOTO JOURNEY Lite（[[3d-photo-journey-lite]]、`docs/roadmap/3d-photo-journey-lite.md`）
+3D PHOTO JOURNEY Lite（[[3d-photo-journey-lite]]、`docs/architecture/3d-photo-journey-lite.md`）
 の実装に合わせて、本ADRの決定事項を着地させた。
 
 - `app/static/js/modes.js` を新設し、`setMode(label)` を `#mode` の唯一の writer とした。

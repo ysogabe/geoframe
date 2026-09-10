@@ -9,6 +9,7 @@
 |---|---|---|
 | [写真パイプライン](architecture/photo-pipeline.md) | 現行 | 写真の取り込みからUI表示までの流れ |
 | [写真カタログ](architecture/photo-catalog.md) | 参照 | SQLiteとメタデータ分離の設計・設計履歴 |
+| [3Dフォトジャーニー](architecture/3d-photo-journey-lite.md) | 現行 | Navara 3D表示の実装契約と調整値 |
 | [ネイティブ表示設計](architecture/native-display.md) | 参照 | C++/SDL2クライアントの設計 |
 | [Home Assistant連携](integrations/home-assistant.md) | 現行 | 安全な連携設定 |
 | [地理空間MCP](integrations/geospatial-mcp.md) | 参照 | 国土交通省APIとMCPの調査記録 |
@@ -23,7 +24,9 @@
 
 - [写真カタログとメタデータ分離](architecture/photo-catalog.md)
 - [現行の写真パイプライン](architecture/photo-pipeline.md)
-- [ネイティブ表示設計](architecture/native-display.md)
+- [3D PHOTO JOURNEY Lite（Navara）の実装契約](architecture/3d-photo-journey-lite.md)
+- [3D PHOTO JOURNEY の奥行きとサイバー地形](architecture/3d-depth-and-cyber-display.md)
+- [ネイティブ表示設計（実装前の企画案）](architecture/native-display.md)
 
 ネイティブクライアント固有の詳細な契約は
 [`native-display/docs/`](../native-display/docs/)にあります。
@@ -56,12 +59,11 @@
 
 ### `roadmap/` — 検討事項
 
-実装を約束するものではない、将来案や検討メモです。
+実装を約束するものではない、将来案や検討メモです。実装に到達した文書は、現行仕様として
+`architecture/`へ移します。
 
 - [Google連携と追加表示コンテンツ](roadmap/content-integrations.md)
 - [表示モード拡張の実装プラン（Wave構成）](roadmap/display-mode-expansion-plan.md)
-- [3D PHOTO JOURNEY Lite（Navara）実装計画と設計メモ](roadmap/3d-photo-journey-lite.md)
-- [3Dの奥行き改善とサイバー表示の比較](roadmap/3d-depth-and-cyber-display.md)
 
 ### `archive/` — 履歴資料
 
