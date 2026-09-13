@@ -8,6 +8,7 @@
 - 日付: 2026-09-13
 - 状態: 検討ベースライン（未採用・作業開始前）
 - 対象ハード: Raspberry Pi 400（4GB、USB3ブート想定）
+- 構築手順: [`README_RPI400.md`](../../deploy/kiosk/README_RPI400.md)（OS導入〜常設化〜負荷測定）
 - 関連: [`rpi-cog-display-design.md`](rpi-cog-display-design.md)（Pi400単体でサーバー+表示を持つ案・アーカイブ）、
   [ADR 0002](../decisions/0002-screen-power-override-via-ha.md) / [0003](../decisions/0003-screen-control-state-machine.md) /
   [0004](../decisions/0004-frontend-display-mode-arbitration.md) / [0005](../decisions/0005-agent-status-via-ha-bus.md) /

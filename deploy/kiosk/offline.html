@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GEOFRAME — offline</title>
+<!--
+  offline.html — サーバーに到達できないときに表示ノードが単独で出す画面
+
+  目的:
+    「サーバーを別機体へ移す」構成では、その機体の再起動やLAN断でキオスクの
+    ページ自体が読み込めなくなる。真っ黒／ブラウザのエラーページだと
+    「壊れた」と区別が付かないため、時計と最後の更新時刻だけを出す。
+
+  置き方:
+    表示ノード側で静的配信する（例: python3 -m http.server 8099 --directory /opt/geoframe/deploy/kiosk）
+    そのうえで /etc/geoframe/kiosk.env に
+      GEOFRAME_KIOSK_OFFLINE_URL=http://127.0.0.1:8099/offline.html
+    を設定する。
+
+  注意:
+    このファイルは外部リソースを一切読まない（オフラインで完結させるため）。
+-->
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #05080f; color: #cfe6ff;
+               font-family: ui-monospace, "Noto Sans Mono CJK JP", monospace; }
+  .wrap { height: 100%; display: flex; flex-direction: column;
+          align-items: center; justify-content: center; gap: 1.2rem; }
+  .clock { font-size: 18vmin; letter-spacing: 0.04em; text-shadow: 0 0 24px #1e6fff66; }
+  .date  { font-size: 4vmin; opacity: 0.75; }
+  .note  { position: fixed; bottom: 3vh; font-size: 2.2vmin; text-align: center;
+           opacity: 0.65; line-height: 1.7; }
+  .dot { display: inline-block; width: 1.1vmin; height: 1.1vmin; border-radius: 50%;
+         background: #ff9d3c; box-shadow: 0 0 12px #ff9d3c; margin-right: 0.8vmin; }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="clock" id="clock">--:--</div>
+    <div class="date" id="date">----</div>
+  </div>
+  <div class="note">
+    <div><span class="dot"></span>GEOFRAMEサーバーに接続できません（表示ノードは動作中）</div>
+    <div id="since"></div>
+    <div>復旧すると自動で通常表示に戻ります</div>
+  </div>
+<script>
+  const pad = (n) => String(n).padStart(2, "0");
+  function tick() {
+    const d = new Date();
+    clock.textContent = pad(d.getHours()) + ":" + pad(d.getMinutes());
+    date.textContent = d.getFullYear() + "-" + pad(d.getMonth() + 1) + "-" + pad(d.getDate())
+      + " (" + "日月火水木金土"[d.getDay()] + ")";
+  }
+  tick(); setInterval(tick, 5000);
+  // この画面を出した時刻を記録（次回以降の切り替え判断の参考）
+  const k = "geoframe.offline.since";
+  if (!sessionStorage.getItem(k)) sessionStorage.setItem(k, String(Date.now()));
+  since.textContent = "オフライン表示 開始: " +
+    new Date(Number(sessionStorage.getItem(k))).toLocaleString("ja-JP");
+</script>
+</body>
+</html>
