@@ -10,7 +10,7 @@
  * Issue #8 の根本対応（#legend削除・#intelコンパクト化によるROOM ENV表示余白の確保）
  * を app.css に実施したため、そのラチェットは撤去し、INV-1（表示容量>=5）/INV-2
  * （クリアランス>=8px）はPASSの直接assertへ、旧INV-3/INV-5（#legendとの重なり回避）
- * は#legend自体の削除に伴い#ticker基準の構造ガードへ置き換えた。
+ * は#legend自体の削除に伴い撤去した。
  */
 const assert = require('assert');
 const fs = require('fs');
@@ -423,8 +423,7 @@ const ALL_TUNABLE_METRICS = { ...MEASURED_KIOSK };
 // Issue #8根本対応によりkiosk/INV-1・kiosk/INV-2・desktop/INV-5の3件はいずれも
 // 解消したため空にした（旧3エントリはPR履歴を参照）。INV-1/INV-2は下記で
 // verdict==='PASS'を直接assertする「本物の不変条件」に格上げし、旧INV-3/INV-5
-// （#legendとの重なり回避）は#legend自体の削除に伴い#ticker基準の構造ガードに
-// 置き換えた（後述）。新たなギャップが生じた場合はここに追加する。
+// （#legendとの重なり回避）も撤去した。新たなギャップが生じた場合はここに追加する。
 //
 // 注: checkRatchet関数と下方のループ内 `else if (EXPECTED_GAPS[key])` 分岐は、
 // EXPECTED_GAPSが空である限り到達しないが、将来また追加されたときのため意図的に
@@ -713,7 +712,7 @@ function verdictInv2(g) {
   return g.clearance >= 8 ? 'PASS' : 'FAIL';
 }
 // 旧verdictInv3/verdictInv5（#legendとの重なり回避）はIssue #8根本対応での
-// #legend削除に伴い撤去した。代わりに#ticker基準の構造ガード（下記）で置き換える。
+// #legend削除に伴い撤去した。
 
 const INV_DEFS = {
   'INV-1': { verdictFn: verdictInv1, valueFn: g => g.capacity, direction: 'biggerIsBetter' },
@@ -861,7 +860,7 @@ console.table(table);
 
 // ============================================================
 // 終了コード決定の第一段階: blockingFailures（ラチェット違反・未登録FAIL）を、
-// INV-1/INV-2の直接assertや#ticker構造ガードより先に判定する。順序が逆だと、
+// INV-1/INV-2の直接assertより先に判定する。順序が逆だと、
 // 本物のCSS退行によるラチェット違反があっても「パーサまたは高さモデルに誤りが
 // ある可能性が高い」という誤誘導メッセージだけが出て、どの層が原因か分からなく
 // なる（実際に起きた欠陥。旧版ではこの判定対象はEXPECTED_NOMINALとの突き合わせ
@@ -893,33 +892,6 @@ assert.strictEqual(
     `verdict=${verdictInv2(nominalGeom.kiosk)} (clearance=${nominalGeom.kiosk.clearance})`
 );
 
-// ============================================================
-// 旧INV-3/INV-5（#envpanelが下のパネル(#legend)と重ならない）は、#legend削除に
-// 伴い「下のパネル」が#ticker（常時表示、bottom:0、height:30pxのリテラル）のみに
-// なった。#envpanelのmax-heightはenvpanel-bottom-marginを差し引いて算出される
-// ため（calc(100vh - intel-top - envpanel-gap - envpanel-bottom-margin)）、
-// envpanel-bottom-margin >= tickerHeightPx である限り構造的に恒真になる。
-// 幾何計算ではなく単純な構造ガードに格下げする。
-// ============================================================
-
-const tickerDecls = declMap(must(findBlock('#ticker', 'default'), '#ticker の宣言ブロックが見つからない').body);
-const tickerHeightPx = evaluate(
-  must(tickerDecls.get('height'), '#ticker に height が無い'),
-  { vars: new Map(), viewport: PROFILES.kiosk.viewport }
-); // #ticker の height はリテラル値でvar()/vw/vhを含まないためctxはダミーでよい
-
-for (const profile of Object.keys(PROFILES)) {
-  const vars = effectiveVars(profile);
-  const marginPx = evaluate(
-    must(vars.get('--envpanel-bottom-margin'), `${profile}: --envpanel-bottom-margin が :root に無い`),
-    { vars, viewport: PROFILES[profile].viewport }
-  );
-  assert.ok(
-    marginPx >= tickerHeightPx,
-    `[構造ガード] ${profile}: --envpanel-bottom-margin(${marginPx}px) が ` +
-      `#ticker の高さ(${tickerHeightPx}px)未満。#envpanelが#tickerと重なる可能性がある`
-  );
-}
 assert.strictEqual(
   Math.round(nominalGeom.desktop.envMaxHeight),
   665,

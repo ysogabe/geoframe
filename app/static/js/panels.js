@@ -1,7 +1,7 @@
 /* ============================================================
-   panels.js — 時計 / ティッカー / イベントカード / 室内環境 / 在不在 /
+   panels.js — 時計 / イベントカード / 室内環境 / 在不在 /
                TRIP REPLAY / TRAVEL STATS の各パネル
-   ※読み込み順が契約: events.js の後（ENV を参照する buildTicker を含むため）
+   ※読み込み順が契約: events.js の後
    宣言する主なグローバル: DAYS, buildTicker, eventCard, ENV_LABELS, fmtEnvVal,
                            pollRoomEnv, sleeping, nightMode, isNightByClock,
                            applyNight, pollPresence, startLivePanels, lastIntroTrip,
@@ -27,45 +27,9 @@ setInterval(()=>{ const d=new Date(), z=n=>String(n).padStart(2,'0');
 },250);
 
 
-/* ==== ティッカー ====
-   実写真では擬似値（p.intel の乱数生成分）を一切流さない。
-   不動産情報ライブラリの実測値は loadIntel が p.real に載せた分だけを使い、
-   未取得の写真は旅名・撮影地・撮影日など実データ由来の文言に差し替える */
-function buildTicker(){
-  const tripLabel = t => {
-    const tr = STATS && STATS.trips && STATS.trips.find(x=>x.id===t);
-    return tr ? tr.label : '';
-  };
-  const parts=PHOTOS.slice(0,30).map(p=>{
-    const head=`<b>▸ ${p.title}</b> ${p.lat.toFixed(3)}N ${p.lon.toFixed(3)}E`;
-    if(usingMock)   // デモ用モックデータはこれまでどおり
-      return `${head} — 用途:${p.intel.youto} / 地価:${p.intel.price.toLocaleString()}円/㎡ / 浸水:${p.intel.flood}`;
-    const bits=[], r=p.real;
-    if(r){
-      if(r.youto) bits.push(`用途:${r.youto}`);
-      if(r.price) bits.push(`地価:${r.price}`);
-      if(r.flood) bits.push(`浸水:${r.flood}`);
-    }
-    if(!bits.length){          // 実測値がまだ無い写真は実データだけで組む
-      const trip=(p.trip!==undefined)?tripLabel(p.trip):'';
-      if(trip) bits.push(trip);
-      const loc=[p.pref,p.city,p.place].filter(Boolean).join(' ');
-      if(loc) bits.push(loc);
-      if(p.realElev) bits.push(`標高:${p.intel.elev}m`);
-      if(p.time) bits.push(`撮影:${p.time}`);
-    }
-    return bits.length ? `${head} — ${bits.join(' / ')}` : head;
-  });
-  const note = usingMock
-    ? '[ALL VALUES = MOCK DATA — server.py起動で実写真＋地理院実データに切替]'
-    : '[標高・地名 = 地理院実データ / 用途地域・地価・浸水 = 不動産情報ライブラリ実データ（取得済み地点のみ）]';
-  let env='';
-  if(ENV&&ENV.weather) env += ` /// <b>▸ 天気(${ENV.weather.area})</b> ${ENV.weather.text}${ENV.weather.pop!=null?' ☂'+ENV.weather.pop+'%':''}`;
-  if(ENV&&ENV.quakes&&ENV.quakes.length){ const q=ENV.quakes[0];
-    env += ` /// <b>▸ 直近地震</b> ${q.time} M${q.mag}${q.maxi?' 震度'+q.maxi:''} ${q.place}`; }
-  document.getElementById('ticker-inner').innerHTML =
-    parts.join('&nbsp;&nbsp;&nbsp;///&nbsp;&nbsp;&nbsp;')+'&nbsp;&nbsp;&nbsp;///&nbsp;&nbsp;&nbsp;'+note+env;
-}
+// 既存の起動経路からの呼び出しを安全に受ける互換フック。
+// 下端表示とそのデータ生成は廃止済みのため、何もしない。
+function buildTicker(){}
 
 function eventCard(head, imgHtml, title, exif){
   clearScatter();   // イベント表示中は散らし写真を片付ける
@@ -193,7 +157,7 @@ const STATS_EVERY = 10;   // 写真Nカットごとに統計画面を1カット�
 let STATS = null;
 async function loadStats(){
   try{ const r = await fetch('/api/stats');
-    if(r.ok){ STATS = await r.json(); buildTicker(); }   // 旅名をティッカーに反映する
+    if(r.ok){ STATS = await r.json(); }
   }catch(e){}
 }
 /* 統計カット／週間予報カット共通のカメラ演出（日本全体をz4.2で俯瞰する）。
