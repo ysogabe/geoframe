@@ -14,7 +14,7 @@
     --fs-2xs:9px;  --fs-xs:10px;  --fs-sm:11px;  --fs-md:13px;
     --fs-lg:15px;  --fs-xl:20px;  --fs-2xl:26px; --fs-hero:44px;
     --panel-w:330px; --intel-top:96px; --envpanel-gap:269px; --alertbar-top:76px;
-    --envpanel-bottom-margin:50px; /* #ticker(高さ30px)との重なり回避 */
+    --envpanel-bottom-margin:50px; /* 下端側の余白。表示レイアウト互換のため値は維持 */
   }
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--ink);font-family:var(--jp)}
@@ -95,13 +95,6 @@
     max-height:calc(100vh - var(--intel-top) - var(--envpanel-gap) - var(--envpanel-bottom-margin));overflow-y:auto}
   #envpanel .in-head{color:var(--green);border-bottom-color:rgba(62,240,140,.2)}
   #envpanel .tile .v.warn2{color:var(--amber);text-shadow:0 0 10px rgba(255,179,0,.5)}
-
-  /* ==== ティッカー（最下部） ==== */
-  #ticker{position:absolute;left:0;right:0;bottom:0;z-index:9;height:30px;display:flex;align-items:center;overflow:hidden;
-    background:linear-gradient(180deg,transparent,rgba(5,8,15,.9));border-top:1px solid rgba(0,229,255,.15)}
-  #ticker .inner{white-space:nowrap;font-family:var(--mono);font-size:11px;color:var(--ink-2);letter-spacing:.12em;animation:tick 55s linear infinite;padding-left:100%}
-  @keyframes tick{to{transform:translateX(-100%)}}
-  #ticker b{color:var(--cyan);font-weight:400}
 
   /* ==== アクティブマーカー（DOMオーバーレイ / フィルタ非適用） ====
      リングはscaleで拡大する（width/heightアニメは親ボックスより大きくなると
@@ -297,11 +290,10 @@
     :root{
       --fs-xs:16px; --fs-sm:20px; --fs-md:22px; --fs-lg:26px; --fs-2xl:56px;
       --panel-w:420px; --intel-top:165px; --envpanel-gap:480px; --alertbar-top:130px;
-      --envpanel-bottom-margin:44px; /* #ticker(bottom:0,height:30px)との重なりを避ける値。
+      --envpanel-bottom-margin:44px; /* 下端側の余白。表示レイアウト互換のため値は維持。
         #intelのコンパクト化と#legend削除(Issue #8根本対応)により、#envpanelはrow表示の
         ままHAセンサー5個を余裕をもって収容できる。旧値(160px)は#legendとの重なり
-        回避用だったが、#legend削除に伴いticker基準に置き換えた。
-        導出: tickerHeight(30px) + slack(14px) = 44px */
+        回避用だったが、#legend削除後も既存値を維持する。 */
       --fs-xl:32px;
       --fs-2xs:14px; --fs-hero:68px; /* 未消費・将来拡張用 */
     }
