@@ -240,6 +240,13 @@
   body.low #hud-root{animation:none}
   body.low #marker .ring:nth-child(2), body.low #marker .ring:nth-child(3){display:none}
   body.low .fx-grid{background-size:128px 128px}
+  /* backdrop-filter は V3D(VC6) で全画面のオフスクリーン合成を要求し高コスト。
+     実測（Pi400 / 1920x1080 / 45秒窓×3）: 地図 `/`=11.5fps、`/?low`=44.0fps、offline.html（床）=60.0fps
+     CSS注入A/B（フラット時・30秒×2）: 現状 47.4/44.0 → backdrop全廃 49.1/49.9
+     よって低電力モードではぼかしを捨てて不透明背景で代替する（既定モードの見た目は不変） */
+  body.low #photocard, body.low #intel, body.low #envpanel,
+  body.low #statspanel, body.low #airpanel, body.low #hzlegend{
+    background:rgba(8,14,26,.96);backdrop-filter:none}
 
   /* ==== ナイトモード（Home Assistant sun.sun 連動 / 取れなければ22時〜6時） ====
      寝室に置く前提なので画面全体を減光する。やりすぎると日没後に何も見えなくなるので
