@@ -41,8 +41,9 @@ function start(){
   markShown(idx);
   showPhoto(idx); syncMarker();
   let tick=0, interludeTurn=0;
-  setInterval(()=>{ if(sleeping) return;                // 不在スリープ中は巡回停止
-    if(Date.now()<eventUntil) return;                   // イベント演出中は巡回を一時停止
+  setInterval(()=>{
+    // The claim API is the only arbitration point for delayed work.
+    if(typeof modeClaimIsTop === 'function' && !modeClaimIsTop('ambient')) return;
     tick++;
     if(tick % STATS_EVERY === 0){        // 定期的にインタールードを挟む（キューは消費しない）
       // 種別は INTERLUDE_KINDS を一巡（STATS → WEEKLY → OTD）。

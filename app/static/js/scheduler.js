@@ -86,7 +86,9 @@ function goTo(i){
   map.flyTo({center:[p.lon,p.lat], zoom:gz,
              pitch:LOW_POWER?0:45+(i%3)*6, bearing:LOW_POWER?0:-30+(i*23)%60,
              duration:FLY_MS, curve:LOW_POWER?1.2:1.6, essential:true});
-  setTimeout(()=>{ if(Date.now()<eventUntil) return;   // イベント演出中は写真カードを奪わない
+  setTimeout(()=>{
+    if(typeof modeClaimIsTop === 'function' && !modeClaimIsTop('ambient')) return;
     setMode('PHOTO JOURNEY');
-    showPhoto(i); }, FLY_MS*0.82);
+    showPhoto(i);
+  }, FLY_MS*0.82);
 }
