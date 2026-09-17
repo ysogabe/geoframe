@@ -33,3 +33,7 @@ window.GEOFRAME_MODE_3D = false;
   window.GEOFRAME_MODE_3D = true;
   if (document.body) document.body.classList.add('mode3d');
 })();
+
+if (typeof window !== 'undefined' && window && typeof window.addEventListener === 'function') {
+  window.addEventListener('DOMContentLoaded', () => { if (typeof initKeys === 'function') initKeys(); }, false);
+}
