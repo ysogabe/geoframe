@@ -268,25 +268,48 @@ sudo ./screen-ctl-pi.sh on  && sudo ./screen-ctl-pi.sh status    # on
 > ドキュメントの `vcgencmd` 一覧には載っていません。sysfs 方式を第一とし、必要なら実機で
 > `vcgencmd commands` を見て補助的に使ってください。
 
-## 表示の残課題（翻訳ポップアップ・マウスカーソル）
+## 表示の残課題（翻訳ポップアップ・マウスポインタ）
 
-cage + Chromium では、Chromium の翻訳機能が自動判定したページに翻訳ポップアップ（「G＋Japanese English [x]」のパネル）を表示することがあります。また、Wayland の既定カーソルテーマでは、マウスカーソルが画面中央に残ることがあります。
+cage + Chromium で Pi400 の画面中央に出ていた矢印の真の原因は、HDMI-CEC の入力ノードです。
+Pi の `vc4-hdmi-0` / `vc4-hdmi-1` が `EV_REL` とポインタ能力を広告するため、実マウスが未接続でも
+ポインタとして認識され、cage/wlroots がカーソルを描いていました。CSSやChromiumの設定で
+コンポジタが描くカーソルを消すことはできません。
 
-対応は次のとおりです。
+### HDMI-CEC入力ノードの除外（Pi400）
 
-- `cage-kiosk.sh` の Chromium 起動引数で翻訳機能・翻訳UI・自動入力サーバー通信を無効化し、`--disable-translate` と `--lang=ja` を指定する。
-- systemd unit で `XCURSOR_THEME=transparent` と `XCURSOR_SIZE=24` を指定する。
-- cage は自動でカーソルを隠さないため、**透明カーソルテーマ（`make-transparent-cursor.py`）と user-style-sheet の二段構え**でカーソルを隠す。テーマでWayland側のカーソルを透明にし、`kiosk-cursor-none.css` の user-style-sheet でChromiumページ側のカーソルも隠す。
-- 表示ページの軽量モード（URLに `?low` を付ける運用）では `body.low{cursor:none}` でカーソルを隠す。通常の管理画面ではカーソルを隠さない。
-- 透明テーマは表示機で次のコマンドを実行して生成する。
+実機で確認済みの対策は、リポジトリの
+[`99-geoframe-ignore-hdmi-pointer.rules`](99-geoframe-ignore-hdmi-pointer.rules) を Pi に配置し、
+udev から libinput に HDMI-CEC ノードを渡さないようにすることです。実機への適用は次の手順だけを
+行い、適用後にキオスクを再起動します。
 
 ```bash
-sudo python3 deploy/kiosk/make-transparent-cursor.py
+sudo install -m 0644 \
+  /opt/geoframe/deploy/kiosk/99-geoframe-ignore-hdmi-pointer.rules \
+  /etc/udev/rules.d/99-geoframe-ignore-hdmi-pointer.rules
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=input
+sudo systemctl restart geoframe-cage-kiosk.service
 ```
 
-生成後、`geoframe-cage-kiosk.service` を再起動して反映します。
+検証は、cage が開いている input fd を確認して行います。`Raspberry Pi Internal Keyboard` に対応する
+内蔵キーボードの fd（通常 `/dev/input/event0` と `event1`）だけが表示され、`vc4-hdmi-0` /
+`vc4-hdmi-1` のノードが含まれないことを確認します。
 
-> 実機のマウスカーソルは CDP のスクリーンショットには写りません。カーソルが消えたことは、接続したモニタを目視して確認してください。
+```bash
+ls -l /proc/$(pgrep -xo cage)/fd | grep /dev/input
+```
+
+この Pi の VC4／ハードウェアプレーンでは `grim` は黒画像しか返さないため、スクリーンショットに
+カーソルが写らないことを検証には使えません。画面のカーソル表示はモニタを目視し、input fd の
+構成を上記コマンドで確認してください。
+
+副作用として HDMI-CEC 経由のリモコン入力は無効になります。USBマウスを後から接続した場合は
+ルールの対象外なので、cage はカーソルを表示します。`kiosk-cursor-none.css` と
+`--user-style-sheet`、`app.css` の `cursor:none` はこの問題の根拠にはなりませんが、USBマウス接続時の
+保険として残します。
+
+翻訳ポップアップについては、`cage-kiosk.sh` の Chromium 起動引数で翻訳機能・翻訳UI・自動入力
+サーバー通信を無効化し、`--disable-translate` と `--lang=ja` を指定します。
 
 ## Phase 6 — 負荷測定（この移行の目的）
 
