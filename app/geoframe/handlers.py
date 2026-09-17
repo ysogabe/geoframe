@@ -19,6 +19,8 @@ from .config import (ALLOWED_HOST_NAMES, DATA_DIR, DEBUG_API, PORT, ROOT,
                      TILE_SOURCES)
 from .geo import geocode_search
 from .ha import ha_get
+from . import keymap
+from .store import setting_compare_and_set, setting_get
 from .jma import api_env
 from .mlit import api_hazard, api_intel, hazard_tile
 from .photos import api_onthisday, api_photos, api_stats
@@ -27,6 +29,26 @@ from .travel_blog import (BlogBadRequest, BlogExportBusy, BlogNotFound,
                           api_blog_candidates, api_blog_draft, api_blog_trip,
                           api_blog_trips, export_blog, save_blog_draft)
 from .util import latlon_to_tile
+
+
+KEYMAP_SETTING = "admin_keymap"
+
+
+def _keymap_doc():
+    raw = setting_get(KEYMAP_SETTING)
+    if raw is None:
+        return {"rev": 0, "updated_at": None, "keys": dict(keymap.DEFAULT_KEYS)}
+    try:
+        doc = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        doc = None
+    return doc if isinstance(doc, dict) else {"rev": 0, "updated_at": None,
+                                               "keys": dict(keymap.DEFAULT_KEYS)}
+
+
+class KeymapConflict(Exception):
+    def __init__(self, doc):
+        self.doc = doc
 
 
 # ============================================================
@@ -341,6 +363,9 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/presence"):
             self._send_json(ha._presence)
             return
+        if p == "/api/keymap":
+            self._send_json(keymap.render(_keymap_doc()))
+            return
         if self.path.startswith("/api/mlit/probe"):
             # 開発用: 任意XKTタイルの件数と属性スキーマを確認する
             if not self._debug_api_ok():
@@ -526,8 +551,28 @@ class Handler(SimpleHTTPRequestHandler):
         return {"/api/admin/setloc": admin_setloc,
                 "/api/admin/setflag": admin_setflag,
                 "/api/admin/sethome": admin_sethome,
+                "/api/admin/setkeymap": self._setkeymap,
                 "/api/blog/save": save_blog_draft,
                 "/api/blog/export": export_blog}
+
+    def _setkeymap(self, payload):
+        keys = keymap.validate(payload)
+        if isinstance(keys, str):
+            raise BadRequest(keys)
+        before = _keymap_doc()
+        # validateで整数に限定し、expected_rev=NoneによるCAS迂回を許さない。
+        result = setting_compare_and_set(
+            KEYMAP_SETTING, {"keys": keys}, payload["base_revision"])
+        if result is None:
+            raise KeymapConflict(_keymap_doc())
+        changed = sorted(k for k in keymap.DEFAULT_KEYS
+                         if before.get("keys", {}).get(k) != result["keys"].get(k))
+        if changed:
+            origin = "有" if self.headers.get("Origin") is not None else "無"
+            print("[journal] keymap ip=%s origin=%s rev=%s->%s keys=%s" % (
+                self.client_address[0], origin, before.get("rev", 0),
+                result["rev"], ",".join(changed)))
+        return keymap.render(result)
 
     def _csrf_ok(self):
         """Content-Type と Origin を検査する。不許可なら応答を返して False"""
@@ -585,6 +630,8 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             self._send_json(handler(payload))
+        except KeymapConflict as e:
+            self._send_json(keymap.render(e.doc), status=409)
         except BadRequest as e:
             self._send_json({"ok": False, "error": str(e)}, status=400)
         except NotFound as e:
