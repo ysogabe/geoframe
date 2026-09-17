@@ -38,3 +38,4 @@
 - Hermesアダプタの実装前に、Mac上の非対話的なクライアントからHermesゲートウェイのAPIへ実際に接続できるかの最小限の疎通確認（スパイク）を行う。失敗した場合のフォールバックは、Mac上のファイルドロップをpublisherが読む方式に留め、Hermes側の仕様変更やトークンの移設は行わない。
 - 片方のソースが不通の場合は、生きている方だけを部分表示する。両方STALEの場合はこのモード自体を[[0004-frontend-display-mode-arbitration]]の優先度ラダーから除外する（表示しない）。
 - 50-echo-left-deviceのEchoアダプタ実装は、その診断APIの仕様（`GET /api/state`）に追従する形とし、50-echo-left-device側のプロトコル定義を変更しない。
+- 適用範囲: キーマップは管理画面からのみsettings表へ保存し、エージェント状態データの経路は本ADRどおりHA唯一のままとする（[[0007-admin-keymap-write-path]]）。

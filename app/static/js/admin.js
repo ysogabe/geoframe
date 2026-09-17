@@ -50,15 +50,20 @@ function postJSON(path, body){
 
 /* ==== 2) タブ ==== */
 let curFilter = 'all', curPage = 1;
+let keymapDoc = null, keymapDirty = false, keymapSubmitting = false;
+let keymapLoadGeneration = 0, keymapEditGeneration = 0;
 function showTab(name){
   document.querySelectorAll('nav .tab').forEach(b =>
     b.classList.toggle('on', b.dataset.tab === name));
-  const view = (name === 'status') ? 'status' : (name === 'home') ? 'home' : 'list';
+  const view = (name === 'status') ? 'status' : (name === 'home') ? 'home' :
+    (name === 'keymap') ? 'keymap' : 'list';
   $('#v-status').classList.toggle('hidden', view !== 'status');
   $('#v-list').classList.toggle('hidden', view !== 'list');
   $('#v-home').classList.toggle('hidden', view !== 'home');
+  $('#v-keymap').classList.toggle('hidden', view !== 'keymap');
   if(view === 'status'){ loadStatus(); return; }
   if(view === 'home'){ loadHome(); return; }
+  if(view === 'keymap'){ loadKeymap(); return; }
   setFilter(name === 'noloc' ? 'noloc' : 'all');
 }
 
@@ -372,7 +377,94 @@ function saveHome(){
   }).catch(e => toast('保存失敗: ' + e.message, true));
 }
 
-/* ==== 8) 起動 ==== */
+/* ==== 8) キー割当 ==== */
+function keymapValues(){
+  const values = {};
+  for(let i = 0; i < 10; i++) values[String(i)] = $('#key-' + i).value;
+  return values;
+}
+function renderKeymapFields(doc){
+  const box = $('#keymap-fields'); box.textContent = '';
+  const modes = doc.modes || [];
+  for(let i = 0; i < 10; i++){
+    const cell0 = el('div', 'cell');
+    cell0.appendChild(el('span', 'k', 'キー ' + i));
+    const select = document.createElement('select');
+    select.id = 'key-' + i;
+    modes.forEach(mode => {
+      const option = el('option', null, mode.label);
+      option.value = mode.id; select.appendChild(option);
+    });
+    select.value = doc.keys[String(i)];
+    select.addEventListener('change', () => { keymapDirty = true; keymapEditGeneration++; });
+    cell0.appendChild(select); box.appendChild(cell0);
+  }
+  $('#keymap-rev').textContent = 'rev ' + doc.rev;
+}
+function loadKeymap(){
+  if(keymapDirty) return;
+  const generation = ++keymapLoadGeneration;
+  fetch('/api/keymap').then(r => r.json().then(d => ({ok: r.ok, status: r.status, data: d})))
+    .then(result => {
+      // 404等の応答も作業コピーを壊さず、後続GETの古い応答も適用しない。
+      if(generation !== keymapLoadGeneration || keymapDirty) return;
+      if(!result.ok) throw new Error(result.data && result.data.error
+        ? result.data.error : ('HTTP ' + result.status));
+      const d = result.data;
+      if(!d.keys || !d.modes) throw new Error('keymap error');
+      // 応答適用直前にもdirtyを再確認する（fetch待ち中の編集を保護する）。
+      if(generation !== keymapLoadGeneration || keymapDirty) return;
+      keymapDoc = d; renderKeymapFields(d); $('#keymap-conflict').textContent = '';
+    }).catch(e => {
+      if(generation !== keymapLoadGeneration || keymapDirty) return;
+      toast('キー割当取得失敗: ' + e.message, true);
+    });
+}
+function saveKeymap(){
+  if(keymapSubmitting || !keymapDoc) return;
+  keymapSubmitting = true; $('#keymap-save').disabled = true;
+  const submitEditGeneration = keymapEditGeneration;
+  const submitLoadGeneration = keymapLoadGeneration;
+  const body = {keys: keymapValues(), base_revision: keymapDoc.rev};
+  fetch('/api/admin/setkeymap', {method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)}).then(r => r.json().then(d => ({ok: r.ok, status: r.status, data: d})))
+    .then(result => {
+      if(result.status === 409){
+        $('#keymap-conflict').textContent = '競合: 現行rev ' + result.data.rev + '。作業コピーを保持しています。';
+        let reload = $('#keymap-reload');
+        if(!reload){ reload = el('button', 'btn', '現行を再読込'); reload.id = 'keymap-reload';
+          reload.addEventListener('click', () => { keymapDirty = false; reload.remove(); loadKeymap(); });
+          $('#keymap-conflict').appendChild(reload); }
+        throw new Error('別の変更があります');
+      }
+      if(!result.ok || !result.data.keys) throw new Error(result.data.error || ('HTTP ' + result.status));
+      // 保存成功は進行中のGETを無効化する。応答適用直前にも世代と編集を再確認する。
+      keymapLoadGeneration++;
+      if(submitLoadGeneration !== keymapLoadGeneration - 1 ||
+         submitEditGeneration !== keymapEditGeneration){
+        keymapDoc = result.data;
+        keymapDirty = true;
+        $('#keymap-conflict').textContent = '保存済みrev ' + result.data.rev +
+          '。送信後の編集を保持しています（再読込で反映）。';
+        toast('保存しました（送信後の編集は未保存のまま保持しています）');
+        return;
+      }
+      keymapDoc = result.data; keymapDirty = false; renderKeymapFields(keymapDoc);
+      $('#keymap-conflict').textContent = ''; toast('キー割当を保存しました');
+    }).catch(e => toast('キー割当保存失敗: ' + e.message, true))
+    .finally(() => { keymapSubmitting = false; $('#keymap-save').disabled = false; });
+}
+function restoreDefaultKeymap(){
+  if(!confirm('キー割当を既定に戻しますか？')) return;
+  if(!confirm('現在の作業コピーは失われます。もう一度確認してください。')) return;
+  const keys = {'0':'sleep','1':'rotation'};
+  for(let i = 2; i < 10; i++) keys[String(i)] = 'reserved';
+  Object.keys(keys).forEach(k => { $('#key-' + k).value = keys[k]; });
+  keymapDirty = true;
+  keymapEditGeneration++;
+}
+
+/* ==== 9) 起動 ==== */
 document.querySelectorAll('nav .tab').forEach(b =>
   b.addEventListener('click', () => showTab(b.dataset.tab)));
 document.querySelectorAll('.flt').forEach(b =>
@@ -386,9 +478,12 @@ $('#m-q').addEventListener('keydown', e => {
   if(e.key === 'Enter'){ e.preventDefault(); doGeocodeSearch(); }
 });
 $('#home-save').addEventListener('click', saveHome);
+$('#keymap-save').addEventListener('click', saveKeymap);
+$('#keymap-default').addEventListener('click', restoreDefaultKeymap);
 $('#modal').addEventListener('click', e => { if(e.target.id === 'modal') closeLocModal(); });
 document.addEventListener('keydown', e => {
   if(e.key === 'Escape' && !$('#modal').classList.contains('hidden')) closeLocModal();
 });
 loadStatus();
 setInterval(() => { if(!$('#v-status').classList.contains('hidden')) loadStatus(); }, 30000);
+setInterval(() => { if(!$('#v-keymap').classList.contains('hidden')) loadKeymap(); }, 60000);

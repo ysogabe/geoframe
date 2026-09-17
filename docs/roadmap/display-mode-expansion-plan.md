@@ -10,7 +10,7 @@
 - **作業ブランチ**: `main`/`master`/`develop`等の保護ブランチ上で直接作業しない。ブランチ名は`<type>/<issue番号>-<短い説明>`（例: `feat/12-screen-override`）。Issueが未起票のWaveは、着手前にGitHub Issueを起票してから番号を確定する（後述、Waveごとに起票の要否を明記）。
 - **worktree**: 複数Waveを並行実装する場合は`git worktree`を使う。worktreeには`node_modules`・`.env`・ローカルDBが無い場合があるため、検証コマンドを回す前に依存インストールと環境ファイルのコピーを済ませる。
 - **実装フェーズの運用契約**: プラン承認直後、最初のサブエージェント dispatch前に`orchestrator-qa` skillを起動して契約を読み込む。
-- **`catalog.db`は再構築不可**。本プランのどのWaveも、写真索引以外の状態を`catalog.db`に追加しない（永続が必要な状態はHome Assistant側に置く、[[0003-screen-control-state-machine]]参照）。
+- **`catalog.db`は再構築不可**。本プランのどのWaveも、写真索引以外の状態を`catalog.db`に追加しない。ただしW2のキーマップのような閉じた語彙の小さな設定値は、`settings`表への限定例外とする（[[0007-admin-keymap-write-path]]参照）。永続が必要な状態はHome Assistant側に置く、[[0003-screen-control-state-machine]]参照。
 - **命名の注意**: フロントのJSは`app/static/js/`配下（`static/js/`ではない）。テストは`app/tests/`（Python）と`app/tests/js/`（Node、package.json無し、`node <file>`で直接実行）。
 - **PRごとの検証コマンド（現状確認済み、実在する）**:
   - Python: `cd app && .venv/bin/python -m unittest discover -s tests`

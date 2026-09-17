@@ -27,4 +27,5 @@ Codex・Claude Opus・Claude Sonnetの3者が独立に見解を出し、(A)で�
 
 - HAへの疎通が一定時間（目安5分）失敗し続けた場合、モードは`auto`へ自動的に減衰させる（[[0003-screen-control-state-machine]]参照）。現行ロジックはHA疎通断時に画面ON側へ倒れるため、減衰の結果は「点きっぱなし」であり、無人キオスクとして安全側に倒れる。
 - 次段階: 将来の照度センサー導入時も、「センサー → HA → 既存のpull経路」という形を崩さずに同じ配線へ合流させる。
+- 適用範囲: キーマップの管理画面書込みだけは ADR 0007 の閉じた語彙・settings CAS に限定し、本ADRのHA経由原則を変更しない。[[0007-admin-keymap-write-path]] 参照。
 - HA側の設定作業（`input_select`ヘルパー作成、iPhoneウィジェット/Siri Shortcut設定）はGEOFRAMEリポジトリの外側の作業であり、実装プラン文書（`docs/roadmap/display-mode-expansion-plan.md`）に手順を明記する。
