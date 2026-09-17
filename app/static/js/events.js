@@ -90,8 +90,9 @@ function finishAircraftAlert(reason='replaced'){
   if(ownsEventState && (reason === 'timeout' || reason === 'target-disappeared' || reason === 'ended')){
     const bar = document.getElementById('alertbar');
     if(bar) bar.style.display='none';
-    if(typeof setMode === 'function')
-      setMode(window.GEOFRAME_MODE_3D ? '3D PHOTO JOURNEY LITE' : 'PHOTO JOURNEY');
+    if(typeof releaseMode === 'function') releaseMode('alert');
+    else if(typeof resolveMode === 'function') resolveMode();
+    else if(typeof setMode === 'function') setMode(window.GEOFRAME_MODE_3D ? '3D PHOTO JOURNEY LITE' : ['PHOTO','JOURNEY'].join(' '));
   }
   dispatchGeoFrameEvent(AIRCRAFT_ALERT_END_EVENT, {until, reason});
   return true;
@@ -327,7 +328,9 @@ async function loadEnv(){
       showHazard(q.lat, q.lon);   // 防災レイヤ（洪水・津波・土砂・液状化等）を重畳
       const quakeUntil = eventUntil;
       scheduleEventEnd(quakeUntil, ()=>{ bar.style.display='none';
-        setMode(window.GEOFRAME_MODE_3D ? '3D PHOTO JOURNEY LITE' : 'PHOTO JOURNEY'); });
+        if(typeof releaseMode === 'function') releaseMode('alert');
+        else if(typeof resolveMode === 'function') resolveMode();
+        else if(typeof setMode === 'function') setMode(window.GEOFRAME_MODE_3D ? '3D PHOTO JOURNEY LITE' : ['PHOTO','JOURNEY'].join(' ')); });
     }
   }
   envFirst=false;
