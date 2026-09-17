@@ -59,6 +59,43 @@
   if (!sessionStorage.getItem(k)) sessionStorage.setItem(k, String(Date.now()));
   since.textContent = "オフライン表示 開始: " +
     new Date(Number(sessionStorage.getItem(k))).toLocaleString("ja-JP");
+
+  // 本URLが検証できる場合だけ、10秒ごとにGETで復旧を確認する。
+  let targetUrl;
+  try {
+    const candidate = new URL(window.location.href).searchParams.get("url");
+    const parsed = candidate === null ? null : new URL(candidate);
+    if (parsed && (parsed.protocol === "http:" || parsed.protocol === "https:")) {
+      targetUrl = parsed.href;
+    }
+  } catch (_) {
+    // 不正なURLはオフライン画面に留まる。
+  }
+
+  let consecutiveSuccesses = 0;
+  let checking = false;
+  async function checkServer() {
+    if (!targetUrl || checking) return;
+    checking = true;
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 5000);
+    try {
+      await fetch(targetUrl, {
+        method: "GET",
+        mode: "no-cors",
+        cache: "no-store",
+        signal: controller.signal
+      });
+      consecutiveSuccesses += 1;
+      if (consecutiveSuccesses >= 2) location.replace(targetUrl);
+    } catch (_) {
+      consecutiveSuccesses = 0;
+    } finally {
+      clearTimeout(timeout);
+      checking = false;
+    }
+  }
+  setInterval(checkServer, 10000);
 </script>
 </body>
 </html>

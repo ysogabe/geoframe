@@ -20,7 +20,7 @@
 #
 set -euo pipefail
 
-GEOFRAME_URL="${GEOFRAME_URL:-http://localhost:8080/}"
+GEOFRAME_URL="${GEOFRAME_URL-http://localhost:8080/}"
 WAIT_TIMEOUT="${GEOFRAME_KIOSK_WAIT_TIMEOUT:-60}"
 OFFLINE_URL="${GEOFRAME_KIOSK_OFFLINE_URL:-}"
 PROFILE_DIR="${KIOSK_PROFILE_DIR:-$HOME/.config/geoframe-kiosk}"
@@ -28,25 +28,64 @@ DEBUG_PORT="${KIOSK_DEBUG_PORT:-9222}"
 
 log() { echo "[cage-kiosk.sh] $*" >&2; }
 
+append_target_url() {
+    python3 - "$1" "$2" <<'PY'
+import sys
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+base, target = sys.argv[1:]
+parts = urlsplit(base)
+query = [(key, value) for key, value in parse_qsl(parts.query, keep_blank_values=True) if key != "url"]
+query.append(("url", target))
+print(urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)))
+PY
+}
+
 for b in cage chromium; do
     command -v "$b" >/dev/null 2>&1 || { log "ERROR: $b が見つかりません"; exit 1; }
 done
 
 mkdir -p "$PROFILE_DIR"
 
+valid_geoframe_url=1
+if python3 - "$GEOFRAME_URL" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+try:
+    parsed = urlsplit(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    raise SystemExit(1)
+PY
+then
+    :
+else
+    valid_geoframe_url=0
+fi
+
 elapsed=0
-until curl --silent --fail --max-time 2 -o /dev/null "$GEOFRAME_URL"; do
-    if [ "$elapsed" -ge "$WAIT_TIMEOUT" ]; then
-        log "WARNING: ${WAIT_TIMEOUT}s待ってもサーバー応答なし（$GEOFRAME_URL）"
-        if [ -n "$OFFLINE_URL" ]; then
-            log "フォールバックURLへ切り替えます: $OFFLINE_URL"
-            GEOFRAME_URL="$OFFLINE_URL"
-        fi
-        break
+if [ "$valid_geoframe_url" -eq 0 ]; then
+    log "WARNING: GEOFRAME_URL が空または不正です。待機せずオフラインへ切り替えます"
+    if [ -n "$OFFLINE_URL" ]; then
+        GEOFRAME_URL="$OFFLINE_URL"
     fi
-    sleep 1
-    elapsed=$((elapsed + 1))
-done
+else
+    until curl --silent --fail --max-time 2 -o /dev/null "$GEOFRAME_URL"; do
+        if [ "$elapsed" -ge "$WAIT_TIMEOUT" ]; then
+            log "WARNING: ${WAIT_TIMEOUT}s待ってもサーバー応答なし（$GEOFRAME_URL）"
+            if [ -n "$OFFLINE_URL" ]; then
+                log "フォールバックURLへ切り替えます: $OFFLINE_URL"
+                OFFLINE_URL="$(append_target_url "$OFFLINE_URL" "$GEOFRAME_URL")"
+                GEOFRAME_URL="$OFFLINE_URL"
+            fi
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+fi
 log "server check done (waited ${elapsed}s). url=$GEOFRAME_URL"
 
 CHROME_ARGS=(
