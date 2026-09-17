@@ -93,7 +93,12 @@ CHROME_ARGS=(
     --ozone-platform=wayland
     --noerrdialogs
     --disable-session-crashed-bubble
+    # 翻訳ポップアップを抑止し、日本語表示と自動入力通信を固定する
+    --disable-features=Translate,TranslateUI,AutofillServerCommunication
     --disable-translate
+    --lang=ja
+    # cageは自動でカーソルを隠さないため、ページ側のuser-style-sheetでも隠す
+    --user-style-sheet=/opt/geoframe/deploy/kiosk/kiosk-cursor-none.css
     --password-store=basic
     --user-data-dir="$PROFILE_DIR"
 )

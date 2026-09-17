@@ -18,6 +18,9 @@
   }
   *{margin:0;padding:0;box-sizing:border-box}
   html,body{width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--ink);font-family:var(--jp)}
+  /* cage/Wayland はコンポジタがカーソルを描く。地図キャンバス等が自前で
+   cursor: grab を持つため、全要素に対して消す（キオスク ?low 時のみ）。 */
+body.low, body.low *{cursor:none !important}
 
   #map{position:absolute;inset:0}
   /* 地理院タイルのダーク反転（invert+hue-rotateで色相をおおむね維持しつつ明暗反転） */
