@@ -113,6 +113,16 @@ function collectClaimState() {
   return state;
 }
 
+function syncLocalSleepLayer() {
+  const layer = typeof document !== 'undefined' && document &&
+    typeof document.getElementById === 'function'
+    ? document.getElementById('sleep-layer') : null;
+  if (!layer || !layer.classList || typeof layer.classList.toggle !== 'function') return;
+  const local = MODE_CLAIMS.sleep && MODE_CLAIMS.sleep.claims &&
+    MODE_CLAIMS.sleep.claims.local;
+  layer.classList.toggle('on', !!local && activeClaim(local));
+}
+
 /* One arbitration API for delayed work: judge ownership by claim priority,
    not by the resolved label.  A real ALERT claim's label varies (INTERCEPT /
    MEMORY LINK / SEISMIC WATCH) and is never the literal string 'ALERT'. */
@@ -135,6 +145,7 @@ function resolveMode() {
     typeof document.getElementById === 'function'
     ? document.getElementById(MODE_EL_ID) : null;
   if (el) el.textContent = 'MODE: ' + label;
+  syncLocalSleepLayer();
   return label;
 }
 
