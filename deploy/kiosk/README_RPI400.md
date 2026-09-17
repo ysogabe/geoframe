@@ -149,6 +149,17 @@ sudoedit /etc/geoframe/kiosk.env     # GEOFRAME_URL / COG_PLATFORM_DRM_MODE_MAX 
 sudo chmod +x /opt/geoframe/deploy/kiosk/*.sh
 ```
 
+Chromium の managed policy を配置する（翻訳ポップアップ等をプロファイル設定に依存せず無効化する）。
+
+```bash
+sudo install -d -m 0755 /etc/chromium/policies/managed
+sudo install -m 0644 \
+  /opt/geoframe/deploy/kiosk/geoframe-kiosk-policy.json \
+  /etc/chromium/policies/managed/geoframe-kiosk.json
+```
+
+`chromium-policy-disable-translate.json` は同じ `TranslateEnabled` を n100 向けに定義した既存ファイルで、Pi400では上記の `geoframe-kiosk-policy.json` を使う。
+
 `/etc/geoframe/kiosk.env` の要点:
 
 - `GEOFRAME_URL=http://<サーバーIP>:8080/` — **IPで指定すればサーバー側の設定変更は不要**
@@ -256,6 +267,26 @@ sudo ./screen-ctl-pi.sh on  && sudo ./screen-ctl-pi.sh status    # on
 > `vcgencmd display_power 0/1` は過去のPi 4系ファームウェアで使えましたが、現在の公式
 > ドキュメントの `vcgencmd` 一覧には載っていません。sysfs 方式を第一とし、必要なら実機で
 > `vcgencmd commands` を見て補助的に使ってください。
+
+## 表示の残課題（翻訳ポップアップ・マウスカーソル）
+
+cage + Chromium では、Chromium の翻訳機能が自動判定したページに翻訳ポップアップ（「G＋Japanese English [x]」のパネル）を表示することがあります。また、Wayland の既定カーソルテーマでは、マウスカーソルが画面中央に残ることがあります。
+
+対応は次のとおりです。
+
+- `cage-kiosk.sh` の Chromium 起動引数で翻訳機能・翻訳UI・自動入力サーバー通信を無効化し、`--disable-translate` と `--lang=ja` を指定する。
+- systemd unit で `XCURSOR_THEME=transparent` と `XCURSOR_SIZE=24` を指定する。
+- cage は自動でカーソルを隠さないため、**透明カーソルテーマ（`make-transparent-cursor.py`）と user-style-sheet の二段構え**でカーソルを隠す。テーマでWayland側のカーソルを透明にし、`kiosk-cursor-none.css` の user-style-sheet でChromiumページ側のカーソルも隠す。
+- 表示ページの軽量モード（URLに `?low` を付ける運用）では `body.low{cursor:none}` でカーソルを隠す。通常の管理画面ではカーソルを隠さない。
+- 透明テーマは表示機で次のコマンドを実行して生成する。
+
+```bash
+sudo python3 deploy/kiosk/make-transparent-cursor.py
+```
+
+生成後、`geoframe-cage-kiosk.service` を再起動して反映します。
+
+> 実機のマウスカーソルは CDP のスクリーンショットには写りません。カーソルが消えたことは、接続したモニタを目視して確認してください。
 
 ## Phase 6 — 負荷測定（この移行の目的）
 
