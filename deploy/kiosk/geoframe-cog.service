@@ -1,0 +1,35 @@
+[Unit]
+Description=GeoFrame kiosk (Cog + WPE WebKit, DRM direct)
+Documentation=file:///opt/geoframe/deploy/kiosk/README_RPI400.md
+# ネットワーク到達後に起動（サーバーが別機体でも、無くても起動はする）
+After=network-online.target
+Wants=network-online.target
+# XやデスクトップのgettyとDRM/コンソールを奪い合わないようにする
+Conflicts=getty@tty1.service
+After=getty@tty1.service
+
+[Service]
+Type=simple
+# 専用ユーザー（sudo権限なし）。video/render/input が必要
+User=geoframe
+Group=geoframe
+SupplementaryGroups=video render input
+WorkingDirectory=/opt/geoframe
+Environment=HOME=/var/lib/geoframe
+Environment=XDG_RUNTIME_DIR=/run/geoframe
+EnvironmentFile=-/etc/geoframe/kiosk.env
+ExecStart=/opt/geoframe/deploy/kiosk/cog-kiosk.sh
+Restart=always
+RestartSec=3
+# 画面そのものを占有するのでtty1に載せる
+TTYPath=/dev/tty1
+StandardInput=tty
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=geoframe-cog
+
+[Install]
+WantedBy=multi-user.target
