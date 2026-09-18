@@ -12,6 +12,8 @@ from unittest.mock import patch
 from geoframe import handlers, keymap, store
 
 
+# 注: "agents" は W4 で正式な語彙になったため、未知IDの例は存在しないIDに変えている
+#     （テストの意図＝「語彙外IDは拒否」は変えていない）
 class KeymapPureFunctionTest(unittest.TestCase):
     def valid(self):
         return {"keys": dict(keymap.DEFAULT_KEYS), "base_revision": 0}
@@ -24,7 +26,7 @@ class KeymapPureFunctionTest(unittest.TestCase):
 
     def test_validation_rejects_six_invalid_shapes(self):
         cases = [
-            (lambda p: p["keys"].update({"2": "agents"}), "unknown id"),
+            (lambda p: p["keys"].update({"2": "no_such_mode"}), "unknown id"),
             (lambda p: p.update(extra=True), "extra field"),
             (lambda p: p["keys"].update({"2": 2}), "non string"),
             (lambda p: p["keys"].pop("9"), "missing key"),
@@ -159,7 +161,7 @@ class KeymapHTTPTest(unittest.TestCase):
 
     def test_six_validation_errors_are_http_400_with_japanese_reason(self):
         cases = [
-            (lambda p: p["keys"].update({"2": "agents"}), "unknown id"),
+            (lambda p: p["keys"].update({"2": "no_such_mode"}), "unknown id"),
             (lambda p: p.update(extra=True), "extra field"),
             (lambda p: p["keys"].update({"2": 2}), "non string"),
             (lambda p: p["keys"].pop("9"), "missing key"),

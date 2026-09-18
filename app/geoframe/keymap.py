@@ -1,10 +1,11 @@
 """閉じた語彙によるキーマップの純粋な検証・描画関数。"""
 from copy import deepcopy
 
-DEFAULT_KEYS = {"0": "sleep", "1": "rotation", **{str(i): "reserved" for i in range(2, 10)}}
+DEFAULT_KEYS = {"0": "sleep", "1": "rotation", "2": "agents", **{str(i): "reserved" for i in range(3, 10)}}
 MODES = (
     {"id": "rotation", "label": "地図と写真"},
     {"id": "sleep", "label": "就寝"},
+    {"id": "agents", "label": "エージェント稼働状況"},
     {"id": "reserved", "label": "未割当"},
 )
 _ALLOWED = frozenset(item["id"] for item in MODES)

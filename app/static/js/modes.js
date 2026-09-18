@@ -2,7 +2,7 @@
    modes.js — 表示モードラベルの一元化（#mode 要素の唯一の writer）
    ============================================================ */
 const MODE_EL_ID = 'mode';
-const MODE_PRIORITY = ['SLEEP', 'ALERT', 'PINNED', 'AMBIENT', 'ROTATION'];
+const MODE_PRIORITY = ['SLEEP', 'ALERT', 'PINNED', 'AGENTS', 'AMBIENT', 'ROTATION'];
 
 /* Claim state is deliberately inert at load time.  Browser globals, storage,
    timers and event listeners are acquired only by initModes(). */
@@ -17,14 +17,17 @@ const MODE_CLAIMS = {
     },
   },
   ambient: { active: false, label: 'AMBIENT', until: 0, source: 'local', canRender: true },
+  agents: { active: false, label: 'AGENTS', until: 0, source: 'local', canRender: true },
 };
 let modesInitialized = false;
+let lastModeEventKey = null;
 
 function pickMode(state) {
   const s = state || {};
   if (s.sleep) return 'SLEEP';
   if (s.alert) return 'ALERT';
   if (s.pinned) return 'PINNED';
+  if (s.agents) return 'AGENTS';
   if (s.ambient) return 'AMBIENT';
   return 'ROTATION';
 }
@@ -107,7 +110,7 @@ function modeClaimActive(name) {
 
 function collectClaimState() {
   const state = {};
-  for (const name of ['sleep', 'alert', 'pin', 'ambient']) {
+  for (const name of ['sleep', 'alert', 'pin', 'agents', 'ambient']) {
     state[name === 'pin' ? 'pinned' : name] = modeClaimActive(name);
   }
   return state;
@@ -128,7 +131,7 @@ function syncLocalSleepLayer() {
    MEMORY LINK / SEISMIC WATCH) and is never the literal string 'ALERT'. */
 function modeClaimIsTop(name) {
   resolveMode();
-  const priority = ['sleep', 'alert', 'pin', 'ambient'];
+  const priority = ['sleep', 'alert', 'pin', 'agents', 'ambient'];
   const top = priority.find(claimName => modeClaimActive(claimName));
   return top === name;
 }
@@ -139,6 +142,7 @@ function resolveMode() {
   if (state.sleep) label = MODE_CLAIMS.sleep.label;
   else if (state.alert) label = MODE_CLAIMS.alert.label;
   else if (state.pinned) label = MODE_CLAIMS.pin.label;
+  else if (state.agents) label = MODE_CLAIMS.agents.label;
   else if (state.ambient) label = MODE_CLAIMS.ambient.label;
   else label = pickMode(state);
   const el = typeof document !== 'undefined' && document &&
@@ -146,6 +150,17 @@ function resolveMode() {
     ? document.getElementById(MODE_EL_ID) : null;
   if (el) el.textContent = 'MODE: ' + label;
   syncLocalSleepLayer();
+  const eventKey = JSON.stringify(state);
+  if (eventKey !== lastModeEventKey && typeof window !== 'undefined' &&
+      window && typeof window.dispatchEvent === 'function') {
+    lastModeEventKey = eventKey;
+    const EventCtor = window.CustomEvent || window.Event;
+    try {
+      window.dispatchEvent(EventCtor
+        ? new EventCtor('geoframe:mode-change', { detail: state })
+        : { type: 'geoframe:mode-change', detail: state });
+    } catch (e) {}
+  }
   return label;
 }
 
@@ -169,6 +184,7 @@ function setMode(label) {
   else if (label === 'PINNED') claimMode('pin', { label, source: 'local' });
   else if (label === 'ALERT' || label === 'INTERCEPT' || label === 'MEMORY LINK' ||
            label === 'SEISMIC WATCH') claimMode('alert', { label, source: 'event' });
+  else if (label === 'AGENTS') claimMode('agents', { label, source: 'local' });
   else claimMode('ambient', { label, source: 'local' });
   resolveMode();
   return label;

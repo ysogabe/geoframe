@@ -87,7 +87,9 @@ class FakeElement {
 
 function validKeys(overrides = {}) {
   const keys = {};
-  for (let i = 0; i < 10; i++) keys[String(i)] = i === 0 ? 'sleep' : i === 1 ? 'rotation' : 'reserved';
+  for (let i = 0; i < 10; i++) {
+    keys[String(i)] = i === 0 ? 'sleep' : i === 1 ? 'rotation' : i === 2 ? 'agents' : 'reserved';
+  }
   return Object.assign(keys, overrides);
 }
 
@@ -258,7 +260,7 @@ async function sleepTwice(scenario, gap = 100) {
     assert.strictEqual((scenario.windowListeners.get('keydown') || []).length, 0, 'GEOFRAME_MODE_3Dではkeydownを登録しない');
   }
 
-  // 3. Digit1はpin解除、Digit0の二度押しはlocal sleep、Digit2は6秒toast。
+  // 3. Digit1はpin解除、Digit0の二度押しはlocal sleep、Digit2はagentsを切り替える。
   {
     const scenario = makeScenario();
     await scenario.start();
@@ -271,7 +273,12 @@ async function sleepTwice(scenario, gap = 100) {
       'Digit0二度押しでlocal sleepをclaimする');
     assert.strictEqual(scenario.sleepLayer.classList.contains('on'), true, 'local sleep overlayを表示する');
     scenario.emit('Escape');
-    const reserved = scenario.emit('Digit2');
+    const agents = scenario.emit('Digit2');
+    assert.strictEqual(agents.defaultPrevented, true, 'agents操作を消費する');
+    assert.strictEqual(scenario.mode("modeClaimActive('agents')"), true, 'Digit2でagentsをclaimする');
+    assert.strictEqual(scenario.mode("document.getElementById('mode').textContent"), 'MODE: AGENTS',
+      'agents claimでAGENTSモードを表示する');
+    const reserved = scenario.emit('Digit3');
     assert.strictEqual(reserved.defaultPrevented, true, 'reserved操作を消費する');
     assert.strictEqual(scenario.toastEl.textContent, 'このキーは未割当です', 'reservedの固定toast');
     scenario.advance(6000);
