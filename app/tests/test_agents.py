@@ -130,15 +130,15 @@ class ExporterTest(unittest.TestCase):
             source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
             now = time.time()
             os.utime(source, (now, now))
-            with patch.object(exporter, "SOURCE", source), patch.object(exporter, "DEST", dest_dir / "hermes.json"):
-                summary = exporter.read_source(now)
+            with patch.object(exporter, "DEST", dest_dir / "hermes.json"):
+                summary = exporter.read_source(now, source)
                 self.assertTrue(exporter.publish(summary))
                 drop = dest_dir / "hermes.json"
                 self.assertTrue(drop.is_file())
                 self.assertEqual(drop.stat().st_mode & 0o777, 0o640)
                 before = drop.read_bytes()
                 os.utime(source, (now - 100, now - 100))
-                stale = exporter.read_source(now)
+                stale = exporter.read_source(now, source)
                 self.assertIsNotNone(stale)
                 self.assertEqual(stale["published_at"], now - 100)
                 self.assertTrue(exporter.publish(stale))
@@ -153,8 +153,8 @@ class ExporterTest(unittest.TestCase):
             now = 1_700_000_000.0
             heartbeat_mtime = now - 13 * 24 * 60 * 60
             os.utime(source, (heartbeat_mtime, heartbeat_mtime))
-            with patch.object(exporter, "SOURCE", source), patch.object(exporter, "DEST", dest):
-                summary = exporter.read_source(now)
+            with patch.object(exporter, "DEST", dest):
+                summary = exporter.read_source(now, source)
                 self.assertEqual(summary["published_at"], heartbeat_mtime)
                 self.assertTrue(exporter.publish(summary))
                 self.assertEqual(json.loads(dest.read_text(encoding="utf-8"))["published_at"], heartbeat_mtime)
@@ -168,8 +168,8 @@ class ExporterTest(unittest.TestCase):
             now = 1_700_000_000.0
             heartbeat_mtime = now - 13 * 24 * 60 * 60
             os.utime(source, (heartbeat_mtime, heartbeat_mtime))
-            with patch.object(exporter, "SOURCE", source), patch.object(exporter, "DEST", dest):
-                self.assertTrue(exporter.publish(exporter.read_source(now)))
+            with patch.object(exporter, "DEST", dest):
+                self.assertTrue(exporter.publish(exporter.read_source(now, source)))
             body = agents.render_agents(dest.parent, now)
             self.assertEqual(body["agents"][0]["state"], "unknown")
             self.assertNotEqual(body["agents"][0]["state"], "live")
@@ -180,14 +180,163 @@ class ExporterTest(unittest.TestCase):
             source = root / "missing-heartbeat.json"
             dest = root / "drops" / "hermes.json"
             now = 1_700_000_000.0
-            with patch.object(exporter, "SOURCE", source), patch.object(exporter, "DEST", dest):
-                summary = exporter.read_source(now)
+            with patch.object(exporter, "DEST", dest):
+                summary = exporter.read_source(now, source)
                 self.assertEqual(summary["state"], "unknown")
                 self.assertEqual(summary["published_at"], now)
                 self.assertTrue(exporter.publish(summary))
             body = agents.render_agents(dest.parent, now)
             self.assertEqual(len(body["agents"]), 1)
             self.assertEqual(body["agents"][0]["state"], "unknown")
+
+
+class ExporterSourceDiscoveryTest(unittest.TestCase):
+    """既定の心拍源は、unitのdrop-inを足さなくても稼働中プロファイルに追随する。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.default_heartbeat = self.home / "state" / "gateway.heartbeat"
+        self.profile_heartbeat = self.home / "profiles" / "example-profile" / "state" / "gateway.heartbeat"
+
+    def _write(self, path, mtime, **payload):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        item = {"state": "live", "task_kind": "coding"}
+        item.update(payload)
+        path.write_text(json.dumps(item), encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def _env(self, **values):
+        return patch.dict(os.environ, values, clear=True)
+
+    def test_env_override_pins_a_single_heartbeat(self):
+        pinned = self._write(self.home / "pinned.json", 100)
+        self._write(self.profile_heartbeat, 200)
+        with self._env(HERMES_HOME=str(self.home), HERMES_HEARTBEAT_FILE=str(pinned)):
+            self.assertEqual(exporter.select_source(), pinned)
+            self.assertEqual(exporter.read_source(105.0)["published_at"], 100)
+
+    def test_profile_pin_wins_over_a_newer_heartbeat(self):
+        pinned = self._write(self.home / "profiles" / "other" / "state" / "gateway.heartbeat", 100)
+        self._write(self.profile_heartbeat, 200)  # より新しいが別プロファイル
+        with self._env(HERMES_HOME=str(self.home), HERMES_PROFILE="other"):
+            self.assertEqual(exporter.select_source(), pinned)
+
+    def test_unknown_profile_name_falls_back_to_discovery(self):
+        self._write(self.profile_heartbeat, 200)
+        with self._env(HERMES_HOME=str(self.home), HERMES_PROFILE="no-such-profile"):
+            self.assertEqual(exporter.select_source(), self.profile_heartbeat)
+
+    def test_hermes_home_defaults_to_the_user_home(self):
+        with patch.dict(os.environ, {"HOME": str(self.home)}, clear=True):
+            self.assertEqual(exporter.hermes_home(), self.home / ".hermes")
+            self.assertEqual(exporter.candidate_sources()[0],
+                             self.home / ".hermes" / "state" / "gateway.heartbeat")
+
+    def test_discovery_picks_the_newest_heartbeat_across_profiles(self):
+        self._write(self.default_heartbeat, 100)  # 既定プロファイル（停止している）
+        self._write(self.home / "profiles" / "other" / "state" / "gateway.heartbeat", 50)
+        self._write(self.profile_heartbeat, 200)  # 稼働中プロファイル（最新）
+        with self._env(HERMES_HOME=str(self.home)):
+            self.assertEqual(exporter.select_source(), self.profile_heartbeat)
+            summary = exporter.read_source(205.0)
+            self.assertEqual(summary["published_at"], 200)
+            self.assertEqual(summary["state"], "live")
+            self.assertEqual(summary["hb_age_s"], 5)
+
+    def test_discovery_falls_back_to_the_default_path_and_publishes_unknown(self):
+        with self._env(HERMES_HOME=str(self.home)):
+            self.assertEqual(exporter.select_source(), self.default_heartbeat)
+            dest = self.home / "drops" / "hermes.json"
+            now = 1_700_000_000.0
+            with patch.object(exporter, "DEST", dest):
+                summary = exporter.read_source(now)
+                self.assertEqual(summary["state"], "unknown")
+                self.assertEqual(summary["published_at"], now)
+                self.assertTrue(exporter.publish(summary))
+            body = agents.render_agents(dest.parent, now)
+            self.assertEqual([item["id"] for item in body["agents"]], ["hermes"])
+            self.assertEqual(body["agents"][0]["state"], "unknown")
+
+    def test_discovery_skips_non_regular_candidates(self):
+        broken = self.home / "profiles" / "broken" / "state" / "gateway.heartbeat"
+        broken.mkdir(parents=True)
+        os.utime(broken, (300, 300))  # 最新でもディレクトリは採用しない
+        self._write(self.profile_heartbeat, 200)
+        with self._env(HERMES_HOME=str(self.home)):
+            self.assertEqual(exporter.select_source(), self.profile_heartbeat)
+
+    def test_two_fresh_heartbeats_race_and_the_newest_wins(self):
+        # 複数プロファイルが同時に稼働している状態。既定は最新を選ぶ（入れ替わりうる）ことを固定する。
+        self._write(self.home / "profiles" / "other" / "state" / "gateway.heartbeat", 990)
+        self._write(self.profile_heartbeat, 995)
+        with self._env(HERMES_HOME=str(self.home)):
+            self.assertEqual(len(exporter.fresh_sources(now=1000.0)), 2)
+            self.assertEqual(exporter.select_source(), self.profile_heartbeat)
+            self.assertEqual(exporter.read_source(1000.0)["state"], "live")
+            # 相手が先に書けば選択は入れ替わる（既定では曖昧さを消せない）
+            self._write(self.home / "profiles" / "other" / "state" / "gateway.heartbeat", 999)
+            self.assertEqual(exporter.select_source(),
+                             self.home / "profiles" / "other" / "state" / "gateway.heartbeat")
+
+    def test_equal_mtimes_keep_the_default_profile_first(self):
+        self._write(self.default_heartbeat, 500)
+        self._write(self.profile_heartbeat, 500)
+        with self._env(HERMES_HOME=str(self.home)):
+            self.assertEqual(exporter.select_source(), self.default_heartbeat)
+
+    def test_ambiguity_notice_only_with_several_fresh_heartbeats(self):
+        self.assertEqual(exporter.ambiguity_notice(self.profile_heartbeat, ()), None)
+        self.assertEqual(exporter.ambiguity_notice(self.profile_heartbeat, (self.profile_heartbeat,)), None)
+        notice = exporter.ambiguity_notice(self.profile_heartbeat, (self.default_heartbeat, self.profile_heartbeat))
+        self.assertIn("2 fresh heartbeats", notice)
+        self.assertIn(str(self.profile_heartbeat), notice)
+        self.assertIn("HERMES_PROFILE", notice)
+
+    def test_ambiguity_notice_dedupes_by_the_fresh_set_not_the_winner(self):
+        fresh = (self.default_heartbeat, self.profile_heartbeat)
+        self.assertIsNotNone(exporter.ambiguity_notice(self.default_heartbeat, fresh))
+        # 勝者（＝reporting のパス）が入れ替わっても、fresh集合が同じなら再出力しない
+        self.assertIsNone(exporter.ambiguity_notice(self.profile_heartbeat, fresh, fresh))
+        # fresh集合が変われば再出力する
+        changed = (self.default_heartbeat, self.profile_heartbeat, self.home / "profiles" / "third" / "state" / "gateway.heartbeat")
+        self.assertIsNotNone(exporter.ambiguity_notice(self.profile_heartbeat, changed, fresh))
+
+    def test_tick_logs_the_ambiguity_once_while_the_winner_keeps_flipping(self):
+        first = self._write(self.home / "profiles" / "aaa" / "state" / "gateway.heartbeat", 100)
+        second = self._write(self.home / "profiles" / "bbb" / "state" / "gateway.heartbeat", 200)
+        now = time.time()
+        os.utime(first, (now - 2, now - 2))
+        os.utime(second, (now - 1, now - 1))
+        stderr = io.StringIO()
+        with self._env(HERMES_HOME=str(self.home)), tempfile.TemporaryDirectory() as tmp, \
+                patch.object(exporter, "DEST", Path(tmp) / "hermes.json"), \
+                contextlib.redirect_stderr(stderr):
+            state = exporter.tick()
+            os.utime(first, (now, now))          # 勝者が first へ入れ替わる
+            state = exporter.tick(state)
+            os.utime(second, (now + 1, now + 1))  # 勝者が second へ戻る
+            state = exporter.tick(state)
+        self.assertEqual(stderr.getvalue().count("fresh heartbeats"), 1)
+
+    def test_a_fifo_heartbeat_never_blocks_the_loop(self):
+        fifo = self.home / "profiles" / "fifo-profile" / "state" / "gateway.heartbeat"
+        fifo.parent.mkdir(parents=True)
+        try:
+            os.mkfifo(fifo)
+        except (OSError, NotImplementedError):
+            self.skipTest("FIFO unavailable")
+        os.utime(fifo, (600, 600))  # 候補の中で最新でもある
+        self._write(self.profile_heartbeat, 200)
+        with self._env(HERMES_HOME=str(self.home)):
+            self.assertEqual(exporter.select_source(), self.profile_heartbeat)
+            self.assertEqual(exporter.read_source(700.0, fifo)["state"], "unknown")
+            self.assertEqual(exporter.read_source(700.0, fifo)["published_at"], 700.0)
+        with self._env(HERMES_HOME=str(self.home), HERMES_PROFILE="fifo-profile"):
+            self.assertEqual(exporter.select_source(), fifo)
+            self.assertEqual(exporter.read_source(700.0)["state"], "unknown")
 
 
 if __name__ == "__main__":
