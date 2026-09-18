@@ -415,6 +415,10 @@ function handleKeydown(event) {
   if (escape) {
     clearSleepDoublePress();
     releaseLocalPin();
+    if (typeof modeClaimActive === 'function' && modeClaimActive('agents')) {
+      keysReleaseMode('agents', 'local');
+      keysResolveMode();
+    }
     return;
   }
 
@@ -422,6 +426,16 @@ function handleKeydown(event) {
   if (assignment === 'rotation') {
     clearSleepDoublePress();
     releaseLocalPin();
+    keysReleaseMode('agents', 'local');
+  } else if (assignment === 'agents') {
+    clearSleepDoublePress();
+    releaseLocalPin();
+    if (typeof modeClaimActive === 'function' && modeClaimActive('agents')) {
+      keysReleaseMode('agents', 'local');
+    } else {
+      keysClaimMode('agents', { label: 'AGENTS', source: 'local', until: keysNow() + KEY_CLAIM_MAX_MS });
+    }
+    keysResolveMode();
   } else if (assignment === 'sleep') {
     onSleepAssignment();
   } else if (assignment === 'reserved') {

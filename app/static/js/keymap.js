@@ -4,16 +4,17 @@
 
 const KEYMAP_CACHE_KEY = 'geoframe.keymap.v1';
 const KEYMAP_CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-const KEYMAP_ALLOWED_IDS = Object.freeze(['rotation', 'sleep', 'reserved']);
+const KEYMAP_ALLOWED_IDS = Object.freeze(['rotation', 'sleep', 'agents', 'reserved']);
 const KEYMAP_DIGITS = Object.freeze(['0', '1', '2', '3', '4', '5', '6', '7', '8', '9']);
 const KEYMAP_DEFAULT_KEYS = Object.freeze({
-  '0': 'sleep', '1': 'rotation', '2': 'reserved', '3': 'reserved',
+  '0': 'sleep', '1': 'rotation', '2': 'agents', '3': 'reserved',
   '4': 'reserved', '5': 'reserved', '6': 'reserved', '7': 'reserved',
   '8': 'reserved', '9': 'reserved',
 });
 const KEYMAP_DEFAULT_MODES = Object.freeze([
   Object.freeze({ id: 'rotation', label: '地図と写真' }),
   Object.freeze({ id: 'sleep', label: '就寝' }),
+  Object.freeze({ id: 'agents', label: 'エージェント稼働状況' }),
   Object.freeze({ id: 'reserved', label: '未割当' }),
 ]);
 

@@ -20,6 +20,7 @@ from .config import (ALLOWED_HOST_NAMES, DATA_DIR, DEBUG_API, PORT, ROOT,
 from .geo import geocode_search
 from .ha import ha_get
 from . import keymap
+from .agents import render_agents
 from .store import setting_compare_and_set, setting_get
 from .jma import api_env
 from .mlit import api_hazard, api_intel, hazard_tile
@@ -365,6 +366,9 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if p == "/api/keymap":
             self._send_json(keymap.render(_keymap_doc()))
+            return
+        if p == "/api/agents":
+            self._send_json(render_agents())
             return
         if self.path.startswith("/api/mlit/probe"):
             # 開発用: 任意XKTタイルの件数と属性スキーマを確認する

@@ -248,6 +248,8 @@ HA_SCREEN_DECAY_MIN = float(os.environ.get("GEOFRAME_HA_SCREEN_DECAY_MIN", "5"))
 SCREEN_STATUS_CMD = os.environ.get("GEOFRAME_SCREEN_STATUS_CMD", "")
 # 画面の意図と実機状態を照合する間隔（秒）
 HA_SCREEN_RECONCILE_SEC = float(os.environ.get("GEOFRAME_HA_SCREEN_RECONCILE_SEC", "90"))
+# Atomic, read-only status drops written by the system Hermes exporter.
+AGENT_STATUS_DIR = Path(os.environ.get("GEOFRAME_AGENT_STATUS_DIR", "/run/geoframe-agent-status"))
 
 # 気象庁（無認証）。GEOFRAME_JMA_AREA: 予報区コード（既定120000=千葉県）
 JMA_AREA = os.environ.get("GEOFRAME_JMA_AREA", "120000")

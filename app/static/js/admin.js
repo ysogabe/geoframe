@@ -457,8 +457,8 @@ function saveKeymap(){
 function restoreDefaultKeymap(){
   if(!confirm('キー割当を既定に戻しますか？')) return;
   if(!confirm('現在の作業コピーは失われます。もう一度確認してください。')) return;
-  const keys = {'0':'sleep','1':'rotation'};
-  for(let i = 2; i < 10; i++) keys[String(i)] = 'reserved';
+  const keys = {'0':'sleep','1':'rotation','2':'agents'};
+  for(let i = 3; i < 10; i++) keys[String(i)] = 'reserved';
   Object.keys(keys).forEach(k => { $('#key-' + k).value = keys[k]; });
   keymapDirty = true;
   keymapEditGeneration++;

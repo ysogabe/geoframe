@@ -23,6 +23,14 @@
 body.low, body.low *{cursor:none !important}
 
   #map{position:absolute;inset:0}
+  /* Agent mode is intentionally static and opaque: no scan, pulse, blur, or animation. */
+  #agentslayer{position:absolute;inset:0;z-index:20;background:#05080d;color:var(--ink);padding:12vh 12vw;font-family:var(--mono);opacity:1;}
+  #agentslayer[hidden]{display:none}
+  .agents-title{font-size:clamp(22px,4vw,48px);color:var(--cyan);letter-spacing:.2em;border-bottom:1px solid var(--cyan);padding-bottom:1rem}
+  .agent-card{display:inline-block;vertical-align:top;width:min(34vw,420px);min-height:150px;margin:3rem 2rem 0 0;padding:1.4rem;border:1px solid rgba(0,229,255,.5);background:#09121b}
+  .agent-label{font-size:clamp(16px,2vw,25px);color:var(--ink)}
+  .agent-state{margin-top:1.2rem;color:var(--green);font-size:1.4rem;letter-spacing:.15em}
+  .agent-task,.agent-age{margin-top:.7rem;color:var(--ink-2);font-size:1rem}
   /* 地理院タイルのダーク反転（invert+hue-rotateで色相をおおむね維持しつつ明暗反転） */
   #map .maplibregl-canvas{filter:invert(1) hue-rotate(180deg) saturate(.55) brightness(.9) contrast(1.15)}
   .maplibregl-ctrl-bottom-right{bottom:34px}
