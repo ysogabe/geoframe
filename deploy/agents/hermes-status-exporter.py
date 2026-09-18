@@ -2,6 +2,7 @@
 """Publish a non-sensitive Hermes heartbeat summary as an atomic status drop."""
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
@@ -12,6 +13,7 @@ HEARTBEAT_RELATIVE = ("state", "gateway.heartbeat")
 DEST = Path(os.environ.get("GEOFRAME_AGENT_STATUS_DIR", "/run/geoframe-agent-status")) / "hermes.json"
 INTERVAL = 10
 HEARTBEAT_MAX_AGE = 30
+PROFILE_NAME = re.compile(r"[a-z0-9][a-z0-9-]{0,31}\Z")
 ALLOWED_TASKS = {"idle", "coding", "testing", "review", "research", "maintenance", "unknown"}
 ALLOWED_STATES = {"live", "idle", "busy", "error", "unknown"}
 
@@ -39,7 +41,8 @@ def candidate_sources(home=None):
         named = sorted(entry for entry in (root / "profiles").iterdir() if entry.is_dir())
     except OSError:
         named = []
-    candidates.extend(entry.joinpath(*HEARTBEAT_RELATIVE) for entry in named)
+    candidates.extend(entry.joinpath(*HEARTBEAT_RELATIVE) for entry in named
+                      if PROFILE_NAME.fullmatch(entry.name))
     return tuple(candidates)
 
 
@@ -89,9 +92,8 @@ def select_source(home=None):
     1. ``HERMES_HEARTBEAT_FILE`` — an explicit file pin.
     2. ``HERMES_PROFILE`` — that profile's heartbeat, when the profile exists.
     3. The newest mtime among ``candidate_sources()``; the default path when nothing exists
-       yet. Only the running profile keeps its heartbeat fresh, so the newest is the live
-       agent. When several profiles are fresh at once the newest one wins and ``main()``
-       logs the ambiguity (reporting one card per profile is a separate change).
+       yet. This single-source result is retained for callers and the ambiguity notice;
+       ``tick()`` publishes every regular candidate.
     """
     pinned = pinned_candidate(home)
     if pinned is not None:
@@ -111,8 +113,8 @@ def select_source(home=None):
 def fresh_sources(home=None, now=None):
     """Candidates written within ``HEARTBEAT_MAX_AGE``, in discovery order.
 
-    More than one means the host runs several profiles at once, and a single card cannot
-    say which one it is reporting.
+    More than one means the host runs several profiles at once and triggers the notice in
+    ``tick()``.
     """
     now = time.time() if now is None else now
     fresh = []
@@ -142,46 +144,74 @@ def _unknown_summary(now):
             "task_kind": "unknown", "metrics": [], "hb_age_s": 0}
 
 
+def _drop_id_for_source(source, home=None):
+    """Return the configured drop id for a heartbeat path, or ``None`` if invalid."""
+    root = Path(home) if home is not None else hermes_home()
+    path = Path(source)
+    if path == root.joinpath(*HEARTBEAT_RELATIVE):
+        return "hermes"
+    try:
+        relative = path.relative_to(root / "profiles")
+    except ValueError:
+        # HERMES_HEARTBEAT_FILE historically accepted an arbitrary path. Keep that
+        # single-file pin on the legacy id unless it identifies a profile layout.
+        return "hermes"
+    if relative.parts[1:] != HEARTBEAT_RELATIVE:
+        return "hermes"
+    name = relative.parts[0]
+    if not PROFILE_NAME.fullmatch(name):
+        return None
+    return f"hermes-{name}"
+
+
 def read_source(now=None, source=None):
     now = time.time() if now is None else now
     path = select_source() if source is None else Path(source)
+    agent_id = _drop_id_for_source(path) or "hermes"
     st = _stat_regular(path)
     if st is None:
-        return _unknown_summary(now)
+        summary = _unknown_summary(now)
+        summary["id"] = agent_id
+        return summary
     try:
         # O_NONBLOCK keeps a swapped-in FIFO (stat→open race) from wedging the loop.
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         with os.fdopen(fd, encoding="utf-8") as fp:
             raw = json.load(fp)
     except (OSError, ValueError, TypeError):
-        return _unknown_summary(now)
+        summary = _unknown_summary(now)
+        summary["id"] = agent_id
+        return summary
     hb_age_s = max(0, int(now - st.st_mtime))
     if not isinstance(raw, dict):
         raw = {}
     task = raw.get("task_kind", "idle")
-    state = raw.get("state", "live" if hb_age_s <= HEARTBEAT_MAX_AGE else "unknown")
+    state = raw.get("state", "live")
     task = task if task in ALLOWED_TASKS else "unknown"
     state = state if state in ALLOWED_STATES else "unknown"
+    if hb_age_s > HEARTBEAT_MAX_AGE:
+        state = "unknown"
     metrics = []
     for name in ("queue", "active", "completed", "errors", "uptime_s"):
         if name in raw:
             metrics.append({"name": name, "value": _number(raw[name])})
-    return {"id": "hermes", "published_at": st.st_mtime,
+    return {"id": agent_id, "published_at": st.st_mtime,
             "state": state, "task_kind": task, "metrics": metrics, "hb_age_s": hb_age_s}
 
 
-def publish(summary):
+def publish(summary, path=None):
     if summary is None:
         return False
-    DEST.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp = tempfile.mkstemp(prefix=".hermes.", suffix=".tmp", dir=DEST.parent)
+    destination = Path(DEST if path is None else path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=".hermes.", suffix=".tmp", dir=destination.parent)
     os.fchmod(fd, 0o640)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fp:
             json.dump(summary, fp, ensure_ascii=False, separators=(",", ":"))
             fp.flush()
             os.fsync(fp.fileno())
-        os.replace(temp, DEST)
+        os.replace(temp, destination)
         return True
     finally:
         try:
@@ -190,20 +220,82 @@ def publish(summary):
             pass
 
 
+def _is_hermes_drop(path):
+    name = Path(path).name
+    if name == "hermes.json":
+        return True
+    if not name.startswith("hermes-") or not name.endswith(".json"):
+        return False
+    return PROFILE_NAME.fullmatch(name[len("hermes-"):-len(".json")]) is not None
+
+
+def _hermes_drop_id(path):
+    name = Path(path).name
+    if name == "hermes.json":
+        return "hermes"
+    if not _is_hermes_drop(path):
+        return None
+    return name[:-len(".json")]
+
+
+def _remove_hermes_drops(directory, keep_ids):
+    """Remove exporter-owned drops not published in the current cycle."""
+    directory = Path(directory)
+    keep_ids = set(keep_ids)
+    try:
+        entries = tuple(directory.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not _is_hermes_drop(entry) or _hermes_drop_id(entry) in keep_ids:
+            continue
+        try:
+            if entry.is_dir() and not entry.is_symlink():
+                continue
+            entry.unlink()
+        except OSError:
+            pass
+
+
+def _publish_source(source, home):
+    """Publish one existing, validly named heartbeat to the corresponding drop."""
+    source = Path(source)
+    drop_id = _drop_id_for_source(source, home)
+    if drop_id is None or _stat_regular(source) is None:
+        return False
+    destination = Path(DEST).parent / f"{drop_id}.json"
+    return publish(read_source(source=source), destination)
+
+
 def tick(reported_fresh=None):
     """Run one cycle and return the state to pass to the next call.
 
     Kept separate from ``main()`` so the warning's dedup can be exercised without sleeping.
     """
     pinned = pinned_candidate()
-    source = select_source() if pinned is None else pinned
+    home = hermes_home()
     if pinned is None:
-        fresh = fresh_sources()
+        candidates = candidate_sources(home)
+        source = select_source(home)
+        fresh = fresh_sources(home)
         notice = ambiguity_notice(source, fresh, reported_fresh)
         if notice is not None:
             print(f"[exporter] {notice}", file=sys.stderr, flush=True)
         reported_fresh = fresh if len(fresh) > 1 else None
-    publish(read_source(source=source))
+        published_ids = set()
+        for candidate in candidates:
+            if _publish_source(candidate, home):
+                drop_id = _drop_id_for_source(candidate, home)
+                if drop_id is not None:
+                    published_ids.add(drop_id)
+        _remove_hermes_drops(Path(DEST).parent, published_ids)
+    else:
+        source = Path(pinned)
+        destination = Path(DEST).parent / "hermes.json"
+        summary = read_source(source=source)
+        summary["id"] = "hermes"
+        publish(summary, destination)
+        _remove_hermes_drops(Path(DEST).parent, {"hermes"})
     return reported_fresh
 
 

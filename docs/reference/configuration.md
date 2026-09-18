@@ -55,6 +55,7 @@
 - `GEOFRAME_SCREEN_STATUS_CMD`（`config.py`: `SCREEN_STATUS_CMD`） — 既定値 （空文字）。実機の画面状態を読むコマンド（例: /opt/geoframe/deploy/kiosk/screen-ctl.sh status）。※標準出力の on/off だけを見る。あのスクリプトは正常な「off」判定でも exit 1 を 返す仕様なので、終了コードで成否を判定してはいけない
 - `GEOFRAME_HA_SCREEN_RECONCILE_SEC`（`config.py`: `HA_SCREEN_RECONCILE_SEC`） — 既定値 `90`。画面の意図と実機状態を照合する間隔（秒）
 - `GEOFRAME_AGENT_STATUS_DIR`（`config.py`: `AGENT_STATUS_DIR`） — 既定値 `/run/geoframe-agent-status`。Atomic, read-only status drops written by the system Hermes exporter.
+- `GEOFRAME_AGENT_LABELS`（`config.py`: `AGENT_LABELS`） — 既定値 `hermes=みなも (Hermes),miach=miach-runtime`。エージェントカードの順序とラベル（id=ラベル、カンマ区切り。.envで指定）
 - `GEOFRAME_JMA_AREA`（`config.py`: `JMA_AREA`） — 既定値 `120000`。気象庁（無認証）。GEOFRAME_JMA_AREA: 予報区コード（既定120000=千葉県）
 - `GEOFRAME_DEBUG_API`（`config.py`: `DEBUG_API`） — 既定値 （空文字）。開発用API（/api/ha/entities・/api/mlit/probe）のガード。既定は無効
 - `GEOFRAME_ALLOWED_HOSTS`（`config.py`: `ALLOWED_HOST_NAMES`） — 既定値 （空文字）。許可するホスト名。IPリテラル宛（192.0.2.7等）は_host_ok側で無条件に許可するため、 ここには名前だけを入れる。GEOFRAME_ALLOWED_HOSTS はTailscaleや固定DNS名で 運用する場合の追加指定用（例: GEOFRAME_ALLOWED_HOSTS=geoframe.local:8080,frame.lan）
