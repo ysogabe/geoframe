@@ -183,6 +183,77 @@ LAN内の別端末からHTTP 403になる場合は、アクセスに使った正
 `GEOFRAME_ALLOWED_HOSTS`へ追加します。IPリテラルによるアクセスは許可されますが、名前付き
 ホストは明示的な許可が必要です。
 
+### 3.1 エージェント稼働状況exporter（任意）
+
+GEOFRAMEと同じ機体でHermesを動かす場合、Hermesの心拍を非機密の要約（稼働状態・経過秒・
+タスク種別・簡易メトリクス）へ変換し、`/run/geoframe-agent-status/hermes.json`へ原子的に
+書き出すexporterを動かせます。表示機のキー`2`（エージェント稼働状況）が読むのはこのdropです
+（[ADR 0005](../docs/decisions/0005-agent-status-via-ha-bus.md)）。
+
+dropのディレクトリはunitの`RuntimeDirectory=geoframe-agent-status`が作り、所有者は
+`hermes:geoframe-status`（0750）になります。GEOFRAMEサーバー側には
+[`geoframe-server.service.d/agents.conf`](geoframe-server.service.d/agents.conf)を置いて
+`SupplementaryGroups=geoframe-status`を足します。`ProtectHome=true`とホームの0600は緩めません。
+
+```sh
+sudo groupadd --system geoframe-status          # 既にあれば不要
+sudo install -d -o root -g root -m 0755 /etc/systemd/system/geoframe-server.service.d
+sudo install -o root -g root -m 0644 \
+  /opt/geoframe/deploy/geoframe-server.service.d/agents.conf \
+  /etc/systemd/system/geoframe-server.service.d/agents.conf
+sudo install -o root -g root -m 0644 \
+  /opt/geoframe/deploy/agents/geoframe-agent-status-exporter.service \
+  /etc/systemd/system/geoframe-agent-status-exporter.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now geoframe-agent-status-exporter.service
+sudo systemctl restart geoframe-server.service
+```
+
+確認します。
+
+```sh
+systemctl status geoframe-agent-status-exporter.service --no-pager
+sudo -u geoframe cat /run/geoframe-agent-status/hermes.json
+curl --fail http://127.0.0.1:8080/api/agents
+```
+
+exporterはHermesのホーム配下（0600の心拍）を読むため、unitの`User=`はHermesを動かしている
+ユーザーへ合わせます。同梱unitは`hermes`を前提にしています。
+
+心拍源は次の順で解決します（`HERMES_HOME`未設定時は`~/.hermes`）。
+
+1. `HERMES_HEARTBEAT_FILE` — 指定した1ファイルへ固定
+2. `HERMES_PROFILE` — その名前付きプロファイルの心拍（プロファイルが実在するときだけ）。
+   複数プロファイルが同時に稼働していて、カードが入れ替わるのを避けたい場合に使います
+3. 上記が無い場合は次の2つを列挙し、**mtimeが最新のもの**を採用
+   - `<HERMES_HOME>/state/gateway.heartbeat` — 既定プロファイル
+   - `<HERMES_HOME>/profiles/<name>/state/gateway.heartbeat` — 名前付きプロファイル
+
+既定で名前付きプロファイルを拾うため、稼働させるプロファイルを変えてもunitへ心拍のパスを
+足す必要はありません。**複数の心拍が同時に新鮮なとき（＝複数プロファイルが同時に稼働しているとき）は、
+既定では選択が入れ替わりうるため、exporterはその状態が続く間だけjournaldへ1回警告を出します**
+（勝者が入れ替わっても再出力しません。freshな集合が変わったときに再度出します）。
+
+```sh
+journalctl -u geoframe-agent-status-exporter -n 5 --no-pager
+# [exporter] 2 fresh heartbeats found; reporting /home/example/.hermes/profiles/example/state/gateway.heartbeat (pin one with HERMES_PROFILE)
+```
+
+プロファイルを固定したい場合は、drop-inで次の1行を入れます
+（パスではなくプロファイル名なので、ホームの構成を変えても書き換えが要りません）。
+
+```sh
+sudo install -d -o root -g root -m 0755 \
+  /etc/systemd/system/geoframe-agent-status-exporter.service.d
+printf '[Service]\nEnvironment=HERMES_PROFILE=example\n' |
+  sudo tee /etc/systemd/system/geoframe-agent-status-exporter.service.d/heartbeat.conf >/dev/null
+sudo systemctl daemon-reload
+sudo systemctl restart geoframe-agent-status-exporter.service
+```
+
+心拍が30秒以上古い場合や読めない場合も`state=unknown`のdropを書きます。表示は「不明」になり、
+心拍が止まっていることが分かります（dropが消えて画面が空になることはありません）。
+
 ## 4. Chromiumキオスク（任意）
 
 [`kiosk/kiosk.sh`](kiosk/kiosk.sh)はGEOFRAMEサーバーの起動を待ってからChromiumを

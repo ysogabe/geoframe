@@ -27,6 +27,8 @@ Hermesの心拍・状態
 
 exporterは標準ライブラリだけで非機密の要約を作り、`published_at`は計測時刻（心拍ファイルのmtime）とする。心拍が停止・欠落していても`state=unknown`のdropを書き、dropはsystem unitと専用groupでGeoFrameから読める権限にし、GeoFrameの`ProtectHome=true`は維持する。
 
+心拍源は次の順で解決する。`HERMES_HEARTBEAT_FILE`（1ファイルへ固定）→`HERMES_PROFILE`（そのプロファイルの心拍。プロファイルが実在するときだけ）→`<HERMES_HOME>/state/gateway.heartbeat`（`HERMES_HOME`未設定時は`~/.hermes`）と`<HERMES_HOME>/profiles/<name>/state/gateway.heartbeat`を列挙して**mtimeが最新のもの**。既定で名前付きプロファイルを拾うため、稼働させるプロファイルを変えてもunitのdrop-inで心拍のパスを指定し直す必要はない。複数プロファイルが同時に稼働しているときに1枚のカードが最新の心拍へ追随して入れ替わるのを避けたい場合は`HERMES_PROFILE`で固定する。既定（発見）で複数の心拍が同時に新鮮なときは、沈黙して入れ替わる代わりにexporterがjournaldへ警告を出し（勝者が入れ替わっても再出力せず、freshな集合が変わったときだけ再出力する）、`HERMES_PROFILE`での固定を促す（プロファイルごとに1枚のカードを出す変更は別段階とする）。固定したパス（`HERMES_HEARTBEAT_FILE`・`HERMES_PROFILE`）と発見した候補は、いずれもregular fileのときだけ開き、開く際も非ブロッキング（`O_NONBLOCK`）にする（FIFOを掴んでも`open()`が戻らず無応答になることを避ける）。
+
 `agents.py`はregular fileだけをno-followで読み、64KiB上限とstrict schemaを適用する。破損したdropではlast-goodの値を使うが、`published_at`を若返らせない。ファイル名とJSON内の`id`が一致しないdropは採用しない。
 
 APIの各要素は`{id, label, state, age_s, task_kind, metrics[]}`だけとする。生ログ、パス、ホスト名、PID、ユーザー名、プロンプト、トークン、コスト、個人情報は含めない。フロントエンドは新設の`#agentslayer`へ`textContent`だけで描画し、`#modelayer`は使用しない（3D表示の所有者は[[0004-frontend-display-mode-arbitration]]）。
