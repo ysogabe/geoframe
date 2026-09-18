@@ -25,9 +25,11 @@ Hermesの心拍・状態
   → #agentslayer
 ```
 
-exporterは標準ライブラリだけで非機密の要約を作り、`published_at`は計測時刻（心拍ファイルのmtime）とする。心拍が停止・欠落していても`state=unknown`のdropを書き、dropはsystem unitと専用groupでGeoFrameから読める権限にし、GeoFrameの`ProtectHome=true`は維持する。
+exporterは標準ライブラリだけで非機密の要約を作り、`published_at`は計測時刻（心拍ファイルのmtime）とする。発見（unpinned）では存在するregular fileの心拍ごとに1本のdropを書き、既定プロファイルは`hermes.json`、名前付きプロファイル（`<name>`）は`hermes-<name>.json`とする。不正なプロファイル名や存在しない候補にはdropを作らない。固定（`HERMES_PROFILE`・`HERMES_HEARTBEAT_FILE`）は単一カード運用とし、プロファイル名に関係なく`hermes.json`（id=`hermes`）へ、固定先が欠落していても常に1本のdropを書く。古い・壊れた・読めない心拍は`state=unknown`の要約にする。dropはsystem unitと専用groupでGeoFrameから読める権限にし、GeoFrameの`ProtectHome=true`は維持する。
 
-心拍源は次の順で解決する。`HERMES_HEARTBEAT_FILE`（1ファイルへ固定）→`HERMES_PROFILE`（そのプロファイルの心拍。プロファイルが実在するときだけ）→`<HERMES_HOME>/state/gateway.heartbeat`（`HERMES_HOME`未設定時は`~/.hermes`）と`<HERMES_HOME>/profiles/<name>/state/gateway.heartbeat`を列挙して**mtimeが最新のもの**。既定で名前付きプロファイルを拾うため、稼働させるプロファイルを変えてもunitのdrop-inで心拍のパスを指定し直す必要はない。複数プロファイルが同時に稼働しているときに1枚のカードが最新の心拍へ追随して入れ替わるのを避けたい場合は`HERMES_PROFILE`で固定する。既定（発見）で複数の心拍が同時に新鮮なときは、沈黙して入れ替わる代わりにexporterがjournaldへ警告を出し（勝者が入れ替わっても再出力せず、freshな集合が変わったときだけ再出力する）、`HERMES_PROFILE`での固定を促す（プロファイルごとに1枚のカードを出す変更は別段階とする）。固定したパス（`HERMES_HEARTBEAT_FILE`・`HERMES_PROFILE`）と発見した候補は、いずれもregular fileのときだけ開き、開く際も非ブロッキング（`O_NONBLOCK`）にする（FIFOを掴んでも`open()`が戻らず無応答になることを避ける）。
+心拍源は次の順で解決する。`HERMES_HEARTBEAT_FILE`（1ファイルへ固定）→`HERMES_PROFILE`（そのプロファイルの心拍。プロファイルが実在するときだけ）→`<HERMES_HOME>/state/gateway.heartbeat`（`HERMES_HOME`未設定時は`~/.hermes`）と`<HERMES_HOME>/profiles/<name>/state/gateway.heartbeat`を列挙して各dropへ反映する。既定で名前付きプロファイルを拾うため、稼働させるプロファイルを変えてもunitのdrop-inで心拍のパスを指定し直す必要はない。既定（発見）で複数の心拍が同時に新鮮なときは、exporterがfreshな集合単位でjournaldへ警告を出し（勝者が入れ替わっても再出力せず、freshな集合が変わったときだけ再出力する）。発見（unpinned）では1周期のpublish後、今回publishしなかった`hermes.json`・`hermes-<name>.json`を削除するため、過去に存在したプロファイルのディレクトリが削除・リネームされた場合もghost dropを残さない。固定したパス（`HERMES_HEARTBEAT_FILE`・`HERMES_PROFILE`）では`hermes.json`（id=`hermes`）だけを書き、`hermes-<name>.json`など他のexporter-owned dropを削除する。複数カードはunpinnedで運用し、`GEOFRAME_AGENT_LABELS`へ`hermes-<name>=ラベル`を登録する。未登録idのdropはカードに出ず、サーバーがjournaldへ1回警告する。`miach.json`など他のidのdropには触れない。固定したパスはregular fileでなくても`state=unknown`のdropを書き、発見した候補はregular fileのときだけ開く。いずれも開く際は非ブロッキング（`O_NONBLOCK`）にする（FIFOを掴んでも`open()`が戻らず無応答になることを避ける）。
+
+サーバー側のカード定義は`GEOFRAME_AGENT_LABELS`（`id=ラベル`のカンマ区切り）から作り、設定にないidのdropは読まない。設定順を候補順としつつ、`live`を優先して`published_at`降順に並べ、最大2枚だけを公開する。ラベルはdrop内の値を使わず、設定値だけを使う。選抜後のカードに`live`がある場合だけ`rotation_allowed`をtrueにする。
 
 `agents.py`はregular fileだけをno-followで読み、64KiB上限とstrict schemaを適用する。破損したdropではlast-goodの値を使うが、`published_at`を若返らせない。ファイル名とJSON内の`id`が一致しないdropは採用しない。
 

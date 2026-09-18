@@ -2,20 +2,43 @@
 import json
 import math
 import os
+import re
 import stat
+import sys
 import time
 from pathlib import Path
 
-from .config import AGENT_STATUS_DIR
+from .config import AGENT_LABELS, AGENT_STATUS_DIR
 
 MAX_BYTES = 64 * 1024
 LIVE_MAX_S = 30
 STALE_MAX_S = 120
-AGENT_IDS = ("hermes", "miach")
-LABELS = {"hermes": "みなも (Hermes)", "miach": "miach-runtime"}
+MAX_CARDS = 2
 STATES = frozenset(("live", "idle", "busy", "error", "unknown"))
 TASK_KINDS = frozenset(("idle", "coding", "testing", "review", "research", "maintenance", "unknown"))
 _last_good = {}
+_unconfigured_drop_warning_emitted = False
+_PROFILE_DROP_ID = re.compile(r"^hermes-[a-z0-9][a-z0-9-]{0,31}$")
+
+
+def _configured_agents(entries):
+    ids = []
+    labels = {}
+    for entry in entries:
+        if "=" not in entry:
+            continue
+        agent_id, label = (part.strip() for part in entry.split("=", 1))
+        if not agent_id or not label or agent_id in labels:
+            continue
+        # The id becomes a filename; reject path components from configuration.
+        if Path(agent_id).name != agent_id or agent_id in {".", ".."}:
+            continue
+        ids.append(agent_id)
+        labels[agent_id] = label
+    return tuple(ids), labels
+
+
+AGENT_IDS, LABELS = _configured_agents(AGENT_LABELS)
 
 
 def _finite_number(value):
@@ -86,10 +109,30 @@ def _public(item, now):
             "age_s": age, "task_kind": item["task_kind"], "metrics": item["metrics"]}
 
 
+def _warn_for_unconfigured_drops(directory):
+    """Warn once when discovery produced a valid-looking, unconfigured profile drop."""
+    global _unconfigured_drop_warning_emitted
+    if _unconfigured_drop_warning_emitted:
+        return
+    try:
+        entries = tuple(Path(directory).iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        name = entry.name
+        agent_id = name[:-5] if name.endswith(".json") else ""
+        if _PROFILE_DROP_ID.fullmatch(agent_id) and agent_id not in AGENT_IDS:
+            print(f"[agents] drop for unconfigured id '{agent_id}' ignored; "
+                  "add it to GEOFRAME_AGENT_LABELS", file=sys.stderr, flush=True)
+            _unconfigured_drop_warning_emitted = True
+            return
+
+
 def read_agents(directory=AGENT_STATUS_DIR, now=None):
     now = time.time() if now is None else float(now)
-    result = []
-    for agent_id in AGENT_IDS:
+    _warn_for_unconfigured_drops(directory)
+    cards = []
+    for order, agent_id in enumerate(AGENT_IDS):
         item = _read_drop(Path(directory) / f"{agent_id}.json")
         if item is not None and item["id"] == agent_id:
             _last_good[agent_id] = item
@@ -97,7 +140,10 @@ def read_agents(directory=AGENT_STATUS_DIR, now=None):
             item = None
         item = _last_good.get(agent_id)
         if item is not None:
-            result.append(_public(item, now))
+            public = _public(item, now)
+            cards.append((public, item["published_at"], order))
+    cards.sort(key=lambda card: (card[0]["state"] != "live", -card[1], card[2]))
+    result = [card[0] for card in cards[:MAX_CARDS]]
     return {"agents": result, "rotation_allowed": any(a["state"] == "live" for a in result)}
 
 

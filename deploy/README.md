@@ -186,9 +186,19 @@ LAN内の別端末からHTTP 403になる場合は、アクセスに使った正
 ### 3.1 エージェント稼働状況exporter（任意）
 
 GEOFRAMEと同じ機体でHermesを動かす場合、Hermesの心拍を非機密の要約（稼働状態・経過秒・
-タスク種別・簡易メトリクス）へ変換し、`/run/geoframe-agent-status/hermes.json`へ原子的に
+タスク種別・簡易メトリクス）へ変換し、`/run/geoframe-agent-status/*.json`へ原子的に
 書き出すexporterを動かせます。表示機のキー`2`（エージェント稼働状況）が読むのはこのdropです
 （[ADR 0005](../docs/decisions/0005-agent-status-via-ha-bus.md)）。
+
+発見（unpinned）では、既定プロファイルの心拍は`hermes.json`、名前付きプロファイル
+（`<name>`）の心拍は`hermes-<name>.json`へ、存在するregular fileごとに1本ずつ出ます。不正な
+プロファイル名や存在しない候補にはdropを作りません。固定（`HERMES_PROFILE`または
+`HERMES_HEARTBEAT_FILE`）は単一カード運用で、プロファイル名に関係なく`hermes.json`
+（id=`hermes`）を常に1本出します。複数カード運用はunpinnedにし、
+`GEOFRAME_AGENT_LABELS`へ`hermes-<name>=ラベル`を登録してください。未登録の
+`hermes-<name>.json`はカードに出ず、サーバーがjournaldへ1回警告します。サーバーが表示する
+カードは最大2枚で、カードのラベルと順序は`GEOFRAME_AGENT_LABELS`（`id=ラベル`のカンマ区切り）で
+設定します。
 
 dropのディレクトリはunitの`RuntimeDirectory=geoframe-agent-status`が作り、所有者は
 `hermes:geoframe-status`（0750）になります。GEOFRAMEサーバー側には
@@ -224,19 +234,19 @@ exporterはHermesのホーム配下（0600の心拍）を読むため、unitの`
 
 1. `HERMES_HEARTBEAT_FILE` — 指定した1ファイルへ固定
 2. `HERMES_PROFILE` — その名前付きプロファイルの心拍（プロファイルが実在するときだけ）。
-   複数プロファイルが同時に稼働していて、カードが入れ替わるのを避けたい場合に使います
-3. 上記が無い場合は次の2つを列挙し、**mtimeが最新のもの**を採用
+   複数プロファイルのうち1本だけを単一カード運用にしたい場合に使います
+3. 上記が無い場合は次の候補を列挙し、存在するregular fileをそれぞれdropへ出力
    - `<HERMES_HOME>/state/gateway.heartbeat` — 既定プロファイル
    - `<HERMES_HOME>/profiles/<name>/state/gateway.heartbeat` — 名前付きプロファイル
 
 既定で名前付きプロファイルを拾うため、稼働させるプロファイルを変えてもunitへ心拍のパスを
 足す必要はありません。**複数の心拍が同時に新鮮なとき（＝複数プロファイルが同時に稼働しているとき）は、
-既定では選択が入れ替わりうるため、exporterはその状態が続く間だけjournaldへ1回警告を出します**
-（勝者が入れ替わっても再出力しません。freshな集合が変わったときに再度出します）。
+exporterはfreshな集合単位でjournaldへ1回警告を出します**（勝者が入れ替わっても再出力せず、
+freshな集合が変わったときに再度出します）。
 
 ```sh
 journalctl -u geoframe-agent-status-exporter -n 5 --no-pager
-# [exporter] 2 fresh heartbeats found; reporting /home/example/.hermes/profiles/example/state/gateway.heartbeat (pin one with HERMES_PROFILE)
+# [exporter] 2 fresh heartbeats found; reporting <HERMES_HOME>/profiles/<name>/state/gateway.heartbeat (pin one with HERMES_PROFILE)
 ```
 
 プロファイルを固定したい場合は、drop-inで次の1行を入れます
@@ -245,14 +255,21 @@ journalctl -u geoframe-agent-status-exporter -n 5 --no-pager
 ```sh
 sudo install -d -o root -g root -m 0755 \
   /etc/systemd/system/geoframe-agent-status-exporter.service.d
-printf '[Service]\nEnvironment=HERMES_PROFILE=example\n' |
+printf '[Service]\nEnvironment=HERMES_PROFILE=example-profile\n' |
   sudo tee /etc/systemd/system/geoframe-agent-status-exporter.service.d/heartbeat.conf >/dev/null
 sudo systemctl daemon-reload
 sudo systemctl restart geoframe-agent-status-exporter.service
 ```
 
-心拍が30秒以上古い場合や読めない場合も`state=unknown`のdropを書きます。表示は「不明」になり、
-心拍が止まっていることが分かります（dropが消えて画面が空になることはありません）。
+固定（`HERMES_PROFILE`または`HERMES_HEARTBEAT_FILE`）では、固定先の心拍ファイルが欠落していても、
+古い・壊れている・読めない場合も`state=unknown`のdropを書きます。発見（unpinned）では、
+心拍ファイルが存在するプロファイルについて、古い・壊れている・読めない場合に
+`state=unknown`のdropを書きます。いずれもカードは「不明」として残るため、dropが消えて画面が空になることはありません。
+一方、発見（unpinned）で心拍ファイルが存在しないプロファイルにはdropを書かず、各周期の後に今回publishしなかった
+`hermes.json`・`hermes-<name>.json`も削除します。そのため、まだ起動していないプロファイルだけでなく、過去に存在して
+いまはディレクトリが削除・リネームされたプロファイルのゴーストカードも残りません。固定時は固定した1本だけを書き、
+他の`hermes.json`・`hermes-<name>.json`は削除します（固定先は常に`hermes.json`、id=`hermes`）。
+`miach.json`など他のidのdropには触れません。
 
 ## 4. Chromiumキオスク（任意）
 

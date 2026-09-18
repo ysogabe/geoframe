@@ -250,6 +250,10 @@ SCREEN_STATUS_CMD = os.environ.get("GEOFRAME_SCREEN_STATUS_CMD", "")
 HA_SCREEN_RECONCILE_SEC = float(os.environ.get("GEOFRAME_HA_SCREEN_RECONCILE_SEC", "90"))
 # Atomic, read-only status drops written by the system Hermes exporter.
 AGENT_STATUS_DIR = Path(os.environ.get("GEOFRAME_AGENT_STATUS_DIR", "/run/geoframe-agent-status"))
+# エージェントカードの順序とラベル（id=ラベル、カンマ区切り。.envで指定）
+AGENT_LABELS = [e.strip() for e in
+                os.environ.get("GEOFRAME_AGENT_LABELS",
+                               "hermes=みなも (Hermes),miach=miach-runtime").split(",") if e.strip()]
 
 # 気象庁（無認証）。GEOFRAME_JMA_AREA: 予報区コード（既定120000=千葉県）
 JMA_AREA = os.environ.get("GEOFRAME_JMA_AREA", "120000")

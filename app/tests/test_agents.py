@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -12,7 +13,7 @@ from http.server import ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from geoframe import agents, handlers, keymap, store
+from geoframe import agents, config, handlers, keymap, store
 
 EXPORTER_PATH = Path(__file__).parents[2] / "deploy" / "agents" / "hermes-status-exporter.py"
 _spec = importlib.util.spec_from_file_location("hermes_status_exporter", EXPORTER_PATH)
@@ -79,6 +80,15 @@ class AgentReaderTest(unittest.TestCase):
         body = agents.render_agents(self.root, self.now)
         # Invalid source values are rejected; no raw path, host, pid, token or prompt can pass.
         self.assertEqual(body["agents"], [])
+
+    def test_public_shape_exposes_only_the_closed_card_fields(self):
+        self.drop(path="/private/path", host="example", pid=123, token="secret", prompt="hidden")
+        body = agents.render_agents(self.root, self.now)
+        self.assertEqual(set(body["agents"][0]),
+                         {"id", "label", "state", "age_s", "task_kind", "metrics"})
+        encoded = json.dumps(body, ensure_ascii=False)
+        for value in ("/private/path", "example", "123", "secret", "hidden"):
+            self.assertNotIn(value, encoded)
 
     def test_filename_and_payload_ids_must_match(self):
         self.drop()
@@ -188,6 +198,206 @@ class ExporterTest(unittest.TestCase):
             body = agents.render_agents(dest.parent, now)
             self.assertEqual(len(body["agents"]), 1)
             self.assertEqual(body["agents"][0]["state"], "unknown")
+
+    def test_fixed_profile_with_missing_heartbeat_publishes_unknown_profile_drop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / "profiles" / "example-profile").mkdir(parents=True)
+            dest = Path(tmp) / "drops" / "hermes.json"
+            env = {"HERMES_HOME": str(home), "HERMES_PROFILE": "example-profile"}
+            with patch.dict(os.environ, env, clear=True), patch.object(exporter, "DEST", dest):
+                exporter.tick()
+            self.assertTrue(dest.is_file())
+            self.assertFalse((dest.parent / "hermes-example-profile.json").exists())
+            body = json.loads(dest.read_text(encoding="utf-8"))
+            self.assertEqual(body["id"], "hermes")
+            self.assertEqual(body["state"], "unknown")
+
+    def test_fixed_missing_heartbeat_file_publishes_unknown_hermes_drop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            missing = home / "missing-heartbeat"
+            dest = Path(tmp) / "drops" / "hermes.json"
+            env = {"HERMES_HOME": str(home), "HERMES_HEARTBEAT_FILE": str(missing)}
+            with patch.dict(os.environ, env, clear=True), patch.object(exporter, "DEST", dest):
+                exporter.tick()
+            self.assertTrue(dest.is_file())
+            body = json.loads(dest.read_text(encoding="utf-8"))
+            self.assertEqual(body["id"], "hermes")
+            self.assertEqual(body["state"], "unknown")
+
+    def test_fixed_invalid_profile_name_falls_back_to_hermes_drop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / "profiles" / "Bad_Name" / "state" / "gateway.heartbeat"
+            source.parent.mkdir(parents=True)
+            source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+            now = time.time()
+            os.utime(source, (now, now))
+            dest = Path(tmp) / "drops" / "hermes.json"
+            env = {"HERMES_HOME": str(home), "HERMES_PROFILE": "Bad_Name"}
+            with patch.dict(os.environ, env, clear=True), patch.object(exporter, "DEST", dest):
+                exporter.tick()
+            self.assertTrue(dest.is_file())
+            body = json.loads(dest.read_text(encoding="utf-8"))
+            self.assertEqual(body["id"], "hermes")
+            self.assertEqual(body["state"], "live")
+
+    def test_named_profile_publishes_a_profile_drop_with_matching_id(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / "profiles" / "example-profile" / "state" / "gateway.heartbeat"
+            source.parent.mkdir(parents=True)
+            source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+            now = time.time()
+            os.utime(source, (now, now))
+            dest = Path(tmp) / "drops" / "hermes.json"
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=True), \
+                    patch.object(exporter, "DEST", dest):
+                self.assertTrue(exporter.tick() is None)
+            profile_drop = dest.parent / "hermes-example-profile.json"
+            self.assertTrue(profile_drop.is_file())
+            self.assertEqual(json.loads(profile_drop.read_text(encoding="utf-8"))["id"],
+                             "hermes-example-profile")
+            self.assertFalse(dest.exists())
+
+    def test_default_profile_publishes_the_hermes_drop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / "state" / "gateway.heartbeat"
+            source.parent.mkdir(parents=True)
+            source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+            now = time.time()
+            os.utime(source, (now, now))
+            dest = Path(tmp) / "drops" / "hermes.json"
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=True), \
+                    patch.object(exporter, "DEST", dest):
+                exporter.tick()
+            self.assertTrue(dest.is_file())
+            self.assertEqual(json.loads(dest.read_text(encoding="utf-8"))["id"], "hermes")
+
+    def test_invalid_profile_names_do_not_publish_drops(self):
+        for name in ("Bad", "bad_name", "..", "a" * 33):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as tmp:
+                home = Path(tmp) / "home"
+                source = home / "profiles" / name / "state" / "gateway.heartbeat"
+                source.parent.mkdir(parents=True)
+                source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+                now = time.time()
+                os.utime(source, (now, now))
+                dest = Path(tmp) / "drops" / "hermes.json"
+                with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=True), \
+                        patch.object(exporter, "DEST", dest), \
+                        patch.object(exporter, "candidate_sources", return_value=(source,)):
+                    exporter.tick()
+                self.assertFalse(dest.parent.exists() and any(dest.parent.iterdir()))
+
+    def test_missing_candidates_do_not_publish_ghost_drops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            (home / "profiles" / "example-profile").mkdir(parents=True)
+            dest = Path(tmp) / "drops" / "hermes.json"
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=True), \
+                    patch.object(exporter, "DEST", dest):
+                exporter.tick()
+            self.assertFalse(dest.parent.exists() and any(dest.parent.iterdir()))
+
+    def test_discovery_removes_drop_for_profile_deleted_between_cycles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            self._write_discovery_heartbeat(home / "state" / "gateway.heartbeat", 100)
+            first = home / "profiles" / "example-profile" / "state" / "gateway.heartbeat"
+            second = home / "profiles" / "another-profile" / "state" / "gateway.heartbeat"
+            self._write_discovery_heartbeat(first, 200)
+            self._write_discovery_heartbeat(second, 300)
+            drop_dir = Path(tmp) / "drops"
+            dest = drop_dir / "hermes.json"
+            drop_dir.mkdir()
+            miach = drop_dir / "miach.json"
+            miach.write_text("keep", encoding="utf-8")
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=True), \
+                    patch.object(exporter, "DEST", dest):
+                exporter.tick()
+                shutil.rmtree(first.parents[1])
+                exporter.tick()
+            self.assertTrue((drop_dir / "hermes.json").is_file())
+            self.assertFalse((drop_dir / "hermes-example-profile.json").exists())
+            self.assertTrue((drop_dir / "hermes-another-profile.json").is_file())
+            self.assertEqual(miach.read_text(encoding="utf-8"), "keep")
+
+    def test_discovery_removes_stale_default_drop_when_default_heartbeat_disappears(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            default = home / "state" / "gateway.heartbeat"
+            self._write_discovery_heartbeat(default, 100)
+            dest = Path(tmp) / "drops" / "hermes.json"
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=True), \
+                    patch.object(exporter, "DEST", dest):
+                exporter.tick()
+                default.unlink()
+                exporter.tick()
+            self.assertFalse(dest.exists())
+
+    def test_discovery_cleanup_does_not_remove_other_drop_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            self._write_discovery_heartbeat(home / "state" / "gateway.heartbeat", 100)
+            drop_dir = Path(tmp) / "drops"
+            dest = drop_dir / "hermes.json"
+            miach = drop_dir / "miach.json"
+            hermesx = drop_dir / "hermesx.json"
+            drop_dir.mkdir()
+            miach.write_text("keep-miach", encoding="utf-8")
+            hermesx.write_text("keep-hermesx", encoding="utf-8")
+            with patch.dict(os.environ, {"HERMES_HOME": str(home)}, clear=True), \
+                    patch.object(exporter, "DEST", dest):
+                exporter.tick()
+            self.assertEqual(miach.read_text(encoding="utf-8"), "keep-miach")
+            self.assertEqual(hermesx.read_text(encoding="utf-8"), "keep-hermesx")
+
+    @staticmethod
+    def _write_discovery_heartbeat(path, mtime):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+        os.utime(path, (mtime, mtime))
+
+    def test_fixed_profile_publishes_only_its_drop_and_removes_other_hermes_drops(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / "profiles" / "example-profile" / "state" / "gateway.heartbeat"
+            source.parent.mkdir(parents=True)
+            source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+            now = time.time()
+            os.utime(source, (now, now))
+            drop_dir = Path(tmp) / "drops"
+            drop_dir.mkdir()
+            for name in ("hermes.json", "hermes-other.json", "hermes-invalid.json"):
+                (drop_dir / name).write_text("old", encoding="utf-8")
+            miach = drop_dir / "miach.json"
+            miach.write_text("keep", encoding="utf-8")
+            dest = drop_dir / "hermes.json"
+            env = {"HERMES_HOME": str(home), "HERMES_PROFILE": "example-profile"}
+            with patch.dict(os.environ, env, clear=True), patch.object(exporter, "DEST", dest):
+                exporter.tick()
+            self.assertTrue(dest.is_file())
+            self.assertEqual(json.loads(dest.read_text(encoding="utf-8"))["id"], "hermes")
+            self.assertFalse((drop_dir / "hermes-other.json").exists())
+            self.assertFalse((drop_dir / "hermes-invalid.json").exists())
+            self.assertEqual(miach.read_text(encoding="utf-8"), "keep")
+
+    def test_old_heartbeat_writes_an_unknown_drop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            source = home / "profiles" / "example-profile" / "state" / "gateway.heartbeat"
+            source.parent.mkdir(parents=True)
+            source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+            old = time.time() - exporter.HEARTBEAT_MAX_AGE - 1
+            os.utime(source, (old, old))
+            dest = Path(tmp) / "drops" / "hermes.json"
+            env = {"HERMES_HOME": str(home), "HERMES_PROFILE": "example-profile"}
+            with patch.dict(os.environ, env, clear=True), patch.object(exporter, "DEST", dest):
+                exporter.tick()
+            self.assertEqual(json.loads(dest.read_text(encoding="utf-8"))["state"], "unknown")
 
 
 class ExporterSourceDiscoveryTest(unittest.TestCase):
@@ -337,6 +547,105 @@ class ExporterSourceDiscoveryTest(unittest.TestCase):
         with self._env(HERMES_HOME=str(self.home), HERMES_PROFILE="fifo-profile"):
             self.assertEqual(exporter.select_source(), fifo)
             self.assertEqual(exporter.read_source(700.0)["state"], "unknown")
+
+
+class ConfiguredAgentCardsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        agents._last_good.clear()
+        self.now = 1_700_000_000.0
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _drop(self, agent_id, published_at, state="busy"):
+        (self.root / f"{agent_id}.json").write_text(json.dumps({
+            "id": agent_id, "published_at": published_at, "state": state,
+            "task_kind": "coding", "metrics": [],
+        }), encoding="utf-8")
+
+    def _with_labels(self, value):
+        return patch.dict(os.environ, {"GEOFRAME_AGENT_LABELS": value}, clear=False)
+
+    def test_labels_follow_env_order_and_unconfigured_drops_are_ignored(self):
+        try:
+            with self._with_labels("alpha=Alpha label, beta=Beta label"):
+                importlib.reload(config)
+                importlib.reload(agents)
+                self._drop("beta", self.now)
+                self._drop("alpha", self.now)
+                self._drop("hermes", self.now)
+                body = agents.render_agents(self.root, self.now)
+                self.assertEqual([item["id"] for item in body["agents"]], ["alpha", "beta"])
+                self.assertEqual([item["label"] for item in body["agents"]],
+                                 ["Alpha label", "Beta label"])
+        finally:
+            importlib.reload(config)
+            importlib.reload(agents)
+
+    def test_two_live_cards_win_over_a_newer_stale_card_and_are_sorted(self):
+        try:
+            with self._with_labels("alpha=Alpha, beta=Beta, gamma=Gamma"):
+                importlib.reload(config)
+                importlib.reload(agents)
+                self._drop("alpha", self.now - 20)
+                self._drop("beta", self.now - 10)
+                self._drop("gamma", self.now - 40)
+                body = agents.render_agents(self.root, self.now)
+                self.assertEqual([item["id"] for item in body["agents"]], ["beta", "alpha"])
+                self.assertTrue(body["rotation_allowed"])
+        finally:
+            importlib.reload(config)
+            importlib.reload(agents)
+
+    def test_all_stale_or_unknown_cards_remain_but_rotation_is_disabled(self):
+        try:
+            with self._with_labels("alpha=Alpha, beta=Beta"):
+                importlib.reload(config)
+                importlib.reload(agents)
+                self._drop("alpha", self.now - 121)
+                self._drop("beta", self.now, state="unknown")
+                body = agents.render_agents(self.root, self.now)
+                self.assertEqual(len(body["agents"]), 2)
+                self.assertFalse(body["rotation_allowed"])
+        finally:
+            importlib.reload(config)
+            importlib.reload(agents)
+
+    def test_unconfigured_profile_drop_warns_only_once(self):
+        try:
+            with self._with_labels("hermes=Hermes"):
+                importlib.reload(config)
+                importlib.reload(agents)
+                self._drop("hermes-example-profile", self.now)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    first = agents.render_agents(self.root, self.now)
+                    second = agents.render_agents(self.root, self.now)
+                self.assertEqual(first, {"agents": [], "rotation_allowed": False})
+                self.assertEqual(second, first)
+                self.assertEqual(stderr.getvalue().count("hermes-example-profile"), 1)
+                self.assertIn("add it to GEOFRAME_AGENT_LABELS", stderr.getvalue())
+        finally:
+            importlib.reload(config)
+            importlib.reload(agents)
+
+    def test_configured_profile_drop_does_not_warn(self):
+        try:
+            with self._with_labels("hermes=Hermes, hermes-example-profile=Example"):
+                importlib.reload(config)
+                importlib.reload(agents)
+                self._drop("hermes-example-profile", self.now)
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    body = agents.render_agents(self.root, self.now)
+                self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual([item["id"] for item in body["agents"]],
+                                 ["hermes-example-profile"])
+        finally:
+            importlib.reload(config)
+            importlib.reload(agents)
 
 
 if __name__ == "__main__":
