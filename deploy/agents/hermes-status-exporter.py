@@ -18,6 +18,11 @@ def _number(value, default=0):
     return value if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0 else default
 
 
+def _unknown_summary(now):
+    return {"id": "hermes", "published_at": now, "state": "unknown",
+            "task_kind": "unknown", "metrics": [], "hb_age_s": 0}
+
+
 def read_source(now=None):
     now = time.time() if now is None else now
     try:
@@ -25,7 +30,7 @@ def read_source(now=None):
         with SOURCE.open(encoding="utf-8") as fp:
             raw = json.load(fp)
     except (OSError, ValueError, TypeError):
-        return None
+        return _unknown_summary(now)
     hb_age_s = max(0, int(now - st.st_mtime))
     if not isinstance(raw, dict):
         raw = {}
@@ -37,12 +42,12 @@ def read_source(now=None):
     for name in ("queue", "active", "completed", "errors", "uptime_s"):
         if name in raw:
             metrics.append({"name": name, "value": _number(raw[name])})
-    return {"id": "hermes", "published_at": now if hb_age_s <= HEARTBEAT_MAX_AGE else None,
+    return {"id": "hermes", "published_at": st.st_mtime,
             "state": state, "task_kind": task, "metrics": metrics, "hb_age_s": hb_age_s}
 
 
 def publish(summary):
-    if summary is None or summary["published_at"] is None:
+    if summary is None:
         return False
     DEST.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(prefix=".hermes.", suffix=".tmp", dir=DEST.parent)

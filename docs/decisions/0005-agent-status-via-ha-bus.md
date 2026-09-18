@@ -25,7 +25,7 @@ Hermesの心拍・状態
   → #agentslayer
 ```
 
-exporterは標準ライブラリだけで非機密の要約を作り、心拍が停止しているときは`published_at`を更新しない。dropはsystem unitと専用groupでGeoFrameから読める権限にし、GeoFrameの`ProtectHome=true`は維持する。
+exporterは標準ライブラリだけで非機密の要約を作り、`published_at`は計測時刻（心拍ファイルのmtime）とする。心拍が停止・欠落していても`state=unknown`のdropを書き、dropはsystem unitと専用groupでGeoFrameから読める権限にし、GeoFrameの`ProtectHome=true`は維持する。
 
 `agents.py`はregular fileだけをno-followで読み、64KiB上限とstrict schemaを適用する。破損したdropではlast-goodの値を使うが、`published_at`を若返らせない。ファイル名とJSON内の`id`が一致しないdropは採用しない。
 
