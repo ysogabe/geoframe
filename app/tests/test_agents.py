@@ -140,9 +140,54 @@ class ExporterTest(unittest.TestCase):
                 os.utime(source, (now - 100, now - 100))
                 stale = exporter.read_source(now)
                 self.assertIsNotNone(stale)
-                self.assertIsNone(stale["published_at"])
-                self.assertFalse(exporter.publish(stale))
-                self.assertEqual(drop.read_bytes(), before)
+                self.assertEqual(stale["published_at"], now - 100)
+                self.assertTrue(exporter.publish(stale))
+                self.assertNotEqual(drop.read_bytes(), before)
+
+    def test_old_heartbeat_publishes_drop_with_heartbeat_mtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "heartbeat.json"
+            dest = root / "drops" / "hermes.json"
+            source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+            now = 1_700_000_000.0
+            heartbeat_mtime = now - 13 * 24 * 60 * 60
+            os.utime(source, (heartbeat_mtime, heartbeat_mtime))
+            with patch.object(exporter, "SOURCE", source), patch.object(exporter, "DEST", dest):
+                summary = exporter.read_source(now)
+                self.assertEqual(summary["published_at"], heartbeat_mtime)
+                self.assertTrue(exporter.publish(summary))
+                self.assertEqual(json.loads(dest.read_text(encoding="utf-8"))["published_at"], heartbeat_mtime)
+
+    def test_old_heartbeat_drop_renders_unknown_not_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "heartbeat.json"
+            dest = root / "drops" / "hermes.json"
+            source.write_text(json.dumps({"state": "live", "task_kind": "coding"}), encoding="utf-8")
+            now = 1_700_000_000.0
+            heartbeat_mtime = now - 13 * 24 * 60 * 60
+            os.utime(source, (heartbeat_mtime, heartbeat_mtime))
+            with patch.object(exporter, "SOURCE", source), patch.object(exporter, "DEST", dest):
+                self.assertTrue(exporter.publish(exporter.read_source(now)))
+            body = agents.render_agents(dest.parent, now)
+            self.assertEqual(body["agents"][0]["state"], "unknown")
+            self.assertNotEqual(body["agents"][0]["state"], "live")
+
+    def test_missing_heartbeat_publishes_unknown_card(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "missing-heartbeat.json"
+            dest = root / "drops" / "hermes.json"
+            now = 1_700_000_000.0
+            with patch.object(exporter, "SOURCE", source), patch.object(exporter, "DEST", dest):
+                summary = exporter.read_source(now)
+                self.assertEqual(summary["state"], "unknown")
+                self.assertEqual(summary["published_at"], now)
+                self.assertTrue(exporter.publish(summary))
+            body = agents.render_agents(dest.parent, now)
+            self.assertEqual(len(body["agents"]), 1)
+            self.assertEqual(body["agents"][0]["state"], "unknown")
 
 
 if __name__ == "__main__":

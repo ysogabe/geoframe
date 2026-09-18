@@ -81,7 +81,7 @@ def _state(published_at, now):
 
 def _public(item, now):
     age = max(0, int(now - item["published_at"]))
-    state = _state(item["published_at"], now)
+    state = "unknown" if item["state"] == "unknown" else _state(item["published_at"], now)
     return {"id": item["id"], "label": LABELS[item["id"]], "state": state,
             "age_s": age, "task_kind": item["task_kind"], "metrics": item["metrics"]}
 
