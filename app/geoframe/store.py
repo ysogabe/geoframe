@@ -193,6 +193,16 @@ CREATE TABLE IF NOT EXISTS photo_ai_features(
 );
 CREATE INDEX IF NOT EXISTS idx_photo_ai_features_sha
   ON photo_ai_features(content_sha256);
+-- embeddingのモデル別キャッシュ（画像の中身のSHA-256単位）。photo_ai_featuresは今のモデルの
+-- 1行だけを持つので、モデルを切り替えて戻したときに計算・課金をやり直さないためにここへ残す。
+CREATE TABLE IF NOT EXISTS photo_embeddings(
+  content_sha256 TEXT NOT NULL,
+  embedding_model TEXT NOT NULL,
+  embedding_dim INTEGER NOT NULL,
+  embedding BLOB NOT NULL,
+  analyzed_at TEXT NOT NULL,
+  PRIMARY KEY(content_sha256, embedding_model)
+);
 CREATE TABLE IF NOT EXISTS photo_ai_groups(
   group_id TEXT PRIMARY KEY,
   kind TEXT NOT NULL CHECK(kind IN ('scene','pet')),
@@ -293,6 +303,12 @@ def db():
                 _db.commit()
             except sqlite3.OperationalError:
                 pass
+        # photo_embeddings導入前のembeddingをキャッシュへ写す（既にあれば何もしない）。
+        _db.execute("""INSERT OR IGNORE INTO photo_embeddings(
+                         content_sha256,embedding_model,embedding_dim,embedding,analyzed_at)
+                       SELECT content_sha256,embedding_model,embedding_dim,embedding,analyzed_at
+                       FROM photo_ai_features WHERE error=''""")
+        _db.commit()
     return _db
 
 
