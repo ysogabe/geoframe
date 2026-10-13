@@ -33,6 +33,7 @@
 - `GEOFRAME_LOCAL_EMBED_THREADS`（`config.py`: `LOCAL_EMBED_THREADS`） — 既定値 `4`。localのembeddingに使うCPUスレッド数。同じPCの他の処理と分け合う
 - `GEOFRAME_AI_SIMILARITY`（`config.py`: `AI_SIMILARITY`） — 既定値 なし（未設定時は `("0.83" if EMBED_BACKEND == "local" else "0.82")`）。同一場面候補とみなすembeddingのcosine類似度しきい値。既定はモデルごとに違う （embeddinggemma-2の0.83は、実写真でGemini Embedding 2の0.82と同じ分位点に当たる値）
 - `GEOFRAME_AI_VISUAL_SIMILARITY`（`config.py`: `AI_VISUAL_SIMILARITY`） — 既定値 なし（未設定時は `("0.91" if EMBED_BACKEND == "local" else "0.90")`）。検索結果で「同じ構図」に畳むcosine類似度しきい値。既定はモデルごとに違う
+- `GEOFRAME_RANK_MODEL`（`config.py`: `RANK_MODEL_PATH`） — 既定値 なし（未設定時は `DATA_DIR / "models" / "rank_model.json"`）。同一場面グループの中の順位に使う学習済みモデル（JSON）。無ければ鮮明度・露出などの 固定の式で順位を付ける。家庭の写真の評価から作るため、リポジトリには入れない
 - `GEOFRAME_AI_SHORTLIST_MAX`（`config.py`: `AI_SHORTLIST_MAX`） — 既定値 `6`。1グループでGemini比較に回す最大枚数（2〜6へクランプ）
 - `GEOFRAME_AI_SEARCH_PER_MIN`（`config.py`: `AI_SEARCH_PER_MIN`） — 既定値 `30`。/api/ai/search の流量上限（分あたり）。LAN内の任意ページから連打GETで 全embedding行の毎回フルスキャン（3テーブルJOIN、グローバルDBロック内）を 誘発できるため、tiles.pyのスライディング窓と同型で抑制する。
 - `GEOFRAME_DRIVE_KEY`（`config.py`: `DRIVE_KEY`） — 既定値 `drive_key.json`。Google Driveサービスアカウント鍵JSONのパス（ROOT＝app/ からの相対）

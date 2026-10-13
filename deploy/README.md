@@ -206,6 +206,23 @@ embeddinggemma-2により計算し、写真をembeddingのためにGoogleへ送�
 戻すときは`GEOFRAME_EMBED_BACKEND`の行を消して再起動します。Geminiのembeddingはキャッシュに
 残っているので、作り直し（課金）は起きません。
 
+### 2.2 学習済みの順位付け（任意）
+
+同一場面グループの中の順位（Geminiに見せる最大6枚の選択と、その並び）を、過去のGemini比較評価から
+学習した線形モデルで付けられます。モデルは家庭の写真の評価から作るため、リポジトリには入れず、
+`/var/lib/geoframe/models/rank_model.json`（`GEOFRAME_RANK_MODEL`）に置きます。読み込みは
+ファイルの更新を検知して自動で行うので、再起動は要りません。
+
+```sh
+sudo install -o geoframe -g geoframe -m 0640 rank_model.json /var/lib/geoframe/models/rank_model.json
+```
+
+- モデルの`embedding_model`が今のembeddingと違う場合（例: ローカル用のモデルで`gemini`のまま）、
+  ファイルが壊れている場合は使わず、固定の式で順位を付けます（ログに理由が出ます）。
+- 7枚以上のグループでは選ばれる6枚が変わるため、そのグループは比べ直しになります。
+- 使っているモデルは`photo_ai_groups.algorithm`の末尾（`:rank-<名前>`）で分かります。
+  戻すときはファイルを消します。
+
 ## 3. サーバーの有効化
 
 ```sh
