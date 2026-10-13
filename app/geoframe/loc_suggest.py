@@ -379,15 +379,23 @@ def _apply_run(run, members: list[dict]) -> int:
     return len(rows)
 
 
+_geocode_retried: set[str] = set()
+
+
 def _needs_apply(run_id: str, members: list[dict], current: dict) -> bool:
-    """候補が未作成・別の問い合わせのもの・座標化がまだ、のいずれかなら書き直す。
-    座標化の再試行はNominatimのキャッシュに当たるので、0件だった地名で通信は増えない"""
+    """候補が未作成・別の問い合わせのもの、なら書き直す。座標化できなかった候補は
+    Nominatimの一時障害かもしれないので、サーバー起動ごとに1回だけ引き直す
+    （0件だった地名はキャッシュに当たるので通信は増えない。毎サイクル書き直さない）"""
+    retry = False
     for photo in members:
         row = current.get(photo["id"])
         if row is None or row["run_id"] != run_id:
             return True
         if row["lat"] is None and row["geocode_query"] and row["precision"] != "unknown":
-            return True
+            retry = True
+    if retry and run_id not in _geocode_retried:
+        _geocode_retried.add(run_id)
+        return True
     return False
 
 

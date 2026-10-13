@@ -77,6 +77,7 @@ class LocSuggestCase(unittest.TestCase):
             return []
 
         for patcher in (
+                patch.object(loc_suggest, "_geocode_retried", set()),
                 patch.object(loc_suggest, "DATA_DIR", self.root),
                 patch.object(loc_suggest, "DERIV_DIR", self.root / "derivatives"),
                 patch.object(loc_suggest, "AgentPlatformEmbeddingClient", Factory),
@@ -269,6 +270,19 @@ class CycleTest(LocSuggestCase):
         row = self.suggestions()[1]
         self.assertEqual((row["lat"], row["precision"]), (30.0, "city"))
         self.assertEqual(self.geocoded[-2:], [("Giza Plateau, Giza", "EG"), ("Giza", "EG")])
+
+
+    def test_ungeocodable_day_is_retried_once_not_every_cycle(self):
+        self.add(1, "2001-06-20 09:00", 0.9, "landmark")
+        self.gemini.responses = [_answer("どこか", "Nowhere Land", precision="city")]
+        loc_suggest.loc_suggest_cycle()
+        first = len(self.geocoded)
+        loc_suggest.loc_suggest_cycle()          # 起動後1回目の引き直し
+        second = len(self.geocoded)
+        loc_suggest.loc_suggest_cycle()
+        loc_suggest.loc_suggest_cycle()
+        self.assertGreater(second, first)
+        self.assertEqual(len(self.geocoded), second)
 
 
 class AdminApiTest(LocSuggestCase):
