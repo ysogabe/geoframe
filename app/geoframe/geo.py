@@ -1,11 +1,12 @@
 """位置の時刻推定・地理院逆ジオコーディング/標高（server.py L577-L693 より移動）"""
 import re
+import threading
 import time
 import urllib.parse
 import urllib.request
 
 from .config import (GSI_ELEV, GSI_GEOCODE, GSI_RGEO, INFER_OFFSET_S,
-                     INFER_WINDOW_S, INFER_WINDOWS_S)
+                     INFER_WINDOW_S, INFER_WINDOWS_S, NOMINATIM_SEARCH)
 from .store import cache_get, cache_put, dbq, dbx
 from .util import http_json, t_epoch
 
@@ -75,15 +76,25 @@ GEOCODE_MIN_LEN = 2         # 1文字等の短すぎる入力は無駄なリク�
 GEOCODE_MAX_RESULTS = 10
 
 
+NOMINATIM_MIN_INTERVAL_S = 1.0   # 公開Nominatimの利用規約（最大1秒1件）
+_nominatim_lock = threading.Lock()
+_nominatim_last = 0.0
+
+
 def geocode_search(query):
-    """地名・住所 → 座標候補のリスト。地理院のアドレス検索APIを使う（認証不要・無料）。
-    日本国内の住所・地名のみ対応（海外地名は0件になる。既知の制約 — 写真自体は
-    OSMタイルで世界中表示できるが、検索のショートカットは国内限定）。
+    """地名・住所 → 座標候補のリスト。まず地理院のアドレス検索API（国内・認証不要）を引き、
+    0件（または失敗）のときだけ Nominatim（OpenStreetMap）で海外を含めて引き直す。
+    国内の地名は従来どおり地理院の結果だけを返し、Nominatimへの問い合わせを最小にする。
+    各候補の source は 'gsi' | 'osm'（osmは画面に出典表示が要るため区別する）。
     上流エラー・タイムアウト・想定外の応答形式は例外を握って空リストにする
     （検索結果ゼロ扱いにするだけで、/admin 全体を落とさない）"""
     q = (query or "").strip()
     if len(q) < GEOCODE_MIN_LEN:
         return []
+    return _gsi_geocode(q) or _nominatim_geocode(q)
+
+
+def _gsi_geocode(q):
     try:
         data = http_json(GSI_GEOCODE.format(q=urllib.parse.quote(q)))
         if not isinstance(data, list):
@@ -98,11 +109,51 @@ def geocode_search(query):
             if not (isinstance(lat, (int, float)) and isinstance(lon, (int, float))):
                 continue
             title = ((feat.get("properties") or {}).get("title") or "").strip()
-            out.append({"title": title or q, "lat": float(lat), "lon": float(lon)})
+            out.append({"title": title or q, "lat": float(lat), "lon": float(lon),
+                        "source": "gsi"})
         return out
     except Exception as e:
-        print(f"[geo] 地名検索失敗（q={q!r}）: {e}")
+        print(f"[geo] 地名検索失敗（地理院 q={q!r}）: {e}")
         return []
+
+
+def _nominatim_geocode(q):
+    """Nominatim で地名検索する。同じ語の再検索で公開サーバーを叩かないよう、
+    応答が返った結果（0件を含む）はキャッシュする。通信失敗はキャッシュしない。
+    問い合わせは全スレッド合計で1秒1件に絞る（超える分は待たせる）"""
+    global _nominatim_last
+    key = f"geocode_osm:{q}"
+    hit = cache_get(key)
+    if isinstance(hit, list):
+        return hit
+    try:
+        with _nominatim_lock:
+            wait = _nominatim_last + NOMINATIM_MIN_INTERVAL_S - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                data = http_json(NOMINATIM_SEARCH.format(
+                    q=urllib.parse.quote(q), limit=GEOCODE_MAX_RESULTS))
+            finally:
+                _nominatim_last = time.monotonic()
+    except Exception as e:
+        print(f"[geo] 地名検索失敗（Nominatim q={q!r}）: {e}")
+        return []
+    if not isinstance(data, list):
+        return []                  # 想定外の形式（エラー応答等）はキャッシュしない
+    out = []
+    for item in data:
+        try:
+            lat, lon = float(item["lat"]), float(item["lon"])   # 文字列で返る
+        except (TypeError, KeyError, ValueError):
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        title = str(item.get("display_name") or "").strip()
+        out.append({"title": title or q, "lat": lat, "lon": lon, "source": "osm"})
+    out = out[:GEOCODE_MAX_RESULTS]
+    cache_put(key, out)
+    return out
 
 
 MUNI_URL = "https://maps.gsi.go.jp/js/muni.js"

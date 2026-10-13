@@ -261,5 +261,9 @@ def allowed_hosts_note():
 GSI_RGEO = "https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress?lat={lat}&lon={lon}"
 GSI_ELEV = "https://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon={lon}&lat={lat}&outtype=JSON"
 # 地名・住所検索（順ジオコーディング）。/admin の手動位置指定で「地名で近くまで飛ぶ」用途。
-# 日本国内の住所・地名のみ対応（海外写真には使えない既知の制約）
+# まず地理院（国内の住所・地名）を引き、0件のときだけ Nominatim（OpenStreetMap・世界）へ回す。
+# Nominatim は公開サーバーの利用規約（1秒1件まで・識別できるUser-Agent・結果のキャッシュ）
+# に従う前提で、手動検索の補助にだけ使う。
 GSI_GEOCODE = "https://msearch.gsi.go.jp/address-search/AddressSearch?q={q}"
+NOMINATIM_SEARCH = ("https://nominatim.openstreetmap.org/search"
+                    "?q={q}&format=jsonv2&limit={limit}&accept-language=ja")

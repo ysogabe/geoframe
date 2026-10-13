@@ -263,6 +263,7 @@ function ensureMini(){
   return mini;
 }
 /* ==== 6b) 地名検索（地図を近くまで移動するショートカット。位置はここでは確定しない） ====
+   国内は地理院、0件なら海外を含めてOpenStreetMap（Nominatim）で引く（サーバー側で切替）。
    候補クリック後も既存の「地図クリック→SAVE」フローは維持する。検索結果の代表点は
    住所の代表座標であり実際の撮影地点とは限らないため、自動確定はしない */
 function clearGeocodeResults(){
@@ -279,7 +280,8 @@ function doGeocodeSearch(){
       const box = $('#m-results');
       box.classList.remove('hidden');
       if(!d.ok || !d.items.length){
-        box.appendChild(el('div', 'm-noresult', '見つかりませんでした（国内の地名のみ対応）'));
+        box.appendChild(el('div', 'm-noresult',
+          '見つかりませんでした（海外は「Times Square」のように地名だけで検索してください）'));
         return;
       }
       d.items.forEach(item => {
@@ -290,6 +292,12 @@ function doGeocodeSearch(){
         });
         box.appendChild(row);
       });
+      // 海外の候補はOpenStreetMap（Nominatim）由来。ODbLの出典表示が要る
+      if(d.items.some(item => item.source === 'osm')){
+        const credit = el('div', 'm-noresult');
+        credit.innerHTML = '地名データ ' + TILE_ATTRIB_OSM;
+        box.appendChild(credit);
+      }
     }).catch(e => toast('検索失敗: ' + e.message, true));
 }
 
