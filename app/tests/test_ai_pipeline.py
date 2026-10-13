@@ -283,3 +283,50 @@ class LearnedRankTest(PipelineDbCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class JudgeOrderTest(PipelineDbCase):
+    def setUp(self):
+        super().setUp()
+        self.original_rate = ai_pipeline.AI_JUDGE_SHUFFLE_RATE
+
+    def tearDown(self):
+        ai_pipeline.AI_JUDGE_SHUFFLE_RATE = self.original_rate
+        super().tearDown()
+
+    def test_presentation_order_is_deterministic_and_shuffles_about_rate(self):
+        ai_pipeline.AI_JUDGE_SHUFFLE_RATE = 0.2
+        ids = [11, 12, 13, 14, 15, 16]
+        modes = [ai_pipeline.presentation_order(f"scene-{n:016x}", ids) for n in range(2000)]
+        shuffled = [presented for mode, presented in modes if mode == "shuffled"]
+        self.assertTrue(0.17 < len(shuffled) / len(modes) < 0.23)
+        self.assertTrue(all(presented == ids for mode, presented in modes if mode == "rank"))
+        self.assertTrue(all(sorted(presented) == ids for presented in shuffled))
+        self.assertTrue(any(presented != ids for presented in shuffled))
+        self.assertEqual(ai_pipeline.presentation_order("scene-x", ids),
+                         ai_pipeline.presentation_order("scene-x", ids))
+        ai_pipeline.AI_JUDGE_SHUFFLE_RATE = 0.0
+        self.assertEqual(ai_pipeline.presentation_order("scene-x", ids), ("rank", ids))
+
+    def test_shuffled_judgment_maps_back_to_presented_photos(self):
+        ai_pipeline.AI_JUDGE_SHUFFLE_RATE = 1.0
+        for pid, color in ((1, "#d02020"), (2, "#c82020"), (3, "#c01818"), (4, "#d81c1c")):
+            self._add_photo(pid, color, f"sha-red-{pid}")
+
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=1)
+
+        group = store.dbq("SELECT group_id,judge_order,presented_json,shortlist_json FROM photo_ai_groups")[0]
+        presented = json.loads(group["presented_json"])
+        self.assertEqual(group["judge_order"], "shuffled")
+        self.assertEqual(sorted(presented), sorted(json.loads(group["shortlist_json"])))
+        # FakeGeminiは見せた1枚目を推奨し、keep_scoreを見せた順に89, 88, ...と付ける。
+        recommended = [row["photo_id"] for row in store.dbq(
+            "SELECT photo_id FROM photo_ai_group_members WHERE recommended=1")]
+        self.assertEqual(recommended, [presented[0]])
+        scores = {row["photo_id"]: row["keep_score"] for row in store.dbq(
+            "SELECT photo_id,keep_score FROM photo_ai_features")}
+        self.assertEqual([scores[pid] for pid in presented], [89, 88, 87, 86])
+
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=1)
+        kept = store.dbq("SELECT group_id,judge_order,presented_json FROM photo_ai_groups")[0]
+        self.assertEqual(tuple(kept), (group["group_id"], "shuffled", group["presented_json"]))
