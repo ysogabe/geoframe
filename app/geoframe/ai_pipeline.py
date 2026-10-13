@@ -210,17 +210,17 @@ def _embed_pending(photos: list[PipelinePhoto], client, limit: int) -> int:
     analyzed_at = _now()
     cached = []
     computed = 0
+    # 同じ中身を前に同じモデルでembeddingしていれば、それを使う（切り替えて戻したとき、
+    # prefill_embeddingsで先に作っておいたとき）。キャッシュからの分は上限に数えない。
+    cache = {row["content_sha256"]: row["embedding"] for row in dbq(
+        """SELECT content_sha256,embedding FROM photo_embeddings
+           WHERE embedding_model=? AND embedding_dim=?""", (EMBED_MODEL, EMBED_DIM))} if pending else {}
     try:
         for photo in pending:
-            # 同じ中身を前に同じモデルでembeddingしていれば、それを使う（切り替えて戻したとき、
-            # prefill_embeddingsで先に作っておいたとき）。キャッシュからの分は上限に数えない。
-            hit = dbq("""SELECT embedding FROM photo_embeddings
-                         WHERE content_sha256=? AND embedding_model=? AND embedding_dim=?""",
-                      (photo.sha256, EMBED_MODEL, EMBED_DIM))
             embedding = None
-            if hit:
+            if photo.sha256 in cache:
                 try:
-                    embedding = list(unpack_embedding(hit[0]["embedding"], EMBED_DIM))
+                    embedding = list(unpack_embedding(cache[photo.sha256], EMBED_DIM))
                 except (ValueError, TypeError):
                     embedding = None
             if embedding is None:

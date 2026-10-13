@@ -205,6 +205,16 @@ class EmbeddingBackendSwitchTest(PipelineDbCase):
         self.assertEqual(result["embedded"], 3)  # キャッシュからの分は上限0でも入る
         self.assertEqual(self.local.embeds, 0)
 
+    def test_upsert_clears_judgment_only_when_content_differs(self):
+        # 通常は中身が変わると掃除で行ごと消えるが、upsert自体も中身の違いで判定を消すことを確かめる。
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=2)
+        before = self._judgments()
+        store.dbx("UPDATE photo_quality_features SET content_sha256='sha-red-2b' WHERE photo_id=2")
+        ai_pipeline._embed_pending(ai_pipeline._load_photos(), self.gemini, 10)
+        after = self._judgments()
+        self.assertEqual(after[1], before[1])
+        self.assertEqual(after[2], ("", None, None, None))
+
     def test_changed_photo_content_clears_its_judgment(self):
         ai_pipeline.ai_cycle(embed_limit=10, judge_limit=2)
         before = self._judgments()
