@@ -1,18 +1,15 @@
 """背景地図タイルのプロキシ（server.py L923-L1051 より移動）"""
 import io
-import hashlib
 import os
 import threading
 import time
 import urllib.error
 import urllib.request
-import zlib
-from collections import OrderedDict, deque
+from collections import deque
 
 from PIL import Image
 
-from .config import (GSI_DEM_TILE_BANDS, GSI_PHOTO_TILE_BANDS,
-                     TILE_CACHE_MAX_MB, TILE_DIR, TILE_FETCH_PER_MIN,
+from .config import (TILE_CACHE_MAX_MB, TILE_DIR, TILE_FETCH_PER_MIN,
                      TILE_SOURCES, TILE_UA)
 
 
@@ -20,7 +17,6 @@ from .config import (GSI_DEM_TILE_BANDS, GSI_PHOTO_TILE_BANDS,
 # 背景地図タイルのプロキシ（ファイル永続キャッシュ）
 # ============================================================
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-JPEG_MAGIC = b"\xff\xd8\xff"
 # ソースごとに上流への同時接続数を絞る（OSMのtile usage policy配慮）
 _tile_sems = {k: threading.Semaphore(v[2]) for k, v in TILE_SOURCES.items()}
 _blank_tile = None
@@ -32,36 +28,15 @@ _tile_fetch_lock = threading.Lock()
 _tile_throttled = False      # 抑制中フラグ。開始時と解除時に1行ずつだけログを出すために持つ
 
 
-def _band_tile_url(bands, label, z, x, y):
-    """min/max zoom帯からURLテンプレートを選ぶ（gsi-photo/gsi-demで共有）。"""
-    for min_zoom, max_zoom, template in bands:
-        if min_zoom <= z <= max_zoom:
-            return template.format(z=z, x=x, y=y)
-    raise ValueError(f"{label}の提供ズーム外: z{z}")
-
-
 def _upstream_tile_url(layer, z, x, y):
-    """layerとzoomから上流URLを決める。3D写真・DEMはGSIの公式ズーム帯を継ぎ合わせる。"""
-    if layer == "gsi-photo":
-        return _band_tile_url(GSI_PHOTO_TILE_BANDS, "gsi-photo", z, x, y)
-    if layer == "gsi-dem":
-        return _band_tile_url(GSI_DEM_TILE_BANDS, "gsi-dem", z, x, y)
     return TILE_SOURCES[layer][0].format(z=z, x=x, y=y)
 
 
-def _normalise_tile_bytes(data):
-    """クライアント向けPNGへ正規化する。GSIシームレス写真のJPEGも受け入れる。"""
-    if data.startswith(PNG_MAGIC):
-        return data
-    if not data.startswith(JPEG_MAGIC):
-        raise ValueError(f"画像ではない応答 ({len(data)}B)")
-    with Image.open(io.BytesIO(data)) as image:
-        image.load()
-        if image.size != (256, 256):
-            raise ValueError(f"想定外のタイルサイズ: {image.size[0]}x{image.size[1]}")
-        buf = io.BytesIO()
-        image.convert("RGB").save(buf, format="PNG", compress_level=3)
-        return buf.getvalue()
+def _check_png(data):
+    """キャプティブポータル等のHTMLを拒否する（osm/gsi はPNGで配信される）。"""
+    if not data.startswith(PNG_MAGIC):
+        raise ValueError(f"PNGではない応答 ({len(data)}B)")
+    return data
 
 
 def _transparent_tile():
@@ -74,142 +49,6 @@ def _transparent_tile():
                 Image.new("RGBA", (256, 256), (0, 0, 0, 0)).save(buf, format="PNG")
                 _blank_tile = buf.getvalue()
     return _blank_tile
-
-
-DEM_NO_DATA_RGB = (128, 0, 0)  # GSI標高エンコードの欠測値: x=128*65536=2^23 => 「データなし」
-_dem_no_data_tile = None
-_dem_no_data_lock = threading.Lock()
-
-
-def _dem_no_data_tile_bytes():
-    """256×256のDEM欠測タイル（RGB 128,0,0で塗り潰したPNG）。
-    透明PNGにはしない: raster-demデコーダは透明ピクセルを標高0mの実データと区別できず
-    地形が不自然に落ち込む。GSIの欠測エンコードそのものを返すことで、フロント側の
-    JAPAN_GSI_ELEVATION_DECODERが「データなし」と正しく判定できるようにする。"""
-    global _dem_no_data_tile
-    if _dem_no_data_tile is None:
-        with _dem_no_data_lock:
-            if _dem_no_data_tile is None:
-                buf = io.BytesIO()
-                Image.new("RGB", (256, 256), DEM_NO_DATA_RGB).save(buf, format="PNG")
-                _dem_no_data_tile = buf.getvalue()
-    return _dem_no_data_tile
-
-
-def _placeholder_tile(layer):
-    """欠損時に返す代替タイル。gsi-demだけは透明ではなくRGB(128,0,0)欠測エンコードを返す。"""
-    return _dem_no_data_tile_bytes() if layer == "gsi-dem" else _transparent_tile()
-
-
-# 再試行時の同じ画像のデコードだけを省く、小さな判定キャッシュ。
-_PHOTO_CONTENT_CACHE_MAX = 256
-_photo_content_cache = OrderedDict()
-_photo_content_lock = threading.Lock()
-
-
-def _photo_png_metadata(data):
-    """ピクセルをデコードせず、PNGチャンクから（alphaの有無, 形式の妥当性）を返す。"""
-    if not isinstance(data, (bytes, bytearray)) or not data.startswith(PNG_MAGIC):
-        return False, False
-    offset = len(PNG_MAGIC)
-    ihdr = None
-    has_trns = False
-    saw_plte = False
-    saw_idat = False
-    saw_iend = False
-    while offset + 12 <= len(data):
-        length = int.from_bytes(data[offset:offset + 4], "big")
-        chunk_start = offset + 8
-        chunk_end = chunk_start + length
-        crc_end = chunk_end + 4
-        if crc_end > len(data):
-            return False, False
-        chunk_type = data[offset + 4:offset + 8]
-        chunk = data[chunk_start:chunk_end]
-        expected_crc = int.from_bytes(data[chunk_end:crc_end], "big")
-        if zlib.crc32(chunk_type + chunk) & 0xffffffff != expected_crc:
-            return False, False
-        if ihdr is None:
-            if chunk_type != b"IHDR" or length != 13:
-                return False, False
-            width = int.from_bytes(chunk[0:4], "big")
-            height = int.from_bytes(chunk[4:8], "big")
-            bit_depth = chunk[8]
-            color_type = chunk[9]
-            valid_depths = {
-                0: {1, 2, 4, 8, 16},
-                2: {8, 16},
-                3: {1, 2, 4, 8},
-                4: {8, 16},
-                6: {8, 16},
-            }
-            if (width != 256 or height != 256 or
-                    bit_depth not in valid_depths.get(color_type, set())):
-                return False, False
-            ihdr = (color_type in (4, 6), color_type)
-        elif chunk_type == b"tRNS":
-            has_trns = True
-        elif chunk_type == b"PLTE":
-            saw_plte = True
-        elif chunk_type == b"IDAT":
-            saw_idat = True
-        elif chunk_type == b"IEND":
-            if length != 0:
-                return False, False
-            saw_iend = True
-            break
-        offset = crc_end
-    if not saw_iend or ihdr is None or not saw_idat:
-        return False, False
-    if ihdr[1] == 3 and not saw_plte:
-        return False, False
-    return ihdr[0] or has_trns, True
-
-
-def _photo_content_cache_get(digest):
-    with _photo_content_lock:
-        value = _photo_content_cache.get(digest)
-        if value is not None:
-            _photo_content_cache.move_to_end(digest)
-        return value
-
-
-def _photo_content_cache_put(digest, value):
-    with _photo_content_lock:
-        _photo_content_cache[digest] = value
-        _photo_content_cache.move_to_end(digest)
-        while len(_photo_content_cache) > _PHOTO_CONTENT_CACHE_MAX:
-            _photo_content_cache.popitem(last=False)
-
-
-def _classify_photo_png(data, has_alpha):
-    if not has_alpha:
-        return "imagery"
-    try:
-        with Image.open(io.BytesIO(data)) as image:
-            image.load()
-            alpha = image.convert("RGBA").getchannel("A")
-            return "empty" if alpha.getextrema() == (0, 0) else "imagery"
-    except Exception:
-        return "empty"
-
-
-def photo_tile_content(layer, data):
-    """通常のRGB PNGをデコードせず、gsi-photoの実画像/透明代替を判別する。"""
-    if layer != "gsi-photo":
-        return None
-    if data == _transparent_tile():
-        return "empty"
-    digest = hashlib.sha256(data).digest() if isinstance(data, (bytes, bytearray)) else None
-    if digest is not None:
-        cached = _photo_content_cache_get(digest)
-        if cached is not None:
-            return cached
-    has_alpha, valid = _photo_png_metadata(data)
-    result = _classify_photo_png(data, has_alpha) if valid else "empty"
-    if digest is not None:
-        _photo_content_cache_put(digest, result)
-    return result
 
 
 def _tile_fetch_allowed():
@@ -235,55 +74,39 @@ def _tile_fetch_allowed():
         return True
 
 
-def fetch_tile(layer, z, x, y, *, detail=False):
-    """地図タイル1枚を取得（ファイル永続キャッシュ。エラーは代替タイル扱いでログ）
-    代替タイルはlayerが gsi-dem かどうかで変わる（_placeholder_tile）:
-    通常layerは透明PNG、gsi-demはRGB(128,0,0)のDEM欠測エンコード。
+def fetch_tile(layer, z, x, y):
+    """地図タイル1枚を取得（ファイル永続キャッシュ。エラーは透明タイル扱いでログ）
     戻り値: (PNGバイト列, cache_status)
       "hit"       キャッシュから返した
-      "miss"      上流から取得してキャッシュに保存した（404の代替タイル永続化を含む）
-      "error"     上流エラー。代替タイルを返すがキャッシュしない（次回再試行させる）
-      "throttled" 流量上限に達したため上流へ行かなかった。代替タイルを返しキャッシュしない
-      "skipped"   detail指定で低ズーム写真を省略した。キャッシュも上流予算も使わない"""
-    # サイバー表示へ重ねる写真は高精細帯だけ。エンジン側minZoomを14へ上げると
-    # 親LODの探索が重くなるため、通常の探索を維持し低ズームだけ透明で返す。
-    # 通常写真のキャッシュを汚さず、上流の取得予算も消費しない。
-    if detail and layer == "gsi-photo" and z < 14:
-        return _transparent_tile(), "skipped"
+      "miss"      上流から取得してキャッシュに保存した（404の透明タイル永続化を含む）
+      "error"     上流エラー。透明タイルを返すがキャッシュしない（次回再試行させる）
+      "throttled" 流量上限に達したため上流へ行かなかった。透明タイルを返しキャッシュしない"""
     f = TILE_DIR / layer / str(z) / str(x) / f"{y}.png"
     if f.exists():
         try:
             return f.read_bytes(), "hit"      # ヒットは無制限（正常な再描画・リロードを妨げない）
         except Exception:
             pass
-    try:
-        url = _upstream_tile_url(layer, z, x, y)
-    except ValueError:
-        # 提供ズーム外（gsi-demならz>14など）は上流へ行けない恒久欠測。
-        # 分/枚の共有予算チェックより先に返すことで、上流へ行かない要求が
-        # 予算を消費しないようにする（スライディング窓の枯渇を防ぐ）。
-        return _placeholder_tile(layer), "error"
+    url = _upstream_tile_url(layer, z, x, y)
     if not _tile_fetch_allowed():
-        # 上限超過。404にするとMapLibreがリトライを連発するので200＋代替タイルで返しきる
-        return _placeholder_tile(layer), "throttled"
+        # 上限超過。404にするとMapLibreがリトライを連発するので200＋透明タイルで返しきる
+        return _transparent_tile(), "throttled"
     try:
         req = urllib.request.Request(url, headers={
-            "User-Agent": TILE_UA, "Accept": "image/jpeg,image/png,image/*;q=0.8"})
+            "User-Agent": TILE_UA, "Accept": "image/png"})
         with _tile_sems[layer]:
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = r.read()
-        # キャプティブポータル等のHTMLを拒否し、JPEG配信の航空写真もPNGへ統一する。
-        # gsi-demは常にPNGで届く（DEMタイルにJPEG配信は無い）ため、そのままraw bytesを通す。
-        data = _normalise_tile_bytes(data)
+        data = _check_png(data)
     except urllib.error.HTTPError as e:
         if e.code != 404:
             print(f"[tile] {layer} z{z}/{x}/{y}: {e}")
-            return _placeholder_tile(layer), "error"
-        # 提供範囲外は恒久的 → 代替タイルを永続化して以後問い合わせない
-        data = _placeholder_tile(layer)
+            return _transparent_tile(), "error"
+        # 提供範囲外は恒久的 → 透明タイルを永続化して以後問い合わせない
+        data = _transparent_tile()
     except Exception as e:
         print(f"[tile] {layer} z{z}/{x}/{y}: {e}")
-        return _placeholder_tile(layer), "error"   # 5xx・タイムアウト・回線断はキャッシュしない
+        return _transparent_tile(), "error"   # 5xx・タイムアウト・回線断はキャッシュしない
     try:
         f.parent.mkdir(parents=True, exist_ok=True)
         # ThreadingHTTPServerの並行書き込み対策: 同一ディレクトリのtmpへ書いてatomicに差し替える

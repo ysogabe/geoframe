@@ -1,19 +1,14 @@
-"""写真マニフェスト・旅行クラスタ・統計
-（server.py L748-L857 / L1341-L1378 / L1402 / L1406-L1410 より移動。
-_last_trips の循環を避けるため api_stats・get_manifest_cached も同居させる）"""
-import time
+"""写真マニフェスト・旅行クラスタ・この日の写真"""
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from .store import dbq
-from .util import haversine_km, t_epoch
+from .util import t_epoch
 
 
 # ============================================================
 # API
 # ============================================================
-_last_trips = []
-
 # 品質結果は「同じ原本・同じ表示画像」にだけ適用する。Drive更新後はmd5が、ローカル更新後は
 # mtimeが変わるため、解析を再実行するまで自動的に未評価へ戻る。
 QUALITY_JOIN = """LEFT JOIN photo_quality q
@@ -58,7 +53,6 @@ def _ai_fields(row):
 
 
 def api_photos():
-    global _last_trips
     rows = dbq(f"""SELECT p.*, {QUALITY_COLUMNS}, {AI_COLUMNS} FROM photos p
                   {QUALITY_JOIN}
                   {AI_JOIN}
@@ -84,7 +78,7 @@ def api_photos():
         **_quality_fields(r),
         **_ai_fields(r),
     } for r in rows]
-    _last_trips = assign_trips(items)   # 各itemに trip 番号も付与される
+    assign_trips(items)   # 各itemに trip 番号を付与する
     return items
 
 
@@ -171,53 +165,3 @@ def api_onthisday(today=None):
                 **_ai_fields(r),
             })
     return {"ok": True, "today": today.isoformat(), "items": items[:ONTHISDAY_MAX]}
-
-
-def api_stats():
-    """写真EXIFから生成する「自分統計」— すべて実データ"""
-    rows = dbq("""SELECT taken_at, lat, lon, pref, city FROM photos
-                  WHERE lat IS NOT NULL""")
-    prefs, cities = {}, {}
-    months = [0] * 12
-    pts = []
-    times = []
-    for r in rows:
-        if r["pref"]:
-            prefs[r["pref"]] = prefs.get(r["pref"], 0) + 1
-        if r["city"]:
-            cities[r["city"]] = cities.get(r["city"], 0) + 1
-        if r["taken_at"]:
-            times.append(r["taken_at"])
-            try:
-                months[int(r["taken_at"][5:7]) - 1] += 1
-            except Exception:
-                pass
-            te = t_epoch(r["taken_at"])
-            if te:
-                pts.append((te, r["lat"], r["lon"]))
-    pts.sort()
-    dist = sum(haversine_km(a[1], a[2], b[1], b[2]) for a, b in zip(pts, pts[1:]))
-    inferred = dbq("SELECT COUNT(*) c FROM photos WHERE loc_source='inferred'")[0]["c"]
-    pending = dbq("SELECT COUNT(*) c FROM photos WHERE lat IS NOT NULL AND display IS NULL")[0]["c"]
-    return {
-        "total": len(rows),
-        "pref_count": len(prefs),
-        "pref_list": sorted(prefs.keys()),
-        "months": months,
-        "dist_km": round(dist),
-        "span": [min(times), max(times)] if times else ["", ""],
-        "top_cities": sorted(cities.items(), key=lambda x: -x[1])[:5],
-        "inferred": inferred,
-        "pending": pending,
-        "trips": (api_photos() and _last_trips),
-    }
-
-
-_manifest_cache = {"items": [], "ts": 0}
-
-
-def get_manifest_cached():
-    if time.time() - _manifest_cache["ts"] > 60:
-        _manifest_cache["items"] = api_photos()
-        _manifest_cache["ts"] = time.time()
-    return _manifest_cache["items"]

@@ -8,48 +8,17 @@ import traceback
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler
 
-# _presence / _room_env は可変なモジュール変数のため、値ではなくモジュール属性で参照する
-from . import ha
 from .admin import (BadRequest, NotFound, admin_setflag, admin_setloc,
-                    admin_sethome, api_admin_home, api_admin_photos, api_admin_status)
-from .adsb import api_aircraft
+                    api_admin_photos, api_admin_status)
 from .ai_search import (AiSearchDisabled, AiSearchRateLimited,
                         AiSearchUnavailable, api_ai_search, api_ai_status)
-from .config import (ALLOWED_HOST_NAMES, DATA_DIR, DEBUG_API, PORT, ROOT,
-                     TILE_SOURCES)
+from .config import ALLOWED_HOST_NAMES, DATA_DIR, PORT, ROOT, TILE_SOURCES
 from .geo import geocode_search
-from .ha import ha_get
-from . import keymap
-from .agents import render_agents
-from .store import setting_compare_and_set, setting_get
-from .jma import api_env
-from .mlit import api_hazard, api_intel, hazard_tile
-from .photos import api_onthisday, api_photos, api_stats
-from .tiles import fetch_tile, photo_tile_content
+from .photos import api_onthisday, api_photos
+from .tiles import fetch_tile
 from .travel_blog import (BlogBadRequest, BlogExportBusy, BlogNotFound,
                           api_blog_candidates, api_blog_draft, api_blog_trip,
                           api_blog_trips, export_blog, save_blog_draft)
-from .util import latlon_to_tile
-
-
-KEYMAP_SETTING = "admin_keymap"
-
-
-def _keymap_doc():
-    raw = setting_get(KEYMAP_SETTING)
-    if raw is None:
-        return {"rev": 0, "updated_at": None, "keys": dict(keymap.DEFAULT_KEYS)}
-    try:
-        doc = json.loads(raw)
-    except (TypeError, json.JSONDecodeError):
-        doc = None
-    return doc if isinstance(doc, dict) else {"rev": 0, "updated_at": None,
-                                               "keys": dict(keymap.DEFAULT_KEYS)}
-
-
-class KeymapConflict(Exception):
-    def __init__(self, doc):
-        self.doc = doc
 
 
 # ============================================================
@@ -115,13 +84,6 @@ class Handler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _debug_api_ok(self):
-        """開発用APIのガード。GEOFRAME_DEBUG_API=1 のときだけ通す"""
-        if DEBUG_API:
-            return True
-        self._send_json({"ok": False, "error": "debug API disabled"}, status=403)
-        return False
-
     # 静的配信はホワイトリスト方式（ブラックリストは追加ファイルの度に穴が開くため）。
     # ここに無いパスは一律403 ⇒ .env / server.py / catalog.db / .venv/ 等が自動的に守られる
     STATIC_ALLOW_PREFIXES = ("/static/", "/vendor/", "/derivatives/", "/photos/",
@@ -164,7 +126,7 @@ class Handler(SimpleHTTPRequestHandler):
             return True
         return False
 
-    TILE_RE = re.compile(r"^/tiles/(osm|gsi|gsi-photo|gsi-dem)/(\d{1,2})/(\d+)/(\d+)\.png$")
+    TILE_RE = re.compile(r"^/tiles/(osm|gsi)/(\d{1,2})/(\d+)/(\d+)\.png$")
 
     # ============================================================
     # Host ヘッダ検証（DNSリバインディング対策。詳しい攻撃の説明は config.py 側）
@@ -294,11 +256,8 @@ class Handler(SimpleHTTPRequestHandler):
         return True
 
     def _serve_tile(self, path, head_only=False):
-        """背景地図タイルを配信（上流取得はfetch_tile、失敗しても200＋代替タイル）
-        ※404を返すとMapLibreがリトライを連発するため、取得失敗も200で返しきる。
-        gsi-demは提供ズーム外（z>14）も404にしない。Navaraのraster-dem loaderは
-        非200応答のbodyをデコードせず初期化を失敗させるため、fetch_tileが返す
-        RGB(128,0,0)の欠測タイルを200で返す（詳細はtiles.fetch_tile）"""
+        """背景地図タイルを配信（上流取得はfetch_tile、失敗しても200＋透明タイル）
+        ※404を返すとMapLibreがリトライを連発するため、取得失敗も200で返しきる"""
         m = self.TILE_RE.match(path)
         if not m:
             self.send_error(404)
@@ -307,27 +266,18 @@ class Handler(SimpleHTTPRequestHandler):
         if x >= 2 ** z or y >= 2 ** z:
             self.send_error(404)      # タイル座標範囲外（常に不正）
             return
-        if z > TILE_SOURCES[layer][1] and layer != "gsi-dem":
-            self.send_error(404)      # ズーム範囲外（gsi-demはfetch_tileが欠測タイルを返す）
+        if z > TILE_SOURCES[layer][1]:
+            self.send_error(404)      # ズーム範囲外
             return
-        detail = (layer == "gsi-photo" and
-                  urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("detail") == ["1"])
-        body, status = (fetch_tile(layer, z, x, y, detail=True) if detail
-                        else fetch_tile(layer, z, x, y))
+        body, status = fetch_tile(layer, z, x, y)
         self.send_response(200)
         self.send_header("Content-Type", "image/png")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control",
                          "no-store" if status in ("error", "throttled")
                          else "public, max-age=86400")
-        # デバッグ用。throttledは流量上限、skippedは粗い写真を意図的に省略した印。
+        # デバッグ用。throttledは流量上限に達した印。
         self.send_header("X-Tile-Cache", status)
-        content = None
-        if layer == "gsi-photo":
-            content = ("empty" if status in ("error", "throttled")
-                       else photo_tile_content(layer, body))
-        if content is not None:
-            self.send_header("X-Tile-Content", content)
         self.end_headers()
         if not head_only:
             self.wfile.write(body)
@@ -358,59 +308,6 @@ class Handler(SimpleHTTPRequestHandler):
         if p.startswith("/tiles/"):
             self._serve_tile(p)
             return
-        if self.path.startswith("/api/presence"):
-            self._send_json(ha._presence)
-            return
-        if p == "/api/keymap":
-            self._send_json(keymap.render(_keymap_doc()))
-            return
-        if p == "/api/agents":
-            self._send_json(render_agents())
-            return
-        if self.path.startswith("/api/mlit/probe"):
-            # 開発用: 任意XKTタイルの件数と属性スキーマを確認する
-            if not self._debug_api_ok():
-                return
-            from urllib.parse import parse_qs, urlparse
-            q = parse_qs(urlparse(self.path).query)
-            try:
-                xkt = q["xkt"][0]
-                lat, lon = float(q["lat"][0]), float(q["lon"][0])
-                z = int(q.get("z", ["13"])[0])
-                if not re.fullmatch(r"(XKT|XPT|XIT|XCT)\d{3}", xkt):
-                    raise ValueError("bad xkt")
-                x, y, _, _ = latlon_to_tile(lat, lon, z)
-                yr = q.get("year", [None])[0]
-                d = hazard_tile(xkt, z, x, y, f"year={int(yr)}" if yr else "")
-                feats = d.get("features", [])
-                self._send_json({"ok": True, "xkt": xkt, "z": z, "count": len(feats),
-                                 "sample": (feats[0].get("properties") if feats else None)})
-            except Exception as e:
-                self._send_json({"ok": False, "error": str(e)})
-            return
-        if self.path.startswith("/api/roomenv"):
-            self._send_json(ha._room_env)
-            return
-        if self.path.startswith("/api/ha/entities"):
-            # HAの全エンティティ一覧（LAN内のHAへserver.pyが代理アクセス）
-            # ※自宅住所を含む全エンティティが出るため開発時専用に限定する
-            if not self._debug_api_ok():
-                return
-            try:
-                states = ha_get("/api/states")
-                ents = [{"entity_id": s.get("entity_id", ""),
-                         "state": s.get("state", ""),
-                         "name": (s.get("attributes") or {}).get("friendly_name", ""),
-                         "unit": (s.get("attributes") or {}).get("unit_of_measurement", ""),
-                         "device_class": (s.get("attributes") or {}).get("device_class", ""),
-                         } for s in states]
-                self._send_json({"ok": True, "count": len(ents), "entities": ents})
-            except Exception as e:
-                self._send_json({"ok": False, "error": str(e)})
-            return
-        if self.path.startswith("/api/aircraft"):
-            self._send_json(api_aircraft())
-            return
         # 表示クライアント（miharashi）との契約。正式名は /api/v1/photos で、
         # /api/photos は移行が済むまで同じ応答を返す別名（docs/architecture/photo-feed-contract.md）
         if p == "/api/v1/photos" or self.path.startswith("/api/photos"):
@@ -422,33 +319,8 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e), "items": []})
             return
-        if self.path.startswith("/api/stats"):
-            self._send_json(api_stats())
-            return
-        if self.path.startswith("/api/env"):
-            self._send_json(api_env())
-            return
-        if self.path.startswith("/api/hazard"):
-            from urllib.parse import parse_qs, urlparse
-            q = parse_qs(urlparse(self.path).query)
-            try:
-                self._send_json(api_hazard(float(q["lat"][0]), float(q["lon"][0])))
-            except (KeyError, ValueError):
-                self._send_json({"ok": False, "reason": "bad_params"})
-            return
-        if self.path.startswith("/api/intel"):
-            from urllib.parse import parse_qs, urlparse
-            q = parse_qs(urlparse(self.path).query)
-            try:
-                self._send_json(api_intel(float(q["lat"][0]), float(q["lon"][0])))
-            except (KeyError, ValueError):
-                self._send_json({"ok": False, "reason": "bad_params"})
-            return
         if self.path.startswith("/api/admin/status"):
             self._send_json(api_admin_status())
-            return
-        if self.path.startswith("/api/admin/home"):
-            self._send_json(api_admin_home())
             return
         if self.path.startswith("/api/admin/photos"):
             from urllib.parse import parse_qs, urlparse
@@ -463,7 +335,7 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if self.path.startswith("/api/admin/geocode"):
             # 地名・住所検索（順ジオコーディング）。読み取り専用・状態変更なしなので
-            # do_POST側のCSRF/DEBUG_APIガードは不要（地名→座標の変換だけで個人情報も返さない）
+            # do_POST側のCSRFガードは不要（地名→座標の変換だけで個人情報も返さない）
             from urllib.parse import parse_qs, urlparse
             q = parse_qs(urlparse(self.path).query)
             self._send_json({"ok": True, "items": geocode_search(q.get("q", [""])[0])})
@@ -551,29 +423,8 @@ class Handler(SimpleHTTPRequestHandler):
     def _post_routes(self):
         return {"/api/admin/setloc": admin_setloc,
                 "/api/admin/setflag": admin_setflag,
-                "/api/admin/sethome": admin_sethome,
-                "/api/admin/setkeymap": self._setkeymap,
                 "/api/blog/save": save_blog_draft,
                 "/api/blog/export": export_blog}
-
-    def _setkeymap(self, payload):
-        keys = keymap.validate(payload)
-        if isinstance(keys, str):
-            raise BadRequest(keys)
-        before = _keymap_doc()
-        # validateで整数に限定し、expected_rev=NoneによるCAS迂回を許さない。
-        result = setting_compare_and_set(
-            KEYMAP_SETTING, {"keys": keys}, payload["base_revision"])
-        if result is None:
-            raise KeymapConflict(_keymap_doc())
-        changed = sorted(k for k in keymap.DEFAULT_KEYS
-                         if before.get("keys", {}).get(k) != result["keys"].get(k))
-        if changed:
-            origin = "有" if self.headers.get("Origin") is not None else "無"
-            print("[journal] keymap ip=%s origin=%s rev=%s->%s keys=%s" % (
-                self.client_address[0], origin, before.get("rev", 0),
-                result["rev"], ",".join(changed)))
-        return keymap.render(result)
 
     def _csrf_ok(self):
         """Content-Type と Origin を検査する。不許可なら応答を返して False"""
@@ -631,8 +482,6 @@ class Handler(SimpleHTTPRequestHandler):
             return
         try:
             self._send_json(handler(payload))
-        except KeymapConflict as e:
-            self._send_json(keymap.render(e.doc), status=409)
         except BadRequest as e:
             self._send_json({"ok": False, "error": str(e)}, status=400)
         except NotFound as e:

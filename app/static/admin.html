@@ -31,8 +31,6 @@
     <button class="tab on" data-tab="status">▸ STATUS</button>
     <button class="tab" data-tab="noloc">▸ 位置なし</button>
     <button class="tab" data-tab="photos">▸ 全写真</button>
-    <button class="tab" data-tab="home">▸ 自宅設定</button>
-    <button class="tab" data-tab="keymap">▸ キー割当</button>
     <a class="tab" href="/blog-admin">▸ TRAVEL BLOG</a>
     <a class="tab" href="/ai-search">▸ AI写真検索</a>
   </nav>
@@ -58,10 +56,6 @@
       <h2>▸ DISK — ディスク使用量</h2>
       <div class="grid" id="s-disk"></div>
     </div>
-    <div class="panel">
-      <h2>▸ HOME ASSISTANT — 接続状態</h2>
-      <div class="grid" id="s-ha"></div>
-    </div>
   </section>
 
   <!-- ==== 写真一覧（位置なし / 全写真 で共用） ==== -->
@@ -82,35 +76,6 @@
     <div class="empty hidden" id="empty">該当する写真がありません</div>
   </section>
 
-  <!-- ==== 自宅設定 ==== -->
-  <section id="v-home" class="hidden">
-    <div class="panel">
-      <h2>▸ HOME — 自宅の都道府県</h2>
-      <p class="hint">行き先空港がこの都道府県と同じ地方（8地方区分）の場合、
-        ADS-B連動の MEMORY LINK 演出をスキップします。未設定なら従来どおりスキップは行いません
-        （都道府県内からランダムに1枚を選ぶ方式自体は、設定の有無にかかわらず常に有効です）。</p>
-      <div class="homerow">
-        <select id="home-pref"></select>
-        <button class="btn" id="home-save">SAVE</button>
-        <span class="count" id="home-region"></span>
-      </div>
-    </div>
-  </section>
-
-  <!-- ==== キー割当 ==== -->
-  <section id="v-keymap" class="hidden">
-    <div class="panel">
-      <h2>▸ KEYMAP — キー割当</h2>
-      <p class="hint">rotationを1つ以上、sleepは1つまで指定してください。</p>
-      <div class="grid" id="keymap-fields"></div>
-      <div class="homerow">
-        <button class="btn" id="keymap-default">既定に戻す</button>
-        <button class="btn" id="keymap-save">SAVE</button>
-        <span class="count" id="keymap-rev"></span>
-      </div>
-      <div class="hint" id="keymap-conflict"></div>
-    </div>
-  </section>
 </main>
 
 <!-- ==== 位置指定モーダル ==== -->

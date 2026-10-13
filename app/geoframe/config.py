@@ -117,24 +117,7 @@ INFER_OFFSET_S = float(os.environ.get("GEOFRAME_INFER_OFFSET_MIN", "0")) * 60
 # /admin で内訳を確認できる（loc_source は 'inferred' のまま＝表示側の互換を壊さない）。
 INFER_WINDOWS_S = sorted({INFER_WINDOW_S, 2 * 3600, 12 * 3600})
 
-# 航空機情報の取得先（readsb/tar1090互換のaircraft.json）
-ADSB_URL = os.environ.get("GEOFRAME_ADSB_URL",
-                          "https://ads-b.dam-lab.work/tar1090/data/aircraft.json")
-ADSB_RECEIVER_URL = ADSB_URL.rsplit("/", 1)[0] + "/receiver.json"
-ADSBDB = "https://api.adsbdb.com/v0"
-# 海外行き先、および国内だが都道府県解決に一時的に失敗した場合の
-# フォールバック半径としてのみ使用する（詳細: adsb.py の3分岐マッチング）
-MATCH_KM = float(os.environ.get("GEOFRAME_MATCH_KM", "80"))
-MAX_LOOKUPS_PER_POLL = 3
-MAX_AIRPORT_LOOKUPS_PER_POLL = 3   # GSI逆ジオコーディング用の予算（adsbdb用とは別枠）
-RARE_TYPES = {"A124", "A225", "A400", "B52", "B742", "B748", "C130", "C17", "C5M",
-              "E4", "E767", "K35R", "KC46", "U2", "VC25", "B701", "GLF6", "P8"}
-MIL_OWNER_WORDS = ("air force", "navy", "army", "coast guard", "government",
-                   "police", "self-def", "self def", "military")
-EMERGENCY_SQUAWKS = {"7500", "7600", "7700"}
-
-# 8地方区分（都道府県の単純一致では羽田=東京都/成田=千葉県で「関東」判定が
-# できないため、地方でグループ化して判定する。用途: adsb.py の自宅地方スキップ）
+# 8地方区分（管理画面の都道府県選択の正本）
 PREF_REGIONS = {
     "北海道地方": ["北海道"],
     "東北地方": ["青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県"],
@@ -147,64 +130,20 @@ PREF_REGIONS = {
     "九州・沖縄地方": ["福岡県", "佐賀県", "長崎県", "熊本県", "大分県",
                      "宮崎県", "鹿児島県", "沖縄県"],
 }
-PREF_TO_REGION = {p: r for r, ps in PREF_REGIONS.items() for p in ps}
 JP_PREFS = [p for ps in PREF_REGIONS.values() for p in ps]   # 47件
 
-# 不動産情報ライブラリ（要APIキー）。地震速報時の防災レイヤ表示に使用
-MLIT_KEY = os.environ.get("GEOFRAME_MLIT_KEY", "")
-MLIT_URL = "https://www.reinfolib.mlit.go.jp/ex-api/external"
-HAZARD_ZOOM = 11                    # 2x2タイルで約40km四方をカバー
-HZ_DIR = DATA_DIR / "hazard_cache"
-# 地震時に意味のある防災系（target_apis番号, エンドポイント, 表示名, zoom, タイルグリッド幅）
-# ※洪水(XKT026)・津波(XKT028)はz14以上のみ提供（z11は400。2026-07-29実測）
-HAZARD_APIS = [
-    (25, "XKT025", "液状化発生傾向", 11, 2),
-    (29, "XKT029", "土砂災害警戒区域", 11, 2),
-    (22, "XKT022", "急傾斜地崩壊危険", 11, 2),
-    (21, "XKT021", "地すべり防止地区", 11, 2),
-    (28, "XKT028", "津波浸水想定", 14, 4),
-    (26, "XKT026", "洪水浸水想定", 14, 4),
-]
-
-# 背景地図タイルのプロキシ＋ローカルキャッシュ
-# ※キオスクは回線が不安定になりうる。一度見た地域はオフラインでも表示できるようにする
+# 背景地図タイルのプロキシ＋ローカルキャッシュ（管理ページの位置修正用の地図）
 TILE_DIR = DATA_DIR / "tile_cache"
 # layer -> (URLテンプレート, maxzoom, 上流への同時接続数)
 TILE_SOURCES = {
     "osm": ("https://tile.openstreetmap.org/{z}/{x}/{y}.png", 19, 2),
     "gsi": ("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", 18, 4),
-    # 3D PHOTO JOURNEY専用。実URLはズームに応じてGSI_PHOTO_TILE_BANDSから選ぶ。
-    # 淡色地図の既存キャッシュと混ざらないよう、独立したlayer名を使う。
-    "gsi-photo": ("", 18, 4),
-    # 3D地形（Navara raster-dem）専用。実URLはズームに応じてGSI_DEM_TILE_BANDSから選ぶ。
-    # 同時接続数はN100トライアル向けに2へ抑制（gsi-photoの4より控えめ）。
-    # 上流フェッチの分/枚上限は全layer共有のまま増やさない。
-    "gsi-dem": ("", 14, 2),
 }
-# 国土地理院の公式提供ズームに合わせた航空・衛星写真ピラミッド。
-# Z2-13: Landsat 8、Z14-18: 全国最新写真（シームレス）。
-GSI_PHOTO_TILE_BANDS = (
-    (2, 13, "https://cyberjapandata.gsi.go.jp/xyz/lndst/{z}/{x}/{y}.png"),
-    (14, 18, "https://cyberjapandata.gsi.go.jp/xyz/seamlessphoto/{z}/{x}/{y}.jpg"),
-)
-# 国土地理院の公式標高タイル（Navara raster-dem用）。Z0-8: 全球DEM（demgm_png、
-# GMTED2010等由来・世界規模だが粗い）、Z9-14: 数値標高モデル（dem_png、国内10mメッシュ
-# 相当・海外や海上は欠測)。エンコードはdemgm_png/dem_pngで共通:
-#   x = 65536*R + 256*G + B
-#   x <  2^23            => 標高 = x * 0.01m
-#   x == 2^23 (=RGB 128,0,0) => 欠測（データなし）
-#   x >  2^23            => 標高 = (x - 2^24) * 0.01m
-# 欠測はfetch_tileがRGB(128,0,0)で塗り潰したPNGを返す（透明PNGにはしない。
-# raster-demデコーダは透明ピクセルを標高0mの実データと区別できないため）。
-GSI_DEM_TILE_BANDS = (
-    (0, 8, "https://cyberjapandata.gsi.go.jp/xyz/demgm_png/{z}/{x}/{y}.png"),
-    (9, 14, "https://cyberjapandata.gsi.go.jp/xyz/dem_png/{z}/{x}/{y}.png"),
-)
 # OSM tile usage policy 準拠に必須。実運用では連絡先入り（例 "GeoFrame/0.1 (me@example.com)"）を
 # GEOFRAME_TILE_UA に設定しておくこと。既定値のままだとブロックされうる
 TILE_UA = os.environ.get("GEOFRAME_TILE_UA", "GeoFrame/0.1 (personal photo frame)")
-# 3D PHOTO JOURNEYの高ズーム航空写真を保持できるよう、全レイヤー共有で16GiB。
-# 実機で容量を抑えたい場合は GEOFRAME_TILE_CACHE_MAX_MB で上書きする。
+# タイルキャッシュの上限（全レイヤー共有）。容量を抑えたい場合は
+# GEOFRAME_TILE_CACHE_MAX_MB で上書きする。
 TILE_CACHE_MAX_MB = int(os.environ.get("GEOFRAME_TILE_CACHE_MAX_MB", "16384"))
 # 上流フェッチ（＝キャッシュミス）だけを対象にした流量上限（枚/分）。キャッシュヒットは無制限。
 # /tiles/ は無認証なので、LAN内の任意のWebページが <img src="http://<frame-ip>:8080/tiles/…">
@@ -214,54 +153,6 @@ TILE_CACHE_MAX_MB = int(os.environ.get("GEOFRAME_TILE_CACHE_MAX_MB", "16384"))
 # 既定240の根拠: コールド起動時の1画面が実測116枚。通常の初回描画＋パン1回分に
 # 約2倍の余裕を持たせた値（gsiの上流同時接続4でも詰まらない）。
 TILE_FETCH_PER_MIN = int(os.environ.get("GEOFRAME_TILE_FETCH_PER_MIN", "240"))
-
-# Home Assistant連携（.envのHOME_ASSISTANT_API_KEY または GEOFRAME_HA_TOKEN）
-# ※平文のままホスト名を指定した場合（下の既定値の homeassistant.local など）は、
-#   mDNS/DNS応答を偽装されてトークンを盗まれる経路になるため起動時に拒否し、連携を開始しない。
-#   https か、名前解決を伴わないIPリテラル（127.0.0.1 等）なら許可する
-HA_URL = os.environ.get("GEOFRAME_HA_URL", "http://homeassistant.local:8123").rstrip("/")
-# HAの長期アクセストークン。GEOFRAME_HA_TOKEN を優先し、無ければ HOME_ASSISTANT_API_KEY を読む
-HA_TOKEN = os.environ.get("GEOFRAME_HA_TOKEN") or os.environ.get("HOME_ASSISTANT_API_KEY", "")
-HA_MOTION = os.environ.get("GEOFRAME_HA_MOTION_ENTITY", "")   # 例: binary_sensor.display_motion
-IDLE_MIN = float(os.environ.get("GEOFRAME_IDLE_MIN", "10"))   # 無人この分数で画面スリープ
-SLEEP_CMD = os.environ.get("GEOFRAME_SLEEP_CMD", "")          # 例: xset dpms force off（N100実機用）
-WAKE_CMD = os.environ.get("GEOFRAME_WAKE_CMD", "")            # 例: xset dpms force on
-# ROOM ENV表示に使うHAエンティティ（カンマ区切り。.envで指定）
-HA_ENV_ENTITIES = [e.strip() for e in
-                   os.environ.get("GEOFRAME_HA_ENV_ENTITIES", "").split(",") if e.strip()]
-
-# ------------------------------------------------------------
-# 画面ON/OFFの手動オーバーライド
-# ------------------------------------------------------------
-# HA側の input_select（選択肢: auto / force_on / force_off）を既存のポーリングで
-# 読むだけの構成にしている。こちら側に書き込み用のHTTPエンドポイントは足さない
-# （このサーバーは無認証なので、外から画面を消せる口を増やしたくない）。
-# 未設定なら常に auto 相当＝従来の人感センサー任せの挙動に戻る（rollback経路）。
-# 例: GEOFRAME_HA_SCREEN_MODE_ENTITY=input_select.geoframe_screen_mode
-HA_SCREEN_MODE_ENTITY = os.environ.get("GEOFRAME_HA_SCREEN_MODE_ENTITY", "")
-# HAへ疎通できないままこの分数を超えたら、オーバーライドを捨てて auto へ戻す。
-# 外出先で force_off にした直後にHAが落ちて画面が二度と点かない、を避ける保険
-HA_SCREEN_DECAY_MIN = float(os.environ.get("GEOFRAME_HA_SCREEN_DECAY_MIN", "5"))
-# 実機の画面状態を読むコマンド（例: /opt/geoframe/deploy/kiosk/screen-ctl.sh status）。
-# ※標準出力の on/off だけを見る。あのスクリプトは正常な「off」判定でも exit 1 を
-#   返す仕様なので、終了コードで成否を判定してはいけない
-SCREEN_STATUS_CMD = os.environ.get("GEOFRAME_SCREEN_STATUS_CMD", "")
-# 画面の意図と実機状態を照合する間隔（秒）
-HA_SCREEN_RECONCILE_SEC = float(os.environ.get("GEOFRAME_HA_SCREEN_RECONCILE_SEC", "90"))
-# Atomic, read-only status drops written by the system Hermes exporter.
-AGENT_STATUS_DIR = Path(os.environ.get("GEOFRAME_AGENT_STATUS_DIR", "/run/geoframe-agent-status"))
-# エージェントカードの順序とラベル（id=ラベル、カンマ区切り。.envで指定）
-AGENT_LABELS = [e.strip() for e in
-                os.environ.get("GEOFRAME_AGENT_LABELS",
-                               "hermes=みなも (Hermes),miach=miach-runtime").split(",") if e.strip()]
-
-# 気象庁（無認証）。GEOFRAME_JMA_AREA: 予報区コード（既定120000=千葉県）
-JMA_AREA = os.environ.get("GEOFRAME_JMA_AREA", "120000")
-JMA_FORECAST = f"https://www.jma.go.jp/bosai/forecast/data/forecast/{JMA_AREA}.json"
-JMA_QUAKES = "https://www.jma.go.jp/bosai/quake/data/list.json"
-
-# 開発用API（/api/ha/entities・/api/mlit/probe）のガード。既定は無効
-DEBUG_API = os.environ.get("GEOFRAME_DEBUG_API", "") == "1"
 
 # ============================================================
 # Host ヘッダ検証（DNSリバインディング対策）

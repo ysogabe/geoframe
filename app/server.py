@@ -62,7 +62,6 @@ from geoframe.ai_pipeline import ai_worker
 from geoframe.config import DB_PATH, DRIVE_KEY, HOST, PORT, allowed_hosts_note
 from geoframe.config import AI_ENABLED
 from geoframe.drive import organize_photos, prepare_tmp_dir
-from geoframe.ha import ha_start
 from geoframe.handlers import Handler
 from geoframe.quality import quality_backfill
 from geoframe.store import (cache_saver, db, load_cache, purge_cache_legacy,
@@ -86,7 +85,6 @@ if __name__ == "__main__":
     if not DRIVE_KEY.exists():
         print(f"[drive] {DRIVE_KEY.name} なし → Drive直接参照OFF（ローカルのみ）")
     # サーバーを即時起動し、同期はバックグラウンドで実行（初回も含む）
-    ha_start()        # .envにトークンがあればHome Assistant連携を開始
     tile_cache_prune()   # 起動時に1回（以降はworkerが1時間に1回）
     prepare_tmp_dir()    # 原本一時置き場の用意＋残骸の掃除
     threading.Thread(target=worker, daemon=True).start()
