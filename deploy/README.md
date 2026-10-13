@@ -13,8 +13,7 @@
 - Python 3.10以降を利用できるDebianまたはUbuntu系Linux
 - `python3-venv`、`sqlite3`、`git`、`curl`
 - 同梱unitを使う場合は`systemd`
-- 同じ機体を表示端末として使う場合だけChromium
-- サーバーからgithub.comへのSSH到達性（TCP 22）。コードは本機がgitで取得します（§6参照）
+- サーバーからgithub.comへのSSH到達性（TCP 22）。コードは本機がgitで取得します（§5参照）
 
 ## 1. アプリケーションの配置
 
@@ -82,7 +81,7 @@ sudo git fetch origin
 ```
 
 `gc.auto 0`は、自動gcが到達不能になった古いコミットを回収してしまうのを防ぎます
-（ロールバックの手段を残すため。§7参照）。
+（ロールバックの手段を残すため。§6参照）。
 
 > [!NOTE]
 > `git clone`は空でないディレクトリに対しては失敗します。rsync方式で運用していた
@@ -143,13 +142,6 @@ sudo install -o geoframe -g geoframe -m 0600 \
 GEOFRAME_HOST=0.0.0.0
 GEOFRAME_ALLOWED_HOSTS=geoframe.example.test:8080
 GEOFRAME_AI_ENABLED=0
-
-# 任意の外部連携
-# GEOFRAME_MLIT_KEY=
-# GEOFRAME_HA_URL=https://home-assistant.example.test
-# HOME_ASSISTANT_API_KEY=
-# GEOFRAME_HA_MOTION_ENTITY=binary_sensor.display_motion
-# GEOFRAME_HA_ENV_ENTITIES=sensor.room_temperature,sensor.room_humidity
 ```
 
 認証情報を含む可能性があるため、読み取り権限を制限します。
@@ -183,142 +175,7 @@ LAN内の別端末からHTTP 403になる場合は、アクセスに使った正
 `GEOFRAME_ALLOWED_HOSTS`へ追加します。IPリテラルによるアクセスは許可されますが、名前付き
 ホストは明示的な許可が必要です。
 
-### 3.1 エージェント稼働状況exporter（任意）
-
-GEOFRAMEと同じ機体でHermesを動かす場合、Hermesの心拍を非機密の要約（稼働状態・経過秒・
-タスク種別・簡易メトリクス）へ変換し、`/run/geoframe-agent-status/*.json`へ原子的に
-書き出すexporterを動かせます。表示機のキー`2`（エージェント稼働状況）が読むのはこのdropです
-（[ADR 0005](../docs/decisions/0005-agent-status-via-ha-bus.md)）。
-
-発見（unpinned）では、既定プロファイルの心拍は`hermes.json`、名前付きプロファイル
-（`<name>`）の心拍は`hermes-<name>.json`へ、存在するregular fileごとに1本ずつ出ます。不正な
-プロファイル名や存在しない候補にはdropを作りません。固定（`HERMES_PROFILE`または
-`HERMES_HEARTBEAT_FILE`）は単一カード運用で、プロファイル名に関係なく`hermes.json`
-（id=`hermes`）を常に1本出します。複数カード運用はunpinnedにし、
-`GEOFRAME_AGENT_LABELS`へ`hermes-<name>=ラベル`を登録してください。未登録の
-`hermes-<name>.json`はカードに出ず、サーバーがjournaldへ1回警告します。サーバーが表示する
-カードは最大2枚で、カードのラベルと順序は`GEOFRAME_AGENT_LABELS`（`id=ラベル`のカンマ区切り）で
-設定します。
-
-dropのディレクトリはunitの`RuntimeDirectory=geoframe-agent-status`が作り、所有者は
-`hermes:geoframe-status`（0750）になります。GEOFRAMEサーバー側には
-[`geoframe-server.service.d/agents.conf`](geoframe-server.service.d/agents.conf)を置いて
-`SupplementaryGroups=geoframe-status`を足します。`ProtectHome=true`とホームの0600は緩めません。
-
-```sh
-sudo groupadd --system geoframe-status          # 既にあれば不要
-sudo install -d -o root -g root -m 0755 /etc/systemd/system/geoframe-server.service.d
-sudo install -o root -g root -m 0644 \
-  /opt/geoframe/deploy/geoframe-server.service.d/agents.conf \
-  /etc/systemd/system/geoframe-server.service.d/agents.conf
-sudo install -o root -g root -m 0644 \
-  /opt/geoframe/deploy/agents/geoframe-agent-status-exporter.service \
-  /etc/systemd/system/geoframe-agent-status-exporter.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now geoframe-agent-status-exporter.service
-sudo systemctl restart geoframe-server.service
-```
-
-確認します。
-
-```sh
-systemctl status geoframe-agent-status-exporter.service --no-pager
-sudo -u geoframe cat /run/geoframe-agent-status/hermes.json
-curl --fail http://127.0.0.1:8080/api/agents
-```
-
-exporterはHermesのホーム配下（0600の心拍）を読むため、unitの`User=`はHermesを動かしている
-ユーザーへ合わせます。同梱unitは`hermes`を前提にしています。
-
-心拍源は次の順で解決します（`HERMES_HOME`未設定時は`~/.hermes`）。
-
-1. `HERMES_HEARTBEAT_FILE` — 指定した1ファイルへ固定
-2. `HERMES_PROFILE` — その名前付きプロファイルの心拍（プロファイルが実在するときだけ）。
-   複数プロファイルのうち1本だけを単一カード運用にしたい場合に使います
-3. 上記が無い場合は次の候補を列挙し、存在するregular fileをそれぞれdropへ出力
-   - `<HERMES_HOME>/state/gateway.heartbeat` — 既定プロファイル
-   - `<HERMES_HOME>/profiles/<name>/state/gateway.heartbeat` — 名前付きプロファイル
-
-既定で名前付きプロファイルを拾うため、稼働させるプロファイルを変えてもunitへ心拍のパスを
-足す必要はありません。**複数の心拍が同時に新鮮なとき（＝複数プロファイルが同時に稼働しているとき）は、
-exporterはfreshな集合単位でjournaldへ1回警告を出します**（勝者が入れ替わっても再出力せず、
-freshな集合が変わったときに再度出します）。
-
-```sh
-journalctl -u geoframe-agent-status-exporter -n 5 --no-pager
-# [exporter] 2 fresh heartbeats found; reporting <HERMES_HOME>/profiles/<name>/state/gateway.heartbeat (pin one with HERMES_PROFILE)
-```
-
-プロファイルを固定したい場合は、drop-inで次の1行を入れます
-（パスではなくプロファイル名なので、ホームの構成を変えても書き換えが要りません）。
-
-```sh
-sudo install -d -o root -g root -m 0755 \
-  /etc/systemd/system/geoframe-agent-status-exporter.service.d
-printf '[Service]\nEnvironment=HERMES_PROFILE=example-profile\n' |
-  sudo tee /etc/systemd/system/geoframe-agent-status-exporter.service.d/heartbeat.conf >/dev/null
-sudo systemctl daemon-reload
-sudo systemctl restart geoframe-agent-status-exporter.service
-```
-
-固定（`HERMES_PROFILE`または`HERMES_HEARTBEAT_FILE`）では、固定先の心拍ファイルが欠落していても、
-古い・壊れている・読めない場合も`state=unknown`のdropを書きます。発見（unpinned）では、
-心拍ファイルが存在するプロファイルについて、古い・壊れている・読めない場合に
-`state=unknown`のdropを書きます。いずれもカードは「不明」として残るため、dropが消えて画面が空になることはありません。
-一方、発見（unpinned）で心拍ファイルが存在しないプロファイルにはdropを書かず、各周期の後に今回publishしなかった
-`hermes.json`・`hermes-<name>.json`も削除します。そのため、まだ起動していないプロファイルだけでなく、過去に存在して
-いまはディレクトリが削除・リネームされたプロファイルのゴーストカードも残りません。固定時は固定した1本だけを書き、
-他の`hermes.json`・`hermes-<name>.json`は削除します（固定先は常に`hermes.json`、id=`hermes`）。
-`miach.json`など他のidのdropには触れません。
-
-## 4. Chromiumキオスク（任意）
-
-[`kiosk/kiosk.sh`](kiosk/kiosk.sh)はGEOFRAMEサーバーの起動を待ってからChromiumを
-キオスクモードで開始します。サーバーが別の機体にある場合は`GEOFRAME_URL`を設定します。
-
-```sh
-GEOFRAME_URL=http://geoframe.example.test:8080/ /opt/geoframe/deploy/kiosk/kiosk.sh
-```
-
-`kiosk/geoframe-kiosk.service`は、グラフィカルセッション開始後に動くユーザーunitです。
-デスクトップ環境によって`graphical-session.target`の扱いが異なるため、安定して起動しない場合は
-デスクトップ環境の自動起動機能を使用してください。
-
-画面のスリープ・復帰制御は任意です。`GEOFRAME_SLEEP_CMD`と`GEOFRAME_WAKE_CMD`を設定する前に、
-`kiosk/screen-ctl.sh`を手動で確認してください。
-
-画面ON/OFFのHA経由手動オーバーライドも任意です。以下の環境変数で挙動を調整します
-（詳細は`app/.env.example`を参照）。
-
-- `GEOFRAME_HA_SCREEN_MODE_ENTITY` — 手動オーバーライド用のHAヘルパーエンティティID
-  （例: `input_select.geoframe_screen_mode`）。未設定時は`force_on`/`force_off`の判定が
-  無効化され、常に`auto`（既存の自動スリープロジックのみ）として扱われます。
-  **`GEOFRAME_SCREEN_STATUS_CMD`を設定している場合、実機との照合（reconciliation）
-  自体はこの変数の設定有無に関わらず動作します。** 両方の機能を完全に無効化したい
-  場合は両方の変数を未設定に戻してください。
-- `GEOFRAME_HA_SCREEN_DECAY_MIN`（既定値5分）— HAへの疎通が失敗し続けた場合に、
-  `force_on`/`force_off`から`auto`へ自動的に減衰するまでの時間。
-- `GEOFRAME_SCREEN_STATUS_CMD`（既定値なし、未設定なら照合機能自体が無効）— 実機の画面電源状態
-  （on/off）を標準出力で返すコマンド。`screen-ctl.sh status`相当を指定し、GEOFRAME側の
-  意図した状態と実機状態を定期的に照合します。**未設定のままだと、コマンド発火が実際には
-  失敗していても画面が「切り替わった」ことになってしまう既存の弱点がそのまま残るため、
-  N100実機では設定を推奨します。**
-- `GEOFRAME_HA_SCREEN_RECONCILE_SEC`（既定値90秒）— 上記照合の実行間隔。
-
-> [!IMPORTANT]
-> `GEOFRAME_SCREEN_STATUS_CMD`は**必ず絶対パスで指定してください。** systemd unitの
-> `WorkingDirectory`（`/opt/geoframe/app`）基準の相対パスでは動作しません。
->
-> ```sh
-> GEOFRAME_SCREEN_STATUS_CMD=/opt/geoframe/deploy/kiosk/screen-ctl.sh status
-> ```
-
-> [!NOTE]
-> reconciliationは「サーバー側の意図」を実機へ追従させる設計です。`force_off`中に
-> ssh経由で`screen-ctl.sh on`等の手動操作を行っても、次の照合サイクルで再び消灯します。
-> 保守作業の前は`input_select`を`auto`へ切り替えてください。
-
-## 5. バックアップ
+## 4. バックアップ
 
 `catalog.db`には、有料生成したAI埋め込み、手動GPS修正、お気に入りなどが含まれます。
 稼働中のWALモードDBにはSQLiteの`.backup`を使い、単純な`cp`は使用しないでください。
@@ -350,7 +207,7 @@ sudo -u geoframe gzip -t /var/backups/geoframe/latest.db.gz
 少なくとも1系統は別の機体へ保管してください。`backup-pull.sh`はLXC向け、
 `backup-pull-n100.sh`はSSH向けのpull型構成例です。接続先などを環境変数で明示して使用します。
 
-## 6. 更新
+## 5. 更新
 
 更新はサーバー自身が`origin/main`を取り込むpull方式です。スクリプトは2つに分かれます。
 
@@ -407,7 +264,7 @@ sudo /opt/geoframe/deploy/deploy-pull.sh
   安全側へ倒して再インストールします（判定を誤ってスキップすると、古い`.venv`のまま起動して
   後から`ImportError`としてしか露見しないためです）。変更が無ければスキップした旨をログへ出します。
 - **`git gc` / `git prune`は実行しません。** ロールバック用に古いコミットオブジェクトを
-  残すためです（§7）。
+  残すためです（§6）。
 - 適用に失敗した場合は、サービスが停止したままになる可能性があります。スクリプトは
   失敗時に復旧コマンド（適用前のSHAへの`git reset --hard`とサービス起動）をログへ出します。
 
@@ -424,7 +281,7 @@ ssh operator@geoframe.example.test \
   'sudo -u geoframe /opt/geoframe/deploy/backup-catalog.sh'
 ```
 
-## 7. ロールバック
+## 6. ロールバック
 
 更新後に問題が起きた場合は、適用前のコミットへ戻します。`deploy-pull.sh`は完了時と
 失敗時の両方に、適用前の`HEAD`（`OLD_HEAD`）のSHAをログへ出しています。
@@ -509,8 +366,4 @@ sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements.t
   成功すると`Hi ysogabe/geoframe-ambient-display! You've successfully authenticated, but GitHub does not provide shell access.`
   のように表示されます（シェルが得られないのは正常です）。`Host key verification failed`の
   場合は`known_hosts`の登録（§1.1）をやり直してください。
-- キオスクが白画面・黒画面: `curl`でサーバーURLを確認し、キオスク利用者のjournalと
-  Chromium引数を調べます。
-- Home Assistantが無効のまま: トークンとURLを確認し、
-  [`../docs/integrations/home-assistant.md`](../docs/integrations/home-assistant.md)を参照します。
-- 古いJavaScriptが表示される: キオスクをハードリロードするか、更新後に再起動します。
+- 管理ページに古いJavaScriptが表示される: ブラウザをハードリロードします。

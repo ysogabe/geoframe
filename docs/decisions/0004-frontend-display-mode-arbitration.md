@@ -1,7 +1,7 @@
 # ADR: 表示モードのアービトレーションはフロント新モジュールに一元化する
 
 - 日付: 2026-08-29（決定）/ 2026-08-31（実装反映）
-- 状態: 承認済み・実装済み（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。modes.js と #modelayer は 3D PHOTO JOURNEY Lite 実装で着地）
+- 状態: 廃止（2026-10-13。[ADR 0008](0008-photo-platform-and-miharashi-display.md)で表示をmiharashiへ移し、この決定の対象コードを削除した。元の状態: 承認済み・実装済み（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。modes.js と #modelayer は 3D PHOTO JOURNEY Lite 実装で着地））
 
 ## 文脈
 

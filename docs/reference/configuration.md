@@ -19,7 +19,7 @@
 
 - `GEOFRAME_DATA_DIR`（`config.py`: `DATA_DIR`） — 既定値 なし（未設定時は `ROOT / "var"`）。ソース（geoframe/ static/ vendor/）は ROOT 配下、書き換わるデータ （catalog.db・derivatives/・photos/・各種キャッシュ）は DATA_DIR 配下に置く。本番では GEOFRAME_DATA_DIR=/var/lib/geoframe のようにデータだけ別の場所へ移せる。※.env の読み込みは ROOT 側のまま。DATA_DIR は .env で指定できる必要があり、 .env を DATA_DIR 配下に置くと「読むために DATA_DIR が要る」鶏卵になるため。※derivatives/ photos/ blog_exports/ というディレクトリ名は変更しないこと。DBの display 列が「DATA_DIR/display＝実ファイル」かつ「/display＝配信URL」の 二重の意味を持っており、名前を変えると既存の全行が解決不能になる。
 - `GEOFRAME_PHOTOS_DIR`（`config.py`: `PHOTOS_DIR`） — 既定値 `photos`。※PHOTOS_DIR は DATA_DIR 配下であること（drive.py が relative_to(DATA_DIR) で DBに入れる相対パスを作るため、外に出すと索引できない）
-- `GEOFRAME_PORT`（`config.py`: `PORT`） — 既定値 `8080`。HTTPの待ち受けポート。キオスク端末は http://<機体IP>:<この値>/ を開く
+- `GEOFRAME_PORT`（`config.py`: `PORT`） — 既定値 `8080`。HTTPの待ち受けポート
 - `GEOFRAME_HOST`（`config.py`: `HOST`） — 既定値 `0.0.0.0`。開発時は GEOFRAME_HOST=127.0.0.1 でこの端末だけに限定できる。実機の家庭内LAN配信は従来互換の 0.0.0.0 を既定とする。
 - `GEOFRAME_FETCH_PER_CYCLE`（`config.py`: `FETCH_PER_CYCLE`） — 既定値 `25`。同期1サイクルで取り込む写真の枚数。初回のDrive全件取り込みもこの数ずつ進む
 - `GEOFRAME_QUALITY_PER_CYCLE`（`config.py`: `QUALITY_PER_CYCLE`） — 既定値 `str(FETCH_PER_CYCLE)`。品質解析も同期1サイクルで処理量を制限する。未指定時はderivative生成数と揃え、 通常運用では新しく取り込んだ分を同じサイクル内で追いつけるようにする。
