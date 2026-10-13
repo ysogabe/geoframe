@@ -218,7 +218,9 @@ CREATE TABLE IF NOT EXISTS photo_ai_groups(
   judge_model TEXT NOT NULL DEFAULT '',
   shortlist_json TEXT NOT NULL DEFAULT '[]',
   error TEXT NOT NULL DEFAULT '',
-  attempts INTEGER NOT NULL DEFAULT 0
+  attempts INTEGER NOT NULL DEFAULT 0,
+  judge_order TEXT NOT NULL DEFAULT '',
+  presented_json TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS photo_ai_group_members(
   group_id TEXT NOT NULL,
@@ -291,6 +293,9 @@ def db():
             "shortlist_json TEXT NOT NULL DEFAULT '[]'",
             "error TEXT NOT NULL DEFAULT ''",
             "attempts INTEGER NOT NULL DEFAULT 0",
+            # Geminiに見せた並び（rank=順位どおり、shuffled=並べ替え、''=記録前）と写真IDの順
+            "judge_order TEXT NOT NULL DEFAULT ''",
+            "presented_json TEXT NOT NULL DEFAULT '[]'",
         ):
             try:
                 _db.execute(f"ALTER TABLE photo_ai_groups ADD COLUMN {col}")
@@ -394,8 +399,8 @@ def replace_photo_ai_groups(groups, members):
     group_sql = """INSERT INTO photo_ai_groups(
         group_id,kind,summary,min_similarity,max_similarity,avg_similarity,
         algorithm,analyzed_at,status,same_scene,judge_version,judge_model,
-        shortlist_json,error,attempts
-      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+        shortlist_json,error,attempts,judge_order,presented_json
+      ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
     member_sql = """INSERT INTO photo_ai_group_members(
         group_id,photo_id,rank_in_group,recommended,shortlisted,local_score
       ) VALUES(?,?,?,?,?,?)"""
@@ -414,7 +419,8 @@ def replace_photo_ai_groups(groups, members):
 
 
 def complete_photo_ai_group(group_id, same_scene, summary, member_recommendations,
-                            feature_judgments, judge_model, judge_version, analyzed_at):
+                            feature_judgments, judge_model, judge_version, analyzed_at,
+                            judge_order="", presented_ids=()):
     """Gemini比較結果をグループ・表示判定・写真詳細へまとめて確定する。"""
     feature_sql = """UPDATE photo_ai_features SET
         subject=?,pet_state=?,eyes=?,face_crop=?,horizon_status=?,horizon_score=?,
@@ -427,9 +433,9 @@ def complete_photo_ai_group(group_id, same_scene, summary, member_recommendation
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("""UPDATE photo_ai_groups SET
                 status='judged',same_scene=?,summary=?,judge_model=?,judge_version=?,
-                error='',analyzed_at=? WHERE group_id=?""",
+                error='',analyzed_at=?,judge_order=?,presented_json=? WHERE group_id=?""",
                          (int(bool(same_scene)), summary, judge_model, judge_version,
-                          analyzed_at, group_id))
+                          analyzed_at, judge_order, json.dumps(list(presented_ids)), group_id))
             conn.executemany(
                 "UPDATE photo_ai_group_members SET recommended=? WHERE group_id=? AND photo_id=?",
                 [(int(bool(value)), group_id, pid)

@@ -11,6 +11,7 @@ import base64
 import hashlib
 import io
 import json
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -21,8 +22,8 @@ from PIL import Image, ImageOps
 from .ai_search import (EMBED_DIM, EMBED_MODEL, AgentPlatformEmbeddingClient,
                         AiSearchUnavailable, cosine, pack_embedding,
                         unpack_embedding)
-from .config import (AI_EMBED_PER_CYCLE, AI_JUDGE_PER_CYCLE, AI_POLL_S,
-                     AI_SHORTLIST_MAX, AI_SIMILARITY, AI_TIME_WINDOW_MIN,
+from .config import (AI_EMBED_PER_CYCLE, AI_JUDGE_PER_CYCLE, AI_JUDGE_SHUFFLE_RATE,
+                     AI_POLL_S, AI_SHORTLIST_MAX, AI_SIMILARITY, AI_TIME_WINDOW_MIN,
                      DATA_DIR, EMBED_BACKEND)
 from .local_embedding import LocalEmbeddingClient
 from .rank_model import load_rank_model
@@ -391,11 +392,14 @@ def _rebuild_groups(photos: list[PipelinePhoto]) -> int:
         error = old["error"] if preserve else ""
         attempts = old["attempts"] if preserve else 0
         judge_model = old["judge_model"] if preserve else ""
+        judge_order = old["judge_order"] if preserve else ""
+        presented_json = old["presented_json"] if preserve else "[]"
         group_rows.append((
             gid, "scene", summary, candidate["min_similarity"],
             candidate["max_similarity"], candidate["avg_similarity"],
             candidate["algorithm"], analyzed_at, status, same_scene, JUDGE_VERSION,
             judge_model, json.dumps(shortlist_ids), error, attempts,
+            judge_order, presented_json,
         ))
         prior = seeded_members if seeded else old_members.get(gid, {})
         for rank, photo in enumerate(candidate["photos"], 1):
@@ -410,6 +414,20 @@ def _rebuild_groups(photos: list[PipelinePhoto]) -> int:
     return len(candidates)
 
 
+def presentation_order(group_id: str, shortlist_ids: list[int]) -> tuple[str, list[int]]:
+    """Geminiに見せる並び。既定は順位どおり、AI_JUDGE_SHUFFLE_RATEの割合だけ並べ替える。
+
+    Geminiは最初に見せた写真を推奨しやすい。並べ替えたグループの判定は順位の影響を
+    受けないので、順位付けの学習と確認に使える。group_idから決めるので再試行でも同じ並び。
+    """
+    digest = hashlib.sha256(f"judge-order|{group_id}".encode()).digest()
+    if int.from_bytes(digest[:4], "big") / 2**32 >= AI_JUDGE_SHUFFLE_RATE:
+        return "rank", list(shortlist_ids)
+    presented = list(shortlist_ids)
+    random.Random(int.from_bytes(digest[4:12], "big")).shuffle(presented)
+    return "shuffled", presented
+
+
 def _judge_group(group_id: str, client) -> None:
     group = dbq("SELECT * FROM photo_ai_groups WHERE group_id=?", (group_id,))[0]
     shortlist_ids = json.loads(group["shortlist_json"])
@@ -419,8 +437,9 @@ def _judge_group(group_id: str, client) -> None:
     by_id = {row["id"]: row for row in rows}
     if len(by_id) != len(shortlist_ids):
         raise RuntimeError("shortlistの写真が更新または削除されました")
+    judge_order, presented = presentation_order(group_id, shortlist_ids)
     parts = [{"text": JUDGE_PROMPT}]
-    for pid in shortlist_ids:
+    for pid in presented:
         encoded = base64.b64encode(_image_bytes(_safe_path(by_id[pid]["display"]))).decode("ascii")
         parts.append({"inlineData": {"mimeType": "image/jpeg", "data": encoded}})
     result = client.post(JUDGE_MODEL, "generateContent", {
@@ -438,7 +457,7 @@ def _judge_group(group_id: str, client) -> None:
     recommendations = {}
     members = dbq("SELECT photo_id,shortlisted,local_score FROM photo_ai_group_members WHERE group_id=?",
                   (group_id,))
-    item_by_pid = dict(zip(shortlist_ids, ordered))
+    item_by_pid = dict(zip(presented, ordered))
     if same_scene and not any(item.get("recommended") for item in ordered):
         best = max(shortlist_ids, key=lambda pid: item_by_pid[pid].get("keep_score", 0))
         item_by_pid[best]["recommended"] = True
@@ -460,7 +479,7 @@ def _judge_group(group_id: str, client) -> None:
         ))
     complete_photo_ai_group(
         group_id, same_scene, value.get("summary") or "", recommendations,
-        feature_rows, JUDGE_MODEL, JUDGE_VERSION, analyzed_at)
+        feature_rows, JUDGE_MODEL, JUDGE_VERSION, analyzed_at, judge_order, presented)
 
 
 def _judge_pending(client, limit: int) -> int:
