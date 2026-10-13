@@ -5,6 +5,7 @@ handlers.do_POST 側の関門（application/json必須＋Origin同一オリジ�
 サイズ上限）を通ったものだけがここに来る。このモジュールは値の検証と
 DB更新に専念し、HTTPの作法は handlers.py 側に寄せている。
 """
+import json
 import os
 import shutil
 import time
@@ -13,6 +14,7 @@ from pathlib import Path
 from .config import DATA_DIR, DERIV_DIR, TILE_DIR, TILE_CACHE_MAX_MB
 from .ai_search import EMBED_MODEL
 from .geo import infer_bucket
+from .loc_suggest import loc_status
 from .store import dbq, dbx
 from .util import t_epoch
 
@@ -137,6 +139,7 @@ def api_admin_status():
             "infer_buckets": buckets,
             "quality": quality,
             "ai": ai,
+            "loc": loc_status(),
         },
         "disk": disk_info(),
         "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -154,6 +157,8 @@ FILTERS = {
     "hidden": "COALESCE(hidden,0)=1",
     "inferred": "loc_source='inferred'",
     "manual": "loc_source='manual'",
+    # 位置なしのうち、AIの撮影地候補がある写真（候補は確定するまで photos に書かない）
+    "suggest": "lat IS NULL AND id IN (SELECT photo_id FROM photo_loc_suggestions)",
 }
 
 
@@ -197,7 +202,8 @@ def api_admin_photos(page=1, per=50, filt="all"):
                    ORDER BY CASE WHEN taken_at IS NULL OR taken_at='' THEN 1 ELSE 0 END,
                             taken_at, id
                    LIMIT ? OFFSET ?""", (per, (page - 1) * per))
-    anchors = _time_anchors() if filt == "noloc" else []
+    anchors = _time_anchors() if filt in ("noloc", "suggest") else []
+    suggestions = _suggestions([r["id"] for r in rows if r["lat"] is None])
     items = []
     for r in rows:
         it = {
@@ -216,9 +222,32 @@ def api_admin_photos(page=1, per=50, filt="all"):
         }
         if anchors:
             it["hint"] = _nearest_hint(anchors, r["taken_at"])
+        if r["id"] in suggestions:
+            it["suggest"] = suggestions[r["id"]]
         items.append(it)
     return {"ok": True, "page": page, "per": per, "pages": pages,
             "total": total, "filter": filt, "items": items}
+
+
+def _suggestions(ids):
+    """位置なし写真のAI撮影地候補（loc_suggest.py が作る。画面に出すだけでDBの位置にはしない）"""
+    if not ids:
+        return {}
+    marks = ",".join("?" for _ in ids)
+    out = {}
+    for r in dbq(f"SELECT * FROM photo_loc_suggestions WHERE photo_id IN ({marks})", tuple(ids)):
+        try:
+            evidence = json.loads(r["evidence_json"])
+        except ValueError:
+            evidence = []
+        out[r["photo_id"]] = {
+            "place_name": r["place_name"], "day_place_name": r["day_place_name"],
+            "scope": r["scope"], "precision": r["precision"], "confidence": r["confidence"],
+            "evidence": evidence if isinstance(evidence, list) else [],
+            "lat": r["lat"], "lon": r["lon"], "geocode_title": r["geocode_title"],
+            "model": r["model"],
+        }
+    return out
 
 
 HINT_MAX_DT_S = 7 * 86400      # これより離れた「近い写真」は手掛かりにならないので出さない

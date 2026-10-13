@@ -87,6 +87,23 @@ class GeocodeSearchTest(unittest.TestCase):
         self.assertEqual(len(slept), 1)
         self.assertAlmostEqual(slept[0], 0.6)
 
+    def test_country_filter_goes_to_url_and_cache_key(self):
+        urls = []
+
+        def fake(url):
+            urls.append(url)
+            return OSM_HIT
+        with patch.object(geo, "http_json", fake):
+            geo.nominatim_search("Cairo", "EG")
+            geo.nominatim_search("Cairo", "EG")      # キャッシュ
+            geo.nominatim_search("Cairo")            # 国を絞らない検索は別のキャッシュ
+            geo.nominatim_search("Cairo", "E1")      # 不正な国コードは無視
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(urls[0].endswith("&countrycodes=eg"))
+        self.assertNotIn("countrycodes", urls[1])
+        self.assertIn("geocode_osm:eg:Cairo", self.cache)
+        self.assertIn("geocode_osm:Cairo", self.cache)
+
     def test_short_query_makes_no_request(self):
         with self._route(GSI_HIT, OSM_HIT):
             self.assertEqual(geo.geocode_search(" a "), [])

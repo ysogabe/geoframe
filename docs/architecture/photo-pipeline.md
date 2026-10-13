@@ -23,13 +23,16 @@
 - AI処理量は`GEOFRAME_AI_EMBED_PER_CYCLE`（既定12）、`GEOFRAME_AI_JUDGE_PER_CYCLE`（既定2）、`GEOFRAME_AI_POLL_S`（既定60秒）で制限する。`GEOFRAME_AI_ENABLED=0`で停止できる。
 - ユーザー評価は `favorite` と `hidden`。rating・表示回数はない。
 - `GEOFRAME_INFER_OFFSET_MIN` は `geoframe.config.INFER_OFFSET_S` として読み込み、位置推定時のカメラ時計補正に使う。写真ごとの補正値・根拠は未保存。
-- 外部AIは写真選定にだけ使用する。`gemini`では検索時に検索文、取り込み時にEXIF除去・縮小したderivativeをAgent Platformへ送る。`local`ではembeddingをこのサーバーで計算し、Agent Platformへ送るのは比較評価に回す同一場面の候補（最大6枚）だけになる。`ai_caption`列は未使用で、旅行ブログ本文は引き続き決定的な事実アウトラインを生成する。
+- 位置なし写真の撮影地候補は`ai_worker`が写真選定の後に別処理として増分実行する（`geoframe/loc_suggest.py`）。まず同じ機体のDecisionサーバー（gpu-evalのd3-lite、`GEOFRAME_DECISION_URL`）が写真ごとに「撮影地の手がかりがあるか」と被写体の種類を判定し、`photo_loc_clues`へ保存する。同じ日の写真（12時間以上の空きか日付の変わり目で区切る）をまとめ、手がかりあり（`clue`≥0.2または`kind=landmark`）の上位6枚だけを`GEOFRAME_LOC_SUGGEST_MODEL`（既定`gemini-3.8-flash`）へ送って撮影地を推定させる。判定の済んでいない写真がある日、手がかりのある写真が無い日は送らない。Decisionが応答しない間は判定が進まないので、家の中のペット写真などが判定なしでGoogleへ送られることはない。推定した地名はNominatimで座標にし、`photo_loc_runs`（問い合わせ1回分）と`photo_loc_suggestions`（写真ごとの候補）へ保存する。候補は`photos.lat/lon`に書かず、管理画面の位置指定で候補の場所へ地図を動かすだけにする。確定は人が地図をクリックしてSAVEしたとき（`manual`）に限る。処理量は`GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`（既定60枚）と`GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`（既定2日）、`GEOFRAME_LOC_SUGGEST=0`で停止できる。
+- 外部AIは写真選定と撮影地候補にだけ使用する。`gemini`では検索時に検索文、取り込み時にEXIF除去・縮小したderivativeをAgent Platformへ送る。`local`ではembeddingをこのサーバーで計算し、Agent Platformへ送るのは比較評価に回す同一場面の候補（最大6枚）だけになる。`ai_caption`列は未使用で、旅行ブログ本文は引き続き決定的な事実アウトラインを生成する。
 
 ## API・UI
 
 - サーバーはPython標準ライブラリの `ThreadingHTTPServer`。家庭内LAN利用を前提とし、Host検証と同一オリジンPOST制限がある。
 - 表示クライアント向けの写真一覧は `GET /api/v1/photos`（旧名 `/api/photos`。[写真フィードの契約](photo-feed-contract.md)）、管理用ページング一覧は `GET /api/admin/photos`。
 - AI検索は`GET /api/ai/search`、進捗は`GET /api/ai/status`、管理画面は`/ai-search`。通常の管理画面STATUSにもembedding・比較待ち・表示抑止数を表示する。
+- 管理用一覧（`GET /api/admin/photos`）は、位置なし写真にAIの撮影地候補（`suggest`）を付ける。`filter=suggest`で候補のある位置なし写真だけを返す。STATUSにはDecisionの接続状態、手がかり判定の進み具合、推定済みの日数を表示する。表示クライアント向けの写真フィードには候補を含めない。
+- 管理画面の地名検索（`GET /api/admin/geocode`）は地理院のアドレス検索が0件のときだけNominatim（OpenStreetMap）で引き直し、海外の地名も探せる。Nominatimへの問い合わせは全体で1秒1件に絞り、結果はキャッシュする。
 - 旅行ブログ機能は `GET /api/blog/*` から写真カタログを読み取り、正確なGPSをレスポンスへ含めない。
 - レビュー状態は再構築可能な写真索引と混ぜず、`GEOFRAME_DATA_DIR/travel_blog/drafts/` のJSONへ保存する。
 - エクスポートは `GEOFRAME_DATA_DIR/blog_exports/<trip_id>/`。画像は再エンコードしてEXIFを除去する。
@@ -39,5 +42,6 @@
 - `taken_at_raw` / UTC / local / timezone / offset / normalization confidence の分離がない。
 - SHA-256とembeddingはいずれも表示用derivative由来で、Drive原本そのもののハッシュではない。
 - AIバックフィル中は未解析写真を表示可能なままにするため、全件完了まで選定率は段階的に上がる。
+- 撮影地候補の関門の基準（`clue`≥0.2または`kind=landmark`）は、位置なし写真64枚に1人が付けたラベルで決めた暫定値。Geminiの確信度は当てにならないため、候補は必ず人が確認する。
 - 海外写真の粗い地名が未解決の場合がある。ブログ候補では旅程の場所ラベルへフォールバックする。
 - 公開は自動化しない。静的HTMLを書き出した後、利用者が内容を確認して別途公開する。

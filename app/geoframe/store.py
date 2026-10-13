@@ -26,7 +26,9 @@ CACHE_SAVE_INTERVAL_S = 60        # 実書き込みの最短間隔
 CACHE_SAVER_TICK_S = 10           # 保存スレッドの起床間隔
 # 現役キー。これ以外（exif:/exif2: 等の死蔵レガシーや、削除した表示機能の
 # adsbdb:/airport:/intel2:）は起動時に破棄する
-CACHE_LIVE_PREFIXES = ("geo:",)
+# geocode_osm: は /admin の地名検索（Nominatim）と位置候補の座標化の結果。公開サーバーへの
+# 再問い合わせを避けるために残す（"geo:" とは前方一致しないので別に書く）
+CACHE_LIVE_PREFIXES = ("geo:", "geocode_osm:")
 CACHE_LIVE_EXACT = frozenset({"muni_table"})
 
 
@@ -231,6 +233,53 @@ CREATE TABLE IF NOT EXISTS photo_ai_group_members(
 );
 CREATE INDEX IF NOT EXISTS idx_photo_ai_group_members_photo
   ON photo_ai_group_members(photo_id);
+-- 位置なし写真の撮影地候補（loc_suggest.py）。photos.lat/lon には書かず、管理画面で人が
+-- 確認してSAVEしたときだけ manual として photos に入る。どれも再生成できる派生データ。
+-- Decisionによる「撮影地の手がかり」判定。display/md5/mtimeが一致する行だけ使う。
+-- 判定に失敗した写真も error を入れて記録し（手がかり無し扱い）、その日の推定を止めない。
+CREATE TABLE IF NOT EXISTS photo_loc_clues(
+  photo_id INTEGER PRIMARY KEY,
+  display TEXT NOT NULL,
+  source_md5 TEXT,
+  source_mtime REAL,
+  clue REAL,
+  kind TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL,
+  analyzed_at TEXT NOT NULL,
+  error TEXT NOT NULL DEFAULT ''
+);
+-- Geminiへの問い合わせ1回分（同じ日に撮った写真のまとまり単位）。run_id は
+-- プロンプト版・モデル・送った写真の組から決まり、同じ組なら再問い合わせしない。
+CREATE TABLE IF NOT EXISTS photo_loc_runs(
+  run_id TEXT PRIMARY KEY,
+  day TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt_version TEXT NOT NULL,
+  member_ids_json TEXT NOT NULL,
+  sent_ids_json TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('pending','done','error')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  answer_json TEXT NOT NULL DEFAULT '',
+  error TEXT NOT NULL DEFAULT '',
+  analyzed_at TEXT NOT NULL
+);
+-- 写真ごとの候補。送った写真は写真ごとの推定（scope='photo'）、同じ日の残りの写真は
+-- その日の推定（scope='day'）。lat/lon は地名をNominatimで引いた代表点で、撮影地点ではない。
+CREATE TABLE IF NOT EXISTS photo_loc_suggestions(
+  photo_id INTEGER PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  scope TEXT NOT NULL CHECK(scope IN ('photo','day')),
+  place_name TEXT NOT NULL,
+  day_place_name TEXT NOT NULL DEFAULT '',
+  geocode_query TEXT NOT NULL DEFAULT '',
+  precision TEXT NOT NULL DEFAULT 'unknown',
+  confidence TEXT NOT NULL DEFAULT 'unknown',
+  evidence_json TEXT NOT NULL DEFAULT '[]',
+  lat REAL, lon REAL,
+  geocode_title TEXT NOT NULL DEFAULT '',
+  model TEXT NOT NULL,
+  analyzed_at TEXT NOT NULL
+);
 """
 _db = None
 _db_lock = threading.Lock()

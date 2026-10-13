@@ -91,7 +91,7 @@ def geocode_search(query):
     q = (query or "").strip()
     if len(q) < GEOCODE_MIN_LEN:
         return []
-    return _gsi_geocode(q) or _nominatim_geocode(q)
+    return _gsi_geocode(q) or nominatim_search(q)
 
 
 def _gsi_geocode(q):
@@ -117,12 +117,17 @@ def _gsi_geocode(q):
         return []
 
 
-def _nominatim_geocode(q):
-    """Nominatim で地名検索する。同じ語の再検索で公開サーバーを叩かないよう、
+def nominatim_search(q, countrycode=""):
+    """Nominatim で地名検索する（世界・認証不要）。/admin の検索の予備と、AIが返した英語の
+    地名を座標にするとき（loc_suggest.py）に使う。countrycode（ISO 3166-1の2文字）を渡すと
+    その国に絞る（"Cairo" が米イリノイ州に当たる、のような同名違いを避ける）。
+    同じ語の再検索で公開サーバーを叩かないよう、
     応答が返った結果（0件を含む）はキャッシュする。通信失敗はキャッシュしない。
     問い合わせは全スレッド合計で1秒1件に絞る（超える分は待たせる）"""
     global _nominatim_last
-    key = f"geocode_osm:{q}"
+    cc = countrycode.strip().lower() if isinstance(countrycode, str) else ""
+    cc = cc if len(cc) == 2 and cc.isascii() and cc.isalpha() else ""
+    key = f"geocode_osm:{cc}:{q}" if cc else f"geocode_osm:{q}"
     hit = cache_get(key)
     if isinstance(hit, list):
         return hit
@@ -132,8 +137,8 @@ def _nominatim_geocode(q):
             if wait > 0:
                 time.sleep(wait)
             try:
-                data = http_json(NOMINATIM_SEARCH.format(
-                    q=urllib.parse.quote(q), limit=GEOCODE_MAX_RESULTS))
+                url = NOMINATIM_SEARCH.format(q=urllib.parse.quote(q), limit=GEOCODE_MAX_RESULTS)
+                data = http_json(url + (f"&countrycodes={cc}" if cc else ""))
             finally:
                 _nominatim_last = time.monotonic()
     except Exception as e:

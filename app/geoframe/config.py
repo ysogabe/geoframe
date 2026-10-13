@@ -111,6 +111,17 @@ AI_VISUAL_SIMILARITY = float(os.environ.get("GEOFRAME_AI_VISUAL_SIMILARITY")
                              or ("0.91" if EMBED_BACKEND == "local" else "0.90"))
 # 1グループでGemini比較に回す最大枚数（2〜6へクランプ）
 AI_SHORTLIST_MAX = max(2, min(6, int(os.environ.get("GEOFRAME_AI_SHORTLIST_MAX", "6"))))
+# 位置なし写真の撮影地候補（loc_suggest.py）を作るか。AI_ENABLED=1のときだけ動く。0で止める
+LOC_SUGGEST_ENABLED = os.environ.get("GEOFRAME_LOC_SUGGEST", "1") == "1"
+# 撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalのd3-lite）。応答しない間は
+# Geminiへ写真を送らない（家の中のペット写真などを外へ出さないための関門）
+DECISION_URL = os.environ.get("GEOFRAME_DECISION_URL", "http://127.0.0.1:8092").rstrip("/")
+# 撮影地を推定するGeminiモデル。3.1-flash-liteは店名から所在地を決めつけやすかったため3.8-flashを使う
+LOC_SUGGEST_MODEL = os.environ.get("GEOFRAME_LOC_SUGGEST_MODEL", "gemini-3.8-flash")
+# 1サイクルでDecisionに判定させる写真の枚数（1枚0.6秒前後）
+LOC_SUGGEST_CLUE_PER_CYCLE = int(os.environ.get("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "60"))
+# 1サイクルでGeminiに撮影地を推定させる日の数（1回20秒前後）
+LOC_SUGGEST_GEMINI_PER_CYCLE = int(os.environ.get("GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE", "2"))
 # /api/ai/search の流量上限（分あたり）。LAN内の任意ページから連打GETで
 # 全embedding行の毎回フルスキャン（3テーブルJOIN、グローバルDBロック内）を
 # 誘発できるため、tiles.pyのスライディング窓と同型で抑制する。

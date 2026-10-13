@@ -23,7 +23,8 @@ from .ai_search import (EMBED_DIM, EMBED_MODEL, AgentPlatformEmbeddingClient,
                         unpack_embedding)
 from .config import (AI_EMBED_PER_CYCLE, AI_JUDGE_PER_CYCLE, AI_POLL_S,
                      AI_SHORTLIST_MAX, AI_SIMILARITY, AI_TIME_WINDOW_MIN,
-                     DATA_DIR, EMBED_BACKEND)
+                     DATA_DIR, EMBED_BACKEND, LOC_SUGGEST_ENABLED)
+from .loc_suggest import loc_suggest_cycle
 from .local_embedding import LocalEmbeddingClient
 from .quality import Metrics, QualityPhoto, UnionFind, parse_taken_at, rank_group
 from .store import (complete_photo_ai_group, dbm, dbq, dbx,
@@ -512,4 +513,10 @@ def ai_worker() -> None:
             error = f"{type(exc).__name__}: {exc}"[:500]
             setting_set("photo_ai_last_error", error)
             print(f"[ai] パイプライン失敗（次回再試行）: {error}")
+        # 位置なし写真の撮影地候補。写真選定とは別に失敗させ、片方の障害でもう片方を止めない
+        if LOC_SUGGEST_ENABLED:
+            try:
+                loc_suggest_cycle()
+            except Exception as exc:
+                print(f"[loc] 撮影地候補の処理に失敗（次回再試行）: {type(exc).__name__}: {exc}"[:500])
         time.sleep(AI_POLL_S)
