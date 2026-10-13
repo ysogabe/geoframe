@@ -69,7 +69,7 @@ class Handler(SimpleHTTPRequestHandler):
             # クリックジャッキング対策。無認証なので、透明にした<iframe>で /admin を
             # 重ねて利用者に誘導クリックさせると、同一オリジン扱いのまま
             # setflag（全件hidden化）等が実行できてしまう。
-            # 本体画面（キオスク）も管理ページもiframeに入れて使う想定は無いため一律DENY。
+            # 管理ページをiframeに入れて使う想定は無いため一律DENY。
             # ※X-Frame-Optionsを無視する新しめのブラウザ向けにCSPも併記する
             self.send_header("X-Frame-Options", "DENY")
             self.send_header("Content-Security-Policy", "frame-ancestors 'none'")

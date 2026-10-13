@@ -1,7 +1,7 @@
 /* Share Tech Mono (latin) — Google Fonts からセルフホストへ移行したもの。
    元CSS: https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap
    ライセンス: SIL Open Font License 1.1
-   ネットワーク不通のキオスク環境でも UI フォントが確実に出るようにローカル配信する。 */
+   外部CDNに依存せず UI フォントが確実に出るようにローカル配信する。 */
 @font-face {
   font-family: 'Share Tech Mono';
   font-style: normal;

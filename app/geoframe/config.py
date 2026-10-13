@@ -66,8 +66,8 @@ DERIV_DIR = DATA_DIR / "derivatives"
 #   tempfile.gettempdir() 配下だと別デバイスになりうるため、
 #   将来 os.replace でderivativeへ差し替える実装にした際に跨デバイスで失敗する
 TMP_DIR = DATA_DIR / "tmp"
-CACHE_FILE = DATA_DIR / ".cache.json"      # adsbdb・地理院ジオコーダ結果の永続キャッシュ
-# HTTPの待ち受けポート。キオスク端末は http://<機体IP>:<この値>/ を開く
+CACHE_FILE = DATA_DIR / ".cache.json"      # 地理院ジオコーダ結果の永続キャッシュ
+# HTTPの待ち受けポート
 PORT = int(os.environ.get("GEOFRAME_PORT", "8080"))
 # 開発時は GEOFRAME_HOST=127.0.0.1 でこの端末だけに限定できる。
 # 実機の家庭内LAN配信は従来互換の 0.0.0.0 を既定とする。

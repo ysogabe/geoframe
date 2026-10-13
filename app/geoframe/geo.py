@@ -6,7 +6,7 @@ import urllib.request
 
 from .config import (GSI_ELEV, GSI_GEOCODE, GSI_RGEO, INFER_OFFSET_S,
                      INFER_WINDOW_S, INFER_WINDOWS_S)
-from .store import _MISS, cache_get, cache_put, dbq, dbx
+from .store import cache_get, cache_put, dbq, dbx
 from .util import http_json, t_epoch
 
 
@@ -138,43 +138,6 @@ def _rg():
         return reverse_geocode
     except ImportError:
         return None
-
-
-def resolve_airport_pref(lat, lon, budget):
-    """行き先空港の緯度経度 → 都道府県名。enrich_rows() と同じ
-    GSI逆ジオコーディング + muni_table() の変換を再利用する。
-    空港は有限個（せいぜい数百）で座標も固定のため、一度解決できれば恒久キャッシュしてよい。
-
-    戻り値: (pref, in_jp)
-      in_jp=False               → JP_BBOX外（海外）。呼び出し側は80km半径マッチにフォールバック
-      in_jp=True かつ pref==""  → 国内だが都道府県解決に失敗（一時的な上流障害等）。同じくフォールバック
-      in_jp=True かつ pref!=""  → 都道府県が確定
-    """
-    in_jp = (JP_BBOX[0] <= lat <= JP_BBOX[2] and JP_BBOX[1] <= lon <= JP_BBOX[3])
-    if not in_jp:
-        return "", False
-    key = f"airport:{lat:.3f},{lon:.3f}"
-    hit = cache_get(key, _MISS)
-    if hit is not _MISS:
-        return (hit or ""), True
-    if budget[0] <= 0:
-        return "", True            # 予算切れ。今回だけ未解決扱い（キャッシュしない＝次回再試行）
-    mt = muni_table()
-    if not mt:
-        return "", True            # 自治体テーブル未取得。キャッシュしない＝次回再試行
-    budget[0] -= 1
-    pref = ""
-    try:
-        res = http_json(GSI_RGEO.format(lat=lat, lon=lon)).get("results") or {}
-        mc = str(res.get("muniCd", "") or "")
-        if mc.isdigit():
-            ent = mt.get(str(int(mc)))
-            if ent:
-                pref = ent[0]
-    except Exception:
-        return "", True            # 上流障害。キャッシュしない＝次回再試行
-    cache_put(key, pref)           # 空文字（=解決失敗）も正当な値として確定キャッシュ
-    return pref, True
 
 
 def enrich_rows():

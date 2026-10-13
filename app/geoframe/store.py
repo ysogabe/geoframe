@@ -9,11 +9,11 @@ from .config import CACHE_FILE, DB_PATH
 
 
 # ============================================================
-# 永続キャッシュ（adsbdb・地理院）
+# 永続キャッシュ（地理院の逆ジオコーディング）
 # ------------------------------------------------------------
 # 読み書きは必ず cache_get / cache_put 経由（_cache への直接アクセスはこの節の中だけ）。
 # 実ディスク書き込みは cache_saver スレッドが CACHE_SAVE_INTERVAL_S 間隔で間引く。
-# ※/api/aircraft は5秒毎に叩かれる。毎回全量書き込みするとSD/eMMCの寿命を直撃するため、
+# ※毎回全量書き込みするとSD/eMMCの寿命を縮めるため、
 #   dirtyフラグ＋デバウンスで「変化があった時だけ・最短60秒間隔」に抑える。
 # ============================================================
 _cache = {}
@@ -24,8 +24,9 @@ _MISS = object()                  # cache_get のミス判定用（None/Falseも
 
 CACHE_SAVE_INTERVAL_S = 60        # 実書き込みの最短間隔
 CACHE_SAVER_TICK_S = 10           # 保存スレッドの起床間隔
-# 現役キー。これ以外（exif:/exif2: 等の死蔵レガシー）は起動時に破棄する
-CACHE_LIVE_PREFIXES = ("adsbdb:", "airport:", "geo:", "intel2:")
+# 現役キー。これ以外（exif:/exif2: 等の死蔵レガシーや、削除した表示機能の
+# adsbdb:/airport:/intel2:）は起動時に破棄する
+CACHE_LIVE_PREFIXES = ("geo:",)
 CACHE_LIVE_EXACT = frozenset({"muni_table"})
 
 
