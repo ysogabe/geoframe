@@ -15,7 +15,7 @@
 
 既定値は未設定時の値です。式で書かれている場合は `config.py` の記述をそのまま示します
 （`ROOT` は `app/`、`DATA_DIR` はデータルートを指します）。定義順（＝機能のまとまり順）に
-並べています。外部連携を有効にする手順は [外部連携](../integrations/) を参照してください。
+並べています。
 
 - `GEOFRAME_DATA_DIR`（`config.py`: `DATA_DIR`） — 既定値 なし（未設定時は `ROOT / "var"`）。ソース（geoframe/ static/ vendor/）は ROOT 配下、書き換わるデータ （catalog.db・derivatives/・photos/・各種キャッシュ）は DATA_DIR 配下に置く。本番では GEOFRAME_DATA_DIR=/var/lib/geoframe のようにデータだけ別の場所へ移せる。※.env の読み込みは ROOT 側のまま。DATA_DIR は .env で指定できる必要があり、 .env を DATA_DIR 配下に置くと「読むために DATA_DIR が要る」鶏卵になるため。※derivatives/ photos/ blog_exports/ というディレクトリ名は変更しないこと。DBの display 列が「DATA_DIR/display＝実ファイル」かつ「/display＝配信URL」の 二重の意味を持っており、名前を変えると既存の全行が解決不能になる。
 - `GEOFRAME_PHOTOS_DIR`（`config.py`: `PHOTOS_DIR`） — 既定値 `photos`。※PHOTOS_DIR は DATA_DIR 配下であること（drive.py が relative_to(DATA_DIR) で DBに入れる相対パスを作るため、外に出すと索引できない）
