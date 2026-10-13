@@ -16,12 +16,19 @@ from geoframe import handlers, photos
 
 # miharashi が読むフィールドと、その JSON 型
 CONTRACT_FIELDS = {
+    "id": int,
     "file": str,
     "time": str,
+    "lat": float,
+    "lon": float,
     "pref": str,
+    "city": str,
     "title": str,
     "fav": bool,
+    "fetched_at": str,
+    "quality_kind": str,
     "quality_recommended": bool,
+    "trip": int,
 }
 
 
@@ -74,6 +81,19 @@ class PhotoFeedFieldsTest(unittest.TestCase):
         self.assertEqual((second["pref"], second["title"]), ("千葉県", "千葉市 中央"))
         self.assertEqual(second["time"], "2025-06-07 11:00")
         self.assertEqual(third["time"], "")             # 撮影時刻不明は空文字
+        self.assertEqual([i["id"] for i in self.items], [1, 2, 3])
+        self.assertEqual((second["city"], second["lat"], second["lon"]), ("千葉市", 35.0, 139.0))
+        self.assertEqual((first["city"], first["pref"]), ("", ""))   # 住所なし（海外など）
+        self.assertEqual((first["quality_kind"], second["quality_kind"]), ("", "similar"))
+
+    def test_trip_numbers_split_at_48_hour_gaps(self):
+        rows = [_row(id=1, taken_at="2025-06-01 10:00"),
+                _row(id=2, taken_at="2025-06-03 09:00"),   # 47時間後: 同じ旅
+                _row(id=3, taken_at="2025-06-05 10:00"),   # 49時間後: 次の旅
+                _row(id=4, taken_at="")]
+        with patch.object(photos, "dbq", return_value=rows):
+            items = photos.api_photos()
+        self.assertEqual([i["trip"] for i in items], [0, 0, 1, 2])
 
 
 class PhotoFeedHttpTest(unittest.TestCase):
