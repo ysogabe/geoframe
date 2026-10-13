@@ -1,0 +1,8 @@
+# ローカルembedding（GEOFRAME_EMBED_BACKEND=local）を使うときだけ追加で入れる依存。
+# torchはCPU版（CUDA版は数GB大きく、本番では使わない）。deploy-pull.shはこのファイルを
+# 見ないため、変更したときは手動で入れ直す（deploy/README.mdの「ローカルembedding」）。
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu
+torchvision==0.29.1+cpu
+transformers==5.19.0
+sentence-transformers==6.1.0

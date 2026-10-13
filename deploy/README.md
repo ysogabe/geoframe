@@ -154,6 +154,58 @@ sudo chmod 0640 /etc/default/geoframe
 unitは`GEOFRAME_DATA_DIR=/var/lib/geoframe`と、上記認証ファイルを指す
 `GEOFRAME_DRIVE_KEY`を設定します。ホストが日本標準時以外の場合はunitの`TZ=`も変更してください。
 
+### 2.1 ローカルembedding（任意）
+
+`GEOFRAME_EMBED_BACKEND=local`にすると、写真と検索語のembeddingをこのサーバーのCPUで
+embeddinggemma-2により計算し、写真をembeddingのためにGoogleへ送らなくなります（比較評価に回す
+同一場面の候補だけは引き続きGeminiへ送ります）。目安はCPU 4スレッドで1枚1.3秒、
+プロセスのメモリ+1.5GBです。既定は`gemini`で、設定しなければ何も変わりません。
+
+1. `catalog.db`をバックアップします（§4）。
+2. 追加の依存を入れます。torchはCPU版です。`deploy-pull.sh`はこのファイルを見ないため、
+   変わったときは同じコマンドで入れ直してください。
+
+   ```sh
+   sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements-local-ai.txt
+   ```
+
+3. モデルを`/var/lib/geoframe/models/embeddinggemma-2`へ置きます（起動時にネットワークから
+   取得しません。サービスは`ProtectHome=true`なので、ホームディレクトリには置けません）。
+   Hugging Faceで`google/embeddinggemma-2`の利用条件に同意したアカウントで取得し、
+   検証済みのリビジョン`914f7f89142e33e77833254d9c9b90c3cef7303b`を使います。
+
+   ```sh
+   sudo install -d -o geoframe -g geoframe -m 0750 /var/lib/geoframe/models
+   sudo cp -rL /path/to/embeddinggemma-2 /var/lib/geoframe/models/embeddinggemma-2
+   sudo chown -R geoframe:geoframe /var/lib/geoframe/models/embeddinggemma-2
+   ```
+
+4. 切り替える前に、全写真のembeddingをキャッシュへ作っておきます。サービスは今のまま動かして
+   かまいません。8スレッドで1秒に約1枚（6,500枚で約2時間）です。省くと、切り替え後に
+   ai_workerが1分12枚ずつ作り直すため数時間かかり、その間は未embeddingの写真を含む場面が
+   グループになりません（写真は表示されたままです）。
+
+   ```sh
+   cd /opt/geoframe/app
+   sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe \
+     nice -n 10 .venv/bin/python -m geoframe.prefill_embeddings --threads 8
+   ```
+
+5. `/etc/default/geoframe`に`GEOFRAME_EMBED_BACKEND=local`を足して再起動します。最初のサイクルで
+   キャッシュから入れ替わり、Geminiの比較評価は写真の中身が同じなら残ります。同一場面の
+   しきい値は既定で0.82から0.83に変わるため、候補の組が変わったグループ（実データでは約800中
+   約210）だけが比べ直しになります（`GEOFRAME_AI_JUDGE_PER_CYCLE`件ずつ）。
+
+   ```sh
+   sudo systemctl restart geoframe-server.service
+   curl --fail http://127.0.0.1:8080/api/ai/status
+   ```
+
+   `embedding_backend`が`local`、`other_model_embeddings`が0になれば入れ替え完了です。
+
+戻すときは`GEOFRAME_EMBED_BACKEND`の行を消して再起動します。Geminiのembeddingはキャッシュに
+残っているので、作り直し（課金）は起きません。
+
 ## 3. サーバーの有効化
 
 ```sh

@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 
 from .config import DATA_DIR, DERIV_DIR, TILE_DIR, TILE_CACHE_MAX_MB
+from .ai_search import EMBED_MODEL
 from .geo import infer_bucket
 from .store import dbq, dbx
 from .util import t_epoch
@@ -104,7 +105,7 @@ def api_admin_status():
                     FROM photo_ai_features a JOIN photos p
                       ON p.id=a.photo_id AND p.display=a.display
                      AND p.md5 IS a.source_md5 AND p.mtime IS a.source_mtime
-                    WHERE a.error=''""")[0])
+                    WHERE a.error='' AND a.embedding_model=?""", (EMBED_MODEL,))[0])
     ai["eligible"] = dbq("""SELECT COUNT(DISTINCT f.content_sha256) c
                               FROM photos p JOIN photo_quality_features f
                                 ON f.photo_id=p.id AND f.display=p.display

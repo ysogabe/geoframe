@@ -39,6 +39,22 @@ class AiSearchTest(unittest.TestCase):
         ai_search._query_cache.clear()
         ai_search._client = None
 
+    def test_query_cache_is_separated_by_embedding_model(self):
+        calls = []
+
+        class Client:
+            def embed_text(self, text):
+                calls.append(text)
+                return [1.0, 0.0, 0.0]
+
+        ai_search._client = Client()
+        with patch.object(ai_search, "EMBED_MODEL", "model-a"):
+            ai_search._embed_query("犬の写真")
+            ai_search._embed_query("犬の写真")
+        with patch.object(ai_search, "EMBED_MODEL", "model-b"):
+            ai_search._embed_query("犬の写真")
+        self.assertEqual(len(calls), 2)
+
     def test_float32_embedding_round_trip_and_cosine(self):
         values = [0.25, -0.5, 0.75]
         unpacked = ai_search.unpack_embedding(ai_search.pack_embedding(values), 3)

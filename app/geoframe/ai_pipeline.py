@@ -23,7 +23,8 @@ from .ai_search import (EMBED_DIM, EMBED_MODEL, AgentPlatformEmbeddingClient,
                         unpack_embedding)
 from .config import (AI_EMBED_PER_CYCLE, AI_JUDGE_PER_CYCLE, AI_POLL_S,
                      AI_SHORTLIST_MAX, AI_SIMILARITY, AI_TIME_WINDOW_MIN,
-                     DATA_DIR)
+                     DATA_DIR, EMBED_BACKEND)
+from .local_embedding import LocalEmbeddingClient
 from .quality import Metrics, QualityPhoto, UnionFind, parse_taken_at, rank_group
 from .store import (complete_photo_ai_group, dbm, dbq, dbx,
                     replace_photo_ai_groups, setting_set)
@@ -195,6 +196,10 @@ def _remove_noncanonical_embeddings() -> int:
                     ON f2.photo_id=p2.id AND f2.display=p2.display
                    AND f2.source_md5 IS p2.md5 AND f2.source_mtime IS p2.mtime
                   WHERE f2.error='' AND f2.content_sha256=f.content_sha256))""")
+    # どの写真にも使われなくなった中身のキャッシュも捨てる。
+    dbx("""DELETE FROM photo_embeddings WHERE content_sha256 NOT IN (
+             SELECT content_sha256 FROM photo_quality_features
+             WHERE content_sha256 IS NOT NULL)""")
     return count
 
 
@@ -203,11 +208,30 @@ def _embed_pending(photos: list[PipelinePhoto], client, limit: int) -> int:
     pending.sort(key=lambda photo: (photo.indexed_at, photo.id), reverse=True)
     values = []
     analyzed_at = _now()
+    cached = []
+    computed = 0
+    # 同じ中身を前に同じモデルでembeddingしていれば、それを使う（切り替えて戻したとき、
+    # prefill_embeddingsで先に作っておいたとき）。キャッシュからの分は上限に数えない。
+    cache = {row["content_sha256"]: row["embedding"] for row in dbq(
+        """SELECT content_sha256,embedding FROM photo_embeddings
+           WHERE embedding_model=? AND embedding_dim=?""", (EMBED_MODEL, EMBED_DIM))} if pending else {}
     try:
-        for photo in pending[:max(0, limit)]:
-            payload = base64.b64encode(_image_bytes(_safe_path(photo.display))).decode("ascii")
-            embedding = client.embed_part({"inlineData": {
-                "mimeType": "image/jpeg", "data": payload}})
+        for photo in pending:
+            embedding = None
+            if photo.sha256 in cache:
+                try:
+                    embedding = list(unpack_embedding(cache[photo.sha256], EMBED_DIM))
+                except (ValueError, TypeError):
+                    embedding = None
+            if embedding is None:
+                if computed >= max(0, limit):
+                    continue
+                computed += 1
+                payload = base64.b64encode(_image_bytes(_safe_path(photo.display))).decode("ascii")
+                embedding = client.embed_part({"inlineData": {
+                    "mimeType": "image/jpeg", "data": payload}})
+                cached.append((photo.sha256, EMBED_MODEL, EMBED_DIM,
+                               pack_embedding(embedding), analyzed_at))
             values.append((
                 photo.id, photo.display, photo.md5, photo.mtime, photo.sha256,
                 EMBED_MODEL, EMBED_DIM, pack_embedding(embedding),
@@ -228,12 +252,43 @@ def _embed_pending(photos: list[PipelinePhoto], client, limit: int) -> int:
             display=excluded.display,source_md5=excluded.source_md5,
             source_mtime=excluded.source_mtime,content_sha256=excluded.content_sha256,
             embedding_model=excluded.embedding_model,embedding_dim=excluded.embedding_dim,
-            embedding=excluded.embedding,subject='',pet_state='',eyes='',face_crop='',
-            horizon_status='',horizon_score=NULL,subject_sharpness=NULL,
-            aesthetic_score=NULL,keep_score=NULL,recommended=NULL,reasons_json='[]',
-            concerns_json='[]',judge_model=NULL,analyzed_at=excluded.analyzed_at,error=''""",
+            embedding=excluded.embedding,
+            -- 判定は写真の中身に対するもの。embeddingのモデルを替えただけ（中身が同じ）なら残し、
+            -- 中身が変わったときだけ消す。SETの右辺は更新前の値を参照する。
+            subject=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                         THEN subject ELSE '' END,
+            pet_state=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                           THEN pet_state ELSE '' END,
+            eyes=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                      THEN eyes ELSE '' END,
+            face_crop=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                           THEN face_crop ELSE '' END,
+            horizon_status=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                                THEN horizon_status ELSE '' END,
+            horizon_score=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                               THEN horizon_score END,
+            subject_sharpness=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                                   THEN subject_sharpness END,
+            aesthetic_score=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                                 THEN aesthetic_score END,
+            keep_score=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                            THEN keep_score END,
+            recommended=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                             THEN recommended END,
+            reasons_json=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                              THEN reasons_json ELSE '[]' END,
+            concerns_json=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                               THEN concerns_json ELSE '[]' END,
+            judge_model=CASE WHEN photo_ai_features.content_sha256=excluded.content_sha256
+                             THEN judge_model END,
+            analyzed_at=excluded.analyzed_at,error=''""",
             values)
-            print(f"[ai] embedding {len(values)}件")
+        if cached:
+            dbm("""INSERT OR REPLACE INTO photo_embeddings(
+                     content_sha256,embedding_model,embedding_dim,embedding,analyzed_at)
+                   VALUES(?,?,?,?,?)""", cached)
+            print(f"[ai] embedding {len(values)}件（{EMBED_MODEL}、うちキャッシュ"
+                  f"{len(values) - len(cached)}件）")
     return len(values)
 
 
@@ -420,12 +475,19 @@ def _judge_pending(client, limit: int) -> int:
 
 
 def ai_cycle(embed_limit=AI_EMBED_PER_CYCLE, judge_limit=AI_JUDGE_PER_CYCLE) -> dict:
-    client = AgentPlatformEmbeddingClient.from_environment()
     removed = _remove_noncanonical_embeddings()
     photos = _load_photos()
-    embedded = _embed_pending(photos, client, embed_limit)
-    groups = _rebuild_groups(photos)
-    judged = _judge_pending(client, judge_limit)
+    # embeddingはバックエンド次第（localならこのサーバーのCPU）。比較評価は常にGemini。
+    # localではGeminiの認証に失敗しても、embeddingと場面のまとめは先に進める。
+    if EMBED_BACKEND == "local":
+        embedded = _embed_pending(photos, LocalEmbeddingClient.shared(), embed_limit)
+        groups = _rebuild_groups(photos)
+        judge_client = AgentPlatformEmbeddingClient.from_environment()
+    else:
+        judge_client = AgentPlatformEmbeddingClient.from_environment()
+        embedded = _embed_pending(photos, judge_client, embed_limit)
+        groups = _rebuild_groups(photos)
+    judged = _judge_pending(judge_client, judge_limit)
     pending_embeddings = sum(photo.embedding is None for photo in photos)
     pending_groups = dbq("""SELECT COUNT(*) c FROM photo_ai_groups
                             WHERE status!='judged'""")[0]["c"]

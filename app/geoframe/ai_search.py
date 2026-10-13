@@ -1,7 +1,8 @@
 """GeoFrame管理画面向けのマルチモーダル写真検索API。
 
 画像embeddingとGemini比較評価はSQLiteの派生表から読み、検索語だけを
-Agent PlatformのGemini Embedding 2へ送る。画像ファイル自体は検索時に送信しない。
+embeddingする（GEOFRAME_EMBED_BACKEND=geminiならAgent PlatformのGemini Embedding 2、
+localならこのサーバーのembeddinggemma-2）。画像ファイル自体は検索時に送信しない。
 """
 from __future__ import annotations
 
@@ -15,17 +16,23 @@ import urllib.error
 import urllib.request
 from collections import OrderedDict, deque
 
-from .config import AI_ENABLED, AI_SEARCH_PER_MIN, DRIVE_KEY, ROOT
+from .config import (AI_ENABLED, AI_SEARCH_PER_MIN, AI_VISUAL_SIMILARITY, DRIVE_KEY,
+                     EMBED_BACKEND, ROOT)
+from .local_embedding import LOCAL_EMBED_MODEL, LocalEmbeddingClient
 from .store import dbq, setting_get
 
 
-EMBED_MODEL = "gemini-embedding-2"
+GEMINI_EMBED_MODEL = "gemini-embedding-2"
+# 今使うembeddingのモデル名。photo_ai_features.embedding_modelがこれと違う行は
+# 再embeddingの対象で、検索にも使わない（別モデルのベクトルとは比べられない）。
+EMBED_MODEL = LOCAL_EMBED_MODEL if EMBED_BACKEND == "local" else GEMINI_EMBED_MODEL
 EMBED_DIM = 768
 MAX_QUERY_CHARS = 300
 MAX_GROUPS = 30
 # 0.82の場面グループは連結成分なので、大きなイベントでは幅広い構図を含む。
-# UIでは0.90以上を「同じ構図」として再分類し、代表写真だけに畳めるようにする。
-VISUAL_CLUSTER_SIMILARITY = 0.90
+# UIでは0.90以上（embeddinggemma-2では0.91以上）を「同じ構図」として再分類し、
+# 代表写真だけに畳めるようにする。
+VISUAL_CLUSTER_SIMILARITY = AI_VISUAL_SIMILARITY
 _query_cache: OrderedDict[str, list[float]] = OrderedDict()
 _query_lock = threading.Lock()
 _client = None
@@ -120,7 +127,7 @@ class AgentPlatformEmbeddingClient:
         except (urllib.error.URLError, TimeoutError) as exc:
             raise AiSearchUnavailable(f"Agent Platformへの接続に失敗しました: {exc}") from exc
     def embed_part(self, part: dict) -> list[float]:
-        result = self.post(EMBED_MODEL, "embedContent", {
+        result = self.post(GEMINI_EMBED_MODEL, "embedContent", {
             "content": {"parts": [part]},
             "outputDimensionality": EMBED_DIM,
         })
@@ -135,6 +142,13 @@ class AgentPlatformEmbeddingClient:
         return self.embed_part({"text": text})
 
 
+def embedding_client():
+    """今のバックエンドのembeddingクライアント（画像と検索語の両方に使う）。"""
+    if EMBED_BACKEND == "local":
+        return LocalEmbeddingClient.shared()
+    return AgentPlatformEmbeddingClient.from_environment()
+
+
 def _embed_query(query: str) -> list[float]:
     """検索語のembeddingを取得する（キャッシュ付き）。
     ※lockはキャッシュの読み書きだけに使い、クライアント構築（credentials読込）と
@@ -143,7 +157,8 @@ def _embed_query(query: str) -> list[float]:
     ※同時キャッシュミス時は複数スレッドがembed_textを重複して呼びうるが、
       同一クエリは決定的に同一結果を返すため冪等で実害がない。"""
     global _client
-    key = " ".join(query.casefold().split())
+    # モデルを切り替えたときに別モデルのベクトルを返さないよう、モデル名もキーに入れる
+    key = EMBED_MODEL + "\0" + " ".join(query.casefold().split())
     with _query_lock:
         cached = _query_cache.get(key)
         if cached is not None:
@@ -151,7 +166,7 @@ def _embed_query(query: str) -> list[float]:
             return cached
         client = _client
     if client is None:
-        client = AgentPlatformEmbeddingClient.from_environment()
+        client = embedding_client()
         with _query_lock:
             if _client is None:
                 _client = client
@@ -213,8 +228,9 @@ def _valid_rows(include_hidden: bool):
                   LEFT JOIN photo_quality q
                     ON q.photo_id=p.id AND q.display=p.display
                    AND p.md5 IS q.source_md5 AND p.mtime IS q.source_mtime
-                  WHERE a.error='' {hidden_sql}
-                    AND NOT (COALESCE(q.group_kind,'')='exact' AND q.recommended=0)""")
+                  WHERE a.error='' AND a.embedding_model=? {hidden_sql}
+                    AND NOT (COALESCE(q.group_kind,'')='exact' AND q.recommended=0)""",
+               (EMBED_MODEL,))
 
 
 def api_ai_status():
@@ -225,11 +241,13 @@ def api_ai_status():
                  FROM photo_ai_features a JOIN photos p
                    ON p.id=a.photo_id AND p.display=a.display
                   AND p.md5 IS a.source_md5 AND p.mtime IS a.source_mtime
-                 WHERE a.error=''""")[0]
+                 WHERE a.error='' AND a.embedding_model=?""", (EMBED_MODEL,))[0]
+    # 切り替え直後は前のモデルの行が残る。検索と場面のまとめには使わず、順に作り直す。
+    other_model = dbq("""SELECT COUNT(DISTINCT content_sha256) c FROM photo_ai_features
+                         WHERE error='' AND embedding_model!=?""", (EMBED_MODEL,))[0]["c"]
     group_status = {row["status"]: row["c"] for row in dbq(
         "SELECT status,COUNT(*) c FROM photo_ai_groups GROUP BY status")}
     groups = sum(group_status.values())
-    model = dbq("SELECT embedding_model FROM photo_ai_features LIMIT 1")
     eligible = dbq("""SELECT COUNT(DISTINCT f.content_sha256) c
                        FROM photos p JOIN photo_quality_features f
                          ON f.photo_id=p.id AND f.display=p.display
@@ -244,7 +262,8 @@ def api_ai_status():
             "recommended": row["recommended"], "groups": groups,
             "eligible": eligible, "pending_embeddings": max(0, eligible - row["total"]),
             "group_status": group_status, "pipeline": pipeline,
-            "embedding_model": model[0]["embedding_model"] if model else EMBED_MODEL}
+            "embedding_model": EMBED_MODEL, "embedding_backend": EMBED_BACKEND,
+            "other_model_embeddings": other_model}
 
 
 def _json_list(raw):

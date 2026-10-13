@@ -28,7 +28,11 @@
 - `GEOFRAME_AI_JUDGE_PER_CYCLE`（`config.py`: `AI_JUDGE_PER_CYCLE`） — 既定値 `2`。AI選定の1サイクルでGemini比較まで進めるグループ数
 - `GEOFRAME_AI_POLL_S`（`config.py`: `AI_POLL_S`） — 既定値 `60`。ai_workerが次のサイクルまで待つ秒数。30秒未満は30秒へ切り上げる
 - `GEOFRAME_AI_TIME_WINDOW_MIN`（`config.py`: `AI_TIME_WINDOW_MIN`） — 既定値 `15`。同一場面候補とみなす撮影時刻の窓（分）。この範囲内の写真だけを類似比較する
-- `GEOFRAME_AI_SIMILARITY`（`config.py`: `AI_SIMILARITY`） — 既定値 `0.82`。同一場面候補とみなすembeddingのcosine類似度しきい値
+- `GEOFRAME_EMBED_BACKEND`（`config.py`: `EMBED_BACKEND`） — 既定値 `gemini`。画像と検索語のembeddingを計算する場所。gemini=Agent PlatformのGemini Embedding 2、 local=このサーバーのCPUでembeddinggemma-2（写真をGoogleへ送らない。requirements-local-ai.txtが必要）
+- `GEOFRAME_LOCAL_EMBED_MODEL_DIR`（`config.py`: `LOCAL_EMBED_MODEL_DIR`） — 既定値 なし（未設定時は `DATA_DIR / "models" / "embeddinggemma-2"`）。localのembeddinggemma-2のモデルディレクトリ。起動時にネットワークから取得しないため、 サービスから読める場所（既定はデータディレクトリの下）へ事前に置く
+- `GEOFRAME_LOCAL_EMBED_THREADS`（`config.py`: `LOCAL_EMBED_THREADS`） — 既定値 `4`。localのembeddingに使うCPUスレッド数。同じPCの他の処理と分け合う
+- `GEOFRAME_AI_SIMILARITY`（`config.py`: `AI_SIMILARITY`） — 既定値 なし（未設定時は `("0.83" if EMBED_BACKEND == "local" else "0.82")`）。同一場面候補とみなすembeddingのcosine類似度しきい値。既定はモデルごとに違う （embeddinggemma-2の0.83は、実写真でGemini Embedding 2の0.82と同じ分位点に当たる値）
+- `GEOFRAME_AI_VISUAL_SIMILARITY`（`config.py`: `AI_VISUAL_SIMILARITY`） — 既定値 なし（未設定時は `("0.91" if EMBED_BACKEND == "local" else "0.90")`）。検索結果で「同じ構図」に畳むcosine類似度しきい値。既定はモデルごとに違う
 - `GEOFRAME_AI_SHORTLIST_MAX`（`config.py`: `AI_SHORTLIST_MAX`） — 既定値 `6`。1グループでGemini比較に回す最大枚数（2〜6へクランプ）
 - `GEOFRAME_AI_SEARCH_PER_MIN`（`config.py`: `AI_SEARCH_PER_MIN`） — 既定値 `30`。/api/ai/search の流量上限（分あたり）。LAN内の任意ページから連打GETで 全embedding行の毎回フルスキャン（3テーブルJOIN、グローバルDBロック内）を 誘発できるため、tiles.pyのスライディング窓と同型で抑制する。
 - `GEOFRAME_DRIVE_KEY`（`config.py`: `DRIVE_KEY`） — 既定値 `drive_key.json`。Google Driveサービスアカウント鍵JSONのパス（ROOT＝app/ からの相対）
