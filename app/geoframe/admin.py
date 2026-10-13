@@ -10,12 +10,9 @@ import shutil
 import time
 from pathlib import Path
 
-# _presence は可変なモジュール変数のため、値ではなくモジュール属性で参照する
-from . import ha
-from .config import (DATA_DIR, DERIV_DIR, HA_MOTION, HA_TOKEN, HZ_DIR, JP_PREFS,
-                     PREF_TO_REGION, TILE_DIR, TILE_CACHE_MAX_MB)
+from .config import DATA_DIR, DERIV_DIR, TILE_DIR, TILE_CACHE_MAX_MB
 from .geo import infer_bucket
-from .store import dbq, dbx, setting_get, setting_set
+from .store import dbq, dbx
 from .util import t_epoch
 
 
@@ -64,7 +61,6 @@ def disk_info():
         "dirs": {
             "derivatives": _dir_usage(DERIV_DIR),
             "tile_cache": _dir_usage(TILE_DIR),
-            "hazard_cache": _dir_usage(HZ_DIR),
         },
         "tile_cache_max_mb": TILE_CACHE_MAX_MB,
         "measured_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -74,8 +70,8 @@ def disk_info():
 
 
 def api_admin_status():
-    """同期状態・DB内訳・ディスク・HA接続状態。
-    ※api_stats()/api_photos() は呼ばない（全行スキャン＋旅行クラスタ計算が走るため）。
+    """同期状態・DB内訳・ディスク。
+    ※api_photos() は呼ばない（全行スキャン＋旅行クラスタ計算が走るため）。
       cycle() が出しているのと同じ3つのCOUNTを直接引く"""
     ready = _count("display IS NOT NULL AND lat IS NOT NULL")
     pending = _count("lat IS NOT NULL AND display IS NULL")
@@ -142,17 +138,6 @@ def api_admin_status():
             "ai": ai,
         },
         "disk": disk_info(),
-        "ha": {
-            "enabled": bool(HA_TOKEN),
-            "motion_entity": HA_MOTION,
-            "ok": ha._presence.get("ha_ok"),
-            "present": ha._presence.get("present"),
-            "screen": ha._presence.get("screen"),
-            "motion_state": ha._presence.get("motion_state", ""),
-            "idle_s": int(time.time() - ha._presence.get("last_motion", time.time())),
-            "room_env_ok": ha._room_env.get("ok"),
-            "room_env_count": len(ha._room_env.get("items") or []),
-        },
         "server_time": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -323,31 +308,3 @@ def admin_setflag(payload):
     r = dbq("SELECT favorite, hidden FROM photos WHERE id=?", (pid,))[0]
     return {"ok": True, "id": pid,
             "favorite": bool(r["favorite"]), "hidden": bool(r["hidden"])}
-
-
-def _req_pref(payload):
-    """都道府県名、または未設定に戻す null/空文字。正本は config.JP_PREFS"""
-    v = payload.get("home_pref")
-    if v is None or v == "":
-        return None
-    if not isinstance(v, str) or v not in JP_PREFS:
-        raise BadRequest("home_pref は都道府県名で指定してください")
-    return v
-
-
-def api_admin_home():
-    """自宅設定の取得。読み取り専用・状態変更なしなので
-    /api/admin/geocode と同様にCSRF/DEBUG_APIガードは不要"""
-    pref = setting_get("home_pref")
-    return {"ok": True, "home_pref": pref,
-            "region": PREF_TO_REGION.get(pref, "") if pref else "",
-            "prefs": JP_PREFS}
-
-
-def admin_sethome(payload):
-    """自宅の都道府県を設定する。home_pref が null/空文字なら未設定に戻す
-    （＝地方スキップを無効化。都道府県ランダム方式自体は変わらない、後方互換）"""
-    pref = _req_pref(payload)
-    setting_set("home_pref", pref)
-    return {"ok": True, "home_pref": pref,
-            "region": PREF_TO_REGION.get(pref, "") if pref else ""}

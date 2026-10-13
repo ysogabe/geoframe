@@ -1,7 +1,7 @@
 # ADR: モニターON/OFF手動オーバーライドはHome Assistant経由のpullで実現する
 
 - 日付: 2026-08-29
-- 状態: 採用（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。2026-08-29 ユーザー承認）
+- 状態: 廃止（2026-10-13。[ADR 0008](0008-photo-platform-and-miharashi-display.md)で表示をmiharashiへ移し、この決定の対象コードを削除した。元の状態: 採用（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。2026-08-29 ユーザー承認））
 
 ## 文脈
 

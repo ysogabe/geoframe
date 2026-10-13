@@ -1,7 +1,7 @@
 # ADR: 実装順序はレイアウト債務を非ブロッカー化し、Wave単位で進める
 
 - 日付: 2026-08-29
-- 状態: 提案（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。ユーザー承認待ち）
+- 状態: 廃止（2026-10-13。[ADR 0008](0008-photo-platform-and-miharashi-display.md)で表示をmiharashiへ移し、この決定の対象コードを削除した。元の状態: 提案（Codex・Claude Opus・Claude Sonnetの合議 → Fable裁定。ユーザー承認待ち））
 
 ## 文脈
 

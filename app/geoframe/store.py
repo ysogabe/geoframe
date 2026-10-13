@@ -4,18 +4,16 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import datetime
 
 from .config import CACHE_FILE, DB_PATH
-from . import keymap
 
 
 # ============================================================
-# 永続キャッシュ（adsbdb・地理院）
+# 永続キャッシュ（地理院の逆ジオコーディング）
 # ------------------------------------------------------------
 # 読み書きは必ず cache_get / cache_put 経由（_cache への直接アクセスはこの節の中だけ）。
 # 実ディスク書き込みは cache_saver スレッドが CACHE_SAVE_INTERVAL_S 間隔で間引く。
-# ※/api/aircraft は5秒毎に叩かれる。毎回全量書き込みするとSD/eMMCの寿命を直撃するため、
+# ※毎回全量書き込みするとSD/eMMCの寿命を縮めるため、
 #   dirtyフラグ＋デバウンスで「変化があった時だけ・最短60秒間隔」に抑える。
 # ============================================================
 _cache = {}
@@ -26,8 +24,9 @@ _MISS = object()                  # cache_get のミス判定用（None/Falseも
 
 CACHE_SAVE_INTERVAL_S = 60        # 実書き込みの最短間隔
 CACHE_SAVER_TICK_S = 10           # 保存スレッドの起床間隔
-# 現役キー。これ以外（exif:/exif2: 等の死蔵レガシー）は起動時に破棄する
-CACHE_LIVE_PREFIXES = ("adsbdb:", "airport:", "geo:", "intel2:")
+# 現役キー。これ以外（exif:/exif2: 等の死蔵レガシーや、削除した表示機能の
+# adsbdb:/airport:/intel2:）は起動時に破棄する
+CACHE_LIVE_PREFIXES = ("geo:",)
 CACHE_LIVE_EXACT = frozenset({"muni_table"})
 
 
@@ -438,54 +437,3 @@ def setting_set(key, value):
     else:
         dbx("""INSERT INTO settings(key, value) VALUES(?, ?)
                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (key, value))
-
-
-def setting_compare_and_set(key, value, expected_rev=None, now=None):
-    """設定文書をrev付きで原子的に更新する。競合時はNoneを返す。
-
-    valueはJSON化可能なdict（少なくともkeysを含む）を想定する。既存行が
-    無い場合の現行revは0。比較・同一内容判定・更新は一つのBEGIN IMMEDIATE
-    内で行い、setting_get→setting_setの間のlost updateを許さない。
-    """
-    with _db_lock:
-        conn = db()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-            current = None
-            if row:
-                try:
-                    parsed = json.loads(row["value"])
-                    if isinstance(parsed, dict):
-                        current = parsed
-                except (TypeError, json.JSONDecodeError):
-                    current = None
-            # GETと同じ妥当性規則で評価し、不正文書は未設定(rev=0)として修復可能にする。
-            current_rev = current["rev"] if keymap.is_valid_saved_document(current) else 0
-            if expected_rev is not None and current_rev != expected_rev:
-                conn.rollback()
-                return None
-            if not row and value.get("keys") == keymap.DEFAULT_KEYS:
-                conn.rollback()
-                return {"rev": 0, "updated_at": None, "keys": dict(keymap.DEFAULT_KEYS)}
-            if keymap.is_valid_saved_document(current) and current.get("keys") == value.get("keys"):
-                conn.rollback()
-                return current
-            if now is None:
-                updated_at = datetime.now().astimezone().isoformat(timespec="seconds")
-            elif hasattr(now, "isoformat"):
-                updated_at = now.isoformat()
-            else:
-                updated_at = str(now)
-            document = dict(value)
-            document["rev"] = current_rev + 1
-            document["updated_at"] = updated_at
-            encoded = json.dumps(document, ensure_ascii=False, separators=(",", ":"))
-            conn.execute("""INSERT INTO settings(key, value) VALUES(?, ?)
-                           ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-                         (key, encoded))
-            conn.commit()
-            return document
-        except Exception:
-            conn.rollback()
-            raise

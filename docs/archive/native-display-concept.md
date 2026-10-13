@@ -4,8 +4,8 @@
 > 2026-07-30時点の、実装前の企画・概要設計を保存した**アーカイブ**です。本文の
 > `/api/device/v1/*` は設計案であり、
 > 現在のコード（`app/`・`native-display/`）には実装されていません。実装済みクライアントの契約は
-> [`native-display/docs/CORE_CONTRACTS.md`](../../native-display/docs/CORE_CONTRACTS.md)、ビルド手順と
-> 移植性のゲートは [`native-display/docs/PORTABILITY.md`](../../native-display/docs/PORTABILITY.md) を
+> [`native-display/docs/CORE_CONTRACTS.md`](https://github.com/ysogabe/geoframe-ambient-display/blob/display-final/native-display/docs/CORE_CONTRACTS.md)、ビルド手順と
+> 移植性のゲートは [`native-display/docs/PORTABILITY.md`](https://github.com/ysogabe/geoframe-ambient-display/blob/display-final/native-display/docs/PORTABILITY.md) を
 > 参照してください。本文中の `01-MLIT-Project` はリポジトリの旧名です。
 
 作成日: 2026-07-30

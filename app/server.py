@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GeoFrame ローカルサーバー（M1+M2: SQLiteカタログ + Drive直接参照 + derivative表示）
+GeoFrame ローカルサーバー（写真管理基盤: SQLiteカタログ + Drive直接参照 + derivative配信）
 ==================================================================================
 アーキテクチャ:
   - Google Drive = 写真ブロブの唯一の真実（GeoFrameフォルダ）
@@ -16,8 +16,8 @@ GeoFrame ローカルサーバー（M1+M2: SQLiteカタログ + Drive直接参�
       オリジナルはローカルに保持しない（Driveにのみ存在）。
   - ローカル photos/ フォルダも従来どおり索引対象（source='local'）。
       ※旧ミラー先 photos/gdrive/ は重複を避けるため索引から除外（削除してよい）
-  - tile_cache/ = 背景地図タイル（OSM・地理院）のプロキシキャッシュ。
-      /tiles/{osm,gsi}/{z}/{x}/{y}.png で配信。回線断でも既訪問地域は地図が出る。
+  - tile_cache/ = 管理ページの地図に使う背景タイル（OSM・地理院）のプロキシキャッシュ。
+      /tiles/{osm,gsi}/{z}/{x}/{y}.png で配信。
 
 使い方:
     pip install -r requirements.txt
@@ -39,15 +39,12 @@ GeoFrame ローカルサーバー（M1+M2: SQLiteカタログ + Drive直接参�
     GEOFRAME_AI_JUDGE_PER_CYCLE(2) GEOFRAME_AI_POLL_S(60)
     GEOFRAME_AI_SEARCH_PER_MIN(30) … /api/ai/search の流量上限（超過分は429）
     GEOFRAME_INFER_MIN(15) GEOFRAME_INFER_OFFSET_MIN(0)
-    GEOFRAME_ADSB_URL GEOFRAME_MATCH_KM(80)
     GEOFRAME_TILE_UA(GeoFrame/0.1 …) GEOFRAME_TILE_CACHE_MAX_MB(16384)
     GEOFRAME_TILE_FETCH_PER_MIN(240) … 上流タイル取得の流量上限（キャッシュヒットは無制限）
-    GEOFRAME_HA_URL(http://homeassistant.local:8123) … 平文httpならIP直指定が必須（後述）
-    GEOFRAME_DEBUG_API(未設定) … 1で /api/ha/entities・/api/mlit/probe を開放（開発時のみ）
     GEOFRAME_ALLOWED_HOSTS(未設定) … Host検証で追加許可するホスト名（カンマ区切り）。
         例 geoframe.local:8080,frame.lan 。localhost とIPリテラルは既定で許可される
 ※家庭内利用前提。インターネットに公開しないこと。
-※静的配信はホワイトリスト方式（/index.html /favicon.ico /vendor/ /derivatives/ /photos/）。
+※静的配信はホワイトリスト方式（/favicon.ico /static/ /vendor/ /derivatives/ /photos/ /blog_exports/）。
   新しく配信したい静的ディレクトリが増えたら Handler.STATIC_ALLOW_* に追加すること。
   許可prefix配下でもドットファイルは配信しない（作業用の一時ファイル対策）。
 ※Hostヘッダを検証している（DNSリバインディング対策）。ホスト名でアクセスして403に
@@ -62,7 +59,6 @@ from geoframe.ai_pipeline import ai_worker
 from geoframe.config import DB_PATH, DRIVE_KEY, HOST, PORT, allowed_hosts_note
 from geoframe.config import AI_ENABLED
 from geoframe.drive import organize_photos, prepare_tmp_dir
-from geoframe.ha import ha_start
 from geoframe.handlers import Handler
 from geoframe.quality import quality_backfill
 from geoframe.store import (cache_saver, db, load_cache, purge_cache_legacy,
@@ -86,7 +82,6 @@ if __name__ == "__main__":
     if not DRIVE_KEY.exists():
         print(f"[drive] {DRIVE_KEY.name} なし → Drive直接参照OFF（ローカルのみ）")
     # サーバーを即時起動し、同期はバックグラウンドで実行（初回も含む）
-    ha_start()        # .envにトークンがあればHome Assistant連携を開始
     tile_cache_prune()   # 起動時に1回（以降はworkerが1時間に1回）
     prepare_tmp_dir()    # 原本一時置き場の用意＋残骸の掃除
     threading.Thread(target=worker, daemon=True).start()

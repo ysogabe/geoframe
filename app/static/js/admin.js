@@ -1,8 +1,7 @@
 /* ============================================================
    admin.js — 管理ページ /admin のフロント（classic script / 依存なし）
-   ※本体画面（static/js/*.js）とは完全に独立。グローバルを共有しない
    構成: 1) 共通ヘルパ 2) タブ 3) STATUS 4) 写真一覧 5) フラグ操作
-        6) 位置指定モーダル（MapLibre） 7) 自宅設定 8) 起動
+        6) 位置指定モーダル（MapLibre） 9) 起動
    ============================================================ */
 'use strict';
 
@@ -50,20 +49,13 @@ function postJSON(path, body){
 
 /* ==== 2) タブ ==== */
 let curFilter = 'all', curPage = 1;
-let keymapDoc = null, keymapDirty = false, keymapSubmitting = false;
-let keymapLoadGeneration = 0, keymapEditGeneration = 0;
 function showTab(name){
   document.querySelectorAll('nav .tab').forEach(b =>
     b.classList.toggle('on', b.dataset.tab === name));
-  const view = (name === 'status') ? 'status' : (name === 'home') ? 'home' :
-    (name === 'keymap') ? 'keymap' : 'list';
+  const view = (name === 'status') ? 'status' : 'list';
   $('#v-status').classList.toggle('hidden', view !== 'status');
   $('#v-list').classList.toggle('hidden', view !== 'list');
-  $('#v-home').classList.toggle('hidden', view !== 'home');
-  $('#v-keymap').classList.toggle('hidden', view !== 'keymap');
   if(view === 'status'){ loadStatus(); return; }
-  if(view === 'home'){ loadHome(); return; }
-  if(view === 'keymap'){ loadKeymap(); return; }
   setFilter(name === 'noloc' ? 'noloc' : 'all');
 }
 
@@ -137,7 +129,7 @@ function loadStatus(){
     c0.appendChild(bar);
     c0.appendChild(el('span', 'k', '使用 ' + pct + '% / 全体 ' + fmtBytes(d.disk.total_bytes)));
     dk.appendChild(c0);
-    const names = {derivatives: 'derivatives/', tile_cache: 'tile_cache/', hazard_cache: 'hazard_cache/'};
+    const names = {derivatives: 'derivatives/', tile_cache: 'tile_cache/'};
     Object.keys(names).forEach(k => {
       const u = d.disk.dirs[k] || {};
       const c = cell(names[k], fmtBytes(u.bytes), '');
@@ -145,21 +137,6 @@ function loadStatus(){
       dk.appendChild(c);
     });
 
-    const ha = $('#s-ha'); ha.textContent = '';
-    if(!d.ha.enabled){
-      ha.appendChild(cell('連携', 'OFF', '', 'warn'));
-      ha.appendChild(cell('理由', 'トークン未設定', ''));
-    }else{
-      const ok = d.ha.ok;
-      ha.appendChild(cell('接続', ok === true ? 'OK' : (ok === null ? '未確認' : 'NG'),
-                          '', ok === true ? 'good' : (ok === null ? 'warn' : 'bad')));
-      ha.appendChild(cell('在室判定', d.ha.present ? '在室' : '不在', ''));
-      ha.appendChild(cell('画面', String(d.ha.screen || '--').toUpperCase(), ''));
-      ha.appendChild(cell('最終検知からの経過', Math.floor(d.ha.idle_s / 60), '分'));
-      ha.appendChild(cell('人感エンティティ', d.ha.motion_entity || '未設定', ''));
-      ha.appendChild(cell('ROOM ENV', (d.ha.room_env_ok ? 'OK ' : 'NG ') + d.ha.room_env_count,
-                          '件', d.ha.room_env_ok ? 'good' : 'warn'));
-    }
   }).catch(e => toast('STATUS取得失敗: ' + e.message, true));
 }
 
@@ -352,118 +329,6 @@ function saveLoc(){
     .catch(e => { toast('位置の保存に失敗: ' + e.message, true); $('#m-save').disabled = false; });
 }
 
-/* ==== 7) 自宅設定 ==== */
-/* ドロップダウンの選択肢は必ずサーバー（/api/admin/home の prefs）から動的に読む。
-   静的にハードコードすると config.PREF_TO_REGION のキー一覧とドリフトし得るため、
-   正本はサーバー側の1箇所に固定する */
-function loadHome(){
-  fetch('/api/admin/home').then(r => r.json()).then(d => {
-    if(!d.ok) throw new Error(d.error || 'home error');
-    const sel = $('#home-pref');
-    if(!sel.options.length){
-      const opt0 = el('option', null, '未設定'); opt0.value = '';
-      sel.appendChild(opt0);
-      d.prefs.forEach(p => { const o = el('option', null, p); o.value = p; sel.appendChild(o); });
-    }
-    sel.value = d.home_pref || '';
-    $('#home-region').textContent = d.region ? ('地方: ' + d.region) : '';
-  }).catch(e => toast('自宅設定の取得失敗: ' + e.message, true));
-}
-function saveHome(){
-  const pref = $('#home-pref').value || null;
-  postJSON('/api/admin/sethome', {home_pref: pref}).then(d => {
-    $('#home-region').textContent = d.region ? ('地方: ' + d.region) : '';
-    toast(d.home_pref ? ('自宅を' + d.home_pref + 'に設定しました') : '自宅設定を解除しました');
-  }).catch(e => toast('保存失敗: ' + e.message, true));
-}
-
-/* ==== 8) キー割当 ==== */
-function keymapValues(){
-  const values = {};
-  for(let i = 0; i < 10; i++) values[String(i)] = $('#key-' + i).value;
-  return values;
-}
-function renderKeymapFields(doc){
-  const box = $('#keymap-fields'); box.textContent = '';
-  const modes = doc.modes || [];
-  for(let i = 0; i < 10; i++){
-    const cell0 = el('div', 'cell');
-    cell0.appendChild(el('span', 'k', 'キー ' + i));
-    const select = document.createElement('select');
-    select.id = 'key-' + i;
-    modes.forEach(mode => {
-      const option = el('option', null, mode.label);
-      option.value = mode.id; select.appendChild(option);
-    });
-    select.value = doc.keys[String(i)];
-    select.addEventListener('change', () => { keymapDirty = true; keymapEditGeneration++; });
-    cell0.appendChild(select); box.appendChild(cell0);
-  }
-  $('#keymap-rev').textContent = 'rev ' + doc.rev;
-}
-function loadKeymap(){
-  if(keymapDirty) return;
-  const generation = ++keymapLoadGeneration;
-  fetch('/api/keymap').then(r => r.json().then(d => ({ok: r.ok, status: r.status, data: d})))
-    .then(result => {
-      // 404等の応答も作業コピーを壊さず、後続GETの古い応答も適用しない。
-      if(generation !== keymapLoadGeneration || keymapDirty) return;
-      if(!result.ok) throw new Error(result.data && result.data.error
-        ? result.data.error : ('HTTP ' + result.status));
-      const d = result.data;
-      if(!d.keys || !d.modes) throw new Error('keymap error');
-      // 応答適用直前にもdirtyを再確認する（fetch待ち中の編集を保護する）。
-      if(generation !== keymapLoadGeneration || keymapDirty) return;
-      keymapDoc = d; renderKeymapFields(d); $('#keymap-conflict').textContent = '';
-    }).catch(e => {
-      if(generation !== keymapLoadGeneration || keymapDirty) return;
-      toast('キー割当取得失敗: ' + e.message, true);
-    });
-}
-function saveKeymap(){
-  if(keymapSubmitting || !keymapDoc) return;
-  keymapSubmitting = true; $('#keymap-save').disabled = true;
-  const submitEditGeneration = keymapEditGeneration;
-  const submitLoadGeneration = keymapLoadGeneration;
-  const body = {keys: keymapValues(), base_revision: keymapDoc.rev};
-  fetch('/api/admin/setkeymap', {method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(body)}).then(r => r.json().then(d => ({ok: r.ok, status: r.status, data: d})))
-    .then(result => {
-      if(result.status === 409){
-        $('#keymap-conflict').textContent = '競合: 現行rev ' + result.data.rev + '。作業コピーを保持しています。';
-        let reload = $('#keymap-reload');
-        if(!reload){ reload = el('button', 'btn', '現行を再読込'); reload.id = 'keymap-reload';
-          reload.addEventListener('click', () => { keymapDirty = false; reload.remove(); loadKeymap(); });
-          $('#keymap-conflict').appendChild(reload); }
-        throw new Error('別の変更があります');
-      }
-      if(!result.ok || !result.data.keys) throw new Error(result.data.error || ('HTTP ' + result.status));
-      // 保存成功は進行中のGETを無効化する。応答適用直前にも世代と編集を再確認する。
-      keymapLoadGeneration++;
-      if(submitLoadGeneration !== keymapLoadGeneration - 1 ||
-         submitEditGeneration !== keymapEditGeneration){
-        keymapDoc = result.data;
-        keymapDirty = true;
-        $('#keymap-conflict').textContent = '保存済みrev ' + result.data.rev +
-          '。送信後の編集を保持しています（再読込で反映）。';
-        toast('保存しました（送信後の編集は未保存のまま保持しています）');
-        return;
-      }
-      keymapDoc = result.data; keymapDirty = false; renderKeymapFields(keymapDoc);
-      $('#keymap-conflict').textContent = ''; toast('キー割当を保存しました');
-    }).catch(e => toast('キー割当保存失敗: ' + e.message, true))
-    .finally(() => { keymapSubmitting = false; $('#keymap-save').disabled = false; });
-}
-function restoreDefaultKeymap(){
-  if(!confirm('キー割当を既定に戻しますか？')) return;
-  if(!confirm('現在の作業コピーは失われます。もう一度確認してください。')) return;
-  const keys = {'0':'sleep','1':'rotation','2':'agents'};
-  for(let i = 3; i < 10; i++) keys[String(i)] = 'reserved';
-  Object.keys(keys).forEach(k => { $('#key-' + k).value = keys[k]; });
-  keymapDirty = true;
-  keymapEditGeneration++;
-}
-
 /* ==== 9) 起動 ==== */
 document.querySelectorAll('nav .tab').forEach(b =>
   b.addEventListener('click', () => showTab(b.dataset.tab)));
@@ -477,13 +342,9 @@ $('#m-search').addEventListener('click', doGeocodeSearch);
 $('#m-q').addEventListener('keydown', e => {
   if(e.key === 'Enter'){ e.preventDefault(); doGeocodeSearch(); }
 });
-$('#home-save').addEventListener('click', saveHome);
-$('#keymap-save').addEventListener('click', saveKeymap);
-$('#keymap-default').addEventListener('click', restoreDefaultKeymap);
 $('#modal').addEventListener('click', e => { if(e.target.id === 'modal') closeLocModal(); });
 document.addEventListener('keydown', e => {
   if(e.key === 'Escape' && !$('#modal').classList.contains('hidden')) closeLocModal();
 });
 loadStatus();
 setInterval(() => { if(!$('#v-status').classList.contains('hidden')) loadStatus(); }, 30000);
-setInterval(() => { if(!$('#v-keymap').classList.contains('hidden')) loadKeymap(); }, 60000);

@@ -28,7 +28,7 @@
 ## API・UI
 
 - サーバーはPython標準ライブラリの `ThreadingHTTPServer`。家庭内LAN利用を前提とし、Host検証と同一オリジンPOST制限がある。
-- 既存の写真一覧は `GET /api/photos`、管理用ページング一覧は `GET /api/admin/photos`。
+- 表示クライアント向けの写真一覧は `GET /api/v1/photos`（旧名 `/api/photos`。[写真フィードの契約](photo-feed-contract.md)）、管理用ページング一覧は `GET /api/admin/photos`。
 - AI検索は`GET /api/ai/search`、進捗は`GET /api/ai/status`、管理画面は`/ai-search`。通常の管理画面STATUSにもembedding・比較待ち・表示抑止数を表示する。
 - 旅行ブログ機能は `GET /api/blog/*` から写真カタログを読み取り、正確なGPSをレスポンスへ含めない。
 - レビュー状態は再構築可能な写真索引と混ぜず、`GEOFRAME_DATA_DIR/travel_blog/drafts/` のJSONへ保存する。

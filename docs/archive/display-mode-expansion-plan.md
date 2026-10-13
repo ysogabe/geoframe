@@ -30,7 +30,7 @@
 > `GEOFRAME_HA_SCREEN_MODE_ENTITY`・`GEOFRAME_HA_SCREEN_RECONCILE_SEC` は実装済みで、
 > 判断の根拠は [[0002-screen-power-override-via-ha]] と
 > [[0003-screen-control-state-machine]]、現行の設定手順は
-> [Home Assistant連携](../integrations/home-assistant.md) にあります。
+> [Home Assistant連携](home-assistant.md) にあります。
 
 ### 目的
 Home Assistant経由でGEOFRAMEキオスクの画面ON/OFFを外部（iPhone含む）から手動制御できるようにする。人感センサーによる自動スリープと矛盾なく共存させる。

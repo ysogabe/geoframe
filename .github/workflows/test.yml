@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   app:
-    name: Python・JavaScript・文書
+    name: Python・文書
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -24,11 +24,6 @@ jobs:
           cache: pip
           cache-dependency-path: app/requirements.txt
 
-      - name: Node.jsを準備
-        uses: actions/setup-node@v7
-        with:
-          node-version: "24"
-
       - name: Python依存関係をインストール
         run: python -m pip install -r app/requirements.txt
 
@@ -36,27 +31,8 @@ jobs:
         working-directory: app
         run: python -m unittest discover -s tests
 
-      - name: JavaScriptテスト
-        working-directory: app
-        run: |
-          for t in tests/js/*.test.js; do
-            echo "== $t"
-            node "$t" || exit 1
-          done
-
       - name: Markdown相対リンク検査
         run: python3 tools/check_markdown_links.py
 
       - name: 設定リファレンスの同期検査
         run: python3 tools/gen_env_reference.py --check
-
-  mac-wkwebview:
-    name: macOS WKWebView
-    runs-on: macos-latest
-    timeout-minutes: 15
-    steps:
-      - name: ソースを取得
-        uses: actions/checkout@v7
-
-      - name: Swiftテスト
-        run: swift test --package-path mac-wkwebview

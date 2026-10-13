@@ -29,10 +29,6 @@ var/
 # OS
 .DS_Store
 
-# Swift / macOS app build artifacts
-mac-wkwebview/.build/
-mac-wkwebview/dist/
-
 # ツールのセッション成果物（プロジェクトのソースではない）
 .claude/
 .serena/
@@ -40,27 +36,6 @@ mac-wkwebview/dist/
 # 個人環境の運用メモ（家庭内ホスト名・IP・センサー構成を含む）
 local-notes/
 
-# Node / 3D PHOTO JOURNEY Lite（package.json の依存。npm ci で再現する）
-node_modules/
-
 # 公開リポジトリには含めないローカル検証コード
 local-poc/
 app/local-tools/
-
-# native-display: ビルド生成物
-native-display/build/
-native-display/build-*/
-
-# native-display: clangd のインデックスキャッシュ
-# （CMAKE_EXPORT_COMPILE_COMMANDS で出る compile_commands.json をエディタが
-#   読んで自動生成する。再生成可能なので追跡しない）
-native-display/.cache/
-
-# native-display: フォント本体（OFL だがバイナリなので tools/fetch-fonts.sh で取得する）
-native-display/assets/fonts/*.ttf
-native-display/assets/fonts/*.ttc
-native-display/assets/fonts/*.otf
-
-# native-display: フル fixture（実環境の位置メタデータ。件数は Drive 同期で
-# 増え続けるため固定値は書かない。コミット版は assets/fixtures/ の座標をぼかした縮小版のみ）
-native-display/tests/data/
