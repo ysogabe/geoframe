@@ -53,12 +53,6 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-# GEOFRAME_SLEEP_CMD/WAKE_CMD（kiosk/screen-ctl.sh）が同一機体のXディスプレイを
-# 操作できるよう、PrivateTmpは維持したままXソケットだけ名前空間に持ち込む。
-# Xauthorityへのアクセスは不要（キオスク側でxhost +SI:localuser:geoframeにより
-# UID単位で許可する運用。deploy/kiosk/kiosk.sh・README §4.2参照）。
-# サーバー/キオスクが別機体の構成では効果が無いだけで無害。
-BindPaths=/tmp/.X11-unix
 SystemCallFilter=@system-service
 # MemoryDenyWriteExecuteは付けない: Pillow（画像デコード）のC拡張が
 # 実行可能メモリへの書き込みを行うため、有効にすると起動時/画像処理時に落ちる。

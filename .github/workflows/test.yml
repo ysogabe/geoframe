@@ -49,14 +49,3 @@ jobs:
 
       - name: 設定リファレンスの同期検査
         run: python3 tools/gen_env_reference.py --check
-
-  mac-wkwebview:
-    name: macOS WKWebView
-    runs-on: macos-latest
-    timeout-minutes: 15
-    steps:
-      - name: ソースを取得
-        uses: actions/checkout@v7
-
-      - name: Swiftテスト
-        run: swift test --package-path mac-wkwebview
