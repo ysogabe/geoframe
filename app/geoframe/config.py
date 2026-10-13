@@ -148,7 +148,7 @@ PREF_REGIONS = {
                      "宮崎県", "鹿児島県", "沖縄県"],
 }
 PREF_TO_REGION = {p: r for r, ps in PREF_REGIONS.items() for p in ps}
-JP_PREFS = [p for ps in PREF_REGIONS.values() for p in ps]   # 47件・vendor/pref.geojsonと同順
+JP_PREFS = [p for ps in PREF_REGIONS.values() for p in ps]   # 47件
 
 # 不動産情報ライブラリ（要APIキー）。地震速報時の防災レイヤ表示に使用
 MLIT_KEY = os.environ.get("GEOFRAME_MLIT_KEY", "")

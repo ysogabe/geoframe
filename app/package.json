@@ -1,6 +1,0 @@
-{
-  "name": "geoframe-app",
-  "private": true,
-  "type": "commonjs",
-  "description": "app/ 配下のテスト（tests/js/*.test.js）は Node の CommonJS で実行する。ルートの package.json が \"type\": \"module\" を宣言しており、その影響を app/ 側で打ち消して従来どおり require で動かすための最小構成。"
-}

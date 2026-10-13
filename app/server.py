@@ -47,7 +47,7 @@ GeoFrame ローカルサーバー（M1+M2: SQLiteカタログ + Drive直接参�
     GEOFRAME_ALLOWED_HOSTS(未設定) … Host検証で追加許可するホスト名（カンマ区切り）。
         例 geoframe.local:8080,frame.lan 。localhost とIPリテラルは既定で許可される
 ※家庭内利用前提。インターネットに公開しないこと。
-※静的配信はホワイトリスト方式（/index.html /favicon.ico /vendor/ /derivatives/ /photos/）。
+※静的配信はホワイトリスト方式（/favicon.ico /static/ /vendor/ /derivatives/ /photos/ /blog_exports/）。
   新しく配信したい静的ディレクトリが増えたら Handler.STATIC_ALLOW_* に追加すること。
   許可prefix配下でもドットファイルは配信しない（作業用の一時ファイル対策）。
 ※Hostヘッダを検証している（DNSリバインディング対策）。ホスト名でアクセスして403に

@@ -36,9 +36,6 @@ var/
 # 個人環境の運用メモ（家庭内ホスト名・IP・センサー構成を含む）
 local-notes/
 
-# Node / 3D PHOTO JOURNEY Lite（package.json の依存。npm ci で再現する）
-node_modules/
-
 # 公開リポジトリには含めないローカル検証コード
 local-poc/
 app/local-tools/

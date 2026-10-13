@@ -66,7 +66,7 @@ class Handler(SimpleHTTPRequestHandler):
         #   一切付けていない」ことで、ヘッダが無いとブラウザはLast-Modifiedから
         #   ヒューリスティックに有効期限を推測し、再検証せずキャッシュを使ってしまう。
         #
-        #   HTML（/, /index.html, /admin→static/admin.html）・/static/ 配下(JS/CSS)・
+        #   HTML（/・/admin→static/admin.html）・/static/ 配下(JS/CSS)・
         #   /vendor/ 配下は "no-cache" にする。
         #   no-store（キャッシュ自体を禁止し常にフル転送させる）ではなく
         #   no-cache（キャッシュはするが毎回サーバーに再検証＝If-Modified-Sinceを
@@ -93,7 +93,7 @@ class Handler(SimpleHTTPRequestHandler):
         #
         # 注: 不正リクエスト時はparse前でself.pathが存在しないためgetattrで防御
         p = getattr(self, "path", "").split("?")[0]
-        is_html = p in ("/", "/index.html") or p.endswith(".html")
+        is_html = p == "/" or p.endswith(".html")
         if is_html or p.startswith("/static/") or p.startswith("/vendor/"):
             self.send_header("Cache-Control", "no-cache")
         if is_html:
@@ -126,11 +126,11 @@ class Handler(SimpleHTTPRequestHandler):
     # ここに無いパスは一律403 ⇒ .env / server.py / catalog.db / .venv/ 等が自動的に守られる
     STATIC_ALLOW_PREFIXES = ("/static/", "/vendor/", "/derivatives/", "/photos/",
                              "/blog_exports/")
-    STATIC_ALLOW_EXACT = frozenset({"/index.html", "/favicon.ico"})
+    STATIC_ALLOW_EXACT = frozenset({"/favicon.ico"})
 
     # 許可prefixのうち、実ファイルが ROOT ではなく DATA_DIR 配下にあるもの
     # （コードとデータの分離。詳細は config.DATA_DIR のコメント）。
-    # 残りの /static/ /vendor/ /index.html はソース側なので従来どおり ROOT 配下。
+    # 残りの /static/ /vendor/ はソース側なので従来どおり ROOT 配下。
     DATA_ALLOW_PREFIXES = ("/derivatives/", "/photos/", "/blog_exports/")
 
     # 管理ページ。正規化後の完全一致だけを内部で /static/admin.html に読み替える。
@@ -142,9 +142,10 @@ class Handler(SimpleHTTPRequestHandler):
     AI_SEARCH_PAGE_FILE = "/static/ai-search.html"
 
     def _admin_page_rewrite(self):
-        """/admin ・ /admin/ なら self.path を admin.html へ差し替えて True を返す。
-        差し替え後は既存のホワイトリスト判定（/static/ 配下＝許可済み）をそのまま通る"""
-        if self._norm_path(self.path) == "/admin":
+        """/ ・ /admin ・ /admin/ なら self.path を admin.html へ差し替えて True を返す。
+        差し替え後は既存のホワイトリスト判定（/static/ 配下＝許可済み）をそのまま通る。
+        表示UIは miharashi へ移したため、トップページも管理ページを返す"""
+        if self._norm_path(self.path) in ("/", "/admin"):
             self.path = self.ADMIN_PAGE_FILE
             return True
         return False
@@ -272,8 +273,6 @@ class Handler(SimpleHTTPRequestHandler):
         p = self._norm_path(raw)
         if not p.startswith("/"):
             return False
-        if p == "/":
-            p = "/index.html"
         # ドットファイルは拒否する。旧実装（FORBIDDEN_NAMES方式）にあった判定が
         # ホワイトリスト化の際に落ちていたもの。許可prefix配下に置かれた隠しファイルは
         # 「配信対象ではない作業用ファイル」なので、prefixの内側でも一律で塞ぐ。
@@ -348,8 +347,6 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._static_allowed(self.path):
             self.send_error(403)
             return
-        if p == "/":
-            self.path = "/index.html"
         super().do_HEAD()
 
     def do_GET(self):
@@ -525,8 +522,6 @@ class Handler(SimpleHTTPRequestHandler):
         if not self._static_allowed(self.path):
             self.send_error(403)
             return
-        if p == "/":
-            self.path = "/index.html"
         super().do_GET()
 
     # ============================================================

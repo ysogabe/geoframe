@@ -9,13 +9,6 @@ cd app
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m unittest discover -s tests
-node tests/js/scheduler-quality.test.js
-node tests/js/right-column-layout.test.js
-node tests/js/photo-journey-lite.test.js
-node tests/js/gsi-dem-terrain.test.js
-node tests/js/photo-journey-depth.test.js
-node tests/js/photo-journey-reveal.test.js
-node tests/js/navara-build-integrity.test.js
 ```
 
 環境変数を追加・変更した場合は、リポジトリルートで
