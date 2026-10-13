@@ -9,6 +9,7 @@
 |---|---|---|
 | [写真パイプライン](architecture/photo-pipeline.md) | 現行 | 写真の取り込みからUI表示までの流れ |
 | [写真カタログ](architecture/photo-catalog.md) | 参照 | SQLiteとメタデータ分離の設計・設計履歴 |
+| [写真フィードの契約](architecture/photo-feed-contract.md) | 現行 | 表示クライアント（miharashi）へ渡す写真一覧と画像 |
 | [3Dフォトジャーニー](architecture/3d-photo-journey-lite.md) | 現行 | Navara 3D表示の実装契約と調整値 |
 | [ネイティブ表示の契約](../native-display/docs/CORE_CONTRACTS.md) | 参照 | C++/SDL2クライアントの実装契約 |
 | [Home Assistant連携](integrations/home-assistant.md) | 現行 | 安全な連携設定 |
@@ -24,6 +25,7 @@
 
 - [写真カタログとメタデータ分離](architecture/photo-catalog.md)
 - [現行の写真パイプライン](architecture/photo-pipeline.md)
+- [写真フィードの契約（表示クライアント向け）](architecture/photo-feed-contract.md)
 - [3D PHOTO JOURNEY Lite（Navara）の実装契約](architecture/3d-photo-journey-lite.md)
 - [3D PHOTO JOURNEY の奥行きとサイバー地形](architecture/3d-depth-and-cyber-display.md)
 

@@ -414,7 +414,9 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path.startswith("/api/aircraft"):
             self._send_json(api_aircraft())
             return
-        if self.path.startswith("/api/photos"):
+        # 表示クライアント（miharashi）との契約。正式名は /api/v1/photos で、
+        # /api/photos は移行が済むまで同じ応答を返す別名（docs/architecture/photo-feed-contract.md）
+        if p == "/api/v1/photos" or self.path.startswith("/api/photos"):
             self._send_json(api_photos())
             return
         if self.path.startswith("/api/onthisday"):
