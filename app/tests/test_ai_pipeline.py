@@ -227,5 +227,59 @@ class EmbeddingBackendSwitchTest(PipelineDbCase):
         self.assertEqual(after[2], ("", None, None, None))
 
 
+
+class LearnedRankTest(PipelineDbCase):
+    """学習済みの順位付けモデルがあれば、固定の式の代わりにそれで順位を付ける。"""
+
+    def setUp(self):
+        super().setUp()
+        from geoframe import rank_model
+        self.rank_model = rank_model
+        self.saved_path = rank_model.RANK_MODEL_PATH
+        rank_model.RANK_MODEL_PATH = self.root / "rank_model.json"
+        rank_model._cache["key"] = None
+        self._add_photo(1, "#d02020", "sha-red-1")
+        self._add_photo(2, "#c82020", "sha-red-2")
+        # 固定の式では鮮明な1が上になる
+        store.dbx("UPDATE photo_quality_features SET sharpness=4.0 WHERE photo_id=2")
+
+    def tearDown(self):
+        self.rank_model.RANK_MODEL_PATH = self.saved_path
+        self.rank_model._cache["key"] = None
+        super().tearDown()
+
+    def _write_model(self, embedding_model):
+        dim = ai_pipeline.EMBED_DIM
+        (self.root / "rank_model.json").write_text(json.dumps({
+            "format": "geoframe-rank-linear-v1", "name": "test", "embedding_model": embedding_model,
+            "embedding_dim": dim, "base_features": ["sharpness"], "base_weights": [-1.0],
+            "pca_mean": [0.0] * dim, "pca_components": [[0.0] * dim], "pca_weights": [0.0],
+        }))
+
+    def _order(self):
+        return [row["photo_id"] for row in store.dbq(
+            "SELECT photo_id FROM photo_ai_group_members ORDER BY rank_in_group")]
+
+    def test_learned_model_ranks_group(self):
+        self._write_model(ai_pipeline.EMBED_MODEL)
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=0)
+        self.assertEqual(self._order(), [2, 1])
+        algorithm = store.dbq("SELECT algorithm FROM photo_ai_groups")[0]["algorithm"]
+        self.assertTrue(algorithm.endswith(":rank-test"))
+        scores = {row["photo_id"]: row["local_score"] for row in store.dbq(
+            "SELECT photo_id,local_score FROM photo_ai_group_members")}
+        self.assertEqual(scores, {1: 0.0, 2: 100.0})
+
+    def test_model_for_other_embedding_falls_back_to_quality_rank(self):
+        self._write_model("other-embedding")
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=0)
+        self.assertEqual(self._order(), [1, 2])
+
+    def test_broken_model_falls_back_to_quality_rank(self):
+        (self.root / "rank_model.json").write_text("{")
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=0)
+        self.assertEqual(self._order(), [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()

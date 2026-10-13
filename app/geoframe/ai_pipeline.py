@@ -25,6 +25,7 @@ from .config import (AI_EMBED_PER_CYCLE, AI_JUDGE_PER_CYCLE, AI_POLL_S,
                      AI_SHORTLIST_MAX, AI_SIMILARITY, AI_TIME_WINDOW_MIN,
                      DATA_DIR, EMBED_BACKEND)
 from .local_embedding import LocalEmbeddingClient
+from .rank_model import load_rank_model
 from .quality import Metrics, QualityPhoto, UnionFind, parse_taken_at, rank_group
 from .store import (complete_photo_ai_group, dbm, dbq, dbx,
                     replace_photo_ai_groups, setting_set)
@@ -292,7 +293,14 @@ def _embed_pending(photos: list[PipelinePhoto], client, limit: int) -> int:
     return len(values)
 
 
-def _rank_locally(bucket: list[PipelinePhoto]) -> None:
+def _rank_locally(bucket: list[PipelinePhoto], model=None) -> None:
+    """グループ内の順位用の点数（0〜100）を付ける。学習済みモデルがあればそれを使う。"""
+    if model is not None and all(photo.embedding is not None for photo in bucket):
+        scores = [model.score(photo.metrics, photo.embedding) for photo in bucket]
+        lo, hi = min(scores), max(scores)
+        for photo, score in zip(bucket, scores):
+            photo.local_score = round(100.0 * (score - lo) / (hi - lo), 2) if hi > lo else 50.0
+        return
     quality_photos = []
     by_id = {}
     for photo in bucket:
@@ -323,6 +331,8 @@ def build_scene_candidates(photos: list[PipelinePhoto]) -> list[dict]:
         buckets.setdefault(union.find(index), []).append(photo)
     pending_times = [photo.captured for photo in photos
                      if photo.embedding is None and photo.captured]
+    model = load_rank_model(EMBED_MODEL, EMBED_DIM)
+    algorithm = GROUP_ALGORITHM + (f":rank-{model.name}" if model else "")
     candidates = []
     for bucket in buckets.values():
         if len(bucket) < 2:
@@ -331,7 +341,7 @@ def build_scene_candidates(photos: list[PipelinePhoto]) -> list[dict]:
         hi = max(photo.captured for photo in bucket) + window
         if any(lo <= captured <= hi for captured in pending_times):
             continue
-        _rank_locally(bucket)
+        _rank_locally(bucket, model)
         ranked = sorted(bucket, key=lambda photo: (-photo.local_score, photo.id))
         shortlist = ranked[:AI_SHORTLIST_MAX]
         fingerprint = "|".join(sorted(photo.sha256 for photo in shortlist))
@@ -344,6 +354,7 @@ def build_scene_candidates(photos: list[PipelinePhoto]) -> list[dict]:
             "group_id": group_id, "photos": ranked, "shortlist": shortlist,
             "min_similarity": min(similarities), "max_similarity": max(similarities),
             "avg_similarity": sum(similarities) / len(similarities),
+            "algorithm": algorithm,
         })
     candidates.sort(key=lambda group: (-len(group["photos"]),
                                        -group["avg_similarity"], group["group_id"]))
@@ -383,7 +394,7 @@ def _rebuild_groups(photos: list[PipelinePhoto]) -> int:
         group_rows.append((
             gid, "scene", summary, candidate["min_similarity"],
             candidate["max_similarity"], candidate["avg_similarity"],
-            GROUP_ALGORITHM, analyzed_at, status, same_scene, JUDGE_VERSION,
+            candidate["algorithm"], analyzed_at, status, same_scene, JUDGE_VERSION,
             judge_model, json.dumps(shortlist_ids), error, attempts,
         ))
         prior = seeded_members if seeded else old_members.get(gid, {})
