@@ -214,6 +214,13 @@ function cardFor(it){
   loc2.title = '地図で位置を指定';
   loc2.addEventListener('click', () => openLocModal(it));
   acts.appendChild(fav); acts.appendChild(hid); acts.appendChild(loc2);
+  // 横倒し・逆さまで保存された写真を直す（画像があるDriveの写真だけ）
+  if(it.thumb && it.source === 'drive'){
+    const rot = el('button', 'rotate', '↻');
+    rot.title = '時計回りに90°回して表示' + (it.rotation ? '（今 ' + it.rotation + '°）' : '');
+    rot.addEventListener('click', () => rotatePhoto(c, it, rot));
+    acts.appendChild(rot);
+  }
   c.appendChild(acts);
   return c;
 }
@@ -227,6 +234,18 @@ function setFlag(card, it, patch){
     card.classList.toggle('is-hidden', j.hidden);
     toast('#' + it.id + ' 更新: ' + (j.favorite ? '★' : '☆') + (j.hidden ? ' 🚫除外' : ''));
   }).catch(e => toast('更新失敗: ' + e.message, true));
+}
+
+function rotatePhoto(card, it, btn){
+  btn.disabled = true;
+  postJSON('/api/admin/rotate', {id: it.id, delta: 90}).then(j => {
+    it.rotation = j.rotation; it.thumb = j.thumb;
+    const img = card.querySelector('.ph img');
+    if(img) img.src = j.thumb;
+    btn.title = '時計回りに90°回して表示' + (j.rotation ? '（今 ' + j.rotation + '°）' : '');
+    toast('#' + it.id + ' を回しました（' + j.rotation + '°）');
+  }).catch(e => toast('回転失敗: ' + e.message, true))
+    .finally(() => { btn.disabled = false; });
 }
 
 /* ==== 6) 位置指定モーダル（MapLibre） ==== */

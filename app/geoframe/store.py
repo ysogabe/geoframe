@@ -261,7 +261,10 @@ def db():
             _db.commit()
         # スキーマ移行: 再生スケジューラ用フラグ列。
         # ※上の migrated ループとは別立てにする（place=NULL の再enrichを誘発させないため）
-        for col in ("favorite INTEGER DEFAULT 0", "hidden INTEGER DEFAULT 0"):
+        # rotation: 管理画面で「回して表示」した角度（時計回り 0/90/180/270）。
+        # 元の写真が横倒しのまま保存されている（EXIFの向きも無い）場合に手で直す
+        for col in ("favorite INTEGER DEFAULT 0", "hidden INTEGER DEFAULT 0",
+                    "rotation INTEGER DEFAULT 0"):
             try:
                 _db.execute(f"ALTER TABLE photos ADD COLUMN {col}")
                 _db.commit()
