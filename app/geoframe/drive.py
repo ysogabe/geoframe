@@ -7,7 +7,7 @@ from .config import (DATA_DIR, DERIV_DIR, DRIVE_FOLDER, DRIVE_KEY, DRIVE_MIMES,
                      EXTS, PHOTOS_DIR, TMP_DIR)
 from .geo import infer_locations
 from .store import dbq, dbx
-from .util import extract_exif, make_derivative, norm_time
+from .util import derivative_name, extract_exif, make_derivative, norm_time
 
 
 # ============================================================
@@ -67,10 +67,10 @@ def index_drive(svc):
         row = dbq("SELECT id, md5 FROM photos WHERE drive_id=?", (gid,))
         if row and row[0]["md5"] == f.get("md5Checksum"):
             continue
-        if row:  # 内容更新 → derivative作り直し
+        if row:  # 内容更新 → derivative作り直し（Drive側で向きを直した場合に二重に回さないよう回転も戻す）
             dbx("""UPDATE photos SET name=?, md5=?, taken_at=?,
                    lat=?, lon=?, loc_source=?, place=NULL, elev=NULL,
-                   display=NULL, fetched_at=NULL, indexed_at=? WHERE drive_id=?""",
+                   display=NULL, fetched_at=NULL, rotation=0, indexed_at=? WHERE drive_id=?""",
                 (f["name"], f.get("md5Checksum"), taken, lat, lon,
                  "drive_meta" if lat is not None else None, now, gid))
         else:
@@ -121,7 +121,7 @@ def fetch_derivatives(svc, limit):
     derivativeが作られず「画像未取得」のままになる）。
     取得順の taken_at は /admin の一覧と同じ並びなので、先頭ページから埋まる。"""
     from googleapiclient.http import MediaIoBaseDownload
-    rows = dbq("""SELECT id, drive_id, name FROM photos
+    rows = dbq("""SELECT id, drive_id, name, rotation FROM photos
                   WHERE source='drive' AND display IS NULL
                   ORDER BY taken_at LIMIT ?""", (limit,))
     for r in rows:
@@ -135,8 +135,8 @@ def fetch_derivatives(svc, limit):
                 done = False
                 while not done:
                     _, done = dl.next_chunk()
-            dest = DERIV_DIR / f"{r['drive_id']}.jpg"
-            make_derivative(tmp, dest)
+            dest = DERIV_DIR / derivative_name(r["drive_id"], r["rotation"] or 0)
+            make_derivative(tmp, dest, r["rotation"] or 0)
             dbx("UPDATE photos SET display=?, fetched_at=? WHERE id=?",
                 (dest.relative_to(DATA_DIR).as_posix(),
                  datetime.now().isoformat(timespec="seconds"), r["id"]))

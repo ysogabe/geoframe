@@ -109,8 +109,16 @@ AI_SIMILARITY = float(os.environ.get("GEOFRAME_AI_SIMILARITY")
 # 検索結果で「同じ構図」に畳むcosine類似度しきい値。既定はモデルごとに違う
 AI_VISUAL_SIMILARITY = float(os.environ.get("GEOFRAME_AI_VISUAL_SIMILARITY")
                              or ("0.91" if EMBED_BACKEND == "local" else "0.90"))
+# 同一場面グループの中の順位に使う学習済みモデル（JSON）。無ければ鮮明度・露出などの
+# 固定の式で順位を付ける。家庭の写真の評価から作るため、リポジトリには入れない
+RANK_MODEL_PATH = Path(os.environ.get("GEOFRAME_RANK_MODEL")
+                       or DATA_DIR / "models" / "rank_model.json")
 # 1グループでGemini比較に回す最大枚数（2〜6へクランプ）
 AI_SHORTLIST_MAX = max(2, min(6, int(os.environ.get("GEOFRAME_AI_SHORTLIST_MAX", "6"))))
+# Gemini比較で写真を順位どおりでなく並べ替えて見せるグループの割合（0〜1）。Geminiは最初に
+# 見せた写真を推奨しやすいため、一部をgroup_idから決まる順に並べ替え、偏りのない判定を
+# 順位付けの学習と確認に使う
+AI_JUDGE_SHUFFLE_RATE = max(0.0, min(1.0, float(os.environ.get("GEOFRAME_AI_JUDGE_SHUFFLE_RATE", "0.2"))))
 # 位置なし写真の撮影地候補（loc_suggest.py）を作るか。AI_ENABLED=1のときだけ動く。0で止める
 LOC_SUGGEST_ENABLED = os.environ.get("GEOFRAME_LOC_SUGGEST", "1") == "1"
 # 撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalのd3-lite）。応答しない間は

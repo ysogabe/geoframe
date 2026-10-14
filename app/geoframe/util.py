@@ -71,9 +71,18 @@ def haversine_km(lat1, lon1, lat2, lon2):
 # ============================================================
 # derivative生成（表示用2560px JPEG。HEIC→JPEG変換もここ）
 # ============================================================
-def make_derivative(src: Path, dest: Path):
+def derivative_name(drive_id: str, rotation: int = 0) -> str:
+    """derivativeのファイル名。回したものは名前を変える（/derivatives/ は内容不変として
+    ブラウザにキャッシュさせているので、同じURLのまま中身を変えると古い向きが残る）"""
+    return f"{drive_id}.jpg" if not rotation else f"{drive_id}.r{rotation}.jpg"
+
+
+def make_derivative(src: Path, dest: Path, rotation: int = 0):
+    """rotation は時計回りの角度（0/90/180/270）。EXIFの向きを当てた後に回す"""
     with Image.open(src) as im:
         im = ImageOps.exif_transpose(im)
+        if rotation:
+            im = im.rotate(-rotation, expand=True)
         im.thumbnail((DERIV_PX, DERIV_PX))
         if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")

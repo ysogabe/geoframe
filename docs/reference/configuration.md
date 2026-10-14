@@ -33,7 +33,9 @@
 - `GEOFRAME_LOCAL_EMBED_THREADS`（`config.py`: `LOCAL_EMBED_THREADS`） — 既定値 `4`。localのembeddingに使うCPUスレッド数。同じPCの他の処理と分け合う
 - `GEOFRAME_AI_SIMILARITY`（`config.py`: `AI_SIMILARITY`） — 既定値 なし（未設定時は `("0.83" if EMBED_BACKEND == "local" else "0.82")`）。同一場面候補とみなすembeddingのcosine類似度しきい値。既定はモデルごとに違う （embeddinggemma-2の0.83は、実写真でGemini Embedding 2の0.82と同じ分位点に当たる値）
 - `GEOFRAME_AI_VISUAL_SIMILARITY`（`config.py`: `AI_VISUAL_SIMILARITY`） — 既定値 なし（未設定時は `("0.91" if EMBED_BACKEND == "local" else "0.90")`）。検索結果で「同じ構図」に畳むcosine類似度しきい値。既定はモデルごとに違う
+- `GEOFRAME_RANK_MODEL`（`config.py`: `RANK_MODEL_PATH`） — 既定値 なし（未設定時は `DATA_DIR / "models" / "rank_model.json"`）。同一場面グループの中の順位に使う学習済みモデル（JSON）。無ければ鮮明度・露出などの 固定の式で順位を付ける。家庭の写真の評価から作るため、リポジトリには入れない
 - `GEOFRAME_AI_SHORTLIST_MAX`（`config.py`: `AI_SHORTLIST_MAX`） — 既定値 `6`。1グループでGemini比較に回す最大枚数（2〜6へクランプ）
+- `GEOFRAME_AI_JUDGE_SHUFFLE_RATE`（`config.py`: `AI_JUDGE_SHUFFLE_RATE`） — 既定値 `0.2`。Gemini比較で写真を順位どおりでなく並べ替えて見せるグループの割合（0〜1）。Geminiは最初に 見せた写真を推奨しやすいため、一部をgroup_idから決まる順に並べ替え、偏りのない判定を 順位付けの学習と確認に使う
 - `GEOFRAME_LOC_SUGGEST`（`config.py`: `LOC_SUGGEST_ENABLED`） — 既定値 `1`。位置なし写真の撮影地候補（loc_suggest.py）を作るか。AI_ENABLED=1のときだけ動く。0で止める
 - `GEOFRAME_DECISION_URL`（`config.py`: `DECISION_URL`） — 既定値 `http://127.0.0.1:8092`。撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalのd3-lite）。応答しない間は Geminiへ写真を送らない（家の中のペット写真などを外へ出さないための関門）
 - `GEOFRAME_LOC_SUGGEST_MODEL`（`config.py`: `LOC_SUGGEST_MODEL`） — 既定値 `gemini-3.8-flash`。撮影地を推定するGeminiモデル。3.1-flash-liteは店名から所在地を決めつけやすかったため3.8-flashを使う

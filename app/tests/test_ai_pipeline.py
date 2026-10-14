@@ -227,5 +227,106 @@ class EmbeddingBackendSwitchTest(PipelineDbCase):
         self.assertEqual(after[2], ("", None, None, None))
 
 
+
+class LearnedRankTest(PipelineDbCase):
+    """学習済みの順位付けモデルがあれば、固定の式の代わりにそれで順位を付ける。"""
+
+    def setUp(self):
+        super().setUp()
+        from geoframe import rank_model
+        self.rank_model = rank_model
+        self.saved_path = rank_model.RANK_MODEL_PATH
+        rank_model.RANK_MODEL_PATH = self.root / "rank_model.json"
+        rank_model._cache["key"] = None
+        self._add_photo(1, "#d02020", "sha-red-1")
+        self._add_photo(2, "#c82020", "sha-red-2")
+        # 固定の式では鮮明な1が上になる
+        store.dbx("UPDATE photo_quality_features SET sharpness=4.0 WHERE photo_id=2")
+
+    def tearDown(self):
+        self.rank_model.RANK_MODEL_PATH = self.saved_path
+        self.rank_model._cache["key"] = None
+        super().tearDown()
+
+    def _write_model(self, embedding_model):
+        dim = ai_pipeline.EMBED_DIM
+        (self.root / "rank_model.json").write_text(json.dumps({
+            "format": "geoframe-rank-linear-v1", "name": "test", "embedding_model": embedding_model,
+            "embedding_dim": dim, "base_features": ["sharpness"], "base_weights": [-1.0],
+            "pca_mean": [0.0] * dim, "pca_components": [[0.0] * dim], "pca_weights": [0.0],
+        }))
+
+    def _order(self):
+        return [row["photo_id"] for row in store.dbq(
+            "SELECT photo_id FROM photo_ai_group_members ORDER BY rank_in_group")]
+
+    def test_learned_model_ranks_group(self):
+        self._write_model(ai_pipeline.EMBED_MODEL)
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=0)
+        self.assertEqual(self._order(), [2, 1])
+        algorithm = store.dbq("SELECT algorithm FROM photo_ai_groups")[0]["algorithm"]
+        self.assertTrue(algorithm.endswith(":rank-test"))
+        scores = {row["photo_id"]: row["local_score"] for row in store.dbq(
+            "SELECT photo_id,local_score FROM photo_ai_group_members")}
+        self.assertEqual(scores, {1: 0.0, 2: 100.0})
+
+    def test_model_for_other_embedding_falls_back_to_quality_rank(self):
+        self._write_model("other-embedding")
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=0)
+        self.assertEqual(self._order(), [1, 2])
+
+    def test_broken_model_falls_back_to_quality_rank(self):
+        (self.root / "rank_model.json").write_text("{")
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=0)
+        self.assertEqual(self._order(), [1, 2])
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class JudgeOrderTest(PipelineDbCase):
+    def setUp(self):
+        super().setUp()
+        self.original_rate = ai_pipeline.AI_JUDGE_SHUFFLE_RATE
+
+    def tearDown(self):
+        ai_pipeline.AI_JUDGE_SHUFFLE_RATE = self.original_rate
+        super().tearDown()
+
+    def test_presentation_order_is_deterministic_and_shuffles_about_rate(self):
+        ai_pipeline.AI_JUDGE_SHUFFLE_RATE = 0.2
+        ids = [11, 12, 13, 14, 15, 16]
+        modes = [ai_pipeline.presentation_order(f"scene-{n:016x}", ids) for n in range(2000)]
+        shuffled = [presented for mode, presented in modes if mode == "shuffled"]
+        self.assertTrue(0.17 < len(shuffled) / len(modes) < 0.23)
+        self.assertTrue(all(presented == ids for mode, presented in modes if mode == "rank"))
+        self.assertTrue(all(sorted(presented) == ids for presented in shuffled))
+        self.assertTrue(any(presented != ids for presented in shuffled))
+        self.assertEqual(ai_pipeline.presentation_order("scene-x", ids),
+                         ai_pipeline.presentation_order("scene-x", ids))
+        ai_pipeline.AI_JUDGE_SHUFFLE_RATE = 0.0
+        self.assertEqual(ai_pipeline.presentation_order("scene-x", ids), ("rank", ids))
+
+    def test_shuffled_judgment_maps_back_to_presented_photos(self):
+        ai_pipeline.AI_JUDGE_SHUFFLE_RATE = 1.0
+        for pid, color in ((1, "#d02020"), (2, "#c82020"), (3, "#c01818"), (4, "#d81c1c")):
+            self._add_photo(pid, color, f"sha-red-{pid}")
+
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=1)
+
+        group = store.dbq("SELECT group_id,judge_order,presented_json,shortlist_json FROM photo_ai_groups")[0]
+        presented = json.loads(group["presented_json"])
+        self.assertEqual(group["judge_order"], "shuffled")
+        self.assertEqual(sorted(presented), sorted(json.loads(group["shortlist_json"])))
+        # FakeGeminiは見せた1枚目を推奨し、keep_scoreを見せた順に89, 88, ...と付ける。
+        recommended = [row["photo_id"] for row in store.dbq(
+            "SELECT photo_id FROM photo_ai_group_members WHERE recommended=1")]
+        self.assertEqual(recommended, [presented[0]])
+        scores = {row["photo_id"]: row["keep_score"] for row in store.dbq(
+            "SELECT photo_id,keep_score FROM photo_ai_features")}
+        self.assertEqual([scores[pid] for pid in presented], [89, 88, 87, 86])
+
+        ai_pipeline.ai_cycle(embed_limit=10, judge_limit=1)
+        kept = store.dbq("SELECT group_id,judge_order,presented_json FROM photo_ai_groups")[0]
+        self.assertEqual(tuple(kept), (group["group_id"], "shuffled", group["presented_json"]))

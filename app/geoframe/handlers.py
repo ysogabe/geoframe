@@ -8,7 +8,7 @@ import traceback
 import urllib.parse
 from http.server import SimpleHTTPRequestHandler
 
-from .admin import (BadRequest, NotFound, admin_setflag, admin_setloc,
+from .admin import (BadRequest, NotFound, admin_rotate, admin_setflag, admin_setloc,
                     api_admin_photos, api_admin_status)
 from .ai_search import (AiSearchDisabled, AiSearchRateLimited,
                         AiSearchUnavailable, api_ai_search, api_ai_status)
@@ -423,6 +423,7 @@ class Handler(SimpleHTTPRequestHandler):
     def _post_routes(self):
         return {"/api/admin/setloc": admin_setloc,
                 "/api/admin/setflag": admin_setflag,
+                "/api/admin/rotate": admin_rotate,
                 "/api/blog/save": save_blog_draft,
                 "/api/blog/export": export_blog}
 

@@ -11,12 +11,14 @@ import shutil
 import time
 from pathlib import Path
 
+from PIL import Image
+
 from .config import DATA_DIR, DERIV_DIR, TILE_DIR, TILE_CACHE_MAX_MB
 from .ai_search import EMBED_MODEL
 from .geo import infer_bucket
 from .loc_suggest import loc_status
 from .store import dbq, dbx
-from .util import t_epoch
+from .util import derivative_name, t_epoch
 
 
 # ============================================================
@@ -218,6 +220,7 @@ def api_admin_photos(page=1, per=50, filt="all"):
                              if r["loc_source"] == "inferred" else ""),
             "place": r["place"] or "", "pref": r["pref"] or "", "city": r["city"] or "",
             "fav": bool(r["favorite"]), "hidden": bool(r["hidden"]),
+            "rotation": r["rotation"] or 0,
             "source": r["source"],
         }
         if anchors:
@@ -338,3 +341,37 @@ def admin_setflag(payload):
     r = dbq("SELECT favorite, hidden FROM photos WHERE id=?", (pid,))[0]
     return {"ok": True, "id": pid,
             "favorite": bool(r["favorite"]), "hidden": bool(r["hidden"])}
+
+
+def admin_rotate(payload):
+    """写真を時計回りに delta 度（90/180/270、-90も可）回して表示する。
+
+    元の写真が横倒しのまま保存されている（EXIFの向きも無い）ものを手で直すため。
+    今のderivativeを回して別名で保存し（URLを変えてブラウザのキャッシュを避ける）、
+    display と rotation を書き換える。displayが変わるので、品質解析とAIのembedding・
+    同一場面の比較は次のサイクルで作り直される。Driveから取り直すときも rotation を当てる"""
+    pid = _req_id(payload)
+    delta = payload.get("delta")
+    if isinstance(delta, bool) or delta not in (90, 180, 270, -90):
+        raise BadRequest("delta は 90 / 180 / 270 / -90 で指定してください")
+    rows = dbq("SELECT source, drive_id, display, rotation FROM photos WHERE id=?", (pid,))
+    if not rows:
+        raise NotFound(f"id={pid} は存在しません")
+    r = rows[0]
+    if r["source"] != "drive" or not r["drive_id"]:
+        raise BadRequest("回せるのはDriveの写真だけです")
+    src = (DATA_DIR / r["display"]) if r["display"] else None
+    if src is None or not src.is_file():
+        raise BadRequest("表示用の画像がまだありません")
+    rotation = ((r["rotation"] or 0) + delta) % 360
+    dest = DERIV_DIR / derivative_name(r["drive_id"], rotation)
+    tmp = dest.with_suffix(".part")
+    with Image.open(src) as im:
+        im.rotate(-delta, expand=True).save(tmp, "JPEG", quality=85)
+    tmp.rename(dest)
+    display = dest.relative_to(DATA_DIR).as_posix()
+    dbx("UPDATE photos SET display=?, rotation=? WHERE id=?", (display, rotation, pid))
+    if src.resolve() != dest.resolve():
+        src.unlink(missing_ok=True)
+    return {"ok": True, "id": pid, "rotation": rotation, "thumb": "/" + display}
+
