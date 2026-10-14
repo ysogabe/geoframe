@@ -36,6 +36,11 @@
 - `GEOFRAME_RANK_MODEL`（`config.py`: `RANK_MODEL_PATH`） — 既定値 なし（未設定時は `DATA_DIR / "models" / "rank_model.json"`）。同一場面グループの中の順位に使う学習済みモデル（JSON）。無ければ鮮明度・露出などの 固定の式で順位を付ける。家庭の写真の評価から作るため、リポジトリには入れない
 - `GEOFRAME_AI_SHORTLIST_MAX`（`config.py`: `AI_SHORTLIST_MAX`） — 既定値 `6`。1グループでGemini比較に回す最大枚数（2〜6へクランプ）
 - `GEOFRAME_AI_JUDGE_SHUFFLE_RATE`（`config.py`: `AI_JUDGE_SHUFFLE_RATE`） — 既定値 `0.2`。Gemini比較で写真を順位どおりでなく並べ替えて見せるグループの割合（0〜1）。Geminiは最初に 見せた写真を推奨しやすいため、一部をgroup_idから決まる順に並べ替え、偏りのない判定を 順位付けの学習と確認に使う
+- `GEOFRAME_LOC_SUGGEST`（`config.py`: `LOC_SUGGEST_ENABLED`） — 既定値 `1`。位置なし写真の撮影地候補（loc_suggest.py）を作るか。AI_ENABLED=1のときだけ動く。0で止める
+- `GEOFRAME_DECISION_URL`（`config.py`: `DECISION_URL`） — 既定値 `http://127.0.0.1:8092`。撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalのd3-lite）。応答しない間は Geminiへ写真を送らない（家の中のペット写真などを外へ出さないための関門）
+- `GEOFRAME_LOC_SUGGEST_MODEL`（`config.py`: `LOC_SUGGEST_MODEL`） — 既定値 `gemini-3.8-flash`。撮影地を推定するGeminiモデル。3.1-flash-liteは店名から所在地を決めつけやすかったため3.8-flashを使う
+- `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`（`config.py`: `LOC_SUGGEST_CLUE_PER_CYCLE`） — 既定値 `60`。1サイクルでDecisionに判定させる写真の枚数（1枚0.6秒前後）
+- `GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`（`config.py`: `LOC_SUGGEST_GEMINI_PER_CYCLE`） — 既定値 `2`。1サイクルでGeminiに撮影地を推定させる日の数（1回20秒前後）
 - `GEOFRAME_AI_SEARCH_PER_MIN`（`config.py`: `AI_SEARCH_PER_MIN`） — 既定値 `30`。/api/ai/search の流量上限（分あたり）。LAN内の任意ページから連打GETで 全embedding行の毎回フルスキャン（3テーブルJOIN、グローバルDBロック内）を 誘発できるため、tiles.pyのスライディング窓と同型で抑制する。
 - `GEOFRAME_DRIVE_KEY`（`config.py`: `DRIVE_KEY`） — 既定値 `drive_key.json`。Google Driveサービスアカウント鍵JSONのパス（ROOT＝app/ からの相対）
 - `GEOFRAME_DRIVE_FOLDER`（`config.py`: `DRIVE_FOLDER`） — 既定値 `GeoFrame`。取り込み対象のDriveフォルダ名

@@ -1,7 +1,7 @@
 /* ============================================================
    admin.js — 管理ページ /admin のフロント（classic script / 依存なし）
    構成: 1) 共通ヘルパ 2) タブ 3) STATUS 4) 写真一覧 5) フラグ操作
-        6) 位置指定モーダル（MapLibre） 9) 起動
+        6) 位置指定モーダル（MapLibre・地名検索・AI撮影地候補） 9) 起動
    ============================================================ */
 'use strict';
 
@@ -115,6 +115,18 @@ function loadStatus(){
                           d.db.ai.group_pending ? 'warn' : 'good'));
       db.appendChild(cell('AIによる表示抑止', d.db.ai.suppressed, '枚'));
     }
+    if(d.db.loc){
+      const lc = d.db.loc;
+      db.appendChild(cell('Decision（前回の処理時）',
+                          lc.decision === 'ready' ? '接続中' : (lc.decision ? '未接続' : '未実行'), '',
+                          lc.decision === 'ready' ? 'good' : (lc.clue_pending ? 'warn' : '')));
+      db.appendChild(cell('手がかり判定待ち', lc.clue_pending, '枚', lc.clue_pending ? 'warn' : 'good'));
+      db.appendChild(cell('手がかりあり', lc.clue_passed + ' / ' + lc.targets, '枚'));
+      db.appendChild(cell('撮影地を推定する日', lc.runs_done + ' / ' + lc.days_with_clue, '日',
+                          lc.runs_done < lc.days_with_clue ? 'warn' : 'good'));
+      db.appendChild(cell('AI撮影地候補のある写真', lc.suggested, '枚'));
+      if(lc.runs_error) db.appendChild(cell('撮影地の推定に失敗', lc.runs_error, '日', 'bad'));
+    }
     kvTable($('#s-locsrc'), d.db.by_loc_source);
     kvTable($('#s-buckets'), d.db.infer_buckets);
     kvTable($('#s-source'), d.db.by_source);
@@ -197,6 +209,8 @@ function cardFor(it){
   if(it.hint && it.hint.label)
     m.appendChild(el('div', 'loc', '近い時刻の位置: ' + it.hint.label +
                                    '（' + fmtDur(it.hint.dt_s) + '差）'));
+  if(!hasLoc && it.suggest)
+    m.appendChild(el('div', 'loc ai', 'AI候補: ' + it.suggest.place_name));
   const src = it.loc_source || 'none';
   const tag = el('span', 'tag t-' + src,
                  (SRC_LABEL[src] || '位置なし') + (it.infer_bucket ? ' ' + it.infer_bucket : ''));
@@ -254,6 +268,7 @@ function rotatePhoto(card, it, btn){
 const TILE_ATTRIB_OSM = "© <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a> contributors";
 const TILE_ATTRIB_GSI = "出典: <a href='https://maps.gsi.go.jp/development/ichiran.html'>国土地理院（地理院タイル）</a>";
 let mini = null, miniMarker = null, curPhoto = null, picked = null;
+let suggestMarker = null;     // AI候補の代表点（確定用の miniMarker とは色を分ける）
 
 function ensureMini(){
   if(mini) return mini;
@@ -282,6 +297,7 @@ function ensureMini(){
   return mini;
 }
 /* ==== 6b) 地名検索（地図を近くまで移動するショートカット。位置はここでは確定しない） ====
+   国内は地理院、0件なら海外を含めてOpenStreetMap（Nominatim）で引く（サーバー側で切替）。
    候補クリック後も既存の「地図クリック→SAVE」フローは維持する。検索結果の代表点は
    住所の代表座標であり実際の撮影地点とは限らないため、自動確定はしない */
 function clearGeocodeResults(){
@@ -298,7 +314,8 @@ function doGeocodeSearch(){
       const box = $('#m-results');
       box.classList.remove('hidden');
       if(!d.ok || !d.items.length){
-        box.appendChild(el('div', 'm-noresult', '見つかりませんでした（国内の地名のみ対応）'));
+        box.appendChild(el('div', 'm-noresult',
+          '見つかりませんでした（海外は「Times Square」のように地名だけで検索してください）'));
         return;
       }
       d.items.forEach(item => {
@@ -309,13 +326,62 @@ function doGeocodeSearch(){
         });
         box.appendChild(row);
       });
+      // 海外の候補はOpenStreetMap（Nominatim）由来。ODbLの出典表示が要る
+      if(d.items.some(item => item.source === 'osm')){
+        const credit = el('div', 'm-noresult');
+        credit.innerHTML = '地名データ ' + TILE_ATTRIB_OSM;
+        box.appendChild(credit);
+      }
     }).catch(e => toast('検索失敗: ' + e.message, true));
+}
+
+/* ==== 6c) AIの撮影地候補（loc_suggest.py）。候補の場所へ地図を動かすだけで、確定はしない ====
+   地名・根拠はモデルの出力なので必ず textContent で入れる（innerHTMLに渡さない） */
+const PRECISION_LABEL = {landmark: '建物・施設', district: '地区', city: '市区町村',
+                         region: '都道府県・州', country: '国', unknown: '不明'};
+const PRECISION_ZOOM = {landmark: 16, district: 14, city: 11, region: 7, country: 5};
+function suggestCenter(sg){
+  if(!sg || sg.lat === null || sg.lat === undefined || !PRECISION_ZOOM[sg.precision]) return null;
+  return {center: [sg.lon, sg.lat], zoom: PRECISION_ZOOM[sg.precision]};
+}
+function renderSuggest(it){
+  const box = $('#m-suggest');
+  box.textContent = '';
+  const sg = it.suggest;
+  const hasLoc = (it.lat !== null && it.lat !== undefined);
+  box.classList.toggle('hidden', !sg || hasLoc);
+  if(!sg || hasLoc) return;
+  const row = el('div', 'row');
+  row.appendChild(el('span', 'lbl', 'AI候補'));
+  row.appendChild(el('span', 'place', sg.place_name));
+  row.appendChild(el('span', 'meta',
+    '細かさ: ' + (PRECISION_LABEL[sg.precision] || sg.precision) +
+    (sg.scope === 'day' ? '（同じ日の写真から推定）' : '（この写真から推定）') +
+    (sg.scope === 'photo' && sg.day_place_name && sg.day_place_name !== sg.place_name
+       ? ' / この日: ' + sg.day_place_name : '')));
+  const go = suggestCenter(sg);
+  if(go){
+    const btn = el('button', 'btn', '候補へ移動');
+    btn.addEventListener('click', () => ensureMini().flyTo(go));
+    row.appendChild(btn);
+  }
+  box.appendChild(row);
+  if(sg.evidence && sg.evidence.length){
+    box.appendChild(el('div', 'note', '根拠（同じ日の写真をAIに見せたときの説明。「写真N」はそのとき送った写真の番号）'));
+    const ul = el('ul');
+    sg.evidence.slice(0, 6).forEach(e => ul.appendChild(el('li', null, e)));
+    box.appendChild(ul);
+  }
+  box.appendChild(el('div', 'note',
+    (go ? '地図上の点は地名の代表点で、撮影地点ではありません。' : '地図上の位置は特定できませんでした。') +
+    ' 確認して地図をクリックし、SAVEで確定してください（' + sg.model + '）'));
 }
 
 function openLocModal(it){
   curPhoto = it; picked = null;
   $('#m-q').value = '';
   clearGeocodeResults();
+  renderSuggest(it);
   $('#m-title').textContent = '#' + it.id + '  ' + it.name +
                               (it.taken_at ? '  /  ' + it.taken_at : '');
   $('#m-pick').textContent = '';
@@ -332,7 +398,14 @@ function openLocModal(it){
     if(miniMarker){ miniMarker.remove(); miniMarker = null; }
     const c = (it.lat !== null && it.lat !== undefined) ? [it.lon, it.lat]
             : (it.hint ? [it.hint.lon, it.hint.lat] : null);
+    const sgo = suggestCenter(it.suggest);
+    if(suggestMarker){ suggestMarker.remove(); suggestMarker = null; }
+    if(sgo && !(it.lat !== null && it.lat !== undefined)){
+      suggestMarker = new maplibregl.Marker({color: '#ffb300'}).setLngLat(sgo.center).addTo(m);
+      suggestMarker.getElement().title = 'AI候補: ' + it.suggest.place_name + '（代表点）';
+    }
     if(c) m.jumpTo({center: c, zoom: 11});
+    else if(sgo) m.jumpTo(sgo);       // 近い時刻の写真が無ければAI候補の場所から始める
   }, 30);
 }
 function closeLocModal(){ $('#modal').classList.add('hidden'); curPhoto = null; }

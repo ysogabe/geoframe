@@ -119,6 +119,17 @@ AI_SHORTLIST_MAX = max(2, min(6, int(os.environ.get("GEOFRAME_AI_SHORTLIST_MAX",
 # 見せた写真を推奨しやすいため、一部をgroup_idから決まる順に並べ替え、偏りのない判定を
 # 順位付けの学習と確認に使う
 AI_JUDGE_SHUFFLE_RATE = max(0.0, min(1.0, float(os.environ.get("GEOFRAME_AI_JUDGE_SHUFFLE_RATE", "0.2"))))
+# 位置なし写真の撮影地候補（loc_suggest.py）を作るか。AI_ENABLED=1のときだけ動く。0で止める
+LOC_SUGGEST_ENABLED = os.environ.get("GEOFRAME_LOC_SUGGEST", "1") == "1"
+# 撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalのd3-lite）。応答しない間は
+# Geminiへ写真を送らない（家の中のペット写真などを外へ出さないための関門）
+DECISION_URL = os.environ.get("GEOFRAME_DECISION_URL", "http://127.0.0.1:8092").rstrip("/")
+# 撮影地を推定するGeminiモデル。3.1-flash-liteは店名から所在地を決めつけやすかったため3.8-flashを使う
+LOC_SUGGEST_MODEL = os.environ.get("GEOFRAME_LOC_SUGGEST_MODEL", "gemini-3.8-flash")
+# 1サイクルでDecisionに判定させる写真の枚数（1枚0.6秒前後）
+LOC_SUGGEST_CLUE_PER_CYCLE = int(os.environ.get("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "60"))
+# 1サイクルでGeminiに撮影地を推定させる日の数（1回20秒前後）
+LOC_SUGGEST_GEMINI_PER_CYCLE = int(os.environ.get("GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE", "2"))
 # /api/ai/search の流量上限（分あたり）。LAN内の任意ページから連打GETで
 # 全embedding行の毎回フルスキャン（3テーブルJOIN、グローバルDBロック内）を
 # 誘発できるため、tiles.pyのスライディング窓と同型で抑制する。
@@ -269,5 +280,9 @@ def allowed_hosts_note():
 GSI_RGEO = "https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress?lat={lat}&lon={lon}"
 GSI_ELEV = "https://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon={lon}&lat={lat}&outtype=JSON"
 # 地名・住所検索（順ジオコーディング）。/admin の手動位置指定で「地名で近くまで飛ぶ」用途。
-# 日本国内の住所・地名のみ対応（海外写真には使えない既知の制約）
+# まず地理院（国内の住所・地名）を引き、0件のときだけ Nominatim（OpenStreetMap・世界）へ回す。
+# Nominatim は公開サーバーの利用規約（1秒1件まで・識別できるUser-Agent・結果のキャッシュ）
+# に従う前提で、手動検索の補助にだけ使う。
 GSI_GEOCODE = "https://msearch.gsi.go.jp/address-search/AddressSearch?q={q}"
+NOMINATIM_SEARCH = ("https://nominatim.openstreetmap.org/search"
+                    "?q={q}&format=jsonv2&limit={limit}&accept-language=ja")

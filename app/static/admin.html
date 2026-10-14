@@ -63,6 +63,7 @@
     <div class="toolbar">
       <button class="btn flt on" data-filter="all">ALL</button>
       <button class="btn flt" data-filter="noloc">位置なし</button>
+      <button class="btn flt" data-filter="suggest">AI候補あり</button>
       <button class="btn flt" data-filter="inferred">推定</button>
       <button class="btn flt" data-filter="manual">手動</button>
       <button class="btn flt" data-filter="fav">★お気に入り</button>
@@ -87,10 +88,11 @@
       <button class="btn x" id="m-close">CLOSE</button>
     </div>
     <div class="msearch">
-      <input type="text" id="m-q" placeholder="地名で検索（例: 東京都渋谷区。国内のみ対応）" autocomplete="off">
+      <input type="text" id="m-q" placeholder="地名で検索（例: 東京都渋谷区 / サマルカンド / Times Square）" autocomplete="off">
       <button class="btn" id="m-search">検索</button>
     </div>
     <div id="m-results" class="hidden"></div>
+    <div id="m-suggest" class="hidden"></div>
     <div id="minimap"></div>
     <div class="mfoot">
       <span class="hint" id="m-hint">地図をクリックして位置を指定してください</span>

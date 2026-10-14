@@ -123,6 +123,17 @@ button.btn:disabled{opacity:.35;cursor:default}
 .m-result:last-child{border-bottom:0}
 .m-result:hover{background:rgba(0,229,255,.1);color:var(--cyan)}
 .m-noresult{padding:8px 16px;font-size:12px;color:var(--ink-3)}
+/* AIの撮影地候補（確定はしない。候補へ地図を動かすだけ） */
+#m-suggest{padding:10px 16px;border-bottom:1px solid var(--panel-border);
+  display:flex;flex-direction:column;gap:6px}
+#m-suggest.hidden{display:none}
+#m-suggest .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#m-suggest .lbl{font-family:var(--mono);font-size:11px;color:var(--cyan);letter-spacing:.08em}
+#m-suggest .place{font-size:14px;color:var(--ink)}
+#m-suggest .meta{font-size:11px;color:var(--ink-2)}
+#m-suggest ul{margin:0;padding-left:18px;font-size:12px;color:var(--ink-2)}
+#m-suggest .note{font-size:11px;color:var(--ink-3)}
+.card .meta .ai{color:var(--cyan)}
 #minimap{height:min(52vh,460px);width:100%}
 #minimap .maplibregl-ctrl-attrib{font-size:9px}
 .mfoot{display:flex;align-items:center;gap:12px;padding:12px 16px;
