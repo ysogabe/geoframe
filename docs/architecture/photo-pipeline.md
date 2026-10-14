@@ -42,6 +42,6 @@
 - `taken_at_raw` / UTC / local / timezone / offset / normalization confidence の分離がない。
 - SHA-256とembeddingはいずれも表示用derivative由来で、Drive原本そのもののハッシュではない。
 - AIバックフィル中は未解析写真を表示可能なままにするため、全件完了まで選定率は段階的に上がる。
-- 撮影地候補の関門の基準（`clue`≥0.2または`kind=landmark`）は、位置なし写真64枚に1人が付けたラベルで決めた暫定値。Geminiの確信度は当てにならないため、候補は必ず人が確認する。
+- 撮影地候補の関門の基準（`clue`≥0.2または`kind=landmark`）は、位置なし写真64枚に1人が付けたラベルで決めた暫定値。ラベルと測り直すスクリプトは[tools/loc_clue_eval](../../tools/loc_clue_eval/README.md)。Geminiの確信度は当てにならないため、候補は必ず人が確認する。
 - 海外写真の粗い地名が未解決の場合がある。ブログ候補では旅程の場所ラベルへフォールバックする。
 - 公開は自動化しない。静的HTMLを書き出した後、利用者が内容を確認して別途公開する。
