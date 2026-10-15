@@ -34,9 +34,9 @@
 [server.py] ── 索引ループ（10分毎）
    ├─ catalog.db (SQLite) ←ここが「真実の索引」。ただし全行Driveから再構築可能
    │    位置なし写真は時刻推定(既存ロジック)をSQLで再計算
-   ├─ 未取得/更新ブロブを必要に応じてDL → derivatives/ に2560px+thumb生成
+   ├─ 未取得/更新ブロブを必要に応じてDL → derivatives/ に2560px生成
    ├─ 地理院enrich（地名/標高）・将来: Gemini(タイトル/解説)もDB列に追記
-   └─ /api/photos, /api/stats … はすべてSQLite読み出しに置換
+   └─ 写真一覧などのAPIはすべてSQLite読み出しに置換
 [ローカル手動フォルダ photos/] も同じ索引ループが対象（source列で区別）
 ```
 
@@ -68,56 +68,37 @@ CREATE INDEX idx_photos_geo  ON photos(lat, lon);
 CREATE INDEX idx_photos_pref ON photos(pref);
 ```
 
-実装ではこのv1案からスキーマが変化している。実際に採用されているスキーマは `app/geoframe/store.py` の `SCHEMA` 定数を正とする。
+実装ではこのv1案からスキーマが変化している。実際のスキーマは `app/geoframe/store.py` の
+`SCHEMA` 定数と、同じファイルの `db()` にある起動時のマイグレーション（`ALTER TABLE photos ADD COLUMN`）を
+正とする。この文書にはスキーマを書き写さない。
 
-```sql
-CREATE TABLE IF NOT EXISTS photos(
-  id INTEGER PRIMARY KEY,
-  source TEXT NOT NULL,             -- 'drive' | 'local'
-  drive_id TEXT UNIQUE,             -- DriveファイルID
-  path TEXT UNIQUE,                 -- ローカル原本の相対パス（drive行はNULL）
-  display TEXT,                     -- 表示用ファイル（derivative等）の相対パス
-  name TEXT NOT NULL,
-  md5 TEXT, mtime REAL,
-  taken_at TEXT,                    -- 'YYYY-MM-DD HH:MM'
-  lat REAL, lon REAL,
-  loc_source TEXT,                  -- 'exif' | 'drive_meta' | 'inferred' | NULL
-  inferred_from INTEGER,
-  place TEXT, elev REAL,
-  title TEXT, ai_caption TEXT,      -- Phase3(Gemini)用
-  indexed_at TEXT, fetched_at TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_photos_time ON photos(taken_at);
-```
-
-さらに起動時のマイグレーション（同ファイル200〜208行目、`ALTER TABLE photos ADD COLUMN`）で以下3列が追加される。
-
-```
-muni_cd TEXT, pref TEXT, city TEXT
-```
-
-**実装で採用された変更（v1案からの進化）:**
+**v1案から変わった点（`photos`テーブル）:**
 - `display`（表示用ファイルの相対パス）列を新設。それに伴い`path`はローカル原本専用（drive行はNULL）に役割が絞られ、`UNIQUE`制約が付いた
 - `mtime REAL`列を新設し、`md5`と併用して変更検知を行う
-- `city`列を、`pref`・`muni_cd`と一緒にマイグレーションで追加（v1案では`pref`・`muni_cd`のみだった）
+- 自治体情報として`muni_cd`・`pref`・`city`列をマイグレーションで追加（v1案では`pref`・`muni_cd`のみだった）
+- 管理画面での操作を残す`favorite`・`hidden`・`rotation`列と、位置推定で錨との時間差を残す`infer_dt_s`列をマイグレーションで追加
+- `loc_source`に、管理画面で手動で位置を決めた`'manual'`が加わった
 
-**未実施のまま残っている提案（v1案にあったが実装されていない）:**
-- `status TEXT NOT NULL DEFAULT 'ok'`列 — 未実装
-- `ai_at TEXT`列（Gemini処理日時） — 未実装（`ai_caption`列のみ存在）
-- `idx_photos_geo (lat, lon)`インデックス — 未作成
-- `idx_photos_pref (pref)`インデックス — 未作成
-- 実際に存在するインデックスは`idx_photos_time (taken_at)`のみ
+品質解析・AIの特徴量と埋め込み・類似写真グループ・撮影地候補は、`photos`本体とは別のテーブルに置いている。
+
+**v1案にあったが採用していないもの:**
+- `status`列 — 位置の有無は`lat`が`NULL`かどうかで判断している
+- `ai_at`列 — `ai_caption`列だけがある
+- `idx_photos_geo (lat, lon)`・`idx_photos_pref (pref)`インデックス — `photos`のインデックスは`idx_photos_time (taken_at)`だけ
+
+いずれも必要になった時点で改めて検討する。
 
 `.cache.json` の geo:/exif2:/drivemd5: キーはこのDBに統合して廃止（adsbdb系キャッシュのみ残す）。
 
 ## 4. これで可能になる活用（提案の狙いの具体化）
 
-- **ピンポイント取得**: 「この空港80km圏の写真」= `WHERE 距離式 < 80km` → drive_idでその場でDL。MEMORY LINKの全ライブラリ化（現状はローカルにある写真のみが対象）
-- **自分統計（Phase 1.5がSQL数本になる）**: 都道府県制覇マップ `SELECT pref, COUNT(*)`、月別撮影ヒート、年間移動距離、時間帯分布
-- **旅行クラスタ**: `app/geoframe/photos.py` の `assign_trips` が撮影時刻の間隔（48時間超）で旅行を分割し、日付・主な地名・boundsを付与する。
-- **再生ローテーション**: `app/static/js/scheduler.js` の `buildPlayOrder` が各tripから `TRIP_MAX` 件ずつ取り出し、大きな旅だけに再生が偏らないよう周回位置を保存する。
+実装済み:
+- **旅行クラスタ**: `app/geoframe/photos.py` の `assign_trips` が撮影時刻の間隔（48時間超）で旅行を分割し、写真フィード（`/api/v1/photos`）の各写真に`trip`番号を付ける。旅ごとの再生は表示クライアント（miharashi）側で行う。
 - **`--organize`オプション**: `app/geoframe/drive.py` の `organize_photos` が、ローカルの表示不能写真（GPS無し・推定も不可）を `_excluded/no_gps/` へ退避する。
-- **表示モードの多様化**: 「1年前の今日」「この場所の過去写真」「未訪問県の可視化」
+
+まだ使っていない活用:
+- **ピンポイント取得**: 「この空港80km圏の写真」= `WHERE 距離式 < 80km` → drive_idでその場でDL
+- **自分統計**: 都道府県制覇 `SELECT pref, COUNT(*)`、月別撮影ヒート、年間移動距離、時間帯分布。以前の統計画面（`/api/stats`）はADR 0008で表示系と一緒に削除した
 - **Gemini解説のバッチ管理**: `WHERE ai_caption IS NULL` を夜間に順次処理、結果はDBに永続
 
 ## 5. 移行計画
@@ -126,10 +107,10 @@ muni_cd TEXT, pref TEXT, city TEXT
 |---|---|---|
 | M1 | catalog.db導入・索引ループ（Drive imageMediaMetadata＋ローカルEXIF）・/api/photosのDB化・時刻推定のDB化（完了） | server.py改修 中 |
 | M2 | derivative生成・表示をderivativeに切替（完了。ただし下記注記参照） | 小〜中 |
-| M3 | /api/stats＋統計画面（Phase 1.5合流・完了） | 中 |
+| M3 | /api/stats＋統計画面（Phase 1.5合流・完了。ADR 0008で表示系と一緒に削除） | 中 |
 | M4 | オンデマンドDL＋LRU（ライブラリがディスクを超えたら。当面不要の可能性大） | 中 |
 
-※M2について: 実装されているのは表示用2560px JPEGの生成（`make_derivative`関数）のみ。設計時に想定していた400pxサムネイルの生成は未実装。
+※M2について: 作っているのは表示用2560px JPEG（`app/geoframe/util.py` の `make_derivative`）だけで、設計時に想定していた400pxサムネイルは作っていない。
 
 リスク: imageMediaMetadataのGPSがHEICで欠ける可能性（→DL解析フォールバックで吸収、実写真で要検証）。SQLite同時書き込み（→単一ライター原則とWALで回避）。
 
