@@ -14,7 +14,7 @@ from .ai_search import (AiSearchDisabled, AiSearchRateLimited,
                         AiSearchUnavailable, api_ai_search, api_ai_status)
 from .config import ALLOWED_HOST_NAMES, DATA_DIR, PORT, ROOT, TILE_SOURCES
 from .geo import geocode_search
-from .photos import api_onthisday, api_photos
+from .photos import api_photos
 from .tiles import fetch_tile
 from .travel_blog import (BlogBadRequest, BlogExportBusy, BlogNotFound,
                           api_blog_candidates, api_blog_draft, api_blog_trip,
@@ -311,12 +311,6 @@ class Handler(SimpleHTTPRequestHandler):
         # 表示クライアント（miharashi）との契約（docs/architecture/photo-feed-contract.md）
         if p == "/api/v1/photos":
             self._send_json(api_photos())
-            return
-        if self.path.startswith("/api/onthisday"):
-            try:
-                self._send_json(api_onthisday())
-            except Exception as e:
-                self._send_json({"ok": False, "error": str(e), "items": []})
             return
         if self.path.startswith("/api/admin/status"):
             self._send_json(api_admin_status())

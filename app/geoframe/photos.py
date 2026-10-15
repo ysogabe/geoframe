@@ -1,5 +1,4 @@
-"""写真マニフェスト・旅行クラスタ・この日の写真"""
-from datetime import datetime, timedelta
+"""写真マニフェスト・旅行クラスタ"""
 from pathlib import Path
 
 from .store import dbq
@@ -112,56 +111,3 @@ def assign_trips(items):
         })
     return trips
 
-
-ONTHISDAY_WINDOW_D = 3     # 今日の前後何日までを「今日」とみなすか
-ONTHISDAY_PER_YEAR = 3     # 1つの年から返す代表枚数
-ONTHISDAY_MAX = 12         # 全体の上限
-
-
-def api_onthisday(today=None):
-    """「◯年前の今日」カット用。撮影月日が今日±3日（環状）で、撮影年が今年より前の写真を
-    年ごとに代表数枚返す。月日の比較は実日付の加減算で行うので年跨ぎ（12/30 ⇔ 1/2）も自然に扱える。"""
-    today = today or datetime.now().date()
-    # 今日±N日の (MM-DD) → 距離（日数）。年跨ぎ・閏日は date 演算に任せる
-    offsets = {}
-    for d in range(-ONTHISDAY_WINDOW_D, ONTHISDAY_WINDOW_D + 1):
-        key = (today + timedelta(days=d)).strftime("%m-%d")
-        offsets[key] = min(abs(d), offsets.get(key, 99))
-    rows = dbq(f"""SELECT p.*, {QUALITY_COLUMNS}, {AI_COLUMNS} FROM photos p
-                  {QUALITY_JOIN}
-                  {AI_JOIN}
-                  WHERE p.lat IS NOT NULL AND p.lon IS NOT NULL AND p.display IS NOT NULL
-                    AND COALESCE(p.hidden,0)=0 AND {QUALITY_VISIBLE} AND {AI_VISIBLE}
-                    AND taken_at IS NOT NULL AND taken_at != ''
-                    AND substr(taken_at,6,5) IN (%s)
-                    AND CAST(substr(taken_at,1,4) AS INTEGER) < ?
-                  ORDER BY taken_at""" % ",".join("?" * len(offsets)),
-               tuple(offsets.keys()) + (today.year,))
-    by_year = {}
-    for r in rows:
-        by_year.setdefault(int(r["taken_at"][:4]), []).append(r)
-    items = []
-    for year in sorted(by_year, reverse=True):     # 直近の年から
-        # 代表選出: お気に入り優先 → 今日との日数差が小さい順 → 撮影時刻順
-        picked = sorted(by_year[year],
-                        key=lambda r: (0 if r["favorite"] else 1,
-                                       0 if r["quality_recommended"] else 1,
-                                       0 if r["ai_recommended"] else 1,
-                                       offsets.get(r["taken_at"][5:10], 99),
-                                       r["taken_at"]))[:ONTHISDAY_PER_YEAR]
-        for r in picked:
-            items.append({
-                "id": r["id"],
-                "file": r["display"],           # 画像URLは /api/v1/photos と同じ形式
-                "title": r["title"] or (f"{r['city']} {r['place'] or ''}".strip()
-                                        if r["city"] else "") or Path(r["name"]).stem,
-                "time": r["taken_at"],
-                "taken_at": r["taken_at"],
-                "lat": r["lat"], "lon": r["lon"],
-                "place": r["place"] or "", "pref": r["pref"] or "", "city": r["city"] or "",
-                "fav": bool(r["favorite"]),
-                "years_ago": today.year - year,
-                **_quality_fields(r),
-                **_ai_fields(r),
-            })
-    return {"ok": True, "today": today.isoformat(), "items": items[:ONTHISDAY_MAX]}

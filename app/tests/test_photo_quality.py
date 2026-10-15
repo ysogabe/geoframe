@@ -1,6 +1,5 @@
 import sqlite3
 import unittest
-from datetime import date
 
 from geoframe import photos
 
@@ -59,10 +58,6 @@ class PhotoQualityApiTest(unittest.TestCase):
         self.assertEqual(items[0]["quality_role"], "recommended")
         self.assertEqual(items[1]["quality_kind"], "similar")
         self.assertEqual(items[2]["quality_role"], "alternate")
-
-    def test_on_this_day_also_suppresses_exact_duplicate_and_prefers_recommendation(self):
-        result = photos.api_onthisday(date(2026, 8, 4))
-        self.assertEqual([item["id"] for item in result["items"]], [1, 3, 4])
 
     def test_manifest_suppresses_only_completed_same_scene_alternates(self):
         self.conn.execute("INSERT INTO photo_ai_groups VALUES('g1','judged',1)")
