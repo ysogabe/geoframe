@@ -152,7 +152,7 @@ def api_onthisday(today=None):
         for r in picked:
             items.append({
                 "id": r["id"],
-                "file": r["display"],           # 画像URLは /api/photos と同じ形式
+                "file": r["display"],           # 画像URLは /api/v1/photos と同じ形式
                 "title": r["title"] or (f"{r['city']} {r['place'] or ''}".strip()
                                         if r["city"] else "") or Path(r["name"]).stem,
                 "time": r["taken_at"],

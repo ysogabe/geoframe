@@ -29,7 +29,7 @@
 ## API・UI
 
 - サーバーはPython標準ライブラリの `ThreadingHTTPServer`。家庭内LAN利用を前提とし、Host検証と同一オリジンPOST制限がある。
-- 表示クライアント向けの写真一覧は `GET /api/v1/photos`（旧名 `/api/photos`。[写真フィードの契約](photo-feed-contract.md)）、管理用ページング一覧は `GET /api/admin/photos`。
+- 表示クライアント向けの写真一覧は `GET /api/v1/photos`（[写真フィードの契約](photo-feed-contract.md)）、管理用ページング一覧は `GET /api/admin/photos`。
 - AI検索は`GET /api/ai/search`、進捗は`GET /api/ai/status`、管理画面は`/ai-search`。通常の管理画面STATUSにもembedding・比較待ち・表示抑止数を表示する。
 - 管理用一覧（`GET /api/admin/photos`）は、位置なし写真にAIの撮影地候補（`suggest`）を付ける。`filter=suggest`で候補のある位置なし写真だけを返す。STATUSにはDecisionの接続状態、手がかり判定の進み具合、推定済みの日数を表示する。表示クライアント向けの写真フィードには候補を含めない。
 - 管理画面の地名検索（`GET /api/admin/geocode`）は地理院のアドレス検索が0件のときだけNominatim（OpenStreetMap）で引き直し、海外の地名も探せる。Nominatimへの問い合わせは全体で1秒1件に絞り、結果はキャッシュする。
