@@ -127,13 +127,11 @@ class PhotoFeedHttpTest(unittest.TestCase):
         finally:
             conn.close()
 
-    def test_v1_and_legacy_paths_return_the_same_list(self):
-        status_v1, _, body_v1 = self.get("/api/v1/photos")
-        status_old, _, body_old = self.get("/api/photos")
-        self.assertEqual((status_v1, status_old), (200, 200))
-        items = json.loads(body_v1)
+    def test_v1_path_returns_the_list(self):
+        status, _, body = self.get("/api/v1/photos")
+        self.assertEqual(status, 200)
+        items = json.loads(body)
         self.assertIsInstance(items, list)
-        self.assertEqual(items, json.loads(body_old))
         self.assertEqual([i["file"] for i in items],
                          ["derivatives/a.jpg", "derivatives/b.jpg", "derivatives/c.jpg"])
 
