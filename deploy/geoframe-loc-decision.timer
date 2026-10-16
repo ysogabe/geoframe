@@ -1,0 +1,15 @@
+[Unit]
+Description=Every morning at 05:00, judge new no-location photos if the GPU is free
+Documentation=file:///opt/geoframe/deploy/README.md
+
+[Timer]
+Unit=geoframe-loc-decision.service
+OnCalendar=*-*-* 05:00:00
+
+# 取り逃した回は追いかけない。起動直後は他の処理が GPU を使い始めることがあり、
+# 新しい写真の候補は翌朝で足りる。
+Persistent=false
+AccuracySec=1m
+
+[Install]
+WantedBy=timers.target

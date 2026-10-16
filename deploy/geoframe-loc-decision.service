@@ -1,0 +1,16 @@
+[Unit]
+Description=GEOFRAME: run Decision only while location-clue judging is pending
+Documentation=file:///opt/geoframe/deploy/README.md
+
+# Decision（llm-decision.service）を動かしているユーザーのユーザーunit
+# （~/.config/systemd/user/）として入れ、同じユーザーから起動・停止する。
+# 判定そのものは geoframe-server（User=geoframe）が行い、このunitは Decision の
+# 起動と停止だけを受け持つ。
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 -I /opt/geoframe/deploy/loc_decision_morning.py
+
+# スクリプトの上限（2時間）＋起動待ち（3分）より長くする。超えると SIGTERM が届き、
+# スクリプトは Decision を止めてから終わる。
+TimeoutStartSec=2h15min
