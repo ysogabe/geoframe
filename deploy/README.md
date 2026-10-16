@@ -239,7 +239,15 @@ sudo install -o geoframe -g geoframe -m 0640 rank_model.json /var/lib/geoframe/m
    別の処理が lease を取った・GPU を使い始めたときも止める（続きは翌朝）
 
 判定が終わった日の Gemini への問い合わせは geoframe-server が続けるので、Decision を止めても
-候補づくりは進みます。Decision を動かしているユーザーで入れます。
+候補づくりは進みます。
+
+llm-manager は誰かが lease を取ると Decision を含む常駐を止め、lease が終わると起動し直します。
+このタイマーが起動した Decision がそうして戻されたまま動き続けないよう、起動したときに
+`~/.local/state/geoframe-loc-decision/decision-owned`へ印を残します。lease のために止められた
+ときは上限の時間まで戻るのを待って止め、それでも戻らなければ翌朝、印のある Decision を
+引き継いで止めます（人が起動した Decision には印が無いので触りません）。
+
+Decision を動かしているユーザーで入れます。
 
 ```sh
 install -m 0644 /opt/geoframe/deploy/geoframe-loc-decision.service \

@@ -10,6 +10,8 @@ Documentation=file:///opt/geoframe/deploy/README.md
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 -I /opt/geoframe/deploy/loc_decision_morning.py
+# 自分で起動した Decision の印を置く（~/.local/state/geoframe-loc-decision/）
+StateDirectory=geoframe-loc-decision
 
 # スクリプトの上限（2時間）＋起動待ち（3分）より長くする。超えると SIGTERM が届き、
 # スクリプトは Decision を止めてから終わる。
