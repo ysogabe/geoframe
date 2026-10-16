@@ -223,6 +223,46 @@ sudo install -o geoframe -g geoframe -m 0640 rank_model.json /var/lib/geoframe/m
 - 使っているモデルは`photo_ai_groups.algorithm`の末尾（`:rank-<名前>`）で分かります。
   戻すときはファイルを消します。
 
+### 2.3 撮影地の手がかり判定を毎朝動かす（任意）
+
+位置なし写真の撮影地候補は、Decision（`llm-decision.service`）が動いている間だけ判定が進みます
+（[写真パイプライン](../docs/architecture/photo-pipeline.md)）。Decision を常駐させずに済むよう、
+毎朝5:00に次の順で確かめ、必要なときだけ Decision を動かすタイマーを用意しています
+（[`loc_decision_morning.py`](loc_decision_morning.py)）。
+
+1. STATUS の判定待ち（`db.loc.clue_pending`）が0なら何もしない
+2. 人が Decision を起動済みなら何もしない（止めるのも人に任せる）
+3. GPU が空いていなければ何もせず、翌朝にもう一度見る。空いているとみなすのは、llm-manager の
+   lease が0件、ほかのプロセスの VRAM が1GB未満、GPU 使用率が10%未満、Ollama がモデルを
+   読み込んでいない、のすべてを満たすとき。llm-manager か Ollama の状態を取れないときも使わない
+4. Decision を起動し、判定待ちが0になったら止める。2時間を過ぎた、15分間判定が進まない、
+   別の処理が lease を取った・GPU を使い始めたときも止める（続きは翌朝）
+
+判定が終わった日の Gemini への問い合わせは geoframe-server が続けるので、Decision を止めても
+候補づくりは進みます。
+
+llm-manager は誰かが lease を取ると Decision を含む常駐を止め、lease が終わると起動し直します。
+このタイマーが起動した Decision がそうして戻されたまま動き続けないよう、起動したときに
+`~/.local/state/geoframe-loc-decision/decision-owned`へ印を残します。lease のために止められた
+ときは上限の時間まで戻るのを待って止め、それでも戻らなければ翌朝、印のある Decision を
+引き継いで止めます（人が起動した Decision には印が無いので触りません）。
+
+Decision を動かしているユーザーで入れます。
+
+```sh
+install -m 0644 /opt/geoframe/deploy/geoframe-loc-decision.service \
+  /opt/geoframe/deploy/geoframe-loc-decision.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now geoframe-loc-decision.timer
+systemctl --user list-timers geoframe-loc-decision.timer
+```
+
+ログイン中でなくても動くよう、そのユーザーで lingering を有効にしておきます
+（`loginctl show-user <ユーザー> -p Linger`が`yes`）。結果は
+`journalctl --user -u geoframe-loc-decision.service`で確かめます。すぐに1回動かすときは
+`systemctl --user start geoframe-loc-decision.service`です。やめるときは
+`systemctl --user disable --now geoframe-loc-decision.timer`を実行します。
+
 ## 3. サーバーの有効化
 
 ```sh
