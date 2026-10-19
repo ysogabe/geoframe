@@ -9,6 +9,11 @@ geoframe-loc-decision.timer（Decision を動かすユーザーのユーザーun
 4. Decision を起動し、判定待ちが0になったら止める。上限の時間を過ぎた・判定が
    進まない・別の処理が GPU を使い始めたときも止める（続きは翌朝）
 
+なお gpu-eval の Decision は今は常駐しているので、現状では 2. で「人が起動済み」と
+みなして何もしない（常駐をやめて必要なあいだだけ起動する運用に戻したときのために残している）。
+Decision への確認は同じ機体の LAN 入口（既定 `http://127.0.0.1:8100/llm-decision`）経由で、
+`X-Client-Name: geoframe-loc-morning` を付ける。
+
 判定そのものと Gemini への問い合わせは geoframe 本体（ai_worker）が1分ごとに行う。
 Gemini は GPU を使わないので、判定が終われば Decision を止めてよい。
 
@@ -34,7 +39,8 @@ GEOFRAME_STATUS_URL = os.environ.get(
     "LOC_MORNING_GEOFRAME_STATUS_URL", "http://127.0.0.1:8080/api/admin/status")
 LLM_MANAGER_URL = os.environ.get("LOC_MORNING_LLM_MANAGER_URL", "http://127.0.0.1:8096")
 OLLAMA_URL = os.environ.get("LOC_MORNING_OLLAMA_URL", "http://127.0.0.1:11434")
-DECISION_URL = os.environ.get("LOC_MORNING_DECISION_URL", "http://127.0.0.1:8092")
+DECISION_URL = os.environ.get("LOC_MORNING_DECISION_URL", "http://127.0.0.1:8100/llm-decision")
+DECISION_CLIENT_NAME = "geoframe-loc-morning"   # 入口が呼び出し元ごとに数えるための名前
 DECISION_UNIT = os.environ.get("LOC_MORNING_DECISION_UNIT", "llm-decision")
 DECISION_PROFILE = "decision"     # llm-manager のプロファイルid（lease.paused に出る名前）
 STATE_DIR = Path(os.environ.get("STATE_DIRECTORY")
@@ -56,8 +62,9 @@ def log(msg: str) -> None:
     print(f"[loc-morning] {msg}", flush=True)
 
 
-def get_json(url: str, timeout: float = 5.0):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+def get_json(url: str, timeout: float = 5.0, headers: dict | None = None):
+    req = urllib.request.Request(url, headers=headers or {})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -146,7 +153,8 @@ def decision_pid() -> int | None:
 
 def decision_ready() -> bool:
     try:
-        return get_json(DECISION_URL + "/health", timeout=2).get("status") == "ready"
+        return get_json(DECISION_URL + "/health", timeout=2,
+                        headers={"X-Client-Name": DECISION_CLIENT_NAME}).get("status") == "ready"
     except (urllib.error.URLError, OSError, ValueError):
         return False
 

@@ -147,10 +147,16 @@ def _image_bytes(rel: str) -> bytes:
 # ============================================================
 # Decision
 # ============================================================
+# gpu-evalの入口が呼び出し元ごとの利用を日ごとにまとめるための名前（Originは付けない）
+DECISION_CLIENT_NAME = "geoframe"
+DECISION_HEADERS = {"X-Client-Name": DECISION_CLIENT_NAME}
+
+
 def decision_health(timeout=2.0) -> dict | None:
     """判定できる状態なら /health の応答（model名を含む）、できなければ None"""
     try:
-        with urllib.request.urlopen(DECISION_URL + "/health", timeout=timeout) as r:
+        req = urllib.request.Request(DECISION_URL + "/health", headers=DECISION_HEADERS)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             data = json.loads(r.read().decode("utf-8"))
     except Exception:
         return None
@@ -170,7 +176,7 @@ def decision_ask(image: bytes, model: str) -> dict:
         "images": ["data:image/jpeg;base64," + base64.b64encode(image).decode("ascii")],
     }).encode()
     req = urllib.request.Request(DECISION_URL + "/v1/systemone", data=body,
-                                 headers={"Content-Type": "application/json"})
+                                 headers={"Content-Type": "application/json", **DECISION_HEADERS})
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
             answers = json.loads(r.read().decode("utf-8"))["answers"]

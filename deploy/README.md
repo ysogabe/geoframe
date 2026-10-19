@@ -225,10 +225,14 @@ sudo install -o geoframe -g geoframe -m 0640 rank_model.json /var/lib/geoframe/m
 
 ### 2.3 撮影地の手がかり判定を毎朝動かす（任意）
 
-位置なし写真の撮影地候補は、Decision（`llm-decision.service`）が動いている間だけ判定が進みます
-（[写真パイプライン](../docs/architecture/photo-pipeline.md)）。Decision を常駐させずに済むよう、
-毎朝5:00に次の順で確かめ、必要なときだけ Decision を動かすタイマーを用意しています
-（[`loc_decision_morning.py`](loc_decision_morning.py)）。
+位置なし写真の撮影地候補は、Decision が動いている間だけ判定が進みます
+（[写真パイプライン](../docs/architecture/photo-pipeline.md)）。gpu-eval の Decision は今は常駐で、
+geoframe は同じ機体の LAN 入口（既定 `GEOFRAME_DECISION_URL=http://127.0.0.1:8100/llm-decision`）経由で
+呼び、どの要求にも呼び出し元の名前 `X-Client-Name: geoframe` を付けます（入口は名前ごとに日ごとにまとめます）。
+Decision が常駐している間は、この節のタイマーは「人が起動済み」として何もしません。
+常駐をやめて必要なときだけ動かす運用に戻す場合のために、毎朝5:00に次の順で確かめ、
+必要なときだけ Decision を動かすタイマーを用意しています
+（[`loc_decision_morning.py`](loc_decision_morning.py)。確認の要求には `X-Client-Name: geoframe-loc-morning` を付けます）。
 
 1. STATUS の判定待ち（`db.loc.clue_pending`）が0なら何もしない
 2. 人が Decision を起動済みなら何もしない（止めるのも人に任せる）
