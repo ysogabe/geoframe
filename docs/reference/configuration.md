@@ -37,7 +37,7 @@
 - `GEOFRAME_AI_SHORTLIST_MAX`（`config.py`: `AI_SHORTLIST_MAX`） — 既定値 `6`。1グループでGemini比較に回す最大枚数（2〜6へクランプ）
 - `GEOFRAME_AI_JUDGE_SHUFFLE_RATE`（`config.py`: `AI_JUDGE_SHUFFLE_RATE`） — 既定値 `0.2`。Gemini比較で写真を順位どおりでなく並べ替えて見せるグループの割合（0〜1）。Geminiは最初に 見せた写真を推奨しやすいため、一部をgroup_idから決まる順に並べ替え、偏りのない判定を 順位付けの学習と確認に使う
 - `GEOFRAME_LOC_SUGGEST`（`config.py`: `LOC_SUGGEST_ENABLED`） — 既定値 `1`。位置なし写真の撮影地候補（loc_suggest.py）を作るか。AI_ENABLED=1のときだけ動く。0で止める
-- `GEOFRAME_DECISION_URL`（`config.py`: `DECISION_URL`） — 既定値 `http://127.0.0.1:8092`。撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalのd3-lite）。応答しない間は Geminiへ写真を送らない（家の中のペット写真などを外へ出さないための関門）
+- `GEOFRAME_DECISION_URL`（`config.py`: `DECISION_URL`） — 既定値 `http://127.0.0.1:8100/llm-decision`。撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalの常駐のd3-lite）。既定は同じ機体の LAN入口（Caddy）経由で、呼び出し元の名前を`X-Client-Name`で伝える。応答しない間は Geminiへ写真を送らない（家の中のペット写真などを外へ出さないための関門）
 - `GEOFRAME_LOC_SUGGEST_MODEL`（`config.py`: `LOC_SUGGEST_MODEL`） — 既定値 `gemini-3.8-flash`。撮影地を推定するGeminiモデル。3.1-flash-liteは店名から所在地を決めつけやすかったため3.8-flashを使う
 - `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`（`config.py`: `LOC_SUGGEST_CLUE_PER_CYCLE`） — 既定値 `60`。1サイクルでDecisionに判定させる写真の枚数（1枚0.6秒前後）
 - `GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`（`config.py`: `LOC_SUGGEST_GEMINI_PER_CYCLE`） — 既定値 `2`。1サイクルでGeminiに撮影地を推定させる日の数（1回20秒前後）

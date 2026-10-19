@@ -121,9 +121,10 @@ AI_SHORTLIST_MAX = max(2, min(6, int(os.environ.get("GEOFRAME_AI_SHORTLIST_MAX",
 AI_JUDGE_SHUFFLE_RATE = max(0.0, min(1.0, float(os.environ.get("GEOFRAME_AI_JUDGE_SHUFFLE_RATE", "0.2"))))
 # 位置なし写真の撮影地候補（loc_suggest.py）を作るか。AI_ENABLED=1のときだけ動く。0で止める
 LOC_SUGGEST_ENABLED = os.environ.get("GEOFRAME_LOC_SUGGEST", "1") == "1"
-# 撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalのd3-lite）。応答しない間は
+# 撮影地の手がかりの有無を判定するDecisionサーバー（gpu-evalの常駐のd3-lite）。既定は同じ機体の
+# LAN入口（Caddy）経由で、呼び出し元の名前を`X-Client-Name`で伝える。応答しない間は
 # Geminiへ写真を送らない（家の中のペット写真などを外へ出さないための関門）
-DECISION_URL = os.environ.get("GEOFRAME_DECISION_URL", "http://127.0.0.1:8092").rstrip("/")
+DECISION_URL = os.environ.get("GEOFRAME_DECISION_URL", "http://127.0.0.1:8100/llm-decision").rstrip("/")
 # 撮影地を推定するGeminiモデル。3.1-flash-liteは店名から所在地を決めつけやすかったため3.8-flashを使う
 LOC_SUGGEST_MODEL = os.environ.get("GEOFRAME_LOC_SUGGEST_MODEL", "gemini-3.8-flash")
 # 1サイクルでDecisionに判定させる写真の枚数（1枚0.6秒前後）

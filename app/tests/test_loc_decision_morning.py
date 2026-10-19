@@ -189,5 +189,37 @@ class RunTest(unittest.TestCase):
         self.assertTrue(m.owned(), "lease が続いている間は、翌朝止めるために印を残す")
 
 
+class DecisionEntranceTest(unittest.TestCase):
+    def test_default_url_is_llm_entrance(self):
+        self.assertEqual(m.DECISION_URL, "http://127.0.0.1:8100/llm-decision")
+
+    def test_health_check_sends_client_name(self):
+        seen = []
+
+        class Resp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return b'{"status": "ready"}'
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req)
+            return Resp()
+
+        real = m.urllib.request.urlopen
+        m.urllib.request.urlopen = fake_urlopen
+        try:
+            self.assertTrue(m.decision_ready())
+        finally:
+            m.urllib.request.urlopen = real
+        self.assertEqual(seen[0].full_url, m.DECISION_URL + "/health")
+        self.assertEqual(seen[0].get_header("X-client-name"), "geoframe-loc-morning")
+        self.assertIsNone(seen[0].get_header("Origin"))
+
+
 if __name__ == "__main__":
     unittest.main()

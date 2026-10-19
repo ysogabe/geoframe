@@ -312,6 +312,54 @@ class AdminApiTest(LocSuggestCase):
                          (3, 2, 1, 1))
 
 
+class _FakeResponse:
+    def __init__(self, payload):
+        self._payload = json.dumps(payload).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return self._payload
+
+
+class DecisionEntranceTest(unittest.TestCase):
+    """Decisionへの要求はLAN入口（既定127.0.0.1:8100/llm-decision）へ、名前つき・Originなしで送る"""
+
+    def test_default_url_is_llm_entrance(self):
+        from geoframe import config
+        self.assertEqual(config.DECISION_URL, "http://127.0.0.1:8100/llm-decision")
+
+    def _capture(self, payload):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(req)
+            return _FakeResponse(payload)
+        return seen, patch.object(loc_suggest.urllib.request, "urlopen", fake_urlopen)
+
+    def test_health_sends_client_name(self):
+        seen, p = self._capture({"status": "ready", "modalities": ["image"]})
+        with p:
+            self.assertIsNotNone(loc_suggest.decision_health())
+        self.assertEqual(seen[0].full_url, loc_suggest.DECISION_URL + "/health")
+        self.assertEqual(seen[0].get_header("X-client-name"), "geoframe")
+        self.assertIsNone(seen[0].get_header("Origin"))
+
+    def test_ask_sends_client_name(self):
+        seen, p = self._capture({"answers": {"clue": {"noul": 0.5},
+                                             "kind": {"choice": "landmark"}}})
+        with p:
+            loc_suggest.decision_ask(b"jpeg", "d3-lite")
+        self.assertTrue(seen[0].full_url.endswith("/llm-decision/v1/systemone"))
+        self.assertEqual(seen[0].get_header("X-client-name"), "geoframe")
+        self.assertEqual(seen[0].get_header("Content-type"), "application/json")
+        self.assertIsNone(seen[0].get_header("Origin"))
+
+
 class CacheTest(unittest.TestCase):
     def test_geocode_cache_survives_legacy_purge(self):
         with patch.object(store, "_cache", {"geocode_osm:サマルカンド": [], "geo:1,2": {},
