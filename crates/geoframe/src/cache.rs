@@ -207,7 +207,9 @@ impl Cache {
             return SaveOutcome::Clean;
         }
         let Some(_exclusive) = self.lock_save(wait) else {
-            tracing::warn!("別の保存が終わらないので、キャッシュの保存を省略します");
+            tracing::warn!(
+                "別の保存が終わらないので、キャッシュの最後の保存を省略します（直近の更新は失われます）"
+            );
             return SaveOutcome::Skipped;
         };
         let body = {

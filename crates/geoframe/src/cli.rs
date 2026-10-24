@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cache::{Cache, SaveOutcome};
+use crate::cache::Cache;
 use crate::config::{Config, Overrides};
 use crate::db::Catalog;
 use crate::server::AppState;
@@ -43,9 +43,8 @@ fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration) {
             tracing::warn!("{name}のスレッドが時間内に止まりませんでした（そのまま終了します）");
         }
     }
-    if cache.save_final(limit) == SaveOutcome::Skipped {
-        tracing::warn!("キャッシュの最後の保存を省略しました（直近の更新は失われます）");
-    }
+    // 省略したときの警告は save_final の中で出す
+    cache.save_final(limit);
 }
 
 fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {
