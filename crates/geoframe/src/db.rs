@@ -2,7 +2,7 @@
 //!
 //! # 方針
 //!
-//! - **P1 は読み取り専用**。`SQLITE_OPEN_READ_ONLY`（`CREATE` なし）で開くので、DB を作らず、
+//! - **読み取り側は読み取り専用**。`SQLITE_OPEN_READ_ONLY`（`CREATE` なし）で開くので、DB を作らず、
 //!   書かず、スキーマ移行もしない。`PRAGMA query_only` も重ねて掛ける。スキーマの作成と移行は
 //!   当面 Python（`app/geoframe/store.py:db`）が行う。Rust は**足りない列を検出して起動を断る**
 //!   だけ（[`REQUIRED_SCHEMA`]）。
@@ -17,14 +17,14 @@
 //!   作る。つまり**ディレクトリには書ける**必要がある（systemd の `StateDirectory=` なら満たす）。
 //!   DB 本体と `-wal` は変更しない（テストで確認）。
 //!
-//! # 書き込みを足すとき（P2 で取り込み用の writer、P3 で更新 API）
+//! # 書き込み（P2 で取り込み用の writer、P3 で更新 API）
 //!
-//! 書き込みは**単一の接続**を専用スレッドに置き、チャネルで依頼を受ける形にする（現行の「1接続＋
-//! グローバルロック」と同じ直列化）。[`Catalog`] に `writer` を足す形で、読み取り側の API
-//! （[`Catalog::read`]）は変えずに済む。P2 の索引・取り込みが書き込むので、取り込み用の writer は
-//! P2 で追加し、unit の `ReadOnlyPaths` を必要な分だけ解除する。手動修正などの更新 API は P3 で足す。
-//! P1 では作らない。
-//!
+//! 書き込みは**単一の接続**を専用スレッドに置き、チャネルで依頼を受ける（[`crate::writer`]。現行の
+//! 「1接続＋グローバルロック」と同じ直列化）。[`Catalog`] は `writer` を持つ（取り込みが有効なときだけ。
+//! [`Catalog::with_writer`]・[`Catalog::writer`]）。読み取り側の API（[`Catalog::read`]）は変えていない。
+//! 取り込みが無効（既定）のときは writer を作らず、この層は P1 と同じ読み取り専用のまま。
+//! スキーマの作成・移行は writer の上で行う（[`crate::schema`]）。
+
 //! # ログ・エラー
 //!
 //! 写真の内容・位置・ファイル名を返す層なので、エラー型の `Display` には SQL の中身や行の値を
@@ -38,6 +38,8 @@ use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags};
 use tokio::sync::Semaphore;
+
+use crate::writer::Writer;
 
 /// 同時に走らせる読み取りの上限（開く接続の最大数）。N100 の 4 コアに対して十分で、LAN の
 /// 家庭用途では余る。
@@ -362,6 +364,8 @@ fn reusable(conn: &Connection, error: Option<&rusqlite::Error>) -> bool {
 /// 読み取り専用の `catalog.db`。複製は安い（中身は共有される）。
 #[derive(Clone)]
 pub struct Catalog {
+    /// 取り込み用の書き込み接続。`GEOFRAME_INGEST=1` のときだけある。
+    writer: Option<Writer>,
     /// API の読み取り用（最大 [`READ_CONNECTIONS`] 本）。
     api: Arc<Pool>,
     /// `/healthz` 専用の1本。API の読み取りが接続を使い切っていても、DB が正常なら 200 を返せる。
@@ -388,10 +392,22 @@ impl Catalog {
         let conn = open_read_only(path).map_err(CatalogError::Open)?;
         check_schema(&conn)?;
         Ok(Self {
+            writer: None,
             // 1本だけ先に開いた状態にして、残りは必要になったときに開く
             api: Pool::new(path, connections, BUSY_TIMEOUT, queue_timeout, Some(conn)),
             health: Pool::new(path, 1, HEALTH_BUSY_TIMEOUT, queue_timeout, None),
         })
+    }
+
+    /// 書き込み用の接続（writer）を付ける。読み取りの経路は変わらない。
+    pub fn with_writer(mut self, writer: Writer) -> Self {
+        self.writer = Some(writer);
+        self
+    }
+
+    /// 書き込み用の接続。取り込みが無効のときは `None`（書き込みは起きない）。
+    pub fn writer(&self) -> Option<&Writer> {
+        self.writer.as_ref()
     }
 
     /// `f` を読み取り専用の接続で、tokio の blocking スレッドで実行する。

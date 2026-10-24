@@ -13,6 +13,8 @@
 //! | 位置推定の窓（管理画面の内訳の区切り） | なし | `GEOFRAME_INFER_MIN` | `15`（分） |
 //! | embedding の場所（管理画面の AI 件数が数えるモデル） | なし | `GEOFRAME_EMBED_BACKEND` | `gemini` |
 //! | タイルキャッシュの上限（管理画面のディスク表示） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
+//! | 取り込み（DB への書き込み・同期サイクル）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_INGEST`（`0`/`1`） | `0`（無効） |
+//! | 同期サイクルの間隔（分） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10` |
 //!
 //! `TZ` は Rust 側では読まない。P1 は時刻の変換をせず、`taken_at` などの naive な日時は文字列の
 //! まま扱う（inventory.md §6.1）。systemd unit が `TZ=Asia/Tokyo` を与え続けるのは、並走する
@@ -52,7 +54,6 @@ pub const UNSUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_PHOTOS_DIR",
     "GEOFRAME_DRIVE_KEY",
     "GEOFRAME_DRIVE_FOLDER",
-    "GEOFRAME_DRIVE_POLL_MIN",
     "GEOFRAME_FETCH_PER_CYCLE",
     "GEOFRAME_QUALITY_PER_CYCLE",
     "GEOFRAME_INFER_OFFSET_MIN",
@@ -91,10 +92,16 @@ pub const SUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_INFER_MIN",
     "GEOFRAME_EMBED_BACKEND",
     "GEOFRAME_TILE_CACHE_MAX_MB",
+    // T2.1: 同期サイクルの間隔
+    "GEOFRAME_DRIVE_POLL_MIN",
 ];
 
 pub const DEFAULT_INFER_MIN: f64 = 15.0;
 pub const DEFAULT_TILE_CACHE_MAX_MB: i64 = 16384;
+/// 同期サイクルの間隔（分）の既定。現行の `GEOFRAME_DRIVE_POLL_MIN`。
+pub const DEFAULT_DRIVE_POLL_MIN: f64 = 10.0;
+/// `GEOFRAME_DRIVE_POLL_MIN` の上限（分）。1 年。これを超える値は設定の誤りとして断る。
+const MAX_DRIVE_POLL_MIN: f64 = 525_600.0;
 /// 位置推定の段階窓のうち固定のもの（秒）。現行の `INFER_WINDOWS_S = sorted({INFER_WINDOW_S, 2h, 12h})`。
 const FIXED_INFER_WINDOWS_S: [f64; 2] = [2.0 * 3600.0, 12.0 * 3600.0];
 
@@ -186,6 +193,11 @@ pub struct Config {
     /// 落とした）。起動ログで知らせる。
     pub embed_backend_invalid: bool,
     pub tile_cache_max_mb: i64,
+    /// 取り込み（DB への書き込みと同期サイクル）を有効にするか。`GEOFRAME_INGEST`。既定は無効。
+    /// 本番は P5 の切替まで Python が書き手なので、誤って二重に書かないよう、明示しない限り Rust は書かない。
+    pub ingest: bool,
+    /// 同期サイクルの間隔（分）。`GEOFRAME_DRIVE_POLL_MIN`（現行と同じく分で、小数も可）。
+    pub drive_poll_min: f64,
 }
 
 impl Config {
@@ -265,6 +277,34 @@ impl Config {
             None => DEFAULT_TILE_CACHE_MAX_MB,
         };
 
+        let ingest = match get("GEOFRAME_INGEST") {
+            Some(raw) => match raw.trim() {
+                "1" => true,
+                "0" => false,
+                _ => {
+                    return Err(ConfigError(
+                        "GEOFRAME_INGEST は 0（無効）か 1（有効）で指定してください".into(),
+                    ));
+                }
+            },
+            None => false,
+        };
+        // 現行は `float(...)`。0 以下や非数だと Python は空回りか例外になるので、Rust は断る
+        let drive_poll_min = match get("GEOFRAME_DRIVE_POLL_MIN") {
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0 && *v <= MAX_DRIVE_POLL_MIN)
+                .ok_or_else(|| {
+                    ConfigError(
+                        "GEOFRAME_DRIVE_POLL_MIN は 0 より大きい数（分。上限 525600）で指定してください"
+                            .into(),
+                    )
+                })?,
+            None => DEFAULT_DRIVE_POLL_MIN,
+        };
+
         Ok(Self {
             listen,
             data_dir,
@@ -275,7 +315,29 @@ impl Config {
             embed_backend,
             embed_backend_invalid,
             tile_cache_max_mb,
+            ingest,
+            drive_poll_min,
         })
+    }
+
+    /// 同期サイクルの間隔。
+    pub fn drive_poll(&self) -> std::time::Duration {
+        std::time::Duration::from_secs_f64(self.drive_poll_min * 60.0)
+    }
+
+    /// 取り込みの一時ダウンロード先（`DATA_DIR/tmp`）。`derivatives/` の外に置く（配信の許可 prefix の外）。
+    pub fn tmp_dir(&self) -> PathBuf {
+        self.data_dir.join("tmp")
+    }
+
+    /// derivative の置き場（`DATA_DIR/derivatives`）。
+    pub fn derivatives_dir(&self) -> PathBuf {
+        self.data_dir.join("derivatives")
+    }
+
+    /// 永続キャッシュ（`DATA_DIR/.cache.json`）。
+    pub fn cache_file(&self) -> PathBuf {
+        self.data_dir.join(".cache.json")
     }
 
     /// 位置推定の段階窓（秒、昇順、重複なし）。現行の `INFER_WINDOWS_S`
@@ -296,7 +358,7 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} embed={} tile_cache_max_mb={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
@@ -305,6 +367,8 @@ impl Config {
             self.infer_min,
             self.embed_backend.model(),
             self.tile_cache_max_mb,
+            if self.ingest { 1 } else { 0 },
+            self.drive_poll_min,
         )
     }
 }
@@ -518,6 +582,75 @@ mod tests {
             assert!(err.0.contains(key), "{err}");
             assert!(!err.0.contains(value), "{err}");
         }
+    }
+
+    #[test]
+    fn ingest_is_off_by_default_and_poll_defaults_to_ten_minutes() {
+        let c = load(&[], &Overrides::default()).unwrap();
+        assert!(!c.ingest);
+        assert_eq!(c.drive_poll_min, 10.0);
+        assert_eq!(c.drive_poll(), std::time::Duration::from_secs(600));
+        // 空文字は未設定と同じ（EnvironmentFile の `KEY=` の事故）
+        let c = load(
+            &[("GEOFRAME_INGEST", ""), ("GEOFRAME_DRIVE_POLL_MIN", " ")],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert!(!c.ingest);
+        assert_eq!(c.drive_poll_min, 10.0);
+        assert!(c.log_summary().contains("ingest=0 drive_poll_min=10"));
+    }
+
+    #[test]
+    fn ingest_and_poll_are_read_from_the_environment() {
+        let c = load(
+            &[
+                ("GEOFRAME_INGEST", "1"),
+                ("GEOFRAME_DRIVE_POLL_MIN", " 0.5 "),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert!(c.ingest);
+        assert_eq!(c.drive_poll(), std::time::Duration::from_secs(30));
+        assert!(c.log_summary().contains("ingest=1 drive_poll_min=0.5"));
+        assert!(
+            !load(&[("GEOFRAME_INGEST", "0")], &Overrides::default())
+                .unwrap()
+                .ingest
+        );
+        let c = load(&[("GEOFRAME_DRIVE_POLL_MIN", "1e1")], &Overrides::default()).unwrap();
+        assert_eq!(c.drive_poll_min, 10.0);
+    }
+
+    #[test]
+    fn invalid_ingest_and_poll_are_errors_without_echoing_the_value() {
+        for (key, value) in [
+            ("GEOFRAME_INGEST", "true"),
+            ("GEOFRAME_INGEST", "2"),
+            ("GEOFRAME_INGEST", "yes"),
+            ("GEOFRAME_DRIVE_POLL_MIN", "abc"),
+            ("GEOFRAME_DRIVE_POLL_MIN", "0"),
+            ("GEOFRAME_DRIVE_POLL_MIN", "-3"),
+            ("GEOFRAME_DRIVE_POLL_MIN", "inf"),
+            ("GEOFRAME_DRIVE_POLL_MIN", "NaN"),
+            ("GEOFRAME_DRIVE_POLL_MIN", "525601"),
+        ] {
+            let err = load(&[(key, value)], &Overrides::default()).unwrap_err();
+            assert!(err.0.contains(key), "{err}");
+            // 1〜2 文字の値（"0"・"2"）は、メッセージの文言と偶然重なるので除く
+            if value.len() > 2 {
+                assert!(!err.0.contains(value), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn data_paths_for_ingest_are_under_the_data_dir() {
+        let c = load(&[("GEOFRAME_DATA_DIR", "/srv/g")], &Overrides::default()).unwrap();
+        assert_eq!(c.tmp_dir(), PathBuf::from("/srv/g/tmp"));
+        assert_eq!(c.derivatives_dir(), PathBuf::from("/srv/g/derivatives"));
+        assert_eq!(c.cache_file(), PathBuf::from("/srv/g/.cache.json"));
     }
 
     #[test]

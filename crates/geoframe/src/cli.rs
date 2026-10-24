@@ -6,9 +6,26 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::cache::Cache;
 use crate::config::{Config, Overrides};
 use crate::db::Catalog;
 use crate::server::AppState;
+use crate::stop::StopFlag;
+use crate::sync::{CycleReport, Mode, StageCtx, StageResult};
+
+/// 停止のときに、取り込みのスレッドを待つ上限。
+const THREAD_STOP_LIMIT: Duration = Duration::from_secs(10);
+
+fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {
+    let started = std::time::Instant::now();
+    while !handle.is_finished() {
+        if started.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    handle.join().is_ok()
+}
 
 const USAGE: &str = "\
 使い方:
@@ -17,9 +34,14 @@ const USAGE: &str = "\
   geoframe selfcheck-net                地理院の逆ジオコーダへ公開の代表点を 1 件問い合わせ、外向き HTTPS（名前解決・
                                         TLS・証明書）が通るかを確かめる。出力は状態と HTTP ステータスだけ
   geoframe serve [--listen <addr:port>] [--data-dir <dir>]
-                                        サーバーを起動する（読み取り専用。DB は <dir>/catalog.db）
+                                        サーバーを起動する（DB は <dir>/catalog.db）。GEOFRAME_INGEST=1 のときだけ
+                                        取り込み（DB への書き込みと同期サイクル）も動かす。それ以外は読み取り専用
                                         設定は 起動引数 > 環境変数 GEOFRAME_* > 既定値 の順
-                                        （詳細は docs/rust-migration/server.md）";
+                                        （詳細は docs/rust-migration/server.md）
+  geoframe sync [--dry-run] [--data-dir <dir>]
+                                        同期サイクルを 1 回だけ動かして終わる。--dry-run は何も書かず、
+                                        やるとしたら何か（スキーマ・掃除・各段）を件数だけ出す。
+                                        書く実行は GEOFRAME_INGEST=1 が要る";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -27,6 +49,10 @@ pub enum Command {
     CheckDb(PathBuf),
     SelfCheckNet,
     Serve(Overrides),
+    Sync {
+        dry_run: bool,
+        data_dir: Option<PathBuf>,
+    },
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
@@ -63,6 +89,20 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 }
             }
             Ok(Command::Serve(overrides))
+        }
+        Some("sync") => {
+            let (mut dry_run, mut data_dir) = (false, None);
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--dry-run" => dry_run = true,
+                    "--data-dir" => {
+                        let value = args.next().ok_or("--data-dir に値が要ります")?;
+                        data_dir = Some(PathBuf::from(value));
+                    }
+                    other => return Err(format!("sync の引数 {other:?} は不明です")),
+                }
+            }
+            Ok(Command::Sync { dry_run, data_dir })
         }
         Some(other) => Err(format!("不明なコマンド {other:?}")),
         None => Err("コマンドがありません".into()),
@@ -103,6 +143,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
             }
         }
         Command::Serve(overrides) => serve(&overrides),
+        Command::Sync { dry_run, data_dir } => sync(dry_run, data_dir),
     }
 }
 
@@ -127,6 +168,23 @@ fn serve(overrides: &Overrides) -> ExitCode {
         );
     }
 
+    // 取り込み（GEOFRAME_INGEST=1）: writer を開き、スキーマの作成・移行と起動時の掃除をする。
+    // 無効（既定）のときは P1 と同じ読み取り専用で、DB が無ければ下で断る
+    let ingest = if config.ingest {
+        match crate::ingest::start(&config) {
+            Ok(ingest) => Some(ingest),
+            Err(e) => {
+                tracing::error!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        tracing::info!(
+            "取り込みは無効です（DB に書きません）。有効にするには GEOFRAME_INGEST=1 を設定します"
+        );
+        None
+    };
+
     // 起動時の DB の確認。開けない・スキーマが古いときは起動しない（設定の誤りや配備の誤りを、
     // 503 を返し続けるプロセスに隠さず、systemd の失敗として見せる）
     let catalog = match Catalog::open(&config.db_path()) {
@@ -148,7 +206,30 @@ fn serve(overrides: &Overrides) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let state = AppState::new(Arc::new(config), catalog);
+    let catalog = match &ingest {
+        Some(ingest) => catalog.with_writer(ingest.writer.clone()),
+        None => catalog,
+    };
+    let config = Arc::new(config);
+    // 同期サイクルとキャッシュ保存のスレッド。HTTP サーバーの起動を待たない
+    let stop = StopFlag::new();
+    let threads: Vec<_> = ingest
+        .iter()
+        .flat_map(|ingest| {
+            [
+                crate::sync::spawn_worker(
+                    Arc::clone(&config),
+                    ingest.writer.clone(),
+                    Arc::clone(&ingest.cache),
+                    crate::sync::default_stages(),
+                    stop.clone(),
+                    config.drive_poll(),
+                ),
+                crate::cache::spawn_saver(Arc::clone(&ingest.cache), stop.clone()),
+            ]
+        })
+        .collect();
+    let state = AppState::new(Arc::clone(&config), catalog);
     if state.data_root.as_path() != state.config.data_dir.as_path() {
         // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する
         tracing::info!(
@@ -157,6 +238,14 @@ fn serve(overrides: &Overrides) -> ExitCode {
         );
     }
     let result = runtime.block_on(crate::server::serve(state));
+    // 取り込みのスレッドを止める（サイクルの最中なら今の段が終わるまで。待つのは限られた時間だけ）
+    stop.stop();
+    for thread in threads {
+        if !join_within(thread, THREAD_STOP_LIMIT) {
+            tracing::warn!("取り込みのスレッドが時間内に止まりませんでした（そのまま終了します）");
+        }
+    }
+    drop(ingest);
     // 固まった spawn_blocking（DB の読み取り）を待ち続けて、停止が終わらないことがないように
     runtime.shutdown_timeout(Duration::from_secs(5));
     match result {
@@ -165,6 +254,147 @@ fn serve(overrides: &Overrides) -> ExitCode {
             tracing::error!("サーバーが異常終了しました: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `geoframe sync [--dry-run]`: 同期サイクルを 1 回だけ動かす（棚卸し §5 の手動トリガー）。
+fn sync(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
+    let overrides = Overrides {
+        listen: None,
+        data_dir,
+    };
+    let config = match Config::load(|key| std::env::var(key).ok(), &overrides) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("geoframe: 設定が不正です: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    crate::logging::init(config.log_level);
+    crate::logging::install_panic_hook();
+    if dry_run {
+        sync_dry_run(&config)
+    } else {
+        sync_apply(&config)
+    }
+}
+
+/// 書かずに計画を出す。書き込み接続を作らず、DB は読み取り専用、キャッシュは凍結して読む。
+fn sync_dry_run(config: &Config) -> ExitCode {
+    println!("dry-run: 何も書きません（DB・ファイル・キャッシュ）");
+    let read = match crate::db::open_read_only(&config.db_path()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("geoframe: DB を読み取り用に開けません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match crate::ingest::plan(config, &read) {
+        Ok(plan) => {
+            let s = &plan.schema;
+            println!(
+                "スキーマ: 作る表・索引 {} / 足す列 {} / place を NULL に戻す {} / embedding の写し {}",
+                s.missing_objects.len(),
+                s.missing_columns.len(),
+                if s.would_reset_places {
+                    "あり"
+                } else {
+                    "なし"
+                },
+                s.embeddings_to_copy
+            );
+            println!(
+                "掃除: 消す .dl_* {} 件 / 捨てる .cache.json の旧キー {} 件",
+                plan.leftover_files, plan.legacy_cache_keys
+            );
+        }
+        Err(e) => {
+            eprintln!("geoframe: 計画を作れません: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let cache = Cache::load_frozen(&config.data_dir);
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let ctx = StageCtx {
+        mode: Mode::DryRun,
+        config,
+        read: &read,
+        writer: None,
+        cache: &cache,
+        http: &http,
+        stop: &stop,
+    };
+    let report = crate::sync::run_cycle(&crate::sync::default_stages(), &ctx);
+    print_report(&report);
+    exit_for(&report)
+}
+
+/// 実際に 1 回書く。`GEOFRAME_INGEST=1` が要る（P5 の切替まで、本番の書き手は Python）。
+fn sync_apply(config: &Config) -> ExitCode {
+    if !config.ingest {
+        eprintln!(
+            "geoframe: sync は GEOFRAME_INGEST=1 のときだけ書きます（書かずに計画だけ見るなら --dry-run）"
+        );
+        return ExitCode::from(2);
+    }
+    let ingest = match crate::ingest::start(config) {
+        Ok(ingest) => ingest,
+        Err(e) => {
+            eprintln!("geoframe: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let read = match crate::db::open_read_only(&config.db_path()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("geoframe: DB を読み取り用に開けません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let ctx = StageCtx {
+        mode: Mode::Apply,
+        config,
+        read: &read,
+        writer: Some(&ingest.writer),
+        cache: &ingest.cache,
+        http: &http,
+        stop: &stop,
+    };
+    let report = crate::sync::run_cycle(&crate::sync::default_stages(), &ctx);
+    ingest.cache.save_now();
+    print_report(&report);
+    exit_for(&report)
+}
+
+/// 段ごとの結果と件数だけを出す（値は持っていない）。
+fn print_report(report: &CycleReport) {
+    for stage in &report.stages {
+        let state = match &stage.result {
+            StageResult::Done(counts) if counts.is_empty() => "完了（件数なし）".to_string(),
+            StageResult::Done(counts) => format!("完了 {counts}"),
+            StageResult::Skipped(reason) => format!("省略（{reason}）"),
+            StageResult::Failed(message) => format!("失敗: {message}"),
+            StageResult::Panicked => "パニック".to_string(),
+            StageResult::NotRun => "未実行".to_string(),
+        };
+        println!("段 {}: {state}", stage.name);
+    }
+    if let Some(p) = report.photos {
+        println!(
+            "写真: 表示可能 {} / 取得待ち {} / 全{}",
+            p.ready, p.pending, p.total
+        );
+    }
+}
+
+fn exit_for(report: &CycleReport) -> ExitCode {
+    if report.failed() > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -199,6 +429,21 @@ mod tests {
         );
         // 引数なしでも起動できる（環境変数と既定値で決まる）
         assert_eq!(p(&["serve"]), Ok(Command::Serve(Overrides::default())));
+        assert_eq!(p(&["selfcheck-net"]), Ok(Command::SelfCheckNet));
+        assert_eq!(
+            p(&["sync"]),
+            Ok(Command::Sync {
+                dry_run: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            p(&["sync", "--dry-run", "--data-dir", "/srv/x"]),
+            Ok(Command::Sync {
+                dry_run: true,
+                data_dir: Some(PathBuf::from("/srv/x"))
+            })
+        );
     }
 
     #[test]
@@ -214,5 +459,8 @@ mod tests {
         assert!(!err.contains("secret-host"), "{err}");
         assert!(p(&["serve", "--data-dir"]).is_err());
         assert!(p(&["serve", "--port", "1"]).is_err());
+        assert!(p(&["selfcheck-net", "x"]).is_err());
+        assert!(p(&["sync", "--listen", "127.0.0.1:1"]).is_err());
+        assert!(p(&["sync", "--data-dir"]).is_err());
     }
 }

@@ -1,0 +1,433 @@
+//! 永続キャッシュ `DATA_DIR/.cache.json`（現行 `store.py` の `load_cache`・`purge_cache_legacy`・
+//! `save_cache`・`cache_saver`。棚卸し B0・B7）。
+//!
+//! # ファイルの形（Python と読み書きの互換）
+//!
+//! JSON のオブジェクト 1 つ。キーは次の 3 種類だけが現役:
+//!
+//! | キー | 値 | 書く段 |
+//! |---|---|---|
+//! | `geo:<緯度3桁>,<経度3桁>` | `{place, elev, muni_cd, pref, city}` | 地名の enrich（T2.5） |
+//! | `geocode_osm:[<国コード>:]<検索語>` | 候補の配列 | 地名検索（P3・P4） |
+//! | `muni_table` | 市区町村コード→`[都道府県, 市区町村]` | 地名の enrich（T2.5） |
+//!
+//! 値は [`serde_json::Value`] のまま持つ（`geo:` の中身を型に落とさないので、往復で欠けない）。
+//! 書き出しは Python の `json.dumps(ensure_ascii=False, indent=1)` と同じ形（インデント 1、日本語は
+//! そのまま）にする。Python が書いたファイルを Rust が、Rust が書いたファイルを Python が、そのまま
+//! 読める。**違うのはキーの並びだけ**: Python は挿入順、Rust は辞書順で書く（`serde_json` の
+//! `preserve_order` を入れると、他の応答の JSON のキーの並びまで変わるため入れない）。初めて Rust が
+//! 保存したときに 1 度だけ並びが変わり、以後は安定する。読むときの並びは問わない。
+//!
+//! **座標を 3 桁に丸めた値がキーに入るので、ファイルは位置情報を含む**。リポジトリ・テストの実データ・
+//! ログに出さない（テストは合成の値だけ）。ログに出すのは件数だけ。
+//!
+//! # 振る舞い
+//!
+//! - [`Cache::load`] は、無い・読めない・オブジェクトでないときは空から始める（現行と同じ）。
+//! - [`Cache::purge_legacy`] は、起動時に 1 回、現役でないキー（旧 `exif:` `exif2:` `adsbdb:` `airport:`
+//!   `intel2:` など）を捨てる。あれば呼び出し側が即保存する。
+//! - [`Cache::save_if_due`] は、変更があり、前回の保存から [`SAVE_INTERVAL`] 以上たっているときだけ書く
+//!   （SD/eMMC の寿命のため、最短 60 秒間隔）。一時ファイル `.cache.json.tmp` に書いて `rename` で
+//!   差し替える（書きかけで落ちても現役のキーを失わない）。失敗したら次の tick で再試行する。
+//! - 凍結（[`Cache::load_frozen`]）は `--dry-run` 用で、`put`・`purge`・保存をしない。
+
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
+
+use serde::Serialize;
+use serde_json::{Map, Value};
+
+use crate::stop::StopFlag;
+
+/// 実書き込みの最短間隔（現行の `CACHE_SAVE_INTERVAL_S`）。
+pub const SAVE_INTERVAL: Duration = Duration::from_secs(60);
+/// 保存スレッドの起床間隔（現行の `CACHE_SAVER_TICK_S`）。
+pub const SAVER_TICK: Duration = Duration::from_secs(10);
+
+const LIVE_PREFIXES: [&str; 2] = ["geo:", "geocode_osm:"];
+const LIVE_EXACT: [&str; 1] = ["muni_table"];
+
+fn is_live(key: &str) -> bool {
+    LIVE_EXACT.contains(&key) || LIVE_PREFIXES.iter().any(|p| key.starts_with(p))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SaveOutcome {
+    /// 変更が無い。
+    Clean,
+    /// 前回の保存から間隔が足りない。
+    TooSoon,
+    Saved,
+    /// 書けなかった（次の tick で再試行する）。
+    Failed,
+}
+
+struct State {
+    map: Map<String, Value>,
+    dirty: bool,
+    /// 前回保存した時刻。まだ保存していなければ `None`（最初の保存は間隔を待たない）。
+    saved_at: Option<Instant>,
+}
+
+pub struct Cache {
+    file: PathBuf,
+    tmp: PathBuf,
+    frozen: bool,
+    state: Mutex<State>,
+}
+
+impl Cache {
+    /// `.cache.json` を読む。無い・壊れている・オブジェクトでないときは空から始める。
+    pub fn load(data_dir: &Path) -> Self {
+        Self::load_with(data_dir, false)
+    }
+
+    /// 読むだけ（`put`・`purge_legacy`・保存はしない）。`--dry-run` 用。
+    pub fn load_frozen(data_dir: &Path) -> Self {
+        Self::load_with(data_dir, true)
+    }
+
+    fn load_with(data_dir: &Path, frozen: bool) -> Self {
+        let file = data_dir.join(".cache.json");
+        let map = match fs::read_to_string(&file) {
+            Ok(text) => match serde_json::from_str::<Value>(&text) {
+                Ok(Value::Object(map)) => map,
+                _ => {
+                    // 中身は出さない（位置を含む）
+                    tracing::warn!(".cache.json を読めないので空から始めます");
+                    Map::new()
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
+            Err(e) => {
+                tracing::warn!(".cache.json を読めないので空から始めます: {}", e.kind());
+                Map::new()
+            }
+        };
+        Self {
+            tmp: data_dir.join(".cache.json.tmp"),
+            file,
+            frozen,
+            state: Mutex::new(State {
+                map,
+                dirty: false,
+                saved_at: None,
+            }),
+        }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn len(&self) -> usize {
+        self.state().map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, key: &str) -> Option<Value> {
+        self.state().map.get(key).cloned()
+    }
+
+    pub fn put(&self, key: &str, value: Value) {
+        if self.frozen {
+            return;
+        }
+        let mut state = self.state();
+        state.map.insert(key.to_string(), value);
+        state.dirty = true;
+    }
+
+    /// 現役でないキーの数（捨てずに数えるだけ）。
+    pub fn legacy_count(&self) -> usize {
+        self.state().map.keys().filter(|k| !is_live(k)).count()
+    }
+
+    /// 現役でないキーを捨てる。捨てた数を返す。
+    pub fn purge_legacy(&self) -> usize {
+        if self.frozen {
+            return 0;
+        }
+        let mut state = self.state();
+        let before = state.map.len();
+        state.map.retain(|k, _| is_live(k));
+        let removed = before - state.map.len();
+        if removed > 0 {
+            state.dirty = true;
+        }
+        removed
+    }
+
+    /// 変更があり、前回の保存から [`SAVE_INTERVAL`] 以上たっているときだけ書く。
+    pub fn save_if_due(&self, now: Instant) -> SaveOutcome {
+        self.save(now, false)
+    }
+
+    /// 間隔を待たずに書く（変更があるときだけ）。起動時の旧キー破棄のあと・停止時。
+    pub fn save_now(&self) -> SaveOutcome {
+        self.save(Instant::now(), true)
+    }
+
+    fn save(&self, now: Instant, force: bool) -> SaveOutcome {
+        if self.frozen {
+            return SaveOutcome::Clean;
+        }
+        let body = {
+            let mut state = self.state();
+            if !state.dirty {
+                return SaveOutcome::Clean;
+            }
+            if !force
+                && state
+                    .saved_at
+                    .is_some_and(|at| now.saturating_duration_since(at) < SAVE_INTERVAL)
+            {
+                return SaveOutcome::TooSoon;
+            }
+            // ロックの下でスナップショットを取る（書いている間に put されても失わない）
+            let body = to_python_json(&state.map);
+            state.dirty = false;
+            state.saved_at = Some(now);
+            body
+        };
+        match self.write_atomically(&body) {
+            Ok(()) => SaveOutcome::Saved,
+            Err(e) => {
+                self.state().dirty = true; // 次の tick で再試行
+                tracing::warn!("キャッシュの保存に失敗しました（次回再試行）: {}", e.kind());
+                SaveOutcome::Failed
+            }
+        }
+    }
+
+    /// 一時ファイルに書いて差し替える。書きかけで落ちても現役のキーを失わない。
+    fn write_atomically(&self, body: &[u8]) -> std::io::Result<()> {
+        let mut file = fs::File::create(&self.tmp)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&self.tmp, &self.file)
+    }
+}
+
+/// Python の `json.dumps(obj, ensure_ascii=False, indent=1)` と同じ形（末尾の改行は付けない）。
+fn to_python_json(map: &Map<String, Value>) -> Vec<u8> {
+    let mut out = Vec::new();
+    let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, formatter);
+    map.serialize(&mut serializer)
+        .expect("JSON を直列化できません");
+    out
+}
+
+/// 保存スレッド（現行の `cache_saver`）。[`SAVER_TICK`] ごとに起きて [`Cache::save_if_due`] を呼び、
+/// 止まるときに最後の保存をする。
+pub fn spawn_saver(cache: Arc<Cache>, stop: StopFlag) -> std::thread::JoinHandle<()> {
+    spawn_saver_with(cache, stop, SAVER_TICK)
+}
+
+fn spawn_saver_with(
+    cache: Arc<Cache>,
+    stop: StopFlag,
+    tick: Duration,
+) -> std::thread::JoinHandle<()> {
+    std::thread::Builder::new()
+        .name("cache-saver".into())
+        .spawn(move || {
+            while !stop.wait(tick) {
+                cache.save_if_due(Instant::now());
+            }
+            // 停止時の取りこぼし（最大で 1 分ぶん）を残さない
+            cache.save_now();
+        })
+        .expect("キャッシュ保存スレッドを起動できません")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+    use serde_json::json;
+
+    fn write_file(dir: &TempDir, text: &str) {
+        fs::write(dir.path().join(".cache.json"), text).unwrap();
+    }
+
+    fn read_file(dir: &TempDir) -> String {
+        fs::read_to_string(dir.path().join(".cache.json")).unwrap()
+    }
+
+    // 合成の値だけ。座標らしいキーも、実在の場所とは無関係な丸めの値
+    const SYNTH: &str = r#"{
+ "geo:10.000,20.000": {
+  "city": "テスト市",
+  "elev": 12.5,
+  "muni_cd": "99999",
+  "place": "テスト県テスト市",
+  "pref": "テスト県"
+ },
+ "geocode_osm:jp:テスト": [],
+ "muni_table": {
+  "99999": [
+   "テスト県",
+   "テスト市"
+  ]
+ }
+}"#;
+
+    #[test]
+    fn missing_or_broken_files_start_empty() {
+        let dir = TempDir::new("cache-empty");
+        assert!(Cache::load(dir.path()).is_empty());
+        for bad in ["", "not json", "[1,2]", "\"x\"", "null", "{\"a\":"] {
+            write_file(&dir, bad);
+            assert!(Cache::load(dir.path()).is_empty(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn python_formatted_file_round_trips_byte_for_byte() {
+        let dir = TempDir::new("cache-roundtrip");
+        write_file(&dir, SYNTH);
+        let cache = Cache::load(dir.path());
+        assert_eq!(cache.len(), 3);
+        assert_eq!(
+            cache.get("geo:10.000,20.000").unwrap()["pref"],
+            json!("テスト県")
+        );
+        // 変更がなければ書かない
+        assert_eq!(cache.save_now(), SaveOutcome::Clean);
+        cache.put("geo:10.000,20.000", cache.get("geo:10.000,20.000").unwrap());
+        assert_eq!(cache.save_now(), SaveOutcome::Saved);
+        // Python の indent=1・ensure_ascii=False と同じ形（Rust はキーを辞書順に書く。この合成データは
+        // 辞書順で書いてある）
+        assert_eq!(read_file(&dir), SYNTH);
+        assert!(!dir.path().join(".cache.json.tmp").exists());
+    }
+
+    #[test]
+    fn output_matches_python_json_dumps() {
+        // `json.dumps({"b": [], "a": {}, "c": [1, 2.5, "あ/\"\n"], "d": None, "e": True}, ensure_ascii=False, indent=1)`
+        // の出力（Python 3.13 で確認した固定値）。キーは辞書順に入れる
+        let python = "{\n \"a\": {},\n \"b\": [],\n \"c\": [\n  1,\n  2.5,\n  \"あ/\\\"\\n\"\n ],\n \"d\": null,\n \"e\": true\n}";
+        let mut map = Map::new();
+        map.insert("a".into(), json!({}));
+        map.insert("b".into(), json!([]));
+        map.insert("c".into(), json!([1, 2.5, "あ/\"\n"]));
+        map.insert("d".into(), Value::Null);
+        map.insert("e".into(), json!(true));
+        assert_eq!(String::from_utf8(to_python_json(&map)).unwrap(), python);
+        assert_eq!(to_python_json(&Map::new()), b"{}");
+    }
+
+    #[test]
+    fn legacy_keys_are_purged_and_live_ones_kept() {
+        let dir = TempDir::new("cache-purge");
+        write_file(
+            &dir,
+            r#"{"exif:a": 1, "exif2:b": {}, "adsbdb:c": [], "airport:d": 0, "intel2:e": "x",
+                "geo:1.000,2.000": {}, "geocode_osm:q": [], "muni_table": {}, "geocodex": 1}"#,
+        );
+        let cache = Cache::load(dir.path());
+        assert_eq!(cache.legacy_count(), 6); // geocodex も現役のどれにも前方一致しない
+        assert_eq!(cache.purge_legacy(), 6);
+        assert_eq!(cache.len(), 3);
+        // 破棄したら即保存できる（間隔を待たない）
+        assert_eq!(cache.save_now(), SaveOutcome::Saved);
+        let again = Cache::load(dir.path());
+        assert_eq!(again.len(), 3);
+        assert!(again.get("geo:1.000,2.000").is_some());
+        assert_eq!(again.purge_legacy(), 0);
+        assert_eq!(again.save_now(), SaveOutcome::Clean);
+    }
+
+    #[test]
+    fn saves_are_debounced_to_one_per_interval() {
+        let dir = TempDir::new("cache-debounce");
+        let cache = Cache::load(dir.path());
+        let t0 = Instant::now();
+        // 最初の保存は間隔を待たない（現行の `_cache_saved_at = 0.0`）
+        cache.put("geo:1", json!(1));
+        assert_eq!(cache.save_if_due(t0), SaveOutcome::Saved);
+        // 変更があっても 60 秒未満は書かない
+        cache.put("geo:2", json!(2));
+        assert_eq!(
+            cache.save_if_due(t0 + Duration::from_secs(59)),
+            SaveOutcome::TooSoon
+        );
+        assert!(!read_file(&dir).contains("geo:2"));
+        assert_eq!(
+            cache.save_if_due(t0 + Duration::from_secs(60)),
+            SaveOutcome::Saved
+        );
+        assert!(read_file(&dir).contains("geo:2"));
+        // 変更が無ければ、時間がたっても書かない
+        assert_eq!(
+            cache.save_if_due(t0 + Duration::from_secs(600)),
+            SaveOutcome::Clean
+        );
+    }
+
+    #[test]
+    fn a_failed_save_is_retried() {
+        let dir = TempDir::new("cache-fail");
+        let cache = Cache::load(dir.path());
+        cache.put("geo:1", json!(1));
+        // 書き込み先のディレクトリを無くして失敗させる
+        let missing = dir.path().join("gone");
+        let broken = Cache {
+            file: missing.join(".cache.json"),
+            tmp: missing.join(".cache.json.tmp"),
+            frozen: false,
+            state: Mutex::new(State {
+                map: cache.state().map.clone(),
+                dirty: true,
+                saved_at: None,
+            }),
+        };
+        assert_eq!(broken.save_now(), SaveOutcome::Failed);
+        assert!(broken.state().dirty, "失敗したら次の tick で再試行する");
+        fs::create_dir_all(&missing).unwrap();
+        assert_eq!(broken.save_now(), SaveOutcome::Saved);
+    }
+
+    #[test]
+    fn frozen_cache_never_writes() {
+        let dir = TempDir::new("cache-frozen");
+        write_file(&dir, r#"{"exif:x": 1, "geo:1": 2}"#);
+        let cache = Cache::load_frozen(dir.path());
+        assert_eq!(cache.legacy_count(), 1); // 数えられる
+        assert_eq!(cache.purge_legacy(), 0);
+        cache.put("geo:2", json!(3));
+        assert_eq!(cache.save_now(), SaveOutcome::Clean);
+        assert_eq!(read_file(&dir), r#"{"exif:x": 1, "geo:1": 2}"#);
+        assert!(cache.get("geo:2").is_none());
+    }
+
+    #[test]
+    fn saver_thread_saves_on_tick_and_on_stop() {
+        let dir = TempDir::new("cache-saver");
+        let cache = Arc::new(Cache::load(dir.path()));
+        let stop = StopFlag::new();
+        let handle = spawn_saver_with(Arc::clone(&cache), stop.clone(), Duration::from_millis(10));
+        cache.put("geo:1", json!(1));
+        for _ in 0..200 {
+            if dir.path().join(".cache.json").exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(read_file(&dir).contains("geo:1"));
+        // 間隔の内側の変更も、停止のときに保存される
+        cache.put("geo:2", json!(2));
+        stop.stop();
+        handle.join().unwrap();
+        assert!(read_file(&dir).contains("geo:2"));
+    }
+}
