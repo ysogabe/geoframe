@@ -1,7 +1,7 @@
 # Rust単一バイナリ化 タスク
 
 - 要求: [Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 設計: [設計案](../architecture/rust-api-and-ai-providers-proposal.md) / 計画: [plan.md](plan.md)
-- ブランチ: ローカルはT3の`t3/issue-54-implementation-plan`のまま、リモートはフェーズごとに分ける（P0は同名で PR #57、P1は`feat/rust-migration-p1`で PR #58、どちらも squash merge 済み。P2は`feat/rust-migration-p2`へpush）
+- ブランチ: ローカルはT3の`t3/issue-54-implementation-plan`のまま、リモートはフェーズごとに分ける（P0は同名で PR #57、P1は`feat/rust-migration-p1`で PR #58、どちらも squash merge 済み。P2は`feat/rust-migration-p2`でPRを出す）
 - PRはフェーズごとに1つ。P2以降のタスクは、そのフェーズの開始時に細かく分け直す。
 - 種類: `ops`は自分で行う運用作業、`quick`/`full`はビルドのスキルに任せる実装。
 
@@ -51,7 +51,7 @@ P2で守ること（各タスクの委任文に入れる）:
 | T2.5 | 位置の推定と地名: `infer_locations`（段階窓・`GEOFRAME_INFER_OFFSET_MIN`・錨が消えたときの取り消し）、`enrich_rows`（GSIの逆ジオ・標高・`muni.js`、1サイクル40件、0.2秒待ち、応答が空なら空で確定、国外は空で確定） | AC2 | T2.1 | full | 完了 | a2e7341 | a4b36c7..93783d5 | レビュー（Sol）3回: 必須 1→1→0（同じ丸めキーで国内の行が空の地名で確定する＝処理順・障害のあいだの追い越し）、推奨（再試行と座標ごとの障害、段の上限2分、待ちと件数、strptimeの空白埋め）を反映。3回目の推奨（時間切れを記憶しないことのテストの補強）はT2.7で。棚卸しS3。合成の行でPythonの`infer_locations`・`enrich_rows`と全列・地理院への要求順・キャッシュのキーが一致（fixture）。本番コピーのdry-runで推定・取り消し・enrichとも0、推定2,162行と地名13行を消して1サイクル回すと`.dump`が元と完全一致。`organize`の`held_back_until_infer`を廃止 |
 | T2.6 | 簡易品質: 特徴量（SHA-256・pHash・鮮明度・露出）、孤児の削除、全員分そろってからの再グルーピング（完全重複・3分以内かつpHash距離12以下）、`BEGIN IMMEDIATE`での全差し替え、`--quality-scan` | AC2 | T2.1, T2.2 | full | 完了 | 460626f | eb54361..5f11220 | レビュー（Sol）2回: 必須0。推奨（同じSHAでそろえるのは指標だけでpHashは行ごと＝配信の抑制をPythonと同じに、Pythonへの切り戻しの試験`switchbacks`と手順）を反映、2回目の推奨（解析し直す切り戻しの説明）は管理者が文書を修正。方針: Pythonの特徴量の行を有効として使い、新しい写真だけRustで解析（全部やり直すと約44時間・7枚の組が変わる）。グルーピングはPythonと20ケースで全列一致（fixture）、本番コピーで解析0・再構築559行全一致、1サイクル後も`.dump`不変・3,065件。棚卸しS7。旧スコアとの一致は不要、同じ入力で同じ結果 |
 | T2.7 | 検証環境での受入: 本番コピーでの`--dry-run`（変更ほぼ0）と実サイクル、同じ写真を比較用PythonとRustへ入れて`photos`の列ごとの比較、棚卸しS1・S2・S3・S7、miharashiでの表示の継続、結果を`p2-acceptance.md`へ | AC1, AC2, AC5 | T2.3〜T2.6 | full | 完了 | 823f237 | 35d677d..67360d4 | [p2-acceptance.md](p2-acceptance.md)。本番コピーのdry-runは全段0、実サイクル2回で`.dump`不変。合成21枚で比較用Pythonと`photos`全26列・`photo_quality`567行・配信件数が一致。S1・S3・S7通過、miharashi定常200・停止再開300とも終了コード0、全件比較の想定外の差0。本物のDriveでの確認（S2・§14.11）は鍵待ち。T2.5のテスト補強も実施 |
-| T2.8 | P2全体レビューの推奨の反映: dry-runの対象を検証環境に統一（本番DBに向けない）、受入の「全段0」の限定、本物のDrive確認をP5の関門に、一次データが消える経路のP3への引き継ぎ、ICCの説明、unitに`Conflicts=geoframe-server.service`、文書のユーザー名 | AC1, AC2, AC7 | T2.1〜T2.7 | quick | 実装中 | 0d2750c | | P2全体レビュー（要求との突き合わせ、Sol）: 必須1・推奨2・参考1。security-review（Opus）: High/Medium 0、Low 2（Python停止の確認が起動時だけ、文書のユーザー名） |
+| T2.8 | P2全体レビューの推奨の反映: dry-runの対象を検証環境に統一（本番DBに向けない）、受入の「全段0」の限定、本物のDrive確認をP5の関門に、一次データが消える経路のP3への引き継ぎ、ICCの説明、unitに`Conflicts=geoframe-server.service`、文書のユーザー名 | AC1, AC2, AC7 | T2.1〜T2.7 | quick | 完了 | 0d2750c | 15c306b | P2全体レビュー（要求との突き合わせ、Sol）: 必須1・推奨2・参考1。security-review（Opus）: High/Medium 0、Low 2（Python停止の確認が起動時だけ、文書のユーザー名） |
 
 ## P3〜P5（開始時に分け直す）
 
