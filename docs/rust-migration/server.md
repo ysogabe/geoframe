@@ -1,6 +1,6 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）
 
-- 状態: T1.1 実装済み（2026-10-24）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
 - 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
@@ -60,8 +60,11 @@
 ### 2.2 接続プール
 
 - tokioのworkerでSQLiteを直接実行しない。`Catalog::read(|conn| …)`が、`spawn_blocking`の中で接続を借りて実行する。
-- 接続は最大4本（`READ_CONNECTIONS`）。起動時に1本だけ開き、残りは必要になったときに開く。同時に走る読み取りは4が上限で、順番待ちは**非同期のセマフォ**で行う（待っている間もworkerは塞がらない）。
-- 呼び出し側が先にFutureを捨てても（タイムアウトなど）、始まった読み取りは最後まで走って接続を戻す。読み取りがパニックしたときはその接続を捨て、次の読み取りが開き直す。
+- API用の接続は最大4本（`READ_CONNECTIONS`）。起動時に1本だけ開き、残りは必要になったときに開く。同時に走る読み取りは4が上限で、順番待ちは**非同期のセマフォ**で行う（待っている間もworkerは塞がらない）。順番待ちには**上限10秒**（`QUEUE_TIMEOUT`）があり、超えると`CatalogError::QueueTimeout`を返す。API（T1.2以降）はこれを**503**にする。
+- **`/healthz`専用の接続を別に1本**持つ（`busy_timeout`は2秒）。API側の4本が長い読み取りで埋まっていても、DBが正常なら`/healthz`は待たされず200を返せる（§4）。
+- 呼び出し側が先にFutureを捨てても（タイムアウトなど）、始まった読み取りは最後まで走って接続を戻す（テスト`the_connection_returns_when_the_caller_gives_up`）。
+- **接続を戻す前の後始末**: 読み取りのあと、トランザクションが開いたままなら`ROLLBACK`する（できなければ接続を捨てる）。開いたまま戻すと、その接続は古いスナップショットを見続け、Python側の`-wal`のチェックポイントも進められず際限なく大きくなる。また、`SQLITE_IOERR`・`SQLITE_CORRUPT`・`SQLITE_NOTADB`など接続の状態が壊れたと見られるエラーが出たときも接続を捨てる（SQLの誤りのような普通のエラーでは戻す）。
+- 読み取りがパニックしたときはその接続を捨て、次の読み取りが開き直す。エラーの文字列は**定型文**（`読み取りがパニックしました`）で、パニックのメッセージ（切り出しに失敗した文字列など値が入りうる）はログに出さない（§3.1）。
 - 新しい依存（プールのcrate）は入れていない。
 - **P3で書き込みを足す構造**: 書き込みは単一の接続を専用スレッドに置き、チャネルで依頼を受ける（現行の「1接続＋グローバルロック」と同じ直列化）。`Catalog`に`writer`を足す形で、`read`のAPIは変えずに済む。今は作らない。
 
@@ -93,6 +96,7 @@ DBはWAL（Pythonが`journal_mode=WAL`にし、その状態がDBに残る）な�
 - リクエストログ: **メソッド・ルートのテンプレート・状態コード・所要時間（ミリ秒）**だけ。例: `GET /healthz 200 0ms`、`GET (unmatched) 404 0ms`。
   - ルートは`/derivatives/{*path}`のような**テンプレート**で出す。どのルートにも当たらないリクエストは`(unmatched)`。実際のパスとクエリは出さない。
   - 5xxはwarn、`/healthz`の成功はdebug、それ以外はinfo。
+- パニック: **場所（ソースのファイルと行）だけ**。メッセージは出さない（標準のパニック表示はstderrに値を書きうるので、`cli::serve`が`logging::init`の直後に`std::panic::set_hook`で置き換える。テスト`panic_hook.rs`）。
 - 起動・停止、待ち受けアドレス、データ置き場のパス、`Config`の要約（待ち受け・データ置き場・許可Host名の件数・ログの詳しさ・`TZ`）。
 - スキーマ不足の**列名**、件数、状態名、写真ID。
 - SQLiteなどが返したエラーメッセージ（**ログにだけ**。HTTP応答には載せない）。
@@ -106,7 +110,7 @@ DBはWAL（Pythonが`journal_mode=WAL`にし、その状態がDBに残る）な�
 - 秘密情報: 鍵ファイルの中身、トークン、`Authorization`などのヘッダ値。
 - 接続元アドレス、`Host`ヘッダの値、許可Host名の中身。
 
-テスト`access_log.rs`が、緯度経度らしいクエリ・ファイル名・Drive IDらしい値・接続元アドレス・`Host`値がログに出ないことを検査する（tracingは呼び出し箇所ごとに購読者の有無を最初に覚えるため、単独のテストファイルにしてある）。新しいログを足すときは、3.1に当てはまるかを先に確かめる。
+テスト`access_log.rs`が、緯度経度らしいクエリ・ファイル名・Drive IDらしい値・接続元アドレス・`Host`値がログに出ないことを検査する（購読者の切り替え──`set_default`はスレッドごと、`set_global_default`は1プロセス1回──が並行して走る他のテストと干渉しないよう、プロセスを分けた単独のテストファイルにしてある）。新しいログを足すときは、3.1に当てはまるかを先に確かめる。
 
 ### 3.3 応答にも載せない
 
@@ -121,6 +125,9 @@ DBはWAL（Pythonが`journal_mode=WAL`にし、その状態がDBに残る）な�
 | プロセスが動いていて、`photos`を1行読める（空のテーブルでも可） | 200 | `{"ok":true}` |
 | DBを読めない、または3秒以内に答えが返らない | 503 | `{"ok":false}` |
 
+- `/healthz`は**API用の4本とは別の専用の接続**で確かめる。API側の読み取りが4本を埋めていても、DBが正常なら待たされない（以前は同じプールの順番待ちを含めて3秒で打ち切っていたため、DBが正常でも混雑で503になりえた）。
+- 専用の接続の`busy_timeout`は2秒で、`/healthz`自身の上限3秒より短い。DBが詰まっていても、タイムアウトの前にSQLiteが`SQLITE_BUSY`で諦めて、503をこちらから返せる。
+
 - 本文は`ok`だけ。件数・パス・エラーの理由は載せない（理由はwarnログ）。`Cache-Control: no-store`を付ける。
 - 起動時のスキーマ検査は通っているので、ここで見るのは「その後も読めるか」。
 - P0の`{"ok":true}`との互換: 200のときの本文は同じ。
@@ -133,7 +140,17 @@ geoframe serve [--listen <addr:port>] [--data-dir <dir>]
 
 `--listen`は必須ではなくなった（環境変数と既定値で決まる）。`check-db`は従来どおり、スキーマの全項目を確かめず`photos`の行数だけを出す（古いDBの調査にも使えるように）。
 
-## 6. 確認の記録
+## 6. systemdで動かすときの注意
+
+unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分かっている注意を先に書いておく。
+
+- **設定不正の終了コード2で再起動ループしない**ようにする。設定の誤りは`Restart=on-failure`で直らないので、unitに`RestartPreventExitStatus=2`を書く（DBが開けない・スキーマ不足の終了コード1は、Pythonより先に起動した場合などで再試行に意味があるので、そのまま再起動してよい）。
+- **Pythonと並走するとき**（P1〜P4の検証）は、`ExecStart`に`--listen <addr:port>`を**書く**。`GEOFRAME_PORT`が`/etc/default/geoframe`にあってもPythonと同じ値になり、ポートが衝突するため。`--listen`は`GEOFRAME_HOST`/`GEOFRAME_PORT`より優先され、それらを読まない（§1.1）。
+- Rustも**`User=geoframe`で動かす**。WALのDBは読み取り専用でも`-shm`・`-wal`を触るので、ファイルの持ち主がPythonの実行ユーザーと違うと、片方が開けなくなる。
+- **P5で、`app/.env`にだけある`GEOFRAME_*`を`/etc/default/geoframe`と突き合わせる**。Rustは`app/.env`を読まない（§1.3）ので、`.env`にしか書かれていない値は、移すか、捨てる判断をする。
+- **DBファイルの入れ替え（バックアップからの復元など）にはRustの再起動が要る**（§2.4の注意）。
+
+## 7. 確認の記録
 
 - `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（合成した一時DBだけ。実データ・実在の位置は使わない）。
 - musl静的ビルド: `static-pie linked`、`ldd`は`statically linked`。追加した依存`tracing`・`tracing-subscriber`は純Rust（C依存なし）。

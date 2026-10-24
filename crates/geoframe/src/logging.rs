@@ -19,6 +19,9 @@
 //! - 認証情報・トークン・鍵ファイルの中身、`Authorization` などのヘッダ値
 //! - 接続元アドレス、`Host` ヘッダの値
 //!
+//! - パニック: メッセージは出さず、場所（ファイルと行）だけ（[`install_panic_hook`]）。
+//!   `spawn_blocking` のパニックの `JoinError` も定型文にしてある（[`crate::db`]）。
+//!
 //! 新しいログを足すときは、上の「出してよいもの」に当てはまるかを先に確かめる。
 
 use tracing::level_filters::LevelFilter;
@@ -50,4 +53,18 @@ where
 pub fn init(level: LogLevel) {
     tracing::subscriber::set_global_default(subscriber(level, std::io::stdout))
         .expect("ログの初期化は1回だけです");
+}
+
+/// パニックの標準の表示（stderr）を、場所だけを `tracing` に出すものに置き換える。
+///
+/// 標準の表示はパニックのメッセージを書き、そこには文字列の切り出しに失敗したときの文字列など、
+/// 値が入りうる。出すのは `info.location()`（ソースのファイルと行）だけで、メッセージは出さない。
+/// プロセスで1回、[`init`] のあとに呼ぶ。
+pub fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| match info.location() {
+        Some(location) => {
+            tracing::error!("パニックしました: {}:{}", location.file(), location.line())
+        }
+        None => tracing::error!("パニックしました"),
+    }));
 }

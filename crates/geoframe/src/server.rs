@@ -21,7 +21,9 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::db::Catalog;
 
-/// `/healthz` が DB の確認を待つ上限。超えたら不健康（503）として答える。
+/// `/healthz` が DB の確認を待つ上限。超えたら不健康（503）として答える。`/healthz` 専用の接続の
+/// `busy_timeout`（2 秒、`db.rs`）より長く、API の読み取りとは別の接続を使うので、API が混んで
+/// いても DB が正常なら間に合う。
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// ハンドラが共有する状態。複製は安い。

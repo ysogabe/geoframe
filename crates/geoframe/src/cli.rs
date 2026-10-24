@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::{Config, Overrides};
 use crate::db::Catalog;
@@ -42,11 +43,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 match arg.as_str() {
                     "--listen" => {
                         let value = args.next().ok_or("--listen に値が要ります")?;
-                        overrides.listen = Some(
-                            value
-                                .parse::<SocketAddr>()
-                                .map_err(|e| format!("--listen の値 {value:?} が不正です: {e}"))?,
-                        );
+                        // config.rs と同じく、不正な値そのものはメッセージに書かない
+                        overrides.listen = Some(value.parse::<SocketAddr>().map_err(
+                            |_| "--listen の値が不正です（<addr:port> の形で指定してください）",
+                        )?);
                     }
                     "--data-dir" => {
                         let value = args.next().ok_or("--data-dir に値が要ります")?;
@@ -99,6 +99,7 @@ fn serve(overrides: &Overrides) -> ExitCode {
         }
     };
     crate::logging::init(config.log_level);
+    crate::logging::install_panic_hook();
     tracing::info!(
         "geoframe {} を起動します: {}",
         env!("CARGO_PKG_VERSION"),
@@ -130,7 +131,10 @@ fn serve(overrides: &Overrides) -> ExitCode {
         config: Arc::new(config),
         catalog,
     };
-    match runtime.block_on(crate::server::serve(state)) {
+    let result = runtime.block_on(crate::server::serve(state));
+    // 固まった spawn_blocking（DB の読み取り）を待ち続けて、停止が終わらないことがないように
+    runtime.shutdown_timeout(Duration::from_secs(5));
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("サーバーが異常終了しました: {e}");
@@ -180,6 +184,9 @@ mod tests {
         assert!(p(&["check-db", "a", "b"]).is_err());
         assert!(p(&["serve", "--listen"]).is_err());
         assert!(p(&["serve", "--listen", "bad"]).is_err());
+        // 不正な値はエラーメッセージに書かない
+        let err = p(&["serve", "--listen", "secret-host:99999"]).unwrap_err();
+        assert!(!err.contains("secret-host"), "{err}");
         assert!(p(&["serve", "--data-dir"]).is_err());
         assert!(p(&["serve", "--port", "1"]).is_err());
     }
