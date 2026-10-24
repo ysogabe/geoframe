@@ -15,7 +15,13 @@
 //!
 //! 5・6 は、巨大・不正な `Content-Length`（`u64` を超える・数字でない・重複して値が違う・`+`付きなど）を
 //! axum/hyper が**この関数に届く前に**断るので、その入力は 3〜6 の順序・状態コード
-//! どおりにならない（431・400 で接続が閉じる）。Python が書く入力を断る向きの差だけで、書き込みは起きない。
+//! どおりにならない（431・400 で接続が閉じる）。これは Python が書く入力を断る向きの差で、書き込みは起きない。
+//! 逆向き（Python が断るのに Rust が書く）は 2 つ見つかり、どちらも書く前に断る:
+//! - hyper が通す先頭の `0` の長い表記（`0…037`）を、Python の `int()` は 4300 桁を超えると断る
+//!   （400）。[`content_length`] が同じ上限で 400 にする。
+//! - hyper の上限は現行 `http.server` より緩く、1 行 65536 バイト超・ヘッダ 100 個以上（現行は 431）、
+//!   要求行 65536 バイト超（現行は 414）を通す。[`head_limits`] が書く前に断る。
+//!
 //! server.md §17.1.1、試験は `tests/update_api.rs` の `content_length_boundaries_at_the_http_layer`。
 //!
 //! CORS ヘッダは一切返さない。`OPTIONS` は 501 のまま（プリフライトを失敗させる。CSRF 対策の一部）。
@@ -32,7 +38,7 @@
 //! 無ければ書かずに 503。writer の呼び出しはブロックするので、`spawn_blocking` に包む。
 
 use axum::body::Body;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::Response;
 use serde_json::{Map, Value};
 
@@ -193,12 +199,61 @@ fn csrf_check(headers: &HeaderMap) -> Result<(), Box<Response>> {
     Ok(())
 }
 
+/// Python の `int()` が文字列を数に直すときの桁数の上限（`sys.int_info.default_max_str_digits`。3.11 以降
+/// と、3.10.7・3.9.14・3.8.14・3.7.14 の既定）。符号・前後の空白・`_` は数えず、先頭の `0` は数える
+/// （`"0"*4301`＝`ValueError`、`"0"*4298 + "37"`＝通る）。超えると `ValueError` で、現行の `do_POST` は 400。
+const PYTHON_INT_MAX_DIGITS: usize = 4300;
+
 /// `Content-Length`。無い・数でない（hyper が弾く形以外では負数）なら `None`。
+///
+/// hyper は先頭の `0` の長い表記（`0…037`）を通すが、現行は `int()` の桁数の上限で 400 にする。書かずに
+/// 400 にしないと、Python が断る入力を Rust が書いてしまうので、ここで同じ上限を適用する。
 fn content_length(headers: &HeaderMap) -> Option<u64> {
-    first_header(headers, header::CONTENT_LENGTH)?
-        .trim()
-        .parse()
-        .ok()
+    let value = first_header(headers, header::CONTENT_LENGTH)?;
+    let value = value.trim();
+    if value.len() > PYTHON_INT_MAX_DIGITS {
+        return None;
+    }
+    value.parse().ok()
+}
+
+/// 現行 `http.server` が 1 行（要求行・ヘッダ 1 行。改行を含む）に許す長さ（`_MAXLINE`）。超えると要求行は 414、
+/// ヘッダは 431 で、`do_POST` に届かない。
+const PYTHON_MAX_LINE: usize = 65536;
+/// 現行 `http.client.parse_headers` が許すヘッダ行の数（`_MAXHEADERS` = 100 で、ヘッダの終わりの空行も数える
+/// ので、ヘッダは 99 個まで。100 個以上は 431）。
+const PYTHON_MAX_HEADERS: usize = 99;
+
+/// 現行が `do_POST` の前（行の読み込み）で断る大きさの要求を、`POST` が書く前に断る。hyper の既定の上限
+/// （head 全体 約 400 KiB・ヘッダ 100 個）は現行より緩く、現行が 414・431 にする要求を Rust が書いてしまうため。
+/// 見えるのは hyper が整えたあとの値なので、現行の長さは次のように見積もる（現行以上の長さにはならず、
+/// 現行より**厳しいことはあっても緩くはならない**向きの見積もり。ただし値の前後の空白と、hyper が捨てた
+/// 重複する `Content-Length` は見えず、その分だけは通る。server.md §17.1.1）。
+/// 要求行は `POST ` + 対象 + ` HTTP/1.1\r\n`、ヘッダは `名前: 値\r\n`。
+pub fn head_limits(uri: &Uri, headers: &HeaderMap) -> Option<Response> {
+    let target = uri.path_and_query().map_or(1, |pq| pq.as_str().len());
+    let too_large = |status, message: &str| {
+        // 現行は閉じる（HTTP/1.0）。未読の本文が残るので、接続を再利用させない
+        let mut response = error_response(status, message);
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("close"));
+        Some(response)
+    };
+    if "POST ".len() + target + " HTTP/1.1\r\n".len() > PYTHON_MAX_LINE {
+        return too_large(StatusCode::URI_TOO_LONG, "要求行が長すぎます");
+    }
+    if headers.len() > PYTHON_MAX_HEADERS
+        || headers
+            .iter()
+            .any(|(name, value)| name.as_str().len() + 2 + value.len() + 2 > PYTHON_MAX_LINE)
+    {
+        return too_large(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+            "ヘッダが大きすぎます",
+        );
+    }
+    None
 }
 
 /// 本文を読む前の検査（Content-Type・Origin・Content-Length・サイズ）。通れば本文の長さ。
@@ -264,4 +319,81 @@ pub async fn handle(state: &AppState, route: Route, headers: &HeaderMap, body: B
 
 fn json_syntax_error() -> Response {
     error_response(StatusCode::BAD_REQUEST, "JSONとして解釈できません")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn with_length(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+
+    /// Python の `int()` の桁数の上限（4300 桁）。先頭の `0` も数える。
+    #[test]
+    fn content_length_follows_pythons_int_digit_limit() {
+        let padded = |digits: usize| format!("{}37", "0".repeat(digits - 2));
+        assert_eq!(content_length(&with_length(&padded(4300))), Some(37));
+        assert_eq!(content_length(&with_length(&padded(4301))), None);
+        assert_eq!(content_length(&with_length(&padded(5000))), None);
+        assert_eq!(content_length(&with_length("37")), Some(37));
+        assert_eq!(content_length(&with_length("abc")), None);
+        assert_eq!(content_length(&HeaderMap::new()), None);
+    }
+
+    /// 4301 桁は、値が上限を超えていても 413 でなく 400（桁数の検査が先）。
+    #[test]
+    fn too_many_digits_is_400_even_when_the_value_is_over_the_limit() {
+        let over = format!("{}{}", "0".repeat(4301 - 5), MAX_POST_BYTES + 1);
+        let response = *pre_body_check(&{
+            let mut h = with_length(&over);
+            h.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            h
+        })
+        .unwrap_err();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn head_limits_match_the_line_and_header_limits_of_http_server() {
+        let ok: Uri = "/api/admin/setloc".parse().unwrap();
+        assert!(head_limits(&ok, &HeaderMap::new()).is_none());
+        // ヘッダ 99 個は通り、100 個は 431
+        let mut headers = HeaderMap::new();
+        for i in 0..99 {
+            let name = header::HeaderName::from_bytes(format!("x-{i}").as_bytes()).unwrap();
+            headers.insert(name, HeaderValue::from_static("1"));
+        }
+        assert!(head_limits(&ok, &headers).is_none());
+        headers.insert("x-99", HeaderValue::from_static("1"));
+        let response = head_limits(&ok, &headers).unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+        );
+        assert_eq!(response.headers()[header::CONNECTION], "close");
+        // 1 行（`名前: 値\r\n`）は 65536 バイトまで
+        let line = |value: usize| {
+            let mut h = HeaderMap::new();
+            h.insert("x-a", HeaderValue::from_str(&"a".repeat(value)).unwrap());
+            h
+        };
+        let room = PYTHON_MAX_LINE - "x-a: ".len() - 2;
+        assert!(head_limits(&ok, &line(room)).is_none());
+        assert!(head_limits(&ok, &line(room + 1)).is_some());
+        // 要求行（`POST 対象 HTTP/1.1\r\n`）も 65536 バイトまで
+        let room = PYTHON_MAX_LINE - "POST ".len() - " HTTP/1.1\r\n".len() - "/?".len();
+        let target = |n: usize| format!("/?{}", "a".repeat(n)).parse::<Uri>().unwrap();
+        assert!(head_limits(&target(room), &HeaderMap::new()).is_none());
+        let response = head_limits(&target(room + 1), &HeaderMap::new()).unwrap();
+        assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+    }
 }

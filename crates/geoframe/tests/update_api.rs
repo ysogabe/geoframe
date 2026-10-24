@@ -625,10 +625,12 @@ async fn probe(addr: std::net::SocketAddr, raw: &[u8]) -> Probe {
         .expect("応答もリセットも来ないまま止まった")
 }
 
-/// HTTP 層（axum/hyper）が `Content-Length` を先に検査して断る境界。`post.rs` に届く前なので、server.md
-/// §17.1 の表の順序・状態コードどおりにはならない。Python との差は**拒否の向きだけ**（Python が書く入力を
-/// Rust が断る）で、Rust が書いて Python が断る入力は無い。要求と Python の結果は、フィクスチャ
-/// （`http_*` ほか）から読む。値は固定した crates（hyper 1.x）の振る舞いで、上げたときはここが落ちて気づく。
+/// HTTP 層（axum/hyper）が `Content-Length` を先に検査して断る境界と、hyper が通すが Python が断る境界
+/// （`int()` の 4300 桁、`http.server` の 1 行 65536 バイト・ヘッダ 99 個）。前者は `post.rs` に届く前なので、
+/// server.md §17.1 の表の順序・状態コードどおりにはならないが、Python との差は**拒否の向きだけ**（Python が
+/// 書く入力を Rust が断る）。後者は `post.rs` が書く前に断り、Python と同じ状態コードになる（Rust が書いて
+/// Python が断る入力は、この表に無い）。要求と Python の結果は、フィクスチャ（`http_*` ほか）から読む。
+/// 値は固定した crates（hyper 1.x）の振る舞いで、上げたときはここが落ちて気づく。
 #[tokio::test]
 async fn content_length_boundaries_at_the_http_layer() {
     // (ケース名, Python の状態, Rust の状態, Rust が応答のあと接続を閉じる, Rust が書く)
@@ -652,6 +654,31 @@ async fn content_length_boundaries_at_the_http_layer() {
         ("http_cl_dup_first_ok_second_big", 200, 400, true, false),
         ("http_cl_dup_first_big_second_ok", 413, 400, true, false),
         ("http_cl_dup_second_over_limit", 200, 400, true, false),
+        // Python の int() が読む桁数の上限（4300 桁。符号・空白・_ は数えず、先頭の 0 は数える）。
+        // hyper は先頭の 0 の長い表記を通すので、post.rs が 4301 桁以上を 400 にする（書かない）
+        ("http_cl_zeros_4300", 200, 200, false, true),
+        ("http_cl_zeros_4301", 400, 400, false, false),
+        ("http_cl_zeros_4302", 400, 400, false, false),
+        // 桁数の検査は 413 より前（4301 桁なら、値が上限超過でも 413 でなく 400）。本文を送らない宣言だけの
+        // 要求は、400 でも本文が来ないので接続を閉じる
+        ("http_cl_zeros_4300_over_limit", 413, 413, true, false),
+        ("http_cl_zeros_4301_over_limit", 400, 400, true, false),
+        // 前後の空白・タブは hyper が取り除く。桁数には数えない
+        ("http_cl_spaces_zeros_4300", 200, 200, false, true),
+        ("http_cl_spaces_zeros_4301", 400, 400, false, false),
+        ("http_cl_tab_padded", 200, 200, false, true),
+        ("http_cl_plus_zeros_4301", 400, 400, true, false),
+        // 重複: hyper は最初の 1 つだけを残す（数値が同じなら通す）。Python も最初の値だけを使う
+        ("http_cl_dup_first_zeros_4301", 400, 400, false, false),
+        ("http_cl_dup_second_zeros_4301", 200, 200, false, true),
+        // 現行 http.server が行の読み込みで断る大きさ（1 行 65536 バイト・ヘッダ 99 個まで。要求行は 414、
+        // ヘッダは 431）。hyper の既定はもっと緩いので post.rs が断る。境界ちょうどは通る
+        ("http_hdr_line_at_limit", 200, 200, false, true),
+        ("http_hdr_line_over_limit", 431, 431, true, false),
+        ("http_hdr_count_at_limit", 200, 200, false, true),
+        ("http_hdr_count_over_limit", 431, 431, true, false),
+        ("http_line_at_limit", 200, 200, false, true),
+        ("http_line_over_limit", 414, 414, true, false),
         // Transfer-Encoding: chunked は、Content-Length が無い扱いで 400
         ("http_te_chunked_only", 400, 400, false, false),
         ("http_te_chunked_with_cl", 400, 400, true, false),
@@ -665,14 +692,18 @@ async fn content_length_boundaries_at_the_http_layer() {
             .find(|c| c["name"] == *name)
             .unwrap_or_else(|| panic!("{name} がフィクスチャに無い"));
         assert_eq!(case["status"], *py_status, "{name}: Python の結果");
-        // フィクスチャの要求をそのまま送る。ただし接続を保てるか見るので Connection: close は外す
+        // フィクスチャの要求をそのまま送る。ただし接続を保てるか見るので Connection: close は keep-alive に替える
         let mut raw =
             format!("POST {} HTTP/1.1\r\n", case["target"].as_str().unwrap()).into_bytes();
         for h in case["headers"].as_array().unwrap() {
             let (k, v) = (h[0].as_str().unwrap(), h[1].as_str().unwrap());
-            if !k.eq_ignore_ascii_case("connection") {
-                raw.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
-            }
+            // 行の数を変えないよう、外さずに keep-alive に替える（ヘッダの個数の境界を試すため）
+            let v = if k.eq_ignore_ascii_case("connection") {
+                "keep-alive"
+            } else {
+                v
+            };
+            raw.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
         }
         raw.extend_from_slice(b"\r\n");
         let hex = case["body_hex"].as_str().unwrap();

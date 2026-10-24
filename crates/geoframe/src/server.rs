@@ -420,7 +420,11 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
     let method = &parts.method;
     let raw = parts.uri.path();
     if *method == Method::POST {
-        // 入口の検査（`guard`）がルートの有無を済ませている
+        // 入口の検査（`guard`）がルートの有無を済ませている。現行は行の読み込みで断る大きさ（414・431）を、
+        // hyper の上限は緩いのでここで断る
+        if let Some(response) = post::head_limits(&parts.uri, &parts.headers) {
+            return response;
+        }
         return match post::route_of(raw) {
             Some(route) => labeled(
                 post::handle(&state, route, &parts.headers, body).await,

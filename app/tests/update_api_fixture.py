@@ -272,6 +272,40 @@ def _http_cases():
         headers=[("Content-Length", "99999"), ("Content-Length", str(n))])
     add("http_cl_dup_second_over_limit", 13, length=None,
         headers=[("Content-Length", str(n)), ("Content-Length", "70000")])
+    # Python の int() は 10 進の文字列を 4300 桁までしか読まない（sys.int_info.default_max_str_digits。
+    # 符号・前後の空白・_ は数えず、先頭の 0 は数える）。hyper は先頭の 0 の長い表記を通すので、
+    # 境界の前後を固定する（4301 桁以上は Python が 400。Rust が書いてはならない）
+    def padded(digits, value=n):
+        return "0" * (digits - len(str(value))) + str(value)
+
+    add("http_cl_zeros_4300", 16, length=padded(4300))
+    add("http_cl_zeros_4301", 17, length=padded(4301))
+    add("http_cl_zeros_4302", 18, length=padded(4302))
+    # 桁数の検査は 413（上限超過）の判定より前。4301 桁なら値が上限超過でも 413 でなく 400
+    add("http_cl_zeros_4300_over_limit", 19, length="declare:" + padded(4300, 65537))
+    add("http_cl_zeros_4301_over_limit", 20, length="declare:" + padded(4301, 65537))
+    # 前後の空白・タブ（hyper が取り除く。Python の int() も取り除く）は桁数に数えない
+    add("http_cl_spaces_zeros_4300", 21, length=" " + padded(4300) + " ")
+    add("http_cl_spaces_zeros_4301", 22, length=" " + padded(4301) + " ")
+    add("http_cl_tab_padded", 23, length="\t" + str(n) + "\t")
+    # 4301 桁以上は +付きでも Python が断る（hyper は + を先に断る）
+    add("http_cl_plus_zeros_4301", 24, length="+" + padded(4301))
+    # 重複: Python は最初の値だけを int() に渡す。hyper は重複を数値が同じなら通す
+    add("http_cl_dup_first_zeros_4301", 25, length=None,
+        headers=[("Content-Length", padded(4301)), ("Content-Length", str(n))])
+    add("http_cl_dup_second_zeros_4301", 26, length=None,
+        headers=[("Content-Length", str(n)), ("Content-Length", padded(4301))])
+    # HTTP 層の大きさの上限。Python（http.server）は 1 行 65536 バイト（改行を含む）・ヘッダ 100 個まで。
+    # 超えると 431（要求行は 414）。Rust（hyper）の既定の上限は別なので、境界の前後を固定する
+    add("http_hdr_line_at_limit", 27, headers=[("X-A", "a" * (65536 - len("X-A: ") - 2))])
+    add("http_hdr_line_over_limit", 28, headers=[("X-A", "a" * (65536 - len("X-A: ") - 1))])
+    add("http_hdr_count_at_limit", 29, headers=[(f"X-{i}", "1") for i in range(95)])
+    add("http_hdr_count_over_limit", 30, headers=[(f"X-{i}", "1") for i in range(96)])
+    # 要求行（"POST " + 対象 + " HTTP/1.1\r\n"）も 1 行 65536 バイトまで。超えると 414
+    for name, k, extra in (("http_line_at_limit", 31, 0), ("http_line_over_limit", 32, 1)):
+        room = 65536 - len("POST ") - len(" HTTP/1.1\r\n") - len(SETLOC) - len("?")
+        body = '{"id": 4, "lat": 50.%02d, "lon": 60.%02d}' % (k, k)
+        cases.append(case(name, SETLOC + "?" + "a" * (room + extra), body))
     return cases
 
 
@@ -298,7 +332,9 @@ KNOWN_DIFFERENCES = {
     "setflag_id_beyond_i64": "同上",
     "route_backslash": "パスの \\ : Python は / に読み替えて当たる、Rust は 403（より厳しい）",
     # HTTP 層（axum/hyper）が Content-Length を先に拒否する境界。どれも Rust は書き込まない（拒否の向きの差。
-    # server.md §17.1）。Python が書く（200）ケースもあるが、Rust が書いて Python が拒否するケースは無い
+    # server.md §17.1）。Python が書く（200）ケースもあるが、Rust が書いて Python が拒否するケースは、
+    # 4300 桁超の Content-Length（http_cl_zeros_*）と大きさの上限（http_hdr_*・http_line_*）で見つかり、
+    # Rust 側（post.rs）で断るようにした。ここに載せるのは Rust が書かないものだけ
     "http_cl_u64_max": "u64 の最大値: Python は 413、Rust は hyper が 431（本文を読まず接続を閉じる）",
     "http_cl_u64_max_plus1": "u64 を超える値: Python は 413、Rust は hyper が 400（本文なし）",
     "http_cl_not_digits": "数字でない Content-Length: 状態コードは 400 で同じ。Rust は hyper が先に断り本文が定型 JSON でない",
@@ -311,6 +347,7 @@ KNOWN_DIFFERENCES = {
     "http_cl_dup_first_ok_second_big": "重複して後ろが違う値: Python は最初の値で 200、Rust は hyper が 400",
     "http_cl_dup_first_big_second_ok": "重複して最初が巨大: Python は 413、Rust は hyper が 400",
     "http_cl_dup_second_over_limit": "重複して後ろが上限超過: Python は最初の値で 200、Rust は hyper が 400",
+    "http_cl_plus_zeros_4301": "+付きで 4301 桁の Content-Length: 状態コードは 400 で同じ（Python は桁数の上限で、Rust は hyper が + を先に断る）。Rust は本文が定型 JSON でない",
     "http_te_chunked_with_cl": "Transfer-Encoding: chunked と Content-Length の併記: 400 で同じ。Python は CL の長さで読んで JSON として解釈できず、Rust は Content-Length が無い扱い（文面が違う）",
 }
 
