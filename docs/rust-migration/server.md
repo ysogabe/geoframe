@@ -1408,6 +1408,13 @@ T2.4の`net.rs`の`Failure`（§14.3の表）に合わせる。`Failure::is_outa
 | (e) | 本番コピーで`geoframe sync --dry-run` | `infer: inferred=0 updated=0 unchanged=2162 cancelled=0`、`enrich: candidates=0 foreign=0 cache_hit=0 would_query=0 unresolved=0 pending=0`。(a)と同じ |
 | (f) | 本番コピーの**コピー**（別のデータ置き場）で、地名の5列をNULLにした13行（国内8・国外5）に実サイクル（`GEOFRAME_INGEST=1 geoframe sync`）を流す | `enrich: candidates=13 foreign=5 cache_hit=5 queried=3 resolved=3 unresolved=0 deferred=0`（実際の地理院へ3座標。残りの国内5行は、同じキーのキャッシュに当たったと見られる）。13行の地名の5列のハッシュが、壊す前と**一致**。本番コピーの`.dump`のSHA-256は配布の前後で変わらない（検証用のコピーとバックアップは消した） |
 
+**2回目のレビュー指摘の修正後（コミット`60c5de7`）の再確認**: 同じ検証環境に`rust-deploy.sh`で配布した（`/healthz` 200、`GEOFRAME_INGEST`なしのまま）。検証環境の本番コピーは触らず、`catalog.db`のコピーを別の一時ディレクトリに作って確かめた（コピーは確認後に消した）。座標・地名は書かない（件数だけ）。
+
+| # | 確認 | 結果 |
+| --- | --- | --- |
+| (g) | 本番コピーのコピーで`geoframe sync --dry-run` | `infer: inferred=0 updated=0 unchanged=2162 cancelled=0`、`enrich: candidates=0 foreign=0 cache_hit=0 would_query=0 unresolved=0 skipped_backoff=0 skipped_blocked=0 unusable=0 pending=0`、サイクルは28 ms。**以前どおり0**（新しい件数`skipped_blocked`が増えた） |
+| (h) | 本番コピーのコピーで、地名の5列をNULLにした13行（国内8・国外5）に実サイクル（`GEOFRAME_INGEST=1 geoframe sync`）を流す | `enrich: candidates=13 foreign=5 cache_hit=5 queried=3 resolved=3 unresolved=0 deferred=0 skipped_backoff=0 skipped_blocked=0 out_of_time=0`（実際の地理院へ3座標。サイクルは2.1秒）。13行の地名の5列が、壊す前と**一致** |
+
 ### 15.9 テスト
 
 | 対象 | テスト |
