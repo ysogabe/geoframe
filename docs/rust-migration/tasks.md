@@ -1,7 +1,7 @@
 # Rust単一バイナリ化 タスク
 
 - 要求: [Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 設計: [設計案](../architecture/rust-api-and-ai-providers-proposal.md) / 計画: [plan.md](plan.md)
-- ブランチ: ローカルはT3の`t3/issue-54-implementation-plan`のまま、リモートはフェーズごとに分ける（P0は同名で PR #57、squash merge 済み。P1は`feat/rust-migration-p1`へpush）
+- ブランチ: ローカルはT3の`t3/issue-54-implementation-plan`のまま、リモートはフェーズごとに分ける（P0は同名で PR #57、P1は`feat/rust-migration-p1`で PR #58、どちらも squash merge 済み。P2は`feat/rust-migration-p2`へpush）
 - PRはフェーズごとに1つ。P2以降のタスクは、そのフェーズの開始時に細かく分け直す。
 - 種類: `ops`は自分で行う運用作業、`quick`/`full`はビルドのスキルに任せる実装。
 
@@ -18,7 +18,7 @@ AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ�
 | T0.5 | `/api/v1/photos`のserde型・JSON Schema・合成DBの契約テスト | AC6, AC7 | T0.3 | full | 完了 | 79d45d9 | e8598d0..6badbde | レビュー（Sol）2回: 1回目 必須2（実在地名、Pythonの`$`）・推奨2・参考1をすべて反映、2回目 指摘なし。本番コピーに`taken_at` NULLの行は無い |
 | T0.6 | 全体レビューの指摘の反映: miharashiとの共有の整理、設計案レビューの記録、未決事項の更新、PoC crateの扱い | AC5, AC6 | T0.1〜T0.5 | quick | 完了 | 51fc0b6 | 51fc0b6..d3f0ac4＋管理者の文書修正 | P0全体レビュー（要求との突き合わせ、Solが利用上限のためOpusで代替）2回: 1回目 必須1・推奨6、2回目 必須0（推奨2・参考2を管理者が反映、P1受入に実クライアント確認を明記）。security-review: High/Medium 0、AC7でIPの記載を指摘→51fc0b6で削除 |
 
-## P1: Rust API基盤
+## P1: Rust API基盤（PR #58、2026-10-24 マージ）
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
@@ -29,11 +29,33 @@ AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ�
 | T1.5 | systemd unit、検証環境への配布スクリプト、Pythonとの全件比較スクリプト、miharashiの実プロセスでの取得確認 | AC1, AC5, AC6 | T1.2, T1.3 | full | 完了 | 56e0665 | 355ba86..2a0c7e5 | 検証環境で常駐（geoframe-rs.service）。全件比較の想定外の差0（写真一覧3,065件を型まで一致、画像3,065件バイト一致、管理API 222通り）。miharashiの実バイナリ（png --renderer cpu 60/60）とFeedで取得・デコード失敗0。障害試験・ロールバック・誤配布の拒否を確認。レビュー（Sol）4回: 必須 4→3→1→0（配布スクリプトの失敗時の復元、比較の判定の厳密化、本番への誤配布の防止）、修正3回 |
 | T1.6 | P1全体レビューの推奨の反映: 書き込み層の担当フェーズ（P2で取り込み用writer、P3で更新API）の統一、Pythonとの差の索引、miharashi確認ツールの判定 | AC1, AC6 | T1.1〜T1.5 | quick | 完了 | 3d29b2e | e745ed3..22903d3 | P1全体レビュー（要求との突き合わせ、Sol）: 必須0・推奨3。security-review: High/Medium 0、参考1（ツールの.gitignore）は3d29b2eで対応。レビュー（Opus）: 必須0、推奨2（確認ツールは`Feed::spawn`の経路で`photo:`を出さないので数える仕組みを外しRetryingで判定、`lon` NULLの行は本番コピーで差0）・参考4を反映。直したツールで検証環境の定常200枚・停止再開300枚とも終了コード0（管理者確認） |
 
-## P2〜P5（開始時に分け直す）
+## P2: 写真取り込み
+
+開始時の調査（件数のみ）: 本番コピーの`photos`は全6,535行が`source='drive'`で、ローカルの`photos/`は空。HEICは1,735行（すべてDrive）。国外（日本のおおよその矩形の外）で位置のある1,267行は`place`がすべて空で、オフライン逆ジオコーダは本番に入っていない（Rustも入れず「空で確定」にする）。
+
+P2で守ること（各タスクの委任文に入れる）:
+- **本番コピーでの冪等性が受入の関門**: 取り込み済みの本番コピーに対してRustの1サイクルを回しても、行の変更・derivativeの再取得はほぼ0であること。確かめるため、同期サイクルに書き込まない計画だけのモード（`--dry-run`）を作る。
+- **M1の罠**（[inventory.md §2.4](inventory.md)）: 空DBから作るスキーマにはALTERで足された列をすべて含める。既存DBへの移行は何もしないことを示す（`place=NULL`で全行の再enrichを起こさない）。
+- 時刻の形式（`taken_at`は`YYYY-MM-DD HH:MM`、`indexed_at`/`fetched_at`はオフセット無し、`analyzed_at`は`+09:00`付き）、差分はnaiveな日時で取る（[inventory.md §6.1](inventory.md)）。
+- ログにファイル名・座標・Driveのファイル名・例外文字列を出さない。`.cache.json`は位置を含むのでリポジトリ・テストに入れない（[inventory.md §6.3](inventory.md)）。
+- テストではDrive・GSI・Nominatimをスタブにする。実際の通信は検証環境の受入だけ。
+- 手動GPS・お気に入りが消える経路（[inventory.md §2.3](inventory.md)）はP2ではPythonと同じにし、Pythonとの差の候補として[server.md §0](server.md)に載せる。直すかはP3（更新APIのフェーズ）で決める。
+- writerを本番の`catalog.db`へ向けない: 配布スクリプトの検証環境の印と本番への誤配布の拒否を維持する。
+
+| ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
+|---|---|---|---|---|---|---|---|---|
+| T2.1 | 書き込みの土台: musl静的のまま外向きHTTPS（rustls・DNS）とサービスアカウントのJWT（RS256）が動くことの確認（検証環境からGSIへ1件）、writer（単一接続・専用スレッド・チャネル）、空DBからのスキーマ作成と既存DBへの移行（M0〜M7相当、何もしないことのテスト）、同期サイクルの骨組み（`GEOFRAME_DRIVE_POLL_MIN`、段ごとの失敗の隔離、`--dry-run`）、起動時の掃除（`tmp/`・`.dl_*`）、`.cache.json`の読み込み・旧キー破棄・保存（`geo:`を引き継ぐ）、unitの`ReadOnlyPaths`の解除 | AC1, AC5 | P1 | full | 未着手 | | | 最初にHTTPSとJWTを確かめる。だめならP2の通信の作りを変える（[build.md](build.md)の「DNSを入れる段階で見直す」） |
+| T2.2 | 画像処理の本実装: PoCからderivative生成（EXIFの向き→手動回転→長辺2560→JPEG q85、`.part`経由、回転後は別名）、EXIF（撮影時刻・GPS）、HEIC（zune-heic）を`crates/geoframe`へ移し、`crates/geoframe-imgpoc`とCIのPoCジョブを消す。実機iPhoneのHEIC（グリッド・HDR等）の確認 | AC5, AC7 | T2.1 | full | 未着手 | | | 実機HEICはDriveにしかない（1,735行）。Drive鍵の扱い次第で確認の方法が変わる |
+| T2.3 | ローカルの索引: `index_local`（追加・更新・削除、`gdrive`を含むパスの除外）、`local_derivatives`、`--organize` | AC2 | T2.1, T2.2 | full | 未着手 | | | 棚卸しS1 |
+| T2.4 | Driveの索引: 認証（`drive.readonly`）、フォルダの解決（名前かID）、`files.list`のページ送りと`imageMediaMetadata`、追加・更新・削除の規則（Pythonと同じ）、`fetch_derivatives`（`tmp/.dl_*`経由、失敗でも原本を残さない、`GEOFRAME_FETCH_PER_CYCLE`）。スタブのDrive APIでのテスト | AC2, AC7 | T2.1, T2.2 | full | 未着手 | | | 棚卸しS2。本番コピーでの冪等性（再取得0）を`--dry-run`で確かめる |
+| T2.5 | 位置の推定と地名: `infer_locations`（段階窓・`GEOFRAME_INFER_OFFSET_MIN`・錨が消えたときの取り消し）、`enrich_rows`（GSIの逆ジオ・標高・`muni.js`、1サイクル40件、0.2秒待ち、応答が空なら空で確定、国外は空で確定） | AC2 | T2.1 | full | 未着手 | | | 棚卸しS3 |
+| T2.6 | 簡易品質: 特徴量（SHA-256・pHash・鮮明度・露出）、孤児の削除、全員分そろってからの再グルーピング（完全重複・3分以内かつpHash距離12以下）、`BEGIN IMMEDIATE`での全差し替え、`--quality-scan` | AC2 | T2.1, T2.2 | full | 未着手 | | | 棚卸しS7。旧スコアとの一致は不要、同じ入力で同じ結果 |
+| T2.7 | 検証環境での受入: 本番コピーでの`--dry-run`（変更ほぼ0）と実サイクル、同じ写真を比較用PythonとRustへ入れて`photos`の列ごとの比較、棚卸しS1・S2・S3・S7、miharashiでの表示の継続、結果を`p2-acceptance.md`へ | AC1, AC2, AC5 | T2.3〜T2.6 | full | 未着手 | | | |
+
+## P3〜P5（開始時に分け直す）
 
 | ID | 内容 | AC | 種類 | 状態 |
 |---|---|---|---|---|
-| P2 | 写真取り込み（ローカル・Drive索引、derivative、EXIF、位置推定、逆ジオコーダ、簡易品質） | AC2, AC5 | full | 未着手 |
 | P3 | 管理機能（手動GPS・お気に入り・除外・回転・地名検索・タイル・旅行ブログ・更新APIのCSRF対策） | AC1, AC2 | full | 未着手 |
 | P4 | AI Provider・永続ジョブ・Embeddingインデックス・位置候補・同一場面・AI検索 | AC2, AC3, AC4, AC7 | full | 未着手 |
 | P5 | バックアップ・復元演習、シャドー比較、本番切替、ロールバック演習、Python依存の撤去 | AC1, AC2, AC5 | full | 未着手 |
