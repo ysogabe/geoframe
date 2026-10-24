@@ -1397,6 +1397,13 @@ T2.4の`net.rs`の`Failure`（§14.3の表）に合わせる。`Failure::is_outa
 | (c) | `.cache.json`（検証環境には元々無かった） | `geo:`13件＋`muni_table`。実物の`muni.js`を、Pythonの正規表現とRustの手書きの解析に通した表が**1,919件で完全に一致** |
 | (d) | 後始末 | `.cache.json`とバックアップを消した（`.dump`のSHA-256は(b)の後のまま一致）。`geoframe-rs`は`GEOFRAME_INGEST`なしのまま稼働、`/healthz` 200、`/api/v1/photos` 3,065件 |
 
+**レビュー指摘の修正後（コミット`efd3dd5`）の再確認**: 同じ検証環境に`rust-deploy.sh`で配布した（`/healthz` 200、`/api/v1/photos`は3,065件、`GEOFRAME_INGEST`なしのまま）。座標・地名は書かない（件数とハッシュだけ）。
+
+| # | 確認 | 結果 |
+| --- | --- | --- |
+| (e) | 本番コピーで`geoframe sync --dry-run` | `infer: inferred=0 updated=0 unchanged=2162 cancelled=0`、`enrich: candidates=0 foreign=0 cache_hit=0 would_query=0 unresolved=0 pending=0`。(a)と同じ |
+| (f) | 本番コピーの**コピー**（別のデータ置き場）で、地名の5列をNULLにした13行（国内8・国外5）に実サイクル（`GEOFRAME_INGEST=1 geoframe sync`）を流す | `enrich: candidates=13 foreign=5 cache_hit=5 queried=3 resolved=3 unresolved=0 deferred=0`（実際の地理院へ3座標。残りの国内5行は、同じキーのキャッシュに当たったと見られる）。13行の地名の5列のハッシュが、壊す前と**一致**。本番コピーの`.dump`のSHA-256は配布の前後で変わらない（検証用のコピーとバックアップは消した） |
+
 ### 15.9 テスト
 
 | 対象 | テスト |
