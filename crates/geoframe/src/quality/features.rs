@@ -90,7 +90,7 @@ fn fit_box(width: u32, height: u32) -> (f64, f64, f64, f64) {
     } else if ratio >= 1.0 {
         (h, h)
     } else {
-        (w, w / 1.0)
+        (w, w)
     };
     ((w - crop_w) * 0.5, (h - crop_h) * 0.5, crop_w, crop_h)
 }

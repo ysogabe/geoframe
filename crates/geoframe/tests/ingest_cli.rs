@@ -330,6 +330,19 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     // 国外の 1 件は `enrich` が空で確定した（NULL でなくなる）。位置の無い行だけが残る。
     // 移行が再 enrich の印（`place=NULL`）を増やしていないことは、スキーマの確認（上）で見ている
     assert_eq!(null_places, 1);
+    // `quality` の段（T2.6）は、`display` があるのにファイルの無い行 `a` を解析して、失敗の行を 1 つ書く
+    // （`photos` の行は変えない）。次のサイクルから再解析しない。グループは無いので `photo_quality` は空
+    let failed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM photo_quality_features WHERE error!='' AND content_sha256 IS NULL",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let grouped: i64 = conn
+        .query_row("SELECT COUNT(*) FROM photo_quality", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!((failed, grouped), (1, 0));
 }
 
 fn free_port() -> u16 {
