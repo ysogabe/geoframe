@@ -2,3 +2,7 @@
 /vendor/
 /Cargo.lock
 /target/
+
+# 設定の写し（接続先を書くので Git に入れない。見本の *.toml.example だけを追跡する）
+/*.toml
+!/Cargo.toml
