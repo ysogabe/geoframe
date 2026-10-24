@@ -1910,11 +1910,12 @@ fn 段の経過時間の上限で打ち切り_残りは次のサイクルへ回�
     let s = setup("geo-enrich-budget");
     let stub = StubGsi::start();
     tokyo_replies(&stub);
-    // 2 行目（緯度 37）の標高だけが 350 ms かかる。上限は 300 ms: 2 行目は最初の要求を始めた時点では上限の内側なので
-    // 確定し、その次の 3 行目を始める前に上限を過ぎている。
+    // 2 行目（緯度 37）の標高だけが 600 ms かかる。上限は 500 ms: 2 行目は最初の要求を始めた時点では上限の内側なので
+    // 確定し、その次の 3 行目を始める前に上限を過ぎている。遅い環境でも 1 行目・2 行目が上限の内側で始まるよう、
+    // 上限は待ちに対して余裕を持たせる。
     stub.set_elev(|lat, _| {
         if (lat - 37.0).abs() < 0.01 {
-            std::thread::sleep(Duration::from_millis(350));
+            std::thread::sleep(Duration::from_millis(600));
         }
         Reply::json(r#"{"elevation":12.5}"#)
     });
@@ -1927,7 +1928,7 @@ fn 段の経過時間の上限で打ち切り_残りは次のサイクルへ回�
         photo(5, None, Some((-33.0, 151.0)), Some("exif")),   // 国外・別のキー: 済ませる
         photo(6, None, Some((38.0, 138.0)), Some("exif")),    // 上限のあと: 始めない
     ));
-    let enrich = enrich_with_long_backoff(&stub).with_budget(Duration::from_millis(300));
+    let enrich = enrich_with_long_backoff(&stub).with_budget(Duration::from_millis(500));
     let started = std::time::Instant::now();
     let first = s.run(&enrich); // Ok: 失敗にしない
     let took = started.elapsed();
@@ -1960,8 +1961,10 @@ fn 段の経過時間の上限で打ち切り_残りは次のサイクルへ回�
         get(&first, "resolved") + get(&first, "unresolved")
     );
     // 応答が戻り、同じ `Enrich`（長いバックオフ）で直ちに次のサイクル: 時間切れの行は記憶に入っていないので飛ばされず、
-    // 現行と同じ順の結果になる
+    // 現行と同じ順の結果になる。ここで見たいのは記憶なので、2 回目は上限に当たらないようにする（`with_budget` は
+    // 失敗の記憶を持ったまま上限だけを替える。遅い環境で 2 回目まで打ち切られて不安定になるのを避ける）
     stub.set_elev(|_, _| Reply::json(r#"{"elevation":12.5}"#));
+    let enrich = enrich.with_budget(Duration::from_secs(3600));
     let second = s.run(&enrich);
     assert_eq!(get(&second, "skipped_backoff"), 0);
     assert_eq!(get(&second, "skipped_blocked"), 0);
@@ -1979,12 +1982,12 @@ fn 上限のあとは再試行に進まない() {
     let stub = StubGsi::start();
     tokyo_replies(&stub);
     stub.set_rgeo(|_, _| {
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(600));
         Reply::Status(503)
     });
     s.sql(&domestic_rows(1));
-    // 1 回目の要求の終わりで上限を過ぎている
-    let enrich = enrich_with_long_backoff(&stub).with_budget(Duration::from_millis(100));
+    // 1 回目の要求の終わりで上限を過ぎている（遅い環境でも要求を始める前には上限に達しないよう、待ちに対して余裕を持たせる）
+    let enrich = enrich_with_long_backoff(&stub).with_budget(Duration::from_millis(400));
     // 上限が先に見られる行頭ではなく、要求の最中に上限に達するように、1 行目だけは始める
     let counts = s.run(&enrich);
     assert_eq!(get(&counts, "out_of_time"), 1);
@@ -1994,6 +1997,7 @@ fn 上限のあとは再試行に進まない() {
     assert_eq!(s.row(1)["place"], Value::Null);
     // 記憶に入っていないので、同じ `Enrich` の次のサイクルは待たずに試し、確定する
     tokyo_replies(&stub);
+    let enrich = enrich.with_budget(Duration::from_secs(3600)); // 2 回目は上限に当たらない（記憶は引き継ぐ）
     let counts = s.run(&enrich);
     assert_eq!(get(&counts, "skipped_backoff"), 0);
     assert_eq!(get(&counts, "out_of_time"), 0);
