@@ -10,7 +10,8 @@
 //!
 //! 停止と再開（再接続の確認）: `--stop-cmd` を `--stop-after` 秒後に、`--start-cmd` を、その `--resume-after` 秒後に
 //! `sh -c` で実行する。止めている間は `Retrying`（指数バックオフ）、戻したあとは `Online` が届き、自動で
-//! 続きを読み込むはず。コマンドの中身（検証環境への ssh など）は呼び出し側が決める。
+//! 続きを読み込むはず。停止したあとは、件数に届いても時間切れでも、終了前に必ず再開コマンドを実行する
+//! （停止したままにしない。失敗は終了コードに反映する）。コマンドの中身（検証環境への ssh など）は呼び出し側が決める。
 //!
 //! photos.rs・album.rs は miharashi-app のソースをそのまま取り込む（`vendor/miharashi` は setup.sh が張るリンク）。
 //! 下の `screen`・`video`・`config`・`home` は、それらが参照する型だけの代役で、描画や取得の動作には関わらない。
@@ -200,6 +201,12 @@ fn main() {
             Some(FeedEvent::Status(FeedStatus::Online)) => online += 1,
             None => std::thread::sleep(Duration::from_millis(20)),
         }
+    }
+
+    // 停止したまま終わらない: 件数に届いた・時間切れが再開の時刻より前でも、止めたサービスは戻す
+    if let (Some(_), None, Some(start)) = (stopped_at, started_at, &a.start_cmd) {
+        eprintln!("[feed-check] {}s: 終了前に再開コマンドを実行", t0.elapsed().as_secs());
+        cmd_failed |= !sh(start);
     }
 
     println!("読み込み: 写真 {photos} 枚、旅・季節のカード {cards} 枚（計 {shown} / 目標 {}）", a.count);

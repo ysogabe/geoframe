@@ -7,7 +7,8 @@
 # ユーザーの立ち会いのもとで行う。本番機（Python 版 geoframe-server が動いている機体）へは
 # 実行しないこと。接続先に既定値は無い（--target か GEOFRAME_SSH_TARGET で必ず指定）。
 # 誤配布を止めるため、接続先に検証環境の印（/etc/geoframe/staging）が無いか、Python 版
-# （geoframe-server.service）が稼働中なら、何も変更せずに拒否する。
+# （geoframe-server.service）が非稼働と確認できなければ（稼働中・状態を取得できない場合も）、
+# 何も変更せずに拒否する。
 #
 # deploy.sh（Python 版。本番機で git を取り込む薄いラッパー）とは別物で、こちらはバイナリを
 # 手元でビルドして送る。やること:
@@ -68,13 +69,17 @@ unit も同じく /etc/systemd/system/geoframe-rs.service.prev に残す。
 状態へ戻す（バイナリ・unit・enable・稼働の状態）。初回の配布なら、止めて disable し、新しく入れた
 unit とバイナリ（geoframe.failed へ退避）を撤去する。
 
+復元の最中は中断（SIGHUP・SIGINT・SIGTERM。ssh の切断）を無視し、復元が終わってから終了する（終了コードは復元の結果）。
+復元で止める操作は、stop の成功と、inactive/failed の確認の両方が要る（確認できなければ終了コード 3）。
+
 終了コード: 0 成功 / 1 失敗したが配布前の状態へ戻した / 3 戻す途中で失敗した（手作業の復旧が要る。
             手順が表示される）/ 4 誤配布の防止のため拒否した（何も変更していない）/ 2 引数の誤り。
 
 誤配布の防止（変更の前に検査。--rollback も同じ）:
   - 接続先に検証環境の印 /etc/geoframe/staging（通常ファイル）があること。
     検証環境で一度だけ作る:  sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging
-  - geoframe-server.service（Python 版）が稼働中でないこと。
+  - geoframe-server.service（Python 版）が inactive/failed、または unit が存在しないと確認できること
+    （稼働中・状態を取得できない・空出力・未知の状態は拒否）。
   本番の切替は P5 で、専用の手順と明示的なフラグをそのとき作る（このスクリプトは本番に配れない）。
 
 本番機には実行しないこと（本番の切替は P5）。
@@ -104,10 +109,22 @@ mode="" bin="" base="" wait_secs="" stage="" unit_path=""
 # 配布前の状態と、どこまで変更したか（失敗時の復元に使う）
 had_bin=0 had_unit=0 was_enabled="" was_active=""
 m_bin=0 m_unit=0 m_enable=0
-phase="idle"       # idle → mutating（変更を始めた。完了か復元で idle へ戻る）
+phase="idle"       # idle → mutating（変更を始めた。完了か復元で idle へ戻る）→ restoring（復元の最中）
 fail_step=""
 
 say() { echo "[remote] $*"; }
+
+# unit の LoadState と ActiveState を取る（u_load・u_active に入れる）。取得できない（systemd に繋がらない・
+# 空出力）なら非ゼロ。unit が存在しないときは systemd が LoadState=not-found を返すので、それとは区別できる。
+u_load="" u_active=""
+unit_state() {
+    local out
+    u_load="" u_active=""
+    out="$(systemctl show --property=LoadState,ActiveState "$1" 2>/dev/null)" || return 1
+    u_load="$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p' | head -n 1)"
+    u_active="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p' | head -n 1)"
+    [ -n "$u_load" ] && [ -n "$u_active" ]
+}
 
 # 誤配布の防止。変更の前に必ず通す。
 preflight() {
@@ -116,14 +133,24 @@ preflight() {
         say "      検証環境なら、一度だけ  install -d /etc/geoframe && touch ${marker}  を実行する"
         return 4
     fi
-    local st
-    st="$(systemctl is-active "$py_unit" 2>/dev/null)" || true
-    case "$st" in
+    # Python 版は『非稼働と確認できた』ときだけ通す。状態を取得できない（systemd に繋がらない・空出力）や
+    # 未知の状態を非稼働とみなして通すと、本番機へ配れてしまう。
+    if ! unit_state "$py_unit"; then
+        say "拒否: Python 版（${py_unit}）の状態を取得できない。非稼働と確認できないので何も変更していない"
+        return 4
+    fi
+    if [ "$u_load" = not-found ]; then
+        return 0   # unit が存在しない（Python 版が入っていない機体）
+    fi
+    case "$u_active" in
+        inactive|failed) return 0 ;;
         active|activating|reloading|deactivating)
-            say "拒否: Python 版（${py_unit}）が稼働中（${st}）。本番機の可能性がある。何も変更していない"
+            say "拒否: Python 版（${py_unit}）が稼働中（${u_active}）。本番機の可能性がある。何も変更していない"
+            return 4 ;;
+        *)
+            say "拒否: Python 版（${py_unit}）の状態が不明（${u_active}）。非稼働と確認できないので何も変更していない"
             return 4 ;;
     esac
-    return 0
 }
 
 # /healthz が 200 で、/api/v1/photos が JSON 配列（先頭が [）で返ること。
@@ -149,10 +176,18 @@ service_restart() {
     systemctl restart "$unit_name"
 }
 
-# 止まっていること（unit がまだ無くて stop が失敗しても、動いていなければ成功）
+# 止まったと確認できること。stop の成功は必須で、失敗を許すのは unit が存在しない（LoadState=not-found）
+# ときだけ。そのうえで状態が inactive か failed と確認できなければ失敗（activating・deactivating や、
+# 状態を取得できない場合を『止まった』とみなさない）。
 service_stop() {
-    systemctl stop "$unit_name" >/dev/null 2>&1 || true
-    ! systemctl is-active --quiet "$unit_name" 2>/dev/null
+    local stopped=1
+    systemctl stop "$unit_name" >/dev/null 2>&1 || stopped=0
+    unit_state "$unit_name" || return 1
+    if [ "$stopped" = 0 ] && [ "$u_load" != not-found ]; then return 1; fi
+    case "$u_active" in
+        inactive|failed) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 fail() { fail_step="$*"; say "失敗: $*"; }
@@ -221,10 +256,25 @@ restore() {
     return 0
 }
 
+# 復元の最中は中断（SIGHUP・SIGINT・SIGTERM。ssh の切断も）と SIGPIPE を無視する。復元の途中で終了すると、
+# 新版のバイナリ・unit が残ったままサービスが止まり、復旧手順も出ない。無視は子プロセス（systemctl など）にも
+# 引き継がれるので、プロセスグループへ送られた中断で復元中のコマンドが落ちることもない。復元が終わってから
+# 終了する（終了コードは復元の結果。SIGKILL だけは防げない）。
+protect_restore() {
+    phase="restoring"
+    trap '' HUP INT TERM PIPE
+}
+
 # 変更を始めたあとの失敗（確認の失敗・各操作の失敗・中断）から、配布前の状態へ戻す。
 # 戻せたら 1、戻す途中で失敗したら 3 を返す。
 recover_deploy() {
+    local rc
+    protect_restore
+    recover_body && rc=0 || rc=$?
     phase="idle"
+    return "$rc"
+}
+recover_body() {
     say "配布前の状態へ戻す"
     journalctl -u "$unit_name" -n 15 --no-pager -o cat 2>/dev/null | sed 's/^/[remote:journal] /' || true
     r_bin=keep r_unit=keep r_disable=0 r_service=keep
@@ -258,13 +308,20 @@ recover_deploy() {
 
 # 中断（ssh の切断・SIGTERM など）や想定外の終了で、変更の途中のまま抜けるときの後始末。
 on_exit() {
-    local rc=$?
+    local rc=$? ph="$phase"
+    # 変更の途中なら、復元に入る前に中断を無視する（この関数の先頭で次の中断に当たると復元が飛ぶ）
+    if [ "$ph" = mutating ]; then protect_restore; fi
     trap - EXIT
     if [ "$mode" = deploy ]; then rm -f "${bin}.new" "${bin}.prev.tmp" "${unit_path}.prev.tmp" 2>/dev/null || true; fi
-    if [ "$phase" = mutating ]; then
+    if [ "$ph" = mutating ]; then
         say "変更の途中で終了した（rc=${rc}）"
         recover_deploy
         rc=$?
+    elif [ "$ph" = restoring ]; then
+        # 復元の最中に想定外の終了（exit・未定義変数の参照など）。復元を入れ子にせず、手作業の手順を出す
+        fail "復元の最中に想定外の終了（rc=${rc}）"
+        manual_hint
+        rc=3
     fi
     exit "$rc"
 }
@@ -325,6 +382,13 @@ do_deploy() {
 do_rollback() {
     preflight || return $?
     [ -f "${bin}.prev" ] || { say "${bin}.prev が無い"; return 1; }
+    local rc
+    protect_restore
+    rollback_body && rc=0 || rc=$?
+    phase="idle"
+    return "$rc"
+}
+rollback_body() {
     r_bin=prev r_disable=0 r_service=restart
     if [ -f "${unit_path}.prev" ]; then r_unit=prev; else r_unit=keep; fi
     first_deploy=0
@@ -404,6 +468,10 @@ if [ "$ROLLBACK" -eq 1 ]; then
     fi
     rc=0
     remote_run rollback || rc=$?
+    case "$rc" in
+        3) log "戻す途中で失敗した。上に出た手作業の復旧手順で戻すこと（終了コード 3）" ;;
+        4) log "誤配布の防止で拒否された。何も変更していない（終了コード 4）" ;;
+    esac
     exit "$rc"
 fi
 
@@ -431,7 +499,7 @@ log "commit  : ${COMMIT}${DIRTY}"
 log "binary  : ${LOCAL_BIN#"$REPO_ROOT"/}（sha256 ${SUM:0:16}…, $(stat -c %s "$LOCAL_BIN") bytes）"
 log "配置先  : ${BIN_PATH}（直前を ${BIN_PATH}.prev へ）、unit: /etc/systemd/system/${UNIT_NAME}"
 log "確認    : ${CHECK_BASE}/healthz, ${CHECK_BASE}/api/v1/photos（${WAIT_SECS} 秒まで待つ）"
-log "拒否条件: 検証環境の印 /etc/geoframe/staging が無い、または geoframe-server.service（Python 版）が稼働中"
+log "拒否条件: 検証環境の印 /etc/geoframe/staging が無い、または geoframe-server.service（Python 版）が非稼働と確認できない"
 if [ "$DRY_RUN" -eq 1 ]; then
     log "*** DRY-RUN: 転送・配置・再起動は行わない ***"
     exit 0
@@ -439,7 +507,13 @@ fi
 
 # --- 2. 誤配布の検査（何も転送・変更しないうちに。リモートの本体でも変更の前に再検査する）---
 log "検査    : 接続先が検証環境か（印と Python 版の稼働）"
-remote_run preflight "''" || die "接続先を検証環境と確認できない。何も変更していない（上の理由を見ること）"
+rc=0
+remote_run preflight "''" || rc=$?
+case "$rc" in
+    0) ;;
+    4) log "誤配布の防止で拒否された。何も変更していない（終了コード 4。上の理由を見ること）"; exit 4 ;;
+    *) die "接続先の検査を完了できない（終了コード ${rc}）。何も変更していない" ;;
+esac
 
 # --- 3. 転送（リモートの一時ディレクトリへ。sha256 を照合）---
 log "転送    : 検証環境の一時ディレクトリへ（sha256 で照合）"

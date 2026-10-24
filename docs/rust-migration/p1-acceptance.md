@@ -1,8 +1,8 @@
 # P1の受入確認（検証環境での記録）
 
-- 日時: 2026-10-24 16:40〜17:10（JST）に実施し、レビュー指摘（Sol）を反映して**17:10〜17:25（JST）にやり直した**。以下は、やり直しの結果
+- 日時: 2026-10-24 16:40〜17:10（JST）に実施し、レビュー指摘（Sol）を反映して17:10〜17:25（JST）にやり直し、2回目の指摘を反映して**17:50（JST）に配布と全件比較をやり直した**。以下は、最新の結果
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）/ 計画: [plan.md](plan.md) §4 P1 / タスク: [tasks.md](tasks.md) T1.5
-- 対象のソース: コミット`355ba86`（`crates/`・`Cargo.*`・`app/static`・`app/vendor`は`d641505`から無変更）。配布スクリプト・比較スクリプト・ハーネスは、この記録を含む修正コミット
+- 対象のソース: コミット`d362f47`の実装（`crates/`の実装部分・`Cargo.*`・`app/static`・`app/vendor`は`d641505`から無変更。2回目の修正で`crates/`に足したのは、`limits.rs`の単体試験と`slow_clients`の統合試験だけ）。配布スクリプト・比較スクリプト・ハーネスは、この記録を含む修正コミット
 - バイナリ: `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`（`static-pie linked`、6,170,752 B、sha256 `d5c19e4de35a467b…`）
 - 検証環境（lxc-geoframe。Ubuntu 24.04、2コア、メモリ4GiB）。本番機ではない。接続先の値はGit管理外のメモにあり、ここには書かない
 - **写真の値・ファイル名・位置・タイトルは書かない。件数と一致の数だけ**
@@ -11,14 +11,14 @@
 
 | 項目 | 内容 |
 | --- | --- |
-| Rust | `geoframe-rs.service`（[`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)）を**修正後の**`deploy/rust-deploy.sh`で配り直し、`:8080`に常駐（enable済み）。`User=geoframe`、データは`/var/lib/geoframe`（本番2026-10-24 06:17のバックアップのコピー、`catalog.db`は6,535行） |
+| Rust | `geoframe-rs.service`（[`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)）を**2回目の修正後の**`deploy/rust-deploy.sh`で配り直し（検査・転送・入れ替え・確認OK、終了コード0。バイナリの sha256 は前回と同じ）、`:8080`に常駐（enable済み）。`User=geoframe`、データは`/var/lib/geoframe`（本番2026-10-24 06:17のバックアップのコピー、`catalog.db`は6,535行） |
 | 比較用Python | `geoframe-pyref.service`（`:8090`、データ`/var/lib/geoframe-pyref`）。AI・Drive無効。今回、本番と同じ`GEOFRAME_EMBED_BACKEND=local`を足した |
 | 環境変数 | 両方とも`GEOFRAME_EMBED_BACKEND=local`（本番の`/etc/default/geoframe`にある、出力に影響する設定はこれだけ。ほかの2項目はタイルの`User-Agent`とHost名で、出力に影響せず、前者には連絡先が入っているので写していない） |
 | 比較 | 手元（開発機）から、LAN越しに両方へ同じ要求を送る。[`tools/compare_with_python.py`](../../tools/compare_with_python.py)（標準ライブラリだけ） |
 
 ## 2. 全件比較（Rust と 比較用Python）
 
-`tools/compare_with_python.py --rust … --python …`の集計（所要54秒、想定外の差 **0** 項目）。レビュー指摘で次を厳密にした: JSON は**型を区別**して比べる（`true`と`1`、`false`と`0`、`35`と`35.0`は別。`--self-test`で、手元の小さなサーバー2つを使って確認）、画像は**両方が200**を返したうえでハッシュ・長さを比べる（同じ404/403/500同士は一致に数えない）、`GET /api/admin/photos`の最終ページは**filterとperの組ごとに**`pages`を取得して作る。
+`tools/compare_with_python.py --rust … --python …`の集計（2回目の修正後の再配布で再実施。所要22秒、想定外の差 **0** 項目。集計は下の表のとおりで前回と変わらない）。レビュー指摘で次を厳密にした: JSON は**型を区別**して比べる（`true`と`1`、`false`と`0`、`35`と`35.0`は別。`--self-test`で、手元の小さなサーバー2つを使って確認）、画像は**両方が200**を返したうえでハッシュ・長さを比べる（同じ404/403/500同士は一致に数えない）、`GET /api/admin/photos`の最終ページは**filterとperの組ごとに**`pages`を取得して作る。
 
 | 比較 | 結果 |
 | --- | --- |
@@ -65,7 +65,9 @@
 
 修正の要点: 入れ替え以降の全工程（unit の導入・`daemon-reload`・`enable`・`restart`・確認）と中断（SIGTERM）を一つの復元処理で覆う。復元の各操作に明示的な成否の判定を付け、失敗したら即座に終了コード3で、手作業の復旧手順を出す（「戻した」とは言わない）。配布前の`enable`・稼働・unit の有無を覚えて、初回の失敗では`disable`と unit の撤去まで行う。変更の前に、検証環境の印`/etc/geoframe/staging`と、Python 版の非稼働を確かめる。
 
-**モックでの試験**（[`deploy/rust-deploy-test.sh`](../../deploy/rust-deploy-test.sh)、ssh なし。一時ディレクトリに作った環境と偽の`systemctl`/`curl`で、検証環境側の本体をそのまま走らせる）: **44/44項目が成功**。印なし・Python 版稼働中・印がシンボリックリンクでの拒否（終了コード4、何も変更しない）、成功、`restart`・`daemon-reload`・`enable`・unit 導入・起動できないバイナリ・`/healthz`不通の各失敗からの復元（もとが`disabled`・停止中のときもそのまま）、復元の`mv`・`daemon-reload`の失敗（終了コード3、手順が出る、「戻した」と出ない）、`rollback`の`mv`の失敗、復元は済んだが戻したあとの確認が通らない場合（使い済みの`.prev`への`mv`は案内せず、先に止める手順を出す）、初回の配布の失敗と成功（古い`.prev`を戻す先にしない）、`restart`中の SIGTERM、手動の`rollback`。
+2回目の修正（レビュー指摘）: ①復元の最中は SIGHUP・SIGINT・SIGTERM・SIGPIPE を無視し（子プロセスにも引き継がれる）、復元が終わってから終了する（終了コードは復元の結果。通常の復元・EXIT trap 内の復元・手動`--rollback`のどれでも）。復元中に想定外の終了があれば、入れ子の復元はせず手作業の手順と終了コード3を出す。②復元で止める操作は`stop`の成功を必須にし、unit が存在しない（`LoadState=not-found`）ときだけ失敗を許す。そのうえで`systemctl show`の`ActiveState`が`inactive`/`failed`と確認できなければ（`activating`・`deactivating`・状態の取得失敗・空出力）終了コード3。③Python 版は`systemctl show`の値で、`inactive`/`failed`か unit の不在が確認できたときだけ通し、稼働中・取得失敗・空出力・未知の状態は終了コード4で拒否する。④事前検査の終了コード4を、ラッパーが1に変えずにそのまま返す。
+
+**モックでの試験**（[`deploy/rust-deploy-test.sh`](../../deploy/rust-deploy-test.sh)、ssh なし。一時ディレクトリに作った環境と偽の`systemctl`/`curl`で、検証環境側の本体をそのまま走らせる）: **79/79項目が成功**（前回は44件）。印なし・Python 版稼働中・印がシンボリックリンクでの拒否（終了コード4、何も変更しない）、Python 版の状態取得の失敗・空出力・未知の状態・`activating`での拒否と、`failed`・unit 不在での許可、成功、`restart`・`daemon-reload`・`enable`・unit 導入・起動できないバイナリ・`/healthz`不通の各失敗からの復元（もとが`disabled`・停止中のときもそのまま）、復元の`mv`・`daemon-reload`の失敗（終了コード3、手順が出る、「戻した」と出ない）、`rollback`の`mv`の失敗、復元は済んだが戻したあとの確認が通らない場合（使い済みの`.prev`への`mv`は案内せず、先に止める手順を出す）、初回の配布の失敗と成功（古い`.prev`を戻す先にしない）、`restart`中の SIGTERM、復元の最中の SIGTERM（通常の復元・EXIT trap 内の復元・手動の`rollback`のそれぞれで、復元をやり切って終了コード1／0）、復元の失敗と SIGTERM が重なる場合（終了コード3・手順が出る）、`stop`の失敗＋`activating`・`stop`は成功でも`activating`・`stop`の失敗（状態は`inactive`）・停止後の状態取得の失敗と空出力（いずれも終了コード3）、unit 未導入の初回で`stop`が「not loaded」になる場合（戻せる）、手動の`rollback`。手元のラッパー（ssh・scp をモックにして`rust-deploy.sh`本体を通す）では、事前検査の拒否が終了コード4のまま返ること（何も転送しない）、成功0・戻せた失敗1・戻せなかった失敗3、`--rollback`の拒否4と成功0。
 
 **検証環境（実機）での試験**（`systemd`の drop-in `ExecStartPre=+`で、起動前の失敗を1回だけ起こした。試験後に drop-in は消した。上の変更の一覧にも書いた）:
 

@@ -211,33 +211,38 @@ async fn a_stalled_download_is_cut_and_gives_its_slot_back() {
     }
 }
 
+/// 少しずつでも読み続ける相手は、全体で停滞の上限より長くかかっても切られない。
+///
+/// これは TCP を通した統合の確認で、期限の細かい動作は見ない（読み取りの間隔と TCP のバッファ・
+/// ウィンドウ更新・スケジューリングで、送信側の進捗が何 ms で起きるかは保証できないため）。
+/// 停滞の上限（2 秒）を読み取りの間隔（50ms）の 40 倍にして、負荷で揺れても「進捗が上限内に起きる」ことを
+/// 余裕で満たす。タイマーの厳密な動作（上限ちょうどで切れる・進捗で測り直す）は `limits.rs` の
+/// 仮想時間の単体試験が見る。読み取りの回数では判定しない。
 #[tokio::test]
 async fn a_slow_but_steady_reader_is_not_cut() {
     let fixture = Fixture::new();
     let limits = ConnLimits {
         max_connections: 64,
-        stall_timeout: Duration::from_millis(800),
-        idle_timeout: Duration::from_millis(800),
+        stall_timeout: Duration::from_secs(2),
+        idle_timeout: Duration::from_secs(2),
     };
     let addr = fixture.serve_limited(4, limits).await;
 
-    // 少しずつでも読み続ける相手は、全体で停滞の上限より長くかかっても切らない
     let (mut stream, mut total, length) = hold_with_head(addr).await;
     assert_eq!(length, BIG);
     let mut chunk = vec![0u8; 256 * 1024];
     let started = Instant::now();
-    let mut slow_reads = 0;
-    while started.elapsed() < Duration::from_millis(2500) {
-        let n = timeout(Duration::from_secs(2), stream.read(&mut chunk))
+    // 停滞の上限を超える時間（1.5 倍）、読み取りの間に待ちを入れながら読み続ける
+    while started.elapsed() < limits.stall_timeout * 3 / 2 {
+        let n = timeout(Duration::from_secs(10), stream.read(&mut chunk))
             .await
             .expect("読めない")
             .unwrap();
         assert_ne!(n, 0, "読んでいる途中で切られた");
         total += n as u64;
-        slow_reads += 1;
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(slow_reads > 10 && total < length, "{slow_reads} {total}");
+    assert!(total < length, "遅い読み取りの間に全量が届いた: {total}");
 
     // 切られていれば、受信バッファの分を読んだあとに EOF になって全量には届かない。
     // 残りを速く読み切り、最初に受け取った分も含めて Content-Length ぴったりになること

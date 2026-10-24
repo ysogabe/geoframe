@@ -289,6 +289,59 @@ mod tests {
         );
     }
 
+    fn stall_limits(stall_ms: u64) -> ConnLimits {
+        ConnLimits {
+            max_connections: 1,
+            stall_timeout: Duration::from_millis(stall_ms),
+            idle_timeout: Duration::from_secs(3600),
+        }
+    }
+
+    /// 相手が読まないまま書き込みが `stall_timeout` 進まなければ、そこで切れる（仮想時間で厳密に）。
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_makes_no_progress_is_cut_after_the_stall_timeout() {
+        let (a, _peer) = duplex(16);
+        let mut io = LimitedIo::new(a, stall_limits(1000), None);
+        let start = Instant::now();
+        let err = io.write_all(&[0u8; 64]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let at = Instant::now() - start;
+        assert!(
+            at >= Duration::from_millis(1000) && at <= Duration::from_millis(1005),
+            "{at:?}"
+        );
+    }
+
+    /// 相手が `stall_timeout` より短い間隔で少しずつでも読む間は、全体が何倍かかっても切れない。
+    /// 読むのをやめてから `stall_timeout` で切れる。
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_steady_reader_keeps_the_write_alive_until_it_stops_reading() {
+        let (a, mut peer) = duplex(16);
+        let mut io = LimitedIo::new(a, stall_limits(1000), None);
+        let start = Instant::now();
+        let writer = tokio::spawn(async move {
+            let res = io.write_all(&[0u8; 400]).await;
+            (res, Instant::now())
+        });
+        // 400ms ごとに 8 バイト。400 バイトを送り切るには 16 + 8×n ≥ 400 → 48 回（約 19 秒）かかるが、
+        // 途中の 5 秒（stall_timeout の 5 倍）まで読んだところで止める
+        let mut buf = [0u8; 8];
+        let mut last_read = Instant::now();
+        while Instant::now() - start < Duration::from_secs(5) {
+            sleep(Duration::from_millis(400)).await;
+            peer.read_exact(&mut buf).await.unwrap();
+            last_read = Instant::now();
+        }
+        let (res, ended) = writer.await.unwrap();
+        assert_eq!(res.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        // 最後に進捗があった（読まれて空きができた）時刻＋stall_timeout で切れる
+        let after = ended - last_read;
+        assert!(
+            after >= Duration::from_millis(1000) && after <= Duration::from_millis(1005),
+            "{after:?}"
+        );
+    }
+
     /// 進捗が続く間は切れず、止まってから idle で切れる。
     #[tokio::test(start_paused = true)]
     async fn steady_writes_keep_the_connection_open() {

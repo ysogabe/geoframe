@@ -36,6 +36,8 @@ $BIN --url $URL --count 300 --stop-after 10 --resume-after 8 \
   --start-cmd "ssh <検証環境> 'sudo systemctl start geoframe-rs'" 2>feed.err
 ```
 
+停止コマンドを実行したあとは、件数に届いても時間切れになっても、終了前に必ず再開コマンドを実行する（`--resume-after`より前に終わっても止めたままにしない）。コマンドの失敗は終了コード1になる。
+
 出力は件数だけ（写真・場所・タイトルは出さない）: 読み込んだ写真とカードの枚数、`Retrying`・`Online`の回数、最初の`Retrying`から次の写真まで（再開コマンドの実行を含む）。終了コード 0 = 目標の枚数に届いた。
 `photos: 対象 N 枚 …`は、miharashi の品質フィルタを通った表示対象の数（`/api/v1/photos`の件数より少ない）。
 
