@@ -348,6 +348,21 @@ fn respond(
         stream.write_all(head.as_bytes())?;
         return stream.write_all(&gzip);
     }
+    // `X-Gzip-Empty-Members: <個数>` を付けると、展開すると空になる gzip のメンバーを指定の個数並べた本文を
+    // `Content-Encoding: gzip` で（Content-Length なしで）送る（展開後は空なので、圧縮前の上限だけが止められる）
+    if let Some(count) = extra
+        .iter()
+        .find(|(k, _)| k == "X-Gzip-Empty-Members")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+    {
+        let gzip = crate::testutil::gzip::padded(b"", 0).repeat(count);
+        let head = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\n\
+             Content-Encoding: gzip\r\n\r\n"
+        );
+        stream.write_all(head.as_bytes())?;
+        return stream.write_all(&gzip);
+    }
     if extra.iter().any(|(k, _)| k == "X-Close-Before-Headers") {
         return Ok(());
     }

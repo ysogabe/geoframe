@@ -51,23 +51,46 @@ pub fn agent() -> ureq::Agent {
     )
 }
 
+/// 圧縮前（回線を流れる）バイト数の上限の余裕。展開後の上限 `max` に対して、
+/// `max × 2 + 64 KiB`（[`wire_limit`]）。
+const WIRE_SLACK_BYTES: u64 = 64 << 10;
+
+/// 展開後の上限 `max` の本文に対して、**圧縮前**（回線を流れるバイト列。gzip の付加情報を含む）に許す上限。
+///
+/// 展開後の大きさだけを数えると、展開後が空になる gzip（空のメンバーを延々と繰り返すなど）は上限が
+/// 働かず、時間切れまで転送と CPU を使いうる。そのため圧縮前にも独立の上限を付ける。
+/// 正当な本文は、展開後 `max` バイト以下で、gzip の見出し・末尾（1 メンバーあたり約 20 バイト）と
+/// 圧縮しきれない分を足しても `max` のわずかな上乗せで収まるので、`max × 2 + 64 KiB` なら誤って断らない。
+/// 圧縮されていない本文は、先に展開後の上限（`max`）で止まる。
+pub fn wire_limit(max: u64) -> u64 {
+    max.saturating_mul(2).saturating_add(WIRE_SLACK_BYTES)
+}
+
 /// 応答の本文を、**展開後の大きさ**に上限をかけて読む。
 ///
 /// `ureq` の `with_config().limit(n)` は圧縮された（`Content-Encoding: gzip` の）バイト列に当たり、展開後には
 /// 効かない（圧縮時 2 KB の本文が 2 MiB に展開されても上限を超えたと見なされない）。小さな JSON の応答を
 /// メモリに読む箇所は、必ずこの関数を通す。展開後の `max` バイトまでは読めて、1 バイトでも超えたら
-/// `ureq::Error::BodyExceedsLimit(max)` を返す。読み出しの途中の失敗は、`ureq` のエラーに戻して返す
-/// （`read_to_vec` と同じ。呼び出し側の分類表はそのまま使える）。
+/// `ureq::Error::BodyExceedsLimit(max)` を返す。これとは別に、圧縮前にも [`wire_limit`] の上限をかける
+/// （展開後が空になる gzip が時間切れまで流れ続けるのを止める。超えたときも `BodyExceedsLimit(max)`）。
+/// 読み出しの途中の失敗は、`ureq` のエラーに戻して返す（`read_to_vec` と同じ。呼び出し側の分類表は
+/// そのまま使える）。
+///
+/// 呼び出し側は、`Err` のとき**途中まで読んだ分は返らない**ことに注意（全体を捨てる）。
 pub fn read_body_limited(body: &mut ureq::Body, max: u64) -> Result<Vec<u8>, ureq::Error> {
     use std::io::Read;
 
-    // `ureq` 側の上限は付けない（展開後を自分で数える）。圧縮されていない本文は、`take` が `max + 1` で止める
-    let reader = body.with_config().reader();
+    // 圧縮前の上限だけを `ureq` に任せ、展開後は自分で数える。圧縮されていない本文は `take` が `max + 1` で止まる
+    // （`ureq` の上限は読み切ったあとの次の読み出しで効くので、`max` ちょうどの本文は断られない）
+    let reader = body.with_config().limit(wire_limit(max)).reader();
     let mut out = Vec::new();
     reader
         .take(max.saturating_add(1))
         .read_to_end(&mut out)
-        .map_err(ureq::Error::from)?;
+        .map_err(|e| match ureq::Error::from(e) {
+            ureq::Error::BodyExceedsLimit(_) => ureq::Error::BodyExceedsLimit(max),
+            other => other,
+        })?;
     if out.len() as u64 > max {
         return Err(ureq::Error::BodyExceedsLimit(max));
     }
@@ -253,6 +276,7 @@ mod tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::Arc;
 
     #[test]
     fn summary_has_only_state_and_status() {
@@ -403,5 +427,54 @@ mod tests {
         let response = agent().get(&serve(GZIP, bomb)).call().unwrap();
         let err = read_body_limited(&mut response.into_body(), 1 << 20).unwrap_err();
         assert!(matches!(err, ureq::Error::BodyExceedsLimit(_)), "{err:?}");
+    }
+
+    /// 展開後が空になる gzip（空のメンバーの繰り返し）は、展開後の上限では止まらない。圧縮前の上限
+    /// （[`wire_limit`]）で、時間切れを待たずに `BodyExceedsLimit` になる。送り手は上限なく流し続けるので、
+    /// 圧縮前の上限が無ければ読み手は時間切れ（30 秒）まで読み続け、`unwrap_err` の種類も変わる。
+    #[test]
+    fn read_body_limited_stops_endless_empty_gzip_members() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let max = 1000u64;
+        // 送り手が止めずに書くと読み手が上限なしだと分かるように、上限よりずっと大きな合計でだけ止める
+        const SENDER_CAP: u64 = 64 << 20;
+        let member = crate::testutil::gzip::padded(b"", 0);
+        assert!(member.len() < 64);
+        let chunk = member.repeat(512);
+        let sent = Arc::new(AtomicU64::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = {
+            let sent = Arc::clone(&sent);
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let head = "HTTP/1.1 200 X\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n";
+                if stream.write_all(head.as_bytes()).is_err() {
+                    return;
+                }
+                while sent.load(Ordering::Relaxed) < SENDER_CAP {
+                    if stream.write_all(&chunk).is_err() {
+                        return;
+                    }
+                    sent.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+                }
+            })
+        };
+        let response = agent().get(&format!("http://{addr}/")).call().unwrap();
+        let mut body = response.into_body();
+        let err = read_body_limited(&mut body, max).unwrap_err();
+        assert!(
+            matches!(err, ureq::Error::BodyExceedsLimit(1000)),
+            "{err:?}"
+        );
+        drop(body);
+        server.join().unwrap();
+        assert!(
+            sent.load(Ordering::Relaxed) < SENDER_CAP,
+            "送り手が最後まで送りきった"
+        );
     }
 }

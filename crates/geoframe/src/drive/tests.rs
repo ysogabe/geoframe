@@ -2456,7 +2456,22 @@ fn download_counts_the_decompressed_size() {
         session.download("big", &mut out, 10_000),
         Err(DriveError::TooLarge)
     );
-    assert!(out.is_empty(), "上限を超える本文は書かない");
+    // 超える前の分を書いてから `TooLarge` になりうる（分割して返る応答）ので、書いた量は上限以内。
+    // 全体を捨てる責任は呼び出し側（`fetch_one` が原本を必ず消す。途中で切れる本文の試験が確かめている）
+    assert!(out.len() <= 10_000, "上限を超えて書かない");
+    // 展開後の本文が複数回に分かれて返る場合は、上限までの分だけが書かれて止まる（書き込みが部分的になる例）
+    let chunk = COPY_CHUNK;
+    serve(4 * chunk);
+    let mut out = Vec::new();
+    assert_eq!(
+        session.download("big", &mut out, 2 * chunk as u64),
+        Err(DriveError::TooLarge)
+    );
+    assert!(
+        !out.is_empty() && out.len() <= 2 * chunk,
+        "途中まで書いてから止まる: {}",
+        out.len()
+    );
     // 圧縮後は小さくても、展開後が 64 MiB の本文（上限は 1000 バイト）
     serve(64 << 20);
     let mut out = Vec::new();
@@ -2465,6 +2480,52 @@ fn download_counts_the_decompressed_size() {
         Err(DriveError::TooLarge)
     );
     assert!(out.len() <= 1000);
+}
+
+/// 展開後が空になる gzip（空のメンバーの繰り返し）は、展開後の数えでは止まらない。圧縮前の上限
+/// （`net::wire_limit`）で止まり、原本は `TooLarge`（その写真の失敗。障害ではない）、小さな JSON・理由の本文は
+/// `TooLarge`・読み捨て扱いになる。上限の内側の空メンバー（正当な範囲）は通る。
+#[test]
+fn empty_gzip_members_are_stopped_by_the_wire_limit() {
+    let e = env("drive-gzip-empty-members");
+    e.listing(vec![]);
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let session = Session::new(&e.shared, &http, &stop, &e.key);
+    let serve = |members: usize| {
+        e.stub.clear_faults();
+        e.stub.add_fault(Box::new(move |r| {
+            (r.is_media() || r.path.ends_with("/probe")).then(|| {
+                (
+                    200,
+                    String::new(),
+                    vec![("X-Gzip-Empty-Members".to_string(), members.to_string())],
+                )
+            })
+        }));
+    };
+    let member = crate::testutil::gzip::padded(b"", 0).len();
+    let limit = 1000u64;
+    let wire = crate::net::wire_limit(limit) as usize;
+    // 圧縮前の上限の内側: 展開後は空なので 0 バイトで終わる
+    serve(wire / member - 1);
+    let mut out = Vec::new();
+    assert_eq!(session.download("big", &mut out, limit), Ok(0));
+    // 圧縮前の上限を超える: 展開後は空のままだが止まる
+    serve(wire / member + 2);
+    let mut out = Vec::new();
+    let error = session.download("big", &mut out, limit).unwrap_err();
+    assert_eq!(error, DriveError::TooLarge);
+    assert!(!error.is_outage());
+    assert!(out.is_empty());
+    // 小さな JSON（read_json）も同じ
+    let json_wire = crate::net::wire_limit(MAX_JSON_BYTES) as usize;
+    serve(json_wire / member + 2);
+    let response = crate::net::agent()
+        .get(&format!("{}/probe", e.stub.base_url()))
+        .call()
+        .unwrap();
+    assert_eq!(read_json(response), Err(DriveError::TooLarge));
 }
 
 /// スタブの壊れた本文が、実際に `ureq` の `Protocol`・`Decompress` を返すこと（この 2 つが理由の本文の

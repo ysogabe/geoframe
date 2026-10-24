@@ -715,8 +715,69 @@ async fn a_real_clock_keeps_the_interval_between_received_requests() {
 /// 本番のコードは、地名検索の通信先を差し替える入口（`Endpoints::loopback`・`Geocoder::with_endpoints`・
 /// `AppState::with_geocoder`）を呼ばない。設定・環境変数・コマンドラインから通信先を変えられないことの確認
 /// （入口は結合テストのために `pub` だが、本番のバイナリからは使われない）。
+///
+/// 入口を定義するファイル（`geocode.rs`・`server.rs`）も含め、すべてのファイルを調べる。外すのは、
+/// コメントの行・入口の**定義の行**（`fn <入口>(`）・`#[cfg(test)]` の付いた項目（試験のビルドにしかない）・
+/// 試験のファイル（`tests.rs`・`stub.rs`。どちらも `cfg(test)` のモジュール）だけ。
 #[test]
 fn production_code_never_redirects_the_geocoder() {
+    const ENTRIES: [(&str, &str); 4] = [
+        ("Endpoints::loopback", "loopback"),
+        ("Endpoints::stub", "stub"),
+        ("with_endpoints(", "with_endpoints"),
+        ("with_geocoder(", "with_geocoder"),
+    ];
+
+    /// `#[cfg(test)]` の付いた項目（同じ字下げの `}` か、`;`・`,` で終わる行まで）と、コメントの行を除く。
+    fn production_lines(text: &str) -> Vec<&str> {
+        let mut out = Vec::new();
+        let mut skipping_from: Option<usize> = None;
+        for line in text.lines() {
+            let indent = line.len() - line.trim_start().len();
+            let trimmed = line.trim();
+            if let Some(attr_indent) = skipping_from {
+                // 属性の次の行から、項目の終わりまで
+                if indent == attr_indent
+                    && (trimmed.starts_with('}')
+                        || trimmed.ends_with(';')
+                        || trimmed.ends_with(','))
+                {
+                    skipping_from = None;
+                }
+                continue;
+            }
+            if trimmed.starts_with("#[cfg(test)]") {
+                skipping_from = Some(indent);
+                continue;
+            }
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            out.push(line);
+        }
+        out
+    }
+
+    /// 入口の定義の行（`pub fn with_geocoder(` など）か。呼び出しは含まない。
+    fn defines(line: &str, name: &str) -> bool {
+        line.find("fn ")
+            .is_some_and(|at| line[at + 3..].trim_start().starts_with(name))
+    }
+
+    /// 本番の行から、入口の使用を探す。
+    fn uses(text: &str) -> Vec<&'static str> {
+        let lines = production_lines(text);
+        ENTRIES
+            .iter()
+            .filter(|(needle, name)| {
+                lines
+                    .iter()
+                    .any(|line| line.contains(needle) && !defines(line, name))
+            })
+            .map(|(needle, _)| *needle)
+            .collect()
+    }
+
     fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
         for entry in fs::read_dir(dir).unwrap() {
             let path = entry.unwrap().path();
@@ -727,6 +788,21 @@ fn production_code_never_redirects_the_geocoder() {
             }
         }
     }
+
+    // 走査そのものの確認: 本番の行に入口の呼び出しを足せば見つかり、定義・コメント・`cfg(test)` の中では見つからない
+    let injected = "fn run() {\n    let g = Geocoder::with_endpoints(Endpoints::loopback(a));\n}\n";
+    assert_eq!(uses(injected), ["Endpoints::loopback", "with_endpoints("]);
+    let allowed = "\
+        pub fn with_geocoder(mut self) -> Self {\n    self\n}\n\
+        // Endpoints::loopback で向ける\n\
+        #[cfg(test)]\n\
+        mod tests {\n    fn f() { let _ = Endpoints::stub(b); }\n}\n\
+        impl X {\n    #[cfg(test)]\n    pub(crate) fn stub(b: &str) -> Self {\n        Self::at(b)\n    }\n}\n";
+    assert!(uses(allowed).is_empty(), "{:?}", uses(allowed));
+    // 試験の項目のあとに本番の呼び出しがあれば、見つかる
+    let after = "#[cfg(test)]\nmod tests;\nfn run() {\n    with_geocoder(g);\n}\n";
+    assert_eq!(uses(after), ["with_geocoder("]);
+
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
     walk(&src, &mut files);
@@ -734,20 +810,13 @@ fn production_code_never_redirects_the_geocoder() {
     let mut users = Vec::new();
     for path in files {
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        // 入口を定義するファイルと、試験のコード
-        if ["geocode.rs", "server.rs", "tests.rs", "stub.rs"].contains(&name.as_str()) {
+        // 試験のファイル（`#[cfg(test)] mod tests;`・`#[cfg(test)] pub(crate) mod stub;` で入るモジュール）
+        if ["tests.rs", "stub.rs"].contains(&name.as_str()) {
             continue;
         }
         let text = fs::read_to_string(&path).unwrap();
-        for needle in [
-            "Endpoints::loopback",
-            "Endpoints::stub",
-            "with_endpoints(",
-            "with_geocoder(",
-        ] {
-            if text.contains(needle) {
-                users.push(format!("{name}: {needle}"));
-            }
+        for needle in uses(&text) {
+            users.push(format!("{name}: {needle}"));
         }
     }
     assert!(users.is_empty(), "{users:?}");

@@ -771,9 +771,15 @@ impl<'a> Session<'a> {
         if body.content_length().is_some_and(|len| len > limit) {
             return Err(DriveError::TooLarge);
         }
-        // `ureq` の `limit` は圧縮された（gzip の）バイト列に当たり、展開後には効かないので付けない。
-        // 展開後の大きさは、下の読み出しで数えて上限（`limit`）を超えたところで止める
-        let mut reader = body.into_with_config().reader();
+        // `ureq` の `limit` は圧縮された（gzip の）バイト列に当たり、展開後には効かないので、展開後の大きさは
+        // 下の読み出しで数えて上限（`limit`）を超えたところで止める。`ureq` の `limit` には、それとは独立の
+        // 圧縮前の上限（[`net::wire_limit`]）を付ける。展開後が空になる gzip（空のメンバーの繰り返し）は
+        // 展開後の数えでは止まらず、`download_timeout` まで転送と CPU を使うため。正当な本文は展開後 `limit`
+        // 以下なので `wire_limit(limit)` を超えない（超えたら `TooLarge`。`read_error`）
+        let mut reader = body
+            .into_with_config()
+            .limit(net::wire_limit(limit))
+            .reader();
         let mut buf = vec![0u8; COPY_CHUNK];
         let mut total = 0u64;
         loop {
@@ -802,6 +808,7 @@ impl<'a> Session<'a> {
 ///
 /// | 失敗 | `DriveError` | 扱い |
 /// | --- | --- | --- |
+/// | 圧縮前の上限超過（`BodyExceedsLimit`。[`net::wire_limit`]） | `TooLarge` | その写真の失敗 |
 /// | 時間切れ（`Timeout(_)` を包んだもの・`TimedOut`・`WouldBlock`） | `BodyTimeout` | その写真の失敗（遅いだけ） |
 /// | 切断（[`crate::net::is_disconnect`] の種類: `UnexpectedEof`・`ConnectionReset`・`ConnectionAborted`・`BrokenPipe` など） | `Net(Disconnected)` | 通信の障害（段を中断） |
 /// | 包まれた `ureq` のエラー（`Tls` など） | `Net(`[`Failure::from`]`)` | `Other` 以外は障害 |
@@ -810,6 +817,9 @@ impl<'a> Session<'a> {
 /// ヘッダーの前の失敗の分類は [`Failure`] の表（`net.rs`）。
 fn read_error(e: &io::Error) -> DriveError {
     if let Some(inner) = e.get_ref().and_then(|x| x.downcast_ref::<ureq::Error>()) {
+        if matches!(inner, ureq::Error::BodyExceedsLimit(_)) {
+            return DriveError::TooLarge;
+        }
         return match Failure::from(inner) {
             Failure::Timeout => DriveError::BodyTimeout,
             failure => DriveError::Net(failure),
