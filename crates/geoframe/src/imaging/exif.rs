@@ -237,15 +237,44 @@ fn ascii_text(tiff: &Tiff, e: &Entry) -> String {
     b.iter().map(|&c| char::from(c)).collect()
 }
 
-/// 時刻の候補 1 つ（Python の `ex.get(tag)`）。`None` は偽値（無い、または空文字）で次の候補へ落ちる。
-/// ASCII 以外の型は Pillow が数値などを返すので真とし、文字列としては読めない（`norm_time` は空を返す）。
+/// 時刻の候補 1 つ（Python の `ex.get(tag)`）。`None` は偽値で次の候補へ落ちる（`a or b or c`）。
+/// ASCII 以外の型は Pillow が数値などを返すので、真なら文字列としては読めない（`norm_time` は空を返す）。
 fn time_candidate(tiff: &Tiff, entries: &[Entry], tag: u16) -> Option<String> {
     let e = find(entries, tag)?;
     if e.typ != T_ASCII {
-        return Some(String::new());
+        return python_truthy(tiff, &e).then(String::new);
     }
     let text = ascii_text(tiff, &e);
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// ASCII 以外の型の値が Python で真か。Pillow の読み方: BYTE・UNDEFINED は `bytes`（空でなければ真。
+/// 1 バイトの 0 も真）、ほかの型は個数 0 が空のタプル（偽）・1 が数値（0 のとき偽。有理数は 0/1 が偽、
+/// 分母 0 は NaN で真）・2 以上がタプル（真）。
+fn python_truthy(tiff: &Tiff, e: &Entry) -> bool {
+    match (e.typ, e.count) {
+        (T_BYTE | 7, n) => n > 0,
+        (_, 0) => false,
+        (_, 1) => {
+            let value = match e.typ {
+                11 => tiff.u32_at(e.start).map(|v| f64::from(f32::from_bits(v))),
+                12 => tiff
+                    .data
+                    .get(e.start..e.start + 8)
+                    .and_then(|b| <[u8; 8]>::try_from(b).ok())
+                    .map(|b| {
+                        f64::from_bits(if tiff.little {
+                            u64::from_le_bytes(b)
+                        } else {
+                            u64::from_be_bytes(b)
+                        })
+                    }),
+                _ => tiff.number(e, 0),
+            };
+            value != Some(0.0)
+        }
+        _ => true,
+    }
 }
 
 /// GPS の度分秒を十進にする（Python の `dms_to_deg`）。成分は先頭の 3 つを使う。

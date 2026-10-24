@@ -175,6 +175,23 @@ CASES = [
     ("ref_embedded_nul", {}, None, {1: (ASCII, b"S\0X\0"), 2: rationals((12, 1), (0, 1), (0, 1)),
                                     3: (ASCII, b"W\0"), 4: rationals((78, 1), (0, 1), (0, 1))}, True),
     ("time_wrong_type_short", {}, {36867: short(5)}, None, True),
+    # --- 撮影時刻: Pythonで偽になる値（0・空）は `or` で次の候補へ落ちる。真になる数値は落ちない ---
+    ("time_short_zero_falls_through", {}, {36867: short(0), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_long_zero_falls_through", {}, {36867: (LONG, [0]), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_byte_zero_falls_through", {}, {36867: (BYTE, b"\0"), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_short_count0_falls_through", {}, {36867: (SHORT, []), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_undefined_empty_falls_through", {}, {36867: (UNDEFINED, b""), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_undefined_nul_does_not_fall_through", {}, {36867: (UNDEFINED, b"\0"), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_short_pair_zero_does_not_fall_through", {}, {36867: (SHORT, [0, 0]), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_short_five_does_not_fall_through", {}, {36867: short(5), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_rational_zero_over_one", {}, {36867: rationals((0, 1)), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_rational_zero_over_zero", {}, {36867: rationals((0, 0)), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_rational_one_over_one", {}, {36867: rationals((1, 1)), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_digitized_short_zero_falls_to_ifd0", {306: ascii_("2022:01:02 03:04:05")},
+     {36867: short(0), 36868: short(0)}, None, True),
+    ("time_digitized_short_zero_original_ascii_empty", {306: ascii_("2022:01:02 03:04:05")},
+     {36867: ascii_(""), 36868: short(0)}, None, True),
+    ("time_ifd0_short_zero", {306: short(0)}, {36867: (LONG, [0])}, None, True),
     ("empty_ifd0", {}, None, None, True),
 ]
 
