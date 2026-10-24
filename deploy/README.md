@@ -471,12 +471,12 @@ Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作�
   DB が開けない（終了コード 1）は再起動対象。`LimitNOFILE=4096`（同時の接続 256＋配信 32＋SQLite で 300 前後を使う）。
 - **取り込み（DB への書き込みと同期サイクル）は`GEOFRAME_INGEST=1`のときだけ動く**（既定は`0`）。P5 の切替まで本番の書き手は Python 版なので、
   `/etc/default/geoframe`をそのまま使って Rust 版を起動しても DB には書かない。検証環境で取り込みを試すときだけ、
-  `/etc/default/geoframe`か drop-in で`GEOFRAME_INGEST=1`を足す。有効にすると、DB が無ければ新しく作り、スキーマの作成・移行をして、
+  `/etc/default/geoframe`か drop-in で`GEOFRAME_INGEST=1`を足す。**P5 の切替までは、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できない機体では、書き込みの前に終了コード 2 で断る**（本番機では動かない。[server.md §11.1.1](../docs/rust-migration/server.md)。`systemctl show geoframe-server.service`が使えない・答えないときも断る）。有効にすると、DB が無ければ新しく作り、スキーマの作成・移行をして、
   `GEOFRAME_DRIVE_POLL_MIN`（既定 10 分）ごとに同期サイクルを回す（[server.md §11](../docs/rust-migration/server.md)）。**Python 版と同じ`catalog.db`には絶対に向けない**。
 - `ReadOnlyPaths=`は、`photos/`・`blog_exports/`・`travel_blog/`だけ（writer が書く`catalog.db`・`derivatives/`は外した。`tmp/`・`.cache.json`・`.ingest.lock`は元から対象外）。
   WAL の DB は読み取りでも同じディレクトリに`-shm`/`-wal`を作るので、ディレクトリ自体は書き込み可のまま。P3 で手動修正などの更新 API を追加するとき`blog_exports/`などを外す。
   `catalog.db`を別の inode に置き換えたら（バックアップからの復元など）再起動する。
-- 取り込みを 1 回だけ手で動かす: `geoframe sync`（`GEOFRAME_INGEST=1`が要る）。**書かずに計画だけ**見るなら`geoframe sync --dry-run`（DB・キャッシュ・ファイルに触れず、件数だけを出す）。
+- 取り込みを 1 回だけ手で動かす: `geoframe sync`（`GEOFRAME_INGEST=1`が要る）。**書かずに計画だけ**見るなら`geoframe sync --dry-run`（行・写真・キャッシュ・ロックを変えず、件数だけを出す。ただし SQLite が読み取りでも作る`catalog.db-wal`・`-shm`はできうる。印も Python の確認も要らない）。
   外向き HTTPS の確認は`geoframe selfcheck-net`（状態と HTTP ステータスだけを出す）。
 - **待ち受けは`--listen`を書かない**。`GEOFRAME_HOST`/`GEOFRAME_PORT`（既定`0.0.0.0:8080`）で決まる。
 

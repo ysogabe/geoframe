@@ -226,8 +226,11 @@ fn to_python_json(map: &Map<String, Value>) -> Vec<u8> {
     out
 }
 
-/// 保存スレッド（現行の `cache_saver`）。[`SAVER_TICK`] ごとに起きて [`Cache::save_if_due`] を呼び、
-/// 止まるときに最後の保存をする。
+/// 保存スレッド（現行の `cache_saver`）。[`SAVER_TICK`] ごとに起きて [`Cache::save_if_due`] を呼ぶ。
+///
+/// 停止の合図で終わるだけで、**最後の保存はしない**。最後の保存は、キャッシュに書く側（同期サイクルの
+/// スレッド）が止まったあとに呼び出し側が [`Cache::save_now`] で行う（`cli::stop_ingest_threads`）。
+/// 同じ合図で保存側が先に最後の保存を終えると、あとから書く側が `put` した更新が失われるため。
 pub fn spawn_saver(cache: Arc<Cache>, stop: StopFlag) -> std::thread::JoinHandle<()> {
     spawn_saver_with(cache, stop, SAVER_TICK)
 }
@@ -243,8 +246,6 @@ fn spawn_saver_with(
             while !stop.wait(tick) {
                 cache.save_if_due(Instant::now());
             }
-            // 停止時の取りこぼし（最大で 1 分ぶん）を残さない
-            cache.save_now();
         })
         .expect("キャッシュ保存スレッドを起動できません")
 }
@@ -411,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn saver_thread_saves_on_tick_and_on_stop() {
+    fn saver_thread_saves_on_tick_but_leaves_the_final_save_to_the_caller() {
         let dir = TempDir::new("cache-saver");
         let cache = Arc::new(Cache::load(dir.path()));
         let stop = StopFlag::new();
@@ -424,10 +425,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(read_file(&dir).contains("geo:1"));
-        // 間隔の内側の変更も、停止のときに保存される
+        // 間隔の内側の変更は、停止してもスレッドは保存しない（書く側が止まったあとに呼び出し側が保存する）
         cache.put("geo:2", json!(2));
         stop.stop();
         handle.join().unwrap();
+        assert!(!read_file(&dir).contains("geo:2"));
+        assert_eq!(cache.save_now(), SaveOutcome::Saved);
         assert!(read_file(&dir).contains("geo:2"));
     }
 }

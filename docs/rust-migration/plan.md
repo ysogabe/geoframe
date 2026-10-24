@@ -95,6 +95,11 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - 本番`catalog.db`のバックアップと復元の演習、検証環境でのシャドー比較、本番でPythonを止めてRustを起動、スモークテスト、ロールバックと再切替の演習。
 - `deploy/`の手順・unit・READMEをRust用に改め、PythonのCIと依存を外す。Python実装の削除は切替後に安定を確かめてから。
 - 本番の切替は**ユーザーの立ち会いのもとで**行う。
+- **取り込みのガードを外す**（T2.1で入れた暫定。[server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード)）。P2〜P4の間、`GEOFRAME_INGEST=1`の`serve`・`sync`は、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できないと、書き込みの前に終了コード2で断る。本番機には印が無いので、**このガードを外さない限り、本番でRustは取り込みを始められない**。切替の手順で次をこの順に行う:
+  1. 本番で`geoframe-server`を止めて`disable`し、停止を確認する（`systemctl is-active`が`inactive`）。Pythonの書き込みが無いことの担保は、ガードではなくこの手順が持つ。
+  2. コードからガードを外す（またはガードの印を本番用に置き換え、`GEOFRAME_INGEST=1`に加えて明示のフラグを要る形にする）。消すもの: `guard.rs`・`lib.rs`の`pub mod guard`・`ingest::start`の`guard.check()`（`start_with`）・`IngestError::Refused`と`cli.rs`の`exit_for_ingest_error`・`tests/ingest_cli.rs`の`Staging`と`GEOFRAME_TEST_*`・ガードのテスト。残った箇所は`grep -rn "guard\|検証環境の印\|GEOFRAME_TEST_" crates deploy docs`で探す。
+  3. 文書を直す: server.md（§0の索引の行・§6の項・§11.1.1・§11.9）、`deploy/README.md §7.1`、`deploy/geoframe-rs.service`と`rust-deploy.sh`の説明、`USAGE`。
+  4. 検証環境と同じバイナリで、本番のコピーを使った通しの演習を済ませてから本番へ入れる。
 
 ## 5. 受入条件とフェーズの対応
 

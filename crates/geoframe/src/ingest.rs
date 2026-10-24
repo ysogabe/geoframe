@@ -11,9 +11,11 @@
 //! 現行は `load_cache` → `purge_cache_legacy` → `db()`（スキーマ・移行）→ `tile_cache_prune`
 //! → `prepare_tmp_dir`。Rust は次の順にする（失敗したら起動しない）。
 //!
+//! 0. **ガード**（[`crate::guard`]）。検証環境の印が無い・Python 版が非稼働と確認できないなら、何も
+//!    書かずに断る（終了コード 2）。データ置き場の作成より前。P5 の切替で外す。
 //! 1. データ置き場を用意し、`DATA_DIR/.ingest.lock` を排他で取る。別の `geoframe`（`serve` か `sync`）が
 //!    すでに取り込み中なら断る。**Python との二重書き込みは防げない**（Python はこのロックを見ない）
-//!    ので、Python が動いている間は `GEOFRAME_INGEST` を 1 にしない。
+//!    ので、Python が動いている間は取り込まない（0 のガードが、起動時に 1 回だけ確かめる）。
 //! 2. writer を開く。DB が無ければ**新しく作る**（`schema::migrate` が空から作る）。作ったときは warn
 //!    で知らせる（`GEOFRAME_DATA_DIR` の誤りで空の DB を静かに作ってしまうのを見つけるため）。
 //! 3. スキーマの作成・移行（[`crate::schema::migrate`]）。
@@ -31,6 +33,7 @@ use rusqlite::Connection;
 
 use crate::cache::Cache;
 use crate::config::Config;
+use crate::guard::{Guard, GuardError};
 use crate::schema::{self, Migration, Pending};
 use crate::writer::{OpenMode, WriteError, Writer};
 
@@ -38,6 +41,8 @@ const LOCK_FILE: &str = ".ingest.lock";
 
 #[derive(Debug)]
 pub enum IngestError {
+    /// 本番への誤指定の防止（[`crate::guard`]）で断った。何も書いていない。
+    Refused(GuardError),
     /// データ置き場を用意できない・ロックのファイルを開けない。
     Io(io::ErrorKind),
     /// 別の `geoframe` がすでに取り込み中。
@@ -48,6 +53,7 @@ pub enum IngestError {
 impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Refused(e) => write!(f, "{e}"),
             Self::Io(kind) => write!(f, "取り込みの準備に失敗しました: {kind}"),
             Self::Locked => f.write_str(
                 "別の geoframe が取り込み中です（serve か sync が動いています）。二重に書かないよう起動を断ります",
@@ -73,8 +79,15 @@ pub struct Ingest {
     _lock: File,
 }
 
-/// 取り込みを始める準備（上の「起動の順序」）。
+/// 取り込みを始める準備（上の「起動の順序」）。最初に[ガード](crate::guard)を通す。
 pub fn start(config: &Config) -> Result<Ingest, IngestError> {
+    start_with(config, &Guard::production())
+}
+
+/// [`start`] のガードを差し替えられる形（単体テスト用。配布するバイナリの経路は [`start`] だけ）。
+fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, IngestError> {
+    // 最初の書き込み（データ置き場の作成・ロック・移行・掃除・キャッシュ保存）より前に断る
+    guard.check().map_err(IngestError::Refused)?;
     fs::create_dir_all(&config.data_dir).map_err(|e| IngestError::Io(e.kind()))?;
     let lock = File::options()
         .create(true)
@@ -205,6 +218,11 @@ mod tests {
     use super::*;
     use crate::config::Overrides;
     use crate::testutil::TempDir;
+
+    /// 合成の置き場で試すので、ガード（検証環境の印・Python の状態）は通す。
+    fn start(config: &Config) -> Result<Ingest, IngestError> {
+        super::start_with(config, &Guard::skip())
+    }
 
     fn config(dir: &TempDir) -> Config {
         let overrides = Overrides {
@@ -343,5 +361,40 @@ mod tests {
                 .unwrap()
                 .contains("exif:a")
         );
+    }
+
+    /// ガードが断ったら、データ置き場も DB もロックも作られない（最初の書き込みより前に止まる）。
+    #[test]
+    fn a_refused_guard_writes_nothing() {
+        let dir = TempDir::new("ingest-refused");
+        let root = dir.path().join("data");
+        let overrides = Overrides {
+            listen: None,
+            data_dir: Some(root.clone()),
+        };
+        let config = Config::load(|_| None, &overrides).unwrap();
+        // 印の無い（通常はここで止まる）ガード。置き場そのものが無い状態から
+        let guard = Guard::production_with_marker_for_test(dir.path().join("no-such-marker"));
+        assert!(matches!(
+            super::start_with(&config, &guard),
+            Err(IngestError::Refused(GuardError::NoMarker(_)))
+        ));
+        assert!(!root.exists());
+        // 既存の置き場でも、DB・キャッシュ・tmp・derivatives・ロックは作られず、中身も変わらない
+        fs::create_dir_all(root.join("derivatives")).unwrap();
+        fs::write(root.join(".cache.json"), r#"{"exif:a": 1}"#).unwrap();
+        fs::write(root.join("derivatives/.dl_x"), b"x").unwrap();
+        assert!(super::start_with(&config, &guard).is_err());
+        let mut names: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, [".cache.json", "derivatives"]);
+        assert_eq!(
+            fs::read_to_string(root.join(".cache.json")).unwrap(),
+            r#"{"exif:a": 1}"#
+        );
+        assert!(root.join("derivatives/.dl_x").exists());
     }
 }

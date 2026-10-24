@@ -22,9 +22,10 @@ P1・P2（T2.1）でPythonと意図して違える点・既知の差の入口。
 | DBが無いとRustは起動を断る（終了コード1、systemdで5秒おきに再起動）。PythonはDBを作る。**ただし`GEOFRAME_INGEST=1`のときは、Rustも空のDBを作る**（T2.1。§11.1） | DBを作るのはPython。配備の誤りを失敗として見せる | `GEOFRAME_DATA_DIR`の誤りなど、DBが無いまま起動したとき | 検証環境で確認（[p1-acceptance.md](p1-acceptance.md)） | なし（決定。P5の切替時にはDBがある） | [§2.4](#24-dbが無い壊れている古いときの扱い) |
 | 管理画面の読み取りAPIの差（件数を1トランザクションで数える、想定外の型は503、キーの並びなど） | 一貫性、読み取り専用の表示で落とさない | `GET /api/admin/status`・`photos` | 検証環境の比較で差0、単体テスト | なし（決定） | [§10.6](#106-pythonとの差まとめ) |
 | `GEOFRAME_INGEST`（Rustだけの項目。既定`0`）。`0`のRustは**DBに一切書かない**（writerを作らない・移行しない・同期サイクルを動かさない） | P5の切替まで本番の書き手はPython。`/etc/default/geoframe`のままRustを起動しても二重に書かない | 取り込みを使うとき（検証環境）だけ`1` | 単体テスト、`tests/ingest_cli.rs`（既定で`serve`が`catalog.db`もフォルダも変えない） | P5の切替で本番の設定に`1`を足す。既定の見直しもその時 | [§11.1](#111-取り込みを有効にする-geoframe_ingest) |
+| **取り込み（`GEOFRAME_INGEST=1`の`serve`・`sync`の実行）は、検証環境の印（`/etc/geoframe/staging`）が無い、または`geoframe-server`が非稼働と確認できないと、書き込みの前に終了コード2で断る**（ガード）。Pythonには無い | 本番機で誤って`GEOFRAME_INGEST=1`を立てて起動しても、Pythonの稼働中に移行・`.cache.json`の更新・`.dl_*`の掃除をしない。配布スクリプトの拒否は直接起動や設定の変更には効かないため、バイナリ自身が守る | 取り込みを有効にして起動するとき。`--dry-run`と読み取り専用の`serve`は対象外 | 単体テスト（`guard.rs`・`ingest.rs`）、`tests/ingest_cli.rs`（印なし・Python稼働中・取得不能で書き込み前に止まり置き場が変わらない）、検証環境（§11.11） | **P5の切替で外す**（手順は[plan.md P5](plan.md)） | [§11.1.1](#1111-本番への誤指定の防止ガード) |
 | `GEOFRAME_DRIVE_POLL_MIN`: 0以下・非数・上限（525600分）超は起動を断る（終了コード2）。Pythonは0以下で空回りか例外 | 事故を早く見つける | 不正な値が設定にあるとき（本番は既定の10） | 単体テスト | なし（決定） | [§11.2](#112-設定) |
 | 同期サイクルの段の失敗は、段の名前と失敗の種類だけをログに出す（Pythonは例外文字列をそのまま出す）。段のパニックも隔離する（Pythonは`except Exception`） | ログに位置・ファイル名を出さない方針（inventory.md §6.3） | 常時 | 単体テスト（`sync.rs`） | なし（決定） | [§11.3](#113-同期サイクルの骨組み) |
-| `.cache.json`のキーをRustは辞書順に書く（Pythonは挿入順）。停止時にも最後の保存をする。`.dl_*`は通常ファイルだけを消す | `serde_json`の`preserve_order`を入れると他のJSON応答の並びが変わる | `.cache.json`をRustが保存したとき（読むときの並びは問わない） | 単体テスト（Pythonの`json.dumps(indent=1, ensure_ascii=False)`と同じ形） | なし（決定） | [§11.5](#115-cachejson) |
+| `.cache.json`のキーをRustは辞書順に書く（Pythonは挿入順）。停止時にも最後の保存をする（同期サイクルのスレッドが止まったあとに1回）。`.dl_*`は通常ファイルだけを消す | `serde_json`の`preserve_order`を入れると他のJSON応答の並びが変わる | `.cache.json`をRustが保存したとき（読むときの並びは問わない） | 単体テスト（Pythonの`json.dumps(indent=1, ensure_ascii=False)`と同じ形） | なし（決定） | [§11.5](#115-cachejson) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
@@ -182,6 +183,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 - Rustも**`User=geoframe`で動かす**。WALのDBは読み取り専用でも`-shm`・`-wal`を触るので、ファイルの持ち主がPythonの実行ユーザーと違うと、片方が開けなくなる。`StateDirectory=geoframe`は初回起動で持ち主を揃えるが、大きなデータでは時間がかかるので、**配備の前に`chown -R geoframe:geoframe /var/lib/geoframe`を済ませておく**。
   - 検証環境の注意: 比較用Pythonの`derivatives/`は、本番のコピーの`derivatives/`への**ハードリンク**（同じ inode）。コピー側を`chown`すると、モード`0660`のファイルは比較用Pythonの実行ユーザーから読めなくなり、`/derivatives/`が404になる。`chmod o+r`で読めるようにした（出力を比べる意味を保つため）。
 - **`ReadOnlyPaths`はT2.1で縮めた**: `photos`・`blog_exports`・`travel_blog`だけを読み取り専用に残し、writerが書く`catalog.db`と`derivatives/`は外した（`-wal`/`-shm`・`tmp/`・`.cache.json`・`.ingest.lock`は元から対象外）。**`GEOFRAME_INGEST`が`0`（既定）の間はwriterが作られないので、外しても何も書かれない**。P1の検証では`catalog.db`・`derivatives/`への書き込みが`Read-only file system`になることを確かめていたが、その防御はT2.1で外した（二重書き込みの防止は`GEOFRAME_INGEST`の既定が担う）。P3で更新APIを足すとき`blog_exports`・`travel_blog`も外す。ファイルのbind mountの注意（`catalog.db`を別のinodeに置き換えたら再起動）は、`catalog.db`を`ReadOnlyPaths`から外したので、unitとしては不要になったが、開いている接続が古いファイルを指し続けることは変わらない（下の「DBファイルの入れ替え」。復元後は必ず再起動する）。
+- **取り込みのガード（P5まで）**: `GEOFRAME_INGEST=1`のとき、バイナリが起動時に`/etc/geoframe/staging`の有無と`systemctl show geoframe-server.service`を確かめる（§11.1.1）。unitの制限下（`NoNewPrivileges`・`ProtectSystem=strict`・`SystemCallFilter=@system-service`）でも`systemctl show`は動く必要がある（`/usr/bin/systemctl`を子プロセスで起こし、systemdのD-Bus（読み取りだけ）で答えを得る）。**動かない・答えない・出力が読めないときは断る**（終了コード2。unitの`RestartPreventExitStatus=2`により再起動ループにならず`failed`で止まる）。`PrivateTmp`・`ProtectHome`は関係しない。検証環境での確認は§11.11。
 - **`MemoryDenyWriteExecute=true`を付けた**（Pythonは Pillow のC拡張が実行可能メモリへ書くので付けられない）。musl静的ビルドのRust（tokio・SQLite同梱）は、これを付けても起動・全エンドポイントの応答・スレッド生成が動いた（検証環境）。P2で画像処理（`zune-heic`・`image`・`fast_image_resize`）を入れたときに、実際のデコードで再確認する。
 - **`LimitNOFILE=4096`**。同時の接続256＋配信中のファイル32＋SQLite（読み取り5接続と`-wal`/`-shm`）＋標準入出力で300前後を使う（§9.3）ので、systemdの既定（1024）でも足りるが、余裕を持たせた。1024未満にするなら`limits.rs`の`MAX_CONNECTIONS`・`STATIC_FILE_SLOTS`もあわせて見直す。
 - **P5で、`app/.env`にだけある`GEOFRAME_*`を`/etc/default/geoframe`と突き合わせる**。Rustは`app/.env`を読まない（§1.3）ので、`.env`にしか書かれていない値は、移すか、捨てる判断をする。
@@ -473,14 +475,28 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | `GEOFRAME_INGEST` | `serve`の動き |
 | --- | --- |
 | `0`（未設定・空も同じ） | P1と同じ。**DBに一切書かない**（writerを作らない・移行しない・サイクルを回さない・`tmp/`も作らない）。DBが無ければ起動を断る。起動ログに`取り込みは無効です`と`ingest=0`を出す |
-| `1` | 起動時にロック→writerを開く→スキーマの作成・移行→`.cache.json`→`.dl_*`の掃除（§11.6）をしてから、読み取りの層を開く。DBが無ければ**空のDBを新しく作る**（warnで知らせる）。起動直後に同期サイクルを1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと |
+| `1` | 起動時に**ガード（§11.1.1）**→ロック→writerを開く→スキーマの作成・移行→`.cache.json`→`.dl_*`の掃除（§11.6）をしてから、読み取りの層を開く。DBが無ければ**空のDBを新しく作る**（warnで知らせる）。起動直後に同期サイクルを1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと |
 | 上記以外（`true`・`2`など） | 起動を断る（終了コード2。値はメッセージに書かない） |
 
 判断の理由:
 
 - **既定を`0`にした**: P5の切替まで本番の書き手はPython（`geoframe-server`）で、本番の`/etc/default/geoframe`をそのままRustの起動に使っても二重に書かない設計にするため。PythonがDBを開いたまま、Rustが移行や`UPDATE`を行うと、一次データ（手動GPS・お気に入り）を壊しうる。書くには明示（`GEOFRAME_INGEST=1`）が要る。既定の見直しはP5の切替のとき（本番の設定に`1`を足す）。
 - **空のDBを作る**（P1の「DBが無いと起動を断る」の例外）: 取り込みが有効ならRustが書き手なので、Pythonの`db()`と同じくDBを作る。無効のときは今までどおり断る（配備の誤りを失敗として見せる）。誤って空のDBを静かに作らないよう、作ったときはwarnを出す。データ置き場のディレクトリも無ければ作る（Pythonの`mkdir(parents=True)`と同じ）。
-- **二重起動のロック**: `DATA_DIR/.ingest.lock`を排他で取る（`File::try_lock`）。`serve`が取り込み中に`sync`（実行）を起動する、といった**Rust同士の二重書き込み**は断る（終了コード1）。**Pythonとの二重書き込みは防げない**（Pythonはこのロックを見ない）ので、Pythonが書いている間は`1`にしない。ドットファイルなので静的配信は403を返す。`--dry-run`はロックを取らず、動いている最中でも見られる。
+- **二重起動のロック**: `DATA_DIR/.ingest.lock`を排他で取る（`File::try_lock`）。`serve`が取り込み中に`sync`（実行）を起動する、といった**Rust同士の二重書き込み**は断る（終了コード1）。**Pythonとの二重書き込みはロックでは防げない**（Pythonはこのロックを見ない）。代わりにP5まではガード（§11.1.1）が、起動時に1回だけ、検証環境の印とPythonの非稼働を確かめる。起動したあとにPythonが起動された場合は検知しない。ドットファイルなので静的配信は403を返す。`--dry-run`はロックを取らず、動いている最中でも見られる。
+
+#### 11.1.1 本番への誤指定の防止（ガード）
+
+**P5の切替までの暫定。** `GEOFRAME_INGEST=1`は、設定の誤りや直接の起動だけで、本番で動いているPython（`geoframe-server`）の足元に書き込みを始められる。レビューでは、Pythonが接続を持ったままRustを起動すると成功し、開いている`.dl_*`まで消された（Pythonのダウンロードを壊す・`.cache.json`の更新が競合する）。配布スクリプトの拒否は、直接の起動や`/etc/default/geoframe`の書き換えには効かない。そこで**バイナリ自身が**、最初の書き込み（データ置き場の作成・ロック・移行・掃除・キャッシュの保存）の前に次の両方を確かめる（`guard.rs`。`ingest::start`の先頭。`serve`も`sync`の実行もここを通る）。
+
+1. **検証環境の印**`/etc/geoframe/staging`が通常ファイルとしてある（リンクは不可。中身は見ない）。`deploy/rust-deploy.sh`が使う印と同じで、扱いも同じ。本番機には印が無いので、ここで必ず止まる。
+2. **`geoframe-server.service`が非稼働と確認できる**。`systemctl show --property=LoadState,ActiveState`の結果が、`LoadState=not-found`（Pythonが入っていない機体）か、`ActiveState`が`inactive`／`failed`のときだけ通す。稼働中（`active`・`activating`・`reloading`・`deactivating`）・未知の状態・`systemctl`が無い／起動できない／5秒以内に答えない／異常終了／出力が空・欠けている、は**全て断る**（判定できないから素通し、にはしない。unitの制限下で`systemctl`が使えない機体では、取り込みは動かない）。
+
+断ったときは何も書かずに**終了コード2**で終わる（`serve`は`failed`で止まり、`RestartPreventExitStatus=2`により再起動ループにならない）。メッセージは理由（印の有無・Pythonの状態名）だけで、値は含まない。通ったときは`[guard]`でinfoを1行出す。
+
+- 検査は**起動時の1回だけ**。そのあとにPythonが起動された場合は検知しない（P5までは、検証環境にPythonの本番unitは無い）。
+- `sync --dry-run`は**ガードを通さない**。行・写真・キャッシュ・ロックを書かない（SQLiteのWAL関連ファイルだけはできうる）ので、本番機でも件数を見られるようにする。読み取り専用の`serve`（`GEOFRAME_INGEST`が`0`）も同じ。
+- **試験用の差し替えは、デバッグビルドだけ**: `GEOFRAME_TEST_STAGING_MARKER`（印のパス）と`GEOFRAME_TEST_PYTHON_STATE`（`<LoadState>/<ActiveState>`。`unavailable`は取得失敗）。`#[cfg(debug_assertions)]`の内側にあるので、配布するリリースビルド（musl）にはコードが無く、環境変数は無視される。差し替えても「印が要る」ことは外れない（指した先に通常ファイルが無ければ断る）。
+- **P5で外す**手順は[plan.md P5](plan.md#p5-切替pr-6)。外すときに消すもの: `guard.rs`と`lib.rs`の`pub mod guard`、`ingest::start`の`start_with`／`guard.check()`、`IngestError::Refused`と`cli.rs`の`exit_for_ingest_error`、`tests/ingest_cli.rs`の`Staging`と`GEOFRAME_TEST_*`、`USAGE`・本節・§0の行・§6の項・`deploy/README.md §7.1`・`deploy/geoframe-rs.service`の記述。
 
 ### 11.2 設定
 
@@ -502,21 +518,21 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 #### `--dry-run`
 
-`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。出すもの:
+`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。**行・写真・キャッシュ・ロック・`tmp/`・`derivatives/`は変えないが、SQLiteが読み取りでも作る`catalog.db-wal`・`catalog.db-shm`は新しくできうる**（WALのDBを開くとできる。中身は書かれない。ヘルプ（`USAGE`）と起動の1行目にも書いてある）。**ガード（§11.1.1）は通さない**: 書かないので、本番機でも件数を見られるようにしてある。出すもの:
 
 ```
-dry-run: 何も書きません（DB・ファイル・キャッシュ）
+dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）
 スキーマ: 作る表・索引 N / 足す列 N / place を NULL に戻す あり|なし / embedding の写し N
 掃除: 消す .dl_* N 件 / 捨てる .cache.json の旧キー N 件
 段 <名前>: 完了 <件数>|省略（理由）|失敗: …
 写真: 表示可能 N / 取得待ち N / 全N
 ```
 
-P2の受入（取り込み済みの本番コピーに対して、行の変更・derivativeの再取得がほぼ0）は、段の中身が入ったあと、この`--dry-run`で確かめる。DBが無ければ作らずに終了コード1で終わる。`tests/ingest_cli.rs`が、DB・`.cache.json`・`tmp/`・`derivatives/`のバイト列が変わらず、`.ingest.lock`も作られないことを確かめる。
+P2の受入（取り込み済みの本番コピーに対して、行の変更・derivativeの再取得がほぼ0）は、段の中身が入ったあと、この`--dry-run`で確かめる。DBが無ければ作らずに終了コード1で終わる。`tests/ingest_cli.rs`が、DB・`.cache.json`・`tmp/`・`derivatives/`のバイト列が変わらず、`.ingest.lock`も作られず、増えるファイルは`-wal`・`-shm`だけであることを確かめる。
 
 #### `geoframe sync`（実行）
 
-同期サイクルを1回だけ動かして終わる（棚卸し §5 の「手動トリガー」）。`GEOFRAME_INGEST=1`が要り、無ければ終了コード2で断る。ロック・writer・移行・掃除は`serve`と同じ（§11.1）。終了コードは、失敗した段があれば1、なければ0。
+同期サイクルを1回だけ動かして終わる（棚卸し §5 の「手動トリガー」）。`GEOFRAME_INGEST=1`が要り、無ければ終了コード2で断る。**ガード（§11.1.1）も`serve`と同じに通し、断られたら書かずに終了コード2**。ロック・writer・移行・掃除は`serve`と同じ（§11.1）。終了コードは、失敗した段があれば1、なければ0。
 
 ### 11.4 writer
 
@@ -524,7 +540,8 @@ P2の受入（取り込み済みの本番コピーに対して、行の変更・
 
 - `Catalog::with_writer`・`Catalog::writer()`で`Catalog`が持つ（取り込みが無効なら`None`）。読み取り側（`Catalog::read`・プール）は変えていない。
 - `writer.call(|conn| …)`は呼び出しスレッドをブロックして、依頼を書き込みスレッドで実行し、結果を返す。tokioのworkerから呼ぶ（P3の更新API）ときは`spawn_blocking`に包む。
-- 依頼が終わったとき、トランザクションが開いたままなら`ROLLBACK`する。依頼がパニックしても接続は生きたまま（`ROLLBACK`して`WriteError::Task`を返す）。
+- 依頼が終わったとき、トランザクションが開いたままなら`ROLLBACK`し、**自動コミットの状態に戻ったことを確かめてから**、結果を返信する（返信より後始末が先）。依頼がパニックしても接続は生きたまま（`ROLLBACK`して`WriteError::Task`を返す）。
+- **`ROLLBACK`できない・自動コミットに戻らないときは、その接続を捨ててwriterを止める**。その依頼の結果は（成功していても）`WriteError::Task`に差し替え、以後の依頼（キューに残っていたものも）は実行せず`WriteError::Task`を返す。再接続はしない（プロセスの再起動で直す。ログに`書き込み接続のトランザクションを戻せません`が出る）。判断の理由: ログだけで同じ接続を使い続けると、失敗した依頼のトランザクションを次の依頼が引き継ぎ、後続の`COMMIT`で失敗した依頼の行まで確定してしまう（レビューで故障注入により再現）。安全な再接続は、開いている読み取り側との整合・`busy_timeout`の扱いが増えるので、writerが壊れること自体が通常は起きない（`ROLLBACK`は実質失敗しない）ことから、止めて見せる方を選んだ。
 - `busy_timeout`は10秒、WAL。`WriteError`の文言はSQLiteのメッセージ（表名・列名まで）と定型文だけで、SQL・値・パスは入れない（テストで確認）。
 
 ### 11.5 `.cache.json`
@@ -532,7 +549,7 @@ P2の受入（取り込み済みの本番コピーに対して、行の変更・
 `cache.rs`。仕様は[inventory.md §3.2](inventory.md)・B0・B7のとおり。
 
 - 起動時に読み（無い・壊れている・オブジェクトでないときは空から）、`geo:`・`geocode_osm:`・`muni_table`以外のキーを捨てる。捨てたものがあれば**即保存**する。
-- 変更があり、前回の保存から60秒以上たっているときだけ書く（10秒ごとに起きる`cache-saver`スレッド）。一時ファイル`.cache.json.tmp`に書いて`fsync`し、`rename`で差し替える（Pythonは`fsync`しない）。失敗したら次のtickで再試行する。停止時にも最後の保存をする（Pythonはしない）。
+- 変更があり、前回の保存から60秒以上たっているときだけ書く（10秒ごとに起きる`cache-saver`スレッド）。一時ファイル`.cache.json.tmp`に書いて`fsync`し、`rename`で差し替える（Pythonは`fsync`しない）。失敗したら次のtickで再試行する。停止時にも最後の保存をする（Pythonはしない）。**最後の保存は、同期サイクルのスレッドの終了を待ってから1回だけ**行う（`cli::stop_ingest_threads`。`cache-saver`は停止の合図で終わるだけ）。同じ合図で両方を起こして保存側が先に最後の保存を終えると、あとから書く側の更新が失われるため。サイクルのスレッドが10秒の上限内に止まらないときは警告を出して、その時点のキャッシュを保存して終了する。
 - 値は`serde_json::Value`のまま持つので、`geo:`の中身は往復で欠けない。書き出しはPythonの`json.dumps(ensure_ascii=False, indent=1)`と同じ形（インデント1、日本語はそのまま）。**違いはキーの並びだけ**: Rustは辞書順、Pythonは挿入順（§0の索引）。どちらが書いたファイルも、もう一方が読める。
 - 座標を3桁に丸めた値がキーに入るので、ログには件数しか出さない。テストは合成の値だけ。
 
@@ -546,7 +563,7 @@ P2の受入（取り込み済みの本番コピーに対して、行の変更・
 
 - **空のDBから作る**: `photos`の定義に`muni_cd pref city favorite hidden rotation`を最初から含める。`sqlite_master.sql`の文字列まで、Pythonが空のデータ置き場から作ったDB（`ALTER`で列が足された形）と一致する。テスト`fresh_database_matches_the_python_one`が、`tools/gen_schema_fixture.py`の出力（`tests/fixtures/schema-python.json`）と、`sqlite_master`の全行・各表の`table_xinfo`・索引を比べる。Pythonの`SCHEMA`を変えたらこのテストが落ちる（再生成は`python3 tools/gen_schema_fixture.py`、`--check`で差を検査）。
 - **既存のDB（本番相当）では何もしない**: 列は`PRAGMA table_info`で有無を見て、無い列だけを`ALTER`する（Pythonは`ALTER`の失敗をすべて握りつぶすが、Rustはロックなどの本当の失敗を返す）。**M1（`UPDATE photos SET place=NULL`）は`muni_cd pref city`のどれかを足したときだけ**起きる。列が既にあるDBでは決して起きない。テスト`migration_is_a_no_op_on_a_production_shaped_database`が、Pythonの形のDBで、構造・`place IS NULL`の件数・`schema_version`・`total_changes()`・ファイルのバイト列が変わらないこと、`pending`（`--dry-run`）も何もないと答えることを示す。旧形のDBでは列を足して`place`を戻すこと（`migration_from_the_old_shape_adds_columns_and_resets_places_once`）、M2の列だけが無いDBでは戻さないこと（`adding_the_flag_columns_alone_does_not_reset_places`）も試験する。
-- **M7（`photo_embeddings`への`INSERT OR IGNORE`）はPythonと同じく毎起動**行う。行が無ければ書き込みは起きない（`total_changes()`が増えない）。`--dry-run`は挿入されるはずの行数を数える。
+- **M7（`photo_embeddings`への`INSERT OR IGNORE`）はPythonと同じく毎起動**行う。行が無ければ書き込みは起きない（`total_changes()`が増えない）。`--dry-run`は挿入されるはずの行数を数える。**`photo_embeddings`の表がまだ無い旧DBでも**、実際の移行は表を作ってから実行するので、作成後に入る件数（`photo_ai_features`の`error=''`の`(content_sha256, embedding_model)`の重複を除いた数）を数える（既にある表なら、そこに無いものだけ）。
 - 全体を`BEGIN IMMEDIATE`の1トランザクションに入れる（Pythonは途中で落ちると中途半端に移行されうる）。`journal_mode=WAL`はトランザクションの外。
 - 列の**並び**は移行で変えない（本番のDBは`infer_dt_s`が末尾など、空のDBと並びが違いうる）。読み取りの層は列名で読むので影響しない。
 
@@ -561,11 +578,13 @@ P2の受入（取り込み済みの本番コピーに対して、行の変更・
 | 対象 | テスト |
 | --- | --- |
 | スキーマ（`schema.rs`） | Pythonの空DBとRustの空DBの`sqlite_master`・`table_xinfo`・索引の一致、本番相当のスキーマで何もしない（構造・`place`・`schema_version`・`total_changes()`・ファイルのバイト列）、旧形の移行、M2の列だけが無いときの`place`、M7、`pending`（読み取り専用の接続で動く） |
-| writer（`writer.rs`） | 同じスレッド・同じ接続、並行する呼び出しの直列化、開いたトランザクションの`ROLLBACK`、失敗とパニックのあとも使えること、エラー文言に値・SQLが入らないこと、DBを作る・作らない、全ての`Writer`を落としたときの接続の終了 |
+| writer（`writer.rs`） | 同じスレッド・同じ接続、並行する呼び出しの直列化、開いたトランザクションの`ROLLBACK`、**`ROLLBACK`の失敗の故障注入（後始末を差し替える。失敗した依頼の行が確定せず、後続の依頼が実行されず、writerが止まる。成功した依頼も後始末に失敗したら成功を返さない）**、失敗とパニックのあとも使えること、エラー文言に値・SQLが入らないこと、DBを作る・作らない、全ての`Writer`を落としたときの接続の終了 |
+| 停止の順序（`cli.rs`） | サイクルのスレッドが最後に書いた更新が、最後のキャッシュの保存に入ること |
 | 同期サイクル（`sync.rs`） | 段の順、失敗・パニックの隔離、dry-runで`writer`が無いこと、停止の合図、起動直後に1回＋周期ごとの繰り返し、段がパニックしてもスレッドが続くこと |
-| `.cache.json`（`cache.rs`） | Pythonの`json.dumps(indent=1, ensure_ascii=False)`と同じ出力、旧キーの破棄と即保存、60秒の間引き、失敗時の再試行、凍結、保存スレッド |
-| 起動処理（`ingest.rs`） | `.dl_*`の掃除（通常ファイルだけ。リンク・ディレクトリは触らない）、DBの作成、ロック、再起動で何も変わらないこと、`plan`が書かないこと |
-| バイナリ（`tests/ingest_cli.rs`） | `sync --dry-run`が本番相当のDB・`.cache.json`・`tmp/`・`derivatives/`のバイト列を変えず`.ingest.lock`も作らないこと、DBが無ければ作らないこと、`GEOFRAME_INGEST`が無いと`sync`も`serve`も書かないこと、`serve`が取り込みつきで起動してSIGTERMで正常終了すること、二重起動の拒否 |
+| `.cache.json`（`cache.rs`） | Pythonの`json.dumps(indent=1, ensure_ascii=False)`と同じ出力、旧キーの破棄と即保存、60秒の間引き、失敗時の再試行、凍結、保存スレッド（最後の保存は呼び出し側） |
+| ガード（`guard.rs`） | 印が無い・ディレクトリ・リンクは断る、`systemctl show`の出力の厳密な解釈（欠け・空・異常終了・出力なしは断る）、稼働中・不明な状態は断る、時間内に答えない`systemctl`は止めて断る、デバッグビルドの差し替えが「印が要る」ことを外さないこと |
+| 起動処理（`ingest.rs`） | 断られたら置き場・DB・ロックが作られず中身も変わらないこと、 `.dl_*`の掃除（通常ファイルだけ。リンク・ディレクトリは触らない）、DBの作成、ロック、再起動で何も変わらないこと、`plan`が書かないこと |
+| バイナリ（`tests/ingest_cli.rs`） | `sync --dry-run`が本番相当のDB・`.cache.json`・`tmp/`・`derivatives/`のバイト列を変えず`.ingest.lock`も作らないこと、DBが無ければ作らないこと、`GEOFRAME_INGEST`が無いと`sync`も`serve`も書かないこと、`serve`が取り込みつきで起動してSIGTERMで正常終了すること、二重起動の拒否、**印が無い・Pythonが稼働中・状態が取れないとき、`sync`も`serve`も書き込みの前に終了コード2で止まり、置き場（DB・`.cache.json`・`tmp/`・`derivatives/`・`.ingest.lock`）が一切変わらないこと**、`--dry-run`と読み取り専用の`serve`はガードの対象外であること。取り込みを動かすテストは、デバッグビルドだけの差し替え（`GEOFRAME_TEST_STAGING_MARKER`・`GEOFRAME_TEST_PYTHON_STATE`）で印とPythonの状態を与える |
 | JWT・HTTPS（`jwt.rs`・`net.rs`） | [build.md §7](build.md) |
 
 ### 11.10 検証環境での確認（2026-10-24）

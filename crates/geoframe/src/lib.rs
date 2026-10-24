@@ -10,6 +10,7 @@ pub mod config;
 pub mod db;
 pub mod embedded;
 pub mod feed;
+pub mod guard;
 pub mod hostcheck;
 pub mod ingest;
 pub mod jwt;

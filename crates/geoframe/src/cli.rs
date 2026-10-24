@@ -16,6 +16,30 @@ use crate::sync::{CycleReport, Mode, StageCtx, StageResult};
 /// 停止のときに、取り込みのスレッドを待つ上限。
 const THREAD_STOP_LIMIT: Duration = Duration::from_secs(10);
 
+/// 取り込みの 2 つのスレッド。
+struct IngestThreads {
+    worker: std::thread::JoinHandle<()>,
+    saver: std::thread::JoinHandle<()>,
+}
+
+/// 止めるときの順序: **worker の終了を待ってから**キャッシュを最後に保存する。
+///
+/// 同じ停止の合図で両方を起こすので、saver が先に最後の保存を終えたあとで worker が最後の `put`
+/// をすると、その更新は保存されずに失われる。saver は合図で止まるだけ（最後の保存はしない）にして、
+/// 保存はここで、両方の終了を待ってから 1 回だけする。限られた時間内に worker が止まらなかったときも
+/// 保存はする（そのあとの `put` は失われうるが、警告を出す）。呼ぶ前に `stop` の合図を出しておくこと。
+fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration) {
+    for (name, handle) in [
+        ("同期サイクル", threads.worker),
+        ("キャッシュ保存", threads.saver),
+    ] {
+        if !join_within(handle, limit) {
+            tracing::warn!("{name}のスレッドが時間内に止まりませんでした（そのまま終了します）");
+        }
+    }
+    cache.save_now();
+}
+
 fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {
     let started = std::time::Instant::now();
     while !handle.is_finished() {
@@ -35,13 +59,17 @@ const USAGE: &str = "\
                                         TLS・証明書）が通るかを確かめる。出力は状態と HTTP ステータスだけ
   geoframe serve [--listen <addr:port>] [--data-dir <dir>]
                                         サーバーを起動する（DB は <dir>/catalog.db）。GEOFRAME_INGEST=1 のときだけ
-                                        取り込み（DB への書き込みと同期サイクル）も動かす。それ以外は読み取り専用
+                                        取り込み（DB への書き込みと同期サイクル）も動かす。それ以外は読み取り専用。
+                                        取り込みは P5 の切替まで検証環境専用: 検証環境の印（/etc/geoframe/staging）が
+                                        無い・geoframe-server が非稼働と確認できないなら、何も書かず終了コード 2 で断る
                                         設定は 起動引数 > 環境変数 GEOFRAME_* > 既定値 の順
                                         （詳細は docs/rust-migration/server.md）
   geoframe sync [--dry-run] [--data-dir <dir>]
-                                        同期サイクルを 1 回だけ動かして終わる。--dry-run は何も書かず、
-                                        やるとしたら何か（スキーマ・掃除・各段）を件数だけ出す。
-                                        書く実行は GEOFRAME_INGEST=1 が要る";
+                                        同期サイクルを 1 回だけ動かして終わる。--dry-run は行・写真・キャッシュ・
+                                        ロックを変えず（SQLite が読み取りでも作る WAL 関連ファイル catalog.db-wal・
+                                        -shm はできうる）、やるとしたら何か（スキーマ・掃除・各段）を件数だけ出す。
+                                        書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ印・Python の確認を通す
+終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または取り込みを断った（本番への誤指定の防止）";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -175,7 +203,7 @@ fn serve(overrides: &Overrides) -> ExitCode {
             Ok(ingest) => Some(ingest),
             Err(e) => {
                 tracing::error!("{e}");
-                return ExitCode::FAILURE;
+                return exit_for_ingest_error(&e);
             }
         }
     } else {
@@ -213,22 +241,17 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let config = Arc::new(config);
     // 同期サイクルとキャッシュ保存のスレッド。HTTP サーバーの起動を待たない
     let stop = StopFlag::new();
-    let threads: Vec<_> = ingest
-        .iter()
-        .flat_map(|ingest| {
-            [
-                crate::sync::spawn_worker(
-                    Arc::clone(&config),
-                    ingest.writer.clone(),
-                    Arc::clone(&ingest.cache),
-                    crate::sync::default_stages(),
-                    stop.clone(),
-                    config.drive_poll(),
-                ),
-                crate::cache::spawn_saver(Arc::clone(&ingest.cache), stop.clone()),
-            ]
-        })
-        .collect();
+    let threads = ingest.as_ref().map(|ingest| IngestThreads {
+        worker: crate::sync::spawn_worker(
+            Arc::clone(&config),
+            ingest.writer.clone(),
+            Arc::clone(&ingest.cache),
+            crate::sync::default_stages(),
+            stop.clone(),
+            config.drive_poll(),
+        ),
+        saver: crate::cache::spawn_saver(Arc::clone(&ingest.cache), stop.clone()),
+    });
     let state = AppState::new(Arc::clone(&config), catalog);
     if state.data_root.as_path() != state.config.data_dir.as_path() {
         // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する
@@ -240,10 +263,8 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let result = runtime.block_on(crate::server::serve(state));
     // 取り込みのスレッドを止める（サイクルの最中なら今の段が終わるまで。待つのは限られた時間だけ）
     stop.stop();
-    for thread in threads {
-        if !join_within(thread, THREAD_STOP_LIMIT) {
-            tracing::warn!("取り込みのスレッドが時間内に止まりませんでした（そのまま終了します）");
-        }
+    if let (Some(threads), Some(ingest)) = (threads, &ingest) {
+        stop_ingest_threads(threads, &ingest.cache, THREAD_STOP_LIMIT);
     }
     drop(ingest);
     // 固まった spawn_blocking（DB の読み取り）を待ち続けて、停止が終わらないことがないように
@@ -281,7 +302,9 @@ fn sync(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
 
 /// 書かずに計画を出す。書き込み接続を作らず、DB は読み取り専用、キャッシュは凍結して読む。
 fn sync_dry_run(config: &Config) -> ExitCode {
-    println!("dry-run: 何も書きません（DB・ファイル・キャッシュ）");
+    println!(
+        "dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）"
+    );
     let read = match crate::db::open_read_only(&config.db_path()) {
         Ok(conn) => conn,
         Err(e) => {
@@ -342,7 +365,7 @@ fn sync_apply(config: &Config) -> ExitCode {
         Ok(ingest) => ingest,
         Err(e) => {
             eprintln!("geoframe: {e}");
-            return ExitCode::FAILURE;
+            return exit_for_ingest_error(&e);
         }
     };
     let read = match crate::db::open_read_only(&config.db_path()) {
@@ -367,6 +390,15 @@ fn sync_apply(config: &Config) -> ExitCode {
     ingest.cache.save_now();
     print_report(&report);
     exit_for(&report)
+}
+
+/// 取り込みを始められなかったときの終了コード。ガードが断ったのは 2（設定の誤りと同じ扱いで、
+/// unit の `RestartPreventExitStatus=2` により再起動ループにしない。再起動しても直らない）。
+fn exit_for_ingest_error(e: &crate::ingest::IngestError) -> ExitCode {
+    match e {
+        crate::ingest::IngestError::Refused(_) => ExitCode::from(2),
+        _ => ExitCode::FAILURE,
+    }
 }
 
 /// 段ごとの結果と件数だけを出す（値は持っていない）。
@@ -462,5 +494,34 @@ mod tests {
         assert!(p(&["selfcheck-net", "x"]).is_err());
         assert!(p(&["sync", "--listen", "127.0.0.1:1"]).is_err());
         assert!(p(&["sync", "--data-dir"]).is_err());
+    }
+
+    /// 停止の順序: worker が止まる直前の最後の `put` も、最後の保存に入る。
+    #[test]
+    fn the_final_save_waits_for_the_worker_to_finish() {
+        use crate::testutil::TempDir;
+        use serde_json::json;
+
+        let dir = TempDir::new("cli-stop-order");
+        let cache = Arc::new(Cache::load(dir.path()));
+        let stop = StopFlag::new();
+        let saver = crate::cache::spawn_saver(Arc::clone(&cache), stop.clone());
+        // 偽の worker: 合図を見てから、少し遅れて最後の更新をする（saver が先に終わっても間に合う長さ）
+        let worker = {
+            let (cache, stop) = (Arc::clone(&cache), stop.clone());
+            std::thread::spawn(move || {
+                stop.wait(Duration::from_secs(30));
+                std::thread::sleep(Duration::from_millis(300));
+                cache.put("geo:late", json!(1));
+            })
+        };
+        stop.stop();
+        stop_ingest_threads(
+            IngestThreads { worker, saver },
+            &cache,
+            Duration::from_secs(10),
+        );
+        let saved = std::fs::read_to_string(dir.path().join(".cache.json")).unwrap();
+        assert!(saved.contains("geo:late"), "{saved}");
     }
 }

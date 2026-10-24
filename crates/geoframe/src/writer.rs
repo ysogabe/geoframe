@@ -17,10 +17,15 @@
 //!
 //! # 後始末の約束
 //!
-//! - 依頼が終わったとき、トランザクションが開いたままなら `ROLLBACK` する（`BEGIN` だけして戻ると、
-//!   以後の依頼が同じトランザクションの続きになってしまう）。
-//! - 依頼がパニックしたら、同じく `ROLLBACK` して**接続はそのまま使い続け**、呼び出し側には
+//! - 依頼が終わったとき、トランザクションが開いたままなら `ROLLBACK` し、自動コミットの状態に戻った
+//!   ことを確かめる（`BEGIN` だけして戻ると、以後の依頼が同じトランザクションの続きになってしまう）。
+//!   **この後始末が終わってから**、結果を呼び出し側へ返す。
+//! - 依頼がパニックしたら、同じく後始末をして**接続はそのまま使い続け**、呼び出し側には
 //!   [`WriteError::Task`] を返す。パニックのメッセージ（値が入りうる）は持たない。
+//! - `ROLLBACK` できない・自動コミットの状態に戻らないときは、**その接続を捨てて writer を止める**。
+//!   その依頼の結果は（成功していても）[`WriteError::Task`] に差し替え、以後の依頼（キューに残って
+//!   いたものも）は実行せずに同じ [`WriteError::Task`] を返す。開いたままのトランザクションを次の依頼が
+//!   引き継いで、後続の `COMMIT` で前の依頼の行まで確定する事故を防ぐ。再接続はしない（再起動で直る）。
 //! - 全ての `Writer` が drop されるとスレッドが終わり、接続が閉じる（WAL がチェックポイントされる）。
 //!
 //! # ログ・エラー
@@ -82,7 +87,29 @@ fn open_read_write(path: &Path, mode: OpenMode) -> rusqlite::Result<Connection> 
     Ok(conn)
 }
 
-type Job = Box<dyn FnOnce(&mut Connection) + Send>;
+/// 依頼。接続で実行し、**後始末が済んだあとに結果を返信する**ための閉包を返す
+/// （引数は後始末が成功したか。失敗なら結果を捨ててエラーを返信する）。
+type Job = Box<dyn FnOnce(&mut Connection) -> Reply + Send>;
+type Reply = Box<dyn FnOnce(bool) + Send>;
+
+/// 後始末: 開いたトランザクションを戻し、自動コミットの状態に戻ったことを確かめる。
+/// 戻せなかった（接続を使い続けてはいけない）ときは `false`。
+type Cleanup = fn(&Connection) -> bool;
+
+fn rollback_and_verify(conn: &Connection) -> bool {
+    if conn.is_autocommit() {
+        return true;
+    }
+    if conn.execute_batch("ROLLBACK").is_err() {
+        tracing::error!("書き込み接続のトランザクションを戻せません。書き込みを止めます");
+        return false;
+    }
+    if !conn.is_autocommit() {
+        tracing::error!("ROLLBACK のあとも自動コミットの状態に戻りません。書き込みを止めます");
+        return false;
+    }
+    true
+}
 
 /// 書き込み用の接続を持つスレッドへの入口。複製は安く、全ての複製が同じ接続（同じスレッド）を使う。
 #[derive(Clone)]
@@ -103,16 +130,27 @@ impl Writer {
         Ok(Self::spawn(conn))
     }
 
-    fn spawn(mut conn: Connection) -> Self {
+    fn spawn(conn: Connection) -> Self {
+        Self::spawn_with(conn, rollback_and_verify)
+    }
+
+    /// 後始末を差し替えられる形（故障注入の試験用に分けてある）。
+    fn spawn_with(mut conn: Connection, cleanup: Cleanup) -> Self {
         let (jobs, inbox) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("db-writer".into())
             .spawn(move || {
                 // 全ての Writer が drop されると recv が Err になり、スレッドが終わる
                 while let Ok(job) = inbox.recv() {
-                    job(&mut conn);
-                    if !conn.is_autocommit() && conn.execute_batch("ROLLBACK").is_err() {
-                        tracing::error!("書き込み接続のトランザクションを戻せません");
+                    let reply = job(&mut conn);
+                    // 後始末（トランザクションを戻して自動コミットに戻ったことの確認）が先、返信が後
+                    let clean = cleanup(&conn);
+                    reply(clean);
+                    if !clean {
+                        // この接続は使い続けない。ここで抜けると inbox が drop され、キューに残った
+                        // 依頼も実行されずに『停止しています』で返る。conn の drop で開いたままの
+                        // トランザクションは SQLite が捨てる
+                        break;
                     }
                 }
             })
@@ -133,8 +171,18 @@ impl Writer {
             let result = catch_unwind(AssertUnwindSafe(|| f(conn)))
                 .map_err(|_| WriteError::Task("書き込みがパニックしました"))
                 .and_then(|r| r.map_err(WriteError::Query));
-            // 呼び出し側が待つのをやめていても（drop 済み）構わない
-            let _ = reply.send(result);
+            Box::new(move |clean| {
+                // 後始末に失敗したら、結果が成功でも返さない（確定していない可能性がある）
+                let result = if clean {
+                    result
+                } else {
+                    Err(WriteError::Task(
+                        "書き込み接続を元に戻せなかったので書き込みを止めました",
+                    ))
+                };
+                // 呼び出し側が待つのをやめていても（drop 済み）構わない
+                let _ = reply.send(result);
+            })
         });
         self.jobs
             .send(job)
@@ -304,5 +352,67 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    /// 故障注入: ROLLBACK が効かない接続（失敗したジョブのトランザクションが残る）。
+    /// 失敗は呼び出し側に返り、writer は止まり、後続の依頼は実行されず、行は確定しない。
+    #[test]
+    fn a_failed_rollback_stops_the_writer_and_never_runs_later_jobs() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = TempDir::new("writer-rollback-fail");
+        let path = dir.path().join("w.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+        // ROLLBACK が効かない後始末: トランザクションが開いていれば戻せず失敗を返す
+        let w = Writer::spawn_with(
+            open_read_write(&path, OpenMode::MustExist).unwrap(),
+            |conn| conn.is_autocommit(),
+        );
+        // 失敗するジョブ: BEGIN して行を入れ、エラーで戻る（コミットしない）
+        let err = w
+            .call(|c| -> rusqlite::Result<()> {
+                c.execute_batch("BEGIN; INSERT INTO t(v) VALUES ('failed-job')")?;
+                Err(rusqlite::Error::InvalidQuery)
+            })
+            .unwrap_err();
+        // 元のエラーではなく、接続を戻せなかったことが返る（呼び出し側は結果を信用しない）
+        assert!(matches!(err, WriteError::Task(_)), "{err:?}");
+
+        // 後続のジョブ（COMMIT するもの）は実行されない
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let err = w
+            .call(move |c| {
+                flag.store(true, Ordering::SeqCst);
+                c.execute_batch("INSERT INTO t(v) VALUES ('later-job'); COMMIT")
+            })
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Task(_)), "{err:?}");
+        assert!(!ran.load(Ordering::SeqCst));
+
+        // 別の接続から見て、どちらの行も確定していない
+        drop(w);
+        let check = Connection::open(&path).unwrap();
+        let n: i64 = check
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// 返信は後始末のあとに届く: 成功したジョブでも、後始末に失敗したら成功は返らない。
+    #[test]
+    fn a_successful_job_is_not_reported_when_cleanup_fails() {
+        let dir = TempDir::new("writer-cleanup-fail");
+        let conn = Connection::open(dir.path().join("w.db")).unwrap();
+        let w = Writer::spawn_with(conn, |_| false);
+        let err = w.call(|_| Ok(1)).unwrap_err();
+        assert!(matches!(err, WriteError::Task(_)));
+        assert!(matches!(w.call(|_| Ok(2)), Err(WriteError::Task(_))));
     }
 }

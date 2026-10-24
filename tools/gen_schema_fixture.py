@@ -9,9 +9,10 @@
     python3 tools/gen_schema_fixture.py --check  # ファイルと再生成結果の差を検査する
 
 出力先は crates/geoframe/tests/fixtures/ の下。RustのテストがPythonの空DBとRustの空DBの構造を比べる
-（`crates/geoframe/src/schema.rs`）。SQLiteの`ALTER TABLE ADD COLUMN`は`sqlite_master.sql`の文字列を
-書き換えるので、`photos`の`sql`の文字列は一致しない。比べるのは構造（列の名前・型・NOT NULL・既定値・
-主キー・並び、索引の列と一意性）。それ以外の表・索引は`sql`の文字列も一致する。
+（`crates/geoframe/src/schema.rs`）。比べるのは`sqlite_master`の`sql`の文字列（作成順どおり。
+`photos`も含む）と、各表の列（名前・型・NOT NULL・既定値・主キー・並び）・各表の索引（列と一意性）。
+空のDBでは、PythonもRustも`CREATE TABLE`の時点で全列を持つ（`ALTER TABLE ADD COLUMN`は起きない）ので、
+`photos`の`sql`の文字列も一致する。
 """
 
 import json

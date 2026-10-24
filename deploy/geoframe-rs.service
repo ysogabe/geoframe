@@ -70,6 +70,9 @@ MemoryDenyWriteExecute=true
 #   .cache.json(.tmp) … 地名の永続キャッシュ    .ingest.lock … 取り込みの二重起動を防ぐロック
 # ただし GEOFRAME_INGEST=1 を設定しない限り（既定は 0）、writer は作られず何も書かない。P5 の切替まで
 # 本番の書き手は Python 版なので、/etc/default/geoframe で明示するまで Rust は書かない。
+# GEOFRAME_INGEST=1 でも、P5 までは検証環境の印（/etc/geoframe/staging）が無い、または geoframe-server が
+# 非稼働と確認できないと、書き込みの前に終了コード 2 で断る（docs/rust-migration/server.md §11.1.1）。
+# 終了コード 2 は下の RestartPreventExitStatus=2 により再起動ループにならない。
 # 引き続き読み取り専用にするもの（先頭の "-" は無いパスを無視する指定。ReadOnlyPaths は
 # StateDirectory の書き込み許可より後に効く）:
 #   photos/ … ローカル原本。索引は読むだけ（T2.3 の --organize が動かすときに見直す）

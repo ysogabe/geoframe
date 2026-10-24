@@ -453,23 +453,30 @@ pub fn pending(conn: &Connection) -> rusqlite::Result<Pending> {
             }
         }
     }
-    if object_exists(conn, "table", "photo_ai_features")?
-        && object_exists(conn, "table", "photo_embeddings")?
-    {
+    if object_exists(conn, "table", "photo_ai_features")? {
         let features = column_names(conn, "photo_ai_features")?;
         if ["content_sha256", "embedding_model", "error"]
             .iter()
             .all(|c| features.iter().any(|f| f == c))
         {
-            // INSERT OR IGNORE が実際に挿入する行数（主キー (sha, model) の重複を 1 つに数える）
-            out.embeddings_to_copy = conn.query_row(
-                "SELECT COUNT(*) FROM (
-                   SELECT DISTINCT f.content_sha256, f.embedding_model
-                   FROM photo_ai_features f
-                   WHERE f.error='' AND NOT EXISTS (
+            // INSERT OR IGNORE が実際に挿入する行数（主キー (sha, model) の重複を 1 つに数える）。
+            // 写し先が無いときも、実際の移行は表を作ってから M7 を実行するので、全て挿入される
+            // （既にあるものを引く条件だけが無くなる）
+            let already_there = if object_exists(conn, "table", "photo_embeddings")? {
+                "AND NOT EXISTS (
                      SELECT 1 FROM photo_embeddings e
                      WHERE e.content_sha256=f.content_sha256
-                       AND e.embedding_model=f.embedding_model))",
+                       AND e.embedding_model=f.embedding_model)"
+            } else {
+                ""
+            };
+            out.embeddings_to_copy = conn.query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM (
+                   SELECT DISTINCT f.content_sha256, f.embedding_model
+                   FROM photo_ai_features f
+                   WHERE f.error='' {already_there})"
+                ),
                 [],
                 |row| row.get(0),
             )?;
@@ -782,6 +789,35 @@ mod tests {
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM photo_embeddings"), 2);
         assert!(migrate(&mut conn).unwrap().is_noop());
         assert_eq!(pending(&conn).unwrap().embeddings_to_copy, 0);
+    }
+
+    /// 旧 DB（`photo_embeddings` が無い）: 実際の移行は表を作ってから M7 を実行するので、
+    /// dry-run も作成後に挿入される件数を数える。既存の表への差分コピーとは別の経路。
+    #[test]
+    fn pending_counts_embeddings_to_copy_when_the_cache_table_is_missing() {
+        let dir = TempDir::new("schema-m7-missing");
+        let mut conn = python_shaped(&dir);
+        conn.execute_batch(
+            "INSERT INTO photo_ai_features(photo_id,display,content_sha256,embedding_model,
+               embedding_dim,embedding,analyzed_at,error) VALUES
+               (1,'d','sha1','m',1,x'01','t',''),
+               (2,'d','sha1','m',1,x'01','t',''),
+               (3,'d','sha1','m2',1,x'01','t',''),
+               (4,'d','sha2','m',1,x'02','t',''),
+               (5,'d','sha3','m',1,x'03','t','failed');
+             DROP TABLE photo_embeddings;",
+        )
+        .unwrap();
+        let p = pending(&conn).unwrap();
+        assert!(p.missing_objects.contains(&"photo_embeddings".to_string()));
+        // (sha1,m)・(sha1,m2)・(sha2,m) の 3 件。sha3 は error 付きで対象外
+        assert_eq!(p.embeddings_to_copy, 3);
+        // 実移行と一致する
+        let done = migrate(&mut conn).unwrap();
+        assert_eq!(done.embeddings_copied, 3);
+        assert!(done.created.contains(&"photo_embeddings".to_string()));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM photo_embeddings"), 3);
+        assert!(pending(&conn).unwrap().is_noop());
     }
 
     #[test]
