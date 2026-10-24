@@ -1,0 +1,25 @@
+# miharashi の Feed（一覧の取得と写真の読み込みの別スレッド）を、画面なしで Rust 版 geoframe に
+# 向けて動かす確認用ハーネス（T1.5）。
+#
+# miharashi-app は実行ファイルだけでライブラリではないので、photos.rs・album.rs を #[path] でそのまま
+# 取り込む（画面側の型だけ src/main.rs に最小の代役を置く）。取得・デコード・並べ方・再接続のコードは
+# miharashi 本体と同じ。miharashi のソースは変更しない。
+#
+# このリポジトリのワークスペースには入れない（miharashi のソースに依存するため。CI ではビルドしない）。
+# 空の [workspace] は、ルートの cargo から「別のワークスペース」と見なさせるための宣言。
+[workspace]
+
+[package]
+name = "miharashi-feed-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# 版は miharashi-app/Cargo.toml に合わせる（setup.sh が miharashi の Cargo.lock を写す）
+[dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+image = "0.25.10"
+serde_json = "1.0.152"
+ureq = "3.4.2"
+# vendor/miharashi は setup.sh が MIHARASHI_DIR へ張るシンボリックリンク
+miharashi-render = { version = "0.1.0", path = "vendor/miharashi/crates/miharashi-render" }

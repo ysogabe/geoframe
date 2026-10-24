@@ -1,0 +1,4 @@
+# setup.sh が作るもの（miharashi へのリンク・miharashi から写した Cargo.lock）
+/vendor/
+/Cargo.lock
+/target/
