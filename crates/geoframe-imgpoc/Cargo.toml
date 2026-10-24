@@ -29,7 +29,8 @@ zune-core = "0.5.1"
 moxcms = "0.8.1"
 # libheif 1.17（Ubuntu 24.04 の既定）で動くよう、API は v1_17 までに限る
 libheif-rs = { version = "3.0.0", default-features = false, features = ["v1_17"], optional = true }
-# 純RustのHEICデコーダ候補。いずれもMIT OR Apache-2.0（`heic`クレートはAGPL-3.0なので候補から外した）
+# 純RustのHEICデコーダ候補。zune-heicは MIT OR Apache-2.0 OR Zlib、heic-rs・heif-oxideは MIT OR Apache-2.0
+# （`heic`クレートはAGPL-3.0-onlyなので候補から外した）
 zune-heic = { version = "0.5.0", optional = true }
 heic-rs = { version = "0.1.4", optional = true }
 heif-oxide = { version = "0.1.0", optional = true }

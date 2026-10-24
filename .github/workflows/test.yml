@@ -67,8 +67,11 @@ jobs:
       - name: Rustテスト
         run: cargo test
 
+      - name: "Rustテスト（画像PoC: 純RustのHEIC zune-heic。libheifなし）"
+        run: cargo test -p geoframe-imgpoc --features heic-zune
+
       - name: muslで静的ビルド
-        # 静的リンクの検査対象は本体のgeoframeだけ。画像PoC（geoframe-imgpoc）は含めない
+        # 本体のgeoframe。画像PoC（geoframe-imgpoc）は下の別の手順で、libheifなしの構成だけを検査する
         run: cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 
       - name: 静的リンクの検査
@@ -84,9 +87,27 @@ jobs:
           fi
           "$bin" --version
 
+      - name: "muslで静的ビルド（画像PoC: zune-heic＋mimalloc）"
+        # 推奨構成の柱「HEICをzune-heicにすればmusl静的に入る」（docs/rust-migration/image-poc.md）の検証。
+        # libheifは入れない。mimallocはCをccでビルドする（上のmusl-toolsが要る）
+        run: cargo build --release --target x86_64-unknown-linux-musl -p geoframe-imgpoc --features heic-zune,mimalloc
+
+      - name: 静的リンクの検査（画像PoC）
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/geoframe-imgpoc
+          ls -l "$bin"
+          file "$bin"
+          file "$bin" | grep -E 'statically linked|static-pie linked'
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "動的ライブラリにリンクされています" >&2
+            exit 1
+          fi
+          "$bin" --help > /dev/null
+
   imgpoc-heic:
     name: "画像PoC（HEIC: libheifへ動的リンク）"
-    runs-on: ubuntu-latest
+    # libheif 1.17.6（Ubuntu 24.04）を前提にしているので、ubuntu-latestではなく固定する
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: ソースを取得

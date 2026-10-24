@@ -109,6 +109,9 @@ pub struct Options {
     pub heic_threads: Option<u32>,
 }
 
+// 既定値はPoCの比較の基準（現行Pythonと同じ順序、libheif）で、**推奨構成とは違う**。
+// 推奨は`order: ResizeFirst`・`heic: Zune`（docs/rust-migration/image-poc.mdの§1・§6）。
+// P2で本体へ移すときに、既定値を推奨に合わせる。
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -352,6 +355,7 @@ pub fn resize(img: RgbImage, dims: (u32, u32), resizer: Resizer) -> Result<RgbIm
     }
 }
 
+/// 画素をsRGBへ変換する。失敗したときは`img`を変えない
 fn to_srgb(img: &mut RgbImage, icc: &[u8]) -> Result<(), String> {
     use moxcms::{ColorProfile, Layout, TransformOptions};
     let src = ColorProfile::new_from_slice(icc).map_err(|e| format!("ICCを読めません: {e:?}"))?;
@@ -359,10 +363,12 @@ fn to_srgb(img: &mut RgbImage, icc: &[u8]) -> Result<(), String> {
     let transform = src
         .create_transform_8bit(Layout::Rgb, &dst, Layout::Rgb, TransformOptions::default())
         .map_err(|e| format!("ICC変換を作れません: {e:?}"))?;
-    let input = img.as_raw().clone();
+    let mut converted = vec![0u8; img.as_raw().len()];
     transform
-        .transform(&input, img.as_mut())
-        .map_err(|e| format!("ICC変換に失敗: {e:?}"))
+        .transform(img.as_raw(), &mut converted)
+        .map_err(|e| format!("ICC変換に失敗: {e:?}"))?;
+    img.copy_from_slice(&converted);
+    Ok(())
 }
 
 pub fn encode_jpeg(img: &RgbImage, icc: Option<&[u8]>, opts: &Options) -> Result<Vec<u8>, String> {
@@ -479,7 +485,9 @@ pub fn process(bytes: &[u8], path: Option<&Path>, opts: &Options) -> Result<Outp
             IccPolicy::Keep => out_icc = Some(profile),
             IccPolicy::Srgb => {
                 let t = Instant::now();
-                to_srgb(&mut img, &profile)?;
+                // 読めない・壊れている・RGBでない（グレーなど）ICCは、警告なしで捨てて続ける（`Drop`と同じ）。
+                // 画像の内容は変えず、失敗の中身（プロファイルの値）もログへ出さない
+                let _ = to_srgb(&mut img, &profile);
                 timings.icc = t.elapsed();
             }
         }

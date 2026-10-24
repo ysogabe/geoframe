@@ -1,6 +1,8 @@
-//! HEICの経路（feature `heic`）の確認。合成の小さなHEIC（`tests/fixtures/`、`scripts/gen_fixtures.py`で作成。
-//! 写真ではない）だけを使う。HEVCのデコーダ（libde265のプラグイン等）がシステムに無いと失敗する。
-#![cfg(feature = "heic")]
+//! HEICの経路（feature `heic`＝libheif、`heic-zune`＝純Rustの`zune-heic`）の確認。合成の小さなHEIC
+//! （`tests/fixtures/`、`scripts/gen_fixtures.py`で作成。写真ではない）だけを使う。libheifの経路は、
+//! HEVCのデコーダ（libde265のプラグイン等）がシステムに無いと失敗する。推奨の`zune-heic`は
+//! libheifの無い環境でもこのファイルで試される。
+#![cfg(any(feature = "heic", feature = "heic-zune"))]
 
 use geoframe_imgpoc::{HeicBackend, IccPolicy, Options, process};
 
@@ -24,9 +26,12 @@ fn has_exif(bytes: &[u8]) -> bool {
     bytes.windows(6).any(|w| w == b"Exif\0\0")
 }
 
+// featureの組み合わせ（libheifだけ・zuneだけ・両方）で`push`の数が変わる
+#[allow(unused_mut, clippy::vec_init_then_push)]
 fn backends() -> Vec<(&'static str, HeicBackend)> {
-    #[allow(unused_mut)]
-    let mut v = vec![("libheif", HeicBackend::Libheif)];
+    let mut v = Vec::new();
+    #[cfg(feature = "heic")]
+    v.push(("libheif", HeicBackend::Libheif));
     #[cfg(feature = "heic-zune")]
     v.push(("zune", HeicBackend::Zune));
     v
@@ -81,12 +86,14 @@ fn heicのiccはデコーダから取れる() {
 }
 
 #[test]
-fn heicでないバイト列は拒否する() {
-    let opts = Options {
-        heic: HeicBackend::Libheif,
-        ..Options::default()
-    };
-    let mut broken = fixture("synthetic_o1.heic");
-    broken.truncate(broken.len() / 2);
-    assert!(process(&broken, None, &opts).is_err());
+fn 途中で切ったheicは拒否する() {
+    for (name, backend) in backends() {
+        let opts = Options {
+            heic: backend,
+            ..Options::default()
+        };
+        let mut broken = fixture("synthetic_o1.heic");
+        broken.truncate(broken.len() / 2);
+        assert!(process(&broken, None, &opts).is_err(), "{name}");
+    }
 }

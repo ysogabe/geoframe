@@ -41,7 +41,7 @@ cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 2. `Swatinem/rust-cache`でビルドをキャッシュする。
 3. `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`。
 4. `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`。
-5. 成果物（本体の`geoframe`のみ。`-p geoframe`で限る）が静的リンクであることを`file`（`statically linked`または`static-pie linked`）と`ldd`（共有ライブラリを列挙しない）で検査し、`--version`を実行する。動的リンクが混ざるとCIが落ちる。
+5. 成果物（本体の`geoframe`。`-p geoframe`で限る。画像PoCは別の手順で、libheifなしの`--features heic-zune,mimalloc`だけ同じ検査をする）が静的リンクであることを`file`（`statically linked`または`static-pie linked`）と`ldd`（共有ライブラリを列挙しない）で検査し、`--version`を実行する。動的リンクが混ざるとCIが落ちる。
 
 ## 3. musl静的ビルドの結果
 
@@ -89,7 +89,7 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 | --- | --- |
 | `Cargo.toml` | workspace（resolver 3、メンバーは`crates/geoframe`と`crates/geoframe-imgpoc`）。`Cargo.lock`はコミットする |
 | `crates/geoframe/` | ライブラリ＋バイナリ`geoframe`。edition 2024（miharashiに合わせる） |
-| `crates/geoframe-imgpoc/` | 画像処理の技術PoC（`publish = false`）。静的ビルドの検査対象にしない（CIのmuslビルドは`-p geoframe`）。結果は[image-poc.md](image-poc.md) |
+| `crates/geoframe-imgpoc/` | 画像処理の技術PoC（`publish = false`）。本体の静的ビルドの検査には含めない。CIは別の手順で、`--features heic-zune,mimalloc`（libheifなし）のmusl静的ビルドと`file`／`ldd`の検査だけを行う。結果は[image-poc.md](image-poc.md) |
 | `geoframe --version` | バージョンを出す |
 | `geoframe check-db <path>` | `photos`の行数とSQLiteのバージョンを出す。読み取り専用 |
 | `geoframe serve --listen <addr>` | `GET /healthz`が`{"ok":true}`を返す。SIGTERMで停止 |
@@ -107,5 +107,5 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
   - 配布先と同じglibcでビルドする（検証環境の中、または同じ世代のコンテナでビルドする）。HEIC部分だけ別プロセス（`heif-convert`など）にする案もある。
   - `cargo-zigbuild`でglibcの古い版（例: 2.31）を指定してビルドする。n100の新しいglibcを避けられる。
 - **名前解決**: muslの`getaddrinfo`はglibcと違い、`/etc/resolv.conf`の`search`・`options`の扱いが一部異なる。外部HTTP（Gemini）を入れるP4で、検証環境から実際に名前解決できることを確かめる。
-- **メモリアロケータ**: muslの標準アロケータは画像処理で**約15〜25%遅かった**（画像PoC: JPEG 273 vs 235 ms、`zune-heic` 1,086 vs 871 ms）。`mimalloc`を付けるとglibcと同等以上（JPEG 222 ms）になるが、RSSはglibc並みに増える。P2の画像処理から`mimalloc`を付ける。現状の本体（画像処理なし）の最大RSS（1.5〜2.8 MiB）では差は出ていない。
+- **メモリアロケータ**: muslの標準アロケータは画像処理で**約15〜25%遅かった**（画像PoC: JPEG 273 vs 235 ms、`zune-heic` 1,086 vs 871 ms）。`mimalloc`を付けると、JPEGはglibcと同等以上（222 ms）になるが、HEIC（`zune-heic`）はglibcより約8%遅いまま（939 vs 871 ms）で、RSSもglibc並みに増える。`mimalloc`はCのソースを`cc`でビルドする（CIの`rust`ジョブは`musl-tools`を入れてある）。P2の画像処理から`mimalloc`を付ける。現状の本体（画像処理なし）の最大RSS（1.5〜2.8 MiB）では差は出ていない。
 - **glibcビルドを選ぶ場合**: CIとn100のglibcは、本番（P5で切り替える機体）より古くなければならない。バイナリの`objdump -T`で要求バージョンを確かめる。画像PoCでは、開発機（glibc 2.41）でビルドしたglibcバイナリが検証環境（2.39）でそのまま動いた。`objdump -T`が出す最大版（`GLIBC_2.39`）は、Rust 1.99の`std::process::Command`が参照する`pidfd_spawnp`・`pidfd_getpid`の**弱参照**（`readelf -V`で`WEAK`）で、必須の要求は2.34まで。最大版だけでなく`WEAK`の有無も見る。

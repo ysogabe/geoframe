@@ -34,9 +34,9 @@ def exif_bytes(orientation, gps=True):
     if gps:
         g = ex.get_ifd(0x8825)
         g[1] = "N"
-        g[2] = (35.0, 40.0, 0.0)
+        g[2] = (10.0, 20.0, 30.0)
         g[3] = "E"
-        g[4] = (139.0, 45.0, 0.0)
+        g[4] = (100.0, 40.0, 50.0)
     return ex.tobytes()
 
 

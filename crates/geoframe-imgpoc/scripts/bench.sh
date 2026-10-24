@@ -50,4 +50,28 @@ if command -v heif-convert > /dev/null; then
   run h-cmd       heic --icc drop --heic heif-convert
   run h-cmd-jobs2 heic --icc drop --heic heif-convert --jobs 2
 fi
+# 純RustのHEICデコーダ（バイナリを heic-zune,heic-rs,heic-oxide 付きでビルドしておく。
+# 付けていないと該当の行は全件エラーになり、下の一致比較も0枚になる）
+run h-zune          heic --icc drop --heic zune
+run h-heic-rs       heic --icc drop --heic heic-rs
+run h-oxide         heic --icc drop --heic oxide
+
+# 出力の比較: zuneとlibheifの出力が、ファイルごとにバイト単位で同じか（どちらも --icc drop）。
+# heic-rs・oxideはlibheifと色が合わないので、一致する枚数が少ないことの確認になる。
+same_bytes() {  # same_bytes <基準の設定名> <比較する設定名>
+  local a=$1 b=$2 total=0 same=0 f
+  for f in "$WORK/out/$a"/*.jpg; do
+    [ -e "$f" ] || continue
+    total=$((total + 1))
+    cmp -s "$f" "$WORK/out/$b/$(basename "$f")" && same=$((same + 1))
+  done
+  echo "## 出力のバイト一致 $a と $b: $same/$total 枚" >> "$LOG"
+}
+same_bytes h-libheif h-zune
+same_bytes h-libheif h-heic-rs
+same_bytes h-libheif h-oxide
+
+# ICCの有無（--reportのicc_in）が、libheifとzuneで同じ枚数か。値の一致までは見ていない
+icc_count() { grep -c '"icc_in":true' "$WORK/out/$1.jsonl"; }
+echo "## icc_in=true の枚数: libheif=$(icc_count h-libheif) zune=$(icc_count h-zune)" >> "$LOG"
 echo done >> "$LOG"

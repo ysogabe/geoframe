@@ -165,6 +165,50 @@ fn collect(inputs: &[PathBuf]) -> Result<Vec<PathBuf>, String> {
     Ok(files)
 }
 
+/// 存在しない部分を含むパスを、実在する最も深い祖先の正規化＋残りの要素に直す
+fn resolve(path: &Path) -> std::io::Result<PathBuf> {
+    let abs = std::path::absolute(path)?;
+    let mut rest = Vec::new();
+    let mut cur = abs.as_path();
+    loop {
+        match cur.canonicalize() {
+            Ok(mut base) => {
+                base.extend(rest.iter().rev());
+                return Ok(base);
+            }
+            Err(_) => {
+                let (Some(name), Some(parent)) = (cur.file_name(), cur.parent()) else {
+                    return Ok(abs);
+                };
+                rest.push(name.to_owned());
+                cur = parent;
+            }
+        }
+    }
+}
+
+/// `--out`が入力のディレクトリ（ファイル入力ならその親）と同じか、その下なら拒否する。
+/// 入力の`<id>.jpg`を出力で上書きしたり、出力を次の入力として拾ったりしないため
+fn check_out_dir(out: &Path, inputs: &[PathBuf]) -> Result<(), String> {
+    let out_abs = resolve(out).map_err(|e| e.to_string())?;
+    for input in inputs {
+        let root = if input.is_dir() {
+            input.clone()
+        } else {
+            input
+                .parent()
+                .map(Path::to_path_buf)
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| PathBuf::from("."))
+        };
+        let root_abs = resolve(&root).map_err(|e| e.to_string())?;
+        if out_abs.starts_with(&root_abs) {
+            return Err("--outは入力のディレクトリと同じか、その下にはできません".into());
+        }
+    }
+    Ok(())
+}
+
 /// `/proc/self/status`の`VmHWM`（最大RSS、KiB）
 fn max_rss_kib() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -318,7 +362,8 @@ fn main() {
         }
     };
     if let Some(dir) = &cli.out
-        && let Err(e) = std::fs::create_dir_all(dir)
+        && let Err(e) = check_out_dir(dir, &cli.inputs)
+            .and_then(|()| std::fs::create_dir_all(dir).map_err(|e| e.to_string()))
     {
         eprintln!("{e}");
         std::process::exit(2);
@@ -336,5 +381,45 @@ fn main() {
         // 失敗の内容は画像の中身を含まないが、件数だけ標準エラーに出す
         eprintln!("失敗した入力があります（--reportで確認）");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("geoframe-imgpoc-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn outは入力と同じかその下なら拒否する() {
+        let base = tmp("out-check");
+        let input = base.join("in");
+        std::fs::create_dir_all(input.join("sub")).unwrap();
+        std::fs::write(input.join("a.jpg"), b"x").unwrap();
+        let inputs = [input.clone()];
+
+        assert!(check_out_dir(&input, &inputs).is_err());
+        assert!(check_out_dir(&input.join("sub"), &inputs).is_err());
+        // まだ無いディレクトリでも、入力の下なら拒否する
+        assert!(check_out_dir(&input.join("new/deeper"), &inputs).is_err());
+        // `..`を経由した同じ場所
+        assert!(check_out_dir(&input.join("sub/.."), &inputs).is_err());
+        // ファイル入力は、その親ディレクトリを入力の場所とみなす
+        assert!(check_out_dir(&input, &[input.join("a.jpg")]).is_err());
+        // 兄弟のディレクトリ（名前が前方一致でも別）は通す
+        assert!(check_out_dir(&base.join("in-out"), &inputs).is_ok());
+        assert!(check_out_dir(&base.join("out"), &inputs).is_ok());
+        assert!(check_out_dir(&base, &inputs).is_ok());
+        // シンボリックリンク経由でも同じ場所は拒否する
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&input, &link).unwrap();
+        assert!(check_out_dir(&link.join("x"), &inputs).is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

@@ -103,7 +103,8 @@ def main():
         if kind == "jpeg":
             stored.save(work / "jpeg" / f"{name}.jpg", "JPEG", quality=92, exif=exif, icc_profile=icc)
         else:
-            # pillow-heifは、EXIFの向きがあるとirot/imirとして書き、EXIF側の向きは1へ戻す（libheifの仕様）
+            # pillow-heifは、EXIFの向きがあるとirot/imirとして書く。渡したEXIFのOrientationも残るので、ファイルは
+            # irotとEXIFの両方を持つ（実機のHEICと同じ。デコーダがEXIF側を無視することの確認になる）
             stored.save(work / "heic" / f"{name}.heic", "HEIF", quality=85, exif=exif, icc_profile=icc)
         stats[kind] += 1
     print("作成:", stats)

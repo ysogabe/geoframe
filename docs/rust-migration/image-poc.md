@@ -27,6 +27,8 @@ Pythonとの比較（検証環境の2コア。1枚あたりの中央値）:
 | JPEG 約12MP | 312 ms | **220〜234 ms**（縮小→向き補正／向き補正→縮小。glibc、musl＋mimallocも同程度） |
 | JPEG 約48MP | 1,120 ms | **568 ms** |
 | HEIC 約12MP | 1,279 ms | **871 ms**（zune-heic、2コアを使う）／1,242 ms（libheif 1.23） |
+| 処理量（JPEG、2並列） | 5.48枚/秒 | 7.20枚/秒（`image`。musl＋mimallocは7.73） |
+| 処理量（HEIC、2並列） | 1.40枚/秒 | **1.20枚/秒**（zune-heic。1枚あたりは速いが、2枚同時の処理量はPythonより低い）／1.26枚/秒（libheif 1.17.6）／1.48枚/秒（libheif 1.23） |
 | 最大RSS（JPEG 12MP、1枚ずつ） | 178 MiB | 約170〜200 MiB（musl＋mimallocは183、縮小→向き補正は173） |
 
 JPEGは約25%速い程度で、**Rustにする理由は速度ではない**（PythonのPillowも縮小・エンコードはCのSIMD実装）。単一バイナリ化と、Python・pillow-heif・libheifの同梱が要らなくなることが利点になる。
@@ -66,7 +68,7 @@ CPUの条件: 検証環境の2コアを他の作業と競合させず、1設定�
 
 ### 3.1 全体と現行Pythonとの違い
 
-計測した全26設定（JPEG17・HEIC9、各50枚、計1,300枚）で、Rustの出力は**現行Pythonと同じ寸法**になった（不一致は0）。向き補正（1/3/6/8）と、HEICのirotの二重適用が無いことを含む。
+[`bench.sh`](../../crates/geoframe-imgpoc/scripts/bench.sh)の全26設定（JPEG17・HEIC9＝libheif4、外部コマンド2、zune-heic・heic-rs・heif-oxideが各1。各50枚、計1,300枚）で、Rustの出力は**現行Pythonと同じ寸法**になった（不一致は0）。向き補正（1/3/6/8）と、HEICのirotの二重適用が無いことを含む。
 
 ### 3.2 JPEG（50枚、ICCは捨てる＝Pythonと同じ条件、`--jobs 1`）
 
@@ -104,7 +106,7 @@ CPUの条件: 検証環境の2コアを他の作業と競合させず、1設定�
 | 向きの読み取り | `image`（基準） / `kamadak-exif` | 234 / 241 ms | - | 同じ | 202 / 190 MiB | 同じ |
 
 - **重要: `jpeg-encoder`の「4:2:0＋ハフマン最適化」の出力を、zune-jpeg 0.5.15（`image`のデコーダ）が正しく読めない。** Pillowは正しく読む。実際の出力10枚を`image`で読み直すと、Pillowの読み取り結果とのPSNRが4〜8 dBだった（正しい出力は52〜59 dB）。miharashiは`image`でderivativeを読むので、**ハフマン最適化は付けない**。4:4:4では起きない。上流への報告はしていない。
-- 4:2:0・ハフマン最適化なし・品質85の出力サイズは、現行Pythonと同じ（平均+0.03%）。`image`の`JpegEncoder`は4:4:4固定で、同じ品質値でも14%大きい。
+- 4:2:0・ハフマン最適化なし・品質85の出力サイズは、現行Pythonと同じ（平均+0.03%）。`image`の`JpegEncoder`は4:4:4固定で、同じ品質値でも11%大きい。
 - 出力の読み戻し: 推奨構成の出力は、`image`・`zune-jpeg`・Pillowのどれで読んでも同じ画素になる（再エンコードを挟んだ比較で55 dB）。
 
 **ICC**（ICC付きの17枚）
@@ -146,7 +148,7 @@ HEICの入力でも、縮小・エンコード・ICCは§3.2と同じコード�
 - **処理量は並列2枚で1.2〜1.5枚/秒に収まり、候補間の差は小さい。** 実機ではderivative生成を1〜2枚ずつ裏で進める用途なので、どれでも足りる（本番の約6,500枚を一括で作り直すと、1.3枚/秒でも約1.4時間）。
 - `zune-heic`は`set_num_threads(1)`でも、1枚の処理が**CPU 166%**（2コア近く）になった。単一画像の中でも並列化する（デブロッキングなど）ためで、1枚あたりの遅延は短い（871 ms）が、2枚同時の処理量はlibheifと変わらない（1.20 vs 1.26枚/秒）。50枚のCPU時間（user＋sys）は`zune-heic`が約69秒、libheif 1.17.6が約68秒で、ほぼ同じ。
 - libheif 1.23.0はCPU時間（約60秒）・RSS（141 MiB）が最も小さい。新しい版の効果で、`zune-heic`より処理量で上回る。
-- `zune-heic`の出力は、libheifと**全50枚でバイト単位で同じ**（デコード結果が同一で、以降の処理が同じ）。作者は「libheif 1.17とビット単位で同じ」と書いており、それと整合する。ICC付き17枚でもICCの取り出しが一致した。
+- `zune-heic`の出力は、libheifと**全50枚でバイト単位で同じ**（デコード結果が同一で、以降の処理が同じ）。作者は「libheif 1.17とビット単位で同じ」と書いており、それと整合する。ICC付きの入力は、ICCの有無（`icc_in`）がlibheifと同じ17枚で一致した（`bench.sh`が数える。ICCの中身のバイト一致までは見ていない）。
 - `heic-rs`と`heif-oxide`は、同じ入力で正解に対して約28 dB（libheifは38 dB）。色変換（行列・範囲の既定）の違いが疑われるが原因は調べていない。実機のHEICで再評価する価値はあるが、今回は候補から外す。なお`heic`クレートはAGPL-3.0なので最初から外した。
 - 約48MPのHEIC（28 MB、単一画像）: libheif 1.17.6は5.16秒・441 MiB、`zune-heic`は約3.0〜3.1秒・278 MiB、`heic-rs`は4.74秒・363 MiB。**現行Python（pillow-heif）は「Decoding the input data did not give a decompressed image」で失敗した**（libheif 1.23.6＋libde265 1.1.3。原因は調べていない。実機の48MP HEICはグリッド分割なのでこの入力とは構造が違う）。`zune-heic`は既定のmdat上限（16 MiB）を超えるファイルを拒否するので、`set_hevc_max_mdat_size`で明示する必要がある（PoCは128 MiB）。
 - 純RustのHEICデコーダは、2026年10月時点で少なくとも5つある。`zune-heic`（MIT OR Apache-2.0 OR Zlib）はzune-jpegと同じ作者で、`image`と同じ系統。
@@ -163,7 +165,7 @@ HEICの入力でも、縮小・エンコード・ICCは§3.2と同じコード�
 | musl静的＋`mimalloc` | なし（static） | **222 ms／7.73枚/秒** | 183 MiB | 939 ms／1.11枚/秒 |
 
 - **開発機（glibc 2.41）でビルドしたglibcバイナリは、検証環境のglibc 2.39でそのまま動いた。** 要求するglibcは、必須が`GLIBC_2.34`まで。`objdump -T`は`GLIBC_2.39`（`pidfd_spawnp`・`pidfd_getpid`。Rust 1.99の`std::process::Command`が参照する）も出すが、`readelf -V`では**弱参照（`WEAK`）**で、古いglibc（2.34〜2.38）でも起動を妨げない見込み（そのglibcでは試していない）。要求バージョンは`objdump -T`の最大値ではなく、`readelf -V`の`WEAK`の有無も見て判断する。
-- musl標準のアロケータは**約15〜25%遅い**（JPEG 273 vs 235 ms、`zune-heic` 1,086 vs 871 ms）がRSSは小さい。`mimalloc`を付けるとglibcと同等以上（JPEG 222 ms）になる代わりに、RSSはglibc並み（`--jobs 2`で352 MiB）。[build.md](build.md)の「画像処理を入れた段階で計測し、問題なら`mimalloc`」の予告どおり。
+- musl標準のアロケータは**約15〜25%遅い**（JPEG 273 vs 235 ms、`zune-heic` 1,086 vs 871 ms）がRSSは小さい。`mimalloc`を付けると、**JPEGではglibcと同等以上**（222 ms）になる代わりに、RSSはglibc並み（`--jobs 2`で352 MiB）。**HEIC（`zune-heic`）はglibcより遅いまま**（939 ms／1.11枚/秒、glibcは871 ms／1.20枚/秒。約8%遅い）。[build.md](build.md)の「画像処理を入れた段階で計測し、問題なら`mimalloc`」の予告どおり。
 - 開発機のglibcビルドと検証環境のビルドの差は誤差の範囲。
 
 ## 4. HEICの依存とライセンス
@@ -196,10 +198,12 @@ HEICの入力でも、縮小・エンコード・ICCは§3.2と同じコード�
 | `libheif-rs`・`libheif-sys` | MIT | ラッパー。`libheif-sys`は同梱するlibheifのLGPLを引き継ぐ |
 | `zune-heic`・`zune-jpeg` | MIT OR Apache-2.0 OR Zlib | 純Rust。配布時の追加の義務なし |
 | `image`・`fast_image_resize` | MIT OR Apache-2.0 | |
+| `heic-rs`・`heif-oxide`（不採用） | MIT OR Apache-2.0 | 色が合わないので使わない（§3.4） |
 | `jpeg-encoder` | (MIT OR Apache-2.0) AND IJG | IJGは表示義務（READMEなどへの記載） |
+| `mimalloc`・`libmimalloc-sys` | MIT | **Cのソースをビルド時に`cc`でコンパイルする**（純Rustではない）。muslでは`musl-gcc`（CIでは`musl-tools`）が要る。静的にリンクされ、実行時の依存は増えない |
 | `moxcms` | BSD-3-Clause OR Apache-2.0 | |
 | `kamadak-exif` | BSD-2-Clause | |
-| `heic`（不採用） | AGPL-3.0-only | ネットワーク経由で使わせるサーバーでは、ソース公開の義務が及ぶ。使わない |
+| `heic`（不採用） | AGPL-3.0-only（または商用ライセンス） | ネットワーク経由で使わせるサーバーでは、ソース公開の義務が及ぶ。使わない |
 
 HEVC（H.265）には特許プールがある。個人の家庭サーバーで読むだけなら通常は問題にしないが、**バイナリを配布する場合は確認する**（法的な助言ではない）。
 
@@ -213,14 +217,14 @@ HEVC（H.265）には特許プールがある。個人の家庭サーバーで�
 | --- | --- |
 | EXIF・GPS | **出力に残らない**（`save`にexifを渡さないため）。EXIFのタグ数は0 |
 | ICC | **捨てる**。画素の変換もしない。広色域（Display P3など）の写真は、sRGBとして表示され、彩度が下がる |
-| 向き | `exif_transpose`で当てる。HEICはpillow-heifが読み込み時にOrientationを1へ戻し、libheifがirot/imirを適用する |
+| 向き | `exif_transpose`で当てる。HEICはlibheifがirot/imirを適用して読み、二重には回らない（合成画像で寸法を確認した。仕組みは調べていない） |
 | 縮小 | `thumbnail`（BICUBIC、`reducing_gap=2.0`）。長辺が2560以下なら何もしない |
 | サブサンプリング | 4:2:0（`subsampling=2`）、JFIFあり |
 
 ### 5.2 Rustの推奨構成
 
 - **EXIF・GPS**: どのエンコーダも、渡さない限りEXIFを書かない。全出力（28ディレクトリ、現行Pythonの100枚を含む計1,400枚）を集計して、EXIF・GPSが残っているものは0だった（ICCが残っていたのは、`keep`を指定した2設定の34枚だけ）。単体テストも、全ての部品の組み合わせで「出力にEXIFのヘッダも機種名の文字列も残らない」ことを確かめている。**ログ・エラー文にも画像の内容を出さない**（PoCは寸法と件数だけ）。
-- **ICC**: 推奨は`srgb`（変換して付けない）。理由: ①miharashi・`image`のデコーダはICCを使わず、`keep`では色管理されない表示側で色が薄くなる、②現行Pythonが捨てているのと違い、変換すれば正解に近づく（PSNR 38.7→41.3 dB、最悪28.6→37.2 dB）、③費用は15 ms/枚。広色域の色は、sRGBの外側がクリップされる。ICCが読めない・壊れているときは、捨てる側（`drop`）へ落とし、ログに件数だけ残す。**これは現行Pythonからの意図した変更**（広色域の写真の見え方が変わる）。
+- **ICC**: 推奨は`srgb`（変換して付けない）。理由: ①miharashi・`image`のデコーダはICCを使わず、`keep`では色管理されない表示側で色が薄くなる、②現行Pythonが捨てているのと違い、変換すれば正解に近づく（PSNR 38.7→41.3 dB、最悪28.6→37.2 dB）、③費用は15 ms/枚。広色域の色は、sRGBの外側がクリップされる。ICCが読めない・壊れている・RGBでない（グレーのICCなど）ときは、画像ごと失敗にせず、**警告なしでICCを捨てて続ける**（`drop`と同じ出力。PoCに合成画像のテストがある）。捨てた件数をログに残すのはP2で実装する（PoCは数えない）。**これは現行Pythonからの意図した変更**（広色域の写真の見え方が変わる）。
 - **向き**: JPEGは`Decoder`のOrientationを当てる。HEICは当てない（libheifと`zune-heic`のどちらもirot/imir/clapを適用する）。PoCのテストはHEICのirot（向き6）が1回だけ当たることを確かめている。
 - **位置・撮影時刻の抽出**はderivativeの生成とは別で、P2で行う。`kamadak-exif`（JPEGのAPP1・TIFF）が使える。HEICのEXIFは`zune-heic`の`exif_data()`、または`libheif-rs`のメタデータブロックから取り出す。
 
@@ -243,6 +247,7 @@ heic-libheif = ["dep:libheif-rs"]
 # libheif-rs = { version = "3.0.0", default-features = false, features = ["v1_17"], optional = true }
 ```
 
+- **PoCの既定値**: `Options::default()`（[`lib.rs`](../../crates/geoframe-imgpoc/src/lib.rs)）は比較の基準（向き補正→縮小、HEICはlibheif）で、上の推奨（縮小→向き補正、HEICは`zune-heic`）とは逆。**P2で本体へ移すときに、既定値を推奨に合わせる**。
 - **処理**: 縮小→向き補正→（ICCがあれば）sRGBへ変換→JPEG（品質85、4:2:0）。縮小の寸法は[`target_dims`](../../crates/geoframe-imgpoc/src/lib.rs)（Pillowの`thumbnail`と同じ丸め）。
 - **並列**: 1枚の処理は単一スレッドで、CPU時間の大半はデコードとエンコード。2コア・4 GiBでは**同時に1〜2枚**に絞る（`--jobs 2`で最大RSSが約300〜390 MiB。約48MPで1枚あたり約220〜280 MiB）。tokioのworkerを塞がないよう`spawn_blocking`か専用スレッドで行う。
 - **入力の制限**: デコードの前に寸法で拒否する（PoCは2億画素。Pillowの`MAX_IMAGE_PIXELS`は約8,900万画素で警告、その2倍でエラー）。`zune-heic`の`set_hevc_max_mdat_size`も明示する。途中で切れたJPEGは`image`・`zune-jpeg`だと部分的な画像になるので、厳格に扱うかをP2で決める。
@@ -260,7 +265,7 @@ heic-libheif = ["dep:libheif-rs"]
 - **HDR・ゲインマップ**: ゲインマップ付きのHEIC（iPhone 12以降）、10ビット（Main 10）、PQ・HLGの転送特性。8ビットのSDR（SDRベース画像）へ落とす結果が妥当か。libheifも`zune-heic`もゲインマップは使わない。
 - **深度・補助画像**: ポートレートの深度、アルファ、マット。主画像だけを取り出せているか。
 - **Live Photo・連写・シーケンス**: Live Photoは静止画（HEIC）と動画（MOV）が別ファイル。Driveの`image/heic`の扱い、複数の最上位画像を持つファイル（`msf1`・`hevc`のブランド）、サムネイル画像が主画像として選ばれないか。
-- **向き**: 実機のHEICは、irot/imirと同時にEXIFにもOrientationを持つ。libheifとzune-heicがEXIF側を無視してirot/imirだけを当てること（今回は合成入力で確認）を、実機で再確認する。
+- **向き**: 実機のHEICは、irot/imirと同時にEXIFにもOrientationを持つ。今回の合成HEICも、pillow-heifがirot/imirを書き、渡したEXIFのOrientationもそのまま残るので、**irotとEXIFの両方を持つ**（「pillow-heifがEXIF側を1へ戻す」ではない）。libheifとzune-heicがEXIF側を無視してirot/imirだけを当てること（今回は合成入力で、向き1/3/6/8の寸法と画素で確認）を、実機で再確認する。
 - **色の記述**: 実機はICC（Display P3）またはnclx（`colr`）。**今回のICCは`prof`形式のみ。nclxだけのファイル（Androidなど）は、`libheif-rs`の`color_profile_nclx`・`zune-heic`の扱いがどうなるかを確かめる**。nclxだけならICCを持たず、sRGB以外の原色の画像を誤って扱う恐れがある。
 - **`heic-rs`・`heif-oxide`の色の不一致**の原因（行列・範囲）が、実機のファイルでも出るか。
 - **EXIFの抽出**: HEICの`Exif`ブロックから位置・撮影時刻を取り出す方法（`zune-heic`の`exif_data()`は先頭のオフセットを含むかなど）。
@@ -275,10 +280,11 @@ heic-libheif = ["dep:libheif-rs"]
 
 1. `prepare_data.py`で入力100枚と正解を作る。`prepare_big.py`で48MPを1枚ずつ。`gen_fixtures.py`で単体テスト用の合成HEIC（750〜3,267バイト。`tests/fixtures/`に置いてある）。
 2. `run_python_ref.py`で現行Pythonのderivativeと時間を測る。
-3. `cargo build --release -p geoframe-imgpoc --features heic,heic-zune,heic-rs,heic-oxide`（検証環境のglibc。`libheif-dev`・`zlib1g-dev`・`libheif-plugin-libde265`が要る）。musl静的は開発機で`--target x86_64-unknown-linux-musl --features heic-zune`（`mimalloc`を付けるなら`,mimalloc`）。
-4. `bench.sh`・`bench_builds.sh`で時間とRSS、`quality.sh`（`compare.py`）で画質、`check_outputs.py`でメタデータを集計する。
+3. `cargo build --release -p geoframe-imgpoc --features heic,heic-zune,heic-rs,heic-oxide`（検証環境のglibc。`libheif-dev`・`zlib1g-dev`・`libheif-plugin-libde265`が要る）。musl静的は開発機で`--target x86_64-unknown-linux-musl --features heic-zune`（`mimalloc`を付けるなら`,mimalloc`）。同じビルドは、CIの`rust`ジョブが`heic-zune,mimalloc`付きで毎回行い、静的リンクを検査する。
+4. `bench.sh`で時間とRSS（libheif・外部コマンド・zune-heic・heic-rs・heif-oxideの全26設定。出力JPEGは残る）。続けて同じスクリプトが、**zune-heicとlibheifの出力のバイト一致の枚数**（`cmp`。§3.4の「50/50」）と、`icc_in`の枚数の一致を`bench.log`に書く。`bench_builds.sh`でビルド方式別（`zune-heic`の`--jobs 2`の処理量を含む）、`quality.sh`（`compare.py`）で画質、`check_outputs.py`でメタデータを集計する。
+   - `heic-rs`の`--jobs 2`の処理量（1.48枚/秒）は、`bench.sh`の`run`と同じ形式で`--heic heic-rs --jobs 2`を**手作業で**1回走らせた値で、スクリプトには入れていない。`heif-oxide`の`--jobs 2`は計測していない。
 
-テスト: `cargo test -p geoframe-imgpoc`（合成画像だけ。向き補正・縮小の規則・EXIFを残さないこと・ICCの扱い・入力の拒否）。HEIC（`--features heic`）は、合成HEICで、向き6が1回だけ当たることとEXIFが残らないことを確かめる。CIの`imgpoc-heic`ジョブがlibheif付きで走らせる。
+テスト: `cargo test -p geoframe-imgpoc`（合成画像だけ。向き補正・縮小の規則・EXIFを残さないこと・ICCの扱い（変換できないICCは捨てて続ける）・入力の拒否・`--out`が入力と重ならないこと）。HEICは、合成HEICで、向き6が1回だけ当たることとEXIFが残らないこと、途中で切った入力の拒否を確かめる。**推奨の`zune-heic`（`--features heic-zune`）はlibheifが無い環境でも走り、CIの`rust`ジョブが回す。** libheifの経路（`--features heic`）は、CIの`imgpoc-heic`ジョブがlibheif 1.17.6（Ubuntu 24.04）付きで走らせる。
 
 ### 検証環境に残した変更
 

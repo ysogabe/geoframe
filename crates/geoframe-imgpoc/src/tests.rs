@@ -355,6 +355,37 @@ fn iccの扱い() {
 }
 
 #[test]
+fn 変換できないiccは捨てて画像は処理を続ける() {
+    use image::ImageEncoder;
+    use moxcms::ColorProfile;
+    // RGBの画像に、グレー用のICCが付いている（RGBレイアウトで変換できない）／ICCとして壊れている
+    let gray = ColorProfile::new_gray_with_gamma(2.2).encode().unwrap();
+    let broken = vec![0x42u8; 200];
+    let img = RgbImage::from_pixel(32, 32, Rgb([200, 100, 100]));
+    for (name, profile) in [("gray", gray), ("broken", broken)] {
+        for decoder in [JpegDecoderKind::Image, JpegDecoderKind::Zune] {
+            let mut src = Vec::new();
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut src, 100);
+            enc.set_icc_profile(profile.clone()).unwrap();
+            enc.write_image(img.as_raw(), 32, 32, image::ExtendedColorType::Rgb8)
+                .unwrap();
+            let opts = |icc| Options {
+                decoder,
+                icc,
+                ..Options::default()
+            };
+            let srgb = process(&src, None, &opts(IccPolicy::Srgb))
+                .unwrap_or_else(|e| panic!("{name}: ICCの失敗で画像ごと失敗した: {e}"));
+            let drop = process(&src, None, &opts(IccPolicy::Drop)).unwrap();
+            assert!(srgb.icc_in, "{name}");
+            assert!(!has_icc(&srgb.jpeg), "{name}");
+            // 変換できなければ`Drop`と同じ出力になる
+            assert_eq!(srgb.jpeg, drop.jpeg, "{name}");
+        }
+    }
+}
+
+#[test]
 fn 壊れた入力と巨大な入力は拒否する() {
     assert!(process(b"not an image", None, &Options::default()).is_err());
     assert!(process(&[0xFF, 0xD8, 0xFF, 0xD9], None, &Options::default()).is_err());
