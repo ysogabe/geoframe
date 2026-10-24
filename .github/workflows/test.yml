@@ -85,7 +85,7 @@ jobs:
           "$bin" --version
 
   imgpoc-heic:
-    name: 画像PoC（HEIC: libheifへ動的リンク）
+    name: "画像PoC（HEIC: libheifへ動的リンク）"
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
