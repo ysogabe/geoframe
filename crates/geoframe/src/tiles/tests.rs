@@ -509,6 +509,25 @@ fn parse_path_follows_the_python_regex_and_range_checks() {
         parse_path(&format!("/tiles/osm/3/0/{}.png", "9".repeat(5000))),
         None
     );
+    // 桁数の上限は Python の `int()` と同じ（先頭ゼロも数える。4300 桁は通り、4301 桁は 404）
+    let zeros = |n: usize| "0".repeat(n);
+    let seven = |n: usize| format!("{}7", "0".repeat(n - 1));
+    assert_eq!(
+        parse_path(&format!("/tiles/osm/3/{}/{}.png", zeros(4300), seven(4300))),
+        Some(t(Layer::Osm, 3, 0, 7))
+    );
+    assert_eq!(
+        parse_path(&format!("/tiles/osm/3/{}/0.png", zeros(4301))),
+        None
+    );
+    assert_eq!(
+        parse_path(&format!("/tiles/osm/3/0/{}.png", zeros(4301))),
+        None
+    );
+    assert_eq!(
+        parse_path(&format!("/tiles/osm/3/{}/0.png", seven(4301))),
+        None
+    );
     for bad in [
         "/tiles/osm/1/0/0.png/",
         "/tiles/osm/1/0/0.PNG",
@@ -1124,6 +1143,58 @@ fn prune_stops_when_asked_and_keeps_the_rest() {
     // 消し残しが古い順の接頭辞になっている（新しい方は残る）
     let left = pngs_under(&root);
     assert_eq!(left.len(), 10 - report.deleted);
+}
+
+/// 古い一時ファイル 2 個と、上限を超える `.png` 3 枚（`max_mb=0` なら止まらなければ全部消える）。
+fn stop_fixture(root: &Path) {
+    for i in 0..3 {
+        put(root, &format!("osm/3/1/{i}.png"), 1000, 100 + i as u64);
+    }
+    for i in 0..2 {
+        put(root, &format!("osm/3/1/{i}.1234.00ff.part"), 10, 100);
+    }
+}
+
+fn remaining(root: &Path) -> (usize, usize) {
+    let all = listing(root);
+    let parts = all.keys().filter(|p| p.ends_with(".part")).count();
+    (all.len() - parts, parts)
+}
+
+#[test]
+fn prune_that_is_stopped_while_scanning_deletes_nothing() {
+    let dir = TempDir::new("prune-stop-scan");
+    let root = dir.path().join("tile_cache");
+    stop_fixture(&root);
+    // 走査の `should_stop` は、ディレクトリで 1 回 + 5 件で 1 回ずつ（計 6 回）。k 回目で止まる合図を、
+    // 走査のどこで立てても、集めた古い一時ファイルも `.png` も 1 件も消さずに戻る
+    for k in 1..=6 {
+        let calls = std::cell::Cell::new(0);
+        let report = prune_dir(&root, 0, &|| {
+            calls.set(calls.get() + 1);
+            calls.get() >= k
+        })
+        .unwrap();
+        assert!(report.interrupted, "k={k} {report:?}");
+        assert_eq!((report.deleted, report.stale_parts), (0, 0), "k={k}");
+        assert_eq!(remaining(&root), (5 - 2, 2), "k={k}");
+    }
+    // 合図が無ければ、同じ並びで全部消える
+    let report = prune_dir(&root, 0, &|| false).unwrap();
+    assert!(!report.interrupted);
+    assert_eq!((report.deleted, report.stale_parts), (3, 2), "{report:?}");
+}
+
+#[test]
+fn prune_that_is_stopped_while_removing_stale_parts_stops_in_the_middle() {
+    let dir = TempDir::new("prune-stop-parts");
+    let root = dir.path().join("tile_cache");
+    stop_fixture(&root);
+    // 古い一時ファイルが 1 個消えたのを見たら止まる合図（走査中は立たない）
+    let report = prune_dir(&root, 0, &|| remaining(&root).1 < 2).unwrap();
+    assert!(report.interrupted, "{report:?}");
+    assert_eq!((report.deleted, report.stale_parts), (0, 1), "{report:?}");
+    assert_eq!(remaining(&root), (3, 1));
 }
 
 #[test]

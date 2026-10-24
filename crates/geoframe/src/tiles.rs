@@ -80,6 +80,8 @@ const STALE_PART_AGE: Duration = Duration::from_secs(3600);
 const PART_ATTEMPTS: usize = 8;
 
 const TILE_PREFIX: &str = "/tiles/";
+/// Python の `int()` が文字列から読む十進の桁数の上限（`sys.int_info.default_max_str_digits`。先頭ゼロも数える）。
+const INT_MAX_STR_DIGITS: usize = 4300;
 /// 上流のタイルの URL（現行の `TILE_SOURCES`）。`{z}`・`{x}`・`{y}` を埋めて使う。
 const OSM_URL: &str = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 const GSI_URL: &str = "https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png";
@@ -144,8 +146,9 @@ fn all_digits(text: &str) -> bool {
 
 /// 現行の `TILE_RE` と `_serve_tile` の範囲検査。形が合わない・座標が `2^z` 以上・ズームが最大を超えるものは
 /// `None`（404）。`path` はクエリを落とした生のパス。`\d` は ASCII の数字（リクエスト行は Latin-1 で読むので、
-/// 他の 10 進数字は現れない）。`x`・`y` が `u64` に収まらない桁数は、最大ズームでも `2^z` 未満になり得ないので 404
-/// （現行は 4300 桁を超えると `int()` が例外になる）。
+/// 他の 10 進数字は現れない）。`x`・`y` の桁数（先頭ゼロを含む）が 4300 を超えるものは 404（現行は `int()` が
+/// `ValueError` になり、応答を返さず接続が切れる。Python 3.11 以降の既定の上限で、4300 桁ちょうどは通る）。
+/// `u64` に収まらない値は、最大ズームでも `2^z` 未満になり得ないので 404。
 pub fn parse_path(path: &str) -> Option<Tile> {
     let rest = path.strip_prefix(TILE_PREFIX)?;
     let mut parts = rest.split('/');
@@ -158,7 +161,11 @@ pub fn parse_path(path: &str) -> Option<Tile> {
     if !(1..=2).contains(&z.len()) || !all_digits(z) || !all_digits(x) || !all_digits(y) {
         return None;
     }
+    if x.len() > INT_MAX_STR_DIGITS || y.len() > INT_MAX_STR_DIGITS {
+        return None;
+    }
     let z: u32 = z.parse().ok()?;
+    // 先頭ゼロを足した値も `u64` に収まれば通す（`0` を 4300 個並べた座標は 0）
     let (x, y): (u64, u64) = (x.parse().ok()?, y.parse().ok()?);
     // 範囲 → ズームの順（現行と同じ。どちらも 404 なので順序は見えない）。`2^z` は z ≤ 99 でも u128 に収まる
     let side = 1u128 << z;
@@ -747,6 +754,11 @@ pub fn prune_dir(
                     continue;
                 };
                 for entry in read.flatten() {
+                    // 1 つのディレクトリに何万枚あっても、合図から次の 1 件で止まる
+                    if should_stop() {
+                        report.interrupted = true;
+                        break 'scan;
+                    }
                     // `DirEntry::metadata` はリンクを辿らない
                     let Ok(meta) = entry.metadata() else { continue };
                     if !meta.file_type().is_file() {
@@ -782,13 +794,18 @@ pub fn prune_dir(
             }
         }
     }
+    // 走査の途中で止まったら、集めた分も消さずに戻る（停止の合図のあとに削除を始めない）
+    if report.interrupted {
+        return Ok(report);
+    }
     for path in stale {
+        if should_stop() {
+            report.interrupted = true;
+            return Ok(report);
+        }
         if fs::remove_file(path).is_ok() {
             report.stale_parts += 1;
         }
-    }
-    if report.interrupted {
-        return Ok(report);
     }
     // 現行は `MB * 1024 * 1024`（整数）と、`limit * 0.9`（浮動小数）の比較
     let limit = i128::from(max_mb) * 1024 * 1024;
