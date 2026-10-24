@@ -2,8 +2,8 @@
 //!
 //! # 方針
 //!
-//! - 署名は `ring`（rustls が既に引いている）。`rsa` crate は使わない（純 Rust 実装は署名にタイミング
-//!   攻撃の既知の問題があり、修正版が無い）。ring は PKCS#8（`-----BEGIN PRIVATE KEY-----`、Google の
+//! - 署名は `ring`（rustls が既に引いている）。暗号の依存を増やさずに済むので、`rsa` crate は使わない
+//!   （`rsa` には RUSTSEC-2023-0071 の経緯もある）。ring は PKCS#8（`-----BEGIN PRIVATE KEY-----`、Google の
 //!   鍵 JSON の `private_key`）と PKCS#1（`-----BEGIN RSA PRIVATE KEY-----`）の秘密鍵を読める。
 //! - JWT は `base64url(header).base64url(claims).base64url(signature)`（パディングなし）。
 //! - **鍵の中身・トークンをログやエラー文字列に出さない**。[`JwtError`] は定型の種類だけを持つ。

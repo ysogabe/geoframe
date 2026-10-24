@@ -126,7 +126,7 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 | `ureq` 3.5（`default-features = false`、`rustls`・`gzip`） | HTTPクライアント（同期） | 同期サイクルは専用のstdスレッドで動かす（[server.md §11](server.md)）ので、同期APIで足りる。miharashiの取得処理も`ureq`。`reqwest`は非同期でhyperのクライアント側まで引くため見送った。`native-tls`・`openssl`は使わない |
 | `rustls` 0.23（`ureq`が引く）＋`ring` 0.17 | TLS | 暗号は`ring`。`aws-lc-rs`はcmakeと追加のCビルドが要るので避けた。`ring`のC・アセンブリは`cc`（`musl-gcc`）でビルドされ、rusqliteの`bundled`と同じ前提（CIの`musl-tools`で足りる） |
 | `webpki-roots` 1.0（`ureq`の`rustls`が引く） | ルート証明書 | **バイナリに埋め込む**。OSの証明書（`/etc/ssl/certs`）に依存しないので、unitや機体に証明書の条件は要らない。更新はcrateの更新で行う |
-| `ring`（直接） | JWT（RS256）の署名・検証 | `rsa` crateは使わない（純Rust実装の署名にタイミング攻撃の既知の問題があり、修正版が無い）。`ring`は既に依存木にある。PKCS#8（Googleの鍵JSONの`private_key`）とPKCS#1の両方を読める |
+| `ring`（直接） | JWT（RS256）の署名・検証 | `rsa` crateは使わない（暗号の依存を増やさずに済む。`rsa`にはRUSTSEC-2023-0071の経緯もある）。`ring`は既に依存木にある。PKCS#8（Googleの鍵JSONの`private_key`）とPKCS#1の両方を読める |
 | `base64` 0.22 | JWTのBase64url、PEMの本文 | 純Rustで小さい |
 
 `jsonwebtoken`は使わない（暗号バックエンドに`rsa`か`aws-lc-rs`を選ばされるため）。JWTは`crates/geoframe/src/jwt.rs`が、ヘッダ・claimsのBase64urlと`ring`の署名で組み立てる。
