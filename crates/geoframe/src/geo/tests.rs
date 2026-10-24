@@ -1148,7 +1148,8 @@ fn script_stub(stub: &StubGsi, case: &Value) {
 }
 
 fn geo_cache(cache: &Cache, expected: &Map<String, Value>) -> Map<String, Value> {
-    // Python が持つ `geo:` キーに対応するものを取り出す（Rust が余計なキーを持たないことも見る）
+    // Python が持つ `geo:` キーに対応するものを取り出す。Rust が余計なキーを持たないことは、呼び出し側が
+    // キャッシュの件数で見る
     let mut got = Map::new();
     for key in expected.keys() {
         if let Some(v) = cache.get(key) {
@@ -1252,6 +1253,12 @@ fn pythonのinfer_locationsとenrich_rowsと全列が一致する() {
                 &geo_cache(&s.cache, want_cache),
                 want_cache,
                 "{label}: キャッシュ"
+            );
+            // 余計なキーが無い（`geo:` のほかは、先に入れた `muni_table` だけ）
+            assert_eq!(
+                s.cache.len(),
+                want_cache.len() + usize::from(case.get("muni").is_some_and(Value::is_object)),
+                "{label}: キャッシュの件数"
             );
             steps_checked += 1;
         }
