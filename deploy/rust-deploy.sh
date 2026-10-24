@@ -315,8 +315,21 @@ on_exit() {
     if [ "$mode" = deploy ]; then rm -f "${bin}.new" "${bin}.prev.tmp" "${unit_path}.prev.tmp" 2>/dev/null || true; fi
     if [ "$ph" = mutating ]; then
         say "変更の途中で終了した（rc=${rc}）"
-        recover_deploy
-        rc=$?
+        # EXIT trap は解除済みなので、復元の中で致命的なシェルエラー（未定義変数の参照など）が起きると、
+        # そのままでは復旧手順を出さずに終わる。専用のサブシェルで復元し、異常終了しても親が手順と 3 を保証する。
+        # 無視している中断（protect_restore）はサブシェルにも引き継がれる。復元の結果は 100 を足して返し、
+        # 正常に終えたこと（101=戻せた・103=戻せず手順は表示済み）と異常終了（それ以外）を見分ける。
+        local sub
+        ( set -u; recover_deploy; exit $(($? + 100)) )
+        sub=$?
+        case "$sub" in
+            101) rc=1 ;;
+            103) rc=3 ;;
+            *)
+                fail "復元の最中に想定外の終了（サブシェルの終了コード ${sub}）"
+                manual_hint
+                rc=3 ;;
+        esac
     elif [ "$ph" = restoring ]; then
         # 復元の最中に想定外の終了（exit・未定義変数の参照など）。復元を入れ子にせず、手作業の手順を出す
         fail "復元の最中に想定外の終了（rc=${rc}）"

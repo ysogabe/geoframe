@@ -75,7 +75,7 @@ stop)
 restart)
     n=0; [ -f "$MOCK_DIR/restart_n" ] && n=$(cat "$MOCK_DIR/restart_n"); n=$((n + 1)); echo "$n" > "$MOCK_DIR/restart_n"
     # n 回目の restart で、呼び出し元（本体のシェル）へ SIGTERM を送る（復元の最中の中断を決まった時点で起こす）
-    if [ -f "$C/term_on_restart" ] && grep -qw "$n" "$C/term_on_restart"; then kill -TERM "$PPID"; fi
+    if [ -f "$C/term_on_restart" ] && grep -qw "$n" "$C/term_on_restart"; then echo "$n" >> "$MOCK_DIR/term_sent"; kill -TERM "$PPID"; fi
     [ -f "$C/hang" ] && sleep 30
     if [ -f "$C/poison_prev" ]; then rm -rf "$MOCK_BIN.prev"; mkdir "$MOCK_BIN.prev"; rm -f "$C/poison_prev"; fi
     if bump fail_restart; then rm -f "$S/active"; exit 1; fi
@@ -263,8 +263,27 @@ setup; run deploy; echo 2 > "$T/env/ctl/term_on_restart"; run rollback
 expect "復元中の SIGTERM（手動 rollback）: 最後まで戻して終了コード0" test "$rc" = 0
 expect "復元中の SIGTERM（手動 rollback）: 旧版で稼働している" back_to_old
 # 復元が途中で失敗するときは、中断が重なっても手作業の手順と終了コード3を出す
-setup; echo 1 > "$T/env/ctl/fail_restart"; touch "$T/env/ctl/poison_prev"; echo 2 > "$T/env/ctl/term_on_restart"; run deploy
-expect "復元の失敗と SIGTERM が重なっても: 終了コード3・手順が出る" bash -c 'test "$1" = 3 && grep -q "手で戻すこと" "$2"' _ "$rc" "$T/out"
+# 復元時（2回目）の restart の失敗と、その restart が送る SIGTERM を重ねる（SIGTERM を実際に送ったことも確かめる）
+setup; echo 2 > "$T/env/ctl/fail_restart"; echo 2 > "$T/env/ctl/term_on_restart"; run deploy
+expect "復元の失敗と SIGTERM が重なっても: SIGTERM を2回目の restart で実際に送った" test "$(content "$T/env/term_sent")" = 2
+expect "復元の失敗と SIGTERM が重なっても: 終了コード3・手順が出る" bash -c 'test "$1" = 3 && grep -q "手で戻すこと" "$2" && grep -q "失敗した操作: systemctl restart" "$2"' _ "$rc" "$T/out"
+expect "復元の失敗と SIGTERM が重なっても: 『戻した』と表示しない" no_restored
+
+# 復元の中で致命的なシェルエラー（未定義変数の参照）が起きても、手作業の手順と終了コード3を出す。
+# 一時コピーの restore() の先頭に未定義変数の参照を注入して試験する（set -u で、その場のシェルが終了する）
+REMOTE_ORIG="$REMOTE"
+REMOTE="$(printf '%s\n' "$REMOTE_ORIG" | sed 's/^restore() {$/restore() { : "$UNDEFINED_VAR_FOR_TEST"/')"
+expect "試験の準備: 未定義変数の参照を注入できた" bash -c 'printf "%s" "$1" | grep -q "^restore() { : \"\$UNDEFINED_VAR_FOR_TEST\""' _ "$REMOTE"
+setup; echo 1 > "$T/env/ctl/term_on_restart"; run deploy
+expect "EXIT trap 内の復元が異常終了: 終了コード3（143にならない）" test "$rc" = 3
+expect "EXIT trap 内の復元が異常終了: 手作業の復旧手順が出る" grep -q '手で戻すこと' "$T/out"
+expect "EXIT trap 内の復元が異常終了: 想定外の終了が出る・『戻した』と表示しない" bash -c 'grep -q "復元の最中に想定外の終了" "$1" && ! grep -q "戻した（" "$1"' _ "$T/out"
+expect "EXIT trap 内の復元が異常終了: SIGTERM を実際に送った" test "$(content "$T/env/term_sent")" = 1
+setup; echo 1 > "$T/env/ctl/fail_restart"; run deploy
+expect "通常の復元が異常終了: 終了コード3・手順が出る" bash -c 'test "$1" = 3 && grep -q "手で戻すこと" "$2"' _ "$rc" "$T/out"
+setup; run deploy; run rollback
+expect "手動 rollback の復元が異常終了: 終了コード3・手順が出る" bash -c 'test "$1" = 3 && grep -q "手で戻すこと" "$2"' _ "$rc" "$T/out"
+REMOTE="$REMOTE_ORIG"
 
 echo "[7] 手動の rollback"
 setup; run deploy; run rollback
