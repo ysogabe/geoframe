@@ -1,6 +1,6 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
 - 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
@@ -146,14 +146,20 @@ geoframe serve [--listen <addr:port>] [--data-dir <dir>]
 
 ## 6. systemdで動かすときの注意
 
-unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分かっている注意を先に書いておく。
+unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5）。配布は[`deploy/rust-deploy.sh`](../../deploy/rust-deploy.sh)、手順は[deploy/README.md §7](../../deploy/README.md)。**P1〜P4 は検証環境専用で、本番へ入れるのは P5。** 決めたことと、その理由は次のとおり。
 
-- **設定不正の終了コード2で再起動ループしない**ようにする。設定の誤りは`Restart=on-failure`で直らないので、unitに`RestartPreventExitStatus=2`を書く（DBが開けない・スキーマ不足の終了コード1は、Pythonより先に起動した場合などで再試行に意味があるので、そのまま再起動してよい）。
-- **Pythonと並走するとき**（P1〜P4の検証）は、`ExecStart`に`--listen <addr:port>`を**書く**。`GEOFRAME_PORT`が`/etc/default/geoframe`にあってもPythonと同じ値になり、ポートが衝突するため。`--listen`は`GEOFRAME_HOST`/`GEOFRAME_PORT`より優先され、それらを読まない（§1.1）。
-- Rustも**`User=geoframe`で動かす**。WALのDBは読み取り専用でも`-shm`・`-wal`を触るので、ファイルの持ち主がPythonの実行ユーザーと違うと、片方が開けなくなる。
+- **設定不正の終了コード2で再起動ループしない**。unit に`Restart=on-failure`と`RestartPreventExitStatus=2`を書いた。設定の誤りは再起動しても直らないので、`failed`のまま止まる。DBが開けない・スキーマ不足の終了コード1は、Pythonより先に起動した場合などで再試行に意味があるので、`RestartSec=5`で再起動し続ける（検証環境で確認。[p1-acceptance.md](p1-acceptance.md)）。
+- **`ExecStart`に`--listen`を書かない**。待ち受けは`GEOFRAME_HOST`/`GEOFRAME_PORT`（既定`0.0.0.0:8080`）で決まり、設定は`/etc/default/geoframe`に集まる（Pythonと同じ運用）。`--listen`を書くと`GEOFRAME_PORT`が黙って無視されるので、普段は書かない。
+  - **Pythonと同じ機体で並走するとき**（P1〜P4の検証）は、drop-inで`ExecStart=`を空にして`--listen <addr:port>`を書く（[deploy/README.md §7.2](../../deploy/README.md)）。`--listen`は`GEOFRAME_HOST`/`GEOFRAME_PORT`より優先され、それらを読まない（§1.1）ので、`/etc/default/geoframe`の`GEOFRAME_PORT`がPythonと同じ値でも衝突しない。検証環境で、`GEOFRAME_PORT=abc`を置いても`--listen`のdrop-inなら起動することを確かめた。
+  - 検証環境の比較用Pythonは別のポート（8090）と別のデータ（`/var/lib/geoframe-pyref`）で動いているので、Rustは drop-in なしで`:8080`を使う。
+- Rustも**`User=geoframe`で動かす**。WALのDBは読み取り専用でも`-shm`・`-wal`を触るので、ファイルの持ち主がPythonの実行ユーザーと違うと、片方が開けなくなる。`StateDirectory=geoframe`は初回起動で持ち主を揃えるが、大きなデータでは時間がかかるので、**配備の前に`chown -R geoframe:geoframe /var/lib/geoframe`を済ませておく**。
+  - 検証環境の注意: 比較用Pythonの`derivatives/`は、本番のコピーの`derivatives/`への**ハードリンク**（同じ inode）。コピー側を`chown`すると、モード`0660`のファイルは比較用Pythonの実行ユーザーから読めなくなり、`/derivatives/`が404になる。`chmod o+r`で読めるようにした（出力を比べる意味を保つため）。
+- **P1は読み取り専用**なので、unit に`ReadOnlyPaths=-/var/lib/geoframe/catalog.db`と、`derivatives`・`photos`・`blog_exports`・`travel_blog`を書いて、OSの側でも書き込み不可にした。ディレクトリ自体は書き込み可のまま（WALの`-shm`/`-wal`のため）。検証環境で`geoframe`ユーザーとして`catalog.db`・`derivatives/`への書き込みが`Read-only file system`になり、ディレクトリには書けることを確かめた。**P2で取り込み・手動修正が書き込むようになったら、この行を外す。** ファイルのbind mountなので、`catalog.db`を別のinodeに置き換えたら再起動するまで古い方を見続ける（下の「DBファイルの入れ替え」と同じ理由で、復元後は必ず再起動する）。
+- **`MemoryDenyWriteExecute=true`を付けた**（Pythonは Pillow のC拡張が実行可能メモリへ書くので付けられない）。musl静的ビルドのRust（tokio・SQLite同梱）は、これを付けても起動・全エンドポイントの応答・スレッド生成が動いた（検証環境）。P2で画像処理（`zune-heic`・`image`・`fast_image_resize`）を入れたときに、実際のデコードで再確認する。
+- **`LimitNOFILE=4096`**。同時の接続256＋配信中のファイル32＋SQLite（読み取り5接続と`-wal`/`-shm`）＋標準入出力で300前後を使う（§9.3）ので、systemdの既定（1024）でも足りるが、余裕を持たせた。1024未満にするなら`limits.rs`の`MAX_CONNECTIONS`・`STATIC_FILE_SLOTS`もあわせて見直す。
 - **P5で、`app/.env`にだけある`GEOFRAME_*`を`/etc/default/geoframe`と突き合わせる**。Rustは`app/.env`を読まない（§1.3）ので、`.env`にしか書かれていない値は、移すか、捨てる判断をする。
-- **ファイル記述子の上限は`LimitNOFILE=1024`以上を前提にする**（systemdの既定）。同時の接続256＋配信中のファイル32＋SQLite（読み取り5接続と`-wal`/`-shm`）＋標準入出力で300前後を使う（§9.3）。上限を下げるなら、`limits.rs`の`MAX_CONNECTIONS`・`STATIC_FILE_SLOTS`もあわせて見直す。
 - **DBファイルの入れ替え（バックアップからの復元など）にはRustの再起動が要る**（§2.4の注意）。
+- 配布スクリプトは、再起動の後に`/healthz`が200で`/api/v1/photos`がJSON配列を返さなければ、直前のバイナリ（`.prev`）へ戻す。戻す先が無い（初回の配布）ときはサービスを止める。
 
 ## 7. 確認の記録
 
@@ -161,6 +167,7 @@ unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分�
 - musl静的ビルド: `static-pie linked`、`ldd`は`statically linked`。追加した依存`tracing`・`tracing-subscriber`は純Rust（C依存なし）。
 - 合成DBでの手動確認: `serve`が`/healthz`に200、未知のパスに404（T1.3以降は403。§9）を返し、SIGTERMで正常終了（終了コード0）。DBが無いときは終了コード1、`GEOFRAME_PORT`が不正なときは2。
 - T1.3: musl静的ビルドの`file`は`static-pie linked`、`ldd`は`statically linked`のまま。管理画面の静的ファイルの埋め込み後のサイズは[build.md §3](build.md)。
+- T1.5: 検証環境（lxc-geoframe）で systemd 配下に常駐させ、比較用Pythonとの全件比較・再起動・`kill -9`・設定不正・巻き戻しを確かめた。結果は[p1-acceptance.md](p1-acceptance.md)。
 
 ## 8. 写真フィード `GET /api/v1/photos`（T1.2）
 
