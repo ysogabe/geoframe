@@ -73,6 +73,10 @@ const USAGE: &str = "\
                                         無い・geoframe-server が非稼働と確認できないなら、何も書かず終了コード 2 で断る
                                         設定は 起動引数 > 環境変数 GEOFRAME_* > 既定値 の順
                                         （詳細は docs/rust-migration/server.md）
+  geoframe img-probe [--out <dir>] [--rotation <度>] [--jobs <n>] <画像>...
+                                        画像処理の確認・計測用。DB・データ置き場には触れない。画像を derivative にして
+                                        （--out があれば <連番>.jpg で書き出す）、連番・形式・寸法・向き・ICC・所要時間を出す。
+                                        ファイル名は出さない。HEIC が読めないときは構造の分類（ブランド・グリッド・コーデック等）が付く
   geoframe sync [--dry-run] [--data-dir <dir>]
                                         同期サイクルを 1 回だけ動かして終わる。--dry-run は行・写真・キャッシュ・
                                         ロックを変えず（SQLite が読み取りでも作る WAL 関連ファイル catalog.db-wal・
@@ -85,6 +89,7 @@ pub enum Command {
     Version,
     CheckDb(PathBuf),
     SelfCheckNet,
+    ImgProbe(crate::imaging::probe::ProbeArgs),
     Serve(Overrides),
     Sync {
         dry_run: bool,
@@ -107,6 +112,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             None => Ok(Command::SelfCheckNet),
             Some(_) => Err("selfcheck-net に引数はありません".into()),
         },
+        Some("img-probe") => crate::imaging::probe::parse(args).map(Command::ImgProbe),
         Some("serve") => {
             let mut overrides = Overrides::default();
             while let Some(arg) = args.next() {
@@ -179,6 +185,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        Command::ImgProbe(args) => crate::imaging::probe::run(&args),
         Command::Serve(overrides) => serve(&overrides),
         Command::Sync { dry_run, data_dir } => sync(dry_run, data_dir),
     }
