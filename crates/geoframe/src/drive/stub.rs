@@ -332,6 +332,22 @@ fn respond(
         stream.write_all(head.as_bytes())?;
         return stream.write_all(gzip);
     }
+    // `X-Gzip-Pad: <個数>` を付けると、`body` の後ろに空白を指定の個数足した本文を gzip にして
+    // `Content-Encoding: gzip` で送る（圧縮後はごく小さい。上限が展開後に効くかの試験）
+    if let Some(pad) = extra
+        .iter()
+        .find(|(k, _)| k == "X-Gzip-Pad")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+    {
+        let gzip = crate::testutil::gzip::padded(body, pad);
+        let head = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\n\
+             Content-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            gzip.len()
+        );
+        stream.write_all(head.as_bytes())?;
+        return stream.write_all(&gzip);
+    }
     if extra.iter().any(|(k, _)| k == "X-Close-Before-Headers") {
         return Ok(());
     }

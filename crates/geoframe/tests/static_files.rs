@@ -13,7 +13,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use common::{TempDir, build_empty_catalog, request};
 use geoframe::config::{Config, Overrides};
 use geoframe::db::Catalog;
-use geoframe::server::{AppState, router};
+use geoframe::server::router;
 
 /// 2025-06-01 00:00:00 UTC（日曜日）
 const MTIME: u64 = 1_748_736_000;
@@ -104,7 +104,7 @@ impl Site {
             },
         )
         .unwrap();
-        let app = router(AppState::new(Arc::new(config), catalog));
+        let app = router(common::test_state(Arc::new(config), catalog));
         tokio::spawn(async move { axum::serve(listener, app).await });
         addr
     }

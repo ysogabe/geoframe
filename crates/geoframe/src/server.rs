@@ -104,9 +104,9 @@ impl AppState {
         self
     }
 
-    /// 地名検索の通信先・時計を差し替える（試験用）。
-    #[cfg(test)]
-    pub(crate) fn with_geocoder(mut self, geocoder: Arc<Geocoder>) -> Self {
+    /// 地名検索（通信先・時計）を差し替える。結合テストが、本物の地理院・Nominatim ではなくループバックのスタブへ
+    /// 向けるためのもの。本番のバイナリは呼ばない（[`geocode::Endpoints`] を参照）。
+    pub fn with_geocoder(mut self, geocoder: Arc<Geocoder>) -> Self {
         self.geocoder = geocoder;
         self
     }
@@ -652,6 +652,7 @@ mod tests {
     fn state(catalog: Catalog) -> AppState {
         let config = Config::load(|_| None, &Overrides::default()).unwrap();
         AppState::new(Arc::new(config), catalog)
+            .with_geocoder(crate::geocode::stub::deny_geocoder())
     }
 
     /// 127.0.0.1 の空きポートで router を起動し、(状態行, ヘッダ, 本文) を返す GET を用意する。

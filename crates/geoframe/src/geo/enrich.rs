@@ -452,15 +452,11 @@ fn fetch(
             CallError::Bad
         });
     }
-    response
-        .body_mut()
-        .with_config()
-        .limit(limit)
-        .read_to_vec()
-        .map_err(|e| match e {
-            ureq::Error::BodyExceedsLimit(_) => CallError::Bad,
-            other => CallError::Net(body_failure(&other)),
-        })
+    // 上限は展開後の大きさに効かせる（`net::read_body_limited`）
+    net::read_body_limited(response.body_mut(), limit).map_err(|e| match e {
+        ureq::Error::BodyExceedsLimit(_) => CallError::Bad,
+        other => CallError::Net(body_failure(&other)),
+    })
 }
 
 fn fetch_json(ctx: &StageCtx<'_>, url: &str) -> Result<Value, CallError> {

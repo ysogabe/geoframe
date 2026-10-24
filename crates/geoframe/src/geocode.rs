@@ -4,7 +4,8 @@
 //!
 //! # 規則（現行と同じ）
 //!
-//! - 検索語は前後の空白（`str.strip()`）を落とし、2 文字（コードポイント）未満は通信せず空にする。
+//! - 検索語は前後の空白（`str.strip()`）を落とし、2 文字（コードポイント）未満は通信せず空にする
+//!   （上限は [`MAX_QUERY_LEN`] 文字。現行との違いを参照）。
 //! - まず地理院の地名検索 API を引く。**0 件（または失敗）のときだけ** Nominatim を引く。国内の地名は
 //!   地理院の結果だけを返し、Nominatim への問い合わせを減らす。
 //! - 地理院の結果は先頭の 10 件だけを見て（使えない要素を飛ばした後ろの要素は繰り上がらない）、座標が数値で
@@ -23,7 +24,13 @@
 //!
 //! # 現行との違い
 //!
-//! - 応答の本文は 1 MiB まで（現行は上限なし）。超えたら失敗と同じ（空）。
+//! - 応答の本文は**展開後で** 1 MiB まで（現行は上限なし）。超えたら失敗と同じ（空）。gzip の本文も展開後の大きさで
+//!   数える（[`crate::net::read_body_limited`]）。
+//! - 検索語は前後の空白を落としたあと [`MAX_QUERY_LEN`]（200）文字まで。超えたら上流へ問い合わせずに空を返す
+//!   （現行は上限なし）。
+//! - `geocode_osm:` のキャッシュは [`CACHE_MAX_ENTRIES`]（5000）件まで。満杯のあとの新しい検索語は結果を返すが
+//!   保存しない（現行は上限なし。古いものを捨てない: キャッシュは挿入順を持たず、期限も無い）。既に入っている
+//!   語は引き続き当たり、上書きもできる。`geo:` など、ほかのキーには触れない。
 //! - 待っている間に、同じ語を別の要求がキャッシュに入れたら、通信せずにそれを返す（現行は待ったあとに必ず通信する）。
 //! - 同時に処理する検索は [`MAX_IN_FLIGHT`] 件まで。超える要求は待たせずに断る（現行は無制限に待たせる）。
 //! - JSON の `NaN`・`Infinity`・`1e400` のような f64 に収まらない数は、Rust では本文全体が不正な JSON になる
@@ -35,6 +42,7 @@
 //!
 //! 検索語・地名・座標・応答の中身・URL は出さない。失敗の種類（[`crate::net::Failure`]・HTTP の状態コード）だけ。
 
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -47,6 +55,12 @@ use crate::pyquery::{py_float, py_quote, py_strip};
 
 /// 短すぎる入力は無駄な要求になるので弾く（現行の `GEOCODE_MIN_LEN`。コードポイント数）。
 pub const MIN_LEN: usize = 2;
+/// 検索語の長さの上限（前後の空白を落としたあとのコードポイント数）。管理画面の地名検索として十分な長さで、
+/// 超えるものは上流へ問い合わせずに空を返す（現行にはこの上限が無い。server.md §18）。
+pub const MAX_QUERY_LEN: usize = 200;
+/// `geocode_osm:` のキャッシュの件数の上限。満杯になったら新しい検索語は保存しない（結果は返す。古いものを
+/// 捨てもしない。`geo:` など、ほかのキーには触れない）。実測の 1 件は数百バイト〜数 KB。
+pub const CACHE_MAX_ENTRIES: usize = 5000;
 /// 返す件数の上限（現行の `GEOCODE_MAX_RESULTS`）。
 pub const MAX_RESULTS: usize = 10;
 /// Nominatim の要求の最短の間隔（公開サーバーの利用規約。現行の `NOMINATIM_MIN_INTERVAL_S`）。
@@ -57,6 +71,8 @@ pub const MAX_IN_FLIGHT: usize = 8;
 const TIMEOUT: Duration = Duration::from_secs(8);
 /// 応答の本文の大きさの上限（実物は数 KB）。
 const MAX_BODY_BYTES: u64 = 1 << 20;
+/// `geocode_osm:` キャッシュのキーの接頭辞。
+const CACHE_PREFIX: &str = "geocode_osm:";
 /// 現行の `http_json` の User-Agent。
 const USER_AGENT: &str = "GeoFrame/0.2";
 
@@ -65,7 +81,15 @@ const GSI_GEOCODE: &str = "https://msearch.gsi.go.jp/address-search/AddressSearc
 /// Nominatim（`config.py` の `NOMINATIM_SEARCH`）。`{q}`・`{limit}` を埋めて使う。
 const NOMINATIM_SEARCH: &str = "https://nominatim.openstreetmap.org/search?q={q}&format=jsonv2&limit={limit}&accept-language=ja";
 
-/// 通信先。ひな形の `{q}`・`{limit}` を埋めて使う。本番は定数だけ（[`Endpoints::production`]）。
+/// 通信先。ひな形の `{q}`・`{limit}` を埋めて使う。
+///
+/// # 向け先を変えられるのは、この crate を直接組み込むコードだけ
+///
+/// 本番のバイナリ（`main.rs`・`cli.rs`）は [`Endpoints::production`]（定数だけ）しか使わず、設定・環境変数・
+/// コマンドラインのどれからも通信先を変えられない。結合テスト（別の crate として `geoframe` を使う）が
+/// ループバックのスタブへ向けるための [`Endpoints::loopback`] は、**ループバックのアドレス以外を受け付けない**
+/// ので、誤って呼んでも外へは出ない。`cfg(test)` の閉じ込めでは結合テストから使えないための形で、
+/// `loopback` の呼び出しが本番のコードに無いことは試験で見る。
 #[derive(Debug, Clone)]
 pub struct Endpoints {
     gsi: String,
@@ -80,9 +104,20 @@ impl Endpoints {
         }
     }
 
-    /// 試験用: ループバックのスタブへ向ける。**試験のビルドだけにある**（配布するバイナリにはコードが無い）。
+    /// ループバックのスタブへ向ける（結合テスト用）。ループバック以外のアドレスは `None`。
+    pub fn loopback(addr: SocketAddr) -> Option<Self> {
+        addr.ip()
+            .is_loopback()
+            .then(|| Self::at(&format!("http://{addr}")))
+    }
+
+    /// 試験用: ループバックのスタブへ向ける。**試験のビルドだけにある**。
     #[cfg(test)]
     pub(crate) fn stub(base: &str) -> Self {
+        Self::at(base)
+    }
+
+    fn at(base: &str) -> Self {
         Self {
             gsi: format!("{base}/address-search/AddressSearch?q={{q}}"),
             nominatim: format!(
@@ -147,6 +182,8 @@ pub struct Geocoder {
     agent: ureq::Agent,
     clock: Box<dyn Clock>,
     min_interval: Duration,
+    /// `geocode_osm:` のキャッシュの件数の上限（本番は [`CACHE_MAX_ENTRIES`]。試験は小さくする）。
+    cache_cap: usize,
     /// 前の Nominatim の通信が終わった時刻（[`Clock::now`]）。まだ通信していなければ `None`。
     /// **ロックは待ちと通信のあいだ持ち続ける**（全体で 1 秒 1 件にするため）。
     nominatim_last: Mutex<Option<Duration>>,
@@ -170,6 +207,17 @@ impl Geocoder {
         )
     }
 
+    /// 通信先だけを差し替える（実時計・既定の同時数。結合テスト用。[`Endpoints`] を参照）。
+    pub fn with_endpoints(endpoints: Endpoints) -> Self {
+        Self::with_parts(
+            endpoints,
+            Box::new(SystemClock {
+                origin: Instant::now(),
+            }),
+            MAX_IN_FLIGHT,
+        )
+    }
+
     pub(crate) fn with_parts(
         endpoints: Endpoints,
         clock: Box<dyn Clock>,
@@ -180,6 +228,7 @@ impl Geocoder {
             agent: net::agent(),
             clock,
             min_interval: NOMINATIM_MIN_INTERVAL,
+            cache_cap: CACHE_MAX_ENTRIES,
             nominatim_last: Mutex::new(None),
             slots: Arc::new(Semaphore::new(in_flight)),
         }
@@ -219,9 +268,9 @@ impl Geocoder {
     pub fn nominatim_search(&self, cache: &Cache, q: &str, countrycode: &str) -> Vec<Value> {
         let cc = normalize_country(countrycode);
         let key = if cc.is_empty() {
-            format!("geocode_osm:{q}")
+            format!("{CACHE_PREFIX}{q}")
         } else {
-            format!("geocode_osm:{cc}:{q}")
+            format!("{CACHE_PREFIX}{cc}:{q}")
         };
         if let Some(Value::Array(hit)) = cache.get(&key) {
             return hit;
@@ -267,7 +316,17 @@ impl Geocoder {
             .filter_map(|item| parse_osm_item(item, q))
             .collect();
         out.truncate(MAX_RESULTS);
-        cache.put(&key, Value::Array(out.clone()));
+        if !cache.put_capped(
+            &key,
+            Value::Array(out.clone()),
+            CACHE_PREFIX,
+            self.cache_cap,
+        ) {
+            tracing::warn!(
+                "[geo] 地名検索のキャッシュが満杯です（{} 件）。保存しません",
+                self.cache_cap
+            );
+        }
         out
     }
 
@@ -286,14 +345,9 @@ impl Geocoder {
         if !(200..300).contains(&status) {
             return Err(Fail::Status(status));
         }
-        let bytes = response
-            .body_mut()
-            .with_config()
-            // ureq は、上限ちょうどの本文でも、読み切ったあとの次の読み出しで上限超過にする。
-            // 1 足して、上限ちょうど（MAX_BODY_BYTES）までを読めるようにする
-            .limit(MAX_BODY_BYTES + 1)
-            .read_to_vec()
-            .map_err(|e| match e {
+        // 上限は展開後の大きさに効かせる（`net::read_body_limited`。gzip の本文は圧縮時の大きさでは測れない）
+        let bytes =
+            net::read_body_limited(response.body_mut(), MAX_BODY_BYTES).map_err(|e| match e {
                 ureq::Error::BodyExceedsLimit(_) => Fail::Bad,
                 other => Fail::Net(body_failure(&other)),
             })?;
@@ -302,10 +356,11 @@ impl Geocoder {
     }
 }
 
-/// 検索語を整える（前後の空白を落とす）。2 文字未満は `None`（通信しない）。
+/// 検索語を整える（前後の空白を落とす）。2 文字未満と [`MAX_QUERY_LEN`] 文字超は `None`（通信しない）。
 pub fn clean_query(raw: &str) -> Option<&str> {
     let q = py_strip(raw);
-    (q.chars().count() >= MIN_LEN).then_some(q)
+    let len = q.chars().take(MAX_QUERY_LEN + 1).count();
+    (MIN_LEN..=MAX_QUERY_LEN).contains(&len).then_some(q)
 }
 
 /// 現行の国コードの正規化: 前後の空白を落として小文字にし、ASCII の英字 2 文字ならそれ、でなければ空。
@@ -434,6 +489,6 @@ fn osm_coordinate(v: &Value) -> Option<f64> {
 }
 
 #[cfg(test)]
-mod stub;
+pub(crate) mod stub;
 #[cfg(test)]
 mod tests;

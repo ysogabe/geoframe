@@ -195,6 +195,24 @@ impl Cache {
         state.dirty = true;
     }
 
+    /// `prefix` で始まるキーが `max` 件に達していて、`key` がまだ無いときは入れずに `false`。それ以外は
+    /// [`Cache::put`] と同じ（上書きは件数が増えないので常に入る）。ほかの名前空間（`geo:` など）は数えず、
+    /// 捨てもしない。検索語のように、利用者の入力で件数が増えるキーの総量を抑えるのに使う。
+    pub fn put_capped(&self, key: &str, value: Value, prefix: &str, max: usize) -> bool {
+        if self.mode == Mode::Frozen {
+            return true;
+        }
+        let mut state = self.state();
+        if !state.map.contains_key(key)
+            && state.map.keys().filter(|k| k.starts_with(prefix)).count() >= max
+        {
+            return false;
+        }
+        state.map.insert(key.to_string(), value);
+        state.dirty = true;
+        true
+    }
+
     /// 現役でないキーの数（捨てずに数えるだけ）。
     pub fn legacy_count(&self) -> usize {
         self.state().map.keys().filter(|k| !is_live(k)).count()
@@ -389,6 +407,22 @@ mod tests {
   ]
  }
 }"#;
+
+    #[test]
+    fn put_capped_limits_one_namespace_only() {
+        let cache = Cache::memory_only();
+        cache.put("geo:1.000,2.000", json!({}));
+        assert!(cache.put_capped("n:a", json!(1), "n:", 2));
+        assert!(cache.put_capped("n:b", json!(2), "n:", 2));
+        // 満杯: 新しいキーは入れない。上書きは入る。ほかの名前空間は数えない・捨てない
+        assert!(!cache.put_capped("n:c", json!(3), "n:", 2));
+        assert!(cache.put_capped("n:a", json!(9), "n:", 2));
+        assert_eq!(cache.get("n:a"), Some(json!(9)));
+        assert_eq!(cache.get("n:c"), None);
+        cache.put("geo:3.000,4.000", json!({}));
+        assert_eq!(cache.len(), 4);
+        assert!(cache.get("geo:1.000,2.000").is_some());
+    }
 
     #[test]
     fn missing_or_broken_files_start_empty() {

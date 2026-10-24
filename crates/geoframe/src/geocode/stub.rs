@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use super::Clock;
+use super::{Clock, Endpoints, Geocoder};
 
 /// 偽の時計。`sleep` は待たずに時計を進め、引数を記録する。
 pub struct TestClock {
@@ -83,6 +83,8 @@ pub struct Reply {
     pub hangup: bool,
     /// 返す前に偽の時計を進める（通信にかかった時間）。
     pub took: Duration,
+    /// `body` は gzip で、`Content-Encoding: gzip` を付ける。
+    pub gzip: bool,
 }
 
 impl Reply {
@@ -92,6 +94,7 @@ impl Reply {
             body: body.as_bytes().to_vec(),
             hangup: false,
             took: Duration::ZERO,
+            gzip: false,
         }
     }
 
@@ -101,6 +104,16 @@ impl Reply {
             body: Vec::new(),
             hangup: false,
             took: Duration::ZERO,
+            gzip: false,
+        }
+    }
+
+    /// 展開すると `head` の後ろに空白が `pad` 個続く JSON になる gzip の本文（圧縮後はごく小さい）。
+    pub fn gzip_padded(head: &str, pad: usize) -> Self {
+        Self {
+            body: crate::testutil::gzip::padded(head.as_bytes(), pad),
+            gzip: true,
+            ..Self::status(200)
         }
     }
 
@@ -290,11 +303,38 @@ fn write_reply(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
         return Ok(());
     }
     let head = format!(
-        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nConnection: close\r\n{}Content-Length: {}\r\n\r\n",
         reply.status,
+        if reply.gzip {
+            "Content-Encoding: gzip\r\n"
+        } else {
+            ""
+        },
         reply.body.len()
     );
     stream.write_all(head.as_bytes())?;
     stream.write_all(&reply.body)?;
     stream.flush()
+}
+
+/// 何も受け付けない接続先の `Geocoder`（試験の既定。`AppState::new` は本番の接続先なので、検索語が 2 文字以上の
+/// E4 を叩く試験が本物の地理院・Nominatim へ出ないよう、`with_geocoder` でこれに差し替える）。要求が 1 つでも
+/// 届いたら**プロセスごと落とす**（通信が要る試験は [`StubUpstreams`] を作って向ける）。
+pub fn deny_geocoder() -> Arc<Geocoder> {
+    static DENY: std::sync::OnceLock<(SocketAddr, Arc<Geocoder>)> = std::sync::OnceLock::new();
+    let (_, geocoder) = DENY.get_or_init(|| {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if listener.accept().is_ok() {
+                eprintln!(
+                    "geocode stub: 想定外の地名検索の通信が届いた（既定の接続先は何も受け付けない）"
+                );
+                std::process::abort();
+            }
+        });
+        let geocoder = Geocoder::with_endpoints(Endpoints::loopback(addr).unwrap());
+        (addr, Arc::new(geocoder))
+    });
+    Arc::clone(geocoder)
 }

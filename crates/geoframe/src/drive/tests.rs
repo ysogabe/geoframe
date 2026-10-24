@@ -2385,6 +2385,88 @@ fn assert_unreadable_reason_stops_the_stage(tag: &str, flag: &str) {
     recovers_without_waiting(&e, &fetch);
 }
 
+/// 本文の上限は、圧縮後でなく**展開後**の大きさに効く（圧縮後は数十 KB でも、展開後が上限を超えれば断る）。
+/// 上限ちょうどは通り、1 バイト超えたら断る。
+#[test]
+fn size_limits_apply_to_the_decompressed_body() {
+    let e = env("drive-gzip-limits");
+    let probe = |status: u16, head: &str, pad: usize| {
+        let head = head.to_string();
+        e.stub.clear_faults();
+        e.stub.add_fault(Box::new(move |_| {
+            Some((
+                status,
+                head.clone(),
+                vec![("X-Gzip-Pad".to_string(), pad.to_string())],
+            ))
+        }));
+        crate::net::agent()
+            .get(&format!("{}/probe", e.stub.base_url()))
+            .call()
+            .unwrap()
+    };
+    // 一覧・トークンの JSON（read_json）
+    let json_max = MAX_JSON_BYTES as usize;
+    assert_eq!(read_json(probe(200, "{}", json_max - 2)), Ok(json!({})));
+    assert_eq!(
+        read_json(probe(200, "{}", json_max - 1)),
+        Err(DriveError::TooLarge)
+    );
+    // 403 の理由の本文（先頭に流量制限の語があるので、全部読めれば true。超えたら読み捨てて false）
+    let reason = "rateLimitExceeded";
+    let reason_max = 16 << 10;
+    assert_eq!(
+        is_rate_limit_body(&mut probe(403, reason, reason_max - reason.len())),
+        Ok(true)
+    );
+    assert_eq!(
+        is_rate_limit_body(&mut probe(403, reason, reason_max - reason.len() + 1)),
+        Ok(false)
+    );
+}
+
+/// 原本のダウンロードも展開後の大きさで数える（圧縮後の大きさを見る Content-Length の事前検査は、
+/// 展開する本文では効かない）。展開後が上限を大きく超える本文は、書き出す前に止まる。
+#[test]
+fn download_counts_the_decompressed_size() {
+    let e = env("drive-gzip-download");
+    e.listing(vec![]);
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let session = Session::new(&e.shared, &http, &stop, &e.key);
+    let serve = |pad: usize| {
+        e.stub.clear_faults();
+        e.stub.add_fault(Box::new(move |r| {
+            r.is_media().then(|| {
+                (
+                    200,
+                    String::new(),
+                    vec![("X-Gzip-Pad".to_string(), pad.to_string())],
+                )
+            })
+        }));
+    };
+    serve(10_000);
+    let mut out = Vec::new();
+    assert_eq!(session.download("big", &mut out, 10_000), Ok(10_000));
+    assert_eq!(out.len(), 10_000);
+    serve(10_001);
+    let mut out = Vec::new();
+    assert_eq!(
+        session.download("big", &mut out, 10_000),
+        Err(DriveError::TooLarge)
+    );
+    assert!(out.is_empty(), "上限を超える本文は書かない");
+    // 圧縮後は小さくても、展開後が 64 MiB の本文（上限は 1000 バイト）
+    serve(64 << 20);
+    let mut out = Vec::new();
+    assert_eq!(
+        session.download("big", &mut out, 1000),
+        Err(DriveError::TooLarge)
+    );
+    assert!(out.len() <= 1000);
+}
+
 /// スタブの壊れた本文が、実際に `ureq` の `Protocol`・`Decompress` を返すこと（この 2 つが理由の本文の
 /// 取りこぼしだった）と、`reason_body_failure` の表。
 #[test]

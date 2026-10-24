@@ -3,6 +3,11 @@
 // テストファイルごとに使う部品が違うので、使われない関数があっても警告しない
 #![allow(dead_code)]
 
+mod geocode_stub;
+
+#[allow(unused_imports)]
+pub use geocode_stub::{GeocodeStub, Upstream};
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -197,7 +202,13 @@ pub fn build_empty_catalog(dir: &Path, rows: &str) -> (PathBuf, rusqlite::Connec
 
 pub fn app_state(catalog: Catalog) -> AppState {
     let config = Config::load(|_| None, &Overrides::default()).unwrap();
-    AppState::new(Arc::new(config), catalog)
+    test_state(Arc::new(config), catalog)
+}
+
+/// 試験用の `AppState`。本物の地理院・Nominatim へ出ないよう、地名検索の接続先を、何も受け付けないスタブに向ける
+/// （[`GeocodeStub::deny`]）。結合テストは `AppState::new` を直接呼ばず、これを通す。
+pub fn test_state(config: Arc<Config>, catalog: Catalog) -> AppState {
+    AppState::new(config, catalog).with_geocoder(GeocodeStub::deny())
 }
 
 /// 127.0.0.1 の空きポートで router を起動する。
@@ -347,7 +358,7 @@ pub async fn spawn_with_env(
     .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router(AppState::new(Arc::new(config), catalog));
+    let app = router(test_state(Arc::new(config), catalog));
     // 本番（`server::serve`）と同じく、接続の上限・無通信の打ち切りを通す
     let listener = LimitedListener::new(listener, ConnLimits::default());
     tokio::spawn(async move { axum::serve(listener, app).await });

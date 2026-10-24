@@ -4,13 +4,15 @@
 //! `set_global_default` は1プロセス1回）が、並行して走る他のテストと干渉しないよう、プロセスを
 //! 分けた。
 
+mod common;
+
 use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use geoframe::config::{Config, LogLevel, Overrides};
 use geoframe::db::{Catalog, REQUIRED_SCHEMA};
-use geoframe::server::{AppState, router};
+use geoframe::server::router;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 書き込み先を共有する `MakeWriter`。
@@ -78,7 +80,7 @@ async fn access_log_has_only_method_route_status_and_time() {
         },
     )
     .unwrap();
-    let state = AppState::new(Arc::new(config), Catalog::open(&path).unwrap());
+    let state = common::test_state(Arc::new(config), Catalog::open(&path).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router(state)).await });
@@ -209,7 +211,7 @@ async fn post_logs_only_method_route_status_and_the_kind_of_internal_error() {
         },
     )
     .unwrap();
-    let state = AppState::new(Arc::new(config), catalog);
+    let state = common::test_state(Arc::new(config), catalog);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router(state)).await });

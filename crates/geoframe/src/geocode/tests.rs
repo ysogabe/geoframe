@@ -139,6 +139,7 @@ fn reply_of(spec: &Value) -> Reply {
         body,
         hangup: false,
         took: spec.get("took").map_or(Duration::ZERO, secs),
+        gzip: false,
     }
 }
 
@@ -338,6 +339,118 @@ async fn a_body_over_the_limit_is_a_failure() {
     rig.stub.set(Upstream::Gsi, Some(Reply::json(&ok)));
     let (_, body) = rig.get_json("/api/admin/geocode?q=cd").await;
     assert_eq!(body["items"].as_array().unwrap().len(), 1);
+}
+
+/// 本文の上限は、gzip の本文では圧縮後でなく**展開後**の大きさに効く（圧縮後は数 KB でも、展開後が 1 MiB を超えれば
+/// 失敗）。上限ちょうどは読める。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_body_limit_counts_the_decompressed_size() {
+    let item = "[{\"geometry\":{\"coordinates\":[1.5,2.5]},\"properties\":{\"title\":\"t\"}}]";
+    let max = MAX_BODY_BYTES as usize;
+    let at_limit = Reply::gzip_padded(item, max - item.len());
+    let over_limit = Reply::gzip_padded(item, max - item.len() + 1);
+    assert!(
+        over_limit.body.len() < 20_000,
+        "圧縮後は小さい本文で試す: {}",
+        over_limit.body.len()
+    );
+
+    // 地理院: 超えたら失敗として Nominatim へ回る。ちょうど上限なら読めて、Nominatim へは回らない
+    let rig = Rig::start().await;
+    rig.stub.set(Upstream::Gsi, Some(over_limit.clone()));
+    rig.stub.set(Upstream::Osm, Some(Reply::json("[]")));
+    let (status, body) = rig.get_json("/api/admin/geocode?q=ab").await;
+    assert_eq!((status, body), (200, json!({"ok": true, "items": []})));
+    assert_eq!(rig.stub.count(Upstream::Osm), 1);
+    rig.stub.set(Upstream::Gsi, Some(at_limit.clone()));
+    let (_, body) = rig.get_json("/api/admin/geocode?q=cd").await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(rig.stub.count(Upstream::Osm), 1);
+
+    // Nominatim: 超えたら空でキャッシュしない。ちょうど上限なら読める（空の配列はキャッシュする）
+    let rig = Rig::start().await;
+    rig.stub.set(Upstream::Gsi, Some(Reply::json("[]")));
+    rig.stub.set(Upstream::Osm, Some(over_limit));
+    let (status, body) = rig.get_json("/api/admin/geocode?q=ab").await;
+    assert_eq!((status, body), (200, json!({"ok": true, "items": []})));
+    assert!(rig.cache.snapshot().is_empty());
+    rig.stub
+        .set(Upstream::Osm, Some(Reply::gzip_padded("[]", max - 2)));
+    let _ = at_limit;
+    rig.get_json("/api/admin/geocode?q=ab").await;
+    assert_eq!(
+        rig.cache.snapshot().len(),
+        1,
+        "上限ちょうどの本文は読めて、結果をキャッシュする"
+    );
+}
+
+/// 検索語は前後の空白を落としたあと 200 文字まで。超えたら上流へ問い合わせずに空を返す。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_query_over_the_length_cap_never_reaches_upstream() {
+    let rig = Rig::start().await;
+    rig.stub.set(
+        Upstream::Gsi,
+        Some(Reply::json(
+            r#"[{"geometry":{"coordinates":[1.5,2.5]},"properties":{"title":"t"}}]"#,
+        )),
+    );
+    rig.stub.set(Upstream::Osm, Some(Reply::json("[]")));
+    // 上限ちょうど（空白は数えない）は検索する
+    let at = "a".repeat(MAX_QUERY_LEN);
+    let (_, body) = rig
+        .get_json(&format!("/api/admin/geocode?q=%20{at}%20"))
+        .await;
+    assert_eq!(body["items"].as_array().unwrap().len(), 1);
+    assert_eq!(rig.stub.count(Upstream::Gsi), 1);
+    // 1 文字超えたら、どちらの上流にも触れない
+    let over = "a".repeat(MAX_QUERY_LEN + 1);
+    let (status, body) = rig.get_json(&format!("/api/admin/geocode?q={over}")).await;
+    assert_eq!((status, body), (200, json!({"ok": true, "items": []})));
+    assert_eq!(rig.stub.count(Upstream::Gsi), 1);
+    assert_eq!(rig.stub.count(Upstream::Osm), 0);
+    // 数えるのはコードポイント（バイトではない）
+    assert_eq!(
+        clean_query(&"あ".repeat(MAX_QUERY_LEN)).map(str::len),
+        Some(MAX_QUERY_LEN * 3)
+    );
+    assert_eq!(clean_query(&"あ".repeat(MAX_QUERY_LEN + 1)), None);
+}
+
+/// `geocode_osm:` のキャッシュは件数に上限があり、満杯のあとの新しい検索語は結果を返すが保存しない。
+/// 既に入っている語は当たり続け、`geo:` など、ほかのキーには触れない。
+#[test]
+fn the_geocode_cache_is_capped_without_touching_other_keys() {
+    let clock = TestClock::new(START);
+    let stub = StubUpstreams::start(Arc::clone(&clock));
+    let mut geocoder = Geocoder::with_parts(
+        Endpoints::stub(&stub.base_url()),
+        Box::new(SharedClock(Arc::clone(&clock))),
+        MAX_IN_FLIGHT,
+    );
+    geocoder.cache_cap = 2;
+    let cache = Cache::memory_only();
+    cache.put("geo:10.000,20.000", json!({"place": "テスト"}));
+    stub.set(Upstream::Gsi, Some(Reply::json("[]")));
+    stub.set(
+        Upstream::Osm,
+        Some(Reply::json(
+            r#"[{"lat":"1.5","lon":"2.5","display_name":"t"}]"#,
+        )),
+    );
+    for q in ["aa", "bb"] {
+        assert_eq!(geocoder.search(&cache, q).len(), 1);
+    }
+    assert_eq!(cache.len(), 3);
+    // 満杯: 結果は返すが、保存しない（毎回問い合わせる）
+    assert_eq!(geocoder.search(&cache, "cc").len(), 1);
+    assert_eq!(geocoder.search(&cache, "cc").len(), 1);
+    assert_eq!(cache.len(), 3);
+    assert_eq!(stub.count(Upstream::Osm), 4);
+    // 入っている語は当たる（問い合わせない）。ほかの名前空間は残る
+    assert_eq!(geocoder.search(&cache, "aa").len(), 1);
+    assert_eq!(stub.count(Upstream::Osm), 4);
+    assert!(cache.get("geo:10.000,20.000").is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -559,30 +672,85 @@ async fn a_cap_slot_is_released_when_the_client_goes_away() {
     assert!(rig.geocoder.try_reserve().is_some());
 }
 
+/// 実時計（`SystemClock`）でも、続けた Nominatim の 2 回の要求が間隔以上あく。スタブが**要求を受けた実際の時刻**
+/// の差を見る（`search` の呼び出しの前後を測らない: 1 回目の通信が終わってから測り始めるまでの遅れや、遅い環境で
+/// の揺れに左右されない）。間隔は 1 回目の通信が**終わった**時刻から数えるので、受信の差はそれ以上になる。
+/// 上限は見ない（遅れて長くなっても落ちない）。
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_real_clock_waits_at_least_the_interval() {
-    // 実時間の下限だけを見る（遅れて長くなっても落ちない）
+async fn a_real_clock_keeps_the_interval_between_received_requests() {
     let clock = TestClock::new(START);
     let stub = StubUpstreams::start(clock);
     stub.set(Upstream::Gsi, Some(Reply::json("[]")));
     stub.set(Upstream::Osm, Some(Reply::json("[]")));
+    let received = Arc::new(Mutex::new(Vec::new()));
+    {
+        let received = Arc::clone(&received);
+        stub.set_hook(move |upstream| {
+            if upstream == Upstream::Osm {
+                received
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(std::time::Instant::now());
+            }
+        });
+    }
+    let interval = Duration::from_millis(300);
     let mut geocoder = Geocoder::production();
     geocoder.endpoints = Endpoints::stub(&stub.base_url());
-    geocoder.min_interval = Duration::from_millis(300);
+    geocoder.min_interval = interval;
     let cache = Cache::memory_only();
     let (geocoder, cache) = (Arc::new(geocoder), Arc::new(cache));
     tokio::task::spawn_blocking(move || {
         geocoder.search(&cache, "ab");
-        let before = std::time::Instant::now();
         geocoder.search(&cache, "cd");
-        assert!(
-            before.elapsed() >= Duration::from_millis(250),
-            "{:?}",
-            before.elapsed()
-        );
     })
     .await
     .unwrap();
+    let received = received.lock().unwrap_or_else(PoisonError::into_inner);
+    assert_eq!(received.len(), 2);
+    let gap = received[1].duration_since(received[0]);
+    assert!(gap >= interval, "{gap:?}");
+}
+
+/// 本番のコードは、地名検索の通信先を差し替える入口（`Endpoints::loopback`・`Geocoder::with_endpoints`・
+/// `AppState::with_geocoder`）を呼ばない。設定・環境変数・コマンドラインから通信先を変えられないことの確認
+/// （入口は結合テストのために `pub` だが、本番のバイナリからは使われない）。
+#[test]
+fn production_code_never_redirects_the_geocoder() {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    walk(&src, &mut files);
+    assert!(files.len() > 20);
+    let mut users = Vec::new();
+    for path in files {
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+        // 入口を定義するファイルと、試験のコード
+        if ["geocode.rs", "server.rs", "tests.rs", "stub.rs"].contains(&name.as_str()) {
+            continue;
+        }
+        let text = fs::read_to_string(&path).unwrap();
+        for needle in [
+            "Endpoints::loopback",
+            "Endpoints::stub",
+            "with_endpoints(",
+            "with_geocoder(",
+        ] {
+            if text.contains(needle) {
+                users.push(format!("{name}: {needle}"));
+            }
+        }
+    }
+    assert!(users.is_empty(), "{users:?}");
 }
 
 // ---------------------------------------------------------------- ログ（AC7）

@@ -1338,6 +1338,47 @@ fn 本文が読めない失敗は障害の種類になる() {
     assert_eq!(stub.count(Kind::Elev), 1, "再試行しない");
 }
 
+/// 応答の上限（逆ジオ・標高は 1 MiB、`muni.js` は 8 MiB）は、gzip の本文では圧縮後でなく展開後の大きさに効く。
+/// 圧縮後は小さくても、展開後が上限を超えれば使えない応答になる。上限ちょうどは読める。
+#[test]
+fn 応答の上限は展開後の大きさに効く() {
+    let rgeo = r#"{"results":{"muniCd":"13101","lv01Nm":"テスト町一丁目"}}"#;
+    let muni = "GSI.MUNI_ARRAY[\"13101\"] = '13,東京都,13101,千代田区';";
+    for (what, extra) in [("上限ちょうど", 0), ("1 バイト超え", 1)] {
+        let s = setup("geo-enrich-gzip-limit");
+        let stub = StubGsi::start();
+        tokyo_replies(&stub);
+        // 逆ジオ（1 MiB）。圧縮後が小さいことも確かめる
+        let reply = Reply::GzipPadded(rgeo.to_string(), (1 << 20) - rgeo.len() + extra);
+        stub.set_rgeo(move |_, _| reply.clone());
+        s.sql(&domestic_rows(1));
+        s.run(&enrich_for(&stub));
+        let place = s.row(1)["place"].clone();
+        assert_eq!(
+            place == json!("テスト町一丁目"),
+            extra == 0,
+            "逆ジオ {what}: {place}"
+        );
+
+        // muni.js（8 MiB）
+        let s = setup("geo-enrich-gzip-limit-muni");
+        let stub = StubGsi::start();
+        tokyo_replies(&stub);
+        stub.set_muni(Reply::GzipPadded(
+            muni.to_string(),
+            (8 << 20) - muni.len() + extra,
+        ));
+        s.sql(&domestic_rows(1));
+        let _ = s.try_run(&enrich_for(&stub));
+        let pref = s.row(1)["pref"].clone();
+        assert_eq!(
+            pref == json!("東京都"),
+            extra == 0,
+            "muni.js {what}: {pref}"
+        );
+    }
+}
+
 #[test]
 fn 障害から復旧した次のサイクルで続きから埋まる() {
     let s = setup("geo-enrich-recover");

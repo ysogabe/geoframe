@@ -771,10 +771,9 @@ impl<'a> Session<'a> {
         if body.content_length().is_some_and(|len| len > limit) {
             return Err(DriveError::TooLarge);
         }
-        let mut reader = body
-            .into_with_config()
-            .limit(limit.saturating_add(1))
-            .reader();
+        // `ureq` の `limit` は圧縮された（gzip の）バイト列に当たり、展開後には効かないので付けない。
+        // 展開後の大きさは、下の読み出しで数えて上限（`limit`）を超えたところで止める
+        let mut reader = body.into_with_config().reader();
         let mut buf = vec![0u8; COPY_CHUNK];
         let mut total = 0u64;
         loop {
@@ -849,12 +848,8 @@ fn reason_body_failure(e: &ureq::Error) -> Failure {
 /// 届かないのは回線の不調）。切断・時間切れ・TLS 以外（`Protocol`・`Decompress` など）は
 /// [`Failure::ReasonUnreadable`]（[`reason_body_failure`]）。
 fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<bool, DriveError> {
-    let bytes = match response
-        .body_mut()
-        .with_config()
-        .limit(16 << 10)
-        .read_to_vec()
-    {
+    // 上限は展開後の大きさに効かせる（`net::read_body_limited`）
+    let bytes = match net::read_body_limited(response.body_mut(), 16 << 10) {
         Ok(bytes) => bytes,
         Err(ureq::Error::BodyExceedsLimit(_)) => return Ok(false),
         Err(e) => return Err(DriveError::Net(reason_body_failure(&e))),
@@ -865,13 +860,10 @@ fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> Result
 
 fn read_json(response: ureq::http::Response<ureq::Body>) -> Result<Value, DriveError> {
     let (_, mut body) = response.into_parts();
-    let bytes = body
-        .with_config()
-        .limit(MAX_JSON_BYTES)
-        .read_to_vec()
-        .map_err(|e| match e {
-            ureq::Error::BodyExceedsLimit(_) => DriveError::TooLarge,
-            other => DriveError::Net(Failure::from(&other)),
-        })?;
+    // 上限は展開後の大きさに効かせる（`net::read_body_limited`）
+    let bytes = net::read_body_limited(&mut body, MAX_JSON_BYTES).map_err(|e| match e {
+        ureq::Error::BodyExceedsLimit(_) => DriveError::TooLarge,
+        other => DriveError::Net(Failure::from(&other)),
+    })?;
     serde_json::from_slice(&bytes).map_err(|_| DriveError::BadResponse)
 }
