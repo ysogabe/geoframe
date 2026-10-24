@@ -69,7 +69,7 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 | 2サイクル目（Rust） | `added=0 updated=0`、`inferred=0`、`enrich candidates=0`、`made=0`、`quality pending=0`。変更0 |
 | **`photos`のローカル行** | 15行（追加分を足して21行）・パスの集合が一致。**全26列（`id`・`path name mtime taken_at lat lon loc_source place elev muni_cd pref city display inferred_from infer_dt_s`ほか）の不一致0**。`indexed_at`・`fetched_at`は値でなく形式（数字を9に置いた形）まで一致 |
 | Driveの6,535行 | 両方とも変化なし（実行時刻を除いて一致） |
-| 位置の推定 | 推定された行は両方とも同じ。バケットは±15分・±2時間・±12時間が1行ずつ以上（窓どおり）。合成の写真から遠い1枚は、本番コピーの既存の写真が窓の内側にあったので、両方とも**その既存の写真を錨に**推定された（値は書かない）。時刻なしの1枚は両方とも推定されない時刻なしの1枚は両方とも推定されない |
+| 位置の推定 | 推定された行は両方とも同じ。バケットは±15分・±2時間・±12時間が1行ずつ以上（窓どおり）。合成の写真から遠い1枚は、本番コピーの既存の写真が窓の内側にあったので、両方とも**その既存の写真を錨に**推定された（値は書かない）。時刻なしの1枚は両方とも推定されない |
 | 地名 | 国内の行は同じ地名の列が付き、国外の1枚は両方とも空で確定。時刻なしの行は`place`がNULLのまま |
 | **`photo_quality`のローカル行** | 21行時点で8行・`kind`（`exact`/`similar`）・順位・推奨が一致 |
 | `photo_quality`の全体 | 行数567・グループ数247・`kind`の内訳（`exact` 189・`similar` 378）が一致。`photo_id`ごとの全列（`group_id`・順位・`recommended`・`score`・`reasons_json`・`issues_json`を含む。実装の印の`algorithm`と`analyzed_at`は除く）の不一致0 |
