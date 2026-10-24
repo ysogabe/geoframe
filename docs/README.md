@@ -11,7 +11,7 @@
 | [写真カタログ](architecture/photo-catalog.md) | 参照 | SQLiteとメタデータ分離の設計・設計履歴 |
 | [写真フィードの契約](architecture/photo-feed-contract.md) | 現行 | 表示クライアント（miharashi）へ渡す写真一覧と画像 |
 | [ADR 0008: 写真管理基盤への転換](decisions/0008-photo-platform-and-miharashi-display.md) | 現行 | 表示をmiharashiへ移し、GEOFRAMEを写真管理基盤にした経緯 |
-| [Go写真管理APIと外部AI Providerの設計案](architecture/go-api-and-ai-providers-proposal.md) | 計画 | Go単一バイナリ化、local-model-labの画像Embedding API、ローカル／クラウドAIの切り替え |
+| [Rust写真管理APIと外部AI Providerの設計案](architecture/rust-api-and-ai-providers-proposal.md) | 計画 | Rust単一バイナリ化、miharashiとの知見共有、local-model-labの画像Embedding API、ローカル／クラウドAIの切り替え |
 | [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（`config.py`から自動生成） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、更新、バックアップ |
 
@@ -24,7 +24,7 @@
 - [写真カタログとメタデータ分離](architecture/photo-catalog.md)
 - [現行の写真パイプライン](architecture/photo-pipeline.md)
 - [写真フィードの契約（表示クライアント向け）](architecture/photo-feed-contract.md)
-- [Go写真管理APIと外部AI Providerの設計案（未実装）](architecture/go-api-and-ai-providers-proposal.md)
+- [Rust写真管理APIと外部AI Providerの設計案（未実装）](architecture/rust-api-and-ai-providers-proposal.md)
 
 ### `decisions/` — 意思決定記録
 
