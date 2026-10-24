@@ -78,6 +78,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - ローカル`photos/`とGoogle Driveの索引（`drive.readonly`、撮影時刻・GPSのメタデータ）、derivative生成（JPEG/HEIC）、EXIF、位置の推定、逆ジオコーダ、簡易品質判定（完全重複・近似の判定。旧スコアとの一致は不要）。
 - 索引・取り込みがDBへ書くので、**取り込み用の書き込み接続（writer）をP2で追加し**、unitの`ReadOnlyPaths`を必要な分だけ解除する（[server.md §2.2](server.md)）。
 - 検証環境でDriveを使うには`drive_key.json`のコピーが要る。**P2の開始時にユーザーへ確認する。**
+- 受入: 検証環境の本番コピーに対して、Rustの`sync --dry-run`が全段0で、実サイクルを回しても`.dump`が変わらないこと（**冪等性が関門**）。同じ写真を比較用PythonとRustに入れて、`photos`の全列・推定・地名・品質の顔ぶれが（既知の差を除いて）一致すること。棚卸しのE2E（S1・S3・S7。S2はスタブのDriveまで、本物のDriveは鍵が置かれてから）と、取り込みを有効にしたRustでのmiharashiの表示の継続。結果は[p2-acceptance.md](p2-acceptance.md)。
 
 ### P3: 管理機能（PR 4）
 
