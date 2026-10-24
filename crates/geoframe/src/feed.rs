@@ -5,16 +5,16 @@
 //! （`app/geoframe/photos.py:api_photos`）が出すキー・JSON 型・`null` の出し方をそのまま
 //! 持つので、T1.5 で Python と Rust の応答を全件比較できる。
 //!
-//! 応答は [`Photo`] の JSON 配列。DB からの取得・除外・並び・旅番号の計算は T1.2 の仕事で、
-//! ここでは形だけを固定する。
+//! 応答は [`Photo`] の JSON 配列。ここでは形だけを固定する。DB からの取得・除外・並び・旅番号の
+//! 計算は [`crate::photos`]（T1.2）。
 //!
-//! **例外（`taken_at` が NULL の行）**: 現行の Python は `photos.taken_at` が NULL の行で
+//! **意図した差（`taken_at` が NULL の行）**: 現行の Python は `photos.taken_at` が NULL の行で
 //! `time: null` を出し、並びでは先頭になる（空文字の行は最後）。契約では `time` は文字列
-//! （不明は空文字）で、この型の `time` も `String` なので、`null` は読めない。本番のコピーには
-//! `taken_at` が NULL の行は無い（管理者が確認済み）ので、Rust での扱い（空文字にそろえて
-//! 最後に並べる等）は T1.2 で決める。現行 Python の挙動は
-//! `app/tests/test_photo_feed_contract.py` の `test_null_taken_at_comes_out_as_null_and_first`
-//! に記録してある。
+//! （不明は空文字）で、この型の `time` も `String` なので、`null` は読めない。Rust（T1.2）は
+//! NULL を空文字として扱い、「時刻不明」と同じく最後に並べて、旅番号も不明な写真と同じにする。
+//! 本番のコピーには `taken_at` が NULL の行は無い（管理者が確認済み）ので、実データでは差が出ない。
+//! 現行 Python の挙動は `app/tests/test_photo_feed_contract.py` の
+//! `test_null_taken_at_comes_out_as_null_and_first` に記録してある。
 //!
 //! [`docs/architecture/photo-feed-contract.md`]: ../../../docs/architecture/photo-feed-contract.md
 //! [`docs/architecture/photo-feed.schema.json`]: ../../../docs/architecture/photo-feed.schema.json

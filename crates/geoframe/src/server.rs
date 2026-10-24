@@ -1,4 +1,5 @@
-//! HTTP サーバー。P1 の T1.1 時点では `GET /healthz`（プロセスが動いていて DB が読める）だけを返す。
+//! HTTP サーバー。ルートは `GET /healthz`（プロセスが動いていて DB が読める）と
+//! `GET /api/v1/photos`（写真フィード。契約は docs/architecture/photo-feed-contract.md）。
 //!
 //! 公開するルートが増えても、次の方針は変えない。
 //!
@@ -20,6 +21,7 @@ use serde::Serialize;
 
 use crate::config::Config;
 use crate::db::Catalog;
+use crate::photos;
 
 /// `/healthz` が DB の確認を待つ上限。超えたら不健康（503）として答える。`/healthz` 専用の接続の
 /// `busy_timeout`（2 秒、`db.rs`）より長く、API の読み取りとは別の接続を使うので、API が混んで
@@ -68,6 +70,52 @@ async fn healthz(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
+/// `GET /api/v1/photos`。Python の `_send_json` と同じ `Content-Type` と `Cache-Control`
+/// （`json.dumps(ensure_ascii=False)` と同じく、日本語はエスケープしない UTF-8 のまま）。
+/// 読めない・順番待ちが `QUEUE_TIMEOUT` を超えたときは 503 と定型の本文で、理由はログにだけ出す。
+async fn api_photos(State(state): State<AppState>) -> Response {
+    match state.catalog.read(photos::list_photos).await {
+        Ok(list) => match serde_json::to_vec(&list) {
+            Ok(body) => json_response(StatusCode::OK, body),
+            Err(e) => {
+                tracing::error!("写真一覧を JSON にできません: {e}");
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "内部エラーが発生しました",
+                )
+            }
+        },
+        Err(e) => {
+            tracing::warn!("写真一覧を読めません: {e}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "写真一覧を読み取れません。しばらくしてから再試行してください",
+            )
+        }
+    }
+}
+
+fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
+    (
+        status,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json; charset=utf-8"),
+            ),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+/// `{"ok":false,"error":"..."}`。本文は定型文だけで、環境の情報（SQLite のエラー・パス）を載せない。
+fn error_response(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "ok": false, "error": message });
+    json_response(status, body.to_string().into_bytes())
+}
+
 /// リクエストログ。出す項目は**メソッド・ルートのテンプレート・状態コード・所要時間（ミリ秒）**
 /// だけ。実際のパスやクエリ（ファイル名・Drive ID・検索語が入りうる）は出さず、どのルートにも
 /// 当たらなかったリクエストは `(unmatched)` と出す。`/healthz` の成功は頻繁に呼ばれるので debug。
@@ -99,6 +147,7 @@ async fn not_found() -> StatusCode {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/api/v1/photos", get(api_photos))
         // 既定のフォールバックには layer が掛からないので、明示して 404 もログに載せる
         .fallback(not_found)
         .layer(middleware::from_fn(access_log))

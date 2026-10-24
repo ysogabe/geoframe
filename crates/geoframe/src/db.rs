@@ -322,7 +322,8 @@ impl Catalog {
         Self::open_with_queue_timeout(path, connections, QUEUE_TIMEOUT)
     }
 
-    fn open_with_queue_timeout(
+    /// 順番待ちの上限を変えて開く（上限を超えたときの 503 を、10 秒待たずに試すため）。
+    pub fn open_with_queue_timeout(
         path: &Path,
         connections: usize,
         queue_timeout: Duration,

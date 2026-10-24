@@ -10,10 +10,14 @@ GEOFRAMEが表示クライアントへ渡す写真一覧と画像の取得方法
 - Python: `app/tests/test_photo_feed_contract.py`が、現行実装の出力をSchemaに照らし、Rustテストが読むフィクスチャ
   （`crates/geoframe/tests/fixtures/photo-feed-python.json`）が現行実装の出力と一致することを確かめます。
   フィクスチャの再生成は`python3 tools/gen_photo_feed_fixture.py`（合成データだけ。差の検査は`--check`）。
+  同じ合成DBのSQL（`photo-feed-catalog.sql`。Pythonの本物のスキーマと行）も一緒に書き出される。
 - Rust: `crates/geoframe/tests/photo_feed_contract.rs`が、型（`geoframe::feed::Photo`）の出力と上のフィクスチャを
   同じSchemaで検査し、フィクスチャを型で読み書きし直しても内容が変わらないことを確かめます。
 - miharashiの読み方: `crates/geoframe/tests/photo_feed_miharashi.rs`が、miharashiが読むフィールドと型を再現して
-  フィクスチャと型の出力が読めることを確かめます（miharashiのcrateには依存しません）。
+  フィクスチャと型の出力、およびRustのエンドポイントの実出力が読めることを確かめます（miharashiのcrateには依存しません）。
+- Rustのエンドポイント: `crates/geoframe/tests/photo_feed_endpoint.rs`が、フィクスチャと同じ合成DB（上のSQL）に対する
+  `GET /api/v1/photos`の出力が、フィクスチャ（現行Pythonの出力）と`serde_json::Value`として完全に一致することと、
+  除外・並び・旅番号・タイトル・ヘッダ・503を確かめます。
 
 ## 写真一覧
 
@@ -37,7 +41,7 @@ GET /api/v1/photos
 | `fetched_at` | 文字列 | GEOFRAMEへ取り込んだ日時（`YYYY-MM-DDTHH:MM:SS`形式のローカル時刻）。不明なら空文字 |
 | `quality_kind` | 文字列 | 品質解析のグループの種類。`exact`（完全に同じ写真）、`similar`（3分以内に撮った見た目のほぼ同じ写真）、グループに入らない・未解析なら空文字 |
 | `quality_recommended` | 真偽値 | 品質解析でグループの上位として推奨された写真。グループに入らない・未解析なら`false` |
-| `trip` | 整数 | 撮影日時を48時間以上の間隔で区切った旅の番号（0から）。**この一覧の中だけで意味を持つ**（写真が増えると番号がずれる） |
+| `trip` | 整数 | 撮影日時を48時間超の間隔で区切った旅の番号（0から）。**この一覧の中だけで意味を持つ**（写真が増えると番号がずれる） |
 
 `quality_recommended`はグループに入った写真にしか付きません。「良い写真だけ」を選ぶ目的で
 これだけを条件にすると、グループに入らない単独の写真がすべて外れます。似た写真を省きたい
@@ -70,7 +74,12 @@ miharashiの読み方に合わせて表を緩めてはいません。
 - `time`: 契約は不明なら空文字ですが、現行のPython実装は`photos.taken_at`が`NULL`の写真で`null`を返します
   （`"time": r["taken_at"]`に`or ""`が無い）。しかも並びは`taken_at=''`だけを最後に回すので、`NULL`の写真は先頭に
   来て旅番号も別になります。インデクサ（`drive.py`・ローカル索引）は`norm_time`を通して常に文字列（読めなければ空文字）で保存するので、通常は起きません（手でDBを書き換えたときなどだけ）。
-  Rust実装（T1.2）は契約どおり空文字で出し、並びも最後にする方針です（T1.2で確定）。
+  Rust実装（T1.2）は意図した差として、`NULL`を空文字（時刻不明）として扱い、契約どおり空文字で出して、並びも
+  最後にします（旅番号も時刻不明の写真と同じ。時刻不明の写真は1枚ごとに別の旅になる）。本番のコピーには該当する行が無いことを確認済みです。
+- `lon`: `lat`はあって`lon`が`NULL`の行を、現行のPythonは`lon: null`で出します。Rustはこの行を一覧から外します
+  （契約では数値。miharashiは数値でない`lon`を「位置なし」として扱うので見え方は同じ。`setloc`は`lat`/`lon`を一緒に書くので通常は起きません）。
+- 同じ撮影日時の写真の並び: `ORDER BY`は撮影日時だけで、同順位の並びはSQLiteの実行計画に依存します。RustはPythonと同じSQLなので通常は同じですが、保証はしていません（本番のコピーでの全件比較で確かめます）。
+- 夏時間: 旅番号の48時間の差を、PythonはローカルのTZで数え、Rustは暦だけで数えます。本番の`TZ=Asia/Tokyo`には夏時間が無く、差は同じです。
 - `file`: 契約の例は`derivatives/<id>.jpg`ですが、ローカルのJPEG/PNGは原本をそのまま`photos/...`として指す
   ことがあります。どちらも`/`で始まらない相対パスで、同じ`GET /<file>`で取れます。Schemaは先頭が`/`でない
   ことだけを要求します。

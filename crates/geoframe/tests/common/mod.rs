@@ -3,10 +3,16 @@
 // テストファイルごとに使う部品が違うので、使われない関数があっても警告しない
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
+use geoframe::config::{Config, Overrides};
+use geoframe::db::Catalog;
 use geoframe::feed::{Photo, QualityKind};
+use geoframe::server::{AppState, router};
 use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// 契約のフィールド（docs/architecture/photo-feed-contract.md の表）。
 pub const CONTRACT_FIELDS: [&str; 13] = [
@@ -130,4 +136,132 @@ pub fn sample_photos() -> Vec<Photo> {
         ..plain.clone()
     };
     vec![plain, grouped, exact_unknown_time]
+}
+
+/// テスト用の一時ディレクトリ。落ちたテストでも `Drop` で消える。
+pub struct TempDir(PathBuf);
+
+impl TempDir {
+    pub fn new(tag: &str) -> Self {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "geoframe-test-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self(dir)
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// フィクスチャを作った合成DB（本物のスキーマ＋行）のSQL。`python3 tools/gen_photo_feed_fixture.py`
+/// が現行 Python から書き出す。
+pub fn catalog_sql() -> String {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/photo-feed-catalog.sql");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+}
+
+/// フィクスチャと同じ合成DBを作る。`then` は続けて流すSQL（行の追加・削除）。戻り値の接続は書き込み用で、
+/// 持ち続けるとWALが残る（読み取りが書き込み中のDBも読めることの確認にもなる）。
+pub fn build_catalog(dir: &Path, then: &str) -> (PathBuf, rusqlite::Connection) {
+    let path = dir.join("catalog.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(&catalog_sql()).unwrap();
+    conn.execute_batch(then).unwrap();
+    (path, conn)
+}
+
+/// フィクスチャの行をすべて消した合成DB（スキーマだけ）に、`rows` のSQLで行を入れる。
+pub fn build_empty_catalog(dir: &Path, rows: &str) -> (PathBuf, rusqlite::Connection) {
+    build_catalog(
+        dir,
+        &format!(
+            "DELETE FROM photo_ai_group_members; DELETE FROM photo_ai_groups;
+             DELETE FROM photo_quality; DELETE FROM photos; {rows}"
+        ),
+    )
+}
+
+pub fn app_state(catalog: Catalog) -> AppState {
+    let config = Config::load(|_| None, &Overrides::default()).unwrap();
+    AppState {
+        config: Arc::new(config),
+        catalog,
+    }
+}
+
+/// 127.0.0.1 の空きポートで router を起動する。
+pub async fn spawn(catalog: Catalog) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(app_state(catalog));
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    addr
+}
+
+pub struct Response {
+    /// 状態コード
+    pub status: u16,
+    /// ヘッダ行（小文字にしたもの）
+    pub headers: String,
+    pub body: Vec<u8>,
+}
+
+impl Response {
+    /// ヘッダの値（名前は小文字で渡す）。
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .lines()
+            .find_map(|l| l.strip_prefix(&format!("{name}: ")))
+    }
+
+    pub fn text(&self) -> &str {
+        std::str::from_utf8(&self.body).expect("本文は UTF-8")
+    }
+
+    pub fn json(&self) -> Value {
+        serde_json::from_slice(&self.body).expect("本文は JSON")
+    }
+}
+
+pub async fn get(addr: std::net::SocketAddr, target: &str) -> Response {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("ヘッダの終わり");
+    let head = std::str::from_utf8(&raw[..split]).unwrap();
+    let (status_line, headers) = head.split_once("\r\n").unwrap();
+    Response {
+        status: status_line.split(' ').nth(1).unwrap().parse().unwrap(),
+        headers: headers.to_lowercase(),
+        body: raw[split + 4..].to_vec(),
+    }
+}
+
+/// 合成DBを開いて router を起動し、`/api/v1/photos` の応答を返す。
+pub async fn photos_from(path: &Path) -> Response {
+    let addr = spawn(Catalog::open(path).unwrap()).await;
+    get(addr, "/api/v1/photos").await
 }

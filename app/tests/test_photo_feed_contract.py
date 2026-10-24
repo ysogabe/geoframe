@@ -152,13 +152,20 @@ class PhotoFeedFixtureTest(unittest.TestCase):
             text, photo_feed_fixture.render(self.items),
             "再生成: python3 tools/gen_photo_feed_fixture.py")
 
+    def test_catalog_sql_is_up_to_date(self):
+        text = photo_feed_fixture.CATALOG_SQL_PATH.read_text(encoding="utf-8")
+        self.assertEqual(
+            text, photo_feed_fixture.build_catalog_sql(),
+            "再生成: python3 tools/gen_photo_feed_fixture.py")
+
     def test_real_schema_output_satisfies_the_schema(self):
         self.assertEqual(mini_jsonschema.errors(self.items, SCHEMA), [])
 
     def test_null_taken_at_comes_out_as_null_and_first(self):
-        # 現行実装の挙動の記録（T1.2 で Rust の正規化方針を決める）。契約は time を文字列と
-        # するが、taken_at=NULL の行は `time: null` で先頭に並び、それだけで1つの旅になる。
-        # 本番コピーには NULL の行は無い（管理者確認済み）
+        # 現行実装の挙動の記録。契約は time を文字列とするが、taken_at=NULL の行は
+        # `time: null` で先頭に並び、それだけで1つの旅になる。Rust は意図した差として空文字
+        # （時刻不明）にして最後に並べる（crates/geoframe/tests/photo_feed_endpoint.rs、
+        # docs/architecture/photo-feed-contract.md）。本番コピーには NULL の行は無い（管理者確認済み）
         row = photo_feed_fixture.photo_row(14, taken_at=None, lat=35.6, lon=139.6)
         items = photo_feed_fixture.build_items([row])
         self.assertEqual([i["id"] for i in items], [14, 1, 2, 3, 4, 6, 8, 9, 10])

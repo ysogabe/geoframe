@@ -1,6 +1,6 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）を追記
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
 - 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
@@ -155,3 +155,49 @@ unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分�
 - `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（合成した一時DBだけ。実データ・実在の位置は使わない）。
 - musl静的ビルド: `static-pie linked`、`ldd`は`statically linked`。追加した依存`tracing`・`tracing-subscriber`は純Rust（C依存なし）。
 - 合成DBでの手動確認: `serve`が`/healthz`に200、未知のパスに404を返し、SIGTERMで正常終了（終了コード0）。DBが無いときは終了コード1、`GEOFRAME_PORT`が不正なときは2。
+
+## 8. 写真フィード `GET /api/v1/photos`（T1.2）
+
+実装は`crates/geoframe/src/photos.rs`（選び方・並び・タイトル・旅番号）と`server.rs`（ルート）。応答の型は`feed.rs`、契約は[photo-feed-contract.md](../architecture/photo-feed-contract.md)。現行Pythonの`api_photos()`と**同じ行・同じ並び・同じ値**を返す。
+
+### 8.1 SQLと並び
+
+- 品質・AIの`JOIN`と表示条件（`lat`あり、`display`あり、`hidden`でない、品質`exact`の推奨外とAI同一場面の推奨外を除く。お気に入りはAIでは残る）の**SQLは文字列まで同じ**。違うのは`p.*`を使う列だけに絞ったことと、`ORDER BY`だけ:
+  `CASE WHEN COALESCE(p.taken_at,'')='' THEN 1 ELSE 0 END, COALESCE(p.taken_at,'')`（Pythonは`taken_at`のみで、NULLが先頭になる）。
+- **同順位（同じ`taken_at`）の並びは固定していない。** Pythonも同じで、SQLiteのソートと`LEFT JOIN`の走査順に依存する。同じSQLなので通常は同じ並びになるが、リンクするSQLiteのバージョン（Rustは同梱のSQLite）が違えば変わりうる。T1.5で本番コピーの全件比較をして、差が出たら`, p.id`を足す（`inventory.md §6`の方針）。テストはフィクスチャ（同順位が出ない）と、同順位を固定しない確認だけ。
+- 複数のAIグループに入った写真は行が重なる（PythonのSQLが同じなので同じ。本番では起きない前提）。
+
+### 8.2 値
+
+- タイトル: 手動/AIの`title` → `city`があれば`"{city} {place}"`を`strip` → ファイル名の拡張子なし（`pathlib.Path(name).stem`と同じ。`a.b.c.jpg`→`a.b.c`、`noext`→`noext`、`trail.`→`trail.`、`.hidden`→`.hidden`、ディレクトリ部分は除く）。`std::path::Path::file_stem`とは末尾が`.`の名前などで違うので使っていない。
+- `bool()`の真偽（NULL・0・空文字は偽）、`or ""`（NULLと空文字を同じ空文字に）、`str.strip()`（Unicode空白と`\x1c`〜`\x1f`）はPythonに合わせてある。
+- 品質の内部値はグループ（`quality_kind`が空でない）に入ったときだけ入れ、AIの内部値は`ai_group`が空でないときだけ入れる（それ以外は`null`/`false`/空文字）。
+- 時刻の解釈は`photos.rs:parse_epoch`。Pythonの`strptime("%Y-%m-%d %H:%M")`が通す形（月日時分が1〜2桁、日付と時刻のあいだが複数の空白、存在しない日付は不可、前後の余分な文字は不可）に合わせた。**既知の差**: 全角数字などASCII以外の数字は、Pythonは通すが、Rustは読めない扱い（インデクサが`norm_time`で正規化するので出ない）。読めない時刻は「不明」と同じ（旅番号では1枚ごとに別の旅。`time`の値はそのまま出す）。
+- 旅番号は`assign_trips`と同じ: 直前に**読めた**時刻との差が**48時間を超えたら**次の旅（ちょうど48時間は同じ旅）。時刻が読めない写真は前後とつながず、それだけで1つの旅。次の読める写真は、不明な写真を飛ばして直前の読めた時刻と比べる。差は暦だけで数える（TZに依存しない。§1.2）。
+
+### 8.3 Pythonとの差
+
+意図した差は2つ。どちらも契約（`time`・`lon`は必ずある）に合わせたもので、本番のコピーには該当する行が無い。
+
+- `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字（時刻不明）で最後。
+- `lat`はあって`lon`がNULLの行: Pythonは`lon: null`、Rustは一覧から外す（写真IDだけをwarnログに出す）。
+
+ほかに、列の型が想定と違う行（`lat`が文字列など）があるとRustは読み取り全体が失敗して503になる（Pythonは素通し）。スキーマ上は起きない。
+
+### 8.4 応答とエラー
+
+- `Content-Type: application/json; charset=utf-8`、`Cache-Control: no-store`（Pythonの`_send_json`と同じ）。JSONは日本語をエスケープしないUTF-8。区切りに空白は入れない（Pythonは`", "`・`": "`。比較は構文解析後に行う）。クエリは無視する。
+- DBを読めない・順番待ち（`QUEUE_TIMEOUT`）が上限を超えたら**503**と`{"ok":false,"error":"写真一覧を読み取れません。しばらくしてから再試行してください"}`。SQLiteのエラー文字列・パスは本文に入れず、ログ（warn）にだけ出す。JSON化の失敗は500。
+- ログに写真の値（位置・ファイル名・タイトル）は出さない（§3）。リクエストログは`GET /api/v1/photos 200 12ms`の形。
+
+### 8.5 T1.3以降に残すもの
+
+axumのルーティングは、Pythonの`_norm_path`（末尾スラッシュの除去、URLデコード、`..`の解決など）、`HEAD`の扱い（Pythonは`/api/`の`HEAD`を403にする。axumの`get`は`HEAD`にも答える）、Host検査をまだ再現していない。`/api/v1/photos/`は404になる。これらは横断の仕組みなのでT1.3で入れる。
+
+### 8.6 テスト
+
+`crates/geoframe/tests/photo_feed_endpoint.rs`（合成データのみ）:
+
+- フィクスチャと同じ合成DBをRustで作り（`tools/gen_photo_feed_fixture.py`が書き出す`photo-feed-catalog.sql`を流す）、エンドポイントの出力がPythonの出力（`photo-feed-python.json`）と`serde_json::Value`として完全一致すること。
+- 除外条件、並び（時刻不明は最後）、旅番号の境界（ちょうど48時間、時刻不明を挟む場合）、タイトルの規則、`taken_at`のNULL、`lon`のNULL、ヘッダ、503（DB破損・順番待ちの超過）を個別に。
+- `photo_feed_miharashi.rs`の読み方をエンドポイントの実出力にも適用。
