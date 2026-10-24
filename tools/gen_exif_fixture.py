@@ -178,7 +178,7 @@ CASES = [
     # --- 撮影時刻: Pythonで偽になる値（0・空）は `or` で次の候補へ落ちる。真になる数値は落ちない ---
     ("time_short_zero_falls_through", {}, {36867: short(0), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
     ("time_long_zero_falls_through", {}, {36867: (LONG, [0]), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
-    ("time_byte_zero_falls_through", {}, {36867: (BYTE, b"\0"), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
+    ("time_byte_zero_does_not_fall_through", {}, {36867: (BYTE, b"\0"), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
     ("time_short_count0_falls_through", {}, {36867: (SHORT, []), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
     ("time_undefined_empty_falls_through", {}, {36867: (UNDEFINED, b""), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
     ("time_undefined_nul_does_not_fall_through", {}, {36867: (UNDEFINED, b"\0"), 36868: ascii_("2023:01:02 03:04:05")}, None, True),

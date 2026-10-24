@@ -57,7 +57,7 @@ pub struct DerivativeInfo {
     pub format: Format,
     pub input: (u32, u32),
     pub output: (u32, u32),
-    /// 当てた EXIF の向き（1〜8。HEIC は常に 1）。
+    /// 当てた向き（1〜8）。EXIF の Orientation で、タグが無ければ XMP の `tiff:Orientation`。HEIC は常に 1。
     pub exif_orientation: u8,
     /// グレースケール（L）のまま出した。
     pub gray: bool,

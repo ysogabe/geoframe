@@ -926,8 +926,10 @@ fn norm_timeは暦を見ず全角などの数字をasciiにする() {
 
 #[test]
 fn libjpegが許す壊れ方のjpegは読める() {
-    // Pillow（libjpeg）は、末尾のゴミ・マーカーの間のゴミを警告だけで読む。
+    // Pillow（libjpeg）は、末尾のゴミ・マーカーの間のゴミ（APP0 の後ろなど）を警告だけで読む。
     // 厳格モードのままだと、これらの写真の derivative が永久にできなくなる。
+    // ここで使う「SOI の直後のゴミ」は Pillow は JPEG と識別できず失敗するが、Rust は読む
+    // （Python との突き合わせは tests/jpeg_eoi_python.rs）。
     // EOI が欠けてファイルがそこで終わるものは Pillow も失敗する。EOI の位置にゴミが続くものは、Pillow は読むが
     // 切れたファイルと見分けられないので Rust は失敗にする（tests/jpeg_eoi_python.rs、server.md §0）
     let data: Vec<u8> = (0..120 * 90)
