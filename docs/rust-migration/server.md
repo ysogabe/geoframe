@@ -36,7 +36,7 @@ P1・P2（T2.1〜T2.4）でPythonと意図して違える点・既知の差の�
 | **`.dl_*`の掃除は、`tmp/`・`derivatives/`がシンボリックリンク（など通常のディレクトリでないもの）なら飛ばす（T2.3）**: 列挙の前に`symlink_metadata`で見る。飛ばした数だけを警告ログに出し（パスは出さない）、`--dry-run`にも「掃除を飛ばす」として出る。無い場合（写真を置く前の`derivatives/`）は飛ばした数に入れない。`.part`の掃除の`derivatives/`の検査も同じ関数 | Pythonの`prepare_tmp_dir`は`is_dir()`でリンクを辿り、リンク先の`.dl_*`を消す。外へのリンクだと関係のない場所のファイルを消すので、Rustは辿らない | 取り込みの起動時 | 単体テスト（`tmp/`・`derivatives/`の両方）、検証環境 | なし（決定） | [§13.14](#1314-再々レビュー2026-10-24の指摘への対応) |
 | **Driveの認証（T2.4）**: ①トークンの交換先は定数`https://oauth2.googleapis.com/token`で、鍵JSONの`token_uri`は読まない（google-authはファイルの値を使う）。②`GEOFRAME_DRIVE_KEY`の相対パスは**カレントディレクトリ基準**（Pythonは`app/`基準。Rustに`app/`は無い）。`deploy/geoframe-rs.service`は、Python版のunitと同じ`GEOFRAME_DRIVE_KEY=/var/lib/geoframe/drive_key.json`を与える。③鍵が他のユーザーに読める権限（`& 0o077`）なら警告する（読みはする）。ディレクトリ・FIFO・64 KiB超は鍵として読まない。④鍵が無ければDriveの2段は通信せずに飛ばす（Pythonと同じ）。**鍵が壊れている・トークンを断られた（4xx）も飛ばす**（Pythonは認証エラーをprintして`svc`無しで進む。同じ）が、**Google側の不調（429・5xx）や通信の失敗は段の失敗**（`sync`の終了コード1）として出す | 鍵ファイルで任意のURLへ署名付きのassertionを送らせない。壊れた鍵と一時的な不調を見分ける | `GEOFRAME_DRIVE_KEY`を置いたとき | 単体テスト（スタブがassertionの署名・`iss`・`scope`・`aud`・`exp`を検証する）。検証環境で合成の鍵を実際のGoogleに向けると400で断られ、飛ばす（[§14.10](#1410-検証環境での確認鍵が無い状態2026-10-25)） | なし（決定） | [§14.2](#142-認証) |
 | **`index_drive`（T2.4）**: ①md5が変わった行の更新は、手動で直した位置（`loc_source='manual'`）も`drive_meta`かNULLに**上書きする**（Pythonと同じ。`place elev display fetched_at`はNULL、`rotation=0`。お気に入り・除外・タイトル・`inferred_from`・`infer_dt_s`・`muni_cd pref city`は残る。古いderivativeのファイルは消さない）。②**一覧が0件で、Driveの行が残っているときは、削除しない**（共有を外した・フォルダの取り違えでもDriveは空の一覧を成功として返し、Pythonは全行を消す。お気に入りや手動の位置まで失う）。**0件以外でも、消す件数が50件を超え、かつDriveの行の20%を超えるときは、削除だけを保留する**（`mass_delete_withheld`に数えて警告する。6,535件から1件だけ見える一覧のような取り違えを止める。追加・更新は通常どおり）。どちらの保留も、**`geoframe sync --allow-mass-delete`を付けた1回だけ**外れる（環境変数・設定・unitでは外せず、`serve`の定期実行は常に保留する。`--dry-run`にも付けられ、外した場合の件数が見える。Pythonは無条件に全部消す）。③一覧は**全ページが取れたときだけ**計画を作る（途中で失敗したら追加も削除もしない。Pythonも例外で同じ）。④書き込みは1つのトランザクション（Pythonは1文ごとのコミット）。⑤消すderivativeの名前は`derivatives/<安全な名前>`だけ（Pythonは`DATA_DIR / display`を無検査で消す）。⑥`name`の無いファイルは索引に入れず（Pythonは途中で例外）、行は残す。`id`の無いファイルは一覧の失敗（Pythonも例外）。⑦フォルダ名の`'`・`\`はエスケープして検索する（Pythonは検索式が壊れてHTTP 400）。⑧再試行（429・5xx・流量制限の403）と応答の大きさの上限を付ける | ①は現行の挙動（直すかは**P3で決める**。[inventory.md §2.3](inventory.md)）。②〜⑧は安全側 | Driveに写真があるとき | 単体テスト＋`drive-index-python.json`（偽のDriveに流したPythonの`index_drive`と、`photos`の全列・`id`・Driveへの問い合わせ・追加/削除の件数が一致。②は意図した差として別に確かめる）。保留の閾値の前後（50件ちょうど・51件、割合がちょうど20%・それを超える）・1件だけ残る一覧・フラグで外れる・`--dry-run`の件数は`a_listing_that_would_delete_most_rows_holds_the_deletes_back`など | ①は**P3で直すか決める**。他は決定 | [§14.4](#144-index_drive) |
-| **`fetch_derivatives`（T2.4）**: ①原本の一時ファイル`tmp/.dl_<drive_id>`は`create_new`＋`O_NOFOLLOW`＋権限0600で作り、既にある名前（リンクを含む）は辿らず・消さず、その写真の失敗にする（Pythonは`"wb"`で上書き）。②ダウンロードは512 MiBまで・1枚15分まで（Pythonは上限なし）。③取得待ちは`ORDER BY taken_at, id`（Pythonは`taken_at`のみ。実際のSQLiteは同じ並びになる）。④**失敗が続く写真を飛ばす**（受入条件②。[§14.6](#146-失敗が続く写真が枠を塞がない受入条件)）。⑤通信や認証の不調（接続・名前解決・TLS・応答の待ちの時間切れ・流量制限の403・429・5xx・認証の失敗）は、写真のせいではないので段を中断して失敗にし、失敗の記録は付けない（**本文の受信が1枚15分を超えた**ことだけは、その写真の失敗`fail_slow_download`）。⑥ログ・件数にファイル名を出さない（Pythonは名前を出す）。失敗は写真の`id`と固定の語だけ。成功・失敗の件数は形式別・失敗の種類別（`ok_jpeg`・`fail_decode_heic`など）。⑦`--dry-run`は一覧を読む以外の通信をせず、取得するはずの件数だけ出す。⑧**原本は通常の終了経路（成功・写真の失敗）で明示的に消して結果を確かめ**、消せなかったら`original_remove_failed`の件数と固定の文言の警告で報告する（Rustの`Drop`は早期`return`・パニックの補助で、結果は捨てる。通常の経路では消えたことを確かめて、報告する） | 原本（GPS・機種情報つき）を残さない・リンクで外を書き換えさせない・枠を塞がせない | 取得待ちがあるとき | 単体テスト（スタブ。原本が成功・失敗・パニックのどれでも残らない、リンクを辿らない、先頭の枠より多い失敗があっても後続が取得される、障害中に試した写真が復旧した次のサイクルで待たずに取得される、原本を消せなかったことが件数に出る）、`drive-index-python.json`（偽のDriveに流したPythonの`fetch_derivatives`と、最初のサイクルが同じ写真を同じ順に試し、同じ行・同じ寸法になる） | なし（決定） | [§14.5](#145-fetch_derivatives) |
+| **`fetch_derivatives`（T2.4）**: ①原本の一時ファイル`tmp/.dl_<drive_id>`は`create_new`＋`O_NOFOLLOW`＋権限0600で作り、既にある名前（リンクを含む）は辿らず・消さず、その写真の失敗にする（Pythonは`"wb"`で上書き）。②ダウンロードは512 MiBまで・1枚15分まで（Pythonは上限なし）。③取得待ちは`ORDER BY taken_at, id`（Pythonは`taken_at`のみ。実際のSQLiteは同じ並びになる）。④**失敗が続く写真を飛ばす**（受入条件②。[§14.6](#146-失敗が続く写真が枠を塞がない受入条件)）。⑤通信や認証の不調（接続・名前解決・TLS・**応答のヘッダーを受け取る前の切断などの I/O の失敗**・応答の待ちの時間切れ・流量制限の403（**理由の本文が受け取れなかった403を含む**）・429・5xx・認証の失敗・原本の本文の途中の切断）は、写真のせいではないので段を中断して失敗にし、失敗の記録は付けない（**本文の受信が1枚15分を超えた**ことだけは、その写真の失敗`fail_slow_download`）。⑥ログ・件数にファイル名を出さない（Pythonは名前を出す）。失敗は写真の`id`と固定の語だけ。成功・失敗の件数は形式別・失敗の種類別（`ok_jpeg`・`fail_decode_heic`など）。⑦`--dry-run`は一覧を読む以外の通信をせず、取得するはずの件数だけ出す。⑧**原本は通常の終了経路（成功・写真の失敗）で明示的に消して結果を確かめ**、消せなかったら`original_remove_failed`の件数と固定の文言の警告で報告する（Rustの`Drop`は早期`return`・パニックの補助で、結果は捨てる。通常の経路では消えたことを確かめて、報告する） | 原本（GPS・機種情報つき）を残さない・リンクで外を書き換えさせない・枠を塞がせない | 取得待ちがあるとき | 単体テスト（スタブ。原本が成功・失敗・パニックのどれでも残らない、リンクを辿らない、先頭の枠より多い失敗があっても後続が取得される、障害中に試した写真が復旧した次のサイクルで待たずに取得される、原本を消せなかったことが件数に出る）、`drive-index-python.json`（偽のDriveに流したPythonの`fetch_derivatives`と、最初のサイクルが同じ写真を同じ順に試し、同じ行・同じ寸法になる） | なし（決定） | [§14.5](#145-fetch_derivatives) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
@@ -1057,7 +1057,23 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 - クライアントは`ureq`（同期。T2.1）。一覧・トークンの応答は16 MiBまで（1ページ1000件で数百KB）。要求の時間は`net::agent()`の30秒、**原本のダウンロードは1枚15分まで**（要求ごとに延ばす）。
 - **再試行**: 429・5xx・Driveが返す流量制限の403（本文に`rateLimitExceeded`・`userRateLimitExceeded`。本文は16 KiBまで読んで捨てる）は、`Retry-After`（秒。あれば）か指数バックオフ（1・2・4・8秒、1回の待ちは30秒まで）で、最大4回再試行する。待ちの最中も停止の合図を見る（合図が来たらすぐ中断）。権限の403・404などは再試行しない。再試行を使い切ったら`DriveError::Status`。**流量制限の403だけは、使い切ったあとも理由を保って`DriveError::RateLimited`にする**（`Status(403)`にすると権限の不足と見分けがつかず、写真の失敗に数えられる）。
 - 一覧のページ送りは最大2000ページ。**同じ`nextPageToken`が続く**・`files`が配列でない・`nextPageToken`が文字列でない・`id`の無い画像は、一覧の失敗（途中まで取れた分は捨てる）。
-- ダウンロードは`Content-Length`が上限（512 MiB）を超えれば読む前に断り、無くても読みながら数えて超えたら止める（書き込んだ分は呼び出し側が消す）。本文を読む途中の切断は`ureq`のエラーを種類に直し（`connect`など。通信の障害）、**本文の受信の時間切れは`DriveError::BodyTimeout`**（その写真が遅いだけ。要求を送って応答の頭を受けるまでの時間切れ`Net(timeout)`とは別。後者は障害）にする。
+- ダウンロードは`Content-Length`が上限（512 MiB）を超えれば読む前に断り、無くても読みながら数えて超えたら止める（書き込んだ分は呼び出し側が消す）。本文を読む途中の切断は`DriveError::Net(disconnected)`（通信の障害。段を中断）、**原本の本文の受信の時間切れは`DriveError::BodyTimeout`**（その写真が遅いだけ。要求を送って応答の頭を受けるまでの時間切れ`Net(timeout)`とは別。後者は障害）にする。
+- **通信の失敗の分類**（`ureq` 3.5 のエラー。実装は`net.rs`の`Failure`の表と`drive.rs`の`read_error`）。**応答のヘッダーを受け取る前**に起きた`Io`の失敗は、種類によらずすべて通信の障害にする（相手が応答の前に切ると`ureq`は`Io(UnexpectedEof)`を返す。`ConnectionReset`・`ConnectionAborted`・`BrokenPipe`・`NotConnected`なども同じ）。
+
+  | 起きる場所 | `ureq`のエラー | 分類 | 扱い |
+  | --- | --- | --- | --- |
+  | ヘッダーの前 | `HostNotFound` | `dns` | 障害（段を中断） |
+  | 同上 | `ConnectionFailed`・`ConnectProxyFailed`・`Io`（`ConnectionRefused`・`NetworkUnreachable`・`HostUnreachable`・`NetworkDown`） | `connect` | 障害 |
+  | 同上 | `Timeout(_)`・`Io`（`TimedOut`・`WouldBlock`） | `timeout` | 障害 |
+  | 同上 | `Tls`・`Rustls`・`Pem`・`TlsRequired`・`Io`（`InvalidData`。rustlsの証明書エラー） | `tls` | 障害 |
+  | 同上 | 上記以外の`Io`すべて（`UnexpectedEof`・`ConnectionReset`・`ConnectionAborted`・`BrokenPipe`・`NotConnected`など） | `disconnected` | 障害 |
+  | 同上 | `Protocol`・`LargeResponseHeader`・`Http`・`BadUri`・`TooManyRedirects`・`BodyExceedsLimit`など | `other` | **写真の失敗**（`fail_download`）。応答は届いていて、要求ごとに決まった結果になりうる（特定の1枚だけ毎回壊れた応答になる）ので、障害にして段を止めると、その1枚が残りを永久に塞ぐ |
+  | 原本の本文（ヘッダーのあと） | 切断（`UnexpectedEof`・`ConnectionReset`・`ConnectionAborted`・`BrokenPipe`・`NotConnected`など） | `disconnected` | 障害 |
+  | 同上 | 時間切れ（`Timeout(_)`を包んだもの・`TimedOut`・`WouldBlock`） | `BodyTimeout` | **写真の失敗**（`fail_slow_download`） |
+  | 同上 | 上記以外の読み出しの`io::Error` | `Io(kind)` | 写真の失敗（`fail_io`） |
+  | 403の理由の本文（16 KiBまで読んで捨てる） | 切断・時間切れ・TLSなど（受け取れなかった） | `Net(…)`（時間切れも`timeout`。`BodyTimeout`にしない） | 障害。**権限の不足（`Status(403)`）と決めつけない**。数百バイトの理由の本文が届かないのは回線の不調 |
+  | 同上 | 本文が16 KiBを超えた | （`false`） | 流量制限ではない403として扱う（権限の不足。写真の失敗） |
+  | 一覧・トークンの本文 | 上のヘッダーの前と同じ分類 | `Net(…)` | 一覧・トークンの失敗（段の失敗） |
 
 ### 14.4 `index_drive`
 
@@ -1093,7 +1109,7 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 | 画像として読めない／BigTIFF／画素数が上限超え | 写真の失敗 | `fail_not_image`／`fail_bigtiff`／`fail_too_many_pixels` |
 | デコードの失敗 | 写真の失敗 | `fail_decode_jpeg`・`fail_decode_png`・`fail_decode_tiff`・`fail_decode_heic`・`fail_decode_other` |
 | JPEGの書き出しの失敗、IDやrotationが不正、`drive_id`がNULL | 写真の失敗 | `fail_encode`・`fail_other` |
-| 接続できない（DNS・接続・TLS）、**接続・応答の待ちの時間切れ**、**流量制限の403が続く**、429・5xxが続く、認証の失敗、**取り直したトークンでも401**（サービスアカウント側の問題） | **段の中断**（写真の失敗に数えない・記録しない） | （失敗の文面） |
+| 接続できない（DNS・接続・TLS）、**応答のヘッダーを受け取る前の切断などのI/Oの失敗**、**原本の本文の途中の切断**、**接続・応答の待ちの時間切れ**、**流量制限の403が続く**、**403の理由の本文の受信の失敗**（切断・時間切れ）、429・5xxが続く、認証の失敗、**取り直したトークンでも401**（サービスアカウント側の問題） | **段の中断**（写真の失敗に数えない・記録しない） | （失敗の文面） |
 | 停止の合図 | 中断（失敗ではない） | — |
 
 成功は形式別に`ok_jpeg`・`ok_png`・`ok_tiff`・`ok_heic`、ほかに`pending`（取得待ちの総数。位置の有無で絞らない）・`skipped_backoff`・`attempted`・`fetched`・`icc_dropped`・`original_remove_failed`（原本の削除に失敗した数。0でなければ`tmp/`の権限を確かめる）。**件数が0の分類は出さない**（`ok_*`・`fail_*`）。失敗した写真は`warn`で写真の`id`と`ImageError`・`DriveError`の文面（パス・名前・座標を含まない固定の語。HEICは構造の分類つき。§12.4）を出す。
@@ -1111,7 +1127,7 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 - キーは`fetch_derivatives`が`(drive_id, md5)`、`local_derivatives`が`(id, mtime)`。**Driveで原本が差し替わる・ローカルのファイルが更新される**（`md5`・`mtime`が変わる）と別のキーになり、**すぐ再び試す**。
 - プロセスが再起動すれば忘れる（もう一度1回ずつ試す。枠の一部を使うだけ）。`--dry-run`は覚えない（実行はしていないので、次の実行に影響させない）。
 - 選び方: `LIMIT`を付けず、`ORDER BY`の順に読み、記録にあるものを飛ばして、`GEOFRAME_FETCH_PER_CYCLE`枚そろったら止める。飛ばした数は`skipped_backoff`。
-- **通信の不調・認証の失敗は写真の失敗に数えない**（記録しない）。ネットワークが落ちている間に全部の写真に待ちが付くと、直ってからも30分以上取得されないため。数えない障害は、接続・名前解決・TLS・**応答の待ちの時間切れ**・**流量制限の403（再試行を使い切ったあと）**・429・5xx・認証の失敗。数える（その写真の失敗）のは、本文の受信が1枚15分を超えたときと、権限の403・404など。テスト: `a_rate_limit_that_outlasts_the_retries_stops_the_stage_without_blaming_the_photos`・`a_timeout_waiting_for_the_response_stops_the_stage_without_blaming_the_photos`（どちらも、障害中に試した写真が、復旧した次のサイクルで待たずに取得される）、`a_body_that_takes_too_long_is_that_photos_failure_and_the_rest_continue`。
+- **通信の不調・認証の失敗は写真の失敗に数えない**（記録しない）。ネットワークが落ちている間に全部の写真に待ちが付くと、直ってからも30分以上取得されないため。数えない障害は、接続・名前解決・TLS・**応答のヘッダーを受け取る前の切断などのI/Oの失敗**・**原本の本文の途中の切断**・**応答の待ちの時間切れ**・**流量制限の403（再試行を使い切ったあと）**・**403の理由の本文の受信の失敗**・429・5xx・認証の失敗（分類の表は§14.3）。数える（その写真の失敗）のは、原本の本文の受信が1枚15分を超えたときと、権限の403・404など。テスト: `a_rate_limit_that_outlasts_the_retries_stops_the_stage_without_blaming_the_photos`・`a_timeout_waiting_for_the_response_stops_the_stage_without_blaming_the_photos`（どちらも、障害中に試した写真が、復旧した次のサイクルで待たずに取得される）、`a_disconnect_before_the_response_headers_stops_the_stage_without_blaming_the_photos`・`a_disconnect_in_the_middle_of_an_original_stops_the_stage_without_blaming_the_photos`・`a_403_whose_reason_body_is_cut_off_is_an_outage_not_a_permission_error`・`a_403_whose_reason_body_times_out_is_an_outage_and_not_a_slow_download`（いずれも復旧後に待たずに取得される）・`a_disconnect_while_exchanging_the_token_is_an_outage_not_an_auth_error`、`a_body_that_takes_too_long_is_that_photos_failure_and_the_rest_continue`。分類の表は`head_phase_errors_follow_the_table`（`net.rs`）と`body_read_errors_follow_the_table`が確かめる。
 
 テスト: `photos_that_keep_failing_do_not_block_the_ones_behind_them`（枠2枚で、先頭3枚が恒久的に失敗する。1回目は先頭2枚を試して失敗、2回目はその2枚を飛ばして3枚目と良い写真1枚、3回目は失敗中の3枚を飛ばして残り、4回目は何も試さない。「待ち時間0」の記録＝毎回すべてを試す方針に差し替えると、良い写真が3サイクル続けて0枚のまま＝Pythonの挙動を再現する）、`a_failed_photo_is_tried_again_when_its_original_changes_or_the_wait_is_over`、`失敗が続く写真は枠を塞がず_後続の写真が作られる`（`local_derivatives`。`mtime`が変わればすぐ試す）、`backoff.rs`の単体テスト（倍々・上限・成功で消える・記録数の上限・溢れない）。
 
@@ -1246,3 +1262,12 @@ T2.4のレビューの指摘7件への対応。コミットは`T2.4: …`の4つ
 | dry-runで通信を避ける方法の説明が誤り | 「存在しない鍵ファイルの絶対パスを`GEOFRAME_DRIVE_KEY`に明示する」に直した（§14.7、`deploy/README.md`） |
 | 受入手順の取得件数の期待値が実装と合わない | `pending`・`planned`・`写真:`の取得待ちの意味を分け、冪等性は「索引の変更件数」と「取得段の`pending`・`planned`」で判断する手順にした（§14.11の(1)） |
 | 成功IDの比較で`comm`の整列の条件を満たしていない | 両方の出力を`LC_ALL=C sort`で整列し、`LC_ALL=C comm`で比べる（§14.11の(2)） |
+
+### 14.14 レビュー2回目（2026-10-25）の指摘への対応
+
+14.13の「通信の障害が写真の失敗として記録される」に残っていた取りこぼし2件。
+
+| 指摘 | 対応 |
+| --- | --- |
+| 応答のヘッダーの前に切断されると写真の失敗になる（`Io(UnexpectedEof)`が`other`になっていた） | ヘッダーを受け取る前の`Io`の失敗は、時間切れ・TLS・接続の拒否/到達不能以外のすべてを`Failure::Disconnected`（`disconnected`）にして障害にした。`ureq`の全エラーの分類の表を§14.3と`net.rs`の`Failure`に書いた。応答の頭が壊れている（`Protocol`など）ものは、要求ごとに決まった結果になりうるので写真の失敗のまま（理由は表）。原本の本文の途中の切断は今まで通り障害（`disconnected`）。テスト: ヘッダー前の切断・本文の途中の切断・トークン交換中の切断が、段を中断し、復旧後に待たずに取得される／認証の失敗にならない |
+| 403の理由の本文の受信の失敗が握り潰され、権限の不足と同じ`Status(403)`になる | `is_rate_limit_body`を`Result<bool, DriveError>`にして、理由の本文の切断・時間切れ・TLSは`Net(…)`として返し、段を中断する。時間切れは原本の`BodyTimeout`（`fail_slow_download`）にしない。16 KiBを超える本文だけは流量制限ではない403として扱う。テスト: 本文の途中切断（`UnexpectedEof`）と時間切れ（`Timeout(Global)`）の2経路 |
