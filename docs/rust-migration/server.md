@@ -1150,6 +1150,8 @@ musl静的バイナリ（`static-pie linked`・`ldd`は静的・`GEOFRAME_TEST_*
 | (c) 合成の鍵（テスト用の使い捨てのRSA鍵。どのサービスにも登録していない）を`GEOFRAME_DRIVE_KEY`で指して`sync --dry-run` | musl静的バイナリ・実際のGoogleへのTLSで assertion の署名とトークンの交換が動き、Googleが**HTTP 400で断った**。`[drive] 認証エラー: トークンの交換が HTTP 400 で断られました`の警告（鍵・URL・本文は出ない）と、`index_drive`・`fetch_derivatives`の`省略（Drive の認証に失敗したので飛ばします）`、終了コード0。権限644にすると`鍵ファイルが所有者以外にも読める権限です（644）`の警告が出た。確認後、合成の鍵は検証環境から削除した |
 | 後片付け | drop-inを外して`ingest=0`（`取り込みは無効です`）に戻し、`/healthz`は200、`.dump`のSHA-256は配布前と一致 |
 
+最後に、`geoframe-rs.service`へ`GEOFRAME_DRIVE_KEY=/var/lib/geoframe/drive_key.json`を足した最終のバイナリ・unitを配布し直して、(a)(b)をもう一度確かめた（unitの環境に`GEOFRAME_DRIVE_KEY`が入っていること、鍵が無いので`省略`、`.dump`のSHA-256は変わらず、`ingest=0`に戻して`/healthz`は200）。
+
 (c)は、実際のDriveへの取り込みではない（鍵は合成で、Googleが断った）。**本物の鍵での確認は管理者が行う**（§14.11）。
 
 ### 14.11 鍵が置かれたあとの管理者の確認手順
