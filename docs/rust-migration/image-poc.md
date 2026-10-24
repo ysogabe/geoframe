@@ -347,7 +347,7 @@ PoCの実装を`crates/geoframe/src/imaging`へ移し、`crates/geoframe-imgpoc`
 
 | 項目 | §6の推奨 | T2.2の実際 |
 | --- | --- | --- |
-| JPEGのデコード | `image`（`jpeg`） | **`zune-jpeg`を直接**（厳格モード）。`image`は途中で切れたJPEGを部分的な画像で成功させるため。マーカーの並びだけが理由の失敗は寛容なモードで読み直す（[server.md §12.8](server.md)） |
+| JPEGのデコード | `image`（`jpeg`） | **`zune-jpeg`を直接**（厳格モード）。`image`は途中で切れたJPEGを部分的な画像で成功させるため。マーカーの並びだけが理由の失敗（許可リスト）は寛容なモードで読み直し、EOIの無いJPEGは失敗にする（[server.md §12.8](server.md)） |
 | `image`のfeature | `jpeg` | `png`・`tiff`（Driveに`.png`の行が5件、PythonのEXTSに`.tif`/`.tiff`があるため。JPEGは`zune-jpeg`が受け持つ） |
 | EXIFの抽出 | `kamadak-exif` | **自前**（約250行）。Pillowの読み方を境界まで合わせるため。HEICは`zune-heic`の`exif_data()`が返すTIFF構造（`Exif\0\0`は付かない）を同じ解析器に渡す |
 | 縮小・エンコード・ICC・HEIC | `fast_image_resize` CatmullRom、`jpeg-encoder`（4:2:0・品質85・ハフマン最適化なし）、`moxcms`、`zune-heic`（`mdat`上限128 MiB） | そのまま。順序は縮小→向き。`zune-core`は`zune_heic::zune_core`を使い直接依存にしない |

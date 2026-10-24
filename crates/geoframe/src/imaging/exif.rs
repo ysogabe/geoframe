@@ -476,6 +476,38 @@ fn jpeg_exif(bytes: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// JPEG の最初の SOS のあと（エントロピー符号化されたデータの先頭）から末尾まで。SOS が見つからなければ `None`。
+/// 画像データの中の `FF` は `FF00` かリスタートマーカーなので、このあとの `FFD9` は EOI。
+pub fn jpeg_scan_data(bytes: &[u8]) -> Option<&[u8]> {
+    let mut pos = 2;
+    loop {
+        while *bytes.get(pos)? != 0xFF {
+            pos += 1;
+        }
+        while *bytes.get(pos)? == 0xFF {
+            pos += 1;
+        }
+        let marker = *bytes.get(pos)?;
+        pos += 1;
+        match marker {
+            0xD8 | 0x01 | 0xD0..=0xD7 => continue,
+            0xD9 => return None,
+            _ => {}
+        }
+        let len = usize::from(u16::from_be_bytes(
+            bytes.get(pos..pos + 2)?.try_into().ok()?,
+        ));
+        let end = pos.checked_add(len)?;
+        if end > bytes.len() {
+            return None;
+        }
+        if marker == 0xDA {
+            return bytes.get(end..);
+        }
+        pos = end;
+    }
+}
+
 /// PNG の `eXIf` チャンクの中身（TIFF 構造）。
 fn png_exif(bytes: &[u8]) -> Option<&[u8]> {
     let mut pos = 8;

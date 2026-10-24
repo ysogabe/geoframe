@@ -29,7 +29,7 @@ P1・P2（T2.1・T2.2）でPythonと意図して違える点・既知の差の�
 
 | **画像処理（T2.2）**: ICCをsRGBへ変換して付けない（Pythonは捨てるだけ）。デコーダ・縮小フィルタ・エンコーダが違うので、画素はPythonと一致しない（寸法・向き・回転・EXIFを残さないことは一致）。16ビットのグレーPNGは8ビットへ正しく縮める（Pillowは`I;16`のRGB変換で飽和する）。HEICは常に取り込む（Pythonは`pillow_heif`があるときだけ。本番は入っている） | 広色域の写真が薄く見える問題を直す（plan.md P0で決定）。純Rustの部品の選択（image-poc.md） | ICC付きの写真、画素の比較 | 合成画像のテスト、検証環境でPythonとの寸法・画質の比較（[§12.9](#129-検証環境での確認2026-10-24)） | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
 | **EXIFの読み取り（T2.2）**: 壊れたGPS（成分が3つ未満・型が違う・分母0）の写真は**位置なしで索引する**（Pythonは例外で写真ごと索引しない、または分母0でNaNを保存する）。時刻の数字はASCIIに直す | 位置が読めないだけで写真を落とさない。`taken_at`の形式を守る | 壊れたGPSのEXIF | `tests/exif_python.rs`が基準（`tools/gen_exif_fixture.py`）と突き合わせる | なし（決定） | [§12.3](#123-exif撮影時刻gps向き) |
-| **入力の限界（T2.2）**: 1ファイル512 MiBまで（まるごとメモリに読む。Pythonは上限なし）。手動回転は0・90・180・270だけ（管理画面もその値しか作らない）。`.part`は書き込みに失敗・パニックしても残さない（Pythonは失敗すると残しうる）。出力の`.part`は`fsync`してから`rename`する | メモリの上限、電源断で空のderivativeを残さない | 巨大なファイル、書き込みの失敗 | 単体テスト | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
+| **入力の限界（T2.2）**: 1ファイル512 MiBまで（まるごとメモリに読む。Pythonは上限なし）。**EOI（画像データの終わりのマーカー）の無いJPEGは失敗にする**（Pillowは読む。切れたファイルと見分けられないため。§12.8）。手動回転は0・90・180・270だけ（管理画面もその値しか作らない）。`.part`は書き込みに失敗・パニックしても残さない（Pythonは失敗すると残しうる）。出力の`.part`は`fsync`してから`rename`する | メモリの上限、電源断で空のderivativeを残さない | 巨大なファイル、書き込みの失敗 | 単体テスト | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
@@ -680,7 +680,7 @@ let _ = std::fs::remove_file(&tmp);                 // 成功でも失敗でも 
 | 項目 | Python | Rust |
 | --- | --- | --- |
 | 読む形式 | Pillowが内容で判別（EXTSは拡張子の集合） | JPEG・PNG・TIFF・HEICを**内容で**判別（拡張子は見ない）。それ以外は`NotAnImage` |
-| JPEGのデコード | libjpeg(-turbo)。途中で切れていればエラー | `zune-jpeg`の厳格モード。**途中で切れていれば失敗**（`image`の`JpegDecoder`は部分的な画像で成功するので使わない）。CMYK・YCCKはRGBへ、グレーは1成分のまま |
+| JPEGのデコード | libjpeg(-turbo)。途中で切れていればエラー | `zune-jpeg`の厳格モード。**途中で切れていれば失敗**（`image`の`JpegDecoder`は部分的な画像で成功するので使わない）。EOIが無ければ失敗。CMYK・YCCKはRGBへ、グレーは1成分のまま（§12.8） |
 | 向き | `exif_transpose`（PillowのEXIF）。HEICはlibheifがirot/imirを適用済み | 自前のEXIF読み取り（§12.3）の1〜8。範囲外・無しは当てない。**HEICはデコーダが適用済みなのでEXIFの向きは使わない**（二重に回らない） |
 | 順序 | 向き→縮小 | **縮小→向き**（同じ結果で速く、メモリも減る。寸法は向きを当てた後の長辺で決める） |
 | 縮小の寸法 | `thumbnail((2560, 2560))` | `target_dims`。Pillowと同じ丸め（縮める側と反対の辺は、縦横比の誤差が小さい方へ切り捨て／切り上げ）。**Pillowの`thumbnail`と170件で一致**（`tools/gen_thumbnail_fixture.py`が基準、CIで`--check`） |
@@ -689,7 +689,7 @@ let _ = std::fs::remove_file(&tmp);                 // 成功でも失敗でも 
 | ICC | **捨てる**（画素は変換しない） | **sRGBへ変換して付けない**（意図した変更）。読めない・壊れている・RGB用でないICCは、**警告なしで捨てて続ける**（`DerivativeInfo.icc`が`Dropped`。件数を数えてログに出すのは呼ぶ段） |
 | EXIF・GPS | 出力に残らない（`save`にexifを渡さない） | 同じ。エンコーダに渡さないので、JPEG・PNG・TIFF・HEICのどの入力でも残らない（テストが機種名・GPSの文字列とTIFFヘッダの有無を見る） |
 | 出力 | JFIFあり、4:2:0、ハフマン最適化なし | 同じ（`jpeg-encoder`。サイズはPythonと同じ水準） |
-| 書き込み | `dest.with_suffix(".part")`に保存して`rename`。保存に失敗すると`.part`が残りうる | 同じ名前（`x.r90.jpg`→`x.r90.part`）。**成功・失敗・パニックのどれでも`.part`を残さない**（`Drop`で消す）。`rename`の前に`fsync`する（電源断のあとに、DBの`display`だけが残って中身が空のderivativeになるのを避ける。検証環境で約26 ms／枚。生成は約230 ms／枚なので許容した）。親ディレクトリは作る |
+| 書き込み | `dest.with_suffix(".part")`に保存して`rename`。保存に失敗すると`.part`が残りうる | 同じ名前（`x.r90.jpg`→`x.r90.part`）。**成功・失敗・パニックのどれでも`.part`を残さない**（`Drop`で消す）。`rename`の前に`fsync`する（ファイルの中身は保証する。電源断のあとに、DBの`display`が指す先が「中身が空のファイル」になるのを避ける。ディレクトリの`fsync`はしないので、`rename`のエントリ自体は失われうるが、その場合は「指す先が無い」で済む。検証環境で約26 ms／枚。生成は約230 ms／枚なので許容した）。親ディレクトリは作る |
 | 入力の上限 | 約1.79億画素で`DecompressionBombError`。ファイルの大きさは無制限 | 同じ画素数（178,956,970。デコードの前に宣言の寸法で断る）。**ファイルは512 MiBまで**（まるごとメモリに読む） |
 | 回転 | 任意の角度 | 0・90・180・270（負・360超は剰余）。それ以外は`BadRotation`（管理画面もその値しか作らない） |
 | ファイル名 | `{id}.jpg`／`{id}.r{rotation}.jpg` | 同じ。ただし`drive_id`が`[A-Za-z0-9_-]+`でなければ断る |
@@ -760,14 +760,18 @@ summary files=2 ok=1 failed=1 jobs=1 wall_ms=285 median_ms=273 p95_ms=273 max_rs
 
 ### 12.7 テスト
 
-- 単体（`imaging/tests.rs`）: 向き1〜8、手動回転の順序、縮小の寸法（Pillowの`thumbnail`と170件で一致）、グレー・アルファ・パレット・16ビットのPNG、PNGの`eXIf`、TIFF（向き）、EXIF・機種名・ICCを出力に残さない（JPEG・PNG・HEICの入力）、P3のICCのsRGB変換、変換できないICC（グレー用・壊れたもの）は捨てて`ICCなし`と同じ出力、途中で切れたJPEG・PNG・HEICの拒否、宣言の寸法が上限を超えるJPEGの拒否、エラーの文面にパス・ファイル名・座標が入らないこと、`.part`を残さない（成功・失敗・`rename`の失敗）、既存の出力を壊さない、`store_derivative`の保存先の検査、EXIFの区間を壊してもパニックしない、拡張子の集合。
+- 単体（`imaging/tests.rs`）: 向き1〜8、手動回転の順序、縮小の寸法（Pillowの`thumbnail`と170件で一致）、グレー・アルファ・パレット・16ビットのPNG、PNGの`eXIf`、TIFF（向き）、EXIF・機種名・ICCを出力に残さない（JPEG・PNG・HEICの入力）、P3のICCのsRGB変換、変換できないICC（グレー用・壊れたもの）は捨てて`ICCなし`と同じ出力、JPEG・PNG・TIFF・HEICを**全ての切断点**で切って失敗になること、EOIの無いJPEGの拒否と末尾のゴミ・マーカーの間のゴミの受け入れ、宣言の寸法が上限を超えるJPEGの拒否、エラーの文面にパス・ファイル名・座標が入らないこと、`.part`を残さない（成功・失敗・`rename`の失敗）、既存の出力を壊さない、`store_derivative`の保存先の検査、EXIFの区間を壊してもパニックしない、拡張子の集合。
 - Pythonとの突き合わせ（`tests/exif_python.rs`）: 合成JPEG 43ケース（境界は§12.3）と`norm_time`の16入力。意図して違える点だけを`rust_differs`に列挙し、それ以外は完全一致を求める。基準のJSONはCIの`app`ジョブが`--check`で再検査する（Pythonの読み取りが変わったら落ちる）。
 - HEIC（`imaging/heic.rs`・`imaging/tests.rs`）: 合成HEIC3枚（`tests/fixtures/synthetic_*.heic`。pillow-heifで作った64x48、`tools/image-poc/gen_fixtures.py`）で、irotを一度だけ適用、ICC、構造の分類、失敗の分類、EXIFの読み取り。
 - パス（`datadir.rs`）: `..`・絶対パス・NUL・外を指すリンク・`derivatives`のリンク・IDの区切り。
 
 ### 12.8 実装上の判断
 
-- **JPEGのデコードは`zune-jpeg`を直接使う**（`image`の`JpegDecoder`を使わない）。`image`は寛容なモードで読み、**途中で切れたJPEGを部分的な画像のまま成功として返す**（グレーで埋まった下半分のderivativeが「取得済み」になり、Pythonのようにエラーで再試行されない）。一方、`zune-jpeg`の厳格モードは、ヘッダの間の余分なバイトのようなマーカーの並びにも厳しく、libjpegが警告だけで読む写真を落とす。そこで**まず厳格モードで読み、マーカーの並びだけが理由の失敗（`Format`／`FormatStatic`。ただし`Premature end of buffer`＝データ不足を除く）は寛容なモードで読み直す**。データの不足・壊れは読み直さない。テストが、切れたJPEG（1/4・1/2・末尾200バイト欠け）の拒否と、EOIなし・末尾のゴミ・マーカーの間のゴミの受け入れの両方を見る。**実機のJPEG原本（Drive）での確認はT2.4**。
+- **JPEGのデコードは`zune-jpeg`を直接使う**（`image`の`JpegDecoder`を使わない）。`image`は寛容なモードで読み、**途中で切れたJPEGを部分的な画像のまま成功として返す**（グレーで埋まった下半分のderivativeが「取得済み」になり、Pythonのようにエラーで再試行されない）。一方、`zune-jpeg`の厳格モードは、ヘッダの間の余分なバイトのようなマーカーの並びにも厳しく、libjpegが警告だけで読む写真を落とす。そこで次のようにした。
+  1. **まず厳格モードで読む。**
+  2. 失敗が**マーカーの並びだけが理由**のとき（`[strict-mode]: Extra bytes between headers`、`Marker .. found where not expected`、`Unexpected marker .. between scans`・`.. at restart boundary`。メッセージに`arker`を含む、または`[strict-mode]`で始まるものだけの**許可リスト**）は、寛容なモードで読み直す。データの不足（`Code length N  more than bits left M`＝ハフマン復号中にビットが尽きた、`Premature end of buffer`、`ExhaustedData`、入出力）は読み直さない。寛容なモードはそれらを部分的な画像で成功させてしまう。
+  3. **読めても、画像データのあとにEOI（`FFD9`）が無ければ失敗にする**（`Truncated`）。厳格モードのデコーダも、最後のMCU行の途中で切れたファイルを成功させてしまう（検証: 64x48の合成JPEGで、切断点の約2%＝データ部の末尾約120バイト）ためで、切れたファイルを確実に弾く。**PillowはEOIの無いJPEGも読む**（libjpegが警告だけで補う）ので、EOIが欠けただけの完全なファイルがあれば、Pythonは取り込めてRustは失敗する（§0）。切れたファイルと見分けられないため、見えないまま下がグレーのderivativeになるより、失敗してログに残る方を選んだ。EOIはエントロピー符号化されたデータの中には現れないので、最初のSOSのあとを探す（EXIFのサムネイルの`FFD9`は数えない）。
+  テストは、JPEGを**全ての切断点**（SOSの少し後から末尾の手前まで、サブサンプリング2種）で切り、1つでも成功すれば落ちる。PNG・TIFF・HEICも全ての切断点で失敗になることを見る。EOIなしは失敗、末尾のゴミ・マーカーの間のゴミは成功。**実機のJPEG原本（Drive）での確認はT2.4**（EOIの無い原本が実際にあるか、件数だけ確かめる）。
 - **PNG・TIFFは`image`**（`png`・`tiff`のfeature）。向きはJPEGと同じ自前のEXIFで読む。
 - **EXIFは自前**（`kamadak-exif`を使わない）。理由はPillowの読み方を境界まで合わせるため（§12.3）。ASCIIの末尾のNULを1つだけ取る、後勝ち、`or`の連鎖は、外部のcrateでは再現できない（NULで分割する、先勝ちなど）。
 - **ICCの変換失敗は黙って捨てる**（画像ごと失敗にしない）。件数は`DerivativeInfo.icc == Dropped`で数えられるので、呼ぶ段がサイクルの末尾に件数だけログに出す（PoCの予告。T2.3・T2.4）。

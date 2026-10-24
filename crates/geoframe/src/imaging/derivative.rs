@@ -166,6 +166,27 @@ enum JpegFailure {
     Final(ImageError),
 }
 
+/// 厳格モードの失敗のうち、**マーカーの並びだけが理由**のものか（読み直してよい）。
+///
+/// `zune-jpeg`の厳格モードのエラーは文字列で区別するしかない。許可リスト方式にして、
+/// データが足りない・壊れている失敗（`Code length N  more than bits left M`＝ハフマン復号中にビットが尽きた、
+/// `Premature end of buffer`、`ExhaustedData`、入出力）は**読み直さない**: 寛容なモードはそれを部分的な画像
+/// （下がグレーで埋まったもの）で成功させてしまう。許可するのは次の3つ（`zune-jpeg` 0.5.15）:
+/// - `[strict-mode]: Extra bytes between headers`（ヘッダの間の余分なバイト）
+/// - `Marker .. found where not expected`／`Unexpected marker .. between scans`（予期しない位置のマーカー）
+/// - `Unexpected marker .. at restart boundary`（リスタートの境のマーカー）
+///
+/// libjpegはどれも警告だけで読む。許可リストが広すぎないことは、全ての切断点で失敗になるテストが見る。
+fn is_marker_error(e: &zune_jpeg::errors::DecodeErrors) -> bool {
+    use zune_jpeg::errors::DecodeErrors as E;
+    let msg: &str = match e {
+        E::Format(m) | E::MCUError(m) => m,
+        E::FormatStatic(m) => m,
+        _ => return false,
+    };
+    msg.starts_with("[strict-mode]") || msg.contains("arker")
+}
+
 fn decode_jpeg_once(bytes: &[u8], strict: bool) -> Result<Decoded, JpegFailure> {
     use zune_jpeg::JpegDecoder;
     use zune_jpeg::errors::DecodeErrors;
@@ -174,14 +195,7 @@ fn decode_jpeg_once(bytes: &[u8], strict: bool) -> Result<Decoded, JpegFailure> 
     use zune_jpeg::zune_core::options::DecoderOptions;
 
     let fail = |e: &DecodeErrors| {
-        // 厳格モードで、マーカーの並びだけが理由の失敗（`Premature end of buffer` はデータ不足なので除く）
-        let structure = strict
-            && match e {
-                DecodeErrors::Format(_) => true,
-                DecodeErrors::FormatStatic(m) => *m != "Premature end of buffer",
-                _ => false,
-            };
-        if structure {
+        if strict && is_marker_error(e) {
             JpegFailure::Structure
         } else {
             JpegFailure::Final(ImageError::Decode {
@@ -240,6 +254,23 @@ fn decode_jpeg_once(bytes: &[u8], strict: bool) -> Result<Decoded, JpegFailure> 
 /// マーカーの並びにも厳しく（例: ヘッダの間の余分なバイト）、libjpeg が警告だけで読む写真まで落とす。
 /// そこで、**マーカーの並びだけが理由の失敗は、寛容なモードで読み直す**。データの不足・壊れは読み直さない。
 fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, ImageError> {
+    let decoded = decode_jpeg_with_retry(bytes)?;
+    // 厳格モードのデコーダも、最後の MCU 行の途中で切れた JPEG を成功させてしまう（検証: 切断点の約 2%）。
+    // 画像データのあとに EOI が無ければ、切れたファイルとして失敗にする。Pillow は EOI の無い JPEG も
+    // 読むが、切れたファイルと見分けられないので、見えないまま下がグレーのderivativeになるよりよい
+    let has_eoi = super::exif::jpeg_scan_data(bytes)
+        .is_none_or(|scan| scan.windows(2).any(|w| w == [0xFF, 0xD9]));
+    if has_eoi {
+        Ok(decoded)
+    } else {
+        Err(ImageError::Decode {
+            format: "jpeg",
+            class: DecodeClass::Truncated,
+        })
+    }
+}
+
+fn decode_jpeg_with_retry(bytes: &[u8]) -> Result<Decoded, ImageError> {
     match decode_jpeg_once(bytes, true) {
         Ok(d) => Ok(d),
         Err(JpegFailure::Final(e)) => Err(e),

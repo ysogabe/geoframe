@@ -165,7 +165,7 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 
 | crate | 用途 | メモ |
 | --- | --- | --- |
-| `zune-jpeg` 0.5.15 | JPEGのデコード | `image`が内部で使うのと同じ版。**厳格モードで読み、途中で切れたJPEGを失敗にする**（`image`の`JpegDecoder`は寛容で、部分的な画像で成功する）。幅・高さの上限（既定16384）は外し、画素数で見る |
+| `zune-jpeg` 0.5.15 | JPEGのデコード | `image`が内部で使うのと同じ版。**厳格モードで読み、途中で切れたJPEGを失敗にする**（`image`の`JpegDecoder`は寛容で、部分的な画像で成功する。マーカーの並びだけの失敗は読み直し、EOIの無いものは失敗にする。[server.md §12.8](server.md)）。幅・高さの上限（既定16384）は外し、画素数で見る |
 | `image` 0.25.10（`default-features = false`、`png`・`tiff`） | PNG・TIFFのデコード | PoCは`jpeg`のみだった。本番コピーに拡張子が`.png`の行が5件あるので`png`、PythonのEXTSに`.tif`/`.tiff`があるので`tiff`を入れた（本番コピーには0件）。miharashiと同じ版 |
 | `fast_image_resize` 6.1.0 | 縮小（CatmullRom） | `image`の`resize`より約14倍速い。**バイナリの約3.4 MiBを占める**（§8.3） |
 | `jpeg-encoder` 0.7.1 | JPEGのエンコード（4:2:0、品質85） | ハフマン表の最適化は付けない（`zune-jpeg`が誤読する） |

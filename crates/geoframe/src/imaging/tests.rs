@@ -926,23 +926,119 @@ fn norm_timeは暦を見ず全角などの数字をasciiにする() {
 
 #[test]
 fn libjpegが許す壊れ方のjpegは読める() {
-    // Pillow（libjpeg）は、EOI の欠け・末尾のゴミ・マーカーの間のゴミを警告だけで読む。
-    // 厳格モードのままだと、これらの写真の derivative が永久にできなくなる
+    // Pillow（libjpeg）は、末尾のゴミ・マーカーの間のゴミを警告だけで読む。
+    // 厳格モードのままだと、これらの写真の derivative が永久にできなくなる。
+    // EOI の欠けは、Pillow は読むが、切れたファイルと見分けられないので失敗にする（server.md §0）
     let data: Vec<u8> = (0..120 * 90)
         .flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8])
         .collect();
     let jpeg = jpeg_encode(&data, 120, 90, jpeg_encoder::ColorType::Rgb, None);
-    let no_eoi = jpeg[..jpeg.len() - 2].to_vec();
     let trailing = [jpeg.clone(), vec![0u8; 64], b"trailer".to_vec()].concat();
     let mut between = jpeg[..2].to_vec();
     between.extend_from_slice(&[0, 0, 0, 0]);
     between.extend_from_slice(&jpeg[2..]);
-    for (name, bytes) in [
-        ("EOIなし", no_eoi),
-        ("末尾のゴミ", trailing),
-        ("マーカーの間のゴミ", between),
-    ] {
+    for (name, bytes) in [("末尾のゴミ", trailing), ("マーカーの間のゴミ", between)] {
         let out = render(&bytes, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(out.info.output, (120, 90), "{name}");
+    }
+    // EOI だけが欠けた JPEG は失敗（切れたファイルとデータの上では見分けられない）
+    let err = render(&jpeg[..jpeg.len() - 2], 0).err().unwrap();
+    assert!(
+        matches!(
+            err,
+            ImageError::Decode {
+                class: DecodeClass::Truncated,
+                ..
+            }
+        ),
+        "{err}"
+    );
+}
+
+/// 擬似乱数のノイズ（圧縮されにくく、データ部が十分に長くなる）
+fn noise_rgb(w: u32, h: u32) -> Vec<u8> {
+    let mut x = 0x2545_F491u32;
+    (0..w * h * 3)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn どこで切れたjpegも失敗にする() {
+    // 切断点を全て回す。1つでも成功すると、部分的な画像（下がグレーで埋まったもの）が「取得済み」になる。
+    // 厳格モードのデコーダは、最後のMCU行の途中で切れていても成功させてしまう（末尾の約2%）ので、
+    // 画像データのあとにEOIがあることも見ている（`jpeg_has_eoi`）
+    for (w, h, subsampled) in [(64u32, 48u32, false), (70, 50, true)] {
+        let data = noise_rgb(w, h);
+        let mut out = Vec::new();
+        let mut enc = jpeg_encoder::Encoder::new(&mut out, 90);
+        enc.set_sampling_factor(if subsampled {
+            jpeg_encoder::SamplingFactor::F_2_2
+        } else {
+            jpeg_encoder::SamplingFactor::F_1_1
+        });
+        enc.encode(&data, w as u16, h as u16, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        let scan_start = out.windows(2).position(|b| b == [0xFF, 0xDA]).unwrap();
+        assert!(
+            out.len() - scan_start > 3000,
+            "データ部が短すぎる: {}",
+            out.len() - scan_start
+        );
+        let mut accepted = Vec::new();
+        for keep in scan_start + 14..out.len() {
+            if render(&out[..keep], 0).is_ok() {
+                accepted.push(keep);
+            }
+        }
+        assert!(
+            accepted.is_empty(),
+            "切れたJPEGが成功した（{w}x{h}）: {} 箇所、最初は {:?}",
+            accepted.len(),
+            accepted.first()
+        );
+    }
+}
+
+#[test]
+fn どこで切れたpngとtiffも失敗にする() {
+    let data = noise_rgb(48, 40);
+    let png = png_encode(&data, 48, 40, image::ExtendedColorType::Rgb8);
+    // IEND（12 バイト）の手前まで切ると失敗。IEND だけが欠けたものは、画素は揃っているので成功してよい
+    for keep in 8..png.len() - 12 {
+        assert!(
+            render(&png[..keep], 0).is_err(),
+            "png keep={keep}/{}",
+            png.len()
+        );
+    }
+    let tif = tiff_image(48, 40, 1);
+    for keep in 0..tif.len() {
+        if render(&tif[..keep], 0).is_ok() {
+            panic!("tiff keep={keep}/{} が成功した", tif.len());
+        }
+    }
+}
+
+#[test]
+fn どこで切れたheicも失敗にする() {
+    for name in [
+        "synthetic_o1.heic",
+        "synthetic_o6.heic",
+        "synthetic_p3.heic",
+    ] {
+        let heic = fixture(name);
+        for keep in 0..heic.len() {
+            assert!(
+                render(&heic[..keep], 0).is_err(),
+                "{name} keep={keep}/{}",
+                heic.len()
+            );
+        }
     }
 }
