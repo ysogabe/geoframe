@@ -68,7 +68,7 @@ P3で守ること（各タスクの委任文に入れる）:
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T3.1 | 更新APIの土台と簡単な更新: POSTのルーティング、CSRF対策（Content-Type・Origin・Content-Length・64KiB超は本文を読まず413で接続を閉じる・JSON・オブジェクトのみ）、エラー応答の対応、writerをサーバーと共有する形（無ければ503）、E12 手動の位置（地名列などのNULL化）とE13 お気に入り・除外。同期サイクルとの競合の試験 | AC1, AC7 | P2 | full | 未着手 | | | 棚卸しS4（更新側）・S5 |
+| T3.1 | 更新APIの土台と簡単な更新: POSTのルーティング、CSRF対策（Content-Type・Origin・Content-Length・64KiB超は本文を読まず413で接続を閉じる・JSON・オブジェクトのみ）、エラー応答の対応、writerをサーバーと共有する形（無ければ503）、E12 手動の位置（地名列などのNULL化）とE13 お気に入り・除外。同期サイクルとの競合の試験 | AC1, AC7 | P2 | full | 実装中 | 588516e | | 棚卸しS4（更新側）・S5 |
 | T3.2 | E14 回転: Drive由来でderivativeがある写真だけ、回したderivativeを別名（`.r90`など）で作る→`display`/`rotation`を更新→旧ファイルを消す。`.part`の作り方はP2と同じ。取得（`fetch_derivatives`）・品質の解析との競合 | AC1 | T3.1 | full | 未着手 | | | 棚卸しS6 |
 | T3.3 | E4 地名検索: 地理院→0件のときだけNominatim（全体で1秒1件）、2文字未満は空、失敗は空配列、`.cache.json`のメモリキャッシュ | AC1, AC7 | T3.1 | full | 未着手 | | | |
 | T3.4 | E11 地図タイルのプロキシとB4 キャッシュの掃除: パスの検査、OSM/GSIの最大ズームと同時数、上流取得は毎分240枚まで、失敗・流量超過は透明PNG、`X-Tile-Cache`とCache-Control、`tile_cache/`の上限（`GEOFRAME_TILE_CACHE_MAX_MB`）で古い順に90%まで縮める | AC1, AC7 | T3.1 | full | 未着手 | | | |
