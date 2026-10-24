@@ -285,23 +285,38 @@ async fn responses_carry_the_json_headers() {
 }
 
 #[tokio::test]
-async fn only_the_two_reads_are_implemented() {
+async fn only_the_three_reads_are_implemented() {
     let server = Server::start(&[]).await;
-    // 地名検索と残りの管理 API は P3 まで 503（定型）
+    // 更新ルートへの GET と、残りの `/api/admin/` は、現行でも静的のホワイトリストに当たらず 403
+    // （T3.3 で P1 の未実装の 503 から揃えた）
     for target in [
-        "/api/admin/geocode?q=sample",
         "/api/admin/setloc",
+        "/api/admin/setflag",
+        "/api/admin/rotate",
         "/api/admin/",
         "/api/admin/stat",
         "/api/admin/Status",
-        // 生のパスで見るので、エンコードした形は当たらない（現行は 403。Rust は未実装の 503）
+        "/api/admin/Geocode?q=x",
+        // 生のパスで見るので、エンコードした形は当たらない（現行も 403）
         "/api/admin/%73tatus",
+        "/api/admin/%67eocode?q=x",
     ] {
         let response = get(server.addr, target).await;
-        assert_eq!(response.status, 503, "{target}");
+        assert_eq!(response.status, 403, "{target}");
+    }
+    // 地名検索。`q` は 1 文字以下なので通信せずに空（このテストは外へ出ない。通信のある試験は
+    // `geocode/tests.rs` のループバックのスタブ）
+    for target in [
+        "/api/admin/geocode",
+        "/api/admin/geocode?q=x",
+        "/api/admin/geocode?q=",
+        "/api/admin/geocodeXYZ?q=%20x%20",
+    ] {
+        let response = get(server.addr, target).await;
+        assert_eq!(response.status, 200, "{target}");
         assert_eq!(
             response.json(),
-            json!({"ok": false, "error": "この機能は Rust 版ではまだ使えません"}),
+            json!({"ok": true, "items": []}),
             "{target}"
         );
     }
@@ -318,7 +333,7 @@ async fn only_the_two_reads_are_implemented() {
         ("//api/admin/status", 200),
         ("///api/admin/photos?per=1", 200),
         ("//api/v1/photos", 200),
-        ("//api/admin/geocode?q=x", 503),
+        ("//api/admin/geocode?q=x", 200),
         ("//api/ai/status", 503),
         ("//tiles/osm/1/0/0.png", 503),
     ] {

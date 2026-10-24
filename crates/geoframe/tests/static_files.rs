@@ -1049,8 +1049,6 @@ async fn features_not_yet_in_rust_answer_503_with_a_fixed_json() {
     let site = Site::new();
     let addr = site.start().await;
     for target in [
-        "/api/admin/geocode?q=x",
-        "/api/admin/setloc",
         "/api/ai/status",
         "/api/ai/search?q=x",
         "/api/blog/trips",

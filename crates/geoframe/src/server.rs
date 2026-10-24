@@ -31,8 +31,10 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::admin::{self, AdminContext};
+use crate::cache::Cache;
 use crate::config::Config;
 use crate::db::Catalog;
+use crate::geocode::{self, Geocoder};
 use crate::limits::{ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
 use crate::writer::Writer;
 use crate::{csrf, hostcheck, photos, post, pyquery, statics, sysinfo, webpath};
@@ -60,6 +62,11 @@ pub struct AppState {
     pub admin: Arc<AdminContext>,
     /// `disk` の直近の計測。ロックを持ったまま測るので、同時に来ても全走査は1回で済む。
     disk_cache: Arc<Mutex<Option<(Instant, Value)>>>,
+    /// `.cache.json` のメモリキャッシュ。取り込みが有効（`GEOFRAME_INGEST=1`）のときは同期サイクルと同じもの
+    /// （保存は保存スレッドに任せる）。無効のときはメモリだけ（ディスクへは書かない。[`Cache::load_memory_only`]）。
+    pub cache: Arc<Cache>,
+    /// 地名検索（`GET /api/admin/geocode`）。Nominatim の 1 秒 1 件の制限をプロセス全体で持つ。
+    pub geocoder: Arc<Geocoder>,
 }
 
 impl AppState {
@@ -86,7 +93,22 @@ impl AppState {
             static_slots: Arc::new(Semaphore::new(STATIC_FILE_SLOTS)),
             admin,
             disk_cache: Arc::new(Mutex::new(None)),
+            cache: Arc::new(Cache::memory_only()),
+            geocoder: Arc::new(Geocoder::production()),
         }
+    }
+
+    /// 地名検索が使うキャッシュを差し替える（起動時。既定は空のメモリだけのキャッシュ）。
+    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// 地名検索の通信先・時計を差し替える（試験用）。
+    #[cfg(test)]
+    pub(crate) fn with_geocoder(mut self, geocoder: Arc<Geocoder>) -> Self {
+        self.geocoder = geocoder;
+        self
     }
 }
 
@@ -243,6 +265,58 @@ async fn api_admin_photos(state: &AppState, query: Option<&str>) -> Response {
     }
 }
 
+/// `GET /api/admin/geocode`（現行の `geocode_search` と、`handlers.py` のクエリの解釈）。`q` は最初の値
+/// （`parse_qs` と同じ。空の値は無かったことになる）。2 文字未満は通信せずに空。通信と 1 秒の待ちがあるので
+/// blocking スレッドで行い、同時に処理する数に上限を付ける（空きが無ければ 503）。失敗は空の配列で、
+/// 応答にも理由を載せない。
+async fn api_admin_geocode(state: &AppState, query: Option<&str>) -> Response {
+    let params = pyquery::parse_qs_first(query.unwrap_or(""));
+    let raw = params.get("q").map_or("", String::as_str);
+    let Some(q) = geocode::clean_query(raw) else {
+        return geocode_response(Vec::new());
+    };
+    let Some(permit) = state.geocoder.try_reserve() else {
+        tracing::warn!("地名検索: 同時に処理できる数を超えたので断りました");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "地名検索が混み合っています。しばらくしてから再試行してください",
+        );
+    };
+    let (geocoder, cache, q) = (
+        Arc::clone(&state.geocoder),
+        Arc::clone(&state.cache),
+        q.to_owned(),
+    );
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        geocoder.search(&cache, &q)
+    })
+    .await
+    {
+        Ok(items) => geocode_response(items),
+        Err(_) => {
+            tracing::error!("地名検索が異常終了しました");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "内部エラーが発生しました",
+            )
+        }
+    }
+}
+
+fn geocode_response(items: Vec<Value>) -> Response {
+    match serde_json::to_vec(&serde_json::json!({"ok": true, "items": items})) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(e) => {
+            tracing::error!("地名検索の結果を JSON にできません: {e}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "内部エラーが発生しました",
+            )
+        }
+    }
+}
+
 pub(crate) fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
     (
         status,
@@ -391,8 +465,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// まだ Rust 版に無い機能（管理画面の地名検索と更新 API・AI・旅行ブログ・地図タイル）。P3 / P4 で
-/// 実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
+/// まだ Rust 版に無い機能（AI・旅行ブログ・地図タイル）。P3 / P4 で実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
 /// （「禁止」ではなく「まだ無い」と分かるように）。
 fn not_yet_implemented(label: &'static str) -> Response {
     labeled(
@@ -409,7 +482,9 @@ fn not_yet_implemented(label: &'static str) -> Response {
 ///
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
-///    `/tiles/`（地図タイル、P3）と、残りの `GET` の `/api/admin/`（地名検索）・`/api/ai/`・`/api/blog/` は 503。
+///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル、P3）と、`/api/ai/`・
+///    `/api/blog/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
+///    ホワイトリストに当たらず 403 なので、下の静的配信の判定へ回す。
 /// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML。
 /// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
 ///    `/static/`・`/vendor/` は埋め込み、`/derivatives/`・`/photos/`・`/blog_exports/` はデータ置き場から。
@@ -461,8 +536,13 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 "/api/admin/photos",
             );
         }
+        if path.starts_with("/api/admin/geocode") {
+            return labeled(
+                api_admin_geocode(&state, parts.uri.query()).await,
+                "/api/admin/geocode",
+            );
+        }
         for (prefix, label) in [
-            ("/api/admin/", "/api/admin/{*path}"),
             ("/api/ai/", "/api/ai/{*path}"),
             ("/api/blog/", "/api/blog/{*path}"),
         ] {

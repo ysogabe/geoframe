@@ -7,7 +7,7 @@
 
 ## 0. Pythonとの差の索引
 
-P1・P2（T2.1〜T2.6）・P3（T3.1・T3.2）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1〜T2.6）・P3（T3.1〜T3.3）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
@@ -17,7 +17,7 @@ P1・P2（T2.1〜T2.6）・P3（T3.1・T3.2）でPythonと意図して違える�
 | 夏時間を持つ`TZ`のときの時刻の差（T2.5の`infer`の時刻の差を含む） | RustはP1で`TZ`を解釈せず、naiveな日時を文字列・暦で扱う（`infer`は暦の日数×86400＋時分で差を取る。Pythonは`strptime(…).timestamp()`で`TZ`として解釈する） | `TZ`が夏時間を持つとき（本番は`Asia/Tokyo`） | 本番設定では差なし | P2以降で時刻を変換するときに再検討 | [§1.2](#12-tz)・[§10.6](#106-pythonとの差まとめ) |
 | `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字で最後 | 契約（`time`は必ずある）に合わせる | `taken_at`がNULLの行がDBにあるとき | 本番コピーに該当行なし（管理者確認済み） | なし（決定） | [§8.3](#83-pythonとの差) |
 | `lat`ありで`lon`がNULLの行: Pythonは一覧全体が500になりうる、Rustは一覧から外す | 契約（`lon`は必ずある）に合わせる | 該当行があるとき（通常は起きない） | 本番コピー（2026-10-24のバックアップ）での全件比較で差0（表示対象に該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
-| 静的配信・HTTPの差（領域外のリンクは403、`ETag`での再検証、`/healthz`の新設、未実装ルートの503、ルートの無い`POST`は403、接続・配信の上限など） | 安全性、固定の挙動、まだ無いことの明示 | 該当する要求を送ったとき | 検証環境で現行Pythonとの比較（状態コード・本文の一致）、単体テスト | 503はP3・P4で実装して外す（`POST`の更新ルートはT3.1で実装）。他は決定 | [§9.7](#97-pythonとの差まとめ) |
+| 静的配信・HTTPの差（領域外のリンクは403、`ETag`での再検証、`/healthz`の新設、未実装ルートの503、ルートの無い`POST`は403、接続・配信の上限など） | 安全性、固定の挙動、まだ無いことの明示 | 該当する要求を送ったとき | 検証環境で現行Pythonとの比較（状態コード・本文の一致）、単体テスト | 503はP3・P4で実装して外す（`POST`の更新ルートはT3.1、`GET /api/admin/geocode`はT3.3で実装。`/api/admin/`配下の残りの`GET`は、T3.3で503をやめて現行どおり403にした）。他は決定 | [§9.7](#97-pythonとの差まとめ) |
 | 列の型が想定外の行（`lat`が文字列など）があると読み取り全体が失敗して503（Pythonは素通し） | スキーマ上は起きない | `GET /api/v1/photos` | 本番コピーの全件比較で差0（該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
 | DBが無いとRustは起動を断る（終了コード1、systemdで5秒おきに再起動）。PythonはDBを作る。**ただし`GEOFRAME_INGEST=1`のときは、Rustも空のDBを作る**（T2.1。§11.1） | DBを作るのはPython。配備の誤りを失敗として見せる | `GEOFRAME_DATA_DIR`の誤りなど、DBが無いまま起動したとき | 検証環境で確認（[p1-acceptance.md](p1-acceptance.md)） | なし（決定。P5の切替時にはDBがある） | [§2.4](#24-dbが無い壊れている古いときの扱い) |
 | 管理画面の読み取りAPIの差（件数を1トランザクションで数える、想定外の型は503、キーの並びなど） | 一貫性、読み取り専用の表示で落とさない | `GET /api/admin/status`・`photos` | 検証環境の比較で差0、単体テスト | なし（決定） | [§10.6](#106-pythonとの差まとめ) |
@@ -44,6 +44,7 @@ P1・P2（T2.1〜T2.6）・P3（T3.1・T3.2）でPythonと意図して違える�
 | **更新APIと同期サイクルの競合（T3.1）**: Pythonは`infer`の`UPDATE`が`WHERE id=?`だけで、計画を読んだあとに管理画面で直された位置（`manual`）を推定で上書き・取り消す。`enrich`の`UPDATE`も`WHERE id=?`だけで、地名の問い合わせ中に位置が直されると、古い座標の地名が新しい位置に書かれて`place`が埋まったまま残る（再enrichされない）。Rustは`infer`が`loc_source IS NULL OR 'inferred'`、`enrich`が`lat=? AND lon=? AND place IS NULL`の条件で守る（P2）。T3.1では`infer`の位置付けに「錨が計画のときの位置・種類のまま」の条件を足した（錨が手動で動かされたあとに古い位置を写さない） | 利用者の変更を失わない | 管理画面の操作が同期サイクルの段の途中に入ったとき | 割り込みを再現する単体テスト（§17.3） | なし（決定） | [§17.3](#173-同期サイクルとの競合) |
 | **回転API（T3.2。E14 `POST /api/admin/rotate`）**: ①**小数の`delta`（`90.0`・`-90.0`・`9e1`）はRustが400**（Pythonは`90.0 == 90`で通し、`<drive_id>.r90.0.jpg`という名前のファイルを作って応答の`rotation`を`90.0`にする。DBには整数の90が入る）。②**`display`がシンボリックリンク・`derivatives/<安全な名前>`でない・通常のファイルでない（ディレクトリ・FIFO）ときは400「表示用の画像がまだありません」**（Pythonは`is_file()`でリンクを辿り、`DATA_DIR`の下の任意のファイル（リンク先が外でも）を読んで回し、元のファイルを`unlink`する）。③`drive_id`が名前に使えない文字（`/`・`..`・非ASCIIなど）の行は500（Pythonは経路にそのまま使う）。④`delta`と`id`の検査のあと、**writerが無ければファイルを作る前に503**（Pythonに無い）。⑤**DBの更新は条件付き**（読んだ時点の`display`・`rotation`・`md5`・`fetched_at`のままなら）で、外れたら何も書かず新しいファイルを消して**409**「他の処理と重なったので回転しませんでした。もう一度お試しください」（行が消えていれば404）。Pythonは無条件に書く。⑥回転どうし・回転と取得（`fetch_derivatives`）は`imaging::lock_derivatives`で直列化する（Pythonは読んで書くまでを排他しない）。⑦画像: Pillowの`rotate(-delta, expand=True)`と同じ向き・寸法、JPEG品質85・4:2:0・ベースライン、EXIFを付けない、EXIFの向きを当てない（Pillowも当てない）。画素は再圧縮の差を許す（デコーダがlibjpegと違うので、平均の差は数段階） | Pythonの癖を再現しない・安全側・競合の守り | 回転の要求を送ったとき | `tests/rotate_api.rs`が基準（`tools/gen_rotate_fixture.py`。合成のderivativeを置いた現行`admin_rotate`に57ケースを順に流した状態コード・応答・`photos`の変化・ファイルの増減（画像は寸法・四隅の色・EXIFの有無）と一致。差は`known_differences`の5件だけ。CIで`--check`）、`rotate/tests.rs`、`drive::tests`・`quality::tests`の競合の試験 | なし（決定） | [§17.8](#178-e14-rotatet32) |
 | **回転と同期サイクル・取得・品質の競合（T3.2）**: Pythonは回転で「読む→画像を作る→`display`・`rotation`を書く→元のファイルを消す」の間を排他せず、①同期サイクルが`display`をNULLにした（推定の錨が消えた取り消し・Driveの`md5`の変更）あとでも、古い原本から作った画像を`display`に書き戻し、`fetch_derivatives`は`display`がNULLでないので取り直さない（`md5`が新しいのに古い画像が出続ける）。②回転どうしが重なると、片方の回転が失われ、負けた側の新しいファイルが孤児になる。③読んだ`src`を無条件に消すので、その間に同じ名前で作り直されたファイルを消すことがある。Rustは条件付きの更新（409）・ロックで守り、DBが今指しているファイルは消さない。**Rustでも残る穴**: `index_drive`が一覧から消えた行と一緒に消すファイルは、計画を読んだ時点の`display`なので、その直後に回転が入ると新しいファイルが孤児で1つ残る（Driveから消えた写真の回転と、一覧を読んだ直後の数ミリ秒が重なる場合だけ。増え続けない）。`md5`の変更で`rotation`が0に戻るとき古い回転済みのファイルを消さない件（[inventory.md §2.3](inventory.md)③）はPythonと同じ | 利用者の変更と実在するファイルの一貫性 | 回転が同期サイクル・取得と重なったとき | `rotate/tests.rs`（`display`のNULL化・`md5`の変更・同じ名前での作り直し・行の消失・同時の回転・DBの失敗）、`drive::tests::fetch_waits_for_a_rotation_in_progress_and_leaves_no_orphan`、`quality::tests::解析の途中で回転が入っても…` | ③は**T3.7で決める**。他は決定 | [§17.8.4](#1784-競合) |
+| **地名検索 `GET /api/admin/geocode`（T3.3。E4）**: ①応答の本文を**1 MiBまで**にする（Pythonは上限なし）。超えたら通信の失敗と同じ（地理院なら空→Nominatim、Nominatimなら空でキャッシュしない）。②**同時に処理する検索は8件まで**。超える要求は待たせずに503（定型の本文。Pythonは無制限に待たせる）。2文字未満の語は数えない。③Nominatimの待ちの間に同じ語が別の要求でキャッシュされたら、**通信せずにそれを返す**（Pythonは待ったあとに必ず通信する）。④JSONの`NaN`・`Infinity`・`1e400`のようにf64に収まらない数は、本文全体が不正なJSONになる（Pythonは読む）。⑤`display_name`が文字列でない（数・配列など）ときは検索語を`title`にする（Pythonは`str()`）。⑥失敗のログに検索語を出さない（Pythonは`q=`を出す）。種類と状態コードだけ。⑦User-AgentはPythonの`http_json`と同じ`GeoFrame/0.2`（P2の他の通信は`geoframe/<版>`）。⑧**取り込みが無効（`GEOFRAME_INGEST=0`）では、`.cache.json`を読んでメモリに入れるだけで、ディスクへ書かない**（Pythonは常に保存スレッドが書く）。再起動すると、この間に得たNominatimの結果は消える。取り込みが有効なら同期サイクルと同じキャッシュを共有し、保存スレッドが書く。⑨応答のキーの並びは辞書順（`items`の各要素が`lat lon source title`。JSONとしては同じ） | ①②は暴走・巨大な応答への歯止め。③は公開サーバーへの問い合わせを減らす。④⑤は非現実的な入力。⑧は本番の書き手がP5の切替までPythonなので、Rustが`.cache.json`を書かない | 該当の入力のとき。⑧は`GEOFRAME_INGEST=0`の`serve` | `geocode/tests.rs`（ループバックのスタブ＋偽の時計。フィクスチャ`geocode-python.json`は現行`handlers.Handler`の出力） | なし（決定。⑧はP5の切替で本番の書き手がRustになれば取り込みが有効になり解消） | [§18](#18-地名検索p3--t33) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記録は[p2-acceptance.md](p2-acceptance.md)。
 
@@ -283,7 +284,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 `site`（`GET`/`HEAD`）は、現行の`do_GET`/`do_HEAD`と同じ順に判定する。
 
-1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。そのあと、`/tiles/`（地図タイル、P3）と、残りの`GET`の`/api/admin/`（地名検索`geocode`はP3）・`/api/ai/`・`/api/blog/`（P3・P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。
+1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。`GET`の`/api/admin/geocode`（地名検索。T3.3、§18）も同じ前方一致。そのあと、`/tiles/`（地図タイル、P3）と、`GET`の`/api/ai/`・`/api/blog/`（P3・P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。`/api/admin/`の残り（`setloc`・`setflag`・`rotate`などの更新ルートへの`GET`、`/api/admin/`そのもの、大文字小文字やエンコードの違い）は、現行でも`do_GET`のどの分岐にも当たらず静的配信のホワイトリストで**403**になるので、T3.3で503をやめて静的配信の判定へ回した（`/api/admin/../static/…`のように`..`を含む形も現行は403で、`geocode-python.json`の`admin_gets`で突き合わせている）。P4に`/api/admin/`配下の`GET`は無い（AI検索は`/api/ai/`）。
 2. 管理画面のページ（§9.5）。
 3. 静的ファイル（§9.3）。許可は`/favicon.ico`と5つの接頭辞だけで、**それ以外はすべて403**（404ではない。`/nope`・`/api/nope`・`/api/v1/photos/`も403）。
 
@@ -380,7 +381,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | 埋め込みファイルの再検証 | `Last-Modified`/`If-Modified-Since` | `ETag`/`If-None-Match` | 時刻に依存して古いJSが居座る事故を避ける（§9.4） |
 | バックスラッシュを含む要求 | 区切りに読み替えて判定、実ファイルは404 | 403 | 区切りの解釈を持たない |
 | HTMLヘッダ・`no-cache`の判定 | 生のパス | デコード・正規化後のパス、`.htm`も | `%2E`で付かなくなる抜けを塞ぐ（§9.5） |
-| 未実装のルート（`/tiles/`、GETの`/api/admin/geocode`など`status`・`photos`以外の`/api/admin/`、`/api/ai/`、`/api/blog/`） | 応答する | 503と定型のJSON | P3・P4で実装する（`status`・`photos`はT1.4で実装、§10） |
+| 未実装のルート（`/tiles/`、`/api/ai/`、`/api/blog/`のGET） | 応答する | 503と定型のJSON | P3・P4で実装する（`status`・`photos`はT1.4、`geocode`はT3.3で実装、§10・§18。`/api/admin/`の残りのGETはT3.3から現行どおり403） |
 | `POST` | 既知のルートはContent-Type不一致でJSONの403、それ以外はHTMLの403 | 同じ（T3.1。P1では全部HTMLの403だった。§17） | 更新ルートはT3.1で実装 |
 | `/healthz` | 無い（403） | 200/503（Host検査あり） | 新設（§4） |
 | 起動ログ・拒否ログ | 許可する名前、機体のIP、拒否したHostの値を出す | 件数だけ。Hostの値は出さない | §3.2の方針 |
@@ -1889,3 +1890,74 @@ Pythonは、①同期サイクルが`display`をNULLにしたあとでも古い�
 
 - **T3.7**: 回転済みの写真が`md5`の変更で`rotation`0に戻り、古い回転済みのファイルが残る経路（[inventory.md §2.3](inventory.md)③）。
 - **T3.8**: 検証環境での回転の受入（比較用Python `:8090`に同じ要求を送る）。
+
+## 18. 地名検索（P3 / T3.3）
+
+状態: T3.3 実装済み（2026-10-25）。`GET /api/admin/geocode?q=…`（[inventory.md](inventory.md) E4）。管理画面の手動位置指定が「地名で近くまで飛ぶ」ために使う。実装は`geocode.rs`（検索・変換・1秒1件）、`server.rs`の`api_admin_geocode`（ルーティング・同時数・応答）、`cache.rs`（メモリだけのモード）。位置候補の座標化（P4）も同じ`Geocoder::nominatim_search`を国コードつきで使う。
+
+### 18.1 ルーティングとクエリ
+
+- **生のパスの前方一致**（`/api/admin/geocode`で始まれば`geocodeXYZ`も当たる。先頭の`//`は畳んでから判定）。`status`・`photos`と同じ。`HEAD`は403（静的のホワイトリストに当たらない）。`POST`は更新ルートではないので403。順序は現行の`do_GET`と同じ（`/tiles/` → `/api/v1/photos` → `status` → `photos` → `geocode`）。
+- `q`は`parse_qs`の最初の値（`pyquery::parse_qs_first`。空の値は無かったことになる。`+`は空白、`%XX`を戻し、不正なUTF-8はU+FFFD）。無ければ空文字。
+- 検索語は前後の空白を落とし（`pyquery::py_strip` = Pythonの`str.strip()`。Rustの`trim`に`\x1c`〜`\x1f`を足したもの。全コードポイントをフィクスチャの`str.isspace`と突き合わせた）、**コードポイントで2文字未満**なら通信せずに`{"ok":true,"items":[]}`。
+- 応答は`Content-Type: application/json; charset=utf-8`・`Cache-Control: no-store`。失敗は空の配列で握りつぶし、応答に理由を載せない。
+
+### 18.2 検索の流れ（Pythonの`geocode_search`と同じ）
+
+| 段 | 内容 |
+| --- | --- |
+| 1 | 地理院の地名検索（`https://msearch.gsi.go.jp/address-search/AddressSearch?q=<quote(q)>`）を**毎回**引く。結果はキャッシュしない |
+| 2 | 先頭の**10件**を見る（使えない要素を飛ばした後ろは繰り上がらない）。座標`[経度, 緯度]`が数値（JSONの真偽値もPythonの`int`として通る）で2つ並んだものを`{title, lat, lon, source:"gsi"}`にする。**座標の範囲は見ない**。`title`は前後の空白を落とし、空・無し・偽の値なら検索語 |
+| 3 | 要素・`geometry`・`properties`が**真の非オブジェクト**、または`title`が**真の非文字列**（数・配列・`true`）だと、Pythonは`.get`・`.strip`が例外になって握りつぶし、**地理院の結果全体を空にする**（それまでに集めた要素も捨てる）。Rustも同じ（座標が使えない要素は、`geometry`・`properties`の型を見る前に飛ばされるので毒にならない）。偽の値（`null`・`0`・`""`・`[]`・`{}`）は`{}`扱い |
+| 4 | 結果が空（0件・失敗・毒）なら、Nominatimを引く（下） |
+| 5 | Nominatimの結果は、`lat`・`lon`を`float()`に通し（文字列・数・真偽値。`null`・配列・オブジェクト・欠落・読めない文字列はその要素だけ飛ばす）、**緯度−90〜90・経度−180〜180**に収まるものだけを`{title: display_name, lat, lon, source:"osm"}`にして**先頭の10件**（有効なものを数える） |
+
+`float()`の寛容さ（前後の空白、数字の間の`_`、ASCII以外の10進数字、`inf`・`nan`、`1.`・`.5`・指数）は`pyquery::py_float`が再現する（`str.isspace`のASCIIの`\x1c`〜`\x1f`は空白にならない、全角の`．`は不可、など。フィクスチャの`float_samples`で突き合わせた）。URLのエンコードは`py_quote`（`urllib.parse.quote`）。
+
+### 18.3 Nominatim は全体で1秒1件
+
+- `Geocoder`の`nominatim_last`（前の通信が**終わった**時刻）のMutexを、**待ちから通信・キャッシュへの保存まで持ち続ける**（Pythonの`_nominatim_lock`と同じ）。複数の要求が同時に来ても、上流への要求は直列になり、前の通信が終わってから`NOMINATIM_MIN_INTERVAL`（1秒）たつまで待つ。**通信が失敗しても終わった時刻を記録する**（Pythonの`finally`）。最初の1件は待たない。キャッシュに当たれば待たない・時刻も変わらない。
+- 時計は`Clock`（`now`・`sleep`）。本番は実時間（`std::thread::sleep`）、試験は偽の時計（待たずに進め、待ちを記録する）。
+- 待つ間にロックを持つので、**ブロッキングのスレッドで動かす**（`spawn_blocking`）。tokioのワーカーは塞がない。同時に処理する検索は**8件**（`MAX_IN_FLIGHT`）で、空きが無い要求は待たせずに**503**（定型の本文`{"ok":false,"error":"地名検索が混み合っています。…"}`。管理画面は`!d.ok`を「見つかりませんでした」と表示する）。2文字未満の語は空きを使わない。Pythonは上限なしに待たせる。最悪の待ちは、Nominatimの1件が最長8秒＋待ち1秒なので8×9秒ほど。
+- 待っている間に別の要求が同じ語をキャッシュに入れたら、待ったあとに**キャッシュを見直して**通信しない（Pythonは見直さず、同じ語を同時に2回検索すると2回問い合わせる）。キャッシュへの保存はロックの中で済ませる。
+- クライアントが切断しても、処理は最後まで進む（キャッシュに入り、空きは終わったときに戻る）。
+
+### 18.4 `.cache.json`（メモリキャッシュ）
+
+- キー`geocode_osm:<検索語>`（国コードを渡したときは`geocode_osm:<国コード>:<検索語>`）。検索語は`strip`済みでURLエンコード前。値は`{title, lat, lon, source}`の配列で、**0件も入れる**。通信の失敗・JSONでない・配列でない応答は入れない。**配列でない既存の値はミス**として取り直して上書きする。配列なら中身を問わずそのまま返す（先頭10件に切らない）。`geo:`・`muni_table`とは別のキーで、起動時の旧キー破棄（`purge_legacy`）は`geocode_osm:`を消さない。
+- **取り込みが有効（`GEOFRAME_INGEST=1`）**: `serve`は`ingest.cache`（同期サイクルの`enrich`と同じ`Arc<Cache>`）をそのまま使う。`Cache`の状態はMutexで守られ、`get`・`put`は短い。保存は`cache-saver`（変更があれば最短60秒間隔）と停止時の最後の保存が行う（§11.5）。地名検索が保存の最中に`put`しても、スナップショットはロックの下で取るので失われない。
+- **取り込みが無効（`GEOFRAME_INGEST=0`。既定）**: `serve`は`.cache.json`を**読んでメモリに入れるだけ**で、**ディスクへは書かない**（`Cache::load_memory_only`。`put`はメモリに入り、保存・`purge_legacy`・`.cache.json.tmp`の作成は一切しない）。同じ語を何度もNominatimに問い合わせないための、プロセスの中だけの記憶で、**再起動すると消える**。Pythonは常に保存スレッドが書くが、本番の書き手がP5の切替までPythonで、Rustの`serve`は`.cache.json`に触れない方針（§11.1）に合わせた。ファイルが無い・壊れているときは空から始める。
+- `AppState`の既定は、ファイルを読まない空のメモリだけのキャッシュ（試験の`AppState::new`が実ファイルに触れないように）。`cli`の`serve`が実際のキャッシュに差し替える。
+
+### 18.5 通信
+
+- クライアントは`ureq`（`net::agent()`の複製）。リクエストごとに**User-Agent: `GeoFrame/0.2`**（Pythonの`http_json`と同じ。P2の他の通信は`geoframe/<版>`）、**全体で8秒**（Pythonの`timeout=8`は1回の読み書きごと）。リダイレクトは`ureq`の既定（10回）。状態コードが2xx以外・本文がUTF-8でない・JSONでない（BOMつきを含む）・本文が**1 MiB**を超える、は失敗。Pythonは本文の上限が無い。`ureq`の上限は「ちょうど」でも超過になるので`+1`して、1 MiBちょうどまでを読む。
+- 接続先は定数（`geocode::Endpoints::production`）。Pythonと同じく設定では変えられない。試験のビルドだけ、ループバックのスタブへ向けられる（`Endpoints::stub`。配布するバイナリにコードが無い。P2の`GsiEndpoints::stub`と同じ流儀）。**結合テスト（`tests/`）は本番の接続先に向いたまま**なので、`q`は1文字以下か`q`を付けない要求だけを送る（通信のある試験は`geocode/tests.rs`）。
+- 本番の`Nominatim`は、利用規約（1秒1件・識別できるUser-Agent・結果のキャッシュ）が前提。User-Agentに連絡先は入っていない（Pythonと同じ`GeoFrame/0.2`）。公開サーバーに識別されないと遮断されうるので、本番で使う前に`GEOFRAME_TILE_UA`と同様に連絡先入りにするか決める（T3.8の確認後。今は変えない）。
+
+### 18.6 ログ
+
+失敗は`[geo] 地名検索失敗（地理院）: <種類>`・`（Nominatim）`と、地理院の応答の形が想定外だったときの1行だけ。種類は`net::Failure`（`dns`・`connect`・`tls`・`timeout`・`disconnected`・`body_unreadable`・`other`）、`http <状態コード>`、`bad_response`（UTF-8でない・JSONでない・大きすぎる）。**検索語・地名・座標・応答の中身・URLは出さない**（Pythonは`q=`を出す）。アクセスログはメソッド・ルート（`/api/admin/geocode`）・状態コード・時間だけ。試験は、検索語・地名・座標・URLを含む失敗の場面で、出力がそれらを含まないことを確かめる（`geocode::tests::failure_logs_never_contain_…`、`tests/access_log.rs`）。
+
+### 18.7 `/api/admin/`配下の`GET`の整理（T3.1の残り）
+
+T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のままにしていた。現行は`do_GET`に`status`・`photos`・`geocode`の3つ以外の`/api/admin/`の分岐が無く、静的配信のホワイトリストで**403**になる（`setloc`・`setflag`・`rotate`、`/api/admin/`、`/api/admin/Status`、`%73tatus`のようなエンコード、`..`を含む形を現行で確かめた）。T3.3で503の接頭辞（`/api/admin/`）を外し、同じ静的配信の判定に回した。**P4に`/api/admin/`配下の`GET`は無い**（AI検索は`/api/ai/`、旅行ブログは`/api/blog/`）ので、今後`/api/admin/`で503を返すルートは無い。`/api/ai/`・`/api/blog/`・`/tiles/`の`GET`は引き続き503（T3.4・T3.5・P4で実装）。
+
+### 18.8 Pythonとの差（まとめ）
+
+§0の1行に同じ。①本文は1 MiBまで。②同時に8件まで、超えたら503。③待つ間に同じ語がキャッシュされたら通信しない。④`NaN`・`Infinity`・f64に収まらない数は本文全体が不正（Pythonは読む）。⑤`display_name`が文字列でないときは検索語（Pythonは`str()`）。⑥ログに検索語を出さない。⑦取り込みが無効なら`.cache.json`に書かない。⑧応答のキーの並びが辞書順。それ以外（流れ・URL・User-Agent・件数・値・キャッシュのキーと保存の条件・1秒1件の待ち）はフィクスチャで一致を確かめた。
+
+### 18.9 テスト
+
+- `src/geocode/tests.rs`:
+  - `python_fixture_*`: `tools/gen_geocode_fixture.py`（`app/tests/geocode_fixture.py`の32ケース・152ステップ）が、現行`handlers.Handler`にGETを順に流し、`urllib.request.urlopen`と`geo.time`を合成の応答・偽の時計に差し替えて記録した、状態コード・応答のJSON・上流への要求（種類・クエリ文字列・User-Agent・タイムアウト）の順・`time.sleep`の引数・メモリキャッシュの全体と、Rustが同じ応答を返すループバックのスタブ・偽の時計で流した結果が一致する。ケース: 検索語の取り出しと2文字未満（空白・`\x1c`〜`\x1f`・全角・NBSP・ゼロ幅スペース）、`q`の重複・`+`・`%XX`・不正なUTF-8・前方一致・`//`、URLのエンコード、地理院の値・毒要素・先頭10件・非リスト・失敗13種（404・500・429・切断・JSONでない・空・不正なUTF-8・BOM・途中で切れたJSON・204）、Nominatimの値・飛ばす要素・`float()`の寛容さ・先頭10件・失敗とキャッシュしないもの、キャッシュの再利用・Pythonが書いた値の扱い・キー、1秒1件の待ちの値（通信中の時間・失敗も待ちを起こす・キャッシュと地理院は待たない）、国コード（正規化・キー・URL）。あわせて、更新ルートや`..`を含む形への`GET`が403であること（21件）。
+  - `python_fixture_small_functions_match`: `float()`・`urllib.parse.quote`・`str.isspace`（全コードポイント）の出力と`py_float`・`py_quote`・`py_strip`。`python_fixture_constants_match`: User-Agent・タイムアウト・件数・間隔・本番の接続先。
+  - 差・Rustだけの性質: 本文の上限、`NaN`などで本文全体が不正、`display_name`が文字列でない、**同時の検索でNominatimへの要求が1秒に1件を超えない**（6スレッドから直接・5本のHTTPで。偽の時計で各要求の受信時刻と待ちを記録して確かめる。実時間に頼らない）、同じ語の同時検索が1回の問い合わせで済む、同時数の上限（応答を止めて2本目が503、2文字未満は答える、終われば空きが戻る）、実時計の下限、ログに検索語などが出ない、`.cache.json`（取り込み無効: ファイルを変えず・`.tmp`も作らずメモリのキャッシュで済む、有効: 同期サイクルが`geo:`を書き続けている間でも互いの更新を失わず保存される）。
+- `src/cache.rs`・`src/pyquery.rs`: メモリだけのモード。`tests/admin_api.rs`・`access_log.rs`・`static_files.rs`・`update_api.rs`: `/api/admin/`の残りの`GET`が403、`geocode`が`q`なし・1文字で空の200（通信しない）。
+- `app/tests/test_geocode_fixture.py`: フィクスチャが最新であること、Pythonの癖（毒要素で地理院の結果全体が空、先頭10件を先に切る、待ちの値、キー）の記録。
+- 確認した変異: `py_strip`を`trim`にする、Nominatimの時刻を通信の前に記録する、のそれぞれで試験が落ちる。
+
+### 18.10 回したもの
+
+- **T3.8**: 検証環境での実際の通信の確認（地理院・Nominatimへの実通信、比較用Python `:8090`に同じ要求を送る）。取り込みが有効・無効の両方で`.cache.json`の挙動を見る。
+- 本番で使う前: Nominatimへ送るUser-Agentの連絡先（§18.5）。

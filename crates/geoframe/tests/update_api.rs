@@ -403,10 +403,9 @@ async fn options_stays_501_and_no_response_carries_cors_headers() {
         assert!(!response.headers.contains("access-control-"), "{target}");
         assert!(!response.headers.contains("allow:"), "{target}");
     }
-    // GET・HEAD の /api/admin/ 配下は今まで通り（P1 で決めたもの）。更新ルートへの GET は未実装の 503、
-    // HEAD は 403
+    // 更新ルートへの GET・HEAD は、現行でも静的のホワイトリストに当たらず 403（GET は T3.3 で、P1 の未実装の 503 から揃えた）
     let response = get(server.addr, "/api/admin/setloc").await;
-    assert_eq!(response.status, 503);
+    assert_eq!(response.status, 403);
     let response = request(
         server.addr,
         "HEAD",

@@ -15,6 +15,7 @@ pub mod drive;
 pub mod embedded;
 pub mod feed;
 pub mod geo;
+pub mod geocode;
 pub mod guard;
 pub mod hostcheck;
 pub mod imaging;

@@ -57,6 +57,10 @@ jobs:
         # （生バイトを Latin-1 にして email のパーサへ）の上で、空白・Latin-1 の全バイト・Origin の書式（角括弧の IPv6 を
         # 含む）・Host の組み合わせに流した判定（9千件超）と、実際の HTTP サーバーへの POST の結果を残す。Rust が
         # Python の断るものを通さないことを確かめる基準（tests/csrf_python.rs）。
+        # 地名検索（crates/geoframe/src/geocode.rs）は、Python の handlers.Handler の GET /api/admin/geocode に、
+        # 合成の地理院・Nominatim の応答と偽の時計で流した結果（状態コード・応答・上流への要求のクエリと順・
+        # Nominatim の 1 秒 1 件の待ち・メモリキャッシュの全体）と、float()・urllib.parse.quote・str.isspace の
+        # 出力を残す。Rust が同じ要求・応答・時計で一致することを確かめる基準（geocode/tests.rs）。
         # Python の読み取りが変わったら落ちる
         run: |
           python3 tools/gen_exif_fixture.py --check
@@ -70,6 +74,7 @@ jobs:
           python3 tools/gen_update_fixture.py --check
           python3 tools/gen_rotate_fixture.py --check
           python3 tools/gen_csrf_fixture.py --check
+          python3 tools/gen_geocode_fixture.py --check
 
       - name: スキーマのフィクスチャの同期検査
         # Rust のスキーマ（crates/geoframe/src/schema.rs）が Python の空 DB と一致することを確かめる

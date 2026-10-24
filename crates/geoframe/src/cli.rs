@@ -320,7 +320,13 @@ fn serve(overrides: &Overrides) -> ExitCode {
             ingest.lock_hold(),
         ),
     });
-    let state = AppState::new(Arc::clone(&config), catalog);
+    // 地名検索の `.cache.json`。取り込みが有効なら同期サイクルと同じキャッシュ（保存は保存スレッドが行う）。
+    // 無効なら、読んでメモリに入れるだけでディスクへは書かない（本番の書き手は P5 の切替まで Python）
+    let cache = match &ingest {
+        Some(ingest) => Arc::clone(&ingest.cache),
+        None => Arc::new(Cache::load_memory_only(&config.data_dir)),
+    };
+    let state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
     if state.data_root.as_path() != state.config.data_dir.as_path() {
         // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する
         tracing::info!(

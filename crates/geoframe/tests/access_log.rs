@@ -95,7 +95,10 @@ async fn access_log_has_only_method_route_status_and_time() {
     get(addr, "/derivatives/%2e%2e/secret-dir/x.jpg").await; // トラバーサル
     get(addr, "/admin?token=abcSecretToken").await; // ページ
     get(addr, "/nope-secret-path?q=x").await; // ホワイトリスト外
-    get(addr, "/api/admin/geocode?q=secret-query").await; // 未実装の API
+    // 地名検索。`q` は 1 文字なので通信しない（このテストは外へ出ない）。ほかの名前の値はログに出ない
+    get(addr, "/api/admin/geocode?secret-query=1&q=x").await;
+    // 更新ルートへの GET は現行でも静的のホワイトリストに当たらず 403（ルートのテンプレートは付かない）
+    get(addr, "/api/admin/secret-route").await;
     // 管理画面の読み取り API。クエリの値（検索語・不正な値）はログに出ない
     get(addr, "/api/admin/photos?filter=secret-filter&page=2").await;
     get(addr, "/api/admin/photos?page=secret-page").await; // 400
@@ -118,7 +121,7 @@ async fn access_log_has_only_method_route_status_and_time() {
         "GET /vendor/{*path} 404",
         "GET /admin 200",
         "GET (unmatched) 403",
-        "GET /api/admin/{*path} 503",
+        "GET /api/admin/geocode 200",
         "GET /api/admin/photos 200",
         "GET /api/admin/photos 400",
         "GET /api/admin/status 200",
