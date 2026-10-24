@@ -288,7 +288,7 @@ heic-libheif = ["dep:libheif-rs"]
 | 縮小 | `cover`（`resize_exact`＋`Lanczos3`で拡大縮小し、中央を切り抜く）。背景は`thumbnail`で縮め、ぼかしてから`imageops::resize`の`Triangle`で拡大。前景は`resize_exact`の`Lanczos3`。いずれも`image`の関数 | `fast_image_resize`の`CatmullRom`（§3.2） |
 | ほかの処理 | 箱型ぼかし（自前）、暗くする、影、`tiny-skia`への合成（premultiplied変換） | ICCからsRGBへの変換（`moxcms`） |
 | 出力 | メモリ上の`Pixmap`（エンコードしない） | JPEG（`jpeg-encoder`、4:2:0、品質85） |
-| `image`の使い方 | `miharashi-render`・`miharashi-gpu`は既定のfeature、`miharashi-app`は`image = "0.25.10"` | `default-features = false`、`jpeg`だけ（§6） |
+| `image`の使い方 | 3 crateとも`image = "0.25.10"`を既定のfeatureで使う（`miharashi-gpu`はテスト用のdev-dependencyだけ） | `default-features = false`、`jpeg`だけ（§6） |
 
 ### 8.2 共有できる関数の有無
 
@@ -312,7 +312,7 @@ heic-libheif = ["dep:libheif-rs"]
 
 ### 8.4 miharashiに返せる知見
 
-- `image::imageops::resize`は、同じ`CatmullRom`の`fast_image_resize`より約14倍遅い（§3.2、GEOFRAMEの縮小での値）。miharashiの`cover`・背景の縮小・拡大は画面サイズで1枚ずつなので、困る水準かは測っていない。表示の切り替えで縮小が目立つなら、`fast_image_resize`への置き換えが選択肢になる。
+- `image::imageops::resize`は、同じ`CatmullRom`の`fast_image_resize`より約14倍遅い（§3.2、GEOFRAMEの縮小での値）。miharashiの`cover`・背景の縮小・拡大は画面サイズで1枚ずつなので、困る水準かは測っていない。また、miharashiは`Lanczos3`・`Triangle`を使うので、倍率はフィルタごとに測り直す必要がある。表示の切り替えで縮小が目立つなら、`fast_image_resize`への置き換えが選択肢になる。
 - `jpeg-encoder`の「4:2:0＋ハフマン最適化」の出力を、`image`のデコーダ（zune-jpeg 0.5.15）が正しく読めない（§3.2の「重要」）。miharashiは`image`でderivativeを読むので、GEOFRAMEの側でハフマン最適化を付けない。上流には報告していない。
 - ICCはmiharashiの`image`では使われない（§5.2）。GEOFRAMEがsRGBへ変換して書き出す前提で、表示側は何もしなくてよい。
 

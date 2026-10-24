@@ -19,7 +19,7 @@ Issue #54 と設計案をそのまま要求・設計として扱い、この文�
 | 静的ファイル | 管理画面（`app/static`・`app/vendor`）はバイナリへ埋め込む | 「バイナリ＋設定＋データ」で起動する受入条件のため |
 | 設定 | 現行の`GEOFRAME_*`環境変数名と`/etc/default/geoframe`を引き継ぐ | systemd unitと運用手順の差し替えを最小にする |
 | DB | 現行の`catalog.db`スキーマをそのまま読む。追加はテーブル・列の追加だけ（既存列は消さない） | 手動GPS・お気に入り・除外・回転を守る。旧Pythonへ戻せる状態をP5まで保つ |
-| 画像ライブラリ | P0の計測で決めた: miharashiと同じ`image = "0.25.10"`（JPEGの入出力）＋縮小・エンコードは専用crate（[画像PoC](image-poc.md)） | 知見の共有。HEICは`zune-heic`で純Rust・musl静的のまま扱える（実機のHEICでの確認はP2）。逃げ道の`libheif-rs`は依存を明示して既定では外す |
+| 画像ライブラリ | P0の計測で決めた: miharashiと同じ`image = "0.25.10"`（JPEGのデコードと向きの読み取り）＋縮小は`fast_image_resize`、エンコードは`jpeg-encoder`（[画像PoC](image-poc.md)） | 知見の共有。HEICは`zune-heic`で純Rust・musl静的のまま扱える（実機のHEICでの確認はP2）。逃げ道の`libheif-rs`は依存を明示して既定では外す |
 
 ## 2. 守ること（本番機の扱い）
 
@@ -71,7 +71,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - `GET /api/v1/photos`（並び・除外・タイトル・旅番号を現行どおり）、`/derivatives/`ほかの静的配信（ホワイトリスト、ドットファイル拒否、パストラバーサル防止、HEAD）、Host検査、管理画面ページ。
 - 管理画面が開く読み取りAPI（`/api/admin/status`・`/api/admin/photos`など）とヘルス確認。
 - systemd unit（現行と同じハードニング）、検証環境への配布スクリプト。
-- 受入: 検証環境で、比較用Pythonと`/api/v1/photos`のJSONを全件比較して一致すること、`/derivatives/`が同じバイト列を返すこと。miharashiの取得処理（`ureq`＋`serde_json`）が同じ形で読めること。
+- 受入: 検証環境で、比較用Pythonと`/api/v1/photos`のJSONを全件比較して一致すること、`/derivatives/`が同じバイト列を返すこと。miharashiの取得処理（`ureq`＋`serde_json`）が同じ形で読めること。さらに、検証環境でmiharashiの実プロセスの写真の取得先をRustへ向け、一覧の取得と写真の読み込みが続くこと（P0の設計案レビューで先送りした実クライアントでの確認）。
 
 ### P2: 写真取り込み（PR 3）
 
