@@ -13,7 +13,7 @@ AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ�
 |---|---|---|---|---|---|---|---|---|
 | T0.1 | 検証環境の用意: lxc-geoframeの旧版退避、SSH、本番データのコピー、比較用Python（`:8090`、AI・Drive無効） | AC1 | - | ops | 完了 | - | - | 比較用Python（main e0f15fe、`geoframe-pyref.service`）の`/api/v1/photos`は本番と同じ3,065件 |
 | T0.2 | 棚卸し`docs/rust-migration/inventory.md`: エンドポイント・DBテーブルと書き込み元・バックグラウンド処理・設定・E2Eシナリオ、各フェーズへの割当 | AC2 | - | quick | 完了 | 66ce058 | a0c2fca..fcea60b | レビュー（Opus）: 必須0、推奨4・参考3を反映（「ピアソン」は誤記でなく指摘不要） |
-| T0.3 | Cargo workspaceの骨組み（`crates/geoframe`）、CIにfmt・clippy・test、musl静的ビルドの可否と検証環境での起動確認 | AC5 | - | full | 実装中 | 8809e31 | | |
+| T0.3 | Cargo workspaceの骨組み（`crates/geoframe`）、CIにfmt・clippy・test、musl静的ビルドの可否と検証環境での起動確認 | AC5 | - | full | 完了 | 8809e31 | 06df8ad | musl静的（static-pie, 約4MB）で検証環境動作。レビュー（Sol）: 必須0。推奨「WAL DBの読み取りテスト」はT1.1へ回す |
 | T0.4 | 画像PoC: 実写真約100枚でデコード・EXIF向き・2560px・JPEG出力・HEICの計測、依存ライブラリの一覧。結果を文書へ（数値のみ） | AC5, AC7 | T0.3 | full | 未着手 | | | 原本の取得にDrive鍵を使う前にユーザー確認 |
 | T0.5 | `/api/v1/photos`のserde型・JSON Schema・合成DBの契約テスト | AC6, AC7 | T0.3 | full | 未着手 | | | |
 
@@ -21,7 +21,7 @@ AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ�
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T1.1 | 設定（`GEOFRAME_*`）、SQLite読み取り層、ログ方針、ヘルス確認 | AC5, AC7 | P0 | full | 未着手 | | | |
+| T1.1 | 設定（`GEOFRAME_*`）、SQLite読み取り層、ログ方針、ヘルス確認 | AC5, AC7 | P0 | full | 未着手 | | | T0.3レビューの推奨: 合成WAL DBで未チェックポイントのコミットが読めること・本体とWALを変えないことのテスト |
 | T1.2 | `GET /api/v1/photos`（除外・並び・タイトル・旅番号） | AC1, AC6 | T1.1 | full | 未着手 | | | |
 | T1.3 | 静的配信（ホワイトリスト・ドットファイル・トラバーサル・HEAD）、Host検査、管理画面ページ、静的ファイルの埋め込み | AC1, AC5 | T1.1 | full | 未着手 | | | |
 | T1.4 | 管理画面の読み取りAPI（`/api/admin/status`・`/api/admin/photos`ほか） | AC1 | T1.1 | full | 未着手 | | | |

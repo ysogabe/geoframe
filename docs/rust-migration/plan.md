@@ -102,7 +102,7 @@ Issue #54 と設計案をそのまま要求・設計として扱い、この文�
 ## 6. 未決事項（決める時期）
 
 - HEIC変換のバックエンドと配布形態 — P0の計測後
-- musl静的ビルドかglibcビルドか — P0
+- ~~musl静的ビルドかglibcビルドか — P0~~ → **musl静的ビルドを標準にする**（[ビルドと配布](build.md)。HEIC・DNS・アロケータを入れる段階で見直す）
 - 画像Embedding APIのJSON契約・CPU/GPU配置 — local-model-lab #93、P4の開始前
 - Embeddingインデックスの保存形式 — P4の開始前
 - 検証環境へのDrive鍵のコピー — P2の開始時にユーザーへ確認
