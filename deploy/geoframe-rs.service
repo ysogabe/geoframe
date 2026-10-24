@@ -28,6 +28,11 @@ StateDirectoryMode=0750
 # --- データルート ---
 Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe
 
+# Drive のサービスアカウント鍵（T2.4）。Python 版の unit と同じ場所。Rust は相対パスをカレント
+# ディレクトリ基準で読むので、unit で絶対パスを与える。鍵が無ければ Drive の段は通信せずに飛ばす。
+# GEOFRAME_INGEST が 0（既定）のときは、鍵があっても Drive には接続しない（段が動かない）。
+Environment=GEOFRAME_DRIVE_KEY=/var/lib/geoframe/drive_key.json
+
 # 撮影時刻はローカル時刻（naive）で比較・表示する。TZ 未設定（=UTC）だと 9 時間ずれる。
 # Rust 版は TZ を解釈せず libc の localtime に渡すだけなので、Python 版と同じく unit で
 # 明示する（docs/rust-migration/server.md §1.2）。

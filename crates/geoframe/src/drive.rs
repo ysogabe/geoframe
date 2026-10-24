@@ -175,7 +175,9 @@ impl DriveError {
     pub fn is_outage(&self) -> bool {
         match self {
             Self::Net(failure) => !matches!(failure, Failure::Timeout | Failure::Other),
-            Self::Status(code) => *code == 429 || *code >= 500,
+            // 401 は、取り直したトークンでも断られた（`authorized` が 1 回やり直したあと）。写真ではなく
+            // サービスアカウント側（スコープ・無効化）の問題
+            Self::Status(code) => *code == 401 || *code == 429 || *code >= 500,
             Self::Key(_) | Self::Jwt(_) | Self::TokenRejected(_) | Self::Stopped => true,
             _ => false,
         }

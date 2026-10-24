@@ -346,6 +346,7 @@ fn errors_never_carry_secrets_or_urls() {
     }
     assert!(DriveError::Status(429).is_outage());
     assert!(DriveError::Status(503).is_outage());
+    assert!(DriveError::Status(401).is_outage());
     assert!(!DriveError::Status(404).is_outage());
     assert!(!DriveError::Status(403).is_outage());
     assert!(DriveError::Net(Failure::Dns).is_outage());
@@ -1919,4 +1920,35 @@ fn only_the_original_download_gets_the_long_timeout() {
     e.stub.add_fault(slow("media"));
     let mut out = Vec::new();
     assert_eq!(session.download("t1", &mut out, 1000).unwrap(), 100);
+}
+
+#[test]
+fn a_401_that_survives_a_new_token_stops_the_stage_without_blaming_the_photos() {
+    // トークンを取り直しても断られる（サービスアカウント側の問題）。写真の失敗として記録しない
+    let e = env("drive-401");
+    e.listing(vec![jpeg("u1", "a.jpg", "m1"), jpeg("u2", "b.jpg", "m2")]);
+    e.stub.set_media("u1", fixture_jpeg("typical"));
+    e.stub.set_media("u2", fixture_jpeg("typical"));
+    e.index();
+    e.stub.add_fault(Box::new(|r| {
+        r.is_media().then(|| (401, "{}".to_string(), vec![]))
+    }));
+    let fetch = e.fetch_stage();
+    let StageResult::Failed(message) = e.run(&fetch) else {
+        panic!("失敗のはず");
+    };
+    assert!(
+        message.contains("401") && message.contains("attempted=1"),
+        "{message}"
+    );
+    // 取り直しは 1 回だけ（最初の要求 + 取り直したあとの要求の 2 回で止まる）
+    assert_eq!(e.stub.media_requests().len(), 2);
+    assert_eq!(e.stub.tokens_issued(), 2);
+    // 写真の失敗として覚えていない: 直れば、待たずに取得できる
+    e.stub.clear_faults();
+    let counts = e.done(&fetch);
+    assert_eq!(
+        (get(&counts, "fetched"), get(&counts, "skipped_backoff")),
+        (2, 0)
+    );
 }
