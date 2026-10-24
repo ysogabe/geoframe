@@ -6,7 +6,7 @@
 
 ## 1. 結論
 
-**標準のビルドは`x86_64-unknown-linux-musl`の完全静的バイナリにする。** 現時点の依存（tokio・axum・rusqlite `bundled`・serde）は純Rustまたは同梱Cコードだけで、musl静的でビルドでき、検証環境（lxc-geoframe。Ubuntu 24.04、glibc 2.39）で動いた。
+**標準のビルドは`x86_64-unknown-linux-musl`の完全静的バイナリにする。** 現時点の依存（tokio・axum・rusqlite `bundled`・serde・tracing）は純Rustまたは同梱Cコードだけで、musl静的でビルドでき、検証環境（lxc-geoframe。Ubuntu 24.04、glibc 2.39）で動いた。
 
 ただし次の依存が入るときは、その都度この結論を見直す（§6）。
 
@@ -92,9 +92,9 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 | `crates/geoframe-imgpoc/` | 画像処理の技術PoC（`publish = false`）。本体の静的ビルドの検査には含めない。CIは別の手順で、`--features heic-zune,mimalloc`（libheifなし）のmusl静的ビルドと`file`／`ldd`の検査だけを行う。結果は[image-poc.md](image-poc.md) |
 | `geoframe --version` | バージョンを出す |
 | `geoframe check-db <path>` | `photos`の行数とSQLiteのバージョンを出す。読み取り専用 |
-| `geoframe serve --listen <addr>` | `GET /healthz`が`{"ok":true}`を返す。SIGTERMで停止 |
+| `geoframe serve [--listen <addr>] [--data-dir <dir>]` | 読み取り専用のサーバー。P0では`GET /healthz`が`{"ok":true}`を返すだけだった。T1.1で、設定・DB読み取り層・ログ・DBを読めるかを返すヘルスを足した（[server.md](server.md)）。SIGTERMで停止 |
 
-依存は`tokio`・`axum`・`rusqlite`（`bundled`）・`serde`・`serde_json`。外部HTTPクライアントと`image`はまだ入れていない。SQLiteの呼び出しは`db::check_db_blocking`のように`spawn_blocking`で包み、tokioのworkerを塞がない形にした（P1以降もこの形に揃える）。
+依存は`tokio`・`axum`・`rusqlite`（`bundled`）・`serde`・`serde_json`、T1.1で`tracing`・`tracing-subscriber`（どちらも純Rust。`env-filter`・時刻・色の機能は入れない）。外部HTTPクライアントと`image`はまだ入れていない。SQLiteの呼び出しは`db::Catalog::read`で`spawn_blocking`に出し、tokioのworkerを塞がない形にした（P1以降もこの形に揃える。[server.md](server.md) §2.2）。
 
 ## 6. 今後の注意と代替案
 

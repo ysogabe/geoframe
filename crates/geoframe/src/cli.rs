@@ -3,18 +3,26 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
+
+use crate::config::{Config, Overrides};
+use crate::db::Catalog;
+use crate::server::AppState;
 
 const USAGE: &str = "\
 使い方:
   geoframe --version
   geoframe check-db <catalog.db>        photos の行数と SQLite のバージョンを出す（読み取り専用）
-  geoframe serve --listen <addr:port>   GET /healthz だけを返すサーバーを起動する";
+  geoframe serve [--listen <addr:port>] [--data-dir <dir>]
+                                        サーバーを起動する（読み取り専用。DB は <dir>/catalog.db）
+                                        設定は 起動引数 > 環境変数 GEOFRAME_* > 既定値 の順
+                                        （詳細は docs/rust-migration/server.md）";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Version,
     CheckDb(PathBuf),
-    Serve(SocketAddr),
+    Serve(Overrides),
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
@@ -29,23 +37,25 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             Ok(Command::CheckDb(PathBuf::from(path)))
         }
         Some("serve") => {
-            let mut listen = None;
+            let mut overrides = Overrides::default();
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--listen" => {
                         let value = args.next().ok_or("--listen に値が要ります")?;
-                        listen = Some(
+                        overrides.listen = Some(
                             value
                                 .parse::<SocketAddr>()
                                 .map_err(|e| format!("--listen の値 {value:?} が不正です: {e}"))?,
                         );
                     }
+                    "--data-dir" => {
+                        let value = args.next().ok_or("--data-dir に値が要ります")?;
+                        overrides.data_dir = Some(PathBuf::from(value));
+                    }
                     other => return Err(format!("serve の引数 {other:?} は不明です")),
                 }
             }
-            Ok(Command::Serve(
-                listen.ok_or("serve には --listen が要ります")?,
-            ))
+            Ok(Command::Serve(overrides))
         }
         Some(other) => Err(format!("不明なコマンド {other:?}")),
         None => Err("コマンドがありません".into()),
@@ -76,24 +86,55 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Command::Serve(addr) => {
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(e) => {
-                    eprintln!("geoframe: tokio を起動できません: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            match runtime.block_on(crate::server::serve(addr)) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("geoframe: サーバーが異常終了しました: {e}");
-                    ExitCode::FAILURE
-                }
-            }
+        Command::Serve(overrides) => serve(&overrides),
+    }
+}
+
+fn serve(overrides: &Overrides) -> ExitCode {
+    let config = match Config::load(|key| std::env::var(key).ok(), overrides) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("geoframe: 設定が不正です: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    crate::logging::init(config.log_level);
+    tracing::info!(
+        "geoframe {} を起動します: {}",
+        env!("CARGO_PKG_VERSION"),
+        config.log_summary()
+    );
+
+    // 起動時の DB の確認。開けない・スキーマが古いときは起動しない（設定の誤りや配備の誤りを、
+    // 503 を返し続けるプロセスに隠さず、systemd の失敗として見せる）
+    let catalog = match Catalog::open(&config.db_path()) {
+        Ok(catalog) => catalog,
+        Err(e) => {
+            tracing::error!(
+                "{e}（GEOFRAME_DATA_DIR を確認してください。DB のあるディレクトリには書き込める必要があります）"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => {
+            tracing::error!("tokio を起動できません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let state = AppState {
+        config: Arc::new(config),
+        catalog,
+    };
+    match runtime.block_on(crate::server::serve(state)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("サーバーが異常終了しました: {e}");
+            ExitCode::FAILURE
         }
     }
 }
@@ -115,8 +156,20 @@ mod tests {
         );
         assert_eq!(
             p(&["serve", "--listen", "127.0.0.1:18080"]),
-            Ok(Command::Serve("127.0.0.1:18080".parse().unwrap()))
+            Ok(Command::Serve(Overrides {
+                listen: Some("127.0.0.1:18080".parse().unwrap()),
+                data_dir: None,
+            }))
         );
+        assert_eq!(
+            p(&["serve", "--data-dir", "/srv/x", "--listen", "[::1]:9"]),
+            Ok(Command::Serve(Overrides {
+                listen: Some("[::1]:9".parse().unwrap()),
+                data_dir: Some(PathBuf::from("/srv/x")),
+            }))
+        );
+        // 引数なしでも起動できる（環境変数と既定値で決まる）
+        assert_eq!(p(&["serve"]), Ok(Command::Serve(Overrides::default())));
     }
 
     #[test]
@@ -125,7 +178,9 @@ mod tests {
         assert!(p(&["nope"]).is_err());
         assert!(p(&["check-db"]).is_err());
         assert!(p(&["check-db", "a", "b"]).is_err());
-        assert!(p(&["serve"]).is_err());
+        assert!(p(&["serve", "--listen"]).is_err());
         assert!(p(&["serve", "--listen", "bad"]).is_err());
+        assert!(p(&["serve", "--data-dir"]).is_err());
+        assert!(p(&["serve", "--port", "1"]).is_err());
     }
 }
