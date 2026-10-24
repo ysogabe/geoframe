@@ -609,6 +609,6 @@ n100でビルドしたmusl静的バイナリ（`static-pie linked`、`ldd`は`st
 | --- | --- |
 | (a) 印あり・`geoframe-server`は未導入（`LoadState=not-found`）で`GEOFRAME_INGEST=1`（drop-in） | 今までどおり起動。ログは`[guard] 検証環境の印を確認しました。geoframe-server.service は 未導入です`→`[db] スキーマは最新です`→サイクル完了（表示可能5288／全6535）。`.dump`のSHA-256は配布前と一致。**unitの制限下でも`systemctl show`が動いた** |
 | (b) 印を`staging.off`へ改名して起動 | `ERROR 検証環境の印（…）が無いので…`で終了コード2、`failed`、`NRestarts`は0（再起動ループにならない）。**置き場のファイル一覧・`.dump`は変わらず、開いたままの`.dl_*`（`derivatives/`に置いた）も消えない**。印を戻すと取り込みが通り、`.dl_*`は掃除された（対照） |
-| (c) 印あり・`geoframe-server.service`（確認用のダミーunit）を`active`にして起動 | `ERROR Python 版（geoframe-server.service）が非稼働と確認できない（状態: active）…`で終了コード2、置き場は変わらず、`.dl_*`も残る。確認後、ダミーunitは止めて撤去（`LoadState=not-found`に戻した） |
+| (c) 印あり・`geoframe-server.service`（確認用のダミーunit）を`active`にして起動 | `ERROR Python 版（geoframe-server.service）が非稼働と確認できない（状態: active）…`で終了コード2、置き場は変わらず、開いたままの`.dl_*`も消えない（`sudo test -e`で確認）。確認後、ダミーunitは止めて撤去（`LoadState=not-found`に戻した） |
 | 比較用Python | `geoframe-pyref.service`（別データ・別ポート）が`active`でも、判定は`geoframe-server.service`だけを見るので通る（(a)） |
 | 後片付け | drop-inを外して`ingest=0`（`取り込みは無効です`）に戻し、`/healthz`は200、`.dump`のSHA-256は配布前と一致。印は戻してある |
