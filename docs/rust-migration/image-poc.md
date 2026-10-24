@@ -274,7 +274,49 @@ heic-libheif = ["dep:libheif-rs"]
 - **本番に近い負荷**: 本番の約6,500枚の一括再生成の時間とメモリ、実機のJPEG原本（拡大＋ノイズではないもの）でのデコード時間。
 - **`jobs`の既定値**と、`zune-heic`がHEIC1枚で2コアを使うことを考えた、同時処理枚数の決め方。
 
-## 8. 再現手順
+## 8. miharashiとの共有
+
+設計案の「Rust採用の理由とmiharashiとの共有方針」への、P0時点の整理。読んだのはmiharashi 1bc73a6の`crates/miharashi-render/src/photo.rs`・`crates/miharashi-app/src/photos.rs`と各`Cargo.toml`。
+
+### 8.1 処理の違い
+
+| | miharashi（表示） | GEOFRAME（derivative生成） |
+| --- | --- | --- |
+| 目的 | 画面サイズ（例: 1920×1080）の1フレームを作る | 長辺2560pxのJPEGを1枚ずつ書き出す |
+| 入力 | GEOFRAMEの`/derivatives/`のJPEG/PNG（`image::load_from_memory`）。HEICは読まない | 原本のJPEG/HEIC |
+| 向き | 扱わない（`orientation`・`apply_orientation`の呼び出しなし）。derivativeは補正済みの前提 | EXIFのOrientationを読んで当てる（HEICは当てない） |
+| 縮小 | `cover`（`resize_exact`＋`Lanczos3`で拡大縮小し、中央を切り抜く）。背景は`thumbnail`で縮め、ぼかしてから`imageops::resize`の`Triangle`で拡大。前景は`resize_exact`の`Lanczos3`。いずれも`image`の関数 | `fast_image_resize`の`CatmullRom`（§3.2） |
+| ほかの処理 | 箱型ぼかし（自前）、暗くする、影、`tiny-skia`への合成（premultiplied変換） | ICCからsRGBへの変換（`moxcms`） |
+| 出力 | メモリ上の`Pixmap`（エンコードしない） | JPEG（`jpeg-encoder`、4:2:0、品質85） |
+| `image`の使い方 | `miharashi-render`・`miharashi-gpu`は既定のfeature、`miharashi-app`は`image = "0.25.10"` | `default-features = false`、`jpeg`だけ（§6） |
+
+### 8.2 共有できる関数の有無
+
+**今の時点で、そのまま共有できる関数はない。** 重なるのは「`image`でJPEGを読む」1行だけで、残りは目的が違う。
+
+- 表示側の`cover`・`blurred_background`・`compose_image`は、画面のフレームを作る処理で、GEOFRAMEには要らない。`tiny-skia`・レイアウトにも結び付いている。
+- GEOFRAME側の向き補正・ICC変換・JPEGエンコードは、miharashiには要らない。
+- 縮小は同じ「Lanczos系のリサイズ」だが、GEOFRAMEは`fast_image_resize`、miharashiは`image`と別のcrateを選んでいる。入れ替えると、どちらかの速度か画質の前提が変わる。
+
+### 8.3 共有を考える候補
+
+設計案の「共有できる候補」（写真フィードの型、日時・位置の正規化、GPU・画面に依らない小さな関数）と照らす。
+
+| 候補 | 今の状況 | 方針 |
+| --- | --- | --- |
+| 写真フィードの型（`/api/v1/photos`） | GEOFRAMEは`geoframe::feed`の型と契約テスト、miharashiは`serde_json::Value`から1フィールドずつ読む（`list_geoframe`）。型の共有はなく、読み方の写しを契約テストで持つ（`photo_feed_miharashi.rs`） | 契約の変更で双方の修正が繰り返されるようになったら、型だけの小さなcrateにする |
+| 日時・位置の正規化 | miharashiは`parse_taken`・`taken_labels`で表示用に解釈、GEOFRAMEは`is_time`で検査。目的が違う | 同じ規則が両方に実装されたら考える |
+| 画像の読み込み・縮小・EXIF | 上のとおり重ならない | 共有しない。P2で本体へ移すときに再検討 |
+
+**共有crateにするかは、実際の重複が出てから決める**（設計案の方針どおり。今は新しいcrateもリポジトリも作らない）。P2で画像処理を本体へ移すときに、改めて検討する。
+
+### 8.4 miharashiに返せる知見
+
+- `image::imageops::resize`は、同じ`CatmullRom`の`fast_image_resize`より約14倍遅い（§3.2、GEOFRAMEの縮小での値）。miharashiの`cover`・背景の縮小・拡大は画面サイズで1枚ずつなので、困る水準かは測っていない。表示の切り替えで縮小が目立つなら、`fast_image_resize`への置き換えが選択肢になる。
+- `jpeg-encoder`の「4:2:0＋ハフマン最適化」の出力を、`image`のデコーダ（zune-jpeg 0.5.15）が正しく読めない（§3.2の「重要」）。miharashiは`image`でderivativeを読むので、GEOFRAMEの側でハフマン最適化を付けない。上流には報告していない。
+- ICCはmiharashiの`image`では使われない（§5.2）。GEOFRAMEがsRGBへ変換して書き出す前提で、表示側は何もしなくてよい。
+
+## 9. 再現手順
 
 検証環境で、本番のコピーは読むだけにし、作業は`/var/tmp/`の下（mode 0700）で行った。計測が終わったら、入力・出力・一時バイナリ・使い捨てのvenvを全て消した。
 

@@ -4,6 +4,7 @@
 //! miharashi の `crates/miharashi-app/src/photos.rs`（`Catalog::list_geoframe`）と
 //! `album.rs`（`eligible`・`parse_time`）を写したもの。miharashi 側の読み方が変わったら、
 //! ここと docs/architecture/photo-feed-contract.md を直す。
+//! 写した時点の miharashi のコミットは 1bc73a6。
 //!
 //! 写し元の要点:
 //! - 応答は配列。配列でなければ失敗。
