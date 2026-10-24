@@ -28,8 +28,10 @@ pub use derivative::{
 pub use error::{DecodeClass, HeicFailure, ImageError};
 pub use exif::{ExifInfo, Format, PhotoMeta, norm_time};
 
-/// 取り込む拡張子（小文字、ドット付き）。Python の `EXTS` は HEIC を `pillow_heif` があるときだけ含める
-/// （本番は入っている）。Rust は HEIC を内蔵しているので常に含める。
+/// 取り込む拡張子（小文字、ドット付き）。`.tif`・`.tiff` は通常の TIFF だけで、**BigTIFF は非対応**
+/// （Pillow は開けるが、Rust は [`ImageError::BigTiff`]。本番のコピーに TIFF は 0 件）。
+/// Python の `EXTS` は HEIC を `pillow_heif` があるときだけ含める（本番は入っている）。
+/// Rust は HEIC を内蔵しているので常に含める。
 pub const EXTS: [&str; 7] = [".jpg", ".jpeg", ".png", ".tif", ".tiff", ".heic", ".heif"];
 
 /// 拡張子が取り込み対象か（Python の `p.suffix.lower() in EXTS`）。
@@ -64,7 +66,7 @@ pub fn extract_exif_info(path: &Path) -> Result<ExifInfo, ImageError> {
 
 /// バイト列から読む。
 pub fn exif_info_from_bytes(bytes: &[u8]) -> Result<ExifInfo, ImageError> {
-    let format = Format::sniff(bytes).ok_or(ImageError::NotAnImage)?;
+    let format = Format::sniff(bytes).ok_or_else(|| derivative::not_an_image(bytes))?;
     let heic_exif;
     let heic_ref = if format == Format::Heic {
         heic_exif = heic::read_header(bytes)?.exif;

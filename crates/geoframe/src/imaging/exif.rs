@@ -551,6 +551,11 @@ pub enum Format {
 }
 
 impl Format {
+    /// BigTIFF（`II+\0`・`MM\0+`）か。これは対応しない（[`super::ImageError::BigTiff`]）。
+    pub fn is_bigtiff(bytes: &[u8]) -> bool {
+        bytes.starts_with(b"II+\0") || bytes.starts_with(b"MM\0+")
+    }
+
     /// 先頭のバイトから種類を決める（Pillow も内容で決める）。
     pub fn sniff(bytes: &[u8]) -> Option<Self> {
         if bytes.starts_with(&[0xFF, 0xD8]) {

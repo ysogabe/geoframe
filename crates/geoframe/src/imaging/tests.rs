@@ -1042,3 +1042,30 @@ fn どこで切れたheicも失敗にする() {
         }
     }
 }
+
+#[test]
+fn bigtiffは専用のエラーで断る() {
+    // 合成: BigTIFF のヘッダ（`II+\0` / `MM\0+`、バイトサイズ 8、0、IFD0 のオフセット）だけ。Pillow は開けるが非対応
+    for header in [
+        &b"II+\0\x08\0\0\0\x10\0\0\0\0\0\0\0"[..],
+        b"MM\0+\0\x08\0\0\0\0\0\0\0\0\0\x10",
+    ] {
+        assert!(matches!(render(header, 0), Err(ImageError::BigTiff)));
+        assert!(matches!(
+            exif_info_from_bytes(header),
+            Err(ImageError::BigTiff)
+        ));
+        assert!(!Format::sniff(header).is_some());
+    }
+    // 通常の TIFF（`*`）は従来どおり
+    assert!(render(&tiff_image(20, 10, 1), 0).is_ok());
+    // 文面は定型で、画像でないものとは区別できる
+    assert_eq!(
+        ImageError::BigTiff.to_string(),
+        "BigTIFFには対応していません"
+    );
+    assert!(matches!(
+        render(b"PK\x03\x04", 0),
+        Err(ImageError::NotAnImage)
+    ));
+}

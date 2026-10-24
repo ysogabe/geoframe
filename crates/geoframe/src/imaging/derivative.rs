@@ -464,13 +464,17 @@ fn encode_jpeg(r: &Raster) -> Result<Vec<u8>, ImageError> {
 
 /// バイト列から derivative の JPEG を作る。`rotation` は時計回りの角度（0・90・180・270。負・360 超は剰余）。
 pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
+    // ファイルから読む経路は [`read_limited`] が見るが、バイト列を直接渡す呼び出しにも同じ上限をかける
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageError::FileTooLarge);
+    }
     let rot = rotation.rem_euclid(360);
     if rot % 90 != 0 {
         return Err(ImageError::BadRotation);
     }
     let manual = manual_orientation(rot as u16);
 
-    let format = Format::sniff(bytes).ok_or(ImageError::NotAnImage)?;
+    let format = Format::sniff(bytes).ok_or_else(|| not_an_image(bytes))?;
     let mut decoded = match format {
         Format::Jpeg => decode_jpeg(bytes)?,
         Format::Png | Format::Tiff => decode_with_image(format, bytes)?,
@@ -531,8 +535,17 @@ pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
     Ok(Rendered { jpeg, info })
 }
 
-/// ファイルを読む（大きさの上限つき）。
-fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
+/// 種類を決められなかったバイト列の失敗: BigTIFF は専用のエラー、それ以外は画像でない。
+pub(super) fn not_an_image(bytes: &[u8]) -> ImageError {
+    if Format::is_bigtiff(bytes) {
+        ImageError::BigTiff
+    } else {
+        ImageError::NotAnImage
+    }
+}
+
+/// ファイルを読む（大きさの上限つき）。`img-probe` も使う。
+pub(super) fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
     let file = fs::File::open(path)?;
     let len = file.metadata()?.len();
     if len > MAX_INPUT_BYTES {
@@ -687,6 +700,32 @@ mod tests {
             .collect();
         v.sort();
         v
+    }
+
+    #[test]
+    fn 大きすぎる入力は読まずに断る() {
+        let tmp = TempDir::new("read-limit");
+        let big = tmp.path().join("big.jpg");
+        // 疎なファイル（中身は読まれない）
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_INPUT_BYTES + 1)
+            .unwrap();
+        assert!(matches!(read_limited(&big), Err(ImageError::FileTooLarge)));
+        // ちょうど上限なら読む（画像ではないので別の失敗になる）
+        let ok = tmp.path().join("ok.bin");
+        fs::File::create(&ok).unwrap().set_len(1 << 20).unwrap();
+        assert_eq!(read_limited(&ok).unwrap().len(), 1 << 20);
+        // バイト列を直接渡す経路にも同じ上限がかかる
+        let bytes = vec![0u8; usize::try_from(MAX_INPUT_BYTES).unwrap() + 1];
+        assert!(matches!(render(&bytes, 0), Err(ImageError::FileTooLarge)));
+        // `img-probe`（--out なし）も読む前に断る
+        let args = crate::imaging::probe::ProbeArgs {
+            files: vec![big],
+            jobs: 1,
+            ..Default::default()
+        };
+        let _ = crate::imaging::probe::run(&args);
     }
 
     #[test]

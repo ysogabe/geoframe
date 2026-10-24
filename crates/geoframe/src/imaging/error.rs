@@ -39,6 +39,8 @@ pub enum ImageError {
     Io(io::ErrorKind),
     /// 内容が JPEG・PNG・TIFF・HEIC のどれでもない。
     NotAnImage,
+    /// BigTIFF（`II+\0`・`MM\0+`）。Pillow は開けるが、Rust は対応しない（本番の TIFF は 0 件）。
+    BigTiff,
     /// ファイルが大きすぎてメモリに載せない。
     FileTooLarge,
     /// 画素数が上限を超える（Pillow の `DecompressionBombError` と同じ考え方）。
@@ -71,6 +73,7 @@ impl fmt::Display for ImageError {
         match self {
             Self::Io(kind) => write!(f, "ファイルの入出力に失敗しました（{kind}）"),
             Self::NotAnImage => f.write_str("画像として読めません（形式が不明）"),
+            Self::BigTiff => f.write_str("BigTIFFには対応していません"),
             Self::FileTooLarge => f.write_str("ファイルが大きすぎます"),
             Self::TooManyPixels { width, height } => {
                 write!(f, "画素数が上限を超えています（{width}x{height}）")

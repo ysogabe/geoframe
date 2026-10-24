@@ -10,6 +10,7 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use super::derivative::read_limited;
 use super::{DerivativeInfo, IccOutcome, ImageError, make_derivative};
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -116,9 +117,8 @@ pub fn run(args: &ProbeArgs) -> ExitCode {
                     let result = if args.out.is_some() {
                         make_derivative(src, &dest, args.rotation)
                     } else {
-                        // 書き出さない: 読んで変換するだけ
-                        std::fs::read(src)
-                            .map_err(ImageError::from)
+                        // 書き出さない: 読んで変換するだけ（読み込みには `make_derivative` と同じ大きさの上限）
+                        read_limited(src)
                             .and_then(|bytes| super::render(&bytes, args.rotation).map(|r| r.info))
                     };
                     let ms = t.elapsed().as_secs_f64() * 1000.0;
