@@ -16,6 +16,7 @@ mod derivative;
 mod error;
 pub mod exif;
 pub mod heic;
+mod heic_guard;
 pub mod probe;
 
 use std::path::Path;

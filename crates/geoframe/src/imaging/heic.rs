@@ -18,6 +18,7 @@ use zune_heic::zune_core::options::DecoderOptions;
 use zune_heic::{HeicErrors, HeifDecoder};
 
 use super::error::{HeicFailure, ImageError};
+use super::heic_guard;
 
 /// `mdat` の上限。既定の 16 MiB は大きい HEIC（約 48MP は約 28 MB）を拒否する。ファイルはまるごとメモリに読む。
 const MAX_MDAT: usize = 128 << 20;
@@ -45,14 +46,25 @@ fn options() -> DecoderOptions {
 }
 
 fn fail(err: &HeicErrors, bytes: &[u8]) -> ImageError {
+    failure(classify(err), bytes)
+}
+
+fn failure(class: &'static str, bytes: &[u8]) -> ImageError {
     ImageError::Heic(Box::new(HeicFailure {
-        class: classify(err),
+        class,
         structure: HeicStructure::probe(bytes),
     }))
 }
 
+/// デコーダに渡す前の、宣言された長さ・寸法の検査（[`heic_guard`]）。`zune-heic` は宣言値で先に確保するので、
+/// 偽った小さなファイルでプロセスが落ちる。
+fn guard(bytes: &[u8], max_pixels: u64, decode: bool) -> Result<(), ImageError> {
+    heic_guard::check(bytes, max_pixels, decode).map_err(|class| failure(class, bytes))
+}
+
 /// ヘッダ（寸法と EXIF）だけ読む。デコードはしない。
 pub fn read_header(bytes: &[u8]) -> Result<HeicHeader, ImageError> {
+    guard(bytes, super::MAX_INPUT_PIXELS, false)?;
     let mut dec = HeifDecoder::new_with_options(ZCursor::new(bytes), options());
     dec.decode_headers().map_err(|e| fail(&e, bytes))?;
     let (w, h) = (dec.width(), dec.height());
@@ -74,6 +86,7 @@ pub fn read_header(bytes: &[u8]) -> Result<HeicHeader, ImageError> {
 
 /// デコードする。`max_pixels` を超える寸法はデコードの前に断る。
 pub fn decode(bytes: &[u8], max_pixels: u64) -> Result<HeicImage, ImageError> {
+    guard(bytes, max_pixels, true)?;
     let mut dec = HeifDecoder::new_with_options(ZCursor::new(bytes), options());
     dec.decode_headers().map_err(|e| fail(&e, bytes))?;
     if let (Some(w), Some(h)) = (dec.width(), dec.height()) {
@@ -273,7 +286,7 @@ fn fourcc(b: &[u8]) -> String {
 }
 
 /// ボックスの一覧（`(種別, 本体)`）。壊れていれば手前で止める。
-fn boxes(mut data: &[u8]) -> Vec<([u8; 4], &[u8])> {
+pub(super) fn boxes(mut data: &[u8]) -> Vec<([u8; 4], &[u8])> {
     let mut out = Vec::new();
     while data.len() >= 8 {
         let size = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
@@ -298,14 +311,36 @@ fn boxes(mut data: &[u8]) -> Vec<([u8; 4], &[u8])> {
     out
 }
 
-fn be16(b: &[u8], o: usize) -> Option<u32> {
+pub(super) fn be16(b: &[u8], o: usize) -> Option<u32> {
     Some(u32::from(u16::from_be_bytes(
         b.get(o..o + 2)?.try_into().ok()?,
     )))
 }
 
-fn be32(b: &[u8], o: usize) -> Option<u32> {
+pub(super) fn be32(b: &[u8], o: usize) -> Option<u32> {
     Some(u32::from_be_bytes(b.get(o..o + 4)?.try_into().ok()?))
+}
+
+/// `iinf` の本体から、項目の ID と種類（`infe` の version 2・3）。壊れていれば手前で止める。
+pub(super) fn item_types(iinf: &[u8]) -> Vec<(u32, [u8; 4])> {
+    let mut out = Vec::new();
+    let version = iinf.first().copied().unwrap_or(0);
+    let start = if version == 0 { 6 } else { 8 };
+    for (k, infe) in iinf.get(start..).map(boxes).unwrap_or_default() {
+        if &k != b"infe" {
+            continue;
+        }
+        let v = infe.first().copied().unwrap_or(0);
+        let (id, type_at) = match v {
+            2 => (be16(infe, 4), 4 + 2 + 2),
+            3 => (be32(infe, 4), 4 + 4 + 2),
+            _ => continue,
+        };
+        if let (Some(id), Some(t)) = (id, infe.get(type_at..type_at + 4)) {
+            out.push((id, [t[0], t[1], t[2], t[3]]));
+        }
+    }
+    out
 }
 
 impl HeicStructure {
@@ -338,25 +373,11 @@ impl HeicStructure {
             });
 
         // iinf: 項目の ID と種類
-        let mut item_types: Vec<(u32, [u8; 4])> = Vec::new();
-        if let Some((_, iinf)) = children.iter().find(|(k, _)| k == b"iinf") {
-            let version = iinf.first().copied().unwrap_or(0);
-            let start = if version == 0 { 6 } else { 8 };
-            for (k, infe) in iinf.get(start..).map(boxes).unwrap_or_default() {
-                if &k != b"infe" {
-                    continue;
-                }
-                let v = infe.first().copied().unwrap_or(0);
-                let (id, type_at) = match v {
-                    2 => (be16(infe, 4), 4 + 2 + 2),
-                    3 => (be32(infe, 4), 4 + 4 + 2),
-                    _ => continue,
-                };
-                if let (Some(id), Some(t)) = (id, infe.get(type_at..type_at + 4)) {
-                    item_types.push((id, [t[0], t[1], t[2], t[3]]));
-                }
-            }
-        }
+        let item_types = children
+            .iter()
+            .find(|(k, _)| k == b"iinf")
+            .map(|(_, iinf)| item_types(iinf))
+            .unwrap_or_default();
         s.items = item_types.len();
         if let Some(pid) = primary_id
             && let Some((_, t)) = item_types.iter().find(|(id, _)| *id == pid)
