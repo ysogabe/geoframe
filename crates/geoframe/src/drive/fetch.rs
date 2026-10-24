@@ -8,7 +8,10 @@
 //!   `GEOFRAME_FETCH_PER_CYCLE` 枚まで。
 //! - 原本は `DATA_DIR/tmp/.dl_<drive_id>` に落とし（`derivatives/` の外。静的配信の対象外）、
 //!   [`imaging::store_derivative`] で `derivatives/<drive_id>[.r<回転>].jpg` を作る。
-//! - **成功・失敗・パニックにかかわらず原本を消す**（EXIF・GPS 付きの原本を残さない。[`Original`] の `Drop`）。
+//! - **成功・失敗・パニックにかかわらず原本を消す**（EXIF・GPS 付きの原本を残さない）。通常の終了経路
+//!   （成功・写真の失敗）では [`Original::remove`] で**明示的に消して結果を確かめ**、消せなかったら
+//!   固定の文言と件数（`original_remove_failed`）で報告する。[`Original`] の `Drop` は、早期 `return`・パニック・
+//!   停止の合図で抜けたときの補助（結果は捨てる）。
 //!
 //! # 現行との違い（server.md §0）
 //!
@@ -89,15 +92,32 @@ impl Candidate {
     }
 }
 
-/// 原本の一時ファイル。**落とされたら（成功・失敗・パニックのどれでも）消す**。自分が新規作成に成功した
-/// ものだけを持つ（既にあったファイル・リンクは消さない）。
+/// 原本の一時ファイル。自分が新規作成に成功したものだけを持つ（既にあったファイル・リンクは消さない）。
+/// 通常の終了経路は [`Original::remove`] で消して結果を確かめる。**落とされたとき（早期 `return`・パニック）に
+/// まだ消えていなければ、`Drop` が消す**（結果は捨てる）。
 pub(super) struct Original {
     path: PathBuf,
+    removed: bool,
+}
+
+impl Original {
+    /// 原本を消す。既に無ければ成功。消せなかったときは `Err` で、`Drop` がもう一度試す。
+    pub(super) fn remove(&mut self) -> io::Result<()> {
+        match fs::remove_file(&self.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        self.removed = true;
+        Ok(())
+    }
 }
 
 impl Drop for Original {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if !self.removed {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -114,6 +134,7 @@ pub(super) fn create_original(path: &Path) -> io::Result<(fs::File, Original)> {
         file,
         Original {
             path: path.to_path_buf(),
+            removed: false,
         },
     ))
 }
@@ -122,6 +143,20 @@ pub(super) fn create_original(path: &Path) -> io::Result<(fs::File, Original)> {
 struct Fetched {
     format: Format,
     icc_dropped: bool,
+}
+
+/// 1 枚の取得の入力（検査を通した名前・パス）。
+struct Job {
+    drive_id: String,
+    rotation: i32,
+    name: String,
+    tmp: PathBuf,
+}
+
+/// 1 枚の結果。`original_left` は、原本の一時ファイルを消せなかった（EXIF・GPS 付きのファイルが残っている）。
+struct Attempt {
+    result: Result<Fetched, Fail>,
+    original_left: bool,
 }
 
 /// 1 枚の失敗。
@@ -206,35 +241,75 @@ impl FetchDerivatives {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
-    /// 1 枚。原本を落とし、derivative を作り、`display`・`fetched_at` を書く。原本は必ず消える。
+    /// 1 枚。原本を落とし、derivative を作り、`display`・`fetched_at` を書く。原本は**必ず消す**（成功・失敗の
+    /// どちらでも、ここで明示的に消して結果を [`Attempt::original_left`] に返す。パニックなら `Original` の `Drop`）。
     fn fetch_one(
         session: &Session<'_>,
         data: &DataDir,
         writer: &crate::writer::Writer,
         candidate: &Candidate,
-    ) -> Result<Fetched, Fail> {
-        let Some(drive_id) = candidate.drive_id.as_deref() else {
+    ) -> Attempt {
+        let (job, file, mut original) = match Self::prepare(data, candidate) {
+            Ok(prepared) => prepared,
+            // 原本を作れなかった（名前の不正・既にあるファイル）なら、消すものは無い
+            Err(fail) => {
+                return Attempt {
+                    result: Err(fail),
+                    original_left: false,
+                };
+            }
+        };
+        let result = Self::download_and_store(session, data, writer, candidate.id, &job, file);
+        let original_left = original.remove().is_err();
+        Attempt {
+            result,
+            original_left,
+        }
+    }
+
+    /// 名前の検査と、原本の一時ファイルの新規作成。
+    fn prepare(data: &DataDir, candidate: &Candidate) -> Result<(Job, fs::File, Original), Fail> {
+        let Some(drive_id) = candidate.drive_id.clone() else {
             return Err(photo_fail("fail_other", "drive_id がありません"));
         };
         let rotation = i32::try_from(candidate.rotation.unwrap_or(0))
             .map_err(|_| photo_fail("fail_other", ImageError::BadRotation))?;
         // 名前の検査（ID が区切りを含まないこと）。保存先の検査は `store_derivative` が改めて行う
-        let name = imaging::derivative_name(drive_id, rotation)
+        let name = imaging::derivative_name(&drive_id, rotation)
             .map_err(|e| photo_fail("fail_other", ImageError::Path(e)))?;
         let tmp = data
-            .download_tmp(drive_id)
+            .download_tmp(&drive_id)
             .map_err(|e| photo_fail("fail_other", ImageError::Path(e)))?;
-        let (mut file, _original) =
+        let (file, original) =
             create_original(&tmp).map_err(|e| photo_fail("fail_io", ImageError::Io(e.kind())))?;
+        Ok((
+            Job {
+                drive_id,
+                rotation,
+                name,
+                tmp,
+            },
+            file,
+            original,
+        ))
+    }
+
+    fn download_and_store(
+        session: &Session<'_>,
+        data: &DataDir,
+        writer: &crate::writer::Writer,
+        id: i64,
+        job: &Job,
+        mut file: fs::File,
+    ) -> Result<Fetched, Fail> {
         session
-            .download(drive_id, &mut file, imaging::MAX_INPUT_BYTES)
+            .download(&job.drive_id, &mut file, imaging::MAX_INPUT_BYTES)
             .map_err(drive_fail)?;
         drop(file);
-        let stored = imaging::store_derivative(data, &tmp, &name, rotation)
+        let stored = imaging::store_derivative(data, &job.tmp, &job.name, job.rotation)
             .map_err(|e| photo_fail(image_fail_kind(&e), e))?;
         let now = crate::sysinfo::local_isoformat();
         let display = stored.display.clone();
-        let id = candidate.id;
         writer
             .call(move |conn| conn.execute(SET_DISPLAY, params![display, now, id]))
             .map_err(|e| Fail::Abort(StageError::from(e)))?;
@@ -242,7 +317,6 @@ impl FetchDerivatives {
             format: stored.info.format,
             icc_dropped: stored.info.icc == IccOutcome::Dropped,
         })
-        // `_original` がここで落とされ、原本が消える（`?` で抜けたときも、パニックでも同じ）
     }
 }
 
@@ -319,13 +393,24 @@ impl Stage for FetchDerivatives {
         let session = Session::new(&self.shared, ctx.http, ctx.stop, &ctx.config.drive_key);
         let mut tally: BTreeMap<&'static str, u64> = BTreeMap::new();
         let (mut attempted, mut fetched, mut icc_dropped) = (0u64, 0u64, 0u64);
+        let mut original_remove_failed = 0u64;
         let mut aborted: Option<StageError> = None;
         for candidate in &selected {
             if ctx.stop.is_stopped() {
                 break;
             }
             attempted += 1;
-            let outcome = Self::fetch_one(&session, &data, writer, candidate);
+            let attempt = Self::fetch_one(&session, &data, writer, candidate);
+            if attempt.original_left {
+                original_remove_failed += 1;
+                // 固定の文言と写真の行 ID だけ（パス・ファイル名は出さない）
+                tracing::warn!(
+                    "[fetch] 原本の一時ファイルを削除できませんでした（id={}）。EXIF・GPS が残っています。\
+                     次の起動時の掃除で消えますが、tmp/ の権限を確かめてください",
+                    candidate.id
+                );
+            }
+            let outcome = attempt.result;
             let mut memo = self.failures.lock().unwrap_or_else(|e| e.into_inner());
             match outcome {
                 Ok(done) => {
@@ -353,6 +438,8 @@ impl Stage for FetchDerivatives {
         head.push(("attempted", attempted));
         head.push(("fetched", fetched));
         head.push(("icc_dropped", icc_dropped));
+        // 0 でないときは、原本（EXIF・GPS 付き）が tmp/ に残っている
+        head.push(("original_remove_failed", original_remove_failed));
         head.extend(tally);
         let counts = Counts(head);
         match aborted {

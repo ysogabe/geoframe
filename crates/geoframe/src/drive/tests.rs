@@ -2278,3 +2278,57 @@ fn dry_run_reports_the_hold_and_what_the_flag_would_do_without_writing() {
     assert_eq!(e.rows(), before);
     assert!(e.root().join("derivatives/d99.jpg").exists());
 }
+
+// ---------------------------------------------------------------------------
+// 原本の削除の失敗
+
+#[test]
+fn a_failed_removal_of_the_original_is_reported_for_success_and_for_failure() {
+    // 取得中（スタブが応答する間）に tmp/ を書き込み不可にして、削除を失敗させる。ファイルの削除は
+    // ディレクトリの書き込み権限が要るので、root 以外で動く試験でだけ成り立つ（CI・この機体は一般ユーザー）
+    for (tag, media, fetched, failed_kind) in [
+        ("ok", fixture_jpeg("typical"), 1, "ok_jpeg"),
+        ("broken", broken(), 0, "fail_not_image"),
+    ] {
+        let e = env("drive-rmfail");
+        e.listing(vec![jpeg("r1", "a.jpg", "m1")]);
+        e.stub.set_media("r1", media);
+        e.index();
+        let tmp = e.root().join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        let locked = tmp.clone();
+        e.stub.add_fault(Box::new(move |r| {
+            if r.is_media() {
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            None
+        }));
+        let counts = e.done(&e.fetch_stage());
+        // 後始末（TempDir の削除が通るように、権限を戻す）
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(get(&counts, "original_remove_failed"), 1, "{tag}: {counts}");
+        assert_eq!(get(&counts, "fetched"), fetched, "{tag}: {counts}");
+        assert_eq!(get(&counts, failed_kind), 1, "{tag}: {counts}");
+        // 消せなかった原本は残っている（次の起動時の掃除の対象）
+        assert_eq!(e.tmp_leftovers(), [".dl_r1"], "{tag}");
+        // 文面にはパスもファイル名もない
+        let text = counts.to_string();
+        assert!(!text.contains("r1") && !text.contains(".dl_"), "{text}");
+    }
+}
+
+#[test]
+fn the_original_is_removed_explicitly_and_the_drop_only_covers_what_is_left() {
+    let dir = TempDir::new("drive-explicit");
+    let path = dir.path().join("o");
+    let (mut file, mut guard) = fetch::create_original(&path).unwrap();
+    std::io::Write::write_all(&mut file, b"secret").unwrap();
+    assert!(guard.remove().is_ok());
+    assert!(!path.exists());
+    // 既に無くても成功（二重に呼んでも落ちない）
+    assert!(guard.remove().is_ok());
+    // 消したあとに同じ名前で作られたファイルは、Drop が消さない（別の持ち主のもの）
+    fs::write(&path, b"someone else's").unwrap();
+    drop(guard);
+    assert!(path.exists());
+}
