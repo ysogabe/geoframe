@@ -108,7 +108,7 @@ def with_exif(jpeg: bytes, tiff: bytes) -> bytes:
     return jpeg[:2] + b"\xff\xe1" + struct.pack(">H", len(seg) + 2) + seg + jpeg[2:]
 
 
-def gps_ok(lat_ref="N", lon_ref="E", lat=((35, 1), (40, 1), (30, 1)), lon=((139, 1), (45, 1), (15, 1))):
+def gps_ok(lat_ref="N", lon_ref="E", lat=((12, 1), (34, 1), (30, 1)), lon=((78, 1), (9, 1), (10, 1))):
     g = {2: rationals(*lat), 4: rationals(*lon)}
     if lat_ref is not None:
         g[1] = ascii_(lat_ref)
@@ -129,26 +129,26 @@ CASES = [
     ("lowercase_refs_are_positive", {}, dto("2024:05:06 07:08:09"), gps_ok("s", "w"), True),
     ("unknown_refs_are_positive", {}, dto("2024:05:06 07:08:09"), gps_ok("X", "Y"), True),
     ("missing_refs_default_n_e", {}, dto("2024:05:06 07:08:09"), gps_ok(None, None), True),
-    ("only_latitude", {}, dto("2024:05:06 07:08:09"), {1: ascii_("N"), 2: rationals((35, 1), (0, 1), (0, 1))}, True),
-    ("only_longitude", {}, dto("2024:05:06 07:08:09"), {3: ascii_("E"), 4: rationals((139, 1), (0, 1), (0, 1))}, True),
+    ("only_latitude", {}, dto("2024:05:06 07:08:09"), {1: ascii_("N"), 2: rationals((12, 1), (0, 1), (0, 1))}, True),
+    ("only_longitude", {}, dto("2024:05:06 07:08:09"), {3: ascii_("E"), 4: rationals((78, 1), (0, 1), (0, 1))}, True),
     ("zero_zero", {}, dto("2024:05:06 07:08:09"),
      gps_ok(lat=((0, 1), (0, 1), (0, 1)), lon=((0, 1), (0, 1), (0, 1))), True),
     ("fractional_seconds", {}, dto("2024:05:06 07:08:09"),
-     gps_ok(lat=((35, 1), (40, 1), (3050, 100)), lon=((139, 1), (45, 1), (1534, 100))), True),
+     gps_ok(lat=((12, 1), (34, 1), (3050, 100)), lon=((78, 1), (45, 1), (1534, 100))), True),
     ("rounding_6_digits", {}, dto("2024:05:06 07:08:09"),
-     gps_ok(lat=((35, 1), (1, 1), (1, 7)), lon=((139, 1), (0, 1), (5, 1000))), True),
+     gps_ok(lat=((12, 1), (1, 1), (1, 7)), lon=((78, 1), (0, 1), (5, 1000))), True),
     ("out_of_range", {}, dto("2024:05:06 07:08:09"),
      gps_ok(lat=((95, 1), (0, 1), (0, 1)), lon=((200, 1), (0, 1), (0, 1))), True),
     ("denominator_zero", {}, dto("2024:05:06 07:08:09"),
-     gps_ok(lat=((35, 0), (40, 1), (30, 1))), True),
+     gps_ok(lat=((12, 0), (34, 1), (30, 1))), True),
     ("denominator_zero_seconds", {}, dto("2024:05:06 07:08:09"),
-     gps_ok(lat=((35, 1), (40, 1), (0, 0))), True),
+     gps_ok(lat=((12, 1), (34, 1), (0, 0))), True),
     ("two_components", {}, dto("2024:05:06 07:08:09"),
-     gps_ok(lat=((35, 1), (40, 1))), True),
+     gps_ok(lat=((12, 1), (34, 1))), True),
     ("four_components", {}, dto("2024:05:06 07:08:09"),
-     gps_ok(lat=((35, 1), (40, 1), (30, 1), (9, 1))), True),
+     gps_ok(lat=((12, 1), (34, 1), (30, 1), (9, 1))), True),
     ("lat_is_short", {}, dto("2024:05:06 07:08:09"),
-     {1: ascii_("N"), 2: short(35), 3: ascii_("E"), 4: rationals((139, 1), (0, 1), (0, 1))}, True),
+     {1: ascii_("N"), 2: short(12), 3: ascii_("E"), 4: rationals((78, 1), (0, 1), (0, 1))}, True),
     ("empty_gps_ifd", {}, dto("2024:05:06 07:08:09"), {}, True),
     # --- 撮影時刻: `36867 or 36868 or 306` の連鎖 ---
     ("time_digitized_when_original_empty", {}, {36867: ascii_(""), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
@@ -172,8 +172,8 @@ CASES = [
     ("time_no_nul", {}, {36867: (ASCII, b"2024:05:06 07:08:09")}, None, True),
     ("time_embedded_nul", {}, {36867: (ASCII, b"2024:05:06 07:08:09\0junk\0")}, None, True),
     ("time_only_nuls_falls_through", {}, {36867: (ASCII, b"\0\0\0\0\0"), 36868: ascii_("2023:01:02 03:04:05")}, None, True),
-    ("ref_embedded_nul", {}, None, {1: (ASCII, b"S\0X\0"), 2: rationals((35, 1), (0, 1), (0, 1)),
-                                    3: (ASCII, b"W\0"), 4: rationals((139, 1), (0, 1), (0, 1))}, True),
+    ("ref_embedded_nul", {}, None, {1: (ASCII, b"S\0X\0"), 2: rationals((12, 1), (0, 1), (0, 1)),
+                                    3: (ASCII, b"W\0"), 4: rationals((78, 1), (0, 1), (0, 1))}, True),
     ("time_wrong_type_short", {}, {36867: short(5)}, None, True),
     ("empty_ifd0", {}, None, None, True),
 ]

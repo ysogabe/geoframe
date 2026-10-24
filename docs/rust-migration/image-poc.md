@@ -230,6 +230,8 @@ HEVC（H.265）には特許プールがある。個人の家庭サーバーで�
 
 ## 6. 推奨構成（P2で使うcrateとfeature、配布形態）
 
+> **T2.2で本体に入れた。実際の依存と、この節からの変更点は§10.1**（`kamadak-exif`は使わず、JPEGは`zune-jpeg`を直接使い、`image`は`png`・`tiff`だけにした）。以下はPoCの時点の推奨。
+
 ```toml
 # crates/geoframe の画像処理（P2）。バージョンはPoCで測ったもの
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
@@ -258,6 +260,8 @@ heic-libheif = ["dep:libheif-rs"]
 - **musl標準のアロケータは遅い**（§3.5）。画像処理を入れるP2から`mimalloc`を付ける。
 
 ## 7. P2に残す確認事項
+
+> **T2.2の時点の状況は§10.4**。実機HEICの項目（グリッド・HDR・深度・Live Photo・向き・nclx・`clap`）は、Driveの鍵が検証環境に無いのでT2.4（Drive取り込みの受入）で確認する。EXIFの抽出、CMYK・グレースケール、`jobs`の既定値はT2.2で決めた。
 
 **実機のHEIC固有の構造は、今回の合成HEICでは確かめられていない。** 今回のHEICは、pillow-heif（x265）が書いた単一画像で、iPhoneなどの実機のファイルとは構造が違う。P2のDrive取り込みで、実機のHEICについて次を確かめる。
 
@@ -334,3 +338,47 @@ heic-libheif = ["dep:libheif-rs"]
 
 - rustup（minimalプロファイル＋clippy）。
 - apt: `libheif-dev`・`libheif-plugin-libde265`・`libheif-examples`・`libde265-dev`・`libnuma-dev`・`zlib1g-dev`・`pkg-config`・`g++`・`cmake`・`python3-venv`。**`libheif-plugin-libde265`が入ったため、検証環境はUbuntu 24.04の標準の状態（HEVCを読めない）ではなくなった。** 標準の状態の再現は、プラグインのパスを空にして確かめた（§4.1）。
+
+## 10. 本体へ移した結果（P2 / T2.2）
+
+PoCの実装を`crates/geoframe/src/imaging`へ移し、`crates/geoframe-imgpoc`・CIのPoCジョブ（musl静的の2つ目のビルドと`imgpoc-heic`）を削除した。実装の説明は[server.md §12](server.md)、依存・サイズは[build.md §8](build.md)。
+
+### 10.1 実際の構成（§6からの変更点）
+
+| 項目 | §6の推奨 | T2.2の実際 |
+| --- | --- | --- |
+| JPEGのデコード | `image`（`jpeg`） | **`zune-jpeg`を直接**（厳格モード）。`image`は途中で切れたJPEGを部分的な画像で成功させるため。マーカーの並びだけが理由の失敗は寛容なモードで読み直す（[server.md §12.8](server.md)） |
+| `image`のfeature | `jpeg` | `png`・`tiff`（Driveに`.png`の行が5件、PythonのEXTSに`.tif`/`.tiff`があるため。JPEGは`zune-jpeg`が受け持つ） |
+| EXIFの抽出 | `kamadak-exif` | **自前**（約250行）。Pillowの読み方を境界まで合わせるため。HEICは`zune-heic`の`exif_data()`が返すTIFF構造（`Exif\0\0`は付かない）を同じ解析器に渡す |
+| 縮小・エンコード・ICC・HEIC | `fast_image_resize` CatmullRom、`jpeg-encoder`（4:2:0・品質85・ハフマン最適化なし）、`moxcms`、`zune-heic`（`mdat`上限128 MiB） | そのまま。順序は縮小→向き。`zune-core`は`zune_heic::zune_core`を使い直接依存にしない |
+| 設定の切り替え（`Options`） | デコーダ・縮小・エンコーダ・順序・HEICバックエンドを列挙 | **持ち込まない**。推奨構成を直書き |
+| アロケータ | `mimalloc`（musl向け） | `main.rs`の`#[global_allocator]`、**muslのときだけ** |
+| 入力の制限 | 2億画素（PoC） | Pillowと同じ約1.79億画素＋ファイル512 MiB |
+| グレースケール | PoCは全部RGB | Pythonと同じく**Lのまま**（1成分のJPEG） |
+
+### 10.2 CMYK・グレースケール（§7の項目）
+
+Pillowで作った合成のCMYK JPEG（1200x900）とグレースケールのJPEG・PNG・TIFFを、Pillowの出力と比べた（開発機。`geoframe img-probe`とPythonの`make_derivative`）。寸法とモード（グレーはL、CMYKはRGB）が一致し、PSNRはCMYK 52.3 dB、グレースケール（JPEG）55.9 dB。**CMYKの色は、Pillowが書いた（Adobe形式でない）合成画像でしか確かめていない**。Adobe形式の反転CMYKの実写真は未確認（Driveに該当があればT2.4）。
+
+### 10.3 libheifへの逃げ道
+
+**コードには残さない**（`heic-libheif`のfeatureも置かない）。optionalな依存はCIで一度もコンパイルされずに腐るため。実機のHEICで`zune-heic`が読めない形式が出たら、PoCの`crates/geoframe-imgpoc/src/heic.rs`（`git show c41c4a9:crates/geoframe-imgpoc/src/heic.rs`）を参照して、`libheif-rs`（`default-features = false, features = ["v1_17"]`）を足す。配布は§6の2案（glibcの動的リンク／zig ccの静的ビルド）のどちらか。[build.md §6](build.md)。
+
+### 10.4 §7の項目の状況
+
+| 項目 | T2.2の状況 |
+| --- | --- |
+| グリッド分割・HDR／ゲインマップ・深度／補助画像・Live Photo／連写／シーケンス・nclxだけの色・`clap`・実機のirotとEXIFの両方 | **T2.4（Drive取り込みの受入）**。T2.2では、読めなかったときに原因を切り分けられるよう、失敗の文面に*構造の分類*（ブランド・主画像がグリッドか・コーデック・プロファイル・ビット深度・クロマ・色の記述・補助画像の種類・項目数）を付けた（[server.md §12.4](server.md)） |
+| 向き | 合成HEIC（irot）で、デコーダがirotを適用し、EXIFの向きは当てないことを確認（PoCから変わらず）。EXIFのOrientationは`zune-heic`の`exif_data()`から読める（IFD0の`0x0112`） |
+| EXIFの抽出（HEIC含む） | **済み**。`exif_data()`はTIFF構造から始まる（先頭のオフセット4バイトは付かない）。合成HEIC（向き6）で読めることをテスト |
+| CMYK・グレースケールのJPEG | §10.2 |
+| `zune-jpeg`の誤読（ハフマン最適化） | 変わらず。ハフマン最適化は付けない |
+| 本番に近い負荷 | JPEG 50枚（約12MP）・48MP 1枚・HEIC 8枚の時間とRSSは[server.md §12.9](server.md)。本番の約6,500枚の一括再生成はT2.4 |
+| `jobs`の既定値 | 呼び出し側（同期サイクル）が**1枚ずつ**処理する前提。検証環境の2コアで2枚同時にすると、JPEGは3.7→6.8枚/秒（約1.8倍）だが最大RSSが144→274 MiB、HEICは1.05→1.13枚/秒（約1.08倍）でRSSが217→321 MiB。1サイクルの件数が小さいので1枚ずつで足りる見込み。並列にするかはT2.4 |
+| 途中で切れたJPEG | **失敗にする**（Pillowと同じ）。PNGも失敗、HEICも失敗 |
+
+### 10.5 テスト
+
+- 本体: 合成画像だけ（[server.md §12.7](server.md)）。HEICは`crates/geoframe/tests/fixtures/synthetic_*.heic`（PoCから移した合成の64x48）。
+- Pythonとの突き合わせ: `tools/gen_exif_fixture.py`・`tools/gen_thumbnail_fixture.py`（`--check`をCIの`app`ジョブが回す）。
+- 静的バイナリでのHEIC: CIの`rust`ジョブが、musl静的ビルドの`geoframe img-probe`で合成HEICを処理する。

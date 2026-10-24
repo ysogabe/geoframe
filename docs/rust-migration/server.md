@@ -689,12 +689,12 @@ let _ = std::fs::remove_file(&tmp);                 // 成功でも失敗でも 
 | ICC | **捨てる**（画素は変換しない） | **sRGBへ変換して付けない**（意図した変更）。読めない・壊れている・RGB用でないICCは、**警告なしで捨てて続ける**（`DerivativeInfo.icc`が`Dropped`。件数を数えてログに出すのは呼ぶ段） |
 | EXIF・GPS | 出力に残らない（`save`にexifを渡さない） | 同じ。エンコーダに渡さないので、JPEG・PNG・TIFF・HEICのどの入力でも残らない（テストが機種名・GPSの文字列とTIFFヘッダの有無を見る） |
 | 出力 | JFIFあり、4:2:0、ハフマン最適化なし | 同じ（`jpeg-encoder`。サイズはPythonと同じ水準） |
-| 書き込み | `dest.with_suffix(".part")`に保存して`rename`。保存に失敗すると`.part`が残りうる | 同じ名前（`x.r90.jpg`→`x.r90.part`）。**成功・失敗・パニックのどれでも`.part`を残さない**（`Drop`で消す）。`rename`の前に`fsync`する。親ディレクトリは作る |
+| 書き込み | `dest.with_suffix(".part")`に保存して`rename`。保存に失敗すると`.part`が残りうる | 同じ名前（`x.r90.jpg`→`x.r90.part`）。**成功・失敗・パニックのどれでも`.part`を残さない**（`Drop`で消す）。`rename`の前に`fsync`する（電源断のあとに、DBの`display`だけが残って中身が空のderivativeになるのを避ける。検証環境で約26 ms／枚。生成は約230 ms／枚なので許容した）。親ディレクトリは作る |
 | 入力の上限 | 約1.79億画素で`DecompressionBombError`。ファイルの大きさは無制限 | 同じ画素数（178,956,970。デコードの前に宣言の寸法で断る）。**ファイルは512 MiBまで**（まるごとメモリに読む） |
 | 回転 | 任意の角度 | 0・90・180・270（負・360超は剰余）。それ以外は`BadRotation`（管理画面もその値しか作らない） |
 | ファイル名 | `{id}.jpg`／`{id}.r{rotation}.jpg` | 同じ。ただし`drive_id`が`[A-Za-z0-9_-]+`でなければ断る |
 
-HEICの`zune-heic`はスレッドを自前で持ち、グリッド画像のタイルを並列に復号する。呼び出し側は**1枚ずつ**呼ぶ（2枚同時にしても処理量は上がらない。image-poc.md §3.4）。
+HEICの`zune-heic`はスレッドを自前で持ち、グリッド画像のタイルや1枚の中の処理を並列に復号する。呼び出し側は**1枚ずつ**呼ぶのを前提にした（検証環境の2コアで、2枚同時にすると、JPEGは処理量が約1.8倍（3.7→6.8枚/秒）になるが最大RSSが144→274 MiBに増え、HEICは約1.08倍（1.05→1.13枚/秒）で321 MiBになる。§12.9）。`GEOFRAME_FETCH_PER_CYCLE`のように1サイクルの件数が小さいので、1枚ずつで足りる見込み。並列にするかはT2.4で決める。
 
 残っている注意: 書き込みの最中にプロセスが落ちる（SIGKILL・電源断）と、`derivatives/<name>.part`が残りうる。同じ名前のderivativeを次に作るときに上書きされるが、写真が消えていれば孤児として残る（EXIFを持たない部分的なJPEGなので、個人情報の問題はない）。起動時の掃除（§11.6）は`.dl_*`だけで、`*.part`は対象にしていない。必要ならT2.3・T2.4で足す。
 
@@ -764,3 +764,61 @@ summary files=2 ok=1 failed=1 jobs=1 wall_ms=285 median_ms=273 p95_ms=273 max_rs
 - Pythonとの突き合わせ（`tests/exif_python.rs`）: 合成JPEG 43ケース（境界は§12.3）と`norm_time`の16入力。意図して違える点だけを`rust_differs`に列挙し、それ以外は完全一致を求める。基準のJSONはCIの`app`ジョブが`--check`で再検査する（Pythonの読み取りが変わったら落ちる）。
 - HEIC（`imaging/heic.rs`・`imaging/tests.rs`）: 合成HEIC3枚（`tests/fixtures/synthetic_*.heic`。pillow-heifで作った64x48、`tools/image-poc/gen_fixtures.py`）で、irotを一度だけ適用、ICC、構造の分類、失敗の分類、EXIFの読み取り。
 - パス（`datadir.rs`）: `..`・絶対パス・NUL・外を指すリンク・`derivatives`のリンク・IDの区切り。
+
+### 12.8 実装上の判断
+
+- **JPEGのデコードは`zune-jpeg`を直接使う**（`image`の`JpegDecoder`を使わない）。`image`は寛容なモードで読み、**途中で切れたJPEGを部分的な画像のまま成功として返す**（グレーで埋まった下半分のderivativeが「取得済み」になり、Pythonのようにエラーで再試行されない）。一方、`zune-jpeg`の厳格モードは、ヘッダの間の余分なバイトのようなマーカーの並びにも厳しく、libjpegが警告だけで読む写真を落とす。そこで**まず厳格モードで読み、マーカーの並びだけが理由の失敗（`Format`／`FormatStatic`。ただし`Premature end of buffer`＝データ不足を除く）は寛容なモードで読み直す**。データの不足・壊れは読み直さない。テストが、切れたJPEG（1/4・1/2・末尾200バイト欠け）の拒否と、EOIなし・末尾のゴミ・マーカーの間のゴミの受け入れの両方を見る。**実機のJPEG原本（Drive）での確認はT2.4**。
+- **PNG・TIFFは`image`**（`png`・`tiff`のfeature）。向きはJPEGと同じ自前のEXIFで読む。
+- **EXIFは自前**（`kamadak-exif`を使わない）。理由はPillowの読み方を境界まで合わせるため（§12.3）。ASCIIの末尾のNULを1つだけ取る、後勝ち、`or`の連鎖は、外部のcrateでは再現できない（NULで分割する、先勝ちなど）。
+- **ICCの変換失敗は黙って捨てる**（画像ごと失敗にしない）。件数は`DerivativeInfo.icc == Dropped`で数えられるので、呼ぶ段がサイクルの末尾に件数だけログに出す（PoCの予告。T2.3・T2.4）。
+- **入力はまるごとメモリに読む**（512 MiBまで）。画素数の上限は約1.79億画素（Pillowと同じ）。約48MPで最大RSSが232 MiB（RGBのラスタ約146 MBの約1.6倍）だったので、上限の画素数（約1.79億）なら約0.85 GiB。Python（Pillow）も同じ画素数まで読む。
+- **MD5は入れない**: `local_derivatives`のファイル名`local_<md5(path)[:16]>.jpg`はT2.3の担当。`ring`にMD5は無いので、T2.3で`md-5`（純Rust）を足す。
+- **`*.part`の掃除は入れない**: §12.2の「残っている注意」。
+
+### 12.9 検証環境での確認（2026-10-24）
+
+検証環境（lxc-geoframe。2コア、メモリ4 GiB）で、**本番コピーの`derivatives/`（長辺2560のJPEG）から無作為に選んだ入力**を使い、[image-poc.md §2](image-poc.md)と同じ作り方（`tools/image-poc/prepare_data.py`: 長辺4032へ拡大して輝度ノイズを足したJPEG 50枚、品質92、平均2.7 MB。3枚に1枚はDisplay P3相当のICC付き。同じ入力から作ったHEICは、作成に時間がかかるので8枚だけ）で、現行Python（Pillow 13.0.0＋pillow-heif 1.8.1）の`make_derivative`と、musl静的ビルドの`geoframe img-probe`を比べた。**写真は検証環境の外へ出していない。計測後に入力・出力・バイナリ・使い捨てのvenvを消した**（`/var/tmp/gf-t22`、mode 0700）。数値と件数だけを書く。
+
+**時間と最大RSS**（1枚あたり。Rustの「書き出しあり」は`.part`・`fsync`・`rename`まで含む）:
+
+| 入力 | 現行Python | Rust（musl静的＋mimalloc） |
+| --- | --- | --- |
+| JPEG 約12MP 50枚、中央値（p95） | 310.2 ms（350.9）。読み・変換・書き出し | **222〜227 ms**（読んで変換だけ）／**281〜282 ms**（書き出しあり。p95 332） |
+| 50枚の所要時間（1ジョブ） | 14.7 s | 10.9〜11.1 s（変換だけ）／13.4〜13.7 s（書き出しあり） |
+| 50枚の処理量（2ジョブ） | 5.64枚/秒 | 6.75枚/秒（書き出しあり） |
+| 最大RSS（1ジョブ／2ジョブ） | 178 MiB／172 MiB | 144 MiB／274 MiB |
+| JPEG 約48MP 1枚 | 1,108 ms、475 MiB | 686 ms、232 MiB |
+| HEIC 約12MP 8枚、中央値（p95） | 1,276 ms（1,386） | 958 ms（1,081） |
+| HEICの処理量（2ジョブ） | 1.25枚/秒 | 1.13枚/秒（`zune-heic`が1枚で2コアを使うため） |
+| HEICの最大RSS（1ジョブ／2ジョブ） | 190 MiB／176 MiB | 217 MiB／321 MiB |
+
+PoC（image-poc.md §1）とほぼ同じ値（JPEG 12MPで222 ms、HEIC 871〜939 ms）。書き出しの`fsync`が1枚あたり約26 ms（同じ検証環境のディスクで、760 KBのファイルを書いて`fsync`した別の測定）。
+
+**寸法・向き・メタデータ**（Python対Rust）:
+
+| 確認 | 結果 |
+| --- | --- |
+| 寸法の不一致 | JPEG 50枚・HEIC 8枚とも**0**。失敗も**0** |
+| 出力のEXIF・GPS・ICC | Python・Rustとも**0**（JPEG 50＋HEIC 8のどちらの出力も）。サブサンプリングは全て4:2:0 |
+| 出力の大きさ（平均） | JPEG 763,834 B（Python）→ 766,674 B（Rust。+0.4%、ICCの変換分）。HEIC 610,087 B → 610,825 B |
+| 向き・回転 | 合成画像（Orientation 1〜8、手動回転90・180・270、HEICのirot）で、Pillowの出力と寸法・モード（L／RGB）・目印の位置が一致（JPEG・PNG・TIFF・HEIC・CMYK・グレー・パレット・アルファ付き計30入力） |
+
+**画質**（Python対Rust、輝度のPSNR・SSIM。画素の一致は求めない）:
+
+| 群 | 枚数 | Rust対Python PSNR | Rust対正解 | Python対正解 |
+| --- | --- | --- | --- | --- |
+| JPEG、ICCなし | 33 | 中央値**48.3 dB**（最小42.0） | 42.30 dB | 42.50 dB |
+| HEIC、ICCなし | 5 | 中央値**47.9 dB**（最小47.3） | 42.54 dB | 43.03 dB |
+| JPEG、P3のICC付き | 17 | 中央値40.3 dB（最小28.8。**RustがsRGBへ変換するため**差が出る） | **41.58 dB**（最小37.3） | 38.75 dB（最小28.7） |
+| HEIC、P3のICC付き | 3 | 中央値40.6 dB | **42.45 dB** | 38.76 dB |
+
+SSIMは全群で中央値0.97〜1.00（Rust対正解・Python対正解とも0.96〜0.98）。ICCなしではRustがPythonの出力に約48 dBまで近く、正解との差は−0.2 dB（PoCの47.7 dB・−0.2 dBと同じ）。ICC付きではsRGBへ変換する分、正解に近づく（+2.8 dB、最悪値は28.7→37.3 dB）。
+
+**配布と起動**: `deploy/rust-deploy.sh`で検証環境へ配布（`/healthz`200・`/api/v1/photos`が配列を確認して完了）。`GEOFRAME_INGEST`は未設定（`ingest=0`、`取り込みは無効です`）のまま。`/healthz`は200、`geoframe-rs`の最大RSSは約50 MiB（写真一覧を1回返した後）。取り込みは動かしていない（T2.2は画像処理の部品で、DBにも`DATA_DIR`にも書かない）。検証環境のDBは書き換えていない。
+
+### 12.10 T2.3・T2.4へ回したもの
+
+- **T2.4（Drive取り込みの受入）で、実機iPhoneのHEICを確認する**: グリッド分割（512x512のタイル）、HDRゲインマップ、深度・補助画像、10ビット（Main 10）、nclxだけの色の記述、Live Photo・連写、`clap`、EXIFのOrientationとirotの両方。**検証環境にDriveの鍵がまだ無い**ので、T2.2では合成のHEIC（pillow-heif）だけを確認した。切り分けは`geoframe img-probe`（連番と構造の分類だけを出す。§12.4）か、取り込みのログの`ImageError`（同じ文面）でできる。`zune-heic`が読めない形式が出たら、PoCの`libheif-rs`の経路を足す（[build.md §6](build.md)）。
+- **T2.4**: JPEG原本（Drive）で、厳格モード＋寛容な読み直しが落とす写真が無いか（失敗の分類は`ImageError`の文面で件数だけ出す）。本番の約6,500枚を一括で作り直すときの時間とメモリ（概算。今回の測定の1枚あたりの時間から、JPEG 4,795枚が約0.28 s、HEIC 1,735枚が約1 s、PNG 5枚で合計約50分。Pythonは同じ見積りで約1時間。実機のHEICの時間は別）。`fetch_derivatives`が`ImageError`を握ってログに出すとき、パス・ファイル名を付けないこと。ICCを捨てた件数のログ。`norm_time`をDriveの`imageMediaMetadata.time`に通すこと。
+- **T2.3**: `index_local`は`extract_exif`の`NotAnImage`を「読み込み失敗」として飛ばす（Pythonと同じ）。`local_<md5(path)[:16]>.jpg`の名前（`md-5`を足す）。`local_derivatives`は`resolve_existing`で`photos.path`を検査してから読む。`*.part`の掃除（§12.2）を入れるかの判断。
+- **P3（更新API）**: 管理画面の回転は`derivative_name(drive_id, rotation)`で別名にして`store_derivative`を呼ぶ（元のderivativeからの回転か、Driveから取り直すか。admin.py:350）。`rotation`の値は`0/90/180/270`のまま。

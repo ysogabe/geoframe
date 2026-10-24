@@ -642,13 +642,13 @@ fn 途中で切れたファイルは失敗にする() {
 #[test]
 fn エラーの文面にパスや内容が入らない() {
     let tmp = TempDir::new("imaging-err");
-    let secret = tmp.path().join("ひみつの写真-35.68,139.76.jpg");
-    std::fs::write(&secret, b"GPS 35.68 139.76 not a jpeg").unwrap();
+    let secret = tmp.path().join("ひみつの写真-12.34,56.78.jpg");
+    std::fs::write(&secret, b"GPS 12.34 56.78 not a jpeg").unwrap();
     let err = make_derivative(&secret, &tmp.path().join("out.jpg"), 0).unwrap_err();
     let text = format!("{err} / {err:?}");
     assert!(
         !text.contains("ひみつ")
-            && !text.contains("35.68")
+            && !text.contains("12.34")
             && !text.contains(tmp.path().to_str().unwrap()),
         "{text}"
     );
@@ -839,15 +839,15 @@ fn exifの値と向きを読む() {
         vec![(0x0112, V::Short(8))],
         vec![
             (1, V::Ascii("S")),
-            (2, V::Rationals(vec![(35, 1), (30, 1), (0, 1)])),
+            (2, V::Rationals(vec![(12, 1), (30, 1), (0, 1)])),
             (3, V::Ascii("W")),
-            (4, V::Rationals(vec![(139, 1), (45, 1), (0, 1)])),
+            (4, V::Rationals(vec![(78, 1), (45, 1), (0, 1)])),
         ],
     );
     let info = exif_info_from_bytes(&with_exif(&jpeg_rgb(8, 8), &t)).unwrap();
     assert_eq!(info.orientation, 8);
-    assert_eq!(info.meta.lat, Some(-35.5));
-    assert_eq!(info.meta.lon, Some(-139.75));
+    assert_eq!(info.meta.lat, Some(-12.5));
+    assert_eq!(info.meta.lon, Some(-78.75));
 }
 
 #[test]
