@@ -923,7 +923,7 @@ T2.2の注意（§12.2）の対応。`ingest::start`の最後（ガード・ロ�
 
 ### 13.6 `--dry-run`
 
-`geoframe sync --dry-run`の`index_local`・`local_derivatives`の段が、書かずに件数を出す（§11.3）: `index_local`は`files added updated removed unreadable skipped …`（置き場が無ければ空の走査として、既存のローカル行の削除を数える）、`local_derivatives`は`original made failed icc_dropped`（後続の段は索引後の写しで数える。§13.3）。掃除の行には`.part`の件数が増えた（`掃除: 消す .dl_* N 件 / 消す書きかけの .part N 件 / 捨てる .cache.json の旧キー N 件`）。`geoframe organize --dry-run`は`targets moved row_only_removed skipped failed held_back_until_infer`（`index_local`のあとの写しで数える。§13.4）。**判断（再レビューの指摘5）**: 後続の段の件数は「索引前の状態で数える」案ではなく、メモリ上の写しに計画を適用する案にした。写しの作成はバックアップAPIの1回で済み、段の側は`ctx.read`の使い方を変えずに、書き込み関数を共有するだけで済んだ。
+`geoframe sync --dry-run`の`index_local`・`local_derivatives`の段が、書かずに件数を出す（§11.3）: `index_local`は`files added updated removed unreadable skipped …`（置き場が無ければ空の走査として、既存のローカル行の削除を数える）、`local_derivatives`は`original made failed icc_dropped`（後続の段は索引後の写しで数える。§13.3）。掃除の行には`.part`の件数が増えた（`掃除: 消す .dl_* N 件 / 消す書きかけの .part N 件 / 捨てる .cache.json の旧キー N 件`）。リンクなどで掃除を飛ばす`tmp/`・`derivatives/`があるときは、`掃除を飛ばす tmp/・derivatives/（…）: N つ`の行も出る（[§13.14](#1314-再々レビュー2026-10-24の指摘への対応)）。`geoframe organize --dry-run`は`targets moved row_only_removed skipped failed held_back_until_infer`（`index_local`のあとの写しで数える。§13.4）。**判断（再レビューの指摘5）**: 後続の段の件数は「索引前の状態で数える」案ではなく、メモリ上の写しに計画を適用する案にした。写しの作成はバックアップAPIの1回で済み、段の側は`ctx.read`の使い方を変えずに、書き込み関数を共有するだけで済んだ。
 
 ### 13.7 Pythonとの差（まとめ）
 
@@ -971,7 +971,7 @@ musl静的バイナリを`deploy/rust-deploy.sh`で配布して確かめた。�
 | --- | --- |
 | 1. 置き場が無いとdry-runが削除を見落とす | 置き場が無いときは空の`Scan`として、実行と同じ計画の関数を通す（§13.2）。実行は置き場を作って空の走査をし、既存のローカル行を消す。dry-runも同じ削除と、消すderivativeを数える。件数一致は単体テスト`写真の置き場が無くてもdry_runは削除を数え_実行と同じ件数になる`で確かめた |
 | 2. 停止の合図を受けても行・ファイルを消す経路 | 確認点を、走査中・写真ごと・計画の完了時・書き込みの始め・256件ごと・`COMMIT`の直前に増やし、確定前の合図は`ROLLBACK`して`Skipped`（§13.2の7）。derivativeのファイル消しは`COMMIT`の後なので、合図で確定しなければ消さない。試験は、確認点を1回目から順に変えて「全く変えない」か「全部やった」のどちらかになること（確認点は7つ）と、写真0枚、256件ごとの確認 |
-| 3. `DATA_DIR`の外へ作ってから検査 | 作る前に親を`canonicalize`して`DATA_DIR`の中かを確かめる（§13.2の1）。絶対パス・`..`・リンクの3通りを、実行とdry-runの両方で試験し、外に何もできないことを確かめた。**他の箇所の確認**: `organize`の`_excluded/no_gps`は、1階層ずつ`symlink_metadata`で見てから作る（元から正しい順。dry-runでは作らない検査だけの形も足した）。`derivatives/`・`tmp/`は`DATA_DIR`直下の固定名で、`create_dir_all`が外へ作ることはない（リンクが外の実在ディレクトリを指す場合は作らず、作った後の`canonicalize`の照合で断る。宙に浮いたリンクは`create_dir_all`が失敗する）。`ingest::prepare_tmp_dir`は`tmp/`・`derivatives/`が外へのリンクだと、作りはしないが`.dl_*`の掃除がリンク先で走った。この回は直していなかったが、次の再レビューで実害（リンク先の`.dl_*`を消す）が見つかったので**対応済み**（[§13.14](#1314-再々レビュー2026-10-24の指摘への対応)） |
+| 3. `DATA_DIR`の外へ作ってから検査 | 作る前に親を`canonicalize`して`DATA_DIR`の中かを確かめる（§13.2の1）。絶対パス・`..`・リンクの3通りを、実行とdry-runの両方で試験し、外に何もできないことを確かめた。**他の箇所の確認**: `organize`の`_excluded/no_gps`は、1階層ずつ`symlink_metadata`で見てから作る（元から正しい順。dry-runでは作らない検査だけの形も足した）。`derivatives/`・`tmp/`は`DATA_DIR`直下の固定名で、`create_dir_all`が外へ作ることはない（リンクが外の実在ディレクトリを指す場合は作らず、作った後の`canonicalize`の照合で断る。宙に浮いたリンクは`create_dir_all`が失敗する）。`ingest::prepare_tmp_dir`は`tmp/`が外へのリンクだと、作りはしないが`.dl_*`の掃除がリンク先で走った（次の再レビューで`derivatives/`も同じと分かった）。この回は直していなかったが、次の再レビューで実害（リンク先の`.dl_*`を消す）が見つかったので**対応済み**（[§13.14](#1314-再々レビュー2026-10-24の指摘への対応)） |
 | 4. `organize`の途中失敗でリンクが増え続ける | 元の削除に失敗したらリンクを取り消し、取り消せなかったものは次の実行が同じ`inode`で再利用する（§13.4）。試験は元のディレクトリを読み取り専用にして3回失敗させ（退避先が空のまま）、権限を戻すと`(2)`の無い名前で移ること、残ったリンクの再利用、別のファイルが同名のときは別名の側で再利用すること。rootなどパーミッションが効かない環境では最初のものを飛ばす |
 | 5. 後続段のdry-runの件数 | メモリ上の写しに先の段の計画を適用する形にした（§11.3、§13.6）。`local_derivatives`のdry-runはパス検査も実行と共通。`organize --dry-run`も同じ。件数一致は単体テスト`dry_runの後続段は索引後の状態で数え_実行と同じ件数になる`と、検証環境（§13.13） |
 | 6. 大量の変更のトランザクション | 計測して分割しないと判断した（§13.12） |
