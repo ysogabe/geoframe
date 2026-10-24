@@ -1073,7 +1073,8 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
   | 原本の本文（ヘッダーのあと） | 切断（`UnexpectedEof`・`ConnectionReset`・`ConnectionAborted`・`BrokenPipe`・`NotConnected`など） | `disconnected` | 障害 |
   | 同上 | 時間切れ（`Timeout(_)`を包んだもの・`TimedOut`・`WouldBlock`） | `BodyTimeout` | **写真の失敗**（`fail_slow_download`） |
   | 同上 | 上記以外の読み出しの`io::Error` | `Io(kind)` | 写真の失敗（`fail_io`） |
-  | 403の理由の本文（16 KiBまで読んで捨てる） | 切断・時間切れ・TLSなど（受け取れなかった） | `Net(…)`（時間切れも`timeout`。`BodyTimeout`にしない） | 障害。**権限の不足（`Status(403)`）と決めつけない**。数百バイトの理由の本文が届かないのは回線の不調 |
+  | 403の理由の本文（16 KiBまで読んで捨てる） | 切断・時間切れ・TLSなど（受け取れなかった） | `Net(…)`（`disconnected`・`timeout`・`tls`。時間切れも`BodyTimeout`にしない） | 障害。**権限の不足（`Status(403)`）と決めつけない**。数百バイトの理由の本文が届かないのは回線の不調 |
+  | 同上 | 上記以外の読み出しの失敗すべて（`Protocol`＝不正なチャンク長、`Decompress`＝途中で終わるgzipなど。ヘッダーでは`other`になる種類） | `Net(reason_unreadable)`（`Failure::ReasonUnreadable`） | 障害（段を中断）。**ヘッダーの`Protocol`（写真の失敗）とは区別する**: 理由が読めないこと自体が、権限の不足とも流量制限とも決められない不調で、写真の失敗にすると待ちが付き、直ってからも取得が遅れる |
   | 同上 | 本文が16 KiBを超えた | （`false`） | 流量制限ではない403として扱う（権限の不足。写真の失敗） |
   | 一覧・トークンの本文 | 上のヘッダーの前と同じ分類 | `Net(…)` | 一覧・トークンの失敗（段の失敗） |
 
@@ -1129,7 +1130,7 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 - キーは`fetch_derivatives`が`(drive_id, md5)`、`local_derivatives`が`(id, mtime)`。**Driveで原本が差し替わる・ローカルのファイルが更新される**（`md5`・`mtime`が変わる）と別のキーになり、**すぐ再び試す**。
 - プロセスが再起動すれば忘れる（もう一度1回ずつ試す。枠の一部を使うだけ）。`--dry-run`は覚えない（実行はしていないので、次の実行に影響させない）。
 - 選び方: `LIMIT`を付けず、`ORDER BY`の順に読み、記録にあるものを飛ばして、`GEOFRAME_FETCH_PER_CYCLE`枚そろったら止める。飛ばした数は`skipped_backoff`。
-- **通信の不調・認証の失敗は写真の失敗に数えない**（記録しない）。ネットワークが落ちている間に全部の写真に待ちが付くと、直ってからも30分以上取得されないため。数えない障害は、接続・名前解決・TLS・**応答のヘッダーを受け取る前の切断などのI/Oの失敗**・**原本の本文の途中の切断**・**応答の待ちの時間切れ**・**流量制限の403（再試行を使い切ったあと）**・**403の理由の本文の受信の失敗**・429・5xx・認証の失敗（分類の表は§14.3）。数える（その写真の失敗）のは、原本の本文の受信が1枚15分を超えたときと、権限の403・404など。テスト: `a_rate_limit_that_outlasts_the_retries_stops_the_stage_without_blaming_the_photos`・`a_timeout_waiting_for_the_response_stops_the_stage_without_blaming_the_photos`（どちらも、障害中に試した写真が、復旧した次のサイクルで待たずに取得される）、`a_disconnect_before_the_response_headers_stops_the_stage_without_blaming_the_photos`・`a_disconnect_in_the_middle_of_an_original_stops_the_stage_without_blaming_the_photos`・`a_403_whose_reason_body_is_cut_off_is_an_outage_not_a_permission_error`・`a_403_whose_reason_body_times_out_is_an_outage_and_not_a_slow_download`（いずれも復旧後に待たずに取得される）・`a_disconnect_while_exchanging_the_token_is_an_outage_not_an_auth_error`、`a_body_that_takes_too_long_is_that_photos_failure_and_the_rest_continue`。分類の表は`head_phase_errors_follow_the_table`（`net.rs`）と`body_read_errors_follow_the_table`が確かめる。
+- **通信の不調・認証の失敗は写真の失敗に数えない**（記録しない）。ネットワークが落ちている間に全部の写真に待ちが付くと、直ってからも30分以上取得されないため。数えない障害は、接続・名前解決・TLS・**応答のヘッダーを受け取る前の切断などのI/Oの失敗**・**原本の本文の途中の切断**・**応答の待ちの時間切れ**・**流量制限の403（再試行を使い切ったあと）**・**403の理由の本文の受信の失敗（切断・時間切れ・TLSに加え、`Protocol`・`Decompress`など読み出しのどんな失敗も。上限超過だけは除く）**・429・5xx・認証の失敗（分類の表は§14.3）。数える（その写真の失敗）のは、原本の本文の受信が1枚15分を超えたときと、権限の403・404など。テスト: `a_rate_limit_that_outlasts_the_retries_stops_the_stage_without_blaming_the_photos`・`a_timeout_waiting_for_the_response_stops_the_stage_without_blaming_the_photos`（どちらも、障害中に試した写真が、復旧した次のサイクルで待たずに取得される）、`a_disconnect_before_the_response_headers_stops_the_stage_without_blaming_the_photos`・`a_disconnect_in_the_middle_of_an_original_stops_the_stage_without_blaming_the_photos`・`a_403_whose_reason_body_is_cut_off_is_an_outage_not_a_permission_error`・`a_403_whose_reason_body_times_out_is_an_outage_and_not_a_slow_download`・`a_403_whose_reason_body_is_malformed_chunked_is_an_outage`・`a_403_whose_reason_body_is_a_truncated_gzip_is_an_outage`（いずれも復旧後に待たずに取得される）・`a_disconnect_while_exchanging_the_token_is_an_outage_not_an_auth_error`、`a_body_that_takes_too_long_is_that_photos_failure_and_the_rest_continue`。分類の表は`head_phase_errors_follow_the_table`（`net.rs`）・`body_read_errors_follow_the_table`・`reason_body_failures_follow_the_table`が確かめる。
 
 テスト: `photos_that_keep_failing_do_not_block_the_ones_behind_them`（枠2枚で、先頭3枚が恒久的に失敗する。1回目は先頭2枚を試して失敗、2回目はその2枚を飛ばして3枚目と良い写真1枚、3回目は失敗中の3枚を飛ばして残り、4回目は何も試さない。「待ち時間0」の記録＝毎回すべてを試す方針に差し替えると、良い写真が3サイクル続けて0枚のまま＝Pythonの挙動を再現する）、`a_failed_photo_is_tried_again_when_its_original_changes_or_the_wait_is_over`、`失敗が続く写真は枠を塞がず_後続の写真が作られる`（`local_derivatives`。`mtime`が変わればすぐ試す）、`backoff.rs`の単体テスト（倍々・上限・成功で消える・記録数の上限・溢れない）。
 
@@ -1273,6 +1274,14 @@ T2.4のレビューの指摘7件への対応。コミットは`T2.4: …`の4つ
 | --- | --- |
 | 応答のヘッダーの前に切断されると写真の失敗になる（`Io(UnexpectedEof)`が`other`になっていた） | ヘッダーを受け取る前の`Io`の失敗は、時間切れ・TLS・接続の拒否/到達不能以外のすべてを`Failure::Disconnected`（`disconnected`）にして障害にした。`ureq`の全エラーの分類の表を§14.3と`net.rs`の`Failure`に書いた。応答の頭が壊れている（`Protocol`など）ものは、要求ごとに決まった結果になりうるので写真の失敗のまま（理由は表）。原本の本文の途中の切断は今まで通り障害（`disconnected`）。テスト: ヘッダー前の切断・本文の途中の切断・トークン交換中の切断が、段を中断し、復旧後に待たずに取得される／認証の失敗にならない |
 | 403の理由の本文の受信の失敗が握り潰され、権限の不足と同じ`Status(403)`になる | `is_rate_limit_body`を`Result<bool, DriveError>`にして、理由の本文の切断・時間切れ・TLSは`Net(…)`として返し、段を中断する。時間切れは原本の`BodyTimeout`（`fail_slow_download`）にしない。16 KiBを超える本文だけは流量制限ではない403として扱う。テスト: 本文の途中切断（`UnexpectedEof`）と時間切れ（`Timeout(Global)`）の2経路 |
+
+### 14.15 レビュー3回目（2026-10-25）の指摘への対応
+
+14.14で解消した「ヘッダー前の切断」は問題なし。「403の理由の本文の受信の失敗」に取りこぼしが残っていた。ヘッダーの`Protocol`・`LargeResponseHeader`を写真の失敗とする判断は妥当（変更なし）。
+
+| 指摘 | 対応 |
+| --- | --- |
+| 403の理由の本文の受信の失敗が、エラーの種類によって写真の失敗になる（`Failure::from`が`Protocol`・`Decompress`を`Other`にし、`is_outage()`が偽になって段が続き、写真に失敗の待ちが付く。不正なチャンク長の403と、途中で終わるgzipの403で再現） | 専用の障害の種類`Failure::ReasonUnreadable`（`reason_unreadable`。`is_outage()`は真）を設けた。`is_rate_limit_body`は、上限超過（`BodyExceedsLimit`。流量制限ではない403として扱う、今のまま）以外の読み出しエラーでは必ず`Err`にして段を中断する。切断・時間切れ・TLSは従来の種類（`disconnected`・`timeout`・`tls`）を保ち、それ以外の`Other`になる種類だけが`reason_unreadable`になる（`reason_body_failure`）。ヘッダーの`Protocol`（写真の失敗）は変えていない。分類の表（§14.3）と§14.14の記述を更新。テスト: 不正なチャンク長・途中で終わるgzipの403が、後続の写真を試さず、障害の間は写真の失敗を記録せず、復旧後に待たずに取得される（修正前に落ちることを確認）。スタブの壊れた本文が実際に`ureq`の`Protocol`・`Decompress`を返すことも確かめる |
 
 ## 15. 位置の推定と地名（P2 / T2.5）
 

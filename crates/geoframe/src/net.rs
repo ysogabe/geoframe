@@ -62,6 +62,11 @@ pub enum Failure {
     Tls,
     /// 時間切れ。
     Timeout,
+    /// Drive の 403 の**理由の本文が読めなかった**（壊れたチャンク・途中で終わる gzip など、切断や時間切れ
+    /// 以外の読み出しの失敗）。ヘッダーの前の `Protocol`（`Other`＝写真の失敗）とは別で、障害にする。
+    /// 数百バイトの理由の本文が読めないのは、権限の不足とも流量制限とも決められない回線・相手の不調で、
+    /// 写真の失敗として数えて待ちを付けると、直ってからも取得が遅れる。
+    ReasonUnreadable,
     /// 要求側の誤り・プロトコル違反・大きすぎる本文など、通信の障害とは言えないもの。
     Other,
 }
@@ -74,12 +79,13 @@ impl Failure {
             Self::Disconnected => "disconnected",
             Self::Tls => "tls",
             Self::Timeout => "timeout",
+            Self::ReasonUnreadable => "reason_unreadable",
             Self::Other => "other",
         }
     }
 
     /// 通信の障害か（写真・検索語といった**要求の中身のせいではなく**、回線・相手・TLS の不調と言える）。
-    /// `Other` だけが、要求や応答の内容に由来する失敗。
+    /// `Other` だけが、要求や応答の内容に由来する失敗（`ReasonUnreadable` は読み出しの種類によらず障害）。
     pub fn is_outage(self) -> bool {
         !matches!(self, Self::Other)
     }
@@ -116,6 +122,9 @@ pub fn is_disconnect(kind: std::io::ErrorKind) -> bool {
 /// | `Io`（上記以外のすべて: `UnexpectedEof`・`ConnectionReset`・`ConnectionAborted`・`BrokenPipe`・`NotConnected`・`PermissionDenied` など） | `Disconnected` | 障害 |
 /// | `Protocol`・`LargeResponseHeader`（応答の頭が壊れている・大きすぎる） | `Other` | 障害としない（※） |
 /// | `Http`・`BadUri`・`InvalidProxyUrl`・`RequireHttpsOnly`・`RedirectFailed`・`TooManyRedirects`・`StatusCode`・`BodyExceedsLimit`・`Other` など | `Other` | 障害としない |
+///
+/// 上の表は**ヘッダーまで**。Drive の 403 の理由の本文を読む失敗は別で、`Protocol`・`Decompress` など
+/// 表で `Other` になる種類も [`Failure::ReasonUnreadable`] にして障害にする（`crate::drive` の表）。
 ///
 /// ※ 応答は届いているが中身が壊れている。要求ごとに決まった結果になりうる（特定の写真だけが毎回壊れた
 /// 応答になる）ので、障害として段を止めると、その 1 枚が残りの写真を永久に塞ぐ。写真の失敗として数えれば

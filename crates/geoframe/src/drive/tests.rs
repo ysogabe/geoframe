@@ -372,6 +372,7 @@ fn errors_never_carry_secrets_or_urls() {
     assert!(DriveError::Net(Failure::Tls).is_outage());
     assert!(DriveError::Net(Failure::Disconnected).is_outage());
     assert!(!DriveError::Net(Failure::Other).is_outage());
+    assert!(DriveError::Net(Failure::ReasonUnreadable).is_outage());
     assert!(DriveError::RateLimited(403).is_outage());
     assert!(!DriveError::BodyTimeout.is_outage());
     assert!(!DriveError::RateLimited(403).is_auth());
@@ -2241,6 +2242,90 @@ fn a_403_whose_reason_body_is_cut_off_is_an_outage_not_a_permission_error() {
     assert_eq!(e.stub.media_requests().len(), 1);
     assert!(e.tmp_leftovers().is_empty());
     recovers_without_waiting(&e, &fetch);
+}
+
+/// 403 の理由の本文が壊れていて読めない（`ureq` が `Protocol`・`Decompress` を返す）ときも、障害として段を
+/// 止める。ヘッダーの `Protocol`（写真の失敗）とは別の扱い（理由は §14.3 の表）。
+fn assert_unreadable_reason_stops_the_stage(tag: &str, flag: &str) {
+    let e = two_pending(tag);
+    let flag = flag.to_string();
+    e.stub.add_fault(Box::new(move |r| {
+        r.is_media()
+            .then(|| (403, String::new(), vec![(flag.clone(), "1".to_string())]))
+    }));
+    let fetch = e.fetch_stage();
+    let StageResult::Failed(message) = e.run(&fetch) else {
+        panic!("失敗のはず");
+    };
+    assert!(
+        message.contains("reason_unreadable") && message.contains("attempted=1"),
+        "{message}"
+    );
+    assert_eq!(e.stub.media_requests().len(), 1);
+    assert!(e.tmp_leftovers().is_empty());
+    recovers_without_waiting(&e, &fetch);
+}
+
+/// スタブの壊れた本文が、実際に `ureq` の `Protocol`・`Decompress` を返すこと（この 2 つが理由の本文の
+/// 取りこぼしだった）と、`reason_body_failure` の表。
+#[test]
+fn reason_body_failures_follow_the_table() {
+    let e = env("drive-reason-table");
+    for flag in ["X-Bad-Chunk", "X-Truncated-Gzip"] {
+        let header = flag.to_string();
+        e.stub.add_fault(Box::new(move |_| {
+            Some((403, String::new(), vec![(header.clone(), "1".to_string())]))
+        }));
+        let url = format!("{}/probe", e.stub.base_url());
+        let mut response = crate::net::agent().get(&url).call().unwrap();
+        let error = response
+            .body_mut()
+            .with_config()
+            .limit(16 << 10)
+            .read_to_vec()
+            .unwrap_err();
+        match (flag, &error) {
+            ("X-Bad-Chunk", ureq::Error::Protocol(_)) => {}
+            ("X-Truncated-Gzip", ureq::Error::Decompress("gzip", _)) => {}
+            _ => panic!("想定外のエラー: {flag}"),
+        }
+        // ヘッダーの前なら写真の失敗（`Other`）になる種類でも、理由の本文では障害
+        assert_eq!(Failure::from(&error), Failure::Other);
+        assert_eq!(reason_body_failure(&error), Failure::ReasonUnreadable);
+        e.stub.clear_faults();
+    }
+    let io = |kind| ureq::Error::Io(io::Error::from(kind));
+    for (error, expected) in [
+        (io(io::ErrorKind::UnexpectedEof), Failure::Disconnected),
+        (io(io::ErrorKind::ConnectionReset), Failure::Disconnected),
+        (io(io::ErrorKind::TimedOut), Failure::Timeout),
+        (
+            ureq::Error::Timeout(ureq::Timeout::Global),
+            Failure::Timeout,
+        ),
+        (ureq::Error::Tls("x"), Failure::Tls),
+        (
+            ureq::Error::Decompress("gzip", io::Error::from(io::ErrorKind::UnexpectedEof)),
+            Failure::ReasonUnreadable,
+        ),
+        (ureq::Error::BadUri("x".into()), Failure::ReasonUnreadable),
+        (ureq::Error::TooManyRedirects, Failure::ReasonUnreadable),
+    ] {
+        let failure = reason_body_failure(&error);
+        assert_eq!(failure, expected);
+        assert!(failure.is_outage());
+    }
+    assert!(DriveError::Net(Failure::ReasonUnreadable).is_outage());
+}
+
+#[test]
+fn a_403_whose_reason_body_is_malformed_chunked_is_an_outage() {
+    assert_unreadable_reason_stops_the_stage("drive-403-bad-chunk", "X-Bad-Chunk");
+}
+
+#[test]
+fn a_403_whose_reason_body_is_a_truncated_gzip_is_an_outage() {
+    assert_unreadable_reason_stops_the_stage("drive-403-bad-gzip", "X-Truncated-Gzip");
 }
 
 #[test]

@@ -189,7 +189,8 @@ impl DriveError {
     pub fn is_outage(&self) -> bool {
         match self {
             // `Timeout` は要求を送って応答の頭を受けるまでの時間切れと、403 の理由の本文の受信の時間切れだけ
-            // （原本の本文の読み出しは `BodyTimeout`）。応答の頭の前の切断・本文の途中の切断も障害
+            // （原本の本文の読み出しは `BodyTimeout`）。応答の頭の前の切断・本文の途中の切断も障害。
+            // 403 の理由の本文が読めない（`ReasonUnreadable`）のも障害
             Self::Net(failure) => failure.is_outage(),
             Self::RateLimited(_) => true,
             // 401 は、取り直したトークンでも断られた（`authorized` が 1 回やり直したあと）。写真ではなく
@@ -822,12 +823,31 @@ fn read_error(e: &io::Error) -> DriveError {
     }
 }
 
+/// 403 の理由の本文の読み出しの失敗（`ureq` のエラー）を、障害の種類にする。`BodyExceedsLimit`（上限超過）は
+/// 呼び出し側が先に取り除く。
+///
+/// | `ureq` のエラー | `Failure` |
+/// | --- | --- |
+/// | 切断・時間切れ・TLS など、[`Failure::from`] が障害にするもの | そのまま（`disconnected`・`timeout`・`tls` など） |
+/// | それ以外すべて（`Protocol`＝不正なチャンク長、`Decompress`＝途中で終わる gzip など） | [`Failure::ReasonUnreadable`] |
+///
+/// ヘッダーの `Protocol` は写真の失敗のまま（[`Failure`] の表）。ここは**理由が読めない**ことそのものが
+/// 障害なので、種類によらず段を止める。
+fn reason_body_failure(e: &ureq::Error) -> Failure {
+    match Failure::from(e) {
+        failure if failure.is_outage() => failure,
+        _ => Failure::ReasonUnreadable,
+    }
+}
+
 /// 403 の本文が流量制限の理由か（読み捨てる。小さい上限つき）。
 ///
-/// 本文の受信に失敗した（切断・時間切れ・TLS）ときは `Err` にして、通信の障害（[`DriveError::Net`]）として
-/// 伝える。**権限の不足（`Status(403)`）と決めつけて写真の失敗にしない**。時間切れも `BodyTimeout` ではなく
-/// `Net(Timeout)`（原本の本文が遅いのとは違い、数百バイトの理由の本文が届かないのは回線の不調）。
-/// 理由の本文が上限（16 KiB）を超えたものは、Drive の流量制限の応答（数百バイト）ではないので `false`。
+/// 理由の本文が上限（16 KiB）を超えたものは、Drive の流量制限の応答（数百バイト）ではないので `false`
+/// （権限の不足など。写真の失敗）。**それ以外の読み出しの失敗は、種類によらず `Err`** にして通信の障害
+/// （[`DriveError::Net`]）として伝える。**権限の不足（`Status(403)`）と決めつけて写真の失敗にしない**。
+/// 時間切れも `BodyTimeout` ではなく `Net(Timeout)`（原本の本文が遅いのとは違い、数百バイトの理由の本文が
+/// 届かないのは回線の不調）。切断・時間切れ・TLS 以外（`Protocol`・`Decompress` など）は
+/// [`Failure::ReasonUnreadable`]（[`reason_body_failure`]）。
 fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<bool, DriveError> {
     let bytes = match response
         .body_mut()
@@ -837,7 +857,7 @@ fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> Result
     {
         Ok(bytes) => bytes,
         Err(ureq::Error::BodyExceedsLimit(_)) => return Ok(false),
-        Err(e) => return Err(DriveError::Net(Failure::from(&e))),
+        Err(e) => return Err(DriveError::Net(reason_body_failure(&e))),
     };
     let text = String::from_utf8_lossy(&bytes);
     Ok(text.contains("rateLimitExceeded") || text.contains("userRateLimitExceeded"))

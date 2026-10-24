@@ -305,7 +305,33 @@ fn respond(
         .and_then(|(_, v)| v.parse().ok());
     // `X-Close-Before-Headers` を付けると、何も書かずに接続を閉じる（応答のヘッダーの前の切断）。
     // `X-Claim-Length: <バイト数>` を付けると、実際の本文より大きな Content-Length を送って本文を途中で切る
-    // （ヘッダーを受け取ったあとの切断）
+    // （ヘッダーを受け取ったあとの切断）。
+    // `X-Bad-Chunk` を付けると、チャンク長が数でない `Transfer-Encoding: chunked` の本文を送る（本文の
+    // プロトコル違反）。`X-Truncated-Gzip` を付けると、途中で終わる gzip の本文を `Content-Encoding: gzip`
+    // で送る（本文の展開の失敗）。どちらも `body` は使わない
+    if extra.iter().any(|(k, _)| k == "X-Bad-Chunk") {
+        return stream.write_all(
+            format!(
+                "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\n\
+                 Transfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    if extra.iter().any(|(k, _)| k == "X-Truncated-Gzip") {
+        // gzip のヘッダー 10 バイト＋最終でない stored ブロックの頭と 4 バイトだけ（ブロックの本体が足りない）
+        let gzip: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0x03, 0x00, 0x10, 0x00, 0xef, 0xff, b'a', b'b',
+            b'c', b'd',
+        ];
+        let head = format!(
+            "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\n\
+             Content-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+            gzip.len()
+        );
+        stream.write_all(head.as_bytes())?;
+        return stream.write_all(gzip);
+    }
     if extra.iter().any(|(k, _)| k == "X-Close-Before-Headers") {
         return Ok(());
     }
