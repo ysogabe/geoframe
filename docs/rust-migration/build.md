@@ -10,7 +10,7 @@
 
 ただし次の依存が入るときは、その都度この結論を見直す（§6）。
 
-- HEIC変換: 画像PoCの結果（[image-poc.md](image-poc.md)）、**純Rustの`zune-heic`ならmuslの静的ビルドのままHEICを含められる**（合成HEIC 50枚でlibheifと出力がバイト単位で一致）。実機のHEICで問題が出て`libheif`が要る場合も、zig ccでmuslの静的ビルドができた（§6）。方針は変えない。
+- HEIC変換: 画像PoCの結果（[image-poc.md](image-poc.md)）、**純Rustの`zune-heic`ならmuslの静的ビルドのままHEICを含められる**（合成HEIC 50枚でlibheifと出力がバイト単位で一致）。**T2.2で本体に入れ、CIのmusl静的ビルドと`ldd`の検査がそのまま覆っている**（§8）。実機のHEICで問題が出て`libheif`が要る場合も、zig ccでmuslの静的ビルドができた（§6）。方針は変えない。
 - 外部HTTPのTLSとDNS: **P2のT2.1で確かめた**。`ureq`＋`rustls`（ring）＋`webpki-roots`の埋め込みで、musl静的のまま検証環境から地理院へHTTPSが通った（§7）。
 
 ## 2. ビルド方法
@@ -26,7 +26,7 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 
-# 配布用（完全静的）。本体だけ（画像PoCは含めない）
+# 配布用（完全静的）。画像処理（HEIC・mimalloc）を含む本体
 cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 # 成果物: target/x86_64-unknown-linux-musl/release/geoframe
 ```
@@ -41,7 +41,7 @@ cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 2. `Swatinem/rust-cache`でビルドをキャッシュする。
 3. `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`。
 4. `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`。
-5. 成果物（本体の`geoframe`。`-p geoframe`で限る。画像PoCは別の手順で、libheifなしの`--features heic-zune,mimalloc`だけ同じ検査をする）が静的リンクであることを`file`（`statically linked`または`static-pie linked`）と`ldd`（共有ライブラリを列挙しない）で検査し、`--version`を実行する。動的リンクが混ざるとCIが落ちる。
+5. 成果物（`geoframe`。T2.2から画像処理＝純RustのHEICと、muslのときだけ`mimalloc`も入る）が静的リンクであることを`file`（`statically linked`または`static-pie linked`）と`ldd`（共有ライブラリを列挙しない）で検査し、`--version`を実行する。動的リンクが混ざるとCIが落ちる。さらに、静的バイナリの`geoframe img-probe`で合成のHEIC（ICC付きを含む）を処理して、HEICのデコードが静的のまま動くことを確かめる。T2.2で、PoC用の2つ目のmusl静的ビルドと、libheifへ動的リンクする`imgpoc-heic`ジョブは削除した。
 
 ## 3. musl静的ビルドの結果
 
@@ -58,6 +58,7 @@ cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 - サイズはほぼ同じ。リリースプロファイルは既定のまま（`strip`・LTOは未設定。必要になったら設定する）。
 - **T1.3（管理画面の静的ファイル約936 KiBの埋め込み、静的配信、Host検査）の後**: musl静的で strip前 5,767,424 B（約5.5 MiB）、strip後 4,886,392 B（約4.7 MiB）。T1.2の時点（strip前 4,565,432 B、strip後 3,772,152 B）から約1.1〜1.2 MB増え、そのうち約0.94 MBが埋め込んだファイル。`static-pie linked`・`ldd`は`statically linked`のまま。埋め込みは`crates/geoframe/build.rs`が`app/static`・`app/vendor`を`include_bytes!`の表にする（外部crateなし）ので、ビルドには**リポジトリの`app/`が要る**（[server.md §9.4](server.md)）。追加した依存は`httpdate`・`futures-util`だけで、どちらも純Rustで依存木に既にあった。
 - **T1.4（管理画面の読み取りAPI）の後**: musl静的で strip前 6,170,752 B（約5.9 MiB）。`static-pie linked`・`ldd`は`statically linked`のまま。直接の依存に`libc`（`statvfs`・`localtime_r`のため。`tokio`が既に引いている純FFIのcrateで、Cのビルドは無い）を足した。`unsafe`は`sysinfo.rs`だけ（[server.md §10.4](server.md)）。musl版でも`TZ=Asia/Tokyo`の現地時刻が出ることを確かめた（合成DB・ループバックのみ）。
+- **T2.2（画像処理）の後**: §8。musl静的で strip前 15,793,432 B（約15.1 MiB）、strip後 13,474,680 B（約12.9 MiB）。直前（T2.1の終わり、`57714f2`）を同じ手順で作り直した 9,145,120 B／7,590,648 B から、strip前で +6.6 MB（+73%）。`static-pie linked`・`ldd`は`statically linked`のまま。
 - glibcビルドの要求は2.34までで、検証環境（2.39）にもn100（2.41）にも載る。ただし、これはこの小さな依存セットでの値で、依存が増えると上がる。配布先のglibcより新しい機体でビルドすると動かなくなる（plan.mdの懸念）。
 
 ## 4. 検証環境での動作確認
@@ -89,9 +90,10 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 
 | ファイル | 内容 |
 | --- | --- |
-| `Cargo.toml` | workspace（resolver 3、メンバーは`crates/geoframe`と`crates/geoframe-imgpoc`）。`Cargo.lock`はコミットする |
+| `Cargo.toml` | workspace（resolver 3、メンバーは`crates/geoframe`だけ。T2.2で`crates/geoframe-imgpoc`を外した）。`Cargo.lock`はコミットする |
 | `crates/geoframe/` | ライブラリ＋バイナリ`geoframe`。edition 2024（miharashiに合わせる） |
-| `crates/geoframe-imgpoc/` | 画像処理の技術PoC（`publish = false`）。本体の静的ビルドの検査には含めない。CIは別の手順で、`--features heic-zune,mimalloc`（libheifなし）のmusl静的ビルドと`file`／`ldd`の検査だけを行う。結果は[image-poc.md](image-poc.md) |
+| `crates/geoframe/src/imaging/`・`datadir.rs` | T2.2。画像処理（derivativeの生成・EXIF・HEIC）と`DATA_DIR`の外へ出ないパスの検査。PoC（`crates/geoframe-imgpoc`）はここへ移して削除した（コミット`c41c4a9`に残る）。結果は[image-poc.md](image-poc.md)、実装の説明は[server.md §12](server.md) |
+| `geoframe img-probe [--out <dir>] [--rotation <度>] [--jobs <n>] <画像>...` | T2.2。画像処理の確認・計測用。DB・データ置き場に触れず、連番・形式・寸法・向き・ICC・所要時間だけを出す（ファイル名は出さない）。HEICが読めないときは構造の分類が付く |
 | `geoframe --version` | バージョンを出す |
 | `geoframe check-db <path>` | `photos`の行数とSQLiteのバージョンを出す。読み取り専用 |
 | `geoframe selfcheck-net` | T2.1。地理院の逆ジオコーダへ公開の代表点を1件問い合わせ、外向きHTTPS（名前解決・TLS・証明書）が通るかを確かめる。出力は状態とHTTPステータスだけ（§7） |
@@ -99,7 +101,7 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 | `geoframe serve [--listen <addr>] [--data-dir <dir>]` | 読み取り専用のサーバー。P0では`GET /healthz`が`{"ok":true}`を返すだけだった。T1.1で、設定・DB読み取り層・ログ・DBを読めるかを返すヘルスを足した（[server.md](server.md)）。SIGTERMで停止 |
 | `deploy/geoframe-rs.service`・`deploy/rust-deploy.sh` | T1.5。検証環境向けのsystemd unitと、ビルド→転送→入れ替え→確認→巻き戻しの配布スクリプト（[deploy/README.md §7](../../deploy/README.md)、[server.md §6](server.md)）。本番の切替はP5 |
 
-依存は`tokio`・`axum`・`rusqlite`（`bundled`）・`serde`・`serde_json`、T1.1で`tracing`・`tracing-subscriber`（どちらも純Rust。`env-filter`・時刻・色の機能は入れない）。外部HTTPクライアントはT2.1で入れた（§7）。`image`はまだ入れていない。SQLiteの呼び出しは`db::Catalog::read`で`spawn_blocking`に出し、tokioのworkerを塞がない形にした（P1以降もこの形に揃える。[server.md](server.md) §2.2）。
+依存は`tokio`・`axum`・`rusqlite`（`bundled`）・`serde`・`serde_json`、T1.1で`tracing`・`tracing-subscriber`（どちらも純Rust。`env-filter`・時刻・色の機能は入れない）。外部HTTPクライアントはT2.1で入れた（§7）。画像処理の依存はT2.2で入れた（§8）。SQLiteの呼び出しは`db::Catalog::read`で`spawn_blocking`に出し、tokioのworkerを塞がない形にした（P1以降もこの形に揃える。[server.md](server.md) §2.2）。
 
 ## 6. 今後の注意と代替案
 
@@ -108,11 +110,12 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
   - **`libheif-rs`＋システムのlibheif 1.17.6**: glibc動的リンク。HEVCのデコーダが別パッケージの`libheif-plugin-libde265`で、無いと読めない。
   - **`libheif-rs`の`embedded-libheif`**: glibcだと自己完結しない（`libde265`・`libx265`・`libaom`などへ動的リンク）。**zig ccでmuslの完全静的ビルドは通った**（静的libde265、`RUSTFLAGS=-C link-self-contained=no`、コンパイラのラッパーで`--target=`を落とす）。LGPLの再リンクの扱いに注意（配布するなら）。
   - 外部コマンド（`heif-convert`）への委譲は、JPEG再圧縮が増え、いちばん遅い。
+  **T2.2の決定: `zune-heic`だけを本体に入れ、libheifへの逃げ道はコードに残さない**（optionalな依存として置くとCIで一度もコンパイルされず腐るため）。実機のHEIC（T2.4で確認）で`zune-heic`が読めない形式が出たら、PoCの`crates/geoframe-imgpoc/src/heic.rs`（コミット`c41c4a9`）を参照して`libheif-rs`（`default-features = false, features = ["v1_17"]`）を足す。そのときの配布は次のどちらか（[image-poc.md §4・§6](image-poc.md)）。
   libheifが必要でmuslで通らない場合は次のどちらかにする。
   - 配布先と同じglibcでビルドする（検証環境の中、または同じ世代のコンテナでビルドする）。HEIC部分だけ別プロセス（`heif-convert`など）にする案もある。
   - `cargo-zigbuild`でglibcの古い版（例: 2.31）を指定してビルドする。n100の新しいglibcを避けられる。
 - **名前解決**: muslの`getaddrinfo`はglibcと違い、`/etc/resolv.conf`の`search`・`options`の扱いが一部異なる。T2.1で検証環境から実際に名前解決できることは確かめた（§7）が、検証環境の`resolv.conf`は`nameserver`1行と`search .`だけの単純な形で、**この差は踏んでいない**。本番機の`resolv.conf`（`search`が複数ある、`ndots`の指定があるなど）での再確認はP5の切替の手順に入れる。
-- **メモリアロケータ**: muslの標準アロケータは画像処理で**約15〜25%遅かった**（画像PoC: JPEG 273 vs 235 ms、`zune-heic` 1,086 vs 871 ms）。`mimalloc`を付けると、JPEGはglibcと同等以上（222 ms）になるが、HEIC（`zune-heic`）はglibcより約8%遅いまま（939 vs 871 ms）で、RSSもglibc並みに増える。`mimalloc`はCのソースを`cc`でビルドする（CIの`rust`ジョブは`musl-tools`を入れてある）。P2の画像処理から`mimalloc`を付ける。現状の本体（画像処理なし）の最大RSS（1.5〜2.8 MiB）では差は出ていない。
+- **メモリアロケータ**: muslの標準アロケータは画像処理で**約15〜25%遅かった**（画像PoC: JPEG 273 vs 235 ms、`zune-heic` 1,086 vs 871 ms）。`mimalloc`を付けると、JPEGはglibcと同等以上（222 ms）になるが、HEIC（`zune-heic`）はglibcより約8%遅いまま（939 vs 871 ms）で、RSSもglibc並みに増える。`mimalloc`はCのソースを`cc`でビルドする（CIの`rust`ジョブは`musl-tools`を入れてある）。**T2.2で、muslのときだけ`mimalloc`を付けた**（`main.rs`の`#[global_allocator]`、依存は`[target.'cfg(target_env = "musl")'.dependencies]`）。glibcのビルドは標準のアロケータのまま。画像処理のない本体の最大RSS（1.5〜2.8 MiB）では差は出ていなかった。
 - **glibcビルドを選ぶ場合**: CIとn100のglibcは、本番（P5で切り替える機体）より古くなければならない。バイナリの`objdump -T`で要求バージョンを確かめる。画像PoCでは、開発機（glibc 2.41）でビルドしたglibcバイナリが検証環境（2.39）でそのまま動いた。`objdump -T`が出す最大版（`GLIBC_2.39`）は、Rust 1.99の`std::process::Command`が参照する`pidfd_spawnp`・`pidfd_getpid`の**弱参照**（`readelf -V`で`WEAK`）で、必須の要求は2.34まで。最大版だけでなく`WEAK`の有無も見る。
 
 ## 7. 外向きHTTPSとJWT（P2 / T2.1）
@@ -153,3 +156,46 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 - 本番機の`resolv.conf`（`search`が複数、`options ndots`など）でのmuslの名前解決の再確認（P5）。
 - Google（`oauth2.googleapis.com`・`www.googleapis.com`）への実際の認証と、Driveの大きな原本のダウンロードに合わせたタイムアウトの調整はT2.4。今の`net::agent()`は接続10秒・1要求30秒。
 - プロキシは`ureq`の既定どおり環境変数（`HTTPS_PROXY`など）を見る。unitは与えない。
+
+## 8. 画像処理の依存（P2 / T2.2）
+
+画像処理（derivativeの生成・EXIF・HEIC）を[image-poc.md](image-poc.md)の推奨構成で`crates/geoframe`に入れた。**すべて純Rust**（C依存が増えたのは`mimalloc`だけで、muslのときだけ）。実装の説明は[server.md §12](server.md)。
+
+### 8.1 追加した依存
+
+| crate | 用途 | メモ |
+| --- | --- | --- |
+| `zune-jpeg` 0.5.15 | JPEGのデコード | `image`が内部で使うのと同じ版。**厳格モードで読み、途中で切れたJPEGを失敗にする**（`image`の`JpegDecoder`は寛容で、部分的な画像で成功する）。幅・高さの上限（既定16384）は外し、画素数で見る |
+| `image` 0.25.10（`default-features = false`、`png`・`tiff`） | PNG・TIFFのデコード | PoCは`jpeg`のみだった。本番コピーに拡張子が`.png`の行が5件あるので`png`、PythonのEXTSに`.tif`/`.tiff`があるので`tiff`を入れた（本番コピーには0件）。miharashiと同じ版 |
+| `fast_image_resize` 6.1.0 | 縮小（CatmullRom） | `image`の`resize`より約14倍速い。**バイナリの約3.4 MiBを占める**（§8.3） |
+| `jpeg-encoder` 0.7.1 | JPEGのエンコード（4:2:0、品質85） | ハフマン表の最適化は付けない（`zune-jpeg`が誤読する） |
+| `moxcms` 0.8.1 | ICCからsRGBへの変換 | `image`が引くのと同じ版（`cargo tree -d`に二重で出ない） |
+| `zune-heic` 0.5.0 | HEICのデコード | 純Rust。libheifと出力がバイト単位で一致（PoC）。`zune-core`は`zune_heic::zune_core`で足りるので直接依存にしない |
+| `mimalloc` 0.1.48（`[target.'cfg(target_env = "musl")'.dependencies]`） | muslのときだけグローバルアロケータ | Cのソースを`cc`でビルドする（`musl-tools`が要る）。glibcのビルドには入らない |
+
+PoCの`kamadak-exif`は**使わない**: PillowのEXIFの読み方（ASCIIの末尾のNULを1つだけ取る、同じタグは後勝ち、`36867 or 36868 or 306`の連鎖、`S`/`W`だけ負）を境界まで合わせるため、必要なタグだけを自前で読む（約250行、unsafeなし、範囲外は黙って捨てる。[server.md §12.3](server.md)）。`cargo tree -d`に出る二重の版は`miniz_oxide`（0.8.9と0.9.1。`flate2`と`png`が別々に引く）だけで、`getrandom`・`syn`は以前から。
+
+### 8.2 サイズの変化
+
+| | strip前 | strip後 |
+| --- | --- | --- |
+| T2.1の終わり（基準。`57714f2`、同じ手順で作り直した） | 9,145,120 B（約8.7 MiB） | 7,590,648 B（約7.2 MiB） |
+| T2.2の画像処理を入れた後 | 15,793,432 B（約15.1 MiB） | 13,474,680 B（約12.9 MiB） |
+| 差 | +6,648,312 B（約+6.3 MiB、+73%） | +5,884,032 B（約+5.6 MiB、+78%） |
+
+`static-pie linked`・`ldd`は`statically linked`のまま。リリースプロファイルは既定のまま（LTO・`opt-level="s"`・`strip`は未設定）。
+
+### 8.3 増えた分の内訳
+
+strip前のバイナリのシンボルを`nm -C -S`でcrate別に合計した目安（シンボルの合計は約11.1 MiB）。画像処理の依存の分だけ抜き出す。
+
+| crate | 目安 |
+| --- | --- |
+| `fast_image_resize` | 約3.3 MiB（SIMD実装を画素の型・フィルタごとに持つ。使うのはU8とU8x3だけだが、単独のfeatureで絞れるのはU8x4だけ） |
+| `zune_heic` | 約0.5 MiB |
+| `zune_jpeg` | 約0.2 MiB |
+| `moxcms` | 約0.2 MiB（`pxfm`約0.1 MiBを含まない） |
+| `jpeg_encoder` | 約0.2 MiB |
+| `tiff` | 約0.1 MiB |
+
+`fast_image_resize`が全体の約3割で突出している。置き場所が家庭のサーバー1台でバイナリのサイズが問題にならないので、**今は何もしない**。必要になったら、`[profile.release.package.fast_image_resize] opt-level = "s"`（縮小は約34 ms／枚で、全体の15%）や、`lto = "thin"`・`strip = true`（stripだけで約1.7 MiB減る）を試す。

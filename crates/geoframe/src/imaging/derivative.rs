@@ -159,29 +159,52 @@ fn jpeg_class(e: &zune_jpeg::errors::DecodeErrors) -> DecodeClass {
     }
 }
 
-fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, ImageError> {
+/// JPEG のデコードの失敗。`Structure` は「データは足りているがマーカーの並びが厳密でない」失敗で、
+/// 寛容なモードで読み直してよい。それ以外（データが足りない・壊れている）は読み直さない。
+enum JpegFailure {
+    Structure,
+    Final(ImageError),
+}
+
+fn decode_jpeg_once(bytes: &[u8], strict: bool) -> Result<Decoded, JpegFailure> {
     use zune_jpeg::JpegDecoder;
+    use zune_jpeg::errors::DecodeErrors;
     use zune_jpeg::zune_core::bytestream::ZCursor;
     use zune_jpeg::zune_core::colorspace::ColorSpace;
     use zune_jpeg::zune_core::options::DecoderOptions;
 
-    let err = |e: &zune_jpeg::errors::DecodeErrors| ImageError::Decode {
-        format: "jpeg",
-        class: jpeg_class(e),
+    let fail = |e: &DecodeErrors| {
+        // 厳格モードで、マーカーの並びだけが理由の失敗（`Premature end of buffer` はデータ不足なので除く）
+        let structure = strict
+            && match e {
+                DecodeErrors::Format(_) => true,
+                DecodeErrors::FormatStatic(m) => *m != "Premature end of buffer",
+                _ => false,
+            };
+        if structure {
+            JpegFailure::Structure
+        } else {
+            JpegFailure::Final(ImageError::Decode {
+                format: "jpeg",
+                class: jpeg_class(e),
+            })
+        }
     };
     // 幅・高さの既定の上限（16384）は外す。大きさは画素数（MAX_INPUT_PIXELS）で見る
     let options = DecoderOptions::default()
-        .set_strict_mode(true)
+        .set_strict_mode(strict)
         .set_max_width(65535)
         .set_max_height(65535);
     let mut dec = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-    dec.decode_headers().map_err(|e| err(&e))?;
-    let (w, h) = dec.dimensions().ok_or(ImageError::Decode {
-        format: "jpeg",
-        class: DecodeClass::Dimensions,
-    })?;
+    dec.decode_headers().map_err(|e| fail(&e))?;
+    let (w, h) = dec
+        .dimensions()
+        .ok_or(JpegFailure::Final(ImageError::Decode {
+            format: "jpeg",
+            class: DecodeClass::Dimensions,
+        }))?;
     let (w, h) = (w as u32, h as u32);
-    check_pixels(w, h)?;
+    check_pixels(w, h).map_err(JpegFailure::Final)?;
     // グレーは 1 成分のまま、それ以外（YCbCr・CMYK・YCCK）は RGB に変換して受け取る
     let out = match dec.input_colorspace() {
         Some(ColorSpace::Luma) => ColorSpace::Luma,
@@ -190,13 +213,13 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, ImageError> {
     let options = dec.options().jpeg_set_out_colorspace(out);
     dec.set_options(options);
     let icc = dec.icc_profile();
-    let data = dec.decode().map_err(|e| err(&e))?;
+    let data = dec.decode().map_err(|e| fail(&e))?;
     let channels = if out == ColorSpace::Luma { 1 } else { 3 };
     if data.len() != w as usize * h as usize * usize::from(channels) {
-        return Err(ImageError::Decode {
+        return Err(JpegFailure::Final(ImageError::Decode {
             format: "jpeg",
             class: DecodeClass::Corrupt,
-        });
+        }));
     }
     Ok(Decoded {
         raster: Raster {
@@ -208,6 +231,26 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, ImageError> {
         icc,
         orientation: 1,
     })
+}
+
+/// JPEG をデコードする。
+///
+/// **途中で切れた JPEG は失敗にする**（Pillow は既定でエラー。`image` の `JpegDecoder` は寛容なモードで
+/// 部分的な画像を成功として返すので使わない）ため、まず `zune-jpeg` の厳格モードで読む。ただし厳格モードは
+/// マーカーの並びにも厳しく（例: ヘッダの間の余分なバイト）、libjpeg が警告だけで読む写真まで落とす。
+/// そこで、**マーカーの並びだけが理由の失敗は、寛容なモードで読み直す**。データの不足・壊れは読み直さない。
+fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, ImageError> {
+    match decode_jpeg_once(bytes, true) {
+        Ok(d) => Ok(d),
+        Err(JpegFailure::Final(e)) => Err(e),
+        Err(JpegFailure::Structure) => decode_jpeg_once(bytes, false).map_err(|f| match f {
+            JpegFailure::Final(e) => e,
+            JpegFailure::Structure => ImageError::Decode {
+                format: "jpeg",
+                class: DecodeClass::Corrupt,
+            },
+        }),
+    }
 }
 
 fn image_err(format: &'static str, e: &image::ImageError) -> ImageError {

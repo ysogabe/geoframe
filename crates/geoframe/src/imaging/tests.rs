@@ -923,3 +923,26 @@ fn norm_timeは暦を見ず全角などの数字をasciiにする() {
     assert_eq!(norm_time("²⁰²⁴:05:06 07:08"), "");
     assert_eq!(norm_time("二〇二四:05:06 07:08"), "");
 }
+
+#[test]
+fn libjpegが許す壊れ方のjpegは読める() {
+    // Pillow（libjpeg）は、EOI の欠け・末尾のゴミ・マーカーの間のゴミを警告だけで読む。
+    // 厳格モードのままだと、これらの写真の derivative が永久にできなくなる
+    let data: Vec<u8> = (0..120 * 90)
+        .flat_map(|i| [(i % 251) as u8, (i % 241) as u8, (i % 239) as u8])
+        .collect();
+    let jpeg = jpeg_encode(&data, 120, 90, jpeg_encoder::ColorType::Rgb, None);
+    let no_eoi = jpeg[..jpeg.len() - 2].to_vec();
+    let trailing = [jpeg.clone(), vec![0u8; 64], b"trailer".to_vec()].concat();
+    let mut between = jpeg[..2].to_vec();
+    between.extend_from_slice(&[0, 0, 0, 0]);
+    between.extend_from_slice(&jpeg[2..]);
+    for (name, bytes) in [
+        ("EOIなし", no_eoi),
+        ("末尾のゴミ", trailing),
+        ("マーカーの間のゴミ", between),
+    ] {
+        let out = render(&bytes, 0).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(out.info.output, (120, 90), "{name}");
+    }
+}

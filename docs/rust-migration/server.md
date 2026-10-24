@@ -1,19 +1,19 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 0. Pythonとの差の索引
 
-P1・P2（T2.1）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1・T2.2）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
 | `GEOFRAME_DATA_DIR`の既定が`./var`（Pythonは`app/var`）。`app/.env`を読まない | 単一バイナリに`app/`が無い。本番はunitの`EnvironmentFile`が同じ役目 | 環境変数・`.env`で与えず手で起動したとき | 設定のテスト。本番はunitが常に与える | なし（決定） | [§1.1](#11-優先順位)・[§1.3](#13-appenvは読まない) |
 | 不正な設定値は起動を断る（終了コード2）。`GEOFRAME_EMBED_BACKEND`だけ`gemini`に落とす。`GEOFRAME_HOST`のホスト名はPythonは通すがRustは断る（IPアドレスだけ） | 事故を早く見つける。Pythonは例外で落ちる | 不正な値が設定にあるとき（本番は`0.0.0.0`か`127.0.0.1`） | 単体テスト、検証環境で再起動ループにならないこと | なし（決定） | [§1.1](#11-優先順位)・[§10.6](#106-pythonとの差まとめ) |
-| 全角数字など ASCII 以外の数字の撮影時刻をRustは読めない（旅番号がずれうる） | 時刻の解釈を`strptime`に合わせきれていない | EXIFに全角数字が入った写真 | 本番コピーでは差0。単体テスト | P2のインデクサで保存時に正規化 | [§8.2](#82-値) |
+| 全角数字など ASCII 以外の数字の撮影時刻をRustのフィード（§8）は読めない（旅番号がずれうる） | 時刻の解釈を`strptime`に合わせきれていない | EXIFに全角数字が入った写真 | 本番コピーでは差0。単体テスト | **T2.2で`imaging::norm_time`が数字をASCIIに直す**（Pythonは元の文字のまま保存する）。呼ぶのはT2.3・T2.4のインデクサ。Pythonが書いて既にDBに入っている全角の値は直さない | [§8.2](#82-値)・[§12.3](#123-exif撮影時刻gps向き) |
 | 夏時間を持つ`TZ`のときの時刻の差 | RustはP1で`TZ`を解釈せず、naiveな日時を文字列・暦で扱う | `TZ`が夏時間を持つとき（本番は`Asia/Tokyo`） | 本番設定では差なし | P2以降で時刻を変換するときに再検討 | [§1.2](#12-tz)・[§10.6](#106-pythonとの差まとめ) |
 | `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字で最後 | 契約（`time`は必ずある）に合わせる | `taken_at`がNULLの行がDBにあるとき | 本番コピーに該当行なし（管理者確認済み） | なし（決定） | [§8.3](#83-pythonとの差) |
 | `lat`ありで`lon`がNULLの行: Pythonは一覧全体が500になりうる、Rustは一覧から外す | 契約（`lon`は必ずある）に合わせる | 該当行があるとき（通常は起きない） | 本番コピー（2026-10-24のバックアップ）での全件比較で差0（表示対象に該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
@@ -26,6 +26,10 @@ P1・P2（T2.1）でPythonと意図して違える点・既知の差の入口。
 | `GEOFRAME_DRIVE_POLL_MIN`: 0以下・非数・上限（525600分）超は起動を断る（終了コード2）。Pythonは0以下で空回りか例外 | 事故を早く見つける | 不正な値が設定にあるとき（本番は既定の10） | 単体テスト | なし（決定） | [§11.2](#112-設定) |
 | 同期サイクルの段の失敗は、段の名前と失敗の種類だけをログに出す（Pythonは例外文字列をそのまま出す）。段のパニックも隔離する（Pythonは`except Exception`） | ログに位置・ファイル名を出さない方針（inventory.md §6.3） | 常時 | 単体テスト（`sync.rs`） | なし（決定） | [§11.3](#113-同期サイクルの骨組み) |
 | `.cache.json`のキーをRustは辞書順に書く（Pythonは挿入順）。停止時にも最後の保存をする（同期サイクルのスレッドが止まったあとに1回。保存スレッドが止まりきらず保存の最中なら、期限付きで待ち、順番が来なければ書かずに省略して警告する）。`.dl_*`は通常ファイルだけを消す | `serde_json`の`preserve_order`を入れると他のJSON応答の並びが変わる | `.cache.json`をRustが保存したとき（読むときの並びは問わない） | 単体テスト（Pythonの`json.dumps(indent=1, ensure_ascii=False)`と同じ形） | なし（決定） | [§11.5](#115-cachejson) |
+
+| **画像処理（T2.2）**: ICCをsRGBへ変換して付けない（Pythonは捨てるだけ）。デコーダ・縮小フィルタ・エンコーダが違うので、画素はPythonと一致しない（寸法・向き・回転・EXIFを残さないことは一致）。16ビットのグレーPNGは8ビットへ正しく縮める（Pillowは`I;16`のRGB変換で飽和する）。HEICは常に取り込む（Pythonは`pillow_heif`があるときだけ。本番は入っている） | 広色域の写真が薄く見える問題を直す（plan.md P0で決定）。純Rustの部品の選択（image-poc.md） | ICC付きの写真、画素の比較 | 合成画像のテスト、検証環境でPythonとの寸法・画質の比較（[§12.9](#129-検証環境での確認2026-10-24)） | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
+| **EXIFの読み取り（T2.2）**: 壊れたGPS（成分が3つ未満・型が違う・分母0）の写真は**位置なしで索引する**（Pythonは例外で写真ごと索引しない、または分母0でNaNを保存する）。時刻の数字はASCIIに直す | 位置が読めないだけで写真を落とさない。`taken_at`の形式を守る | 壊れたGPSのEXIF | `tests/exif_python.rs`が基準（`tools/gen_exif_fixture.py`）と突き合わせる | なし（決定） | [§12.3](#123-exif撮影時刻gps向き) |
+| **入力の限界（T2.2）**: 1ファイル512 MiBまで（まるごとメモリに読む。Pythonは上限なし）。手動回転は0・90・180・270だけ（管理画面もその値しか作らない）。`.part`は書き込みに失敗・パニックしても残さない（Pythonは失敗すると残しうる）。出力の`.part`は`fsync`してから`rename`する | メモリの上限、電源断で空のderivativeを残さない | 巨大なファイル、書き込みの失敗 | 単体テスト | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
@@ -634,3 +638,129 @@ n100でビルドしたmusl静的バイナリ（`static-pie linked`、`ldd`は`st
 | (b) 取り込み中の`serve`に`sync`（実行）を起動 | `別の geoframe が取り込み中です`で終了コード1（ロックは`serve`が持ち続けている） |
 | (c) 停止・再起動 | `systemctl stop`は約0.1秒で`inactive`、ログは`停止しました`。`start`・`restart`とも`active`で、`ERROR`／`WARN`は0件。`.dump`のSHA-256は変わらない |
 | 後片付け | drop-inを外して`ingest=0`（`取り込みは無効です`）に戻し、`/healthz`は200、`.dump`のSHA-256は配布前と一致 |
+
+## 12. 画像処理（P2 / T2.2）
+
+derivative（表示用の長辺2560pxのJPEG）の生成、EXIF（撮影時刻・GPS）の読み取り、HEIC、`DATA_DIR`の外へ出ないパスの検査。実装は`crates/geoframe/src/imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`。部品の選択と計測は[image-poc.md](image-poc.md)、依存・サイズは[build.md §8](build.md)。**PoC（`crates/geoframe-imgpoc`）をここへ移して削除した**。
+
+### 12.1 取り込みの段から呼ぶ関数
+
+**同期API**で、CPUを食うので、同期サイクルのstdスレッドから1枚ずつ呼ぶ（tokioのworkerでは呼ばない）。エラー型（`ImageError`）の`Display`は**パス・ファイル名・画像の内容を含まない**（定型文、固定の語、`io::ErrorKind`、寸法、HEICの構造の分類だけ）ので、そのままログに出してよい（[inventory.md §6.3](inventory.md)）。
+
+| 関数 | 対応するPython | 呼ぶ段 | 内容 |
+| --- | --- | --- | --- |
+| `imaging::derivative_name(drive_id, rotation)` | `util.derivative_name` | T2.4・管理画面（P3） | `{id}.jpg`、回したものは`{id}.r{rotation}.jpg`。IDは英数字・`_`・`-`だけ（区切りを含められない） |
+| `imaging::store_derivative(&DataDir, src, name, rotation)` | `util.make_derivative` ＋ `dest.relative_to(DATA_DIR)` | T2.4（`fetch_derivatives`）・T2.3（`local_derivatives`） | `DATA_DIR/derivatives/<name>`に作り、DBの`display`に入れる`derivatives/<name>`と生成の内容（`DerivativeInfo`）を返す |
+| `imaging::make_derivative(src, dest, rotation)` | `util.make_derivative` | 上の下請け・テスト | 保存先を検査しない低レベル版。`dest`は`DataDir`で検査したものを渡す |
+| `imaging::extract_exif(path)` | `util.extract_exif` | T2.3（`index_local`） | `PhotoMeta { lat, lon, taken_at }`。ヘッダだけ読む（JPEGは先頭4 MiBだけ） |
+| `imaging::extract_exif_info(path)` | （向きも） | 同上 | `ExifInfo { meta, orientation }` |
+| `imaging::norm_time(s)` | `util.norm_time` | T2.3・**T2.4（Driveの`imageMediaMetadata.time`）** | `YYYY-MM-DD HH:MM` |
+| `imaging::is_supported_ext(path)` | `p.suffix.lower() in EXTS` | T2.3 | `.jpg .jpeg .png .tif .tiff .heic .heif` |
+| `imaging::is_browser_displayable_ext(path)` | `suffix in (".jpg", ".jpeg", ".png")` | T2.3（`local_derivatives`） | 原本をそのまま`display`にしてよい拡張子 |
+| `DataDir::open(dir)` | — | 各段の入口 | `canonicalize`して持つ |
+| `DataDir::resolve_existing(rel)` | `path.resolve().relative_to(DATA_DIR)` | T2.3（`photos.path`）・読み出し全般 | DBの相対パス文字列を、`DATA_DIR`の中の実在ファイルの絶対パスにする |
+| `DataDir::download_tmp(drive_id)` | `TMP_DIR / f".dl_{id}"` | T2.4 | `tmp/.dl_<id>`（`tmp/`を作る） |
+| `DataDir::relative(abs)` | `relative_to(DATA_DIR).as_posix()` | 各段 | `/`区切りの相対パス |
+| `imaging::probe`（`geoframe img-probe`） | — | 確認・計測 | §12.6 |
+
+呼び出しの例（T2.4の`fetch_derivatives`）:
+
+```rust
+let data = DataDir::open(&config.data_dir)?;
+let tmp = data.download_tmp(&drive_id)?;           // ID が不正ならここで断る
+let result = download_to(&tmp)                      // 原本を tmp/.dl_<id> へ
+    .and_then(|_| store_derivative(&data, &tmp, &derivative_name(&drive_id, rotation)?, rotation));
+let _ = std::fs::remove_file(&tmp);                 // 成功でも失敗でも EXIF 付き原本を残さない
+```
+
+### 12.2 derivativeの手順とPythonとの差
+
+手順（Pythonの`make_derivative`と同じ）: 読む → EXIFの向きを当てる → 手動回転（`rotation`、時計回り）→ 長辺を2560pxに収める（拡大しない）→ RGBかL以外はRGBへ → JPEG品質85 → `.part`に書いて`rename`。
+
+| 項目 | Python | Rust |
+| --- | --- | --- |
+| 読む形式 | Pillowが内容で判別（EXTSは拡張子の集合） | JPEG・PNG・TIFF・HEICを**内容で**判別（拡張子は見ない）。それ以外は`NotAnImage` |
+| JPEGのデコード | libjpeg(-turbo)。途中で切れていればエラー | `zune-jpeg`の厳格モード。**途中で切れていれば失敗**（`image`の`JpegDecoder`は部分的な画像で成功するので使わない）。CMYK・YCCKはRGBへ、グレーは1成分のまま |
+| 向き | `exif_transpose`（PillowのEXIF）。HEICはlibheifがirot/imirを適用済み | 自前のEXIF読み取り（§12.3）の1〜8。範囲外・無しは当てない。**HEICはデコーダが適用済みなのでEXIFの向きは使わない**（二重に回らない） |
+| 順序 | 向き→縮小 | **縮小→向き**（同じ結果で速く、メモリも減る。寸法は向きを当てた後の長辺で決める） |
+| 縮小の寸法 | `thumbnail((2560, 2560))` | `target_dims`。Pillowと同じ丸め（縮める側と反対の辺は、縦横比の誤差が小さい方へ切り捨て／切り上げ）。**Pillowの`thumbnail`と170件で一致**（`tools/gen_thumbnail_fixture.py`が基準、CIで`--check`） |
+| 縮小のフィルタ | BICUBIC（`reducing_gap=2.0`、JPEGは`draft`でDCT縮小もする） | CatmullRom（`fast_image_resize`）。画素は一致しない（§12.9のPSNR） |
+| モード | `L`はそのまま、RGB以外はRGBへ（アルファは落とすだけ） | 同じ（グレースケールのJPEG・PNG・TIFFは1成分のJPEGで出す）。アルファは落とす。16ビットは8ビットへ |
+| ICC | **捨てる**（画素は変換しない） | **sRGBへ変換して付けない**（意図した変更）。読めない・壊れている・RGB用でないICCは、**警告なしで捨てて続ける**（`DerivativeInfo.icc`が`Dropped`。件数を数えてログに出すのは呼ぶ段） |
+| EXIF・GPS | 出力に残らない（`save`にexifを渡さない） | 同じ。エンコーダに渡さないので、JPEG・PNG・TIFF・HEICのどの入力でも残らない（テストが機種名・GPSの文字列とTIFFヘッダの有無を見る） |
+| 出力 | JFIFあり、4:2:0、ハフマン最適化なし | 同じ（`jpeg-encoder`。サイズはPythonと同じ水準） |
+| 書き込み | `dest.with_suffix(".part")`に保存して`rename`。保存に失敗すると`.part`が残りうる | 同じ名前（`x.r90.jpg`→`x.r90.part`）。**成功・失敗・パニックのどれでも`.part`を残さない**（`Drop`で消す）。`rename`の前に`fsync`する。親ディレクトリは作る |
+| 入力の上限 | 約1.79億画素で`DecompressionBombError`。ファイルの大きさは無制限 | 同じ画素数（178,956,970。デコードの前に宣言の寸法で断る）。**ファイルは512 MiBまで**（まるごとメモリに読む） |
+| 回転 | 任意の角度 | 0・90・180・270（負・360超は剰余）。それ以外は`BadRotation`（管理画面もその値しか作らない） |
+| ファイル名 | `{id}.jpg`／`{id}.r{rotation}.jpg` | 同じ。ただし`drive_id`が`[A-Za-z0-9_-]+`でなければ断る |
+
+HEICの`zune-heic`はスレッドを自前で持ち、グリッド画像のタイルを並列に復号する。呼び出し側は**1枚ずつ**呼ぶ（2枚同時にしても処理量は上がらない。image-poc.md §3.4）。
+
+残っている注意: 書き込みの最中にプロセスが落ちる（SIGKILL・電源断）と、`derivatives/<name>.part`が残りうる。同じ名前のderivativeを次に作るときに上書きされるが、写真が消えていれば孤児として残る（EXIFを持たない部分的なJPEGなので、個人情報の問題はない）。起動時の掃除（§11.6）は`.dl_*`だけで、`*.part`は対象にしていない。必要ならT2.3・T2.4で足す。
+
+### 12.3 EXIF（撮影時刻・GPS・向き）
+
+PillowのEXIFの読み方を**境界まで合わせるため**、外部のEXIF crateは使わず、必要なタグだけを自前で読む（`imaging/exif.rs`）。基準は`tools/gen_exif_fixture.py`が作る`tests/fixtures/exif-python.json`（合成のJPEG 43ケースと、Pythonの`extract_exif`の結果。`tests/exif_python.rs`が突き合わせる）。
+
+- **どこから読むか**: JPEGは最初の`Exif\0`で始まるAPP1（SOSの前まで）、PNGは`eXIf`チャンク、TIFFはファイル自身、HEICは`zune-heic`の`exif_data()`（TIFF構造から始まる）。見つからなければ「EXIFなし」（位置なし・時刻なし）。
+- **撮影時刻**: Exif IFDの`36867`（DateTimeOriginal）、なければ`36868`、なければIFD0の`306`。Pythonの`or`の連鎖と同じで、**空文字だけが次へ落ちる**（空白だけ・`0000:00:00 00:00:00`のような値は真なので、そこで止まり、`norm_time`が空か`0000-00-00 00:00`にする）。ASCIIは**末尾のNULを1つだけ**取り、latin-1として読む（Pillowと同じ。UTF-8の全角数字は文字化けして合わず空になる）。IFD0に誤って置かれた`36867`は無視する。
+- **`norm_time`**: 先頭から`\d{4}[:-]\d{2}[:-]\d{2}[ T]\d{2}:\d{2}`に合うときだけ`YYYY-MM-DD HH:MM`にする（暦は見ない。`2024:13:45 25:61:00`→`2024-13-45 25:61`）。秒以降は捨てる。**数字はUnicodeの十進数字（Nd。68の範囲）を通し、ASCIIに直す**（Pythonの`\d`と同じ範囲を読み、元の文字のまま返すPythonと違い、`taken_at`の形式を守る。§0）。
+- **GPS**: GPS IFDに`2`（緯度）と`4`（経度）の**両方**があるときだけ。各3つ以上の数値（有理数・整数。先頭の3つを使う）の度分秒を`度 + 分/60 + 秒/3600`で十進にする（Pythonと同じ式・同じ順序）。参照（`1`・`3`）は**緯度も経度も`S`か`W`のとき負**（緯度の参照が`W`でも負になるのはPythonと同じ）。小文字・その他の文字・型が違うものは正。参照が無いときは正（`N`/`E`）。`round(x, 6)`は、Rustの固定小数点の書式（2進の厳密な値を偶数丸め）で同じ値になる。**範囲は検証しない**（`95.0, 200.0`もそのまま。`0, 0`もそのまま位置ありとして返す）。
+- **Pythonと違う点**（§0）: 緯度か経度が壊れている（成分が3つ未満、数値でない型、分母0）ときは**位置なし（`lat`・`lon`とも`None`）で、時刻は残す**。Pythonは成分不足・型違いで例外（`index_local`は「読み込み失敗」でその写真を索引しない）、分母0はNaNを保存する（SQLiteではNULLで、`loc_source='exif'`だけが残る）。
+- **向き**: IFD0の`0x0112`（SHORT/LONG/BYTEの先頭）。1〜8以外は1。
+- **壊れたEXIF**: 範囲外のオフセット・巨大な個数・切れたデータは**黙って捨てる**（Pillowも警告して飛ばす）。EXIFが読めないことは画像が読めないことではない。EXIFの区間を1バイトずつ壊す・どこで切ってもパニックしないことをテストしている。
+- **画像として読めないファイル**は`ImageError::NotAnImage`（Pythonの`Image.open`の失敗。`index_local`は飛ばす）。Pillowは`.jpg`の名前のGIF・WebPなども開くが、Rustは対象外。
+
+### 12.4 HEICと失敗の分類
+
+`zune-heic` 0.5.0（純Rust）。`irot`・`imir`・`clap`を適用して返す。`mdat`の上限は128 MiB（既定の16 MiBは大きいHEICを拒否する）。主画像だけを取り出す（深度・ゲインマップ・アルファの補助画像は使わない。アルファは捨てる）。ICCは`icc_data()`（`prof`形式）。**nclxだけの色の記述は変換に使わない**（デコーダがnclxでYCbCrからRGBへ変換する分だけ。sRGB以外の原色のnclxは未確認。T2.4）。
+
+**実機のHEICが読めないとき、原因を切り分けられるよう、失敗の文面に*構造の種類*だけを付ける**（`ImageError::Heic`の`Display`。ファイル名・EXIFの値・寸法・座標は出さない。4文字の種別コードは英数字だけに限る）:
+
+```
+heicをデコードできません（hevc-bitstream）構造: brand=heic primary=grid codec=hevc profile=2 bit_depth=10 chroma=1 colr=prof aux=gainmap items=52
+```
+
+| 項目 | 値 |
+| --- | --- |
+| 先頭の語（括弧） | `HeicErrors`の種類を畳んだもの: `io`・`truncated`・`unsupported-version`・`box-too-short`・`inconsistent`・`hevc-bitstream`・`box-header`・`buffer`、`ParseError`はボックスの種別から`grid`・`hevc-config`・`item-structure`・`image-property`、`Generic`はメッセージの*語*から`grid`・`unsupported`・`limit`・`missing-box`・`dimensions`・`decode-failure`・`other`（メッセージ自体は出さない） |
+| `brand` | `ftyp`のメジャーブランド（`heic`・`mif1`・`msf1`など） |
+| `primary` | 主画像（`pitm`）の項目の種類: `single`（`hvc1`など）・`grid`・`overlay`・`identity`・`other`・`unknown` |
+| `codec` | `hevc`・`av1`・`other`・`unknown` |
+| `profile`・`bit_depth`・`chroma` | `hvcC`から。プロファイル（1=Main、2=Main 10、3=Main Still Picture、4=RExt…）、ビット深度、クロマ形式（0=モノクロ、1=4:2:0、2=4:2:2、3=4:4:4） |
+| `colr` | `none`・`prof`（ICC）・`nclx`・`prof+nclx` |
+| `aux` | 補助画像の種類（`auxC`のURNの語から）: `alpha`・`depth`・`gainmap`・`other` |
+| `items` | 項目の数 |
+
+`geoframe img-probe`（§12.6）を実機のHEICに向けると、読めたものは寸法・向き・ICCを、読めなかったものはこの分類を、ファイル名なしで出す。**実機iPhoneのHEIC（グリッド分割・HDRゲインマップ・深度・10ビット）の確認はT2.4**（Driveの鍵が検証環境にまだ無い。§12.10）。
+
+### 12.5 パスの検査（`datadir.rs`）
+
+DBの`display`・`path`列は**信用しない**。Pythonは画像を読む箇所ごとに`resolve().relative_to(DATA_DIR)`で検査している（inventory.md §6.2）のを、Rustは`DataDir`の1か所にまとめた。
+
+1. 文字列として: 空・NUL・絶対パス・`..`の要素を拒否（`.`は読み飛ばす）。判定は文字列のままで、`%2e%2e`のようなデコードは扱わない（Web層`webpath`の仕事）。
+2. ファイルシステムとして: `canonicalize`（シンボリックリンクを辿った実体）が`DATA_DIR`（これも`canonicalize`済み）の中であること。外を指すリンクは拒否。
+3. 書き込み先（`derivative_dest`）: 名前は`[A-Za-z0-9_.-]`だけ・先頭が`.`でない・`..`を含まない・200文字まで。`derivatives/`がシンボリックリンクなら使わない（`display`の`derivatives/...`と実体が食い違うため）。
+4. Driveのファイル名に使うID（`check_drive_id`）: `[A-Za-z0-9_-]`の1〜128文字。DBの行やDriveの応答に区切りが入っていても、`derivatives/`・`tmp/`の外へ出られない。
+
+検査と使用のあいだの差し替え（TOCTOU）は防がない（置き場は取り込み自身だけが書く）。`webpath`のドット始まりの拒否はWeb配信の規則なので持ち込まない（原本の一時ファイルは`tmp/.dl_*`にある）。
+
+### 12.6 `geoframe img-probe`
+
+画像処理の確認・計測用。DB・データ置き場に触れない。
+
+```
+geoframe img-probe [--out <dir>] [--rotation <度>] [--jobs <n>] <画像>...
+#0003 ok format=Jpeg in=4032x3024 out=2560x1920 exif_orientation=6 gray=0 icc=srgb bytes=764042 ms=273
+#0004 error heicをデコードできません（hevc-bitstream）構造: brand=heic primary=grid codec=hevc ... ms=12
+summary files=2 ok=1 failed=1 jobs=1 wall_ms=285 median_ms=273 p95_ms=273 max_rss_kib=147572
+```
+
+ファイル名・パスは出さず、連番（引数の順）で呼ぶ。`--out`があれば`<連番>.jpg`で書き出し（`make_derivative`＝`.part`・`fsync`・`rename`まで含めた時間）、なければ読んで変換するだけ（書かない）。終了コードは、失敗が1枚でもあれば1。musl静的ビルドをCIが合成HEICで動かす。
+
+### 12.7 テスト
+
+- 単体（`imaging/tests.rs`）: 向き1〜8、手動回転の順序、縮小の寸法（Pillowの`thumbnail`と170件で一致）、グレー・アルファ・パレット・16ビットのPNG、PNGの`eXIf`、TIFF（向き）、EXIF・機種名・ICCを出力に残さない（JPEG・PNG・HEICの入力）、P3のICCのsRGB変換、変換できないICC（グレー用・壊れたもの）は捨てて`ICCなし`と同じ出力、途中で切れたJPEG・PNG・HEICの拒否、宣言の寸法が上限を超えるJPEGの拒否、エラーの文面にパス・ファイル名・座標が入らないこと、`.part`を残さない（成功・失敗・`rename`の失敗）、既存の出力を壊さない、`store_derivative`の保存先の検査、EXIFの区間を壊してもパニックしない、拡張子の集合。
+- Pythonとの突き合わせ（`tests/exif_python.rs`）: 合成JPEG 43ケース（境界は§12.3）と`norm_time`の16入力。意図して違える点だけを`rust_differs`に列挙し、それ以外は完全一致を求める。基準のJSONはCIの`app`ジョブが`--check`で再検査する（Pythonの読み取りが変わったら落ちる）。
+- HEIC（`imaging/heic.rs`・`imaging/tests.rs`）: 合成HEIC3枚（`tests/fixtures/synthetic_*.heic`。pillow-heifで作った64x48、`tools/image-poc/gen_fixtures.py`）で、irotを一度だけ適用、ICC、構造の分類、失敗の分類、EXIFの読み取り。
+- パス（`datadir.rs`）: `..`・絶対パス・NUL・外を指すリンク・`derivatives`のリンク・IDの区切り。

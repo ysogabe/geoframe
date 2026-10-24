@@ -13,13 +13,13 @@ Issue #54 と設計案をそのまま要求・設計として扱い、この文�
 | 項目 | 決定 | 理由 |
 | --- | --- | --- |
 | PRの単位 | **フェーズごとに1つ**（P0、P1、…）。各PRでmainへマージする | 全体は数か月規模。最後に1本にすると差分が大きすぎてレビューできない |
-| Rustの置き場所 | リポジトリ直下に`Cargo.toml`（workspace）、`crates/geoframe/`（バイナリ兼ライブラリ1つ）。`crates/geoframe-imgpoc`はP0の計測専用で`publish = false`。P2で本体へ移植した後に削除する | 移行完了後にPythonを消すと、直下がCargo workspaceという最終形になる。crateの分割は必要になってから |
+| Rustの置き場所 | リポジトリ直下に`Cargo.toml`（workspace）、`crates/geoframe/`（バイナリ兼ライブラリ1つ）。P0の計測用だった`crates/geoframe-imgpoc`は、**T2.2で本体（`crates/geoframe/src/imaging`）へ移して削除した**（コミット`c41c4a9`に残る） | 移行完了後にPythonを消すと、直下がCargo workspaceという最終形になる。crateの分割は必要になってから |
 | 本番への影響 | **Rustをmainへマージしても本番は変わらない** | 本番の`deploy-pull.sh`はgitの取り込みと`requirements.txt`変更時の`pip install`だけを行い、Pythonの`server.py`を起動する。Rustのビルドも起動もしない。本番の切替はP5で明示的に行う |
 | 公開API | 既存のパスと応答形を維持する。`/api/v1/photos`と`/derivatives/`は契約、管理APIは現行の管理画面が動く形 | 管理画面のHTML/JSを流用し、作り直しを避ける |
 | 静的ファイル | 管理画面（`app/static`・`app/vendor`）はバイナリへ埋め込む | 「バイナリ＋設定＋データ」で起動する受入条件のため |
 | 設定 | 現行の`GEOFRAME_*`環境変数名と`/etc/default/geoframe`を引き継ぐ | systemd unitと運用手順の差し替えを最小にする |
 | DB | 現行の`catalog.db`スキーマをそのまま読む。追加はテーブル・列の追加だけ（既存列は消さない） | 手動GPS・お気に入り・除外・回転を守る。旧Pythonへ戻せる状態をP5まで保つ |
-| 画像ライブラリ | P0の計測で決めた: miharashiと同じ`image = "0.25.10"`（JPEGのデコードと向きの読み取り）＋縮小は`fast_image_resize`、エンコードは`jpeg-encoder`（[画像PoC](image-poc.md)） | 知見の共有。HEICは`zune-heic`で純Rust・musl静的のまま扱える（実機のHEICでの確認はP2）。逃げ道の`libheif-rs`は依存を明示して既定では外す |
+| 画像ライブラリ | P0の計測で決め、**T2.2で本体に入れた**: miharashiと同じ`image = "0.25.10"`（PNG・TIFFのデコード）＋JPEGのデコードは`zune-jpeg`（厳格モード）、縮小は`fast_image_resize`、エンコードは`jpeg-encoder`、ICCは`moxcms`、EXIFは自前（[画像PoC](image-poc.md)、[ビルド §8](build.md)、[server.md §12](server.md)） | 知見の共有。HEICは`zune-heic`で純Rust・musl静的のまま扱える（**実機のHEICでの確認はT2.4**）。逃げ道の`libheif-rs`は、T2.2で**コードには残さない**ことにした（CIで一度もコンパイルされず腐るため。必要になったらPoCの実装を参照して足す。[ビルド §6](build.md)） |
 
 ## 2. 守ること（本番機の扱い）
 
@@ -56,7 +56,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - 画像PoC: 検証環境にある本番コピーのderivatives（JPEG）から約100枚と、それをHEICへ変換したものを使い、検証環境の上でデコード→EXIF向き補正→長辺2560px→JPEG出力の画質・時間・最大RSS・リンクされるライブラリを計測する。HEICの候補（libheif連携など）を比較する。結果は数値だけを残す。
   - ユーザー指示（2026-10-24）によりGoogle Driveの原本は使わない。実機のHEIC固有の構造（グリッド分割・HDRゲインマップ・深度など）はP2のDrive取り込みの実装時に確かめる。
 - `/api/v1/photos`のserde型とJSON Schemaを定義し、合成DBで契約テストを書く。
-- miharashiの既存`image`実装と共有できる純粋な処理の整理: 今は共有できる関数はなく、共有crateは実際の重複が出てから決める。P2で画像処理を本体へ移すときに改めて検討する（[画像PoC](image-poc.md)の「miharashiとの共有」）。
+- miharashiの既存`image`実装と共有できる純粋な処理の整理: 今は共有できる関数はなく、共有crateは実際の重複が出てから決める。T2.2で本体へ移すときに改めて検討したが、結論は変わらない（[画像PoC](image-poc.md)の「miharashiとの共有」・§10）。
 - 画像Embedding APIはlocal-model-lab #93で評価中（別リポジトリ、OPEN）。P4の開始前に結果を取り込む。P1の妨げにはならない。
 
 #### P0での設計案のレビュー結果
@@ -115,7 +115,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 
 ## 6. 未決事項（決める時期）
 
-- ~~HEIC変換のバックエンドと配布形態 — P0の計測後~~ → 第一候補は`zune-heic`（[画像PoC](image-poc.md)）。実機HEICでの確定はP2
+- ~~HEIC変換のバックエンドと配布形態 — P0の計測後~~ → `zune-heic`を本体に入れた（T2.2、[画像PoC](image-poc.md)）。実機HEICでの確定はT2.4（Drive取り込みの受入）
 - ~~musl静的ビルドかglibcビルドか — P0~~ → **musl静的ビルドを標準にする**（[ビルドと配布](build.md)。HEIC・アロケータを入れる段階で見直す）。HTTPS（rustls）とDNSはT2.1で、musl静的のまま検証環境から通ることを確かめた（[build.md §7](build.md)）
 - 画像Embedding APIのJSON契約・CPU/GPU配置 — local-model-lab #93、P4の開始前
 - Embeddingインデックスの保存形式 — P4の開始前
