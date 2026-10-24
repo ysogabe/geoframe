@@ -12,12 +12,14 @@ P1でPythonと意図して違える点・既知の差の入口。本文は各節
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
 | `GEOFRAME_DATA_DIR`の既定が`./var`（Pythonは`app/var`）。`app/.env`を読まない | 単一バイナリに`app/`が無い。本番はunitの`EnvironmentFile`が同じ役目 | 環境変数・`.env`で与えず手で起動したとき | 設定のテスト。本番はunitが常に与える | なし（決定） | [§1.1](#11-優先順位)・[§1.3](#13-appenvは読まない) |
-| 不正な設定値は起動を断る（終了コード2）。`GEOFRAME_EMBED_BACKEND`だけ`gemini`に落とす | 事故を早く見つける。Pythonは例外で落ちる | 不正な値が設定にあるとき | 単体テスト、検証環境で再起動ループにならないこと | なし（決定） | [§1.1](#11-優先順位)・[§10.6](#106-pythonとの差まとめ) |
+| 不正な設定値は起動を断る（終了コード2）。`GEOFRAME_EMBED_BACKEND`だけ`gemini`に落とす。`GEOFRAME_HOST`のホスト名はPythonは通すがRustは断る（IPアドレスだけ） | 事故を早く見つける。Pythonは例外で落ちる | 不正な値が設定にあるとき（本番は`0.0.0.0`か`127.0.0.1`） | 単体テスト、検証環境で再起動ループにならないこと | なし（決定） | [§1.1](#11-優先順位)・[§10.6](#106-pythonとの差まとめ) |
 | 全角数字など ASCII 以外の数字の撮影時刻をRustは読めない（旅番号がずれうる） | 時刻の解釈を`strptime`に合わせきれていない | EXIFに全角数字が入った写真 | 本番コピーでは差0。単体テスト | P2のインデクサで保存時に正規化 | [§8.2](#82-値) |
 | 夏時間を持つ`TZ`のときの時刻の差 | RustはP1で`TZ`を解釈せず、naiveな日時を文字列・暦で扱う | `TZ`が夏時間を持つとき（本番は`Asia/Tokyo`） | 本番設定では差なし | P2以降で時刻を変換するときに再検討 | [§1.2](#12-tz)・[§10.6](#106-pythonとの差まとめ) |
 | `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字で最後 | 契約（`time`は必ずある）に合わせる | `taken_at`がNULLの行がDBにあるとき | 本番コピーに該当行なし（管理者確認済み） | なし（決定） | [§8.3](#83-pythonとの差) |
-| `lat`ありで`lon`がNULLの行: Pythonは一覧全体が500になりうる、Rustは一覧から外す | 契約（`lon`は必ずある）に合わせる | 該当行があるとき（通常は起きない） | 本番コピーでは未確認、検証環境の全件比較で差0 | なし（決定） | [§8.3](#83-pythonとの差) |
+| `lat`ありで`lon`がNULLの行: Pythonは一覧全体が500になりうる、Rustは一覧から外す | 契約（`lon`は必ずある）に合わせる | 該当行があるとき（通常は起きない） | 本番コピー（2026-10-24のバックアップ）での全件比較で差0（表示対象に該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
 | 静的配信・HTTPの差（領域外のリンクは403、`ETag`での再検証、`/healthz`の新設、未実装ルートの503、`POST`は全部403、接続・配信の上限など） | 安全性、固定の挙動、まだ無いことの明示 | 該当する要求を送ったとき | 検証環境で現行Pythonとの比較（状態コード・本文の一致）、単体テスト | 503・`POST`はP3・P4で実装して外す。他は決定 | [§9.7](#97-pythonとの差まとめ) |
+| 列の型が想定外の行（`lat`が文字列など）があると読み取り全体が失敗して503（Pythonは素通し） | スキーマ上は起きない | `GET /api/v1/photos` | 本番コピーの全件比較で差0（該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
+| DBが無いとRustは起動を断る（終了コード1、systemdで5秒おきに再起動）。PythonはDBを作る | DBを作るのはPython。配備の誤りを失敗として見せる | `GEOFRAME_DATA_DIR`の誤りなど、DBが無いまま起動したとき | 検証環境で確認（[p1-acceptance.md](p1-acceptance.md)） | なし（決定。P5の切替時にはDBがある） | [§2.4](#24-dbが無い壊れている古いときの扱い) |
 | 管理画面の読み取りAPIの差（件数を1トランザクションで数える、想定外の型は503、キーの並びなど） | 一貫性、読み取り専用の表示で落とさない | `GET /api/admin/status`・`photos` | 検証環境の比較で差0、単体テスト | なし（決定） | [§10.6](#106-pythonとの差まとめ) |
 
 検証の記録は[p1-acceptance.md](p1-acceptance.md)。
@@ -50,7 +52,7 @@ P1でPythonと意図して違える点・既知の差の入口。本文は各節
 
 ### 1.2 `TZ`
 
-**Rustは`TZ`を解釈しない。** P1は時刻を変換せず、`taken_at`などのnaiveな日時は文字列のまま扱う（[inventory.md §6.1](inventory.md)）。旅番号の48時間差などの計算（T1.2）も、環境のTZに依存しない`NaiveDateTime`で行う。ただしunitは`TZ=Asia/Tokyo`を与え続ける（並走するPythonのため、将来`Local`を使うときの保険）。起動ログに値を出すだけ。**例外**: `/api/admin/status`の`server_time`と`disk.measured_at`だけは現地時刻を出すので、Cライブラリの`localtime_r`に任せる（`sysinfo.rs`。§10.4）。muslは実行時に`TZ`と`/usr/share/zoneinfo`を読むので、unitが`TZ=Asia/Tokyo`を与えていれば Python と同じ時刻になる。tzdataが無い機体ではPythonもRustもUTCになる。
+**Rustは`TZ`を解釈しない。** P1は時刻を変換せず、`taken_at`などのnaiveな日時は文字列のまま扱う（[inventory.md §6.1](inventory.md)）。旅番号の48時間差などの計算（T1.2）も、環境のTZに依存しない`NaiveDateTime`で行う。ただしunitは`TZ=Asia/Tokyo`を与え続ける（並走するPythonのため、将来`Local`を使うときの保険）。起動ログに値を出すだけ。**例外**: `/api/admin/status`の`server_time`と`disk.measured_at`だけは現地時刻を出すので、Cライブラリの`localtime_r`に任せる（`sysinfo.rs`。§10.4）。muslは実行時に`TZ`と`/usr/share/zoneinfo`を読むので、unitが`TZ=Asia/Tokyo`を与えていれば Python と同じ時刻になる。tzdataが無い機体ではPythonもRustもUTCになる。そのため`TZ`が夏時間を持つときは、Pythonとの時刻の差が出うる（本番は`Asia/Tokyo`で、本番設定では差なし。[§0](#0-pythonとの差の索引)）。P2以降で時刻を変換するときに再検討する。
 
 ### 1.3 `app/.env`は読まない
 
@@ -210,7 +212,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 意図した差は2つ。どちらも契約（`time`・`lon`は必ずある）に合わせたもの。
 
 - `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字（時刻不明）で最後。本番のコピーには該当する行が無いことを管理者が確認済み。
-- `lat`はあって`lon`がNULLの行: Pythonは、同じ旅に他の写真があれば`assign_trips`の`min(lon)`が`TypeError`になって**一覧全体が500**、その行だけの旅なら`lon: null`。Rustは一覧から外す（写真IDだけをwarnログに出す）。通常は`setloc`が`lat`/`lon`を一緒に書くので起きないが、**本番のコピーでは未確認**。T1.5の全件比較で、Pythonが500でRustが200の差が出たらこれが原因。
+- `lat`はあって`lon`がNULLの行: Pythonは、同じ旅に他の写真があれば`assign_trips`の`min(lon)`が`TypeError`になって**一覧全体が500**、その行だけの旅なら`lon: null`。Rustは一覧から外す（写真IDだけをwarnログに出す）。通常は`setloc`が`lat`/`lon`を一緒に書くので起きない。本番のコピー（2026-10-24のバックアップ）での全件比較（`/api/v1/photos`の3,065件、型まで一致。[p1-acceptance.md §1・§2](p1-acceptance.md)）で差は0で、表示対象に該当する行は無かった。
 
 ほかに、列の型が想定と違う行（`lat`が文字列など）があるとRustは読み取り全体が失敗して503になる（Pythonは素通し）。スキーマ上は起きない。
 

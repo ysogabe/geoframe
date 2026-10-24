@@ -26,8 +26,8 @@ CARGO_TARGET_DIR=/tmp/miharashi-feed-check-target cargo build --release
 BIN=/tmp/miharashi-feed-check-target/release/miharashi-feed-check
 URL=http://<検証環境のホスト>:8080
 
-# 定常: 200 枚（写真かカードが届くたびに next() を呼ぶ）。取得・デコードの失敗は標準エラーに "photo: …" で出て、ツールが数えて終了コードに反映する
-$BIN --url $URL --count 200 2>feed.err; echo "rc=$?"; grep -c '^photo:' feed.err
+# 定常: 200 枚（写真かカードが届くたびに next() を呼ぶ）。停止・再開の区間の外で Retrying が届けば、終了コードが 1 になる
+$BIN --url $URL --count 200 2>feed.err; echo "rc=$?"
 
 # 停止と再開: 10 秒後に停止コマンド、その 8 秒後に再開コマンドを実行し、300 枚まで読む。
 # 止めている間は Retrying（指数バックオフ）、戻すと Online が 1 回届いて自動で続きを読む。キー操作は要らない
@@ -43,7 +43,7 @@ $BIN --url $URL --count 300 --stop-after 10 --resume-after 8 \
 終了コード 0 の条件（満たさなければ 1。引数の誤りは 2）:
 
 - 目標の枚数に届いた。
-- 取得・デコードの失敗が 0 件。miharashi が標準エラーに出す`photo: …`の行（ツールが自分を子プロセスとして起こして数え、行はそのまま流す）と、停止から復帰までの区間の外で届いた`Retrying`（一覧や写真を3回続けて読めず再接続に入った）の合計。1件でもあれば失敗。miharashi が別の写真へ飛ばして先へ進む1〜2回の失敗は、イベントにも標準エラーにも出ないので数えられない。
+- 停止から復帰までの区間の外で届いた`Retrying`（一覧や写真を3回続けて読めず再接続に入った）が 0 回。1回でもあれば失敗。`Feed::spawn`の経路では、miharashi が別の写真へ飛ばして先へ進む1〜2回の取得・デコードの失敗はイベントにも標準エラーにも出ないので数えられない。検出できるのは3回続けて失敗して`Retrying`になったときだけ（標準エラーの`photo: …`は`PhotoItem::ensure_frame`と inline モードだけが出し、このツールはどちらも通らない）。
 - 停止・再開を指定したときは、さらに、停止と再開の両コマンドが実行されて成功し、`Retrying`と、再開後の`Online`が観測され、復帰後に写真を受信したこと。停止の前に件数へ届いた、復帰を観測する前に終わった場合は失敗（`--count`を増やす）。
 
 `photos: 対象 N 枚 …`は、miharashi の品質フィルタを通った表示対象の数（`/api/v1/photos`の件数より少ない）。

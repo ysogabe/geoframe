@@ -6,10 +6,12 @@
 //!       [--stop-cmd '<止めるコマンド>' --stop-after 10 --start-cmd '<戻すコマンド>' --resume-after 8]
 //!
 //! `Feed::spawn` を実際の設定と同じ形で起こし、写真かカードが届くたびに `next()` を呼んで `--count` 枚まで進める。
-//! 出力は件数だけ（写真の値・場所・タイトルは出さない）。終了コード 0 = `--count` 枚に届き、取得・デコードの失敗が 0
-//! （停止・再開を指定したときは、下の条件も満たす）。取得・デコードの失敗は、miharashi が標準エラーに出す `photo: …` の行の数と、
-//! 停止・再開の区間の外で届いた `Retrying`（一覧や写真を3回続けて読めず再接続に入った）の数で数える。1件でもあれば終了コード 1。
-//! `photo: …` を数えるため、自分自身を子プロセスとして起こし、その標準エラーを読んで流す（`FEED_CHECK_CHILD`）。
+//! 出力は件数だけ（写真の値・場所・タイトルは出さない）。終了コード 0 = `--count` 枚に届き、停止・再開の区間の外で
+//! `Retrying`（一覧や写真を3回続けて読めず再接続に入った）が 0 回（停止・再開を指定したときは、下の条件も満たす）。
+//! `Feed::spawn` の経路では、miharashi が別の写真へ飛ばして先へ進む1〜2回の取得・デコードの失敗はイベントにも標準エラーにも
+//! 出ないので数えられない。検出できるのは3回続けて失敗して `Retrying` になったときだけ。
+//! （標準エラーの `photo: …` は `PhotoItem::ensure_frame` と inline モードの `Inline::push_current` だけが出し、
+//! このツールはどちらも通らないので、`photo:` の行は数えない。）
 //!
 //! 停止と再開（再接続の確認）: `--stop-cmd` を `--stop-after` 秒後に、`--start-cmd` を、その `--resume-after` 秒後に
 //! `sh -c` で実行する。止めている間は `Retrying`（指数バックオフ）、戻したあとは `Online` が届き、自動で
@@ -81,8 +83,7 @@ mod home {
 }
 
 use photos::{Feed, FeedEvent, FeedStatus, Source};
-use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 struct Args {
@@ -151,52 +152,7 @@ fn sh(cmd: &str) -> bool {
     Command::new("sh").arg("-c").arg(cmd).status().is_ok_and(|s| s.success())
 }
 
-/// 子プロセスだと分かる印。
-const CHILD_ENV: &str = "FEED_CHECK_CHILD";
-
-/// 自分自身を子として起こし、標準エラーの `photo: …`（取得・デコードの失敗）を数えながらそのまま流す。
-fn supervise() -> i32 {
-    let exe = match std::env::current_exe() {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("ERROR: 自分自身を起こせない: {e}");
-            return 2;
-        }
-    };
-    let mut child = match Command::new(exe)
-        .args(std::env::args_os().skip(1))
-        .env(CHILD_ENV, "1")
-        .stderr(Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("ERROR: 子プロセスを起こせない: {e}");
-            return 2;
-        }
-    };
-    let mut failures = 0usize;
-    if let Some(err) = child.stderr.take() {
-        for line in BufReader::new(err).lines().map_while(Result::ok) {
-            if line.starts_with("photo:") {
-                failures += 1;
-            }
-            eprintln!("{line}");
-        }
-    }
-    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
-    println!("取得・デコードの失敗（`photo:` の行）: {failures} 件");
-    if code == 0 && failures > 0 {
-        eprintln!("取得・デコードの失敗があった");
-        return 1;
-    }
-    code
-}
-
 fn main() {
-    if std::env::var_os(CHILD_ENV).is_none() {
-        std::process::exit(supervise());
-    }
     run();
 }
 
@@ -232,12 +188,13 @@ fn run() {
                 cmd_failed |= !sh(stop);
                 stopped_at = Some(Instant::now());
             }
-            if let Some(s) = stopped_at {
-                if started_at.is_none() && s.elapsed() >= a.resume_after {
-                    eprintln!("[feed-check] {}s: 再開コマンドを実行", t0.elapsed().as_secs());
-                    cmd_failed |= !sh(start);
-                    started_at = Some(Instant::now());
-                }
+            if let Some(s) = stopped_at
+                && started_at.is_none()
+                && s.elapsed() >= a.resume_after
+            {
+                eprintln!("[feed-check] {}s: 再開コマンドを実行", t0.elapsed().as_secs());
+                cmd_failed |= !sh(start);
+                started_at = Some(Instant::now());
             }
         }
         match feed.try_recv() {
@@ -287,13 +244,12 @@ fn run() {
         println!("最初の Retrying から次の写真まで: {:.1} 秒", g.as_secs_f64());
     }
     println!("経過: {:.0} 秒", t0.elapsed().as_secs_f64());
-    // 取得・デコードの失敗（`photo:` の行）は親が数える。ここでは、件数・コマンド・再接続の条件を見る。
     let mut problems: Vec<String> = Vec::new();
     if shown < a.count {
         problems.push("目標の枚数に届かなかった".into());
     }
     if unplanned_retrying > 0 {
-        problems.push(format!("停止・再開の区間の外で Retrying が {unplanned_retrying} 回あった（取得に失敗した）"));
+        problems.push(format!("停止・再開の区間の外で Retrying が {unplanned_retrying} 回あった（3回続けて取得に失敗した）"));
     }
     if cmd_failed {
         problems.push("停止または再開のコマンドが失敗した".into());
