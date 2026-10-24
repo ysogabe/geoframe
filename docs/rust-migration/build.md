@@ -58,7 +58,7 @@ cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 - サイズはほぼ同じ。リリースプロファイルは既定のまま（`strip`・LTOは未設定。必要になったら設定する）。
 - **T1.3（管理画面の静的ファイル約936 KiBの埋め込み、静的配信、Host検査）の後**: musl静的で strip前 5,767,424 B（約5.5 MiB）、strip後 4,886,392 B（約4.7 MiB）。T1.2の時点（strip前 4,565,432 B、strip後 3,772,152 B）から約1.1〜1.2 MB増え、そのうち約0.94 MBが埋め込んだファイル。`static-pie linked`・`ldd`は`statically linked`のまま。埋め込みは`crates/geoframe/build.rs`が`app/static`・`app/vendor`を`include_bytes!`の表にする（外部crateなし）ので、ビルドには**リポジトリの`app/`が要る**（[server.md §9.4](server.md)）。追加した依存は`httpdate`・`futures-util`だけで、どちらも純Rustで依存木に既にあった。
 - **T1.4（管理画面の読み取りAPI）の後**: musl静的で strip前 6,170,752 B（約5.9 MiB）。`static-pie linked`・`ldd`は`statically linked`のまま。直接の依存に`libc`（`statvfs`・`localtime_r`のため。`tokio`が既に引いている純FFIのcrateで、Cのビルドは無い）を足した。`unsafe`は`sysinfo.rs`だけ（[server.md §10.4](server.md)）。musl版でも`TZ=Asia/Tokyo`の現地時刻が出ることを確かめた（合成DB・ループバックのみ）。
-- **T2.2（画像処理）の後**: §8。musl静的で strip前 15,831,976 B（約15.1 MiB）、strip後 13,491,064 B（約12.9 MiB）（T2.2の最後のコミット時点）。直前（T2.1の終わり、`57714f2`）を同じ手順で作り直した 9,145,120 B／7,590,648 B から、strip前で +6.7 MB（+73%）。`static-pie linked`・`ldd`は`statically linked`のまま。
+- **T2.2（画像処理）の後**: §8。musl静的で strip前 15,812,376 B（約15.1 MiB）、strip後 13,491,064 B（約12.9 MiB）（T2.2の最後のコミット時点。レビューの修正の前後で、strip後は同じ値だった）。直前（T2.1の終わり、`57714f2`）を同じ手順で作り直した 9,145,120 B／7,590,648 B から、strip前で +6.7 MB（+73%）。`static-pie linked`・`ldd`は`statically linked`のまま。
 - glibcビルドの要求は2.34までで、検証環境（2.39）にもn100（2.41）にも載る。ただし、これはこの小さな依存セットでの値で、依存が増えると上がる。配布先のglibcより新しい機体でビルドすると動かなくなる（plan.mdの懸念）。
 
 ## 4. 検証環境での動作確認
@@ -180,8 +180,8 @@ PoCの`kamadak-exif`は**使わない**: PillowのEXIFの読み方（ASCIIの末
 | | strip前 | strip後 |
 | --- | --- | --- |
 | T2.1の終わり（基準。`57714f2`、同じ手順で作り直した） | 9,145,120 B（約8.7 MiB） | 7,590,648 B（約7.2 MiB） |
-| T2.2の画像処理を入れた後（最後のコミット） | 15,831,976 B（約15.1 MiB） | 13,491,064 B（約12.9 MiB） |
-| 差 | +6,686,856 B（約+6.4 MiB、+73%） | +5,900,416 B（約+5.6 MiB、+78%） |
+| T2.2の画像処理を入れた後（最後のコミット） | 15,812,376 B（約15.1 MiB） | 13,491,064 B（約12.9 MiB） |
+| 差 | +6,667,256 B（約+6.4 MiB、+73%） | +5,900,416 B（約+5.6 MiB、+78%） |
 
 `static-pie linked`・`ldd`は`statically linked`のまま。リリースプロファイルは既定のまま（LTO・`opt-level="s"`・`strip`は未設定）。
 
