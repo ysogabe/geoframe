@@ -8,6 +8,14 @@
 //! 応答は [`Photo`] の JSON 配列。DB からの取得・除外・並び・旅番号の計算は T1.2 の仕事で、
 //! ここでは形だけを固定する。
 //!
+//! **例外（`taken_at` が NULL の行）**: 現行の Python は `photos.taken_at` が NULL の行で
+//! `time: null` を出し、並びでは先頭になる（空文字の行は最後）。契約では `time` は文字列
+//! （不明は空文字）で、この型の `time` も `String` なので、`null` は読めない。本番のコピーには
+//! `taken_at` が NULL の行は無い（管理者が確認済み）ので、Rust での扱い（空文字にそろえて
+//! 最後に並べる等）は T1.2 で決める。現行 Python の挙動は
+//! `app/tests/test_photo_feed_contract.py` の `test_null_taken_at_comes_out_as_null_and_first`
+//! に記録してある。
+//!
 //! [`docs/architecture/photo-feed-contract.md`]: ../../../docs/architecture/photo-feed-contract.md
 //! [`docs/architecture/photo-feed.schema.json`]: ../../../docs/architecture/photo-feed.schema.json
 
@@ -150,6 +158,8 @@ mod tests {
             "2025-06-07 11:6",
             "２０２５-06-07 11:00",
             " 2025-06-07 11:00",
+            "2025-06-07 11:00\n",
+            "\n",
         ] {
             assert!(!is_time(ng), "{ng:?}");
         }
@@ -166,6 +176,7 @@ mod tests {
             "2025-06-08T09:30:60",
             "2025-06-08T09:30:00Z",
             "2025-06-08T09:30:00+09:00",
+            "2025-06-08T09:30:00\n",
         ] {
             assert!(!is_fetched_at(ng), "{ng:?}");
         }

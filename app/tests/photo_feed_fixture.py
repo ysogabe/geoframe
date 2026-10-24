@@ -5,7 +5,8 @@
 この JSON を読み、Python と同じ形で出せることを確かめる。
 
 再生成: `python3 tools/gen_photo_feed_fixture.py`（差分の検査は `--check`）。
-座標・地名・ファイル名は実在のものを使わない。
+座標・地名・ファイル名は実在のものを使わない。座標は 35.0/139.0 のような0.1刻みの丸い値、
+地名は「架空県」「見本市」「サンプル町」。
 """
 import json
 import tempfile
@@ -23,7 +24,7 @@ PHOTO_COLUMNS = ("id", "source", "display", "name", "md5", "taken_at", "lat", "l
                  "favorite", "hidden")
 
 
-def _photo(id, **over):
+def photo_row(id, **over):
     row = {"id": id, "source": "drive", "display": f"derivatives/p{id:02d}.jpg",
            "name": f"IMG_{id:04d}.jpg", "md5": f"md5-{id}", "taken_at": "2025-06-01 10:00",
            "lat": 35.0, "lon": 139.0, "loc_source": "exif", "place": None, "elev": None,
@@ -36,32 +37,32 @@ def _photo(id, **over):
 # 一覧に出る写真（出る順は taken_at 昇順、空文字は最後）と、出ない写真
 PHOTOS = [
     # 品質・AIなし。住所なし（海外など）。タイトルはファイル名
-    _photo(1, taken_at="2025-06-01 10:00", lat=35.1, lon=139.1),
+    photo_row(1, taken_at="2025-06-01 10:00", lat=35.1, lon=139.1),
     # similar の推奨。お気に入り。住所あり。取り込み日時あり・標高あり。位置は推定
-    _photo(2, taken_at="2025-06-01 12:00", pref="千葉県", city="千葉市", place="中央",
+    photo_row(2, taken_at="2025-06-01 12:00", pref="架空県", city="見本市", place="サンプル町",
            favorite=1, fetched_at="2025-06-02T09:30:00", elev=12.5, loc_source="inferred",
            lat=35.2, lon=139.2),
     # similar の推奨外（一覧には残る）。町名なしのタイトルは市区町村だけ
-    _photo(3, taken_at="2025-06-01 12:01", pref="千葉県", city="千葉市",
+    photo_row(3, taken_at="2025-06-01 12:01", pref="架空県", city="見本市",
            fetched_at="2025-06-02T09:30:01", lat=35.2, lon=139.2),
     # exact の推奨。手動のタイトル。前の写真から48時間以上後なので次の旅
-    _photo(4, taken_at="2025-06-05 10:00", title="夏の海", elev=3.0, lat=35.3, lon=139.3),
+    photo_row(4, taken_at="2025-06-05 10:00", title="夏の海", elev=3.0, lat=35.3, lon=139.3),
     # exact の推奨外（一覧から除かれる）
-    _photo(5, taken_at="2025-06-05 10:00", lat=35.3, lon=139.3),
+    photo_row(5, taken_at="2025-06-05 10:00", lat=35.3, lon=139.3),
     # AI整理で同じ場面と判定された推奨
-    _photo(6, taken_at="2025-06-05 11:00", lat=35.4, lon=139.4),
+    photo_row(6, taken_at="2025-06-05 11:00", lat=35.4, lon=139.4),
     # AI整理で同じ場面と判定された推奨外（一覧から除かれる）
-    _photo(7, taken_at="2025-06-05 11:01", lat=35.4, lon=139.4),
+    photo_row(7, taken_at="2025-06-05 11:01", lat=35.4, lon=139.4),
     # 同じ AI グループの推奨外だがお気に入り（一覧に残る）
-    _photo(8, taken_at="2025-06-05 11:02", favorite=1, lat=35.4, lon=139.4),
+    photo_row(8, taken_at="2025-06-05 11:02", favorite=1, lat=35.4, lon=139.4),
     # AI整理が未判定のグループ（推奨外でも一覧に残る）
-    _photo(9, taken_at="2025-06-05 11:03", lat=35.5, lon=139.5),
+    photo_row(9, taken_at="2025-06-05 11:03", lat=35.5, lon=139.5),
     # 撮影日時が空文字（最後に並ぶ）。lat/lon は整数値の浮動小数（35.0 / 139.0）
-    _photo(10, taken_at=""),
+    photo_row(10, taken_at=""),
     # 一覧に出ない: 非表示、表示用画像なし、位置なし
-    _photo(11, hidden=1),
-    _photo(12, display=None),
-    _photo(13, lat=None, lon=None),
+    photo_row(11, hidden=1),
+    photo_row(12, display=None),
+    photo_row(13, lat=None, lon=None),
 ]
 
 # photo_quality: (photo_id, group_id, group_kind, rank_in_group, recommended, score)
@@ -84,24 +85,28 @@ AI_MEMBERS = [
 ]
 
 
-def build_items():
-    """合成DBに対する現行 `api_photos()` の出力（JSONに直せる dict のリスト）。"""
+def build_items(extra_photos=()):
+    """合成DBに対する現行 `api_photos()` の出力（JSONに直せる dict のリスト）。
+
+    `extra_photos` は PHOTOS に足す行（フィクスチャには入れない特殊な行の挙動を調べる用）。
+    """
     with tempfile.TemporaryDirectory() as tmp:
         with patch.object(store, "DB_PATH", Path(tmp) / "catalog.db"), \
                 patch.object(store, "_db", None):
             try:
-                _seed()
+                _seed(extra_photos)
                 return photos.api_photos()
             finally:
                 if store._db is not None:
                     store._db.close()
 
 
-def _seed():
+def _seed(extra_photos=()):
+    photos_ = [*PHOTOS, *extra_photos]
     marks = ",".join("?" * len(PHOTO_COLUMNS))
     store.dbm(f"INSERT INTO photos({','.join(PHOTO_COLUMNS)}) VALUES({marks})",
-              [tuple(p[c] for c in PHOTO_COLUMNS) for p in PHOTOS])
-    by_id = {p["id"]: p for p in PHOTOS}
+              [tuple(p[c] for c in PHOTO_COLUMNS) for p in photos_])
+    by_id = {p["id"]: p for p in photos_}
     store.dbm("""INSERT INTO photo_quality(photo_id, display, source_md5, source_mtime,
                    content_sha256, group_id, group_kind, rank_in_group, recommended, score,
                    algorithm, analyzed_at)

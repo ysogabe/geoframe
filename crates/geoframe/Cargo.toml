@@ -14,3 +14,5 @@ tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "s
 # 契約テストで応答を JSON Schema と突き合わせる。Schema は内部参照（`#/$defs/...`）だけなので、HTTP・ファイルの
 # 参照解決（reqwest/rustls）は要らない
 jsonschema = { version = "0.60.1", default-features = false }
+# miharashi と同じ日付の解析（暦の正しさまで見る）を再現する。miharashi の crate は使わない
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }

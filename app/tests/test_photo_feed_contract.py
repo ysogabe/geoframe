@@ -55,8 +55,8 @@ def _row(**over):
 
 ROWS = [
     _row(),
-    _row(id=2, favorite=1, display="derivatives/b.jpg", pref="千葉県", city="千葉市",
-         place="中央", taken_at="2025-06-07 11:00",
+    _row(id=2, favorite=1, display="derivatives/b.jpg", pref="架空県", city="見本市",
+         place="サンプル町", taken_at="2025-06-07 11:00",
          quality_kind="similar", quality_score=0.9, quality_group=1,
          quality_rank=1, quality_recommended=1),
     _row(id=3, display="derivatives/c.jpg", taken_at=""),
@@ -84,11 +84,11 @@ class PhotoFeedFieldsTest(unittest.TestCase):
         self.assertEqual((first["fav"], first["quality_recommended"]), (False, False))
         self.assertEqual(first["title"], "IMG_0001")   # 地名が無ければファイル名
         self.assertEqual((second["fav"], second["quality_recommended"]), (True, True))
-        self.assertEqual((second["pref"], second["title"]), ("千葉県", "千葉市 中央"))
+        self.assertEqual((second["pref"], second["title"]), ("架空県", "見本市 サンプル町"))
         self.assertEqual(second["time"], "2025-06-07 11:00")
         self.assertEqual(third["time"], "")             # 撮影時刻不明は空文字
         self.assertEqual([i["id"] for i in self.items], [1, 2, 3])
-        self.assertEqual((second["city"], second["lat"], second["lon"]), ("千葉市", 35.0, 139.0))
+        self.assertEqual((second["city"], second["lat"], second["lon"]), ("見本市", 35.0, 139.0))
         self.assertEqual((first["city"], first["pref"]), ("", ""))   # 住所なし（海外など）
         self.assertEqual((first["quality_kind"], second["quality_kind"]), ("", "similar"))
 
@@ -127,6 +127,7 @@ class PhotoFeedSchemaTest(unittest.TestCase):
                 "trip": 0}
         self.assertEqual(mini_jsonschema.errors([good], SCHEMA), [])
         broken = [("id", "1"), ("id", True), ("file", "/derivatives/a.jpg"), ("time", "2025-06-07"),
+                  ("time", "2025-06-07 11:00\n"), ("fetched_at", "2025-06-08T09:30:00\n"),
                   ("lat", "35.0"), ("lat", 91.0), ("title", ""), ("fav", 1),
                   ("fetched_at", "2025-06-08 09:30:00"), ("quality_kind", "other"),
                   ("quality_recommended", None), ("trip", -1), ("trip", 0.5)]
@@ -153,6 +154,18 @@ class PhotoFeedFixtureTest(unittest.TestCase):
 
     def test_real_schema_output_satisfies_the_schema(self):
         self.assertEqual(mini_jsonschema.errors(self.items, SCHEMA), [])
+
+    def test_null_taken_at_comes_out_as_null_and_first(self):
+        # 現行実装の挙動の記録（T1.2 で Rust の正規化方針を決める）。契約は time を文字列と
+        # するが、taken_at=NULL の行は `time: null` で先頭に並び、それだけで1つの旅になる。
+        # 本番コピーには NULL の行は無い（管理者確認済み）
+        row = photo_feed_fixture.photo_row(14, taken_at=None, lat=35.6, lon=139.6)
+        items = photo_feed_fixture.build_items([row])
+        self.assertEqual([i["id"] for i in items], [14, 1, 2, 3, 4, 6, 8, 9, 10])
+        self.assertIsNone(items[0]["time"])
+        self.assertEqual(items[0]["trip"], 0)
+        self.assertEqual([i["trip"] for i in items[1:]], [1, 1, 1, 2, 2, 2, 2, 3])
+        self.assertTrue(mini_jsonschema.errors(items, SCHEMA))   # 契約（string）には合わない
 
     def test_fixture_covers_the_selection_rules(self):
         ids = [i["id"] for i in self.items]

@@ -11,13 +11,14 @@
 //! - 文字列は `as_str().unwrap_or("")`、`lat`/`lon` は `as_f64()`、`trip` は `as_i64()`。
 //! - `fav` と `quality_recommended` は `== true`（`1` や `"true"` は false 扱い）。
 //! - `id` は数値・文字列ならそれを文字列にし、無ければ `file` で代用する。
-//! - `time`・`fetched_at` は先頭16文字を `YYYY-MM-DD HH:MM` か `YYYY-MM-DDTHH:MM` で読み、
-//!   読めなければ先頭10文字の日付だけ（12:00 扱い）で読む。
+//! - `time`・`fetched_at` は先頭16文字を chrono で `YYYY-MM-DD HH:MM` か `YYYY-MM-DDTHH:MM` と
+//!   読み、読めなければ先頭10文字の日付だけ（12:00 扱い）で読む。暦（月の日数・閏年）も見る。
 
 mod common;
 
+use chrono::{NaiveDate, NaiveDateTime};
 use common::{CONTRACT_FIELDS, python_fixture, sample_photos};
-use geoframe::feed::Photo;
+use geoframe::feed::{Photo, is_time};
 use serde_json::{Value, json};
 
 /// miharashi の `Meta` と `Entry` のうち、GEOFRAME の応答から読む部分。
@@ -102,35 +103,23 @@ fn read_feed(list: &Value) -> Result<Vec<Read>, String> {
     Ok(out)
 }
 
-/// `album::parse_time`（暦の正しさは月1〜12・日1〜31・時分の範囲までしか見ない）。
-/// 戻り値は (年, 月, 日, 時, 分)。
-fn parse_time(s: &str) -> Option<(u32, u32, u32, u32, u32)> {
+/// `album::parse_time`。chrono で解析するので、月ごとの日数・閏年まで見る
+/// （`2025-02-31 10:00` は読めず、日付だけにも落ちない）。
+fn parse_time(s: &str) -> Option<NaiveDateTime> {
     let s = s.get(..16).unwrap_or(s);
-    let full = |sep: char| -> Option<(u32, u32, u32, u32, u32)> {
-        let (date, time) = s.split_once(sep)?;
-        let (y, m, d) = parse_date(date)?;
-        let (h, mi) = time.split_once(':')?;
-        let (h, mi) = (num(h, 2)?, num(mi, 2)?);
-        (h < 24 && mi < 60).then_some((y, m, d, h, mi))
-    };
-    full(' ').or_else(|| full('T')).or_else(|| {
-        let (y, m, d) = parse_date(s.get(..10)?)?;
-        Some((y, m, d, 12, 0))
-    })
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M"))
+        .ok()
+        .or_else(|| {
+            NaiveDate::parse_from_str(s.get(..10)?, "%Y-%m-%d")
+                .ok()?
+                .and_hms_opt(12, 0, 0)
+        })
 }
 
-fn num(s: &str, len: usize) -> Option<u32> {
-    (s.len() == len && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse().ok())?
-}
-
-fn parse_date(s: &str) -> Option<(u32, u32, u32)> {
-    let mut it = s.split('-');
-    let (y, m, d) = (
-        num(it.next()?, 4)?,
-        num(it.next()?, 2)?,
-        num(it.next()?, 2)?,
-    );
-    ((1..=12).contains(&m) && (1..=31).contains(&d) && it.next().is_none()).then_some((y, m, d))
+/// 期待値の組み立て（`parse_time` の結果との比較用）。
+fn at(y: i32, m: u32, d: u32, h: u32, mi: u32) -> Option<NaiveDateTime> {
+    NaiveDate::from_ymd_opt(y, m, d)?.and_hms_opt(h, mi, 0)
 }
 
 /// フィクスチャのうち miharashi が一覧に出す写真の ID（`album::eligible` の結果）。
@@ -158,12 +147,12 @@ fn reads_the_python_fixture() {
     }
     // 値の読み取りを1件で確かめる（id=2: お気に入り・住所あり・取り込み日時あり）
     let r = reads.iter().find(|r| r.id == "2").unwrap();
-    assert_eq!(r.place, "千葉県 千葉市 中央");
-    assert_eq!((r.pref.as_str(), r.city.as_str()), ("千葉県", "千葉市"));
+    assert_eq!(r.place, "架空県 見本市 サンプル町");
+    assert_eq!((r.pref.as_str(), r.city.as_str()), ("架空県", "見本市"));
     assert!(r.fav);
     assert_eq!(r.trip, Some(0));
-    assert_eq!(parse_time(&r.fetched_at), Some((2025, 6, 2, 9, 30)));
-    assert_eq!(parse_time(&r.taken), Some((2025, 6, 1, 12, 0)));
+    assert_eq!(parse_time(&r.fetched_at), at(2025, 6, 2, 9, 30));
+    assert_eq!(parse_time(&r.taken), at(2025, 6, 1, 12, 0));
     // 住所なし（pref 空）の場所名はタイトルだけ。時刻不明は読めないまま空
     let r = reads.iter().find(|r| r.id == "1").unwrap();
     assert_eq!(r.place, "IMG_0001");
@@ -270,10 +259,40 @@ fn miharashi_quirks_that_the_contract_must_keep_in_mind() {
     let item = json!([{"file": "derivatives/a.jpg", "id": "abc"}]);
     assert_eq!(read_feed(&item).unwrap()[0].id, "abc");
     // 時刻は T 区切りも、日付だけも読む。契約の書式（空白区切り・秒なしと T 区切り・秒あり）は読める範囲
-    assert_eq!(parse_time("2025-06-07 11:00"), Some((2025, 6, 7, 11, 0)));
-    assert_eq!(parse_time("2025-06-08T09:30:00"), Some((2025, 6, 8, 9, 30)));
-    assert_eq!(parse_time("2025-06-08"), Some((2025, 6, 8, 12, 0)));
-    assert_eq!(parse_time("2025-06-07 25:00"), Some((2025, 6, 7, 12, 0))); // 時刻が壊れても日付は読む
+    assert_eq!(parse_time("2025-06-07 11:00"), at(2025, 6, 7, 11, 0));
+    assert_eq!(parse_time("2025-06-08T09:30:00"), at(2025, 6, 8, 9, 30));
+    assert_eq!(parse_time("2025-06-08"), at(2025, 6, 8, 12, 0));
+    assert_eq!(parse_time("2025-06-07 25:00"), at(2025, 6, 7, 12, 0)); // 時刻が壊れても日付は読む
     assert_eq!(parse_time(""), None);
     assert_eq!(parse_time("unknown"), None);
+}
+
+#[test]
+fn miharashi_checks_the_calendar_which_the_schema_pattern_does_not() {
+    // 存在しない日付は読めない（日付だけにも落ちない）。平年の2月29日も同じ
+    for ng in [
+        "2025-02-31 10:00",
+        "2025-02-30 10:00",
+        "2025-02-29 10:00",
+        "2025-04-31 10:00",
+        "2025-06-31T10:00",
+        "2025-02-31",
+        "2100-02-29 10:00", // 100で割れ400で割れない年は平年
+    ] {
+        assert_eq!(parse_time(ng), None, "{ng:?}");
+    }
+    // 閏年の2月29日と各月の末日は読める
+    assert_eq!(parse_time("2024-02-29 10:00"), at(2024, 2, 29, 10, 0));
+    assert_eq!(parse_time("2000-02-29 10:00"), at(2000, 2, 29, 10, 0));
+    assert_eq!(parse_time("2025-04-30 23:59"), at(2025, 4, 30, 23, 59));
+    assert_eq!(parse_time("2025-12-31T00:00:00"), at(2025, 12, 31, 0, 0));
+    // 契約の書式（Schema の pattern と is_time）は月1〜12・日1〜31までしか見ないので、
+    // miharashi が読めない日付を通す。書く側（Python の取り込み）が実在の日付を出す前提
+    for s in ["2025-02-31 10:00", "2025-02-29 10:00"] {
+        assert!(is_time(s), "{s:?}");
+    }
+    let validator = common::validator();
+    let mut item = python_fixture()[1].clone();
+    item["time"] = json!("2025-02-31 10:00");
+    assert!(common::violations(&validator, &json!([item])).is_empty());
 }

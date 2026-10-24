@@ -182,6 +182,8 @@ fn schema_and_type_reject_wrong_json_types_and_formats() {
         ("file", json!(null)),
         ("time", json!("2025-06-07")),
         ("time", json!("2025-06-07T11:00")),
+        ("time", json!("2025-06-07 11:00\n")),
+        ("fetched_at", json!("2025-06-08T09:30:00\n")),
         ("time", json!(null)),
         ("lat", json!("35.0")),
         ("lat", json!(91.0)),
@@ -270,6 +272,33 @@ fn format_helpers_agree_with_the_schema_patterns() {
         let ok = violations(&validator, &json!([item])).is_empty();
         assert_eq!(is_fetched_at(s), ok, "fetched_at {s:?}");
     }
+}
+
+#[test]
+fn trailing_newline_is_rejected_by_schema_and_helpers() {
+    // Python の re は `$` が末尾の改行の前にも一致する。Schema の pattern（ECMA 262）では一致しない
+    let validator = validator();
+    let base = as_array(&python_fixture())[1].clone();
+    for (field, ok, ng) in [
+        ("time", "2025-06-07 11:00", "2025-06-07 11:00\n"),
+        ("fetched_at", "2025-06-08T09:30:00", "2025-06-08T09:30:00\n"),
+    ] {
+        let mut item = base.clone();
+        item[field] = json!(ok);
+        assert!(violations(&validator, &json!([item])).is_empty(), "{field}");
+        let mut item = base.clone();
+        item[field] = json!(ng);
+        assert!(
+            !violations(&validator, &json!([item])).is_empty(),
+            "{field} の末尾改行が Schema を通った"
+        );
+    }
+    // 空文字は不明の意味で許すが、改行だけは許さない
+    let mut item = base.clone();
+    item["time"] = json!("\n");
+    assert!(!violations(&validator, &json!([item])).is_empty());
+    assert!(!is_time("2025-06-07 11:00\n") && !is_time("\n"));
+    assert!(!is_fetched_at("2025-06-08T09:30:00\n") && !is_fetched_at("\n"));
 }
 
 #[test]
