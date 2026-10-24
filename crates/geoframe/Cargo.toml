@@ -20,6 +20,13 @@ futures-util = { version = "0.3.34", default-features = false }
 libc = "0.2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# P2: 外向きの HTTPS（Drive・地理院・Nominatim）。同期サイクルは専用の std スレッドで動かすので、
+# 同期 API の ureq を使う（miharashi と同じ）。TLS は rustls（暗号は ring。C は cc でビルド）で、
+# ルート証明書は webpki-roots を埋め込む（OS の証明書に依存しない）。native-tls/openssl は使わない
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+# サービスアカウントの JWT（RS256）の署名。rsa crate は使わず、rustls が既に引いている ring で署名する
+ring = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 # 時間を止めて進める（limits.rs の無通信の期限の検査）。新しい crate は増えない

@@ -111,7 +111,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 ## 6. 未決事項（決める時期）
 
 - ~~HEIC変換のバックエンドと配布形態 — P0の計測後~~ → 第一候補は`zune-heic`（[画像PoC](image-poc.md)）。実機HEICでの確定はP2
-- ~~musl静的ビルドかglibcビルドか — P0~~ → **musl静的ビルドを標準にする**（[ビルドと配布](build.md)。HEIC・DNS・アロケータを入れる段階で見直す）
+- ~~musl静的ビルドかglibcビルドか — P0~~ → **musl静的ビルドを標準にする**（[ビルドと配布](build.md)。HEIC・アロケータを入れる段階で見直す）。HTTPS（rustls）とDNSはT2.1で、musl静的のまま検証環境から通ることを確かめた（[build.md §7](build.md)）
 - 画像Embedding APIのJSON契約・CPU/GPU配置 — local-model-lab #93、P4の開始前
 - Embeddingインデックスの保存形式 — P4の開始前
 - 検証環境へのDrive鍵のコピー — P2の開始時にユーザーへ確認

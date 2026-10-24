@@ -11,7 +11,7 @@
 ただし次の依存が入るときは、その都度この結論を見直す（§6）。
 
 - HEIC変換: 画像PoCの結果（[image-poc.md](image-poc.md)）、**純Rustの`zune-heic`ならmuslの静的ビルドのままHEICを含められる**（合成HEIC 50枚でlibheifと出力がバイト単位で一致）。実機のHEICで問題が出て`libheif`が要る場合も、zig ccでmuslの静的ビルドができた（§6）。方針は変えない。
-- 外部HTTP（Gemini）のTLSとDNS: `rustls`系ならmuslでも通る見込み。ただしmuslの名前解決はglibcと挙動が違う（§6）。
+- 外部HTTPのTLSとDNS: **P2のT2.1で確かめた**。`ureq`＋`rustls`（ring）＋`webpki-roots`の埋め込みで、musl静的のまま検証環境から地理院へHTTPSが通った（§7）。
 
 ## 2. ビルド方法
 
@@ -97,7 +97,7 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 | `geoframe serve [--listen <addr>] [--data-dir <dir>]` | 読み取り専用のサーバー。P0では`GET /healthz`が`{"ok":true}`を返すだけだった。T1.1で、設定・DB読み取り層・ログ・DBを読めるかを返すヘルスを足した（[server.md](server.md)）。SIGTERMで停止 |
 | `deploy/geoframe-rs.service`・`deploy/rust-deploy.sh` | T1.5。検証環境向けのsystemd unitと、ビルド→転送→入れ替え→確認→巻き戻しの配布スクリプト（[deploy/README.md §7](../../deploy/README.md)、[server.md §6](server.md)）。本番の切替はP5 |
 
-依存は`tokio`・`axum`・`rusqlite`（`bundled`）・`serde`・`serde_json`、T1.1で`tracing`・`tracing-subscriber`（どちらも純Rust。`env-filter`・時刻・色の機能は入れない）。外部HTTPクライアントと`image`はまだ入れていない。SQLiteの呼び出しは`db::Catalog::read`で`spawn_blocking`に出し、tokioのworkerを塞がない形にした（P1以降もこの形に揃える。[server.md](server.md) §2.2）。
+依存は`tokio`・`axum`・`rusqlite`（`bundled`）・`serde`・`serde_json`、T1.1で`tracing`・`tracing-subscriber`（どちらも純Rust。`env-filter`・時刻・色の機能は入れない）。外部HTTPクライアントはT2.1で入れた（§7）。`image`はまだ入れていない。SQLiteの呼び出しは`db::Catalog::read`で`spawn_blocking`に出し、tokioのworkerを塞がない形にした（P1以降もこの形に揃える。[server.md](server.md) §2.2）。
 
 ## 6. 今後の注意と代替案
 
@@ -109,6 +109,44 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
   libheifが必要でmuslで通らない場合は次のどちらかにする。
   - 配布先と同じglibcでビルドする（検証環境の中、または同じ世代のコンテナでビルドする）。HEIC部分だけ別プロセス（`heif-convert`など）にする案もある。
   - `cargo-zigbuild`でglibcの古い版（例: 2.31）を指定してビルドする。n100の新しいglibcを避けられる。
-- **名前解決**: muslの`getaddrinfo`はglibcと違い、`/etc/resolv.conf`の`search`・`options`の扱いが一部異なる。外部HTTP（Gemini）を入れるP4で、検証環境から実際に名前解決できることを確かめる。
+- **名前解決**: muslの`getaddrinfo`はglibcと違い、`/etc/resolv.conf`の`search`・`options`の扱いが一部異なる。T2.1で検証環境から実際に名前解決できることは確かめた（§7）が、検証環境の`resolv.conf`は`nameserver`1行と`search .`だけの単純な形で、**この差は踏んでいない**。本番機の`resolv.conf`（`search`が複数ある、`ndots`の指定があるなど）での再確認はP5の切替の手順に入れる。
 - **メモリアロケータ**: muslの標準アロケータは画像処理で**約15〜25%遅かった**（画像PoC: JPEG 273 vs 235 ms、`zune-heic` 1,086 vs 871 ms）。`mimalloc`を付けると、JPEGはglibcと同等以上（222 ms）になるが、HEIC（`zune-heic`）はglibcより約8%遅いまま（939 vs 871 ms）で、RSSもglibc並みに増える。`mimalloc`はCのソースを`cc`でビルドする（CIの`rust`ジョブは`musl-tools`を入れてある）。P2の画像処理から`mimalloc`を付ける。現状の本体（画像処理なし）の最大RSS（1.5〜2.8 MiB）では差は出ていない。
 - **glibcビルドを選ぶ場合**: CIとn100のglibcは、本番（P5で切り替える機体）より古くなければならない。バイナリの`objdump -T`で要求バージョンを確かめる。画像PoCでは、開発機（glibc 2.41）でビルドしたglibcバイナリが検証環境（2.39）でそのまま動いた。`objdump -T`が出す最大版（`GLIBC_2.39`）は、Rust 1.99の`std::process::Command`が参照する`pidfd_spawnp`・`pidfd_getpid`の**弱参照**（`readelf -V`で`WEAK`）で、必須の要求は2.34まで。最大版だけでなく`WEAK`の有無も見る。
+
+## 7. 外向きHTTPSとJWT（P2 / T2.1）
+
+取り込み（Drive・地理院・Nominatim）が外へ出るので、**musl静的のままHTTPSとサービスアカウントのJWTが動くか**を、P2の最初に確かめた（確かめられなければ通信の作りを変える、というのがtasks.mdの条件だった）。結果は**通った**。
+
+### 7.1 選んだ依存
+
+| crate | 用途 | 理由 |
+| --- | --- | --- |
+| `ureq` 3.5（`default-features = false`、`rustls`・`gzip`） | HTTPクライアント（同期） | 同期サイクルは専用のstdスレッドで動かす（[server.md §11](server.md)）ので、同期APIで足りる。miharashiの取得処理も`ureq`。`reqwest`は非同期でhyperのクライアント側まで引くため見送った。`native-tls`・`openssl`は使わない |
+| `rustls` 0.23（`ureq`が引く）＋`ring` 0.17 | TLS | 暗号は`ring`。`aws-lc-rs`はcmakeと追加のCビルドが要るので避けた。`ring`のC・アセンブリは`cc`（`musl-gcc`）でビルドされ、rusqliteの`bundled`と同じ前提（CIの`musl-tools`で足りる） |
+| `webpki-roots` 1.0（`ureq`の`rustls`が引く） | ルート証明書 | **バイナリに埋め込む**。OSの証明書（`/etc/ssl/certs`）に依存しないので、unitや機体に証明書の条件は要らない。更新はcrateの更新で行う |
+| `ring`（直接） | JWT（RS256）の署名・検証 | `rsa` crateは使わない（純Rust実装の署名にタイミング攻撃の既知の問題があり、修正版が無い）。`ring`は既に依存木にある。PKCS#8（Googleの鍵JSONの`private_key`）とPKCS#1の両方を読める |
+| `base64` 0.22 | JWTのBase64url、PEMの本文 | 純Rustで小さい |
+
+`jsonwebtoken`は使わない（暗号バックエンドに`rsa`か`aws-lc-rs`を選ばされるため）。JWTは`crates/geoframe/src/jwt.rs`が、ヘッダ・claimsのBase64urlと`ring`の署名で組み立てる。
+
+### 7.2 確かめたこと
+
+- 検証環境（Ubuntu 24.04）で、n100でビルドしたmusl静的バイナリの`geoframe selfcheck-net`（地理院の逆ジオコーダへ公開の代表点を1件問い合わせる確認用のサブコマンド）が、名前解決・TLSの証明書検証・HTTP 200・JSONの読み取りまで**成功**した。出力は状態とHTTPステータスだけ（`status=ok http=200 json=ok failure=-`）で、URL・座標・応答の中身は出さない。
+- `strace`で開くファイルを見ると、名前解決のために`/etc/hosts`と`/etc/resolv.conf`だけを読み、**`/etc/ssl`は一切開かない**（証明書が埋め込みであることの直接の証拠）。
+- JWTは、テスト専用の使い捨てRSA鍵（2048ビット。どこにも登録していない。ヘッダ行を付けずにBase64だけを`crates/geoframe/tests/fixtures/`に置く）で、署名→検証、PKCS#1/#8、改ざん・不正な形式の拒否、鍵の中身をエラーやDebugに出さないことをユニットテストした。Googleへの実際の認証はT2.4。
+
+### 7.3 サイズの変化
+
+| | strip前 | strip後 |
+| --- | --- | --- |
+| P1の終わり（基準。`fdde8e1`） | 6,170,664 B（約5.9 MiB） | 5,206,040 B（約5.0 MiB） |
+| T2.1の依存追加後（HTTPS・JWTのみ） | 8,813,736 B（約8.4 MiB） | 7,336,056 B（約7.0 MiB） |
+| 差 | +2,643,072 B（約+2.5 MiB） | +2,130,016 B（約+2.0 MiB） |
+
+`static-pie linked`・`ldd`は`statically linked`のまま。増加の大半は`rustls`・`webpki-roots`（証明書の表）・`ring`。LTO・`opt-level="s"`・`strip`は未設定のままで、必要になったら設定する。クリーンビルドの時間は増えたが、`ring`の`cc`ビルドを含めても1分未満。
+
+### 7.4 残した課題
+
+- 本番機の`resolv.conf`（`search`が複数、`options ndots`など）でのmuslの名前解決の再確認（P5）。
+- Google（`oauth2.googleapis.com`・`www.googleapis.com`）への実際の認証と、Driveの大きな原本のダウンロードに合わせたタイムアウトの調整はT2.4。今の`net::agent()`は接続10秒・1要求30秒。
+- プロキシは`ureq`の既定どおり環境変数（`HTTPS_PROXY`など）を見る。unitは与えない。

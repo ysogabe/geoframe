@@ -14,6 +14,8 @@ const USAGE: &str = "\
 使い方:
   geoframe --version
   geoframe check-db <catalog.db>        photos の行数と SQLite のバージョンを出す（読み取り専用）
+  geoframe selfcheck-net                地理院の逆ジオコーダへ公開の代表点を 1 件問い合わせ、外向き HTTPS（名前解決・
+                                        TLS・証明書）が通るかを確かめる。出力は状態と HTTP ステータスだけ
   geoframe serve [--listen <addr:port>] [--data-dir <dir>]
                                         サーバーを起動する（読み取り専用。DB は <dir>/catalog.db）
                                         設定は 起動引数 > 環境変数 GEOFRAME_* > 既定値 の順
@@ -23,6 +25,7 @@ const USAGE: &str = "\
 pub enum Command {
     Version,
     CheckDb(PathBuf),
+    SelfCheckNet,
     Serve(Overrides),
 }
 
@@ -37,6 +40,10 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             }
             Ok(Command::CheckDb(PathBuf::from(path)))
         }
+        Some("selfcheck-net") => match args.next() {
+            None => Ok(Command::SelfCheckNet),
+            Some(_) => Err("selfcheck-net に引数はありません".into()),
+        },
         Some("serve") => {
             let mut overrides = Overrides::default();
             while let Some(arg) = args.next() {
@@ -86,6 +93,15 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::SelfCheckNet => {
+            let result = crate::net::selfcheck(&crate::net::agent());
+            println!("{}", result.summary());
+            if result.ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
         Command::Serve(overrides) => serve(&overrides),
     }
 }
