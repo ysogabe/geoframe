@@ -38,6 +38,16 @@ mod tests;
 /// 2 桁の欄の 1 桁目と月・日の 1 桁は ASCII だけ）が、Rust は読まない（T1.2 の写真フィードと同じ既知の差。server.md §0）。T2.2 の `norm_time` は数字を ASCII に直して
 /// 保存するので、Rust が書く行には起きない。
 pub(crate) fn naive_seconds(s: &str) -> Option<f64> {
+    naive_seconds_in(s, false)
+}
+
+/// [`naive_seconds`] の、秒つき（`%Y-%m-%d %H:%M:%S`）の形。品質解析の `parse_taken_at` は、この形を先に、
+/// 秒の無い形を次に試す。秒は 0〜59（`strptime` の `%S` は 60・61 も読むが、`datetime` が拒否して失敗になる）。
+pub(crate) fn naive_seconds_with_seconds(s: &str) -> Option<f64> {
+    naive_seconds_in(s, true)
+}
+
+fn naive_seconds_in(s: &str, with_seconds: bool) -> Option<f64> {
     let mut chars = s.chars().peekable();
     let number = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>, min: usize, max: usize| {
         let mut value = 0u32;
@@ -69,17 +79,31 @@ pub(crate) fn naive_seconds(s: &str) -> Option<f64> {
     let hour = number(&mut chars, 1, 2)?;
     (chars.next()? == ':').then_some(())?;
     let minute = number(&mut chars, 1, 2)?;
+    let second = if with_seconds {
+        (chars.next()? == ':').then_some(())?;
+        number(&mut chars, 1, 2)?
+    } else {
+        0
+    };
     if chars.next().is_some() {
         return None;
     }
-    if !(1..=9999).contains(&year) || !(1..=12).contains(&month) || hour > 23 || minute > 59 {
+    if !(1..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
         return None;
     }
     if day < 1 || day > days_in_month(year, month) {
         return None;
     }
     let days = days_from_civil(i64::from(year), i64::from(month), i64::from(day));
-    Some((days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60) as f64)
+    Some(
+        (days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second))
+            as f64,
+    )
 }
 
 fn is_leap(year: u32) -> bool {

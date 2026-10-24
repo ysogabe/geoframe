@@ -73,10 +73,11 @@ const USAGE: &str = "\
                                         無い・geoframe-server が非稼働と確認できないなら、何も書かず終了コード 2 で断る
                                         設定は 起動引数 > 環境変数 GEOFRAME_* > 既定値 の順
                                         （詳細は docs/rust-migration/server.md）
-  geoframe img-probe [--out <dir>] [--rotation <度>] [--jobs <n>] <画像>...
+  geoframe img-probe [--out <dir>] [--rotation <度>] [--jobs <n>] [--quality] <画像>...
                                         画像処理の確認・計測用。DB・データ置き場には触れない。画像を derivative にして
                                         （--out があれば <連番>.jpg で書き出す）、連番・形式・寸法・向き・ICC・所要時間を出す。
-                                        ファイル名は出さない。HEIC が読めないときは構造の分類（ブランド・グリッド・コーデック等）が付く
+                                        ファイル名は出さない。HEIC が読めないときは構造の分類（ブランド・グリッド・コーデック等）が付く。
+                                        --quality は derivative の代わりに品質の特徴量（SHA-256・pHash・鮮明度・露出）を出す
   geoframe sync [--dry-run] [--allow-mass-delete] [--data-dir <dir>]
                                         同期サイクルを 1 回だけ動かして終わる。--dry-run は行・写真・キャッシュ・
                                         ロックを変えず（SQLite が読み取りでも作る WAL 関連ファイル catalog.db-wal・
@@ -95,6 +96,11 @@ const USAGE: &str = "\
                                         動かし、推定で位置が付いた写真は移さない。同名のファイルは
                                         上書きせず「名前 (2).拡張子」にする。--dry-run は件数だけ。書く実行は
                                         GEOFRAME_INGEST=1 が要り、sync と同じ印・Python の確認を通す
+  geoframe quality-scan [--dry-run] [--data-dir <dir>]
+                                        品質の一括解析（現行の server.py --quality-scan）。孤児の特徴量を消し、未解析の写真を
+                                        GEOFRAME_QUALITY_PER_CYCLE 件ずつ全部解析して、グループ（完全重複・類似）と推奨を
+                                        作り直す。--dry-run は解析せず、件数（消す孤児・解析する枚数・再構築するか）だけ。
+                                        書く実行は GEOFRAME_INGEST=1 が要り、sync と同じ印・Python の確認を通す
 終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または取り込みを断った（本番への誤指定の防止）";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -111,6 +117,10 @@ pub enum Command {
         data_dir: Option<PathBuf>,
     },
     Organize {
+        dry_run: bool,
+        data_dir: Option<PathBuf>,
+    },
+    QualityScan {
         dry_run: bool,
         data_dir: Option<PathBuf>,
     },
@@ -152,7 +162,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             }
             Ok(Command::Serve(overrides))
         }
-        Some(name @ ("sync" | "organize")) => {
+        Some(name @ ("sync" | "organize" | "quality-scan")) => {
             let (mut dry_run, mut allow_mass_delete, mut data_dir) = (false, false, None);
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -166,14 +176,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                     other => return Err(format!("{name} の引数 {other:?} は不明です")),
                 }
             }
-            Ok(if name == "sync" {
-                Command::Sync {
+            Ok(match name {
+                "sync" => Command::Sync {
                     dry_run,
                     allow_mass_delete,
                     data_dir,
-                }
-            } else {
-                Command::Organize { dry_run, data_dir }
+                },
+                "organize" => Command::Organize { dry_run, data_dir },
+                _ => Command::QualityScan { dry_run, data_dir },
             })
         }
         Some(other) => Err(format!("不明なコマンド {other:?}")),
@@ -222,6 +232,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
             data_dir,
         } => sync(dry_run, allow_mass_delete, data_dir),
         Command::Organize { dry_run, data_dir } => organize(dry_run, data_dir),
+        Command::QualityScan { dry_run, data_dir } => quality_scan(dry_run, data_dir),
     }
 }
 
@@ -483,6 +494,90 @@ fn sync_apply(config: &Config, allow_mass_delete: bool) -> ExitCode {
 /// `_excluded/no_gps/` へ移す（現行の `server.py --organize`）。書く実行は `sync` と同じ条件と
 /// ガードを通す。
 fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
+    one_off(
+        "organize",
+        dry_run,
+        data_dir,
+        "organize の対象は、index_local が済んだあとの状態（メモリ上の写し）で数えます",
+        |ctx| {
+            // 先に index_local → infer（現行の organize_photos と同じ順序）。その結果を使って移す。
+            // どちらかが失敗・省略されたときは移さない（古い行を信じて、まだある写真・位置が付く写真を動かさないため）
+            let mut failed = false;
+            for stage in [
+                &crate::local::IndexLocal as &dyn crate::sync::Stage,
+                &crate::geo::Infer,
+            ] {
+                if failed {
+                    break;
+                }
+                let name = stage.name();
+                match stage.run(ctx) {
+                    Ok(crate::sync::StageOutcome::Done(counts)) => {
+                        println!("{name}: 完了 {counts}")
+                    }
+                    Ok(crate::sync::StageOutcome::Skipped(reason)) => {
+                        println!("{name}: 省略（{reason}）");
+                        failed = true;
+                    }
+                    Err(e) => {
+                        println!("{name}: 失敗: {e}");
+                        failed = true;
+                    }
+                }
+            }
+            if !failed {
+                match crate::local::organize(ctx) {
+                    Ok(counts) => println!("organize: 完了 {counts}"),
+                    Err(e) => {
+                        println!("organize: 失敗: {e}");
+                        failed = true;
+                    }
+                }
+            }
+            if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        },
+    )
+}
+
+/// `geoframe quality-scan [--dry-run]`: 孤児の特徴量を消し、未解析の写真を**全部**解析して、品質を
+/// 再構築する（現行の `server.py --quality-scan`）。書く実行は `sync` と同じ条件とガードを通す。
+fn quality_scan(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
+    one_off(
+        "quality-scan",
+        dry_run,
+        data_dir,
+        "解析（重い処理）は実行せず、件数だけを数えます",
+        |ctx| match crate::quality::scan(ctx) {
+            Ok(crate::sync::StageOutcome::Done(counts)) => {
+                println!("quality-scan: 完了 {counts}");
+                ExitCode::SUCCESS
+            }
+            Ok(crate::sync::StageOutcome::Skipped(reason)) => {
+                println!("quality-scan: 省略（{reason}）");
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                println!("quality-scan: 失敗: {e}");
+                ExitCode::FAILURE
+            }
+        },
+    )
+}
+
+/// `organize`・`quality-scan` のような、段を 1 回だけ動かして終わるコマンドの共通部分。設定を読み、
+/// 書く実行ではガードとロックを通して書き込み接続を作り、`--dry-run` では DB のメモリ上の写しを作って、
+/// `body` に渡す。
+fn one_off(
+    command: &str,
+    dry_run: bool,
+    data_dir: Option<PathBuf>,
+    dry_run_note: &str,
+    body: impl FnOnce(&StageCtx<'_>) -> ExitCode,
+) -> ExitCode {
     let overrides = Overrides {
         listen: None,
         data_dir,
@@ -499,13 +594,13 @@ fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
     let ingest = if dry_run {
         println!(
             "dry-run: 何も書きません（行・ファイルは変えません。SQLite の WAL 関連ファイルだけはできうります）。\
-             organize の対象は、index_local が済んだあとの状態（メモリ上の写し）で数えます"
+             {dry_run_note}"
         );
         None
     } else {
         if !config.ingest {
             eprintln!(
-                "geoframe: organize は GEOFRAME_INGEST=1 のときだけ動きます（書かずに件数だけ見るなら --dry-run）"
+                "geoframe: {command} は GEOFRAME_INGEST=1 のときだけ動きます（書かずに件数だけ見るなら --dry-run）"
             );
             return ExitCode::from(2);
         }
@@ -524,7 +619,7 @@ fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    // dry-run は、index_local が自分の計画を適用した写しの上で organize を数える
+    // dry-run は、先の段が自分の計画を適用した写しの上で数える
     let sim;
     let read = if dry_run {
         sim = match crate::sync::simulation_copy(&read) {
@@ -553,43 +648,7 @@ fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
         http: &http,
         stop: &stop,
     };
-    // 先に index_local → infer（現行の organize_photos と同じ順序）。その結果を使って移す。
-    // どちらかが失敗・省略されたときは移さない（古い行を信じて、まだある写真・位置が付く写真を動かさないため）
-    let mut failed = false;
-    for stage in [
-        &crate::local::IndexLocal as &dyn crate::sync::Stage,
-        &crate::geo::Infer,
-    ] {
-        if failed {
-            break;
-        }
-        let name = stage.name();
-        match stage.run(&ctx) {
-            Ok(crate::sync::StageOutcome::Done(counts)) => println!("{name}: 完了 {counts}"),
-            Ok(crate::sync::StageOutcome::Skipped(reason)) => {
-                println!("{name}: 省略（{reason}）");
-                failed = true;
-            }
-            Err(e) => {
-                println!("{name}: 失敗: {e}");
-                failed = true;
-            }
-        }
-    }
-    if !failed {
-        match crate::local::organize(&ctx) {
-            Ok(counts) => println!("organize: 完了 {counts}"),
-            Err(e) => {
-                println!("organize: 失敗: {e}");
-                failed = true;
-            }
-        }
-    }
-    if failed {
-        ExitCode::FAILURE
-    } else {
-        ExitCode::SUCCESS
-    }
+    body(&ctx)
 }
 
 /// 取り込みを始められなかったときの終了コード。ガードが断ったのは 2（設定の誤りと同じ扱いで、
@@ -709,6 +768,27 @@ mod tests {
         assert!(p(&["sync", "--data-dir"]).is_err());
         assert!(p(&["organize", "--listen", "127.0.0.1:1"]).is_err());
         assert!(p(&["organize", "--data-dir"]).is_err());
+    }
+
+    #[test]
+    fn parses_quality_scan() {
+        assert_eq!(
+            p(&["quality-scan"]),
+            Ok(Command::QualityScan {
+                dry_run: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            p(&["quality-scan", "--dry-run", "--data-dir", "/srv/x"]),
+            Ok(Command::QualityScan {
+                dry_run: true,
+                data_dir: Some(PathBuf::from("/srv/x"))
+            })
+        );
+        // 大量削除の保留を外すのは sync の明示的な引数だけ
+        assert!(p(&["quality-scan", "--allow-mass-delete"]).is_err());
+        assert!(p(&["quality-scan", "--listen", "127.0.0.1:1"]).is_err());
     }
 
     #[test]

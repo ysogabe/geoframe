@@ -212,7 +212,13 @@ fn dry_run_writes_nothing_and_reports_counts() {
         ),
         "{stdout}"
     );
-    assert!(stdout.contains("段 quality: 完了（件数なし）"), "{stdout}");
+    // 表示用の画像がある 1 枚が未解析（解析は dry-run では実行しない）。解析すれば再構築になる
+    assert!(
+        stdout.contains(
+            "段 quality: 完了 orphans=0 pending=1 would_analyze=1 remaining=0 would_rebuild=1"
+        ),
+        "{stdout}"
+    );
     assert!(
         stdout.contains("写真: 表示可能 1 / 取得待ち 1 / 全3"),
         "{stdout}"
@@ -269,7 +275,13 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
     assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
     assert!(data.join("catalog.db").exists());
     assert!(data.join("tmp").is_dir());
-    assert!(stdout.contains("段 quality: 完了（件数なし）"), "{stdout}");
+    // 写真が無いので解析も再構築も無い
+    assert!(
+        stdout.contains(
+            "段 quality: 完了 removed=0 pending=0 analyzed=0 failed=0 remaining=0 rebuilt=0 rows=0"
+        ),
+        "{stdout}"
+    );
     // 鍵が無いので Drive の 2 つの段は飛ばす（通信しない。失敗ではないので終了コードは 0）
     for stage in ["index_drive", "fetch_derivatives"] {
         assert!(
@@ -705,4 +717,138 @@ fn organize_moves_photos_without_a_location_when_the_guard_passes() {
     // ログ・出力に写真の名前を出さない
     assert!(!stdout.contains("no_gps"), "{stdout}");
     assert!(!text(&out.stderr).contains("no_gps"));
+}
+
+// ---- quality-scan（T2.6）-------------------------------------------------------
+
+/// 合成の JPEG（単色。EXIF なし）。
+fn solid_jpeg(value: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    jpeg_encoder_encode(&mut out, value);
+    out
+}
+
+fn jpeg_encoder_encode(out: &mut Vec<u8>, value: u8) {
+    // `plain_jpeg()` は固定の 1 枚。値を変えた複数の画像が要るので、PNG ではなく JPEG を自前で作る
+    let mut data = Vec::new();
+    for y in 0..48u32 {
+        for x in 0..64u32 {
+            let v = value.wrapping_add((x * 3 + y) as u8);
+            data.extend_from_slice(&[v, v.wrapping_mul(2), 255 - v]);
+        }
+    }
+    jpeg_encoder::Encoder::new(out, 85)
+        .encode(&data, 64, 48, jpeg_encoder::ColorType::Rgb)
+        .unwrap();
+}
+
+fn data_with_derivatives(dir: &Dir) -> PathBuf {
+    let data = dir.0.join("data");
+    fs::create_dir_all(data.join("derivatives")).unwrap();
+    production_shaped_db(&data);
+    // 行 1 の display は derivatives/a.jpg。同じバイト列の b.jpg を行 3 に付ける（完全重複）
+    let a = solid_jpeg(10);
+    fs::write(data.join("derivatives/a.jpg"), &a).unwrap();
+    fs::write(data.join("derivatives/b.jpg"), &a).unwrap();
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    conn.execute_batch(
+        "UPDATE photos SET display='derivatives/b.jpg', taken_at='2024-05-06 10:00' WHERE drive_id='c';
+         UPDATE photos SET taken_at='2024-05-06 10:00' WHERE drive_id='a'",
+    )
+    .unwrap();
+    data
+}
+
+#[test]
+fn quality_scan_without_ingest_or_marker_refuses_and_changes_nothing() {
+    let dir = Dir::new("qscan-refused");
+    let data = data_with_derivatives(&dir);
+    let before = snapshot(&data);
+    let out = run(&["quality-scan", "--data-dir", data.to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(snapshot(&data), before);
+    let missing = dir.0.join("no-such-marker");
+    let envs = vec![
+        ("GEOFRAME_INGEST", "1".to_string()),
+        (
+            "GEOFRAME_TEST_STAGING_MARKER",
+            missing.to_str().unwrap().to_string(),
+        ),
+        ("GEOFRAME_TEST_PYTHON_STATE", "not-found/inactive".into()),
+    ];
+    let out = run_owned(
+        &["quality-scan", "--data-dir", data.to_str().unwrap()],
+        &envs,
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_untouched_after_refusal(&data, &before);
+}
+
+#[test]
+fn quality_scan_dry_run_counts_without_analyzing_or_writing() {
+    let dir = Dir::new("qscan-dry");
+    let data = data_with_derivatives(&dir);
+    let before = snapshot(&data);
+    let out = run(
+        &[
+            "quality-scan",
+            "--dry-run",
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains(
+            "quality-scan: 完了 orphans=0 pending=2 would_analyze=2 remaining=0 would_rebuild=1"
+        ),
+        "{stdout}"
+    );
+    assert_eq!(snapshot(&data), before);
+}
+
+#[test]
+fn quality_scan_analyzes_everything_and_rebuilds_when_the_guard_passes() {
+    let dir = Dir::new("qscan-apply");
+    let staging = Staging::new("qscan-apply");
+    let data = data_with_derivatives(&dir);
+    let mut envs = staging.envs();
+    envs.push(("GEOFRAME_INGEST", "1".into()));
+    envs.push(("GEOFRAME_QUALITY_PER_CYCLE", "1".into())); // 1 件ずつ → 2 回に分かれても全部解析する
+    let out = run_owned(
+        &["quality-scan", "--data-dir", data.to_str().unwrap()],
+        &envs,
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains(
+            "quality-scan: 完了 removed=0 analyzed=2 failed=0 remaining=0 rebuilt=1 rows=2"
+        ),
+        "{stdout}"
+    );
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    let rows: Vec<(i64, String, i64)> = conn
+        .prepare("SELECT photo_id, group_kind, recommended FROM photo_quality ORDER BY photo_id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(
+        rows,
+        [(1, "exact".to_string(), 1), (3, "exact".to_string(), 0)]
+    );
+    let dirty: String = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key='photo_quality_dirty'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(dirty, "0");
+    // 出力にファイル名を出さない
+    assert!(!stdout.contains("a.jpg") && !text(&out.stderr).contains("a.jpg"));
 }

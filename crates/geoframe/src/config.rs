@@ -18,6 +18,7 @@
 //! | 同期サイクルの間隔（分） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10` |
 //! | ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可） | なし | `GEOFRAME_PHOTOS_DIR` | `photos` |
 //! | 同期 1 サイクルで derivative を作る枚数 | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25` |
+//! | 同期 1 サイクルで品質を解析する枚数（0 は 1 として扱う） | なし | `GEOFRAME_QUALITY_PER_CYCLE` | `GEOFRAME_FETCH_PER_CYCLE` と同じ |
 //! | Drive のサービスアカウント鍵 JSON のパス（相対はカレントディレクトリ基準。現行は `app/` 基準） | なし | `GEOFRAME_DRIVE_KEY` | `drive_key.json` |
 //! | 取り込む Drive のフォルダ（名前、または 20 字以上の英数字なら ID） | なし | `GEOFRAME_DRIVE_FOLDER` | `GeoFrame` |
 //!
@@ -55,8 +56,6 @@ pub const DB_FILE_NAME: &str = "catalog.db";
 /// `docs/reference/configuration.md` の項目がここか [`SUPPORTED_ENV`] のどちらかに載っているかを
 /// テストで確かめている（Python 側で項目が増えたのに Rust の分類が漏れるのを防ぐ）。
 pub const UNSUPPORTED_ENV: &[&str] = &[
-    // P2: 取り込み
-    "GEOFRAME_QUALITY_PER_CYCLE",
     // P3: 管理機能（地図タイル）
     "GEOFRAME_TILE_UA",
     "GEOFRAME_TILE_FETCH_PER_MIN",
@@ -102,6 +101,8 @@ pub const SUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_DRIVE_FOLDER",
     // T2.5: 位置の推定（`GEOFRAME_INFER_MIN` は T1.4 から読んでいて、推定の窓にもなった）
     "GEOFRAME_INFER_OFFSET_MIN",
+    // T2.6: 簡易品質
+    "GEOFRAME_QUALITY_PER_CYCLE",
 ];
 
 pub const DEFAULT_INFER_MIN: f64 = 15.0;
@@ -227,6 +228,9 @@ pub struct Config {
     photos_dir_setting: PathBuf,
     /// 同期 1 サイクルで derivative を作る枚数。`GEOFRAME_FETCH_PER_CYCLE`（0 以上の整数）。
     pub fetch_per_cycle: u32,
+    /// 同期 1 サイクルで品質（特徴量）を解析する枚数。`GEOFRAME_QUALITY_PER_CYCLE`（0 以上の整数。未指定は
+    /// `fetch_per_cycle`）。0 でも 1 枚は解析する（現行の `max(1, limit)`）。
+    pub quality_per_cycle: u32,
     /// Drive のサービスアカウント鍵 JSON のパス（絶対パス）。`GEOFRAME_DRIVE_KEY`。**持つのはパスだけ**で、
     /// 中身は [`crate::drive`] が段の中で読む（設定にも起動ログにも載せない）。
     pub drive_key: PathBuf,
@@ -365,6 +369,12 @@ impl Config {
             })?,
             None => DEFAULT_FETCH_PER_CYCLE,
         };
+        let quality_per_cycle = match get("GEOFRAME_QUALITY_PER_CYCLE") {
+            Some(raw) => raw.trim().parse::<u32>().map_err(|_| {
+                ConfigError("GEOFRAME_QUALITY_PER_CYCLE は 0 以上の整数で指定してください".into())
+            })?,
+            None => fetch_per_cycle,
+        };
 
         // 現行は `ROOT / 値`（`ROOT` は `app/`）。Rust は `app/` が無いので、相対パスはカレントディレクトリ基準にする
         let drive_key = std::path::absolute(PathBuf::from(
@@ -393,6 +403,7 @@ impl Config {
             drive_poll_min,
             photos_dir_setting,
             fetch_per_cycle,
+            quality_per_cycle,
             drive_key,
             drive_folder,
         })
@@ -451,7 +462,7 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
@@ -464,6 +475,7 @@ impl Config {
             if self.ingest { 1 } else { 0 },
             self.drive_poll_min,
             self.fetch_per_cycle,
+            self.quality_per_cycle,
         )
     }
 }
@@ -806,6 +818,39 @@ mod tests {
         .unwrap();
         for text in [format!("{c:?}"), c.log_summary()] {
             assert!(!text.contains("secret-name") && !text.contains("PrivateFolderName"));
+        }
+    }
+
+    #[test]
+    fn quality_per_cycle_defaults_to_fetch_per_cycle() {
+        let c = load(&[], &Overrides::default()).unwrap();
+        assert_eq!(c.quality_per_cycle, 25);
+        let c = load(&[("GEOFRAME_FETCH_PER_CYCLE", "7")], &Overrides::default()).unwrap();
+        assert_eq!(c.quality_per_cycle, 7);
+        let c = load(
+            &[
+                ("GEOFRAME_FETCH_PER_CYCLE", "7"),
+                ("GEOFRAME_QUALITY_PER_CYCLE", " 3 "),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.quality_per_cycle, 3);
+        // 空文字は未設定と同じ
+        let c = load(
+            &[("GEOFRAME_QUALITY_PER_CYCLE", " ")],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.quality_per_cycle, 25);
+        for value in ["abc", "-1", "1.5"] {
+            let err = load(
+                &[("GEOFRAME_QUALITY_PER_CYCLE", value)],
+                &Overrides::default(),
+            )
+            .unwrap_err();
+            assert!(err.0.contains("GEOFRAME_QUALITY_PER_CYCLE"), "{err}");
+            assert!(!err.0.contains(value), "値を出さない: {err}");
         }
     }
 

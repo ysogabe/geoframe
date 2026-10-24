@@ -4,6 +4,9 @@
 //! 所要時間**だけを出す。**ファイル名・パスは出さない**（失敗の文面も [`ImageError`] の定型文だけ）。
 //! HEIC が読めなかったときは、構造の分類（ブランド・グリッドか・コーデック・ビット深度など）が付くので、
 //! 実機の HEIC の切り分け（T2.4 の受入）にそのまま使える。
+//!
+//! `--quality` を付けると、derivative を作る代わりに**品質の特徴量**（SHA-256・pHash・鮮明度・輝度・露出・
+//! 白飛び・黒つぶれ・コントラスト。T2.6）を出す。Python が保存した値との比較（server.md §16.2）に使う。
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -20,6 +23,8 @@ pub struct ProbeArgs {
     pub out: Option<PathBuf>,
     pub rotation: i32,
     pub jobs: usize,
+    /// derivative の代わりに品質の特徴量を出す。
+    pub quality: bool,
 }
 
 pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ProbeArgs, String> {
@@ -30,6 +35,7 @@ pub fn parse<I: Iterator<Item = String>>(mut args: I) -> Result<ProbeArgs, Strin
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--out" => parsed.out = Some(PathBuf::from(args.next().ok_or("--out に値が要ります")?)),
+            "--quality" => parsed.quality = true,
             "--rotation" => {
                 parsed.rotation = args
                     .next()
@@ -86,8 +92,23 @@ fn max_rss_kib() -> Option<u64> {
         .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
 }
 
-/// 1 枚の結果（結果と所要ミリ秒）。
-type Slot = std::sync::Mutex<Option<(Result<DerivativeInfo, ImageError>, f64)>>;
+/// 1 枚の結果（出力する説明と所要ミリ秒）。
+type Slot = std::sync::Mutex<Option<(Result<String, ImageError>, f64)>>;
+
+fn describe_quality(f: &crate::quality::Features) -> String {
+    let m = &f.metrics;
+    format!(
+        "sha256={} phash={:016x} sharpness={:.9} luminance={:.6} exposure={:.6} black_clip={:.9} white_clip={:.9} contrast={}",
+        f.sha256,
+        f.phash,
+        m.sharpness,
+        m.luminance,
+        m.exposure_score,
+        m.black_clip,
+        m.white_clip,
+        m.contrast
+    )
+}
 
 pub fn run(args: &ProbeArgs) -> ExitCode {
     if let Some(dir) = &args.out
@@ -114,12 +135,17 @@ pub fn run(args: &ProbeArgs) -> ExitCode {
                         |d| d.join(format!("{i:04}.jpg")),
                     );
                     let t = Instant::now();
-                    let result = if args.out.is_some() {
-                        make_derivative(src, &dest, args.rotation)
+                    let result = if args.quality {
+                        read_limited(src).and_then(|bytes| {
+                            crate::quality::analyze_bytes(&bytes).map(|f| describe_quality(&f))
+                        })
+                    } else if args.out.is_some() {
+                        make_derivative(src, &dest, args.rotation).map(|info| describe(&info))
                     } else {
                         // 書き出さない: 読んで変換するだけ（読み込みには `make_derivative` と同じ大きさの上限）
-                        read_limited(src)
-                            .and_then(|bytes| super::render(&bytes, args.rotation).map(|r| r.info))
+                        read_limited(src).and_then(|bytes| {
+                            super::render(&bytes, args.rotation).map(|r| describe(&r.info))
+                        })
                     };
                     let ms = t.elapsed().as_secs_f64() * 1000.0;
                     if let Ok(mut slot) = results[i].lock() {
@@ -134,10 +160,10 @@ pub fn run(args: &ProbeArgs) -> ExitCode {
     let mut times = Vec::new();
     for (i, slot) in results.iter().enumerate() {
         match slot.lock().ok().and_then(|mut s| s.take()) {
-            Some((Ok(info), ms)) => {
+            Some((Ok(text), ms)) => {
                 ok += 1;
                 times.push(ms);
-                println!("#{i:04} ok {} ms={ms:.0}", describe(&info));
+                println!("#{i:04} ok {text} ms={ms:.0}");
             }
             Some((Err(e), ms)) => {
                 failed += 1;

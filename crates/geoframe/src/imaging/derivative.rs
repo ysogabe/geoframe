@@ -462,18 +462,9 @@ fn encode_jpeg(r: &Raster) -> Result<Vec<u8>, ImageError> {
 // ---------------------------------------------------------------------------
 // 公開 API
 
-/// バイト列から derivative の JPEG を作る。`rotation` は時計回りの角度（0・90・180・270。負・360 超は剰余）。
-pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
-    // ファイルから読む経路は [`read_limited`] が見るが、バイト列を直接渡す呼び出しにも同じ上限をかける
-    if bytes.len() as u64 > MAX_INPUT_BYTES {
-        return Err(ImageError::FileTooLarge);
-    }
-    let rot = rotation.rem_euclid(360);
-    if rot % 90 != 0 {
-        return Err(ImageError::BadRotation);
-    }
-    let manual = manual_orientation(rot as u16);
-
+/// 内容で形式を判別してデコードする。`orientation` には EXIF の向き（EXIF に無ければ XMP の向き。Pillow の
+/// `getexif` と同じ）を入れる。HEIC はデコーダが適用済みなので 1 のまま。
+fn decode_any(bytes: &[u8]) -> Result<(Format, Decoded), ImageError> {
     let format = Format::sniff(bytes).ok_or_else(|| not_an_image(bytes))?;
     let mut decoded = match format {
         Format::Jpeg => decode_jpeg(bytes)?,
@@ -492,12 +483,74 @@ pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
             }
         }
     };
-    let input = (decoded.raster.width, decoded.raster.height);
-    // EXIF の向き。EXIF に無ければ XMP の向き（Pillow の `getexif` と同じ）。HEIC はデコーダが適用済みなので 1 のまま
     if format != Format::Heic {
         let tiff = exif::exif_tiff(format, bytes, None);
         decoded.orientation = exif::effective_orientation(format, bytes, tiff.as_deref());
     }
+    Ok((format, decoded))
+}
+
+/// 向きを当てた 8 ビットのグレー画像（品質解析の入力）。
+pub struct Luma {
+    pub width: u32,
+    pub height: u32,
+    pub data: Vec<u8>,
+}
+
+/// 品質解析用にデコードする。Python の `ImageOps.exif_transpose(image).convert("L")` に当たる:
+/// EXIF の向きを当て、RGB は Pillow と同じ整数式 `(R*19595 + G*38470 + B*7471 + 0x8000) >> 16` でグレーにする
+/// （`image` crate の `to_luma8` は係数が違う）。ICC・アルファは使わない。
+pub fn decode_luma(bytes: &[u8]) -> Result<Luma, ImageError> {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageError::FileTooLarge);
+    }
+    let (_, decoded) = decode_any(bytes)?;
+    let raster = decoded.raster;
+    let gray = if raster.channels == 1 {
+        raster
+    } else {
+        let data = raster
+            .data
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|p| {
+                ((u32::from(p[0]) * 19595
+                    + u32::from(p[1]) * 38470
+                    + u32::from(p[2]) * 7471
+                    + 0x8000)
+                    >> 16) as u8
+            })
+            .collect();
+        Raster {
+            width: raster.width,
+            height: raster.height,
+            channels: 1,
+            data,
+        }
+    };
+    let oriented = orient(gray, orientation_of(decoded.orientation))?;
+    Ok(Luma {
+        width: oriented.width,
+        height: oriented.height,
+        data: oriented.data,
+    })
+}
+
+/// バイト列から derivative の JPEG を作る。`rotation` は時計回りの角度（0・90・180・270。負・360 超は剰余）。
+pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
+    // ファイルから読む経路は [`read_limited`] が見るが、バイト列を直接渡す呼び出しにも同じ上限をかける
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageError::FileTooLarge);
+    }
+    let rot = rotation.rem_euclid(360);
+    if rot % 90 != 0 {
+        return Err(ImageError::BadRotation);
+    }
+    let manual = manual_orientation(rot as u16);
+
+    let (format, decoded) = decode_any(bytes)?;
+    let input = (decoded.raster.width, decoded.raster.height);
     let exif_o = orientation_of(decoded.orientation);
 
     // 向きを当てたあとの寸法で長辺を収める。縮小してから向きを当てる（同じ結果で速い）
@@ -545,7 +598,7 @@ pub(super) fn not_an_image(bytes: &[u8]) -> ImageError {
 }
 
 /// ファイルを読む（大きさの上限つき）。`img-probe` も使う。
-pub(super) fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
+pub fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
     let file = fs::File::open(path)?;
     let len = file.metadata()?.len();
     if len > MAX_INPUT_BYTES {

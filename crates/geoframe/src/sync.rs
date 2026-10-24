@@ -317,6 +317,7 @@ fn stages(drive: Arc<crate::drive::DriveShared>, allow_mass_delete: bool) -> Vec
             "fetch_derivatives" => {
                 Box::new(crate::drive::FetchDerivatives::new(Arc::clone(&drive)))
             }
+            "quality" => Box::new(crate::quality::Quality::new()),
             _ => Box::new(Placeholder(name)),
         })
         .collect()

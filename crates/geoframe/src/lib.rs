@@ -25,6 +25,7 @@ pub mod logging;
 pub mod net;
 pub mod photos;
 pub mod pyquery;
+pub mod quality;
 pub mod schema;
 pub mod server;
 pub mod statics;
