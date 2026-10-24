@@ -1,13 +1,13 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 0. Pythonとの差の索引
 
-P1・P2（T2.1〜T2.5）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1〜T2.6）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
@@ -39,6 +39,7 @@ P1・P2（T2.1〜T2.5）でPythonと意図して違える点・既知の差の�
 | **`fetch_derivatives`（T2.4）**: ①原本の一時ファイル`tmp/.dl_<drive_id>`は`create_new`＋`O_NOFOLLOW`＋権限0600で作り、既にある名前（リンクを含む）は辿らず・消さず、その写真の失敗にする（Pythonは`"wb"`で上書き）。②ダウンロードは512 MiBまで・1枚15分まで（Pythonは上限なし）。③取得待ちは`ORDER BY taken_at, id`（Pythonは`taken_at`のみ。実際のSQLiteは同じ並びになる）。④**失敗が続く写真を飛ばす**（受入条件②。[§14.6](#146-失敗が続く写真が枠を塞がない受入条件)）。⑤通信や認証の不調（接続・名前解決・TLS・**応答のヘッダーを受け取る前の切断などの I/O の失敗**・応答の待ちの時間切れ・流量制限の403（**理由の本文が受け取れなかった403を含む**）・429・5xx・認証の失敗・原本の本文の途中の切断）は、写真のせいではないので段を中断して失敗にし、失敗の記録は付けない（**本文の受信が1枚15分を超えた**ことだけは、その写真の失敗`fail_slow_download`）。⑥ログ・件数にファイル名を出さない（Pythonは名前を出す）。失敗は写真の`id`と固定の語だけ。成功・失敗の件数は形式別・失敗の種類別（`ok_jpeg`・`fail_decode_heic`など）。⑦`--dry-run`は一覧を読む以外の通信をせず、取得するはずの件数だけ出す。⑧**原本は通常の終了経路（成功・写真の失敗）で明示的に消して結果を確かめ**、消せなかったら`original_remove_failed`の件数と固定の文言の警告で報告する（Rustの`Drop`は早期`return`・パニックの補助で、結果は捨てる。通常の経路では消えたことを確かめて、報告する） | 原本（GPS・機種情報つき）を残さない・リンクで外を書き換えさせない・枠を塞がせない | 取得待ちがあるとき | 単体テスト（スタブ。原本が成功・失敗・パニックのどれでも残らない、リンクを辿らない、先頭の枠より多い失敗があっても後続が取得される、障害中に試した写真が復旧した次のサイクルで待たずに取得される、原本を消せなかったことが件数に出る）、`drive-index-python.json`（偽のDriveに流したPythonの`fetch_derivatives`と、最初のサイクルが同じ写真を同じ順に試し、同じ行・同じ寸法になる） | なし（決定） | [§14.5](#145-fetch_derivatives) |
 | **位置の推定 `infer`（T2.5）**: ①**値が変わらない行には書かない**（Pythonは毎サイクル、対象の全行に同じ値を`UPDATE`する。最終の行は同じ）。②`UPDATE`は`loc_source IS NULL OR 'inferred'`の行にだけ効く（計画を作ってから書くまでの間に手動で位置が付いた行を上書きしない。Pythonにはこの隙間がある）。③時刻の差は**`TZ`に依存しないnaiveな日時**で取る（Pythonは`strptime(…).timestamp()`）。ASCIIの数字だけ読む（全角の数字が混じった時刻をPythonは読む場合がある。CPython 3.13で確認: 年が全角でも、分が1桁の全角でも読める）。④`GEOFRAME_INFER_OFFSET_MIN`は有限の数だけ（負も小数も可。Pythonは検証なし）。⑤同順位（同じ距離の錨が複数）は**`id`の小さい方**（Pythonは`ORDER BY`なしの全件走査の最初で、実際は`rowid`順＝同じ）。⑥**Pythonと同じで直さないもの**: `place elev muni_cd pref city`には触らない（錨が変わって位置が動いても、推定を取り消して別の場所へ推定し直しても、`place`は古い地名のまま残る）。`display`は取り消す行だけをNULLにする（`fetch_derivatives`が取り直す。ファイルは消さない）。`manual`は再推定しない・錨にはなる。`inferred`は錨にしない | ①②は書き込みを減らす（本番コピーの`--dry-run`が「変更ほぼ0」と読める）。③はP1以来の方針。⑥は現行の挙動（位置が動いたときに地名を付け直すかはP3で決める） | 位置の無い写真があるとき | `geo-python.json`（合成の行にPythonの`infer_locations`を段階的に流した結果と、`photos`の全列・戻り値が一致: 窓の境界・同順位・オフセット・錨の削除・錨の移動・手動・時刻なし・暦の不正。`tools/gen_geo_fixture.py`、CIで`--check`）、単体テスト、検証環境（§15.8。本番コピーで推定済みの2,162行すべてが「変更なし」） | ⑥は**P3で直すか決める**。他は決定 | [§15.2](#152-infer) |
 | **地名の enrich（T2.5）**: ①**通信の障害は段を中断し、何も確定しない**（接続・名前解決・TLS・切断・時間切れ・429・5xx。T2.4の`net.rs`の分類）。Pythonは障害の行を飛ばして続け（1行8秒×最大40行）、**片方のAPIだけ障害のときはもう片方の応答だけで確定してキャッシュする**ので、一時的な不調で`place=''`が永久に残る。②`muni.js`は、国内で通信が要る行があるときだけ取りに行き、**取れなければ（障害でも、4xxでも、表が空でも）通信が要る行を処理せず段を失敗にする**（国外・キャッシュで済む行は先に済ませる）。Pythonは空の表で続け、`pref`・`city`が空のまま確定する。③**両方のAPIの応答が壊れた座標は、プロセスの中で覚えてしばらく飛ばす**（30分から倍々、12時間まで）。Pythonは毎サイクル、40件の枠を占める。④**`lon`がNULL・数値でない行は対象にしない**（`unusable`に数える）。Pythonは例外になり、`cycle()`は`enrich_rows`を`try`で包んでいないので、周期全体が落ちる。⑤キャッシュの値は`place`と`city`の両方を持つ辞書だけ有効、型が違う値は空文字（Pythonは`city`だけ見て、`place`が無いと例外）。⑥書き込みは`lat`・`lon`が計画のときと同じで`place`がNULLの行にだけ効く。⑦**国外は空で確定**（オフラインの逆ジオコーダは本番に入っていない。Pythonも入っていなければ同じ）。⑧応答は1 MiB、`muni.js`は8 MiBまで。時間は8秒・15秒（Pythonと同じ）。⑨`muni_table`は、国内の問い合わせが要るときだけ取る（Pythonは毎サイクルの先頭で、無ければ取りに行く）。⑩ログ・失敗の文面に座標・地名・URLを出さない | 障害で誤った「確定」を作らない、枠を塞がせない、サイクルを落とさない | 位置があって`place`がNULLの行があるとき | `geo-python.json`（Pythonの`enrich_rows`に偽の地理院を流した結果と、`photos`の全列・地理院への要求の順序・`.cache.json`の`geo:`キーが一致: 国内・国外・空で確定・矩形の角・片方だけ応答・両方なし・偶数丸め・先頭の0の自治体コード・キャッシュ済み・40件・`{:.3}`の丸め）、単体テスト（障害の種類ごとの中断・復旧・`muni.js`の失敗・記憶・競合・停止・`--dry-run`）、検証環境（§15.8。実際の地理院と`muni.js`で、Pythonが保存した8行の地名が一致） | なし（決定） | [§15.3](#153-enrich) |
+| **簡易品質 `quality`（T2.6）**: ①**特徴量の行はPythonが作ったものも有効として使い、Rustは新しい（または`display`・`md5`・`mtime`が変わった）写真だけを自分の算法で解析する**（全写真を解析し直さない。特徴量の表に算法の印が無いので、混在する）。②Rustの鮮明度・輝度・露出はPythonと少し違う（Pillowの`thumbnail`の`reducing_gap`による箱型の縮小を再現しない。本番コピー6,535枚で鮮明度の比の中央値1.004）。pHashは同じ作り方で、同じ写真のPythonの値との距離は最大6（12以上は0枚）。③**同じSHA-256の写真は、`id`が最小の行のpHash・指標にそろえてから比べる**（Pythonは行ごと。Pythonだけが作った行では同じ値なので差は出ない。本番コピーで確認）。④失敗の行の`error`は種類だけ（Pythonは`型名: 例外の文字列`を500文字まで）。⑤`photo_quality.algorithm`は`rust-phash-v1:t3:h12`（Pythonは`poc-phash-v1:t3:h12`。再構築のたびに全行がこの値になる）。⑥特徴量の書き込みと`dirty`、再構築の読み書き（未解析の数・dirty・特徴量の読み取り・全差し替え）がそれぞれ1つのトランザクション（Pythonは別々）。⑦`GEOFRAME_QUALITY_PER_CYCLE`が負・小数・非数なら起動を断る（Pythonは`int()`で通し、`max(1, …)`で負を1にする）。⑧撮影時刻は`strptime`と同じ規則でASCIIの数字だけ読む（全角の数字が混じった時刻はPythonだけが読める場合がある。同じ既知の差） | 全写真を解析し直すと、一括で424秒、既定の同期サイクル（25枚／10分）では約44時間かかり、グループの顔ぶれが変わる（7枚）。Pythonの行を使えば`photo_quality`もE1の件数も変わらない。他は安全側・決定性 | 取り込み済みの本番コピー・新しい写真があるとき | `quality-python.json`（合成の`photos`と合成の特徴量にPythonの`quality_cycle`・`quality_backfill`を段階的に流した結果と、特徴量・`photo_quality`・`settings`の全列が一致: 完全重複・3分と距離12の境界・推奨・順位・並び・無効化・孤児・件数制限・dirty。`tools/gen_quality_fixture.py`、CIで`--check`）、単体テスト、検証環境（§16.9。Rustの再構築が本番コピーの`photo_quality`559行と全列で一致、実サイクルで`.dump`不変） | ②は、Pythonの行を全部Rustで作り直す必要が出たら`geoframe quality-scan`（特徴量を消してから）で解消できる。他は決定 | [§16](#16-簡易品質p2--t26) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
@@ -64,6 +65,7 @@ P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 | 同期サイクルの間隔（分。小数も可） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10`（§11.2） |
 | ローカル写真の置き場（`DATA_DIR`からの相対。T2.3） | なし | `GEOFRAME_PHOTOS_DIR` | `photos`（§13.1） |
 | 同期1サイクルで`local_derivatives`が処理する枚数（0以上の整数。T2.3） | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25`（§13.1） |
+| 同期1サイクルで品質を解析する枚数（0以上の整数。0は1として扱う。T2.6） | なし | `GEOFRAME_QUALITY_PER_CYCLE` | `GEOFRAME_FETCH_PER_CYCLE`と同じ（§16.1） |
 
 - **空文字の環境変数は未設定と同じ**に扱う。現行の`GEOFRAME_DATA_DIR`が`or`で空文字を未設定扱いにするのと同じで、`EnvironmentFile`に`KEY=`と書いた事故を避ける。
 - **不正な値は起動を断る**（終了コード2）。メッセージには環境変数の名前と理由だけを書き、値は書かない。`GEOFRAME_HOST`はIPアドレスだけ（現行Pythonはホスト名も通すが、本番は`0.0.0.0`か`127.0.0.1`）。
@@ -88,7 +90,7 @@ P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
 ### 1.4 未対応の項目（P2以降）
 
-`config.rs`の`UNSUPPORTED_ENV`に、現行の`config.py`にあるP2以降の項目（取り込み・タイル・AI・位置候補など）を**列挙だけ**してある（T2.1で`GEOFRAME_DRIVE_POLL_MIN`、T2.3で`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_FETCH_PER_CYCLE`を読み始めたので、27個）。読まず、警告も出さない（`/etc/default/geoframe`に書いてあっても無視される）。`docs/reference/configuration.md`にある`GEOFRAME_*`が、読む項目（`SUPPORTED_ENV`）か未対応のどちらかに分類されていることを、テスト`every_documented_variable_is_classified`が検査する。Pythonに項目が増えたら、このテストが落ちて気づける。
+`config.rs`の`UNSUPPORTED_ENV`に、現行の`config.py`にあるP2以降の項目（取り込み・タイル・AI・位置候補など）を**列挙だけ**してある（T2.1で`GEOFRAME_DRIVE_POLL_MIN`、T2.3で`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_FETCH_PER_CYCLE`、T2.4で`GEOFRAME_DRIVE_KEY`・`GEOFRAME_DRIVE_FOLDER`、T2.5で`GEOFRAME_INFER_OFFSET_MIN`、T2.6で`GEOFRAME_QUALITY_PER_CYCLE`を読み始めたので、20個）。読まず、警告も出さない（`/etc/default/geoframe`に書いてあっても無視される）。`docs/reference/configuration.md`にある`GEOFRAME_*`が、読む項目（`SUPPORTED_ENV`）か未対応のどちらかに分類されていることを、テスト`every_documented_variable_is_classified`が検査する。Pythonに項目が増えたら、このテストが落ちて気づける。
 
 秘密になりうる項目（P2の`GEOFRAME_DRIVE_KEY`ほか）が入るときも、設定が持つのは**鍵ファイルのパスだけ**で、中身は設定の型に載せない。`Config`は`Debug`を手書きにしてあり、ログへ出す要約（`log_summary`）に載せた項目だけが出る。許可Host名も件数だけで、名前は出さない。
 
@@ -520,11 +522,11 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | `GEOFRAME_INGEST`（Rustだけ） | `0` | `0`／`1`だけ（他は起動を断る）。空文字は未設定 | [inventory.md §3.1](inventory.md) B0・B1（起動時の準備と同期サイクル）を動かすか。Pythonには無い |
 | `GEOFRAME_DRIVE_POLL_MIN` | `10` | 分。小数も可（`0.5`は30秒）。Pythonは`float()`で秒に換算。**Rustは0以下・非有限・上限（525600分＝1年）超を起動の断りにする**（Pythonは0以下で空回りか例外） | [inventory.md §4.1](inventory.md)の`GEOFRAME_DRIVE_POLL_MIN`（P2・引き継ぐ） |
 
-`GEOFRAME_DRIVE_POLL_MIN`は`UNSUPPORTED_ENV`から`SUPPORTED_ENV`へ移した。`GEOFRAME_INGEST`は`GEOFRAME_LOG`と同じRustだけの項目なので`docs/reference/configuration.md`（Pythonの`config.py`から生成）には無く、どちらの一覧にも載せない。`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_FETCH_PER_CYCLE`はT2.3で読み始めた（§13.1）。`GEOFRAME_DRIVE_KEY`・`GEOFRAME_DRIVE_FOLDER`はT2.4で読み始めた（§14.1）。`GEOFRAME_INFER_OFFSET_MIN`はT2.5で読み始めた（§15.1）。`GEOFRAME_QUALITY_PER_CYCLE`は、段の中身を入れるT2.6で読み始める。
+`GEOFRAME_DRIVE_POLL_MIN`は`UNSUPPORTED_ENV`から`SUPPORTED_ENV`へ移した。`GEOFRAME_INGEST`は`GEOFRAME_LOG`と同じRustだけの項目なので`docs/reference/configuration.md`（Pythonの`config.py`から生成）には無く、どちらの一覧にも載せない。`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_FETCH_PER_CYCLE`はT2.3で読み始めた（§13.1）。`GEOFRAME_DRIVE_KEY`・`GEOFRAME_DRIVE_FOLDER`はT2.4で読み始めた（§14.1）。`GEOFRAME_INFER_OFFSET_MIN`はT2.5で読み始めた（§15.1）。`GEOFRAME_QUALITY_PER_CYCLE`はT2.6で読み始めた（§16.1）。
 
 ### 11.3 同期サイクルの骨組み
 
-現行の`catalog.py:cycle()`の順に、**段（`Stage`）を並べた**もの。段は`index_local`→`index_drive`→`infer`→`enrich`→`local_derivatives`→`fetch_derivatives`→`quality`。T2.1の段は何もしない（`Placeholder`）。
+現行の`catalog.py:cycle()`の順に、**段（`Stage`）を並べた**もの。段は`index_local`→`index_drive`→`infer`→`enrich`→`local_derivatives`→`fetch_derivatives`→`quality`。T2.1の段は何もしない（`Placeholder`）で、T2.3〜T2.6で全部の段に中身が入った（`quality`はT2.6。§16）。
 
 - **起動直後に1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと**。専用のstdスレッド`sync-worker`で動き、HTTPサーバーの起動を待たせない。SIGTERMで`StopFlag`を立て、待ちの最中ならすぐ、サイクルの最中なら今の段が終わってから止まる（最大10秒待ち、超えたらそのまま終了する。途中で止まってもDBはトランザクション単位なので壊れず、`.dl_*`の残骸は次回の起動で消す）。
 - **段ごとに失敗を隔離する**: 段が`Err`を返しても、パニックしても、残りの段と次の周期へ進む。ログに出すのは段の名前と失敗の種類だけ（`StageError`はDB・I/Oの種類と定型文しか持たない。パニックのメッセージは出さず、場所だけをpanic hookが出す）。Pythonの`index_drive`段の「Drive認証に失敗したらDBの段だけ飛ばす」は、段が`Skipped(理由)`を返す形で表す（T2.4）。
@@ -1391,6 +1393,153 @@ T2.4の`net.rs`の`Failure`（§14.3の表）に合わせる。`Failure::is_outa
 
 ### 15.10 回したもの
 
-- **T2.6**: `quality`段（簡易品質）。
+- **T2.6**: `quality`段（簡易品質）。済み（§16）。
 - **T2.7**: 検証環境での受入のうち、**同じ写真を比較用PythonとRustへ入れた`photos`の列ごとの比較**（`infer`・`enrich`を含む）。Drive・GSIの本物での確認は管理者が行う。
 - **P3**: 位置が動いたときに地名を付け直すか（§15.2の5）。手動の位置の上書き（§13.10・§14.12）と一緒に決める。
+
+## 16. 簡易品質（P2 / T2.6）
+
+写真の重複・類似を見つけ、表示から外してよい写真（完全重複の非推奨）を決める。現行の`quality.py`の`quality_cycle`・`quality_backfill`に対応する。棚卸しB3・B9（`--quality-scan`）・S7（[inventory.md](inventory.md)）。実装は`crates/geoframe/src/quality.rs`（段・DB・`--dry-run`・一括解析）、`quality/features.rs`（1枚の特徴量）、`quality/group.rs`（グルーピング。DBにも画像にも触れない純粋な関数）。試験は`quality/tests.rs`。
+
+**表示への効き方**: 配信の`QUALITY_VISIBLE`（`GET /api/v1/photos`が`group_kind='exact'`で`recommended=0`の写真を外す）が`photo_quality`を読む（§8.1）。段の責任は`photo_quality`を作ることだけで、配信の側は変えていない。
+
+### 16.1 段と設定
+
+| 項目 | 内容 |
+| --- | --- |
+| 段 | `quality`。同期サイクルの**最後**（`fetch_derivatives`の後）。失敗・パニックは隔離される（§11.3） |
+| `GEOFRAME_QUALITY_PER_CYCLE`（既定は`GEOFRAME_FETCH_PER_CYCLE`＝25） | 1サイクルで解析する枚数。0以上の整数だけ（負・小数・非数は起動を断る＝終了コード2。Pythonは負を`max(1, …)`で1にする）。**0は1として扱う**（Pythonの`max(1, limit)`）。`UNSUPPORTED_ENV`から`SUPPORTED_ENV`へ移した |
+| 流れ | ①孤児の特徴量を消す→②未解析を`id`順に上の枚数まで解析→③未解析が0で`photo_quality_dirty=1`のときだけ再構築（Pythonと同じ） |
+| ログ | 件数だけ（`removed pending analyzed failed remaining rebuilt rows`）。写真の名前・パス・失敗の詳しい文面は出さない |
+
+### 16.2 算法の方針: Pythonが作った特徴量の行を有効として使う
+
+**決めたこと**: `photo_quality_features`の行は、Pythonが作ったものも、Rustが作ったものも、同じく有効として使う。Rustは**新しく入った（または`display`・`md5`・`mtime`が変わった）写真だけ**を自分の算法で解析する。本番コピーの約6,500枚を解析し直さない。
+
+**理由**: ①特徴量の行には**算法の印が無い**（`photo_quality`には`algorithm`があるが、`photo_quality_features`には無い）。「Pythonの行だけを無効にして作り直す」には列を足すしかなく、それはスキーマの移行（「何もしない」ことを試験で保証している。§11.7）とPythonへの切り戻し（P5）に触れる。②有効かどうかの判定は`display`・`md5`・`mtime`の`IS`比較だけで（Pythonと同じ）、算法には依らない。③全部解析し直すと次のような費用になる（下の計測）。
+
+検証環境の本番コピー（`photos`6,535行すべてに有効な特徴量がある。`photo_quality`は559行・243グループ、`GET /api/v1/photos`は3,065件）の複製で、3通りを比べた（件数だけ。§16.9）:
+
+| | A. Pythonの行を使う（採用） | B. 300枚だけRustで解析（混在） | C. 全6,535枚をRustで解析し直す |
+| --- | --- | --- | --- |
+| 解析する枚数 | 0（`pending=0`） | 300 | 6,535 |
+| 所要時間 | — | 17秒 | **424秒**（`quality-scan`）。同期サイクルの既定（25枚／10分）では**262サイクル＝約44時間**（その間、新しい写真の重複判定は前回のまま止まる） |
+| `photo_quality`の行数・グループ数 | 559・243（変わらない） | 559・243 | 560・243 |
+| グループの顔ぶれが変わった写真 | 0 | 0 | 7（距離12の境界付近の組が入れ替わった） |
+| 推奨が変わった行／順位が変わった行 | 0／0 | 4／17 | 2／14 |
+| スコアが変わった行 | 0 | 38（最大68.5） | 301（最大43.5） |
+| 完全重複の非推奨（＝配信から外れる）の集合 | 同じ（93） | 同じ | 同じ |
+| `GET /api/v1/photos`の件数 | 3,065 | 3,065 | 3,065 |
+
+Aは、Pythonの特徴量の行をそのまま入力にしたRustの再構築が、**Pythonの`photo_quality`と559行すべて同じ**になること（`group_id`・順位・推奨・スコア・理由・注意を含む）。B・Cでスコアが大きく動く行があるのは、グループ内の最小・最大で正規化する式が、鮮明度がほぼ同じ2枚では0.4%の差で順位を入れ替えるため（Rustの鮮明度はPythonより中央値で0.4%高い）。表示に効く完全重複の集合は、どの場合も変わらない。
+
+**混在の安全性**: Pythonの行とRustの行が同じ再構築に入るので、pHashが別の算法どうしで比べられる。そこで、RustのpHashを**Pythonと同じ作り方**（グレーに変換→中央を正方形に切って32×32へLanczos→DCTの左上8×8→直流を除く63個の中央値より大きいか→先頭の係数が最上位ビット）にした。画素は一致しない（デコーダ・縮小の実装が違う）が、同じ写真のPythonの値とのハミング距離を、検証環境の本番コピーの6,535枚（`geoframe img-probe --quality`の出力と、Pythonが保存した`phash`）で測った:
+
+| ハミング距離 | 0 | 2 | 4 | 6 | 8以上 |
+| --- | --- | --- | --- | --- | --- |
+| 枚数 | 6,134（93.9%） | 391（6.0%） | 9 | 1 | 0 |
+
+最大6で、類似の判定の閾値（12）に届くものは0枚。SHA-256は6,535枚すべて一致（同じファイルのバイト列を読んでいる）。Pythonの値と**同じ閾値で別の算法の値を比べても、判定の境目に来る写真はごくわずか**で、実際、混在のB（300枚をRustで解析）ではグループの顔ぶれが1枚も変わらなかった。さらに、**同じSHA-256の写真は、`id`が最小の行のpHash・指標にそろえてから比べる**（`group.rs`の`unify_same_content`）: 同じバイト列の特徴量は同じはずで、違うのは算法が違う行が混ざったときだけ。そろえないと、同一ファイルの2枚（Pythonの行とRustの行）のスコアが算法の差で食い違い、完全重複でどちらを推奨にするかが算法の差で決まる。Pythonの行だけの入力では何も変わらない（本番コピーで確かめた。§16.9）。
+
+### 16.3 特徴量（`quality/features.rs`）
+
+| 項目 | 内容 |
+| --- | --- |
+| SHA-256 | **`display`が指すファイルのバイト列**（Driveの写真はderivative。ローカルの写真でブラウザが表示できるJPEG・PNGは原本）。Pythonの`sha256_file(path)`と同じ。16進・小文字。`ring`で計算 |
+| 読む前の検査 | `DataDir::resolve_existing`（絶対パス・`..`・リンクの先が`DATA_DIR`の外は失敗）、通常のファイルか、512 MiB以下か（§12.5）。**FIFOなどで止まらない** |
+| デコード | 内容で形式を判別（JPEG・PNG・TIFF・HEIC）→EXIFの向きを当てる（`exif_transpose`）→**Pillowと同じ整数式**でグレー化（`(R×19595+G×38470+B×7471+0x8000)>>16`。`image`の`to_luma8`は係数が違うので使わない）。ICC・アルファは使わない |
+| pHash | 上の16.2の作り方。`ImageOps.fit`の切り出し（中央、縦横比1:1、小数の枠）を`fast_image_resize`の`crop`で、Lanczos3で32×32へ。DCTは係数の表をPythonと同じ式で作り、足す順もPythonと同じ。保存は`{:016x}` |
+| 鮮明度 | 長辺512pxへLanczosで縮め（`target_dims`はPillowの`thumbnail`と同じ丸め）、`FIND_EDGES`（3×3、0〜255に収める、外周1画素は元のまま）→外周4画素を除く→母分散（`ImageStat.var`と同じ式）→`ln(1+var)` |
+| 輝度・露出・白飛び・黒つぶれ・コントラスト | ヒストグラムから。Pythonの式をそのまま写した（`exposure_score`、`white_clip`＝248以上、`black_clip`＝8未満、`contrast`＝95%点−5%点） |
+| 決定性 | 乱数・時刻・並列に依らない。同じバイト列は常に同じ値（単体テスト） |
+| Pythonとの違い | **縮小は`reducing_gap`による箱型の縮小を再現しない**（Pillowの`thumbnail`は先に箱型で縮めてからLanczos。Rustは直接Lanczos）。鮮明度はRust／Pythonの比が中央値1.004（5〜95%点が1.000〜1.007、最小0.985・最大1.011）、輝度は中央値で0.1（0〜255）低い、コントラスト（整数）は95%点で1違う（16.2の計測）。値は`error=''`の行なら有効で、混在しても順位づけは相対値で行う |
+| 失敗 | 画像として読めない・パスが不正・大きすぎる・通常のファイルでない: `error`に**種類だけ**を書いた行を作る（Pythonは`型名: 例外の文字列`を500文字まで。パスを含みうるので書かない）。この行も解析済み（画像が変わるまで再解析しない）で、グルーピングには入らない |
+| `analyzed_at` | `+09:00`のようにUTCからのずれが付く（`datetime.now().astimezone().isoformat(timespec="seconds")`）。`sysinfo::local_isoformat_offset` |
+| `algorithm` | `photo_quality.algorithm`は`rust-phash-v1:t3:h12`（Pythonは`poc-phash-v1:t3:h12`。`t3`＝時刻の窓3分、`h12`＝距離12）。再構築のたびに全行がこの値になる。特徴量の表には`algorithm`の列が無い |
+
+### 16.4 グルーピング（`quality/group.rs`）
+
+Pythonの`build_quality_rows`・`rank_group`と同じ。入力は`id`の昇順の特徴量。
+
+1. **完全重複**: SHA-256が同じ写真を1つにつなぐ。
+2. **類似**: 撮影時刻（`YYYY-MM-DD HH:MM:SS`、なければ`YYYY-MM-DD HH:MM`）の差が**3分以内（ちょうど3分を含む）**で、pHashのハミング距離が**12以下**の写真どうしをつなぐ（撮影時刻の順に、3分の窓の中で比べる）。時刻が読めない写真（空・NULL・暦として不正・秒が60以上・末尾の余分）は時刻では結びつかない。
+3. **グループ**: つながった連結成分で2枚以上のものだけが行になる。`kind`は成分のSHAが1種類なら`exact`、それ以外は`similar`。
+4. **スコア**: グループ内の相対値（鮮明さ62%・露出25%・コントラスト13%、白飛び・黒つぶれの減点、`round(…, 1)`）。最小と最大が`math.isclose`なら0.5。理由・注意の文言（`ぼけ傾向`・`露出要確認`・`白飛び多め`・`黒つぶれ多め`・`低コントラスト`／`グループ内で最も鮮明`・`鮮明さ良好`・`露出良好`・`白飛び・黒つぶれ少`・`総合スコア上位`）もPythonと同じで、`json.dumps(ensure_ascii=False)`と同じ`["…", "…"]`の形。
+5. **順位**: スコアの降順、同点は`id`の昇順。**推奨**はSHAごとの最上位1枚（代表）のうち上位2枚（完全重複だけのグループは1枚）。信頼度＝代表の1位と3位（なければ最後）のスコアの差（代表が1枚だけなら100）。
+6. **グループ番号**: `exact`が先、次にグループが大きい順、次に信頼度の高い順、次に先頭の写真の`taken_at`の文字列の昇順（安定ソート。同順位は成分の最小の`id`の順）。
+
+`round(x, 1)`はPythonと同じ丸め（10進で最も近い値、中間は偶数側）を`format!("{x:.1}")`の解析で再現し、境界の値で突き合わせた。
+
+### 16.5 再構築と書き込み
+
+- **全員分そろってから**: 未解析（`display`が空でなく、行が無いか`display`・`md5`・`mtime`が違う）が0件で、`settings`の`photo_quality_dirty`が`'1'`のときだけ再構築する。未解析が残る間は前回の`photo_quality`を保つ（途中結果で表示候補が揺れない）。
+- **`BEGIN IMMEDIATE`の1トランザクション**で、未解析の数・dirty・特徴量の読み取り・グルーピング・`DELETE FROM photo_quality`・全行の`INSERT`・`photo_quality_dirty='0'`をまとめる（Pythonは読んでから別に書く。Rustは読んだあとに他の書き込みが入って食い違わない）。途中で失敗しても、確定の前に停止の合図が来ても、何も変わらない（前回の結果とdirtyのまま）。
+- 特徴量の書き込み（upsert）と`photo_quality_dirty='1'`は1つのトランザクション。孤児の削除と`dirty='1'`も1つ。
+- 解析（重い）は書き込み接続の外で行う（writerを塞がない）。
+- 再構築で`photo_quality`に書く列は、Pythonと同じ（`photo_id display source_md5 source_mtime content_sha256 group_id group_kind rank_in_group recommended score reasons_json issues_json algorithm analyzed_at`）。`source_md5`・`source_mtime`は`photos`の値をSQLiteの型のまま写す。
+
+### 16.6 `--dry-run`と`geoframe quality-scan`
+
+- **`sync --dry-run`**: 解析（重い）は**実行しない**。件数だけ: `orphans`（消す孤児）`pending`（未解析）`would_analyze`（今回解析する枚数）`remaining`（今回のあとに残る未解析）`would_rebuild`（0／1: 残りが0で、dirtyか今回の解析か孤児の削除がある）。今回解析する写真が無くて再構築になるときは、`rows`（書く行数）と`changed`（今の`photo_quality`から変わる行数。追加・削除・変更。`analyzed_at`・`algorithm`は比べない）も出す。**取り込み済みの本番コピーでは全部0**（`pending=0`、dirty=0）。
+- **`geoframe quality-scan [--dry-run] [--data-dir <dir>]`**（現行の`server.py --quality-scan`の`quality_backfill`）: 孤児を消し、未解析が0になるまで`GEOFRAME_QUALITY_PER_CYCLE`件ずつ解析し、再構築する。`GEOFRAME_INGEST=1`と、`sync`・`organize`と同じガード（検証環境の印・Pythonが非稼働）を通す。`--dry-run`は`would_analyze`が未解析の全部になる。書いたのに未解析が減らない（行が有効にならない）ときは、無限に回さず失敗にする。出力は件数だけ。
+- `geoframe img-probe --quality <画像>…`: 画像から特徴量（SHA-256・pHash・指標）を出す確認用。DB・`DATA_DIR`に触れない。ファイル名は出さない。16.2の計測に使った。
+
+### 16.7 Pythonとの差（まとめ）
+
+§0の1行に載せたもの:
+
+- **特徴量の行の算法**は混在する（Pythonの行を使い、Rustは新しい写真だけを解析する）。
+- **Rustの鮮明度・露出・輝度は、Pythonと値が少し違う**（`reducing_gap`を再現しない）。pHashは同じ作り方で距離が小さい。
+- **同じSHA-256の写真は`id`最小の行の特徴量にそろえて比べる**。
+- **失敗の行の`error`は種類だけ**（Pythonは例外の文字列）。
+- `algorithm`は`rust-phash-v1:t3:h12`。
+- 特徴量の書き込みと`dirty`、再構築の読み書きがそれぞれ1トランザクション。
+- `GEOFRAME_QUALITY_PER_CYCLE`が負・小数・非数なら起動を断る。
+- 時刻の読み方は§15.2の6と同じ規則（`strptime`に合わせる。ASCIIの数字だけ）。秒つきの形も試す。全角の数字が混じった時刻は読めない（既知の差。§0）。
+
+### 16.8 テスト
+
+| 対象 | テスト |
+| --- | --- |
+| Pythonとの突き合わせ（`quality/tests.rs`の`pythonのquality_cycleとquality_backfillと全列が一致する`） | `tools/gen_quality_fixture.py`が作る`quality-python.json`。20ケース・合成の`photos`と**合成の特徴量**（画像は使わない）にPythonの`quality_cycle`・`quality_backfill`を段階的に流した結果と、Rustの`photo_quality_features`・`photo_quality`・`settings`の全列・戻り値（`analyzed removed remaining rebuilt`）が一致する。完全重複、3分の境界（2:59・3:00・3:01、秒つき）、距離12・13、連鎖、類似の中の完全重複、3枚以上の推奨・信頼度・同点のid順、理由・注意の文言、読めない時刻、件数制限での分割、一括解析、失敗の行、孤児（削除・空・NULL）、無効化（`md5`が値に・`mtime`・`display`）、位置なし・`display`なし、グループの並び、dirtyの印が無いとき、前回の結果を保つ、再グルーピング、乱数の3ケース（60・90・40枚）。CIで`--check` |
+| 特徴量の算出（`quality/tests.rs`） | 同じ入力なら同じ値（別スレッドでも）、再圧縮・縮小した同じ絵のpHashが近い、別の絵は遠い、ぼけ・白飛び、極端な縦横比、壊れた入力、Pillowと同じ整数式のグレー化、`round`の丸め |
+| 段（実ファイル） | 解析→行→再構築、失敗の行（パス・ファイル名が入らない）、リンクで`DATA_DIR`の外を指す写真、件数制限と0、再構築が失敗しても前回の結果を保つ（トリガーで挿入を失敗させる）、停止の合図、`--dry-run`、一括解析と待ちが減らないときの停止、位置なし・`display`なし、同じSHAの指標をそろえる |
+| `tests/ingest_cli.rs` | `sync --dry-run`の品質の件数、`quality-scan`（ガードの拒否、`--dry-run`、実行） |
+| `config.rs`・`cli.rs`・`sysinfo.rs` | `GEOFRAME_QUALITY_PER_CYCLE`、`quality-scan`の引数、`+09:00`付きの時刻の形 |
+
+### 16.9 検証環境での確認（2026-10-25）
+
+検証環境（本番の2026-10-24のバックアップのコピー。`photos`6,535行、特徴量6,535行・`photo_quality`559行、Driveの鍵は無い）に`rust-deploy.sh`で配布して（コミット`eb54361`）確かめた。**書き換える前に、検証環境の中でバックアップを取った**（`sqlite3 .backup`。`.dump`のSHA-256の先頭16桁`57f6dcef…`）。座標・ファイル名・撮影日時は出していない。
+
+| # | 確認 | 結果 |
+| --- | --- | --- |
+| (a) | 特徴量の計測: 6,535枚のderivativeを`geoframe img-probe --quality`で解析し、Pythonが保存した値と比べた | SHA-256は6,535枚すべて一致。pHashの距離は0が6,134・2が391・4が9・6が1（最大6）。鮮明度の比（Rust／Python）は中央値1.004。**1枚あたり中央値62 ms・95%点88 ms**（長辺2560pxのJPEG。1スレッド、最大RSS 87 MiB）、全6,535枚で407秒。同期サイクルの既定の25枚は約1.6秒 |
+| (b) | 本番コピーで`geoframe sync --dry-run` | `段 quality: 完了 orphans=0 pending=0 would_analyze=0 remaining=0 would_rebuild=0`（**ほぼ0どころか0**）。`infer`は`inferred=0 updated=0 cancelled=0`、`enrich`は`candidates=0`。`.dump`のSHA-256は実行の前後で一致 |
+| (c) | `GEOFRAME_INGEST=1 geoframe sync`を1サイクル（本番コピーの実DBに対して） | `段 quality: 完了 removed=0 pending=0 analyzed=0 failed=0 remaining=0 rebuilt=0 rows=0`。**`.dump`のSHA-256が実行前・バックアップと完全に一致**（`photo_quality`559行・`algorithm=poc-phash-v1:t3:h12`のまま）、`/api/v1/photos`は3,065件のまま、`/healthz` 200。常駐の`geoframe-rs`は`GEOFRAME_INGEST`なし（読み取り専用）のまま。元に戻す作業は要らなかった |
+| (d) | 複製A: dirty=1にして`--dry-run`→`quality-scan` | dry-runは`would_rebuild=1 rows=559 changed=0`。再構築のあとの`photo_quality`は**元の559行と全列で一致**（`algorithm`・`analyzed_at`を除く）。`/api/v1/photos` 3,065件。**同じSHAの特徴量をそろえる処理（§16.2）は、本番のPythonの行では何も変えない** |
+| (e) | 複製B・C（§16.2の表） | 300枚だけRustで解析（混在）: 17秒、グループの顔ぶれ・完全重複の集合・E1の件数は変わらない。全6,535枚をRustで解析し直す: 424秒、7枚の組が入れ替わる。どちらもE1は3,065件 |
+| (f) | 棚卸しS7: 複製Aに、単独の写真と同じバイト列の写真を2枚足して1サイクル | dry-runは`pending=2 would_analyze=2 would_rebuild=1`。実行は`analyzed=2 rebuilt=1 rows=562`。新しいグループは`exact`で、元の写真が推奨（順位1）、足した2枚が非推奨（順位2・3）。`/api/v1/photos`は足した直後の3,067件から**3,065件に戻った**（完全重複の非推奨が配信から消えた）。`photo_quality`の全行が`algorithm=rust-phash-v1:t3:h12`になった |
+| (g) | 後始末 | 複製（`/var/tmp`の使い捨て）・バックアップ・スクリプトを消した。実DBは(c)のとおり不変 |
+
+再現の手順（検証環境の中で。座標・ファイル名は出力に出ない）:
+
+```sh
+# 実DBに触れる前にバックアップ
+sudo -u geoframe sqlite3 /var/lib/geoframe/catalog.db ".backup /var/tmp/catalog.pre.db"
+# (a) 特徴量の計測: derivative の絶対パスを引数に渡す（出力は引数の順。Python が保存した phash と突き合わせる）
+geoframe img-probe --quality --jobs 1 /var/lib/geoframe/derivatives/<ファイル>…
+# (b) 書かずに件数: 品質の行は pending=0 would_rebuild=0 になる
+sudo -u geoframe env GEOFRAME_DRIVE_KEY=/nonexistent/k.json geoframe sync --dry-run --data-dir /var/lib/geoframe
+# (c) 実DBに1サイクル（前後の .dump の SHA-256 と /api/v1/photos の件数が同じ）
+sudo -u geoframe sqlite3 -readonly /var/lib/geoframe/catalog.db .dump | sha256sum
+sudo -u geoframe env GEOFRAME_INGEST=1 GEOFRAME_DRIVE_KEY=/nonexistent/k.json geoframe sync --data-dir /var/lib/geoframe
+# (d)(e)(f) 複製で: バックアップを使い捨ての置き場に置く。derivatives/ はハードリンクで複製する（実体は増えない）
+d=/var/tmp/qcopy; mkdir -p $d && cp /var/tmp/catalog.pre.db $d/catalog.db && cp -al /var/lib/geoframe/derivatives $d/ && chown -R geoframe $d
+sudo -u geoframe sqlite3 $d/catalog.db "DELETE FROM photo_quality_features WHERE photo_id IN (SELECT photo_id FROM photo_quality_features ORDER BY random() LIMIT 300)"
+sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
+```
+
+### 16.10 回したもの
+
+- **T2.7**: 検証環境での受入のうち、本番コピーの`--dry-run`（変更ほぼ0）と実サイクルの通し、棚卸しS7（同じバイト列の写真・3分以内のほぼ同じ写真を入れて、完全重複の非推奨がE1から消えること）。
+- **P4**: AIワーカーが`photo_quality_features`を読む（`content_sha256`が`error=''`の行）。Rustで特徴量を作った行もそのまま使える。
