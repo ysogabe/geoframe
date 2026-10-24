@@ -14,7 +14,7 @@ AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ�
 | T0.1 | 検証環境の用意: lxc-geoframeの旧版退避、SSH、本番データのコピー、比較用Python（`:8090`、AI・Drive無効） | AC1 | - | ops | 完了 | - | - | 比較用Python（main e0f15fe、`geoframe-pyref.service`）の`/api/v1/photos`は本番と同じ3,065件 |
 | T0.2 | 棚卸し`docs/rust-migration/inventory.md`: エンドポイント・DBテーブルと書き込み元・バックグラウンド処理・設定・E2Eシナリオ、各フェーズへの割当 | AC2 | - | quick | 完了 | 66ce058 | a0c2fca..fcea60b | レビュー（Opus）: 必須0、推奨4・参考3を反映（「ピアソン」は誤記でなく指摘不要） |
 | T0.3 | Cargo workspaceの骨組み（`crates/geoframe`）、CIにfmt・clippy・test、musl静的ビルドの可否と検証環境での起動確認 | AC5 | - | full | 完了 | 8809e31 | 06df8ad | musl静的（static-pie, 約4MB）で検証環境動作。レビュー（Sol）: 必須0。推奨「WAL DBの読み取りテスト」はT1.1へ回す |
-| T0.4 | 画像PoC: 実写真約100枚でデコード・EXIF向き・2560px・JPEG出力・HEICの計測、依存ライブラリの一覧。結果を文書へ（数値のみ） | AC5, AC7 | T0.3 | full | 実装中 | 0f97acb | | ユーザー指示（2026-10-24）でDriveは使わずローカルのファイルを使う: 検証環境の本番コピーのderivatives（JPEG）と、それを変換したHEIC。実機HEIC固有の問題（グリッド・HDR等）はP2で確認 |
+| T0.4 | 画像PoC: 実写真約100枚でデコード・EXIF向き・2560px・JPEG出力・HEICの計測、依存ライブラリの一覧。結果を文書へ（数値のみ） | AC5, AC7 | T0.3 | full | 完了 | 0f97acb | 912bb60..14152cf | 結論: HEICは純Rustのzune-heicでmusl静的のまま扱える。レビュー（Solが利用上限のためOpusで代替）: 必須0、推奨7・参考7を反映。CIのYAML構文エラー（ジョブ名のコロン）は管理者が修正。ユーザー指示（2026-10-24）でDriveは使わずローカルのファイルを使う: 検証環境の本番コピーのderivatives（JPEG）と、それを変換したHEIC。実機HEIC固有の問題（グリッド・HDR等）はP2で確認 |
 | T0.5 | `/api/v1/photos`のserde型・JSON Schema・合成DBの契約テスト | AC6, AC7 | T0.3 | full | 完了 | 79d45d9 | e8598d0..6badbde | レビュー（Sol）2回: 1回目 必須2（実在地名、Pythonの`$`）・推奨2・参考1をすべて反映、2回目 指摘なし。本番コピーに`taken_at` NULLの行は無い |
 
 ## P1: Rust API基盤
