@@ -1879,3 +1879,44 @@ fn matches_the_python_fixture() {
     );
     assert_eq!(rust_fetch_cycles.len(), 4);
 }
+
+#[test]
+fn only_the_original_download_gets_the_long_timeout() {
+    // agent 全体の時間切れを 150 ms にして、応答を 500 ms 遅らせる。一覧は時間切れ、原本のダウンロードは
+    // 要求ごとの設定（15 分）で最後まで読める
+    let e = env("drive-timeout");
+    e.listing(vec![jpeg("t1", "a.jpg", "m1")]);
+    e.stub.set_media("t1", vec![1u8; 100]);
+    let slow = |name: &'static str| -> stub::Fault {
+        Box::new(move |r| {
+            let hit = if name == "media" {
+                r.is_media()
+            } else {
+                r.param("fields")
+                    .is_some_and(|f| f.starts_with("nextPageToken"))
+            };
+            if hit {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            None
+        })
+    };
+    let http = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(Duration::from_millis(150)))
+            .http_status_as_error(false)
+            .build(),
+    );
+    let stop = StopFlag::new();
+    let session = Session::new(&e.shared, &http, &stop, &e.key);
+    session.token().unwrap();
+    e.stub.add_fault(slow("list"));
+    assert_eq!(
+        session.list_folder(FOLDER_ID).unwrap_err(),
+        DriveError::Net(Failure::Timeout)
+    );
+    e.stub.clear_faults();
+    e.stub.add_fault(slow("media"));
+    let mut out = Vec::new();
+    assert_eq!(session.download("t1", &mut out, 1000).unwrap(), 100);
+}
