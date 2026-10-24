@@ -180,18 +180,20 @@ CASES = [
 
 
 def extract(path: Path) -> dict:
-    """Python本体の`util.extract_exif`を呼ぶ（例外は型名だけを残す）"""
+    """Python本体の`util.extract_exif`を呼ぶ（例外は型名だけを残す）。
+
+    分母0の有理数は、Pillowの版で結果が違う（11.xは`ZeroDivisionError`、13は`IFDRational`がNaN）ので、
+    どちらも`NonFinite`にそろえる（どちらもRustは位置なしにする）"""
     from geoframe.util import extract_exif
     try:
         lat, lon, taken = extract_exif(path)
+    except ZeroDivisionError:
+        return {"error": "NonFinite"}
     except Exception as e:  # noqa: BLE001 - 期待値の記録
         return {"error": type(e).__name__}
-    # JSONにNaNは書けない（serde_jsonが読めない）ので、文字列"NaN"にする
-    return {"lat": jsonable(lat), "lon": jsonable(lon), "taken_at": taken}
-
-
-def jsonable(v):
-    return "NaN" if isinstance(v, float) and v != v else v
+    if any(isinstance(v, float) and v != v for v in (lat, lon)):
+        return {"error": "NonFinite"}
+    return {"lat": lat, "lon": lon, "taken_at": taken}
 
 
 NORM_TIME_INPUTS = [

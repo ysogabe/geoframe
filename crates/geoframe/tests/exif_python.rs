@@ -49,7 +49,10 @@ fn exifの読み取りはpythonと一致する() {
         if python.get("error").is_some() {
             match name {
                 // 壊れた GPS は Rust では位置なしで成功する（上の `rust_differs`）
-                "two_components" | "lat_is_short" => {
+                "two_components"
+                | "lat_is_short"
+                | "denominator_zero"
+                | "denominator_zero_seconds" => {
                     let info = rust.unwrap_or_else(|e| panic!("{name}: {e}"));
                     let want = rust_differs(name, "").unwrap();
                     assert_eq!(

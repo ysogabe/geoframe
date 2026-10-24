@@ -10,8 +10,10 @@
 """
 
 import json
+import os
 import random
 import sys
+import tempfile
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -36,6 +38,8 @@ def sizes() -> list:
 
 
 def thumb(w: int, h: int) -> list:
+    # config.py は import 時に環境変数を読む。置き場を作らせないよう一時の場所を指す
+    os.environ.setdefault("GEOFRAME_DATA_DIR", tempfile.mkdtemp(prefix="geoframe-thumb-"))
     sys.path.insert(0, str(APP))
     from PIL import Image
     from geoframe.config import DERIV_PX

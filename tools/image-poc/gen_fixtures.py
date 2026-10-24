@@ -1,4 +1,4 @@
-"""tests/fixtures/ の合成HEICを作る（左半分が赤・右半分が青の64x48。写真ではない）。
+"""crates/geoframe/tests/fixtures/ の合成HEIC（synthetic_*.heic）を作る（左半分が赤・右半分が青の64x48。写真ではない）。
 
 pillow-heifのあるvenvで実行する:
     python gen_fixtures.py <出力ディレクトリ>
