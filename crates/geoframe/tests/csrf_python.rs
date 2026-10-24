@@ -15,6 +15,7 @@ mod common;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use common::{TempDir, build_admin_catalog, spawn_with_env};
 use geoframe::csrf::{self, Verdict};
@@ -362,7 +363,7 @@ async fn send(addr: std::net::SocketAddr, case: &Value) -> u16 {
             }
         }
     };
-    tokio::time::timeout(std::time::Duration::from_secs(15), read)
+    tokio::time::timeout(Duration::from_secs(15), read)
         .await
         .expect("応答もリセットも来ないまま止まった");
     let head = String::from_utf8_lossy(&response);
@@ -484,7 +485,11 @@ async fn post_status(addr: std::net::SocketAddr, origin: Option<&str>, k: u32) -
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(head.as_bytes()).await.unwrap();
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await.unwrap();
+    // 閉じられないまま止まった試験を、ハングではなく失敗にする
+    tokio::time::timeout(Duration::from_secs(15), stream.read_to_end(&mut response))
+        .await
+        .expect("応答が閉じられない")
+        .unwrap();
     String::from_utf8_lossy(&response)
         .split(' ')
         .nth(1)
@@ -540,7 +545,9 @@ async fn a_later_request_on_the_same_connection_is_judged_on_its_own_origin() {
             body.len()
         );
         stream.write_all(request.as_bytes()).await.unwrap();
-        let (status, _) = read_response(&mut stream).await;
+        let (status, _) = tokio::time::timeout(Duration::from_secs(15), read_response(&mut stream))
+            .await
+            .expect("応答が返らない");
         assert_eq!(status, if k == 1 { 403 } else { 200 }, "{origin:?}");
     }
 }
