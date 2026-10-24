@@ -23,6 +23,9 @@ use serde_json::Value;
 pub const GSI_RGEO: &str =
     "https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress?lat={lat}&lon={lon}";
 
+/// 地理院の標高 API（`config.py` の `GSI_ELEV`）。`{lat}`・`{lon}` を埋めて使う。
+pub const GSI_ELEV: &str = "https://cyberjapandata2.gsi.go.jp/general/dem/scripts/getelevation.php?lon={lon}&lat={lat}&outtype=JSON";
+
 /// 確認用の公開の代表点（東京駅付近。個人の位置ではない）。`selfcheck-net` だけが使う。
 const SELFCHECK_POINT: (f64, f64) = (35.681, 139.767);
 

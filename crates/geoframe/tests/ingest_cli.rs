@@ -86,10 +86,11 @@ fn production_shaped_db(data_dir: &Path) {
         }
     }
     conn.execute_batch(
-        "INSERT INTO photos(source,drive_id,name,display,lat,lon,place) VALUES
-           ('drive','a','n1','derivatives/a.jpg',1.0,2.0,'p'),
-           ('drive','b','n2',NULL,1.0,2.0,NULL),
-           ('drive','c','n3',NULL,NULL,NULL,NULL)",
+        // 位置のある行は `exif`（`infer` が取り消さない）。(1, 2) は国外なので、`enrich` は通信せずに済む
+        "INSERT INTO photos(source,drive_id,name,display,lat,lon,loc_source,place) VALUES
+           ('drive','a','n1','derivatives/a.jpg',1.0,2.0,'exif','p'),
+           ('drive','b','n2',NULL,1.0,2.0,'exif',NULL),
+           ('drive','c','n3',NULL,NULL,NULL,NULL,NULL)",
     )
     .unwrap();
 }
@@ -197,12 +198,21 @@ fn dry_run_writes_nothing_and_reports_counts() {
             "{stage}\n{stdout}"
         );
     }
-    for stage in ["infer", "enrich", "quality"] {
-        assert!(
-            stdout.contains(&format!("段 {stage}: 完了（件数なし）")),
-            "{stage}\n{stdout}"
-        );
-    }
+    // 錨が無い（撮影時刻のある位置つきの写真が無い）ので、推定は何もしない。地名は、国外の 1 件を
+    // 通信なしで空で確定するはず（dry-run は何も書かない）
+    assert!(
+        stdout.contains(
+            "段 infer: 完了 anchors=0 targets=1 inferred=0 updated=0 unchanged=0 cancelled=0 untimed=1"
+        ),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(
+            "段 enrich: 完了 candidates=1 foreign=1 cache_hit=0 would_query=0 unresolved=0 skipped_backoff=0 unusable=0 pending=1"
+        ),
+        "{stdout}"
+    );
+    assert!(stdout.contains("段 quality: 完了（件数なし）"), "{stdout}");
     assert!(
         stdout.contains("写真: 表示可能 1 / 取得待ち 1 / 全3"),
         "{stdout}"
@@ -305,7 +315,9 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
             r.get(0)
         })
         .unwrap();
-    assert_eq!(null_places, 2); // 入れたとおり。再 enrich の印は増えない
+    // 国外の 1 件は `enrich` が空で確定した（NULL でなくなる）。位置の無い行だけが残る。
+    // 移行が再 enrich の印（`place=NULL`）を増やしていないことは、スキーマの確認（上）で見ている
+    assert_eq!(null_places, 1);
 }
 
 fn free_port() -> u16 {

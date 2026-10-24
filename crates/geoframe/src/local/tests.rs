@@ -16,6 +16,7 @@ use rusqlite::Connection;
 use super::*;
 use crate::cache::Cache;
 use crate::config::{Config, Overrides};
+use crate::geo::Infer;
 use crate::stop::StopFlag;
 use crate::sync::{Mode, StageResult};
 use crate::testutil::TempDir;
@@ -192,6 +193,9 @@ impl Setup {
             http: &http,
             stop: &stop,
         };
+        // `geoframe organize` と同じ順序（現行の `organize_photos`: index_local → infer_locations → 移動）。
+        // `index_local` は呼び出し側が済ませてある
+        Infer.run(&ctx).unwrap();
         organize(&ctx).unwrap()
     }
 
@@ -953,30 +957,44 @@ fn 退避先に同名があっても上書きしない() {
 }
 
 #[test]
-fn 位置が付きうる写真はt2_5まで移さない() {
-    let s = setup("local-organize-held");
-    // 撮影時刻つきで位置の無い写真と、錨になる写真がある → 推定で位置が付きうるので移さない
-    let mut with_time = jpeg_plain();
-    with_time.clear();
-    with_time.extend(fixture_jpeg("time_digitized_only")); // 時刻だけあって GPS が無い
-    s.put("photos/timed.jpg", &with_time, T0);
+fn 推定で位置が付く写真は移さない() {
+    let s = setup("local-organize-inferred");
+    // 錨（GPS・撮影時刻 2024-05-06 07:08）と、位置の無い 3 枚: 錨の 22 分後・13 時間後・撮影時刻なし
     s.put("photos/anchor.jpg", &jpeg_gps(), T0);
+    s.put("photos/near.jpg", &fixture_jpeg("time_digitized_only"), T0);
+    s.put(
+        "photos/far.jpg",
+        &fixture_jpeg("time_datetime_ifd0_only"),
+        T0,
+    );
     s.put("photos/untimed.jpg", &jpeg_plain(), T0);
     s.run(&IndexLocal);
-    assert_eq!(
-        s.row("photos/timed.jpg").taken_at.as_deref(),
-        Some("2023-01-02 03:04")
-    );
+    s.sql("UPDATE photos SET taken_at='2024-05-06 07:30' WHERE path='photos/near.jpg'");
+    s.sql("UPDATE photos SET taken_at='2024-05-06 20:09' WHERE path='photos/far.jpg'");
     let dry = s.organize(Mode::DryRun);
+    // 移すのは窓（12 時間）の外の 1 枚と、撮影時刻のない 1 枚。推定で位置が付く 1 枚と錨は残す
     assert_eq!(
-        (get(&dry, "targets"), get(&dry, "held_back_until_infer")),
-        (1, 1)
+        (
+            get(&dry, "targets"),
+            get(&dry, "moved"),
+            get(&dry, "failed")
+        ),
+        (2, 2, 0)
     );
+    assert!(
+        dry.0
+            .iter()
+            .all(|(name, _)| *name != "held_back_until_infer")
+    );
+    // dry-run は何も動かさない
+    assert_eq!(s.paths().len(), 4);
     let counts = s.organize(Mode::Apply);
-    assert_eq!(get(&counts, "moved"), 1);
-    assert_eq!(get(&counts, "held_back_until_infer"), 1);
-    assert_eq!(s.paths(), ["photos/anchor.jpg", "photos/timed.jpg"]);
-    // 錨が無ければ時刻つきでも移す（位置は付かない）
+    assert_eq!(get(&counts, "moved"), 2);
+    assert_eq!(s.paths(), ["photos/anchor.jpg", "photos/near.jpg"]);
+    let near = s.row("photos/near.jpg");
+    assert_eq!(near.loc_source.as_deref(), Some("inferred"));
+    assert_eq!(near.lat, Some(12.575));
+    // 錨が無くなれば、推定は取り消され、次の organize で移る（現行と同じ順序: 索引→推定→移動）
     fs::remove_file(s.root().join("photos/anchor.jpg")).unwrap();
     s.run(&IndexLocal);
     assert_eq!(get(&s.organize(Mode::Apply), "moved"), 1);

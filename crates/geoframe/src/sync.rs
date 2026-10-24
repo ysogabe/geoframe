@@ -3,7 +3,8 @@
 //! # 構成
 //!
 //! サイクルは**段（[`Stage`]）を順に実行**する。段の中身は T2.3〜T2.6 で入れる（T2.3 で
-//! `index_local`・`local_derivatives` が入った。残りは何もしない [`Placeholder`]）。順序は現行の
+//! `index_local`・`local_derivatives`、T2.4 で Drive の 2 段、T2.5 で `infer`・`enrich` が入った。残りは何もしない
+//! [`Placeholder`]）。順序は現行の
 //! `cycle()` と同じ:
 //!
 //! `index_local` → `index_drive` → `infer` → `enrich` → `local_derivatives` → `fetch_derivatives` → `quality`
@@ -281,8 +282,9 @@ fn copy_snapshot(
     Ok(copy)
 }
 
-/// 段の一覧（[`STAGE_NAMES`] の順）。T2.5・T2.6 で、残りの `Placeholder` を中身の入った段に置き換えていく
-/// （T2.3 で `index_local`・`local_derivatives`、T2.4 で `index_drive`・`fetch_derivatives` が入った）。
+/// 段の一覧（[`STAGE_NAMES`] の順）。T2.6 で、残りの `Placeholder`（`quality`）を中身の入った段に置き換える
+/// （T2.3 で `index_local`・`local_derivatives`、T2.4 で `index_drive`・`fetch_derivatives`、T2.5 で
+/// `infer`・`enrich` が入った）。
 pub fn default_stages() -> Vec<Box<dyn Stage>> {
     // Drive の 2 つの段は、トークン・フォルダ ID を共有する（現行は 1 サイクルで `svc` を作って両方に渡す）
     default_stages_with(Arc::new(crate::drive::DriveShared::new()))
@@ -300,10 +302,13 @@ pub(crate) fn default_stages_with(drive: Arc<crate::drive::DriveShared>) -> Vec<
 }
 
 fn stages(drive: Arc<crate::drive::DriveShared>, allow_mass_delete: bool) -> Vec<Box<dyn Stage>> {
+    // `enrich` は応答の壊れた座標を覚えるので、プロセスの間 1 つを使い回す（`stages` を呼ぶたびに作る）
     STAGE_NAMES
         .iter()
         .map(|name| match *name {
             "index_local" => Box::new(crate::local::IndexLocal) as Box<dyn Stage>,
+            "infer" => Box::new(crate::geo::Infer),
+            "enrich" => Box::new(crate::geo::Enrich::new()),
             "index_drive" if allow_mass_delete => Box::new(
                 crate::drive::IndexDrive::allowing_mass_delete(Arc::clone(&drive)),
             ),
@@ -588,10 +593,11 @@ mod tests {
         s.writer
             .call(|c| {
                 c.execute_batch(
-                    "INSERT INTO photos(source,drive_id,name,display,lat,lon) VALUES
-                       ('drive','a','n','derivatives/a.jpg',1,2),
-                       ('drive','b','n',NULL,1,2),
-                       ('drive','c','n',NULL,NULL,NULL)",
+                    // 位置は `exif`（推定の取り消しの対象にならない）。国外なので、地名の段は通信しない
+                    "INSERT INTO photos(source,drive_id,name,display,lat,lon,loc_source) VALUES
+                       ('drive','a','n','derivatives/a.jpg',1,2,'exif'),
+                       ('drive','b','n',NULL,1,2,'exif'),
+                       ('drive','c','n',NULL,NULL,NULL,NULL)",
                 )
             })
             .unwrap();

@@ -10,7 +10,8 @@
 //! | データ置き場 | `--data-dir <path>` | `GEOFRAME_DATA_DIR` | `./var`（実行時のカレントディレクトリ基準） |
 //! | 許可する Host 名 | なし | `GEOFRAME_ALLOWED_HOSTS`（`localhost` に足す） | `localhost` のみ |
 //! | ログの詳しさ | なし | `GEOFRAME_LOG`（Rust だけの項目） | `info` |
-//! | 位置推定の窓（管理画面の内訳の区切り） | なし | `GEOFRAME_INFER_MIN` | `15`（分） |
+//! | 位置推定の窓（1 段目。推定と管理画面の内訳の区切り） | なし | `GEOFRAME_INFER_MIN` | `15`（分） |
+//! | カメラ時計のずれの補正（推定する写真の時刻に足す。負でもよい） | なし | `GEOFRAME_INFER_OFFSET_MIN` | `0`（分） |
 //! | embedding の場所（管理画面の AI 件数が数えるモデル） | なし | `GEOFRAME_EMBED_BACKEND` | `gemini` |
 //! | タイルキャッシュの上限（管理画面のディスク表示） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
 //! | 取り込み（DB への書き込み・同期サイクル）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_INGEST`（`0`/`1`） | `0`（無効） |
@@ -56,7 +57,6 @@ pub const DB_FILE_NAME: &str = "catalog.db";
 pub const UNSUPPORTED_ENV: &[&str] = &[
     // P2: 取り込み
     "GEOFRAME_QUALITY_PER_CYCLE",
-    "GEOFRAME_INFER_OFFSET_MIN",
     // P3: 管理機能（地図タイル）
     "GEOFRAME_TILE_UA",
     "GEOFRAME_TILE_FETCH_PER_MIN",
@@ -100,9 +100,13 @@ pub const SUPPORTED_ENV: &[&str] = &[
     // T2.4: Drive の索引と取得
     "GEOFRAME_DRIVE_KEY",
     "GEOFRAME_DRIVE_FOLDER",
+    // T2.5: 位置の推定（`GEOFRAME_INFER_MIN` は T1.4 から読んでいて、推定の窓にもなった）
+    "GEOFRAME_INFER_OFFSET_MIN",
 ];
 
 pub const DEFAULT_INFER_MIN: f64 = 15.0;
+/// カメラ時計のずれの補正（分）の既定。現行の `GEOFRAME_INFER_OFFSET_MIN`。
+pub const DEFAULT_INFER_OFFSET_MIN: f64 = 0.0;
 pub const DEFAULT_TILE_CACHE_MAX_MB: i64 = 16384;
 /// 同期サイクルの間隔（分）の既定。現行の `GEOFRAME_DRIVE_POLL_MIN`。
 pub const DEFAULT_DRIVE_POLL_MIN: f64 = 10.0;
@@ -204,6 +208,9 @@ pub struct Config {
     pub tz: Option<String>,
     /// 位置推定の1段目の窓（分）。`GEOFRAME_INFER_MIN`。管理画面の「推定の内訳」の区切りに使う。
     pub infer_min: f64,
+    /// カメラ時計のずれの補正（分）。`GEOFRAME_INFER_OFFSET_MIN`。位置を推定する写真の撮影時刻に足す
+    /// （負でもよい）。現行は検証なしで `float()` に通すが、Rust は有限の数だけを受ける。
+    pub infer_offset_min: f64,
     pub embed_backend: EmbedBackend,
     /// `GEOFRAME_EMBED_BACKEND` が `gemini`・`local` のどちらでもなかった（現行と同じく `gemini` に
     /// 落とした）。起動ログで知らせる。
@@ -289,6 +296,19 @@ impl Config {
                 })?,
             None => DEFAULT_INFER_MIN,
         };
+        let infer_offset_min = match get("GEOFRAME_INFER_OFFSET_MIN") {
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| {
+                    ConfigError(
+                        "GEOFRAME_INFER_OFFSET_MIN は数（分。負でもよい）で指定してください".into(),
+                    )
+                })?,
+            None => DEFAULT_INFER_OFFSET_MIN,
+        };
         // 現行は `.strip().lower()` で、gemini・local 以外は警告して gemini に落とす（起動は続ける）
         let (embed_backend, embed_backend_invalid) = match get("GEOFRAME_EMBED_BACKEND") {
             Some(raw) => match raw.trim().to_lowercase().as_str() {
@@ -365,6 +385,7 @@ impl Config {
             log_level,
             tz: get("TZ"),
             infer_min,
+            infer_offset_min,
             embed_backend,
             embed_backend_invalid,
             tile_cache_max_mb,
@@ -412,6 +433,16 @@ impl Config {
         windows
     }
 
+    /// 位置推定の最大の窓（秒）。現行の `INFER_WINDOWS_S[-1]`（`GEOFRAME_INFER_MIN` が 12 時間より長ければそれ）。
+    pub fn infer_widest_s(&self) -> f64 {
+        self.infer_windows_s().last().copied().unwrap_or(0.0)
+    }
+
+    /// カメラ時計のずれの補正（秒）。現行の `INFER_OFFSET_S`。
+    pub fn infer_offset_s(&self) -> f64 {
+        self.infer_offset_min * 60.0
+    }
+
     /// `catalog.db` のパス。
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join(DB_FILE_NAME)
@@ -420,13 +451,14 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
             self.log_level,
             self.tz.as_deref().unwrap_or("(未設定)"),
             self.infer_min,
+            self.infer_offset_min,
             self.embed_backend.model(),
             self.tile_cache_max_mb,
             if self.ingest { 1 } else { 0 },
@@ -615,6 +647,31 @@ mod tests {
         assert_eq!(wide.infer_windows_s(), [7200.0, 43200.0, 60000.0]);
         let fractional = load(&[("GEOFRAME_INFER_MIN", "0.5")], &Overrides::default()).unwrap();
         assert_eq!(fractional.infer_windows_s(), [30.0, 7200.0, 43200.0]);
+    }
+
+    #[test]
+    fn infer_offset_defaults_to_zero_and_accepts_negative_and_fractional_minutes() {
+        let c = load(&[], &Overrides::default()).unwrap();
+        assert_eq!(c.infer_offset_min, 0.0);
+        assert_eq!(c.infer_offset_s(), 0.0);
+        assert_eq!(c.infer_widest_s(), 43200.0);
+        let c = load(
+            &[
+                ("GEOFRAME_INFER_OFFSET_MIN", " -7.5 "),
+                ("GEOFRAME_INFER_MIN", "1000"),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.infer_offset_s(), -450.0);
+        // 最大の窓は、1 段目が 12 時間より長ければそちら
+        assert_eq!(c.infer_widest_s(), 60000.0);
+        for bad in ["abc", "inf", "NaN"] {
+            let err =
+                load(&[("GEOFRAME_INFER_OFFSET_MIN", bad)], &Overrides::default()).unwrap_err();
+            assert!(err.0.contains("GEOFRAME_INFER_OFFSET_MIN"), "{err}");
+            assert!(!err.0.contains(bad), "{err}");
+        }
     }
 
     #[test]

@@ -748,23 +748,13 @@ pub const EXCLUDED_DIR: &str = "_excluded/no_gps";
 
 /// 移動の対象を選ぶ SQL（`lat IS NULL` のローカル写真）。
 ///
-/// 現行の `organize_photos` は `index_local` → **`infer_locations`** → `lat IS NULL` の順で、撮影時刻が
-/// 近い位置つきの写真（錨）から位置が付く写真は移さない。Rust の `infer` 段は T2.5 まで何もしないので、
-/// そのまま移すと現行なら残る写真まで移してしまう。そこで T2.5 までは**推定の対象になりうる写真を
-/// 移さない**: 撮影時刻が空の写真（推定できない）か、錨になりうる写真（`exif`・`drive_meta`・`manual`
-/// で時刻つき）が 1 枚も無いときだけ移す。現行の移動対象の部分集合。T2.5 で `infer` 段のあとに
-/// この条件を外す。
+/// 現行の `organize_photos` は `index_local` → **`infer_locations`** → `lat IS NULL` の順で、撮影時刻が近い
+/// 位置つきの写真（錨）から位置が付く写真は移さない。呼び出し側（`geoframe organize`）が `index_local` と
+/// `infer`（[`crate::geo::Infer`]）の段を済ませてから呼ぶので、ここは位置の無い写真をそのまま選ぶ。
 const CANDIDATES_SQL: &str = "
     SELECT id, path FROM photos
     WHERE source = 'local' AND lat IS NULL
-      AND (taken_at IS NULL OR taken_at = ''
-           OR NOT EXISTS (SELECT 1 FROM photos a
-                          WHERE a.loc_source IN ('exif', 'drive_meta', 'manual')
-                            AND a.taken_at IS NOT NULL AND a.taken_at != ''))
     ORDER BY id";
-
-const ALL_UNLOCATED_SQL: &str =
-    "SELECT COUNT(*) FROM photos WHERE source = 'local' AND lat IS NULL";
 
 /// 移動先の名前。`name` が既にあれば `<stem> (2).<ext>`, `(3)`… と探す。
 fn destination_candidates(name: &str) -> impl Iterator<Item = String> + '_ {
@@ -880,10 +870,6 @@ pub fn organize(ctx: &StageCtx<'_>) -> Result<Counts, StageError> {
         stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<Result<_, _>>()?
     };
-    let unlocated: i64 = ctx
-        .read
-        .query_row(ALL_UNLOCATED_SQL, [], |row| row.get(0))?;
-    let held_back = (unlocated as u64).saturating_sub(candidates.len() as u64);
     let dry_run = ctx.is_dry_run();
     let (mut moved, mut gone, mut skipped, mut failed) = (0u64, 0u64, 0u64, 0u64);
     if !candidates.is_empty() {
@@ -929,7 +915,6 @@ pub fn organize(ctx: &StageCtx<'_>) -> Result<Counts, StageError> {
         ("row_only_removed", gone),
         ("skipped", skipped),
         ("failed", failed),
-        ("held_back_until_infer", held_back),
     ]))
 }
 

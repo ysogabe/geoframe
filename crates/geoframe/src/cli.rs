@@ -90,9 +90,9 @@ const USAGE: &str = "\
                                         書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ印・Python の確認を通す
   geoframe organize [--dry-run] [--data-dir <dir>]
                                         位置の無いローカル写真を DATA_DIR/_excluded/no_gps/ へ移し、行を削除する
-                                        （現行の server.py --organize）。先に index_local を 1 回動かす。同名のファイルは
-                                        上書きせず「名前 (2).拡張子」にする。T2.5（位置の推定）までは、撮影時刻があって
-                                        推定で位置が付きうる写真は移さない。--dry-run は件数だけ。書く実行は
+                                        （現行の server.py --organize）。先に index_local と位置の推定（infer）を 1 回ずつ
+                                        動かし、推定で位置が付いた写真は移さない。同名のファイルは
+                                        上書きせず「名前 (2).拡張子」にする。--dry-run は件数だけ。書く実行は
                                         GEOFRAME_INGEST=1 が要り、sync と同じ印・Python の確認を通す
 終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または取り込みを断った（本番への誤指定の防止）";
 
@@ -552,20 +552,29 @@ fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
         http: &http,
         stop: &stop,
     };
-    // 先に index_local（現行の organize_photos と同じ）。その結果を使って移す
+    // 先に index_local → infer（現行の organize_photos と同じ順序）。その結果を使って移す。
+    // どちらかが失敗・省略されたときは移さない（古い行を信じて、まだある写真・位置が付く写真を動かさないため）
     let mut failed = false;
-    match crate::sync::Stage::run(&crate::local::IndexLocal, &ctx) {
-        Ok(crate::sync::StageOutcome::Done(counts)) => println!("index_local: 完了 {counts}"),
-        Ok(crate::sync::StageOutcome::Skipped(reason)) => {
-            println!("index_local: 省略（{reason}）");
-            failed = true;
+    for stage in [
+        &crate::local::IndexLocal as &dyn crate::sync::Stage,
+        &crate::geo::Infer,
+    ] {
+        if failed {
+            break;
         }
-        Err(e) => {
-            println!("index_local: 失敗: {e}");
-            failed = true;
+        let name = stage.name();
+        match stage.run(&ctx) {
+            Ok(crate::sync::StageOutcome::Done(counts)) => println!("{name}: 完了 {counts}"),
+            Ok(crate::sync::StageOutcome::Skipped(reason)) => {
+                println!("{name}: 省略（{reason}）");
+                failed = true;
+            }
+            Err(e) => {
+                println!("{name}: 失敗: {e}");
+                failed = true;
+            }
         }
     }
-    // 索引が失敗したときは移さない（古い行を信じて、まだある写真を動かさないため）
     if !failed {
         match crate::local::organize(&ctx) {
             Ok(counts) => println!("organize: 完了 {counts}"),

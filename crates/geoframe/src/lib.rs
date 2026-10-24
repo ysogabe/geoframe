@@ -13,6 +13,7 @@ pub mod db;
 pub mod drive;
 pub mod embedded;
 pub mod feed;
+pub mod geo;
 pub mod guard;
 pub mod hostcheck;
 pub mod imaging;
