@@ -10,7 +10,7 @@
 
 ただし次の依存が入るときは、その都度この結論を見直す（§6）。
 
-- HEIC変換（libheif連携など）: P0の画像PoCの結果次第。純Rustで完結しなければ、muslで静的にリンクできるか、またはglibcビルドに切り替えるかを決める。
+- HEIC変換: 画像PoCの結果（[image-poc.md](image-poc.md)）、**純Rustの`zune-heic`ならmuslの静的ビルドのままHEICを含められる**（合成HEIC 50枚でlibheifと出力がバイト単位で一致）。実機のHEICで問題が出て`libheif`が要る場合も、zig ccでmuslの静的ビルドができた（§6）。方針は変えない。
 - 外部HTTP（Gemini）のTLSとDNS: `rustls`系ならmuslでも通る見込み。ただしmuslの名前解決はglibcと挙動が違う（§6）。
 
 ## 2. ビルド方法
@@ -26,8 +26,8 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 
-# 配布用（完全静的）
-cargo build --release --target x86_64-unknown-linux-musl
+# 配布用（完全静的）。本体だけ（画像PoCは含めない）
+cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 # 成果物: target/x86_64-unknown-linux-musl/release/geoframe
 ```
 
@@ -40,8 +40,8 @@ cargo build --release --target x86_64-unknown-linux-musl
 1. `dtolnay/rust-toolchain@stable`（rustfmt・clippy・muslターゲット付き）と`musl-tools`を入れる。
 2. `Swatinem/rust-cache`でビルドをキャッシュする。
 3. `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`。
-4. `cargo build --release --target x86_64-unknown-linux-musl`。
-5. 成果物が静的リンクであることを`file`（`statically linked`または`static-pie linked`）と`ldd`（共有ライブラリを列挙しない）で検査し、`--version`を実行する。動的リンクが混ざるとCIが落ちる。
+4. `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`。
+5. 成果物（本体の`geoframe`のみ。`-p geoframe`で限る）が静的リンクであることを`file`（`statically linked`または`static-pie linked`）と`ldd`（共有ライブラリを列挙しない）で検査し、`--version`を実行する。動的リンクが混ざるとCIが落ちる。
 
 ## 3. musl静的ビルドの結果
 
@@ -87,8 +87,9 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 
 | ファイル | 内容 |
 | --- | --- |
-| `Cargo.toml` | workspace（resolver 3、メンバーは`crates/geoframe`のみ）。`Cargo.lock`はコミットする |
+| `Cargo.toml` | workspace（resolver 3、メンバーは`crates/geoframe`と`crates/geoframe-imgpoc`）。`Cargo.lock`はコミットする |
 | `crates/geoframe/` | ライブラリ＋バイナリ`geoframe`。edition 2024（miharashiに合わせる） |
+| `crates/geoframe-imgpoc/` | 画像処理の技術PoC（`publish = false`）。静的ビルドの検査対象にしない（CIのmuslビルドは`-p geoframe`）。結果は[image-poc.md](image-poc.md) |
 | `geoframe --version` | バージョンを出す |
 | `geoframe check-db <path>` | `photos`の行数とSQLiteのバージョンを出す。読み取り専用 |
 | `geoframe serve --listen <addr>` | `GET /healthz`が`{"ok":true}`を返す。SIGTERMで停止 |
@@ -97,9 +98,14 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 
 ## 6. 今後の注意と代替案
 
-- **HEIC**: libheifのような外部Cライブラリが必要になった場合、musl静的で通るか（libheif・libde265・x265のビルド）を、画像PoCで確かめる。通らなければ次のどちらかにする。
+- **HEIC**: 画像PoC（[image-poc.md](image-poc.md)）の結果は次のとおり。
+  - **純Rustの`zune-heic`（既定の候補）**: C依存なし。musl静的で通り、7.0 MBのバイナリ（`ldd`は動的実行ファイルではないと答える）で検証環境のHEIC 50枚を処理できた。
+  - **`libheif-rs`＋システムのlibheif 1.17.6**: glibc動的リンク。HEVCのデコーダが別パッケージの`libheif-plugin-libde265`で、無いと読めない。
+  - **`libheif-rs`の`embedded-libheif`**: glibcだと自己完結しない（`libde265`・`libx265`・`libaom`などへ動的リンク）。**zig ccでmuslの完全静的ビルドは通った**（静的libde265、`RUSTFLAGS=-C link-self-contained=no`、コンパイラのラッパーで`--target=`を落とす）。LGPLの再リンクの扱いに注意（配布するなら）。
+  - 外部コマンド（`heif-convert`）への委譲は、JPEG再圧縮が増え、いちばん遅い。
+  libheifが必要でmuslで通らない場合は次のどちらかにする。
   - 配布先と同じglibcでビルドする（検証環境の中、または同じ世代のコンテナでビルドする）。HEIC部分だけ別プロセス（`heif-convert`など）にする案もある。
   - `cargo-zigbuild`でglibcの古い版（例: 2.31）を指定してビルドする。n100の新しいglibcを避けられる。
 - **名前解決**: muslの`getaddrinfo`はglibcと違い、`/etc/resolv.conf`の`search`・`options`の扱いが一部異なる。外部HTTP（Gemini）を入れるP4で、検証環境から実際に名前解決できることを確かめる。
-- **メモリアロケータ**: muslの標準アロケータはマルチスレッドの負荷で遅いことがある。画像処理を入れた段階（P2〜）で処理時間とRSSを計測し、問題なら`mimalloc`などを検討する。現状の最大RSS（1.5〜2.8 MiB）では差は出ていない。
-- **glibcビルドを選ぶ場合**: CIとn100のglibcは、本番（P5で切り替える機体）より古くなければならない。バイナリの`objdump -T`で要求バージョンを確かめる。
+- **メモリアロケータ**: muslの標準アロケータは画像処理で**約15〜25%遅かった**（画像PoC: JPEG 273 vs 235 ms、`zune-heic` 1,086 vs 871 ms）。`mimalloc`を付けるとglibcと同等以上（JPEG 222 ms）になるが、RSSはglibc並みに増える。P2の画像処理から`mimalloc`を付ける。現状の本体（画像処理なし）の最大RSS（1.5〜2.8 MiB）では差は出ていない。
+- **glibcビルドを選ぶ場合**: CIとn100のglibcは、本番（P5で切り替える機体）より古くなければならない。バイナリの`objdump -T`で要求バージョンを確かめる。画像PoCでは、開発機（glibc 2.41）でビルドしたglibcバイナリが検証環境（2.39）でそのまま動いた。`objdump -T`が出す最大版（`GLIBC_2.39`）は、Rust 1.99の`std::process::Command`が参照する`pidfd_spawnp`・`pidfd_getpid`の**弱参照**（`readelf -V`で`WEAK`）で、必須の要求は2.34まで。最大版だけでなく`WEAK`の有無も見る。

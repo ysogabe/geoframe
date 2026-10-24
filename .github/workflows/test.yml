@@ -68,7 +68,8 @@ jobs:
         run: cargo test
 
       - name: muslで静的ビルド
-        run: cargo build --release --target x86_64-unknown-linux-musl
+        # 静的リンクの検査対象は本体のgeoframeだけ。画像PoC（geoframe-imgpoc）は含めない
+        run: cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 
       - name: 静的リンクの検査
         run: |
@@ -82,3 +83,30 @@ jobs:
             exit 1
           fi
           "$bin" --version
+
+  imgpoc-heic:
+    name: 画像PoC（HEIC: libheifへ動的リンク）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: ソースを取得
+        uses: actions/checkout@v7
+
+      - name: Rustを準備
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: libheifをインストール
+        # libheif-rs（feature heic）がシステムのlibheifへリンクする。HEVCのデコーダはプラグインなので別に要る。
+        # libheif.pcがzlibを要求するので、zlib1g-devも明示する
+        run: sudo apt-get update && sudo apt-get install -y libheif-dev libheif-plugin-libde265 pkg-config zlib1g-dev
+
+      - name: Cargoのキャッシュ
+        uses: Swatinem/rust-cache@v2
+
+      - name: Clippy（全HEIC候補）
+        run: cargo clippy -p geoframe-imgpoc --all-targets --features heic,heic-zune,heic-rs,heic-oxide -- -D warnings
+
+      - name: テスト（全HEIC候補）
+        run: cargo test -p geoframe-imgpoc --features heic,heic-zune,heic-rs,heic-oxide
