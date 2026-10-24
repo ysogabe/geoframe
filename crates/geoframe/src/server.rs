@@ -18,6 +18,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use tokio::sync::Semaphore;
+
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -29,6 +31,7 @@ use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::db::Catalog;
+use crate::limits::{ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
 use crate::{hostcheck, photos, statics, webpath};
 
 /// `/healthz` が DB の確認を待つ上限。超えたら不健康（503）として答える。`/healthz` 専用の接続の
@@ -44,6 +47,9 @@ pub struct AppState {
     /// データ置き場を**リンクを辿って解決した**絶対パス（起動時に1回。静的配信が、要求されたファイルを
     /// 解決した結果の内外判定に使う）。データ置き場自体がシンボリックリンクでもよい。
     pub data_root: Arc<PathBuf>,
+    /// データ置き場のファイルを同時に配れる数（[`STATIC_FILE_SLOTS`]）。ファイルを開く前に取り、
+    /// 空きが無ければ待たずに 503。ファイル記述子を握る数の上限（`/healthz` などを巻き込まないため）。
+    pub static_slots: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -59,6 +65,7 @@ impl AppState {
             config,
             catalog,
             data_root: Arc::new(data_root),
+            static_slots: Arc::new(Semaphore::new(STATIC_FILE_SLOTS)),
         }
     }
 }
@@ -188,17 +195,24 @@ async fn access_log(request: Request, next: Next) -> Response {
 ///
 /// 1. `GET`/`HEAD`/`POST` 以外は 501。`OPTIONS` もここ。クロスオリジンの `application/json` の
 ///    プリフライトを失敗させる（CSRF 対策の一部）ので、**CORS ヘッダは一切返さない**。
-/// 2. Host 検査（[`hostcheck`]）。不許可は 403。**Host の値はログに出さない**。
-/// 3. `POST` は P1 では全部 403（更新系は P3 で実装する。現行の「未知の POST」と同じ応答）。
+/// 2. `Host` ヘッダが複数あれば 400（どれで判定するかが実装次第になり、先頭だけ見ると順序で
+///    すり抜けられるため、判定の前に拒否する）。無い場合は従来どおり許可。
+/// 3. Host 検査（[`hostcheck`]）。不許可は 403。**Host の値はログに出さない**。
+/// 4. 絶対形式の request-target（`GET http://host/...`）は全ルートで 403（現行でもホワイトリストに
+///    当たらず 403。`Host` ヘッダと別の宛先を名乗れる形なので、`/healthz`・`/api/v1/photos` にも通さない）。
+/// 5. `POST` は P1 では全部 403（更新系は P3 で実装する。現行の「未知の POST」と同じ応答）。
 async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let method = request.method();
     if !matches!(*method, Method::GET | Method::HEAD | Method::POST) {
         return statics::unsupported_method(method);
     }
-    let host = request
-        .headers()
-        .get(header::HOST)
+    let mut hosts = request.headers().get_all(header::HOST).iter();
+    let host = hosts
+        .next()
         .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    if hosts.next().is_some() {
+        return statics::bad_request();
+    }
     if !hostcheck::host_allowed(
         host.as_deref(),
         state.config.listen.port(),
@@ -208,6 +222,9 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
             "Host ヘッダが許可されていないため拒否しました（値は記録しません。GEOFRAME_ALLOWED_HOSTS で名前を足せます）"
         );
         return statics::forbidden_host();
+    }
+    if request.uri().scheme().is_some() {
+        return statics::forbidden();
     }
     if *method == Method::POST {
         return statics::forbidden();
@@ -299,8 +316,7 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
             }
         }
     }
-    // 絶対形式の request-target（GET http://host/...）は現行でもホワイトリストに当たらず 403
-    let Some(normalized) = webpath::normalize(raw).filter(|_| parts.uri.scheme().is_none()) else {
+    let Some(normalized) = webpath::normalize(raw) else {
         return statics::forbidden();
     };
     let trailing_slash = normalized.trailing_slash;
@@ -332,6 +348,7 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
         _ => {
             statics::serve_data(
                 &state.data_root,
+                &state.static_slots,
                 &target,
                 trailing_slash,
                 method,
@@ -381,6 +398,8 @@ pub async fn serve(state: AppState) -> std::io::Result<()> {
         "{}",
         hostcheck::startup_note(state.config.listen.port(), &state.config.allowed_hosts)
     );
+    // 接続の総数・送信の停滞・無通信の上限（limits.rs）
+    let listener = LimitedListener::new(listener, ConnLimits::default());
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;

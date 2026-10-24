@@ -7,12 +7,14 @@
 //! 仕様と Python との差は docs/rust-migration/server.md §9。
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use tokio::io::AsyncReadExt;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::embedded;
 use crate::webpath::{Area, Target};
@@ -97,6 +99,15 @@ pub fn error_page(status: StatusCode, message: &str, explain: &str) -> Response 
     response
 }
 
+/// 400（Python の `send_error(400)`）。`Host` ヘッダが複数ある要求に返す。
+pub fn bad_request() -> Response {
+    error_page(
+        StatusCode::BAD_REQUEST,
+        "Bad Request",
+        "Bad request syntax or unsupported method",
+    )
+}
+
 /// 403（Python の `send_error(403)`）。
 pub fn forbidden() -> Response {
     error_page(
@@ -133,6 +144,20 @@ pub fn forbidden_host() -> Response {
         "許可されていないHostヘッダです。LAN内の他端末からホスト名で開く場合は、\
          環境変数 GEOFRAME_ALLOWED_HOSTS に追加してください。",
     )
+}
+
+/// 同時に配れるファイルの数（[`crate::limits::STATIC_FILE_SLOTS`]）に空きが無いときの 503
+/// （Python の `http.server` の 503 の文面）。本文は定型で、環境の情報は載せない。
+pub fn busy() -> Response {
+    let mut response = error_page(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Service Unavailable",
+        "The server cannot process the request due to a high load",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
 }
 
 fn not_modified() -> Response {
@@ -211,15 +236,19 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 }
 
 /// ファイルを `CHUNK` ずつ流す本文。読み取りに失敗したらそこで打ち切る（接続が閉じる）。
-fn file_body(file: tokio::fs::File) -> Body {
-    let stream = futures_util::stream::unfold(Some(file), |state| async move {
-        let mut file = state?;
+/// 同時配信の枠（`permit`）は本文が最後まで流れるか捨てられる（切断・停滞の打ち切り・`HEAD`）まで持つ。
+fn file_body(file: tokio::fs::File, permit: OwnedSemaphorePermit) -> Body {
+    let stream = futures_util::stream::unfold(Some((file, permit)), |state| async move {
+        let (mut file, permit) = state?;
         let mut buf = vec![0u8; CHUNK];
         match file.read(&mut buf).await {
             Ok(0) => None,
             Ok(n) => {
                 buf.truncate(n);
-                Some((Ok::<Bytes, std::io::Error>(Bytes::from(buf)), Some(file)))
+                Some((
+                    Ok::<Bytes, std::io::Error>(Bytes::from(buf)),
+                    Some((file, permit)),
+                ))
             }
             Err(e) => Some((Err(e), None)),
         }
@@ -288,9 +317,12 @@ pub fn serve_embedded_key(
 ///    別のディスクへ置く場合）が、**中のリンク**は解決後も領域のディレクトリの内側でなければ 403
 ///    （`derivatives/x.jpg -> ../catalog.db` のような、データ置き場の中でも領域の外を指すものを含む）。
 /// 2. ディレクトリは 403（一覧は出さない）、通常のファイル以外は 404。
-/// 3. 解決後のパスを開き、開いたハンドルのサイズと更新時刻で `Content-Length`・`Last-Modified`・304 を決める。
+/// 3. 同時配信の枠（`slots`）を取る。空きが無ければ待たずに 503（ファイル記述子を握る数の上限）。
+/// 4. 解決後のパスを開き、開いたハンドルのサイズと更新時刻で `Content-Length`・`Last-Modified`・304 を決める。
+///    枠は応答の本文が捨てられるまで持つ（304 と `HEAD` はすぐ返す）。
 pub async fn serve_data(
     data_root: &Path,
+    slots: &Arc<Semaphore>,
     target: &Target<'_>,
     trailing_slash: bool,
     method: &Method,
@@ -326,6 +358,9 @@ pub async fn serve_data(
     if !meta.is_file() || trailing_slash {
         return not_found();
     }
+    let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
+        return busy();
+    };
     let Ok(file) = tokio::fs::File::open(&real).await else {
         return not_found();
     };
@@ -344,7 +379,7 @@ pub async fn serve_data(
         method,
         content_type(name),
         meta.len(),
-        file_body(file),
+        file_body(file, permit),
         modified,
         None,
     )

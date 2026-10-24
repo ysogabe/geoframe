@@ -6,6 +6,7 @@ pub mod db;
 pub mod embedded;
 pub mod feed;
 pub mod hostcheck;
+pub mod limits;
 pub mod logging;
 pub mod photos;
 pub mod server;

@@ -849,6 +849,78 @@ async fn host_check_follows_the_current_rules() {
     assert!(r.text().contains("Forbidden host"));
 }
 
+/// `Host` ヘッダが複数ある要求は、順序によらず 400（先頭だけで判定してすり抜けさせない）。
+/// 差: Python は先頭の値だけで判定する（`self.headers.get`）ので、`Host: localhost` を先に置けば通った。
+#[tokio::test]
+async fn duplicate_host_headers_are_rejected_in_either_order() {
+    let site = Site::new();
+    let addr = site.start().await;
+    for route in ["/healthz", "/api/v1/photos", "/derivatives/a.jpg", "/"] {
+        for hosts in [
+            [("Host", "localhost"), ("Host", "evil.example")],
+            [("Host", "evil.example"), ("Host", "localhost")],
+            [("Host", "localhost"), ("Host", "localhost")],
+        ] {
+            let r = request(addr, "GET", route, &hosts).await;
+            assert_eq!(r.status, 400, "{hosts:?} {route}");
+            assert!(r.text().contains("<p>Error code: 400</p>"), "{}", r.text());
+            // 理由の説明にも Host の値を載せない
+            assert!(!r.text().contains("evil.example"), "{}", r.text());
+        }
+    }
+    // 1つだけなら従来どおり（許可は200、不許可は403）、無ければ許可
+    assert_eq!(get(addr, "/healthz").await.status, 200);
+    assert_eq!(
+        request(addr, "GET", "/healthz", &[("Host", "evil.example")])
+            .await
+            .status,
+        403
+    );
+    assert_eq!(request(addr, "GET", "/healthz", &[]).await.status, 200);
+}
+
+/// 絶対形式の request-target（`GET http://host/...`）は、`Host` が許可でも全ルートで 403
+/// （ホワイトリストに当たらない現行の挙動。`/healthz`・`/api/v1/photos` にも通さない）。
+/// Host 検査が先なので、`Host` が不許可なら 403（Host 用の本文）のまま。
+#[tokio::test]
+async fn absolute_form_targets_are_refused_on_every_route() {
+    let site = Site::new();
+    let addr = site.start().await;
+    for route in [
+        "/healthz",
+        "/api/v1/photos",
+        "/derivatives/a.jpg",
+        "/static/admin.css",
+        "/photos/p1.jpg",
+        "/admin",
+        "/",
+        "/tiles/1/2/3.png",
+        "/api/admin/status",
+        "/nope",
+    ] {
+        for method in ["GET", "HEAD", "POST"] {
+            let target = format!("http://evil.example{route}");
+            let r = request(addr, method, &target, LOCALHOST).await;
+            assert_eq!(r.status, 403, "{method} {target}");
+            assert!(r.text().is_empty() || r.text().contains("Message: Forbidden."));
+            assert!(!r.text().contains("TOP-SECRET") && !r.text().contains("\"ok\""));
+        }
+        // 同じ宛先でも、origin-form なら（GET の healthz と写真APIは）200
+    }
+    assert_eq!(get(addr, "/healthz").await.status, 200);
+    assert_eq!(get(addr, "/api/v1/photos").await.status, 200);
+    // Host が不許可なら、絶対形式でも Host 検査の本文（現行は _host_ok が先）
+    let r = request(
+        addr,
+        "GET",
+        "http://evil.example/healthz",
+        &[("Host", "evil.example")],
+    )
+    .await;
+    assert_eq!(r.status, 403);
+    assert!(r.text().contains("Forbidden host"));
+}
+
 #[tokio::test]
 async fn names_are_allowed_only_when_listed_in_the_environment() {
     let site = Site::new();
