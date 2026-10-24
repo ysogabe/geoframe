@@ -174,6 +174,17 @@ class PhotoFeedFixtureTest(unittest.TestCase):
         self.assertEqual([i["trip"] for i in items[1:]], [1, 1, 1, 2, 2, 2, 2, 3])
         self.assertTrue(mini_jsonschema.errors(items, SCHEMA))   # 契約（string）には合わない
 
+    def test_null_lon_breaks_the_whole_feed_unless_alone_in_its_trip(self):
+        # 現行実装の挙動の記録。lat があって lon が NULL の行は、同じ旅に他の写真があると
+        # assign_trips の min(lon) が TypeError で一覧全体が失敗し、その行だけの旅なら lon:null になる。
+        # Rust は契約（lon は数値）に合わせて、この行を一覧から外す
+        alone = photo_feed_fixture.photo_row(14, lon=None, taken_at="2030-01-01 10:00")
+        items = photo_feed_fixture.build_items([alone])
+        self.assertIsNone(next(i for i in items if i["id"] == 14)["lon"])
+        shared = photo_feed_fixture.photo_row(15, lon=None, taken_at="2025-06-01 10:30")
+        with self.assertRaises(TypeError):
+            photo_feed_fixture.build_items([shared])
+
     def test_fixture_covers_the_selection_rules(self):
         ids = [i["id"] for i in self.items]
         # 除外: exact推奨外(5)、AI同一場面の推奨外(7)、非表示(11)、表示画像なし(12)、位置なし(13)

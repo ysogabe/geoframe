@@ -16,9 +16,11 @@
 //!
 //! - **`taken_at` が NULL**: Python は `time: null` で先頭に並べる。ここでは空文字として「時刻
 //!   不明」と同じに扱い、最後に並べる（契約は `time` を文字列とする）。
-//! - **`lon` が NULL**（`lat` はある）: Python は `lon: null` を出す。契約は数値なので、この行は
-//!   一覧から外し、写真IDだけをログに出す（miharashi は数値でない `lon` を「位置なし」として
-//!   扱うので、見え方は同じ）。通常は `setloc` が `lat`/`lon` を一緒に書くので起きない。
+//! - **`lon` が NULL**（`lat` はある）: Python は、同じ旅に他の写真があると `assign_trips` の
+//!   `min(i["lon"] ...)` が `TypeError` になって**一覧全体が 500**、その行だけの旅のときは
+//!   `lon: null` を出す。契約は数値なので、Rust はこの行を一覧から外し、写真IDだけをログに出す
+//!   （miharashi は数値でない `lon` を「位置なし」として扱うので、見え方は `lon: null` と同じ）。
+//!   通常は `setloc` が `lat`/`lon` を一緒に書くので起きない。
 //! - **時刻の解釈**: Python の `t_epoch` は `strptime(...).timestamp()` でローカル時刻として
 //!   解釈する。ここでは暦だけで数える（[`parse_epoch`]）。unit が与える `TZ=Asia/Tokyo` には
 //!   夏時間が無いので、2つの時刻の差は同じ。夏時間のある `TZ` では、Python は切り替えをまたぐ

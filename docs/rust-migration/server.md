@@ -177,10 +177,10 @@ unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分�
 
 ### 8.3 Pythonとの差
 
-意図した差は2つ。どちらも契約（`time`・`lon`は必ずある）に合わせたもので、本番のコピーには該当する行が無い。
+意図した差は2つ。どちらも契約（`time`・`lon`は必ずある）に合わせたもの。
 
-- `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字（時刻不明）で最後。
-- `lat`はあって`lon`がNULLの行: Pythonは`lon: null`、Rustは一覧から外す（写真IDだけをwarnログに出す）。
+- `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字（時刻不明）で最後。本番のコピーには該当する行が無いことを管理者が確認済み。
+- `lat`はあって`lon`がNULLの行: Pythonは、同じ旅に他の写真があれば`assign_trips`の`min(lon)`が`TypeError`になって**一覧全体が500**、その行だけの旅なら`lon: null`。Rustは一覧から外す（写真IDだけをwarnログに出す）。通常は`setloc`が`lat`/`lon`を一緒に書くので起きないが、**本番のコピーでは未確認**。T1.5の全件比較で、Pythonが500でRustが200の差が出たらこれが原因。
 
 ほかに、列の型が想定と違う行（`lat`が文字列など）があるとRustは読み取り全体が失敗して503になる（Pythonは素通し）。スキーマ上は起きない。
 
