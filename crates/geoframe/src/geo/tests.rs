@@ -1680,7 +1680,7 @@ fn 単発の障害で止まった国内の行を同じキーの国外の行が�
     let enrich = Enrich::with(
         GsiEndpoints::stub(&stub.base_url()),
         Duration::ZERO,
-        FailureMemo::with_policy(Duration::from_millis(300), Duration::from_millis(300), 16),
+        FailureMemo::with_policy(Duration::from_secs(3600), Duration::from_secs(3600), 16),
     )
     .with_retry_wait(Duration::ZERO);
     let first = s.run(&enrich);
@@ -1703,7 +1703,7 @@ fn 単発の障害で止まった国内の行を同じキーの国外の行が�
     assert!(s.cache.get("geo:20.000,130.000").is_none());
     // 直って、バックオフが明ける: 先の行が問い合わせた結果で確定し、後の行はその順で続く
     tokyo_replies(&stub);
-    std::thread::sleep(Duration::from_millis(350));
+    enrich.advance_memo_clock(Duration::from_secs(3601));
     let third = s.run(&enrich);
     assert_eq!(get(&third, "resolved"), 1);
     assert_eq!(s.row(1)["place"], "テスト町一丁目");
@@ -1747,12 +1747,12 @@ fn 障害で中断した次のサイクルも追い越さず_直れば現行と�
         }
     };
     stub.set_rgeo(|_, _| Reply::Status(503));
-    // バックオフを短くする。3 つの座標で続けて障害になるので、1 つ目の障害の行（id=1）が止まった次のサイクルに
+    // バックオフ中を保つため長くする（明けるのは時計を進めたとき）。3 つの座標で続けて障害になるので、1 つ目の障害の行（id=1）が止まった次のサイクルに
     // 国外の行（id=2）が入り込める条件になる
     let enrich = Enrich::with(
         GsiEndpoints::stub(&stub.base_url()),
         Duration::ZERO,
-        FailureMemo::with_policy(Duration::from_millis(400), Duration::from_millis(400), 64),
+        FailureMemo::with_policy(Duration::from_secs(3600), Duration::from_secs(3600), 64),
     )
     .with_retry_wait(Duration::ZERO);
     // 追加の行: id=1 の座標のほかに、障害の座標を 2 つ足して中断させる（国内・別のキー）
@@ -1782,10 +1782,10 @@ fn 障害で中断した次のサイクルも追い越さず_直れば現行と�
     );
     // 直る
     stub.set_rgeo(healthy_rgeo);
-    std::thread::sleep(Duration::from_millis(450));
+    enrich.advance_memo_clock(Duration::from_secs(3601));
     for _ in 0..3 {
         let _ = s.try_run(&enrich);
-        std::thread::sleep(Duration::from_millis(450));
+        enrich.advance_memo_clock(Duration::from_secs(3601));
     }
     let want_rows = step["python"]["rows"].as_array().unwrap();
     let got = s.rows();
@@ -1832,7 +1832,7 @@ fn バックオフ中の国内の行と同じキーの国外の行は枠に入�
     let enrich = Enrich::with(
         GsiEndpoints::stub(&stub.base_url()),
         Duration::ZERO,
-        FailureMemo::with_policy(Duration::from_millis(300), Duration::from_millis(300), 16),
+        FailureMemo::with_policy(Duration::from_secs(3600), Duration::from_secs(3600), 16),
     )
     .with_retry_wait(Duration::ZERO);
     let dry = s.dry_run(&[&enrich]);
@@ -1859,7 +1859,7 @@ fn バックオフ中の国内の行と同じキーの国外の行は枠に入�
     assert_eq!(get(&dry, "foreign"), 0);
     // 応答が返るようになり、バックオフが明ける
     tokyo_replies(&stub);
-    std::thread::sleep(Duration::from_millis(350));
+    enrich.advance_memo_clock(Duration::from_secs(3601));
     let third = s.run(&enrich);
     assert_eq!(get(&third, "resolved"), 1);
     assert_eq!(s.row(1)["place"], "テスト町一丁目");

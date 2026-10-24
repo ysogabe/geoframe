@@ -158,6 +158,9 @@ pub struct Enrich {
     budget: Duration,
     /// 両方の API の応答が無かった座標（`id` と座標）。
     failures: Mutex<FailureMemo<(i64, u64, u64)>>,
+    /// 失敗の記憶が見る時計の進み（試験用。実時間を待たずにバックオフを明けさせる）。
+    #[cfg(test)]
+    memo_skew: Mutex<Duration>,
 }
 
 impl Default for Enrich {
@@ -183,7 +186,23 @@ impl Enrich {
             retry_wait: RETRY_WAIT,
             budget: STAGE_BUDGET,
             failures: Mutex::new(memo),
+            #[cfg(test)]
+            memo_skew: Mutex::new(Duration::ZERO),
         }
+    }
+
+    /// 失敗の記憶が見る「今」。本番は実時間そのもの。
+    fn memo_now(&self) -> Instant {
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = now + *self.memo_skew.lock().unwrap_or_else(|e| e.into_inner());
+        now
+    }
+
+    /// 失敗の記憶の時計を進める（試験用。実時間を待たずに、バックオフが明けた状態にする）。
+    #[cfg(test)]
+    pub(crate) fn advance_memo_clock(&self, by: Duration) {
+        *self.memo_skew.lock().unwrap_or_else(|e| e.into_inner()) += by;
     }
 
     /// 再試行の前の待ちを変える（試験用。本番は [`RETRY_WAIT`]）。
@@ -584,7 +603,7 @@ impl Stage for Enrich {
             ))?;
             let mut rows = stmt.query([])?;
             let memo = self.failures.lock().unwrap_or_else(|e| e.into_inner());
-            let now = Instant::now();
+            let now = self.memo_now();
             while candidates.len() < PER_CYCLE {
                 let Some(row) = rows.next()? else { break };
                 let candidate = Candidate {
@@ -810,7 +829,7 @@ impl Enrich {
         self.failures
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .record_failure(candidate.memo_key(), Instant::now());
+            .record_failure(candidate.memo_key(), self.memo_now());
     }
 
     fn forget_failure(&self, candidate: &Candidate) {
