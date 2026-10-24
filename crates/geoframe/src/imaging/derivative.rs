@@ -8,7 +8,8 @@
 //! 3. 長辺を 2560px に収める（拡大しない。丸めは Pillow の `thumbnail` と同じ [`target_dims`]）。
 //! 4. RGB か L（グレー）以外は RGB にする。
 //! 5. JPEG（品質 85、4:2:0）。**EXIF（GPS を含む）は出力に残さない**（エンコーダに渡さない）。
-//! 6. `.part` に書いて `rename`（読み手に書きかけを見せない）。失敗・パニックでも `.part` を残さない。
+//! 6. `.part` に書いて `rename`（読み手に書きかけを見せない）。失敗・パニックでも自分の `.part` を残さない。
+//!    `.part` は排他的な新規作成（`O_EXCL`＋`O_NOFOLLOW`）で、既存のリンクを辿らない。
 //!
 //! # Python と違う点
 //!
@@ -546,7 +547,8 @@ fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
     Ok(bytes)
 }
 
-/// 書きかけの `.part`。`commit` されないまま落とされたら（失敗・パニック）消す。
+/// 書きかけの `.part`。`commit` されないまま落とされたら（失敗・パニック）消す。**自分が作ったものだけ**を持つ
+/// （[`create_part`] が新規作成に成功してから作る。既にあったファイル・リンクは消さない）。
 struct PartFile {
     path: PathBuf,
     committed: bool,
@@ -560,10 +562,68 @@ impl Drop for PartFile {
     }
 }
 
-/// `src`（原本）から `dest` に derivative を書く。`.part` を経由し、失敗しても `.part` を残さない
+/// `.part` の名前の候補を作る。`<dest の名前>.<pid>.<乱数>.part`（末尾は `.part` のまま）。
+/// 名前を推測できないので、`DATA_DIR` に置かれたリンクに当たらない（当たっても [`create_part`] が拒否する）。
+fn part_name(dest: &Path) -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut random = [0u8; 8];
+    // 乱数が取れない環境では 0 のまま（pid と、衝突時の作り直しに任せる）
+    let _ = SystemRandom::new().fill(&mut random);
+    let stem = dest
+        .file_name()
+        .map_or_else(|| "derivative".into(), |n| n.to_string_lossy().into_owned());
+    format!(
+        "{stem}.{}.{:016x}.part",
+        std::process::id(),
+        u64::from_be_bytes(random)
+    )
+}
+
+/// 作り直す回数の上限（乱数の衝突、または同じ名前を置かれ続ける場合）。
+const PART_ATTEMPTS: usize = 8;
+
+/// `dest` と同じディレクトリに `.part` を**新規作成**して開く。
+///
+/// `O_CREAT|O_EXCL`（`create_new`）と `O_NOFOLLOW` で作るので、同じ名前のファイル・シンボリックリンク
+/// （切れたリンクも）が既にあれば開けず（`AlreadyExists`）、リンクの先を書き換えない。名前を変えて
+/// [`PART_ATTEMPTS`] 回まで作り直す。それでも作れなければ失敗にする。
+fn create_part(
+    dest: &Path,
+    mut next_name: impl FnMut() -> String,
+) -> Result<(fs::File, PartFile), ImageError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let dir = dest.parent().unwrap_or_else(|| Path::new("."));
+    let mut last = std::io::ErrorKind::AlreadyExists;
+    for _ in 0..PART_ATTEMPTS {
+        let path = dir.join(next_name());
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+        {
+            Ok(file) => {
+                return Ok((
+                    file,
+                    PartFile {
+                        path,
+                        committed: false,
+                    },
+                ));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => last = e.kind(),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ImageError::Io(last))
+}
+
+/// `src`（原本）から `dest` に derivative を書く。`.part` を経由し、失敗しても自分の `.part` を残さない
 /// （原本は呼び出し側が消す。EXIF 付きの原本を残さないのは呼び出し側の `finally` の役目）。
 ///
 /// `dest` は[`DataDir::derivative_dest`]で検査した絶対パスを渡すこと。親ディレクトリは作る。
+/// `.part` は新規作成だけで（[`create_part`]）既存のリンクを辿らず、最後の `rename` は `dest` が
+/// リンクでもそのリンク自体を置き換える（先は書き換えない）。
 pub fn make_derivative(
     src: &Path,
     dest: &Path,
@@ -575,17 +635,11 @@ pub fn make_derivative(
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
-    // Python は `dest.with_suffix(".part")`（最後の拡張子を置き換える。`x.r90.jpg` → `x.r90.part`）
-    let mut part = PartFile {
-        path: dest.with_extension("part"),
-        committed: false,
-    };
-    {
-        let mut file = fs::File::create(&part.path)?;
-        file.write_all(&rendered.jpeg)?;
-        // rename の前にディスクへ（電源断で空のファイルが derivative として残らないように）
-        file.sync_all()?;
-    }
+    let (mut file, mut part) = create_part(dest, || part_name(dest))?;
+    file.write_all(&rendered.jpeg)?;
+    // rename の前にディスクへ（電源断で空のファイルが derivative として残らないように）
+    file.sync_all()?;
+    drop(file);
     fs::rename(&part.path, dest)?;
     part.committed = true;
     Ok(rendered.info)
@@ -610,4 +664,128 @@ pub fn store_derivative(
     let (dest, display) = data.derivative_dest(name)?;
     let info = make_derivative(src, &dest, rotation)?;
     Ok(Stored { display, info })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+    use crate::testutil::TempDir;
+
+    fn jpeg_8x8() -> Vec<u8> {
+        let mut out = Vec::new();
+        jpeg_encoder::Encoder::new(&mut out, 90)
+            .encode(&[128; 8 * 8 * 3], 8, 8, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        out
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn partの名前は_partで終わり毎回変わる() {
+        let dest = Path::new("/x/derivatives/abc.r90.jpg");
+        let a = part_name(dest);
+        assert!(a.starts_with("abc.r90.jpg.") && a.ends_with(".part"), "{a}");
+        assert_ne!(a, part_name(dest));
+        assert!(!a.contains('/'));
+    }
+
+    #[test]
+    fn 既存のリンクには作らず別の名前で作り直す() {
+        let tmp = TempDir::new("part-link");
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, b"keep me").unwrap();
+        let dir = tmp.path().join("derivatives");
+        fs::create_dir(&dir).unwrap();
+        let dest = dir.join("safe.jpg");
+        // 生きているリンクと、切れたリンク（先がまだ無い）を置く
+        symlink(&outside, dir.join("first.part")).unwrap();
+        symlink(
+            tmp.path().join("created-by-attacker"),
+            dir.join("second.part"),
+        )
+        .unwrap();
+        let mut candidates = ["first.part", "second.part", "third.part"].into_iter();
+        let (mut file, part) =
+            create_part(&dest, || candidates.next().unwrap().to_owned()).unwrap();
+        file.write_all(b"jpeg").unwrap();
+        drop(file);
+        assert_eq!(part.path, dir.join("third.part"));
+        // リンクの先は書き換わらず、切れたリンクの先も作られていない
+        assert_eq!(fs::read(&outside).unwrap(), b"keep me");
+        assert!(!tmp.path().join("created-by-attacker").exists());
+        drop(part); // 未確定なので自分の `third.part` だけ消える
+        assert_eq!(names(&dir), ["first.part", "second.part"]);
+        assert!(
+            fs::symlink_metadata(dir.join("first.part"))
+                .unwrap()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn 名前がすべて塞がれていれば失敗にしてほかを消さない() {
+        let tmp = TempDir::new("part-blocked");
+        let dir = tmp.path().join("derivatives");
+        fs::create_dir(&dir).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, b"keep me").unwrap();
+        symlink(&outside, dir.join("same.part")).unwrap();
+        let dest = dir.join("safe.jpg");
+        let err = create_part(&dest, || "same.part".to_owned()).err().unwrap();
+        assert!(matches!(
+            err,
+            ImageError::Io(std::io::ErrorKind::AlreadyExists)
+        ));
+        assert_eq!(fs::read(&outside).unwrap(), b"keep me");
+        assert_eq!(names(&dir), ["same.part"]);
+    }
+
+    #[test]
+    fn 従来の名前に置かれたリンクがあっても外を書き換えない() {
+        let tmp = TempDir::new("part-legacy");
+        let src = tmp.path().join("src.jpg");
+        fs::write(&src, jpeg_8x8()).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, b"keep me").unwrap();
+        let dir = tmp.path().join("derivatives");
+        fs::create_dir(&dir).unwrap();
+        // Python と同じ名前（`dest.with_extension("part")`）に外向きのリンク
+        symlink(&outside, dir.join("safe.part")).unwrap();
+        let dest = dir.join("safe.jpg");
+        make_derivative(&src, &dest, 0).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"keep me");
+        // 出力は通常のファイルで、リンクではない
+        let meta = fs::symlink_metadata(&dest).unwrap();
+        assert!(meta.is_file() && !meta.is_symlink());
+        // リンクは自分のものではないので触らない
+        assert_eq!(names(&dir), ["safe.jpg", "safe.part"]);
+    }
+
+    #[test]
+    fn 出力先がリンクならリンク自体を置き換え先は書き換えない() {
+        let tmp = TempDir::new("part-dest-link");
+        let src = tmp.path().join("src.jpg");
+        fs::write(&src, jpeg_8x8()).unwrap();
+        let outside = tmp.path().join("outside.txt");
+        fs::write(&outside, b"keep me").unwrap();
+        let dir = tmp.path().join("derivatives");
+        fs::create_dir(&dir).unwrap();
+        let dest = dir.join("safe.jpg");
+        symlink(&outside, &dest).unwrap();
+        make_derivative(&src, &dest, 0).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"keep me");
+        let meta = fs::symlink_metadata(&dest).unwrap();
+        assert!(meta.is_file() && !meta.is_symlink());
+        assert_eq!(names(&dir), ["safe.jpg"]);
+    }
 }
