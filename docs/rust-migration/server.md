@@ -31,7 +31,7 @@ P1・P2（T2.1〜T2.3）でPythonと意図して違える点・既知の差の�
 | **入力の限界（T2.2）**: 1ファイル512 MiBまで（まるごとメモリに読む。Pythonは上限なし。`img-probe`の`--out`なしも同じ）。**HEICは、デコーダに渡す前に、ファイルが宣言する長さ・寸法（`mdat`のサイズ・EXIFのextent・`ispe`・SPS）がファイルの実際の大きさと画素数の上限に収まるか検査する**（`zune-heic`は宣言値で先に確保するので、小さな偽のファイルで確保に失敗してプロセスごと落ちるため。§12.4）。**EOI（画像データの終わりのマーカー）の無いJPEGは失敗にする**（切れたファイルと見分けられないため。§12.8）。Pillow 12.3.0も、EOIだけが欠けてファイルがそこで終わるJPEGと、SOS以降の全ての切断点で切ったJPEGは失敗にする。**Pythonが読んでRustが失敗にするのは、EOIが無くその位置にゴミやゼロ埋めが続くファイルだけ**（Pillowはそれも画像データとして読む。`tests/jpeg_eoi_python.rs`）。手動回転は0・90・180・270だけ（管理画面もその値しか作らない）。`.part`は`<出力名>.<pid>.<乱数>.part`を**排他的に新規作成**して（`O_EXCL`＋`O_NOFOLLOW`。既存のシンボリックリンクを辿らない）書き、書き込みに失敗・パニックしても**自分の**`.part`は残さない（Pythonは失敗すると残しうる）。出力の`.part`は`fsync`してから`rename`する | メモリの上限、電源断で空のderivativeを残さない、`DATA_DIR`の外を書き換えさせない | 巨大なファイル、偽の長さのHEIC、書き込みの失敗、`derivatives/`に置かれたリンク | 単体テスト、`tests/jpeg_eoi_python.rs`（`tools/gen_jpeg_eoi_fixture.py`） | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
 | **ローカル写真の索引（T2.3）**: ①`mtime`が変わった行の更新は、手動で直した位置（`loc_source='manual'`）も`exif`か`NULL`に**上書きする**（Pythonと同じ。`place elev display`もNULLに戻る。お気に入り・除外・回転・`fetched_at`は残る）。②**シンボリックリンクのディレクトリには降りない**（Pythonの`rglob`も降りない）。**ファイルのリンクは、実体が`DATA_DIR`の中にあるときだけ**取り込む（Pythonは外のファイルも読む）。名前がUTF-8でないエントリは飛ばす（Pythonは行を作る段で例外）。③書き込みは**1つのトランザクション**（追加・更新・削除をまとめる。Pythonは1文ごとのコミット）。EXIFの読み取りは書き込みの外で先に済ませる。④`GEOFRAME_PHOTOS_DIR`が`DATA_DIR`の外・`DATA_DIR`そのものを指すとその段は失敗する（Pythonは外で例外。`DATA_DIR`そのものだと`derivatives/`と`tmp/`の原本まで索引する）。⑤`mtime`がNULL・文字列の行は「変わった」とみなす（Pythonは例外）。⑥消した行の`display`が`derivatives/<安全な名前>`でなければ、行は消すがファイルは消さない（Pythonは`DATA_DIR / display`を無検査で消す）。⑦`GEOFRAME_FETCH_PER_CYCLE`は0以上の整数だけ（負の値は起動を断る。Pythonは負だとSQLiteの`LIMIT`が無制限） | ①は現行の挙動（直すかはP3で決める。[inventory.md §2.3](inventory.md)）。②〜⑦は安全側 | ローカルに写真を置いたとき | `tests/local_index_python.rs`（合成の木を4段階の操作でPythonの`index_local`と`photos`の全列・`id`・書き換えの有無まで突き合わせる。基準は`tools/gen_local_index_fixture.py`、CIで`--check`）、単体テスト、検証環境（§13.9。比較用Pythonと14行・全列が同じ） | ①は**P3で直すか決める**。他は決定 | [§13.2](#132-index_local)・[§13.7](#137-pythonとの差まとめ) |
 | **`local_derivatives`（T2.3）**: 取得待ちを`ORDER BY id`で選ぶ（Pythonは`ORDER BY`なしの`LIMIT`）。`photos.path`を`DataDir::resolve_existing`で検査してから読み、`DATA_DIR`の外へ出るものは失敗として数える（Pythonは原本のとき存在も見ずに`display`にする）。**変換が恒久的に失敗する写真が先頭の枠を埋め続けうる**のはPythonと同じ（`GEOFRAME_FETCH_PER_CYCLE`件より多く失敗すると後続が取得されない） | 順序の固定、DBの値を信用しない | 位置のあるローカルのHEIC・TIFFが壊れたとき | 単体テスト、検証環境 | 枠の占有はT2.4のDrive側と一緒に判断する（[§12.10](#1210-t23t24へ回したもの)） | [§13.3](#133-local_derivatives) |
-| **`organize`（T2.3。`geoframe organize [--dry-run]`）**: ①移動先に同名のファイルがあっても**上書きせず**`名前 (2).拡張子`にする（Pythonの`rename`は上書きして失った）。②通常のファイルだけを移す（リンク・ディレクトリは動かさず、行も残す）。③**T2.5までは、推定で位置が付きうる写真は移さない**（撮影時刻があって、錨になる位置つき写真が1枚でもあるとき）。Pythonは`index_local`→**`infer_locations`**→移動の順で、推定された写真は残す。Rustの`infer`段はT2.5まで何もしないので、そのまま移すとPythonなら残る写真まで移してしまう。そこで移動対象をPythonの部分集合に絞る。④ガード・ロックはsyncと同じ。ログに名前を出さない（件数だけ）。`unit`の`ReadOnlyPaths`が`photos`を読み取り専用にするので、`organize`はunitの外（`sudo -u geoframe`）で動かす | データを失わない、Pythonの結果を超えて動かさない | 位置の無いローカル写真を整理するとき | 単体テスト、`tests/ingest_cli.rs`、検証環境 | ③はT2.5で`infer`段のあとに移動する形にして外す | [§13.4](#134-geoframe-organize) |
+| **`organize`（T2.3。`geoframe organize [--dry-run]`）**: ①移動先に同名のファイルがあっても**上書きせず**`名前 (2).拡張子`にする（Pythonの`rename`は上書きして失った）。②通常のファイルだけを移す（リンク・ディレクトリは動かさず、行も残す）。③**T2.5までは、推定で位置が付きうる写真は移さない**（撮影時刻があって、錨になる位置つき写真が1枚でもあるとき）。Pythonは`index_local`→**`infer_locations`**→移動の順で、推定された写真は残す。Rustの`infer`段はT2.5まで何もしないので、そのまま移すとPythonなら残る写真まで移してしまう。そこで移動対象をPythonの部分集合に絞る。④元の削除に失敗したら退避先に作ったリンクを取り消す（残ったリンクは次の実行が同じ`inode`で再利用し、`(2)`・`(3)`を増やさない）。⑤`--dry-run`は`index_local`のあとの状態で、実行と同じ分類の件数を出す。⑥ガード・ロックはsyncと同じ。ログに名前を出さない（件数だけ）。`unit`の`ReadOnlyPaths`が`photos`を読み取り専用にするので、`organize`はunitの外（`sudo -u geoframe`）で動かす | データを失わない、Pythonの結果を超えて動かさない | 位置の無いローカル写真を整理するとき | 単体テスト、`tests/ingest_cli.rs`、検証環境 | ③はT2.5で`infer`段のあとに移動する形にして外す | [§13.4](#134-geoframe-organize) |
 | **書きかけの`derivatives/*.part`を起動時に消す（T2.3）**: `GEOFRAME_INGEST=1`のガードとロックのあと、`.dl_*`の掃除と同じ時点で、`derivatives/`**直下の通常ファイルで名前が`.part`で終わり、安全な名前**のものを消す。リンクは消さず辿らない。`derivatives`自体がリンクなら何もしない。件数だけをログに出す（`--dry-run`にも出る）。Pythonには掃除が無い | SIGKILL・電源断で残る`<名前>.<pid>.<乱数>.part`は名前に乱数があるので上書きされず容量を食い続ける | 取り込みの起動時 | 単体テスト、検証環境 | なし（決定） | [§13.5](#135-書きかけの-part-の掃除) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
@@ -527,7 +527,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 #### `--dry-run`
 
-`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。**行・写真・キャッシュ・ロック・`tmp/`・`derivatives/`は変えないが、SQLiteが読み取りでも作る`catalog.db-wal`・`catalog.db-shm`は新しくできうる**（WALのDBを開くとできる。中身は書かれない。ヘルプ（`USAGE`）と起動の1行目にも書いてある）。**ガード（§11.1.1）は通さない**: 書かないので、本番機でも件数を見られるようにしてある。出すもの:
+`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、実DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。**段に渡す読み取り用の接続`ctx.read`は、実DBのメモリ上の写し**（`sync::simulation_copy`。SQLiteのバックアップAPIで作る。`rusqlite`の`backup`機能を足した）で、先の段が自分の計画を写しに適用する（`index_local`が追加・更新・削除を、`local_derivatives`が`display`を、実行と同じ書き込み関数で写しに書く）。後の段は「先の段が済んだあと」の状態で件数を数え、最後の`写真: 表示可能／取得待ち／全`も同じ状態の見込みになる（T2.3の再レビューの指摘。以前は後続の段が索引前の行を見て、新しい写真を数え落とした）。写しの大きさはDBと同じ（検証環境の本番コピーで約85 MiB。`sync --dry-run`は0.3秒ほどで終わる）で、dry-runのときだけ作る。**行・写真・キャッシュ・ロック・`tmp/`・`derivatives/`は変えないが、SQLiteが読み取りでも作る`catalog.db-wal`・`catalog.db-shm`は新しくできうる**（WALのDBを開くとできる。中身は書かれない。ヘルプ（`USAGE`）と起動の1行目にも書いてある）。**ガード（§11.1.1）は通さない**: 書かないので、本番機でも件数を見られるようにしてある。出すもの:
 
 ```
 dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）
@@ -858,7 +858,7 @@ SSIMは全群で中央値0.97〜1.00（Rust対正解・Python対正解とも0.96
 | 項目 | 内容 |
 | --- | --- |
 | 段 | `index_local`（サイクルの先頭）・`local_derivatives`（`enrich`の後、`fetch_derivatives`の前）。順序は現行の`cycle()`のまま。どちらも失敗・パニックは隔離される（§11.3） |
-| `GEOFRAME_PHOTOS_DIR`（既定`photos`） | `DATA_DIR`からの相対（絶対パスなら、そのパス）。現行の`(DATA_DIR / 値).resolve()`と同じ。`canonicalize`した先が`DATA_DIR`の**中のサブディレクトリ**でなければ`index_local`は失敗する（§0）。ディレクトリ名`photos`は変えない（`display`・`path`列の相対パスが配信URLを兼ねる） |
+| `GEOFRAME_PHOTOS_DIR`（既定`photos`） | `DATA_DIR`からの相対（絶対パスなら、そのパス）。現行の`(DATA_DIR / 値).resolve()`と同じ。`canonicalize`した先が`DATA_DIR`の**中のサブディレクトリ**でなければ`index_local`は失敗する（§0）。ディレクトリを作る前に親を検査するので、外を指す未作成のパスでも外には何もできない。ディレクトリ名`photos`は変えない（`display`・`path`列の相対パスが配信URLを兼ねる） |
 | `GEOFRAME_FETCH_PER_CYCLE`（既定`25`） | `local_derivatives`が1サイクルで処理する枚数。T2.4で`fetch_derivatives`も同じ値を使う。0以上の整数だけ（それ以外は起動を断る。終了コード2） |
 | ログ | 段ごとの件数だけ（`files added updated removed unreadable skipped …`、`original made failed icc_dropped`）。ファイル名・座標・撮影日時・例外の文字列は出さない |
 
@@ -866,15 +866,15 @@ SSIMは全群で中央値0.97〜1.00（Rust対正解・Python対正解とも0.96
 
 **規則はPythonと同じ**で、違いは§0の行と下の表に挙げたものだけ。
 
-1. **走査**: `PHOTOS_DIR`の下を再帰して、拡張子が`imaging::EXTS`（大文字小文字を区別しない）のファイルを集める。パスの要素のどれかが**ちょうど`gdrive`**なら除外する（旧ミラー先。部分一致ではなく、`gdrive2`・`mygdrive`は対象）。ドット始まりのファイル・ディレクトリも対象（Pythonと同じ）。`PHOTOS_DIR`が無ければ作る（`mkdir`。`--dry-run`では作らない）。
+1. **走査**: `PHOTOS_DIR`の下を再帰して、拡張子が`imaging::EXTS`（大文字小文字を区別しない）のファイルを集める。パスの要素のどれかが**ちょうど`gdrive`**なら除外する（旧ミラー先。部分一致ではなく、`gdrive2`・`mygdrive`は対象）。ドット始まりのファイル・ディレクトリも対象（Pythonと同じ）。`PHOTOS_DIR`が無ければ作る（`mkdir`。最後の1階層だけ。親が無ければ失敗）。**作る前に**、親を`canonicalize`して`DATA_DIR`の中かを確かめる（`..`やリンクを経由する未作成のパスは、外にディレクトリを作らずに断る。以前は`mkdir`してから検査していたので、段は失敗しても外にディレクトリが残った）。`--dry-run`は作らず、**置き場が無ければ空の走査として**同じ計画の関数を通す（実行は作って空の走査をし、既存のローカル行を削除するので、dry-runもその削除と消すderivativeを数える）。
 2. **並び**: パスの要素の列の昇順（Pythonの`sorted(rglob("*"))`）。`a/b.jpg`は`a-b.jpg`より前。新しい行の`id`はこの順に振られる（`INTEGER PRIMARY KEY`なので`max+1`）。
 3. **追加**: `photos(source='local', path, name, mtime, taken_at, lat, lon, loc_source, indexed_at)`。`path`は`DATA_DIR`からの相対（`/`区切り）、`name`はファイル名、`mtime`は`st_mtime`（`sec + nsec * 1e-9`の`double`。CPythonと同じ式で、比較テストでビット一致を確かめた）、`taken_at`は`imaging::extract_exif`の値（読めなければ空文字。NULLにしない）、`lat`・`lon`はGPSがあるときだけ、`loc_source`はGPSがあれば`exif`、無ければNULL、`indexed_at`は`YYYY-MM-DDTHH:MM:SS`（現地時刻・オフセット無し）で、段の先頭で1回だけ作って全行に使う。
 4. **更新**: 既存の行（`path`が一致）で`mtime`の差が**1秒以上**（または`mtime`がNULL）のとき、`mtime taken_at lat lon loc_source`を上書きし、`place elev display`をNULLに戻し、`indexed_at`を更新する。**`name favorite hidden rotation title inferred_from infer_dt_s muni_cd pref city fetched_at`は触らない**（手動の位置は上書きされる。§0）。1秒未満の差は何もしない。
 5. **削除**: 走査で見つからなかった`source='local'`の行（`path`がNULLの行も）を削除する。`display`が`derivatives/`で始まる行は、そのファイルも消す（`photos/`の原本は消さない）。消すのは行の削除を確定したあとで、名前は`DataDir::derivative_file`の検査（`derivatives/`直下の1ファイル、安全な名前、`derivatives`がリンクでない）を通ったものだけ。
 6. **読めない写真**: 画像として読めない（`NotAnImage`・読み取りの失敗・512 MiB超・BigTIFF）写真は、行を作らず・更新せず、件数（`unreadable`）に数える。既に索引した写真が壊れても、走査では見つけているので行は消えない（Pythonと同じ）。EXIFが無い・壊れているのは失敗ではない（位置なし・時刻なし）。
-7. **中断**: 停止の合図が来たら、何も書かずに段を終える（走査が途中の「見つからなかった」で行を消さない）。
+7. **中断**: 停止の合図は、行・ファイルを**変える前**にだけ効く。確認する点は、走査でディレクトリを開くたび・計画で写真1枚ごと・計画の完了時（写真が0枚でも通る。最後の1枚のEXIF読み取り中に来た合図もここで拾う）・書き込みの始め・書き込みの途中で256件ごと・`COMMIT`の直前。どこで来ても`ROLLBACK`して何も変えず、段は`Skipped`（`停止の合図で中断しました`）で終わる（走査が途中の「見つからなかった」で行を消さない）。derivativeのファイル消しは`COMMIT`の**後**なので、`COMMIT`しなければ消さない。逆に`COMMIT`した後は、行がもう無くて後から拾えないので、合図が来ても最後まで消す。
 
-**書き込みの形**: 走査・EXIFの読み取りはwriterの外で先に済ませ、計画（追加・更新・削除）を作ってから、`writer.call`1回の中で`BEGIN`〜`COMMIT`にまとめて書く。途中で落ちても中途半端な状態を残さない。`--dry-run`は計画の件数だけを出し、置き場の作成・書き込み・ファイルの削除をしない。
+**書き込みの形**: 走査・EXIFの読み取りはwriterの外で先に済ませ、計画（追加・更新・削除）を作ってから、`writer.call`1回の中で`BEGIN`〜`COMMIT`にまとめて書く。途中で落ちても中途半端な状態を残さない。`--dry-run`は計画の件数だけを出し、置き場の作成・実DBへの書き込み・ファイルの削除をしない（計画は§11.3の写しに適用して、後続の段に見せる）。実行とdry-runは**同じ計画の関数**（`IndexLocal::plan`）と**同じ書き込み関数**（`write_plan`）を通る。
 
 | Pythonの挙動 | Rustの挙動 |
 | --- | --- |
@@ -892,7 +892,7 @@ SSIMは全群で中央値0.97〜1.00（Rust対正解・Python対正解とも0.96
 - 行ごとに`UPDATE photos SET display=?, fetched_at=?`（`fetched_at`は`YYYY-MM-DDTHH:MM:SS`）。1枚ずつ書くので、途中で止まっても進んだ分は残る。
 - `photos.path`は`DataDir::resolve_existing`を通してから読む（`DATA_DIR`の外へ出るもの・存在しないものは`failed`）。変換に失敗した写真は`failed`に数えて次へ進み、`display`はNULLのまま（毎サイクル再試行される）。`ImageError`の文面はパスを含まないので`debug`ログに写真のIDと一緒に出せる。ICCを捨てた件数は`icc_dropped`。
 - **残る注意**: 恒久的に失敗する写真が`FETCH_PER_CYCLE`件を超えると、後続が取得されない（Pythonと同じ。ローカルの位置あり写真が対象なので、実際には起きにくい）。T2.4のDrive側（受入条件②）と一緒に判断する。
-- `--dry-run`は`display=path`にする枚数（`original`）と、derivativeを作る枚数（`made`）を数えるだけ。
+- `--dry-run`も、実行と同じ順に`resolve_existing`でパスを検査し（存在しない・`DATA_DIR`の外は`failed`）、`display=path`にする枚数（`original`）とderivativeを作る枚数（`made`）を数える。対象の行は、`index_local`の計画を適用した写しから選ぶ（新しく索引される位置つきの写真も数える）。違いは、derivativeを実際に作らない（変換の失敗は分からず`failed`に出ない・`icc_dropped`は常に0）ことと、`display`を書く先が写しであることだけ。出力の件数の組（`original made failed icc_dropped`）は実行と同じ。
 
 ### 13.4 `geoframe organize`
 
@@ -904,9 +904,9 @@ geoframe organize [--dry-run] [--data-dir <dir>]
 
 - **対象**: `source='local' AND lat IS NULL`の行のうち、次のいずれか: 撮影時刻が空（NULLか空文字）、または錨になりうる写真（`loc_source IN ('exif','drive_meta','manual')`で時刻つき）が1枚も無い。それ以外（時刻つきで、錨がある）は**T2.5まで移さない**（`held_back_until_infer`として数える）。Pythonは`index_local`→`infer_locations`→移動で、推定で位置が付いた写真は移さない。Rustの`infer`段は何もしないので、絞らないとPythonなら残る写真まで移して行を失う。T2.5で`infer`段のあとに移す形にして、この絞り込みを外す。
 - **ファイル**: `entry_path`（親を`canonicalize`して`DATA_DIR`の中か検査し、最後の要素のリンクは辿らない）で絶対パスにし、**通常のファイルだけ**を移す。リンク・ディレクトリは動かさず、行も残す（`skipped`）。ファイルが無い行は、Pythonと同じく行だけ消す（`row_only_removed`）。
-- **移動先**: `_excluded`・`_excluded/no_gps`を1階層ずつ`symlink_metadata`で見て、リンクやファイルならディレクトリを作らずに断る（`DATA_DIR`の外へ出さない）。ファイル名はそのまま。**同名があっても上書きしない**: ハードリンクを作ってから元を消す（リンクは既にあれば失敗するので、同名のファイルを壊さない）。あれば`名前 (2).拡張子`、`(3)`…と探す。ハードリンクを作れないファイルシステムでは、無いことを確かめてから`rename`する。1つの移動に失敗しても次へ進む（`failed`）。
+- **移動先**: `_excluded`・`_excluded/no_gps`を1階層ずつ`symlink_metadata`で見て、リンクやファイルならディレクトリを作らずに断る（`DATA_DIR`の外へ出さない）。ファイル名はそのまま。**同名があっても上書きしない**: ハードリンクを作ってから元を消す（リンクは既にあれば失敗するので、同名のファイルを壊さない）。あれば`名前 (2).拡張子`、`(3)`…と探す。ハードリンクを作れないファイルシステムでは、無いことを確かめてから`rename`する。1つの移動に失敗しても次へ進む（`failed`）。**元の削除に失敗したら、作ったリンクを取り消す**（元のディレクトリが書き込み禁止のとき、リンクだけが残って行も残り、再実行のたびに`(2)`・`(3)`と増えて、候補を使い切ると権限を直しても移せなくなった）。取り消しにも失敗して残ったリンクは、次の実行で**退避先に同じ`inode`の名前があれば**それを使い、リンクを重ねずに元だけ消す（同じ実体への名前なので、中身は退避先に残る。別々の行が元からハードリンクだった場合も、実体は退避先に1つ残る）。
 - 行の削除は、ファイルを移したあとに1行ずつ。
-- `--dry-run`は`targets`と`held_back_until_infer`だけを出し、何も動かさない。対象は今のDBの行だけで、`index_local`が追加・更新する分は含まない（出力にその旨が出る）。
+- `--dry-run`は何も動かさずに、実行と同じ分類（移す・行だけ消す・動かさない・調べられない）で`targets moved row_only_removed skipped failed held_back_until_infer`を数える。対象は、`index_local`の計画を適用した写し（§11.3）の行なので、新しく索引される位置の無い写真も含む。移動先は作らず（リンクを経由していないかの検査だけ行う）、移せるものとして数える（権限・名前の使い切りは試さない）。実行の出力も同じ6つの件数（対象が0件でも）。
 - unitの`ReadOnlyPaths`は`photos`を読み取り専用にするので、`organize`はunitの外（`sudo -u geoframe geoframe organize`）で動かす。出力はファイル名を含まない。
 
 ### 13.5 書きかけの`.part`の掃除
@@ -921,7 +921,7 @@ T2.2の注意（§12.2）の対応。`ingest::start`の最後（ガード・ロ�
 
 ### 13.6 `--dry-run`
 
-`geoframe sync --dry-run`の`index_local`・`local_derivatives`の段が、書かずに件数を出す（§11.3）: `index_local`は`files added updated removed unreadable skipped …`（置き場が無ければ全部0）、`local_derivatives`は`original made`。掃除の行には`.part`の件数が増えた（`掃除: 消す .dl_* N 件 / 消す書きかけの .part N 件 / 捨てる .cache.json の旧キー N 件`）。`geoframe organize --dry-run`は`targets`・`held_back_until_infer`。
+`geoframe sync --dry-run`の`index_local`・`local_derivatives`の段が、書かずに件数を出す（§11.3）: `index_local`は`files added updated removed unreadable skipped …`（置き場が無ければ空の走査として、既存のローカル行の削除を数える）、`local_derivatives`は`original made failed icc_dropped`（後続の段は索引後の写しで数える。§13.3）。掃除の行には`.part`の件数が増えた（`掃除: 消す .dl_* N 件 / 消す書きかけの .part N 件 / 捨てる .cache.json の旧キー N 件`）。`geoframe organize --dry-run`は`targets moved row_only_removed skipped failed held_back_until_infer`（`index_local`のあとの写しで数える。§13.4）。**判断（再レビューの指摘5）**: 後続の段の件数は「索引前の状態で数える」案ではなく、メモリ上の写しに計画を適用する案にした。写しの作成はバックアップAPIの1回で済み、段の側は`ctx.read`の使い方を変えずに、書き込み関数を共有するだけで済んだ。
 
 ### 13.7 Pythonとの差（まとめ）
 
@@ -937,10 +937,10 @@ T2.2の注意（§12.2）の対応。`ingest::start`の最後（ガード・ロ�
 | 対象 | テスト |
 | --- | --- |
 | Pythonとの突き合わせ（`tests/local_index_python.rs`） | `tools/gen_local_index_fixture.py`が作る`local-index-python.json`（合成のJPEG・PNG・TIFF・HEICの木。ナノ秒つきの`mtime`、`gdrive`・隠しディレクトリ・日本語名・並びの境目・画像でないファイル。4段階の操作: 初回の索引・変化なし・更新と削除と追加と手動の書き込み・変化なし）を、Rustが同じ木と操作で`IndexLocal`に通し、`photos`の**全列と`id`**、書き換えられたか（`indexed_at`に入れた目印が残るか）、`derivatives/`のファイルの有無が一致することを確かめる。意図した差（壊れたGPSの写真）は別のテストで確かめる。CIの`app`ジョブが`--check`でPythonの結果を検査する（`pillow-heif`が必要） |
-| `local.rs`の単体テスト | 追加の列、2回目に何も書かない、1秒の許容、更新で上書きする列と残す列、削除（`derivatives/`だけファイルも消す、危険な`display`は消さない）、`gdrive`・拡張子・隠しファイル、走査順、読めない写真、リンク（ディレクトリは降りない・外を指すファイルは読まない）、置き場が外・`DATA_DIR`そのもの、`dry-run`、停止、ログに名前が出ないこと、`local_derivatives`（JPEG・HEIC、上限、失敗、`path`の逸脱、位置なし、`dry-run`）、`organize`（移動・同名・保留・`dry-run`・欠けた行・リンク・移動先がリンク）、MD5の名前（Pythonの値） |
+| `local.rs`の単体テスト | 追加の列、2回目に何も書かない、1秒の許容、更新で上書きする列と残す列、削除（`derivatives/`だけファイルも消す、危険な`display`は消さない）、`gdrive`・拡張子・隠しファイル、走査順、読めない写真、リンク（ディレクトリは降りない・外を指すファイルは読まない）、置き場が外・`DATA_DIR`そのもの、置き場の親が`DATA_DIR`の外（絶対パス・`..`・リンク。作る前に断り外に何も作らない）、`dry-run`（置き場が無くても削除を数え、実行と同じ件数）、停止（写真0枚、確認点を1回目から順に変えて「何も変えない」か「全部やった」のどちらかになること、256件ごとの確認）、ログに名前が出ないこと、`local_derivatives`（JPEG・HEIC、上限、失敗、`path`の逸脱、位置なし、`dry-run`）、`organize`（移動・同名・保留・`dry-run`・欠けた行・リンク・移動先がリンク、元の削除に失敗したときのリンクの取り消し・取り消せずに残ったリンクの再利用）、後続の段のdry-run（`index_local`→`local_derivatives`→`organize`を写しの上で通し、実行と同じ件数になること）、MD5の名前（Pythonの値）、大量の変更の計測（`--ignored`。§13.12） |
 | `ingest.rs` | `.part`の掃除（対象と対象外、リンク、`derivatives`がリンク、ガードが断れば消さない） |
 | `datadir.rs` | `derivative_file`・`entry_path` |
-| `tests/ingest_cli.rs` | `sync --dry-run`の出力（`.part`の件数・新しい段の件数）、`organize`（INGESTなし・印なしで断る、`--dry-run`が何も変えない、ガードを通すと移して行を消す。Driveの行は触らない。出力に名前が出ない） |
+| `tests/ingest_cli.rs` | `sync --dry-run`の出力（`.part`の件数・新しい段の件数）、`organize`（INGESTなし・印なしで断る、`--dry-run`が何も変えず索引後の対象を数える、ガードを通すと移して行を消す。Driveの行は触らない。出力に名前が出ない） |
 
 ### 13.9 検証環境での確認（2026-10-24）
 
@@ -962,3 +962,47 @@ musl静的バイナリを`deploy/rust-deploy.sh`で配布して確かめた。�
 - **T2.5**: `organize`の「推定で位置が付きうる写真は移さない」制限（§13.4）を外す。`infer`段のあとに移す。
 - **T2.4**: `fetch_derivatives`の取得待ちの占有（§12.10の受入条件②）は、`local_derivatives`の枠の占有（§13.3）と同じ形で判断する。
 - **P3**: 手動の位置がmtimeの変更で上書きされる挙動（§0、[inventory.md §2.3](inventory.md)）を直すか決める。直すなら、`loc_source='manual'`の行は`lat lon loc_source`を更新しない・`display`だけをNULLにする、などの選択肢がある。
+
+### 13.11 再レビュー（2026-10-24）の指摘への対応
+
+| 指摘 | 対応 |
+| --- | --- |
+| 1. 置き場が無いとdry-runが削除を見落とす | 置き場が無いときは空の`Scan`として、実行と同じ計画の関数を通す（§13.2）。実行は置き場を作って空の走査をし、既存のローカル行を消す。dry-runも同じ削除と、消すderivativeを数える。件数一致は単体テスト`写真の置き場が無くてもdry_runは削除を数え_実行と同じ件数になる`で確かめた |
+| 2. 停止の合図を受けても行・ファイルを消す経路 | 確認点を、走査中・写真ごと・計画の完了時・書き込みの始め・256件ごと・`COMMIT`の直前に増やし、確定前の合図は`ROLLBACK`して`Skipped`（§13.2の7）。derivativeのファイル消しは`COMMIT`の後なので、合図で確定しなければ消さない。試験は、確認点を1回目から順に変えて「全く変えない」か「全部やった」のどちらかになること（確認点は7つ）と、写真0枚、256件ごとの確認 |
+| 3. `DATA_DIR`の外へ作ってから検査 | 作る前に親を`canonicalize`して`DATA_DIR`の中かを確かめる（§13.2の1）。絶対パス・`..`・リンクの3通りを、実行とdry-runの両方で試験し、外に何もできないことを確かめた。**他の箇所の確認**: `organize`の`_excluded/no_gps`は、1階層ずつ`symlink_metadata`で見てから作る（元から正しい順。dry-runでは作らない検査だけの形も足した）。`derivatives/`・`tmp/`は`DATA_DIR`直下の固定名で、`create_dir_all`が外へ作ることはない（リンクが外の実在ディレクトリを指す場合は作らず、作った後の`canonicalize`の照合で断る。宙に浮いたリンクは`create_dir_all`が失敗する）。`ingest::prepare_tmp_dir`は`tmp/`が外へのリンクだと、作りはしないが`.dl_*`の掃除がリンク先で走る。T2.2の範囲で今回は直していない（`tmp/`は取り込み自身だけが作る）。必要なら別の項目にする |
+| 4. `organize`の途中失敗でリンクが増え続ける | 元の削除に失敗したらリンクを取り消し、取り消せなかったものは次の実行が同じ`inode`で再利用する（§13.4）。試験は元のディレクトリを読み取り専用にして3回失敗させ（退避先が空のまま）、権限を戻すと`(2)`の無い名前で移ること、残ったリンクの再利用、別のファイルが同名のときは別名の側で再利用すること。rootなどパーミッションが効かない環境では最初のものを飛ばす |
+| 5. 後続段のdry-runの件数 | メモリ上の写しに先の段の計画を適用する形にした（§11.3、§13.6）。`local_derivatives`のdry-runはパス検査も実行と共通。`organize --dry-run`も同じ。件数一致は単体テスト`dry_runの後続段は索引後の状態で数え_実行と同じ件数になる`と、検証環境（§13.13） |
+| 6. 大量の変更のトランザクション | 計測して分割しないと判断した（§13.12） |
+
+### 13.12 大量の変更の計測
+
+合成の`Entry`を、writerの1回の呼び出し（1トランザクション）に渡して測った（`local/tests.rs`の`#[ignore]`のテスト。`cargo test --release -p geoframe --lib -- --ignored --nocapture 大量`）。本番機（N100）で、リリースビルド、SQLiteはWAL。
+
+| 操作（1トランザクション） | tmpfs | NVMeのディスク（4回） |
+| --- | --- | --- |
+| 10,000件の追加 | 約10 ms | 約13 ms（初回の1回だけ約620 ms: 空のDBの作成を含む） |
+| 10,000件の更新 | 約11 ms | 13〜15 ms |
+| 10,000件の削除 | 約7 ms | 12〜14 ms |
+| 更新の途中で停止の合図 → `ROLLBACK`して戻るまで | 約0.5 ms | 0.4〜0.5 ms |
+
+- **writerの占有**は、最悪でも1万件で約15 ms（初回の空のDBでも1秒未満）。writerを使う他の呼び出し（P3の管理画面の更新）はこの間だけ待つ。読み取りはWALなので待たない。
+- **停止への応答**は、256件ごとの確認で1 ms未満。確認の間隔はトランザクションを分割する代わりになる。
+- **判断: 分割しない**。分けると、削除の判定（走査で見つからなかった行）と、追加・更新・削除の原子性が崩れる（途中で止まると、一部だけ反映された索引が残る）。1万件を桁で超える変更（数十万枚の初回の取り込みなど）はこの機体では想定しない。超える場合は、占有時間が件数に比例するので、その時点で分割を設計する（削除の判定は走査の完了後に1回だけ行い、追加・更新だけを分ける、など）。
+- 計測していないもの: 計画の側（走査とEXIFの読み取り）の所要時間。これはwriterの外で行い、停止の確認は写真1枚ごとなので、応答は「1枚のEXIFを読む時間」で決まる。
+
+### 13.13 検証環境での確認（2回目。2026-10-24）
+
+再レビューの修正を入れたmusl静的バイナリを`deploy/rust-deploy.sh`で配布して確かめた。§13.9と同じ手順: 書き換える前に検証環境の中で`sqlite3 .backup`のコピーを取り（`.dump`と、`source='drive'`の全行の`SELECT *`のSHA-256を記録）、合成の写真（`tests/fixtures`のJPEG・HEICの複製。実写真は使わず、検証環境の外へも出していない）を置いて、`sync --dry-run`と`GEOFRAME_INGEST=1`の`sync`を同じ状態に対して続けて実行し、`index_local`・`local_derivatives`の段と`写真:`の行を比べた。
+
+| 状態 | dry-run | 実行 |
+| --- | --- | --- |
+| 5枚を新しく置く（位置つきJPEG3・位置なしJPEG1・位置なしHEIC1） | `added=5`、`original=3`、`写真: … 全6540` | 同じ（出力が一致）。以前のdry-runは`original=0`になった |
+| `organize --dry-run`（上の状態で、索引前） | `index_local added=5`、`targets=2 moved=2` | 実行は`targets=2 moved=2`（2枚が`_excluded/no_gps/`へ） |
+| HEICと位置つきJPEGを足し、1枚を更新・1枚を削除 | `added=2`、次に`updated=1 removed=1`、`original=1` | 同じ |
+| HEICに位置を与える（検証環境の`sqlite3`で更新） | `made=1` | 同じ。`derivatives/local_<md5>.jpg`ができる。2回目は変更0 |
+| HEICの原本を消す | `removed=1 derivative_files_removed=1` | 同じ。derivativeも消える |
+| 位置なしJPEGを足す → `organize --dry-run` / `organize` | `index_local added=1`、`organize targets=1 moved=1` | 出力が一致 |
+| `photos/`ごと退避し、偽のderivativeを1つ`display`にする | `removed=3 derivative_files_removed=1`。`photos/`は作られない | 同じ件数。`photos/`が作られ、行3つとderivativeが消える |
+
+- 2回目の変更は0（`added=0 updated=0 removed=0`、`made=0`）。Driveの行（6,535行）の`SELECT *`のSHA-256は、配布前のコピーと**一致**した。
+- 後片付け: 合成の写真・`_excluded`・`derivatives/local_*.jpg`・`source='local'`の行を消し、`photos/`の権限を元（750）に戻した。**`.dump`のSHA-256は配布前のコピーと一致**。`GEOFRAME_INGEST`は設定されておらず（`取り込みは無効です`）、`/healthz`は200。検証環境の中に作ったバックアップは確認後に削除した。

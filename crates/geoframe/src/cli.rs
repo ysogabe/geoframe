@@ -374,13 +374,24 @@ fn sync_dry_run(config: &Config) -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    // 後続の段は、先の段が済んだあとの状態で数える（先の段が自分の計画を写しに適用する）
+    let sim = match crate::sync::simulation_copy(&read) {
+        Ok(sim) => sim,
+        Err(e) => {
+            eprintln!("geoframe: DB のメモリ上の写しを作れません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "後続の段は、先の段が済んだあとの状態（メモリ上の写し）で数えます。「写真:」の行も同じです"
+    );
     let cache = Cache::load_frozen(&config.data_dir);
     let http = crate::net::agent();
     let stop = StopFlag::new();
     let ctx = StageCtx {
         mode: Mode::DryRun,
         config,
-        read: &read,
+        read: &sim,
         writer: None,
         cache: &cache,
         http: &http,
@@ -450,7 +461,7 @@ fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
     let ingest = if dry_run {
         println!(
             "dry-run: 何も書きません（行・ファイルは変えません。SQLite の WAL 関連ファイルだけはできうります）。\
-             organize の対象は今の DB の行だけで、index_local が追加・更新する分は含みません"
+             organize の対象は、index_local が済んだあとの状態（メモリ上の写し）で数えます"
         );
         None
     } else {
@@ -475,6 +486,20 @@ fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // dry-run は、index_local が自分の計画を適用した写しの上で organize を数える
+    let sim;
+    let read = if dry_run {
+        sim = match crate::sync::simulation_copy(&read) {
+            Ok(sim) => sim,
+            Err(e) => {
+                eprintln!("geoframe: DB のメモリ上の写しを作れません: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        &sim
+    } else {
+        &read
+    };
     let cache = match &ingest {
         Some(ingest) => Arc::clone(&ingest.cache),
         None => Arc::new(Cache::load_frozen(&config.data_dir)),
@@ -484,7 +509,7 @@ fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
     let ctx = StageCtx {
         mode: if dry_run { Mode::DryRun } else { Mode::Apply },
         config: &config,
-        read: &read,
+        read,
         writer: ingest.as_ref().map(|i| &i.writer),
         cache: &cache,
         http: &http,

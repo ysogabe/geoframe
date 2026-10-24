@@ -627,8 +627,11 @@ fn organize_dry_run_reports_counts_and_changes_nothing() {
         stdout.contains("index_local: 完了 files=1 added=1"),
         "{stdout}"
     );
-    // 計画は索引の結果を反映しない（dry-run は DB に書かない）。対象は今の DB にある行だけ
-    assert!(stdout.contains("organize: 完了 targets=0"), "{stdout}");
+    // 計画は索引の結果を反映する（実 DB でなくメモリ上の写しに適用する）。位置の無い 1 枚が対象
+    assert!(
+        stdout.contains("organize: 完了 targets=1 moved=1"),
+        "{stdout}"
+    );
     assert_eq!(snapshot(&data), before);
     assert!(!data.join("_excluded").exists());
 }

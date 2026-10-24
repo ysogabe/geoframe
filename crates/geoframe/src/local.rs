@@ -106,38 +106,63 @@ impl Scan {
     }
 }
 
+/// 置き場が `DATA_DIR` の中のサブディレクトリではないときの断り文。
+const PHOTOS_DIR_OUTSIDE: &str =
+    "GEOFRAME_PHOTOS_DIR が DATA_DIR の中のサブディレクトリではありません";
+
 /// 写真の置き場を解決する。`DATA_DIR` の中の実在のディレクトリ（`canonicalize` 済み）。
 ///
-/// 現行の `PHOTOS_DIR.mkdir(exist_ok=True)` と `.resolve()`。dry-run では作らず、無ければ `None`
-/// （写真は 0 枚として数える）。`DATA_DIR` そのもの・外を指すときは断る: 前者は `derivatives/` や
-/// `tmp/`（EXIF 付きの原本の一時置き場）まで索引してしまい、後者は現行が `relative_to` で落ちる。
+/// 現行の `PHOTOS_DIR.mkdir(exist_ok=True)` と `.resolve()`。**ディレクトリを作る前に**、親を解決して
+/// `DATA_DIR` の中かを確かめる（`..` やリンクを経由して外に作らない。作ってから検査すると、段は失敗しても
+/// 外にディレクトリが残る）。作るのは最後の 1 階層だけ（`mkdir` と同じ。親が無ければ失敗）。
+/// dry-run では作らず、無ければ `None`（空の置き場として扱う。実行は作って空の走査をするので、
+/// 既存のローカル行は消える。dry-run もその計画を数える）。`DATA_DIR` そのもの・外を指すときは断る:
+/// 前者は `derivatives/` や `tmp/`（EXIF 付きの原本の一時置き場）まで索引してしまい、後者は現行が
+/// `relative_to` で落ちる。
 fn photos_root(ctx: &StageCtx<'_>, data: &DataDir) -> Result<Option<PathBuf>, StageError> {
     let configured = ctx.config.photos_dir();
-    if !ctx.is_dry_run() {
-        match fs::create_dir(&configured) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    let real = match fs::canonicalize(&configured) {
-        Ok(real) => real,
-        Err(e) if e.kind() == io::ErrorKind::NotFound && ctx.is_dry_run() => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let (Some(parent), Some(name)) = (configured.parent(), configured.file_name()) else {
+        // `..` で終わる・ルートそのもの
+        return Err(StageError::fixed(PHOTOS_DIR_OUTSIDE));
     };
+    let real_parent = fs::canonicalize(parent)?;
+    if !real_parent.starts_with(data.root()) {
+        return Err(StageError::fixed(PHOTOS_DIR_OUTSIDE));
+    }
+    let target = real_parent.join(name);
+    match fs::symlink_metadata(&target) {
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if ctx.is_dry_run() {
+                return Ok(None);
+            }
+            match fs::create_dir(&target) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    }
+    let real = fs::canonicalize(&target)?;
     if real == data.root() || !real.starts_with(data.root()) {
-        return Err(StageError::fixed(
-            "GEOFRAME_PHOTOS_DIR が DATA_DIR の中のサブディレクトリではありません",
-        ));
+        return Err(StageError::fixed(PHOTOS_DIR_OUTSIDE));
     }
     Ok(Some(real))
 }
 
-/// `photos` の下を走査して、取り込み対象のファイルを集める（パスの要素の列の昇順）。
-fn scan(data: &DataDir, photos: &Path) -> io::Result<Scan> {
+/// 停止の合図が来ているか。段は合図の確認を、これを通して行う（試験で来る時点を指定できるように）。
+type Stopped<'a> = &'a dyn Fn() -> bool;
+
+/// `photos` の下を走査して、取り込み対象のファイルを集める（パスの要素の列の昇順）。ディレクトリを
+/// 開くたびに停止の合図を見て、来ていれば `None`（走査が途中の結果から削除を決めてはいけない）。
+fn scan(data: &DataDir, photos: &Path, stopped: Stopped<'_>) -> io::Result<Option<Scan>> {
     let mut out = Scan::default();
     let mut stack: Vec<(PathBuf, Vec<String>)> = vec![(photos.to_path_buf(), Vec::new())];
     while let Some((dir, parts)) = stack.pop() {
+        if stopped() {
+            return Ok(None);
+        }
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
             // 一番上が読めないのは失敗。下の階層は飛ばして数える（現行の `rglob` も権限エラーを無視する）
@@ -203,7 +228,7 @@ fn scan(data: &DataDir, photos: &Path) -> io::Result<Scan> {
         }
     }
     out.found.sort_by(|a, b| a.parts.cmp(&b.parts));
-    Ok(out)
+    Ok(Some(out))
 }
 
 // ============================================================
@@ -233,18 +258,10 @@ struct Entry {
     loc_source: Option<&'static str>,
 }
 
+#[derive(Clone)]
 enum Op {
     Insert(Entry),
     Update(Entry),
-}
-
-impl Op {
-    fn clone_for_write(&self) -> Op {
-        match self {
-            Op::Insert(e) => Op::Insert(e.clone()),
-            Op::Update(e) => Op::Update(e.clone()),
-        }
-    }
 }
 
 /// 計画の結果（書き込む前）。
@@ -300,15 +317,30 @@ fn load_existing(
     Ok((by_path, local_without_path))
 }
 
+/// 停止の合図で中断したときの `Skipped` の理由（定型文）。
+const STOPPED: &str = "停止の合図で中断しました";
+
+/// 書き込みの途中で停止の合図を見る間隔（操作の件数）。
+const STOP_CHECK_EVERY: usize = 256;
+
 impl IndexLocal {
-    /// 計画を作る。ファイルは読むが、DB にもファイルにも書かない。`stop` の合図が来たら `None`
-    /// （走査が途中の `seen` で削除を決めてはいけない）。
+    /// 計画を作る。ファイルは読むが、DB にもファイルにも書かない。`photos` が `None` のときは置き場が
+    /// まだ無い（dry-run）ので、空の走査として扱う: 実行と同じ関数を通り、既存のローカル行の削除も数える。
+    /// 停止の合図が来たら `None`（走査が途中の `seen` で削除を決めてはいけない）。確認は、走査中・写真ごと・
+    /// 計画の完了時。
     fn plan(
         ctx: &StageCtx<'_>,
         data: &DataDir,
-        photos: &Path,
+        photos: Option<&Path>,
+        stopped: Stopped<'_>,
     ) -> Result<Option<(Plan, Scan)>, StageError> {
-        let scan = scan(data, photos)?;
+        let scan = match photos {
+            Some(photos) => match scan(data, photos, stopped)? {
+                Some(scan) => scan,
+                None => return Ok(None),
+            },
+            None => Scan::default(),
+        };
         let (mut existing, local_without_path) = load_existing(ctx.read)?;
         let mut plan = Plan {
             files: scan.found.len() as u64,
@@ -316,7 +348,7 @@ impl IndexLocal {
         };
         let mut seen: HashSet<&str> = HashSet::with_capacity(scan.found.len());
         for found in &scan.found {
-            if ctx.stop.is_stopped() {
+            if stopped() {
                 return Ok(None);
             }
             seen.insert(&found.rel);
@@ -357,6 +389,10 @@ impl IndexLocal {
                 Op::Insert(entry)
             });
         }
+        // 最後の 1 枚の読み取り中に来た合図も、ここで拾う（写真が 0 枚でもここは通る）
+        if stopped() {
+            return Ok(None);
+        }
         // 走査で見つからなかった `source='local'` の行（`path` が NULL の行も、現行は消す）
         for (path, row) in existing.drain() {
             if row.source == "local" && !seen.contains(path.as_str()) {
@@ -371,44 +407,78 @@ impl IndexLocal {
     }
 }
 
-/// 書き込み: 追加・更新・削除を 1 つのトランザクションで。
+/// 計画を `conn` に 1 つのトランザクションで書く。確定したら `true`。**確定の前に**停止の合図が来たら
+/// （始めるとき・[`STOP_CHECK_EVERY`] 件ごと・`COMMIT` の直前）何も変えずに `false`（`ROLLBACK`）。
+/// writer の接続と、dry-run の写し（[`crate::sync::simulation_copy`]）が同じ関数を通る。
+fn write_plan(
+    conn: &Connection,
+    now: &str,
+    ops: &[Op],
+    delete_ids: &[i64],
+    stopped: Stopped<'_>,
+) -> rusqlite::Result<bool> {
+    if stopped() {
+        return Ok(false);
+    }
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO photos(source, path, name, mtime, taken_at, lat, lon, loc_source, indexed_at)
+             VALUES('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )?;
+        let mut update = tx.prepare(
+            "UPDATE photos SET mtime=?1, taken_at=?2, lat=?3, lon=?4, loc_source=?5,
+             place=NULL, elev=NULL, display=NULL, indexed_at=?6 WHERE path=?7",
+        )?;
+        let mut delete = tx.prepare("DELETE FROM photos WHERE id=?1")?;
+        let steps = ops.len() + delete_ids.len();
+        for i in 0..steps {
+            if i % STOP_CHECK_EVERY == STOP_CHECK_EVERY - 1 && stopped() {
+                return Ok(false); // `tx` は確定せずに drop される（ROLLBACK）
+            }
+            match ops.get(i) {
+                Some(Op::Insert(e)) => insert.execute(params![
+                    e.rel,
+                    e.name,
+                    e.mtime,
+                    e.taken_at,
+                    e.lat,
+                    e.lon,
+                    e.loc_source,
+                    now
+                ])?,
+                Some(Op::Update(e)) => update.execute(params![
+                    e.mtime,
+                    e.taken_at,
+                    e.lat,
+                    e.lon,
+                    e.loc_source,
+                    now,
+                    e.rel
+                ])?,
+                None => delete.execute([delete_ids[i - ops.len()]])?,
+            };
+        }
+    }
+    if stopped() {
+        tx.rollback()?;
+        return Ok(false);
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// 書き込み: 追加・更新・削除を writer の 1 回の呼び出しで、1 つのトランザクションに。確定したら `true`。
 fn apply_plan(
     writer: &crate::writer::Writer,
     now: String,
     ops: &[Op],
     delete_ids: Vec<i64>,
-) -> Result<(), StageError> {
+    stopped: impl Fn() -> bool + Send + 'static,
+) -> Result<bool, StageError> {
     // `Writer::call` の閉包は `'static`。計画は読み取り専用で使い回す（件数・ログ用）ので、書く分を写す
-    let ops: Vec<Op> = ops.iter().map(Op::clone_for_write).collect();
-    writer.call(move |conn| {
-        let tx = conn.transaction()?;
-        {
-            let mut insert = tx.prepare(
-                "INSERT INTO photos(source, path, name, mtime, taken_at, lat, lon, loc_source, indexed_at)
-                 VALUES('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            )?;
-            let mut update = tx.prepare(
-                "UPDATE photos SET mtime=?1, taken_at=?2, lat=?3, lon=?4, loc_source=?5,
-                 place=NULL, elev=NULL, display=NULL, indexed_at=?6 WHERE path=?7",
-            )?;
-            for op in &ops {
-                match op {
-                    Op::Insert(e) => insert.execute(params![
-                        e.rel, e.name, e.mtime, e.taken_at, e.lat, e.lon, e.loc_source, now
-                    ])?,
-                    Op::Update(e) => update.execute(params![
-                        e.mtime, e.taken_at, e.lat, e.lon, e.loc_source, now, e.rel
-                    ])?,
-                };
-            }
-            let mut delete = tx.prepare("DELETE FROM photos WHERE id=?1")?;
-            for id in &delete_ids {
-                delete.execute([id])?;
-            }
-        }
-        tx.commit()
-    })?;
-    Ok(())
+    let ops = ops.to_vec();
+    Ok(writer.call(move |conn| write_plan(conn, &now, &ops, &delete_ids, &stopped))?)
 }
 
 /// 消した行の derivative を消す（行を消したあと）。`display` が `derivatives/` で始まるものだけ。
@@ -459,26 +529,32 @@ fn index_counts(plan: &Plan, scan: &Scan, removed_files: (u64, u64, u64)) -> Cou
     ])
 }
 
-impl Stage for IndexLocal {
-    fn name(&self) -> &'static str {
-        "index_local"
-    }
-
-    fn run(&self, ctx: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
+impl IndexLocal {
+    /// 段の本体。停止の合図の確認を `stopped` で受ける（試験で来る時点を指定できるように）。
+    ///
+    /// 停止の合図は、行・ファイルを**変える前**にしか効かない: 走査中・計画の完了時・書き込みの始めと
+    /// `COMMIT` の直前。確定したあとの derivative のファイル消しは、行がもう無く後から拾えないので、
+    /// 合図が来ても最後まで行う。
+    fn run_with(
+        ctx: &StageCtx<'_>,
+        stopped: impl Fn() -> bool + Send + 'static,
+    ) -> Result<StageOutcome, StageError> {
         let data = DataDir::open(&ctx.config.data_dir)?;
-        let Some(photos) = photos_root(ctx, &data)? else {
-            // dry-run で置き場がまだ無い: 写真は 0 枚
-            return Ok(StageOutcome::Done(index_counts(
-                &Plan::default(),
-                &Scan::default(),
-                (0, 0, 0),
-            )));
-        };
-        let Some((plan, scan)) = Self::plan(ctx, &data, &photos)? else {
-            return Ok(StageOutcome::Skipped("停止の合図で中断しました"));
+        let photos = photos_root(ctx, &data)?;
+        let Some((plan, scan)) = Self::plan(ctx, &data, photos.as_deref(), &stopped)? else {
+            return Ok(StageOutcome::Skipped(STOPPED));
         };
         let mut files_removed = (0, 0, 0);
         if ctx.is_dry_run() {
+            // 実 DB の写し（`ctx.read`。[`crate::sync::simulation_copy`]）に計画を適用して、後続の段に
+            // 索引後の状態を見せる。実行と同じ書き込み関数を通る
+            if !plan.ops.is_empty() || !plan.deletes.is_empty() {
+                let now = crate::sysinfo::local_isoformat();
+                let ids: Vec<i64> = plan.deletes.iter().map(|(id, _)| *id).collect();
+                write_plan(ctx.read, &now, &plan.ops, &ids, &|| false).map_err(|e| {
+                    StageError::text(format!("dry-run の写しに計画を適用できません: {e}"))
+                })?;
+            }
             files_removed = remove_derivatives(&data, &plan.deletes, true);
         } else if !plan.ops.is_empty() || !plan.deletes.is_empty() {
             let writer = ctx.writer()?;
@@ -486,7 +562,9 @@ impl Stage for IndexLocal {
             let now = crate::sysinfo::local_isoformat();
             let ids = plan.deletes.iter().map(|(id, _)| *id).collect();
             // 行を消して確定してから、そのファイルを消す（先にファイルを消して失敗すると、行だけが残る）
-            apply_plan(writer, now, &plan.ops, ids)?;
+            if !apply_plan(writer, now, &plan.ops, ids, stopped)? {
+                return Ok(StageOutcome::Skipped(STOPPED));
+            }
             files_removed = remove_derivatives(&data, &plan.deletes, false);
         }
         Ok(StageOutcome::Done(index_counts(
@@ -494,6 +572,17 @@ impl Stage for IndexLocal {
             &scan,
             files_removed,
         )))
+    }
+}
+
+impl Stage for IndexLocal {
+    fn name(&self) -> &'static str {
+        "index_local"
+    }
+
+    fn run(&self, ctx: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
+        let stop = ctx.stop.clone();
+        Self::run_with(ctx, move || stop.is_stopped())
     }
 }
 
@@ -531,21 +620,11 @@ impl Stage for LocalDerivatives {
                 ("icc_dropped", 0),
             ])));
         }
-        if ctx.is_dry_run() {
-            for (_, path) in &rows {
-                if imaging::is_browser_displayable_ext(Path::new(path)) {
-                    original += 1;
-                } else {
-                    made += 1;
-                }
-            }
-            return Ok(StageOutcome::Done(Counts(vec![
-                ("original", original),
-                ("made", made),
-            ])));
-        }
+        // dry-run もパスの検査・件数の数え方は実行と同じ。違うのは、derivative を作らない（変換の失敗と
+        // ICC の件数は分からない）ことと、書き込み先が実 DB でなく `ctx.read`（写し）であること
+        let dry_run = ctx.is_dry_run();
         let data = DataDir::open(&ctx.config.data_dir)?;
-        let writer = ctx.writer()?;
+        let writer = if dry_run { None } else { Some(ctx.writer()?) };
         for (id, path) in rows {
             if ctx.stop.is_stopped() {
                 break;
@@ -559,6 +638,10 @@ impl Stage for LocalDerivatives {
                 // ブラウザがそのまま表示できるので原本を使う
                 original += 1;
                 path
+            } else if dry_run {
+                // 成功するものとして数える
+                made += 1;
+                format!("derivatives/{}", local_derivative_name(&path))
             } else {
                 match imaging::store_derivative(&data, &src, &local_derivative_name(&path), 0) {
                     Ok(stored) => {
@@ -577,12 +660,20 @@ impl Stage for LocalDerivatives {
                 }
             };
             let now = crate::sysinfo::local_isoformat();
-            writer.call(move |conn| {
-                conn.execute(
-                    "UPDATE photos SET display=?1, fetched_at=?2 WHERE id=?3",
-                    params![display, now, id],
-                )
-            })?;
+            const SET_DISPLAY: &str = "UPDATE photos SET display=?1, fetched_at=?2 WHERE id=?3";
+            match writer {
+                Some(writer) => {
+                    writer
+                        .call(move |conn| conn.execute(SET_DISPLAY, params![display, now, id]))?;
+                }
+                None => {
+                    ctx.read
+                        .execute(SET_DISPLAY, params![display, now, id])
+                        .map_err(|e| {
+                            StageError::text(format!("dry-run の写しに書けません: {e}"))
+                        })?;
+                }
+            }
         }
         Ok(StageOutcome::Done(Counts(vec![
             ("original", original),
@@ -629,22 +720,41 @@ fn destination_candidates(name: &str) -> impl Iterator<Item = String> + '_ {
     std::iter::once(name.to_string()).chain((2..=1000).map(move |n| format!("{stem} ({n}){ext}")))
 }
 
-/// `src` を `dest_dir` の下へ**上書きせずに**移す。成功したら移し先の名前の有無だけ返す。
+/// `src` を `dest_dir` の下へ**上書きせずに**移す。
+///
 /// ハードリンクを作ってから元を消す（`link` は既にあるときに失敗するので、同名のファイルを壊さない）。
 /// リンクを作れない FS では、無いことを確かめてから `rename` する。
+///
+/// - 元の削除に失敗したら、作ったリンクを取り消す（リンクが残ったまま行も残ると、再実行のたびに
+///   `(2)`・`(3)` が増える）。
+/// - 取り消しにも失敗して残ったリンクは、次の実行で**同じ inode の名前が退避先にあれば**それを使い、
+///   リンクを重ねずに元だけ消す（同じ実体への名前なので、中身は退避先に残る）。
 fn move_without_overwrite(src: &Path, dest_dir: &Path, name: &str) -> io::Result<()> {
+    let src_meta = fs::symlink_metadata(src)?;
     for candidate in destination_candidates(name) {
         let dest = dest_dir.join(candidate);
-        match fs::hard_link(src, &dest) {
-            Ok(()) => return fs::remove_file(src),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(_) => {
-                // リンクを作れない（FS の都合）: 無いことを確かめてから rename
-                if fs::symlink_metadata(&dest).is_ok() {
-                    continue;
+        match fs::symlink_metadata(&dest) {
+            Ok(existing) => {
+                if existing.is_file()
+                    && (existing.dev(), existing.ino()) == (src_meta.dev(), src_meta.ino())
+                {
+                    return fs::remove_file(src);
                 }
-                return fs::rename(src, &dest);
+                continue;
             }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        match fs::hard_link(src, &dest) {
+            Ok(()) => {
+                return fs::remove_file(src).inspect_err(|_| {
+                    // 元を消せなかった: 退避先のリンクを取り消す。これも失敗したら次の実行が再利用する
+                    let _ = fs::remove_file(&dest);
+                });
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            // リンクを作れない（FS の都合）: 無いことは確かめた。rename する
+            Err(_) => return fs::rename(src, &dest),
         }
     }
     Err(io::Error::new(
@@ -653,9 +763,9 @@ fn move_without_overwrite(src: &Path, dest_dir: &Path, name: &str) -> io::Result
     ))
 }
 
-/// 移動先 `DATA_DIR/_excluded/no_gps` を用意する。階層を 1 つずつ見て、リンクを経由していたら
-/// （`DATA_DIR` の外へ出るおそれがあるので）何も作らずに断る。
-fn excluded_dir(data: &DataDir) -> Result<PathBuf, StageError> {
+/// 移動先 `DATA_DIR/_excluded/no_gps` のパス。階層を 1 つずつ見て、リンクを経由していたら（`DATA_DIR` の
+/// 外へ出るおそれがあるので）何も作らずに断る。`create` のときだけ、無い階層を作る（見てから作る）。
+fn excluded_dir(data: &DataDir, create: bool) -> Result<PathBuf, StageError> {
     let mut dir = data.root().to_path_buf();
     for part in EXCLUDED_DIR.split('/') {
         dir.push(part);
@@ -666,15 +776,48 @@ fn excluded_dir(data: &DataDir) -> Result<PathBuf, StageError> {
                     "移動先の _excluded/no_gps がディレクトリではない（リンクを含む）",
                 ));
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => fs::create_dir(&dir)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                if !create {
+                    // 無い階層の下は、これから作るもの（リンクではない）
+                    return Ok(data.root().join(EXCLUDED_DIR));
+                }
+                fs::create_dir(&dir)?;
+            }
             Err(e) => return Err(e.into()),
         }
     }
     Ok(dir)
 }
 
+/// 候補 1 件の扱い。
+enum Action {
+    /// 通常のファイル: 移す（絶対パス）。
+    Move(PathBuf),
+    /// ファイルが無い: 行だけ消す（現行と同じ）。
+    RowOnly,
+    /// リンク・ディレクトリ・`DATA_DIR` の外へ出るパス: 動かさず、行も残す。
+    Skip,
+    /// 調べられない（権限など）: 動かさず、行も残す。
+    Fail,
+}
+
+fn classify(data: &DataDir, path: &str) -> Action {
+    let entry = match data.entry_path(path) {
+        Ok(entry) => entry,
+        Err(PathError::Io(io::ErrorKind::NotFound)) => return Action::RowOnly,
+        Err(_) => return Action::Skip,
+    };
+    match fs::symlink_metadata(&entry) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Action::RowOnly,
+        Err(_) => Action::Fail,
+        // 通常のファイルだけ移す（リンク・ディレクトリは動かさない）
+        Ok(meta) if meta.is_file() => Action::Move(entry),
+        Ok(_) => Action::Skip,
+    }
+}
+
 /// `geoframe organize` の本体（`index_local` を済ませたあとで呼ぶ）。位置の無い写真を `_excluded/no_gps/` へ
-/// 移して行を削除する。`--dry-run` は件数だけ。
+/// 移して行を削除する。`--dry-run` は同じ分類（[`classify`]）で件数だけを出し、何も動かさない。
 pub fn organize(ctx: &StageCtx<'_>) -> Result<Counts, StageError> {
     let data = DataDir::open(&ctx.config.data_dir)?;
     let candidates: Vec<(i64, String)> = {
@@ -686,55 +829,44 @@ pub fn organize(ctx: &StageCtx<'_>) -> Result<Counts, StageError> {
         .read
         .query_row(ALL_UNLOCATED_SQL, [], |row| row.get(0))?;
     let held_back = (unlocated as u64).saturating_sub(candidates.len() as u64);
-    if ctx.is_dry_run() || candidates.is_empty() {
-        return Ok(Counts(vec![
-            ("targets", candidates.len() as u64),
-            ("held_back_until_infer", held_back),
-        ]));
-    }
-    let writer = ctx.writer()?;
-    let dest_dir = excluded_dir(&data)?;
+    let dry_run = ctx.is_dry_run();
     let (mut moved, mut gone, mut skipped, mut failed) = (0u64, 0u64, 0u64, 0u64);
-    for (id, path) in candidates {
-        if ctx.stop.is_stopped() {
-            break;
-        }
-        let entry = match data.entry_path(&path) {
-            Ok(entry) => Some(entry),
-            Err(PathError::Io(io::ErrorKind::NotFound)) => None,
-            Err(_) => {
-                skipped += 1;
-                continue;
+    if !candidates.is_empty() {
+        let writer = if dry_run { None } else { Some(ctx.writer()?) };
+        let dest_dir = excluded_dir(&data, !dry_run)?;
+        for (id, path) in candidates {
+            if ctx.stop.is_stopped() {
+                break;
             }
-        };
-        let meta = entry.as_deref().map(fs::symlink_metadata);
-        match meta {
-            // ファイルが無い: 現行と同じく行だけ消す
-            None => gone += 1,
-            Some(Err(e)) if e.kind() == io::ErrorKind::NotFound => gone += 1,
-            Some(Err(_)) => {
-                failed += 1;
-                continue;
-            }
-            // 通常のファイルだけ移す（リンク・ディレクトリは動かさない）
-            Some(Ok(meta)) if meta.is_file() => {
-                let name = Path::new(&path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                let src = entry.as_deref().unwrap_or(Path::new(""));
-                if move_without_overwrite(src, &dest_dir, name).is_err() {
+            match classify(&data, &path) {
+                Action::Fail => {
                     failed += 1;
                     continue;
                 }
-                moved += 1;
+                Action::Skip => {
+                    skipped += 1;
+                    continue;
+                }
+                Action::RowOnly => gone += 1,
+                Action::Move(src) => {
+                    // dry-run は移せるものとして数える（権限・名前の使い切りは試さない）
+                    if !dry_run {
+                        let name = Path::new(&path)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or_default();
+                        if move_without_overwrite(&src, &dest_dir, name).is_err() {
+                            failed += 1;
+                            continue;
+                        }
+                    }
+                    moved += 1;
+                }
             }
-            Some(Ok(_)) => {
-                skipped += 1;
-                continue;
+            if let Some(writer) = writer {
+                writer.call(move |conn| conn.execute("DELETE FROM photos WHERE id=?1", [id]))?;
             }
         }
-        writer.call(move |conn| conn.execute("DELETE FROM photos WHERE id=?1", [id]))?;
     }
     Ok(Counts(vec![
         ("targets", moved + gone + skipped + failed),

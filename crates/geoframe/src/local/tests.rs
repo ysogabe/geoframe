@@ -7,9 +7,11 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use base64::Engine;
+use rusqlite::Connection;
 
 use super::*;
 use crate::cache::Cache;
@@ -102,8 +104,18 @@ impl Setup {
         path
     }
 
+    /// 段に渡す読み取り用の接続。実行は読み取り専用の接続、dry-run は実 DB のメモリ上の写し
+    /// （`cli.rs` と同じ）。
+    fn read_for(&self, mode: Mode) -> Connection {
+        let real = crate::db::open_read_only(&self.config.db_path()).unwrap();
+        match mode {
+            Mode::Apply => real,
+            Mode::DryRun => crate::sync::simulation_copy(&real).unwrap(),
+        }
+    }
+
     fn run_with(&self, stage: &dyn Stage, mode: Mode, stop: &StopFlag) -> StageResult {
-        let read = crate::db::open_read_only(&self.config.db_path()).unwrap();
+        let read = self.read_for(mode);
         let http = crate::net::agent();
         let ctx = StageCtx {
             mode,
@@ -121,6 +133,38 @@ impl Setup {
         }
     }
 
+    /// `read` を段の読み取り用の接続にして `f` を呼ぶ（dry-run で複数の段が同じ写しを共有するため）。
+    fn with_ctx<R>(
+        &self,
+        mode: Mode,
+        read: &Connection,
+        stop: &StopFlag,
+        f: impl FnOnce(&StageCtx<'_>) -> R,
+    ) -> R {
+        let http = crate::net::agent();
+        let ctx = StageCtx {
+            mode,
+            config: &self.config,
+            read,
+            writer: (mode == Mode::Apply).then_some(&self.writer),
+            cache: &self.cache,
+            http: &http,
+            stop,
+        };
+        f(&ctx)
+    }
+
+    /// 停止の合図が `n` 回目の確認で来るものとして、`index_local` を実行する。確認の回数も返す。
+    fn index_stopping_at(&self, n: usize) -> (Result<StageOutcome, StageError>, usize) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&calls);
+        let read = self.read_for(Mode::Apply);
+        let result = self.with_ctx(Mode::Apply, &read, &StopFlag::new(), |ctx| {
+            IndexLocal::run_with(ctx, move || counter.fetch_add(1, Ordering::SeqCst) + 1 >= n)
+        });
+        (result, calls.load(Ordering::SeqCst))
+    }
+
     fn run(&self, stage: &dyn Stage) -> Counts {
         match self.run_with(stage, Mode::Apply, &StopFlag::new()) {
             StageResult::Done(counts) => counts,
@@ -136,7 +180,7 @@ impl Setup {
     }
 
     fn organize(&self, mode: Mode) -> Counts {
-        let read = crate::db::open_read_only(&self.config.db_path()).unwrap();
+        let read = self.read_for(mode);
         let http = crate::net::agent();
         let stop = StopFlag::new();
         let ctx = StageCtx {
@@ -930,4 +974,471 @@ fn 退避先がリンクを経由するなら動かさない() {
     assert!(s.root().join("photos/a.jpg").exists());
     assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
     assert_eq!(s.paths(), ["photos/a.jpg"]);
+}
+
+// ---------------------------------------------------------------- レビュー指摘（T2.3 の再レビュー）
+
+/// `DATA_DIR` の下のファイルを `(相対パス, サイズ)` で（DB のファイルは除く）。
+fn tree(root: &Path) -> Vec<(String, u64)> {
+    fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let rel = entry
+                .path()
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let meta = fs::symlink_metadata(entry.path()).unwrap();
+            if meta.is_dir() {
+                out.push((format!("{rel}/"), 0));
+                walk(root, &entry.path(), out);
+            } else if !rel.starts_with("catalog.db") {
+                out.push((rel, meta.len()));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, root, &mut out);
+    out.sort();
+    out
+}
+
+/// 写真を 1 枚索引して derivative の行を作り、写真のディレクトリごと消した状態にする。
+fn setup_with_vanished_photos(tag: &str) -> Setup {
+    let s = setup(tag);
+    s.put("photos/a.jpg", &jpeg_gps(), T0);
+    s.run(&IndexLocal);
+    s.sql("UPDATE photos SET display='derivatives/d.jpg'");
+    fs::create_dir_all(s.root().join("derivatives")).unwrap();
+    fs::write(s.root().join("derivatives/d.jpg"), b"d").unwrap();
+    fs::remove_dir_all(s.root().join("photos")).unwrap();
+    s
+}
+
+#[test]
+fn 写真の置き場が無くてもdry_runは削除を数え_実行と同じ件数になる() {
+    let dry_side = setup_with_vanished_photos("local-vanished-dry");
+    let rows = dry_side.rows();
+    let files = tree(dry_side.root());
+    let dry = dry_side.dry_run(&IndexLocal);
+    assert_eq!(
+        (
+            get(&dry, "files"),
+            get(&dry, "removed"),
+            get(&dry, "derivative_files_removed")
+        ),
+        (0, 1, 1),
+        "{dry}"
+    );
+    // dry-run は何も変えない（置き場も作らない）
+    assert_eq!(dry_side.rows(), rows);
+    assert_eq!(tree(dry_side.root()), files);
+    assert!(!dry_side.root().join("photos").exists());
+
+    // 同じ状態に実行すると、同じ件数。置き場は作られ、行と derivative が消える
+    let apply_side = setup_with_vanished_photos("local-vanished-apply");
+    let applied = apply_side.run(&IndexLocal);
+    assert_eq!(applied, dry);
+    assert!(apply_side.root().join("photos").is_dir());
+    assert!(apply_side.rows().is_empty());
+    assert!(!apply_side.root().join("derivatives/d.jpg").exists());
+}
+
+#[test]
+fn 写真が0枚で停止の合図が来ていても行を消さない() {
+    let s = setup("local-stop-empty");
+    s.put("photos/a.jpg", &jpeg_gps(), T0);
+    s.run(&IndexLocal);
+    s.sql("UPDATE photos SET display='derivatives/d.jpg'");
+    fs::create_dir_all(s.root().join("derivatives")).unwrap();
+    fs::write(s.root().join("derivatives/d.jpg"), b"d").unwrap();
+    fs::remove_file(s.root().join("photos/a.jpg")).unwrap(); // 置き場はあるが 0 枚
+    let before = s.rows();
+    let stop = StopFlag::new();
+    stop.stop();
+    let result = s.run_with(&IndexLocal, Mode::Apply, &stop);
+    assert!(matches!(result, StageResult::Skipped(_)), "{result:?}");
+    assert_eq!(s.rows(), before);
+    assert!(s.root().join("derivatives/d.jpg").exists());
+}
+
+/// 停止の合図が 1 回目、2 回目、… の確認で来たとき、どの時点でも「何も変えない」か「全部やった」
+/// のどちらかになる（途中までの削除・書き込みが残らない）。
+#[test]
+fn 停止の合図はどの確認点で来ても確定の前なら何も変えない() {
+    let build = |tag: &str| {
+        let s = setup(tag);
+        s.put("photos/old.jpg", &jpeg_gps(), T0);
+        s.put("photos/keep.jpg", &jpeg_gps(), T0);
+        s.run(&IndexLocal);
+        s.sql("UPDATE photos SET display='derivatives/old.jpg' WHERE path='photos/old.jpg'");
+        fs::create_dir_all(s.root().join("derivatives")).unwrap();
+        fs::write(s.root().join("derivatives/old.jpg"), b"d").unwrap();
+        fs::remove_file(s.root().join("photos/old.jpg")).unwrap(); // 削除 1
+        s.put("photos/keep.jpg", &jpeg_plain(), T0 + 50); // 更新 1
+        s.put("photos/new1.jpg", &jpeg_gps(), T0); // 追加 2
+        s.put("photos/new2.jpg", &jpeg_gps(), T0);
+        s
+    };
+    let mut skipped = 0;
+    for n in 1..=40 {
+        let s = build(&format!("local-stop-sweep-{n}"));
+        let (rows, files) = (s.rows(), tree(s.root()));
+        let (result, calls) = s.index_stopping_at(n);
+        match result.unwrap() {
+            StageOutcome::Skipped(_) => {
+                skipped += 1;
+                assert_eq!(s.rows(), rows, "n={n}: 行が変わった");
+                assert_eq!(tree(s.root()), files, "n={n}: ファイルが変わった");
+                assert_eq!(calls, n, "n={n}: 合図の後にも確認が続いた");
+            }
+            StageOutcome::Done(counts) => {
+                assert_eq!(
+                    (
+                        get(&counts, "added"),
+                        get(&counts, "updated"),
+                        get(&counts, "removed")
+                    ),
+                    (2, 1, 1),
+                    "n={n}"
+                );
+                assert!(!s.root().join("derivatives/old.jpg").exists(), "n={n}");
+                break;
+            }
+        }
+    }
+    // 確認点: 走査（ディレクトリ 1）・写真ごと（3）・計画の完了・書き込みの始め・COMMIT の直前
+    assert_eq!(skipped, 7);
+}
+
+#[test]
+fn 書き込みの途中でも停止の合図が来たら戻して確定しない() {
+    let s = setup("local-stop-write");
+    s.put("photos/a.jpg", &jpeg_gps(), T0);
+    s.run(&IndexLocal);
+    let before = s.rows();
+    let entry = |i: usize| Entry {
+        rel: format!("photos/gen{i}.jpg"),
+        name: format!("gen{i}.jpg"),
+        mtime: 1.0,
+        taken_at: String::new(),
+        lat: None,
+        lon: None,
+        loc_source: None,
+    };
+    // 300 件の追加と既存の行の削除。1 回目（始め）は通り、2 回目（256 件目）で合図が来る
+    let ops: Vec<Op> = (0..300).map(|i| Op::Insert(entry(i))).collect();
+    let id = before[0].id;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let committed = apply_plan(
+        &s.writer,
+        "2024-01-01T00:00:00".into(),
+        &ops,
+        vec![id],
+        move || counter.fetch_add(1, Ordering::SeqCst) + 1 >= 2,
+    )
+    .unwrap();
+    assert!(!committed);
+    assert_eq!(s.rows(), before);
+    // 合図が来なければ全部確定する
+    let committed = apply_plan(
+        &s.writer,
+        "2024-01-01T00:00:00".into(),
+        &ops,
+        vec![id],
+        || false,
+    )
+    .unwrap();
+    assert!(committed);
+    assert_eq!(s.rows().len(), 300);
+}
+
+#[test]
+fn 置き場の親がdata_dirの外なら_作る前に断り外には何も作らない() {
+    let outside = TempDir::new("local-photos-outside");
+    // 絶対パスで、まだ無い外のディレクトリ
+    let absolute = outside.path().join("newdir");
+    // `..` を経由する
+    let unique = format!("geoframe-photos-escape-{}", std::process::id());
+    let dotdot = format!("../{unique}");
+    // 外へのリンクを経由する
+    let via_link = "link/newdir".to_string();
+    for (value, created) in [
+        (absolute.to_str().unwrap().to_string(), absolute.clone()),
+        (dotdot, outside.path().join("never")), // 下で別に確かめる
+        (via_link, outside.path().join("newdir")),
+    ] {
+        for mode in [Mode::Apply, Mode::DryRun] {
+            let s = setup_with("local-photos-escape", &[("GEOFRAME_PHOTOS_DIR", &value)]);
+            symlink(outside.path(), s.root().join("link")).unwrap();
+            let escaped = s.root().join("..").join(&unique);
+            let result = s.run_with(&IndexLocal, mode, &StopFlag::new());
+            match result {
+                StageResult::Failed(message) => {
+                    assert!(message.contains("GEOFRAME_PHOTOS_DIR"), "{message}");
+                }
+                other => panic!("{value} {mode:?}: {other:?}"),
+            }
+            assert!(!created.exists(), "{value} {mode:?}: 外にできた");
+            assert!(!escaped.exists(), "{value} {mode:?}: 外にできた");
+            assert!(s.rows().is_empty());
+        }
+    }
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn 置き場の親が無ければ作らずに失敗する() {
+    // 作るのは最後の 1 階層だけ（現行の `mkdir` と同じ）
+    let s = setup_with("local-photos-noparent", &[("GEOFRAME_PHOTOS_DIR", "a/b")]);
+    let result = s.run_with(&IndexLocal, Mode::Apply, &StopFlag::new());
+    assert!(matches!(result, StageResult::Failed(_)), "{result:?}");
+    assert!(!s.root().join("a").exists());
+}
+
+// ---------------------------------------------------------------- dry-run の後続段
+
+/// 索引済みの位置ありの HEIC が 1 枚あるところへ、新しい位置ありの JPEG と位置なしの HEIC を足した状態。
+fn sequence_state(tag: &str) -> Setup {
+    let s = setup(tag);
+    index_with_location(&s, &[("photos/h.heic", heic())]);
+    s.put("photos/a.jpg", &jpeg_gps(), T0);
+    s.put("photos/n.heic", &heic(), T0);
+    s
+}
+
+/// `index_local` → `local_derivatives` → `organize` を 1 回ずつ。dry-run は 3 つが同じ写しを共有する。
+fn run_sequence(s: &Setup, mode: Mode) -> (Counts, Counts, Counts) {
+    let read = s.read_for(mode);
+    let stop = StopFlag::new();
+    s.with_ctx(mode, &read, &stop, |ctx| {
+        let done = |outcome: StageOutcome| match outcome {
+            StageOutcome::Done(counts) => counts,
+            other => panic!("{other:?}"),
+        };
+        let index = done(IndexLocal.run(ctx).unwrap());
+        let derivatives = done(LocalDerivatives.run(ctx).unwrap());
+        let organized = organize(ctx).unwrap();
+        (index, derivatives, organized)
+    })
+}
+
+#[test]
+fn dry_runの後続段は索引後の状態で数え_実行と同じ件数になる() {
+    let dry_side = sequence_state("local-seq-dry");
+    let (rows, files) = (dry_side.rows(), tree(dry_side.root()));
+    let dry = run_sequence(&dry_side, Mode::DryRun);
+    // 何も変えない
+    assert_eq!(dry_side.rows(), rows);
+    assert_eq!(tree(dry_side.root()), files);
+
+    let apply_side = sequence_state("local-seq-apply");
+    let applied = run_sequence(&apply_side, Mode::Apply);
+    assert_eq!(dry.0, applied.0, "index_local");
+    assert_eq!(dry.1, applied.1, "local_derivatives");
+    assert_eq!(dry.2, applied.2, "organize");
+    // 索引で増える行が後続の対象になっている（索引前の状態なら 0 件になる数）
+    assert_eq!(get(&dry.0, "added"), 2);
+    assert_eq!((get(&dry.1, "original"), get(&dry.1, "made")), (1, 1));
+    assert_eq!((get(&dry.2, "targets"), get(&dry.2, "moved")), (1, 1));
+}
+
+#[test]
+fn derivativeのdry_runもパスを検査し_存在しないものはfailedに数える() {
+    let s = setup("local-deriv-dry-missing");
+    s.sql(
+        "INSERT INTO photos(source, path, name, lat, lon) VALUES
+         ('local','photos/missing.jpg','missing.jpg',1.0,2.0),
+         ('local','../x.heic','x.heic',1.0,2.0)",
+    );
+    let dry = s.dry_run(&LocalDerivatives);
+    assert_eq!(
+        (
+            get(&dry, "original"),
+            get(&dry, "made"),
+            get(&dry, "failed")
+        ),
+        (0, 0, 2),
+        "{dry}"
+    );
+    assert_eq!(s.run(&LocalDerivatives), dry);
+}
+
+#[test]
+fn organizeのdry_runも実行と同じ分類で数える() {
+    let s = setup("local-organize-dry-classes");
+    s.put("photos/gone.jpg", &jpeg_plain(), T0);
+    s.put("photos/link.jpg", &jpeg_plain(), T0);
+    s.put("photos/move.jpg", &jpeg_plain(), T0);
+    s.run(&IndexLocal);
+    fs::remove_file(s.root().join("photos/gone.jpg")).unwrap();
+    fs::remove_file(s.root().join("photos/link.jpg")).unwrap();
+    s.put("photos/real.bin", b"x", T0);
+    symlink(
+        s.root().join("photos/real.bin"),
+        s.root().join("photos/link.jpg"),
+    )
+    .unwrap();
+    let files = tree(s.root());
+    let dry = s.organize(Mode::DryRun);
+    assert_eq!(tree(s.root()), files);
+    assert!(!s.root().join("_excluded").exists());
+    assert_eq!(s.organize(Mode::Apply), dry);
+    assert_eq!(
+        (
+            get(&dry, "moved"),
+            get(&dry, "row_only_removed"),
+            get(&dry, "skipped")
+        ),
+        (1, 1, 1)
+    );
+}
+
+// ---------------------------------------------------------------- organize の途中失敗
+
+/// 子ディレクトリのパーミッションを、drop で（パニックしても）戻す。
+struct Restore(PathBuf);
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+fn names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<_> = fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn 元の削除に失敗したら退避先のリンクを取り消し_再実行で増えない() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = setup("local-organize-ro");
+    s.put("photos/ro/x.jpg", &jpeg_plain(), T0);
+    s.run(&IndexLocal);
+    let ro = s.root().join("photos/ro");
+    let _restore = Restore(ro.clone());
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+    if fs::File::create(ro.join("probe")).is_ok() {
+        return; // root など、パーミッションが効かない環境では確かめられない
+    }
+    let dest = s.root().join("_excluded/no_gps");
+    for _ in 0..3 {
+        let counts = s.organize(Mode::Apply);
+        assert_eq!((get(&counts, "failed"), get(&counts, "moved")), (1, 0));
+        assert_eq!(s.paths(), ["photos/ro/x.jpg"]);
+        assert!(ro.join("x.jpg").exists());
+        // リンクを残さない（残ると `(2)`・`(3)` と増える）
+        assert!(names(&dest).is_empty(), "{:?}", names(&dest));
+    }
+    // 権限を直せば、同じ名前で移せる
+    fs::set_permissions(&ro, fs::Permissions::from_mode(0o755)).unwrap();
+    let counts = s.organize(Mode::Apply);
+    assert_eq!(get(&counts, "moved"), 1);
+    assert_eq!(names(&dest), ["x.jpg"]);
+    assert!(s.rows().is_empty());
+}
+
+#[test]
+fn 取り消せずに残ったリンクは重ねずに再利用する() {
+    let s = setup("local-organize-leftover");
+    let src = s.put("photos/x.jpg", &jpeg_plain(), T0);
+    s.run(&IndexLocal);
+    // 前回、リンクを作ったあとで元を消せず、リンクの取り消しにも失敗した状態
+    let dest = s.root().join("_excluded/no_gps");
+    fs::create_dir_all(&dest).unwrap();
+    fs::hard_link(&src, dest.join("x.jpg")).unwrap();
+    let counts = s.organize(Mode::Apply);
+    assert_eq!((get(&counts, "moved"), get(&counts, "failed")), (1, 0));
+    assert_eq!(names(&dest), ["x.jpg"]);
+    assert!(!src.exists());
+    assert!(s.rows().is_empty());
+}
+
+#[test]
+fn 同名の別のファイルがあれば別名にし_残ったリンクは別名の側で再利用する() {
+    let s = setup("local-organize-leftover-2");
+    let src = s.put("photos/x.jpg", &jpeg_plain(), T0);
+    s.run(&IndexLocal);
+    let dest = s.root().join("_excluded/no_gps");
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("x.jpg"), b"previous").unwrap();
+    fs::hard_link(&src, dest.join("x (2).jpg")).unwrap();
+    s.organize(Mode::Apply);
+    assert_eq!(names(&dest), ["x (2).jpg", "x.jpg"]);
+    assert_eq!(fs::read(dest.join("x.jpg")).unwrap(), b"previous");
+    assert!(!src.exists());
+}
+
+// ---------------------------------------------------------------- 大量の変更（計測）
+
+/// 大量の追加・更新・削除の所要時間と、停止の合図への応答を測る（`cargo test --release
+/// --lib -- --ignored --nocapture 大量`）。結果は docs/rust-migration/server.md §13.12 に記録した。
+#[test]
+#[ignore = "計測用（件数が多く、時間がかかる）"]
+fn 大量の変更のトランザクションの所要時間と停止への応答を測る() {
+    const N: usize = 10_000;
+    let s = setup("local-bulk");
+    let entry = |i: usize, mtime: f64| Entry {
+        rel: format!("photos/{i:06}.jpg"),
+        name: format!("{i:06}.jpg"),
+        mtime,
+        taken_at: "2024-05-06 07:08".into(),
+        lat: Some(12.5),
+        lon: Some(78.1),
+        loc_source: Some("exif"),
+    };
+    let now = || "2024-01-01T00:00:00".to_string();
+    let timed = |label: &str, ops: Vec<Op>, ids: Vec<i64>| {
+        let start = Instant::now();
+        assert!(apply_plan(&s.writer, now(), &ops, ids, || false).unwrap());
+        eprintln!("{label}: {:?}", start.elapsed());
+    };
+    timed(
+        "10000 件の追加",
+        (0..N).map(|i| Op::Insert(entry(i, 1.0))).collect(),
+        vec![],
+    );
+    timed(
+        "10000 件の更新",
+        (0..N).map(|i| Op::Update(entry(i, 9.0))).collect(),
+        vec![],
+    );
+    // 停止への応答: 更新の途中で合図を出し、合図から戻るまで
+    let flag = Arc::new(AtomicBool::new(false));
+    let raised: Arc<std::sync::Mutex<Option<Instant>>> = Arc::default();
+    let setter = {
+        let (flag, raised) = (Arc::clone(&flag), Arc::clone(&raised));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(3));
+            *raised.lock().unwrap() = Some(Instant::now());
+            flag.store(true, Ordering::SeqCst);
+        })
+    };
+    let ops: Vec<Op> = (0..N).map(|i| Op::Update(entry(i, 20.0))).collect();
+    let checker = Arc::clone(&flag);
+    let committed = apply_plan(&s.writer, now(), &ops, vec![], move || {
+        checker.load(Ordering::SeqCst)
+    })
+    .unwrap();
+    let returned = Instant::now();
+    setter.join().unwrap();
+    let raised = raised.lock().unwrap().unwrap();
+    eprintln!(
+        "停止の合図 → 戻るまで: {:?}（確定した: {committed}）",
+        returned.saturating_duration_since(raised)
+    );
+    assert!(!committed);
+    assert_eq!(s.rows().len(), N);
+    assert!(s.rows().iter().all(|r| r.mtime == Some(9.0)));
+    let ids: Vec<i64> = s.rows().iter().map(|r| r.id).collect();
+    timed("10000 件の削除", vec![], ids);
+    assert!(s.rows().is_empty());
 }

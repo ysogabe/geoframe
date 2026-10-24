@@ -18,8 +18,9 @@
 //! # `--dry-run`
 //!
 //! [`Mode::DryRun`] では**書き込み接続を段に渡さない**（[`StageCtx::writer`] が `None`）。DB への書き込みは
-//! 構造的に起きない。ファイルへの書き込み・ネットワークの副作用（原本のダウンロード、derivative の
-//! 生成、キャッシュの更新）は、各段が [`StageCtx::is_dry_run`] を見て避ける（`Cache` は凍結される）。
+//! 構造的に起きない。`StageCtx::read` は実 DB の**メモリ上の写し**で（[`simulation_copy`]）、先の段が
+//! 自分の計画を写しに適用するので、後の段は「先の段が済んだあと」の状態で件数を数える。
+//! ファイルへの書き込み・ネットワークの副作用（原本のダウンロード、derivative の生成、キャッシュの更新）は、各段が [`StageCtx::is_dry_run`] を見て避ける（`Cache` は凍結される）。
 //! 段は dry-run では「何をするか」を件数にして返す。P2 の受入（取り込み済みの本番コピーに対して
 //! 変更がほぼ 0 であること）は、これで確かめる。
 //!
@@ -67,7 +68,10 @@ pub enum Mode {
 pub struct StageCtx<'a> {
     pub mode: Mode,
     pub config: &'a Config,
-    /// 読み取り専用の接続（サイクルの間だけ有効）。
+    /// 読み取り用の接続（サイクルの間だけ有効）。実行では読み取り専用の接続。**`--dry-run` では実 DB の
+    /// メモリ上の写し**（[`simulation_copy`]）で、先の段が自分の計画を写しに適用して、後の段に
+    /// 「その段が済んだあとの状態」を見せる（実 DB は変わらない）。dry-run の段が写しに書くのは
+    /// このためだけで、実 DB への書き込みは [`StageCtx::writer`] を通る。
     pub read: &'a Connection,
     /// 書き込み接続。`Mode::DryRun` では `None`。
     pub writer: Option<&'a Writer>,
@@ -177,6 +181,17 @@ impl Stage for Placeholder {
     fn run(&self, _ctx: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
         Ok(StageOutcome::Done(Counts::default()))
     }
+}
+
+/// `--dry-run` 用の、実 DB のメモリ上の写し。`read` から SQLite のバックアップ API で作る（実 DB は
+/// 読むだけ）。写しは書ける接続で、段が自分の計画を適用して後続の段に見せるために使う。
+pub fn simulation_copy(read: &Connection) -> rusqlite::Result<Connection> {
+    let mut copy = Connection::open_in_memory()?;
+    {
+        let backup = rusqlite::backup::Backup::new(read, &mut copy)?;
+        backup.run_to_completion(1024, Duration::from_millis(5), None)?;
+    }
+    Ok(copy)
 }
 
 /// 段の一覧（[`STAGE_NAMES`] の順）。T2.4〜T2.6 で、残りの `Placeholder` を中身の入った段に置き換えていく
