@@ -226,7 +226,8 @@ pub fn file_stem(name: &str) -> &str {
 /// Python の `t_epoch`（`datetime.strptime(s, "%Y-%m-%d %H:%M").timestamp()`）に合わせて、
 /// `strptime` が通す形を同じに通す: 月・日・時・分は1〜2桁、日付と時刻のあいだは1つ以上の空白、
 /// 前後に余分な文字は不可、存在しない日付（2月30日・閏年でない年の2月29日・0000年）は不可。
-/// 数字は ASCII のみ（Python は全角数字なども通すが、インデクサは `norm_time` で正規化済み）。
+/// 数字は ASCII のみ（Python は全角数字なども通す。`norm_time` は全角数字を正規化しないので
+/// 差になりうる。P2 の Rust のインデクサで保存時に正規化して解消する。docs/rust-migration/server.md §8.2）。
 ///
 /// 返す秒数は暦だけで数えたもの（タイムゾーンも夏時間も無し）。使い道は2つの時刻の差だけ。
 pub fn parse_epoch(s: &str) -> Option<i64> {
