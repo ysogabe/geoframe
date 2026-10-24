@@ -1618,8 +1618,10 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 **切り戻しの手順**（[plan.md P5](plan.md#p5-切替pr-6)）:
 
 1. Pythonを起動する。`photo_quality`には何もしなくてよい（変化なしのサイクルは結果を保つ）。`algorithm`を書き換える必要も、意味もない。
-2. 「表に出る完全重複の写しが入れ替わる」「Rustの別算法のpHashで結びついた組が、Pythonの値に戻って離れる」のも避けたいときだけ、**切り戻す前に**、Rustが解析した特徴量の行を消す（`photo_quality_features`には印が無いので、Rustへ切り替えた日時以降の`analyzed_at`で選ぶ）: `DELETE FROM photo_quality_features WHERE analyzed_at >= '<Rustへの切替の日時>'`。Pythonが次のサイクルから`GEOFRAME_QUALITY_PER_CYCLE`枚ずつ解析し直し、**未解析が0になるまで前回の`photo_quality`（Rustの結果）を保つ**。全員分そろった時点で、Pythonの算法で再構築する。消さずに切り戻しても壊れない（変化は上の表のとおり）。
-3. 確認: `GET /api/v1/photos`の件数が切り戻しの前後で同じ、`photo_quality`の行数・グループ数が同じ（再構築が走ったあとも）。
+2. **Pythonだけで解析した結果に戻したいときだけ**、**切り戻す前に**、Rustが解析した特徴量の行を消す（`photo_quality_features`には印が無いので、Rustへ切り替えた日時以降の`analyzed_at`で選ぶ）: `DELETE FROM photo_quality_features WHERE analyzed_at >= '<Rustへの切替の日時>'`。Pythonが次のサイクルから`GEOFRAME_QUALITY_PER_CYCLE`枚ずつ解析し直し、**未解析が0になるまで前回の`photo_quality`（Rustの結果）を保つ**。全員分そろった時点で、Pythonの算法で再構築する。**これはRustの結果を保つ方法ではない**: Rustの別算法のpHashが橋になっていた組は、Pythonの値に戻ると離れ、グループの顔ぶれ・`kind`・配信から外れる数が変わりうる（試験`bridge_by_copy`では、`similar`3行が`exact`2行になり、配信から外れる数が0→1）。消さずに切り戻しても壊れない（変化は上の表のとおり）。
+3. 確認:
+   - 手順2をしない（特徴量を保ったまま、後で`dirty`の再構築が走る）とき: `GET /api/v1/photos`の件数が切り戻しの前後で同じ、`photo_quality`の行数・グループ数が同じ。
+   - 手順2をしたとき: 件数・行数・グループの顔ぶれ・`kind`は変わりうる。解析し直しが終わった（未解析が0）あとに、`photo_quality`の行数・グループ数・配信から外れる数と`GET /api/v1/photos`の件数を記録し、Pythonだけで解析した場合の結果として受け入れる。
 
 ### 16.11 回したもの
 
