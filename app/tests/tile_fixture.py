@@ -14,8 +14,11 @@ Rust の単体テスト（crates/geoframe/src/tiles/tests.rs）は、同じ手�
 座標はすべて合成の値。上流のホスト名・実在の連絡先は載せない。
 
 このフィクスチャに載せたケースは、Rust も Python と同じ結果にする。Python と意図して違える点（本文の上限、gzip、
-壊れたキャッシュのファイル、リンク、座標の桁あふれなど）は載せず、Rust の単体テストが別に確かめる
+壊れたキャッシュのファイル、リンク、座標の桁あふれなど）と、タイルと関係のない既知の差は載せず、Rust の単体テストが別に確かめる
 （docs/rust-migration/server.md §0・§19）。
+載せなかった例: `/tiles/osm/1/0/0.png#frag`（hyper が `#` 以降を落とす）、`/static/../tiles/…`（403 の本文は同じだが、
+Python は生のパスが `/static/` で始まるので `Cache-Control: no-cache` が付き、Rust は正規化後のパスで判定するので付かない。
+P1 の既知の差、§9.5）、非 ASCII の文字・空白を含むパス（hyper が 400 にする）。
 """
 import collections
 import contextlib
