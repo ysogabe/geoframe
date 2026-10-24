@@ -137,6 +137,11 @@ fn compare(headers: [Option<&str>; 3], python: &str, tally: &mut Tally) {
     }
     let verdict = post::csrf_verdict(&map);
     if is_known_ows_difference(headers[1], python, verdict) {
+        // 原因が空白・タブの除去だけであることの確認: hyper が取り除く前の生の値を同じ判定に渡せば、
+        // Python と同じになる（`netloc` や角括弧の読み違いが、末尾の空白と重なって紛れ込まない）
+        let raw = headers.map(|h| h.map(raw_bytes));
+        let untrimmed = csrf::verdict(raw[0].as_deref(), raw[1].as_deref(), raw[2].as_deref());
+        assert_eq!(untrimmed, expected(python), "{headers:?}");
         tally.known_ows_difference += 1;
         return;
     }
@@ -391,6 +396,8 @@ async fn real_requests_get_the_same_status_and_never_write_what_python_refuses()
                 origin_ends_with_ows(case),
                 "{name}: 最初の Origin の末尾が空白・タブでない"
             );
+            // 原因が空白・タブの除去だけであること: 取り除く前の生の値の判定は、Python の 403（例外）と同じ
+            assert_eq!(untrimmed_verdict(case), Verdict::CrossOrigin, "{name}");
             assert!(
                 !py_wrote && matches!(py_status, 0 | 403),
                 "{name}: もう同じ。表から外す"
@@ -440,6 +447,25 @@ fn origin_ends_with_ows(case: &Value) -> bool {
         .iter()
         .find(|h| s(&h[0]).eq_ignore_ascii_case("origin"))
         .is_some_and(|h| s(&h[1]).ends_with([' ', '\t']))
+}
+
+/// 要求の最初の `name` ヘッダの生の値（Latin-1 を 1 バイト＝1 文字で戻したもの）。
+fn first_raw_header(case: &Value, name: &str) -> Option<Vec<u8>> {
+    case["headers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| s(&h[0]).eq_ignore_ascii_case(name))
+        .map(|h| raw_bytes(s(&h[1])))
+}
+
+/// hyper が両端を取り除く前の生の値で、`csrf::verdict` を呼んだ結果。
+fn untrimmed_verdict(case: &Value) -> Verdict {
+    csrf::verdict(
+        first_raw_header(case, "content-type").as_deref(),
+        first_raw_header(case, "origin").as_deref(),
+        first_raw_header(case, "host").as_deref(),
+    )
 }
 
 // ---- 末尾に空白がある Origin（既知の差） ----
