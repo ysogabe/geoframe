@@ -2332,3 +2332,244 @@ fn the_original_is_removed_explicitly_and_the_drop_only_covers_what_is_left() {
     drop(guard);
     assert!(path.exists());
 }
+
+// ---------------------------------------------------------------------------
+// 実際のログ出力の検査
+
+/// `tracing` の出力を、試験のスレッドごとに捕まえる。
+///
+/// `with_default` だけだと、並列に動く他の試験が先に通した呼び出し地点の「興味なし」の判定が残って、
+/// 出るはずの行が捕まらないことがある。そこで**プロセスで 1 つの購読側**（全レベル）を 1 回だけ入れ、
+/// 書き込み先だけをスレッドごとに差し替える（捕まえていないスレッドの出力は捨てる）。
+mod capture {
+    use std::cell::RefCell;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex, Once};
+
+    type Sink = Arc<Mutex<Vec<u8>>>;
+
+    thread_local! {
+        static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+    }
+
+    struct ThreadWriter;
+
+    impl Write for ThreadWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            SINK.with(|sink| {
+                if let Some(sink) = sink.borrow().as_ref() {
+                    sink.lock().unwrap().extend_from_slice(buf);
+                }
+            });
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct Maker;
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Maker {
+        type Writer = ThreadWriter;
+
+        fn make_writer(&'a self) -> ThreadWriter {
+            ThreadWriter
+        }
+    }
+
+    /// `f` を動かし、そのスレッドで出たログ（本番と同じ書式・フィルター。全レベル）を返す。
+    pub fn logs_of(f: impl FnOnce()) -> String {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            tracing::subscriber::set_global_default(crate::logging::subscriber(
+                crate::config::LogLevel::Trace,
+                Maker,
+            ))
+            .expect("試験のログの購読側は 1 回だけ入れる");
+        });
+        let sink: Sink = Arc::default();
+        SINK.with(|s| *s.borrow_mut() = Some(Arc::clone(&sink)));
+        // `f` がパニックしても、次の試験に出力を持ち越さない
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SINK.with(|s| *s.borrow_mut() = None);
+            }
+        }
+        let _reset = Reset;
+        f();
+        let bytes = sink.lock().unwrap().clone();
+        String::from_utf8(bytes).expect("ログは UTF-8")
+    }
+}
+
+#[test]
+fn derived_debug_output_hides_names_times_and_locations() {
+    let file = RemoteFile {
+        id: "secretid0001".into(),
+        name: Some("Private-Holiday-Name.jpg".into()),
+        md5: Some("m1".into()),
+        time: Some("2024:05:06 07:08:09".into()),
+        lat: Some(35.123456),
+        lon: Some(139.654321),
+    };
+    let listing = Listing {
+        files: vec![file.clone()],
+        pages: 1,
+    };
+    let entry = index::Entry {
+        drive_id: "secretid0001".into(),
+        name: "Private-Holiday-Name.jpg".into(),
+        md5: Some("m1".into()),
+        taken_at: "2024-05-06T07:08:09".into(),
+        lat: Some(35.123456),
+        lon: Some(139.654321),
+    };
+    let plan = index::DrivePlan {
+        ops: vec![
+            index::Op::Insert(entry.clone()),
+            index::Op::Update(entry.clone()),
+        ],
+        deletes: vec![(1, Some("derivatives/secretid0001.jpg".into()))],
+        ..Default::default()
+    };
+    for text in [
+        format!("{file:?}"),
+        format!("{listing:?}"),
+        format!("{:?}", index::Op::Insert(entry.clone())),
+        format!("{entry:?}"),
+        format!("{plan:?}"),
+        format!("{:#?}", Some(&listing)),
+    ] {
+        for needle in [
+            "secretid",
+            "Private",
+            "Holiday",
+            "35.12",
+            "139.65",
+            "2024",
+            "07:08",
+            "derivatives/",
+        ] {
+            assert!(!text.contains(needle), "{needle} in {text}");
+        }
+    }
+    // 件数と有無は残る（失敗の表示が役に立つ）
+    assert!(format!("{listing:?}").contains("files: 1"));
+    assert!(format!("{file:?}").contains("has_location: true"));
+}
+
+#[test]
+fn the_actual_log_output_never_contains_names_coordinates_times_keys_or_tokens() {
+    let e = env("drive-reallog");
+    let key_dir = e.root().display().to_string();
+    let log = capture::logs_of(|| {
+        // 1. 個人情報つきの一覧の索引と取得（成功・写真の失敗）
+        e.listing(vec![
+            located(
+                "secretid0001",
+                "Private-Holiday-Name.jpg",
+                "m1",
+                "2024:05:06 07:08:09",
+                35.123456,
+                139.654321,
+            ),
+            located(
+                "secretid0002",
+                "Another-Private-Name.jpg",
+                "m2",
+                "2024:05:07 08:09:10",
+                35.223456,
+                139.754321,
+            ),
+        ]);
+        e.stub.set_media("secretid0001", broken());
+        e.stub.set_media("secretid0002", fixture_jpeg("typical"));
+        e.index();
+        e.done(&e.fetch_stage());
+        // 2. 流量制限の再試行（DEBUG の行）と、使い切った失敗
+        e.stub.add_fault(Box::new(|r| {
+            r.path
+                .ends_with("/files")
+                .then(|| (429, "{}".to_string(), vec![]))
+        }));
+        let _ = e.run(&e.index_stage());
+        e.stub.clear_faults();
+        // 3. 大量削除・0 件の一覧の保留の警告
+        seed_drive_rows(&e, 100);
+        list_first(&e, 1);
+        e.index();
+        e.listing(vec![]);
+        e.index();
+        // 4. トークンの取り直し（期限切れ）と 401 のやり直し
+        e.stub.set_expires_in(30);
+        e.listing(vec![jpeg("f1", "Private-Holiday-Name.jpg", "m1")]);
+        e.index();
+        e.stub.revoke_tokens();
+        e.index();
+        // 5. 鍵ファイルの権限の警告
+        fs::set_permissions(&e.key, fs::Permissions::from_mode(0o644)).unwrap();
+        e.shared.permission_warned.store(false, Ordering::SeqCst);
+        e.stub.set_expires_in(3599);
+        e.shared.state().token = None;
+        e.index();
+        // 6. 原本を消せなかった警告
+        let e2 = env("drive-reallog-rm");
+        e2.listing(vec![jpeg("secretid0003", "Private-Holiday-Name.jpg", "m3")]);
+        e2.stub.set_media("secretid0003", fixture_jpeg("typical"));
+        e2.index();
+        let tmp = e2.root().join("tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        let locked = tmp.clone();
+        e2.stub.add_fault(Box::new(move |r| {
+            if r.is_media() {
+                fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+            }
+            None
+        }));
+        e2.done(&e2.fetch_stage());
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)).unwrap();
+    });
+    // 何も捕まえていない試験にならないように、出るはずの行があること
+    for expected in [
+        "[fetch] 取得に失敗しました",
+        "再試行します",
+        "消す行が多すぎます",
+        "一覧が 0 件でした",
+        "所有者以外にも読める権限",
+        "原本の一時ファイルを削除できませんでした",
+    ] {
+        assert!(log.contains(expected), "{expected} が無い:\n{log}");
+    }
+    for needle in [
+        "Private",
+        "Holiday",
+        "Another",
+        ".jpg",
+        "35.12",
+        "35.22",
+        "139.65",
+        "139.75",
+        "2024",
+        "07:08",
+        "secretid",
+        "stub-token",
+        "Bearer",
+        "PRIVATE",
+        "private_key",
+        "BEGIN",
+        "eyJ",
+        "sa@example",
+        "http",
+        "127.0.0.1",
+        FOLDER_NAME,
+        FOLDER_ID,
+        "drive_key",
+        key_dir.as_str(),
+        ".dl_",
+    ] {
+        assert!(!log.contains(needle), "{needle} in:\n{log}");
+    }
+}

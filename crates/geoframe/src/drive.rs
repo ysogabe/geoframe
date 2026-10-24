@@ -407,7 +407,10 @@ fn escape_query_literal(value: &str) -> String {
 // 一覧
 
 /// `files.list` が返した 1 ファイル（取り込み対象の MIME のものだけ）。
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Debug` は手書きで、**ID・ファイル名・撮影時刻・座標を出さない**（有無だけ。個人情報がログ・パニックの
+/// 表示・試験の失敗の表示に漏れないように）。
+#[derive(Clone, PartialEq)]
 pub struct RemoteFile {
     pub id: String,
     /// 無いことは本来ない。無いファイルは索引に入れず、一覧には「有る」ものとして数える。
@@ -419,12 +422,33 @@ pub struct RemoteFile {
     pub lon: Option<f64>,
 }
 
+impl fmt::Debug for RemoteFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteFile")
+            .field("has_name", &self.name.is_some())
+            .field("has_md5", &self.md5.is_some())
+            .field("has_time", &self.time.is_some())
+            .field("has_location", &(self.lat.is_some() || self.lon.is_some()))
+            .finish_non_exhaustive()
+    }
+}
+
 /// 一覧の結果。`files` は**Drive が返した順**で、同じ ID が 2 回あれば最初の位置に最後の値を入れる
 /// （現行の `remote[f["id"]] = f` の dict と同じ。新しい行の `id` はこの順に振られる）。
-#[derive(Debug, Default, PartialEq)]
+#[derive(Default, PartialEq)]
 pub struct Listing {
     pub files: Vec<RemoteFile>,
     pub pages: u32,
+}
+
+// 件数だけ（`RemoteFile` の `Debug` も中身を出さないが、一覧の全件を並べない）
+impl fmt::Debug for Listing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Listing")
+            .field("files", &self.files.len())
+            .field("pages", &self.pages)
+            .finish()
+    }
 }
 
 fn remote_file(value: &Value) -> Result<Option<RemoteFile>, DriveError> {
