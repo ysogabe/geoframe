@@ -600,3 +600,15 @@ n100でビルドしたmusl静的バイナリ（`static-pie linked`、`ldd`は`st
 | 後片付け | drop-inを外して取り込み無効（既定）に戻した。`.ingest.lock`・`tmp/`が検証環境のデータ置き場に残る。配布前のコピーは`/var/lib/geoframe-backup-t21/`に残してある |
 
 本番コピーでは、取り込み済みの6,535行すべてが`source='drive'`で、段の中身がまだ無いので、サイクルは件数を数えるだけ。行の変更・derivativeの再取得が0であること（P2の受入）は、T2.3〜T2.6で段の中身を入れたあと、同じ`--dry-run`で確かめる。
+
+### 11.11 検証環境での確認: ガード（レビュー指摘後。2026-10-24）
+
+指摘修正のバイナリ（musl静的。リリースビルドに`GEOFRAME_TEST_*`の文字列が無いことも確認）を`deploy/rust-deploy.sh`で配布し、検証環境のsystemd配下（unitのハードニングのまま）で確かめた。いずれも`sqlite3 -readonly … .dump`のSHA-256（配布前に取ったもの）と、データ置き場のファイル一覧（サイズ・更新時刻）の比較で、書き込みの有無を見た。
+
+| 確認 | 結果 |
+| --- | --- |
+| (a) 印あり・`geoframe-server`は未導入（`LoadState=not-found`）で`GEOFRAME_INGEST=1`（drop-in） | 今までどおり起動。ログは`[guard] 検証環境の印を確認しました。geoframe-server.service は 未導入です`→`[db] スキーマは最新です`→サイクル完了（表示可能5288／全6535）。`.dump`のSHA-256は配布前と一致。**unitの制限下でも`systemctl show`が動いた** |
+| (b) 印を`staging.off`へ改名して起動 | `ERROR 検証環境の印（…）が無いので…`で終了コード2、`failed`、`NRestarts`は0（再起動ループにならない）。**置き場のファイル一覧・`.dump`は変わらず、開いたままの`.dl_*`（`derivatives/`に置いた）も消えない**。印を戻すと取り込みが通り、`.dl_*`は掃除された（対照） |
+| (c) 印あり・`geoframe-server.service`（確認用のダミーunit）を`active`にして起動 | `ERROR Python 版（geoframe-server.service）が非稼働と確認できない（状態: active）…`で終了コード2、置き場は変わらず、`.dl_*`も残る。確認後、ダミーunitは止めて撤去（`LoadState=not-found`に戻した） |
+| 比較用Python | `geoframe-pyref.service`（別データ・別ポート）が`active`でも、判定は`geoframe-server.service`だけを見るので通る（(a)） |
+| 後片付け | drop-inを外して`ingest=0`（`取り込みは無効です`）に戻し、`/healthz`は200、`.dump`のSHA-256は配布前と一致。印は戻してある |
