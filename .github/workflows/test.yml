@@ -50,7 +50,9 @@ jobs:
         # （画像は使わない）に流した結果（photo_quality_features・photo_quality・settings の全列）と突き合わせる基準。
         # 更新 API（crates/geoframe/src/update.rs・post.rs）は Python の handlers.do_POST・admin_setloc・
         # admin_setflag に同じ POST（CSRF 対策・ルーティング・エラー応答を含む）を順に流した結果（状態コード・応答・
-        # photos の変化）と突き合わせる基準。
+        # photos の変化）と突き合わせる基準。回転 API（crates/geoframe/src/rotate.rs）は、合成の derivative を置いた
+        # Python の admin_rotate に同じ POST を順に流した結果（状態コード・応答・photos の変化・ファイルの増減と、
+        # 画像の寸法・四隅の色・EXIF の有無）と突き合わせる基準（tests/rotate_api.rs）。
         # CSRF 対策の判定（crates/geoframe/src/csrf.rs）は、Python の _csrf_ok・_host_ok を実際のヘッダ解析
         # （生バイトを Latin-1 にして email のパーサへ）の上で、空白・Latin-1 の全バイト・Origin の書式（角括弧の IPv6 を
         # 含む）・Host の組み合わせに流した判定（9千件超）と、実際の HTTP サーバーへの POST の結果を残す。Rust が
@@ -66,6 +68,7 @@ jobs:
           python3 tools/gen_geo_fixture.py --check
           python3 tools/gen_quality_fixture.py --check
           python3 tools/gen_update_fixture.py --check
+          python3 tools/gen_rotate_fixture.py --check
           python3 tools/gen_csrf_fixture.py --check
 
       - name: スキーマのフィクスチャの同期検査

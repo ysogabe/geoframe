@@ -306,6 +306,9 @@ impl FetchDerivatives {
             .download(&job.drive_id, &mut file, imaging::MAX_INPUT_BYTES)
             .map_err(drive_fail)?;
         drop(file);
+        // derivative のファイルを作ってから `display` を DB に書くまで、管理画面の回転（`rotate.rs`）が同じ
+        // 写真のファイルを差し替えたり消したりしないようにする（ダウンロードの間は持たない）
+        let _files = imaging::lock_derivatives();
         let stored = imaging::store_derivative(data, &job.tmp, &job.name, job.rotation)
             .map_err(|e| photo_fail(image_fail_kind(&e), e))?;
         let now = crate::sysinfo::local_isoformat();

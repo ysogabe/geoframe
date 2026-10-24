@@ -28,6 +28,7 @@ pub mod photos;
 pub mod post;
 pub mod pyquery;
 pub mod quality;
+pub mod rotate;
 pub mod schema;
 pub mod server;
 pub mod statics;
@@ -80,6 +81,75 @@ mod testutil {
                 .unwrap();
         }
         (path, conn)
+    }
+
+    /// `tracing` の出力を、試験のスレッドごとに捕まえる。
+    ///
+    /// `with_default` だけだと、並列に動く他の試験が先に通した呼び出し地点の「興味なし」の判定が残って、
+    /// 出るはずの行が捕まらないことがある。そこで**プロセスで 1 つの購読側**（全レベル）を 1 回だけ入れ、
+    /// 書き込み先だけをスレッドごとに差し替える（捕まえていないスレッドの出力は捨てる）。
+    pub mod capture {
+        use std::cell::RefCell;
+        use std::io::Write;
+        use std::sync::{Arc, Mutex, Once};
+
+        type Sink = Arc<Mutex<Vec<u8>>>;
+
+        thread_local! {
+            static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+        }
+
+        struct ThreadWriter;
+
+        impl Write for ThreadWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                SINK.with(|sink| {
+                    if let Some(sink) = sink.borrow().as_ref() {
+                        sink.lock().unwrap().extend_from_slice(buf);
+                    }
+                });
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        struct Maker;
+
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Maker {
+            type Writer = ThreadWriter;
+
+            fn make_writer(&'a self) -> ThreadWriter {
+                ThreadWriter
+            }
+        }
+
+        /// `f` を動かし、そのスレッドで出たログ（本番と同じ書式・フィルター。全レベル）を返す。
+        pub fn logs_of(f: impl FnOnce()) -> String {
+            static INSTALL: Once = Once::new();
+            INSTALL.call_once(|| {
+                tracing::subscriber::set_global_default(crate::logging::subscriber(
+                    crate::config::LogLevel::Trace,
+                    Maker,
+                ))
+                .expect("試験のログの購読側は 1 回だけ入れる");
+            });
+            let sink: Sink = Arc::default();
+            SINK.with(|s| *s.borrow_mut() = Some(Arc::clone(&sink)));
+            // `f` がパニックしても、次の試験に出力を持ち越さない
+            struct Reset;
+            impl Drop for Reset {
+                fn drop(&mut self) {
+                    SINK.with(|s| *s.borrow_mut() = None);
+                }
+            }
+            let _reset = Reset;
+            f();
+            let bytes = sink.lock().unwrap().clone();
+            String::from_utf8(bytes).expect("ログは UTF-8")
+        }
     }
 
     impl Drop for TempDir {

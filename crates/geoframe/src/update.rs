@@ -27,15 +27,15 @@ use crate::post::ApiError;
 use crate::writer::Writer;
 
 /// 検査を通った `id`。`shown` は 404 の文面に出す元の表記。
-struct Id {
+pub(crate) struct Id {
     /// SQLite の rowid に入る値。`i64` を超える整数は `None`（SQL を実行せずに 404 にする。
     /// `i64::MAX` に丸めると、その rowid の行が実在するとき、より大きい `id` の要求が当たってしまう）。
-    value: Option<i64>,
+    pub(crate) value: Option<i64>,
     shown: String,
 }
 
 impl Id {
-    fn not_found(&self) -> ApiError {
+    pub(crate) fn not_found(&self) -> ApiError {
         ApiError::NotFound(format!("id={} は存在しません", self.shown))
     }
 }
@@ -44,7 +44,7 @@ impl Id {
 ///
 /// 差: `i64` を超える整数は、Python では SQLite に渡せず 500 になる。Rust は存在しない `id` として 404 にする
 /// （`value` は `None`。ほかの検査と writer の確認のあと、SQL を実行せずに 404）。
-fn req_id(payload: &Map<String, Value>) -> Result<Id, ApiError> {
+pub(crate) fn req_id(payload: &Map<String, Value>) -> Result<Id, ApiError> {
     let not_int = || ApiError::BadRequest("id は整数で指定してください".into());
     let Some(Value::Number(n)) = payload.get("id") else {
         return Err(not_int());
@@ -83,7 +83,7 @@ fn req_coord(payload: &Map<String, Value>, key: &str, lo: f64, hi: f64) -> Resul
     Ok(v)
 }
 
-fn writer_or_unavailable(writer: Option<&Writer>) -> Result<&Writer, ApiError> {
+pub(crate) fn writer_or_unavailable(writer: Option<&Writer>) -> Result<&Writer, ApiError> {
     writer.ok_or(ApiError::Unavailable)
 }
 

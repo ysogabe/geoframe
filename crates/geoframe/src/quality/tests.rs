@@ -1231,3 +1231,91 @@ fn 時刻の秒つきの形も読む() {
     assert!(super::parse_taken_at("2024-05- 6 10:00").is_some());
     assert_eq!(super::parse_taken_at("2024-05- 06 10:00:30"), None);
 }
+
+// ---------------------------------------------------------------- 回転（P3 / T3.2 の E14）との競合
+
+thread_local! {
+    /// 解析の途中で 1 回だけ回す写真: (writer, データ置き場, 写真の id)。
+    static ROTATE_ONCE: RefCell<Option<(Writer, std::path::PathBuf, i64)>> =
+        const { RefCell::new(None) };
+}
+
+fn rotate_once() {
+    ROTATE_ONCE.with(|slot| {
+        if let Some((writer, dir, id)) = slot.borrow_mut().take() {
+            let payload = json!({"id": id, "delta": 90});
+            crate::rotate::rotate(payload.as_object().unwrap(), Some(&writer), &dir).unwrap();
+        }
+    });
+}
+
+/// 旧ファイルを読む前に、回転が旧ファイルを消す。
+fn rotate_then_analyze(data: &DataDir, display: &Sql) -> Result<Features, String> {
+    rotate_once();
+    super::analyze_one(data, display)
+}
+
+/// 旧ファイルを読んだあと、結果を書く前に回転が入る。
+fn analyze_then_rotate(data: &DataDir, display: &Sql) -> Result<Features, String> {
+    let result = super::analyze_one(data, display);
+    rotate_once();
+    result
+}
+
+/// 解析が旧ファイルを読んでいる最中に回転が `display` を変えて旧ファイルを消しても、解析結果は「読んだ時点の
+/// `display`」の行に書かれ、今の `display` とは一致しないので未解析に戻る。品質は古い結果から作られず、
+/// 次のサイクルが新しいファイルを解析し直す。
+#[test]
+fn 解析の途中で回転が入っても_表示が変わった写真は未解析に戻り次のサイクルで解析し直す() {
+    for (when, analyzer) in [
+        ("読む前", rotate_then_analyze as super::Analyzer),
+        ("読んだ後", analyze_then_rotate as super::Analyzer),
+    ] {
+        let s = setup("quality-rotate");
+        write_jpeg(&s, "dA.jpg", &gradient_jpeg(640, 480, 85, 0));
+        insert_photo(&s, 1, "2024-05-06 10:00", "derivatives/dA.jpg");
+        s.sql("UPDATE photos SET drive_id='dA' WHERE id=1");
+        ROTATE_ONCE.with(|slot| {
+            *slot.borrow_mut() = Some((s.writer.clone(), s.dir.path().to_path_buf(), 1));
+        });
+        s.run(&Quality::with_analyzer(analyzer));
+
+        // 回転は済んでいる: 表示は新しいファイル、旧ファイルは無い
+        let display: String =
+            s.query(|c| c.query_row("SELECT display FROM photos WHERE id=1", [], |r| r.get(0)));
+        assert_eq!(display, "derivatives/dA.r90.jpg", "{when}");
+        assert!(!s.dir.path().join("derivatives/dA.jpg").exists(), "{when}");
+        // 特徴量の行は「読んだ時点の」display に付いていて、今の display とは一致しない
+        let (feature_display, error): (String, String) = s.query(|c| {
+            c.query_row(
+                "SELECT display, error FROM photo_quality_features WHERE photo_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        });
+        assert_eq!(feature_display, "derivatives/dA.jpg", "{when}");
+        assert_eq!(error.is_empty(), when == "読んだ後", "{when}: {error}");
+        let pending = s.query(super::pending_count);
+        assert_eq!(pending, 1, "{when}: 未解析に戻っている");
+        assert_eq!(
+            count_of(&s, "SELECT COUNT(*) FROM photo_quality"),
+            0,
+            "{when}"
+        );
+
+        // 次のサイクルは新しいファイルを解析し直す（失敗の行も古い結果も残らない）
+        let counts = s.run(&Quality::new());
+        assert_eq!(get(&counts, "analyzed"), 1, "{when}");
+        assert_eq!(get(&counts, "failed"), 0, "{when}");
+        let (feature_display, error): (String, String) = s.query(|c| {
+            c.query_row(
+                "SELECT display, error FROM photo_quality_features WHERE photo_id=1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+        });
+        assert_eq!(feature_display, "derivatives/dA.r90.jpg", "{when}");
+        assert_eq!(error, "", "{when}");
+        assert_eq!(s.query(super::pending_count), 0, "{when}");
+    }
+}

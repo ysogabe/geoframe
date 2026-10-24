@@ -46,12 +46,12 @@ use axum::response::Response;
 use serde_json::{Map, Value};
 
 use crate::server::{AppState, error_response, json_response};
-use crate::{csrf, update, webpath};
+use crate::{csrf, rotate, update, webpath};
 
 /// 本文の上限（現行の `MAX_POST_BYTES`）。
 pub const MAX_POST_BYTES: u64 = 64 * 1024;
 
-/// 受け付ける POST のルート（現行の `_post_routes`）。T3.1 で動くのは `SetLoc`・`SetFlag` だけで、
+/// 受け付ける POST のルート（現行の `_post_routes`）。T3.2 までに動くのは `SetLoc`・`SetFlag`・`Rotate` で、
 /// 残りは CSRF 対策までを現行と同じに通し、処理は後のタスクで入れる（それまでは 503）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
@@ -97,10 +97,9 @@ pub enum ApiError {
     BadRequest(String),
     /// 対象が無い（404）。
     NotFound(String),
-    /// 実行中（409）。旅行ブログの書き出し（T3.6）が使う。
-    #[allow(dead_code)]
+    /// 他の処理と重なった・実行中（409）。回転（T3.2）と、旅行ブログの書き出し（T3.6）が使う。
     Busy(String),
-    /// このタスクではまだ無いルート（T3.2 回転、T3.6 旅行ブログの保存・書き出し）。GET の未実装と同じ 503。
+    /// このタスクではまだ無いルート（T3.6 旅行ブログの保存・書き出し）。GET の未実装と同じ 503。
     NotYetImplemented,
     /// 書き込みが無効（`GEOFRAME_INGEST=0`、またはガードで取り込みを断った）ので何も書かなかった（503）。
     Unavailable,
@@ -271,11 +270,13 @@ pub async fn handle(state: &AppState, route: Route, headers: &HeaderMap, body: B
         Err(_) => return json_syntax_error(),
     };
     let writer = state.writer();
+    let data_dir = state.data_root.as_ref().clone();
     let result = tokio::task::spawn_blocking(move || match route {
         Route::SetLoc => update::set_loc(&payload, writer.as_ref()),
         Route::SetFlag => update::set_flag(&payload, writer.as_ref()),
-        // 後のタスクで入れる（T3.2 回転、T3.6 旅行ブログの保存・書き出し）
-        Route::Rotate | Route::BlogSave | Route::BlogExport => Err(ApiError::NotYetImplemented),
+        Route::Rotate => rotate::rotate(&payload, writer.as_ref(), &data_dir),
+        // 後のタスクで入れる（T3.6 旅行ブログの保存・書き出し）
+        Route::BlogSave | Route::BlogExport => Err(ApiError::NotYetImplemented),
     })
     .await
     .unwrap_or_else(|_| Err(ApiError::Internal("更新の処理が異常終了しました".into())));

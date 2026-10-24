@@ -148,7 +148,7 @@ CASES = [
     case("route_case_sensitive", "/api/admin/SetFlag", j({"id": 2, "favorite": True})),
     case("route_prefix_only", "/api/admin/setflagx", j({"id": 2, "favorite": True})),
     case("route_backslash", "/api\\admin\\setflag", j({"id": 21, "hidden": True})),
-    # まだ Rust に無いルート（T3.2・T3.6）。検査は同じ順序を通る
+    # 回転（T3.2。処理は rotate_fixture）と旅行ブログ（T3.6、まだ Rust に無い）のルート。検査は同じ順序を通る
     case("route_rotate_bad_content_type", "/api/admin/rotate", "{}", ct=False),
     case("route_blog_save_cross_origin", "/api/blog/save", "{}",
          headers=[("Origin", "http://attacker.example")]),

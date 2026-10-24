@@ -1,13 +1,13 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）。T3.2 で E14 回転を入れ、回転と取得・品質・同期サイクルの競合を調べた（§17.8）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）、T3.1 は`post.rs`・`update.rs`
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）、T3.1 は`post.rs`・`update.rs`、T3.2 は`rotate.rs`（と`imaging`の`rotate_jpeg`・`write_atomic`・`lock_derivatives`）
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 0. Pythonとの差の索引
 
-P1・P2（T2.1〜T2.6）・P3（T3.1）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1〜T2.6）・P3（T3.1・T3.2）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
@@ -42,6 +42,8 @@ P1・P2（T2.1〜T2.6）・P3（T3.1）でPythonと意図して違える点・�
 | **簡易品質 `quality`（T2.6）**: ①**特徴量の行はPythonが作ったものも有効として使い、Rustは新しい（または`display`・`md5`・`mtime`が変わった）写真だけを自分の算法で解析する**（全写真を解析し直さない。特徴量の表に算法の印が無いので、混在する）。②Rustの鮮明度・輝度・露出はPythonと少し違う（Pillowの`thumbnail`の`reducing_gap`による箱型の縮小を再現しない。本番コピー6,535枚で鮮明度の比の中央値1.004）。pHashは同じ作り方で、同じ写真のPythonの値との距離は最大6（12以上は0枚）。③**同じSHA-256の写真は、指標（鮮明度・露出・コントラストなど）を`id`が最小の行にそろえてから順位をつける**（Pythonは行ごと。Pythonだけが作った行では同じ値なので差は出ない。本番コピーで確認）。**pHashはそろえない**: 類似の結びつき（3分以内・距離12以下）は各行の元のpHashで決めるので、グループの顔ぶれ・`kind`・配信の抑制の規則はPythonと同じ（同じSHAの2枚のpHashがPython／Rustの算法の差で違うとき、結びつきも各行のpHashで決まる）。④失敗の行の`error`は種類だけ（Pythonは`型名: 例外の文字列`を500文字まで）。⑤`photo_quality.algorithm`は`rust-phash-v1:t3:h12`（Pythonは`poc-phash-v1:t3:h12`。再構築のたびに全行がこの値になる）。**これは特徴量の由来ではなく、その`photo_quality`を作った実装の印**で、Pythonはこの値を読まない（書き換えても特徴量を無効にしない。切り戻しは§16.10）。⑥特徴量の書き込みと`dirty`、再構築の読み書き（未解析の数・dirty・特徴量の読み取り・全差し替え）がそれぞれ1つのトランザクション（Pythonは別々）。⑦`GEOFRAME_QUALITY_PER_CYCLE`が負・小数・非数なら起動を断る（Pythonは`int()`で通し、`max(1, …)`で負を1にする）。⑧撮影時刻は`strptime`と同じ規則でASCIIの数字だけ読む（全角の数字が混じった時刻はPythonだけが読める場合がある。同じ既知の差）。⑨**混在の限界**: 特徴量の行にはPython製とRust製が混ざり、同じ画像のpHashはPythonとRustで最大6離れる（計測）。類似の判定の閾値は12なので、別の写真との距離が12の境目にいる組は、算法の差で結びつきが変わりうる（境目の保証はできない。本番コピーで無作為の300枚をRustで解析した混在では、顔ぶれが変わらなかった回（eb54361。§16.2の表）と、7枚が入れ替わった回（de90a57。§16.9の(h)）があった。完全重複の非推奨＝配信から外れる数は、測った回ではどれも93。§16.2・§16.9）。⑩Rustで作った結果をPythonへ切り戻すと、変化なしのサイクルは結果を保つが、後で`dirty`になるとPythonがRust製の特徴量を含めて再構築する。顔ぶれ・`kind`は変わらず、同じSHAの写しの指標の差から出る順位・推奨・スコアだけが変わりうる（完全重複の写しのどちらを表に出すかが入れ替わりうる。件数は同じ。スコアの変化で信頼度の並びが変わると、グループ番号`group_id`は振り直されうる。§16.10） | 全写真を解析し直すと、一括で424秒、既定の同期サイクル（25枚／10分）では約44時間かかり、グループの顔ぶれが変わる（7枚）。Pythonの行を使えば`photo_quality`もE1の件数も変わらない。他は安全側・決定性 | 取り込み済みの本番コピー・新しい写真があるとき | `quality-python.json`（合成の`photos`と合成の特徴量にPythonの`quality_cycle`・`quality_backfill`を段階的に流した結果と、特徴量・`photo_quality`・`settings`の全列が一致: 完全重複・3分と距離12の境界・推奨・順位・並び・無効化・孤児・件数制限・dirty・同じSHAでpHashが違う写真の結びつき。さらに`switchbacks`: Rust→Pythonへの切り戻し（変化なしのサイクル・dirtyでの再構築）をPython本体に流した結果。`tools/gen_quality_fixture.py`、CIで`--check`）、単体テスト、検証環境（§16.9。Rustの再構築が本番コピーの`photo_quality`559行と全列で一致、実サイクルで`.dump`不変） | ②は、Pythonの行を全部Rustで作り直す必要が出たら`geoframe quality-scan`（特徴量を消してから）で解消できる。他は決定 | [§16](#16-簡易品質p2--t26) |
 | **更新API（T3.1。E12 `setloc`・E13 `setflag`と`POST`の入口）**: ①`i64`を超える整数の`id`はRustが存在しない`id`として404（Pythonは`sqlite3`が受け取れず500）。入力の検査（400）とwriterの確認（503）のあとで、**SQLを実行せずに**404にする（`i64::MAX`に丸めると、その`rowid`の行が実在するとき、より大きい`id`の要求が当たってしまう）。②JSONの`NaN`・`Infinity`はRustの解析が受け付けず400（Pythonは受け付けて「範囲外」の400。状態コードは同じで文面だけ違う）。③パスの`\`を`/`に読み替えない（`/api\admin\setloc`はPythonは当たり、Rustは403）。④`setflag`は`UPDATE … RETURNING`で1回の書き込みにする（PythonはUPDATEとSELECTが別）。⑤**書き込み（writer）が無い（`GEOFRAME_INGEST=0`）ときは、入力の検査（400）のあとで書かずに503**（Pythonに無い）。⑥未知の`POST`は`/api/blog/`配下も403（Pythonも403。依頼文の「`/api/blog/`の未知は404」は`GET`の話）。 ⑦**巨大・不正な`Content-Length`はaxum/hyperのHTTP層が`post.rs`より先に拒否する**（`u64`の最大値は431、それを超える値・数字でない値・負・空・`+`付き・アンダースコア入り・`N, N`・値が食い違う重複は400。Pythonは巨大なら413、`Content-Type`が違えば403、`+N`・`2_7`・最初の値が正しい重複は読んで書く）。状態コードと本文が[§17.1](#171-順序と状態コード)の表と違い、本文は定型JSONでない。**これらは書き込みが起きず、Pythonが書く入力をRustが断る向きの差だけ**。厳密な互換は求めない（[§17.1.1](#1711-http層が先に拒否する場合)）。⑧**逆向き（Pythonが断るのにRustが書く）の差は2つ見つかり、どちらもRustが書く前に断る**。(a)hyperは先頭の`0`を足した長い`Content-Length`（`0…037`）を通すが、Pythonの`int()`は10進で4300桁を超えると`ValueError`で400（`post::content_length`が同じ上限で400。4300桁ちょうどは両方通す。値が上限超過でも413でなく400）。(b)Python（`http.server`）は1行65536バイト（改行を含む）を超えるヘッダを431、要求行を414、ヘッダ100個以上（空行も数えるので99個まで）を431にするが、hyperの上限（head全体約400KiB・ヘッダ100個）は緩く書いてしまう（`post::head_limits`が書く前に431・414）。**残る穴**: 値の前後の空白と、hyperが捨てる重複した`Content-Length`の行はhyper通過後に見えないので、その分の長さ・個数はPythonの方が厳しいことがある。 ⑨**CSRFの判定（`Content-Type`・`Origin`・`Host`の値）は、生バイトを Latin-1 として読み、Pythonの`str.strip()`・`urlparse().netloc`・`ipaddress`と同じ規則で判定する**（`csrf.rs`。UTF-8として読み直すと、`\xC2\xA0`（UTF-8のNBSP）が空白として取り除かれ、Pythonが断る値を通してしまった。非ASCIIを一律に断る方式にしなかったのは、UTF-8の名前をそのまま`Origin`・`Host`に載せる非ブラウザを、Pythonは通すため）。**Pythonが断るものをRustが通す差は、`Origin`の値の末尾の空白・タブの1種類だけ**（hyperがRFC 9110のOWSとして取り除く。Pythonは空白を残して`netloc`に入れ403にする。HTTPのフレーミングの差として許す。ブラウザは`Origin`に空白を付けられず、付けられるクライアントは`Origin`を省けばPythonでも通る（無ければ通す仕様）ので、守りは変わらない）。差分試験の9213件のうち73件と、実際のHTTPの84件のうち10件がこれで、条件を狭く（`Origin`の値の末尾が空白かタブ）固定し、それ以外の許す向きは0件（[§17.1.2](#1712-csrfの判定のヘッダの値の読み方)）。Rustだけが断るのは次の2種類で、どちらも拒否の向き。(a)`Origin`の角括弧の中がIPv6でない（IPv4・ゾーンIDだけ・IPvFutureの書式違反・閉じ忘れ・前後の余り）などで、Pythonは`_csrf_ok`の中で`ValueError`になり**応答を返さず接続を閉じる**（状態コードが付かない）。Rustは403の定型JSON。(b)値に制御文字（0x00〜0x08・0x0a〜0x1f・0x7f）や折り返し（obs-fold）があると、hyperが要求ごと400にする（Pythonは`strip()`が取り除くので200になることがある）。 | ①②③⑦⑧⑨は実装の違い（⑦⑨は安全側）。⑤はP5まで本番の書き手がPythonで、Rustは書かない設計 | 更新APIを送ったとき | `tests/update_api.rs`が基準（`tools/gen_update_fixture.py`。現行の`handlers.Handler`に167件のPOSTを順に流した状態コード・応答・`photos`の変化と一致。差は`known_differences`の19件だけ。CIで`--check`）。HTTP層の境界（4300桁・ヘッダの大きさを含む）は実際のTCP接続で状態コードと接続の切断・書き込みの有無を固定（`content_length_boundaries_at_the_http_layer`）。CSRFの判定は`tests/csrf_python.rs`（`tools/gen_csrf_fixture.py`。9213件の判定と84件の実HTTP。CIで`--check`） | なし（決定） | [§17](#17-更新apit31) |
 | **更新APIと同期サイクルの競合（T3.1）**: Pythonは`infer`の`UPDATE`が`WHERE id=?`だけで、計画を読んだあとに管理画面で直された位置（`manual`）を推定で上書き・取り消す。`enrich`の`UPDATE`も`WHERE id=?`だけで、地名の問い合わせ中に位置が直されると、古い座標の地名が新しい位置に書かれて`place`が埋まったまま残る（再enrichされない）。Rustは`infer`が`loc_source IS NULL OR 'inferred'`、`enrich`が`lat=? AND lon=? AND place IS NULL`の条件で守る（P2）。T3.1では`infer`の位置付けに「錨が計画のときの位置・種類のまま」の条件を足した（錨が手動で動かされたあとに古い位置を写さない） | 利用者の変更を失わない | 管理画面の操作が同期サイクルの段の途中に入ったとき | 割り込みを再現する単体テスト（§17.3） | なし（決定） | [§17.3](#173-同期サイクルとの競合) |
+| **回転API（T3.2。E14 `POST /api/admin/rotate`）**: ①**小数の`delta`（`90.0`・`-90.0`・`9e1`）はRustが400**（Pythonは`90.0 == 90`で通し、`<drive_id>.r90.0.jpg`という名前のファイルを作って応答の`rotation`を`90.0`にする。DBには整数の90が入る）。②**`display`がシンボリックリンク・`derivatives/<安全な名前>`でない・通常のファイルでない（ディレクトリ・FIFO）ときは400「表示用の画像がまだありません」**（Pythonは`is_file()`でリンクを辿り、`DATA_DIR`の下の任意のファイル（リンク先が外でも）を読んで回し、元のファイルを`unlink`する）。③`drive_id`が名前に使えない文字（`/`・`..`・非ASCIIなど）の行は500（Pythonは経路にそのまま使う）。④`delta`と`id`の検査のあと、**writerが無ければファイルを作る前に503**（Pythonに無い）。⑤**DBの更新は条件付き**（読んだ時点の`display`・`rotation`・`md5`・`fetched_at`のままなら）で、外れたら何も書かず新しいファイルを消して**409**「他の処理と重なったので回転しませんでした。もう一度お試しください」（行が消えていれば404）。Pythonは無条件に書く。⑥回転どうし・回転と取得（`fetch_derivatives`）は`imaging::lock_derivatives`で直列化する（Pythonは読んで書くまでを排他しない）。⑦画像: Pillowの`rotate(-delta, expand=True)`と同じ向き・寸法、JPEG品質85・4:2:0・ベースライン、EXIFを付けない、EXIFの向きを当てない（Pillowも当てない）。画素は再圧縮の差を許す（デコーダがlibjpegと違うので、平均の差は数段階） | Pythonの癖を再現しない・安全側・競合の守り | 回転の要求を送ったとき | `tests/rotate_api.rs`が基準（`tools/gen_rotate_fixture.py`。合成のderivativeを置いた現行`admin_rotate`に57ケースを順に流した状態コード・応答・`photos`の変化・ファイルの増減（画像は寸法・四隅の色・EXIFの有無）と一致。差は`known_differences`の5件だけ。CIで`--check`）、`rotate/tests.rs`、`drive::tests`・`quality::tests`の競合の試験 | なし（決定） | [§17.8](#178-e14-rotatet32) |
+| **回転と同期サイクル・取得・品質の競合（T3.2）**: Pythonは回転で「読む→画像を作る→`display`・`rotation`を書く→元のファイルを消す」の間を排他せず、①同期サイクルが`display`をNULLにした（推定の錨が消えた取り消し・Driveの`md5`の変更）あとでも、古い原本から作った画像を`display`に書き戻し、`fetch_derivatives`は`display`がNULLでないので取り直さない（`md5`が新しいのに古い画像が出続ける）。②回転どうしが重なると、片方の回転が失われ、負けた側の新しいファイルが孤児になる。③読んだ`src`を無条件に消すので、その間に同じ名前で作り直されたファイルを消すことがある。Rustは条件付きの更新（409）・ロックで守り、DBが今指しているファイルは消さない。**Rustでも残る穴**: `index_drive`が一覧から消えた行と一緒に消すファイルは、計画を読んだ時点の`display`なので、その直後に回転が入ると新しいファイルが孤児で1つ残る（Driveから消えた写真の回転と、一覧を読んだ直後の数ミリ秒が重なる場合だけ。増え続けない）。`md5`の変更で`rotation`が0に戻るとき古い回転済みのファイルを消さない件（[inventory.md §2.3](inventory.md)③）はPythonと同じ | 利用者の変更と実在するファイルの一貫性 | 回転が同期サイクル・取得と重なったとき | `rotate/tests.rs`（`display`のNULL化・`md5`の変更・同じ名前での作り直し・行の消失・同時の回転・DBの失敗）、`drive::tests::fetch_waits_for_a_rotation_in_progress_and_leaves_no_orphan`、`quality::tests::解析の途中で回転が入っても…` | ③は**T3.7で決める**。他は決定 | [§17.8.4](#1784-競合) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記録は[p2-acceptance.md](p2-acceptance.md)。
 
@@ -1665,7 +1667,7 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 
 ## 17. 更新API（P3 / T3.1）
 
-状態: T3.1 実装済み（2026-10-25）。E12 `POST /api/admin/setloc`（手動の位置）、E13 `POST /api/admin/setflag`（お気に入り・除外）と、POST の入口（ルーティング・CSRF 対策・エラー応答）。実装は`post.rs`（入口）と`update.rs`（E12・E13）。E14 回転は T3.2、旅行ブログの保存・書き出し（E15・E16）は T3.6。T3.2・T3.6 のルートは入口の検査（403・400・413）まで通し、処理は未実装として 503 を返す。巨大・不正な`Content-Length`はHTTP層が先に断るので、下の表の順序・状態コードどおりにならない（§17.1.1）。
+状態: T3.1 実装済み（2026-10-25）。E12 `POST /api/admin/setloc`（手動の位置）、E13 `POST /api/admin/setflag`（お気に入り・除外）と、POST の入口（ルーティング・CSRF 対策・エラー応答）。実装は`post.rs`（入口）と`update.rs`（E12・E13）。E14 回転は T3.2（実装済み。§17.8）、旅行ブログの保存・書き出し（E15・E16）は T3.6。T3.6 のルートは入口の検査（403・400・413）まで通し、処理は未実装として 503 を返す。巨大・不正な`Content-Length`はHTTP層が先に断るので、下の表の順序・状態コードどおりにならない（§17.1.1）。
 
 ### 17.1 順序と状態コード
 
@@ -1784,7 +1786,7 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 | `index_local` / `index_drive` | `UPDATE`は`mtime`・`md5`が変わった行の`lat lon loc_source`などを上書きし、`DELETE`は消えた行を消す。`favorite`/`hidden`/`rotation`は`SET`句に無いので**残る**。手動の位置は、ファイルが変わった行では上書きされ、消えた行はお気に入り・除外ごと消える | **競合では失われない**: 更新APIが計画の前でも後でも結果は同じ（ファイルから決まる値で上書き・削除）。失われるのは[inventory.md §2.3](inventory.md)の①②で、**T3.7でユーザーの決めた方針に合わせる**。それまでは現行と同じ。計画に入らない行（ファイルが変わっていない行）の手動の位置・お気に入りは残る | 同じ（Pythonは1枚ずつ読んで書くので窓は狭いが、結果は同じ） | `local::tests::計画のあとに更新apiが入っても…`、`drive::tests::index_drive_plan_survives_…` |
 | `infer` | 計画（読み取り）のあとに、対象の行が手動になった・錨が手動で動かされた | `Set`/`Clear`の`UPDATE`は`loc_source IS NULL OR 'inferred'`の行にだけ効く（P2）。**T3.1で追加**: `Set`は、錨が計画のときの位置・種類（`exif`/`drive_meta`/`manual`）のままのときだけ。動かされた錨の古い位置を写さない（次のサイクルが新しい錨で付け直す） | `WHERE id=?`だけ: **手動の位置を推定で上書きし、`Clear`は取り消す**（位置が失われる） | `geo::tests::計画のあとに更新apiで直された位置…`（`Set`・`Clear`・錨の移動） |
 | `enrich` | 地名の問い合わせ中に位置が直された（`place`がNULLに戻る） | `UPDATE`は`lat=? AND lon=? AND place IS NULL`（P2）。座標が変わった行には古い座標の地名を書かず、次のサイクルが新しい座標で付ける | `WHERE id=?`だけ: 古い座標の地名が新しい位置に書かれ、`place`が埋まったまま**再enrichされない**（誤った地名が残る） | `geo::tests::enrichの途中で更新apiが…` |
-| `fetch_derivatives` / `local_derivatives` | 取得の途中で位置・お気に入りが変わる | 書くのは`display fetched_at`だけ（`WHERE id=?`）で、利用者の列に触れない。割り込みの影響なし。（T3.2の回転は`display`/`rotation`を書くので、そこで取得との競合を扱う） | 同じ | `drive::tests::fetch_keeps_what_the_update_api_wrote…`、`local::tests::derivativeの作成中に…` |
+| `fetch_derivatives` / `local_derivatives` | 取得の途中で位置・お気に入りが変わる | 書くのは`display fetched_at`だけ（`WHERE id=?`）で、利用者の列に触れない。割り込みの影響なし。回転（T3.2）は`display`/`rotation`を書くので、取得との競合は§17.8.4 | 同じ | `drive::tests::fetch_keeps_what_the_update_api_wrote…`、`local::tests::derivativeの作成中に…` |
 | `quality` | 解析の途中で位置・お気に入りが変わる | 書くのは`photo_quality_features`・`photo_quality`・`settings`だけで`photos`に書かない。影響なし | 同じ | `quality::tests::解析の途中で更新apiが…` |
 
 割り込みの再現は、`Writer`の試験用の口（`interrupt_next_call`: 次の`call`が依頼を積む直前に1回だけ閉包を呼ぶ。`cfg(test)`）で、**段の`run`が計画を読んだあと**に更新API（`update::set_loc`・`set_flag`を本物の writer 経由で）を呼ぶ。段が書いたあとの`photos`の全列を確かめる。`enrich`は地理院のスタブの応答の中から呼ぶ。条件を外すと落ちることは確認済み（`infer`の2つの条件）。
@@ -1811,6 +1813,79 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 
 ### 17.7 回したもの
 
-- **T3.2**: E14 回転（`display`/`rotation`を書く。取得・品質との競合）。
+- **T3.2**: 済み（§17.8）。
 - **T3.7**: 索引（`index_local`・`index_drive`）が手動の位置・お気に入り・除外を失う経路（§17.3の1行目）の方針。
 - **T3.8**: 検証環境での受入（比較用Python `:8090`に同じ要求を送って応答とDBの変化を比べる）。
+
+### 17.8 E14 `rotate`（T3.2）
+
+状態: T3.2 実装済み（2026-10-25）。`POST /api/admin/rotate`、JSON `{id, delta}`。Driveの写真の表示用画像（derivative）を時計回りに`delta`度回して別名で保存し、`display`・`rotation`を書き換え、古いファイルを消す。実装は`rotate.rs`（流れ・DB）と`imaging`（`rotate_jpeg`・`write_atomic`・`lock_derivatives`）。入口（CSRF・ルーティング・エラー応答）は§17.1。
+
+#### 17.8.1 検査・流れ・応答
+
+| 順 | 処理 | 外れたとき |
+| --- | --- | --- |
+| 1 | `id`（E12・E13と同じ`req_id`。`i64`超の扱いも同じ） | 400 |
+| 2 | `delta`は整数の90・180・270・-90だけ（`bool`・文字列・`null`・配列・欠落・小数は`delta は 90 / 180 / 270 / -90 で指定してください`） | 400 |
+| 3 | writerが無い（取り込みが無効） | **ファイルに触れる前に**503（§17.4） |
+| 4 | `id`が`i64`超 | SQLを実行せず404 |
+| 5 | 回転どうし・取得との排他（`lock_derivatives`）を取り、行を読む（writer経由）。`id`が無い | 404（`id=… は存在しません`） |
+| 6 | `source != 'drive'`か`drive_id`が空（NULL・空文字） | 400「回せるのはDriveの写真だけです」 |
+| 7 | `display`が空・`derivatives/<安全な名前>`でない・無い・通常のファイルでない（リンク・ディレクトリ・FIFO） | 400「表示用の画像がまだありません」 |
+| 8 | 新しい`rotation = (旧rotation（NULLは0）+ delta) mod 360`（負の剰余は非負。`45`や`1000`のような90の倍数でない値の行もそのまま足す）。名前は`derivative_name(drive_id, rotation)`（0なら`<drive_id>.jpg`に戻る）。`drive_id`が名前に使えない | 500（定型文。詳細はログにだけ） |
+| 9 | 回して`.part`経由で保存（`create_new`＋`O_NOFOLLOW`、`fsync`、`rename`。`DATA_DIR/derivatives`の外に出ない）。画像が読めない・書けない | 500、何も残さない |
+| 10 | DBを条件付きで更新（§17.8.4） | 409（行が消えていれば404） |
+| 11 | 旧ファイルと新ファイルの`display`が違えば旧ファイルを消す（`derivatives/`直下の通常ファイルだけ） | 消せなくても成功。ログは固定の文言だけ |
+
+応答`{ok:true, id, rotation, thumb:"/"+display}`（`display`は`derivatives/<名前>`）。エラーの文面は現行と同じ。検査の順は現行と同じ（`id`→`delta`→行→`source`/`drive_id`→`display`）で、Rustの503（3）は`delta`の検査のあと・行の検索の前（E12・E13と同じ）。
+
+#### 17.8.2 画像
+
+- `imaging::rotate_jpeg`: 派生画像をデコードして`manual_orientation(delta)`だけを当て、JPEG品質85・4:2:0・ハフマン表の最適化なし（P2の`derivative`と同じ設定）で書く。Pillowの`im.rotate(-delta, expand=True).save(.., "JPEG", quality=85)`に当たる。**EXIFの向きを当てない**（Pillowの`rotate`も当てない。EXIFの向きが付いたJPEGは、Pythonも向きを無視して回す）、**縮小しない**（派生画像は作ったときに2560pxに収まっている）、**ICCを変換せず付けない**。グレーはグレーのまま。出力に**EXIF・GPS・ICCを付けない**（エンコーダに渡さない。Pythonの`save`も付けない）。
+- 向きは時計回り: 左上の色は右上へ移る（`+90`で四隅が`[青,赤,黄,緑]`）。寸法はPillowと完全一致（`-90`＝反時計回り、`180`は同じ寸法）。画素はデコーダ（zune-jpeg対libjpeg）・再エンコードの差で一致しない。測定（なだらかな合成画像400×260・品質92の入力、Pillow 13.0との比較）: 平均の絶対差1.4〜2.5、PSNR 34〜40 dB。Rust自身の「回した元の画素」との比較は平均の差3未満（`rotate/tests.rs`）。
+- `imaging::write_atomic`: P2の`make_derivative`の書き出しを関数に分けたもの（挙動は同じ）。既存のリンク（切れたリンクも）に作らず別の名前で作り直し、出力先がリンクならそのリンク自体を置き換えて先を書き換えない。
+
+#### 17.8.3 失敗の後始末
+
+| 失敗 | 結果 |
+| --- | --- |
+| 画像が読めない・書き出せない（`.part`の作成・`fsync`・`rename`） | 自分の`.part`と新しいファイルを残さない。旧ファイルとDBは元のまま。500 |
+| DBの更新が失敗（SQLiteのエラー・writerの停止） | 新しいファイルを消す（DBが今そのファイルを指しているなら消さない）。旧ファイルとDBは元のまま。500 |
+| 条件が外れた（§17.8.4） | 同じ後始末。409／404 |
+| 新しい名前が今の`display`と同じ（`display`と`rotation`が食い違った行） | Pythonと同じにそのファイルへ上書きする（旧ファイルは消さない）。DBの更新が失敗・条件が外れたら、読んでおいた元の内容を書き戻す |
+| DB更新のあと旧ファイルを消せない | 応答は成功（Pythonの`unlink(missing_ok=True)`と同じ）。ログは「古い表示用ファイルを削除できませんでした」だけ（ファイル名・`drive_id`・`id`を出さない）。旧ファイルは孤児で残る |
+
+#### 17.8.4 競合
+
+writerは単一接続なので、DBへの書き込みどうしは割り込めない。ファイルとDBを別々に変える回転は、次の守りで`display`と実在するファイルの食い違いを防ぐ。
+
+- **排他**: `imaging::lock_derivatives()`（プロセスで1つのMutex）を、回転は「行を読む」から「旧ファイルを消す」まで、取得（`fetch_derivatives`）は「derivativeを作る」から「`display`をDBに書く」まで持つ（原本のダウンロードの間は持たない）。writerの依頼はロックを取らないのでデッドロックしない。
+- **条件付きの更新**: `UPDATE photos SET display=?, rotation=? WHERE id=? AND display IS ? AND rotation IS ? AND md5 IS ? AND fetched_at IS ?`（読んだ時点の値。`IS`でNULLも一致）。`md5`・`fetched_at`も条件に入れるのは、`display`が一度NULLにされて取得が同じ名前（`<drive_id>.jpg`）で**変わった原本から**作り直すと、`display`・`rotation`が元に戻って見えるため（ABA）。外れたら何も書かず、新しいファイルを消して409。
+
+| 場面 | どうなるか | 守り | 試験 |
+| --- | --- | --- | --- |
+| 回転が2本同時（同じ写真） | ロックで1本ずつ。累積して反映（90を6本→回転は{0,90,90,180,180,270}がそれぞれ1回、最後は180・`<drive_id>.r180.jpg`だけ） | `lock_derivatives` | `rotate::tests::同じ写真への回転が同時に来ても…`、`tests/rotate_api.rs`（実際のHTTPで同時に4本） |
+| 取得が同じ写真のderivativeを書いている最中 | 取得はderivativeを作る前にロックを取るので、回転の終わりまで待つ。回転が読んだ`display`はその間に変わらない。取得の候補は`display`がNULLの行だけなので、回転が対象にできる行（`display`あり）は取得の対象外 | `lock_derivatives`（取得側） | `drive::tests::fetch_waits_for_a_rotation_in_progress_and_leaves_no_orphan`（取得が待つこと、回転が負けたあとの取り直しで`display`が実在するファイルを指し、孤児が残らないこと） |
+| 同期サイクルが`display`をNULLにした直後（`infer`の取り消し・`md5`の変更） | 回転が読んだ後なら、条件が外れて409。新しいファイルは消える。旧ファイルは残り、取得が同じ名前で作り直す（`rotation`は`md5`の変更で0に戻る）。`display`が消えたファイルを指すことも、古い原本の回転済みの画像が`display`に入ることもない | 条件付きの更新 | `rotate::tests::途中でdisplayがnullになったら…`、`…md5が変わって索引が…`、`…同じdisplayに作り直されても…`（ABA） |
+| 同じ名前で取得が作り直した | DBが今指しているファイルは、回転が負けても消さない | 後始末は`current display != 新しい名前`のときだけ消す | `rotate::tests::dbが今指しているファイルと新しい名前が同じなら…` |
+| 行が消えた（`index_drive`） | 404。新しいファイルを消す | 条件付きの更新＋`SELECT` | `rotate::tests::途中で行が消えたら…` |
+| 品質の解析が旧ファイルを読んでいる最中 | 解析は読んだ時点の`display`を特徴量の行に書く。回転で`display`が変わると行は「未解析」に戻り（`f.display=p.display`の結合）、品質はその古い結果から作られず、次のサイクルが新しいファイルを解析し直す。旧ファイルが読む前に消えていたら、失敗の行が`display`＝旧ファイルで付くが、同じく次のサイクルで解析し直される | `quality.rs`の`display`の突き合わせ（P2。変更なし） | `quality::tests::解析の途中で回転が入っても…`（読む前に消える／読んだあとに回る、の2通り） |
+| 書き込みの失敗 | §17.8.3 | | `rotate::tests::dbの更新に失敗したら…`、`書き出しに失敗したら…` |
+
+Pythonは、①同期サイクルが`display`をNULLにしたあとでも古い画像を`display`に書き戻し（取得は取り直さない）、②回転どうしの片方を失い、③無条件に`src`を消す（同じ名前で作り直されたファイルを消しうる）。**残る穴**: `index_drive`が一覧から消えた行と一緒に消すderivativeは、計画を読んだ時点の`display`のファイルなので、その直後（数ミリ秒）に回転が入ると新しいファイルが孤児で1つ残る（増え続けない。Pythonも同じ）。`md5`の変更で`rotation`が0に戻る経路が古い回転済みのファイルを残すこと（[inventory.md §2.3](inventory.md)③）は、T3.7で方針を決めるまでPythonと同じ。
+
+#### 17.8.5 Pythonとの差（まとめ）
+
+§0の2行に同じ。①小数の`delta`は400。②`display`がリンク・`derivatives/<安全な名前>`でない・通常のファイルでないとき400。③`drive_id`が名前に使えないとき500。④writerが無ければ503。⑤条件付きの更新で409。⑥ロックによる直列化。いずれも安全側の差か、Pythonが失う場面を守る差で、状態コード・応答・DB・ファイルがPythonと一致するのは、フィクスチャの57ケースのうち`known_differences`の5件（`id`が`i64`超・リンクの`display`・`derivatives/`の外の`display`・小数の`delta`2件）を除く52ケース。
+
+#### 17.8.6 テスト
+
+- `tests/rotate_api.rs`: `tools/gen_rotate_fixture.py`（`app/tests/rotate_fixture.py`）が、合成のderivative（JPEGの4色の象限、グレー、EXIF・GPS付き）を置いた現行`admin_rotate`に57ケースを順に流した結果（状態コード・応答のJSON・`photos`の変化・ファイルの増減と画像の寸法・四隅の色・EXIFの有無）と、同じDB・同じ画像を作り直したRustのサーバーの結果が一致する。ケース: 4方向の累積（90を4回で元の名前・元の向き）、`-90`・`180`・`270`、NULL・0・負・90の倍数でない`rotation`、新しい名前が今の`display`と同じ行、ローカルの写真・`drive_id`がNULL／空・`display`がNULL／ファイル無し／ディレクトリ／画像でない、`delta`の各種の不正値、`id`の各種の不正値、検査の順序、意図した差5件。`.part`が残らないことも確かめる。writerなしの503（ファイルもDBも変わらない）、同時の4本の回転。
+- `src/rotate/tests.rs`: 検査の境界、JPEGの設定（ベースライン・4:2:0・EXIF/GPS/ICCなし・グレーは1成分）、画素の近さ、失敗の後始末（`rename`の失敗・書き込めないディレクトリ・DBのトリガーによる失敗・同じ名前の書き戻し・旧ファイルを消せない）、競合（§17.8.4）、リンク（`display`・`derivatives/`・新しい名前の位置。外のファイルが読まれず消されず作られない）、`drive_id`の不正。旧ファイルを消せない試験のログは固定の文言だけで、ファイル名を含まない。
+- `drive::tests`（取り直しで回転が同じ名前・同じ向きになる、取得がロックで待つ）、`quality::tests`（解析の途中の回転）。`app/tests/test_rotate_fixture.py`: フィクスチャが最新であること、Pythonの癖の記録（四隅の色の向き、EXIFの向きを当てないこと、リンクの`display`が辿られること）。
+- 割り込みは`rotate::rotate_with`の`between`（新しいファイルを書いたあと・DBを更新する前に1回呼ぶ閉包）。条件（`md5`・`fetched_at`）を外す、`current display`の確認を外す、取得のロックを外すと、それぞれの試験が落ちることを確認した。
+
+#### 17.8.7 回したもの
+
+- **T3.7**: 回転済みの写真が`md5`の変更で`rotation`0に戻り、古い回転済みのファイルが残る経路（[inventory.md §2.3](inventory.md)③）。
+- **T3.8**: 検証環境での回転の受入（比較用Python `:8090`に同じ要求を送る）。

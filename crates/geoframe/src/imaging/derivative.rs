@@ -588,6 +588,47 @@ pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
     Ok(Rendered { jpeg, info })
 }
 
+/// 既存の derivative を時計回りに `delta` 度回した JPEG にする（管理画面の回転。Python の
+/// `im.rotate(-delta, expand=True).save(.., "JPEG", quality=85)`）。
+///
+/// [`render`] との違い: **EXIF の向きを当てない**（Pillow の `rotate` は当てない）、**縮小しない**（derivative は
+/// 作ったときに 2560px に収まっている）、**ICC を変換せず付けない**（Pillow は付けない）。グレーはグレーのまま。
+/// 出力に EXIF（GPS を含む）は付かない。`delta` は 90 の倍数（負・360 超は剰余）。
+pub fn rotate_jpeg(bytes: &[u8], delta: i32) -> Result<Rendered, ImageError> {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageError::FileTooLarge);
+    }
+    let rot = delta.rem_euclid(360);
+    if rot % 90 != 0 {
+        return Err(ImageError::BadRotation);
+    }
+    let (format, decoded) = decode_any(bytes)?;
+    let input = (decoded.raster.width, decoded.raster.height);
+    let raster = orient(decoded.raster, manual_orientation(rot as u16))?;
+    let jpeg = encode_jpeg(&raster)?;
+    let info = DerivativeInfo {
+        format,
+        input,
+        output: (raster.width, raster.height),
+        exif_orientation: decoded.orientation,
+        gray: raster.channels == 1,
+        icc: IccOutcome::None,
+        bytes: jpeg.len(),
+    };
+    Ok(Rendered { jpeg, info })
+}
+
+/// derivative のファイルを作る・差し替える・消す処理の直列化。回転（管理画面）と取得（`fetch_derivatives`）が
+/// 同じ写真の derivative を同時に書き換えて、DB の `display` と実在するファイルが食い違わないようにする。
+/// ファイルを書くところからその `display` を DB に書くところまで（または、読んだ `display` を DB で
+/// 確かめて消すところまで）を、このロックを持ったまま行う。ロックの中で待つのは writer だけで、
+/// writer の依頼はこのロックを取らない（デッドロックしない）。
+pub fn lock_derivatives() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// 種類を決められなかったバイト列の失敗: BigTIFF は専用のエラー、それ以外は画像でない。
 pub(super) fn not_an_image(bytes: &[u8]) -> ImageError {
     if Format::is_bigtiff(bytes) {
@@ -697,17 +738,24 @@ pub fn make_derivative(
     let bytes = read_limited(src)?;
     let rendered = render(&bytes, rotation)?;
     drop(bytes);
+    write_atomic(dest, &rendered.jpeg)?;
+    Ok(rendered.info)
+}
+
+/// `dest` に `jpeg` を書く。`.part` を排他的に新規作成して書き、`fsync` してから `rename` する（読み手に
+/// 書きかけを見せない）。失敗しても自分の `.part` は残さず、`dest` は元のまま。親ディレクトリは作る。
+pub fn write_atomic(dest: &Path, jpeg: &[u8]) -> Result<(), ImageError> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
     let (mut file, mut part) = create_part(dest, || part_name(dest))?;
-    file.write_all(&rendered.jpeg)?;
+    file.write_all(jpeg)?;
     // rename の前にディスクへ（電源断で空のファイルが derivative として残らないように）
     file.sync_all()?;
     drop(file);
     fs::rename(&part.path, dest)?;
     part.committed = true;
-    Ok(rendered.info)
+    Ok(())
 }
 
 /// 取り込みの結果: DB の `display` に入れる相対パスと生成の内容。

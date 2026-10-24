@@ -21,7 +21,7 @@ use crate::cache::Cache;
 use crate::config::{Config, Overrides};
 use crate::jwt::Rs256Signer;
 use crate::sync::{Counts, Mode, Stage, StageCtx, StageOutcome, StageResult};
-use crate::testutil::TempDir;
+use crate::testutil::{TempDir, capture};
 use crate::writer::{OpenMode, Writer};
 use std::sync::atomic::Ordering;
 
@@ -2701,75 +2701,6 @@ fn the_original_is_removed_explicitly_and_the_drop_only_covers_what_is_left() {
 // ---------------------------------------------------------------------------
 // 実際のログ出力の検査
 
-/// `tracing` の出力を、試験のスレッドごとに捕まえる。
-///
-/// `with_default` だけだと、並列に動く他の試験が先に通した呼び出し地点の「興味なし」の判定が残って、
-/// 出るはずの行が捕まらないことがある。そこで**プロセスで 1 つの購読側**（全レベル）を 1 回だけ入れ、
-/// 書き込み先だけをスレッドごとに差し替える（捕まえていないスレッドの出力は捨てる）。
-mod capture {
-    use std::cell::RefCell;
-    use std::io::Write;
-    use std::sync::{Arc, Mutex, Once};
-
-    type Sink = Arc<Mutex<Vec<u8>>>;
-
-    thread_local! {
-        static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
-    }
-
-    struct ThreadWriter;
-
-    impl Write for ThreadWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            SINK.with(|sink| {
-                if let Some(sink) = sink.borrow().as_ref() {
-                    sink.lock().unwrap().extend_from_slice(buf);
-                }
-            });
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    struct Maker;
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Maker {
-        type Writer = ThreadWriter;
-
-        fn make_writer(&'a self) -> ThreadWriter {
-            ThreadWriter
-        }
-    }
-
-    /// `f` を動かし、そのスレッドで出たログ（本番と同じ書式・フィルター。全レベル）を返す。
-    pub fn logs_of(f: impl FnOnce()) -> String {
-        static INSTALL: Once = Once::new();
-        INSTALL.call_once(|| {
-            tracing::subscriber::set_global_default(crate::logging::subscriber(
-                crate::config::LogLevel::Trace,
-                Maker,
-            ))
-            .expect("試験のログの購読側は 1 回だけ入れる");
-        });
-        let sink: Sink = Arc::default();
-        SINK.with(|s| *s.borrow_mut() = Some(Arc::clone(&sink)));
-        // `f` がパニックしても、次の試験に出力を持ち越さない
-        struct Reset;
-        impl Drop for Reset {
-            fn drop(&mut self) {
-                SINK.with(|s| *s.borrow_mut() = None);
-            }
-        }
-        let _reset = Reset;
-        f();
-        let bytes = sink.lock().unwrap().clone();
-        String::from_utf8(bytes).expect("ログは UTF-8")
-    }
-}
-
 #[test]
 fn derived_debug_output_hides_names_times_and_locations() {
     let file = RemoteFile {
@@ -2937,4 +2868,129 @@ fn the_actual_log_output_never_contains_names_coordinates_times_keys_or_tokens()
     ] {
         assert!(!log.contains(needle), "{needle} in:\n{log}");
     }
+}
+
+// ---------------------------------------------------------------------------
+// 回転（P3 / T3.2 の E14）との関係
+
+fn rotate_api(e: &Env, id: i64, delta: i64) -> Result<Value, crate::post::ApiError> {
+    let payload = json!({"id": id, "delta": delta});
+    crate::rotate::rotate(payload.as_object().unwrap(), Some(&e.writer), e.root())
+}
+
+fn derivative_names(e: &Env) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(e.root().join("derivatives"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// 回した写真が取り直されるとき（`display` が NULL に戻った: 推定の取り消し・同じ原本の再取得）、
+/// `fetch_derivatives` は行の `rotation` を当て、回転の API と同じ名前・同じ向きになる。
+#[test]
+fn a_rotated_photo_is_fetched_again_with_the_same_name_and_orientation() {
+    let e = env("drive-fetch-after-rotate");
+    e.listing(vec![jpeg("j1", "a.jpg", "m1")]);
+    e.stub.set_media("j1", crate::rotate::tests::jpeg(80, 40));
+    e.index();
+    e.done(&e.fetch_stage());
+    let id = id_of(&e, "j1");
+    let measure = |name: &str| {
+        crate::rotate::tests::measure(&fs::read(e.root().join("derivatives").join(name)).unwrap())
+    };
+    assert_eq!(
+        measure("j1.jpg"),
+        ((80, 40), vec!["red", "green", "blue", "yellow"])
+    );
+
+    // 管理画面で時計回りに 90°
+    let out = rotate_api(&e, id, 90).unwrap();
+    assert_eq!(out["thumb"], "/derivatives/j1.r90.jpg");
+    let rotated = measure("j1.r90.jpg");
+    assert_eq!(rotated, ((40, 80), vec!["blue", "red", "yellow", "green"]));
+    assert_eq!(derivative_names(&e), ["j1.r90.jpg"]);
+
+    // `display` が NULL に戻って（`rotation` は残る）取り直される: 同じ名前・同じ向き
+    e.sql("UPDATE photos SET display=NULL WHERE drive_id='j1'");
+    let counts = e.done(&e.fetch_stage());
+    assert_eq!(get(&counts, "fetched"), 1);
+    let row = row_of(&e, "j1").unwrap();
+    assert_eq!(
+        text(&row, "display").as_deref(),
+        Some("derivatives/j1.r90.jpg")
+    );
+    assert_eq!(int(&row, "rotation"), 90);
+    assert_eq!(measure("j1.r90.jpg"), rotated);
+    assert_eq!(derivative_names(&e), ["j1.r90.jpg"]);
+
+    // 4 回目の回転で 0 に戻ると、取り直しも元の名前で元の向き
+    rotate_api(&e, id, 90).unwrap();
+    rotate_api(&e, id, 90).unwrap();
+    rotate_api(&e, id, 90).unwrap();
+    assert_eq!(derivative_names(&e), ["j1.jpg"]);
+    e.sql("UPDATE photos SET display=NULL WHERE drive_id='j1'");
+    e.done(&e.fetch_stage());
+    assert_eq!(
+        measure("j1.jpg"),
+        ((80, 40), vec!["red", "green", "blue", "yellow"])
+    );
+    assert_eq!(derivative_names(&e), ["j1.jpg"]);
+}
+
+/// 回転の途中（新しいファイルを書いたあと・DB を更新する前）に、同期サイクルが同じ写真の `display` を
+/// NULL にし、取得が別の写真を取りに来る。取得はファイルの書き込みと DB の更新の間、回転の終わりまで待ち、
+/// 回転は 409 で新しいファイルを消す。取り直しのあとも、`display` は実在するファイルを指し、孤児は残らない。
+#[test]
+fn fetch_waits_for_a_rotation_in_progress_and_leaves_no_orphan() {
+    let e = env("drive-fetch-rotate-race");
+    e.listing(vec![jpeg("j1", "a.jpg", "m1")]);
+    e.stub.set_media("j1", crate::rotate::tests::jpeg(80, 40));
+    e.index();
+    e.done(&e.fetch_stage());
+    let id1 = id_of(&e, "j1");
+    // 2 枚目が加わる（まだ取得していない）
+    e.listing(vec![jpeg("j1", "a.jpg", "m1"), jpeg("j2", "b.jpg", "m2")]);
+    e.stub.set_media("j2", crate::rotate::tests::jpeg(80, 40));
+    e.index();
+
+    let payload = json!({"id": id1, "delta": 90});
+    let (result, fetch_waited) = std::thread::scope(|scope| {
+        let fetch = std::cell::RefCell::new(None);
+        let waited = std::cell::Cell::new(false);
+        let result = crate::rotate::rotate_with_for_tests(
+            payload.as_object().unwrap(),
+            &e.writer,
+            e.root(),
+            &|| {
+                // 取得が始まる。原本は取れるが、derivative を作る前の排他で待たされる
+                *fetch.borrow_mut() = Some(scope.spawn(|| e.done(&e.fetch_stage())));
+                std::thread::sleep(Duration::from_millis(400));
+                waited.set(!fetch.borrow().as_ref().unwrap().is_finished());
+                // 同期サイクルが j1 の display を NULL にした（回転が読んだあと）
+                e.sql("UPDATE photos SET display=NULL WHERE drive_id='j1'");
+            },
+        );
+        let counts = fetch.borrow_mut().take().unwrap().join().unwrap();
+        assert_eq!(get(&counts, "fetched"), 1, "j2 が取れた");
+        (result, waited.get())
+    });
+    assert!(fetch_waited, "取得は回転が終わるまで derivative を作らない");
+    assert_eq!(
+        crate::rotate::tests::status(result),
+        "409",
+        "回転は負けて何も書かない"
+    );
+    // j2 が取れ、j1 は display が NULL のまま。回転の新しいファイル（j1.r90.jpg）は消えている
+    assert_eq!(derivative_names(&e), ["j1.jpg", "j2.jpg"]);
+    assert!(text(&row_of(&e, "j1").unwrap(), "display").is_none());
+    // 次の取得が j1 を同じ名前で取り直す: display は実在するファイルを指す
+    e.done(&e.fetch_stage());
+    for drive_id in ["j1", "j2"] {
+        let row = row_of(&e, drive_id).unwrap();
+        let display = text(&row, "display").unwrap();
+        assert!(e.root().join(&display).is_file(), "{drive_id}: {display}");
+    }
+    assert_eq!(derivative_names(&e), ["j1.jpg", "j2.jpg"]);
 }
