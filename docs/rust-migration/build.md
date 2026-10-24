@@ -199,3 +199,15 @@ strip前のバイナリのシンボルを`nm -C -S`でcrate別に合計した目
 | `tiff` | 約0.1 MiB |
 
 `fast_image_resize`が全体の約3割で突出している。置き場所が家庭のサーバー1台でバイナリのサイズが問題にならないので、**今は何もしない**。必要になったら、`[profile.release.package.fast_image_resize] opt-level = "s"`（縮小は約34 ms／枚で、全体の15%）や、`lto = "thin"`・`strip = true`（stripだけで約1.7 MiB減る）を試す。
+
+## 9. ローカル写真の索引の依存（P2 / T2.3）
+
+`local_derivatives`のファイル名`local_<md5(path)[:16]>.jpg`（現行の`hashlib.md5`）を作るため、**`md-5` 0.11.0を足した**（RustCryptoの純Rust実装。`digest`・`crypto-common`・`block-buffer`・`hybrid-array`・`typenum`・`const-oid`が一緒に入る。いずれもCのビルドは無い）。暗号の用途ではなく、既存の名前との互換のためだけ（`ring`にMD5は無い）。
+
+| | strip前 | strip後 |
+| --- | --- | --- |
+| T2.2の画像処理を入れた後（§8.2。基準） | 15,812,376 B（約15.1 MiB） | 13,491,064 B（約12.9 MiB） |
+| T2.3のローカル索引・`organize`・`md-5`を入れた後 | 16,003,320 B（約15.3 MiB） | 13,638,584 B（約13.0 MiB） |
+| 差 | +190,944 B（約+0.2 MiB） | +147,520 B（約+0.1 MiB） |
+
+`static-pie linked`・`ldd`は`statically linked`のまま。実装の説明は[server.md §13](server.md)。
