@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use geoframe::config::{Config, Overrides};
 use geoframe::db::Catalog;
 use geoframe::feed::{Photo, QualityKind};
+use geoframe::limits::{ConnLimits, LimitedListener};
 use geoframe::server::{AppState, router};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -347,6 +348,8 @@ pub async fn spawn_with_env(
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let app = router(AppState::new(Arc::new(config), catalog));
+    // 本番（`server::serve`）と同じく、接続の上限・無通信の打ち切りを通す
+    let listener = LimitedListener::new(listener, ConnLimits::default());
     tokio::spawn(async move { axum::serve(listener, app).await });
     addr
 }
