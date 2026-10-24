@@ -24,7 +24,7 @@ AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ�
 |---|---|---|---|---|---|---|---|---|
 | T1.1 | 設定（`GEOFRAME_*`）、SQLite読み取り層、ログ方針、ヘルス確認 | AC5, AC7 | P0 | full | 完了 | c41c4a9 | dc13801..52c7d8f | 検証環境の本番コピーでスキーマ検査を通過・/healthz 200（管理者確認）。レビュー（Solが利用上限のためOpusで代替）: 必須0、推奨4・参考を反映（パニック文言の固定、開きっぱなしのトランザクションのROLLBACK、/healthz専用接続、順番待ち10秒上限） |
 | T1.2 | `GET /api/v1/photos`（除外・並び・タイトル・旅番号） | AC1, AC6 | T1.1 | full | 完了 | fae0fe6 | 9ae7fd0..5d8acc9 | 検証環境の本番コピー3,065件でPythonとJSON完全一致（管理者確認）。レビュー（Sol）: 必須0。推奨「全角数字の時刻」は文書に既知の差として記録しP2のインデクサで解消、参考「iterdumpの書式依存」は見送り |
-| T1.3 | 静的配信（ホワイトリスト・ドットファイル・トラバーサル・HEAD）、Host検査、管理画面ページ、静的ファイルの埋め込み | AC1, AC5 | T1.1 | full | 未着手 | | | T1.1レビュー: データ置き場がシンボリックリンクのとき、Pythonは`resolve()`で辿る。データ置き場も起動時に`canonicalize`してから比べる |
+| T1.3 | 静的配信（ホワイトリスト・ドットファイル・トラバーサル・HEAD）、Host検査、管理画面ページ、静的ファイルの埋め込み | AC1, AC5 | T1.1 | full | 実装中 | 48c9aaa | | T1.1レビュー: データ置き場がシンボリックリンクのとき、Pythonは`resolve()`で辿る。データ置き場も起動時に`canonicalize`してから比べる |
 | T1.4 | 管理画面の読み取りAPI（`/api/admin/status`・`/api/admin/photos`ほか） | AC1 | T1.1 | full | 未着手 | | | |
 | T1.5 | systemd unit、検証環境への配布スクリプト、Pythonとの全件比較スクリプト、miharashiの実プロセスでの取得確認 | AC1, AC5, AC6 | T1.2, T1.3 | full | 未着手 | | | 実クライアントでの確認はP0の設計案レビューで先送りしたもの。unitの注意はserver.md §6（`RestartPreventExitStatus=2`、`--listen`、`User=geoframe`） |
 
