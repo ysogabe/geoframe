@@ -18,6 +18,9 @@
     python3 tools/gen_geo_fixture.py          # 書き出す
     python3 tools/gen_geo_fixture.py --check  # 保存済みのシナリオをPythonに通し直し、結果が一致するか検査する
 
+`enrich_key_collision`の`first`は、Rustの試験が「障害で止まった国内の行を後の国外の行が追い越さず、直ったあとにPythonと
+同じ地名・キャッシュに収束する」ことの期待値にも使う（障害の流し方はRust側の試験にある）。
+
 意図した差（通信の障害での中断、`lon`がNULLの行など）は、このフィクスチャには入れず、Rustの単体テストで確かめる
 （`docs/rust-migration/server.md` §0・§15）。出力先は crates/geoframe/tests/fixtures/ の下。
 """

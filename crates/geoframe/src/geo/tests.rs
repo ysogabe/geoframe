@@ -1459,7 +1459,11 @@ fn 再試行の待ちの途中で停止の合図が来たら打ち切る() {
         started.elapsed() < Duration::from_secs(10),
         "待ちを打ち切る"
     );
-    assert_eq!(get(&counts, "queried"), 0);
+    // 最初の要求を出した行は通信済みなので数える（確定しなかった行として）
+    assert_eq!(get(&counts, "queried"), 1);
+    assert_eq!(get(&counts, "resolved"), 0);
+    assert_eq!(get(&counts, "unresolved"), 1);
+    assert_eq!(get(&counts, "deferred"), 0);
     assert_eq!(stub.count(Kind::Rgeo), 1, "再試行に進まない");
     for id in [1, 2] {
         assert_eq!(s.row(id)["place"], Value::Null);
@@ -1645,6 +1649,323 @@ fn 通信できない間も同じキーの行は追い越さない() {
             "{cause}: 国外の空に当たる（現行と同じ順）"
         );
     }
+}
+
+/// 国内の先の行が障害で確定しないとき、同じキーの国外の後の行は追い越して空のキャッシュを作ってはいけない:
+/// 先の行は、直ったあとに問い合わせた結果で確定する（単発の 503）。
+#[test]
+fn 単発の障害で止まった国内の行を同じキーの国外の行が追い越さない() {
+    let s = setup("geo-enrich-collision-outage");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    stub.set_elev(|_, _| Reply::Status(503));
+    s.sql(&format!(
+        "{};{};{};{}",
+        photo(1, None, Some((20.0001, 130.0)), Some("exif")), // 国内: 503 で確定しない
+        photo(2, None, Some((19.9999, 130.0)), Some("exif")), // 国外・同じキー: 追い越さない
+        photo(3, None, Some((20.0002, 130.0)), Some("exif")), // 国内・同じキー: 追い越さない
+        photo(4, None, Some((19.9999, 131.0)), Some("exif")), // 国外・別のキー: 済ませる
+    ));
+    let enrich = Enrich::with(
+        GsiEndpoints::stub(&stub.base_url()),
+        Duration::ZERO,
+        FailureMemo::with_policy(Duration::from_millis(300), Duration::from_millis(300), 16),
+    )
+    .with_retry_wait(Duration::ZERO);
+    let first = s.run(&enrich);
+    assert_eq!(get(&first, "unresolved"), 1);
+    assert_eq!(get(&first, "deferred"), 2);
+    assert_eq!(get(&first, "foreign"), 1);
+    for id in [1, 2, 3] {
+        assert_eq!(s.row(id)["place"], Value::Null, "{id}");
+    }
+    assert_eq!(s.row(4)["place"], "");
+    assert!(
+        s.cache.get("geo:20.000,130.000").is_none(),
+        "空のキャッシュを作らない"
+    );
+    // バックオフ中の次のサイクル: 先の行を枠から外すだけでなく、同じキーの後の行も枠に入れない
+    let second = s.run(&enrich);
+    assert_eq!(get(&second, "skipped_backoff"), 1);
+    assert_eq!(get(&second, "skipped_blocked"), 2);
+    assert_eq!(get(&second, "candidates"), 0);
+    assert!(s.cache.get("geo:20.000,130.000").is_none());
+    // 直って、バックオフが明ける: 先の行が問い合わせた結果で確定し、後の行はその順で続く
+    tokyo_replies(&stub);
+    std::thread::sleep(Duration::from_millis(350));
+    let third = s.run(&enrich);
+    assert_eq!(get(&third, "resolved"), 1);
+    assert_eq!(s.row(1)["place"], "テスト町一丁目");
+    assert_eq!(s.row(2)["place"], "");
+    assert_eq!(s.row(3)["place"], "", "国外の空に当たる（現行と同じ順）");
+}
+
+/// 3 件目の障害で段を中断した次のサイクルでも、バックオフ中の行と同じキーの後の行は追い越さない。直ったあとは
+/// 現行（Python）の `first` と同じ地名・キャッシュに収束する。
+#[test]
+fn 障害で中断した次のサイクルも追い越さず_直れば現行と同じ地名に収束する() {
+    let doc = fixture();
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "enrich_key_collision")
+        .unwrap();
+    let step = &case["steps"][0];
+    assert_eq!(step["name"], "first");
+    let s = setup("geo-enrich-collision-converge");
+    let stub = StubGsi::start();
+    script_stub(&stub, case);
+    s.cache.put("muni_table", case["muni"].clone());
+    for (key, value) in step["cache"].as_object().unwrap() {
+        s.cache.put(key, value.clone());
+    }
+    for statement in step["sql"].as_array().unwrap() {
+        s.sql(statement.as_str().unwrap());
+    }
+    // 障害の間: 問い合わせる座標（緯度 20.0001 の 3 つ）がすべて 503
+    let healthy_rgeo = {
+        let table = case["gsi"]["rgeo"].clone();
+        move |lat: f64, lon: f64| {
+            table
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["lat"].as_f64() == Some(lat) && e["lon"].as_f64() == Some(lon))
+                .map_or_else(|| Reply::json("{}"), |e| reply_of(&e["reply"]))
+        }
+    };
+    stub.set_rgeo(|_, _| Reply::Status(503));
+    // バックオフを短くする。3 つの座標で続けて障害になるので、1 つ目の障害の行（id=1）が止まった次のサイクルに
+    // 国外の行（id=2）が入り込める条件になる
+    let enrich = Enrich::with(
+        GsiEndpoints::stub(&stub.base_url()),
+        Duration::ZERO,
+        FailureMemo::with_policy(Duration::from_millis(400), Duration::from_millis(400), 64),
+    )
+    .with_retry_wait(Duration::ZERO);
+    // 追加の行: id=1 の座標のほかに、障害の座標を 2 つ足して中断させる（国内・別のキー）
+    s.sql(&format!(
+        "{};{}",
+        photo(11, None, Some((21.0, 130.0)), Some("exif")),
+        photo(12, None, Some((22.0, 130.0)), Some("exif")),
+    ));
+    let first = s.try_run(&enrich);
+    // id=1 の障害と id=9 の障害は続く。id=11・12 でも障害になるので、3 つ目の座標で中断する
+    let err = first.unwrap_err().to_string();
+    assert!(err.contains("続けて3つの座標"), "{err}");
+    // 追い越されていない
+    for id in [1, 2, 3, 9, 10] {
+        assert_eq!(s.row(id)["place"], Value::Null, "第 1 サイクル: {id}");
+    }
+    assert!(s.cache.get("geo:20.000,130.000").is_none());
+    // 次のサイクル（バックオフ中）: 先の行 id=1 は飛ばされるが、同じキーの id=2・3 は枠に入らない
+    let second = s.try_run(&enrich);
+    let _ = second; // 中断の有無はここでは問わない（残りの行で再び障害が続くことがある）
+    for id in [1, 2, 3] {
+        assert_eq!(s.row(id)["place"], Value::Null, "第 2 サイクル: {id}");
+    }
+    assert!(
+        s.cache.get("geo:20.000,130.000").is_none(),
+        "空のキャッシュを作らない"
+    );
+    // 直る
+    stub.set_rgeo(healthy_rgeo);
+    std::thread::sleep(Duration::from_millis(450));
+    for _ in 0..3 {
+        let _ = s.try_run(&enrich);
+        std::thread::sleep(Duration::from_millis(450));
+    }
+    let want_rows = step["python"]["rows"].as_array().unwrap();
+    let got = s.rows();
+    for want in want_rows {
+        let id = want["id"].as_i64().unwrap();
+        let row = got.iter().find(|r| r["id"] == json!(id)).unwrap();
+        for column in ["place", "elev", "muni_cd", "pref", "city"] {
+            assert_eq!(row[column], want[column], "id={id} {column}");
+        }
+    }
+    let want_cache = step["python"]["cache"].as_object().unwrap();
+    let got_cache = geo_cache(&s.cache, want_cache);
+    for (key, want) in want_cache {
+        assert_eq!(got_cache.get(key), Some(want), "{key}");
+    }
+}
+
+/// バックオフ中の国内の行と同じキーの国外の行は、枠に入れず、国外の空のキャッシュを作らない。
+#[test]
+fn バックオフ中の国内の行と同じキーの国外の行は枠に入れない() {
+    let s = setup("geo-enrich-collision-backoff");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    stub.set_rgeo(|lat, _| {
+        if (lat - 20.0001).abs() < 1e-9 {
+            Reply::Text("broken".into())
+        } else {
+            Reply::json(r#"{"results":{"muniCd":"13101","lv01Nm":"テスト町一丁目"}}"#)
+        }
+    });
+    stub.set_elev(|lat, _| {
+        if (lat - 20.0001).abs() < 1e-9 {
+            Reply::Text("broken".into())
+        } else {
+            Reply::json(r#"{"elevation":12.5}"#)
+        }
+    });
+    s.sql(&format!(
+        "{};{};{}",
+        photo(1, None, Some((20.0001, 130.0)), Some("exif")), // 国内: 応答なし（NoAnswer）でバックオフに入る
+        photo(2, None, Some((19.9999, 130.0)), Some("exif")), // 国外・同じキー
+        photo(3, None, Some((36.0, 136.0)), Some("exif")),    // 別のキー: 進む
+    ));
+    let enrich = Enrich::with(
+        GsiEndpoints::stub(&stub.base_url()),
+        Duration::ZERO,
+        FailureMemo::with_policy(Duration::from_millis(300), Duration::from_millis(300), 16),
+    )
+    .with_retry_wait(Duration::ZERO);
+    let dry = s.dry_run(&[&enrich]);
+    assert_eq!(get(&dry, "skipped_blocked"), 0);
+    let first = s.run(&enrich);
+    assert_eq!(get(&first, "unresolved"), 1);
+    assert_eq!(
+        get(&first, "deferred"),
+        1,
+        "NoAnswer の行と同じキーの国外の行"
+    );
+    assert_eq!(get(&first, "resolved"), 1);
+    assert_eq!(s.row(2)["place"], Value::Null);
+    let second = s.run(&enrich);
+    assert_eq!(get(&second, "skipped_backoff"), 1);
+    assert_eq!(get(&second, "skipped_blocked"), 1);
+    assert_eq!(get(&second, "foreign"), 0);
+    assert_eq!(s.row(2)["place"], Value::Null);
+    assert!(s.cache.get("geo:20.000,130.000").is_none());
+    // `--dry-run`（バックオフ中の記憶は同じプロセスのものを使う）も同じ枠の選び方をする
+    let dry = s.dry_run(&[&enrich]);
+    assert_eq!(get(&dry, "skipped_backoff"), 1);
+    assert_eq!(get(&dry, "skipped_blocked"), 1);
+    assert_eq!(get(&dry, "foreign"), 0);
+    // 応答が返るようになり、バックオフが明ける
+    tokyo_replies(&stub);
+    std::thread::sleep(Duration::from_millis(350));
+    let third = s.run(&enrich);
+    assert_eq!(get(&third, "resolved"), 1);
+    assert_eq!(s.row(1)["place"], "テスト町一丁目");
+    assert_eq!(s.row(2)["place"], "");
+}
+
+/// 中断の判定は異なるキーで数える: 同じ座標の写真が 3 行障害でも、中断せず、その後の正常な座標が進む。
+#[test]
+fn 同じ座標の写真が何枚あっても障害は1つの座標として数える() {
+    let s = setup("geo-enrich-streak-same-key");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    stub.set_rgeo(|lat, _| {
+        if (lat - 36.0).abs() < 0.01 {
+            Reply::Status(503)
+        } else {
+            Reply::json(r#"{"results":{"muniCd":"13101","lv01Nm":"テスト町一丁目"}}"#)
+        }
+    });
+    s.sql(&format!(
+        "{};{};{};{}",
+        photo(1, None, Some((36.0, 136.0)), Some("exif")),
+        photo(2, None, Some((36.0, 136.0)), Some("exif")), // 同じ座標
+        photo(3, None, Some((36.0001, 136.0)), Some("exif")), // 同じキー
+        photo(4, None, Some((37.0, 137.0)), Some("exif")), // 正常な座標
+    ));
+    let enrich = enrich_with_memory(&stub);
+    let counts = s.run(&enrich); // 中断しない（Ok）
+    assert_eq!(get(&counts, "unresolved"), 1);
+    assert_eq!(get(&counts, "deferred"), 2);
+    assert_eq!(get(&counts, "resolved"), 1);
+    assert_eq!(s.row(4)["place"], "テスト町一丁目");
+    assert_eq!(
+        requests_for(&stub, Kind::Rgeo, 36.0),
+        3,
+        "同じ座標は 1 + 2 回だけ"
+    );
+}
+
+/// 段全体の経過時間の上限を超えたら、通信が要る未確定の行は次のサイクルへ回す（失敗にしない）。同じキーの後の行は
+/// 追い越さず、通信の要らない行は済ませる。要求の途中では打ち切らず、次の要求を始める前に見る。
+#[test]
+fn 段の経過時間の上限で打ち切り_残りは次のサイクルへ回す() {
+    let s = setup("geo-enrich-budget");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    // 逆ジオが 1 要求 150 ms かかる。上限は 400 ms（行ごとに 2 要求で 300 ms 前後）
+    stub.set_rgeo(|_, _| {
+        std::thread::sleep(Duration::from_millis(150));
+        Reply::json(r#"{"results":{"muniCd":"13101","lv01Nm":"テスト町一丁目"}}"#)
+    });
+    s.sql(&format!(
+        "{};{};{};{};{}",
+        photo(1, None, Some((36.0, 136.0)), Some("exif")),
+        photo(2, None, Some((37.0, 137.0)), Some("exif")),
+        photo(3, None, Some((20.0001, 130.0)), Some("exif")), // 上限のあと: 見送る
+        photo(4, None, Some((19.9999, 130.0)), Some("exif")), // 国外・同じキー: 追い越さない
+        photo(5, None, Some((-33.0, 151.0)), Some("exif")),   // 国外・別のキー: 済ませる
+    ));
+    let enrich = enrich_for(&stub).with_budget(Duration::from_millis(400));
+    let started = std::time::Instant::now();
+    let first = s.run(&enrich); // Ok: 失敗にしない
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_eq!(get(&first, "out_of_time"), 1);
+    // 1・2 行目は確定し（2 行目の途中で上限に達する場合もある）、少なくとも 3 行目には進んでいない
+    assert_eq!(s.row(1)["place"], "テスト町一丁目");
+    assert_eq!(s.row(3)["place"], Value::Null);
+    assert_eq!(
+        s.row(4)["place"],
+        Value::Null,
+        "同じキーの国外の行は追い越さない"
+    );
+    assert_eq!(s.row(5)["place"], "", "通信の要らない行は済ませる");
+    assert!(s.cache.get("geo:20.000,130.000").is_none());
+    assert_eq!(
+        get(&first, "queried"),
+        get(&first, "resolved") + get(&first, "unresolved")
+    );
+    // 上限で止まった行は記憶に入らない: 次のサイクルは待たずに続きから進み、現行と同じ順の結果になる
+    stub.set_rgeo(|_, _| {
+        Reply::json(r#"{"results":{"muniCd":"13101","lv01Nm":"テスト町一丁目"}}"#)
+    });
+    let second = s.run(&enrich);
+    assert_eq!(get(&second, "skipped_backoff"), 0);
+    assert_eq!(get(&second, "out_of_time"), 0);
+    assert_eq!(s.row(2)["place"], "テスト町一丁目");
+    assert_eq!(s.row(3)["place"], "テスト町一丁目");
+    assert_eq!(s.row(4)["place"], "");
+}
+
+/// 再試行込みの 1 行が長引いても、上限で次の要求（再試行）に進まない。
+#[test]
+fn 上限のあとは再試行に進まない() {
+    let s = setup("geo-enrich-budget-retry");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    stub.set_rgeo(|_, _| {
+        std::thread::sleep(Duration::from_millis(200));
+        Reply::Status(503)
+    });
+    s.sql(&domestic_rows(1));
+    // 1 回目の要求の終わりで上限を過ぎている
+    let enrich = enrich_for(&stub).with_budget(Duration::from_millis(100));
+    // 上限が先に見られる行頭ではなく、要求の最中に上限に達するように、1 行目だけは始める
+    let counts = s.run(&enrich);
+    assert_eq!(get(&counts, "out_of_time"), 1);
+    assert_eq!(get(&counts, "queried"), 1);
+    assert_eq!(get(&counts, "unresolved"), 1);
+    assert_eq!(stub.count(Kind::Rgeo), 1, "再試行に進まない");
+    assert_eq!(s.row(1)["place"], Value::Null);
+    // 記憶に入っていないので、次のサイクルは待たずに試す
+    tokyo_replies(&stub);
+    let next = enrich_for(&stub);
+    let counts = s.run(&next);
+    assert_eq!(get(&counts, "skipped_backoff"), 0);
+    assert_eq!(get(&counts, "resolved"), 1);
 }
 
 // ---------------------------------------------------------------- muni.js・書式

@@ -208,7 +208,7 @@ fn dry_run_writes_nothing_and_reports_counts() {
     );
     assert!(
         stdout.contains(
-            "段 enrich: 完了 candidates=1 foreign=1 cache_hit=0 would_query=0 unresolved=0 skipped_backoff=0 unusable=0 pending=1"
+            "段 enrich: 完了 candidates=1 foreign=1 cache_hit=0 would_query=0 unresolved=0 skipped_backoff=0 skipped_blocked=0 unusable=0 pending=1"
         ),
         "{stdout}"
     );
