@@ -4,20 +4,36 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod backoff;
+pub mod cache;
 pub mod cli;
 pub mod config;
+pub mod datadir;
 pub mod db;
+pub mod drive;
 pub mod embedded;
 pub mod feed;
+pub mod geo;
+pub mod guard;
 pub mod hostcheck;
+pub mod imaging;
+pub mod ingest;
+pub mod jwt;
 pub mod limits;
+pub mod local;
 pub mod logging;
+pub mod net;
 pub mod photos;
 pub mod pyquery;
+pub mod quality;
+pub mod schema;
 pub mod server;
 pub mod statics;
+pub mod stop;
+pub mod sync;
 pub mod sysinfo;
 pub mod webpath;
+pub mod writer;
 
 #[cfg(test)]
 mod testutil {

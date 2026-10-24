@@ -1,0 +1,1588 @@
+{
+ "objects": [
+  {
+   "type": "table",
+   "name": "photos",
+   "tbl_name": "photos",
+   "sql": "CREATE TABLE photos(\n  id INTEGER PRIMARY KEY,\n  source TEXT NOT NULL,             -- 'drive' | 'local'\n  drive_id TEXT UNIQUE,             -- DriveファイルID\n  path TEXT UNIQUE,                 -- ローカル原本の相対パス（drive行はNULL）\n  display TEXT,                     -- 表示用ファイル（derivative等）の相対パス\n  name TEXT NOT NULL,\n  md5 TEXT, mtime REAL,\n  taken_at TEXT,                    -- 'YYYY-MM-DD HH:MM'\n  lat REAL, lon REAL,\n  loc_source TEXT,                  -- 'exif' | 'drive_meta' | 'inferred' | 'manual' | NULL\n  inferred_from INTEGER,\n  infer_dt_s INTEGER,               -- 推定に使った錨との時間差（秒）。loc_source='inferred'時のみ\n  place TEXT, elev REAL,\n  title TEXT, ai_caption TEXT,      -- Phase3(Gemini)用\n  indexed_at TEXT, fetched_at TEXT\n, muni_cd TEXT, pref TEXT, city TEXT, favorite INTEGER DEFAULT 0, hidden INTEGER DEFAULT 0, rotation INTEGER DEFAULT 0)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_photos_1",
+   "tbl_name": "photos",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_photos_2",
+   "tbl_name": "photos",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_photos_time",
+   "tbl_name": "photos",
+   "sql": "CREATE INDEX idx_photos_time ON photos(taken_at)"
+  },
+  {
+   "type": "table",
+   "name": "settings",
+   "tbl_name": "settings",
+   "sql": "CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_settings_1",
+   "tbl_name": "settings",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "photo_quality",
+   "tbl_name": "photo_quality",
+   "sql": "CREATE TABLE photo_quality(\n  photo_id INTEGER PRIMARY KEY,\n  display TEXT NOT NULL,\n  source_md5 TEXT,\n  source_mtime REAL,\n  content_sha256 TEXT NOT NULL,\n  group_id INTEGER NOT NULL,\n  group_kind TEXT NOT NULL CHECK(group_kind IN ('exact','similar')),\n  rank_in_group INTEGER NOT NULL,\n  recommended INTEGER NOT NULL CHECK(recommended IN (0,1)),\n  score REAL NOT NULL,\n  reasons_json TEXT NOT NULL DEFAULT '[]',\n  issues_json TEXT NOT NULL DEFAULT '[]',\n  algorithm TEXT NOT NULL,\n  analyzed_at TEXT NOT NULL\n)"
+  },
+  {
+   "type": "index",
+   "name": "idx_photo_quality_group",
+   "tbl_name": "photo_quality",
+   "sql": "CREATE INDEX idx_photo_quality_group ON photo_quality(group_kind, group_id)"
+  },
+  {
+   "type": "table",
+   "name": "photo_quality_features",
+   "tbl_name": "photo_quality_features",
+   "sql": "CREATE TABLE photo_quality_features(\n  photo_id INTEGER PRIMARY KEY,\n  display TEXT NOT NULL,\n  source_md5 TEXT,\n  source_mtime REAL,\n  content_sha256 TEXT,\n  phash TEXT,\n  sharpness REAL,\n  luminance REAL,\n  exposure_score REAL,\n  black_clip REAL,\n  white_clip REAL,\n  contrast REAL,\n  error TEXT NOT NULL DEFAULT '',\n  analyzed_at TEXT NOT NULL\n)"
+  },
+  {
+   "type": "index",
+   "name": "idx_photo_quality_features_sha",
+   "tbl_name": "photo_quality_features",
+   "sql": "CREATE INDEX idx_photo_quality_features_sha\n  ON photo_quality_features(content_sha256)"
+  },
+  {
+   "type": "table",
+   "name": "photo_ai_features",
+   "tbl_name": "photo_ai_features",
+   "sql": "CREATE TABLE photo_ai_features(\n  photo_id INTEGER PRIMARY KEY,\n  display TEXT NOT NULL,\n  source_md5 TEXT,\n  source_mtime REAL,\n  content_sha256 TEXT NOT NULL,\n  embedding_model TEXT NOT NULL,\n  embedding_dim INTEGER NOT NULL,\n  embedding BLOB NOT NULL,\n  subject TEXT NOT NULL DEFAULT '',\n  pet_state TEXT NOT NULL DEFAULT '',\n  eyes TEXT NOT NULL DEFAULT '',\n  face_crop TEXT NOT NULL DEFAULT '',\n  horizon_status TEXT NOT NULL DEFAULT '',\n  horizon_score INTEGER,\n  subject_sharpness INTEGER,\n  aesthetic_score INTEGER,\n  keep_score INTEGER,\n  recommended INTEGER CHECK(recommended IS NULL OR recommended IN (0,1)),\n  reasons_json TEXT NOT NULL DEFAULT '[]',\n  concerns_json TEXT NOT NULL DEFAULT '[]',\n  judge_model TEXT,\n  analyzed_at TEXT NOT NULL,\n  error TEXT NOT NULL DEFAULT ''\n)"
+  },
+  {
+   "type": "index",
+   "name": "idx_photo_ai_features_sha",
+   "tbl_name": "photo_ai_features",
+   "sql": "CREATE INDEX idx_photo_ai_features_sha\n  ON photo_ai_features(content_sha256)"
+  },
+  {
+   "type": "table",
+   "name": "photo_embeddings",
+   "tbl_name": "photo_embeddings",
+   "sql": "CREATE TABLE photo_embeddings(\n  content_sha256 TEXT NOT NULL,\n  embedding_model TEXT NOT NULL,\n  embedding_dim INTEGER NOT NULL,\n  embedding BLOB NOT NULL,\n  analyzed_at TEXT NOT NULL,\n  PRIMARY KEY(content_sha256, embedding_model)\n)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_photo_embeddings_1",
+   "tbl_name": "photo_embeddings",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "photo_ai_groups",
+   "tbl_name": "photo_ai_groups",
+   "sql": "CREATE TABLE photo_ai_groups(\n  group_id TEXT PRIMARY KEY,\n  kind TEXT NOT NULL CHECK(kind IN ('scene','pet')),\n  summary TEXT NOT NULL DEFAULT '',\n  min_similarity REAL,\n  max_similarity REAL,\n  avg_similarity REAL,\n  algorithm TEXT NOT NULL,\n  analyzed_at TEXT NOT NULL,\n  status TEXT NOT NULL DEFAULT 'judged',\n  same_scene INTEGER NOT NULL DEFAULT 1,\n  judge_version TEXT NOT NULL DEFAULT '',\n  judge_model TEXT NOT NULL DEFAULT '',\n  shortlist_json TEXT NOT NULL DEFAULT '[]',\n  error TEXT NOT NULL DEFAULT '',\n  attempts INTEGER NOT NULL DEFAULT 0,\n  judge_order TEXT NOT NULL DEFAULT '',\n  presented_json TEXT NOT NULL DEFAULT '[]'\n)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_photo_ai_groups_1",
+   "tbl_name": "photo_ai_groups",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "photo_ai_group_members",
+   "tbl_name": "photo_ai_group_members",
+   "sql": "CREATE TABLE photo_ai_group_members(\n  group_id TEXT NOT NULL,\n  photo_id INTEGER NOT NULL,\n  rank_in_group INTEGER NOT NULL,\n  recommended INTEGER NOT NULL CHECK(recommended IN (0,1)),\n  shortlisted INTEGER NOT NULL DEFAULT 1,\n  local_score REAL,\n  PRIMARY KEY(group_id, photo_id)\n)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_photo_ai_group_members_1",
+   "tbl_name": "photo_ai_group_members",
+   "sql": null
+  },
+  {
+   "type": "index",
+   "name": "idx_photo_ai_group_members_photo",
+   "tbl_name": "photo_ai_group_members",
+   "sql": "CREATE INDEX idx_photo_ai_group_members_photo\n  ON photo_ai_group_members(photo_id)"
+  },
+  {
+   "type": "table",
+   "name": "photo_loc_clues",
+   "tbl_name": "photo_loc_clues",
+   "sql": "CREATE TABLE photo_loc_clues(\n  photo_id INTEGER PRIMARY KEY,\n  display TEXT NOT NULL,\n  source_md5 TEXT,\n  source_mtime REAL,\n  clue REAL,\n  kind TEXT NOT NULL DEFAULT '',\n  model TEXT NOT NULL,\n  analyzed_at TEXT NOT NULL,\n  error TEXT NOT NULL DEFAULT ''\n)"
+  },
+  {
+   "type": "table",
+   "name": "photo_loc_runs",
+   "tbl_name": "photo_loc_runs",
+   "sql": "CREATE TABLE photo_loc_runs(\n  run_id TEXT PRIMARY KEY,\n  day TEXT NOT NULL,\n  model TEXT NOT NULL,\n  prompt_version TEXT NOT NULL,\n  member_ids_json TEXT NOT NULL,\n  sent_ids_json TEXT NOT NULL,\n  status TEXT NOT NULL CHECK(status IN ('pending','done','error')),\n  attempts INTEGER NOT NULL DEFAULT 0,\n  answer_json TEXT NOT NULL DEFAULT '',\n  error TEXT NOT NULL DEFAULT '',\n  analyzed_at TEXT NOT NULL\n)"
+  },
+  {
+   "type": "index",
+   "name": "sqlite_autoindex_photo_loc_runs_1",
+   "tbl_name": "photo_loc_runs",
+   "sql": null
+  },
+  {
+   "type": "table",
+   "name": "photo_loc_suggestions",
+   "tbl_name": "photo_loc_suggestions",
+   "sql": "CREATE TABLE photo_loc_suggestions(\n  photo_id INTEGER PRIMARY KEY,\n  run_id TEXT NOT NULL,\n  scope TEXT NOT NULL CHECK(scope IN ('photo','day')),\n  place_name TEXT NOT NULL,\n  day_place_name TEXT NOT NULL DEFAULT '',\n  geocode_query TEXT NOT NULL DEFAULT '',\n  precision TEXT NOT NULL DEFAULT 'unknown',\n  confidence TEXT NOT NULL DEFAULT 'unknown',\n  evidence_json TEXT NOT NULL DEFAULT '[]',\n  lat REAL, lon REAL,\n  geocode_title TEXT NOT NULL DEFAULT '',\n  model TEXT NOT NULL,\n  analyzed_at TEXT NOT NULL\n)"
+  }
+ ],
+ "tables": {
+  "photos": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "id",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "source",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "drive_id",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "path",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "display",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "name",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 6,
+     "name": "md5",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 7,
+     "name": "mtime",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 8,
+     "name": "taken_at",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 9,
+     "name": "lat",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 10,
+     "name": "lon",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 11,
+     "name": "loc_source",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 12,
+     "name": "inferred_from",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 13,
+     "name": "infer_dt_s",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 14,
+     "name": "place",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 15,
+     "name": "elev",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 16,
+     "name": "title",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 17,
+     "name": "ai_caption",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 18,
+     "name": "indexed_at",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 19,
+     "name": "fetched_at",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 20,
+     "name": "muni_cd",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 21,
+     "name": "pref",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 22,
+     "name": "city",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 23,
+     "name": "favorite",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": "0",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 24,
+     "name": "hidden",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": "0",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 25,
+     "name": "rotation",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": "0",
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "idx_photos_time",
+     "unique": 0,
+     "origin": "c",
+     "partial": 0,
+     "columns": [
+      "taken_at"
+     ]
+    },
+    {
+     "name": "sqlite_autoindex_photos_1",
+     "unique": 1,
+     "origin": "u",
+     "partial": 0,
+     "columns": [
+      "drive_id"
+     ]
+    },
+    {
+     "name": "sqlite_autoindex_photos_2",
+     "unique": 1,
+     "origin": "u",
+     "partial": 0,
+     "columns": [
+      "path"
+     ]
+    }
+   ]
+  },
+  "settings": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "key",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "value",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "sqlite_autoindex_settings_1",
+     "unique": 1,
+     "origin": "pk",
+     "partial": 0,
+     "columns": [
+      "key"
+     ]
+    }
+   ]
+  },
+  "photo_quality": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "photo_id",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "display",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "source_md5",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "source_mtime",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "content_sha256",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "group_id",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 6,
+     "name": "group_kind",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 7,
+     "name": "rank_in_group",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 8,
+     "name": "recommended",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 9,
+     "name": "score",
+     "type": "REAL",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 10,
+     "name": "reasons_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'[]'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 11,
+     "name": "issues_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'[]'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 12,
+     "name": "algorithm",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 13,
+     "name": "analyzed_at",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "idx_photo_quality_group",
+     "unique": 0,
+     "origin": "c",
+     "partial": 0,
+     "columns": [
+      "group_kind",
+      "group_id"
+     ]
+    }
+   ]
+  },
+  "photo_quality_features": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "photo_id",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "display",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "source_md5",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "source_mtime",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "content_sha256",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "phash",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 6,
+     "name": "sharpness",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 7,
+     "name": "luminance",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 8,
+     "name": "exposure_score",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 9,
+     "name": "black_clip",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 10,
+     "name": "white_clip",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 11,
+     "name": "contrast",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 12,
+     "name": "error",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 13,
+     "name": "analyzed_at",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "idx_photo_quality_features_sha",
+     "unique": 0,
+     "origin": "c",
+     "partial": 0,
+     "columns": [
+      "content_sha256"
+     ]
+    }
+   ]
+  },
+  "photo_ai_features": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "photo_id",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "display",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "source_md5",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "source_mtime",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "content_sha256",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "embedding_model",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 6,
+     "name": "embedding_dim",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 7,
+     "name": "embedding",
+     "type": "BLOB",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 8,
+     "name": "subject",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 9,
+     "name": "pet_state",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 10,
+     "name": "eyes",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 11,
+     "name": "face_crop",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 12,
+     "name": "horizon_status",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 13,
+     "name": "horizon_score",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 14,
+     "name": "subject_sharpness",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 15,
+     "name": "aesthetic_score",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 16,
+     "name": "keep_score",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 17,
+     "name": "recommended",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 18,
+     "name": "reasons_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'[]'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 19,
+     "name": "concerns_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'[]'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 20,
+     "name": "judge_model",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 21,
+     "name": "analyzed_at",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 22,
+     "name": "error",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "idx_photo_ai_features_sha",
+     "unique": 0,
+     "origin": "c",
+     "partial": 0,
+     "columns": [
+      "content_sha256"
+     ]
+    }
+   ]
+  },
+  "photo_embeddings": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "content_sha256",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "embedding_model",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 2,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "embedding_dim",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "embedding",
+     "type": "BLOB",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "analyzed_at",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "sqlite_autoindex_photo_embeddings_1",
+     "unique": 1,
+     "origin": "pk",
+     "partial": 0,
+     "columns": [
+      "content_sha256",
+      "embedding_model"
+     ]
+    }
+   ]
+  },
+  "photo_ai_groups": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "group_id",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "kind",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "summary",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "min_similarity",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "max_similarity",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "avg_similarity",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 6,
+     "name": "algorithm",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 7,
+     "name": "analyzed_at",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 8,
+     "name": "status",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'judged'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 9,
+     "name": "same_scene",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": "1",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 10,
+     "name": "judge_version",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 11,
+     "name": "judge_model",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 12,
+     "name": "shortlist_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'[]'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 13,
+     "name": "error",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 14,
+     "name": "attempts",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": "0",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 15,
+     "name": "judge_order",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 16,
+     "name": "presented_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'[]'",
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "sqlite_autoindex_photo_ai_groups_1",
+     "unique": 1,
+     "origin": "pk",
+     "partial": 0,
+     "columns": [
+      "group_id"
+     ]
+    }
+   ]
+  },
+  "photo_ai_group_members": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "group_id",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "photo_id",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 2,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "rank_in_group",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "recommended",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "shortlisted",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": "1",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "local_score",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "idx_photo_ai_group_members_photo",
+     "unique": 0,
+     "origin": "c",
+     "partial": 0,
+     "columns": [
+      "photo_id"
+     ]
+    },
+    {
+     "name": "sqlite_autoindex_photo_ai_group_members_1",
+     "unique": 1,
+     "origin": "pk",
+     "partial": 0,
+     "columns": [
+      "group_id",
+      "photo_id"
+     ]
+    }
+   ]
+  },
+  "photo_loc_clues": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "photo_id",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "display",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "source_md5",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "source_mtime",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "clue",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "kind",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 6,
+     "name": "model",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 7,
+     "name": "analyzed_at",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 8,
+     "name": "error",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": []
+  },
+  "photo_loc_runs": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "run_id",
+     "type": "TEXT",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "day",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "model",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "prompt_version",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "member_ids_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "sent_ids_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 6,
+     "name": "status",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 7,
+     "name": "attempts",
+     "type": "INTEGER",
+     "notnull": 1,
+     "dflt_value": "0",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 8,
+     "name": "answer_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 9,
+     "name": "error",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 10,
+     "name": "analyzed_at",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": [
+    {
+     "name": "sqlite_autoindex_photo_loc_runs_1",
+     "unique": 1,
+     "origin": "pk",
+     "partial": 0,
+     "columns": [
+      "run_id"
+     ]
+    }
+   ]
+  },
+  "photo_loc_suggestions": {
+   "columns": [
+    {
+     "cid": 0,
+     "name": "photo_id",
+     "type": "INTEGER",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 1,
+     "hidden": 0
+    },
+    {
+     "cid": 1,
+     "name": "run_id",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 2,
+     "name": "scope",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 3,
+     "name": "place_name",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 4,
+     "name": "day_place_name",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 5,
+     "name": "geocode_query",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 6,
+     "name": "precision",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'unknown'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 7,
+     "name": "confidence",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'unknown'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 8,
+     "name": "evidence_json",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "'[]'",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 9,
+     "name": "lat",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 10,
+     "name": "lon",
+     "type": "REAL",
+     "notnull": 0,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 11,
+     "name": "geocode_title",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": "''",
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 12,
+     "name": "model",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    },
+    {
+     "cid": 13,
+     "name": "analyzed_at",
+     "type": "TEXT",
+     "notnull": 1,
+     "dflt_value": null,
+     "pk": 0,
+     "hidden": 0
+    }
+   ],
+   "indexes": []
+  }
+ }
+}

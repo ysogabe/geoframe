@@ -13,13 +13,13 @@ Issue #54 と設計案をそのまま要求・設計として扱い、この文�
 | 項目 | 決定 | 理由 |
 | --- | --- | --- |
 | PRの単位 | **フェーズごとに1つ**（P0、P1、…）。各PRでmainへマージする | 全体は数か月規模。最後に1本にすると差分が大きすぎてレビューできない |
-| Rustの置き場所 | リポジトリ直下に`Cargo.toml`（workspace）、`crates/geoframe/`（バイナリ兼ライブラリ1つ）。`crates/geoframe-imgpoc`はP0の計測専用で`publish = false`。P2で本体へ移植した後に削除する | 移行完了後にPythonを消すと、直下がCargo workspaceという最終形になる。crateの分割は必要になってから |
+| Rustの置き場所 | リポジトリ直下に`Cargo.toml`（workspace）、`crates/geoframe/`（バイナリ兼ライブラリ1つ）。P0の計測用だった`crates/geoframe-imgpoc`は、**T2.2で本体（`crates/geoframe/src/imaging`）へ移して削除した**（コミット`c41c4a9`に残る） | 移行完了後にPythonを消すと、直下がCargo workspaceという最終形になる。crateの分割は必要になってから |
 | 本番への影響 | **Rustをmainへマージしても本番は変わらない** | 本番の`deploy-pull.sh`はgitの取り込みと`requirements.txt`変更時の`pip install`だけを行い、Pythonの`server.py`を起動する。Rustのビルドも起動もしない。本番の切替はP5で明示的に行う |
 | 公開API | 既存のパスと応答形を維持する。`/api/v1/photos`と`/derivatives/`は契約、管理APIは現行の管理画面が動く形 | 管理画面のHTML/JSを流用し、作り直しを避ける |
 | 静的ファイル | 管理画面（`app/static`・`app/vendor`）はバイナリへ埋め込む | 「バイナリ＋設定＋データ」で起動する受入条件のため |
 | 設定 | 現行の`GEOFRAME_*`環境変数名と`/etc/default/geoframe`を引き継ぐ | systemd unitと運用手順の差し替えを最小にする |
 | DB | 現行の`catalog.db`スキーマをそのまま読む。追加はテーブル・列の追加だけ（既存列は消さない） | 手動GPS・お気に入り・除外・回転を守る。旧Pythonへ戻せる状態をP5まで保つ |
-| 画像ライブラリ | P0の計測で決めた: miharashiと同じ`image = "0.25.10"`（JPEGのデコードと向きの読み取り）＋縮小は`fast_image_resize`、エンコードは`jpeg-encoder`（[画像PoC](image-poc.md)） | 知見の共有。HEICは`zune-heic`で純Rust・musl静的のまま扱える（実機のHEICでの確認はP2）。逃げ道の`libheif-rs`は依存を明示して既定では外す |
+| 画像ライブラリ | P0の計測で決め、**T2.2で本体に入れた**: miharashiと同じ`image = "0.25.10"`（PNG・TIFFのデコード）＋JPEGのデコードは`zune-jpeg`（厳格モード）、縮小は`fast_image_resize`、エンコードは`jpeg-encoder`、ICCは`moxcms`、EXIFは自前（[画像PoC](image-poc.md)、[ビルド §8](build.md)、[server.md §12](server.md)） | 知見の共有。HEICは`zune-heic`で純Rust・musl静的のまま扱える（**実機のHEICでの確認はT2.4**）。逃げ道の`libheif-rs`は、T2.2で**コードには残さない**ことにした（CIで一度もコンパイルされず腐るため。必要になったらPoCの実装を参照して足す。[ビルド §6](build.md)） |
 
 ## 2. 守ること（本番機の扱い）
 
@@ -56,7 +56,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - 画像PoC: 検証環境にある本番コピーのderivatives（JPEG）から約100枚と、それをHEICへ変換したものを使い、検証環境の上でデコード→EXIF向き補正→長辺2560px→JPEG出力の画質・時間・最大RSS・リンクされるライブラリを計測する。HEICの候補（libheif連携など）を比較する。結果は数値だけを残す。
   - ユーザー指示（2026-10-24）によりGoogle Driveの原本は使わない。実機のHEIC固有の構造（グリッド分割・HDRゲインマップ・深度など）はP2のDrive取り込みの実装時に確かめる。
 - `/api/v1/photos`のserde型とJSON Schemaを定義し、合成DBで契約テストを書く。
-- miharashiの既存`image`実装と共有できる純粋な処理の整理: 今は共有できる関数はなく、共有crateは実際の重複が出てから決める。P2で画像処理を本体へ移すときに改めて検討する（[画像PoC](image-poc.md)の「miharashiとの共有」）。
+- miharashiの既存`image`実装と共有できる純粋な処理の整理: 今は共有できる関数はなく、共有crateは実際の重複が出てから決める。T2.2で本体へ移すときに改めて検討したが、結論は変わらない（[画像PoC](image-poc.md)の「miharashiとの共有」・§10）。
 - 画像Embedding APIはlocal-model-lab #93で評価中（別リポジトリ、OPEN）。P4の開始前に結果を取り込む。P1の妨げにはならない。
 
 #### P0での設計案のレビュー結果
@@ -78,11 +78,13 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - ローカル`photos/`とGoogle Driveの索引（`drive.readonly`、撮影時刻・GPSのメタデータ）、derivative生成（JPEG/HEIC）、EXIF、位置の推定、逆ジオコーダ、簡易品質判定（完全重複・近似の判定。旧スコアとの一致は不要）。
 - 索引・取り込みがDBへ書くので、**取り込み用の書き込み接続（writer）をP2で追加し**、unitの`ReadOnlyPaths`を必要な分だけ解除する（[server.md §2.2](server.md)）。
 - 検証環境でDriveを使うには`drive_key.json`のコピーが要る。**P2の開始時にユーザーへ確認する。**
+- 受入: 検証環境の本番コピーに対して、Rustの`sync --dry-run`が全段0で、実サイクルを回しても`.dump`が変わらないこと（**冪等性が関門**）。同じ写真を比較用PythonとRustに入れて、`photos`の全列・推定・地名・品質の顔ぶれが（既知の差を除いて）一致すること。棚卸しのE2E（S1・S3・S7。S2はスタブのDriveまで、本物のDriveは鍵が置かれてから）と、取り込みを有効にしたRustでのmiharashiの表示の継続。結果は[p2-acceptance.md](p2-acceptance.md)。
 
 ### P3: 管理機能（PR 4）
 
 - 手動修正などの更新APIをwriterの上に追加する（writer自体はP2で入っている）。手動GPS、お気に入り、除外、回転、地名検索（地理院→Nominatim）、地図タイルのプロキシ、旅行ブログ（下書き・書き出し）、AI検索の画面。更新APIのCSRF対策（JSON必須・Origin検査・本文上限）を現行どおり。
 - 受入: 検証環境で管理画面の全操作を行い、変更がDBに残ること。
+- **一次データが消える・変わる経路を、今の仕様のまま残すか守る仕様にするかを決める**（[inventory.md §2.3](inventory.md)・[p2-acceptance.md §5](p2-acceptance.md)。P2のRustは今のPythonと同じ挙動）: ①mtime/md5の変更での手動GPSの上書きと、位置が動いたときの地名の付け直し ②索引からの削除・`organize`によるお気に入り・除外（`hidden`）・手動の位置の消失 ③Driveの更新（md5の変更）での回転のリセット ④削除→再追加による写真IDの変化と旅行ブログの参照の断絶 ⑤大量削除の保留が意図した削除も配信に残すこと（保留の件数と`--allow-mass-delete`での解除方法を管理画面で知らせる案）。
 
 ### P4: AI Providerとジョブ（PR 5）
 
@@ -93,8 +95,16 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 ### P5: 切替（PR 6）
 
 - 本番`catalog.db`のバックアップと復元の演習、検証環境でのシャドー比較、本番でPythonを止めてRustを起動、スモークテスト、ロールバックと再切替の演習。
+- **ロールバック（Rust→Python）での簡易品質**（[server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)。試験は`tools/gen_quality_fixture.py`の`switchbacks`）: ①`photo_quality.algorithm`は特徴量の由来ではなく結果を作った実装の印で、Pythonは読まない（書き換えは不要・無意味）。②切り戻した直後はPythonの変化なしのサイクルがRustの`photo_quality`をそのまま保つので、配信は変わらない。③後で`dirty`になると、PythonがRust製の特徴量を含めて全行を再構築する。**グループの顔ぶれ・`kind`と`/api/v1/photos`の件数は変わらず**、同じSHAの写しの指標の差から出る順位・推奨・スコア（とそれによる`group_id`の振り直し）だけが変わりうる（完全重複の写しのうち表に出る方が入れ替わることがある）。④Pythonだけで解析した結果に戻したいときは、切り戻す前にRustが解析した特徴量の行（`analyzed_at`がRustへの切替の日時以降）を消し、Pythonに解析し直させる。これはRustの結果を保つ方法ではなく、Rustの別算法のpHashで結びついていた組が離れて、グループの顔ぶれ・`kind`・配信件数が変わりうる（試験`bridge_by_copy`）。演習では、③の場合は件数・行数・グループ数が変わらないこと、④の場合は解析し直しのあとの件数・行数・グループ数を記録することを手順に入れる。
 - `deploy/`の手順・unit・READMEをRust用に改め、PythonのCIと依存を外す。Python実装の削除は切替後に安定を確かめてから。
 - 本番の切替は**ユーザーの立ち会いのもとで**行う。
+- **本番で取り込みを有効にする前に済ませる、P2から持ち越した未完の項目**（鍵が置かれてから管理者が検証環境で行う。手順は[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)、記録は[p2-acceptance.md §6](p2-acceptance.md)）。**これが済むまで本番の取り込みを有効にしない**: ①実Driveの一覧での冪等性（`sync --dry-run`で変更・取得予定がほぼ0）②同じ原本でのPython／Rustの形式別の成功・失敗の比較（Rustだけが失敗する写真が0）③実機iPhoneのHEICの確認（`img-probe`）④実DriveでのS2（合成のJPEGをDriveのフォルダに足す→周期同期→`loc_source='drive_meta'`・derivative・`GET /derivatives/…`が200→もう一度の周期で変更0）。
+- **取り込みのガードを外す**（T2.1で入れた暫定。[server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード)）。P2〜P4の間、`GEOFRAME_INGEST=1`の`serve`・`sync`は、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できないと、書き込みの前に終了コード2で断る。本番機には印が無いので、**このガードを外さない限り、本番でRustは取り込みを始められない**。切替の手順で次をこの順に行う:
+  1. 本番で`geoframe-server`を止めて`disable`し、停止を確認する（`systemctl is-active`が`inactive`）。Pythonの書き込みが無いことの担保は、ガードではなくこの手順が持つ。ガードは`LoadState`を見ず`ActiveState`だけで判定する（unitファイルを消しても動いているサービスは止まらない）ので、**止める前にunitファイルを消さない**（消すなら停止の確認のあと）。
+  2. コードからガードを外す（またはガードの印を本番用に置き換え、`GEOFRAME_INGEST=1`に加えて明示のフラグを要る形にする）。消すもの: `guard.rs`・`lib.rs`の`pub mod guard`・`ingest::start`の`guard.check()`（`start_with`）・`IngestError::Refused`と`cli.rs`の`exit_for_ingest_error`・`tests/ingest_cli.rs`の`Staging`と`GEOFRAME_TEST_*`・ガードのテスト。残った箇所は`grep -rn "guard\|検証環境の印\|GEOFRAME_TEST_" crates deploy docs`で探す。
+  3. 文書を直す: server.md（§0の索引の行・§6の項・§11.1.1・§11.9）、`deploy/README.md §7.1`、`deploy/geoframe-rs.service`と`rust-deploy.sh`の説明、`USAGE`。
+  4. 検証環境と同じバイナリで、本番のコピーを使った通しの演習を済ませてから本番へ入れる。
+  5. `deploy/geoframe-rs.service`の`Conflicts=geoframe-server.service`（検証環境で足した。Pythonが起動されるとsystemdがRustを止める。ガードが起動時の1回しかPythonの停止を確かめない弱さの補い）の扱いを決める。ガードを外しても、この行は本番でRustとPythonが同時に書くのを防ぐ装置として**残すのが既定**（ロールバックでPythonを`start`するとRustが止まる。再切替でRustを`start`するとPythonが止まる）。ロールバックと再切替の演習で、止まる向きが手順と合うことを確かめてから決める。
 
 ## 5. 受入条件とフェーズの対応
 
@@ -110,8 +120,8 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 
 ## 6. 未決事項（決める時期）
 
-- ~~HEIC変換のバックエンドと配布形態 — P0の計測後~~ → 第一候補は`zune-heic`（[画像PoC](image-poc.md)）。実機HEICでの確定はP2
-- ~~musl静的ビルドかglibcビルドか — P0~~ → **musl静的ビルドを標準にする**（[ビルドと配布](build.md)。HEIC・DNS・アロケータを入れる段階で見直す）
+- ~~HEIC変換のバックエンドと配布形態 — P0の計測後~~ → `zune-heic`を本体に入れた（T2.2、[画像PoC](image-poc.md)）。実機HEICでの確定はT2.4の受入（実装済み。確認の手順は[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)。鍵が置かれてから管理者が行う）
+- ~~musl静的ビルドかglibcビルドか — P0~~ → **musl静的ビルドを標準にする**（[ビルドと配布](build.md)。HEIC・アロケータを入れる段階で見直す）。HTTPS（rustls）とDNSはT2.1で、musl静的のまま検証環境から通ることを確かめた（[build.md §7](build.md)）
 - 画像Embedding APIのJSON契約・CPU/GPU配置 — local-model-lab #93、P4の開始前
 - Embeddingインデックスの保存形式 — P4の開始前
 - 検証環境へのDrive鍵のコピー — P2の開始時にユーザーへ確認

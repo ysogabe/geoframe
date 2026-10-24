@@ -198,7 +198,7 @@ fn truthy(row: &Row<'_>, name: &str) -> rusqlite::Result<bool> {
 }
 
 /// Python の `str.isspace` に近い空白（Unicode の空白＋ `\x1c`〜`\x1f`）。
-fn py_space(c: char) -> bool {
+pub(crate) fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
 }
 

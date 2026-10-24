@@ -149,6 +149,9 @@ Rustでも意識して残すか、直すかを決める必要がある。
 | 推定の錨が消えた後のDrive写真 | `display=NULL` になったDrive写真は `fetch_derivatives`（`source='drive' AND display IS NULL`）が取り直し、`fetched_at` が新しくなる。表示側（E1の新着ブースト）で**新着扱いになり直す** | `geo.py:infer_locations`、`drive.py:fetch_derivatives` |
 | 写真の行が消える／idが変わる | 旅行ブログの下書きは画像を `photo_id` で参照する（`travel_blog.py:319` 付近）。行が消えるか再追加で別idになると、下書きの参照が切れる（書き出し時に `_photo_source` が400） | `travel_blog.py` |
 | `manual` | 再推定の対象外（`loc_source IS NULL OR 'inferred'` のみ再評価）。ほかの未解決写真の錨になる | `geo.py:infer_locations` |
+| 大量削除の保留（Rustで足した保護。T2.4） | 消す行が50件超かつDriveの行の20%超、または一覧が空のときは、削除を保留する。**意図した削除も配信に残る**（`geoframe sync --allow-mass-delete`の1回だけで外れ、`serve`の定期実行では外せない） | `drive/`（Rust） |
+
+**P3で決めること**（Rustは今のPythonと同じ挙動のままで、P3の更新APIと一緒に「今の仕様を残すか、守る仕様にするか」を決める）: ①mtime/md5の変更での手動GPSの上書きと、位置が動いたときの地名の付け直し ②索引からの削除・`--organize`でお気に入り・除外（`hidden`）・手動の位置が行ごと消えること ③Driveの更新（md5の変更）で`rotation`が0に戻ること ④削除→再追加で写真IDが変わり、旅行ブログの下書きの参照が切れること ⑤大量削除の保留が意図した削除も配信に残すこと（保留の件数と解除方法を管理画面で知らせる案）。
 
 ### 2.3b DB外のデータ（`DATA_DIR` ほか）
 
@@ -247,7 +250,8 @@ store.py の永続キャッシュ。JSONオブジェクト。読み書きは `ca
 | `GEOFRAME_PHOTOS_DIR` | `photos` | 引き継ぐ | `DATA_DIR` 配下であること | P2 |
 | `GEOFRAME_DRIVE_KEY` | `drive_key.json` | 引き継ぐ | `app/` 相対（絶対パスなら絶対）。本番は `/var/lib/geoframe/drive_key.json` | P2 |
 | `GEOFRAME_DRIVE_FOLDER` | `GeoFrame` | 引き継ぐ | 20字以上の英数字なら生のフォルダIDとして扱う | P2 |
-| `GEOFRAME_DRIVE_POLL_MIN` | `10` | 引き継ぐ | 分 | P2 |
+| `GEOFRAME_DRIVE_POLL_MIN` | `10` | 引き継ぐ | 分（小数可）。**T2.1で実装済み**。0以下・非数は起動を断る（[server.md §11.2](server.md)） | P2 |
+| `GEOFRAME_INGEST` | （Pythonに無い。Rustの既定`0`） | **Rustだけの項目** | 取り込み（DBへの書き込みと同期サイクル）を有効にする。P5の切替まで本番の書き手はPythonなので、明示（`1`）しない限りRustは書かない。**T2.1で実装済み**（[server.md §11.1](server.md)） | P2 |
 | `GEOFRAME_FETCH_PER_CYCLE` | `25` | 引き継ぐ | | P2 |
 | `GEOFRAME_QUALITY_PER_CYCLE` | `FETCH_PER_CYCLE` | 引き継ぐ | | P2 |
 | `GEOFRAME_INFER_MIN` | `15` | 引き継ぐ | 段階窓は `{INFER_MIN, 2時間, 12時間}` | P2 |
@@ -319,6 +323,8 @@ Issue #54 の受入条件「写真追加→位置補完→表示→選別→検�
 | S10 | 旅行ブログの下書き→書き出し | `/blog-admin` で旅程を選ぶ（E7〜E10）→ 編集 → E15 保存 → E16 実行 | `DATA_DIR/travel_blog/drafts/<id>.json` ができる。`blog_exports/<id>/index.html` と `images/photo-<id>.jpg` ができ、画像のEXIF（GPS）が無い。`GET /blog_exports/<id>/index.html` が200。存在しなくても `GET /blog_exports/.<id>.previous/` や `/blog_exports/.<id>-x/` が404ではなく403（ドット始まりの要素は途中でも403） | P3 |
 
 **同期サイクルの手動実行**: 現行には1回だけ動かす公式手段が無い（`catalog.py:cycle` はワーカーが `GEOFRAME_DRIVE_POLL_MIN` ごとに呼ぶ。検証では `python -c "from geoframe.catalog import cycle; cycle()"` を `app/` で動かして代用できる）。**Rust側で、同期サイクルを1回動かす手動トリガー（CLIサブコマンド等）を用意する**。S1〜S4、S7 の「サイクル待ち」はこれで置き換える。
+
+→ **T2.1で用意した**: `geoframe sync`（1回だけ実行。`GEOFRAME_INGEST=1`が要る）と`geoframe sync --dry-run`（書かずに件数だけ）。[server.md §11.3](server.md)。
 
 S5〜S6 は管理画面の操作のE2E、S8〜S9 は「local-model-lab停止／lease中でも閲覧・管理できる」の確認（AC3）にも使う。
 

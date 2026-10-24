@@ -54,21 +54,55 @@ pub fn local_timestamp() -> String {
     format_local(secs)
 }
 
+/// 今の現地時刻を `YYYY-MM-DDTHH:MM:SS`（オフセット無し）で。`datetime.now().isoformat(timespec="seconds")`
+/// と同じ形で、`indexed_at`・`fetched_at` に入れる（inventory.md §6.1）。
+pub fn local_isoformat() -> String {
+    local_timestamp().replacen(' ', "T", 1)
+}
+
 fn format_local(secs: u64) -> String {
-    let Ok(secs) = i64::try_from(secs) else {
+    local_parts(secs).map_or_else(String::new, |(text, _)| text)
+}
+
+/// 今の現地時刻を UTC からのずれ付きで（`YYYY-MM-DDTHH:MM:SS+09:00`）。`datetime.now().astimezone()
+/// .isoformat(timespec="seconds")` と同じ形で、`analyzed_at`（品質・AI・位置候補）に入れる（inventory.md §6.1）。
+pub fn local_isoformat_offset() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    format_local_offset(secs)
+}
+
+fn format_local_offset(secs: u64) -> String {
+    let Some((text, off)) = local_parts(secs) else {
         return String::new();
     };
+    let sign = if off < 0 { '-' } else { '+' };
+    let off = off.abs();
+    format!(
+        "{}{sign}{:02}:{:02}",
+        text.replacen(' ', "T", 1),
+        off / 3600,
+        off % 3600 / 60
+    )
+}
+
+/// 現地時刻（`YYYY-MM-DD HH:MM:SS`）と、UTC からのずれ（秒。東が正）。
+// `tm_gmtoff` の型は OS で違う（x86_64 では i64 だが、32 ビットでは i32）ので、`i64::from` で受ける
+#[allow(clippy::useless_conversion)]
+fn local_parts(secs: u64) -> Option<(String, i64)> {
+    let secs = i64::try_from(secs).ok()?;
     // `time_t` は64ビット（muslの`libc::time_t`は移行中で非推奨の警告が出るので、型名を書かない）
     let t = secs as _;
     let mut tm = MaybeUninit::<libc::tm>::zeroed();
     // SAFETY: `t` と `tm` はこの関数の中の有効な値で、`localtime_r` はスレッドセーフ（結果を `tm` に書く）。
     let done = unsafe { libc::localtime_r(&t, tm.as_mut_ptr()) };
     if done.is_null() {
-        return String::new();
+        return None;
     }
     // SAFETY: `localtime_r` が成功（非 NULL）したので書き込み済み。
     let tm = unsafe { tm.assume_init() };
-    format!(
+    let text = format!(
         "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
         i64::from(tm.tm_year) + 1900,
         tm.tm_mon + 1,
@@ -76,7 +110,8 @@ fn format_local(secs: u64) -> String {
         tm.tm_hour,
         tm.tm_min,
         tm.tm_sec
-    )
+    );
+    Some((text, i64::from(tm.tm_gmtoff)))
 }
 
 #[cfg(test)]
@@ -112,6 +147,37 @@ mod tests {
             }
         }
         assert!(text.starts_with("20"), "{text}");
+    }
+
+    #[test]
+    fn local_isoformat_is_the_naive_iso_shape() {
+        let text = local_isoformat();
+        let bytes = text.as_bytes();
+        assert_eq!(bytes.len(), 19, "{text}");
+        for (i, b) in bytes.iter().enumerate() {
+            match i {
+                4 | 7 => assert_eq!(*b, b'-', "{text}"),
+                10 => assert_eq!(*b, b'T', "{text}"),
+                13 | 16 => assert_eq!(*b, b':', "{text}"),
+                _ => assert!(b.is_ascii_digit(), "{text}"),
+            }
+        }
+    }
+
+    #[test]
+    fn local_isoformat_offset_is_the_aware_iso_shape() {
+        let text = local_isoformat_offset();
+        let bytes = text.as_bytes();
+        assert_eq!(bytes.len(), 25, "{text}");
+        for (i, b) in bytes.iter().enumerate() {
+            match i {
+                4 | 7 => assert_eq!(*b, b'-', "{text}"),
+                10 => assert_eq!(*b, b'T', "{text}"),
+                13 | 16 | 22 => assert_eq!(*b, b':', "{text}"),
+                19 => assert!(matches!(*b, b'+' | b'-'), "{text}"),
+                _ => assert!(b.is_ascii_digit(), "{text}"),
+            }
+        }
     }
 
     #[test]

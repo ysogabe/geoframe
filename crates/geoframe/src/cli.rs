@@ -6,24 +6,126 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::cache::Cache;
 use crate::config::{Config, Overrides};
 use crate::db::Catalog;
 use crate::server::AppState;
+use crate::stop::StopFlag;
+use crate::sync::{CycleReport, Mode, StageCtx, StageResult};
+
+/// 停止のときに、取り込みのスレッドを待つ上限。
+const THREAD_STOP_LIMIT: Duration = Duration::from_secs(10);
+
+/// 取り込みの 2 つのスレッド。
+struct IngestThreads {
+    worker: std::thread::JoinHandle<()>,
+    saver: std::thread::JoinHandle<()>,
+}
+
+/// 止めるときの順序: **worker の終了を待ってから**キャッシュを最後に保存する。
+///
+/// 同じ停止の合図で両方を起こすので、saver が先に最後の保存を終えたあとで worker が最後の `put`
+/// をすると、その更新は保存されずに失われる。saver は合図で止まるだけ（最後の保存はしない）にして、
+/// 保存はここで、両方の終了を待ってから 1 回だけする。限られた時間内に worker が止まらなかったときも
+/// 保存はする（そのあとの `put` は失われうるが、警告を出す）。
+///
+/// saver が I/O の最中に期限を超えて残った場合は、保存用の排他（`Cache::save_final`）で重ねて書かない。
+/// 排他は `limit` まで待ち、それでも取れなければ最後の保存は省略する（警告を出す）。省略した分は、
+/// 残った saver の保存が終わったあとの内容に含まれないが、書きかけの一時ファイルと競合して JSON を
+/// 壊すよりは、キャッシュ（位置の逆引き結果で、作り直せる）の直近の更新を失うほうを選ぶ。
+/// 期限を超えて残ったスレッドは `.ingest.lock` を持ち続ける（`LockHold`）ので、そのあいだ別の
+/// 取り込みは始まらない。
+/// 呼ぶ前に `stop` の合図を出しておくこと。
+fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration) {
+    for (name, handle) in [
+        ("同期サイクル", threads.worker),
+        ("キャッシュ保存", threads.saver),
+    ] {
+        if !join_within(handle, limit) {
+            tracing::warn!("{name}のスレッドが時間内に止まりませんでした（そのまま終了します）");
+        }
+    }
+    // 省略したときの警告は save_final の中で出す
+    cache.save_final(limit);
+}
+
+fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {
+    let started = std::time::Instant::now();
+    while !handle.is_finished() {
+        if started.elapsed() > limit {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    handle.join().is_ok()
+}
 
 const USAGE: &str = "\
 使い方:
   geoframe --version
   geoframe check-db <catalog.db>        photos の行数と SQLite のバージョンを出す（読み取り専用）
+  geoframe selfcheck-net                地理院の逆ジオコーダへ公開の代表点を 1 件問い合わせ、外向き HTTPS（名前解決・
+                                        TLS・証明書）が通るかを確かめる。出力は状態と HTTP ステータスだけ
   geoframe serve [--listen <addr:port>] [--data-dir <dir>]
-                                        サーバーを起動する（読み取り専用。DB は <dir>/catalog.db）
+                                        サーバーを起動する（DB は <dir>/catalog.db）。GEOFRAME_INGEST=1 のときだけ
+                                        取り込み（DB への書き込みと同期サイクル）も動かす。それ以外は読み取り専用。
+                                        取り込みは P5 の切替まで検証環境専用: 検証環境の印（/etc/geoframe/staging）が
+                                        無い・geoframe-server が非稼働と確認できないなら、何も書かず終了コード 2 で断る
                                         設定は 起動引数 > 環境変数 GEOFRAME_* > 既定値 の順
-                                        （詳細は docs/rust-migration/server.md）";
+                                        （詳細は docs/rust-migration/server.md）
+  geoframe img-probe [--out <dir>] [--rotation <度>] [--jobs <n>] [--quality] <画像>...
+                                        画像処理の確認・計測用。DB・データ置き場には触れない。画像を derivative にして
+                                        （--out があれば <連番>.jpg で書き出す）、連番・形式・寸法・向き・ICC・所要時間を出す。
+                                        ファイル名は出さない。HEIC が読めないときは構造の分類（ブランド・グリッド・コーデック等）が付く。
+                                        --quality は derivative の代わりに品質の特徴量（SHA-256・pHash・鮮明度・露出）を出す
+  geoframe sync [--dry-run] [--allow-mass-delete] [--data-dir <dir>]
+                                        同期サイクルを 1 回だけ動かして終わる。--dry-run は行・写真・キャッシュ・
+                                        ロックを変えず（SQLite が読み取りでも作る WAL 関連ファイル catalog.db-wal・
+                                        -shm はできうる）、やるとしたら何か（スキーマ・掃除・各段）を件数だけ出す。
+                                        Drive の鍵（GEOFRAME_DRIVE_KEY）があれば、一覧を読みに Drive へ接続する
+                                        （原本のダウンロードはしない。鍵が無ければ Drive の段は通信せずに飛ばす。地名の段（enrich）は
+                                        --dry-run では地理院に問い合わせず、件数だけを出す。Drive への通信を避けるなら、
+                                        存在しない鍵ファイルの絶対パスを GEOFRAME_DRIVE_KEY に与える。--data-dir では避けられない）。
+                                        Drive の一覧が空、または消す行が多すぎる（50 件超かつ Drive の行の 20% 超）ときは
+                                        削除を保留する。意図した削除なら --allow-mass-delete を付けた 1 回だけで外す
+                                        （serve の定期実行では外せない。--dry-run と併せれば、外した場合の件数を見られる）。
+                                        --dry-run はガードを通さないが、本番機で実行してよいという意味ではない
+                                        （検証環境の本番コピーに向ける。本番の DB には向けない）。
+                                        書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ印・Python の確認を通す
+  geoframe organize [--dry-run] [--data-dir <dir>]
+                                        位置の無いローカル写真を DATA_DIR/_excluded/no_gps/ へ移し、行を削除する
+                                        （現行の server.py --organize）。先に index_local と位置の推定（infer）を 1 回ずつ
+                                        動かし、推定で位置が付いた写真は移さない。同名のファイルは
+                                        上書きせず「名前 (2).拡張子」にする。--dry-run は件数だけ。書く実行は
+                                        GEOFRAME_INGEST=1 が要り、sync と同じ印・Python の確認を通す
+  geoframe quality-scan [--dry-run] [--data-dir <dir>]
+                                        品質の一括解析（現行の server.py --quality-scan）。孤児の特徴量を消し、未解析の写真を
+                                        GEOFRAME_QUALITY_PER_CYCLE 件ずつ全部解析して、グループ（完全重複・類似）と推奨を
+                                        作り直す。--dry-run は解析せず、件数（消す孤児・解析する枚数・再構築するか）だけ。
+                                        書く実行は GEOFRAME_INGEST=1 が要り、sync と同じ印・Python の確認を通す
+終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または取り込みを断った（本番への誤指定の防止）";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Version,
     CheckDb(PathBuf),
+    SelfCheckNet,
+    ImgProbe(crate::imaging::probe::ProbeArgs),
     Serve(Overrides),
+    Sync {
+        dry_run: bool,
+        /// Drive の大量削除の保留を、この 1 回だけ外す。
+        allow_mass_delete: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Organize {
+        dry_run: bool,
+        data_dir: Option<PathBuf>,
+    },
+    QualityScan {
+        dry_run: bool,
+        data_dir: Option<PathBuf>,
+    },
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
@@ -37,6 +139,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             }
             Ok(Command::CheckDb(PathBuf::from(path)))
         }
+        Some("selfcheck-net") => match args.next() {
+            None => Ok(Command::SelfCheckNet),
+            Some(_) => Err("selfcheck-net に引数はありません".into()),
+        },
+        Some("img-probe") => crate::imaging::probe::parse(args).map(Command::ImgProbe),
         Some("serve") => {
             let mut overrides = Overrides::default();
             while let Some(arg) = args.next() {
@@ -56,6 +163,30 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 }
             }
             Ok(Command::Serve(overrides))
+        }
+        Some(name @ ("sync" | "organize" | "quality-scan")) => {
+            let (mut dry_run, mut allow_mass_delete, mut data_dir) = (false, false, None);
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--dry-run" => dry_run = true,
+                    // 大量削除の保留を外すのは sync の明示的な 1 回だけ（serve・organize には与えない）
+                    "--allow-mass-delete" if name == "sync" => allow_mass_delete = true,
+                    "--data-dir" => {
+                        let value = args.next().ok_or("--data-dir に値が要ります")?;
+                        data_dir = Some(PathBuf::from(value));
+                    }
+                    other => return Err(format!("{name} の引数 {other:?} は不明です")),
+                }
+            }
+            Ok(match name {
+                "sync" => Command::Sync {
+                    dry_run,
+                    allow_mass_delete,
+                    data_dir,
+                },
+                "organize" => Command::Organize { dry_run, data_dir },
+                _ => Command::QualityScan { dry_run, data_dir },
+            })
         }
         Some(other) => Err(format!("不明なコマンド {other:?}")),
         None => Err("コマンドがありません".into()),
@@ -86,7 +217,24 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Command::SelfCheckNet => {
+            let result = crate::net::selfcheck(&crate::net::agent());
+            println!("{}", result.summary());
+            if result.ok() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Command::ImgProbe(args) => crate::imaging::probe::run(&args),
         Command::Serve(overrides) => serve(&overrides),
+        Command::Sync {
+            dry_run,
+            allow_mass_delete,
+            data_dir,
+        } => sync(dry_run, allow_mass_delete, data_dir),
+        Command::Organize { dry_run, data_dir } => organize(dry_run, data_dir),
+        Command::QualityScan { dry_run, data_dir } => quality_scan(dry_run, data_dir),
     }
 }
 
@@ -111,6 +259,23 @@ fn serve(overrides: &Overrides) -> ExitCode {
         );
     }
 
+    // 取り込み（GEOFRAME_INGEST=1）: writer を開き、スキーマの作成・移行と起動時の掃除をする。
+    // 無効（既定）のときは P1 と同じ読み取り専用で、DB が無ければ下で断る
+    let ingest = if config.ingest {
+        match crate::ingest::start(&config) {
+            Ok(ingest) => Some(ingest),
+            Err(e) => {
+                tracing::error!("{e}");
+                return exit_for_ingest_error(&e);
+            }
+        }
+    } else {
+        tracing::info!(
+            "取り込みは無効です（DB に書きません）。有効にするには GEOFRAME_INGEST=1 を設定します"
+        );
+        None
+    };
+
     // 起動時の DB の確認。開けない・スキーマが古いときは起動しない（設定の誤りや配備の誤りを、
     // 503 を返し続けるプロセスに隠さず、systemd の失敗として見せる）
     let catalog = match Catalog::open(&config.db_path()) {
@@ -132,7 +297,30 @@ fn serve(overrides: &Overrides) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let state = AppState::new(Arc::new(config), catalog);
+    let catalog = match &ingest {
+        Some(ingest) => catalog.with_writer(ingest.writer.clone()),
+        None => catalog,
+    };
+    let config = Arc::new(config);
+    // 同期サイクルとキャッシュ保存のスレッド。HTTP サーバーの起動を待たない
+    let stop = StopFlag::new();
+    let threads = ingest.as_ref().map(|ingest| IngestThreads {
+        worker: crate::sync::spawn_worker(
+            Arc::clone(&config),
+            ingest.writer.clone(),
+            Arc::clone(&ingest.cache),
+            crate::sync::default_stages(),
+            stop.clone(),
+            config.drive_poll(),
+            ingest.lock_hold(),
+        ),
+        saver: crate::cache::spawn_saver(
+            Arc::clone(&ingest.cache),
+            stop.clone(),
+            ingest.lock_hold(),
+        ),
+    });
+    let state = AppState::new(Arc::clone(&config), catalog);
     if state.data_root.as_path() != state.config.data_dir.as_path() {
         // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する
         tracing::info!(
@@ -141,6 +329,14 @@ fn serve(overrides: &Overrides) -> ExitCode {
         );
     }
     let result = runtime.block_on(crate::server::serve(state));
+    // 取り込みのスレッドを止める（サイクルの最中なら今の段が終わるまで。待つのは限られた時間だけ）
+    stop.stop();
+    if let (Some(threads), Some(ingest)) = (threads, &ingest) {
+        stop_ingest_threads(threads, &ingest.cache, THREAD_STOP_LIMIT);
+    }
+    // 期限内に止まらなかったスレッドが残っていても、`.ingest.lock` はそのスレッドが終わる（プロセスが
+    // 終わる）まで外れない（スレッドが `LockHold` を持つ）。ここで Ingest を捨てても二重には書かれない
+    drop(ingest);
     // 固まった spawn_blocking（DB の読み取り）を待ち続けて、停止が終わらないことがないように
     runtime.shutdown_timeout(Duration::from_secs(5));
     match result {
@@ -149,6 +345,349 @@ fn serve(overrides: &Overrides) -> ExitCode {
             tracing::error!("サーバーが異常終了しました: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// `geoframe sync [--dry-run]`: 同期サイクルを 1 回だけ動かす（棚卸し §5 の手動トリガー）。
+fn sync(dry_run: bool, allow_mass_delete: bool, data_dir: Option<PathBuf>) -> ExitCode {
+    let overrides = Overrides {
+        listen: None,
+        data_dir,
+    };
+    let config = match Config::load(|key| std::env::var(key).ok(), &overrides) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("geoframe: 設定が不正です: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    crate::logging::init(config.log_level);
+    crate::logging::install_panic_hook();
+    if dry_run {
+        sync_dry_run(&config, allow_mass_delete)
+    } else {
+        sync_apply(&config, allow_mass_delete)
+    }
+}
+
+/// `index_drive` の段を含む段の一覧。`--allow-mass-delete` の 1 回だけ、大量削除の保留を外す。
+fn stages_for(allow_mass_delete: bool) -> Vec<Box<dyn crate::sync::Stage>> {
+    if allow_mass_delete {
+        crate::sync::default_stages_allowing_mass_delete()
+    } else {
+        crate::sync::default_stages()
+    }
+}
+
+/// 書かずに計画を出す。書き込み接続を作らず、DB は読み取り専用、キャッシュは凍結して読む。
+fn sync_dry_run(config: &Config, allow_mass_delete: bool) -> ExitCode {
+    println!(
+        "dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）。\
+         Drive の鍵があれば一覧を読みに接続します（原本のダウンロードはしません）"
+    );
+    let read = match crate::db::open_read_only(&config.db_path()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("geoframe: DB を読み取り用に開けません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match crate::ingest::plan(config, &read) {
+        Ok(plan) => {
+            let s = &plan.schema;
+            println!(
+                "スキーマ: 作る表・索引 {} / 足す列 {} / place を NULL に戻す {} / embedding の写し {}",
+                s.missing_objects.len(),
+                s.missing_columns.len(),
+                if s.would_reset_places {
+                    "あり"
+                } else {
+                    "なし"
+                },
+                s.embeddings_to_copy
+            );
+            println!(
+                "掃除: 消す .dl_* {} 件 / 消す書きかけの .part {} 件 / 捨てる .cache.json の旧キー {} 件",
+                plan.leftover_files, plan.part_files, plan.legacy_cache_keys
+            );
+            if plan.skipped_dirs > 0 {
+                println!(
+                    "掃除を飛ばす tmp/・derivatives/（リンクなどで通常のディレクトリではない）: {} つ",
+                    plan.skipped_dirs
+                );
+            }
+        }
+        Err(e) => {
+            eprintln!("geoframe: 計画を作れません: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    // 後続の段は、先の段が済んだあとの状態で数える（先の段が自分の計画を写しに適用する）
+    let sim = match crate::sync::simulation_copy(&read) {
+        Ok(sim) => sim,
+        Err(e) => {
+            eprintln!("geoframe: DB のメモリ上の写しを作れません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!(
+        "後続の段は、先の段が済んだあとの状態（メモリ上の写し）で数えます。「写真:」の行も同じです"
+    );
+    let cache = Cache::load_frozen(&config.data_dir);
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let ctx = StageCtx {
+        mode: Mode::DryRun,
+        config,
+        read: &sim,
+        writer: None,
+        cache: &cache,
+        http: &http,
+        stop: &stop,
+    };
+    if allow_mass_delete {
+        println!("--allow-mass-delete: Drive の大量削除の保留を外した場合の件数を数えます");
+    }
+    let report = crate::sync::run_cycle(&stages_for(allow_mass_delete), &ctx);
+    print_report(&report);
+    exit_for(&report)
+}
+
+/// 実際に 1 回書く。`GEOFRAME_INGEST=1` が要る（P5 の切替まで、本番の書き手は Python）。
+fn sync_apply(config: &Config, allow_mass_delete: bool) -> ExitCode {
+    if !config.ingest {
+        eprintln!(
+            "geoframe: sync は GEOFRAME_INGEST=1 のときだけ書きます（書かずに計画だけ見るなら --dry-run）"
+        );
+        return ExitCode::from(2);
+    }
+    let ingest = match crate::ingest::start(config) {
+        Ok(ingest) => ingest,
+        Err(e) => {
+            eprintln!("geoframe: {e}");
+            return exit_for_ingest_error(&e);
+        }
+    };
+    let read = match crate::db::open_read_only(&config.db_path()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("geoframe: DB を読み取り用に開けません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let ctx = StageCtx {
+        mode: Mode::Apply,
+        config,
+        read: &read,
+        writer: Some(&ingest.writer),
+        cache: &ingest.cache,
+        http: &http,
+        stop: &stop,
+    };
+    let report = crate::sync::run_cycle(&stages_for(allow_mass_delete), &ctx);
+    ingest.cache.save_now();
+    print_report(&report);
+    exit_for(&report)
+}
+
+/// `geoframe organize [--dry-run]`: `index_local` を 1 回動かしてから、位置の無いローカル写真を
+/// `_excluded/no_gps/` へ移す（現行の `server.py --organize`）。書く実行は `sync` と同じ条件と
+/// ガードを通す。
+fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
+    one_off(
+        "organize",
+        dry_run,
+        data_dir,
+        "organize の対象は、index_local が済んだあとの状態（メモリ上の写し）で数えます",
+        |ctx| {
+            // 先に index_local → infer（現行の organize_photos と同じ順序）。その結果を使って移す。
+            // どちらかが失敗・省略されたときは移さない（古い行を信じて、まだある写真・位置が付く写真を動かさないため）
+            let mut failed = false;
+            for stage in [
+                &crate::local::IndexLocal as &dyn crate::sync::Stage,
+                &crate::geo::Infer,
+            ] {
+                if failed {
+                    break;
+                }
+                let name = stage.name();
+                match stage.run(ctx) {
+                    Ok(crate::sync::StageOutcome::Done(counts)) => {
+                        println!("{name}: 完了 {counts}")
+                    }
+                    Ok(crate::sync::StageOutcome::Skipped(reason)) => {
+                        println!("{name}: 省略（{reason}）");
+                        failed = true;
+                    }
+                    Err(e) => {
+                        println!("{name}: 失敗: {e}");
+                        failed = true;
+                    }
+                }
+            }
+            if !failed {
+                match crate::local::organize(ctx) {
+                    Ok(counts) => println!("organize: 完了 {counts}"),
+                    Err(e) => {
+                        println!("organize: 失敗: {e}");
+                        failed = true;
+                    }
+                }
+            }
+            if failed {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        },
+    )
+}
+
+/// `geoframe quality-scan [--dry-run]`: 孤児の特徴量を消し、未解析の写真を**全部**解析して、品質を
+/// 再構築する（現行の `server.py --quality-scan`）。書く実行は `sync` と同じ条件とガードを通す。
+fn quality_scan(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
+    one_off(
+        "quality-scan",
+        dry_run,
+        data_dir,
+        "解析（重い処理）は実行せず、件数だけを数えます",
+        |ctx| match crate::quality::scan(ctx) {
+            Ok(crate::sync::StageOutcome::Done(counts)) => {
+                println!("quality-scan: 完了 {counts}");
+                ExitCode::SUCCESS
+            }
+            Ok(crate::sync::StageOutcome::Skipped(reason)) => {
+                println!("quality-scan: 省略（{reason}）");
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                println!("quality-scan: 失敗: {e}");
+                ExitCode::FAILURE
+            }
+        },
+    )
+}
+
+/// `organize`・`quality-scan` のような、段を 1 回だけ動かして終わるコマンドの共通部分。設定を読み、
+/// 書く実行ではガードとロックを通して書き込み接続を作り、`--dry-run` では DB のメモリ上の写しを作って、
+/// `body` に渡す。
+fn one_off(
+    command: &str,
+    dry_run: bool,
+    data_dir: Option<PathBuf>,
+    dry_run_note: &str,
+    body: impl FnOnce(&StageCtx<'_>) -> ExitCode,
+) -> ExitCode {
+    let overrides = Overrides {
+        listen: None,
+        data_dir,
+    };
+    let config = match Config::load(|key| std::env::var(key).ok(), &overrides) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("geoframe: 設定が不正です: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    crate::logging::init(config.log_level);
+    crate::logging::install_panic_hook();
+    let ingest = if dry_run {
+        println!(
+            "dry-run: 何も書きません（行・ファイルは変えません。SQLite の WAL 関連ファイルだけはできうります）。\
+             {dry_run_note}"
+        );
+        None
+    } else {
+        if !config.ingest {
+            eprintln!(
+                "geoframe: {command} は GEOFRAME_INGEST=1 のときだけ動きます（書かずに件数だけ見るなら --dry-run）"
+            );
+            return ExitCode::from(2);
+        }
+        match crate::ingest::start(&config) {
+            Ok(ingest) => Some(ingest),
+            Err(e) => {
+                eprintln!("geoframe: {e}");
+                return exit_for_ingest_error(&e);
+            }
+        }
+    };
+    let read = match crate::db::open_read_only(&config.db_path()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("geoframe: DB を読み取り用に開けません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    // dry-run は、先の段が自分の計画を適用した写しの上で数える
+    let sim;
+    let read = if dry_run {
+        sim = match crate::sync::simulation_copy(&read) {
+            Ok(sim) => sim,
+            Err(e) => {
+                eprintln!("geoframe: DB のメモリ上の写しを作れません: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        &sim
+    } else {
+        &read
+    };
+    let cache = match &ingest {
+        Some(ingest) => Arc::clone(&ingest.cache),
+        None => Arc::new(Cache::load_frozen(&config.data_dir)),
+    };
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let ctx = StageCtx {
+        mode: if dry_run { Mode::DryRun } else { Mode::Apply },
+        config: &config,
+        read,
+        writer: ingest.as_ref().map(|i| &i.writer),
+        cache: &cache,
+        http: &http,
+        stop: &stop,
+    };
+    body(&ctx)
+}
+
+/// 取り込みを始められなかったときの終了コード。ガードが断ったのは 2（設定の誤りと同じ扱いで、
+/// unit の `RestartPreventExitStatus=2` により再起動ループにしない。再起動しても直らない）。
+fn exit_for_ingest_error(e: &crate::ingest::IngestError) -> ExitCode {
+    match e {
+        crate::ingest::IngestError::Refused(_) => ExitCode::from(2),
+        _ => ExitCode::FAILURE,
+    }
+}
+
+/// 段ごとの結果と件数だけを出す（値は持っていない）。
+fn print_report(report: &CycleReport) {
+    for stage in &report.stages {
+        let state = match &stage.result {
+            StageResult::Done(counts) if counts.is_empty() => "完了（件数なし）".to_string(),
+            StageResult::Done(counts) => format!("完了 {counts}"),
+            StageResult::Skipped(reason) => format!("省略（{reason}）"),
+            StageResult::Failed(message) => format!("失敗: {message}"),
+            StageResult::Panicked => "パニック".to_string(),
+            StageResult::NotRun => "未実行".to_string(),
+        };
+        println!("段 {}: {state}", stage.name);
+    }
+    if let Some(p) = report.photos {
+        println!(
+            "写真: 表示可能 {} / 取得待ち {} / 全{}",
+            p.ready, p.pending, p.total
+        );
+    }
+}
+
+fn exit_for(report: &CycleReport) -> ExitCode {
+    if report.failed() > 0 {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
     }
 }
 
@@ -183,6 +722,34 @@ mod tests {
         );
         // 引数なしでも起動できる（環境変数と既定値で決まる）
         assert_eq!(p(&["serve"]), Ok(Command::Serve(Overrides::default())));
+        assert_eq!(p(&["selfcheck-net"]), Ok(Command::SelfCheckNet));
+        assert_eq!(
+            p(&["sync"]),
+            Ok(Command::Sync {
+                dry_run: false,
+                allow_mass_delete: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            p(&["sync", "--dry-run", "--data-dir", "/srv/x"]),
+            Ok(Command::Sync {
+                dry_run: true,
+                allow_mass_delete: false,
+                data_dir: Some(PathBuf::from("/srv/x"))
+            })
+        );
+        // 大量削除の保留を外すのは sync の明示的な引数だけ（serve・organize は受けない）
+        assert_eq!(
+            p(&["sync", "--allow-mass-delete", "--dry-run"]),
+            Ok(Command::Sync {
+                dry_run: true,
+                allow_mass_delete: true,
+                data_dir: None
+            })
+        );
+        assert!(p(&["organize", "--allow-mass-delete"]).is_err());
+        assert!(p(&["serve", "--allow-mass-delete"]).is_err());
     }
 
     #[test]
@@ -198,5 +765,130 @@ mod tests {
         assert!(!err.contains("secret-host"), "{err}");
         assert!(p(&["serve", "--data-dir"]).is_err());
         assert!(p(&["serve", "--port", "1"]).is_err());
+        assert!(p(&["selfcheck-net", "x"]).is_err());
+        assert!(p(&["sync", "--listen", "127.0.0.1:1"]).is_err());
+        assert!(p(&["sync", "--data-dir"]).is_err());
+        assert!(p(&["organize", "--listen", "127.0.0.1:1"]).is_err());
+        assert!(p(&["organize", "--data-dir"]).is_err());
+    }
+
+    #[test]
+    fn parses_quality_scan() {
+        assert_eq!(
+            p(&["quality-scan"]),
+            Ok(Command::QualityScan {
+                dry_run: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            p(&["quality-scan", "--dry-run", "--data-dir", "/srv/x"]),
+            Ok(Command::QualityScan {
+                dry_run: true,
+                data_dir: Some(PathBuf::from("/srv/x"))
+            })
+        );
+        // 大量削除の保留を外すのは sync の明示的な引数だけ
+        assert!(p(&["quality-scan", "--allow-mass-delete"]).is_err());
+        assert!(p(&["quality-scan", "--listen", "127.0.0.1:1"]).is_err());
+    }
+
+    #[test]
+    fn parses_organize() {
+        assert_eq!(
+            p(&["organize"]),
+            Ok(Command::Organize {
+                dry_run: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            p(&["organize", "--dry-run", "--data-dir", "/srv/x"]),
+            Ok(Command::Organize {
+                dry_run: true,
+                data_dir: Some(PathBuf::from("/srv/x"))
+            })
+        );
+    }
+
+    /// 停止の順序: worker が止まる直前の最後の `put` も、最後の保存に入る。
+    #[test]
+    fn the_final_save_waits_for_the_worker_to_finish() {
+        use crate::testutil::TempDir;
+        use serde_json::json;
+
+        let dir = TempDir::new("cli-stop-order");
+        let cache = Arc::new(Cache::load(dir.path()));
+        let stop = StopFlag::new();
+        let saver = crate::cache::spawn_saver(
+            Arc::clone(&cache),
+            stop.clone(),
+            crate::ingest::LockHold::for_test(dir.path()),
+        );
+        // 偽の worker: 合図を見てから、少し遅れて最後の更新をする（saver が先に終わっても間に合う長さ）
+        let worker = {
+            let (cache, stop) = (Arc::clone(&cache), stop.clone());
+            std::thread::spawn(move || {
+                stop.wait(Duration::from_secs(30));
+                std::thread::sleep(Duration::from_millis(300));
+                cache.put("geo:late", json!(1));
+            })
+        };
+        stop.stop();
+        stop_ingest_threads(
+            IngestThreads { worker, saver },
+            &cache,
+            Duration::from_secs(10),
+        );
+        let saved = std::fs::read_to_string(dir.path().join(".cache.json")).unwrap();
+        assert!(saved.contains("geo:late"), "{saved}");
+    }
+    /// 保存スレッドが停止の期限を超えて残っている間は、`Ingest` を drop しても `.ingest.lock` が外れず、
+    /// 別の取り込みを始められない。スレッドが終わったら取れる（故障注入: 止まったままの保存スレッド）。
+    #[test]
+    fn the_ingest_lock_stays_while_a_stuck_saver_remains() {
+        use crate::config::Overrides;
+        use crate::guard::Guard;
+        use crate::ingest::{IngestError, start_with};
+        use crate::testutil::TempDir;
+
+        let dir = TempDir::new("cli-stuck-saver");
+        let overrides = Overrides {
+            listen: None,
+            data_dir: Some(dir.path().to_path_buf()),
+        };
+        let config = Config::load(|_| None, &overrides).unwrap();
+        let ingest = start_with(&config, &Guard::skip()).unwrap();
+
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        let hold = ingest.lock_hold();
+        let saver = std::thread::spawn(move || {
+            let _lock = hold; // 本物の保存スレッドと同じく、終わるまで持つ
+            started.send(()).unwrap();
+            let _ = wait.recv(); // I/O で固まっているつもり
+        });
+        running.recv().unwrap();
+        let worker = std::thread::spawn(|| {});
+        stop_ingest_threads(
+            IngestThreads { worker, saver },
+            &ingest.cache,
+            Duration::from_millis(100),
+        );
+        // serve の末尾と同じく Ingest を捨てる。固まった保存スレッドはまだ生きている
+        drop(ingest);
+        assert!(matches!(
+            start_with(&config, &Guard::skip()),
+            Err(IngestError::Locked)
+        ));
+        release.send(()).unwrap();
+        for _ in 0..200 {
+            match start_with(&config, &Guard::skip()) {
+                Ok(_) => return,
+                Err(IngestError::Locked) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("保存スレッドが終わってもロックが外れない");
     }
 }

@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8.9"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "sync", "time", "fs"] }
@@ -20,6 +20,35 @@ futures-util = { version = "0.3.34", default-features = false }
 libc = "0.2"
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# P2: 外向きの HTTPS（Drive・地理院・Nominatim）。同期サイクルは専用の std スレッドで動かすので、
+# 同期 API の ureq を使う（miharashi と同じ）。TLS は rustls（暗号は ring。C は cc でビルド）で、
+# ルート証明書は webpki-roots を埋め込む（OS の証明書に依存しない）。native-tls/openssl は使わない
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+# サービスアカウントの JWT（RS256）の署名。rsa crate は使わず、rustls が既に引いている ring で署名する
+ring = "0.17"
+base64 = "0.22"
+# P2 / T2.2: 画像処理（derivative の生成）。推奨構成の根拠と計測は docs/rust-migration/image-poc.md。
+# いずれも純 Rust（muslの静的ビルドを壊さない）。`image` は JPEG を zune-jpeg 直接で読むので
+# PNG・TIFF のデコードだけに使う（miharashi と同じ版）
+image = { version = "0.25.10", default-features = false, features = ["png", "tiff"] }
+# JPEG のデコード（`image` が内部で使うのと同じ版。厳格なモードと ICC・寸法の取得のため直接使う）
+zune-jpeg = "0.5.15"
+# 縮小は CatmullRom（Pillow の thumbnail 既定 BICUBIC と同系統）。`image` の resize より約 14 倍速い
+fast_image_resize = "6.1.0"
+# JPEG のエンコード（4:2:0、品質 85、ハフマン表の最適化は付けない。image-poc.md §3.2）
+jpeg-encoder = "0.7.1"
+# 広色域（Display P3 など）の ICC を sRGB へ変換する（Python は捨てるだけ）
+moxcms = "0.8.1"
+# HEIC（純 Rust。libheif と出力がバイト単位で一致）
+zune-heic = "0.5.0"
+# P2 / T2.3: ローカル写真の derivative の名前 `local_<md5(path)[:16]>.jpg`（現行の hashlib.md5）。
+# 暗号用途ではなく名前の互換のためだけ。純 Rust（RustCrypto。digest は既に Cargo.lock にある）
+md-5 = "0.11.0"
+
+# musl 標準のアロケータは画像処理で 15〜25% 遅い（image-poc.md §3.5）ので、musl のときだけ mimalloc を使う。
+# C のソースを cc でビルドする（CI の musl-tools で足りる）。静的にリンクされ、実行時の依存は増えない
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.48", default-features = false }
 
 [dev-dependencies]
 # 時間を止めて進める（limits.rs の無通信の期限の検査）。新しい crate は増えない
