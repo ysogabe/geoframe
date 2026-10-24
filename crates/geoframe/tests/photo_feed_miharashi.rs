@@ -18,7 +18,10 @@
 mod common;
 
 use chrono::{NaiveDate, NaiveDateTime};
-use common::{CONTRACT_FIELDS, python_fixture, sample_photos};
+use common::{
+    CONTRACT_FIELDS, TempDir, build_catalog, build_empty_catalog, photos_from, python_fixture,
+    sample_photos,
+};
 use geoframe::feed::{Photo, is_time};
 use serde_json::{Value, json};
 
@@ -128,7 +131,49 @@ const FIXTURE_SHOWN: [&str; 7] = ["1", "2", "4", "6", "8", "9", "10"];
 
 #[test]
 fn reads_the_python_fixture() {
-    let reads = read_feed(&python_fixture()).unwrap();
+    check_fixture_reads(&python_fixture());
+}
+
+/// エンドポイントの実出力（HTTP 越し）を miharashi の読み方で読む。Python のフィクスチャと同じ
+/// 結果になる。
+#[tokio::test]
+async fn reads_the_live_endpoint_like_the_python_fixture() {
+    let dir = TempDir::new("miharashi-live");
+    let (path, _writer) = build_catalog(dir.path(), "");
+    let response = photos_from(&path).await;
+    assert_eq!(response.status, 200);
+    let live = response.json();
+    check_fixture_reads(&live);
+    assert_eq!(
+        read_feed(&live).unwrap(),
+        read_feed(&python_fixture()).unwrap()
+    );
+}
+
+/// `taken_at` が NULL の行は、契約どおり空文字（時刻不明）で最後に出るので、miharashi は
+/// 時刻なしの写真として読める（Python の `time: null` は文字列でなく、`unwrap_or("")` で
+/// 空になるだけだった）。
+#[tokio::test]
+async fn reads_a_null_taken_at_as_an_unknown_time() {
+    let dir = TempDir::new("miharashi-null");
+    let sql = "INSERT INTO photos(id,source,display,name,taken_at,lat,lon)
+               VALUES(1,'local','derivatives/a.jpg','IMG_0001.jpg','2025-06-01 10:00',35.0,139.0);
+               INSERT INTO photos(id,source,display,name,taken_at,lat,lon)
+               VALUES(2,'local','derivatives/b.jpg','IMG_0002.jpg',NULL,35.1,139.1);";
+    let (path, _writer) = build_empty_catalog(dir.path(), sql);
+    let live = photos_from(&path).await.json();
+    let reads = read_feed(&live).unwrap();
+    let ids: Vec<&str> = reads.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(ids, ["1", "2"]);
+    assert_eq!(reads[0].trip, Some(0));
+    assert_eq!(reads[1].trip, Some(1));
+    assert_eq!(reads[1].taken, "");
+    assert_eq!(parse_time(&reads[1].taken), None);
+    assert_eq!(live[1]["time"], "");
+}
+
+fn check_fixture_reads(list: &Value) {
+    let reads = read_feed(list).unwrap();
     let ids: Vec<&str> = reads.iter().map(|r| r.id.as_str()).collect();
     // id=3 は similar の推奨外でお気に入りでもないので出さない
     assert_eq!(ids, FIXTURE_SHOWN);

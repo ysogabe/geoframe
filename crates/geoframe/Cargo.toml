@@ -8,9 +8,22 @@ axum = "0.8.9"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "io-util"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "io-util", "sync", "time", "fs"] }
+# 静的ファイルの Last-Modified / If-Modified-Since（IMF-fixdate）。hyper が既に使っている純 Rust の小さな crate
+httpdate = "1.0.3"
+# ファイルを分けて流す Stream（stream::unfold）だけを使う。axum が既に引いている crate
+futures-util = { version = "0.3.34", default-features = false }
+# ログは journal 向けに標準出力へ。どちらも純 Rust で、musl 静的ビルドを壊さない（C 依存なし）。
+# env-filter（regex）や時刻・色の機能は入れない（journald が時刻を付ける）
+# statvfs（ディスク使用量）と localtime_r（現地時刻）だけ。unsafe は sysinfo.rs に閉じ込める。
+# tokio が既に引いている crate（C のビルドは無い。musl 静的ビルドを壊さない）
+libc = "0.2"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 [dev-dependencies]
+# 時間を止めて進める（limits.rs の無通信の期限の検査）。新しい crate は増えない
+tokio = { version = "1.54.1", features = ["test-util"] }
 # 契約テストで応答を JSON Schema と突き合わせる。Schema は内部参照（`#/$defs/...`）だけなので、HTTP・ファイルの
 # 参照解決（reqwest/rustls）は要らない
 jsonschema = { version = "0.60.1", default-features = false }

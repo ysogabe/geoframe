@@ -6,7 +6,7 @@
 
 ## 1. 結論
 
-**標準のビルドは`x86_64-unknown-linux-musl`の完全静的バイナリにする。** 現時点の依存（tokio・axum・rusqlite `bundled`・serde）は純Rustまたは同梱Cコードだけで、musl静的でビルドでき、検証環境（lxc-geoframe。Ubuntu 24.04、glibc 2.39）で動いた。
+**標準のビルドは`x86_64-unknown-linux-musl`の完全静的バイナリにする。** 現時点の依存（tokio・axum・rusqlite `bundled`・serde・tracing）は純Rustまたは同梱Cコードだけで、musl静的でビルドでき、検証環境（lxc-geoframe。Ubuntu 24.04、glibc 2.39）で動いた。
 
 ただし次の依存が入るときは、その都度この結論を見直す（§6）。
 
@@ -56,6 +56,8 @@ cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 | 要求するglibc | なし | `GLIBC_2.34`まで（`objdump -T`） |
 
 - サイズはほぼ同じ。リリースプロファイルは既定のまま（`strip`・LTOは未設定。必要になったら設定する）。
+- **T1.3（管理画面の静的ファイル約936 KiBの埋め込み、静的配信、Host検査）の後**: musl静的で strip前 5,767,424 B（約5.5 MiB）、strip後 4,886,392 B（約4.7 MiB）。T1.2の時点（strip前 4,565,432 B、strip後 3,772,152 B）から約1.1〜1.2 MB増え、そのうち約0.94 MBが埋め込んだファイル。`static-pie linked`・`ldd`は`statically linked`のまま。埋め込みは`crates/geoframe/build.rs`が`app/static`・`app/vendor`を`include_bytes!`の表にする（外部crateなし）ので、ビルドには**リポジトリの`app/`が要る**（[server.md §9.4](server.md)）。追加した依存は`httpdate`・`futures-util`だけで、どちらも純Rustで依存木に既にあった。
+- **T1.4（管理画面の読み取りAPI）の後**: musl静的で strip前 6,170,752 B（約5.9 MiB）。`static-pie linked`・`ldd`は`statically linked`のまま。直接の依存に`libc`（`statvfs`・`localtime_r`のため。`tokio`が既に引いている純FFIのcrateで、Cのビルドは無い）を足した。`unsafe`は`sysinfo.rs`だけ（[server.md §10.4](server.md)）。musl版でも`TZ=Asia/Tokyo`の現地時刻が出ることを確かめた（合成DB・ループバックのみ）。
 - glibcビルドの要求は2.34までで、検証環境（2.39）にもn100（2.41）にも載る。ただし、これはこの小さな依存セットでの値で、依存が増えると上がる。配布先のglibcより新しい機体でビルドすると動かなくなる（plan.mdの懸念）。
 
 ## 4. 検証環境での動作確認
@@ -92,9 +94,10 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 | `crates/geoframe-imgpoc/` | 画像処理の技術PoC（`publish = false`）。本体の静的ビルドの検査には含めない。CIは別の手順で、`--features heic-zune,mimalloc`（libheifなし）のmusl静的ビルドと`file`／`ldd`の検査だけを行う。結果は[image-poc.md](image-poc.md) |
 | `geoframe --version` | バージョンを出す |
 | `geoframe check-db <path>` | `photos`の行数とSQLiteのバージョンを出す。読み取り専用 |
-| `geoframe serve --listen <addr>` | `GET /healthz`が`{"ok":true}`を返す。SIGTERMで停止 |
+| `geoframe serve [--listen <addr>] [--data-dir <dir>]` | 読み取り専用のサーバー。P0では`GET /healthz`が`{"ok":true}`を返すだけだった。T1.1で、設定・DB読み取り層・ログ・DBを読めるかを返すヘルスを足した（[server.md](server.md)）。SIGTERMで停止 |
+| `deploy/geoframe-rs.service`・`deploy/rust-deploy.sh` | T1.5。検証環境向けのsystemd unitと、ビルド→転送→入れ替え→確認→巻き戻しの配布スクリプト（[deploy/README.md §7](../../deploy/README.md)、[server.md §6](server.md)）。本番の切替はP5 |
 
-依存は`tokio`・`axum`・`rusqlite`（`bundled`）・`serde`・`serde_json`。外部HTTPクライアントと`image`はまだ入れていない。SQLiteの呼び出しは`db::check_db_blocking`のように`spawn_blocking`で包み、tokioのworkerを塞がない形にした（P1以降もこの形に揃える）。
+依存は`tokio`・`axum`・`rusqlite`（`bundled`）・`serde`・`serde_json`、T1.1で`tracing`・`tracing-subscriber`（どちらも純Rust。`env-filter`・時刻・色の機能は入れない）。外部HTTPクライアントと`image`はまだ入れていない。SQLiteの呼び出しは`db::Catalog::read`で`spawn_blocking`に出し、tokioのworkerを塞がない形にした（P1以降もこの形に揃える。[server.md](server.md) §2.2）。
 
 ## 6. 今後の注意と代替案
 

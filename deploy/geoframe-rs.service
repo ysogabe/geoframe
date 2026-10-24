@@ -1,0 +1,79 @@
+[Unit]
+Description=GEOFRAME server, Rust 版 (geoframe serve, http://localhost:8080/)
+Documentation=file:///opt/geoframe/deploy/README.md
+
+# Python 版（geoframe-server.service）と同じ理由で time-sync.target は待たない。
+# 時刻のずれは下記 Environment=TZ で別途担保する。
+After=network-online.target
+Wants=network-online.target
+
+# P1〜P4 は検証環境専用で、本番の切替は P5（docs/rust-migration/plan.md）。
+# 本番機にはこの unit を入れない。Python 版と同じ待ち受けポート・データ置き場が既定なので、
+# 同じ機体で並走させるときは待ち受けとデータ置き場を分ける（deploy/README.md）。
+
+[Service]
+Type=simple
+User=geoframe
+# バイナリは musl の完全静的ビルド（docs/rust-migration/build.md）。実行時に app/ は読まない
+# （管理画面の静的ファイルは埋め込み済み）ので、WorkingDirectory も要らない。
+ExecStart=/usr/local/bin/geoframe serve
+
+# StateDirectory=geoframe … /var/lib/geoframe を User=（geoframe:geoframe）に書き込み許可で
+# 用意する。Python 版と同じ名前なので、データ置き場は両者で共通になる。
+# P1 は読み取り専用だが、WAL の DB は読み取りでも同じディレクトリに -shm/-wal を作る・触る
+# ので、ディレクトリには書き込み許可が要る（DB 本体を守るのは下の ReadOnlyPaths）。
+StateDirectory=geoframe
+StateDirectoryMode=0750
+
+# --- データルート ---
+Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe
+
+# 撮影時刻はローカル時刻（naive）で比較・表示する。TZ 未設定（=UTC）だと 9 時間ずれる。
+# Rust 版は TZ を解釈せず libc の localtime に渡すだけなので、Python 版と同じく unit で
+# 明示する（docs/rust-migration/server.md §1.2）。
+Environment=TZ=Asia/Tokyo
+
+# 運用トグル。先頭の "-" はファイルが無くても起動失敗にしない指定。
+# Environment=/EnvironmentFile= は記載順に評価され後勝ちなので、上の Environment= より
+# 後に置く（/etc/default/geoframe で同名キーを指定すれば意図的に上書きできる）。
+# 待ち受けは --listen を書かず、GEOFRAME_HOST/GEOFRAME_PORT（既定 0.0.0.0:8080）で決まる。
+# Python 版と同じ機体で並走するときは、README の「Rust 版を Python 版と並走させる」の
+# drop-in で --listen を足す（--listen は GEOFRAME_HOST/GEOFRAME_PORT より優先される）。
+EnvironmentFile=-/etc/default/geoframe
+
+# 異常終了は再起動する。ただし設定不正（終了コード 2）は再起動しても直らないので、
+# 再起動ループにせず failed のまま止める。DB が開けない・スキーマ不足（終了コード 1）は
+# Python より先に起動した場合などで再試行に意味があるので再起動対象。
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2
+
+# 同時の接続 256 ＋ 配信中のファイル 32 ＋ SQLite ＋ 標準入出力で 300 前後を使う
+# （docs/rust-migration/server.md §9.3）。既定の 1024 以上にすること。
+LimitNOFILE=4096
+
+# --- ハードニング ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+SystemCallFilter=@system-service
+# Rust 版は C 拡張を動的に読み込まず JIT も使わないので、Python 版（Pillow のため付けられない）と
+# 違って付けられる。
+MemoryDenyWriteExecute=true
+
+# P1 は読み取り専用: DB 本体と画像の置き場を OS の側でも書き込み不可にする。
+# （ReadOnlyPaths は StateDirectory の書き込み許可より後に効く。先頭の "-" は無いパスを無視する指定。）
+# P2 で取り込み用の書き込み接続（writer）を足すとき、必要な分だけ解除する。P3 で手動修正などの更新 API を足す。
+# 注意: ファイルの bind mount なので、catalog.db を別の inode に置き換えた（mv で復元した）
+# 場合は、再起動するまで古い方を見続ける。復元は Rust の再起動が要るという元の注意
+# （docs/rust-migration/server.md §2.4）のとおり、復元後は必ず再起動する。
+ReadOnlyPaths=-/var/lib/geoframe/catalog.db -/var/lib/geoframe/derivatives -/var/lib/geoframe/photos -/var/lib/geoframe/blog_exports -/var/lib/geoframe/travel_blog
+
+# ログは journal へ集約（確認: journalctl -u geoframe-rs -f）
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=geoframe-rs
+
+[Install]
+WantedBy=multi-user.target

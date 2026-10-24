@@ -447,6 +447,98 @@ sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements.t
 > ロールバックした状態は`origin/main`より古いため、次に`deploy-pull.sh`を実行すると
 > 再び`origin/main`へ進みます。問題のあるコミットはGitHub側で修正してください。
 
+## 7. Rust 版（移行中。検証環境専用）
+
+Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作業（[Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)）の途中経過です。
+**P1 の Rust 版は読み取り専用で、本番では使いません。本番の切替は P5**（[計画](../docs/rust-migration/plan.md)）で、
+ユーザーの立ち会いのもとで行います。ここまでの§1〜§6（Python 版）が現行の本番の手順で、変わりません。
+本番機（`geoframe-server` が動いている機体）に、この節の unit・スクリプトを使わないでください。
+
+| ファイル | 役割 |
+| --- | --- |
+| [`geoframe-rs.service`](geoframe-rs.service) | Rust 版の systemd unit。`geoframe-server.service` と同じハードニングに、Rust 版だけ付けられる`MemoryDenyWriteExecute=true`を足す |
+| [`rust-deploy.sh`](rust-deploy.sh) | 手元でビルド（`x86_64-unknown-linux-musl`の完全静的）→ 検証環境の確認 → 転送 → 入れ替え → 確認 → 失敗時の復元 |
+| [`rust-deploy-test.sh`](rust-deploy-test.sh) | `rust-deploy.sh`の検証環境側の本体を、モックの`systemctl`/`curl`で試験する（ssh もサービスも使わない） |
+| [`../tools/compare_with_python.py`](../tools/compare_with_python.py) | Rust 版と比較用 Python 版の全件比較（集計だけを出す） |
+| [`../tools/miharashi-feed-check/`](../tools/miharashi-feed-check/README.md) | miharashi の取得・読み込みのコードを、画面なしで Rust 版に向けて動かす確認用ハーネス |
+
+### 7.1 unit の要点
+
+- バイナリは`/usr/local/bin/geoframe`、`geoframe serve`をそのまま起動する（`app/`も`.venv`も要らない）。
+- `User=geoframe`、`StateDirectory=geoframe`（`/var/lib/geoframe`）、`Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe`、
+  `Environment=TZ=Asia/Tokyo`、`EnvironmentFile=-/etc/default/geoframe`（後勝ち）。Python 版と**同じ設定ファイル・同じデータ置き場**を読む。
+- `RestartPreventExitStatus=2`: 設定不正（終了コード 2）は再起動しても直らないので、再起動ループにせず`failed`で止める。
+  DB が開けない（終了コード 1）は再起動対象。`LimitNOFILE=4096`（同時の接続 256＋配信 32＋SQLite で 300 前後を使う）。
+- P1 は読み取り専用なので、`ReadOnlyPaths=`で`catalog.db`と`derivatives/`などを OS の側でも書き込み不可にしている。
+  WAL の DB は読み取りでも同じディレクトリに`-shm`/`-wal`を作るので、ディレクトリ自体は書き込み可のまま。
+  P2 で取り込み用の書き込み接続（writer）を追加し、`ReadOnlyPaths=`を必要な分だけ解除する。P3 で手動修正などの更新 API を追加する。`catalog.db`を別の inode に置き換えたら（バックアップからの復元など）再起動する。
+- **待ち受けは`--listen`を書かない**。`GEOFRAME_HOST`/`GEOFRAME_PORT`（既定`0.0.0.0:8080`）で決まる。
+
+### 7.2 Rust 版を Python 版と並走させる（P1〜P4 の検証）
+
+同じ機体で Python 版と Rust 版を同時に動かすなら、**待ち受けとデータ置き場を分ける**。
+Python 版と Rust 版は同じ`catalog.db`を同時には開かない（Python は起動時の移行・位置推定で DB へ書く）。
+Rust 版へ別のポートを与えるには、drop-in の`ExecStart=`に`--listen`を書く（`--listen`は`GEOFRAME_HOST`/`GEOFRAME_PORT`より優先され、それらを読まない）。
+
+```sh
+sudo systemctl edit geoframe-rs
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/geoframe serve --listen 0.0.0.0:8081
+```
+
+検証環境（lxc-geoframe）では、Python 版を比較用に別のデータ（`/var/lib/geoframe-pyref`）・別のポート（8090）で動かし、
+Rust 版は本番のコピーのデータ（`/var/lib/geoframe`）を`:8080`で読んでいる。
+
+### 7.3 配布と確認（検証環境）
+
+```sh
+# 接続先は引数か環境変数で必ず指定する（既定値は無い）
+export GEOFRAME_SSH_TARGET=user@検証環境
+deploy/rust-deploy.sh --dry-run        # ビルドと手順の表示だけ（ssh もしない）
+deploy/rust-deploy.sh                  # ビルド→検査→転送→入れ替え→/healthz と /api/v1/photos の確認
+deploy/rust-deploy.sh --skip-build     # ビルド済みの成果物をそのまま配る
+deploy/rust-deploy.sh --rollback       # 直前のバイナリ（.prev）へ手で戻す
+bash deploy/rust-deploy-test.sh        # 失敗経路をモックで試験（ssh なし）
+```
+
+**検証環境の印（誤配布の防止）。** 変更の前に、接続先に次の 2 つを確かめ、満たさなければ何も変更せずに終了コード 4 で拒否する（`--rollback`も同じ）。
+
+- 検証環境の印`/etc/geoframe/staging`（通常ファイル。シンボリックリンクは不可）があること。**検証環境で一度だけ作る**（本番機には作らない）:
+  `sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging`（`/etc/geoframe/`は本番機にも SSH の鍵置き場として存在するので、ディレクトリではなくファイルを見る）。
+- Python 版の`geoframe-server.service`が稼働中でないこと（稼働中なら本番機の可能性が高い）。
+
+本番の切替は P5 で、専用の手順と明示的なフラグをそのとき作る。このスクリプトは、印の無い機体には配らない。
+
+配置先のバイナリは入れ替えの直前に`/usr/local/bin/geoframe.prev`へ（unit も`.prev`へ）残す。**直前の 1 世代だけ**。
+
+**失敗したときの復元。** 入れ替え以降（unit の導入・`daemon-reload`・`enable`・`restart`・確認）のどこで失敗しても、
+さらにリモートの本体が中断されても（ssh の切断・SIGTERM）、配布前の状態へ戻す。
+
+| 状況 | 戻し方 |
+| --- | --- |
+| 既存の配布を更新 | バイナリを`.prev`から、unit を`.prev`から戻す。配布前に稼働していれば再起動して確認、止まっていれば止めたまま。配布前に`enable`でなかったなら`disable`する。失敗した方のバイナリは`geoframe.failed`に残る |
+| 初回の配布（戻すバイナリが無い） | サービスを止め、配布前に`enable`でなかったなら`disable`し、新しく入れた unit を撤去し、バイナリを`geoframe.failed`へ退避する（以前の世代の`.prev`は戻す先にしない） |
+
+終了コード: 0 成功 / 1 失敗したが配布前の状態へ戻した / **3 戻す途中でも失敗した**（途中で失敗した操作と、手作業の復旧手順が出る。
+「戻した」とは表示しない）/ 4 誤配布の防止で拒否 / 2 引数の誤り。
+
+初回だけ、検証環境で次を整える（以後は`rust-deploy.sh`が unit を入れる）。
+
+```sh
+sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging  # 検証環境の印（上記）
+sudo chown -R geoframe:geoframe /var/lib/geoframe   # WAL の -shm を作れる持ち主にそろえる
+sudo install -m 0644 /dev/null /etc/default/geoframe # 出力に影響する設定だけ書く。本番に合わせて GEOFRAME_EMBED_BACKEND=local など
+```
+
+全件比較（Python 版の応答との一致）は`tools/compare_with_python.py --rust <Rust のURL> --python <比較用 Python のURL>`。
+JSON は型を区別して比べる（`true`と`1`、`false`と`0`、`35`と`35.0`は別）。画像は両方が 200 を返したうえで、バイト列を比べる
+（同じエラー同士は一致に数えない）。`--self-test`で比較関数だけを試せる（接続しない）。
+結果の記録は[P1 の受入確認](../docs/rust-migration/p1-acceptance.md)。
+
 ## トラブルシュート
 
 - `status=200/CHDIR`: `/opt/geoframe/app`と親ディレクトリを`geoframe`ユーザーが通過できるか

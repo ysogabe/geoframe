@@ -10,6 +10,7 @@
 """
 import json
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -17,6 +18,9 @@ from geoframe import photos, store
 
 ROOT = Path(__file__).resolve().parents[2]
 FIXTURE_PATH = ROOT / "crates/geoframe/tests/fixtures/photo-feed-python.json"
+# 同じ合成DBのSQL（本物のスキーマ＋行）。Rustのテストがこれを流し込んで同じDBを作り、
+# FIXTURE_PATH の出力と突き合わせる
+CATALOG_SQL_PATH = ROOT / "crates/geoframe/tests/fixtures/photo-feed-catalog.sql"
 SCHEMA_PATH = ROOT / "docs/architecture/photo-feed.schema.json"
 
 PHOTO_COLUMNS = ("id", "source", "display", "name", "md5", "taken_at", "lat", "lon",
@@ -85,20 +89,33 @@ AI_MEMBERS = [
 ]
 
 
-def build_items(extra_photos=()):
-    """合成DBに対する現行 `api_photos()` の出力（JSONに直せる dict のリスト）。
-
-    `extra_photos` は PHOTOS に足す行（フィクスチャには入れない特殊な行の挙動を調べる用）。
-    """
+@contextmanager
+def _seeded(extra_photos=()):
+    """合成DBを本物のスキーマで作って行を入れ、その間 `store` がそのDBを指すようにする。"""
     with tempfile.TemporaryDirectory() as tmp:
         with patch.object(store, "DB_PATH", Path(tmp) / "catalog.db"), \
                 patch.object(store, "_db", None):
             try:
                 _seed(extra_photos)
-                return photos.api_photos()
+                yield
             finally:
                 if store._db is not None:
                     store._db.close()
+
+
+def build_items(extra_photos=()):
+    """合成DBに対する現行 `api_photos()` の出力（JSONに直せる dict のリスト）。
+
+    `extra_photos` は PHOTOS に足す行（フィクスチャには入れない特殊な行の挙動を調べる用）。
+    """
+    with _seeded(extra_photos):
+        return photos.api_photos()
+
+
+def build_catalog_sql():
+    """合成DB（`build_items()` が読むのと同じもの）のSQL。スキーマ→行の順で、順序は決まっている。"""
+    with _seeded():
+        return "\n".join(store.db().iterdump()) + "\n"
 
 
 def _seed(extra_photos=()):

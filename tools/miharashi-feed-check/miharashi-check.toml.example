@@ -1,0 +1,7 @@
+# miharashi の `png` サブコマンドを、Rust 版 geoframe に向けて画面なしで動かすための最小の設定。
+# `miharashi png --config <このファイルを写したもの> --renderer cpu --size 640x360 --out <出力先>`
+# --config を明示するので /etc/miharashi を拾わず、STATE_DIRECTORY が無ければ表示履歴も書かない。
+# 写して、url を検証環境の Rust 版（http://<ホスト>:8080）に書き換えて使う。
+# 実際のホスト名・IP はコミットしない（写したファイルは /tmp など Git の外に置く）。
+[geoframe]
+url = "http://192.0.2.10:8080"
