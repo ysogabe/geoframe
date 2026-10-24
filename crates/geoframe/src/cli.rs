@@ -368,6 +368,12 @@ fn sync_dry_run(config: &Config) -> ExitCode {
                 "掃除: 消す .dl_* {} 件 / 消す書きかけの .part {} 件 / 捨てる .cache.json の旧キー {} 件",
                 plan.leftover_files, plan.part_files, plan.legacy_cache_keys
             );
+            if plan.skipped_dirs > 0 {
+                println!(
+                    "掃除を飛ばす tmp/・derivatives/（リンクなどで通常のディレクトリではない）: {} つ",
+                    plan.skipped_dirs
+                );
+            }
         }
         Err(e) => {
             eprintln!("geoframe: 計画を作れません: {e}");

@@ -183,13 +183,100 @@ impl Stage for Placeholder {
     }
 }
 
+/// 写しを作る時間の上限。本番相当の DB（約 85 MiB）で 0.3 秒ほどなので、その 100 倍。超えたら dry-run を
+/// 失敗（終了コード 1）にする。読み取りトランザクションでスナップショットを固定するので（下記）、
+/// 超えるのは写しの元（実 DB）が長く排他ロックされているような異常なときだけ。
+pub const COPY_DEADLINE: Duration = Duration::from_secs(30);
+
+/// 写しの 1 回の `step` で進めるページ数（4 KiB で約 4 MiB）。
+const COPY_PAGES_PER_STEP: i32 = 1024;
+/// ロックで進めなかったときの待ち。ロックの解けを待つだけなので短くてよい（期限内なら何度でも）。
+const COPY_RETRY_INTERVAL: Duration = Duration::from_millis(20);
+
 /// `--dry-run` 用の、実 DB のメモリ上の写し。`read` から SQLite のバックアップ API で作る（実 DB は
 /// 読むだけ）。写しは書ける接続で、段が自分の計画を適用して後続の段に見せるために使う。
+///
+/// **やり直しが起きないようにする**: バックアップは、元が途中で更新されると最初からやり直す。更新の
+/// 多い DB では終わらなくなる。そこで、写しの間だけ `read` で読み取りトランザクションを持ち、
+/// スナップショットを固定する（WAL なら書き手を止めず、書き手の更新は写しに入らない。ロールバック
+/// ジャーナルの DB では、写しの間（約 0.3 秒）だけ書き手が待つ）。さらに [`COPY_DEADLINE`] の期限を
+/// 付け、ロックで進めない間は短い間隔で繰り返し、期限を超えたらエラーにする（`busy_timeout` ぶんまでは
+/// 超えうる）。
 pub fn simulation_copy(read: &Connection) -> rusqlite::Result<Connection> {
+    simulation_copy_within(read, COPY_DEADLINE)
+}
+
+/// [`simulation_copy`] の期限を指定できる形（試験用に分けた）。
+pub(crate) fn simulation_copy_within(
+    read: &Connection,
+    deadline: Duration,
+) -> rusqlite::Result<Connection> {
+    let start = Instant::now();
+    let timed_out = || {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some(format!(
+                "DB が使用中で、{}秒以内にメモリ上へ写せませんでした",
+                deadline.as_secs_f32()
+            )),
+        )
+    };
+    // スナップショットを固定する。`BEGIN` だけでは最初の読み取りまで固定されないので、1 回読む
+    loop {
+        let snapshot = read
+            .execute_batch("BEGIN")
+            .and_then(|()| read.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(())));
+        match snapshot {
+            Ok(()) => break,
+            Err(e) => {
+                let _ = read.execute_batch("ROLLBACK");
+                if !is_busy(&e) {
+                    return Err(e);
+                }
+                if start.elapsed() >= deadline {
+                    return Err(timed_out());
+                }
+                std::thread::sleep(COPY_RETRY_INTERVAL);
+            }
+        }
+    }
+    let result = copy_snapshot(read, start, deadline).map_err(|e| e.unwrap_or_else(timed_out));
+    let _ = read.execute_batch("ROLLBACK");
+    result
+}
+
+fn is_busy(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if matches!(
+                f.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+/// `Err(None)` は期限切れ。
+fn copy_snapshot(
+    read: &Connection,
+    start: Instant,
+    deadline: Duration,
+) -> Result<Connection, Option<rusqlite::Error>> {
+    use rusqlite::backup::{Backup, StepResult};
     let mut copy = Connection::open_in_memory()?;
     {
-        let backup = rusqlite::backup::Backup::new(read, &mut copy)?;
-        backup.run_to_completion(1024, Duration::from_millis(5), None)?;
+        let backup = Backup::new(read, &mut copy)?;
+        loop {
+            match backup.step(COPY_PAGES_PER_STEP)? {
+                StepResult::Done => break,
+                StepResult::More => {}
+                // 元か先がロックされている（rusqlite は他の結果も `#[non_exhaustive]` で持つ）
+                _ => std::thread::sleep(COPY_RETRY_INTERVAL),
+            }
+            if start.elapsed() >= deadline {
+                return Err(None);
+            }
+        }
     }
     Ok(copy)
 }
@@ -636,6 +723,107 @@ mod tests {
         assert!(RUNS.load(Ordering::SeqCst) >= 3);
         stop.stop();
         handle.join().unwrap();
+    }
+
+    /// 別の接続が更新し続けても、写しは完了する（スナップショットを固定するのでやり直しが起きない）。
+    /// 写しは固定した時点の内容で、整合している。
+    #[test]
+    fn simulation_copy_finishes_while_a_wal_db_is_updated_continuously() {
+        let dir = TempDir::new("sync-copy-wal");
+        let path = dir.path().join("catalog.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)")
+                .unwrap();
+            // 1 回の step（1024 ページ）では収まらない大きさ（約 12 MiB）
+            let tx = conn.unchecked_transaction().unwrap();
+            for _ in 0..3000 {
+                tx.execute("INSERT INTO t(v) VALUES (zeroblob(4000))", [])
+                    .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (path, stop) = (path.clone(), Arc::clone(&stop));
+            std::thread::spawn(move || {
+                let conn = Connection::open(&path).unwrap();
+                conn.busy_timeout(Duration::from_secs(5)).unwrap();
+                let mut n = 0;
+                while !stop.load(Ordering::SeqCst) {
+                    // 元の接続が step の合間に見るたびに変わっている状態を作り続ける
+                    conn.execute("INSERT INTO t(v) VALUES (zeroblob(100))", [])
+                        .unwrap();
+                    conn.execute(
+                        "UPDATE t SET v = zeroblob(4000) WHERE id = ?1",
+                        [n % 3000 + 1],
+                    )
+                    .unwrap();
+                    n += 1;
+                }
+                n
+            })
+        };
+        let read = crate::db::open_read_only(&path).unwrap();
+        let before: i64 = read
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        let started = Instant::now();
+        let copy = simulation_copy_within(&read, Duration::from_secs(20));
+        let took = started.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        let written = writer.join().unwrap();
+        let copy = copy.expect("更新され続けても完了する");
+        assert!(written > 0, "書き手が動いていなかった");
+        assert!(took < Duration::from_secs(20), "{took:?}");
+        let rows: i64 = copy
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert!(rows >= before, "{rows} < {before}");
+        let check: String = copy
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(check, "ok");
+        // 写しのあと、元の接続は読み取りトランザクションを持ち越さない（次は最新が見える）
+        assert!(read.is_autocommit());
+        let latest: i64 = read
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert!(latest >= rows);
+    }
+
+    /// 元が排他ロックされたままなら、期限でエラーにする（終わらずに待ち続けない）。
+    #[test]
+    fn simulation_copy_fails_at_the_deadline_when_the_source_stays_locked() {
+        let dir = TempDir::new("sync-copy-locked");
+        let path = dir.path().join("catalog.db");
+        let other = Connection::open(&path).unwrap();
+        other
+            .execute_batch("CREATE TABLE t(id INTEGER); INSERT INTO t VALUES (1);")
+            .unwrap();
+        let read = crate::db::open_read_only(&path).unwrap();
+        read.busy_timeout(Duration::from_millis(50)).unwrap();
+        // ジャーナルが DELETE のまま、書き手が排他ロックを持つ
+        other.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let started = Instant::now();
+        let err = simulation_copy_within(&read, Duration::from_millis(200)).unwrap_err();
+        let took = started.elapsed();
+        assert!(is_busy(&err), "{err}");
+        assert!(
+            err.to_string().contains("メモリ上へ写せませんでした"),
+            "{err}"
+        );
+        // 期限＋busy_timeout 1 回ぶん程度で返る
+        assert!(took < Duration::from_secs(5), "{took:?}");
+        // 失敗しても元の接続はトランザクションを持ち越さず、ロックが解ければ写せる
+        assert!(read.is_autocommit());
+        other.execute_batch("COMMIT").unwrap();
+        let copy = simulation_copy_within(&read, Duration::from_secs(5)).unwrap();
+        let n: i64 = copy
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

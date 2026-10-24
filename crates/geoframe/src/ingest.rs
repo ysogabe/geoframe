@@ -153,6 +153,12 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         Ok(n) => tracing::info!("[fetch] 一時ダウンロードの残骸を{n}件削除しました"),
         Err(e) => return Err(IngestError::Io(e.kind())),
     }
+    match sweepable_dirs(&config.data_dir).skipped {
+        0 => {}
+        n => tracing::warn!(
+            "[fetch] tmp/・derivatives/ のうち{n}つがリンクなどで通常のディレクトリではないので、掃除を飛ばしました"
+        ),
+    }
 
     // 書きかけの `.part`。`.dl_*` と同じく起動時に 1 回、ガードとロックのあと（二重に動く書き手がいない）
     match sweep_part_files(&config.data_dir) {
@@ -193,11 +199,12 @@ fn log_migration(m: &Migration) {
 /// 残骸を消すのは、フル解像度・EXIF 完全保持の Drive 原本（GPS・機体シリアル・原撮影時刻を含む）を
 /// ディスクに置いたままにしないため。`derivatives/` は静的配信の許可 prefix の内側なので特に放置
 /// しない。**ファイルだけ**を消す（ディレクトリや消せないものは無視。現行の `unlink` の `OSError: pass`
-/// と同じ）。名前はログに出さない。
+/// と同じ）。名前はログに出さない。`tmp/`・`derivatives/` 自体がリンク（など通常のディレクトリでない
+/// もの）なら、その中は掃除しない（リンク先の別の場所のファイルを消さないため。[`sweepable_dirs`]）。
 pub fn prepare_tmp_dir(data_dir: &Path) -> io::Result<usize> {
     fs::create_dir_all(data_dir.join("tmp"))?;
     let mut removed = 0;
-    for dir in [data_dir.join("tmp"), data_dir.join("derivatives")] {
+    for dir in sweepable_dirs(data_dir).dirs {
         for path in leftovers(&dir) {
             if fs::remove_file(&path).is_ok() {
                 removed += 1;
@@ -207,7 +214,38 @@ pub fn prepare_tmp_dir(data_dir: &Path) -> io::Result<usize> {
     Ok(removed)
 }
 
+/// 掃除してよい `tmp/`・`derivatives/`（[`sweepable_dirs`] の結果）。
+struct SweepDirs {
+    /// 通常のディレクトリであるもの。
+    dirs: Vec<std::path::PathBuf>,
+    /// 存在するのに通常のディレクトリではない（リンク・ファイルなど）ので飛ばしたものの数。
+    skipped: usize,
+}
+
+/// `.dl_*` の掃除の対象にする `DATA_DIR/tmp/`・`DATA_DIR/derivatives/` を選ぶ。
+///
+/// `read_dir` はリンクを辿るので、`tmp/`・`derivatives/` が外へのリンクだと、列挙の前に検査しないと
+/// リンク先の `.dl_*` を消してしまう。`symlink_metadata` でリンクを辿らずに見て、通常のディレクトリだけを
+/// 対象にする。存在しないものは黙って外す（`derivatives/` は写真を置く前は無い）。それ以外（リンク・
+/// ファイル・見られないもの）は数えて、呼び出し側が件数だけ警告する（パスは出さない）。`.part` の
+/// 掃除（[`part_leftovers`]）の `derivatives/` の検査も同じ。
+fn sweepable_dirs(data_dir: &Path) -> SweepDirs {
+    let mut out = SweepDirs {
+        dirs: Vec::new(),
+        skipped: 0,
+    };
+    for dir in [data_dir.join("tmp"), data_dir.join("derivatives")] {
+        match fs::symlink_metadata(&dir) {
+            Ok(m) if m.is_dir() => out.dirs.push(dir),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            _ => out.skipped += 1,
+        }
+    }
+    out
+}
+
 /// `.dl_*` のファイルの一覧（消さずに数えるとき・消すときの共通）。ディレクトリ・リンクは含めない。
+/// `dir` が通常のディレクトリであることは呼び出し側が [`sweepable_dirs`] で確かめる。
 fn leftovers(dir: &Path) -> Vec<std::path::PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -233,7 +271,7 @@ fn leftovers(dir: &Path) -> Vec<std::path::PathBuf> {
 /// 止まっていることを確かめる）ので、残っている `.part` はすべて書きかけの残骸。
 fn part_leftovers(data_dir: &Path) -> Vec<std::path::PathBuf> {
     let dir = data_dir.join("derivatives");
-    if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+    if !sweepable_dirs(data_dir).dirs.contains(&dir) {
         return Vec::new();
     }
     let Ok(entries) = fs::read_dir(&dir) else {
@@ -266,10 +304,16 @@ pub fn count_part_files(data_dir: &Path) -> usize {
 
 /// `--dry-run` の掃除の計画（消さずに数える）。
 pub fn count_leftovers(data_dir: &Path) -> usize {
-    [data_dir.join("tmp"), data_dir.join("derivatives")]
+    sweepable_dirs(data_dir)
+        .dirs
         .iter()
         .map(|d| leftovers(d).len())
         .sum()
+}
+
+/// `--dry-run` の掃除の計画: リンクなどで掃除を飛ばす `tmp/`・`derivatives/` の数。
+pub fn count_skipped_dirs(data_dir: &Path) -> usize {
+    sweepable_dirs(data_dir).skipped
 }
 
 /// `--dry-run` が出す「やるとしたら何か」。
@@ -277,6 +321,8 @@ pub fn count_leftovers(data_dir: &Path) -> usize {
 pub struct Plan {
     pub schema: Pending,
     pub leftover_files: usize,
+    /// リンクなどで掃除を飛ばす `tmp/`・`derivatives/` の数（[`count_skipped_dirs`]）。
+    pub skipped_dirs: usize,
     /// 消す書きかけの `*.part`（[`sweep_part_files`]）。
     pub part_files: usize,
     pub legacy_cache_keys: usize,
@@ -287,6 +333,7 @@ pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
     Ok(Plan {
         schema: schema::pending(conn)?,
         leftover_files: count_leftovers(&config.data_dir),
+        skipped_dirs: count_skipped_dirs(&config.data_dir),
         part_files: count_part_files(&config.data_dir),
         legacy_cache_keys: Cache::load_frozen(&config.data_dir).legacy_count(),
     })
@@ -452,6 +499,58 @@ mod tests {
         // リンクは消さず、リンク先にも触れない
         assert_eq!(prepare_tmp_dir(root).unwrap(), 0);
         assert!(root.join("target.txt").exists());
+    }
+
+    /// `tmp/`・`derivatives/` が外へのリンクのとき、リンク先の `.dl_*` を消さず、`.part` も消さない
+    /// （実行・dry-run の件数の両方）。通常のディレクトリのほうは、同じ実行でふつうに掃除する。
+    #[cfg(unix)]
+    #[test]
+    fn linked_tmp_and_derivatives_are_not_swept() {
+        for linked in ["tmp", "derivatives"] {
+            let dir = TempDir::new("ingest-linked-dir");
+            let root = dir.path().join("data");
+            let outside = dir.path().join("outside");
+            fs::create_dir_all(&root).unwrap();
+            fs::create_dir_all(&outside).unwrap();
+            fs::write(outside.join(".dl_x"), b"x").unwrap();
+            fs::write(outside.join("y.1.aa.part"), b"x").unwrap();
+            // リンクでないほうの側には、ふつうの残骸を置く
+            let plain = if linked == "tmp" {
+                "derivatives"
+            } else {
+                "tmp"
+            };
+            fs::create_dir_all(root.join(plain)).unwrap();
+            fs::write(root.join(plain).join(".dl_z"), b"x").unwrap();
+            std::os::unix::fs::symlink(&outside, root.join(linked)).unwrap();
+
+            // dry-run の件数も、リンク先を数えず、飛ばす数を出す
+            assert_eq!(count_leftovers(&root), 1, "{linked}");
+            assert_eq!(count_part_files(&root), 0, "{linked}");
+            assert_eq!(count_skipped_dirs(&root), 1, "{linked}");
+
+            assert_eq!(prepare_tmp_dir(&root).unwrap(), 1, "{linked}");
+            assert_eq!(sweep_part_files(&root), 0, "{linked}");
+            assert!(outside.join(".dl_x").exists(), "{linked}: リンク先を消した");
+            assert!(outside.join("y.1.aa.part").exists(), "{linked}");
+            assert!(!root.join(plain).join(".dl_z").exists(), "{linked}");
+            assert!(
+                fs::symlink_metadata(root.join(linked))
+                    .unwrap()
+                    .is_symlink(),
+                "{linked}"
+            );
+        }
+    }
+
+    /// `derivatives/` が無い（写真を置く前）のは飛ばした数に入れない。ファイルなどの通常でないものは入れる。
+    #[test]
+    fn missing_derivatives_is_not_counted_as_skipped() {
+        let dir = TempDir::new("ingest-no-derivatives");
+        fs::create_dir_all(dir.path().join("tmp")).unwrap();
+        assert_eq!(count_skipped_dirs(dir.path()), 0);
+        fs::write(dir.path().join("derivatives"), b"file").unwrap();
+        assert_eq!(count_skipped_dirs(dir.path()), 1);
     }
 
     #[test]
