@@ -53,8 +53,8 @@ Issue #54 と設計案をそのまま要求・設計として扱い、この文�
 - 現行の全HTTPエンドポイント、DBテーブルと書き込み元、バックグラウンド処理（同期・品質・AI・位置候補・タイル掃除・キャッシュ保存）、設定項目を棚卸し（[棚卸し](inventory.md)）し、各フェーズへの割り当てと代表的なE2Eシナリオを決める。
 - Cargo workspaceの骨組みとCI（`cargo fmt --check`・`clippy -D warnings`・`test`）。既存のPythonのCIは残す。
 - ビルドと配布: `x86_64-unknown-linux-musl`＋`rusqlite`の`bundled`で完全静的なバイナリにできるか。できればそれを標準にし、できなければ配布先と同じglibcでビルドする方法を決める。
-- 画像PoC: 実写真約100枚（JPEG・HEIC）の原本をn100の一時ディレクトリへ取得して、デコード→EXIF向き補正→長辺2560px→JPEG出力の画質・時間・最大RSS・リンクされるライブラリを計測する。HEICの候補（libheif連携など）を比較する。写真は計測後に消し、結果は数値だけを残す。
-  - 原本はGoogle Driveにしか無いため、本番機の読み取り専用Drive鍵（`drive.readonly`）で取得する。**取得前にユーザーへ確認する。**
+- 画像PoC: 検証環境にある本番コピーのderivatives（JPEG）から約100枚と、それをHEICへ変換したものを使い、検証環境の上でデコード→EXIF向き補正→長辺2560px→JPEG出力の画質・時間・最大RSS・リンクされるライブラリを計測する。HEICの候補（libheif連携など）を比較する。結果は数値だけを残す。
+  - ユーザー指示（2026-10-24）によりGoogle Driveの原本は使わない。実機のHEIC固有の構造（グリッド分割・HDRゲインマップ・深度など）はP2のDrive取り込みの実装時に確かめる。
 - `/api/v1/photos`のserde型とJSON Schemaを定義し、合成DBで契約テストを書く。
 
 ### P1: Rust API基盤（PR 2）
