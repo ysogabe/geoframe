@@ -25,12 +25,13 @@
 //! 非 ASCII の `netloc` に Python が掛ける NFKC の検査（`/?#@:` に展開される文字を断る）は移植しない。
 //! Latin-1 の範囲（U+0080〜U+00FF）に、NFKC で ASCII の `/?#@:` を生む文字が無いため（試験で全文字を確認）。
 //!
-//! # 末尾の空白（IO 層が補う）
+//! # 値の両端の空白・タブ（既知の差）
 //!
-//! Python は `Origin` の値の**末尾の空白**を残し（先頭の空白だけ取り除く）、hyper（httparse）は両端を
-//! 取り除く。末尾の空白（タブは `urlparse` が捨てるので、空白文字そのもの）が `netloc` に残ると現行は
-//! 断る。hyper は取り除いた後の値しか見せないので、[`crate::limits::LimitedIo`] が生のバイト列を見て
-//! 印を付け（[`crate::rawhead`]）、[`verdict`] の呼び出し側が値に空白を 1 つ足して渡す。
+//! hyper（httparse）は、ヘッダの値の両端の空白・タブを RFC 9110 の OWS として取り除いてから渡す。
+//! 現行は `Origin` の値の**末尾**の空白を残し（先頭は取り除く）、`netloc` に残ると断る（403）。
+//! Rust は取り除いた値で判定するので、`Origin: http://localhost␠` を通す。HTTP のフレーミングの差で、
+//! 許す向きだが守りは変わらない（ブラウザは `Origin` に空白を付けられず、付けられるクライアントは
+//! `Origin` を省けば現行でも通る）。差分試験が、この差だけを名指しで許す（tests/csrf_python.rs）。
 
 /// 判定の結果。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

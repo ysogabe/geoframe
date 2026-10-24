@@ -20,8 +20,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Semaphore};
 
-use axum::extract::connect_info::IntoMakeServiceWithConnectInfo;
-use axum::extract::{ConnectInfo, MatchedPath, Request, State};
+use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -35,7 +34,6 @@ use crate::admin::{self, AdminContext};
 use crate::config::Config;
 use crate::db::Catalog;
 use crate::limits::{ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
-use crate::rawhead::ConnHints;
 use crate::writer::Writer;
 use crate::{csrf, hostcheck, photos, post, pyquery, statics, sysinfo, webpath};
 
@@ -427,15 +425,9 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
         if let Some(response) = post::head_limits(&parts.uri, &parts.headers) {
             return response;
         }
-        // 生のバイト列から取った印（`Origin` の末尾の空白。hyper が取り除いてしまうぶん。rawhead.rs）。
-        // `LimitedListener` を通らない起動（試験の素の `axum::serve`）では印が無く、付いていない扱い
-        let origin_trailing_space = parts
-            .extensions
-            .get::<ConnectInfo<ConnHints>>()
-            .is_some_and(|ConnectInfo(hints)| hints.origin_trailing_space());
         return match post::route_of(raw) {
             Some(route) => labeled(
-                post::handle(&state, route, &parts.headers, origin_trailing_space, body).await,
+                post::handle(&state, route, &parts.headers, body).await,
                 route.label(),
             ),
             None => statics::forbidden(),
@@ -554,12 +546,6 @@ async fn shutdown_signal() {
     }
 }
 
-/// 接続ごとの印（[`ConnHints`]）を要求に載せて、`router` を配るサービス。本番（[`serve`]）と、実際の TCP で
-/// 確かめる試験の起動で同じにする。待ち受けは [`LimitedListener`] を使う。
-pub fn service(state: AppState) -> IntoMakeServiceWithConnectInfo<Router, ConnHints> {
-    router(state).into_make_service_with_connect_info::<ConnHints>()
-}
-
 pub async fn serve(state: AppState) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
     tracing::info!("{} で待ち受けます", listener.local_addr()?);
@@ -569,7 +555,7 @@ pub async fn serve(state: AppState) -> std::io::Result<()> {
     );
     // 接続の総数・送信の停滞・無通信の上限（limits.rs）
     let listener = LimitedListener::new(listener, ConnLimits::default());
-    axum::serve(listener, service(state))
+    axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     tracing::info!("停止しました");

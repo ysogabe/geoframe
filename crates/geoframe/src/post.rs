@@ -9,8 +9,8 @@
 //! 3. `Content-Type: application/json` 必須（違えば 403）。
 //! 4. `Origin` があれば `Host` と同じ（違えば 403。無い・空なら通す）。3・4 の値は現行と同じく**生バイトを
 //!    Latin-1 として**読む（[`crate::csrf`]）。現行が例外にする `Origin`（角括弧の中が IPv6 でない等）は、現行は
-//!    応答を返さず接続を閉じるが、Rust は 403。`Origin` の末尾の空白は hyper が取り除くので、生のバイト列から
-//!    付けた印（[`crate::rawhead`]）で補う。
+//!    応答を返さず接続を閉じるが、Rust は 403。`Origin` の前後の空白・タブは hyper が RFC 9110 の OWS として
+//!    取り除く（現行は末尾を残して 403 にする。既知の差。server.md §17.1.2）。
 //! 5. `Content-Length` 必須（無い・数でなければ 400）。
 //! 6. 上限 [`MAX_POST_BYTES`] 超は**本文を読まずに** 413 を返して接続を閉じる。
 //! 7. JSON として解釈できなければ 400、オブジェクトでなければ 400。
@@ -148,24 +148,18 @@ fn first_header(headers: &HeaderMap, name: header::HeaderName) -> Option<&[u8]> 
 
 /// 現行の `_csrf_ok` の判定（[`csrf::verdict`]）を、リクエストのヘッダに掛ける。
 ///
-/// `origin_trailing_space`: この接続で、末尾に空白文字がある `Origin` の行を受け取ったか
-/// （[`crate::rawhead`]）。現行は値の末尾の空白を残し、hyper は取り除く。印があれば、`Origin` に空白を 1 つ
-/// 足して現行と同じに判定する。差分試験（tests/csrf_python.rs）がこの関数を直接呼ぶ。
-pub fn csrf_verdict(headers: &HeaderMap, origin_trailing_space: bool) -> csrf::Verdict {
-    let mut origin = first_header(headers, header::ORIGIN).map(<[u8]>::to_vec);
-    if origin_trailing_space && let Some(origin) = origin.as_mut().filter(|o| !o.is_empty()) {
-        origin.push(b' ');
-    }
+/// 差分試験（tests/csrf_python.rs）がこの関数を直接呼ぶ。
+pub fn csrf_verdict(headers: &HeaderMap) -> csrf::Verdict {
     csrf::verdict(
         first_header(headers, header::CONTENT_TYPE),
-        origin.as_deref(),
+        first_header(headers, header::ORIGIN),
         first_header(headers, header::HOST),
     )
 }
 
 /// 現行の `_csrf_ok`。通らなければそのまま返す応答（403）。
-fn csrf_check(headers: &HeaderMap, origin_trailing_space: bool) -> Result<(), Box<Response>> {
-    match csrf_verdict(headers, origin_trailing_space) {
+fn csrf_check(headers: &HeaderMap) -> Result<(), Box<Response>> {
+    match csrf_verdict(headers) {
         csrf::Verdict::Allowed => Ok(()),
         csrf::Verdict::ContentType => Err(Box::new(error_response(
             StatusCode::FORBIDDEN,
@@ -236,8 +230,8 @@ pub fn head_limits(uri: &Uri, headers: &HeaderMap) -> Option<Response> {
 }
 
 /// 本文を読む前の検査（Content-Type・Origin・Content-Length・サイズ）。通れば本文の長さ。
-fn pre_body_check(headers: &HeaderMap, origin_trailing_space: bool) -> Result<u64, Box<Response>> {
-    csrf_check(headers, origin_trailing_space)?;
+fn pre_body_check(headers: &HeaderMap) -> Result<u64, Box<Response>> {
+    csrf_check(headers)?;
     let Some(length) = content_length(headers) else {
         return Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
@@ -259,14 +253,8 @@ fn pre_body_check(headers: &HeaderMap, origin_trailing_space: bool) -> Result<u6
 }
 
 /// `POST` を処理する。`route` は [`route_of`] が選んだもの（入口の検査で、ルートが無い POST は 403 済み）。
-pub async fn handle(
-    state: &AppState,
-    route: Route,
-    headers: &HeaderMap,
-    origin_trailing_space: bool,
-    body: Body,
-) -> Response {
-    let length = match pre_body_check(headers, origin_trailing_space) {
+pub async fn handle(state: &AppState, route: Route, headers: &HeaderMap, body: Body) -> Response {
+    let length = match pre_body_check(headers) {
         Ok(length) => length,
         Err(response) => return *response,
     };
@@ -335,17 +323,14 @@ mod tests {
     #[test]
     fn too_many_digits_is_400_even_when_the_value_is_over_the_limit() {
         let over = format!("{}{}", "0".repeat(4301 - 5), MAX_POST_BYTES + 1);
-        let response = *pre_body_check(
-            &{
-                let mut h = with_length(&over);
-                h.insert(
-                    header::CONTENT_TYPE,
-                    HeaderValue::from_static("application/json"),
-                );
-                h
-            },
-            false,
-        )
+        let response = *pre_body_check(&{
+            let mut h = with_length(&over);
+            h.insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            h
+        })
         .unwrap_err();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }

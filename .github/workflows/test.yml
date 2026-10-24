@@ -51,7 +51,7 @@ jobs:
         # 更新 API（crates/geoframe/src/update.rs・post.rs）は Python の handlers.do_POST・admin_setloc・
         # admin_setflag に同じ POST（CSRF 対策・ルーティング・エラー応答を含む）を順に流した結果（状態コード・応答・
         # photos の変化）と突き合わせる基準。
-        # CSRF 対策の判定（crates/geoframe/src/csrf.rs・rawhead.rs）は、Python の _csrf_ok・_host_ok を実際のヘッダ解析
+        # CSRF 対策の判定（crates/geoframe/src/csrf.rs）は、Python の _csrf_ok・_host_ok を実際のヘッダ解析
         # （生バイトを Latin-1 にして email のパーサへ）の上で、空白・Latin-1 の全バイト・Origin の書式（角括弧の IPv6 を
         # 含む）・Host の組み合わせに流した判定（9千件超）と、実際の HTTP サーバーへの POST の結果を残す。Rust が
         # Python の断るものを通さないことを確かめる基準（tests/csrf_python.rs）。

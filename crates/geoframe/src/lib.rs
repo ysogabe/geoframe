@@ -28,7 +28,6 @@ pub mod photos;
 pub mod post;
 pub mod pyquery;
 pub mod quality;
-pub mod rawhead;
 pub mod schema;
 pub mod server;
 pub mod statics;
