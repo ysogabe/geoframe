@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Semaphore};
 
+use axum::body::Body;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -36,6 +37,7 @@ use crate::config::Config;
 use crate::db::Catalog;
 use crate::geocode::{self, Geocoder};
 use crate::limits::{ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
+use crate::tiles::{self, CacheStatus, TileProxy};
 use crate::writer::Writer;
 use crate::{csrf, hostcheck, photos, post, pyquery, statics, sysinfo, webpath};
 
@@ -67,6 +69,8 @@ pub struct AppState {
     pub cache: Arc<Cache>,
     /// 地名検索（`GET /api/admin/geocode`）。Nominatim の 1 秒 1 件の制限をプロセス全体で持つ。
     pub geocoder: Arc<Geocoder>,
+    /// 地図タイルのプロキシ（`GET`/`HEAD /tiles/…`）と、そのキャッシュの掃除。流量の窓と同時数をプロセス全体で持つ。
+    pub tiles: Arc<TileProxy>,
 }
 
 impl AppState {
@@ -86,6 +90,7 @@ impl AppState {
             config.data_dir.clone()
         });
         let admin = Arc::new(AdminContext::new(&config, &data_root));
+        let tiles = Arc::new(TileProxy::production(&config, &data_root));
         Self {
             config,
             catalog,
@@ -95,6 +100,7 @@ impl AppState {
             disk_cache: Arc::new(Mutex::new(None)),
             cache: Arc::new(Cache::memory_only()),
             geocoder: Arc::new(Geocoder::production()),
+            tiles,
         }
     }
 
@@ -108,6 +114,13 @@ impl AppState {
     /// 向けるためのもの。本番のバイナリは呼ばない（[`geocode::Endpoints`] を参照）。
     pub fn with_geocoder(mut self, geocoder: Arc<Geocoder>) -> Self {
         self.geocoder = geocoder;
+        self
+    }
+
+    /// 地図タイル（通信先・時計）を差し替える。結合テストが、本物の OSM・地理院ではなくループバックのスタブへ
+    /// 向けるためのもの。本番のバイナリは呼ばない（[`tiles::TileEndpoints`] を参照）。
+    pub fn with_tiles(mut self, tiles: Arc<TileProxy>) -> Self {
+        self.tiles = tiles;
         self
     }
 }
@@ -317,6 +330,44 @@ fn geocode_response(items: Vec<Value>) -> Response {
     }
 }
 
+/// アクセスログに出すタイルのルートのテンプレート（座標・層は出さない）。
+const TILE_ROUTE: &str = "/tiles/{*path}";
+
+/// `GET`/`HEAD /tiles/…`（現行の `_serve_tile`）。形が合わない・範囲外は 404（`send_error(404)` と同じ本文）、
+/// それ以外は常に 200（取得の失敗・流量の超過も透明 PNG）。`HEAD` も同じ処理で、本文だけ省く
+/// （`Content-Length` は `GET` と同じ）。
+async fn tile_response(state: &AppState, path: &str, method: &Method) -> Response {
+    let Some(tile) = tiles::parse_path(path) else {
+        return labeled(
+            statics::error_page(
+                StatusCode::NOT_FOUND,
+                "Not Found",
+                "Nothing matches the given URI",
+            ),
+            TILE_ROUTE,
+        );
+    };
+    let (png, status) = state.tiles.fetch(tile).await;
+    labeled(tile_ok(png, status, *method == Method::HEAD), TILE_ROUTE)
+}
+
+fn tile_ok(png: Vec<u8>, status: CacheStatus, head: bool) -> Response {
+    let len = png.len();
+    let mut response = Response::new(if head { Body::empty() } else { Body::from(png) });
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(status.cache_control()),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-tile-cache"),
+        HeaderValue::from_static(status.as_str()),
+    );
+    response
+}
+
 pub(crate) fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
     (
         status,
@@ -465,7 +516,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// まだ Rust 版に無い機能（AI・旅行ブログ・地図タイル）。P3 / P4 で実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
+/// まだ Rust 版に無い機能（AI・旅行ブログ）。P3 / P4 で実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
 /// （「禁止」ではなく「まだ無い」と分かるように）。
 fn not_yet_implemented(label: &'static str) -> Response {
     labeled(
@@ -482,8 +533,8 @@ fn not_yet_implemented(label: &'static str) -> Response {
 ///
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
-///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル、P3）と、`/api/ai/`・
-///    `/api/blog/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
+///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
+///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/ai/`・`/api/blog/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
 ///    ホワイトリストに当たらず 403 なので、下の静的配信の判定へ回す。
 /// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML。
 /// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
@@ -519,8 +570,9 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
         raw
     };
 
+    // 現行の `do_GET`/`do_HEAD` は、`/tiles/` を他のどの判定よりも先に（生のパスで）見る
     if path.starts_with("/tiles/") {
-        return not_yet_implemented("/tiles/{*path}");
+        return tile_response(&state, path, method).await;
     }
     if *method == Method::GET {
         // axum のルートは完全一致なので、`//api/v1/photos` はここへ来る（現行は200）
@@ -651,8 +703,14 @@ mod tests {
 
     fn state(catalog: Catalog) -> AppState {
         let config = Config::load(|_| None, &Overrides::default()).unwrap();
-        AppState::new(Arc::new(config), catalog)
-            .with_geocoder(crate::geocode::stub::deny_geocoder())
+        let state = AppState::new(Arc::new(config), catalog)
+            .with_geocoder(crate::geocode::stub::deny_geocoder());
+        let proxy = TileProxy::with_endpoints(
+            &state.config,
+            &state.data_root,
+            crate::tiles::stub::deny_endpoints(),
+        );
+        state.with_tiles(Arc::new(proxy))
     }
 
     /// 127.0.0.1 の空きポートで router を起動し、(状態行, ヘッダ, 本文) を返す GET を用意する。

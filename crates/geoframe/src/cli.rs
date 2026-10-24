@@ -334,9 +334,21 @@ fn serve(overrides: &Overrides) -> ExitCode {
             state.data_root.display()
         );
     }
+    // 地図タイルのキャッシュの掃除（B4）。起動時に 1 回、以後 1 時間ごと。取り込みの有無に関わらず動く
+    // （キャッシュは catalog.db に書かないので、writer が無くても掃除する）
+    let pruner = crate::tiles::spawn_pruner(
+        Arc::clone(&state.tiles),
+        stop.clone(),
+        crate::tiles::PRUNE_INTERVAL,
+    );
     let result = runtime.block_on(crate::server::serve(state));
     // 取り込みのスレッドを止める（サイクルの最中なら今の段が終わるまで。待つのは限られた時間だけ）
     stop.stop();
+    if !join_within(pruner, THREAD_STOP_LIMIT) {
+        tracing::warn!(
+            "タイルキャッシュの掃除のスレッドが時間内に止まりませんでした（そのまま終了します）"
+        );
+    }
     if let (Some(threads), Some(ingest)) = (threads, &ingest) {
         stop_ingest_threads(threads, &ingest.cache, THREAD_STOP_LIMIT);
     }

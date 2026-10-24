@@ -4,9 +4,12 @@
 #![allow(dead_code)]
 
 mod geocode_stub;
+mod tile_stub;
 
 #[allow(unused_imports)]
 pub use geocode_stub::{GeocodeStub, Upstream};
+#[allow(unused_imports)]
+pub use tile_stub::{SAMPLE_PNG, TileStub};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -17,6 +20,7 @@ use geoframe::db::Catalog;
 use geoframe::feed::{Photo, QualityKind};
 use geoframe::limits::{ConnLimits, LimitedListener};
 use geoframe::server::{AppState, router};
+use geoframe::tiles::{TileEndpoints, TileProxy};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -205,10 +209,18 @@ pub fn app_state(catalog: Catalog) -> AppState {
     test_state(Arc::new(config), catalog)
 }
 
-/// 試験用の `AppState`。本物の地理院・Nominatim へ出ないよう、地名検索の接続先を、何も受け付けないスタブに向ける
-/// （[`GeocodeStub::deny`]）。結合テストは `AppState::new` を直接呼ばず、これを通す。
+/// 試験用の `AppState`。本物の地理院・Nominatim・OSM へ出ないよう、地名検索と地図タイルの接続先を、何も受け付けない
+/// スタブに向ける（[`GeocodeStub::deny`]・[`TileStub::deny_endpoints`]）。結合テストは `AppState::new` を直接呼ばず、
+/// これを通す。
 pub fn test_state(config: Arc<Config>, catalog: Catalog) -> AppState {
-    AppState::new(config, catalog).with_geocoder(GeocodeStub::deny())
+    let state = AppState::new(config, catalog).with_geocoder(GeocodeStub::deny());
+    with_tile_endpoints(state, TileStub::deny_endpoints())
+}
+
+/// 地図タイルの接続先だけを差し替える（状態の設定・データ置き場はそのまま）。
+pub fn with_tile_endpoints(state: AppState, endpoints: TileEndpoints) -> AppState {
+    let proxy = TileProxy::with_endpoints(&state.config, &state.data_root, endpoints);
+    state.with_tiles(Arc::new(proxy))
 }
 
 /// 127.0.0.1 の空きポートで router を起動する。

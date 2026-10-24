@@ -24,7 +24,8 @@
 //! 6. `derivatives/` の書きかけの `*.part`（プロセスが `SIGKILL`・電源断で落ちて残ったもの）を消す
 //!    （[`sweep_part_files`]）。
 //!
-//! 地図タイルの掃除（`tile_cache_prune`）は P3。
+//! 地図タイルの掃除（`tile_cache_prune`）は取り込みの起動時の掃除に含めない。`catalog.db` に書かないので、取り込みの有無に
+//! 関わらず `serve` が独立のスレッドで行う（[`crate::tiles::spawn_pruner`]。T3.4）。
 
 use std::fs::{self, File, TryLockError};
 use std::io;

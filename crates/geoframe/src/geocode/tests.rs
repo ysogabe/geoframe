@@ -713,7 +713,8 @@ async fn a_real_clock_keeps_the_interval_between_received_requests() {
 }
 
 /// 本番のコードは、地名検索の通信先を差し替える入口（`Endpoints::loopback`・`Geocoder::with_endpoints`・
-/// `AppState::with_geocoder`）を呼ばない。設定・環境変数・コマンドラインから通信先を変えられないことの確認
+/// `AppState::with_geocoder`）と、地図タイルの通信先を差し替える入口（`TileEndpoints::loopback`・
+/// `TileProxy::with_endpoints`・`AppState::with_tiles`）を呼ばない。設定・環境変数・コマンドラインから通信先を変えられないことの確認
 /// （入口は結合テストのために `pub` だが、本番のバイナリからは使われない）。
 ///
 /// 入口を定義するファイル（`geocode.rs`・`server.rs`）も含め、すべてのファイルを調べる。外すのは、
@@ -721,11 +722,14 @@ async fn a_real_clock_keeps_the_interval_between_received_requests() {
 /// 試験のファイル（`tests.rs`・`stub.rs`。どちらも `cfg(test)` のモジュール）だけ。
 #[test]
 fn production_code_never_redirects_the_geocoder() {
-    const ENTRIES: [(&str, &str); 4] = [
+    // 地名検索（`Endpoints`・`with_geocoder`）と地図タイル（`TileEndpoints`・`with_tiles`）の入口。`Endpoints::…` は
+    // `TileEndpoints::…` にも当たる
+    const ENTRIES: [(&str, &str); 5] = [
         ("Endpoints::loopback", "loopback"),
         ("Endpoints::stub", "stub"),
         ("with_endpoints(", "with_endpoints"),
         ("with_geocoder(", "with_geocoder"),
+        ("with_tiles(", "with_tiles"),
     ];
 
     /// `#[cfg(test)]` の付いた項目（同じ字下げの `}` か、`;`・`,` で終わる行まで）と、コメントの行を除く。
@@ -802,6 +806,12 @@ fn production_code_never_redirects_the_geocoder() {
     // 試験の項目のあとに本番の呼び出しがあれば、見つかる
     let after = "#[cfg(test)]\nmod tests;\nfn run() {\n    with_geocoder(g);\n}\n";
     assert_eq!(uses(after), ["with_geocoder("]);
+    // 地図タイルの入口も同じ
+    let tiles = "fn run() {\n    let p = TileProxy::with_endpoints(c, d, TileEndpoints::loopback(a));\n    s.with_tiles(p);\n}\n";
+    assert_eq!(
+        uses(tiles),
+        ["Endpoints::loopback", "with_endpoints(", "with_tiles("]
+    );
 
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();

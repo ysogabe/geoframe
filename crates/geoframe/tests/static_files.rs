@@ -1048,12 +1048,7 @@ async fn post_without_a_route_is_403_and_other_methods_are_501_without_cors() {
 async fn features_not_yet_in_rust_answer_503_with_a_fixed_json() {
     let site = Site::new();
     let addr = site.start().await;
-    for target in [
-        "/api/ai/status",
-        "/api/ai/search?q=x",
-        "/api/blog/trips",
-        "/tiles/osm/1/0/0.png",
-    ] {
+    for target in ["/api/ai/status", "/api/ai/search?q=x", "/api/blog/trips"] {
         let r = get(addr, target).await;
         assert_eq!(r.status, 503, "{target}");
         assert_eq!(

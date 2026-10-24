@@ -161,6 +161,87 @@ async fn access_log_has_only_method_route_status_and_time() {
     }
 }
 
+/// 本文が UTF-8 でない応答（PNG）も読む `get`。
+async fn get_bytes(addr: std::net::SocketAddr, target: &str) {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+}
+
+/// 地図タイル: ログに出るのはメソッド・ルートのテンプレート・状態コード・時間だけ。タイルの座標（z/x/y）・層は出ない。
+/// 上流はループバックのスタブ。
+#[tokio::test]
+async fn tile_requests_log_only_the_route_template_and_never_the_coordinates() {
+    let captured = Captured::default();
+    let subscriber = geoframe::logging::subscriber(LogLevel::Trace, captured.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let dir = std::env::temp_dir().join(format!(
+        "geoframe-test-accesslog-tiles-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("catalog.db");
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    for (table, columns) in REQUIRED_SCHEMA {
+        writer
+            .execute_batch(&format!("CREATE TABLE {table} ({})", columns.join(", ")))
+            .unwrap();
+    }
+    let config = Config::load(
+        |_| None,
+        &Overrides {
+            data_dir: Some(dir.clone()),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
+    let stub = common::TileStub::start();
+    let state = common::with_tile_endpoints(
+        common::test_state(Arc::new(config), Catalog::open(&path).unwrap()),
+        stub.endpoints(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router(state)).await });
+
+    get_bytes(addr, "/tiles/osm/13/4321/2345.png").await; // 取得（miss）
+    get_bytes(addr, "/tiles/osm/13/4321/2345.png").await; // hit
+    get_bytes(addr, "/tiles/gsi/7/66/33.png?secret-query=1").await;
+    get_bytes(addr, "/tiles/osm/13/99999/2345.png").await; // 404（範囲外）
+    stub.set_status(Some(503));
+    get_bytes(addr, "/tiles/gsi/9/257/258.png").await; // 上流の失敗
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    drop(writer);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert!(log.matches("GET /tiles/{*path} 200").count() >= 4, "{log}");
+    assert!(log.contains("GET /tiles/{*path} 404"), "{log}");
+    for secret in [
+        "4321",
+        "2345",
+        "99999",
+        "257",
+        "258",
+        "secret-query",
+        "osm/",
+        "gsi/",
+        ".png",
+        "127.0.0.1",
+    ] {
+        assert!(!log.contains(secret), "ログに {secret} が出ている:\n{log}");
+    }
+}
+
 async fn post(addr: std::net::SocketAddr, target: &str, extra: &str, body: &str) -> String {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream

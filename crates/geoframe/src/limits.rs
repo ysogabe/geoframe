@@ -25,6 +25,11 @@ use tokio::time::{Instant, Sleep, sleep, sleep_until};
 /// 接続数の上限と合わせて記述子の予算（server.md §6）に収める。
 pub const STATIC_FILE_SLOTS: usize = 32;
 
+/// 地図タイルのキャッシュのファイルを同時に読む上限（[`crate::tiles`]）。静的配信の枠とは別で、**待たせるだけで
+/// 断らない**（地図は1画面に100枚以上を一度に求めるので、503 にすると描画が欠ける）。記述子を握る数の上限で、
+/// 読み出しは小さなファイル 1 枚なのですぐ戻る。
+pub const TILE_FILE_SLOTS: usize = 32;
+
 /// 同時に受け付ける接続の上限。超えたぶんは accept せず、OS の待ち行列で待たせる。
 /// 記述子の予算: 256（接続）＋32（配信のファイル）＋SQLite（API 4 本・ヘルス 1 本と `-wal`/`-shm`）
 /// ＋標準入出力で 300 前後。systemd の既定（`LimitNOFILE=1024`）に十分収まる。

@@ -61,6 +61,10 @@ jobs:
         # 合成の地理院・Nominatim の応答と偽の時計で流した結果（状態コード・応答・上流への要求のクエリと順・
         # Nominatim の 1 秒 1 件の待ち・メモリキャッシュの全体）と、float()・urllib.parse.quote・str.isspace の
         # 出力を残す。Rust が同じ要求・応答・時計で一致することを確かめる基準（geocode/tests.rs）。
+        # 地図タイル（crates/geoframe/src/tiles.rs）は、Python の handlers.Handler の GET/HEAD /tiles/… に、
+        # ループバックの上流のスタブ・偽の時計で流した結果（状態コード・ヘッダ・本文・上流への要求・キャッシュの
+        # ファイル・毎分の流量の窓）と、tile_cache_prune を偽のファイル群に流した結果を残す。Rust が同じ手順で
+        # 一致することを確かめる基準（tiles/tests.rs）。
         # Python の読み取りが変わったら落ちる
         run: |
           python3 tools/gen_exif_fixture.py --check
@@ -75,6 +79,7 @@ jobs:
           python3 tools/gen_rotate_fixture.py --check
           python3 tools/gen_csrf_fixture.py --check
           python3 tools/gen_geocode_fixture.py --check
+          python3 tools/gen_tile_fixture.py --check
 
       - name: スキーマのフィクスチャの同期検査
         # Rust のスキーマ（crates/geoframe/src/schema.rs）が Python の空 DB と一致することを確かめる

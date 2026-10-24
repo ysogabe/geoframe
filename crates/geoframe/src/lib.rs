@@ -36,6 +36,7 @@ pub mod statics;
 pub mod stop;
 pub mod sync;
 pub mod sysinfo;
+pub mod tiles;
 pub mod update;
 pub mod webpath;
 pub mod writer;

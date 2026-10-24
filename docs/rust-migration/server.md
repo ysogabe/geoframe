@@ -1,13 +1,13 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）。T3.2 で E14 回転を入れ、回転と取得・品質・同期サイクルの競合を調べた（§17.8）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）。T3.2 で E14 回転を入れ、回転と取得・品質・同期サイクルの競合を調べた（§17.8）。T3.3 で E4 地名検索を入れた（§18）。T3.4 で E11 地図タイルのプロキシと B4 タイルキャッシュの掃除を入れた（§19）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）、T3.1 は`post.rs`・`update.rs`、T3.2 は`rotate.rs`（と`imaging`の`rotate_jpeg`・`write_atomic`・`lock_derivatives`）
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）、T3.1 は`post.rs`・`update.rs`、T3.2 は`rotate.rs`（と`imaging`の`rotate_jpeg`・`write_atomic`・`lock_derivatives`）、T3.3 は`geocode.rs`、T3.4 は`tiles.rs`（試験用に`tiles/stub.rs`・`tiles/tests.rs`）
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 0. Pythonとの差の索引
 
-P1・P2（T2.1〜T2.6）・P3（T3.1〜T3.3）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1〜T2.6）・P3（T3.1〜T3.4）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
@@ -46,6 +46,8 @@ P1・P2（T2.1〜T2.6）・P3（T3.1〜T3.3）でPythonと意図して違える�
 | **回転と同期サイクル・取得・品質の競合（T3.2）**: Pythonは回転で「読む→画像を作る→`display`・`rotation`を書く→元のファイルを消す」の間を排他せず、①同期サイクルが`display`をNULLにした（推定の錨が消えた取り消し・Driveの`md5`の変更）あとでも、古い原本から作った画像を`display`に書き戻し、`fetch_derivatives`は`display`がNULLでないので取り直さない（`md5`が新しいのに古い画像が出続ける）。②回転どうしが重なると、片方の回転が失われ、負けた側の新しいファイルが孤児になる。③読んだ`src`を無条件に消すので、その間に同じ名前で作り直されたファイルを消すことがある。Rustは条件付きの更新（409）・ロックで守り、DBが今指しているファイルは消さない。**Rustでも残る穴**: `index_drive`が一覧から消えた行と一緒に消すファイルは、計画を読んだ時点の`display`なので、その直後に回転が入ると新しいファイルが孤児で1つ残る（Driveから消えた写真の回転と、一覧を読んだ直後の数ミリ秒が重なる場合だけ。増え続けない）。`md5`の変更で`rotation`が0に戻るとき古い回転済みのファイルを消さない件（[inventory.md §2.3](inventory.md)③）はPythonと同じ | 利用者の変更と実在するファイルの一貫性 | 回転が同期サイクル・取得と重なったとき | `rotate/tests.rs`（`display`のNULL化・`md5`の変更・同じ名前での作り直し・行の消失・同時の回転・DBの失敗）、`drive::tests::fetch_waits_for_a_rotation_in_progress_and_leaves_no_orphan`、`quality::tests::解析の途中で回転が入っても…` | ③は**T3.7で決める**。他は決定 | [§17.8.4](#1784-競合) |
 | **地名検索 `GET /api/admin/geocode`（T3.3。E4）**: ①応答の本文を**展開後で1 MiBまで**にする（Pythonは上限なし。gzipの本文も展開後の大きさで数える。下の行）。超えたら通信の失敗と同じ（地理院なら空→Nominatim、Nominatimなら空でキャッシュしない）。②**同時に処理する検索は8件まで**。超える要求は待たせずに503（定型の本文。Pythonは無制限に待たせる）。2文字未満の語は数えない。③Nominatimの待ちの間に同じ語が別の要求でキャッシュされたら、**通信せずにそれを返す**（Pythonは待ったあとに必ず通信する）。④JSONの`NaN`・`Infinity`・`1e400`のようにf64に収まらない数は、本文全体が不正なJSONになる（Pythonは読む）。⑤`display_name`が文字列でない（数・配列など）ときは検索語を`title`にする（Pythonは`str()`）。⑥失敗のログに検索語を出さない（Pythonは`q=`を出す）。種類と状態コードだけ。⑦User-AgentはPythonの`http_json`と同じ`GeoFrame/0.2`（P2の他の通信は`geoframe/<版>`）。⑧**取り込みが無効（`GEOFRAME_INGEST=0`）では、`.cache.json`を読んでメモリに入れるだけで、ディスクへ書かない**（Pythonは常に保存スレッドが書く）。再起動すると、この間に得たNominatimの結果は消える。取り込みが有効なら同期サイクルと同じキャッシュを共有し、保存スレッドが書く。⑨応答のキーの並びは辞書順（`items`の各要素が`lat lon source title`。JSONとしては同じ）。⑩**検索語は前後の空白を落としたあと200文字まで**。超える語は上流へ問い合わせずに空（Pythonは上限なし）。⑪**`geocode_osm:`のキャッシュは5000件まで**。満杯のあとの新しい語は結果を返すが保存しない（古いものは捨てない。Pythonは上限なし）。`geo:`など他のキーには触れない | ①②は暴走・巨大な応答への歯止め。⑩⑪は検索語（LANの管理画面から誰でも送れる）でメモリと`.cache.json`が際限なく増えないように。③は公開サーバーへの問い合わせを減らす。④⑤は非現実的な入力。⑧は本番の書き手がP5の切替までPythonなので、Rustが`.cache.json`を書かない | 該当の入力のとき。⑧は`GEOFRAME_INGEST=0`の`serve` | `geocode/tests.rs`（ループバックのスタブ＋偽の時計。フィクスチャ`geocode-python.json`は現行`handlers.Handler`の出力）、`tests/geocode_api.rs`（結合テスト） | なし（決定。⑧はP5の切替で本番の書き手がRustになれば取り込みが有効になり解消） | [§18](#18-地名検索p3--t33) |
 | **外向きHTTPSの応答の上限は、展開後の大きさに効かせる（T3.3のレビューで全体を洗った）**: `ureq`の`with_config().limit(n)`は、`Content-Encoding: gzip`の本文では**圧縮されたバイト列**に当たり、展開後には効かない（圧縮時2 KBの本文が2 MiBに展開されても通る）。メモリに読む箇所は`net::read_body_limited`（展開後を`take`で数え、`max`ちょうどまで通して1バイト超えたら`BodyExceedsLimit`）を通す。**これとは別に、圧縮前（回線を流れるバイト列）にも独立の上限`net::wire_limit(max)` = `max`×2＋64 KiBを付ける**（展開後が空になるgzip＝空のメンバーの繰り返しは、展開後の数えでは止まらず、時間切れまで転送とCPUを使いうるため。正当な本文は展開後`max`以下なので、gzipの付加情報や圧縮しきれない分を見込んでも収まり、誤って断らない。超えたときも`BodyExceedsLimit(max)`）。対象: 地名検索（1 MiB）、地理院の逆ジオ・標高（1 MiB）・`muni.js`（8 MiB）、Driveの一覧・トークン（16 MiB）、Driveの403の理由の本文（16 KiB）、`selfcheck-net`（1 MiB）。Driveの原本のダウンロードは読みながら展開後の大きさを数えて`limit`（512 MiB）で止める（展開後の上限には`ureq`の`limit`を使わない: 圧縮後の大きさでは、上限ちょうどの原本を誤って断りうる）。**原本にも同じ圧縮前の上限`net::wire_limit(limit)`（約1 GiB）を`ureq`の`limit`として付けた**（空のメンバーの繰り返しは展開後の数えでは止まらず、`download_timeout`の15分まで転送とCPUを使いうる。`read`が0バイトを返さないので停止の合図の確認も通らない）。超えたら`DriveError::TooLarge`（その写真の失敗。障害ではない＝P2の分類のまま）。正当な原本（展開後512 MiB以下）は、gzipで圧縮されても約1 GiBに届かない。**P2で決めた上限の値は変えていない**が、これまでは`enrich`・Driveの`limit(n)`が上限ちょうどの本文も断っていた（`ureq`の仕様）のが、ちょうどまで通る（「超えた」ときだけ断る）。Pythonはどの応答にも上限が無い | 圧縮された小さな応答でメモリを使い切らせない（受信した側の保護） | gzipで応答する上流（またはその途中）のとき | `net::tests::read_body_limited_counts_decoded_bytes`、`geocode::tests::the_body_limit_counts_the_decompressed_size`、`geo::tests::応答の上限は展開後の大きさに効く`、`net::tests::read_body_limited_stops_endless_empty_gzip_members`（空のメンバーを延々と送るスタブ。圧縮前の上限を外すと時間切れまで読んで落ちる）、`drive::tests::empty_gzip_members_are_stopped_by_the_wire_limit`（原本・JSON。上限の内側は通り、外側は`TooLarge`）、`drive::tests::size_limits_apply_to_the_decompressed_body`・`download_counts_the_decompressed_size`（圧縮後が数KBで展開後が上限を超える本文と、上限ちょうど・1バイト超え。`ureq`の`limit`に戻すと落ちることを確かめた） | なし（決定） | [§14.3](#143-通信)・[§15.4](#154-通信の失敗の分類)・[§18.5](#185-通信) |
+| **地図タイル `GET/HEAD /tiles/…`（T3.4。E11）**: ①上流の応答の本文は**展開後で2 MiBまで**（Pythonは上限なし。gzipの本文も展開後の大きさで数える）。超えたら`error`。②**gzipで返された本文は展開して受ける**（Pythonは`Accept-Encoding: identity`を付けて展開せず、PNGでなければ`error`にする。OSM・地理院はgzipを返さない）。③キャッシュの**ヒットは、中身がPNGのマジックで始まる、上限以下の通常ファイル**だけ（Pythonは何でも返す。空・壊れたファイル・リンク・FIFO・巨大なものは取り直し、成功すれば置き換える）。④キャッシュは**リンクを辿らない**: `tile_cache`から`<層>/<z>/<x>`までのどれかがリンクなら読みも書きもしない（取得した本文は返す。保存はしない）。ファイルは一時ファイル（`.part`、`create_new`+`O_NOFOLLOW`）に書いて`rename`する。Pythonは`mkdir`して`.tmp`に書き、リンクを辿る。⑤流量の窓は**単調時計**（Pythonは`time.time()`。時計の飛びで止まらない）。⑥`GEOFRAME_TILE_FETCH_PER_MIN`・`GEOFRAME_TILE_CACHE_MAX_MB`は**負の値を起動時に断る**（Pythonは負の上限でも動き、常に`throttled`・毎回すべて消す）。`GEOFRAME_TILE_UA`は印字可能なASCIIだけ（Pythonは不正な値でも起動し、取得のたびに失敗する）。⑦座標が`u64`に収まらない・4300桁を超える数は404（Pythonの4300桁超は`int()`が例外になり、応答なしで接続が切れる）。⑧リクエスト行の`#`以降はhyperが落とす（Pythonは`#`を含むパスとして404）。ブラウザは送らない。⑨ログにタイルの座標・URL・User-Agentを出さない（Pythonは`z/x/y`を出す）。⑩同時の取得は`tokio`の枠（待つのは非同期で、スレッドを塞がない）。⑪取得は**クライアントが切断しても最後まで進めて保存する** | 上流の暴走・メモリ・ディスクの保護、リンクの差し替え対策、座標の秘匿 | `/tiles/…`への要求 | `tiles/tests.rs`（Pythonに176手順を流したフィクスチャと一致。差は別に単体テスト） | なし（決定） | [§19](#19-地図タイルとキャッシュの掃除p3--t34) |
+| **タイルキャッシュの掃除（T3.4。B4）**: ①**独立のスレッド**（Pythonは起動時に同期で1回、以後は同期サイクルの周期のあと「前回から1時間超なら」）。起動時に1回、以後1時間ごと。**`GEOFRAME_INGEST=0`（同期サイクルなし）でも動く**。起動を待たせず、停止の合図で止まる。②数える・消すのは`<層>/<z>/<x>/<y>.png`の形（先頭ゼロなしの十進）の**通常ファイルだけ**（Pythonは`rglob("*.png")`でリンクの先の大きさを数え、リンクを消す）。リンクのディレクトリへは降りない。形の合わないファイルは数えない・消さない。③異常終了で残った**古い（1時間以上前の）`.part`も消す**（Pythonは`.tmp`を残す）。④Pythonの`tile_cache_prune`と同じ規則（`mtime`の古い順、同じなら大きさ、さらに同じならパスの文字列順で、合計が上限の90%以下になるまで）で、フィクスチャと一致 | 取り込みが無効でもキャッシュが際限なく増えないように。メモリ（百万枚でも）に収める | `tile_cache/`があるとき | `tiles/tests.rs`、`tests/ingest_cli.rs` | なし（決定） | [§19](#19-地図タイルとキャッシュの掃除p3--t34) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記録は[p2-acceptance.md](p2-acceptance.md)。
 
@@ -66,7 +68,9 @@ P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記�
 | `TZ` | なし | `TZ` | （後述。解釈しない） |
 | 位置推定の1段目の窓（分） | なし | `GEOFRAME_INFER_MIN` | `15` |
 | embeddingの場所 | なし | `GEOFRAME_EMBED_BACKEND` | `gemini` |
-| タイルキャッシュの上限（MB） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
+| タイルキャッシュの上限（MB。0以上。表示と掃除に使う） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384`（§19） |
+| 地図タイルの上流へ送るUser-Agent（印字可能なASCII。連絡先入りにする。ログには出さない。T3.4） | なし | `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)`（§19） |
+| 地図タイルの上流取得の毎分の上限（全体。0以上。0は上流へ行かない。T3.4） | なし | `GEOFRAME_TILE_FETCH_PER_MIN` | `240`（§19） |
 | 取り込み（DBへの書き込みと同期サイクル）を有効にするか（**Rustだけの項目**。`0`／`1`） | なし | `GEOFRAME_INGEST` | `0`（無効。§11.1） |
 | 同期サイクルの間隔（分。小数も可） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10`（§11.2） |
 | ローカル写真の置き場（`DATA_DIR`からの相対。T2.3） | なし | `GEOFRAME_PHOTOS_DIR` | `photos`（§13.1） |
@@ -77,7 +81,7 @@ P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記�
 - **不正な値は起動を断る**（終了コード2）。メッセージには環境変数の名前と理由だけを書き、値は書かない。`GEOFRAME_HOST`はIPアドレスだけ（現行Pythonはホスト名も通すが、本番は`0.0.0.0`か`127.0.0.1`）。
 - `--listen`を渡したときは`GEOFRAME_HOST`/`GEOFRAME_PORT`を**読まない**（不正でも問わない）。
 - `GEOFRAME_ALLOWED_HOSTS`の解釈は現行の`_parse_allowed_hosts`と同じ（小文字、末尾の`.`を除く、`name:port`・`[v6]:port`のポートを無視）。この集合を使うHost検査は§9.2。
-- **最後の3つは T1.4 で読み始めた**。取り込み・AI・タイルは P2 以降なので、これらは**管理画面の表示にだけ**効く（`/api/admin/status`、§10）: `GEOFRAME_INFER_MIN`は「推定の内訳」の区切りと位置候補の「日」の区切り、`GEOFRAME_EMBED_BACKEND`はAIの件数が数える`embedding_model`（`gemini`→`gemini-embedding-2`、`local`→`embeddinggemma-2`）、`GEOFRAME_TILE_CACHE_MAX_MB`は`disk.tile_cache_max_mb`にそのまま出る。**読まないと Python と値がずれる**ため（`/etc/default/geoframe`に書いてあれば、Python と同じ値を Rust も見る）。解釈は現行に合わせ、`GEOFRAME_EMBED_BACKEND`は前後の空白を除いて小文字にし、`gemini`・`local`以外は**起動を断らず`gemini`に落とす**（現行も警告して`gemini`にする。Rustは起動ログにwarnを1行出す。値は書かない）。`GEOFRAME_INFER_MIN`は0以上の有限の数、`GEOFRAME_TILE_CACHE_MAX_MB`は整数でなければ**起動を断る**（Rustの方針。現行は`float()`/`int()`が例外で落ちるので、起動できない点は同じ）。
+- **最後の3つは T1.4 で読み始めた**。取り込み・AI・タイルは P2 以降なので、これらは**管理画面の表示にだけ**効く（`/api/admin/status`、§10）: `GEOFRAME_INFER_MIN`は「推定の内訳」の区切りと位置候補の「日」の区切り、`GEOFRAME_EMBED_BACKEND`はAIの件数が数える`embedding_model`（`gemini`→`gemini-embedding-2`、`local`→`embeddinggemma-2`）、`GEOFRAME_TILE_CACHE_MAX_MB`は`disk.tile_cache_max_mb`にそのまま出る。**読まないと Python と値がずれる**ため（`/etc/default/geoframe`に書いてあれば、Python と同じ値を Rust も見る）。解釈は現行に合わせ、`GEOFRAME_EMBED_BACKEND`は前後の空白を除いて小文字にし、`gemini`・`local`以外は**起動を断らず`gemini`に落とす**（現行も警告して`gemini`にする。Rustは起動ログにwarnを1行出す。値は書かない）。`GEOFRAME_INFER_MIN`は0以上の有限の数、`GEOFRAME_TILE_CACHE_MAX_MB`は0以上の整数でなければ**起動を断る**（Rustの方針。現行は`float()`/`int()`が例外で落ちるので、起動できない点は同じ。負の`GEOFRAME_TILE_CACHE_MAX_MB`はT3.4で断るようにした。掃除が毎回すべてを消すことになるため）。`GEOFRAME_TILE_UA`・`GEOFRAME_TILE_FETCH_PER_MIN`はT3.4で読み始めた（§19）。
 - **`GEOFRAME_DATA_DIR`の既定が現行と違う**: Pythonは`app/var`（ソースの隣）だが、単一バイナリには`app/`が無いので`./var`にした。本番は常に`GEOFRAME_DATA_DIR=/var/lib/geoframe`をunitが与える。
 
 ### 1.2 `TZ`
@@ -96,7 +100,7 @@ P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記�
 
 ### 1.4 未対応の項目（P2以降）
 
-`config.rs`の`UNSUPPORTED_ENV`に、現行の`config.py`にあるP2以降の項目（取り込み・タイル・AI・位置候補など）を**列挙だけ**してある（T2.1で`GEOFRAME_DRIVE_POLL_MIN`、T2.3で`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_FETCH_PER_CYCLE`、T2.4で`GEOFRAME_DRIVE_KEY`・`GEOFRAME_DRIVE_FOLDER`、T2.5で`GEOFRAME_INFER_OFFSET_MIN`、T2.6で`GEOFRAME_QUALITY_PER_CYCLE`を読み始めたので、20個）。読まず、警告も出さない（`/etc/default/geoframe`に書いてあっても無視される）。`docs/reference/configuration.md`にある`GEOFRAME_*`が、読む項目（`SUPPORTED_ENV`）か未対応のどちらかに分類されていることを、テスト`every_documented_variable_is_classified`が検査する。Pythonに項目が増えたら、このテストが落ちて気づける。
+`config.rs`の`UNSUPPORTED_ENV`に、現行の`config.py`にあるP2以降の項目（取り込み・タイル・AI・位置候補など）を**列挙だけ**してある（T2.1で`GEOFRAME_DRIVE_POLL_MIN`、T2.3で`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_FETCH_PER_CYCLE`、T2.4で`GEOFRAME_DRIVE_KEY`・`GEOFRAME_DRIVE_FOLDER`、T2.5で`GEOFRAME_INFER_OFFSET_MIN`、T2.6で`GEOFRAME_QUALITY_PER_CYCLE`、T3.4で`GEOFRAME_TILE_UA`・`GEOFRAME_TILE_FETCH_PER_MIN`を読み始めたので、18個）。読まず、警告も出さない（`/etc/default/geoframe`に書いてあっても無視される）。`docs/reference/configuration.md`にある`GEOFRAME_*`が、読む項目（`SUPPORTED_ENV`）か未対応のどちらかに分類されていることを、テスト`every_documented_variable_is_classified`が検査する。Pythonに項目が増えたら、このテストが落ちて気づける。
 
 秘密になりうる項目（P2の`GEOFRAME_DRIVE_KEY`ほか）が入るときも、設定が持つのは**鍵ファイルのパスだけ**で、中身は設定の型に載せない。`Config`は`Debug`を手書きにしてあり、ログへ出す要約（`log_summary`）に載せた項目だけが出る。許可Host名も件数だけで、名前は出さない。
 
@@ -285,7 +289,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 `site`（`GET`/`HEAD`）は、現行の`do_GET`/`do_HEAD`と同じ順に判定する。
 
-1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。`GET`の`/api/admin/geocode`（地名検索。T3.3、§18）も同じ前方一致。そのあと、`/tiles/`（地図タイル、P3）と、`GET`の`/api/ai/`・`/api/blog/`（P3・P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。`/api/admin/`の残り（`setloc`・`setflag`・`rotate`などの更新ルートへの`GET`、`/api/admin/`そのもの、大文字小文字やエンコードの違い）は、現行でも`do_GET`のどの分岐にも当たらず静的配信のホワイトリストで**403**になるので、T3.3で503をやめて静的配信の判定へ回した（`/api/admin/../static/…`のように`..`を含む形も現行は403で、`geocode-python.json`の`admin_gets`で突き合わせている）。P4に`/api/admin/`配下の`GET`は無い（AI検索は`/api/ai/`）。
+1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。`GET`の`/api/admin/geocode`（地名検索。T3.3、§18）も同じ前方一致。そのあと、`GET`/`HEAD`の`/tiles/`（地図タイル。T3.4、§19。他のどの判定よりも先に、生のパスで見る）は`tiles.rs`が答え、`GET`の`/api/ai/`・`/api/blog/`（P3・P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。`/api/admin/`の残り（`setloc`・`setflag`・`rotate`などの更新ルートへの`GET`、`/api/admin/`そのもの、大文字小文字やエンコードの違い）は、現行でも`do_GET`のどの分岐にも当たらず静的配信のホワイトリストで**403**になるので、T3.3で503をやめて静的配信の判定へ回した（`/api/admin/../static/…`のように`..`を含む形も現行は403で、`geocode-python.json`の`admin_gets`で突き合わせている）。P4に`/api/admin/`配下の`GET`は無い（AI検索は`/api/ai/`）。
 2. 管理画面のページ（§9.5）。
 3. 静的ファイル（§9.3）。許可は`/favicon.ico`と5つの接頭辞だけで、**それ以外はすべて403**（404ではない。`/nope`・`/api/nope`・`/api/v1/photos/`も403）。
 
@@ -370,7 +374,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 ### 9.6 ログ
 
-§3の方針のまま。アクセスログの**ルートのテンプレート**に、静的ファイルは`/derivatives/{*path}`・`/photos/{*path}`・`/blog_exports/{*path}`・`/static/{*path}`・`/vendor/{*path}`・`/favicon.ico`、ページは`/`・`/admin`・`/blog-admin`・`/ai-search`、未実装は`/tiles/{*path}`・`/api/admin/{*path}`など、を出す。**実際のパスは出さない**（derivativesのファイル名にはDrive IDが入る）。ホワイトリスト外・トラバーサルで領域の外へ出た要求は`(unmatched)`。ドット始まりなどホワイトリストの内側で拒否したものは、領域のテンプレートで出す。テストは`access_log.rs`。
+§3の方針のまま。アクセスログの**ルートのテンプレート**に、静的ファイルは`/derivatives/{*path}`・`/photos/{*path}`・`/blog_exports/{*path}`・`/static/{*path}`・`/vendor/{*path}`・`/favicon.ico`、ページは`/`・`/admin`・`/blog-admin`・`/ai-search`、地図タイルは`/tiles/{*path}`（層・座標は出さない）、未実装は`/api/ai/{*path}`・`/api/blog/{*path}`、を出す。**実際のパスは出さない**（derivativesのファイル名にはDrive IDが入る）。ホワイトリスト外・トラバーサルで領域の外へ出た要求は`(unmatched)`。ドット始まりなどホワイトリストの内側で拒否したものは、領域のテンプレートで出す。テストは`access_log.rs`。
 
 ### 9.7 Pythonとの差（まとめ）
 
@@ -382,7 +386,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | 埋め込みファイルの再検証 | `Last-Modified`/`If-Modified-Since` | `ETag`/`If-None-Match` | 時刻に依存して古いJSが居座る事故を避ける（§9.4） |
 | バックスラッシュを含む要求 | 区切りに読み替えて判定、実ファイルは404 | 403 | 区切りの解釈を持たない |
 | HTMLヘッダ・`no-cache`の判定 | 生のパス | デコード・正規化後のパス、`.htm`も | `%2E`で付かなくなる抜けを塞ぐ（§9.5） |
-| 未実装のルート（`/tiles/`、`/api/ai/`、`/api/blog/`のGET） | 応答する | 503と定型のJSON | P3・P4で実装する（`status`・`photos`はT1.4、`geocode`はT3.3で実装、§10・§18。`/api/admin/`の残りのGETはT3.3から現行どおり403） |
+| 未実装のルート（`/api/ai/`、`/api/blog/`のGET） | 応答する | 503と定型のJSON | P3・P4で実装する（`status`・`photos`はT1.4、`geocode`はT3.3、`/tiles/`はT3.4で実装、§10・§18・§19。`/api/admin/`の残りのGETはT3.3から現行どおり403） |
 | `POST` | 既知のルートはContent-Type不一致でJSONの403、それ以外はHTMLの403 | 同じ（T3.1。P1では全部HTMLの403だった。§17） | 更新ルートはT3.1で実装 |
 | `/healthz` | 無い（403） | 200/503（Host検査あり） | 新設（§4） |
 | 起動ログ・拒否ログ | 許可する名前、機体のIP、拒否したHostの値を出す | 件数だけ。Hostの値は出さない | §3.2の方針 |
@@ -498,7 +502,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 | `GEOFRAME_INGEST` | `serve`の動き |
 | --- | --- |
-| `0`（未設定・空も同じ） | P1と同じ。**DBに一切書かない**（writerを作らない・移行しない・サイクルを回さない・`tmp/`も作らない）。DBが無ければ起動を断る。起動ログに`取り込みは無効です`と`ingest=0`を出す |
+| `0`（未設定・空も同じ） | P1と同じ。**DBに一切書かない**（writerを作らない・移行しない・サイクルを回さない・`tmp/`も作らない）。ただし**地図タイルのキャッシュ`tile_cache/`はDBではないので、書く（タイルを取る）・掃除する**（T3.4、§19）。DBが無ければ起動を断る。起動ログに`取り込みは無効です`と`ingest=0`を出す |
 | `1` | 起動時に**ガード（§11.1.1）**→ロック→writerを開く→スキーマの作成・移行→`.cache.json`→`.dl_*`の掃除（§11.6）をしてから、読み取りの層を開く。DBが無ければ**空のDBを新しく作る**（warnで知らせる）。起動直後に同期サイクルを1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと |
 | 上記以外（`true`・`2`など） | 起動を断る（終了コード2。値はメッセージに書かない） |
 
@@ -1796,7 +1800,7 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 ### 17.4 writer の共有と、取り込みが無効なとき
 
 - `AppState::writer()`は`Catalog`が持つ writer（`cli.rs`が`GEOFRAME_INGEST=1`のときだけ付ける。§11.4）の複製を返す。同期サイクルのスレッドと**同じ接続・同じキュー**。更新は`spawn_blocking`の中で`Writer::call`する。
-- `None`（`GEOFRAME_INGEST=0`、またはガード（§11.1.1）で取り込みを断ったので writer が作られない）のとき、更新APIは**何も書かず**503（`書き込みが無効なので更新できません（この Rust 版は取り込みが無効です）`。値・パス・環境変数名は含めない）。この503は`catalog.db`への書き込みに限る。地図タイルのキャッシュや`.cache.json`はDBではないので、後のタスク（T3.3・T3.4）では取り込みが無効でも動かす。
+- `None`（`GEOFRAME_INGEST=0`、またはガード（§11.1.1）で取り込みを断ったので writer が作られない）のとき、更新APIは**何も書かず**503（`書き込みが無効なので更新できません（この Rust 版は取り込みが無効です）`。値・パス・環境変数名は含めない）。この503は`catalog.db`への書き込みに限る。地図タイルのキャッシュ（`tile_cache/`、T3.4、§19）や`.cache.json`（T3.3は読むだけ、§18.4）はDBではないので、取り込みが無効でも動かす。
 - P2〜P4のガード（検証環境の印・`geoframe-server`の停止の確認）は変えていない。ガードを通らないと writer が作られず、更新APIは書かない。
 
 ### 17.5 Pythonとの差（まとめ）
@@ -1944,7 +1948,7 @@ Pythonは、①同期サイクルが`display`をNULLにしたあとでも古い�
 
 ### 18.7 `/api/admin/`配下の`GET`の整理（T3.1の残り）
 
-T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のままにしていた。現行は`do_GET`に`status`・`photos`・`geocode`の3つ以外の`/api/admin/`の分岐が無く、静的配信のホワイトリストで**403**になる（`setloc`・`setflag`・`rotate`、`/api/admin/`、`/api/admin/Status`、`%73tatus`のようなエンコード、`..`を含む形を現行で確かめた）。T3.3で503の接頭辞（`/api/admin/`）を外し、同じ静的配信の判定に回した。**P4に`/api/admin/`配下の`GET`は無い**（AI検索は`/api/ai/`、旅行ブログは`/api/blog/`）ので、今後`/api/admin/`で503を返すルートは無い。`/api/ai/`・`/api/blog/`・`/tiles/`の`GET`は引き続き503（T3.4・T3.5・P4で実装）。
+T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のままにしていた。現行は`do_GET`に`status`・`photos`・`geocode`の3つ以外の`/api/admin/`の分岐が無く、静的配信のホワイトリストで**403**になる（`setloc`・`setflag`・`rotate`、`/api/admin/`、`/api/admin/Status`、`%73tatus`のようなエンコード、`..`を含む形を現行で確かめた）。T3.3で503の接頭辞（`/api/admin/`）を外し、同じ静的配信の判定に回した。**P4に`/api/admin/`配下の`GET`は無い**（AI検索は`/api/ai/`、旅行ブログは`/api/blog/`）ので、今後`/api/admin/`で503を返すルートは無い。`/api/ai/`・`/api/blog/`の`GET`は引き続き503（T3.5・P4で実装。`/tiles/`はT3.4で実装した、§19）。
 
 ### 18.8 Pythonとの差（まとめ）
 
@@ -1965,3 +1969,93 @@ T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のまま�
 
 - **T3.8**: 検証環境での実際の通信の確認（地理院・Nominatimへの実通信、比較用Python `:8090`に同じ要求を送る）。取り込みが有効・無効の両方で`.cache.json`の挙動を見る。
 - 本番で使う前: Nominatimへ送るUser-Agentの連絡先（§18.5）。
+
+## 19. 地図タイルとキャッシュの掃除（P3 / T3.4）
+
+状態: T3.4 実装済み（2026-10-25）。`GET`/`HEAD /tiles/{osm|gsi}/{z}/{x}/{y}.png`（[inventory.md](inventory.md) E11）と、そのファイルキャッシュ`DATA_DIR/tile_cache/`の掃除（B4）。管理画面の位置修正の地図（MapLibre の raster source）が使う。実装は`tiles.rs`（パス・流量の窓・上流の取得・キャッシュ・掃除）、`server.rs`の`tile_response`（ルーティング・応答）、`cli.rs`（掃除のスレッド）、`config.rs`（`GEOFRAME_TILE_UA`・`GEOFRAME_TILE_FETCH_PER_MIN`・`GEOFRAME_TILE_CACHE_MAX_MB`）。通信とキャッシュの作り方は§18（地名検索）と同じ（`net::read_body_limited`・ループバックのスタブへ向ける入口・本番のコードが入口を呼ばないことの試験）。
+
+### 19.1 ルーティングとパス
+
+- `site`の**先頭**で、`//`を畳んだ生のパスが`/tiles/`で始まれば`tile_response`（`GET`・`HEAD`とも。現行の`do_GET`・`do_HEAD`が他の判定より先に`p.startswith("/tiles/")`を見るのと同じ）。**`webpath::normalize`は通さない**: 現行は`self.path.split("?")[0]`をそのまま正規表現に当てる。`/tiles`（末尾の`/`なし）、`/Tiles/…`、`/%74iles/…`、`/derivatives/../tiles/…`は`/tiles/`で始まらないので静的配信の判定に落ち、ホワイトリスト外で403。`/tiles/`で始まるのに形が合わないものは**404**（403ではない）。
+- 形は`^/tiles/(osm|gsi)/(\d{1,2})/(\d+)/(\d+)\.png$`と同じ（`tiles::parse_path`。層は小文字のみ、ズームは1〜2桁、`x`・`y`は数字1桁以上、`.png`は小文字、`..`・`.`・`//`・`%`エンコード・`+`・`-`・`;`・末尾の`/`は全部不一致）。先頭ゼロは`int()`で畳まれ、キャッシュと上流の URL は`str(int)`の形（`/tiles/osm/05/003/004.png`は`osm/5/3/4`）。
+- 範囲: `x`・`y`が`2^z`以上、`z`が最大ズーム（OSM 19・地理院 18）超過は404（`send_error(404)`と同じ HTML の本文。`Message: Not Found.`。`statics::not_found()`の`File not found`とは別）。`x`・`y`が`u64`に収まらない桁数は404（`2^z`の`z`は最大19なので、収まらない値は必ず範囲外）。`2^z`は`u128`で比べるので`z`が99でもパニックしない。
+- `HEAD`は`GET`と**同じ処理**（上流の取得・保存・窓の消費まで）をして、本文だけ省く。`Content-Length`は`GET`と同じ。404の`HEAD`は本文なし。
+- 他の検査は先に通る: Host 検査（403）、絶対形式の request-target（403）、`POST`（ルートが無いので403）、`OPTIONS`（501、CORS のヘッダなし）。
+
+### 19.2 応答
+
+- 形が合えば**常に200**（取得の失敗・流量の超過も透明 PNG。404にすると MapLibre がリトライを連発する）。ヘッダは`Content-Type: image/png`・`Content-Length`・`Cache-Control`・`X-Tile-Cache`だけ（現行の`Date`・`Server`のうち、Rust は`Date`だけ）。
+- `X-Tile-Cache`と`Cache-Control`: `hit`（キャッシュから）・`miss`（上流から取って保存。**上流の404は透明 PNG を保存して`miss`**）は`public, max-age=86400`。`error`（上流の失敗。保存しない）・`throttled`（流量の上限。上流へ行かない・保存しない）は`no-store`（次回に取り直させる）。
+- 透明 PNG は`tiles/transparent_tile.png`（334バイト、256×256 の RGBA）。現行の`_transparent_tile()`（Pillow）が作るバイト列と同じ。フィクスチャが SHA-256 とバイト列を持ち、Pillow の版（11.1・13.0 で確認）が変えたら`--check`が落ちて気づく。
+
+### 19.3 取得の流れ（`TileProxy::fetch`）
+
+現行の`fetch_tile`と同じ順:
+
+1. **キャッシュを読む**。ヒットは流量の窓に**数えない**（正常な再描画・リロードを妨げない）。ヒットするのは、`tile_cache/<層>/<z>/<x>/<y>.png`が**リンクでない通常ファイル**で、`MAX_TILE_BYTES`（2 MiB）以下、先頭が PNG のマジック（8バイト）のもの。読めない・壊れている（現行は何でも返す。空のファイルを返し続ける）なら、ヒットにせず**取りに行く**。同時に読む数は32（`limits::TILE_FILE_SLOTS`。記述子の数の上限。静的配信の枠とは別で、**待たせるだけ**で断らない）。
+2. **流量の窓**（§19.5）。超えていれば上流へ行かず`throttled`。
+3. **層ごとの同時数の枠**（OSM 2・地理院 4）を待つ（非同期の枠。待つ間スレッドを塞がない）。**窓の判定は枠を待つ前**（現行と同じ。枠を待っている間も窓に数えられている）。
+4. 上流へ取りに行き（ブロッキングのスレッド）、保存する。枠は取得が終わったら放す（保存では持たない）。**クライアントが切断しても、取得と保存は最後まで進む**（枠も戻る）。
+
+同じタイルへの同時の要求は、現行と同じく**まとめない**（それぞれ取りに行き、別名の一時ファイルを経由して最後の`rename`が残る）。壊れたファイルは残らない（試験: 12本の同時の要求のあと、完全な1ファイルだけ）。
+
+### 19.4 上流への要求と応答の検査
+
+- URL は現行の`TILE_SOURCES`と同じ: OSM `https://tile.openstreetmap.org/{z}/{x}/{y}.png`、地理院 `https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png`。本番のバイナリは通信先を変えられない（§18.5と同じ。`TileEndpoints::production`だけ。結合テストが使う`TileEndpoints::loopback`はループバック以外を受け付けない）。
+- 送るヘッダは`User-Agent`（`GEOFRAME_TILE_UA`。既定`GeoFrame/0.1 (personal photo frame)`）・`Accept: image/png`・`Accept-Encoding: identity`（現行の urllib と同じ。`Referer`・`Cookie`などは送らない。フィクスチャが上流で受けたヘッダの名前と値を Python と突き合わせる）。1要求10秒（現行の`timeout=10`はソケットの読み書きごと。Rust は名前解決から本文の読み切りまでの合計）。リダイレクトは`ureq`の既定（10回まで）で、`urllib`もたどる。同じ場所への繰り返しを`urllib`は無限ループとして断るが、`ureq`は回数だけで止める（境界の数え方が違うので、フィクスチャは境界を載せない）。
+- 応答: 404（リダイレクトをたどった最後の応答を含む）→ 透明 PNG を保存して`miss`。2xx → 本文を**展開後で`MAX_TILE_BYTES`（2 MiB）まで**読み（`net::read_body_limited`。gzip でも展開後の大きさ）、**PNG のマジックで始まらなければ`error`**（HTML のキャプティブポータル・JPEG・空・204）。`Content-Type`は見ない（現行も見ない。`text/html`でも中身が PNG なら通り、`image/png`でも中身が HTML なら断る）。それ以外の状態コード（3xx のまま残ったもの・4xx・5xx）・通信の失敗・本文の途中切れ・時間切れは`error`。マジックだけの本文（`\x89PNG\r\n\x1a\n`）も現行は通る（PNG として復号できるかは見ない）。
+- 上限を超える本文（展開後が2 MiBを超える・gzip 爆弾）は`error`で、保存しない。**gzip で返された PNG は展開して受ける**（現行は展開せず、マジックで断る）。OSM・地理院はタイルを gzip で返さない。
+
+### 19.5 流量の窓（B8）
+
+- 上流の取得は**全体で毎分`GEOFRAME_TILE_FETCH_PER_MIN`（既定240）枚**。層をまたいで1つの窓（層ごとに分けると、層を交互に叩くだけで上限が倍になる）。直近60秒に許可した時刻を持ち、60秒以上前のものを捨ててから数える（ちょうど60秒前は窓から出る）。判定と記録は同じ排他の中。上限に達していれば記録せず`throttled`。
+- **数えるのは上流へ行く要求だけ**: 取得に失敗したもの、404 を保存したもの、`HEAD`は数える。ヒット、404（パス）、`throttled`は数えない。`0`は上流へ一切行かない。負の値は起動時に断る。
+- 時計は**単調時計**（現行は`time.time()`）。試験は偽の時計で決定的に進める（240枚ちょうどで通り241枚目が止まる、59.999秒では動かず60秒で戻る、8スレッドから1000回叩いても許可はちょうど240）。
+- ログは抑制の開始と解除の1行ずつ（連続して断っても1行）。
+
+### 19.6 キャッシュ
+
+- 場所は`DATA_DIR/tile_cache/<層>/<z>/<x>/<y>.png`（現行と同じ。Python と並走しても同じファイルを読み書きできる）。`DATA_DIR`は起動時に`canonicalize`したもの（`AppState.data_root`）。
+- **リンクを辿らない・`DATA_DIR`の外へ出ない**: `tile_cache`から`<層>/<z>/<x>`までの各階層を`symlink_metadata`で見て、リンクや通常のディレクトリでないものがあれば、読みも書きもしない。書くときは無ければ作る（同時に別の要求が作っても確かめ直す）。ファイルは同じディレクトリに一時ファイル`<y>.<pid>.<乱数>.part`を`create_new`+`O_NOFOLLOW`で作って書き、`rename`で差し替える（P2の`.part`と同じ流儀。`fsync`はしない: 現行もしない。電源断で壊れたファイルが残っても、ヒットの検査（マジック）で取り直す）。書き込みに失敗しても自分の`.part`は残さず、取得した本文は返す（`miss`。失敗は`[tile] キャッシュ書込失敗: <ErrorKind>`の1行）。
+- `tile_cache`自体や`osm`・`gsi`をリンクにする運用（別のディスクへ向ける）は**使えない**: 読み書きしないので、キャッシュが効かず、上流の流量の上限（240枚/分）に当たり続ける。別のディスクを使うなら、`tile_cache`にマウントする（リンクではなく）。現行はリンクを辿る（差）。
+- 検査と使用の間の差し替え（TOCTOU）は防がない（`datadir.rs`と同じ前提: 置き場は取り込み自身だけが書く。`StateDirectory`の権限で分ける）。
+
+### 19.7 掃除（B4）
+
+- 合計が`GEOFRAME_TILE_CACHE_MAX_MB`（既定16384）を超えたら、`mtime`の古い順に消して**上限の90%以下**にする。停止条件は現行と同じ浮動小数の比較（`total - freed <= limit * 0.9`を各削除の前に）。並びは`(mtime, 大きさ, パスの文字列)`（現行の`(st_mtime, st_size, Path)`。パスの文字列順は`Path`の比較と一致する: `osm/10/…`は`osm/9/…`より前）。上限ちょうどは消さない。`0`はすべて消す。
+- **独立のスレッド**（`tiles::spawn_pruner`）: 起動時に1回、以後1時間ごと（`StopFlag::wait`なので、停止の合図で待ちも走査も途中で止まる）。現行は起動時に同期で1回（サーバーより前）、以後は同期サイクルの周期のあと「前回から1時間超なら」だが、**Rust は取り込みが無効だと同期サイクルが動かない**ので、取り込みの有無に関わらず動かす。起動を待たせない（16 GB の走査は SD で時間がかかる）。`serve`の停止で`stop.stop()`のあと`join_within`（10秒）で待つ。パニックしてもループは続ける。
+- 数える・消すのは`<層>/<z>/<x>/<y>.png`の形（層は`osm`・`gsi`、数値は先頭ゼロなしの十進）の**通常ファイルだけ**。`DirEntry::file_type`/`metadata`はリンクを辿らないので、リンクのファイル・ディレクトリは数えず・降りず・消さない。`tile_cache`自体がリンクなら何もせず警告1行。形の合わないファイル（`notes.txt`・`01.png`・深さの違う`.png`）は数えず消さない（現行は`rglob("*.png")`）。1件あたり構造体（`mtime`・大きさ・層・`z`・`x`・`y`）だけを持ち、パスの文字列は持たないので、百万枚でも約50 MB（現行は`Path`を持つ）。
+- 異常終了で残った一時ファイル（`*.part`で、1時間以上前のもの）も消す。新しいもの（今まさに書いているもの）は消さない。
+- 配信・書き込みとの競合: 掃除は走査してから消すだけで、ファイルを開いている読み手は消えても読み続けられる。消されたあとの要求は`miss`で取り直す。消す対象が走査のあとで新しく書き直されていても、消えるだけ（キャッシュなので害はない）。試験は、`GEOFRAME_TILE_CACHE_MAX_MB=0`（毎回すべて消す）の掃除を回し続けながら40本の取得を流し、どれも完全な本文で返ること、書きかけが残らないことを見る。
+- ログ: 消したときだけ`[tile] キャッシュ整理: N枚削除 AMB → BMB`（現行と同じ形）。パスは出さない。
+
+### 19.8 取り込みが無効のとき・unit
+
+- `tile_cache/`は`catalog.db`に書かないので、**`GEOFRAME_INGEST=0`（writer なし）でも取得も掃除も動く**（`AppState::writer()`は`None`のまま）。試験: `tiles_work_without_a_writer_and_do_not_touch_the_database`（miss でファイルができ、DB のバイト列は変わらない）、`tests/ingest_cli.rs`（取り込み無効の`serve`が起動時に掃除し、SIGTERM で正常に終わり、DB のバイト列が変わらない）。
+- `deploy/geoframe-rs.service`: `tile_cache/`は`StateDirectory=geoframe`の中で、`ReadOnlyPaths`（`photos`・`blog_exports`・`travel_blog`）に入っていないので書ける。`ProtectSystem=strict`の下でも書ける場所。コメントに「`GEOFRAME_INGEST`が`0`でも`tile_cache/`には書く」を足した。
+- Python と並走しているとき、両方が同じ`tile_cache/`を書き、掃除する。形式は同じで書き込みは`rename`による差し替えなので、互いを壊さない（読み取りが書きかけを見ない）。
+
+### 19.9 ログ（AC7）
+
+- アクセスログは`GET /tiles/{*path} 200 12ms`のようにテンプレートだけ（層・座標・クエリは出さない）。404も同じテンプレート。
+- 失敗は`[tile] 上流取得失敗（osm）: http 503`/`disconnected`/`timeout`/`bad_response`など（層・失敗の種類・状態コード）まで。**座標（z/x/y）・URL・ホスト・User-Agent は出さない**（現行は`z/x/y`と例外文字列を出す）。User-Agent は連絡先が入りうるので、設定の`Debug`・起動ログにも出さない（`config::tests`）。試験: 失敗の場面で、座標・`/osm/`・`127.0.0.1`・User-Agent の連絡先・`tile_cache`が出力に含まれないこと（`tiles::tests::logs_never_contain_…`）、アクセスログに座標が出ないこと（`tests/access_log.rs`）、掃除のログにパスが出ないこと。
+
+### 19.10 Pythonとの差（まとめ）
+
+§0の2行に同じ。①本文は2 MiBまで（展開後）。②gzip で返された PNG は展開して受ける。③ヒットは中身が PNG の通常ファイルだけ。④リンクを辿らない・一時ファイルは`create_new`+`O_NOFOLLOW`。⑤流量の窓は単調時計。⑥負の設定値・不正な User-Agent は起動を断る。⑦巨大な座標は404。⑧`#`以降はhyperが落とす。⑨ログに座標を出さない。⑩枠は非同期。⑪切断しても保存まで進める。掃除は⑫独立のスレッド（取り込みの有無によらない）、⑬形の合う通常ファイルだけ、⑭古い`.part`も消す。それ以外（パスの形・範囲・ズーム・常に200・`X-Tile-Cache`・`Cache-Control`・`HEAD`・上流のヘッダと検査・404の保存・流量の窓の数え方・同時数・キャッシュの置き場・掃除の順序と90%）はフィクスチャで一致を確かめた。
+
+### 19.11 テスト
+
+- `src/tiles/tests.rs`:
+  - `python_fixture_*`: `tools/gen_tile_fixture.py`（`app/tests/tile_fixture.py`の19ケース・176手順と、掃除7ケース）が、現行`handlers.Handler`に GET / HEAD を順に流し、上流をループバックのスタブ（本物の`urllib`で通信する。リダイレクト・切断・途中切れも本物の挙動）に、時計を偽の時計に差し替えて記録した、状態コード・ヘッダ（名前も値も）・本文（長さと SHA-256、404 は HTML 全体）・上流が受けた要求（順序・パス・`User-Agent`・`Accept`・`Accept-Encoding`・ヘッダの名前の集合）・使われなかった応答の数・直後の`tile_cache`の全ファイル（相対パスと SHA-256。`.part`が残らないことを含む）と、Rust が同じ手順・同じ応答のスタブ・同じ偽の時計で流した結果が一致する。ケース: miss→hit、上流へ送るヘッダ、ズームと範囲の境界（OSM 19/20・地理院 18/19、`2^z`、`z`=63・64・99・3桁、巨大な`x`・`y`）、先頭ゼロ、形の合わない46個のパス（`..`・エンコード・大文字・末尾の`/`・`+`・`-`・`;`・`\`）、クエリ、先頭の`//`、他の接頭辞（`/tiles`・`/Tiles/`・`/%74iles/`・`/derivatives/../tiles/`は403）、HEAD、404 の保存、各状態コード（400・403・410・429・5xx・300・301・302・304・204）、PNG でない本文（HTML・JPEG・空・マジックの欠け・先頭に空白）とマジックだけの本文・`Content-Type`を見ないこと、切断・途中切れ、リダイレクト（301・302・303・307・308、先が404・500、連なり）、300 KB の本文、毎分の窓（3枚/分・2枚/分・0枚/分、層をまたぐ、60秒の境界、ヒット・失敗・404の保存・HEAD・パスの404の数え方）、置いておいたキャッシュのヒット。掃除は偽のファイル群（大きさと`mtime`を指定）の残りが一致する（上限ちょうど、1バイト超過、90%ちょうど、`mtime`の順、同じ`mtime`の大きさ・パスの文字列順、0）。
+  - `python_fixture_constants_match`: 透明 PNG のバイト列、既定の User-Agent・毎分の上限・上限 MB・タイムアウト・窓・最大ズーム・同時数、本番の URL。
+  - 差・Rust だけの性質: 本文の上限（ちょうどは通り1バイト超で失敗、gzip 爆弾、上限内の gzip）、壊れた/空/巨大/ディレクトリ/FIFO のキャッシュのファイルは取り直し、リンク（ファイル・切れたリンク・ディレクトリ・層・`tile_cache`自体）を読まず書かず外のファイルを変えない、同じタイルの12本の同時の要求、**同時数の上限**（OSM 2・地理院 4。スタブが応答を止めて、枠が使い切られた状態と同時に開いている数を見る。1つずつ放すと次が届く。実時間の`sleep`なし）、遅い上流のタイムアウト、クライアントが切れても保存まで進み枠が戻る、窓（偽の時計・8スレッドの同時）、ログに座標などが出ない、取り込みが無効で動く、掃除（リンク・形の合わないファイル・古い`.part`・停止の合図で中断・配信との競合・スレッドが起動時と定期に動き停止の合図で止まる・`tile_cache`が無い/リンク）。
+- `tests/tile_api.rs`（結合テスト）: ルーター全体を通した miss→hit・HEAD・上流の失敗・404・Host 検査・絶対形式・POST・OPTIONS。既定の接続先は何も受け付けないスタブ（`tests/common/tile_stub.rs`）で、外へ出ない。`tests/access_log.rs`: ログに座標が出ない。`tests/ingest_cli.rs`: 取り込み無効の`serve`が掃除する。
+- `src/config.rs`: 新しい3項目の既定・不正な値・User-Agent を Debug・要約に出さない。
+- `app/tests/test_tile_fixture.py`: フィクスチャが最新であることと、Python の癖（`Content-Type`を見ない、窓に数えるもの）の記録。
+- 確認した変異: OSM の同時数を3にする、窓の境界を`>`にする、窓の判定を外す、90%を100%にする、のそれぞれで試験が落ちる。
+
+### 19.12 回したもの
+
+- **T3.8**: 検証環境での実際の通信の確認（OSM・地理院への実通信、比較用 Python `:8090`との同じタイル・同じ流量での応答の比較、`GEOFRAME_TILE_UA`に連絡先を入れる）。取り込みが有効・無効の両方で、`tile_cache/`の書き込みと掃除を見る。検証環境の実機で`StateDirectory`の下の`tile_cache`が書けること（unit の`ProtectSystem=strict`）。
+- 本番で使う前: `GEOFRAME_TILE_UA`に連絡先を入れる（OSM の利用規約。既定のままだとブロックされうる）。

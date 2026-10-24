@@ -13,7 +13,9 @@
 //! | 位置推定の窓（1 段目。推定と管理画面の内訳の区切り） | なし | `GEOFRAME_INFER_MIN` | `15`（分） |
 //! | カメラ時計のずれの補正（推定する写真の時刻に足す。負でもよい） | なし | `GEOFRAME_INFER_OFFSET_MIN` | `0`（分） |
 //! | embedding の場所（管理画面の AI 件数が数えるモデル） | なし | `GEOFRAME_EMBED_BACKEND` | `gemini` |
-//! | タイルキャッシュの上限（管理画面のディスク表示） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
+//! | タイルキャッシュの上限（管理画面のディスク表示と、掃除） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
+//! | 地図タイルの上流へ送る User-Agent（連絡先入りにする。ログには出さない） | なし | `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` |
+//! | 地図タイルの上流取得の毎分の上限（全体。0 は上流へ行かない） | なし | `GEOFRAME_TILE_FETCH_PER_MIN` | `240` |
 //! | 取り込み（DB への書き込み・同期サイクル）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_INGEST`（`0`/`1`） | `0`（無効） |
 //! | 同期サイクルの間隔（分） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10` |
 //! | ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可） | なし | `GEOFRAME_PHOTOS_DIR` | `photos` |
@@ -56,9 +58,6 @@ pub const DB_FILE_NAME: &str = "catalog.db";
 /// `docs/reference/configuration.md` の項目がここか [`SUPPORTED_ENV`] のどちらかに載っているかを
 /// テストで確かめている（Python 側で項目が増えたのに Rust の分類が漏れるのを防ぐ）。
 pub const UNSUPPORTED_ENV: &[&str] = &[
-    // P3: 管理機能（地図タイル）
-    "GEOFRAME_TILE_UA",
-    "GEOFRAME_TILE_FETCH_PER_MIN",
     // P4: AI・位置候補
     "GEOFRAME_AI_ENABLED",
     "GEOFRAME_AI_EMBED_PER_CYCLE",
@@ -91,6 +90,9 @@ pub const SUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_INFER_MIN",
     "GEOFRAME_EMBED_BACKEND",
     "GEOFRAME_TILE_CACHE_MAX_MB",
+    // T3.4: 地図タイルのプロキシ（E11）。キャッシュの上限（`GEOFRAME_TILE_CACHE_MAX_MB`）は掃除（B4）にも使う
+    "GEOFRAME_TILE_UA",
+    "GEOFRAME_TILE_FETCH_PER_MIN",
     // T2.1: 同期サイクルの間隔
     "GEOFRAME_DRIVE_POLL_MIN",
     // T2.3: ローカル写真の索引（index_local・local_derivatives）
@@ -109,6 +111,11 @@ pub const DEFAULT_INFER_MIN: f64 = 15.0;
 /// カメラ時計のずれの補正（分）の既定。現行の `GEOFRAME_INFER_OFFSET_MIN`。
 pub const DEFAULT_INFER_OFFSET_MIN: f64 = 0.0;
 pub const DEFAULT_TILE_CACHE_MAX_MB: i64 = 16384;
+/// 地図タイルの上流へ送る User-Agent の既定。現行の `TILE_UA`。OSM の利用規約は連絡先入りを求めるので、
+/// 本番は `GEOFRAME_TILE_UA` で与える（値は起動ログにも載せない）。
+pub const DEFAULT_TILE_UA: &str = "GeoFrame/0.1 (personal photo frame)";
+/// 地図タイルの上流取得（キャッシュミス）の流量の上限（枚/分、全体）の既定。現行の `TILE_FETCH_PER_MIN`。
+pub const DEFAULT_TILE_FETCH_PER_MIN: i64 = 240;
 /// 同期サイクルの間隔（分）の既定。現行の `GEOFRAME_DRIVE_POLL_MIN`。
 pub const DEFAULT_DRIVE_POLL_MIN: f64 = 10.0;
 /// ローカル写真の置き場の既定（`DATA_DIR` からの相対）。ディレクトリ名は変えない（`display`・`path` 列の
@@ -216,7 +223,14 @@ pub struct Config {
     /// `GEOFRAME_EMBED_BACKEND` が `gemini`・`local` のどちらでもなかった（現行と同じく `gemini` に
     /// 落とした）。起動ログで知らせる。
     pub embed_backend_invalid: bool,
+    /// 地図タイルのキャッシュの上限（MB。0 以上）。`GEOFRAME_TILE_CACHE_MAX_MB`。
     pub tile_cache_max_mb: i64,
+    /// 地図タイルの上流へ送る User-Agent。`GEOFRAME_TILE_UA`（印字可能な ASCII だけ）。連絡先が入りうるので、
+    /// `Debug`・起動ログには載せない。
+    pub tile_ua: String,
+    /// 地図タイルの上流取得（キャッシュミス）の毎分の上限（全体。0 以上）。`GEOFRAME_TILE_FETCH_PER_MIN`。
+    /// 0 なら上流へ行かない。
+    pub tile_fetch_per_min: i64,
     /// 取り込み（DB への書き込みと同期サイクル）を有効にするか。`GEOFRAME_INGEST`。既定は無効。
     /// 本番は P5 の切替まで Python が書き手なので、誤って二重に書かないよう、明示しない限り Rust は書かない。
     pub ingest: bool,
@@ -322,11 +336,47 @@ impl Config {
             },
             None => (EmbedBackend::Gemini, false),
         };
+        // 現行は `int(...)`。負の値は掃除が毎回すべてのタイルを消す意味になるので、Rust は断る
         let tile_cache_max_mb = match get("GEOFRAME_TILE_CACHE_MAX_MB") {
-            Some(raw) => raw.trim().parse::<i64>().map_err(|_| {
-                ConfigError("GEOFRAME_TILE_CACHE_MAX_MB は整数（MB）で指定してください".into())
-            })?,
+            Some(raw) => raw
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|v| *v >= 0)
+                .ok_or_else(|| {
+                    ConfigError(
+                        "GEOFRAME_TILE_CACHE_MAX_MB は 0 以上の整数（MB）で指定してください".into(),
+                    )
+                })?,
             None => DEFAULT_TILE_CACHE_MAX_MB,
+        };
+        // 現行は `int(...)`（負の値は「常に上限超過」）。Rust は断る。0 は上流へ行かない
+        let tile_fetch_per_min = match get("GEOFRAME_TILE_FETCH_PER_MIN") {
+            Some(raw) => raw
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .filter(|v| *v >= 0)
+                .ok_or_else(|| {
+                    ConfigError(
+                        "GEOFRAME_TILE_FETCH_PER_MIN は 0 以上の整数（枚/分）で指定してください"
+                            .into(),
+                    )
+                })?,
+            None => DEFAULT_TILE_FETCH_PER_MIN,
+        };
+        // ヘッダの値になるので、印字可能な ASCII（と空白）だけ。現行は不正な値でも起動し、取得のたびに失敗する
+        let tile_ua = match get("GEOFRAME_TILE_UA") {
+            Some(raw) => {
+                let ua = raw.trim().to_string();
+                if !ua.bytes().all(|b| (0x20..0x7f).contains(&b)) {
+                    return Err(ConfigError(
+                        "GEOFRAME_TILE_UA は印字可能な ASCII で指定してください".into(),
+                    ));
+                }
+                ua
+            }
+            None => DEFAULT_TILE_UA.to_string(),
         };
 
         let ingest = match get("GEOFRAME_INGEST") {
@@ -399,6 +449,8 @@ impl Config {
             embed_backend,
             embed_backend_invalid,
             tile_cache_max_mb,
+            tile_ua,
+            tile_fetch_per_min,
             ingest,
             drive_poll_min,
             photos_dir_setting,
@@ -662,6 +714,44 @@ mod tests {
     }
 
     #[test]
+    fn tile_settings_default_to_the_python_values_and_the_user_agent_stays_out_of_the_log() {
+        let c = load(&[], &Overrides::default()).unwrap();
+        assert_eq!(c.tile_ua, "GeoFrame/0.1 (personal photo frame)");
+        assert_eq!(c.tile_fetch_per_min, 240);
+        let c = load(
+            &[
+                (
+                    "GEOFRAME_TILE_UA",
+                    "  GeoFrame/0.1 (contact-private@example.test) ",
+                ),
+                ("GEOFRAME_TILE_FETCH_PER_MIN", " 0 "),
+                ("GEOFRAME_TILE_CACHE_MAX_MB", "0"),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.tile_ua, "GeoFrame/0.1 (contact-private@example.test)");
+        assert_eq!((c.tile_fetch_per_min, c.tile_cache_max_mb), (0, 0));
+        // 連絡先が入りうる User-Agent は Debug にも起動ログの要約にも載せない
+        for text in [format!("{c:?}"), c.log_summary()] {
+            assert!(!text.contains("contact-private"), "{text}");
+        }
+        // 空文字は未設定と同じ
+        let c = load(
+            &[
+                ("GEOFRAME_TILE_UA", ""),
+                ("GEOFRAME_TILE_FETCH_PER_MIN", " "),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            (c.tile_ua.as_str(), c.tile_fetch_per_min),
+            (DEFAULT_TILE_UA, 240)
+        );
+    }
+
+    #[test]
     fn infer_offset_defaults_to_zero_and_accepts_negative_and_fractional_minutes() {
         let c = load(&[], &Overrides::default()).unwrap();
         assert_eq!(c.infer_offset_min, 0.0);
@@ -709,6 +799,15 @@ mod tests {
             ("GEOFRAME_INFER_MIN", "NaN"),
             ("GEOFRAME_TILE_CACHE_MAX_MB", "1.5"),
             ("GEOFRAME_TILE_CACHE_MAX_MB", "big"),
+            ("GEOFRAME_TILE_CACHE_MAX_MB", "-1"),
+            ("GEOFRAME_TILE_FETCH_PER_MIN", "1.5"),
+            ("GEOFRAME_TILE_FETCH_PER_MIN", "many"),
+            ("GEOFRAME_TILE_FETCH_PER_MIN", "-1"),
+            (
+                "GEOFRAME_TILE_UA",
+                "GeoFrame/1 (a@example.test)\r\nX-Evil: 1",
+            ),
+            ("GEOFRAME_TILE_UA", "GeoFrame/1 (連絡先)"),
         ] {
             let err = load(&[(key, value)], &Overrides::default()).unwrap_err();
             assert!(err.0.contains(key), "{err}");

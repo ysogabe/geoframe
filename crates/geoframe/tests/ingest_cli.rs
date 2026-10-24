@@ -429,6 +429,48 @@ fn serve_without_ingest_stays_read_only() {
     assert_eq!(snapshot(&dir.0), before);
 }
 
+/// 取り込みが無効（既定）でも、地図タイルのキャッシュは掃除する（B4。同期サイクルは動かないので、サーバー側の
+/// 独立のタイマー）。起動時に 1 回走り、停止の合図で正常に終わる。DB には触れない。
+#[test]
+fn serve_without_ingest_still_prunes_the_tile_cache_at_start_and_stops_cleanly() {
+    let dir = Dir::new("serve-tile-prune");
+    production_shaped_db(&dir.0);
+    let db_before = fs::read(dir.0.join("catalog.db")).unwrap();
+    let tiles = dir.0.join("tile_cache/osm/5/3");
+    fs::create_dir_all(&tiles).unwrap();
+    for (y, secs) in [(1u64, 100u64), (2, 200), (3, 300)] {
+        let file = fs::File::create(tiles.join(format!("{y}.png"))).unwrap();
+        file.set_len(600_000).unwrap();
+        file.set_modified(std::time::UNIX_EPOCH + Duration::from_secs(secs))
+            .unwrap();
+    }
+    // 上限は 1 MB（1,048,576 バイト）。合計 1,800,000 バイトは超えているので、古い順に 90% 以下まで消す
+    let port = free_port();
+    let mut child = Command::new(BIN)
+        .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
+        .args(["--data-dir", dir.0.to_str().unwrap()])
+        .env_clear()
+        .env("GEOFRAME_TILE_CACHE_MAX_MB", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_healthy(&mut child, port);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while fs::read_dir(&tiles).unwrap().count() > 1 {
+        assert!(Instant::now() < deadline, "起動時の掃除が走りません");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let (status, stdout) = terminate(child);
+    assert!(status.success(), "{stdout}");
+    assert!(stdout.contains("取り込みは無効です"), "{stdout}");
+    assert!(stdout.contains("キャッシュ整理: 2枚削除"), "{stdout}");
+    // 新しい 1 枚だけが残る。座標（z/x/y）はログに出ない
+    assert!(tiles.join("3.png").is_file());
+    assert!(!stdout.contains("osm/5/3"), "{stdout}");
+    assert_eq!(fs::read(dir.0.join("catalog.db")).unwrap(), db_before);
+}
+
 #[test]
 fn serve_without_ingest_refuses_a_missing_database() {
     let dir = Dir::new("serve-missing");
