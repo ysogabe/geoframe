@@ -330,7 +330,8 @@ fn known(name: &str) -> (u16, &'static str) {
 async fn every_request_matches_python_status_body_row_changes_and_files() {
     let fixture = fixture();
     let cases = fixture["cases"].as_array().unwrap();
-    assert!(cases.len() >= 55, "{}", cases.len());
+    // 取りこぼしが無いよう規模を固定する（ケースを足したら更新する）
+    assert_eq!(cases.len(), 57);
     let known_names: Vec<&str> = fixture["known_differences"]
         .as_object()
         .unwrap()
@@ -512,5 +513,51 @@ async fn simultaneous_rotations_of_one_photo_are_applied_one_after_another() {
     assert_eq!(
         server.snapshot()[&2]["display"],
         json!("derivatives/drive-2.jpg")
+    );
+}
+
+/// 棚卸し S6: 回したあと、表示のURL（E23）は新しい名前で200、古い名前は404、写真フィード（E1）の`file`も
+/// 新しい名前になる（miharashi 側のキャッシュ回避）。
+#[tokio::test]
+async fn after_a_rotation_the_new_url_is_served_and_the_feed_names_it() {
+    let server = Server::start(true).await;
+    server.apply_setup(&fixture()["initial"]);
+    let file_of = |feed: &Value, id: i64| {
+        feed.as_array()
+            .expect("写真一覧は配列")
+            .iter()
+            .find(|p| p["id"] == id)
+            .map(|p| p["file"].as_str().unwrap().to_string())
+    };
+    let feed = common::get(server.addr, "/api/v1/photos").await.json();
+    assert_eq!(file_of(&feed, 2).as_deref(), Some("derivatives/p02.jpg"));
+    assert_eq!(
+        common::get(server.addr, "/derivatives/p02.jpg")
+            .await
+            .status,
+        200
+    );
+
+    let response = server.post_body(ROTATE, br#"{"id": 2, "delta": 90}"#).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json()["thumb"], "/derivatives/drive-2.r90.jpg");
+
+    let image = common::get(server.addr, "/derivatives/drive-2.r90.jpg").await;
+    assert_eq!(image.status, 200);
+    assert_eq!(image.header("content-type"), Some("image/jpeg"));
+    assert_eq!(
+        image.body,
+        fs::read(server.dir.path().join("derivatives/drive-2.r90.jpg")).unwrap()
+    );
+    assert_eq!(
+        common::get(server.addr, "/derivatives/p02.jpg")
+            .await
+            .status,
+        404
+    );
+    let feed = common::get(server.addr, "/api/v1/photos").await.json();
+    assert_eq!(
+        file_of(&feed, 2).as_deref(),
+        Some("derivatives/drive-2.r90.jpg")
     );
 }

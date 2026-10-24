@@ -1859,7 +1859,7 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 
 writerは単一接続なので、DBへの書き込みどうしは割り込めない。ファイルとDBを別々に変える回転は、次の守りで`display`と実在するファイルの食い違いを防ぐ。
 
-- **排他**: `imaging::lock_derivatives()`（プロセスで1つのMutex）を、回転は「行を読む」から「旧ファイルを消す」まで、取得（`fetch_derivatives`）は「derivativeを作る」から「`display`をDBに書く」まで持つ（原本のダウンロードの間は持たない）。writerの依頼はロックを取らないのでデッドロックしない。
+- **排他**: `imaging::lock_derivatives()`（プロセスで1つのMutex）を、回転は「行を読む」から「旧ファイルを消す」まで、取得（`fetch_derivatives`）は「derivativeを作る」から「`display`をDBに書く」まで持つ（原本のダウンロードの間は持たない）。writerの依頼はロックを取らないのでデッドロックしない。取得がロックを持つのは1枚のderivativeを作る間（デコード・縮小・保存。大きなHEICで数秒）なので、回転はその間待たされうる（管理画面の1操作が数秒遅れる程度）。
 - **条件付きの更新**: `UPDATE photos SET display=?, rotation=? WHERE id=? AND display IS ? AND rotation IS ? AND md5 IS ? AND fetched_at IS ?`（読んだ時点の値。`IS`でNULLも一致）。`md5`・`fetched_at`も条件に入れるのは、`display`が一度NULLにされて取得が同じ名前（`<drive_id>.jpg`）で**変わった原本から**作り直すと、`display`・`rotation`が元に戻って見えるため（ABA）。外れたら何も書かず、新しいファイルを消して409。
 
 | 場面 | どうなるか | 守り | 試験 |
@@ -1880,7 +1880,7 @@ Pythonは、①同期サイクルが`display`をNULLにしたあとでも古い�
 
 #### 17.8.6 テスト
 
-- `tests/rotate_api.rs`: `tools/gen_rotate_fixture.py`（`app/tests/rotate_fixture.py`）が、合成のderivative（JPEGの4色の象限、グレー、EXIF・GPS付き）を置いた現行`admin_rotate`に57ケースを順に流した結果（状態コード・応答のJSON・`photos`の変化・ファイルの増減と画像の寸法・四隅の色・EXIFの有無）と、同じDB・同じ画像を作り直したRustのサーバーの結果が一致する。ケース: 4方向の累積（90を4回で元の名前・元の向き）、`-90`・`180`・`270`、NULL・0・負・90の倍数でない`rotation`、新しい名前が今の`display`と同じ行、ローカルの写真・`drive_id`がNULL／空・`display`がNULL／ファイル無し／ディレクトリ／画像でない、`delta`の各種の不正値、`id`の各種の不正値、検査の順序、意図した差5件。`.part`が残らないことも確かめる。writerなしの503（ファイルもDBも変わらない）、同時の4本の回転。
+- `tests/rotate_api.rs`: `tools/gen_rotate_fixture.py`（`app/tests/rotate_fixture.py`）が、合成のderivative（JPEGの4色の象限、グレー、EXIF・GPS付き）を置いた現行`admin_rotate`に57ケースを順に流した結果（状態コード・応答のJSON・`photos`の変化・ファイルの増減と画像の寸法・四隅の色・EXIFの有無）と、同じDB・同じ画像を作り直したRustのサーバーの結果が一致する。ケース: 4方向の累積（90を4回で元の名前・元の向き）、`-90`・`180`・`270`、NULL・0・負・90の倍数でない`rotation`、新しい名前が今の`display`と同じ行、ローカルの写真・`drive_id`がNULL／空・`display`がNULL／ファイル無し／ディレクトリ／画像でない、`delta`の各種の不正値、`id`の各種の不正値、検査の順序、意図した差5件。`.part`が残らないことも確かめる。writerなしの503（ファイルもDBも変わらない）、同時の4本の回転、棚卸しS6（回したあと、新しいURLがE23で200・古いURLが404・写真フィードE1の`file`が新しい名前）。
 - `src/rotate/tests.rs`: 検査の境界、JPEGの設定（ベースライン・4:2:0・EXIF/GPS/ICCなし・グレーは1成分）、画素の近さ、失敗の後始末（`rename`の失敗・書き込めないディレクトリ・DBのトリガーによる失敗・同じ名前の書き戻し・旧ファイルを消せない）、競合（§17.8.4）、リンク（`display`・`derivatives/`・新しい名前の位置。外のファイルが読まれず消されず作られない）、`drive_id`の不正。旧ファイルを消せない試験のログは固定の文言だけで、ファイル名を含まない。
 - `drive::tests`（取り直しで回転が同じ名前・同じ向きになる、取得がロックで待つ）、`quality::tests`（解析の途中の回転）。`app/tests/test_rotate_fixture.py`: フィクスチャが最新であること、Pythonの癖の記録（四隅の色の向き、EXIFの向きを当てないこと、リンクの`display`が辿られること）。
 - 割り込みは`rotate::rotate_with`の`between`（新しいファイルを書いたあと・DBを更新する前に1回呼ぶ閉包）。条件（`md5`・`fetched_at`）を外す、`current display`の確認を外す、取得のロックを外すと、それぞれの試験が落ちることを確認した。

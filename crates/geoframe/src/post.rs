@@ -31,7 +31,7 @@
 //!
 //! # エラー応答
 //!
-//! [`ApiError`] → `BadRequest` 400、`NotFound` 404、`Busy` 409（旅行ブログの書き出し中。T3.6）、
+//! [`ApiError`] → `BadRequest` 400、`NotFound` 404、`Busy` 409（他の処理と重なった回転（T3.2）、旅行ブログの書き出し中（T3.6））、
 //! `Unavailable` 503（書き込みが無効。Python に無い）、`Internal` 500（定型文だけ。詳細は**ログにだけ**
 //! 出し、応答には出さない）。本文は `{"ok": false, "error": "…"}`。
 //!
