@@ -1,5 +1,11 @@
-//! HTTP サーバー。ルートは `GET /healthz`（プロセスが動いていて DB が読める）と
-//! `GET /api/v1/photos`（写真フィード。契約は docs/architecture/photo-feed-contract.md）。
+//! HTTP サーバー。ルートは `GET /healthz`（プロセスが動いていて DB が読める）、
+//! `GET /api/v1/photos`（写真フィード。契約は docs/architecture/photo-feed-contract.md）、
+//! それ以外（静的ファイル・管理画面のページ・未実装の API）を受ける [`site`]。
+//!
+//! リクエストは外側から **ログ → ヘッダ付与 → 検査（[`guard`]）→ ルート** の順に通る。検査は
+//! 現行 Python の `do_GET`/`do_HEAD`/`do_POST` の入口と同じ順序で、未実装のメソッド（`OPTIONS` を含む。
+//! CORS ヘッダは一切返さない）は 501、Host 検査、`POST` は全部 403、の順。仕様と Python との差は
+//! docs/rust-migration/server.md §9。
 //!
 //! 公開するルートが増えても、次の方針は変えない。
 //!
@@ -13,15 +19,17 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{MatchedPath, Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::{Json, Router, routing::get};
+use axum::routing::{MethodFilter, any, on};
+use axum::{Json, Router};
 use serde::Serialize;
+use std::path::PathBuf;
 
 use crate::config::Config;
 use crate::db::Catalog;
-use crate::photos;
+use crate::{hostcheck, photos, statics, webpath};
 
 /// `/healthz` が DB の確認を待つ上限。超えたら不健康（503）として答える。`/healthz` 専用の接続の
 /// `busy_timeout`（2 秒、`db.rs`）より長く、API の読み取りとは別の接続を使うので、API が混んで
@@ -33,6 +41,26 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 pub struct AppState {
     pub config: Arc<Config>,
     pub catalog: Catalog,
+    /// データ置き場を**リンクを辿って解決した**絶対パス（起動時に1回。静的配信が、要求されたファイルを
+    /// 解決した結果の内外判定に使う）。データ置き場自体がシンボリックリンクでもよい。
+    pub data_root: Arc<PathBuf>,
+}
+
+impl AppState {
+    /// `config.data_dir` を解決して状態を作る。解決できないとき（起動時には DB を開いているので
+    /// 起きない。テストで存在しない置き場を渡した場合など）は解決前の絶対パスのままにし、
+    /// 静的配信は 404 を返す。
+    pub fn new(config: Arc<Config>, catalog: Catalog) -> Self {
+        let data_root = std::fs::canonicalize(&config.data_dir).unwrap_or_else(|e| {
+            tracing::warn!("データ置き場を解決できません: {e}");
+            config.data_dir.clone()
+        });
+        Self {
+            config,
+            catalog,
+            data_root: Arc::new(data_root),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -116,9 +144,20 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     json_response(status, body.to_string().into_bytes())
 }
 
+/// 応答に付ける、アクセスログ用のルートのテンプレート（`/derivatives/{*path}` など）。
+/// 実際のパスの代わりにこれだけをログへ出す。応答の拡張で渡す（ネットワークには出ない）。
+#[derive(Clone, Copy)]
+struct RouteLabel(&'static str);
+
+fn labeled(mut response: Response, label: &'static str) -> Response {
+    response.extensions_mut().insert(RouteLabel(label));
+    response
+}
+
 /// リクエストログ。出す項目は**メソッド・ルートのテンプレート・状態コード・所要時間（ミリ秒）**
 /// だけ。実際のパスやクエリ（ファイル名・Drive ID・検索語が入りうる）は出さず、どのルートにも
 /// 当たらなかったリクエストは `(unmatched)` と出す。`/healthz` の成功は頻繁に呼ばれるので debug。
+/// 引数付きのルート（静的ファイル）は [`RouteLabel`] のテンプレートで出す。
 async fn access_log(request: Request, next: Next) -> Response {
     let method = request.method().clone();
     let route = request
@@ -129,7 +168,12 @@ async fn access_log(request: Request, next: Next) -> Response {
     let response = next.run(request).await;
     let status = response.status().as_u16();
     let ms = started.elapsed().as_millis();
-    let route = route.as_deref().unwrap_or("(unmatched)");
+    let route = response
+        .extensions()
+        .get::<RouteLabel>()
+        .map(|label| label.0)
+        .or(route.as_deref())
+        .unwrap_or("(unmatched)");
     if status >= 500 {
         tracing::warn!("{method} {route} {status} {ms}ms");
     } else if route == "/healthz" {
@@ -140,16 +184,182 @@ async fn access_log(request: Request, next: Next) -> Response {
     response
 }
 
-async fn not_found() -> StatusCode {
-    StatusCode::NOT_FOUND
+/// 検査（現行 Python の `do_GET`/`do_HEAD`/`do_POST` の入口と同じ順序）:
+///
+/// 1. `GET`/`HEAD`/`POST` 以外は 501。`OPTIONS` もここ。クロスオリジンの `application/json` の
+///    プリフライトを失敗させる（CSRF 対策の一部）ので、**CORS ヘッダは一切返さない**。
+/// 2. Host 検査（[`hostcheck`]）。不許可は 403。**Host の値はログに出さない**。
+/// 3. `POST` は P1 では全部 403（更新系は P3 で実装する。現行の「未知の POST」と同じ応答）。
+async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let method = request.method();
+    if !matches!(*method, Method::GET | Method::HEAD | Method::POST) {
+        return statics::unsupported_method(method);
+    }
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    if !hostcheck::host_allowed(
+        host.as_deref(),
+        state.config.listen.port(),
+        &state.config.allowed_hosts,
+    ) {
+        tracing::warn!(
+            "Host ヘッダが許可されていないため拒否しました（値は記録しません。GEOFRAME_ALLOWED_HOSTS で名前を足せます）"
+        );
+        return statics::forbidden_host();
+    }
+    if *method == Method::POST {
+        return statics::forbidden();
+    }
+    next.run(request).await
+}
+
+/// 現行の `end_headers` と同じヘッダを付ける（全ての応答。403・404・304 にも付く）。
+///
+/// - HTML と `/static/`・`/vendor/` 配下は `Cache-Control: no-cache`（キャッシュはするが毎回
+///   再検証させる。サーバー側のコードを更新しても常時起動のブラウザが古い JS/CSS を使い続ける
+///   事故の対策）。`/derivatives/`・`/photos/` は付けない（内容不変で重い）。
+/// - HTML には `X-Frame-Options: DENY` と `Content-Security-Policy: frame-ancestors 'none'`
+///   （無認証なので、透明な iframe に重ねて誘導クリックさせる攻撃を防ぐ）。
+///
+/// 判定は**デコード・正規化したあとのパス**（ページの読み替え後）で行う。Python は生のパスで見るため、
+/// `/static/admin%2Ehtml` のようにエンコードすると同じ HTML に `X-Frame-Options` が付かなかった。
+/// `.htm` も HTML として扱う（`Content-Type` が `text/html` になるため）。
+async fn security_headers(request: Request, next: Next) -> Response {
+    let method = request.method().clone();
+    let raw = request.uri().path().to_owned();
+    let mut response = next.run(request).await;
+
+    let normalized = webpath::normalize(&raw).map(|n| n.path);
+    let mut effective = normalized.clone().unwrap_or(raw);
+    if matches!(method, Method::GET | Method::HEAD)
+        && let Some(target) = normalized.as_deref().and_then(webpath::page_target)
+    {
+        effective = format!("/{target}");
+    }
+    let lower = effective.to_ascii_lowercase();
+    let is_html = effective == "/" || lower.ends_with(".html") || lower.ends_with(".htm");
+    let headers = response.headers_mut();
+    // ディレクトリ自体への要求（`/static`・`/vendor/`。403）にも付ける
+    let under_embedded = ["/static/", "/vendor/"]
+        .iter()
+        .any(|prefix| format!("{effective}/").starts_with(prefix));
+    if (is_html || under_embedded) && !headers.contains_key(header::CACHE_CONTROL) {
+        headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    }
+    if is_html {
+        headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY,
+            HeaderValue::from_static("frame-ancestors 'none'"),
+        );
+    }
+    response
+}
+
+/// まだ Rust 版に無い機能（管理画面のデータ API・AI・旅行ブログ・地図タイル）。T1.4 / P3 / P4 で
+/// 実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
+/// （「禁止」ではなく「まだ無い」と分かるように）。
+fn not_yet_implemented(label: &'static str) -> Response {
+    labeled(
+        error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "この機能は Rust 版ではまだ使えません",
+        ),
+        label,
+    )
+}
+
+/// `/healthz`・`/api/v1/photos` 以外の `GET`/`HEAD`（`POST` と未実装のメソッドは [`guard`] が返す）。
+/// 現行の `do_GET`/`do_HEAD` と同じ順に:
+///
+/// 1. `/tiles/`（地図タイル、P3）と、`GET` の `/api/admin/`・`/api/ai/`・`/api/blog/`（T1.4 以降）は 503。
+/// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML。
+/// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
+///    `/static/`・`/vendor/` は埋め込み、`/derivatives/`・`/photos/`・`/blog_exports/` はデータ置き場から。
+///
+/// `HEAD` も `GET` と同じ判定を通る（`HEAD /api/...` は静的のホワイトリストに当たらず 403。現行と同じ）。
+async fn site(State(state): State<AppState>, request: Request) -> Response {
+    let (parts, _body) = request.into_parts();
+    let method = &parts.method;
+    let raw = parts.uri.path();
+
+    if raw.starts_with("/tiles/") {
+        return not_yet_implemented("/tiles/{*path}");
+    }
+    if *method == Method::GET {
+        for (prefix, label) in [
+            ("/api/admin/", "/api/admin/{*path}"),
+            ("/api/ai/", "/api/ai/{*path}"),
+            ("/api/blog/", "/api/blog/{*path}"),
+        ] {
+            if raw.starts_with(prefix) {
+                return not_yet_implemented(label);
+            }
+        }
+    }
+    // 絶対形式の request-target（GET http://host/...）は現行でもホワイトリストに当たらず 403
+    let Some(normalized) = webpath::normalize(raw).filter(|_| parts.uri.scheme().is_none()) else {
+        return statics::forbidden();
+    };
+    let trailing_slash = normalized.trailing_slash;
+    if let Some(key) = webpath::page_target(&normalized.path) {
+        let label = match normalized.path.as_str() {
+            "/blog-admin" => "/blog-admin",
+            "/ai-search" => "/ai-search",
+            "/admin" => "/admin",
+            _ => "/",
+        };
+        return labeled(
+            statics::serve_embedded_key(key, false, method, &parts.headers),
+            label,
+        );
+    }
+    let Some(target) = webpath::classify(&normalized.path) else {
+        // ホワイトリストの内側のドット始まりなどは、ログにはテンプレートで出す
+        let response = statics::forbidden();
+        return match webpath::area_of(&normalized.path) {
+            Some(area) => labeled(response, area.route()),
+            None => response,
+        };
+    };
+    let response = match target.area {
+        webpath::Area::Static | webpath::Area::Vendor => {
+            statics::serve_embedded(&target, trailing_slash, method, &parts.headers)
+        }
+        webpath::Area::Favicon => statics::not_found(),
+        _ => {
+            statics::serve_data(
+                &state.data_root,
+                &target,
+                trailing_slash,
+                method,
+                &parts.headers,
+            )
+            .await
+        }
+    };
+    labeled(response, target.area.route())
 }
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(healthz))
-        .route("/api/v1/photos", get(api_photos))
-        // 既定のフォールバックには layer が掛からないので、明示して 404 もログに載せる
-        .fallback(not_found)
+        // `any`: メソッドの絞り込みは `guard`（GET/HEAD/POST 以外は 501、POST は 403）が済ませている。
+        // `get` にすると axum が 405 用の `Allow` を付ける
+        .route("/healthz", any(healthz))
+        // GET だけ。HEAD は axum が GET へ自動で回さないよう `site` を明示し、静的のホワイトリストに
+        // 当たらず 403（現行と同じ）
+        .route(
+            "/api/v1/photos",
+            on(MethodFilter::GET, api_photos)
+                .on(MethodFilter::HEAD, site)
+                .fallback(site),
+        )
+        // 既定のフォールバックには layer が掛からないので、明示して全ての応答をログに載せる
+        .fallback(site)
+        .layer(middleware::from_fn_with_state(state.clone(), guard))
+        .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn(access_log))
         .with_state(state)
 }
@@ -167,6 +377,10 @@ async fn shutdown_signal() {
 pub async fn serve(state: AppState) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
     tracing::info!("{} で待ち受けます", listener.local_addr()?);
+    tracing::info!(
+        "{}",
+        hostcheck::startup_note(state.config.listen.port(), &state.config.allowed_hosts)
+    );
     axum::serve(listener, router(state))
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -183,10 +397,7 @@ mod tests {
 
     fn state(catalog: Catalog) -> AppState {
         let config = Config::load(|_| None, &Overrides::default()).unwrap();
-        AppState {
-            config: Arc::new(config),
-            catalog,
-        }
+        AppState::new(Arc::new(config), catalog)
     }
 
     /// 127.0.0.1 の空きポートで router を起動し、(状態行, ヘッダ, 本文) を返す GET を用意する。
@@ -242,11 +453,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_paths_are_404() {
-        let dir = TempDir::new("health-404");
+    async fn unknown_paths_are_403_like_python() {
+        let dir = TempDir::new("health-403");
         let (path, _writer) = synthetic_catalog(dir.path(), 0);
         let addr = spawn(state(Catalog::open(&path).unwrap())).await;
+        // 現行の静的配信はホワイトリスト方式で、未知のパスは 404 ではなく 403
         let (status, _, _) = get(addr, "/nope").await;
-        assert!(status.starts_with("HTTP/1.1 404"), "{status}");
+        assert!(status.starts_with("HTTP/1.1 403"), "{status}");
     }
 }

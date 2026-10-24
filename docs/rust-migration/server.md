@@ -1,8 +1,8 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）を追記
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）を追記
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 1. 設定
@@ -24,7 +24,7 @@
 - **空文字の環境変数は未設定と同じ**に扱う。現行の`GEOFRAME_DATA_DIR`が`or`で空文字を未設定扱いにするのと同じで、`EnvironmentFile`に`KEY=`と書いた事故を避ける。
 - **不正な値は起動を断る**（終了コード2）。メッセージには環境変数の名前と理由だけを書き、値は書かない。`GEOFRAME_HOST`はIPアドレスだけ（現行Pythonはホスト名も通すが、本番は`0.0.0.0`か`127.0.0.1`）。
 - `--listen`を渡したときは`GEOFRAME_HOST`/`GEOFRAME_PORT`を**読まない**（不正でも問わない）。
-- `GEOFRAME_ALLOWED_HOSTS`の解釈は現行の`_parse_allowed_hosts`と同じ（小文字、末尾の`.`を除く、`name:port`・`[v6]:port`のポートを無視）。この集合を使うHost検査そのものはT1.3。
+- `GEOFRAME_ALLOWED_HOSTS`の解釈は現行の`_parse_allowed_hosts`と同じ（小文字、末尾の`.`を除く、`name:port`・`[v6]:port`のポートを無視）。この集合を使うHost検査は§9.2。
 - **`GEOFRAME_DATA_DIR`の既定が現行と違う**: Pythonは`app/var`（ソースの隣）だが、単一バイナリには`app/`が無いので`./var`にした。本番は常に`GEOFRAME_DATA_DIR=/var/lib/geoframe`をunitが与える。
 
 ### 1.2 `TZ`
@@ -154,7 +154,8 @@ unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分�
 
 - `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（合成した一時DBだけ。実データ・実在の位置は使わない）。
 - musl静的ビルド: `static-pie linked`、`ldd`は`statically linked`。追加した依存`tracing`・`tracing-subscriber`は純Rust（C依存なし）。
-- 合成DBでの手動確認: `serve`が`/healthz`に200、未知のパスに404を返し、SIGTERMで正常終了（終了コード0）。DBが無いときは終了コード1、`GEOFRAME_PORT`が不正なときは2。
+- 合成DBでの手動確認: `serve`が`/healthz`に200、未知のパスに404（T1.3以降は403。§9）を返し、SIGTERMで正常終了（終了コード0）。DBが無いときは終了コード1、`GEOFRAME_PORT`が不正なときは2。
+- T1.3: musl静的ビルドの`file`は`static-pie linked`、`ldd`は`statically linked`のまま。管理画面の静的ファイルの埋め込み後のサイズは[build.md §3](build.md)。
 
 ## 8. 写真フィード `GET /api/v1/photos`（T1.2）
 
@@ -190,9 +191,9 @@ unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分�
 - DBを読めない・順番待ち（`QUEUE_TIMEOUT`）が上限を超えたら**503**と`{"ok":false,"error":"写真一覧を読み取れません。しばらくしてから再試行してください"}`。SQLiteのエラー文字列・パスは本文に入れず、ログ（warn）にだけ出す。JSON化の失敗は500。
 - ログに写真の値（位置・ファイル名・タイトル）は出さない（§3）。リクエストログは`GET /api/v1/photos 200 12ms`の形。
 
-### 8.5 T1.3以降に残すもの
+### 8.5 横断の仕組み（T1.3 で入れた）
 
-axumのルーティングは、Pythonの`_norm_path`（末尾スラッシュの除去、URLデコード、`..`の解決など）、`HEAD`の扱い（Pythonは`/api/`の`HEAD`を403にする。axumの`get`は`HEAD`にも答える）、Host検査をまだ再現していない。`/api/v1/photos/`は404になる。これらは横断の仕組みなのでT1.3で入れる。
+パスの正規化（末尾スラッシュの除去、URLデコード、`..`の解決など）、`HEAD`の扱い（Pythonは`/api/`の`HEAD`を403にする。axumの`get`は`HEAD`にも答えてしまう）、Host検査は、T1.3で入れた（§9）。`/api/v1/photos/`は静的のホワイトリストに当たらず403になる（現行と同じ）。
 
 ### 8.6 テスト
 
@@ -201,3 +202,123 @@ axumのルーティングは、Pythonの`_norm_path`（末尾スラッシュの�
 - フィクスチャと同じ合成DBをRustで作り（`tools/gen_photo_feed_fixture.py`が書き出す`photo-feed-catalog.sql`を流す）、エンドポイントの出力がPythonの出力（`photo-feed-python.json`）と`serde_json::Value`として完全一致すること。
 - 除外条件、並び（時刻不明は最後）、旅番号の境界（ちょうど48時間、時刻不明を挟む場合）、タイトルの規則、`taken_at`のNULL、`lon`のNULL、ヘッダ、503（DB破損・順番待ちの超過）を個別に。
 - `photo_feed_miharashi.rs`の読み方をエンドポイントの実出力にも適用。
+
+## 9. 静的配信・Host検査・管理画面ページ（T1.3）
+
+実装は`webpath.rs`（URLパスの正規化とホワイトリスト。純関数）、`hostcheck.rs`（Host検査。純関数）、`statics.rs`（実体の解決と応答、Pythonと同じ形のエラーページ）、`embedded.rs`＋`build.rs`（埋め込み）、`server.rs`（ルートと検査）。現行Pythonの`handlers.py`（`_host_ok`・`_norm_path`・`_static_allowed`・`end_headers`・`do_GET`/`do_HEAD`/`do_POST`）を、同じリクエストを流して挙動を確かめながら移した。
+
+### 9.1 リクエストが通る順序
+
+外側から **ログ → ヘッダ付与 → 検査（`guard`）→ ルート** の順。検査はPythonの`do_*`の入口と同じ順序。
+
+1. `GET`/`HEAD`/`POST`以外は**501**。`OPTIONS`もここで、**CORSヘッダは一切返さない**（`Allow`も付けない）。クロスオリジンの`application/json`のプリフライトが必ず失敗する＝CSRF対策の一部（[inventory.md §1.2](inventory.md)）。Host検査より前に判定する（Pythonも同じ順）。
+2. **Host検査**（§9.2）。不許可は403。
+3. **`POST`は全部403**。更新系はP3で実装するまで、現行の「未知のPOST」と同じ403にする。
+4. ルート: `/healthz`、`GET /api/v1/photos`（§8）、それ以外は`site`（下記）。
+
+`site`（`GET`/`HEAD`）は、現行の`do_GET`/`do_HEAD`と同じ順に判定する。
+
+1. `/tiles/`（地図タイル、P3）と、`GET`の`/api/admin/`・`/api/ai/`・`/api/blog/`（管理画面のデータAPIはT1.4、残りはP3・P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。
+2. 管理画面のページ（§9.5）。
+3. 静的ファイル（§9.3）。許可は`/favicon.ico`と5つの接頭辞だけで、**それ以外はすべて403**（404ではない。`/nope`・`/api/nope`・`/api/v1/photos/`も403）。
+
+`HEAD`も`GET`と同じ判定を通る（ホワイトリストを通し、本文だけ省く。`Content-Length`は`GET`と同じ）。`HEAD /api/v1/photos`は現行どおり403（axumの`get`は`HEAD`を自動で受けてしまうので、明示して`site`へ回している）。`/healthz`は新設のルートなので`HEAD`にも200を返す。
+
+### 9.2 Host検査（DNSリバインディング対策）
+
+全ルート（`/healthz`・`/api/v1/photos`を含む）の前に適用する。規則は現行の`_host_ok`と同じ。
+
+- **ホスト部がIPリテラルなら無条件に許可**（IPv4、`[::1]`、ブラケットなしのIPv6、ゾーンID付き`fe80::1%en0`・`[fe80::1%25en0]`、`::ffff:192.0.2.7`）。先頭にゼロのある`010.0.0.1`や`999.1.1.1`、`1.2.3`はIPではなく「名前」として扱われ、許可リストに無いので403（Pythonの`ipaddress`も拒否する）。
+- **ホスト名**は`localhost`と`GEOFRAME_ALLOWED_HOSTS`だけ（小文字、末尾の`.`を除く）。
+- **ポート**は待ち受けポートの**文字列と一致**するか、省略（`localhost:`のような空も省略扱い）。`localhost:0{port}`・`:{port}`（ホスト名が空）は403。`--listen`で待ち受けを変えたときは、そのポートが基準になる。
+- **Hostヘッダが無い・空は許可**（HTTP/1.0の素の要求・curl・監視を壊さない。ブラウザは必ず送る）。ヘルスの確認を`curl http://127.0.0.1:{port}/healthz`で行えるのはこのため（IPリテラル宛も許可）。
+- 不許可は**403**。本文はPythonと同じHTMLのエラーページ（`Message: Forbidden host.`と、`GEOFRAME_ALLOWED_HOSTS`への案内。475バイトでPythonと一致）。ステータス行の理由句はhyperの標準（`Forbidden`）で、Pythonの`Forbidden host`にはならない。
+- 起動時に1行ログを出す: `Host 検査: 名前は localhost を含む N 件のみ許可、IP リテラルは全て許可、ポートは {port} か省略のみ …`。**差**: Pythonは許可する名前そのものと、この機体のIPを出すが、Rustは**件数だけ**（§3.2の方針。名前は運用者が環境ファイルで確かめられる）。機体のIPの検出もしない（IPリテラルは無条件に許可なので、判定に使わない）。
+- 拒否したときは`Host ヘッダが許可されていないため拒否しました…`の1行をwarnで出す。**Hostの値は出さない**（Pythonは出す）。理由の追跡は、起動ログの案内と状態コード403で足りる。
+
+### 9.3 静的配信
+
+#### 判定（`webpath.rs`）
+
+判定は必ず**デコードしたあとの正規化済みパス**で行う。手順はPythonの`_norm_path`と同じ: クエリ・フラグメントを落とす → 先頭の`//`を1つに（`http.server`の癖。`//admin`・`//derivatives/…`は200）→ `%XX`を戻す（壊れた`%`はそのまま、不正なUTF-8はU+FFFD）→ `posixpath.normpath`（`.`と`..`を解決、連続・末尾のスラッシュを落とす。ルートより上へは出られない）。
+
+- **ホワイトリスト**: `/favicon.ico`と接頭辞`/static/`・`/vendor/`・`/derivatives/`・`/photos/`・`/blog_exports/`の内側だけ。大文字小文字は区別する。ディレクトリ自体（`/derivatives`）は接頭辞に当たらず403。
+- **ドット始まり**: パスの**どの要素**がドットで始まっても403（`/derivatives/.dl_<drive_id>`＝Drive原本の一時ファイル、`/blog_exports/.<trip>-<temp>/`＝書き出しの作業領域）。**実在するかを見る前に**判定するので、無いファイルも同じ403で、存在の有無が応答から漏れない。`%2e`でエンコードしても同じ。名前の途中にドットを含むだけ（`a.b.jpg`）は通る。
+- **トラバーサル**: `..`・`%2e%2e`・`%2f`・二重スラッシュ・絶対パス・二重エンコード（`%252e`）は、正規化したあとにホワイトリストの内側へ残るか、外へ出て403になるかのどちらか。`/derivatives/sub/../a.jpg`のように内側に残るものは現行どおり200。デコード後に**ちょうど`//`で始まる**もの（`/%2fderivatives/…`）はホワイトリスト外で403（`normpath`が`//`だけは残す癖を移してある）。
+- **NULとバックスラッシュ**: デコード後に`\0`または`\`を含む要求は**403**。Pythonも`\0`は403。バックスラッシュは、Pythonは`/`に読み替えて判定したうえで実ファイルを探し404になる（リテラルな名前のファイルがあれば200）が、Rustは区切りの解釈を持たず最初から拒否する（`..\..\etc\passwd`のような形を一律に塞ぐ）。
+- 先頭が`/`でない要求（`GET derivatives/a.jpg`）や絶対形式（`GET http://host/…`）: hyperが先に400にするか、403にする。Pythonは前者を200で配った。実クライアントは送らない形。
+
+#### 実体の解決（`statics.rs`）
+
+`/static/`・`/vendor/`は埋め込み（§9.4）。`/derivatives/`・`/photos/`・`/blog_exports/`は`GEOFRAME_DATA_DIR`配下（`derivatives`・`photos`・`blog_exports`）から配る。
+
+1. **データ置き場は起動時に`canonicalize`**して`AppState.data_root`に持つ（T1.1レビューからの申し送り。Pythonは`resolve()`でデータ置き場のシンボリックリンクを辿る）。解決した先が元と違えば起動ログに出す。
+2. 要求ごとに、領域のディレクトリ（`<data_root>/<領域>`）と**要求されたファイルの両方をリンクを辿って解決**し、**ファイルの解決結果が領域のディレクトリの解決結果の内側**でなければ**403**（警告ログに領域のテンプレートだけ。ファイル名は出さない）。比べる先をデータ置き場全体ではなく**領域のディレクトリ**にしたのは、`derivatives/x.jpg -> ../catalog.db`のような「データ置き場の中だが領域の外」を指すリンクも塞ぐため。
+   - **差**: Pythonは外を指すリンクも辿って配信する（`derivatives/x -> /etc/passwd`が200）。本番に外を指すリンクは無い前提なので、互換への影響はない。`derivatives/`を`photos/`へのリンクで作るような構成はできない（P2で`photos/`と`derivatives/`の関係を決めるときに見直す）。
+   - 領域のディレクトリ自体がリンクなのは許す（別のディスクへ向ける運用の設定。Pythonも辿る）。その中のリンクは解決後の領域の内側でなければ403。
+   - 解決できない（無い・循環・権限）は404（Pythonは`open`の失敗を一律404にする）。
+3. 解決後のパスがディレクトリなら**403**（一覧は出さない。Pythonも403）。通常のファイル以外（FIFO・デバイス）は404（FIFOを開いて、読み手が来るまで固まらないように）。ファイルに末尾の`/`が付いた要求（`/derivatives/a.jpg/`・`…%2F`）は404（Pythonと同じ）。
+4. 解決後のパスを開き、**開いたハンドル**のサイズと更新時刻で`Content-Length`・`Last-Modified`を決め、64KiBずつ流す（大きな原本を丸ごとメモリに載せない）。
+5. `canonicalize`から`open`までの間にリンクを差し替えられる競合は塞いでいない。差し替えるにはデータ置き場への書き込み権限が要り、その権限があれば直接読める。`User=geoframe`（§6）で権限を分けていることが前提。
+
+#### 応答
+
+- `Content-Type`は拡張子の**固定の表**（`.jpg`→`image/jpeg`、`.png`、`.heic`、`.html`→`text/html`、`.css`、`.js`→`text/javascript`、`.woff2`→`font/woff2`、`.md`→`text/markdown`ほか。表に無いものは`application/octet-stream`）。Pythonと同じく、テキストにも`charset`は付けない。Pythonは機体の`/etc/mime.types`に左右されるが、Rustは固定。
+- `Last-Modified`（`httpdate`、秒未満は切り捨て）と`If-Modified-Since`→**304**。Pythonと同じ規則: 更新が日付以前なら304、読めない日付は無視、`If-None-Match`があれば日付は見ない（Rustは`ETag`を出さないので毎回200）。304は`Last-Modified`も付けず、本文なし。`HEAD`でも304。
+- `Range`は扱わない（Pythonも同じ。常に200で全体を返す）。`Accept-Ranges`も付けない。
+
+### 9.4 静的ファイルの埋め込み
+
+`app/static`・`app/vendor`（14ファイル、約936 KiB）を、`crates/geoframe/build.rs`が`include_bytes!`の表（`$OUT_DIR/embedded_files.rs`）にしてバイナリへ入れる。実行時に`app/`は読まない（plan.md §1）。`rust-embed`・`include_dir`などの外部crateは足さず、依存は増やしていない（`httpdate`・`futures-util`は`hyper`/`axum`が既に引いている純Rustのcrate）。
+
+- ディレクトリ配下の追加・削除・変更で再生成される（`cargo:rerun-if-changed`）。ドット始まりの名前は含めない（配信側でも403）。
+- パスは`app/`からの相対（`static/js/admin.js`）。ディレクトリ（`static/js`）は403、無ければ404。
+- **`Last-Modified`は出さず、内容のハッシュ（FNV-1a 64bit＋長さ）の`ETag`と`If-None-Match`→304で再検証させる**（`*`・カンマ区切り・`W/`に対応）。**差**: Pythonは`Last-Modified`。ファイルの時刻はチェックアウトやビルドの時刻で決まり、内容が変わったのに古い時刻で304になる（`handlers.py`のコメントにある、常時起動のブラウザが旧JSを使い続けた事故）おそれがあるため、時刻に依存しない方式にした。`If-Modified-Since`だけの再検証は常に200で全文を返す。
+- `Cache-Control: no-cache`と組み合わせるので、ブラウザは毎回再検証し、変わっていなければ304（本文なし）になる。
+- テストが、`app/static`・`app/vendor`の全ファイルを、リポジトリの実ファイルとバイト単位で比べる（`every_embedded_file_is_served_byte_for_byte`）。
+
+### 9.5 管理画面のページとヘッダ
+
+- ページ: 正規化後の**完全一致**だけを埋め込みのHTMLに読み替える（接頭辞一致にしない。`/admin/../.env`のようなパスを通さないため）。`/`・`/admin`（`/admin/`・`//admin`・`/admin?x=1`・`/%61dmin`も同じ）→`static/admin.html`、`/blog-admin`→`static/blog-admin.html`、`/ai-search`→`static/ai-search.html`。**`/blog`というルートは現行に無い**（403。旅行ブログの画面は`/blog-admin`）ので、そのまま移した。
+- `Cache-Control: no-cache`: HTML（`/`と`.html`）と、`/static/`・`/vendor/`配下（ディレクトリ自体への要求の403も含む）。キャッシュはするが毎回再検証させる。`/derivatives/`・`/photos/`・`/blog_exports/`の画像などには付けない。APIは`no-store`（`/api/v1/photos`・`/healthz`）。
+- HTMLには`X-Frame-Options: DENY`と`Content-Security-Policy: frame-ancestors 'none'`（透明なiframeに重ねて誘導クリックさせる攻撃への対策）。
+- ヘッダは403・404・304にも付く（Pythonの`end_headers`と同じ）。
+- **差**: 判定は**デコード・正規化したあとのパス**（ページの読み替え後）で行い、`.htm`もHTMLとして扱う。Pythonは生のパスの`endswith(".html")`で見るため、`/static/admin%2Ehtml`のようにエンコードすると、同じHTMLに`X-Frame-Options`も`no-cache`も付かなかった（クリックジャッキング対策の抜け）。
+
+### 9.6 ログ
+
+§3の方針のまま。アクセスログの**ルートのテンプレート**に、静的ファイルは`/derivatives/{*path}`・`/photos/{*path}`・`/blog_exports/{*path}`・`/static/{*path}`・`/vendor/{*path}`・`/favicon.ico`、ページは`/`・`/admin`・`/blog-admin`・`/ai-search`、未実装は`/tiles/{*path}`・`/api/admin/{*path}`など、を出す。**実際のパスは出さない**（derivativesのファイル名にはDrive IDが入る）。ホワイトリスト外・トラバーサルで領域の外へ出た要求は`(unmatched)`。ドット始まりなどホワイトリストの内側で拒否したものは、領域のテンプレートで出す。テストは`access_log.rs`。
+
+### 9.7 Pythonとの差（まとめ）
+
+意図した差:
+
+| 項目 | Python | Rust | 理由 |
+| --- | --- | --- | --- |
+| 領域の外を指すシンボリックリンク | 辿って200 | 解決後の領域の外なら403 | データ置き場の外・`catalog.db`が配信されないように（§9.3） |
+| 埋め込みファイルの再検証 | `Last-Modified`/`If-Modified-Since` | `ETag`/`If-None-Match` | 時刻に依存して古いJSが居座る事故を避ける（§9.4） |
+| バックスラッシュを含む要求 | 区切りに読み替えて判定、実ファイルは404 | 403 | 区切りの解釈を持たない |
+| HTMLヘッダ・`no-cache`の判定 | 生のパス | デコード・正規化後のパス、`.htm`も | `%2E`で付かなくなる抜けを塞ぐ（§9.5） |
+| 未実装のルート（`/tiles/`、GETの`/api/admin/`・`/api/ai/`・`/api/blog/`） | 応答する | 503と定型のJSON | T1.4・P3・P4で実装する |
+| `POST` | 既知のルートはContent-Type不一致でJSONの403、それ以外はHTMLの403 | 全部HTMLの403 | P3まで更新系が無い |
+| `/healthz` | 無い（403） | 200/503（Host検査あり） | 新設（§4） |
+| 起動ログ・拒否ログ | 許可する名前、機体のIP、拒否したHostの値を出す | 件数だけ。Hostの値は出さない | §3.2の方針 |
+| 通常のファイル以外（FIFOなど） | 開こうとする（読み手が来るまで固まりうる） | 404 | 固まらないように |
+| 領域をまたぐリンク（`derivatives/x -> ../photos/y`） | 辿って200 | 403 | 領域ごとに内側を確かめる |
+| Content-Typeの表 | 機体の`/etc/mime.types`に左右される | 固定の表 | 配備先で変わらないように |
+| 理由句 | `Forbidden host`、`File not found` | `Forbidden`、`Not Found`（hyper標準。本文の`Message:`行はPythonと同じ） | |
+| `Server`ヘッダ、HTTPのバージョン | `SimpleHTTP/0.6 Python/…`、HTTP/1.0 | 付けない、HTTP/1.1 | |
+| 304の`Content-Length` | 付かない | `0` | |
+| 先頭が`/`でない、絶対形式のtarget | 200/403 | 400/403 | hyperが先に判定する。実クライアントは送らない |
+
+そのまま同じもの: ホワイトリストの5つの接頭辞と`/favicon.ico`（実ファイルが無く404）、ドット始まりの403、ディレクトリの403（一覧なし）、ファイルに`/`を付けると404、`%2f`は区切り、`//`の扱い、Host検査の全規則、`HEAD`の判定、`OPTIONS`の501とCORSヘッダなし、`HEAD /api/...`の403、エラーページの本文（403は349バイト、404は335バイト）、`Cache-Control`/`X-Frame-Options`/CSPの付く条件、`Last-Modified`と`If-Modified-Since`の規則（データ置き場のファイル）。
+
+### 9.8 テスト
+
+合成データだけ（`TempDir`に作る）。実データ・実在の位置は使わない。
+
+- `webpath.rs`・`hostcheck.rs`・`statics.rs`の単体テスト: 正規化（Pythonの`normpath`の癖を含む）、ホワイトリストとドット、ページの読み替え、Hostの全規則（現行Pythonで確かめた表）、`Content-Type`、エラーページの本文、`If-Modified-Since`/`If-None-Match`。
+- `tests/static_files.rs`（結合）: 配信とヘッダ、`HEAD`、304、埋め込み全ファイルのバイト一致、ページ、ホワイトリスト、ドット、ディレクトリと404、トラバーサル（`..`・`%2e%2e`・`%2f`・バックスラッシュ・NUL・二重スラッシュ・絶対パス・二重エンコード・不正なUTF-8）、シンボリックリンク（外を指すファイル・外を指すディレクトリ・`catalog.db`を指す・領域の内側を指す・壊れた・循環・データ置き場自体がリンク・領域のディレクトリ自体がリンク）、FIFO、Host検査（許可と拒否の表を全ルートで）、`POST`/`OPTIONS`/未実装のメソッドとCORSヘッダなし、未実装ルートの503、大きなファイルの流し。
+- `tests/access_log.rs`: 引数付きのルートでも、ログに出るのは実際のパスではなくテンプレートであること（`secret-name`・Drive IDらしい値・Hostの値などが出ない）。
+- 手元で、現行Python（合成データ）と同じリクエスト131件を流して差分を確かめた（意図した差は§9.7の表のとおり）。
+

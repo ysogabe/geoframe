@@ -35,10 +35,14 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
 }
 
 async fn get(addr: std::net::SocketAddr, target: &str) -> String {
+    get_with_host(addr, target, "localhost").await
+}
+
+async fn get_with_host(addr: std::net::SocketAddr, target: &str, host: &str) -> String {
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(
-            format!("GET {target} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            format!("GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")
                 .as_bytes(),
         )
         .await
@@ -67,16 +71,26 @@ async fn access_log_has_only_method_route_status_and_time() {
     }
 
     let config = Config::load(|_| None, &Overrides::default()).unwrap();
-    let state = AppState {
-        config: Arc::new(config),
-        catalog: Catalog::open(&path).unwrap(),
-    };
+    let state = AppState::new(Arc::new(config), Catalog::open(&path).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router(state)).await });
 
     get(addr, "/healthz?lat=12.345678&lon=98.765432").await;
     get(addr, "/derivatives/IMG_secret-name.jpg?q=1AbCdEfDriveId").await;
+    // 引数付きのルート（静的ファイル）でも、ログに出るのは実際のパスではなくテンプレート。
+    // derivatives のファイル名には Drive ID が入る（T1.1 レビューからの申し送り）
+    get(addr, "/photos/IMG_other-secret.jpg").await;
+    get(addr, "/blog_exports/trip-secret/index.html").await;
+    get(addr, "/static/js/secret-script.js").await;
+    get(addr, "/vendor/secret-vendor.css").await;
+    get(addr, "/derivatives/.dl_1AbCdEfDriveId").await; // ドット始まり（403）
+    get(addr, "/derivatives/%2e%2e/secret-dir/x.jpg").await; // トラバーサル
+    get(addr, "/admin?token=abcSecretToken").await; // ページ
+    get(addr, "/nope-secret-path?q=x").await; // ホワイトリスト外
+    get(addr, "/api/admin/photos?q=secret-query").await; // 未実装の API
+    // Host が許可されない要求。拒否の理由は出るが、Host の値は出ない
+    get_with_host(addr, "/derivatives/a.jpg", "attacker.invalid:8080").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
@@ -84,7 +98,20 @@ async fn access_log_has_only_method_route_status_and_time() {
     let _ = std::fs::remove_dir_all(&dir);
 
     assert!(log.contains("GET /healthz 200"), "{log}");
-    assert!(log.contains("GET (unmatched) 404"), "{log}");
+    for expected in [
+        "GET /derivatives/{*path} 404",
+        "GET /derivatives/{*path} 403",
+        "GET /photos/{*path} 404",
+        "GET /blog_exports/{*path} 404",
+        "GET /static/{*path} 404",
+        "GET /vendor/{*path} 404",
+        "GET /admin 200",
+        "GET (unmatched) 403",
+        "GET /api/admin/{*path} 503",
+    ] {
+        assert!(log.contains(expected), "{expected} が無い:\n{log}");
+    }
+    assert!(log.contains("Host ヘッダが許可されていない"), "{log}");
     // 依存クレート（axum の「connection … accepted」など）のログは出ない
     assert!(!log.contains("accepted"), "{log}");
     for secret in [
@@ -94,6 +121,18 @@ async fn access_log_has_only_method_route_status_and_time() {
         "DriveId",
         "127.0.0.1",
         "localhost",
+        "other-secret",
+        "trip-secret",
+        "secret-script",
+        "secret-vendor",
+        "secret-dir",
+        "abcSecretToken",
+        "nope-secret",
+        "secret-query",
+        "attacker",
+        "a.jpg",
+        "x.jpg",
+        ".dl_",
     ] {
         assert!(!log.contains(secret), "ログに {secret} が出ている:\n{log}");
     }

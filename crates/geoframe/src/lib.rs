@@ -1,12 +1,16 @@
-//! GEOFRAME の Rust 実装。P1 では読み取り専用の API 基盤（設定・SQLite 読み取り層・ログ・ヘルス確認・写真一覧）を持つ。
+//! GEOFRAME の Rust 実装。P1 では読み取り専用の API 基盤（設定・SQLite 読み取り層・ログ・ヘルス確認・写真一覧・静的配信・Host 検査・管理画面のページ）を持つ。
 
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod embedded;
 pub mod feed;
+pub mod hostcheck;
 pub mod logging;
 pub mod photos;
 pub mod server;
+pub mod statics;
+pub mod webpath;
 
 #[cfg(test)]
 mod testutil {

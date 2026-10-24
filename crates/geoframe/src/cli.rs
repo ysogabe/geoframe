@@ -127,10 +127,14 @@ fn serve(overrides: &Overrides) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let state = AppState {
-        config: Arc::new(config),
-        catalog,
-    };
+    let state = AppState::new(Arc::new(config), catalog);
+    if state.data_root.as_path() != state.config.data_dir.as_path() {
+        // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する
+        tracing::info!(
+            "データ置き場はリンクを辿って {} に解決されました",
+            state.data_root.display()
+        );
+    }
     let result = runtime.block_on(crate::server::serve(state));
     // 固まった spawn_blocking（DB の読み取り）を待ち続けて、停止が終わらないことがないように
     runtime.shutdown_timeout(Duration::from_secs(5));

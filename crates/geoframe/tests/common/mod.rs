@@ -196,10 +196,7 @@ pub fn build_empty_catalog(dir: &Path, rows: &str) -> (PathBuf, rusqlite::Connec
 
 pub fn app_state(catalog: Catalog) -> AppState {
     let config = Config::load(|_| None, &Overrides::default()).unwrap();
-    AppState {
-        config: Arc::new(config),
-        catalog,
-    }
+    AppState::new(Arc::new(config), catalog)
 }
 
 /// 127.0.0.1 の空きポートで router を起動する。
@@ -253,6 +250,36 @@ pub async fn get(addr: std::net::SocketAddr, target: &str) -> Response {
         .expect("ヘッダの終わり");
     let head = std::str::from_utf8(&raw[..split]).unwrap();
     let (status_line, headers) = head.split_once("\r\n").unwrap();
+    Response {
+        status: status_line.split(' ').nth(1).unwrap().parse().unwrap(),
+        headers: headers.to_lowercase(),
+        body: raw[split + 4..].to_vec(),
+    }
+}
+
+/// 任意のメソッド・ヘッダでリクエストを送る。**Host は自動では付けない**（`headers` で指定する。
+/// 無い場合の挙動も確かめるため）。`target` は加工せずそのまま送る（`%2e%2e` や `//` を確かめるため）。
+pub async fn request(
+    addr: std::net::SocketAddr,
+    method: &str,
+    target: &str,
+    headers: &[(&str, &str)],
+) -> Response {
+    let mut head = format!("{method} {target} HTTP/1.1\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.unwrap();
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .expect("ヘッダの終わり");
+    let head = std::str::from_utf8(&raw[..split]).unwrap();
+    let (status_line, headers) = head.split_once("\r\n").unwrap_or((head, ""));
     Response {
         status: status_line.split(' ').nth(1).unwrap().parse().unwrap(),
         headers: headers.to_lowercase(),
