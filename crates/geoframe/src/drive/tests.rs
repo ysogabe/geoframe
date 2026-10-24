@@ -2956,27 +2956,37 @@ fn fetch_waits_for_a_rotation_in_progress_and_leaves_no_orphan() {
     e.index();
 
     let payload = json!({"id": id1, "delta": 90});
-    let (result, fetch_waited) = std::thread::scope(|scope| {
+    let (result, counts) = std::thread::scope(|scope| {
         let fetch = std::cell::RefCell::new(None);
-        let waited = std::cell::Cell::new(false);
         let result = crate::rotate::rotate_with_for_tests(
             payload.as_object().unwrap(),
             &e.writer,
             e.root(),
             &|| {
-                // 取得が始まる。原本は取れるが、derivative を作る前の排他で待たされる
-                *fetch.borrow_mut() = Some(scope.spawn(|| e.done(&e.fetch_stage())));
-                std::thread::sleep(Duration::from_millis(400));
-                waited.set(!fetch.borrow().as_ref().unwrap().is_finished());
-                // 同期サイクルが j1 の display を NULL にした（回転が読んだあと）
+                // 取得が始まる。候補（j2 だけ。j1 は display があるので入らない）を決めて原本を取り、
+                // derivative を作る前の排他で止まる。その状態になるまで待つ（実時間で推し量らない）
+                let handle = scope.spawn(|| e.done(&e.fetch_stage()));
+                let waiting = crate::imaging::lock_waiters::wait_until_waiting(
+                    handle.thread().id(),
+                    || handle.is_finished(),
+                    Duration::from_secs(60),
+                );
+                *fetch.borrow_mut() = Some(handle);
+                assert!(
+                    waiting,
+                    "取得は derivative を作る前に、回転が持つロックを待つ"
+                );
+                // 取得が待っているところで、同期サイクルが j1 の display を NULL にした（回転が読んだあと）
                 e.sql("UPDATE photos SET display=NULL WHERE drive_id='j1'");
             },
         );
-        let counts = fetch.borrow_mut().take().unwrap().join().unwrap();
-        assert_eq!(get(&counts, "fetched"), 1, "j2 が取れた");
-        (result, waited.get())
+        let counts = match fetch.borrow_mut().take() {
+            Some(handle) => handle.join().unwrap(),
+            None => panic!("取得が始まっていません"),
+        };
+        (result, counts)
     });
-    assert!(fetch_waited, "取得は回転が終わるまで derivative を作らない");
+    assert_eq!(get(&counts, "fetched"), 1, "j2 だけが取れた");
     assert_eq!(
         crate::rotate::tests::status(result),
         "409",

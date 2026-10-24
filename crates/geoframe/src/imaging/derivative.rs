@@ -625,8 +625,65 @@ pub fn rotate_jpeg(bytes: &[u8], delta: i32) -> Result<Rendered, ImageError> {
 /// writer の依頼はこのロックを取らない（デッドロックしない）。
 pub fn lock_derivatives() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(test)]
+    let _waiting = lock_waiters::Registered::new();
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// 試験用: [`lock_derivatives`] の中でロックを待っているスレッドの記録。他のスレッドがロックを持っている間に
+/// 「このスレッドはもうロックの前まで来て、待っている」ことを、実時間を待たずに確かめる。
+#[cfg(test)]
+pub(crate) mod lock_waiters {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
+
+    static WAITING: Mutex<Option<HashSet<ThreadId>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashSet<ThreadId>) -> R) -> R {
+        let mut guard = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashSet::new))
+    }
+
+    /// 生きている間、呼んだスレッドを「待っている」に入れる（ロックを取れたら外れる）。
+    pub(super) struct Registered(ThreadId);
+
+    impl Registered {
+        pub(super) fn new() -> Self {
+            let id = std::thread::current().id();
+            with(|set| set.insert(id));
+            Self(id)
+        }
+    }
+
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            with(|set| set.remove(&self.0));
+        }
+    }
+
+    /// `thread` が [`super::lock_derivatives`] でロックを待つ状態になるまで待つ。`gave_up()` が真になった
+    /// （そのスレッドが待たずに終わった）か `limit` を過ぎたら false。**待つのは来るはずの出来事だけ**で、
+    /// 来ないことを時間で推し量りはしない（`limit` は止まったときに試験を終わらせるための上限）。
+    pub(crate) fn wait_until_waiting(
+        thread: ThreadId,
+        gave_up: impl Fn() -> bool,
+        limit: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if with(|set| set.contains(&thread)) {
+                return true;
+            }
+            if gave_up() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
 }
 
 /// 種類を決められなかったバイト列の失敗: BigTIFF は専用のエラー、それ以外は画像でない。

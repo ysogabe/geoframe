@@ -16,6 +16,8 @@
 //! | [`decode_luma`] | `ImageOps.exif_transpose(..).convert("L")` | 品質解析（T2.6）の入力: 向きを当てたグレー |
 
 mod derivative;
+#[cfg(test)]
+pub(crate) use derivative::lock_waiters;
 mod error;
 pub mod exif;
 pub mod heic;
