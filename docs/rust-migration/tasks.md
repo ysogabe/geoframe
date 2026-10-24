@@ -1,7 +1,7 @@
 # Rust単一バイナリ化 タスク
 
 - 要求: [Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 設計: [設計案](../architecture/rust-api-and-ai-providers-proposal.md) / 計画: [plan.md](plan.md)
-- ブランチ: ローカルはT3の`t3/issue-54-implementation-plan`のまま、リモートはフェーズごとに分ける（P0は同名で PR #57、P1は`feat/rust-migration-p1`で PR #58、どちらも squash merge 済み。P2は`feat/rust-migration-p2`でPRを出す）
+- ブランチ: ローカルはT3の`t3/issue-54-implementation-plan`のまま、リモートはフェーズごとに分ける（P0は同名で PR #57、P1は`feat/rust-migration-p1`で PR #58、どちらも squash merge 済み。P2は`feat/rust-migration-p2`で PR #59、いずれも squash merge 済み。P3は`feat/rust-migration-p3`でPRを出す）
 - PRはフェーズごとに1つ。P2以降のタスクは、そのフェーズの開始時に細かく分け直す。
 - 種類: `ops`は自分で行う運用作業、`quick`/`full`はビルドのスキルに任せる実装。
 
@@ -29,7 +29,7 @@ AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ�
 | T1.5 | systemd unit、検証環境への配布スクリプト、Pythonとの全件比較スクリプト、miharashiの実プロセスでの取得確認 | AC1, AC5, AC6 | T1.2, T1.3 | full | 完了 | 56e0665 | 355ba86..2a0c7e5 | 検証環境で常駐（geoframe-rs.service）。全件比較の想定外の差0（写真一覧3,065件を型まで一致、画像3,065件バイト一致、管理API 222通り）。miharashiの実バイナリ（png --renderer cpu 60/60）とFeedで取得・デコード失敗0。障害試験・ロールバック・誤配布の拒否を確認。レビュー（Sol）4回: 必須 4→3→1→0（配布スクリプトの失敗時の復元、比較の判定の厳密化、本番への誤配布の防止）、修正3回 |
 | T1.6 | P1全体レビューの推奨の反映: 書き込み層の担当フェーズ（P2で取り込み用writer、P3で更新API）の統一、Pythonとの差の索引、miharashi確認ツールの判定 | AC1, AC6 | T1.1〜T1.5 | quick | 完了 | 3d29b2e | e745ed3..22903d3 | P1全体レビュー（要求との突き合わせ、Sol）: 必須0・推奨3。security-review: High/Medium 0、参考1（ツールの.gitignore）は3d29b2eで対応。レビュー（Opus）: 必須0、推奨2（確認ツールは`Feed::spawn`の経路で`photo:`を出さないので数える仕組みを外しRetryingで判定、`lon` NULLの行は本番コピーで差0）・参考4を反映。直したツールで検証環境の定常200枚・停止再開300枚とも終了コード0（管理者確認） |
 
-## P2: 写真取り込み
+## P2: 写真取り込み（PR #59、2026-10-25 マージ）
 
 開始時の調査（件数のみ）: 本番コピーの`photos`は全6,535行が`source='drive'`で、ローカルの`photos/`は空。HEICは1,735行（すべてDrive）。国外（日本のおおよその矩形の外）で位置のある1,267行は`place`がすべて空で、オフライン逆ジオコーダは本番に入っていない（Rustも入れず「空で確定」にする）。
 
@@ -53,10 +53,33 @@ P2で守ること（各タスクの委任文に入れる）:
 | T2.7 | 検証環境での受入: 本番コピーでの`--dry-run`（変更ほぼ0）と実サイクル、同じ写真を比較用PythonとRustへ入れて`photos`の列ごとの比較、棚卸しS1・S2・S3・S7、miharashiでの表示の継続、結果を`p2-acceptance.md`へ | AC1, AC2, AC5 | T2.3〜T2.6 | full | 完了 | 823f237 | 35d677d..67360d4 | [p2-acceptance.md](p2-acceptance.md)。本番コピーのdry-runは全段0、実サイクル2回で`.dump`不変。合成21枚で比較用Pythonと`photos`全26列・`photo_quality`567行・配信件数が一致。S1・S3・S7通過、miharashi定常200・停止再開300とも終了コード0、全件比較の想定外の差0。本物のDriveでの確認（S2・§14.11）は鍵待ち。T2.5のテスト補強も実施 |
 | T2.8 | P2全体レビューの推奨の反映: dry-runの対象を検証環境に統一（本番DBに向けない）、受入の「全段0」の限定、本物のDrive確認をP5の関門に、一次データが消える経路のP3への引き継ぎ、ICCの説明、unitに`Conflicts=geoframe-server.service`、文書のユーザー名 | AC1, AC2, AC7 | T2.1〜T2.7 | quick | 完了 | 0d2750c | 15c306b | P2全体レビュー（要求との突き合わせ、Sol）: 必須1・推奨2・参考1。security-review（Opus）: High/Medium 0、Low 2（Python停止の確認が起動時だけ、文書のユーザー名） |
 
-## P3〜P5（開始時に分け直す）
+## P3: 管理機能
+
+開始時の整理: 管理画面・AI写真検索・旅行ブログの画面（`app/static/`）はP1でバイナリに埋め込み済みで、読み取りAPI（E1〜E3）もP1で済んでいる。P3で足すのは、外部通信のあるGET（E4 地名検索、E11 地図タイル）、旅行ブログの読み取り（E7〜E10）、更新API（E12〜E16）と、その横断の仕組み（CSRF対策・エラー応答）。AI写真検索の画面のうちP3で動くのはE13（お気に入り・除外）だけで、検索そのもの（E5・E6）はP4。番号は[inventory.md §1.1](inventory.md)。
+
+P3で守ること（各タスクの委任文に入れる）:
+- 更新APIはP2のwriter（単一接続・専用スレッド）だけを通して書く。writerが動いていない（`GEOFRAME_INGEST=0`、またはガードで断られた）ときは、更新APIは書かずに定型文の503を返す。P2〜P4のガード（[server.md §11.1.1](server.md)）を弱めない。
+- 同期サイクルの段と更新APIが同時に動いても、利用者の変更（手動の位置・お気に入り・除外・回転）が失われないこと。段が計画を読んでから書くまでの間に更新APIが割り込む場合を試験で確かめる。
+- CSRF対策とエラー応答は今のPythonと同じ順序・同じ状態コード（[inventory.md §1.2](inventory.md)）。CORSヘッダを返さず、`OPTIONS`は501。未知のPOSTパスは403、`/api/blog/`配下の未知パスだけ404。500の本文に例外文字列を出さない。
+- 外部への通信（地理院・Nominatim・地図タイル）はテストではスタブ。実際の通信は検証環境の受入だけ。User-Agent（`GEOFRAME_TILE_UA`）・流量の上限・同時数は今と同じ。
+- ログに写真のファイル名・座標・地名・検索語・旅程の中身を出さない（[inventory.md §6.3](inventory.md)）。旅行ブログの候補（E9）は粗い地名だけを返し、正確な位置を返さない。
+- Pythonと同じ要求を比較用Python（検証環境の`:8090`）にも送り、応答とDB・ファイルの変化を比べる（P1・P2と同じ全件比較の考え方）。
+- 一次データが消える・変わる経路（[inventory.md §2.3](inventory.md)の①〜⑤）は、T3.7でユーザーの決めた方針に合わせる。それまでのタスクはPythonと同じ挙動のまま。
+
+| ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
+|---|---|---|---|---|---|---|---|---|
+| T3.1 | 更新APIの土台と簡単な更新: POSTのルーティング、CSRF対策（Content-Type・Origin・Content-Length・64KiB超は本文を読まず413で接続を閉じる・JSON・オブジェクトのみ）、エラー応答の対応、writerをサーバーと共有する形（無ければ503）、E12 手動の位置（地名列などのNULL化）とE13 お気に入り・除外。同期サイクルとの競合の試験 | AC1, AC7 | P2 | full | 未着手 | | | 棚卸しS4（更新側）・S5 |
+| T3.2 | E14 回転: Drive由来でderivativeがある写真だけ、回したderivativeを別名（`.r90`など）で作る→`display`/`rotation`を更新→旧ファイルを消す。`.part`の作り方はP2と同じ。取得（`fetch_derivatives`）・品質の解析との競合 | AC1 | T3.1 | full | 未着手 | | | 棚卸しS6 |
+| T3.3 | E4 地名検索: 地理院→0件のときだけNominatim（全体で1秒1件）、2文字未満は空、失敗は空配列、`.cache.json`のメモリキャッシュ | AC1, AC7 | T3.1 | full | 未着手 | | | |
+| T3.4 | E11 地図タイルのプロキシとB4 キャッシュの掃除: パスの検査、OSM/GSIの最大ズームと同時数、上流取得は毎分240枚まで、失敗・流量超過は透明PNG、`X-Tile-Cache`とCache-Control、`tile_cache/`の上限（`GEOFRAME_TILE_CACHE_MAX_MB`）で古い順に90%まで縮める | AC1, AC7 | T3.1 | full | 未着手 | | | |
+| T3.5 | 旅行ブログの読み取り E7〜E10: 旅程JSONの置き場所（設定）、`trip_id`の検査、日ごとの候補（`hidden`除外・粗い地名のみ）、保存済みの下書きか生成した初期案 | AC1, AC7 | T3.1 | full | 未着手 | | | |
+| T3.6 | 旅行ブログの保存と書き出し E15・E16: 本文の検査（章・画像数・文字列の上限）、下書きは一時ファイル→置き換え、書き出しは作業領域→`.previous`経由の置き換え、画像は1800pxで再エンコードしEXIF・GPSを落とす、実行中は409、`dry_run`。unitの`ReadOnlyPaths`から`travel_blog`・`blog_exports`を外す | AC1, AC7 | T3.5 | full | 未着手 | | | 棚卸しS10 |
+| T3.7 | 一次データが消える・変わる経路①〜⑤への対応（ユーザーが決めた方針で） | AC1 | T3.1〜T3.6 | full | 未着手 | | | 方針はユーザーに確認中 |
+| T3.8 | 検証環境での受入: 管理画面・AI写真検索（E13）・旅行ブログの全操作を行い、変更がDB・ファイルに残ること。比較用Pythonと同じ要求で応答と変化を比べる。棚卸しS4〜S6・S10、miharashiの表示の継続、結果を`p3-acceptance.md`へ | AC1, AC2 | T3.1〜T3.7 | full | 未着手 | | | |
+
+## P4〜P5（開始時に分け直す）
 
 | ID | 内容 | AC | 種類 | 状態 |
 |---|---|---|---|---|
-| P3 | 管理機能（手動GPS・お気に入り・除外・回転・地名検索・タイル・旅行ブログ・更新APIのCSRF対策） | AC1, AC2 | full | 未着手 |
 | P4 | AI Provider・永続ジョブ・Embeddingインデックス・位置候補・同一場面・AI検索 | AC2, AC3, AC4, AC7 | full | 未着手 |
 | P5 | バックアップ・復元演習、シャドー比較、本番切替、ロールバック演習、Python依存の撤去 | AC1, AC2, AC5 | full | 未着手 |
