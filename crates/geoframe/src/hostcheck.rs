@@ -16,9 +16,11 @@
 use std::collections::BTreeSet;
 use std::net::IpAddr;
 
+use crate::csrf::py_strip;
+
 /// Host ヘッダを (ホスト部, ポート部) に分ける。ポート未指定なら空文字。
 pub fn split_host_port(raw: &str) -> (&str, &str) {
-    let h = raw.trim();
+    let h = py_strip(raw);
     if let Some(rest) = h.strip_prefix('[') {
         // IPv6 リテラル: [::1] / [::1]:8080。`]` が無ければ全体をホスト部とみなす（Python と同じ）
         return match rest.split_once(']') {
@@ -36,7 +38,7 @@ pub fn split_host_port(raw: &str) -> (&str, &str) {
 
 /// Host ヘッダ（無ければ `None`）が許可されるか。`port` は待ち受けポート。
 pub fn host_allowed(raw: Option<&str>, port: u16, names: &BTreeSet<String>) -> bool {
-    let Some(raw) = raw.filter(|r| !r.trim().is_empty()) else {
+    let Some(raw) = raw.filter(|r| !py_strip(r).is_empty()) else {
         return true;
     };
     let (host, host_port) = split_host_port(raw);

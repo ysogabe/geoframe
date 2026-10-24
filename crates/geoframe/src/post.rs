@@ -7,7 +7,10 @@
 //! 2. ルートが無ければ 403（[`route_of`]。`/api/blog/` 配下も含め、未知の POST は一律 403＝現行の
 //!    `send_error(403)`。`GET` の未知の `/api/blog/…` だけが 404 で、POST は違う）。
 //! 3. `Content-Type: application/json` 必須（違えば 403）。
-//! 4. `Origin` があれば `Host` と同じ（違えば 403。無い・空なら通す）。
+//! 4. `Origin` があれば `Host` と同じ（違えば 403。無い・空なら通す）。3・4 の値は現行と同じく**生バイトを
+//!    Latin-1 として**読む（[`crate::csrf`]）。現行が例外にする `Origin`（角括弧の中が IPv6 でない等）は、現行は
+//!    応答を返さず接続を閉じるが、Rust は 403。`Origin` の末尾の空白は hyper が取り除くので、生のバイト列から
+//!    付けた印（[`crate::rawhead`]）で補う。
 //! 5. `Content-Length` 必須（無い・数でなければ 400）。
 //! 6. 上限 [`MAX_POST_BYTES`] 超は**本文を読まずに** 413 を返して接続を閉じる。
 //! 7. JSON として解釈できなければ 400、オブジェクトでなければ 400。
@@ -43,7 +46,7 @@ use axum::response::Response;
 use serde_json::{Map, Value};
 
 use crate::server::{AppState, error_response, json_response};
-use crate::{update, webpath};
+use crate::{csrf, update, webpath};
 
 /// 本文の上限（現行の `MAX_POST_BYTES`）。
 pub const MAX_POST_BYTES: u64 = 64 * 1024;
@@ -137,66 +140,42 @@ impl ApiError {
     }
 }
 
-/// ヘッダの最初の値（現行の `self.headers.get`）。UTF-8 でなければ置き換え文字にする。
-fn first_header(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
-    headers
-        .get(name)
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+/// ヘッダの最初の値の生バイト（現行の `self.headers.get`）。現行は Latin-1 の `str` として読むので、
+/// 文字にせず**バイトのまま**判定に渡す（[`crate::csrf`]）。
+fn first_header(headers: &HeaderMap, name: header::HeaderName) -> Option<&[u8]> {
+    headers.get(name).map(HeaderValue::as_bytes)
 }
 
-/// Python の `urllib.parse.urlparse(url).netloc`。`//` で始まる部分の、次の `/`・`?`・`#` までの文字列。
-/// `scheme:` の前置きは、Python と同じ規則（先頭が英字で、`:` までが英数字と `+-.`）で読み飛ばす。
-/// 先頭の制御文字・空白と、タブ・改行は Python が取り除く。角括弧が合わない（Python は `ValueError`）ときは
-/// `None`（拒否する）。
-fn netloc(url: &str) -> Option<String> {
-    let url = url.trim_start_matches(|c: char| c <= ' ');
-    let url: String = url
-        .chars()
-        .filter(|c| !matches!(c, '\t' | '\r' | '\n'))
-        .collect();
-    let mut rest = url.as_str();
-    if let Some(i) = rest.find(':')
-        && i > 0
-        && rest.starts_with(|c: char| c.is_ascii_alphabetic())
-        && rest[..i]
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    {
-        rest = &rest[i + 1..];
+/// 現行の `_csrf_ok` の判定（[`csrf::verdict`]）を、リクエストのヘッダに掛ける。
+///
+/// `origin_trailing_space`: この接続で、末尾に空白文字がある `Origin` の行を受け取ったか
+/// （[`crate::rawhead`]）。現行は値の末尾の空白を残し、hyper は取り除く。印があれば、`Origin` に空白を 1 つ
+/// 足して現行と同じに判定する。差分試験（tests/csrf_python.rs）がこの関数を直接呼ぶ。
+pub fn csrf_verdict(headers: &HeaderMap, origin_trailing_space: bool) -> csrf::Verdict {
+    let mut origin = first_header(headers, header::ORIGIN).map(<[u8]>::to_vec);
+    if origin_trailing_space && let Some(origin) = origin.as_mut().filter(|o| !o.is_empty()) {
+        origin.push(b' ');
     }
-    let Some(after) = rest.strip_prefix("//") else {
-        return Some(String::new());
-    };
-    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
-    let netloc = &after[..end];
-    if netloc.contains('[') != netloc.contains(']') {
-        return None;
-    }
-    Some(netloc.to_owned())
+    csrf::verdict(
+        first_header(headers, header::CONTENT_TYPE),
+        origin.as_deref(),
+        first_header(headers, header::HOST),
+    )
 }
 
 /// 現行の `_csrf_ok`。通らなければそのまま返す応答（403）。
-fn csrf_check(headers: &HeaderMap) -> Result<(), Box<Response>> {
-    let content_type = first_header(headers, header::CONTENT_TYPE).unwrap_or_default();
-    let content_type = content_type.split(';').next().unwrap_or("").trim();
-    if !content_type.eq_ignore_ascii_case("application/json") {
-        return Err(Box::new(error_response(
+fn csrf_check(headers: &HeaderMap, origin_trailing_space: bool) -> Result<(), Box<Response>> {
+    match csrf_verdict(headers, origin_trailing_space) {
+        csrf::Verdict::Allowed => Ok(()),
+        csrf::Verdict::ContentType => Err(Box::new(error_response(
             StatusCode::FORBIDDEN,
             "Content-Type: application/json が必要です",
-        )));
+        ))),
+        csrf::Verdict::CrossOrigin => Err(Box::new(error_response(
+            StatusCode::FORBIDDEN,
+            "クロスオリジンは拒否されます",
+        ))),
     }
-    if let Some(origin) = first_header(headers, header::ORIGIN)
-        && !origin.is_empty()
-    {
-        let host = first_header(headers, header::HOST).unwrap_or_default();
-        if netloc(&origin).as_deref() != Some(host.trim()) {
-            return Err(Box::new(error_response(
-                StatusCode::FORBIDDEN,
-                "クロスオリジンは拒否されます",
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// Python の `int()` が文字列を数に直すときの桁数の上限（`sys.int_info.default_max_str_digits`。3.11 以降
@@ -210,7 +189,7 @@ const PYTHON_INT_MAX_DIGITS: usize = 4300;
 /// 400 にしないと、Python が断る入力を Rust が書いてしまうので、ここで同じ上限を適用する。
 fn content_length(headers: &HeaderMap) -> Option<u64> {
     let value = first_header(headers, header::CONTENT_LENGTH)?;
-    let value = value.trim();
+    let value = std::str::from_utf8(value).ok()?.trim();
     if value.len() > PYTHON_INT_MAX_DIGITS {
         return None;
     }
@@ -257,8 +236,8 @@ pub fn head_limits(uri: &Uri, headers: &HeaderMap) -> Option<Response> {
 }
 
 /// 本文を読む前の検査（Content-Type・Origin・Content-Length・サイズ）。通れば本文の長さ。
-fn pre_body_check(headers: &HeaderMap) -> Result<u64, Box<Response>> {
-    csrf_check(headers)?;
+fn pre_body_check(headers: &HeaderMap, origin_trailing_space: bool) -> Result<u64, Box<Response>> {
+    csrf_check(headers, origin_trailing_space)?;
     let Some(length) = content_length(headers) else {
         return Err(Box::new(error_response(
             StatusCode::BAD_REQUEST,
@@ -280,8 +259,14 @@ fn pre_body_check(headers: &HeaderMap) -> Result<u64, Box<Response>> {
 }
 
 /// `POST` を処理する。`route` は [`route_of`] が選んだもの（入口の検査で、ルートが無い POST は 403 済み）。
-pub async fn handle(state: &AppState, route: Route, headers: &HeaderMap, body: Body) -> Response {
-    let length = match pre_body_check(headers) {
+pub async fn handle(
+    state: &AppState,
+    route: Route,
+    headers: &HeaderMap,
+    origin_trailing_space: bool,
+    body: Body,
+) -> Response {
+    let length = match pre_body_check(headers, origin_trailing_space) {
         Ok(length) => length,
         Err(response) => return *response,
     };
@@ -350,14 +335,17 @@ mod tests {
     #[test]
     fn too_many_digits_is_400_even_when_the_value_is_over_the_limit() {
         let over = format!("{}{}", "0".repeat(4301 - 5), MAX_POST_BYTES + 1);
-        let response = *pre_body_check(&{
-            let mut h = with_length(&over);
-            h.insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/json"),
-            );
-            h
-        })
+        let response = *pre_body_check(
+            &{
+                let mut h = with_length(&over);
+                h.insert(
+                    header::CONTENT_TYPE,
+                    HeaderValue::from_static("application/json"),
+                );
+                h
+            },
+            false,
+        )
         .unwrap_err();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }

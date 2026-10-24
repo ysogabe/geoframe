@@ -21,6 +21,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::{Instant, Sleep, sleep, sleep_until};
 
+use crate::rawhead::{ConnHints, OriginTrailingSpace};
+
 /// データ置き場のファイルを同時に配る上限。1件ごとにファイル記述子を1つ握るので、
 /// 接続数の上限と合わせて記述子の予算（server.md §6）に収める。
 pub const STATIC_FILE_SLOTS: usize = 32;
@@ -108,6 +110,9 @@ pub struct LimitedIo<T> {
     read_timer: Option<Pin<Box<Sleep>>>,
     /// 最後に読み取り・書き込みのどちらかが進んだ（`Ready` を返した）時刻。無通信の期限の起点。
     last_progress: Instant,
+    /// 届いたバイト列から取る、接続ごとの印（`Origin` の末尾の空白。[`crate::rawhead`]）。
+    scanner: OriginTrailingSpace,
+    hints: ConnHints,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -120,8 +125,15 @@ impl<T> LimitedIo<T> {
             write_timer: None,
             read_timer: None,
             last_progress: Instant::now(),
+            scanner: OriginTrailingSpace::default(),
+            hints: ConnHints::default(),
             _permit: permit,
         }
+    }
+
+    /// この接続の印。要求の `extensions` に `ConnectInfo` として載る（[`crate::rawhead::ConnHints`]）。
+    pub fn hints(&self) -> ConnHints {
+        self.hints.clone()
     }
 }
 
@@ -149,6 +161,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for LimitedIo<T> {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
+        let before = buf.filled().len();
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Pending => {
                 let idle = this.idle_timeout;
@@ -171,6 +184,10 @@ impl<T: AsyncRead + Unpin> AsyncRead for LimitedIo<T> {
             ready => {
                 this.read_timer = None;
                 this.last_progress = Instant::now();
+                // hyper が値の両端を取り除く前の生のバイト列を見る（hyper には見えない情報）
+                if this.scanner.feed(&buf.filled()[before..]) {
+                    this.hints.mark_origin_trailing_space();
+                }
                 ready
             }
         }
