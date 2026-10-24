@@ -27,9 +27,9 @@ P1・P2（T2.1・T2.2）でPythonと意図して違える点・既知の差の�
 | 同期サイクルの段の失敗は、段の名前と失敗の種類だけをログに出す（Pythonは例外文字列をそのまま出す）。段のパニックも隔離する（Pythonは`except Exception`） | ログに位置・ファイル名を出さない方針（inventory.md §6.3） | 常時 | 単体テスト（`sync.rs`） | なし（決定） | [§11.3](#113-同期サイクルの骨組み) |
 | `.cache.json`のキーをRustは辞書順に書く（Pythonは挿入順）。停止時にも最後の保存をする（同期サイクルのスレッドが止まったあとに1回。保存スレッドが止まりきらず保存の最中なら、期限付きで待ち、順番が来なければ書かずに省略して警告する）。`.dl_*`は通常ファイルだけを消す | `serde_json`の`preserve_order`を入れると他のJSON応答の並びが変わる | `.cache.json`をRustが保存したとき（読むときの並びは問わない） | 単体テスト（Pythonの`json.dumps(indent=1, ensure_ascii=False)`と同じ形） | なし（決定） | [§11.5](#115-cachejson) |
 
-| **画像処理（T2.2）**: ICCをsRGBへ変換して付けない（Pythonは捨てるだけ）。デコーダ・縮小フィルタ・エンコーダが違うので、画素はPythonと一致しない（寸法・向き・回転・EXIFを残さないことは一致）。16ビットのグレーPNGは8ビットへ正しく縮める（Pillowは`I;16`のRGB変換で飽和する）。HEICは常に取り込む（Pythonは`pillow_heif`があるときだけ。本番は入っている） | 広色域の写真が薄く見える問題を直す（plan.md P0で決定）。純Rustの部品の選択（image-poc.md） | ICC付きの写真、画素の比較 | 合成画像のテスト、検証環境でPythonとの寸法・画質の比較（[§12.9](#129-検証環境での確認2026-10-24)） | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
-| **EXIFの読み取り（T2.2）**: 壊れたGPS（成分が3つ未満・型が違う・分母0）の写真は**位置なしで索引する**（Pythonは例外で写真ごと索引しない、または分母0でNaNを保存する）。時刻の数字はASCIIに直す | 位置が読めないだけで写真を落とさない。`taken_at`の形式を守る | 壊れたGPSのEXIF | `tests/exif_python.rs`が基準（`tools/gen_exif_fixture.py`）と突き合わせる | なし（決定） | [§12.3](#123-exif撮影時刻gps向き) |
-| **入力の限界（T2.2）**: 1ファイル512 MiBまで（まるごとメモリに読む。Pythonは上限なし）。**EOI（画像データの終わりのマーカー）の無いJPEGは失敗にする**（Pillowは読む。切れたファイルと見分けられないため。§12.8）。手動回転は0・90・180・270だけ（管理画面もその値しか作らない）。`.part`は書き込みに失敗・パニックしても残さない（Pythonは失敗すると残しうる）。出力の`.part`は`fsync`してから`rename`する | メモリの上限、電源断で空のderivativeを残さない | 巨大なファイル、書き込みの失敗 | 単体テスト | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
+| **画像処理（T2.2）**: ICCをsRGBへ変換して付けない（Pythonは捨てるだけ）。デコーダ・縮小フィルタ・エンコーダが違うので、画素はPythonと一致しない（寸法・向き・回転・EXIFを残さないことは一致）。16ビットのグレーPNGは8ビットへ正しく縮める（Pillowは`I;16`のRGB変換で飽和する）。HEICは常に取り込む（Pythonは`pillow_heif`があるときだけ。本番は入っている）。向きはEXIFのOrientationのタグが無いときだけXMPの`tiff:Orientation`を使う（Pillowの`getexif`と同じ。**圧縮したXMP（`zTXt`・圧縮した`iTXt`）とHEICのXMPは読まない**。HEICはpillow-heifが開くときにXMPの向きを取り除くので、Pillowも当てない）。**BigTIFFは非対応**（`ImageError::BigTiff`。Pythonは開ける。本番のTIFFは0件） | 広色域の写真が薄く見える問題を直す（plan.md P0で決定）。純Rustの部品の選択（image-poc.md） | ICC付きの写真、画素の比較 | 合成画像のテスト、向きは`tests/orientation_python.rs`が基準（`tools/gen_orientation_fixture.py`。四隅に色を付けた合成画像のPythonの出力と寸法・色を比べる）、検証環境でPythonとの寸法・画質の比較（[§12.9](#129-検証環境での確認2026-10-24)） | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
+| **EXIFの読み取り（T2.2）**: 壊れたGPS（成分が3つ未満・型が違う・分母0）の写真は**位置なしで索引する**（Pythonは例外で写真ごと索引しない、または分母0でNaNを保存する）。時刻の数字はASCIIに直す。時刻のタグが数値のときの偽値（0・個数0）は、Pythonの`or`と同じに次の候補へ落とす | 位置が読めないだけで写真を落とさない。`taken_at`の形式を守る | 壊れたGPSのEXIF | `tests/exif_python.rs`が基準（`tools/gen_exif_fixture.py`）と突き合わせる | なし（決定） | [§12.3](#123-exif撮影時刻gps向き) |
+| **入力の限界（T2.2）**: 1ファイル512 MiBまで（まるごとメモリに読む。Pythonは上限なし。`img-probe`の`--out`なしも同じ）。**HEICは、デコーダに渡す前に、ファイルが宣言する長さ・寸法（`mdat`のサイズ・EXIFのextent・`ispe`・SPS）がファイルの実際の大きさと画素数の上限に収まるか検査する**（`zune-heic`は宣言値で先に確保するので、小さな偽のファイルで確保に失敗してプロセスごと落ちるため。§12.4）。**EOI（画像データの終わりのマーカー）の無いJPEGは失敗にする**（切れたファイルと見分けられないため。§12.8）。Pillow 12.3.0も、EOIだけが欠けてファイルがそこで終わるJPEGと、SOS以降の全ての切断点で切ったJPEGは失敗にする。**Pythonが読んでRustが失敗にするのは、EOIが無くその位置にゴミやゼロ埋めが続くファイルだけ**（Pillowはそれも画像データとして読む。`tests/jpeg_eoi_python.rs`）。手動回転は0・90・180・270だけ（管理画面もその値しか作らない）。`.part`は`<出力名>.<pid>.<乱数>.part`を**排他的に新規作成**して（`O_EXCL`＋`O_NOFOLLOW`。既存のシンボリックリンクを辿らない）書き、書き込みに失敗・パニックしても**自分の**`.part`は残さない（Pythonは失敗すると残しうる）。出力の`.part`は`fsync`してから`rename`する | メモリの上限、電源断で空のderivativeを残さない、`DATA_DIR`の外を書き換えさせない | 巨大なファイル、偽の長さのHEIC、書き込みの失敗、`derivatives/`に置かれたリンク | 単体テスト、`tests/jpeg_eoi_python.rs`（`tools/gen_jpeg_eoi_fixture.py`） | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
@@ -681,7 +681,7 @@ let _ = std::fs::remove_file(&tmp);                 // 成功でも失敗でも 
 | --- | --- | --- |
 | 読む形式 | Pillowが内容で判別（EXTSは拡張子の集合） | JPEG・PNG・TIFF・HEICを**内容で**判別（拡張子は見ない）。それ以外は`NotAnImage` |
 | JPEGのデコード | libjpeg(-turbo)。途中で切れていればエラー | `zune-jpeg`の厳格モード。**途中で切れていれば失敗**（`image`の`JpegDecoder`は部分的な画像で成功するので使わない）。EOIが無ければ失敗。CMYK・YCCKはRGBへ、グレーは1成分のまま（§12.8） |
-| 向き | `exif_transpose`（PillowのEXIF）。HEICはlibheifがirot/imirを適用済み | 自前のEXIF読み取り（§12.3）の1〜8。範囲外・無しは当てない。**HEICはデコーダが適用済みなのでEXIFの向きは使わない**（二重に回らない） |
+| 向き | `exif_transpose`（PillowのEXIF。タグが無ければXMPの`tiff:Orientation`）。HEICはlibheifがirot/imirを適用済み | 自前のEXIF読み取り（§12.3）の1〜8。範囲外・無しは当てない。EXIFにタグが無いときだけXMPの向きを使う（§12.3）。**HEICはデコーダが適用済みなのでEXIFの向きもXMPの向きも使わない**（二重に回らない） |
 | 順序 | 向き→縮小 | **縮小→向き**（同じ結果で速く、メモリも減る。寸法は向きを当てた後の長辺で決める） |
 | 縮小の寸法 | `thumbnail((2560, 2560))` | `target_dims`。Pillowと同じ丸め（縮める側と反対の辺は、縦横比の誤差が小さい方へ切り捨て／切り上げ）。**Pillowの`thumbnail`と170件で一致**（`tools/gen_thumbnail_fixture.py`が基準、CIで`--check`） |
 | 縮小のフィルタ | BICUBIC（`reducing_gap=2.0`、JPEGは`draft`でDCT縮小もする） | CatmullRom（`fast_image_resize`）。画素は一致しない（§12.9のPSNR） |
@@ -689,25 +689,25 @@ let _ = std::fs::remove_file(&tmp);                 // 成功でも失敗でも 
 | ICC | **捨てる**（画素は変換しない） | **sRGBへ変換して付けない**（意図した変更）。読めない・壊れている・RGB用でないICCは、**警告なしで捨てて続ける**（`DerivativeInfo.icc`が`Dropped`。件数を数えてログに出すのは呼ぶ段） |
 | EXIF・GPS | 出力に残らない（`save`にexifを渡さない） | 同じ。エンコーダに渡さないので、JPEG・PNG・TIFF・HEICのどの入力でも残らない（テストが機種名・GPSの文字列とTIFFヘッダの有無を見る） |
 | 出力 | JFIFあり、4:2:0、ハフマン最適化なし | 同じ（`jpeg-encoder`。サイズはPythonと同じ水準） |
-| 書き込み | `dest.with_suffix(".part")`に保存して`rename`。保存に失敗すると`.part`が残りうる | 同じ名前（`x.r90.jpg`→`x.r90.part`）。**成功・失敗・パニックのどれでも`.part`を残さない**（`Drop`で消す）。`rename`の前に`fsync`する（ファイルの中身は保証する。電源断のあとに、DBの`display`が指す先が「中身が空のファイル」になるのを避ける。ディレクトリの`fsync`はしないので、`rename`のエントリ自体は失われうるが、その場合は「指す先が無い」で済む。検証環境で約26 ms／枚。生成は約230 ms／枚なので許容した）。親ディレクトリは作る |
-| 入力の上限 | 約1.79億画素で`DecompressionBombError`。ファイルの大きさは無制限 | 同じ画素数（178,956,970。デコードの前に宣言の寸法で断る）。**ファイルは512 MiBまで**（まるごとメモリに読む） |
+| 書き込み | `dest.with_suffix(".part")`に保存して`rename`。保存に失敗すると`.part`が残りうる。既存の`.part`がリンクなら先を書き換える | `<出力名>.<pid>.<乱数>.part`（`x.r90.jpg`→`x.r90.jpg.1234.9f3a….part`）を**`O_CREAT\|O_EXCL`＋`O_NOFOLLOW`で新規作成**する（既存のファイル・シンボリックリンクがあれば開けず、名前を変えて8回まで作り直し、それでも駄目なら失敗）。`rename`は出力先がリンクならそのリンク自体を置き換える（先は書き換えない）。**成功・失敗・パニックのどれでも自分の`.part`を残さない**（`Drop`で消す。自分が作ったものだけ）。`rename`の前に`fsync`する（ファイルの中身は保証する。電源断のあとに、DBの`display`が指す先が「中身が空のファイル」になるのを避ける。ディレクトリの`fsync`はしないので、`rename`のエントリ自体は失われうるが、その場合は「指す先が無い」で済む。検証環境で約26 ms／枚。生成は約230 ms／枚なので許容した）。親ディレクトリは作る |
+| 入力の上限 | 約1.79億画素で`DecompressionBombError`。ファイルの大きさは無制限 | 同じ画素数（178,956,970。デコードの前に宣言の寸法で断る）。**ファイルは512 MiBまで**（まるごとメモリに読む。`render`・`img-probe`も検査する）。HEICは宣言の長さ・寸法の検査つき（§12.4） |
 | 回転 | 任意の角度 | 0・90・180・270（負・360超は剰余）。それ以外は`BadRotation`（管理画面もその値しか作らない） |
 | ファイル名 | `{id}.jpg`／`{id}.r{rotation}.jpg` | 同じ。ただし`drive_id`が`[A-Za-z0-9_-]+`でなければ断る |
 
 HEICの`zune-heic`はスレッドを自前で持ち、グリッド画像のタイルや1枚の中の処理を並列に復号する。呼び出し側は**1枚ずつ**呼ぶのを前提にした（検証環境の2コアで、2枚同時にすると、JPEGは処理量が約1.8倍（3.7→6.8枚/秒）になるが最大RSSが144→274 MiBに増え、HEICは約1.08倍（1.05→1.13枚/秒）で321 MiBになる。§12.9）。`GEOFRAME_FETCH_PER_CYCLE`のように1サイクルの件数が小さいので、1枚ずつで足りる見込み。並列にするかはT2.4で決める。
 
-残っている注意: 書き込みの最中にプロセスが落ちる（SIGKILL・電源断）と、`derivatives/<name>.part`が残りうる。同じ名前のderivativeを次に作るときに上書きされるが、写真が消えていれば孤児として残る（EXIFを持たない部分的なJPEGなので、個人情報の問題はない）。起動時の掃除（§11.6）は`.dl_*`だけで、`*.part`は対象にしていない。必要ならT2.3・T2.4で足す。
+残っている注意: 書き込みの最中にプロセスが落ちる（SIGKILL・電源断）と、`derivatives/<name>.<pid>.<乱数>.part`が残りうる。名前に乱数が入るので、次に同じderivativeを作っても**上書きされず残り続ける**（EXIFを持たない部分的なJPEGなので、個人情報の問題はないが、容量は使う）。起動時の掃除（§11.6）は`.dl_*`だけで、`*.part`は対象にしていない。**T2.3の掃除（`derivatives/*.part`。通常ファイルだけを消し、リンクは辿らない）で足す**。なお`tmp/.dl_<id>`（T2.4。固定の名前）にも同じリンクの問題があるので、`create_new`＋`O_NOFOLLOW`で作ること（§12.10）。
 
 ### 12.3 EXIF（撮影時刻・GPS・向き）
 
 PillowのEXIFの読み方を**境界まで合わせるため**、外部のEXIF crateは使わず、必要なタグだけを自前で読む（`imaging/exif.rs`）。基準は`tools/gen_exif_fixture.py`が作る`tests/fixtures/exif-python.json`（合成のJPEG 43ケースと、Pythonの`extract_exif`の結果。`tests/exif_python.rs`が突き合わせる）。
 
-- **どこから読むか**: JPEGは最初の`Exif\0`で始まるAPP1（SOSの前まで）、PNGは`eXIf`チャンク、TIFFはファイル自身、HEICは`zune-heic`の`exif_data()`（TIFF構造から始まる）。見つからなければ「EXIFなし」（位置なし・時刻なし）。
-- **撮影時刻**: Exif IFDの`36867`（DateTimeOriginal）、なければ`36868`、なければIFD0の`306`。Pythonの`or`の連鎖と同じで、**空文字だけが次へ落ちる**（空白だけ・`0000:00:00 00:00:00`のような値は真なので、そこで止まり、`norm_time`が空か`0000-00-00 00:00`にする）。ASCIIは**末尾のNULを1つだけ**取り、latin-1として読む（Pillowと同じ。UTF-8の全角数字は文字化けして合わず空になる）。IFD0に誤って置かれた`36867`は無視する。
+- **どこから読むか**: JPEGは最初の`Exif\0`で始まるAPP1（SOSの前まで）、PNGは`eXIf`チャンク、TIFFはファイル自身（**BigTIFFは非対応**。`II+\0`・`MM\0+`は`ImageError::BigTiff`で断る。Pythonは開けるが、本番のTIFFは0件で、対応には依存かコードが要るので見送った）、HEICは`zune-heic`の`exif_data()`（TIFF構造から始まる）。見つからなければ「EXIFなし」（位置なし・時刻なし）。
+- **撮影時刻**: Exif IFDの`36867`（DateTimeOriginal）、なければ`36868`、なければIFD0の`306`。Pythonの`or`の連鎖と同じで、**Pythonで偽になる値だけが次へ落ちる**。ASCIIの空文字（NULだけも）のほか、数値のタグでは、値0のSHORT・LONGなど、個数0、分子0・分母1の有理数が偽（BYTE・UNDEFINEDは`bytes`なので空でなければ、1バイトの0も真。2個以上の組、分母0の有理数（NaN）も真）。真なら、そこで止まり、`norm_time`が空にする。空白だけ・`0000:00:00 00:00:00`のような文字列も真なので、そこで止まり、`norm_time`が空か`0000-00-00 00:00`にする（`gen_exif_fixture.py`がこの境界を型ごとにPythonの結果で記録している）。ASCIIは**末尾のNULを1つだけ**取り、latin-1として読む（Pillowと同じ。UTF-8の全角数字は文字化けして合わず空になる）。IFD0に誤って置かれた`36867`は無視する。
 - **`norm_time`**: 先頭から`\d{4}[:-]\d{2}[:-]\d{2}[ T]\d{2}:\d{2}`に合うときだけ`YYYY-MM-DD HH:MM`にする（暦は見ない。`2024:13:45 25:61:00`→`2024-13-45 25:61`）。秒以降は捨てる。**数字はUnicodeの十進数字（Nd。68の範囲）を通し、ASCIIに直す**（Pythonの`\d`と同じ範囲を読み、元の文字のまま返すPythonと違い、`taken_at`の形式を守る。§0）。
 - **GPS**: GPS IFDに`2`（緯度）と`4`（経度）の**両方**があるときだけ。各3つ以上の数値（有理数・整数。先頭の3つを使う）の度分秒を`度 + 分/60 + 秒/3600`で十進にする（Pythonと同じ式・同じ順序）。参照（`1`・`3`）は**緯度も経度も`S`か`W`のとき負**（緯度の参照が`W`でも負になるのはPythonと同じ）。小文字・その他の文字・型が違うものは正。参照が無いときは正（`N`/`E`）。`round(x, 6)`は、Rustの固定小数点の書式（2進の厳密な値を偶数丸め）で同じ値になる。**範囲は検証しない**（`95.0, 200.0`もそのまま。`0, 0`もそのまま位置ありとして返す）。
 - **Pythonと違う点**（§0）: 緯度か経度が壊れている（成分が3つ未満、数値でない型、分母0）ときは**位置なし（`lat`・`lon`とも`None`）で、時刻は残す**。Pythonは成分不足・型違いで例外（`index_local`は「読み込み失敗」でその写真を索引しない）、分母0はNaNを保存する（SQLiteではNULLで、`loc_source='exif'`だけが残る）。
-- **向き**: IFD0の`0x0112`（SHORT/LONG/BYTEの先頭）。1〜8以外は1。
+- **向き**（Pillowの`getexif()`＋`exif_transpose`と同じ）: IFD0の`0x0112`（SHORT/LONG/BYTEの先頭）。1〜8以外は1。**タグが（値が範囲外でも）あれば、それを使いXMPは見ない**。無いときだけ、XMPの`tiff:Orientation(="|>)([0-9])`の**最初の一致の1桁**を使う（`"16"`は1、属性形式`tiff:Orientation="6"`と要素形式`<tiff:Orientation>6</tiff:Orientation>`は左にあるものが勝つ）。2〜8だけが変換になる。XMPの在りか: JPEGは`http://ns.adobe.com/xap/1.0/\0`で始まるAPP1（複数あれば**最後**。拡張XMPは読まない）、PNGは`XML:com.adobe.xmp`の`tEXt`・圧縮しない`iTXt`（複数あれば最後）、TIFFはタグ700（BYTE・UNDEFINED型）。**読まないもの**: 圧縮した`iTXt`・`zTXt`のXMP（Pillowは展開して読み、Pythonは回す。展開には依存が要るので見送った。意図した差）、HEICのXMP（pillow-heifは開くときにXMPの向きを取り除くので、PillowもHEICのXMPだけの向きは回さない）。基準は`tools/gen_orientation_fixture.py`の`orientation-python.json`（JPEG・PNG・TIFF・HEICの60ケース。四隅に色を付けた140x90の合成画像に向きを付け、Pythonの`make_derivative`の出力の寸法と四隅の色を記録。CIで`--check`）で、`tests/orientation_python.rs`が突き合わせる。
 - **壊れたEXIF**: 範囲外のオフセット・巨大な個数・切れたデータは**黙って捨てる**（Pillowも警告して飛ばす）。EXIFが読めないことは画像が読めないことではない。EXIFの区間を1バイトずつ壊す・どこで切ってもパニックしないことをテストしている。
 - **画像として読めないファイル**は`ImageError::NotAnImage`（Pythonの`Image.open`の失敗。`index_local`は飛ばす）。Pillowは`.jpg`の名前のGIF・WebPなども開くが、Rustは対象外。
 
@@ -731,6 +731,17 @@ heicをデコードできません（hevc-bitstream）構造: brand=heic primary
 | `colr` | `none`・`prof`（ICC）・`nclx`・`prof+nclx` |
 | `aux` | 補助画像の種類（`auxC`のURNの語から）: `alpha`・`depth`・`gainmap`・`other` |
 | `items` | 項目の数 |
+
+**ファイルが宣言する長さ・寸法の検査**（`imaging/heic_guard.rs`）。`zune-heic`は、ファイルの中の宣言値で**先にメモリを確保してから**読む。小さなファイルがそれを偽ると、確保に失敗して**プロセスごと`SIGABRT`で落ちる**（Rustの確保失敗は`panic`ではなくabortで、`catch_unwind`で捕まえられない）。レビューで、750バイトの合成HEICのEXIFのextent長だけを1 GiBにすると再現した（`prlimit --as`・musl静的ビルドでも）。そこで`zune-heic` 0.5.0の確保の経路を読んで洗い、デコーダに渡す前に自前で検査する。
+
+| 確保（`zune-heic`） | 宣言値 | 検査 | いつ |
+| --- | --- | --- | --- |
+| `mdat`本体（`vec![0; size]`。上限128 MiB） | トップレベルのボックスのサイズ | ボックスの宣言サイズが残りのバイト数に収まる | 常に |
+| EXIF（`vec![0; length]`） | `iloc`のextentの位置と長さ | 全項目のextentがファイル（構築方法1は`idat`）に収まる | 常に |
+| alphaなどの補助面（`vec![0; w*h]`） | `ispe`の寸法 | 画素数が上限（約1.79億）以下 | デコード時 |
+| フレーム・タイルの面（`RawFrame`・`BlockMap`。SPSの寸法は最大65,536×65,536で、`ispe`とは独立） | `hvcC`のSPSと、画像データ（`hvc1`の項目）の中のSPS | 画素数が上限以下（SPSをビット単位で読んで寸法だけ見る） | デコード時 |
+
+`ipco`の子ボックスの中身（`colr`・`hvcC`など）は`zune-heic`が自分で10 MiBに、`iinf`・`iloc`・`iref`・`ipma`の個数は137に制限するので、確保が小さく収まり、ここでは見ない。失敗は固定の語（`truncated`・`extent`・`dimensions`・`item-structure`・`box-header`）で返し、値は出さない。**残る限界**: この検査は`zune-heic`のパーサとは別の実装なので、`zune-heic`が自分では拒否しない形でボックスの並びがずれるような壊れ方は、ここでは見えない。また、検査を通った宣言値でも、画素数の上限いっぱい（約1.79億画素）のHEICは1枚で0.5〜1 GiBのメモリを使う（§12.8）。回帰テストは、`iloc`のextent長・`mdat`のサイズ・`ispe`・SPSを偽った合成入力で、検査が断ること（確保に進まないこと）を確かめ、検査を外すと1 GiBの確保でプロセスが落ちることも確認した。
 
 `geoframe img-probe`（§12.6）を実機のHEICに向けると、読めたものは寸法・向き・ICCを、読めなかったものはこの分類を、ファイル名なしで出す。**実機iPhoneのHEIC（グリッド分割・HDRゲインマップ・深度・10ビット）の確認はT2.4**（Driveの鍵が検証環境にまだ無い。§12.10）。
 
@@ -760,9 +771,12 @@ summary files=2 ok=1 failed=1 jobs=1 wall_ms=285 median_ms=273 p95_ms=273 max_rs
 
 ### 12.7 テスト
 
-- 単体（`imaging/tests.rs`）: 向き1〜8、手動回転の順序、縮小の寸法（Pillowの`thumbnail`と170件で一致）、グレー・アルファ・パレット・16ビットのPNG、PNGの`eXIf`、TIFF（向き）、EXIF・機種名・ICCを出力に残さない（JPEG・PNG・HEICの入力）、P3のICCのsRGB変換、変換できないICC（グレー用・壊れたもの）は捨てて`ICCなし`と同じ出力、JPEG・PNG・TIFF・HEICを**全ての切断点**で切って失敗になること、EOIの無いJPEGの拒否と末尾のゴミ・マーカーの間のゴミの受け入れ、宣言の寸法が上限を超えるJPEGの拒否、エラーの文面にパス・ファイル名・座標が入らないこと、`.part`を残さない（成功・失敗・`rename`の失敗）、既存の出力を壊さない、`store_derivative`の保存先の検査、EXIFの区間を壊してもパニックしない、拡張子の集合。
+- 単体（`imaging/tests.rs`）: 向き1〜8、手動回転の順序、縮小の寸法（Pillowの`thumbnail`と170件で一致）、グレー・アルファ・パレット・16ビットのPNG、PNGの`eXIf`、TIFF（向き）、EXIF・機種名・ICCを出力に残さない（JPEG・PNG・HEICの入力）、P3のICCのsRGB変換、変換できないICC（グレー用・壊れたもの）は捨てて`ICCなし`と同じ出力、JPEG・PNG・TIFF・HEICを**全ての切断点**で切って失敗になること、EOIの無いJPEGの拒否と末尾のゴミ・マーカーの間のゴミの受け入れ、宣言の寸法が上限を超えるJPEGの拒否、エラーの文面にパス・ファイル名・座標が入らないこと、`.part`を残さない（成功・失敗・`rename`の失敗）、`.part`の名前に置かれたシンボリックリンク（生きている・切れている）を辿らず外を書き換えないこと、出力先がリンクのときはリンク自体を置き換えること、既存の出力を壊さない、512 MiB超の入力を読む前に断ること（`render`・`img-probe`）、BigTIFFの拒否、`store_derivative`の保存先の検査、EXIFの区間を壊してもパニックしない、拡張子の集合。
 - Pythonとの突き合わせ（`tests/exif_python.rs`）: 合成JPEG 43ケース（境界は§12.3）と`norm_time`の16入力。意図して違える点だけを`rust_differs`に列挙し、それ以外は完全一致を求める。基準のJSONはCIの`app`ジョブが`--check`で再検査する（Pythonの読み取りが変わったら落ちる）。
 - HEIC（`imaging/heic.rs`・`imaging/tests.rs`）: 合成HEIC3枚（`tests/fixtures/synthetic_*.heic`。pillow-heifで作った64x48、`tools/image-poc/gen_fixtures.py`）で、irotを一度だけ適用、ICC、構造の分類、失敗の分類、EXIFの読み取り。
+- 宣言値の検査（`imaging/heic_guard.rs`）: `iloc`のextent長・位置、`mdat`のサイズ、`ispe`、SPS（ビット列の読み方、hvcCと画像データの中、長さ付き・Annex B）を偽った合成入力が、`read_header`・`decode`の両方で検査に断られること、実際の合成HEICは通ること、壊れた入力（全ての切断・全バイトの破壊）で検査が落ちないこと。
+- 向き（`tests/orientation_python.rs`）: 合成画像60ケース（EXIFだけ・XMPだけ・両方・範囲外・複数のXMP・JPEG/PNG/TIFF/HEIC・手動回転との組み合わせ）を、Pythonの`make_derivative`の出力の寸法と四隅の色に突き合わせる。意図した差（圧縮したXMP）だけを`rust_differs`に列挙。
+- JPEGのEOI（`tests/jpeg_eoi_python.rs`）: EOIの欠けや後ろのゴミなど10ケースと、全ての切断点を、Pythonの結果に突き合わせる（差は表に列挙）。
 - パス（`datadir.rs`）: `..`・絶対パス・NUL・外を指すリンク・`derivatives`のリンク・IDの区切り。
 
 ### 12.8 実装上の判断
@@ -770,8 +784,8 @@ summary files=2 ok=1 failed=1 jobs=1 wall_ms=285 median_ms=273 p95_ms=273 max_rs
 - **JPEGのデコードは`zune-jpeg`を直接使う**（`image`の`JpegDecoder`を使わない）。`image`は寛容なモードで読み、**途中で切れたJPEGを部分的な画像のまま成功として返す**（グレーで埋まった下半分のderivativeが「取得済み」になり、Pythonのようにエラーで再試行されない）。一方、`zune-jpeg`の厳格モードは、ヘッダの間の余分なバイトのようなマーカーの並びにも厳しく、libjpegが警告だけで読む写真を落とす。そこで次のようにした。
   1. **まず厳格モードで読む。**
   2. 失敗が**マーカーの並びだけが理由**のとき（`[strict-mode]: Extra bytes between headers`、`Marker .. found where not expected`、`Unexpected marker .. between scans`・`.. at restart boundary`。メッセージに`arker`を含む、または`[strict-mode]`で始まるものだけの**許可リスト**）は、寛容なモードで読み直す。データの不足（`Code length N  more than bits left M`＝ハフマン復号中にビットが尽きた、`Premature end of buffer`、`ExhaustedData`、入出力）は読み直さない。寛容なモードはそれらを部分的な画像で成功させてしまう。
-  3. **読めても、画像データのあとにEOI（`FFD9`）が無ければ失敗にする**（`Truncated`）。厳格モードのデコーダも、最後のMCU行の途中で切れたファイルを成功させてしまう（検証: 64x48の合成JPEGで、切断点の約2%＝データ部の末尾約120バイト）ためで、切れたファイルを確実に弾く。**PillowはEOIの無いJPEGも読む**（libjpegが警告だけで補う）ので、EOIが欠けただけの完全なファイルがあれば、Pythonは取り込めてRustは失敗する（§0）。切れたファイルと見分けられないため、見えないまま下がグレーのderivativeになるより、失敗してログに残る方を選んだ。EOIはエントロピー符号化されたデータの中には現れないので、最初のSOSのあとを探す（EXIFのサムネイルの`FFD9`は数えない）。
-  テストは、JPEGを**全ての切断点**（SOSの少し後から末尾の手前まで、サブサンプリング2種）で切り、1つでも成功すれば落ちる。PNG・TIFF・HEICも全ての切断点で失敗になることを見る。EOIなしは失敗、末尾のゴミ・マーカーの間のゴミは成功。**実機のJPEG原本（Drive）での確認はT2.4**（EOIの無い原本が実際にあるか、件数だけ確かめる）。
+  3. **読めても、画像データのあとにEOI（`FFD9`）が無ければ失敗にする**（`Truncated`）。厳格モードのデコーダも、最後のMCU行の途中で切れたファイルを成功させてしまう（検証: 64x48の合成JPEGで、切断点の約2%＝データ部の末尾約120バイト）ためで、切れたファイルを確実に弾く。**Pillow 12.3.0は、EOIだけが欠けてファイルがそこで終わるJPEGも、SOS以降のどの切断点で切ったJPEGも失敗にする**（合成JPEG 1枚で全ての切断点、別の4種で計6,539通りも、読めたものは0。「PillowはEOIの無いJPEGを読む」とは言えない）。**差が出るのは、EOIが無くその位置にゼロ埋めやゴミが続くファイル**（Pillowはそれも画像データとして読み、足りない分を補う。`tests/jpeg_eoi_python.rs`の`no_eoi_then_zero_padding`・`no_eoi_then_garbage`）で、Pythonは取り込めてRustは失敗する（§0）。逆に、SOIの直後のゴミは、PillowはJPEGと識別できず失敗するがRustは読み直して読む。切れたファイルと見分けられないため、見えないまま下がグレーのderivativeになるより、失敗してログに残る方を選んだ。EOIはエントロピー符号化されたデータの中には現れないので、最初のSOSのあとを探す（EXIFのサムネイルの`FFD9`は数えない）。
+  テストは、JPEGを**全ての切断点**（SOSの少し後から末尾の手前まで、サブサンプリング2種）で切り、1つでも成功すれば落ちる。PNG・TIFF・HEICも全ての切断点で失敗になることを見る。EOIなしは失敗、末尾のゴミ・マーカーの間のゴミは成功。Pythonとの突き合わせは`tests/jpeg_eoi_python.rs`。**実機のJPEG原本（Drive）での確認はT2.4**（EOIの無い原本が実際にあるか、Pythonの結果と合わせて件数だけ確かめる）。
 - **PNG・TIFFは`image`**（`png`・`tiff`のfeature）。向きはJPEGと同じ自前のEXIFで読む。
 - **EXIFは自前**（`kamadak-exif`を使わない）。理由はPillowの読み方を境界まで合わせるため（§12.3）。ASCIIの末尾のNULを1つだけ取る、後勝ち、`or`の連鎖は、外部のcrateでは再現できない（NULで分割する、先勝ちなど）。
 - **ICCの変換失敗は黙って捨てる**（画像ごと失敗にしない）。件数は`DerivativeInfo.icc == Dropped`で数えられるので、呼ぶ段がサイクルの末尾に件数だけログに出す（PoCの予告。T2.3・T2.4）。
@@ -823,6 +837,10 @@ SSIMは全群で中央値0.97〜1.00（Rust対正解・Python対正解とも0.96
 ### 12.10 T2.3・T2.4へ回したもの
 
 - **T2.4（Drive取り込みの受入）で、実機iPhoneのHEICを確認する**: グリッド分割（512x512のタイル）、HDRゲインマップ、深度・補助画像、10ビット（Main 10）、nclxだけの色の記述、Live Photo・連写、`clap`、EXIFのOrientationとirotの両方。**検証環境にDriveの鍵がまだ無い**ので、T2.2では合成のHEIC（pillow-heif）だけを確認した。切り分けは`geoframe img-probe`（連番と構造の分類だけを出す。§12.4）か、取り込みのログの`ImageError`（同じ文面）でできる。`zune-heic`が読めない形式が出たら、PoCの`libheif-rs`の経路を足す（[build.md §6](build.md)）。
+- **T2.4の受入条件（T2.2のレビューから）**:
+  1. **Driveの原本の互換性は、原本で確かめる。** 検証に使ったJPEG 50枚・HEIC 8枚（§12.9）は本番コピーのderivativeからの再生成で、Driveの原本（カメラ・iPhoneが書いたもの）の互換性を裏付けない。T2.4では、**原本の形式別（JPEG・HEIC・PNG・TIFF）の成功件数と、失敗の分類（`ImageError`の固定の語。HEICは構造の分類つき）を、同じ原本に対するPythonの結果と比べ**、Rustだけが失敗する写真が無いこと（あれば原因ごとに判断すること）を確かめる。ファイル名・座標は出さず、件数と分類だけを記録する。
+  2. **変換の失敗が取得待ちを塞がない。** Pythonの`fetch_derivatives`は、取得待ちを`LIMIT`つきのSQLで選ぶ。恒久的に変換に失敗する写真（壊れた原本、`NotAnImage`、BigTIFF、読めないHEIC）があると、毎回それが先頭の枠を埋め、後続の写真がいつまでも取得されないおそれがある。**失敗が続いても、後続の写真を取得できること**を、スタブのDrive APIで確かめる（`GEOFRAME_FETCH_PER_CYCLE`件より多い、恒久的に失敗する写真を先頭に並べ、後続の写真の`display`が埋まること）。失敗した写真を飛ばす・後回しにする仕組み（失敗の記録を除く、試行回数の上限など）を入れるかは、Pythonの挙動を確かめてから決める。
+  3. `tmp/.dl_<id>`（固定の名前）は、`create_new`＋`O_NOFOLLOW`で作る（`derivative`の`.part`と同じリンクの問題。§12.2）。
 - **T2.4**: JPEG原本（Drive）で、厳格モード＋寛容な読み直しが落とす写真が無いか（失敗の分類は`ImageError`の文面で件数だけ出す）。本番の約6,500枚を一括で作り直すときの時間とメモリ（概算。今回の測定の1枚あたりの時間から、JPEG 4,795枚が約0.28 s、HEIC 1,735枚が約1 s、PNG 5枚で合計約50分。Pythonは同じ見積りで約1時間。実機のHEICの時間は別）。`fetch_derivatives`が`ImageError`を握ってログに出すとき、パス・ファイル名を付けないこと。ICCを捨てた件数のログ。`norm_time`をDriveの`imageMediaMetadata.time`に通すこと。
 - **T2.3**: `index_local`は`extract_exif`の`NotAnImage`を「読み込み失敗」として飛ばす（Pythonと同じ）。`local_<md5(path)[:16]>.jpg`の名前（`md-5`を足す）。`local_derivatives`は`resolve_existing`で`photos.path`を検査してから読む。`*.part`の掃除（§12.2）を入れるかの判断。
 - **P3（更新API）**: 管理画面の回転は`derivative_name(drive_id, rotation)`で別名にして`store_derivative`を呼ぶ（元のderivativeからの回転か、Driveから取り直すか。admin.py:350）。`rotation`の値は`0/90/180/270`のまま。

@@ -37,7 +37,7 @@ jobs:
       - name: 設定リファレンスの同期検査
         run: python3 tools/gen_env_reference.py --check
 
-      - name: EXIF・縮小寸法・向きのフィクスチャの同期検査
+      - name: EXIF・縮小寸法・向き・JPEGのEOIのフィクスチャの同期検査
         # Rust の画像処理（crates/geoframe/src/imaging）が Python の extract_exif・norm_time・Pillow の
         # thumbnail・exif_transpose（XMP の向きの補完を含む）と同じ結果になることを確かめるテストの基準。
         # Python の読み取りが変わったら落ちる
@@ -45,6 +45,7 @@ jobs:
           python3 tools/gen_exif_fixture.py --check
           python3 tools/gen_thumbnail_fixture.py --check
           python3 tools/gen_orientation_fixture.py --check
+          python3 tools/gen_jpeg_eoi_fixture.py --check
 
       - name: スキーマのフィクスチャの同期検査
         # Rust のスキーマ（crates/geoframe/src/schema.rs）が Python の空 DB と一致することを確かめる
