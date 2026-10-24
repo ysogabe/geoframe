@@ -42,7 +42,7 @@
 
 - 地図タイル・地名検索・Driveなど外部へ出る要求（`/tiles/`・`/api/admin/geocode`）は、比較用Pythonが外へ取りに行くので送っていない。
 - 更新系（`POST`）はP3まで無い（全部403）。
-- `taken_at`がNULLの行など、本番のコピーに無いデータの差は[server.md §8.3](server.md)・[§10.6](server.md)の既知の差のとおり。
+- `taken_at`がNULLの行など、本番のコピーに無いデータの差は[server.md §8.3](server.md)・[§10.6](server.md)の既知の差のとおり。Pythonとの差の全体は[server.md §0の索引](server.md)から辿れる。
 
 ## 3. 常駐・障害・巻き戻し
 

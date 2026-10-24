@@ -5,6 +5,23 @@
 - 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
+## 0. Pythonとの差の索引
+
+P1でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+
+| 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
+| --- | --- | --- | --- | --- | --- |
+| `GEOFRAME_DATA_DIR`の既定が`./var`（Pythonは`app/var`）。`app/.env`を読まない | 単一バイナリに`app/`が無い。本番はunitの`EnvironmentFile`が同じ役目 | 環境変数・`.env`で与えず手で起動したとき | 設定のテスト。本番はunitが常に与える | なし（決定） | [§1.1](#11-優先順位)・[§1.3](#13-appenvは読まない) |
+| 不正な設定値は起動を断る（終了コード2）。`GEOFRAME_EMBED_BACKEND`だけ`gemini`に落とす | 事故を早く見つける。Pythonは例外で落ちる | 不正な値が設定にあるとき | 単体テスト、検証環境で再起動ループにならないこと | なし（決定） | [§1.1](#11-優先順位)・[§10.6](#106-pythonとの差まとめ) |
+| 全角数字など ASCII 以外の数字の撮影時刻をRustは読めない（旅番号がずれうる） | 時刻の解釈を`strptime`に合わせきれていない | EXIFに全角数字が入った写真 | 本番コピーでは差0。単体テスト | P2のインデクサで保存時に正規化 | [§8.2](#82-値) |
+| 夏時間を持つ`TZ`のときの時刻の差 | RustはP1で`TZ`を解釈せず、naiveな日時を文字列・暦で扱う | `TZ`が夏時間を持つとき（本番は`Asia/Tokyo`） | 本番設定では差なし | P2以降で時刻を変換するときに再検討 | [§1.2](#12-tz)・[§10.6](#106-pythonとの差まとめ) |
+| `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字で最後 | 契約（`time`は必ずある）に合わせる | `taken_at`がNULLの行がDBにあるとき | 本番コピーに該当行なし（管理者確認済み） | なし（決定） | [§8.3](#83-pythonとの差) |
+| `lat`ありで`lon`がNULLの行: Pythonは一覧全体が500になりうる、Rustは一覧から外す | 契約（`lon`は必ずある）に合わせる | 該当行があるとき（通常は起きない） | 本番コピーでは未確認、検証環境の全件比較で差0 | なし（決定） | [§8.3](#83-pythonとの差) |
+| 静的配信・HTTPの差（領域外のリンクは403、`ETag`での再検証、`/healthz`の新設、未実装ルートの503、`POST`は全部403、接続・配信の上限など） | 安全性、固定の挙動、まだ無いことの明示 | 該当する要求を送ったとき | 検証環境で現行Pythonとの比較（状態コード・本文の一致）、単体テスト | 503・`POST`はP3・P4で実装して外す。他は決定 | [§9.7](#97-pythonとの差まとめ) |
+| 管理画面の読み取りAPIの差（件数を1トランザクションで数える、想定外の型は503、キーの並びなど） | 一貫性、読み取り専用の表示で落とさない | `GET /api/admin/status`・`photos` | 検証環境の比較で差0、単体テスト | なし（決定） | [§10.6](#106-pythonとの差まとめ) |
+
+検証の記録は[p1-acceptance.md](p1-acceptance.md)。
+
 ## 1. 設定
 
 現行Pythonの`GEOFRAME_*`と**同じ名前・同じ既定値**で読む。読み込みは`Config::load`で、環境変数は引数のクロージャ経由で引く（テストが並行しても干渉しない）。
@@ -70,7 +87,7 @@
 - **接続を戻す前の後始末**: 読み取りのあと、トランザクションが開いたままなら`ROLLBACK`する（できなければ接続を捨てる）。開いたまま戻すと、その接続は古いスナップショットを見続け、Python側の`-wal`のチェックポイントも進められず際限なく大きくなる。また、`SQLITE_IOERR`・`SQLITE_CORRUPT`・`SQLITE_NOTADB`など接続の状態が壊れたと見られるエラーが出たときも接続を捨てる（SQLの誤りのような普通のエラーでは戻す）。
 - 読み取りがパニックしたときはその接続を捨て、次の読み取りが開き直す。エラーの文字列は**定型文**（`読み取りがパニックしました`）で、パニックのメッセージ（切り出しに失敗した文字列など値が入りうる）はログに出さない（§3.1）。
 - 新しい依存（プールのcrate）は入れていない。
-- **P3で書き込みを足す構造**: 書き込みは単一の接続を専用スレッドに置き、チャネルで依頼を受ける（現行の「1接続＋グローバルロック」と同じ直列化）。`Catalog`に`writer`を足す形で、`read`のAPIは変えずに済む。今は作らない。
+- **書き込みを足す構造（P2で取り込み用のwriter、P3で更新API）**: 書き込みは単一の接続を専用スレッドに置き、チャネルで依頼を受ける（現行の「1接続＋グローバルロック」と同じ直列化）。`Catalog`に`writer`を足す形で、`read`のAPIは変えずに済む。P2の索引・取り込みから書き込みが要るので、取り込み用のwriterはP2で追加し、unitの`ReadOnlyPaths`を必要な分だけ解除する。手動修正などの更新APIはP3で足す。P1では作らない。
 
 ### 2.3 Pythonが書き込み中でも読める
 
@@ -154,7 +171,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
   - 検証環境の比較用Pythonは別のポート（8090）と別のデータ（`/var/lib/geoframe-pyref`）で動いているので、Rustは drop-in なしで`:8080`を使う。
 - Rustも**`User=geoframe`で動かす**。WALのDBは読み取り専用でも`-shm`・`-wal`を触るので、ファイルの持ち主がPythonの実行ユーザーと違うと、片方が開けなくなる。`StateDirectory=geoframe`は初回起動で持ち主を揃えるが、大きなデータでは時間がかかるので、**配備の前に`chown -R geoframe:geoframe /var/lib/geoframe`を済ませておく**。
   - 検証環境の注意: 比較用Pythonの`derivatives/`は、本番のコピーの`derivatives/`への**ハードリンク**（同じ inode）。コピー側を`chown`すると、モード`0660`のファイルは比較用Pythonの実行ユーザーから読めなくなり、`/derivatives/`が404になる。`chmod o+r`で読めるようにした（出力を比べる意味を保つため）。
-- **P1は読み取り専用**なので、unit に`ReadOnlyPaths=-/var/lib/geoframe/catalog.db`と、`derivatives`・`photos`・`blog_exports`・`travel_blog`を書いて、OSの側でも書き込み不可にした。ディレクトリ自体は書き込み可のまま（WALの`-shm`/`-wal`のため）。検証環境で`geoframe`ユーザーとして`catalog.db`・`derivatives/`への書き込みが`Read-only file system`になり、ディレクトリには書けることを確かめた。**P2で取り込み・手動修正が書き込むようになったら、この行を外す。** ファイルのbind mountなので、`catalog.db`を別のinodeに置き換えたら再起動するまで古い方を見続ける（下の「DBファイルの入れ替え」と同じ理由で、復元後は必ず再起動する）。
+- **P1は読み取り専用**なので、unit に`ReadOnlyPaths=-/var/lib/geoframe/catalog.db`と、`derivatives`・`photos`・`blog_exports`・`travel_blog`を書いて、OSの側でも書き込み不可にした。ディレクトリ自体は書き込み可のまま（WALの`-shm`/`-wal`のため）。検証環境で`geoframe`ユーザーとして`catalog.db`・`derivatives/`への書き込みが`Read-only file system`になり、ディレクトリには書けることを確かめた。**P2で取り込み用の書き込み接続（writer）を追加し、unitの`ReadOnlyPaths`を必要な分だけ解除する。P3で手動修正などの更新APIを追加する。** ファイルのbind mountなので、`catalog.db`を別のinodeに置き換えたら再起動するまで古い方を見続ける（下の「DBファイルの入れ替え」と同じ理由で、復元後は必ず再起動する）。
 - **`MemoryDenyWriteExecute=true`を付けた**（Pythonは Pillow のC拡張が実行可能メモリへ書くので付けられない）。musl静的ビルドのRust（tokio・SQLite同梱）は、これを付けても起動・全エンドポイントの応答・スレッド生成が動いた（検証環境）。P2で画像処理（`zune-heic`・`image`・`fast_image_resize`）を入れたときに、実際のデコードで再確認する。
 - **`LimitNOFILE=4096`**。同時の接続256＋配信中のファイル32＋SQLite（読み取り5接続と`-wal`/`-shm`）＋標準入出力で300前後を使う（§9.3）ので、systemdの既定（1024）でも足りるが、余裕を持たせた。1024未満にするなら`limits.rs`の`MAX_CONNECTIONS`・`STATIC_FILE_SLOTS`もあわせて見直す。
 - **P5で、`app/.env`にだけある`GEOFRAME_*`を`/etc/default/geoframe`と突き合わせる**。Rustは`app/.env`を読まない（§1.3）ので、`.env`にしか書かれていない値は、移すか、捨てる判断をする。

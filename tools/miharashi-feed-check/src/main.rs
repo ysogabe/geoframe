@@ -6,12 +6,17 @@
 //!       [--stop-cmd '<止めるコマンド>' --stop-after 10 --start-cmd '<戻すコマンド>' --resume-after 8]
 //!
 //! `Feed::spawn` を実際の設定と同じ形で起こし、写真かカードが届くたびに `next()` を呼んで `--count` 枚まで進める。
-//! 出力は件数だけ（写真の値・場所・タイトルは出さない）。終了コード 0 = `--count` 枚に届き、取得・デコードの失敗が 0。
+//! 出力は件数だけ（写真の値・場所・タイトルは出さない）。終了コード 0 = `--count` 枚に届き、取得・デコードの失敗が 0
+//! （停止・再開を指定したときは、下の条件も満たす）。取得・デコードの失敗は、miharashi が標準エラーに出す `photo: …` の行の数と、
+//! 停止・再開の区間の外で届いた `Retrying`（一覧や写真を3回続けて読めず再接続に入った）の数で数える。1件でもあれば終了コード 1。
+//! `photo: …` を数えるため、自分自身を子プロセスとして起こし、その標準エラーを読んで流す（`FEED_CHECK_CHILD`）。
 //!
 //! 停止と再開（再接続の確認）: `--stop-cmd` を `--stop-after` 秒後に、`--start-cmd` を、その `--resume-after` 秒後に
 //! `sh -c` で実行する。止めている間は `Retrying`（指数バックオフ）、戻したあとは `Online` が届き、自動で
 //! 続きを読み込むはず。停止したあとは、件数に届いても時間切れでも、終了前に必ず再開コマンドを実行する
 //! （停止したままにしない。失敗は終了コードに反映する）。コマンドの中身（検証環境への ssh など）は呼び出し側が決める。
+//! 成功は、停止・再開の両コマンドが実行され、成功し、`Retrying` と（再開後の）`Online` が観測され、復帰後に写真を受信したとき。
+//! 件数に先に届いて停止しなかった場合、復帰を観測できなかった場合は失敗（`--count` を増やす）。
 //!
 //! photos.rs・album.rs は miharashi-app のソースをそのまま取り込む（`vendor/miharashi` は setup.sh が張るリンク）。
 //! 下の `screen`・`video`・`config`・`home` は、それらが参照する型だけの代役で、描画や取得の動作には関わらない。
@@ -76,7 +81,8 @@ mod home {
 }
 
 use photos::{Feed, FeedEvent, FeedStatus, Source};
-use std::process::Command;
+use std::io::{BufRead, BufReader};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 struct Args {
@@ -145,7 +151,56 @@ fn sh(cmd: &str) -> bool {
     Command::new("sh").arg("-c").arg(cmd).status().is_ok_and(|s| s.success())
 }
 
+/// 子プロセスだと分かる印。
+const CHILD_ENV: &str = "FEED_CHECK_CHILD";
+
+/// 自分自身を子として起こし、標準エラーの `photo: …`（取得・デコードの失敗）を数えながらそのまま流す。
+fn supervise() -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("ERROR: 自分自身を起こせない: {e}");
+            return 2;
+        }
+    };
+    let mut child = match Command::new(exe)
+        .args(std::env::args_os().skip(1))
+        .env(CHILD_ENV, "1")
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("ERROR: 子プロセスを起こせない: {e}");
+            return 2;
+        }
+    };
+    let mut failures = 0usize;
+    if let Some(err) = child.stderr.take() {
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            if line.starts_with("photo:") {
+                failures += 1;
+            }
+            eprintln!("{line}");
+        }
+    }
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+    println!("取得・デコードの失敗（`photo:` の行）: {failures} 件");
+    if code == 0 && failures > 0 {
+        eprintln!("取得・デコードの失敗があった");
+        return 1;
+    }
+    code
+}
+
 fn main() {
+    if std::env::var_os(CHILD_ENV).is_none() {
+        std::process::exit(supervise());
+    }
+    run();
+}
+
+fn run() {
     let a = match parse_args() {
         Ok(a) => a,
         Err(e) => {
@@ -163,6 +218,11 @@ fn main() {
     let mut stopped_at: Option<Instant> = None;
     let mut started_at: Option<Instant> = None;
     let mut cmd_failed = false;
+    // 停止から復帰までの区間の外で届いた Retrying（想定外の取得失敗）
+    let mut unplanned_retrying = 0usize;
+    // 再開コマンドのあとに届いた Online（復帰）と、それ以後に届いた写真
+    let mut recovered = false;
+    let mut photos_after_recovery = 0usize;
 
     while shown < a.count && t0.elapsed() < a.timeout {
         // 停止 → 再開（指定があれば）
@@ -184,6 +244,9 @@ fn main() {
             Some(FeedEvent::Photo(_)) => {
                 photos += 1;
                 shown += 1;
+                if recovered {
+                    photos_after_recovery += 1;
+                }
                 if first_retry.is_some() && resume_gap.is_none() {
                     resume_gap = first_retry.map(|t| t.elapsed());
                 }
@@ -196,9 +259,17 @@ fn main() {
             }
             Some(FeedEvent::Status(FeedStatus::Retrying { .. })) => {
                 retrying += 1;
+                if stopped_at.is_none() || recovered {
+                    unplanned_retrying += 1;
+                }
                 first_retry.get_or_insert_with(Instant::now);
             }
-            Some(FeedEvent::Status(FeedStatus::Online)) => online += 1,
+            Some(FeedEvent::Status(FeedStatus::Online)) => {
+                online += 1;
+                if started_at.is_some() && retrying > 0 {
+                    recovered = true;
+                }
+            }
             None => std::thread::sleep(Duration::from_millis(20)),
         }
     }
@@ -207,6 +278,7 @@ fn main() {
     if let (Some(_), None, Some(start)) = (stopped_at, started_at, &a.start_cmd) {
         eprintln!("[feed-check] {}s: 終了前に再開コマンドを実行", t0.elapsed().as_secs());
         cmd_failed |= !sh(start);
+        started_at = Some(Instant::now());
     }
 
     println!("読み込み: 写真 {photos} 枚、旅・季節のカード {cards} 枚（計 {shown} / 目標 {}）", a.count);
@@ -215,10 +287,33 @@ fn main() {
         println!("最初の Retrying から次の写真まで: {:.1} 秒", g.as_secs_f64());
     }
     println!("経過: {:.0} 秒", t0.elapsed().as_secs_f64());
-    // 取得・デコードの失敗は photos.rs が標準エラー（`photo: …`）に出す。件数は呼び出し側が数える。
-    let ok = shown >= a.count && !cmd_failed;
-    if !ok {
-        eprintln!("目標に届かなかった、または停止・再開のコマンドが失敗した");
+    // 取得・デコードの失敗（`photo:` の行）は親が数える。ここでは、件数・コマンド・再接続の条件を見る。
+    let mut problems: Vec<String> = Vec::new();
+    if shown < a.count {
+        problems.push("目標の枚数に届かなかった".into());
     }
-    std::process::exit(if ok { 0 } else { 1 });
+    if unplanned_retrying > 0 {
+        problems.push(format!("停止・再開の区間の外で Retrying が {unplanned_retrying} 回あった（取得に失敗した）"));
+    }
+    if cmd_failed {
+        problems.push("停止または再開のコマンドが失敗した".into());
+    }
+    if a.stop_cmd.is_some() {
+        if stopped_at.is_none() || started_at.is_none() {
+            problems.push("停止・再開のコマンドが両方は実行されなかった（先に件数へ届いた。--count を増やす）".into());
+        }
+        if retrying == 0 {
+            problems.push("Retrying を観測できなかった".into());
+        }
+        if !recovered {
+            problems.push("再開後の Online を観測できなかった".into());
+        }
+        if photos_after_recovery == 0 {
+            problems.push("復帰後に写真を受信できなかった".into());
+        }
+    }
+    for p in &problems {
+        eprintln!("NG: {p}");
+    }
+    std::process::exit(if problems.is_empty() { 0 } else { 1 });
 }

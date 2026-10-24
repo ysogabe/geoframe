@@ -64,7 +64,7 @@ MemoryDenyWriteExecute=true
 
 # P1 は読み取り専用: DB 本体と画像の置き場を OS の側でも書き込み不可にする。
 # （ReadOnlyPaths は StateDirectory の書き込み許可より後に効く。先頭の "-" は無いパスを無視する指定。）
-# P2 以降で取り込み・手動修正が書き込むようになったら、この節を外す。
+# P2 で取り込み用の書き込み接続（writer）を足すとき、必要な分だけ解除する。P3 で手動修正などの更新 API を足す。
 # 注意: ファイルの bind mount なので、catalog.db を別の inode に置き換えた（mv で復元した）
 # 場合は、再起動するまで古い方を見続ける。復元は Rust の再起動が要るという元の注意
 # （docs/rust-migration/server.md §2.4）のとおり、復元後は必ず再起動する。

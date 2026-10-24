@@ -76,11 +76,12 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 ### P2: 写真取り込み（PR 3）
 
 - ローカル`photos/`とGoogle Driveの索引（`drive.readonly`、撮影時刻・GPSのメタデータ）、derivative生成（JPEG/HEIC）、EXIF、位置の推定、逆ジオコーダ、簡易品質判定（完全重複・近似の判定。旧スコアとの一致は不要）。
+- 索引・取り込みがDBへ書くので、**取り込み用の書き込み接続（writer）をP2で追加し**、unitの`ReadOnlyPaths`を必要な分だけ解除する（[server.md §2.2](server.md)）。
 - 検証環境でDriveを使うには`drive_key.json`のコピーが要る。**P2の開始時にユーザーへ確認する。**
 
 ### P3: 管理機能（PR 4）
 
-- 手動GPS、お気に入り、除外、回転、地名検索（地理院→Nominatim）、地図タイルのプロキシ、旅行ブログ（下書き・書き出し）、AI検索の画面。更新APIのCSRF対策（JSON必須・Origin検査・本文上限）を現行どおり。
+- 手動修正などの更新APIをwriterの上に追加する（writer自体はP2で入っている）。手動GPS、お気に入り、除外、回転、地名検索（地理院→Nominatim）、地図タイルのプロキシ、旅行ブログ（下書き・書き出し）、AI検索の画面。更新APIのCSRF対策（JSON必須・Origin検査・本文上限）を現行どおり。
 - 受入: 検証環境で管理画面の全操作を行い、変更がDBに残ること。
 
 ### P4: AI Providerとジョブ（PR 5）
