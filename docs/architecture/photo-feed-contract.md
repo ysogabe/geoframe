@@ -4,8 +4,16 @@ GEOFRAMEが表示クライアントへ渡す写真一覧と画像の取得方法
 クライアントは[miharashi](https://github.com/ysogabe/miharashi)（DRM/KMSへ直接描画する
 キオスク）だけで、GEOFRAMEとの接点はこの文書の範囲に限ります。
 
-この契約は`app/tests/test_photo_feed_contract.py`で検査しています。変更するときは、
-表示クライアント側の読み取りも同時に直してください。
+応答の形は[JSON Schema](photo-feed.schema.json)に定めています。この契約は次のテストで検査します。
+変更するときは、Schema・各テスト・表示クライアント側の読み取りを同時に直してください。
+
+- Python: `app/tests/test_photo_feed_contract.py`が、現行実装の出力をSchemaに照らし、Rustテストが読むフィクスチャ
+  （`crates/geoframe/tests/fixtures/photo-feed-python.json`）が現行実装の出力と一致することを確かめます。
+  フィクスチャの再生成は`python3 tools/gen_photo_feed_fixture.py`（合成データだけ。差の検査は`--check`）。
+- Rust: `crates/geoframe/tests/photo_feed_contract.rs`が、型（`geoframe::feed::Photo`）の出力と上のフィクスチャを
+  同じSchemaで検査し、フィクスチャを型で読み書きし直しても内容が変わらないことを確かめます。
+- miharashiの読み方: `crates/geoframe/tests/photo_feed_miharashi.rs`が、miharashiが読むフィールドと型を再現して
+  フィクスチャと型の出力が読めることを確かめます（miharashiのcrateには依存しません）。
 
 ## 写真一覧
 
@@ -39,6 +47,33 @@ GET /api/v1/photos
 品質解析で完全な重複と判定されたグループの推奨外と、AI整理で同じ場面と判定されたグループの
 推奨外（お気に入りを除く）も除かれます。並びは撮影日時の昇順で、
 撮影日時の不明な写真が最後に来ます。表示の順番や選び方はクライアント側で決めてかまいません。
+
+### 表示クライアント（miharashi）の読み方と、この表との差
+
+miharashiは`serde_json::Value`で読み、`file`が文字列でない要素を飛ばします（`similar`の推奨外も表示対象から外します）。ほかのフィールドが
+欠けても失敗せず、既定値（文字列は空、数値は無し、真偽値は`false`）で続けます（`miharashi-app/src/photos.rs`の
+`list_geoframe`と`album.rs`の`eligible`・`parse_time`）。この表と食い違う点は次のとおりです。契約は表のままで、
+miharashiの読み方に合わせて表を緩めてはいません。
+
+- `id`: miharashiは数値も文字列も受け、無ければ`file`で代用します。契約は整数で、必ずあります。
+- `lat` / `lon`: miharashiは数値でなければ「位置なし」として扱います。契約は数値で、必ずあります。
+- `fav` / `quality_recommended`: miharashiは`true`との一致で見ます。`1`や`"true"`は`false`扱いになるので、
+  必ず真偽値で出してください（`quality_recommended`が`1`だと、`similar`の写真が推奨外として落ちます）。
+- `time` / `fetched_at`: miharashiは先頭16文字を`YYYY-MM-DD HH:MM`か`YYYY-MM-DDTHH:MM`として読み、
+  読めなければ先頭10文字の日付だけ（12:00扱い）で読みます。`fetched_at`の秒は使いません。
+- miharashiが読む契約フィールドは`id file time lat lon pref city title fav fetched_at quality_kind
+  quality_recommended trip`のすべてです。`quality_kind`と`quality_recommended`は`similar`の絞り込みだけに使います。
+  `place`・`elev`・`inferred`と品質解析・AIの内部値は読みません。
+
+### 現行実装との差（Rust移行で決めること）
+
+- `time`: 契約は不明なら空文字ですが、現行のPython実装は`photos.taken_at`が`NULL`の写真で`null`を返します
+  （`"time": r["taken_at"]`に`or ""`が無い）。しかも並びは`taken_at=''`だけを最後に回すので、`NULL`の写真は先頭に
+  来て旅番号も別になります。インデクサ（`drive.py`・ローカル索引）は`norm_time`を通して常に文字列（読めなければ空文字）で保存するので、通常は起きません（手でDBを書き換えたときなどだけ）。
+  Rust実装（T1.2）は契約どおり空文字で出し、並びも最後にする方針です（T1.2で確定）。
+- `file`: 契約の例は`derivatives/<id>.jpg`ですが、ローカルのJPEG/PNGは原本をそのまま`photos/...`として指す
+  ことがあります。どちらも`/`で始まらない相対パスで、同じ`GET /<file>`で取れます。Schemaは先頭が`/`でない
+  ことだけを要求します。
 
 ### 表示クライアント（miharashi）の使い方
 

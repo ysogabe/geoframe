@@ -1,6 +1,6 @@
 # 設計案: Rust単一バイナリの写真管理APIと外部AI Provider
 
-- 状態: **提案（未実装）**
+- 状態: **提案（実装中）**。P0のレビュー結果は[実装計画](../rust-migration/plan.md#p0での設計案のレビュー結果)
 - 作成日: 2026-10-24
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / [local-model-lab #93](https://github.com/ysogabe/local-model-lab/issues/93)
 - 現行方針: [ADR 0008](../decisions/0008-photo-platform-and-miharashi-display.md)
@@ -46,7 +46,7 @@ RustはGEOFRAMEの画像処理を高速化するためではなく、既存の[m
 1. 現在のGEOFRAMEで実際に使用しているJPEG/HEICを代表する約100枚について、EXIF orientation、回転、長辺2560px derivative、JPEG品質、ICC色再現、画像サイズ制限、処理時間、最大RSSを測定する。家庭写真や位置情報をGitへ追加しない。
 2. Cライブラリ依存の有無、配布先環境での静的／動的リンクとsystemd実行条件を確認する。**単一バイナリは成果物数の目標であり、あらゆる処理の完全静的リンクを保証するものではない**。
 3. miharashiの`miharashi-render/src/photo.rs`と`miharashi-app/src/photos.rs`を参考にしつつ、GPUや表示固有の依存はGEOFRAMEへ持ち込まない。
-4. `/api/v1/photos`の型と契約テストをGEOFRAME側に定義し、miharashiの実クライアントで後方互換を確認する。
+4. `/api/v1/photos`の型と契約テストをGEOFRAME側に定義し、miharashiの実クライアントで後方互換を確認する。P0では契約テスト（miharashiの読み方の再現）まで行い、実クライアントでの確認はP1の受入で行う（[実装計画](../rust-migration/plan.md)）。
 
 ## 既存のモデル・APIと採用候補
 
@@ -129,5 +129,5 @@ ai:
 ## 非目標・未決事項
 
 - 非目標: 全AIモデルの自作、local-model-labの推論コード移植、miharashiの再開発、GPU表示コードのサーバー移植、事前の巨大共通crate化。
-- 未決: 画像Embedding APIのJSON契約、CPU／GPU配備、HEIC変換バックエンド、旧DBへのマイグレーション詳細、モデル別インデックスのストレージ形式。各Phaseの実装前に決定する。
+- 未決: 画像Embedding APIのJSON契約、CPU／GPU配備、~~HEIC変換バックエンド~~（P0で第一候補を`zune-heic`に決定。実機HEICでの確定はP2。[画像PoC](../rust-migration/image-poc.md)）、旧DBへのマイグレーション詳細、モデル別インデックスのストレージ形式。各Phaseの実装前に決定する。
 - **本設計案は採用済みADRではない**。レビュー後、必要なら新しいADRで採否を記録する。
