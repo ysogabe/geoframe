@@ -466,6 +466,76 @@ fn 更新は現行と同じ列だけを上書きし手動の位置も戻す() {
     assert_eq!(s.rows().len(), 1);
 }
 
+/// 更新 API を writer 経由で呼ぶ（割り込みの試験用）。
+fn api_set_loc(writer: &Writer, id: i64, lat: f64, lon: f64) {
+    let payload = serde_json::json!({"id": id, "lat": lat, "lon": lon});
+    crate::update::set_loc(payload.as_object().unwrap(), Some(writer)).unwrap();
+}
+
+fn api_set_flag(writer: &Writer, id: i64, favorite: bool, hidden: bool) {
+    let payload = serde_json::json!({"id": id, "favorite": favorite, "hidden": hidden});
+    crate::update::set_flag(payload.as_object().unwrap(), Some(writer)).unwrap();
+}
+
+/// `(favorite, hidden)`。
+fn flags_of(s: &Setup, id: i64) -> Option<(i64, i64)> {
+    let read = crate::db::open_read_only(&s.config.db_path()).unwrap();
+    read.query_row(
+        "SELECT favorite, hidden FROM photos WHERE id=?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
+}
+
+#[test]
+fn 計画のあとに更新apiが入っても_お気に入りと除外は残り_変わらない行の手動の位置も残る() {
+    let mut s = setup("local-update-api");
+    let a = s.put("photos/a.jpg", &jpeg_plain(), T0); // ファイルが変わる（Update）
+    s.put("photos/b.jpg", &jpeg_plain(), T0); // 変わらない（計画に入らない）
+    let c = s.put("photos/c.jpg", &jpeg_plain(), T0); // 消える（Delete）
+    s.run(&IndexLocal);
+    let (ida, idb, idc) = (
+        s.row("photos/a.jpg").id,
+        s.row("photos/b.jpg").id,
+        s.row("photos/c.jpg").id,
+    );
+    set_mtime(&a, T0 + 10);
+    fs::write(&a, jpeg_gps()).unwrap();
+    set_mtime(&a, T0 + 10);
+    fs::remove_file(&c).unwrap();
+    // 計画を読んだあと、書く直前に更新 API が入る
+    let api = s.writer.clone();
+    s.writer = api.clone().interrupt_next_call(move || {
+        api_set_flag(&api, ida, true, true);
+        api_set_loc(&api, ida, 43.0, 141.0);
+        api_set_loc(&api, idb, 48.0, 2.0);
+        api_set_flag(&api, idb, true, false);
+        api_set_flag(&api, idc, true, true);
+    });
+    let counts = s.run(&IndexLocal);
+    assert_eq!((get(&counts, "updated"), get(&counts, "removed")), (1, 1));
+
+    // 変わらない行: 手動の位置も、お気に入りも残る
+    let b = s.row("photos/b.jpg");
+    assert_eq!(
+        (b.loc_source.as_deref(), b.lat, b.lon),
+        (Some("manual"), Some(48.0), Some(2.0))
+    );
+    assert_eq!(flags_of(&s, idb), Some((1, 0)));
+    // 更新される行: お気に入り・除外は索引の SET 句に無いので残る。
+    // 位置は、索引が EXIF の値で上書きする（inventory.md §2.3 ①。方針は T3.7 で決める。更新 API が
+    // 計画の前に入っても後に入っても同じ結果＝競合で失われるのではなく、現行の仕様）
+    assert_eq!(flags_of(&s, ida), Some((1, 1)));
+    let a_row = s.row("photos/a.jpg");
+    assert_eq!(
+        (a_row.loc_source.as_deref(), a_row.lat),
+        (Some("exif"), Some(12.575))
+    );
+    // 消える行は、お気に入りごと消える（§2.3 ②。T3.7）
+    assert_eq!(flags_of(&s, idc), None);
+}
+
 #[test]
 fn 消えたファイルの行を削除しderivativeだけファイルも消す() {
     let s = setup("local-delete");
@@ -762,6 +832,33 @@ fn jpegは原本をdisplayにしheicはderivativeを作る() {
     // 2 回目は何もしない
     let again = s.run(&LocalDerivatives::new());
     assert_eq!((get(&again, "original"), get(&again, "made")), (0, 0));
+}
+
+#[test]
+fn derivativeの作成中に更新apiが入っても_位置とお気に入りは残る() {
+    let mut s = setup("local-deriv-update-api");
+    index_with_location(
+        &s,
+        &[("photos/a.heic", heic()), ("photos/b.JPG", jpeg_gps())],
+    );
+    let (ida, idb) = (s.row("photos/a.heic").id, s.row("photos/b.JPG").id);
+    let api = s.writer.clone();
+    s.writer = api.clone().interrupt_next_call(move || {
+        api_set_loc(&api, ida, 43.0, 141.0);
+        api_set_flag(&api, ida, true, true);
+        api_set_flag(&api, idb, false, true);
+    });
+    let counts = s.run(&LocalDerivatives::new());
+    assert_eq!(get(&counts, "made") + get(&counts, "original"), 2);
+    let a = s.row("photos/a.heic");
+    assert_eq!(
+        (a.loc_source.as_deref(), a.lat),
+        (Some("manual"), Some(43.0))
+    );
+    assert!(a.display.is_some());
+    assert_eq!(flags_of(&s, ida), Some((1, 1)));
+    assert_eq!(flags_of(&s, idb), Some((0, 1)));
+    assert!(s.row("photos/b.JPG").display.is_some());
 }
 
 #[test]

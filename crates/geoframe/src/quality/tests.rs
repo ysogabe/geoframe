@@ -919,6 +919,42 @@ fn 実ファイルを解析して特徴量と品質の行を作る() {
 }
 
 #[test]
+fn 解析の途中で更新apiが入っても_利用者の列は変わらず_品質は作られる() {
+    let mut s = setup("quality-update-api");
+    let a = gradient_jpeg(640, 480, 85, 0);
+    write_jpeg(&s, "a.jpg", &a);
+    write_jpeg(&s, "b.jpg", &a);
+    insert_photo(&s, 1, "2024-05-06 10:00", "derivatives/a.jpg");
+    insert_photo(&s, 2, "2024-05-06 10:00", "derivatives/b.jpg");
+    // 品質の段が書くのは photo_quality_features・photo_quality・settings だけで、photos には書かない。
+    // 段が最初に書く直前（解析のあと）に更新 API が入っても、変更は残る
+    let api = s.writer.clone();
+    s.writer = api.clone().interrupt_next_call(move || {
+        let loc = json!({"id": 1, "lat": 43.0, "lon": 141.0});
+        crate::update::set_loc(loc.as_object().unwrap(), Some(&api)).unwrap();
+        let flags = json!({"id": 2, "favorite": true, "hidden": true});
+        crate::update::set_flag(flags.as_object().unwrap(), Some(&api)).unwrap();
+    });
+    let counts = s.run(&Quality::new());
+    assert_eq!(get(&counts, "rebuilt"), 1);
+    assert_eq!(count_of(&s, "SELECT COUNT(*) FROM photo_quality"), 2);
+    assert_eq!(
+        count_of(
+            &s,
+            "SELECT COUNT(*) FROM photos WHERE id=1 AND loc_source='manual' AND lat=43.0 AND lon=141.0"
+        ),
+        1
+    );
+    assert_eq!(
+        count_of(
+            &s,
+            "SELECT COUNT(*) FROM photos WHERE id=2 AND favorite=1 AND hidden=1"
+        ),
+        1
+    );
+}
+
+#[test]
 fn 読めない写真は失敗の行になり_種類だけを書き_毎回やり直さない() {
     let s = setup("quality-fail");
     write_jpeg(&s, "good.jpg", &gradient_jpeg(320, 240, 85, 0));

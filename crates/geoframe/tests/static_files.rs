@@ -962,20 +962,11 @@ async fn names_are_allowed_only_when_listed_in_the_environment() {
 // ---- メソッド（CSRF の外側の関門） ----------------------------------------------------------
 
 #[tokio::test]
-async fn post_is_always_403_and_other_methods_are_501_without_cors() {
+async fn post_without_a_route_is_403_and_other_methods_are_501_without_cors() {
     let site = Site::new();
     let addr = site.start().await;
-    for target in [
-        "/api/admin/setflag",
-        "/api/admin/setloc",
-        "/api/blog/save",
-        "/api/nope",
-        "/",
-        "/admin",
-        "/derivatives/a.jpg",
-        "/healthz",
-    ] {
-        let r = request(
+    let post = |target: &'static str| async move {
+        request(
             addr,
             "POST",
             target,
@@ -985,8 +976,33 @@ async fn post_is_always_403_and_other_methods_are_501_without_cors() {
                 ("Content-Length", "0"),
             ],
         )
-        .await;
+        .await
+    };
+    // ルートが無い POST は、Content-Type・本文の検査より前に 403（`/api/blog/` 配下も。現行の send_error(403)）
+    for target in [
+        "/api/nope",
+        "/api/blog/nope",
+        "/api/admin/status",
+        "/",
+        "/admin",
+        "/derivatives/a.jpg",
+        "/healthz",
+        "/api/v1/photos",
+    ] {
+        let r = post(target).await;
         assert_eq!(r.status, 403, "POST {target}");
+        assert!(!r.headers.contains("access-control-"), "{target}");
+    }
+    // ルートがある POST は CSRF 対策を通り、空の本文は JSON として解釈できず 400（更新 API は update_api.rs）
+    for target in [
+        "/api/admin/setflag",
+        "/api/admin/setloc",
+        "/api/admin/rotate",
+        "/api/blog/save",
+        "/api/blog/export",
+    ] {
+        let r = post(target).await;
+        assert_eq!(r.status, 400, "POST {target}");
         assert!(!r.headers.contains("access-control-"), "{target}");
     }
     // OPTIONS（CORS プリフライト）は 501 で、CORS ヘッダを一切返さない。クロスオリジンの POST は成立しない

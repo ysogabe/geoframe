@@ -350,3 +350,51 @@ pub async fn spawn_with_env(
     tokio::spawn(async move { axum::serve(listener, app).await });
     addr
 }
+
+/// `POST` を、ヘッダを加工せずそのまま（`Content-Length` も自動では付けない）送り、応答を読む。
+/// サーバーが本文を読まずに閉じたときは、本文の送信が失敗したりリセットされたりするが、
+/// それまでに届いた応答は返す（上限超過の 413 の確認用）。
+pub async fn post_raw(
+    addr: std::net::SocketAddr,
+    target: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Response {
+    let mut head = format!("POST {target} HTTP/1.1\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let _ = stream.write_all(&request).await;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 65536];
+    // 接続が閉じられないまま止まった試験を、ハングではなく失敗にする
+    let read_all = async {
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(15), read_all)
+        .await
+        .is_err()
+    {
+        panic!("応答が閉じられない: POST {target}（Connection: close を付けたか）");
+    }
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("応答が無い: POST {target}"));
+    let head = std::str::from_utf8(&raw[..split]).unwrap();
+    let (status_line, headers) = head.split_once("\r\n").unwrap_or((head, ""));
+    Response {
+        status: status_line.split(' ').nth(1).unwrap().parse().unwrap(),
+        headers: headers.to_lowercase(),
+        body: raw[split + 4..].to_vec(),
+    }
+}

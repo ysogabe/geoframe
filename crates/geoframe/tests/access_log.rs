@@ -154,3 +154,125 @@ async fn access_log_has_only_method_route_status_and_time() {
         assert!(!log.contains(secret), "ログに {secret} が出ている:\n{log}");
     }
 }
+
+async fn post(addr: std::net::SocketAddr, target: &str, extra: &str, body: &str) -> String {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream
+        .write_all(
+            format!(
+                "POST {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                 {extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).await.unwrap();
+    raw
+}
+
+/// 更新 API（POST）のログ: 出るのはメソッド・ルート・状態コード・時間と、内部エラーの種類だけ。
+/// 座標・id・Origin の値・本文の中身は出ない。500 の応答にも例外の文字列は載らない。
+#[tokio::test]
+async fn post_logs_only_method_route_status_and_the_kind_of_internal_error() {
+    let captured = Captured::default();
+    let subscriber = geoframe::logging::subscriber(LogLevel::Trace, captured.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let dir = std::env::temp_dir().join(format!(
+        "geoframe-test-accesslog-post-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("catalog.db");
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    for (table, columns) in REQUIRED_SCHEMA {
+        conn.execute_batch(&format!("CREATE TABLE {table} ({})", columns.join(", ")))
+            .unwrap();
+    }
+    conn.execute_batch("INSERT INTO photos(id, name) VALUES(4, 'secret-name.jpg')")
+        .unwrap();
+    let writer =
+        geoframe::writer::Writer::open(&path, geoframe::writer::OpenMode::MustExist).unwrap();
+    let catalog = Catalog::open(&path).unwrap().with_writer(writer);
+    let config = Config::load(
+        |_| None,
+        &Overrides {
+            data_dir: Some(dir.clone()),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
+    let state = AppState::new(Arc::new(config), catalog);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router(state)).await });
+
+    let setloc = r#"{"id": 4, "lat": 12.345678, "lon": 98.765432}"#;
+    // 成功（200）
+    let ok = post(addr, "/api/admin/setloc?q=secret-query", "", setloc).await;
+    assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+    // CSRF 対策で断る（403）・ルートが無い（403）
+    let origin = post(
+        addr,
+        "/api/admin/setloc",
+        "Origin: http://attacker.invalid\r\n",
+        setloc,
+    )
+    .await;
+    assert!(origin.starts_with("HTTP/1.1 403"), "{origin}");
+    let none = post(addr, "/api/admin/secret-route", "", setloc).await;
+    assert!(none.starts_with("HTTP/1.1 403"), "{none}");
+    // 入力の違反（400）
+    let bad = post(
+        addr,
+        "/api/admin/setloc",
+        "",
+        r#"{"id": 4, "lat": 99.5, "lon": 1}"#,
+    )
+    .await;
+    assert!(bad.starts_with("HTTP/1.1 400"), "{bad}");
+    // 書き込みが失敗する（表が消えた）→ 500。応答は定型文だけ
+    conn.execute_batch("DROP TABLE photos").unwrap();
+    let broken = post(
+        addr,
+        "/api/admin/setflag",
+        "",
+        r#"{"id": 4, "favorite": true}"#,
+    )
+    .await;
+    assert!(broken.starts_with("HTTP/1.1 500"), "{broken}");
+    assert!(broken.contains("内部エラーが発生しました"), "{broken}");
+    assert!(!broken.contains("no such table"), "{broken}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    drop(conn);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    for expected in [
+        "POST /api/admin/setloc 200",
+        "POST /api/admin/setloc 403",
+        "POST (unmatched) 403",
+        "POST /api/admin/setloc 400",
+        "POST /api/admin/setflag 500",
+        "[api] /api/admin/setflag 内部エラー",
+    ] {
+        assert!(log.contains(expected), "{expected} が無い:\n{log}");
+    }
+    for secret in [
+        "12.345678",
+        "98.765432",
+        "secret-name",
+        "secret-query",
+        "secret-route",
+        "attacker",
+        "99.5",
+        "127.0.0.1",
+        "localhost",
+    ] {
+        assert!(!log.contains(secret), "ログに {secret} が出ている:\n{log}");
+    }
+}

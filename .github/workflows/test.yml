@@ -48,6 +48,9 @@ jobs:
         # 偽の地理院に流した結果（photos の全列・地理院への要求・.cache.json の geo: キー）と突き合わせる基準。
         # 簡易品質（crates/geoframe/src/quality）は Python の quality_cycle・quality_backfill を、合成の特徴量
         # （画像は使わない）に流した結果（photo_quality_features・photo_quality・settings の全列）と突き合わせる基準。
+        # 更新 API（crates/geoframe/src/update.rs・post.rs）は Python の handlers.do_POST・admin_setloc・
+        # admin_setflag に同じ POST（CSRF 対策・ルーティング・エラー応答を含む）を順に流した結果（状態コード・応答・
+        # photos の変化）と突き合わせる基準。
         # Python の読み取りが変わったら落ちる
         run: |
           python3 tools/gen_exif_fixture.py --check
@@ -58,6 +61,7 @@ jobs:
           python3 tools/gen_drive_index_fixture.py --check
           python3 tools/gen_geo_fixture.py --check
           python3 tools/gen_quality_fixture.py --check
+          python3 tools/gen_update_fixture.py --check
 
       - name: スキーマのフィクスチャの同期検査
         # Rust のスキーマ（crates/geoframe/src/schema.rs）が Python の空 DB と一致することを確かめる

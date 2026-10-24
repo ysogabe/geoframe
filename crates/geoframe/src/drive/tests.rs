@@ -783,6 +783,125 @@ fn a_changed_md5_updates_the_row_and_resets_the_derived_columns() {
     assert_eq!(e.rows(), before);
 }
 
+fn api_set_loc(writer: &Writer, id: i64, lat: f64, lon: f64) {
+    let payload = json!({"id": id, "lat": lat, "lon": lon});
+    crate::update::set_loc(payload.as_object().unwrap(), Some(writer)).unwrap();
+}
+
+fn api_set_flag(writer: &Writer, id: i64, favorite: bool, hidden: bool) {
+    let payload = json!({"id": id, "favorite": favorite, "hidden": hidden});
+    crate::update::set_flag(payload.as_object().unwrap(), Some(writer)).unwrap();
+}
+
+/// `drive_id` の行の id。
+fn id_of(e: &Env, drive_id: &str) -> i64 {
+    let row = e
+        .rows()
+        .into_iter()
+        .find(|r| text(r, "drive_id").as_deref() == Some(drive_id))
+        .unwrap_or_else(|| panic!("行が無い: {drive_id}"));
+    match col(&row, "id") {
+        rusqlite::types::Value::Integer(n) => *n,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn row_of(e: &Env, drive_id: &str) -> Option<Row> {
+    e.rows()
+        .into_iter()
+        .find(|r| text(r, "drive_id").as_deref() == Some(drive_id))
+}
+
+fn int(row: &Row, name: &str) -> i64 {
+    match col(row, name) {
+        rusqlite::types::Value::Integer(n) => *n,
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
+#[test]
+fn index_drive_plan_survives_the_update_api_except_where_the_python_rules_overwrite() {
+    let mut e = env("drive-update-api");
+    e.listing(vec![
+        located("f1", "a.jpg", "m1", "2024:05:06 07:08:09", 35.0, 139.0), // md5 が変わる（Update）
+        located("f2", "b.jpg", "m2", "2024:05:06 07:09:09", 35.1, 139.1), // 変わらない
+        located("f3", "c.jpg", "m3", "2024:05:06 07:10:09", 35.2, 139.2), // 消える（Delete）
+    ]);
+    e.index();
+    let (id1, id2, id3) = (id_of(&e, "f1"), id_of(&e, "f2"), id_of(&e, "f3"));
+    e.listing(vec![
+        located("f1", "a.jpg", "m1-new", "2024:05:06 07:08:09", 35.0, 139.0),
+        located("f2", "b.jpg", "m2", "2024:05:06 07:09:09", 35.1, 139.1),
+    ]);
+    // 一覧を読んで計画を作ったあと、書く直前に更新 API が入る
+    let api = e.writer.clone();
+    e.writer = api.clone().interrupt_next_call(move || {
+        api_set_flag(&api, id1, true, true);
+        api_set_loc(&api, id1, 43.0, 141.0);
+        api_set_loc(&api, id2, 48.0, 2.0);
+        api_set_flag(&api, id2, true, false);
+        api_set_flag(&api, id3, true, true);
+    });
+    let counts = e.index();
+    assert_eq!((get(&counts, "updated"), get(&counts, "removed")), (1, 1));
+
+    // 変わらない行は、手動の位置もお気に入りも残る
+    let r2 = row_of(&e, "f2").unwrap();
+    assert_eq!(text(&r2, "loc_source").as_deref(), Some("manual"));
+    assert_eq!(col(&r2, "lat"), &rusqlite::types::Value::Real(48.0));
+    assert_eq!((int(&r2, "favorite"), int(&r2, "hidden")), (1, 0));
+    // md5 が変わった行: お気に入り・除外は残る。位置は Drive の値で上書きされる
+    // （inventory.md §2.3 ①。T3.7 で方針を決める。更新 API が計画の前でも後でも同じ結果）
+    let r1 = row_of(&e, "f1").unwrap();
+    assert_eq!((int(&r1, "favorite"), int(&r1, "hidden")), (1, 1));
+    assert_eq!(text(&r1, "loc_source").as_deref(), Some("drive_meta"));
+    assert_eq!(col(&r1, "lat"), &rusqlite::types::Value::Real(35.0));
+    // 一覧から消えた行は、お気に入りごと消える（§2.3 ②。T3.7）
+    assert!(row_of(&e, "f3").is_none());
+}
+
+#[test]
+fn fetch_keeps_what_the_update_api_wrote_while_an_original_is_downloading() {
+    let mut e = env("drive-fetch-update-api");
+    e.listing(vec![
+        located("j1", "a.jpg", "m1", "2024:05:01 10:00:00", 35.0, 139.0),
+        located("j2", "b.jpg", "m2", "2024:05:02 10:00:00", 35.1, 139.1),
+    ]);
+    e.stub.set_media("j1", fixture_jpeg("typical"));
+    e.stub.set_media("j2", fixture_jpeg("typical"));
+    e.index();
+    let (id1, id2) = (id_of(&e, "j1"), id_of(&e, "j2"));
+    // 取得の段が最初の書き込み（j1 の display）を積む直前に、更新 API が j1・j2 を直す
+    let api = e.writer.clone();
+    e.writer = api.clone().interrupt_next_call(move || {
+        api_set_loc(&api, id1, 43.0, 141.0);
+        api_set_flag(&api, id1, true, false);
+        api_set_loc(&api, id2, 48.0, 2.0);
+        api_set_flag(&api, id2, false, true);
+    });
+    let counts = e.done(&e.fetch_stage());
+    assert_eq!(get(&counts, "fetched"), 2);
+    for (drive_id, lat, flags) in [("j1", 43.0, (1, 0)), ("j2", 48.0, (0, 1))] {
+        let r = row_of(&e, drive_id).unwrap();
+        assert_eq!(
+            text(&r, "loc_source").as_deref(),
+            Some("manual"),
+            "{drive_id}"
+        );
+        assert_eq!(
+            col(&r, "lat"),
+            &rusqlite::types::Value::Real(lat),
+            "{drive_id}"
+        );
+        assert_eq!(
+            (int(&r, "favorite"), int(&r, "hidden")),
+            flags,
+            "{drive_id}"
+        );
+        assert!(text(&r, "display").is_some(), "{drive_id}");
+    }
+}
+
 #[test]
 fn vanished_files_are_deleted_with_their_derivatives_but_only_safe_names() {
     let e = env("drive-delete");

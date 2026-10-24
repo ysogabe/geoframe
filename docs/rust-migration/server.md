@@ -1,13 +1,13 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）、T3.1 は`post.rs`・`update.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 0. Pythonとの差の索引
 
-P1・P2（T2.1〜T2.6）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1〜T2.6）・P3（T3.1）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
@@ -17,7 +17,7 @@ P1・P2（T2.1〜T2.6）でPythonと意図して違える点・既知の差の�
 | 夏時間を持つ`TZ`のときの時刻の差（T2.5の`infer`の時刻の差を含む） | RustはP1で`TZ`を解釈せず、naiveな日時を文字列・暦で扱う（`infer`は暦の日数×86400＋時分で差を取る。Pythonは`strptime(…).timestamp()`で`TZ`として解釈する） | `TZ`が夏時間を持つとき（本番は`Asia/Tokyo`） | 本番設定では差なし | P2以降で時刻を変換するときに再検討 | [§1.2](#12-tz)・[§10.6](#106-pythonとの差まとめ) |
 | `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字で最後 | 契約（`time`は必ずある）に合わせる | `taken_at`がNULLの行がDBにあるとき | 本番コピーに該当行なし（管理者確認済み） | なし（決定） | [§8.3](#83-pythonとの差) |
 | `lat`ありで`lon`がNULLの行: Pythonは一覧全体が500になりうる、Rustは一覧から外す | 契約（`lon`は必ずある）に合わせる | 該当行があるとき（通常は起きない） | 本番コピー（2026-10-24のバックアップ）での全件比較で差0（表示対象に該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
-| 静的配信・HTTPの差（領域外のリンクは403、`ETag`での再検証、`/healthz`の新設、未実装ルートの503、`POST`は全部403、接続・配信の上限など） | 安全性、固定の挙動、まだ無いことの明示 | 該当する要求を送ったとき | 検証環境で現行Pythonとの比較（状態コード・本文の一致）、単体テスト | 503・`POST`はP3・P4で実装して外す。他は決定 | [§9.7](#97-pythonとの差まとめ) |
+| 静的配信・HTTPの差（領域外のリンクは403、`ETag`での再検証、`/healthz`の新設、未実装ルートの503、ルートの無い`POST`は403、接続・配信の上限など） | 安全性、固定の挙動、まだ無いことの明示 | 該当する要求を送ったとき | 検証環境で現行Pythonとの比較（状態コード・本文の一致）、単体テスト | 503はP3・P4で実装して外す（`POST`の更新ルートはT3.1で実装）。他は決定 | [§9.7](#97-pythonとの差まとめ) |
 | 列の型が想定外の行（`lat`が文字列など）があると読み取り全体が失敗して503（Pythonは素通し） | スキーマ上は起きない | `GET /api/v1/photos` | 本番コピーの全件比較で差0（該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
 | DBが無いとRustは起動を断る（終了コード1、systemdで5秒おきに再起動）。PythonはDBを作る。**ただし`GEOFRAME_INGEST=1`のときは、Rustも空のDBを作る**（T2.1。§11.1） | DBを作るのはPython。配備の誤りを失敗として見せる | `GEOFRAME_DATA_DIR`の誤りなど、DBが無いまま起動したとき | 検証環境で確認（[p1-acceptance.md](p1-acceptance.md)） | なし（決定。P5の切替時にはDBがある） | [§2.4](#24-dbが無い壊れている古いときの扱い) |
 | 管理画面の読み取りAPIの差（件数を1トランザクションで数える、想定外の型は503、キーの並びなど） | 一貫性、読み取り専用の表示で落とさない | `GET /api/admin/status`・`photos` | 検証環境の比較で差0、単体テスト | なし（決定） | [§10.6](#106-pythonとの差まとめ) |
@@ -40,6 +40,8 @@ P1・P2（T2.1〜T2.6）でPythonと意図して違える点・既知の差の�
 | **位置の推定 `infer`（T2.5）**: ①**値が変わらない行には書かない**（Pythonは毎サイクル、対象の全行に同じ値を`UPDATE`する。最終の行は同じ）。②`UPDATE`は`loc_source IS NULL OR 'inferred'`の行にだけ効く（計画を作ってから書くまでの間に手動で位置が付いた行を上書きしない。Pythonにはこの隙間がある）。③時刻の差は**`TZ`に依存しないnaiveな日時**で取る（Pythonは`strptime(…).timestamp()`）。ASCIIの数字だけ読む（全角の数字が混じった時刻をPythonは読む場合がある。CPython 3.13で確認: 年が全角でも、分が1桁の全角でも読める）。④`GEOFRAME_INFER_OFFSET_MIN`は有限の数だけ（負も小数も可。Pythonは検証なし）。⑤同順位（同じ距離の錨が複数）は**`id`の小さい方**（Pythonは`ORDER BY`なしの全件走査の最初で、実際は`rowid`順＝同じ）。⑥**Pythonと同じで直さないもの**: `place elev muni_cd pref city`には触らない（錨が変わって位置が動いても、推定を取り消して別の場所へ推定し直しても、`place`は古い地名のまま残る）。`display`は取り消す行だけをNULLにする（`fetch_derivatives`が取り直す。ファイルは消さない）。`manual`は再推定しない・錨にはなる。`inferred`は錨にしない | ①②は書き込みを減らす（本番コピーの`--dry-run`が「変更ほぼ0」と読める）。③はP1以来の方針。⑥は現行の挙動（位置が動いたときに地名を付け直すかはP3で決める） | 位置の無い写真があるとき | `geo-python.json`（合成の行にPythonの`infer_locations`を段階的に流した結果と、`photos`の全列・戻り値が一致: 窓の境界・同順位・オフセット・錨の削除・錨の移動・手動・時刻なし・暦の不正。`tools/gen_geo_fixture.py`、CIで`--check`）、単体テスト、検証環境（§15.8。本番コピーで推定済みの2,162行すべてが「変更なし」） | ⑥は**P3で直すか決める**。他は決定 | [§15.2](#152-infer) |
 | **地名の enrich（T2.5）**: ①**処理は`id`順の1パス**（Pythonと同じ）。キャッシュのキーは丸めた座標なので、近い座標の行は同じキーを共有し、先に来た行がキャッシュを作る（国外の行は国内の行のキャッシュを空で上書きする）。国内外を分けて国内を後回しにする作りは、先の国内の行が後の国外の空のキャッシュに当たって空の地名で確定するので採らない（レビュー指摘。`(20.0001,130.0)`と`(19.9999,130.0)`は同じキー）。②**通信の障害は短い待ちで2回まで再試行し**（0.5秒・1秒。停止の合図で打ち切る）、**続くときは座標の種類で分ける**: 接続できない（`dns`・`connect`・`tls`）・429は座標によらない障害なのですぐ段を中断する（その座標は覚えない）。5xx・時間切れ・切断・本文が読めないは座標による場合もあるので、その座標を覚えて30分以上飛ばして**次へ進み**、**続けて3つの異なるキー（座標）**で起きたら中断する（同じ座標の写真が何枚あっても1つ。応答が返った座標で数は0に戻る）。**段全体の経過時間にも上限がある**（2分。超えたら通信が要る未確定の行を次のサイクルへ回す。失敗にはしない）。Pythonは再試行せず、障害の行を飛ばして続ける（1行8秒×最大40行）。中断しても確定した行は残る。③**片方のAPIだけ障害のときは確定しない**（Pythonはもう片方の応答だけで確定してキャッシュするので、一時的な標高の不調で`elev`が、逆ジオの不調で`place`が、空のまま永久に残る。海上の空と見分けがつかない）。標高だけの長期障害の間は、国内の未キャッシュの行が進まない（直れば欠けなく埋まる。Pythonは進むが、その間の行の`elev`は恒久的にNULL）。応答は返ったが使えない（4xx・JSONでない）ときはPythonと同じく、もう片方の応答で確定する。④**確定していない先の行は、サイクルをまたいでも追い越させない**: 座標による障害・両方の応答なし・バックオフ中・段の中断や時間の上限で止まった行があるキーは、同じキーの後の行（国外・キャッシュ・別の座標の国内）を見送る（サイクル内は`deferred`、前のサイクルから続くバックオフ中の行は枠に入れず`skipped_blocked`）。追い越すと、国外の行が空のキャッシュを作り、先の国内の行は直ったあともその空に当たって地名が空のまま永久に確定する。通信の要らない行（別のキーの国外・キャッシュ）は止まったあとも済ませる。⑤`muni.js`は、国内で通信が要る行があるときだけ取りに行き、**取れなければ（障害でも、4xxでも、表が空でも）通信が要る行を見送り段を失敗にする**。Pythonは空の表で続け、`pref`・`city`が空のまま確定する。⑥**両方のAPIの応答が使えない座標も、プロセスの中で覚えてしばらく飛ばす**（30分から倍々、12時間まで）。Pythonは毎サイクル、40件の枠を占める。⑦**通信を試した行は、確定してもしなくても0.2秒待つ**（Pythonは確定した行のあとだけ）。件数は`queried`（最初の要求を出した行。再試行の待ちで止まった行も含む）と`resolved`（うち確定した行）・`unresolved`（確定しなかった行）に分ける。⑧**`lon`がNULL・数値でない行は対象にしない**（`unusable`に数える）。Pythonは例外になり、`cycle()`は`enrich_rows`を`try`で包んでいないので、周期全体が落ちる。⑨キャッシュの値は`place`と`city`の両方を持つ辞書だけ有効、型が違う値は空文字（Pythonは`city`だけ見て、`place`が無いと例外）。⑩書き込みは`lat`・`lon`が計画のときと同じで`place`がNULLの行にだけ効く。⑪**国外は空で確定**（オフラインの逆ジオコーダは本番に入っていない。Pythonも入っていなければ同じ）。⑫応答は1 MiB、`muni.js`は8 MiBまで。時間は8秒・15秒（Pythonと同じ）。⑬`muni_table`は、国内の問い合わせが要るときだけ取る（Pythonは毎サイクルの先頭で、無ければ取りに行く）。⑭ログ・失敗の文面に座標・地名・URLを出さない。⑮**停止の合図**は、行の境界・行のあとの待ち・再試行の待ちで見る。通信が進んでいる行は、標高・キャッシュ・DBの更新まで済ませてから止まる（普通の行は1秒未満、再試行込みでは最大で約51秒）。**時間の上限**は次の要求（再試行を含む）を始める前に見る。**Pythonとの差**: Pythonは、確定しなかった国内の行と同じキーの国外の行が後に来ると、国外の行がそのキーを空で上書きするので、先の国内の行は次のサイクルで空に当たる。Rustは先の行が確定するまで後の行を見送るので、障害があっても、直ったあとは障害が無かった場合（Pythonの順）と同じ地名に収束する | 障害で誤った「確定」を作らない、枠を塞がせない、サイクルを落とさない、Pythonの処理順を守る | 位置があって`place`がNULLの行があるとき | `geo-python.json`（Pythonの`enrich_rows`に偽の地理院を流した結果と、`photos`の全列・地理院への要求の順序・`.cache.json`の`geo:`キーが一致: 国内・国外・空で確定・矩形の角・片方だけ応答・両方なし・偶数丸め・先頭の0の自治体コード・キャッシュ済み・40件・`{:.3}`の丸め・**国内外でキーが衝突する行**。`--dry-run`の`would_query`もPythonの逆ジオの要求の数と一致）、単体テスト（再試行・全体の障害と座標による障害・標高だけの長期障害・本文が読めない失敗・待ち・停止・`muni.js`の失敗・記憶・競合・`--dry-run`）、検証環境（§15.8。実際の地理院と`muni.js`で、Pythonが保存した8行の地名が一致） | なし（決定） | [§15.3](#153-enrich)・[§15.4](#154-通信の失敗の分類) |
 | **簡易品質 `quality`（T2.6）**: ①**特徴量の行はPythonが作ったものも有効として使い、Rustは新しい（または`display`・`md5`・`mtime`が変わった）写真だけを自分の算法で解析する**（全写真を解析し直さない。特徴量の表に算法の印が無いので、混在する）。②Rustの鮮明度・輝度・露出はPythonと少し違う（Pillowの`thumbnail`の`reducing_gap`による箱型の縮小を再現しない。本番コピー6,535枚で鮮明度の比の中央値1.004）。pHashは同じ作り方で、同じ写真のPythonの値との距離は最大6（12以上は0枚）。③**同じSHA-256の写真は、指標（鮮明度・露出・コントラストなど）を`id`が最小の行にそろえてから順位をつける**（Pythonは行ごと。Pythonだけが作った行では同じ値なので差は出ない。本番コピーで確認）。**pHashはそろえない**: 類似の結びつき（3分以内・距離12以下）は各行の元のpHashで決めるので、グループの顔ぶれ・`kind`・配信の抑制の規則はPythonと同じ（同じSHAの2枚のpHashがPython／Rustの算法の差で違うとき、結びつきも各行のpHashで決まる）。④失敗の行の`error`は種類だけ（Pythonは`型名: 例外の文字列`を500文字まで）。⑤`photo_quality.algorithm`は`rust-phash-v1:t3:h12`（Pythonは`poc-phash-v1:t3:h12`。再構築のたびに全行がこの値になる）。**これは特徴量の由来ではなく、その`photo_quality`を作った実装の印**で、Pythonはこの値を読まない（書き換えても特徴量を無効にしない。切り戻しは§16.10）。⑥特徴量の書き込みと`dirty`、再構築の読み書き（未解析の数・dirty・特徴量の読み取り・全差し替え）がそれぞれ1つのトランザクション（Pythonは別々）。⑦`GEOFRAME_QUALITY_PER_CYCLE`が負・小数・非数なら起動を断る（Pythonは`int()`で通し、`max(1, …)`で負を1にする）。⑧撮影時刻は`strptime`と同じ規則でASCIIの数字だけ読む（全角の数字が混じった時刻はPythonだけが読める場合がある。同じ既知の差）。⑨**混在の限界**: 特徴量の行にはPython製とRust製が混ざり、同じ画像のpHashはPythonとRustで最大6離れる（計測）。類似の判定の閾値は12なので、別の写真との距離が12の境目にいる組は、算法の差で結びつきが変わりうる（境目の保証はできない。本番コピーで無作為の300枚をRustで解析した混在では、顔ぶれが変わらなかった回（eb54361。§16.2の表）と、7枚が入れ替わった回（de90a57。§16.9の(h)）があった。完全重複の非推奨＝配信から外れる数は、測った回ではどれも93。§16.2・§16.9）。⑩Rustで作った結果をPythonへ切り戻すと、変化なしのサイクルは結果を保つが、後で`dirty`になるとPythonがRust製の特徴量を含めて再構築する。顔ぶれ・`kind`は変わらず、同じSHAの写しの指標の差から出る順位・推奨・スコアだけが変わりうる（完全重複の写しのどちらを表に出すかが入れ替わりうる。件数は同じ。スコアの変化で信頼度の並びが変わると、グループ番号`group_id`は振り直されうる。§16.10） | 全写真を解析し直すと、一括で424秒、既定の同期サイクル（25枚／10分）では約44時間かかり、グループの顔ぶれが変わる（7枚）。Pythonの行を使えば`photo_quality`もE1の件数も変わらない。他は安全側・決定性 | 取り込み済みの本番コピー・新しい写真があるとき | `quality-python.json`（合成の`photos`と合成の特徴量にPythonの`quality_cycle`・`quality_backfill`を段階的に流した結果と、特徴量・`photo_quality`・`settings`の全列が一致: 完全重複・3分と距離12の境界・推奨・順位・並び・無効化・孤児・件数制限・dirty・同じSHAでpHashが違う写真の結びつき。さらに`switchbacks`: Rust→Pythonへの切り戻し（変化なしのサイクル・dirtyでの再構築）をPython本体に流した結果。`tools/gen_quality_fixture.py`、CIで`--check`）、単体テスト、検証環境（§16.9。Rustの再構築が本番コピーの`photo_quality`559行と全列で一致、実サイクルで`.dump`不変） | ②は、Pythonの行を全部Rustで作り直す必要が出たら`geoframe quality-scan`（特徴量を消してから）で解消できる。他は決定 | [§16](#16-簡易品質p2--t26) |
+| **更新API（T3.1。E12 `setloc`・E13 `setflag`と`POST`の入口）**: ①`i64`を超える整数の`id`はRustが存在しない`id`として404（Pythonは`sqlite3`が受け取れず500）。②JSONの`NaN`・`Infinity`はRustの解析が受け付けず400（Pythonは受け付けて「範囲外」の400。状態コードは同じで文面だけ違う）。③パスの`\`を`/`に読み替えない（`/api\admin\setloc`はPythonは当たり、Rustは403）。④`setflag`は`UPDATE … RETURNING`で1回の書き込みにする（PythonはUPDATEとSELECTが別）。⑤**書き込み（writer）が無い（`GEOFRAME_INGEST=0`）ときは、入力の検査（400）のあとで書かずに503**（Pythonに無い）。⑥未知の`POST`は`/api/blog/`配下も403（Pythonも403。依頼文の「`/api/blog/`の未知は404」は`GET`の話）。 | ①②③は実装の違い。⑤はP5まで本番の書き手がPythonで、Rustは書かない設計 | 更新APIを送ったとき | `tests/update_api.rs`が基準（`tools/gen_update_fixture.py`。現行の`handlers.Handler`に135件のPOSTを順に流した状態コード・応答・`photos`の変化と一致。差は`known_differences`の5件だけ。CIで`--check`） | なし（決定） | [§17](#17-更新apit31) |
+| **更新APIと同期サイクルの競合（T3.1）**: Pythonは`infer`の`UPDATE`が`WHERE id=?`だけで、計画を読んだあとに管理画面で直された位置（`manual`）を推定で上書き・取り消す。`enrich`の`UPDATE`も`WHERE id=?`だけで、地名の問い合わせ中に位置が直されると、古い座標の地名が新しい位置に書かれて`place`が埋まったまま残る（再enrichされない）。Rustは`infer`が`loc_source IS NULL OR 'inferred'`、`enrich`が`lat=? AND lon=? AND place IS NULL`の条件で守る（P2）。T3.1では`infer`の位置付けに「錨が計画のときの位置・種類のまま」の条件を足した（錨が手動で動かされたあとに古い位置を写さない） | 利用者の変更を失わない | 管理画面の操作が同期サイクルの段の途中に入ったとき | 割り込みを再現する単体テスト（§17.3） | なし（決定） | [§17.3](#173-同期サイクルとの競合) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記録は[p2-acceptance.md](p2-acceptance.md)。
 
@@ -274,7 +276,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 2. **`Host`ヘッダが2つ以上あれば400**（§9.2）。無い場合は従来どおり許可。
 3. **Host検査**（§9.2）。不許可は403。
 4. **絶対形式のrequest-target**（`GET http://host/…`）は、`Host`が許可でも**全ルートで403**（`/healthz`・`/api/v1/photos`も。Pythonはホワイトリストに当たらず403）。Host検査の後に判定するので、`Host`が不許可なら先にHost用の403になる（Pythonの`_host_ok`が先なのと同じ）。
-5. **`POST`は全部403**。更新系はP3で実装するまで、現行の「未知のPOST」と同じ403にする。
+5. **ルートの無い`POST`は403**（`/healthz`・`/api/v1/photos`など`GET`のAPIも）。ルート（`/api/admin/setloc`・`setflag`・`rotate`、`/api/blog/save`・`export`。`webpath::normalize`した結果の完全一致）がある`POST`は、CSRF対策を含めて`post::handle`が検査する（§17。P1では全部403だった）。
 6. ルート: `/healthz`、`GET /api/v1/photos`（§8）、それ以外は`site`（下記）。
 
 `site`（`GET`/`HEAD`）は、現行の`do_GET`/`do_HEAD`と同じ順に判定する。
@@ -377,7 +379,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | バックスラッシュを含む要求 | 区切りに読み替えて判定、実ファイルは404 | 403 | 区切りの解釈を持たない |
 | HTMLヘッダ・`no-cache`の判定 | 生のパス | デコード・正規化後のパス、`.htm`も | `%2E`で付かなくなる抜けを塞ぐ（§9.5） |
 | 未実装のルート（`/tiles/`、GETの`/api/admin/geocode`など`status`・`photos`以外の`/api/admin/`、`/api/ai/`、`/api/blog/`） | 応答する | 503と定型のJSON | P3・P4で実装する（`status`・`photos`はT1.4で実装、§10） |
-| `POST` | 既知のルートはContent-Type不一致でJSONの403、それ以外はHTMLの403 | 全部HTMLの403 | P3まで更新系が無い |
+| `POST` | 既知のルートはContent-Type不一致でJSONの403、それ以外はHTMLの403 | 同じ（T3.1。P1では全部HTMLの403だった。§17） | 更新ルートはT3.1で実装 |
 | `/healthz` | 無い（403） | 200/503（Host検査あり） | 新設（§4） |
 | 起動ログ・拒否ログ | 許可する名前、機体のIP、拒否したHostの値を出す | 件数だけ。Hostの値は出さない | §3.2の方針 |
 | 通常のファイル以外（FIFOなど） | 開こうとする（読み手が来るまで固まりうる） | 404 | 固まらないように |
@@ -1659,3 +1661,77 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 
 - **T2.7（実施済み。[p2-acceptance.md](p2-acceptance.md) §1・§3）**: 検証環境での受入のうち、本番コピーの`--dry-run`（変更ほぼ0）と実サイクルの通し、棚卸しS7（同じバイト列の写真・3分以内のほぼ同じ写真を入れて、完全重複の非推奨がE1から消えること）。
 - **P4**: AIワーカーが`photo_quality_features`を読む（`content_sha256`が`error=''`の行）。Rustで特徴量を作った行もそのまま使える。
+
+
+## 17. 更新API（P3 / T3.1）
+
+状態: T3.1 実装済み（2026-10-25）。E12 `POST /api/admin/setloc`（手動の位置）、E13 `POST /api/admin/setflag`（お気に入り・除外）と、POST の入口（ルーティング・CSRF 対策・エラー応答）。実装は`post.rs`（入口）と`update.rs`（E12・E13）。E14 回転は T3.2、旅行ブログの保存・書き出し（E15・E16）は T3.6。T3.2・T3.6 のルートは入口の検査（403・400・413）まで通し、処理は未実装として 503 を返す。
+
+### 17.1 順序と状態コード
+
+外側から §9.1 の検査（501 → Host → 絶対形式）を通ったあと、現行 `do_POST` と同じ順序:
+
+| 順 | 検査 | 外れたとき |
+| --- | --- | --- |
+| 1 | ルートが無い（`/api/blog/`配下も含む）。`webpath::normalize`した結果の完全一致なので、`/api/admin/setloc/`・`//api/admin/setloc`・`%73etloc`・`?x=1`付きも当たる | HTMLの403（`GET`の未知の`/api/blog/…`だけが404。`POST`は違う） |
+| 2 | `Content-Type`の`;`より前を空白除去・小文字化して`application/json` | JSONの403 |
+| 3 | `Origin`があり**空でなければ**、そのnetloc（Pythonの`urlparse(origin).netloc`）が`Host`（空白除去）と**文字列として同じ**（ポート込み・大文字小文字を区別）。`Origin`が無い・空なら通す | JSONの403 |
+| 4 | `Content-Length`がある（`Transfer-Encoding: chunked`は無いのと同じ） | JSONの400 |
+| 5 | 64 KiB（65536）以下。**超えたら本文を読まず**413を返し、`Connection: close`で接続を閉じる | JSONの413（`上限65536バイト`） |
+| 6 | JSONとして解釈できる | JSONの400 |
+| 7 | 値がオブジェクト | JSONの400 |
+| 8 | 各ルートの処理 | `BadRequest`400・`NotFound`404・（実行中）409・writerなし503・その他500 |
+
+- CORSヘッダは一切返さない。`OPTIONS`は501のまま（§9.1の1）。`HEAD /api/…`は今のまま403（P1で決めたもの）、`GET /api/admin/setloc`などの更新ルートへのGETは未実装の503のまま（T3.3で`/api/admin/`の503が狭まる）。
+- 応答は`{"ok": false, "error": "…"}`（成功は各ルートの形）。`Content-Type: application/json; charset=utf-8`・`Cache-Control: no-store`。
+- 文面（`error`）は現行と同じ。例外・SQLiteのエラー文字列は**応答に出さない**: 500は`内部エラーが発生しました`だけで、詳細（`WriteError`のDisplay＝SQLiteのメッセージ。表名・列名まで）は`[api] <ルート> 内部エラー: …`としてログにだけ出す。成功時は何もログに出さない（座標・`id`を出さない）。アクセスログは§9.6のまま（メソッド・ルートのテンプレート・状態コード・時間）。
+- Pythonの`http.server`はHTTP/1.0で毎回接続を閉じるが、Rustは keep-alive する。本文を読まずに返す応答（403・400）の未読の本文は hyper が扱う（次の要求として解釈しない）。413だけは、Pythonと同じく**明示的に閉じる**（`Connection: close`）。
+- 本文は`axum::body::to_bytes`で宣言の長さまで読む。宣言より短く切れたら400。遅い・読まないクライアントは`limits.rs`の無通信・停滞の上限（§9.3）が切る。
+
+### 17.2 E12 `setloc`・E13 `setflag`
+
+`update.rs`。検査は現行の`_req_id`・`_req_coord`と同じ境界・同じ文面。
+
+- `id`: 整数で正（`bool`・文字列・小数・`null`・欠落は`id は整数で指定してください`、0以下は`id が範囲外です`）。
+- `lat`（-90〜90）・`lon`（-180〜180）: 数値のみ（整数も可で`float`に直す。`bool`・文字列・`null`・欠落は`… は数値で指定してください`）。閉区間。範囲外は`lat が範囲外です（-90.0〜90.0）`。検査の順は`id`→`lat`→`lon`。
+- E12が更新する列（現行の`admin_setloc`と同じ。フィクスチャで`photos`の変化を全列比較）: `lat lon`、`loc_source='manual'`、`inferred_from infer_dt_s`と`place elev muni_cd pref city`をNULL。`display`・`favorite`・`hidden`・`rotation`などには触れない。地名は`enrich`が`lat IS NOT NULL AND place IS NULL`で次のサイクルに拾い直す。`manual`は`infer`の再評価の対象外で、ほかの未解決の写真の錨になる（棚卸しS4）。応答`{ok,id,lat,lon,loc_source:'manual'}`、対象なしは404。
+- E13: `favorite`・`hidden`はJSONの`bool`だけ（`null`・数値・文字列は`… は true/false で指定してください`）。どちらも無ければ400。指定した列だけ書く。応答`{ok,id,favorite,hidden}`（更新後の両方）、対象なしは404。`favorite`→`hidden`の順に検査し、片方が不正なら何も書かない。
+- 検査（400）を先に済ませ、通ったものだけ writer の有無を見る（§17.4）。
+
+### 17.3 同期サイクルとの競合
+
+書き込みは全部 writer の単一接続・専用スレッドを通る（§11.4）ので、段の1回の書き込み（1トランザクション）の**途中**に更新APIは入れない。入れるのは「段が計画を読んでから writer に書きを積むまで」の間（`index_local`は写真の走査とEXIFの読み取りの間、`index_drive`はDriveの一覧取得の間、`enrich`は地理院への問い合わせの間、`fetch_derivatives`は原本のダウンロードの間）。段ごとの結果:
+
+| 段 | 割り込みで起きうること | 守り（Rust） | Python | 試験 |
+| --- | --- | --- | --- | --- |
+| `index_local` / `index_drive` | `UPDATE`は`mtime`・`md5`が変わった行の`lat lon loc_source`などを上書きし、`DELETE`は消えた行を消す。`favorite`/`hidden`/`rotation`は`SET`句に無いので**残る**。手動の位置は、ファイルが変わった行では上書きされ、消えた行はお気に入り・除外ごと消える | **競合では失われない**: 更新APIが計画の前でも後でも結果は同じ（ファイルから決まる値で上書き・削除）。失われるのは[inventory.md §2.3](inventory.md)の①②で、**T3.7でユーザーの決めた方針に合わせる**。それまでは現行と同じ。計画に入らない行（ファイルが変わっていない行）の手動の位置・お気に入りは残る | 同じ（Pythonは1枚ずつ読んで書くので窓は狭いが、結果は同じ） | `local::tests::計画のあとに更新apiが入っても…`、`drive::tests::index_drive_plan_survives_…` |
+| `infer` | 計画（読み取り）のあとに、対象の行が手動になった・錨が手動で動かされた | `Set`/`Clear`の`UPDATE`は`loc_source IS NULL OR 'inferred'`の行にだけ効く（P2）。**T3.1で追加**: `Set`は、錨が計画のときの位置・種類（`exif`/`drive_meta`/`manual`）のままのときだけ。動かされた錨の古い位置を写さない（次のサイクルが新しい錨で付け直す） | `WHERE id=?`だけ: **手動の位置を推定で上書きし、`Clear`は取り消す**（位置が失われる） | `geo::tests::計画のあとに更新apiで直された位置…`（`Set`・`Clear`・錨の移動） |
+| `enrich` | 地名の問い合わせ中に位置が直された（`place`がNULLに戻る） | `UPDATE`は`lat=? AND lon=? AND place IS NULL`（P2）。座標が変わった行には古い座標の地名を書かず、次のサイクルが新しい座標で付ける | `WHERE id=?`だけ: 古い座標の地名が新しい位置に書かれ、`place`が埋まったまま**再enrichされない**（誤った地名が残る） | `geo::tests::enrichの途中で更新apiが…` |
+| `fetch_derivatives` / `local_derivatives` | 取得の途中で位置・お気に入りが変わる | 書くのは`display fetched_at`だけ（`WHERE id=?`）で、利用者の列に触れない。割り込みの影響なし。（T3.2の回転は`display`/`rotation`を書くので、そこで取得との競合を扱う） | 同じ | `drive::tests::fetch_keeps_what_the_update_api_wrote…`、`local::tests::derivativeの作成中に…` |
+| `quality` | 解析の途中で位置・お気に入りが変わる | 書くのは`photo_quality_features`・`photo_quality`・`settings`だけで`photos`に書かない。影響なし | 同じ | `quality::tests::解析の途中で更新apiが…` |
+
+割り込みの再現は、`Writer`の試験用の口（`interrupt_next_call`: 次の`call`が依頼を積む直前に1回だけ閉包を呼ぶ。`cfg(test)`）で、**段の`run`が計画を読んだあと**に更新API（`update::set_loc`・`set_flag`を本物の writer 経由で）を呼ぶ。段が書いたあとの`photos`の全列を確かめる。`enrich`は地理院のスタブの応答の中から呼ぶ。条件を外すと落ちることは確認済み（`infer`の2つの条件）。
+
+### 17.4 writer の共有と、取り込みが無効なとき
+
+- `AppState::writer()`は`Catalog`が持つ writer（`cli.rs`が`GEOFRAME_INGEST=1`のときだけ付ける。§11.4）の複製を返す。同期サイクルのスレッドと**同じ接続・同じキュー**。更新は`spawn_blocking`の中で`Writer::call`する。
+- `None`（`GEOFRAME_INGEST=0`、またはガード（§11.1.1）で取り込みを断ったので writer が作られない）のとき、更新APIは**何も書かず**503（`書き込みが無効なので更新できません（この Rust 版は取り込みが無効です）`。値・パス・環境変数名は含めない）。この503は`catalog.db`への書き込みに限る。地図タイルのキャッシュや`.cache.json`はDBではないので、後のタスク（T3.3・T3.4）では取り込みが無効でも動かす。
+- P2〜P4のガード（検証環境の印・`geoframe-server`の停止の確認）は変えていない。ガードを通らないと writer が作られず、更新APIは書かない。
+
+### 17.5 Pythonとの差（まとめ）
+
+§0の2行に同じ。①`i64`超の`id`は404（Pythonは500）。②JSONの`NaN`・`Infinity`は400（文面が違う）。③パスの`\`は読み替えず403。④`setflag`は1回の`UPDATE … RETURNING`。⑤writerが無いと503。⑥競合の守り（`infer`・`enrich`はPythonが失う）。
+
+### 17.6 テスト
+
+- `tests/update_api.rs`: `tools/gen_update_fixture.py`（`app/tests/update_api_fixture.py`の135ケース）が現行`handlers.Handler`に順にPOSTした状態コード・応答のJSON・`photos`の変化（変わった行の変わった列）と、同じDBを作り直したRustのサーバーの結果が一致する。ケース: 各境界値（閉区間・範囲外・`bool`・文字列・`null`・欠落・`id` 0/負/文字列/小数）、存在しない`id`、更新する列、ルーティング（正規化・クエリ・大文字小文字・未知）、CSRFの各分岐と順序（Content-Type→Origin→Content-Length→413→JSON→オブジェクト）、64 KiBちょうどと1バイト超、BOM・不正UTF-8・末尾ゴミなど。意図した差（5件）は`known_differences`で、差が消えたら落ちる。
+- 同ファイル: writerなしの503（書かない・定型文・400/403は変わらない）、Hostの検査がルートより先、`Origin`とポート、`OPTIONS`が501でCORSヘッダなし、`chunked`は400、413で接続が閉じる（keep-aliveのソケットで本文を送らずに確認）、500の本文に例外が出ない、同時の更新がすべて書かれる。
+- `src/update/tests.rs`: E12・E13の境界と文面、writerなし。`access_log.rs`: POSTのログにメソッド・ルート・状態コードと内部エラーの種類だけが出て、座標・`id`・Originの値は出ない。
+- §17.3の割り込みの試験（`geo`・`local`・`drive`・`quality`の`tests`）。
+- `app/tests/test_update_api_fixture.py`: フィクスチャが最新であること、検査の順序、Pythonの癖の記録。
+
+### 17.7 回したもの
+
+- **T3.2**: E14 回転（`display`/`rotation`を書く。取得・品質との競合）。
+- **T3.7**: 索引（`index_local`・`index_drive`）が手動の位置・お気に入り・除外を失う経路（§17.3の1行目）の方針。
+- **T3.8**: 検証環境での受入（比較用Python `:8090`に同じ要求を送って応答とDBの変化を比べる）。

@@ -37,6 +37,8 @@ use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 use std::sync::mpsc;
+#[cfg(test)]
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -111,10 +113,18 @@ fn rollback_and_verify(conn: &Connection) -> bool {
     true
 }
 
+/// 試験用の割り込み口（[`Writer::interrupt_next_call`]）。
+#[cfg(test)]
+type Hook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 /// 書き込み用の接続を持つスレッドへの入口。複製は安く、全ての複製が同じ接続（同じスレッド）を使う。
 #[derive(Clone)]
 pub struct Writer {
     jobs: mpsc::Sender<Job>,
+    /// 試験用: 次の [`Writer::call`] が依頼を積む直前に 1 回だけ呼ぶ閉包（呼び出したスレッドで）。
+    /// 同期サイクルの段が「計画を読んでから書くまで」の間に更新 API を割り込ませる試験のため。
+    #[cfg(test)]
+    before_call: Option<Hook>,
 }
 
 impl fmt::Debug for Writer {
@@ -155,7 +165,21 @@ impl Writer {
                 }
             })
             .expect("書き込みスレッドを起動できません");
-        Self { jobs }
+        Self {
+            jobs,
+            #[cfg(test)]
+            before_call: None,
+        }
+    }
+
+    /// 試験用: 次の [`Writer::call`] の直前に `f` を 1 回だけ呼ぶ複製を返す（元の `Writer` には効かない）。
+    /// `f` の中で元の `Writer` に書けば、その書き込みはこの `call` の依頼より先に確定する。
+    #[cfg(test)]
+    pub(crate) fn interrupt_next_call(&self, f: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            before_call: Some(Arc::new(Mutex::new(Some(Box::new(f))))),
+            ..self.clone()
+        }
     }
 
     /// `f` を書き込みスレッドの接続で実行し、結果を返す（呼び出しスレッドはその間ブロックされる）。
@@ -166,6 +190,13 @@ impl Writer {
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
     {
+        #[cfg(test)]
+        if let Some(hook) = &self.before_call {
+            let hook = hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let (reply, answer) = mpsc::sync_channel(1);
         let job: Job = Box::new(move |conn| {
             let result = catch_unwind(AssertUnwindSafe(|| f(conn)))

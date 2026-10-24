@@ -34,7 +34,8 @@ use crate::admin::{self, AdminContext};
 use crate::config::Config;
 use crate::db::Catalog;
 use crate::limits::{ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
-use crate::{hostcheck, photos, pyquery, statics, sysinfo, webpath};
+use crate::writer::Writer;
+use crate::{hostcheck, photos, post, pyquery, statics, sysinfo, webpath};
 
 /// `/healthz` が DB の確認を待つ上限。超えたら不健康（503）として答える。`/healthz` 専用の接続の
 /// `busy_timeout`（2 秒、`db.rs`）より長く、API の読み取りとは別の接続を使うので、API が混んで
@@ -62,6 +63,13 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// 書き込み用の接続（writer）の共有ハンドル。取り込みが有効（`GEOFRAME_INGEST=1`）のときだけある。
+    /// 同期サイクルの段と同じ writer（単一接続・専用スレッド）で、更新 API もこれを通す。`None` のときの
+    /// 更新 API は、何も書かずに 503（[`post`]）。
+    pub fn writer(&self) -> Option<Writer> {
+        self.catalog.writer().cloned()
+    }
+
     /// `config.data_dir` を解決して状態を作る。解決できないとき（起動時には DB を開いているので
     /// 起きない。テストで存在しない置き場を渡した場合など）は解決前の絶対パスのままにし、
     /// 静的配信は 404 を返す。
@@ -235,7 +243,7 @@ async fn api_admin_photos(state: &AppState, query: Option<&str>) -> Response {
     }
 }
 
-fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
+pub(crate) fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
     (
         status,
         [
@@ -251,7 +259,7 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
 }
 
 /// `{"ok":false,"error":"..."}`。本文は定型文だけで、環境の情報（SQLite のエラー・パス）を載せない。
-fn error_response(status: StatusCode, message: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "ok": false, "error": message });
     json_response(status, body.to_string().into_bytes())
 }
@@ -305,7 +313,8 @@ async fn access_log(request: Request, next: Next) -> Response {
 /// 3. Host 検査（[`hostcheck`]）。不許可は 403。**Host の値はログに出さない**。
 /// 4. 絶対形式の request-target（`GET http://host/...`）は全ルートで 403（現行でもホワイトリストに
 ///    当たらず 403。`Host` ヘッダと別の宛先を名乗れる形なので、`/healthz`・`/api/v1/photos` にも通さない）。
-/// 5. `POST` は P1 では全部 403（更新系は P3 で実装する。現行の「未知の POST」と同じ応答）。
+/// 5. `POST` はルート（[`post::route_of`]）が無ければ 403。あれば [`site`] の `post::handle` が CSRF 対策
+///    （Content-Type・Origin・Content-Length・サイズ・JSON）を検査する。
 async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let method = request.method();
     if !matches!(*method, Method::GET | Method::HEAD | Method::POST) {
@@ -331,7 +340,9 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
     if request.uri().scheme().is_some() {
         return statics::forbidden();
     }
-    if *method == Method::POST {
+    // ルートの無い POST は 403（`/healthz` など GET の API も）。ルートのある POST は CSRF 対策を含めて
+    // `post::handle` が検査する
+    if *method == Method::POST && post::route_of(request.uri().path()).is_none() {
         return statics::forbidden();
     }
     next.run(request).await
@@ -405,9 +416,19 @@ fn not_yet_implemented(label: &'static str) -> Response {
 ///
 /// `HEAD` も `GET` と同じ判定を通る（`HEAD /api/...` は静的のホワイトリストに当たらず 403。現行と同じ）。
 async fn site(State(state): State<AppState>, request: Request) -> Response {
-    let (parts, _body) = request.into_parts();
+    let (parts, body) = request.into_parts();
     let method = &parts.method;
     let raw = parts.uri.path();
+    if *method == Method::POST {
+        // 入口の検査（`guard`）がルートの有無を済ませている
+        return match post::route_of(raw) {
+            Some(route) => labeled(
+                post::handle(&state, route, &parts.headers, body).await,
+                route.label(),
+            ),
+            None => statics::forbidden(),
+        };
+    }
     // 現行の `http.server` は、先頭の `//` を1つの `/` にしてから `do_GET` に渡す。接頭辞の判定は
     // その後のパスで行う（`//api/admin/status` も当たる）。静的配信の正規化（`webpath::normalize`）は
     // 元のパスを受けて自分で同じ畳み込みをする

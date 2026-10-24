@@ -586,6 +586,110 @@ fn 計画を作ってから書くまでの間に手動になった行は上書�
     assert_eq!(row["lat"], SAPPORO.0);
 }
 
+/// 更新 API（E12・E13）を writer 経由で呼ぶ。割り込みの試験用。
+fn api_set_loc(writer: &Writer, id: i64, pos: (f64, f64)) {
+    let payload = json!({"id": id, "lat": pos.0, "lon": pos.1});
+    crate::update::set_loc(payload.as_object().unwrap(), Some(writer)).unwrap();
+}
+
+fn api_set_flag(writer: &Writer, id: i64, flags: Value) {
+    let mut payload = flags.as_object().unwrap().clone();
+    payload.insert("id".into(), json!(id));
+    crate::update::set_flag(&payload, Some(writer)).unwrap();
+}
+
+#[test]
+fn 計画のあとに更新apiで直された位置_お気に入り_除外はinferに失われない() {
+    let mut s = setup("geo-infer-update-api");
+    s.sql(&format!(
+        "{};{};{};{}",
+        photo(1, Some("2024-05-06 10:00"), Some(TOKYO), Some("exif")), // 錨
+        photo(2, Some("2024-05-06 10:05"), None, None),                // 推定される（Set）
+        photo(3, Some("2024-05-12 10:00"), Some(TOKYO), Some("inferred")), // どの錨も窓の外（Clear）
+        photo(4, Some("2024-05-06 10:20"), None, None), // 錨 1 から推定される（Set）
+    ));
+    // 段が計画を読んだあと、writer に依頼を積む直前に、管理画面から更新が入る
+    let api = s.writer.clone();
+    s.writer = api.clone().interrupt_next_call(move || {
+        api_set_loc(&api, 2, SAPPORO);
+        api_set_flag(&api, 2, json!({"favorite": true, "hidden": true}));
+        api_set_loc(&api, 3, PARIS);
+        api_set_flag(&api, 3, json!({"favorite": true}));
+        api_set_loc(&api, 1, PARIS); // 錨が手動で動かされる
+    });
+    let counts = s.run(&Infer);
+    // 計画は割り込みの前の状態（3 件が書かれるはずだった）
+    assert_eq!(get(&counts, "inferred"), 2);
+    assert_eq!(get(&counts, "cancelled"), 1);
+
+    let (p2, p3) = (s.row(2), s.row(3));
+    assert_eq!(
+        (p2["loc_source"].clone(), p2["lat"].clone()),
+        (json!("manual"), json!(SAPPORO.0))
+    );
+    assert_eq!(
+        (p2["favorite"].clone(), p2["hidden"].clone()),
+        (json!(1), json!(1))
+    );
+    assert_eq!(p2["inferred_from"], Value::Null);
+    assert_eq!(
+        (p3["loc_source"].clone(), p3["lat"].clone()),
+        (json!("manual"), json!(PARIS.0))
+    );
+    assert_eq!(p3["favorite"], json!(1));
+    assert_eq!(p3["inferred_from"], Value::Null);
+    // 錨が計画のときの位置ではなくなったので、古い位置を 4 に写さない
+    let p4 = s.row(4);
+    assert_eq!(
+        (p4["lat"].clone(), p4["loc_source"].clone()),
+        (Value::Null, Value::Null),
+        "動かされた錨の古い位置を写してはいけない"
+    );
+    assert_eq!(s.row(1)["lat"], json!(PARIS.0));
+
+    // 次のサイクルが、新しい錨（2 は手動、10:05）から付け直す
+    s.writer = s.writer.clone();
+    let counts = s.run(&Infer);
+    assert_eq!(get(&counts, "inferred"), 1);
+    let p4 = s.row(4);
+    assert_eq!(p4["loc_source"], "inferred");
+    assert_eq!(p4["inferred_from"], json!(2));
+    assert_eq!(p4["lat"], json!(SAPPORO.0));
+}
+
+#[test]
+fn enrichの途中で更新apiが位置を直しても古い座標の地名は書かず_除外は残る() {
+    let s = setup("geo-enrich-update-api");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    s.sql(&format!(
+        "{};{}",
+        photo(1, None, Some(TOKYO), Some("exif")),
+        photo(2, None, Some(PARIS), Some("exif")),
+    ));
+    // 1 の逆ジオの応答を返している最中に、管理画面で 1 の位置が直され、2 が除外される
+    let api = s.writer.clone();
+    stub.set_elev(move |lat, _| {
+        if (lat - TOKYO.0).abs() < 1e-6 {
+            api_set_loc(&api, 1, SAPPORO);
+            api_set_flag(&api, 2, json!({"hidden": true}));
+        }
+        Reply::json(r#"{"elevation":1}"#)
+    });
+    s.run(&enrich_for(&stub));
+    let p1 = s.row(1);
+    // 古い座標（東京）の地名は、新しい座標（手動）に書かれない
+    assert_eq!(p1["place"], Value::Null);
+    assert_eq!(
+        (p1["lat"].clone(), p1["loc_source"].clone()),
+        (json!(SAPPORO.0), json!("manual"))
+    );
+    assert_eq!(s.row(2)["hidden"], json!(1));
+    // 次のサイクルが新しい座標で地名を付ける
+    s.run(&enrich_for(&stub));
+    assert_ne!(s.row(1)["place"], Value::Null);
+}
+
 #[test]
 fn 値が変わらない行には書かない() {
     let s = setup("geo-infer-nowrite");

@@ -24,6 +24,7 @@ pub mod local;
 pub mod logging;
 pub mod net;
 pub mod photos;
+pub mod post;
 pub mod pyquery;
 pub mod quality;
 pub mod schema;
@@ -32,6 +33,7 @@ pub mod statics;
 pub mod stop;
 pub mod sync;
 pub mod sysinfo;
+pub mod update;
 pub mod webpath;
 pub mod writer;
 

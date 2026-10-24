@@ -305,7 +305,7 @@ async fn only_the_two_reads_are_implemented() {
             "{target}"
         );
     }
-    // GET だけ。HEAD は `/api/` の接頭辞なので現行と同じく 403、POST は P3 まで全部 403
+    // GET だけ。HEAD は `/api/` の接頭辞なので現行と同じく 403、POST は更新ルートではないので 403
     for method in ["HEAD", "POST"] {
         for target in ["/api/admin/status", "/api/admin/photos"] {
             let response = request(server.addr, method, target, &[("Host", "localhost")]).await;
