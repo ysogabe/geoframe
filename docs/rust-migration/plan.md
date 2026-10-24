@@ -23,7 +23,7 @@ Issue #54 と設計案をそのまま要求・設計として扱い、この文�
 
 ## 2. 守ること（本番機の扱い）
 
-- **geoframe-n100（192.168.0.132）が本番機**で、開発もこの機体で行う。ここでは次をしない。
+- **geoframe-n100が本番機**で、開発もこの機体で行う。ここでは次をしない。
   - `deploy/deploy.sh`・`deploy-pull.sh`の実行、`geoframe-server`の停止・再起動
   - `/var/lib/geoframe/catalog.db`を書き込み可能で開くこと、Rustを本番DBへ向けること
 - 本番データの持ち出しは**読み取りのバックアップ**（`/var/backups/geoframe/latest.db.gz`、`sqlite3 .backup`相当）からだけ行う。
@@ -32,11 +32,11 @@ Issue #54 と設計案をそのまま要求・設計として扱い、この文�
 
 ## 3. 検証環境（lxc-geoframe）
 
-192.168.0.131のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境として使う。
+LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境として使う。
 
 | 項目 | 内容 |
 | --- | --- |
-| 接続 | `ssh hermes@192.168.0.155`（macvlanでLAN直結、sudo可）。LXDホストからは`lxc exec lxc-geoframe` |
+| 接続 | macvlanでLAN直結のSSH。LXDホストからは`lxc exec lxc-geoframe`。接続先の値はGit管理外のメモ（`local-notes/rust-migration-staging.md`）に置く |
 | OS・資源 | Ubuntu 24.04（glibc 2.39）、2コア、メモリ4GiB。ビルド機のn100はDebian 13（glibc 2.41）なので、**n100でglibc向けにビルドしたものはそのまま動かない可能性がある**（P0で確かめる） |
 | データ | `/var/lib/geoframe`に本番のコピー: `catalog.db`（2026-10-24 06:17のバックアップ）、`derivatives/`、`blog_exports/`、`travel_blog/`。`drive_key.json`・`models/`・`tile_cache/`はコピーしない |
 | 旧環境 | 2026-08時点の旧版は`/opt/geoframe.old-202608`・`/var/lib/geoframe.old-202608`・`/etc/default/geoframe.old-202608`・`/root/old-units-202608/`へ退避し、unitは無効化済み。不要になったら消す |
@@ -77,7 +77,7 @@ Issue #54 と設計案をそのまま要求・設計として扱い、この文�
 
 ### P4: AI Providerとジョブ（PR 5）
 
-- 永続ジョブ（状態・再試行時刻・回数上限・入力ハッシュ・処理版）、local-model-labのLAN API（`http://192.168.0.132:8100`、`X-Client-Name: geoframe`、`/llm/services/<id>`のavailable確認、lease中は後回し）、Geminiアダプター（タスクごとの明示ポリシーがあるときだけ写真を送る）。
+- 永続ジョブ（状態・再試行時刻・回数上限・入力ハッシュ・処理版）、local-model-labのLAN入口（本番機の`:8100`。接続先は設定で与える、`X-Client-Name: geoframe`、`/llm/services/<id>`のavailable確認、lease中は後回し）、Geminiアダプター（タスクごとの明示ポリシーがあるときだけ写真を送る）。
 - Embeddingはmodel・前処理版・次元・ベクトル空間IDごとに分けて保存し、異なる空間を混ぜない。画像Embedding APIはlocal-model-lab #93の結果に合わせる。
 - 位置候補（Decision→Gemini）、同一場面のグループ化と代表選択、AI検索。
 
