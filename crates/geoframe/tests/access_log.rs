@@ -146,6 +146,7 @@ async fn access_log_has_only_method_route_status_and_time() {
         "abcSecretToken",
         "nope-secret",
         "secret-query",
+        "secret-route",
         "secret-filter",
         "secret-page",
         "secret-status",
