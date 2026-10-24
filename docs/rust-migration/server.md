@@ -1,20 +1,20 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 0. Pythonとの差の索引
 
-P1・P2（T2.1〜T2.4）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1〜T2.5）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
 | `GEOFRAME_DATA_DIR`の既定が`./var`（Pythonは`app/var`）。`app/.env`を読まない | 単一バイナリに`app/`が無い。本番はunitの`EnvironmentFile`が同じ役目 | 環境変数・`.env`で与えず手で起動したとき | 設定のテスト。本番はunitが常に与える | なし（決定） | [§1.1](#11-優先順位)・[§1.3](#13-appenvは読まない) |
 | 不正な設定値は起動を断る（終了コード2）。`GEOFRAME_EMBED_BACKEND`だけ`gemini`に落とす。`GEOFRAME_HOST`のホスト名はPythonは通すがRustは断る（IPアドレスだけ） | 事故を早く見つける。Pythonは例外で落ちる | 不正な値が設定にあるとき（本番は`0.0.0.0`か`127.0.0.1`） | 単体テスト、検証環境で再起動ループにならないこと | なし（決定） | [§1.1](#11-優先順位)・[§10.6](#106-pythonとの差まとめ) |
-| 全角数字など ASCII 以外の数字の撮影時刻をRustのフィード（§8）は読めない（旅番号がずれうる） | 時刻の解釈を`strptime`に合わせきれていない | EXIFに全角数字が入った写真 | 本番コピーでは差0。単体テスト | **T2.2で`imaging::norm_time`が数字をASCIIに直す**（Pythonは元の文字のまま保存する）。呼ぶのはT2.3・T2.4のインデクサ。Pythonが書いて既にDBに入っている全角の値は直さない | [§8.2](#82-値)・[§12.3](#123-exif撮影時刻gps向き) |
-| 夏時間を持つ`TZ`のときの時刻の差 | RustはP1で`TZ`を解釈せず、naiveな日時を文字列・暦で扱う | `TZ`が夏時間を持つとき（本番は`Asia/Tokyo`） | 本番設定では差なし | P2以降で時刻を変換するときに再検討 | [§1.2](#12-tz)・[§10.6](#106-pythonとの差まとめ) |
+| 全角数字など ASCII 以外の数字の撮影時刻をRustのフィード（§8）と**位置の推定（T2.5の`infer`）**は読めない（旅番号がずれうる。`infer`は、そのような時刻の写真を「時刻なし」として扱う） | 時刻の解釈を`strptime`に合わせきれていない | EXIFに全角数字が入った写真 | 本番コピーでは差0。単体テスト | **T2.2で`imaging::norm_time`が数字をASCIIに直す**（Pythonは元の文字のまま保存する）。呼ぶのはT2.3・T2.4のインデクサ。Pythonが書いて既にDBに入っている全角の値は直さない | [§8.2](#82-値)・[§12.3](#123-exif撮影時刻gps向き) |
+| 夏時間を持つ`TZ`のときの時刻の差（T2.5の`infer`の時刻の差を含む） | RustはP1で`TZ`を解釈せず、naiveな日時を文字列・暦で扱う（`infer`は暦の日数×86400＋時分で差を取る。Pythonは`strptime(…).timestamp()`で`TZ`として解釈する） | `TZ`が夏時間を持つとき（本番は`Asia/Tokyo`） | 本番設定では差なし | P2以降で時刻を変換するときに再検討 | [§1.2](#12-tz)・[§10.6](#106-pythonとの差まとめ) |
 | `taken_at`がNULLの行: Pythonは`time: null`で先頭、Rustは空文字で最後 | 契約（`time`は必ずある）に合わせる | `taken_at`がNULLの行がDBにあるとき | 本番コピーに該当行なし（管理者確認済み） | なし（決定） | [§8.3](#83-pythonとの差) |
 | `lat`ありで`lon`がNULLの行: Pythonは一覧全体が500になりうる、Rustは一覧から外す | 契約（`lon`は必ずある）に合わせる | 該当行があるとき（通常は起きない） | 本番コピー（2026-10-24のバックアップ）での全件比較で差0（表示対象に該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
 | 静的配信・HTTPの差（領域外のリンクは403、`ETag`での再検証、`/healthz`の新設、未実装ルートの503、`POST`は全部403、接続・配信の上限など） | 安全性、固定の挙動、まだ無いことの明示 | 該当する要求を送ったとき | 検証環境で現行Pythonとの比較（状態コード・本文の一致）、単体テスト | 503・`POST`はP3・P4で実装して外す。他は決定 | [§9.7](#97-pythonとの差まとめ) |
@@ -31,12 +31,14 @@ P1・P2（T2.1〜T2.4）でPythonと意図して違える点・既知の差の�
 | **入力の限界（T2.2）**: 1ファイル512 MiBまで（まるごとメモリに読む。Pythonは上限なし。`img-probe`の`--out`なしも同じ）。**HEICは、デコーダに渡す前に、ファイルが宣言する長さ・寸法（`mdat`のサイズ・EXIFのextent・`ispe`・SPS）がファイルの実際の大きさと画素数の上限に収まるか検査する**（`zune-heic`は宣言値で先に確保するので、小さな偽のファイルで確保に失敗してプロセスごと落ちるため。§12.4）。**EOI（画像データの終わりのマーカー）の無いJPEGは失敗にする**（切れたファイルと見分けられないため。§12.8）。Pillow 12.3.0も、EOIだけが欠けてファイルがそこで終わるJPEGと、SOS以降の全ての切断点で切ったJPEGは失敗にする。**Pythonが読んでRustが失敗にするのは、EOIが無くその位置にゴミやゼロ埋めが続くファイルだけ**（Pillowはそれも画像データとして読む。`tests/jpeg_eoi_python.rs`）。手動回転は0・90・180・270だけ（管理画面もその値しか作らない）。`.part`は`<出力名>.<pid>.<乱数>.part`を**排他的に新規作成**して（`O_EXCL`＋`O_NOFOLLOW`。既存のシンボリックリンクを辿らない）書き、書き込みに失敗・パニックしても**自分の**`.part`は残さない（Pythonは失敗すると残しうる）。出力の`.part`は`fsync`してから`rename`する | メモリの上限、電源断で空のderivativeを残さない、`DATA_DIR`の外を書き換えさせない | 巨大なファイル、偽の長さのHEIC、書き込みの失敗、`derivatives/`に置かれたリンク | 単体テスト、`tests/jpeg_eoi_python.rs`（`tools/gen_jpeg_eoi_fixture.py`） | なし（決定） | [§12.2](#122-derivativeの手順とpythonとの差) |
 | **ローカル写真の索引（T2.3）**: ①`mtime`が変わった行の更新は、手動で直した位置（`loc_source='manual'`）も`exif`か`NULL`に**上書きする**（Pythonと同じ。`place elev display`もNULLに戻る。お気に入り・除外・回転・`fetched_at`は残る）。②**シンボリックリンクのディレクトリには降りない**（Pythonの`rglob`も降りない）。**ファイルのリンクは、実体が`DATA_DIR`の中にあるときだけ**取り込む（Pythonは外のファイルも読む）。名前がUTF-8でないエントリは飛ばす（Pythonは行を作る段で例外）。③書き込みは**1つのトランザクション**（追加・更新・削除をまとめる。Pythonは1文ごとのコミット）。EXIFの読み取りは書き込みの外で先に済ませる。④`GEOFRAME_PHOTOS_DIR`が`DATA_DIR`の外・`DATA_DIR`そのものを指すとその段は失敗する（Pythonは外で例外。`DATA_DIR`そのものだと`derivatives/`と`tmp/`の原本まで索引する）。⑤`mtime`がNULL・文字列の行は「変わった」とみなす（Pythonは例外）。⑥消した行の`display`が`derivatives/<安全な名前>`でなければ、行は消すがファイルは消さない（Pythonは`DATA_DIR / display`を無検査で消す）。⑦`GEOFRAME_FETCH_PER_CYCLE`は0以上の整数だけ（負の値は起動を断る。Pythonは負だとSQLiteの`LIMIT`が無制限） | ①は現行の挙動（直すかはP3で決める。[inventory.md §2.3](inventory.md)）。②〜⑦は安全側 | ローカルに写真を置いたとき | `tests/local_index_python.rs`（合成の木を4段階の操作でPythonの`index_local`と`photos`の全列・`id`・書き換えの有無まで突き合わせる。基準は`tools/gen_local_index_fixture.py`、CIで`--check`）、単体テスト、検証環境（§13.9。比較用Pythonと14行・全列が同じ） | ①は**P3で直すか決める**。他は決定 | [§13.2](#132-index_local)・[§13.7](#137-pythonとの差まとめ) |
 | **`local_derivatives`（T2.3）**: 取得待ちを`ORDER BY id`で選ぶ（Pythonは`ORDER BY`なしの`LIMIT`）。`photos.path`を`DataDir::resolve_existing`で検査してから読み、`DATA_DIR`の外へ出るものは失敗として数える（Pythonは原本のとき存在も見ずに`display`にする）。**変換が恒久的に失敗する写真は、失敗を覚えて飛ばし、後続を枠に入れる**（T2.4で解消。Pythonは`GEOFRAME_FETCH_PER_CYCLE`件より多く失敗すると後続が取得されない。[§14.6](#146-失敗が続く写真が枠を塞がない受入条件)） | 順序の固定、DBの値を信用しない | 位置のあるローカルのHEIC・TIFFが壊れたとき | 単体テスト、検証環境 | 枠の占有はT2.4で解消した（[§14.6](#146-失敗が続く写真が枠を塞がない受入条件)） | [§13.3](#133-local_derivatives) |
-| **`organize`（T2.3。`geoframe organize [--dry-run]`）**: ①移動先に同名のファイルがあっても**上書きせず**`名前 (2).拡張子`にする（Pythonの`rename`は上書きして失った）。②通常のファイルだけを移す（リンク・ディレクトリは動かさず、行も残す）。③**T2.5までは、推定で位置が付きうる写真は移さない**（撮影時刻があって、錨になる位置つき写真が1枚でもあるとき）。Pythonは`index_local`→**`infer_locations`**→移動の順で、推定された写真は残す。Rustの`infer`段はT2.5まで何もしないので、そのまま移すとPythonなら残る写真まで移してしまう。そこで移動対象をPythonの部分集合に絞る。④元の削除に失敗したら退避先に作ったリンクを取り消す（残ったリンクは次の実行が同じ`inode`で再利用し、`(2)`・`(3)`を増やさない）。⑤`--dry-run`は`index_local`のあとの状態で、実行と同じ分類の件数を出す。⑥ガード・ロックはsyncと同じ。ログに名前を出さない（件数だけ）。`unit`の`ReadOnlyPaths`が`photos`を読み取り専用にするので、`organize`はunitの外（`sudo -u geoframe`）で動かす | データを失わない、Pythonの結果を超えて動かさない | 位置の無いローカル写真を整理するとき | 単体テスト、`tests/ingest_cli.rs`、検証環境 | ③はT2.5で`infer`段のあとに移動する形にして外す | [§13.4](#134-geoframe-organize) |
+| **`organize`（T2.3。`geoframe organize [--dry-run]`）**: ①移動先に同名のファイルがあっても**上書きせず**`名前 (2).拡張子`にする（Pythonの`rename`は上書きして失った）。②通常のファイルだけを移す（リンク・ディレクトリは動かさず、行も残す）。③**`index_local`→`infer`→移動の順**（Pythonと同じ。推定で位置が付いた写真は移さない。T2.3〜T2.4はRustの`infer`が空だったので、推定で位置が付きうる写真を移さず`held_back_until_infer`として数えていたが、T2.5で外した）。④元の削除に失敗したら退避先に作ったリンクを取り消す（残ったリンクは次の実行が同じ`inode`で再利用し、`(2)`・`(3)`を増やさない）。⑤`--dry-run`は`index_local`のあとの状態で、実行と同じ分類の件数を出す。⑥ガード・ロックはsyncと同じ。ログに名前を出さない（件数だけ）。`unit`の`ReadOnlyPaths`が`photos`を読み取り専用にするので、`organize`はunitの外（`sudo -u geoframe`）で動かす | データを失わない、Pythonの結果を超えて動かさない | 位置の無いローカル写真を整理するとき | 単体テスト（推定で位置が付く写真が残る・窓の外と時刻なしは移る・錨が消えれば次に移る）、`tests/ingest_cli.rs`、検証環境 | なし（決定。③はT2.5で解消した） | [§13.4](#134-geoframe-organize) |
 | **書きかけの`derivatives/*.part`を起動時に消す（T2.3）**: `GEOFRAME_INGEST=1`のガードとロックのあと、`.dl_*`の掃除と同じ時点で、`derivatives/`**直下の通常ファイルで名前が`.part`で終わり、安全な名前**のものを消す。リンクは消さず辿らない。`derivatives`自体がリンクなら何もしない。件数だけをログに出す（`--dry-run`にも出る）。Pythonには掃除が無い | SIGKILL・電源断で残る`<名前>.<pid>.<乱数>.part`は名前に乱数があるので上書きされず容量を食い続ける | 取り込みの起動時 | 単体テスト、検証環境 | なし（決定） | [§13.5](#135-書きかけの-part-の掃除) |
 | **`.dl_*`の掃除は、`tmp/`・`derivatives/`がシンボリックリンク（など通常のディレクトリでないもの）なら飛ばす（T2.3）**: 列挙の前に`symlink_metadata`で見る。飛ばした数だけを警告ログに出し（パスは出さない）、`--dry-run`にも「掃除を飛ばす」として出る。無い場合（写真を置く前の`derivatives/`）は飛ばした数に入れない。`.part`の掃除の`derivatives/`の検査も同じ関数 | Pythonの`prepare_tmp_dir`は`is_dir()`でリンクを辿り、リンク先の`.dl_*`を消す。外へのリンクだと関係のない場所のファイルを消すので、Rustは辿らない | 取り込みの起動時 | 単体テスト（`tmp/`・`derivatives/`の両方）、検証環境 | なし（決定） | [§13.14](#1314-再々レビュー2026-10-24の指摘への対応) |
 | **Driveの認証（T2.4）**: ①トークンの交換先は定数`https://oauth2.googleapis.com/token`で、鍵JSONの`token_uri`は読まない（google-authはファイルの値を使う）。②`GEOFRAME_DRIVE_KEY`の相対パスは**カレントディレクトリ基準**（Pythonは`app/`基準。Rustに`app/`は無い）。`deploy/geoframe-rs.service`は、Python版のunitと同じ`GEOFRAME_DRIVE_KEY=/var/lib/geoframe/drive_key.json`を与える。③鍵が他のユーザーに読める権限（`& 0o077`）なら警告する（読みはする）。ディレクトリ・FIFO・64 KiB超は鍵として読まない。④鍵が無ければDriveの2段は通信せずに飛ばす（Pythonと同じ）。**鍵が壊れている・トークンを断られた（4xx）も飛ばす**（Pythonは認証エラーをprintして`svc`無しで進む。同じ）が、**Google側の不調（429・5xx）や通信の失敗は段の失敗**（`sync`の終了コード1）として出す | 鍵ファイルで任意のURLへ署名付きのassertionを送らせない。壊れた鍵と一時的な不調を見分ける | `GEOFRAME_DRIVE_KEY`を置いたとき | 単体テスト（スタブがassertionの署名・`iss`・`scope`・`aud`・`exp`を検証する）。検証環境で合成の鍵を実際のGoogleに向けると400で断られ、飛ばす（[§14.10](#1410-検証環境での確認鍵が無い状態2026-10-25)） | なし（決定） | [§14.2](#142-認証) |
 | **`index_drive`（T2.4）**: ①md5が変わった行の更新は、手動で直した位置（`loc_source='manual'`）も`drive_meta`かNULLに**上書きする**（Pythonと同じ。`place elev display fetched_at`はNULL、`rotation=0`。お気に入り・除外・タイトル・`inferred_from`・`infer_dt_s`・`muni_cd pref city`は残る。古いderivativeのファイルは消さない）。②**一覧が0件で、Driveの行が残っているときは、削除しない**（共有を外した・フォルダの取り違えでもDriveは空の一覧を成功として返し、Pythonは全行を消す。お気に入りや手動の位置まで失う）。**0件以外でも、消す件数が50件を超え、かつDriveの行の20%を超えるときは、削除だけを保留する**（`mass_delete_withheld`に数えて警告する。6,535件から1件だけ見える一覧のような取り違えを止める。追加・更新は通常どおり）。どちらの保留も、**`geoframe sync --allow-mass-delete`を付けた1回だけ**外れる（環境変数・設定・unitでは外せず、`serve`の定期実行は常に保留する。`--dry-run`にも付けられ、外した場合の件数が見える。Pythonは無条件に全部消す）。③一覧は**全ページが取れたときだけ**計画を作る（途中で失敗したら追加も削除もしない。Pythonも例外で同じ）。④書き込みは1つのトランザクション（Pythonは1文ごとのコミット）。⑤消すderivativeの名前は`derivatives/<安全な名前>`だけ（Pythonは`DATA_DIR / display`を無検査で消す）。⑥`name`の無いファイルは索引に入れず（Pythonは途中で例外）、行は残す。`id`の無いファイルは一覧の失敗（Pythonも例外）。⑦フォルダ名の`'`・`\`はエスケープして検索する（Pythonは検索式が壊れてHTTP 400）。⑧再試行（429・5xx・流量制限の403）と応答の大きさの上限を付ける | ①は現行の挙動（直すかは**P3で決める**。[inventory.md §2.3](inventory.md)）。②〜⑧は安全側 | Driveに写真があるとき | 単体テスト＋`drive-index-python.json`（偽のDriveに流したPythonの`index_drive`と、`photos`の全列・`id`・Driveへの問い合わせ・追加/削除の件数が一致。②は意図した差として別に確かめる）。保留の閾値の前後（50件ちょうど・51件、割合がちょうど20%・それを超える）・1件だけ残る一覧・フラグで外れる・`--dry-run`の件数は`a_listing_that_would_delete_most_rows_holds_the_deletes_back`など | ①は**P3で直すか決める**。他は決定 | [§14.4](#144-index_drive) |
 | **`fetch_derivatives`（T2.4）**: ①原本の一時ファイル`tmp/.dl_<drive_id>`は`create_new`＋`O_NOFOLLOW`＋権限0600で作り、既にある名前（リンクを含む）は辿らず・消さず、その写真の失敗にする（Pythonは`"wb"`で上書き）。②ダウンロードは512 MiBまで・1枚15分まで（Pythonは上限なし）。③取得待ちは`ORDER BY taken_at, id`（Pythonは`taken_at`のみ。実際のSQLiteは同じ並びになる）。④**失敗が続く写真を飛ばす**（受入条件②。[§14.6](#146-失敗が続く写真が枠を塞がない受入条件)）。⑤通信や認証の不調（接続・名前解決・TLS・**応答のヘッダーを受け取る前の切断などの I/O の失敗**・応答の待ちの時間切れ・流量制限の403（**理由の本文が受け取れなかった403を含む**）・429・5xx・認証の失敗・原本の本文の途中の切断）は、写真のせいではないので段を中断して失敗にし、失敗の記録は付けない（**本文の受信が1枚15分を超えた**ことだけは、その写真の失敗`fail_slow_download`）。⑥ログ・件数にファイル名を出さない（Pythonは名前を出す）。失敗は写真の`id`と固定の語だけ。成功・失敗の件数は形式別・失敗の種類別（`ok_jpeg`・`fail_decode_heic`など）。⑦`--dry-run`は一覧を読む以外の通信をせず、取得するはずの件数だけ出す。⑧**原本は通常の終了経路（成功・写真の失敗）で明示的に消して結果を確かめ**、消せなかったら`original_remove_failed`の件数と固定の文言の警告で報告する（Rustの`Drop`は早期`return`・パニックの補助で、結果は捨てる。通常の経路では消えたことを確かめて、報告する） | 原本（GPS・機種情報つき）を残さない・リンクで外を書き換えさせない・枠を塞がせない | 取得待ちがあるとき | 単体テスト（スタブ。原本が成功・失敗・パニックのどれでも残らない、リンクを辿らない、先頭の枠より多い失敗があっても後続が取得される、障害中に試した写真が復旧した次のサイクルで待たずに取得される、原本を消せなかったことが件数に出る）、`drive-index-python.json`（偽のDriveに流したPythonの`fetch_derivatives`と、最初のサイクルが同じ写真を同じ順に試し、同じ行・同じ寸法になる） | なし（決定） | [§14.5](#145-fetch_derivatives) |
+| **位置の推定 `infer`（T2.5）**: ①**値が変わらない行には書かない**（Pythonは毎サイクル、対象の全行に同じ値を`UPDATE`する。最終の行は同じ）。②`UPDATE`は`loc_source IS NULL OR 'inferred'`の行にだけ効く（計画を作ってから書くまでの間に手動で位置が付いた行を上書きしない。Pythonにはこの隙間がある）。③時刻の差は**`TZ`に依存しないnaiveな日時**で取る（Pythonは`strptime(…).timestamp()`）。ASCIIの数字だけ読む（全角の数字が混じった時刻をPythonは読む場合がある）。④`GEOFRAME_INFER_OFFSET_MIN`は有限の数だけ（負も小数も可。Pythonは検証なし）。⑤同順位（同じ距離の錨が複数）は**`id`の小さい方**（Pythonは`ORDER BY`なしの全件走査の最初で、実際は`rowid`順＝同じ）。⑥**Pythonと同じで直さないもの**: `place elev muni_cd pref city`には触らない（錨が変わって位置が動いても、推定を取り消して別の場所へ推定し直しても、`place`は古い地名のまま残る）。`display`は取り消す行だけをNULLにする（`fetch_derivatives`が取り直す。ファイルは消さない）。`manual`は再推定しない・錨にはなる。`inferred`は錨にしない | ①②は書き込みを減らす（本番コピーの`--dry-run`が「変更ほぼ0」と読める）。③はP1以来の方針。⑥は現行の挙動（位置が動いたときに地名を付け直すかはP3で決める） | 位置の無い写真があるとき | `geo-python.json`（合成の行にPythonの`infer_locations`を段階的に流した結果と、`photos`の全列・戻り値が一致: 窓の境界・同順位・オフセット・錨の削除・錨の移動・手動・時刻なし・暦の不正。`tools/gen_geo_fixture.py`、CIで`--check`）、単体テスト、検証環境（§15.8。本番コピーで推定済みの2,162行すべてが「変更なし」） | ⑥は**P3で直すか決める**。他は決定 | [§15.2](#152-infer) |
+| **地名の enrich（T2.5）**: ①**通信の障害は段を中断し、何も確定しない**（接続・名前解決・TLS・切断・時間切れ・429・5xx。T2.4の`net.rs`の分類）。Pythonは障害の行を飛ばして続け（1行8秒×最大40行）、**片方のAPIだけ障害のときはもう片方の応答だけで確定してキャッシュする**ので、一時的な不調で`place=''`が永久に残る。②`muni.js`は、国内で通信が要る行があるときだけ取りに行き、**取れなければ（障害でも、4xxでも、表が空でも）通信が要る行を処理せず段を失敗にする**（国外・キャッシュで済む行は先に済ませる）。Pythonは空の表で続け、`pref`・`city`が空のまま確定する。③**両方のAPIの応答が壊れた座標は、プロセスの中で覚えてしばらく飛ばす**（30分から倍々、12時間まで）。Pythonは毎サイクル、40件の枠を占める。④**`lon`がNULL・数値でない行は対象にしない**（`unusable`に数える）。Pythonは例外になり、`cycle()`は`enrich_rows`を`try`で包んでいないので、周期全体が落ちる。⑤キャッシュの値は`place`と`city`の両方を持つ辞書だけ有効、型が違う値は空文字（Pythonは`city`だけ見て、`place`が無いと例外）。⑥書き込みは`lat`・`lon`が計画のときと同じで`place`がNULLの行にだけ効く。⑦**国外は空で確定**（オフラインの逆ジオコーダは本番に入っていない。Pythonも入っていなければ同じ）。⑧応答は1 MiB、`muni.js`は8 MiBまで。時間は8秒・15秒（Pythonと同じ）。⑨`muni_table`は、国内の問い合わせが要るときだけ取る（Pythonは毎サイクルの先頭で、無ければ取りに行く）。⑩ログ・失敗の文面に座標・地名・URLを出さない | 障害で誤った「確定」を作らない、枠を塞がせない、サイクルを落とさない | 位置があって`place`がNULLの行があるとき | `geo-python.json`（Pythonの`enrich_rows`に偽の地理院を流した結果と、`photos`の全列・地理院への要求の順序・`.cache.json`の`geo:`キーが一致: 国内・国外・空で確定・矩形の角・片方だけ応答・両方なし・偶数丸め・先頭の0の自治体コード・キャッシュ済み・40件・`{:.3}`の丸め）、単体テスト（障害の種類ごとの中断・復旧・`muni.js`の失敗・記憶・競合・停止・`--dry-run`）、検証環境（§15.8。実際の地理院と`muni.js`で、Pythonが保存した8行の地名が一致） | なし（決定） | [§15.3](#153-enrich) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
@@ -518,7 +520,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | `GEOFRAME_INGEST`（Rustだけ） | `0` | `0`／`1`だけ（他は起動を断る）。空文字は未設定 | [inventory.md §3.1](inventory.md) B0・B1（起動時の準備と同期サイクル）を動かすか。Pythonには無い |
 | `GEOFRAME_DRIVE_POLL_MIN` | `10` | 分。小数も可（`0.5`は30秒）。Pythonは`float()`で秒に換算。**Rustは0以下・非有限・上限（525600分＝1年）超を起動の断りにする**（Pythonは0以下で空回りか例外） | [inventory.md §4.1](inventory.md)の`GEOFRAME_DRIVE_POLL_MIN`（P2・引き継ぐ） |
 
-`GEOFRAME_DRIVE_POLL_MIN`は`UNSUPPORTED_ENV`から`SUPPORTED_ENV`へ移した。`GEOFRAME_INGEST`は`GEOFRAME_LOG`と同じRustだけの項目なので`docs/reference/configuration.md`（Pythonの`config.py`から生成）には無く、どちらの一覧にも載せない。`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_FETCH_PER_CYCLE`はT2.3で読み始めた（§13.1）。`GEOFRAME_DRIVE_KEY`・`GEOFRAME_DRIVE_FOLDER`はT2.4で読み始めた（§14.1）。`GEOFRAME_QUALITY_PER_CYCLE`・`GEOFRAME_INFER_OFFSET_MIN`は、段の中身を入れるT2.5・T2.6で読み始める。
+`GEOFRAME_DRIVE_POLL_MIN`は`UNSUPPORTED_ENV`から`SUPPORTED_ENV`へ移した。`GEOFRAME_INGEST`は`GEOFRAME_LOG`と同じRustだけの項目なので`docs/reference/configuration.md`（Pythonの`config.py`から生成）には無く、どちらの一覧にも載せない。`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_FETCH_PER_CYCLE`はT2.3で読み始めた（§13.1）。`GEOFRAME_DRIVE_KEY`・`GEOFRAME_DRIVE_FOLDER`はT2.4で読み始めた（§14.1）。`GEOFRAME_INFER_OFFSET_MIN`はT2.5で読み始めた（§15.1）。`GEOFRAME_QUALITY_PER_CYCLE`は、段の中身を入れるT2.6で読み始める。
 
 ### 11.3 同期サイクルの骨組み
 
@@ -531,7 +533,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 #### `--dry-run`
 
-`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、実DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。**段に渡す読み取り用の接続`ctx.read`は、実DBのメモリ上の写し**（`sync::simulation_copy`。SQLiteのバックアップAPIで作る。`rusqlite`の`backup`機能を足した）で、先の段が自分の計画を写しに適用する（`index_local`が追加・更新・削除を、`local_derivatives`が`display`を、実行と同じ書き込み関数で写しに書く）。後の段は「先の段が済んだあと」の状態で件数を数え、最後の`写真: 表示可能／取得待ち／全`も同じ状態の見込みになる（T2.3の再レビューの指摘。以前は後続の段が索引前の行を見て、新しい写真を数え落とした）。写しの大きさはDBと同じ（検証環境の本番コピーで約85 MiB。`sync --dry-run`は0.3秒ほどで終わる）で、dry-runのときだけ作る。**写しの間だけ`ctx.read`の元の接続で読み取りトランザクションを持ち、スナップショットを固定する**（バックアップは元が更新されると最初からやり直すので、更新の多いDBで終わらなくなるのを防ぐ。WALなら書き手を止めず、書き手の更新は写しに入らない。ロールバックジャーナルのDBでは写しの間だけ書き手が待つ）。さらに**30秒の期限**（`sync::COPY_DEADLINE`。本番相当で0.3秒の約100倍）を付け、ロックで進めない間は20 ms間隔で繰り返し、超えたら`geoframe: DB のメモリ上の写しを作れません: …`で終了コード1にする（`busy_timeout`の分までは超えうる）。**行・写真・キャッシュ・ロック・`tmp/`・`derivatives/`は変えないが、SQLiteが読み取りでも作る`catalog.db-wal`・`catalog.db-shm`は新しくできうる**（WALのDBを開くとできる。中身は書かれない。ヘルプ（`USAGE`）と起動の1行目にも書いてある）。**ガード（§11.1.1）は通さない**: 書かないので、本番機でも件数を見られるようにしてある。出すもの:
+`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、実DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。**段に渡す読み取り用の接続`ctx.read`は、実DBのメモリ上の写し**（`sync::simulation_copy`。SQLiteのバックアップAPIで作る。`rusqlite`の`backup`機能を足した）で、先の段が自分の計画を写しに適用する（`index_local`が追加・更新・削除を、`infer`が推定・取り消しを、`local_derivatives`が`display`を、実行と同じ書き込み関数で写しに書く。`enrich`は地理院に問い合わせないので、写しには書かず件数だけを数える）。後の段は「先の段が済んだあと」の状態で件数を数え、最後の`写真: 表示可能／取得待ち／全`も同じ状態の見込みになる（T2.3の再レビューの指摘。以前は後続の段が索引前の行を見て、新しい写真を数え落とした）。写しの大きさはDBと同じ（検証環境の本番コピーで約85 MiB。`sync --dry-run`は0.3秒ほどで終わる）で、dry-runのときだけ作る。**写しの間だけ`ctx.read`の元の接続で読み取りトランザクションを持ち、スナップショットを固定する**（バックアップは元が更新されると最初からやり直すので、更新の多いDBで終わらなくなるのを防ぐ。WALなら書き手を止めず、書き手の更新は写しに入らない。ロールバックジャーナルのDBでは写しの間だけ書き手が待つ）。さらに**30秒の期限**（`sync::COPY_DEADLINE`。本番相当で0.3秒の約100倍）を付け、ロックで進めない間は20 ms間隔で繰り返し、超えたら`geoframe: DB のメモリ上の写しを作れません: …`で終了コード1にする（`busy_timeout`の分までは超えうる）。**行・写真・キャッシュ・ロック・`tmp/`・`derivatives/`は変えないが、SQLiteが読み取りでも作る`catalog.db-wal`・`catalog.db-shm`は新しくできうる**（WALのDBを開くとできる。中身は書かれない。ヘルプ（`USAGE`）と起動の1行目にも書いてある）。**ガード（§11.1.1）は通さない**: 書かないので、本番機でも件数を見られるようにしてある。出すもの:
 
 ```
 dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）
@@ -909,11 +911,11 @@ geoframe organize [--dry-run] [--data-dir <dir>]
 
 位置の無いローカル写真を`DATA_DIR/_excluded/no_gps/`へ移し、行を削除する（Pythonの`server.py --organize`）。`index_local`を先に1回動かし、その結果を使う（失敗したら移さない）。書く実行は`GEOFRAME_INGEST=1`が要り、**`sync`と同じガード（§11.1.1）・ロック・移行・掃除を通す**。無いと終了コード2で断る。
 
-- **対象**: `source='local' AND lat IS NULL`の行のうち、次のいずれか: 撮影時刻が空（NULLか空文字）、または錨になりうる写真（`loc_source IN ('exif','drive_meta','manual')`で時刻つき）が1枚も無い。それ以外（時刻つきで、錨がある）は**T2.5まで移さない**（`held_back_until_infer`として数える）。Pythonは`index_local`→`infer_locations`→移動で、推定で位置が付いた写真は移さない。Rustの`infer`段は何もしないので、絞らないとPythonなら残る写真まで移して行を失う。T2.5で`infer`段のあとに移す形にして、この絞り込みを外す。
+- **対象**: `source='local' AND lat IS NULL`の行。**`index_local`→`infer`（§15.2）→移動の順**で、推定で位置が付いた写真は対象に入らない（Pythonの`index_local`→`infer_locations`→移動と同じ。錨が消えれば推定は取り消され、次の`organize`で移る）。T2.3〜T2.4はRustの`infer`が何もしなかったので、推定で位置が付きうる写真（撮影時刻があって、錨になる位置つきの写真が1枚でもあるもの）を移さず`held_back_until_infer`として数えていたが、T2.5で外した（出力の件数からも無くなった）。
 - **ファイル**: `entry_path`（親を`canonicalize`して`DATA_DIR`の中か検査し、最後の要素のリンクは辿らない）で絶対パスにし、**通常のファイルだけ**を移す。リンク・ディレクトリは動かさず、行も残す（`skipped`）。ファイルが無い行は、Pythonと同じく行だけ消す（`row_only_removed`）。
 - **移動先**: `_excluded`・`_excluded/no_gps`を1階層ずつ`symlink_metadata`で見て、リンクやファイルならディレクトリを作らずに断る（`DATA_DIR`の外へ出さない）。ファイル名はそのまま。**同名があっても上書きしない**: ハードリンクを作ってから元を消す（リンクは既にあれば失敗するので、同名のファイルを壊さない）。あれば`名前 (2).拡張子`、`(3)`…と探す。ハードリンクを作れないファイルシステムでは、無いことを確かめてから`rename`する。1つの移動に失敗しても次へ進む（`failed`）。**元の削除に失敗したら、作ったリンクを取り消す**（元のディレクトリが書き込み禁止のとき、リンクだけが残って行も残り、再実行のたびに`(2)`・`(3)`と増えて、候補を使い切ると権限を直しても移せなくなった）。取り消しにも失敗して残ったリンクは、次の実行で**退避先に同じ`inode`の名前があれば**それを使い、リンクを重ねずに元だけ消す（同じ実体への名前なので、中身は退避先に残る。別々の行が元からハードリンクだった場合も、実体は退避先に1つ残る）。
 - 行の削除は、ファイルを移したあとに1行ずつ。
-- `--dry-run`は何も動かさずに、実行と同じ分類（移す・行だけ消す・動かさない・調べられない）で`targets moved row_only_removed skipped failed held_back_until_infer`を数える。対象は、`index_local`の計画を適用した写し（§11.3）の行なので、新しく索引される位置の無い写真も含む。移動先は作らず（リンクを経由していないかの検査だけ行う）、移せるものとして数える（権限・名前の使い切りは試さない）。実行の出力も同じ6つの件数（対象が0件でも）。
+- `--dry-run`は何も動かさずに、実行と同じ分類（移す・行だけ消す・動かさない・調べられない）で`targets moved row_only_removed skipped failed`を数える。対象は、`index_local`と`infer`の計画を適用した写し（§11.3）の行なので、新しく索引される位置の無い写真も含み、推定で位置が付く写真は含まない。移動先は作らず（リンクを経由していないかの検査だけ行う）、移せるものとして数える（権限・名前の使い切りは試さない）。実行の出力も同じ5つの件数（対象が0件でも）。
 - unitの`ReadOnlyPaths`は`photos`を読み取り専用にするので、`organize`はunitの外（`sudo -u geoframe geoframe organize`）で動かす。出力はファイル名を含まない。
 
 ### 13.5 書きかけの`.part`の掃除
@@ -928,7 +930,7 @@ T2.2の注意（§12.2）の対応。`ingest::start`の最後（ガード・ロ�
 
 ### 13.6 `--dry-run`
 
-`geoframe sync --dry-run`の`index_local`・`local_derivatives`の段が、書かずに件数を出す（§11.3）: `index_local`は`files added updated removed unreadable skipped …`（置き場が無ければ空の走査として、既存のローカル行の削除を数える）、`local_derivatives`は`original made failed icc_dropped`（後続の段は索引後の写しで数える。§13.3）。掃除の行には`.part`の件数が増えた（`掃除: 消す .dl_* N 件 / 消す書きかけの .part N 件 / 捨てる .cache.json の旧キー N 件`）。リンクなどで掃除を飛ばす`tmp/`・`derivatives/`があるときは、`掃除を飛ばす tmp/・derivatives/（…）: N つ`の行も出る（[§13.14](#1314-再々レビュー2026-10-24の指摘への対応)）。`geoframe organize --dry-run`は`targets moved row_only_removed skipped failed held_back_until_infer`（`index_local`のあとの写しで数える。§13.4）。**判断（再レビューの指摘5）**: 後続の段の件数は「索引前の状態で数える」案ではなく、メモリ上の写しに計画を適用する案にした。写しの作成はバックアップAPIの1回で済み、段の側は`ctx.read`の使い方を変えずに、書き込み関数を共有するだけで済んだ。
+`geoframe sync --dry-run`の`index_local`・`local_derivatives`の段が、書かずに件数を出す（§11.3）: `index_local`は`files added updated removed unreadable skipped …`（置き場が無ければ空の走査として、既存のローカル行の削除を数える）、`local_derivatives`は`original made failed icc_dropped`（後続の段は索引後の写しで数える。§13.3）。掃除の行には`.part`の件数が増えた（`掃除: 消す .dl_* N 件 / 消す書きかけの .part N 件 / 捨てる .cache.json の旧キー N 件`）。リンクなどで掃除を飛ばす`tmp/`・`derivatives/`があるときは、`掃除を飛ばす tmp/・derivatives/（…）: N つ`の行も出る（[§13.14](#1314-再々レビュー2026-10-24の指摘への対応)）。`geoframe organize --dry-run`は`targets moved row_only_removed skipped failed`（`index_local`と`infer`のあとの写しで数える。§13.4）。**判断（再レビューの指摘5）**: 後続の段の件数は「索引前の状態で数える」案ではなく、メモリ上の写しに計画を適用する案にした。写しの作成はバックアップAPIの1回で済み、段の側は`ctx.read`の使い方を変えずに、書き込み関数を共有するだけで済んだ。
 
 ### 13.7 Pythonとの差（まとめ）
 
@@ -936,7 +938,7 @@ T2.2の注意（§12.2）の対応。`ingest::start`の最後（ガード・ロ�
 
 - **現行のまま残した危ない挙動（P3で決める）**: `mtime`が変わると**手動で直した位置も上書きされる**。お気に入り・除外・回転・タイトルは残る。
 - **安全側に変えたもの**: ファイルのリンクは実体が`DATA_DIR`の中のものだけ、`PHOTOS_DIR`が外・`DATA_DIR`そのものなら断る、消すderivativeの名前の検査、`organize`は上書きせず通常のファイルだけ動かす。
-- **T2.5で解消するもの**: `organize`が推定で位置が付きうる写真を移さない制限。
+- **T2.5で解消したもの**: `organize`が推定で位置が付きうる写真を移さない制限（§15.7）。
 - 意図して同じにしたもの: 走査順（`id`の採番順）、`gdrive`の完全一致、1秒の許容、読めない写真は飛ばす、削除時の`photos/`の原本は残す、`indexed_at`/`fetched_at`の形式、位置のあるローカル写真だけにderivativeを作る。
 
 ### 13.8 テスト
@@ -966,7 +968,7 @@ musl静的バイナリを`deploy/rust-deploy.sh`で配布して確かめた。�
 
 ### 13.10 T2.5・T2.4へ回したもの
 
-- **T2.5**: `organize`の「推定で位置が付きうる写真は移さない」制限（§13.4）を外す。`infer`段のあとに移す。
+- **T2.5（実施済み。§15）**: `organize`の「推定で位置が付きうる写真は移さない」制限（§13.4）を外し、`index_local`→`infer`→移動の順にした。
 - **T2.4（実施済み。§14）**: `fetch_derivatives`の取得待ちの占有（§12.10の受入条件②）は、`local_derivatives`にも同じ仕組みで入れた（§14.6）。
 - **P3**: 手動の位置がmtimeの変更で上書きされる挙動（§0、[inventory.md §2.3](inventory.md)）を直すか決める。直すなら、`loc_source='manual'`の行は`lat lon loc_source`を更新しない・`display`だけをNULLにする、などの選択肢がある。
 
@@ -1245,7 +1247,7 @@ sudo rm -rf $D
 
 ### 14.12 T2.5・T2.7へ回したもの
 
-- **T2.5**: `infer`段（位置の推定）。`index_drive`が`display`をNULLに戻す（md5の変更）と、推定の錨だった写真の`display`が消える点は`infer`が考慮する（[inventory.md §2.3](inventory.md)）。
+- **T2.5（実施済み。§15）**: `infer`段（位置の推定）。`index_drive`が`display`をNULLに戻す（md5の変更）ことと推定は独立で、`infer`は錨の選び方に`display`を使わない（錨になるのは`loc_source`が`exif`・`drive_meta`・`manual`で時刻が読める写真だけ）。`infer`が`display`をNULLにするのは、推定を取り消す行だけ（[inventory.md §2.3](inventory.md)）。
 - **T2.7**: 本番コピーでの`--dry-run`（§14.11の(1)）と実サイクル、同じ写真を比較用PythonとRustへ入れた`photos`の列ごとの比較、棚卸しS2の実機確認、結果の`p2-acceptance.md`への記録。**§14.11の(2)・(3)が受入条件①の実機での確認**。
 - **P3**: md5の変更で手動の位置を上書きする挙動（§0）を直すか決める。直すなら`loc_source='manual'`の行は`lat lon loc_source`を更新せず`display`だけをNULLにする、などの選択肢がある（§13.10と同じ）。
 
@@ -1271,3 +1273,115 @@ T2.4のレビューの指摘7件への対応。コミットは`T2.4: …`の4つ
 | --- | --- |
 | 応答のヘッダーの前に切断されると写真の失敗になる（`Io(UnexpectedEof)`が`other`になっていた） | ヘッダーを受け取る前の`Io`の失敗は、時間切れ・TLS・接続の拒否/到達不能以外のすべてを`Failure::Disconnected`（`disconnected`）にして障害にした。`ureq`の全エラーの分類の表を§14.3と`net.rs`の`Failure`に書いた。応答の頭が壊れている（`Protocol`など）ものは、要求ごとに決まった結果になりうるので写真の失敗のまま（理由は表）。原本の本文の途中の切断は今まで通り障害（`disconnected`）。テスト: ヘッダー前の切断・本文の途中の切断・トークン交換中の切断が、段を中断し、復旧後に待たずに取得される／認証の失敗にならない |
 | 403の理由の本文の受信の失敗が握り潰され、権限の不足と同じ`Status(403)`になる | `is_rate_limit_body`を`Result<bool, DriveError>`にして、理由の本文の切断・時間切れ・TLSは`Net(…)`として返し、段を中断する。時間切れは原本の`BodyTimeout`（`fail_slow_download`）にしない。16 KiBを超える本文だけは流量制限ではない403として扱う。テスト: 本文の途中切断（`UnexpectedEof`）と時間切れ（`Timeout(Global)`）の2経路 |
+
+## 15. 位置の推定と地名（P2 / T2.5）
+
+撮影時刻が近い位置つきの写真（錨）から、位置の無い写真の位置を推定し（`infer`）、位置のある写真に地名・標高・自治体を付ける（`enrich`）。現行の`geo.py`の`infer_locations`・`enrich_rows`・`muni_table`に対応する。棚卸しB1・B2・S3（[inventory.md](inventory.md)）。実装は`crates/geoframe/src/geo.rs`（時刻の解釈）・`geo/infer.rs`・`geo/enrich.rs`。試験用に`geo/stub.rs`（ループバックの地理院のスタブ）と`geo/tests.rs`。
+
+どちらも**計画を作る関数と書く関数が分かれていて**、実行と`--dry-run`が同じ関数を通る（§11.3。`--dry-run`は書き込み接続を持たず、`infer`の計画だけメモリ上の写しに当てる）。
+
+### 15.1 段と設定
+
+| 項目 | 内容 |
+| --- | --- |
+| 段 | `infer`（`index_drive`の後）→`enrich`（その直後）→`local_derivatives`。順序は現行の`cycle()`のまま。失敗・パニックは隔離される（§11.3） |
+| `GEOFRAME_INFER_MIN`（既定`15`） | 1段目の窓（分）。T1.4から読んでいる（管理画面の内訳の区切り）。推定の**最大の窓**は`max(この値, 12時間)`（現行の`INFER_WINDOWS_S[-1]`）。段階窓（15分→2時間→12時間）は「差を含む最小の窓」に振り分けるのと同値なので、1回の最近傍探索で済ませる。窓のラベルは`infer_dt_s`から表示側が計算する |
+| `GEOFRAME_INFER_OFFSET_MIN`（既定`0`） | **T2.5で読み始めた**。カメラ時計のずれ（分）。推定する写真の撮影時刻に1回だけ足す（錨には足さない）。有限の数なら負も小数も可。それ以外は起動を断る（終了コード2。値は出さない） |
+| 通信先 | 地理院の逆ジオコーダ・標高API・`muni.js`。**本番は定数のみ**で、環境変数・設定では変えられない（座標を任意のURLへ送らせない）。試験のビルドだけがスタブへ向ける |
+| ログ | 段ごとの件数だけ。座標・地名・撮影時刻・URL・応答の本文を出さない |
+
+### 15.2 `infer`
+
+**規則はPythonと同じ**で、違いは§0の行と下に挙げたものだけ。
+
+1. **錨**: `loc_source IN ('exif','drive_meta','manual')`で`taken_at`が空でなく、時刻が読める写真。`inferred`は錨にしない（推定が推定を呼ばない）。`manual`は錨になる（手動で1枚直すと、同じ旅の近い時刻の未解決の写真に波及する）。位置が付いていない錨（`lat`がNULL）も錨の数に入る（現行は`lat`を見ない）。
+2. **対象**: `loc_source IS NULL OR loc_source='inferred'`。`exif`・`drive_meta`・`manual`は再推定しない（手動の位置が次のサイクルで上書き・取り消しされない。棚卸しS4）。
+3. **選び方**: 対象の時刻に`GEOFRAME_INFER_OFFSET_MIN`を足し、時刻の差が最小の錨。**同順位は`id`の小さい方**（錨を`ORDER BY id`で並べ、より小さい差が出たときだけ入れ替える）。差が最大の窓**以内**（境界を含む）なら、`lat lon`を錨のものにし、`loc_source='inferred'`・`inferred_from`＝錨の`id`・`infer_dt_s`＝差の秒（切り捨て）にする。
+4. **取り消し**: 錨が消えた・窓から外れた・時刻が読めなくなった対象で、`lat`が入っているものは、`lat lon loc_source inferred_from infer_dt_s display`をNULLにする。`display`をNULLにするので、Driveの写真は`fetch_derivatives`が取り直す。**derivativeのファイルは消さない**（管理画面が`derivatives/<drive_id>.jpg`を拾い直す）。
+5. **地名の列には触らない**（Pythonと同じ）。位置が動いても`place elev muni_cd pref city`は古いまま残る。新しく位置が付いた行は`place`がNULLなので、`enrich`が付ける。**位置が動いたときに地名を付け直すか**は、手動の位置の扱い（[inventory.md §2.3](inventory.md)）と一緒にP3で決める。
+6. **時刻**: `YYYY-MM-DD HH:MM`を`strptime`と同じ規則で読む（`geo.rs`の`naive_seconds`。月・日・時・分は1〜2桁、日付と時刻の間は空白1文字以上、暦として不正・範囲外・末尾の余分は失敗）。差は**`TZ`に依存しないnaiveな日時**（暦の日数×86400＋時分）で取る。夏時間の無い`TZ`（本番は`Asia/Tokyo`）ではPythonと一致する。ASCIIの数字だけ読む。
+
+件数（段の出力）: `anchors targets inferred updated unchanged cancelled untimed`。`inferred`は新しく位置が付いた数（現行の戻り値）、`updated`は推定済みで錨や差が変わる数、`unchanged`は推定済みで値が変わらない数（書かない）、`cancelled`は取り消す数、`untimed`は時刻が無い・読めない対象の数。
+
+**書き込み**は計画を1つのトランザクションにまとめる（writerの1回の呼び出し）。始めるとき・256件ごと・`COMMIT`の直前に停止の合図を見て、来ていれば`ROLLBACK`して`省略`で返る（`index_local`と同じ。§13.2）。`UPDATE`は`loc_source IS NULL OR 'inferred'`の行にだけ効く。
+
+### 15.3 `enrich`
+
+**規則はPythonと同じ**で、違いは§0の行と下に挙げたものだけ。
+
+1. **対象**: `lat`・`lon`が数値で`place IS NULL`の行を`id`順に**1サイクル40件まで**（`place`がNULLが「未enrich」の印。空文字は「確定」）。
+2. **キー**: `geo:<緯度3桁>,<経度3桁>`（`{:.3}`。PythonのCPython `f"{x:.3f}"`と同じ丸め。62個の値で突き合わせた）。値は`{place, elev, muni_cd, pref, city}`。
+3. **国外**（緯度20〜46.5、経度122〜154.5の矩形の外）: キャッシュを引かず、通信せず、`place=''`・`elev=NULL`・`muni_cd=''`・`pref=''`・`city=''`で確定する。キャッシュにも同じ値を書く（Pythonと同じ）。待ちなし。
+4. **国内**: キャッシュに`place`・`city`を持つ辞書があればそれを使う（通信しない・待たない）。無ければ逆ジオコーダ（`LonLatToAddress`）と標高APIを呼ぶ。
+   - `place`＝応答の`results.lv01Nm`（字。都道府県・市区町村は連結しない。別の列）。
+   - `muni_cd`＝`results.muniCd`（ASCIIの数字だけのとき。文字列でも整数でも）。先頭の0を落とした文字列で`muni_table`（`muni.js`から作る コード→[都道府県, 市区町村]。市区町村名の全角空白は除く）を引いて`pref`・`city`にする。表に無ければ空。
+   - `elev`＝応答の`elevation`が数値のとき、**偶数丸め**（Pythonの`round`。`12.5`→`12`、`13.5`→`14`、`-0.5`→`0`）の整数。`"-----"`など文字列はNULL。
+   - **応答が空でも確定する**（`place=''`）。海上や地理院のカバー外は何度問い合わせても埋まらず、確定させないと40件の枠を恒久的に占める。「応答あり」は、状態コードが2xxで本文がJSONとして読めたこと（形が違う・`results`が空でも「あり」）。
+   - **片方のAPIだけ応答があれば、その分で確定する**（Pythonと同じ）。**両方とも応答が無かった**座標は、キャッシュも`photos`も更新せず次の行へ進み、プロセスの中で覚えて30分（失敗が続けば倍々、12時間まで）飛ばす。
+   - 問い合わせた行のあとに0.2秒待つ（停止の合図で打ち切れる）。キャッシュ・国外の行は待たない。同じキーの2件目以降は、1件目の結果（キャッシュ）で済む。
+5. **処理の順**: 通信の要らない行（国外・キャッシュ）を先に済ませ、そのあとに通信の要る行を`id`順に処理する（最終の行・キャッシュは`id`順に処理した場合と同じ）。`muni.js`は、通信の要る行があるときだけ、キャッシュの`muni_table`が無ければ取りに行き、取れたら保存する（Pythonは毎サイクルの先頭）。
+6. **書き込み**は行ごと（writerの呼び出し）。`UPDATE`は`id`・`lat`・`lon`が計画のときと同じで`place`がNULLの行にだけ効く（enrichの最中に管理画面で位置が直されて地名が消えた行へ、古い座標の地名を書かない）。
+
+件数（段の出力）: `candidates foreign cache_hit queried unresolved skipped_backoff unusable pending`。`queried`は地理院に問い合わせた数、`unresolved`は両方の応答が無かった数、`skipped_backoff`は覚えていて飛ばした数、`unusable`は`lon`がNULL・数値でない等で対象にしない数、`pending`は今サイクルを始める時点で未enrichの数（40件を超えた分も含む）。
+
+### 15.4 通信の失敗の分類
+
+T2.4の`net.rs`の`Failure`（§14.3の表）に合わせる。`Failure::is_outage()`が偽のもの（`Other`）は「応答が使えない」、それ以外は「通信の障害」。
+
+| 起きる場所 | 失敗 | 扱い |
+| --- | --- | --- |
+| 逆ジオ・標高。ヘッダーを受け取る前 | `dns`・`connect`・`timeout`・`tls`・`disconnected`（§14.3の表） | **通信の障害: 段を中断**。確定しない。それまでに済んだ行（国外・キャッシュ・問い合わせ済み）は残る。失敗の文面は種類と件数だけ（URL・座標を含まない） |
+| 同 | `Other`（`Protocol`・`BadUri`・`TooManyRedirects`など） | そのAPIは「応答なし」 |
+| 状態コード | 429・5xx | 通信の障害（段を中断） |
+| 状態コード | 3xx（リダイレクトを辿り切れない）・4xx | そのAPIは「応答なし」（要求ごとに決まった結果になりうるので、障害にして段を止めない） |
+| 2xxの本文 | JSONでない・1 MiBを超える | そのAPIは「応答なし」 |
+| 2xxの本文 | 読んでいる最中の切断・時間切れ | 通信の障害（段を中断） |
+| 2xxで、JSONとして読めた | `results`が空・配列・`null`など形が違う | 「応答あり」で、空のまま確定 |
+| `muni.js` | 障害・4xx・本文が解釈できない（表が空） | 通信の要る行を処理せず、段を失敗にする。国外・キャッシュの行は先に済んでいる。キャッシュの`muni_table`があれば取りに行かない |
+
+障害から復旧した次のサイクルは、待たずに続きから処理する（障害は座標の記憶に入れない）。
+
+### 15.5 `--dry-run`とログ
+
+- `infer`: 全部オフラインで計算でき、計画をメモリ上の写しに当てる（後続の段は推定後の状態を見る）。件数は`anchors targets inferred updated unchanged cancelled untimed`。取り込み済みの本番コピーで`inferred updated cancelled`が0に近いことが、P2の受入の一部（§15.8）。
+- `enrich`: **地理院に問い合わせない**（本番機でも`--dry-run`を回すことがあるので）。40件を、国外・キャッシュで済む・問い合わせるはず（`would_query`。同じキーは1件に数える）に分けて数える。`photos`の写しには書かない（後続の段が地名を使わない）。`.cache.json`は凍結されていて何も書かれない。`queried`の代わりに`would_query`が出る。
+- ログに出すのは件数と固定の語だけ。座標・地名・撮影時刻・URLは出さない。通信の失敗は種類（`dns`・`http 503`など）だけ。
+
+### 15.6 Pythonとの差（まとめ）
+
+§0の2行に載せたものがすべて。要点:
+
+- **Pythonと同じにした（直さない）もの**: 地名の列を推定で触らない（位置が動いても古い地名が残る）、片方のAPIだけ応答があれば確定する、手動の位置は錨にはなる、時刻のずれの補正は推定する側にだけ足す、国外は空で確定する。
+- **安全側に変えたもの**: 値が変わらない行に書かない、書き込みの条件付き`UPDATE`、通信の障害で段を中断して何も確定しない、`muni.js`が取れなければ地名を付けない、壊れた座標を覚えて枠を塞がせない、`lon`がNULLの行を対象にしない、応答の大きさの上限。
+- **既知の差**: 全角の数字が混じった時刻（Pythonは読む場合がある）、夏時間のある`TZ`。
+
+### 15.7 `organize`の絞り込みを外した
+
+§13.4のとおり、`geoframe organize`は`index_local`→`infer`→移動の順になった（Pythonの`organize_photos`と同じ）。`local::organize`は`infer`が済んだ状態の`source='local' AND lat IS NULL`をそのまま選ぶ。`held_back_until_infer`は件数から無くなった。`--dry-run`は`index_local`と`infer`の計画を写しに当ててから数える。
+
+### 15.8 検証環境での確認（2026-10-25）
+
+検証環境（本番の2026-10-24のバックアップのコピー。`photos`6,535行・`inferred`2,162行・Driveの鍵は無い）に`rust-deploy.sh`で配布して（コミット`a4b36c7`）、比較した。座標・地名は書かない（件数だけ）。
+
+| # | 確認 | 結果 |
+| --- | --- | --- |
+| (a) | 本番コピーで`geoframe sync --dry-run` | `infer: anchors=3125 targets=3409 inferred=0 updated=0 unchanged=2162 cancelled=0 untimed=31`、`enrich: candidates=0 pending=0`、サイクルは22 ms。**Pythonが推定・enrich済みの本番コピーで、変更は0**。推定済み2,162行すべてが「値が変わらない」（`lat`・`lon`・`inferred_from`・`infer_dt_s`がPythonの保存した値とビット単位で一致） |
+| (b) | 実サイクル（`GEOFRAME_INGEST=1 geoframe sync`）の前にDBを検証環境の中でバックアップし、**わざと壊して**回す: 推定済み2,162行の`lat lon loc_source inferred_from infer_dt_s`をNULLにし、地名の5列をNULLにした13行（国内8・国外5）を作った | `infer: inferred=2162`、`enrich: candidates=13 foreign=5 queried=8`（実際の地理院に逆ジオ8＋標高8＋`muni.js`1回）。**実行後の`.dump`のSHA-256が、壊す前と完全に一致**（2,162行の推定と13行の地名がPythonの保存した値に戻った。`display`などの列も変わらない） |
+| (c) | `.cache.json`（検証環境には元々無かった） | `geo:`13件＋`muni_table`。実物の`muni.js`を、Pythonの正規表現とRustの手書きの解析に通した表が**1,919件で完全に一致** |
+| (d) | 後始末 | `.cache.json`とバックアップを消した（`.dump`のSHA-256は(b)の後のまま一致）。`geoframe-rs`は`GEOFRAME_INGEST`なしのまま稼働、`/healthz` 200、`/api/v1/photos` 3,065件 |
+
+### 15.9 テスト
+
+| 対象 | テスト |
+| --- | --- |
+| Pythonとの突き合わせ（`geo/tests.rs`の`pythonのinfer_locationsとenrich_rowsと全列が一致する`） | `tools/gen_geo_fixture.py`が作る`geo-python.json`。10ケース・21段階: 合成の行（座標は駅・役所など公開の代表点、時刻・地名は架空）にPythonの`infer_locations`・`enrich_rows`を段階的に流した結果と、Rustの`photos`の全列・`infer`が付けた数・地理院への要求の種類と座標と順序・`.cache.json`の`geo:`キーが一致する。窓の境界（15分・2時間・12時間ちょうどと、12時間1分）、同順位（錨が等距離・同じ時刻）、オフセット（−90・＋30・±0.01分）、`GEOFRAME_INFER_MIN`を1・1000にした窓、錨の削除・移動・手動への変化・全部の消失、時刻なし・空・暦の不正・末尾の余分・桁が足りない・空白2つ・全角の数字、国内・国外・矩形の角と外、応答が空・標高が文字列・片方だけ応答・両方なし・JSONでない・`null`・`results`が配列・自治体コードの先頭の0・数字でない・未知、偶数丸め、キャッシュ済み、同じキーの2件目、40件の枠。Pythonの`geo.http_json`だけを差し替えて、`geo.py`本体を流す。CIで`--check` |
+| `muni.js`の解析・キー | 合成の断片（カンマを含む市区町村名、重なるコード、先頭に0が並ぶ、閉じない引用符など）をPythonの正規表現に通した表と一致。`{:.3}`はPythonの`f"{x:.3f}"`と62個の値（ちょうど中間・負・大きい値）で一致 |
+| 単体テスト（`geo/tests.rs`） | 時刻の解釈、同順位、オフセット、取り消しと地名・お気に入りの残存、手動、値が変わらない行に書かない（トリガーで`UPDATE`を数える）、計画と書き込みの間に手動になった行を上書きしない、書き込みの途中の停止、`--dry-run`（通信しない・写しに当てる・件数）、国外、空で確定、待ちの回数、片方だけ応答・両方なし、壊れた座標の記憶と後続の処理、通信の障害（5xx・429・切断・本文の途中の切断×逆ジオ・標高）で中断して何も確定しない・復旧後に続きから、`muni.js`の失敗、キャッシュの値の検査、`lon`が数値でない行、競合、40件、停止 |
+| `local/tests.rs` | `organize`が推定で位置が付く写真を移さない・窓の外と時刻なしは移す・錨が消えれば次に移す |
+| `tests/ingest_cli.rs` | `sync --dry-run`が`infer`・`enrich`の件数を出す、取り込み済みの形のDBで国外の1件が空で確定する |
+
+### 15.10 回したもの
+
+- **T2.6**: `quality`段（簡易品質）。
+- **T2.7**: 検証環境での受入のうち、**同じ写真を比較用PythonとRustへ入れた`photos`の列ごとの比較**（`infer`・`enrich`を含む）。Drive・GSIの本物での確認は管理者が行う。
+- **P3**: 位置が動いたときに地名を付け直すか（§15.2の5）。手動の位置の上書き（§13.10・§14.12）と一緒に決める。
