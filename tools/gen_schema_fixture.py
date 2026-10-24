@@ -11,8 +11,10 @@
 出力先は crates/geoframe/tests/fixtures/ の下。RustのテストがPythonの空DBとRustの空DBの構造を比べる
 （`crates/geoframe/src/schema.rs`）。比べるのは`sqlite_master`の`sql`の文字列（作成順どおり。
 `photos`も含む）と、各表の列（名前・型・NOT NULL・既定値・主キー・並び）・各表の索引（列と一意性）。
-空のDBでは、PythonもRustも`CREATE TABLE`の時点で全列を持つ（`ALTER TABLE ADD COLUMN`は起きない）ので、
-`photos`の`sql`の文字列も一致する。
+Pythonは`photos`を`CREATE TABLE`で作ったあと、`store.py`の`db()`が`muni_cd`・`pref`・`city`、
+`favorite`・`hidden`・`rotation`を`ALTER TABLE ADD COLUMN`で足す。
+`ALTER`のあとの`sqlite_master.sql`は、列定義が末尾に追記された形になる。Rust側は、その`ALTER`後の
+`sql`に`CREATE TABLE`を合わせて書いているので、`photos`の`sql`の文字列まで一致する。
 """
 
 import json

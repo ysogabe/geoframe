@@ -179,7 +179,14 @@ expect "rollback も状態取得の失敗なら拒否（終了コード4）" tes
 setup; echo failed > "$T/env/state/py_state"; run preflight
 expect "Python 版が failed なら通す" test "$rc" = 0
 setup; echo not-found > "$T/env/state/py_load"; run preflight
-expect "Python 版の unit が存在しないと確認できれば通す" test "$rc" = 0
+expect "Python 版が未導入（not-found/inactive）なら通す" test "$rc" = 0
+setup; echo not-found > "$T/env/state/py_load"; touch "$T/env/state/py_active"; run deploy
+expect "Python 版の unit ファイルが無くても稼働中（not-found/active）なら拒否（終了コード4）" test "$rc" = 4
+expect "not-found/active で拒否したとき何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a ! -e "$MOCK_BIN.new"
+setup; echo not-found > "$T/env/state/py_load"; echo deactivating > "$T/env/state/py_state"; run preflight
+expect "not-found/deactivating も拒否（終了コード4）" test "$rc" = 4
+setup; echo not-found > "$T/env/state/py_load"; touch "$T/env/state/py_active"; run rollback
+expect "rollback も not-found/active なら拒否（終了コード4）" test "$rc" = 4
 
 echo "[2] 成功"
 setup; run deploy

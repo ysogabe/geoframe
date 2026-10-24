@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::cache::Cache;
+use crate::cache::{Cache, SaveOutcome};
 use crate::config::{Config, Overrides};
 use crate::db::Catalog;
 use crate::server::AppState;
@@ -27,7 +27,13 @@ struct IngestThreads {
 /// 同じ停止の合図で両方を起こすので、saver が先に最後の保存を終えたあとで worker が最後の `put`
 /// をすると、その更新は保存されずに失われる。saver は合図で止まるだけ（最後の保存はしない）にして、
 /// 保存はここで、両方の終了を待ってから 1 回だけする。限られた時間内に worker が止まらなかったときも
-/// 保存はする（そのあとの `put` は失われうるが、警告を出す）。呼ぶ前に `stop` の合図を出しておくこと。
+/// 保存はする（そのあとの `put` は失われうるが、警告を出す）。
+///
+/// saver が I/O の最中に期限を超えて残った場合は、保存用の排他（`Cache::save_final`）で重ねて書かない。
+/// 排他は `limit` まで待ち、それでも取れなければ最後の保存は省略する（警告を出す）。省略した分は、
+/// 残った saver の保存が終わったあとの内容に含まれないが、書きかけの一時ファイルと競合して JSON を
+/// 壊すよりは、キャッシュ（位置の逆引き結果で、作り直せる）の直近の更新を失うほうを選ぶ。
+/// 呼ぶ前に `stop` の合図を出しておくこと。
 fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration) {
     for (name, handle) in [
         ("同期サイクル", threads.worker),
@@ -37,7 +43,9 @@ fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration) {
             tracing::warn!("{name}のスレッドが時間内に止まりませんでした（そのまま終了します）");
         }
     }
-    cache.save_now();
+    if cache.save_final(limit) == SaveOutcome::Skipped {
+        tracing::warn!("キャッシュの最後の保存を省略しました（直近の更新は失われます）");
+    }
 }
 
 fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {

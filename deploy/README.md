@@ -471,7 +471,7 @@ Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作�
   DB が開けない（終了コード 1）は再起動対象。`LimitNOFILE=4096`（同時の接続 256＋配信 32＋SQLite で 300 前後を使う）。
 - **取り込み（DB への書き込みと同期サイクル）は`GEOFRAME_INGEST=1`のときだけ動く**（既定は`0`）。P5 の切替まで本番の書き手は Python 版なので、
   `/etc/default/geoframe`をそのまま使って Rust 版を起動しても DB には書かない。検証環境で取り込みを試すときだけ、
-  `/etc/default/geoframe`か drop-in で`GEOFRAME_INGEST=1`を足す。**P5 の切替までは、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できない機体では、書き込みの前に終了コード 2 で断る**（本番機では動かない。[server.md §11.1.1](../docs/rust-migration/server.md)。`systemctl show geoframe-server.service`が使えない・答えないときも断る）。有効にすると、DB が無ければ新しく作り、スキーマの作成・移行をして、
+  `/etc/default/geoframe`か drop-in で`GEOFRAME_INGEST=1`を足す。**P5 の切替までは、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できない機体では、書き込みの前に終了コード 2 で断る**（本番機では動かない。[server.md §11.1.1](../docs/rust-migration/server.md)。`systemctl show geoframe-server.service`が使えない・答えないときも断る。`ActiveState`だけを見る: unit ファイルが無くても動いているサービスは断る）。有効にすると、DB が無ければ新しく作り、スキーマの作成・移行をして、
   `GEOFRAME_DRIVE_POLL_MIN`（既定 10 分）ごとに同期サイクルを回す（[server.md §11](../docs/rust-migration/server.md)）。**Python 版と同じ`catalog.db`には絶対に向けない**。
 - `ReadOnlyPaths=`は、`photos/`・`blog_exports/`・`travel_blog/`だけ（writer が書く`catalog.db`・`derivatives/`は外した。`tmp/`・`.cache.json`・`.ingest.lock`は元から対象外）。
   WAL の DB は読み取りでも同じディレクトリに`-shm`/`-wal`を作るので、ディレクトリ自体は書き込み可のまま。P3 で手動修正などの更新 API を追加するとき`blog_exports/`などを外す。
@@ -515,7 +515,7 @@ bash deploy/rust-deploy-test.sh        # 失敗経路をモックで試験（ssh
 
 - 検証環境の印`/etc/geoframe/staging`（通常ファイル。シンボリックリンクは不可）があること。**検証環境で一度だけ作る**（本番機には作らない）:
   `sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging`（`/etc/geoframe/`は本番機にも SSH の鍵置き場として存在するので、ディレクトリではなくファイルを見る）。
-- Python 版の`geoframe-server.service`が稼働中でないこと（稼働中なら本番機の可能性が高い）。
+- Python 版の`geoframe-server.service`が稼働中でないこと（稼働中なら本番機の可能性が高い）。`systemctl show`の`ActiveState`が`inactive`／`failed`のときだけ通し、`LoadState`は見ない（unit ファイルが無い`not-found`でも、動いているサービスは動き続けうるので、`not-found/active`も拒否する。Python が入っていない機体は`not-found/inactive`で通る）。
 
 本番の切替は P5 で、専用の手順と明示的なフラグをそのとき作る。このスクリプトは、印の無い機体には配らない。
 

@@ -78,8 +78,9 @@ unit とバイナリ（geoframe.failed へ退避）を撤去する。
 誤配布の防止（変更の前に検査。--rollback も同じ）:
   - 接続先に検証環境の印 /etc/geoframe/staging（通常ファイル）があること。
     検証環境で一度だけ作る:  sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging
-  - geoframe-server.service（Python 版）が inactive/failed、または unit が存在しないと確認できること
-    （稼働中・状態を取得できない・空出力・未知の状態は拒否）。
+  - geoframe-server.service（Python 版）の ActiveState が inactive/failed と確認できること
+    （未導入は not-found/inactive で通る。LoadState は見ない: unit ファイルが無くても動いている
+    サービスはありうるので、not-found/active も拒否。稼働中・状態を取得できない・空出力・未知の状態も拒否）。
   本番の切替は P5 で、専用の手順と明示的なフラグをそのとき作る（このスクリプトは本番に配れない）。
 
 本番機には実行しないこと（本番の切替は P5）。
@@ -116,6 +117,7 @@ say() { echo "[remote] $*"; }
 
 # unit の LoadState と ActiveState を取る（u_load・u_active に入れる）。取得できない（systemd に繋がらない・
 # 空出力）なら非ゼロ。unit が存在しないときは systemd が LoadState=not-found を返すので、それとは区別できる。
+# LoadState と ActiveState は独立で、not-found でも active でありうる。
 u_load="" u_active=""
 unit_state() {
     local out
@@ -139,9 +141,8 @@ preflight() {
         say "拒否: Python 版（${py_unit}）の状態を取得できない。非稼働と確認できないので何も変更していない"
         return 4
     fi
-    if [ "$u_load" = not-found ]; then
-        return 0   # unit が存在しない（Python 版が入っていない機体）
-    fi
+    # LoadState は見ない。unit ファイルを消して daemon-reload しても、動いているサービスは動き続けうる
+    # （not-found と active は両立する）。未導入の機体は not-found/inactive になり、そのまま通る。
     case "$u_active" in
         inactive|failed) return 0 ;;
         active|activating|reloading|deactivating)
@@ -512,7 +513,7 @@ log "commit  : ${COMMIT}${DIRTY}"
 log "binary  : ${LOCAL_BIN#"$REPO_ROOT"/}（sha256 ${SUM:0:16}…, $(stat -c %s "$LOCAL_BIN") bytes）"
 log "配置先  : ${BIN_PATH}（直前を ${BIN_PATH}.prev へ）、unit: /etc/systemd/system/${UNIT_NAME}"
 log "確認    : ${CHECK_BASE}/healthz, ${CHECK_BASE}/api/v1/photos（${WAIT_SECS} 秒まで待つ）"
-log "拒否条件: 検証環境の印 /etc/geoframe/staging が無い、または geoframe-server.service（Python 版）が非稼働と確認できない"
+log "拒否条件: 検証環境の印 /etc/geoframe/staging が無い、または geoframe-server.service（Python 版）が非稼働（ActiveState が inactive／failed）と確認できない"
 if [ "$DRY_RUN" -eq 1 ]; then
     log "*** DRY-RUN: 転送・配置・再起動は行わない ***"
     exit 0

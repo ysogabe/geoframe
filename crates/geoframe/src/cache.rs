@@ -29,12 +29,14 @@
 //! - [`Cache::save_if_due`] は、変更があり、前回の保存から [`SAVE_INTERVAL`] 以上たっているときだけ書く
 //!   （SD/eMMC の寿命のため、最短 60 秒間隔）。一時ファイル `.cache.json.tmp` に書いて `rename` で
 //!   差し替える（書きかけで落ちても現役のキーを失わない）。失敗したら次の tick で再試行する。
+//!   保存の全体は保存用の排他で 1 つずつにする。停止時の [`Cache::save_final`] は、保存スレッドが
+//!   I/O の最中ならそれを期限まで待ち、順番が来なければ書かずに省略する（重ねて書かない）。
 //! - 凍結（[`Cache::load_frozen`]）は `--dry-run` 用で、`put`・`purge`・保存をしない。
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -63,6 +65,8 @@ pub enum SaveOutcome {
     Saved,
     /// 書けなかった（次の tick で再試行する）。
     Failed,
+    /// 別のスレッドが保存の最中で、期限内に順番が来なかったので書かなかった（`save_final` だけ）。
+    Skipped,
 }
 
 struct State {
@@ -77,6 +81,10 @@ pub struct Cache {
     tmp: PathBuf,
     frozen: bool,
     state: Mutex<State>,
+    /// 保存の全体（スナップショット〜一時ファイルへの書き込み〜`fsync`〜`rename`）を 1 つずつにする。
+    /// 保存中は `state` の Mutex を放すうえ、一時ファイル名は共通なので、2 つの保存が重なると
+    /// truncate・write・rename が競合して更新の欠落や JSON の破損が起こりうる。
+    save_lock: Mutex<()>,
 }
 
 impl Cache {
@@ -116,6 +124,7 @@ impl Cache {
                 dirty: false,
                 saved_at: None,
             }),
+            save_lock: Mutex::new(()),
         }
     }
 
@@ -166,18 +175,41 @@ impl Cache {
 
     /// 変更があり、前回の保存から [`SAVE_INTERVAL`] 以上たっているときだけ書く。
     pub fn save_if_due(&self, now: Instant) -> SaveOutcome {
-        self.save(now, false)
+        self.save_with(now, false, None, |body| self.write_atomically(body))
     }
 
-    /// 間隔を待たずに書く（変更があるときだけ）。起動時の旧キー破棄のあと・停止時。
+    /// 間隔を待たずに書く（変更があるときだけ）。起動時の旧キー破棄のあと。ほかの保存が終わるまで待つ。
     pub fn save_now(&self) -> SaveOutcome {
-        self.save(Instant::now(), true)
+        self.save_with(Instant::now(), true, None, |body| {
+            self.write_atomically(body)
+        })
     }
 
-    fn save(&self, now: Instant, force: bool) -> SaveOutcome {
+    /// 停止時の最後の保存。ほかの保存（保存スレッドが I/O の最中に止まりきらなかった場合）の終了を
+    /// `wait` まで待ち、それでも順番が来なければ**書かずに** [`SaveOutcome::Skipped`] を返す。
+    /// 無期限には待たない（停止が終わらなくなる）。重ねて書くよりは、この回の更新を捨てるほうを選ぶ。
+    pub fn save_final(&self, wait: Duration) -> SaveOutcome {
+        self.save_with(Instant::now(), true, Some(wait), |body| {
+            self.write_atomically(body)
+        })
+    }
+
+    /// 保存の本体。`wait` が `None` なら排他を無期限に待つ。`write` は本文を書く処理（試験で遅延や
+    /// 失敗を差し込めるよう、呼び出し側から渡す。本番の呼び出しは [`Cache::write_atomically`] を渡す）。
+    fn save_with(
+        &self,
+        now: Instant,
+        force: bool,
+        wait: Option<Duration>,
+        write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> SaveOutcome {
         if self.frozen {
             return SaveOutcome::Clean;
         }
+        let Some(_exclusive) = self.lock_save(wait) else {
+            tracing::warn!("別の保存が終わらないので、キャッシュの保存を省略します");
+            return SaveOutcome::Skipped;
+        };
         let body = {
             let mut state = self.state();
             if !state.dirty {
@@ -196,13 +228,36 @@ impl Cache {
             state.saved_at = Some(now);
             body
         };
-        match self.write_atomically(&body) {
+        match write(&body) {
             Ok(()) => SaveOutcome::Saved,
             Err(e) => {
                 self.state().dirty = true; // 次の tick で再試行
                 tracing::warn!("キャッシュの保存に失敗しました（次回再試行）: {}", e.kind());
                 SaveOutcome::Failed
             }
+        }
+    }
+
+    /// 保存の排他を取る。`wait` が `Some` なら、その時間までしか待たず、取れなければ `None`。
+    fn lock_save(&self, wait: Option<Duration>) -> Option<MutexGuard<'_, ()>> {
+        let Some(wait) = wait else {
+            return Some(
+                self.save_lock
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+            );
+        };
+        let deadline = Instant::now() + wait;
+        loop {
+            match self.save_lock.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(TryLockError::Poisoned(e)) => return Some(e.into_inner()),
+                Err(TryLockError::WouldBlock) => {}
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -229,7 +284,7 @@ fn to_python_json(map: &Map<String, Value>) -> Vec<u8> {
 /// 保存スレッド（現行の `cache_saver`）。[`SAVER_TICK`] ごとに起きて [`Cache::save_if_due`] を呼ぶ。
 ///
 /// 停止の合図で終わるだけで、**最後の保存はしない**。最後の保存は、キャッシュに書く側（同期サイクルの
-/// スレッド）が止まったあとに呼び出し側が [`Cache::save_now`] で行う（`cli::stop_ingest_threads`）。
+/// スレッド）が止まったあとに呼び出し側が [`Cache::save_final`] で行う（`cli::stop_ingest_threads`）。
 /// 同じ合図で保存側が先に最後の保存を終えると、あとから書く側が `put` した更新が失われるため。
 pub fn spawn_saver(cache: Arc<Cache>, stop: StopFlag) -> std::thread::JoinHandle<()> {
     spawn_saver_with(cache, stop, SAVER_TICK)
@@ -391,6 +446,7 @@ mod tests {
                 dirty: true,
                 saved_at: None,
             }),
+            save_lock: Mutex::new(()),
         };
         assert_eq!(broken.save_now(), SaveOutcome::Failed);
         assert!(broken.state().dirty, "失敗したら次の tick で再試行する");
@@ -432,5 +488,73 @@ mod tests {
         assert!(!read_file(&dir).contains("geo:2"));
         assert_eq!(cache.save_now(), SaveOutcome::Saved);
         assert!(read_file(&dir).contains("geo:2"));
+    }
+
+    #[test]
+    fn the_final_save_does_not_overlap_a_stuck_save_and_is_skipped_after_the_deadline() {
+        use std::sync::mpsc;
+        let dir = TempDir::new("cache-overlap");
+        let cache = Arc::new(Cache::load(dir.path()));
+        cache.put("geo:1", json!(1));
+        // 保存スレッドが I/O の最中で固まっている状態（書き込み処理に待ちを差し込む）
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let stuck = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache.save_with(Instant::now(), false, None, |body| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    cache.write_atomically(body)
+                })
+            })
+        };
+        entered_rx.recv().unwrap();
+        // 固まっている間に書き手が更新し、停止側が最後の保存を試みる
+        cache.put("geo:2", json!(2));
+        let started = Instant::now();
+        assert_eq!(
+            cache.save_final(Duration::from_millis(100)),
+            SaveOutcome::Skipped
+        );
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(
+            !dir.path().join(".cache.json").exists()
+                && !dir.path().join(".cache.json.tmp").exists(),
+            "排他の外では何も書かない"
+        );
+        // 固まりが解けたら、保存は 1 つずつ終わり、省略された分も次の保存で残る
+        release_tx.send(()).unwrap();
+        assert_eq!(stuck.join().unwrap(), SaveOutcome::Saved);
+        assert_eq!(cache.save_final(Duration::from_secs(5)), SaveOutcome::Saved);
+        let text = read_file(&dir);
+        assert!(text.contains("geo:1") && text.contains("geo:2"), "{text}");
+        serde_json::from_str::<Value>(&text).expect("JSON が壊れていない");
+        assert!(!dir.path().join(".cache.json.tmp").exists());
+    }
+
+    #[test]
+    fn the_final_save_waits_for_a_save_that_finishes_in_time() {
+        use std::sync::mpsc;
+        let dir = TempDir::new("cache-wait");
+        let cache = Arc::new(Cache::load(dir.path()));
+        cache.put("geo:1", json!(1));
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let slow = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache.save_with(Instant::now(), false, None, |body| {
+                    entered_tx.send(()).unwrap();
+                    std::thread::sleep(Duration::from_millis(150));
+                    cache.write_atomically(body)
+                })
+            })
+        };
+        entered_rx.recv().unwrap();
+        cache.put("geo:2", json!(2));
+        assert_eq!(cache.save_final(Duration::from_secs(5)), SaveOutcome::Saved);
+        assert_eq!(slow.join().unwrap(), SaveOutcome::Saved);
+        let text = read_file(&dir);
+        assert!(text.contains("geo:1") && text.contains("geo:2"), "{text}");
     }
 }

@@ -188,11 +188,11 @@ fn check_marker(marker: &std::path::Path) -> Result<(), GuardError> {
     }
 }
 
-/// `LoadState`・`ActiveState` から、通してよいかを決める（配布スクリプトの `preflight` と同じ）。
-fn decide(load: &str, active: &str) -> Result<(), GuardError> {
-    if load == "not-found" {
-        return Ok(());
-    }
+/// `ActiveState` から、通してよいかを決める（配布スクリプトの `preflight` と同じ）。
+/// `LoadState` は見ない: unit ファイルを消して `daemon-reload` しても、動いているサービスは
+/// 動き続けうる（`not-found` と `active` は両立する）ので、ロード状態からは停止を判断できない。
+/// 未導入の機体は `not-found/inactive` になり、そのまま通る。
+fn decide(_load: &str, active: &str) -> Result<(), GuardError> {
     match active {
         "inactive" | "failed" => Ok(()),
         other => Err(GuardError::PythonNotStopped(other.to_string())),
@@ -343,7 +343,6 @@ mod tests {
             ("loaded", "inactive"),
             ("loaded", "failed"),
             ("not-found", "inactive"),
-            ("not-found", "active"), // 存在しない unit が稼働中、は起きないが、未導入を優先する
         ] {
             assert_eq!(
                 guard(&dir, fixed(load, active)).check(),
@@ -357,6 +356,14 @@ mod tests {
     fn a_running_or_unknown_python_is_refused() {
         let dir = TempDir::new("guard-running");
         fs::write(dir.path().join("staging"), b"").unwrap();
+        // unit ファイルを消して daemon-reload しても、動いているサービスは止まらない
+        for load in ["loaded", "not-found"] {
+            assert_eq!(
+                guard(&dir, fixed(load, "active")).check(),
+                Err(GuardError::PythonNotStopped("active".into())),
+                "{load}/active"
+            );
+        }
         for active in [
             "active",
             "activating",
@@ -365,11 +372,13 @@ mod tests {
             "maintenance",
             "something-new",
         ] {
-            assert_eq!(
-                guard(&dir, fixed("loaded", active)).check(),
-                Err(GuardError::PythonNotStopped(active.into())),
-                "{active}"
-            );
+            for load in ["loaded", "not-found"] {
+                assert_eq!(
+                    guard(&dir, fixed(load, active)).check(),
+                    Err(GuardError::PythonNotStopped(active.into())),
+                    "{load}/{active}"
+                );
+            }
         }
     }
 
@@ -402,6 +411,10 @@ mod tests {
         );
         assert_eq!(
             ok("printf 'LoadState=loaded\\nActiveState=active\\n'"),
+            Err(GuardError::PythonNotStopped("active".into()))
+        );
+        assert_eq!(
+            ok("printf 'LoadState=not-found\\nActiveState=active\\n'"),
             Err(GuardError::PythonNotStopped("active".into()))
         );
         // 空・欠け・値が空・異常終了・出力なしの成功は、全て不明として断る
