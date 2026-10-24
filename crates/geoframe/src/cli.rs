@@ -33,6 +33,8 @@ struct IngestThreads {
 /// 排他は `limit` まで待ち、それでも取れなければ最後の保存は省略する（警告を出す）。省略した分は、
 /// 残った saver の保存が終わったあとの内容に含まれないが、書きかけの一時ファイルと競合して JSON を
 /// 壊すよりは、キャッシュ（位置の逆引き結果で、作り直せる）の直近の更新を失うほうを選ぶ。
+/// 期限を超えて残ったスレッドは `.ingest.lock` を持ち続ける（`LockHold`）ので、そのあいだ別の
+/// 取り込みは始まらない。
 /// 呼ぶ前に `stop` の合図を出しておくこと。
 fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration) {
     for (name, handle) in [
@@ -256,8 +258,13 @@ fn serve(overrides: &Overrides) -> ExitCode {
             crate::sync::default_stages(),
             stop.clone(),
             config.drive_poll(),
+            ingest.lock_hold(),
         ),
-        saver: crate::cache::spawn_saver(Arc::clone(&ingest.cache), stop.clone()),
+        saver: crate::cache::spawn_saver(
+            Arc::clone(&ingest.cache),
+            stop.clone(),
+            ingest.lock_hold(),
+        ),
     });
     let state = AppState::new(Arc::clone(&config), catalog);
     if state.data_root.as_path() != state.config.data_dir.as_path() {
@@ -273,6 +280,8 @@ fn serve(overrides: &Overrides) -> ExitCode {
     if let (Some(threads), Some(ingest)) = (threads, &ingest) {
         stop_ingest_threads(threads, &ingest.cache, THREAD_STOP_LIMIT);
     }
+    // 期限内に止まらなかったスレッドが残っていても、`.ingest.lock` はそのスレッドが終わる（プロセスが
+    // 終わる）まで外れない（スレッドが `LockHold` を持つ）。ここで Ingest を捨てても二重には書かれない
     drop(ingest);
     // 固まった spawn_blocking（DB の読み取り）を待ち続けて、停止が終わらないことがないように
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -512,7 +521,11 @@ mod tests {
         let dir = TempDir::new("cli-stop-order");
         let cache = Arc::new(Cache::load(dir.path()));
         let stop = StopFlag::new();
-        let saver = crate::cache::spawn_saver(Arc::clone(&cache), stop.clone());
+        let saver = crate::cache::spawn_saver(
+            Arc::clone(&cache),
+            stop.clone(),
+            crate::ingest::LockHold::for_test(dir.path()),
+        );
         // 偽の worker: 合図を見てから、少し遅れて最後の更新をする（saver が先に終わっても間に合う長さ）
         let worker = {
             let (cache, stop) = (Arc::clone(&cache), stop.clone());
@@ -530,5 +543,53 @@ mod tests {
         );
         let saved = std::fs::read_to_string(dir.path().join(".cache.json")).unwrap();
         assert!(saved.contains("geo:late"), "{saved}");
+    }
+    /// 保存スレッドが停止の期限を超えて残っている間は、`Ingest` を drop しても `.ingest.lock` が外れず、
+    /// 別の取り込みを始められない。スレッドが終わったら取れる（故障注入: 止まったままの保存スレッド）。
+    #[test]
+    fn the_ingest_lock_stays_while_a_stuck_saver_remains() {
+        use crate::config::Overrides;
+        use crate::guard::Guard;
+        use crate::ingest::{IngestError, start_with};
+        use crate::testutil::TempDir;
+
+        let dir = TempDir::new("cli-stuck-saver");
+        let overrides = Overrides {
+            listen: None,
+            data_dir: Some(dir.path().to_path_buf()),
+        };
+        let config = Config::load(|_| None, &overrides).unwrap();
+        let ingest = start_with(&config, &Guard::skip()).unwrap();
+
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (started, running) = std::sync::mpsc::channel::<()>();
+        let hold = ingest.lock_hold();
+        let saver = std::thread::spawn(move || {
+            let _lock = hold; // 本物の保存スレッドと同じく、終わるまで持つ
+            started.send(()).unwrap();
+            let _ = wait.recv(); // I/O で固まっているつもり
+        });
+        running.recv().unwrap();
+        let worker = std::thread::spawn(|| {});
+        stop_ingest_threads(
+            IngestThreads { worker, saver },
+            &ingest.cache,
+            Duration::from_millis(100),
+        );
+        // serve の末尾と同じく Ingest を捨てる。固まった保存スレッドはまだ生きている
+        drop(ingest);
+        assert!(matches!(
+            start_with(&config, &Guard::skip()),
+            Err(IngestError::Locked)
+        ));
+        release.send(()).unwrap();
+        for _ in 0..200 {
+            match start_with(&config, &Guard::skip()) {
+                Ok(_) => return,
+                Err(IngestError::Locked) => std::thread::sleep(Duration::from_millis(10)),
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("保存スレッドが終わってもロックが外れない");
     }
 }

@@ -71,12 +71,36 @@ impl From<WriteError> for IngestError {
     }
 }
 
-/// 取り込みの書き手一式。drop するとロックが外れる。
+/// `.ingest.lock` の所有権。複製（[`Ingest::lock_hold`]）を持つ間はロックが外れない。
+///
+/// 書き込みうるスレッド（同期サイクル・キャッシュ保存）が `Ingest` の drop のあとも残りうる（停止の期限を
+/// 超えても待ちきらない）ので、ロックの寿命を `Ingest` だけに結びつけない。そうしないと、旧スレッドが
+/// まだ書ける間に別の `sync`／`serve` が起動して、DB やキャッシュの一時ファイルで競合する。
+/// 各スレッドは自分の複製をスレッドの終了（パニックを含む）まで持ち、プロセスが終わればOS が外す。
+#[derive(Clone)]
+pub struct LockHold(#[allow(dead_code)] Arc<File>);
+
+impl LockHold {
+    /// 試験用: ロックは取らない（スレッドに渡す引数を満たすだけ）。
+    #[cfg(test)]
+    pub(crate) fn for_test(dir: &Path) -> Self {
+        Self(Arc::new(File::create(dir.join("hold-for-test")).unwrap()))
+    }
+}
+
+/// 取り込みの書き手一式。drop してもスレッドが [`LockHold`] を持つ間はロックが残る。
 pub struct Ingest {
     pub writer: Writer,
     pub cache: Arc<Cache>,
     pub migration: Migration,
-    _lock: File,
+    lock: LockHold,
+}
+
+impl Ingest {
+    /// ロックの所有権の複製。書き込みうるスレッドに渡し、そのスレッドが終わるまで持たせる。
+    pub fn lock_hold(&self) -> LockHold {
+        self.lock.clone()
+    }
 }
 
 /// 取り込みを始める準備（上の「起動の順序」）。最初に[ガード](crate::guard)を通す。
@@ -85,7 +109,7 @@ pub fn start(config: &Config) -> Result<Ingest, IngestError> {
 }
 
 /// [`start`] のガードを差し替えられる形（単体テスト用。配布するバイナリの経路は [`start`] だけ）。
-fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, IngestError> {
+pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, IngestError> {
     // 最初の書き込み（データ置き場の作成・ロック・移行・掃除・キャッシュ保存）より前に断る
     guard.check().map_err(IngestError::Refused)?;
     fs::create_dir_all(&config.data_dir).map_err(|e| IngestError::Io(e.kind()))?;
@@ -132,7 +156,7 @@ fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, IngestError> {
         writer,
         cache,
         migration,
-        _lock: lock,
+        lock: LockHold(Arc::new(lock)),
     })
 }
 
@@ -326,6 +350,19 @@ mod tests {
         assert!(matches!(start(&config), Err(IngestError::Locked)));
         drop(first);
         // 外れたら取れる
+        assert!(start(&config).is_ok());
+    }
+
+    /// `Ingest` を drop しても、スレッドが [`LockHold`] を持つ間は次の取り込みを断り、手放したら取れる。
+    #[test]
+    fn the_lock_outlives_ingest_while_a_thread_holds_it() {
+        let dir = TempDir::new("ingest-lock-hold");
+        let config = config(&dir);
+        let first = start(&config).unwrap();
+        let hold = first.lock_hold();
+        drop(first);
+        assert!(matches!(start(&config), Err(IngestError::Locked)));
+        drop(hold);
         assert!(start(&config).is_ok());
     }
 

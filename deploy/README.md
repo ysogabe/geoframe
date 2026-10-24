@@ -515,7 +515,7 @@ bash deploy/rust-deploy-test.sh        # 失敗経路をモックで試験（ssh
 
 - 検証環境の印`/etc/geoframe/staging`（通常ファイル。シンボリックリンクは不可）があること。**検証環境で一度だけ作る**（本番機には作らない）:
   `sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging`（`/etc/geoframe/`は本番機にも SSH の鍵置き場として存在するので、ディレクトリではなくファイルを見る）。
-- Python 版の`geoframe-server.service`が稼働中でないこと（稼働中なら本番機の可能性が高い）。`systemctl show`の`ActiveState`が`inactive`／`failed`のときだけ通し、`LoadState`は見ない（unit ファイルが無い`not-found`でも、動いているサービスは動き続けうるので、`not-found/active`も拒否する。Python が入っていない機体は`not-found/inactive`で通る）。
+- Python 版の`geoframe-server.service`が稼働中でないこと（稼働中なら本番機の可能性が高い）。`systemctl show`の`ActiveState`が`inactive`／`failed`のときだけ通し、`LoadState`は見ない（unit ファイルが無い`not-found`でも、動いているサービスは動き続けうるので、`not-found/active`も拒否する。Python が入っていない機体は`not-found/inactive`で通る）。`LoadState=`・`ActiveState=`はそれぞれちょうど1行で値が空でないときだけ受け入れ、重複（同じ値の重複も）は拒否する（先頭の行だけを使うと矛盾した出力を取り違えるため）。
 
 本番の切替は P5 で、専用の手順と明示的なフラグをそのとき作る。このスクリプトは、印の無い機体には配らない。
 

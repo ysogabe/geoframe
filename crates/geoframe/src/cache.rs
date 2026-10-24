@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::ingest::LockHold;
 use crate::stop::StopFlag;
 
 /// 実書き込みの最短間隔（現行の `CACHE_SAVE_INTERVAL_S`）。
@@ -288,18 +289,27 @@ fn to_python_json(map: &Map<String, Value>) -> Vec<u8> {
 /// 停止の合図で終わるだけで、**最後の保存はしない**。最後の保存は、キャッシュに書く側（同期サイクルの
 /// スレッド）が止まったあとに呼び出し側が [`Cache::save_final`] で行う（`cli::stop_ingest_threads`）。
 /// 同じ合図で保存側が先に最後の保存を終えると、あとから書く側が `put` した更新が失われるため。
-pub fn spawn_saver(cache: Arc<Cache>, stop: StopFlag) -> std::thread::JoinHandle<()> {
-    spawn_saver_with(cache, stop, SAVER_TICK)
+///
+/// `lock` は保存スレッドが終わるまで持つ（停止の期限を超えて I/O の最中に残っても、その間は
+/// `.ingest.lock` が外れず、別の `geoframe` が同じ置き場に書き始めない）。
+pub fn spawn_saver(
+    cache: Arc<Cache>,
+    stop: StopFlag,
+    lock: LockHold,
+) -> std::thread::JoinHandle<()> {
+    spawn_saver_with(cache, stop, SAVER_TICK, lock)
 }
 
 fn spawn_saver_with(
     cache: Arc<Cache>,
     stop: StopFlag,
     tick: Duration,
+    lock: LockHold,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("cache-saver".into())
         .spawn(move || {
+            let _lock = lock;
             while !stop.wait(tick) {
                 cache.save_if_due(Instant::now());
             }
@@ -474,7 +484,12 @@ mod tests {
         let dir = TempDir::new("cache-saver");
         let cache = Arc::new(Cache::load(dir.path()));
         let stop = StopFlag::new();
-        let handle = spawn_saver_with(Arc::clone(&cache), stop.clone(), Duration::from_millis(10));
+        let handle = spawn_saver_with(
+            Arc::clone(&cache),
+            stop.clone(),
+            Duration::from_millis(10),
+            LockHold::for_test(dir.path()),
+        );
         cache.put("geo:1", json!(1));
         for _ in 0..200 {
             if dir.path().join(".cache.json").exists() {

@@ -44,12 +44,17 @@ is-active)
     if [ "$unit" = geoframe-server.service ]; then st="$(py_active)"; else st="$(rs_active)"; fi
     echo "$st"; [ "$st" = active ] ;;
 show)
-    # ctl/py_show, ctl/rs_show: fail（systemd へ繋がらない: 標準エラーだけ・終了コード1）| empty（空出力・終了コード0）
+    # ctl/py_show, ctl/rs_show: fail（systemd へ繋がらない: 標準エラーだけ・終了コード1）| empty（空出力・終了コード0）|
+    #   dup_conflict（ActiveState が inactive のあとに active）| dup_same（ActiveState が inactive で2行）|
+    #   dup_load（LoadState が2行）
     if [ "$unit" = geoframe-server.service ]; then tag=py; else tag=rs; fi
     if [ -f "$C/${tag}_show" ]; then
         case "$(cat "$C/${tag}_show")" in
             fail)  echo "Failed to connect to bus: No such file or directory" >&2; exit 1 ;;
             empty) exit 0 ;;
+            dup_conflict) printf 'LoadState=loaded\nActiveState=inactive\nActiveState=active\n'; exit 0 ;;
+            dup_same)     printf 'LoadState=loaded\nActiveState=inactive\nActiveState=inactive\n'; exit 0 ;;
+            dup_load)     printf 'LoadState=loaded\nLoadState=loaded\nActiveState=inactive\n'; exit 0 ;;
         esac
     fi
     if [ "$tag" = py ]; then
@@ -170,6 +175,13 @@ expect "Python 版の状態取得が失敗（systemd に繋がらない）なら
 expect "状態取得の失敗で拒否したとき何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a ! -e "$MOCK_BIN.new"
 setup; echo empty > "$T/env/ctl/py_show"; run deploy
 expect "Python 版の状態が空出力なら拒否（終了コード4）" test "$rc" = 4
+for dup in dup_conflict dup_same dup_load; do
+    setup; echo "$dup" > "$T/env/ctl/py_show"; run deploy
+    expect "Python 版の状態行が重複（$dup）なら拒否（終了コード4）" test "$rc" = 4
+    expect "重複（$dup）で拒否したとき何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a ! -e "$MOCK_BIN.new"
+    setup; echo "$dup" > "$T/env/ctl/py_show"; run rollback
+    expect "rollback も状態行が重複（$dup）なら拒否（終了コード4）" test "$rc" = 4
+done
 setup; echo maintenance > "$T/env/state/py_state"; run deploy
 expect "Python 版の状態が未知の値なら拒否（終了コード4）" test "$rc" = 4
 setup; echo activating > "$T/env/state/py_state"; run deploy

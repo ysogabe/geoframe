@@ -299,10 +299,13 @@ pub fn spawn_worker(
     stages: Vec<Box<dyn Stage>>,
     stop: StopFlag,
     poll: Duration,
+    lock: crate::ingest::LockHold,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("sync-worker".into())
         .spawn(move || {
+            // スレッドが終わるまで `.ingest.lock` を手放さない（呼び出し側が先に終わっても）
+            let _lock = lock;
             let http = crate::net::agent();
             loop {
                 one_cycle(&config, &writer, &cache, &stages, &http, &stop);
@@ -556,6 +559,7 @@ mod tests {
             vec![Box::new(Counter)],
             stop.clone(),
             Duration::from_millis(40),
+            crate::ingest::LockHold::for_test(s._dir.path()),
         );
         for _ in 0..300 {
             if RUNS.load(Ordering::SeqCst) >= 3 {
@@ -594,6 +598,7 @@ mod tests {
             vec![Box::new(Boom)],
             stop.clone(),
             Duration::from_millis(20),
+            crate::ingest::LockHold::for_test(s._dir.path()),
         );
         for _ in 0..300 {
             if RUNS.load(Ordering::SeqCst) >= 3 {

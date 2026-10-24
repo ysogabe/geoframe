@@ -11,9 +11,11 @@
 //!
 //! 1. 検証環境の印 [`STAGING_MARKER`] が通常ファイルとしてある（リンクは不可。配布スクリプトと同じ）。
 //!    本番機には印が無いので、ここで必ず止まる。
-//! 2. Python 版（[`PYTHON_UNIT`]）が非稼働と**確認できる**。`systemctl show` の結果が、`LoadState=not-found`
-//!    （Python が入っていない機体）か、`ActiveState` が `inactive`／`failed` のときだけ通す。稼働中・
-//!    状態不明・`systemctl` が無い／使えない／時間内に答えない／出力が読めない、は全て断る
+//! 2. Python 版（[`PYTHON_UNIT`]）が非稼働と**確認できる**。`systemctl show` の結果の `ActiveState` が
+//!    `inactive`／`failed` のときだけ通す（`LoadState` は見ない。unit ファイルが無い `not-found` でも、
+//!    動いているサービスは動き続けうるので、`not-found/active` も断る。Python が入っていない機体は
+//!    `not-found/inactive` で通る）。稼働中・状態不明・`systemctl` が無い／使えない／時間内に答えない／
+//!    出力が読めない・`LoadState`／`ActiveState` の行が欠けている・空・重複している、は全て断る
 //!    （判定できないから素通し、にはしない）。
 //!
 //! 検査は起動時の 1 回だけ。その後に Python が起動された場合は検知しない。
@@ -282,18 +284,22 @@ fn capture(command: &mut Command) -> Result<String, CaptureError> {
     Ok(out)
 }
 
-/// `systemctl show --property=LoadState,ActiveState` の出力から 2 つの値を取る。空・欠けは失敗。
+/// `systemctl show --property=LoadState,ActiveState` の出力から 2 つの値を取る。
+/// `LoadState=`・`ActiveState=` はそれぞれ**ちょうど 1 行**で、値が空でないときだけ受け入れる。
+/// 欠けている・空・重複（同じ値の重複も）は失敗: 先頭だけを使うと、矛盾する行
+/// （`ActiveState=inactive` のあとに `ActiveState=active`）を「止まっている」と取り違えるため。
 fn parse_show(out: &str) -> Result<(String, String), GuardError> {
     let find = |key: &str| {
-        out.lines()
-            .find_map(|line| line.strip_prefix(key))
-            .filter(|v| !v.is_empty())
-            .map(str::to_string)
+        let mut lines = out.lines().filter_map(|line| line.strip_prefix(key));
+        match (lines.next(), lines.next()) {
+            (Some(value), None) if !value.is_empty() => Some(value.to_string()),
+            _ => None,
+        }
     };
     match (find("LoadState="), find("ActiveState=")) {
         (Some(load), Some(active)) => Ok((load, active)),
         _ => Err(GuardError::PythonUnknown(
-            "systemctl の出力に状態が含まれません",
+            "systemctl の出力の状態が欠けている・空・重複しています",
         )),
     }
 }
@@ -425,6 +431,14 @@ mod tests {
             "printf 'LoadState=\\nActiveState=inactive\\n'",
             "printf 'LoadState=loaded\\nActiveState=inactive\\n'; exit 1",
             "echo oops >&2; exit 3",
+            // 重複は、矛盾する行（先頭が止まっていても後ろが稼働中）も、同じ値の重複も断る
+            "printf 'LoadState=loaded\\nActiveState=inactive\\nActiveState=active\\n'",
+            "printf 'LoadState=loaded\\nActiveState=active\\nActiveState=inactive\\n'",
+            "printf 'LoadState=loaded\\nActiveState=inactive\\nActiveState=inactive\\n'",
+            "printf 'LoadState=loaded\\nLoadState=not-found\\nActiveState=inactive\\n'",
+            "printf 'LoadState=loaded\\nLoadState=loaded\\nActiveState=inactive\\n'",
+            // 空の行が混ざっても、1 行だけではないので断る
+            "printf 'LoadState=loaded\\nActiveState=\\nActiveState=inactive\\n'",
         ] {
             assert!(
                 matches!(ok(script), Err(GuardError::PythonUnknown(_))),

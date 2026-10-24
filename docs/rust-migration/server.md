@@ -482,14 +482,14 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 - **既定を`0`にした**: P5の切替まで本番の書き手はPython（`geoframe-server`）で、本番の`/etc/default/geoframe`をそのままRustの起動に使っても二重に書かない設計にするため。PythonがDBを開いたまま、Rustが移行や`UPDATE`を行うと、一次データ（手動GPS・お気に入り）を壊しうる。書くには明示（`GEOFRAME_INGEST=1`）が要る。既定の見直しはP5の切替のとき（本番の設定に`1`を足す）。
 - **空のDBを作る**（P1の「DBが無いと起動を断る」の例外）: 取り込みが有効ならRustが書き手なので、Pythonの`db()`と同じくDBを作る。無効のときは今までどおり断る（配備の誤りを失敗として見せる）。誤って空のDBを静かに作らないよう、作ったときはwarnを出す。データ置き場のディレクトリも無ければ作る（Pythonの`mkdir(parents=True)`と同じ）。
-- **二重起動のロック**: `DATA_DIR/.ingest.lock`を排他で取る（`File::try_lock`）。`serve`が取り込み中に`sync`（実行）を起動する、といった**Rust同士の二重書き込み**は断る（終了コード1）。**Pythonとの二重書き込みはロックでは防げない**（Pythonはこのロックを見ない）。代わりにP5まではガード（§11.1.1）が、起動時に1回だけ、検証環境の印とPythonの非稼働を確かめる。起動したあとにPythonが起動された場合は検知しない。ドットファイルなので静的配信は403を返す。`--dry-run`はロックを取らず、動いている最中でも見られる。
+- **二重起動のロック**: `DATA_DIR/.ingest.lock`を排他で取る（`File::try_lock`）。`serve`が取り込み中に`sync`（実行）を起動する、といった**Rust同士の二重書き込み**は断る（終了コード1）。ロックの所有権は`Ingest`だけでなく、書き込みうる2つのスレッド（`sync-worker`・`cache-saver`）も複製（`ingest::LockHold`）を持つ。停止の期限（§11.5）を超えてスレッドが残っても、そのスレッドが終わる（プロセスが終わる）まで`.ingest.lock`は外れないので、残った旧スレッドの書き込みと、新しく起動した`sync`／`serve`が重ならない（`Ingest`を捨てた直後に外れていた、レビュー3回目の指摘の修正。試験は、止まったままの保存スレッドを模した`cli::tests::the_ingest_lock_stays_while_a_stuck_saver_remains`）。**Pythonとの二重書き込みはロックでは防げない**（Pythonはこのロックを見ない）。代わりにP5まではガード（§11.1.1）が、起動時に1回だけ、検証環境の印とPythonの非稼働を確かめる。起動したあとにPythonが起動された場合は検知しない。ドットファイルなので静的配信は403を返す。`--dry-run`はロックを取らず、動いている最中でも見られる。
 
 #### 11.1.1 本番への誤指定の防止（ガード）
 
 **P5の切替までの暫定。** `GEOFRAME_INGEST=1`は、設定の誤りや直接の起動だけで、本番で動いているPython（`geoframe-server`）の足元に書き込みを始められる。レビューでは、Pythonが接続を持ったままRustを起動すると成功し、開いている`.dl_*`まで消された（Pythonのダウンロードを壊す・`.cache.json`の更新が競合する）。配布スクリプトの拒否は、直接の起動や`/etc/default/geoframe`の書き換えには効かない。そこで**バイナリ自身が**、最初の書き込み（データ置き場の作成・ロック・移行・掃除・キャッシュの保存）の前に次の両方を確かめる（`guard.rs`。`ingest::start`の先頭。`serve`も`sync`の実行もここを通る）。
 
 1. **検証環境の印**`/etc/geoframe/staging`が通常ファイルとしてある（リンクは不可。中身は見ない）。`deploy/rust-deploy.sh`が使う印と同じで、扱いも同じ。本番機には印が無いので、ここで必ず止まる。
-2. **`geoframe-server.service`が非稼働と確認できる**。`systemctl show --property=LoadState,ActiveState`の結果の**`ActiveState`が`inactive`／`failed`のときだけ**通す（Pythonが入っていない機体は`LoadState=not-found`と`ActiveState=inactive`になるので、そのまま通る）。**`LoadState`では判断しない**: unitファイルを消して`daemon-reload`しても、動いているサービスは動き続けうる（systemdでは`LoadState`と`ActiveState`は独立で、`not-found`と`active`は両立する）ので、`not-found/active`も断る。稼働中（`active`・`activating`・`reloading`・`deactivating`）・未知の状態・`systemctl`が無い／起動できない／5秒以内に答えない／異常終了／出力が空・欠けている、は**全て断る**（判定できないから素通し、にはしない。unitの制限下で`systemctl`が使えない機体では、取り込みは動かない）。
+2. **`geoframe-server.service`が非稼働と確認できる**。`systemctl show --property=LoadState,ActiveState`の結果の**`ActiveState`が`inactive`／`failed`のときだけ**通す（Pythonが入っていない機体は`LoadState=not-found`と`ActiveState=inactive`になるので、そのまま通る）。**`LoadState`では判断しない**: unitファイルを消して`daemon-reload`しても、動いているサービスは動き続けうる（systemdでは`LoadState`と`ActiveState`は独立で、`not-found`と`active`は両立する）ので、`not-found/active`も断る。稼働中（`active`・`activating`・`reloading`・`deactivating`）・未知の状態・`systemctl`が無い／起動できない／5秒以内に答えない／異常終了／出力が空・欠けている、は**全て断る**。`LoadState=`・`ActiveState=`は**それぞれちょうど1行で値が空でないときだけ**受け入れ、重複（同じ値の重複も）は断る（先頭の行だけを使うと、`ActiveState=inactive`のあとに`ActiveState=active`が続く矛盾した出力を「止まっている」と取り違えるため。配布スクリプトの`unit_state`も同じ）（判定できないから素通し、にはしない。unitの制限下で`systemctl`が使えない機体では、取り込みは動かない）。
 
 断ったときは何も書かずに**終了コード2**で終わる（`serve`は`failed`で止まり、`RestartPreventExitStatus=2`により再起動ループにならない）。メッセージは理由（印の有無・Pythonの状態名）だけで、値は含まない。通ったときは`[guard]`でinfoを1行出す。
 
@@ -550,7 +550,10 @@ P2の受入（取り込み済みの本番コピーに対して、行の変更・
 
 - 起動時に読み（無い・壊れている・オブジェクトでないときは空から）、`geo:`・`geocode_osm:`・`muni_table`以外のキーを捨てる。捨てたものがあれば**即保存**する。
 - 変更があり、前回の保存から60秒以上たっているときだけ書く（10秒ごとに起きる`cache-saver`スレッド）。一時ファイル`.cache.json.tmp`に書いて`fsync`し、`rename`で差し替える（Pythonは`fsync`しない）。失敗したら次のtickで再試行する。停止時にも最後の保存をする（Pythonはしない）。**最後の保存は、同期サイクルのスレッドの終了を待ってから1回だけ**行う（`cli::stop_ingest_threads`。`cache-saver`は停止の合図で終わるだけ）。同じ合図で両方を起こして保存側が先に最後の保存を終えると、あとから書く側の更新が失われるため。サイクルのスレッドが10秒の上限内に止まらないときは警告を出して、その時点のキャッシュを保存して終了する。
-- **保存の全体（スナップショット〜一時ファイルへの書き込み〜`fsync`〜`rename`）は、保存用の排他で1つずつ**にする。保存中は状態のMutexを持たず、一時ファイル名も共通なので、`cache-saver`がディスクI/Oの最中に停止の期限を超えて残ったまま最後の保存に進むと、truncate・write・renameが競合して更新の欠落やJSONの破損が起こりうる。最後の保存（`Cache::save_final`）は排他を**期限（10秒）付き**で取り、取れなければ**最後の保存を省略して警告を出す**。無期限に待つと停止が終わらなくなる点と、重ねて書いて壊すより直近の更新（地名の逆引き結果で、次の同期で作り直せる）を失うほうが軽い点から、省略を選んだ。saverが期限内に終わる遅さなら、終わるのを待ってから保存する。停止の最悪の長さは、サイクルのスレッド10秒＋保存スレッド10秒＋排他の待ち10秒＋書き込み自体で約30秒強。unitは`TimeoutStopSec`を書いていない（systemdの既定90秒）ので、`SIGKILL`の前に最後の保存まで届く。試験は、書き込み処理に待ちを差し込める内部の入口（`save_with`。本番の呼び出しは常に実際の書き込みを渡す）で、saverの固まりと期限切れの省略・期限内に終わる遅れを再現する。
+- **保存の全体（スナップショット〜一時ファイルへの書き込み〜`fsync`〜`rename`）は、保存用の排他で1つずつ**にする。保存中は状態のMutexを持たず、一時ファイル名も共通なので、`cache-saver`がディスクI/Oの最中に停止の期限を超えて残ったまま最後の保存に進むと、truncate・write・renameが競合して更新の欠落やJSONの破損が起こりうる。最後の保存（`Cache::save_final`）は排他を**期限（10秒）付き**で取り、取れなければ**最後の保存を省略して警告を出す**。無期限に待つと停止が終わらなくなる点と、重ねて書いて壊すより直近の更新（地名の逆引き結果で、次の同期で作り直せる）を失うほうが軽い点から、省略を選んだ。saverが期限内に終わる遅さなら、終わるのを待ってから保存する。
+- **停止にかかる時間（上限は保証しない）**: 期限があるのは次の待ちだけで、合計は最大約35秒（サイクルのスレッド10秒＋保存スレッド10秒＋最後の保存の排他10秒＋tokioの終了待ち5秒）。これとは別に、**排他を取ったあとの書き込み・`fsync`・`rename`には期限がない**（ディスクが固まれば、その分だけ延びる）。したがって「何秒以内に最後の保存まで届く」とは言えない。unitは`TimeoutStopSec`を書いていない（systemdの既定90秒）ので、通常は期限付きの待ちと書き込みが収まるが、収まらなければ`SIGKILL`で終わり、最後の保存は失われる（一時ファイルへの書き込みなので`.cache.json`自体は壊れない）。
+- **残ったスレッドと`.ingest.lock`**: 停止の期限を超えて`sync-worker`・`cache-saver`が残っても、スレッドが`ingest::LockHold`を持つ間は`.ingest.lock`が外れない（§11.1のロック）ので、別の`sync`／`serve`は起動を断られ、`Cache`が別々の排他を持つ2つのプロセスが同じ一時ファイルを書くことはない。**一時ファイル名をプロセスごとに一意（pidなど）にすることは見送った**: ロックで同時に動くのは1プロセスだけになり、名前を変えても保護が増えない一方、途中で落ちたプロセスの`.cache.json.tmp.<pid>`が残り続けて掃除の仕組みが要る。単一名なら次の保存が上書きする。
+- 試験は、書き込み処理に待ちを差し込める内部の入口（`save_with`。本番の呼び出しは常に実際の書き込みを渡す）で、saverの固まりと期限切れの省略・期限内に終わる遅れを再現する。
 - 値は`serde_json::Value`のまま持つので、`geo:`の中身は往復で欠けない。書き出しはPythonの`json.dumps(ensure_ascii=False, indent=1)`と同じ形（インデント1、日本語はそのまま）。**違いはキーの並びだけ**: Rustは辞書順、Pythonは挿入順（§0の索引）。どちらが書いたファイルも、もう一方が読める。
 - 座標を3桁に丸めた値がキーに入るので、ログには件数しか出さない。テストは合成の値だけ。
 
@@ -622,3 +625,12 @@ n100でビルドしたmusl静的バイナリ（`static-pie linked`、`ldd`は`st
 | (b) ダミーunit（`/run/systemd/system`に置いた`sleep`）を`active`にして起動 | `LoadState=loaded`・`ActiveState=active`。`ERROR Python 版（geoframe-server.service）が非稼働と確認できない（状態: active）…`で終了コード2、`NRestarts`は0 |
 | (b') (b)の続きで、unitファイルを消して`daemon-reload`（動いているサービスは残る） | **`LoadState=not-found`・`ActiveState=active`**になる（両立することを実機で確認）。この状態でも同じ拒否（終了コード2）。`.dump`のSHA-256は変わらない |
 | 後片付け | ダミーを停止し`/run`の unit を撤去（`not-found/inactive`に戻した）。drop-inを外して`ingest=0`（`取り込みは無効です`）に戻し、`/healthz`は200、`.dump`のSHA-256は配布前と一致。印は戻してある |
+
+**レビュー3回目の修正後（`.ingest.lock`をスレッドが持つ・状態行の重複を拒否）。** 同じ手順（`rust-deploy.sh`で配布→`GEOFRAME_INGEST=1`のdrop-in）で確かめた。`sqlite3 -readonly … .dump`のSHA-256は配布前に取ったものと比べた。
+
+| 確認 | 結果 |
+| --- | --- |
+| (a) 印あり・`geoframe-server`は未導入で`GEOFRAME_INGEST=1` | `[guard] 検証環境の印を確認しました。geoframe-server.service は 未導入です`→`[db] スキーマは最新です`→サイクル完了（表示可能5288／全6535）。`.dump`のSHA-256は配布前と一致 |
+| (b) 取り込み中の`serve`に`sync`（実行）を起動 | `別の geoframe が取り込み中です`で終了コード1（ロックは`serve`が持ち続けている） |
+| (c) 停止・再起動 | `systemctl stop`は約0.1秒で`inactive`、ログは`停止しました`。`start`・`restart`とも`active`で、`ERROR`／`WARN`は0件。`.dump`のSHA-256は変わらない |
+| 後片付け | drop-inを外して`ingest=0`（`取り込みは無効です`）に戻し、`/healthz`は200、`.dump`のSHA-256は配布前と一致 |

@@ -80,7 +80,7 @@ unit とバイナリ（geoframe.failed へ退避）を撤去する。
     検証環境で一度だけ作る:  sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging
   - geoframe-server.service（Python 版）の ActiveState が inactive/failed と確認できること
     （未導入は not-found/inactive で通る。LoadState は見ない: unit ファイルが無くても動いている
-    サービスはありうるので、not-found/active も拒否。稼働中・状態を取得できない・空出力・未知の状態も拒否）。
+    サービスはありうるので、not-found/active も拒否。稼働中・状態を取得できない・空出力・未知の状態・状態の行の欠け／重複も拒否）。
   本番の切替は P5 で、専用の手順と明示的なフラグをそのとき作る（このスクリプトは本番に配れない）。
 
 本番機には実行しないこと（本番の切替は P5）。
@@ -116,15 +116,19 @@ fail_step=""
 say() { echo "[remote] $*"; }
 
 # unit の LoadState と ActiveState を取る（u_load・u_active に入れる）。取得できない（systemd に繋がらない・
-# 空出力）なら非ゼロ。unit が存在しないときは systemd が LoadState=not-found を返すので、それとは区別できる。
+# 空出力・LoadState／ActiveState の行がちょうど1行でない（欠け・重複）・値が空）なら非ゼロ。unit が存在しないときは systemd が LoadState=not-found を返すので、それとは区別できる。
 # LoadState と ActiveState は独立で、not-found でも active でありうる。
 u_load="" u_active=""
 unit_state() {
     local out
     u_load="" u_active=""
     out="$(systemctl show --property=LoadState,ActiveState "$1" 2>/dev/null)" || return 1
-    u_load="$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p' | head -n 1)"
-    u_active="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p' | head -n 1)"
+    # LoadState= と ActiveState= はそれぞれちょうど1行のときだけ受け入れる。先頭だけを使うと、矛盾する行
+    # （ActiveState=inactive のあとに ActiveState=active）を『止まっている』と取り違える。同じ値の重複も拒否。
+    [ "$(printf '%s\n' "$out" | grep -c '^LoadState=')" = 1 ] || return 1
+    [ "$(printf '%s\n' "$out" | grep -c '^ActiveState=')" = 1 ] || return 1
+    u_load="$(printf '%s\n' "$out" | sed -n 's/^LoadState=//p')"
+    u_active="$(printf '%s\n' "$out" | sed -n 's/^ActiveState=//p')"
     [ -n "$u_load" ] && [ -n "$u_active" ]
 }
 
