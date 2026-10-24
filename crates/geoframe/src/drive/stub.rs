@@ -293,18 +293,30 @@ fn respond(
     body: &[u8],
     extra: &[(String, String)],
 ) -> std::io::Result<()> {
-    // `X-No-Length` を付けると Content-Length を送らない（接続を閉じて本文の終わりを知らせる）
+    // `X-No-Length` を付けると Content-Length を送らない（接続を閉じて本文の終わりを知らせる）。
+    // `X-Slow-Body: <ミリ秒>` を付けると、ヘッダを送ってからその時間待って本文を送る（本文の受信の時間切れ）
+    let slow_ms: Option<u64> = extra
+        .iter()
+        .find(|(k, _)| k == "X-Slow-Body")
+        .and_then(|(_, v)| v.parse().ok());
     let no_length = extra.iter().any(|(k, _)| k == "X-No-Length");
     let mut head =
         format!("HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\n");
     if !no_length {
         head.push_str(&format!("Content-Length: {}\r\n", body.len()));
     }
-    for (k, v) in extra.iter().filter(|(k, _)| k != "X-No-Length") {
+    for (k, v) in extra
+        .iter()
+        .filter(|(k, _)| k != "X-No-Length" && k != "X-Slow-Body")
+    {
         head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str("\r\n");
     stream.write_all(head.as_bytes())?;
+    if let Some(ms) = slow_ms {
+        stream.flush()?;
+        std::thread::sleep(Duration::from_millis(ms));
+    }
     stream.write_all(body)?;
     stream.flush()
 }

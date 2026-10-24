@@ -189,14 +189,30 @@ impl Env {
         read: &Connection,
         stop: &StopFlag,
     ) -> StageResult {
-        let http = crate::net::agent();
+        self.run_on_http(stage, mode, read, stop, &crate::net::agent())
+    }
+
+    /// 通信の設定（時間切れなど）を差し替えて実行する。
+    fn run_with_http(&self, stage: &dyn Stage, http: &ureq::Agent) -> StageResult {
+        let read = self.read_for(Mode::Apply);
+        self.run_on_http(stage, Mode::Apply, &read, &StopFlag::new(), http)
+    }
+
+    fn run_on_http(
+        &self,
+        stage: &dyn Stage,
+        mode: Mode,
+        read: &Connection,
+        stop: &StopFlag,
+        http: &ureq::Agent,
+    ) -> StageResult {
         let ctx = StageCtx {
             mode,
             config: &self.config,
             read,
             writer: (mode == Mode::Apply).then_some(&self.writer),
             cache: &self.cache,
-            http: &http,
+            http,
             stop,
         };
         match stage.run(&ctx) {
@@ -350,7 +366,13 @@ fn errors_never_carry_secrets_or_urls() {
     assert!(!DriveError::Status(404).is_outage());
     assert!(!DriveError::Status(403).is_outage());
     assert!(DriveError::Net(Failure::Dns).is_outage());
-    assert!(!DriveError::Net(Failure::Timeout).is_outage());
+    // 接続・応答の待ちの時間切れと流量制限は障害（写真のせいではない）。権限の 403 と本文の時間切れは写真の失敗
+    assert!(DriveError::Net(Failure::Timeout).is_outage());
+    assert!(DriveError::Net(Failure::Tls).is_outage());
+    assert!(!DriveError::Net(Failure::Other).is_outage());
+    assert!(DriveError::RateLimited(403).is_outage());
+    assert!(!DriveError::BodyTimeout.is_outage());
+    assert!(!DriveError::RateLimited(403).is_auth());
     assert!(DriveError::TokenRejected(400).is_auth());
     assert!(!DriveError::Status(503).is_auth());
 }
@@ -1950,5 +1972,145 @@ fn a_401_that_survives_a_new_token_stops_the_stage_without_blaming_the_photos() 
     assert_eq!(
         (get(&counts, "fetched"), get(&counts, "skipped_backoff")),
         (2, 0)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 通信の障害と写真の失敗の区別（レビュー指摘）
+
+/// 取得待ちの 2 枚を作り、索引まで済ませる。
+fn two_pending(tag: &str) -> Env {
+    let e = env(tag);
+    e.listing(vec![jpeg("o1", "a.jpg", "m1"), jpeg("o2", "b.jpg", "m2")]);
+    e.stub.set_media("o1", fixture_jpeg("typical"));
+    e.stub.set_media("o2", fixture_jpeg("typical"));
+    e.index();
+    e
+}
+
+/// 障害が直った次のサイクルで、2 枚とも待たずに取得される。
+fn recovers_without_waiting(e: &Env, fetch: &FetchDerivatives) {
+    e.stub.clear_faults();
+    let counts = e.done(fetch);
+    assert_eq!(
+        (
+            get(&counts, "fetched"),
+            get(&counts, "skipped_backoff"),
+            get(&counts, "pending")
+        ),
+        (2, 0, 2),
+        "{counts}"
+    );
+}
+
+#[test]
+fn a_rate_limit_that_outlasts_the_retries_stops_the_stage_without_blaming_the_photos() {
+    let e = two_pending("drive-ratelimit-fetch");
+    e.stub.add_fault(Box::new(|r| {
+        r.is_media().then(|| {
+            (
+                403,
+                r#"{"error":{"errors":[{"reason":"rateLimitExceeded"}]}}"#.to_string(),
+                vec![],
+            )
+        })
+    }));
+    let fetch = e.fetch_stage();
+    let StageResult::Failed(message) = e.run(&fetch) else {
+        panic!("失敗のはず");
+    };
+    // 流量制限だと分かる文面で、最初の 1 枚で止まった（2 枚目は試さない）
+    assert!(
+        message.contains("流量制限") && message.contains("attempted=1"),
+        "{message}"
+    );
+    assert_eq!(e.stub.media_requests().len(), 4); // 最初 + 再試行 3 回
+    assert!(e.tmp_leftovers().is_empty());
+    recovers_without_waiting(&e, &fetch);
+}
+
+#[test]
+fn a_permission_403_is_still_that_photos_failure() {
+    let e = two_pending("drive-403-photo");
+    e.stub.add_fault(Box::new(|r| {
+        (r.is_media() && r.path.ends_with("/o1")).then(|| {
+            (
+                403,
+                r#"{"error":{"errors":[{"reason":"forbidden"}]}}"#.to_string(),
+                vec![],
+            )
+        })
+    }));
+    let counts = e.done(&e.fetch_stage());
+    assert_eq!(
+        (get(&counts, "fetched"), get(&counts, "fail_download")),
+        (1, 1)
+    );
+}
+
+#[test]
+fn a_timeout_waiting_for_the_response_stops_the_stage_without_blaming_the_photos() {
+    let e = two_pending("drive-timeout-head");
+    let http = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_recv_response(Some(Duration::from_millis(150)))
+            .http_status_as_error(false)
+            .build(),
+    );
+    e.stub.add_fault(Box::new(|r| {
+        if r.is_media() {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        None
+    }));
+    let fetch = e.fetch_stage();
+    let StageResult::Failed(message) = e.run_with_http(&fetch, &http) else {
+        panic!("失敗のはず");
+    };
+    assert!(
+        message.contains("timeout") && message.contains("attempted=1"),
+        "{message}"
+    );
+    assert_eq!(e.stub.media_requests().len(), 1);
+    assert!(e.tmp_leftovers().is_empty());
+    recovers_without_waiting(&e, &fetch);
+}
+
+#[test]
+fn a_body_that_takes_too_long_is_that_photos_failure_and_the_rest_continue() {
+    // スタブは 1 本のスレッドなので、遅い本文を送っている間（450 ms）は次の要求が待たされる。上限（300 ms）は
+    // その待ちを含めても 2 枚目が間に合う長さにしてある
+    let mut e = two_pending("drive-timeout-body");
+    e.shared = Arc::new(
+        DriveShared::with(Endpoints::stub(&e.stub.base_url()), FAST_RETRY)
+            .with_download_timeout(Duration::from_millis(300)),
+    );
+    e.stub.add_fault(Box::new(|r| {
+        (r.is_media() && r.path.ends_with("/o1")).then(|| {
+            (
+                200,
+                "x".repeat(10),
+                vec![("X-Slow-Body".to_string(), "450".to_string())],
+            )
+        })
+    }));
+    let fetch = e.fetch_stage();
+    let counts = e.done(&fetch);
+    assert_eq!(
+        (
+            get(&counts, "attempted"),
+            get(&counts, "fetched"),
+            get(&counts, "fail_slow_download")
+        ),
+        (2, 1, 1),
+        "{counts}"
+    );
+    assert!(e.tmp_leftovers().is_empty());
+    // その写真は次のサイクルでは飛ばされる（失敗が続く写真が枠を塞がない仕組みの対象）
+    e.stub.clear_faults();
+    let counts = e.done(&fetch);
+    assert_eq!(
+        (get(&counts, "skipped_backoff"), get(&counts, "attempted")),
+        (1, 0)
     );
 }

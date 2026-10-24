@@ -25,6 +25,7 @@
 //! 429・5xx・403 のうち Drive が返す流量制限（`rateLimitExceeded` など）は、`Retry-After`（あれば）か
 //! 指数バックオフで [`Retry::max_retries`] 回まで再試行する。待ちの最中も停止の合図を見る。401 は
 //! トークンを取り直して 1 回だけ再試行する。それ以外の状態コードは [`DriveError::Status`] で返す。
+//! 再試行を使い切った流量制限の 403 は、権限の不足と区別できるよう [`DriveError::RateLimited`] にする。
 
 mod fetch;
 mod index;
@@ -118,6 +119,12 @@ pub enum DriveError {
     Net(Failure),
     /// API が成功以外の状態コードを返した（再試行しても直らなかった）。
     Status(u16),
+    /// 流量制限（403 の `rateLimitExceeded` など）を再試行の回数だけ受けても直らなかった。権限の不足の
+    /// 403（[`DriveError::Status`]）と区別する。写真のせいではない。
+    RateLimited(u16),
+    /// 本文の受信が時間の上限（[`DOWNLOAD_TIMEOUT`]）を超えた。接続や応答の待ちの時間切れ
+    /// （[`DriveError::Net`] の `Timeout`）と違い、その写真が大きい・遅いだけで通信の障害とは言えない。
+    BodyTimeout,
     /// トークンの交換が成功以外の状態コードで断られた。
     TokenRejected(u16),
     /// 応答が JSON として読めない・想定した形でない。
@@ -141,6 +148,10 @@ impl fmt::Display for DriveError {
             Self::Jwt(e) => write!(f, "JWT を作れません: {e}"),
             Self::Net(failure) => write!(f, "通信に失敗しました（{}）", failure.as_str()),
             Self::Status(code) => write!(f, "Drive API が HTTP {code} を返しました"),
+            Self::RateLimited(code) => {
+                write!(f, "Drive API が流量制限（HTTP {code}）を返し続けました")
+            }
+            Self::BodyTimeout => f.write_str("ダウンロードが時間の上限を超えました"),
             Self::TokenRejected(code) => {
                 write!(f, "トークンの交換が HTTP {code} で断られました")
             }
@@ -172,9 +183,14 @@ impl DriveError {
 
     /// 写真 1 枚のせいではなく、通信や Drive 側の不調と言える失敗か。取得の途中でこれが出たら、残りの
     /// 写真を試しても同じなので段を止める（写真の失敗の記録も付けない）。
+    ///
+    /// 接続・名前解決・TLS・応答の待ちの時間切れ（`Net`）と流量制限は障害。**本文の受信が上限を超えた**
+    /// （[`DriveError::BodyTimeout`]）ことだけは、その写真の失敗として数える。
     pub fn is_outage(&self) -> bool {
         match self {
-            Self::Net(failure) => !matches!(failure, Failure::Timeout | Failure::Other),
+            // `Timeout` は要求を送って応答の頭を受けるまでの時間切れだけ（本文の読み出しは `BodyTimeout`）
+            Self::Net(failure) => !matches!(failure, Failure::Other),
+            Self::RateLimited(_) => true,
             // 401 は、取り直したトークンでも断られた（`authorized` が 1 回やり直したあと）。写真ではなく
             // サービスアカウント側（スコープ・無効化）の問題
             Self::Status(code) => *code == 401 || *code == 429 || *code >= 500,
@@ -275,6 +291,8 @@ pub struct DriveShared {
     auth_failed: AtomicBool,
     /// 鍵ファイルの権限の警告を出した（プロセスで 1 回）。
     permission_warned: AtomicBool,
+    /// 原本 1 枚のダウンロードの時間の上限。本番は [`DOWNLOAD_TIMEOUT`] だけ（試験が短くできる）。
+    download_timeout: Duration,
 }
 
 impl DriveShared {
@@ -289,7 +307,15 @@ impl DriveShared {
             state: Mutex::new(State::default()),
             auth_failed: AtomicBool::new(false),
             permission_warned: AtomicBool::new(false),
+            download_timeout: DOWNLOAD_TIMEOUT,
         }
+    }
+
+    /// 試験用: ダウンロードの時間の上限を短くする。
+    #[cfg(test)]
+    pub(crate) fn with_download_timeout(mut self, timeout: Duration) -> Self {
+        self.download_timeout = timeout;
+        self
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -553,8 +579,17 @@ impl<'a> Session<'a> {
                 || status >= 500
                 // 403 は権限の不足と流量制限が同じ状態コード。本文の理由で見分ける（本文は読んで捨てる）
                 || (status == 403 && is_rate_limit_body(&mut response));
-            if !transient || attempt >= retry.max_retries {
+            if !transient {
                 return Err(DriveError::Status(status));
+            }
+            if attempt >= retry.max_retries {
+                // 403 は流量制限だった（`transient` は本文の理由で決めた）。理由を失って権限の不足と見分けが
+                // つかなくならないよう、別の失敗として返す
+                return Err(if status == 403 {
+                    DriveError::RateLimited(status)
+                } else {
+                    DriveError::Status(status)
+                });
             }
             tracing::debug!(
                 "[drive] HTTP {status}。再試行します（{}/{}）",
@@ -701,7 +736,7 @@ impl<'a> Session<'a> {
                 .header("Authorization", format!("Bearer {token}"))
                 .query("alt", "media")
                 .config()
-                .timeout_global(Some(DOWNLOAD_TIMEOUT))
+                .timeout_global(Some(self.shared.download_timeout))
                 .build()
                 .call()
         })?;
@@ -737,13 +772,17 @@ impl<'a> Session<'a> {
 }
 
 /// 本文を読んでいる最中の失敗。`ureq` の本文の読み出しは `io::Error` に包んで返す。
+/// 時間切れは [`DriveError::BodyTimeout`]（その写真が遅いだけ）。切断などは通信の障害。
 fn read_error(e: &io::Error) -> DriveError {
     // `ureq` は自分のエラーを `io::Error` に包んで返す（切断・時間切れなど）
     if let Some(inner) = e.get_ref().and_then(|x| x.downcast_ref::<ureq::Error>()) {
-        return DriveError::Net(Failure::from(inner));
+        return match Failure::from(inner) {
+            Failure::Timeout => DriveError::BodyTimeout,
+            failure => DriveError::Net(failure),
+        };
     }
     match e.kind() {
-        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => DriveError::Net(Failure::Timeout),
+        io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => DriveError::BodyTimeout,
         io::ErrorKind::ConnectionReset
         | io::ErrorKind::ConnectionAborted
         | io::ErrorKind::BrokenPipe
