@@ -212,6 +212,17 @@ fn enrich_with_memory(stub: &StubGsi) -> Enrich {
     .with_retry_wait(Duration::ZERO)
 }
 
+/// 失敗の記憶が長く（1 時間）残る `Enrich`。時間切れの行を誤って失敗として覚えると、次のサイクルの `skipped_backoff` に
+/// 現れて、確定しない（待ちなしの `enrich_for` では見えない）。
+fn enrich_with_long_backoff(stub: &StubGsi) -> Enrich {
+    Enrich::with(
+        GsiEndpoints::stub(&stub.base_url()),
+        Duration::ZERO,
+        FailureMemo::with_policy(Duration::from_secs(3600), Duration::from_secs(3600), 16),
+    )
+    .with_retry_wait(Duration::ZERO)
+}
+
 /// 国内の `n` 行（`id` は 1 から、緯度 36.0 から 0.5 度ずつ違う。キャッシュのキーは重ならない）。
 fn domestic_rows(n: i64) -> String {
     (1..=n)
@@ -1890,32 +1901,40 @@ fn 同じ座標の写真が何枚あっても障害は1つの座標として数�
 
 /// 段全体の経過時間の上限を超えたら、通信が要る未確定の行は次のサイクルへ回す（失敗にしない）。同じキーの後の行は
 /// 追い越さず、通信の要らない行は済ませる。要求の途中では打ち切らず、次の要求を始める前に見る。
+///
+/// 時間切れの行は**失敗の記憶に入れない**。長い（1 時間の）バックオフの `Enrich` を使い回し、応答を戻したあとの
+/// **直後のサイクル**で `skipped_backoff=0` のまま確定することで確かめる（記憶に入れると、その行と同じキーの後の行が
+/// 1 時間飛ばされる）。ここは「上限のあとで要求を始めなかった行」（要求の途中で上限に達した行は次の試験）。
 #[test]
 fn 段の経過時間の上限で打ち切り_残りは次のサイクルへ回す() {
     let s = setup("geo-enrich-budget");
     let stub = StubGsi::start();
     tokyo_replies(&stub);
-    // 逆ジオが 1 要求 150 ms かかる。上限は 400 ms（行ごとに 2 要求で 300 ms 前後）
-    stub.set_rgeo(|_, _| {
-        std::thread::sleep(Duration::from_millis(150));
-        Reply::json(r#"{"results":{"muniCd":"13101","lv01Nm":"テスト町一丁目"}}"#)
+    // 2 行目（緯度 37）の標高だけが 350 ms かかる。上限は 300 ms: 2 行目は最初の要求を始めた時点では上限の内側なので
+    // 確定し、その次の 3 行目を始める前に上限を過ぎている。
+    stub.set_elev(|lat, _| {
+        if (lat - 37.0).abs() < 0.01 {
+            std::thread::sleep(Duration::from_millis(350));
+        }
+        Reply::json(r#"{"elevation":12.5}"#)
     });
     s.sql(&format!(
-        "{};{};{};{};{}",
+        "{};{};{};{};{};{}",
         photo(1, None, Some((36.0, 136.0)), Some("exif")),
         photo(2, None, Some((37.0, 137.0)), Some("exif")),
-        photo(3, None, Some((20.0001, 130.0)), Some("exif")), // 上限のあと: 見送る
+        photo(3, None, Some((20.0001, 130.0)), Some("exif")), // 上限のあと: 始めない
         photo(4, None, Some((19.9999, 130.0)), Some("exif")), // 国外・同じキー: 追い越さない
         photo(5, None, Some((-33.0, 151.0)), Some("exif")),   // 国外・別のキー: 済ませる
+        photo(6, None, Some((38.0, 138.0)), Some("exif")),    // 上限のあと: 始めない
     ));
-    let enrich = enrich_for(&stub).with_budget(Duration::from_millis(400));
+    let enrich = enrich_with_long_backoff(&stub).with_budget(Duration::from_millis(300));
     let started = std::time::Instant::now();
     let first = s.run(&enrich); // Ok: 失敗にしない
     let took = started.elapsed();
     assert!(took < Duration::from_secs(5), "{took:?}");
     assert_eq!(get(&first, "out_of_time"), 1);
-    // 1・2 行目は確定し（2 行目の途中で上限に達する場合もある）、少なくとも 3 行目には進んでいない
     assert_eq!(s.row(1)["place"], "テスト町一丁目");
+    assert_eq!(s.row(2)["place"], "テスト町一丁目");
     assert_eq!(s.row(3)["place"], Value::Null);
     assert_eq!(
         s.row(4)["place"],
@@ -1923,24 +1942,37 @@ fn 段の経過時間の上限で打ち切り_残りは次のサイクルへ回�
         "同じキーの国外の行は追い越さない"
     );
     assert_eq!(s.row(5)["place"], "", "通信の要らない行は済ませる");
+    assert_eq!(s.row(6)["place"], Value::Null);
     assert!(s.cache.get("geo:20.000,130.000").is_none());
+    assert_eq!(get(&first, "resolved"), 2);
+    assert_eq!(
+        get(&first, "unresolved"),
+        0,
+        "要求を始めなかった行は失敗でない"
+    );
+    assert_eq!(
+        get(&first, "deferred"),
+        3,
+        "3 行目・同じキーの 4 行目・6 行目"
+    );
     assert_eq!(
         get(&first, "queried"),
         get(&first, "resolved") + get(&first, "unresolved")
     );
-    // 上限で止まった行は記憶に入らない: 次のサイクルは待たずに続きから進み、現行と同じ順の結果になる
-    stub.set_rgeo(|_, _| {
-        Reply::json(r#"{"results":{"muniCd":"13101","lv01Nm":"テスト町一丁目"}}"#)
-    });
+    // 応答が戻り、同じ `Enrich`（長いバックオフ）で直ちに次のサイクル: 時間切れの行は記憶に入っていないので飛ばされず、
+    // 現行と同じ順の結果になる
+    stub.set_elev(|_, _| Reply::json(r#"{"elevation":12.5}"#));
     let second = s.run(&enrich);
     assert_eq!(get(&second, "skipped_backoff"), 0);
+    assert_eq!(get(&second, "skipped_blocked"), 0);
     assert_eq!(get(&second, "out_of_time"), 0);
-    assert_eq!(s.row(2)["place"], "テスト町一丁目");
     assert_eq!(s.row(3)["place"], "テスト町一丁目");
     assert_eq!(s.row(4)["place"], "");
+    assert_eq!(s.row(6)["place"], "テスト町一丁目");
 }
 
-/// 再試行込みの 1 行が長引いても、上限で次の要求（再試行）に進まない。
+/// 再試行込みの 1 行が長引いても、上限で次の要求（再試行）に進まない。要求の途中で上限に達した行も失敗の記憶に
+/// 入れない（長いバックオフの `Enrich` を使い回した直後のサイクルで、`skipped_backoff=0` のまま確定する）。
 #[test]
 fn 上限のあとは再試行に進まない() {
     let s = setup("geo-enrich-budget-retry");
@@ -1952,7 +1984,7 @@ fn 上限のあとは再試行に進まない() {
     });
     s.sql(&domestic_rows(1));
     // 1 回目の要求の終わりで上限を過ぎている
-    let enrich = enrich_for(&stub).with_budget(Duration::from_millis(100));
+    let enrich = enrich_with_long_backoff(&stub).with_budget(Duration::from_millis(100));
     // 上限が先に見られる行頭ではなく、要求の最中に上限に達するように、1 行目だけは始める
     let counts = s.run(&enrich);
     assert_eq!(get(&counts, "out_of_time"), 1);
@@ -1960,12 +1992,13 @@ fn 上限のあとは再試行に進まない() {
     assert_eq!(get(&counts, "unresolved"), 1);
     assert_eq!(stub.count(Kind::Rgeo), 1, "再試行に進まない");
     assert_eq!(s.row(1)["place"], Value::Null);
-    // 記憶に入っていないので、次のサイクルは待たずに試す
+    // 記憶に入っていないので、同じ `Enrich` の次のサイクルは待たずに試し、確定する
     tokyo_replies(&stub);
-    let next = enrich_for(&stub);
-    let counts = s.run(&next);
+    let counts = s.run(&enrich);
     assert_eq!(get(&counts, "skipped_backoff"), 0);
+    assert_eq!(get(&counts, "out_of_time"), 0);
     assert_eq!(get(&counts, "resolved"), 1);
+    assert_eq!(s.row(1)["place"], "テスト町一丁目");
 }
 
 // ---------------------------------------------------------------- muni.js・書式
