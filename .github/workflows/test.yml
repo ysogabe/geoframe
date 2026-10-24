@@ -36,3 +36,49 @@ jobs:
 
       - name: 設定リファレンスの同期検査
         run: python3 tools/gen_env_reference.py --check
+
+  rust:
+    name: Rust（fmt・clippy・test・musl静的ビルド）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: ソースを取得
+        uses: actions/checkout@v7
+
+      - name: Rustを準備
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+
+      - name: musl-toolsをインストール
+        # rusqlite の bundled が SQLite（C）をビルドするため、musl 用の C コンパイラが要る
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cargoのキャッシュ
+        uses: Swatinem/rust-cache@v2
+
+      - name: フォーマット検査
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rustテスト
+        run: cargo test
+
+      - name: muslで静的ビルド
+        run: cargo build --release --target x86_64-unknown-linux-musl
+
+      - name: 静的リンクの検査
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/geoframe
+          ls -l "$bin"
+          file "$bin"
+          file "$bin" | grep -E 'statically linked|static-pie linked'
+          # 動的リンクなら ldd は共有ライブラリを列挙する。静的なら "not a dynamic executable" 等になる
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "動的ライブラリにリンクされています" >&2
+            exit 1
+          fi
+          "$bin" --version

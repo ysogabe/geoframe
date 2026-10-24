@@ -39,3 +39,6 @@ local-notes/
 # 公開リポジトリには含めないローカル検証コード
 local-poc/
 app/local-tools/
+
+# Rust（Cargo）
+/target/
