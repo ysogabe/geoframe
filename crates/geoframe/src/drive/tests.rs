@@ -2114,3 +2114,167 @@ fn a_body_that_takes_too_long_is_that_photos_failure_and_the_rest_continue() {
         (1, 0)
     );
 }
+
+// ---------------------------------------------------------------------------
+// 大量削除の保留
+
+/// DB に Drive の行 `d1..=dN`（md5 は `m`）を作る。派生物の `display` も付けて、ファイルを置く。
+fn seed_drive_rows(e: &Env, rows: usize) {
+    fs::create_dir_all(e.root().join("derivatives")).unwrap();
+    e.writer
+        .call(move |conn| {
+            for i in 1..=rows {
+                conn.execute(
+                    "INSERT INTO photos(source, drive_id, name, md5, display, favorite)
+                     VALUES('drive', ?1, 'n', 'm', ?2, 1)",
+                    rusqlite::params![format!("d{i}"), format!("derivatives/d{i}.jpg")],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    for i in 1..=rows {
+        fs::write(e.root().join(format!("derivatives/d{i}.jpg")), b"x").unwrap();
+    }
+}
+
+/// 一覧に `d1..=dKEEP` だけを返す（md5 は DB と同じなので、更新も追加もない）。
+fn list_first(e: &Env, keep: usize) {
+    e.stub.set_page_size(1000);
+    e.listing(
+        (1..=keep)
+            .map(|i| jpeg(&format!("d{i}"), "n", "m"))
+            .collect(),
+    );
+}
+
+fn row_count(e: &Env) -> usize {
+    e.rows().len()
+}
+
+#[test]
+fn a_listing_that_would_delete_most_rows_holds_the_deletes_back() {
+    // 100 件から 1 件だけ見える一覧（0 件ではないので、空の一覧の保護は効かない）
+    let e = env("drive-mass-1");
+    seed_drive_rows(&e, 100);
+    list_first(&e, 1);
+    let before = e.rows();
+    let counts = e.index();
+    assert_eq!(
+        (
+            get(&counts, "removed"),
+            get(&counts, "mass_delete_withheld"),
+            get(&counts, "deletes_withheld")
+        ),
+        (0, 99, 0)
+    );
+    assert_eq!(e.rows(), before);
+    assert!(e.root().join("derivatives/d50.jpg").exists());
+    // 保留しても、追加と更新は通常どおり
+    e.listing(vec![jpeg("d1", "n", "m"), jpeg("new1", "n", "m9")]);
+    let counts = e.index();
+    assert_eq!(
+        (
+            get(&counts, "added"),
+            get(&counts, "removed"),
+            get(&counts, "mass_delete_withheld")
+        ),
+        (1, 0, 99)
+    );
+    assert_eq!(row_count(&e), 101);
+}
+
+#[test]
+fn the_mass_delete_threshold_is_more_than_50_rows_and_more_than_20_percent() {
+    // (Drive の行, 一覧に残す件数, 消える件数が保留されるか)
+    for (rows, keep, withheld) in [
+        (100, 50, false),  // 消す 50 件: 件数が「超える」でない
+        (100, 49, true),   // 消す 51 件で 51%
+        (300, 240, false), // 消す 60 件: ちょうど 20%（超えない）
+        (300, 239, true),  // 消す 61 件: 20% を超える
+        (400, 349, false), // 消す 51 件（12.75%）: 割合が小さい
+        (60, 5, true),     // 消す 55 件（92%）
+        (50, 1, false),    // 消す 49 件: 件数が小さい
+    ] {
+        let e = env("drive-mass-edge");
+        seed_drive_rows(&e, rows);
+        list_first(&e, keep);
+        let counts = e.index();
+        let doomed = rows - keep;
+        if withheld {
+            assert_eq!(
+                (
+                    get(&counts, "removed"),
+                    get(&counts, "mass_delete_withheld")
+                ),
+                (0, doomed as u64),
+                "{rows} 件から {keep} 件"
+            );
+            assert_eq!(row_count(&e), rows);
+        } else {
+            assert_eq!(
+                (
+                    get(&counts, "removed"),
+                    get(&counts, "mass_delete_withheld")
+                ),
+                (doomed as u64, 0),
+                "{rows} 件から {keep} 件"
+            );
+            assert_eq!(row_count(&e), keep);
+        }
+    }
+}
+
+#[test]
+fn the_explicit_flag_lifts_the_mass_delete_and_the_empty_listing_holds() {
+    let e = env("drive-mass-flag");
+    seed_drive_rows(&e, 100);
+    list_first(&e, 1);
+    let allowing = IndexDrive::allowing_mass_delete(Arc::clone(&e.shared));
+    let counts = e.done(&allowing);
+    assert_eq!(
+        (
+            get(&counts, "removed"),
+            get(&counts, "mass_delete_withheld"),
+            get(&counts, "derivative_files_removed")
+        ),
+        (99, 0, 99)
+    );
+    assert_eq!(row_count(&e), 1);
+    assert!(!e.root().join("derivatives/d50.jpg").exists());
+    assert!(e.root().join("derivatives/d1.jpg").exists());
+    // 0 件の一覧の保留も外れる（一度きりの、意図した全削除）
+    e.listing(vec![]);
+    assert_eq!(get(&e.done(&allowing), "removed"), 1);
+    assert_eq!(row_count(&e), 0);
+}
+
+#[test]
+fn dry_run_reports_the_hold_and_what_the_flag_would_do_without_writing() {
+    let e = env("drive-mass-dry");
+    seed_drive_rows(&e, 100);
+    list_first(&e, 1);
+    let before = e.rows();
+    let stop = StopFlag::new();
+    let StageResult::Done(held) = e.run_with(&e.index_stage(), Mode::DryRun, &stop) else {
+        panic!("完了のはず");
+    };
+    assert_eq!(
+        (get(&held, "removed"), get(&held, "mass_delete_withheld")),
+        (0, 99)
+    );
+    let allowing = IndexDrive::allowing_mass_delete(Arc::clone(&e.shared));
+    let StageResult::Done(lifted) = e.run_with(&allowing, Mode::DryRun, &stop) else {
+        panic!("完了のはず");
+    };
+    assert_eq!(
+        (
+            get(&lifted, "removed"),
+            get(&lifted, "mass_delete_withheld")
+        ),
+        (99, 0)
+    );
+    // どちらでも実 DB と派生物は変わらない
+    assert_eq!(e.rows(), before);
+    assert!(e.root().join("derivatives/d99.jpg").exists());
+}

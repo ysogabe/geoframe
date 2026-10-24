@@ -19,12 +19,18 @@
 //! - **一覧が全ページ取れたときだけ**計画を作る。途中で失敗したら DB に触れない（現行も例外で同じ。差ではない）。
 //! - 一覧が **0 件**で、Drive の行が残っているときは、**削除しない**（共有を外した・フォルダを取り違えた
 //!   ときも Drive は空の一覧を成功として返すので、全行の削除は、お気に入りや手動の位置まで消す）。
+//! - **0 件以外でも、消す行が多すぎるとき**（消す件数が [`MASS_DELETE_MIN`] 件を超え、かつ Drive の行の
+//!   [`MASS_DELETE_PERCENT`]% を超える。例: 6,535 件から 1 件だけ見える一覧）は、**削除だけを保留**して件数と
+//!   警告を出す（追加・更新は通常どおり。`mass_delete_withheld`）。保留を外すのは**一度きりの明示的な操作**
+//!   `geoframe sync --allow-mass-delete` だけで、環境変数・設定・unit では与えられない（`serve` の定期実行は
+//!   常に保留する）。同じ操作が 0 件の一覧の保留も外す。
 //! - 書き込みは 1 つのトランザクション（追加・更新・削除をまとめる。現行は 1 文ごとのコミット）。
 //! - 消す derivative の名前は `derivatives/<安全な名前>` だけ（現行は `DATA_DIR / display` を無検査で消す）。
 //! - 一覧に `id` が無い（現行は例外で全体が失敗）・名前が無い（現行は途中で例外）ファイルは、前者は一覧の失敗、
 //!   後者は索引に入れず（`malformed`）、行は「一覧にある」ものとして残す。
 
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::sync::Arc;
 
 use rusqlite::types::ValueRef;
@@ -46,14 +52,33 @@ const STOPPED: &str = "停止の合図で中断しました";
 /// 書き込みの途中で停止の合図を見る間隔（操作の件数）。
 const STOP_CHECK_EVERY: usize = 256;
 
+/// 消す件数がこれを**超え**、かつ Drive の行の [`MASS_DELETE_PERCENT`]% を**超える**と、削除を保留する。
+/// 小さな写真集（数十件）の入れ替えでは止めず、手作業で 50 件以上まとめて消すことは普通ない、という判断。
+pub const MASS_DELETE_MIN: usize = 50;
+/// 上の割合（%）。6,535 件なら 1,307 件を超える削除が対象。1 件だけ見える一覧のような取り違えを止める。
+pub const MASS_DELETE_PERCENT: usize = 20;
+
 /// 同期サイクルの段 `index_drive`。
 pub struct IndexDrive {
     shared: Arc<DriveShared>,
+    /// 大量削除の保留を外す（`geoframe sync --allow-mass-delete` のときだけ true）。
+    allow_mass_delete: bool,
 }
 
 impl IndexDrive {
     pub fn new(shared: Arc<DriveShared>) -> Self {
-        Self { shared }
+        Self {
+            shared,
+            allow_mass_delete: false,
+        }
+    }
+
+    /// 大量削除の保留を外した段（`geoframe sync --allow-mass-delete` の 1 回だけ）。
+    pub fn allowing_mass_delete(shared: Arc<DriveShared>) -> Self {
+        Self {
+            shared,
+            allow_mass_delete: true,
+        }
     }
 }
 
@@ -86,7 +111,7 @@ pub(super) struct ExistingRow {
 }
 
 /// 書き込む 1 行分（追加・更新に共通）。
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(super) struct Entry {
     pub drive_id: String,
     pub name: String,
@@ -96,6 +121,16 @@ pub(super) struct Entry {
     pub lon: Option<f64>,
 }
 
+// 名前・撮影時刻・座標をログやパニックの表示に出さない（`{:?}` で出るのは ID の有無だけ）
+impl fmt::Debug for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Entry")
+            .field("has_md5", &self.md5.is_some())
+            .field("has_location", &self.lat.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
 impl Entry {
     /// 現行の `"drive_meta" if lat is not None else None`。
     fn loc_source(&self) -> Option<&'static str> {
@@ -103,14 +138,23 @@ impl Entry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub(super) enum Op {
     Insert(Entry),
     Update(Entry),
 }
 
+impl fmt::Debug for Op {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Insert(e) => f.debug_tuple("Insert").field(e).finish(),
+            Self::Update(e) => f.debug_tuple("Update").field(e).finish(),
+        }
+    }
+}
+
 /// 計画（書き込む前）。
-#[derive(Debug, Default, PartialEq)]
+#[derive(Default, PartialEq)]
 pub(super) struct DrivePlan {
     /// 一覧の順（`id` の採番順）。
     pub ops: Vec<Op>,
@@ -122,6 +166,30 @@ pub(super) struct DrivePlan {
     pub malformed: u64,
     /// 一覧が空だったので消さなかった行の数。
     pub deletes_withheld: u64,
+    /// 消す行が多すぎるので（[`MASS_DELETE_MIN`]・[`MASS_DELETE_PERCENT`]）消さなかった行の数。
+    pub mass_delete_withheld: u64,
+    /// 計画を作った時点の、DB の Drive の行の数（警告の文面に使う）。
+    pub drive_rows: u64,
+}
+
+// 計画の中身（名前・座標を持つ `ops`）を出さず、件数だけを出す
+impl fmt::Debug for DrivePlan {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DrivePlan")
+            .field("ops", &self.ops.len())
+            .field("deletes", &self.deletes.len())
+            .field("remote", &self.remote)
+            .field("unchanged", &self.unchanged)
+            .field("malformed", &self.malformed)
+            .field("deletes_withheld", &self.deletes_withheld)
+            .field("mass_delete_withheld", &self.mass_delete_withheld)
+            .finish()
+    }
+}
+
+/// 消す行の数が、保留する大きさか。
+fn is_mass_delete(doomed: usize, drive_rows: usize) -> bool {
+    doomed > MASS_DELETE_MIN && doomed * 100 > drive_rows * MASS_DELETE_PERCENT
 }
 
 impl DrivePlan {
@@ -165,14 +233,21 @@ pub(super) fn load_existing(conn: &Connection) -> rusqlite::Result<Vec<ExistingR
     Ok(out)
 }
 
-/// 一覧と DB の行から計画を作る（副作用なし。実行と dry-run が同じ関数を通る）。
-pub(super) fn plan(existing: &[ExistingRow], files: &[RemoteFile]) -> DrivePlan {
+/// 一覧と DB の行から計画を作る（副作用なし。実行と dry-run が同じ関数を通る）。`allow_mass_delete` は
+/// 削除の保留（0 件の一覧・大量削除）を外す。
+pub(super) fn plan(
+    existing: &[ExistingRow],
+    files: &[RemoteFile],
+    allow_mass_delete: bool,
+) -> DrivePlan {
     let by_drive_id: HashMap<&str, &ExistingRow> = existing
         .iter()
         .filter_map(|row| row.drive_id.as_deref().map(|id| (id, row)))
         .collect();
+    let drive_rows = existing.iter().filter(|row| row.source == "drive").count();
     let mut plan = DrivePlan {
         remote: files.len() as u64,
+        drive_rows: drive_rows as u64,
         ..DrivePlan::default()
     };
     let mut remote_ids: HashSet<&str> = HashSet::with_capacity(files.len());
@@ -213,9 +288,15 @@ pub(super) fn plan(existing: &[ExistingRow], files: &[RemoteFile]) -> DrivePlan 
         })
         .map(|row| (row.id, row.display.clone()))
         .collect();
-    if files.is_empty() && !doomed.is_empty() {
+    if allow_mass_delete {
+        plan.deletes = doomed;
+        plan.deletes.sort_by_key(|(id, _)| *id);
+    } else if files.is_empty() && !doomed.is_empty() {
         // 空の一覧は成功として返ることがある（共有を外した・フォルダの取り違え）。全行の削除はしない
         plan.deletes_withheld = doomed.len() as u64;
+    } else if is_mass_delete(doomed.len(), drive_rows) {
+        // 0 件でなくても、ほとんどの行が消える一覧（一部しか見えない共有・フォルダの取り違え）は疑う
+        plan.mass_delete_withheld = doomed.len() as u64;
     } else {
         plan.deletes = doomed;
         plan.deletes.sort_by_key(|(id, _)| *id);
@@ -296,6 +377,7 @@ fn counts(plan: &DrivePlan, pages: u32, removed_files: (u64, u64, u64)) -> Count
         ("unchanged", plan.unchanged),
         ("malformed", plan.malformed),
         ("deletes_withheld", plan.deletes_withheld),
+        ("mass_delete_withheld", plan.mass_delete_withheld),
         ("derivative_files_removed", removed_files.0),
         ("derivative_files_unsafe", removed_files.1),
         ("derivative_files_failed", removed_files.2),
@@ -340,7 +422,17 @@ impl IndexDrive {
             Err(e) => return Err(stage_error(e)),
         };
         let existing = load_existing(ctx.read)?;
-        let plan = plan(&existing, &listing.files);
+        let plan = plan(&existing, &listing.files, self.allow_mass_delete);
+        if plan.mass_delete_withheld > 0 {
+            // 件数だけ（名前は出さない）。保留はサイクルごとに警告する
+            tracing::warn!(
+                "[drive] 消す行が多すぎます（Drive の行 {} 件のうち {} 件。一覧は {} 件）。削除は保留します。\
+                 意図した削除なら `geoframe sync --allow-mass-delete` を一度だけ実行してください",
+                plan.drive_rows,
+                plan.mass_delete_withheld,
+                plan.remote
+            );
+        }
         if plan.deletes_withheld > 0 {
             tracing::warn!(
                 "[drive] 一覧が 0 件でした。Drive の行 {} 件は削除しません（共有・フォルダの設定を確認してください）",

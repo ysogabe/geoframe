@@ -125,6 +125,10 @@ impl StubDrive {
         self.state().media.insert(id.to_string(), bytes);
     }
 
+    pub fn set_page_size(&self, size: usize) {
+        self.state().page_size = size;
+    }
+
     pub fn set_expires_in(&self, seconds: u64) {
         self.state().expires_in = seconds;
     }

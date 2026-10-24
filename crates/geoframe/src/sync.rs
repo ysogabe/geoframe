@@ -288,12 +288,25 @@ pub fn default_stages() -> Vec<Box<dyn Stage>> {
     default_stages_with(Arc::new(crate::drive::DriveShared::new()))
 }
 
+/// `geoframe sync --allow-mass-delete` の 1 回だけ使う段の一覧: `index_drive` が大量削除の保留を外す。
+/// **`serve` の定期実行は [`default_stages`] で、常に保留する**（環境変数・設定では外せない）。
+pub fn default_stages_allowing_mass_delete() -> Vec<Box<dyn Stage>> {
+    stages(Arc::new(crate::drive::DriveShared::new()), true)
+}
+
 /// [`default_stages`] の、Drive の状態（通信先・再試行）を指定できる形（試験用）。
 pub(crate) fn default_stages_with(drive: Arc<crate::drive::DriveShared>) -> Vec<Box<dyn Stage>> {
+    stages(drive, false)
+}
+
+fn stages(drive: Arc<crate::drive::DriveShared>, allow_mass_delete: bool) -> Vec<Box<dyn Stage>> {
     STAGE_NAMES
         .iter()
         .map(|name| match *name {
             "index_local" => Box::new(crate::local::IndexLocal) as Box<dyn Stage>,
+            "index_drive" if allow_mass_delete => Box::new(
+                crate::drive::IndexDrive::allowing_mass_delete(Arc::clone(&drive)),
+            ),
             "index_drive" => Box::new(crate::drive::IndexDrive::new(Arc::clone(&drive))),
             "local_derivatives" => Box::new(crate::local::LocalDerivatives::new()),
             "fetch_derivatives" => {

@@ -77,12 +77,15 @@ const USAGE: &str = "\
                                         画像処理の確認・計測用。DB・データ置き場には触れない。画像を derivative にして
                                         （--out があれば <連番>.jpg で書き出す）、連番・形式・寸法・向き・ICC・所要時間を出す。
                                         ファイル名は出さない。HEIC が読めないときは構造の分類（ブランド・グリッド・コーデック等）が付く
-  geoframe sync [--dry-run] [--data-dir <dir>]
+  geoframe sync [--dry-run] [--allow-mass-delete] [--data-dir <dir>]
                                         同期サイクルを 1 回だけ動かして終わる。--dry-run は行・写真・キャッシュ・
                                         ロックを変えず（SQLite が読み取りでも作る WAL 関連ファイル catalog.db-wal・
                                         -shm はできうる）、やるとしたら何か（スキーマ・掃除・各段）を件数だけ出す。
                                         Drive の鍵（GEOFRAME_DRIVE_KEY）があれば、一覧を読みに Drive へ接続する
                                         （原本のダウンロードはしない。鍵が無ければ Drive の段は通信せずに飛ばす）。
+                                        Drive の一覧が空、または消す行が多すぎる（50 件超かつ Drive の行の 20% 超）ときは
+                                        削除を保留する。意図した削除なら --allow-mass-delete を付けた 1 回だけで外す
+                                        （serve の定期実行では外せない。--dry-run と併せれば、外した場合の件数を見られる）。
                                         書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ印・Python の確認を通す
   geoframe organize [--dry-run] [--data-dir <dir>]
                                         位置の無いローカル写真を DATA_DIR/_excluded/no_gps/ へ移し、行を削除する
@@ -101,6 +104,8 @@ pub enum Command {
     Serve(Overrides),
     Sync {
         dry_run: bool,
+        /// Drive の大量削除の保留を、この 1 回だけ外す。
+        allow_mass_delete: bool,
         data_dir: Option<PathBuf>,
     },
     Organize {
@@ -146,10 +151,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             Ok(Command::Serve(overrides))
         }
         Some(name @ ("sync" | "organize")) => {
-            let (mut dry_run, mut data_dir) = (false, None);
+            let (mut dry_run, mut allow_mass_delete, mut data_dir) = (false, false, None);
             while let Some(arg) = args.next() {
                 match arg.as_str() {
                     "--dry-run" => dry_run = true,
+                    // 大量削除の保留を外すのは sync の明示的な 1 回だけ（serve・organize には与えない）
+                    "--allow-mass-delete" if name == "sync" => allow_mass_delete = true,
                     "--data-dir" => {
                         let value = args.next().ok_or("--data-dir に値が要ります")?;
                         data_dir = Some(PathBuf::from(value));
@@ -158,7 +165,11 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                 }
             }
             Ok(if name == "sync" {
-                Command::Sync { dry_run, data_dir }
+                Command::Sync {
+                    dry_run,
+                    allow_mass_delete,
+                    data_dir,
+                }
             } else {
                 Command::Organize { dry_run, data_dir }
             })
@@ -203,7 +214,11 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
         }
         Command::ImgProbe(args) => crate::imaging::probe::run(&args),
         Command::Serve(overrides) => serve(&overrides),
-        Command::Sync { dry_run, data_dir } => sync(dry_run, data_dir),
+        Command::Sync {
+            dry_run,
+            allow_mass_delete,
+            data_dir,
+        } => sync(dry_run, allow_mass_delete, data_dir),
         Command::Organize { dry_run, data_dir } => organize(dry_run, data_dir),
     }
 }
@@ -319,7 +334,7 @@ fn serve(overrides: &Overrides) -> ExitCode {
 }
 
 /// `geoframe sync [--dry-run]`: 同期サイクルを 1 回だけ動かす（棚卸し §5 の手動トリガー）。
-fn sync(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
+fn sync(dry_run: bool, allow_mass_delete: bool, data_dir: Option<PathBuf>) -> ExitCode {
     let overrides = Overrides {
         listen: None,
         data_dir,
@@ -334,14 +349,23 @@ fn sync(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
     crate::logging::init(config.log_level);
     crate::logging::install_panic_hook();
     if dry_run {
-        sync_dry_run(&config)
+        sync_dry_run(&config, allow_mass_delete)
     } else {
-        sync_apply(&config)
+        sync_apply(&config, allow_mass_delete)
+    }
+}
+
+/// `index_drive` の段を含む段の一覧。`--allow-mass-delete` の 1 回だけ、大量削除の保留を外す。
+fn stages_for(allow_mass_delete: bool) -> Vec<Box<dyn crate::sync::Stage>> {
+    if allow_mass_delete {
+        crate::sync::default_stages_allowing_mass_delete()
+    } else {
+        crate::sync::default_stages()
     }
 }
 
 /// 書かずに計画を出す。書き込み接続を作らず、DB は読み取り専用、キャッシュは凍結して読む。
-fn sync_dry_run(config: &Config) -> ExitCode {
+fn sync_dry_run(config: &Config, allow_mass_delete: bool) -> ExitCode {
     println!(
         "dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）。\
          Drive の鍵があれば一覧を読みに接続します（原本のダウンロードはしません）"
@@ -406,13 +430,16 @@ fn sync_dry_run(config: &Config) -> ExitCode {
         http: &http,
         stop: &stop,
     };
-    let report = crate::sync::run_cycle(&crate::sync::default_stages(), &ctx);
+    if allow_mass_delete {
+        println!("--allow-mass-delete: Drive の大量削除の保留を外した場合の件数を数えます");
+    }
+    let report = crate::sync::run_cycle(&stages_for(allow_mass_delete), &ctx);
     print_report(&report);
     exit_for(&report)
 }
 
 /// 実際に 1 回書く。`GEOFRAME_INGEST=1` が要る（P5 の切替まで、本番の書き手は Python）。
-fn sync_apply(config: &Config) -> ExitCode {
+fn sync_apply(config: &Config, allow_mass_delete: bool) -> ExitCode {
     if !config.ingest {
         eprintln!(
             "geoframe: sync は GEOFRAME_INGEST=1 のときだけ書きます（書かずに計画だけ見るなら --dry-run）"
@@ -444,7 +471,7 @@ fn sync_apply(config: &Config) -> ExitCode {
         http: &http,
         stop: &stop,
     };
-    let report = crate::sync::run_cycle(&crate::sync::default_stages(), &ctx);
+    let report = crate::sync::run_cycle(&stages_for(allow_mass_delete), &ctx);
     ingest.cache.save_now();
     print_report(&report);
     exit_for(&report)
@@ -628,6 +655,7 @@ mod tests {
             p(&["sync"]),
             Ok(Command::Sync {
                 dry_run: false,
+                allow_mass_delete: false,
                 data_dir: None
             })
         );
@@ -635,9 +663,21 @@ mod tests {
             p(&["sync", "--dry-run", "--data-dir", "/srv/x"]),
             Ok(Command::Sync {
                 dry_run: true,
+                allow_mass_delete: false,
                 data_dir: Some(PathBuf::from("/srv/x"))
             })
         );
+        // 大量削除の保留を外すのは sync の明示的な引数だけ（serve・organize は受けない）
+        assert_eq!(
+            p(&["sync", "--allow-mass-delete", "--dry-run"]),
+            Ok(Command::Sync {
+                dry_run: true,
+                allow_mass_delete: true,
+                data_dir: None
+            })
+        );
+        assert!(p(&["organize", "--allow-mass-delete"]).is_err());
+        assert!(p(&["serve", "--allow-mass-delete"]).is_err());
     }
 
     #[test]
