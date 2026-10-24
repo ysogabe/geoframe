@@ -303,15 +303,28 @@ fn respond(
         .iter()
         .find(|(k, _)| k == "X-Slow-Body")
         .and_then(|(_, v)| v.parse().ok());
+    // `X-Close-Before-Headers` を付けると、何も書かずに接続を閉じる（応答のヘッダーの前の切断）。
+    // `X-Claim-Length: <バイト数>` を付けると、実際の本文より大きな Content-Length を送って本文を途中で切る
+    // （ヘッダーを受け取ったあとの切断）
+    if extra.iter().any(|(k, _)| k == "X-Close-Before-Headers") {
+        return Ok(());
+    }
+    let claim_length: Option<usize> = extra
+        .iter()
+        .find(|(k, _)| k == "X-Claim-Length")
+        .and_then(|(_, v)| v.parse().ok());
     let no_length = extra.iter().any(|(k, _)| k == "X-No-Length");
     let mut head =
         format!("HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\n");
     if !no_length {
-        head.push_str(&format!("Content-Length: {}\r\n", body.len()));
+        head.push_str(&format!(
+            "Content-Length: {}\r\n",
+            claim_length.unwrap_or(body.len())
+        ));
     }
     for (k, v) in extra
         .iter()
-        .filter(|(k, _)| k != "X-No-Length" && k != "X-Slow-Body")
+        .filter(|(k, _)| !matches!(k.as_str(), "X-No-Length" | "X-Slow-Body" | "X-Claim-Length"))
     {
         head.push_str(&format!("{k}: {v}\r\n"));
     }

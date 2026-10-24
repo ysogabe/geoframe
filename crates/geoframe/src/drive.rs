@@ -46,7 +46,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::Value;
 
 use crate::jwt::{GoogleAssertion, JwtError, Rs256Signer};
-use crate::net::Failure;
+use crate::net::{self, Failure};
 use crate::stop::StopFlag;
 
 pub use fetch::FetchDerivatives;
@@ -188,8 +188,9 @@ impl DriveError {
     /// （[`DriveError::BodyTimeout`]）ことだけは、その写真の失敗として数える。
     pub fn is_outage(&self) -> bool {
         match self {
-            // `Timeout` は要求を送って応答の頭を受けるまでの時間切れだけ（本文の読み出しは `BodyTimeout`）
-            Self::Net(failure) => !matches!(failure, Failure::Other),
+            // `Timeout` は要求を送って応答の頭を受けるまでの時間切れと、403 の理由の本文の受信の時間切れだけ
+            // （原本の本文の読み出しは `BodyTimeout`）。応答の頭の前の切断・本文の途中の切断も障害
+            Self::Net(failure) => failure.is_outage(),
             Self::RateLimited(_) => true,
             // 401 は、取り直したトークンでも断られた（`authorized` が 1 回やり直したあと）。写真ではなく
             // サービスアカウント側（スコープ・無効化）の問題
@@ -601,8 +602,9 @@ impl<'a> Session<'a> {
                 .map(Duration::from_secs);
             let transient = status == 429
                 || status >= 500
-                // 403 は権限の不足と流量制限が同じ状態コード。本文の理由で見分ける（本文は読んで捨てる）
-                || (status == 403 && is_rate_limit_body(&mut response));
+                // 403 は権限の不足と流量制限が同じ状態コード。本文の理由で見分ける（本文は読んで捨てる。
+                // 理由の本文の受信に失敗したら、権限の不足と決めつけず通信の障害として返す）
+                || (status == 403 && is_rate_limit_body(&mut response)?);
             if !transient {
                 return Err(DriveError::Status(status));
             }
@@ -795,10 +797,18 @@ impl<'a> Session<'a> {
     }
 }
 
-/// 本文を読んでいる最中の失敗。`ureq` の本文の読み出しは `io::Error` に包んで返す。
-/// 時間切れは [`DriveError::BodyTimeout`]（その写真が遅いだけ）。切断などは通信の障害。
+/// 原本の本文を読んでいる最中の失敗（応答のヘッダーは受け取り済み）。`ureq` の本文の読み出しは `ureq` の
+/// エラーを `io::Error` に包んで返す（`Io` は中身の `io::Error` をそのまま返す）。
+///
+/// | 失敗 | `DriveError` | 扱い |
+/// | --- | --- | --- |
+/// | 時間切れ（`Timeout(_)` を包んだもの・`TimedOut`・`WouldBlock`） | `BodyTimeout` | その写真の失敗（遅いだけ） |
+/// | 切断（[`crate::net::is_disconnect`] の種類: `UnexpectedEof`・`ConnectionReset`・`ConnectionAborted`・`BrokenPipe` など） | `Net(Disconnected)` | 通信の障害（段を中断） |
+/// | 包まれた `ureq` のエラー（`Tls` など） | `Net(`[`Failure::from`]`)` | `Other` 以外は障害 |
+/// | それ以外の I/O | `Io(kind)` | その写真の失敗 |
+///
+/// ヘッダーの前の失敗の分類は [`Failure`] の表（`net.rs`）。
 fn read_error(e: &io::Error) -> DriveError {
-    // `ureq` は自分のエラーを `io::Error` に包んで返す（切断・時間切れなど）
     if let Some(inner) = e.get_ref().and_then(|x| x.downcast_ref::<ureq::Error>()) {
         return match Failure::from(inner) {
             Failure::Timeout => DriveError::BodyTimeout,
@@ -807,26 +817,30 @@ fn read_error(e: &io::Error) -> DriveError {
     }
     match e.kind() {
         io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => DriveError::BodyTimeout,
-        io::ErrorKind::ConnectionReset
-        | io::ErrorKind::ConnectionAborted
-        | io::ErrorKind::BrokenPipe
-        | io::ErrorKind::UnexpectedEof => DriveError::Net(Failure::Connect),
+        kind if net::is_disconnect(kind) => DriveError::Net(Failure::Disconnected),
         kind => DriveError::Io(kind),
     }
 }
 
 /// 403 の本文が流量制限の理由か（読み捨てる。小さい上限つき）。
-fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> bool {
-    let Ok(bytes) = response
+///
+/// 本文の受信に失敗した（切断・時間切れ・TLS）ときは `Err` にして、通信の障害（[`DriveError::Net`]）として
+/// 伝える。**権限の不足（`Status(403)`）と決めつけて写真の失敗にしない**。時間切れも `BodyTimeout` ではなく
+/// `Net(Timeout)`（原本の本文が遅いのとは違い、数百バイトの理由の本文が届かないのは回線の不調）。
+/// 理由の本文が上限（16 KiB）を超えたものは、Drive の流量制限の応答（数百バイト）ではないので `false`。
+fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<bool, DriveError> {
+    let bytes = match response
         .body_mut()
         .with_config()
         .limit(16 << 10)
         .read_to_vec()
-    else {
-        return false;
+    {
+        Ok(bytes) => bytes,
+        Err(ureq::Error::BodyExceedsLimit(_)) => return Ok(false),
+        Err(e) => return Err(DriveError::Net(Failure::from(&e))),
     };
     let text = String::from_utf8_lossy(&bytes);
-    text.contains("rateLimitExceeded") || text.contains("userRateLimitExceeded")
+    Ok(text.contains("rateLimitExceeded") || text.contains("userRateLimitExceeded"))
 }
 
 fn read_json(response: ureq::http::Response<ureq::Body>) -> Result<Value, DriveError> {

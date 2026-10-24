@@ -52,11 +52,14 @@ pub enum Failure {
     Dns,
     /// 接続できない（拒否・到達不能）。
     Connect,
+    /// 接続は張れたが、応答のヘッダーを受け取る前、または本文の途中で切れた（切断・リセット・中断・
+    /// 予期しない終端など）。
+    Disconnected,
     /// TLS（証明書の検証・ハンドシェイク）。
     Tls,
     /// 時間切れ。
     Timeout,
-    /// 本文が大きすぎる・プロトコル違反など、その他。
+    /// 要求側の誤り・プロトコル違反・大きすぎる本文など、通信の障害とは言えないもの。
     Other,
 }
 
@@ -65,29 +68,76 @@ impl Failure {
         match self {
             Self::Dns => "dns",
             Self::Connect => "connect",
+            Self::Disconnected => "disconnected",
             Self::Tls => "tls",
             Self::Timeout => "timeout",
             Self::Other => "other",
         }
     }
+
+    /// 通信の障害か（写真・検索語といった**要求の中身のせいではなく**、回線・相手・TLS の不調と言える）。
+    /// `Other` だけが、要求や応答の内容に由来する失敗。
+    pub fn is_outage(self) -> bool {
+        !matches!(self, Self::Other)
+    }
 }
 
+/// 回線が切れた・繋がっていない、と言える I/O の種類（本文を読んでいる最中の判定にも使う）。
+pub fn is_disconnect(kind: std::io::ErrorKind) -> bool {
+    use std::io::ErrorKind as K;
+    matches!(
+        kind,
+        K::ConnectionReset
+            | K::ConnectionAborted
+            | K::BrokenPipe
+            | K::UnexpectedEof
+            | K::NotConnected
+            | K::ConnectionRefused
+            | K::NetworkDown
+            | K::NetworkUnreachable
+            | K::HostUnreachable
+    )
+}
+
+/// `ureq` のエラー（`ureq` 3.5 の全種類）を、**要求を送って応答のヘッダーを受け取るまで**の失敗として
+/// 分類する。`Agent::call` / `send` が返す `Err` はすべてここに入る（ヘッダーを受け取ったあとの本文の
+/// 読み出しの失敗は、呼び出し側が別に扱う。Drive の原本は `crate::drive` の本文の扱い）。
+///
+/// | `ureq::Error` | `Failure` | 通信の障害か |
+/// | --- | --- | --- |
+/// | `HostNotFound` | `Dns` | 障害 |
+/// | `ConnectionFailed`・`ConnectProxyFailed` | `Connect` | 障害 |
+/// | `Io`（`ConnectionRefused`・`NetworkUnreachable`・`HostUnreachable`・`NetworkDown`） | `Connect` | 障害 |
+/// | `Io`（`TimedOut`・`WouldBlock`）・`Timeout(_)` | `Timeout` | 障害 |
+/// | `Io`（`InvalidData`。rustls が証明書の不正などで返す）・`Tls`・`Rustls`・`Pem`・`TlsRequired` | `Tls` | 障害 |
+/// | `Io`（上記以外のすべて: `UnexpectedEof`・`ConnectionReset`・`ConnectionAborted`・`BrokenPipe`・`NotConnected`・`PermissionDenied` など） | `Disconnected` | 障害 |
+/// | `Protocol`・`LargeResponseHeader`（応答の頭が壊れている・大きすぎる） | `Other` | 障害としない（※） |
+/// | `Http`・`BadUri`・`InvalidProxyUrl`・`RequireHttpsOnly`・`RedirectFailed`・`TooManyRedirects`・`StatusCode`・`BodyExceedsLimit`・`Other` など | `Other` | 障害としない |
+///
+/// ※ 応答は届いているが中身が壊れている。要求ごとに決まった結果になりうる（特定の写真だけが毎回壊れた
+/// 応答になる）ので、障害として段を止めると、その 1 枚が残りの写真を永久に塞ぐ。写真の失敗として数えれば
+/// 待ちが付き、ほかの写真は進む。切断は逆に、どの写真でも起きる回線・相手の不調なので障害にする。
 impl From<&ureq::Error> for Failure {
     fn from(e: &ureq::Error) -> Self {
+        use std::io::ErrorKind as K;
         match e {
             ureq::Error::HostNotFound => Self::Dns,
-            ureq::Error::ConnectionFailed => Self::Connect,
+            ureq::Error::ConnectionFailed | ureq::Error::ConnectProxyFailed(_) => Self::Connect,
             ureq::Error::Timeout(_) => Self::Timeout,
-            ureq::Error::Tls(_) | ureq::Error::Rustls(_) | ureq::Error::Pem(_) => Self::Tls,
+            ureq::Error::Tls(_)
+            | ureq::Error::Rustls(_)
+            | ureq::Error::Pem(_)
+            | ureq::Error::TlsRequired => Self::Tls,
             ureq::Error::Io(io) => match io.kind() {
-                // rustls は証明書の不正などを InvalidData の I/O エラーとして返すことがある
-                std::io::ErrorKind::InvalidData => Self::Tls,
-                std::io::ErrorKind::TimedOut => Self::Timeout,
-                std::io::ErrorKind::ConnectionRefused
-                | std::io::ErrorKind::ConnectionReset
-                | std::io::ErrorKind::NetworkUnreachable
-                | std::io::ErrorKind::HostUnreachable => Self::Connect,
-                _ => Self::Other,
+                K::InvalidData => Self::Tls,
+                K::TimedOut | K::WouldBlock => Self::Timeout,
+                K::ConnectionRefused
+                | K::NetworkUnreachable
+                | K::HostUnreachable
+                | K::NetworkDown => Self::Connect,
+                // 相手が応答の前に切った（`ureq` は `UnexpectedEof`）・リセット・中断など。
+                // 応答のヘッダーを受け取る前の I/O の失敗は、種類によらず通信の障害にする
+                _ => Self::Disconnected,
             },
             _ => Self::Other,
         }
@@ -188,6 +238,53 @@ mod tests {
         assert!(!bad.ok());
     }
 
+    /// `Failure::from` の表（ヘッダーを受け取るまで）どおりに分類され、`Other` 以外が障害になる。
+    #[test]
+    fn head_phase_errors_follow_the_table() {
+        use std::io::ErrorKind as K;
+        let io = |kind| ureq::Error::Io(std::io::Error::from(kind));
+        for (kind, expected) in [
+            (K::UnexpectedEof, Failure::Disconnected),
+            (K::ConnectionReset, Failure::Disconnected),
+            (K::ConnectionAborted, Failure::Disconnected),
+            (K::BrokenPipe, Failure::Disconnected),
+            (K::NotConnected, Failure::Disconnected),
+            (K::PermissionDenied, Failure::Disconnected),
+            (K::Other, Failure::Disconnected),
+            (K::ConnectionRefused, Failure::Connect),
+            (K::NetworkUnreachable, Failure::Connect),
+            (K::HostUnreachable, Failure::Connect),
+            (K::TimedOut, Failure::Timeout),
+            (K::WouldBlock, Failure::Timeout),
+            (K::InvalidData, Failure::Tls),
+        ] {
+            let failure = Failure::from(&io(kind));
+            assert_eq!(failure, expected, "{kind:?}");
+            assert!(failure.is_outage(), "{kind:?}");
+        }
+        for (error, expected) in [
+            (ureq::Error::HostNotFound, Failure::Dns),
+            (ureq::Error::ConnectionFailed, Failure::Connect),
+            (
+                ureq::Error::Timeout(ureq::Timeout::Global),
+                Failure::Timeout,
+            ),
+            (
+                ureq::Error::Timeout(ureq::Timeout::RecvResponse),
+                Failure::Timeout,
+            ),
+            (ureq::Error::Tls("x"), Failure::Tls),
+            (ureq::Error::BadUri("x".into()), Failure::Other),
+            (ureq::Error::TooManyRedirects, Failure::Other),
+            (ureq::Error::BodyExceedsLimit(1), Failure::Other),
+            (ureq::Error::LargeResponseHeader(1, 1), Failure::Other),
+        ] {
+            let failure = Failure::from(&error);
+            assert_eq!(failure, expected);
+            assert_eq!(failure.is_outage(), expected != Failure::Other);
+        }
+    }
+
     /// ループバックの平文 HTTP サーバー（この端末の中だけ。外へ出ない）で、状態コードを受けられること
     /// （`http_status_as_error(false)`）と、接続できないときの失敗の種類を確かめる。
     #[test]
@@ -211,9 +308,6 @@ mod tests {
         let addr = closed.local_addr().unwrap();
         drop(closed);
         let err = agent().get(&format!("http://{addr}/")).call().unwrap_err();
-        assert!(matches!(
-            Failure::from(&err),
-            Failure::Connect | Failure::Other
-        ));
+        assert_eq!(Failure::from(&err), Failure::Connect);
     }
 }

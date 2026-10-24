@@ -348,6 +348,7 @@ fn errors_never_carry_secrets_or_urls() {
         DriveError::Key(KeyError::Unreadable(io::ErrorKind::NotFound)),
         DriveError::Jwt(JwtError::Key),
         DriveError::Net(Failure::Tls),
+        DriveError::Net(Failure::Disconnected),
         DriveError::Status(503),
         DriveError::TokenRejected(400),
         DriveError::BadResponse,
@@ -369,6 +370,7 @@ fn errors_never_carry_secrets_or_urls() {
     // 接続・応答の待ちの時間切れと流量制限は障害（写真のせいではない）。権限の 403 と本文の時間切れは写真の失敗
     assert!(DriveError::Net(Failure::Timeout).is_outage());
     assert!(DriveError::Net(Failure::Tls).is_outage());
+    assert!(DriveError::Net(Failure::Disconnected).is_outage());
     assert!(!DriveError::Net(Failure::Other).is_outage());
     assert!(DriveError::RateLimited(403).is_outage());
     assert!(!DriveError::BodyTimeout.is_outage());
@@ -2113,6 +2115,165 @@ fn a_body_that_takes_too_long_is_that_photos_failure_and_the_rest_continue() {
         (get(&counts, "skipped_backoff"), get(&counts, "attempted")),
         (1, 0)
     );
+}
+
+/// 本文の読み出しの失敗は、`read_error` の表どおりに分類される。
+#[test]
+fn body_read_errors_follow_the_table() {
+    for kind in [
+        io::ErrorKind::UnexpectedEof,
+        io::ErrorKind::ConnectionReset,
+        io::ErrorKind::ConnectionAborted,
+        io::ErrorKind::BrokenPipe,
+        io::ErrorKind::NotConnected,
+    ] {
+        let error = read_error(&io::Error::from(kind));
+        assert_eq!(error, DriveError::Net(Failure::Disconnected), "{kind:?}");
+        assert!(error.is_outage(), "{kind:?}");
+    }
+    for kind in [io::ErrorKind::TimedOut, io::ErrorKind::WouldBlock] {
+        let error = read_error(&io::Error::from(kind));
+        assert_eq!(error, DriveError::BodyTimeout, "{kind:?}");
+        assert!(!error.is_outage(), "{kind:?}");
+    }
+    // `ureq` が包んで返す時間切れ（全体の上限）も、原本の本文では写真の失敗
+    let wrapped = ureq::Error::Timeout(ureq::Timeout::Global).into_io();
+    assert_eq!(read_error(&wrapped), DriveError::BodyTimeout);
+    assert_eq!(
+        read_error(&io::Error::from(io::ErrorKind::PermissionDenied)),
+        DriveError::Io(io::ErrorKind::PermissionDenied)
+    );
+}
+
+#[test]
+fn a_disconnect_before_the_response_headers_stops_the_stage_without_blaming_the_photos() {
+    let e = two_pending("drive-disconnect-head");
+    e.stub.add_fault(Box::new(|r| {
+        r.is_media().then(|| {
+            (
+                200,
+                String::new(),
+                vec![("X-Close-Before-Headers".to_string(), "1".to_string())],
+            )
+        })
+    }));
+    let fetch = e.fetch_stage();
+    let StageResult::Failed(message) = e.run(&fetch) else {
+        panic!("失敗のはず");
+    };
+    // 最初の 1 枚で止まった（2 枚目は試さない）。再試行もしない（通信の障害は次のサイクルに任せる）
+    assert!(
+        message.contains("disconnected") && message.contains("attempted=1"),
+        "{message}"
+    );
+    assert_eq!(e.stub.media_requests().len(), 1);
+    assert!(e.tmp_leftovers().is_empty());
+    // 写真の失敗として覚えていないので、復旧した次のサイクルで 2 枚とも待たずに取得される
+    recovers_without_waiting(&e, &fetch);
+}
+
+#[test]
+fn a_disconnect_while_exchanging_the_token_is_an_outage_not_an_auth_error() {
+    let e = env("drive-disconnect-token");
+    e.stub.add_fault(Box::new(|r| {
+        (r.path == "/token").then(|| {
+            (
+                200,
+                String::new(),
+                vec![("X-Close-Before-Headers".to_string(), "1".to_string())],
+            )
+        })
+    }));
+    // 認証の失敗（両方の段を飛ばす）ではなく、段の失敗
+    let StageResult::Failed(message) = e.run(&e.index_stage()) else {
+        panic!("失敗のはず");
+    };
+    assert!(message.contains("disconnected"), "{message}");
+    assert!(!e.shared.auth_failed());
+}
+
+#[test]
+fn a_disconnect_in_the_middle_of_an_original_stops_the_stage_without_blaming_the_photos() {
+    let e = two_pending("drive-disconnect-body");
+    e.stub.add_fault(Box::new(|r| {
+        r.is_media().then(|| {
+            (
+                200,
+                "x".repeat(10),
+                vec![("X-Claim-Length".to_string(), "1000".to_string())],
+            )
+        })
+    }));
+    let fetch = e.fetch_stage();
+    let StageResult::Failed(message) = e.run(&fetch) else {
+        panic!("失敗のはず");
+    };
+    assert!(
+        message.contains("disconnected") && message.contains("attempted=1"),
+        "{message}"
+    );
+    assert_eq!(e.stub.media_requests().len(), 1);
+    assert!(e.tmp_leftovers().is_empty());
+    recovers_without_waiting(&e, &fetch);
+}
+
+#[test]
+fn a_403_whose_reason_body_is_cut_off_is_an_outage_not_a_permission_error() {
+    let e = two_pending("drive-403-cut");
+    e.stub.add_fault(Box::new(|r| {
+        r.is_media().then(|| {
+            (
+                403,
+                r#"{"error":{"errors":[{"rea"#.to_string(),
+                vec![("X-Claim-Length".to_string(), "500".to_string())],
+            )
+        })
+    }));
+    let fetch = e.fetch_stage();
+    let StageResult::Failed(message) = e.run(&fetch) else {
+        panic!("失敗のはず");
+    };
+    // 理由が読めなかった 403 を権限の不足（写真の失敗）にしない。再試行もしない
+    assert!(
+        message.contains("disconnected") && message.contains("attempted=1"),
+        "{message}"
+    );
+    assert_eq!(e.stub.media_requests().len(), 1);
+    assert!(e.tmp_leftovers().is_empty());
+    recovers_without_waiting(&e, &fetch);
+}
+
+#[test]
+fn a_403_whose_reason_body_times_out_is_an_outage_and_not_a_slow_download() {
+    let mut e = two_pending("drive-403-slow");
+    e.shared = Arc::new(
+        DriveShared::with(Endpoints::stub(&e.stub.base_url()), FAST_RETRY)
+            .with_download_timeout(Duration::from_millis(300)),
+    );
+    e.stub.add_fault(Box::new(|r| {
+        r.is_media().then(|| {
+            (
+                403,
+                r#"{"error":{"errors":[{"reason":"forbidden"}]}}"#.to_string(),
+                vec![("X-Slow-Body".to_string(), "700".to_string())],
+            )
+        })
+    }));
+    let fetch = e.fetch_stage();
+    let StageResult::Failed(message) = e.run(&fetch) else {
+        panic!("失敗のはず");
+    };
+    // 原本の本文の時間切れ（`fail_slow_download`・写真の失敗）ではなく、通信の障害として止まる
+    assert!(
+        message.contains("timeout") && message.contains("attempted=1"),
+        "{message}"
+    );
+    assert!(!message.contains("fail_slow_download"), "{message}");
+    assert_eq!(e.stub.media_requests().len(), 1);
+    assert!(e.tmp_leftovers().is_empty());
+    // スタブは 1 本のスレッドで、遅い本文を送り終える（700 ms）まで次の要求を受けられない
+    std::thread::sleep(Duration::from_millis(800));
+    recovers_without_waiting(&e, &fetch);
 }
 
 // ---------------------------------------------------------------------------
