@@ -37,6 +37,11 @@ jobs:
       - name: 設定リファレンスの同期検査
         run: python3 tools/gen_env_reference.py --check
 
+      - name: スキーマのフィクスチャの同期検査
+        # Rust のスキーマ（crates/geoframe/src/schema.rs）が Python の空 DB と一致することを確かめる
+        # テストの Golden。store.py の SCHEMA を変えたら tools/gen_schema_fixture.py で再生成する
+        run: python3 tools/gen_schema_fixture.py --check
+
   rust:
     name: Rust（fmt・clippy・test・musl静的ビルド）
     runs-on: ubuntu-latest

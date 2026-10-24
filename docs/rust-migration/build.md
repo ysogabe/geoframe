@@ -94,6 +94,8 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 | `crates/geoframe-imgpoc/` | 画像処理の技術PoC（`publish = false`）。本体の静的ビルドの検査には含めない。CIは別の手順で、`--features heic-zune,mimalloc`（libheifなし）のmusl静的ビルドと`file`／`ldd`の検査だけを行う。結果は[image-poc.md](image-poc.md) |
 | `geoframe --version` | バージョンを出す |
 | `geoframe check-db <path>` | `photos`の行数とSQLiteのバージョンを出す。読み取り専用 |
+| `geoframe selfcheck-net` | T2.1。地理院の逆ジオコーダへ公開の代表点を1件問い合わせ、外向きHTTPS（名前解決・TLS・証明書）が通るかを確かめる。出力は状態とHTTPステータスだけ（§7） |
+| `geoframe sync [--dry-run]` | T2.1。同期サイクルを1回だけ動かす。`--dry-run`は書かずに件数だけ（[server.md §11](server.md)） |
 | `geoframe serve [--listen <addr>] [--data-dir <dir>]` | 読み取り専用のサーバー。P0では`GET /healthz`が`{"ok":true}`を返すだけだった。T1.1で、設定・DB読み取り層・ログ・DBを読めるかを返すヘルスを足した（[server.md](server.md)）。SIGTERMで停止 |
 | `deploy/geoframe-rs.service`・`deploy/rust-deploy.sh` | T1.5。検証環境向けのsystemd unitと、ビルド→転送→入れ替え→確認→巻き戻しの配布スクリプト（[deploy/README.md §7](../../deploy/README.md)、[server.md §6](server.md)）。本番の切替はP5 |
 

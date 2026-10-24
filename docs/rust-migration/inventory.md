@@ -247,7 +247,8 @@ store.py の永続キャッシュ。JSONオブジェクト。読み書きは `ca
 | `GEOFRAME_PHOTOS_DIR` | `photos` | 引き継ぐ | `DATA_DIR` 配下であること | P2 |
 | `GEOFRAME_DRIVE_KEY` | `drive_key.json` | 引き継ぐ | `app/` 相対（絶対パスなら絶対）。本番は `/var/lib/geoframe/drive_key.json` | P2 |
 | `GEOFRAME_DRIVE_FOLDER` | `GeoFrame` | 引き継ぐ | 20字以上の英数字なら生のフォルダIDとして扱う | P2 |
-| `GEOFRAME_DRIVE_POLL_MIN` | `10` | 引き継ぐ | 分 | P2 |
+| `GEOFRAME_DRIVE_POLL_MIN` | `10` | 引き継ぐ | 分（小数可）。**T2.1で実装済み**。0以下・非数は起動を断る（[server.md §11.2](server.md)） | P2 |
+| `GEOFRAME_INGEST` | （Pythonに無い。Rustの既定`0`） | **Rustだけの項目** | 取り込み（DBへの書き込みと同期サイクル）を有効にする。P5の切替まで本番の書き手はPythonなので、明示（`1`）しない限りRustは書かない。**T2.1で実装済み**（[server.md §11.1](server.md)） | P2 |
 | `GEOFRAME_FETCH_PER_CYCLE` | `25` | 引き継ぐ | | P2 |
 | `GEOFRAME_QUALITY_PER_CYCLE` | `FETCH_PER_CYCLE` | 引き継ぐ | | P2 |
 | `GEOFRAME_INFER_MIN` | `15` | 引き継ぐ | 段階窓は `{INFER_MIN, 2時間, 12時間}` | P2 |
@@ -319,6 +320,8 @@ Issue #54 の受入条件「写真追加→位置補完→表示→選別→検�
 | S10 | 旅行ブログの下書き→書き出し | `/blog-admin` で旅程を選ぶ（E7〜E10）→ 編集 → E15 保存 → E16 実行 | `DATA_DIR/travel_blog/drafts/<id>.json` ができる。`blog_exports/<id>/index.html` と `images/photo-<id>.jpg` ができ、画像のEXIF（GPS）が無い。`GET /blog_exports/<id>/index.html` が200。存在しなくても `GET /blog_exports/.<id>.previous/` や `/blog_exports/.<id>-x/` が404ではなく403（ドット始まりの要素は途中でも403） | P3 |
 
 **同期サイクルの手動実行**: 現行には1回だけ動かす公式手段が無い（`catalog.py:cycle` はワーカーが `GEOFRAME_DRIVE_POLL_MIN` ごとに呼ぶ。検証では `python -c "from geoframe.catalog import cycle; cycle()"` を `app/` で動かして代用できる）。**Rust側で、同期サイクルを1回動かす手動トリガー（CLIサブコマンド等）を用意する**。S1〜S4、S7 の「サイクル待ち」はこれで置き換える。
+
+→ **T2.1で用意した**: `geoframe sync`（1回だけ実行。`GEOFRAME_INGEST=1`が要る）と`geoframe sync --dry-run`（書かずに件数だけ）。[server.md §11.3](server.md)。
 
 S5〜S6 は管理画面の操作のE2E、S8〜S9 は「local-model-lab停止／lease中でも閲覧・管理できる」の確認（AC3）にも使う。
 

@@ -1,13 +1,13 @@
-# Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）
+# Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
 - 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 0. Pythonとの差の索引
 
-P1でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
@@ -19,10 +19,14 @@ P1でPythonと意図して違える点・既知の差の入口。本文は各節
 | `lat`ありで`lon`がNULLの行: Pythonは一覧全体が500になりうる、Rustは一覧から外す | 契約（`lon`は必ずある）に合わせる | 該当行があるとき（通常は起きない） | 本番コピー（2026-10-24のバックアップ）での全件比較で差0（表示対象に該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
 | 静的配信・HTTPの差（領域外のリンクは403、`ETag`での再検証、`/healthz`の新設、未実装ルートの503、`POST`は全部403、接続・配信の上限など） | 安全性、固定の挙動、まだ無いことの明示 | 該当する要求を送ったとき | 検証環境で現行Pythonとの比較（状態コード・本文の一致）、単体テスト | 503・`POST`はP3・P4で実装して外す。他は決定 | [§9.7](#97-pythonとの差まとめ) |
 | 列の型が想定外の行（`lat`が文字列など）があると読み取り全体が失敗して503（Pythonは素通し） | スキーマ上は起きない | `GET /api/v1/photos` | 本番コピーの全件比較で差0（該当行なし） | なし（決定） | [§8.3](#83-pythonとの差) |
-| DBが無いとRustは起動を断る（終了コード1、systemdで5秒おきに再起動）。PythonはDBを作る | DBを作るのはPython。配備の誤りを失敗として見せる | `GEOFRAME_DATA_DIR`の誤りなど、DBが無いまま起動したとき | 検証環境で確認（[p1-acceptance.md](p1-acceptance.md)） | なし（決定。P5の切替時にはDBがある） | [§2.4](#24-dbが無い壊れている古いときの扱い) |
+| DBが無いとRustは起動を断る（終了コード1、systemdで5秒おきに再起動）。PythonはDBを作る。**ただし`GEOFRAME_INGEST=1`のときは、Rustも空のDBを作る**（T2.1。§11.1） | DBを作るのはPython。配備の誤りを失敗として見せる | `GEOFRAME_DATA_DIR`の誤りなど、DBが無いまま起動したとき | 検証環境で確認（[p1-acceptance.md](p1-acceptance.md)） | なし（決定。P5の切替時にはDBがある） | [§2.4](#24-dbが無い壊れている古いときの扱い) |
 | 管理画面の読み取りAPIの差（件数を1トランザクションで数える、想定外の型は503、キーの並びなど） | 一貫性、読み取り専用の表示で落とさない | `GET /api/admin/status`・`photos` | 検証環境の比較で差0、単体テスト | なし（決定） | [§10.6](#106-pythonとの差まとめ) |
+| `GEOFRAME_INGEST`（Rustだけの項目。既定`0`）。`0`のRustは**DBに一切書かない**（writerを作らない・移行しない・同期サイクルを動かさない） | P5の切替まで本番の書き手はPython。`/etc/default/geoframe`のままRustを起動しても二重に書かない | 取り込みを使うとき（検証環境）だけ`1` | 単体テスト、`tests/ingest_cli.rs`（既定で`serve`が`catalog.db`もフォルダも変えない） | P5の切替で本番の設定に`1`を足す。既定の見直しもその時 | [§11.1](#111-取り込みを有効にする-geoframe_ingest) |
+| `GEOFRAME_DRIVE_POLL_MIN`: 0以下・非数・上限（525600分）超は起動を断る（終了コード2）。Pythonは0以下で空回りか例外 | 事故を早く見つける | 不正な値が設定にあるとき（本番は既定の10） | 単体テスト | なし（決定） | [§11.2](#112-設定) |
+| 同期サイクルの段の失敗は、段の名前と失敗の種類だけをログに出す（Pythonは例外文字列をそのまま出す）。段のパニックも隔離する（Pythonは`except Exception`） | ログに位置・ファイル名を出さない方針（inventory.md §6.3） | 常時 | 単体テスト（`sync.rs`） | なし（決定） | [§11.3](#113-同期サイクルの骨組み) |
+| `.cache.json`のキーをRustは辞書順に書く（Pythonは挿入順）。停止時にも最後の保存をする。`.dl_*`は通常ファイルだけを消す | `serde_json`の`preserve_order`を入れると他のJSON応答の並びが変わる | `.cache.json`をRustが保存したとき（読むときの並びは問わない） | 単体テスト（Pythonの`json.dumps(indent=1, ensure_ascii=False)`と同じ形） | なし（決定） | [§11.5](#115-cachejson) |
 
-検証の記録は[p1-acceptance.md](p1-acceptance.md)。
+P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
 ## 1. 設定
 
@@ -42,6 +46,8 @@ P1でPythonと意図して違える点・既知の差の入口。本文は各節
 | 位置推定の1段目の窓（分） | なし | `GEOFRAME_INFER_MIN` | `15` |
 | embeddingの場所 | なし | `GEOFRAME_EMBED_BACKEND` | `gemini` |
 | タイルキャッシュの上限（MB） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
+| 取り込み（DBへの書き込みと同期サイクル）を有効にするか（**Rustだけの項目**。`0`／`1`） | なし | `GEOFRAME_INGEST` | `0`（無効。§11.1） |
+| 同期サイクルの間隔（分。小数も可） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10`（§11.2） |
 
 - **空文字の環境変数は未設定と同じ**に扱う。現行の`GEOFRAME_DATA_DIR`が`or`で空文字を未設定扱いにするのと同じで、`EnvironmentFile`に`KEY=`と書いた事故を避ける。
 - **不正な値は起動を断る**（終了コード2）。メッセージには環境変数の名前と理由だけを書き、値は書かない。`GEOFRAME_HOST`はIPアドレスだけ（現行Pythonはホスト名も通すが、本番は`0.0.0.0`か`127.0.0.1`）。
@@ -66,7 +72,7 @@ P1でPythonと意図して違える点・既知の差の入口。本文は各節
 
 ### 1.4 未対応の項目（P2以降）
 
-`config.rs`の`UNSUPPORTED_ENV`に、現行の`config.py`にあるP2以降の項目（取り込み・タイル・AI・位置候補など30個）を**列挙だけ**してある。P1は読まず、警告も出さない（`/etc/default/geoframe`に書いてあっても無視される）。`docs/reference/configuration.md`にある`GEOFRAME_*`が、読む項目（`SUPPORTED_ENV`）か未対応のどちらかに分類されていることを、テスト`every_documented_variable_is_classified`が検査する。Pythonに項目が増えたら、このテストが落ちて気づける。
+`config.rs`の`UNSUPPORTED_ENV`に、現行の`config.py`にあるP2以降の項目（取り込み・タイル・AI・位置候補など）を**列挙だけ**してある（T2.1で`GEOFRAME_DRIVE_POLL_MIN`だけ読み始めたので、29個）。読まず、警告も出さない（`/etc/default/geoframe`に書いてあっても無視される）。`docs/reference/configuration.md`にある`GEOFRAME_*`が、読む項目（`SUPPORTED_ENV`）か未対応のどちらかに分類されていることを、テスト`every_documented_variable_is_classified`が検査する。Pythonに項目が増えたら、このテストが落ちて気づける。
 
 秘密になりうる項目（P2の`GEOFRAME_DRIVE_KEY`ほか）が入るときも、設定が持つのは**鍵ファイルのパスだけ**で、中身は設定の型に載せない。`Config`は`Debug`を手書きにしてあり、ログへ出す要約（`log_summary`）に載せた項目だけが出る。許可Host名も件数だけで、名前は出さない。
 
@@ -75,6 +81,8 @@ P1でPythonと意図して違える点・既知の差の入口。本文は各節
 `crates/geoframe/src/db.rs`の`Catalog`。
 
 ### 2.1 読み取り専用
+
+（読み取り側の話。取り込みが有効なときの書き込みとスキーマの作成は§11。ここに書いた「スキーマの作成・移行をしない」は、`GEOFRAME_INGEST`が`0`の場合と、読み取りの層そのものについて。）
 
 - `SQLITE_OPEN_READ_ONLY`（`CREATE`なし）＋`PRAGMA query_only`。書き込みはSQLiteが拒否し、無いDBを作ることもない。
 - **スキーマの作成・移行をしない。** それは当面Python（`store.py:db`）の仕事。Rustは`REQUIRED_SCHEMA`（`photos`の25列、`photo_quality`、`photo_ai_groups`、`photo_ai_group_members`のうちP1の読み取りが使う列。T1.4で`photo_quality_features`・`photo_ai_features`・`photo_loc_clues`・`photo_loc_runs`・`photo_loc_suggestions`・`settings`を足した）がそろっているかを起動時に確かめる。使う列が増えたら、ここに足す。**T1.4 で足した表は Python が起動時に作る**ので、古い版のPythonで止まったままのDBには無く、Rustは起動を断る。**T1.5 の本番コピーでは、これらの表があること（比較用Pythonを一度でも動かしたコピーならある）を先に確かめる。**
@@ -89,7 +97,7 @@ P1でPythonと意図して違える点・既知の差の入口。本文は各節
 - **接続を戻す前の後始末**: 読み取りのあと、トランザクションが開いたままなら`ROLLBACK`する（できなければ接続を捨てる）。開いたまま戻すと、その接続は古いスナップショットを見続け、Python側の`-wal`のチェックポイントも進められず際限なく大きくなる。また、`SQLITE_IOERR`・`SQLITE_CORRUPT`・`SQLITE_NOTADB`など接続の状態が壊れたと見られるエラーが出たときも接続を捨てる（SQLの誤りのような普通のエラーでは戻す）。
 - 読み取りがパニックしたときはその接続を捨て、次の読み取りが開き直す。エラーの文字列は**定型文**（`読み取りがパニックしました`）で、パニックのメッセージ（切り出しに失敗した文字列など値が入りうる）はログに出さない（§3.1）。
 - 新しい依存（プールのcrate）は入れていない。
-- **書き込みを足す構造（P2で取り込み用のwriter、P3で更新API）**: 書き込みは単一の接続を専用スレッドに置き、チャネルで依頼を受ける（現行の「1接続＋グローバルロック」と同じ直列化）。`Catalog`に`writer`を足す形で、`read`のAPIは変えずに済む。P2の索引・取り込みから書き込みが要るので、取り込み用のwriterはP2で追加し、unitの`ReadOnlyPaths`を必要な分だけ解除する。手動修正などの更新APIはP3で足す。P1では作らない。
+- **書き込みを足す構造（P2で取り込み用のwriter、P3で更新API）**: **T2.1で入れた**（[§11.4](#114-writer)）。書き込みは単一の接続を専用スレッドに置き、チャネルで依頼を受ける（現行の「1接続＋グローバルロック」と同じ直列化）。`Catalog`に`writer`を足す形で、`read`のAPIは変えずに済む。P2の索引・取り込みから書き込みが要るので、取り込み用のwriterはP2で追加し、unitの`ReadOnlyPaths`を必要な分だけ解除する。手動修正などの更新APIはP3で足す。P1では作らない。
 
 ### 2.3 Pythonが書き込み中でも読める
 
@@ -102,7 +110,7 @@ DBはWAL（Pythonが`journal_mode=WAL`にし、その状態がDBに残る）な�
 
 | 状況 | 扱い |
 | --- | --- |
-| 起動時: DBが無い・開けない・SQLiteのDBでない | **起動を断る**（終了コード1。ログに`DB を開けません`と、`GEOFRAME_DATA_DIR`を確認する案内） |
+| 起動時: DBが無い・開けない・SQLiteのDBでない | **起動を断る**（終了コード1。ログに`DB を開けません`と、`GEOFRAME_DATA_DIR`を確認する案内）。**ただし`GEOFRAME_INGEST=1`で「DBが無い」だけは、空のDBを作って起動する**（warnで知らせる。§11.1）。開けない・SQLiteのDBでないは取り込みが有効でも断る |
 | 起動時: 必要なテーブル・列が無い（古い版・別物） | **起動を断る**。ログに足りない`テーブル.列`の名前だけを出す |
 | 起動後: DBが読めなくなった（入れ替え・破損・ディスクエラー） | **プロセスは動かし続け**、`/healthz`が503を返す。ログにwarn |
 
@@ -173,7 +181,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
   - 検証環境の比較用Pythonは別のポート（8090）と別のデータ（`/var/lib/geoframe-pyref`）で動いているので、Rustは drop-in なしで`:8080`を使う。
 - Rustも**`User=geoframe`で動かす**。WALのDBは読み取り専用でも`-shm`・`-wal`を触るので、ファイルの持ち主がPythonの実行ユーザーと違うと、片方が開けなくなる。`StateDirectory=geoframe`は初回起動で持ち主を揃えるが、大きなデータでは時間がかかるので、**配備の前に`chown -R geoframe:geoframe /var/lib/geoframe`を済ませておく**。
   - 検証環境の注意: 比較用Pythonの`derivatives/`は、本番のコピーの`derivatives/`への**ハードリンク**（同じ inode）。コピー側を`chown`すると、モード`0660`のファイルは比較用Pythonの実行ユーザーから読めなくなり、`/derivatives/`が404になる。`chmod o+r`で読めるようにした（出力を比べる意味を保つため）。
-- **P1は読み取り専用**なので、unit に`ReadOnlyPaths=-/var/lib/geoframe/catalog.db`と、`derivatives`・`photos`・`blog_exports`・`travel_blog`を書いて、OSの側でも書き込み不可にした。ディレクトリ自体は書き込み可のまま（WALの`-shm`/`-wal`のため）。検証環境で`geoframe`ユーザーとして`catalog.db`・`derivatives/`への書き込みが`Read-only file system`になり、ディレクトリには書けることを確かめた。**P2で取り込み用の書き込み接続（writer）を追加し、unitの`ReadOnlyPaths`を必要な分だけ解除する。P3で手動修正などの更新APIを追加する。** ファイルのbind mountなので、`catalog.db`を別のinodeに置き換えたら再起動するまで古い方を見続ける（下の「DBファイルの入れ替え」と同じ理由で、復元後は必ず再起動する）。
+- **`ReadOnlyPaths`はT2.1で縮めた**: `photos`・`blog_exports`・`travel_blog`だけを読み取り専用に残し、writerが書く`catalog.db`と`derivatives/`は外した（`-wal`/`-shm`・`tmp/`・`.cache.json`・`.ingest.lock`は元から対象外）。**`GEOFRAME_INGEST`が`0`（既定）の間はwriterが作られないので、外しても何も書かれない**。P1の検証では`catalog.db`・`derivatives/`への書き込みが`Read-only file system`になることを確かめていたが、その防御はT2.1で外した（二重書き込みの防止は`GEOFRAME_INGEST`の既定が担う）。P3で更新APIを足すとき`blog_exports`・`travel_blog`も外す。ファイルのbind mountの注意（`catalog.db`を別のinodeに置き換えたら再起動）は、`catalog.db`を`ReadOnlyPaths`から外したので、unitとしては不要になったが、開いている接続が古いファイルを指し続けることは変わらない（下の「DBファイルの入れ替え」。復元後は必ず再起動する）。
 - **`MemoryDenyWriteExecute=true`を付けた**（Pythonは Pillow のC拡張が実行可能メモリへ書くので付けられない）。musl静的ビルドのRust（tokio・SQLite同梱）は、これを付けても起動・全エンドポイントの応答・スレッド生成が動いた（検証環境）。P2で画像処理（`zune-heic`・`image`・`fast_image_resize`）を入れたときに、実際のデコードで再確認する。
 - **`LimitNOFILE=4096`**。同時の接続256＋配信中のファイル32＋SQLite（読み取り5接続と`-wal`/`-shm`）＋標準入出力で300前後を使う（§9.3）ので、systemdの既定（1024）でも足りるが、余裕を持たせた。1024未満にするなら`limits.rs`の`MAX_CONNECTIONS`・`STATIC_FILE_SLOTS`もあわせて見直す。
 - **P5で、`app/.env`にだけある`GEOFRAME_*`を`/etc/default/geoframe`と突き合わせる**。Rustは`app/.env`を読まない（§1.3）ので、`.env`にしか書かれていない値は、移すか、捨てる判断をする。
@@ -453,3 +461,123 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 - `crates/geoframe/tests/admin_api.rs`: 同じDBを作り直してRustのサーバーに同じリクエストを流し、`serde_json::Value`として完全一致を確かめる。比べない値は`disk`と`server_time`だけで、形・数え方・キャッシュを別に検査する。そのほか、`per`の上限（205枚）、並び（NULL・空文字・同時刻はid）、ヘッダ、`HEAD`/`POST`の403、未実装の503、DBが壊れたとき・順番待ちが超えたときの503、`status`の`disk`の数え方（リンク）。
 - `pyquery.rs`の単体テストの期待値は、Pythonの`parse_qs`・`int()`で確かめたもの（開発時に、ランダムな入力5万件で突き合わせて差が無いことを確認した。コミットしていない）。
 - 手元での確認: musl静的ビルドの`file`は`static-pie linked`、`ldd`は`statically linked`のまま。
+
+## 11. 書き込みの土台（P2 / T2.1）
+
+取り込み（P2）が`catalog.db`へ書くための土台。P1までは読み取り専用だった。実装は`writer.rs`（書き込み接続）、`schema.rs`（スキーマの作成・移行）、`sync.rs`（同期サイクルの骨組み）、`ingest.rs`（起動処理・`sync`の本体）、`cache.rs`（`.cache.json`）、`net.rs`・`jwt.rs`（外向きHTTPSとJWT。[build.md §7](build.md)）。段の中身（索引・位置推定・地名・derivative・品質）はT2.2〜T2.6で入れる。
+
+### 11.1 取り込みを有効にする（`GEOFRAME_INGEST`）
+
+**既定は無効（`0`）。`1`のときだけ、書き込み接続・スキーマの作成と移行・同期サイクル・起動時の掃除が動く。**
+
+| `GEOFRAME_INGEST` | `serve`の動き |
+| --- | --- |
+| `0`（未設定・空も同じ） | P1と同じ。**DBに一切書かない**（writerを作らない・移行しない・サイクルを回さない・`tmp/`も作らない）。DBが無ければ起動を断る。起動ログに`取り込みは無効です`と`ingest=0`を出す |
+| `1` | 起動時にロック→writerを開く→スキーマの作成・移行→`.cache.json`→`.dl_*`の掃除（§11.6）をしてから、読み取りの層を開く。DBが無ければ**空のDBを新しく作る**（warnで知らせる）。起動直後に同期サイクルを1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと |
+| 上記以外（`true`・`2`など） | 起動を断る（終了コード2。値はメッセージに書かない） |
+
+判断の理由:
+
+- **既定を`0`にした**: P5の切替まで本番の書き手はPython（`geoframe-server`）で、本番の`/etc/default/geoframe`をそのままRustの起動に使っても二重に書かない設計にするため。PythonがDBを開いたまま、Rustが移行や`UPDATE`を行うと、一次データ（手動GPS・お気に入り）を壊しうる。書くには明示（`GEOFRAME_INGEST=1`）が要る。既定の見直しはP5の切替のとき（本番の設定に`1`を足す）。
+- **空のDBを作る**（P1の「DBが無いと起動を断る」の例外）: 取り込みが有効ならRustが書き手なので、Pythonの`db()`と同じくDBを作る。無効のときは今までどおり断る（配備の誤りを失敗として見せる）。誤って空のDBを静かに作らないよう、作ったときはwarnを出す。データ置き場のディレクトリも無ければ作る（Pythonの`mkdir(parents=True)`と同じ）。
+- **二重起動のロック**: `DATA_DIR/.ingest.lock`を排他で取る（`File::try_lock`）。`serve`が取り込み中に`sync`（実行）を起動する、といった**Rust同士の二重書き込み**は断る（終了コード1）。**Pythonとの二重書き込みは防げない**（Pythonはこのロックを見ない）ので、Pythonが書いている間は`1`にしない。ドットファイルなので静的配信は403を返す。`--dry-run`はロックを取らず、動いている最中でも見られる。
+
+### 11.2 設定
+
+| 変数 | 既定 | 解釈 | 棚卸しとの対応 |
+| --- | --- | --- | --- |
+| `GEOFRAME_INGEST`（Rustだけ） | `0` | `0`／`1`だけ（他は起動を断る）。空文字は未設定 | [inventory.md §3.1](inventory.md) B0・B1（起動時の準備と同期サイクル）を動かすか。Pythonには無い |
+| `GEOFRAME_DRIVE_POLL_MIN` | `10` | 分。小数も可（`0.5`は30秒）。Pythonは`float()`で秒に換算。**Rustは0以下・非有限・上限（525600分＝1年）超を起動の断りにする**（Pythonは0以下で空回りか例外） | [inventory.md §4.1](inventory.md)の`GEOFRAME_DRIVE_POLL_MIN`（P2・引き継ぐ） |
+
+`GEOFRAME_DRIVE_POLL_MIN`は`UNSUPPORTED_ENV`から`SUPPORTED_ENV`へ移した。`GEOFRAME_INGEST`は`GEOFRAME_LOG`と同じRustだけの項目なので`docs/reference/configuration.md`（Pythonの`config.py`から生成）には無く、どちらの一覧にも載せない。`GEOFRAME_PHOTOS_DIR`・`GEOFRAME_DRIVE_KEY`・`GEOFRAME_DRIVE_FOLDER`・`GEOFRAME_FETCH_PER_CYCLE`・`GEOFRAME_QUALITY_PER_CYCLE`・`GEOFRAME_INFER_OFFSET_MIN`は、段の中身を入れるT2.2〜T2.6で読み始める。
+
+### 11.3 同期サイクルの骨組み
+
+現行の`catalog.py:cycle()`の順に、**段（`Stage`）を並べた**もの。段は`index_local`→`index_drive`→`infer`→`enrich`→`local_derivatives`→`fetch_derivatives`→`quality`。T2.1の段は何もしない（`Placeholder`）。
+
+- **起動直後に1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと**。専用のstdスレッド`sync-worker`で動き、HTTPサーバーの起動を待たせない。SIGTERMで`StopFlag`を立て、待ちの最中ならすぐ、サイクルの最中なら今の段が終わってから止まる（最大10秒待ち、超えたらそのまま終了する。途中で止まってもDBはトランザクション単位なので壊れず、`.dl_*`の残骸は次回の起動で消す）。
+- **段ごとに失敗を隔離する**: 段が`Err`を返しても、パニックしても、残りの段と次の周期へ進む。ログに出すのは段の名前と失敗の種類だけ（`StageError`はDB・I/Oの種類と定型文しか持たない。パニックのメッセージは出さず、場所だけをpanic hookが出す）。Pythonの`index_drive`段の「Drive認証に失敗したらDBの段だけ飛ばす」は、段が`Skipped(理由)`を返す形で表す（T2.4）。
+- **ログは件数だけ**: 段ごとの件数（`added=3`のような固定の名前と数）と、サイクル末尾の`表示可能／取得待ち／全`（Pythonの`[cycle]`行と同じ集計）。
+- **サイクルの前に、そのサイクル用の読み取り専用の接続を開く**（開けなければ次の周期へ持ち越す）。段は読むときは`ctx.read`、書くときは`ctx.writer()`（writer）を使う。
+
+#### `--dry-run`
+
+`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。出すもの:
+
+```
+dry-run: 何も書きません（DB・ファイル・キャッシュ）
+スキーマ: 作る表・索引 N / 足す列 N / place を NULL に戻す あり|なし / embedding の写し N
+掃除: 消す .dl_* N 件 / 捨てる .cache.json の旧キー N 件
+段 <名前>: 完了 <件数>|省略（理由）|失敗: …
+写真: 表示可能 N / 取得待ち N / 全N
+```
+
+P2の受入（取り込み済みの本番コピーに対して、行の変更・derivativeの再取得がほぼ0）は、段の中身が入ったあと、この`--dry-run`で確かめる。DBが無ければ作らずに終了コード1で終わる。`tests/ingest_cli.rs`が、DB・`.cache.json`・`tmp/`・`derivatives/`のバイト列が変わらず、`.ingest.lock`も作られないことを確かめる。
+
+#### `geoframe sync`（実行）
+
+同期サイクルを1回だけ動かして終わる（棚卸し §5 の「手動トリガー」）。`GEOFRAME_INGEST=1`が要り、無ければ終了コード2で断る。ロック・writer・移行・掃除は`serve`と同じ（§11.1）。終了コードは、失敗した段があれば1、なければ0。
+
+### 11.4 writer
+
+`writer.rs`の`Writer`。**単一の読み書き接続を専用スレッド`db-writer`に置き、チャネルで依頼を受ける**（Pythonの「1接続＋グローバルロック」と同じ直列化を、ロックではなく所有で表す）。
+
+- `Catalog::with_writer`・`Catalog::writer()`で`Catalog`が持つ（取り込みが無効なら`None`）。読み取り側（`Catalog::read`・プール）は変えていない。
+- `writer.call(|conn| …)`は呼び出しスレッドをブロックして、依頼を書き込みスレッドで実行し、結果を返す。tokioのworkerから呼ぶ（P3の更新API）ときは`spawn_blocking`に包む。
+- 依頼が終わったとき、トランザクションが開いたままなら`ROLLBACK`する。依頼がパニックしても接続は生きたまま（`ROLLBACK`して`WriteError::Task`を返す）。
+- `busy_timeout`は10秒、WAL。`WriteError`の文言はSQLiteのメッセージ（表名・列名まで）と定型文だけで、SQL・値・パスは入れない（テストで確認）。
+
+### 11.5 `.cache.json`
+
+`cache.rs`。仕様は[inventory.md §3.2](inventory.md)・B0・B7のとおり。
+
+- 起動時に読み（無い・壊れている・オブジェクトでないときは空から）、`geo:`・`geocode_osm:`・`muni_table`以外のキーを捨てる。捨てたものがあれば**即保存**する。
+- 変更があり、前回の保存から60秒以上たっているときだけ書く（10秒ごとに起きる`cache-saver`スレッド）。一時ファイル`.cache.json.tmp`に書いて`fsync`し、`rename`で差し替える（Pythonは`fsync`しない）。失敗したら次のtickで再試行する。停止時にも最後の保存をする（Pythonはしない）。
+- 値は`serde_json::Value`のまま持つので、`geo:`の中身は往復で欠けない。書き出しはPythonの`json.dumps(ensure_ascii=False, indent=1)`と同じ形（インデント1、日本語はそのまま）。**違いはキーの並びだけ**: Rustは辞書順、Pythonは挿入順（§0の索引）。どちらが書いたファイルも、もう一方が読める。
+- 座標を3桁に丸めた値がキーに入るので、ログには件数しか出さない。テストは合成の値だけ。
+
+### 11.6 起動時の掃除
+
+`ingest::prepare_tmp_dir`（`drive.py:prepare_tmp_dir`と同じ）。`DATA_DIR/tmp/`を用意し、`tmp/`と`derivatives/`の`.dl_*`を消す。フル解像度・EXIF完全保持のDrive原本が残らないようにするため。消すのは**通常のファイルだけ**（ディレクトリ・シンボリックリンクは触らない。消せないものは無視）。名前はログに出さず、件数だけ（`[fetch] 一時ダウンロードの残骸を…`）。`tile_cache_prune`（B4）はP3。
+
+### 11.7 スキーマ（`schema.rs`）
+
+[inventory.md §2.4](inventory.md)のM0〜M7を、Pythonの`store.py:db()`と同じ結果になるように行う。要点:
+
+- **空のDBから作る**: `photos`の定義に`muni_cd pref city favorite hidden rotation`を最初から含める。`sqlite_master.sql`の文字列まで、Pythonが空のデータ置き場から作ったDB（`ALTER`で列が足された形）と一致する。テスト`fresh_database_matches_the_python_one`が、`tools/gen_schema_fixture.py`の出力（`tests/fixtures/schema-python.json`）と、`sqlite_master`の全行・各表の`table_xinfo`・索引を比べる。Pythonの`SCHEMA`を変えたらこのテストが落ちる（再生成は`python3 tools/gen_schema_fixture.py`、`--check`で差を検査）。
+- **既存のDB（本番相当）では何もしない**: 列は`PRAGMA table_info`で有無を見て、無い列だけを`ALTER`する（Pythonは`ALTER`の失敗をすべて握りつぶすが、Rustはロックなどの本当の失敗を返す）。**M1（`UPDATE photos SET place=NULL`）は`muni_cd pref city`のどれかを足したときだけ**起きる。列が既にあるDBでは決して起きない。テスト`migration_is_a_no_op_on_a_production_shaped_database`が、Pythonの形のDBで、構造・`place IS NULL`の件数・`schema_version`・`total_changes()`・ファイルのバイト列が変わらないこと、`pending`（`--dry-run`）も何もないと答えることを示す。旧形のDBでは列を足して`place`を戻すこと（`migration_from_the_old_shape_adds_columns_and_resets_places_once`）、M2の列だけが無いDBでは戻さないこと（`adding_the_flag_columns_alone_does_not_reset_places`）も試験する。
+- **M7（`photo_embeddings`への`INSERT OR IGNORE`）はPythonと同じく毎起動**行う。行が無ければ書き込みは起きない（`total_changes()`が増えない）。`--dry-run`は挿入されるはずの行数を数える。
+- 全体を`BEGIN IMMEDIATE`の1トランザクションに入れる（Pythonは途中で落ちると中途半端に移行されうる）。`journal_mode=WAL`はトランザクションの外。
+- 列の**並び**は移行で変えない（本番のDBは`infer_dt_s`が末尾など、空のDBと並びが違いうる）。読み取りの層は列名で読むので影響しない。
+
+### 11.8 unit
+
+[`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)の`ReadOnlyPaths`から`catalog.db`と`derivatives`を外した（§6）。`MemoryDenyWriteExecute=true`は、HTTPS（rustls・ring）を入れたあとも付けたまま動くかを検証環境のsystemd配下で確かめる（§11.9）。
+
+### 11.9 テスト
+
+合成のDB・`.cache.json`・ループバックのスタブのHTTPサーバーだけを使う（実際の通信は検証環境の確認のみ）。
+
+| 対象 | テスト |
+| --- | --- |
+| スキーマ（`schema.rs`） | Pythonの空DBとRustの空DBの`sqlite_master`・`table_xinfo`・索引の一致、本番相当のスキーマで何もしない（構造・`place`・`schema_version`・`total_changes()`・ファイルのバイト列）、旧形の移行、M2の列だけが無いときの`place`、M7、`pending`（読み取り専用の接続で動く） |
+| writer（`writer.rs`） | 同じスレッド・同じ接続、並行する呼び出しの直列化、開いたトランザクションの`ROLLBACK`、失敗とパニックのあとも使えること、エラー文言に値・SQLが入らないこと、DBを作る・作らない、全ての`Writer`を落としたときの接続の終了 |
+| 同期サイクル（`sync.rs`） | 段の順、失敗・パニックの隔離、dry-runで`writer`が無いこと、停止の合図、起動直後に1回＋周期ごとの繰り返し、段がパニックしてもスレッドが続くこと |
+| `.cache.json`（`cache.rs`） | Pythonの`json.dumps(indent=1, ensure_ascii=False)`と同じ出力、旧キーの破棄と即保存、60秒の間引き、失敗時の再試行、凍結、保存スレッド |
+| 起動処理（`ingest.rs`） | `.dl_*`の掃除（通常ファイルだけ。リンク・ディレクトリは触らない）、DBの作成、ロック、再起動で何も変わらないこと、`plan`が書かないこと |
+| バイナリ（`tests/ingest_cli.rs`） | `sync --dry-run`が本番相当のDB・`.cache.json`・`tmp/`・`derivatives/`のバイト列を変えず`.ingest.lock`も作らないこと、DBが無ければ作らないこと、`GEOFRAME_INGEST`が無いと`sync`も`serve`も書かないこと、`serve`が取り込みつきで起動してSIGTERMで正常終了すること、二重起動の拒否 |
+| JWT・HTTPS（`jwt.rs`・`net.rs`） | [build.md §7](build.md) |
+
+### 11.10 検証環境での確認（2026-10-24）
+
+n100でビルドしたmusl静的バイナリ（`static-pie linked`、`ldd`は`statically linked`）を`deploy/rust-deploy.sh`で検証環境へ配布して確かめた（検証環境の印とPython版の非稼働の確認を通った）。検証環境の`catalog.db`は本番の2026-10-24 06:17のバックアップのコピー（6,535行）。**書き換える前に、検証環境の中で`sqlite3 .backup`のコピーを取った**。
+
+| 確認 | 結果 |
+| --- | --- |
+| (a) 外向きHTTPS | `geoframe selfcheck-net`が地理院へ**成功**（名前解決・TLS・HTTP 200・JSON）。unitと同じ`NoNewPrivileges`・`ProtectSystem=strict`・`ProtectHome`・`PrivateTmp`・`SystemCallFilter=@system-service`・`MemoryDenyWriteExecute=true`を`systemd-run`で与えて`geoframe`ユーザーで実行しても成功（rustls・ringを入れても`MemoryDenyWriteExecute`のまま動く） |
+| (b) 移行が何もしない | `GEOFRAME_INGEST=1`（drop-in）で起動し直したところ、ログは`[db] スキーマは最新です`。**`sqlite3 .dump`のSHA-256が配布前のコピーと一致**、`.schema`も一致、`schema_version`も同じ、`photos`は6,535行のまま、`place IS NULL`は**1,173行のまま**。再起動をもう一度しても、`geoframe sync`（実行）を止めた状態で1回動かしても同じ。取り込み中の`serve`に対して`sync`を起動すると断られる（終了コード1） |
+| (c) `--dry-run` | 本番コピーに対して、`スキーマ: 作る表・索引 0 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0`、`掃除: 消す .dl_* 0 件 / 捨てる .cache.json の旧キー 0 件`、全7段が`完了（件数なし）`、`写真: 表示可能 5288 / 取得待ち 0 / 全6535`。`geoframe`ユーザーで実行した（取り込み中の`serve`と同時に動かせることは`tests/ingest_cli.rs`で確かめた） |
+| (d) 応答がP1と変わらない | `tools/compare_with_python.py`（比較用Python :8090と全件比較）が、取り込み無効の配布直後と`GEOFRAME_INGEST=1`のときの**両方で、想定外の差0項目**（写真一覧3,065件のJSON完全一致・並びも一致、管理画面の読み取りAPI 222通り、`/derivatives/`のバイト一致3,065件ほか） |
+| 後片付け | drop-inを外して取り込み無効（既定）に戻した。`.ingest.lock`・`tmp/`が検証環境のデータ置き場に残る。配布前のコピーは`/var/lib/geoframe-backup-t21/`に残してある |
+
+本番コピーでは、取り込み済みの6,535行すべてが`source='drive'`で、段の中身がまだ無いので、サイクルは件数を数えるだけ。行の変更・derivativeの再取得が0であること（P2の受入）は、T2.3〜T2.6で段の中身を入れたあと、同じ`--dry-run`で確かめる。
