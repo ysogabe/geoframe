@@ -2,7 +2,7 @@
 
 - 日時: 2026-10-25に実施
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）/ 計画: [plan.md](plan.md) §4 P2 / タスク: [tasks.md](tasks.md) T2.7 / 前フェーズの記録: [p1-acceptance.md](p1-acceptance.md)
-- 対象のソース: コミット`35d677d`（T2.5の「時間切れの行を記憶しない」テストの補強。実装は`T2.6`まで無変更。この記録とテストの補強以外にコードの変更は無い）
+- 対象のソース: コミット`35d677d`の実装（T2.5の「時間切れの行を記憶しない」テストの補強を含む。`crates/`の実装部分は`T2.6`から無変更）。比較用の合成の写真の生成スクリプト`tools/gen_acceptance_photos.py`とこの記録は、この記録を含むコミット
 - バイナリ: `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`（`static-pie linked`、16,564,016 B、sha256 `a1fdee065aab9498…`）。`deploy/rust-deploy.sh`で配布（検査・転送・入れ替え・確認OK）
 - 検証環境（lxc-geoframe。Ubuntu 24.04、2コア、メモリ4GiB）。本番機ではない。接続先の値はGit管理外のメモにあり、ここには書かない。本番機（geoframe-server）・本番の`/var/lib/geoframe`・miharashiの本番プロセスには触れていない
 - **写真の値・ファイル名・位置・地名・撮影日時は書かない。件数・ハッシュの先頭・合否だけ**（合成の写真は公開の代表点と架空の時刻。実写真ではない）
@@ -69,7 +69,7 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 | 2サイクル目（Rust） | `added=0 updated=0`、`inferred=0`、`enrich candidates=0`、`made=0`、`quality pending=0`。変更0 |
 | **`photos`のローカル行** | 15行（追加分を足して21行）・パスの集合が一致。**全26列（`id`・`path name mtime taken_at lat lon loc_source place elev muni_cd pref city display inferred_from infer_dt_s`ほか）の不一致0**。`indexed_at`・`fetched_at`は値でなく形式（数字を9に置いた形）まで一致 |
 | Driveの6,535行 | 両方とも変化なし（実行時刻を除いて一致） |
-| 位置の推定 | 推定された行は両方とも同じ。バケットは±15分・±2時間・±12時間が1行ずつ以上（窓どおり）。合成の写真から9日後の1枚は、本番コピーの既存の写真が60秒の差にあったので（`infer_dt_s=60`）、両方とも**その既存の写真から**推定された。時刻なしの1枚は両方とも推定されない |
+| 位置の推定 | 推定された行は両方とも同じ。バケットは±15分・±2時間・±12時間が1行ずつ以上（窓どおり）。合成の写真から遠い1枚は、本番コピーの既存の写真が窓の内側にあったので、両方とも**その既存の写真を錨に**推定された（値は書かない）。時刻なしの1枚は両方とも推定されない時刻なしの1枚は両方とも推定されない |
 | 地名 | 国内の行は同じ地名の列が付き、国外の1枚は両方とも空で確定。時刻なしの行は`place`がNULLのまま |
 | **`photo_quality`のローカル行** | 21行時点で8行・`kind`（`exact`/`similar`）・順位・推奨が一致 |
 | `photo_quality`の全体 | 行数567・グループ数247・`kind`の内訳（`exact` 189・`similar` 378）が一致。`photo_id`ごとの全列（`group_id`・順位・`recommended`・`score`・`reasons_json`・`issues_json`を含む。実装の印の`algorithm`と`analyzed_at`は除く）の不一致0 |
