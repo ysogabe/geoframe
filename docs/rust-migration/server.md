@@ -35,8 +35,8 @@ P1・P2（T2.1〜T2.4）でPythonと意図して違える点・既知の差の�
 | **書きかけの`derivatives/*.part`を起動時に消す（T2.3）**: `GEOFRAME_INGEST=1`のガードとロックのあと、`.dl_*`の掃除と同じ時点で、`derivatives/`**直下の通常ファイルで名前が`.part`で終わり、安全な名前**のものを消す。リンクは消さず辿らない。`derivatives`自体がリンクなら何もしない。件数だけをログに出す（`--dry-run`にも出る）。Pythonには掃除が無い | SIGKILL・電源断で残る`<名前>.<pid>.<乱数>.part`は名前に乱数があるので上書きされず容量を食い続ける | 取り込みの起動時 | 単体テスト、検証環境 | なし（決定） | [§13.5](#135-書きかけの-part-の掃除) |
 | **`.dl_*`の掃除は、`tmp/`・`derivatives/`がシンボリックリンク（など通常のディレクトリでないもの）なら飛ばす（T2.3）**: 列挙の前に`symlink_metadata`で見る。飛ばした数だけを警告ログに出し（パスは出さない）、`--dry-run`にも「掃除を飛ばす」として出る。無い場合（写真を置く前の`derivatives/`）は飛ばした数に入れない。`.part`の掃除の`derivatives/`の検査も同じ関数 | Pythonの`prepare_tmp_dir`は`is_dir()`でリンクを辿り、リンク先の`.dl_*`を消す。外へのリンクだと関係のない場所のファイルを消すので、Rustは辿らない | 取り込みの起動時 | 単体テスト（`tmp/`・`derivatives/`の両方）、検証環境 | なし（決定） | [§13.14](#1314-再々レビュー2026-10-24の指摘への対応) |
 | **Driveの認証（T2.4）**: ①トークンの交換先は定数`https://oauth2.googleapis.com/token`で、鍵JSONの`token_uri`は読まない（google-authはファイルの値を使う）。②`GEOFRAME_DRIVE_KEY`の相対パスは**カレントディレクトリ基準**（Pythonは`app/`基準。Rustに`app/`は無い）。`deploy/geoframe-rs.service`は、Python版のunitと同じ`GEOFRAME_DRIVE_KEY=/var/lib/geoframe/drive_key.json`を与える。③鍵が他のユーザーに読める権限（`& 0o077`）なら警告する（読みはする）。ディレクトリ・FIFO・64 KiB超は鍵として読まない。④鍵が無ければDriveの2段は通信せずに飛ばす（Pythonと同じ）。**鍵が壊れている・トークンを断られた（4xx）も飛ばす**（Pythonは認証エラーをprintして`svc`無しで進む。同じ）が、**Google側の不調（429・5xx）や通信の失敗は段の失敗**（`sync`の終了コード1）として出す | 鍵ファイルで任意のURLへ署名付きのassertionを送らせない。壊れた鍵と一時的な不調を見分ける | `GEOFRAME_DRIVE_KEY`を置いたとき | 単体テスト（スタブがassertionの署名・`iss`・`scope`・`aud`・`exp`を検証する）。検証環境で合成の鍵を実際のGoogleに向けると400で断られ、飛ばす（[§14.10](#1410-検証環境での確認鍵が無い状態2026-10-25)） | なし（決定） | [§14.2](#142-認証) |
-| **`index_drive`（T2.4）**: ①md5が変わった行の更新は、手動で直した位置（`loc_source='manual'`）も`drive_meta`かNULLに**上書きする**（Pythonと同じ。`place elev display fetched_at`はNULL、`rotation=0`。お気に入り・除外・タイトル・`inferred_from`・`infer_dt_s`・`muni_cd pref city`は残る。古いderivativeのファイルは消さない）。②**一覧が0件で、Driveの行が残っているときは、削除しない**（共有を外した・フォルダの取り違えでもDriveは空の一覧を成功として返し、Pythonは全行を消す。お気に入りや手動の位置まで失う）。③一覧は**全ページが取れたときだけ**計画を作る（途中で失敗したら追加も削除もしない。Pythonも例外で同じ）。④書き込みは1つのトランザクション（Pythonは1文ごとのコミット）。⑤消すderivativeの名前は`derivatives/<安全な名前>`だけ（Pythonは`DATA_DIR / display`を無検査で消す）。⑥`name`の無いファイルは索引に入れず（Pythonは途中で例外）、行は残す。`id`の無いファイルは一覧の失敗（Pythonも例外）。⑦フォルダ名の`'`・`\`はエスケープして検索する（Pythonは検索式が壊れてHTTP 400）。⑧再試行（429・5xx・流量制限の403）と応答の大きさの上限を付ける | ①は現行の挙動（直すかは**P3で決める**。[inventory.md §2.3](inventory.md)）。②〜⑧は安全側 | Driveに写真があるとき | 単体テスト＋`drive-index-python.json`（偽のDriveに流したPythonの`index_drive`と、`photos`の全列・`id`・Driveへの問い合わせ・追加/削除の件数が一致。②は意図した差として別に確かめる） | ①は**P3で直すか決める**。他は決定 | [§14.4](#144-index_drive) |
-| **`fetch_derivatives`（T2.4）**: ①原本の一時ファイル`tmp/.dl_<drive_id>`は`create_new`＋`O_NOFOLLOW`＋権限0600で作り、既にある名前（リンクを含む）は辿らず・消さず、その写真の失敗にする（Pythonは`"wb"`で上書き）。②ダウンロードは512 MiBまで・1枚15分まで（Pythonは上限なし）。③取得待ちは`ORDER BY taken_at, id`（Pythonは`taken_at`のみ。実際のSQLiteは同じ並びになる）。④**失敗が続く写真を飛ばす**（受入条件②。[§14.6](#146-失敗が続く写真が枠を塞がない受入条件)）。⑤通信や認証の不調（接続できない・429・5xx）は、写真のせいではないので段を中断して失敗にし、失敗の記録は付けない。⑥ログ・件数にファイル名を出さない（Pythonは名前を出す）。失敗は写真の`id`と固定の語だけ。成功・失敗の件数は形式別・失敗の種類別（`ok_jpeg`・`fail_decode_heic`など）。⑦`--dry-run`は一覧を読む以外の通信をせず、取得するはずの件数だけ出す | 原本（GPS・機種情報つき）を残さない・リンクで外を書き換えさせない・枠を塞がせない | 取得待ちがあるとき | 単体テスト（スタブ。原本が成功・失敗・パニックのどれでも残らない、リンクを辿らない、先頭の枠より多い失敗があっても後続が取得される）、`drive-index-python.json`（偽のDriveに流したPythonの`fetch_derivatives`と、最初のサイクルが同じ写真を同じ順に試し、同じ行・同じ寸法になる） | なし（決定） | [§14.5](#145-fetch_derivatives) |
+| **`index_drive`（T2.4）**: ①md5が変わった行の更新は、手動で直した位置（`loc_source='manual'`）も`drive_meta`かNULLに**上書きする**（Pythonと同じ。`place elev display fetched_at`はNULL、`rotation=0`。お気に入り・除外・タイトル・`inferred_from`・`infer_dt_s`・`muni_cd pref city`は残る。古いderivativeのファイルは消さない）。②**一覧が0件で、Driveの行が残っているときは、削除しない**（共有を外した・フォルダの取り違えでもDriveは空の一覧を成功として返し、Pythonは全行を消す。お気に入りや手動の位置まで失う）。**0件以外でも、消す件数が50件を超え、かつDriveの行の20%を超えるときは、削除だけを保留する**（`mass_delete_withheld`に数えて警告する。6,535件から1件だけ見える一覧のような取り違えを止める。追加・更新は通常どおり）。どちらの保留も、**`geoframe sync --allow-mass-delete`を付けた1回だけ**外れる（環境変数・設定・unitでは外せず、`serve`の定期実行は常に保留する。`--dry-run`にも付けられ、外した場合の件数が見える。Pythonは無条件に全部消す）。③一覧は**全ページが取れたときだけ**計画を作る（途中で失敗したら追加も削除もしない。Pythonも例外で同じ）。④書き込みは1つのトランザクション（Pythonは1文ごとのコミット）。⑤消すderivativeの名前は`derivatives/<安全な名前>`だけ（Pythonは`DATA_DIR / display`を無検査で消す）。⑥`name`の無いファイルは索引に入れず（Pythonは途中で例外）、行は残す。`id`の無いファイルは一覧の失敗（Pythonも例外）。⑦フォルダ名の`'`・`\`はエスケープして検索する（Pythonは検索式が壊れてHTTP 400）。⑧再試行（429・5xx・流量制限の403）と応答の大きさの上限を付ける | ①は現行の挙動（直すかは**P3で決める**。[inventory.md §2.3](inventory.md)）。②〜⑧は安全側 | Driveに写真があるとき | 単体テスト＋`drive-index-python.json`（偽のDriveに流したPythonの`index_drive`と、`photos`の全列・`id`・Driveへの問い合わせ・追加/削除の件数が一致。②は意図した差として別に確かめる）。保留の閾値の前後（50件ちょうど・51件、割合がちょうど20%・それを超える）・1件だけ残る一覧・フラグで外れる・`--dry-run`の件数は`a_listing_that_would_delete_most_rows_holds_the_deletes_back`など | ①は**P3で直すか決める**。他は決定 | [§14.4](#144-index_drive) |
+| **`fetch_derivatives`（T2.4）**: ①原本の一時ファイル`tmp/.dl_<drive_id>`は`create_new`＋`O_NOFOLLOW`＋権限0600で作り、既にある名前（リンクを含む）は辿らず・消さず、その写真の失敗にする（Pythonは`"wb"`で上書き）。②ダウンロードは512 MiBまで・1枚15分まで（Pythonは上限なし）。③取得待ちは`ORDER BY taken_at, id`（Pythonは`taken_at`のみ。実際のSQLiteは同じ並びになる）。④**失敗が続く写真を飛ばす**（受入条件②。[§14.6](#146-失敗が続く写真が枠を塞がない受入条件)）。⑤通信や認証の不調（接続・名前解決・TLS・応答の待ちの時間切れ・流量制限の403・429・5xx・認証の失敗）は、写真のせいではないので段を中断して失敗にし、失敗の記録は付けない（**本文の受信が1枚15分を超えた**ことだけは、その写真の失敗`fail_slow_download`）。⑥ログ・件数にファイル名を出さない（Pythonは名前を出す）。失敗は写真の`id`と固定の語だけ。成功・失敗の件数は形式別・失敗の種類別（`ok_jpeg`・`fail_decode_heic`など）。⑦`--dry-run`は一覧を読む以外の通信をせず、取得するはずの件数だけ出す。⑧**原本は通常の終了経路（成功・写真の失敗）で明示的に消して結果を確かめ**、消せなかったら`original_remove_failed`の件数と固定の文言の警告で報告する（Rustの`Drop`は早期`return`・パニックの補助で、結果は捨てる。通常の経路では消えたことを確かめて、報告する） | 原本（GPS・機種情報つき）を残さない・リンクで外を書き換えさせない・枠を塞がせない | 取得待ちがあるとき | 単体テスト（スタブ。原本が成功・失敗・パニックのどれでも残らない、リンクを辿らない、先頭の枠より多い失敗があっても後続が取得される、障害中に試した写真が復旧した次のサイクルで待たずに取得される、原本を消せなかったことが件数に出る）、`drive-index-python.json`（偽のDriveに流したPythonの`fetch_derivatives`と、最初のサイクルが同じ写真を同じ順に試し、同じ行・同じ寸法になる） | なし（決定） | [§14.5](#145-fetch_derivatives) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)。
 
@@ -1055,9 +1055,9 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 ### 14.3 通信
 
 - クライアントは`ureq`（同期。T2.1）。一覧・トークンの応答は16 MiBまで（1ページ1000件で数百KB）。要求の時間は`net::agent()`の30秒、**原本のダウンロードは1枚15分まで**（要求ごとに延ばす）。
-- **再試行**: 429・5xx・Driveが返す流量制限の403（本文に`rateLimitExceeded`・`userRateLimitExceeded`。本文は16 KiBまで読んで捨てる）は、`Retry-After`（秒。あれば）か指数バックオフ（1・2・4・8秒、1回の待ちは30秒まで）で、最大4回再試行する。待ちの最中も停止の合図を見る（合図が来たらすぐ中断）。権限の403・404などは再試行しない。再試行を使い切ったら`DriveError::Status`。
+- **再試行**: 429・5xx・Driveが返す流量制限の403（本文に`rateLimitExceeded`・`userRateLimitExceeded`。本文は16 KiBまで読んで捨てる）は、`Retry-After`（秒。あれば）か指数バックオフ（1・2・4・8秒、1回の待ちは30秒まで）で、最大4回再試行する。待ちの最中も停止の合図を見る（合図が来たらすぐ中断）。権限の403・404などは再試行しない。再試行を使い切ったら`DriveError::Status`。**流量制限の403だけは、使い切ったあとも理由を保って`DriveError::RateLimited`にする**（`Status(403)`にすると権限の不足と見分けがつかず、写真の失敗に数えられる）。
 - 一覧のページ送りは最大2000ページ。**同じ`nextPageToken`が続く**・`files`が配列でない・`nextPageToken`が文字列でない・`id`の無い画像は、一覧の失敗（途中まで取れた分は捨てる）。
-- ダウンロードは`Content-Length`が上限（512 MiB）を超えれば読む前に断り、無くても読みながら数えて超えたら止める（書き込んだ分は呼び出し側が消す）。本文を読む途中の切断・時間切れは`ureq`のエラーを種類に直す。
+- ダウンロードは`Content-Length`が上限（512 MiB）を超えれば読む前に断り、無くても読みながら数えて超えたら止める（書き込んだ分は呼び出し側が消す）。本文を読む途中の切断は`ureq`のエラーを種類に直し（`connect`など。通信の障害）、**本文の受信の時間切れは`DriveError::BodyTimeout`**（その写真が遅いだけ。要求を送って応答の頭を受けるまでの時間切れ`Net(timeout)`とは別。後者は障害）にする。
 
 ### 14.4 `index_drive`
 
@@ -1066,36 +1066,37 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 - **一覧の順を保つ**: Pythonは`remote`（dict）の挿入順に`INSERT`するので、新しい行の`id`は一覧の順に振られる。同じIDが2回来たら、位置は最初、値は最後（dictの代入と同じ）。
 - **追加**: `drive_id`の行が無いとき。`source='drive'`・`name`・`md5`（`md5Checksum`。無ければNULL）・`taken_at`（`imageMediaMetadata.time`を[`norm_time`](#123-exif撮影時刻gps向き)に通す。無い・合わなければ**空文字**）・`lat`/`lon`（`location.latitude`/`longitude`。**独立に取る**ので、緯度だけあれば`lat`あり・`lon`NULL）・`loc_source`（`lat`があれば`drive_meta`、無ければNULL）・`indexed_at`（`YYYY-MM-DDTHH:MM:SS`。計画の後に1回作って全行に使う）。
 - **更新**: `drive_id`の行があって`md5`が違うとき（`NULL`同士は同じ）。`name md5 taken_at lat lon loc_source`を上書きし、`place elev display fetched_at`をNULL、`rotation=0`、`indexed_at`を更新する。**手動の位置も上書きされる**（Pythonと同じ。§0。直すかは**P3で決める**）。`md5`が同じなら何もしない（`name`が変わっていても）。`favorite hidden title inferred_from infer_dt_s muni_cd pref city`は触らない。古いderivativeのファイルは消さない（次の取得が上書きする。回転済みの別名は残る。Pythonと同じ）。
-- **削除**: `source='drive'`の行で、一覧に無いもの（`drive_id`がNULLの行も）。確定したあとに`display`のderivativeも消す（`derivatives/<安全な名前>`だけ。§13.2の5と同じ関数`remove_derivatives`）。**一覧が0件でDriveの行が残っているときは削除しない**（`deletes_withheld`に数えて警告する。§0）。
+- **削除**: `source='drive'`の行で、一覧に無いもの（`drive_id`がNULLの行も）。確定したあとに`display`のderivativeも消す（`derivatives/<安全な名前>`だけ。§13.2の5と同じ関数`remove_derivatives`）。**一覧が0件でDriveの行が残っているときは削除しない**（`deletes_withheld`に数えて警告する。§0）。**0件でなくても、消す件数が50件（`MASS_DELETE_MIN`）を超え、かつ計画を作った時点のDriveの行（`source='drive'`）の20%（`MASS_DELETE_PERCENT`）を超えるときも、削除だけを保留する**（`mass_delete_withheld`に数えて、件数だけの警告を出す。名前は出さない。追加・更新は通常どおり行い、保留の判定は`plan`の中なので`--dry-run`にも同じ件数が出る）。例: 6,535行から1件だけ見える一覧は、6,534件の削除を保留する。値の根拠は、50件以下の入れ替えは普通の運用（Driveで数枚消した）で、手作業で50件以上を一度に消し、かつ2割を超えることは普通ない、という判断。**保留を外すのは`geoframe sync --allow-mass-delete`の1回だけ**（`--dry-run`と併せると、外した場合の件数を見られる）。環境変数・設定・unitで常時外せる形にはせず、`serve`の定期実行は常に保留する（毎サイクル警告が出る）。このフラグは0件の一覧の保留も外す（意図した全削除）。
 - **途中で失敗したら何も変えない**: 全ページが取れてから計画を作る。Pythonも例外で`index_drive`全体が落ちるので同じ。停止の合図も、書く前にだけ効く（§13.2の7と同じ確認点: 一覧の各ページ・書き込みの始め・256件ごと・`COMMIT`の直前。確定前なら`ROLLBACK`して`Skipped`）。
 - 計画（`plan`）と書き込み（`write_plan`）は、実行と`--dry-run`が同じ関数を通る。`--dry-run`は一覧を**読み**（通信する）、計画を§11.3の写しに適用して、後続の段（`fetch_derivatives`）と最後の`写真:`の行に索引後の状態を見せる。
-- 件数: `remote pages added updated removed unchanged malformed deletes_withheld derivative_files_removed derivative_files_unsafe derivative_files_failed`（`malformed`は`name`が無くて索引に入れなかったファイル）。
+- 件数: `remote pages added updated removed unchanged malformed deletes_withheld mass_delete_withheld derivative_files_removed derivative_files_unsafe derivative_files_failed`（`malformed`は`name`が無くて索引に入れなかったファイル）。
 
 ### 14.5 `fetch_derivatives`
 
 `source='drive' AND display IS NULL`の行を`ORDER BY taken_at, id`で、`GEOFRAME_FETCH_PER_CYCLE`枚まで試す。**位置の有無では絞らない**（[inventory.md §6.4](inventory.md)）。1枚ごとに:
 
 1. `imaging::derivative_name(drive_id, rotation)`（IDが`[A-Za-z0-9_-]`でなければここで断る。`rotation`がNULLなら0）と、`DataDir::download_tmp`（`tmp/.dl_<drive_id>`。IDの検査つき）。
-2. **`create_new`＋`O_NOFOLLOW`＋権限0600で作る**（受入条件③）。既にある名前（シンボリックリンク・切れたリンクを含む）は辿らず・消さず、その写真の失敗（`fail_io`）にする。起動時の掃除（§11.6）が消す。**作った直後に、成功・失敗・パニックのどれでも原本を消すガード（`Original`の`Drop`）を置く**。ガードは自分が新規作成に成功したものだけを持つ。
+2. **`create_new`＋`O_NOFOLLOW`＋権限0600で作る**（受入条件③）。既にある名前（シンボリックリンク・切れたリンクを含む）は辿らず・消さず、その写真の失敗（`fail_io`）にする。起動時の掃除（§11.6）が消す。**作った直後に、原本を消すガード（`Original`）を置く**。ガードは自分が新規作成に成功したものだけを持つ。
 3. ダウンロード（§14.3。512 MiBまで）。
 4. `imaging::store_derivative`で`derivatives/<drive_id>[.r<回転>].jpg`を作る（§12。ICCはsRGBへ変換して付けない）。
 5. `UPDATE photos SET display=?, fetched_at=? WHERE id=?`（`fetched_at`は`YYYY-MM-DDTHH:MM:SS`）。1枚ずつ書くので、途中で止まっても進んだ分は残る。
-6. ガードが原本を消す。
+6. **原本を明示的に消し（`Original::remove`。成功・写真の失敗のどちらでも）、結果を確かめる**。消せなかったら`original_remove_failed`に数え、固定の文言と写真の`id`だけの警告を出す（EXIF・GPS付きのファイルが`tmp/`に残っている。次の起動時の掃除で消える）。ガードの`Drop`は、早期`return`・パニック・停止の合図で抜けたときの補助で、まだ消えていなければ消す（結果は捨てる）。
 
 失敗は**写真の失敗**と**段の中断**に分ける。写真の失敗は件数に数え、記録して次へ進む。段の中断（通信の不調）は、残りを試しても同じなので、止めて段の失敗（`sync`の終了コード1）にする。ここまでの件数は失敗の文面に付く。
 
 | 失敗 | 扱い | 件数の名前 |
 | --- | --- | --- |
-| ダウンロードの404・403（権限）・その他の4xx、単一のファイルの時間切れ | 写真の失敗 | `fail_download` |
+| ダウンロードの404・403（権限）・その他の4xx | 写真の失敗 | `fail_download` |
+| 本文の受信が1枚15分を超えた（`BodyTimeout`） | 写真の失敗 | `fail_slow_download` |
 | ダウンロードが上限超え、`ImageError::FileTooLarge` | 写真の失敗 | `fail_too_large` |
 | 一時ファイルの作成・書き込みの失敗（`AlreadyExists`を含む） | 写真の失敗 | `fail_io` |
 | 画像として読めない／BigTIFF／画素数が上限超え | 写真の失敗 | `fail_not_image`／`fail_bigtiff`／`fail_too_many_pixels` |
 | デコードの失敗 | 写真の失敗 | `fail_decode_jpeg`・`fail_decode_png`・`fail_decode_tiff`・`fail_decode_heic`・`fail_decode_other` |
 | JPEGの書き出しの失敗、IDやrotationが不正、`drive_id`がNULL | 写真の失敗 | `fail_encode`・`fail_other` |
-| 接続できない（DNS・接続・TLS）、429・5xxが続く、認証の失敗、**取り直したトークンでも401**（サービスアカウント側の問題） | **段の中断**（写真の失敗に数えない・記録しない） | （失敗の文面） |
+| 接続できない（DNS・接続・TLS）、**接続・応答の待ちの時間切れ**、**流量制限の403が続く**、429・5xxが続く、認証の失敗、**取り直したトークンでも401**（サービスアカウント側の問題） | **段の中断**（写真の失敗に数えない・記録しない） | （失敗の文面） |
 | 停止の合図 | 中断（失敗ではない） | — |
 
-成功は形式別に`ok_jpeg`・`ok_png`・`ok_tiff`・`ok_heic`、ほかに`pending`（取得待ちの総数）・`skipped_backoff`・`attempted`・`fetched`・`icc_dropped`。**件数が0の分類は出さない**（`ok_*`・`fail_*`）。失敗した写真は`warn`で写真の`id`と`ImageError`・`DriveError`の文面（パス・名前・座標を含まない固定の語。HEICは構造の分類つき。§12.4）を出す。
+成功は形式別に`ok_jpeg`・`ok_png`・`ok_tiff`・`ok_heic`、ほかに`pending`（取得待ちの総数。位置の有無で絞らない）・`skipped_backoff`・`attempted`・`fetched`・`icc_dropped`・`original_remove_failed`（原本の削除に失敗した数。0でなければ`tmp/`の権限を確かめる）。**件数が0の分類は出さない**（`ok_*`・`fail_*`）。失敗した写真は`warn`で写真の`id`と`ImageError`・`DriveError`の文面（パス・名前・座標を含まない固定の語。HEICは構造の分類つき。§12.4）を出す。
 
 `--dry-run`: ダウンロードも変換もしない。取得するはずの写真（`planned`）と、使えない写真（`unusable`。IDが不正など）を数え、`pending`・`skipped_backoff`も出す。成功したものとして写しの`display`を埋める（後続の段と`写真:`の行に見せる）。**鍵が無ければ実行と同じく`Skipped`**。
 
@@ -1110,14 +1111,14 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 - キーは`fetch_derivatives`が`(drive_id, md5)`、`local_derivatives`が`(id, mtime)`。**Driveで原本が差し替わる・ローカルのファイルが更新される**（`md5`・`mtime`が変わる）と別のキーになり、**すぐ再び試す**。
 - プロセスが再起動すれば忘れる（もう一度1回ずつ試す。枠の一部を使うだけ）。`--dry-run`は覚えない（実行はしていないので、次の実行に影響させない）。
 - 選び方: `LIMIT`を付けず、`ORDER BY`の順に読み、記録にあるものを飛ばして、`GEOFRAME_FETCH_PER_CYCLE`枚そろったら止める。飛ばした数は`skipped_backoff`。
-- **通信の不調・認証の失敗は写真の失敗に数えない**（記録しない）。ネットワークが落ちている間に全部の写真に待ちが付くと、直ってからも30分以上取得されないため。
+- **通信の不調・認証の失敗は写真の失敗に数えない**（記録しない）。ネットワークが落ちている間に全部の写真に待ちが付くと、直ってからも30分以上取得されないため。数えない障害は、接続・名前解決・TLS・**応答の待ちの時間切れ**・**流量制限の403（再試行を使い切ったあと）**・429・5xx・認証の失敗。数える（その写真の失敗）のは、本文の受信が1枚15分を超えたときと、権限の403・404など。テスト: `a_rate_limit_that_outlasts_the_retries_stops_the_stage_without_blaming_the_photos`・`a_timeout_waiting_for_the_response_stops_the_stage_without_blaming_the_photos`（どちらも、障害中に試した写真が、復旧した次のサイクルで待たずに取得される）、`a_body_that_takes_too_long_is_that_photos_failure_and_the_rest_continue`。
 
 テスト: `photos_that_keep_failing_do_not_block_the_ones_behind_them`（枠2枚で、先頭3枚が恒久的に失敗する。1回目は先頭2枚を試して失敗、2回目はその2枚を飛ばして3枚目と良い写真1枚、3回目は失敗中の3枚を飛ばして残り、4回目は何も試さない。「待ち時間0」の記録＝毎回すべてを試す方針に差し替えると、良い写真が3サイクル続けて0枚のまま＝Pythonの挙動を再現する）、`a_failed_photo_is_tried_again_when_its_original_changes_or_the_wait_is_over`、`失敗が続く写真は枠を塞がず_後続の写真が作られる`（`local_derivatives`。`mtime`が変わればすぐ試す）、`backoff.rs`の単体テスト（倍々・上限・成功で消える・記録数の上限・溢れない）。
 
 ### 14.7 ログ・`--dry-run`
 
-- ログ・件数に出すのは件数・状態名・写真の`id`・HTTPステータス・固定の語だけ。Driveのファイル名・フォルダ名・フォルダID・座標・撮影日時・鍵・トークンは出さない（テスト`log_lines_never_contain_names_keys_tokens_or_urls`が、スタブの合成の名前・座標・トークン・鍵・URL・フォルダ名・Drive IDが段の結果に入らないことを確かめる）。
-- `sync --dry-run`の`index_drive`は、鍵があれば**Driveの一覧を読みに接続する**（読み取りのスコープ。原本のダウンロードも書き込みもしない）。**ガードは通さない**（§11.1.1）ので、鍵のある機体なら本番機でも一覧を読みに行く。`--help`と`--dry-run`の1行目にも書いてある。本番の鍵（`/var/lib/geoframe/drive_key.json`）のある機体で手元から試すときは、`GEOFRAME_DRIVE_KEY`を空のパスにするか、`--data-dir`に使い捨てのディレクトリを指定すること。
+- ログ・件数に出すのは件数・状態名・写真の`id`・HTTPステータス・固定の語だけ。Driveのファイル名・フォルダ名・フォルダID・座標・撮影日時・鍵・トークンは出さない（テスト`log_lines_never_contain_names_keys_tokens_or_urls`が段の結果の文面を、`the_actual_log_output_never_contains_names_coordinates_times_keys_or_tokens`が**実際の`tracing`の出力**（全レベル。索引・取得・再試行・保留の警告・鍵の権限の警告・原本の削除の失敗・トークンの取り直しを通す）を捕まえて、スタブの合成の名前・座標・撮影時刻・トークン・鍵・URL・メール・フォルダ名・Drive IDが入らないことを確かめる）。`RemoteFile`・`Listing`・`Entry`・`Op`・`DrivePlan`の`Debug`は手書きで、件数と有無だけを出す（`{:?}`・パニックの表示・試験の失敗の表示からも漏れない。`derived_debug_output_hides_names_times_and_locations`）。
+- `sync --dry-run`の`index_drive`は、鍵があれば**Driveの一覧を読みに接続する**（読み取りのスコープ。原本のダウンロードも書き込みもしない）。**ガードは通さない**（§11.1.1）ので、鍵のある機体なら本番機でも一覧を読みに行く。`--help`と`--dry-run`の1行目にも書いてある。**通信を避けたいときは、存在しない鍵ファイルの絶対パスを`GEOFRAME_DRIVE_KEY`に明示する**（例: `GEOFRAME_DRIVE_KEY=/nonexistent/drive_key.json geoframe sync --dry-run`。鍵が無ければDriveの2段は通信せずに`省略`になる）。`--data-dir`を変えても鍵の設定は変わらないので、鍵のある機体では接続する。`GEOFRAME_DRIVE_KEY`を空文字にしても、既定の`drive_key.json`（カレントディレクトリ基準）に戻るだけで、通信を避けられない。
 
 ### 14.8 Pythonとの差（まとめ）
 
@@ -1134,8 +1135,8 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 | --- | --- |
 | スタブ（`drive/stub.rs`） | ループバックの平文HTTPサーバー。**assertionのJWTを署名・`iss`・`scope`・`aud`・`exp`まで検証してトークンを発行**し、`files.list`（フォルダ名の検索・ページ送り）と`files.get?alt=media`を返す。故障の注入（状態コード・`Retry-After`・`Content-Length`無し）、トークンの失効、受けた要求の記録。応答はすべて合成 |
 | 認証 | 鍵が無い／壊れている（JSONでない・項目が無い・PEMでない）で通信せずに飛ばす、署名の検証、トークンの共有（2つの段で1回）、期限の60秒前に取り直す、失効（401）で1回だけ取り直す、400は飛ばす・500は失敗（再試行つき）、ディレクトリ・FIFO・大きすぎる鍵、権限が緩い鍵でも読む |
-| 索引 | 一覧の順で`id`が振られる・全列（`taken_at`の正規化、空文字、緯度だけ、MIMEの絞り込み）、Pythonと同じ問い合わせ、フォルダ名のエスケープ・見つからない、2回目は何も書かない（`indexed_at`も）、md5変更で戻る列・残る列、消える行とderivative（危ない`display`は消さない）、**一覧が途中で失敗・壊れていたら何も変えない**、429・5xx・流量制限の403は再試行／権限の403は再試行しない、**空の一覧は削除しない**、重複ID、名前の無いファイル、`drive_id`がNULLの行、停止の合図、dry-run（一覧は読むが実DBは変わらず、後続の段に索引後の状態を見せ、実行と同じ件数） |
-| 取得 | JPEG・PNG・TIFF・HEICの全形式、**原本が成功・失敗・パニックのどれでも残らない**（ガードの単体テスト）、リンクを辿らない・消さない・その写真だけの失敗、**先頭の枠より多い失敗があっても後続が取得される**、md5が変わると再び試す・待ちが過ぎると再び試す、通信の不調は段を中断して写真の失敗に数えない、404は写真の失敗、回転・不正なID（通信もファイル作成もしない）、枠の数と0、サイズ上限（`Content-Length`あり・なし） |
+| 索引 | 一覧の順で`id`が振られる・全列（`taken_at`の正規化、空文字、緯度だけ、MIMEの絞り込み）、Pythonと同じ問い合わせ、フォルダ名のエスケープ・見つからない、2回目は何も書かない（`indexed_at`も）、md5変更で戻る列・残る列、消える行とderivative（危ない`display`は消さない）、**一覧が途中で失敗・壊れていたら何も変えない**、429・5xx・流量制限の403は再試行／権限の403は再試行しない、**空の一覧は削除しない**、**大量の削除（50件超かつ2割超）は保留する（閾値の前後・1件だけ残る一覧・フラグで外れる・dry-run）**、重複ID、名前の無いファイル、`drive_id`がNULLの行、停止の合図、dry-run（一覧は読むが実DBは変わらず、後続の段に索引後の状態を見せ、実行と同じ件数） |
+| 取得 | JPEG・PNG・TIFF・HEICの全形式、**原本が成功・失敗・パニックのどれでも残らない**（ガードの単体テスト）、リンクを辿らない・消さない・その写真だけの失敗、**先頭の枠より多い失敗があっても後続が取得される**、md5が変わると再び試す・待ちが過ぎると再び試す、通信の不調（流量制限の403・応答の待ちの時間切れ・5xx・401）は段を中断して写真の失敗に数えず、復旧した次のサイクルで待たずに取得される、本文の受信の時間切れ・404は写真の失敗、原本の削除の失敗が件数に出る、回転・不正なID（通信もファイル作成もしない）、枠の数と0、サイズ上限（`Content-Length`あり・なし） |
 | Pythonとの突き合わせ（`matches_the_python_fixture`） | `tools/gen_drive_index_fixture.py`が、偽のDriveに**Pythonの`index_drive`・`fetch_derivatives`**を流した結果を作る（`svc`と`googleapiclient.http.MediaIoBaseDownload`を差し替え。HEICの変換に`pillow-heif`が要る）。10段階: 初回・変化なし・変更（md5の変更・削除・追加・名前だけの変更・手動の位置など）・変化なし・一覧が途中で失敗・取得4サイクル（枠が3・1・1・25）・空の一覧。Rustが同じ応答をスタブから返し、**`photos`の全列と`id`**、**Driveへの問い合わせ（`q`・`fields`・`pageSize`・`pageToken`）**、追加/削除の件数、derivativeのファイルの有無が一致することを確かめる。取得は、最初のサイクルが**同じ写真を同じ順に試し、同じ行・同じ寸法**になり、最後は同じ写真が取得済みになる。意図した差（空の一覧を削除しない、失敗を覚えて枠に後続を入れる）は、その差が出ることを確かめる。CIの`app`ジョブが`--check`でPythonの結果を検査する |
 | バイナリ（`tests/ingest_cli.rs`） | 鍵が無い環境で、`sync --dry-run`・`sync`が`index_drive`・`fetch_derivatives`を`省略（Drive の鍵が無いので飛ばします）`として終了コード0で終えること（通信しない） |
 
@@ -1164,12 +1165,20 @@ musl静的バイナリ（`static-pie linked`・`ldd`は静的・`GEOFRAME_TEST_*
 $ENV GEOFRAME_DATA_DIR=/var/lib/geoframe /usr/local/bin/geoframe sync --dry-run
 ```
 
-`index_drive: 完了 remote=… added=… updated=… removed=… unchanged=… deletes_withheld=0`と、`fetch_derivatives: 完了 pending=… planned=…`、最後の`写真:`の行を見る。期待:
+`index_drive: 完了 remote=… added=… updated=… removed=… unchanged=… deletes_withheld=0 mass_delete_withheld=0`と、`fetch_derivatives: 完了 pending=… skipped_backoff=0 planned=…`、最後の`写真:`の行を見る。**件数の意味は別々**で、同じ数にならない:
 
-- `remote`は、Driveのフォルダの画像の数（本番コピーは6,535行）。`unchanged`がほぼ`remote`。
-- **`added`・`updated`・`removed`はほぼ0**（バックアップ（2026-10-24 06:17）のあとにDriveへ足した・差し替えた・消した写真の数だけ。`updated`が多いと、`display`が戻って再取得される。`md5`の違いの原因を調べる）。
-- **`planned`（取得予定）は0**（`added`・`updated`の分だけ。これが取得待ちの総数`pending`と一致する）。`写真:`の取得待ちも、その分だけ。
-- `deletes_withheld`が0でなければ、一覧が空だった（フォルダ名・共有・鍵の権限を確かめる）。
+- `index_drive`の`remote`は、Driveのフォルダの画像の数（本番コピーは6,535行）。`unchanged`がほぼ`remote`。`added`・`updated`・`removed`は索引が**この実行で変える**行数（`--dry-run`は写しに適用するだけで、実DBは変わらない）。
+- `fetch_derivatives`の`pending`は、**取得待ちの総数**（`source='drive' AND display IS NULL`。**位置の有無で絞らない**）。索引の`updated`・`added`の行はここに入る（`display`がNULLに戻る・NULLで入る）。`planned`は、そのうち**この1回で取得するはずの数**で、`GEOFRAME_FETCH_PER_CYCLE`（既定25）が上限。`pending`が25を超えれば`planned`は25になる（`skipped_backoff`は失敗の記録があって飛ばす数で、dry-runの新しいプロセスでは0）。`unusable`は取得できない行（IDが不正など）。
+- 最後の`写真:`の取得待ちは別の数え方で、**位置のある行（`lat IS NOT NULL`）のうち`display`がNULLのもの**だけ（dry-runでは、`planned`の分を取得した後の写しで数える）。位置の無い取得待ちは含まれず、`pending`・`planned`とは一致しない。
+
+**冪等性の判断**は、次の2つで行う（`写真:`の行では行わない）。
+
+1. 索引: `added`・`updated`・`removed`が、バックアップ（2026-10-24 06:17）のあとにDriveへ足した・差し替えた・消した写真の数だけ（ほぼ0）であること。`updated`が多いと`display`が戻って再取得される（`md5`の違いの原因を調べる）。
+2. 取得段: 実行の**前**に`sudo -u geoframe sqlite3 -readonly /var/lib/geoframe/catalog.db "SELECT COUNT(*) FROM photos WHERE source='drive' AND display IS NULL"`で取得待ち`P0`を控える。`pending`が`P0 + added + updated`にほぼ一致し（`updated`の行がもともと取得待ちなら二重には増えない。消えた行が取得待ちだった分は引く）、`planned`が`min(pending, 25)`であること。
+
+そのほか:
+
+- `deletes_withheld`・`mass_delete_withheld`が0でなければ、削除を保留した（0なら一覧が空、0以外なら消す行が多すぎる。フォルダ名・共有・鍵の権限・`GEOFRAME_DRIVE_FOLDER`を確かめる。意図した削除なら`sync --allow-mass-delete`の1回だけで外れる。§14.4）。
 - 失敗するときは`段 index_drive: 失敗: Drive: …`（状態コードや通信の種類だけ。URL・ファイル名は出ない）か、`省略（Drive の認証に失敗したので飛ばします）`（鍵・assertionが断られた。`[drive] 認証エラー`の警告に状態コード）。
 
 **(2) 原本の形式別の成功・失敗をPythonと比べる（受入条件①）。** 本番コピーの`derivatives/`からの再生成（T2.2の確認）は原本の互換性を裏付けないので、**実際の原本をDriveから落として**、同じ写真をPythonとRustの両方で変換して比べる。検証環境の本番コピーは書き換えず、**使い捨ての置き場**（`geoframe`所有・`0700`）に`catalog.db`の複製を2つ作ってそれぞれで動かす。
@@ -1200,8 +1209,9 @@ $ENV GEOFRAME_DATA_DIR=$S/py <pyrefのPython> -c 'import sys; sys.path.insert(0,
 両方の置き場で、**選んだ写真のうち`display`が入ったものを`id`で比べる**:
 
 ```
-for d in rust py; do sudo -u geoframe sqlite3 -readonly $S/$d/catalog.db "SELECT id FROM photos WHERE id IN ($IDS) AND display IS NOT NULL ORDER BY id" > $S/$d.ok; done
-comm -3 $S/rust.ok $S/py.ok          # 左だけ = Rustだけ成功、右だけ = Pythonだけ成功
+# comm は、両方の入力が同じロケールで整列されている必要がある。整列も comm も LC_ALL=C にそろえる
+for d in rust py; do sudo -u geoframe sqlite3 -readonly $S/$d/catalog.db "SELECT id FROM photos WHERE id IN ($IDS) AND display IS NOT NULL" | LC_ALL=C sort > $S/$d.ok; done
+LC_ALL=C comm -3 $S/rust.ok $S/py.ok          # 左だけ = Rustだけ成功、右だけ = Pythonだけ成功
 sudo -u geoframe sqlite3 -readonly $S/rust/catalog.db "SELECT lower(substr(name, length(rtrim(name, replace(name,'.','')))+1)) ext, count(*), sum(display IS NOT NULL) FROM photos WHERE id IN ($IDS) GROUP BY ext"
 ```
 
@@ -1222,3 +1232,17 @@ sudo rm -rf $D
 - **T2.5**: `infer`段（位置の推定）。`index_drive`が`display`をNULLに戻す（md5の変更）と、推定の錨だった写真の`display`が消える点は`infer`が考慮する（[inventory.md §2.3](inventory.md)）。
 - **T2.7**: 本番コピーでの`--dry-run`（§14.11の(1)）と実サイクル、同じ写真を比較用PythonとRustへ入れた`photos`の列ごとの比較、棚卸しS2の実機確認、結果の`p2-acceptance.md`への記録。**§14.11の(2)・(3)が受入条件①の実機での確認**。
 - **P3**: md5の変更で手動の位置を上書きする挙動（§0）を直すか決める。直すなら`loc_source='manual'`の行は`lat lon loc_source`を更新せず`display`だけをNULLにする、などの選択肢がある（§13.10と同じ）。
+
+### 14.13 レビュー（2026-10-25）の指摘への対応
+
+T2.4のレビューの指摘7件への対応。コミットは`T2.4: …`の4つ（通信の障害の区別・大量削除の保留・原本の削除・`Debug`とログの検査）と、この文書。
+
+| 指摘 | 対応 |
+| --- | --- |
+| 通信の障害が写真の失敗として記録される | 再試行を使い切った流量制限の403を`DriveError::RateLimited`にして理由を保ち、接続・応答の待ちの時間切れ（`Net(timeout)`）も障害にした。本文の受信の時間切れだけを`BodyTimeout`（`fail_slow_download`、写真の失敗）として区別する。障害中に試した写真が、復旧した次のサイクルで待たずに取得されるテストを足した（§14.6） |
+| 0件以外の大量削除に保護が効かない | 消す件数が50件を超え、かつDriveの行の20%を超えるときは、削除だけを保留する（`mass_delete_withheld`）。外すのは`geoframe sync --allow-mass-delete`の1回だけ。判断: 閾値は「50件以下の入れ替えは普通の運用、手作業で50件以上を2割超まとめて消すことは普通ない」。フラグは0件の一覧の保留も外す（意図した全削除ができないままになる行き止まりを避ける）。環境変数・設定・unitでは外せない（§14.4） |
+| 原本の削除の失敗を黙って捨てている | 成功・写真の失敗では`Original::remove`で明示的に消して結果を確かめ、失敗を`original_remove_failed`の件数と固定の文言の警告で報告する。`Drop`は早期`return`・パニックの補助（§14.5） |
+| `Debug`がファイル名・時刻・座標を出す／ログの試験が実際のログを見ていない | `RemoteFile`・`Listing`・`Entry`・`Op`・`DrivePlan`の`Debug`を手書きにして件数と有無だけにした。`tracing`の出力を捕まえて検査する試験を足した（§14.7） |
+| dry-runで通信を避ける方法の説明が誤り | 「存在しない鍵ファイルの絶対パスを`GEOFRAME_DRIVE_KEY`に明示する」に直した（§14.7、`deploy/README.md`） |
+| 受入手順の取得件数の期待値が実装と合わない | `pending`・`planned`・`写真:`の取得待ちの意味を分け、冪等性は「索引の変更件数」と「取得段の`pending`・`planned`」で判断する手順にした（§14.11の(1)） |
+| 成功IDの比較で`comm`の整列の条件を満たしていない | 両方の出力を`LC_ALL=C sort`で整列し、`LC_ALL=C comm`で比べる（§14.11の(2)） |
