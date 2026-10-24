@@ -29,7 +29,7 @@
 | E3 | GET `/api/admin/photos` | `page`(1)、`per`(50、上限200)、`filter`(all/noloc/fav/hidden/inferred/manual/suggest。未知はall) | `items[]`（id name thumb taken_at lat lon loc_source infer_dt_s infer_bucket place pref city fav hidden rotation source、位置なしでは `hint`・`suggest`）、`page pages total filter`。並びは時刻（NULL・空は最後）→id | なし | なし | `admin.py:api_admin_photos` / `admin.py:_thumb_for` / `admin.py:_nearest_hint` / `admin.py:_suggestions` | `admin.js`（一覧） | 生パスの前方一致。`int()` 失敗は400 `bad_params` | P1 |
 | E4 | GET `/api/admin/geocode` | `q`（2文字未満は空配列） | `{ok, items[{title,lat,lon,source:'gsi'|'osm'}]}`。GSIが0件のときだけNom。失敗は空配列で握りつぶす | なし（`.cache.json` のメモリキャッシュを更新） | GSI、Nom（1秒1件の全体ロック） | `geo.py:geocode_search` / `geo.py:_gsi_geocode` / `geo.py:nominatim_search` | `admin.js`（地名検索） | 生パスの前方一致 | P3 |
 | E5 | GET `/api/ai/status` | なし | embedding件数、グループ、パイプライン状態（`photo_ai_status` 設定）、モデル切替直後の他モデル行数 | なし | なし | `ai_search.py:api_ai_status` | `ai-search.js` | 完全一致 | P4 |
-| E6 | GET `/api/ai/search` | `q`（300字以内、空なら「推薦順」）、`groups`(12、1〜30)、`include_hidden`(1/true) | `groups[{group_id kind summary 類似度 photos[]}]`、`mode` は `semantic`/`recommended`/`empty`。分あたり30件を超えると429、`GEOFRAME_AI_ENABLED=0` は503、上流障害は503（定型文） | なし（クエリのembeddingをメモリLRU 64件にキャッシュ） | Gemini（または local embedding）で検索語を1回embedding | `ai_search.py:api_ai_search` / `ai_search.py:_embed_query` / `ai_search.py:_search_rate_limit_allowed` | `ai-search.js` | 完全一致 | P4 |
+| E6 | GET `/api/ai/search` | `q`（300字以内、空なら「推薦順」）、`groups`(12、1〜30)、`include_hidden`(1/true) | `groups[{group_id kind summary 類似度 photos[]}]`、`mode` は `semantic`/`recommended`/`empty`。分あたり30件を超えると429、`GEOFRAME_AI_ENABLED=0` は503、上流障害は503（定型文）。**不正な `groups`（数値でない等）・`q` の不正は400**（現行は例外文字列 `str(e)` をそのまま返す。Rustでは定型文にする） | なし（クエリのembeddingをメモリLRU 64件にキャッシュ） | Gemini（または local embedding）で検索語を1回embedding | `ai_search.py:api_ai_search` / `ai_search.py:_embed_query` / `ai_search.py:_search_rate_limit_allowed` | `ai-search.js` | 完全一致 | P4 |
 | E7 | GET `/api/blog/trips` | なし | 旅程JSON（`app/travel_blog/plans/*.json`）の一覧と、下書き・書き出しの有無 | なし | なし | `travel_blog.py:api_blog_trips` / `travel_blog.py:list_plans` | `blog-admin.js` | 完全一致 | P3 |
 | E8 | GET `/api/blog/trip` | `trip_id`（`^[a-z0-9][a-z0-9-]{0,79}$`） | 旅程JSONそのもの。不正は400、無ければ404 | なし | なし | `travel_blog.py:api_blog_trip` / `travel_blog.py:load_plan` | `blog-admin.js` | 完全一致 | P3 |
 | E9 | GET `/api/blog/candidates` | `trip_id` | 日ごとの写真候補（`hidden` でない写真を日付範囲で選び、粗い地名だけ返す。正確なGPSは返さない） | なし | なし | `travel_blog.py:api_blog_candidates` / `travel_blog.py:_segment_candidates` | `blog-admin.js` | 完全一致 | P3 |
@@ -90,7 +90,7 @@ SQLite、WAL。接続は**プロセスで1本**（`check_same_thread=False`）�
 
 - **一次**: 利用者が与えた情報で、再構築できない。
 - **派生（無償）**: 原本・他の列から計算で作り直せる。
-- **派生（有償）**: 作り直せるが、クラウド課金・GPU時間・時間のかかる外部通信が要る（Gemini判定、embedding、位置候補の回答）。サーバーのdocstringとバックアップスクリプトは embedding を「再構築不可」と扱っている。
+- **派生（有償）**: 作り直せるが、クラウド課金・GPU時間・時間のかかる外部通信が要る（Gemini判定、embedding、位置候補の回答）。サーバーのdocstring（`app/server.py:13,27`）と更新前の注意（`deploy/deploy-pull.sh:11`）は embedding を「再構築不可」と扱っている。
 
 ### 2.1 テーブル一覧
 
@@ -145,7 +145,22 @@ Rustでも意識して残すか、直すかを決める必要がある。
 | Drive側／ローカルから消えた | 行を削除（derivativeも削除）。`favorite`/`hidden`/`manual` も一緒に消える | `drive.py:index_drive` / `index_local` |
 | Driveのmd5変更時 `inferred_from`/`infer_dt_s` | UPDATEに含まれず、`loc_source` が `drive_meta`／NULL に変わっても**古い値が残る**（読む側は `loc_source` を見るため実害は小さい） | `drive.py:index_drive` |
 | 推定の錨が消えた | `inferred` の位置を取り消し、`lat lon loc_source inferred_from infer_dt_s display` をNULLへ。**derivativeのファイルは消さない**（`_thumb_for`・`loc_suggest._image_rel` が `derivatives/<drive_id>.jpg` を拾い直す） | `geo.py:infer_locations` |
+| `--organize` | 位置の無いローカル写真（`source='local' AND lat IS NULL'`）を `_excluded/no_gps/` へ移し、**行を削除**する。`favorite`/`hidden` も消える。起動引数 `--organize` の手動操作 | `drive.py:organize_photos` |
+| 推定の錨が消えた後のDrive写真 | `display=NULL` になったDrive写真は `fetch_derivatives`（`source='drive' AND display IS NULL`）が取り直し、`fetched_at` が新しくなる。表示側（E1の新着ブースト）で**新着扱いになり直す** | `geo.py:infer_locations`、`drive.py:fetch_derivatives` |
+| 写真の行が消える／idが変わる | 旅行ブログの下書きは画像を `photo_id` で参照する（`travel_blog.py:319` 付近）。行が消えるか再追加で別idになると、下書きの参照が切れる（書き出し時に `_photo_source` が400） | `travel_blog.py` |
 | `manual` | 再推定の対象外（`loc_source IS NULL OR 'inferred'` のみ再評価）。ほかの未解決写真の錨になる | `geo.py:infer_locations` |
+
+### 2.3b DB外のデータ（`DATA_DIR` ほか）
+
+| パス | 分類 | 備考 |
+|---|---|---|
+| `DATA_DIR/travel_blog/drafts/<trip_id>.json` | **一次**（利用者が編集した下書き。`travel_blog.py:27` 付近の `DRAFT_DIR`） | 再構築できない。バックアップ対象に含める。`photo_id` で写真を参照する（§2.3） |
+| `DATA_DIR/blog_exports/` | 派生（書き出し結果） | 下書きから作り直せる。ディレクトリ名は変えない |
+| `DATA_DIR/derivatives/` | 派生（Drive原本から再取得できる） | 再取得すると `fetched_at` が新しくなる（§2.2） |
+| `DATA_DIR/tile_cache/` | 派生（地図タイルのキャッシュ） | |
+| `DATA_DIR/.cache.json` | 派生（地理院ジオコーダ結果のキャッシュ） | §3.2 |
+| `DATA_DIR/models/rank_model.json`（`GEOFRAME_RANK_MODEL` で変更可） | **要判断**（学習済みの順位モデル。無ければ固定式にフォールバック） | 再生成の手段をこのリポジトリで確認できていない。Rustへ引き継ぐか決める |
+| `drive_key.json`（`ROOT` 直下。`GEOFRAME_DRIVE_KEY`） | **秘密** | リポジトリ・ログ・文書に出さない |
 
 ### 2.4 スキーマ移行（`store.py:db`）
 
@@ -293,15 +308,17 @@ Issue #54 の受入条件「写真追加→位置補完→表示→選別→検�
 | # | シナリオ | 手順（現行の画面・API） | 確認方法 | フェーズ |
 |---|---|---|---|---|
 | S1 | ローカル写真の追加→表示 | GPSとDateTimeOriginal入りのJPEGを `DATA_DIR/photos/` に置く → 次の同期サイクル（`GEOFRAME_DRIVE_POLL_MIN` 待ち）→ E1 を呼ぶ | `photos` に `source='local'`・`loc_source='exif'`・`display='photos/...'`。E1に1件増え、`file` が `photos/...`、`GET /photos/...` が200 | P2（取り込み）、P1（表示） |
-| S2 | Driveの写真（GPS有）の追加 | Driveの `GeoFrame` フォルダへJPEGを追加 → サイクル → E1 | `loc_source='drive_meta'`。`display='derivatives/<drive_id>.jpg'`（長辺≦2560）。`fetched_at` が入る。E23が200 | P2 |
+| S2 | Driveの写真（GPS有）の追加 | Driveの `GeoFrame` フォルダへJPEGを追加 → サイクル → E1 | `loc_source='drive_meta'`。`display='derivatives/<drive_id>.jpg'`（長辺≦2560）。`fetched_at` が入る。E23が200。**検証環境の準備**: Driveは無効のままにし、Drive APIのスタブ（`files.list` が `imageMediaMetadata` 付きの合成ファイルを返し、`files.get` が合成JPEGを返す）を差す。または `source='drive'` の行と `derivatives/<drive_id>.jpg` を入れた検証用DBで索引後の状態から始める | P2 |
 | S3 | GPSなし写真の位置補完 | GPSなし・撮影時刻が既存の位置あり写真の±15分／±2時間／±12時間以内の写真を追加 → サイクル → E3 `filter=inferred` | `loc_source='inferred'`、`inferred_from`＝錨のid、`infer_dt_s` が窓に合う。E3の `infer_bucket` が `±15分` など。E2の `db.infer_buckets` に集計。E1に含まれ `inferred=true` | P2 |
 | S4 | 手動GPSと再推定の波及 | `filter=noloc` の写真を選び、地名検索（E4）で近くへ飛び、地図で位置を指定して SAVE（E12） → 次サイクル | `loc_source='manual'`、地名列が一旦NULL→サイクル後に埋まる。近い時刻の未解決写真が新しい `manual` を錨に推定される。**次のサイクルで `manual` が上書き・取り消しされない** | P3（更新）、P2（推定） |
 | S5 | 選別（お気に入り・除外） | E13 で `hidden:true` → E1 から消える。`favorite:true` → E1の `fav=true`。AIの「同一場面の推奨外」に当たる写真をお気に入りにする | E1の件数が減る／`fav` が真。AIが抑制していても `favorite` は残る（`photos.py:AI_VISIBLE`）。E3 `filter=hidden/fav` に出る | P3 |
-| S6 | 回転 | Drive由来の写真で E14 `delta:90` | `rotation=90`、`display` が `derivatives/<drive_id>.r90.jpg` に変わり旧ファイルが消える。E23 が新URLで200。E1の `file` も新しい名前（miharashi側のキャッシュ回避） | P3 |
+| S6 | 回転 | Drive由来の写真で E14 `delta:90` | `rotation=90`、`display` が `derivatives/<drive_id>.r90.jpg` に変わり旧ファイルが消える。E23 が新URLで200。E1の `file` も新しい名前（miharashi側のキャッシュ回避）。**検証環境の準備**: Driveを無効にしたまま、`source='drive'` の行と `derivatives/<drive_id>.jpg` を入れた検証用DBを使う（現行の回転は既存derivativeを回すだけで、Drive通信は要らない。`display` のファイルが実在することが前提）。Driveを使うなら上のスタブ | P3 |
 | S7 | 重複の選別（品質解析） | 同じバイト列の写真を2枚入れる／3分以内のほぼ同じ写真を入れる → サイクル → E1・E2 | `photo_quality` に `exact`/`similar` の行ができ、完全重複は推奨外の1枚がE1から消える（`quality_kind='exact'` かつ非推奨）。E2の `db.quality` に `exact_suppressed` | P2 |
-| S8 | AI検索（クラウド有効時） | E5 でパイプライン状態を確認 → E6 `q=<自然文>`、`q=` 空 | `mode='semantic'`／`'recommended'`、`groups[].photos[]` に類似度。`photo_ai_features` の `embedding_model` が今のモデルの行だけを検索対象にする。Geminiを無効にすると E6 は503（`AI検索は無効化されています`）で、E1〜E3 は影響を受けない | P4 |
+| S8 | AI検索（クラウド有効時） | E5 でパイプライン状態を確認 → E6 `q=<自然文>`、`q=` 空 | `mode='semantic'`／`'recommended'`、`groups[].photos[]` に類似度。`photo_ai_features` の `embedding_model` が今のモデルの行だけを検索対象にする。Geminiを無効にすると E6 は503（`AI検索は無効化されています`）で、E1〜E3 は影響を受けない。**検証環境の準備**: クラウドAIは無効のまま、embedding を返すスタブProvider（固定ベクトルを返す）か local-model-lab を使う。`photo_ai_features` に検証用のembedding行を入れたDBでもよい | P4 |
 | S9 | 位置候補（Decisionが止まっている場合） | 位置なし写真がある状態で Decision を止めて待つ | E2の `db.loc.decision='unavailable'`、`clue_pending` が減らず、`photo_loc_runs` に行が増えない（**写真はGeminiに送られない**）。再開後に `filter=suggest` に候補が出る。候補は確定するまで `photos.lat` に書かれない | P4 |
-| S10 | 旅行ブログの下書き→書き出し | `/blog-admin` で旅程を選ぶ（E7〜E10）→ 編集 → E15 保存 → E16 実行 | `DATA_DIR/travel_blog/drafts/<id>.json` ができる。`blog_exports/<id>/index.html` と `images/photo-<id>.jpg` ができ、画像のEXIF（GPS）が無い。`GET /blog_exports/<id>/index.html` が200。`.<id>-...` の作業領域は404ではなく403 | P3 |
+| S10 | 旅行ブログの下書き→書き出し | `/blog-admin` で旅程を選ぶ（E7〜E10）→ 編集 → E15 保存 → E16 実行 | `DATA_DIR/travel_blog/drafts/<id>.json` ができる。`blog_exports/<id>/index.html` と `images/photo-<id>.jpg` ができ、画像のEXIF（GPS）が無い。`GET /blog_exports/<id>/index.html` が200。存在しなくても `GET /blog_exports/.<id>.previous/` や `/blog_exports/.<id>-x/` が404ではなく403（ドット始まりの要素は途中でも403） | P3 |
+
+**同期サイクルの手動実行**: 現行には1回だけ動かす公式手段が無い（`catalog.py:cycle` はワーカーが `GEOFRAME_DRIVE_POLL_MIN` ごとに呼ぶ。検証では `python -c "from geoframe.catalog import cycle; cycle()"` を `app/` で動かして代用できる）。**Rust側で、同期サイクルを1回動かす手動トリガー（CLIサブコマンド等）を用意する**。S1〜S4、S7 の「サイクル待ち」はこれで置き換える。
 
 S5〜S6 は管理画面の操作のE2E、S8〜S9 は「local-model-lab停止／lease中でも閲覧・管理できる」の確認（AC3）にも使う。
 
@@ -317,7 +334,7 @@ S5〜S6 は管理画面の操作のE2E、S8〜S9 は「local-model-lab停止／l
   - `analyzed_at`（`photo_quality*`、`photo_ai_*`、`photo_loc_*`）: `datetime.now().astimezone().isoformat(timespec='seconds')`＝`+09:00` 付き。
   - `admin.py` の `server_time` / `disk.measured_at`: `time.strftime('%Y-%m-%d %H:%M:%S')`。
 - **naiveな時刻をそのまま比較・差分する**: `util.py:t_epoch` は `datetime.strptime(...).timestamp()`（環境のTZで解釈）。位置推定・旅の区切り（48時間）・品質グルーピング・ブログ候補の日付範囲・`loc_suggest` の「日」まとめ（`taken_at[:10]`）がすべてこれに乗る。ユニットは `TZ=Asia/Tokyo` を明示している（未設定のUTCだと「今日の写真」等が9時間ずれた実害がある）。日本にはDSTが無いので、Rustは**TZに依存しないnaiveな日時（例: `chrono::NaiveDateTime`）で差分を取る**のが安全。`Local` を使うなら `TZ` を維持する。
-- **並び順**: E1 の `ORDER BY` は `CASE WHEN taken_at='' THEN 1 ELSE 0 END, taken_at` だけで**`id` の同順位規則が無い**。同じ `taken_at` の写真の順序はSQLiteの実行計画次第。E3 は `..., taken_at, id`。T1.2 の「全件比較」では、比較用Pythonの出力が実際にid順になっているかを先に確かめてから `, id` を足すか決める。`taken_at` は両インデクサが空文字で入れるのでNULLは来ないはずだが、NULLがあれば先頭に来る（`CASE` が0になるため）。
+- **並び順**: E1 の `ORDER BY` は `CASE WHEN taken_at='' THEN 1 ELSE 0 END, taken_at` だけで**`id` の同順位規則が無い**。同じ `taken_at` の写真の順序はSQLiteの実行計画次第。E3 は `..., taken_at, id`。T1.2 の「全件比較」では、現行Python実装の E1 の出力が実際にid順になっているかを先に確かめてから `, id` を足すか決める。`taken_at` は両インデクサが空文字で入れるのでNULLは来ないはずだが、NULLがあれば先頭に来る（`CASE` が0になるため）。
 - `trip` の採番は E1 の**取得結果の並び**に依存する（`assign_trips`）。並びが変わると番号が変わる。写真が増えると番号がずれる（契約に明記）。
 
 ### 6.2 パス・ファイルの安全
