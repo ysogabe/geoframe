@@ -489,11 +489,10 @@ pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
         }
     };
     let input = (decoded.raster.width, decoded.raster.height);
-    // EXIF の向き（HEIC はデコーダが適用済みなので 1 のまま）
-    if format != Format::Heic
-        && let Some(tiff) = exif::exif_tiff(format, bytes, None)
-    {
-        decoded.orientation = exif::parse_tiff(&tiff).orientation;
+    // EXIF の向き。EXIF に無ければ XMP の向き（Pillow の `getexif` と同じ）。HEIC はデコーダが適用済みなので 1 のまま
+    if format != Format::Heic {
+        let tiff = exif::exif_tiff(format, bytes, None);
+        decoded.orientation = exif::effective_orientation(format, bytes, tiff.as_deref());
     }
     let exif_o = orientation_of(decoded.orientation);
 

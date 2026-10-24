@@ -32,7 +32,8 @@ pub struct PhotoMeta {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExifInfo {
     pub meta: PhotoMeta,
-    /// EXIF の Orientation（1〜8）。無い・範囲外なら 1。
+    /// 画像に当てる向き（1〜8）。EXIF の Orientation で、無いときは XMP の `tiff:Orientation`
+    /// （[`effective_orientation`]）。どちらも無い・範囲外なら 1。
     pub orientation: u8,
 }
 
@@ -54,6 +55,7 @@ const TAG_ORIENTATION: u16 = 0x0112;
 const TAG_DATETIME: u16 = 0x0132; // 306（IFD0）
 const TAG_EXIF_IFD: u16 = 0x8769;
 const TAG_GPS_IFD: u16 = 0x8825;
+const TAG_XMP: u16 = 700;
 const TAG_DATETIME_ORIGINAL: u16 = 0x9003; // 36867
 const TAG_DATETIME_DIGITIZED: u16 = 0x9004; // 36868
 const GPS_LAT_REF: u16 = 1;
@@ -297,6 +299,115 @@ fn gps(tiff: &Tiff, gps_entries: &[Entry]) -> (Option<f64>, Option<f64>) {
     }
 }
 
+/// IFD0 の Orientation タグ。**タグがあれば `Some`**（値が範囲外・読めない型なら 1）。無ければ `None`。
+fn orientation_tag(tiff: &Tiff, ifd0: &[Entry]) -> Option<u8> {
+    let e = find(ifd0, TAG_ORIENTATION)?;
+    Some(
+        tiff.uint(&e, 0)
+            .and_then(|v| u8::try_from(v).ok())
+            .filter(|v| (1..=8).contains(v))
+            .unwrap_or(1),
+    )
+}
+
+/// TIFF 構造の IFD0 に Orientation タグがあるか、あればその値（範囲外は 1）。
+pub fn tiff_orientation(data: &[u8]) -> Option<u8> {
+    let tiff = Tiff::new(data)?;
+    let ifd0 = tiff.entries(tiff.ifd0_offset()?);
+    orientation_tag(&tiff, &ifd0)
+}
+
+/// 画像に当てる EXIF の向き（1〜8。Pillow の `getexif()` + `exif_transpose` と同じ）。
+///
+/// 1. IFD0 に Orientation タグがあれば、**値が範囲外でも**それを使う（XMP は見ない）。
+/// 2. 無いときだけ、XMP の `tiff:Orientation` を使う（Pillow の `getexif` の補完）。JPEG は APP1 の XMP
+///    （複数あれば最後）、PNG は `XML:com.adobe.xmp` のテキスト（`tEXt`・圧縮しない `iTXt`。`zTXt`・
+///    圧縮した `iTXt` は読まない）、TIFF はタグ 700。HEIC の XMP は読まない（pillow-heif が開くときに
+///    XMP の向きを取り除くので、Pillow も使わない）。
+///
+/// `tiff` は [`exif_tiff`] で取り出した EXIF の TIFF 構造。
+pub fn effective_orientation(format: Format, bytes: &[u8], tiff: Option<&[u8]>) -> u8 {
+    if let Some(o) = tiff.and_then(tiff_orientation) {
+        return o;
+    }
+    let xmp = match format {
+        Format::Jpeg => jpeg_xmp(bytes),
+        Format::Png => png_xmp(bytes),
+        Format::Tiff => tiff_xmp(bytes),
+        Format::Heic => None,
+    };
+    xmp.and_then(xmp_orientation)
+        .filter(|v| (1..=8).contains(v))
+        .unwrap_or(1)
+}
+
+/// XMP の最初の `tiff:Orientation="d` か `tiff:Orientation>d`（Pillow の正規表現
+/// `tiff:Orientation(="|>)([0-9])` の最初の一致。1 桁だけ読むので `"16"` は 1）。
+fn xmp_orientation(xmp: &[u8]) -> Option<u8> {
+    const KEY: &[u8] = b"tiff:Orientation";
+    let mut from = 0;
+    while let Some(i) = xmp[from..].windows(KEY.len()).position(|w| w == KEY) {
+        let rest = &xmp[from + i + KEY.len()..];
+        let digit = if rest.starts_with(b"=\"") {
+            rest.get(2)
+        } else if rest.starts_with(b">") {
+            rest.get(1)
+        } else {
+            None
+        };
+        if let Some(d) = digit.filter(|d| d.is_ascii_digit()) {
+            return Some(d - b'0');
+        }
+        from += i + 1;
+    }
+    None
+}
+
+/// TIFF のタグ 700（XMP）。バイト列の型だけ（Pillow は文字列の型に正規表現のバイト列を当てて失敗する）。
+fn tiff_xmp(data: &[u8]) -> Option<&[u8]> {
+    let tiff = Tiff::new(data)?;
+    let ifd0 = tiff.entries(tiff.ifd0_offset()?);
+    let e = find(&ifd0, TAG_XMP)?;
+    matches!(e.typ, T_BYTE | 7).then(|| tiff.bytes(&e))
+}
+
+/// PNG の `XML:com.adobe.xmp` のテキスト。同じキーが複数あれば後のものが勝つ（Pillow は辞書に入れ直す）。
+fn png_xmp(bytes: &[u8]) -> Option<&[u8]> {
+    const KEY: &[u8] = b"XML:com.adobe.xmp";
+    let mut found = None;
+    let mut pos = 8usize;
+    while let Some(head) = bytes.get(pos..pos + 8) {
+        let len = u32::from_be_bytes([head[0], head[1], head[2], head[3]]) as usize;
+        let kind = &head[4..8];
+        let Some(body) = bytes.get(pos + 8..pos + 8 + len) else {
+            break;
+        };
+        match kind {
+            b"tEXt" => {
+                if let Some(value) = body.strip_prefix(KEY).and_then(|r| r.strip_prefix(&[0])) {
+                    found = Some(value);
+                }
+            }
+            b"iTXt" => {
+                // キー NUL 圧縮フラグ 圧縮方式 言語 NUL 翻訳キーワード NUL テキスト
+                if let Some(rest) = body.strip_prefix(KEY).and_then(|r| r.strip_prefix(&[0]))
+                    && let [0, _, rest @ ..] = rest
+                    && let Some(rest) = rest.splitn(3, |&b| b == 0).nth(2)
+                {
+                    found = Some(rest);
+                }
+            }
+            b"IEND" => break,
+            _ => {}
+        }
+        pos = match pos.checked_add(len).and_then(|p| p.checked_add(12)) {
+            Some(p) => p,
+            None => break,
+        };
+    }
+    found
+}
+
 /// TIFF 構造のバイト列（`II*\0` か `MM\0*` で始まる）から読む。壊れていれば空の結果。
 pub fn parse_tiff(data: &[u8]) -> ExifInfo {
     let Some(tiff) = Tiff::new(data) else {
@@ -321,11 +432,7 @@ pub fn parse_tiff(data: &[u8]) -> ExifInfo {
         .or_else(|| time_candidate(&tiff, &exif, TAG_DATETIME_DIGITIZED))
         .or_else(|| time_candidate(&tiff, &ifd0, TAG_DATETIME));
     let (lat, lon) = gps(&tiff, &gps_entries);
-    let orientation = find(&ifd0, TAG_ORIENTATION)
-        .and_then(|e| tiff.uint(&e, 0))
-        .and_then(|v| u8::try_from(v).ok())
-        .filter(|v| (1..=8).contains(v))
-        .unwrap_or(1);
+    let orientation = orientation_tag(&tiff, &ifd0).unwrap_or(1);
     ExifInfo {
         meta: PhotoMeta {
             lat,
@@ -446,34 +553,60 @@ fn is_heif_brand(brand: &[u8]) -> bool {
     .contains(&brand)
 }
 
+/// JPEG の SOS より前のセグメント（マーカー、本体）を順に返す。長さを持たないマーカーは飛ばし、
+/// 切れていれば（または EOI・SOS に着いたら）そこで終わる。
+fn jpeg_segments(bytes: &[u8]) -> impl Iterator<Item = (u8, &[u8])> {
+    let mut pos = 2;
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let next = (|| {
+            loop {
+                // マーカー: 0xFF の連続のあとに種別
+                while *bytes.get(pos)? != 0xFF {
+                    pos += 1;
+                }
+                while *bytes.get(pos)? == 0xFF {
+                    pos += 1;
+                }
+                let marker = *bytes.get(pos)?;
+                pos += 1;
+                match marker {
+                    0xD8 | 0x01 | 0xD0..=0xD7 => continue, // 長さを持たない
+                    0xD9 | 0xDA => return None, // EOI / SOS（画像データの前までしか探さない）
+                    _ => {}
+                }
+                let len = usize::from(u16::from_be_bytes(
+                    bytes.get(pos..pos + 2)?.try_into().ok()?,
+                ));
+                let body = bytes.get(pos + 2..pos + len)?;
+                pos += len;
+                return Some((marker, body));
+            }
+        })();
+        done = next.is_none();
+        next
+    })
+}
+
 /// JPEG の最初の `Exif\0` で始まる APP1 の中身（`Exif\0\0` の後ろ）。SOS までの区間だけ見る。
 fn jpeg_exif(bytes: &[u8]) -> Option<&[u8]> {
-    let mut pos = 2;
-    loop {
-        // マーカー: 0xFF の連続のあとに種別
-        while *bytes.get(pos)? != 0xFF {
-            pos += 1;
-        }
-        while *bytes.get(pos)? == 0xFF {
-            pos += 1;
-        }
-        let marker = *bytes.get(pos)?;
-        pos += 1;
-        match marker {
-            0xD8 | 0x01 | 0xD0..=0xD7 => continue, // 長さを持たない
-            0xD9 | 0xDA => return None,            // EOI / SOS（画像データの前までしか探さない）
-            _ => {}
-        }
-        let len = usize::from(u16::from_be_bytes(
-            bytes.get(pos..pos + 2)?.try_into().ok()?,
-        ));
-        let body = bytes.get(pos + 2..pos + len)?;
-        if marker == 0xE1 && body.starts_with(b"Exif\0") {
-            // `Exif\0\0`（6 バイト）を取る
-            return body.get(6..);
-        }
-        pos += len;
-    }
+    // `Exif\0\0`（6 バイト）を取る
+    jpeg_segments(bytes)
+        .find(|(marker, body)| *marker == 0xE1 && body.starts_with(b"Exif\0"))
+        .and_then(|(_, body)| body.get(6..))
+}
+
+/// JPEG の XMP（`http://ns.adobe.com/xap/1.0/\0` で始まる APP1 の、名前空間の後ろ）。Pillow は
+/// 見つけるたびに上書きするので、**最後**のものが勝つ。拡張 XMP（`.../xmp/extension/`）は読まない。
+fn jpeg_xmp(bytes: &[u8]) -> Option<&[u8]> {
+    const NS: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
+    jpeg_segments(bytes)
+        .filter(|(marker, body)| *marker == 0xE1 && body.starts_with(NS))
+        .last()
+        .map(|(_, body)| &body[NS.len()..])
 }
 
 /// JPEG の最初の SOS のあと（エントロピー符号化されたデータの先頭）から末尾まで。SOS が見つからなければ `None`。

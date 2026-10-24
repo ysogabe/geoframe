@@ -72,9 +72,14 @@ pub fn exif_info_from_bytes(bytes: &[u8]) -> Result<ExifInfo, ImageError> {
     } else {
         None
     };
-    Ok(exif::exif_tiff(format, bytes, heic_ref)
-        .map(|tiff| exif::parse_tiff(&tiff))
-        .unwrap_or_else(ExifInfo::empty))
+    let tiff = exif::exif_tiff(format, bytes, heic_ref);
+    let mut info = tiff
+        .as_deref()
+        .map(exif::parse_tiff)
+        .unwrap_or_else(ExifInfo::empty);
+    // 向きは EXIF に無ければ XMP から（Pillow の `getexif()` と同じ）
+    info.orientation = exif::effective_orientation(format, bytes, tiff.as_deref());
+    Ok(info)
 }
 
 /// JPEG の EXIF は画像データ（SOS）の前にあるので、先頭だけ読めばよい。
