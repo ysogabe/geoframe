@@ -4,11 +4,13 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod backoff;
 pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod datadir;
 pub mod db;
+pub mod drive;
 pub mod embedded;
 pub mod feed;
 pub mod guard;

@@ -81,6 +81,8 @@ const USAGE: &str = "\
                                         同期サイクルを 1 回だけ動かして終わる。--dry-run は行・写真・キャッシュ・
                                         ロックを変えず（SQLite が読み取りでも作る WAL 関連ファイル catalog.db-wal・
                                         -shm はできうる）、やるとしたら何か（スキーマ・掃除・各段）を件数だけ出す。
+                                        Drive の鍵（GEOFRAME_DRIVE_KEY）があれば、一覧を読みに Drive へ接続する
+                                        （原本のダウンロードはしない。鍵が無ければ Drive の段は通信せずに飛ばす）。
                                         書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ印・Python の確認を通す
   geoframe organize [--dry-run] [--data-dir <dir>]
                                         位置の無いローカル写真を DATA_DIR/_excluded/no_gps/ へ移し、行を削除する
@@ -341,7 +343,8 @@ fn sync(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
 /// 書かずに計画を出す。書き込み接続を作らず、DB は読み取り専用、キャッシュは凍結して読む。
 fn sync_dry_run(config: &Config) -> ExitCode {
     println!(
-        "dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）"
+        "dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）。\
+         Drive の鍵があれば一覧を読みに接続します（原本のダウンロードはしません）"
     );
     let read = match crate::db::open_read_only(&config.db_path()) {
         Ok(conn) => conn,

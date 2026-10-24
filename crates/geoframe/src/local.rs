@@ -39,8 +39,12 @@ use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use std::time::Instant;
+
 use md5::{Digest, Md5};
 use rusqlite::{Connection, params};
+
+use crate::backoff::FailureMemo;
 
 use crate::datadir::{DataDir, PathError};
 use crate::imaging::{self, IccOutcome};
@@ -483,7 +487,7 @@ fn apply_plan(
 
 /// 消した行の derivative を消す（行を消したあと）。`display` が `derivatives/` で始まるものだけ。
 /// 戻り値は `(消した数, 安全でない display で消さなかった数, 消せなかった数)`。
-fn remove_derivatives(
+pub(crate) fn remove_derivatives(
     data: &DataDir,
     deletes: &[(i64, Option<String>)],
     dry_run: bool,
@@ -591,7 +595,21 @@ impl Stage for IndexLocal {
 // ============================================================
 
 /// 同期サイクルの段 `local_derivatives`。
-pub struct LocalDerivatives;
+///
+/// **失敗が続く写真は飛ばす**（T2.4 の受入条件②。[`crate::backoff`]）。現行は `LIMIT n` の SQL なので、
+/// 恒久的に失敗する写真が先頭の枠を埋め続け、後続が取得されない。失敗した写真（`id` と `mtime`）は
+/// しばらく飛ばして後続を枠に入れる（プロセスの中だけの記録。ファイルが更新されれば `mtime` が変わり、
+/// すぐ再び試す）。
+#[derive(Default)]
+pub struct LocalDerivatives {
+    failures: std::sync::Mutex<FailureMemo<(i64, u64)>>,
+}
+
+impl LocalDerivatives {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
 
 impl Stage for LocalDerivatives {
     fn name(&self) -> &'static str {
@@ -599,39 +617,64 @@ impl Stage for LocalDerivatives {
     }
 
     fn run(&self, ctx: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
-        // 現行は `ORDER BY` なしの `LIMIT`（実際は rowid 順）。順序を固定する
-        let rows: Vec<(i64, String)> = {
+        // 現行は `ORDER BY` なしの `LIMIT`（実際は rowid 順）。順序を固定する。`LIMIT` は付けず、失敗中の写真を
+        // 飛ばしながら `GEOFRAME_FETCH_PER_CYCLE` 件そろうまで読む
+        let limit = ctx.config.fetch_per_cycle as usize;
+        let now = Instant::now();
+        let mut skipped_backoff = 0u64;
+        let mut rows: Vec<(i64, String, u64)> = Vec::new();
+        {
             let mut stmt = ctx.read.prepare(
-                "SELECT id, path FROM photos
+                "SELECT id, path, mtime FROM photos
                  WHERE source='local' AND path IS NOT NULL AND lat IS NOT NULL AND display IS NULL
-                 ORDER BY id LIMIT ?1",
+                 ORDER BY id",
             )?;
-            stmt.query_map([ctx.config.fetch_per_cycle], |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })?
-            .collect::<Result<_, _>>()?
-        };
+            let mut cursor = stmt.query([])?;
+            let memo = self.failures.lock().unwrap_or_else(|e| e.into_inner());
+            while rows.len() < limit {
+                let Some(row) = cursor.next()? else { break };
+                let id: i64 = row.get(0)?;
+                let path: String = row.get(1)?;
+                let mtime = row.get::<_, Option<f64>>(2).unwrap_or(None);
+                let key_mtime = mtime.map_or(0, f64::to_bits);
+                if memo.is_waiting(&(id, key_mtime), now) {
+                    skipped_backoff += 1;
+                    continue;
+                }
+                rows.push((id, path, key_mtime));
+            }
+        }
         let (mut original, mut made, mut failed, mut icc_dropped) = (0u64, 0u64, 0u64, 0u64);
+        let finish = |original, made, failed, icc_dropped| {
+            let mut counts = vec![
+                ("original", original),
+                ("made", made),
+                ("failed", failed),
+                ("icc_dropped", icc_dropped),
+            ];
+            // 飛ばした写真があるときだけ付ける（無ければ出力は従来のまま）
+            if skipped_backoff > 0 {
+                counts.push(("skipped_backoff", skipped_backoff));
+            }
+            Ok(StageOutcome::Done(Counts(counts)))
+        };
         if rows.is_empty() {
-            return Ok(StageOutcome::Done(Counts(vec![
-                ("original", 0),
-                ("made", 0),
-                ("failed", 0),
-                ("icc_dropped", 0),
-            ])));
+            return finish(0, 0, 0, 0);
         }
         // dry-run もパスの検査・件数の数え方は実行と同じ。違うのは、derivative を作らない（変換の失敗と
         // ICC の件数は分からない）ことと、書き込み先が実 DB でなく `ctx.read`（写し）であること
         let dry_run = ctx.is_dry_run();
         let data = DataDir::open(&ctx.config.data_dir)?;
         let writer = if dry_run { None } else { Some(ctx.writer()?) };
-        for (id, path) in rows {
+        for (id, path, key_mtime) in rows {
             if ctx.stop.is_stopped() {
                 break;
             }
+            let key = (id, key_mtime);
             // DB の `path` は信用しない（`DATA_DIR` の外へ出るものは読まない）
             let Ok(src) = data.resolve_existing(&path) else {
                 failed += 1;
+                self.record_failure(key, dry_run);
                 continue;
             };
             let display = if imaging::is_browser_displayable_ext(Path::new(&path)) {
@@ -655,10 +698,15 @@ impl Stage for LocalDerivatives {
                         // `ImageError` の文面はパス・ファイル名を含まない
                         tracing::debug!("[local] derivative 失敗（id={id}）: {e}");
                         failed += 1;
+                        self.record_failure(key, dry_run);
                         continue;
                     }
                 }
             };
+            self.failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_success(&key);
             let now = crate::sysinfo::local_isoformat();
             const SET_DISPLAY: &str = "UPDATE photos SET display=?1, fetched_at=?2 WHERE id=?3";
             match writer {
@@ -675,12 +723,19 @@ impl Stage for LocalDerivatives {
                 }
             }
         }
-        Ok(StageOutcome::Done(Counts(vec![
-            ("original", original),
-            ("made", made),
-            ("failed", failed),
-            ("icc_dropped", icc_dropped),
-        ])))
+        finish(original, made, failed, icc_dropped)
+    }
+}
+
+impl LocalDerivatives {
+    /// 失敗を記録する（dry-run は覚えない: 実行はしていないので、次の実行に影響させない）。
+    fn record_failure(&self, key: (i64, u64), dry_run: bool) {
+        if !dry_run {
+            self.failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_failure(key, Instant::now());
+        }
     }
 }
 

@@ -476,7 +476,7 @@ Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作�
 - `ReadOnlyPaths=`は、`photos/`・`blog_exports/`・`travel_blog/`だけ（writer が書く`catalog.db`・`derivatives/`は外した。`tmp/`・`.cache.json`・`.ingest.lock`は元から対象外）。
   WAL の DB は読み取りでも同じディレクトリに`-shm`/`-wal`を作るので、ディレクトリ自体は書き込み可のまま。P3 で手動修正などの更新 API を追加するとき`blog_exports/`などを外す。
   `catalog.db`を別の inode に置き換えたら（バックアップからの復元など）再起動する。
-- 取り込みを 1 回だけ手で動かす: `geoframe sync`（`GEOFRAME_INGEST=1`が要る）。**書かずに計画だけ**見るなら`geoframe sync --dry-run`（行・写真・キャッシュ・ロックを変えず、件数だけを出す。ただし SQLite が読み取りでも作る`catalog.db-wal`・`-shm`はできうる。印も Python の確認も要らない）。
+- 取り込みを 1 回だけ手で動かす: `geoframe sync`（`GEOFRAME_INGEST=1`が要る）。**書かずに計画だけ**見るなら`geoframe sync --dry-run`（行・写真・キャッシュ・ロックを変えず、件数だけを出す。ただし SQLite が読み取りでも作る`catalog.db-wal`・`-shm`はできうる。印も Python の確認も要らない）。**Drive の鍵（`GEOFRAME_DRIVE_KEY`）がある機体では、`--dry-run`も Drive の一覧を読みに接続する**（原本のダウンロードも書き込みもしない。鍵が無ければ通信しない）。本番の鍵のある機体で試すときは`--data-dir`に使い捨てのディレクトリを指す。
   外向き HTTPS の確認は`geoframe selfcheck-net`（状態と HTTP ステータスだけを出す）。
 - **待ち受けは`--listen`を書かない**。`GEOFRAME_HOST`/`GEOFRAME_PORT`（既定`0.0.0.0:8080`）で決まる。
 

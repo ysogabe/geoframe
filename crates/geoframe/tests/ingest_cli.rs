@@ -62,6 +62,15 @@ impl Staging {
                 self.marker.to_str().unwrap().to_string(),
             ),
             ("GEOFRAME_TEST_PYTHON_STATE", "not-found/inactive".into()),
+            // 鍵は無い（置き場の外の、存在しないパス）。Drive の段は通信せずに飛ばす
+            (
+                "GEOFRAME_DRIVE_KEY",
+                self.marker
+                    .with_file_name("no_such_drive_key.json")
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+            ),
         ]
     }
 }
@@ -150,9 +159,11 @@ fn dry_run_writes_nothing_and_reports_counts() {
     fs::write(data.join(".cache.json"), r#"{"exif:a": 1, "geo:1": 2}"#).unwrap();
     let before = snapshot(data);
 
+    // 鍵が無い（置き場の中の、存在しないパス）ので、Drive の 2 つの段は通信せずに飛ばす
+    let missing_key = data.join("no_such_drive_key.json");
     let out = run(
         &["sync", "--dry-run", "--data-dir", data.to_str().unwrap()],
-        &[],
+        &[("GEOFRAME_DRIVE_KEY", missing_key.to_str().unwrap())],
     );
     let stdout = text(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
@@ -178,13 +189,15 @@ fn dry_run_writes_nothing_and_reports_counts() {
         stdout.contains("段 local_derivatives: 完了 original=0 made=0 failed=0 icc_dropped=0"),
         "{stdout}"
     );
-    for stage in [
-        "index_drive",
-        "infer",
-        "enrich",
-        "fetch_derivatives",
-        "quality",
-    ] {
+    for stage in ["index_drive", "fetch_derivatives"] {
+        assert!(
+            stdout.contains(&format!(
+                "段 {stage}: 省略（Drive の鍵が無いので飛ばします）"
+            )),
+            "{stage}\n{stdout}"
+        );
+    }
+    for stage in ["infer", "enrich", "quality"] {
         assert!(
             stdout.contains(&format!("段 {stage}: 完了（件数なし）")),
             "{stage}\n{stdout}"
@@ -247,6 +260,15 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
     assert!(data.join("catalog.db").exists());
     assert!(data.join("tmp").is_dir());
     assert!(stdout.contains("段 quality: 完了（件数なし）"), "{stdout}");
+    // 鍵が無いので Drive の 2 つの段は飛ばす（通信しない。失敗ではないので終了コードは 0）
+    for stage in ["index_drive", "fetch_derivatives"] {
+        assert!(
+            stdout.contains(&format!(
+                "段 {stage}: 省略（Drive の鍵が無いので飛ばします）"
+            )),
+            "{stage}\n{stdout}"
+        );
+    }
     assert!(
         stdout.contains("写真: 表示可能 0 / 取得待ち 0 / 全0"),
         "{stdout}"

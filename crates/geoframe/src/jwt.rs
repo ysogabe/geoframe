@@ -8,7 +8,7 @@
 //! - JWT は `base64url(header).base64url(claims).base64url(signature)`（パディングなし）。
 //! - **鍵の中身・トークンをログやエラー文字列に出さない**。[`JwtError`] は定型の種類だけを持つ。
 //!   [`Rs256Signer`] の `Debug` は中身を出さない。
-//! - 鍵ファイルを読む処理（パスは設定が持つ）と、Google へ送る処理は T2.4。ここは署名と検証だけ。
+//! - 鍵ファイルを読む処理（パスは設定が持つ）と、Google へ送る処理は [`crate::drive`]（T2.4）。ここは署名と検証だけ。
 
 use std::fmt;
 

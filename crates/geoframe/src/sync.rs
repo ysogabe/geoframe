@@ -281,14 +281,24 @@ fn copy_snapshot(
     Ok(copy)
 }
 
-/// 段の一覧（[`STAGE_NAMES`] の順）。T2.4〜T2.6 で、残りの `Placeholder` を中身の入った段に置き換えていく
-/// （T2.3 で `index_local`・`local_derivatives` が入った）。
+/// 段の一覧（[`STAGE_NAMES`] の順）。T2.5・T2.6 で、残りの `Placeholder` を中身の入った段に置き換えていく
+/// （T2.3 で `index_local`・`local_derivatives`、T2.4 で `index_drive`・`fetch_derivatives` が入った）。
 pub fn default_stages() -> Vec<Box<dyn Stage>> {
+    // Drive の 2 つの段は、トークン・フォルダ ID を共有する（現行は 1 サイクルで `svc` を作って両方に渡す）
+    default_stages_with(Arc::new(crate::drive::DriveShared::new()))
+}
+
+/// [`default_stages`] の、Drive の状態（通信先・再試行）を指定できる形（試験用）。
+pub(crate) fn default_stages_with(drive: Arc<crate::drive::DriveShared>) -> Vec<Box<dyn Stage>> {
     STAGE_NAMES
         .iter()
         .map(|name| match *name {
             "index_local" => Box::new(crate::local::IndexLocal) as Box<dyn Stage>,
-            "local_derivatives" => Box::new(crate::local::LocalDerivatives),
+            "index_drive" => Box::new(crate::drive::IndexDrive::new(Arc::clone(&drive))),
+            "local_derivatives" => Box::new(crate::local::LocalDerivatives::new()),
+            "fetch_derivatives" => {
+                Box::new(crate::drive::FetchDerivatives::new(Arc::clone(&drive)))
+            }
             _ => Box::new(Placeholder(name)),
         })
         .collect()

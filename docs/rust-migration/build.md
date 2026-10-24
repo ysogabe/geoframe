@@ -154,7 +154,7 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 ### 7.4 残した課題
 
 - 本番機の`resolv.conf`（`search`が複数、`options ndots`など）でのmuslの名前解決の再確認（P5）。
-- Google（`oauth2.googleapis.com`・`www.googleapis.com`）への実際の認証と、Driveの大きな原本のダウンロードに合わせたタイムアウトの調整はT2.4。今の`net::agent()`は接続10秒・1要求30秒。
+- Google（`oauth2.googleapis.com`・`www.googleapis.com`）への認証は、T2.4で入れた（合成の鍵を実際のGoogleに向けるとmusl静的バイナリのまま署名・TLS・トークンの交換が動き、400で断られる。[server.md §14.10](server.md#1410-検証環境での確認鍵が無い状態2026-10-25)）。本物の鍵での確認は管理者（[§14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)）。タイムアウトは`net::agent()`が接続10秒・1要求30秒で、Driveの原本のダウンロードだけ要求ごとに15分へ延ばす（[§14.3](server.md#143-通信)）。
 - プロキシは`ureq`の既定どおり環境変数（`HTTPS_PROXY`など）を見る。unitは与えない。
 
 ## 8. 画像処理の依存（P2 / T2.2）

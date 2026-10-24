@@ -727,7 +727,7 @@ fn jpegは原本をdisplayにしheicはderivativeを作る() {
             ("photos/c.png", jpeg_plain()),
         ],
     );
-    let counts = s.run(&LocalDerivatives);
+    let counts = s.run(&LocalDerivatives::new());
     assert_eq!(get(&counts, "original"), 2);
     assert_eq!(get(&counts, "made"), 1);
     assert_eq!(get(&counts, "failed"), 0);
@@ -756,7 +756,7 @@ fn jpegは原本をdisplayにしheicはderivativeを作る() {
         assert_eq!((at.len(), &at[10..11]), (19, "T"), "{at}");
     }
     // 2 回目は何もしない
-    let again = s.run(&LocalDerivatives);
+    let again = s.run(&LocalDerivatives::new());
     assert_eq!((get(&again, "original"), get(&again, "made")), (0, 0));
 }
 
@@ -768,7 +768,7 @@ fn 位置の無い写真と他のsourceの行は対象にしない() {
     s.sql(
         "INSERT INTO photos(source, drive_id, name, lat, lon) VALUES('drive','d1','x.jpg',1.0,2.0)",
     );
-    let counts = s.run(&LocalDerivatives);
+    let counts = s.run(&LocalDerivatives::new());
     assert_eq!(get(&counts, "made") + get(&counts, "original"), 0);
     assert!(!s.root().join("derivatives").exists());
     assert!(s.rows().iter().all(|r| r.display.is_none()));
@@ -785,11 +785,11 @@ fn 一度に作る枚数はfetch_per_cycleまで_idの順() {
             ("photos/3.jpg", jpeg_gps()),
         ],
     );
-    assert_eq!(get(&s.run(&LocalDerivatives), "original"), 2);
+    assert_eq!(get(&s.run(&LocalDerivatives::new()), "original"), 2);
     assert!(s.row("photos/1.jpg").display.is_some());
     assert!(s.row("photos/2.jpg").display.is_some());
     assert!(s.row("photos/3.jpg").display.is_none());
-    assert_eq!(get(&s.run(&LocalDerivatives), "original"), 1);
+    assert_eq!(get(&s.run(&LocalDerivatives::new()), "original"), 1);
     assert!(s.row("photos/3.jpg").display.is_some());
 }
 
@@ -799,7 +799,7 @@ fn 変換に失敗した写真は数えて続ける() {
     // 画像として読めるのは索引の時点だけ。後から壊れた HEIC
     index_with_location(&s, &[("photos/a.heic", heic()), ("photos/b.heic", heic())]);
     fs::write(s.root().join("photos/a.heic"), b"broken").unwrap();
-    let counts = s.run(&LocalDerivatives);
+    let counts = s.run(&LocalDerivatives::new());
     assert_eq!((get(&counts, "failed"), get(&counts, "made")), (1, 1));
     assert!(s.row("photos/a.heic").display.is_none());
     assert!(s.row("photos/b.heic").display.is_some());
@@ -810,6 +810,74 @@ fn 変換に失敗した写真は数えて続ける() {
         .filter(|n| n.ends_with(".part"))
         .collect();
     assert!(leftovers.is_empty(), "{leftovers:?}");
+}
+
+#[test]
+fn 失敗が続く写真は枠を塞がず_後続の写真が作られる() {
+    // T2.4 の受入条件②（local_derivatives にも同じ仕組み）。1 サイクル 2 枚、先頭の 3 枚が恒久的に失敗する
+    let s = setup_with("local-deriv-block", &[("GEOFRAME_FETCH_PER_CYCLE", "2")]);
+    index_with_location(
+        &s,
+        &[
+            ("photos/a1.heic", heic()),
+            ("photos/a2.heic", heic()),
+            ("photos/a3.heic", heic()),
+            ("photos/b1.jpg", jpeg_gps()),
+            ("photos/b2.jpg", jpeg_gps()),
+            ("photos/b3.jpg", jpeg_gps()),
+        ],
+    );
+    for name in ["a1", "a2", "a3"] {
+        fs::write(s.root().join(format!("photos/{name}.heic")), b"broken").unwrap();
+    }
+    let stage = LocalDerivatives::new();
+    let shown = |s: &Setup| {
+        s.rows()
+            .iter()
+            .filter(|r| r.display.is_some())
+            .map(|r| r.path.clone().unwrap())
+            .collect::<Vec<_>>()
+    };
+    // 1 回目: id の若い a1・a2 を試して失敗
+    let counts = s.run(&stage);
+    assert_eq!((get(&counts, "failed"), get(&counts, "original")), (2, 0));
+    assert!(shown(&s).is_empty());
+    // 2 回目: a1・a2 を飛ばし、a3（失敗）と b1
+    let counts = s.run(&stage);
+    assert_eq!(get(&counts, "skipped_backoff"), 2);
+    assert_eq!((get(&counts, "failed"), get(&counts, "original")), (1, 1));
+    // 3 回目: 失敗中の 3 枚を飛ばして b2・b3
+    let counts = s.run(&stage);
+    assert_eq!(get(&counts, "skipped_backoff"), 3);
+    assert_eq!(get(&counts, "original"), 2);
+    assert_eq!(
+        shown(&s),
+        ["photos/b1.jpg", "photos/b2.jpg", "photos/b3.jpg"]
+    );
+    // 4 回目: 失敗中のものだけが残り、何も試さない
+    let counts = s.run(&stage);
+    assert_eq!((get(&counts, "failed"), get(&counts, "made")), (0, 0));
+    assert_eq!(get(&counts, "skipped_backoff"), 3);
+    // ファイルが更新されれば（mtime が変わる）すぐ試す
+    s.put("photos/a1.heic", &heic(), T0 + 100);
+    s.run(&IndexLocal);
+    s.sql("UPDATE photos SET lat=35.0, lon=139.0, loc_source='manual' WHERE lat IS NULL");
+    let counts = s.run(&stage);
+    assert_eq!((get(&counts, "made"), get(&counts, "failed")), (1, 0));
+    assert!(s.row("photos/a1.heic").display.is_some());
+}
+
+#[test]
+fn dry_runは失敗を覚えない() {
+    let s = setup("local-deriv-dry-memo");
+    index_with_location(&s, &[("photos/a.heic", heic())]);
+    fs::write(s.root().join("photos/a.heic"), b"broken").unwrap();
+    let stage = LocalDerivatives::new();
+    // dry-run は変換しないので失敗も分からないが、`resolve_existing` の失敗（存在しない）は数える。覚えない
+    fs::remove_file(s.root().join("photos/a.heic")).unwrap();
+    assert_eq!(get(&s.dry_run(&stage), "failed"), 1);
+    assert_eq!(get(&s.dry_run(&stage), "failed"), 1);
+    assert!(!s.dry_run(&stage).to_string().contains("skipped_backoff"));
 }
 
 #[test]
@@ -824,7 +892,7 @@ fn dbのpathが置き場の外を指しても読まない() {
          ('local','link/x.heic','x.heic',1.0,2.0),
          ('local','/etc/passwd.heic','x.heic',1.0,2.0)",
     );
-    let counts = s.run(&LocalDerivatives);
+    let counts = s.run(&LocalDerivatives::new());
     assert_eq!(get(&counts, "failed"), 3);
     assert!(s.rows().iter().all(|r| r.display.is_none()));
     assert!(!s.root().join("derivatives").exists());
@@ -837,7 +905,7 @@ fn derivativeのdry_runは作らず件数だけ() {
         &s,
         &[("photos/a.heic", heic()), ("photos/b.jpg", jpeg_gps())],
     );
-    let counts = s.dry_run(&LocalDerivatives);
+    let counts = s.dry_run(&LocalDerivatives::new());
     assert_eq!((get(&counts, "original"), get(&counts, "made")), (1, 1));
     assert!(s.rows().iter().all(|r| r.display.is_none()));
     assert!(!s.root().join("derivatives").exists());
@@ -1219,7 +1287,7 @@ fn run_sequence(s: &Setup, mode: Mode) -> (Counts, Counts, Counts) {
             other => panic!("{other:?}"),
         };
         let index = done(IndexLocal.run(ctx).unwrap());
-        let derivatives = done(LocalDerivatives.run(ctx).unwrap());
+        let derivatives = done(LocalDerivatives::new().run(ctx).unwrap());
         let organized = organize(ctx).unwrap();
         (index, derivatives, organized)
     })
@@ -1253,7 +1321,7 @@ fn derivativeのdry_runもパスを検査し_存在しないものはfailedに�
          ('local','photos/missing.jpg','missing.jpg',1.0,2.0),
          ('local','../x.heic','x.heic',1.0,2.0)",
     );
-    let dry = s.dry_run(&LocalDerivatives);
+    let dry = s.dry_run(&LocalDerivatives::new());
     assert_eq!(
         (
             get(&dry, "original"),
@@ -1263,7 +1331,7 @@ fn derivativeのdry_runもパスを検査し_存在しないものはfailedに�
         (0, 0, 2),
         "{dry}"
     );
-    assert_eq!(s.run(&LocalDerivatives), dry);
+    assert_eq!(s.run(&LocalDerivatives::new()), dry);
 }
 
 #[test]

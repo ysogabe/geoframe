@@ -17,6 +17,8 @@
 //! | 同期サイクルの間隔（分） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10` |
 //! | ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可） | なし | `GEOFRAME_PHOTOS_DIR` | `photos` |
 //! | 同期 1 サイクルで derivative を作る枚数 | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25` |
+//! | Drive のサービスアカウント鍵 JSON のパス（相対はカレントディレクトリ基準。現行は `app/` 基準） | なし | `GEOFRAME_DRIVE_KEY` | `drive_key.json` |
+//! | 取り込む Drive のフォルダ（名前、または 20 字以上の英数字なら ID） | なし | `GEOFRAME_DRIVE_FOLDER` | `GeoFrame` |
 //!
 //! `TZ` は Rust 側では読まない。P1 は時刻の変換をせず、`taken_at` などの naive な日時は文字列の
 //! まま扱う（inventory.md §6.1）。systemd unit が `TZ=Asia/Tokyo` を与え続けるのは、並走する
@@ -53,8 +55,6 @@ pub const DB_FILE_NAME: &str = "catalog.db";
 /// テストで確かめている（Python 側で項目が増えたのに Rust の分類が漏れるのを防ぐ）。
 pub const UNSUPPORTED_ENV: &[&str] = &[
     // P2: 取り込み
-    "GEOFRAME_DRIVE_KEY",
-    "GEOFRAME_DRIVE_FOLDER",
     "GEOFRAME_QUALITY_PER_CYCLE",
     "GEOFRAME_INFER_OFFSET_MIN",
     // P3: 管理機能（地図タイル）
@@ -97,6 +97,9 @@ pub const SUPPORTED_ENV: &[&str] = &[
     // T2.3: ローカル写真の索引（index_local・local_derivatives）
     "GEOFRAME_PHOTOS_DIR",
     "GEOFRAME_FETCH_PER_CYCLE",
+    // T2.4: Drive の索引と取得
+    "GEOFRAME_DRIVE_KEY",
+    "GEOFRAME_DRIVE_FOLDER",
 ];
 
 pub const DEFAULT_INFER_MIN: f64 = 15.0;
@@ -108,6 +111,11 @@ pub const DEFAULT_DRIVE_POLL_MIN: f64 = 10.0;
 pub const DEFAULT_PHOTOS_DIR: &str = "photos";
 /// 同期 1 サイクルで derivative を作る枚数の既定。現行の `FETCH_PER_CYCLE`。
 pub const DEFAULT_FETCH_PER_CYCLE: u32 = 25;
+/// Drive の鍵ファイルの既定の名前。現行は `app/drive_key.json`。Rust は `app/` が無いので、
+/// 相対パスはカレントディレクトリ基準（`GEOFRAME_DATA_DIR` の既定 `./var` と同じ扱い）。本番は絶対パス。
+pub const DEFAULT_DRIVE_KEY: &str = "drive_key.json";
+/// 取り込む Drive のフォルダの既定の名前。
+pub const DEFAULT_DRIVE_FOLDER: &str = "GeoFrame";
 /// `GEOFRAME_DRIVE_POLL_MIN` の上限（分）。1 年。これを超える値は設定の誤りとして断る。
 const MAX_DRIVE_POLL_MIN: f64 = 525_600.0;
 /// 位置推定の段階窓のうち固定のもの（秒）。現行の `INFER_WINDOWS_S = sorted({INFER_WINDOW_S, 2h, 12h})`。
@@ -212,6 +220,12 @@ pub struct Config {
     photos_dir_setting: PathBuf,
     /// 同期 1 サイクルで derivative を作る枚数。`GEOFRAME_FETCH_PER_CYCLE`（0 以上の整数）。
     pub fetch_per_cycle: u32,
+    /// Drive のサービスアカウント鍵 JSON のパス（絶対パス）。`GEOFRAME_DRIVE_KEY`。**持つのはパスだけ**で、
+    /// 中身は [`crate::drive`] が段の中で読む（設定にも起動ログにも載せない）。
+    pub drive_key: PathBuf,
+    /// 取り込む Drive のフォルダ。`GEOFRAME_DRIVE_FOLDER`（名前、または 20 字以上の英数字・`_`・`-` なら ID）。
+    /// 起動ログには載せない（フォルダ名は利用者の情報）。
+    pub drive_folder: String,
 }
 
 impl Config {
@@ -332,6 +346,18 @@ impl Config {
             None => DEFAULT_FETCH_PER_CYCLE,
         };
 
+        // 現行は `ROOT / 値`（`ROOT` は `app/`）。Rust は `app/` が無いので、相対パスはカレントディレクトリ基準にする
+        let drive_key = std::path::absolute(PathBuf::from(
+            get("GEOFRAME_DRIVE_KEY")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_else(|| DEFAULT_DRIVE_KEY.into()),
+        ))
+        .map_err(|e| ConfigError(format!("GEOFRAME_DRIVE_KEY を絶対パスにできません: {e}")))?;
+        let drive_folder = get("GEOFRAME_DRIVE_FOLDER")
+            .unwrap_or_else(|| DEFAULT_DRIVE_FOLDER.into())
+            .trim()
+            .to_string();
+
         Ok(Self {
             listen,
             data_dir,
@@ -346,6 +372,8 @@ impl Config {
             drive_poll_min,
             photos_dir_setting,
             fetch_per_cycle,
+            drive_key,
+            drive_folder,
         })
     }
 
@@ -680,6 +708,47 @@ mod tests {
             if value.len() > 2 {
                 assert!(!err.0.contains(value), "{err}");
             }
+        }
+    }
+
+    #[test]
+    fn drive_key_and_folder_follow_the_python_defaults() {
+        let cwd = std::env::current_dir().unwrap();
+        let c = load(&[], &Overrides::default()).unwrap();
+        assert_eq!(c.drive_key, cwd.join("drive_key.json"));
+        assert_eq!(c.drive_folder, "GeoFrame");
+        let c = load(
+            &[
+                ("GEOFRAME_DRIVE_KEY", "/etc/g/key.json"),
+                ("GEOFRAME_DRIVE_FOLDER", " Photos "),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.drive_key, PathBuf::from("/etc/g/key.json"));
+        assert_eq!(c.drive_folder, "Photos");
+        // 相対パスはカレントディレクトリ基準、空文字は未設定と同じ
+        let c = load(
+            &[
+                ("GEOFRAME_DRIVE_KEY", "k/x.json"),
+                ("GEOFRAME_DRIVE_FOLDER", " "),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.drive_key, cwd.join("k/x.json"));
+        assert_eq!(c.drive_folder, "GeoFrame");
+        // 鍵のパスもフォルダ名も、Debug・起動ログの要約には載せない
+        let c = load(
+            &[
+                ("GEOFRAME_DRIVE_KEY", "/etc/g/secret-name.json"),
+                ("GEOFRAME_DRIVE_FOLDER", "PrivateFolderName"),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        for text in [format!("{c:?}"), c.log_summary()] {
+            assert!(!text.contains("secret-name") && !text.contains("PrivateFolderName"));
         }
     }
 

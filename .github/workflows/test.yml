@@ -37,11 +37,13 @@ jobs:
       - name: 設定リファレンスの同期検査
         run: python3 tools/gen_env_reference.py --check
 
-      - name: EXIF・縮小寸法・向き・JPEGのEOI・ローカル索引のフィクスチャの同期検査
+      - name: EXIF・縮小寸法・向き・JPEGのEOI・ローカル索引・Drive索引のフィクスチャの同期検査
         # Rust の画像処理（crates/geoframe/src/imaging）が Python の extract_exif・norm_time・Pillow の
         # thumbnail・exif_transpose（XMP の向きの補完を含む）と同じ結果になることを確かめるテストの基準。
         # ローカル索引（crates/geoframe/src/local.rs）は Python の index_local と photos の全列が一致することを
         # 確かめる基準（HEIC を索引するため pillow-heif が要る。requirements.txt に入っている）。
+        # Drive の索引・取得（crates/geoframe/src/drive）は Python の index_drive・fetch_derivatives を偽の
+        # Drive に流した結果（photos の全列・Drive への問い合わせ・変換できた原本の寸法）と突き合わせる基準。
         # Python の読み取りが変わったら落ちる
         run: |
           python3 tools/gen_exif_fixture.py --check
@@ -49,6 +51,7 @@ jobs:
           python3 tools/gen_orientation_fixture.py --check
           python3 tools/gen_jpeg_eoi_fixture.py --check
           python3 tools/gen_local_index_fixture.py --check
+          python3 tools/gen_drive_index_fixture.py --check
 
       - name: スキーマのフィクスチャの同期検査
         # Rust のスキーマ（crates/geoframe/src/schema.rs）が Python の空 DB と一致することを確かめる

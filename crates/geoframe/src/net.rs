@@ -28,8 +28,8 @@ const SELFCHECK_POINT: (f64, f64) = (35.681, 139.767);
 
 /// 接続を張るまでの待ち。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-/// 1 回の要求（名前解決から本文の読み切りまで）の上限。Drive の大きな原本のダウンロードは
-/// T2.4 で個別に延ばす。
+/// 1 回の要求（名前解決から本文の読み切りまで）の上限。Drive の大きな原本のダウンロードだけ、
+/// 要求ごとに延ばす（[`crate::drive`]）。
 const GLOBAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 同期サイクルが使う HTTP クライアント。複製は安く、接続は共有される。
