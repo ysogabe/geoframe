@@ -203,31 +203,32 @@ struct Group {
     confidence: f64,
 }
 
-/// 同じ SHA-256（＝同じバイト列）の写真は、`id` が最小の行の pHash・指標にそろえる。同じ入力なら特徴量は
-/// 同じはずで、違うのは算法が違う行（Python が作った行と Rust が作った行）が混ざったときだけ。そろえないと、
-/// 同一ファイルの 2 枚のスコアが算法の差で食い違い、どちらを推奨にするかが算法の差で決まってしまう。
-/// Python だけが作った行では、同じ SHA の特徴量は同じなので、何も変わらない。
-fn unify_same_content(photos: &[QualityPhoto]) -> Vec<QualityPhoto> {
+/// 同じ SHA-256（＝同じバイト列）の写真は、**指標**（鮮明さ・露出・コントラストなど）を `id` が最小の行の
+/// ものにそろえる。同じ入力なら指標は同じはずで、違うのは算法が違う行（Python が作った行と Rust が作った行）が
+/// 混ざったときだけ。そろえないと、同一ファイルの 2 枚のスコアが算法の差で食い違い、どちらを推奨にするかが
+/// 算法の差で決まってしまう。Python だけが作った行では、同じ SHA の指標は同じなので、何も変わらない。
+///
+/// **pHash はそろえない**。類似の結びつき（時刻 3 分以内・距離 12 以下）は各行の元の pHash で判定する。
+/// そろえると、同じ SHA の 2 枚目が別の写真と結びついていたのに、1 枚目の pHash では結びつかなくなり、
+/// グループの顔ぶれ・`kind`・配信の抑制が Python と変わる（同じ SHA の pHash が算法の差で違っても、
+/// 結びつきは Python と同じ規則で決める）。
+fn unify_same_content_metrics(photos: &[QualityPhoto]) -> Vec<QualityPhoto> {
     let mut first: HashMap<&str, &QualityPhoto> = HashMap::new();
     for photo in photos {
         first.entry(photo.sha256.as_str()).or_insert(photo);
     }
     photos
         .iter()
-        .map(|photo| {
-            let head = first[photo.sha256.as_str()];
-            QualityPhoto {
-                phash: head.phash,
-                metrics: head.metrics,
-                ..photo.clone()
-            }
+        .map(|photo| QualityPhoto {
+            metrics: first[photo.sha256.as_str()].metrics,
+            ..photo.clone()
         })
         .collect()
 }
 
 /// 最新の特徴量から、グループに属する行だけを作る。`photos` は `id` の昇順（現行の `ORDER BY p.id`）。
 pub fn build_quality_rows(photos: &[QualityPhoto]) -> Vec<QualityRow> {
-    let photos = &unify_same_content(photos)[..];
+    let photos = &unify_same_content_metrics(photos)[..];
     let mut union = UnionFind::new(photos.len());
     // 完全重複: 同じ SHA の 2 枚目以降を最初の 1 枚につなぐ
     let mut first_by_sha: HashMap<&str, usize> = HashMap::new();

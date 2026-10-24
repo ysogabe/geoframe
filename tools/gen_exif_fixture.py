@@ -240,15 +240,17 @@ def build() -> dict:
 
 def fill(doc: dict) -> dict:
     """保存済みの入力から、Pythonの結果を埋める"""
-    os.environ.setdefault("GEOFRAME_DATA_DIR", tempfile.mkdtemp(prefix="geoframe-exif-"))
     sys.path.insert(0, str(APP))
-    from geoframe.util import norm_time
-    with tempfile.TemporaryDirectory(prefix="geoframe-exif-case-") as tmp:
+    with (tempfile.TemporaryDirectory(prefix="geoframe-exif-") as data_dir,
+          tempfile.TemporaryDirectory(prefix="geoframe-exif-case-") as tmp):
+        # config.py は import 時に環境変数を読む。置き場を作らせないよう一時の場所を指す（終わったら消す）
+        os.environ["GEOFRAME_DATA_DIR"] = data_dir
+        from geoframe.util import norm_time
         for case in doc["cases"]:
             path = Path(tmp) / "case.jpg"
             path.write_bytes(base64.b64decode(case["jpeg_base64"]))
             case["python"] = extract(path)
-    doc["norm_time"] = [{"input": s, "python": norm_time(s)} for s in NORM_TIME_INPUTS]
+        doc["norm_time"] = [{"input": s, "python": norm_time(s)} for s in NORM_TIME_INPUTS]
     return doc
 
 

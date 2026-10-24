@@ -238,12 +238,13 @@ def python_result(case: dict, tmp: Path) -> dict:
 
 
 def fill(doc: dict) -> dict:
-    # config.py は import 時に環境変数を読む。置き場を作らせないよう一時の場所を指す
-    os.environ["GEOFRAME_DATA_DIR"] = tempfile.mkdtemp(prefix="geoframe-orient-")
     sys.path.insert(0, str(APP))
     import pillow_heif
     pillow_heif.register_heif_opener()
-    with tempfile.TemporaryDirectory(prefix="geoframe-orient-case-") as tmp:
+    with (tempfile.TemporaryDirectory(prefix="geoframe-orient-") as data_dir,
+          tempfile.TemporaryDirectory(prefix="geoframe-orient-case-") as tmp):
+        # config.py は import 時に環境変数を読む。置き場を作らせないよう一時の場所を指す（終わったら消す）
+        os.environ["GEOFRAME_DATA_DIR"] = data_dir
         for case in doc["cases"]:
             case["python"] = python_result(case, Path(tmp))
     return doc

@@ -161,7 +161,11 @@ def normalize(rows: list) -> list:
 
 def run_python(steps: list) -> list:
     """各段階の操作をPythonの`index_local`に流し、段階ごとの結果（行・ファイルの有無）を返す"""
-    data_dir = tempfile.mkdtemp(prefix="geoframe-local-index-")
+    with tempfile.TemporaryDirectory(prefix="geoframe-local-index-") as data_dir:
+        return _run_python(steps, data_dir)
+
+
+def _run_python(steps: list, data_dir: str) -> list:
     os.environ["GEOFRAME_DATA_DIR"] = data_dir
     sys.path.insert(0, str(APP))
     from geoframe import drive

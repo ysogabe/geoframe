@@ -4827,6 +4827,248 @@
    ]
   },
   {
+   "name": "same_sha_phash_differs",
+   "photos": [
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(1,'drive','p1','2024-05-06 10:00','derivatives/q1.jpg','m1',1.5,NULL)",
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(2,'drive','p2','2024-05-06 10:10','derivatives/q2.jpg','m2',2.5,NULL)",
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(3,'drive','p3','2024-05-06 10:11','derivatives/q3.jpg','m3',3.5,NULL)",
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(4,'drive','p4','2024-05-07 10:00','derivatives/q4.jpg','m4',4.5,NULL)",
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(5,'drive','p5','2024-05-07 10:30','derivatives/q5.jpg','m5',5.5,NULL)"
+   ],
+   "feats": {
+    "derivatives/q1.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    },
+    "derivatives/q2.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c16",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    },
+    "derivatives/q3.jpg": {
+     "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "phash": "9e3779b97f4a43ea",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    },
+    "derivatives/q4.jpg": {
+     "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    },
+    "derivatives/q5.jpg": {
+     "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+     "phash": "9e377e4680b583ed",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "steps": [
+    {
+     "name": "cycle",
+     "run": {
+      "kind": "cycle",
+      "limit": 100
+     },
+     "sql": [],
+     "feats": {},
+     "python": {
+      "name": "cycle",
+      "result": {
+       "analyzed": 5,
+       "removed": 0,
+       "remaining": 0,
+       "rebuilt": true
+      },
+      "features": [
+       {
+        "photo_id": 1,
+        "display": "derivatives/q1.jpg",
+        "source_md5": "m1",
+        "source_mtime": 1.5,
+        "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "phash": "9e3779b97f4a7c15",
+        "sharpness": 5.0,
+        "luminance": 120.0,
+        "exposure_score": 90.0,
+        "black_clip": 0.01,
+        "white_clip": 0.01,
+        "contrast": 120.0,
+        "failed": 0
+       },
+       {
+        "photo_id": 2,
+        "display": "derivatives/q2.jpg",
+        "source_md5": "m2",
+        "source_mtime": 2.5,
+        "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "phash": "9e3779b97f4a7c16",
+        "sharpness": 5.0,
+        "luminance": 120.0,
+        "exposure_score": 90.0,
+        "black_clip": 0.01,
+        "white_clip": 0.01,
+        "contrast": 120.0,
+        "failed": 0
+       },
+       {
+        "photo_id": 3,
+        "display": "derivatives/q3.jpg",
+        "source_md5": "m3",
+        "source_mtime": 3.5,
+        "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "phash": "9e3779b97f4a43ea",
+        "sharpness": 5.0,
+        "luminance": 120.0,
+        "exposure_score": 90.0,
+        "black_clip": 0.01,
+        "white_clip": 0.01,
+        "contrast": 120.0,
+        "failed": 0
+       },
+       {
+        "photo_id": 4,
+        "display": "derivatives/q4.jpg",
+        "source_md5": "m4",
+        "source_mtime": 4.5,
+        "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "phash": "9e3779b97f4a7c15",
+        "sharpness": 5.0,
+        "luminance": 120.0,
+        "exposure_score": 90.0,
+        "black_clip": 0.01,
+        "white_clip": 0.01,
+        "contrast": 120.0,
+        "failed": 0
+       },
+       {
+        "photo_id": 5,
+        "display": "derivatives/q5.jpg",
+        "source_md5": "m5",
+        "source_mtime": 5.5,
+        "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "phash": "9e377e4680b583ed",
+        "sharpness": 5.0,
+        "luminance": 120.0,
+        "exposure_score": 90.0,
+        "black_clip": 0.01,
+        "white_clip": 0.01,
+        "contrast": 120.0,
+        "failed": 0
+       }
+      ],
+      "quality": [
+       {
+        "photo_id": 1,
+        "display": "derivatives/q1.jpg",
+        "source_md5": "m1",
+        "source_mtime": 1.5,
+        "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "group_id": 2,
+        "group_kind": "similar",
+        "rank_in_group": 1,
+        "recommended": 1,
+        "score": 53.9,
+        "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+        "issues_json": "[]"
+       },
+       {
+        "photo_id": 2,
+        "display": "derivatives/q2.jpg",
+        "source_md5": "m2",
+        "source_mtime": 2.5,
+        "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "group_id": 2,
+        "group_kind": "similar",
+        "rank_in_group": 2,
+        "recommended": 0,
+        "score": 53.9,
+        "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+        "issues_json": "[]"
+       },
+       {
+        "photo_id": 3,
+        "display": "derivatives/q3.jpg",
+        "source_md5": "m3",
+        "source_mtime": 3.5,
+        "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "group_id": 2,
+        "group_kind": "similar",
+        "rank_in_group": 3,
+        "recommended": 1,
+        "score": 53.9,
+        "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+        "issues_json": "[]"
+       },
+       {
+        "photo_id": 4,
+        "display": "derivatives/q4.jpg",
+        "source_md5": "m4",
+        "source_mtime": 4.5,
+        "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "group_id": 1,
+        "group_kind": "exact",
+        "rank_in_group": 1,
+        "recommended": 1,
+        "score": 53.9,
+        "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+        "issues_json": "[]"
+       },
+       {
+        "photo_id": 5,
+        "display": "derivatives/q5.jpg",
+        "source_md5": "m5",
+        "source_mtime": 5.5,
+        "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "group_id": 1,
+        "group_kind": "exact",
+        "rank_in_group": 2,
+        "recommended": 0,
+        "score": 53.9,
+        "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+        "issues_json": "[]"
+       }
+      ],
+      "dirty": "0"
+     }
+    }
+   ]
+  },
+  {
    "name": "not_dirty",
    "photos": [
     "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(1,'drive','p1','2024-05-06 10:00','derivatives/q1.jpg','m1',1.5,NULL)",
@@ -14734,6 +14976,1454 @@
      }
     }
    ]
+  }
+ ],
+ "switchbacks": [
+  {
+   "name": "exact_copy_added",
+   "photos": [
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(1,'drive','p1','2024-05-06 10:00','derivatives/q1.jpg','m1',1.5,NULL)",
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(3,'drive','p3','2024-05-07 09:00','derivatives/q3.jpg','m3',3.5,NULL)"
+   ],
+   "python_feats": {
+    "derivatives/q1.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    },
+    "derivatives/q3.jpg": {
+     "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+     "phash": "9e3779b940b583ea",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "rust_photos": [
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(2,'drive','p2','2024-05-06 10:00','derivatives/q2.jpg','m2',2.5,NULL)"
+   ],
+   "rust_feats": {
+    "derivatives/q2.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c16",
+     "metrics": {
+      "sharpness": 5.02,
+      "luminance": 120.0,
+      "exposure_score": 90.2,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "rust_photo_ids": [
+    2
+   ],
+   "python_reanalyzed_feats": {
+    "derivatives/q2.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "python": {
+    "python_built": {
+     "name": "python_built",
+     "result": {
+      "analyzed": 2,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "phash": "9e3779b940b583ea",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [],
+     "dirty": "0",
+     "algorithms": []
+    },
+    "rust_emulated": {
+     "name": "rust_emulated",
+     "result": {
+      "analyzed": 1,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c16",
+       "sharpness": 5.02,
+       "luminance": 120.0,
+       "exposure_score": 90.2,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "phash": "9e3779b940b583ea",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "rust-phash-v1:t3:h12"
+     ]
+    },
+    "python_idle": {
+     "name": "python_idle",
+     "result": {
+      "analyzed": 0,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": false
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c16",
+       "sharpness": 5.02,
+       "luminance": 120.0,
+       "exposure_score": 90.2,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "phash": "9e3779b940b583ea",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "rust-phash-v1:t3:h12"
+     ]
+    },
+    "python_rebuild": {
+     "name": "python_rebuild",
+     "result": {
+      "analyzed": 0,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c16",
+       "sharpness": 5.02,
+       "luminance": 120.0,
+       "exposure_score": 90.2,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "phash": "9e3779b940b583ea",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 17.3,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 90.6,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "poc-phash-v1:t3:h12"
+     ]
+    },
+    "python_reanalyze": {
+     "name": "python_reanalyze",
+     "result": {
+      "analyzed": 1,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+       "phash": "9e3779b940b583ea",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "poc-phash-v1:t3:h12"
+     ]
+    },
+    "diff": [
+     {
+      "photo_id": 1,
+      "change": "changed",
+      "columns": [
+       "rank_in_group",
+       "recommended",
+       "score"
+      ]
+     },
+     {
+      "photo_id": 2,
+      "change": "changed",
+      "columns": [
+       "rank_in_group",
+       "recommended",
+       "score"
+      ]
+     }
+    ],
+    "diff_reanalyze": []
+   }
+  },
+  {
+   "name": "bridge_by_copy",
+   "photos": [
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(1,'drive','p1','2024-05-06 10:00','derivatives/q1.jpg','m1',1.5,NULL)",
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(3,'drive','p3','2024-05-06 10:11','derivatives/q3.jpg','m3',3.5,NULL)"
+   ],
+   "python_feats": {
+    "derivatives/q1.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    },
+    "derivatives/q3.jpg": {
+     "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+     "phash": "9e3779b97f4a43ea",
+     "metrics": {
+      "sharpness": 4.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "rust_photos": [
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(2,'drive','p2','2024-05-06 10:10','derivatives/q2.jpg','m2',2.5,NULL)"
+   ],
+   "rust_feats": {
+    "derivatives/q2.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c16",
+     "metrics": {
+      "sharpness": 5.3,
+      "luminance": 120.0,
+      "exposure_score": 91.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "rust_photo_ids": [
+    2
+   ],
+   "python_reanalyzed_feats": {
+    "derivatives/q2.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "python": {
+    "python_built": {
+     "name": "python_built",
+     "result": {
+      "analyzed": 2,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "phash": "9e3779b97f4a43ea",
+       "sharpness": 4.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [],
+     "dirty": "0",
+     "algorithms": []
+    },
+    "rust_emulated": {
+     "name": "rust_emulated",
+     "result": {
+      "analyzed": 1,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c16",
+       "sharpness": 5.3,
+       "luminance": 120.0,
+       "exposure_score": 91.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "phash": "9e3779b97f4a43ea",
+       "sharpness": 4.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 84.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 84.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 3,
+       "recommended": 1,
+       "score": 22.9,
+       "reasons_json": "[\"露出良好\"]",
+       "issues_json": "[\"ぼけ傾向\"]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "rust-phash-v1:t3:h12"
+     ]
+    },
+    "python_idle": {
+     "name": "python_idle",
+     "result": {
+      "analyzed": 0,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": false
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c16",
+       "sharpness": 5.3,
+       "luminance": 120.0,
+       "exposure_score": 91.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "phash": "9e3779b97f4a43ea",
+       "sharpness": 4.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 84.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 84.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 3,
+       "recommended": 1,
+       "score": 22.9,
+       "reasons_json": "[\"露出良好\"]",
+       "issues_json": "[\"ぼけ傾向\"]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "rust-phash-v1:t3:h12"
+     ]
+    },
+    "python_rebuild": {
+     "name": "python_rebuild",
+     "result": {
+      "analyzed": 0,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c16",
+       "sharpness": 5.3,
+       "luminance": 120.0,
+       "exposure_score": 91.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "phash": "9e3779b97f4a43ea",
+       "sharpness": 4.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 65.0,
+       "reasons_json": "[\"鮮明さ良好\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 90.7,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "group_id": 1,
+       "group_kind": "similar",
+       "rank_in_group": 3,
+       "recommended": 1,
+       "score": 17.3,
+       "reasons_json": "[\"露出良好\"]",
+       "issues_json": "[\"ぼけ傾向\"]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "poc-phash-v1:t3:h12"
+     ]
+    },
+    "python_reanalyze": {
+     "name": "python_reanalyze",
+     "result": {
+      "analyzed": 1,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 3,
+       "display": "derivatives/q3.jpg",
+       "source_md5": "m3",
+       "source_mtime": 3.5,
+       "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+       "phash": "9e3779b97f4a43ea",
+       "sharpness": 4.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "poc-phash-v1:t3:h12"
+     ]
+    },
+    "diff": [
+     {
+      "photo_id": 1,
+      "change": "changed",
+      "columns": [
+       "rank_in_group",
+       "recommended",
+       "score",
+       "reasons_json"
+      ]
+     },
+     {
+      "photo_id": 2,
+      "change": "changed",
+      "columns": [
+       "rank_in_group",
+       "recommended",
+       "score"
+      ]
+     },
+     {
+      "photo_id": 3,
+      "change": "changed",
+      "columns": [
+       "score"
+      ]
+     }
+    ],
+    "diff_reanalyze": [
+     {
+      "photo_id": 1,
+      "change": "changed",
+      "columns": [
+       "group_kind",
+       "score"
+      ]
+     },
+     {
+      "photo_id": 2,
+      "change": "changed",
+      "columns": [
+       "group_kind",
+       "score"
+      ]
+     },
+     {
+      "photo_id": 3,
+      "change": "removed"
+     }
+    ]
+   }
+  },
+  {
+   "name": "identical_copy_added",
+   "photos": [
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(1,'drive','p1','2024-05-06 10:00','derivatives/q1.jpg','m1',1.5,NULL)"
+   ],
+   "python_feats": {
+    "derivatives/q1.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "rust_photos": [
+    "INSERT INTO photos(id,source,name,taken_at,display,md5,mtime,lat) VALUES(2,'drive','p2','2024-05-06 10:00','derivatives/q2.jpg','m2',2.5,NULL)"
+   ],
+   "rust_feats": {
+    "derivatives/q2.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "rust_photo_ids": [
+    2
+   ],
+   "python_reanalyzed_feats": {
+    "derivatives/q2.jpg": {
+     "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     "phash": "9e3779b97f4a7c15",
+     "metrics": {
+      "sharpness": 5.0,
+      "luminance": 120.0,
+      "exposure_score": 90.0,
+      "black_clip": 0.01,
+      "white_clip": 0.01,
+      "contrast": 120.0
+     }
+    }
+   },
+   "python": {
+    "python_built": {
+     "name": "python_built",
+     "result": {
+      "analyzed": 1,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [],
+     "dirty": "0",
+     "algorithms": []
+    },
+    "rust_emulated": {
+     "name": "rust_emulated",
+     "result": {
+      "analyzed": 1,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "rust-phash-v1:t3:h12"
+     ]
+    },
+    "python_idle": {
+     "name": "python_idle",
+     "result": {
+      "analyzed": 0,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": false
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "rust-phash-v1:t3:h12"
+     ]
+    },
+    "python_rebuild": {
+     "name": "python_rebuild",
+     "result": {
+      "analyzed": 0,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "poc-phash-v1:t3:h12"
+     ]
+    },
+    "python_reanalyze": {
+     "name": "python_reanalyze",
+     "result": {
+      "analyzed": 1,
+      "removed": 0,
+      "remaining": 0,
+      "rebuilt": true
+     },
+     "features": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "phash": "9e3779b97f4a7c15",
+       "sharpness": 5.0,
+       "luminance": 120.0,
+       "exposure_score": 90.0,
+       "black_clip": 0.01,
+       "white_clip": 0.01,
+       "contrast": 120.0,
+       "failed": 0
+      }
+     ],
+     "quality": [
+      {
+       "photo_id": 1,
+       "display": "derivatives/q1.jpg",
+       "source_md5": "m1",
+       "source_mtime": 1.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 1,
+       "recommended": 1,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      },
+      {
+       "photo_id": 2,
+       "display": "derivatives/q2.jpg",
+       "source_md5": "m2",
+       "source_mtime": 2.5,
+       "content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+       "group_id": 1,
+       "group_kind": "exact",
+       "rank_in_group": 2,
+       "recommended": 0,
+       "score": 53.9,
+       "reasons_json": "[\"グループ内で最も鮮明\", \"露出良好\"]",
+       "issues_json": "[]"
+      }
+     ],
+     "dirty": "0",
+     "algorithms": [
+      "poc-phash-v1:t3:h12"
+     ]
+    },
+    "diff": [],
+    "diff_reanalyze": []
+   }
   }
  ]
 }

@@ -267,7 +267,11 @@ def apply_op(root: Path, op: dict, db_exec) -> None:
 
 
 def run_python(doc: dict) -> list:
-    data_dir = tempfile.mkdtemp(prefix="geoframe-drive-index-")
+    with tempfile.TemporaryDirectory(prefix="geoframe-drive-index-") as data_dir:
+        return _run_python(doc, data_dir)
+
+
+def _run_python(doc: dict, data_dir: str) -> list:
     os.environ["GEOFRAME_DATA_DIR"] = data_dir
     os.environ["GEOFRAME_DRIVE_FOLDER"] = doc["folder"]["name"]
     sys.path.insert(0, str(APP))

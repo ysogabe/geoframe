@@ -376,6 +376,195 @@ fn pythonのquality_cycleとquality_backfillと全列が一致する() {
     }
 }
 
+/// 合成の特徴量（`FEATS`）で `quality` 段を 1 サイクル流す。
+fn run_cycle(s: &Setup, limit: u32) -> Counts {
+    let mut config = s.config.clone();
+    config.quality_per_cycle = limit;
+    let stage = Quality::with_analyzer(fake_analyze);
+    let read = s.read(Mode::Apply);
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let ctx = StageCtx {
+        mode: Mode::Apply,
+        config: &config,
+        read: &read,
+        writer: Some(&s.writer),
+        cache: &s.cache,
+        http: &http,
+        stop: &stop,
+    };
+    match stage.run(&ctx).unwrap() {
+        StageOutcome::Done(c) => c,
+        other => panic!("{other:?}"),
+    }
+}
+
+const FEATURES_SQL: &str = "SELECT photo_id,display,source_md5,source_mtime,content_sha256,phash,
+        sharpness,luminance,exposure_score,black_clip,white_clip,contrast,error!='' AS failed
+   FROM photo_quality_features ORDER BY photo_id";
+
+const QUALITY_SQL: &str = "SELECT photo_id,display,source_md5,source_mtime,content_sha256,group_id,
+        group_kind,rank_in_group,recommended,score,reasons_json,issues_json
+   FROM photo_quality ORDER BY photo_id";
+
+#[test]
+fn rustで作った結果をpythonへ切り戻すと_変化なしのサイクルは保ち_dirtyの再構築で指標の差だけが変わる()
+ {
+    // P5 の切り戻し（Rust → Python）の試験の Rust 側。Python 側（`tools/gen_quality_fixture.py` の
+    // `switchbacks`）は、Python が作った行 → Rust が新しい写真（同じバイト列の写し）を解析して再構築 →
+    // Python の変化なしのサイクル → dirty にして Python が再構築、を Python 本体に流した結果を記録している。
+    // ここでは、Rust の実際の結果が、その「Rust の再構築」と全列で一致する（＝Python が受け取る入力が同じ）ことと、
+    // 記録された切り戻しの結果を見る。
+    let doc = fixture();
+    let cases = doc["switchbacks"].as_array().unwrap();
+    assert!(cases.len() >= 3);
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let py = &case["python"];
+        let s = setup(&format!("qswitch-{name}"));
+        FEATS.with(|f| {
+            f.borrow_mut().clear();
+            for (display, spec) in case["python_feats"].as_object().unwrap() {
+                f.borrow_mut().insert(display.clone(), spec_to_result(spec));
+            }
+        });
+        for sql in case["photos"].as_array().unwrap() {
+            s.sql(sql.as_str().unwrap());
+        }
+        // 1. Python が作った行（特徴量は Python の値）
+        run_cycle(&s, 1000);
+        let conn = s.read(Mode::Apply);
+        assert_eq!(
+            Value::Array(rows_json(&conn, QUALITY_SQL)),
+            py["python_built"]["quality"],
+            "{name}: Python が作った photo_quality"
+        );
+        // 2. Rust が新しい写真を解析して再構築する
+        FEATS.with(|f| {
+            for (display, spec) in case["rust_feats"].as_object().unwrap() {
+                f.borrow_mut().insert(display.clone(), spec_to_result(spec));
+            }
+        });
+        for sql in case["rust_photos"].as_array().unwrap() {
+            s.sql(sql.as_str().unwrap());
+        }
+        let counts = run_cycle(&s, 1000);
+        assert_eq!(get(&counts, "rebuilt"), 1, "{name}");
+        let conn = s.read(Mode::Apply);
+        let emulated = &py["rust_emulated"];
+        assert_eq!(
+            Value::Array(rows_json(&conn, FEATURES_SQL)),
+            emulated["features"],
+            "{name}: Rust の再構築のあとの photo_quality_features"
+        );
+        let rust_quality = rows_json(&conn, QUALITY_SQL);
+        assert_eq!(
+            Value::Array(rust_quality.clone()),
+            emulated["quality"],
+            "{name}: Rust の再構築のあとの photo_quality"
+        );
+        let algorithms: Vec<String> = s.query(|c| {
+            c.prepare("SELECT DISTINCT algorithm FROM photo_quality ORDER BY algorithm")?
+                .query_map([], |r| r.get(0))?
+                .collect()
+        });
+        assert_eq!(emulated["algorithms"], json!(algorithms), "{name}");
+        assert!(algorithms.iter().all(|a| a == ALGORITHM), "{name}");
+        // 3. Python の変化なしのサイクルは、Rust の結果を一切変えない（`algorithm` も見ない）
+        assert_eq!(py["python_idle"]["quality"], emulated["quality"], "{name}");
+        assert_eq!(py["python_idle"]["result"]["rebuilt"], json!(false));
+        assert_eq!(py["python_idle"]["algorithms"], emulated["algorithms"]);
+        // 4. dirty にして Python が再構築すると、`algorithm` は Python の値になり、グループの顔ぶれ・`kind`・
+        //    グループ番号は変わらない。変わりうるのは、同じ SHA の写しの指標の差から出る順位・推奨・スコア・理由だけ
+        assert_eq!(py["python_rebuild"]["result"]["rebuilt"], json!(true));
+        assert_eq!(
+            py["python_rebuild"]["algorithms"],
+            json!(["poc-phash-v1:t3:h12"])
+        );
+        let after = py["python_rebuild"]["quality"].as_array().unwrap();
+        let ids = |rows: &[Value]| -> Vec<i64> {
+            rows.iter()
+                .map(|r| r["photo_id"].as_i64().unwrap())
+                .collect()
+        };
+        assert_eq!(ids(after), ids(&rust_quality), "{name}: グループに入る写真");
+        // 配信（`QUALITY_VISIBLE`）から外れるのは `exact` で非推奨の行。その数は切り戻しの前後で同じ
+        let hidden = |rows: &[Value]| {
+            rows.iter()
+                .filter(|r| r["group_kind"] == "exact" && r["recommended"] == 0)
+                .count()
+        };
+        assert_eq!(
+            hidden(after),
+            hidden(&rust_quality),
+            "{name}: 配信から外れる数"
+        );
+        for (before, after) in rust_quality.iter().zip(after) {
+            for column in ["group_id", "group_kind", "content_sha256"] {
+                assert_eq!(before[column], after[column], "{name}: {column}");
+            }
+        }
+        for change in case["python"]["diff"].as_array().unwrap() {
+            assert_eq!(change["change"], "changed", "{name}");
+            for column in change["columns"].as_array().unwrap() {
+                assert!(
+                    [
+                        "rank_in_group",
+                        "recommended",
+                        "score",
+                        "reasons_json",
+                        "issues_json"
+                    ]
+                    .contains(&column.as_str().unwrap()),
+                    "{name}: {change}"
+                );
+            }
+        }
+    }
+    // 指標が同じ写し（Rust の算法でも同じ値）なら、切り戻しても何も変わらない
+    let identical = cases
+        .iter()
+        .find(|c| c["name"] == "identical_copy_added")
+        .unwrap();
+    assert_eq!(identical["python"]["diff"], json!([]));
+    // 指標が違う写しでは、完全重複のどちらを推奨にするかが入れ替わりうる（表に出る写しが変わる。件数は同じ）
+    let flipped = cases
+        .iter()
+        .find(|c| c["name"] == "exact_copy_added")
+        .unwrap();
+    let rec = |key: &str| -> Vec<i64> {
+        flipped["python"][key]["quality"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["recommended"] == 1)
+            .map(|r| r["photo_id"].as_i64().unwrap())
+            .collect()
+    };
+    assert_eq!(rec("rust_emulated"), [1]);
+    assert_eq!(rec("python_rebuild"), [2]);
+    // 5. Rust が解析した特徴量の行を消して Python に解析し直させると（同じバイト列の Python の値になる）、
+    //    Python だけで作った場合の結果に戻る。指標が同じ写しなら元から変わらない
+    for name in ["exact_copy_added", "identical_copy_added"] {
+        let case = cases.iter().find(|c| c["name"] == name).unwrap();
+        assert_eq!(case["python"]["diff_reanalyze"], json!([]), "{name}");
+    }
+    // pHash が別の算法で距離 2 違った写しが橋になっていた組は、Python の値に戻ると結びつかない
+    // （同じ SHA の写真が別の算法の pHash を持つときの限界。server.md §16.2）
+    let bridge = cases
+        .iter()
+        .find(|c| c["name"] == "bridge_by_copy")
+        .unwrap();
+    let diff = bridge["python"]["diff_reanalyze"].as_array().unwrap();
+    assert!(diff.contains(&json!({"photo_id": 3, "change": "removed"})));
+    for case in cases {
+        assert_eq!(
+            case["python"]["python_reanalyze"]["algorithms"],
+            json!(["poc-phash-v1:t3:h12"])
+        );
+    }
+}
+
 // ---------------------------------------------------------------- グルーピングの単体
 
 fn photo(id: i64, taken_at: &str, sha: &str, phash: u64, sharp: f64) -> QualityPhoto {
@@ -408,12 +597,33 @@ fn 同じsha256の写真は_算法が違っても同じ指標にそろえて_id�
         .map(|r| r.photo_id)
         .collect();
     assert_eq!(rec, [1]);
-    // 同じ SHA の pHash も、id が最小の行のものにそろう（別の写真との類似の判定が行ごとにぶれない）
-    let a = photo(1, "2024-05-06 10:00", "same", 0, 5.0);
-    let b = photo(2, "2024-05-06 10:00", "same", u64::MAX, 5.0);
-    let c = photo(3, "2024-05-06 10:01", "other", 0, 5.0);
+}
+
+#[test]
+fn 同じsha256でphashが違っても_類似の結びつきは各行の元のphashで決める() {
+    // 回帰（レビュー指摘）: A・B は同じ SHA（算法の違う行が混ざって pHash が違う。距離 2）、時刻差 10 分。
+    // C は B の 1 分後。距離は A–B=2・B–C=12・A–C=14。Python は各行の pHash で比べるので B–C が類似になり、
+    // 3 枚が `similar`。B の pHash を A にそろえると B–C=14 でつながらず、`exact` の A・B だけになって、
+    // B が配信から消える（完全重複の非推奨）。
+    let base: u64 = 0x9E37_79B9_7F4A_7C15;
+    let a = photo(1, "2024-05-06 10:00", "same", base, 5.0);
+    let b = photo(2, "2024-05-06 10:10", "same", base ^ 0b11, 5.0);
+    let c = photo(
+        3,
+        "2024-05-06 10:11",
+        "other",
+        (base ^ 0b11) ^ (0xFFF << 2),
+        5.0,
+    );
+    assert_eq!((a.phash ^ b.phash).count_ones(), 2);
+    assert_eq!((b.phash ^ c.phash).count_ones(), 12);
+    assert_eq!((a.phash ^ c.phash).count_ones(), 14);
     let rows = build_quality_rows(&[a, b, c]);
-    assert_eq!(rows.len(), 3); // 3 枚とも 1 つのグループ（c は a の pHash と同じ）
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|r| r.kind == "similar"), "{rows:?}");
+    assert!(rows.iter().all(|r| r.group_id == rows[0].group_id));
+    // 配信から外れるのは `exact` で非推奨の行だけ。`similar` の B は外れない
+    assert!(rows.iter().all(|r| r.kind != "exact"));
 }
 
 #[test]

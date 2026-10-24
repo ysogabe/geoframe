@@ -38,8 +38,6 @@ def sizes() -> list:
 
 
 def thumb(w: int, h: int) -> list:
-    # config.py は import 時に環境変数を読む。置き場を作らせないよう一時の場所を指す
-    os.environ.setdefault("GEOFRAME_DATA_DIR", tempfile.mkdtemp(prefix="geoframe-thumb-"))
     sys.path.insert(0, str(APP))
     from PIL import Image
     from geoframe.config import DERIV_PX
@@ -50,7 +48,10 @@ def thumb(w: int, h: int) -> list:
 
 
 def render() -> str:
-    cases = [{"input": s, "python": thumb(*s)} for s in sizes()]
+    # config.py は import 時に環境変数を読む。置き場を作らせないよう一時の場所を指す（終わったら消す）
+    with tempfile.TemporaryDirectory(prefix="geoframe-thumb-") as data_dir:
+        os.environ["GEOFRAME_DATA_DIR"] = data_dir
+        cases = [{"input": s, "python": thumb(*s)} for s in sizes()]
     return json.dumps({"cases": cases}, indent=1) + "\n"
 
 

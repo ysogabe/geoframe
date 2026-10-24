@@ -448,14 +448,14 @@ def run_child(mode, payload, env_extra):
     env = dict(os.environ)
     for key in [k for k in env if k.startswith("GEOFRAME_")]:
         del env[key]
-    data_dir = tempfile.mkdtemp(prefix="geoframe-geo-fixture-")
-    env.update({"GEOFRAME_DATA_DIR": data_dir, "TZ": "Asia/Tokyo", "PYTHONHASHSEED": "0"})
-    env.update(env_extra)
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), mode],
-                            input=json.dumps(payload), capture_output=True, text=True, env=env)
-    if result.returncode != 0:
-        sys.exit(f"Python の実行に失敗しました（{mode}）:\n{result.stderr}")
-    return json.loads(result.stdout)
+    with tempfile.TemporaryDirectory(prefix="geoframe-geo-fixture-") as data_dir:
+        env.update({"GEOFRAME_DATA_DIR": data_dir, "TZ": "Asia/Tokyo", "PYTHONHASHSEED": "0"})
+        env.update(env_extra)
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), mode],
+                                input=json.dumps(payload), capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            sys.exit(f"Python の実行に失敗しました（{mode}）:\n{result.stderr}")
+        return json.loads(result.stdout)
 
 
 def run_python(doc):

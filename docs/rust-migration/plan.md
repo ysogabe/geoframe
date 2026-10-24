@@ -93,6 +93,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 ### P5: 切替（PR 6）
 
 - 本番`catalog.db`のバックアップと復元の演習、検証環境でのシャドー比較、本番でPythonを止めてRustを起動、スモークテスト、ロールバックと再切替の演習。
+- **ロールバック（Rust→Python）での簡易品質**（[server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)。試験は`tools/gen_quality_fixture.py`の`switchbacks`）: ①`photo_quality.algorithm`は特徴量の由来ではなく結果を作った実装の印で、Pythonは読まない（書き換えは不要・無意味）。②切り戻した直後はPythonの変化なしのサイクルがRustの`photo_quality`をそのまま保つので、配信は変わらない。③後で`dirty`になると、PythonがRust製の特徴量を含めて全行を再構築する。**グループの顔ぶれ・`kind`・`group_id`と`/api/v1/photos`の件数は変わらず**、同じSHAの写しの指標の差から出る順位・推奨・スコアだけが変わりうる（完全重複の写しのうち表に出る方が入れ替わることがある）。④それも避けるなら、切り戻す前にRustが解析した特徴量の行（`analyzed_at`がRustへの切替の日時以降）を消し、Pythonに解析し直させる。演習ではこの確認（件数・行数・グループ数）を手順に入れる。
 - `deploy/`の手順・unit・READMEをRust用に改め、PythonのCIと依存を外す。Python実装の削除は切替後に安定を確かめてから。
 - 本番の切替は**ユーザーの立ち会いのもとで**行う。
 - **取り込みのガードを外す**（T2.1で入れた暫定。[server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード)）。P2〜P4の間、`GEOFRAME_INGEST=1`の`serve`・`sync`は、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できないと、書き込みの前に終了コード2で断る。本番機には印が無いので、**このガードを外さない限り、本番でRustは取り込みを始められない**。切替の手順で次をこの順に行う:

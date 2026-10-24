@@ -10,14 +10,22 @@
   `photo_quality_features`・`photo_quality`・`settings`・戻り値を記録する（時刻の列は比べない）。
   RustのテストがPythonと同じ行・同じ特徴量で`quality`の段を流して、列ごとに比べる
   （`crates/geoframe/src/quality/tests.rs`）。
+- `switchbacks`: **RustからPythonへ切り戻したとき**（P5のロールバック）の試験。①Pythonが特徴量と`photo_quality`
+  を作る→②新しい写真（同じSHAの写し）をRustが解析して再構築する（Rustの再構築は「同じSHAの指標を`id`最小の
+  行にそろえる」以外はPythonと同じなので、Pythonの`build_quality_rows`に同じそろえ方を足して流す。Rustの単体
+  テストが、Rustの実際の結果とこの結果が全列で一致することを確かめる）→③Pythonで変化なしのサイクルを回す
+  （`photo_quality`を保つ。`algorithm`は見ない）→④`photo_quality_dirty=1`にしてPythonで再構築する（Rustが作った
+  特徴量も入力に含めて、Pythonの算法でグルーピングし直す）→⑤Rustが解析した特徴量の行を消してPythonに解析し直させる
+  （同じバイト列のPythonの値になるので、Pythonだけで作った場合と同じ結果に戻る）。各段階の状態と、②と④・②と⑤の
+  `photo_quality`の差を記録する。
 - 特徴量の算出そのもの（pHash・鮮明度など）は算法が違ってよい（旧値との一致は不要）ので、ここには入れない。
   Rustの単体テストが決定性（同じ入力で同じ値）を見る。
 
     python3 tools/gen_quality_fixture.py          # 書き出す
     python3 tools/gen_quality_fixture.py --check  # 保存済みのシナリオをPythonに通し直し、結果が一致するか検査する
 
-意図した差（エラー行の文面、同じSHAの特徴量をそろえる処理など）は、このフィクスチャには入れず、Rustの単体テストで
-確かめる（`docs/rust-migration/server.md` §0・§16）。出力先は crates/geoframe/tests/fixtures/ の下。
+意図した差（エラー行の文面、同じSHAの指標をそろえる処理など）は、`cases`には入れず、`switchbacks`とRustの単体テスト
+で確かめる（`docs/rust-migration/server.md` §0・§16）。出力先は crates/geoframe/tests/fixtures/ の下。
 """
 
 import json
@@ -247,6 +255,19 @@ def fixed_cases():
     add("2024-09-06 10:00", ph[5], sha="g5" + "0" * 62)
     cases.append(case("group_order", p, f, [step("cycle", cycle())]))
 
+    # 18. 同じ SHA の 2 枚の pHash が違っても（算法の違う行が混ざった形）、類似の結びつきは各行の pHash で決める。
+    #     A・B は同じ SHA（距離 2）、時刻差 10 分。C は B の 1 分後で、距離は B–C=12・A–C=14。B–C が類似なので
+    #     3 枚が 1 つの `similar`（B の pHash を A にそろえると B–C=14 でつながらず、`exact` の A・B だけになる）
+    p, f, pid = [], {}, 0
+    b_hash = flip(BASE, 2)
+    add("2024-05-06 10:00", BASE, sha="aa" * 32)
+    add("2024-05-06 10:10", b_hash, sha="aa" * 32)
+    add("2024-05-06 10:11", flip(b_hash, 12, 2), sha="bb" * 32)
+    # 近くに別の写真が無い同じ SHA の 2 枚は、pHash が違っても `exact` のまま
+    add("2024-05-07 10:00", BASE, sha="cc" * 32)
+    add("2024-05-07 10:30", flip(BASE, 40, 3), sha="cc" * 32)
+    cases.append(case("same_sha_phash_differs", p, f, [step("cycle", cycle())]))
+
     # 15. dirty の印が無く未解析も無いときは再構築しない（既存の photo_quality をそのまま保つ）
     p = [photo_sql(1), photo_sql(2)]
     f = {disp(1): feat("a" * 64, BASE), disp(2): feat("a" * 64, BASE)}
@@ -315,26 +336,67 @@ def random_case(seed, count):
     return case(f"random_{seed}", p, f, [step("cycle", cycle(count // 2)), step("rest", cycle(count))])
 
 
+def switchback_cases():
+    """Rust で解析・再構築した DB を Python へ切り戻す試験の入力。
+
+    `python_feats`: Python が作った特徴量（先に 1 サイクルで `photo_quality` まで作る）。`rust_photos`・
+    `rust_feats`: そのあとで Rust が解析する新しい写真（古い写真と同じバイト列の写しなので SHA は同じで、
+    算法が違うので pHash と指標が少し違う。Rust の鮮明度は Python より 0.4%ほど高い）。
+    `python_reanalyzed_feats`: 同じ写真（`rust_photo_ids`）を Python が解析したときの特徴量（同じバイト列なので、
+    古い写真の Python の値と同じ）。
+    """
+    cases = []
+
+    # 1. 同じバイト列の写しが 1 枚増えた（完全重複）。Python の行 A（id 1）と Rust の行 B（id 2）は指標が
+    #    わずかに違う。Rust は B の指標を A にそろえるので A が推奨（B は配信から消える）。Python が再構築すると、
+    #    B の指標の方が高いので B が推奨になり、表に出る写しが入れ替わる
+    p = [photo_sql(1, "2024-05-06 10:00"), photo_sql(3, "2024-05-07 09:00")]
+    f = {disp(1): feat("a" * 64, BASE, sharp=5.0), disp(3): feat("c" * 64, flip(BASE, 30), sharp=5.0)}
+    rp = [photo_sql(2, "2024-05-06 10:00")]
+    rf = {disp(2): feat("a" * 64, flip(BASE, 2), sharp=5.02, exp=90.2)}
+    cases.append({"name": "exact_copy_added", "photos": p, "python_feats": f,
+                  "rust_photos": rp, "rust_feats": rf, "rust_photo_ids": [2],
+                  "python_reanalyzed_feats": {disp(2): feat("a" * 64, BASE, sharp=5.0)}})
+
+    # 2. 同じ SHA の写し B（id 2）の pHash が A とも C とも違い、B だけが C と結びつく形（A–B=2・B–C=12・A–C=14）。
+    #    どちらの実装も 3 枚が `similar`（pHash は各行のものを使う）。指標の差で順位・推奨だけが変わりうる
+    b_hash = flip(BASE, 2)
+    p = [photo_sql(1, "2024-05-06 10:00"), photo_sql(3, "2024-05-06 10:11")]
+    f = {disp(1): feat("a" * 64, BASE, sharp=5.0), disp(3): feat("b" * 64, flip(b_hash, 12, 2), sharp=4.0)}
+    rp = [photo_sql(2, "2024-05-06 10:10")]
+    rf = {disp(2): feat("a" * 64, b_hash, sharp=5.3, exp=91.0)}
+    cases.append({"name": "bridge_by_copy", "photos": p, "python_feats": f,
+                  "rust_photos": rp, "rust_feats": rf, "rust_photo_ids": [2],
+                  "python_reanalyzed_feats": {disp(2): feat("a" * 64, BASE, sharp=5.0)}})
+
+    # 3. 同じバイト列で指標が同じ（Rust の算法でも同じ値になった）写しが増えるだけ: 切り戻しても何も変わらない
+    p = [photo_sql(1, "2024-05-06 10:00")]
+    f = {disp(1): feat("a" * 64, BASE, sharp=5.0)}
+    rp = [photo_sql(2, "2024-05-06 10:00")]
+    rf = {disp(2): feat("a" * 64, BASE, sharp=5.0)}
+    cases.append({"name": "identical_copy_added", "photos": p, "python_feats": f,
+                  "rust_photos": rp, "rust_feats": rf, "rust_photo_ids": [2],
+                  "python_reanalyzed_feats": {disp(2): feat("a" * 64, BASE, sharp=5.0)}})
+    return cases
+
+
 def build():
     cases = fixed_cases() + [random_case(54, 60), random_case(7, 90), random_case(2026, 40)]
-    return {"cases": cases}
+    return {"cases": cases, "switchbacks": switchback_cases()}
 
 
 # ---- Python 本体を流す（子プロセス: GEOFRAME_DATA_DIR は import 時に読まれるため） ------------------
 
-def worker():
-    """標準入力の 1 ケースを Python の quality.py に流し、各段階のあとの状態を JSON で出す"""
-    case = json.load(sys.stdin)
+def _setup_python(case_feats):
+    """Python の quality.py を、画像の解析だけ合成の特徴量に差し替えて読み込む（DB も作る）"""
     real_stdout, sys.stdout = sys.stdout, sys.stderr     # Python 本体の print は結果に混ぜない
     sys.path.insert(0, str(APP))
     from geoframe import quality, store
-    from geoframe.store import db, dbx
-
-    feats = dict(case["feats"])
+    from geoframe.store import db
 
     def fake_analyze(path):
         key = str(Path(path).relative_to(quality.DATA_DIR.resolve()))
-        spec = feats[key]
+        spec = case_feats[key]
         if "error" in spec:
             raise RuntimeError(spec["error"])
         m = spec["metrics"]
@@ -344,6 +406,43 @@ def worker():
 
     quality.analyze_path = fake_analyze
     db()
+    return real_stdout, quality, store
+
+
+def _snapshot(name, result, algorithms=False):
+    """各段階のあとの特徴量・photo_quality・dirty の印（時刻の列は含めない）"""
+    from geoframe import store
+    from geoframe.store import db
+
+    conn = db()
+    cur = conn.execute("""SELECT photo_id,display,source_md5,source_mtime,content_sha256,phash,
+                                 sharpness,luminance,exposure_score,black_clip,white_clip,contrast,
+                                 error!='' AS failed
+                          FROM photo_quality_features ORDER BY photo_id""")
+    names = [d[0] for d in cur.description]
+    features = [dict(zip(names, r)) for r in cur.fetchall()]
+    cur = conn.execute("""SELECT photo_id,display,source_md5,source_mtime,content_sha256,group_id,
+                                 group_kind,rank_in_group,recommended,score,reasons_json,issues_json
+                          FROM photo_quality ORDER BY photo_id""")
+    names = [d[0] for d in cur.description]
+    quality_rows = [dict(zip(names, r)) for r in cur.fetchall()]
+    out = {"name": name, "result": result, "features": features, "quality": quality_rows,
+           "dirty": store.setting_get("photo_quality_dirty")}
+    if algorithms:
+        out["algorithms"] = [r[0] for r in conn.execute(
+            "SELECT DISTINCT algorithm FROM photo_quality ORDER BY algorithm")]
+    return out
+
+
+def worker():
+    """標準入力の 1 ケースを Python の quality.py に流し、各段階のあとの状態を JSON で出す"""
+    case = json.load(sys.stdin)
+    if "python_feats" in case:
+        return worker_switchback(case)
+    feats = dict(case["feats"])
+    real_stdout, quality, _store = _setup_python(feats)
+    from geoframe.store import dbx
+
     for sql in case["photos"]:
         dbx(sql)
 
@@ -357,21 +456,54 @@ def worker():
             result = quality.quality_cycle(run["limit"])
         else:
             result = quality.quality_backfill(run["batch"])
-        conn = db()
-        cur = conn.execute("""SELECT photo_id,display,source_md5,source_mtime,content_sha256,phash,
-                                     sharpness,luminance,exposure_score,black_clip,white_clip,contrast,
-                                     error!='' AS failed
-                              FROM photo_quality_features ORDER BY photo_id""")
-        names = [d[0] for d in cur.description]
-        features = [dict(zip(names, r)) for r in cur.fetchall()]
-        cur = conn.execute("""SELECT photo_id,display,source_md5,source_mtime,content_sha256,group_id,
-                                     group_kind,rank_in_group,recommended,score,reasons_json,issues_json
-                              FROM photo_quality ORDER BY photo_id""")
-        names = [d[0] for d in cur.description]
-        quality_rows = [dict(zip(names, r)) for r in cur.fetchall()]
-        dirty = store.setting_get("photo_quality_dirty")
-        out.append({"name": st["name"], "result": result, "features": features,
-                    "quality": quality_rows, "dirty": dirty})
+        out.append(_snapshot(st["name"], result))
+    json.dump(out, real_stdout, ensure_ascii=False)
+
+
+RUST_ALGORITHM = "rust-phash-v1:t3:h12"      # crates/geoframe/src/quality.rs の ALGORITHM
+
+
+def worker_switchback(case):
+    """Rust で解析・再構築した DB を Python へ切り戻したときの流れ（モジュールの説明を参照）"""
+    feats = dict(case["python_feats"])
+    real_stdout, quality, store = _setup_python(feats)
+    from geoframe.store import dbx
+
+    for sql in case["photos"]:
+        dbx(sql)
+    out = {"python_built": _snapshot("python_built", quality.quality_cycle(1000), True)}
+
+    # Rust の再構築: Python の build_quality_rows に、Rust の「同じ SHA の指標を id 最小の行にそろえる」
+    # （group.rs の unify_same_content_metrics。pHash はそろえない）を足したもの
+    original = quality.build_quality_rows
+
+    def rust_like(photos, analyzed_at):
+        first = {}
+        for photo in photos:
+            first.setdefault(photo.sha256, photo)
+        for photo in photos:
+            photo.metrics = first[photo.sha256].metrics
+        return original(photos, analyzed_at)
+
+    feats.update(case["rust_feats"])
+    for sql in case["rust_photos"]:
+        dbx(sql)
+    quality.build_quality_rows = rust_like
+    result = quality.quality_cycle(1000)
+    quality.build_quality_rows = original
+    dbx("UPDATE photo_quality SET algorithm=?", (RUST_ALGORITHM,))
+    out["rust_emulated"] = _snapshot("rust_emulated", result, True)
+
+    # Python へ切り戻す: 変化なしのサイクル→dirty にして再構築
+    out["python_idle"] = _snapshot("python_idle", quality.quality_cycle(1000), True)
+    store.setting_set("photo_quality_dirty", "1")
+    out["python_rebuild"] = _snapshot("python_rebuild", quality.quality_cycle(1000), True)
+
+    # Rust が解析した特徴量の行を消すと、Python が解析し直して（同じバイト列の Python の値）再構築する
+    feats.update(case["python_reanalyzed_feats"])
+    marks = ",".join("?" * len(case["rust_photo_ids"]))
+    dbx(f"DELETE FROM photo_quality_features WHERE photo_id IN ({marks})", tuple(case["rust_photo_ids"]))
+    out["python_reanalyze"] = _snapshot("python_reanalyze", quality.quality_cycle(1000), True)
     json.dump(out, real_stdout, ensure_ascii=False)
 
 
@@ -379,13 +511,34 @@ def run_child(payload):
     env = dict(os.environ)
     for key in [k for k in env if k.startswith("GEOFRAME_")]:
         del env[key]
-    data_dir = tempfile.mkdtemp(prefix="geoframe-quality-fixture-")
-    env.update({"GEOFRAME_DATA_DIR": data_dir, "TZ": "Asia/Tokyo", "PYTHONHASHSEED": "0"})
-    result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker"],
-                            input=json.dumps(payload), capture_output=True, text=True, env=env)
-    if result.returncode != 0:
-        sys.exit(f"Python の実行に失敗しました（{payload['name']}）:\n{result.stderr}")
-    return json.loads(result.stdout)
+    with tempfile.TemporaryDirectory(prefix="geoframe-quality-fixture-") as data_dir:
+        env.update({"GEOFRAME_DATA_DIR": data_dir, "TZ": "Asia/Tokyo", "PYTHONHASHSEED": "0"})
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker"],
+                                input=json.dumps(payload), capture_output=True, text=True, env=env)
+        if result.returncode != 0:
+            sys.exit(f"Python の実行に失敗しました（{payload['name']}）:\n{result.stderr}")
+        return json.loads(result.stdout)
+
+
+QUALITY_COLUMNS = ["display", "source_md5", "source_mtime", "content_sha256", "group_id", "group_kind",
+                   "rank_in_group", "recommended", "score", "reasons_json", "issues_json"]
+
+
+def quality_diff(before, after):
+    """2 つの photo_quality の差: 変わった（増えた・消えた）行と、変わった列"""
+    old = {r["photo_id"]: r for r in before}
+    new = {r["photo_id"]: r for r in after}
+    diff = []
+    for pid in sorted(old.keys() | new.keys()):
+        if pid not in new:
+            diff.append({"photo_id": pid, "change": "removed"})
+        elif pid not in old:
+            diff.append({"photo_id": pid, "change": "added"})
+        else:
+            columns = [c for c in QUALITY_COLUMNS if old[pid][c] != new[pid][c]]
+            if columns:
+                diff.append({"photo_id": pid, "change": "changed", "columns": columns})
+    return diff
 
 
 def run_python(doc):
@@ -393,7 +546,13 @@ def run_python(doc):
     for c in doc["cases"]:
         steps = run_child(c)
         cases.append({**c, "steps": [{**s, "python": r} for s, r in zip(c["steps"], steps)]})
-    return {"cases": cases}
+    switchbacks = []
+    for c in doc["switchbacks"]:
+        out = run_child(c)
+        out["diff"] = quality_diff(out["rust_emulated"]["quality"], out["python_rebuild"]["quality"])
+        out["diff_reanalyze"] = quality_diff(out["rust_emulated"]["quality"], out["python_reanalyze"]["quality"])
+        switchbacks.append({**c, "python": out})
+    return {"cases": cases, "switchbacks": switchbacks}
 
 
 def render(doc):
@@ -412,7 +571,8 @@ def main():
         stored = json.loads(FIXTURE.read_text(encoding="utf-8"))
         # 保存済みのシナリオ（入力）を流し直す。Python の結果の欄は入力に含めない
         doc = {"cases": [{**c, "steps": [{k: v for k, v in s.items() if k != "python"} for s in c["steps"]]}
-                         for c in stored["cases"]]}
+                         for c in stored["cases"]],
+               "switchbacks": [{k: v for k, v in c.items() if k != "python"} for c in stored["switchbacks"]]}
     else:
         doc = build()
     result = run_python(doc)
@@ -422,10 +582,10 @@ def main():
             print(f"{FIXTURE.name} が Python の結果と違います。python3 tools/gen_quality_fixture.py で作り直して"
                   "差分を確認してください", file=sys.stderr)
             return 1
-        print(f"{FIXTURE.name}: 一致（{len(result['cases'])}ケース）")
+        print(f"{FIXTURE.name}: 一致（{len(result['cases'])}ケース・切り戻し{len(result['switchbacks'])}ケース）")
         return 0
     FIXTURE.write_text(text, encoding="utf-8")
-    print(f"{FIXTURE} を書きました（{len(result['cases'])}ケース）")
+    print(f"{FIXTURE} を書きました（{len(result['cases'])}ケース・切り戻し{len(result['switchbacks'])}ケース）")
     return 0
 
 

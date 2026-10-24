@@ -80,10 +80,11 @@ def python_outcome(data: bytes, tmp: Path) -> str:
 
 
 def fill(doc: dict) -> dict:
-    # config.py は import 時に環境変数を読む。置き場を作らせないよう一時の場所を指す
-    os.environ["GEOFRAME_DATA_DIR"] = tempfile.mkdtemp(prefix="geoframe-eoi-")
     sys.path.insert(0, str(APP))
-    with tempfile.TemporaryDirectory(prefix="geoframe-eoi-case-") as t:
+    with (tempfile.TemporaryDirectory(prefix="geoframe-eoi-") as data_dir,
+          tempfile.TemporaryDirectory(prefix="geoframe-eoi-case-") as t):
+        # config.py は import 時に環境変数を読む。置き場を作らせないよう一時の場所を指す（終わったら消す）
+        os.environ["GEOFRAME_DATA_DIR"] = data_dir
         tmp = Path(t)
         for case in doc["cases"]:
             case["python"] = python_outcome(base64.b64decode(case["jpeg_base64"]), tmp)
