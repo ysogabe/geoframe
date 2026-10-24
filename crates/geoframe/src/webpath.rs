@@ -14,7 +14,7 @@ pub struct Normalized {
 }
 
 /// `%XX` を戻す。壊れた `%`（16進でない・足りない）はそのまま残す（Python の `unquote` と同じ）。
-fn percent_decode(input: &str) -> Vec<u8> {
+pub(crate) fn percent_decode(input: &str) -> Vec<u8> {
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

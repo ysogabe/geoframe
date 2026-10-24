@@ -70,7 +70,14 @@ async fn access_log_has_only_method_route_status_and_time() {
             .unwrap();
     }
 
-    let config = Config::load(|_| None, &Overrides::default()).unwrap();
+    let config = Config::load(
+        |_| None,
+        &Overrides {
+            data_dir: Some(dir.clone()),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
     let state = AppState::new(Arc::new(config), Catalog::open(&path).unwrap());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -88,7 +95,11 @@ async fn access_log_has_only_method_route_status_and_time() {
     get(addr, "/derivatives/%2e%2e/secret-dir/x.jpg").await; // トラバーサル
     get(addr, "/admin?token=abcSecretToken").await; // ページ
     get(addr, "/nope-secret-path?q=x").await; // ホワイトリスト外
-    get(addr, "/api/admin/photos?q=secret-query").await; // 未実装の API
+    get(addr, "/api/admin/geocode?q=secret-query").await; // 未実装の API
+    // 管理画面の読み取り API。クエリの値（検索語・不正な値）はログに出ない
+    get(addr, "/api/admin/photos?filter=secret-filter&page=2").await;
+    get(addr, "/api/admin/photos?page=secret-page").await; // 400
+    get(addr, "/api/admin/status?x=secret-status").await;
     // Host が許可されない要求。拒否の理由は出るが、Host の値は出ない
     get_with_host(addr, "/derivatives/a.jpg", "attacker.invalid:8080").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -108,6 +119,9 @@ async fn access_log_has_only_method_route_status_and_time() {
         "GET /admin 200",
         "GET (unmatched) 403",
         "GET /api/admin/{*path} 503",
+        "GET /api/admin/photos 200",
+        "GET /api/admin/photos 400",
+        "GET /api/admin/status 200",
     ] {
         assert!(log.contains(expected), "{expected} が無い:\n{log}");
     }
@@ -129,6 +143,9 @@ async fn access_log_has_only_method_route_status_and_time() {
         "abcSecretToken",
         "nope-secret",
         "secret-query",
+        "secret-filter",
+        "secret-page",
+        "secret-status",
         "attacker",
         "a.jpg",
         "x.jpg",

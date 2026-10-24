@@ -292,3 +292,61 @@ pub async fn photos_from(path: &Path) -> Response {
     let addr = spawn(Catalog::open(path).unwrap()).await;
     get(addr, "/api/v1/photos").await
 }
+
+/// 管理画面の読み取り API のフィクスチャ（`python3 tools/gen_admin_fixture.py` が現行 Python から
+/// 書き出す）。
+pub fn admin_fixture() -> Value {
+    read_json(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/admin-api-python.json"),
+    )
+}
+
+/// 管理画面 API のフィクスチャを作った合成DB（本物のスキーマ＋行）のSQL。
+pub fn admin_catalog_sql() -> String {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/admin-api-catalog.sql");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+}
+
+/// `dir` をデータ置き場にして、管理画面 API のフィクスチャと同じ合成DB（`dir/catalog.db`）を作る。
+/// `derivatives/<drive_id>.jpg` の空ファイルも、フィクスチャが指定する名前で作る。戻り値の接続は書き込み用。
+pub fn build_admin_catalog(dir: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(dir.join("catalog.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(&admin_catalog_sql()).unwrap();
+    std::fs::create_dir_all(dir.join("derivatives")).unwrap();
+    for id in admin_fixture()["derivative_ids"].as_array().unwrap() {
+        std::fs::write(
+            dir.join("derivatives")
+                .join(format!("{}.jpg", id.as_str().unwrap())),
+            b"",
+        )
+        .unwrap();
+    }
+    conn
+}
+
+/// 環境変数 `env` とデータ置き場 `dir` で設定を作り、その `catalog` で router を起動する。
+pub async fn spawn_with_env(
+    dir: &Path,
+    env: &[(&str, &str)],
+    catalog: Catalog,
+) -> std::net::SocketAddr {
+    let map: std::collections::HashMap<String, String> = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let config = Config::load(
+        |k| map.get(k).cloned(),
+        &Overrides {
+            data_dir: Some(dir.to_path_buf()),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(AppState::new(Arc::new(config), catalog));
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    addr
+}

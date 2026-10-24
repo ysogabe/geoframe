@@ -13,13 +13,13 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::serve::Listener;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-use tokio::time::{Sleep, sleep};
+use tokio::time::{Instant, Sleep, sleep, sleep_until};
 
 /// データ置き場のファイルを同時に配る上限。1件ごとにファイル記述子を1つ握るので、
 /// 接続数の上限と合わせて記述子の予算（server.md §6）に収める。
@@ -97,15 +97,17 @@ impl Listener for LimitedListener {
 ///
 /// - **書き込み・flush・shutdown** が `Pending` のまま `stall_timeout` を超えたら `TimedOut`。
 ///   進捗（`Ready`）があれば測り直す。
-/// - **読み取り**が `Pending` のまま `idle_timeout` を超え、かつその間に書き込みの進捗も無ければ
-///   `TimedOut`。大きなファイルを遅い相手へ送っている最中（書き込みは進んでいる）は切らない。
+/// - **読み取り**が `Pending` のまま、**最後に読み書きが進んだ時刻**から `idle_timeout` を超えたら
+///   `TimedOut`（期限は「最後の進捗＋`idle_timeout`」で、タイマーが切れるたびに延ばさない）。
+///   大きなファイルを遅い相手へ送っている最中（書き込みは進んでいる）は切らない。
 pub struct LimitedIo<T> {
     inner: T,
     stall_timeout: Duration,
     idle_timeout: Duration,
     write_timer: Option<Pin<Box<Sleep>>>,
     read_timer: Option<Pin<Box<Sleep>>>,
-    last_write: Instant,
+    /// 最後に読み取り・書き込みのどちらかが進んだ（`Ready` を返した）時刻。無通信の期限の起点。
+    last_progress: Instant,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -117,7 +119,7 @@ impl<T> LimitedIo<T> {
             idle_timeout: limits.idle_timeout,
             write_timer: None,
             read_timer: None,
-            last_write: Instant::now(),
+            last_progress: Instant::now(),
             _permit: permit,
         }
     }
@@ -150,11 +152,16 @@ impl<T: AsyncRead + Unpin> AsyncRead for LimitedIo<T> {
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Pending => {
                 let idle = this.idle_timeout;
-                let timer = this.read_timer.get_or_insert_with(|| Box::pin(sleep(idle)));
-                // 期限が来ても、直近に書き込みの進捗があれば切らずに張り直す
+                let last_progress = this.last_progress;
+                // 期限は「最後の進捗＋idle」。書き込みが進んでいれば期限が先へ動くので、そのぶんだけ
+                // 張り直す（「今＋idle」で延ばすと、最後の送信から最大 2×idle 残ってしまう）
+                let timer = this
+                    .read_timer
+                    .get_or_insert_with(|| Box::pin(sleep_until(last_progress + idle)));
                 while timer.as_mut().poll(cx).is_ready() {
-                    if this.last_write.elapsed() < idle {
-                        timer.as_mut().reset(tokio::time::Instant::now() + idle);
+                    let deadline = this.last_progress + idle;
+                    if deadline > Instant::now() {
+                        timer.as_mut().reset(deadline);
                     } else {
                         return Poll::Ready(Err(timed_out("無通信です")));
                     }
@@ -163,6 +170,7 @@ impl<T: AsyncRead + Unpin> AsyncRead for LimitedIo<T> {
             }
             ready => {
                 this.read_timer = None;
+                this.last_progress = Instant::now();
                 ready
             }
         }
@@ -180,7 +188,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LimitedIo<T> {
             Poll::Pending => stall_check(&mut this.write_timer, this.stall_timeout, cx),
             ready => {
                 this.write_timer = None;
-                this.last_write = Instant::now();
+                this.last_progress = Instant::now();
                 ready
             }
         }
@@ -196,7 +204,7 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LimitedIo<T> {
             Poll::Pending => stall_check(&mut this.write_timer, this.stall_timeout, cx),
             ready => {
                 this.write_timer = None;
-                this.last_write = Instant::now();
+                this.last_progress = Instant::now();
                 ready
             }
         }
@@ -226,5 +234,81 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for LimitedIo<T> {
                 ready
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex, split};
+
+    fn limits(idle_ms: u64) -> ConnLimits {
+        ConnLimits {
+            max_connections: 1,
+            stall_timeout: Duration::from_secs(3600),
+            idle_timeout: Duration::from_millis(idle_ms),
+        }
+    }
+
+    /// 読み取りで待つ側が、`idle` 経過後に切られるまでの時刻（開始からの経過）を測る。
+    /// `write_at` に書き込みの進捗を起こす（`None` なら何も書かない）。
+    async fn cut_at(idle_ms: u64, write_at: Option<u64>) -> Duration {
+        let (a, _peer) = duplex(64);
+        let (mut reader, mut writer) = split(LimitedIo::new(a, limits(idle_ms), None));
+        let start = Instant::now();
+        let waiting = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            let err = reader.read(&mut buf).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            Instant::now()
+        });
+        if let Some(ms) = write_at {
+            sleep(Duration::from_millis(ms)).await;
+            writer.write_all(b"x").await.unwrap();
+        }
+        waiting.await.unwrap() - start
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_connection_is_cut_after_the_idle_timeout() {
+        let at = cut_at(1000, None).await;
+        assert!(
+            at >= Duration::from_millis(1000) && at <= Duration::from_millis(1005),
+            "{at:?}"
+        );
+    }
+
+    /// 最後に書き込みが進んだ時刻＋idle で切れる。以前は「タイマーが切れた時刻＋idle」で延ばしていたので、
+    /// 300ms に送ると 2000ms まで残った（最後の送信から 1700ms）。
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_is_the_last_progress_plus_idle() {
+        let at = cut_at(1000, Some(300)).await;
+        assert!(
+            at >= Duration::from_millis(1300) && at <= Duration::from_millis(1305),
+            "{at:?}"
+        );
+    }
+
+    /// 進捗が続く間は切れず、止まってから idle で切れる。
+    #[tokio::test(start_paused = true)]
+    async fn steady_writes_keep_the_connection_open() {
+        let (a, _peer) = duplex(64);
+        let (mut reader, mut writer) = split(LimitedIo::new(a, limits(1000), None));
+        let start = Instant::now();
+        let waiting = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            reader.read(&mut buf).await.unwrap_err();
+            Instant::now()
+        });
+        for _ in 0..5 {
+            sleep(Duration::from_millis(600)).await;
+            writer.write_all(b"x").await.unwrap();
+        }
+        let at = waiting.await.unwrap() - start;
+        // 最後の送信は 3000ms
+        assert!(
+            at >= Duration::from_millis(4000) && at <= Duration::from_millis(4005),
+            "{at:?}"
+        );
     }
 }

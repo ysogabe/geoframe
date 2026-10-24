@@ -52,7 +52,7 @@ const HEALTH_BUSY_TIMEOUT: Duration = Duration::from_secs(2);
 /// 4 本がすべて長い読み取りで埋まっているときに、リクエストが際限なく溜まらないようにする。
 pub const QUEUE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// P1 の読み取り（T1.2 の `/api/v1/photos`、T1.4 の管理画面の読み取り API）が使うテーブルと列。
+/// P1 の読み取り（T1.2 の `/api/v1/photos`、T1.4 の管理画面の読み取り API `admin.rs`）が使うテーブルと列。
 /// 現行 Python の `SCHEMA`（`store.py`）と起動時の `ALTER TABLE` の結果にあたる。
 /// これが無い DB（古い版、または別物）は起動時に断る。足りない列はここに足す。
 pub const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
@@ -111,6 +111,61 @@ pub const REQUIRED_SCHEMA: &[(&str, &[&str])] = &[
             "local_score",
         ],
     ),
+    // ここから下は T1.4（`/api/admin/status`・`/api/admin/photos`）。Python が起動時に作る表
+    (
+        "photo_quality_features",
+        &[
+            "photo_id",
+            "display",
+            "source_md5",
+            "source_mtime",
+            "content_sha256",
+            "error",
+        ],
+    ),
+    (
+        "photo_ai_features",
+        &[
+            "photo_id",
+            "display",
+            "source_md5",
+            "source_mtime",
+            "content_sha256",
+            "embedding_model",
+            "recommended",
+            "error",
+        ],
+    ),
+    (
+        "photo_loc_clues",
+        &[
+            "photo_id",
+            "display",
+            "source_md5",
+            "source_mtime",
+            "clue",
+            "kind",
+            "error",
+        ],
+    ),
+    ("photo_loc_runs", &["run_id", "status"]),
+    (
+        "photo_loc_suggestions",
+        &[
+            "photo_id",
+            "scope",
+            "place_name",
+            "day_place_name",
+            "precision",
+            "confidence",
+            "evidence_json",
+            "lat",
+            "lon",
+            "geocode_title",
+            "model",
+        ],
+    ),
+    ("settings", &["key", "value"]),
 ];
 
 #[derive(Debug)]

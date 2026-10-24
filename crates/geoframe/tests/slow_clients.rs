@@ -79,6 +79,11 @@ impl Fixture {
 
 /// 大きなファイルを要求し、応答のヘッダが来たところで読むのをやめる（枠を握ったままにする）。
 async fn hold(addr: std::net::SocketAddr) -> TcpStream {
+    hold_with_head(addr).await.0
+}
+
+/// [`hold`] に加えて、ヘッダと同じ読み取りで受け取ってしまった本文のバイト数と、`Content-Length` を返す。
+async fn hold_with_head(addr: std::net::SocketAddr) -> (TcpStream, u64, u64) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream
         .write_all(b"GET /photos/big.bin HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -86,16 +91,27 @@ async fn hold(addr: std::net::SocketAddr) -> TcpStream {
         .unwrap();
     let mut seen = Vec::new();
     let mut chunk = [0u8; 512];
-    while !seen.windows(4).any(|w| w == b"\r\n\r\n") {
+    let head_end = loop {
+        if let Some(i) = seen.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
         let n = timeout(Duration::from_secs(5), stream.read(&mut chunk))
             .await
             .expect("ヘッダが来ない")
             .unwrap();
         assert_ne!(n, 0, "ヘッダの前に閉じた");
         seen.extend_from_slice(&chunk[..n]);
-    }
+    };
     assert!(seen.starts_with(b"HTTP/1.1 200"), "{:?}", &seen[..16]);
-    stream
+    let head = String::from_utf8_lossy(&seen[..head_end]).to_lowercase();
+    let length = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length: "))
+        .expect("Content-Length")
+        .trim()
+        .parse()
+        .unwrap();
+    (stream, (seen.len() - head_end) as u64, length)
 }
 
 /// 時間内に答えが返ること（返らなければテスト失敗）。
@@ -173,6 +189,9 @@ async fn a_stalled_download_is_cut_and_gives_its_slot_back() {
 
     // 読まないまま停滞の上限を超えると、サーバーが切って枠が戻る
     wait_until_served(addr, Duration::from_secs(10)).await;
+    // 枠が1つ戻った時点では、もう1本はまだ切られていないことがある。その状態で読み始めると受信バッファが
+    // 空いて送信が進み、停滞でなくなって最後まで送られてしまう。どちらも切られるまで（停滞の上限の倍）待つ
+    tokio::time::sleep(limits.stall_timeout * 2).await;
 
     // 切られた側は、バッファに残っていた分を読み終えたところで終わる（128MiB を最後まで送られない）
     for mut stream in holders {
@@ -203,10 +222,11 @@ async fn a_slow_but_steady_reader_is_not_cut() {
     let addr = fixture.serve_limited(4, limits).await;
 
     // 少しずつでも読み続ける相手は、全体で停滞の上限より長くかかっても切らない
-    let mut stream = hold(addr).await;
+    let (mut stream, mut total, length) = hold_with_head(addr).await;
+    assert_eq!(length, BIG);
     let mut chunk = vec![0u8; 256 * 1024];
     let started = Instant::now();
-    let mut total = 0u64;
+    let mut slow_reads = 0;
     while started.elapsed() < Duration::from_millis(2500) {
         let n = timeout(Duration::from_secs(2), stream.read(&mut chunk))
             .await
@@ -214,9 +234,29 @@ async fn a_slow_but_steady_reader_is_not_cut() {
             .unwrap();
         assert_ne!(n, 0, "読んでいる途中で切られた");
         total += n as u64;
+        slow_reads += 1;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(total > 0);
+    assert!(slow_reads > 10 && total < length, "{slow_reads} {total}");
+
+    // 切られていれば、受信バッファの分を読んだあとに EOF になって全量には届かない。
+    // 残りを速く読み切り、最初に受け取った分も含めて Content-Length ぴったりになること
+    let rest = timeout(Duration::from_secs(60), async {
+        while total < length {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert_ne!(
+                n, 0,
+                "残りを読む途中で切られた（受信済み {total} / {length}）"
+            );
+            total += n as u64;
+        }
+    })
+    .await;
+    assert!(
+        rest.is_ok(),
+        "残りを読み切れない（受信済み {total} / {length}）"
+    );
+    assert_eq!(total, length);
 }
 
 #[tokio::test]

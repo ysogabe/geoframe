@@ -10,6 +10,9 @@
 //! | データ置き場 | `--data-dir <path>` | `GEOFRAME_DATA_DIR` | `./var`（実行時のカレントディレクトリ基準） |
 //! | 許可する Host 名 | なし | `GEOFRAME_ALLOWED_HOSTS`（`localhost` に足す） | `localhost` のみ |
 //! | ログの詳しさ | なし | `GEOFRAME_LOG`（Rust だけの項目） | `info` |
+//! | 位置推定の窓（管理画面の内訳の区切り） | なし | `GEOFRAME_INFER_MIN` | `15`（分） |
+//! | embedding の場所（管理画面の AI 件数が数えるモデル） | なし | `GEOFRAME_EMBED_BACKEND` | `gemini` |
+//! | タイルキャッシュの上限（管理画面のディスク表示） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
 //!
 //! `TZ` は Rust 側では読まない。P1 は時刻の変換をせず、`taken_at` などの naive な日時は文字列の
 //! まま扱う（inventory.md §6.1）。systemd unit が `TZ=Asia/Tokyo` を与え続けるのは、並走する
@@ -52,11 +55,9 @@ pub const UNSUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_DRIVE_POLL_MIN",
     "GEOFRAME_FETCH_PER_CYCLE",
     "GEOFRAME_QUALITY_PER_CYCLE",
-    "GEOFRAME_INFER_MIN",
     "GEOFRAME_INFER_OFFSET_MIN",
     // P3: 管理機能（地図タイル）
     "GEOFRAME_TILE_UA",
-    "GEOFRAME_TILE_CACHE_MAX_MB",
     "GEOFRAME_TILE_FETCH_PER_MIN",
     // P4: AI・位置候補
     "GEOFRAME_AI_ENABLED",
@@ -69,7 +70,6 @@ pub const UNSUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_AI_SHORTLIST_MAX",
     "GEOFRAME_AI_JUDGE_SHUFFLE_RATE",
     "GEOFRAME_AI_SEARCH_PER_MIN",
-    "GEOFRAME_EMBED_BACKEND",
     "GEOFRAME_LOCAL_EMBED_MODEL_DIR",
     "GEOFRAME_LOCAL_EMBED_THREADS",
     "GEOFRAME_RANK_MODEL",
@@ -86,7 +86,17 @@ pub const SUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_HOST",
     "GEOFRAME_PORT",
     "GEOFRAME_ALLOWED_HOSTS",
+    // T1.4: 管理画面の読み取り API（/api/admin/status）の値を Python と同じにするために読む。
+    // 取り込みや AI の処理はまだ Rust に無いので、この3つは表示にだけ効く
+    "GEOFRAME_INFER_MIN",
+    "GEOFRAME_EMBED_BACKEND",
+    "GEOFRAME_TILE_CACHE_MAX_MB",
 ];
+
+pub const DEFAULT_INFER_MIN: f64 = 15.0;
+pub const DEFAULT_TILE_CACHE_MAX_MB: i64 = 16384;
+/// 位置推定の段階窓のうち固定のもの（秒）。現行の `INFER_WINDOWS_S = sorted({INFER_WINDOW_S, 2h, 12h})`。
+const FIXED_INFER_WINDOWS_S: [f64; 2] = [2.0 * 3600.0, 12.0 * 3600.0];
 
 /// ログの詳しさ。`GEOFRAME_LOG` で指定する（既定 `info`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,6 +131,23 @@ impl LogLevel {
     }
 }
 
+/// embedding の計算場所（`GEOFRAME_EMBED_BACKEND`）。管理画面の AI の件数は、今のモデルの行だけを数える。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbedBackend {
+    Gemini,
+    Local,
+}
+
+impl EmbedBackend {
+    /// `photo_ai_features.embedding_model` に入るモデル名（現行の `ai_search.EMBED_MODEL`）。
+    pub fn model(self) -> &'static str {
+        match self {
+            Self::Gemini => "gemini-embedding-2",
+            Self::Local => "embeddinggemma-2",
+        }
+    }
+}
+
 /// `serve` の起動引数で上書きできる項目。
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Overrides {
@@ -140,7 +167,7 @@ impl fmt::Display for ConfigError {
 
 impl std::error::Error for ConfigError {}
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq)]
 pub struct Config {
     /// 待ち受けアドレス（起動引数・環境変数・既定値を解決した結果）。Host 検査のポート判定にも使う。
     pub listen: SocketAddr,
@@ -152,6 +179,13 @@ pub struct Config {
     pub log_level: LogLevel,
     /// 環境変数 `TZ` の値。解釈せず、起動ログに出すためだけに控える。
     pub tz: Option<String>,
+    /// 位置推定の1段目の窓（分）。`GEOFRAME_INFER_MIN`。管理画面の「推定の内訳」の区切りに使う。
+    pub infer_min: f64,
+    pub embed_backend: EmbedBackend,
+    /// `GEOFRAME_EMBED_BACKEND` が `gemini`・`local` のどちらでもなかった（現行と同じく `gemini` に
+    /// 落とした）。起動ログで知らせる。
+    pub embed_backend_invalid: bool,
+    pub tile_cache_max_mb: i64,
 }
 
 impl Config {
@@ -204,13 +238,54 @@ impl Config {
             None => LogLevel::Info,
         };
 
+        let infer_min = match get("GEOFRAME_INFER_MIN") {
+            Some(raw) => raw
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .ok_or_else(|| {
+                    ConfigError("GEOFRAME_INFER_MIN は 0 以上の数（分）で指定してください".into())
+                })?,
+            None => DEFAULT_INFER_MIN,
+        };
+        // 現行は `.strip().lower()` で、gemini・local 以外は警告して gemini に落とす（起動は続ける）
+        let (embed_backend, embed_backend_invalid) = match get("GEOFRAME_EMBED_BACKEND") {
+            Some(raw) => match raw.trim().to_lowercase().as_str() {
+                "gemini" => (EmbedBackend::Gemini, false),
+                "local" => (EmbedBackend::Local, false),
+                _ => (EmbedBackend::Gemini, true),
+            },
+            None => (EmbedBackend::Gemini, false),
+        };
+        let tile_cache_max_mb = match get("GEOFRAME_TILE_CACHE_MAX_MB") {
+            Some(raw) => raw.trim().parse::<i64>().map_err(|_| {
+                ConfigError("GEOFRAME_TILE_CACHE_MAX_MB は整数（MB）で指定してください".into())
+            })?,
+            None => DEFAULT_TILE_CACHE_MAX_MB,
+        };
+
         Ok(Self {
             listen,
             data_dir,
             allowed_hosts,
             log_level,
             tz: get("TZ"),
+            infer_min,
+            embed_backend,
+            embed_backend_invalid,
+            tile_cache_max_mb,
         })
+    }
+
+    /// 位置推定の段階窓（秒、昇順、重複なし）。現行の `INFER_WINDOWS_S`
+    /// （`sorted({INFER_WINDOW_S, 2時間, 12時間})`）。
+    pub fn infer_windows_s(&self) -> Vec<f64> {
+        let mut windows = vec![self.infer_min * 60.0];
+        windows.extend(FIXED_INFER_WINDOWS_S);
+        windows.sort_by(f64::total_cmp);
+        windows.dedup();
+        windows
     }
 
     /// `catalog.db` のパス。
@@ -221,12 +296,15 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} embed={} tile_cache_max_mb={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
             self.log_level,
             self.tz.as_deref().unwrap_or("(未設定)"),
+            self.infer_min,
+            self.embed_backend.model(),
+            self.tile_cache_max_mb,
         )
     }
 }
@@ -370,6 +448,71 @@ mod tests {
             ("GEOFRAME_PORT", "70000"),
             ("GEOFRAME_HOST", "not-an-ip"),
             ("GEOFRAME_LOG", "loud"),
+        ] {
+            let err = load(&[(key, value)], &Overrides::default()).unwrap_err();
+            assert!(err.0.contains(key), "{err}");
+            assert!(!err.0.contains(value), "{err}");
+        }
+    }
+
+    #[test]
+    fn admin_display_settings_default_to_the_python_values() {
+        let c = load(&[], &Overrides::default()).unwrap();
+        assert_eq!(c.infer_min, 15.0);
+        assert_eq!(c.infer_windows_s(), [900.0, 7200.0, 43200.0]);
+        assert_eq!(c.embed_backend, EmbedBackend::Gemini);
+        assert!(!c.embed_backend_invalid);
+        assert_eq!(c.embed_backend.model(), "gemini-embedding-2");
+        assert_eq!(c.tile_cache_max_mb, 16384);
+    }
+
+    #[test]
+    fn admin_display_settings_are_read_from_the_environment() {
+        let c = load(
+            &[
+                ("GEOFRAME_INFER_MIN", " 30 "),
+                ("GEOFRAME_EMBED_BACKEND", " Local "),
+                ("GEOFRAME_TILE_CACHE_MAX_MB", "2048"),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.infer_windows_s(), [1800.0, 7200.0, 43200.0]);
+        assert_eq!(c.embed_backend, EmbedBackend::Local);
+        assert_eq!(c.embed_backend.model(), "embeddinggemma-2");
+        assert_eq!(c.tile_cache_max_mb, 2048);
+        // 窓は昇順・重複なし（現行の `sorted({…})`）。固定の窓と同じ値や、それより大きい値
+        let same = load(&[("GEOFRAME_INFER_MIN", "120")], &Overrides::default()).unwrap();
+        assert_eq!(same.infer_windows_s(), [7200.0, 43200.0]);
+        let wide = load(&[("GEOFRAME_INFER_MIN", "1000")], &Overrides::default()).unwrap();
+        assert_eq!(wide.infer_windows_s(), [7200.0, 43200.0, 60000.0]);
+        let fractional = load(&[("GEOFRAME_INFER_MIN", "0.5")], &Overrides::default()).unwrap();
+        assert_eq!(fractional.infer_windows_s(), [30.0, 7200.0, 43200.0]);
+    }
+
+    #[test]
+    fn an_unknown_embed_backend_falls_back_to_gemini_like_python() {
+        let c = load(
+            &[("GEOFRAME_EMBED_BACKEND", "other")],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.embed_backend, EmbedBackend::Gemini);
+        assert!(c.embed_backend_invalid);
+        // 空文字は未設定と同じ
+        let c = load(&[("GEOFRAME_EMBED_BACKEND", "")], &Overrides::default()).unwrap();
+        assert!(!c.embed_backend_invalid);
+    }
+
+    #[test]
+    fn invalid_admin_display_settings_are_errors_without_echoing_the_value() {
+        for (key, value) in [
+            ("GEOFRAME_INFER_MIN", "abc"),
+            ("GEOFRAME_INFER_MIN", "-5"),
+            ("GEOFRAME_INFER_MIN", "inf"),
+            ("GEOFRAME_INFER_MIN", "NaN"),
+            ("GEOFRAME_TILE_CACHE_MAX_MB", "1.5"),
+            ("GEOFRAME_TILE_CACHE_MAX_MB", "big"),
         ] {
             let err = load(&[(key, value)], &Overrides::default()).unwrap_err();
             assert!(err.0.contains(key), "{err}");

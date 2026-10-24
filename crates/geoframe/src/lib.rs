@@ -1,5 +1,9 @@
 //! GEOFRAME の Rust 実装。P1 では読み取り専用の API 基盤（設定・SQLite 読み取り層・ログ・ヘルス確認・写真一覧・静的配信・Host 検査・管理画面のページ）を持つ。
 
+// unsafe は sysinfo.rs だけ（libc の statvfs・localtime_r）
+#![deny(unsafe_code)]
+
+pub mod admin;
 pub mod cli;
 pub mod config;
 pub mod db;
@@ -9,8 +13,10 @@ pub mod hostcheck;
 pub mod limits;
 pub mod logging;
 pub mod photos;
+pub mod pyquery;
 pub mod server;
 pub mod statics;
+pub mod sysinfo;
 pub mod webpath;
 
 #[cfg(test)]

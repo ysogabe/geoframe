@@ -18,7 +18,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -27,17 +27,22 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{MethodFilter, any, on};
 use axum::{Json, Router};
 use serde::Serialize;
+use serde_json::Value;
 use std::path::PathBuf;
 
+use crate::admin::{self, AdminContext};
 use crate::config::Config;
 use crate::db::Catalog;
 use crate::limits::{ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
-use crate::{hostcheck, photos, statics, webpath};
+use crate::{hostcheck, photos, pyquery, statics, sysinfo, webpath};
 
 /// `/healthz` が DB の確認を待つ上限。超えたら不健康（503）として答える。`/healthz` 専用の接続の
 /// `busy_timeout`（2 秒、`db.rs`）より長く、API の読み取りとは別の接続を使うので、API が混んで
 /// いても DB が正常なら間に合う。
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// ディスク使用量（`/api/admin/status` の `disk`）のキャッシュ時間。全走査になるので現行と同じく 60 秒。
+const DISK_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// ハンドラが共有する状態。複製は安い。
 #[derive(Clone)]
@@ -50,6 +55,10 @@ pub struct AppState {
     /// データ置き場のファイルを同時に配れる数（[`STATIC_FILE_SLOTS`]）。ファイルを開く前に取り、
     /// 空きが無ければ待たずに 503。ファイル記述子を握る数の上限（`/healthz` などを巻き込まないため）。
     pub static_slots: Arc<Semaphore>,
+    /// 管理画面の読み取り API（`admin.rs`）の設定。
+    pub admin: Arc<AdminContext>,
+    /// `disk` の直近の計測。ロックを持ったまま測るので、同時に来ても全走査は1回で済む。
+    disk_cache: Arc<Mutex<Option<(Instant, Value)>>>,
 }
 
 impl AppState {
@@ -61,11 +70,14 @@ impl AppState {
             tracing::warn!("データ置き場を解決できません: {e}");
             config.data_dir.clone()
         });
+        let admin = Arc::new(AdminContext::new(&config, &data_root));
         Self {
             config,
             catalog,
             data_root: Arc::new(data_root),
             static_slots: Arc::new(Semaphore::new(STATIC_FILE_SLOTS)),
+            admin,
+            disk_cache: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -125,6 +137,99 @@ async fn api_photos(State(state): State<AppState>) -> Response {
             error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "写真一覧を読み取れません。しばらくしてから再試行してください",
+            )
+        }
+    }
+}
+
+/// `GET /api/admin/status`（現行の `api_admin_status`）。DB の読み取りは 503（読めない・順番待ち超過）、
+/// ディスクの測定に失敗したときは 500。どちらも本文は定型で、理由はログにだけ出す。
+async fn api_admin_status(state: &AppState) -> Response {
+    let ctx = Arc::clone(&state.admin);
+    let mut status = match state
+        .catalog
+        .read(move |conn| admin::status(conn, &ctx))
+        .await
+    {
+        Ok(status) => status,
+        Err(e) => {
+            tracing::warn!("管理画面の状態を読めません: {e}");
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "状態を読み取れません。しばらくしてから再試行してください",
+            );
+        }
+    };
+    match disk_info(state).await {
+        Ok(disk) => status.insert("disk".into(), disk),
+        Err(e) => {
+            tracing::error!("ディスク使用量を測れません: {e}");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "内部エラーが発生しました",
+            );
+        }
+    };
+    status.insert("server_time".into(), sysinfo::local_timestamp().into());
+    match serde_json::to_vec(&status) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(e) => {
+            tracing::error!("状態を JSON にできません: {e}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "内部エラーが発生しました",
+            )
+        }
+    }
+}
+
+/// `disk`。60 秒以内の計測があればそれを返す。測定は全走査なので blocking スレッドで行う。
+async fn disk_info(state: &AppState) -> std::io::Result<Value> {
+    let mut cache = state.disk_cache.lock().await;
+    if let Some((at, data)) = cache.as_ref()
+        && at.elapsed() < DISK_CACHE_TTL
+    {
+        return Ok(data.clone());
+    }
+    let root = Arc::clone(&state.data_root);
+    let max_mb = state.config.tile_cache_max_mb;
+    let data = tokio::task::spawn_blocking(move || admin::disk_info(&root, max_mb))
+        .await
+        .map_err(|_| std::io::Error::other("ディスク使用量の測定が異常終了しました"))??;
+    *cache = Some((Instant::now(), data.clone()));
+    Ok(data)
+}
+
+/// `GET /api/admin/photos`（現行の `api_admin_photos` と、`handlers.py` のクエリの解釈）。
+/// `page`・`per` が `int()` を通らなければ 400 `bad_params`（クエリの値は応答にもログにも出さない）。
+async fn api_admin_photos(state: &AppState, query: Option<&str>) -> Response {
+    let params = pyquery::parse_qs_first(query.unwrap_or(""));
+    let int = |name: &str, default: &str| pyquery::py_int(params.get(name).map_or(default, |v| v));
+    let (Some(page), Some(per)) = (int("page", "1"), int("per", "50")) else {
+        return error_response(StatusCode::BAD_REQUEST, "bad_params");
+    };
+    let filter = admin::Filter::parse(params.get("filter").map_or("all", String::as_str));
+    let ctx = Arc::clone(&state.admin);
+    match state
+        .catalog
+        .read(move |conn| admin::photos(conn, &ctx, page, per, filter))
+        .await
+    {
+        Ok(listing) => match serde_json::to_vec(&listing) {
+            Ok(body) => json_response(StatusCode::OK, body),
+            Err(e) => {
+                tracing::error!("管理画面の一覧を JSON にできません: {e}");
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "内部エラーが発生しました",
+                )
+            }
+        },
+        Err(e) => {
+            tracing::warn!("管理画面の一覧を読めません: {e}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "一覧を読み取れません。しばらくしてから再試行してください",
             )
         }
     }
@@ -275,7 +380,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// まだ Rust 版に無い機能（管理画面のデータ API・AI・旅行ブログ・地図タイル）。T1.4 / P3 / P4 で
+/// まだ Rust 版に無い機能（管理画面の地名検索と更新 API・AI・旅行ブログ・地図タイル）。P3 / P4 で
 /// 実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
 /// （「禁止」ではなく「まだ無い」と分かるように）。
 fn not_yet_implemented(label: &'static str) -> Response {
@@ -291,7 +396,9 @@ fn not_yet_implemented(label: &'static str) -> Response {
 /// `/healthz`・`/api/v1/photos` 以外の `GET`/`HEAD`（`POST` と未実装のメソッドは [`guard`] が返す）。
 /// 現行の `do_GET`/`do_HEAD` と同じ順に:
 ///
-/// 1. `/tiles/`（地図タイル、P3）と、`GET` の `/api/admin/`・`/api/ai/`・`/api/blog/`（T1.4 以降）は 503。
+/// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
+///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
+///    `/tiles/`（地図タイル、P3）と、残りの `GET` の `/api/admin/`（地名検索）・`/api/ai/`・`/api/blog/` は 503。
 /// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML。
 /// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
 ///    `/static/`・`/vendor/` は埋め込み、`/derivatives/`・`/photos/`・`/blog_exports/` はデータ置き場から。
@@ -301,17 +408,40 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
     let (parts, _body) = request.into_parts();
     let method = &parts.method;
     let raw = parts.uri.path();
+    // 現行の `http.server` は、先頭の `//` を1つの `/` にしてから `do_GET` に渡す。接頭辞の判定は
+    // その後のパスで行う（`//api/admin/status` も当たる）。静的配信の正規化（`webpath::normalize`）は
+    // 元のパスを受けて自分で同じ畳み込みをする
+    let collapsed;
+    let path = if raw.starts_with("//") {
+        collapsed = format!("/{}", raw.trim_start_matches('/'));
+        collapsed.as_str()
+    } else {
+        raw
+    };
 
-    if raw.starts_with("/tiles/") {
+    if path.starts_with("/tiles/") {
         return not_yet_implemented("/tiles/{*path}");
     }
     if *method == Method::GET {
+        // axum のルートは完全一致なので、`//api/v1/photos` はここへ来る（現行は200）
+        if path == "/api/v1/photos" {
+            return labeled(api_photos(State(state)).await, "/api/v1/photos");
+        }
+        if path.starts_with("/api/admin/status") {
+            return labeled(api_admin_status(&state).await, "/api/admin/status");
+        }
+        if path.starts_with("/api/admin/photos") {
+            return labeled(
+                api_admin_photos(&state, parts.uri.query()).await,
+                "/api/admin/photos",
+            );
+        }
         for (prefix, label) in [
             ("/api/admin/", "/api/admin/{*path}"),
             ("/api/ai/", "/api/ai/{*path}"),
             ("/api/blog/", "/api/blog/{*path}"),
         ] {
-            if raw.starts_with(prefix) {
+            if path.starts_with(prefix) {
                 return not_yet_implemented(label);
             }
         }

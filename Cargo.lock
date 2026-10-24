@@ -394,6 +394,7 @@ dependencies = [
  "futures-util",
  "httpdate",
  "jsonschema",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",

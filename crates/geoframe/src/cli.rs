@@ -105,6 +105,11 @@ fn serve(overrides: &Overrides) -> ExitCode {
         env!("CARGO_PKG_VERSION"),
         config.log_summary()
     );
+    if config.embed_backend_invalid {
+        tracing::warn!(
+            "GEOFRAME_EMBED_BACKEND が gemini・local のどちらでもないので gemini を使います"
+        );
+    }
 
     // 起動時の DB の確認。開けない・スキーマが古いときは起動しない（設定の誤りや配備の誤りを、
     // 503 を返し続けるプロセスに隠さず、systemd の失敗として見せる）

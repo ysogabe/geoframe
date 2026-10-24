@@ -1,8 +1,8 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）を追記
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 1. 設定
@@ -20,16 +20,20 @@
 | 許可するHost名 | なし | `GEOFRAME_ALLOWED_HOSTS`（カンマ区切り。`localhost`は常に入る） | `localhost`のみ |
 | ログの詳しさ | なし | `GEOFRAME_LOG`（`error`/`warn`/`info`/`debug`/`trace`。**Rustだけの項目**） | `info` |
 | `TZ` | なし | `TZ` | （後述。解釈しない） |
+| 位置推定の1段目の窓（分） | なし | `GEOFRAME_INFER_MIN` | `15` |
+| embeddingの場所 | なし | `GEOFRAME_EMBED_BACKEND` | `gemini` |
+| タイルキャッシュの上限（MB） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
 
 - **空文字の環境変数は未設定と同じ**に扱う。現行の`GEOFRAME_DATA_DIR`が`or`で空文字を未設定扱いにするのと同じで、`EnvironmentFile`に`KEY=`と書いた事故を避ける。
 - **不正な値は起動を断る**（終了コード2）。メッセージには環境変数の名前と理由だけを書き、値は書かない。`GEOFRAME_HOST`はIPアドレスだけ（現行Pythonはホスト名も通すが、本番は`0.0.0.0`か`127.0.0.1`）。
 - `--listen`を渡したときは`GEOFRAME_HOST`/`GEOFRAME_PORT`を**読まない**（不正でも問わない）。
 - `GEOFRAME_ALLOWED_HOSTS`の解釈は現行の`_parse_allowed_hosts`と同じ（小文字、末尾の`.`を除く、`name:port`・`[v6]:port`のポートを無視）。この集合を使うHost検査は§9.2。
+- **最後の3つは T1.4 で読み始めた**。取り込み・AI・タイルは P2 以降なので、これらは**管理画面の表示にだけ**効く（`/api/admin/status`、§10）: `GEOFRAME_INFER_MIN`は「推定の内訳」の区切りと位置候補の「日」の区切り、`GEOFRAME_EMBED_BACKEND`はAIの件数が数える`embedding_model`（`gemini`→`gemini-embedding-2`、`local`→`embeddinggemma-2`）、`GEOFRAME_TILE_CACHE_MAX_MB`は`disk.tile_cache_max_mb`にそのまま出る。**読まないと Python と値がずれる**ため（`/etc/default/geoframe`に書いてあれば、Python と同じ値を Rust も見る）。解釈は現行に合わせ、`GEOFRAME_EMBED_BACKEND`は前後の空白を除いて小文字にし、`gemini`・`local`以外は**起動を断らず`gemini`に落とす**（現行も警告して`gemini`にする。Rustは起動ログにwarnを1行出す。値は書かない）。`GEOFRAME_INFER_MIN`は0以上の有限の数、`GEOFRAME_TILE_CACHE_MAX_MB`は整数でなければ**起動を断る**（Rustの方針。現行は`float()`/`int()`が例外で落ちるので、起動できない点は同じ）。
 - **`GEOFRAME_DATA_DIR`の既定が現行と違う**: Pythonは`app/var`（ソースの隣）だが、単一バイナリには`app/`が無いので`./var`にした。本番は常に`GEOFRAME_DATA_DIR=/var/lib/geoframe`をunitが与える。
 
 ### 1.2 `TZ`
 
-**Rustは`TZ`を解釈しない。** P1は時刻を変換せず、`taken_at`などのnaiveな日時は文字列のまま扱う（[inventory.md §6.1](inventory.md)）。旅番号の48時間差などの計算（T1.2）も、環境のTZに依存しない`NaiveDateTime`で行う。ただしunitは`TZ=Asia/Tokyo`を与え続ける（並走するPythonのため、将来`Local`を使うときの保険）。起動ログに値を出すだけ。
+**Rustは`TZ`を解釈しない。** P1は時刻を変換せず、`taken_at`などのnaiveな日時は文字列のまま扱う（[inventory.md §6.1](inventory.md)）。旅番号の48時間差などの計算（T1.2）も、環境のTZに依存しない`NaiveDateTime`で行う。ただしunitは`TZ=Asia/Tokyo`を与え続ける（並走するPythonのため、将来`Local`を使うときの保険）。起動ログに値を出すだけ。**例外**: `/api/admin/status`の`server_time`と`disk.measured_at`だけは現地時刻を出すので、Cライブラリの`localtime_r`に任せる（`sysinfo.rs`。§10.4）。muslは実行時に`TZ`と`/usr/share/zoneinfo`を読むので、unitが`TZ=Asia/Tokyo`を与えていれば Python と同じ時刻になる。tzdataが無い機体ではPythonもRustもUTCになる。
 
 ### 1.3 `app/.env`は読まない
 
@@ -54,7 +58,7 @@
 ### 2.1 読み取り専用
 
 - `SQLITE_OPEN_READ_ONLY`（`CREATE`なし）＋`PRAGMA query_only`。書き込みはSQLiteが拒否し、無いDBを作ることもない。
-- **スキーマの作成・移行をしない。** それは当面Python（`store.py:db`）の仕事。Rustは`REQUIRED_SCHEMA`（`photos`の25列、`photo_quality`、`photo_ai_groups`、`photo_ai_group_members`のうちP1の読み取りが使う列）がそろっているかを起動時に確かめる。T1.2/T1.4で使う列が増えたら、ここに足す。
+- **スキーマの作成・移行をしない。** それは当面Python（`store.py:db`）の仕事。Rustは`REQUIRED_SCHEMA`（`photos`の25列、`photo_quality`、`photo_ai_groups`、`photo_ai_group_members`のうちP1の読み取りが使う列。T1.4で`photo_quality_features`・`photo_ai_features`・`photo_loc_clues`・`photo_loc_runs`・`photo_loc_suggestions`・`settings`を足した）がそろっているかを起動時に確かめる。使う列が増えたら、ここに足す。**T1.4 で足した表は Python が起動時に作る**ので、古い版のPythonで止まったままのDBには無く、Rustは起動を断る。**T1.5 の本番コピーでは、これらの表があること（比較用Pythonを一度でも動かしたコピーならある）を先に確かめる。**
 - WALのDBは、読み取り専用で開いても`-shm`が要る（無ければ作る）。そのため**DBのあるディレクトリには書ける**必要がある（systemdの`StateDirectory=`なら満たす）。DB本体と`-wal`は変更しない（テストで確認。`-shm`だけは読み取りでも触れる）。
 
 ### 2.2 接続プール
@@ -221,7 +225,7 @@ unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分�
 
 `site`（`GET`/`HEAD`）は、現行の`do_GET`/`do_HEAD`と同じ順に判定する。
 
-1. `/tiles/`（地図タイル、P3）と、`GET`の`/api/admin/`・`/api/ai/`・`/api/blog/`（管理画面のデータAPIはT1.4、残りはP3・P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。
+1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。そのあと、`/tiles/`（地図タイル、P3）と、残りの`GET`の`/api/admin/`（地名検索`geocode`はP3）・`/api/ai/`・`/api/blog/`（P3・P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。
 2. 管理画面のページ（§9.5）。
 3. 静的ファイル（§9.3）。許可は`/favicon.ico`と5つの接頭辞だけで、**それ以外はすべて403**（404ではない。`/nope`・`/api/nope`・`/api/v1/photos/`も403）。
 
@@ -318,7 +322,7 @@ unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分�
 | 埋め込みファイルの再検証 | `Last-Modified`/`If-Modified-Since` | `ETag`/`If-None-Match` | 時刻に依存して古いJSが居座る事故を避ける（§9.4） |
 | バックスラッシュを含む要求 | 区切りに読み替えて判定、実ファイルは404 | 403 | 区切りの解釈を持たない |
 | HTMLヘッダ・`no-cache`の判定 | 生のパス | デコード・正規化後のパス、`.htm`も | `%2E`で付かなくなる抜けを塞ぐ（§9.5） |
-| 未実装のルート（`/tiles/`、GETの`/api/admin/`・`/api/ai/`・`/api/blog/`） | 応答する | 503と定型のJSON | T1.4・P3・P4で実装する |
+| 未実装のルート（`/tiles/`、GETの`/api/admin/geocode`など`status`・`photos`以外の`/api/admin/`、`/api/ai/`、`/api/blog/`） | 応答する | 503と定型のJSON | P3・P4で実装する（`status`・`photos`はT1.4で実装、§10） |
 | `POST` | 既知のルートはContent-Type不一致でJSONの403、それ以外はHTMLの403 | 全部HTMLの403 | P3まで更新系が無い |
 | `/healthz` | 無い（403） | 200/503（Host検査あり） | 新設（§4） |
 | 起動ログ・拒否ログ | 許可する名前、機体のIP、拒否したHostの値を出す | 件数だけ。Hostの値は出さない | §3.2の方針 |
@@ -345,3 +349,81 @@ unitの本体はP5で整える（[build.md](build.md)）。T1.1の時点で分�
 - `tests/access_log.rs`: 引数付きのルートでも、ログに出るのは実際のパスではなくテンプレートであること（`secret-name`・Drive IDらしい値・Hostの値などが出ない）。
 - 手元で、現行Python（合成データ）と同じリクエスト131件を流して差分を確かめた（意図した差は§9.7の表のとおり）。
 
+## 10. 管理画面の読み取りAPI `GET /api/admin/status`・`GET /api/admin/photos`（T1.4）
+
+実装は`admin.rs`（DBの読み取り、ディスク）、`pyquery.rs`（クエリの解釈）、`sysinfo.rs`（`statvfs`と現地時刻）、`server.rs`（ルートとキャッシュ）。現行Pythonの`admin.py:api_admin_status`・`api_admin_photos`、`loc_suggest.py:loc_status`、`handlers.py`のクエリの扱いを、同じ入力で出力を比べながら移した。棚卸しの[E2・E3](inventory.md)。管理画面（`admin.js`）が読むフィールドは、`status`の`sync`・`db.*`・`disk.*`・`server_time`と、一覧の`items[]`・`page`・`pages`・`total`で、**すべてPythonと同じ値で出す**。
+
+### 10.1 ルートとクエリ
+
+- **生のパスの前方一致**（現行の`self.path.startswith(...)`）。`GET`で、生のパスが`/api/admin/status`または`/api/admin/photos`で始まれば当たる（`/api/admin/statusX`・`/api/admin/photos/`・クエリ付きも）。先頭の`//`は現行の`http.server`と同じく`/`に畳んでから判定する（`//api/admin/status`も当たる。T1.4で`/tiles/`・`/api/ai/`・`/api/blog/`・`/api/v1/photos`の判定にも同じ畳み込みを入れた。axumのルートは完全一致なので`//api/v1/photos`は`site`で受ける）。`%73tatus`のようなエンコードと大文字（`/API/...`）は当たらない（`/api/admin/`で始まるものは未実装の503、そうでないものはホワイトリスト外の403）。`HEAD`は現行どおり403、`POST`は全部403。
+- `status`はクエリを見ない。`photos`は`page`（既定1）・`per`（既定50）・`filter`（既定`all`）。
+  - **`parse_qs`と同じ**: `&`で区切り（`;`は区切りでない）、`+`は空白、`%XX`を戻す（壊れた`%`はそのまま、不正なUTF-8はU+FFFD）、**値が空の項目と`=`の無い項目は無かったことになる**（`page=`は既定の1。400にならない）、同じ名前は**最初の値**、`#`以降は落とす。
+  - **`int()`と同じ**: 前後の空白（ASCIIは` \t\n\v\f\r`、ASCII以外はUnicodeの空白。`\x1c`〜`\x1f`は落とさない）、`+`/`-`の符号、数字の間に1つだけの`_`（`1_0`は10、`1__0`・`_1`・`1_`は不可）、**全角など任意のUnicodeの10進数字**（`pyquery.rs`にNd表を持つ）、4300桁を超えるとエラー。桁あふれは`i64`に飽和させる（使い道は丸めだけで、結果は同じ: `per=99999999999999999999`は200、`page=99999999999999999999`は最後のページ）。`page`と`per`のどちらかが通らなければ**400** `{"ok":false,"error":"bad_params"}`（値は応答にもログにも出さない。`filter`は検証しない）。
+  - 丸め: `per`を1〜200に → 総ページ数`max(1, ceil(total/per))` → `page`を1〜総ページ数に。応答の`page`・`per`は**丸めたあとの値**、`filter`は**解決後の名前**（未知の値・大文字小文字違い・空は`all`）。受け取った文字列は返さない。
+- 差: **Pythonの`int()`と違うのは、Pythonのバージョン差（Unicode表）だけ**。Nd表はPython 3.13（Unicode 15.1）から作った。他のバージョンの`unicodedata`と差が出るのは、新しい文字体系の数字が追加された場合に限る。
+
+### 10.2 `GET /api/admin/photos`
+
+`SELECT`・並び（`taken_at`がNULLか空文字なら最後、そのあと`taken_at`、`id`。`id`まで固定なので同順位の揺れは無い。NULLは空文字より先）・件数・値は現行と同じ。
+
+- 項目: `id name thumb taken_at lat lon loc_source infer_dt_s infer_bucket place pref city fav hidden rotation source`。`taken_at`・`place`・`pref`・`city`・`loc_source`はNULLを空文字に（`or ""`）、`fav`・`hidden`は`bool()`の真偽（0・NULL・空文字は偽）、`rotation`は偽なら`0`、`lat`・`lon`・`infer_dt_s`・`name`・`source`は列の値のまま（型も同じ。REAL列は`35.0`のように小数で出る）。
+- `thumb`: `display`があれば`"/" + display`。無ければ、`drive_id`があって`<データ置き場>/derivatives/<drive_id>.jpg`が**実在**すれば`/derivatives/<drive_id>.jpg`（過去に作ったderivativeを拾う。Driveへ取りに行かない）。それ以外は空文字。
+- `infer_bucket`: `loc_source='inferred'`の行だけ。`infer_dt_s`が段階窓（既定15分・2時間・12時間。`GEOFRAME_INFER_MIN`で1つ目が変わる）のどれに入るか（`<=`）で`±15分`・`±2時間`・`±12時間`、超えれば`範囲外`、NULLは空文字（`status`の内訳では`未計測`）。1時間未満は分、以上は時間で、端数は切り捨て。
+- `hint`（`filter`が`noloc`・`suggest`のとき）: 位置あり（`loc_source`が`exif`/`drive_meta`）で撮影時刻が読める写真を「錨」とし、各行の撮影時刻に**最も近い錨**（同じ差なら時刻の早いほう。同じ時刻の錨が複数あるときはSQLiteの走査順に依存するのはPythonと同じ）の`{label, lat, lon, taken_at, dt_s}`。差が7日を超える・自分の時刻が読めない・時刻なしは`null`。**錨が1枚も無ければ`hint`のキー自体を付けない**（`null`と区別がある）。`label`は都道府県・市区町村・町名の空でないものを空白でつなぐ。
+- `suggest`: 位置なしの行で、`photo_loc_suggestions`に行があれば付く（`place_name day_place_name scope precision confidence evidence lat lon geocode_title model`）。`evidence`は`evidence_json`をJSONとして読み、**配列でなければ（壊れている・オブジェクトなど）`[]`**。
+- 時刻の読み方は`photos.rs:parse_epoch`（§8.2）。**既知の差**（§8.2と同じ）: 全角数字の時刻は読めない扱い。
+
+### 10.3 `GET /api/admin/status`
+
+`ok`・`sync{ready,pending,total}`・`db{...}`・`disk{...}`・`server_time`。**Pythonがバックグラウンドで計算して持つ値は無く、すべてDBとファイルシステムから読み取りだけで出せる**（Rustが持たない値はない）。決めごと:
+
+| 項目 | Rust |
+| --- | --- |
+| `sync`・`db`の件数、`by_loc_source`・`by_source` | 同じSQL。`by_loc_source`のキーはNULLを`""`に寄せる。NULLと空文字の両方があると、後から数えた空文字の件数が残る（Pythonの辞書と同じ） |
+| `db.infer_buckets` | `loc_source='inferred'`の行を窓のラベルで数える（NULLは`未計測`） |
+| `db.quality`・`db.ai` | 同じSQL。AIの`embedded`・`detailed`は`embedding_model`が**今のモデル**（`GEOFRAME_EMBED_BACKEND`。§1.1）の行だけ。`pending=max(0, eligible-embedded)` |
+| `db.loc` | `loc_status()`の移植。位置なし・撮影時刻ありの写真（`targets`）のうち、`photo_loc_clues`の判定が**今の画像**（表示ファイル、`md5`、`mtime`が一致）のものを判定済みとして`clue_pending`/`clue_passed`を数える。通る条件は、エラーが空、`clue`がNULLでなく、`clue>=0.2`または`kind='landmark'`。`days`は、撮影時刻順に「最大の窓以上の空き」か「日付の変わり目」で区切ったまとまりの数、`days_with_clue`は通る写真を含むまとまりの数。`runs_done`・`runs_error`は`photo_loc_runs`、`suggested`は位置なしの写真にある候補の数。`decision`・`last_at`は`settings.photo_loc_status`（Pythonのワーカーが前回の処理時に書くJSON）の`decision`・`at`で、**値の型のまま**出す。**Rustは Decision に問い合わせず、この値を書き換えない**。無い・壊れている・オブジェクトでないときは空文字（Pythonはオブジェクトでないと500） |
+| `disk` | §10.4 |
+| `server_time` | 現地時刻の`YYYY-MM-DD HH:MM:SS` |
+
+- 表示ファイルが無い写真の`rel`（判定との照合に使う）は、`thumb`と同じく`derivatives/<drive_id>.jpg`が実在すればそれ。
+- 件数は**1つの読み取りトランザクション**の中で数える（Pythonは件数ごとにロックを取り直すので、書き込みが挟まると合計がずれうる）。`photos`も件数と行を同じトランザクションで読む。
+- **空のテーブルでも動く**（件数は0、内訳は`{}`、`decision`・`last_at`は空文字）。管理画面は`d.db.ai`・`d.db.loc`・`d.db.quality`が無ければ項目を飛ばすが、Rustは常に出す（Pythonも常に出す）。
+
+### 10.4 ディスク使用量と現地時刻
+
+- `disk`は`statvfs`（Pythonの`shutil.disk_usage`と同じ式: `total=f_blocks*f_frsize`、`used=(f_blocks-f_bfree)*f_frsize`、`free=f_bavail*f_frsize`）と、`derivatives/`・`tile_cache/`の再帰的な走査（`os.walk`と同じ: ディレクトリへのシンボリックリンクは辿らず数えない、ファイルへのリンクは先の大きさ、壊れたリンクと走査中に消えたものは無視、無いディレクトリは`{files:0,bytes:0,exists:false}`）。`used_pct`は小数1桁（`round(x,1)`と同じ偶数丸め。総量が0なら整数の`0`）。`tile_cache_max_mb`は`GEOFRAME_TILE_CACHE_MAX_MB`。
+- **60秒キャッシュ**（Pythonと同じ）。全走査になるので、`spawn_blocking`で行い（DBの接続は握らない）、キャッシュを持つロックを走査の間も持つので、同時に来ても走査は1回。`admin.js`は30秒ごとにこのAPIを引く。測定に失敗したとき（データ置き場が無いなど）はキャッシュせず**500**と定型の本文（Pythonも`OSError`で500）。
+- `statvfs`と`localtime_r`のために`libc`を直接の依存にした（`tokio`が既に引いているcrateで、Cのビルドは無く、musl静的ビルドを壊さない）。**`unsafe`は`sysinfo.rs`だけ**で、`lib.rs`が`#![deny(unsafe_code)]`にしている。
+
+### 10.5 応答とエラー
+
+- §8.4と同じ: `application/json; charset=utf-8`、`Cache-Control: no-store`、日本語はエスケープしないUTF-8。**キーの並びはPythonと違う**（Rustは`status`をアルファベット順で出す。`photos`の`items[]`は`api_admin_photos`と同じ順）。比較は構文解析後。
+- DBを読めない・順番待ち（`QUEUE_TIMEOUT`）が上限を超えたら**503**と定型の本文（`status`は`状態を読み取れません。…`、`photos`は`一覧を読み取れません。…`）。SQLiteのエラー文字列・パスは本文に入れずログ（warn）にだけ出す。不正なクエリは**DBを読む前に400**。JSON化の失敗とディスクの測定失敗は500。
+- `photos`は、位置なしの行が一覧にあるとき`photo_loc_suggestions`を引く。この表を読めなければ、その一覧だけ503になる（`fav`など位置ありの行だけの一覧は影響しない）。
+- ログは§3のまま。ルートのテンプレートは`/api/admin/status`・`/api/admin/photos`（`photosX`などの前方一致も同じ）。クエリの値・写真の値は出さない（テスト`access_log.rs`）。
+
+### 10.6 Pythonとの差（まとめ）
+
+意図した差:
+
+| 項目 | Python | Rust | 理由 |
+| --- | --- | --- | --- |
+| 件数の一貫性 | 件数ごとにロックを取り直す | 1つの読み取りトランザクション | 書き込みが挟まっても合計がずれない |
+| `settings.photo_loc_status`がオブジェクトでない | 500 | 空として扱う（200） | 読み取り専用の表示で落とさない |
+| 型が想定外の列（`name`がBLOBなど） | 素通し／例外 | 読み取り全体が503 | スキーマ上は起きない |
+| 表示ファイルが絶対パス（`drive_id`が`/`で始まる）の`rel` | 500（`relative_to`の`ValueError`） | 空文字 | 起きない |
+| 設定 | `GEOFRAME_INFER_MIN`などが不正だと起動できない（例外） | `INFER_MIN`・`TILE_CACHE_MAX_MB`は起動を断る（終了コード2）、`EMBED_BACKEND`は`gemini`に落とす | §1.1 |
+| キーの並び・区切りの空白 | `", "`・`": "`、挿入順 | 空白なし、`status`はアルファベット順 | 構文解析後に比べる |
+| 空・壊れたJSONの扱い（`evidence_json`、`photo_loc_status`） | `json.loads`（`NaN`などを通す） | `serde_json`（通さない） | Pythonの書き手は`json.dumps`で`NaN`を書かない |
+
+残る既知の差（§8.2と同じ）: 全角数字の撮影時刻、`TZ`が夏時間を持つときの時刻の差、時刻の解釈。
+
+### 10.7 テスト
+
+合成データだけ（実在の地名・座標・ファイル名を使わない）。
+
+- `app/tests/admin_api_fixture.py`が合成DB（本物のスキーマ＋30枚の写真・品質・AI・位置候補・Decisionの判定・実行・設定）を作り、**現行のPythonハンドラを実際に起動**して、`/api/admin/photos`の80通り超のクエリ（各filter、ページ境界、`per`の上限、`parse_qs`と`int()`の癖、400、前方一致）と、`status`（既定・`local`・設定なし・壊れた設定・`GEOFRAME_INFER_MIN`違い・空のテーブル）の出力を`crates/geoframe/tests/fixtures/admin-api-python.json`に書く。DBは`admin-api-catalog.sql`。再生成と検査は`python3 tools/gen_admin_fixture.py`（`--check`）。Pythonのテスト（`test_admin_api_fixture.py`）が、ファイルが最新であることと、フィクスチャが押さえている癖を確かめる（CIで古いフィクスチャが落ちる）。
+- `crates/geoframe/tests/admin_api.rs`: 同じDBを作り直してRustのサーバーに同じリクエストを流し、`serde_json::Value`として完全一致を確かめる。比べない値は`disk`と`server_time`だけで、形・数え方・キャッシュを別に検査する。そのほか、`per`の上限（205枚）、並び（NULL・空文字・同時刻はid）、ヘッダ、`HEAD`/`POST`の403、未実装の503、DBが壊れたとき・順番待ちが超えたときの503、`status`の`disk`の数え方（リンク）。
+- `pyquery.rs`の単体テストの期待値は、Pythonの`parse_qs`・`int()`で確かめたもの（開発時に、ランダムな入力5万件で突き合わせて差が無いことを確認した。コミットしていない）。
+- 手元での確認: musl静的ビルドの`file`は`static-pie linked`、`ldd`は`statically linked`のまま。
