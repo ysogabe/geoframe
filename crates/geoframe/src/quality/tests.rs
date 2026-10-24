@@ -977,4 +977,11 @@ fn 時刻の秒つきの形も読む() {
         assert_eq!(super::parse_taken_at(bad), None, "{bad:?}");
     }
     assert!(super::parse_taken_at("2024-5-6 1:2:3").is_some());
+    // 日だけは空白埋めを読む（`strptime` の `%d`）。`geo::naive_seconds` と同じ規則（geo のテストが Python と突き合わせる）
+    assert_eq!(
+        super::parse_taken_at("2024-05- 6 10:00:30"),
+        super::parse_taken_at("2024-05-06 10:00:30")
+    );
+    assert!(super::parse_taken_at("2024-05- 6 10:00").is_some());
+    assert_eq!(super::parse_taken_at("2024-05- 06 10:00:30"), None);
 }

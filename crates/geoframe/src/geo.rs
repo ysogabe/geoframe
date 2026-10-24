@@ -31,7 +31,9 @@ mod tests;
 /// `taken_at` を、naive な日時の通算秒（任意の起点）にする。解釈できなければ `None`
 /// （現行の `t_epoch`: `strptime(s, "%Y-%m-%d %H:%M")` が失敗したとき）。
 ///
-/// `strptime` に合わせた点: 月・日・時・分は 1〜2 桁（`1` でも `01` でも可）、日付と時刻の間は空白 1 文字以上、
+/// `strptime` に合わせた点: 月・日・時・分は 1〜2 桁（`1` でも `01` でも可）、日付と時刻の間は空白 1 文字以上
+/// （Python の `\s` に当たる文字。U+001C〜001F も含む）、**日だけ空白埋め**（`2024-05- 6`。` [1-9]` の空白 1 つ＋
+/// 1 桁。`strptime` の `%d` の正規表現にだけある。月・時・分・秒に空白埋めは無く、`- 06`・`- 16` も読めない）、
 /// 暦として不正（2 月 30 日など）・範囲外（24 時、60 分）・末尾の余分は失敗。年は 4 桁で 1〜9999。
 /// **ASCII の数字だけを読む**。`strptime` の正規表現の `\d` は Unicode の数字（全角の `０`〜`９` など）にも当たるので、
 /// 全角の数字が混じった時刻を現行は読む場合がある（CPython 3.13 で確認: 年が全角でも、分が 1 桁の全角でも読める。
@@ -68,10 +70,19 @@ fn naive_seconds_in(s: &str, with_seconds: bool) -> Option<f64> {
     (chars.next()? == '-').then_some(())?;
     let month = number(&mut chars, 1, 2)?;
     (chars.next()? == '-').then_some(())?;
-    let day = number(&mut chars, 1, 2)?;
+    // 日は `3[0-1]|[1-2]\d|0[1-9]|[1-9]| [1-9]`。空白埋めは空白 1 つ＋ 1〜9 の 1 桁だけ（`- 06` は読めない）
+    let day = if chars.peek() == Some(&' ') {
+        chars.next();
+        chars
+            .next()
+            .and_then(|c| c.to_digit(10))
+            .filter(|d| *d >= 1)?
+    } else {
+        number(&mut chars, 1, 2)?
+    };
     // 日付と時刻の間は `\s+`
     let mut spaces = 0;
-    while chars.peek().is_some_and(|c| c.is_whitespace()) {
+    while chars.peek().is_some_and(|c| crate::photos::py_space(*c)) {
         chars.next();
         spaces += 1;
     }

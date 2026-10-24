@@ -24,6 +24,10 @@ pub enum Reply {
     Hangup,
     /// ヘッダーを返してから、本文の途中で接続を閉じる。
     Truncated,
+    /// チャンク長が数でない `Transfer-Encoding: chunked` の本文（`ureq` の `Protocol`）。
+    BadChunk,
+    /// 途中で終わる gzip の本文を `Content-Encoding: gzip` で送る（`ureq` の `Decompress`）。
+    TruncatedGzip,
 }
 
 impl Reply {
@@ -201,12 +205,36 @@ fn handle(mut stream: TcpStream, state: &Mutex<State>) -> std::io::Result<()> {
 }
 
 fn respond(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
+    match reply {
+        Reply::BadChunk => {
+            return stream.write_all(
+                b"HTTP/1.1 200 X\r\nContent-Type: application/json\r\nConnection: close\r\n\
+                  Transfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n",
+            );
+        }
+        Reply::TruncatedGzip => {
+            // gzip のヘッダー 10 バイト＋最終でない stored ブロックの頭と 4 バイトだけ（ブロックの本体が足りない）
+            let gzip: &[u8] = &[
+                0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0x03, 0x00, 0x10, 0x00, 0xef, 0xff, b'a', b'b',
+                b'c', b'd',
+            ];
+            let head = format!(
+                "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nConnection: close\r\n\
+                 Content-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                gzip.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            return stream.write_all(gzip);
+        }
+        _ => {}
+    }
     let (status, content_type, body, claim): (u16, &str, &str, Option<usize>) = match reply {
         Reply::Hangup => return Ok(()),
         Reply::Json(body) => (200, "application/json", body, None),
         Reply::Text(body) => (200, "text/plain", body, None),
         Reply::Status(status) => (*status, "text/plain", "", None),
         Reply::Truncated => (200, "application/json", "{\"resu", Some(1000)),
+        Reply::BadChunk | Reply::TruncatedGzip => unreachable!("上で返した"),
     };
     let head = format!(
         "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",

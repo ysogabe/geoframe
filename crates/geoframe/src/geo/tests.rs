@@ -11,12 +11,13 @@ use std::time::Duration;
 use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 
-use super::enrich::{GsiEndpoints, parse_muni_js};
+use super::enrich::{GsiEndpoints, body_failure, parse_muni_js};
 use super::stub::{Kind, Reply, StubGsi};
-use super::{Enrich, Infer, naive_seconds};
+use super::{Enrich, Infer, naive_seconds, naive_seconds_with_seconds};
 use crate::backoff::FailureMemo;
 use crate::cache::Cache;
 use crate::config::{Config, Overrides};
+use crate::net::Failure;
 use crate::stop::StopFlag;
 use crate::sync::{Counts, Mode, Stage, StageCtx, StageError, StageOutcome};
 use crate::testutil::TempDir;
@@ -198,6 +199,7 @@ fn enrich_for(stub: &StubGsi) -> Enrich {
         Duration::ZERO,
         FailureMemo::with_policy(Duration::ZERO, Duration::ZERO, 16),
     )
+    .with_retry_wait(Duration::ZERO)
 }
 
 /// 記憶つき（本番の設定）の `Enrich`。
@@ -207,6 +209,35 @@ fn enrich_with_memory(stub: &StubGsi) -> Enrich {
         Duration::ZERO,
         FailureMemo::default(),
     )
+    .with_retry_wait(Duration::ZERO)
+}
+
+/// 国内の `n` 行（`id` は 1 から、緯度 36.0 から 0.5 度ずつ違う。キャッシュのキーは重ならない）。
+fn domestic_rows(n: i64) -> String {
+    (1..=n)
+        .map(|i| {
+            photo(
+                i,
+                None,
+                Some((36.0 + f64::from(i as i32) / 2.0, 136.0)),
+                Some("exif"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// `domestic_rows` の `i` 行目の緯度。
+fn domestic_lat(i: i64) -> f64 {
+    36.0 + f64::from(i as i32) / 2.0
+}
+
+/// 地理院への要求のうち、この緯度への、指定の種類の数。
+fn requests_for(stub: &StubGsi, kind: Kind, lat: f64) -> usize {
+    stub.requests()
+        .iter()
+        .filter(|(k, a, _)| *k == kind && (*a - lat).abs() < 1e-9)
+        .count()
 }
 
 fn tokyo_replies(stub: &StubGsi) {
@@ -239,6 +270,46 @@ fn 時刻はstrptimeと同じ規則で読む() {
         naive_seconds("2024-05-06\t07:08"),
         naive_seconds("2024-05-06 07:08")
     );
+    // 日だけは空白埋めを読む（`%d` の ` [1-9]`）。月・時・分に空白埋めは無く、2 桁の日の前の空白（` 06`）も読めない
+    assert_eq!(
+        naive_seconds("2024-05- 6 07:08"),
+        naive_seconds("2024-05-06 07:08")
+    );
+    assert_eq!(
+        naive_seconds("2024-05- 9\t7:8"),
+        naive_seconds("2024-05-09 07:08")
+    );
+    for bad in [
+        "2024-05- 06 07:08",
+        "2024-05- 16 07:08",
+        "2024-05- 0 07:08",
+        "2024-05-  6 07:08",
+        "2024-05-0 6 07:08",
+        "2024- 5-06 07:08",
+        "2024-05-06  7: 8",
+        "2024-05-06 07: 8",
+    ] {
+        assert_eq!(naive_seconds(bad), None, "{bad:?}");
+    }
+    // 区切りは Python の `\s`（U+001C〜001F も含む）。ゼロ幅の空白は含まない
+    for sep in [
+        "\u{1c}",
+        "\u{1f}",
+        "\u{a0}",
+        "\u{202f}",
+        "\u{3000} ",
+        "\u{b}",
+        "\n",
+    ] {
+        assert_eq!(
+            naive_seconds(&format!("2024-05-06{sep}07:08")),
+            naive_seconds("2024-05-06 07:08"),
+            "{sep:?}"
+        );
+    }
+    for sep in ["\u{200b}", "\u{180e}"] {
+        assert_eq!(naive_seconds(&format!("2024-05-06{sep}07:08")), None);
+    }
     // うるう年
     assert!(naive_seconds("2024-02-29 00:00").is_some());
     assert!(naive_seconds("2023-02-29 00:00").is_none());
@@ -276,6 +347,60 @@ fn 時刻はstrptimeと同じ規則で読む() {
     let a = naive_seconds("2024-02-28 12:00").unwrap();
     let b = naive_seconds("2024-03-01 12:00").unwrap();
     assert_eq!(b - a, 2.0 * 86_400.0);
+}
+
+/// 品質解析が使う秒つきの形にも、同じ規則（日の空白埋め・区切り）を当てる。
+#[test]
+fn 秒つきの時刻にも同じ規則を当てる() {
+    assert_eq!(
+        naive_seconds_with_seconds("2024-05- 6 07:08:09"),
+        naive_seconds_with_seconds("2024-05-06 07:08:09")
+    );
+    assert_eq!(
+        naive_seconds_with_seconds("2024-05- 6 07:08:09").map(|t| t - 9.0),
+        naive_seconds("2024-05-06 07:08")
+    );
+    assert!(naive_seconds_with_seconds("2024-05-06\u{1c}7:8:9").is_some());
+    for bad in [
+        "2024-05- 06 07:08:09",
+        "2024-05-06 07:08",
+        "2024-05-06 07:08:60",
+        "2024-05-06 07:08: 9",
+        "2024-05-06 07:08:09 ",
+    ] {
+        assert_eq!(naive_seconds_with_seconds(bad), None, "{bad:?}");
+    }
+}
+
+/// Python の `strptime`（`%Y-%m-%d %H:%M`・`%Y-%m-%d %H:%M:%S`）の結果との突き合わせ。
+#[test]
+fn pythonのstrptimeと時刻の読み方が一致する() {
+    let doc = fixture();
+    let samples = doc["time_samples"].as_array().unwrap();
+    assert!(samples.len() >= 400, "{}", samples.len());
+    let mut readable = 0;
+    for sample in samples {
+        let text = sample["text"].as_str().unwrap();
+        assert_eq!(
+            naive_seconds(text),
+            sample["minute"].as_f64(),
+            "分まで: {text:?}"
+        );
+        assert_eq!(
+            naive_seconds_with_seconds(text),
+            sample["second"].as_f64(),
+            "秒まで: {text:?}"
+        );
+        // 写真フィードの `parse_epoch`（T1.2）も同じ規則
+        assert_eq!(
+            crate::photos::parse_epoch(text).map(|t| t as f64),
+            sample["minute"].as_f64(),
+            "フィード: {text:?}"
+        );
+        readable += usize::from(sample["minute"].is_number());
+    }
+    // 読めるものも読めないものも十分ある
+    assert!(readable > 20 && readable < samples.len() - 20, "{readable}");
 }
 
 // ---------------------------------------------------------------- infer
@@ -711,7 +836,8 @@ fn 片方だけ応答があればその分で確定し_両方なければ確定�
     ));
     let enrich = enrich_for(&stub);
     let counts = s.run(&enrich);
-    assert_eq!(get(&counts, "queried"), 1);
+    assert_eq!(get(&counts, "queried"), 2); // 通信を試した行
+    assert_eq!(get(&counts, "resolved"), 1); // うち確定した行
     assert_eq!(get(&counts, "unresolved"), 1);
     // 1: 標高だけで確定（place は空）
     assert_eq!(s.row(1)["place"], "");
@@ -764,13 +890,16 @@ fn 応答が壊れた座標は記憶してしばらく飛ばし_後続を枠に�
     let enrich = enrich_with_memory(&stub);
     let first = s.run(&enrich);
     assert_eq!(get(&first, "candidates"), 40);
+    assert_eq!(get(&first, "queried"), 40);
+    assert_eq!(get(&first, "resolved"), 0);
     assert_eq!(get(&first, "unresolved"), 40);
     assert_eq!(s.row(100)["place"], Value::Null);
     // 2 回目: 40 件は飛ばして、残りの 5 件と後続を枠に入れる
     let second = s.run(&enrich);
     assert_eq!(get(&second, "skipped_backoff"), 40);
     assert_eq!(get(&second, "unresolved"), 5);
-    assert_eq!(get(&second, "queried"), 1);
+    assert_eq!(get(&second, "queried"), 6);
+    assert_eq!(get(&second, "resolved"), 1);
     assert_eq!(s.row(100)["place"], "");
     // 3 回目: 45 件とも飛ばす
     let third = s.run(&enrich);
@@ -778,17 +907,85 @@ fn 応答が壊れた座標は記憶してしばらく飛ばし_後続を枠に�
     assert_eq!(get(&third, "skipped_backoff"), 45);
 }
 
+/// 座標によらない障害（429）は、再試行のあとすぐ段を中断する。
 #[test]
-fn 通信の障害は何も確定せずに段を中断する() {
-    let outages: Vec<(&str, Reply)> = vec![
-        ("5xx", Reply::Status(503)),
-        ("429", Reply::Status(429)),
-        ("切断", Reply::Hangup),
-        ("本文の途中の切断", Reply::Truncated),
+fn 全体の障害は再試行のあと何も確定せずに段を中断し_記憶に入れない() {
+    for broken in ["rgeo", "elev"] {
+        let s = setup("geo-enrich-outage-global");
+        let stub = StubGsi::start();
+        tokyo_replies(&stub);
+        if broken == "rgeo" {
+            stub.set_rgeo(|_, _| Reply::Status(429));
+        } else {
+            stub.set_elev(|_, _| Reply::Status(429));
+        }
+        s.cache.put(
+            "geo:38.000,138.000",
+            json!({"place": "キャッシュ", "elev": 1, "muni_cd": "", "pref": "", "city": ""}),
+        );
+        s.sql(&format!(
+            "{};{};{};{};{};{}",
+            photo(1, None, Some(PARIS), Some("exif")), // 国外: 先に確定する
+            photo(2, None, Some(TOKYO), Some("exif")), // ここで 429
+            photo(3, None, Some((36.0, 136.0)), Some("exif")),
+            photo(4, None, Some((37.0, 137.0)), Some("exif")),
+            photo(5, None, Some((38.0, 138.0)), Some("exif")), // 通信の要らない行は、止まったあとも済ませる
+            photo(6, None, Some((-33.0, 151.0)), Some("exif")),
+        ));
+        let enrich = enrich_with_memory(&stub);
+        let err = s.try_run(&enrich).unwrap_err().to_string();
+        assert!(err.contains("通信の障害"), "{broken}: {err}");
+        assert!(err.contains("http 429"), "{err}");
+        // 件数: 試したのは 1 行、見送ったのは 2 行（URL・座標は含まない）
+        assert!(
+            err.contains("queried=1") && err.contains("deferred=2"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("127.0.0.1") && !err.contains("35.68"),
+            "{err}"
+        );
+        assert_eq!(s.row(1)["place"], "", "{broken}: 国外は済んでいる");
+        assert_eq!(s.row(5)["place"], "キャッシュ", "{broken}");
+        assert_eq!(s.row(6)["place"], "", "{broken}");
+        // 障害の行は確定しない（片方だけ応答があっても、現行のようには確定しない）。見送った行にも問い合わせない
+        for id in [2, 3, 4] {
+            assert_eq!(s.row(id)["place"], Value::Null, "{broken}/{id}");
+        }
+        assert!(s.cache.get("geo:35.681,139.767").is_none(), "{broken}");
+        // 同じ要求を 1 + 2 回。ほかの座標には進まない
+        let (rgeo, elev) = if broken == "rgeo" { (3, 0) } else { (1, 3) };
+        assert_eq!(requests_for(&stub, Kind::Rgeo, TOKYO.0), rgeo, "{broken}");
+        assert_eq!(requests_for(&stub, Kind::Elev, TOKYO.0), elev, "{broken}");
+        assert!(
+            stub.requests()
+                .iter()
+                .filter(|(kind, _, _)| *kind != Kind::Muni)
+                .all(|(_, lat, _)| (*lat - TOKYO.0).abs() < 1e-9),
+            "{broken}"
+        );
+        // 直れば、記憶に入っていないので待たずに続きから埋まる
+        tokyo_replies(&stub);
+        let counts = s.run(&enrich);
+        assert_eq!(get(&counts, "skipped_backoff"), 0);
+        assert_eq!(get(&counts, "resolved"), 3, "{broken}");
+    }
+}
+
+/// 座標による障害（5xx・切断・本文が読めない）は、その座標を覚えて飛ばして次へ進み、続けて 3 つの座標で
+/// 起きたら全体の障害として中断する。
+#[test]
+fn 座標による障害は覚えて飛ばし_続けて3つの座標で起きたら段を中断する() {
+    let outages: Vec<(&str, Reply, &str)> = vec![
+        ("5xx", Reply::Status(503), "http 503"),
+        ("切断", Reply::Hangup, "disconnected"),
+        ("本文の途中の切断", Reply::Truncated, "disconnected"),
+        ("壊れたチャンク", Reply::BadChunk, "body_unreadable"),
+        ("途中で終わる gzip", Reply::TruncatedGzip, "body_unreadable"),
     ];
-    for (label, outage) in outages {
+    for (label, outage, word) in outages {
         for broken in ["rgeo", "elev"] {
-            let s = setup("geo-enrich-outage");
+            let s = setup("geo-enrich-outage-coordinate");
             let stub = StubGsi::start();
             tokyo_replies(&stub);
             let bad = outage.clone();
@@ -797,34 +994,233 @@ fn 通信の障害は何も確定せずに段を中断する() {
             } else {
                 stub.set_elev(move |_, _| bad.clone());
             }
-            s.sql(&format!(
-                "{};{};{}",
-                photo(1, None, Some(PARIS), Some("exif")), // 国外: 先に確定する
-                photo(2, None, Some(TOKYO), Some("exif")),
-                photo(3, None, Some((36.0, 136.0)), Some("exif")),
-            ));
-            let err = s.try_run(&enrich_for(&stub)).unwrap_err().to_string();
-            assert!(err.contains("通信の障害"), "{label}/{broken}: {err}");
-            // URL・座標を含まない
-            assert!(!err.contains("127.0.0.1"), "{err}");
-            assert!(!err.contains("35.68"), "{err}");
-            assert_eq!(s.row(1)["place"], "", "{label}/{broken}: 国外は済んでいる");
-            // 障害の行は確定しない（片方だけ応答があっても、現行のようには確定しない）
-            assert_eq!(s.row(2)["place"], Value::Null, "{label}/{broken}");
-            assert!(
-                s.cache.get("geo:35.681,139.767").is_none(),
-                "{label}/{broken}"
+            s.cache.put(
+                "geo:38.000,138.000",
+                json!({"place": "キャッシュ", "elev": 1, "muni_cd": "", "pref": "", "city": ""}),
             );
-            // 中断したので、3 の行は問い合わせていない
-            assert_eq!(s.row(3)["place"], Value::Null);
+            // 1 国外 / 2〜6 国内（2・3・4 で続けて失敗して中断。5・6 は見送る）/ 7 国外 / 8 キャッシュにある国内
+            let mut rows = vec![photo(1, None, Some(PARIS), Some("exif"))];
+            for i in 2..=6 {
+                rows.push(photo(i, None, Some((domestic_lat(i), 136.0)), Some("exif")));
+            }
+            rows.push(photo(7, None, Some((-33.0, 151.0)), Some("exif")));
+            rows.push(photo(8, None, Some((38.0, 138.0)), Some("exif")));
+            s.sql(&rows.join(";"));
+            let enrich = enrich_with_memory(&stub);
+            let err = s.try_run(&enrich).unwrap_err().to_string();
+            let name = format!("{label}/{broken}");
+            assert!(err.contains("通信の障害"), "{name}: {err}");
+            assert!(err.contains("3つの座標"), "{name}: {err}");
+            assert!(err.contains(word), "{name}: {err}");
             assert!(
-                stub.requests()
-                    .iter()
-                    .all(|(_, lat, _)| (*lat - 36.0).abs() > 1e-9),
-                "{label}/{broken}"
+                err.contains("queried=3")
+                    && err.contains("unresolved=3")
+                    && err.contains("deferred=2"),
+                "{name}: {err}"
             );
+            assert!(
+                !err.contains("127.0.0.1") && !err.contains("136.0"),
+                "{err}"
+            );
+            for id in [1, 7] {
+                assert_eq!(s.row(id)["place"], "", "{name}: 国外は済んでいる");
+            }
+            assert_eq!(
+                s.row(8)["place"],
+                "キャッシュ",
+                "{name}: 通信の要らない行は済ませる"
+            );
+            for id in 2..=6 {
+                assert_eq!(s.row(id)["place"], Value::Null, "{name}/{id}");
+            }
+            // 失敗した座標ごとに、同じ要求を 1 + 2 回。見送った 5・6 には問い合わせない
+            for id in 2..=4 {
+                let (rgeo, elev) = if broken == "rgeo" { (3, 0) } else { (1, 3) };
+                assert_eq!(
+                    requests_for(&stub, Kind::Rgeo, domestic_lat(id)),
+                    rgeo,
+                    "{name}/{id}"
+                );
+                assert_eq!(
+                    requests_for(&stub, Kind::Elev, domestic_lat(id)),
+                    elev,
+                    "{name}/{id}"
+                );
+            }
+            for id in 5..=6 {
+                assert_eq!(
+                    requests_for(&stub, Kind::Rgeo, domestic_lat(id)),
+                    0,
+                    "{name}/{id}"
+                );
+            }
+            // 直ると、失敗した 3 座標は覚えているので飛ばし（30 分以上）、見送った 2 行から埋まる
+            tokyo_replies(&stub);
+            let counts = s.run(&enrich);
+            assert_eq!(get(&counts, "skipped_backoff"), 3, "{name}");
+            assert_eq!(get(&counts, "resolved"), 2, "{name}");
+            assert_eq!(s.row(5)["place"], "テスト町一丁目", "{name}");
+            assert_eq!(s.row(2)["place"], Value::Null, "{name}");
         }
     }
+}
+
+/// 先頭だけ座標による障害で、後続は正常: 先頭の座標を覚えて飛ばし、後続は埋まる。続けて失敗しなければ
+/// （間に成功する座標があれば）何度失敗しても中断しない。
+#[test]
+fn 先頭の座標だけ5xxでも後続は埋まり_間に成功があれば中断しない() {
+    let s = setup("geo-enrich-outage-head");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    // 緯度 36.5・37.5・38.5（id 1・3・5）だけ 503。ほかは正常
+    let bad = [domestic_lat(1), domestic_lat(3), domestic_lat(5)];
+    stub.set_rgeo(move |lat, _| {
+        if bad.iter().any(|b| (*b - lat).abs() < 1e-9) {
+            Reply::Status(503)
+        } else {
+            Reply::json(r#"{"results":{"lv01Nm":"x"}}"#)
+        }
+    });
+    s.sql(&domestic_rows(7));
+    let enrich = enrich_with_memory(&stub);
+    let counts = s.run(&enrich);
+    assert_eq!(get(&counts, "queried"), 7);
+    assert_eq!(get(&counts, "resolved"), 4);
+    assert_eq!(get(&counts, "unresolved"), 3);
+    assert_eq!(get(&counts, "deferred"), 0);
+    for id in 1..=7 {
+        let bad = id % 2 == 1 && id <= 5;
+        assert_eq!(s.row(id)["place"] == Value::Null, bad, "{id}");
+    }
+    // 先頭の座標には 1 + 2 回だけ要求した
+    assert_eq!(requests_for(&stub, Kind::Rgeo, domestic_lat(1)), 3);
+    // 次のサイクル: 覚えているので 3 座標は飛ばし、枠を占めない
+    stub.clear_requests();
+    let counts = s.run(&enrich);
+    assert_eq!(get(&counts, "candidates"), 0);
+    assert_eq!(get(&counts, "skipped_backoff"), 3);
+    assert!(stub.requests().is_empty());
+}
+
+/// 標高だけの長期障害: 逆ジオが答えていても確定せず（現行は地名だけで確定して `elev` を空に固定する）、
+/// 国内の未キャッシュの行は進まない。直れば欠けなく埋まる。
+#[test]
+fn 標高だけの長期障害は地名だけでは確定せず_直れば欠けなく埋まる() {
+    let s = setup("geo-enrich-elev-down");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    stub.set_elev(|_, _| Reply::Status(503));
+    s.sql(&domestic_rows(5));
+    let enrich = enrich_with_memory(&stub);
+    let err = s.try_run(&enrich).unwrap_err().to_string();
+    assert!(
+        err.contains("3つの座標") && err.contains("http 503"),
+        "{err}"
+    );
+    // 逆ジオは答えているのに、地名も書かない（elev を NULL に固定しない）
+    for id in 1..=5 {
+        assert_eq!(s.row(id)["place"], Value::Null, "{id}");
+    }
+    assert!(s.cache.get("geo:36.500,136.000").is_none());
+    assert!(requests_for(&stub, Kind::Rgeo, domestic_lat(1)) >= 1);
+    // 標高が直った: 失敗した 3 座標は覚えて飛ばし、残りは埋まる。elev も付く
+    tokyo_replies(&stub);
+    let counts = s.run(&enrich);
+    assert_eq!(get(&counts, "skipped_backoff"), 3);
+    assert_eq!(get(&counts, "resolved"), 2);
+    assert_eq!(s.row(4)["elev"], 12.0);
+    assert_eq!(s.row(5)["place"], "テスト町一丁目");
+}
+
+/// 一時的な 5xx は再試行で通る。
+#[test]
+fn 一度だけの5xxは再試行で通り_確定する() {
+    let s = setup("geo-enrich-retry");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    stub.set_elev(move |_, _| {
+        if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+            Reply::Status(503)
+        } else {
+            Reply::json(r#"{"elevation":12.5}"#)
+        }
+    });
+    s.sql(&domestic_rows(1));
+    let counts = s.run(&enrich_for(&stub));
+    assert_eq!(get(&counts, "queried"), 1);
+    assert_eq!(get(&counts, "resolved"), 1);
+    assert_eq!(get(&counts, "unresolved"), 0);
+    assert_eq!(s.row(1)["elev"], 12.0);
+    assert_eq!(stub.count(Kind::Rgeo), 1);
+    assert_eq!(stub.count(Kind::Elev), 2);
+}
+
+/// 本文を読む失敗の分類（`CallError` の表）。ヘッダーの前なら `Other` の種類も、本文では障害にする。
+#[test]
+fn 本文が読めない失敗は障害の種類になる() {
+    let stub = StubGsi::start();
+    for reply in [Reply::BadChunk, Reply::TruncatedGzip] {
+        let what = format!("{reply:?}");
+        stub.set_rgeo(move |_, _| reply.clone());
+        let url = format!(
+            "{}/reverse-geocoder/LonLatToAddress?lat=1&lon=2",
+            stub.base_url()
+        );
+        let mut response = crate::net::agent().get(&url).call().unwrap();
+        let error = response
+            .body_mut()
+            .with_config()
+            .limit(1 << 20)
+            .read_to_vec()
+            .unwrap_err();
+        match (&what[..], &error) {
+            ("BadChunk", ureq::Error::Protocol(_)) => {}
+            ("TruncatedGzip", ureq::Error::Decompress("gzip", _)) => {}
+            _ => panic!("想定外のエラー: {what}"),
+        }
+        assert_eq!(Failure::from(&error), Failure::Other);
+        assert_eq!(body_failure(&error), Failure::BodyUnreadable);
+    }
+    let io = |kind| ureq::Error::Io(std::io::Error::from(kind));
+    for (error, expected) in [
+        (io(std::io::ErrorKind::UnexpectedEof), Failure::Disconnected),
+        (
+            io(std::io::ErrorKind::ConnectionReset),
+            Failure::Disconnected,
+        ),
+        (io(std::io::ErrorKind::TimedOut), Failure::Timeout),
+        (
+            ureq::Error::Timeout(ureq::Timeout::Global),
+            Failure::Timeout,
+        ),
+        (ureq::Error::Tls("x"), Failure::Tls),
+        (
+            ureq::Error::Decompress(
+                "gzip",
+                std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            ),
+            Failure::BodyUnreadable,
+        ),
+        (ureq::Error::TooManyRedirects, Failure::BodyUnreadable),
+    ] {
+        let failure = body_failure(&error);
+        assert_eq!(failure, expected);
+        assert!(failure.is_outage());
+    }
+    // 上限（1 MiB）を超える本文は障害でなく、応答が使えない扱い（座標は覚える）
+    let s = setup("geo-enrich-body-limit");
+    let big = format!(r#"{{"x":"{}"}}"#, "a".repeat(1 << 20));
+    stub.set_rgeo(move |_, _| Reply::Json(big.clone()));
+    stub.set_elev(|_, _| Reply::Text("not json".into()));
+    s.sql(&domestic_rows(1));
+    stub.set_muni(Reply::Text("'13,東京都,13101,千代田区'".into()));
+    stub.clear_requests();
+    let counts = s.run(&enrich_for(&stub));
+    assert_eq!(get(&counts, "unresolved"), 1);
+    assert_eq!(stub.count(Kind::Rgeo), 1, "再試行しない");
+    assert_eq!(stub.count(Kind::Elev), 1, "再試行しない");
 }
 
 #[test]
@@ -832,11 +1228,11 @@ fn 障害から復旧した次のサイクルで続きから埋まる() {
     let s = setup("geo-enrich-recover");
     let stub = StubGsi::start();
     tokyo_replies(&stub);
-    stub.set_elev(|_, _| Reply::Status(503));
+    stub.set_elev(|_, _| Reply::Status(429));
     s.sql(&photo(1, None, Some(TOKYO), Some("exif")));
     let enrich = enrich_with_memory(&stub);
     assert!(s.try_run(&enrich).is_err());
-    // 復旧: 障害は記憶に入らない（写真の失敗ではない）ので、待たずに問い合わせる
+    // 復旧: 全体の障害は記憶に入らないので、待たずに問い合わせる
     stub.set_elev(|_, _| Reply::json(r#"{"elevation":12.5}"#));
     let counts = s.run(&enrich);
     assert_eq!(get(&counts, "queried"), 1);
@@ -861,6 +1257,7 @@ fn muni_jsが取れなければ通信が要る行は処理せず_国外とキャ
     ));
     let err = s.try_run(&enrich_for(&stub)).unwrap_err().to_string();
     assert!(err.contains("muni.js"), "{err}");
+    assert!(err.contains("deferred=1"), "{err}");
     assert_eq!(s.row(1)["place"], "");
     assert_eq!(s.row(3)["place"], "キャッシュ");
     assert_eq!(s.row(2)["place"], Value::Null);
@@ -1027,6 +1424,94 @@ fn 停止の合図が来たら次の行へ進まない() {
     );
     assert_eq!(s.row(1)["place"], "x");
     assert_eq!(s.row(2)["place"], Value::Null);
+    // 停止の境界: 通信が進んでいる行は、標高・キャッシュ・DB まで済ませてから止まる
+    assert_eq!(stub.count(Kind::Rgeo), 1);
+    assert_eq!(stub.count(Kind::Elev), 1);
+    assert!(s.cache.get("geo:35.681,139.767").is_some());
+}
+
+/// 再試行の待ちの途中で停止の合図が来たら、待ちを打ち切って戻る。その行は確定せず、記憶にも入れない。
+#[test]
+fn 再試行の待ちの途中で停止の合図が来たら打ち切る() {
+    let s = setup("geo-enrich-stop-retry");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    s.sql(&domestic_rows(2));
+    let stop = StopFlag::new();
+    let flag = stop.clone();
+    stub.set_rgeo(move |_, _| {
+        flag.stop();
+        Reply::Status(503)
+    });
+    let enrich = Enrich::with(
+        GsiEndpoints::stub(&stub.base_url()),
+        Duration::ZERO,
+        FailureMemo::default(),
+    )
+    .with_retry_wait(Duration::from_secs(30));
+    let read = s.read(Mode::Apply);
+    let started = std::time::Instant::now();
+    let outcome = s.run_in(&enrich, Mode::Apply, &read, &stop).unwrap();
+    let StageOutcome::Done(counts) = outcome else {
+        panic!("{outcome:?}")
+    };
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "待ちを打ち切る"
+    );
+    assert_eq!(get(&counts, "queried"), 0);
+    assert_eq!(stub.count(Kind::Rgeo), 1, "再試行に進まない");
+    for id in [1, 2] {
+        assert_eq!(s.row(id)["place"], Value::Null);
+    }
+    // 記憶に入っていないので、次のサイクルは待たずに試す
+    tokyo_replies(&stub);
+    let counts = s.run(&enrich);
+    assert_eq!(get(&counts, "skipped_backoff"), 0);
+    assert_eq!(get(&counts, "resolved"), 2);
+}
+
+/// 通信を試した行は、確定してもしなくても待つ（地理院への連続リクエストの抑制）。再試行の前にも待つ。
+#[test]
+fn 通信を試した行は結果によらず待つ() {
+    let pause = Duration::from_millis(150);
+    let make = |stub: &StubGsi, retry_wait: Duration| {
+        Enrich::with(
+            GsiEndpoints::stub(&stub.base_url()),
+            pause,
+            FailureMemo::default(),
+        )
+        .with_retry_wait(retry_wait)
+    };
+    // 両方の応答が使えない行（確定しない）: 以前は待たなかった
+    let s = setup("geo-enrich-pause-noanswer");
+    let stub = StubGsi::start();
+    stub.set_muni(Reply::Text("'13,東京都,13101,千代田区'".into()));
+    stub.set_rgeo(|_, _| Reply::Text("broken".into()));
+    stub.set_elev(|_, _| Reply::Text("broken".into()));
+    s.sql(&domestic_rows(2));
+    let started = std::time::Instant::now();
+    let counts = s.run(&make(&stub, Duration::ZERO));
+    let took = started.elapsed();
+    assert_eq!(get(&counts, "queried"), 2);
+    assert_eq!(get(&counts, "resolved"), 0);
+    assert!(took >= pause * 2, "{took:?}");
+    assert!(took < pause * 2 + Duration::from_secs(3), "{took:?}");
+    // 障害で確定しなかった行（再試行の待ち 100 ms + 200 ms が先に入る）
+    let s = setup("geo-enrich-pause-failed");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    stub.set_elev(|_, _| Reply::Status(503));
+    s.sql(&domestic_rows(2));
+    let started = std::time::Instant::now();
+    let counts = s.run(&make(&stub, Duration::from_millis(100)));
+    let took = started.elapsed();
+    assert_eq!(get(&counts, "queried"), 2);
+    assert_eq!(get(&counts, "unresolved"), 2);
+    let expected = (Duration::from_millis(300) + pause) * 2;
+    assert!(took >= expected, "{took:?}");
+    assert!(took < expected + Duration::from_secs(3), "{took:?}");
+    assert_eq!(stub.count(Kind::Elev), 6, "座標ごとに 1 + 2 回");
 }
 
 #[test]
@@ -1060,6 +1545,106 @@ fn dry_runは通信せず_問い合わせる件数とキャッシュで済む件
     assert_eq!(s.rows(), before);
     // キャッシュは凍結されない Cache でも、dry-run は put しない
     assert!(s.cache.get("geo:48.858,2.294").is_none());
+}
+
+/// 国内の行が先で、後の国外の行が同じキー（丸めた座標）を空で上書きする: 現行と同じ `id` 順に処理するので、
+/// 先の国内の行は問い合わせて確定し、キャッシュは最後に空になる。`--dry-run` も同じ件数になる。
+#[test]
+fn 国内の行が先なら問い合わせ_後の国外の行が同じキーを空で上書きする() {
+    let s = setup("geo-enrich-collision-domestic-first");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    s.sql(&format!(
+        "{};{};{}",
+        photo(1, None, Some((20.0001, 130.0)), Some("exif")),
+        photo(2, None, Some((19.9999, 130.0)), Some("exif")), // 国外・同じキー geo:20.000,130.000
+        photo(3, None, Some((20.0002, 130.0)), Some("exif")), // 国内・同じキー: 国外の空に当たる
+    ));
+    let enrich = enrich_for(&stub);
+    let dry = s.dry_run(&[&enrich]);
+    assert_eq!(get(&dry, "foreign"), 1);
+    assert_eq!(get(&dry, "would_query"), 1);
+    assert_eq!(get(&dry, "cache_hit"), 1);
+    let counts = s.run(&enrich);
+    assert_eq!(get(&counts, "foreign"), 1);
+    assert_eq!(get(&counts, "queried"), 1);
+    assert_eq!(get(&counts, "cache_hit"), 1);
+    assert_eq!(get(&counts, "queried"), get(&dry, "would_query"));
+    assert_eq!(s.row(1)["place"], "テスト町一丁目");
+    assert_eq!(s.row(2)["place"], "");
+    assert_eq!(s.row(3)["place"], "");
+    assert_eq!(stub.count(Kind::Rgeo), 1);
+    assert_eq!(
+        s.cache.get("geo:20.000,130.000").unwrap(),
+        json!({"place": "", "elev": null, "muni_cd": "", "pref": "", "city": ""})
+    );
+}
+
+/// 国外の行が先なら、後の国内の行は国外の空のキャッシュに当たる（問い合わせない）。
+#[test]
+fn 国外の行が先なら_後の国内の行は空のキャッシュに当たる() {
+    let s = setup("geo-enrich-collision-foreign-first");
+    let stub = StubGsi::start();
+    tokyo_replies(&stub);
+    s.sql(&format!(
+        "{};{}",
+        photo(1, None, Some((19.9999, 130.0)), Some("exif")),
+        photo(2, None, Some((20.0001, 130.0)), Some("exif")),
+    ));
+    let enrich = enrich_for(&stub);
+    let dry = s.dry_run(&[&enrich]);
+    assert_eq!(get(&dry, "would_query"), 0);
+    assert_eq!(get(&dry, "cache_hit"), 1);
+    let counts = s.run(&enrich);
+    assert_eq!(get(&counts, "cache_hit"), 1);
+    assert_eq!(get(&counts, "queried"), 0);
+    assert_eq!(s.row(2)["place"], "");
+    assert!(stub.requests().is_empty());
+}
+
+/// 通信できない間（`muni.js` が取れない・全体の障害）も、先の国内の行を後の行が追い越さない:
+/// 同じキーの国外の行は見送り、別のキーの国外の行は済ませる。直れば現行と同じ結果になる。
+#[test]
+fn 通信できない間も同じキーの行は追い越さない() {
+    for cause in ["muni", "429"] {
+        let s = setup("geo-enrich-collision-halted");
+        let stub = StubGsi::start();
+        tokyo_replies(&stub);
+        if cause == "muni" {
+            stub.set_muni(Reply::Status(503));
+        } else {
+            stub.set_rgeo(|_, _| Reply::Status(429));
+        }
+        s.sql(&format!(
+            "{};{};{};{}",
+            photo(1, None, Some((20.0001, 130.0)), Some("exif")), // 国内: 通信できず確定しない
+            photo(2, None, Some((19.9999, 130.0)), Some("exif")), // 国外・同じキー: 追い越さない
+            photo(3, None, Some((19.9999, 131.0)), Some("exif")), // 国外・別のキー: 済ませる
+            photo(4, None, Some((20.0002, 130.0)), Some("exif")), // 国内・同じキー: 見送る
+        ));
+        let enrich = enrich_with_memory(&stub);
+        let err = s.try_run(&enrich).unwrap_err().to_string();
+        assert!(err.contains("deferred="), "{cause}: {err}");
+        assert_eq!(s.row(1)["place"], Value::Null, "{cause}");
+        assert_eq!(s.row(2)["place"], Value::Null, "{cause}");
+        assert_eq!(s.row(3)["place"], "", "{cause}");
+        assert_eq!(s.row(4)["place"], Value::Null, "{cause}");
+        assert!(s.cache.get("geo:20.000,130.000").is_none(), "{cause}");
+        // 直る
+        tokyo_replies(&stub);
+        s.run(&enrich);
+        assert_eq!(
+            s.row(1)["place"],
+            "テスト町一丁目",
+            "{cause}: 先の国内の行は問い合わせた結果"
+        );
+        assert_eq!(s.row(2)["place"], "", "{cause}");
+        assert_eq!(
+            s.row(4)["place"],
+            "",
+            "{cause}: 国外の空に当たる（現行と同じ順）"
+        );
+    }
 }
 
 // ---------------------------------------------------------------- muni.js・書式
@@ -1194,6 +1779,41 @@ fn pythonのinfer_locationsとenrich_rowsと全列が一致する() {
                 s.sql(statement.as_str().unwrap());
             }
             stub.clear_requests();
+            // `--dry-run` は、同じ `id` 順でキャッシュを模擬して、Python が問い合わせる回数と同じ数を数える
+            // （書かず、通信せず、模擬のキャッシュは実のキャッシュに残らない）
+            if step["run"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w == "enrich")
+            {
+                let stages: Vec<&dyn Stage> = step["run"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|w| match w.as_str().unwrap() {
+                        "infer" => &Infer as &dyn Stage,
+                        _ => &enrich as &dyn Stage,
+                    })
+                    .collect();
+                let rows_before = s.rows();
+                let cache_before = s.cache.len();
+                let dry = s.dry_run(&stages);
+                let python_queries = step["python"]["requests"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r[0] == "rgeo")
+                    .count() as u64;
+                assert_eq!(get(&dry, "would_query"), python_queries, "{label}: dry-run");
+                assert!(stub.requests().is_empty(), "{label}: dry-run は通信しない");
+                assert_eq!(s.rows(), rows_before, "{label}: dry-run は書かない");
+                assert_eq!(
+                    s.cache.len(),
+                    cache_before,
+                    "{label}: dry-run はキャッシュを書かない"
+                );
+            }
             let mut inferred = None;
             for what in step["run"].as_array().unwrap() {
                 match what.as_str().unwrap() {

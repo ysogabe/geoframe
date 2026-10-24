@@ -11,6 +11,9 @@
   （`crates/geoframe/src/geo/tests.rs`）。
 - `muni_js`: 合成の`muni.js`の断片をPythonの`muni_table()`に通した表（Rustの手書きの解析との突き合わせ）。
 - `float_keys`: Pythonの`f"{x:.3f}"`（キャッシュのキー）の結果。Rustの`{:.3}`との突き合わせ。
+- `time_samples`: `datetime.strptime`の`%Y-%m-%d %H:%M`・`%Y-%m-%d %H:%M:%S`の結果（naiveな通算秒、読めなければnull）。
+  日の空白埋め（`2024-05- 6`）、区切りの空白の種類などを含む。Rustの`naive_seconds`・`naive_seconds_with_seconds`との突き合わせ。
+  全角の数字は入れない（Rustは読まない既知の差。server.md §0）。
 
     python3 tools/gen_geo_fixture.py          # 書き出す
     python3 tools/gen_geo_fixture.py --check  # 保存済みのシナリオをPythonに通し直し、結果が一致するか検査する
@@ -93,6 +96,14 @@ def infer_cases():
         photo(25, f"{day}  10:30"),                     # 区切りの空白が 2 つ（`\s+`）
         photo(26, f"{day} 10:00 "),                     # 末尾の余分: 解釈できない
         photo(27, "２０２４-０５-０６ １０:４０"),       # 全角の数字（Python も読めない: 月・日・時は ASCII だけ）
+        # 日だけは空白埋めを読む（`%d` の ` [1-9]`）。月・時・分・2 桁の日（` 06`・` 16`）は読めない
+        photo(29, "2024-05- 6 10:03"),                   # 1 の 3 分後（空白埋めの日）
+        photo(30, "2024-05- 6 11:11", *PARIS, "inferred", inferred_from=99, infer_dt_s=1,
+              display="derivatives/x30.jpg"),            # 読めるので 1 から再推定される（取り消されない）
+        photo(31, "2024-05- 06 10:04", *PARIS, "inferred", inferred_from=99, infer_dt_s=1,
+              display="derivatives/x31.jpg"),            # 読めない（取り消す）
+        photo(32, "2024- 5-06 10:05"),                   # 月の空白埋めは読めない
+        photo(33, "2024-05-06 10: 5"),                   # 分の空白埋めは読めない
     ]
     base = [{"name": "initial", "sql": rows, "run": ["infer"]}]
     steps = base + [
@@ -223,6 +234,38 @@ def enrich_case():
             ]}
 
 
+def collision_case():
+    """国内外の境界をまたいで丸めたキー（`.3f`）が衝突する行（緯度 20.0 の境目）。現行は `id` 順に 1 行ずつ処理し、
+    先に来た行がキャッシュを作る。国外の行は、国内の行が作ったキャッシュを空で上書きする。"""
+    rows = [
+        photo(1, lat=20.0001, lon=130.0, loc_source="exif"),     # 国内: 問い合わせる
+        photo(2, lat=19.9999, lon=130.0, loc_source="exif"),     # 国外: 同じキーを空で上書きする
+        photo(3, lat=20.0002, lon=130.0, loc_source="exif"),     # 国内: 空のキャッシュに当たる（問い合わせない）
+        photo(4, lat=19.9999, lon=131.0, loc_source="exif"),     # 国外が先
+        photo(5, lat=20.0001, lon=131.0, loc_source="exif"),     # 国内: 国外の空のキャッシュに当たる
+        photo(6, lat=20.0001, lon=132.0, loc_source="exif"),     # 国内: 先にキャッシュにある
+        photo(7, lat=19.9999, lon=132.0, loc_source="exif"),     # 国外: それを空で上書きする
+        photo(8, lat=20.0002, lon=132.0, loc_source="exif"),     # 国内: 空のキャッシュに当たる
+        photo(9, lat=20.0001, lon=133.0, loc_source="exif"),     # 国内: 問い合わせる
+        photo(10, lat=20.0002, lon=133.0, loc_source="exif"),    # 国内: 9 のキャッシュに当たる
+    ]
+    pre = {"geo:20.000,132.000": {"place": "キャッシュの町", "elev": 3, "muni_cd": "13101",
+                                  "pref": "東京都", "city": "千代田区"}}
+    rgeo = [((20.0001, 130.0), reply_json({"results": {"muniCd": "13101", "lv01Nm": "衝突の町"}})),
+            ((20.0001, 133.0), reply_json({"results": {"muniCd": "01100", "lv01Nm": "ふつうの町"}}))]
+    elev = [((20.0001, 130.0), reply_json({"elevation": 5.5})),
+            ((20.0001, 133.0), reply_json({"elevation": 6.5}))]
+    return {"name": "enrich_key_collision", "env": {}, "muni": MUNI,
+            "gsi": {"rgeo": [{"lat": c[0], "lon": c[1], "reply": r} for c, r in rgeo],
+                    "elev": [{"lat": c[0], "lon": c[1], "reply": r} for c, r in elev]},
+            "steps": [
+                {"name": "first", "sql": rows, "cache": pre, "run": ["enrich"]},
+                # 再 enrich の印を戻しても、キャッシュ（国外の空）が残るので、問い合わせずに空で確定する
+                {"name": "reset_place", "sql": [
+                    "UPDATE photos SET place=NULL WHERE id IN (1,3,5,6,8,9,10)"], "run": ["enrich"]},
+            ]}
+
+
 def limit_case():
     rows = [photo(i, lat=48.0 + i / 100, lon=2.0, loc_source="exif") for i in range(1, 46)]
     return {"name": "enrich_limit", "env": {}, "muni": MUNI, "gsi": {"rgeo": [], "elev": []},
@@ -262,12 +305,61 @@ FLOAT_KEY_SAMPLES = [
 ]
 
 
+TIME_HAND = [
+    "2024-05-06 10:05", "2024-05- 6 10:05", "2024-05- 6 10:05:07", "2024-05-6 10:05", "2024-5-6 1:5", "2024- 5-06 10:05",
+    "2024-05- 06 10:05", "2024-05- 16 10:05", "2024-05-16 10:05", "2024-05- 0 10:05", "2024-05-00 10:05",
+    "2024-05-  6 10:05", "2024-05-0 6 10:05", "2024-05- 6\t10:05", "2024-05- 6\x1c10:05", "2024-05-06\x1f10:05",
+    "2024-05-06\u00a010:05", "2024-05-06\u202f10:05", "2024-05-06\u3000 10:05", "2024-05-06\u200b10:05",
+    "2024-05-06\u180e10:05", "2024-05-06\x0b10:05", "2024-05-06\n10:05", "2024-05-06 10: 5", "2024-05-06 10:05 ",
+    "2024-05-06 10:05:", "2024-05-06 10:05:60", "2024-05-06 10:05:61", "2024-05-06 10:05:5", "2024-05-06 10:05:05x",
+    "2024-02-29 10:05", "2023-02-29 10:05", "2024-02- 9 10:05", "2024-04-31 10:05", "2024-04- 31 10:05",
+    "2024-12-31 23:59:59", "0001-01-01 00:00", "0000-01-01 00:00", "9999-12-31 23:59", "2024-05-32 10:05",
+    "2024-05-3 10:05", "2024-05-30 10:05", "2024-05-31 10:05", " 2024-05-06 10:05", "", "abc",
+]
+
+
+def time_samples():
+    rng = random.Random(55)
+    months = ["5", "05", "12", "13", "0", "00", " 5", "1", "01"]
+    days = ["6", "06", " 6", " 06", "16", " 16", "31", "32", "0", "00", " 0", "3 ", "9", " 9", "30", "29", "28"]
+    seps = [" ", "  ", "\t", "\x1c", "\u00a0", "\u200b", "", " \t", "\x1f ", "\u3000"]
+    hours = ["7", "07", "24", "10", " 7", "23", "00", "0", "1"]
+    minutes = ["5", "05", "59", "60", " 5", "00", "0", "10"]
+    tails = ["", ":09", ":60", ":5", " ", ":", ":07x", ":61"]
+    out = list(TIME_HAND)
+    for _ in range(600):
+        out.append(f"2024-{rng.choice(months)}-{rng.choice(days)}{rng.choice(seps)}"
+                   f"{rng.choice(hours)}:{rng.choice(minutes)}{rng.choice(tails)}")
+    seen, uniq = set(), []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    return uniq
+
+
+def python_times(samples):
+    from datetime import datetime
+    epoch = datetime(1970, 1, 1)
+    out = []
+    for text in samples:
+        row = {"text": text}
+        for name, fmt in (("minute", "%Y-%m-%d %H:%M"), ("second", "%Y-%m-%d %H:%M:%S")):
+            try:
+                row[name] = (datetime.strptime(text, fmt) - epoch).total_seconds()
+            except ValueError:
+                row[name] = None
+        out.append(row)
+    return out
+
+
 def build():
-    cases = infer_cases() + [enrich_case(), limit_case(), both_case()]
+    cases = infer_cases() + [enrich_case(), collision_case(), limit_case(), both_case()]
     rng = random.Random(54)
     samples = list(FLOAT_KEY_SAMPLES) + [round(rng.uniform(-180, 180), 7) for _ in range(40)]
     return {"cases": cases, "muni_js": [{"text": t} for t in MUNI_JS_SAMPLES],
-            "float_keys": [{"x": x} for x in samples]}
+            "float_keys": [{"x": x} for x in samples],
+            "time_samples": [{"text": t} for t in time_samples()]}
 
 
 # ---- Python 本体を流す（子プロセス: GEOFRAME_* は import 時に読まれるため） --------------------------
@@ -373,7 +465,8 @@ def run_python(doc):
         cases.append({**case, "steps": [{**s, "python": r} for s, r in zip(case["steps"], steps)]})
     muni = run_child("--worker-muni", doc["muni_js"], {})
     floats = [{"x": f["x"], "key": f"{f['x']:.3f}"} for f in doc["float_keys"]]
-    return {"cases": cases, "muni_js": muni, "float_keys": floats}
+    times = python_times([t["text"] for t in doc["time_samples"]])
+    return {"cases": cases, "muni_js": muni, "float_keys": floats, "time_samples": times}
 
 
 def render(doc):
@@ -397,7 +490,8 @@ def main():
         doc = {"cases": [{**c, "steps": [{k: v for k, v in s.items() if k != "python"} for s in c["steps"]]}
                          for c in stored["cases"]],
                "muni_js": [{"text": m["text"]} for m in stored["muni_js"]],
-               "float_keys": [{"x": f["x"]} for f in stored["float_keys"]]}
+               "float_keys": [{"x": f["x"]} for f in stored["float_keys"]],
+               "time_samples": [{"text": t["text"]} for t in stored["time_samples"]]}
     else:
         doc = build()
     result = run_python(doc)

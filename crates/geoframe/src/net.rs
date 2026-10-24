@@ -67,6 +67,11 @@ pub enum Failure {
     /// 数百バイトの理由の本文が読めないのは、権限の不足とも流量制限とも決められない回線・相手の不調で、
     /// 写真の失敗として数えて待ちを付けると、直ってからも取得が遅れる。
     ReasonUnreadable,
+    /// 小さな JSON の応答（地理院の逆ジオ・標高）の**本文が読めなかった**（壊れたチャンク・途中で終わる gzip など、
+    /// 切断・時間切れ・TLS 以外の読み出しの失敗）。ヘッダーの前の `Protocol`（`Other`）とは別。数百バイトの本文が
+    /// 読めないのは、座標の中身ではなく回線・相手の不調と言えるので、障害にする（ただし**どの座標でも起きるとは
+    /// 限らない**ので、地理院の段は連続して複数の座標で失敗したときに中断する）。
+    BodyUnreadable,
     /// 要求側の誤り・プロトコル違反・大きすぎる本文など、通信の障害とは言えないもの。
     Other,
 }
@@ -80,6 +85,7 @@ impl Failure {
             Self::Tls => "tls",
             Self::Timeout => "timeout",
             Self::ReasonUnreadable => "reason_unreadable",
+            Self::BodyUnreadable => "body_unreadable",
             Self::Other => "other",
         }
     }
@@ -125,6 +131,8 @@ pub fn is_disconnect(kind: std::io::ErrorKind) -> bool {
 ///
 /// 上の表は**ヘッダーまで**。Drive の 403 の理由の本文を読む失敗は別で、`Protocol`・`Decompress` など
 /// 表で `Other` になる種類も [`Failure::ReasonUnreadable`] にして障害にする（`crate::drive` の表）。
+/// 地理院の逆ジオ・標高の本文を読む失敗も同じ考え方で、`Other` になる種類は [`Failure::BodyUnreadable`]
+/// にして障害にする（`crate::geo` の表。上限超過の `BodyExceedsLimit` だけは応答の中身の問題なので障害にしない）。
 ///
 /// ※ 応答は届いているが中身が壊れている。要求ごとに決まった結果になりうる（特定の写真だけが毎回壊れた
 /// 応答になる）ので、障害として段を止めると、その 1 枚が残りの写真を永久に塞ぐ。写真の失敗として数えれば

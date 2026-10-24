@@ -4,6 +4,10 @@
 //!
 //! - 対象: `lat IS NOT NULL AND place IS NULL`（`place` が NULL なのが「未 enrich」の印。空文字は「確定」）を
 //!   `id` 順に **1 サイクル 40 件まで**。
+//! - **処理は `id` 順の 1 パス**（現行と同じ）。キャッシュのキーは丸めた座標なので、近い座標の行は同じキーを共有し、
+//!   **先に来た行がキャッシュを作る**。国外の行は国内の行が作ったキャッシュを空で上書きするので、国内外を分けて
+//!   国内を後回しにすると、先の国内の行が後の国外の行の空のキャッシュに当たって、空の地名で確定してしまう
+//!   （例: `(20.0001, 130.0)` と `(19.9999, 130.0)` はどちらも `geo:20.000,130.000`）。
 //! - キャッシュのキーは `geo:<緯度3桁>,<経度3桁>`（`{:.3}`。値は `{place, elev, muni_cd, pref, city}`）。
 //! - **日本国内**（緯度 20〜46.5、経度 122〜154.5 の矩形）: キャッシュに `place`・`city` を持つ辞書があればそれを使う
 //!   （通信しない）。無ければ地理院の逆ジオコーダ（`LonLatToAddress`）と標高 API を呼ぶ。
@@ -17,17 +21,26 @@
 //! - **国外**: 地理院は圏外。オフラインの逆ジオコーダは本番に無いので、`place=''`・`elev=NULL`・`muni_cd=''`・`pref=''`・
 //!   `city=''` で確定する（`pip install reverse-geocode` が入った現行だけ国名が付く。本番には入っていない）。
 //!   キャッシュは引かずに上書きする。
-//! - 通信した行のあとに 0.2 秒待つ（地理院への連続リクエストの抑制）。キャッシュ・国外の行は待たない。
+//! - 通信を試した行のあとに 0.2 秒待つ（地理院への連続リクエストの抑制）。キャッシュ・国外の行は待たない。
 //!
 //! # 現行との違い（通信の失敗の扱い。server.md §0・§15）
 //!
-//! - **通信の障害は段を中断する**（[`crate::net::Failure::is_outage`] と、429・5xx）。何も確定せずに戻り、残りは
-//!   次のサイクルで再試行する。現行は障害の行を飛ばして次の行へ進み、障害のたびに最大 8 秒かかる（40 件で
-//!   5 分超）。**片方の API だけ障害のとき、現行はもう片方の応答だけで確定してキャッシュする**ので、一時的な不調で
-//!   `place=''` が永久に残る。Rust は確定しない。
+//! - **通信の障害は、短い待ちで 2 回まで再試行する**（待ちは 0.5 秒、1 秒。停止の合図で打ち切る）。それでも続く
+//!   とき、**接続できない（`dns`・`connect`・`tls`）・429** は座標によらない全体の障害なので、すぐ段を中断する。
+//!   **5xx・時間切れ・切断・本文が読めない**は座標による場合もあるので、その座標を壊れた座標として
+//!   [`crate::backoff`] に入れて（30 分以上飛ばす）**次へ進み**、**連続して 3 つの座標**で続いたら全体の障害として
+//!   中断する。応答が返った座標（確定した・応答が使えなかった）で連続の数は 0 に戻る。中断しても確定した行は残り、
+//!   残りは次のサイクルでやる（接続できない・429 の座標は記憶に入れないので、直れば待たずに続く）。現行は障害の行を
+//!   飛ばして次へ進み、障害のたびに最大 8 秒かかる（40 件で 5 分超）。
+//! - **片方の API だけ障害のとき、確定しない**。現行は応答のあったもう片方だけで確定してキャッシュするので、
+//!   一時的な標高の不調で `elev=NULL` が（海上の NULL と見分けがつかないまま）永久に残る。Rust は確定せず、
+//!   障害が続く間は国内の未キャッシュの行が進まない代わりに、直れば欠けなく埋まる（server.md §15.4）。
+//!   応答は返ったが使えない（4xx・本文が JSON でない）ときは現行と同じく、もう片方の応答で確定する。
+//! - 通信が止まった（中断した）あとも、**通信の要らない行**（国外・キャッシュにある行）は id 順に済ませる。ただし
+//!   中断した行・見送った国内の行と**同じキーの行は、順序を守るため見送る**（`deferred`）。
 //! - `muni_table` は、国内で通信が要る行があるときだけ取りに行く（現行は毎サイクルの先頭で、無ければ取りに行く）。
 //!   取れなかったとき、現行は空の表で続けて **`pref`・`city` が空のまま確定**する。Rust は取れなければ（通信の障害でも、
-//!   解釈できない本文でも）通信が要る行を処理せず、段を失敗にする。国外の行・キャッシュにある行は先に済ませる。
+//!   解釈できない本文でも）通信が要る行を見送り、段を失敗にする。
 //! - 応答が壊れていて両方の API が応答なしだった行は、現行は毎サイクル 40 件の枠を占める。Rust は、しばらく飛ばす
 //!   （[`crate::backoff`]。プロセスの中だけの記録）。
 //! - `lon` が NULL（や数値でない）の行は対象にしない。現行は `format` で例外になり、サイクル全体が落ちる
@@ -36,16 +49,25 @@
 //!   地名を書かない）。
 //! - 通信の上限: 逆ジオ・標高の応答は 1 MiB まで、`muni.js` は 8 MiB まで。時間は現行と同じ 8 秒・15 秒。
 //!
+//! # 停止の境界
+//!
+//! 停止の合図は、行と行のあいだ・行のあとの待ち・再試行の待ちで見る。**通信が進んでいる行は、逆ジオ・標高・キャッシュ・
+//! DB の更新まで済ませてから止まる**（要求の途中で捨てると、片方だけの応答が残らない代わりに、1 行ぶんの通信が無駄に
+//! なる。1 行は最大でも数秒）。再試行の待ちの途中で止まったときは、その行は確定せずに戻る。
+//!
 //! # `--dry-run`
 //!
-//! 通信しない。1 サイクルで扱う 40 件を、国外・キャッシュで済む・問い合わせるはず（同じキーは 1 件に数える）に
-//! 分けて数える。写しには書かない（後続の段が地名を使わない）。キャッシュは凍結されているので何も書かれない。
+//! 通信しない。1 サイクルで扱う 40 件を、国外・キャッシュで済む・問い合わせるはずに分けて数える。**実行と同じ id 順で、
+//! 書くはずのキャッシュを模擬する**（国外の行が空で上書きしたキー、問い合わせるはずの行が作るキーは、あとの行に
+//! とってキャッシュにある）。写しには書かない（後続の段が地名を使わない）。キャッシュは凍結されているので何も
+//! 書かれない。
 //!
 //! # ログ
 //!
 //! 件数だけ。座標・地名・URL・応答の本文は出さない。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+use std::ops::ControlFlow;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -60,8 +82,15 @@ use crate::sync::{Counts, Stage, StageCtx, StageError, StageOutcome};
 const JP_BBOX: (f64, f64, f64, f64) = (20.0, 122.0, 46.5, 154.5);
 /// 1 サイクルで扱う件数（現行の `LIMIT 40`）。
 const PER_CYCLE: usize = 40;
-/// 通信した行のあとの待ち（現行の `time.sleep(0.2)`）。
+/// 通信を試した行のあとの待ち（現行の `time.sleep(0.2)`。現行は確定した行のあとだけ）。
 const PAUSE: Duration = Duration::from_millis(200);
+/// 通信の障害のあとの再試行の回数（最初の 1 回のあとに）。
+const RETRIES: u32 = 2;
+/// 再試行の前の待ち。1 回目はこれ、2 回目はその 2 倍。
+const RETRY_WAIT: Duration = Duration::from_millis(500);
+/// 座標による障害（5xx・時間切れ・切断・本文が読めない）が、別の座標でも続けてこの数になったら、全体の障害として
+/// 段を中断する。
+const OUTAGE_STREAK: usize = 3;
 /// 逆ジオ・標高の 1 要求の時間（現行の `http_json` の `timeout=8`）。
 const API_TIMEOUT: Duration = Duration::from_secs(8);
 /// `muni.js` の 1 要求の時間（現行の `timeout=15`）。
@@ -109,6 +138,7 @@ impl GsiEndpoints {
 pub struct Enrich {
     endpoints: GsiEndpoints,
     pause: Duration,
+    retry_wait: Duration,
     /// 両方の API の応答が無かった座標（`id` と座標）。
     failures: Mutex<FailureMemo<(i64, u64, u64)>>,
 }
@@ -133,8 +163,16 @@ impl Enrich {
         Self {
             endpoints,
             pause,
+            retry_wait: RETRY_WAIT,
             failures: Mutex::new(memo),
         }
+    }
+
+    /// 再試行の前の待ちを変える（試験用。本番は [`RETRY_WAIT`]）。
+    #[cfg(test)]
+    pub(crate) fn with_retry_wait(mut self, retry_wait: Duration) -> Self {
+        self.retry_wait = retry_wait;
+        self
     }
 }
 
@@ -285,6 +323,21 @@ fn muni_entry(rest: &str) -> Option<(usize, &str, &str, &str)> {
 // 通信
 
 /// 1 回の問い合わせの失敗。
+///
+/// # 本文を読む失敗の分類
+///
+/// 状態コードが 2xx のあと、本文を読む最中の失敗（`read_to_vec`）。ヘッダーの前の失敗は [`Failure`] の表（`net.rs`）。
+///
+/// | 失敗 | `CallError` | 障害か |
+/// | --- | --- | --- |
+/// | 上限（1 MiB・8 MiB）を超えた（`BodyExceedsLimit`） | `Bad` | 障害でない（応答の中身の問題） |
+/// | 時間切れ・切断・TLS など、[`Failure::from`] が障害にするもの | `Net(その種類)` | 障害 |
+/// | それ以外すべて（`Protocol`＝不正なチャンク長、`Decompress`＝途中で終わる gzip など） | `Net(`[`Failure::BodyUnreadable`]`)` | 障害 |
+///
+/// 数百バイトの本文が読めないのは、座標の中身でなく回線・相手の不調と言えるので、Drive の 403 の理由の本文
+/// （`ReasonUnreadable`）と同じく障害にする。ただし座標による場合（特定の座標の応答だけが壊れる）もありうるので、
+/// 地理院の段では「座標による障害」として扱う（[`CallError::is_global`]。連続して複数の座標で続いたら中断する）。
+/// ヘッダーの前の `Protocol`（応答の頭が壊れている）は `Other` のままで障害にしない（`net.rs` の表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CallError {
     /// 要求を送って応答のヘッダーを受け取るまで、または本文を読む間の失敗（[`Failure`]）。
@@ -305,6 +358,16 @@ impl CallError {
         }
     }
 
+    /// 座標によらない全体の障害か（名前解決・接続・TLS・流量制限）。そうでない障害（5xx・時間切れ・切断・
+    /// 本文が読めない）は、特定の座標の応答だけがそうなることもある。
+    fn is_global(self) -> bool {
+        match self {
+            Self::Net(failure) => matches!(failure, Failure::Dns | Failure::Connect | Failure::Tls),
+            Self::Status(status) => status == 429,
+            Self::Bad => false,
+        }
+    }
+
     /// ログ・エラーに出してよい語（URL・本文を含まない）。
     fn describe(self) -> String {
         match self {
@@ -312,6 +375,14 @@ impl CallError {
             Self::Status(status) => format!("http {status}"),
             Self::Bad => "bad_response".to_string(),
         }
+    }
+}
+
+/// 本文を読む最中の `ureq` のエラーを、障害の種類にする（`BodyExceedsLimit` は呼び出し側が先に取り除く）。
+pub(super) fn body_failure(e: &ureq::Error) -> Failure {
+    match Failure::from(e) {
+        failure if failure.is_outage() => failure,
+        _ => Failure::BodyUnreadable,
     }
 }
 
@@ -344,7 +415,7 @@ fn fetch(
         .read_to_vec()
         .map_err(|e| match e {
             ureq::Error::BodyExceedsLimit(_) => CallError::Bad,
-            other => CallError::Net(Failure::from(&other)),
+            other => CallError::Net(body_failure(&other)),
         })
 }
 
@@ -406,9 +477,53 @@ const USABLE: &str = "lat IS NOT NULL AND lon IS NOT NULL AND place IS NULL
 struct Tally {
     foreign: u64,
     cache_hit: u64,
+    /// 通信を試した行（成否によらない）。
     queried: u64,
+    /// うち、確定した行。
+    resolved: u64,
+    /// 通信を試して確定しなかった行（応答なし・障害）。
     unresolved: u64,
+    /// 通信できない間・同じキーの先の行が未確定で、見送った行。
+    deferred: u64,
     would_query: u64,
+}
+
+/// 1 サイクルの処理の途中の状態。
+#[derive(Default)]
+struct Pass {
+    tally: Tally,
+    /// 先の行が確定できなかったキー。同じキーの後の行は、先の行を追い越さないよう見送る。
+    blocked: HashSet<String>,
+    /// 通信を続けられなくなった理由。以降の通信が要る行は見送り、通信の要らない行は済ませる。
+    halted: Option<StageError>,
+    /// 市区町村の表。最初に通信が要る行が来たときに用意する。
+    muni: Option<MuniTable>,
+    /// 座標による障害（5xx・時間切れ・切断・本文が読めない）で、続けて確定できなかった座標の数。
+    /// 応答が返った座標（確定した・応答が使えなかった）で 0 に戻る。
+    consecutive_failures: usize,
+    /// `--dry-run` で、実行なら書くキャッシュのキー（国外の行が上書きするキー、問い合わせる行が作るキー）。
+    simulated: HashSet<String>,
+}
+
+/// 1 つの座標の問い合わせの結果。
+enum Lookup {
+    /// 確定する値。
+    Answered(Entry),
+    /// 両方の API の応答が使えなかった（本文が壊れている・4xx など）。障害ではない。
+    NoAnswer,
+    /// どちらかが通信の障害のまま再試行が尽きた。確定しない。
+    Failed(CallError),
+    /// 再試行の待ちの途中で停止の合図が来た。
+    Stopped,
+}
+
+/// 再試行つきの 1 回の JSON の取得の結果。
+enum Call {
+    Json(Value),
+    /// 応答は届いたが使えない（障害ではない）。
+    Unusable,
+    Failed(CallError),
+    Stopped,
 }
 
 impl Stage for Enrich {
@@ -448,18 +563,68 @@ impl Stage for Enrich {
                 candidates.push(candidate);
             }
         }
-        let mut tally = Tally::default();
-        let mut misses: Vec<Candidate> = Vec::new();
-        // 通信の要らない行（国外・キャッシュ）を先に済ませる
-        let mut dry_keys: Vec<String> = Vec::new();
-        for candidate in &candidates {
+        let mut pass = Pass::default();
+        self.process(ctx, &candidates, &mut pass)?;
+        let tally = &pass.tally;
+        let counts = if ctx.is_dry_run() {
+            Counts(vec![
+                ("candidates", candidates.len() as u64),
+                ("foreign", tally.foreign),
+                ("cache_hit", tally.cache_hit),
+                ("would_query", tally.would_query),
+                ("unresolved", tally.unresolved),
+                ("skipped_backoff", skipped_backoff),
+                ("unusable", unusable),
+                ("pending", pending),
+            ])
+        } else {
+            Counts(vec![
+                ("candidates", candidates.len() as u64),
+                ("foreign", tally.foreign),
+                ("cache_hit", tally.cache_hit),
+                ("queried", tally.queried),
+                ("resolved", tally.resolved),
+                ("unresolved", tally.unresolved),
+                ("deferred", tally.deferred),
+                ("skipped_backoff", skipped_backoff),
+                ("unusable", unusable),
+                ("pending", pending),
+            ])
+        };
+        match pass.halted {
+            None => Ok(StageOutcome::Done(counts)),
+            // 件数は失敗の文面に載せる（途中までは確定している）
+            Some(e) => Err(StageError::text(format!("{e}（{counts}）"))),
+        }
+    }
+}
+
+impl Enrich {
+    /// 候補を `id` 順に 1 行ずつ処理する（現行の `for r in dbq(...)` と同じ順序）。DB の書き込みの失敗は `Err`。
+    /// 通信の障害・`muni.js` の失敗は `pass.halted` に残し、確定した行はそのまま残す。
+    fn process(
+        &self,
+        ctx: &StageCtx<'_>,
+        candidates: &[Candidate],
+        pass: &mut Pass,
+    ) -> Result<(), StageError> {
+        let dry_run = ctx.is_dry_run();
+        for candidate in candidates {
             if ctx.stop.is_stopped() {
-                break;
+                return Ok(());
             }
             let key = cache_key(candidate.lat, candidate.lon);
+            // 先の行がまだ確定していないキーは追い越さない（国外の行の空の上書きが先に入ると、先の国内の行が
+            // 空で確定してしまう）
+            if pass.blocked.contains(&key) {
+                pass.tally.deferred += 1;
+                continue;
+            }
             if !in_japan(candidate.lat, candidate.lon) {
-                tally.foreign += 1;
-                if !ctx.is_dry_run() {
+                pass.tally.foreign += 1;
+                if dry_run {
+                    pass.simulated.insert(key);
+                } else {
                     // 国外はキャッシュを引かずに上書きする（現行と同じ）
                     let entry = Entry::empty();
                     ctx.cache.put(&key, entry.to_json());
@@ -467,122 +632,129 @@ impl Stage for Enrich {
                 }
                 continue;
             }
-            match ctx.cache.get(&key).as_ref().and_then(Entry::from_cache) {
-                Some(entry) => {
-                    tally.cache_hit += 1;
-                    if !ctx.is_dry_run() {
-                        store(ctx, candidate, &entry)?;
-                    }
-                }
-                None if ctx.is_dry_run() => {
-                    // 同じキーの 2 件目以降は、1 件目の問い合わせで済む
-                    if dry_keys.contains(&key) {
-                        tally.cache_hit += 1;
-                    } else {
-                        dry_keys.push(key);
-                        tally.would_query += 1;
-                    }
-                }
-                None => misses.push(*candidate),
-            }
-        }
-        let outcome = if misses.is_empty() {
-            Ok(())
-        } else {
-            self.query_all(ctx, &misses, &mut tally)
-        };
-        let query_name = if ctx.is_dry_run() {
-            "would_query"
-        } else {
-            "queried"
-        };
-        let counts = Counts(vec![
-            ("candidates", candidates.len() as u64),
-            ("foreign", tally.foreign),
-            ("cache_hit", tally.cache_hit),
-            (
-                query_name,
-                if ctx.is_dry_run() {
-                    tally.would_query
+            let cached = ctx.cache.get(&key).as_ref().and_then(Entry::from_cache);
+            if dry_run {
+                if cached.is_some() || pass.simulated.contains(&key) {
+                    pass.tally.cache_hit += 1;
                 } else {
-                    tally.queried
-                },
-            ),
-            ("unresolved", tally.unresolved),
-            ("skipped_backoff", skipped_backoff),
-            ("unusable", unusable),
-            ("pending", pending),
-        ]);
-        match outcome {
-            Ok(()) => Ok(StageOutcome::Done(counts)),
-            // 件数は失敗の文面に載せる（途中までは確定している）
-            Err(e) => Err(StageError::text(format!("{e}（{counts}）"))),
-        }
-    }
-}
-
-impl Enrich {
-    /// 通信が要る行を順に処理する。通信の障害・`muni.js` の失敗は `Err`（確定した行はそのまま残る）。
-    fn query_all(
-        &self,
-        ctx: &StageCtx<'_>,
-        misses: &[Candidate],
-        tally: &mut Tally,
-    ) -> Result<(), StageError> {
-        let muni = self.muni_table(ctx)?;
-        for candidate in misses {
-            if ctx.stop.is_stopped() {
-                break;
+                    pass.simulated.insert(key);
+                    pass.tally.would_query += 1;
+                }
+                continue;
             }
-            let key = cache_key(candidate.lat, candidate.lon);
-            // 先の行が同じキーを確定していれば、それを使う（現行も 2 件目はキャッシュに当たる）
-            if let Some(entry) = ctx.cache.get(&key).as_ref().and_then(Entry::from_cache) {
-                tally.cache_hit += 1;
+            if let Some(entry) = cached {
+                pass.tally.cache_hit += 1;
                 store(ctx, candidate, &entry)?;
                 continue;
             }
-            match self.lookup(ctx, candidate, &muni) {
-                Err(e) => {
-                    return Err(StageError::text(format!(
-                        "地理院への問い合わせが通信の障害で中断しました（{}）",
-                        e.describe()
-                    )));
-                }
-                Ok(None) => {
-                    // 両方の API の応答が無かった: 確定せず、次の行へ。この座標はしばらく飛ばす
-                    tally.unresolved += 1;
-                    self.failures
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_failure(candidate.memo_key(), Instant::now());
-                }
-                Ok(Some(entry)) => {
-                    // 空でも確定として記録し、同じ座標を二度と問い合わせない
-                    ctx.cache.put(&key, entry.to_json());
-                    store(ctx, candidate, &entry)?;
-                    tally.queried += 1;
-                    self.failures
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_success(&candidate.memo_key());
-                    // 地理院への連続リクエストを抑制する。停止の合図が来たら待たずに戻る
-                    if ctx.stop.wait(self.pause) {
-                        break;
-                    }
-                }
+            if pass.halted.is_some() {
+                pass.tally.deferred += 1;
+                pass.blocked.insert(key);
+                continue;
+            }
+            if self.query_row(ctx, candidate, key, pass)?.is_break() {
+                return Ok(());
             }
         }
         Ok(())
     }
 
-    /// 逆ジオコーダと標高 API を呼ぶ。どちらかが通信の障害なら `Err`。両方の応答が無ければ `Ok(None)`。
-    /// 片方だけ応答があれば、その分で確定する（現行と同じ）。
-    fn lookup(
+    /// 通信が要る 1 行を処理する。`Break` は停止の合図。
+    fn query_row(
         &self,
         ctx: &StageCtx<'_>,
         candidate: &Candidate,
-        muni: &MuniTable,
-    ) -> Result<Option<Entry>, CallError> {
+        key: String,
+        pass: &mut Pass,
+    ) -> Result<ControlFlow<()>, StageError> {
+        let Pass {
+            tally,
+            blocked,
+            halted,
+            muni,
+            consecutive_failures,
+            ..
+        } = pass;
+        let table = match muni {
+            Some(table) => table,
+            None => match self.muni_table(ctx) {
+                Ok(table) => muni.insert(table),
+                Err(e) => {
+                    // 表が無いまま pref・city 抜きで確定させない。以降の通信が要る行は見送る
+                    *halted = Some(e);
+                    tally.deferred += 1;
+                    blocked.insert(key);
+                    return Ok(ControlFlow::Continue(()));
+                }
+            },
+        };
+        let outcome = self.lookup(ctx, candidate, table);
+        if matches!(outcome, Lookup::Stopped) {
+            return Ok(ControlFlow::Break(()));
+        }
+        tally.queried += 1;
+        match outcome {
+            Lookup::Answered(entry) => {
+                // 空でも確定として記録し、同じ座標を二度と問い合わせない
+                ctx.cache.put(&key, entry.to_json());
+                store(ctx, candidate, &entry)?;
+                tally.resolved += 1;
+                *consecutive_failures = 0;
+                self.forget_failure(candidate);
+            }
+            Lookup::NoAnswer => {
+                // 両方の API の応答が使えなかった: 確定せず、次の行へ。この座標はしばらく飛ばす
+                tally.unresolved += 1;
+                *consecutive_failures = 0;
+                self.remember_failure(candidate);
+            }
+            Lookup::Failed(error) => {
+                tally.unresolved += 1;
+                if error.is_global() {
+                    // 座標によらない障害: この座標は覚えない（直れば、待たずに試す）
+                    *halted = Some(outage_error(error, None));
+                } else {
+                    // 座標による障害かもしれない: 覚えてしばらく飛ばし、後続を通す
+                    self.remember_failure(candidate);
+                    *consecutive_failures += 1;
+                    if *consecutive_failures >= OUTAGE_STREAK {
+                        *halted = Some(outage_error(error, Some(*consecutive_failures)));
+                    }
+                }
+                if halted.is_some() {
+                    blocked.insert(key);
+                }
+            }
+            Lookup::Stopped => {}
+        }
+        // 地理院への連続リクエストを抑制する。通信を試した行は結果によらず待つ。停止の合図が来たら待たずに戻る
+        if ctx.stop.wait(self.pause) {
+            return Ok(ControlFlow::Break(()));
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// 座標の失敗を記憶に入れる（しばらく飛ばす）。
+    fn remember_failure(&self, candidate: &Candidate) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_failure(candidate.memo_key(), Instant::now());
+    }
+
+    fn forget_failure(&self, candidate: &Candidate) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .record_success(&candidate.memo_key());
+    }
+
+    /// 逆ジオコーダと標高 API を呼ぶ。
+    ///
+    /// - どちらかが通信の障害のまま再試行が尽きたら `Failed`（もう片方に応答があっても確定しない。逆ジオが障害なら
+    ///   標高は呼ばない）。
+    /// - 両方の応答が使えなければ `NoAnswer`。片方だけ使えれば、その分で確定する（現行と同じ）。
+    fn lookup(&self, ctx: &StageCtx<'_>, candidate: &Candidate, muni: &MuniTable) -> Lookup {
         let fill = |template: &str| {
             template
                 .replace("{lat}", &py_float(candidate.lat))
@@ -590,23 +762,49 @@ impl Enrich {
         };
         let mut entry = Entry::empty();
         let mut answered = false;
-        match fetch_json(ctx, &fill(&self.endpoints.rgeo)) {
-            Ok(data) => {
+        match self.call_json(ctx, &fill(&self.endpoints.rgeo)) {
+            Call::Json(data) => {
                 answered = true;
                 apply_rgeo(&mut entry, &data, muni);
             }
-            Err(e) if e.is_outage() => return Err(e),
-            Err(_) => {}
+            Call::Unusable => {}
+            Call::Failed(e) => return Lookup::Failed(e),
+            Call::Stopped => return Lookup::Stopped,
         }
-        match fetch_json(ctx, &fill(&self.endpoints.elev)) {
-            Ok(data) => {
+        match self.call_json(ctx, &fill(&self.endpoints.elev)) {
+            Call::Json(data) => {
                 answered = true;
                 apply_elev(&mut entry, &data);
             }
-            Err(e) if e.is_outage() => return Err(e),
-            Err(_) => {}
+            Call::Unusable => {}
+            Call::Failed(e) => return Lookup::Failed(e),
+            Call::Stopped => return Lookup::Stopped,
         }
-        Ok(answered.then_some(entry))
+        if answered {
+            Lookup::Answered(entry)
+        } else {
+            Lookup::NoAnswer
+        }
+    }
+
+    /// 1 つの URL を取る。通信の障害は [`RETRIES`] 回まで、短い待ちを置いて取り直す（待ちは停止の合図で打ち切る）。
+    fn call_json(&self, ctx: &StageCtx<'_>, url: &str) -> Call {
+        let mut retried = 0;
+        loop {
+            match fetch_json(ctx, url) {
+                Ok(data) => return Call::Json(data),
+                Err(e) if e.is_outage() => {
+                    if retried >= RETRIES {
+                        return Call::Failed(e);
+                    }
+                    retried += 1;
+                    if ctx.stop.wait(self.retry_wait * retried) {
+                        return Call::Stopped;
+                    }
+                }
+                Err(_) => return Call::Unusable,
+            }
+        }
     }
 
     /// 市区町村の表。キャッシュ（`muni_table`）にあればそれを使い、無ければ `muni.js` から作って保存する。
@@ -638,6 +836,20 @@ impl Enrich {
         ctx.cache.put("muni_table", Value::Object(map));
         tracing::info!("[geo] 自治体テーブル取得: {}件", table.len());
         Ok(table)
+    }
+}
+
+/// 段を中断する理由。URL・座標を含まない。`streak` は座標による障害が続いた座標の数。
+fn outage_error(error: CallError, streak: Option<usize>) -> StageError {
+    match streak {
+        None => StageError::text(format!(
+            "地理院への問い合わせが通信の障害で中断しました（{}）",
+            error.describe()
+        )),
+        Some(n) => StageError::text(format!(
+            "地理院への問い合わせが、続けて{n}つの座標で通信の障害になったので中断しました（{}）",
+            error.describe()
+        )),
     }
 }
 
