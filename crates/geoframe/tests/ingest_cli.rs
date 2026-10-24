@@ -144,6 +144,9 @@ fn dry_run_writes_nothing_and_reports_counts() {
     fs::create_dir_all(data.join("derivatives")).unwrap();
     fs::write(data.join("tmp/.dl_a"), b"x").unwrap();
     fs::write(data.join("derivatives/.dl_b"), b"y").unwrap();
+    // SIGKILL で残った書きかけ（消す対象に数える）と、対象外のもの
+    fs::write(data.join("derivatives/x.jpg.1.00ff.part"), b"p").unwrap();
+    fs::write(data.join("derivatives/x.jpg"), b"d").unwrap();
     fs::write(data.join(".cache.json"), r#"{"exif:a": 1, "geo:1": 2}"#).unwrap();
     let before = snapshot(data);
 
@@ -161,15 +164,24 @@ fn dry_run_writes_nothing_and_reports_counts() {
         "{stdout}"
     );
     assert!(
-        stdout.contains("消す .dl_* 2 件 / 捨てる .cache.json の旧キー 1 件"),
+        stdout.contains(
+            "消す .dl_* 2 件 / 消す書きかけの .part 1 件 / 捨てる .cache.json の旧キー 1 件"
+        ),
+        "{stdout}"
+    );
+    // 写真の置き場が無い（dry-run は作らない）ので、ローカル写真の段は 0 件
+    assert!(
+        stdout.contains("段 index_local: 完了 files=0 added=0 updated=0 removed=0 "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("段 local_derivatives: 完了 original=0 made=0 failed=0 icc_dropped=0"),
         "{stdout}"
     );
     for stage in [
-        "index_local",
         "index_drive",
         "infer",
         "enrich",
-        "local_derivatives",
         "fetch_derivatives",
         "quality",
     ] {
@@ -543,4 +555,117 @@ fn dry_run_and_read_only_serve_need_neither_the_marker_nor_a_stopped_python() {
     wait_healthy(&mut child, port);
     let (status, _) = terminate(child);
     assert!(status.success());
+}
+
+// ---- organize（T2.3）-----------------------------------------------------------
+
+/// EXIF の無い合成 JPEG（`tests/fixtures/exif-python.json` の `no_exif`）。
+fn plain_jpeg() -> Vec<u8> {
+    use base64::Engine;
+    let doc: Value = serde_json::from_str(include_str!("fixtures/exif-python.json")).unwrap();
+    let case = doc["cases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "no_exif")
+        .unwrap();
+    base64::engine::general_purpose::STANDARD
+        .decode(case["jpeg_base64"].as_str().unwrap())
+        .unwrap()
+}
+
+fn data_with_a_photo(dir: &Dir) -> PathBuf {
+    let data = dir.0.join("data");
+    fs::create_dir_all(data.join("photos")).unwrap();
+    production_shaped_db(&data);
+    fs::write(data.join("photos/no_gps.jpg"), plain_jpeg()).unwrap();
+    data
+}
+
+#[test]
+fn organize_without_ingest_or_marker_refuses_and_moves_nothing() {
+    let dir = Dir::new("organize-refused");
+    let data = data_with_a_photo(&dir);
+    let before = snapshot(&data);
+    // GEOFRAME_INGEST が無い
+    let out = run(&["organize", "--data-dir", data.to_str().unwrap()], &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_eq!(snapshot(&data), before);
+    // 印が無い（Python が止まっていても断る）
+    let missing = dir.0.join("no-such-marker");
+    let envs = vec![
+        ("GEOFRAME_INGEST", "1".to_string()),
+        (
+            "GEOFRAME_TEST_STAGING_MARKER",
+            missing.to_str().unwrap().to_string(),
+        ),
+        ("GEOFRAME_TEST_PYTHON_STATE", "not-found/inactive".into()),
+    ];
+    let out = run_owned(&["organize", "--data-dir", data.to_str().unwrap()], &envs);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_untouched_after_refusal(&data, &before);
+    assert!(data.join("photos/no_gps.jpg").exists());
+}
+
+#[test]
+fn organize_dry_run_reports_counts_and_changes_nothing() {
+    let dir = Dir::new("organize-dry");
+    let data = data_with_a_photo(&dir);
+    let before = snapshot(&data);
+    let out = run(
+        &[
+            "organize",
+            "--dry-run",
+            "--data-dir",
+            data.to_str().unwrap(),
+        ],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains("index_local: 完了 files=1 added=1"),
+        "{stdout}"
+    );
+    // 計画は索引の結果を反映しない（dry-run は DB に書かない）。対象は今の DB にある行だけ
+    assert!(stdout.contains("organize: 完了 targets=0"), "{stdout}");
+    assert_eq!(snapshot(&data), before);
+    assert!(!data.join("_excluded").exists());
+}
+
+#[test]
+fn organize_moves_photos_without_a_location_when_the_guard_passes() {
+    let dir = Dir::new("organize-apply");
+    let staging = Staging::new("organize-apply");
+    let data = data_with_a_photo(&dir);
+    let mut envs = staging.envs();
+    envs.push(("GEOFRAME_INGEST", "1".into()));
+    let out = run_owned(&["organize", "--data-dir", data.to_str().unwrap()], &envs);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains("organize: 完了 targets=1 moved=1"),
+        "{stdout}"
+    );
+    assert!(!data.join("photos/no_gps.jpg").exists());
+    assert!(data.join("_excluded/no_gps/no_gps.jpg").is_file());
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    let local: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM photos WHERE source='local'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let drive: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM photos WHERE source='drive'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((local, drive), (0, 3)); // Drive の行は触らない
+    // ログ・出力に写真の名前を出さない
+    assert!(!stdout.contains("no_gps"), "{stdout}");
+    assert!(!text(&out.stderr).contains("no_gps"));
 }

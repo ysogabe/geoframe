@@ -2,8 +2,9 @@
 //!
 //! # 構成
 //!
-//! サイクルは**段（[`Stage`]）を順に実行**する。段の中身は T2.3〜T2.6 で入れる（この版の段は
-//! 何もしない [`Placeholder`]）。順序は現行の `cycle()` と同じ:
+//! サイクルは**段（[`Stage`]）を順に実行**する。段の中身は T2.3〜T2.6 で入れる（T2.3 で
+//! `index_local`・`local_derivatives` が入った。残りは何もしない [`Placeholder`]）。順序は現行の
+//! `cycle()` と同じ:
 //!
 //! `index_local` → `index_drive` → `infer` → `enrich` → `local_derivatives` → `fetch_derivatives` → `quality`
 //!
@@ -125,6 +126,12 @@ impl StageError {
     pub fn fixed(message: &'static str) -> Self {
         Self(message.to_string())
     }
+
+    /// 組み立てた文面から作る。**呼ぶ側が、パス・ファイル名・座標・例外の文字列を含めない**こと
+    /// （`PathError`・`io::ErrorKind` など、値を持たない型の `Display` だけを渡す）。
+    pub fn text(message: String) -> Self {
+        Self(message)
+    }
 }
 
 impl fmt::Display for StageError {
@@ -172,11 +179,16 @@ impl Stage for Placeholder {
     }
 }
 
-/// 段の一覧（[`STAGE_NAMES`] の順）。T2.3〜T2.6 で、中身の入った段に置き換えていく。
+/// 段の一覧（[`STAGE_NAMES`] の順）。T2.4〜T2.6 で、残りの `Placeholder` を中身の入った段に置き換えていく
+/// （T2.3 で `index_local`・`local_derivatives` が入った）。
 pub fn default_stages() -> Vec<Box<dyn Stage>> {
     STAGE_NAMES
         .iter()
-        .map(|name| Box::new(Placeholder(name)) as Box<dyn Stage>)
+        .map(|name| match *name {
+            "index_local" => Box::new(crate::local::IndexLocal) as Box<dyn Stage>,
+            "local_derivatives" => Box::new(crate::local::LocalDerivatives),
+            _ => Box::new(Placeholder(name)),
+        })
         .collect()
 }
 

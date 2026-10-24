@@ -82,6 +82,12 @@ const USAGE: &str = "\
                                         ロックを変えず（SQLite が読み取りでも作る WAL 関連ファイル catalog.db-wal・
                                         -shm はできうる）、やるとしたら何か（スキーマ・掃除・各段）を件数だけ出す。
                                         書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ印・Python の確認を通す
+  geoframe organize [--dry-run] [--data-dir <dir>]
+                                        位置の無いローカル写真を DATA_DIR/_excluded/no_gps/ へ移し、行を削除する
+                                        （現行の server.py --organize）。先に index_local を 1 回動かす。同名のファイルは
+                                        上書きせず「名前 (2).拡張子」にする。T2.5（位置の推定）までは、撮影時刻があって
+                                        推定で位置が付きうる写真は移さない。--dry-run は件数だけ。書く実行は
+                                        GEOFRAME_INGEST=1 が要り、sync と同じ印・Python の確認を通す
 終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または取り込みを断った（本番への誤指定の防止）";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -92,6 +98,10 @@ pub enum Command {
     ImgProbe(crate::imaging::probe::ProbeArgs),
     Serve(Overrides),
     Sync {
+        dry_run: bool,
+        data_dir: Option<PathBuf>,
+    },
+    Organize {
         dry_run: bool,
         data_dir: Option<PathBuf>,
     },
@@ -133,7 +143,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             }
             Ok(Command::Serve(overrides))
         }
-        Some("sync") => {
+        Some(name @ ("sync" | "organize")) => {
             let (mut dry_run, mut data_dir) = (false, None);
             while let Some(arg) = args.next() {
                 match arg.as_str() {
@@ -142,10 +152,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
                         let value = args.next().ok_or("--data-dir に値が要ります")?;
                         data_dir = Some(PathBuf::from(value));
                     }
-                    other => return Err(format!("sync の引数 {other:?} は不明です")),
+                    other => return Err(format!("{name} の引数 {other:?} は不明です")),
                 }
             }
-            Ok(Command::Sync { dry_run, data_dir })
+            Ok(if name == "sync" {
+                Command::Sync { dry_run, data_dir }
+            } else {
+                Command::Organize { dry_run, data_dir }
+            })
         }
         Some(other) => Err(format!("不明なコマンド {other:?}")),
         None => Err("コマンドがありません".into()),
@@ -188,6 +202,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
         Command::ImgProbe(args) => crate::imaging::probe::run(&args),
         Command::Serve(overrides) => serve(&overrides),
         Command::Sync { dry_run, data_dir } => sync(dry_run, data_dir),
+        Command::Organize { dry_run, data_dir } => organize(dry_run, data_dir),
     }
 }
 
@@ -350,8 +365,8 @@ fn sync_dry_run(config: &Config) -> ExitCode {
                 s.embeddings_to_copy
             );
             println!(
-                "掃除: 消す .dl_* {} 件 / 捨てる .cache.json の旧キー {} 件",
-                plan.leftover_files, plan.legacy_cache_keys
+                "掃除: 消す .dl_* {} 件 / 消す書きかけの .part {} 件 / 捨てる .cache.json の旧キー {} 件",
+                plan.leftover_files, plan.part_files, plan.legacy_cache_keys
             );
         }
         Err(e) => {
@@ -413,6 +428,96 @@ fn sync_apply(config: &Config) -> ExitCode {
     ingest.cache.save_now();
     print_report(&report);
     exit_for(&report)
+}
+
+/// `geoframe organize [--dry-run]`: `index_local` を 1 回動かしてから、位置の無いローカル写真を
+/// `_excluded/no_gps/` へ移す（現行の `server.py --organize`）。書く実行は `sync` と同じ条件と
+/// ガードを通す。
+fn organize(dry_run: bool, data_dir: Option<PathBuf>) -> ExitCode {
+    let overrides = Overrides {
+        listen: None,
+        data_dir,
+    };
+    let config = match Config::load(|key| std::env::var(key).ok(), &overrides) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("geoframe: 設定が不正です: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    crate::logging::init(config.log_level);
+    crate::logging::install_panic_hook();
+    let ingest = if dry_run {
+        println!(
+            "dry-run: 何も書きません（行・ファイルは変えません。SQLite の WAL 関連ファイルだけはできうります）。\
+             organize の対象は今の DB の行だけで、index_local が追加・更新する分は含みません"
+        );
+        None
+    } else {
+        if !config.ingest {
+            eprintln!(
+                "geoframe: organize は GEOFRAME_INGEST=1 のときだけ動きます（書かずに件数だけ見るなら --dry-run）"
+            );
+            return ExitCode::from(2);
+        }
+        match crate::ingest::start(&config) {
+            Ok(ingest) => Some(ingest),
+            Err(e) => {
+                eprintln!("geoframe: {e}");
+                return exit_for_ingest_error(&e);
+            }
+        }
+    };
+    let read = match crate::db::open_read_only(&config.db_path()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("geoframe: DB を読み取り用に開けません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let cache = match &ingest {
+        Some(ingest) => Arc::clone(&ingest.cache),
+        None => Arc::new(Cache::load_frozen(&config.data_dir)),
+    };
+    let http = crate::net::agent();
+    let stop = StopFlag::new();
+    let ctx = StageCtx {
+        mode: if dry_run { Mode::DryRun } else { Mode::Apply },
+        config: &config,
+        read: &read,
+        writer: ingest.as_ref().map(|i| &i.writer),
+        cache: &cache,
+        http: &http,
+        stop: &stop,
+    };
+    // 先に index_local（現行の organize_photos と同じ）。その結果を使って移す
+    let mut failed = false;
+    match crate::sync::Stage::run(&crate::local::IndexLocal, &ctx) {
+        Ok(crate::sync::StageOutcome::Done(counts)) => println!("index_local: 完了 {counts}"),
+        Ok(crate::sync::StageOutcome::Skipped(reason)) => {
+            println!("index_local: 省略（{reason}）");
+            failed = true;
+        }
+        Err(e) => {
+            println!("index_local: 失敗: {e}");
+            failed = true;
+        }
+    }
+    // 索引が失敗したときは移さない（古い行を信じて、まだある写真を動かさないため）
+    if !failed {
+        match crate::local::organize(&ctx) {
+            Ok(counts) => println!("organize: 完了 {counts}"),
+            Err(e) => {
+                println!("organize: 失敗: {e}");
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    }
 }
 
 /// 取り込みを始められなかったときの終了コード。ガードが断ったのは 2（設定の誤りと同じ扱いで、
@@ -517,6 +622,26 @@ mod tests {
         assert!(p(&["selfcheck-net", "x"]).is_err());
         assert!(p(&["sync", "--listen", "127.0.0.1:1"]).is_err());
         assert!(p(&["sync", "--data-dir"]).is_err());
+        assert!(p(&["organize", "--listen", "127.0.0.1:1"]).is_err());
+        assert!(p(&["organize", "--data-dir"]).is_err());
+    }
+
+    #[test]
+    fn parses_organize() {
+        assert_eq!(
+            p(&["organize"]),
+            Ok(Command::Organize {
+                dry_run: false,
+                data_dir: None
+            })
+        );
+        assert_eq!(
+            p(&["organize", "--dry-run", "--data-dir", "/srv/x"]),
+            Ok(Command::Organize {
+                dry_run: true,
+                data_dir: Some(PathBuf::from("/srv/x"))
+            })
+        );
     }
 
     /// 停止の順序: worker が止まる直前の最後の `put` も、最後の保存に入る。

@@ -21,6 +21,8 @@
 //! 3. スキーマの作成・移行（[`crate::schema::migrate`]）。
 //! 4. `.cache.json` を読み、旧キーを捨て、捨てたものがあれば即保存する。
 //! 5. `DATA_DIR/tmp/` を用意し、`tmp/` と `derivatives/` の `.dl_*` を消す（[`prepare_tmp_dir`]）。
+//! 6. `derivatives/` の書きかけの `*.part`（プロセスが `SIGKILL`・電源断で落ちて残ったもの）を消す
+//!    （[`sweep_part_files`]）。
 //!
 //! 地図タイルの掃除（`tile_cache_prune`）は P3。
 
@@ -152,6 +154,12 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         Err(e) => return Err(IngestError::Io(e.kind())),
     }
 
+    // 書きかけの `.part`。`.dl_*` と同じく起動時に 1 回、ガードとロックのあと（二重に動く書き手がいない）
+    match sweep_part_files(&config.data_dir) {
+        0 => {}
+        n => tracing::info!("[derivative] 書きかけの .part を{n}件削除しました"),
+    }
+
     Ok(Ingest {
         writer,
         cache,
@@ -212,6 +220,50 @@ fn leftovers(dir: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
+/// `derivatives/` の中の書きかけの `*.part` のファイル一覧。
+///
+/// derivative は `<出力名>.<pid>.<乱数>.part`（Rust）または `<名前>.part`（Python）に書いてから `rename`
+/// する。書き込み中に落ちると残り、Rust は名前に乱数を含むので次に同じ derivative を作っても上書き
+/// されない。中身は EXIF を持たない部分的な JPEG（個人情報の問題は無く、容量だけ使う）。
+///
+/// 対象は `derivatives/` の**直下の通常ファイルだけ**（名前は [`crate::datadir::check_file_name`] を通り、
+/// `.part` で終わるもの）。`derivatives` がシンボリックリンクなら何もしない（リンク先の別の場所を
+/// 掃除しない）。ディレクトリ・シンボリックリンクは対象にしない（`DirEntry::file_type` はリンクを
+/// 辿らない）。取り込みのロックを持つ間は、他に書きかけを作るプロセスがいない（Python は P5 までガードが
+/// 止まっていることを確かめる）ので、残っている `.part` はすべて書きかけの残骸。
+fn part_leftovers(data_dir: &Path) -> Vec<std::path::PathBuf> {
+    let dir = data_dir.join("derivatives");
+    if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".part") && crate::datadir::check_file_name(&name).is_ok()
+        })
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .map(|e| e.path())
+        .collect()
+}
+
+/// 書きかけの `*.part` を消す。消した数を返す（名前はログに出さない）。消せないものは無視する。
+pub fn sweep_part_files(data_dir: &Path) -> usize {
+    part_leftovers(data_dir)
+        .iter()
+        .filter(|p| fs::remove_file(p).is_ok())
+        .count()
+}
+
+/// `--dry-run` の掃除の計画（消さずに数える）。
+pub fn count_part_files(data_dir: &Path) -> usize {
+    part_leftovers(data_dir).len()
+}
+
 /// `--dry-run` の掃除の計画（消さずに数える）。
 pub fn count_leftovers(data_dir: &Path) -> usize {
     [data_dir.join("tmp"), data_dir.join("derivatives")]
@@ -225,6 +277,8 @@ pub fn count_leftovers(data_dir: &Path) -> usize {
 pub struct Plan {
     pub schema: Pending,
     pub leftover_files: usize,
+    /// 消す書きかけの `*.part`（[`sweep_part_files`]）。
+    pub part_files: usize,
     pub legacy_cache_keys: usize,
 }
 
@@ -233,6 +287,7 @@ pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
     Ok(Plan {
         schema: schema::pending(conn)?,
         leftover_files: count_leftovers(&config.data_dir),
+        part_files: count_part_files(&config.data_dir),
         legacy_cache_keys: Cache::load_frozen(&config.data_dir).legacy_count(),
     })
 }
@@ -290,6 +345,92 @@ mod tests {
         }
         // 2 回目は 0
         assert_eq!(prepare_tmp_dir(root).unwrap(), 0);
+    }
+
+    #[test]
+    fn sweep_removes_only_part_files_directly_in_derivatives() {
+        let dir = TempDir::new("ingest-part");
+        let root = dir.path();
+        fs::create_dir_all(root.join("derivatives/sub")).unwrap();
+        fs::create_dir_all(root.join("photos")).unwrap();
+        for f in [
+            // 消す: Rust の名前・Python の名前
+            "derivatives/abc.jpg.123.00ff00ff00ff00ff.part",
+            "derivatives/x.r90.jpg.9.0123456789abcdef.part",
+            "derivatives/old.part",
+            // 残す
+            "derivatives/abc.jpg",
+            "derivatives/abc.part.keep",
+            "derivatives/.hidden.part", // ドット始まりは派生の名前ではない
+            "derivatives/sub/inner.part",
+            "derivatives/日本.part",
+            "photos/outside.part",
+        ] {
+            fs::write(root.join(f), b"x").unwrap();
+        }
+        // ディレクトリ名が `.part` で終わっても消さない
+        fs::create_dir_all(root.join("derivatives/dir.part")).unwrap();
+        assert_eq!(count_part_files(root), 3);
+        assert_eq!(sweep_part_files(root), 3);
+        assert_eq!(count_part_files(root), 0);
+        for kept in [
+            "derivatives/abc.jpg",
+            "derivatives/abc.part.keep",
+            "derivatives/.hidden.part",
+            "derivatives/sub/inner.part",
+            "derivatives/日本.part",
+            "derivatives/dir.part",
+            "photos/outside.part",
+        ] {
+            assert!(root.join(kept).exists(), "{kept}");
+        }
+        assert_eq!(sweep_part_files(root), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_does_not_follow_or_remove_links() {
+        let dir = TempDir::new("ingest-part-link");
+        let root = dir.path();
+        fs::create_dir_all(root.join("derivatives")).unwrap();
+        fs::write(root.join("target.txt"), b"x").unwrap();
+        // `.part` という名前のリンクは消さず、先にも触れない
+        std::os::unix::fs::symlink(
+            root.join("target.txt"),
+            root.join("derivatives/link.jpg.1.aa.part"),
+        )
+        .unwrap();
+        assert_eq!(sweep_part_files(root), 0);
+        assert!(root.join("target.txt").exists());
+        assert!(fs::symlink_metadata(root.join("derivatives/link.jpg.1.aa.part")).is_ok());
+        // `derivatives` がリンクなら、先の `.part` を掃除しない
+        let elsewhere = TempDir::new("ingest-part-elsewhere");
+        fs::write(elsewhere.path().join("a.jpg.1.aa.part"), b"x").unwrap();
+        let root2 = TempDir::new("ingest-part-root2");
+        std::os::unix::fs::symlink(elsewhere.path(), root2.path().join("derivatives")).unwrap();
+        assert_eq!(count_part_files(root2.path()), 0);
+        assert_eq!(sweep_part_files(root2.path()), 0);
+        assert!(elsewhere.path().join("a.jpg.1.aa.part").exists());
+    }
+
+    #[test]
+    fn start_sweeps_part_files_after_the_guard() {
+        let dir = TempDir::new("ingest-part-start");
+        let root = dir.path().join("data");
+        let overrides = Overrides {
+            listen: None,
+            data_dir: Some(root.clone()),
+        };
+        let config = Config::load(|_| None, &overrides).unwrap();
+        fs::create_dir_all(root.join("derivatives")).unwrap();
+        fs::write(root.join("derivatives/a.jpg.1.aa.part"), b"x").unwrap();
+        // ガードが断れば消さない
+        let guard = Guard::production_with_marker_for_test(dir.path().join("no-such-marker"));
+        assert!(super::start_with(&config, &guard).is_err());
+        assert!(root.join("derivatives/a.jpg.1.aa.part").exists());
+        // 通れば消える
+        drop(start(&config).unwrap());
+        assert!(!root.join("derivatives/a.jpg.1.aa.part").exists());
     }
 
     #[test]
@@ -390,6 +531,7 @@ mod tests {
         let plan = plan(&config, &conn).unwrap();
         assert!(plan.schema.is_noop());
         assert_eq!(plan.leftover_files, 1);
+        assert_eq!(plan.part_files, 0);
         assert_eq!(plan.legacy_cache_keys, 1);
         // 何も消えていない・書かれていない
         assert!(config.data_dir.join("tmp/.dl_a").exists());

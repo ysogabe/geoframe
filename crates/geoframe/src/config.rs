@@ -15,6 +15,8 @@
 //! | タイルキャッシュの上限（管理画面のディスク表示） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
 //! | 取り込み（DB への書き込み・同期サイクル）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_INGEST`（`0`/`1`） | `0`（無効） |
 //! | 同期サイクルの間隔（分） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10` |
+//! | ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可） | なし | `GEOFRAME_PHOTOS_DIR` | `photos` |
+//! | 同期 1 サイクルで derivative を作る枚数 | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25` |
 //!
 //! `TZ` は Rust 側では読まない。P1 は時刻の変換をせず、`taken_at` などの naive な日時は文字列の
 //! まま扱う（inventory.md §6.1）。systemd unit が `TZ=Asia/Tokyo` を与え続けるのは、並走する
@@ -51,10 +53,8 @@ pub const DB_FILE_NAME: &str = "catalog.db";
 /// テストで確かめている（Python 側で項目が増えたのに Rust の分類が漏れるのを防ぐ）。
 pub const UNSUPPORTED_ENV: &[&str] = &[
     // P2: 取り込み
-    "GEOFRAME_PHOTOS_DIR",
     "GEOFRAME_DRIVE_KEY",
     "GEOFRAME_DRIVE_FOLDER",
-    "GEOFRAME_FETCH_PER_CYCLE",
     "GEOFRAME_QUALITY_PER_CYCLE",
     "GEOFRAME_INFER_OFFSET_MIN",
     // P3: 管理機能（地図タイル）
@@ -94,12 +94,20 @@ pub const SUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_TILE_CACHE_MAX_MB",
     // T2.1: 同期サイクルの間隔
     "GEOFRAME_DRIVE_POLL_MIN",
+    // T2.3: ローカル写真の索引（index_local・local_derivatives）
+    "GEOFRAME_PHOTOS_DIR",
+    "GEOFRAME_FETCH_PER_CYCLE",
 ];
 
 pub const DEFAULT_INFER_MIN: f64 = 15.0;
 pub const DEFAULT_TILE_CACHE_MAX_MB: i64 = 16384;
 /// 同期サイクルの間隔（分）の既定。現行の `GEOFRAME_DRIVE_POLL_MIN`。
 pub const DEFAULT_DRIVE_POLL_MIN: f64 = 10.0;
+/// ローカル写真の置き場の既定（`DATA_DIR` からの相対）。ディレクトリ名は変えない（`display`・`path` 列の
+/// 相対パスが `photos/...` で、配信 URL も兼ねる）。
+pub const DEFAULT_PHOTOS_DIR: &str = "photos";
+/// 同期 1 サイクルで derivative を作る枚数の既定。現行の `FETCH_PER_CYCLE`。
+pub const DEFAULT_FETCH_PER_CYCLE: u32 = 25;
 /// `GEOFRAME_DRIVE_POLL_MIN` の上限（分）。1 年。これを超える値は設定の誤りとして断る。
 const MAX_DRIVE_POLL_MIN: f64 = 525_600.0;
 /// 位置推定の段階窓のうち固定のもの（秒）。現行の `INFER_WINDOWS_S = sorted({INFER_WINDOW_S, 2h, 12h})`。
@@ -198,6 +206,12 @@ pub struct Config {
     pub ingest: bool,
     /// 同期サイクルの間隔（分）。`GEOFRAME_DRIVE_POLL_MIN`（現行と同じく分で、小数も可）。
     pub drive_poll_min: f64,
+    /// `GEOFRAME_PHOTOS_DIR` の値そのまま（`DATA_DIR` からの相対、または絶対）。現行と同じく
+    /// `DATA_DIR / 値`（絶対ならその値）を解決して使う。`DATA_DIR` の外に解決されたら、索引は断る
+    /// （[`crate::local`]）。
+    photos_dir_setting: PathBuf,
+    /// 同期 1 サイクルで derivative を作る枚数。`GEOFRAME_FETCH_PER_CYCLE`（0 以上の整数）。
+    pub fetch_per_cycle: u32,
 }
 
 impl Config {
@@ -305,6 +319,19 @@ impl Config {
             None => DEFAULT_DRIVE_POLL_MIN,
         };
 
+        let photos_dir_setting = PathBuf::from(
+            get("GEOFRAME_PHOTOS_DIR")
+                .map(|v| v.trim().to_string())
+                .unwrap_or_else(|| DEFAULT_PHOTOS_DIR.into()),
+        );
+        // 現行は `int(...)`（負の値は SQLite の `LIMIT` で「無制限」になるが、意図とは思えないので断る）
+        let fetch_per_cycle = match get("GEOFRAME_FETCH_PER_CYCLE") {
+            Some(raw) => raw.trim().parse::<u32>().map_err(|_| {
+                ConfigError("GEOFRAME_FETCH_PER_CYCLE は 0 以上の整数で指定してください".into())
+            })?,
+            None => DEFAULT_FETCH_PER_CYCLE,
+        };
+
         Ok(Self {
             listen,
             data_dir,
@@ -317,7 +344,14 @@ impl Config {
             tile_cache_max_mb,
             ingest,
             drive_poll_min,
+            photos_dir_setting,
+            fetch_per_cycle,
         })
+    }
+
+    /// ローカル写真の置き場（字句のパス。リンクは辿っていない）。現行の `DATA_DIR / GEOFRAME_PHOTOS_DIR`。
+    pub fn photos_dir(&self) -> PathBuf {
+        self.data_dir.join(&self.photos_dir_setting)
     }
 
     /// 同期サイクルの間隔。
@@ -358,7 +392,7 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
@@ -369,6 +403,7 @@ impl Config {
             self.tile_cache_max_mb,
             if self.ingest { 1 } else { 0 },
             self.drive_poll_min,
+            self.fetch_per_cycle,
         )
     }
 }
@@ -598,7 +633,10 @@ mod tests {
         .unwrap();
         assert!(!c.ingest);
         assert_eq!(c.drive_poll_min, 10.0);
-        assert!(c.log_summary().contains("ingest=0 drive_poll_min=10"));
+        assert!(
+            c.log_summary()
+                .contains("ingest=0 drive_poll_min=10 fetch_per_cycle=25")
+        );
     }
 
     #[test]
@@ -613,7 +651,7 @@ mod tests {
         .unwrap();
         assert!(c.ingest);
         assert_eq!(c.drive_poll(), std::time::Duration::from_secs(30));
-        assert!(c.log_summary().contains("ingest=1 drive_poll_min=0.5"));
+        assert!(c.log_summary().contains("ingest=1 drive_poll_min=0.5 "));
         assert!(
             !load(&[("GEOFRAME_INGEST", "0")], &Overrides::default())
                 .unwrap()
@@ -642,6 +680,46 @@ mod tests {
             if value.len() > 2 {
                 assert!(!err.0.contains(value), "{err}");
             }
+        }
+    }
+
+    #[test]
+    fn photos_dir_and_fetch_per_cycle_follow_the_python_defaults() {
+        let c = load(&[("GEOFRAME_DATA_DIR", "/srv/g")], &Overrides::default()).unwrap();
+        assert_eq!(c.photos_dir(), PathBuf::from("/srv/g/photos"));
+        assert_eq!(c.fetch_per_cycle, 25);
+        let c = load(
+            &[
+                ("GEOFRAME_DATA_DIR", "/srv/g"),
+                ("GEOFRAME_PHOTOS_DIR", " pics "),
+                ("GEOFRAME_FETCH_PER_CYCLE", "0"),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.photos_dir(), PathBuf::from("/srv/g/pics"));
+        assert_eq!(c.fetch_per_cycle, 0);
+        // 絶対パスは `DATA_DIR / 値` で値そのものになる（現行の `Path` の結合と同じ）
+        let c = load(
+            &[
+                ("GEOFRAME_DATA_DIR", "/srv/g"),
+                ("GEOFRAME_PHOTOS_DIR", "/srv/g/in"),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert_eq!(c.photos_dir(), PathBuf::from("/srv/g/in"));
+        // 空文字は未設定と同じ
+        let c = load(&[("GEOFRAME_PHOTOS_DIR", " ")], &Overrides::default()).unwrap();
+        assert!(c.photos_dir().ends_with("photos"));
+        for value in ["abc", "-1", "1.5", "99999999999"] {
+            let err = load(
+                &[("GEOFRAME_FETCH_PER_CYCLE", value)],
+                &Overrides::default(),
+            )
+            .unwrap_err();
+            assert!(err.0.contains("GEOFRAME_FETCH_PER_CYCLE"), "{err}");
+            assert!(!err.0.contains(value), "{err}");
         }
     }
 

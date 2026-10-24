@@ -54,6 +54,12 @@ pub fn local_timestamp() -> String {
     format_local(secs)
 }
 
+/// 今の現地時刻を `YYYY-MM-DDTHH:MM:SS`（オフセット無し）で。`datetime.now().isoformat(timespec="seconds")`
+/// と同じ形で、`indexed_at`・`fetched_at` に入れる（inventory.md §6.1）。
+pub fn local_isoformat() -> String {
+    local_timestamp().replacen(' ', "T", 1)
+}
+
 fn format_local(secs: u64) -> String {
     let Ok(secs) = i64::try_from(secs) else {
         return String::new();
@@ -112,6 +118,21 @@ mod tests {
             }
         }
         assert!(text.starts_with("20"), "{text}");
+    }
+
+    #[test]
+    fn local_isoformat_is_the_naive_iso_shape() {
+        let text = local_isoformat();
+        let bytes = text.as_bytes();
+        assert_eq!(bytes.len(), 19, "{text}");
+        for (i, b) in bytes.iter().enumerate() {
+            match i {
+                4 | 7 => assert_eq!(*b, b'-', "{text}"),
+                10 => assert_eq!(*b, b'T', "{text}"),
+                13 | 16 => assert_eq!(*b, b':', "{text}"),
+                _ => assert!(b.is_ascii_digit(), "{text}"),
+            }
+        }
     }
 
     #[test]

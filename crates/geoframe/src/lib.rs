@@ -17,6 +17,7 @@ pub mod imaging;
 pub mod ingest;
 pub mod jwt;
 pub mod limits;
+pub mod local;
 pub mod logging;
 pub mod net;
 pub mod photos;

@@ -41,6 +41,9 @@ jpeg-encoder = "0.7.1"
 moxcms = "0.8.1"
 # HEIC（純 Rust。libheif と出力がバイト単位で一致）
 zune-heic = "0.5.0"
+# P2 / T2.3: ローカル写真の derivative の名前 `local_<md5(path)[:16]>.jpg`（現行の hashlib.md5）。
+# 暗号用途ではなく名前の互換のためだけ。純 Rust（RustCrypto。digest は既に Cargo.lock にある）
+md-5 = "0.11.0"
 
 # musl 標準のアロケータは画像処理で 15〜25% 遅い（image-poc.md §3.5）ので、musl のときだけ mimalloc を使う。
 # C のソースを cc でビルドする（CI の musl-tools で足りる）。静的にリンクされ、実行時の依存は増えない

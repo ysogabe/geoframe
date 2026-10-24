@@ -147,6 +147,39 @@ impl DataDir {
         Ok((dir.join(name), format!("derivatives/{name}")))
     }
 
+    /// 行の `display`（`derivatives/<名前>`）が指す derivative の絶対パス。**消す前の検査用**。
+    /// `derivatives/` の直下の 1 ファイルで、名前が [`check_file_name`] を通り、`derivatives/` が
+    /// シンボリックリンクでないときだけ返す（DB の値を信用しない。`..` や別の階層は断る）。
+    /// ファイルが無くてもよい（存在は見ない）。最後の要素がリンクでも、消すのはそのリンク自体。
+    pub fn derivative_file(&self, display: &str) -> Result<PathBuf, PathError> {
+        let name = display
+            .strip_prefix("derivatives/")
+            .ok_or(PathError::BadName)?;
+        check_file_name(name)?;
+        let dir = self.root.join("derivatives");
+        match fs::symlink_metadata(&dir) {
+            Ok(meta) if meta.is_dir() => Ok(dir.join(name)),
+            Ok(_) => Err(PathError::Escapes),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// DB の相対パス文字列が指す**エントリそのもの**の絶対パス（最後の要素のリンクは辿らない）。
+    /// 親ディレクトリは `canonicalize` して `DATA_DIR` の中であることを確かめる。ファイルを**移す・消す**
+    /// ときに使う（[`resolve_existing`](Self::resolve_existing) はリンクを辿って実体を返すので、
+    /// 移すと実体を動かしてしまう）。親が無い（`NotFound`）ときは入出力の失敗。
+    pub fn entry_path(&self, rel: &str) -> Result<PathBuf, PathError> {
+        let lexical = self.lexical(rel)?;
+        let (Some(parent), Some(name)) = (lexical.parent(), lexical.file_name()) else {
+            return Err(PathError::Invalid);
+        };
+        let real_parent = fs::canonicalize(parent)?;
+        if !real_parent.starts_with(&self.root) {
+            return Err(PathError::Escapes);
+        }
+        Ok(real_parent.join(name))
+    }
+
     /// 取り込みの一時ファイル `tmp/.dl_<drive_id>` の絶対パス。`tmp/` を作る。
     pub fn download_tmp(&self, drive_id: &str) -> Result<PathBuf, PathError> {
         check_drive_id(drive_id)?;
@@ -300,6 +333,61 @@ mod tests {
         }
         let p = d.download_tmp("abc").unwrap();
         assert!(p.ends_with("tmp/.dl_abc"));
+    }
+
+    #[test]
+    fn 消してよいderivativeはderivativesの直下の安全な名前だけ() {
+        let (t, d) = setup();
+        fs::create_dir_all(t.path().join("derivatives")).unwrap();
+        let p = d.derivative_file("derivatives/local_0123.jpg").unwrap();
+        assert!(p.ends_with("derivatives/local_0123.jpg"));
+        for bad in [
+            "photos/a.jpg",
+            "derivatives/",
+            "derivatives/../catalog.db",
+            "derivatives/sub/a.jpg",
+            "derivatives/.hidden.jpg",
+            "/etc/passwd",
+            "derivatives",
+            "",
+        ] {
+            assert!(d.derivative_file(bad).is_err(), "{bad:?}");
+        }
+        // `derivatives` がリンクなら使わない
+        let outside = TempDir::new("datadir-outside3");
+        fs::remove_dir_all(t.path().join("derivatives")).unwrap();
+        symlink(outside.path(), t.path().join("derivatives")).unwrap();
+        assert_eq!(
+            d.derivative_file("derivatives/a.jpg").unwrap_err(),
+            PathError::Escapes
+        );
+    }
+
+    #[test]
+    fn エントリのパスはリンクを辿らず親だけを検査する() {
+        let (t, d) = setup();
+        let outside = TempDir::new("datadir-outside4");
+        fs::write(outside.path().join("secret.jpg"), b"s").unwrap();
+        symlink(
+            outside.path().join("secret.jpg"),
+            t.path().join("photos/link.jpg"),
+        )
+        .unwrap();
+        // 最後の要素がリンクでも、リンクそのもののパスを返す（外を指していても、ここでは断らない）
+        let p = d.entry_path("photos/link.jpg").unwrap();
+        assert!(p.ends_with("photos/link.jpg"));
+        assert!(fs::symlink_metadata(&p).unwrap().file_type().is_symlink());
+        // 親が外へ出るリンクは断る。存在しない親は入出力の失敗
+        symlink(outside.path(), t.path().join("photos/dirlink")).unwrap();
+        assert_eq!(
+            d.entry_path("photos/dirlink/secret.jpg").unwrap_err(),
+            PathError::Escapes
+        );
+        assert!(matches!(
+            d.entry_path("photos/none/x.jpg").unwrap_err(),
+            PathError::Io(_)
+        ));
+        assert_eq!(d.entry_path("../x.jpg").unwrap_err(), PathError::Traversal);
     }
 
     #[test]
