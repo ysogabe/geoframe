@@ -1,13 +1,13 @@
 # Rust単一バイナリ化 タスク
 
 - 要求: [Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 設計: [設計案](../architecture/rust-api-and-ai-providers-proposal.md) / 計画: [plan.md](plan.md)
-- ブランチ: フェーズごとに作る（P0は`t3/issue-54-implementation-plan`）
+- ブランチ: ローカルはT3の`t3/issue-54-implementation-plan`のまま、リモートはフェーズごとに分ける（P0は同名で PR #57、squash merge 済み。P1は`feat/rust-migration-p1`へpush）
 - PRはフェーズごとに1つ。P2以降のタスクは、そのフェーズの開始時に細かく分け直す。
 - 種類: `ops`は自分で行う運用作業、`quick`/`full`はビルドのスキルに任せる実装。
 
 AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ、AC2 E2E、AC3 停止・lease中の動作と再試行、AC4 ベクトル空間、AC5 単一バイナリ・CI・systemd・依存、AC6 契約型・互換テスト、AC7 秘密・位置・写真を載せない）。
 
-## P0: 棚卸しと技術PoC
+## P0: 棚卸しと技術PoC（PR #57、2026-10-24 マージ）
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
@@ -22,7 +22,7 @@ AC番号はIssue #54の受入条件の順（AC1 公開契約・永続データ�
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T1.1 | 設定（`GEOFRAME_*`）、SQLite読み取り層、ログ方針、ヘルス確認 | AC5, AC7 | P0 | full | 未着手 | | | T0.3レビューの推奨: 合成WAL DBで未チェックポイントのコミットが読めること・本体とWALを変えないことのテスト |
+| T1.1 | 設定（`GEOFRAME_*`）、SQLite読み取り層、ログ方針、ヘルス確認 | AC5, AC7 | P0 | full | 実装中 | c41c4a9 | | T0.3レビューの推奨: 合成WAL DBで未チェックポイントのコミットが読めること・本体とWALを変えないことのテスト |
 | T1.2 | `GET /api/v1/photos`（除外・並び・タイトル・旅番号） | AC1, AC6 | T1.1 | full | 未着手 | | | |
 | T1.3 | 静的配信（ホワイトリスト・ドットファイル・トラバーサル・HEAD）、Host検査、管理画面ページ、静的ファイルの埋め込み | AC1, AC5 | T1.1 | full | 未着手 | | | |
 | T1.4 | 管理画面の読み取りAPI（`/api/admin/status`・`/api/admin/photos`ほか） | AC1 | T1.1 | full | 未着手 | | | |
