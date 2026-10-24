@@ -220,6 +220,77 @@ fn setlocとsetflagは存在しないidを404にし_何も書かない() {
     assert_eq!(status, "400");
 }
 
+/// rowid は `i64::MAX` まで実在しうる。それより大きい `id` を `i64::MAX` に丸めると、その行が更新されてしまう。
+#[test]
+fn i64を超えるidは最大のidの行があっても_その行を更新せず404() {
+    let db = db();
+    db.writer
+        .call(|c| {
+            c.execute(
+                "INSERT INTO photos(id, source, name, lat, lon, loc_source, favorite, hidden)
+                 VALUES(9223372036854775807, 'drive', 'max', 35.0, 139.0, 'exif', 0, 0)",
+                [],
+            )
+        })
+        .unwrap();
+    let before = row(&db, i64::MAX);
+    let before_all = (row(&db, 1), row(&db, 2));
+    let too_big = r#"9223372036854775808"#;
+    let setloc = format!(r#"{{"id": {too_big}, "lat": 1, "lon": 1}}"#);
+    let setflag = format!(r#"{{"id": {too_big}, "favorite": true, "hidden": true}}"#);
+    assert_eq!(
+        setloc_err(&db, serde_json::from_str(&setloc).unwrap()),
+        ("404", format!("id={too_big} は存在しません"))
+    );
+    assert_eq!(
+        setflag_err(&db, serde_json::from_str(&setflag).unwrap()),
+        ("404", format!("id={too_big} は存在しません"))
+    );
+    // u64 の最大値でも同じ
+    let setflag = r#"{"id": 18446744073709551615, "hidden": true}"#;
+    assert_eq!(
+        setflag_err(&db, serde_json::from_str(setflag).unwrap()),
+        ("404", "id=18446744073709551615 は存在しません".into())
+    );
+    assert_eq!(row(&db, i64::MAX), before, "最大の id の行は変わらない");
+    assert_eq!((row(&db, 1), row(&db, 2)), before_all);
+    // 入力の検査（400）と writer の確認（503）は、範囲外の id でも今まで通りその順で先
+    assert_eq!(
+        setloc_err(
+            &db,
+            serde_json::from_str(&format!(r#"{{"id": {too_big}, "lat": 1}}"#)).unwrap()
+        )
+        .0,
+        "400"
+    );
+    assert_eq!(
+        setflag_err(
+            &db,
+            serde_json::from_str(&format!(r#"{{"id": {too_big}}}"#)).unwrap()
+        )
+        .0,
+        "400"
+    );
+    let err = set_loc(&obj(serde_json::from_str(&setloc).unwrap()), None).unwrap_err();
+    assert_eq!(message(err).0, "503");
+    let err = set_flag(
+        &obj(serde_json::from_str(&format!(r#"{{"id": {too_big}, "favorite": true}}"#)).unwrap()),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(message(err).0, "503");
+    // 実在する最大の id そのものは、普通に更新できる
+    let out = set_flag(
+        &obj(json!({"id": i64::MAX, "favorite": true})),
+        Some(&db.writer),
+    )
+    .unwrap();
+    assert_eq!(
+        out,
+        json!({"ok": true, "id": i64::MAX, "favorite": true, "hidden": false})
+    );
+}
+
 #[test]
 fn setflagは指定した列だけ書き_更新後の両方の値を返す() {
     let db = db();

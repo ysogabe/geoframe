@@ -66,6 +66,20 @@ class UpdateApiFixtureTest(unittest.TestCase):
         # Origin の host は大文字小文字を区別して Host と比べる
         self.assertEqual(by["origin_host_uppercase"]["status"], 403)
 
+    def test_content_length_quirks_recorded(self):
+        # Rust は axum/hyper が先に断る境界（server.md §17.1.1）。Python は int() で読み、重複は最初の値だけを使う
+        by = self.by_name
+        for name in ("http_cl_plus_sign", "http_cl_underscore", "http_cl_dup_first_ok_second_big",
+                     "http_cl_dup_second_over_limit"):
+            self.assertEqual(by[name]["status"], 200, name)
+            self.assertIn("4", by[name]["changes"], name)
+        for name in ("http_cl_u64_max", "http_cl_u64_max_plus1", "http_cl_dup_first_big_second_ok"):
+            self.assertEqual(by[name]["status"], 413, name)
+        for name in ("http_cl_not_digits", "http_cl_negative", "http_cl_empty", "http_cl_list_same"):
+            self.assertEqual(by[name]["body"]["error"], "Content-Length が必要です", name)
+        # Content-Type の検査が Content-Length より先
+        self.assertEqual(by["http_cl_not_digits_text_plain"]["status"], 403)
+
     def test_setloc_changes_the_python_columns(self):
         changes = self.by_name["setloc_on_row_with_place"]["changes"]["1"]
         self.assertEqual(

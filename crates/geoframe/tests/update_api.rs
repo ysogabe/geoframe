@@ -134,6 +134,11 @@ fn known(name: &str) -> (u16, &'static str, Value) {
         }
         // パスの \ は / に読み替えない（Python は読み替えて当たる）
         "route_backslash" => (403, "", json!({})),
+        // HTTP 層が Content-Length を先に断る（本文は定型 JSON でない。書き込みは起きない）。
+        // 状態コードと接続の扱いは `content_length_boundaries_at_the_http_layer`
+        "http_cl_u64_max" => (431, "", json!({})),
+        "http_te_chunked_with_cl" => (400, "Content-Length が必要です", json!({})),
+        name if name.starts_with("http_cl_") => (400, "", json!({})),
         other => panic!("{other} は known_differences に無い"),
     }
 }
@@ -541,4 +546,191 @@ async fn concurrent_updates_all_land() {
         assert_eq!(row["lat"], json!(10.0 + id as f64 / 100.0), "{id}");
         assert_eq!(row["hidden"], json!(1), "{id}");
     }
+}
+
+// ---- HTTP 層が先に拒否する Content-Length（server.md §17.1） ----
+
+/// 1 回の接続の結果。
+#[derive(Debug)]
+struct Probe {
+    /// 状態コード（応答が無ければ 0）
+    status: u16,
+    headers: String,
+    body: Vec<u8>,
+    /// 応答のあと、同じ接続にもう 1 つ要求を足しても応答が来ない（サーバーが閉じた）
+    closed: bool,
+}
+
+/// 受け取った分から、ヘッダの終わりと本文までの 1 つの応答を取り出す。足りなければ `None`。
+fn parse_response(raw: &[u8]) -> Option<(u16, String, Vec<u8>, usize)> {
+    let split = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let head = std::str::from_utf8(&raw[..split]).unwrap();
+    let (status_line, headers) = head.split_once("\r\n").unwrap_or((head, ""));
+    let headers = headers.to_lowercase();
+    let length: usize = headers
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length: "))
+        .map_or(0, |v| v.trim().parse().unwrap());
+    let end = split + 4 + length;
+    if raw.len() < end {
+        return None;
+    }
+    let status = status_line.split(' ').nth(1).unwrap().parse().unwrap();
+    Some((status, headers, raw[split + 4..end].to_vec(), end))
+}
+
+/// `raw`（要求のバイト列。本文は付けても付けなくてもよい）を実際の TCP 接続で送り、最初の応答を読む。
+/// そのあと同じ接続に `GET /healthz` を足して、応答が来れば接続は保たれ、EOF・リセットなら閉じられている。
+/// 時間には頼らない（応答もリセットも EOF も即座に来る）。止まった試験は 20 秒の上限でハングではなく失敗にする。
+async fn probe(addr: std::net::SocketAddr, raw: &[u8]) -> Probe {
+    async fn read_one(stream: &mut tokio::net::TcpStream, acc: &mut Vec<u8>) -> bool {
+        let mut chunk = [0u8; 8192];
+        loop {
+            if parse_response(acc).is_some() {
+                return true;
+            }
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return false,
+                Ok(n) => acc.extend_from_slice(&chunk[..n]),
+            }
+        }
+    }
+    let run = async {
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _ = stream.write_all(raw).await;
+        let mut acc = Vec::new();
+        if !read_one(&mut stream, &mut acc).await {
+            return Probe {
+                status: 0,
+                headers: String::new(),
+                body: Vec::new(),
+                closed: true,
+            };
+        }
+        let (status, headers, body, used) = parse_response(&acc).unwrap();
+        acc.drain(..used);
+        let _ = stream
+            .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await;
+        let closed = !read_one(&mut stream, &mut acc).await;
+        Probe {
+            status,
+            headers,
+            body,
+            closed,
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(20), run)
+        .await
+        .expect("応答もリセットも来ないまま止まった")
+}
+
+/// HTTP 層（axum/hyper）が `Content-Length` を先に検査して断る境界。`post.rs` に届く前なので、server.md
+/// §17.1 の表の順序・状態コードどおりにはならない。Python との差は**拒否の向きだけ**（Python が書く入力を
+/// Rust が断る）で、Rust が書いて Python が断る入力は無い。要求と Python の結果は、フィクスチャ
+/// （`http_*` ほか）から読む。値は固定した crates（hyper 1.x）の振る舞いで、上げたときはここが落ちて気づく。
+#[tokio::test]
+async fn content_length_boundaries_at_the_http_layer() {
+    // (ケース名, Python の状態, Rust の状態, Rust が応答のあと接続を閉じる, Rust が書く)
+    const TABLE: &[(&str, u16, u16, bool, bool)] = &[
+        // 上限の境目: ちょうど 65536 は通り、65537 は本文を読まずに 413 と接続の切断
+        ("body_exactly_limit_ok", 200, 200, false, true),
+        ("length_declared_too_big", 413, 413, true, false),
+        // 巨大・不正な値は hyper が先に断る（u64 の最大値は 431、それを超えると 400）
+        ("http_cl_u64_max", 413, 431, true, false),
+        ("http_cl_u64_max_plus1", 413, 400, true, false),
+        ("http_cl_not_digits", 400, 400, true, false),
+        ("http_cl_not_digits_text_plain", 403, 400, true, false),
+        ("http_cl_negative", 400, 400, true, false),
+        ("http_cl_empty", 400, 400, true, false),
+        // Python の int() だけが読む形（Python は書く）
+        ("http_cl_plus_sign", 200, 400, true, false),
+        ("http_cl_underscore", 200, 400, true, false),
+        ("http_cl_list_same", 400, 400, true, false),
+        // 重複した Content-Length: 同じ値だけ通る
+        ("http_cl_dup_same", 200, 200, false, true),
+        ("http_cl_dup_first_ok_second_big", 200, 400, true, false),
+        ("http_cl_dup_first_big_second_ok", 413, 400, true, false),
+        ("http_cl_dup_second_over_limit", 200, 400, true, false),
+        // Transfer-Encoding: chunked は、Content-Length が無い扱いで 400
+        ("http_te_chunked_only", 400, 400, false, false),
+        ("http_te_chunked_with_cl", 400, 400, true, false),
+    ];
+    let fixture = fixture();
+    let cases = fixture["cases"].as_array().unwrap();
+    let server = Server::start(true).await;
+    for (name, py_status, status, closed, writes) in TABLE {
+        let case = cases
+            .iter()
+            .find(|c| c["name"] == *name)
+            .unwrap_or_else(|| panic!("{name} がフィクスチャに無い"));
+        assert_eq!(case["status"], *py_status, "{name}: Python の結果");
+        // フィクスチャの要求をそのまま送る。ただし接続を保てるか見るので Connection: close は外す
+        let mut raw =
+            format!("POST {} HTTP/1.1\r\n", case["target"].as_str().unwrap()).into_bytes();
+        for h in case["headers"].as_array().unwrap() {
+            let (k, v) = (h[0].as_str().unwrap(), h[1].as_str().unwrap());
+            if !k.eq_ignore_ascii_case("connection") {
+                raw.extend_from_slice(format!("{k}: {v}\r\n").as_bytes());
+            }
+        }
+        raw.extend_from_slice(b"\r\n");
+        let hex = case["body_hex"].as_str().unwrap();
+        raw.extend(
+            (0..hex.len() / 2).map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap()),
+        );
+
+        let before = server.snapshot();
+        let p = probe(server.addr, &raw).await;
+        let wrote = server.snapshot() != before;
+        let context = format!("{name}: {} {}", p.status, String::from_utf8_lossy(&p.body));
+        assert_eq!(p.status, *status, "{context}");
+        assert_eq!(p.closed, *closed, "接続の切断 {context}");
+        assert_eq!(wrote, *writes, "書き込み {context}");
+        assert!(!p.headers.contains("access-control-"), "{name}");
+    }
+}
+
+/// `id` が `i64` を超える要求は、SQLite の rowid の最大（`i64::MAX`）の行があっても、その行を更新しない。
+#[tokio::test]
+async fn an_id_beyond_i64_never_updates_the_row_with_the_largest_rowid() {
+    let server = Server::start(true).await;
+    server
+        .db
+        .execute(
+            "INSERT INTO photos(id, source, name, lat, lon, loc_source, favorite, hidden)
+             VALUES(9223372036854775807, 'drive', 'max', 35.0, 139.0, 'exif', 0, 0)",
+            [],
+        )
+        .unwrap();
+    let before = server.snapshot();
+    for (target, body) in [
+        (
+            "/api/admin/setloc",
+            r#"{"id": 9223372036854775808, "lat": 1, "lon": 2}"#,
+        ),
+        (
+            "/api/admin/setflag",
+            r#"{"id": 9223372036854775808, "favorite": true, "hidden": true}"#,
+        ),
+        (
+            "/api/admin/setflag",
+            r#"{"id": 18446744073709551615, "favorite": true}"#,
+        ),
+    ] {
+        let response = server
+            .post_json(target, &serde_json::from_str(body).unwrap())
+            .await;
+        assert_eq!(response.status, 404, "{target} {body}");
+        assert_eq!(server.snapshot(), before, "{target} {body}");
+    }
+    // 実在する最大の id そのものは更新できる
+    let response = server
+        .post_json(
+            "/api/admin/setflag",
+            &json!({"id": 9223372036854775807i64, "favorite": true}),
+        )
+        .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(server.snapshot()[&i64::MAX]["favorite"], json!(1));
 }

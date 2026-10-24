@@ -232,6 +232,63 @@ CASES = [
          '{"id": 27, "favorite": true, "x": ' + "[" * 50 + "]" * 50 + "}"),
 ]
 
+
+def http_loc(name, k, **kw):
+    """HTTP 層（Rust では axum/hyper）が Content-Length を先に検査する境界のケース。書き込みが起きたかを
+    見分けられるよう、どれも同じ行（id 4）へ**毎回違う** lat・lon を書く（書けば必ず lat・lon が変わる）。
+    戻り値の `body_len` は本文のバイト数（`length` の文字列を作るため）。"""
+    body = '{"id": 4, "lat": 50.%02d, "lon": 60.%02d}' % (k, k)
+    return case(name, SETLOC, body, **kw), len(body.encode("utf-8"))
+
+
+def _http_cases():
+    cases = []
+    n = len('{"id": 4, "lat": 50.00, "lon": 60.00}')  # 本文の長さはどのケースも同じ
+
+    def add(name, k, **kw):
+        c, length = http_loc(name, k, **kw)
+        assert length == n
+        cases.append(c)
+
+    # 巨大・不正な Content-Length（本文は送らない）
+    add("http_cl_u64_max", 1, length="declare:18446744073709551615")
+    add("http_cl_u64_max_plus1", 2, length="declare:18446744073709551616")
+    # 数字でない・負・空
+    add("http_cl_not_digits", 3, length="abc")
+    add("http_cl_not_digits_text_plain", 4, ct=False,
+        headers=[("Content-Type", "text/plain")], length="abc")
+    add("http_cl_negative", 5, length="-1")
+    add("http_cl_empty", 6, length="")
+    # Python の int() は + 記号・アンダースコア入りも読む
+    add("http_cl_plus_sign", 7, length=f"+{n}")
+    add("http_cl_underscore", 8, length=f"{n // 10}_{n % 10}")
+    add("http_cl_list_same", 9, length=f"{n}, {n}")
+    # 重複した Content-Length（Python は最初の値だけを見る）
+    add("http_cl_dup_same", 10, length=None,
+        headers=[("Content-Length", str(n)), ("Content-Length", str(n))])
+    add("http_cl_dup_first_ok_second_big", 11, length=None,
+        headers=[("Content-Length", str(n)), ("Content-Length", "99999")])
+    add("http_cl_dup_first_big_second_ok", 12, length=None,
+        headers=[("Content-Length", "99999"), ("Content-Length", str(n))])
+    add("http_cl_dup_second_over_limit", 13, length=None,
+        headers=[("Content-Length", str(n)), ("Content-Length", "70000")])
+    return cases
+
+
+def _chunked_cases():
+    body = '{"id": 4, "lat": 50.%02d, "lon": 60.%02d}'
+    out = []
+    for name, k, length in (("http_te_chunked_only", 14, None),
+                            ("http_te_chunked_with_cl", 15, "auto")):
+        raw = body % (k, k)
+        framed = f"{len(raw.encode('utf-8')):x}\r\n{raw}\r\n0\r\n\r\n"
+        out.append(case(name, SETLOC, framed, length=length,
+                        headers=[("Transfer-Encoding", "chunked")]))
+    return out
+
+
+CASES += _http_cases() + _chunked_cases()
+
 # Python と Rust で応答が違うケース。名前 → 理由。Rust のテストは、ここに無いケースは状態コードと
 # 応答のJSON・DBの変化がすべて一致することを要求し、ここにあるケースは Rust のテストが持つ期待値を使う。
 KNOWN_DIFFERENCES = {
@@ -240,6 +297,21 @@ KNOWN_DIFFERENCES = {
     "setloc_id_beyond_i64": "i64 を超える id: Python は SQLite に渡せず 500、Rust は存在しない id として 404",
     "setflag_id_beyond_i64": "同上",
     "route_backslash": "パスの \\ : Python は / に読み替えて当たる、Rust は 403（より厳しい）",
+    # HTTP 層（axum/hyper）が Content-Length を先に拒否する境界。どれも Rust は書き込まない（拒否の向きの差。
+    # server.md §17.1）。Python が書く（200）ケースもあるが、Rust が書いて Python が拒否するケースは無い
+    "http_cl_u64_max": "u64 の最大値: Python は 413、Rust は hyper が 431（本文を読まず接続を閉じる）",
+    "http_cl_u64_max_plus1": "u64 を超える値: Python は 413、Rust は hyper が 400（本文なし）",
+    "http_cl_not_digits": "数字でない Content-Length: 状態コードは 400 で同じ。Rust は hyper が先に断り本文が定型 JSON でない",
+    "http_cl_not_digits_text_plain": "数字でない Content-Length と text/plain: Python は 403（Content-Type が先）、Rust は hyper が 400",
+    "http_cl_negative": "負の Content-Length: 400 で同じ。Rust は本文が定型 JSON でない",
+    "http_cl_empty": "空の Content-Length: 400 で同じ。Rust は本文が定型 JSON でない",
+    "http_cl_plus_sign": "+付きの Content-Length: Python は int() が読んで 200、Rust は hyper が 400",
+    "http_cl_underscore": "アンダースコア入りの Content-Length: Python は int() が読んで 200、Rust は hyper が 400",
+    "http_cl_list_same": "Content-Length: N, N: 400 で同じ。Rust は本文が定型 JSON でない",
+    "http_cl_dup_first_ok_second_big": "重複して後ろが違う値: Python は最初の値で 200、Rust は hyper が 400",
+    "http_cl_dup_first_big_second_ok": "重複して最初が巨大: Python は 413、Rust は hyper が 400",
+    "http_cl_dup_second_over_limit": "重複して後ろが上限超過: Python は最初の値で 200、Rust は hyper が 400",
+    "http_te_chunked_with_cl": "Transfer-Encoding: chunked と Content-Length の併記: 400 で同じ。Python は CL の長さで読んで JSON として解釈できず、Rust は Content-Length が無い扱い（文面が違う）",
 }
 
 

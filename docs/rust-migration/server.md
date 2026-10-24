@@ -40,7 +40,7 @@ P1・P2（T2.1〜T2.6）・P3（T3.1）でPythonと意図して違える点・�
 | **位置の推定 `infer`（T2.5）**: ①**値が変わらない行には書かない**（Pythonは毎サイクル、対象の全行に同じ値を`UPDATE`する。最終の行は同じ）。②`UPDATE`は`loc_source IS NULL OR 'inferred'`の行にだけ効く（計画を作ってから書くまでの間に手動で位置が付いた行を上書きしない。Pythonにはこの隙間がある）。③時刻の差は**`TZ`に依存しないnaiveな日時**で取る（Pythonは`strptime(…).timestamp()`）。ASCIIの数字だけ読む（全角の数字が混じった時刻をPythonは読む場合がある。CPython 3.13で確認: 年が全角でも、分が1桁の全角でも読める）。④`GEOFRAME_INFER_OFFSET_MIN`は有限の数だけ（負も小数も可。Pythonは検証なし）。⑤同順位（同じ距離の錨が複数）は**`id`の小さい方**（Pythonは`ORDER BY`なしの全件走査の最初で、実際は`rowid`順＝同じ）。⑥**Pythonと同じで直さないもの**: `place elev muni_cd pref city`には触らない（錨が変わって位置が動いても、推定を取り消して別の場所へ推定し直しても、`place`は古い地名のまま残る）。`display`は取り消す行だけをNULLにする（`fetch_derivatives`が取り直す。ファイルは消さない）。`manual`は再推定しない・錨にはなる。`inferred`は錨にしない | ①②は書き込みを減らす（本番コピーの`--dry-run`が「変更ほぼ0」と読める）。③はP1以来の方針。⑥は現行の挙動（位置が動いたときに地名を付け直すかはP3で決める） | 位置の無い写真があるとき | `geo-python.json`（合成の行にPythonの`infer_locations`を段階的に流した結果と、`photos`の全列・戻り値が一致: 窓の境界・同順位・オフセット・錨の削除・錨の移動・手動・時刻なし・暦の不正。`tools/gen_geo_fixture.py`、CIで`--check`）、単体テスト、検証環境（§15.8。本番コピーで推定済みの2,162行すべてが「変更なし」） | ⑥は**P3で直すか決める**。他は決定 | [§15.2](#152-infer) |
 | **地名の enrich（T2.5）**: ①**処理は`id`順の1パス**（Pythonと同じ）。キャッシュのキーは丸めた座標なので、近い座標の行は同じキーを共有し、先に来た行がキャッシュを作る（国外の行は国内の行のキャッシュを空で上書きする）。国内外を分けて国内を後回しにする作りは、先の国内の行が後の国外の空のキャッシュに当たって空の地名で確定するので採らない（レビュー指摘。`(20.0001,130.0)`と`(19.9999,130.0)`は同じキー）。②**通信の障害は短い待ちで2回まで再試行し**（0.5秒・1秒。停止の合図で打ち切る）、**続くときは座標の種類で分ける**: 接続できない（`dns`・`connect`・`tls`）・429は座標によらない障害なのですぐ段を中断する（その座標は覚えない）。5xx・時間切れ・切断・本文が読めないは座標による場合もあるので、その座標を覚えて30分以上飛ばして**次へ進み**、**続けて3つの異なるキー（座標）**で起きたら中断する（同じ座標の写真が何枚あっても1つ。応答が返った座標で数は0に戻る）。**段全体の経過時間にも上限がある**（2分。超えたら通信が要る未確定の行を次のサイクルへ回す。失敗にはしない）。Pythonは再試行せず、障害の行を飛ばして続ける（1行8秒×最大40行）。中断しても確定した行は残る。③**片方のAPIだけ障害のときは確定しない**（Pythonはもう片方の応答だけで確定してキャッシュするので、一時的な標高の不調で`elev`が、逆ジオの不調で`place`が、空のまま永久に残る。海上の空と見分けがつかない）。標高だけの長期障害の間は、国内の未キャッシュの行が進まない（直れば欠けなく埋まる。Pythonは進むが、その間の行の`elev`は恒久的にNULL）。応答は返ったが使えない（4xx・JSONでない）ときはPythonと同じく、もう片方の応答で確定する。④**確定していない先の行は、サイクルをまたいでも追い越させない**: 座標による障害・両方の応答なし・バックオフ中・段の中断や時間の上限で止まった行があるキーは、同じキーの後の行（国外・キャッシュ・別の座標の国内）を見送る（サイクル内は`deferred`、前のサイクルから続くバックオフ中の行は枠に入れず`skipped_blocked`）。追い越すと、国外の行が空のキャッシュを作り、先の国内の行は直ったあともその空に当たって地名が空のまま永久に確定する。通信の要らない行（別のキーの国外・キャッシュ）は止まったあとも済ませる。⑤`muni.js`は、国内で通信が要る行があるときだけ取りに行き、**取れなければ（障害でも、4xxでも、表が空でも）通信が要る行を見送り段を失敗にする**。Pythonは空の表で続け、`pref`・`city`が空のまま確定する。⑥**両方のAPIの応答が使えない座標も、プロセスの中で覚えてしばらく飛ばす**（30分から倍々、12時間まで）。Pythonは毎サイクル、40件の枠を占める。⑦**通信を試した行は、確定してもしなくても0.2秒待つ**（Pythonは確定した行のあとだけ）。件数は`queried`（最初の要求を出した行。再試行の待ちで止まった行も含む）と`resolved`（うち確定した行）・`unresolved`（確定しなかった行）に分ける。⑧**`lon`がNULL・数値でない行は対象にしない**（`unusable`に数える）。Pythonは例外になり、`cycle()`は`enrich_rows`を`try`で包んでいないので、周期全体が落ちる。⑨キャッシュの値は`place`と`city`の両方を持つ辞書だけ有効、型が違う値は空文字（Pythonは`city`だけ見て、`place`が無いと例外）。⑩書き込みは`lat`・`lon`が計画のときと同じで`place`がNULLの行にだけ効く。⑪**国外は空で確定**（オフラインの逆ジオコーダは本番に入っていない。Pythonも入っていなければ同じ）。⑫応答は1 MiB、`muni.js`は8 MiBまで。時間は8秒・15秒（Pythonと同じ）。⑬`muni_table`は、国内の問い合わせが要るときだけ取る（Pythonは毎サイクルの先頭で、無ければ取りに行く）。⑭ログ・失敗の文面に座標・地名・URLを出さない。⑮**停止の合図**は、行の境界・行のあとの待ち・再試行の待ちで見る。通信が進んでいる行は、標高・キャッシュ・DBの更新まで済ませてから止まる（普通の行は1秒未満、再試行込みでは最大で約51秒）。**時間の上限**は次の要求（再試行を含む）を始める前に見る。**Pythonとの差**: Pythonは、確定しなかった国内の行と同じキーの国外の行が後に来ると、国外の行がそのキーを空で上書きするので、先の国内の行は次のサイクルで空に当たる。Rustは先の行が確定するまで後の行を見送るので、障害があっても、直ったあとは障害が無かった場合（Pythonの順）と同じ地名に収束する | 障害で誤った「確定」を作らない、枠を塞がせない、サイクルを落とさない、Pythonの処理順を守る | 位置があって`place`がNULLの行があるとき | `geo-python.json`（Pythonの`enrich_rows`に偽の地理院を流した結果と、`photos`の全列・地理院への要求の順序・`.cache.json`の`geo:`キーが一致: 国内・国外・空で確定・矩形の角・片方だけ応答・両方なし・偶数丸め・先頭の0の自治体コード・キャッシュ済み・40件・`{:.3}`の丸め・**国内外でキーが衝突する行**。`--dry-run`の`would_query`もPythonの逆ジオの要求の数と一致）、単体テスト（再試行・全体の障害と座標による障害・標高だけの長期障害・本文が読めない失敗・待ち・停止・`muni.js`の失敗・記憶・競合・`--dry-run`）、検証環境（§15.8。実際の地理院と`muni.js`で、Pythonが保存した8行の地名が一致） | なし（決定） | [§15.3](#153-enrich)・[§15.4](#154-通信の失敗の分類) |
 | **簡易品質 `quality`（T2.6）**: ①**特徴量の行はPythonが作ったものも有効として使い、Rustは新しい（または`display`・`md5`・`mtime`が変わった）写真だけを自分の算法で解析する**（全写真を解析し直さない。特徴量の表に算法の印が無いので、混在する）。②Rustの鮮明度・輝度・露出はPythonと少し違う（Pillowの`thumbnail`の`reducing_gap`による箱型の縮小を再現しない。本番コピー6,535枚で鮮明度の比の中央値1.004）。pHashは同じ作り方で、同じ写真のPythonの値との距離は最大6（12以上は0枚）。③**同じSHA-256の写真は、指標（鮮明度・露出・コントラストなど）を`id`が最小の行にそろえてから順位をつける**（Pythonは行ごと。Pythonだけが作った行では同じ値なので差は出ない。本番コピーで確認）。**pHashはそろえない**: 類似の結びつき（3分以内・距離12以下）は各行の元のpHashで決めるので、グループの顔ぶれ・`kind`・配信の抑制の規則はPythonと同じ（同じSHAの2枚のpHashがPython／Rustの算法の差で違うとき、結びつきも各行のpHashで決まる）。④失敗の行の`error`は種類だけ（Pythonは`型名: 例外の文字列`を500文字まで）。⑤`photo_quality.algorithm`は`rust-phash-v1:t3:h12`（Pythonは`poc-phash-v1:t3:h12`。再構築のたびに全行がこの値になる）。**これは特徴量の由来ではなく、その`photo_quality`を作った実装の印**で、Pythonはこの値を読まない（書き換えても特徴量を無効にしない。切り戻しは§16.10）。⑥特徴量の書き込みと`dirty`、再構築の読み書き（未解析の数・dirty・特徴量の読み取り・全差し替え）がそれぞれ1つのトランザクション（Pythonは別々）。⑦`GEOFRAME_QUALITY_PER_CYCLE`が負・小数・非数なら起動を断る（Pythonは`int()`で通し、`max(1, …)`で負を1にする）。⑧撮影時刻は`strptime`と同じ規則でASCIIの数字だけ読む（全角の数字が混じった時刻はPythonだけが読める場合がある。同じ既知の差）。⑨**混在の限界**: 特徴量の行にはPython製とRust製が混ざり、同じ画像のpHashはPythonとRustで最大6離れる（計測）。類似の判定の閾値は12なので、別の写真との距離が12の境目にいる組は、算法の差で結びつきが変わりうる（境目の保証はできない。本番コピーで無作為の300枚をRustで解析した混在では、顔ぶれが変わらなかった回（eb54361。§16.2の表）と、7枚が入れ替わった回（de90a57。§16.9の(h)）があった。完全重複の非推奨＝配信から外れる数は、測った回ではどれも93。§16.2・§16.9）。⑩Rustで作った結果をPythonへ切り戻すと、変化なしのサイクルは結果を保つが、後で`dirty`になるとPythonがRust製の特徴量を含めて再構築する。顔ぶれ・`kind`は変わらず、同じSHAの写しの指標の差から出る順位・推奨・スコアだけが変わりうる（完全重複の写しのどちらを表に出すかが入れ替わりうる。件数は同じ。スコアの変化で信頼度の並びが変わると、グループ番号`group_id`は振り直されうる。§16.10） | 全写真を解析し直すと、一括で424秒、既定の同期サイクル（25枚／10分）では約44時間かかり、グループの顔ぶれが変わる（7枚）。Pythonの行を使えば`photo_quality`もE1の件数も変わらない。他は安全側・決定性 | 取り込み済みの本番コピー・新しい写真があるとき | `quality-python.json`（合成の`photos`と合成の特徴量にPythonの`quality_cycle`・`quality_backfill`を段階的に流した結果と、特徴量・`photo_quality`・`settings`の全列が一致: 完全重複・3分と距離12の境界・推奨・順位・並び・無効化・孤児・件数制限・dirty・同じSHAでpHashが違う写真の結びつき。さらに`switchbacks`: Rust→Pythonへの切り戻し（変化なしのサイクル・dirtyでの再構築）をPython本体に流した結果。`tools/gen_quality_fixture.py`、CIで`--check`）、単体テスト、検証環境（§16.9。Rustの再構築が本番コピーの`photo_quality`559行と全列で一致、実サイクルで`.dump`不変） | ②は、Pythonの行を全部Rustで作り直す必要が出たら`geoframe quality-scan`（特徴量を消してから）で解消できる。他は決定 | [§16](#16-簡易品質p2--t26) |
-| **更新API（T3.1。E12 `setloc`・E13 `setflag`と`POST`の入口）**: ①`i64`を超える整数の`id`はRustが存在しない`id`として404（Pythonは`sqlite3`が受け取れず500）。②JSONの`NaN`・`Infinity`はRustの解析が受け付けず400（Pythonは受け付けて「範囲外」の400。状態コードは同じで文面だけ違う）。③パスの`\`を`/`に読み替えない（`/api\admin\setloc`はPythonは当たり、Rustは403）。④`setflag`は`UPDATE … RETURNING`で1回の書き込みにする（PythonはUPDATEとSELECTが別）。⑤**書き込み（writer）が無い（`GEOFRAME_INGEST=0`）ときは、入力の検査（400）のあとで書かずに503**（Pythonに無い）。⑥未知の`POST`は`/api/blog/`配下も403（Pythonも403。依頼文の「`/api/blog/`の未知は404」は`GET`の話）。 | ①②③は実装の違い。⑤はP5まで本番の書き手がPythonで、Rustは書かない設計 | 更新APIを送ったとき | `tests/update_api.rs`が基準（`tools/gen_update_fixture.py`。現行の`handlers.Handler`に135件のPOSTを順に流した状態コード・応答・`photos`の変化と一致。差は`known_differences`の5件だけ。CIで`--check`） | なし（決定） | [§17](#17-更新apit31) |
+| **更新API（T3.1。E12 `setloc`・E13 `setflag`と`POST`の入口）**: ①`i64`を超える整数の`id`はRustが存在しない`id`として404（Pythonは`sqlite3`が受け取れず500）。入力の検査（400）とwriterの確認（503）のあとで、**SQLを実行せずに**404にする（`i64::MAX`に丸めると、その`rowid`の行が実在するとき、より大きい`id`の要求が当たってしまう）。②JSONの`NaN`・`Infinity`はRustの解析が受け付けず400（Pythonは受け付けて「範囲外」の400。状態コードは同じで文面だけ違う）。③パスの`\`を`/`に読み替えない（`/api\admin\setloc`はPythonは当たり、Rustは403）。④`setflag`は`UPDATE … RETURNING`で1回の書き込みにする（PythonはUPDATEとSELECTが別）。⑤**書き込み（writer）が無い（`GEOFRAME_INGEST=0`）ときは、入力の検査（400）のあとで書かずに503**（Pythonに無い）。⑥未知の`POST`は`/api/blog/`配下も403（Pythonも403。依頼文の「`/api/blog/`の未知は404」は`GET`の話）。 ⑦**巨大・不正な`Content-Length`はaxum/hyperのHTTP層が`post.rs`より先に拒否する**（`u64`の最大値は431、それを超える値・数字でない値・負・空・`+`付き・アンダースコア入り・`N, N`・値が食い違う重複は400。Pythonは巨大なら413、`Content-Type`が違えば403、`+N`・`2_7`・最初の値が正しい重複は読んで書く）。状態コードと本文が[§17.1](#171-順序と状態コード)の表と違い、本文は定型JSONでない。**どれも書き込みは起きず、Pythonが書く入力をRustが断る向きの差だけ**（Rustが書いてPythonが断る入力は無い）。厳密な互換は求めない（[§17.1.1](#1711-http層が先に拒否する場合)）。 | ①②③⑦は実装の違い（⑦は安全側）。⑤はP5まで本番の書き手がPythonで、Rustは書かない設計 | 更新APIを送ったとき | `tests/update_api.rs`が基準（`tools/gen_update_fixture.py`。現行の`handlers.Handler`に150件のPOSTを順に流した状態コード・応答・`photos`の変化と一致。差は`known_differences`の18件だけ。CIで`--check`）。HTTP層の境界は実際のTCP接続で状態コードと接続の切断を固定（`content_length_boundaries_at_the_http_layer`） | なし（決定） | [§17](#17-更新apit31) |
 | **更新APIと同期サイクルの競合（T3.1）**: Pythonは`infer`の`UPDATE`が`WHERE id=?`だけで、計画を読んだあとに管理画面で直された位置（`manual`）を推定で上書き・取り消す。`enrich`の`UPDATE`も`WHERE id=?`だけで、地名の問い合わせ中に位置が直されると、古い座標の地名が新しい位置に書かれて`place`が埋まったまま残る（再enrichされない）。Rustは`infer`が`loc_source IS NULL OR 'inferred'`、`enrich`が`lat=? AND lon=? AND place IS NULL`の条件で守る（P2）。T3.1では`infer`の位置付けに「錨が計画のときの位置・種類のまま」の条件を足した（錨が手動で動かされたあとに古い位置を写さない） | 利用者の変更を失わない | 管理画面の操作が同期サイクルの段の途中に入ったとき | 割り込みを再現する単体テスト（§17.3） | なし（決定） | [§17.3](#173-同期サイクルとの競合) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記録は[p2-acceptance.md](p2-acceptance.md)。
@@ -1665,7 +1665,7 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 
 ## 17. 更新API（P3 / T3.1）
 
-状態: T3.1 実装済み（2026-10-25）。E12 `POST /api/admin/setloc`（手動の位置）、E13 `POST /api/admin/setflag`（お気に入り・除外）と、POST の入口（ルーティング・CSRF 対策・エラー応答）。実装は`post.rs`（入口）と`update.rs`（E12・E13）。E14 回転は T3.2、旅行ブログの保存・書き出し（E15・E16）は T3.6。T3.2・T3.6 のルートは入口の検査（403・400・413）まで通し、処理は未実装として 503 を返す。
+状態: T3.1 実装済み（2026-10-25）。E12 `POST /api/admin/setloc`（手動の位置）、E13 `POST /api/admin/setflag`（お気に入り・除外）と、POST の入口（ルーティング・CSRF 対策・エラー応答）。実装は`post.rs`（入口）と`update.rs`（E12・E13）。E14 回転は T3.2、旅行ブログの保存・書き出し（E15・E16）は T3.6。T3.2・T3.6 のルートは入口の検査（403・400・413）まで通し、処理は未実装として 503 を返す。巨大・不正な`Content-Length`はHTTP層が先に断るので、下の表の順序・状態コードどおりにならない（§17.1.1）。
 
 ### 17.1 順序と状態コード
 
@@ -1682,17 +1682,47 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 | 7 | 値がオブジェクト | JSONの400 |
 | 8 | 各ルートの処理 | `BadRequest`400・`NotFound`404・（実行中）409・writerなし503・その他500 |
 
+- **この表は`post::handle`の順序**。巨大・不正な`Content-Length`と`Transfer-Encoding`は、axum/hyperのHTTP層が4・5行目より先に断る（状態コード・本文が表と違う）。拒否の向きだけの差で書き込みは起きない（§17.1.1）。
 - CORSヘッダは一切返さない。`OPTIONS`は501のまま（§9.1の1）。`HEAD /api/…`は今のまま403（P1で決めたもの）、`GET /api/admin/setloc`などの更新ルートへのGETは未実装の503のまま（T3.3で`/api/admin/`の503が狭まる）。
 - 応答は`{"ok": false, "error": "…"}`（成功は各ルートの形）。`Content-Type: application/json; charset=utf-8`・`Cache-Control: no-store`。
 - 文面（`error`）は現行と同じ。例外・SQLiteのエラー文字列は**応答に出さない**: 500は`内部エラーが発生しました`だけで、詳細（`WriteError`のDisplay＝SQLiteのメッセージ。表名・列名まで）は`[api] <ルート> 内部エラー: …`としてログにだけ出す。成功時は何もログに出さない（座標・`id`を出さない）。アクセスログは§9.6のまま（メソッド・ルートのテンプレート・状態コード・時間）。
 - Pythonの`http.server`はHTTP/1.0で毎回接続を閉じるが、Rustは keep-alive する。本文を読まずに返す応答（403・400）の未読の本文は hyper が扱う（次の要求として解釈しない）。413だけは、Pythonと同じく**明示的に閉じる**（`Connection: close`）。
 - 本文は`axum::body::to_bytes`で宣言の長さまで読む。宣言より短く切れたら400。遅い・読まないクライアントは`limits.rs`の無通信・停滞の上限（§9.3）が切る。
 
+#### 17.1.1 HTTP層が先に拒否する場合
+
+上の表は`post::handle`が見る順序。**axum/hyperは`Content-Length`と`Transfer-Encoding`をそれより前に（ハンドラに届く前に）検査して拒否する**ので、巨大・不正な値の要求は表の4・5行目に届かず、状態コードも本文も表と違う。HTTP層の検査は変えられない（変えるには自前のHTTPパーサーが要る）ので、**厳密な互換は求めない**。理由は、どの場合も**書き込みが起きず**、Pythonが書く入力をRustが断る「拒否の向き」の差だけだから（管理者の決定）。Rustが書いてPythonが断る入力は、試験の範囲では見つからなかった。
+
+実際のTCP接続（`axum::serve`＝`serve`と同じhyper/axumのスタック。`LimitedListener`は通さない）で確かめた結果。Pythonはフィクスチャ（現行の`handlers.Handler`）の結果で、毎回接続を閉じる（HTTP/1.0）。「閉じる」は応答のあと同じ接続に`GET /healthz`を足して応答が来ないこと:
+
+| 入力（`Content-Type: application/json`。本文は有効なJSON） | Python | Rust 状態 | Rust 本文 | Rust 接続 | Rust 書き込み |
+| --- | --- | --- | --- | --- | --- |
+| `Content-Length: 65536`（本文も65536バイト） | 200 | 200 | 通常 | 保つ | する（同じ） |
+| `65537`（本文は送らない） | 413 | 413 | 定型JSON（`post.rs`。`Connection: close`） | **閉じる** | しない |
+| `18446744073709551615`（`u64`の最大値） | 413 | **431** | なし | 閉じる | しない |
+| `18446744073709551616`（`u64`を超える） | 413 | **400** | なし | 閉じる | しない |
+| 数字でない（`abc`） | 400 | 400 | なし（Pythonは定型JSON） | 閉じる | しない |
+| 数字でない＋`Content-Type: text/plain` | **403** | **400** | なし | 閉じる | しない |
+| 負（`-1`）・空 | 400 | 400 | なし | 閉じる | しない |
+| `+N`・`3_7`（Pythonの`int()`が読む形。Nは本文の長さ37） | **200（書く）** | **400** | なし | 閉じる | しない |
+| `N, N` | 400 | 400 | なし | 閉じる | しない |
+| 重複・同じ値（`N`と`N`） | 200 | 200 | 通常 | 保つ | する（同じ） |
+| 重複・最初が正しく後ろが違う（`N`と`99999`、`N`と`70000`） | **200（書く）** | **400** | なし | 閉じる | しない |
+| 重複・最初が巨大（`99999`と`N`） | 413 | 400 | なし | 閉じる | しない |
+| `Transfer-Encoding: chunked`のみ | 400（`Content-Length が必要です`） | 400（同じ文面） | 定型JSON | 保つ | しない |
+| `Transfer-Encoding: chunked`と`Content-Length` | 400（`JSONとして解釈できません`） | 400（`Content-Length が必要です`） | 定型JSON | 閉じる | しない |
+
+- 431はhyperが巨大な値に付けるもので、本文を読まずに接続を閉じる。`u64`を超える整数の400はhyperの構文エラー。どちらもhyperの版に依存するので、試験は固定した版の値を期待値にし、版を上げて変わったら落ちて気づく。
+- hyperは`Content-Length`を厳密に（ASCIIの数字だけ）読み、複数あれば**同じ値のときだけ**1つにまとめる。Pythonは`int()`で`+`・アンダースコア・前後の空白を読み、重複は最初の値だけを使う。この差が、上の「Pythonは書く・Rustは断る」の行になる。
+- `Transfer-Encoding: chunked`はhyperが`Content-Length`を外すので、`post::handle`は`Content-Length`が無いものとして400にする（Pythonはチャンクの枠も含めて`Content-Length`の長さだけ読み、JSONにならず400）。どちらも書かない。
+- 413だけは`post::handle`が返し、本文を読まず`Connection: close`で閉じる（§17.1の5行目）。ほかのHTTP層の拒否は、hyperが接続を閉じる。
+- 試験は、ポートを0で取り、実時間に頼らない（応答・EOF・リセットは即座に来る。止まれば20秒の上限で失敗にする）。
+
 ### 17.2 E12 `setloc`・E13 `setflag`
 
 `update.rs`。検査は現行の`_req_id`・`_req_coord`と同じ境界・同じ文面。
 
-- `id`: 整数で正（`bool`・文字列・小数・`null`・欠落は`id は整数で指定してください`、0以下は`id が範囲外です`）。
+- `id`: 整数で正（`bool`・文字列・小数・`null`・欠落は`id は整数で指定してください`、0以下は`id が範囲外です`）。`i64`を超える整数は入力として正しく、`lat`/`lon`（`setflag`は`favorite`/`hidden`）の検査とwriterの確認（503）のあとで、**SQLを実行せずに**`id=… は存在しません`の404（§17.5①。`rowid`が`i64::MAX`の行があっても更新しない）。
 - `lat`（-90〜90）・`lon`（-180〜180）: 数値のみ（整数も可で`float`に直す。`bool`・文字列・`null`・欠落は`… は数値で指定してください`）。閉区間。範囲外は`lat が範囲外です（-90.0〜90.0）`。検査の順は`id`→`lat`→`lon`。
 - E12が更新する列（現行の`admin_setloc`と同じ。フィクスチャで`photos`の変化を全列比較）: `lat lon`、`loc_source='manual'`、`inferred_from infer_dt_s`と`place elev muni_cd pref city`をNULL。`display`・`favorite`・`hidden`・`rotation`などには触れない。地名は`enrich`が`lat IS NOT NULL AND place IS NULL`で次のサイクルに拾い直す。`manual`は`infer`の再評価の対象外で、ほかの未解決の写真の錨になる（棚卸しS4）。応答`{ok,id,lat,lon,loc_source:'manual'}`、対象なしは404。
 - E13: `favorite`・`hidden`はJSONの`bool`だけ（`null`・数値・文字列は`… は true/false で指定してください`）。どちらも無ければ400。指定した列だけ書く。応答`{ok,id,favorite,hidden}`（更新後の両方）、対象なしは404。`favorite`→`hidden`の順に検査し、片方が不正なら何も書かない。
@@ -1720,13 +1750,14 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 
 ### 17.5 Pythonとの差（まとめ）
 
-§0の2行に同じ。①`i64`超の`id`は404（Pythonは500）。②JSONの`NaN`・`Infinity`は400（文面が違う）。③パスの`\`は読み替えず403。④`setflag`は1回の`UPDATE … RETURNING`。⑤writerが無いと503。⑥競合の守り（`infer`・`enrich`はPythonが失う）。
+§0の2行に同じ。①`i64`超の`id`は、入力の検査と writer の確認のあとで SQL を実行せずに404（Pythonは500。最大の`rowid`の行があっても更新しない）。②JSONの`NaN`・`Infinity`は400（文面が違う）。③パスの`\`は読み替えず403。④`setflag`は1回の`UPDATE … RETURNING`。⑤writerが無いと503。⑥競合の守り（`infer`・`enrich`はPythonが失う）。⑦巨大・不正な`Content-Length`はHTTP層が先に断る（§17.1.1。状態コード・本文が違うが、書き込みは起きず拒否の向きの差だけ）。
 
 ### 17.6 テスト
 
-- `tests/update_api.rs`: `tools/gen_update_fixture.py`（`app/tests/update_api_fixture.py`の135ケース）が現行`handlers.Handler`に順にPOSTした状態コード・応答のJSON・`photos`の変化（変わった行の変わった列）と、同じDBを作り直したRustのサーバーの結果が一致する。ケース: 各境界値（閉区間・範囲外・`bool`・文字列・`null`・欠落・`id` 0/負/文字列/小数）、存在しない`id`、更新する列、ルーティング（正規化・クエリ・大文字小文字・未知）、CSRFの各分岐と順序（Content-Type→Origin→Content-Length→413→JSON→オブジェクト）、64 KiBちょうどと1バイト超、BOM・不正UTF-8・末尾ゴミなど。意図した差（5件）は`known_differences`で、差が消えたら落ちる。
+- `tests/update_api.rs`: `tools/gen_update_fixture.py`（`app/tests/update_api_fixture.py`の150ケース）が現行`handlers.Handler`に順にPOSTした状態コード・応答のJSON・`photos`の変化（変わった行の変わった列）と、同じDBを作り直したRustのサーバーの結果が一致する。ケース: 各境界値（閉区間・範囲外・`bool`・文字列・`null`・欠落・`id` 0/負/文字列/小数）、存在しない`id`、更新する列、ルーティング（正規化・クエリ・大文字小文字・未知）、CSRFの各分岐と順序（Content-Type→Origin→Content-Length→413→JSON→オブジェクト）、64 KiBちょうどと1バイト超、BOM・不正UTF-8・末尾ゴミなど。意図した差（18件）は`known_differences`で、差が消えたら落ちる。HTTP層の境界（`http_*`、§17.1.1）のケースを含む。
+- 同ファイル: `content_length_boundaries_at_the_http_layer`（実際のTCP接続で§17.1.1の表の状態コード・接続の切断・書き込みの有無を固定し、Pythonの結果はフィクスチャと突き合わせる）、`an_id_beyond_i64_never_updates_the_row_with_the_largest_rowid`（`rowid`が`i64::MAX`の行があっても、それを超える`id`の`setloc`・`setflag`は404で何も書かない）。
 - 同ファイル: writerなしの503（書かない・定型文・400/403は変わらない）、Hostの検査がルートより先、`Origin`とポート、`OPTIONS`が501でCORSヘッダなし、`chunked`は400、413で接続が閉じる（keep-aliveのソケットで本文を送らずに確認）、500の本文に例外が出ない、同時の更新がすべて書かれる。
-- `src/update/tests.rs`: E12・E13の境界と文面、writerなし。`access_log.rs`: POSTのログにメソッド・ルート・状態コードと内部エラーの種類だけが出て、座標・`id`・Originの値は出ない。
+- `src/update/tests.rs`: E12・E13の境界と文面、writerなし、`i64`を超える`id`が最大の`rowid`の行を更新しない回帰。`access_log.rs`: POSTのログにメソッド・ルート・状態コードと内部エラーの種類だけが出て、座標・`id`・Originの値は出ない。
 - §17.3の割り込みの試験（`geo`・`local`・`drive`・`quality`の`tests`）。
 - `app/tests/test_update_api_fixture.py`: フィクスチャが最新であること、検査の順序、Pythonの癖の記録。
 

@@ -28,14 +28,22 @@ use crate::writer::Writer;
 
 /// 検査を通った `id`。`shown` は 404 の文面に出す元の表記。
 struct Id {
-    value: i64,
+    /// SQLite の rowid に入る値。`i64` を超える整数は `None`（SQL を実行せずに 404 にする。
+    /// `i64::MAX` に丸めると、その rowid の行が実在するとき、より大きい `id` の要求が当たってしまう）。
+    value: Option<i64>,
     shown: String,
+}
+
+impl Id {
+    fn not_found(&self) -> ApiError {
+        ApiError::NotFound(format!("id={} は存在しません", self.shown))
+    }
 }
 
 /// 現行の `_req_id`。`bool` は拒否（Python では `True` が `int` として通ってしまうため）、整数だけ、正の数だけ。
 ///
 /// 差: `i64` を超える整数は、Python では SQLite に渡せず 500 になる。Rust は存在しない `id` として 404 にする
-/// （`value` は `i64::MAX`＝行が存在しえない値）。
+/// （`value` は `None`。ほかの検査と writer の確認のあと、SQL を実行せずに 404）。
 fn req_id(payload: &Map<String, Value>) -> Result<Id, ApiError> {
     let not_int = || ApiError::BadRequest("id は整数で指定してください".into());
     let Some(Value::Number(n)) = payload.get("id") else {
@@ -46,13 +54,13 @@ fn req_id(payload: &Map<String, Value>) -> Result<Id, ApiError> {
             return Err(ApiError::BadRequest("id が範囲外です".into()));
         }
         return Ok(Id {
-            value: v,
+            value: Some(v),
             shown: v.to_string(),
         });
     }
     if n.is_u64() {
         return Ok(Id {
-            value: i64::MAX,
+            value: None,
             shown: n.to_string(),
         });
     }
@@ -88,7 +96,9 @@ pub fn set_loc(payload: &Map<String, Value>, writer: Option<&Writer>) -> Result<
     let lat = req_coord(payload, "lat", -90.0, 90.0)?;
     let lon = req_coord(payload, "lon", -180.0, 180.0)?;
     let writer = writer_or_unavailable(writer)?;
-    let pid = id.value;
+    let Some(pid) = id.value else {
+        return Err(id.not_found());
+    };
     let changed = writer.call(move |conn| {
         conn.execute(
             "UPDATE photos SET lat=?1, lon=?2, loc_source='manual',
@@ -99,10 +109,7 @@ pub fn set_loc(payload: &Map<String, Value>, writer: Option<&Writer>) -> Result<
         )
     })?;
     if changed == 0 {
-        return Err(ApiError::NotFound(format!(
-            "id={} は存在しません",
-            id.shown
-        )));
+        return Err(id.not_found());
     }
     Ok(json!({"ok": true, "id": pid, "lat": lat, "lon": lon, "loc_source": "manual"}))
 }
@@ -130,7 +137,9 @@ pub fn set_flag(payload: &Map<String, Value>, writer: Option<&Writer>) -> Result
         ));
     }
     let writer = writer_or_unavailable(writer)?;
-    let pid = id.value;
+    let Some(pid) = id.value else {
+        return Err(id.not_found());
+    };
     // 列名は上の固定の 2 つだけ（利用者の入力は値としてしか入らない）
     let assignments: Vec<String> = sets
         .iter()
@@ -151,10 +160,7 @@ pub fn set_flag(payload: &Map<String, Value>, writer: Option<&Writer>) -> Result
         .optional()
     })?;
     let Some((favorite, hidden)) = row else {
-        return Err(ApiError::NotFound(format!(
-            "id={} は存在しません",
-            id.shown
-        )));
+        return Err(id.not_found());
     };
     Ok(json!({
         "ok": true,
