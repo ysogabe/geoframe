@@ -12,13 +12,13 @@
 
 | 項目 | 結果 |
 | --- | --- |
-| §1 本番コピーでの冪等性（P2の受入の関門） | **合格。** `sync --dry-run`は全段0。複製での実サイクル2回のあと、`.dump`のSHA-256が元と一致（`57f6dcef…`） |
+| §1 本番コピーでの冪等性（P2の受入の関門） | **合格（Driveの2段を除く）。** `sync --dry-run`で、実行した段の変更は0。`index_drive`・`fetch_derivatives`は鍵が無く省略されたので**Driveの2段は未確認（鍵待ち）**。複製での実サイクル2回のあと、`.dump`のSHA-256が元と一致（`57f6dcef…`） |
 | §2 同じ写真をPythonとRustへ入れた比較 | **合格。** `photos`の全26列×21行が一致（`id`・推定・地名・`display`を含む）。品質の顔ぶれ・`kind`・グループ番号・配信から外れる数も一致。差は2つで、どちらもPythonとの既知の差で説明できた（HEICのderivativeの画素、実行時刻） |
 | §3 棚卸しのE2E | S1・S3・S7は通った（RustとPythonで同じ結果）。S2は**スタブのDriveの範囲**（本物のDriveは鍵待ち）。S4はP3 |
 | §4 miharashiでの表示の継続 | **合格。** 取り込みを有効にしたRust（複製）で、定常200枚・停止と再開300枚とも終了コード0。`compare_with_python.py`は想定外の差0 |
 | §7 検証環境の最終状態 | `ingest=0`・`/healthz` 200・本番コピーの`.dump`は配布前と一致・使い捨てのものは全部削除 |
 | 説明できなかった差 | **なし** |
-| 未実施（鍵待ち） | 本物のDrive（S2の実機・[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)の(1)〜(3)） |
+| 未実施（鍵待ち） | 本物のDrive（S2の実機・[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)の(1)〜(4)）。**本番で取り込みを有効にする前の関門**（[plan.md P5](plan.md#p5-切替pr-6)） |
 
 ## 1. 本番コピーでの冪等性（受入の関門）
 
@@ -81,7 +81,7 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 
 | 差 | 理由 | 分類 |
 | --- | --- | --- |
-| HEICのderivative1枚のバイト列（`content_sha256`も）。寸法は同じ（1600x1200）、画素の平均絶対差は0.003（64x48に縮めた輝度、0〜255）、pHash距離は0 | デコーダ・縮小フィルタ・エンコーダがPillowと違う。ICCもsRGBへ変換しない（[server.md §0](server.md)の「画像処理（T2.2）」） | 既知の差 |
+| HEICのderivative1枚のバイト列（`content_sha256`も）。寸法は同じ（1600x1200）、画素の平均絶対差は0.003（64x48に縮めた輝度、0〜255）、pHash距離は0 | デコーダ・縮小フィルタ・エンコーダがPillowと違う。ICCの扱いも違う: Rustは対応するICCで画素をsRGBへ変換し、出力にICCを付けない。Pythonは画素を変換せず、ICCを捨てる（[server.md §12.2](server.md)・[§0](server.md)の「画像処理（T2.2）」） | 既知の差 |
 | `/api/v1/photos`の`fetched_at`（ローカルのderivative・原本を作った時刻） | 実行時刻はRustとPythonで別のサイクルで書かれる。形式（`YYYY-MM-DDTHH:MM:SS`）は同じ | 実行時刻 |
 | `photo_quality.algorithm`・`analyzed_at`（比較から除いた） | 実装の印と実行時刻。Pythonは`algorithm`を読まない（[server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)） | 実行時刻・実装の印 |
 
@@ -120,6 +120,7 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 | Driveの`md5`が変わると、手動の位置が`drive_meta`かNULLに上書きされる | [server.md §14.8・§14.12](server.md#148-pythonとの差まとめ) | P3 |
 | 位置が動いたとき（推定の取り消し・変更、手動の位置）に、地名（`place elev muni_cd pref city`）を付け直すか | [server.md §15.2の5・§15.11](server.md#152-infer) | P3 |
 | S4（手動GPSと再推定の波及） | 更新API（地名検索・SAVE）がP3 | P3 |
+| 次の**一次データが消える・変わる経路**。Rustは今のPythonと同じ挙動のままで、P3で「今の仕様を残すか、守る仕様にするか」を決める（[inventory.md §2.3](inventory.md)）: ①索引からの削除（Drive・ローカルから消えた行）と`organize`で、お気に入り・除外（`hidden`）・手動の位置も行ごと消える ②Driveの更新（`md5`の変更）で回転が`0`に戻る ③削除→再追加で写真IDが変わり、旅行ブログの下書きの参照が切れる（書き出しが400） ④大量削除の保留（50件超かつDriveの行の20%超）は、意図した削除も配信に残す。保留の件数と`--allow-mass-delete`での解除方法を管理画面で知らせる案 | P3 |
 | AIワーカーが`photo_quality_features`を読む | [server.md §16.11](server.md#1611-回したもの) | P4 |
 | Rustで作った品質の結果をPythonへ切り戻す手順の試験（本番での最終確認） | [server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック) | P5 |
 | `GEOFRAME_INGEST=1`のガード（検証環境の印・Pythonの非稼働）を外し、本番の設定に`1`を足す | [server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード) | P5（切替） |
@@ -133,7 +134,7 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 | 本物のDriveでの冪等性 | 本番コピーに対する`sync --dry-run`で`index_drive`の`added`・`updated`・`removed`がほぼ0、`fetch_derivatives`の`pending`が取得待ちの総数と合うこと（§1の`index_drive`・`fetch_derivatives`の行は「省略」のまま） | §14.11の(1) |
 | 原本の形式別の成功・失敗をPythonと比べる（T2.4の受入条件①） | 使い捨ての置き場でRustとPythonが同じ原本を変換し、Rustだけが失敗する写真が0であること | §14.11の(2) |
 | 実機iPhoneのHEIC（グリッド・HDR・10ビットなど。T2.2から持ち越し） | `geoframe img-probe`で分類 | §14.11の(3) |
-| S2の実機（Driveにフォルダの写真を追加→サイクル→`loc_source='drive_meta'`・`display='derivatives/<drive_id>.jpg'`・E23が200） | 本物のDriveでの追加 | §14.11と[inventory.md §5](inventory.md)のS2 |
+| S2の実機（Driveにフォルダの写真を追加→サイクル→`loc_source='drive_meta'`・`display='derivatives/<drive_id>.jpg'`・E23が200） | **合成のJPEG**（`tools/gen_acceptance_photos.py`のa01。公開の代表点・架空の時刻）をDriveのフォルダへ足し、周期同期→行・derivative・`GET /derivatives/…`が200→もう一度の周期で変更0（終わったらDriveから消す） | §14.11の(4)と[inventory.md §5](inventory.md)のS2 |
 
 ## 7. 検証環境に加えた変更（戻した）と最終状態
 
@@ -158,7 +159,7 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 
 P2の受入（[plan.md](plan.md) P2）の、検証環境で確かめられる部分は満たした。
 
-- 本番コピーに対して、Rustの`sync --dry-run`は全段0、実サイクルを2回回しても`.dump`が元と**完全一致**。
+- 本番コピーに対して、Rustの`sync --dry-run`は、実行した段の変更が0（`index_drive`・`fetch_derivatives`の2段は鍵が無く省略。Driveの2段は未確認で鍵待ち）、実サイクルを2回回しても`.dump`が元と**完全一致**。
 - 同じ写真（GPSあり・なし、近い撮影時刻、同じバイト列、ほぼ同じ写真、HEIC、国外）を比較用PythonとRustに入れると、`photos`の全列・推定・地名・品質の顔ぶれ・`kind`・配信から外れる数が一致する。差はHEICのderivativeの画素と実行時刻だけで、既知の差で説明できる。
 - 取り込みを有効にしたRustで、miharashiの取得処理が定常・停止と再開とも続き、Pythonとの全件比較の差は0。
 - 本物のDrive（S2の実機・原本の形式別の比較・実機のHEIC）は、鍵が置かれてから管理者が行う（§6）。残り（手動GPSの扱い、地名の付け直し、本番の切替）はP3以降。

@@ -200,6 +200,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 - Rustも**`User=geoframe`で動かす**。WALのDBは読み取り専用でも`-shm`・`-wal`を触るので、ファイルの持ち主がPythonの実行ユーザーと違うと、片方が開けなくなる。`StateDirectory=geoframe`は初回起動で持ち主を揃えるが、大きなデータでは時間がかかるので、**配備の前に`chown -R geoframe:geoframe /var/lib/geoframe`を済ませておく**。
   - 検証環境の注意: 比較用Pythonの`derivatives/`は、本番のコピーの`derivatives/`への**ハードリンク**（同じ inode）。コピー側を`chown`すると、モード`0660`のファイルは比較用Pythonの実行ユーザーから読めなくなり、`/derivatives/`が404になる。`chmod o+r`で読めるようにした（出力を比べる意味を保つため）。
 - **`ReadOnlyPaths`はT2.1で縮めた**: `photos`・`blog_exports`・`travel_blog`だけを読み取り専用に残し、writerが書く`catalog.db`と`derivatives/`は外した（`-wal`/`-shm`・`tmp/`・`.cache.json`・`.ingest.lock`は元から対象外）。**`GEOFRAME_INGEST`が`0`（既定）の間はwriterが作られないので、外しても何も書かれない**。P1の検証では`catalog.db`・`derivatives/`への書き込みが`Read-only file system`になることを確かめていたが、その防御はT2.1で外した（二重書き込みの防止は`GEOFRAME_INGEST`の既定が担う）。P3で更新APIを足すとき`blog_exports`・`travel_blog`も外す。ファイルのbind mountの注意（`catalog.db`を別のinodeに置き換えたら再起動）は、`catalog.db`を`ReadOnlyPaths`から外したので、unitとしては不要になったが、開いている接続が古いファイルを指し続けることは変わらない（下の「DBファイルの入れ替え」。復元後は必ず再起動する）。
+- **`Conflicts=geoframe-server.service`（P5まで。検証環境だけ）**: ガードはPythonの非稼働を起動時に1回しか見ないので、その後にPythonが起動されたときにRustの書き込みが続かないよう、unitに付けた（§11.1.1）。
 - **取り込みのガード（P5まで）**: `GEOFRAME_INGEST=1`のとき、バイナリが起動時に`/etc/geoframe/staging`の有無と`systemctl show geoframe-server.service`を確かめる（§11.1.1。判定は`ActiveState`が`inactive`／`failed`かだけで、`LoadState`は見ない）。unitの制限下（`NoNewPrivileges`・`ProtectSystem=strict`・`SystemCallFilter=@system-service`）でも`systemctl show`は動く必要がある（`/usr/bin/systemctl`を子プロセスで起こし、systemdのD-Bus（読み取りだけ）で答えを得る）。**動かない・答えない・出力が読めないときは断る**（終了コード2。unitの`RestartPreventExitStatus=2`により再起動ループにならず`failed`で止まる）。`PrivateTmp`・`ProtectHome`は関係しない。検証環境での確認は§11.11。
 - **`MemoryDenyWriteExecute=true`を付けた**（Pythonは Pillow のC拡張が実行可能メモリへ書くので付けられない）。musl静的ビルドのRust（tokio・SQLite同梱）は、これを付けても起動・全エンドポイントの応答・スレッド生成が動いた（検証環境）。P2で画像処理（`zune-heic`・`image`・`fast_image_resize`）を入れたときに、実際のデコードで再確認する。
 - **`LimitNOFILE=4096`**。同時の接続256＋配信中のファイル32＋SQLite（読み取り5接続と`-wal`/`-shm`）＋標準入出力で300前後を使う（§9.3）ので、systemdの既定（1024）でも足りるが、余裕を持たせた。1024未満にするなら`limits.rs`の`MAX_CONNECTIONS`・`STATIC_FILE_SLOTS`もあわせて見直す。
@@ -510,8 +511,8 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 断ったときは何も書かずに**終了コード2**で終わる（`serve`は`failed`で止まり、`RestartPreventExitStatus=2`により再起動ループにならない）。メッセージは理由（印の有無・Pythonの状態名）だけで、値は含まない。通ったときは`[guard]`でinfoを1行出す。
 
-- 検査は**起動時の1回だけ**。そのあとにPythonが起動された場合は検知しない（P5までは、検証環境にPythonの本番unitは無い）。
-- `sync --dry-run`は**ガードを通さない**。行・写真・キャッシュ・ロックを書かない（SQLiteのWAL関連ファイルだけはできうる）ので、本番機でも件数を見られるようにする。読み取り専用の`serve`（`GEOFRAME_INGEST`が`0`）も同じ。
+- 検査は**起動時の1回だけ**。そのあとにPythonが起動された場合はバイナリは検知しない（P5までは、検証環境にPythonの本番unitは無い）。その補いとして、`deploy/geoframe-rs.service`に**`Conflicts=geoframe-server.service`**を付けた（検証環境だけで使う unit。Pythonが起動されるとsystemdがRustを止め、Rustを起動するとPythonを止める。`geoframe-server.service`が無い機体では何も起きない）。バイナリを直接起動した場合（systemd配下でない）には効かない。P5の切替でこの行をどうするかは[plan.md P5](plan.md#p5-切替pr-6)の「ガードを外す」の5。
+- `sync --dry-run`は**ガードを通さない**。行・写真・キャッシュ・ロックを書かない（SQLiteのWAL関連ファイルだけはできうる）ので、ガードは要らない。**ただし「本番機で実行してよい」という意味ではない**: 対象は検証環境の本番コピー（そのバックアップのコピー）だけで、本番の`catalog.db`には向けない（[plan.md §2](plan.md#2-守ること本番機の扱い)。dry-runでもWAL関連ファイルができ、鍵があればDriveに接続する）。読み取り専用の`serve`（`GEOFRAME_INGEST`が`0`）も同じ。
 - **試験用の差し替えは、デバッグビルドだけ**: `GEOFRAME_TEST_STAGING_MARKER`（印のパス）と`GEOFRAME_TEST_PYTHON_STATE`（`<LoadState>/<ActiveState>`。`unavailable`は取得失敗）。`#[cfg(debug_assertions)]`の内側にあるので、配布するリリースビルド（musl）にはコードが無く、環境変数は無視される。差し替えても「印が要る」ことは外れない（指した先に通常ファイルが無ければ断る）。
 - **P5で外す**手順は[plan.md P5](plan.md#p5-切替pr-6)。外すときに消すもの: `guard.rs`と`lib.rs`の`pub mod guard`、`ingest::start`の`start_with`／`guard.check()`、`IngestError::Refused`と`cli.rs`の`exit_for_ingest_error`、`tests/ingest_cli.rs`の`Staging`と`GEOFRAME_TEST_*`、`USAGE`・本節・§0の行・§6の項・`deploy/README.md §7.1`・`deploy/geoframe-rs.service`の記述。
 
@@ -535,7 +536,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 #### `--dry-run`
 
-`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、実DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。**段に渡す読み取り用の接続`ctx.read`は、実DBのメモリ上の写し**（`sync::simulation_copy`。SQLiteのバックアップAPIで作る。`rusqlite`の`backup`機能を足した）で、先の段が自分の計画を写しに適用する（`index_local`が追加・更新・削除を、`infer`が推定・取り消しを、`local_derivatives`が`display`を、実行と同じ書き込み関数で写しに書く。`enrich`は地理院に問い合わせないので、写しには書かず件数だけを数える）。後の段は「先の段が済んだあと」の状態で件数を数え、最後の`写真: 表示可能／取得待ち／全`も同じ状態の見込みになる（T2.3の再レビューの指摘。以前は後続の段が索引前の行を見て、新しい写真を数え落とした）。写しの大きさはDBと同じ（検証環境の本番コピーで約85 MiB。`sync --dry-run`は0.3秒ほどで終わる）で、dry-runのときだけ作る。**写しの間だけ`ctx.read`の元の接続で読み取りトランザクションを持ち、スナップショットを固定する**（バックアップは元が更新されると最初からやり直すので、更新の多いDBで終わらなくなるのを防ぐ。WALなら書き手を止めず、書き手の更新は写しに入らない。ロールバックジャーナルのDBでは写しの間だけ書き手が待つ）。さらに**30秒の期限**（`sync::COPY_DEADLINE`。本番相当で0.3秒の約100倍）を付け、ロックで進めない間は20 ms間隔で繰り返し、超えたら`geoframe: DB のメモリ上の写しを作れません: …`で終了コード1にする（`busy_timeout`の分までは超えうる）。**行・写真・キャッシュ・ロック・`tmp/`・`derivatives/`は変えないが、SQLiteが読み取りでも作る`catalog.db-wal`・`catalog.db-shm`は新しくできうる**（WALのDBを開くとできる。中身は書かれない。ヘルプ（`USAGE`）と起動の1行目にも書いてある）。**ガード（§11.1.1）は通さない**: 書かないので、本番機でも件数を見られるようにしてある。出すもの:
+`geoframe sync --dry-run [--data-dir <dir>]`は、**書かずに「何をするか」の件数だけを出す**。書き込み接続を作らない（`ctx.writer`が`None`）ので、実DBへの書き込みは構造的に起きない。キャッシュは凍結して読むだけ。**段に渡す読み取り用の接続`ctx.read`は、実DBのメモリ上の写し**（`sync::simulation_copy`。SQLiteのバックアップAPIで作る。`rusqlite`の`backup`機能を足した）で、先の段が自分の計画を写しに適用する（`index_local`が追加・更新・削除を、`infer`が推定・取り消しを、`local_derivatives`が`display`を、実行と同じ書き込み関数で写しに書く。`enrich`は地理院に問い合わせないので、写しには書かず件数だけを数える）。後の段は「先の段が済んだあと」の状態で件数を数え、最後の`写真: 表示可能／取得待ち／全`も同じ状態の見込みになる（T2.3の再レビューの指摘。以前は後続の段が索引前の行を見て、新しい写真を数え落とした）。写しの大きさはDBと同じ（検証環境の本番コピーで約85 MiB。`sync --dry-run`は0.3秒ほどで終わる）で、dry-runのときだけ作る。**写しの間だけ`ctx.read`の元の接続で読み取りトランザクションを持ち、スナップショットを固定する**（バックアップは元が更新されると最初からやり直すので、更新の多いDBで終わらなくなるのを防ぐ。WALなら書き手を止めず、書き手の更新は写しに入らない。ロールバックジャーナルのDBでは写しの間だけ書き手が待つ）。さらに**30秒の期限**（`sync::COPY_DEADLINE`。本番相当で0.3秒の約100倍）を付け、ロックで進めない間は20 ms間隔で繰り返し、超えたら`geoframe: DB のメモリ上の写しを作れません: …`で終了コード1にする（`busy_timeout`の分までは超えうる）。**行・写真・キャッシュ・ロック・`tmp/`・`derivatives/`は変えないが、SQLiteが読み取りでも作る`catalog.db-wal`・`catalog.db-shm`は新しくできうる**（WALのDBを開くとできる。中身は書かれない。ヘルプ（`USAGE`）と起動の1行目にも書いてある）。**ガード（§11.1.1）は通さない**: 書かないからで、本番機で実行してよいという意味ではない。向ける先は検証環境の本番コピー（そのバックアップのコピー）で、本番の`catalog.db`には向けない（[plan.md §2](plan.md#2-守ること本番機の扱い)。WAL関連ファイルができ、鍵があればDriveに接続する）。出すもの:
 
 ```
 dry-run: 何も書きません（行・ファイル・キャッシュ・ロックは変えません。SQLite の WAL 関連ファイルだけはできうります）
@@ -652,6 +653,13 @@ n100でビルドしたmusl静的バイナリ（`static-pie linked`、`ldd`は`st
 | (b) 取り込み中の`serve`に`sync`（実行）を起動 | `別の geoframe が取り込み中です`で終了コード1（ロックは`serve`が持ち続けている） |
 | (c) 停止・再起動 | `systemctl stop`は約0.1秒で`inactive`、ログは`停止しました`。`start`・`restart`とも`active`で、`ERROR`／`WARN`は0件。`.dump`のSHA-256は変わらない |
 | 後片付け | drop-inを外して`ingest=0`（`取り込みは無効です`）に戻し、`/healthz`は200、`.dump`のSHA-256は配布前と一致 |
+
+**レビュー（全体）の指摘への対応後（`Conflicts=`）。** unitに`Conflicts=geoframe-server.service`を足して`deploy/rust-deploy.sh`で配布した。
+
+| 確認 | 結果 |
+| --- | --- |
+| `systemctl show geoframe-rs -p Conflicts` | `Conflicts=geoframe-server.service shutdown.target`（`shutdown.target`はsystemdが既定で足す）。`geoframe-server.service`は未導入（`LoadState=not-found`・`ActiveState=inactive`）のままで、`geoframe-rs`は`active`で起動した |
+| 起動のログ・`GET /healthz` | `取り込みは無効です（DB に書きません）`（`ingest=0`）。200 |
 
 ## 12. 画像処理（P2 / T2.2）
 
@@ -964,7 +972,7 @@ musl静的バイナリを`deploy/rust-deploy.sh`で配布して確かめた。�
 | (c) `GEOFRAME_INGEST=1`の`sync`1回目・2回目 | 1回目は`added=15`、`local_derivatives`は`original=8`（位置のあるJPEG）。**2回目は`added=0 updated=0 removed=0`、`made=0`**。`.dump`の差分は**15行（すべて`source='local'`の`INSERT`）で、ほかの表・行の差は0**。Driveの6,535行の中身（`SELECT *`のSHA-256）は変わらない |
 | (d) 比較用Python（`geoframe-pyref`、別データ）との比較 | pyrefを止めて（DBは検証環境の中でバックアップ）、同じ木をpyrefの置き場に置き、pyrefのvenv（Python 3.12.3・Pillow 13.0.0・pillow-heif 1.8.1）の`index_local`・`local_derivatives`を通し、`photos`の`source='local'`の行をRustの行（壊れたGPSの1枚を除く）と**`id`の並び順・`path name mtime taken_at lat lon loc_source display …`の全列まで比べた: 14行すべて一致**（`indexed_at`・`fetched_at`は形式まで一致）。続けて変化の操作（更新・削除・追加）を流して、もう一度比べて**14行すべて一致**。HEICに位置を与えたときのderivativeの名前も同じ（`local_<md5>.jpg`、64x48のJPEG） |
 | (e) `organize` | `INGEST`なしは終了コード2。`--dry-run`は`targets=5 held_back_until_infer=2`。実行で5枚を`_excluded/no_gps/`へ移して行を削除（`moved=5 failed=0`）。もう一度動かすと`targets=0`。時刻つきで錨がある2枚は残った |
-| (f) `.part`の掃除 | `derivatives/`に書きかけの`.part`1つと、`.part`という名前のシンボリックリンク1つ（リンク先は別の場所の一時ファイル）を置いた。`--dry-run`は`消す書きかけの .part 1 件`（リンクは数えない）。`sync`が1件削除し、リンク先の別の場所の一時ファイルの中身は無傷（検証環境の`derivatives/`は`hermes`から読めないので、リンク自体が残ることは直接見ていない。単体テスト`sweep_does_not_follow_or_remove_links`が確かめる） |
+| (f) `.part`の掃除 | `derivatives/`に書きかけの`.part`1つと、`.part`という名前のシンボリックリンク1つ（リンク先は別の場所の一時ファイル）を置いた。`--dry-run`は`消す書きかけの .part 1 件`（リンクは数えない）。`sync`が1件削除し、リンク先の別の場所の一時ファイルの中身は無傷（検証環境の`derivatives/`は作業用のユーザーから読めないので、リンク自体が残ることは直接見ていない。単体テスト`sweep_does_not_follow_or_remove_links`が確かめる） |
 | (g) unitの制限下（`NoNewPrivileges`・`ProtectSystem=strict`・`ReadOnlyPaths`に`photos`・`MemoryDenyWriteExecute`）で`GEOFRAME_INGEST=1`のdrop-inで起動 | 起動時のサイクルが通り（`index_local`が`photos`が読み取り専用でも走査できる。置き場の`mkdir`は`AlreadyExists`で済む）、写真を1枚足して再起動すると`added=1`・`original=1`。`/api/v1/photos`は3,065＋合成のぶん増え、`/photos/<名前>`は200 |
 | 後片付け | 合成の写真・`_excluded`・`derivatives/local_*.jpg`・Rustが足した`source='local'`の行を消し、drop-inを外して`ingest=0`（`取り込みは無効です`）に戻した。**`.dump`のSHA-256は配布前のコピーと一致**。`/healthz`は200。比較用Pythonは、DBを変更前のバックアップと同じ内容に戻して（`.dump`が一致）起動し直した。検証環境の中に作ったバックアップは確認後に削除した |
 
@@ -1139,7 +1147,7 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 ### 14.7 ログ・`--dry-run`
 
 - ログ・件数に出すのは件数・状態名・写真の`id`・HTTPステータス・固定の語だけ。Driveのファイル名・フォルダ名・フォルダID・座標・撮影日時・鍵・トークンは出さない（テスト`log_lines_never_contain_names_keys_tokens_or_urls`が段の結果の文面を、`the_actual_log_output_never_contains_names_coordinates_times_keys_or_tokens`が**実際の`tracing`の出力**（全レベル。索引・取得・再試行・保留の警告・鍵の権限の警告・原本の削除の失敗・トークンの取り直しを通す）を捕まえて、スタブの合成の名前・座標・撮影時刻・トークン・鍵・URL・メール・フォルダ名・Drive IDが入らないことを確かめる）。`RemoteFile`・`Listing`・`Entry`・`Op`・`DrivePlan`の`Debug`は手書きで、件数と有無だけを出す（`{:?}`・パニックの表示・試験の失敗の表示からも漏れない。`derived_debug_output_hides_names_times_and_locations`）。
-- `sync --dry-run`の`index_drive`は、鍵があれば**Driveの一覧を読みに接続する**（読み取りのスコープ。原本のダウンロードも書き込みもしない）。**ガードは通さない**（§11.1.1）ので、鍵のある機体なら本番機でも一覧を読みに行く。`--help`と`--dry-run`の1行目にも書いてある。**通信を避けたいときは、存在しない鍵ファイルの絶対パスを`GEOFRAME_DRIVE_KEY`に明示する**（例: `GEOFRAME_DRIVE_KEY=/nonexistent/drive_key.json geoframe sync --dry-run`。鍵が無ければDriveの2段は通信せずに`省略`になる）。`--data-dir`を変えても鍵の設定は変わらないので、鍵のある機体では接続する。`GEOFRAME_DRIVE_KEY`を空文字にしても、既定の`drive_key.json`（カレントディレクトリ基準）に戻るだけで、通信を避けられない。
+- `sync --dry-run`の`index_drive`は、鍵があれば**Driveの一覧を読みに接続する**（読み取りのスコープ。原本のダウンロードも書き込みもしない）。**ガードは通さない**（§11.1.1）ので、鍵のある機体では一覧を読みに行く（だから本番機では実行しない。検証環境の本番コピーに向ける）。`--help`と`--dry-run`の1行目にも書いてある。**通信を避けたいときは、存在しない鍵ファイルの絶対パスを`GEOFRAME_DRIVE_KEY`に明示する**（例: `GEOFRAME_DRIVE_KEY=/nonexistent/drive_key.json geoframe sync --dry-run`。鍵が無ければDriveの2段は通信せずに`省略`になる）。`--data-dir`を変えても鍵の設定は変わらないので、鍵のある機体では接続する。`GEOFRAME_DRIVE_KEY`を空文字にしても、既定の`drive_key.json`（カレントディレクトリ基準）に戻るだけで、通信を避けられない。
 
 ### 14.8 Pythonとの差（まとめ）
 
@@ -1248,10 +1256,28 @@ sudo rm -rf $D
 
 各行は連番と`ok format=Heic in=… out=… exif_orientation=… icc=…`、または`error heicをデコードできません（…）構造: brand=… primary=grid codec=hevc profile=… bit_depth=… chroma=… colr=… aux=gainmap items=…`。最後の`summary files=… ok=… failed=…`で件数を見る。**読めない形式（`error`）が出たら**、構造の行（ファイル名は含まれない）と`ok`のものの寸法を記録して、`zune-heic`が読めない形式かどうかを判断する（読めなければPoCの`libheif-rs`の経路を足す。[build.md §6](build.md)）。
 
+**(4) 実DriveでのS2（合成のJPEGをDriveのフォルダに足す）。** 本番の取り込みを有効にする前に済ませる関門の一つ（[plan.md P5](plan.md#p5-切替pr-6)）。(1)〜(3)と同じ検証環境で、本番コピーの**複製**（使い捨ての置き場）に対して行い、本番コピーそのものには書かない。合成のJPEGは実写真ではない（`tools/gen_acceptance_photos.py`の`a01`。公開の代表点（東京駅）・架空の撮影時刻・ファイル名は連番）。
+
+```
+S=/var/tmp/gf-t24-s2; sudo install -d -o geoframe -g geoframe -m 0700 $S $S/photos
+sudo -u geoframe sqlite3 /var/lib/geoframe/catalog.db ".backup $S/catalog.db"
+G=$(mktemp -d); python3 tools/gen_acceptance_photos.py $G   # a01.jpg が合成のJPEG。他は使わない
+```
+
+1. **足す前の確認。** `$ENV GEOFRAME_DATA_DIR=$S /usr/local/bin/geoframe sync --dry-run`で`index_drive`の`added`・`updated`・`removed`がほぼ0であること（(1)が済んでいること）。`SELECT COUNT(*) FROM photos`を控える。
+2. **Driveへ足す。** 管理者がDriveのweb画面から、`$G/a01.jpg`をDriveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）へアップロードする（`drive.readonly`の鍵では書けない）。
+3. **周期同期を1回。** `$ENV GEOFRAME_INGEST=1 GEOFRAME_DATA_DIR=$S /usr/local/bin/geoframe sync`で、`index_drive`の`added=1`と`fetch_derivatives`の`fetched=1`（`ok_jpeg=1`）になること。確認:
+   `sudo -u geoframe sqlite3 -readonly $S/catalog.db "SELECT source, loc_source, display, lat IS NOT NULL FROM photos WHERE id > <控えた最大のid>"`が`drive`・`drive_meta`・`derivatives/<drive_id>.jpg`・`1`（`display`の`<drive_id>`はDriveのファイルID）であること。
+4. **配信を確かめる。** `$ENV GEOFRAME_DATA_DIR=$S GEOFRAME_INGEST=0 /usr/local/bin/geoframe serve --listen 127.0.0.1:8099`を前面で起動し（別の端末で）`curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8099/derivatives/<drive_id>.jpg`が200（`Host`検査に通る名前で。`GET /api/v1/photos`の件数が1増える）、終わったら止める。
+5. **もう一度の周期で変更0。** もう一度`sync`（または`sync --dry-run`）で、`index_drive`の`added`・`updated`・`removed`と`fetch_derivatives`の`pending`・`fetched`が0であること。
+6. **後片付け。** Driveのフォルダから合成のJPEGを削除する（ゴミ箱へ。以後の(1)の件数に影響しない）。`sudo rm -rf $S "$G"`（変換後の画像・複製のDBを含む）。
+
+結果は件数と合否だけを記録する（ファイル名・ファイルID・座標は書かない）。
+
 ### 14.12 T2.5・T2.7へ回したもの
 
 - **T2.5（実施済み。§15）**: `infer`段（位置の推定）。`index_drive`が`display`をNULLに戻す（md5の変更）ことと推定は独立で、`infer`は錨の選び方に`display`を使わない（錨になるのは`loc_source`が`exif`・`drive_meta`・`manual`で時刻が読める写真だけ）。`infer`が`display`をNULLにするのは、推定を取り消す行だけ（[inventory.md §2.3](inventory.md)）。
-- **T2.7（実施済み。[p2-acceptance.md](p2-acceptance.md)。ただし§14.11の(1)〜(3)の本物のDriveでの確認は鍵待ち）**: 本番コピーでの`--dry-run`（§14.11の(1)の鍵なし部分）と実サイクル、同じ写真を比較用PythonとRustへ入れた`photos`の列ごとの比較、棚卸しS2の実機確認、結果の`p2-acceptance.md`への記録。**§14.11の(2)・(3)が受入条件①の実機での確認**。
+- **T2.7（実施済み。[p2-acceptance.md](p2-acceptance.md)。ただし§14.11の(1)〜(4)の本物のDriveでの確認は鍵待ち。本番で取り込みを有効にする前の関門）**: 本番コピーでの`--dry-run`（§14.11の(1)の鍵なし部分）と実サイクル、同じ写真を比較用PythonとRustへ入れた`photos`の列ごとの比較、棚卸しS2の実機確認、結果の`p2-acceptance.md`への記録。**§14.11の(2)・(3)が受入条件①の実機での確認**。
 - **P3**: md5の変更で手動の位置を上書きする挙動（§0）を直すか決める。直すなら`loc_source='manual'`の行は`lat lon loc_source`を更新せず`display`だけをNULLにする、などの選択肢がある（§13.10と同じ）。
 
 ### 14.13 レビュー（2026-10-25）の指摘への対応
@@ -1374,7 +1400,7 @@ T2.4の`net.rs`の`Failure`（§14.3の表）に合わせる。`Failure::is_outa
 ### 15.5 `--dry-run`とログ
 
 - `infer`: 全部オフラインで計算でき、計画をメモリ上の写しに当てる（後続の段は推定後の状態を見る）。件数は`anchors targets inferred updated unchanged cancelled untimed`。取り込み済みの本番コピーで`inferred updated cancelled`が0に近いことが、P2の受入の一部（§15.8）。
-- `enrich`: **地理院に問い合わせない**（本番機でも`--dry-run`を回すことがあるので）。40件を、国外・キャッシュで済む・問い合わせるはず（`would_query`）に分けて数える。**実行と同じ`id`順で、書くはずのキャッシュを模擬する**（国外の行が空で上書きするキー、問い合わせるはずの行が作るキーは、あとの行にとってキャッシュにある。同じキーの2件目以降は`cache_hit`）。`photos`の写しには書かない（後続の段が地名を使わない）。`.cache.json`は凍結されていて何も書かれない。バックオフ中の行とそのキーの後の行を枠から外す選び方は実行と同じ（`skipped_backoff`・`skipped_blocked`。ただし`--dry-run`は別のプロセスなのでふつうは記憶が空）。`queried resolved deferred out_of_time`の代わりに`would_query`が出る。件数は、障害が無ければ実行の`queried`と一致し、`geo-python.json`ではPythonの逆ジオの要求の数と一致する。
+- `enrich`: **地理院に問い合わせない**（検証環境の本番コピーに`--dry-run`を回しても、外へ通信しないように）。40件を、国外・キャッシュで済む・問い合わせるはず（`would_query`）に分けて数える。**実行と同じ`id`順で、書くはずのキャッシュを模擬する**（国外の行が空で上書きするキー、問い合わせるはずの行が作るキーは、あとの行にとってキャッシュにある。同じキーの2件目以降は`cache_hit`）。`photos`の写しには書かない（後続の段が地名を使わない）。`.cache.json`は凍結されていて何も書かれない。バックオフ中の行とそのキーの後の行を枠から外す選び方は実行と同じ（`skipped_backoff`・`skipped_blocked`。ただし`--dry-run`は別のプロセスなのでふつうは記憶が空）。`queried resolved deferred out_of_time`の代わりに`would_query`が出る。件数は、障害が無ければ実行の`queried`と一致し、`geo-python.json`ではPythonの逆ジオの要求の数と一致する。
 - **停止の境界**: 停止の合図は、行と行のあいだ・行のあとの待ち・再試行の待ちで見る。**通信が進んでいる行は、逆ジオ・標高・キャッシュ・DBの更新まで済ませてから止まる**（要求の途中で捨てても片方の応答が残るだけで、得るものが無い。普通の行は1秒未満、再試行込みでは最大で約51秒＝§15.4）。再試行の待ちの途中で止まったときは、その行は確定せず、覚えもせずに戻る（次のサイクルで待たずに試す）。通信は試したので`queried`と`unresolved`に数える。段の時間の上限（§15.4）は停止の合図と違い、次の要求を始める前に見る。
 - ログに出すのは件数と固定の語だけ。座標・地名・撮影時刻・URLは出さない。通信の失敗は種類（`dns`・`http 503`など）だけ。
 

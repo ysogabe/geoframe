@@ -84,6 +84,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 
 - 手動修正などの更新APIをwriterの上に追加する（writer自体はP2で入っている）。手動GPS、お気に入り、除外、回転、地名検索（地理院→Nominatim）、地図タイルのプロキシ、旅行ブログ（下書き・書き出し）、AI検索の画面。更新APIのCSRF対策（JSON必須・Origin検査・本文上限）を現行どおり。
 - 受入: 検証環境で管理画面の全操作を行い、変更がDBに残ること。
+- **一次データが消える・変わる経路を、今の仕様のまま残すか守る仕様にするかを決める**（[inventory.md §2.3](inventory.md)・[p2-acceptance.md §5](p2-acceptance.md)。P2のRustは今のPythonと同じ挙動）: ①mtime/md5の変更での手動GPSの上書きと、位置が動いたときの地名の付け直し ②索引からの削除・`organize`によるお気に入り・除外（`hidden`）・手動の位置の消失 ③Driveの更新（md5の変更）での回転のリセット ④削除→再追加による写真IDの変化と旅行ブログの参照の断絶 ⑤大量削除の保留が意図した削除も配信に残すこと（保留の件数と`--allow-mass-delete`での解除方法を管理画面で知らせる案）。
 
 ### P4: AI Providerとジョブ（PR 5）
 
@@ -97,11 +98,13 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - **ロールバック（Rust→Python）での簡易品質**（[server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)。試験は`tools/gen_quality_fixture.py`の`switchbacks`）: ①`photo_quality.algorithm`は特徴量の由来ではなく結果を作った実装の印で、Pythonは読まない（書き換えは不要・無意味）。②切り戻した直後はPythonの変化なしのサイクルがRustの`photo_quality`をそのまま保つので、配信は変わらない。③後で`dirty`になると、PythonがRust製の特徴量を含めて全行を再構築する。**グループの顔ぶれ・`kind`と`/api/v1/photos`の件数は変わらず**、同じSHAの写しの指標の差から出る順位・推奨・スコア（とそれによる`group_id`の振り直し）だけが変わりうる（完全重複の写しのうち表に出る方が入れ替わることがある）。④Pythonだけで解析した結果に戻したいときは、切り戻す前にRustが解析した特徴量の行（`analyzed_at`がRustへの切替の日時以降）を消し、Pythonに解析し直させる。これはRustの結果を保つ方法ではなく、Rustの別算法のpHashで結びついていた組が離れて、グループの顔ぶれ・`kind`・配信件数が変わりうる（試験`bridge_by_copy`）。演習では、③の場合は件数・行数・グループ数が変わらないこと、④の場合は解析し直しのあとの件数・行数・グループ数を記録することを手順に入れる。
 - `deploy/`の手順・unit・READMEをRust用に改め、PythonのCIと依存を外す。Python実装の削除は切替後に安定を確かめてから。
 - 本番の切替は**ユーザーの立ち会いのもとで**行う。
+- **本番で取り込みを有効にする前に済ませる、P2から持ち越した未完の項目**（鍵が置かれてから管理者が検証環境で行う。手順は[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)、記録は[p2-acceptance.md §6](p2-acceptance.md)）。**これが済むまで本番の取り込みを有効にしない**: ①実Driveの一覧での冪等性（`sync --dry-run`で変更・取得予定がほぼ0）②同じ原本でのPython／Rustの形式別の成功・失敗の比較（Rustだけが失敗する写真が0）③実機iPhoneのHEICの確認（`img-probe`）④実DriveでのS2（合成のJPEGをDriveのフォルダに足す→周期同期→`loc_source='drive_meta'`・derivative・`GET /derivatives/…`が200→もう一度の周期で変更0）。
 - **取り込みのガードを外す**（T2.1で入れた暫定。[server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード)）。P2〜P4の間、`GEOFRAME_INGEST=1`の`serve`・`sync`は、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できないと、書き込みの前に終了コード2で断る。本番機には印が無いので、**このガードを外さない限り、本番でRustは取り込みを始められない**。切替の手順で次をこの順に行う:
   1. 本番で`geoframe-server`を止めて`disable`し、停止を確認する（`systemctl is-active`が`inactive`）。Pythonの書き込みが無いことの担保は、ガードではなくこの手順が持つ。ガードは`LoadState`を見ず`ActiveState`だけで判定する（unitファイルを消しても動いているサービスは止まらない）ので、**止める前にunitファイルを消さない**（消すなら停止の確認のあと）。
   2. コードからガードを外す（またはガードの印を本番用に置き換え、`GEOFRAME_INGEST=1`に加えて明示のフラグを要る形にする）。消すもの: `guard.rs`・`lib.rs`の`pub mod guard`・`ingest::start`の`guard.check()`（`start_with`）・`IngestError::Refused`と`cli.rs`の`exit_for_ingest_error`・`tests/ingest_cli.rs`の`Staging`と`GEOFRAME_TEST_*`・ガードのテスト。残った箇所は`grep -rn "guard\|検証環境の印\|GEOFRAME_TEST_" crates deploy docs`で探す。
   3. 文書を直す: server.md（§0の索引の行・§6の項・§11.1.1・§11.9）、`deploy/README.md §7.1`、`deploy/geoframe-rs.service`と`rust-deploy.sh`の説明、`USAGE`。
   4. 検証環境と同じバイナリで、本番のコピーを使った通しの演習を済ませてから本番へ入れる。
+  5. `deploy/geoframe-rs.service`の`Conflicts=geoframe-server.service`（検証環境で足した。Pythonが起動されるとsystemdがRustを止める。ガードが起動時の1回しかPythonの停止を確かめない弱さの補い）の扱いを決める。ガードを外しても、この行は本番でRustとPythonが同時に書くのを防ぐ装置として**残すのが既定**（ロールバックでPythonを`start`するとRustが止まる。再切替でRustを`start`するとPythonが止まる）。ロールバックと再切替の演習で、止まる向きが手順と合うことを確かめてから決める。
 
 ## 5. 受入条件とフェーズの対応
 

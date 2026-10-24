@@ -149,6 +149,9 @@ Rustでも意識して残すか、直すかを決める必要がある。
 | 推定の錨が消えた後のDrive写真 | `display=NULL` になったDrive写真は `fetch_derivatives`（`source='drive' AND display IS NULL`）が取り直し、`fetched_at` が新しくなる。表示側（E1の新着ブースト）で**新着扱いになり直す** | `geo.py:infer_locations`、`drive.py:fetch_derivatives` |
 | 写真の行が消える／idが変わる | 旅行ブログの下書きは画像を `photo_id` で参照する（`travel_blog.py:319` 付近）。行が消えるか再追加で別idになると、下書きの参照が切れる（書き出し時に `_photo_source` が400） | `travel_blog.py` |
 | `manual` | 再推定の対象外（`loc_source IS NULL OR 'inferred'` のみ再評価）。ほかの未解決写真の錨になる | `geo.py:infer_locations` |
+| 大量削除の保留（Rustで足した保護。T2.4） | 消す行が50件超かつDriveの行の20%超、または一覧が空のときは、削除を保留する。**意図した削除も配信に残る**（`geoframe sync --allow-mass-delete`の1回だけで外れ、`serve`の定期実行では外せない） | `drive/`（Rust） |
+
+**P3で決めること**（Rustは今のPythonと同じ挙動のままで、P3の更新APIと一緒に「今の仕様を残すか、守る仕様にするか」を決める）: ①mtime/md5の変更での手動GPSの上書きと、位置が動いたときの地名の付け直し ②索引からの削除・`--organize`でお気に入り・除外（`hidden`）・手動の位置が行ごと消えること ③Driveの更新（md5の変更）で`rotation`が0に戻ること ④削除→再追加で写真IDが変わり、旅行ブログの下書きの参照が切れること ⑤大量削除の保留が意図した削除も配信に残すこと（保留の件数と解除方法を管理画面で知らせる案）。
 
 ### 2.3b DB外のデータ（`DATA_DIR` ほか）
 

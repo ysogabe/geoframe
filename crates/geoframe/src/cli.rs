@@ -89,6 +89,8 @@ const USAGE: &str = "\
                                         Drive の一覧が空、または消す行が多すぎる（50 件超かつ Drive の行の 20% 超）ときは
                                         削除を保留する。意図した削除なら --allow-mass-delete を付けた 1 回だけで外す
                                         （serve の定期実行では外せない。--dry-run と併せれば、外した場合の件数を見られる）。
+                                        --dry-run はガードを通さないが、本番機で実行してよいという意味ではない
+                                        （検証環境の本番コピーに向ける。本番の DB には向けない）。
                                         書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ印・Python の確認を通す
   geoframe organize [--dry-run] [--data-dir <dir>]
                                         位置の無いローカル写真を DATA_DIR/_excluded/no_gps/ へ移し、行を削除する

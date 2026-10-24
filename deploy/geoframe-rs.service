@@ -10,6 +10,14 @@ Wants=network-online.target
 # P1〜P4 は検証環境専用で、本番の切替は P5（docs/rust-migration/plan.md）。
 # 本番機にはこの unit を入れない。Python 版と同じ待ち受けポート・データ置き場が既定なので、
 # 同じ機体で並走させるときは待ち受けとデータ置き場を分ける（deploy/README.md）。
+#
+# Conflicts= は検証環境だけの安全装置（この unit 自体が検証環境専用）。取り込みのガード
+# （docs/rust-migration/server.md §11.1.1）は Python が止まっていることを起動時に 1 回しか確かめない
+# ので、その後に geoframe-server.service が起動されても、Rust が書き込み続けて二重に書くことが
+# ないよう、systemd に「Python を起動したら Rust を止める（Rust を起動したら Python を止める）」
+# 関係を持たせる。geoframe-server.service が無い機体（検証環境）では何も起きない。
+# P5 の切替でこの行をどうするかは docs/rust-migration/plan.md P5 の「ガードを外す手順」の 5。
+Conflicts=geoframe-server.service
 
 [Service]
 Type=simple
