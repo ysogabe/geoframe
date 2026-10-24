@@ -2,6 +2,10 @@
 
 docs/architecture/photo-feed-contract.md に書いたフィールドと配信パスが変わったら、
 ここで落ちるようにする。契約を変えるときは miharashi 側の読み取りも合わせて直すこと。
+
+応答の形は docs/architecture/photo-feed.schema.json にも定め、Rust側（crates/geoframe/tests）と
+同じSchemaで検査する。Rustの契約テストが読むフィクスチャは、ここで現行実装から再生成して
+差がないことを確かめる（再生成: python3 tools/gen_photo_feed_fixture.py）。
 """
 import http.client
 import json
@@ -13,6 +17,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from geoframe import handlers, photos
+
+from tests import mini_jsonschema, photo_feed_fixture
 
 # miharashi が読むフィールドと、その JSON 型
 CONTRACT_FIELDS = {
@@ -51,7 +57,7 @@ ROWS = [
     _row(),
     _row(id=2, favorite=1, display="derivatives/b.jpg", pref="千葉県", city="千葉市",
          place="中央", taken_at="2025-06-07 11:00",
-         quality_kind="similar", quality_score=0.9, quality_group="g1",
+         quality_kind="similar", quality_score=0.9, quality_group=1,
          quality_rank=1, quality_recommended=1),
     _row(id=3, display="derivatives/c.jpg", taken_at=""),
 ]
@@ -94,6 +100,71 @@ class PhotoFeedFieldsTest(unittest.TestCase):
         with patch.object(photos, "dbq", return_value=rows):
             items = photos.api_photos()
         self.assertEqual([i["trip"] for i in items], [0, 0, 1, 2])
+
+
+SCHEMA = json.loads(photo_feed_fixture.SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+class PhotoFeedSchemaTest(unittest.TestCase):
+    def test_output_satisfies_the_schema(self):
+        with patch.object(photos, "dbq", return_value=ROWS):
+            items = photos.api_photos()
+        self.assertEqual(mini_jsonschema.errors(items, SCHEMA), [])
+
+    def test_schema_requires_exactly_the_contract_fields(self):
+        required = set(SCHEMA["$defs"]["photo"]["required"])
+        self.assertEqual(required, set(CONTRACT_FIELDS))
+        # JSON型は上の CONTRACT_FIELDS と同じ（floatのlat/lonはSchemaでは number）
+        kinds = {"integer": int, "string": str, "boolean": bool, "number": float}
+        for name, prop in SCHEMA["$defs"]["photo"]["properties"].items():
+            if "type" in prop:
+                self.assertIs(kinds[prop["type"]], CONTRACT_FIELDS[name], name)
+
+    def test_checker_rejects_broken_items(self):
+        good = {"id": 1, "file": "derivatives/a.jpg", "time": "2025-06-07 11:00", "lat": 35.0,
+                "lon": 139.0, "pref": "", "city": "", "title": "t", "fav": False,
+                "fetched_at": "2025-06-08T09:30:00", "quality_kind": "", "quality_recommended": False,
+                "trip": 0}
+        self.assertEqual(mini_jsonschema.errors([good], SCHEMA), [])
+        broken = [("id", "1"), ("id", True), ("file", "/derivatives/a.jpg"), ("time", "2025-06-07"),
+                  ("lat", "35.0"), ("lat", 91.0), ("title", ""), ("fav", 1),
+                  ("fetched_at", "2025-06-08 09:30:00"), ("quality_kind", "other"),
+                  ("quality_recommended", None), ("trip", -1), ("trip", 0.5)]
+        for name, value in broken:
+            self.assertTrue(mini_jsonschema.errors([{**good, name: value}], SCHEMA), (name, value))
+        for name in good:
+            rest = {k: v for k, v in good.items() if k != name}
+            self.assertTrue(mini_jsonschema.errors([rest], SCHEMA), name)
+        self.assertTrue(mini_jsonschema.errors({}, SCHEMA))   # 配列でない
+
+
+class PhotoFeedFixtureTest(unittest.TestCase):
+    """Rustの契約テストが読むフィクスチャが、現行実装の出力と一致している。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.items = photo_feed_fixture.build_items()
+
+    def test_fixture_file_is_up_to_date(self):
+        text = photo_feed_fixture.FIXTURE_PATH.read_text(encoding="utf-8")
+        self.assertEqual(
+            text, photo_feed_fixture.render(self.items),
+            "再生成: python3 tools/gen_photo_feed_fixture.py")
+
+    def test_real_schema_output_satisfies_the_schema(self):
+        self.assertEqual(mini_jsonschema.errors(self.items, SCHEMA), [])
+
+    def test_fixture_covers_the_selection_rules(self):
+        ids = [i["id"] for i in self.items]
+        # 除外: exact推奨外(5)、AI同一場面の推奨外(7)、非表示(11)、表示画像なし(12)、位置なし(13)
+        self.assertEqual(ids, [1, 2, 3, 4, 6, 8, 9, 10])
+        by_id = {i["id"]: i for i in self.items}
+        self.assertEqual((by_id[3]["quality_kind"], by_id[3]["quality_recommended"]), ("similar", False))
+        self.assertTrue(by_id[8]["fav"])                        # AI推奨外でもお気に入りは残る
+        self.assertEqual(by_id[10]["time"], "")                 # 時刻不明は最後
+        self.assertEqual([by_id[i]["trip"] for i in ids], [0, 0, 0, 1, 1, 1, 1, 2])
+        self.assertIsNone(by_id[1]["elev"])                     # 内部値のnullも含む
+        self.assertEqual(by_id[2]["quality_group"], 1)          # 品質グループ番号は整数
 
 
 class PhotoFeedHttpTest(unittest.TestCase):
