@@ -87,8 +87,8 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 
   | 持ち越し | 担当 | 確かめる内容 |
   | --- | --- | --- |
-  | ①画面の目視 | ユーザー | `/admin`の地図の位置指定・回転ボタン・STATUSタブの注意（大量削除の保留）の見た目、`/blog-admin`の書き出しの結果の文面 |
-  | ②OSMのタイルの実取得 | ユーザーが検証環境の`/etc/default/geoframe`に連絡先入りの`GEOFRAME_TILE_UA`を設定したあと、管理者 | OSMのタイル数枚が`miss`→`hit`で200・`image/png`になり、キャッシュのファイルができる |
+  | ①画面の目視 | ユーザー | **済み（2026-10-25。[p3-acceptance.md §7.1](p3-acceptance.md#71-持ち越し期限はp5の本番切替の前p3のprのマージはこれで止めない)）**。微調整は要るが最初の移行としてOK。旅行ブログは作り直す予定のため今の動作でよい。STATUSタブの保留の注意は④と一緒 |
+  | ②OSMのタイルの実取得 | ユーザーが検証環境の`/etc/default/geoframe`に連絡先入りの`GEOFRAME_TILE_UA`を設定したあと、管理者 | **済み（2026-10-25）** |
   | ③Nominatimの実通信と User-Agent の決定 | 連絡先入りの User-Agent をどうするかを決めたあと、管理者 | 地理院が0件のときの Nominatim への問い合わせが成功し、1秒1件・結果のキャッシュが守られる（送る User-Agent は今は連絡先なしの`GeoFrame/0.2`） |
   | ④T3.7 ⑤ 大量削除の保留の実機 | 管理者（Drive の鍵が置かれてから。P2のT2.4の本物のDriveの確認と一緒） | 保留が`/api/admin/status`の`sync.mass_delete_hold`と STATUS タブに出て、`geoframe sync --allow-mass-delete`で解除できる |
 - **一次データが消える・変わる経路を、今の仕様のまま残すか守る仕様にするかを決める** — **決定済み（[tasks.md](tasks.md) T3.7。2026-10-25にユーザーが決定。結果は[inventory.md §2.3](inventory.md)「P3で決めたこと」・[server.md §0](server.md)）**: ①手動の位置は原本の更新（Driveの`md5`・ローカルの`mtime`）で上書きしない ②行の削除は今のまま ③回転のリセットは今のまま ④旅行ブログの書き出しは使えない写真を飛ばして`skipped`で知らせる ⑤大量削除の保留は管理画面に件数と解除のコマンドを表示（画面からは解除しない）。決める前の論点（[p2-acceptance.md §5](p2-acceptance.md)。P2のRustは今のPythonと同じ挙動だった）: ①mtime/md5の変更での手動GPSの上書きと、位置が動いたときの地名の付け直し ②索引からの削除・`organize`によるお気に入り・除外（`hidden`）・手動の位置の消失 ③Driveの更新（md5の変更）での回転のリセット ④削除→再追加による写真IDの変化と旅行ブログの参照の断絶 ⑤大量削除の保留が意図した削除も配信に残すこと（保留の件数と`--allow-mass-delete`での解除方法を管理画面で知らせる案）。
@@ -106,7 +106,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - `deploy/`の手順・unit・READMEをRust用に改め、PythonのCIと依存を外す。Python実装の削除は切替後に安定を確かめてから。
 - 本番の切替は**ユーザーの立ち会いのもとで**行う。
 - **本番で取り込みを有効にする前に済ませる、P2から持ち越した未完の項目**（鍵が置かれてから管理者が検証環境で行う。手順は[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)、記録は[p2-acceptance.md §6](p2-acceptance.md)）。**これが済むまで本番の取り込みを有効にしない**: ①実Driveの一覧での冪等性（`sync --dry-run`で変更・取得予定がほぼ0）②同じ原本でのPython／Rustの形式別の成功・失敗の比較（Rustだけが失敗する写真が0）③実機iPhoneのHEICの確認（`img-probe`）④実DriveでのS2（合成のJPEGをDriveのフォルダに足す→周期同期→`loc_source='drive_meta'`・derivative・`GET /derivatives/…`が200→もう一度の周期で変更0）。
-- **P3から持ち越した、画面と実通信の項目**（P3のPRのマージは止めない。**切替の前に済ませる**。詳細は上のP3の表と[p3-acceptance.md §7](p3-acceptance.md#7-持ち越しと見つかったこと)）: ①**画面の目視**（ユーザー。`/admin`の地図の位置指定・回転ボタン・STATUSタブの注意、`/blog-admin`の書き出しの結果の文面）②**OSMのタイルの実取得**（ユーザーが検証環境に連絡先入りの`GEOFRAME_TILE_UA`を設定したあと、管理者）③**Nominatimの実通信と User-Agent の決定**（連絡先入りにするかを決めたあと、管理者）。P3の④（大量削除の保留の実機）は、上の「P2から持ち越した未完の項目」と同じく鍵が置かれてから、その確認と一緒に行う。
+- **P3から持ち越した、画面と実通信の項目**（P3のPRのマージは止めない。**切替の前に済ませる**。詳細は上のP3の表と[p3-acceptance.md §7](p3-acceptance.md#7-持ち越しと見つかったこと)）: ①**画面の目視**（**済み・2026-10-25**。STATUSタブの保留の注意だけ④と一緒）②**OSMのタイルの実取得**（**済み・2026-10-25**）③**Nominatimの実通信と User-Agent の決定**（連絡先入りにするかを決めたあと、管理者）。P3の④（大量削除の保留の実機）は、上の「P2から持ち越した未完の項目」と同じく鍵が置かれてから、その確認と一緒に行う。
 - **取り込みのガードを外す**（T2.1で入れた暫定。[server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード)）。P2〜P4の間、`GEOFRAME_INGEST=1`の`serve`・`sync`は、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できないと、書き込みの前に終了コード2で断る。本番機には印が無いので、**このガードを外さない限り、本番でRustは取り込みを始められない**。切替の手順で次をこの順に行う:
   1. 本番で`geoframe-server`を止めて`disable`し、停止を確認する（`systemctl is-active`が`inactive`）。Pythonの書き込みが無いことの担保は、ガードではなくこの手順が持つ。ガードは`LoadState`を見ず`ActiveState`だけで判定する（unitファイルを消しても動いているサービスは止まらない）ので、**止める前にunitファイルを消さない**（消すなら停止の確認のあと）。
   2. コードからガードを外す（またはガードの印を本番用に置き換え、`GEOFRAME_INGEST=1`に加えて明示のフラグを要る形にする）。消すもの: `guard.rs`・`lib.rs`の`pub mod guard`・`ingest::start`の`guard.check()`（`start_with`）・`IngestError::Refused`と`cli.rs`の`exit_for_ingest_error`・`tests/ingest_cli.rs`の`Staging`と`GEOFRAME_TEST_*`・ガードのテスト。残った箇所は`grep -rn "guard\|検証環境の印\|GEOFRAME_TEST_" crates deploy docs`で探す。
