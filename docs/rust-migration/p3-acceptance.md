@@ -10,7 +10,7 @@
 
 ## 0. 結果の要約
 
-**API による受入は通過。画面の目視と一部の実通信（OSMのタイル・Nominatim）、大量削除の保留の実機は、期限付きの持ち越し**（期限はP5の本番切替の前。P3のPRのマージはこれで止めない。§7）。
+**APIによる受入は通過。画面の目視・OSMタイルは2026-10-25に確認済み。残っていたNominatimと大量削除の保留もT3.10で確認済み**（[drive-acceptance.md](drive-acceptance.md)。§7.1）。
 
 | 項目 | 結果 |
 | --- | --- |
@@ -143,6 +143,8 @@ drop-inを外してRustを再起動（`取り込みは無効です（DB に書�
 
 ## 3. T3.7 ⑤ 大量削除の保留の表示
 
+**追記（T3.10）**: 実Driveの一覧を使う試験と、STATUS画面の描画・解除後の消失まで確認済み（[drive-acceptance.md](drive-acceptance.md) §5）。以下はP3実施時の記録。
+
 `/api/admin/status`の`sync.mass_delete_hold`は、`index_drive`がDriveの一覧から削除を保留したときだけ出る。検証環境にはDriveの鍵が無く、本番のバイナリはDriveの接続先を変えられない（テスト用の入口は`cfg(test)`・ループバック限定）ので、**実機では出せない**。確かめたのは次まで:
 
 - 取り込みを有効にしたRustの`status`には`mass_delete_hold`が**無い**（`sync`のキーは`pending`・`ready`・`total`）。Pythonと`status`の全体が一致（全件比較の項目2）。
@@ -205,10 +207,10 @@ RustとPythonの掃除（`tile_cache/`の上限）が**同じ`tile_cache/`に対
 
 | 持ち越し | 担当 | 確かめる内容 |
 | --- | --- | --- |
-| ①画面の目視（§4） | ユーザー | **済み（2026-10-25）**。取り込みを一時的に有効にした検証環境のRustで、ユーザーが`/admin`の位置指定と地名、お気に入り・除外、回転、地図のタイル（OSM・地理院）を確認し、「微調整は要るが最初の移行としてOK」。`/blog-admin`は作り直す予定のため今の動作でよい（ユーザーの判断）。STATUSタブの大量削除の保留の注意はDriveの鍵が無いと出せないので④と一緒に行う。確認のあと、DB・derivatives・ブログのファイルをバックアップから戻し（`.dump`のSHA-256が`57f6dceff3b48bc5…`で一致、derivatives 6,535ファイルのinodeが一致）、Rustの`tile_cache/`・`.cache.json`を削除し、取り込みを無効に戻した（`/healthz` 200、3,065件） |
+| ①画面の目視（§4） | ユーザー | **済み（2026-10-25）**。取り込みを一時的に有効にした検証環境のRustで、ユーザーが`/admin`の位置指定と地名、お気に入り・除外、回転、地図のタイル（OSM・地理院）を確認し、「微調整は要るが最初の移行としてOK」。`/blog-admin`は作り直す予定のため今の動作でよい（ユーザーの判断）。STATUSタブの大量削除の保留もT3.10で確認済み（[drive-acceptance.md](drive-acceptance.md) §5）。確認のあと、DB・derivatives・ブログのファイルをバックアップから戻し（`.dump`のSHA-256が`57f6dceff3b48bc5…`で一致、derivatives 6,535ファイルのinodeが一致）、Rustの`tile_cache/`・`.cache.json`を削除し、取り込みを無効に戻した（`/healthz` 200、3,065件） |
 | ②OSMのタイルの実取得（§2.5） | ユーザーが検証環境の`/etc/default/geoframe`に連絡先入りの`GEOFRAME_TILE_UA`を設定したあと、管理者 | **済み（2026-10-25。§2.5）** |
-| ③Nominatimの実通信と User-Agent の決定 | 連絡先入りの User-Agent をどうするかを決めたあと、管理者 | 地理院が0件のときの Nominatim への問い合わせが成功し、1秒1件・結果のキャッシュが守られる。この受入では地理院が結果を返したので呼ばれていない（送る User-Agent は今は連絡先なしの`GeoFrame/0.2`） |
-| ④T3.7 ⑤ 大量削除の保留の実機（§3） | 管理者（Drive の鍵が置かれてから。P2のT2.4の本物のDriveの確認、[p2-acceptance.md §6](p2-acceptance.md)と一緒） | 保留が`/api/admin/status`の`sync.mass_delete_hold`と STATUS タブに出て、`geoframe sync --allow-mass-delete`で解除できる |
+| ③Nominatimの実通信と User-Agent の決定 | 管理者 | **済み（2026-10-25、T3.10）**。ユーザーが`GEOFRAME_TILE_UA`共用を決定し、実装・配布。Nominatim由来の結果2件と繰り返し時のキャッシュを確認（[drive-acceptance.md](drive-acceptance.md) §6） |
+| ④T3.7 ⑤ 大量削除の保留の実機（§3） | 管理者 | **済み（2026-10-25、T3.10）**。実Drive一覧と複製DBの試験用2000行で、保留API・STATUS画面・解除コマンド・解除後の表示の消失を確認（[drive-acceptance.md](drive-acceptance.md) §5） |
 
 ### 7.2 そのほか
 
@@ -248,4 +250,4 @@ RustとPythonの掃除（`tile_cache/`の上限）が**同じ`tile_cache/`に対
 - 管理画面の更新操作（手動の位置・お気に入り・除外・回転・旅行ブログの保存と書き出し）を取り込みを有効にしたRustで行い、変更がDBとファイルに残る。同じ要求を比較用Pythonにも送ると、`photos`の全行・下書きのバイト列・書き出しの3ファイルが一致する。差は T3.7 の決定（使えない写真を飛ばす）と、既知の差（画素・小数の`delta`・JSONの空白）だけ。
 - `GEOFRAME_INGEST=0`では書かない（503、DBもファイルも不変）が、地名検索・タイル・旅行ブログの読み取りは動く。
 - 全件比較の差は想定内の2つだけ、miharashiの定常・停止と再開は終了コード0。
-- 持ち越し: 画面の目視（ユーザー）、OSMのタイル（`GEOFRAME_TILE_UA`の設定後に管理者）、Nominatimの実通信とUser-Agentの決定（決めたあとに管理者）、T3.7 ⑤の実機確認（Driveの鍵が置かれてから管理者）。
+- 当時の持ち越しはすべて確認済み。画面の目視・OSMタイルは2026-10-25、NominatimのUA・実通信とT3.7 ⑤の実機確認はT3.10（[drive-acceptance.md](drive-acceptance.md)）。

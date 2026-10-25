@@ -8,6 +8,8 @@
 - **写真の値・ファイル名・位置・地名・撮影日時は書かない。件数・ハッシュの先頭・合否だけ**（合成の写真は公開の代表点と架空の時刻。実写真ではない）
 - 比較用Pythonは`geoframe-pyref`の`/opt/geoframe-pyref`（Python 3.12.3・Pillow 13.0.0・pillow-heif 1.8.1。本番と同じ`GEOFRAME_EMBED_BACKEND=local`）
 
+**追記（2026-10-25、T3.10）**: 以下はP2実施時の記録。鍵待ちだった実Driveの冪等性・原本比較・iPhone HEIC・未登録行の索引から配信までの確認は[drive-acceptance.md](drive-acceptance.md)で完了した。元の実施記録は残す。
+
 ## 0. 結果の要約
 
 | 項目 | 結果 |
@@ -125,9 +127,9 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 | Rustで作った品質の結果をPythonへ切り戻す手順の試験（本番での最終確認） | [server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック) | P5 |
 | `GEOFRAME_INGEST=1`のガード（検証環境の印・Pythonの非稼働）を外し、本番の設定に`1`を足す | [server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード) | P5（切替） |
 
-## 6. 未実施（鍵が置かれてから管理者が行う）
+## 6. P2時点の未実施（T3.10で確認済み）
 
-検証環境にはDriveの鍵（`/var/lib/geoframe/drive_key.json`）が無い。次は**行っていない**。手順は[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)にある。本番機では行わない。
+P2実施時は検証環境にDriveの鍵が無く、次は行っていなかった。**T3.10で確認済み**（[drive-acceptance.md](drive-acceptance.md)。S2はDriveへの新規アップロードに代え、複製DBの未登録行で確認。10ビット・HDRなど標本に無いモードは未確認）。手順は[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)にある。本番機では行わない。
 
 | 確認 | 内容 | 手順 |
 | --- | --- | --- |
