@@ -51,7 +51,8 @@
 //! - 飛ばした写真の画像は、書き出す `blog-manifest.json`・`index.md`・`index.html` から**取り除く**（`images/` に
 //!   ファイルを作らず、`<img>`・`![]()` も出さない。壊れたリンクを残さない）。
 //! - `images` は**書き出した枚数**（`manifest` の参照の数 − `skipped` の数）。全部飛んだら 0 で、本文だけを書き出す。
-//! - `dry_run` も同じ判定で `skipped` と `images` を返す。ただし画像のデコードまではしないので、**画像として読めない
+//! - `dry_run` も同じ判定で `skipped` と `images` を返す（ファイルを開ける・通常のファイル・大きさの上限までは
+//!   実際の書き出しと同じ関数で見る）。ただし画像のデコードまではしないので、**画像として読めない
 //!   写真（`no_image`）は予測できず**、実際の書き出しでだけ `skipped` に出る。取り込みが無効で writer が無いときは、
 //!   読み取り専用の接続で行を引く。
 //! - 下書きの保存（E15）は写真の存在を見ない（今までどおり）。
@@ -301,14 +302,16 @@ impl Rows<'_> {
     }
 }
 
-/// 行を引いて、書き出せる画像のファイル（`DATA_DIR` の中の通常のファイル）の場所を返す。使えなければ理由。
+/// 行を引いて、書き出せる画像のファイル（`DATA_DIR` の中の通常のファイルで、開けて、大きさの上限以内）を
+/// 開いて返す（ファイルと長さ）。使えなければ理由。デコードの要らない検査はここに全部あり、書き出し
+/// （[`read_source`]）と `dry_run` が同じ判定になる。
 /// 現行は `(DATA_DIR / display).resolve()` で、絶対パスの `display` は `DATA_DIR` の外になる。リンクを辿った
 /// 先が `DATA_DIR` の中の通常のファイルでなければ読まない。
 fn locate(
     rows: &Rows<'_>,
     data_root: &Path,
     row_id: Option<i64>,
-) -> Result<Result<PathBuf, Skip>, ApiError> {
+) -> Result<Result<(fs::File, u64), Skip>, ApiError> {
     let Some(row_id) = row_id else {
         return Ok(Err(Skip::Missing));
     };
@@ -324,7 +327,8 @@ fn locate(
     if !path.starts_with(data_root) || !fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
         return Ok(Err(Skip::NoImage));
     }
-    Ok(Ok(path))
+    // 開けない（消えた・権限）・大きすぎるファイルも、その写真だけ飛ばす
+    Ok(imaging::open_limited(&path).map_err(|_| Skip::NoImage))
 }
 
 /// 現行 `_photo_source` + 画像ファイルの読み込み。行を引いて、`display` が指す `DATA_DIR` の中の通常の
@@ -337,12 +341,12 @@ fn read_source(
     row_id: Option<i64>,
 ) -> Result<Result<Vec<u8>, Skip>, ApiError> {
     let _files = imaging::lock_derivatives();
-    let path = match locate(rows, data_root, row_id)? {
-        Ok(path) => path,
+    let (file, len) = match locate(rows, data_root, row_id)? {
+        Ok(opened) => opened,
         Err(skip) => return Ok(Err(skip)),
     };
-    // 読めない（大きすぎる・消えた・権限）ファイルも、その写真だけ飛ばす
-    Ok(imaging::read_limited(&path).map_err(|_| Skip::NoImage))
+    // 読み切れない（読む途中の失敗）ファイルも、その写真だけ飛ばす
+    Ok(imaging::read_opened(file, len).map_err(|_| Skip::NoImage))
 }
 
 /// 飛ばした写真 1 件（manifest の参照ごと）。
@@ -370,7 +374,8 @@ fn export_name(photo_id: &str) -> (String, Option<i64>) {
     (name, row_id)
 }
 
-/// `dry_run`: 書き出したら飛ばす写真を数える（行を引いて、画像のファイルがあるかまで。デコードはしない）。
+/// `dry_run`: 書き出したら飛ばす写真を数える（実際の書き出しと同じ [`locate`] で、行を引いてファイルを開き、
+/// 大きさの上限まで見る。中身は読まず、デコードもしない）。
 fn dry_run_skipped(
     manifest: &Value,
     rows: &Rows<'_>,

@@ -749,6 +749,40 @@ fn dry_run_counts_what_a_real_export_would_skip_except_undecodable_images() {
     );
 }
 
+/// 大きさの上限を超えるファイルは、`dry_run` でも実際の書き出しでも同じ `no_image` で飛ぶ（デコードの要らない
+/// 検査は同じ関数で行う）。巨大なファイルは疎ファイルで作るので、ディスクは使わない。
+#[test]
+fn dry_run_and_the_real_export_skip_an_oversized_file_alike() {
+    let fixture = Fixture::new("blog-write-dry-big");
+    let big = fixture.root().join("derivatives/huge.jpg");
+    fs::File::create(&big)
+        .unwrap()
+        .set_len(imaging::MAX_INPUT_BYTES + 1)
+        .unwrap();
+    fixture
+        .writer
+        .call(|c| {
+            c.execute(
+                "INSERT INTO photos VALUES (10, 'derivatives/huge.jpg', 0)",
+                [],
+            )
+        })
+        .unwrap();
+    let ids = ["1", "10", "2", "010"];
+    let mut dry = request(&ids);
+    dry["dry_run"] = json!(true);
+    let dry = fixture.run(&dry, &go).unwrap();
+    let real = fixture.run(&request(&ids), &go).unwrap();
+    let expected = json!([
+        {"photo_id": "10", "reason": "no_image"},
+        {"photo_id": "010", "reason": "no_image"},
+    ]);
+    assert_eq!(dry["skipped"], expected);
+    assert_eq!(real["skipped"], expected);
+    assert_eq!(dry["images"], 2);
+    assert_eq!(real["images"], 2);
+}
+
 /// writer が無い（取り込み無効）ときの `dry_run` は、読み取り専用の接続で行を引く。写真が 1 枚も無ければ DB を開かない。
 #[test]
 fn dry_run_without_a_writer_reads_the_rows_read_only() {

@@ -778,19 +778,31 @@ pub(super) fn not_an_image(bytes: &[u8]) -> ImageError {
     }
 }
 
-/// ファイルを読む（大きさの上限つき）。`img-probe` も使う。
-pub fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
+/// ファイルを開いて、大きさの上限（[`MAX_INPUT_BYTES`]）を超えていないことまで確かめる。中身は読まない。
+/// 読む前の検査なので、書き出しの `dry_run`（読まない）と実際の読み込み（[`read_opened`]）で同じ答えになる。
+pub fn open_limited(path: &Path) -> Result<(fs::File, u64), ImageError> {
     let file = fs::File::open(path)?;
     let len = file.metadata()?.len();
     if len > MAX_INPUT_BYTES {
         return Err(ImageError::FileTooLarge);
     }
+    Ok((file, len))
+}
+
+/// [`open_limited`] で開いたファイルを、大きさの上限つきで読み切る。
+pub fn read_opened(file: fs::File, len: u64) -> Result<Vec<u8>, ImageError> {
     let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
     file.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ImageError::FileTooLarge);
     }
     Ok(bytes)
+}
+
+/// ファイルを読む（大きさの上限つき）。`img-probe` も使う。
+pub fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
+    let (file, len) = open_limited(path)?;
+    read_opened(file, len)
 }
 
 /// 書きかけの `.part`。`commit` されないまま落とされたら（失敗・パニック）消す。**自分が作ったものだけ**を持つ
