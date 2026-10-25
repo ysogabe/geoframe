@@ -11,7 +11,8 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -42,7 +43,74 @@ pub const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// 読み書きのどちらも無い接続を待つ上限。keep-alive の待機と、リクエストのヘッダを
 /// 少しずつしか送らない相手（slowloris）を切る。応答の生成（DB の順番待ちは最大 10 秒）より長く取る。
+/// それを超えうる `POST`（書き出し E16 など）は、処理の間だけ [`ConnBusy`] で期限を止める。
 pub const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 接続の上で**処理中の要求**がある間、無通信の期限を止めるための印（接続ごと）。
+///
+/// hyper は要求を読み終えたあとも、クライアントが切ったかを見るために接続を読み続ける。書き出し（E16）のように
+/// 数十秒〜数分かかる処理の間は、読み書きのどちらも進まないので、そのままだと無通信の期限（[`IDLE_TIMEOUT`]）で
+/// 接続が切られ、処理は終わるのに利用者には失敗に見える（Python の `http.server` にこの期限は無い）。
+/// 長い処理は [`ConnBusy::enter`] の守りを持つ間だけ、期限を止める。止めるのは**読み取りの無通信**だけで、
+/// 送信の停滞（[`STALL_TIMEOUT`]）は変わらない。処理が済めば応答の書き込みが進捗になり、そこから測り直す。
+#[derive(Clone, Debug, Default)]
+pub struct ConnBusy(Arc<BusyState>);
+
+#[derive(Debug, Default)]
+struct BusyState {
+    /// 処理中の要求の数。
+    count: AtomicUsize,
+    /// 最後に処理が済んだ時刻。無通信の期限の起点を、そこまで進める（処理が長くても、済んだ直後に切られない）。
+    exited: Mutex<Option<Instant>>,
+    /// 処理中に読み取りを待っているタスク。処理が済んだら起こして、無通信の期限を張り直させる。
+    waker: Mutex<Option<std::task::Waker>>,
+}
+
+impl ConnBusy {
+    /// 処理を始める。返した守りが生きている間、この接続の無通信の期限は働かない。
+    pub fn enter(&self) -> BusyGuard {
+        self.0.count.fetch_add(1, Ordering::SeqCst);
+        BusyGuard(self.clone())
+    }
+
+    fn is_busy(&self) -> bool {
+        self.0.count.load(Ordering::SeqCst) > 0
+    }
+
+    fn register(&self, waker: &std::task::Waker) {
+        *self.0.waker.lock().unwrap_or_else(PoisonError::into_inner) = Some(waker.clone());
+    }
+
+    /// 処理が済んだ時刻（あれば）を取り出す。
+    fn take_exit(&self) -> Option<Instant> {
+        self.0
+            .exited
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// [`ConnBusy::enter`] の守り。落とすと処理中でなくなる。
+#[derive(Debug)]
+pub struct BusyGuard(ConnBusy);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        let state = &self.0.0;
+        *state.exited.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+        if state.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            let waker = state
+                .waker
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+    }
+}
 
 /// [`LimitedListener`] の設定。本番は [`ConnLimits::default`]、テストは短い値を渡す。
 #[derive(Clone, Copy, Debug)]
@@ -113,6 +181,7 @@ pub struct LimitedIo<T> {
     read_timer: Option<Pin<Box<Sleep>>>,
     /// 最後に読み取り・書き込みのどちらかが進んだ（`Ready` を返した）時刻。無通信の期限の起点。
     last_progress: Instant,
+    busy: ConnBusy,
     _permit: Option<OwnedSemaphorePermit>,
 }
 
@@ -125,8 +194,14 @@ impl<T> LimitedIo<T> {
             write_timer: None,
             read_timer: None,
             last_progress: Instant::now(),
+            busy: ConnBusy::default(),
             _permit: permit,
         }
+    }
+
+    /// この接続の「処理中」の印。ハンドラが長い処理の間だけ [`ConnBusy::enter`] する。
+    pub fn busy(&self) -> &ConnBusy {
+        &self.busy
     }
 }
 
@@ -156,6 +231,19 @@ impl<T: AsyncRead + Unpin> AsyncRead for LimitedIo<T> {
         let this = &mut *self;
         match Pin::new(&mut this.inner).poll_read(cx, buf) {
             Poll::Pending => {
+                if this.busy.is_busy() {
+                    // 処理中の要求がある間は無通信で切らない（期限は処理が済んでからの進捗で測り直す）
+                    this.read_timer = None;
+                    this.busy.register(cx.waker());
+                    return Poll::Pending;
+                }
+                // 処理が済んだ時刻までは進捗とみなす（長い処理のあと、応答を書く前に切らない）
+                if let Some(exited) = this.busy.take_exit()
+                    && exited > this.last_progress
+                {
+                    this.last_progress = exited;
+                    this.read_timer = None;
+                }
                 let idle = this.idle_timeout;
                 let last_progress = this.last_progress;
                 // 期限は「最後の進捗＋idle」。書き込みが進んでいれば期限が先へ動くので、そのぶんだけ
@@ -290,6 +378,64 @@ mod tests {
         let at = cut_at(1000, Some(300)).await;
         assert!(
             at >= Duration::from_millis(1300) && at <= Duration::from_millis(1305),
+            "{at:?}"
+        );
+    }
+
+    /// 処理中の要求がある間は、無通信で切れない。済んだ時刻から測り直す（長い処理のあとすぐ切らない）。
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_connection_is_not_cut_and_the_clock_restarts_when_the_work_ends() {
+        let (a, _peer) = duplex(64);
+        let io = LimitedIo::new(a, limits(1000), None);
+        let busy = io.busy().clone();
+        let (mut reader, _writer) = split(io);
+        let guard = busy.enter();
+        let start = Instant::now();
+        let waiting = tokio::spawn(async move {
+            let mut buf = [0u8; 8];
+            let err = reader.read(&mut buf).await.unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+            Instant::now()
+        });
+        // 期限（1000ms）の 50 倍の間、処理中。切れない
+        sleep(Duration::from_secs(50)).await;
+        assert!(!waiting.is_finished());
+        drop(guard);
+        let at = waiting.await.unwrap() - start;
+        // 済んだ時刻（50 秒）から idle（1 秒）で切れる。済んだ瞬間には切れない
+        assert!(
+            at >= Duration::from_millis(51_000) && at <= Duration::from_millis(51_005),
+            "{at:?}"
+        );
+    }
+
+    /// 処理中が重なっても（2 件）、両方が済むまで止まる。送信の停滞の期限は処理中でも働く。
+    #[tokio::test(start_paused = true)]
+    async fn the_idle_clock_waits_for_every_busy_guard_and_the_stall_timeout_still_applies() {
+        let (a, _peer) = duplex(16);
+        let mut io = LimitedIo::new(
+            a,
+            ConnLimits {
+                max_connections: 1,
+                stall_timeout: Duration::from_millis(1000),
+                idle_timeout: Duration::from_millis(1000),
+            },
+            None,
+        );
+        let busy = io.busy().clone();
+        let (first, second) = (busy.enter(), busy.enter());
+        drop(first);
+        assert!(busy.is_busy());
+        drop(second);
+        assert!(!busy.is_busy());
+        let _held = busy.enter();
+        // 処理中でも、相手が読まないまま書き込みが進まなければ切れる
+        let start = Instant::now();
+        let err = io.write_all(&[0u8; 64]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        let at = Instant::now() - start;
+        assert!(
+            at >= Duration::from_millis(1000) && at <= Duration::from_millis(1005),
             "{at:?}"
         );
     }

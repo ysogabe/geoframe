@@ -827,3 +827,139 @@ async fn oversized_sources_are_refused_before_decoding() {
             .exists()
     );
 }
+
+/// 回転・取得と同じロック（`imaging::lock_derivatives`）を握る別スレッド。`release` で手放す。
+struct Hold {
+    release: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+fn hold_derivatives() -> Hold {
+    let (held_tx, held_rx) = std::sync::mpsc::channel::<()>();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let _guard = geoframe::imaging::lock_derivatives();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.recv().unwrap();
+    Hold { release, thread }
+}
+
+impl Hold {
+    fn release(self) {
+        let _ = self.release.send(());
+        self.thread.join().unwrap();
+    }
+}
+
+/// 書き出しのように応答まで長くかかる `POST` は、無通信の期限で接続を切られない（`serve` が付ける接続の情報の
+/// `ConnBusy`）。期限を 0.4 秒にして、書き出しを 1.5 秒止めておく（回転・取得と同じロックを試験が握る）。
+/// 比較として、接続の情報を付けない起動では同じ要求が切られる（試験が効いていることの確認）。
+#[tokio::test]
+async fn a_long_export_is_not_cut_by_the_idle_timeout() {
+    use geoframe::config::{Config, Overrides};
+    use geoframe::limits::{ConnLimits, LimitedListener};
+    use geoframe::server::{ConnInfo, router};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let _serial = serial().await;
+    let fixture = fixture();
+    let plans = TempDir::new("blog-write-idle-plans");
+    for (name, content) in fixture["plans"].as_object().unwrap() {
+        fs::write(plans.path().join(name), content.as_str().unwrap()).unwrap();
+    }
+    let dir = TempDir::new("blog-write-idle");
+    let db = build_admin_catalog(dir.path());
+    fs::create_dir_all(dir.path().join("derivatives")).unwrap();
+    fs::write(
+        dir.path().join("derivatives/p01.jpg"),
+        draw("small", &fixture["images"]),
+    )
+    .unwrap();
+    let path = dir.path().join("catalog.db");
+    let catalog = Catalog::open(&path)
+        .unwrap()
+        .with_writer(Writer::open(&path, OpenMode::MustExist).unwrap());
+    let plans_dir = plans.path().to_string_lossy().into_owned();
+    let env = [("GEOFRAME_BLOG_PLANS_DIR".to_string(), plans_dir)];
+    let config = Config::load(
+        |k| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()),
+        &Overrides {
+            data_dir: Some(dir.path().to_path_buf()),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
+    let limits = ConnLimits {
+        idle_timeout: Duration::from_millis(400),
+        ..ConnLimits::default()
+    };
+    let app = router(common::test_state(Arc::new(config), catalog));
+
+    // 本番の起動（接続の情報つき）
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let with_info = listener.local_addr().unwrap();
+    let service = app
+        .clone()
+        .into_make_service_with_connect_info::<ConnInfo>();
+    let listener = LimitedListener::new(listener, limits);
+    tokio::spawn(async move { axum::serve(listener, service).await });
+    // 接続の情報を付けない起動（比較用）
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let without_info = listener.local_addr().unwrap();
+    let listener = LimitedListener::new(listener, limits);
+    tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let body = json!({"trip_id": "sample-trip-a", "manifest": {
+        "trip_id": "sample-trip-a", "status": "draft",
+        "chapters": [{"id": "d1", "images": [{"photo_id": "1"}]}]}})
+    .to_string();
+    let send = |addr: std::net::SocketAddr| {
+        let body = body.clone();
+        tokio::spawn(async move {
+            post_raw(
+                addr,
+                EXPORT,
+                &[
+                    ("Host".into(), "localhost".into()),
+                    ("Content-Type".into(), "application/json".into()),
+                    ("Content-Length".into(), body.len().to_string()),
+                    ("Connection".into(), "close".into()),
+                ],
+                body.as_bytes(),
+            )
+            .await
+        })
+    };
+    // 比較: 接続の情報が無い起動では、処理を止めている間に無通信の期限で切られる
+    let hold = hold_derivatives();
+    let cut = send(without_info);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    hold.release();
+    assert!(
+        cut.await.is_err(),
+        "比較: 接続の情報が無いと、無通信の期限で切られる"
+    );
+    // 切られても書き出し自体は終わる（応答を受けた者がいないだけ）。済むのを待つ（来るはずの出来事だけを待つ）
+    let index = dir.path().join("blog_exports/sample-trip-a/index.html");
+    for _ in 0..2000 {
+        if index.is_file() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(index.is_file());
+    fs::remove_dir_all(dir.path().join("blog_exports")).unwrap();
+
+    // 本番の起動: 同じ止め方でも、最後まで答える
+    let hold = hold_derivatives();
+    let kept = send(with_info);
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    hold.release();
+    let kept = kept.await.expect("接続の情報つきは最後まで答える");
+    assert_eq!(kept.status, 200, "{}", kept.text());
+    assert!(index.is_file());
+    drop(db);
+}

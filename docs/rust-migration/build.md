@@ -101,7 +101,7 @@ n100でビルドしたバイナリを`scp`で検証環境（lxc-geoframe）の`/
 | `geoframe serve [--listen <addr>] [--data-dir <dir>]` | 読み取り専用のサーバー。P0では`GET /healthz`が`{"ok":true}`を返すだけだった。T1.1で、設定・DB読み取り層・ログ・DBを読めるかを返すヘルスを足した（[server.md](server.md)）。SIGTERMで停止 |
 | `deploy/geoframe-rs.service`・`deploy/rust-deploy.sh` | T1.5。検証環境向けのsystemd unitと、ビルド→転送→入れ替え→確認→巻き戻しの配布スクリプト（[deploy/README.md §7](../../deploy/README.md)、[server.md §6](server.md)）。本番の切替はP5 |
 
-依存は`tokio`・`axum`・`rusqlite`（`bundled`・`backup`。dry-run の写し用。追加の依存は無い）・`serde`・`serde_json`、T1.1で`tracing`・`tracing-subscriber`（どちらも純Rust。`env-filter`・時刻・色の機能は入れない）。外部HTTPクライアントはT2.1で入れた（§7）。画像処理の依存はT2.2で入れた（§8）。SQLiteの呼び出しは`db::Catalog::read`で`spawn_blocking`に出し、tokioのworkerを塞がない形にした（P1以降もこの形に揃える。[server.md](server.md) §2.2）。
+依存は`tokio`・`axum`・`rusqlite`（`bundled`・`backup`。dry-run の写し用。追加の依存は無い）・`serde`・`serde_json`、T1.1で`tracing`・`tracing-subscriber`（どちらも純Rust。`env-filter`・時刻・色の機能は入れない）。外部HTTPクライアントはT2.1で入れた（§7）。画像処理の依存はT2.2で入れた（§8）。T3.6で`serde_json`に`preserve_order`機能を入れた（下書きと書き出しのmanifestをPythonと同じキーの並びで書くため。`indexmap`が増える。純Rustで、musl静的ビルドは変わらない）。SQLiteの呼び出しは`db::Catalog::read`で`spawn_blocking`に出し、tokioのworkerを塞がない形にした（P1以降もこの形に揃える。[server.md](server.md) §2.2）。
 
 ## 6. 今後の注意と代替案
 

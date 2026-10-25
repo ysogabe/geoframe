@@ -37,7 +37,7 @@ use crate::cache::Cache;
 use crate::config::Config;
 use crate::db::Catalog;
 use crate::geocode::{self, Geocoder};
-use crate::limits::{ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
+use crate::limits::{ConnBusy, ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
 use crate::tiles::{self, CacheStatus, TileProxy};
 use crate::writer::Writer;
 use crate::{csrf, hostcheck, photos, post, pyquery, statics, sysinfo, webpath};
@@ -619,10 +619,18 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
             return response;
         }
         return match post::route_of(raw) {
-            Some(route) => labeled(
-                post::handle(&state, route, &parts.headers, body).await,
-                route.label(),
-            ),
+            Some(route) => {
+                // 書き出し（E16）などの長い処理の間は、無通信の期限で接続を切らない（`serve` が付けた接続の情報。
+                // 付いていない起動のしかた（試験）では何もしない）
+                let _busy = parts
+                    .extensions
+                    .get::<axum::extract::ConnectInfo<ConnInfo>>()
+                    .map(|info| info.0.busy.enter());
+                labeled(
+                    post::handle(&state, route, &parts.headers, body).await,
+                    route.label(),
+                )
+            }
             None => statics::forbidden(),
         };
     }
@@ -757,6 +765,23 @@ async fn shutdown_signal() {
     crate::blog_write::request_stop();
 }
 
+/// 接続ごとの付随情報（`axum::extract::ConnectInfo`）。長い処理を持つ `POST` が、その間だけ無通信の期限を
+/// 止めるために使う（[`ConnBusy`]）。
+#[derive(Clone, Debug)]
+pub struct ConnInfo {
+    pub busy: ConnBusy,
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, LimitedListener>>
+    for ConnInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, LimitedListener>) -> Self {
+        Self {
+            busy: stream.io().busy().clone(),
+        }
+    }
+}
+
 pub async fn serve(state: AppState) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
     tracing::info!("{} で待ち受けます", listener.local_addr()?);
@@ -766,9 +791,12 @@ pub async fn serve(state: AppState) -> std::io::Result<()> {
     );
     // 接続の総数・送信の停滞・無通信の上限（limits.rs）
     let listener = LimitedListener::new(listener, ConnLimits::default());
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<ConnInfo>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     tracing::info!("停止しました");
     Ok(())
 }
