@@ -33,7 +33,9 @@ use serde_json::{Map, Value, json};
 
 use crate::db::{Catalog, CatalogError};
 use crate::embedded;
-use crate::pyval::{is_py_digit_str, prefix_chars, py_str, py_str_or, round3, truthy};
+use crate::pyval::{
+    DictKey, dict_key, is_py_digit_str, prefix_chars, py_str, py_str_or, round3, truthy,
+};
 
 /// 1 日あたりの候補グループの上限。
 const MAX_CANDIDATE_GROUPS: usize = 36;
@@ -731,14 +733,21 @@ fn manifest_json(conn: &Connection, plan: &Value) -> rusqlite::Result<Result<Val
         Ok(s) => s,
         Err(e) => return Ok(Err(e)),
     };
-    // `{s.get("id"): s for s in segments}`: 同じ id なら後のものが残る
-    let mut by_id: HashMap<String, &Map<String, Value>> = HashMap::new();
+    // `{s.get("id"): s for s in segments}`: キーは Python の `dict` と同じ等価性（`5` と `5.0`、`1` と
+    // `True` は同じキー）で、同じキーなら後のものが残る。配列・オブジェクトの id は Python が `TypeError`。
+    let mut by_id: HashMap<DictKey, &Map<String, Value>> = HashMap::new();
     for segment in &segments {
-        by_id.insert(id_key(segment.get("id")), segment);
+        let Some(key) = id_key(segment.get("id")) else {
+            return Ok(Err(bad_plan()));
+        };
+        by_id.insert(key, segment);
     }
     let mut out = Vec::with_capacity(chapters.len());
     for chapter in &chapters {
-        let segment = by_id[&id_key(Some(&chapter.segment_id))];
+        let Some(segment) = id_key(Some(&chapter.segment_id)).and_then(|k| by_id.get(&k).copied())
+        else {
+            return Ok(Err(bad_plan()));
+        };
         let images: Vec<Value> = chapter
             .candidates
             .iter()
@@ -791,9 +800,9 @@ fn manifest_json(conn: &Connection, plan: &Value) -> rusqlite::Result<Result<Val
     })))
 }
 
-/// 区間の `id`（`dict` のキー）を比べるための文字列。
-fn id_key(id: Option<&Value>) -> String {
-    id.unwrap_or(&Value::Null).to_string()
+/// 区間の `id`（`dict` のキー）。無ければ `None`（`dict.get` の `None`）。
+fn id_key(id: Option<&Value>) -> Option<DictKey> {
+    dict_key(id.unwrap_or(&Value::Null))
 }
 
 // ---- 下書きの検査 ---------------------------------------------------------------------------

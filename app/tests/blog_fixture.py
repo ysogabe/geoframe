@@ -85,6 +85,22 @@ PLANS = {
     ".dot-plan.json": j(plan("dot-plan", [])),
     "notes.txt": "plan ではない",
     "invalid-id.json": j(plan("Bad_ID", [])),
+    # 区間の id は Python の dict のキー: 5 と 5.0、1 と True、0 と False は同じキー（同じ値なら後の区間が
+    # 初期案の本文になる）。"7" と 7 は別のキー。順序を変えて両方向を入れる
+    "sample-trip-keys.json": j(plan("sample-trip-keys", [
+        segment(5, "2025-06-06", title="整数の5"),
+        segment(5.0, "2025-06-06", title="小数の5.0"),
+        segment(2.0, "2025-06-06", title="小数の2.0"),
+        segment(2, "2025-06-06", title="整数の2"),
+        segment(True, "2025-06-06", title="真"),
+        segment(1, "2025-06-06", title="整数の1"),
+        segment(0, "2025-06-06", title="整数の0"),
+        segment(False, "2025-06-06", title="偽"),
+        segment("7", "2025-06-06", title="文字列の7"),
+        segment(7, "2025-06-06", title="整数の7"),
+        segment(None, "2025-06-06", title="null"),
+        {"date": "2025-06-06", "title": "idなし"},
+    ])),
     "sample-trip-odd.json": j(plan("sample-trip-odd", [
         # id なし・場所が文字列・活動の時刻/名前が null
         {"date": "2025-06-06", "title": None, "locations": "ab", "start_local": "00:00",
@@ -297,7 +313,8 @@ TARGETS = [
     "/api/blog/trips", "/api/blog/trips?x=1", "/api/blog/trips?trip_id=sample-trip-a", "//api/blog/trips",
     # E8 旅程そのもの
     "/api/blog/trip?trip_id=sample-trip-a", "/api/blog/trip?trip_id=sample-trip-b",
-    "/api/blog/trip?trip_id=sample-trip-odd", "/api/blog/trip?trip_id=title-number",
+    "/api/blog/trip?trip_id=sample-trip-odd", "/api/blog/trip?trip_id=sample-trip-keys",
+    "/api/blog/trip?trip_id=title-number",
     "/api/blog/trip?trip_id=mismatch-file", "/api/blog/trip?trip_id=sample-trip-c",
     "/api/blog/trip?trip_id=bad-json", "/api/blog/trip?trip_id=dir-plan",
     "/api/blog/trip?trip_id=segments-empty", "/api/blog/trip?trip_id=segments-string",
@@ -318,6 +335,7 @@ TARGETS = [
     "/api/blog/trip?trip_id=sample%00", "/api/blog/trip?trip_id=nonexistent&trip_id=sample-trip-a",
     # E9 候補
     "/api/blog/candidates?trip_id=sample-trip-a", "/api/blog/candidates?trip_id=sample-trip-odd",
+    "/api/blog/candidates?trip_id=sample-trip-keys",
     "/api/blog/candidates?trip_id=sample-trip-b", "/api/blog/candidates?trip_id=title-number",
     "/api/blog/candidates?trip_id=segments-empty", "/api/blog/candidates?trip_id=segments-string",
     "/api/blog/candidates?trip_id=mismatch-file", "/api/blog/candidates?trip_id=bad-json",
@@ -326,7 +344,8 @@ TARGETS = [
     "/api/blog/candidates?trip_id=&trip_id=sample-trip-b",
     # E10 下書き（保存済み・生成）
     "/api/blog/draft?trip_id=sample-trip-a", "/api/blog/draft?trip_id=sample-trip-b",
-    "/api/blog/draft?trip_id=sample-trip-odd", "/api/blog/draft?trip_id=title-number",
+    "/api/blog/draft?trip_id=sample-trip-odd",
+    "/api/blog/draft?trip_id=sample-trip-keys", "/api/blog/draft?trip_id=title-number",
     "/api/blog/draft?trip_id=draft-without-plan", "/api/blog/draft?trip_id=draft-invalid-json",
     "/api/blog/draft?trip_id=draft-array", "/api/blog/draft?trip_id=draft-id-mismatch",
     "/api/blog/draft?trip_id=draft-id-missing", "/api/blog/draft?trip_id=draft-bad-status",

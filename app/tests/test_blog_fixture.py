@@ -3,6 +3,7 @@
 Rust の結合テスト（crates/geoframe/tests/blog_api.rs）が読むフィクスチャが、現行実装の出力と一致していること
 （再生成: python3 tools/gen_blog_fixture.py）と、フィクスチャが押さえている現行実装の癖を記録する。
 """
+import re
 import unittest
 
 from tests import blog_fixture as fixture
@@ -39,7 +40,8 @@ class BlogFixtureTest(unittest.TestCase):
                 for p in (fixture.ROOT / "app/travel_blog/plans").glob("*.json")]
         text = fixture.FIXTURE_PATH.read_text(encoding="utf-8")
         for trip_id in real:
-            self.assertNotIn(trip_id, text)
+            # 失敗したときに実際の旅程の値と全文を CI のログに出さないよう、真偽だけを見る
+            self.assertFalse(trip_id in text, "fixture に実際の旅程の識別子が含まれている")
 
     def test_list_uses_the_trip_id_inside_the_file_and_skips_unreadable_files(self):
         ids = [i["trip_id"] for i in self.body("/api/blog/trips")["items"]]
@@ -152,3 +154,16 @@ class BlogFixtureTest(unittest.TestCase):
         dup = [c for c in manifest["chapters"] if c["id"] == "dup"]
         self.assertEqual(len(dup), 2)
         self.assertTrue(all("後の区間" in c["body"] for c in dup))
+
+    def test_segment_ids_are_dict_keys(self):
+        # 区間の id は dict のキー。5 と 5.0、2.0 と 2、True と 1、0 と False は同じキーで、後の区間が残る。
+        # "7" と 7 は別のキー。null と id なしは同じキー（dict.get の None）
+        chapters = self.body("/api/blog/draft?trip_id=sample-trip-keys")["manifest"]["chapters"]
+        titles = [re.search("「(.*?)」", c["body"]).group(1) for c in chapters]
+        self.assertEqual([c["id"] for c in chapters],
+                         [5, 5.0, 2.0, 2, True, 1, 0, False, "7", 7, None, None])
+        self.assertEqual(titles, ["小数の5.0", "小数の5.0", "整数の2", "整数の2", "整数の1", "整数の1",
+                                  "偽", "偽", "文字列の7", "整数の7", "idなし", "idなし"])
+        # 型は応答にそのまま出る（5 は 5、5.0 は 5.0、True は true）
+        self.assertEqual([type(c["id"]) for c in chapters[:2]], [int, float])
+        self.assertIs(chapters[4]["id"], True)

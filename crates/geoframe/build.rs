@@ -7,7 +7,8 @@
 //!
 //! 生成物は `$OUT_DIR/embedded_files.rs`。パスは `static/admin.html` のような `app/` からの相対で、
 //! ソート済み（二分探索）。ドットで始まる名前は含めない（配信側もドット始まりは拒否する）。
-//! 旅程 JSON は別の表（`PLAN_FILES`。名前は `<trip_id>.json` のファイル名だけで、`.json` で終わるものだけ）。
+//! 旅程 JSON は別の表（`PLAN_FILES`。名前は `<trip_id>.json` のファイル名だけで、`.json` で終わるものだけ。
+//! `app/travel_blog/plans` 直下の通常ファイルに限り、リンクは辿らずにビルドを止める）。
 //! 配信の表（`FILES`）には入れない（`/static/`・`/vendor/` の配信とは無関係）。
 //! 各ファイルに内容のハッシュ（FNV-1a 64bit）から作った ETag を付ける。時刻は埋め込まない:
 //! チェックアウト時刻に依存する `Last-Modified` を出すと、ビルドごとに値が揺れるうえ、内容が
@@ -54,14 +55,27 @@ fn fnv1a(data: &[u8]) -> u64 {
     hash
 }
 
-/// `app/travel_blog/plans` の `*.json`（ドット始まりを除く）。ディレクトリが無ければ空の表にする。
+/// `app/travel_blog/plans` 直下の通常ファイルのうち、`*.json`（ドット始まりを除く）。ディレクトリが無ければ空の表にする。
+/// リンクは辿らず、見つけたらビルドを止める（リポジトリの外のファイルが混ざらないように。名前は出さない）。
+/// git 管理外のファイルを断るのは配布スクリプト（`deploy/rust-deploy.sh`）。ここでは git を呼ばない。
 fn plan_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    if let Ok(meta) = fs::symlink_metadata(dir) {
+        assert!(
+            !meta.file_type().is_symlink(),
+            "app/travel_blog/plans がシンボリックリンク（埋め込まない）"
+        );
+    }
     let Ok(read) = fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut out = Vec::new();
     for entry in read {
         let entry = entry.unwrap();
+        let file_type = entry.file_type().unwrap();
+        assert!(
+            !file_type.is_symlink(),
+            "app/travel_blog/plans にシンボリックリンクがある（埋め込まない。実ファイルにすること）"
+        );
         let name = entry
             .file_name()
             .into_string()
@@ -69,7 +83,7 @@ fn plan_files(dir: &Path) -> Vec<(String, PathBuf)> {
         if name.starts_with('.') || !name.ends_with(".json") {
             continue;
         }
-        if fs::metadata(entry.path()).unwrap().is_file() {
+        if file_type.is_file() {
             out.push((name, entry.path()));
         }
     }
@@ -103,7 +117,8 @@ fn main() {
     }
     code.push_str("];\n");
 
-    // 旅行ブログの旅程 JSON（git 管理のソース。実行時は `app/` を読まないので埋め込む）
+    // 旅行ブログの旅程 JSON（git 管理のソース。実行時は `app/` を読まないので埋め込む）。
+    // 直下の通常ファイルだけ。リンクは断る（git 管理外のファイルの検査は配布スクリプト）
     let plans_dir = app.join("travel_blog/plans");
     println!("cargo:rerun-if-changed={}", plans_dir.display());
     code.push_str("static PLAN_FILES: &[PlanFile] = &[\n");

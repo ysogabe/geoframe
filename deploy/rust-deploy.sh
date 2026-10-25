@@ -12,6 +12,7 @@
 #
 # deploy.sh（Python 版。本番機で git を取り込む薄いラッパー）とは別物で、こちらはバイナリを
 # 手元でビルドして送る。やること:
+#   0. 埋め込む旅程（app/travel_blog/plans）に git 管理外のファイルかリンクがあれば、ビルド前に止める
 #   1. cargo build --release --target x86_64-unknown-linux-musl -p geoframe（完全静的）
 #   2. バイナリと unit を転送（sha256 で照合）
 #   3. 配置先のバイナリを .prev に残して入れ替え、unit を入れて daemon-reload・enable・restart
@@ -82,6 +83,9 @@ unit とバイナリ（geoframe.failed へ退避）を撤去する。
     （未導入は not-found/inactive で通る。LoadState は見ない: unit ファイルが無くても動いている
     サービスはありうるので、not-found/active も拒否。稼働中・状態を取得できない・空出力・未知の状態・状態の行の欠け／重複も拒否）。
   本番の切替は P5 で、専用の手順と明示的なフラグをそのとき作る（このスクリプトは本番に配れない）。
+
+ビルドの前に、app/travel_blog/plans（バイナリへ埋め込まれる旅程）に git 管理外（未追跡・無視）のファイルか
+リンクがあれば、終了コード 1 で止める（--dry-run・--skip-build でも検査する）。ログには件数だけを出す。
 
 本番機には実行しないこと（本番の切替は P5）。
 USAGE
@@ -493,8 +497,28 @@ if [ "$ROLLBACK" -eq 1 ]; then
     exit "$rc"
 fi
 
-# --- 1. ビルド ---
+# --- 1. 埋め込む旅程の検査 ---
+# crates/geoframe/build.rs は app/travel_blog/plans の *.json をバイナリへ埋め込む。git の管理外（未追跡・
+# .gitignore で無視）のファイルやリンクがあると、同じコミットの表示でも手元だけの旅程が混ざって配られる
+# （下の DIRTY は管理下の変更しか見ない）。名前や内容はログに出さず、件数と真偽だけ。
+check_embedded_plans() {
+    local dir="app/travel_blog/plans" links untracked=0 status
+    [ -e "$dir" ] || [ -L "$dir" ] || return 0
+    links="$(find "$dir" -type l | wc -l | tr -d ' ')"
+    if [ "$links" -eq 0 ]; then
+        status="$(git status --porcelain --untracked-files=all --ignored -- "$dir" 2>/dev/null)" \
+            || die "埋め込む旅程の git の状態を調べられない（git の作業ツリーで実行すること）"
+        untracked="$(printf '%s' "$status" | grep -c -E '^(\?\?|!!) ' || true)"
+    fi
+    log "旅程の検査: ${dir} の git 管理外のファイル ${untracked} 件、リンク ${links} 件"
+    if [ "$links" -ne 0 ] || [ "$untracked" -ne 0 ]; then
+        die "埋め込む旅程に git 管理外のファイルかリンクがある。取り除くかコミットしてから配ること（名前はここに出さない。git status --ignored で確認）"
+    fi
+}
+
+# --- 2. ビルド ---
 cd "$REPO_ROOT"
+check_embedded_plans
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIRTY=""
 git diff --quiet HEAD -- crates Cargo.toml Cargo.lock app/static app/vendor app/travel_blog/plans 2>/dev/null || DIRTY="（未コミットの変更あり）"
@@ -523,7 +547,7 @@ if [ "$DRY_RUN" -eq 1 ]; then
     exit 0
 fi
 
-# --- 2. 誤配布の検査（何も転送・変更しないうちに。リモートの本体でも変更の前に再検査する）---
+# --- 3. 誤配布の検査（何も転送・変更しないうちに。リモートの本体でも変更の前に再検査する）---
 log "検査    : 接続先が検証環境か（印と Python 版の稼働）"
 rc=0
 remote_run preflight "''" || rc=$?
@@ -533,7 +557,7 @@ case "$rc" in
     *) die "接続先の検査を完了できない（終了コード ${rc}）。何も変更していない" ;;
 esac
 
-# --- 3. 転送（リモートの一時ディレクトリへ。sha256 を照合）---
+# --- 4. 転送（リモートの一時ディレクトリへ。sha256 を照合）---
 log "転送    : 検証環境の一時ディレクトリへ（sha256 で照合）"
 STAGE="$(ssh_run 'mktemp -d /tmp/geoframe-rs-deploy.XXXXXX')"
 case "$STAGE" in /tmp/geoframe-rs-deploy.*) ;; *) die "リモートの一時ディレクトリが想定外: ${STAGE}" ;; esac
@@ -544,7 +568,7 @@ scp -q -- "$LOCAL_UNIT" "${SSH_TARGET}:${STAGE}/${UNIT_NAME}"
 REMOTE_SUM="$(ssh_run "sha256sum '${STAGE}/geoframe'" | cut -d' ' -f1)"
 [ "$REMOTE_SUM" = "$SUM" ] || die "転送後の sha256 が一致しない"
 
-# --- 4〜5. 入れ替え・確認・失敗時の復元（リモート）---
+# --- 5〜6. 入れ替え・確認・失敗時の復元（リモート）---
 rc=0
 remote_run deploy "'${STAGE}'" || rc=$?
 case "$rc" in

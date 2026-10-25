@@ -328,6 +328,8 @@ async fn malformed_plan_shapes_are_rejected_without_crashing() {
         "locations-object.json": plan("locations-object", serde_json::json!([seg(serde_json::json!({"locations": {"a": 1}}))])),
         "activities-string.json": plan("activities-string", serde_json::json!([seg(serde_json::json!({"activities": "x"}))])),
         "activity-string.json": plan("activity-string", serde_json::json!([seg(serde_json::json!({"activities": ["x"]}))])),
+        "id-list.json": plan("id-list", serde_json::json!([seg(serde_json::json!({"id": [1]}))])),
+        "id-object.json": plan("id-object", serde_json::json!([seg(serde_json::json!({"id": {"a": 1}}))])),
         "nan.json": "{\"trip_id\": \"nan\", \"segments\": [], \"x\": NaN}",
         "ok.json": plan("ok", serde_json::json!([seg(serde_json::json!({}))])),
     });
@@ -354,6 +356,8 @@ async fn malformed_plan_shapes_are_rejected_without_crashing() {
         [
             "activities-string",
             "activity-string",
+            "id-list",
+            "id-object",
             "locations-number",
             "locations-object",
             "ok",
@@ -390,7 +394,13 @@ async fn malformed_plan_shapes_are_rejected_without_crashing() {
         );
     }
     // 活動の形が壊れているのは初期案の本文を作るときに分かる（候補だけなら使わない）
-    for id in ["activities-string", "activity-string"] {
+    // 区間の id が配列・オブジェクトなら、Python は初期案の `dict` のキーにできず落ちる（候補は返る）
+    for id in [
+        "id-list",
+        "id-object",
+        "activities-string",
+        "activity-string",
+    ] {
         assert_eq!(
             site.json(&format!("/api/blog/candidates?trip_id={id}"))
                 .await

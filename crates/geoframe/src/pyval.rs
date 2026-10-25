@@ -120,6 +120,45 @@ fn is_py_digit(c: char) -> bool {
         .any(|&(lo, hi)| (lo..=hi).contains(&code))
 }
 
+/// Python の `dict` のキーとして等しいかを見るための値（`hash`・`==` が同じものは同じキー）。
+/// 数は値で比べる（`5` と `5.0` と `True`・`1`、`0` と `0.0` と `False` は同じ。`"5"` は別）。
+/// 整数と浮動小数の `==` は厳密なので、2^53 を超える整数と、それに丸まる浮動小数は別になる。
+/// `u64` を超える整数は `serde_json` が `f64` にする（server.md §0）ので、その浮動小数と同じキーになる
+/// （Python は別）。`NaN` は `serde_json` が読まないので現れない。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DictKey {
+    None,
+    Int(i128),
+    /// 整数でない浮動小数のビット列（`-0.0` は整数の 0 に寄るのでここには来ない）。
+    Float(u64),
+    Str(String),
+}
+
+/// `dict` のキーにできる値のキー。配列・オブジェクトは Python が `TypeError`（unhashable）なので `None`。
+pub fn dict_key(value: &Value) -> Option<DictKey> {
+    Some(match value {
+        Value::Null => DictKey::None,
+        Value::Bool(b) => DictKey::Int(i128::from(*b)),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                DictKey::Int(i128::from(i))
+            } else if let Some(u) = n.as_u64() {
+                DictKey::Int(i128::from(u))
+            } else {
+                let f = n.as_f64()?;
+                // i128 に収まる整数値の浮動小数は、同じ値の整数と等しい（2^126 未満なら厳密に変換できる）
+                if f.is_finite() && f.fract() == 0.0 && f.abs() < 2f64.powi(126) {
+                    DictKey::Int(f as i128)
+                } else {
+                    DictKey::Float(f.to_bits())
+                }
+            }
+        }
+        Value::String(s) => DictKey::Str(s.clone()),
+        Value::Array(_) | Value::Object(_) => return None,
+    })
+}
+
 /// `s[:n]`（コードポイント数で切る）。
 pub fn prefix_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
@@ -222,6 +261,45 @@ mod tests {
         ] {
             assert_eq!(is_py_digit_str(s), expected, "{s:?}");
         }
+    }
+
+    /// 期待値は Python 3.13 の `{k: ...}`（同じキーになるか）で確かめたもの。
+    #[test]
+    fn dict_keys_follow_python_equality() {
+        let key = |v: Value| dict_key(&v).expect("hashable");
+        let same = |a: Value, b: Value| key(a) == key(b);
+        assert!(same(json!(5), json!(5.0)));
+        assert!(same(json!(1), json!(true)));
+        assert!(same(json!(1.0), json!(true)));
+        assert!(same(json!(0), json!(false)));
+        assert!(same(json!(0.0), json!(false)));
+        assert!(same(json!(0), json!(-0.0)));
+        assert!(same(json!(100), serde_json::from_str("1e2").unwrap()));
+        assert!(same(json!(1.5), json!(1.5)));
+        assert!(same(json!("a"), json!("a")));
+        assert!(same(json!(null), json!(null)));
+        assert!(!same(json!("5"), json!(5)));
+        assert!(!same(json!("5"), json!(5.0)));
+        assert!(!same(json!("True"), json!(true)));
+        assert!(!same(json!(null), json!(0)));
+        assert!(!same(json!(null), json!("")));
+        assert!(!same(json!(5), json!(5.5)));
+        assert!(!same(json!(2), json!(true)));
+        assert!(!same(json!(-1), json!(1)));
+        // 2^53+1 の整数は、2^53 の浮動小数と別（Python: 9007199254740993 != 9007199254740992.0）
+        assert!(!same(
+            json!(9_007_199_254_740_993_i64),
+            json!(9_007_199_254_740_992.0)
+        ));
+        assert!(same(
+            json!(9_007_199_254_740_992_i64),
+            json!(9_007_199_254_740_992.0)
+        ));
+        // 整数にならない大きな浮動小数も自分とは等しい
+        assert!(same(json!(1e300), json!(1e300)));
+        assert!(!same(json!(1e300), json!(1e299)));
+        assert!(dict_key(&json!([1])).is_none());
+        assert!(dict_key(&json!({"a": 1})).is_none());
     }
 
     #[test]
