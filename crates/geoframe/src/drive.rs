@@ -879,9 +879,18 @@ fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> Result
 }
 
 fn read_json(response: ureq::http::Response<ureq::Body>) -> Result<Value, DriveError> {
+    read_json_within(response, MAX_JSON_BYTES)
+}
+
+/// [`read_json`] の本体。展開後の上限 `max` を引数にしてあるのは、試験が 16 MiB 規模の本文を流さずに
+/// 上限の挙動（`BodyExceedsLimit` → `TooLarge`）を確かめられるようにするため（本番は常に [`MAX_JSON_BYTES`]）。
+fn read_json_within(
+    response: ureq::http::Response<ureq::Body>,
+    max: u64,
+) -> Result<Value, DriveError> {
     let (_, mut body) = response.into_parts();
     // 上限は展開後の大きさに効かせる（`net::read_body_limited`）
-    let bytes = net::read_body_limited(&mut body, MAX_JSON_BYTES).map_err(|e| match e {
+    let bytes = net::read_body_limited(&mut body, max).map_err(|e| match e {
         ureq::Error::BodyExceedsLimit(_) => DriveError::TooLarge,
         other => DriveError::Net(Failure::from(&other)),
     })?;

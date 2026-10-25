@@ -2666,14 +2666,27 @@ fn empty_gzip_members_are_stopped_by_the_wire_limit() {
     assert_eq!(error, DriveError::TooLarge);
     assert!(!error.is_outage());
     assert!(out.is_empty());
-    // 小さな JSON（read_json）も同じ
-    let json_wire = crate::net::wire_limit(MAX_JSON_BYTES) as usize;
+    // 小さな JSON（read_json）も同じ。本番の上限（16 MiB）は圧縮前に約 32 MiB（空のメンバー約 160 万個）まで
+    // 流さないと超えず、遅い機械では時間切れと競うので、上限だけを小さくした `read_json_within` で確かめる
+    // （上限の値そのものは `read_json` が `MAX_JSON_BYTES` を渡すことで決まる）
+    let json_max = 1000u64;
+    let json_wire = crate::net::wire_limit(json_max) as usize;
+    let probe = || {
+        crate::net::agent()
+            .get(&format!("{}/probe", e.stub.base_url()))
+            .call()
+            .unwrap()
+    };
+    serve(json_wire / member - 1);
+    assert_eq!(
+        read_json_within(probe(), json_max),
+        Err(DriveError::BadResponse)
+    );
     serve(json_wire / member + 2);
-    let response = crate::net::agent()
-        .get(&format!("{}/probe", e.stub.base_url()))
-        .call()
-        .unwrap();
-    assert_eq!(read_json(response), Err(DriveError::TooLarge));
+    assert_eq!(
+        read_json_within(probe(), json_max),
+        Err(DriveError::TooLarge)
+    );
 }
 
 /// スタブの壊れた本文が、実際に `ureq` の `Protocol`・`Decompress` を返すこと（この 2 つが理由の本文の
