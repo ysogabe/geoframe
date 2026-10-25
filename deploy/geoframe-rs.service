@@ -81,16 +81,22 @@ MemoryDenyWriteExecute=true
 #   derivatives/ … 起動時の .dl_* の掃除と、derivative の生成（T2.2〜）
 #   tmp/ … Drive 原本の一時ダウンロード先（derivatives/ の外。配信の許可 prefix の外）
 #   .cache.json(.tmp) … 地名の永続キャッシュ    .ingest.lock … 取り込みの二重起動を防ぐロック
-# ただし GEOFRAME_INGEST=1 を設定しない限り（既定は 0）、writer は作られず何も書かない。P5 の切替まで
-# 本番の書き手は Python 版なので、/etc/default/geoframe で明示するまで Rust は書かない。
+#   tile_cache/ … 地図タイルのキャッシュ（E11 の取得と、起動時・1 時間ごとの掃除。T3.4）。catalog.db ではない
+#     ので、GEOFRAME_INGEST が 0 でも書く・消す（読み取り専用にする photos/ の下には無い）
+#   travel_blog/drafts/ … 旅行ブログの下書き（E15。一次データ）    blog_exports/ … 書き出し（E16。作業領域と退避先を含む）
+#     どちらも writer が動いているとき（GEOFRAME_INGEST=1）だけ書く。GEOFRAME_INGEST=0 の間は、保存・書き出しの
+#     要求は書かずに 503 を返す（P5 の切替まで、本番で下書きを書くのは Python 版。docs/rust-migration/server.md §21）
+# ただし GEOFRAME_INGEST=1 を設定しない限り（既定は 0）、writer は作られず、catalog.db・derivatives/ には
+# 何も書かない（上の tile_cache/ は除く）。P5 の切替まで本番の書き手は Python 版なので、
+# /etc/default/geoframe で明示するまで Rust は DB に書かない。
 # GEOFRAME_INGEST=1 でも、P5 までは検証環境の印（/etc/geoframe/staging）が無い、または geoframe-server が
 # 非稼働と確認できないと、書き込みの前に終了コード 2 で断る（docs/rust-migration/server.md §11.1.1）。
 # 終了コード 2 は下の RestartPreventExitStatus=2 により再起動ループにならない。
 # 引き続き読み取り専用にするもの（先頭の "-" は無いパスを無視する指定。ReadOnlyPaths は
 # StateDirectory の書き込み許可より後に効く）:
 #   photos/ … ローカル原本。索引は読むだけ（T2.3 の --organize が動かすときに見直す）
-#   blog_exports/・travel_blog/ … 旅行ブログ（P3 で更新 API を足すときに外す）
-ReadOnlyPaths=-/var/lib/geoframe/photos -/var/lib/geoframe/blog_exports -/var/lib/geoframe/travel_blog
+# （旅行ブログの travel_blog/・blog_exports/ は T3.6 で外した。上のとおり取り込みが有効なときだけ書く）
+ReadOnlyPaths=-/var/lib/geoframe/photos
 # 注意: catalog.db を別の inode に置き換えた（mv で復元した）場合は、再起動するまで古い方を見続ける。
 # 復元後は必ず再起動する（docs/rust-migration/server.md §2.4）。
 

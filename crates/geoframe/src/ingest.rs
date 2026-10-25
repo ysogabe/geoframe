@@ -24,7 +24,8 @@
 //! 6. `derivatives/` の書きかけの `*.part`（プロセスが `SIGKILL`・電源断で落ちて残ったもの）を消す
 //!    （[`sweep_part_files`]）。
 //!
-//! 地図タイルの掃除（`tile_cache_prune`）は P3。
+//! 地図タイルの掃除（`tile_cache_prune`）は取り込みの起動時の掃除に含めない。`catalog.db` に書かないので、取り込みの有無に
+//! 関わらず `serve` が独立のスレッドで行う（[`crate::tiles::spawn_pruner`]。T3.4）。
 
 use std::fs::{self, File, TryLockError};
 use std::io;
@@ -165,6 +166,9 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         0 => {}
         n => tracing::info!("[derivative] 書きかけの .part を{n}件削除しました"),
     }
+
+    // 旅行ブログの書き出しの作業領域・置き換え途中の書き出し・下書きの書きかけ（強制終了・電源断で残ったもの）
+    crate::blog_write::sweep_leftovers(&config.data_dir);
 
     Ok(Ingest {
         writer,

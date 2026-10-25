@@ -25,7 +25,7 @@
 | # | メソッド・パス | クエリ／本文 | 応答の要点 | 状態変更 | 外部通信 | 実装箇所 | 呼び出し元 | 一致 | フェーズ |
 |---|---|---|---|---|---|---|---|---|---|
 | E1 | GET `/api/v1/photos` | なし | 写真オブジェクトのJSON配列（契約。`id file time lat lon pref city title fav fetched_at quality_* trip` ほか内部値）。位置あり・display有り・hidden除外・品質/AIの抑制除外。撮影日時昇順、時刻不明は最後。`trip` は48時間超の空きで0から採番 | なし | なし | `photos.py:api_photos` / `photos.py:assign_trips` / `handlers.py:Handler.do_GET` | miharashi（表示） | クエリ除去後の完全一致 | P1 |
-| E2 | GET `/api/admin/status` | なし | `sync{ready,pending,total}`、`db{件数内訳、by_loc_source、infer_buckets、quality、ai、loc}`、`disk`（60秒キャッシュ）、`server_time` | なし | なし | `admin.py:api_admin_status`、`loc_suggest.py:loc_status`、`admin.py:disk_info` | `admin.js`（STATUSタブ）、`deploy/loc_decision_morning.py`（`db.loc.clue_pending` を読む） | **生パスの前方一致**（`/api/admin/status?x` も `/api/admin/statusX` も通る） | P1（AI・位置候補の列は読み取りのみ。テーブルが空でも動くこと） |
+| E2 | GET `/api/admin/status` | なし | `sync{ready,pending,total}`（**Rustは保留があるときだけ`mass_delete_hold`を足す**。T3.7⑤）、`db{件数内訳、by_loc_source、infer_buckets、quality、ai、loc}`、`disk`（60秒キャッシュ）、`server_time` | なし | なし | `admin.py:api_admin_status`、`loc_suggest.py:loc_status`、`admin.py:disk_info` | `admin.js`（STATUSタブ）、`deploy/loc_decision_morning.py`（`db.loc.clue_pending` を読む） | **生パスの前方一致**（`/api/admin/status?x` も `/api/admin/statusX` も通る） | P1（AI・位置候補の列は読み取りのみ。テーブルが空でも動くこと） |
 | E3 | GET `/api/admin/photos` | `page`(1)、`per`(50、上限200)、`filter`(all/noloc/fav/hidden/inferred/manual/suggest。未知はall) | `items[]`（id name thumb taken_at lat lon loc_source infer_dt_s infer_bucket place pref city fav hidden rotation source、位置なしでは `hint`・`suggest`）、`page pages total filter`。並びは時刻（NULL・空は最後）→id | なし | なし | `admin.py:api_admin_photos` / `admin.py:_thumb_for` / `admin.py:_nearest_hint` / `admin.py:_suggestions` | `admin.js`（一覧） | 生パスの前方一致。`int()` 失敗は400 `bad_params` | P1 |
 | E4 | GET `/api/admin/geocode` | `q`（2文字未満は空配列） | `{ok, items[{title,lat,lon,source:'gsi'|'osm'}]}`。GSIが0件のときだけNom。失敗は空配列で握りつぶす | なし（`.cache.json` のメモリキャッシュを更新） | GSI、Nom（1秒1件の全体ロック） | `geo.py:geocode_search` / `geo.py:_gsi_geocode` / `geo.py:nominatim_search` | `admin.js`（地名検索） | 生パスの前方一致 | P3 |
 | E5 | GET `/api/ai/status` | なし | embedding件数、グループ、パイプライン状態（`photo_ai_status` 設定）、モデル切替直後の他モデル行数 | なし | なし | `ai_search.py:api_ai_status` | `ai-search.js` | 完全一致 | P4 |
@@ -39,7 +39,7 @@
 | E13 | POST `/api/admin/setflag` | JSON `{id, favorite?:bool, hidden?:bool}`（どちらも無ければ400） | `{ok,id,favorite,hidden}` | `photos.favorite`/`hidden` | なし | `admin.py:admin_setflag` | `admin.js`、`ai-search.js` | 同上 | P3 |
 | E14 | POST `/api/admin/rotate` | JSON `{id, delta:90/180/270/-90}` | `{ok,id,rotation,thumb}`。Drive由来で derivative がある写真だけ（それ以外は400） | 回転した derivative を別名で作成→`photos.display`/`rotation` 更新→旧ファイル削除 | なし | `admin.py:admin_rotate` / `util.py:derivative_name` | `admin.js`（回転ボタン。常に+90） | 同上 | P3 |
 | E15 | POST `/api/blog/save` | JSON `{trip_id, manifest}`（検証あり。章40・章内画像100・合計200枚、各文字列に長さ上限） | `{ok,trip_id,saved}`。`published` は `draft` に落として保存 | `DATA_DIR/travel_blog/drafts/<trip_id>.json`（tmp→`os.replace`） | なし | `travel_blog.py:save_blog_draft` / `travel_blog.py:_validate_manifest` | `blog-admin.js` | 同上 | P3 |
-| E16 | POST `/api/blog/export` | JSON `{trip_id, manifest, dry_run?}` | `{ok,images,path,url}`。実行中の別エクスポートがあれば409 | `DATA_DIR/blog_exports/<trip_id>/`（staging→置換、`.previous` を経由）。画像は1800pxで再エンコードしEXIF/GPSを落とす | なし | `travel_blog.py:export_blog` | `blog-admin.js` | 同上 | P3 |
+| E16 | POST `/api/blog/export` | JSON `{trip_id, manifest, dry_run?}` | `{ok,images,path,url}`（**Rustは使えない写真を飛ばしたときだけ`skipped`を足す**。T3.7④）。実行中の別エクスポートがあれば409 | `DATA_DIR/blog_exports/<trip_id>/`（staging→置換、`.previous` を経由）。画像は1800pxで再エンコードしEXIF/GPSを落とす | なし | `travel_blog.py:export_blog` | `blog-admin.js` | 同上 | P3 |
 | E17 | GET/HEAD `/`、`/admin`（`/admin/` も） | なし | `static/admin.html` を返す（内部書き換え）。`no-cache`、`X-Frame-Options: DENY`、CSP `frame-ancestors 'none'` | なし | なし | `handlers.py:Handler._admin_page_rewrite` | ブラウザ（管理画面） | `_norm_path` 後の完全一致（`/admin/../.env` は `/.env` になり403） | P1 |
 | E18 | GET/HEAD `/blog-admin` | なし | `static/blog-admin.html`（E17と同じヘッダ） | なし | なし | `handlers.py:Handler._blog_page_rewrite` | `admin.html` のTRAVEL BLOGタブ | 同上 | P1（配信）/P3（機能） |
 | E19 | GET/HEAD `/ai-search` | なし | `static/ai-search.html`（同上） | なし | なし | `handlers.py:Handler._ai_search_page_rewrite` | `admin.html` のAI写真検索タブ | 同上 | P1（配信）/P4（機能） |
@@ -140,18 +140,26 @@ Rustでも意識して残すか、直すかを決める必要がある。
 
 | 経路 | 現行の挙動 | 実装箇所 |
 |---|---|---|
-| Driveのmd5が変わった | `name md5 taken_at lat lon loc_source` を更新し、`place elev display fetched_at` をNULL、**`rotation=0`**。`loc_source` は `drive_meta`（GPS有）かNULLに**上書きされ、手動GPSは失われる**。`favorite`/`hidden` はSET句に無いので残る | `drive.py:index_drive` |
-| ローカルのmtimeが変わった | `mtime taken_at lat lon loc_source` を上書き（**手動GPSは失われる**）。`display=NULL` | `drive.py:index_local` |
-| Drive側／ローカルから消えた | 行を削除（derivativeも削除）。`favorite`/`hidden`/`manual` も一緒に消える | `drive.py:index_drive` / `index_local` |
+| Driveのmd5が変わった | `name md5 taken_at lat lon loc_source` を更新し、`place elev display fetched_at` をNULL、**`rotation=0`**。`loc_source` は `drive_meta`（GPS有）かNULLに**上書きされ、手動GPSは失われる**。`favorite`/`hidden` はSET句に無いので残る。**Rust（T3.7、2026-10-25決定）: `loc_source='manual'` の行は `lat lon loc_source place elev` を書かない**（`taken_at`・`name`・`md5`・`display`・`fetched_at`・`rotation=0`・`indexed_at` は今までどおり更新。判定は `UPDATE` の中で書く時点の行について行う）。`rotation=0` は③のとおり今のまま | `drive.py:index_drive` |
+| ローカルのmtimeが変わった | `mtime taken_at lat lon loc_source` を上書き（**手動GPSは失われる**）。`place elev display` をNULL。**Rust（T3.7）: Driveと同じく、`loc_source='manual'` の行は `lat lon loc_source place elev` を書かない**（`mtime`・`taken_at`・`display`・`indexed_at` は更新） | `drive.py:index_local` |
+| Drive側／ローカルから消えた | 行を削除（derivativeも削除）。`favorite`/`hidden`/`manual` も一緒に消える。**Rustも今のまま**（T3.7の決定: ②行の削除は変えない。消した行を旅行ブログが参照していても書き出しが止まらないよう、下の「写真の行が消える／idが変わる」で対応する） | `drive.py:index_drive` / `index_local` |
 | Driveのmd5変更時 `inferred_from`/`infer_dt_s` | UPDATEに含まれず、`loc_source` が `drive_meta`／NULL に変わっても**古い値が残る**（読む側は `loc_source` を見るため実害は小さい） | `drive.py:index_drive` |
 | 推定の錨が消えた | `inferred` の位置を取り消し、`lat lon loc_source inferred_from infer_dt_s display` をNULLへ。**derivativeのファイルは消さない**（`_thumb_for`・`loc_suggest._image_rel` が `derivatives/<drive_id>.jpg` を拾い直す） | `geo.py:infer_locations` |
-| `--organize` | 位置の無いローカル写真（`source='local' AND lat IS NULL'`）を `_excluded/no_gps/` へ移し、**行を削除**する。`favorite`/`hidden` も消える。起動引数 `--organize` の手動操作 | `drive.py:organize_photos` |
+| `--organize` | 位置の無いローカル写真（`source='local' AND lat IS NULL'`）を `_excluded/no_gps/` へ移し、**行を削除**する。`favorite`/`hidden` も消える。起動引数 `--organize` の手動操作。**Rustも今のまま**（T3.7の決定: ②） | `drive.py:organize_photos` |
 | 推定の錨が消えた後のDrive写真 | `display=NULL` になったDrive写真は `fetch_derivatives`（`source='drive' AND display IS NULL`）が取り直し、`fetched_at` が新しくなる。表示側（E1の新着ブースト）で**新着扱いになり直す** | `geo.py:infer_locations`、`drive.py:fetch_derivatives` |
-| 写真の行が消える／idが変わる | 旅行ブログの下書きは画像を `photo_id` で参照する（`travel_blog.py:319` 付近）。行が消えるか再追加で別idになると、下書きの参照が切れる（書き出し時に `_photo_source` が400） | `travel_blog.py` |
+| 写真の行が消える／idが変わる | 旅行ブログの下書きは画像を `photo_id` で参照する（`travel_blog.py:319` 付近）。行が消えるか再追加で別idになると、下書きの参照が切れる（書き出し時に `_photo_source` が400）。**Rust（T3.7、④）: 書き出しは、行が無い（`missing`）・`hidden`・表示用の画像が使えない（`no_image`）写真だけを飛ばして残りを書き出し、応答の `skipped` で知らせる**（飛ばした写真は manifest・Markdown・HTML から取り除く。全部飛んだら本文だけ。`dry_run` も数える。下書きの保存E15は写真を見ない）。idが変わること自体は今のまま | `travel_blog.py` |
 | `manual` | 再推定の対象外（`loc_source IS NULL OR 'inferred'` のみ再評価）。ほかの未解決写真の錨になる | `geo.py:infer_locations` |
-| 大量削除の保留（Rustで足した保護。T2.4） | 消す行が50件超かつDriveの行の20%超、または一覧が空のときは、削除を保留する。**意図した削除も配信に残る**（`geoframe sync --allow-mass-delete`の1回だけで外れ、`serve`の定期実行では外せない） | `drive/`（Rust） |
+| 大量削除の保留（Rustで足した保護。T2.4。**T3.7の⑤で管理画面に表示**） | 消す行が50件超かつDriveの行の20%超、または一覧が空のときは、削除を保留する。**意図した削除も配信に残る**（`geoframe sync --allow-mass-delete`の1回だけで外れ、`serve`の定期実行では外せない） | `drive/`（Rust） |
 
-**P3で決めること**（Rustは今のPythonと同じ挙動のままで、P3の更新APIと一緒に「今の仕様を残すか、守る仕様にするか」を決める）: ①mtime/md5の変更での手動GPSの上書きと、位置が動いたときの地名の付け直し ②索引からの削除・`--organize`でお気に入り・除外（`hidden`）・手動の位置が行ごと消えること ③Driveの更新（md5の変更）で`rotation`が0に戻ること ④削除→再追加で写真IDが変わり、旅行ブログの下書きの参照が切れること ⑤大量削除の保留が意図した削除も配信に残すこと（保留の件数と解除方法を管理画面で知らせる案）。
+**P3で決めたこと**（2026-10-25にユーザーが決定。実装は[tasks.md](tasks.md) T3.7、Rustの挙動は[server.md §0](server.md)・§13.7・§14.8・§10.6・§21.9）:
+
+| 番号 | 決定 | Rustの挙動 |
+|---|---|---|
+| ① | **手で直した位置を残す** | 原本が更新されたとき（Driveの`md5`の変更＝`index_drive`、ローカルの`mtime`の変更＝`index_local`）、`loc_source='manual'`の行は`lat lon loc_source place elev`を書かない（`muni_cd pref city inferred_from infer_dt_s`は元から`SET`句に無く、そのまま）。`taken_at`・`name`・`md5`・`mtime`・`display`・`fetched_at`・`rotation`（③）・`indexed_at`は今までどおり更新。手動でない行は今のまま（原本のGPSかNULLで上書き、`place elev`をNULLにして付け直し）。判定は`UPDATE`の中（`CASE WHEN loc_source = 'manual'`）で**書く時点の行**について行うので、同期サイクルが計画を読んだあとに更新API（E12）が入った行も守られる。`--dry-run`の写しにも同じ書き込み関数を当て、件数に`location_kept`（計画の時点で手動だった更新行の数）を足す。**範囲外（今のまま）**: 推定の取り消し・変更で位置が動いたときに地名を付け直すか（`infer`は地名の列に触らない。[server.md §15.2](server.md#152-infer)の5）は、この決定に含まれず、Pythonと同じ |
+| ② | **写真の行の削除は今のまま**（`index_drive`・`index_local`の削除、`--organize`）。お気に入り・除外・手動の位置は行と一緒に消える | 変更なし（Pythonと同じ）。旅行ブログ側の対応は④ |
+| ③ | **回転を0に戻すのは今のまま**（Driveの`md5`の変更で`rotation=0`、回転済みのderivativeのファイルは残る） | **決定どおり今のまま。変更なし**（Pythonと同じ） |
+| ④ | **旅行ブログの書き出しは、使えない写真を知らせて残りを書き出す**（削除→再追加でidが変わること自体は今のまま） | E16は、manifestの`photo_id`が指す写真の行が無い（`missing`）・除外（`hidden`）・表示用の画像が使えない（`no_image`）とき、全体を400で止めずにその写真だけを飛ばす。応答に`skipped: [{photo_id, reason}]`を足し、飛ばした画像は`blog-manifest.json`・`index.md`・`index.html`から取り除く。全部飛んだら本文だけを書き出す。`dry_run`も数える。`blog-admin.js`が「N枚の写真を書き出せませんでした」を理由ごとの件数付きで出す。下書きの保存（E15）は写真の存在を見ない（[server.md §21.9](server.md)） |
+| ⑤ | **大量削除の保留を管理画面に表示する**（画面からは解除しない） | `GET /api/admin/status`の`sync`に、保留があるときだけ`mass_delete_hold: {held, reason: "ratio"\|"empty_listing", drive_rows, since, checked_at}`を足す（無いときはキーを出さない。取り込み無効の`serve`・最初のサイクルの前も同じ）。`admin.js`のSTATUSタブに注意（件数・理由・解除は`geoframe sync --allow-mass-delete`を1回実行、と文字で示す）。保留の記憶はプロセスの中だけ（[server.md §10.6](server.md#106-pythonとの差まとめ)） |
 
 ### 2.3b DB外のデータ（`DATA_DIR` ほか）
 
@@ -256,7 +264,7 @@ store.py の永続キャッシュ。JSONオブジェクト。読み書きは `ca
 | `GEOFRAME_QUALITY_PER_CYCLE` | `FETCH_PER_CYCLE` | 引き継ぐ | | P2 |
 | `GEOFRAME_INFER_MIN` | `15` | 引き継ぐ | 段階窓は `{INFER_MIN, 2時間, 12時間}` | P2 |
 | `GEOFRAME_INFER_OFFSET_MIN` | `0` | 引き継ぐ | カメラ時計のずれ | P2 |
-| `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` | 引き継ぐ | 本番では連絡先入りを設定する運用 | P3 |
+| `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` | 引き継ぐ | 本番では連絡先入りを設定する運用。検証環境でのOSMのタイルの実取得は、設定のあとに行う持ち越し（P5の本番切替の前。[plan.md](plan.md) P3・P5）。Nominatimへ送るUser-Agent（`GeoFrame/0.2`）は別で、決定も同じ期限 | P3 |
 | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` | 引き継ぐ | | P3 |
 | `GEOFRAME_TILE_FETCH_PER_MIN` | `240` | 引き継ぐ | | P3 |
 | `GEOFRAME_AI_ENABLED` | `1` | 引き継ぐ（意味は「AIジョブ全体の有効化」） | `0` で E6 が503 | P4 |

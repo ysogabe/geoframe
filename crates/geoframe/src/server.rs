@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Semaphore};
 
+use axum::body::Body;
 use axum::extract::{MatchedPath, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -31,10 +32,16 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::admin::{self, AdminContext};
+use crate::blog::{self, BlogEnv, BlogError};
+use crate::cache::Cache;
 use crate::config::Config;
 use crate::db::Catalog;
-use crate::limits::{ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
-use crate::{hostcheck, photos, pyquery, statics, sysinfo, webpath};
+use crate::drive::MassDeleteBoard;
+use crate::geocode::{self, Geocoder};
+use crate::limits::{ConnBusy, ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
+use crate::tiles::{self, CacheStatus, TileProxy};
+use crate::writer::Writer;
+use crate::{csrf, hostcheck, photos, post, pyquery, statics, sysinfo, webpath};
 
 /// `/healthz` が DB の確認を待つ上限。超えたら不健康（503）として答える。`/healthz` 専用の接続の
 /// `busy_timeout`（2 秒、`db.rs`）より長く、API の読み取りとは別の接続を使うので、API が混んで
@@ -59,9 +66,29 @@ pub struct AppState {
     pub admin: Arc<AdminContext>,
     /// `disk` の直近の計測。ロックを持ったまま測るので、同時に来ても全走査は1回で済む。
     disk_cache: Arc<Mutex<Option<(Instant, Value)>>>,
+    /// `.cache.json` のメモリキャッシュ。取り込みが有効（`GEOFRAME_INGEST=1`）のときは同期サイクルと同じもの
+    /// （保存は保存スレッドに任せる）。無効のときはメモリだけ（ディスクへは書かない。[`Cache::load_memory_only`]）。
+    pub cache: Arc<Cache>,
+    /// 地名検索（`GET /api/admin/geocode`）。Nominatim の 1 秒 1 件の制限をプロセス全体で持つ。
+    pub geocoder: Arc<Geocoder>,
+    /// 地図タイルのプロキシ（`GET`/`HEAD /tiles/…`）と、そのキャッシュの掃除。流量の窓と同時数をプロセス全体で持つ。
+    pub tiles: Arc<TileProxy>,
+    /// 旅行ブログの読み取り（旅程 JSON の置き場・下書き・書き出し。E7〜E10）。
+    pub blog: Arc<BlogEnv>,
+    /// Drive の大量削除の保留の記憶（同期サイクルの `index_drive` が書く）。取り込みが有効（`GEOFRAME_INGEST=1`）の
+    /// `serve` だけが持ち、`/api/admin/status` の `sync.mass_delete_hold` に出す。無いとき（取り込み無効・試験）は
+    /// キーを出さない。
+    pub mass_delete: Option<Arc<MassDeleteBoard>>,
 }
 
 impl AppState {
+    /// 書き込み用の接続（writer）の共有ハンドル。取り込みが有効（`GEOFRAME_INGEST=1`）のときだけある。
+    /// 同期サイクルの段と同じ writer（単一接続・専用スレッド）で、更新 API もこれを通す。`None` のときの
+    /// 更新 API は、何も書かずに 503（[`post`]）。
+    pub fn writer(&self) -> Option<Writer> {
+        self.catalog.writer().cloned()
+    }
+
     /// `config.data_dir` を解決して状態を作る。解決できないとき（起動時には DB を開いているので
     /// 起きない。テストで存在しない置き場を渡した場合など）は解決前の絶対パスのままにし、
     /// 静的配信は 404 を返す。
@@ -71,6 +98,8 @@ impl AppState {
             config.data_dir.clone()
         });
         let admin = Arc::new(AdminContext::new(&config, &data_root));
+        let tiles = Arc::new(TileProxy::production(&config, &data_root));
+        let blog = Arc::new(BlogEnv::new(config.blog_plans_dir.as_deref(), &data_root));
         Self {
             config,
             catalog,
@@ -78,7 +107,38 @@ impl AppState {
             static_slots: Arc::new(Semaphore::new(STATIC_FILE_SLOTS)),
             admin,
             disk_cache: Arc::new(Mutex::new(None)),
+            cache: Arc::new(Cache::memory_only()),
+            geocoder: Arc::new(Geocoder::production()),
+            tiles,
+            blog,
+            mass_delete: None,
         }
+    }
+
+    /// 大量削除の保留の記憶を付ける（取り込みが有効の `serve`。同期サイクルの段と同じもの）。
+    pub fn with_mass_delete_board(mut self, board: Arc<MassDeleteBoard>) -> Self {
+        self.mass_delete = Some(board);
+        self
+    }
+
+    /// 地名検索が使うキャッシュを差し替える（起動時。既定は空のメモリだけのキャッシュ）。
+    pub fn with_cache(mut self, cache: Arc<Cache>) -> Self {
+        self.cache = cache;
+        self
+    }
+
+    /// 地名検索（通信先・時計）を差し替える。結合テストが、本物の地理院・Nominatim ではなくループバックのスタブへ
+    /// 向けるためのもの。本番のバイナリは呼ばない（[`geocode::Endpoints`] を参照）。
+    pub fn with_geocoder(mut self, geocoder: Arc<Geocoder>) -> Self {
+        self.geocoder = geocoder;
+        self
+    }
+
+    /// 地図タイル（通信先・時計）を差し替える。結合テストが、本物の OSM・地理院ではなくループバックのスタブへ
+    /// 向けるためのもの。本番のバイナリは呼ばない（[`tiles::TileEndpoints`] を参照）。
+    pub fn with_tiles(mut self, tiles: Arc<TileProxy>) -> Self {
+        self.tiles = tiles;
+        self
     }
 }
 
@@ -160,6 +220,13 @@ async fn api_admin_status(state: &AppState) -> Response {
             );
         }
     };
+    if let Some(hold) = state
+        .mass_delete
+        .as_deref()
+        .and_then(MassDeleteBoard::current)
+    {
+        admin::insert_mass_delete_hold(&mut status, &hold);
+    }
     match disk_info(state).await {
         Ok(disk) => status.insert("disk".into(), disk),
         Err(e) => {
@@ -235,7 +302,159 @@ async fn api_admin_photos(state: &AppState, query: Option<&str>) -> Response {
     }
 }
 
-fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
+/// `GET /api/admin/geocode`（現行の `geocode_search` と、`handlers.py` のクエリの解釈）。`q` は最初の値
+/// （`parse_qs` と同じ。空の値は無かったことになる）。2 文字未満は通信せずに空。通信と 1 秒の待ちがあるので
+/// blocking スレッドで行い、同時に処理する数に上限を付ける（空きが無ければ 503）。失敗は空の配列で、
+/// 応答にも理由を載せない。
+async fn api_admin_geocode(state: &AppState, query: Option<&str>) -> Response {
+    let params = pyquery::parse_qs_first(query.unwrap_or(""));
+    let raw = params.get("q").map_or("", String::as_str);
+    let Some(q) = geocode::clean_query(raw) else {
+        return geocode_response(Vec::new());
+    };
+    let Some(permit) = state.geocoder.try_reserve() else {
+        tracing::warn!("地名検索: 同時に処理できる数を超えたので断りました");
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "地名検索が混み合っています。しばらくしてから再試行してください",
+        );
+    };
+    let (geocoder, cache, q) = (
+        Arc::clone(&state.geocoder),
+        Arc::clone(&state.cache),
+        q.to_owned(),
+    );
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        geocoder.search(&cache, &q)
+    })
+    .await
+    {
+        Ok(items) => geocode_response(items),
+        Err(_) => {
+            tracing::error!("地名検索が異常終了しました");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "内部エラーが発生しました",
+            )
+        }
+    }
+}
+
+fn geocode_response(items: Vec<Value>) -> Response {
+    match serde_json::to_vec(&serde_json::json!({"ok": true, "items": items})) {
+        Ok(body) => json_response(StatusCode::OK, body),
+        Err(e) => {
+            tracing::error!("地名検索の結果を JSON にできません: {e}");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "内部エラーが発生しました",
+            )
+        }
+    }
+}
+
+/// 旅行ブログの読み取り API（E7〜E10）のルート。現行 `do_GET` は `/api/blog/` で始まるパスを、完全一致の4つだけ
+/// 受け、それ以外は `send_error(404)`（末尾の `/`・大文字・エンコードした名前も 404）。
+fn blog_route(path: &str) -> Option<(&'static str, BlogCall)> {
+    Some(match path {
+        "/api/blog/trips" => ("/api/blog/trips", BlogCall::Trips),
+        "/api/blog/trip" => ("/api/blog/trip", BlogCall::Trip),
+        "/api/blog/candidates" => ("/api/blog/candidates", BlogCall::Candidates),
+        "/api/blog/draft" => ("/api/blog/draft", BlogCall::Draft),
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum BlogCall {
+    Trips,
+    Trip,
+    Candidates,
+    Draft,
+}
+
+/// `GET /api/blog/…`（現行の `api_blog_*` と、`handlers.py` のクエリの解釈）。`trip_id` は `parse_qs` の最初の値
+/// （空の値は無かったことになる。無ければ `""` で 400）。応答の本文は定型文だけ（旅程の中身・例外の文字列を載せない）。
+async fn blog_response(state: &AppState, call: BlogCall, query: Option<&str>) -> Response {
+    let params = pyquery::parse_qs_first(query.unwrap_or(""));
+    let trip_id = params.get("trip_id").cloned().unwrap_or_default();
+    let env = Arc::clone(&state.blog);
+    let result = match call {
+        BlogCall::Trips => blog::trips(env).await,
+        BlogCall::Trip => blog::trip(env, trip_id).await,
+        BlogCall::Candidates => blog::candidates(env, &state.catalog, trip_id).await,
+        BlogCall::Draft => blog::draft(env, &state.catalog, trip_id).await,
+    };
+    match result {
+        Ok(value) => match serde_json::to_vec(&value) {
+            Ok(body) => json_response(StatusCode::OK, body),
+            Err(e) => {
+                tracing::error!("旅行ブログの応答を JSON にできません: {e}");
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "内部エラーが発生しました",
+                )
+            }
+        },
+        Err(BlogError::BadRequest(message)) => error_response(StatusCode::BAD_REQUEST, &message),
+        Err(BlogError::NotFound(message)) => error_response(StatusCode::NOT_FOUND, &message),
+        Err(BlogError::Unavailable(reason)) => {
+            tracing::warn!("旅行ブログの写真を読めません: {reason}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "写真を読み取れません。しばらくしてから再試行してください",
+            )
+        }
+        Err(BlogError::Internal) => {
+            tracing::error!("旅行ブログの処理が異常終了しました");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "内部エラーが発生しました",
+            )
+        }
+    }
+}
+
+/// アクセスログに出すタイルのルートのテンプレート（座標・層は出さない）。
+const TILE_ROUTE: &str = "/tiles/{*path}";
+
+/// `GET`/`HEAD /tiles/…`（現行の `_serve_tile`）。形が合わない・範囲外は 404（`send_error(404)` と同じ本文）、
+/// それ以外は常に 200（取得の失敗・流量の超過も透明 PNG）。`HEAD` も同じ処理で、本文だけ省く
+/// （`Content-Length` は `GET` と同じ）。
+async fn tile_response(state: &AppState, path: &str, method: &Method) -> Response {
+    let Some(tile) = tiles::parse_path(path) else {
+        return labeled(
+            statics::error_page(
+                StatusCode::NOT_FOUND,
+                "Not Found",
+                "Nothing matches the given URI",
+            ),
+            TILE_ROUTE,
+        );
+    };
+    let (png, status) = state.tiles.fetch(tile).await;
+    labeled(tile_ok(png, status, *method == Method::HEAD), TILE_ROUTE)
+}
+
+fn tile_ok(png: Vec<u8>, status: CacheStatus, head: bool) -> Response {
+    let len = png.len();
+    let mut response = Response::new(if head { Body::empty() } else { Body::from(png) });
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    headers.insert(header::CONTENT_LENGTH, HeaderValue::from(len));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(status.cache_control()),
+    );
+    headers.insert(
+        header::HeaderName::from_static("x-tile-cache"),
+        HeaderValue::from_static(status.as_str()),
+    );
+    response
+}
+
+pub(crate) fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
     (
         status,
         [
@@ -251,7 +470,7 @@ fn json_response(status: StatusCode, body: Vec<u8>) -> Response {
 }
 
 /// `{"ok":false,"error":"..."}`。本文は定型文だけで、環境の情報（SQLite のエラー・パス）を載せない。
-fn error_response(status: StatusCode, message: &str) -> Response {
+pub(crate) fn error_response(status: StatusCode, message: &str) -> Response {
     let body = serde_json::json!({ "ok": false, "error": message });
     json_response(status, body.to_string().into_bytes())
 }
@@ -305,16 +524,17 @@ async fn access_log(request: Request, next: Next) -> Response {
 /// 3. Host 検査（[`hostcheck`]）。不許可は 403。**Host の値はログに出さない**。
 /// 4. 絶対形式の request-target（`GET http://host/...`）は全ルートで 403（現行でもホワイトリストに
 ///    当たらず 403。`Host` ヘッダと別の宛先を名乗れる形なので、`/healthz`・`/api/v1/photos` にも通さない）。
-/// 5. `POST` は P1 では全部 403（更新系は P3 で実装する。現行の「未知の POST」と同じ応答）。
+/// 5. `POST` はルート（[`post::route_of`]）が無ければ 403。あれば [`site`] の `post::handle` が CSRF 対策
+///    （Content-Type・Origin・Content-Length・サイズ・JSON）を検査する。
 async fn guard(State(state): State<AppState>, request: Request, next: Next) -> Response {
     let method = request.method();
     if !matches!(*method, Method::GET | Method::HEAD | Method::POST) {
         return statics::unsupported_method(method);
     }
     let mut hosts = request.headers().get_all(header::HOST).iter();
-    let host = hosts
-        .next()
-        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+    // 現行は生のバイトを Latin-1 の文字列として読む（csrf.rs）。UTF-8 として読み直すと、`\xC2\xA0` が NBSP 1 文字になって
+    // 空白として取り除かれ、現行が断る値を通してしまう
+    let host = hosts.next().map(|v| csrf::latin1(v.as_bytes()));
     if hosts.next().is_some() {
         return statics::bad_request();
     }
@@ -331,7 +551,9 @@ async fn guard(State(state): State<AppState>, request: Request, next: Next) -> R
     if request.uri().scheme().is_some() {
         return statics::forbidden();
     }
-    if *method == Method::POST {
+    // ルートの無い POST は 403（`/healthz` など GET の API も）。ルートのある POST は CSRF 対策を含めて
+    // `post::handle` が検査する
+    if *method == Method::POST && post::route_of(request.uri().path()).is_none() {
         return statics::forbidden();
     }
     next.run(request).await
@@ -380,8 +602,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// まだ Rust 版に無い機能（管理画面の地名検索と更新 API・AI・旅行ブログ・地図タイル）。P3 / P4 で
-/// 実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
+/// まだ Rust 版に無い機能（AI）。P4 で実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
 /// （「禁止」ではなく「まだ無い」と分かるように）。
 fn not_yet_implemented(label: &'static str) -> Response {
     labeled(
@@ -398,16 +619,41 @@ fn not_yet_implemented(label: &'static str) -> Response {
 ///
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
-///    `/tiles/`（地図タイル、P3）と、残りの `GET` の `/api/admin/`（地名検索）・`/api/ai/`・`/api/blog/` は 503。
+///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
+///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/blog/`（旅行ブログの読み取り。T3.5。完全一致の4つ以外は 404）は [`blog_response`]、`/api/ai/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
+///    ホワイトリストに当たらず 403 なので、下の静的配信の判定へ回す。
 /// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML。
 /// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
 ///    `/static/`・`/vendor/` は埋め込み、`/derivatives/`・`/photos/`・`/blog_exports/` はデータ置き場から。
 ///
 /// `HEAD` も `GET` と同じ判定を通る（`HEAD /api/...` は静的のホワイトリストに当たらず 403。現行と同じ）。
 async fn site(State(state): State<AppState>, request: Request) -> Response {
-    let (parts, _body) = request.into_parts();
+    let (parts, body) = request.into_parts();
     let method = &parts.method;
     let raw = parts.uri.path();
+    if *method == Method::POST {
+        // 入口の検査（`guard`）がルートの有無を済ませている。現行は行の読み込みで断る大きさ（414・431）を、
+        // hyper の上限は緩いのでここで断る
+        if let Some(response) = post::head_limits(&parts.uri, &parts.headers) {
+            return response;
+        }
+        return match post::route_of(raw) {
+            Some(route) => {
+                // 書き出し（E16）などの長い処理の間は、無通信の期限で接続を切らない（`serve` が付けた接続の情報。
+                // 付いていない起動のしかた（試験）では何もしない）。止めるのは**本文を読み終えて検査したあと**の
+                // 処理の間だけで、本文の受信中は期限を働かせたままにする（`post::handle`）
+                let busy = parts
+                    .extensions
+                    .get::<axum::extract::ConnectInfo<ConnInfo>>()
+                    .map(|info| info.0.busy.clone());
+                labeled(
+                    post::handle(&state, route, &parts.headers, body, busy.as_ref()).await,
+                    route.label(),
+                )
+            }
+            None => statics::forbidden(),
+        };
+    }
     // 現行の `http.server` は、先頭の `//` を1つの `/` にしてから `do_GET` に渡す。接頭辞の判定は
     // その後のパスで行う（`//api/admin/status` も当たる）。静的配信の正規化（`webpath::normalize`）は
     // 元のパスを受けて自分で同じ畳み込みをする
@@ -419,8 +665,9 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
         raw
     };
 
+    // 現行の `do_GET`/`do_HEAD` は、`/tiles/` を他のどの判定よりも先に（生のパスで）見る
     if path.starts_with("/tiles/") {
-        return not_yet_implemented("/tiles/{*path}");
+        return tile_response(&state, path, method).await;
     }
     if *method == Method::GET {
         // axum のルートは完全一致なので、`//api/v1/photos` はここへ来る（現行は200）
@@ -436,14 +683,29 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 "/api/admin/photos",
             );
         }
-        for (prefix, label) in [
-            ("/api/admin/", "/api/admin/{*path}"),
-            ("/api/ai/", "/api/ai/{*path}"),
-            ("/api/blog/", "/api/blog/{*path}"),
-        ] {
-            if path.starts_with(prefix) {
-                return not_yet_implemented(label);
-            }
+        if path.starts_with("/api/admin/geocode") {
+            return labeled(
+                api_admin_geocode(&state, parts.uri.query()).await,
+                "/api/admin/geocode",
+            );
+        }
+        if path.starts_with("/api/blog/") {
+            return match blog_route(path) {
+                Some((label, call)) => {
+                    labeled(blog_response(&state, call, parts.uri.query()).await, label)
+                }
+                None => labeled(
+                    statics::error_page(
+                        StatusCode::NOT_FOUND,
+                        "Not Found",
+                        "Nothing matches the given URI",
+                    ),
+                    "/api/blog/{*path}",
+                ),
+            };
+        }
+        if path.starts_with("/api/ai/") {
+            return not_yet_implemented("/api/ai/{*path}");
         }
     }
     let Some(normalized) = webpath::normalize(raw) else {
@@ -519,6 +781,25 @@ async fn shutdown_signal() {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
+    // 実行中の旅行ブログの書き出しは、次の画像の前で作業領域を片付けて止まる（前の書き出しは残る）
+    crate::blog_write::request_stop();
+}
+
+/// 接続ごとの付随情報（`axum::extract::ConnectInfo`）。長い処理を持つ `POST` が、その間だけ無通信の期限を
+/// 止めるために使う（[`ConnBusy`]）。
+#[derive(Clone, Debug)]
+pub struct ConnInfo {
+    pub busy: ConnBusy,
+}
+
+impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, LimitedListener>>
+    for ConnInfo
+{
+    fn connect_info(stream: axum::serve::IncomingStream<'_, LimitedListener>) -> Self {
+        Self {
+            busy: stream.io().busy().clone(),
+        }
+    }
 }
 
 pub async fn serve(state: AppState) -> std::io::Result<()> {
@@ -530,9 +811,12 @@ pub async fn serve(state: AppState) -> std::io::Result<()> {
     );
     // 接続の総数・送信の停滞・無通信の上限（limits.rs）
     let listener = LimitedListener::new(listener, ConnLimits::default());
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<ConnInfo>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
     tracing::info!("停止しました");
     Ok(())
 }
@@ -546,7 +830,14 @@ mod tests {
 
     fn state(catalog: Catalog) -> AppState {
         let config = Config::load(|_| None, &Overrides::default()).unwrap();
-        AppState::new(Arc::new(config), catalog)
+        let state = AppState::new(Arc::new(config), catalog)
+            .with_geocoder(crate::geocode::stub::deny_geocoder());
+        let proxy = TileProxy::with_endpoints(
+            &state.config,
+            &state.data_root,
+            crate::tiles::stub::deny_endpoints(),
+        );
+        state.with_tiles(Arc::new(proxy))
     }
 
     /// 127.0.0.1 の空きポートで router を起動し、(状態行, ヘッダ, 本文) を返す GET を用意する。

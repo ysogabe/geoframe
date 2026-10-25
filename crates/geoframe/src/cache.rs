@@ -14,9 +14,8 @@
 //! 値は [`serde_json::Value`] のまま持つ（`geo:` の中身を型に落とさないので、往復で欠けない）。
 //! 書き出しは Python の `json.dumps(ensure_ascii=False, indent=1)` と同じ形（インデント 1、日本語は
 //! そのまま）にする。Python が書いたファイルを Rust が、Rust が書いたファイルを Python が、そのまま
-//! 読める。**違うのはキーの並びだけ**: Python は挿入順、Rust は辞書順で書く（`serde_json` の
-//! `preserve_order` を入れると、他の応答の JSON のキーの並びまで変わるため入れない）。初めて Rust が
-//! 保存したときに 1 度だけ並びが変わり、以後は安定する。読むときの並びは問わない。
+//! 読める。キーの並びは**読んだ順のまま、新しいキーは末尾**（Python の挿入順と同じ。T3.6 で `serde_json` の
+//! `preserve_order` を入れた。それまでは Rust だけ辞書順で書いていた）。
 //!
 //! **座標を 3 桁に丸めた値がキーに入るので、ファイルは位置情報を含む**。リポジトリ・テストの実データ・
 //! ログに出さない（テストは合成の値だけ）。ログに出すのは件数だけ。
@@ -32,6 +31,10 @@
 //!   保存の全体は保存用の排他で 1 つずつにする。停止時の [`Cache::save_final`] は、保存スレッドが
 //!   I/O の最中ならそれを期限まで待ち、順番が来なければ書かずに省略する（重ねて書かない）。
 //! - 凍結（[`Cache::load_frozen`]）は `--dry-run` 用で、`put`・`purge`・保存をしない。
+//! - メモリだけ（[`Cache::load_memory_only`]・[`Cache::memory_only`]）は、取り込みが無効（`GEOFRAME_INGEST=0`）の
+//!   `serve` の地名検索用で、読み込み（無ければ空）と `put` はするが、**ディスクへは書かない**（`purge`・保存をしない）。
+//!   本番の書き手は P5 の切替まで Python なので、`.cache.json` を Rust が書かない。プロセスの中だけで、同じ語を
+//!   Nominatim へ何度も問い合わせない。再起動すると消える。
 
 use std::fs;
 use std::io::Write;
@@ -77,10 +80,21 @@ struct State {
     saved_at: Option<Instant>,
 }
 
+/// キャッシュの使い方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// 読み書きと保存（取り込みが有効）。
+    Persistent,
+    /// 読むだけ（`--dry-run`）。
+    Frozen,
+    /// 読み書きはするが、ディスクへは書かない（取り込みが無効の `serve`）。
+    MemoryOnly,
+}
+
 pub struct Cache {
     file: PathBuf,
     tmp: PathBuf,
-    frozen: bool,
+    mode: Mode,
     state: Mutex<State>,
     /// 保存の全体（スナップショット〜一時ファイルへの書き込み〜`fsync`〜`rename`）を 1 つずつにする。
     /// 保存中は `state` の Mutex を放すうえ、一時ファイル名は共通なので、2 つの保存が重なると
@@ -91,15 +105,35 @@ pub struct Cache {
 impl Cache {
     /// `.cache.json` を読む。無い・壊れている・オブジェクトでないときは空から始める。
     pub fn load(data_dir: &Path) -> Self {
-        Self::load_with(data_dir, false)
+        Self::load_with(data_dir, Mode::Persistent)
     }
 
     /// 読むだけ（`put`・`purge_legacy`・保存はしない）。`--dry-run` 用。
     pub fn load_frozen(data_dir: &Path) -> Self {
-        Self::load_with(data_dir, true)
+        Self::load_with(data_dir, Mode::Frozen)
     }
 
-    fn load_with(data_dir: &Path, frozen: bool) -> Self {
+    /// `.cache.json` を読み、`put` はメモリだけに入れる（`purge_legacy`・保存はしない）。取り込みが無効の `serve` 用。
+    pub fn load_memory_only(data_dir: &Path) -> Self {
+        Self::load_with(data_dir, Mode::MemoryOnly)
+    }
+
+    /// 空で始めるメモリだけのキャッシュ（ファイルを読まない）。
+    pub fn memory_only() -> Self {
+        Self {
+            file: PathBuf::new(),
+            tmp: PathBuf::new(),
+            mode: Mode::MemoryOnly,
+            state: Mutex::new(State {
+                map: Map::new(),
+                dirty: false,
+                saved_at: None,
+            }),
+            save_lock: Mutex::new(()),
+        }
+    }
+
+    fn load_with(data_dir: &Path, mode: Mode) -> Self {
         let file = data_dir.join(".cache.json");
         let map = match fs::read_to_string(&file) {
             Ok(text) => match serde_json::from_str::<Value>(&text) {
@@ -119,7 +153,7 @@ impl Cache {
         Self {
             tmp: data_dir.join(".cache.json.tmp"),
             file,
-            frozen,
+            mode,
             state: Mutex::new(State {
                 map,
                 dirty: false,
@@ -141,17 +175,41 @@ impl Cache {
         self.len() == 0
     }
 
+    /// 全体の写し（試験用）。
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> Map<String, Value> {
+        self.state().map.clone()
+    }
+
     pub fn get(&self, key: &str) -> Option<Value> {
         self.state().map.get(key).cloned()
     }
 
     pub fn put(&self, key: &str, value: Value) {
-        if self.frozen {
+        if self.mode == Mode::Frozen {
             return;
         }
         let mut state = self.state();
         state.map.insert(key.to_string(), value);
         state.dirty = true;
+    }
+
+    /// `prefix` で始まるキーが `max` 件に達していて、`key` がまだ無いときは入れずに `false`。それ以外は
+    /// [`Cache::put`] と同じ（上書きは件数が増えないので常に入る）。ほかの名前空間（`geo:` など）は数えず、
+    /// 捨てもしない。検索語のように、利用者の入力で件数が増えるキーの総量を抑えるのに使う。
+    pub fn put_capped(&self, key: &str, value: Value, prefix: &str, max: usize) -> bool {
+        if self.mode == Mode::Frozen {
+            return true;
+        }
+        let mut state = self.state();
+        if !state.map.contains_key(key)
+            && state.map.keys().filter(|k| k.starts_with(prefix)).count() >= max
+        {
+            return false;
+        }
+        state.map.insert(key.to_string(), value);
+        state.dirty = true;
+        true
     }
 
     /// 現役でないキーの数（捨てずに数えるだけ）。
@@ -161,7 +219,7 @@ impl Cache {
 
     /// 現役でないキーを捨てる。捨てた数を返す。
     pub fn purge_legacy(&self) -> usize {
-        if self.frozen {
+        if self.mode != Mode::Persistent {
             return 0;
         }
         let mut state = self.state();
@@ -204,7 +262,7 @@ impl Cache {
         wait: Option<Duration>,
         write: impl FnOnce(&[u8]) -> std::io::Result<()>,
     ) -> SaveOutcome {
-        if self.frozen {
+        if self.mode != Mode::Persistent {
             return SaveOutcome::Clean;
         }
         let Some(_exclusive) = self.lock_save(wait) else {
@@ -350,6 +408,22 @@ mod tests {
 }"#;
 
     #[test]
+    fn put_capped_limits_one_namespace_only() {
+        let cache = Cache::memory_only();
+        cache.put("geo:1.000,2.000", json!({}));
+        assert!(cache.put_capped("n:a", json!(1), "n:", 2));
+        assert!(cache.put_capped("n:b", json!(2), "n:", 2));
+        // 満杯: 新しいキーは入れない。上書きは入る。ほかの名前空間は数えない・捨てない
+        assert!(!cache.put_capped("n:c", json!(3), "n:", 2));
+        assert!(cache.put_capped("n:a", json!(9), "n:", 2));
+        assert_eq!(cache.get("n:a"), Some(json!(9)));
+        assert_eq!(cache.get("n:c"), None);
+        cache.put("geo:3.000,4.000", json!({}));
+        assert_eq!(cache.len(), 4);
+        assert!(cache.get("geo:1.000,2.000").is_some());
+    }
+
+    #[test]
     fn missing_or_broken_files_start_empty() {
         let dir = TempDir::new("cache-empty");
         assert!(Cache::load(dir.path()).is_empty());
@@ -373,8 +447,7 @@ mod tests {
         assert_eq!(cache.save_now(), SaveOutcome::Clean);
         cache.put("geo:10.000,20.000", cache.get("geo:10.000,20.000").unwrap());
         assert_eq!(cache.save_now(), SaveOutcome::Saved);
-        // Python の indent=1・ensure_ascii=False と同じ形（Rust はキーを辞書順に書く。この合成データは
-        // 辞書順で書いてある）
+        // Python の indent=1・ensure_ascii=False と同じ形（キーは読んだ順のまま。この合成データは辞書順で書いてある）
         assert_eq!(read_file(&dir), SYNTH);
         assert!(!dir.path().join(".cache.json.tmp").exists());
     }
@@ -382,7 +455,7 @@ mod tests {
     #[test]
     fn output_matches_python_json_dumps() {
         // `json.dumps({"b": [], "a": {}, "c": [1, 2.5, "あ/\"\n"], "d": None, "e": True}, ensure_ascii=False, indent=1)`
-        // の出力（Python 3.13 で確認した固定値）。キーは辞書順に入れる
+        // の出力の、キーを a から順に入れた版（Python 3.13 で確認した固定値。挿入順のまま出る）
         let python = "{\n \"a\": {},\n \"b\": [],\n \"c\": [\n  1,\n  2.5,\n  \"あ/\\\"\\n\"\n ],\n \"d\": null,\n \"e\": true\n}";
         let mut map = Map::new();
         map.insert("a".into(), json!({}));
@@ -452,7 +525,7 @@ mod tests {
         let broken = Cache {
             file: missing.join(".cache.json"),
             tmp: missing.join(".cache.json.tmp"),
-            frozen: false,
+            mode: Mode::Persistent,
             state: Mutex::new(State {
                 map: cache.state().map.clone(),
                 dirty: true,
@@ -477,6 +550,34 @@ mod tests {
         assert_eq!(cache.save_now(), SaveOutcome::Clean);
         assert_eq!(read_file(&dir), r#"{"exif:x": 1, "geo:1": 2}"#);
         assert!(cache.get("geo:2").is_none());
+    }
+
+    #[test]
+    fn memory_only_cache_reads_and_puts_but_never_writes_the_disk() {
+        let dir = TempDir::new("cache-memory");
+        write_file(&dir, r#"{"exif:x": 1, "geo:1": 2}"#);
+        let cache = Cache::load_memory_only(dir.path());
+        assert_eq!(cache.get("geo:1"), Some(json!(2)));
+        // 旧キーの破棄はしない（Python が書き手の間は、ファイルにも手を付けない）
+        assert_eq!(cache.purge_legacy(), 0);
+        assert_eq!(cache.legacy_count(), 1);
+        cache.put("geocode_osm:ab", json!([]));
+        assert_eq!(cache.get("geocode_osm:ab"), Some(json!([])));
+        assert_eq!(cache.save_now(), SaveOutcome::Clean);
+        assert_eq!(cache.save_if_due(Instant::now()), SaveOutcome::Clean);
+        assert_eq!(
+            cache.save_final(Duration::from_millis(10)),
+            SaveOutcome::Clean
+        );
+        assert_eq!(read_file(&dir), r#"{"exif:x": 1, "geo:1": 2}"#);
+        assert!(!dir.path().join(".cache.json.tmp").exists());
+
+        // ファイルを読まない空のもの。置き場が無くても書こうとしない
+        let empty = Cache::memory_only();
+        assert!(empty.is_empty());
+        empty.put("geo:1", json!(1));
+        assert_eq!(empty.get("geo:1"), Some(json!(1)));
+        assert_eq!(empty.save_now(), SaveOutcome::Clean);
     }
 
     #[test]

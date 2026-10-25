@@ -6,6 +6,8 @@
 //! 符号、数字の間の `_`、全角などの Unicode の 10 進数字、桁数の上限）を合わせてある。
 //! 値は 64 ビットに飽和させる（使い道は `min`/`max` での丸めだけで、桁あふれしても結果は同じ）。
 //! 仕様と差は docs/rust-migration/server.md §10。
+//!
+//! T3.3 で、地名検索（`geocode.rs`）が使う `str.strip()`・`float(str)`・`urllib.parse.quote` も加えた。
 
 use std::collections::HashMap;
 
@@ -82,6 +84,69 @@ fn is_int_space(c: char) -> bool {
     }
 }
 
+/// Python の `str.strip()`（引数なし）。`str.isspace` が真の文字を前後から落とす。Rust の `trim` が落とす
+/// Unicode の `White_Space` に、`\x1c`〜`\x1f`（FS・GS・RS・US）を足したもの。
+pub fn py_strip(s: &str) -> &str {
+    s.trim_matches(is_py_space)
+}
+
+fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+}
+
+/// Python の `float(str)`。受け付けない形（`ValueError`）は `None`。`inf`・`nan`・桁あふれ（`1e400`）は
+/// `Some` で返す（呼び出し側が有限かを見る）。
+///
+/// CPython と同じく、まず ASCII 以外の 10 進数字を ASCII に、ASCII 以外の空白を ` ` にし（その他の ASCII 以外の
+/// 文字は不可。ASCII の `\x1c`〜`\x1f` はここでは空白にならない）、前後の ASCII の空白（` \t\n\v\f\r`）を落として、
+/// `_` を数字と数字の間にだけ許し（取り除く）、残りを `[符号]数字[.数字][e[符号]数字]`・`inf`・`infinity`・`nan`
+/// （大文字小文字を問わない）として読む。
+pub fn py_float(s: &str) -> Option<f64> {
+    let mut ascii = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c.is_ascii() {
+            ascii.push(c);
+        } else if let Some(d) = decimal_digit(c) {
+            ascii.push(char::from(b'0' + d));
+        } else if c.is_whitespace() {
+            ascii.push(' ');
+        } else {
+            return None;
+        }
+    }
+    let trimmed = ascii.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
+    let bytes = trimmed.as_bytes();
+    let mut digits = String::with_capacity(trimmed.len());
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'_' {
+            let before = i.checked_sub(1).map(|j| bytes[j]);
+            let after = bytes.get(i + 1).copied();
+            if !before.is_some_and(|c| c.is_ascii_digit())
+                || !after.is_some_and(|c| c.is_ascii_digit())
+            {
+                return None;
+            }
+        } else {
+            digits.push(char::from(b));
+        }
+    }
+    // Rust の `f64::from_str` は、CPython の `float` が受け付ける形（上の文法）を過不足なく読む
+    digits.parse::<f64>().ok()
+}
+
+/// Python の `urllib.parse.quote(s)`（`safe='/'`）。UTF-8 にして、英数字と `_.-~/` 以外を `%XX`（大文字）にする。
+pub fn py_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-' | b'~' | b'/') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// 各 10 進数字の並び（Unicode の Nd）の `0` の位置。ASCII 以外。Python 3.13（Unicode 15.1）の
 /// `unicodedata` から作った表で、どの並びも `0`〜`9` の 10 文字が連続する。
 const DIGIT_ZEROS: [u32; 67] = [
@@ -94,7 +159,13 @@ const DIGIT_ZEROS: [u32; 67] = [
     0x1FBF0,
 ];
 
-fn decimal_digit(c: char) -> Option<u8> {
+/// `str.isdecimal()` が真の文字（Unicode の Nd）。
+pub fn is_decimal_digit(c: char) -> bool {
+    decimal_digit(c).is_some()
+}
+
+/// 十進の数字（Unicode の Nd）の値。
+pub fn decimal_digit(c: char) -> Option<u8> {
     if c.is_ascii() {
         return c.to_digit(10).map(|d| d as u8);
     }

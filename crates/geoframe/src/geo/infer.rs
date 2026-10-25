@@ -17,15 +17,18 @@
 //!   `lat lon loc_source inferred_from infer_dt_s display` を NULL にする（`display` を NULL にするので、Drive の写真は
 //!   `fetch_derivatives` が取り直す）。**derivative のファイルは消さない**。
 //! - **地名の列（`place elev muni_cd pref city`）には触らない**（現行と同じ）。錨が別の写真に変わって位置が動いても、
-//!   取り消して別の場所に推定し直しても、`place` は古いまま残る。位置が動いたときに地名を直すかは P3 で決める
-//!   （server.md §0）。
+//!   取り消して別の場所に推定し直しても、`place` は古いまま残る。位置が動いたときに地名を直すかは、T3.7 の
+//!   決定（手動の位置を原本の更新で失わない）の範囲外で、今のまま（server.md §15.2 の 5）。
 //!
 //! # 現行との違い
 //!
 //! - 値が変わらない行には書かない（現行は毎サイクル全対象に同じ値を `UPDATE` する）。最終の行は同じ。
 //!   `--dry-run` の件数（`updated`・`cancelled`）が「ほぼ 0」と読めるのは、これがあるため。
 //! - 書き込みは 1 つのトランザクション。`UPDATE` は `loc_source IS NULL OR 'inferred'` のままの行にだけ効く
-//!   （計画を作ってから書くまでの間に、手動で位置が付いた行を上書きしない）。
+//!   （計画を作ってから書くまでの間に、手動で位置が付いた行を上書きしない）。Python は `WHERE id=?` だけなので、
+//!   この間に管理画面で位置を直された写真は推定に上書きされる（server.md §0・§17.3）。
+//! - 位置を付ける（`Set`）ときは、錨が**計画のときの位置・種類のまま**でなければ付けない（計画のあとに錨が
+//!   手動で動かされた・消されたら、古い位置を写さない。次のサイクルが新しい錨で付け直す）。
 
 use rusqlite::{Connection, params, types::Value};
 
@@ -229,7 +232,9 @@ pub(super) fn write_plan(
     {
         let mut set = tx.prepare(
             "UPDATE photos SET lat=?1, lon=?2, loc_source='inferred', inferred_from=?3, infer_dt_s=?4
-             WHERE id=?5 AND (loc_source IS NULL OR loc_source='inferred')",
+             WHERE id=?5 AND (loc_source IS NULL OR loc_source='inferred')
+             AND EXISTS (SELECT 1 FROM photos a WHERE a.id=?3 AND a.lat IS ?1 AND a.lon IS ?2
+                         AND a.loc_source IN ('exif','drive_meta','manual'))",
         )?;
         let mut clear = tx.prepare(
             "UPDATE photos SET lat=NULL, lon=NULL, loc_source=NULL, inferred_from=NULL,

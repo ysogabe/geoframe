@@ -81,6 +81,24 @@ function kvTable(node, obj){
     node.appendChild(tr);
   });
 }
+/* Driveの大量削除の保留（/api/admin/status の sync.mass_delete_hold。Rust版だけが返す）の注意表示。
+   保留が無い・キーが無い（Python版・取り込み無効）ときは null を返し、何も出さない。
+   解除は画面からはできない。ここには解除のコマンドを文字で示すだけ。 */
+const HOLD_REASON = {
+  ratio: 'Driveの一覧に無い行が多すぎる（50件超かつ全体の20%超）',
+  empty_listing: 'Driveの一覧が空だった'
+};
+function massDeleteNotice(hold){
+  if(!hold) return null;
+  const c = cell('Driveの削除を保留中', hold.held, '件', 'bad');
+  c.style.gridColumn = '1 / -1';
+  c.appendChild(el('span', 'k',
+    (HOLD_REASON[hold.reason] || hold.reason) + ' / Driveの行 ' + hold.drive_rows + '件'));
+  c.appendChild(el('span', 'k', '保留の開始 ' + hold.since + ' / 最後に確認 ' + hold.checked_at));
+  c.appendChild(el('span', 'k',
+    '意図した削除なら、サービスを止めて geoframe sync --allow-mass-delete を1回実行（この画面からは解除できません）'));
+  return c;
+}
 function loadStatus(){
   fetch('/api/admin/status').then(r => r.json()).then(d => {
     if(!d.ok) throw new Error(d.error || 'status error');
@@ -90,6 +108,8 @@ function loadStatus(){
     sy.appendChild(cell('表示可能', d.sync.ready, '枚', 'good'));
     sy.appendChild(cell('取得待ち', d.sync.pending, '枚', d.sync.pending ? 'warn' : ''));
     sy.appendChild(cell('全件数', d.sync.total, '枚'));
+    const hold = massDeleteNotice(d.sync.mass_delete_hold);
+    if(hold) sy.appendChild(hold);
 
     const db = $('#s-db'); db.textContent = '';
     db.appendChild(cell('位置なし（lat NULL）', d.db.no_loc, '枚', d.db.no_loc ? 'warn' : 'good'));

@@ -39,8 +39,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -51,6 +51,7 @@ use crate::stop::StopFlag;
 
 pub use fetch::FetchDerivatives;
 pub use index::IndexDrive;
+pub use index::{HoldReason, MassDeleteBoard, MassDeleteHold};
 
 /// 読み取り専用のスコープ（現行と同じ）。
 pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
@@ -295,6 +296,9 @@ pub struct DriveShared {
     permission_warned: AtomicBool,
     /// 原本 1 枚のダウンロードの時間の上限。本番は [`DOWNLOAD_TIMEOUT`] だけ（試験が短くできる）。
     download_timeout: Duration,
+    /// 大量削除の保留の記憶（`/api/admin/status` が読む。T3.7）。`serve` が [`DriveShared::mass_delete_board`] で
+    /// 同じものをサーバーの状態に渡す。
+    board: Arc<MassDeleteBoard>,
 }
 
 impl DriveShared {
@@ -310,7 +314,13 @@ impl DriveShared {
             auth_failed: AtomicBool::new(false),
             permission_warned: AtomicBool::new(false),
             download_timeout: DOWNLOAD_TIMEOUT,
+            board: Arc::new(MassDeleteBoard::default()),
         }
+    }
+
+    /// 大量削除の保留の記憶。`index_drive` が書き、管理画面の状態（`/api/admin/status`）が読む。
+    pub fn mass_delete_board(&self) -> Arc<MassDeleteBoard> {
+        Arc::clone(&self.board)
     }
 
     /// 試験用: ダウンロードの時間の上限を短くする。
@@ -771,9 +781,14 @@ impl<'a> Session<'a> {
         if body.content_length().is_some_and(|len| len > limit) {
             return Err(DriveError::TooLarge);
         }
+        // `ureq` の `limit` は圧縮された（gzip の）バイト列に当たり、展開後には効かないので、展開後の大きさは
+        // 下の読み出しで数えて上限（`limit`）を超えたところで止める。`ureq` の `limit` には、それとは独立の
+        // 圧縮前の上限（[`net::wire_limit`]）を付ける。展開後が空になる gzip（空のメンバーの繰り返し）は
+        // 展開後の数えでは止まらず、`download_timeout` まで転送と CPU を使うため。正当な本文は展開後 `limit`
+        // 以下なので `wire_limit(limit)` を超えない（超えたら `TooLarge`。`read_error`）
         let mut reader = body
             .into_with_config()
-            .limit(limit.saturating_add(1))
+            .limit(net::wire_limit(limit))
             .reader();
         let mut buf = vec![0u8; COPY_CHUNK];
         let mut total = 0u64;
@@ -803,6 +818,7 @@ impl<'a> Session<'a> {
 ///
 /// | 失敗 | `DriveError` | 扱い |
 /// | --- | --- | --- |
+/// | 圧縮前の上限超過（`BodyExceedsLimit`。[`net::wire_limit`]） | `TooLarge` | その写真の失敗 |
 /// | 時間切れ（`Timeout(_)` を包んだもの・`TimedOut`・`WouldBlock`） | `BodyTimeout` | その写真の失敗（遅いだけ） |
 /// | 切断（[`crate::net::is_disconnect`] の種類: `UnexpectedEof`・`ConnectionReset`・`ConnectionAborted`・`BrokenPipe` など） | `Net(Disconnected)` | 通信の障害（段を中断） |
 /// | 包まれた `ureq` のエラー（`Tls` など） | `Net(`[`Failure::from`]`)` | `Other` 以外は障害 |
@@ -811,6 +827,9 @@ impl<'a> Session<'a> {
 /// ヘッダーの前の失敗の分類は [`Failure`] の表（`net.rs`）。
 fn read_error(e: &io::Error) -> DriveError {
     if let Some(inner) = e.get_ref().and_then(|x| x.downcast_ref::<ureq::Error>()) {
+        if matches!(inner, ureq::Error::BodyExceedsLimit(_)) {
+            return DriveError::TooLarge;
+        }
         return match Failure::from(inner) {
             Failure::Timeout => DriveError::BodyTimeout,
             failure => DriveError::Net(failure),
@@ -849,12 +868,8 @@ fn reason_body_failure(e: &ureq::Error) -> Failure {
 /// 届かないのは回線の不調）。切断・時間切れ・TLS 以外（`Protocol`・`Decompress` など）は
 /// [`Failure::ReasonUnreadable`]（[`reason_body_failure`]）。
 fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> Result<bool, DriveError> {
-    let bytes = match response
-        .body_mut()
-        .with_config()
-        .limit(16 << 10)
-        .read_to_vec()
-    {
+    // 上限は展開後の大きさに効かせる（`net::read_body_limited`）
+    let bytes = match net::read_body_limited(response.body_mut(), 16 << 10) {
         Ok(bytes) => bytes,
         Err(ureq::Error::BodyExceedsLimit(_)) => return Ok(false),
         Err(e) => return Err(DriveError::Net(reason_body_failure(&e))),
@@ -864,14 +879,20 @@ fn is_rate_limit_body(response: &mut ureq::http::Response<ureq::Body>) -> Result
 }
 
 fn read_json(response: ureq::http::Response<ureq::Body>) -> Result<Value, DriveError> {
+    read_json_within(response, MAX_JSON_BYTES)
+}
+
+/// [`read_json`] の本体。展開後の上限 `max` を引数にしてあるのは、試験が 16 MiB 規模の本文を流さずに
+/// 上限の挙動（`BodyExceedsLimit` → `TooLarge`）を確かめられるようにするため（本番は常に [`MAX_JSON_BYTES`]）。
+fn read_json_within(
+    response: ureq::http::Response<ureq::Body>,
+    max: u64,
+) -> Result<Value, DriveError> {
     let (_, mut body) = response.into_parts();
-    let bytes = body
-        .with_config()
-        .limit(MAX_JSON_BYTES)
-        .read_to_vec()
-        .map_err(|e| match e {
-            ureq::Error::BodyExceedsLimit(_) => DriveError::TooLarge,
-            other => DriveError::Net(Failure::from(&other)),
-        })?;
+    // 上限は展開後の大きさに効かせる（`net::read_body_limited`）
+    let bytes = net::read_body_limited(&mut body, max).map_err(|e| match e {
+        ureq::Error::BodyExceedsLimit(_) => DriveError::TooLarge,
+        other => DriveError::Net(Failure::from(&other)),
+    })?;
     serde_json::from_slice(&bytes).map_err(|_| DriveError::BadResponse)
 }

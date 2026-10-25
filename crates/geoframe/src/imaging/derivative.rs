@@ -36,6 +36,9 @@ use crate::datadir::{DataDir, PathError, check_drive_id};
 pub const DERIV_PX: u32 = 2560;
 /// JPEG の品質（Python の `quality=85`）。
 pub const JPEG_QUALITY: u8 = 85;
+/// 旅行ブログの書き出しの長辺（現行の `EXPORT_MAX_PX`）と JPEG の品質（`quality=88`）。
+pub const EXPORT_PX: u32 = 1800;
+pub const EXPORT_QUALITY: u8 = 88;
 /// 入力の画素数の上限。Pillow は 2 倍（約 1.79 億画素）を超えると `DecompressionBombError`。
 pub const MAX_INPUT_PIXELS: u64 = 178_956_970;
 /// 入力ファイルの大きさの上限（まるごとメモリに読む）。
@@ -442,11 +445,15 @@ fn to_srgb(r: &mut Raster, icc: &[u8]) -> bool {
 }
 
 fn encode_jpeg(r: &Raster) -> Result<Vec<u8>, ImageError> {
+    encode_jpeg_with(r, JPEG_QUALITY)
+}
+
+fn encode_jpeg_with(r: &Raster, quality: u8) -> Result<Vec<u8>, ImageError> {
     use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
     let w = u16::try_from(r.width).map_err(|_| ImageError::Encode)?;
     let h = u16::try_from(r.height).map_err(|_| ImageError::Encode)?;
     let mut out = Vec::with_capacity(r.data.len() / 8);
-    let mut enc = Encoder::new(&mut out, JPEG_QUALITY);
+    let mut enc = Encoder::new(&mut out, quality);
     // 4:2:0（Pillow の既定と同じ）。ハフマン表の最適化は付けない（zune-jpeg が誤読する。image-poc.md §3.2）
     enc.set_sampling_factor(SamplingFactor::F_2_2);
     let color = if r.channels == 1 {
@@ -588,6 +595,180 @@ pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
     Ok(Rendered { jpeg, info })
 }
 
+/// 既存の derivative を時計回りに `delta` 度回した JPEG にする（管理画面の回転。Python の
+/// `im.rotate(-delta, expand=True).save(.., "JPEG", quality=85)`）。
+///
+/// [`render`] との違い: **EXIF の向きを当てない**（Pillow の `rotate` は当てない）、**縮小しない**（derivative は
+/// 作ったときに 2560px に収まっている）、**ICC を変換せず付けない**（Pillow は付けない）。グレーはグレーのまま。
+/// 出力に EXIF（GPS を含む）は付かない。`delta` は 90 の倍数（負・360 超は剰余）。
+pub fn rotate_jpeg(bytes: &[u8], delta: i32) -> Result<Rendered, ImageError> {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageError::FileTooLarge);
+    }
+    let rot = delta.rem_euclid(360);
+    if rot % 90 != 0 {
+        return Err(ImageError::BadRotation);
+    }
+    let (format, decoded) = decode_any(bytes)?;
+    let input = (decoded.raster.width, decoded.raster.height);
+    let raster = orient(decoded.raster, manual_orientation(rot as u16))?;
+    let jpeg = encode_jpeg(&raster)?;
+    let info = DerivativeInfo {
+        format,
+        input,
+        output: (raster.width, raster.height),
+        exif_orientation: decoded.orientation,
+        gray: raster.channels == 1,
+        icc: IccOutcome::None,
+        bytes: jpeg.len(),
+    };
+    Ok(Rendered { jpeg, info })
+}
+
+/// 旅行ブログの書き出し用の JPEG にする（現行 `travel_blog._export_image`）。Pillow の
+/// `exif_transpose` → `thumbnail((1800, 1800), LANCZOS)` → `convert("RGB")` → `save(.., "JPEG", quality=88)`
+/// に当たる。[`render`] との違い:
+///
+/// - 長辺 [`EXPORT_PX`]・品質 [`EXPORT_QUALITY`]。
+/// - **ICC を付けない・変換もしない**（Pillow は `icc_profile` を渡さないので落とすだけ。広色域の原本は色が
+///   薄くなる。現行と同じ）。EXIF（GPS を含む）も付けない。
+/// - **グレーも RGB（3 成分）で出す**（Pillow の `convert("RGB")`。derivative はグレーのまま）。
+/// - ハフマン表の最適化は付けない（Pillow は `optimize=True`。`jpeg-encoder` の 4:2:0 との組み合わせを
+///   `zune-jpeg` が誤読するため。ファイルが数 % 大きくなる）。
+///
+/// 入力の上限（ファイルの大きさ・画素数・HEIC の守り）は [`render`] と同じ経路を通る。
+pub fn render_export(bytes: &[u8]) -> Result<Rendered, ImageError> {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageError::FileTooLarge);
+    }
+    let (format, decoded) = decode_any(bytes)?;
+    let input = (decoded.raster.width, decoded.raster.height);
+    let exif_o = orientation_of(decoded.orientation);
+    let swapped = swaps_axes(exif_o);
+    let (ow, oh) = if swapped { (input.1, input.0) } else { input };
+    let out_dims = target_dims(ow, oh, EXPORT_PX);
+    let pre = if swapped {
+        (out_dims.1, out_dims.0)
+    } else {
+        out_dims
+    };
+    let mut raster = orient(resize(decoded.raster, pre)?, exif_o)?;
+    if raster.channels == 1 {
+        raster = Raster {
+            width: raster.width,
+            height: raster.height,
+            channels: 3,
+            data: raster.data.iter().flat_map(|&v| [v, v, v]).collect(),
+        };
+    }
+    let jpeg = encode_jpeg_with(&raster, EXPORT_QUALITY)?;
+    let info = DerivativeInfo {
+        format,
+        input,
+        output: (raster.width, raster.height),
+        exif_orientation: decoded.orientation,
+        gray: false,
+        icc: IccOutcome::None,
+        bytes: jpeg.len(),
+    };
+    Ok(Rendered { jpeg, info })
+}
+
+/// derivative のファイルを作る・差し替える・消す処理の直列化。回転（管理画面）と取得（`fetch_derivatives`）が
+/// 同じ写真の derivative を同時に書き換えて、DB の `display` と実在するファイルが食い違わないようにする。
+/// ファイルを書くところからその `display` を DB に書くところまで（または、読んだ `display` を DB で
+/// 確かめて消すところまで）を、このロックを持ったまま行う。ロックの中で待つのは writer だけで、
+/// writer の依頼はこのロックを取らない（デッドロックしない）。
+pub fn lock_derivatives() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    #[cfg(test)]
+    let _waiting = lock_waiters::Registered::new();
+    let _counted = WaitingCount::new();
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`lock_derivatives`] を待っているスレッドの数（待ち始めから取れるまで）。
+static WAITING_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct WaitingCount;
+
+impl WaitingCount {
+    fn new() -> Self {
+        WAITING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for WaitingCount {
+    fn drop(&mut self) {
+        WAITING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 試験用の観測: [`lock_derivatives`] で今ロックを待っているスレッドの数。結合試験（別のクレートとして
+/// ビルドされるので、`cfg(test)` の [`lock_waiters`] は見えない）が、要求の処理が「ロックの前まで来て待っている」
+/// ことを、実時間を待たずに合図で確かめるのに使う。本番の処理は使わない。
+#[doc(hidden)]
+pub fn lock_derivatives_waiting() -> usize {
+    WAITING_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 試験用: [`lock_derivatives`] の中でロックを待っているスレッドの記録。他のスレッドがロックを持っている間に
+/// 「このスレッドはもうロックの前まで来て、待っている」ことを、実時間を待たずに確かめる。
+#[cfg(test)]
+pub(crate) mod lock_waiters {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::thread::ThreadId;
+    use std::time::{Duration, Instant};
+
+    static WAITING: Mutex<Option<HashSet<ThreadId>>> = Mutex::new(None);
+
+    fn with<R>(f: impl FnOnce(&mut HashSet<ThreadId>) -> R) -> R {
+        let mut guard = WAITING.lock().unwrap_or_else(|e| e.into_inner());
+        f(guard.get_or_insert_with(HashSet::new))
+    }
+
+    /// 生きている間、呼んだスレッドを「待っている」に入れる（ロックを取れたら外れる）。
+    pub(super) struct Registered(ThreadId);
+
+    impl Registered {
+        pub(super) fn new() -> Self {
+            let id = std::thread::current().id();
+            with(|set| set.insert(id));
+            Self(id)
+        }
+    }
+
+    impl Drop for Registered {
+        fn drop(&mut self) {
+            with(|set| set.remove(&self.0));
+        }
+    }
+
+    /// `thread` が [`super::lock_derivatives`] でロックを待つ状態になるまで待つ。`gave_up()` が真になった
+    /// （そのスレッドが待たずに終わった）か `limit` を過ぎたら false。**待つのは来るはずの出来事だけ**で、
+    /// 来ないことを時間で推し量りはしない（`limit` は止まったときに試験を終わらせるための上限）。
+    pub(crate) fn wait_until_waiting(
+        thread: ThreadId,
+        gave_up: impl Fn() -> bool,
+        limit: Duration,
+    ) -> bool {
+        let deadline = Instant::now() + limit;
+        while Instant::now() < deadline {
+            if with(|set| set.contains(&thread)) {
+                return true;
+            }
+            if gave_up() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+}
+
 /// 種類を決められなかったバイト列の失敗: BigTIFF は専用のエラー、それ以外は画像でない。
 pub(super) fn not_an_image(bytes: &[u8]) -> ImageError {
     if Format::is_bigtiff(bytes) {
@@ -597,19 +778,31 @@ pub(super) fn not_an_image(bytes: &[u8]) -> ImageError {
     }
 }
 
-/// ファイルを読む（大きさの上限つき）。`img-probe` も使う。
-pub fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
+/// ファイルを開いて、大きさの上限（[`MAX_INPUT_BYTES`]）を超えていないことまで確かめる。中身は読まない。
+/// 読む前の検査なので、書き出しの `dry_run`（読まない）と実際の読み込み（[`read_opened`]）で同じ答えになる。
+pub fn open_limited(path: &Path) -> Result<(fs::File, u64), ImageError> {
     let file = fs::File::open(path)?;
     let len = file.metadata()?.len();
     if len > MAX_INPUT_BYTES {
         return Err(ImageError::FileTooLarge);
     }
+    Ok((file, len))
+}
+
+/// [`open_limited`] で開いたファイルを、大きさの上限つきで読み切る。
+pub fn read_opened(file: fs::File, len: u64) -> Result<Vec<u8>, ImageError> {
     let mut bytes = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
     file.take(MAX_INPUT_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ImageError::FileTooLarge);
     }
     Ok(bytes)
+}
+
+/// ファイルを読む（大きさの上限つき）。`img-probe` も使う。
+pub fn read_limited(path: &Path) -> Result<Vec<u8>, ImageError> {
+    let (file, len) = open_limited(path)?;
+    read_opened(file, len)
 }
 
 /// 書きかけの `.part`。`commit` されないまま落とされたら（失敗・パニック）消す。**自分が作ったものだけ**を持つ
@@ -697,17 +890,24 @@ pub fn make_derivative(
     let bytes = read_limited(src)?;
     let rendered = render(&bytes, rotation)?;
     drop(bytes);
+    write_atomic(dest, &rendered.jpeg)?;
+    Ok(rendered.info)
+}
+
+/// `dest` に `jpeg` を書く。`.part` を排他的に新規作成して書き、`fsync` してから `rename` する（読み手に
+/// 書きかけを見せない）。失敗しても自分の `.part` は残さず、`dest` は元のまま。親ディレクトリは作る。
+pub fn write_atomic(dest: &Path, jpeg: &[u8]) -> Result<(), ImageError> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
     let (mut file, mut part) = create_part(dest, || part_name(dest))?;
-    file.write_all(&rendered.jpeg)?;
+    file.write_all(jpeg)?;
     // rename の前にディスクへ（電源断で空のファイルが derivative として残らないように）
     file.sync_all()?;
     drop(file);
     fs::rename(&part.path, dest)?;
     part.committed = true;
-    Ok(rendered.info)
+    Ok(())
 }
 
 /// 取り込みの結果: DB の `display` に入れる相対パスと生成の内容。

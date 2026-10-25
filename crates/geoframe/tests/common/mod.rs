@@ -3,6 +3,14 @@
 // テストファイルごとに使う部品が違うので、使われない関数があっても警告しない
 #![allow(dead_code)]
 
+mod geocode_stub;
+mod tile_stub;
+
+#[allow(unused_imports)]
+pub use geocode_stub::{GeocodeStub, Upstream};
+#[allow(unused_imports)]
+pub use tile_stub::{SAMPLE_PNG, TileStub};
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -10,7 +18,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use geoframe::config::{Config, Overrides};
 use geoframe::db::Catalog;
 use geoframe::feed::{Photo, QualityKind};
+use geoframe::limits::{ConnLimits, LimitedListener};
 use geoframe::server::{AppState, router};
+use geoframe::tiles::{TileEndpoints, TileProxy};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -196,7 +206,21 @@ pub fn build_empty_catalog(dir: &Path, rows: &str) -> (PathBuf, rusqlite::Connec
 
 pub fn app_state(catalog: Catalog) -> AppState {
     let config = Config::load(|_| None, &Overrides::default()).unwrap();
-    AppState::new(Arc::new(config), catalog)
+    test_state(Arc::new(config), catalog)
+}
+
+/// 試験用の `AppState`。本物の地理院・Nominatim・OSM へ出ないよう、地名検索と地図タイルの接続先を、何も受け付けない
+/// スタブに向ける（[`GeocodeStub::deny`]・[`TileStub::deny_endpoints`]）。結合テストは `AppState::new` を直接呼ばず、
+/// これを通す。
+pub fn test_state(config: Arc<Config>, catalog: Catalog) -> AppState {
+    let state = AppState::new(config, catalog).with_geocoder(GeocodeStub::deny());
+    with_tile_endpoints(state, TileStub::deny_endpoints())
+}
+
+/// 地図タイルの接続先だけを差し替える（状態の設定・データ置き場はそのまま）。
+pub fn with_tile_endpoints(state: AppState, endpoints: TileEndpoints) -> AppState {
+    let proxy = TileProxy::with_endpoints(&state.config, &state.data_root, endpoints);
+    state.with_tiles(Arc::new(proxy))
 }
 
 /// 127.0.0.1 の空きポートで router を起動する。
@@ -346,7 +370,84 @@ pub async fn spawn_with_env(
     .unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let app = router(AppState::new(Arc::new(config), catalog));
+    let app = router(test_state(Arc::new(config), catalog));
+    // 本番（`server::serve`）と同じく、接続の上限・無通信の打ち切りを通す
+    let listener = LimitedListener::new(listener, ConnLimits::default());
     tokio::spawn(async move { axum::serve(listener, app).await });
     addr
+}
+
+/// 組み立て済みの状態（`test_state` から作ったもの）で router を起動する。
+pub async fn spawn_state(
+    dir: &Path,
+    env: &[(&str, &str)],
+    catalog: Catalog,
+    with: impl FnOnce(AppState) -> AppState,
+) -> std::net::SocketAddr {
+    let map: std::collections::HashMap<String, String> = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let config = Config::load(
+        |k| map.get(k).cloned(),
+        &Overrides {
+            data_dir: Some(dir.to_path_buf()),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(with(test_state(Arc::new(config), catalog)));
+    let listener = LimitedListener::new(listener, ConnLimits::default());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    addr
+}
+
+/// `POST` を、ヘッダを加工せずそのまま（`Content-Length` も自動では付けない）送り、応答を読む。
+/// サーバーが本文を読まずに閉じたときは、本文の送信が失敗したりリセットされたりするが、
+/// それまでに届いた応答は返す（上限超過の 413 の確認用）。
+pub async fn post_raw(
+    addr: std::net::SocketAddr,
+    target: &str,
+    headers: &[(String, String)],
+    body: &[u8],
+) -> Response {
+    let mut head = format!("POST {target} HTTP/1.1\r\n");
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    let mut request = head.into_bytes();
+    request.extend_from_slice(body);
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let _ = stream.write_all(&request).await;
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 65536];
+    // 接続が閉じられないまま止まった試験を、ハングではなく失敗にする
+    let read_all = async {
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+            }
+        }
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(15), read_all)
+        .await
+        .is_err()
+    {
+        panic!("応答が閉じられない: POST {target}（Connection: close を付けたか）");
+    }
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .unwrap_or_else(|| panic!("応答が無い: POST {target}"));
+    let head = std::str::from_utf8(&raw[..split]).unwrap();
+    let (status_line, headers) = head.split_once("\r\n").unwrap_or((head, ""));
+    Response {
+        status: status_line.split(' ').nth(1).unwrap().parse().unwrap(),
+        headers: headers.to_lowercase(),
+        body: raw[split + 4..].to_vec(),
+    }
 }

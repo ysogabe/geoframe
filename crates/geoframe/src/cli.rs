@@ -304,12 +304,15 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let config = Arc::new(config);
     // 同期サイクルとキャッシュ保存のスレッド。HTTP サーバーの起動を待たない
     let stop = StopFlag::new();
+    // Drive の状態。大量削除の保留の記憶は、管理画面（サーバーの状態）と `index_drive` で同じものを使う
+    let drive = Arc::new(crate::drive::DriveShared::new());
+    let mass_delete = drive.mass_delete_board();
     let threads = ingest.as_ref().map(|ingest| IngestThreads {
         worker: crate::sync::spawn_worker(
             Arc::clone(&config),
             ingest.writer.clone(),
             Arc::clone(&ingest.cache),
-            crate::sync::default_stages(),
+            crate::sync::default_stages_with(drive),
             stop.clone(),
             config.drive_poll(),
             ingest.lock_hold(),
@@ -320,7 +323,16 @@ fn serve(overrides: &Overrides) -> ExitCode {
             ingest.lock_hold(),
         ),
     });
-    let state = AppState::new(Arc::clone(&config), catalog);
+    // 地名検索の `.cache.json`。取り込みが有効なら同期サイクルと同じキャッシュ（保存は保存スレッドが行う）。
+    // 無効なら、読んでメモリに入れるだけでディスクへは書かない（本番の書き手は P5 の切替まで Python）
+    let cache = match &ingest {
+        Some(ingest) => Arc::clone(&ingest.cache),
+        None => Arc::new(Cache::load_memory_only(&config.data_dir)),
+    };
+    let mut state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
+    if ingest.is_some() {
+        state = state.with_mass_delete_board(mass_delete);
+    }
     if state.data_root.as_path() != state.config.data_dir.as_path() {
         // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する
         tracing::info!(
@@ -328,9 +340,21 @@ fn serve(overrides: &Overrides) -> ExitCode {
             state.data_root.display()
         );
     }
+    // 地図タイルのキャッシュの掃除（B4）。起動時に 1 回、以後 1 時間ごと。取り込みの有無に関わらず動く
+    // （キャッシュは catalog.db に書かないので、writer が無くても掃除する）
+    let pruner = crate::tiles::spawn_pruner(
+        Arc::clone(&state.tiles),
+        stop.clone(),
+        crate::tiles::PRUNE_INTERVAL,
+    );
     let result = runtime.block_on(crate::server::serve(state));
     // 取り込みのスレッドを止める（サイクルの最中なら今の段が終わるまで。待つのは限られた時間だけ）
     stop.stop();
+    if !join_within(pruner, THREAD_STOP_LIMIT) {
+        tracing::warn!(
+            "タイルキャッシュの掃除のスレッドが時間内に止まりませんでした（そのまま終了します）"
+        );
+    }
     if let (Some(threads), Some(ingest)) = (threads, &ingest) {
         stop_ingest_threads(threads, &ingest.cache, THREAD_STOP_LIMIT);
     }

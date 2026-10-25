@@ -28,6 +28,9 @@ pub enum Reply {
     BadChunk,
     /// 途中で終わる gzip の本文を `Content-Encoding: gzip` で送る（`ureq` の `Decompress`）。
     TruncatedGzip,
+    /// 展開すると `head` の後ろに空白が `pad` 個続く本文を、`Content-Encoding: gzip` で送る
+    /// （圧縮後はごく小さい。上限が展開後に効くかの試験）。
+    GzipPadded(String, usize),
 }
 
 impl Reply {
@@ -226,6 +229,16 @@ fn respond(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
             stream.write_all(head.as_bytes())?;
             return stream.write_all(gzip);
         }
+        Reply::GzipPadded(head, pad) => {
+            let gzip = crate::testutil::gzip::padded(head.as_bytes(), *pad);
+            let head = format!(
+                "HTTP/1.1 200 X\r\nContent-Type: application/json\r\nConnection: close\r\n\
+                 Content-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
+                gzip.len()
+            );
+            stream.write_all(head.as_bytes())?;
+            return stream.write_all(&gzip);
+        }
         _ => {}
     }
     let (status, content_type, body, claim): (u16, &str, &str, Option<usize>) = match reply {
@@ -234,7 +247,9 @@ fn respond(stream: &mut TcpStream, reply: &Reply) -> std::io::Result<()> {
         Reply::Text(body) => (200, "text/plain", body, None),
         Reply::Status(status) => (*status, "text/plain", "", None),
         Reply::Truncated => (200, "application/json", "{\"resu", Some(1000)),
-        Reply::BadChunk | Reply::TruncatedGzip => unreachable!("上で返した"),
+        Reply::BadChunk | Reply::TruncatedGzip | Reply::GzipPadded(..) => {
+            unreachable!("上で返した")
+        }
     };
     let head = format!(
         "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",

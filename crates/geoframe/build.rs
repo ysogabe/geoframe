@@ -1,4 +1,5 @@
-//! 管理画面の静的ファイル（`app/static`・`app/vendor`）をバイナリへ埋め込む表を作る。
+//! 管理画面の静的ファイル（`app/static`・`app/vendor`）と、旅行ブログの旅程 JSON
+//! （`app/travel_blog/plans/*.json`）をバイナリへ埋め込む表を作る。
 //!
 //! 単一バイナリは「バイナリ＋設定＋データ」だけで起動できる必要があり、実行時に `app/` を読まない
 //! （docs/rust-migration/plan.md §1）。外部の埋め込み crate を足さず、ここで `include_bytes!` の
@@ -6,6 +7,10 @@
 //!
 //! 生成物は `$OUT_DIR/embedded_files.rs`。パスは `static/admin.html` のような `app/` からの相対で、
 //! ソート済み（二分探索）。ドットで始まる名前は含めない（配信側もドット始まりは拒否する）。
+//! 旅程 JSON は別の表（`PLAN_FILES`。名前は `<trip_id>.json` のファイル名だけで、`.json` で終わるものだけ。
+//! `app/travel_blog/plans` 直下の通常ファイルに限り、そこへ至るパスの各要素（`app`・`travel_blog`・`plans`）と
+//! 直下のリンクは辿らずにビルドを止める。エラーにはパス・ファイル名を出さない。検査は`build_plans.rs`）。
+//! 配信の表（`FILES`）には入れない（`/static/`・`/vendor/` の配信とは無関係）。
 //! 各ファイルに内容のハッシュ（FNV-1a 64bit）から作った ETag を付ける。時刻は埋め込まない:
 //! チェックアウト時刻に依存する `Last-Modified` を出すと、ビルドごとに値が揺れるうえ、内容が
 //! 変わったのに古い時刻で 304 になる事故（キオスクの古い JS）の元になるため。
@@ -13,6 +18,9 @@
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+// 旅程の検査（リンク・名前・読めること）は単体試験できるよう別ファイルにある（`src/embedded.rs` の試験も読む）
+mod build_plans;
 
 const ROOTS: [&str; 2] = ["static", "vendor"];
 
@@ -71,6 +79,31 @@ fn main() {
         writeln!(
             code,
             "    File {{ path: {key:?}, data: include_bytes!({:?}), etag: {etag:?} }},",
+            path.display().to_string()
+        )
+        .unwrap();
+    }
+    code.push_str("];\n");
+
+    // 旅行ブログの旅程 JSON（git 管理のソース。実行時は `app/` を読まないので埋め込む）。
+    // 直下の通常ファイルだけ。リンクは断る（git 管理外のファイルの検査は配布スクリプト）
+    // リポジトリの根から旅程のディレクトリまでの各要素（`app`・`app/travel_blog`・`plans`）にリンクがあれば止める。
+    // エラーはパス・ファイル名を出さず定型文だけ（旅程の名前をビルドのログに残さない）
+    let plans_dir = app.join("travel_blog/plans");
+    println!("cargo:rerun-if-changed={}", plans_dir.display());
+    println!("cargo:rerun-if-changed=build_plans.rs");
+    let fail = |e: build_plans::PlanError| -> ! { panic!("{}", e.message()) };
+    build_plans::reject_links(&manifest.join("../.."), &["app", "travel_blog", "plans"])
+        .unwrap_or_else(|e| fail(e));
+    let plans = build_plans::plan_files(&plans_dir).unwrap_or_else(|e| fail(e));
+    code.push_str("static PLAN_FILES: &[PlanFile] = &[\n");
+    for (name, path) in plans {
+        let path = path
+            .canonicalize()
+            .unwrap_or_else(|_| fail(build_plans::PlanError::Unreadable));
+        writeln!(
+            code,
+            "    PlanFile {{ name: {name:?}, data: include_bytes!({:?}) }},",
             path.display().to_string()
         )
         .unwrap();

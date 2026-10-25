@@ -52,7 +52,7 @@ impl Fixture {
             },
         )
         .unwrap();
-        let mut state = AppState::new(Arc::new(config), catalog);
+        let mut state = common::test_state(Arc::new(config), catalog);
         state.static_slots = Arc::new(Semaphore::new(slots));
         state
     }

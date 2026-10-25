@@ -28,6 +28,22 @@ const SENTINEL: &str = "2000-01-01T00:00:00";
 /// Python が索引しない（例外で飛ばす）壊れた GPS の写真。Rust は位置なしで索引する。
 const RUST_ONLY: &str = "photos/n_two_components.jpg";
 
+/// T3.7 ①（ユーザーの決定。server.md §0）による、Python との**唯一の**差の分類。フィクスチャの
+/// `photos/c_no_exif.png` は `changes` の段階で手動の位置（`1.5, 2.5, 'manual'`、`place='p'`）を持ったまま mtime が
+/// 変わる。Python はその位置を EXIF の値（位置なし）で上書きして `lat lon loc_source place` が NULL になるが、Rust は
+/// 手動の値を残す。`elev` は fixture が入れていない（どちらも NULL）ので差ではない。この行のこれ以外の列と、ほかの
+/// 行の全列は Python と一致のまま比べる。差であること（Python の値が Rust の値と違うこと）も確かめて、分類が
+/// 空振りしないようにする。
+const MANUAL_DECIDED_PATH: &str = "photos/c_no_exif.png";
+fn manual_decided_columns() -> [(&'static str, Value); 4] {
+    [
+        ("lat", Value::from(1.5)),
+        ("lon", Value::from(2.5)),
+        ("loc_source", Value::from("manual")),
+        ("place", Value::from("p")),
+    ]
+}
+
 struct TempRoot(PathBuf);
 
 impl TempRoot {
@@ -184,8 +200,12 @@ fn index_localの全列はpythonと一致する() {
     let steps = doc["steps"].as_array().unwrap();
     assert!(steps.len() >= 4);
     let mut compared_rows = 0;
+    // `changes` から先は、手動の位置を持つ行が Python との差（決定による差）になる
+    let mut manual_decision = false;
+    let mut classified_rows = 0;
     for step in steps {
         let name = step["name"].as_str().unwrap();
+        manual_decision |= name == "changes";
         env.exec(format!("UPDATE photos SET indexed_at='{SENTINEL}'"));
         for op in step["ops"].as_array().unwrap() {
             // Python が索引しない写真は、この突き合わせでは置かない（別のテストで確かめる）
@@ -200,19 +220,38 @@ fn index_localの全列はpythonと一致する() {
         env.index();
 
         let python = &step["python"];
-        let want: Vec<&Map<String, Value>> = python["rows"]
+        let mut want_rows: Vec<Map<String, Value>> = python["rows"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| r.as_object().unwrap())
+            .map(|r| r.as_object().unwrap().clone())
             .collect();
+        if manual_decision {
+            for row in &mut want_rows {
+                if row["path"] != MANUAL_DECIDED_PATH {
+                    continue;
+                }
+                for (column, kept) in manual_decided_columns() {
+                    assert_ne!(
+                        row[column], kept,
+                        "{name} {column}: Python と同じ値なら決定による差ではない"
+                    );
+                    row.insert(column.into(), kept);
+                }
+                classified_rows += 1;
+            }
+        }
+        let want: Vec<&Map<String, Value>> = want_rows.iter().collect();
         let got = normalize(env.rows());
         assert_eq!(got.len(), want.len(), "{name}: 行数");
         for (got, want) in got.iter().zip(&want) {
             let id = want["id"].clone();
             // 列の集合も一致する（Python の `SELECT *` と Rust の `SELECT *`）
-            let got_keys: Vec<_> = got.keys().collect();
-            let want_keys: Vec<_> = want.keys().collect();
+            // （`serde_json` は挿入順で持つので、並びではなく集合で比べる）
+            let mut got_keys: Vec<_> = got.keys().collect();
+            let mut want_keys: Vec<_> = want.keys().collect();
+            got_keys.sort();
+            want_keys.sort();
             assert_eq!(got_keys, want_keys, "{name} id={id}: 列");
             for key in want.keys() {
                 assert_eq!(got[key], want[key], "{name} id={id} 列 {key}");
@@ -238,6 +277,8 @@ fn index_localの全列はpythonと一致する() {
         }
     }
     assert!(compared_rows > 40, "比べた行が少なすぎる: {compared_rows}");
+    // `changes` と、その後の変化なしの段階（`unchanged_again`）の 2 回
+    assert_eq!(classified_rows, 2, "決定による差の分類が空振りしている");
 }
 
 #[test]
