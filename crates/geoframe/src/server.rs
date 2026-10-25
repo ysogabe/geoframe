@@ -36,6 +36,7 @@ use crate::blog::{self, BlogEnv, BlogError};
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::db::Catalog;
+use crate::drive::MassDeleteBoard;
 use crate::geocode::{self, Geocoder};
 use crate::limits::{ConnBusy, ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
 use crate::tiles::{self, CacheStatus, TileProxy};
@@ -74,6 +75,10 @@ pub struct AppState {
     pub tiles: Arc<TileProxy>,
     /// 旅行ブログの読み取り（旅程 JSON の置き場・下書き・書き出し。E7〜E10）。
     pub blog: Arc<BlogEnv>,
+    /// Drive の大量削除の保留の記憶（同期サイクルの `index_drive` が書く）。取り込みが有効（`GEOFRAME_INGEST=1`）の
+    /// `serve` だけが持ち、`/api/admin/status` の `sync.mass_delete_hold` に出す。無いとき（取り込み無効・試験）は
+    /// キーを出さない。
+    pub mass_delete: Option<Arc<MassDeleteBoard>>,
 }
 
 impl AppState {
@@ -106,7 +111,14 @@ impl AppState {
             geocoder: Arc::new(Geocoder::production()),
             tiles,
             blog,
+            mass_delete: None,
         }
+    }
+
+    /// 大量削除の保留の記憶を付ける（取り込みが有効の `serve`。同期サイクルの段と同じもの）。
+    pub fn with_mass_delete_board(mut self, board: Arc<MassDeleteBoard>) -> Self {
+        self.mass_delete = Some(board);
+        self
     }
 
     /// 地名検索が使うキャッシュを差し替える（起動時。既定は空のメモリだけのキャッシュ）。
@@ -208,6 +220,13 @@ async fn api_admin_status(state: &AppState) -> Response {
             );
         }
     };
+    if let Some(hold) = state
+        .mass_delete
+        .as_deref()
+        .and_then(MassDeleteBoard::current)
+    {
+        admin::insert_mass_delete_hold(&mut status, &hold);
+    }
     match disk_info(state).await {
         Ok(disk) => status.insert("disk".into(), disk),
         Err(e) => {

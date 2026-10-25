@@ -388,13 +388,13 @@ fn mtimeの差が1秒未満なら更新しない_以上なら更新する() {
 }
 
 #[test]
-fn 更新は現行と同じ列だけを上書きし手動の位置も戻す() {
+fn 更新は現行と同じ列だけを上書きする_手動でない位置は原本の値に戻る() {
     let s = setup("local-update");
     let path = s.put("photos/a.jpg", &jpeg_plain(), T0);
     s.run(&IndexLocal);
-    // 手動で位置を直し、地名・表示用・お気に入りなどを持たせる
+    // 推定の位置（手動ではない）に、地名・表示用・お気に入りなどを持たせる
     s.sql(
-        "UPDATE photos SET lat=35.0, lon=139.0, loc_source='manual', place='どこか', elev=3.0,
+        "UPDATE photos SET lat=35.0, lon=139.0, loc_source='inferred', place='どこか', elev=3.0,
          display='derivatives/x.jpg', fetched_at='2024-01-01T00:00:00', favorite=1, hidden=1,
          rotation=90, title='題', inferred_from=7, infer_dt_s=8, pref='県', city='市', muni_cd='01'
          WHERE path='photos/a.jpg'",
@@ -404,9 +404,10 @@ fn 更新は現行と同じ列だけを上書きし手動の位置も戻す() {
     set_mtime(&path, T0 + 10);
     let counts = s.run(&IndexLocal);
     assert_eq!(get(&counts, "updated"), 1);
+    assert_eq!(get(&counts, "location_kept"), 0);
 
     let row = s.row("photos/a.jpg");
-    // 上書きされる（inventory.md §2.3: 手動の位置も戻る）
+    // 手動でない位置は原本の値で上書きされる（現行と同じ）
     assert_eq!(row.lat, Some(12.575));
     assert_eq!(row.loc_source.as_deref(), Some("exif"));
     assert_eq!(row.place, None);
@@ -466,6 +467,122 @@ fn 更新は現行と同じ列だけを上書きし手動の位置も戻す() {
     assert_eq!(s.rows().len(), 1);
 }
 
+/// T3.7 ①: 手動の位置（`loc_source='manual'`）は、mtime が変わっても `lat lon loc_source place elev` を
+/// 書き換えない。撮影時刻・mtime・表示・indexed_at は今までどおり更新される。
+#[test]
+fn 更新しても手動の位置と地名は残る() {
+    let s = setup("local-update-manual");
+    let path = s.put("photos/a.jpg", &jpeg_plain(), T0);
+    s.run(&IndexLocal);
+    s.sql(
+        "UPDATE photos SET lat=35.0, lon=139.0, loc_source='manual', place='どこか', elev=3.0,
+         display='photos/a.jpg', fetched_at='2024-01-01T00:00:00', favorite=1, hidden=1,
+         rotation=90, title='題', inferred_from=7, infer_dt_s=8, pref='県', city='市', muni_cd='01',
+         indexed_at='2000-01-01T00:00:00' WHERE path='photos/a.jpg'",
+    );
+    set_mtime(&path, T0 + 10);
+    fs::write(&path, jpeg_gps()).unwrap(); // 原本には別の位置（EXIF）がある
+    set_mtime(&path, T0 + 10);
+    let counts = s.run(&IndexLocal);
+    assert_eq!(get(&counts, "updated"), 1);
+    assert_eq!(get(&counts, "location_kept"), 1);
+
+    let row = s.row("photos/a.jpg");
+    assert_eq!(
+        (row.loc_source.as_deref(), row.lat, row.lon),
+        (Some("manual"), Some(35.0), Some(139.0))
+    );
+    assert_eq!(row.place.as_deref(), Some("どこか"));
+    // 位置以外は今までどおり更新される
+    assert_eq!(row.taken_at.as_deref(), Some("2024-05-06 07:08"));
+    assert_eq!(row.display, None);
+    assert_ne!(row.mtime, Some(T0 as f64 + 0.123456789));
+    let read = crate::db::open_read_only(&s.config.db_path()).unwrap();
+    let kept: (f64, String, String, String, i64, i64, i64, String, i64, i64) = read
+        .query_row(
+            "SELECT elev, pref, city, muni_cd, favorite, hidden, rotation, title, inferred_from, infer_dt_s
+             FROM photos WHERE path='photos/a.jpg'",
+            [],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        kept,
+        (
+            3.0,
+            "県".into(),
+            "市".into(),
+            "01".into(),
+            1,
+            1,
+            90,
+            "題".into(),
+            7,
+            8
+        )
+    );
+    // indexed_at は更新される（この行の mtime の変更は索引した）
+    let indexed: String = read
+        .query_row(
+            "SELECT indexed_at FROM photos WHERE path='photos/a.jpg'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_ne!(indexed, "2000-01-01T00:00:00");
+}
+
+/// `--dry-run` の写しにも同じ規則が当たり、件数が同じになる。実 DB は変わらない。
+#[test]
+fn dry_runでも手動の行の位置を残す規則で数える() {
+    let s = setup("local-update-manual-dry");
+    let m = s.put("photos/m.jpg", &jpeg_plain(), T0);
+    let n = s.put("photos/n.jpg", &jpeg_plain(), T0);
+    s.run(&IndexLocal);
+    s.sql("UPDATE photos SET lat=35.0, lon=139.0, loc_source='manual' WHERE path='photos/m.jpg'");
+    for path in [&m, &n] {
+        fs::write(path, jpeg_gps()).unwrap();
+        set_mtime(path, T0 + 10);
+    }
+    let before = s.rows().len();
+    let read = s.read_for(Mode::DryRun);
+    let result = s.with_ctx(Mode::DryRun, &read, &StopFlag::new(), |ctx| {
+        IndexLocal.run(ctx)
+    });
+    let Ok(StageOutcome::Done(counts)) = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(
+        (get(&counts, "updated"), get(&counts, "location_kept")),
+        (2, 1)
+    );
+    let lat_of = |path: &str| -> f64 {
+        read.query_row("SELECT lat FROM photos WHERE path=?1", [path], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(
+        (lat_of("photos/m.jpg"), lat_of("photos/n.jpg")),
+        (35.0, 12.575)
+    );
+    // 実 DB は変わらない
+    assert_eq!(s.rows().len(), before);
+    assert_eq!(s.row("photos/m.jpg").lat, Some(35.0));
+    assert_eq!(s.row("photos/n.jpg").lat, None);
+}
+
 /// 更新 API を writer 経由で呼ぶ（割り込みの試験用）。
 fn api_set_loc(writer: &Writer, id: i64, lat: f64, lon: f64) {
     let payload = serde_json::json!({"id": id, "lat": lat, "lon": lon});
@@ -489,7 +606,7 @@ fn flags_of(s: &Setup, id: i64) -> Option<(i64, i64)> {
 }
 
 #[test]
-fn 計画のあとに更新apiが入っても_お気に入りと除外は残り_変わらない行の手動の位置も残る() {
+fn 計画のあとに更新apiが入っても_お気に入りと除外と手動の位置は残る() {
     let mut s = setup("local-update-api");
     let a = s.put("photos/a.jpg", &jpeg_plain(), T0); // ファイルが変わる（Update）
     s.put("photos/b.jpg", &jpeg_plain(), T0); // 変わらない（計画に入らない）
@@ -524,14 +641,16 @@ fn 計画のあとに更新apiが入っても_お気に入りと除外は残り_
     );
     assert_eq!(flags_of(&s, idb), Some((1, 0)));
     // 更新される行: お気に入り・除外は索引の SET 句に無いので残る。
-    // 位置は、索引が EXIF の値で上書きする（inventory.md §2.3 ①。方針は T3.7 で決める。更新 API が
-    // 計画の前に入っても後に入っても同じ結果＝競合で失われるのではなく、現行の仕様）
+    // 位置は、計画のあとに更新 API が手動で直したものが残る（T3.7 ①。書く時点で `manual` なら位置を書かない。
+    // 計画の時点では手動でなかったので、件数の `location_kept` には数えない）
     assert_eq!(flags_of(&s, ida), Some((1, 1)));
     let a_row = s.row("photos/a.jpg");
     assert_eq!(
-        (a_row.loc_source.as_deref(), a_row.lat),
-        (Some("exif"), Some(12.575))
+        (a_row.loc_source.as_deref(), a_row.lat, a_row.lon),
+        (Some("manual"), Some(43.0), Some(141.0))
     );
+    assert_eq!(a_row.taken_at.as_deref(), Some("2024-05-06 07:08"));
+    assert_eq!(get(&counts, "location_kept"), 0);
     // 消える行は、お気に入りごと消える（§2.3 ②。T3.7）
     assert_eq!(flags_of(&s, idc), None);
 }

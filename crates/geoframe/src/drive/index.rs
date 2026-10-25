@@ -9,8 +9,9 @@
 //!   [`imaging::norm_time`] に通す。無ければ空文字）・`lat`/`lon`（`latitude`/`longitude`。独立に取る）・
 //!   `loc_source`（`lat` があれば `drive_meta`、無ければ NULL）・`indexed_at`。新しい行の `id` は一覧の順に振られる。
 //! - **更新**: `drive_id` の行があって `md5` が違うとき。`name md5 taken_at lat lon loc_source` を上書きし、
-//!   `place elev display fetched_at` を NULL、`rotation=0`、`indexed_at` を更新する。**手動で直した位置も上書きされる**
-//!   （inventory.md §2.3。P3 で直すか決める）。`md5` が同じなら何もしない（`name` が変わっていても）。
+//!   `place elev display fetched_at` を NULL、`rotation=0`、`indexed_at` を更新する。**ただし `loc_source='manual'`
+//!   の行は `lat lon loc_source place elev` を書かない**（T3.7。ユーザーの決定。現行は手動の位置も上書きして失う。
+//!   inventory.md §2.3 ①）。`md5` が同じなら何もしない（`name` が変わっていても）。
 //!   `favorite hidden title inferred_from infer_dt_s muni_cd pref city` は触らない。
 //! - **削除**: `source='drive'` の行で、一覧に無いもの。`display` の derivative も消す。
 //!
@@ -57,6 +58,80 @@ const STOP_CHECK_EVERY: usize = 256;
 pub const MASS_DELETE_MIN: usize = 50;
 /// 上の割合（%）。6,535 件なら 1,307 件を超える削除が対象。1 件だけ見える一覧のような取り違えを止める。
 pub const MASS_DELETE_PERCENT: usize = 20;
+
+/// 大量削除を保留している理由。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldReason {
+    /// 消す行が [`MASS_DELETE_MIN`] 件を超え、かつ Drive の行の [`MASS_DELETE_PERCENT`]% を超える。
+    Ratio,
+    /// 一覧が 0 件で、Drive の行が残っている。
+    EmptyListing,
+}
+
+impl HoldReason {
+    /// `/api/admin/status` の `sync.mass_delete_hold.reason` の値。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ratio => "ratio",
+            Self::EmptyListing => "empty_listing",
+        }
+    }
+}
+
+/// 保留している削除（`/api/admin/status` の `sync.mass_delete_hold`。T3.7）。写真の名前・座標は持たない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MassDeleteHold {
+    /// 保留している（消さなかった）行の数。直近の確認での数。
+    pub held: u64,
+    pub reason: HoldReason,
+    /// そのときの Drive の行の数。
+    pub drive_rows: u64,
+    /// 保留が続き始めた時刻（`YYYY-MM-DD HH:MM:SS`。連続して保留している間は変わらない）。
+    pub since: String,
+    /// 直近に保留を確かめた時刻（同）。
+    pub checked_at: String,
+}
+
+/// 大量削除の保留の記憶。**プロセスの中だけ**（再起動で消え、次のサイクルでまた付く）。`index_drive` が一覧を
+/// 読んで計画を作るたびに書き直し、管理画面の状態（`/api/admin/status`）が読む。DB には書かない。
+///
+/// - 保留があれば `Some`、計画が保留なしだったら `None` に戻る（`geoframe sync --allow-mass-delete` で消したあと、
+///   または Drive の一覧が元に戻ったあとの、**この `serve` の次のサイクル**）。
+/// - 鍵が無い・認証に失敗・一覧の取得に失敗・停止の合図で中断したサイクルは何も確かめていないので、直前の記憶を変えない
+///   （`checked_at` が古いままなので、画面では「最後に確かめた時刻」で分かる）。
+/// - 取り込みが無効（`GEOFRAME_INGEST=0`）の `serve` には、この記憶自体が無い（`index_drive` が動かない）。
+#[derive(Debug, Default)]
+pub struct MassDeleteBoard {
+    hold: std::sync::Mutex<Option<MassDeleteHold>>,
+}
+
+impl MassDeleteBoard {
+    /// 今の保留（無ければ `None`）。
+    pub fn current(&self) -> Option<MassDeleteHold> {
+        self.hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 計画を作った結果を記録する（`index_drive` が呼ぶ。結合試験も使う）。`observed` は保留した `(行数, 理由, Drive の行数)`、無ければ保留なし。
+    pub fn record(&self, observed: Option<(u64, HoldReason, u64)>, now: &str) {
+        let mut guard = self
+            .hold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = observed.map(|(held, reason, drive_rows)| MassDeleteHold {
+            held,
+            reason,
+            drive_rows,
+            // 連続して保留している間は、保留が始まった時刻のまま
+            since: guard
+                .as_ref()
+                .map_or_else(|| now.to_string(), |old| old.since.clone()),
+            checked_at: now.to_string(),
+        });
+    }
+}
 
 /// 同期サイクルの段 `index_drive`。
 pub struct IndexDrive {
@@ -108,6 +183,8 @@ pub(super) struct ExistingRow {
     drive_id: Option<String>,
     md5: Md5Cell,
     display: Option<String>,
+    /// `loc_source='manual'`（手で直した位置。md5 が変わっても位置を書き換えない）。
+    manual: bool,
 }
 
 /// 書き込む 1 行分（追加・更新に共通）。
@@ -170,6 +247,9 @@ pub(super) struct DrivePlan {
     pub mass_delete_withheld: u64,
     /// 計画を作った時点の、DB の Drive の行の数（警告の文面に使う）。
     pub drive_rows: u64,
+    /// 更新する行のうち、計画を作った時点で `loc_source='manual'` だったもの（位置と地名を書かない。T3.7）。
+    /// 書く時点の判定は SQL の条件で行うので、計画のあとに手動の位置が付いた行はこの数に入らないが守られる。
+    pub location_kept: u64,
 }
 
 // 計画の中身（名前・座標を持つ `ops`）を出さず、件数だけを出す
@@ -183,6 +263,7 @@ impl fmt::Debug for DrivePlan {
             .field("malformed", &self.malformed)
             .field("deletes_withheld", &self.deletes_withheld)
             .field("mass_delete_withheld", &self.mass_delete_withheld)
+            .field("location_kept", &self.location_kept)
             .finish()
     }
 }
@@ -193,6 +274,25 @@ fn is_mass_delete(doomed: usize, drive_rows: usize) -> bool {
 }
 
 impl DrivePlan {
+    /// 削除を保留したなら `(保留した行数, 理由, Drive の行数)`。
+    fn hold(&self) -> Option<(u64, HoldReason, u64)> {
+        if self.mass_delete_withheld > 0 {
+            Some((
+                self.mass_delete_withheld,
+                HoldReason::Ratio,
+                self.drive_rows,
+            ))
+        } else if self.deletes_withheld > 0 {
+            Some((
+                self.deletes_withheld,
+                HoldReason::EmptyListing,
+                self.drive_rows,
+            ))
+        } else {
+            None
+        }
+    }
+
     fn added(&self) -> u64 {
         self.ops
             .iter()
@@ -210,7 +310,7 @@ impl DrivePlan {
 
 pub(super) fn load_existing(conn: &Connection) -> rusqlite::Result<Vec<ExistingRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, source, drive_id, md5, display FROM photos
+        "SELECT id, source, drive_id, md5, display, loc_source = 'manual' FROM photos
          WHERE drive_id IS NOT NULL OR source = 'drive'",
     )?;
     let mut rows = stmt.query([])?;
@@ -228,6 +328,10 @@ pub(super) fn load_existing(conn: &Connection) -> rusqlite::Result<Vec<ExistingR
             drive_id: row.get::<_, Option<String>>(2).unwrap_or(None),
             md5,
             display: row.get::<_, Option<String>>(4).unwrap_or(None),
+            manual: row
+                .get::<_, Option<bool>>(5)
+                .unwrap_or(None)
+                .unwrap_or(false),
         });
     }
     Ok(out)
@@ -270,6 +374,9 @@ pub(super) fn plan(
             lat: file.lat,
             lon: file.lon,
         };
+        if known.is_some_and(|row| row.manual) {
+            plan.location_kept += 1;
+        }
         plan.ops.push(if known.is_some() {
             Op::Update(entry)
         } else {
@@ -323,9 +430,17 @@ pub(super) fn write_plan(
             "INSERT INTO photos(source, drive_id, name, md5, taken_at, lat, lon, loc_source, indexed_at)
              VALUES('drive', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
+        // `loc_source='manual'`（手で直した位置）の行は、位置と地名（`lat lon loc_source place elev`）を書かない
+        // （T3.7）。判定は書く時点の行で行う（SQLite の `UPDATE` は右辺をすべて更新前の行で評価する）ので、
+        // 計画を読んでから書くまでの間に更新 API が位置を直した行も守られる
         let mut update = tx.prepare(
-            "UPDATE photos SET name=?1, md5=?2, taken_at=?3, lat=?4, lon=?5, loc_source=?6,
-             place=NULL, elev=NULL, display=NULL, fetched_at=NULL, rotation=0, indexed_at=?7
+            "UPDATE photos SET name=?1, md5=?2, taken_at=?3,
+             lat=CASE WHEN loc_source = 'manual' THEN lat ELSE ?4 END,
+             lon=CASE WHEN loc_source = 'manual' THEN lon ELSE ?5 END,
+             loc_source=CASE WHEN loc_source = 'manual' THEN loc_source ELSE ?6 END,
+             place=CASE WHEN loc_source = 'manual' THEN place END,
+             elev=CASE WHEN loc_source = 'manual' THEN elev END,
+             display=NULL, fetched_at=NULL, rotation=0, indexed_at=?7
              WHERE drive_id=?8",
         )?;
         let mut delete = tx.prepare("DELETE FROM photos WHERE id=?1")?;
@@ -375,6 +490,7 @@ fn counts(plan: &DrivePlan, pages: u32, removed_files: (u64, u64, u64)) -> Count
         ("updated", plan.updated()),
         ("removed", plan.deletes.len() as u64),
         ("unchanged", plan.unchanged),
+        ("location_kept", plan.location_kept),
         ("malformed", plan.malformed),
         ("deletes_withheld", plan.deletes_withheld),
         ("mass_delete_withheld", plan.mass_delete_withheld),
@@ -423,6 +539,13 @@ impl IndexDrive {
         };
         let existing = load_existing(ctx.read)?;
         let plan = plan(&existing, &listing.files, self.allow_mass_delete);
+        if !ctx.is_dry_run() {
+            // 一覧を全部読めて計画ができたので、保留の有無を管理画面に見せる（T3.7）。
+            // 失敗・省略したサイクルはここに来ないので、直前の記憶のまま
+            self.shared
+                .board
+                .record(plan.hold(), &crate::sysinfo::local_timestamp());
+        }
         if plan.mass_delete_withheld > 0 {
             // 件数だけ（名前は出さない）。保留はサイクルごとに警告する
             tracing::warn!(

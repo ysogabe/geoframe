@@ -377,6 +377,33 @@ pub async fn spawn_with_env(
     addr
 }
 
+/// 組み立て済みの状態（`test_state` から作ったもの）で router を起動する。
+pub async fn spawn_state(
+    dir: &Path,
+    env: &[(&str, &str)],
+    catalog: Catalog,
+    with: impl FnOnce(AppState) -> AppState,
+) -> std::net::SocketAddr {
+    let map: std::collections::HashMap<String, String> = env
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let config = Config::load(
+        |k| map.get(k).cloned(),
+        &Overrides {
+            data_dir: Some(dir.to_path_buf()),
+            ..Overrides::default()
+        },
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = router(with(test_state(Arc::new(config), catalog)));
+    let listener = LimitedListener::new(listener, ConnLimits::default());
+    tokio::spawn(async move { axum::serve(listener, app).await });
+    addr
+}
+
 /// `POST` を、ヘッダを加工せずそのまま（`Content-Length` も自動では付けない）送り、応答を読む。
 /// サーバーが本文を読まずに閉じたときは、本文の送信が失敗したりリセットされたりするが、
 /// それまでに届いた応答は返す（上限超過の 413 の確認用）。

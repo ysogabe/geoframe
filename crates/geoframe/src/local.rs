@@ -12,8 +12,9 @@
 //! - **走査順は「パスの要素の列」の昇順**（Python の `sorted(rglob("*"))` と同じ。`a/b` は `a-b` より前）。
 //!   新しい行の `id` はこの順に振られる。
 //! - 行が無ければ追加（`loc_source` は GPS があれば `exif`、無ければ NULL）。`mtime` が 1 秒以上違えば
-//!   更新（`mtime taken_at lat lon loc_source` を上書きし `place elev display` を NULL に戻す。**手動で
-//!   直した位置も上書きされる**。inventory.md §2.3）。そうでなければ触らない。
+//!   更新（`mtime taken_at lat lon loc_source` を上書きし `place elev display` を NULL に戻す。**ただし
+//!   `loc_source='manual'` の行は `lat lon loc_source place elev` を書かない**＝手で直した位置を残す。T3.7・
+//!   inventory.md §2.3 ①。現行は手動の位置も上書きして失う）。そうでなければ触らない。
 //! - 走査で見つからなかった `source='local'` の行は削除する。`display` が `derivatives/` で始まるときだけ
 //!   そのファイルも消す（`photos/` の原本は消さない）。
 //! - 画像として読めない写真は飛ばす（行を作らない・更新しない）。
@@ -248,6 +249,8 @@ struct ExistingRow {
     source: String,
     mtime: Option<f64>,
     display: Option<String>,
+    /// `loc_source='manual'`（手で直した位置。mtime が変わっても位置を書き換えない）。
+    manual: bool,
 }
 
 /// 書き込む 1 行分（追加・更新に共通）。
@@ -276,6 +279,9 @@ struct Plan {
     deletes: Vec<(i64, Option<String>)>,
     files: u64,
     unreadable: u64,
+    /// 更新する行のうち、計画を作った時点で `loc_source='manual'` だったもの（位置と地名を書かない。T3.7）。
+    /// 書く時点の判定は SQL の条件で行うので、計画のあとに手動の位置が付いた行はこの数に入らないが守られる。
+    location_kept: u64,
 }
 
 impl Plan {
@@ -299,7 +305,7 @@ fn load_existing(
     let mut by_path = HashMap::new();
     let mut local_without_path = Vec::new();
     let mut stmt = conn.prepare(
-        "SELECT id, source, path, mtime, display FROM photos
+        "SELECT id, source, path, mtime, display, loc_source = 'manual' FROM photos
          WHERE path IS NOT NULL OR source = 'local'",
     )?;
     let mut rows = stmt.query([])?;
@@ -310,6 +316,10 @@ fn load_existing(
             // 型が想定外（文字列など）の mtime は「変わった」とみなす（現行は例外で落ちる）
             mtime: row.get::<_, Option<f64>>(3).unwrap_or(None),
             display: row.get(4)?,
+            manual: row
+                .get::<_, Option<bool>>(5)
+                .unwrap_or(None)
+                .unwrap_or(false),
         };
         match row.get::<_, Option<String>>(2)? {
             Some(path) => {
@@ -387,6 +397,9 @@ impl IndexLocal {
                 lon,
                 loc_source: lat.map(|_| "exif"),
             };
+            if known.is_some_and(|row| row.manual) {
+                plan.location_kept += 1;
+            }
             plan.ops.push(if known.is_some() {
                 Op::Update(entry)
             } else {
@@ -430,9 +443,17 @@ fn write_plan(
             "INSERT INTO photos(source, path, name, mtime, taken_at, lat, lon, loc_source, indexed_at)
              VALUES('local', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         )?;
+        // `loc_source='manual'`（手で直した位置）の行は、位置と地名（`lat lon loc_source place elev`）を書かない
+        // （T3.7）。判定は書く時点の行で行う（SQLite の `UPDATE` は右辺をすべて更新前の行で評価する）ので、
+        // 計画を読んでから書くまでの間に更新 API が位置を直した行も守られる
         let mut update = tx.prepare(
-            "UPDATE photos SET mtime=?1, taken_at=?2, lat=?3, lon=?4, loc_source=?5,
-             place=NULL, elev=NULL, display=NULL, indexed_at=?6 WHERE path=?7",
+            "UPDATE photos SET mtime=?1, taken_at=?2,
+             lat=CASE WHEN loc_source = 'manual' THEN lat ELSE ?3 END,
+             lon=CASE WHEN loc_source = 'manual' THEN lon ELSE ?4 END,
+             loc_source=CASE WHEN loc_source = 'manual' THEN loc_source ELSE ?5 END,
+             place=CASE WHEN loc_source = 'manual' THEN place END,
+             elev=CASE WHEN loc_source = 'manual' THEN elev END,
+             display=NULL, indexed_at=?6 WHERE path=?7",
         )?;
         let mut delete = tx.prepare("DELETE FROM photos WHERE id=?1")?;
         let steps = ops.len() + delete_ids.len();
@@ -524,6 +545,7 @@ fn index_counts(plan: &Plan, scan: &Scan, removed_files: (u64, u64, u64)) -> Cou
         ("added", plan.added()),
         ("updated", plan.updated()),
         ("removed", plan.deletes.len() as u64),
+        ("location_kept", plan.location_kept),
         ("unreadable", plan.unreadable),
         ("skipped", scan.skipped()),
         ("unreadable_dirs", scan.unreadable_dirs),

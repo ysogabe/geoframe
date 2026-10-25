@@ -39,8 +39,8 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::Value;
@@ -51,6 +51,7 @@ use crate::stop::StopFlag;
 
 pub use fetch::FetchDerivatives;
 pub use index::IndexDrive;
+pub use index::{HoldReason, MassDeleteBoard, MassDeleteHold};
 
 /// 読み取り専用のスコープ（現行と同じ）。
 pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";
@@ -295,6 +296,9 @@ pub struct DriveShared {
     permission_warned: AtomicBool,
     /// 原本 1 枚のダウンロードの時間の上限。本番は [`DOWNLOAD_TIMEOUT`] だけ（試験が短くできる）。
     download_timeout: Duration,
+    /// 大量削除の保留の記憶（`/api/admin/status` が読む。T3.7）。`serve` が [`DriveShared::mass_delete_board`] で
+    /// 同じものをサーバーの状態に渡す。
+    board: Arc<MassDeleteBoard>,
 }
 
 impl DriveShared {
@@ -310,7 +314,13 @@ impl DriveShared {
             auth_failed: AtomicBool::new(false),
             permission_warned: AtomicBool::new(false),
             download_timeout: DOWNLOAD_TIMEOUT,
+            board: Arc::new(MassDeleteBoard::default()),
         }
+    }
+
+    /// 大量削除の保留の記憶。`index_drive` が書き、管理画面の状態（`/api/admin/status`）が読む。
+    pub fn mass_delete_board(&self) -> Arc<MassDeleteBoard> {
+        Arc::clone(&self.board)
     }
 
     /// 試験用: ダウンロードの時間の上限を短くする。

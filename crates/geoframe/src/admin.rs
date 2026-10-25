@@ -135,6 +135,26 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
 
 /// 列の値ごとの件数（NULL は空文字のキーに寄せる）。現行の `_group` と同じく、NULL と空文字が両方
 /// あるときは**後から来た行**（SQLite の GROUP BY は NULL が先）の件数が残る。
+/// `sync` に `mass_delete_hold`（Drive の大量削除の保留。T3.7）を足す。保留が無いときは呼ばない
+/// （キーを出さない＝Python の応答と同じ形）。写真の名前・座標は入れない。
+pub fn insert_mass_delete_hold(
+    status: &mut Map<String, Value>,
+    hold: &crate::drive::MassDeleteHold,
+) {
+    if let Some(Value::Object(sync)) = status.get_mut("sync") {
+        sync.insert(
+            "mass_delete_hold".into(),
+            json!({
+                "held": hold.held,
+                "reason": hold.reason.as_str(),
+                "drive_rows": hold.drive_rows,
+                "since": hold.since,
+                "checked_at": hold.checked_at,
+            }),
+        );
+    }
+}
+
 fn group_counts(conn: &Connection, column: &str) -> rusqlite::Result<Map<String, Value>> {
     let mut stmt = conn.prepare(&format!(
         "SELECT {column}, COUNT(*) c FROM photos GROUP BY {column}"

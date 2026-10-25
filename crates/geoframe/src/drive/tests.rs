@@ -723,9 +723,8 @@ fn the_second_run_changes_nothing() {
     assert_eq!(e.rows(), before);
 }
 
-#[test]
-fn a_changed_md5_updates_the_row_and_resets_the_derived_columns() {
-    let e = env("drive-update");
+/// 手動の位置のほかに、お気に入り・回転・表示・地名・推定の痕跡を持つ行を作る（`loc_source` は引数）。
+fn seed_located_row(e: &Env, loc_source: &str) {
     e.listing(vec![located(
         "f1",
         "a.jpg",
@@ -735,23 +734,32 @@ fn a_changed_md5_updates_the_row_and_resets_the_derived_columns() {
         139.0,
     )]);
     e.index();
-    // 手動の位置・お気に入り・回転・表示・地名・推定の痕跡
-    e.sql(
-        "UPDATE photos SET loc_source='manual', lat=1.0, lon=2.0, favorite=1, hidden=1, rotation=90,
-         place='東京', elev=12.5, display='derivatives/f1.r90.jpg', fetched_at='2024-01-01T00:00:00',
-         inferred_from=7, infer_dt_s=60, title='題名', muni_cd='13101', pref='東京都', city='千代田区',
-         indexed_at='2000-01-01T00:00:00'",
-    );
+    e.sql(Box::leak(
+        format!(
+            "UPDATE photos SET loc_source='{loc_source}', lat=1.0, lon=2.0, favorite=1, hidden=1, rotation=90,
+             place='東京', elev=12.5, display='derivatives/f1.r90.jpg', fetched_at='2024-01-01T00:00:00',
+             inferred_from=7, infer_dt_s=60, title='題名', muni_cd='13101', pref='東京都', city='千代田区',
+             indexed_at='2000-01-01T00:00:00'"
+        )
+        .into_boxed_str(),
+    ));
     fs::create_dir_all(e.root().join("derivatives")).unwrap();
     fs::write(e.root().join("derivatives/f1.r90.jpg"), b"x").unwrap();
+}
+
+#[test]
+fn a_changed_md5_updates_the_row_and_resets_the_derived_columns() {
+    let e = env("drive-update");
+    // 手動でない位置（推定）は、現行と同じく原本の値（ここでは位置なし）で上書きされる
+    seed_located_row(&e, "inferred");
     e.listing(vec![jpeg("f1", "a2.jpg", "m1-new")]);
     let counts = e.index();
     assert_eq!(get(&counts, "updated"), 1);
+    assert_eq!(get(&counts, "location_kept"), 0);
     let rows = e.rows();
     let r = &rows[0];
     assert_eq!(text(r, "name").as_deref(), Some("a2.jpg"));
     assert_eq!(text(r, "md5").as_deref(), Some("m1-new"));
-    // 手動の位置も上書きされる（現行と同じ。server.md §0）。位置が無くなれば NULL
     assert_eq!(col(r, "lat"), &rusqlite::types::Value::Null);
     assert_eq!(col(r, "lon"), &rusqlite::types::Value::Null);
     assert!(text(r, "loc_source").is_none());
@@ -781,6 +789,100 @@ fn a_changed_md5_updates_the_row_and_resets_the_derived_columns() {
     let counts = e.index();
     assert_eq!(get(&counts, "updated") + get(&counts, "added"), 0);
     assert_eq!(e.rows(), before);
+}
+
+/// T3.7 ①: 手動の位置（`loc_source='manual'`）は、md5 が変わっても `lat lon loc_source place elev` を書き換えない。
+/// 撮影時刻・名前・md5・表示・取得時刻・回転・indexed_at は今までどおり更新される。
+#[test]
+fn a_changed_md5_keeps_a_manual_location_and_its_place_names() {
+    let e = env("drive-update-manual");
+    seed_located_row(&e, "manual");
+    // 原本は位置つきで、撮影時刻も変わる（手動の位置は原本の位置に置き換わらない）
+    e.listing(vec![located(
+        "f1",
+        "a2.jpg",
+        "m1-new",
+        "2025:01:02 03:04:05",
+        35.5,
+        139.5,
+    )]);
+    let counts = e.index();
+    assert_eq!(get(&counts, "updated"), 1);
+    assert_eq!(get(&counts, "location_kept"), 1);
+    let rows = e.rows();
+    let r = &rows[0];
+    assert_eq!(col(r, "lat"), &rusqlite::types::Value::Real(1.0));
+    assert_eq!(col(r, "lon"), &rusqlite::types::Value::Real(2.0));
+    assert_eq!(text(r, "loc_source").as_deref(), Some("manual"));
+    assert_eq!(text(r, "place").as_deref(), Some("東京"));
+    assert_eq!(col(r, "elev"), &rusqlite::types::Value::Real(12.5));
+    assert_eq!(text(r, "muni_cd").as_deref(), Some("13101"));
+    assert_eq!(text(r, "pref").as_deref(), Some("東京都"));
+    assert_eq!(text(r, "city").as_deref(), Some("千代田区"));
+    assert_eq!(col(r, "inferred_from"), &rusqlite::types::Value::Integer(7));
+    assert_eq!(col(r, "infer_dt_s"), &rusqlite::types::Value::Integer(60));
+    // それ以外の更新は今までどおり
+    assert_eq!(text(r, "name").as_deref(), Some("a2.jpg"));
+    assert_eq!(text(r, "md5").as_deref(), Some("m1-new"));
+    assert_eq!(text(r, "taken_at").as_deref(), Some("2025-01-02 03:04"));
+    for name in ["display", "fetched_at"] {
+        assert_eq!(col(r, name), &rusqlite::types::Value::Null, "{name}");
+    }
+    assert_eq!(col(r, "rotation"), &rusqlite::types::Value::Integer(0));
+    assert_ne!(
+        text(r, "indexed_at").as_deref(),
+        Some("2000-01-01T00:00:00")
+    );
+    assert_eq!(col(r, "favorite"), &rusqlite::types::Value::Integer(1));
+    assert_eq!(col(r, "hidden"), &rusqlite::types::Value::Integer(1));
+    assert_eq!(text(r, "title").as_deref(), Some("題名"));
+}
+
+/// 手動の行と手動でない行が同じ更新に混ざっても、行ごとに規則が決まる。`--dry-run`（写しに同じ書き込みを
+/// 当てる）も同じ結果と件数になる。
+#[test]
+fn dry_run_counts_and_applies_the_same_rule_for_manual_rows() {
+    let e = env("drive-update-manual-dry");
+    e.listing(vec![
+        located("m", "m.jpg", "m1", "2024:05:06 07:08:09", 35.0, 139.0),
+        located("n", "n.jpg", "n1", "2024:05:06 07:09:09", 35.1, 139.1),
+    ]);
+    e.index();
+    e.sql("UPDATE photos SET loc_source='manual', lat=1.0, lon=2.0 WHERE drive_id='m'");
+    e.listing(vec![
+        located("m", "m.jpg", "m2", "2024:05:06 07:08:09", 35.0, 139.0),
+        located("n", "n.jpg", "n2", "2024:05:06 07:09:09", 36.0, 140.0),
+    ]);
+    let before = e.rows();
+    let sim = e.read_for(Mode::DryRun);
+    let result = e.run_on(&e.index_stage(), Mode::DryRun, &sim, &StopFlag::new());
+    let StageResult::Done(counts) = result else {
+        panic!("{result:?}");
+    };
+    assert_eq!(get(&counts, "updated"), 2);
+    assert_eq!(get(&counts, "location_kept"), 1);
+    // 後続の段に見せる写しにも同じ規則が当たっている
+    let sim_lat = |id: &str| -> f64 {
+        sim.query_row("SELECT lat FROM photos WHERE drive_id=?1", [id], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    };
+    assert_eq!((sim_lat("m"), sim_lat("n")), (1.0, 36.0));
+    // dry-run は実 DB を変えない
+    assert_eq!(e.rows(), before);
+    // 実行すると、手動の行だけ位置が残る
+    let counts = e.index();
+    assert_eq!(
+        (get(&counts, "updated"), get(&counts, "location_kept")),
+        (2, 1)
+    );
+    let m = row_of(&e, "m").unwrap();
+    assert_eq!(col(&m, "lat"), &rusqlite::types::Value::Real(1.0));
+    assert_eq!(text(&m, "loc_source").as_deref(), Some("manual"));
+    let n = row_of(&e, "n").unwrap();
+    assert_eq!(col(&n, "lat"), &rusqlite::types::Value::Real(36.0));
+    assert_eq!(text(&n, "loc_source").as_deref(), Some("drive_meta"));
 }
 
 fn api_set_loc(writer: &Writer, id: i64, lat: f64, lon: f64) {
@@ -820,7 +922,7 @@ fn int(row: &Row, name: &str) -> i64 {
 }
 
 #[test]
-fn index_drive_plan_survives_the_update_api_except_where_the_python_rules_overwrite() {
+fn index_drive_plan_survives_the_update_api_including_a_location_set_after_the_plan() {
     let mut e = env("drive-update-api");
     e.listing(vec![
         located("f1", "a.jpg", "m1", "2024:05:06 07:08:09", 35.0, 139.0), // md5 が変わる（Update）
@@ -850,12 +952,15 @@ fn index_drive_plan_survives_the_update_api_except_where_the_python_rules_overwr
     assert_eq!(text(&r2, "loc_source").as_deref(), Some("manual"));
     assert_eq!(col(&r2, "lat"), &rusqlite::types::Value::Real(48.0));
     assert_eq!((int(&r2, "favorite"), int(&r2, "hidden")), (1, 0));
-    // md5 が変わった行: お気に入り・除外は残る。位置は Drive の値で上書きされる
-    // （inventory.md §2.3 ①。T3.7 で方針を決める。更新 API が計画の前でも後でも同じ結果）
+    // md5 が変わった行: お気に入り・除外は残る。位置は、計画のあとに更新 API が手動で直したものが残る
+    // （T3.7 ①。書く時点で `manual` なら位置を書かない。計画の時点では手動でなかったので `location_kept` には数えない）
     let r1 = row_of(&e, "f1").unwrap();
     assert_eq!((int(&r1, "favorite"), int(&r1, "hidden")), (1, 1));
-    assert_eq!(text(&r1, "loc_source").as_deref(), Some("drive_meta"));
-    assert_eq!(col(&r1, "lat"), &rusqlite::types::Value::Real(35.0));
+    assert_eq!(text(&r1, "loc_source").as_deref(), Some("manual"));
+    assert_eq!(col(&r1, "lat"), &rusqlite::types::Value::Real(43.0));
+    assert_eq!(col(&r1, "lon"), &rusqlite::types::Value::Real(141.0));
+    assert_eq!(get(&counts, "location_kept"), 0);
+    assert_eq!(text(&r1, "md5").as_deref(), Some("m1-new"));
     // 一覧から消えた行は、お気に入りごと消える（§2.3 ②。T3.7）
     assert!(row_of(&e, "f3").is_none());
 }
@@ -1847,6 +1952,38 @@ impl Env {
     }
 }
 
+/// T3.7 ①（ユーザーの決定。server.md §0）による、Python との**唯一の**差の分類。フィクスチャの `idA` は
+/// `changes` の段階で手動の位置（`1.0, 2.0, 'manual', place='p', elev=3.5`）を持ったまま md5 が変わる。
+/// Python はその位置を原本の値（位置なし）で上書きして `lat lon loc_source place elev` が NULL になるが、
+/// Rust は手動の値を残す。この 5 列以外（`inferred_from` `infer_dt_s` `muni_cd` `pref` `city` `favorite` `hidden`
+/// `title` や、`name md5 taken_at display fetched_at rotation indexed_at`）は Python と一致のまま比べる。
+/// 差であること（Python の値が Rust の値と違うこと）も確かめ、分類が空振りしていないようにする。
+fn python_rows_with_the_manual_location_decision(py_rows: &Value) -> Value {
+    let mut rows = py_rows.clone();
+    let mut classified = 0;
+    for row in rows.as_array_mut().unwrap() {
+        if row["drive_id"] != "idA" {
+            continue;
+        }
+        for (column, kept) in [
+            ("lat", json!(1.0)),
+            ("lon", json!(2.0)),
+            ("loc_source", json!("manual")),
+            ("place", json!("p")),
+            ("elev", json!(3.5)),
+        ] {
+            assert_ne!(
+                row[column], kept,
+                "{column}: Python と同じ値なら決定による差ではない"
+            );
+            row[column] = kept;
+        }
+        classified += 1;
+    }
+    assert_eq!(classified, 1, "idA の行が無い");
+    rows
+}
+
 #[test]
 fn matches_the_python_fixture() {
     let text = fs::read_to_string(format!(
@@ -1877,10 +2014,21 @@ fn matches_the_python_fixture() {
     let mut rows_before_emptied = Value::Null;
     let mut final_python_displays = Value::Null;
     let mut rust_fetch_cycles = Vec::new();
+    // `changes` から先は、idA の手動の位置が Python との差（決定による差）になる
+    let mut manual_decision = false;
 
     for phase in doc["phases"].as_array().unwrap() {
         let name = phase["name"].as_str().unwrap();
         let py = &phase["python"];
+        manual_decision |= name == "changes";
+        // この段階の Python の行（決定による差だけを反映したもの）
+        let py_rows = || {
+            if manual_decision && py["rows"].as_array().is_some_and(|r| !r.is_empty()) {
+                python_rows_with_the_manual_location_decision(&py["rows"])
+            } else {
+                py["rows"].clone()
+            }
+        };
         e.sql("UPDATE photos SET indexed_at='2000-01-01T00:00:00'");
         for op in phase["ops"].as_array().map(Vec::as_slice).unwrap_or(&[]) {
             match op["op"].as_str().unwrap() {
@@ -1952,7 +2100,7 @@ fn matches_the_python_fixture() {
                 if name == "emptied" {
                     assert_eq!(rows_now, rows_before_emptied, "{name}: 消さない");
                 } else {
-                    assert_eq!(rows_now, py["rows"], "{name}: photos の全列");
+                    assert_eq!(rows_now, py_rows(), "{name}: photos の全列");
                 }
                 rows_before_emptied = rows_now.clone();
             }
@@ -1971,7 +2119,7 @@ fn matches_the_python_fixture() {
                 if first {
                     // 最初のサイクルは Python と同じ写真を同じ順に試し、同じ行・同じ寸法になる
                     assert_eq!(attempts, py_attempts, "{name}");
-                    assert_eq!(normalized(&e.rows()), py["rows"], "{name}");
+                    assert_eq!(normalized(&e.rows()), py_rows(), "{name}");
                     assert_eq!(derivative_sizes(&e), py["sizes"], "{name}");
                 } else if name.contains("limit1") {
                     // Python は失敗する idF が毎回枠を占め、後ろの写真を取得できない。Rust は idF を飛ばして先へ進む
@@ -2785,6 +2933,97 @@ fn dry_run_reports_the_hold_and_what_the_flag_would_do_without_writing() {
     // どちらでも実 DB と派生物は変わらない
     assert_eq!(e.rows(), before);
     assert!(e.root().join("derivatives/d99.jpg").exists());
+}
+
+// ---------------------------------------------------------------------------
+// 大量削除の保留の記憶（管理画面の `sync.mass_delete_hold`。T3.7）
+
+#[test]
+fn the_board_shows_a_ratio_hold_and_clears_when_the_listing_recovers() {
+    let e = env("drive-board-ratio");
+    let board = e.shared.mass_delete_board();
+    seed_drive_rows(&e, 100);
+    // まだサイクルが回っていない
+    assert_eq!(board.current(), None);
+    // 100 件から 1 件だけ見える一覧: 99 件を保留
+    list_first(&e, 1);
+    e.index();
+    let hold = board.current().expect("保留が記録される");
+    assert_eq!(
+        (hold.held, hold.reason, hold.drive_rows),
+        (99, HoldReason::Ratio, 100)
+    );
+    assert_eq!(hold.reason.as_str(), "ratio");
+    assert_eq!(hold.since.len(), 19);
+    // 一覧が元に戻れば（保留が要らなくなれば）消える
+    list_first(&e, 100);
+    e.index();
+    assert_eq!(board.current(), None);
+}
+
+#[test]
+fn the_board_shows_an_empty_listing_hold_and_the_flag_cycle_clears_it() {
+    let e = env("drive-board-empty");
+    let board = e.shared.mass_delete_board();
+    seed_drive_rows(&e, 3);
+    e.listing(vec![]);
+    e.index();
+    let hold = board.current().expect("空の一覧の保留が記録される");
+    assert_eq!(
+        (hold.held, hold.reason, hold.drive_rows),
+        (3, HoldReason::EmptyListing, 3)
+    );
+    assert_eq!(hold.reason.as_str(), "empty_listing");
+    // `--allow-mass-delete` のサイクルは保留せずに消すので、記憶も消える（同じ `serve` の中で解除した場合）
+    let allowing = IndexDrive::allowing_mass_delete(Arc::clone(&e.shared));
+    assert_eq!(get(&e.done(&allowing), "removed"), 3);
+    assert_eq!(board.current(), None);
+}
+
+#[test]
+fn the_board_is_untouched_by_dry_run_and_by_cycles_that_learned_nothing() {
+    let e = env("drive-board-keep");
+    let board = e.shared.mass_delete_board();
+    seed_drive_rows(&e, 100);
+    list_first(&e, 1);
+    // dry-run は記録しない
+    let stop = StopFlag::new();
+    let StageResult::Done(_) = e.run_with(&e.index_stage(), Mode::DryRun, &stop) else {
+        panic!("完了のはず");
+    };
+    assert_eq!(board.current(), None);
+    e.index();
+    let held = board.current().expect("保留");
+    // 一覧の取得に失敗したサイクルは何も確かめていないので、記憶はそのまま
+    e.stub.add_fault(Box::new(|r| {
+        (r.path == "/drive/v3/files" && !r.is_media()).then(|| (500, "{}".to_string(), vec![]))
+    }));
+    assert!(matches!(e.run(&e.index_stage()), StageResult::Failed(_)));
+    assert_eq!(board.current(), Some(held.clone()));
+    e.stub.clear_faults();
+    // 鍵が無い（Drive を使わない）サイクルも同じ
+    fs::remove_file(&e.key).unwrap();
+    assert!(matches!(e.run(&e.index_stage()), StageResult::Skipped(_)));
+    assert_eq!(board.current(), Some(held));
+}
+
+#[test]
+fn the_board_keeps_since_while_the_hold_continues() {
+    let board = MassDeleteBoard::default();
+    board.record(Some((99, HoldReason::Ratio, 100)), "2026-10-25 10:00:00");
+    board.record(Some((98, HoldReason::Ratio, 100)), "2026-10-25 10:10:00");
+    let hold = board.current().unwrap();
+    assert_eq!(hold.held, 98);
+    assert_eq!(hold.since, "2026-10-25 10:00:00");
+    assert_eq!(hold.checked_at, "2026-10-25 10:10:00");
+    // 保留が外れて、また付いたら新しい `since`
+    board.record(None, "2026-10-25 10:20:00");
+    assert_eq!(board.current(), None);
+    board.record(
+        Some((60, HoldReason::EmptyListing, 60)),
+        "2026-10-25 10:30:00",
+    );
+    assert_eq!(board.current().unwrap().since, "2026-10-25 10:30:00");
 }
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,9 @@ mod common;
 
 use std::time::Duration;
 
-use common::{TempDir, admin_fixture, build_admin_catalog, get, request, spawn_with_env};
+use common::{
+    TempDir, admin_fixture, build_admin_catalog, get, request, spawn_state, spawn_with_env,
+};
 use geoframe::db::Catalog;
 use serde_json::{Value, json};
 
@@ -543,4 +545,79 @@ fn directory_usage_counts_like_os_walk() {
     );
     // データ置き場が無ければ失敗（Python も OSError で 500）
     assert!(geoframe::admin::disk_info(&root.join("none"), 1).is_err());
+}
+
+/// T3.7 ⑤: 大量削除の保留があるときだけ `sync.mass_delete_hold` が付く。保留が無い・記憶が無い（取り込み無効）ときは
+/// キーが無く、応答は Python と同じ（フィクスチャと完全一致）。
+#[tokio::test]
+async fn the_mass_delete_hold_appears_only_while_there_is_one() {
+    use geoframe::drive::{HoldReason, MassDeleteBoard};
+    use std::sync::Arc;
+
+    let fixture = admin_fixture();
+    let dir = TempDir::new("admin-hold");
+    let _writer = build_admin_catalog(dir.path());
+    let board = Arc::new(MassDeleteBoard::default());
+    let catalog = Catalog::open(&dir.path().join("catalog.db")).unwrap();
+    let shared = Arc::clone(&board);
+    let addr = spawn_state(dir.path(), &[], catalog, move |s| {
+        s.with_mass_delete_board(shared)
+    })
+    .await;
+    let status = || async {
+        let response = get(addr, "/api/admin/status").await;
+        assert_eq!(response.status, 200);
+        strip_unstable(response.json())
+    };
+    // 記憶はあるが、まだ何も保留していない（サイクル前も、保留なしのサイクルのあとも同じ）: Python と同じ応答
+    assert_eq!(status().await, fixture["status"]["gemini"]);
+    board.record(None, "2026-10-25 10:00:00");
+    assert_eq!(status().await, fixture["status"]["gemini"]);
+
+    // 保留中: `sync` の末尾にキーが付き、ほかは変わらない
+    board.record(Some((99, HoldReason::Ratio, 100)), "2026-10-25 10:05:00");
+    let body = status().await;
+    assert_eq!(
+        body["sync"]["mass_delete_hold"],
+        json!({
+            "held": 99,
+            "reason": "ratio",
+            "drive_rows": 100,
+            "since": "2026-10-25 10:05:00",
+            "checked_at": "2026-10-25 10:05:00",
+        })
+    );
+    let mut without = body.clone();
+    without["sync"]
+        .as_object_mut()
+        .unwrap()
+        .remove("mass_delete_hold");
+    assert_eq!(without, fixture["status"]["gemini"]);
+    // キーの並びは `ready, pending, total, mass_delete_hold`
+    let keys: Vec<&String> = body["sync"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["ready", "pending", "total", "mass_delete_hold"]);
+
+    // 一覧が空の保留は `reason` が変わる
+    board.record(
+        Some((100, HoldReason::EmptyListing, 100)),
+        "2026-10-25 10:10:00",
+    );
+    let body = status().await;
+    assert_eq!(body["sync"]["mass_delete_hold"]["reason"], "empty_listing");
+    assert_eq!(
+        body["sync"]["mass_delete_hold"]["since"],
+        "2026-10-25 10:05:00"
+    );
+
+    // 解除されたあとのサイクルで消える
+    board.record(None, "2026-10-25 10:20:00");
+    assert_eq!(status().await, fixture["status"]["gemini"]);
+}
+
+/// 取り込みが無効の `serve`（記憶が無い）は、キーを出さない。
+#[tokio::test]
+async fn without_the_ingest_there_is_no_hold_key() {
+    let server = Server::start(&[]).await;
+    let (_, body) = server.json("/api/admin/status").await;
+    assert!(body["sync"].get("mass_delete_hold").is_none());
 }

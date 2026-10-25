@@ -304,12 +304,15 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let config = Arc::new(config);
     // 同期サイクルとキャッシュ保存のスレッド。HTTP サーバーの起動を待たない
     let stop = StopFlag::new();
+    // Drive の状態。大量削除の保留の記憶は、管理画面（サーバーの状態）と `index_drive` で同じものを使う
+    let drive = Arc::new(crate::drive::DriveShared::new());
+    let mass_delete = drive.mass_delete_board();
     let threads = ingest.as_ref().map(|ingest| IngestThreads {
         worker: crate::sync::spawn_worker(
             Arc::clone(&config),
             ingest.writer.clone(),
             Arc::clone(&ingest.cache),
-            crate::sync::default_stages(),
+            crate::sync::default_stages_with(drive),
             stop.clone(),
             config.drive_poll(),
             ingest.lock_hold(),
@@ -326,7 +329,10 @@ fn serve(overrides: &Overrides) -> ExitCode {
         Some(ingest) => Arc::clone(&ingest.cache),
         None => Arc::new(Cache::load_memory_only(&config.data_dir)),
     };
-    let state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
+    let mut state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
+    if ingest.is_some() {
+        state = state.with_mass_delete_board(mass_delete);
+    }
     if state.data_root.as_path() != state.config.data_dir.as_path() {
         // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する
         tracing::info!(
