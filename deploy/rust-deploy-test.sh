@@ -456,6 +456,14 @@ GEOFRAME_RS_LOCAL_BIN="$T/plans-bin/geoframe" bash "$R/deploy/rust-deploy.sh" --
 expect "旅程の検査: --rollback では検査しない" bash -c '! grep -q "旅程の検査" "$1"' _ "$T/out"
 rm "$R/app/travel_blog/plans/stray.json"
 
+echo "[11] unit の書き込み許可（旅行ブログの保存・書き出しが書けること。T3.6）"
+unit_ro="$(grep -E '^ReadOnlyPaths=' "$HERE/geoframe-rs.service")"
+expect "unit: ReadOnlyPaths に photos が残る" bash -c 'grep -q "/var/lib/geoframe/photos" <<<"$1"' _ "$unit_ro"
+expect "unit: ReadOnlyPaths から travel_blog を外した（下書きを書ける）" bash -c '! grep -q travel_blog <<<"$1"' _ "$unit_ro"
+expect "unit: ReadOnlyPaths から blog_exports を外した（書き出しを書ける）" bash -c '! grep -q blog_exports <<<"$1"' _ "$unit_ro"
+expect "unit: ReadOnlyPaths は 1 行だけ" test "$(grep -cE '^ReadOnlyPaths=' "$HERE/geoframe-rs.service")" = 1
+expect "unit: 書き込みを広げた分、ProtectSystem=strict は残る" grep -q '^ProtectSystem=strict' "$HERE/geoframe-rs.service"
+
 echo
 echo "結果: ok ${pass} / FAIL ${failn}"
 [ "$failn" -eq 0 ]

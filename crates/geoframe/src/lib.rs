@@ -6,6 +6,7 @@
 pub mod admin;
 pub mod backoff;
 pub mod blog;
+pub mod blog_write;
 pub mod cache;
 pub mod cli;
 pub mod config;

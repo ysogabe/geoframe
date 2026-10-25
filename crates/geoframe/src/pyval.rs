@@ -164,6 +164,140 @@ pub fn prefix_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// Python の `json.dumps(value, ensure_ascii=False, indent=2)` と同じバイト列（末尾の改行は付けない）。
+/// `serde_json` の `PrettyFormatter`（インデントと区切りは同じ）に、浮動小数だけ Python の `repr` を使う。
+/// 違いが残るのは、`u64` を超える整数（`serde_json` が浮動小数にする。Python は桁をそのまま出す）。
+/// キーの並びは `Value` の並び（`serde_json` の `preserve_order`）で、Python の挿入順と同じ。
+pub fn dumps_indent2(value: &Value) -> Vec<u8> {
+    use serde::Serialize;
+    let mut out = Vec::new();
+    let mut serializer = serde_json::Serializer::with_formatter(&mut out, PyFormatter::default());
+    value
+        .serialize(&mut serializer)
+        .expect("JSON を直列化できません");
+    out
+}
+
+/// インデント 2 の整形（`serde_json::ser::PrettyFormatter` と同じ動き）で、浮動小数は [`float_repr`]。
+#[derive(Default)]
+struct PyFormatter {
+    depth: usize,
+    has_value: bool,
+}
+
+impl PyFormatter {
+    fn indent<W: ?Sized + std::io::Write>(&self, w: &mut W) -> std::io::Result<()> {
+        for _ in 0..self.depth {
+            w.write_all(b"  ")?;
+        }
+        Ok(())
+    }
+
+    fn begin_item<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        w.write_all(if first { b"\n" } else { b",\n" })?;
+        self.indent(w)
+    }
+
+    fn end_container<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        close: &[u8],
+    ) -> std::io::Result<()> {
+        self.depth -= 1;
+        if self.has_value {
+            w.write_all(b"\n")?;
+            self.indent(w)?;
+        }
+        w.write_all(close)
+    }
+}
+
+impl serde_json::ser::Formatter for PyFormatter {
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        w.write_all(float_repr(value).as_bytes())
+    }
+
+    fn begin_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.depth += 1;
+        self.has_value = false;
+        w.write_all(b"[")
+    }
+
+    fn end_array<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.end_container(w, b"]")
+    }
+
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        self.begin_item(w, first)
+    }
+
+    fn end_array_value<W: ?Sized + std::io::Write>(&mut self, _: &mut W) -> std::io::Result<()> {
+        self.has_value = true;
+        Ok(())
+    }
+
+    fn begin_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.depth += 1;
+        self.has_value = false;
+        w.write_all(b"{")
+    }
+
+    fn end_object<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        self.end_container(w, b"}")
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        w: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        self.begin_item(w, first)
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(&mut self, w: &mut W) -> std::io::Result<()> {
+        w.write_all(b": ")
+    }
+
+    fn end_object_value<W: ?Sized + std::io::Write>(&mut self, _: &mut W) -> std::io::Result<()> {
+        self.has_value = true;
+        Ok(())
+    }
+}
+
+/// Python の `str.isspace()` が真になる文字（`strip()`・`split()` が空白とみなすもの）。Rust の
+/// `char::is_whitespace` に、区切り文字 U+001C〜U+001F を足したもの。
+pub fn is_py_space(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{1c}'..='\u{1f}')
+}
+
+/// `html.escape(s, quote=True)`。
+pub fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +326,45 @@ mod tests {
         ] {
             assert_eq!(float_repr(x), expected, "{x:e}");
         }
+    }
+
+    /// 期待値は Python 3.13 の `json.dumps(v, ensure_ascii=False, indent=2)` の出力。
+    #[test]
+    fn dumps_indent2_matches_python() {
+        let value: Value = serde_json::from_str(
+            r#"{"b": [], "a": {}, "c": [1, 2.5, "あ/\"\n\t\u0001\u007f\u2028", 1e22, 1e-05, -0.0],
+                "d": null, "e": true, "f": {"x": [{"y": 1}, [], [[]]]}}"#,
+        )
+        .unwrap();
+        let python = "{\n  \"b\": [],\n  \"a\": {},\n  \"c\": [\n    1,\n    2.5,\n    \"あ/\\\"\\n\\t\\u0001\u{7f}\u{2028}\",\n    1e+22,\n    1e-05,\n    -0.0\n  ],\n  \"d\": null,\n  \"e\": true,\n  \"f\": {\n    \"x\": [\n      {\n        \"y\": 1\n      },\n      [],\n      [\n        []\n      ]\n    ]\n  }\n}";
+        assert_eq!(String::from_utf8(dumps_indent2(&value)).unwrap(), python);
+        assert_eq!(dumps_indent2(&json!({})), b"{}");
+        assert_eq!(dumps_indent2(&json!([])), b"[]");
+        // u64 を超える整数は浮動小数になる（Python は桁をそのまま出す。server.md §21）
+        let big: Value = serde_json::from_str("123456789012345678901234567890").unwrap();
+        assert_eq!(dumps_indent2(&big), b"1.2345678901234568e+29");
+    }
+
+    #[test]
+    fn python_whitespace_and_html_escape() {
+        for c in [
+            '\u{1c}', '\u{1f}', ' ', '\t', '\u{85}', '\u{a0}', '\u{3000}', '\u{2028}',
+        ] {
+            assert!(is_py_space(c), "{c:?}");
+        }
+        for c in [
+            'a',
+            '\u{200b}',
+            '\u{feff}',
+            '\u{1b}',
+            '\u{20}'.to_ascii_uppercase(),
+        ] {
+            assert_eq!(is_py_space(c), c == ' ', "{c:?}");
+        }
+        assert_eq!(
+            html_escape("<a href=\"x\">'&'</a>"),
+            "&lt;a href=&quot;x&quot;&gt;&#x27;&amp;&#x27;&lt;/a&gt;"
+        );
     }
 
     #[test]

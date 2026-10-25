@@ -753,6 +753,8 @@ async fn shutdown_signal() {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
+    // 実行中の旅行ブログの書き出しは、次の画像の前で作業領域を片付けて止まる（前の書き出しは残る）
+    crate::blog_write::request_stop();
 }
 
 pub async fn serve(state: AppState) -> std::io::Result<()> {

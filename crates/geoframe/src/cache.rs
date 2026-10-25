@@ -14,9 +14,8 @@
 //! 値は [`serde_json::Value`] のまま持つ（`geo:` の中身を型に落とさないので、往復で欠けない）。
 //! 書き出しは Python の `json.dumps(ensure_ascii=False, indent=1)` と同じ形（インデント 1、日本語は
 //! そのまま）にする。Python が書いたファイルを Rust が、Rust が書いたファイルを Python が、そのまま
-//! 読める。**違うのはキーの並びだけ**: Python は挿入順、Rust は辞書順で書く（`serde_json` の
-//! `preserve_order` を入れると、他の応答の JSON のキーの並びまで変わるため入れない）。初めて Rust が
-//! 保存したときに 1 度だけ並びが変わり、以後は安定する。読むときの並びは問わない。
+//! 読める。キーの並びは**読んだ順のまま、新しいキーは末尾**（Python の挿入順と同じ。T3.6 で `serde_json` の
+//! `preserve_order` を入れた。それまでは Rust だけ辞書順で書いていた）。
 //!
 //! **座標を 3 桁に丸めた値がキーに入るので、ファイルは位置情報を含む**。リポジトリ・テストの実データ・
 //! ログに出さない（テストは合成の値だけ）。ログに出すのは件数だけ。
@@ -448,8 +447,7 @@ mod tests {
         assert_eq!(cache.save_now(), SaveOutcome::Clean);
         cache.put("geo:10.000,20.000", cache.get("geo:10.000,20.000").unwrap());
         assert_eq!(cache.save_now(), SaveOutcome::Saved);
-        // Python の indent=1・ensure_ascii=False と同じ形（Rust はキーを辞書順に書く。この合成データは
-        // 辞書順で書いてある）
+        // Python の indent=1・ensure_ascii=False と同じ形（キーは読んだ順のまま。この合成データは辞書順で書いてある）
         assert_eq!(read_file(&dir), SYNTH);
         assert!(!dir.path().join(".cache.json.tmp").exists());
     }
@@ -457,7 +455,7 @@ mod tests {
     #[test]
     fn output_matches_python_json_dumps() {
         // `json.dumps({"b": [], "a": {}, "c": [1, 2.5, "あ/\"\n"], "d": None, "e": True}, ensure_ascii=False, indent=1)`
-        // の出力（Python 3.13 で確認した固定値）。キーは辞書順に入れる
+        // の出力の、キーを a から順に入れた版（Python 3.13 で確認した固定値。挿入順のまま出る）
         let python = "{\n \"a\": {},\n \"b\": [],\n \"c\": [\n  1,\n  2.5,\n  \"あ/\\\"\\n\"\n ],\n \"d\": null,\n \"e\": true\n}";
         let mut map = Map::new();
         map.insert("a".into(), json!({}));

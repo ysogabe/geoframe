@@ -170,7 +170,6 @@ fn kind(e: &ApiError) -> (&'static str, String) {
         ApiError::Busy(m) => ("409", m.clone()),
         ApiError::Unavailable => ("503", String::new()),
         ApiError::Internal(m) => ("500", m.clone()),
-        ApiError::NotYetImplemented => ("501", String::new()),
     }
 }
 

@@ -167,6 +167,9 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         n => tracing::info!("[derivative] 書きかけの .part を{n}件削除しました"),
     }
 
+    // 旅行ブログの書き出しの作業領域・置き換え途中の書き出し・下書きの書きかけ（強制終了・電源断で残ったもの）
+    crate::blog_write::sweep_leftovers(&config.data_dir);
+
     Ok(Ingest {
         writer,
         cache,

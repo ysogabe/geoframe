@@ -9,6 +9,7 @@
 //! | [`derivative_name`] | `util.derivative_name` | 回したものは別名 |
 //! | [`store_derivative`]・[`make_derivative`] | `util.make_derivative` | 原本 → 長辺 2560px の JPEG（`.part` 経由） |
 //! | [`rotate_jpeg`]・[`write_atomic`] | `admin_rotate` の `im.rotate(..).save(..)` | 既存の derivative を回す（管理画面。P3 / T3.2） |
+//! | [`render_export`] | `travel_blog._export_image` | 旅行ブログの書き出し用（長辺 1800px・品質 88・EXIF/ICC なし。P3 / T3.6） |
 //! | [`lock_derivatives`] | （Python に無い） | 回転と取得が同じ写真の derivative を同時に書き換えないための直列化 |
 //! | [`extract_exif`] | `util.extract_exif` | 撮影時刻・GPS |
 //! | [`norm_time`] | `util.norm_time` | `YYYY-MM-DD HH:MM` |
@@ -27,9 +28,10 @@ pub mod probe;
 use std::path::Path;
 
 pub use derivative::{
-    DERIV_PX, DerivativeInfo, IccOutcome, JPEG_QUALITY, Luma, MAX_INPUT_BYTES, MAX_INPUT_PIXELS,
-    Rendered, Stored, decode_luma, derivative_name, lock_derivatives, make_derivative,
-    read_limited, render, rotate_jpeg, store_derivative, target_dims, write_atomic,
+    DERIV_PX, DerivativeInfo, EXPORT_PX, EXPORT_QUALITY, IccOutcome, JPEG_QUALITY, Luma,
+    MAX_INPUT_BYTES, MAX_INPUT_PIXELS, Rendered, Stored, decode_luma, derivative_name,
+    lock_derivatives, make_derivative, read_limited, render, render_export, rotate_jpeg,
+    store_derivative, target_dims, write_atomic,
 };
 pub use error::{DecodeClass, HeicFailure, ImageError};
 pub use exif::{ExifInfo, Format, PhotoMeta, norm_time};

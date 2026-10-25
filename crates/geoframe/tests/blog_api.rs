@@ -504,7 +504,7 @@ async fn only_get_reaches_the_blog_routes() {
             "{target}"
         );
     }
-    // 読み取りの API に POST は無い（ルート無し＝403。保存・書き出しは T3.6）
+    // 読み取りの API に POST は無い（ルート無し＝403。保存・書き出しは blog_write_api.rs）
     let r = request(
         site.addr,
         "POST",

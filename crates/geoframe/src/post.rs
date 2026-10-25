@@ -46,13 +46,12 @@ use axum::response::Response;
 use serde_json::{Map, Value};
 
 use crate::server::{AppState, error_response, json_response};
-use crate::{csrf, rotate, update, webpath};
+use crate::{blog_write, csrf, rotate, update, webpath};
 
 /// 本文の上限（現行の `MAX_POST_BYTES`）。
 pub const MAX_POST_BYTES: u64 = 64 * 1024;
 
-/// 受け付ける POST のルート（現行の `_post_routes`）。T3.2 までに動くのは `SetLoc`・`SetFlag`・`Rotate` で、
-/// 残りは CSRF 対策までを現行と同じに通し、処理は後のタスクで入れる（それまでは 503）。
+/// 受け付ける POST のルート（現行の `_post_routes`）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
     SetLoc,
@@ -99,8 +98,6 @@ pub enum ApiError {
     NotFound(String),
     /// 他の処理と重なった・実行中（409）。回転（T3.2）と、旅行ブログの書き出し（T3.6）が使う。
     Busy(String),
-    /// このタスクではまだ無いルート（T3.6 旅行ブログの保存・書き出し）。GET の未実装と同じ 503。
-    NotYetImplemented,
     /// 書き込みが無効（`GEOFRAME_INGEST=0`、またはガードで取り込みを断った）ので何も書かなかった（503）。
     Unavailable,
     /// それ以外（500）。応答は定型文。ここの文字列は**ログにだけ**出す（SQLite のメッセージは表名・列名
@@ -120,10 +117,6 @@ impl ApiError {
             Self::BadRequest(m) => error_response(StatusCode::BAD_REQUEST, &m),
             Self::NotFound(m) => error_response(StatusCode::NOT_FOUND, &m),
             Self::Busy(m) => error_response(StatusCode::CONFLICT, &m),
-            Self::NotYetImplemented => error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "この機能は Rust 版ではまだ使えません",
-            ),
             Self::Unavailable => error_response(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "書き込みが無効なので更新できません（この Rust 版は取り込みが無効です）",
@@ -271,12 +264,13 @@ pub async fn handle(state: &AppState, route: Route, headers: &HeaderMap, body: B
     };
     let writer = state.writer();
     let data_dir = state.data_root.as_ref().clone();
+    let blog = std::sync::Arc::clone(&state.blog);
     let result = tokio::task::spawn_blocking(move || match route {
         Route::SetLoc => update::set_loc(&payload, writer.as_ref()),
         Route::SetFlag => update::set_flag(&payload, writer.as_ref()),
         Route::Rotate => rotate::rotate(&payload, writer.as_ref(), &data_dir),
-        // 後のタスクで入れる（T3.6 旅行ブログの保存・書き出し）
-        Route::BlogSave | Route::BlogExport => Err(ApiError::NotYetImplemented),
+        Route::BlogSave => blog_write::save(&payload, &blog, &data_dir, writer.as_ref()),
+        Route::BlogExport => blog_write::export(&payload, &blog, &data_dir, writer.as_ref()),
     })
     .await
     .unwrap_or_else(|_| Err(ApiError::Internal("更新の処理が異常終了しました".into())));

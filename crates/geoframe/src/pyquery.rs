@@ -164,7 +164,8 @@ pub fn is_decimal_digit(c: char) -> bool {
     decimal_digit(c).is_some()
 }
 
-fn decimal_digit(c: char) -> Option<u8> {
+/// 十進の数字（Unicode の Nd）の値。
+pub fn decimal_digit(c: char) -> Option<u8> {
     if c.is_ascii() {
         return c.to_digit(10).map(|d| d as u8);
     }

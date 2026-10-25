@@ -36,6 +36,9 @@ use crate::datadir::{DataDir, PathError, check_drive_id};
 pub const DERIV_PX: u32 = 2560;
 /// JPEG の品質（Python の `quality=85`）。
 pub const JPEG_QUALITY: u8 = 85;
+/// 旅行ブログの書き出しの長辺（現行の `EXPORT_MAX_PX`）と JPEG の品質（`quality=88`）。
+pub const EXPORT_PX: u32 = 1800;
+pub const EXPORT_QUALITY: u8 = 88;
 /// 入力の画素数の上限。Pillow は 2 倍（約 1.79 億画素）を超えると `DecompressionBombError`。
 pub const MAX_INPUT_PIXELS: u64 = 178_956_970;
 /// 入力ファイルの大きさの上限（まるごとメモリに読む）。
@@ -442,11 +445,15 @@ fn to_srgb(r: &mut Raster, icc: &[u8]) -> bool {
 }
 
 fn encode_jpeg(r: &Raster) -> Result<Vec<u8>, ImageError> {
+    encode_jpeg_with(r, JPEG_QUALITY)
+}
+
+fn encode_jpeg_with(r: &Raster, quality: u8) -> Result<Vec<u8>, ImageError> {
     use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
     let w = u16::try_from(r.width).map_err(|_| ImageError::Encode)?;
     let h = u16::try_from(r.height).map_err(|_| ImageError::Encode)?;
     let mut out = Vec::with_capacity(r.data.len() / 8);
-    let mut enc = Encoder::new(&mut out, JPEG_QUALITY);
+    let mut enc = Encoder::new(&mut out, quality);
     // 4:2:0（Pillow の既定と同じ）。ハフマン表の最適化は付けない（zune-jpeg が誤読する。image-poc.md §3.2）
     enc.set_sampling_factor(SamplingFactor::F_2_2);
     let color = if r.channels == 1 {
@@ -612,6 +619,55 @@ pub fn rotate_jpeg(bytes: &[u8], delta: i32) -> Result<Rendered, ImageError> {
         output: (raster.width, raster.height),
         exif_orientation: decoded.orientation,
         gray: raster.channels == 1,
+        icc: IccOutcome::None,
+        bytes: jpeg.len(),
+    };
+    Ok(Rendered { jpeg, info })
+}
+
+/// 旅行ブログの書き出し用の JPEG にする（現行 `travel_blog._export_image`）。Pillow の
+/// `exif_transpose` → `thumbnail((1800, 1800), LANCZOS)` → `convert("RGB")` → `save(.., "JPEG", quality=88)`
+/// に当たる。[`render`] との違い:
+///
+/// - 長辺 [`EXPORT_PX`]・品質 [`EXPORT_QUALITY`]。
+/// - **ICC を付けない・変換もしない**（Pillow は `icc_profile` を渡さないので落とすだけ。広色域の原本は色が
+///   薄くなる。現行と同じ）。EXIF（GPS を含む）も付けない。
+/// - **グレーも RGB（3 成分）で出す**（Pillow の `convert("RGB")`。derivative はグレーのまま）。
+/// - ハフマン表の最適化は付けない（Pillow は `optimize=True`。`jpeg-encoder` の 4:2:0 との組み合わせを
+///   `zune-jpeg` が誤読するため。ファイルが数 % 大きくなる）。
+///
+/// 入力の上限（ファイルの大きさ・画素数・HEIC の守り）は [`render`] と同じ経路を通る。
+pub fn render_export(bytes: &[u8]) -> Result<Rendered, ImageError> {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageError::FileTooLarge);
+    }
+    let (format, decoded) = decode_any(bytes)?;
+    let input = (decoded.raster.width, decoded.raster.height);
+    let exif_o = orientation_of(decoded.orientation);
+    let swapped = swaps_axes(exif_o);
+    let (ow, oh) = if swapped { (input.1, input.0) } else { input };
+    let out_dims = target_dims(ow, oh, EXPORT_PX);
+    let pre = if swapped {
+        (out_dims.1, out_dims.0)
+    } else {
+        out_dims
+    };
+    let mut raster = orient(resize(decoded.raster, pre)?, exif_o)?;
+    if raster.channels == 1 {
+        raster = Raster {
+            width: raster.width,
+            height: raster.height,
+            channels: 3,
+            data: raster.data.iter().flat_map(|&v| [v, v, v]).collect(),
+        };
+    }
+    let jpeg = encode_jpeg_with(&raster, EXPORT_QUALITY)?;
+    let info = DerivativeInfo {
+        format,
+        input,
+        output: (raster.width, raster.height),
+        exif_orientation: decoded.orientation,
+        gray: false,
         icc: IccOutcome::None,
         bytes: jpeg.len(),
     };

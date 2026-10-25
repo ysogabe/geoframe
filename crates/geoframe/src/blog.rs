@@ -1,7 +1,7 @@
 //! 旅行ブログの読み取り API（E7〜E10。T3.5）: 現行 `app/geoframe/travel_blog.py` の
 //! `api_blog_trips`・`api_blog_trip`・`api_blog_candidates`・`api_blog_draft` と、その部品
 //! （`list_plans`・`load_plan`・`_segment_candidates`・`generate_manifest`・`_validate_manifest`）を同じ挙動で移したもの。
-//! 保存・書き出し（E15・E16）は T3.6。ここの [`is_valid_trip_id`]・[`validate_manifest`]・[`PlanSource`] は T3.6 も使う。
+//! 保存・書き出し（E15・E16）は `blog_write.rs`（T3.6）。ここの [`is_valid_trip_id`]・[`validate_manifest`]・[`PlanSource`] はそちらも使う。
 //!
 //! # 置き場
 //!

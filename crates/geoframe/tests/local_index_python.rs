@@ -211,8 +211,11 @@ fn index_localの全列はpythonと一致する() {
         for (got, want) in got.iter().zip(&want) {
             let id = want["id"].clone();
             // 列の集合も一致する（Python の `SELECT *` と Rust の `SELECT *`）
-            let got_keys: Vec<_> = got.keys().collect();
-            let want_keys: Vec<_> = want.keys().collect();
+            // （`serde_json` は挿入順で持つので、並びではなく集合で比べる）
+            let mut got_keys: Vec<_> = got.keys().collect();
+            let mut want_keys: Vec<_> = want.keys().collect();
+            got_keys.sort();
+            want_keys.sort();
             assert_eq!(got_keys, want_keys, "{name} id={id}: 列");
             for key in want.keys() {
                 assert_eq!(got[key], want[key], "{name} id={id} 列 {key}");
