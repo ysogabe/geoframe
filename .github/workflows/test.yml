@@ -65,6 +65,9 @@ jobs:
         # ループバックの上流のスタブ・偽の時計で流した結果（状態コード・ヘッダ・本文・上流への要求・キャッシュの
         # ファイル・毎分の流量の窓）と、tile_cache_prune を偽のファイル群に流した結果を残す。Rust が同じ手順で
         # 一致することを確かめる基準（tiles/tests.rs）。
+        # 旅行ブログの読み取り（crates/geoframe/src/blog.rs）は、Python の handlers.Handler の GET /api/blog/… に、
+        # 合成の旅程 JSON・下書き・書き出しの印・合成の写真の行（blog-catalog.sql）を流した結果を残す。
+        # Rust が同じ入力で JSON として一致することを確かめる基準（tests/blog_api.rs）。
         # Python の読み取りが変わったら落ちる
         run: |
           python3 tools/gen_exif_fixture.py --check
@@ -80,6 +83,7 @@ jobs:
           python3 tools/gen_csrf_fixture.py --check
           python3 tools/gen_geocode_fixture.py --check
           python3 tools/gen_tile_fixture.py --check
+          python3 tools/gen_blog_fixture.py --check
 
       - name: スキーマのフィクスチャの同期検査
         # Rust のスキーマ（crates/geoframe/src/schema.rs）が Python の空 DB と一致することを確かめる

@@ -159,6 +159,11 @@ const DIGIT_ZEROS: [u32; 67] = [
     0x1FBF0,
 ];
 
+/// `str.isdecimal()` が真の文字（Unicode の Nd）。
+pub fn is_decimal_digit(c: char) -> bool {
+    decimal_digit(c).is_some()
+}
+
 fn decimal_digit(c: char) -> Option<u8> {
     if c.is_ascii() {
         return c.to_digit(10).map(|d| d as u8);

@@ -497,7 +497,7 @@ fi
 cd "$REPO_ROOT"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIRTY=""
-git diff --quiet HEAD -- crates Cargo.toml Cargo.lock app/static app/vendor 2>/dev/null || DIRTY="（未コミットの変更あり）"
+git diff --quiet HEAD -- crates Cargo.toml Cargo.lock app/static app/vendor app/travel_blog/plans 2>/dev/null || DIRTY="（未コミットの変更あり）"
 if [ "$DO_BUILD" -eq 1 ]; then
     log "ビルド : cargo build --release --target ${TARGET_TRIPLE} -p geoframe（commit ${COMMIT}${DIRTY}）"
     cargo build --release --target "$TARGET_TRIPLE" -p geoframe >&2

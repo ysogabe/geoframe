@@ -1,4 +1,5 @@
-//! 管理画面の静的ファイル（`app/static`・`app/vendor`）をバイナリへ埋め込む表を作る。
+//! 管理画面の静的ファイル（`app/static`・`app/vendor`）と、旅行ブログの旅程 JSON
+//! （`app/travel_blog/plans/*.json`）をバイナリへ埋め込む表を作る。
 //!
 //! 単一バイナリは「バイナリ＋設定＋データ」だけで起動できる必要があり、実行時に `app/` を読まない
 //! （docs/rust-migration/plan.md §1）。外部の埋め込み crate を足さず、ここで `include_bytes!` の
@@ -6,6 +7,8 @@
 //!
 //! 生成物は `$OUT_DIR/embedded_files.rs`。パスは `static/admin.html` のような `app/` からの相対で、
 //! ソート済み（二分探索）。ドットで始まる名前は含めない（配信側もドット始まりは拒否する）。
+//! 旅程 JSON は別の表（`PLAN_FILES`。名前は `<trip_id>.json` のファイル名だけで、`.json` で終わるものだけ）。
+//! 配信の表（`FILES`）には入れない（`/static/`・`/vendor/` の配信とは無関係）。
 //! 各ファイルに内容のハッシュ（FNV-1a 64bit）から作った ETag を付ける。時刻は埋め込まない:
 //! チェックアウト時刻に依存する `Last-Modified` を出すと、ビルドごとに値が揺れるうえ、内容が
 //! 変わったのに古い時刻で 304 になる事故（キオスクの古い JS）の元になるため。
@@ -51,6 +54,29 @@ fn fnv1a(data: &[u8]) -> u64 {
     hash
 }
 
+/// `app/travel_blog/plans` の `*.json`（ドット始まりを除く）。ディレクトリが無ければ空の表にする。
+fn plan_files(dir: &Path) -> Vec<(String, PathBuf)> {
+    let Ok(read) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in read {
+        let entry = entry.unwrap();
+        let name = entry
+            .file_name()
+            .into_string()
+            .expect("ファイル名が UTF-8 でない");
+        if name.starts_with('.') || !name.ends_with(".json") {
+            continue;
+        }
+        if fs::metadata(entry.path()).unwrap().is_file() {
+            out.push((name, entry.path()));
+        }
+    }
+    out.sort();
+    out
+}
+
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let app = manifest.join("../../app");
@@ -71,6 +97,21 @@ fn main() {
         writeln!(
             code,
             "    File {{ path: {key:?}, data: include_bytes!({:?}), etag: {etag:?} }},",
+            path.display().to_string()
+        )
+        .unwrap();
+    }
+    code.push_str("];\n");
+
+    // 旅行ブログの旅程 JSON（git 管理のソース。実行時は `app/` を読まないので埋め込む）
+    let plans_dir = app.join("travel_blog/plans");
+    println!("cargo:rerun-if-changed={}", plans_dir.display());
+    code.push_str("static PLAN_FILES: &[PlanFile] = &[\n");
+    for (name, path) in plan_files(&plans_dir) {
+        let path = path.canonicalize().unwrap();
+        writeln!(
+            code,
+            "    PlanFile {{ name: {name:?}, data: include_bytes!({:?}) }},",
             path.display().to_string()
         )
         .unwrap();

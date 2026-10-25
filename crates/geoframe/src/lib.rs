@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod backoff;
+pub mod blog;
 pub mod cache;
 pub mod cli;
 pub mod config;
@@ -28,6 +29,7 @@ pub mod net;
 pub mod photos;
 pub mod post;
 pub mod pyquery;
+pub mod pyval;
 pub mod quality;
 pub mod rotate;
 pub mod schema;

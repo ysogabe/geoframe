@@ -105,6 +105,12 @@ async fn access_log_has_only_method_route_status_and_time() {
     get(addr, "/api/admin/photos?filter=secret-filter&page=2").await;
     get(addr, "/api/admin/photos?page=secret-page").await; // 400
     get(addr, "/api/admin/status?x=secret-status").await;
+    // 旅行ブログの読み取り API。trip_id・未知のパスの名前はログに出ない（旅程の中身も読まない）
+    get(addr, "/api/blog/trips?secret-blog-query=1").await;
+    get(addr, "/api/blog/trip?trip_id=secret-trip-id").await; // 404
+    get(addr, "/api/blog/trip?trip_id=Secret_Bad").await; // 400
+    get(addr, "/api/blog/draft?trip_id=secret-draft-id").await; // 404
+    get(addr, "/api/blog/secret-blog-route").await; // 404
     // Host が許可されない要求。拒否の理由は出るが、Host の値は出ない
     get_with_host(addr, "/derivatives/a.jpg", "attacker.invalid:8080").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -127,6 +133,11 @@ async fn access_log_has_only_method_route_status_and_time() {
         "GET /api/admin/photos 200",
         "GET /api/admin/photos 400",
         "GET /api/admin/status 200",
+        "GET /api/blog/trips 200",
+        "GET /api/blog/trip 404",
+        "GET /api/blog/trip 400",
+        "GET /api/blog/draft 404",
+        "GET /api/blog/{*path} 404",
     ] {
         assert!(log.contains(expected), "{expected} が無い:\n{log}");
     }
@@ -152,6 +163,10 @@ async fn access_log_has_only_method_route_status_and_time() {
         "secret-filter",
         "secret-page",
         "secret-status",
+        "secret-blog",
+        "secret-trip-id",
+        "Secret_Bad",
+        "secret-draft-id",
         "attacker",
         "a.jpg",
         "x.jpg",

@@ -1,13 +1,13 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）。T3.2 で E14 回転を入れ、回転と取得・品質・同期サイクルの競合を調べた（§17.8）。T3.3 で E4 地名検索を入れた（§18）。T3.4 で E11 地図タイルのプロキシと B4 タイルキャッシュの掃除を入れた（§19）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）。T3.2 で E14 回転を入れ、回転と取得・品質・同期サイクルの競合を調べた（§17.8）。T3.3 で E4 地名検索を入れた（§18）。T3.4 で E11 地図タイルのプロキシと B4 タイルキャッシュの掃除を入れた（§19）。T3.5 で E7〜E10 旅行ブログの読み取りを入れた（§20）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
-- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）、T3.1 は`post.rs`・`update.rs`、T3.2 は`rotate.rs`（と`imaging`の`rotate_jpeg`・`write_atomic`・`lock_derivatives`）、T3.3 は`geocode.rs`、T3.4 は`tiles.rs`（試験用に`tiles/stub.rs`・`tiles/tests.rs`）
+- 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）、T3.1 は`post.rs`・`update.rs`、T3.2 は`rotate.rs`（と`imaging`の`rotate_jpeg`・`write_atomic`・`lock_derivatives`）、T3.3 は`geocode.rs`、T3.4 は`tiles.rs`（試験用に`tiles/stub.rs`・`tiles/tests.rs`）、T3.5 は`blog.rs`・`pyval.rs`（旅程 JSON の埋め込みは`build.rs`・`embedded.rs`）
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
 
 ## 0. Pythonとの差の索引
 
-P1・P2（T2.1〜T2.6）・P3（T3.1〜T3.4）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
+P1・P2（T2.1〜T2.6）・P3（T3.1〜T3.5）でPythonと意図して違える点・既知の差の入口。本文は各節にあり、ここは1行ずつの索引だけ（内容／理由／適用条件／検証状況／解消予定）。
 
 | 差 | 理由 | 適用条件 | 検証状況 | 解消予定 | 詳細 |
 | --- | --- | --- | --- | --- | --- |
@@ -48,6 +48,7 @@ P1・P2（T2.1〜T2.6）・P3（T3.1〜T3.4）でPythonと意図して違える�
 | **外向きHTTPSの応答の上限は、展開後の大きさに効かせる（T3.3のレビューで全体を洗った）**: `ureq`の`with_config().limit(n)`は、`Content-Encoding: gzip`の本文では**圧縮されたバイト列**に当たり、展開後には効かない（圧縮時2 KBの本文が2 MiBに展開されても通る）。メモリに読む箇所は`net::read_body_limited`（展開後を`take`で数え、`max`ちょうどまで通して1バイト超えたら`BodyExceedsLimit`）を通す。**これとは別に、圧縮前（回線を流れるバイト列）にも独立の上限`net::wire_limit(max)` = `max`×2＋64 KiBを付ける**（展開後が空になるgzip＝空のメンバーの繰り返しは、展開後の数えでは止まらず、時間切れまで転送とCPUを使いうるため。正当な本文は展開後`max`以下なので、gzipの付加情報や圧縮しきれない分を見込んでも収まり、誤って断らない。超えたときも`BodyExceedsLimit(max)`）。対象: 地名検索（1 MiB）、地理院の逆ジオ・標高（1 MiB）・`muni.js`（8 MiB）、Driveの一覧・トークン（16 MiB）、Driveの403の理由の本文（16 KiB）、`selfcheck-net`（1 MiB）。Driveの原本のダウンロードは読みながら展開後の大きさを数えて`limit`（512 MiB）で止める（展開後の上限には`ureq`の`limit`を使わない: 圧縮後の大きさでは、上限ちょうどの原本を誤って断りうる）。**原本にも同じ圧縮前の上限`net::wire_limit(limit)`（約1 GiB）を`ureq`の`limit`として付けた**（空のメンバーの繰り返しは展開後の数えでは止まらず、`download_timeout`の15分まで転送とCPUを使いうる。`read`が0バイトを返さないので停止の合図の確認も通らない）。超えたら`DriveError::TooLarge`（その写真の失敗。障害ではない＝P2の分類のまま）。正当な原本（展開後512 MiB以下）は、gzipで圧縮されても約1 GiBに届かない。**P2で決めた上限の値は変えていない**が、これまでは`enrich`・Driveの`limit(n)`が上限ちょうどの本文も断っていた（`ureq`の仕様）のが、ちょうどまで通る（「超えた」ときだけ断る）。Pythonはどの応答にも上限が無い | 圧縮された小さな応答でメモリを使い切らせない（受信した側の保護） | gzipで応答する上流（またはその途中）のとき | `net::tests::read_body_limited_counts_decoded_bytes`、`geocode::tests::the_body_limit_counts_the_decompressed_size`、`geo::tests::応答の上限は展開後の大きさに効く`、`net::tests::read_body_limited_stops_endless_empty_gzip_members`（空のメンバーを延々と送るスタブ。圧縮前の上限を外すと時間切れまで読んで落ちる）、`drive::tests::empty_gzip_members_are_stopped_by_the_wire_limit`（原本・JSON。上限の内側は通り、外側は`TooLarge`）、`drive::tests::size_limits_apply_to_the_decompressed_body`・`download_counts_the_decompressed_size`（圧縮後が数KBで展開後が上限を超える本文と、上限ちょうど・1バイト超え。`ureq`の`limit`に戻すと落ちることを確かめた） | なし（決定） | [§14.3](#143-通信)・[§15.4](#154-通信の失敗の分類)・[§18.5](#185-通信) |
 | **地図タイル `GET/HEAD /tiles/…`（T3.4。E11）**: ①上流の応答の本文は**展開後で2 MiBまで**（Pythonは上限なし。gzipの本文も展開後の大きさで数える）。超えたら`error`。②**gzipで返された本文は展開して受ける**（Pythonは`Accept-Encoding: identity`を付けて展開せず、PNGでなければ`error`にする。OSM・地理院はgzipを返さない）。③キャッシュの**ヒットは、中身がPNGのマジックで始まる、上限以下の通常ファイル**だけ（Pythonは何でも返す。空・壊れたファイル・リンク・FIFO・巨大なものは取り直し、成功すれば置き換える）。④キャッシュは**リンクを辿らない**: `tile_cache`から`<層>/<z>/<x>`までのどれかがリンクなら読みも書きもしない（取得した本文は返す。保存はしない）。ファイルは一時ファイル（`.part`、`create_new`+`O_NOFOLLOW`）に書いて`rename`する。Pythonは`mkdir`して`.tmp`に書き、リンクを辿る。⑤流量の窓は**単調時計**（Pythonは`time.time()`。時計の飛びで止まらない）。⑥`GEOFRAME_TILE_FETCH_PER_MIN`・`GEOFRAME_TILE_CACHE_MAX_MB`は**負の値を起動時に断る**（Pythonは負の上限でも動き、常に`throttled`・毎回すべて消す）。`GEOFRAME_TILE_UA`は印字可能なASCIIだけ（Pythonは不正な値でも起動し、取得のたびに失敗する）。⑦`x`・`y`の桁数（先頭ゼロを含む）が4300を超える座標は404（Pythonは`int()`が`ValueError`になり、応答なしで接続が切れる。Python 3.13で確かめた: `0`を4300個並べた文字列は`int()`が0を返し、4301個は`ValueError`）。4300桁以内でも`u64`に収まらない値は404（最大ズームの`2^z`より大きいので範囲外）。⑧リクエスト行の`#`以降はhyperが落とす（Pythonは`#`を含むパスとして404）。ブラウザは送らない。⑨ログにタイルの座標・URL・User-Agentを出さない（Pythonは`z/x/y`を出す）。⑩同時の取得は`tokio`の枠（待つのは非同期で、スレッドを塞がない）。⑪取得は**クライアントが切断しても最後まで進めて保存する** | 上流の暴走・メモリ・ディスクの保護、リンクの差し替え対策、座標の秘匿 | `/tiles/…`への要求 | `tiles/tests.rs`（Pythonに176手順を流したフィクスチャと一致。差は別に単体テスト） | なし（決定） | [§19](#19-地図タイルとキャッシュの掃除p3--t34) |
 | **タイルキャッシュの掃除（T3.4。B4）**: ①**独立のスレッド**（Pythonは起動時に同期で1回、以後は同期サイクルの周期のあと「前回から1時間超なら」）。起動時に1回、以後1時間ごと。**`GEOFRAME_INGEST=0`（同期サイクルなし）でも動く**。起動を待たせず、停止の合図で止まる。②数える・消すのは`<層>/<z>/<x>/<y>.png`の形（先頭ゼロなしの十進）の**通常ファイルだけ**（Pythonは`rglob("*.png")`でリンクの先の大きさを数え、リンクを消す）。リンクのディレクトリへは降りない。形の合わないファイルは数えない・消さない。③異常終了で残った**古い（1時間以上前の）`.part`も消す**（Pythonは`.tmp`を残す）。④Pythonの`tile_cache_prune`と同じ規則（`mtime`の古い順、同じなら大きさ、さらに同じならパスの文字列順で、合計が上限の90%以下になるまで）で、フィクスチャと一致 | 取り込みが無効でもキャッシュが際限なく増えないように。メモリ（百万枚でも）に収める | `tile_cache/`があるとき | `tiles/tests.rs`、`tests/ingest_cli.rs` | なし（決定） | [§19](#19-地図タイルとキャッシュの掃除p3--t34) |
+| **旅行ブログの読み取り `GET /api/blog/trips`・`trip`・`candidates`・`draft`（T3.5。E7〜E10）**: ①**旅程JSONはバイナリに埋め込む**（`app/travel_blog/plans/*.json`。Pythonは実行時に`ROOT/travel_blog/plans`を読む）。`GEOFRAME_BLOG_PLANS_DIR`（Rustだけの項目）があれば埋め込みの代わりにそのディレクトリを読む。②**型が想定と違う旅程（Pythonは未処理の例外で応答なし）**: 旅程が配列・文字列、`date_range`が文字列/配列、`segments`が数/真偽は一覧から外す。`segments`の要素がオブジェクトでない、`locations`が配列/文字列でない・配列に文字列でない要素、`activities`が配列でない・要素がオブジェクトでないは、候補・初期案が400（`旅程JSONの形式が不正です`）。③**JSONの`NaN`・`Infinity`・`1e400`、UTF-8でないファイル、8 MiBを超えるファイル、通常ファイルでないもの（FIFOなど）は「読めない」**（一覧から外す、旅程・下書きは400 `JSONを読み込めません: <trip_id>.json`）。Pythonは`NaN`を読み、UTF-8でなければ応答なし、大きさは無制限。`u64`を超える整数は`f64`になる（旅程にも下書きにも現れない）。④配列・オブジェクトを`str()`に通す箇所（`title`・`subtitle`・`date`・活動の`time`など）はJSONの文字列にする（Pythonは`repr`）。⑤キーの並びは辞書順。比べるのは構文解析後。⑥DBを読めない・順番待ちが長すぎるときは候補・初期案が503（定型の本文。Pythonは500か応答なし）。型の違う列（`display`が数など）も同じ503。⑦`/api/blog/trips#x`の`#`以降はhyperが落とすので200（Pythonは404）。⑧組み込みの表は`.`で始まる名前を含めない（ディレクトリ指定の読み取りは含める。Pythonの`glob`と同じ）。**Pythonと同じ**: 日付範囲は`taken_at`との文字列比較だけで、タイムゾーンの換算も時刻の解釈もしない、`hidden`の除外、粗い地名（`city`・`place`・旅程の`locations`）だけで位置・ファイル名を返さない、`trip_id`の検査、保存済みの下書きは旅程が無くても返す、下書きの検査・切り詰め | 実行時に`app/`を読まない（単一バイナリ）、未処理の例外で応答を返さない形を400か一覧から外すに揃える、読み込みの上限（待たない・メモリを守る） | `/api/blog/`への`GET`、旅程・下書きの形が壊れているとき | `tests/blog_api.rs`（`tools/gen_blog_fixture.py`。合成の旅程14ファイル・下書き24ファイル・写真の行を、現行`handlers.Handler`に流した108件の応答と一致。CIで`--check`）、`src/pyval.rs`の単体テスト（`repr(float)`・`round(x, 3)`・`isdigit`はPythonで確かめた値） | なし（決定） | [§20](#20-旅行ブログの読み取りp3--t35) |
 
 P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記録は[p2-acceptance.md](p2-acceptance.md)。
 
@@ -76,6 +77,7 @@ P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記�
 | ローカル写真の置き場（`DATA_DIR`からの相対。T2.3） | なし | `GEOFRAME_PHOTOS_DIR` | `photos`（§13.1） |
 | 同期1サイクルで`local_derivatives`が処理する枚数（0以上の整数。T2.3） | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25`（§13.1） |
 | 同期1サイクルで品質を解析する枚数（0以上の整数。0は1として扱う。T2.6） | なし | `GEOFRAME_QUALITY_PER_CYCLE` | `GEOFRAME_FETCH_PER_CYCLE`と同じ（§16.1） |
+| 旅行ブログの旅程JSONを読むディレクトリ（**Rustだけの項目**。あれば埋め込みの代わりに、そこの`*.json`だけを読む。相対はカレントディレクトリ基準。T3.5） | なし | `GEOFRAME_BLOG_PLANS_DIR` | （未設定＝バイナリに埋め込んだ`app/travel_blog/plans/*.json`。§20.1） |
 
 - **空文字の環境変数は未設定と同じ**に扱う。現行の`GEOFRAME_DATA_DIR`が`or`で空文字を未設定扱いにするのと同じで、`EnvironmentFile`に`KEY=`と書いた事故を避ける。
 - **不正な値は起動を断る**（終了コード2）。メッセージには環境変数の名前と理由だけを書き、値は書かない。`GEOFRAME_HOST`はIPアドレスだけ（現行Pythonはホスト名も通すが、本番は`0.0.0.0`か`127.0.0.1`）。
@@ -289,7 +291,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 `site`（`GET`/`HEAD`）は、現行の`do_GET`/`do_HEAD`と同じ順に判定する。
 
-1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。`GET`の`/api/admin/geocode`（地名検索。T3.3、§18）も同じ前方一致。そのあと、`GET`/`HEAD`の`/tiles/`（地図タイル。T3.4、§19。他のどの判定よりも先に、生のパスで見る）は`tiles.rs`が答え、`GET`の`/api/ai/`・`/api/blog/`（P3・P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。`/api/admin/`の残り（`setloc`・`setflag`・`rotate`などの更新ルートへの`GET`、`/api/admin/`そのもの、大文字小文字やエンコードの違い）は、現行でも`do_GET`のどの分岐にも当たらず静的配信のホワイトリストで**403**になるので、T3.3で503をやめて静的配信の判定へ回した（`/api/admin/../static/…`のように`..`を含む形も現行は403で、`geocode-python.json`の`admin_gets`で突き合わせている）。P4に`/api/admin/`配下の`GET`は無い（AI検索は`/api/ai/`）。
+1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。`GET`の`/api/admin/geocode`（地名検索。T3.3、§18）も同じ前方一致。そのあと、`GET`/`HEAD`の`/tiles/`（地図タイル。T3.4、§19。他のどの判定よりも先に、生のパスで見る）は`tiles.rs`が答え、`GET`の`/api/blog/`（旅行ブログの読み取り。T3.5、§20。完全一致の4つ以外は`send_error(404)`と同じHTMLの404）は`blog.rs`が答え、`GET`の`/api/ai/`（P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。`/api/admin/`の残り（`setloc`・`setflag`・`rotate`などの更新ルートへの`GET`、`/api/admin/`そのもの、大文字小文字やエンコードの違い）は、現行でも`do_GET`のどの分岐にも当たらず静的配信のホワイトリストで**403**になるので、T3.3で503をやめて静的配信の判定へ回した（`/api/admin/../static/…`のように`..`を含む形も現行は403で、`geocode-python.json`の`admin_gets`で突き合わせている）。P4に`/api/admin/`配下の`GET`は無い（AI検索は`/api/ai/`）。
 2. 管理画面のページ（§9.5）。
 3. 静的ファイル（§9.3）。許可は`/favicon.ico`と5つの接頭辞だけで、**それ以外はすべて403**（404ではない。`/nope`・`/api/nope`・`/api/v1/photos/`も403）。
 
@@ -387,7 +389,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | 埋め込みファイルの再検証 | `Last-Modified`/`If-Modified-Since` | `ETag`/`If-None-Match` | 時刻に依存して古いJSが居座る事故を避ける（§9.4） |
 | バックスラッシュを含む要求 | 区切りに読み替えて判定、実ファイルは404 | 403 | 区切りの解釈を持たない |
 | HTMLヘッダ・`no-cache`の判定 | 生のパス | デコード・正規化後のパス、`.htm`も | `%2E`で付かなくなる抜けを塞ぐ（§9.5） |
-| 未実装のルート（`/api/ai/`、`/api/blog/`のGET） | 応答する | 503と定型のJSON | P3・P4で実装する（`status`・`photos`はT1.4、`geocode`はT3.3、`/tiles/`はT3.4で実装、§10・§18・§19。`/api/admin/`の残りのGETはT3.3から現行どおり403） |
+| 未実装のルート（`/api/ai/`のGET） | 応答する | 503と定型のJSON | P4で実装する（`status`・`photos`はT1.4、`geocode`はT3.3、`/tiles/`はT3.4、`/api/blog/`のGETはT3.5で実装、§10・§18・§19・§20。`/api/admin/`の残りのGETはT3.3から現行どおり403） |
 | `POST` | 既知のルートはContent-Type不一致でJSONの403、それ以外はHTMLの403 | 同じ（T3.1。P1では全部HTMLの403だった。§17） | 更新ルートはT3.1で実装 |
 | `/healthz` | 無い（403） | 200/503（Host検査あり） | 新設（§4） |
 | 起動ログ・拒否ログ | 許可する名前、機体のIP、拒否したHostの値を出す | 件数だけ。Hostの値は出さない | §3.2の方針 |
@@ -2060,3 +2062,70 @@ T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のまま�
 
 - **T3.8**: 検証環境での実際の通信の確認（OSM・地理院への実通信、比較用 Python `:8090`との同じタイル・同じ流量での応答の比較、`GEOFRAME_TILE_UA`に連絡先を入れる）。取り込みが有効・無効の両方で、`tile_cache/`の書き込みと掃除を見る。検証環境の実機で`StateDirectory`の下の`tile_cache`が書けること（unit の`ProtectSystem=strict`）。
 - 本番で使う前: `GEOFRAME_TILE_UA`に連絡先を入れる（OSM の利用規約。既定のままだとブロックされうる）。
+
+## 20. 旅行ブログの読み取り（P3 / T3.5）
+
+状態: T3.5 実装済み（2026-10-25）。E7 `GET /api/blog/trips`、E8 `trip`、E9 `candidates`、E10 `draft`。保存・書き出し（E15 `save`・E16 `export`）は T3.6。実装は`blog.rs`（本体）・`pyval.rs`（Python の`str()`・`or`・`round()`・`isdigit()`の再現）、旅程 JSON の埋め込みは`build.rs`・`embedded.rs`、設定は`config.rs`の`blog_plans_dir`、ルーティングは`server.rs`の`blog_route`・`blog_response`。現行の`app/geoframe/travel_blog.py`（`api_blog_trips`・`list_plans`・`api_blog_trip`・`load_plan`・`api_blog_candidates`・`_segment_candidates`・`api_blog_draft`・`generate_manifest`・`_validate_manifest`）と`handlers.py`の`/api/blog/`の`GET`を同じ挙動で移した。これらは`catalog.db`に書かないので、`GEOFRAME_INGEST=0`でも動く（DB は P1 の読み取り層）。
+
+### 20.1 旅程 JSON の置き場所
+
+**決定: バイナリに埋め込む（既定）。`GEOFRAME_BLOG_PLANS_DIR`を与えるとそのディレクトリの`*.json`だけを読む（埋め込みは使わない）。**
+
+- 現行の旅程 JSON は`app/travel_blog/plans/*.json`で、git 管理のソース（`ROOT`＝`app/`の下）。単一バイナリは実行時に`app/`を読まない（[plan.md](plan.md) §1。管理画面の静的ファイルと同じ）ので、`build.rs`が`app/static`・`app/vendor`と並べて`app/travel_blog/plans/*.json`を`PLAN_FILES`の表に埋め込む（配信の表`FILES`とは別。`/static/`などからは見えない）。ディレクトリが無ければ空の表。
+- 理由: ①**配布が増えない**。unit は`WorkingDirectory`も`/opt/geoframe`への依存も持たず、検証環境（`rust-deploy.sh`）も本番切替（P5）もバイナリ1つを入れ替えるだけ。旅程を別に配ると、バイナリと旅程の版がずれうる。②**Python との互換**: 旅程はソースの一部なので、同じ版のチェックアウトからビルドしたバイナリは、その時点の Python と同じ旅程を返す。旅程を足す・直すのは git の変更（Python と同じ）で、再ビルドが要る。③**テストが実際の旅程に触れない**: `GEOFRAME_BLOG_PLANS_DIR`で合成の旅程を与えられる。
+- 設定のディレクトリを足す理由: 再ビルドなしで旅程を差し替えたいとき（検証環境で試す、将来旅程が増えたとき）と、テスト。**置き換えであって、併用ではない**（同じ`trip_id`の優先順位を考えなくて済む）。相対パスはカレントディレクトリ基準（`GEOFRAME_DRIVE_KEY`と同じ）。空文字は未設定。unit には書かない（既定の埋め込みで足りる）。パスはログの要約に出さない（`blog_plans=embedded|dir`だけ）。
+- `rust-deploy.sh`の「未コミットの変更あり」の判定に`app/travel_blog/plans`を足した（埋め込みの元が変わったまま配るのを検出するため）。ビルドに要る`app/`の範囲は[build.md](build.md)。
+- 下書きと書き出しは**一次データ**で、`DATA_DIR`（解決済みの`data_root`）の下。`DATA_DIR/travel_blog/drafts/<trip_id>.json`、`DATA_DIR/blog_exports/<trip_id>/index.html`。ここでは読むだけ（unit の`ReadOnlyPaths`は T3.6 が書く側を外すときに見直す）。リンクは Python と同じく辿る（`DATA_DIR`に書ける人だけが置ける）。
+
+### 20.2 ルーティングとクエリ
+
+- `GET`の生のパス（先頭の`//`は`/`に畳んだあと）が`/api/blog/`で始まれば、**完全一致の4つ**（`/api/blog/trips`・`trip`・`candidates`・`draft`）だけが答え、それ以外は`send_error(404)`と同じ HTML の 404（`/api/blog/`そのもの、末尾の`/`、大文字、`%74rips`、`;x`、`/api/blog/save`・`export`への`GET`も）。`/api/blogx/…`は静的のホワイトリストに当たらず 403。`HEAD`は GET の分岐を通らず、現行どおり 403。`POST`はルートの有無を T3.1 の入口が見る（`/api/blog/save`・`export`だけにルートがあり、それ以外は 403。読み取りの 4 つへの`POST`も 403）。
+- クエリは`parse_qs`の最初の値（P1・T3.3 と同じ`pyquery::parse_qs_first`。空の値は無かったことになる、`+`は空白、`%XX`を戻す、同じ名前は最初）。`trip_id`が無い・空は`""`で 400。
+- アクセスログのルートのテンプレートは`/api/blog/trips`・`/api/blog/trip`・`/api/blog/candidates`・`/api/blog/draft`・`/api/blog/{*path}`。`trip_id`・クエリは出ない。
+
+### 20.3 E7 一覧・E8 旅程
+
+- `trip_id`の形は`^[a-z0-9][a-z0-9-]{0,79}$`（`is_valid_trip_id`。ASCII だけ、末尾の改行も不可）。不正は 400 `trip_idが不正です`。
+- **E7**: 旅程のファイル名順（バイト順。Python の`sorted(glob("*.json"))`）。`.json`で終わる名前は、ドット始まり・ディレクトリも拾う（ディレクトリは読めず外れる）。ファイルを読めない・JSON でない・`trip_id`の検査に通らない・形が合わないものは一覧から外す（Python は`BlogBadRequest`と`TypeError`だけ外す）。**一覧の`trip_id`はファイルの中の値**（ファイル名ではない。`str(value or "")`なので数値`5`は`"5"`）。各件のキー: `trip_id`・`title`（`str(title or trip_id)`）・`subtitle`（`str(subtitle or "")`）・`start`・`end`（`date_range`の値そのまま、無ければ`""`）・`days`（`len(segments or [])`。文字列なら文字数、オブジェクトなら要素数）・`has_draft`（`drafts/<trip_id>.json`が`exists()`）・`has_export`（`blog_exports/<trip_id>/index.html`が`exists()`。ディレクトリだけでは偽）。
+- **E8**: `<trip_id>.json`が無ければ 404 `旅程が見つかりません`、読めなければ 400 `JSONを読み込めません: <trip_id>.json`、ファイルの`trip_id`が要求と違う・`segments`が配列でないは 400 `旅程JSONの形式が不正です`。成功は旅程 JSON をそのまま `{"ok": true, "plan": …}` に入れる（キーの並びだけ辞書順になる）。
+
+### 20.4 E9 候補
+
+旅程の`segments`の区間ごとに（`_segment_candidates`）:
+
+- **日付範囲は SQLite の文字列比較だけ**: `start = "<date> <start_local or 00:00>"`、`end = "<date> <end_local or 23:59>"`、`taken_at>=? AND taken_at<=?`。時刻の解釈もタイムゾーンの換算も無く、`timezone`は応答にそのまま出すだけ（`timezone`が偽なら`""`）。そのため、`"9:00"`のような 0 埋めのない値は 0 埋めの行（`09:30`）に当たらず、終了が開始より前なら 0 件、`23:59`までなので秒つきの`23:59:30`は入らず、翌日 00:00 は翌日の区間のもの、`date`が無い区間はどの行にも当たらない。Python と同じ SQL なのでこれらは同じになる。
+- 行: `COALESCE(hidden,0)=0`（**`hidden`は除く**）かつ`display IS NOT NULL`、`ORDER BY taken_at, id`。**SQL は`lat`・`lon`・`pref`・`elev`・`name`を選ばない**（応答に出さないことを構造で守る。Python は`name`を選ぶが出さない）。
+- 同じ`taken_at`（分）が続く行を1グループにし、グループの代表は点（`_base_score`: 0.20＋表示用画像あり 0.25＋位置あり 0.25／推定 0.12＋お気に入り 0.25＋題・説明あり 0.05、上限 1.0、`round(x, 3)`）の高い順、同点は`id`の小さい順。`alternates`は代表の次の3枚まで（`photo_id`・`src`・`captured_at`・`score`・`alt`）。
+- 候補は最大 36 グループ（`_evenly_spaced`: 等間隔に抜き、お気に入りを足し、時系列の先頭から 36 件に切る。丸めは Python の偶数丸め＝`round_ties_even`）。初期案で選ぶ（`selected`）のは、等間隔の最大 6 枚とお気に入り。
+- 返す項目（候補1件）: `photo_id`（文字列）・`src`（`display`の`\`を`/`にして先頭の`/`を落とし、空・`.`始まり・`..`の区間を含むものは`""`、それ以外は`/`＋パス）・`captured_at`・`location_label`（`city`と`place`の空でないものを重複なしで` `で繋ぎ、無ければ区間の`locations`の先頭2つを`・`で繋いだもの）・`timezone_source`（`loc_source`、無ければ`unknown`）・`score`・`selection_reason`・`favorite`・`alt`（題、説明、区間のタイトル、`旅の写真`の順）・`caption`・`duplicate_group_id`（`<区間のid>-g<番号>`）・`duplicate_count`・`alternates`・`selected`。区間は`segment_id`・`date`・`title`・`timezone`・`location_label`・`photo_count`（グループにする前の行数）・`duplicate_groups`・`candidates`。全体は`ok`・`trip_id`・`title`・`photo_count`・`chapters`・`privacy: {"exact_gps_in_response": false}`。**Python より多くを返さない**（テストが応答の全キーに`lat`・`lon`・`name`・`pref`・`elev`が無いことと、値に座標・都道府県・ファイル名が無いことを検査する）。
+
+### 20.5 E10 下書き
+
+- 保存済みの下書き（`drafts/<trip_id>.json`が`exists()`）があれば`source: "saved"`。**旅程が（もう）無くても返す**（Python は`load_plan`を呼ばない）。読めなければ 400 `JSONを読み込めません: <trip_id>.json`（ディレクトリが置かれていても同じ）。読んだ中身は`_validate_manifest`を通した複製を返す（`validate_manifest`。T3.6 の保存・書き出しも使う）: オブジェクトでなければ 400、`trip_id`の検査（要求と違えば 400 `trip_idが一致しません`）、`status`は`draft`・`reviewed`・`published`のどれか（**読むときは`published`も据え置き**）、`chapters`は配列で 40 まで、`title`200・`subtitle`300・`summary`4000 文字、章の`id`100・`date`10・`title`200・`location_label`300・`body`20000 文字、画像は 1 章 100 枚・合計 200 枚、`photo_id`は`str.isdigit()`が真の文字列（数値は文字列にする。`0`は偽で 400）、`alt`は500（既定 `旅の写真`）・`caption`は2000 文字。切り詰めは**コードポイント**数。知らないキーはそのまま残る。
+- 無ければ`source: "generated"`: 旅程を`load_plan`し（無ければ 404）、E9 と同じ候補から初期案を作る（`generate_manifest`）。`selected`の画像だけを章に入れ、本文は`_outline_body`（区間のタイトルと活動の`時刻 名前`を`、`で繋ぐ。`time`のキーが無ければ`時刻未確認`、`null`なら`None`）、キャプションは説明、無ければ`<区間のタイトル>（<HH:MM>）[要確認]`。同じ`id`の区間が複数あると本文は後の区間から作る。
+
+### 20.6 取り込みが無効のとき・DB
+
+読み取りだけなので`GEOFRAME_INGEST=0`でも動く。DB は`Catalog::read`（P1 の読み取り接続）。ファイルの読み込みは DB の接続を握る前に`spawn_blocking`で済ませる。DB を読めない・順番待ちが長すぎるときは 503（定型の本文 `写真を読み取れません。…`）で、旅程・一覧・保存済みの下書きは DB を使わないので 200 のまま。
+
+### 20.7 ログ（AC7）
+
+旅程・下書きの中身（地名・本文）、`trip_id`、クエリ、ファイルの名前をログに出さない。出るのはアクセスログ（メソッド・ルートのテンプレート・状態コード・時間）と、DB を読めないときの理由（エラーの種類。SQL の断片は含まない）だけ。応答のエラー文は Python と同じ定型文で、ファイル名は検査済みの`<trip_id>.json`だけ。
+
+### 20.8 Pythonとの差（まとめ）
+
+§0の1行に同じ。①旅程はバイナリに埋め込む（`GEOFRAME_BLOG_PLANS_DIR`で差し替え）。②型が想定と違う旅程（Python は未処理の例外で応答なし）: 一覧から外す、または候補・初期案が 400。③`NaN`・`Infinity`・UTF-8 でない・8 MiB 超・通常ファイルでないものは「読めない」。④配列・オブジェクトを`str()`に通す箇所は JSON の文字列。⑤キーの並びは辞書順。⑥DB を読めなければ 503。⑦`#`以降はhyperが落とす。⑧埋め込みの表はドット始まりを含めない。
+
+**フィクスチャに載せた Python の癖**（Rust も同じ）: `trip_id`はファイルの中の値で一覧に載り、ファイル名と違えば E8 は 404/400 になる。数値の`trip_id`は`"5"`で載るが E8 は 400。`segments`が`"abc"`なら`days`は 3 で E8 は 400。`locations`が文字列`"ab"`なら先頭2文字を`・`で繋ぐ（`a・b`）。区間に`id`が無ければ`segment_id`は`null`、グループの id は`None-g1`。同じ`id`の区間が2つなら初期案の本文は後の区間から。`time`が`null`の活動は`None`と出る。`hidden`が`NULL`の行は除かれない。`display`が空文字の行は含まれ（`src`は`""`）、`NULL`の行は含まれない。`a/./b.jpg`は`src`になるが`a/../b.jpg`・`../x.jpg`・`.x.jpg`は`""`。
+
+### 20.9 テスト
+
+- `tests/blog_api.rs`（結合）: `every_response_matches_python` … `tools/gen_blog_fixture.py`（`app/tests/blog_fixture.py`）が合成の旅程14ファイル・下書き24ファイル・書き出しの印・合成の写真の行（`blog-catalog.sql`）を作り、現行`handlers.Handler`に108件の`GET`を流した状態コード・`Cache-Control`・JSON と一致（200・400・403・404 を全部通す）。ケース: `trip_id`の境界（80・81文字、大文字、先頭`-`、`_`、`.`、`/`、`..`、末尾の改行・空白・`+`、`%00`、日本語、不正な UTF-8、重複・空・`;`・エンコードされた名前）、存在しない旅程、ファイル名と`trip_id`の不一致、壊れた JSON、ディレクトリ、`segments`の型違い、下書きの有無・壊れ・検査の全部の失敗（章41・画像101・合計201・`photo_id`の形・`trip_id`の不一致・`status`・配列）と成功（切り詰め・知らないキー・`published`・`²`）、書き出しの印（`index.html`あり・ディレクトリだけ）、日付範囲の境界（08:59・09:00・18:00・18:01・秒つき・0埋めなし・終了が開始より前・日付をまたぐ・日付なし・`taken_at`が`NULL`/空）、`hidden`・`display`の`NULL`/空、同じ分の6枚、45グループ＋お気に入り、`/api/blog/`配下の未知。`responses_never_carry_exact_positions_or_file_names`（全応答のキーと値）、`hidden_photos_are_excluded_and_changes_show_up`、`saved_drafts_are_read_fresh_each_time_…`、`malformed_plan_shapes_are_rejected_without_crashing`、`huge_files_and_fifos_are_not_read`、`an_unreadable_catalog_is_a_fixed_503_…`、`only_get_reaches_the_blog_routes`（HEAD・POST・OPTIONS・Host）、`embedded_plans_are_the_repository_files`（埋め込みがリポジトリの実ファイルと同じ内容・同じ並び。真偽だけで中身は出さない）、`the_directory_setting_replaces_the_embedded_plans`。`tests/access_log.rs`: `trip_id`・クエリ・未知のパスの名前がログに出ない。
+- `src/pyval.rs`: `repr(float)`・`str()`・真偽・`round(x, 3)`・`isdigit()`・コードポイントでの切り詰め。`src/embedded.rs`: 旅程の表がソート済みで`.json`だけ。`src/config.rs`は既存の試験が通る（新しい項目は要約に`blog_plans=embedded|dir`だけ）。
+- `app/tests/test_blog_fixture.py`: フィクスチャが最新であることと、Python の癖の記録（上の一覧）、フィクスチャにリポジトリの実際の旅程の`trip_id`が無いこと。
+- 確認した変異: 初期案で選ぶ枚数を5にする、推定の点を0.13にする、のそれぞれで`every_response_matches_python`が落ちる。
+
+### 20.10 T3.6 への引き継ぎ・回したもの
+
+- T3.6（`save`・`export`）は`blog::is_valid_trip_id`・`trip_id_of`・`validate_manifest`・`load_plan`・`PlanSource`（`BlogEnv`）を使う。`MAX_TOTAL_EXPORT_IMAGES`は`pub`。保存は`drafts/`の一時ファイル→置き換えなので、この節の読み取りは書きかけを見ない。unit の`ReadOnlyPaths`の`travel_blog`・`blog_exports`は T3.6 で外す。
+- **T3.8**: 検証環境で、比較用 Python（`:8090`）と同じ`trip_id`の要求（一覧・旅程・候補・下書き）を送って応答を比べる。旅程は本物の埋め込みで、写真は検証環境の DB（座標・地名は記録に残さない）。

@@ -32,6 +32,7 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::admin::{self, AdminContext};
+use crate::blog::{self, BlogEnv, BlogError};
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::db::Catalog;
@@ -71,6 +72,8 @@ pub struct AppState {
     pub geocoder: Arc<Geocoder>,
     /// 地図タイルのプロキシ（`GET`/`HEAD /tiles/…`）と、そのキャッシュの掃除。流量の窓と同時数をプロセス全体で持つ。
     pub tiles: Arc<TileProxy>,
+    /// 旅行ブログの読み取り（旅程 JSON の置き場・下書き・書き出し。E7〜E10）。
+    pub blog: Arc<BlogEnv>,
 }
 
 impl AppState {
@@ -91,6 +94,7 @@ impl AppState {
         });
         let admin = Arc::new(AdminContext::new(&config, &data_root));
         let tiles = Arc::new(TileProxy::production(&config, &data_root));
+        let blog = Arc::new(BlogEnv::new(config.blog_plans_dir.as_deref(), &data_root));
         Self {
             config,
             catalog,
@@ -101,6 +105,7 @@ impl AppState {
             cache: Arc::new(Cache::memory_only()),
             geocoder: Arc::new(Geocoder::production()),
             tiles,
+            blog,
         }
     }
 
@@ -330,6 +335,68 @@ fn geocode_response(items: Vec<Value>) -> Response {
     }
 }
 
+/// 旅行ブログの読み取り API（E7〜E10）のルート。現行 `do_GET` は `/api/blog/` で始まるパスを、完全一致の4つだけ
+/// 受け、それ以外は `send_error(404)`（末尾の `/`・大文字・エンコードした名前も 404）。
+fn blog_route(path: &str) -> Option<(&'static str, BlogCall)> {
+    Some(match path {
+        "/api/blog/trips" => ("/api/blog/trips", BlogCall::Trips),
+        "/api/blog/trip" => ("/api/blog/trip", BlogCall::Trip),
+        "/api/blog/candidates" => ("/api/blog/candidates", BlogCall::Candidates),
+        "/api/blog/draft" => ("/api/blog/draft", BlogCall::Draft),
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum BlogCall {
+    Trips,
+    Trip,
+    Candidates,
+    Draft,
+}
+
+/// `GET /api/blog/…`（現行の `api_blog_*` と、`handlers.py` のクエリの解釈）。`trip_id` は `parse_qs` の最初の値
+/// （空の値は無かったことになる。無ければ `""` で 400）。応答の本文は定型文だけ（旅程の中身・例外の文字列を載せない）。
+async fn blog_response(state: &AppState, call: BlogCall, query: Option<&str>) -> Response {
+    let params = pyquery::parse_qs_first(query.unwrap_or(""));
+    let trip_id = params.get("trip_id").cloned().unwrap_or_default();
+    let env = Arc::clone(&state.blog);
+    let result = match call {
+        BlogCall::Trips => blog::trips(env).await,
+        BlogCall::Trip => blog::trip(env, trip_id).await,
+        BlogCall::Candidates => blog::candidates(env, &state.catalog, trip_id).await,
+        BlogCall::Draft => blog::draft(env, &state.catalog, trip_id).await,
+    };
+    match result {
+        Ok(value) => match serde_json::to_vec(&value) {
+            Ok(body) => json_response(StatusCode::OK, body),
+            Err(e) => {
+                tracing::error!("旅行ブログの応答を JSON にできません: {e}");
+                error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "内部エラーが発生しました",
+                )
+            }
+        },
+        Err(BlogError::BadRequest(message)) => error_response(StatusCode::BAD_REQUEST, &message),
+        Err(BlogError::NotFound(message)) => error_response(StatusCode::NOT_FOUND, &message),
+        Err(BlogError::Unavailable(reason)) => {
+            tracing::warn!("旅行ブログの写真を読めません: {reason}");
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "写真を読み取れません。しばらくしてから再試行してください",
+            )
+        }
+        Err(BlogError::Internal) => {
+            tracing::error!("旅行ブログの処理が異常終了しました");
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "内部エラーが発生しました",
+            )
+        }
+    }
+}
+
 /// アクセスログに出すタイルのルートのテンプレート（座標・層は出さない）。
 const TILE_ROUTE: &str = "/tiles/{*path}";
 
@@ -516,7 +583,7 @@ async fn security_headers(request: Request, next: Next) -> Response {
     response
 }
 
-/// まだ Rust 版に無い機能（AI・旅行ブログ）。P3 / P4 で実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
+/// まだ Rust 版に無い機能（AI）。P4 で実装する。現行の「未知の API」の 403 とは区別して、**503 と定型の JSON** を返す
 /// （「禁止」ではなく「まだ無い」と分かるように）。
 fn not_yet_implemented(label: &'static str) -> Response {
     labeled(
@@ -534,7 +601,7 @@ fn not_yet_implemented(label: &'static str) -> Response {
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
 ///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
-///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/ai/`・`/api/blog/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
+///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/blog/`（旅行ブログの読み取り。T3.5。完全一致の4つ以外は 404）は [`blog_response`]、`/api/ai/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
 ///    ホワイトリストに当たらず 403 なので、下の静的配信の判定へ回す。
 /// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML。
 /// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
@@ -594,13 +661,23 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 "/api/admin/geocode",
             );
         }
-        for (prefix, label) in [
-            ("/api/ai/", "/api/ai/{*path}"),
-            ("/api/blog/", "/api/blog/{*path}"),
-        ] {
-            if path.starts_with(prefix) {
-                return not_yet_implemented(label);
-            }
+        if path.starts_with("/api/blog/") {
+            return match blog_route(path) {
+                Some((label, call)) => {
+                    labeled(blog_response(&state, call, parts.uri.query()).await, label)
+                }
+                None => labeled(
+                    statics::error_page(
+                        StatusCode::NOT_FOUND,
+                        "Not Found",
+                        "Nothing matches the given URI",
+                    ),
+                    "/api/blog/{*path}",
+                ),
+            };
+        }
+        if path.starts_with("/api/ai/") {
+            return not_yet_implemented("/api/ai/{*path}");
         }
     }
     let Some(normalized) = webpath::normalize(raw) else {

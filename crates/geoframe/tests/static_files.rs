@@ -1048,7 +1048,8 @@ async fn post_without_a_route_is_403_and_other_methods_are_501_without_cors() {
 async fn features_not_yet_in_rust_answer_503_with_a_fixed_json() {
     let site = Site::new();
     let addr = site.start().await;
-    for target in ["/api/ai/status", "/api/ai/search?q=x", "/api/blog/trips"] {
+    // 旅行ブログの読み取り（`/api/blog/`）は T3.5 で実装した（tests/blog_api.rs）。残るのは AI（P4）
+    for target in ["/api/ai/status", "/api/ai/search?q=x"] {
         let r = get(addr, target).await;
         assert_eq!(r.status, 503, "{target}");
         assert_eq!(

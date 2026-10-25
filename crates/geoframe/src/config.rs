@@ -22,6 +22,7 @@
 //! | 同期 1 サイクルで derivative を作る枚数 | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25` |
 //! | 同期 1 サイクルで品質を解析する枚数（0 は 1 として扱う） | なし | `GEOFRAME_QUALITY_PER_CYCLE` | `GEOFRAME_FETCH_PER_CYCLE` と同じ |
 //! | Drive のサービスアカウント鍵 JSON のパス（相対はカレントディレクトリ基準。現行は `app/` 基準） | なし | `GEOFRAME_DRIVE_KEY` | `drive_key.json` |
+//! | 旅行ブログの旅程 JSON の置き場（**Rust だけの項目**。あれば埋め込みの代わりにこのディレクトリの `*.json` を読む。相対はカレントディレクトリ基準） | なし | `GEOFRAME_BLOG_PLANS_DIR` | （未設定＝バイナリに埋め込んだもの） |
 //! | 取り込む Drive のフォルダ（名前、または 20 字以上の英数字なら ID） | なし | `GEOFRAME_DRIVE_FOLDER` | `GeoFrame` |
 //!
 //! `TZ` は Rust 側では読まない。P1 は時刻の変換をせず、`taken_at` などの naive な日時は文字列の
@@ -251,6 +252,10 @@ pub struct Config {
     /// 取り込む Drive のフォルダ。`GEOFRAME_DRIVE_FOLDER`（名前、または 20 字以上の英数字・`_`・`-` なら ID）。
     /// 起動ログには載せない（フォルダ名は利用者の情報）。
     pub drive_folder: String,
+    /// 旅行ブログの旅程 JSON を読むディレクトリ（絶対パス）。`GEOFRAME_BLOG_PLANS_DIR`（Rust だけの項目）。
+    /// `None` のときはバイナリに埋め込んだ `app/travel_blog/plans/*.json`（現行の `PLAN_DIR` と同じ内容）。
+    /// 旅程の中身は利用者の情報なので、パスもログの要約には載せない（埋め込みかディレクトリかだけ）。
+    pub blog_plans_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -438,6 +443,16 @@ impl Config {
             .trim()
             .to_string();
 
+        // 空文字は未設定と同じ（`get` が除く）。相対パスはカレントディレクトリ基準（`GEOFRAME_DRIVE_KEY` と同じ）
+        let blog_plans_dir = get("GEOFRAME_BLOG_PLANS_DIR")
+            .map(|v| std::path::absolute(PathBuf::from(v.trim())))
+            .transpose()
+            .map_err(|e| {
+                ConfigError(format!(
+                    "GEOFRAME_BLOG_PLANS_DIR を絶対パスにできません: {e}"
+                ))
+            })?;
+
         Ok(Self {
             listen,
             data_dir,
@@ -458,6 +473,7 @@ impl Config {
             quality_per_cycle,
             drive_key,
             drive_folder,
+            blog_plans_dir,
         })
     }
 
@@ -514,7 +530,7 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} blog_plans={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
@@ -528,6 +544,11 @@ impl Config {
             self.drive_poll_min,
             self.fetch_per_cycle,
             self.quality_per_cycle,
+            if self.blog_plans_dir.is_some() {
+                "dir"
+            } else {
+                "embedded"
+            },
         )
     }
 }
