@@ -112,15 +112,15 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 
 ## 5. P3以降へ回したもの
 
-[server.md §0](server.md)で「P3で決める」とした、現行（Python）のままの挙動。P2はPythonと同じにしてあり、今回の比較の入力にも含めていない。
+[server.md §0](server.md)で「P3で決める」とした、現行（Python）のままの挙動。P2はPythonと同じにしてあり、今回の比較の入力にも含めていない。**P3のT3.7（2026-10-25）で①〜⑤を決めて実装した**（下の各行の末尾。結果は[inventory.md §2.3](inventory.md)）。
 
 | 内容 | 詳細 | 回す先 |
 | --- | --- | --- |
-| ローカル写真の`mtime`が変わると、手動で直した位置（`loc_source='manual'`）も`exif`かNULLに上書きされる | [server.md §13.7・§13.10](server.md#137-pythonとの差まとめ) | P3（更新APIと一緒に決める） |
-| Driveの`md5`が変わると、手動の位置が`drive_meta`かNULLに上書きされる | [server.md §14.8・§14.12](server.md#148-pythonとの差まとめ) | P3 |
-| 位置が動いたとき（推定の取り消し・変更、手動の位置）に、地名（`place elev muni_cd pref city`）を付け直すか | [server.md §15.2の5・§15.11](server.md#152-infer) | P3 |
-| S4（手動GPSと再推定の波及） | 更新API（地名検索・SAVE）がP3 | P3 |
-| 次の**一次データが消える・変わる経路**。Rustは今のPythonと同じ挙動のままで、P3で「今の仕様を残すか、守る仕様にするか」を決める（[inventory.md §2.3](inventory.md)）: ①索引からの削除（Drive・ローカルから消えた行）と`organize`で、お気に入り・除外（`hidden`）・手動の位置も行ごと消える ②Driveの更新（`md5`の変更）で回転が`0`に戻る ③削除→再追加で写真IDが変わり、旅行ブログの下書きの参照が切れる（書き出しが400） ④大量削除の保留（50件超かつDriveの行の20%超）は、意図した削除も配信に残す。保留の件数と`--allow-mass-delete`での解除方法を管理画面で知らせる案 | P3 |
+| ローカル写真の`mtime`が変わると、手動で直した位置（`loc_source='manual'`）も`exif`かNULLに上書きされる | [server.md §13.7・§13.10](server.md#137-pythonとの差まとめ) | P3（更新APIと一緒に決める）→ **T3.7で手動の位置を残す形に変更済み** |
+| Driveの`md5`が変わると、手動の位置が`drive_meta`かNULLに上書きされる | [server.md §14.8・§14.12](server.md#148-pythonとの差まとめ) | P3 → **T3.7で手動の位置を残す形に変更済み** |
+| 位置が動いたとき（推定の取り消し・変更、手動の位置）に、地名（`place elev muni_cd pref city`）を付け直すか | [server.md §15.2の5・§15.11](server.md#152-infer) | P3 → T3.7の決定の範囲外で今のまま（残した課題） |
+| S4（手動GPSと再推定の波及） | 更新API（地名検索・SAVE）がP3 | P3（T3.8で確かめる） |
+| 次の**一次データが消える・変わる経路**。Rustは今のPythonと同じ挙動のままで、P3で「今の仕様を残すか、守る仕様にするか」を決める（[inventory.md §2.3](inventory.md)）: ①索引からの削除（Drive・ローカルから消えた行）と`organize`で、お気に入り・除外（`hidden`）・手動の位置も行ごと消える ②Driveの更新（`md5`の変更）で回転が`0`に戻る ③削除→再追加で写真IDが変わり、旅行ブログの下書きの参照が切れる（書き出しが400） ④大量削除の保留（50件超かつDriveの行の20%超）は、意図した削除も配信に残す。保留の件数と`--allow-mass-delete`での解除方法を管理画面で知らせる案 **→ T3.7（2026-10-25）で決定・実装**: ①は手動の位置を残す、②③は今のまま、④は書き出しが使えない写真を飛ばして`skipped`で知らせる、⑤は管理画面に表示（[inventory.md §2.3](inventory.md)の「P3で決めたこと」） | P3（T3.7で完了） |
 | AIワーカーが`photo_quality_features`を読む | [server.md §16.11](server.md#1611-回したもの) | P4 |
 | Rustで作った品質の結果をPythonへ切り戻す手順の試験（本番での最終確認） | [server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック) | P5 |
 | `GEOFRAME_INGEST=1`のガード（検証環境の印・Pythonの非稼働）を外し、本番の設定に`1`を足す | [server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード) | P5（切替） |
