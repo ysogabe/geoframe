@@ -414,6 +414,42 @@ mv "$R/app/travel_blog/plans" "$T/plans-moved"; ln -s "$T/plans-moved" "$R/app/t
 plans
 expect "旅程の検査: ディレクトリ自体のリンクも止める（終了コード1）" bash -c 'test "$1" = 1 && grep -q "リンク 1 件" "$2"' _ "$rc" "$T/out"
 rm "$R/app/travel_blog/plans"; mv "$T/plans-moved" "$R/app/travel_blog/plans"
+# 親（app/travel_blog・app）がリンク: リンク先の未追跡の旅程が、plans 自体の検査をすり抜けて埋め込まれる
+printf '{"secret":1}' > "$R/app/travel_blog/plans/parent-link-name.json"
+git -C "$R" add -A; git -C "$R" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q -m tracked-extra
+mv "$R/app/travel_blog" "$T/tb-moved"; ln -s "$T/tb-moved" "$R/app/travel_blog"
+printf '{"secret":2}' > "$T/tb-moved/plans/outside-name.json"
+plans
+expect "旅程の検査: 親（app/travel_blog）のリンクも止める（終了コード1・リンク 1 件）" bash -c 'test "$1" = 1 && grep -q "リンク 1 件" "$2"' _ "$rc" "$T/out"
+expect "旅程の検査: 親のリンクで止めたらビルドの段へ進まない" bash -c '! grep -q "ビルドを省略" "$1"' _ "$T/out"
+expect "旅程の検査: 親のリンクでも名前も内容もログに出さない" bash -c '! grep -q -e outside-name -e parent-link-name -e secret "$1"' _ "$T/out"
+rm "$R/app/travel_blog"; mv "$T/tb-moved" "$R/app/travel_blog"; rm "$R/app/travel_blog/plans/outside-name.json"
+mv "$R/app" "$T/app-moved"; ln -s "$T/app-moved" "$R/app"
+plans
+expect "旅程の検査: さらに上（app）のリンクも止める（終了コード1・リンク 1 件）" bash -c 'test "$1" = 1 && grep -q "リンク 1 件" "$2"' _ "$rc" "$T/out"
+rm "$R/app"; mv "$T/app-moved" "$R/app"
+git -C "$R" reset -q --hard HEAD~1
+plans
+expect "旅程の検査: リンクを戻せば通る" plans_reached_build
+# 読めないディレクトリ（find が標準エラーに名前を出す）。root では権限が効かないので飛ばす
+if [ "$(id -u)" -ne 0 ]; then
+    mkdir "$R/app/travel_blog/plans/locked-dir-name"; chmod 000 "$R/app/travel_blog/plans/locked-dir-name"
+    plans
+    chmod 755 "$R/app/travel_blog/plans/locked-dir-name"
+    expect "旅程の検査: 読めないディレクトリは止める（終了コード1・調べられない旨の定型文）" bash -c 'test "$1" = 1 && grep -q "調べられない" "$2"' _ "$rc" "$T/out"
+    expect "旅程の検査: 読めないディレクトリの名前をログに出さない" bash -c '! grep -q -e locked-dir-name -e Permission "$1"' _ "$T/out"
+    expect "旅程の検査: 読めないディレクトリで止めたらビルドの段へ進まない" bash -c '! grep -q "ビルドを省略" "$1"' _ "$T/out"
+    rmdir "$R/app/travel_blog/plans/locked-dir-name"
+fi
+# UTF-8 でない名前（未追跡）: 止める。ログに名前も化けた名前も出さない
+badname=$'bad-utf8-name-\xff.json'
+printf '{}' > "$R/app/travel_blog/plans/$badname"
+plans
+expect "旅程の検査: UTF-8 でない名前の未追跡も止める（終了コード1・件数 1）" bash -c 'test "$1" = 1 && grep -q "ファイル 1 件、リンク 0 件" "$2"' _ "$rc" "$T/out"
+expect "旅程の検査: UTF-8 でない名前もログに出さない" bash -c '! grep -q -e bad-utf8 -e xff "$1"' _ "$T/out"
+rm "$R/app/travel_blog/plans/$badname"
+plans
+expect "旅程の検査: 取り除けば通る（読めない・UTF-8 でない名前のあと）" plans_reached_build
 # rollback は旅程を使わないので検査しない
 printf '{}' > "$R/app/travel_blog/plans/stray.json"
 GEOFRAME_RS_LOCAL_BIN="$T/plans-bin/geoframe" bash "$R/deploy/rust-deploy.sh" --rollback --dry-run --target mock@test > "$T/out" 2>&1

@@ -38,6 +38,12 @@ pub fn is_dir(path: &str) -> bool {
     FILES.iter().any(|f| f.path.starts_with(&prefix))
 }
 
+/// `build.rs` が旅程の埋め込みの前に使う検査（リンク・名前・読めること）の単体試験。同じファイルを読む。
+#[cfg(test)]
+#[path = "../build_plans.rs"]
+#[allow(dead_code)]
+mod build_plans;
+
 #[cfg(test)]
 mod tests {
     use super::*;

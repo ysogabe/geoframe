@@ -85,7 +85,9 @@ unit とバイナリ（geoframe.failed へ退避）を撤去する。
   本番の切替は P5 で、専用の手順と明示的なフラグをそのとき作る（このスクリプトは本番に配れない）。
 
 ビルドの前に、app/travel_blog/plans（バイナリへ埋め込まれる旅程）に git 管理外（未追跡・無視）のファイルか
-リンクがあれば、終了コード 1 で止める（--dry-run・--skip-build でも検査する）。ログには件数だけを出す。
+リンクがあれば、終了コード 1 で止める（--dry-run・--skip-build でも検査する）。そこへ至るパスの途中（app・
+app/travel_blog）がリンクでも止める。読めないディレクトリがあって調べられないときも止める。ログには件数と
+定型文だけを出し、ファイル名は出さない。
 
 本番機には実行しないこと（本番の切替は P5）。
 USAGE
@@ -502,13 +504,27 @@ fi
 # .gitignore で無視）のファイルやリンクがあると、同じコミットの表示でも手元だけの旅程が混ざって配られる
 # （下の DIRTY は管理下の変更しか見ない）。名前や内容はログに出さず、件数と真偽だけ。
 check_embedded_plans() {
-    local dir="app/travel_blog/plans" links untracked=0 status
-    [ -e "$dir" ] || [ -L "$dir" ] || return 0
-    links="$(find "$dir" -type l | wc -l | tr -d ' ')"
-    if [ "$links" -eq 0 ]; then
-        status="$(git status --porcelain --untracked-files=all --ignored -- "$dir" 2>/dev/null)" \
-            || die "埋め込む旅程の git の状態を調べられない（git の作業ツリーで実行すること）"
-        untracked="$(printf '%s' "$status" | grep -c -E '^(\?\?|!!) ' || true)"
+    local dir="app/travel_blog/plans" path="" part found links=0 untracked=0 status
+    # リポジトリの根から旅程までの各要素（app・app/travel_blog・plans）がリンクでないこと。親がリンクだと、
+    # リンク先の（git 管理外の）ファイルが、下の検査も build.rs も通って埋め込まれる
+    for part in app travel_blog plans; do
+        path="${path:+${path}/}${part}"
+        if [ -L "$path" ]; then
+            links=$((links + 1))
+        elif [ ! -e "$path" ]; then
+            break
+        fi
+    done
+    if [ "$links" -eq 0 ] && [ -e "$dir" ]; then
+        # find の標準エラー（読めない子ディレクトリの名前）は捨てる。失敗は定型文で止める
+        found="$(find "$dir" -type l -printf x 2>/dev/null)" \
+            || die "埋め込む旅程のディレクトリを調べられない（読めないディレクトリがある。名前はここに出さない）"
+        links=${#found}
+        if [ "$links" -eq 0 ]; then
+            status="$(git status --porcelain --untracked-files=all --ignored -- "$dir" 2>/dev/null)" \
+                || die "埋め込む旅程の git の状態を調べられない（git の作業ツリーで実行すること）"
+            untracked="$(printf '%s' "$status" | grep -c -E '^(\?\?|!!) ' || true)"
+        fi
     fi
     log "旅程の検査: ${dir} の git 管理外のファイル ${untracked} 件、リンク ${links} 件"
     if [ "$links" -ne 0 ] || [ "$untracked" -ne 0 ]; then
