@@ -17,8 +17,8 @@
 //!   `lat lon loc_source inferred_from infer_dt_s display` を NULL にする（`display` を NULL にするので、Drive の写真は
 //!   `fetch_derivatives` が取り直す）。**derivative のファイルは消さない**。
 //! - **地名の列（`place elev muni_cd pref city`）には触らない**（現行と同じ）。錨が別の写真に変わって位置が動いても、
-//!   取り消して別の場所に推定し直しても、`place` は古いまま残る。位置が動いたときに地名を直すかは P3 で決める
-//!   （server.md §0）。
+//!   取り消して別の場所に推定し直しても、`place` は古いまま残る。位置が動いたときに地名を直すかは、T3.7 の
+//!   決定（手動の位置を原本の更新で失わない）の範囲外で、今のまま（server.md §15.2 の 5）。
 //!
 //! # 現行との違い
 //!

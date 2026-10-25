@@ -15,7 +15,7 @@
 //! 保存・書き出しは `catalog.db` に書かないが、**writer（取り込みが有効なときだけある）が無いときは書かずに 503**
 //! （T3.1 の更新 API と同じ「書けない」扱い。P5 の切替まで本番の書き手は Python で、`GEOFRAME_INGEST=0` の Rust が
 //! Python と同じ下書きを書かないため）。写真の行は writer の接続で読む（読み取りだけ。書かない）。`dry_run` は
-//! 何も書かず DB も読まないので、writer が無くても答える。
+//! 何も書かないので、writer が無くても答える（行は読み取り専用の接続で引く）。
 //!
 //! # E15 保存
 //!
@@ -26,7 +26,7 @@
 //!
 //! # E16 書き出し
 //!
-//! 検査は保存と同じ。`dry_run` なら枚数だけ返す。それ以外は**プロセスで 1 本だけ**（実行中なら 409）。
+//! 検査は保存と同じ。`dry_run` なら書き出す枚数と飛ばす写真だけ返す（下の「書き出せない写真は飛ばして」）。それ以外は**プロセスで 1 本だけ**（実行中なら 409）。
 //! `blog_exports/.<trip_id>-rs<乱数>/`（作業領域。モード 0700）に `images/photo-<id>.jpg`・`blog-manifest.json`・
 //! `index.md`・`index.html` を作ってから、`.<trip_id>.previous` を経由して `blog_exports/<trip_id>/` に置き換える。
 //! 途中で失敗しても、前の書き出しは残る（置き換えの 2 回の `rename` の間に失敗したら元に戻す）。
@@ -872,7 +872,8 @@ pub(crate) fn export_with(
             dry_run_skipped(&manifest, &rows, data_root)?
         };
         let mut response = json!({
-            "ok": true, "dry_run": true, "trip_id": trip_id, "images": selected - skipped.len(),
+            "ok": true, "dry_run": true, "trip_id": trip_id,
+            "images": selected.saturating_sub(skipped.len()),
         });
         if !skipped.is_empty() {
             response["skipped"] = skipped_json(&skipped);
@@ -917,7 +918,7 @@ pub(crate) fn export_with(
     let mut response = json!({
         "ok": true,
         "trip_id": trip_id,
-        "images": selected - skipped.len(),
+        "images": selected.saturating_sub(skipped.len()),
         "path": format!("blog_exports/{trip_id}"),
         "url": format!("/blog_exports/{trip_id}/index.html"),
     });
