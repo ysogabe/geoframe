@@ -1,6 +1,6 @@
 # Rustサーバーの基盤: 設定・DB読み取り・ログ・ヘルス（P1 / T1.1）と、書き込みの土台（P2 / T2.1、§11）
 
-- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）。T3.2 で E14 回転を入れ、回転と取得・品質・同期サイクルの競合を調べた（§17.8）。T3.3 で E4 地名検索を入れた（§18）。T3.4 で E11 地図タイルのプロキシと B4 タイルキャッシュの掃除を入れた（§19）。T3.5 で E7〜E10 旅行ブログの読み取りを入れた（§20）。T3.6 で E15・E16 旅行ブログの保存と書き出しを入れた（§21）
+- 状態: T1.1 実装済み（2026-10-24）。レビュー指摘（パニック・トランザクション・ヘルス）を反映済み。T1.2（`GET /api/v1/photos`、§8）、T1.3（静的配信・Host検査・管理画面ページ、§9）、T1.4（管理画面の読み取りAPI、§10）を追記。T1.5 で systemd unit と配布スクリプトを入れ、検証環境で受入確認した（§6、[p1-acceptance.md](p1-acceptance.md)）。P2 の T2.1 で書き込みの土台（writer・スキーマの作成と移行・同期サイクルの骨組み・`--dry-run`・起動時の掃除・`.cache.json`）を入れた（§11）。T2.2 で画像処理（derivative の生成・EXIF・HEIC・パスの検査）を入れた（§12）。T2.3 でローカル写真の索引（`index_local`・`local_derivatives`・`organize`）と書きかけの`.part`の掃除を入れた（§13）。T2.4 で Drive の索引と取得（`index_drive`・`fetch_derivatives`）と、失敗が続く写真が枠を塞がない仕組みを入れた（§14）。T2.5 で位置の推定と地名（`infer`・`enrich`）を入れ、`organize`の絞り込みを外した（§15）。T2.6 で簡易品質（`quality`・`quality-scan`）を入れた（§16）。T2.7 で検証環境の受入を行った（[p2-acceptance.md](p2-acceptance.md)）。P3 の T3.1 で更新 API（E12 手動の位置・E13 お気に入り/除外）と POST の入口（ルーティング・CSRF 対策・エラー応答）を入れ、同期サイクルとの競合を調べた（§17）。T3.2 で E14 回転を入れ、回転と取得・品質・同期サイクルの競合を調べた（§17.8）。T3.3 で E4 地名検索を入れた（§18）。T3.4 で E11 地図タイルのプロキシと B4 タイルキャッシュの掃除を入れた（§19）。T3.5 で E7〜E10 旅行ブログの読み取りを入れた（§20）。T3.6 で E15・E16 旅行ブログの保存と書き出しを入れた（§21）。T3.7 で一次データの扱い（手動の位置を残す・使えない写真を飛ばす・大量削除の保留の表示）を直した（§0）。T3.8 で検証環境の受入を行った（[p3-acceptance.md](p3-acceptance.md)。画面の目視・OSMのタイル・Nominatimの実通信・大量削除の保留の実機は期限付きの持ち越し）
 - 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md) / 棚卸し: [inventory.md](inventory.md)（§2 DB、§4 設定、§6.3 ログ）
 - 実装: `crates/geoframe/src/config.rs`・`db.rs`・`logging.rs`・`server.rs`・`cli.rs`、T1.3 は`webpath.rs`・`hostcheck.rs`・`statics.rs`・`embedded.rs`と`build.rs`、T1.4 は`admin.rs`・`pyquery.rs`・`sysinfo.rs`、T2.2 は`imaging/`（`derivative.rs`・`exif.rs`・`heic.rs`・`probe.rs`）と`datadir.rs`、T2.3 は`local.rs`、T2.4 は`drive.rs`・`drive/`（`index.rs`・`fetch.rs`）と`backoff.rs`、T2.5 は`geo.rs`・`geo/`（`infer.rs`・`enrich.rs`。試験用に`stub.rs`・`tests.rs`）、T2.6 は`quality.rs`・`quality/`（`features.rs`・`group.rs`。試験は`tests.rs`）、T3.1 は`post.rs`・`update.rs`、T3.2 は`rotate.rs`（と`imaging`の`rotate_jpeg`・`write_atomic`・`lock_derivatives`）、T3.3 は`geocode.rs`、T3.4 は`tiles.rs`（試験用に`tiles/stub.rs`・`tiles/tests.rs`）、T3.5 は`blog.rs`・`pyval.rs`（旅程 JSON の埋め込みは`build.rs`・`embedded.rs`）、T3.6 は`blog_write.rs`（と`blog_export.html`、`imaging`の`render_export`）
 - ビルドと配布は[build.md](build.md)。ここは**起動したあとの振る舞い**の決めごと。
@@ -49,7 +49,7 @@ P1・P2（T2.1〜T2.6）・P3（T3.1〜T3.7）でPythonと意図して違える�
 | **地図タイル `GET/HEAD /tiles/…`（T3.4。E11）**: ①上流の応答の本文は**展開後で2 MiBまで**（Pythonは上限なし。gzipの本文も展開後の大きさで数える）。超えたら`error`。②**gzipで返された本文は展開して受ける**（Pythonは`Accept-Encoding: identity`を付けて展開せず、PNGでなければ`error`にする。OSM・地理院はgzipを返さない）。③キャッシュの**ヒットは、中身がPNGのマジックで始まる、上限以下の通常ファイル**だけ（Pythonは何でも返す。空・壊れたファイル・リンク・FIFO・巨大なものは取り直し、成功すれば置き換える）。④キャッシュは**リンクを辿らない**: `tile_cache`から`<層>/<z>/<x>`までのどれかがリンクなら読みも書きもしない（取得した本文は返す。保存はしない）。ファイルは一時ファイル（`.part`、`create_new`+`O_NOFOLLOW`）に書いて`rename`する。Pythonは`mkdir`して`.tmp`に書き、リンクを辿る。⑤流量の窓は**単調時計**（Pythonは`time.time()`。時計の飛びで止まらない）。⑥`GEOFRAME_TILE_FETCH_PER_MIN`・`GEOFRAME_TILE_CACHE_MAX_MB`は**負の値を起動時に断る**（Pythonは負の上限でも動き、常に`throttled`・毎回すべて消す）。`GEOFRAME_TILE_UA`は印字可能なASCIIだけ（Pythonは不正な値でも起動し、取得のたびに失敗する）。⑦`x`・`y`の桁数（先頭ゼロを含む）が4300を超える座標は404（Pythonは`int()`が`ValueError`になり、応答なしで接続が切れる。Python 3.13で確かめた: `0`を4300個並べた文字列は`int()`が0を返し、4301個は`ValueError`）。4300桁以内でも`u64`に収まらない値は404（最大ズームの`2^z`より大きいので範囲外）。⑧リクエスト行の`#`以降はhyperが落とす（Pythonは`#`を含むパスとして404）。ブラウザは送らない。⑨ログにタイルの座標・URL・User-Agentを出さない（Pythonは`z/x/y`を出す）。⑩同時の取得は`tokio`の枠（待つのは非同期で、スレッドを塞がない）。⑪取得は**クライアントが切断しても最後まで進めて保存する** | 上流の暴走・メモリ・ディスクの保護、リンクの差し替え対策、座標の秘匿 | `/tiles/…`への要求 | `tiles/tests.rs`（Pythonに176手順を流したフィクスチャと一致。差は別に単体テスト） | なし（決定） | [§19](#19-地図タイルとキャッシュの掃除p3--t34) |
 | **タイルキャッシュの掃除（T3.4。B4）**: ①**独立のスレッド**（Pythonは起動時に同期で1回、以後は同期サイクルの周期のあと「前回から1時間超なら」）。起動時に1回、以後1時間ごと。**`GEOFRAME_INGEST=0`（同期サイクルなし）でも動く**。起動を待たせず、停止の合図で止まる。②数える・消すのは`<層>/<z>/<x>/<y>.png`の形（先頭ゼロなしの十進）の**通常ファイルだけ**（Pythonは`rglob("*.png")`でリンクの先の大きさを数え、リンクを消す）。リンクのディレクトリへは降りない。形の合わないファイルは数えない・消さない。③異常終了で残った**古い（1時間以上前の）`.part`も消す**（Pythonは`.tmp`を残す）。④Pythonの`tile_cache_prune`と同じ規則（`mtime`の古い順、同じなら大きさ、さらに同じならパスの文字列順で、合計が上限の90%以下になるまで）で、フィクスチャと一致 | 取り込みが無効でもキャッシュが際限なく増えないように。メモリ（百万枚でも）に収める | `tile_cache/`があるとき | `tiles/tests.rs`、`tests/ingest_cli.rs` | なし（決定） | [§19](#19-地図タイルとキャッシュの掃除p3--t34) |
 | **旅行ブログの読み取り `GET /api/blog/trips`・`trip`・`candidates`・`draft`（T3.5。E7〜E10）**: ①**旅程JSONはバイナリに埋め込む**（`app/travel_blog/plans/*.json`。Pythonは実行時に`ROOT/travel_blog/plans`を読む）。`GEOFRAME_BLOG_PLANS_DIR`（Rustだけの項目）があれば埋め込みの代わりにそのディレクトリを読む。②**型が想定と違う旅程（Pythonは未処理の例外で応答なし）**: 旅程が配列・文字列、`date_range`が文字列/配列、`segments`が数/真偽は一覧から外す。`segments`の要素がオブジェクトでない、`locations`が配列/文字列でない・配列に文字列でない要素、`activities`が配列でない・要素がオブジェクトでないは、候補・初期案が400（`旅程JSONの形式が不正です`）。③**JSONの`NaN`・`Infinity`・`1e400`、UTF-8でないファイル、8 MiBを超えるファイル、通常ファイルでないもの（FIFOなど）は「読めない」**（一覧から外す、旅程・下書きは400 `JSONを読み込めません: <trip_id>.json`）。Pythonは`NaN`を読み、UTF-8でなければ応答なし、大きさは無制限。`u64`を超える整数は`f64`になる（旅程にも下書きにも現れない）。④配列・オブジェクトを`str()`に通す箇所（`title`・`subtitle`・`date`・活動の`time`など）はJSONの文字列にする（Pythonは`repr`）。⑤キーの並びは、旅程・下書きはファイルのまま、候補などはRustが組み立てた順（T3.5の時点では辞書順。T3.6の`preserve_order`で変わった）。比べるのは構文解析後。⑥DBを読めない・順番待ちが長すぎるときは候補・初期案が503（定型の本文。Pythonは500か応答なし）。型の違う列（`display`が数など）も同じ503。⑦`/api/blog/trips#x`の`#`以降はhyperが落とすので200（Pythonは404）。⑧組み込みの表は`.`で始まる名前を含めない（ディレクトリ指定の読み取りは含める。Pythonの`glob`と同じ）。⑨**区間の`id`はPythonの`dict`のキーと同じ等価性で比べる**（`5`と`5.0`、`1`と`true`、`0`と`false`は同じキーで、同じなら初期案の本文は後の区間から。`"5"`と`5`は別、`null`とidなしは同じ）。`id`が配列・オブジェクトなら、Pythonは初期案の`dict`で`TypeError`（応答なし）、Rustは初期案が400（候補は返る）。`u64`を超える整数は`f64`になるので、同じ値の浮動小数と同じキーになる（Pythonは別。旅程に現れない）。⑩**埋め込みは`app/travel_blog/plans`直下の通常ファイルだけ**。`build.rs`はリンク（ディレクトリ自体も、リポジトリの根からそこへ至る`app`・`app/travel_blog`の途中も）を辿らずビルドを止め、`rust-deploy.sh`は配る前に、そのディレクトリの未追跡・`.gitignore`で無視されたファイルとリンク（途中の親のリンクも）があれば、また読めないディレクトリで調べられなければ止める（`git diff`は未追跡を見ない。同じコミットの表示でも手元だけの旅程が混ざらないように。ログには件数だけ）。**Pythonと同じ**: 日付範囲は`taken_at`との文字列比較だけで、タイムゾーンの換算も時刻の解釈もしない、`hidden`の除外、粗い地名（`city`・`place`・旅程の`locations`）だけで位置・ファイル名を返さない、`trip_id`の検査、保存済みの下書きは旅程が無くても返す、下書きの検査・切り詰め | 実行時に`app/`を読まない（単一バイナリ）、未処理の例外で応答を返さない形を400か一覧から外すに揃える、読み込みの上限（待たない・メモリを守る） | `/api/blog/`への`GET`、旅程・下書きの形が壊れているとき | `tests/blog_api.rs`（`tools/gen_blog_fixture.py`。合成の旅程15ファイル・下書き24ファイル・写真の行を、現行`handlers.Handler`に流した111件の応答と一致。CIで`--check`）、`src/pyval.rs`の単体テスト（`repr(float)`・`round(x, 3)`・`isdigit`・`dict`のキーの等価性はPythonで確かめた値）、`deploy/rust-deploy-test.sh`（旅程の検査） | なし（決定） | [§20](#20-旅行ブログの読み取りp3--t35) |
-| **旅行ブログの保存と書き出し `POST /api/blog/save`・`export`（T3.6。E15・E16）**: ①**書き込みが無効（`GEOFRAME_INGEST=0`）のときは書かずに503**（保存と、`dry_run`でない書き出し。入力の違反の400・404はその前。`dry_run`は何も書かず答える。Pythonは常に書く）。②書き出しの作業領域の名前は`.<trip_id>-rs<16桁の16進>`（Pythonは`mkdtemp`の`.<trip_id>-<8文字>`）。残った作業領域は次の書き出しの前と起動時に消し、置き換えの途中で止まって`<trip_id>/`が無く`.<trip_id>.previous`だけが残ったときは**戻す**（Pythonは`.previous`を消して前の書き出しを失う）。置き換えの2回の`rename`の間に失敗したら元に戻す（Pythonは戻さない）。③下書きは`.part`を排他的に新規作成して`fsync`→`rename`（Pythonは固定の`<id>.json.tmp`）。`travel_blog/`・`drafts/`・`blog_exports/`がシンボリックリンクなら使わず500（Pythonは辿る）。④書き出しの画像は、デコーダ・縮小のフィルタ・エンコーダが違うので画素は一致せず、ハフマン表の最適化を付けない（Pillowの`optimize=True`より、ファイルがやや大きくなりうる。未計測）。寸法・向きの適用・EXIF/GPS/ICCを残さないこと・グレーもRGB（3成分）で出すことは一致。ICCはPythonと同じく変換せず捨てる（derivativeのsRGB変換とは別）。読む画像は512 MiBまで、画素数はderivativeと同じ上限。⑤`i64`を超える・上付き数字などの`photo_id`は、実在しない写真として400（Pythonは`int()`・SQLiteの例外で500）。⑥`u64`を超える整数は浮動小数になって保存される（Pythonは桁をそのまま）。`NaN`・`Infinity`・対にならないサロゲートはPOSTの入口の解析（T3.1から共通）で400（Pythonは通す）。⑦500の本文・ログに例外の文字列やトレースバックを出さない（Pythonはパスを含む例外をログに出す）。⑧行を引いて画像を読み切るまでを回転・取得と同じロックの中で行う（Pythonは排他しない）。⑨SIGTERMを受けたら、実行中の書き出しは次の画像の前で作業領域を片付けて止まる。⑩キーの並びはPythonの挿入順と同じ（保存した下書きと書き出しの`blog-manifest.json`はPythonと同じバイト列）。⑪`POST`の処理中は無通信の期限（60秒）を止める（長い書き出しが接続を切られないように。Pythonの`http.server`には期限が無い）。止めるのは**本文を読み終えて検査したあと**の処理の間だけで、本文を送らない相手は期限で切る。⑫起動時の掃除は、`blog_exports/`・`travel_blog/`・`drafts/`のどれかがリンクなど通常のディレクトリでなければ、その中を掃除しない（リンク先の別の場所のファイルを消さない。ログは定型文） ⑬**使えない写真は飛ばして残りを書き出す**（T3.7。下の行）。 | ①Pythonと同じ`DATA_DIR`に二重に書かない（P5まで本番の書き手はPython）。②〜③一次データ（下書き）と前の書き出しを失わない。④⑤Pythonの未処理の例外の再現はしない。⑦ログに旅程・写真の名前を出さない（AC7） | 保存・書き出しの要求 | `tests/blog_write_api.rs`（Pythonの出力との93ケースの一致。応答・下書きと書き出しの全文・画像の寸法/成分数/EXIF/ICC/四隅の色）、`blog_write/tests.rs`（409・停止・置き換え途中の失敗・残骸・パニック・リンク・ロック）。検証環境の確認はT3.8 | なし（決定）。④の画素の一致は求めない | [§21](#21-旅行ブログの保存と書き出しp3--t36) |
+| **旅行ブログの保存と書き出し `POST /api/blog/save`・`export`（T3.6。E15・E16）**: ①**書き込みが無効（`GEOFRAME_INGEST=0`）のときは書かずに503**（保存と、`dry_run`でない書き出し。入力の違反の400・404はその前。`dry_run`は何も書かず答える。Pythonは常に書く）。②書き出しの作業領域の名前は`.<trip_id>-rs<16桁の16進>`（Pythonは`mkdtemp`の`.<trip_id>-<8文字>`）。残った作業領域は次の書き出しの前と起動時に消し、置き換えの途中で止まって`<trip_id>/`が無く`.<trip_id>.previous`だけが残ったときは**戻す**（Pythonは`.previous`を消して前の書き出しを失う）。置き換えの2回の`rename`の間に失敗したら元に戻す（Pythonは戻さない）。③下書きは`.part`を排他的に新規作成して`fsync`→`rename`（Pythonは固定の`<id>.json.tmp`）。`travel_blog/`・`drafts/`・`blog_exports/`がシンボリックリンクなら使わず500（Pythonは辿る）。④書き出しの画像は、デコーダ・縮小のフィルタ・エンコーダが違うので画素は一致せず、ハフマン表の最適化を付けない（Pillowの`optimize=True`より、ファイルがやや大きくなりうる。未計測）。寸法・向きの適用・EXIF/GPS/ICCを残さないこと・グレーもRGB（3成分）で出すことは一致。ICCはPythonと同じく変換せず捨てる（derivativeのsRGB変換とは別）。読む画像は512 MiBまで、画素数はderivativeと同じ上限。⑤`i64`を超える・上付き数字などの`photo_id`は、実在しない写真として400（Pythonは`int()`・SQLiteの例外で500）。⑥`u64`を超える整数は浮動小数になって保存される（Pythonは桁をそのまま）。`NaN`・`Infinity`・対にならないサロゲートはPOSTの入口の解析（T3.1から共通）で400（Pythonは通す）。⑦500の本文には例外の文字列やトレースバックを出さない（定型文）。ログには値（写真のファイル名・座標・本文・パス）を含まない詳細（種類）だけを出す（Pythonはパスを含む例外をログに出す）。⑧行を引いて画像を読み切るまでを回転・取得と同じロックの中で行う（Pythonは排他しない）。⑨SIGTERMを受けたら、実行中の書き出しは次の画像の前で作業領域を片付けて止まる。⑩キーの並びはPythonの挿入順と同じ（保存した下書きと書き出しの`blog-manifest.json`はPythonと同じバイト列）。⑪`POST`の処理中は無通信の期限（60秒）を止める（長い書き出しが接続を切られないように。Pythonの`http.server`には期限が無い）。止めるのは**本文を読み終えて検査したあと**の処理の間だけで、本文を送らない相手は期限で切る。⑫起動時の掃除は、`blog_exports/`・`travel_blog/`・`drafts/`のどれかがリンクなど通常のディレクトリでなければ、その中を掃除しない（リンク先の別の場所のファイルを消さない。ログは定型文） ⑬**使えない写真は飛ばして残りを書き出す**（T3.7。下の行）。 | ①Pythonと同じ`DATA_DIR`に二重に書かない（P5まで本番の書き手はPython）。②〜③一次データ（下書き）と前の書き出しを失わない。④⑤Pythonの未処理の例外の再現はしない。⑦ログに旅程・写真の名前を出さない（AC7） | 保存・書き出しの要求 | `tests/blog_write_api.rs`（Pythonの出力との93ケースの一致。応答・下書きと書き出しの全文・画像の寸法/成分数/EXIF/ICC/四隅の色）、`blog_write/tests.rs`（409・停止・置き換え途中の失敗・残骸・パニック・リンク・ロック）。検証環境の確認はT3.8 | なし（決定）。④の画素の一致は求めない | [§21](#21-旅行ブログの保存と書き出しp3--t36) |
 | **旅行ブログの書き出しは、使えない写真を飛ばして残りを書き出す（T3.7。E16。inventory.md §2.3 ②④。ユーザーの決定）**: manifestの`photo_id`が指す写真の行が無い（`missing`。`i64`を超える・上付き数字などの`int()`が読めないidも）・除外（`hidden`。`COALESCE(hidden,0)`が0でない）・表示用の画像が使えない（`no_image`。`display`が空・NULL、`DATA_DIR`の外や通常のファイルでない、読めない・大きすぎる、画像として読めない）とき、Pythonは400（読めない画像・`i64`超などは500）で書き出し全体を止めるが、**Rustはその写真だけを飛ばして残りを書き出す**。応答に`skipped: [{photo_id, reason: "missing"\|"hidden"\|"no_image"}]`を足す（飛ばした**参照ごとに1件**、manifestの順、応答の最後のキー。**飛ばしたものが無ければキーごと出さない**ので、その応答はPythonと同じ。`photo_id`はmanifestの文字列のまま。ファイル名・座標・地名は入れない）。飛ばした写真の画像は`blog-manifest.json`・`index.md`・`index.html`から**取り除き**（`images/`にファイルも作らない。壊れたリンクを残さない）、`images`は**書き出した枚数**（参照の数−`skipped`の数）。**全部飛んだら本文だけを書き出す**（`images`は0、`images/`は空、`<img>`なし。Pythonも画像0枚の書き出しは成功する）。`dry_run`も同じ判定で`skipped`と`images`を返す（書き込まないので、Pythonと違い行とファイルの有無は見る。ファイルを開ける・通常のファイル・大きさの上限（512 MiB）までは実際の書き出しと同じ関数で見るので、大きすぎる写真は`dry_run`でも`no_image`に数える。画像のデコードはしないので、画像として読めない写真だけは`dry_run`では数えず、実際の書き出しでだけ`no_image`になる）。取り込みが無効で writer が無いときの`dry_run`は、読み取り専用の接続で行を引く（開けなければ500。画像が0枚ならDBを開かない）。下書きの保存（E15）は写真の存在を見ないまま。ログは飛ばした件数だけ（idも理由の内訳も出さない）。DB・作業領域への書き込みの失敗は、飛ばさず500/503のまま。`blog-admin.js`は`skipped`があれば「N枚の写真を書き出せませんでした（除外 N枚・…）」を警告の色で長めに出す（Pythonは`skipped`を返さないので、今までの文面のまま） | 削除→再追加でidが変わる・写真を除外する・派生物が消える、のどれでも旅行ブログの書き出しが止まらないように。一次データ（下書き）は変えない | 書き出しの要求で使えない写真があるとき | `tests/blog_write_api.rs`（Pythonの93ケースのうち、使えない写真を含む14ケースだけを決定による差として分類し、書き出し一式にその写真の痕跡が無いことを確かめる。それ以外の書き出しはPythonと完全に一致）、`blog_write/tests.rs`（行なし・除外・display NULL/空・画像が読めない・ファイルなし・全部飛ぶ・`dry_run`・writerなしの`dry_run`・`skipped`なしの応答・ログ） | なし（決定） | [§21.9](#219-pythonとの差まとめ) |
 | **大量削除の保留を管理画面に出す（T3.7。E2 `GET /api/admin/status`。inventory.md §2.3 ⑤。ユーザーの決定）**: `index_drive`が保留した（T2.4: 消す行が50件超かつDriveの行の20%超、または一覧が空）ときだけ、`sync`の末尾に`mass_delete_hold: {held, reason: "ratio"\|"empty_listing", drive_rows, since, checked_at}`を足す（`held`＝保留している行数、`drive_rows`＝そのときのDriveの行数、`since`＝連続して保留している間の最初の確認の現地時刻`YYYY-MM-DD HH:MM:SS`、`checked_at`＝直近に確かめた時刻）。**保留が無ければキーを出さない**ので、応答はPythonと同じ形（Pythonには保留が無い）。記憶は**プロセスの中だけ**（DBに書かない。再起動で消え、次のサイクルでまた付く）。取り込みが無効の`serve`（`index_drive`が動かない）と、最初のサイクルの前は、キーを出さない（保留があるかどうか分からない）。鍵が無い・認証失敗・一覧の取得失敗・停止で中断したサイクルは何も確かめていないので、直前の記憶をそのまま（`checked_at`が古いままで分かる）。`--dry-run`は記録しない。解除は`geoframe sync --allow-mass-delete`を1回（`.ingest.lock`のため`serve`を止めてから。別プロセスなので、`serve`の表示はその後の最初のサイクルで消える）。`admin.js`のSTATUSタブが注意（赤）に件数・理由・開始と最終確認の時刻・解除のコマンドを文字で出す。**画面からは解除できない** | 意図した削除が配信に残り続けても気づけない、を防ぐ | 管理画面のSTATUS・`/api/admin/status`（`GEOFRAME_INGEST=1`の`serve`） | `drive/tests.rs`（保留・空の一覧・解除のサイクルで消える・dry-runと失敗したサイクルでは変わらない・`since`の保持）、`tests/admin_api.rs`（キーの有無・形・並び。キーが無い応答はPythonのフィクスチャと完全一致）。画面はT3.8 | なし（決定） | [§10.6](#106-pythonとの差まとめ)・[§14.4](#144-index_drive) |
 
@@ -1015,7 +1015,7 @@ musl静的バイナリを`deploy/rust-deploy.sh`で配布して確かめた。�
 
 - **T2.5（実施済み。§15）**: `organize`の「推定で位置が付きうる写真は移さない」制限（§13.4）を外し、`index_local`→`infer`→移動の順にした。
 - **T2.4（実施済み。§14）**: `fetch_derivatives`の取得待ちの占有（§12.10の受入条件②）は、`local_derivatives`にも同じ仕組みで入れた（§14.6）。
-- **P3**: 手動の位置がmtimeの変更で上書きされる挙動（§0、[inventory.md §2.3](inventory.md)）を直すか決める。直すなら、`loc_source='manual'`の行は`lat lon loc_source`を更新しない・`display`だけをNULLにする、などの選択肢がある。
+- **P3（決定済み。T3.7。ユーザーの決定）**: 手動の位置がmtimeの変更で上書きされる挙動は直した。`loc_source='manual'`の行は`lat lon loc_source place elev`を更新しない（§0、§13.7、[inventory.md §2.3](inventory.md)）。
 
 ### 13.11 再レビュー（2026-10-24）の指摘への対応
 
@@ -1314,7 +1314,7 @@ G=$(mktemp -d); python3 tools/gen_acceptance_photos.py $G   # a01.jpg が合成�
 
 - **T2.5（実施済み。§15）**: `infer`段（位置の推定）。`index_drive`が`display`をNULLに戻す（md5の変更）ことと推定は独立で、`infer`は錨の選び方に`display`を使わない（錨になるのは`loc_source`が`exif`・`drive_meta`・`manual`で時刻が読める写真だけ）。`infer`が`display`をNULLにするのは、推定を取り消す行だけ（[inventory.md §2.3](inventory.md)）。
 - **T2.7（実施済み。[p2-acceptance.md](p2-acceptance.md)。ただし§14.11の(1)〜(4)の本物のDriveでの確認は鍵待ち。本番で取り込みを有効にする前の関門）**: 本番コピーでの`--dry-run`（§14.11の(1)の鍵なし部分）と実サイクル、同じ写真を比較用PythonとRustへ入れた`photos`の列ごとの比較、棚卸しS2の実機確認、結果の`p2-acceptance.md`への記録。**§14.11の(2)・(3)が受入条件①の実機での確認**。
-- **P3**: md5の変更で手動の位置を上書きする挙動（§0）を直すか決める。直すなら`loc_source='manual'`の行は`lat lon loc_source`を更新せず`display`だけをNULLにする、などの選択肢がある（§13.10と同じ）。
+- **P3（決定済み。T3.7。ユーザーの決定）**: md5の変更で手動の位置を上書きする挙動は直した。`loc_source='manual'`の行は`lat lon loc_source place elev`を更新しない（§0、§14.8、[inventory.md §2.3](inventory.md)）。
 
 ### 14.13 レビュー（2026-10-25）の指摘への対応
 
@@ -1517,7 +1517,7 @@ T2.4の`net.rs`の`Failure`（§14.3の表）に合わせる。`Failure::is_outa
 
 - **T2.6**: `quality`段（簡易品質）。済み（§16）。
 - **T2.7（実施済み。[p2-acceptance.md](p2-acceptance.md) §2）**: 検証環境での受入のうち、**同じ写真を比較用PythonとRustへ入れた`photos`の列ごとの比較**（`infer`・`enrich`を含む。地理院は本物）。Driveの本物での確認は管理者が行う。
-- **P3**: 位置が動いたときに地名を付け直すか（§15.2の5）。手動の位置の上書き（§13.10・§14.12）と一緒に決める。
+- **P3（T3.7で決めた結果: 付け直さない）**: 位置が動いたときに地名を付け直すか（§15.2の5）は、手動の位置を残す決定の範囲外で、今のまま（`infer`は地名に触らない）。残した課題。
 
 ## 16. 簡易品質（P2 / T2.6）
 
@@ -1717,7 +1717,7 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 | 8 | 各ルートの処理 | `BadRequest`400・`NotFound`404・（実行中）409・writerなし503・その他500 |
 
 - **この表は`post::handle`の順序**。巨大・不正な`Content-Length`と`Transfer-Encoding`は、axum/hyperのHTTP層が4・5行目より先に断る（状態コード・本文が表と違う）。拒否の向きだけの差で書き込みは起きない（§17.1.1）。
-- CORSヘッダは一切返さない。`OPTIONS`は501のまま（§9.1の1）。`HEAD /api/…`は今のまま403（P1で決めたもの）、`GET /api/admin/setloc`などの更新ルートへのGETは未実装の503のまま（T3.3で`/api/admin/`の503が狭まる）。
+- CORSヘッダは一切返さない。`OPTIONS`は501のまま（§9.1の1）。`HEAD /api/…`は今のまま403（P1で決めたもの）、`GET /api/admin/setloc`などの更新ルートへのGETはT3.1の時点では未実装の503だったが、T3.3で`/api/admin/`の503を外し、現行どおり403にした（§18.7）。
 - 応答は`{"ok": false, "error": "…"}`（成功は各ルートの形）。`Content-Type: application/json; charset=utf-8`・`Cache-Control: no-store`。
 - 文面（`error`）は現行と同じ。例外・SQLiteのエラー文字列は**応答に出さない**: 500は`内部エラーが発生しました`だけで、詳細（`WriteError`のDisplay＝SQLiteのメッセージ。表名・列名まで）は`[api] <ルート> 内部エラー: …`としてログにだけ出す。成功時は何もログに出さない（座標・`id`を出さない）。アクセスログは§9.6のまま（メソッド・ルートのテンプレート・状態コード・時間）。
 - Pythonの`http.server`はHTTP/1.0で毎回接続を閉じるが、Rustは keep-alive する。本文を読まずに返す応答（403・400）の未読の本文は hyper が扱う（次の要求として解釈しない）。413だけは、Pythonと同じく**明示的に閉じる**（`Connection: close`）。
@@ -1815,7 +1815,7 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 
 | 段 | 割り込みで起きうること | 守り（Rust） | Python | 試験 |
 | --- | --- | --- | --- | --- |
-| `index_local` / `index_drive` | `UPDATE`は`mtime`・`md5`が変わった行の`lat lon loc_source`などを上書きし、`DELETE`は消えた行を消す。`favorite`/`hidden`/`rotation`は`SET`句に無いので**残る**。手動の位置は、ファイルが変わった行では上書きされ（Python）、消えた行はお気に入り・除外ごと消える | **T3.7で、手動の位置は競合でも原本の更新でも失われない**: `UPDATE`が`CASE WHEN loc_source = 'manual'`で**書く時点の行**を見るので、計画の時点で手動でなくても、計画のあとに更新APIが位置を直した行は`lat lon loc_source place elev`を書かない（inventory.md §2.3 ①）。消えた行がお気に入り・除外・手動の位置ごと消えるのは②の決定どおり今のまま。計画に入らない行（ファイルが変わっていない行）の手動の位置・お気に入りも残る | Pythonは1枚ずつ読んで書くので窓は狭いが、ファイルが変わった行の手動の位置は上書きされて失う | `local::tests::計画のあとに更新apiが入っても…`、`drive::tests::index_drive_plan_survives_the_update_api_including_a_location_set_after_the_plan` | `local::tests::計画のあとに更新apiが入っても…`、`drive::tests::index_drive_plan_survives_…` |
+| `index_local` / `index_drive` | `UPDATE`は`mtime`・`md5`が変わった行の`lat lon loc_source`などを上書きし、`DELETE`は消えた行を消す。`favorite`/`hidden`は両方の`SET`句に無いので**残る**。`rotation`は`index_local`の`SET`句に無いので残り、`index_drive`は`md5`が変わった行を`rotation=0`に戻す（T3.7 ③の決定どおり今のまま。回転済みのderivativeのファイルは残る）。手動の位置は、ファイルが変わった行では上書きされ（Python）、消えた行はお気に入り・除外ごと消える | **T3.7で、手動の位置は競合でも原本の更新でも失われない**: `UPDATE`が`CASE WHEN loc_source = 'manual'`で**書く時点の行**を見るので、計画の時点で手動でなくても、計画のあとに更新APIが位置を直した行は`lat lon loc_source place elev`を書かない（inventory.md §2.3 ①）。消えた行がお気に入り・除外・手動の位置ごと消えるのは②の決定どおり今のまま。計画に入らない行（ファイルが変わっていない行）の手動の位置・お気に入りも残る | Pythonは1枚ずつ読んで書くので窓は狭いが、ファイルが変わった行の手動の位置は上書きされて失う | `local::tests::計画のあとに更新apiが入っても…`、`drive::tests::index_drive_plan_survives_the_update_api_including_a_location_set_after_the_plan` | `local::tests::計画のあとに更新apiが入っても…`、`drive::tests::index_drive_plan_survives_…` |
 | `infer` | 計画（読み取り）のあとに、対象の行が手動になった・錨が手動で動かされた | `Set`/`Clear`の`UPDATE`は`loc_source IS NULL OR 'inferred'`の行にだけ効く（P2）。**T3.1で追加**: `Set`は、錨が計画のときの位置・種類（`exif`/`drive_meta`/`manual`）のままのときだけ。動かされた錨の古い位置を写さない（次のサイクルが新しい錨で付け直す） | `WHERE id=?`だけ: **手動の位置を推定で上書きし、`Clear`は取り消す**（位置が失われる） | `geo::tests::計画のあとに更新apiで直された位置…`（`Set`・`Clear`・錨の移動） |
 | `enrich` | 地名の問い合わせ中に位置が直された（`place`がNULLに戻る） | `UPDATE`は`lat=? AND lon=? AND place IS NULL`（P2）。座標が変わった行には古い座標の地名を書かず、次のサイクルが新しい座標で付ける | `WHERE id=?`だけ: 古い座標の地名が新しい位置に書かれ、`place`が埋まったまま**再enrichされない**（誤った地名が残る） | `geo::tests::enrichの途中で更新apiが…` |
 | `fetch_derivatives` / `local_derivatives` | 取得の途中で位置・お気に入りが変わる | 書くのは`display fetched_at`だけ（`WHERE id=?`）で、利用者の列に触れない。割り込みの影響なし。回転（T3.2）は`display`/`rotation`を書くので、取得との競合は§17.8.4 | 同じ | `drive::tests::fetch_keeps_what_the_update_api_wrote…`、`local::tests::derivativeの作成中に…` |
@@ -1847,7 +1847,7 @@ sudo -u geoframe env GEOFRAME_INGEST=1 geoframe quality-scan --data-dir $d
 
 - **T3.2**: 済み（§17.8）。
 - **T3.7**: 済み。索引（`index_local`・`index_drive`）の更新が手動の位置を失う経路は塞いだ（§17.3の1行目）。行の削除でお気に入り・除外が消えるのは決定どおり今のまま。
-- **T3.8**: 検証環境での受入（比較用Python `:8090`に同じ要求を送って応答とDBの変化を比べる）。
+- **T3.8（実施済み。[p3-acceptance.md](p3-acceptance.md) §2.1・§2.3）**: 検証環境での受入（比較用Python `:8090`に同じ要求を送って応答とDBの変化を比べる）。
 
 ### 17.8 E14 `rotate`（T3.2）
 
@@ -1920,7 +1920,7 @@ Pythonは、①同期サイクルが`display`をNULLにしたあとでも古い�
 #### 17.8.7 回したもの
 
 - **T3.7**: 済み。回転済みの写真が`md5`の変更で`rotation`0に戻り、古い回転済みのファイルが残る経路（[inventory.md §2.3](inventory.md)③）は、**決定どおり今のまま**（変更なし）。
-- **T3.8**: 検証環境での回転の受入（比較用Python `:8090`に同じ要求を送る）。
+- **T3.8（実施済み。[p3-acceptance.md](p3-acceptance.md) §2.4）**: 検証環境での回転の受入（比較用Python `:8090`に同じ要求を送る）。
 
 ## 18. 地名検索（P3 / T3.3）
 
@@ -1966,7 +1966,7 @@ Pythonは、①同期サイクルが`display`をNULLにしたあとでも古い�
 - クライアントは`ureq`（`net::agent()`の複製）。リクエストごとに**User-Agent: `GeoFrame/0.2`**（Pythonの`http_json`と同じ。P2の他の通信は`geoframe/<版>`）、**全体で8秒**（Pythonの`timeout=8`は1回の読み書きごと）。リダイレクトは`ureq`の既定（10回）。状態コードが2xx以外・本文がUTF-8でない・JSONでない（BOMつきを含む）・本文が**展開後で1 MiB**を超える、は失敗。Pythonは本文の上限が無い。**gzipの本文は`ureq`の`limit`では測れない**（圧縮後の大きさに当たる。圧縮時2 KBの本文が2 MiBに展開されても通ってしまう。T3.3のレビューで再現）ので、`net::read_body_limited`が展開後を数える。1 MiBちょうどは読め、1バイト超えたら失敗。展開後が空になるgzip（空のメンバーの繰り返し）のために、圧縮前にも独立の上限`net::wire_limit`（1 MiB×2＋64 KiB）を付けてあり、超えたら同じく失敗。
 - 接続先は定数（`geocode::Endpoints::production`）。Pythonと同じく、**本番のバイナリは設定・環境変数・コマンドラインから通信先を変えられない**（`main.rs`・`cli.rs`は`AppState::new`の既定＝本番の接続先しか使わない）。
 - **結合テストへの注入（T3.3のレビューで追加）**: 結合テスト（`tests/`は別のcrate）は`cfg(test)`の入口を使えないので、`Endpoints::loopback(addr)`・`Geocoder::with_endpoints`・`AppState::with_geocoder`を`pub`にした。**ループバック以外のアドレスは`loopback`が受け付けない**（`None`）ので、誤って呼んでも外へは出ない。本番のコードがこの入口を呼ばないことは試験で見る（`production_code_never_redirects_the_geocoder`: `src/`を走査して、入口を定義するファイル（`geocode.rs`・`server.rs`）も含め、コメント・定義の行・`#[cfg(test)]`の項目・試験のファイル以外に呼び出しが無いこと。本番の処理に呼び出しを足すと落ちることを`geocode.rs`・`server.rs`の両方で確かめた）。`tests/common`の`app_state`・`test_state`（直接`AppState`を作る試験も通す）は、既定を**何も受け付けないスタブ**（`GeocodeStub::deny`）に向け、要求が1つでも届いたらプロセスごと落とす（外へ出る代わりに、意図しない通信をした試験が必ず失敗する）。2文字以上の検索語で通信が要る試験は`GeocodeStub::start()`を作って`with_geocoder`で向ける（`tests/geocode_api.rs`。スタブに要求が届くことを確かめる）。単体試験の側も同じで、`AppState::new`を使う`server.rs`の試験は`geocode::stub::deny_geocoder()`に向ける。
-- 本番の`Nominatim`は、利用規約（1秒1件・識別できるUser-Agent・結果のキャッシュ）が前提。User-Agentに連絡先は入っていない（Pythonと同じ`GeoFrame/0.2`）。公開サーバーに識別されないと遮断されうるので、本番で使う前に`GEOFRAME_TILE_UA`と同様に連絡先入りにするか決める（T3.8の確認後。今は変えない）。
+- 本番の`Nominatim`は、利用規約（1秒1件・識別できるUser-Agent・結果のキャッシュ）が前提。User-Agentに連絡先は入っていない（Pythonと同じ`GeoFrame/0.2`）。公開サーバーに識別されないと遮断されうるので、本番で使う前に`GEOFRAME_TILE_UA`と同様に連絡先入りにするか決める（持ち越し。P5の本番切替の前に決める。今は変えない。[p3-acceptance.md §7.1](p3-acceptance.md#71-持ち越し期限はp5の本番切替の前p3のprのマージはこれで止めない)）。
 
 ### 18.6 ログ
 
@@ -1974,7 +1974,7 @@ Pythonは、①同期サイクルが`display`をNULLにしたあとでも古い�
 
 ### 18.7 `/api/admin/`配下の`GET`の整理（T3.1の残り）
 
-T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のままにしていた。現行は`do_GET`に`status`・`photos`・`geocode`の3つ以外の`/api/admin/`の分岐が無く、静的配信のホワイトリストで**403**になる（`setloc`・`setflag`・`rotate`、`/api/admin/`、`/api/admin/Status`、`%73tatus`のようなエンコード、`..`を含む形を現行で確かめた）。T3.3で503の接頭辞（`/api/admin/`）を外し、同じ静的配信の判定に回した。**P4に`/api/admin/`配下の`GET`は無い**（AI検索は`/api/ai/`、旅行ブログは`/api/blog/`）ので、今後`/api/admin/`で503を返すルートは無い。`/api/ai/`・`/api/blog/`の`GET`は引き続き503（T3.5・P4で実装。`/tiles/`はT3.4で実装した、§19）。
+T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のままにしていた。現行は`do_GET`に`status`・`photos`・`geocode`の3つ以外の`/api/admin/`の分岐が無く、静的配信のホワイトリストで**403**になる（`setloc`・`setflag`・`rotate`、`/api/admin/`、`/api/admin/Status`、`%73tatus`のようなエンコード、`..`を含む形を現行で確かめた）。T3.3で503の接頭辞（`/api/admin/`）を外し、同じ静的配信の判定に回した。**P4に`/api/admin/`配下の`GET`は無い**（AI検索は`/api/ai/`、旅行ブログは`/api/blog/`）ので、今後`/api/admin/`で503を返すルートは無い。`/api/blog/`の`GET`（E7〜E10）はT3.5で実装済み（§20。完全一致の4つ以外は404）。`/tiles/`はT3.4で実装した（§19）。503のままなのは`/api/ai/`の`GET`だけで、P4で実装する。
 
 ### 18.8 Pythonとの差（まとめ）
 
@@ -1993,7 +1993,7 @@ T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のまま�
 
 ### 18.10 回したもの
 
-- **T3.8**: 検証環境での実際の通信の確認（地理院・Nominatimへの実通信、比較用Python `:8090`に同じ要求を送る）。取り込みが有効・無効の両方で`.cache.json`の挙動を見る。
+- **T3.8（実施済み。[p3-acceptance.md](p3-acceptance.md) §2.3・§2.7）**: 地理院への実通信（検索は200・10件、Pythonと同じ）と、取り込みが有効・無効の両方での`.cache.json`の挙動は確かめた。**Nominatimへの実通信は、地理院が結果を返したので呼ばれておらず、持ち越し**（担当は管理者。連絡先入りのUser-Agentをどうするかを決めたあと。期限はP5の本番切替の前。[p3-acceptance.md §7.1](p3-acceptance.md#71-持ち越し期限はp5の本番切替の前p3のprのマージはこれで止めない)）。
 - 本番で使う前: Nominatimへ送るUser-Agentの連絡先（§18.5）。
 
 ## 19. 地図タイルとキャッシュの掃除（P3 / T3.4）
@@ -2083,7 +2083,7 @@ T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のまま�
 
 ### 19.12 回したもの
 
-- **T3.8**: 検証環境での実際の通信の確認（OSM・地理院への実通信、比較用 Python `:8090`との同じタイル・同じ流量での応答の比較、`GEOFRAME_TILE_UA`に連絡先を入れる）。取り込みが有効・無効の両方で、`tile_cache/`の書き込みと掃除を見る。検証環境の実機で`StateDirectory`の下の`tile_cache`が書けること（unit の`ProtectSystem=strict`）。
+- **T3.8（実施済み。[p3-acceptance.md](p3-acceptance.md) §2.5・§2.7）**: 地理院のタイルの実通信（`miss`→`hit`、Pythonと同じ）、取り込みが有効・無効の両方での`tile_cache/`の書き込み、検証環境の実機で`StateDirectory`の下の`tile_cache`が書けること（unit の`ProtectSystem=strict`）は確かめた。**OSMのタイルの実取得は持ち越し**（検証環境に`GEOFRAME_TILE_UA`が無いため。ユーザーが連絡先入りの値を設定したあと管理者が確かめる。期限はP5の本番切替の前。[p3-acceptance.md §7.1](p3-acceptance.md#71-持ち越し期限はp5の本番切替の前p3のprのマージはこれで止めない)）。
 - 本番で使う前: `GEOFRAME_TILE_UA`に連絡先を入れる（OSM の利用規約。既定のままだとブロックされうる）。
 
 ## 20. 旅行ブログの読み取り（P3 / T3.5）
@@ -2151,7 +2151,7 @@ T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のまま�
 ### 20.10 T3.6 への引き継ぎ・回したもの
 
 - T3.6（`save`・`export`）は済み（§21）。`blog::is_valid_trip_id`・`trip_id_of`・`validate_manifest`・`load_plan`・`BlogEnv`を使う。保存は`drafts/`の`.part`→`rename`なので、この節の読み取りは書きかけを見ない。unit の`ReadOnlyPaths`の`travel_blog`・`blog_exports`は T3.6 で外した。
-- **T3.8**: 検証環境で、比較用 Python（`:8090`）と同じ`trip_id`の要求（一覧・旅程・候補・下書き）を送って応答を比べる。旅程は本物の埋め込みで、写真は検証環境の DB（座標・地名は記録に残さない）。
+- **T3.8（実施済み。[p3-acceptance.md](p3-acceptance.md) §2.2）**: 検証環境で、比較用 Python（`:8090`）と同じ`trip_id`の要求（一覧・旅程・候補・下書き）を送って応答を比べる。旅程は本物の埋め込みで、写真は検証環境の DB（座標・地名は記録に残さない）。
 
 
 ## 21. 旅行ブログの保存と書き出し（P3 / T3.6）
@@ -2235,11 +2235,11 @@ T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のまま�
 
 ### 21.8 ログ（AC7）
 
-旅程・下書きの中身、`trip_id`、写真の id・ファイル名、パスを出さない。エラーの本文は Python と同じ定型文（400・404・409）か、`内部エラーが発生しました`（500）。500 の詳細（`ErrorKind`・画像の失敗の種類など。名前を含まない）は`post.rs`が`[api] /api/blog/save 内部エラー: …`の形でログにだけ出す。成功は何も出さない（アクセスログのメソッド・ルートのテンプレート・状態コード・時間だけ）。起動時の片付けは件数だけ。
+旅程・下書きの中身、`trip_id`、写真の id・ファイル名、パスを出さない。エラーの本文は Python と同じ定型文（400・404・409）か、`内部エラーが発生しました`（500）。500 の詳細（`ErrorKind`・画像の失敗の種類など。値を含まない＝写真のファイル名・座標・本文・パスは含まない）は`post.rs`が`[api] <ルート> 内部エラー: …`の形（`/api/blog/save`・`/api/blog/export`）でログにだけ出す。応答は定型文、ログは値を含まない詳細、と扱いが違う。成功は何も出さない（アクセスログのメソッド・ルートのテンプレート・状態コード・時間だけ）。起動時の片付けは件数だけ。
 
 ### 21.9 Pythonとの差（まとめ）
 
-§0の2行（T3.6の保存と書き出し、T3.7の使えない写真）に同じ。①書き込みが無効なら503（`dry_run`を除く）。②作業領域の名前、残骸の掃除、`.previous`の復元、置き換えの失敗の巻き戻し。③下書きの`.part`・`fsync`・リンクを使わない。④画像のデコーダ・縮小・エンコーダ、ハフマン最適化なし。⑤`i64`を超える・上付き数字などの`photo_id`は、実在しない写真として`missing`で飛ばす（Python は500）。⑥`u64`を超える整数は浮動小数。`NaN`・`Infinity`・対にならないサロゲートは入口で400。⑦500の詳細をログに出さない。⑧回転・取得と同じロックの中で読む。⑨SIGTERM で中断。⑩`display`が`DATA_DIR`の中を指す`..`は Python と同じく解決する。⑪`POST`の処理中は無通信の期限を止める（§21.6）。⑫**使えない写真（行なし・`hidden`・`display`なし・`DATA_DIR`の外・通常のファイルでない・読めない・画像として読めない）は、Python が400/500で止めるところを、Rust は飛ばして残りを書き出し、応答に`skipped`を足す**（T3.7。ユーザーの決定。§21.3の2。`dry_run`も数える）。同じ点: ICC を変換しない、EXIF・GPS を残さない、重複した写真は1回だけ書く。
+§0の2行（T3.6の保存と書き出し、T3.7の使えない写真）に同じ。①書き込みが無効なら503（`dry_run`を除く）。②作業領域の名前、残骸の掃除、`.previous`の復元、置き換えの失敗の巻き戻し。③下書きの`.part`・`fsync`・リンクを使わない。④画像のデコーダ・縮小・エンコーダ、ハフマン最適化なし。⑤`i64`を超える・上付き数字などの`photo_id`は、実在しない写真として`missing`で飛ばす（Python は500）。⑥`u64`を超える整数は浮動小数。`NaN`・`Infinity`・対にならないサロゲートは入口で400。⑦500の本文には例外の文字列を出さない（定型文）。ログには値（写真のファイル名・座標・本文・パス）を含まない詳細（種類）だけを出す（Pythonはパスを含む例外をログに出す）。⑧回転・取得と同じロックの中で読む。⑨SIGTERM で中断。⑩`display`が`DATA_DIR`の中を指す`..`は Python と同じく解決する。⑪`POST`の処理中は無通信の期限を止める（§21.6）。⑫**使えない写真（行なし・`hidden`・`display`なし・`DATA_DIR`の外・通常のファイルでない・読めない・画像として読めない）は、Python が400/500で止めるところを、Rust は飛ばして残りを書き出し、応答に`skipped`を足す**（T3.7。ユーザーの決定。§21.3の2。`dry_run`も数える）。同じ点: ICC を変換しない、EXIF・GPS を残さない、重複した写真は1回だけ書く。
 
 ### 21.10 テスト
 
@@ -2253,4 +2253,4 @@ T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のまま�
 ### 21.11 回したもの
 
 - **T3.7**: 済み。下書きの`photo_id`が指す行が消える・`hidden`になる・別の id になる経路（[inventory.md §2.3](inventory.md)の④）は、書き出しが止まらず、使えない写真を飛ばして知らせる形にした（§21.3の2）。削除→再追加でidが変わること自体は今のまま。保存は写真の存在を見ないので、下書きは残る。
-- **T3.8**: 検証環境で、比較用 Python（`:8090`）と同じ要求（保存・書き出し・`dry_run`・409）を送り、下書きと書き出しのファイルを比べる。比較用 Python は別の`DATA_DIR`（`/var/lib/geoframe-pyref`）を使うこと（Rust の`DATA_DIR`と共有すると、二重に書く）。Rust の`GEOFRAME_INGEST=1`が要る。画像は実写真の derivative で、書き出した画像の EXIF/GPS が空であることを確かめる（座標・地名・ファイル名は記録に残さない）。
+- **T3.8（実施済み。[p3-acceptance.md](p3-acceptance.md) §2.2）**: 検証環境で、比較用 Python（`:8090`）と同じ要求（保存・書き出し・`dry_run`・409）を送り、下書きと書き出しのファイルを比べる。比較用 Python は別の`DATA_DIR`（`/var/lib/geoframe-pyref`）を使うこと（Rust の`DATA_DIR`と共有すると、二重に書く）。Rust の`GEOFRAME_INGEST=1`が要る。画像は実写真の derivative で、書き出した画像の EXIF/GPS が空であることを確かめる（座標・地名・ファイル名は記録に残さない）。

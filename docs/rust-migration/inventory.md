@@ -264,7 +264,7 @@ store.py の永続キャッシュ。JSONオブジェクト。読み書きは `ca
 | `GEOFRAME_QUALITY_PER_CYCLE` | `FETCH_PER_CYCLE` | 引き継ぐ | | P2 |
 | `GEOFRAME_INFER_MIN` | `15` | 引き継ぐ | 段階窓は `{INFER_MIN, 2時間, 12時間}` | P2 |
 | `GEOFRAME_INFER_OFFSET_MIN` | `0` | 引き継ぐ | カメラ時計のずれ | P2 |
-| `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` | 引き継ぐ | 本番では連絡先入りを設定する運用 | P3 |
+| `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` | 引き継ぐ | 本番では連絡先入りを設定する運用。検証環境でのOSMのタイルの実取得は、設定のあとに行う持ち越し（P5の本番切替の前。[plan.md](plan.md) P3・P5）。Nominatimへ送るUser-Agent（`GeoFrame/0.2`）は別で、決定も同じ期限 | P3 |
 | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` | 引き継ぐ | | P3 |
 | `GEOFRAME_TILE_FETCH_PER_MIN` | `240` | 引き継ぐ | | P3 |
 | `GEOFRAME_AI_ENABLED` | `1` | 引き継ぐ（意味は「AIジョブ全体の有効化」） | `0` で E6 が503 | P4 |
