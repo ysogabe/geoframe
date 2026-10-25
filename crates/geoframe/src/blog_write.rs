@@ -37,20 +37,39 @@
 //! ファイルだけを読む。読むのは derivative の回転・取得と同じロック（[`imaging::lock_derivatives`]）の中で、
 //! 行を引いてからファイルをメモリに読み切るまで（デコード・縮小・エンコードはロックの外）。
 //!
+//! ## 書き出せない写真は飛ばして、残りを書き出す（T3.7。ユーザーの決定。inventory.md §2.3 ②④）
+//!
+//! 現行は、manifest の `photo_id` が指す写真が使えないと**書き出し全体を 400 で止める**。Rust は、その写真だけを
+//! 飛ばして残りを書き出し、飛ばした写真を応答の `skipped` で知らせる:
+//!
+//! - `skipped`: `[{"photo_id": "<manifest のまま>", "reason": "missing"|"hidden"|"no_image"}]`。manifest の順で、
+//!   **飛ばした参照ごとに 1 件**（同じ写真が 2 回あれば 2 件）。**飛ばしたものが無いときはキーごと出さない**
+//!   （Python と同じ応答になる）。ファイル名・座標・地名は入れない。応答の最後のキー。
+//! - `reason`: `missing`＝その id の行が無い（`photos` から消えた・id が読めない）／`hidden`＝除外
+//!   （`hidden` が 0 でない）／`no_image`＝行はあるが表示用の画像が使えない（`display` が空、`DATA_DIR` の外や
+//!   通常のファイルでない、読めない、画像として読めない）。
+//! - 飛ばした写真の画像は、書き出す `blog-manifest.json`・`index.md`・`index.html` から**取り除く**（`images/` に
+//!   ファイルを作らず、`<img>`・`![]()` も出さない。壊れたリンクを残さない）。
+//! - `images` は**書き出した枚数**（`manifest` の参照の数 − `skipped` の数）。全部飛んだら 0 で、本文だけを書き出す。
+//! - `dry_run` も同じ判定で `skipped` と `images` を返す。ただし画像のデコードまではしないので、**画像として読めない
+//!   写真（`no_image`）は予測できず**、実際の書き出しでだけ `skipped` に出る。取り込みが無効で writer が無いときは、
+//!   読み取り専用の接続で行を引く。
+//! - 下書きの保存（E15）は写真の存在を見ない（今までどおり）。
+//! - 行を引けない・DB が読めない、作業領域へ書けないなどの失敗は、飛ばさず 500/503 のまま。
+//!
 //! # ログ（AC7）
 //!
 //! 旅程・下書きの中身、`trip_id`、写真の id・ファイル名、パスを出さない。失敗の詳細（定型の語・`ErrorKind`）は
 //! [`ApiError::Internal`] に入れ、`post.rs` が定型の行でログにだけ出す。
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use rusqlite::OptionalExtension;
-use rusqlite::types::Value as Sql;
+use rusqlite::{Connection, OptionalExtension};
 use serde_json::{Map, Value, json};
 
 use crate::blog::{self, BlogEnv, BlogError};
@@ -216,46 +235,174 @@ fn photo_row_id(photo_id: &str) -> Option<i64> {
     })
 }
 
+/// 書き出せない写真の理由（応答の `skipped[].reason`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Skip {
+    /// その id の行が無い。
+    Missing,
+    /// 除外されている。
+    Hidden,
+    /// 行はあるが、表示用の画像が使えない。
+    NoImage,
+}
+
+impl Skip {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::Hidden => "hidden",
+            Self::NoImage => "no_image",
+        }
+    }
+}
+
+/// 行の引き方。書き出しは writer の接続（回転・取得と同じ接続）で、書き込みのない `dry_run` は writer が無くても
+/// 答えるので、読み取り専用の接続でも引ける。
+enum Rows<'a> {
+    Writer(&'a Writer),
+    ReadOnly(Connection),
+}
+
+/// 行を引いた結果。
+enum Lookup {
+    Missing,
+    Hidden,
+    /// 表示できる行の `display`（空・NULL・文字列でないものは `None`）。
+    Visible(Option<String>),
+}
+
+impl Rows<'_> {
+    /// 現行 `_photo_source` の `SELECT id, display FROM photos WHERE id=? AND COALESCE(hidden,0)=0` を、
+    /// 行が無いのと除外とを区別できる形にしたもの。
+    fn lookup(&self, row_id: i64) -> Result<Lookup, ApiError> {
+        const SQL: &str = "SELECT display, COALESCE(hidden,0)=0 FROM photos WHERE id=?1";
+        let query = move |conn: &Connection| {
+            conn.query_row(SQL, [row_id], |r| {
+                Ok((r.get::<_, rusqlite::types::Value>(0)?, r.get::<_, bool>(1)?))
+            })
+            .optional()
+        };
+        let row = match self {
+            Self::Writer(writer) => writer
+                .call(move |conn| query(conn))
+                .map_err(|e| ApiError::Internal(e.to_string()))?,
+            Self::ReadOnly(conn) => {
+                query(conn).map_err(|e| ApiError::Internal(format!("写真の行を読めません: {e}")))?
+            }
+        };
+        Ok(match row {
+            None => Lookup::Missing,
+            Some((_, false)) => Lookup::Hidden,
+            Some((rusqlite::types::Value::Text(text), true)) if !text.is_empty() => {
+                Lookup::Visible(Some(text))
+            }
+            Some((_, true)) => Lookup::Visible(None),
+        })
+    }
+}
+
+/// 行を引いて、書き出せる画像のファイル（`DATA_DIR` の中の通常のファイル）の場所を返す。使えなければ理由。
+/// 現行は `(DATA_DIR / display).resolve()` で、絶対パスの `display` は `DATA_DIR` の外になる。リンクを辿った
+/// 先が `DATA_DIR` の中の通常のファイルでなければ読まない。
+fn locate(
+    rows: &Rows<'_>,
+    data_root: &Path,
+    row_id: Option<i64>,
+) -> Result<Result<PathBuf, Skip>, ApiError> {
+    let Some(row_id) = row_id else {
+        return Ok(Err(Skip::Missing));
+    };
+    let display = match rows.lookup(row_id)? {
+        Lookup::Missing => return Ok(Err(Skip::Missing)),
+        Lookup::Hidden => return Ok(Err(Skip::Hidden)),
+        Lookup::Visible(None) => return Ok(Err(Skip::NoImage)),
+        Lookup::Visible(Some(display)) => display,
+    };
+    let Ok(path) = fs::canonicalize(data_root.join(&display)) else {
+        return Ok(Err(Skip::NoImage));
+    };
+    if !path.starts_with(data_root) || !fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
+        return Ok(Err(Skip::NoImage));
+    }
+    Ok(Ok(path))
+}
+
 /// 現行 `_photo_source` + 画像ファイルの読み込み。行を引いて、`display` が指す `DATA_DIR` の中の通常の
 /// ファイルをメモリに読み切るまでを、derivative の回転・取得と同じロックの中で行う（読む途中に回転が
-/// `display` を差し替えて古いファイルを消しても、行とファイルの組が食い違わない）。
+/// `display` を差し替えて古いファイルを消しても、行とファイルの組が食い違わない）。使えない写真は理由
+/// （[`Skip`]）で返す。DB の失敗だけが `Err`。
 fn read_source(
-    writer: &Writer,
+    rows: &Rows<'_>,
     data_root: &Path,
-    photo_id: &str,
     row_id: Option<i64>,
-) -> Result<Vec<u8>, ApiError> {
-    let no_display = || ApiError::BadRequest(format!("写真#{photo_id}の表示用画像がありません"));
-    let no_file = || ApiError::BadRequest(format!("写真#{photo_id}のファイルを確認できません"));
-    let Some(row_id) = row_id else {
-        return Err(no_display());
-    };
+) -> Result<Result<Vec<u8>, Skip>, ApiError> {
     let _files = imaging::lock_derivatives();
-    let display: Option<Sql> = writer
-        .call(move |conn| {
-            conn.query_row(
-                "SELECT display FROM photos WHERE id=?1 AND COALESCE(hidden,0)=0",
-                [row_id],
-                |r| r.get::<_, Sql>(0),
-            )
-            .optional()
-        })
-        .map_err(|e| ApiError::Internal(e.to_string()))?;
-    let display = match display {
-        Some(Sql::Text(text)) if !text.is_empty() => text,
-        _ => return Err(no_display()),
+    let path = match locate(rows, data_root, row_id)? {
+        Ok(path) => path,
+        Err(skip) => return Ok(Err(skip)),
     };
-    // 現行は `(DATA_DIR / display).resolve()`。絶対パスの `display` は `DATA_DIR` の外になる。リンクを辿った
-    // 先が `DATA_DIR` の中の通常のファイルでなければ読まない
-    let path = fs::canonicalize(data_root.join(&display)).map_err(|_| no_file())?;
-    if !path.starts_with(data_root) {
-        return Err(no_file());
+    // 読めない（大きすぎる・消えた・権限）ファイルも、その写真だけ飛ばす
+    Ok(imaging::read_limited(&path).map_err(|_| Skip::NoImage))
+}
+
+/// 飛ばした写真 1 件（manifest の参照ごと）。
+struct Skipped {
+    photo_id: String,
+    reason: Skip,
+}
+
+fn skipped_json(skipped: &[Skipped]) -> Value {
+    Value::Array(
+        skipped
+            .iter()
+            .map(|s| json!({"photo_id": s.photo_id, "reason": s.reason.as_str()}))
+            .collect(),
+    )
+}
+
+/// 書き出すファイル名（現行は `int(photo_id)` で作る。`007` と `7` は同じ名前）と、行の `id`。
+fn export_name(photo_id: &str) -> (String, Option<i64>) {
+    let row_id = photo_row_id(photo_id);
+    let name = match row_id {
+        Some(id) => format!("photo-{id}.jpg"),
+        None => format!("photo-{photo_id}.jpg"),
+    };
+    (name, row_id)
+}
+
+/// `dry_run`: 書き出したら飛ばす写真を数える（行を引いて、画像のファイルがあるかまで。デコードはしない）。
+fn dry_run_skipped(
+    manifest: &Value,
+    rows: &Rows<'_>,
+    data_root: &Path,
+) -> Result<Vec<Skipped>, ApiError> {
+    let mut verdicts: HashMap<String, Option<Skip>> = HashMap::new();
+    let mut skipped = Vec::new();
+    let chapters = manifest.as_object().map(|m| items(m, "chapters"));
+    for chapter in chapters.unwrap_or_default() {
+        for image in items(chapter, "images") {
+            let photo_id = json_str(image, "photo_id");
+            let (name, row_id) = export_name(photo_id);
+            let verdict = match verdicts.get(&name) {
+                Some(verdict) => *verdict,
+                None => {
+                    let verdict = {
+                        let _files = imaging::lock_derivatives();
+                        locate(rows, data_root, row_id)?.err()
+                    };
+                    verdicts.insert(name, verdict);
+                    verdict
+                }
+            };
+            if let Some(reason) = verdict {
+                skipped.push(Skipped {
+                    photo_id: photo_id.to_string(),
+                    reason,
+                });
+            }
+        }
     }
-    match fs::metadata(&path) {
-        Ok(meta) if meta.is_file() => {}
-        _ => return Err(no_file()),
-    }
-    imaging::read_limited(&path).map_err(|e| image_err("写真を読み込めません", &e))
+    Ok(skipped)
 }
 
 /// 作業領域。成功するまで（[`Staging::disarm`]）、落とされたら中身ごと消す。
@@ -553,18 +700,21 @@ fn render_html(manifest: &Map<String, Value>) -> String {
     )
 }
 
-/// 作業領域に書き出す一式を作る。`probe` は試験用の割り込み口。
+/// 作業領域に書き出す一式を作る。`probe` は試験用の割り込み口。使えない写真は飛ばし（画像の参照ごと取り除く）、
+/// 飛ばしたものを返す。
 fn build(
     staging: &Path,
     manifest: &Value,
-    writer: &Writer,
+    rows: &Rows<'_>,
     data_root: &Path,
     probe: &dyn Fn(Step) -> Flow,
-) -> Result<(), ApiError> {
+) -> Result<Vec<Skipped>, ApiError> {
     let image_dir = staging.join("images");
     fs::create_dir(&image_dir).map_err(|e| io_err("作業領域を作れません", &e))?;
     let mut exported = manifest.clone();
-    let mut done: HashSet<String> = HashSet::new();
+    // 書き出すファイル名ごとの結果（`None`＝書き出した）。同じ写真の 2 回目以降は引き直さない
+    let mut verdicts: HashMap<String, Option<Skip>> = HashMap::new();
+    let mut skipped = Vec::new();
     let mut index = 0usize;
     let Some(Value::Array(chapters)) = exported.get_mut("chapters") else {
         return Err(ApiError::Internal("chaptersがありません".into()));
@@ -573,7 +723,8 @@ fn build(
         let Some(Value::Array(images)) = chapter.get_mut("images") else {
             continue;
         };
-        for image in images {
+        let mut kept = Vec::with_capacity(images.len());
+        for mut image in std::mem::take(images) {
             if probe(Step::Image(index)) == Flow::Stop {
                 return Err(ApiError::Internal(
                     "停止の合図を受けたので書き出しを中断しました".into(),
@@ -585,23 +736,24 @@ fn build(
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let row_id = photo_row_id(&photo_id);
-            // 現行はファイル名を `int(photo_id)` で作る（`007` と `7` は同じ名前で、2 回目は作り直さない）
-            let name = match row_id {
-                Some(id) => format!("photo-{id}.jpg"),
-                None => format!("photo-{photo_id}.jpg"),
+            let (name, row_id) = export_name(&photo_id);
+            let verdict = match verdicts.get(&name) {
+                Some(verdict) => *verdict,
+                None => {
+                    let verdict = write_image(rows, data_root, row_id, &image_dir, &name)?;
+                    verdicts.insert(name.clone(), verdict);
+                    verdict
+                }
             };
-            if !done.contains(&name) {
-                let bytes = read_source(writer, data_root, &photo_id, row_id)?;
-                let rendered = imaging::render_export(&bytes)
-                    .map_err(|e| image_err("写真を書き出せません", &e))?;
-                drop(bytes);
-                imaging::write_atomic(&image_dir.join(&name), &rendered.jpeg)
-                    .map_err(|e| image_err("写真を保存できません", &e))?;
-                done.insert(name.clone());
+            match verdict {
+                None => {
+                    image["src"] = Value::from(format!("images/{name}"));
+                    kept.push(image);
+                }
+                Some(reason) => skipped.push(Skipped { photo_id, reason }),
             }
-            image["src"] = Value::from(format!("images/{name}"));
         }
+        *images = kept;
     }
     exported["status"] = Value::from("reviewed");
     let write = |file: &str, bytes: &[u8]| {
@@ -614,7 +766,29 @@ fn build(
     write("index.html", render_html(&top).as_bytes())?;
     sync_dir(&image_dir);
     sync_dir(staging);
-    Ok(())
+    Ok(skipped)
+}
+
+/// 写真 1 枚を `images/<name>` に書き出す。使えない写真は `Some(理由)`（ファイルは作らない）。画像として読めない
+/// ものも `no_image`。DB・作業領域への書き込みの失敗だけが `Err`。
+fn write_image(
+    rows: &Rows<'_>,
+    data_root: &Path,
+    row_id: Option<i64>,
+    image_dir: &Path,
+    name: &str,
+) -> Result<Option<Skip>, ApiError> {
+    let bytes = match read_source(rows, data_root, row_id)? {
+        Ok(bytes) => bytes,
+        Err(skip) => return Ok(Some(skip)),
+    };
+    let Ok(rendered) = imaging::render_export(&bytes) else {
+        return Ok(Some(Skip::NoImage));
+    };
+    drop(bytes);
+    imaging::write_atomic(&image_dir.join(name), &rendered.jpeg)
+        .map_err(|e| image_err("写真を保存できません", &e))?;
+    Ok(None)
 }
 
 /// 作業領域を `destination` に置き換える。前のものは `backup`（`.<trip_id>.previous`）に寄せ、置き換えに
@@ -682,7 +856,28 @@ pub(crate) fn export_with(
         })
         .sum();
     if truthy_opt(payload.get("dry_run")) {
-        return Ok(json!({"ok": true, "dry_run": true, "trip_id": trip_id, "images": selected}));
+        // 何も書かない。書き出したら飛ばす写真も数える（writer が無ければ読み取り専用の接続で行を引く）
+        let skipped = if selected == 0 {
+            Vec::new()
+        } else {
+            let rows = match writer {
+                Some(writer) => Rows::Writer(writer),
+                None => Rows::ReadOnly(
+                    crate::db::open_read_only(&data_root.join(crate::config::DB_FILE_NAME))
+                        .map_err(|e| {
+                            ApiError::Internal(format!("DB を読み取り用に開けません: {e}"))
+                        })?,
+                ),
+            };
+            dry_run_skipped(&manifest, &rows, data_root)?
+        };
+        let mut response = json!({
+            "ok": true, "dry_run": true, "trip_id": trip_id, "images": selected - skipped.len(),
+        });
+        if !skipped.is_empty() {
+            response["skipped"] = skipped_json(&skipped);
+        }
+        return Ok(response);
     }
     let writer = crate::update::writer_or_unavailable(writer)?;
 
@@ -706,20 +901,35 @@ pub(crate) fn export_with(
         armed: true,
     };
     probe(Step::Staged);
-    build(&staging.path, &manifest, writer, data_root, probe)?;
+    let skipped = build(
+        &staging.path,
+        &manifest,
+        &Rows::Writer(writer),
+        data_root,
+        probe,
+    )?;
     probe(Step::Built);
 
     let destination = export_dir.join(&trip_id);
     let backup = export_dir.join(format!(".{trip_id}.previous"));
     swap(export_dir, &staging.path, &destination, &backup, probe)?;
     staging.disarm();
-    Ok(json!({
+    let mut response = json!({
         "ok": true,
         "trip_id": trip_id,
-        "images": selected,
+        "images": selected - skipped.len(),
         "path": format!("blog_exports/{trip_id}"),
         "url": format!("/blog_exports/{trip_id}/index.html"),
-    }))
+    });
+    if !skipped.is_empty() {
+        // 件数だけをログに出す（写真の id・理由ごとの内訳は応答にだけ載せる）
+        tracing::info!(
+            "[blog] 書き出せない写真 {} 件を飛ばして書き出しました",
+            skipped.len()
+        );
+        response["skipped"] = skipped_json(&skipped);
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

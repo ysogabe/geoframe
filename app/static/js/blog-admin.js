@@ -4,7 +4,7 @@ const state = {tripId:'', plan:null, candidates:null, manifest:null, dirty:false
 
 function busy(on, text){ $('#busy').classList.toggle('hidden', !on); if(text) $('#busy span').textContent=text; }
 let toastTimer;
-function toast(text, error=false){ const n=$('#toast'); n.textContent=text; n.className='toast show'+(error?' error':''); clearTimeout(toastTimer); toastTimer=setTimeout(()=>n.className='toast',3500); }
+function toast(text, error=false, ms=3500){ const n=$('#toast'); n.textContent=text; n.className='toast show'+(error?' error':''); clearTimeout(toastTimer); toastTimer=setTimeout(()=>n.className='toast',ms); }
 async function json(url, options){ const r=await fetch(url, options); const j=await r.json().catch(()=>({})); if(!r.ok||!j.ok) throw new Error(j.error||`HTTP ${r.status}`); return j; }
 function post(url, body){ return json(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}); }
 function stat(value,label){ const n=document.createElement('div'); n.className='stat'; const b=document.createElement('b'); b.textContent=value; const s=document.createElement('span'); s.textContent=label; n.append(b,s); return n; }
@@ -110,11 +110,25 @@ async function save(){
   try{ $('#save').disabled=true; await post('/api/blog/save',{trip_id:state.tripId,manifest:state.manifest}); state.dirty=false; $('#save').textContent='下書き保存'; toast('下書きを保存しました'); }
   catch(e){ toast('保存失敗: '+e.message,true); } finally{$('#save').disabled=false;}
 }
+/* 書き出しの結果の文面。Rust版は、使えない写真を飛ばして残りを書き出し、応答に skipped を付ける
+   （[{photo_id, reason: missing|hidden|no_image}]）。Python版は skipped を返さない（使えない写真があると400で止まる）ので、
+   その場合は今までの文面のまま。 */
+const SKIP_REASON={missing:'写真DBに無い',hidden:'除外',no_image:'表示用の画像なし'};
+function exportSummary(r){
+  const done=`${r.images}枚の画像とHTMLを書き出しました`;
+  const skipped=Array.isArray(r.skipped)?r.skipped:[];
+  if(!skipped.length) return {text:done,warn:false};
+  const counts={};
+  skipped.forEach(s=>{ counts[s.reason]=(counts[s.reason]||0)+1; });
+  const detail=Object.keys(counts).map(k=>`${SKIP_REASON[k]||k} ${counts[k]}枚`).join('・');
+  return {text:`${done}。${skipped.length}枚の写真を書き出せませんでした（${detail}）`,warn:true};
+}
 async function exportBlog(){
   try{
     busy(true,'EXIFを除去して静的ブログを書き出しています…');
     const r=await post('/api/blog/export',{trip_id:state.tripId,manifest:state.manifest});
-    toast(`${r.images}枚の画像とHTMLを書き出しました`);
+    const summary=exportSummary(r);
+    toast(summary.text,summary.warn,summary.warn?12000:3500);
     window.open(r.url,'_blank','noopener');
   }catch(e){ toast('書き出し失敗: '+e.message,true); } finally{busy(false);}
 }

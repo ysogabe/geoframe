@@ -401,13 +401,95 @@ fn no_change() -> Value {
     serde_json::from_str(NO_CHANGE).unwrap()
 }
 
-/// Python と応答が違うケースの、Rust の期待値: (状態コード, `error` の文面)。どれもファイルは変わらない。
-fn known(name: &str) -> (u16, &'static str) {
-    match name {
-        "export_photo_id_beyond_i64" => (400, "写真#99999999999999999999の表示用画像がありません"),
-        "export_photo_id_superscript" => (400, "写真#²の表示用画像がありません"),
-        other => panic!("{other} は known_differences に無い"),
+/// T3.7 ②④（ユーザーの決定。server.md §0・§21）による差の分類。Python は、manifest の写真が使えない書き出しを
+/// 400（または 500）で止めて何も書かない。Rust は、使えない写真だけを飛ばして残りを書き出し、応答の `skipped` で
+/// 知らせる。ケース名 → (飛ばす写真と理由、書き出す枚数)。ここに無い書き出しは Python と完全に一致する。
+type Decided = (&'static [(&'static str, &'static str)], u64);
+
+fn decided(name: &str) -> Option<Decided> {
+    Some(match name {
+        "export_hidden_photo" => (&[("3", "hidden")], 1),
+        "export_photo_without_display" => (&[("5", "no_image")], 1),
+        "export_photo_that_does_not_exist" => (&[("99999", "missing")], 1),
+        "export_hidden_flag_is_checked_for_every_photo" => (&[("15", "hidden")], 1),
+        "export_display_is_an_empty_string" => (&[("17", "no_image")], 0),
+        "export_display_file_is_missing" => (&[("18", "no_image")], 0),
+        "export_display_is_absolute" => (&[("19", "no_image")], 0),
+        "export_display_goes_up_out_of_the_data_dir" => (&[("20", "no_image")], 0),
+        "export_display_is_a_symlink_to_outside" => (&[("21", "no_image")], 0),
+        "export_display_is_a_directory" => (&[("22", "no_image")], 0),
+        "export_display_is_not_an_image" => (&[("23", "no_image")], 1),
+        "export_photo_id_beyond_i64" => (&[("99999999999999999999", "missing")], 0),
+        "export_photo_id_superscript" => (&[("²", "missing")], 0),
+        // dry_run も使えない写真を数える（Python は写真を見ずに参照の数を返す）
+        "export_dry_run_does_not_check_photos" => (&[("99999", "missing"), ("3", "hidden")], 0),
+        _ => return None,
+    })
+}
+
+/// 決定による差のケースは、Python と違って書き出しを作る。後続のケースの期待（ファイルの増減）が Python と同じ前提に
+/// なるよう、前の書き出しをデータ置き場の外へ退避し（[`hold_export`]）、ケースのあとで戻す（[`restore_export`]）。
+fn hold_export(server: &Server) -> Option<PathBuf> {
+    let dir = server.dir.path().join("blog_exports/sample-trip-a");
+    let held = server.dir.path().with_extension("held-export");
+    if !dir.exists() {
+        return None;
     }
+    let _ = fs::remove_dir_all(&held);
+    fs::rename(&dir, &held).unwrap();
+    Some(held)
+}
+
+fn restore_export(server: &Server, held: Option<PathBuf>) {
+    let dir = server.dir.path().join("blog_exports/sample-trip-a");
+    let _ = fs::remove_dir_all(&dir);
+    if let Some(held) = held {
+        fs::rename(held, &dir).unwrap();
+    }
+}
+
+/// 要求の manifest の写真の id（章の順、画像の順）。
+fn photo_ids_of(request: &Value) -> Vec<String> {
+    request["manifest"]["chapters"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|chapter| chapter["images"].as_array().unwrap())
+        .map(|image| image["photo_id"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// 飛ばした写真が、書き出し一式のどこにも残っていないこと（壊れたリンクを残さない）と、残した写真の画像が
+/// あることを確かめる。`kept` は書き出した写真の id。
+fn assert_export_has_no_trace_of(server: &Server, skipped: &[(&str, &str)], kept: &[&str]) {
+    let dir = server.dir.path().join("blog_exports/sample-trip-a");
+    let texts: Vec<String> = ["index.html", "index.md", "blog-manifest.json"]
+        .iter()
+        .map(|f| fs::read_to_string(dir.join(f)).unwrap())
+        .collect();
+    for (photo_id, _) in skipped {
+        let file = format!("photo-{photo_id}.jpg");
+        assert!(!dir.join("images").join(&file).exists(), "{file} がある");
+        for (text, label) in texts.iter().zip(["html", "md", "manifest"]) {
+            assert!(!text.contains(&file), "{label} に {file} が残っている");
+            assert!(
+                !text.contains(&format!("\"photo_id\": \"{photo_id}\"")),
+                "{label} に写真 {photo_id} の参照が残っている"
+            );
+        }
+    }
+    for photo_id in kept {
+        let file = format!("photo-{photo_id}.jpg");
+        assert!(dir.join("images").join(&file).is_file(), "{file} が無い");
+        assert!(
+            texts.iter().all(|t| t.contains(&file)),
+            "{file} の参照が無い"
+        );
+    }
+    // 画像の要素の数と `images/` のファイルの数が一致する（参照だけ・ファイルだけが残らない）
+    let files = fs::read_dir(dir.join("images")).unwrap().count();
+    assert_eq!(texts[0].matches("<img ").count(), files);
+    assert_eq!(texts[1].matches("](images/").count(), files);
 }
 
 #[tokio::test]
@@ -417,15 +499,13 @@ async fn every_request_matches_python_status_body_and_files() {
     let cases = fixture["cases"].as_array().unwrap();
     // 取りこぼしが無いよう規模を固定する（ケースを足したら更新する）
     assert_eq!(cases.len(), 93);
-    let known_names: Vec<&str> = fixture["known_differences"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .map(String::as_str)
-        .collect();
+    // Python の `known_differences`（i64 を超える id・上付き数字の id）は、どちらも使えない写真の扱いに含まれる
+    for name in fixture["known_differences"].as_object().unwrap().keys() {
+        assert!(decided(name).is_some(), "{name}");
+    }
     let mut server = Server::start(true).await;
     server.apply_setup(&fixture["initial"]);
-    let mut seen_known = 0;
+    let mut seen_decided = 0;
     for case in cases {
         let name = case["name"].as_str().unwrap();
         server.apply_setup(&case["setup"]);
@@ -446,6 +526,7 @@ async fn every_request_matches_python_status_body_and_files() {
                 .map(|i| u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).unwrap())
                 .collect()
         };
+        let held = decided(name).map(|_| hold_export(&server));
         let files_before = server.listing();
         let response = post_raw(
             server.addr,
@@ -456,18 +537,52 @@ async fn every_request_matches_python_status_body_and_files() {
         .await;
         let files = files_diff(&files_before, &server.listing());
 
-        if known_names.contains(&name) {
-            seen_known += 1;
-            let (status, error) = known(name);
-            assert_eq!(response.status, status, "{name}");
-            assert_eq!(response.json()["error"], error, "{name}");
-            assert_eq!(files, no_change(), "{name}: ファイルは変わらない");
-            // Python は違う（だから known）。差が消えたら、この一覧から外す
-            let py_same = case["status"].as_u64().unwrap() as u16 == response.status
-                && case["body"] == response.json();
+        if let Some((skipped, images)) = decided(name) {
+            seen_decided += 1;
+            let dry_run = name.contains("dry_run");
+            let sent: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(
+                response.status,
+                200,
+                "{name}: {}",
+                String::from_utf8_lossy(&response.body)
+            );
+            let reply = response.json();
+            assert_eq!(reply["ok"], true, "{name}");
+            assert_eq!(reply["images"], images, "{name}: 書き出した枚数");
+            let want: Vec<Value> = skipped
+                .iter()
+                .map(|(photo_id, reason)| json!({"photo_id": photo_id, "reason": reason}))
+                .collect();
+            assert_eq!(reply["skipped"], Value::Array(want), "{name}: skipped");
+            // 応答の最後のキーが `skipped`。ファイル名・座標・地名は入らない
+            assert_eq!(
+                reply.as_object().unwrap().keys().next_back().unwrap(),
+                "skipped"
+            );
+            assert!(!response.text().contains(".jpg"), "{name}");
+            // Python の応答とは、書き出した枚数と `skipped` の有無だけが違う
+            let mut rust_body = reply.clone();
+            rust_body.as_object_mut().unwrap().remove("skipped");
+            if dry_run {
+                assert_eq!(files, no_change(), "{name}: dry_run は何も書かない");
+                assert_eq!(rust_body["dry_run"], true);
+            } else {
+                assert_eq!(reply["path"], "blog_exports/sample-trip-a", "{name}");
+                let kept: Vec<String> = photo_ids_of(&sent)
+                    .into_iter()
+                    .filter(|id| !skipped.iter().any(|(s, _)| s == id))
+                    .collect();
+                let kept: Vec<&str> = kept.iter().map(String::as_str).collect();
+                assert_eq!(kept.len() as u64, images, "{name}");
+                assert_export_has_no_trace_of(&server, skipped, &kept);
+            }
+            restore_export(&server, held.flatten());
+            // Python は 4xx/5xx で止めるか（dry_run なら参照の数を返すか）、ここは決定による差
             assert!(
-                !py_same,
-                "{name} は Python と同じになった。known_differences から外す"
+                case["status"].as_u64().unwrap() as u16 != 200
+                    || case["body"]["images"] != reply["images"],
+                "{name} は Python と同じになった。decided から外す"
             );
             continue;
         }
@@ -485,7 +600,7 @@ async fn every_request_matches_python_status_body_and_files() {
         assert_eq!(files, case["files"], "{name}: ファイルの増減");
         assert!(!response.headers.contains("access-control-"), "{name}");
     }
-    assert_eq!(seen_known, known_names.len());
+    assert_eq!(seen_decided, 14);
     // どのケースも `.part` や作業領域（ドット始まり）を残さない
     let leftovers: Vec<String> = server
         .listing()
@@ -804,28 +919,31 @@ async fn oversized_sources_are_refused_before_decoding() {
              UPDATE photos SET display='derivatives/huge-file.jpg' WHERE id=26;",
         )
         .unwrap();
-    let after_setup = server.listing();
     for id in ["25", "26"] {
         let body = json!({"trip_id": "sample-trip-a", "manifest": {
             "trip_id": "sample-trip-a", "status": "draft",
             "chapters": [{"id": "d1", "images": [{"photo_id": "1"}, {"photo_id": id}]}]}});
         let response = server.post(EXPORT, body.to_string().as_bytes()).await;
-        assert_eq!(response.status, 500, "{id}");
-        assert_eq!(response.json()["error"], "内部エラーが発生しました");
-        // 書き出しの置き場（空の`blog_exports/`）のほかは何も残さない
-        let mut now = server.listing();
-        now.remove("blog_exports");
-        assert_eq!(now, after_setup, "{id}: 何も残さない");
+        // 寸法・大きさの上限を超える写真は、デコードの前に断り（大きな確保をしない）、その写真だけ飛ばして残りを
+        // 書き出す（T3.7。Python は 500 で止める）
+        assert_eq!(response.status, 200, "{id}");
+        let reply = response.json();
+        assert_eq!(reply["images"], 1, "{id}");
+        assert_eq!(
+            reply["skipped"],
+            json!([{"photo_id": id, "reason": "no_image"}]),
+            "{id}"
+        );
+        assert_export_has_no_trace_of(&server, &[(id, "no_image")], &["1"]);
+        // 作業領域は残らない
+        let leftovers: Vec<String> = server
+            .listing()
+            .into_keys()
+            .filter(|name| name.starts_with("blog_exports/.") || name.ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty(), "{id}: {leftovers:?}");
     }
-    assert!(after_setup.len() > before.len());
-    assert!(
-        !server
-            .dir
-            .path()
-            .join("blog_exports")
-            .join("sample-trip-a")
-            .exists()
-    );
+    assert!(server.listing().len() > before.len());
 }
 
 /// 回転・取得と同じロック（`imaging::lock_derivatives`）を握る別スレッド。`release` で手放す。

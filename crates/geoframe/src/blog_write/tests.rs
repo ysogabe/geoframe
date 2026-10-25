@@ -55,6 +55,7 @@ impl Fixture {
             .unwrap();
         }
         fs::create_dir_all(root.join("derivatives")).unwrap();
+        fs::write(root.join("derivatives/bad.jpg"), b"not an image").unwrap();
         for (id, size) in [(1u16, (320, 200)), (2, (200, 320))] {
             fs::write(
                 root.join(format!("derivatives/p{id}.jpg")),
@@ -69,7 +70,9 @@ impl Fixture {
                 c.execute_batch(
                     "CREATE TABLE photos (id INTEGER PRIMARY KEY, display TEXT, hidden INTEGER);
                      INSERT INTO photos VALUES (1, 'derivatives/p1.jpg', 0), (2, 'derivatives/p2.jpg', 0),
-                                               (3, 'derivatives/p1.jpg', 1);",
+                                               (3, 'derivatives/p1.jpg', 1), (4, NULL, 0),
+                                               (5, 'derivatives/bad.jpg', 0), (6, '', 0),
+                                               (7, 'derivatives/gone.jpg', 0);",
                 )
             })
             .unwrap();
@@ -329,9 +332,15 @@ fn a_previous_export_is_restored_when_the_destination_is_missing_even_if_the_exp
     let backup = export_dir.join(format!(".{TRIP}.previous"));
     fs::create_dir_all(&backup).unwrap();
     fs::write(backup.join("index.html"), "前の書き出し").unwrap();
-    // 隠れた写真を含むので、この書き出しは 400 で失敗する
-    let result = fixture.run(&request(&["1", "3"]), &go);
-    assert!(matches!(result, Err(ApiError::BadRequest(_))));
+    // 1 枚目の画像の前に停止の合図が来るので、この書き出しは失敗する
+    let result = fixture.run(&request(&["1", "2"]), &|step| {
+        if step == Step::Image(0) {
+            Flow::Stop
+        } else {
+            Flow::Go
+        }
+    });
+    assert!(matches!(result, Err(ApiError::Internal(_))));
     assert_eq!(fixture.names(&export_dir), [TRIP]);
     assert_eq!(
         fs::read_to_string(export_dir.join(TRIP).join("index.html")).unwrap(),
@@ -546,31 +555,232 @@ fn a_failed_save_keeps_the_existing_draft_and_leaves_no_part_file() {
 fn errors_and_logs_never_carry_names_ids_or_paths() {
     let fixture = Fixture::new("blog-write-no-leak");
     fs::write(fixture.root().join("derivatives/p1.jpg"), b"not an image").unwrap();
+    // 画像として読めない写真は飛ばし（500 にしない）、ログには件数だけを出す
+    let mut reply = Value::Null;
     let logs = capture::logs_of(|| {
-        let ApiError::Internal(detail) = error_of(fixture.run(&request(&["1"]), &go)) else {
-            panic!("500 のはず")
-        };
-        for secret in [
-            TRIP,
-            "p1.jpg",
-            "derivatives",
-            "blog_exports",
-            "写真#1",
-            "本文",
-        ] {
-            assert!(
-                !detail.contains(secret),
-                "{secret} が詳細に出ている: {detail}"
-            );
-        }
+        reply = fixture.run(&request(&["1", "3", "99"]), &go).unwrap();
     });
-    assert_eq!(logs, "");
-    // 400 の文面は Python と同じで、写真の id だけを含む
-    let ApiError::BadRequest(message) = error_of(fixture.run(&request(&["3"]), &go)) else {
-        panic!("400 のはず")
+    assert_eq!(
+        reply["skipped"],
+        json!([
+            {"photo_id": "1", "reason": "no_image"},
+            {"photo_id": "3", "reason": "hidden"},
+            {"photo_id": "99", "reason": "missing"},
+        ])
+    );
+    for secret in [
+        TRIP,
+        "p1.jpg",
+        "derivatives",
+        "blog_exports",
+        "写真#",
+        "本文",
+        "photo_id",
+        "hidden",
+        "missing",
+        "no_image",
+    ] {
+        assert!(!logs.contains(secret), "{secret} がログに出ている: {logs}");
+    }
+    assert!(logs.contains("3 件"), "{logs}");
+    // 応答の `skipped` はファイル名・パスを持たない
+    assert!(!reply.to_string().contains(".jpg\""), "{reply}");
+}
+
+/// 書き出しの失敗（500）の詳細は、定型の語だけでファイル名・id・パスを含まない（飛ばした写真ではなく、作業領域に
+/// 書けないなどの失敗）。
+#[test]
+fn an_internal_error_still_carries_no_names_ids_or_paths() {
+    let fixture = Fixture::new("blog-write-no-leak-500");
+    // 書き出しの置き場がリンクだと使えない
+    let outside = fixture.root().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, fixture.export_dir()).unwrap();
+    let ApiError::Internal(detail) = error_of(fixture.run(&request(&["1"]), &go)) else {
+        panic!("500 のはず")
     };
-    assert_eq!(message, "写真#3の表示用画像がありません");
-    assert_eq!(fixture.names(&fixture.export_dir()), Vec::<String>::new());
+    for secret in [TRIP, "p1.jpg", "derivatives", "写真#1", "本文", "outside"] {
+        assert!(
+            !detail.contains(secret),
+            "{secret} が詳細に出ている: {detail}"
+        );
+    }
+}
+
+fn read_export(fixture: &Fixture, file: &str) -> String {
+    fs::read_to_string(fixture.export_dir().join(TRIP).join(file)).unwrap()
+}
+
+/// T3.7 ②④: 使えない写真だけを飛ばして残りを書き出す。飛ばした写真の画像は、manifest・Markdown・HTML のどこにも
+/// 残らず、`images/` にもファイルを作らない。`images` は書き出した枚数。
+#[test]
+fn unusable_photos_are_skipped_and_everything_else_is_exported() {
+    let fixture = Fixture::new("blog-write-skip");
+    // 1・2 は使える。3＝除外、4＝display が NULL、5＝画像として読めない、6＝display が空、7＝ファイルが無い、9＝行が無い
+    let reply = fixture
+        .run(&request(&["1", "3", "4", "2", "5", "6", "7", "9"]), &go)
+        .unwrap();
+    assert_eq!(reply["images"], 2);
+    assert_eq!(
+        reply["skipped"],
+        json!([
+            {"photo_id": "3", "reason": "hidden"},
+            {"photo_id": "4", "reason": "no_image"},
+            {"photo_id": "5", "reason": "no_image"},
+            {"photo_id": "6", "reason": "no_image"},
+            {"photo_id": "7", "reason": "no_image"},
+            {"photo_id": "9", "reason": "missing"},
+        ])
+    );
+    // `skipped` は応答の最後のキー
+    assert_eq!(
+        reply.as_object().unwrap().keys().next_back().unwrap(),
+        "skipped"
+    );
+    let dir = fixture.export_dir().join(TRIP);
+    assert_eq!(
+        fixture.names(&dir.join("images")),
+        ["photo-1.jpg", "photo-2.jpg"]
+    );
+    let manifest: Value =
+        serde_json::from_str(&read_export(&fixture, "blog-manifest.json")).unwrap();
+    let kept: Vec<&str> = manifest["chapters"][0]["images"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["photo_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(kept, ["1", "2"]);
+    for file in ["index.html", "index.md", "blog-manifest.json"] {
+        let text = read_export(&fixture, file);
+        for id in [3, 4, 5, 6, 7, 9] {
+            assert!(!text.contains(&format!("photo-{id}.jpg")), "{file}: {id}");
+        }
+    }
+    let html = read_export(&fixture, "index.html");
+    assert_eq!(html.matches("<img ").count(), 2);
+    assert_eq!(read_export(&fixture, "index.md").matches("![").count(), 2);
+    // 本文はそのまま
+    assert!(html.contains("<p>本文</p>"));
+}
+
+#[test]
+fn a_chapter_whose_photos_are_all_skipped_exports_the_text_only() {
+    let fixture = Fixture::new("blog-write-skip-all");
+    let reply = fixture.run(&request(&["3", "9", "003"]), &go).unwrap();
+    // 同じ写真への 2 つの参照（`3` と `003`）は、参照ごとに 1 件
+    assert_eq!(reply["images"], 0);
+    assert_eq!(
+        reply["skipped"],
+        json!([
+            {"photo_id": "3", "reason": "hidden"},
+            {"photo_id": "9", "reason": "missing"},
+            {"photo_id": "003", "reason": "hidden"},
+        ])
+    );
+    let dir = fixture.export_dir().join(TRIP);
+    assert_eq!(
+        fixture.names(&dir),
+        ["blog-manifest.json", "images", "index.html", "index.md"]
+    );
+    assert_eq!(fixture.names(&dir.join("images")), Vec::<String>::new());
+    let html = read_export(&fixture, "index.html");
+    assert!(!html.contains("<img "), "{html}");
+    assert!(!html.contains("<figure"), "{html}");
+    assert!(html.contains("<p>本文</p>"));
+    assert!(!read_export(&fixture, "index.md").contains("!["));
+    // 作業領域は残らない
+    assert_eq!(fixture.names(&fixture.export_dir()), [TRIP]);
+}
+
+/// 何も飛ばさない書き出しは、応答に `skipped` のキーを出さない（Python と同じ応答）。同じ写真の 2 回目以降は
+/// 書き出し済みとして扱う。
+#[test]
+fn an_export_without_skips_has_no_skipped_key() {
+    let fixture = Fixture::new("blog-write-no-skip");
+    let reply = fixture.run(&request(&["1", "2", "01"]), &go).unwrap();
+    assert_eq!(
+        reply,
+        json!({
+            "ok": true, "trip_id": TRIP, "images": 3,
+            "path": format!("blog_exports/{TRIP}"),
+            "url": format!("/blog_exports/{TRIP}/index.html"),
+        })
+    );
+}
+
+/// `dry_run` も使えない写真を数える。画像のデコードまではしないので、画像として読めない写真（`5`）は
+/// `dry_run` では数えず、実際の書き出しで `no_image` になる。
+#[test]
+fn dry_run_counts_what_a_real_export_would_skip_except_undecodable_images() {
+    let fixture = Fixture::new("blog-write-dry");
+    let mut payload = request(&["1", "3", "4", "5", "6", "7", "9", "2"]);
+    payload["dry_run"] = json!(true);
+    let reply = fixture.run(&payload, &go).unwrap();
+    assert_eq!(reply["images"], 3);
+    assert_eq!(
+        reply["skipped"],
+        json!([
+            {"photo_id": "3", "reason": "hidden"},
+            {"photo_id": "4", "reason": "no_image"},
+            {"photo_id": "6", "reason": "no_image"},
+            {"photo_id": "7", "reason": "no_image"},
+            {"photo_id": "9", "reason": "missing"},
+        ])
+    );
+    assert_eq!(
+        reply.as_object().unwrap().keys().next_back().unwrap(),
+        "skipped"
+    );
+    // 何も書かない
+    assert!(!fixture.export_dir().exists());
+    // 実際の書き出しでは、画像として読めない 5 も飛ぶ
+    let real = fixture
+        .run(&request(&["1", "3", "4", "5", "6", "7", "9", "2"]), &go)
+        .unwrap();
+    assert_eq!(real["images"], 2);
+    assert_eq!(real["skipped"].as_array().unwrap().len(), 6);
+    // 飛ぶ写真が無ければ `skipped` は付かない
+    let mut clean = request(&["1", "2"]);
+    clean["dry_run"] = json!(true);
+    assert_eq!(
+        fixture.run(&clean, &go).unwrap(),
+        json!({"ok": true, "dry_run": true, "trip_id": TRIP, "images": 2})
+    );
+}
+
+/// writer が無い（取り込み無効）ときの `dry_run` は、読み取り専用の接続で行を引く。写真が 1 枚も無ければ DB を開かない。
+#[test]
+fn dry_run_without_a_writer_reads_the_rows_read_only() {
+    let fixture = Fixture::new("blog-write-dry-ro");
+    let mut payload = request(&["1", "3"]);
+    payload["dry_run"] = json!(true);
+    let object = payload.as_object().unwrap();
+    let reply = export(object, &fixture.env, &fixture.root(), None).unwrap();
+    assert_eq!(reply["images"], 1);
+    assert_eq!(
+        reply["skipped"],
+        json!([{"photo_id": "3", "reason": "hidden"}])
+    );
+    // DB が無くても、画像が 0 枚なら答える
+    let empty = tempdir_without_db(&fixture);
+    let mut none = request(&[]);
+    none["dry_run"] = json!(true);
+    assert_eq!(
+        export(none.as_object().unwrap(), &fixture.env, &empty, None).unwrap()["images"],
+        0
+    );
+    // 画像があるのに DB が開けないなら 500（黙って 0 件にしない）
+    assert!(matches!(
+        export(object, &fixture.env, &empty, None),
+        Err(ApiError::Internal(_))
+    ));
+}
+
+fn tempdir_without_db(fixture: &Fixture) -> std::path::PathBuf {
+    let dir = fixture.root().join("no-db");
+    fs::create_dir_all(&dir).unwrap();
+    dir
 }
 
 #[test]
