@@ -20,7 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::stub::{Reply, SharedClock, StubUpstreams, TestClock, Upstream};
 use super::*;
 use crate::cache::{Cache, SaveOutcome};
-use crate::config::{Config, Overrides};
+use crate::config::{Config, DEFAULT_TILE_UA, Overrides};
 use crate::db::Catalog;
 use crate::server::{AppState, router};
 use crate::testutil::{TempDir, capture, synthetic_catalog};
@@ -695,7 +695,7 @@ async fn a_real_clock_keeps_the_interval_between_received_requests() {
         });
     }
     let interval = Duration::from_millis(300);
-    let mut geocoder = Geocoder::production();
+    let mut geocoder = Geocoder::production(DEFAULT_TILE_UA);
     geocoder.endpoints = Endpoints::stub(&stub.base_url());
     geocoder.min_interval = interval;
     let cache = Cache::memory_only();
@@ -842,9 +842,17 @@ fn failure_logs_never_contain_the_query_titles_or_coordinates() {
         Endpoints::stub(&stub.base_url()),
         Box::new(SharedClock(Arc::clone(&clock))),
         MAX_IN_FLIGHT,
-    );
+    )
+    .with_user_agent("GeoFrame-Test/1 (secret-contact.test)");
     let cache = Cache::memory_only();
-    let secrets = ["秘密の検索語", "秘密の地名", "31.4159", "27.1828"];
+    let secrets = [
+        "秘密の検索語",
+        "秘密の地名",
+        "31.4159",
+        "27.1828",
+        "GeoFrame-Test",
+        "secret-contact",
+    ];
     let poisoned = r#"[{"geometry":{"coordinates":[27.1828,31.4159]},"properties":{"title":"秘密の地名"}},"text"]"#;
     let logs = capture::logs_of(|| {
         for (gsi, osm) in [
@@ -888,6 +896,74 @@ fn failure_logs_never_contain_the_query_titles_or_coordinates() {
     assert!(
         !logs.contains("127.0.0.1") && !logs.contains("http://"),
         "{logs}"
+    );
+}
+
+// ---------------------------------------------------------------- User-Agent（`GEOFRAME_TILE_UA`と共用）
+
+/// 本番の組み立て（`AppState::new`）は、設定の `GEOFRAME_TILE_UA` を地名検索にも渡す。未設定なら地図タイルと同じ既定。
+#[test]
+fn the_app_state_hands_the_configured_tile_user_agent_to_the_geocoder() {
+    let dir = TempDir::new("geocode-ua");
+    let (path, _writer) = synthetic_catalog(dir.path(), 0);
+    let state_with = |env: &'static [(&str, &str)]| {
+        let config = Config::load(
+            |k| {
+                env.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| (*v).to_string())
+            },
+            &Overrides::default(),
+        )
+        .unwrap();
+        AppState::new(Arc::new(config), Catalog::open(&path).unwrap())
+    };
+    let state = state_with(&[("GEOFRAME_TILE_UA", " GeoFrame-Test/1 (synthetic contact) ")]);
+    assert_eq!(
+        state.geocoder.user_agent(),
+        "GeoFrame-Test/1 (synthetic contact)"
+    );
+    assert_eq!(state_with(&[]).geocoder.user_agent(), DEFAULT_TILE_UA);
+    assert_eq!(
+        state_with(&[("GEOFRAME_TILE_UA", "")])
+            .geocoder
+            .user_agent(),
+        DEFAULT_TILE_UA
+    );
+}
+
+/// 地理院にも Nominatim にも、設定した User-Agent が届く。通信先を替える入口は既定（`GeoFrame/0.2`）のまま。
+#[test]
+fn the_configured_user_agent_reaches_both_upstreams() {
+    let ua = "GeoFrame-Test/1 (synthetic contact)";
+    let clock = TestClock::new(START);
+    let stub = StubUpstreams::start(Arc::clone(&clock));
+    let parts = || {
+        Geocoder::with_parts(
+            Endpoints::stub(&stub.base_url()),
+            Box::new(SharedClock(Arc::clone(&clock))),
+            MAX_IN_FLIGHT,
+        )
+    };
+    let search = |geocoder: &Geocoder| {
+        stub.set(Upstream::Gsi, Some(Reply::json("[]")));
+        stub.set(Upstream::Osm, Some(Reply::json("[]")));
+        geocoder.search(&Cache::memory_only(), "ab");
+        stub.take_seen()
+            .into_iter()
+            .map(|s| (s.upstream, s.user_agent))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        search(&parts()),
+        [
+            (Upstream::Gsi, USER_AGENT.into()),
+            (Upstream::Osm, USER_AGENT.into())
+        ]
+    );
+    assert_eq!(
+        search(&parts().with_user_agent(ua)),
+        [(Upstream::Gsi, ua.into()), (Upstream::Osm, ua.into())]
     );
 }
 

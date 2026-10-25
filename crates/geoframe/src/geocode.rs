@@ -20,7 +20,7 @@
 //! - **Nominatim は全体で 1 秒 1 件**: ロックを持ったまま、**前の通信が終わった時刻**から 1 秒たつまで待ってから
 //!   通信する（失敗でも終わった時刻を記録する）。キャッシュに当たれば待たない。
 //! - 通信の失敗（接続・時間切れ・HTTP のエラー・JSON でない・UTF-8 でない）は空にして握りつぶす。
-//! - User-Agent は現行の `GeoFrame/0.2`、1 要求 8 秒。
+//! - 1 要求 8 秒。User-Agent は地図タイルと同じ設定値（`GEOFRAME_TILE_UA`。連絡先入りにできる。現行は固定の `GeoFrame/0.2`）。
 //!
 //! # 現行との違い
 //!
@@ -74,7 +74,8 @@ const TIMEOUT: Duration = Duration::from_secs(8);
 const MAX_BODY_BYTES: u64 = 1 << 20;
 /// `geocode_osm:` キャッシュのキーの接頭辞。
 const CACHE_PREFIX: &str = "geocode_osm:";
-/// 現行の `http_json` の User-Agent。
+/// 現行の `http_json` の User-Agent。本番は設定の `GEOFRAME_TILE_UA` を使う（[`Geocoder::production`]）ので、これは
+/// 通信先を差し替える入口（[`Geocoder::with_endpoints`] など）の既定で、現行の出力のフィクスチャと突き合わせる値。
 const USER_AGENT: &str = "GeoFrame/0.2";
 
 /// 地理院の地名検索（`config.py` の `GSI_GEOCODE`）。`{q}` を埋めて使う。
@@ -182,6 +183,8 @@ pub struct Geocoder {
     endpoints: Endpoints,
     agent: ureq::Agent,
     clock: Box<dyn Clock>,
+    /// 上流へ送る User-Agent。連絡先が入りうるので、`Debug`・ログには載せない（この型は `Debug` を持たない）。
+    user_agent: String,
     min_interval: Duration,
     /// `geocode_osm:` のキャッシュの件数の上限（本番は [`CACHE_MAX_ENTRIES`]。試験は小さくする）。
     cache_cap: usize,
@@ -191,14 +194,9 @@ pub struct Geocoder {
     slots: Arc<Semaphore>,
 }
 
-impl Default for Geocoder {
-    fn default() -> Self {
-        Self::production()
-    }
-}
-
 impl Geocoder {
-    pub fn production() -> Self {
+    /// 本番の通信先・実時計。`user_agent` は設定の `GEOFRAME_TILE_UA`（地図タイルと共用。検証済みの値を渡す）。
+    pub fn production(user_agent: &str) -> Self {
         Self::with_parts(
             Endpoints::production(),
             Box::new(SystemClock {
@@ -206,6 +204,19 @@ impl Geocoder {
             }),
             MAX_IN_FLIGHT,
         )
+        .with_user_agent(user_agent)
+    }
+
+    /// 上流へ送る User-Agent を替える。
+    pub fn with_user_agent(mut self, user_agent: &str) -> Self {
+        self.user_agent = user_agent.to_string();
+        self
+    }
+
+    /// 試験用: 送る User-Agent を確かめる（本番のコードからは読まない）。
+    #[cfg(test)]
+    pub(crate) fn user_agent(&self) -> &str {
+        &self.user_agent
     }
 
     /// 通信先だけを差し替える（実時計・既定の同時数。結合テスト用。[`Endpoints`] を参照）。
@@ -228,6 +239,7 @@ impl Geocoder {
             endpoints,
             agent: net::agent(),
             clock,
+            user_agent: USER_AGENT.to_string(),
             min_interval: NOMINATIM_MIN_INTERVAL,
             cache_cap: CACHE_MAX_ENTRIES,
             nominatim_last: Mutex::new(None),
@@ -336,7 +348,7 @@ impl Geocoder {
         let mut response = self
             .agent
             .get(url)
-            .header("User-Agent", USER_AGENT)
+            .header("User-Agent", self.user_agent.as_str())
             .config()
             .timeout_global(Some(TIMEOUT))
             .build()

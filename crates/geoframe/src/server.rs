@@ -100,6 +100,7 @@ impl AppState {
         let admin = Arc::new(AdminContext::new(&config, &data_root));
         let tiles = Arc::new(TileProxy::production(&config, &data_root));
         let blog = Arc::new(BlogEnv::new(config.blog_plans_dir.as_deref(), &data_root));
+        let geocoder = Arc::new(Geocoder::production(&config.tile_ua));
         Self {
             config,
             catalog,
@@ -108,7 +109,7 @@ impl AppState {
             admin,
             disk_cache: Arc::new(Mutex::new(None)),
             cache: Arc::new(Cache::memory_only()),
-            geocoder: Arc::new(Geocoder::production()),
+            geocoder,
             tiles,
             blog,
             mass_delete: None,
