@@ -70,6 +70,16 @@ static STOPPING: AtomicBool = AtomicBool::new(false);
 /// 書き出しは**プロセスで 1 本だけ**（同じ作業領域・`.previous` を奪い合わないため）。
 static EXPORT_LOCK: Mutex<()> = Mutex::new(());
 
+/// 試験用の観測: 書き出し（E16）の本処理が今走っているか（ロックを持っているか）。結合試験が、書き出しの処理が
+/// 終わったことを、実時間を待たずに合図で確かめるのに使う。本番の処理は使わない。
+#[doc(hidden)]
+pub fn export_running() -> bool {
+    matches!(
+        EXPORT_LOCK.try_lock(),
+        Err(std::sync::TryLockError::WouldBlock)
+    )
+}
+
 /// 停止の合図を出す。実行中の書き出しは、次の画像の前に作業領域を片付けて止まる（前の書き出しは残る）。
 pub fn request_stop() {
     STOPPING.store(true, Ordering::SeqCst);
@@ -315,16 +325,28 @@ fn previous_trip_id(name: &str) -> Option<&str> {
     blog::is_valid_trip_id(id).then_some(id)
 }
 
+/// 掃除してよいディレクトリか。リンクを辿らずに見て、通常のディレクトリだけ true。無ければ false（黙って飛ばす）。
+/// リンク・ファイルなど通常のディレクトリでないものは、飛ばした旨を定型の文でログに出す（パスは出さない）。
+fn is_sweepable_dir(dir: &Path) -> bool {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        _ => {
+            tracing::warn!(
+                "[blog] 書き出し・下書きの置き場の一部がリンクなどで通常のディレクトリではないので、掃除を飛ばしました"
+            );
+            false
+        }
+    }
+}
+
 /// 置き場の残骸の片付け。`export_dir` が通常のディレクトリのときだけ。
 /// - 自分の形の作業領域（通常のディレクトリ）を消す。
 /// - `.<trip_id>.previous` は、`<trip_id>/` が無ければ戻し（置き換えの途中で止まった）、あれば消す。
 ///
 /// 戻り値は（消した作業領域の数、戻した・消した `.previous` の数）。名前はログに出さない。
 fn sweep_exports(export_dir: &Path) -> (usize, usize) {
-    let Ok(meta) = fs::symlink_metadata(export_dir) else {
-        return (0, 0);
-    };
-    if !meta.is_dir() {
+    if !is_sweepable_dir(export_dir) {
         return (0, 0);
     }
     let Ok(read) = fs::read_dir(export_dir) else {
@@ -356,10 +378,17 @@ fn sweep_exports(export_dir: &Path) -> (usize, usize) {
 }
 
 /// 下書きの書きかけ（`<trip_id>.json.<pid>.<16 桁>.part`）を消す。戻り値は消した数。
-fn sweep_draft_parts(draft_dir: &Path) -> usize {
-    let Ok(read) = fs::read_dir(draft_dir) else {
-        return 0;
-    };
+///
+/// `read_dir` はリンクを辿るので、`travel_blog/` か `drafts/` が外へのリンクだと、列挙の前に確かめないと
+/// リンク先の別の場所の通常ファイルを消してしまう。**両方を** `symlink_metadata` で（リンクを辿らずに）見て、
+/// 通常のディレクトリでなければ何もしない（`None`。無いときも `None`＝消すものが無い）。
+fn sweep_draft_parts(data_root: &Path) -> Option<usize> {
+    let travel_blog = data_root.join("travel_blog");
+    let draft_dir = travel_blog.join("drafts");
+    if !is_sweepable_dir(&travel_blog) || !is_sweepable_dir(&draft_dir) {
+        return None;
+    }
+    let read = fs::read_dir(&draft_dir).ok()?;
     let mut removed = 0;
     for entry in read.flatten() {
         let Ok(name) = entry.file_name().into_string() else {
@@ -376,17 +405,19 @@ fn sweep_draft_parts(draft_dir: &Path) -> usize {
             removed += 1;
         }
     }
-    removed
+    Some(removed)
 }
 
 /// 起動時の掃除（取り込みが有効なとき。`.ingest.lock` を取ったあと）。強制終了・電源断で残った書き出しの作業領域と
 /// 下書きの書きかけを片付け、置き換えの途中で止まった書き出しを元に戻す。件数だけをログに出す。
+/// 掃除の対象の親（`blog_exports/`・`travel_blog/`・`drafts/`）がリンクなどで通常のディレクトリでなければ、
+/// その中は掃除しない（リンク先の別の場所のファイルを消さないため）。
 pub fn sweep_leftovers(data_root: &Path) {
     let _export = EXPORT_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (staged, previous) = sweep_exports(&data_root.join("blog_exports"));
-    let parts = sweep_draft_parts(&data_root.join("travel_blog").join("drafts"));
+    let parts = sweep_draft_parts(data_root).unwrap_or(0);
     if staged + previous + parts > 0 {
         tracing::info!(
             "[blog] 書き出しの作業領域{staged}件・置き換え途中の書き出し{previous}件・下書きの書きかけ{parts}件を片付けました"

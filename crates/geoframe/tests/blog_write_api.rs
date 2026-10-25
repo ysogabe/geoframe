@@ -853,24 +853,32 @@ impl Hold {
     }
 }
 
-/// 書き出しのように応答まで長くかかる `POST` は、無通信の期限で接続を切られない（`serve` が付ける接続の情報の
-/// `ConnBusy`）。期限を 0.4 秒にして、書き出しを 1.5 秒止めておく（回転・取得と同じロックを試験が握る）。
-/// 比較として、接続の情報を付けない起動では同じ要求が切られる（試験が効いていることの確認）。
-#[tokio::test]
-async fn a_long_export_is_not_cut_by_the_idle_timeout() {
+// ---- 無通信の期限（`ConnBusy`）と POST ----
+
+/// 無通信の期限を短くした、接続の情報つき（本番の起動）と接続の情報なし（比較用）の 2 つのサーバー。
+struct IdleServers {
+    dir: TempDir,
+    _plans: TempDir,
+    _db: Connection,
+    /// 本番の起動（`into_make_service_with_connect_info::<ConnInfo>`）。
+    with_info: std::net::SocketAddr,
+    /// 接続の情報を付けない起動。長い処理でも期限で切られる。
+    without_info: std::net::SocketAddr,
+}
+
+async fn idle_servers(tag: &str) -> IdleServers {
     use geoframe::config::{Config, Overrides};
     use geoframe::limits::{ConnLimits, LimitedListener};
     use geoframe::server::{ConnInfo, router};
     use std::sync::Arc;
     use std::time::Duration;
 
-    let _serial = serial().await;
     let fixture = fixture();
-    let plans = TempDir::new("blog-write-idle-plans");
+    let plans = TempDir::new(&format!("{tag}-plans"));
     for (name, content) in fixture["plans"].as_object().unwrap() {
         fs::write(plans.path().join(name), content.as_str().unwrap()).unwrap();
     }
-    let dir = TempDir::new("blog-write-idle");
+    let dir = TempDir::new(tag);
     let db = build_admin_catalog(dir.path());
     fs::create_dir_all(dir.path().join("derivatives")).unwrap();
     fs::write(
@@ -893,12 +901,11 @@ async fn a_long_export_is_not_cut_by_the_idle_timeout() {
     )
     .unwrap();
     let limits = ConnLimits {
-        idle_timeout: Duration::from_millis(400),
+        idle_timeout: Duration::from_millis(300),
         ..ConnLimits::default()
     };
     let app = router(common::test_state(Arc::new(config), catalog));
 
-    // 本番の起動（接続の情報つき）
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let with_info = listener.local_addr().unwrap();
     let service = app
@@ -906,60 +913,236 @@ async fn a_long_export_is_not_cut_by_the_idle_timeout() {
         .into_make_service_with_connect_info::<ConnInfo>();
     let listener = LimitedListener::new(listener, limits);
     tokio::spawn(async move { axum::serve(listener, service).await });
-    // 接続の情報を付けない起動（比較用）
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let without_info = listener.local_addr().unwrap();
     let listener = LimitedListener::new(listener, limits);
     tokio::spawn(async move { axum::serve(listener, app).await });
+    IdleServers {
+        dir,
+        _plans: plans,
+        _db: db,
+        with_info,
+        without_info,
+    }
+}
 
-    let body = json!({"trip_id": "sample-trip-a", "manifest": {
+/// 来るはずの出来事を待つ上限（止まった試験をハングでなく失敗にするためのもので、進み具合を推し量る時間ではない）。
+const EVENT_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// 1 本の接続（keep-alive）。要求を書いて、応答を `Content-Length` で読み、サーバーが閉じるのを待つ。
+struct Conn(tokio::net::TcpStream);
+
+impl Conn {
+    async fn open(addr: std::net::SocketAddr) -> Self {
+        Self(tokio::net::TcpStream::connect(addr).await.unwrap())
+    }
+
+    /// 要求の頭（ヘッダ）。`Content-Length` は `length`（本文は別に送る）。
+    fn head(target: &str, length: usize) -> Vec<u8> {
+        format!(
+            "POST {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {length}\r\n\r\n"
+        )
+        .into_bytes()
+    }
+
+    async fn send(&mut self, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        self.0.write_all(bytes).await.unwrap();
+    }
+
+    /// 応答を 1 つ読む（接続は閉じない）。
+    async fn response(&mut self) -> common::Response {
+        use tokio::io::AsyncReadExt;
+        let mut raw = Vec::new();
+        let mut byte = [0u8; 1];
+        while !raw.ends_with(b"\r\n\r\n") {
+            let n = tokio::time::timeout(EVENT_LIMIT, self.0.read(&mut byte))
+                .await
+                .expect("応答が来ない")
+                .expect("応答を読めない");
+            assert_eq!(n, 1, "応答の途中で閉じられた");
+            raw.push(byte[0]);
+        }
+        let head = std::str::from_utf8(&raw[..raw.len() - 4]).unwrap();
+        let (status_line, headers) = head.split_once("\r\n").unwrap();
+        let headers = headers.to_lowercase();
+        let length: usize = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length: "))
+            .expect("Content-Length")
+            .parse()
+            .unwrap();
+        let mut body = vec![0u8; length];
+        tokio::time::timeout(EVENT_LIMIT, self.0.read_exact(&mut body))
+            .await
+            .expect("本文が来ない")
+            .expect("本文を読めない");
+        common::Response {
+            status: status_line.split(' ').nth(1).unwrap().parse().unwrap(),
+            headers,
+            body,
+        }
+    }
+
+    /// サーバーが接続を閉じる（無通信の期限で切る）のを待ち、閉じるまでに届いたバイトを返す。
+    async fn until_closed(&mut self) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut raw = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let read_all = async {
+            loop {
+                match self.0.read(&mut chunk).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                }
+            }
+        };
+        tokio::time::timeout(EVENT_LIMIT, read_all)
+            .await
+            .expect("無通信の期限で切られなかった");
+        raw
+    }
+}
+
+/// 長い書き出しの本文（合成の旅程の写真 1 枚）。
+fn export_body() -> Vec<u8> {
+    json!({"trip_id": "sample-trip-a", "manifest": {
         "trip_id": "sample-trip-a", "status": "draft",
         "chapters": [{"id": "d1", "images": [{"photo_id": "1"}]}]}})
-    .to_string();
-    let send = |addr: std::net::SocketAddr| {
-        let body = body.clone();
-        tokio::spawn(async move {
-            post_raw(
-                addr,
-                EXPORT,
-                &[
-                    ("Host".into(), "localhost".into()),
-                    ("Content-Type".into(), "application/json".into()),
-                    ("Content-Length".into(), body.len().to_string()),
-                    ("Connection".into(), "close".into()),
-                ],
-                body.as_bytes(),
-            )
-            .await
-        })
-    };
+    .to_string()
+    .into_bytes()
+}
+
+/// ロックを待つ要求の処理が来るまで待つ（合図: [`geoframe::imaging::lock_derivatives_waiting`]）。
+async fn wait_until_waiting_for_the_lock() {
+    let deadline = std::time::Instant::now() + EVENT_LIMIT;
+    while geoframe::imaging::lock_derivatives_waiting() == 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "処理がロックを待つところまで来ない"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+/// 書き出しの処理が終わる（プロセスで 1 本の書き出しのロックが手放される）のを待つ。
+async fn wait_until_export_is_done() {
+    let deadline = std::time::Instant::now() + EVENT_LIMIT;
+    while geoframe::blog_write::export_running() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "書き出しの処理が終わらない"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
+/// ヘッダだけ送って本文を送らない（または宣言より短くしか送らない）`POST` は、**どのルートでも**無通信の期限で切られる。
+/// `ConnBusy` は本文を読み終えて検査したあとの処理の間だけ取る: 本文の受信の前に取ると、この相手が接続を無期限に
+/// 握れる（256 接続で他の接続やヘルス確認が待たされる。server.md §9.3）。切られるのは「来るはずの出来事」として待つ。
+#[tokio::test]
+async fn a_post_without_its_whole_body_is_cut_by_the_idle_timeout() {
+    let _serial = serial().await;
+    let servers = idle_servers("blog-write-no-body").await;
+    let routes = [
+        "/api/admin/setloc",
+        "/api/admin/setflag",
+        "/api/admin/rotate",
+        SAVE,
+        EXPORT,
+    ];
+    let body = export_body();
+    let mut cuts = Vec::new();
+    for route in routes {
+        for sent in [0, body.len() / 2] {
+            let addr = servers.with_info;
+            let body = body.clone();
+            cuts.push(tokio::spawn(async move {
+                let mut conn = Conn::open(addr).await;
+                conn.send(&Conn::head(route, body.len())).await;
+                conn.send(&body[..sent]).await;
+                (route, sent, conn.until_closed().await)
+            }));
+        }
+    }
+    for cut in cuts {
+        let (route, sent, received) = cut.await.unwrap();
+        // 何も処理されず、成功の応答も返らない
+        let received = String::from_utf8_lossy(&received);
+        assert!(
+            !received.contains(" 200 "),
+            "{route} 本文{sent}バイト: {received}"
+        );
+    }
+    // 何も書かれていない
+    assert!(!servers.dir.path().join("blog_exports").exists());
+    assert!(!servers.dir.path().join("travel_blog").exists());
+}
+
+/// 書き出しのように応答まで長くかかる `POST` は、処理の間は無通信の期限で接続を切られず（`serve` が付ける接続の情報の
+/// `ConnBusy`）、済んだら期限が戻る。期限を 0.3 秒にして、書き出しをロック待ちで止めておく（回転・取得と同じロックを
+/// 試験が握る）。経過した時間は実時間の `sleep` で推し量らず、**同じサーバーの別の接続が期限で切られた**ことを
+/// 時計にする（その接続は書き出しの接続がロック待ちに入ったあとに始めたので、そのとき書き出しの接続の無通信も
+/// 期限を超えている）。比較として、接続の情報を付けない起動では同じ要求が切られる（試験が効いていることの確認）。
+#[tokio::test]
+async fn a_long_export_is_not_cut_by_the_idle_timeout_and_the_timeout_returns_after() {
+    let _serial = serial().await;
+    let servers = idle_servers("blog-write-idle").await;
+    let body = export_body();
+    let index = servers
+        .dir
+        .path()
+        .join("blog_exports/sample-trip-a/index.html");
+
     // 比較: 接続の情報が無い起動では、処理を止めている間に無通信の期限で切られる
     let hold = hold_derivatives();
-    let cut = send(without_info);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    hold.release();
+    let cut = {
+        let (addr, body) = (servers.without_info, body.clone());
+        tokio::spawn(async move {
+            let mut conn = Conn::open(addr).await;
+            conn.send(&Conn::head(EXPORT, body.len())).await;
+            conn.send(&body).await;
+            conn.until_closed().await
+        })
+    };
+    wait_until_waiting_for_the_lock().await;
+    // 書き出しの処理がロック待ちのまま（手放していない）、期限で切られた
+    let received = cut
+        .await
+        .expect("接続の情報が無いと、無通信の期限で切られる");
     assert!(
-        cut.await.is_err(),
-        "比較: 接続の情報が無いと、無通信の期限で切られる"
+        !String::from_utf8_lossy(&received).contains(" 200 "),
+        "比較: 応答が来ない"
     );
-    // 切られても書き出し自体は終わる（応答を受けた者がいないだけ）。済むのを待つ（来るはずの出来事だけを待つ）
-    let index = dir.path().join("blog_exports/sample-trip-a/index.html");
-    for _ in 0..2000 {
-        if index.is_file() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
+    hold.release();
+    // 切られても書き出し自体は終わる（応答を受けた者がいないだけ）。終わりの合図を待ってから後片付けする
+    wait_until_export_is_done().await;
     assert!(index.is_file());
-    fs::remove_dir_all(dir.path().join("blog_exports")).unwrap();
+    fs::remove_dir_all(servers.dir.path().join("blog_exports")).unwrap();
 
     // 本番の起動: 同じ止め方でも、最後まで答える
     let hold = hold_derivatives();
-    let kept = send(with_info);
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    let kept = {
+        let (addr, body) = (servers.with_info, body.clone());
+        tokio::spawn(async move {
+            let mut conn = Conn::open(addr).await;
+            conn.send(&Conn::head(EXPORT, body.len())).await;
+            conn.send(&body).await;
+            let response = conn.response().await;
+            (response, conn)
+        })
+    };
+    wait_until_waiting_for_the_lock().await;
+    // 時計: 本文を送らない別の接続が、無通信の期限で切られる
+    let mut clock = Conn::open(servers.with_info).await;
+    clock.send(&Conn::head(EXPORT, body.len())).await;
+    clock.until_closed().await;
+    assert!(!kept.is_finished(), "処理の間は、期限を超えても切られない");
     hold.release();
-    let kept = kept.await.expect("接続の情報つきは最後まで答える");
-    assert_eq!(kept.status, 200, "{}", kept.text());
+    let (response, mut conn) = kept.await.expect("接続の情報つきは最後まで答える");
+    assert_eq!(response.status, 200, "{}", response.text());
     assert!(index.is_file());
-    drop(db);
+    wait_until_export_is_done().await;
+    // 処理が済んだら期限が戻る: 同じ接続は、次の要求が無いまま期限で切られる
+    assert!(conn.until_closed().await.is_empty());
 }

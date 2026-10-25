@@ -683,8 +683,35 @@ pub fn lock_derivatives() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[cfg(test)]
     let _waiting = lock_waiters::Registered::new();
+    let _counted = WaitingCount::new();
     LOCK.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// [`lock_derivatives`] を待っているスレッドの数（待ち始めから取れるまで）。
+static WAITING_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+struct WaitingCount;
+
+impl WaitingCount {
+    fn new() -> Self {
+        WAITING_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for WaitingCount {
+    fn drop(&mut self) {
+        WAITING_COUNT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 試験用の観測: [`lock_derivatives`] で今ロックを待っているスレッドの数。結合試験（別のクレートとして
+/// ビルドされるので、`cfg(test)` の [`lock_waiters`] は見えない）が、要求の処理が「ロックの前まで来て待っている」
+/// ことを、実時間を待たずに合図で確かめるのに使う。本番の処理は使わない。
+#[doc(hidden)]
+pub fn lock_derivatives_waiting() -> usize {
+    WAITING_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// 試験用: [`lock_derivatives`] の中でロックを待っているスレッドの記録。他のスレッドがロックを持っている間に

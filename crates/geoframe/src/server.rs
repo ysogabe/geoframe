@@ -621,13 +621,14 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
         return match post::route_of(raw) {
             Some(route) => {
                 // 書き出し（E16）などの長い処理の間は、無通信の期限で接続を切らない（`serve` が付けた接続の情報。
-                // 付いていない起動のしかた（試験）では何もしない）
-                let _busy = parts
+                // 付いていない起動のしかた（試験）では何もしない）。止めるのは**本文を読み終えて検査したあと**の
+                // 処理の間だけで、本文の受信中は期限を働かせたままにする（`post::handle`）
+                let busy = parts
                     .extensions
                     .get::<axum::extract::ConnectInfo<ConnInfo>>()
-                    .map(|info| info.0.busy.enter());
+                    .map(|info| info.0.busy.clone());
                 labeled(
-                    post::handle(&state, route, &parts.headers, body).await,
+                    post::handle(&state, route, &parts.headers, body, busy.as_ref()).await,
                     route.label(),
                 )
             }

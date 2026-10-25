@@ -381,6 +381,61 @@ fn the_startup_sweep_restores_and_cleans_and_reports_only_counts() {
     );
 }
 
+/// 起動時の掃除は、掃除する場所の親（`travel_blog/`・`drafts/`・`blog_exports/`）がリンクなら何もしない:
+/// `read_dir` はリンクを辿るので、確かめないと、外のディレクトリの通常ファイルや作業領域の形のものを消してしまう。
+/// 外のものは何も変わらず、ログは定型文で名前を含まない。
+#[test]
+fn the_startup_sweep_does_not_follow_a_linked_parent() {
+    let fixture = Fixture::new("blog-write-startup-links");
+    let root = fixture.root();
+    let part = "sample-trip-a.json.123.0123456789abcdef.part";
+    // 外のディレクトリ: 下書きの書きかけの形・書き出しの作業領域と `.previous` の形のもの
+    let outside = root.join("outside");
+    fs::create_dir_all(outside.join(".sample-trip-a-rs0123456789abcdef")).unwrap();
+    fs::create_dir_all(outside.join(format!(".{TRIP}.previous"))).unwrap();
+    fs::write(outside.join(part), "外").unwrap();
+    let before = fixture.names(&outside);
+    let skipped = |logs: &str| {
+        assert!(logs.contains("掃除を飛ばしました"), "{logs}");
+        assert!(!logs.contains("sample-trip"), "名前を出さない: {logs}");
+        assert!(!logs.contains("outside"), "パスを出さない: {logs}");
+    };
+
+    // `travel_blog` が外へのリンク（`drafts` は外にある）
+    fs::create_dir_all(outside.join("drafts")).unwrap();
+    fs::write(outside.join("drafts").join(part), "外").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("travel_blog")).unwrap();
+    let logs = capture::logs_of(|| sweep_leftovers(&root));
+    skipped(&logs);
+    assert!(outside.join("drafts").join(part).is_file());
+    fs::remove_file(root.join("travel_blog")).unwrap();
+
+    // `travel_blog` は通常のディレクトリで、`drafts` が外へのリンク
+    fs::create_dir_all(root.join("travel_blog")).unwrap();
+    fs::remove_dir_all(outside.join("drafts")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("travel_blog/drafts")).unwrap();
+    let logs = capture::logs_of(|| sweep_leftovers(&root));
+    skipped(&logs);
+    assert!(outside.join(part).is_file());
+    fs::remove_file(root.join("travel_blog/drafts")).unwrap();
+
+    // `blog_exports` が外へのリンク
+    std::os::unix::fs::symlink(&outside, root.join("blog_exports")).unwrap();
+    let logs = capture::logs_of(|| sweep_leftovers(&root));
+    skipped(&logs);
+    fs::remove_file(root.join("blog_exports")).unwrap();
+
+    assert_eq!(fixture.names(&outside), before);
+    assert!(outside.join(".sample-trip-a-rs0123456789abcdef").is_dir());
+    assert!(outside.join(format!(".{TRIP}.previous")).is_dir());
+    // 通常のディレクトリなら、同じ場所の同じ形のものを掃除する（試験が効いていることの確認）
+    let drafts = root.join("travel_blog/drafts");
+    fs::create_dir_all(&drafts).unwrap();
+    fs::write(drafts.join(part), "半端").unwrap();
+    sweep_leftovers(&root);
+    assert!(!drafts.join(part).exists());
+}
+
 #[test]
 fn nothing_is_written_without_a_writer_but_dry_run_answers() {
     let fixture = Fixture::new("blog-write-no-writer");

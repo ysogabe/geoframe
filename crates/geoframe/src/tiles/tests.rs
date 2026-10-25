@@ -1056,6 +1056,10 @@ fn prune_does_not_follow_or_delete_symlinks_and_ignores_other_files() {
     put(outside.path(), "dir/1/1.png", 4 * mb, 50);
     symlink(outside.path().join("dir"), root.join("osm/4")).unwrap();
     symlink(outside.path().join("dir"), root.join("gsi")).unwrap();
+    // x の階層がリンク（先に大きな PNG と古い書きかけがある）
+    put(outside.path(), "xdir/7.png", 4 * mb, 50);
+    put(outside.path(), "xdir/8.1234.00ff.part", 10, 50);
+    symlink(outside.path().join("xdir"), root.join("osm/3/2")).unwrap();
     // 形の合わないファイル（foreign）は数えず、消さない
     put(&root, "osm/3/1/notes.txt", mb, 10);
     put(&root, "osm/3/1/01.png", mb, 10);
@@ -1096,6 +1100,14 @@ fn prune_does_not_follow_or_delete_symlinks_and_ignores_other_files() {
         4 * mb as u64
     );
     assert!(outside.path().join("dir/1/1.png").is_file());
+    assert!(
+        fs::symlink_metadata(root.join("osm/3/2"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(outside.path().join("xdir/7.png").is_file());
+    assert!(outside.path().join("xdir/8.1234.00ff.part").is_file());
 
     // tile_cache 自体がリンクなら、何もせずエラー
     let link = dir.path().join("linked");

@@ -45,6 +45,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri, header};
 use axum::response::Response;
 use serde_json::{Map, Value};
 
+use crate::limits::ConnBusy;
 use crate::server::{AppState, error_response, json_response};
 use crate::{blog_write, csrf, rotate, update, webpath};
 
@@ -245,7 +246,17 @@ fn pre_body_check(headers: &HeaderMap) -> Result<u64, Box<Response>> {
 }
 
 /// `POST` を処理する。`route` は [`route_of`] が選んだもの（入口の検査で、ルートが無い POST は 403 済み）。
-pub async fn handle(state: &AppState, route: Route, headers: &HeaderMap, body: Body) -> Response {
+///
+/// `busy` は接続の「処理中」の印（[`ConnBusy`]。付いていない起動のしかたでは `None`）。**本文を読み終えて JSON を
+/// 検査したあと**、更新の処理（`spawn_blocking`）を待つ間だけ取る。本文の受信中は取らない: ヘッダだけ送って本文を
+/// 送らない相手が、無通信の期限（[`crate::limits::IDLE_TIMEOUT`]）に掛からず接続を握り続けるのを防ぐ（server.md §9.3）。
+pub async fn handle(
+    state: &AppState,
+    route: Route,
+    headers: &HeaderMap,
+    body: Body,
+    busy: Option<&ConnBusy>,
+) -> Response {
     let length = match pre_body_check(headers) {
         Ok(length) => length,
         Err(response) => return *response,
@@ -265,6 +276,8 @@ pub async fn handle(state: &AppState, route: Route, headers: &HeaderMap, body: B
     let writer = state.writer();
     let data_dir = state.data_root.as_ref().clone();
     let blog = std::sync::Arc::clone(&state.blog);
+    // ここから応答が決まるまでが「処理中」。済んだら（守りを落としたら）無通信の期限が戻る
+    let busy_guard = busy.map(ConnBusy::enter);
     let result = tokio::task::spawn_blocking(move || match route {
         Route::SetLoc => update::set_loc(&payload, writer.as_ref()),
         Route::SetFlag => update::set_flag(&payload, writer.as_ref()),
@@ -274,6 +287,7 @@ pub async fn handle(state: &AppState, route: Route, headers: &HeaderMap, body: B
     })
     .await
     .unwrap_or_else(|_| Err(ApiError::Internal("更新の処理が異常終了しました".into())));
+    drop(busy_guard);
     match result {
         Ok(value) => match serde_json::to_vec(&value) {
             Ok(body) => json_response(StatusCode::OK, body),
