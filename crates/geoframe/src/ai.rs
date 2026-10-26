@@ -1,6 +1,6 @@
 //! P4: AI の実行基盤。永続ジョブ（[`jobs`]）、設定（[`settings`]）、クラウド送信の予算（[`budget`]）、
 //! Provider の一時停止（[`pause`]）、共有の一時待機（[`waits`]）、起動 ID と停止開始の記録（[`runs`]）、背景ワーカー
-//! （[`worker`]）、管理操作（[`ops`]。CLI と STATUS）。T4.2 で AI 専用の HTTP（[`http`]・[`dest`]・[`lanes`]）、
+//! （[`worker`]）、管理操作（[`ops`]。CLI と STATUS）。T4.2 で AI 専用の HTTP（[`http`]・[`dest`]・[`gate`]・[`lanes`]）、
 //! Discovery（[`discovery`]）、Decision（[`decision`]・[`image_input`]）、LAN の共通部分（[`provider`]）を足した。
 //! 用途別の handler の登録は後続のタスク。
 //! 設計は `docs/rust-migration/p4-design.md` §3・§4。
@@ -15,6 +15,7 @@ pub mod budget;
 pub mod decision;
 pub mod dest;
 pub mod discovery;
+pub mod gate;
 pub mod http;
 pub mod image_input;
 pub mod jobs;

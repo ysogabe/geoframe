@@ -31,14 +31,24 @@
 | 応答の上限 | 展開後1 MiB（`net::read_body_limited`。圧縮前の上限も同じ関数が掛ける）。2xx以外の本文は読まない |
 | 枠 | 背景1・対話1で独立。対話の枠が使用中なら待たず`Busy`（定型503に当たる）。対話が枠を待つ間は新しい背景を始めない |
 | 呼出境界 | 同期の`ureq`をtokioのworkerやwriterの上では呼ばない。背景はAIワーカーの専用スレッド、対話は`AiHttp::run_interactive`（枠を先に取り`spawn_blocking`で実行） |
-| 停止 | 停止の合図が立っていれば、枠も要求も始めない。送信済みの要求は期限まで待ち、有効な応答は確定できる（既存のworker/Writerの停止・token・LockHoldは変えていない） |
+| 停止 | 停止の合図が立っていれば、枠も要求も始めない。確認は3か所: `send`の入口、名前解決のあと（接続を始める前）、**HTTP要求の最初のバイトを書く直前**（接続・TLSの待ちのあと。下の「停止の境界」）。**書き始めたら止めない**: 残りの本文・応答の受信・有効な結果の確定は続ける。止めたときは固定の`HttpError::Stopping`で、待ち・停止（pause）・課金の試行には数えず、jobは`shutdown`の後回し。既存のworker/Writerの停止・token・LockHoldは変えていない |
 | エラー | `HttpError`は固定の列挙と状態コードだけ（URL・本文・例外文字列・認証・モデル応答を持たない）。`Debug`も本文を出さない |
 
-テストだけが偽のDNS（`AiHttp::with_lookup`、`#[cfg(test)]`）を差し込める。本番の設定・環境変数からは選べない。
+テストだけが偽のDNS（`AiHttp::with_lookup`、`#[cfg(test)]`）と、接続後に呼ぶ処理（`with_lookup_and_connect_hook`、`#[cfg(test)]`）を差し込める。本番の設定・環境変数からは選べない。
+
+### 停止の境界（`ai::gate`）
+
+`ureq` 3.5.0の接続の連鎖（`DefaultConnector` = SOCKS/CONNECT準備 → TCP → rustls TLS）の**いちばん外側**に`GateConnector`を置く。内側のコネクターは`connect`の中でTCP接続とTLSハンドシェイク（`complete_io`）まで終えて`Transport`を返すので、`GateTransport::transmit_output`の呼び出し（＝HTTP要求の最初のバイトを書く、`run.rs`の`send_request`）は、名前解決・接続・TLSの待ちの**すべてのあと**になる。
+
+- 要求ごとの停止の合図は、`send`が`ureq`を呼ぶスレッドのスレッドローカルに結ぶ（接続プールとコネクターは背景・対話の2つの枠で共有されるため、agentには持たせられない）。結ばれていない書き込みは出さない（フェイルクローズ）。
+- **要求ごと・トランスポートごとの最初の書き込み**で停止を確かめる。接続プールから取り出した古い接続でも、同じ要求の中で接続が作り直された場合でも、最初の書き込みで確認が走る。同じ要求の2回目以降の書き込み（残りのヘッダー・本文）は確認しない。
+- 止めるときのエラーは`ureq::Error::Other(StopRequested)`で、`http.rs`の`classify`が固定の`HttpError::Stopping`にする。
+- クラウド（T4.6）の注意: `RunCtx::before_send`の送信枠の予約は書き込みの前に取られるので、この境界で止まった要求は、予約だけが残る（課金は0。枠を余分に1つ消費しうる安全側）。LANには予算が無い。
+- 限界: この境界は**書き始める前**の確認で、書き込みの途中・応答待ちの最中の停止は止めない（有償の結果を捨てないため）。
 
 ### `ureq`の更新時の注意
 
-`ureq`のunversioned API（`Resolver`・`DefaultConnector`・`Agent::with_parts`）はsemver外（minorで変わりうる）。使う箇所は`ai/dest.rs`の`PinResolver`と`ai/http.rs`の`AiHttp::build`の**2か所だけ**。更新時はコンパイルと`tests_http.rs`（接続先の固定・rebinding・SNI・リダイレクト・プロキシ）を必ず確認する。Cargo.lockの`ureq`は3.5.0。
+`ureq`のunversioned API（`Resolver`・`DefaultConnector`・`Connector`/`Transport`・`Agent::with_parts`）はsemver外（minorで変わりうる）。使う箇所は`ai/dest.rs`の`PinResolver`、`ai/gate.rs`の`GateConnector`/`GateTransport`、`ai/http.rs`の`AiHttp::build`の**3か所だけ**。更新時はコンパイルと`tests_http.rs`（接続先の固定・rebinding・SNI・リダイレクト・プロキシ・停止の境界）、`gate.rs`の試験を必ず確認する。Cargo.lockの`ureq`は3.5.0。
 
 ## Discovery（`ai::discovery`）
 
@@ -51,7 +61,14 @@
 
 - 送る前に`GET /llm-decision/health`: `status=ready`かつ`modalities`に`image`があり、`model`が設定の`location_clue`のモデルと同じ。`loading`・`modalities`がnullは一時待ち、`image`が無い・モデル違いは契約エラー。
 - `POST /llm-decision/v1/systemone`: 要求は`{model, state, questions:{名前:{type: choice|noul, instructions, criteria}}, images:[dataURL]}`、応答は`{model, answers, usage}`。応答の形を要求の質問と突き合わせて検査する（`noul`は有限の0〜1、`choice`は要求の選択肢のいずれか、`error`を持つ質問は`Unanswerable`）。質問の文面・閾値・clueの保存はT4.6。
-- 画像は`PreparedImage`（JPEG/PNG/WebPのdataURLだけ）。1枚8,000,000バイト以下・1.6メガピクセル以下・長辺はDecision 1536px（埋め込み用は768px）、EXIF/XMP/IPTC/コメント/PNGテキスト/WebPのEXIF・XMPを含むものは**断る**（黙って削らない）。外部URL・ファイルのパス・元画像は受けない。縮小・向きの適用・再エンコードは用途（T4.6/T4.4）が既存のderivativeから行い、この版は検査の境界と`PreparedImage::encode_jpeg_rgb`（EXIFを出さないエンコード）までを持つ。
+- 画像は`PreparedImage`（JPEG/PNG/WebPのdataURLだけ）。1枚8,000,000バイト以下・1.6メガピクセル以下・長辺はDecision 1536px（埋め込み用は768px）。メタデータを含むもの・構造が最後まで正しくないものは**断る**（黙って削らない）。外部URL・ファイルのパス・元画像は受けない。縮小・向きの適用・再エンコードは用途（T4.6/T4.4）が既存のderivativeから行い、この版は検査の境界と`PreparedImage::encode_jpeg_rgb`（EXIFを出さないエンコード）までを持つ。
+- **JPEGの検査**（`image_input::jpeg_scan`。最初のSOSで打ち切らず、EOIまで全マーカーを読む）:
+  - 許す: SOF0/1/2（8bit・1か3成分。プログレッシブも可）、DHT・DQT・DRI・SOS・EOI、形が固定のAPP0（`JFIF\0` 1.x・14バイトちょうど・サムネイルなし）とAPP14（`Adobe` 12バイトちょうど）。DQT/DHT/SOF/SOS/DRIは中身の構造まで見て、**ペイロードに余分なバイトがあれば断る**（任意データを隠せない）。
+  - 断る: APP1（EXIF/XMP）、**APP2（ICCプロファイルは任意のタグを持てるので中身を見ずに断る。入力はsRGBのderivativeが前提）**、APP3〜13（IPTCなど）、APP15、COM、JPGn、JFXXやJFIFのサムネイル、算術符号・ロスレス・階層・12bit・4成分、DNL、予約マーカー、SOF後のAPP0/APP14、SOIの重複。
+  - エントロピー符号化部分は、バイトスタッフィング（`FF 00`）・リスタート（`FF D0..D7`。DRIが有効で番号が0から順）・マーカー前の詰め物`FF`を読み分けて**正しく読み飛ばす**（SOSが複数のプログレッシブも同じ）。**EOIが無い（途中で切れた）ものと、EOIの後ろにデータがあるものは断る**（MPFなどを後ろに持つ写真は事前にderivativeで作り直す前提）。
+  - 大きさ・画素数の上限を**先に**適用し、そのあと`zune-jpeg`の厳格モードで全体をデコードして確かめる（1.6MP×3バイトまで。結果は捨てる）。ベースライン/シーケンシャルは末尾のEOIを外して読ませ、EOIを付け足された切れた走査を「ゼロ埋めで成功」にさせない。
+  - 限界: プログレッシブは次のマーカーとしてEOIを読むので、走査の途中で切れてEOIだけ付け足されたものは見抜けない。最後の走査の「全MCUの後ろからEOIまで」に足されたバイト、ハフマン表のシンボル・画素データに隠された任意のバイト列も対象外（ハフマン符号を自前で数える必要がある）。
+- PNGはIHDRで始まりIENDで終わり、IENDの後ろにデータが無いこと。許すチャンクはIHDR/PLTE/IDAT/IEND/tRNS/gAMA/cHRM/sRGB/sBIT/bKGD/pHYsだけ（iCCP・tIME・eXIf・テキスト・未知は断る）。WebPはRIFFの長さがファイルの長さと一致し、チャンクはVP8X/VP8/VP8L/ALPHだけ（ICCP/EXIF/XMP・未知は断る）。PNG/WebPの画素データそのものはデコードしない（この版では寸法の読み取りだけ）。
 - 入口は`decision::run(ctx, lan, request)`: 組み立て（8 MiB検査）→`before_probe`→背景の枠→Discovery・health→`before_send`→POST。POSTが通信失敗・5xxなら**Discoveryをやり直して分類**する（使えなければ待ち、使えるならそのjobだけの反復失敗）。
 
 ## 分類（`ai::provider`）
@@ -78,6 +95,9 @@
 - 識別は`AiSettings::provider_fingerprint`（接続先・認証のハッシュ）と`service_key`（サービスIDのハッシュ。`location_clue`は固定の`decision`、クラウドはモデル単位）。別のProvider・別のサービスは巻き込まない。
 - ワーカーは待ちを`ai_provider_waits`に記録し（同じWriterの1回の依頼でjobの`next_attempt_at`も遅らせる）、周期の最初にDBから読み直す。待っている用途は**claimの前に**飛ばす。再起動後も`until`まで連打しない。既存の`blocked`（`Unavailable`・`RateLimited`・予算切れ）はこの起動の中の用途単位で、そのまま残る。
 - 待ちは成功済みの結果にも他のjobにも触れず、設定の変更や待ちだけで過去の成功結果を再送しない。
+- **管理表示**（`ai-jobs status`・`/api/admin/status`の`ai_waits`・管理画面STATUS）: 有効な待ち（`until`が今より先）を**今の設定の用途に結び直して**出す。保存された識別（Providerとサービスのハッシュ）は用途名に引き直すだけで、ハッシュ・接続先・サービスID・モデル・Providerの自由文の`reason`は出さない。出すのは用途名・範囲（`entrance`＝入口全体／`service`＝サービス単体）・固定の理由（`unreachable`・`leased`・`not_ready`・`rate_limited`・`busy`）・期限だけ。入口全体の待ちは同じProviderの全用途の行になり、サービス単体の待ちはそのサービスの用途だけ。今の設定に当たらない待ち（古い設定の残り）は何も止めていないので出さない。設定が未指定・不正で結び直せないときは、有効な待ちの**件数**（`unidentified`）だけ。期限切れの行は残っていても出さない。再起動の前後は同じDBの行から読み直すので同じ表示になる。
+  - JSONの形: `"ai_waits": {"items": [{"task", "scope", "reason", "until"}], "unidentified": n}`。待ちが無ければキーを足さない（`unidentified`は0なら出さない）。表が無い旧DB・Python版の応答も変わらない。
+  - **期限の表記**: UTCのISO 8601、秒まで、末尾`Z`（`YYYY-MM-DDTHH:MM:SSZ`）。管理画面は`YYYY-MM-DD HH:MM:SS UTC`と書く。`ai-jobs status`は`待機中 <用途> <入口全体|サービス単体>: <理由>（期限 <ISO> UTC）`、待ちが無ければ`共有の一時待機: なし`。
 - `RunCtx::before_probe`（新設）はDiscoveryなどの読み取りの前に使い、`before_send`の確認のうちクラウドの送信枠の予約だけをしない（Discoveryでクラウド枠を消費しない）。推論のPOSTの直前は従来どおり`before_send`。
 
 ## 新しいスキーマ（互換・dry-run）
@@ -89,5 +109,4 @@
 - 用途別handlerの登録（Decisionのclue→T4.6、画像／文Embedding→T4.4）。それまで配布バイナリはAI処理をしない。
 - クラウド（Vertex）のアダプター・token読取・401の一度のrefresh・送信後の課金計数（T4.6）。このタスクでクラウドへの実送信はしていない。
 - 対話（検索語Embedding）の予約キャッシュとE5/E6への接続（T4.4）。`AiHttp::run_interactive`は枠と境界だけ。
-- `ai-jobs status`/STATUSへの待ちの表示は未実装（jobの`last_error_code`・`next_attempt_at`で追える）。
 - 実LAN・実Decision・実画像での確認はT4.7（LXC）。

@@ -12,6 +12,8 @@
 //!   `Accept`・POST の `Content-Type` だけ。`Origin` は付けない）。
 //! - プロキシは使わない（`proxy(None)`）。環境変数 `HTTP_PROXY`／`HTTPS_PROXY` は LAN でもクラウド既定でも読まない。
 //!   クラウドのプロキシは、管理者が設定で明示した場合だけ（T4.6 以降の境界。今の設定 JSON には項目を足さない）。
+//! - 停止の合図は、`send` の入口・名前解決のあと・**HTTP 要求の最初のバイトを書く直前**（接続・TLS の待ちのあと。
+//!   [`super::gate`]）で見る。書き始めたあとは止めない。止めたときは固定の [`HttpError::Stopping`]。
 //! - 時間は用途別の全体期限（[`Deadline`]。名前解決・接続・ヘッダー・本文の読み切りを含む）。Discovery 全体 2 秒、
 //!   対話 15 秒、背景 60〜180 秒。接続は 5 秒まで。
 //! - 要求 JSON は base64 込みで 8 MiB まで。**送る前に**検査し、超えたら接続も DNS もしない
@@ -29,9 +31,10 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ureq::unversioned::transport::DefaultConnector;
+use ureq::unversioned::transport::{Connector, DefaultConnector};
 
 use super::dest::{self, Lookup, PinResolver, SystemLookup};
+use super::gate::{self, GateConnector};
 use super::lanes::{Lane, LaneError, Lanes, Permit};
 use super::settings::TaskKind;
 use crate::net::{self, Failure};
@@ -107,6 +110,9 @@ impl From<LaneError> for HttpError {
 }
 
 fn classify(error: &ureq::Error) -> HttpError {
+    if gate::is_stop(error) {
+        return HttpError::Stopping;
+    }
     if dest::denied(error).is_some() {
         return HttpError::DestinationDenied;
     }
@@ -257,16 +263,45 @@ impl std::fmt::Debug for AiHttp {
 impl AiHttp {
     /// 設定の `local_base_url`（`http`／`https` の `scheme://host[:port]`）から作る。名前解決は OS。
     pub fn new(base_url: &str) -> Result<Self, HttpError> {
-        Self::build(base_url, Arc::new(SystemLookup))
+        Self::build(
+            base_url,
+            Arc::new(SystemLookup),
+            DefaultConnector::new().chain(GateConnector),
+        )
     }
 
     /// 試験だけが偽の名前解決を差し込む（本番の設定・環境変数からは選べない）。
     #[cfg(test)]
     pub fn with_lookup(base_url: &str, lookup: Arc<dyn Lookup>) -> Result<Self, HttpError> {
-        Self::build(base_url, lookup)
+        Self::build(
+            base_url,
+            lookup,
+            DefaultConnector::new().chain(GateConnector),
+        )
     }
 
-    fn build(base_url: &str, lookup: Arc<dyn Lookup>) -> Result<Self, HttpError> {
+    /// 試験だけ: 接続（TCP・TLS）を終えたあと、要求を書き始める前に `after_connect` を呼ぶ。
+    /// 「接続・TLS の待ちの間に停止が来た」順序を固定するための差し込み（本番の構築口には無い）。
+    #[cfg(test)]
+    pub fn with_lookup_and_connect_hook(
+        base_url: &str,
+        lookup: Arc<dyn Lookup>,
+        after_connect: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<Self, HttpError> {
+        Self::build(
+            base_url,
+            lookup,
+            DefaultConnector::new()
+                .chain(gate::HookConnector(after_connect))
+                .chain(GateConnector),
+        )
+    }
+
+    fn build(
+        base_url: &str,
+        lookup: Arc<dyn Lookup>,
+        connector: impl Connector,
+    ) -> Result<Self, HttpError> {
         let uri: ureq::http::Uri = base_url.trim().parse().map_err(|_| HttpError::BadTarget)?;
         let scheme = match uri.scheme_str() {
             Some("http") => "http",
@@ -285,7 +320,7 @@ impl AiHttp {
             .unwrap_or(if scheme == "https" { 443 } else { 80 });
         let host = authority.host();
         let pinned_host = host.trim_start_matches('[').trim_end_matches(']');
-        // ureq の unversioned API は、このファイルのこの 1 か所（と dest.rs の Resolver）だけ
+        // ureq の unversioned API は、このファイルのこの 1 か所（と dest.rs の Resolver・gate.rs の Connector）だけ
         let config = ureq::Agent::config_builder()
             .max_redirects(0)
             .proxy(None)
@@ -298,7 +333,7 @@ impl AiHttp {
             .build();
         let agent = ureq::Agent::with_parts(
             config,
-            DefaultConnector::new(),
+            connector,
             PinResolver::new(pinned_host, port, lookup),
         );
         Ok(Self(Arc::new(Inner {
@@ -390,6 +425,9 @@ impl Session {
         let remaining = deadline.remaining().ok_or(HttpError::Timeout)?;
         let inner = &self.http.0;
         let url = format!("{}://{}{}", inner.scheme, inner.authority, endpoint.path());
+        // 名前解決・接続・TLS を待っている間に来た停止は、要求の最初のバイトを書く直前（gate.rs）で止める。
+        // 書き始めたあとは止めない（ヘッダー・本文の残り・応答の受信は続ける）
+        let armed = gate::arm(&self.stop);
         let result = match body {
             None => inner
                 .agent
@@ -411,6 +449,7 @@ impl Session {
                 .build()
                 .send(body),
         };
+        drop(armed);
         let mut response = result.map_err(|e| classify(&e))?;
         let status = response.status().as_u16();
         if (300..400).contains(&status) {

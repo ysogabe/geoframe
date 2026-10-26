@@ -99,7 +99,7 @@ function massDeleteNotice(hold){
     '意図した削除なら、サービスを止めて geoframe sync --allow-mass-delete を1回実行（この画面からは解除できません）'));
   return c;
 }
-/* AI運用の状態（/api/admin/status の ai_config_invalid・ai_jobs・ai_pauses。Rust版だけが返し、あるときだけ入る）。
+/* AI運用の状態（/api/admin/status の ai_config_invalid・ai_jobs・ai_pauses・ai_waits。Rust版だけが返し、あるときだけ入る）。
    出すのは件数と固定の理由コードだけ（対象・接続先・モデルは返らない）。無ければ空の配列。
    Provider停止の解除・失敗ジョブの再試行は画面からはできない。コマンドを文字で示すだけ。 */
 const AI_JOB_STATE = {
@@ -117,6 +117,18 @@ const AI_PAUSE_REASON = {
   unauthorized: '認証エラー（401）', forbidden: '権限エラー（403）', model_not_found: 'モデルが無い（404）',
   contract_mismatch: '契約の不一致'
 };
+/* ai_waits: まだ有効な共有の一時待機（到達不能・GPU lease・429など。期限が来れば自然に消える）。
+   items は {task, scope: entrance|service, reason, until}。untilはUTCのISO 8601（YYYY-MM-DDTHH:MM:SSZ）で、
+   画面では「YYYY-MM-DD HH:MM:SS UTC」と書く。unidentified は設定が使えず用途に結び直せない件数。 */
+const AI_WAIT_REASON = {
+  unreachable: '到達できない', leased: 'GPUのlease中', not_ready: 'サービスが未準備',
+  rate_limited: '429（レート制限）', busy: '混雑中'
+};
+const AI_WAIT_SCOPE = {entrance: '入口全体', service: 'サービス単体'};
+function fmtUtc(iso){
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})Z$/.exec(String(iso));
+  return m ? m[1] + ' ' + m[2] + ' UTC' : '--';
+}
 function aiOpsCells(d){
   const cells = [];
   if(d.ai_config_invalid){
@@ -141,6 +153,20 @@ function aiOpsCells(d){
         'サービスを止めて geoframe ai-jobs retry --all で再検査（この画面からは操作できません）'));
       cells.push(c);
     });
+  }
+  const waits = d.ai_waits;
+  if(waits && ((waits.items && waits.items.length) || waits.unidentified)){
+    const items = waits.items || [];
+    const c = cell('AI一時待機中', items.length + (waits.unidentified || 0), '件', 'warn');
+    items.forEach(w => {
+      c.appendChild(el('span', 'k',
+        w.task + '（' + (AI_WAIT_SCOPE[w.scope] || w.scope) + '）: ' +
+        (AI_WAIT_REASON[w.reason] || w.reason) + ' / 期限 ' + fmtUtc(w.until)));
+    });
+    if(waits.unidentified) c.appendChild(el('span', 'k',
+      '用途を特定できない待ち ' + waits.unidentified + '件（AI設定が使えないため）'));
+    c.appendChild(el('span', 'k', '期限が来れば自動で再開します（操作は不要）'));
+    cells.push(c);
   }
   const pauses = d.ai_pauses;
   if(pauses && pauses.length){

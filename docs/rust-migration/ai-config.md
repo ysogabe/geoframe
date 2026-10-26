@@ -133,7 +133,7 @@ handlerの**panic**は当該ジョブの失敗1回（`panic`。5回で`failed`�
 
 | コマンド | 内容 |
 |---|---|
-| `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、用途ごとの使える／使えない（固定の理由コード）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途 |
+| `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、用途ごとの使える／使えない（固定の理由コード）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途、有効な共有の一時待機（用途・範囲・固定の理由・UTCの期限） |
 | `geoframe ai-jobs retry (--kind <種類>｜--all)` | `failed`だけを、登録済みhandlerが現在の入力・既存の結果に照らして再検査し、`Requeue`（カウンタ・履歴を0に戻して`pending`）／`Obsolete`／`Satisfied`（成功済み扱い。再計算しない）へ振り分ける。**外部へは送らない**。成功済み・待機中は変えない。検査できないものは戻さず`failed`のまま件数だけ報告する: handler未登録の種類（**いまの配布バイナリは全て**）、設定で今は使えない用途 |
 | `geoframe ai-jobs release-pause (--task <用途>｜--all)` | Provider・用途の停止の明示解除。`--task`は今の設定でその用途に当たる停止だけ（設定が未指定・不正なら何もせず終了コード2）、`--all`は全部 |
 
@@ -148,6 +148,7 @@ Rustだけが返す追加フィールドで、**あるときだけ**付く（AI�
 | `ai_config_invalid` | `{"code": <設定の誤りの固定コード>, "disabled_tasks": 5}`（設定が不正なときだけ。値・パスは出さない。写真の配信・管理は続く） |
 | `ai_jobs` | `{"total", "by_state", "by_kind", "reasons"}`（ジョブが1件でもあるとき。`reasons`は状態ごとの理由コードの件数で、`clock_rewound`・`budget_exhausted`・`provider_paused`・`interrupted`など。固定のコード以外は`other`にまとめる） |
 | `ai_pauses` | `[{"task", "scope", "reason"}]`（停止中のProvider・用途。解除はCLI） |
+| `ai_waits` | `{"items": [{"task", "scope": "entrance"\|"service", "reason", "until": "YYYY-MM-DDTHH:MM:SSZ"}], "unidentified": n}`（まだ有効な共有の一時待機を今の設定の用途に結び直したもの。`unidentified`は設定が使えず結び直せない件数で0なら出さない。待ちが無ければキーを出さない。期限はUTC。接続先・モデル・ハッシュは出さない。[ai-provider.md](ai-provider.md)の「共有の一時待機」） |
 
 STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解除・再試行のコマンドを文字で示す（画面からは操作できない）。
 

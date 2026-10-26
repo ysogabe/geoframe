@@ -455,7 +455,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | `db.infer_buckets` | `loc_source='inferred'`の行を窓のラベルで数える（NULLは`未計測`） |
 | `db.quality`・`db.ai` | 同じSQL。AIの`embedded`・`detailed`は`embedding_model`が**今のモデル**（`GEOFRAME_EMBED_BACKEND`。§1.1）の行だけ。`pending=max(0, eligible-embedded)` |
 | `db.loc` | `loc_status()`の移植。位置なし・撮影時刻ありの写真（`targets`）のうち、`photo_loc_clues`の判定が**今の画像**（表示ファイル、`md5`、`mtime`が一致）のものを判定済みとして`clue_pending`/`clue_passed`を数える。通る条件は、エラーが空、`clue`がNULLでなく、`clue>=0.2`または`kind='landmark'`。`days`は、撮影時刻順に「最大の窓以上の空き」か「日付の変わり目」で区切ったまとまりの数、`days_with_clue`は通る写真を含むまとまりの数。`runs_done`・`runs_error`は`photo_loc_runs`、`suggested`は位置なしの写真にある候補の数。`decision`・`last_at`は`settings.photo_loc_status`（Pythonのワーカーが前回の処理時に書くJSON）の`decision`・`at`で、**値の型のまま**出す。**Rustは Decision に問い合わせず、この値を書き換えない**。無い・壊れている・オブジェクトでないときは空文字（Pythonはオブジェクトでないと500） |
-| `ai_config_invalid`・`ai_jobs`・`ai_pauses`（Rustだけ。P4 / T4.1c） | **あるときだけ**トップレベルに付く（AIの設定が不正・AIジョブの行がある・Provider停止がある）。無ければキーを出さない（Pythonと同じ形）。固定のコードと件数だけで、ジョブの対象・接続先・モデル・パスは返さない。形は[ai-config.md](ai-config.md)の「管理画面のSTATUS」、停止と回収は§22 |
+| `ai_config_invalid`・`ai_jobs`・`ai_pauses`・`ai_waits`（Rustだけ。P4 / T4.1c・T4.2） | **あるときだけ**トップレベルに付く（AIの設定が不正・AIジョブの行がある・Provider停止がある・有効な共有の一時待機がある）。無ければキーを出さない（Pythonと同じ形）。固定のコードと件数だけで、ジョブの対象・接続先・モデル・パスは返さない。形は[ai-config.md](ai-config.md)の「管理画面のSTATUS」、停止と回収は§22 |
 | `disk` | §10.4 |
 | `server_time` | 現地時刻の`YYYY-MM-DD HH:MM:SS` |
 

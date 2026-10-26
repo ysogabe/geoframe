@@ -423,7 +423,7 @@ fn an_oversized_request_is_a_permanent_error_with_nothing_received() {
     let mut padded = fixtures::png(32, 32, None);
     let iend = padded.split_off(padded.len() - 12);
     let mut chunk = (2_500_000u32).to_be_bytes().to_vec();
-    chunk.extend_from_slice(b"pAdd");
+    chunk.extend_from_slice(b"IDAT");
     chunk.extend(std::iter::repeat_n(0u8, 2_500_000));
     chunk.extend_from_slice(&[0; 4]);
     padded.extend(chunk);
@@ -790,6 +790,67 @@ fn stop_prevents_discovery_and_posts_but_a_valid_inflight_answer_is_committed() 
     assert_eq!(lab.posts(), 1);
     assert_eq!(e.state(JobKind::LocationClue, "t"), JobState::Succeeded);
     assert_eq!(e.results(), 1);
+}
+
+/// 名前解決の最中に停止が来ても、要求は出ず、待ち・停止（pause）・失敗の試行回数のどれにも数えない
+/// （停止は固定の Shutdown の後回しになるだけ）。旧実装は停止後に Discovery の GET を出した。
+#[test]
+fn a_stop_during_name_resolution_is_not_counted_as_a_wait_pause_or_attempt() {
+    let e = env("prov-stop-dns");
+    let lab = new_lab();
+    let clue = clue_handler(&lab, request());
+    e.enqueue(&key(JobKind::LocationClue, "t"));
+    let stop = StopFlag::new();
+    let hook_stop = stop.clone();
+    lab.dns.on_lookup(move || hook_stop.stop());
+    e.cycle(&[Arc::clone(&clue)], &stop);
+    assert!(stop.is_stopped());
+    assert_eq!((clue.runs(), lab.requests(), lab.posts()), (1, 0, 0));
+    assert_eq!(lab.stub.bytes.load(Ordering::SeqCst), 0);
+    let row = e.row(JobKind::LocationClue, "t").unwrap();
+    assert_ne!(row.state, JobState::Failed);
+    assert_eq!((row.attempts, row.interruptions), (0, 0));
+    assert_eq!(wait_rows(&e), []);
+    assert_eq!(pause_rows(&e), []);
+}
+
+/// 画素データのあとにメタデータを足した JPEG は準備済み入力にならず、Decision のスタブには何も届かない。
+#[test]
+fn an_image_with_trailing_metadata_never_reaches_the_lab() {
+    let lab = new_lab();
+    let client = lab.client();
+    let _ = &client;
+    let base = fixtures::jpeg(32, 24);
+    for tail in [
+        fixtures::segment(0xE1, b"Exif\0\0II*\0"),
+        fixtures::segment(0xFE, b"hidden"),
+    ] {
+        let bad = fixtures::before_eoi(base.clone(), &tail);
+        assert_eq!(
+            PreparedImage::from_bytes(bad, ImageProfile::Decision).unwrap_err(),
+            super::image_input::ImageError::HasMetadata
+        );
+    }
+    // EOI の後ろに足したデータ
+    let mut after = base.clone();
+    after.extend_from_slice(b"trailing");
+    assert_eq!(
+        PreparedImage::from_bytes(after, ImageProfile::Decision).unwrap_err(),
+        super::image_input::ImageError::Malformed
+    );
+    // 切れた JPEG（SOS の直後）も同じ
+    let sos = fixtures::marker_positions(&base, 0xDA)[0];
+    let cut =
+        base[..sos + 2 + usize::from(u16::from_be_bytes([base[sos + 2], base[sos + 3]]))].to_vec();
+    assert!(PreparedImage::from_bytes(cut, ImageProfile::Decision).is_err());
+    assert_eq!(
+        (
+            lab.requests(),
+            lab.stub.connections.load(Ordering::SeqCst),
+            lab.stub.bytes.load(Ordering::SeqCst)
+        ),
+        (0, 0, 0)
+    );
 }
 
 #[test]

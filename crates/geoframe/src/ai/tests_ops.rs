@@ -17,6 +17,7 @@ use super::pause::{self, PauseReason};
 use super::settings::{AiConfig, AiConfigError, TaskKind};
 use super::tests_settings::SAMPLE;
 use super::tests_worker::{Fake, key};
+use super::waits::{self, WaitKey, WaitReason, WaitScope};
 use super::worker::{Clock, Handler};
 use crate::schema;
 use crate::testutil::TempDir;
@@ -115,7 +116,13 @@ fn the_report_of_an_old_database_without_ai_tables_is_empty_and_reads_only() {
     assert!(report.tasks.iter().all(|(_, s)| s.is_err()));
     // 追加のキーは 1 つも足さない（Python 版と同じ応答のまま）
     let mut out = Map::new();
-    ops::insert_admin_status(&mut out, &ro, None);
+    ops::insert_admin_status(
+        &mut out,
+        &ro,
+        None,
+        &waits::Identities::from_config(&config),
+        T0,
+    );
     assert!(out.is_empty(), "{out:?}");
     // 表は作られていない
     assert!(!super::tests::table_exists(&ro, "ai_jobs"));
@@ -136,7 +143,13 @@ fn the_config_states_are_fixed_codes_and_an_invalid_config_adds_only_a_code() {
     );
     let d = db("ops-config-status", Some("{"));
     let mut out = Map::new();
-    ops::insert_admin_status(&mut out, &d.read(), d.config.invalid());
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        d.config.invalid(),
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
     assert_eq!(
         out.get("ai_config_invalid").unwrap(),
         &serde_json::json!({"code": "syntax", "disabled_tasks": 5})
@@ -188,7 +201,13 @@ fn the_admin_keys_carry_counts_and_fixed_reasons_only() {
         })
         .unwrap();
     let mut out = Map::new();
-    ops::insert_admin_status(&mut out, &d.read(), None);
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        None,
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
     let jobs_json = out.get("ai_jobs").unwrap();
     assert_eq!(jobs_json["total"], 4);
     assert_eq!(jobs_json["by_state"]["deferred"], 2);
@@ -478,4 +497,209 @@ fn release_pause_by_task_does_nothing_when_the_config_cannot_identify_the_pause(
         ),
         Err(ReleaseError::ConfigUnavailable)
     );
+}
+
+// ---------------------------------------------------------------- 共有の一時待機の表示
+
+fn wait_key(provider: String, service: Option<String>) -> WaitKey {
+    WaitKey { provider, service }
+}
+
+/// 待ちを `until` まで DB に書く。
+fn put_wait(d: &Db, key: WaitKey, reason: WaitReason, until: i64) {
+    d.writer
+        .call(move |c| waits::set(c, &key, reason, until, T0))
+        .unwrap();
+}
+
+/// 有効な共有の待ちは、用途・範囲・固定の理由・UTC の期限だけを出す。入口全体は同じ Provider の全用途、
+/// サービス単体はそのサービスの用途だけ。古い設定の待ち・期限切れは出ない。
+#[test]
+fn live_shared_waits_are_shown_per_task_with_scope_reason_and_utc_deadline() {
+    let d = db("ops-waits", Some(SAMPLE));
+    let s = super::tests_settings::sample();
+    let local = s.provider_fingerprint(TaskKind::LocationClue).unwrap();
+    let cloud = s.provider_fingerprint(TaskKind::PhotoJudge).unwrap();
+    // 入口全体（LAN）: 画像・文の Embedding と clue の 3 用途
+    put_wait(
+        &d,
+        wait_key(local.clone(), None),
+        WaitReason::Leased,
+        T0 + 600,
+    );
+    // サービス単体（LAN の Embedding サービス）: 画像・文の Embedding だけ（clue の decision は別）
+    put_wait(
+        &d,
+        wait_key(
+            local,
+            Some(s.service_key(TaskKind::ImageEmbedding).unwrap()),
+        ),
+        WaitReason::NotReady,
+        T0 + 1_200,
+    );
+    // クラウドのモデル単位
+    put_wait(
+        &d,
+        wait_key(cloud, Some(s.service_key(TaskKind::PhotoJudge).unwrap())),
+        WaitReason::RateLimited,
+        T0 + 3_600,
+    );
+    // 古い設定の待ち（今の設定のどれにも当たらない）と、期限切れの待ち
+    put_wait(
+        &d,
+        wait_key("f".repeat(64), None),
+        WaitReason::Unreachable,
+        T0 + 900,
+    );
+    put_wait(
+        &d,
+        wait_key(
+            s.provider_fingerprint(TaskKind::LocationSuggest).unwrap(),
+            None,
+        ),
+        WaitReason::Busy,
+        T0 + 30,
+    );
+    let report = ops::report_at(&d.read(), &d.config, T0 + 60).unwrap();
+    let shown: Vec<(&str, &str, &str, i64)> = report
+        .waits
+        .waits
+        .iter()
+        .map(|w| {
+            (
+                w.task.as_str(),
+                w.scope.as_str(),
+                w.reason.as_str(),
+                w.until - T0,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            ("image_embedding", "entrance", "leased", 600),
+            ("image_embedding", "service", "not_ready", 1_200),
+            ("query_embedding", "entrance", "leased", 600),
+            ("query_embedding", "service", "not_ready", 1_200),
+            ("photo_judge", "service", "rate_limited", 3_600),
+            ("location_clue", "entrance", "leased", 600),
+        ]
+    );
+    assert_eq!(report.waits.unidentified, 0);
+
+    // STATUS の JSON: 固定の語だけ（ハッシュ・接続先・サービス ID・モデルは出ない）
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        None,
+        &waits::Identities::from_config(&d.config),
+        T0 + 60,
+    );
+    let items = out.get("ai_waits").unwrap()["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(items.len(), 6);
+    assert_eq!(
+        items[0],
+        serde_json::json!({"task": "image_embedding", "scope": "entrance",
+                           "reason": "leased", "until": waits::utc_iso(T0 + 600)})
+    );
+    assert!(out.get("ai_waits").unwrap().get("unidentified").is_none());
+    let text = serde_json::Value::Object(out).to_string();
+    for secret in [
+        "192.0.2.10",
+        "example-embed",
+        "example-judge",
+        "example-project",
+        &"f".repeat(64),
+    ] {
+        assert!(!text.contains(secret), "{secret}\n{text}");
+    }
+    assert!(!text.contains(&s.provider_fingerprint(TaskKind::LocationClue).unwrap()));
+
+    // 再起動のあと（新しい接続・設定の読み直し）も同じ表示
+    let again = db_reopen(&d);
+    let report2 = ops::report_at(&again.read(), &again.config, T0 + 60).unwrap();
+    assert_eq!(report2.waits, report.waits);
+
+    // 期限が来れば（行が残っていても）出ない。最後の期限（T0+3600）ちょうどでも出ない
+    let late = ops::report_at(&d.read(), &d.config, T0 + 3_600).unwrap();
+    assert!(late.waits.is_empty(), "{:?}", late.waits);
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        None,
+        &waits::Identities::from_config(&d.config),
+        T0 + 3_600,
+    );
+    assert!(!out.contains_key("ai_waits"));
+}
+
+/// 同じ DB と設定ファイルを新しく開き直す（再起動に当たる）。
+fn db_reopen(d: &Db) -> Db {
+    let dir = TempDir::new("ops-waits-reopen");
+    let config = ai_config(&dir, Some(SAMPLE));
+    Db {
+        _dir: dir,
+        path: d.path.clone(),
+        writer: Writer::open(&d.path, OpenMode::CreateIfMissing).unwrap(),
+        config,
+    }
+}
+
+/// 設定が不正・未指定で用途に結び直せないときは、件数だけ（値は出さない）。待ちが無ければキーを足さない。
+#[test]
+fn unidentifiable_waits_are_only_counted() {
+    let d = db("ops-waits-bad-config", Some(SAMPLE));
+    let s = super::tests_settings::sample();
+    put_wait(
+        &d,
+        wait_key(
+            s.provider_fingerprint(TaskKind::LocationClue).unwrap(),
+            None,
+        ),
+        WaitReason::Unreachable,
+        T0 + 600,
+    );
+    put_wait(
+        &d,
+        wait_key("a".repeat(64), Some("b".repeat(64))),
+        WaitReason::Busy,
+        T0 + 600,
+    );
+    let broken = db("ops-waits-bad-config2", Some("{"));
+    for config in [
+        &broken.config,
+        &ai_config(&TempDir::new("ops-waits-unset"), None),
+    ] {
+        let ids = waits::Identities::from_config(config);
+        let mut out = Map::new();
+        ops::insert_admin_status(&mut out, &d.read(), config.invalid(), &ids, T0 + 60);
+        assert_eq!(
+            out.get("ai_waits").unwrap(),
+            &serde_json::json!({"items": [], "unidentified": 2})
+        );
+        let text = serde_json::Value::Object(out).to_string();
+        assert!(!text.contains("aaaa") && !text.contains("bbbb"), "{text}");
+        let report = ops::report_at(&d.read(), config, T0 + 60).unwrap();
+        assert_eq!(
+            (report.waits.waits.len(), report.waits.unidentified),
+            (0, 2)
+        );
+    }
+    // 表の無い旧 DB・待ちの無い DB には何も足さない
+    let empty = db("ops-waits-none", Some(SAMPLE));
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &empty.read(),
+        None,
+        &waits::Identities::from_config(&empty.config),
+        T0,
+    );
+    assert!(out.is_empty(), "{out:?}");
+    assert_eq!(WaitScope::Entrance.as_str(), "entrance");
 }

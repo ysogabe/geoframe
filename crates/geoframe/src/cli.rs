@@ -946,6 +946,29 @@ fn format_ai_report(report: &ops::Report) -> String {
     for (state, code, count) in &report.reasons {
         let _ = writeln!(out, "理由 {} {code}: {count} 件", state.as_str());
     }
+    for w in &report.waits.waits {
+        let scope = match w.scope {
+            crate::ai::waits::WaitScope::Entrance => "入口全体",
+            crate::ai::waits::WaitScope::Service => "サービス単体",
+        };
+        let _ = writeln!(
+            out,
+            "待機中 {} {scope}: {}（期限 {} UTC）",
+            w.task.as_str(),
+            w.reason.as_str(),
+            crate::ai::waits::utc_iso(w.until)
+        );
+    }
+    if report.waits.unidentified > 0 {
+        let _ = writeln!(
+            out,
+            "待機中 用途を特定できない（設定が使えない）: {} 件",
+            report.waits.unidentified
+        );
+    }
+    if report.waits.is_empty() {
+        let _ = writeln!(out, "共有の一時待機: なし");
+    }
     if report.pauses.is_empty() {
         let _ = writeln!(out, "停止中の Provider・用途: なし");
     }
@@ -1265,9 +1288,46 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        // 共有の一時待機（入口全体と、設定に当たらない古い待ち）
+        let wait_settings = config.ai.settings().unwrap().clone();
+        writer
+            .call(move |c| {
+                let now = crate::ai::jobs::unix_now();
+                let entrance = crate::ai::waits::WaitKey {
+                    provider: wait_settings
+                        .provider_fingerprint(TaskKind::LocationClue)
+                        .unwrap(),
+                    service: None,
+                };
+                crate::ai::waits::set(
+                    c,
+                    &entrance,
+                    crate::ai::waits::WaitReason::Leased,
+                    now + 1_800,
+                    now,
+                )?;
+                let stale = crate::ai::waits::WaitKey {
+                    provider: "SECRET-OLD-PROVIDER".into(),
+                    service: None,
+                };
+                crate::ai::waits::set(
+                    c,
+                    &stale,
+                    crate::ai::waits::WaitReason::Unreachable,
+                    now + 1_800,
+                    now,
+                )
+            })
+            .unwrap();
         let read = crate::db::open_read_only(&config.db_path()).unwrap();
         let report = ops::report(&read, &config.ai).unwrap();
         let out = format_ai_report(&report);
+        assert!(
+            out.contains("待機中 location_clue 入口全体: leased（期限 20")
+                && out.contains(" UTC）"),
+            "{out}"
+        );
+        assert!(!out.contains("共有の一時待機: なし"), "{out}");
         assert!(out.contains("ジョブ location_clue failed: 1 件"), "{out}");
         assert!(out.contains("理由 failed interrupted: 1 件"), "{out}");
         assert!(

@@ -29,6 +29,7 @@ use serde_json::{Map, Value, json};
 use super::jobs::{self, ErrorCode, JobKind, JobState, RetryScope};
 use super::pause::{self, PauseInfo};
 use super::settings::{AiConfig, AiConfigError, Disabled, TaskKind};
+use super::waits;
 use super::worker::{Clock, Handler, task_for};
 use crate::writer::{WriteError, Writer};
 
@@ -52,6 +53,8 @@ pub struct Report {
     /// 後回し・失敗・待機中のジョブの理由コードごとの件数（状態、固定の理由コード）。
     pub reasons: Vec<(JobState, &'static str, i64)>,
     pub pauses: Vec<PauseInfo>,
+    /// まだ有効な共有の一時待機（今の設定の用途に結び直したもの。[`waits::view`]）。
+    pub waits: waits::WaitView,
 }
 
 /// 設定の状態。
@@ -65,6 +68,11 @@ pub fn config_state(ai: &AiConfig) -> ConfigState {
 
 /// 状態を読む（読み取りだけ。表が無ければ 0 件）。
 pub fn report(conn: &Connection, ai: &AiConfig) -> rusqlite::Result<Report> {
+    report_at(conn, ai, jobs::unix_now())
+}
+
+/// [`report`] の、待ちの期限を見る時刻（UTC の Unix 秒）を指定できる形。
+pub fn report_at(conn: &Connection, ai: &AiConfig, now: i64) -> rusqlite::Result<Report> {
     Ok(Report {
         config: config_state(ai),
         tasks: TaskKind::ALL
@@ -74,6 +82,7 @@ pub fn report(conn: &Connection, ai: &AiConfig) -> rusqlite::Result<Report> {
         jobs: jobs::status_counts(conn)?,
         reasons: reason_counts(conn)?,
         pauses: pause::list(conn)?,
+        waits: waits::view(conn, now, &waits::Identities::from_config(ai))?,
     })
 }
 
@@ -117,12 +126,18 @@ fn reason_counts(conn: &Connection) -> rusqlite::Result<Vec<(JobState, &'static 
 /// - `ai_jobs`: `{"total", "by_state": {状態: 件数}, "by_kind": {種類: {状態: 件数}}, "reasons": {状態: {理由: 件数}}}`。
 ///   理由は固定のコード（`clock_rewound`・`budget_exhausted`・`provider_paused`・`interrupted` など）だけ。
 /// - `ai_pauses`: `[{"task", "scope", "reason"}]`（Provider・用途の停止。解除は CLI）。
+/// - `ai_waits`: `{"items": [{"task", "scope": "entrance"|"service", "reason", "until": "YYYY-MM-DDTHH:MM:SSZ"}],
+///   "unidentified": 件数}`（まだ有効な共有の一時待機。`items` は今の設定の用途に結び直したもので、`unidentified` は
+///   設定が使えず結び直せない件数。どちらも空ならキーを足さない。`unidentified` は 0 なら出さない。接続先・モデル・
+///   サービス ID・ハッシュ・Provider の自由文は返さない。期限は UTC）。
 ///
 /// 読み取りの失敗は STATUS 全体を壊さない（足さないだけ）。
 pub fn insert_admin_status(
     out: &mut Map<String, Value>,
     conn: &Connection,
     invalid: Option<AiConfigError>,
+    wait_ids: &waits::Identities,
+    now: i64,
 ) {
     if let Some(code) = invalid {
         out.insert(
@@ -166,6 +181,24 @@ pub fn insert_admin_status(
             })
             .collect();
         out.insert("ai_pauses".into(), Value::Array(list));
+    }
+    if let Ok(view) = waits::view(conn, now, wait_ids)
+        && !view.is_empty()
+    {
+        let items: Vec<Value> = view
+            .waits
+            .iter()
+            .map(|w| {
+                json!({"task": w.task.as_str(), "scope": w.scope.as_str(),
+                       "reason": w.reason.as_str(), "until": waits::utc_iso(w.until)})
+            })
+            .collect();
+        let mut value = Map::new();
+        value.insert("items".into(), Value::Array(items));
+        if view.unidentified > 0 {
+            value.insert("unidentified".into(), json!(view.unidentified));
+        }
+        out.insert("ai_waits".into(), Value::Object(value));
     }
 }
 

@@ -86,7 +86,7 @@ async fn status_matches_python_and_the_prefix_forms_return_the_same() {
 /// 追加のキーを除いた応答。既存のキーの意味・値は Python 版のフィクスチャのまま。
 fn without_ai_ops(mut body: Value) -> Value {
     let map = body.as_object_mut().unwrap();
-    for key in ["ai_config_invalid", "ai_jobs", "ai_pauses"] {
+    for key in ["ai_config_invalid", "ai_jobs", "ai_pauses", "ai_waits"] {
         map.remove(key);
     }
     body
@@ -169,6 +169,96 @@ async fn ai_jobs_and_pauses_appear_as_counts_and_fixed_reasons_when_the_tables_h
     );
     let text = body.to_string();
     assert!(!text.contains("SECRET"), "{text}");
+}
+
+/// 有効な共有の一時待機だけが、今の設定の用途に結び直されて固定の語と UTC の期限で出る。期限切れ・古い設定の待ちは
+/// 出ず、接続先・モデル・ハッシュは返らない。待ちが無ければキーを足さない。
+#[tokio::test]
+async fn live_provider_waits_appear_with_task_scope_reason_and_utc_deadline_only() {
+    use geoframe::ai::settings::{AiConfig, TaskKind};
+    use geoframe::ai::waits::{WaitKey, WaitReason, set};
+
+    let fixture = admin_fixture();
+    let cfg_dir = TempDir::new("admin-ai-waits");
+    let path = cfg_dir.path().join("ai.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"local_base_url":"http://192.0.2.77:8100",
+            "tasks":{"location_clue":{"provider":"local","model":"secret-model-q7"}}}"#,
+    )
+    .unwrap();
+    let path = path.to_str().unwrap().to_string();
+    let config = AiConfig::load(&|k| (k == "GEOFRAME_AI_CONFIG").then(|| path.clone()));
+    let provider = config
+        .settings()
+        .unwrap()
+        .provider_fingerprint(TaskKind::LocationClue)
+        .unwrap();
+
+    let mut server = Server::start(&[("GEOFRAME_AI_CONFIG", &path)]).await;
+    geoframe::ai::migrate(&mut server.writer).unwrap();
+    // 待ちが無い（表だけある）なら何も足さない
+    let (_, body) = server.json("/api/admin/status").await;
+    assert!(body.get("ai_waits").is_none());
+
+    let now = geoframe::ai::jobs::unix_now();
+    let until = now + 1_800;
+    set(
+        &mut server.writer,
+        &WaitKey {
+            provider,
+            service: None,
+        },
+        WaitReason::Leased,
+        until,
+        now,
+    )
+    .unwrap();
+    // 古い設定の待ち・期限切れの待ち（行は残っていても出ない）
+    set(
+        &mut server.writer,
+        &WaitKey {
+            provider: "stale-provider-hash".into(),
+            service: None,
+        },
+        WaitReason::Unreachable,
+        until,
+        now,
+    )
+    .unwrap();
+    server
+        .writer
+        .execute(
+            "INSERT INTO ai_provider_waits(provider, service, reason, until, updated_at)
+             VALUES ('expired-provider-hash', '', 'busy', ?1, ?1)",
+            [now - 10],
+        )
+        .unwrap();
+    let (status, body) = server.json("/api/admin/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["ai_waits"],
+        json!({"items": [{
+            "task": "location_clue", "scope": "entrance", "reason": "leased",
+            "until": geoframe::ai::waits::utc_iso(until)
+        }]})
+    );
+    assert_eq!(without_ai_ops(body.clone()), fixture["status"]["gemini"]);
+    let text = body.to_string();
+    for secret in [
+        "192.0.2.77",
+        "secret-model-q7",
+        "stale-provider-hash",
+        "expired-provider-hash",
+    ] {
+        assert!(!text.contains(secret), "{secret}");
+    }
+    // 秒まで・Z つきの UTC
+    let shown = body["ai_waits"]["items"][0]["until"].as_str().unwrap();
+    assert!(
+        shown.len() == 20 && shown.ends_with('Z') && shown.as_bytes()[10] == b'T',
+        "{shown}"
+    );
 }
 
 #[tokio::test]

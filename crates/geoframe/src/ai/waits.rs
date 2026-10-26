@@ -21,12 +21,25 @@
 //! # 秘匿
 //!
 //! 保存するのはハッシュ化した識別（URL・サービス ID・モデル名そのものは入れない）・固定の理由・時刻だけ。
+//!
+//! # 管理表示（`ai-jobs status`・`/api/admin/status`・管理画面 STATUS）
+//!
+//! [`view`] が、**まだ有効な**待ち（`until` が今より先）を、**今の設定の用途**に結び直して返す。保存された識別
+//! （Provider・サービスのハッシュ）は用途名に引き直すだけで、ハッシュも接続先・サービス ID・モデル名・Provider の
+//! 自由文の `reason` も表示に出さない。出すのは用途名・範囲（`entrance`/`service`）・固定の理由・期限（UTC）だけ。
+//!
+//! - 入口全体の待ちは、同じ Provider の識別を持つ**全ての用途**の行になる。サービス単体の待ちは、そのサービスの識別を
+//!   持つ用途だけ。今の設定に当たらない待ち（古い設定の残り）は、何も止めていないので**出さない**。
+//! - 設定が未指定・不正で用途に結び直せないときは、有効な待ちの**件数だけ**（`unidentified`）を返す。
+//! - 期限が過ぎた待ちは出ない（行が残っていても数えない）。再起動の前後で同じ表示になる（DB の行から読み直す）。
+//! - 期限は UTC の ISO 8601（`YYYY-MM-DDTHH:MM:SSZ`、秒まで）。
 
 use std::collections::HashMap;
 
 use rusqlite::{Connection, params};
 
 use super::jobs::{MAX_DEFER_SECS, MIN_DEFER_SECS};
+use super::settings::{AiConfig, TaskKind};
 
 pub const TABLES: &[&str] = &["ai_provider_waits"];
 
@@ -49,6 +62,15 @@ pub enum WaitScope {
     Entrance,
     /// そのサービスを使う用途だけ。
     Service,
+}
+
+impl WaitScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Entrance => "entrance",
+            Self::Service => "service",
+        }
+    }
 }
 
 /// 待ちの理由（固定の列挙だけを保存・表示する。Provider の自由文の `reason` は使わない）。
@@ -75,6 +97,18 @@ impl WaitReason {
             Self::RateLimited => "rate_limited",
             Self::Busy => "busy",
         }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        [
+            Self::Unreachable,
+            Self::Leased,
+            Self::NotReady,
+            Self::RateLimited,
+            Self::Busy,
+        ]
+        .into_iter()
+        .find(|r| r.as_str() == text)
     }
 }
 
@@ -179,4 +213,149 @@ pub fn blocks(
             service: Some(s.to_string()),
         })
     })
+}
+
+// ---------------------------------------------------------------- 管理表示
+
+/// 今の設定での、用途ごとの待ちの識別（メモリの中だけ。表示には出さない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identities {
+    /// 設定が使えて、用途に結び直せるか（未指定・不正なら `false`）。
+    identifiable: bool,
+    tasks: Vec<(TaskKind, String, String)>,
+}
+
+impl Identities {
+    /// 今の設定から作る。未指定・不正なら結び直せない。
+    pub fn from_config(ai: &AiConfig) -> Self {
+        let Some(settings) = ai.settings() else {
+            return Self {
+                identifiable: false,
+                tasks: Vec::new(),
+            };
+        };
+        let tasks = TaskKind::ALL
+            .into_iter()
+            .filter_map(|task| {
+                Some((
+                    task,
+                    settings.provider_fingerprint(task)?,
+                    settings.service_key(task)?,
+                ))
+            })
+            .collect();
+        Self {
+            identifiable: true,
+            tasks,
+        }
+    }
+}
+
+/// 表示する有効な待ち 1 件（用途ごと）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveWait {
+    pub task: TaskKind,
+    pub scope: WaitScope,
+    pub reason: WaitReason,
+    /// UTC の Unix 秒。
+    pub until: i64,
+}
+
+/// 表示用の待ちの集計。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WaitView {
+    pub waits: Vec<ActiveWait>,
+    /// 設定が使えず用途に結び直せない、有効な待ちの件数（値は出さない）。
+    pub unidentified: usize,
+}
+
+impl WaitView {
+    pub fn is_empty(&self) -> bool {
+        self.waits.is_empty() && self.unidentified == 0
+    }
+}
+
+/// `now` にまだ有効な待ちを、今の設定の用途に結び直して返す（読み取りだけ。表が無い旧 DB は空）。
+pub fn view(conn: &Connection, now: i64, ids: &Identities) -> rusqlite::Result<WaitView> {
+    let mut out = WaitView::default();
+    if !super::jobs::object_exists(conn, "table", "ai_provider_waits")? {
+        return Ok(out);
+    }
+    let mut stmt = conn
+        .prepare("SELECT provider, service, reason, until FROM ai_provider_waits WHERE until>?1")?;
+    let rows = stmt.query_map([now], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (provider, service, reason, until) = row?;
+        let Some(reason) = WaitReason::parse(&reason) else {
+            continue;
+        };
+        if !ids.identifiable {
+            out.unidentified += 1;
+            continue;
+        }
+        for (task, task_provider, task_service) in &ids.tasks {
+            if *task_provider != provider {
+                continue;
+            }
+            let scope = if service == ENTRANCE {
+                WaitScope::Entrance
+            } else if *task_service == service {
+                WaitScope::Service
+            } else {
+                continue;
+            };
+            out.waits.push(ActiveWait {
+                task: *task,
+                scope,
+                reason,
+                until,
+            });
+        }
+    }
+    // 用途の順、同じ用途では入口全体が先
+    out.waits
+        .sort_by_key(|w| (w.task, w.scope == WaitScope::Service, w.until));
+    Ok(out)
+}
+
+/// UTC の Unix 秒を `YYYY-MM-DDTHH:MM:SSZ` にする（先発グレゴリオ暦。Howard Hinnant の `civil_from_days`）。
+pub fn utc_iso(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3_600,
+        rem % 3_600 / 60,
+        rem % 60
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utc_iso;
+
+    #[test]
+    fn utc_dates_are_formatted_as_iso_8601() {
+        assert_eq!(utc_iso(0), "1970-01-01T00:00:00Z");
+        assert_eq!(utc_iso(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(utc_iso(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(utc_iso(1_782_432_000 + 3_661), "2026-06-26T01:01:01Z");
+        assert_eq!(utc_iso(-1), "1969-12-31T23:59:59Z");
+    }
 }

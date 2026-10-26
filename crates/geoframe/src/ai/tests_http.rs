@@ -31,6 +31,8 @@ pub(super) struct FakeDns {
     delay: Mutex<Duration>,
     running: AtomicUsize,
     pub max_running: AtomicUsize,
+    /// 名前解決の最中に呼ぶ処理（停止の合図を立てるなど。解決結果を返す直前）。
+    on_lookup: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl FakeDns {
@@ -41,7 +43,13 @@ impl FakeDns {
             delay: Mutex::new(Duration::ZERO),
             running: AtomicUsize::new(0),
             max_running: AtomicUsize::new(0),
+            on_lookup: Mutex::new(None),
         })
+    }
+
+    /// 名前解決の最中（結果を返す直前）に `f` を呼ぶ。
+    pub fn on_lookup(&self, f: impl Fn() + Send + Sync + 'static) {
+        *self.on_lookup.lock().unwrap() = Some(Arc::new(f));
     }
 
     /// `host` の解決結果を差し込む。呼び出しごとに先頭から順に使い、最後の結果は繰り返す。
@@ -61,6 +69,10 @@ impl Lookup for Arc<FakeDns> {
         self.max_running.fetch_max(now, Ordering::SeqCst);
         let delay = *self.delay.lock().unwrap();
         std::thread::sleep(delay);
+        let hook = self.on_lookup.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook();
+        }
         self.running.fetch_sub(1, Ordering::SeqCst);
         let table = self.table.lock().unwrap();
         match table.get(host) {
@@ -93,6 +105,8 @@ pub(super) struct Stub {
     pub addr: SocketAddr,
     pub connections: Arc<AtomicUsize>,
     pub requests: Arc<Mutex<Vec<Captured>>>,
+    /// 受け取ったバイト数（要求の一部でも届いていれば 0 でなくなる）。
+    pub bytes: Arc<AtomicUsize>,
 }
 
 pub(super) fn respond(stream: &mut TcpStream, status: &str, headers: &str, body: &[u8]) {
@@ -105,6 +119,16 @@ pub(super) fn respond(stream: &mut TcpStream, status: &str, headers: &str, body:
 }
 
 pub(super) fn stub(handler: impl Fn(&mut TcpStream, &Captured) + Send + Sync + 'static) -> Stub {
+    stub_with_first_bytes(|| {}, handler)
+}
+
+/// 最初のバイトが届いた瞬間（要求を読み切る前）に `first_bytes` を呼ぶスタブ。
+pub(super) fn stub_with_first_bytes(
+    first_bytes: impl Fn() + Send + Sync + 'static,
+    handler: impl Fn(&mut TcpStream, &Captured) + Send + Sync + 'static,
+) -> Stub {
+    let first_bytes: Arc<dyn Fn() + Send + Sync> = Arc::new(first_bytes);
+    let bytes = Arc::new(AtomicUsize::new(0));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let connections = Arc::new(AtomicUsize::new(0));
@@ -112,13 +136,15 @@ pub(super) fn stub(handler: impl Fn(&mut TcpStream, &Captured) + Send + Sync + '
     let handler: Arc<Handler> = Arc::new(handler);
     {
         let (connections, requests) = (Arc::clone(&connections), Arc::clone(&requests));
+        let bytes = Arc::clone(&bytes);
         std::thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 connections.fetch_add(1, Ordering::SeqCst);
                 let (handler, requests) = (Arc::clone(&handler), Arc::clone(&requests));
+                let (bytes, first_bytes) = (Arc::clone(&bytes), Arc::clone(&first_bytes));
                 std::thread::spawn(move || {
-                    let Some(captured) = read_request(&mut stream) else {
+                    let Some(captured) = read_request(&mut stream, &bytes, &*first_bytes) else {
                         return;
                     };
                     requests.lock().unwrap().push(captured.clone());
@@ -131,10 +157,15 @@ pub(super) fn stub(handler: impl Fn(&mut TcpStream, &Captured) + Send + Sync + '
         addr,
         connections,
         requests,
+        bytes,
     }
 }
 
-fn read_request(stream: &mut TcpStream) -> Option<Captured> {
+fn read_request(
+    stream: &mut TcpStream,
+    total: &AtomicUsize,
+    first_bytes: &(dyn Fn() + Send + Sync),
+) -> Option<Captured> {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .ok()?;
@@ -147,6 +178,9 @@ fn read_request(stream: &mut TcpStream) -> Option<Captured> {
         let n = stream.read(&mut chunk).ok()?;
         if n == 0 {
             return None;
+        }
+        if total.fetch_add(n, Ordering::SeqCst) == 0 {
+            first_bytes();
         }
         buf.extend_from_slice(&chunk[..n]);
     };
@@ -168,6 +202,7 @@ fn read_request(stream: &mut TcpStream) -> Option<Captured> {
         if n == 0 {
             return None;
         }
+        total.fetch_add(n, Ordering::SeqCst);
         have += n;
     }
     Some(Captured {
@@ -733,6 +768,220 @@ fn a_stopped_flag_sends_nothing() {
     );
     assert_eq!(server.connections.load(Ordering::SeqCst), 0);
     assert_eq!(dns.calls.load(Ordering::SeqCst), 0);
+}
+
+// ---------------------------------------------------------------- 停止: 要求を書き始める境界
+
+/// 停止の合図を立てるクロージャー（DNS・スタブの差し込みから呼ぶ）。
+fn stopper(stop: &StopFlag) -> impl Fn() + Send + Sync + 'static {
+    let stop = stop.clone();
+    move || stop.stop()
+}
+
+fn started_session(http: &AiHttp, stop: &StopFlag) -> super::http::Session {
+    http.session(Lane::Background, Duration::ZERO, stop)
+        .unwrap()
+}
+
+/// 名前解決の最中に停止が来て、解決は（ループバックを）返す: 接続も要求も出ない。
+/// 旧実装（`send` の入口だけで確認）は、このあと接続して要求を送った。
+#[test]
+fn a_stop_during_name_resolution_connects_and_sends_nothing() {
+    let server = stub(|s, _| respond(s, "200 OK", "", b"{}"));
+    let dns = FakeDns::new();
+    let http = lab_http(server.addr, &dns);
+    let stop = StopFlag::new();
+    let session = started_session(&http, &stop);
+    dns.on_lookup(stopper(&stop));
+    assert_eq!(
+        session
+            .get(Endpoint::Catalog, &Deadline::after(Duration::from_secs(5)))
+            .unwrap_err(),
+        HttpError::Stopping
+    );
+    assert_eq!(dns.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(server.connections.load(Ordering::SeqCst), 0);
+    assert_eq!(server.bytes.load(Ordering::SeqCst), 0);
+    // POST も同じ（本文があっても出ない）
+    drop(session);
+    let stop = StopFlag::new();
+    dns.on_lookup(stopper(&stop));
+    let session = started_session(&http, &stop);
+    assert_eq!(
+        session
+            .post_json(
+                Endpoint::DecisionSystemOne,
+                b"{\"x\":1}",
+                &Deadline::after(Duration::from_secs(5))
+            )
+            .unwrap_err(),
+        HttpError::Stopping
+    );
+    assert_eq!(
+        (
+            server.connections.load(Ordering::SeqCst),
+            server.bytes.load(Ordering::SeqCst)
+        ),
+        (0, 0)
+    );
+}
+
+/// 接続（TCP の確立）を終えたあと、要求を書き始める前に停止が来た: 接続は張られているが、要求のバイトは 0。
+/// 旧実装は DNS の前しか確認しなかったので、ここで要求を送って 200 を受けた。
+#[test]
+fn a_stop_after_the_connection_is_made_writes_no_request_bytes() {
+    let server = stub(|s, _| respond(s, "200 OK", "", b"{}"));
+    let dns = FakeDns::new();
+    dns.script("lab.test", vec![vec![server.addr]]);
+    let stop = StopFlag::new();
+    let http = AiHttp::with_lookup_and_connect_hook(
+        &format!("http://lab.test:{}", server.addr.port()),
+        Arc::new(Arc::clone(&dns)),
+        Arc::new(stopper(&stop)),
+    )
+    .unwrap();
+    let session = started_session(&http, &stop);
+    assert_eq!(
+        session
+            .get(Endpoint::Catalog, &Deadline::after(Duration::from_secs(5)))
+            .unwrap_err(),
+        HttpError::Stopping
+    );
+    assert!(stop.is_stopped());
+    // 接続を張ったことは受け側に見えるが、HTTP のバイトは 1 つも届かない
+    let started = Instant::now();
+    while server.connections.load(Ordering::SeqCst) == 0
+        && started.elapsed() < Duration::from_secs(2)
+    {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.connections.load(Ordering::SeqCst), 1);
+    assert_eq!(server.bytes.load(Ordering::SeqCst), 0);
+    assert!(server.requests.lock().unwrap().is_empty());
+    // POST（本文あり）も同じ
+    let stop = StopFlag::new();
+    let http = AiHttp::with_lookup_and_connect_hook(
+        &format!("http://lab.test:{}", server.addr.port()),
+        Arc::new(Arc::clone(&dns)),
+        Arc::new(stopper(&stop)),
+    )
+    .unwrap();
+    assert_eq!(
+        started_session(&http, &stop)
+            .post_json(
+                Endpoint::DecisionSystemOne,
+                &vec![b'x'; 100_000],
+                &Deadline::after(Duration::from_secs(5))
+            )
+            .unwrap_err(),
+        HttpError::Stopping
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(server.bytes.load(Ordering::SeqCst), 0);
+}
+
+/// 要求を書き始めたあとに停止が来ても、残りの本文の送信・応答の受信・結果の確定は止めない。
+#[test]
+fn a_stop_after_the_first_byte_does_not_cut_the_exchange() {
+    let stop = StopFlag::new();
+    let server = stub_with_first_bytes(stopper(&stop), |s, req| {
+        // 本文は全部届いてから応答する
+        assert_eq!(req.body_len, 3 << 20);
+        respond(s, "200 OK", "", b"{\"ok\":true}");
+    });
+    let dns = FakeDns::new();
+    let http = lab_http(server.addr, &dns);
+    let session = started_session(&http, &stop);
+    let reply = session
+        .post_json(
+            Endpoint::DecisionSystemOne,
+            &vec![b'x'; 3 << 20],
+            &Deadline::after(Duration::from_secs(20)),
+        )
+        .unwrap();
+    // 最初のバイトが届いた時点で停止の合図が立っている
+    assert!(stop.is_stopped());
+    assert_eq!(
+        (reply.status, reply.body.as_slice()),
+        (200, b"{\"ok\":true}".as_slice())
+    );
+    assert_eq!(server.requests.lock().unwrap().len(), 1);
+    assert!(server.bytes.load(Ordering::SeqCst) >= 3 << 20);
+}
+
+/// 接続プールの再利用でも、要求を書く前の確認が効く。keep-alive のスタブで 2 回続けて成功し（接続は 1 本）、
+/// 3 回目は停止で、スタブの受信は増えない。
+#[test]
+fn a_pooled_connection_is_gated_per_request_and_still_reused() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let served = Arc::new(AtomicUsize::new(0));
+    {
+        let (connections, served) = (Arc::clone(&connections), Arc::clone(&served));
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                connections.fetch_add(1, Ordering::SeqCst);
+                let served = Arc::clone(&served);
+                std::thread::spawn(move || {
+                    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(n) if n > 0 => buf.extend_from_slice(&chunk[..n]),
+                                _ => return,
+                            }
+                        }
+                        buf.clear();
+                        served.fetch_add(1, Ordering::SeqCst);
+                        let body = b"{}";
+                        let head =
+                            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+                        if stream.write_all(head.as_bytes()).is_err()
+                            || stream.write_all(body).is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+    }
+    let dns = FakeDns::new();
+    dns.script("lab.test", vec![vec![addr]]);
+    let http = AiHttp::with_lookup(
+        &format!("http://lab.test:{}", addr.port()),
+        Arc::new(Arc::clone(&dns)),
+    )
+    .unwrap();
+    let stop = StopFlag::new();
+    for _ in 0..2 {
+        let reply = started_session(&http, &stop)
+            .get(Endpoint::Catalog, &Deadline::after(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(reply.status, 200);
+    }
+    assert_eq!(
+        (
+            connections.load(Ordering::SeqCst),
+            served.load(Ordering::SeqCst)
+        ),
+        (1, 2)
+    );
+    // 3 回目: 名前解決の最中に停止
+    dns.on_lookup(stopper(&stop));
+    assert_eq!(
+        started_session(&http, &stop)
+            .get(Endpoint::Catalog, &Deadline::after(Duration::from_secs(5)))
+            .unwrap_err(),
+        HttpError::Stopping
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(served.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

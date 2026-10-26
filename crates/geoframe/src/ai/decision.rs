@@ -478,11 +478,11 @@ mod tests {
     #[test]
     fn oversized_request_json_is_refused_before_it_is_sent() {
         // 画像 1 枚が 8,000,000 バイトに近いと base64 で 8 MiB を超える（上流の 16 MiB より厳しい側を優先）
-        // 未知の補助チャンクで余白を作る（形式検査は寸法とメタデータのチャンクだけを見る）
+        // IDAT で余白を作る（PNG は許可したチャンクだけ通る。IDAT の中身は見ない）
         let mut padded = fixtures::png(32, 32, None);
         let iend = padded.split_off(padded.len() - 12);
         let mut chunk = (6_300_000u32).to_be_bytes().to_vec();
-        chunk.extend_from_slice(b"pAdd");
+        chunk.extend_from_slice(b"IDAT");
         chunk.extend(std::iter::repeat_n(0u8, 6_300_000));
         chunk.extend_from_slice(&[0; 4]);
         padded.extend(chunk);

@@ -195,6 +195,10 @@ impl Resolver for PinResolver {
             return Err(ureq::Error::HostNotFound);
         }
         vet(&addrs).map_err(deny)?;
+        // 名前解決を待っている間に停止が来ていれば、接続しない（要求の書き込み前の確認は gate.rs）
+        if super::gate::stopped() {
+            return Err(ureq::Error::Other(Box::new(super::gate::StopRequested)));
+        }
         let mut out: ResolvedSocketAddrs =
             ArrayVec::from_fn(|_| SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0));
         for addr in addrs {

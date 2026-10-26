@@ -44,6 +44,8 @@ pub struct AdminContext {
     pub embed_model: &'static str,
     /// AI の設定が不正なときの固定のコード（`ai_config_invalid`。値・パスは持たない）。
     pub ai_config_invalid: Option<crate::ai::settings::AiConfigError>,
+    /// 今の AI 設定の用途ごとの待ちの識別（`ai_waits` を用途に結び直す。ハッシュはメモリの中だけで、応答には出さない）。
+    pub ai_waits: crate::ai::waits::Identities,
 }
 
 impl AdminContext {
@@ -53,6 +55,7 @@ impl AdminContext {
             infer_windows_s: config.infer_windows_s(),
             embed_model: config.embed_backend.model(),
             ai_config_invalid: config.ai.invalid(),
+            ai_waits: crate::ai::waits::Identities::from_config(&config.ai),
         }
     }
 }
@@ -133,9 +136,15 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
             "loc": loc_status(conn, ctx)?,
         }),
     );
-    // P4（Rust だけが返す追加フィールド）: AI の設定の誤り・ジョブ・停止の集計。あるときだけ足すので、
+    // P4（Rust だけが返す追加フィールド）: AI の設定の誤り・ジョブ・停止・共有の一時待機の集計。あるときだけ足すので、
     // AI の表も設定の誤りも停止も無い DB（Python 版と同じ応答）には 1 つも足さない
-    crate::ai::ops::insert_admin_status(&mut out, conn, ctx.ai_config_invalid);
+    crate::ai::ops::insert_admin_status(
+        &mut out,
+        conn,
+        ctx.ai_config_invalid,
+        &ctx.ai_waits,
+        crate::ai::jobs::unix_now(),
+    );
     Ok(out)
 }
 
