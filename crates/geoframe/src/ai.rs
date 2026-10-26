@@ -1,8 +1,9 @@
 //! P4: AI の実行基盤。永続ジョブ（[`jobs`]）、設定（[`settings`]）、クラウド送信の予算（[`budget`]）、
-//! Provider の一時停止（[`pause`]）。HTTP・ワーカー・Provider は後続のタスク。
+//! Provider の一時停止（[`pause`]）、起動 ID と停止開始の記録（[`runs`]）、背景ワーカー（[`worker`]）、
+//! 管理操作（[`ops`]。CLI と STATUS）。HTTP・Provider・用途別の handler は後続のタスク。
 //! 設計は `docs/rust-migration/p4-design.md` §3・§4。
 //!
-//! 追加の表（`ai_jobs`・`ai_request_usage`・`ai_provider_pauses`）は Python と同じスキーマの再現
+//! 追加の表（`ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_worker_runs`）は Python と同じスキーマの再現
 //! （[`crate::schema::migrate`]）には入れず、取り込みが有効な起動で [`migrate`] が足す。`INGEST=0`
 //! （読み取り専用）の起動では作らず、表が無い旧 DB は `db::REQUIRED_SCHEMA` を満たしたまま読める。
 
@@ -10,21 +11,29 @@ use rusqlite::{Connection, TransactionBehavior};
 
 pub mod budget;
 pub mod jobs;
+pub mod ops;
 pub mod pause;
+pub mod runs;
 pub mod settings;
+pub mod worker;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_ops;
+#[cfg(test)]
 mod tests_settings;
 #[cfg(test)]
 mod tests_store;
+#[cfg(test)]
+mod tests_worker;
 
 /// まだ無い AI の表・索引・列の名前（読み取りだけ。`--dry-run` 用）。
 pub fn pending(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut missing = jobs::pending(conn)?;
     missing.extend(missing_tables(conn, budget::TABLES)?);
     missing.extend(missing_tables(conn, pause::TABLES)?);
+    missing.extend(missing_tables(conn, runs::TABLES)?);
     Ok(missing)
 }
 
@@ -34,6 +43,7 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
     let mut created = jobs::migrate(conn)?;
     created.extend(create_tables(conn, budget::TABLES, budget::SCHEMA)?);
     created.extend(create_tables(conn, pause::TABLES, pause::SCHEMA)?);
+    created.extend(create_tables(conn, runs::TABLES, runs::SCHEMA)?);
     Ok(created)
 }
 

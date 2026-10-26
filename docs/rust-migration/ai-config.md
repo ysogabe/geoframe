@@ -94,4 +94,65 @@
 
 ## ハッシュ・停止
 
-設定全体のハッシュ・用途の送信ポリシーのハッシュ（SHA-256）は監査と送信可否の検査用で、**ジョブの冪等キーには入れない**（URL・許可・上限だけの変更で成功済みの結果を再送しないため）。Providerの一時停止（認証の失敗・403・モデル404・契約不一致。`ai_provider_pauses`）は、接続先・認証・モデルなど**その理由に関係する設定だけ**から識別を作り、再起動では解除されず、関係する設定が変わるか管理CLI（T4.1c）の明示の解除で効かなくなる。全ジョブを`failed`にはしない。
+設定全体のハッシュ・用途の送信ポリシーのハッシュ（SHA-256）は監査と送信可否の検査用で、**ジョブの冪等キーには入れない**（URL・許可・上限だけの変更で成功済みの結果を再送しないため）。Providerの一時停止（認証の失敗・403・モデル404・契約不一致。`ai_provider_pauses`）は、接続先・認証・モデルなど**その理由に関係する設定だけ**から識別を作り、再起動では解除されず、関係する設定が変わるか管理CLI（`geoframe ai-jobs release-pause`。下の「管理操作」）の明示の解除で効かなくなる。全ジョブを`failed`にはしない。
+
+## 背景ワーカー（T4.1c）
+
+専用スレッド1本が、既存のwriter（`Ingest.writer`）と`.ingest.lock`（`LockHold`）を共有して動く（`ai::worker`）。**いまの配布バイナリは用途別の処理（handler）を1つも登録していない**（`production_handlers()`は空。fakeのProvider・スタブの設定は置かない）。実際のAI処理は後続のタスク（T4.2のDecision、T4.4の画像Embedding、T4.6の位置候補）が`Handler`を実装して登録する。登録が無い種類のジョブは、claimも成功化もされず`pending`/`deferred`のまま残る。
+
+- **起動の条件**: `GEOFRAME_INGEST=1`かつ`GEOFRAME_AI_ENABLED=1`かつ有効な背景用途が1つ以上。`query_embedding`は利用者を待たせる対話の用途で、永続キューの背景ジョブではない。`INGEST=0`では何も起動せず、AIの表を作らず、ジョブの回収もProvider停止の整理もしない。
+- **起動の準備**（`INGEST=1`なら、ワーカーが無効でも。ロックを取ったあと）: ①前の起動の`running`を回収する。停止開始が記録された起動のものは数えず`deferred/shutdown`、記録の無いもの（`SIGKILL`・クラッシュ・電源断）は`interruption_count`を加算して3回で`failed`。②設定が**有効なときだけ**、関係する設定が変わって効かなくなったProvider停止を整理する（`release_unmatched`）。設定が未指定・不正のときは、現在の識別が分からないので既存の停止を1件も消さない。
+- **種類と用途**: `image_embedding`→`image_embedding`、`location_clue`→`location_clue`、`location_suggest`・`location_geocode`→`location_suggest`（geocodeはLLMのroutingを持たず、位置候補の後続として同じ用途の有効・無効・停止・上限に従う）、`photo_judge`→`photo_judge`。
+- **1周期**（`GEOFRAME_AI_POLL_S`ごと、起動直後にも）: ①reconcile: 使える用途のhandlerが現在の写真・結果から導いたキーを積む（冪等。別世代は`obsolete`）。設定で許可されない用途は積まない。②登録済みで使える種類だけでclaim→writerの外で`Handler::run`→writerで確定（token・入力世代の確認つき）、を空になるまで繰り返す。使えない種類は**claimの対象から外すだけ**で、他の種類は進む: 未登録、設定で無効（`Disabled`）、Provider・用途の停止中、Provider側の待ち（利用不可・429・予算切れ）、1周期の上限（上の表の`*_PER_CYCLE`。LANの用途にも効く）に達した用途。
+- **送る直前の確認**: handlerは外部へ送る**直前に毎回**`RunCtx::before_send`を呼ぶ。停止の合図→今の設定の送信可否→Provider・用途の停止→（クラウドの用途は）送信予算の予約、の順に再評価し、全部通ったときだけ接続情報（`Gate`）を返す。送る直前に、DBの行・入力世代・hiddenを読み直して古ければ`RunError::InputChanged`（ジョブは`obsolete`で送らない）。writerやトランザクションを外部I/Oの間は持たない（`RunCtx::read`は読み取り専用の接続）。
+- **実行エラーの分類**（`RunError`。固定のenum。例外の本文・URL・応答は持たない）:
+
+| `RunError` | ジョブ | その他 |
+|---|---|---|
+| `Stopping` | `deferred/shutdown`（失敗に数えない） | 送っていない |
+| `InputChanged` | `obsolete` | |
+| `PolicyDisabled` | `deferred/policy_disabled`（失敗に数えない） | 後続のhandlerは`Disabled`をこれに対応付ける |
+| `Paused` | `deferred/provider_paused` | |
+| `Budget(予約の結果)` | `deferred`。1日の枠切れ・周期の枠切れは`budget_exhausted`（待ちは3600秒・周期窓の長さ）、時計の巻き戻りは`clock_rewound`（600秒）、順番待ちの超過などは`internal` | その用途を待ちの間は送らない。**予算をリセットする救済は無い**（時計が履歴に追いつくまで送らない） |
+| `Unavailable` | `deferred/unavailable`（60秒後以降） | その用途を60秒送らない（用途単位。同じ入口の他の用途は進む。Provider全体の到達不能を複数用途へ広げるのはT4.2のDiscovery） |
+| `RateLimited` | `deferred/rate_limited`（Retry-Afterを60〜3600秒に収める） | その用途をその間送らない |
+| `Attempt` / `Repeated` / `Permanent` | 失敗1回（5回で`failed`）／反復失敗（3回目から失敗に数える）／即`failed` | `jobs::Failure`と同じ |
+| `ProviderPause` / `TaskPause` | 失敗に数えず後回し | 停止をDBに記録（再起動では解除されない） |
+
+handlerの**panic**は当該ジョブの失敗1回（`panic`。5回で`failed`）に数え、同じジョブが全AIを塞ぐ無限ループにならない。
+
+### 停止と回収
+
+- **SIGTERMを受けた直後に**共有の`StopFlag`が立つ（HTTPのgraceful shutdownが終わるのを待たない）。ワーカーはclaimの前と送信の直前に確かめ、止まっていればclaimも送信もしない。claim済みで送る前に止まったジョブは`deferred/shutdown`に戻る（失敗にも中断にも数えない）。
+- 起動IDと**停止開始**は`ai_worker_runs`（起動ID・開始・停止開始の時刻）に残る。停止開始はSIGTERMの直後に専用の小さなスレッドが書く。
+- ワーカーのjoinの間（最大10秒）はtokenが有効で、待っていた**有効な応答は確定される**（受信済みの有償結果を一律に捨てない）。joinの期限までに終わらないhandlerは、スレッドごと残り（`LockHold`を持ったまま。別の書き手は始まらない）、最後の戻し（`deferred/shutdown`・token失効）のあとに届いた応答は保存されない。
+- 停止開始の記録も最後の戻しも**共通期限つき**（`Writer::call_within`）で、writerが忙しくても停止の期限を越えて待たない。最後の戻しが書けなかった場合も、次の起動の回収が停止開始の記録で区別するので、予期しない中断として加算しない。
+
+### 管理操作（`geoframe ai-jobs`）
+
+| コマンド | 内容 |
+|---|---|
+| `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、用途ごとの使える／使えない（固定の理由コード）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途 |
+| `geoframe ai-jobs retry (--kind <種類>｜--all)` | `failed`だけを、登録済みhandlerが現在の入力・既存の結果に照らして再検査し、`Requeue`（カウンタ・履歴を0に戻して`pending`）／`Obsolete`／`Satisfied`（成功済み扱い。再計算しない）へ振り分ける。**外部へは送らない**。成功済み・待機中は変えない。検査できないものは戻さず`failed`のまま件数だけ報告する: handler未登録の種類（**いまの配布バイナリは全て**）、設定で今は使えない用途 |
+| `geoframe ai-jobs release-pause (--task <用途>｜--all)` | Provider・用途の停止の明示解除。`--task`は今の設定でその用途に当たる停止だけ（設定が未指定・不正なら何もせず終了コード2）、`--all`は全部 |
+
+`retry`と`release-pause`は**書く**ので、`GEOFRAME_INGEST=1`、検証環境のガード（`sync`と同じ印・Pythonの確認）、`.ingest.lock`、writerを通す。稼働中の`serve`はロックを持つので、**サービスを止めてから**実行する（稼働中は終了コード1で断る）。出力は件数・用途・固定の理由コードだけで、対象のキー・入力のhash・token・起動ID・モデル・URL・パス・写真の値は出さず、生の対象IDも引数に取らない（範囲は種類・用途単位）。
+
+### 管理画面のSTATUS（`GET /api/admin/status`の追加キー）
+
+Rustだけが返す追加フィールドで、**あるときだけ**付く（AIの表も設定の誤りも停止も無いDB、Python版の応答には1つも付かず、既存のキーの意味・値は変えない）。`tests/admin_api.rs`が、追加キーを除いたPython版のフィクスチャとの完全一致と、追加キーの形を固定している。
+
+| キー | 値 |
+|---|---|
+| `ai_config_invalid` | `{"code": <設定の誤りの固定コード>, "disabled_tasks": 5}`（設定が不正なときだけ。値・パスは出さない。写真の配信・管理は続く） |
+| `ai_jobs` | `{"total", "by_state", "by_kind", "reasons"}`（ジョブが1件でもあるとき。`reasons`は状態ごとの理由コードの件数で、`clock_rewound`・`budget_exhausted`・`provider_paused`・`interrupted`など。固定のコード以外は`other`にまとめる） |
+| `ai_pauses` | `[{"task", "scope", "reason"}]`（停止中のProvider・用途。解除はCLI） |
+
+STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解除・再試行のコマンドを文字で示す（画面からは操作できない）。
+
+### 限界・後続
+
+- handlerが未登録の間、`ai-jobs retry`は全ての`failed`を保持する（`unsupported`）。再検査の中身（入力・処理版・ポリシー・既存結果の確認）は各handlerの`recheck`で、T4.2・T4.4・T4.6が実装する。
+- `Disabled`から`RunError::PolicyDisabled`への対応付け、401/403/404/契約不一致から`ProviderPause`／`TaskPause`への対応付け、429のRetry-After、予算エラー（`Budget`）の扱いは、各handlerが`before_send`の結果をそのまま返すことで揃う（ワーカーがジョブの状態へ対応付ける）。
+- 対話の検索語Embedding（`query_embedding`）の予約・キャッシュ、結果の保存先の表、HTTP通信そのものはT4.2・T4.4。
+

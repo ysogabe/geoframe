@@ -467,6 +467,7 @@ Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作�
 - バイナリは`/usr/local/bin/geoframe`、`geoframe serve`をそのまま起動する（`app/`も`.venv`も要らない）。
 - `User=geoframe`、`StateDirectory=geoframe`（`/var/lib/geoframe`）、`Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe`、
   `Environment=TZ=Asia/Tokyo`、`EnvironmentFile=-/etc/default/geoframe`（後勝ち）。Python 版と**同じ設定ファイル・同じデータ置き場**を読む。
+- `TimeoutStopSec=90s`: 停止（SIGTERM）はHTTP・同期・AI・キャッシュ保存・runtimeの停止を合わせて受信から60秒の共通期限で打ち切る（[server.md §22](../docs/rust-migration/server.md)）。unitは期限のあとの余裕を含めて90秒待ち、終わらなければSIGKILLする（実行中のAIジョブは次の起動が回収する）。
 - `RestartPreventExitStatus=2`: 設定不正（終了コード 2）は再起動しても直らないので、再起動ループにせず`failed`で止める。
   DB が開けない（終了コード 1）は再起動対象。`LimitNOFILE=4096`（同時の接続 256＋配信 32＋SQLite で 300 前後を使う）。
 - **取り込み（DB への書き込みと同期サイクル）は`GEOFRAME_INGEST=1`のときだけ動く**（既定は`0`）。P5 の切替まで本番の書き手は Python 版なので、
@@ -484,6 +485,8 @@ Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作�
 - **Drive の大量削除の保留（T3.7）**: 一覧から消える行が 50 件を超えかつ Drive の行の 20% を超える、または一覧が空のとき、`index_drive`は削除を保留する。**取り込みが有効な`serve`は、保留中だけ`/api/admin/status`の`sync.mass_delete_hold`に件数・理由・開始時刻を出し、管理画面の STATUS タブに赤い注意を出す**（取り込み無効のときと最初のサイクルの前は出ない。記憶はプロセスの中だけで、再起動後の最初のサイクルでまた付く）。意図した削除なら、`serve`を止めて（`.ingest.lock`が二重の取り込みを断る）`geoframe sync --allow-mass-delete`を 1 回実行し、`serve`を起動し直す。**画面からは解除できない**。手動で直した位置（`loc_source='manual'`）は、Drive の`md5`・ローカルの`mtime`が変わっても書き換わらない（T3.7）。詳細は[server.md §10.6](../docs/rust-migration/server.md)。
 - 品質（`quality`の段。孤児の特徴量を消す→未解析を`GEOFRAME_QUALITY_PER_CYCLE`枚（既定は`GEOFRAME_FETCH_PER_CYCLE`）まで解析→未解析が無くて`photo_quality_dirty=1`のときだけ全写真を再グルーピングして`photo_quality`を全差し替え）は同期サイクルの最後に動く。**`--dry-run`は解析せず**、消す孤児・未解析・今回解析する枚数・再構築をするかを件数で出す（取り込み済みの本番コピーでは全部ほぼ0。Python が作った特徴量の行も有効として使うので、Rust に切り替えても全写真を解析し直さない。Python へ切り戻したときの扱い（`algorithm`は結果を作った実装の印で、Python は読まない）は[server.md §16.10](../docs/rust-migration/server.md)。[server.md §16](../docs/rust-migration/server.md)）。一括解析（現行の`server.py --quality-scan`）は`geoframe quality-scan [--dry-run] [--data-dir <dir>]`（`GEOFRAME_INGEST=1`と、`sync`と同じ印・Python の確認が要る）。
   外向き HTTPS の確認は`geoframe selfcheck-net`（状態と HTTP ステータスだけを出す）。
+- **AIの背景ワーカー（P4 / T4.1c）**: `GEOFRAME_INGEST=1`かつ`GEOFRAME_AI_ENABLED=1`かつ有効な背景用途（`GEOFRAME_AI_CONFIG`のJSON。[ai-config.md](../docs/rust-migration/ai-config.md)）があるときだけ起動する。**いまの配布バイナリは用途別の処理を登録していない**ので、ジョブを1件も実行しない（実処理はT4.2・T4.4・T4.6）。`INGEST=0`ではAIの表を作らず、回収もしない。AIの設定が不正でも写真の配信・管理は続き、STATUSタブに設定の誤りの固定コードが出る。
+  状態の確認とやり直しは`geoframe ai-jobs`: `status`（読み取りだけ。稼働中でも可。件数と固定の理由コードだけ）、`retry (--kind <種類>|--all)`（失敗だけを再検査。外部へ送らない。検査できない種類は保持して件数だけ報告）、`release-pause (--task <用途>|--all)`（認証・契約の不一致で止まったProvider・用途の明示解除）。`retry`と`release-pause`は書くので、**サービスを止めてから**`GEOFRAME_INGEST=1`で実行する（`sync`と同じ印・Pythonの確認を通す。稼働中は`.ingest.lock`で断る）。
 - **待ち受けは`--listen`を書かない**。`GEOFRAME_HOST`/`GEOFRAME_PORT`（既定`0.0.0.0:8080`）で決まる。
 
 ### 7.2 Rust 版を Python 版と並走させる（P1〜P4 の検証）

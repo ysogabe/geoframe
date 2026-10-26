@@ -42,6 +42,8 @@ pub struct AdminContext {
     pub infer_windows_s: Vec<f64>,
     /// 管理画面の AI の件数が数える `embedding_model`。
     pub embed_model: &'static str,
+    /// AI の設定が不正なときの固定のコード（`ai_config_invalid`。値・パスは持たない）。
+    pub ai_config_invalid: Option<crate::ai::settings::AiConfigError>,
 }
 
 impl AdminContext {
@@ -50,6 +52,7 @@ impl AdminContext {
             deriv_dir: data_root.join("derivatives"),
             infer_windows_s: config.infer_windows_s(),
             embed_model: config.embed_backend.model(),
+            ai_config_invalid: config.ai.invalid(),
         }
     }
 }
@@ -130,6 +133,9 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
             "loc": loc_status(conn, ctx)?,
         }),
     );
+    // P4（Rust だけが返す追加フィールド）: AI の設定の誤り・ジョブ・停止の集計。あるときだけ足すので、
+    // AI の表も設定の誤りも停止も無い DB（Python 版と同じ応答）には 1 つも足さない
+    crate::ai::ops::insert_admin_status(&mut out, conn, ctx.ai_config_invalid);
     Ok(out)
 }
 

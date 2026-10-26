@@ -455,6 +455,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 | `db.infer_buckets` | `loc_source='inferred'`の行を窓のラベルで数える（NULLは`未計測`） |
 | `db.quality`・`db.ai` | 同じSQL。AIの`embedded`・`detailed`は`embedding_model`が**今のモデル**（`GEOFRAME_EMBED_BACKEND`。§1.1）の行だけ。`pending=max(0, eligible-embedded)` |
 | `db.loc` | `loc_status()`の移植。位置なし・撮影時刻ありの写真（`targets`）のうち、`photo_loc_clues`の判定が**今の画像**（表示ファイル、`md5`、`mtime`が一致）のものを判定済みとして`clue_pending`/`clue_passed`を数える。通る条件は、エラーが空、`clue`がNULLでなく、`clue>=0.2`または`kind='landmark'`。`days`は、撮影時刻順に「最大の窓以上の空き」か「日付の変わり目」で区切ったまとまりの数、`days_with_clue`は通る写真を含むまとまりの数。`runs_done`・`runs_error`は`photo_loc_runs`、`suggested`は位置なしの写真にある候補の数。`decision`・`last_at`は`settings.photo_loc_status`（Pythonのワーカーが前回の処理時に書くJSON）の`decision`・`at`で、**値の型のまま**出す。**Rustは Decision に問い合わせず、この値を書き換えない**。無い・壊れている・オブジェクトでないときは空文字（Pythonはオブジェクトでないと500） |
+| `ai_config_invalid`・`ai_jobs`・`ai_pauses`（Rustだけ。P4 / T4.1c） | **あるときだけ**トップレベルに付く（AIの設定が不正・AIジョブの行がある・Provider停止がある）。無ければキーを出さない（Pythonと同じ形）。固定のコードと件数だけで、ジョブの対象・接続先・モデル・パスは返さない。形は[ai-config.md](ai-config.md)の「管理画面のSTATUS」、停止と回収は§22 |
 | `disk` | §10.4 |
 | `server_time` | 現地時刻の`YYYY-MM-DD HH:MM:SS` |
 
@@ -565,7 +566,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 現行の`catalog.py:cycle()`の順に、**段（`Stage`）を並べた**もの。段は`index_local`→`index_drive`→`infer`→`enrich`→`local_derivatives`→`fetch_derivatives`→`quality`。T2.1の段は何もしない（`Placeholder`）で、T2.3〜T2.6で全部の段に中身が入った（`quality`はT2.6。§16）。
 
-- **起動直後に1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと**。専用のstdスレッド`sync-worker`で動き、HTTPサーバーの起動を待たせない。SIGTERMで`StopFlag`を立て、待ちの最中ならすぐ、サイクルの最中なら今の段が終わってから止まる（最大10秒待ち、超えたらそのまま終了する。途中で止まってもDBはトランザクション単位なので壊れず、`.dl_*`の残骸は次回の起動で消す）。
+- **起動直後に1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと**。専用のstdスレッド`sync-worker`で動き、HTTPサーバーの起動を待たせない。SIGTERMで`StopFlag`を立て、待ちの最中ならすぐ、サイクルの最中なら今の段が終わってから止まる（最大10秒待ち、超えたらそのまま終了する。途中で止まってもDBはトランザクション単位なので壊れず、`.dl_*`の残骸は次回の起動で消す）。SIGTERMの合図はHTTPのgraceful shutdownを待たずに立ち、待ちはSIGTERMから60秒の共通期限の残りを越えない（§22）。
 - **段ごとに失敗を隔離する**: 段が`Err`を返しても、パニックしても、残りの段と次の周期へ進む。ログに出すのは段の名前と失敗の種類だけ（`StageError`はDB・I/Oの種類と定型文しか持たない。パニックのメッセージは出さず、場所だけをpanic hookが出す）。Pythonの`index_drive`段の「Drive認証に失敗したらDBの段だけ飛ばす」は、段が`Skipped(理由)`を返す形で表す（T2.4）。
 - **ログは件数だけ**: 段ごとの件数（`added=3`のような固定の名前と数）と、サイクル末尾の`表示可能／取得待ち／全`（Pythonの`[cycle]`行と同じ集計）。
 - **サイクルの前に、そのサイクル用の読み取り専用の接続を開く**（開けなければ次の周期へ持ち越す）。段は読むときは`ctx.read`、書くときは`ctx.writer()`（writer）を使う。
@@ -2255,3 +2256,22 @@ T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のまま�
 
 - **T3.7**: 済み。下書きの`photo_id`が指す行が消える・`hidden`になる・別の id になる経路（[inventory.md §2.3](inventory.md)の④）は、書き出しが止まらず、使えない写真を飛ばして知らせる形にした（§21.3の2）。削除→再追加でidが変わること自体は今のまま。保存は写真の存在を見ないので、下書きは残る。
 - **T3.8（実施済み。[p3-acceptance.md](p3-acceptance.md) §2.2）**: 検証環境で、比較用 Python（`:8090`）と同じ要求（保存・書き出し・`dry_run`・409）を送り、下書きと書き出しのファイルを比べる。比較用 Python は別の`DATA_DIR`（`/var/lib/geoframe-pyref`）を使うこと（Rust の`DATA_DIR`と共有すると、二重に書く）。Rust の`GEOFRAME_INGEST=1`が要る。画像は実写真の derivative で、書き出した画像の EXIF/GPS が空であることを確かめる（座標・地名・ファイル名は記録に残さない）。
+
+## 22. 停止の共通期限とAIの背景ワーカー（P4 / T4.1c）
+
+AIの背景ワーカー・Providerの停止・送信予算・ジョブの回収は[ai-config.md](ai-config.md)にまとめた。ここでは`serve`の停止の順序と期限を定める。
+
+### 22.1 SIGTERMから60秒の共通期限
+
+- **合図の起点はSIGTERMの受信時刻**。`server::serve_until`は、停止の合図（SIGINT/SIGTERM）が来た**直後に**共有の`StopFlag`を立てる（旧版はHTTPのgraceful shutdownが終わってから`serve`の呼び出し側が立てていたので、同期・AI・キャッシュ保存のスレッドが、HTTPの終了待ちの間も新しい仕事を始めていた）。`StopFlag`は最初の合図の時刻を持ち（2回目以降は変えない）、そこから60秒（`SHUTDOWN_BUDGET`）が共通期限。
+- **各処理は残り時間までしか待たない**（`StopFlag::phase_limit(cap)` = `cap`と期限までの残りの小さいほう）: ①HTTPの終了待ちは期限の3/4（45秒。終わらない接続はプロセスの終了で切る。残りの1/4は後続のため）②タイルキャッシュの掃除のスレッドのjoin（上限10秒）③**AIワーカーのjoin（上限10秒）と、停止開始の記録・最後の戻し（writerへの依頼は期限つき。writerが忙しくても期限を越えて待たない）**④同期サイクルのスレッド・キャッシュ保存のスレッドのjoin（各10秒）と最後のキャッシュ保存⑤runtimeの停止（5秒）。全てが期限の残りで頭打ちなので、合計はSIGTERMから60秒を超えない。
+- unitの`TimeoutStopSec=90s`は、この期限のあとにプロセスが終わるまでの余裕。それでも終わらなければsystemdがSIGKILLし、実行中のAIジョブは次の起動の回収が数える（停止開始が記録されていれば数えない）。
+- 期限までに終わらないスレッド（固まった同期の段・AIのhandler・キャッシュ保存）は残り、**プロセスが終わるまで`LockHold`を持つ**ので、別の書き手（`sync`・次の`serve`）は始まらない。
+- bind・起動に失敗して`serve_until`が`Err`を返したときも、続けて合図を立ててスレッドを止める。
+- 試験は短い予算を注入する（`StopFlag::with_budget`）。実時間60秒は待たない。
+
+### 22.2 試験
+
+- `stop.rs`（起点・phase_limit・http_limit）、`tests/shutdown.rs`（`serve_until`が合図の直後に`StopFlag`を立てる／読まないクライアントで終わらないHTTPが期限の3/4で打ち切られる／bind失敗はエラーで合図を立てない）、`cli.rs`（固まったスレッドがあっても停止の各待ちが共通期限を越えない）、`ai/tests_worker.rs`（writerが忙しくてもAIの停止記録・最後の戻しが期限を越えない／固まったhandlerが`LockHold`を残し、遅れた応答を保存しない）。
+- `tests/ingest_cli.rs`: 実バイナリでSIGTERM後に起動IDと停止開始が残る／`INGEST=0`はAIの回収・表の作成・Provider停止の整理を一切しない／`ai-jobs`のガード・稼働中拒否・出力に秘匿情報を含めない。
+

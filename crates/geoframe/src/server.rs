@@ -15,6 +15,7 @@
 //! - リクエストログは [`access_log`] が一手に引き受け、出す項目は
 //!   メソッド・ルートのテンプレート・状態コード・所要時間だけ（[`crate::logging`]）。
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,7 @@ use crate::db::Catalog;
 use crate::drive::MassDeleteBoard;
 use crate::geocode::{self, Geocoder};
 use crate::limits::{ConnBusy, ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
+use crate::stop::StopFlag;
 use crate::tiles::{self, CacheStatus, TileProxy};
 use crate::writer::Writer;
 use crate::{csrf, hostcheck, photos, post, pyquery, statics, sysinfo, webpath};
@@ -775,15 +777,13 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// SIGINT / SIGTERM（systemd の停止）を待つ。
-async fn shutdown_signal() {
+async fn wait_for_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM を登録できません");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
-    // 実行中の旅行ブログの書き出しは、次の画像の前で作業領域を片付けて止まる（前の書き出しは残る）
-    crate::blog_write::request_stop();
 }
 
 /// 接続ごとの付随情報（`axum::extract::ConnectInfo`）。長い処理を持つ `POST` が、その間だけ無通信の期限を
@@ -803,7 +803,24 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, Limi
     }
 }
 
-pub async fn serve(state: AppState) -> std::io::Result<()> {
+/// サーバーを動かし、SIGINT / SIGTERM で止まる。
+pub async fn serve(state: AppState, stop: StopFlag) -> std::io::Result<()> {
+    serve_until(state, stop, wait_for_signal()).await
+}
+
+/// [`serve`] の停止の合図を差し替えられる形（試験用に分けてある。配布するバイナリの経路は [`serve`] だけ）。
+///
+/// `signal` が完了した**直後に**共有の `stop` を立てる。HTTP の graceful shutdown が終わってから合図する
+/// 順序だと、同期・AI・キャッシュ保存のスレッドが HTTP の終了待ちの間も新しい仕事を始めてしまうので、
+/// 停止の起点（共通期限の 60 秒）は SIGTERM の受信時刻にする。HTTP の終了待ちは共通期限の 3/4
+/// （[`StopFlag::http_limit`]）で打ち切り、終わらない接続はプロセスの終了で切る（残り 1/4 は AI・同期・
+/// キャッシュ保存・runtime の停止のため）。bind に失敗したときはすぐ `Err` を返す（呼び出し側が続けて
+/// スレッドを止める）。
+pub async fn serve_until(
+    state: AppState,
+    stop: StopFlag,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
     tracing::info!("{} で待ち受けます", listener.local_addr()?);
     tracing::info!(
@@ -812,12 +829,34 @@ pub async fn serve(state: AppState) -> std::io::Result<()> {
     );
     // 接続の総数・送信の停滞・無通信の上限（limits.rs）
     let listener = LimitedListener::new(listener, ConnLimits::default());
-    axum::serve(
+    let signalled = Arc::new(tokio::sync::Notify::new());
+    let shutdown = {
+        let (stop, signalled) = (stop.clone(), Arc::clone(&signalled));
+        async move {
+            signal.await;
+            // 合図の直後に共有の停止を立てる（HTTP の終了待ちを待たない）
+            stop.stop();
+            // 実行中の旅行ブログの書き出しは、次の画像の前で作業領域を片付けて止まる（前の書き出しは残る）
+            crate::blog_write::request_stop();
+            signalled.notify_one();
+        }
+    };
+    let server = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<ConnInfo>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(shutdown)
+    .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        () = async {
+            signalled.notified().await;
+            tokio::time::sleep(stop.http_limit()).await;
+        } => {
+            tracing::warn!("HTTP の終了待ちが期限に達したので、残りの接続を切って停止します");
+        }
+    }
     tracing::info!("停止しました");
     Ok(())
 }

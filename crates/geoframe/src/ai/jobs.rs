@@ -178,9 +178,37 @@ pub enum ErrorCode {
     Interrupted,
     Panic,
     Internal,
+    /// Provider・用途が停止中（[`super::pause`]。送信前の確認で見つかった）。
+    ProviderPaused,
+    /// 送信予算（1 日・周期）が尽きている。
+    BudgetExhausted,
+    /// 時計が送信予算の履歴より前に戻っている（予算をリセットする救済は無い。時計が追いつくまで送らない）。
+    ClockRewound,
 }
 
 impl ErrorCode {
+    pub const ALL: [Self; 15] = [
+        Self::Unavailable,
+        Self::RateLimited,
+        Self::Timeout,
+        Self::ServerError,
+        Self::BadResponse,
+        Self::InputTooLarge,
+        Self::InputInvalid,
+        Self::PolicyDisabled,
+        Self::Shutdown,
+        Self::Interrupted,
+        Self::Panic,
+        Self::Internal,
+        Self::ProviderPaused,
+        Self::BudgetExhausted,
+        Self::ClockRewound,
+    ];
+
+    pub fn parse(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == text)
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unavailable => "unavailable",
@@ -195,6 +223,9 @@ impl ErrorCode {
             Self::Interrupted => "interrupted",
             Self::Panic => "panic",
             Self::Internal => "internal",
+            Self::ProviderPaused => "provider_paused",
+            Self::BudgetExhausted => "budget_exhausted",
+            Self::ClockRewound => "clock_rewound",
         }
     }
 }
@@ -381,6 +412,13 @@ pub enum Enqueued {
 ///   あれば `failed` に戻して（`Existing(Failed)`）claim できないままにする。
 pub fn enqueue(conn: &mut Connection, key: &JobKey, now: i64) -> rusqlite::Result<Enqueued> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let outcome = enqueue_in(&tx, key, now)?;
+    tx.commit()?;
+    Ok(outcome)
+}
+
+/// [`enqueue`] の本体（呼び出し側のトランザクションの中で動く。コミットしない）。
+fn enqueue_in(tx: &Connection, key: &JobKey, now: i64) -> rusqlite::Result<Enqueued> {
     let inserted = tx.execute(
         "INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,next_attempt_at,
                              created_at,updated_at)
@@ -395,7 +433,6 @@ pub fn enqueue(conn: &mut Connection, key: &JobKey, now: i64) -> rusqlite::Resul
         ],
     )?;
     if inserted == 1 {
-        tx.commit()?;
         return Ok(Enqueued::Created);
     }
     let (id, state, terminal): (i64, String, bool) = tx.query_row(
@@ -423,14 +460,48 @@ pub fn enqueue(conn: &mut Connection, key: &JobKey, now: i64) -> rusqlite::Resul
         "UPDATE ai_jobs SET state=?2, claim_token=NULL, updated_at=?3 WHERE id=?1",
         params![id, back, now],
     )?;
-    tx.commit()?;
     Ok(outcome)
+}
+
+/// [`enqueue_batch`] の集計。
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Enqueues {
+    pub created: usize,
+    pub revived: usize,
+    /// 既にあった（そのままのもの）。
+    pub existing: usize,
+}
+
+/// `keys` を **1 つのトランザクション**で [`enqueue`] し、同じ `kind`・`target_key` の別世代を [`supersede`] する
+/// （周期の reconcile が、現在の入力から導いたキーをまとめて積む）。呼び出し側が件数を区切って呼ぶこと
+/// （writer を長く塞がない）。
+pub fn enqueue_batch(
+    conn: &mut Connection,
+    keys: &[JobKey],
+    now: i64,
+) -> rusqlite::Result<Enqueues> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut done = Enqueues::default();
+    for key in keys {
+        match enqueue_in(&tx, key, now)? {
+            Enqueued::Created => done.created += 1,
+            Enqueued::Revived => done.revived += 1,
+            Enqueued::Existing(_) => done.existing += 1,
+        }
+        supersede_in(&tx, key, now)?;
+    }
+    tx.commit()?;
+    Ok(done)
 }
 
 /// 同じ `kind`・`target_key` の、`keep` と違う世代（`input_hash` か `processor_version` が違う）の
 /// 未完了・失敗のジョブを `obsolete` にする。`running` も対象で、token が失効するので遅れて届く応答は
 /// 保存されない。`succeeded` は結果なので変えない。無効にした件数を返す。
 pub fn supersede(conn: &mut Connection, keep: &JobKey, now: i64) -> rusqlite::Result<usize> {
+    supersede_in(conn, keep, now)
+}
+
+fn supersede_in(conn: &Connection, keep: &JobKey, now: i64) -> rusqlite::Result<usize> {
     conn.execute(
         "UPDATE ai_jobs SET state='obsolete', claim_token=NULL, updated_at=?5
          WHERE kind=?1 AND target_key=?2
@@ -702,6 +773,17 @@ pub fn reclaim_interrupted(
     now: i64,
 ) -> rusqlite::Result<Reclaimed> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let reclaimed = reclaim_interrupted_in(&tx, current_run_id, now)?;
+    tx.commit()?;
+    Ok(reclaimed)
+}
+
+/// [`reclaim_interrupted`] の本体（呼び出し側のトランザクションの中で動く。コミットしない）。
+pub(super) fn reclaim_interrupted_in(
+    tx: &Connection,
+    current_run_id: &str,
+    now: i64,
+) -> rusqlite::Result<Reclaimed> {
     let failed = tx.execute(
         "UPDATE ai_jobs SET state='failed', interruption_count=interruption_count+1, terminal=1,
                 claim_token=NULL, last_error_code='interrupted', updated_at=?2
@@ -714,7 +796,6 @@ pub fn reclaim_interrupted(
          WHERE state='running' AND run_id IS NOT ?1",
         params![current_run_id, now],
     )?;
-    tx.commit()?;
     Ok(Reclaimed { requeued, failed })
 }
 

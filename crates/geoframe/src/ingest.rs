@@ -18,7 +18,7 @@
 //!    ので、Python が動いている間は取り込まない（0 のガードが、起動時に 1 回だけ確かめる）。
 //! 2. writer を開く。DB が無ければ**新しく作る**（`schema::migrate` が空から作る）。作ったときは warn
 //!    で知らせる（`GEOFRAME_DATA_DIR` の誤りで空の DB を静かに作ってしまうのを見つけるため）。
-//! 3. スキーマの作成・移行（[`crate::schema::migrate`]）と、P4 の AI 表（ジョブ・送信予算・Provider 停止）の追加（[`crate::ai::migrate`]）。
+//! 3. スキーマの作成・移行（[`crate::schema::migrate`]）と、P4 の AI 表（ジョブ・送信予算・Provider 停止・起動 ID）の追加（[`crate::ai::migrate`]）。
 //! 4. `.cache.json` を読み、旧キーを捨て、捨てたものがあれば即保存する。
 //! 5. `DATA_DIR/tmp/` を用意し、`tmp/` と `derivatives/` の `.dl_*` を消す（[`prepare_tmp_dir`]）。
 //! 6. `derivatives/` の書きかけの `*.part`（プロセスが `SIGKILL`・電源断で落ちて残ったもの）を消す
@@ -138,7 +138,7 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         );
     }
     let mut migration = writer.call(schema::migrate)?;
-    // P4: AI の表（ジョブ・送信予算・Provider 停止）。Python と同じスキーマの再現（schema::migrate）とは別に足す
+    // P4: AI の表（ジョブ・送信予算・Provider 停止・起動 ID）。Python と同じスキーマの再現（schema::migrate）とは別に足す
     migration.created.extend(writer.call(ai::migrate)?);
     log_migration(&migration);
 
@@ -578,9 +578,14 @@ mod tests {
 
         let ingest = start(&config).unwrap();
         assert!(config.db_path().exists());
-        // Python と同じスキーマの 16（表 11・索引 5）と、P4 の AI 表（`ai_jobs`・その索引・送信予算・Provider 停止）
-        assert_eq!(ingest.migration.created.len(), 16 + 4);
-        for name in ["ai_jobs", "ai_request_usage", "ai_provider_pauses"] {
+        // Python と同じスキーマの 16（表 11・索引 5）と、P4 の AI 表（`ai_jobs`・その索引・送信予算・Provider 停止・起動 ID）
+        assert_eq!(ingest.migration.created.len(), 16 + 5);
+        for name in [
+            "ai_jobs",
+            "ai_request_usage",
+            "ai_provider_pauses",
+            "ai_worker_runs",
+        ] {
             assert!(
                 ingest.migration.created.contains(&name.to_string()),
                 "{name}"

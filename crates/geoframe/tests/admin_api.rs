@@ -83,6 +83,94 @@ async fn status_matches_python_and_the_prefix_forms_return_the_same() {
     server.check(&fixture["status_targets"]).await;
 }
 
+/// 追加のキーを除いた応答。既存のキーの意味・値は Python 版のフィクスチャのまま。
+fn without_ai_ops(mut body: Value) -> Value {
+    let map = body.as_object_mut().unwrap();
+    for key in ["ai_config_invalid", "ai_jobs", "ai_pauses"] {
+        map.remove(key);
+    }
+    body
+}
+
+#[tokio::test]
+async fn an_invalid_ai_config_shows_only_a_fixed_code_and_changes_no_other_field() {
+    let fixture = admin_fixture();
+    let secrets = TempDir::new("admin-ai-config");
+    let bad = secrets.path().join("ai-secret-name.json");
+    std::fs::write(&bad, r#"{"version": "sentinel-value-93ab"}"#).unwrap();
+    let server = Server::start(&[("GEOFRAME_AI_CONFIG", bad.to_str().unwrap())]).await;
+    let (status, body) = server.json("/api/admin/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["ai_config_invalid"],
+        json!({"code": "bad_value", "disabled_tasks": 5})
+    );
+    // 追加したのはこの 1 つだけ。既存のフィールドは Python 版と同じ
+    assert_eq!(
+        body.as_object().unwrap().len(),
+        fixture["status"]["gemini"].as_object().unwrap().len() + 1
+    );
+    assert_eq!(without_ai_ops(body.clone()), fixture["status"]["gemini"]);
+    let text = body.to_string();
+    for secret in ["sentinel-value-93ab", "ai-secret-name"] {
+        assert!(!text.contains(secret), "{secret}");
+    }
+    // 旧設定の環境変数が不正でも同じ（固定のコード）
+    let server = Server::start(&[("GEOFRAME_AI_POLL_S", "-1")]).await;
+    let (_, body) = server.json("/api/admin/status").await;
+    assert_eq!(body["ai_config_invalid"]["code"], "legacy_env");
+    // 設定が正常・未指定なら、何も足さない
+    let server = Server::start(&[]).await;
+    let (_, body) = server.json("/api/admin/status").await;
+    assert!(body.get("ai_config_invalid").is_none());
+}
+
+#[tokio::test]
+async fn ai_jobs_and_pauses_appear_as_counts_and_fixed_reasons_when_the_tables_have_rows() {
+    let fixture = admin_fixture();
+    let mut server = Server::start(&[]).await;
+    // AI の表があっても行が無ければ何も足さない
+    geoframe::ai::migrate(&mut server.writer).unwrap();
+    let (_, body) = server.json("/api/admin/status").await;
+    assert_eq!(body, fixture["status"]["gemini"]);
+
+    server
+        .writer
+        .execute_batch(
+            "INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,
+                                 last_error_code,created_at,updated_at) VALUES
+               ('photo_judge','SECRET-T1','SECRET-H1','SECRET-P','deferred','clock_rewound',1,1),
+               ('photo_judge','SECRET-T2','SECRET-H2','SECRET-P','pending','',1,1),
+               ('location_clue','SECRET-T3','SECRET-H3','SECRET-P','failed','interrupted',1,1);
+             INSERT INTO ai_provider_pauses(scope,subject,task,reason,created_at)
+               VALUES ('provider','SECRET-SUBJECT','image_embedding','unauthorized',1)",
+        )
+        .unwrap();
+    let (_, body) = server.json("/api/admin/status").await;
+    assert_eq!(without_ai_ops(body.clone()), fixture["status"]["gemini"]);
+    assert_eq!(
+        body["ai_jobs"],
+        json!({
+            "total": 3,
+            "by_state": {"deferred": 1, "failed": 1, "pending": 1},
+            "by_kind": {
+                "location_clue": {"failed": 1},
+                "photo_judge": {"deferred": 1, "pending": 1}
+            },
+            "reasons": {
+                "deferred": {"clock_rewound": 1},
+                "failed": {"interrupted": 1}
+            }
+        })
+    );
+    assert_eq!(
+        body["ai_pauses"],
+        json!([{"task": "image_embedding", "scope": "provider", "reason": "unauthorized"}])
+    );
+    let text = body.to_string();
+    assert!(!text.contains("SECRET"), "{text}");
+}
+
 #[tokio::test]
 async fn status_counts_the_models_of_the_configured_backend() {
     let fixture = admin_fixture();
