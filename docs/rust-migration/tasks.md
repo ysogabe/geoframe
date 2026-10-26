@@ -1,7 +1,7 @@
 # Rust単一バイナリ化 タスク
 
 - 要求: [Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 設計: [設計案](../architecture/rust-api-and-ai-providers-proposal.md) / 計画: [plan.md](plan.md)
-- ブランチ: ローカルはT3の`t3/issue-54-implementation-plan`のまま、リモートはフェーズごとに分ける（P0は同名で PR #57、P1は`feat/rust-migration-p1`で PR #58、どちらも squash merge 済み。P2は`feat/rust-migration-p2`で PR #59、いずれも squash merge 済み。P3は`feat/rust-migration-p3`でPRを出す）
+- ブランチ: `feat/rust-migration-p4`。P0=PR #57、P1=#58、P2=#59、P3=#60はsquash merge済み。P4ブランチにはT3.10の補足を含む。
 - PRはフェーズごとに1つ。P2以降のタスクは、そのフェーズの開始時に細かく分け直す。
 - 種類: `ops`は自分で行う運用作業、`quick`/`full`はビルドのスキルに任せる実装。
 
@@ -84,7 +84,9 @@ P3で守ること（各タスクの委任文に入れる）:
 |---|---|---|---|---|---|---|---|---|
 | T3.10 | 地名検索にもGEOFRAME_TILE_UAを使い、検証環境でNominatimの実通信と本物のDriveの取り込み・大量削除の保留表示を確認する | AC1, AC2, AC7 | T3.8 | full | 完了 | d7252b7 | 0acfc2c | [drive-acceptance.md](drive-acceptance.md)。通常レビュー（Sol）指摘0、fmt/clippy/739テスト成功。実Drive6535件の冪等性、46原本のRust/Python全件成功、iPhone原本5枚、未登録1行の索引→配信、2000行の保留→解除と画面、Nominatim実通信・キャッシュを確認。一時鍵・原本・複製は削除、元DBと画像は不変 |
 
-## P4〜P5（開始時に分け直す）
+## P4〜P5（実装開始時に分け直す）
+
+P4の設計案は[p4-prd.md](p4-prd.md)・[p4-design.md](p4-design.md)（2026-10-26、整合性・安全面ともレビューの必須指摘0）。画像Embedding API #93の本接続に先立ち、T4.1のジョブ基盤、T4.2のProvider・用途別許可、T4.3の索引基盤を進める案。ここでは実装タスクの開始を記録せず、設計確認後に開始SHA・AC・担当を割り当てる。
 
 | ID | 内容 | AC | 種類 | 状態 |
 |---|---|---|---|---|

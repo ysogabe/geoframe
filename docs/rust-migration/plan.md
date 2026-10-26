@@ -95,6 +95,7 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 
 ### P4: AI Providerとジョブ（PR 5）
 
+- 詳細設計案（2026-10-26）: [P4 PRD](p4-prd.md)・[P4設計](p4-design.md)。まず永続ジョブ・Providerの利用可否・用途別送信設定を実装し、画像Embeddingの本接続はlocal-model-lab #93の契約確定後に行う。フェーズのPR単位は変えない。
 - 永続ジョブ（状態・再試行時刻・回数上限・入力ハッシュ・処理版）、local-model-labのLAN入口（本番機の`:8100`。接続先は設定で与える、`X-Client-Name: geoframe`、`/llm/services/<id>`のavailable確認、lease中は後回し）、Geminiアダプター（タスクごとの明示ポリシーがあるときだけ写真を送る）。
 - Embeddingはmodel・前処理版・次元・ベクトル空間IDごとに分けて保存し、異なる空間を混ぜない。画像Embedding APIはlocal-model-lab #93の結果に合わせる。
 - 位置候補（Decision→Gemini）、同一場面のグループ化と代表選択、AI検索。
@@ -130,6 +131,6 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 
 - ~~HEIC変換のバックエンドと配布形態 — P0の計測後~~ → `zune-heic`を本体に入れた（T2.2、[画像PoC](image-poc.md)）。実機HEICでの確定はT2.4の受入（実装済み。確認の手順は[server.md §14.11](server.md#1411-鍵が置かれたあとの管理者の確認手順)。鍵が置かれてから管理者が行う）
 - ~~musl静的ビルドかglibcビルドか — P0~~ → **musl静的ビルドを標準にする**（[ビルドと配布](build.md)。HEIC・アロケータを入れる段階で見直す）。HTTPS（rustls）とDNSはT2.1で、musl静的のまま検証環境から通ることを確かめた（[build.md §7](build.md)）
-- 画像Embedding APIのJSON契約・CPU/GPU配置 — local-model-lab #93、P4の開始前
-- Embeddingインデックスの保存形式 — P4の開始前
-- 検証環境へのDrive鍵のコピー — P2の開始時にユーザーへ確認
+- 画像Embedding APIのJSON契約・CPU/GPU配置 — local-model-lab #93。2026-10-26確認時はOPEN、現行サービス定義はテキスト専用。P4の接続実装前に確定。ジョブ・Provider基盤の実装は先行可能（[P4設計 §2](p4-design.md#2-進め方と外部依存)）
+- Embeddingインデックスの保存形式 — P4設計案は空間別のSQLite float32 BLOBと別索引の構築・原子的切替（[P4設計 §6](p4-design.md#6-索引旧データ切替)）。旧ベクトルは版が不明なまま新空間へ混ぜない
+- 検証環境へのDrive鍵の一時コピー — T3.10でユーザーが明示承認し、確認後に削除済み。クラウドAI送信の許可とは別（[確認記録](drive-acceptance.md)）
