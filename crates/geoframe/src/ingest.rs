@@ -18,7 +18,7 @@
 //!    ので、Python が動いている間は取り込まない（0 のガードが、起動時に 1 回だけ確かめる）。
 //! 2. writer を開く。DB が無ければ**新しく作る**（`schema::migrate` が空から作る）。作ったときは warn
 //!    で知らせる（`GEOFRAME_DATA_DIR` の誤りで空の DB を静かに作ってしまうのを見つけるため）。
-//! 3. スキーマの作成・移行（[`crate::schema::migrate`]）。
+//! 3. スキーマの作成・移行（[`crate::schema::migrate`]）と、P4 の AI ジョブ表の追加（[`crate::ai::jobs::migrate`]）。
 //! 4. `.cache.json` を読み、旧キーを捨て、捨てたものがあれば即保存する。
 //! 5. `DATA_DIR/tmp/` を用意し、`tmp/` と `derivatives/` の `.dl_*` を消す（[`prepare_tmp_dir`]）。
 //! 6. `derivatives/` の書きかけの `*.part`（プロセスが `SIGKILL`・電源断で落ちて残ったもの）を消す
@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
+use crate::ai;
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::guard::{Guard, GuardError};
@@ -136,7 +137,9 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
             "DB が無かったので新しく作ります（GEOFRAME_DATA_DIR が正しいか確認してください）"
         );
     }
-    let migration = writer.call(schema::migrate)?;
+    let mut migration = writer.call(schema::migrate)?;
+    // P4: AI のジョブ表。Python と同じスキーマの再現（schema::migrate）とは別に足す
+    migration.created.extend(writer.call(ai::jobs::migrate)?);
     log_migration(&migration);
 
     let cache = Arc::new(Cache::load(&config.data_dir));
@@ -334,8 +337,10 @@ pub struct Plan {
 
 /// 書かずに計画を作る。DB は読み取り専用の接続で見る。
 pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
+    let mut schema = schema::pending(conn)?;
+    schema.missing_objects.extend(ai::jobs::pending(conn)?);
     Ok(Plan {
-        schema: schema::pending(conn)?,
+        schema,
         leftover_files: count_leftovers(&config.data_dir),
         skipped_dirs: count_skipped_dirs(&config.data_dir),
         part_files: count_part_files(&config.data_dir),
@@ -573,7 +578,9 @@ mod tests {
 
         let ingest = start(&config).unwrap();
         assert!(config.db_path().exists());
-        assert_eq!(ingest.migration.created.len(), 16);
+        // Python と同じスキーマの 16（表 11・索引 5）と、P4 のジョブ表 `ai_jobs`・その索引
+        assert_eq!(ingest.migration.created.len(), 16 + 2);
+        assert!(ingest.migration.created.contains(&"ai_jobs".to_string()));
         assert!(!ingest.migration.places_reset);
         crate::db::Catalog::open(&config.db_path()).unwrap();
         // 旧キーは即保存された
@@ -617,6 +624,31 @@ mod tests {
         drop(start(&config).unwrap());
         let again = start(&config).unwrap();
         assert!(again.migration.is_noop(), "{:?}", again.migration);
+    }
+
+    /// P4 より前の DB（`ai_jobs` が無い）を `--dry-run` で見ると、ジョブ表を作ると数える（書かない）。
+    /// 実際の起動はそれだけを足し、次の起動からは何もしない。
+    #[test]
+    fn plan_counts_the_ai_jobs_table_that_a_start_would_add() {
+        let dir = TempDir::new("ingest-plan-ai");
+        let config = config(&dir);
+        drop(start(&config).unwrap());
+        {
+            let conn = Connection::open(config.db_path()).unwrap();
+            conn.execute_batch("DROP TABLE ai_jobs").unwrap();
+        }
+        let conn = crate::db::open_read_only(&config.db_path()).unwrap();
+        let plan = plan(&config, &conn).unwrap();
+        assert_eq!(
+            plan.schema.missing_objects,
+            ["ai_jobs", "idx_ai_jobs_runnable"]
+        );
+        assert!(plan.schema.missing_columns.is_empty());
+        drop(conn);
+        let again = start(&config).unwrap();
+        assert_eq!(again.migration.created, ["ai_jobs", "idx_ai_jobs_runnable"]);
+        drop(again);
+        assert!(start(&config).unwrap().migration.is_noop());
     }
 
     #[test]
