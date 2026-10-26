@@ -133,11 +133,12 @@ handlerの**panic**は当該ジョブの失敗1回（`panic`。5回で`failed`�
 
 | コマンド | 内容 |
 |---|---|
-| `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、用途ごとの使える／使えない（固定の理由コード）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途、有効な共有の一時待機（用途・範囲・固定の理由・UTCの期限） |
+| `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、検索空間の有無・登録数と索引の件数（対象・保存済み・待ち・失敗で除外・壊れ。[ai-index.md](ai-index.md)）、用途ごとの使える／使えない（固定の理由コード）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途、有効な共有の一時待機（用途・範囲・固定の理由・UTCの期限） |
 | `geoframe ai-jobs retry (--kind <種類>｜--all)` | `failed`だけを、登録済みhandlerが現在の入力・既存の結果に照らして再検査し、`Requeue`（カウンタ・履歴を0に戻して`pending`）／`Obsolete`／`Satisfied`（成功済み扱い。再計算しない）へ振り分ける。**外部へは送らない**。成功済み・待機中は変えない。検査できないものは戻さず`failed`のまま件数だけ報告する: handler未登録の種類（**いまの配布バイナリは全て**）、設定で今は使えない用途 |
 | `geoframe ai-jobs release-pause (--task <用途>｜--all)` | Provider・用途の停止の明示解除。`--task`は今の設定でその用途に当たる停止だけ（設定が未指定・不正なら何もせず終了コード2）、`--all`は全部 |
+| `geoframe ai-jobs deactivate-space` | 有効な検索空間（`settings.ai_active_space`）を外して旧結果参照へ戻す（P4 / T4.3。[ai-index.md](ai-index.md)）。旧結果・空間・ベクトル・ジョブは消さない。稼働中は拒否 |
 
-`retry`と`release-pause`は**書く**ので、`GEOFRAME_INGEST=1`、検証環境のガード（`sync`と同じ印・Pythonの確認）、`.ingest.lock`、writerを通す。稼働中の`serve`はロックを持つので、**サービスを止めてから**実行する（稼働中は終了コード1で断る）。出力は件数・用途・固定の理由コードだけで、対象のキー・入力のhash・token・起動ID・モデル・URL・パス・写真の値は出さず、生の対象IDも引数に取らない（範囲は種類・用途単位）。
+`retry`・`release-pause`・`deactivate-space`は**書く**ので、`GEOFRAME_INGEST=1`、検証環境のガード（`sync`と同じ印・Pythonの確認）、`.ingest.lock`、writerを通す。稼働中の`serve`はロックを持つので、**サービスを止めてから**実行する（稼働中は終了コード1で断る）。出力は件数・用途・固定の理由コードだけで、対象のキー・入力のhash・token・起動ID・モデル・URL・パス・写真の値は出さず、生の対象IDも引数に取らない（範囲は種類・用途単位）。
 
 ### 管理画面のSTATUS（`GET /api/admin/status`の追加キー）
 
@@ -156,5 +157,5 @@ STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解�
 
 - handlerが未登録の間、`ai-jobs retry`は全ての`failed`を保持する（`unsupported`）。再検査の中身（入力・処理版・ポリシー・既存結果の確認）は各handlerの`recheck`で、T4.4・T4.6が実装する。
 - `Disabled`から`RunError::PolicyDisabled`への対応付け、401/403/404/契約不一致から`ProviderPause`／`TaskPause`への対応付け、429のRetry-After、予算エラー（`Budget`）の扱いは、各handlerが`before_send`の結果をそのまま返すことで揃う（ワーカーがジョブの状態へ対応付ける）。
-- HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。対話の検索語Embedding（`query_embedding`）の予約・キャッシュ、結果の保存先の表、画像／文EmbeddingのアダプターはT4.4、Decisionの質問・clue保存・クラウドはT4.6。
+- HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。空間別のベクトル保存・検索空間の切替・旧選別の安全化はT4.3で実装済み（[ai-index.md](ai-index.md)。切替の成功率の閾値`activation_min_coverage`は、今は`try_activate`の引数と既定0.95で、このJSONには置かない。後続が任意の独立キーとして足す場合は、有限の0〜1だけを許し、不正ならAI設定不正としてAIだけを無効にし、閾値は設定ハッシュ・結果の同一性に入れない）。対話の検索語Embedding（`query_embedding`）の予約・キャッシュ、画像／文EmbeddingのアダプターはT4.4、Decisionの質問・clue保存・クラウドはT4.6。
 

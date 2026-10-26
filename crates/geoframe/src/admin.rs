@@ -295,19 +295,16 @@ fn ai_summary(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Value> 
             AND f.source_md5 IS p.md5 AND f.source_mtime IS p.mtime
           WHERE f.error='' AND f.content_sha256 IS NOT NULL",
     )?;
+    // groups・group_pending・suppressed は、フィードと同じ旧選別の有効判定から数える（crate::selection）
+    let selection = crate::selection::admin_counts(conn)?;
     Ok(json!({
         "embedded": embedded,
         "detailed": detailed,
         "eligible": eligible,
         "pending": (eligible - embedded).max(0),
-        "groups": count(conn, "SELECT COUNT(*) c FROM photo_ai_groups")?,
-        "group_pending": count(conn, "SELECT COUNT(*) c FROM photo_ai_groups WHERE status!='judged'")?,
-        "suppressed": count(
-            conn,
-            "SELECT COUNT(*) c FROM photo_ai_group_members m
-               JOIN photo_ai_groups g ON g.group_id=m.group_id
-              WHERE g.status='judged' AND g.same_scene=1 AND m.recommended=0",
-        )?,
+        "groups": selection.groups,
+        "group_pending": selection.group_pending,
+        "suppressed": selection.suppressed,
     }))
 }
 

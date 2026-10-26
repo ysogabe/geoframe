@@ -35,6 +35,7 @@ pub mod pyval;
 pub mod quality;
 pub mod rotate;
 pub mod schema;
+pub mod selection;
 pub mod server;
 pub mod statics;
 pub mod stop;

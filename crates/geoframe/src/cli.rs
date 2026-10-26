@@ -121,8 +121,12 @@ const USAGE: &str = "\
                                         Provider・用途の停止（認証・契約の不一致で自動的に止まったもの）を明示的に解除する。
                                         用途: image_embedding / query_embedding / photo_judge / location_clue / location_suggest。
                                         --task は今の設定でその用途に当たる停止だけ、--all は全部
-                                        retry・release-pause は書くので、サービスを止めてから実行する（稼働中は
-                                        .ingest.lock により断る）。GEOFRAME_INGEST=1 と、sync と同じ印・Python の確認が要る
+  geoframe ai-jobs deactivate-space [--data-dir <dir>]
+                                        有効な検索空間（settings.ai_active_space）を外し、旧結果参照へ戻す。旧結果・
+                                        新しい空間・ベクトル・ジョブは消さない
+                                        retry・release-pause・deactivate-space は書くので、サービスを止めてから実行する
+                                        （稼働中は .ingest.lock により断る）。GEOFRAME_INGEST=1 と、sync と同じ印・Python の
+                                        確認が要る
 終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または取り込みを断った（本番への誤指定の防止）";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -163,12 +167,15 @@ pub enum AiJobsCommand {
         target: PauseTarget,
         data_dir: Option<PathBuf>,
     },
+    DeactivateSpace {
+        data_dir: Option<PathBuf>,
+    },
 }
 
 fn parse_ai_jobs<I: Iterator<Item = String>>(mut args: I) -> Result<AiJobsCommand, String> {
-    let sub = args
-        .next()
-        .ok_or("ai-jobs にはサブコマンドが要ります（status・retry・release-pause）")?;
+    let sub = args.next().ok_or(
+        "ai-jobs にはサブコマンドが要ります（status・retry・release-pause・deactivate-space）",
+    )?;
     let (mut data_dir, mut all, mut kind, mut task) = (None, false, None, None);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -177,7 +184,7 @@ fn parse_ai_jobs<I: Iterator<Item = String>>(mut args: I) -> Result<AiJobsComman
                     args.next().ok_or("--data-dir に値が要ります")?,
                 ));
             }
-            "--all" if sub != "status" => all = true,
+            "--all" if sub == "retry" || sub == "release-pause" => all = true,
             "--kind" if sub == "retry" => {
                 let value = args.next().ok_or("--kind に値が要ります")?;
                 kind =
@@ -222,6 +229,7 @@ fn parse_ai_jobs<I: Iterator<Item = String>>(mut args: I) -> Result<AiJobsComman
                     .into(),
             ),
         },
+        "deactivate-space" => Ok(AiJobsCommand::DeactivateSpace { data_dir }),
         other => Err(format!("ai-jobs のサブコマンド {other:?} は不明です")),
     }
 }
@@ -841,7 +849,8 @@ fn ai_jobs(command: AiJobsCommand) -> ExitCode {
     let data_dir = match &command {
         AiJobsCommand::Status { data_dir }
         | AiJobsCommand::Retry { data_dir, .. }
-        | AiJobsCommand::ReleasePause { data_dir, .. } => data_dir.clone(),
+        | AiJobsCommand::ReleasePause { data_dir, .. }
+        | AiJobsCommand::DeactivateSpace { data_dir } => data_dir.clone(),
     };
     let overrides = Overrides {
         listen: None,
@@ -861,7 +870,7 @@ fn ai_jobs(command: AiJobsCommand) -> ExitCode {
     }
     if !config.ingest {
         eprintln!(
-            "geoframe: ai-jobs の retry・release-pause は GEOFRAME_INGEST=1 のときだけ動きます（読み取りだけなら ai-jobs status）"
+            "geoframe: ai-jobs の retry・release-pause・deactivate-space は GEOFRAME_INGEST=1 のときだけ動きます（読み取りだけなら ai-jobs status）"
         );
         return ExitCode::from(2);
     }
@@ -881,6 +890,7 @@ fn ai_jobs(command: AiJobsCommand) -> ExitCode {
         AiJobsCommand::ReleasePause { target, .. } => {
             ai_jobs_release_pause(&config, &ingest, target)
         }
+        AiJobsCommand::DeactivateSpace { .. } => ai_jobs_deactivate_space(&ingest),
         AiJobsCommand::Status { .. } => ExitCode::SUCCESS,
     }
 }
@@ -972,6 +982,7 @@ fn format_ai_report(report: &ops::Report) -> String {
     if report.pauses.is_empty() {
         let _ = writeln!(out, "停止中の Provider・用途: なし");
     }
+    out.push_str(&format_index_status(&report.index));
     for p in &report.pauses {
         let _ = writeln!(
             out,
@@ -981,6 +992,37 @@ fn format_ai_report(report: &ops::Report) -> String {
             p.reason.as_str()
         );
     }
+    out
+}
+
+/// `ai-jobs status` の検索索引の部分（件数と固定のコードだけ。空間の ID・モデル・SHA は出さない）。
+fn format_index_status(status: &crate::ai::index::IndexStatus) -> String {
+    use crate::ai::index::ActiveState;
+    use std::fmt::Write;
+    let mut out = String::new();
+    let active = match status.active {
+        ActiveState::NoTables => "なし（空間の表が無い。旧結果参照）",
+        ActiveState::Unset => "なし（旧結果参照）",
+        ActiveState::Active(_) => "あり",
+        ActiveState::Unusable => "なし（指す空間が未登録・不正。旧結果参照）",
+    };
+    let p = &status.progress;
+    let _ = writeln!(out, "検索空間: {active}（登録 {} 件）", status.spaces);
+    if matches!(status.active, ActiveState::Active(_)) {
+        let _ = writeln!(
+            out,
+            "検索索引: 対象 {} / 保存済み {} / 待ち {} / 失敗で除外 {} / 壊れ {}",
+            p.eligible, p.indexed, p.pending, p.failed_excluded, status.corrupt
+        );
+        for (code, count) in &p.failed_reasons {
+            let _ = writeln!(out, "検索索引 除外の理由 {code}: {count} 件");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "他の空間・旧結果のベクトル: {} 種類（うち旧結果 {}。新しい空間には使わない）",
+        status.other_shas, status.legacy_shas
+    );
     out
 }
 
@@ -996,6 +1038,23 @@ fn ai_jobs_retry(config: &Config, ingest: &Ingest, target: RetryTarget, clock: &
         }
         Err(e) => {
             eprintln!("geoframe: 再試行に失敗しました: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn ai_jobs_deactivate_space(ingest: &Ingest) -> ExitCode {
+    match ingest.writer.call(crate::ai::activation::deactivate) {
+        Ok(true) => {
+            println!("有効な検索空間を外した（旧結果参照へ戻した）");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("有効な検索空間は設定されていない（何も変えていない）");
+            ExitCode::SUCCESS
+        }
+        Err(_) => {
+            eprintln!("geoframe: 検索空間の解除に失敗しました");
             ExitCode::FAILURE
         }
     }
@@ -1213,6 +1272,18 @@ mod tests {
             }))
         );
         assert_eq!(
+            p(&["ai-jobs", "deactivate-space", "--data-dir", "/srv/x"]),
+            Ok(Command::AiJobs(AiJobsCommand::DeactivateSpace {
+                data_dir: Some("/srv/x".into())
+            }))
+        );
+        assert_eq!(
+            p(&["ai-jobs", "deactivate-space"]),
+            Ok(Command::AiJobs(AiJobsCommand::DeactivateSpace {
+                data_dir: None
+            }))
+        );
+        assert_eq!(
             p(&["ai-jobs", "release-pause", "--all"]),
             Ok(Command::AiJobs(AiJobsCommand::ReleasePause {
                 target: PauseTarget::All,
@@ -1236,6 +1307,8 @@ mod tests {
             &["ai-jobs", "release-pause", "--kind", "photo_judge"],
             &["ai-jobs", "status", "--all"],
             &["ai-jobs", "status", "--data-dir"],
+            &["ai-jobs", "deactivate-space", "--all"],
+            &["ai-jobs", "deactivate-space", "--space", "x"],
         ] {
             assert!(p(args).is_err(), "{args:?}");
         }

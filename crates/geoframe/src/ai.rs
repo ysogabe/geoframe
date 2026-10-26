@@ -5,12 +5,17 @@
 //! 用途別の handler の登録は後続のタスク。
 //! 設計は `docs/rust-migration/p4-design.md` §3・§4。
 //!
-//! 追加の表（`ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`）は Python と同じスキーマの再現
+//! T4.3 で空間別の検索索引（[`space`]・[`index`]・[`activation`]・[`search`]）を足した。旧選別の安全化は
+//! [`crate::selection`]（旧表だけを読むので、AI の表が無い旧 DB でも動く）。
+//!
+//! 追加の表（`ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・
+//! `ai_embedding_spaces`・`ai_embedding_vectors`）は Python と同じスキーマの再現
 //! （[`crate::schema::migrate`]）には入れず、取り込みが有効な起動で [`migrate`] が足す。`INGEST=0`
 //! （読み取り専用）の起動では作らず、表が無い旧 DB は `db::REQUIRED_SCHEMA` を満たしたまま読める。
 
 use rusqlite::{Connection, TransactionBehavior};
 
+pub mod activation;
 pub mod budget;
 pub mod decision;
 pub mod dest;
@@ -18,13 +23,16 @@ pub mod discovery;
 pub mod gate;
 pub mod http;
 pub mod image_input;
+pub mod index;
 pub mod jobs;
 pub mod lanes;
 pub mod ops;
 pub mod pause;
 pub mod provider;
 pub mod runs;
+pub mod search;
 pub mod settings;
+pub mod space;
 pub mod waits;
 pub mod worker;
 
@@ -32,6 +40,8 @@ pub mod worker;
 mod tests;
 #[cfg(test)]
 mod tests_http;
+#[cfg(test)]
+mod tests_index;
 #[cfg(test)]
 mod tests_ops;
 #[cfg(test)]
@@ -50,6 +60,7 @@ pub fn pending(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     missing.extend(missing_tables(conn, pause::TABLES)?);
     missing.extend(missing_tables(conn, runs::TABLES)?);
     missing.extend(missing_tables(conn, waits::TABLES)?);
+    missing.extend(index::pending(conn)?);
     Ok(missing)
 }
 
@@ -61,6 +72,7 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
     created.extend(create_tables(conn, pause::TABLES, pause::SCHEMA)?);
     created.extend(create_tables(conn, runs::TABLES, runs::SCHEMA)?);
     created.extend(create_tables(conn, waits::TABLES, waits::SCHEMA)?);
+    created.extend(index::migrate(conn)?);
     Ok(created)
 }
 

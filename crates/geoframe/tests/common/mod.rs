@@ -182,13 +182,35 @@ pub fn catalog_sql() -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
 }
 
+/// 旧 AI 選別の「有効なメンバー」にするための行（P4 / T4.3）。`photos` の今の `display`・`md5`・`mtime` に合う
+/// `photo_ai_features`・`photo_quality_features` を、`ids` の写真ごとに足す（`content_sha256` は `sha-<id>`）。
+/// `photos` の行を入れたあとに流す。Python の出力には関係しない行（Python は世代を検査しない）。
+pub fn legacy_generation_sql(ids: &[i64]) -> String {
+    let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    format!(
+        "INSERT OR REPLACE INTO photo_quality_features(photo_id,display,source_md5,source_mtime,
+                content_sha256,error,analyzed_at)
+           SELECT id,display,md5,mtime,'sha-'||id,'','t' FROM photos
+            WHERE id IN ({list}) AND display IS NOT NULL;
+         INSERT OR REPLACE INTO photo_ai_features(photo_id,display,source_md5,source_mtime,
+                content_sha256,embedding_model,embedding_dim,embedding,analyzed_at)
+           SELECT id,display,md5,mtime,'sha-'||id,'legacy-model',3,X'00','t' FROM photos
+            WHERE id IN ({list}) AND display IS NOT NULL;"
+    )
+}
+
 /// フィクスチャと同じ合成DBを作る。`then` は続けて流すSQL（行の追加・削除）。戻り値の接続は書き込み用で、
 /// 持ち続けるとWALが残る（読み取りが書き込み中のDBも読めることの確認にもなる）。
+///
+/// フィクスチャの旧 AI グループのメンバー（写真 6〜9）には、世代の合う特徴量の行を足す
+/// （[`legacy_generation_sql`]）。これで Python と同じ抑止の結果になる。
 pub fn build_catalog(dir: &Path, then: &str) -> (PathBuf, rusqlite::Connection) {
     let path = dir.join("catalog.db");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.pragma_update(None, "journal_mode", "WAL").unwrap();
     conn.execute_batch(&catalog_sql()).unwrap();
+    conn.execute_batch(&legacy_generation_sql(&[6, 7, 8, 9]))
+        .unwrap();
     conn.execute_batch(then).unwrap();
     (path, conn)
 }
@@ -199,6 +221,7 @@ pub fn build_empty_catalog(dir: &Path, rows: &str) -> (PathBuf, rusqlite::Connec
         dir,
         &format!(
             "DELETE FROM photo_ai_group_members; DELETE FROM photo_ai_groups;
+             DELETE FROM photo_ai_features; DELETE FROM photo_quality_features;
              DELETE FROM photo_quality; DELETE FROM photos; {rows}"
         ),
     )
@@ -319,10 +342,33 @@ pub async fn photos_from(path: &Path) -> Response {
 
 /// 管理画面の読み取り API のフィクスチャ（`python3 tools/gen_admin_fixture.py` が現行 Python から
 /// 書き出す）。
+///
+/// **意図した差（P4 / T4.3）**: `db.ai` の `groups`・`group_pending`・`suppressed` だけは Python の値でなく、
+/// Rust の「世代の合う有効な旧メンバーだけを数える」値に直してある（合成 DB の `photo_ai_group_members` の
+/// うち、`photo_ai_features`・`photo_quality_features` の世代が今の写真と合うのは `ai-1` の写真 6・7 だけ。
+/// 8 は `md5` が古く、9・10 は特徴量の行が無い）。他の値は Python のまま。
 pub fn admin_fixture() -> Value {
-    read_json(
+    let mut fixture = read_json(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/admin-api-python.json"),
-    )
+    );
+    fn patch(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                if let Some(Value::Object(ai)) = map.get_mut("db").and_then(|d| d.get_mut("ai")) {
+                    ai.insert("groups".into(), 1.into());
+                    ai.insert("group_pending".into(), 0.into());
+                    ai.insert("suppressed".into(), 1.into());
+                }
+                map.values_mut().for_each(patch);
+            }
+            Value::Array(items) => items.iter_mut().for_each(patch),
+            _ => {}
+        }
+    }
+    patch(&mut fixture["status"]);
+    patch(&mut fixture["status_targets"]);
+    patch(&mut fixture["infer_variants"]);
+    fixture
 }
 
 /// 管理画面 API のフィクスチャを作った合成DB（本物のスキーマ＋行）のSQL。

@@ -387,7 +387,7 @@ Pythonの現行ログには、Rustでは出さないほうがよいものが含�
 | 品質・AI行の有効性判定 | `display` / `md5` / `mtime`（`IS` 比較）が現在の `photos` と一致する行だけ採用。画像が変わると自動で無効になる | `photos.py:QUALITY_JOIN`、`ai_search.py:_valid_rows` ほか |
 | 品質の「全員分そろってから再構築」 | 未解析が残る間は前回の `photo_quality` を維持 | `quality.py:rebuild_quality_if_ready` |
 | AIグループの判定引き継ぎ | `judge_version` が同じ `group_id` の判定結果は再構築しても保持 | `ai_pipeline.py:_rebuild_groups` |
-| 配信の抑制（E1） | 完全重複の非推奨を除外、AIが「同一場面で推奨外」としたもの（お気に入りを除く）を除外 | `photos.py:QUALITY_VISIBLE` / `AI_VISIBLE` |
+| 配信の抑制（E1） | 完全重複の非推奨を除外、AIが「同一場面で推奨外」としたもの（お気に入りを除く）を除外。**Rust（P4 / T4.3）は、メンバーの世代が今の写真と合い、同じグループに有効で表示可能な推奨写真があるときだけ抑止する**（[ai-index.md §6](ai-index.md)。意図した変更） | `photos.py:QUALITY_VISIBLE` / `AI_VISIBLE` |
 | クラウド送信の関門 | 位置候補は Decision の判定が済んだ「日」だけをGeminiへ送る | `loc_suggest.py:loc_suggest_cycle` |
 | ブログ書き出しの個人情報除去 | 再エンコード時にEXIFを渡さない、候補APIは粗い地名だけを返す | `travel_blog.py:_export_image` / `_location_label` |
 | 書き込みの原子性 | 品質・AIグループは `BEGIN IMMEDIATE` で全削除→全挿入。derivative・キャッシュ・下書きは tmp→`os.replace`/`rename`。ブログ書き出しは staging→`.previous` を経由して置換 | `store.py`、`util.py:make_derivative`、`travel_blog.py:export_blog` |

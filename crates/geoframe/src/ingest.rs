@@ -593,14 +593,16 @@ mod tests {
 
         let ingest = start(&config).unwrap();
         assert!(config.db_path().exists());
-        // Python と同じスキーマの 16（表 11・索引 5）と、P4 の AI 表（`ai_jobs`・その索引・送信予算・Provider 停止・共有の一時待機・起動 ID）
-        assert_eq!(ingest.migration.created.len(), 16 + 6);
+        // Python と同じスキーマの 16（表 11・索引 5）と、P4 の AI 表（`ai_jobs`・その索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表・その索引）
+        assert_eq!(ingest.migration.created.len(), 16 + 9);
         for name in [
             "ai_jobs",
             "ai_request_usage",
             "ai_provider_pauses",
             "ai_provider_waits",
             "ai_worker_runs",
+            "ai_embedding_spaces",
+            "ai_embedding_vectors",
         ] {
             assert!(
                 ingest.migration.created.contains(&name.to_string()),

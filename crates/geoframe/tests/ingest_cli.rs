@@ -171,7 +171,7 @@ fn dry_run_writes_nothing_and_reports_counts() {
     assert!(stdout.contains("dry-run: 何も書きません"), "{stdout}");
     assert!(
         stdout.contains(
-            "スキーマ: 作る表・索引 6 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
+            "スキーマ: 作る表・索引 9 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
         ),
         "{stdout}"
     );
@@ -308,8 +308,8 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
             |r| r.get(0),
         )
         .unwrap();
-    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`
-    assert_eq!(tables, 16);
+    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・`ai_embedding_spaces`・`ai_embedding_vectors`
+    assert_eq!(tables, 18);
 }
 
 #[test]
@@ -321,9 +321,9 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     envs.push(("GEOFRAME_INGEST", "1".into()));
     let out = run_owned(&["sync", "--data-dir", dir.0.to_str().unwrap()], &envs);
     assert!(out.status.success(), "{}", text(&out.stdout));
-    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID）だけ。ほかの表・列は変えない
+    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表）だけ。ほかの表・列は変えない
     assert!(
-        text(&out.stdout).contains("スキーマを更新しました: 作成 6件 / 列の追加 0件"),
+        text(&out.stdout).contains("スキーマを更新しました: 作成 9件 / 列の追加 0件"),
         "{}",
         text(&out.stdout)
     );
@@ -1395,4 +1395,182 @@ fn quality_scan_analyzes_everything_and_rebuilds_when_the_guard_passes() {
     assert_eq!(dirty, "0");
     // 出力にファイル名を出さない
     assert!(!stdout.contains("a.jpg") && !text(&out.stderr).contains("a.jpg"));
+}
+
+// ---------------------------------------------------------------- 検索索引（P4 / T4.3）
+
+/// 本番相当の DB に、新しい空間（登録）・ベクトル・有効な検索空間のポインタを足す。旧結果（`photo_ai_features`・
+/// `photo_embeddings`）は別に持たせ、新しい空間の操作で変わらないことを後で確かめる。
+fn data_with_active_space(dir: &Dir) -> PathBuf {
+    use geoframe::ai::settings::Normalization;
+    use geoframe::ai::space::SpaceIdentity;
+    let data = dir.0.join("space-data");
+    fs::create_dir_all(&data).unwrap();
+    production_shaped_db(&data);
+    let mut conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    geoframe::ai::migrate(&mut conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,
+                                            error,analyzed_at)
+           VALUES (1,'derivatives/a.jpg',NULL,NULL,'SECRET-SHA','','t');
+         INSERT INTO photo_ai_features(photo_id,display,source_md5,source_mtime,content_sha256,
+                embedding_model,embedding_dim,embedding,analyzed_at)
+           VALUES (1,'derivatives/a.jpg',NULL,NULL,'SECRET-SHA','old-model',3,X'0102','t');
+         INSERT INTO photo_embeddings VALUES ('SECRET-SHA','old-model',3,X'0102','t');",
+    )
+    .unwrap();
+    let space = SpaceIdentity::new(
+        "space-1",
+        "shared-1",
+        "model-a",
+        "rev-1",
+        "img-v1",
+        "txt-v1",
+        3,
+        Normalization::L2,
+    )
+    .unwrap();
+    geoframe::ai::index::register_space(&mut conn, &space, 0).unwrap();
+    geoframe::ai::index::store_vector(&mut conn, &space, "SECRET-SHA", "sent", &[1.0, 0.0, 0.0], 0)
+        .unwrap();
+    let snapshot = geoframe::ai::activation::snapshot_targets(&conn, &space).unwrap();
+    assert!(
+        geoframe::ai::activation::try_activate(&mut conn, &snapshot, &space, 0.95)
+            .unwrap()
+            .published()
+    );
+    data
+}
+
+fn active_pointer(data: &Path) -> Option<String> {
+    rusqlite::Connection::open(data.join("catalog.db"))
+        .unwrap()
+        .query_row(
+            "SELECT value FROM settings WHERE key='ai_active_space'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+fn count(data: &Path, table: &str) -> i64 {
+    rusqlite::Connection::open(data.join("catalog.db"))
+        .unwrap()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn ai_jobs_status_shows_the_search_index_with_counts_only_and_writes_nothing() {
+    // 空間の表が無い旧 DB: 新しい空間なし・旧結果参照。書き込み 0（AI の表も作らない）
+    let dir = Dir::new("aiindex-status-old");
+    production_shaped_db(&dir.0);
+    let before = snapshot(&dir.0);
+    let out = run(
+        &["ai-jobs", "status", "--data-dir", dir.0.to_str().unwrap()],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains("検索空間: なし（空間の表が無い。旧結果参照）（登録 0 件）"),
+        "{stdout}"
+    );
+    assert_eq!(snapshot(&dir.0), before);
+
+    // 有効な空間がある DB: 件数だけ（空間の ID・SHA・モデルは出さない）
+    let dir = Dir::new("aiindex-status-active");
+    let data = data_with_active_space(&dir);
+    let before = snapshot(&data);
+    let out = run(
+        &["ai-jobs", "status", "--data-dir", data.to_str().unwrap()],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("検索空間: あり（登録 1 件）"), "{stdout}");
+    assert!(
+        stdout.contains("検索索引: 対象 1 / 保存済み 1 / 待ち 0 / 失敗で除外 0 / 壊れ 0"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("旧結果 1"), "{stdout}");
+    for secret in ["SECRET", "space-1", "model-a", "shared-1", "old-model"] {
+        assert!(!stdout.contains(secret), "{secret}: {stdout}");
+    }
+    assert_eq!(snapshot(&data), before);
+}
+
+#[test]
+fn deactivate_space_needs_ingest_the_guard_and_a_stopped_service_and_keeps_every_result() {
+    let dir = Dir::new("aiindex-deactivate");
+    let data = data_with_active_space(&dir);
+    let before = snapshot(&data);
+    let arg = data.to_str().unwrap();
+    let args = ["ai-jobs", "deactivate-space", "--data-dir", arg];
+    // INGEST が無い → 2。印が無い → 2。どちらも何も書かない
+    let out = run(&args, &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("GEOFRAME_INGEST=1"));
+    let out = run(&args, &[("GEOFRAME_INGEST", "1")]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_untouched_after_refusal(&data, &before);
+
+    // 稼働中の serve（ロックを持つ）があるときは、印があっても断る → 1。ポインタは変わらない
+    let staging = Staging::new("aiindex-deactivate");
+    let port = free_port();
+    let mut child = serve(&data, port, Some(("1", &staging)));
+    wait_healthy(&mut child, port);
+    let mut envs = staging.envs();
+    envs.push(("GEOFRAME_INGEST", "1".into()));
+    let out = run_owned(&args, &envs);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("サービスを止めてから"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(active_pointer(&data).as_deref(), Some("space-1"));
+    let (stopped, _) = terminate(child);
+    assert!(stopped.success());
+
+    // 停止後は外せる。旧結果・空間・ベクトル・ジョブは消さず、設定の ai_active_space だけが消える
+    let legacy = (
+        count(&data, "photo_ai_features"),
+        count(&data, "photo_embeddings"),
+        count(&data, "ai_embedding_spaces"),
+        count(&data, "ai_embedding_vectors"),
+    );
+    let out = run_owned(&args, &envs);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("有効な検索空間を外した（旧結果参照へ戻した）"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(active_pointer(&data), None);
+    assert_eq!(
+        legacy,
+        (
+            count(&data, "photo_ai_features"),
+            count(&data, "photo_embeddings"),
+            count(&data, "ai_embedding_spaces"),
+            count(&data, "ai_embedding_vectors"),
+        )
+    );
+    assert_eq!(legacy, (1, 1, 1, 1));
+    // 2 回目は何も変えない
+    let out = run_owned(&args, &envs);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("有効な検索空間は設定されていない"),
+        "{}",
+        text(&out.stdout)
+    );
+    // status は旧結果参照へ戻ったと示す
+    let out = run(&["ai-jobs", "status", "--data-dir", arg], &[]);
+    assert!(
+        text(&out.stdout).contains("検索空間: なし（旧結果参照）（登録 1 件）"),
+        "{}",
+        text(&out.stdout)
+    );
 }

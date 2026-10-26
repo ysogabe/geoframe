@@ -238,7 +238,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 ### 8.1 SQLと並び
 
-- 品質・AIの`JOIN`と表示条件（`lat`あり、`display`あり、`hidden`でない、品質`exact`の推奨外とAI同一場面の推奨外を除く。お気に入りはAIでは残る）の**SQLは文字列まで同じ**。違うのは`p.*`を使う列だけに絞ったことと、`ORDER BY`だけ:
+- 品質・AIの`JOIN`と表示条件（`lat`あり、`display`あり、`hidden`でない、品質`exact`の推奨外とAI同一場面の推奨外を除く。お気に入りはAIでは残る）の**SQLは、AIの抑止条件（`AI_VISIBLE`）を除いて文字列まで同じ**。違うのは`p.*`を使う列だけに絞ったことと、`ORDER BY`、そしてP4 / T4.3で安全にした`AI_VISIBLE`だけ（[ai-index.md §6](ai-index.md)。旧`AI_VISIBLE`は旧メンバー表の行があるだけで推奨外を隠していたが、メンバーの世代（`photo_ai_features`の`display`・`md5`・`mtime`・内容SHAが今の写真と現在の品質特徴量に合う）と、同じグループに有効で表示可能な推奨写真があることを検査する。管理画面の`groups`・`group_pending`・`suppressed`も同じSQLから数える）。`ORDER BY`は:
   `CASE WHEN COALESCE(p.taken_at,'')='' THEN 1 ELSE 0 END, COALESCE(p.taken_at,'')`（Pythonは`taken_at`のみで、NULLが先頭になる）。
 - **同順位（同じ`taken_at`）の並びは固定していない。** Pythonも同じで、SQLiteのソートと`LEFT JOIN`の走査順に依存する。同じSQLなので通常は同じ並びになるが、リンクするSQLiteのバージョン（Rustは同梱のSQLite）が違えば変わりうる。T1.5で本番コピーの全件比較をして、差が出たら`, p.id`を足す（`inventory.md §6`の方針）。テストはフィクスチャ（同順位が出ない）と、同順位を固定しない確認だけ。
 - 複数のAIグループに入った写真は行が重なる（PythonのSQLが同じなので同じ。本番では起きない前提）。
@@ -2274,4 +2274,5 @@ AIの背景ワーカー・Providerの停止・送信予算・ジョブの回収�
 
 - `stop.rs`（起点・phase_limit・http_limit）、`tests/shutdown.rs`（`serve_until`が合図の直後に`StopFlag`を立てる／読まないクライアントで終わらないHTTPが期限の3/4で打ち切られる／bind失敗はエラーで合図を立てない）、`cli.rs`（固まったスレッドがあっても停止の各待ちが共通期限を越えない）、`ai/tests_worker.rs`（writerが忙しくてもAIの停止記録・最後の戻しが期限を越えない／固まったhandlerが`LockHold`を残し、遅れた応答を保存しない）。
 - `tests/ingest_cli.rs`: 実バイナリでSIGTERM後に起動IDと停止開始が残る／`INGEST=0`はAIの回収・表の作成・Provider停止の整理を一切しない／`ai-jobs`のガード・稼働中拒否・出力に秘匿情報を含めない。
+- P4 / T4.3（空間別の検索索引と旧選別の安全化。[ai-index.md](ai-index.md)）: `ai/tests_index.rs`（識別の全項目照合・`space_id`の再利用拒否・ベクトルの検査・L2の安定・壊れた行・顔ぶれ・切替の条件・並行する切替の読み取り・検索の混在0）、`tests/legacy_selection.rs`（代表の削除・更新・回転・hidden化・位置なし・品質非表示後に残りが表示される・favorite・空間切替で旧選別が不変・管理画面の集計とフィードの一致・AI表なしの旧DB）、`tests/ai_index_python_rollback.rs`（Rustの追加表・ポインタがあるDBを現行Pythonに渡しても人手の列・旧の有償結果が不変）、`tests/ingest_cli.rs`（`ai-jobs status`の索引の件数・`deactivate-space`のガード・稼働中拒否）。
 

@@ -26,6 +26,7 @@ use std::sync::Arc;
 use rusqlite::Connection;
 use serde_json::{Map, Value, json};
 
+use super::index;
 use super::jobs::{self, ErrorCode, JobKind, JobState, RetryScope};
 use super::pause::{self, PauseInfo};
 use super::settings::{AiConfig, AiConfigError, Disabled, TaskKind};
@@ -55,6 +56,8 @@ pub struct Report {
     pub pauses: Vec<PauseInfo>,
     /// まだ有効な共有の一時待機（今の設定の用途に結び直したもの。[`waits::view`]）。
     pub waits: waits::WaitView,
+    /// 検索索引（空間別ベクトル）の状態（件数だけ。空間の表が無い旧 DB でも読める）。
+    pub index: index::IndexStatus,
 }
 
 /// 設定の状態。
@@ -83,6 +86,7 @@ pub fn report_at(conn: &Connection, ai: &AiConfig, now: i64) -> rusqlite::Result
         reasons: reason_counts(conn)?,
         pauses: pause::list(conn)?,
         waits: waits::view(conn, now, &waits::Identities::from_config(ai))?,
+        index: index::status(conn)?,
     })
 }
 
