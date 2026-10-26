@@ -7,6 +7,7 @@
 //! - 切替: 未完了の待ち・1 件失敗でも公開・全件失敗/閾値未達は旧ポインタ・世代変更・追加が続く・並行する切替の読み取り
 //! - 検索: 空間の混在 0・識別の不一致の拒否
 
+use rusqlite::types::Value;
 use rusqlite::{Connection, params};
 
 use super::activation::{self, ActivateError, Activation};
@@ -548,10 +549,12 @@ fn eligible_targets_follow_the_current_generation_of_each_photo() {
         )
         .unwrap();
 
-    let rows = index::classify(&db.conn, None).unwrap();
-    let got: Vec<(i64, &str)> = rows
+    let snapshot =
+        activation::snapshot_targets(&db.conn, &ident("x", 3, Normalization::L2)).unwrap();
+    let got: Vec<(i64, &str)> = snapshot
+        .targets()
         .iter()
-        .map(|c| (c.target.photo_id, c.target.input_sha256.as_str()))
+        .map(|t| (t.members()[0].photo_id, t.input_sha256()))
         .collect();
     assert_eq!(got, [(1, "sha-a"), (3, "sha-b"), (4, "sha-c")]);
 }
@@ -590,10 +593,7 @@ fn status_counts_progress_from_the_effective_join_only() {
     assert_eq!(st.progress.indexed, 2);
     assert_eq!(st.progress.pending, 1); // s3 は a にまだ無い
     assert_eq!(st.progress.failed_excluded, 1);
-    assert_eq!(
-        st.progress.failed_reasons,
-        [("bad_response".to_string(), 1)]
-    );
+    assert_eq!(st.progress.failed_reasons, [("bad_response", 1)]);
     assert_eq!(st.other_space_shas, 3); // s3・s1・old-sha（重複なし）
     assert_eq!(st.legacy_shas, 0);
     assert_eq!(st.spaces, 2);
@@ -1292,4 +1292,346 @@ fn building_and_switching_never_touch_legacy_or_primary_rows() {
     assert!(db.try_activate(&a, 0.95).published());
     activation::deactivate(&mut db.conn).unwrap();
     assert_eq!(super::tests::dump(&db.conn), before);
+}
+
+// ---------------------------------------------------------------- 修正 r2
+
+/// 壊れた保存済みベクトルの作り方（`ai_embedding_vectors` の CHECK を通る形のもの）。
+fn corrupt_variants() -> Vec<(&'static str, Value, Option<i64>)> {
+    let nan = space::encode(&[f32::NAN, 0.0, 0.0]);
+    let inf = space::encode(&[f32::INFINITY, 0.0, 0.0]);
+    vec![
+        ("nan", Value::Blob(nan), None),
+        ("infinity", Value::Blob(inf), None),
+        ("zero", Value::Blob(space::encode(&[0.0, 0.0, 0.0])), None),
+        (
+            "not-unit",
+            Value::Blob(space::encode(&[3.0, 4.0, 0.0])),
+            None,
+        ),
+        // 次元の列と長さが（CHECK の上では）整合していても、空間の次元と違う
+        ("short", Value::Blob(space::encode(&[1.0, 0.0])), Some(2)),
+        // 型が BLOB でない（長さは dimension*4 に見える）
+        ("text", Value::Text("abcdefghijkl".into()), None),
+    ]
+}
+
+fn corrupt_stored(db: &Db, sha: &str, value: &Value, dimension: Option<i64>) {
+    db.conn
+        .execute(
+            "UPDATE ai_embedding_vectors SET vector=?1, dimension=COALESCE(?2,dimension)
+             WHERE input_sha256=?3",
+            params![value, dimension, sha],
+        )
+        .unwrap();
+}
+
+#[test]
+fn a_stored_vector_that_fails_the_read_check_is_never_counted_as_a_success() {
+    for (tag, value, dimension) in corrupt_variants() {
+        let mut db = db(&format!("corrupt-{tag}"));
+        let old = ident("old", 3, Normalization::L2);
+        let new = SpaceIdentity::new(
+            "new",
+            "shared-2",
+            "model-b",
+            "rev-1",
+            "img-v1",
+            "txt-v1",
+            3,
+            Normalization::L2,
+        )
+        .unwrap();
+        db.register(&old);
+        db.register(&new);
+        db.photo(1, "s1");
+        db.store(&old, "s1", &unit3(1.0, 0.0, 0.0));
+        assert!(db.try_activate(&old, 0.95).published());
+        db.store(&new, "s1", &unit3(1.0, 0.0, 0.0));
+        corrupt_stored(&db, "s1", &value, dimension); // old の行も壊れるが new を後で直す
+        db.conn
+            .execute(
+                "UPDATE ai_embedding_vectors SET vector=?1, dimension=3 WHERE space_id='old'",
+                [space::encode(&[1.0, 0.0, 0.0])],
+            )
+            .unwrap();
+        // 壊れた new を成功に数えない: 公開されず、旧ポインタを保持する
+        let outcome = db.try_activate(&new, 0.95);
+        assert!(
+            matches!(outcome, Activation::Waiting(_)),
+            "{tag}: {outcome:?}"
+        );
+        assert_eq!(outcome.counts().indexed, 0, "{tag}");
+        assert_eq!(outcome.counts().pending, 1, "{tag}");
+        assert_eq!(db.pointer().as_deref(), Some("old"), "{tag}");
+        // 進捗・status・検索の再集計がすべて同じ（壊れた行は pending・corrupt の実件数）
+        let progress = index::progress(&db.conn, &new).unwrap();
+        db.set_pointer("new");
+        let loaded = search::load_active_index(&db.conn).unwrap();
+        assert_eq!(loaded.status.progress, progress, "{tag}");
+        assert_eq!(index::status(&db.conn).unwrap(), loaded.status, "{tag}");
+        assert_eq!(
+            (progress.indexed, progress.pending, loaded.status.corrupt),
+            (0, 1, 1),
+            "{tag}"
+        );
+        assert!(loaded.index.unwrap().is_empty(), "{tag}");
+        db.set_pointer("old");
+        // 再生成（置き換え）すれば公開できる
+        assert_eq!(
+            db.store(&new, "s1", &unit3(0.0, 1.0, 0.0)),
+            Stored::Repaired,
+            "{tag}"
+        );
+        assert!(db.try_activate(&new, 0.95).published(), "{tag}");
+    }
+}
+
+#[test]
+fn a_corrupt_row_blocks_publication_even_when_99_of_100_are_good_and_a_failed_job_excludes_it() {
+    let mut db = db("corrupt-99");
+    let a = ident("a", 3, Normalization::L2);
+    db.register(&a);
+    for i in 1..=100 {
+        db.photo(i, &format!("s{i}"));
+        db.store(&a, &format!("s{i}"), &unit3(1.0, i as f32, 0.0));
+    }
+    corrupt_stored(
+        &db,
+        "s7",
+        &Value::Blob(space::encode(&[f32::NAN, 0.0, 0.0])),
+        None,
+    );
+    let outcome = db.try_activate(&a, 0.95);
+    assert!(matches!(outcome, Activation::Waiting(_)), "{outcome:?}");
+    assert_eq!(
+        (outcome.counts().indexed, outcome.counts().pending),
+        (99, 1)
+    );
+    // 現在の入力・処理版の failed ジョブがあれば除外（99/100 で公開）。corrupt の件数は残る
+    db.fail_job(&a, "s7");
+    let outcome = db.try_activate(&a, 0.95);
+    assert!(outcome.published(), "{outcome:?}");
+    assert_eq!(outcome.counts().failed_excluded, 1);
+    assert_eq!(index::status(&db.conn).unwrap().corrupt, 1);
+}
+
+/// 同じ SHA の写真を複数持つ状態を作る（`ids` はどれも `sha`）。
+fn dup(db: &Db, sha: &str, ids: &[i64]) {
+    for id in ids {
+        db.photo(*id, sha);
+    }
+}
+
+#[test]
+fn deleting_a_representative_keeps_the_sha_while_a_duplicate_remains() {
+    // A(id1)、B(id2,id3)。A だけベクトル済みで id2 を削除しても、B は id3 で残っているので未完
+    let mut db = db("dup-rep");
+    let a = ident("a", 3, Normalization::L2);
+    db.register(&a);
+    dup(&db, "sA", &[1]);
+    dup(&db, "sB", &[2, 3]);
+    let snapshot = activation::snapshot_targets(&db.conn, &a).unwrap();
+    assert_eq!(snapshot.len(), 2);
+    db.store(&a, "sA", &unit3(1.0, 0.0, 0.0));
+    db.conn
+        .execute("DELETE FROM photos WHERE id=2", [])
+        .unwrap();
+    let outcome = activation::try_activate(&mut db.conn, &snapshot, &a, 0.95).unwrap();
+    assert!(matches!(outcome, Activation::Waiting(_)), "{outcome:?}");
+    let c = outcome.counts();
+    assert_eq!(
+        (c.snapshot, c.stale, c.valid, c.indexed, c.pending),
+        (2, 0, 2, 1, 1)
+    );
+    assert_eq!(db.pointer(), None);
+    // B が完了すれば公開
+    db.store(&a, "sB", &unit3(0.0, 1.0, 0.0));
+    let outcome = activation::try_activate(&mut db.conn, &snapshot, &a, 0.95).unwrap();
+    assert!(outcome.published(), "{outcome:?}");
+    assert_eq!(outcome.counts().indexed, 2);
+}
+
+#[test]
+fn deleting_every_representative_keeps_vectorized_duplicates_in_the_denominator() {
+    let mut db = db("dup-all-reps");
+    let a = ident("a", 3, Normalization::L2);
+    db.register(&a);
+    dup(&db, "s1", &[1, 3]);
+    dup(&db, "s2", &[2, 4]);
+    let snapshot = activation::snapshot_targets(&db.conn, &a).unwrap();
+    db.store(&a, "s1", &unit3(1.0, 0.0, 0.0));
+    db.store(&a, "s2", &unit3(0.0, 1.0, 0.0));
+    db.conn
+        .execute("DELETE FROM photos WHERE id IN (1,2)", [])
+        .unwrap();
+    let outcome = activation::try_activate(&mut db.conn, &snapshot, &a, 0.95).unwrap();
+    assert!(outcome.published(), "{outcome:?}");
+    let c = outcome.counts();
+    assert_eq!((c.snapshot, c.stale, c.valid, c.indexed), (2, 0, 2, 2));
+    // 検索も同じ SHA を残りの写真で返す
+    let index = search::load_active_index(&db.conn).unwrap().index.unwrap();
+    let ids: Vec<i64> = index.entries().iter().map(|e| e.photo_id()).collect();
+    assert_eq!(ids, [3, 4]);
+}
+
+#[test]
+fn a_sha_goes_stale_only_when_every_original_member_changed() {
+    let mut db = db("dup-stale");
+    let a = ident("a", 3, Normalization::L2);
+    db.register(&a);
+    dup(&db, "s1", &[1, 2]);
+    dup(&db, "s2", &[3, 4]);
+    dup(&db, "s3", &[5]);
+    dup(&db, "s4", &[6, 7]);
+    for sha in ["s1", "s2", "s3", "s4"] {
+        db.store(&a, sha, &unit3(1.0, 0.0, 0.0));
+    }
+    let snapshot = activation::snapshot_targets(&db.conn, &a).unwrap();
+    assert_eq!(snapshot.len(), 4);
+    // s1: 片方（1）を更新、もう片方（2）は未変更 → 有効のまま
+    db.conn
+        .execute("UPDATE photos SET md5='changed' WHERE id=1", [])
+        .unwrap();
+    // s2: 片方（3）を削除、もう片方（4）は未変更 → 有効のまま
+    db.conn
+        .execute("DELETE FROM photos WHERE id=3", [])
+        .unwrap();
+    // s3: 唯一の構成員（5）を更新し、同じ SHA の写真 8 が後から追加される → 元の構成員は全滅なので stale
+    db.conn
+        .execute("UPDATE photos SET md5='changed' WHERE id=5", [])
+        .unwrap();
+    dup(&db, "s3", &[8]);
+    // s4: 全構成員（6,7）を削除 → stale
+    db.conn
+        .execute("DELETE FROM photos WHERE id IN (6,7)", [])
+        .unwrap();
+    let outcome = activation::try_activate(&mut db.conn, &snapshot, &a, 1.0).unwrap();
+    assert!(outcome.published(), "{outcome:?}");
+    let c = outcome.counts();
+    assert_eq!(
+        (c.snapshot, c.stale, c.valid, c.indexed, c.pending),
+        (4, 2, 2, 2, 0)
+    );
+    assert_eq!(c.coverage, 1.0);
+}
+
+#[test]
+fn a_duplicate_survivor_that_lost_its_generation_does_not_keep_the_sha_alive_and_pending_still_waits()
+ {
+    let mut db = db("dup-gen");
+    let a = ident("a", 3, Normalization::L2);
+    db.register(&a);
+    dup(&db, "s1", &[1]);
+    dup(&db, "s2", &[2, 3]);
+    let snapshot = activation::snapshot_targets(&db.conn, &a).unwrap();
+    db.store(&a, "s1", &unit3(1.0, 0.0, 0.0));
+    // 2 は削除、3 は回転（display が変わり世代が合わなくなる）→ s2 の構成員は全滅
+    db.conn
+        .execute("DELETE FROM photos WHERE id=2", [])
+        .unwrap();
+    db.conn
+        .execute(
+            "UPDATE photos SET display='derivatives/p3.r90.jpg' WHERE id=3",
+            [],
+        )
+        .unwrap();
+    let outcome = activation::try_activate(&mut db.conn, &snapshot, &a, 0.95).unwrap();
+    assert!(outcome.published(), "{outcome:?}");
+    assert_eq!((outcome.counts().stale, outcome.counts().valid), (1, 1));
+    // 逆に、生き残った構成員が未完（ベクトルなし）なら待たせる。coverage の閾値も SHA 単位で維持
+    let mut db = db_with_hundred();
+    let snapshot =
+        activation::snapshot_targets(&db.conn, &ident("a", 3, Normalization::L2)).unwrap();
+    let a = ident("a", 3, Normalization::L2);
+    db.conn
+        .execute("DELETE FROM photos WHERE id=1", [])
+        .unwrap(); // s1 の代表。複製 101 が残る
+    let outcome = activation::try_activate(&mut db.conn, &snapshot, &a, 0.95).unwrap();
+    assert!(matches!(outcome, Activation::Waiting(_)), "{outcome:?}");
+    assert_eq!(outcome.counts().valid, 100);
+    assert_eq!(outcome.counts().pending, 1);
+    db.fail_job(&a, "s1");
+    let outcome = activation::try_activate(&mut db.conn, &snapshot, &a, 0.995).unwrap();
+    assert!(
+        matches!(outcome, Activation::BelowThreshold(_)),
+        "{outcome:?}"
+    );
+    assert!(
+        activation::try_activate(&mut db.conn, &snapshot, &a, 0.99)
+            .unwrap()
+            .published()
+    );
+}
+
+/// SHA が 100 種類あり、s1 だけ写真が 2 枚（1 と 101）で、s1 以外にベクトルがある状態。
+fn db_with_hundred() -> Db {
+    let mut db = db("dup-hundred");
+    let a = ident("a", 3, Normalization::L2);
+    db.register(&a);
+    for i in 1..=100 {
+        db.photo(i, &format!("s{i}"));
+        if i > 1 {
+            db.store(&a, &format!("s{i}"), &unit3(1.0, i as f32, 0.0));
+        }
+    }
+    db.photo(101, "s1");
+    db
+}
+
+#[test]
+fn unknown_failure_reasons_are_folded_into_other_on_every_path() {
+    let mut db = db("reasons");
+    let a = ident("a", 3, Normalization::L2);
+    db.register(&a);
+    for i in 1..=6 {
+        db.photo(i, &format!("s{i}"));
+    }
+    db.store(&a, "s1", &unit3(1.0, 0.0, 0.0));
+    let planted = [
+        ("s2", "synthetic-private-value"),
+        ("s3", "other-planted\nINJECTED-LINE"),
+        ("s4", "bad_response"),
+        ("s5", "bad_response"),
+        ("s6", ""),
+    ];
+    for (sha, code) in planted {
+        db.fail_job(&a, sha);
+        db.conn
+            .execute(
+                "UPDATE ai_jobs SET last_error_code=?1 WHERE input_hash=?2 AND kind='image_embedding'",
+                params![code, sha],
+            )
+            .unwrap();
+    }
+    // 不明な理由でも「失敗がある」ものとして扱う（pending に混ぜない）
+    let progress = index::progress(&db.conn, &a).unwrap();
+    assert_eq!((progress.pending, progress.failed_excluded), (0, 5));
+    assert_eq!(progress.failed_reasons, [("bad_response", 2), ("other", 3)]);
+    // status（active）・search の再集計・壊れた行がある再集計も同じ
+    db.set_pointer("a");
+    let status = index::status(&db.conn).unwrap();
+    assert_eq!(status.progress, progress);
+    let loaded = search::load_active_index(&db.conn).unwrap();
+    assert_eq!(loaded.status.progress, progress);
+    // 公開でも failed として除外される（pending ではない）。ここでは 1/6 だが閾値 0.1 を満たすので公開できる
+    let outcome = db.try_activate(&a, 0.1);
+    assert!(outcome.published(), "{outcome:?}");
+    assert_eq!(
+        (outcome.counts().pending, outcome.counts().failed_excluded),
+        (0, 5)
+    );
+    corrupt_stored(
+        &db,
+        "s1",
+        &Value::Blob(space::encode(&[f32::NAN, 0.0, 0.0])),
+        None,
+    );
+    let loaded = search::load_active_index(&db.conn).unwrap();
+    assert_eq!(loaded.status.corrupt, 1);
+    let rendered = format!("{:?}", loaded.status.progress.failed_reasons);
+    assert!(rendered.contains("other") && rendered.contains("bad_response"));
+    for marker in ["synthetic-private-value", "INJECTED", "other-planted"] {
+        assert!(!rendered.contains(marker), "{marker}");
+    }
 }

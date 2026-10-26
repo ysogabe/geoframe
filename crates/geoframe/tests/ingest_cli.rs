@@ -1501,6 +1501,79 @@ fn ai_jobs_status_shows_the_search_index_with_counts_only_and_writes_nothing() {
 }
 
 #[test]
+fn ai_jobs_status_never_prints_a_stored_failure_reason_that_is_not_a_known_code() {
+    use geoframe::ai::index::image_embedding_key;
+    let dir = Dir::new("aiindex-status-reasons");
+    let data = data_with_active_space(&dir);
+    let space = {
+        let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+        geoframe::ai::index::load_space(&conn, "space-1")
+            .unwrap()
+            .unwrap()
+    };
+    let mut conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    for (id, sha, code) in [
+        (
+            101,
+            "SECRET-SHA-2",
+            "synthetic-private-value\nINJECTED-LINE",
+        ),
+        (102, "SECRET-SHA-3", "other-private"),
+        (103, "SECRET-SHA-4", "bad_response"),
+    ] {
+        conn.execute(
+            "INSERT INTO photos(id,source,name,display,md5,mtime,lat,lon)
+             VALUES(?1,'drive','synthetic',?2,?3,?1,35,139)",
+            rusqlite::params![id, format!("derivatives/p{id}.jpg"), format!("m{id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,
+                                                error,analyzed_at)
+             SELECT id,display,md5,mtime,?2,'','t' FROM photos WHERE id=?1",
+            rusqlite::params![id, sha],
+        )
+        .unwrap();
+        let key = image_embedding_key(&space, sha);
+        geoframe::ai::jobs::enqueue(&mut conn, &key, 0).unwrap();
+        conn.execute(
+            "UPDATE ai_jobs SET state='failed', terminal=1, last_error_code=?1 WHERE input_hash=?2",
+            rusqlite::params![code, sha],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let before = snapshot(&data);
+    let out = run(
+        &["ai-jobs", "status", "--data-dir", data.to_str().unwrap()],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains("検索索引 除外の理由 bad_response: 1 件"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("検索索引 除外の理由 other: 2 件"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("失敗で除外 3"), "{stdout}");
+    for marker in [
+        "synthetic-private-value",
+        "INJECTED",
+        "other-private",
+        "SECRET",
+    ] {
+        assert!(
+            !stdout.contains(marker) && !text(&out.stderr).contains(marker),
+            "{marker}: {stdout}"
+        );
+    }
+    assert_eq!(snapshot(&data), before);
+}
+
+#[test]
 fn deactivate_space_needs_ingest_the_guard_and_a_stopped_service_and_keeps_every_result() {
     let dir = Dir::new("aiindex-deactivate");
     let data = data_with_active_space(&dir);

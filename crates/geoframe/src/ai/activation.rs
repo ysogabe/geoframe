@@ -2,18 +2,24 @@
 //!
 //! # 流れ
 //!
-//! 1. 構築を始める時点で [`snapshot_targets`] が**今の対象と各世代**（写真 ID・`content_sha256`・`display`・`md5`・
-//!    `mtime`）を候補として持つ（[`BuildSnapshot`]）。
+//! 1. 構築を始める時点で [`snapshot_targets`] が**今の対象と各世代**を候補として持つ（[`BuildSnapshot`]）。
+//!    候補は `content_sha256` ごとで、その SHA に属する**すべての写真の世代**（写真 ID・`display`・`md5`・
+//!    `mtime`）を持つ（代表 1 枚だけではない）。
 //! 2. 後続のワーカー（T4.4）が、その空間の画像 Embedding を作り、[`super::index::store_vector`] で保存する
 //!    （ジョブは [`super::index::image_embedding_key`]）。
 //! 3. 切替できそうなとき [`try_activate`] を writer 上で呼ぶ。**1 つの書き込みトランザクションの中で**、候補の
-//!    それぞれが**今も同じ世代の対象か**を再検査し、削除・更新・回転された写真は候補から除く（`stale`）。
+//!    それぞれが**今も同じ世代の対象か**を再検査する。SHA は、**構築開始時の構成員のうち 1 枚でも今も同じ世代の
+//!    対象**ならまだ有効（代表が消えても、同じ内容の写真が変わらず残っていれば分母・待ちに残す）。構成員が
+//!    すべて削除・更新・回転された SHA だけを候補から除く（`stale`）。構築後に同じ SHA の写真が**追加されて
+//!    いても**、元の構成員がすべて変わっていれば有効にはならない（追加分は差分として後続で処理する）。
 //!
 //! # 公開の条件
 //!
-//! 残った候補（`valid`）を数える:
+//! 残った候補（`valid`。SHA の数）を数える。ベクトルの有無は索引の読み取り・進捗と**同じ検査**
+//! （[`super::index::ShaState`]。長さ・次元・有限数・ゼロでないノルム・L2 の単位ノルム・型）で決め、壊れた行は
+//! 成功に数えず `pending`（再生成の対象）として公開を待たせる:
 //!
-//! - ベクトルがあるもの: `indexed`。
+//! - 検査を通ったベクトルがあるもの: `indexed`。
 //! - ベクトルが無く、現在の入力・処理版・空間のジョブが `failed`: `failed_excluded`（公開を待たせず、対象から除く。
 //!   別の空間・古い版・別の SHA の失敗では除かない。T4.4 が手動再試行に成功してベクトルを保存すると、有効な結合で
 //!   自動的に検索へ加わる）。
@@ -29,6 +35,8 @@
 //! 検索に加わる）。閾値は結果の同一性（識別・ジョブのキー）に入れない。**設定への配線は後続**で、いまは
 //! `min_coverage` の引数と [`DEFAULT_ACTIVATION_MIN_COVERAGE`] だけ（`AiSettings` に任意キーを足す場合も、
 //! 有限・0〜1 の検査をここの [`valid_coverage`] に合わせる）。
+//! 検査は writer の 1 トランザクションの中で、候補のベクトルを読んで行う（ローカルの計算だけ。外部通信・
+//! 重い変換は持ち込まない。6,500 × 768 でも数十 ms の見込み）。
 //!
 //! # 復帰
 //!
@@ -40,15 +48,40 @@ use std::fmt;
 use rusqlite::{Connection, TransactionBehavior, params};
 
 use super::index::{
-    ACTIVE_KEY, DEFAULT_ACTIVATION_MIN_COVERAGE, Eligible, SpaceError, classify, load_space,
+    ACTIVE_KEY, DEFAULT_ACTIVATION_MIN_COVERAGE, Eligible, ShaState, SpaceError, load_space, scan,
 };
 use super::space::SpaceIdentity;
+
+/// 切替の候補の 1 件（`content_sha256` 1 種類と、構築開始時のその構成員すべて）。値は `Debug` に出さない。
+#[derive(Clone)]
+pub struct SnapshotTarget {
+    members: Vec<Eligible>,
+}
+
+impl fmt::Debug for SnapshotTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotTarget")
+            .field("members", &self.members.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl SnapshotTarget {
+    pub fn input_sha256(&self) -> &str {
+        &self.members[0].input_sha256
+    }
+
+    /// 構築開始時の構成員（写真 ID の昇順。写真 ID・世代を持つ）。
+    pub fn members(&self) -> &[Eligible] {
+        &self.members
+    }
+}
 
 /// 切替の候補（構築を始めた時点の今の対象）。値（SHA・写真 ID）は `Debug` に出さない。
 #[derive(Clone)]
 pub struct BuildSnapshot {
     space_id: String,
-    targets: Vec<Eligible>,
+    targets: Vec<SnapshotTarget>,
 }
 
 impl fmt::Debug for BuildSnapshot {
@@ -60,6 +93,7 @@ impl fmt::Debug for BuildSnapshot {
 }
 
 impl BuildSnapshot {
+    /// 候補の数（`content_sha256` の種類数）。
     pub fn len(&self) -> usize {
         self.targets.len()
     }
@@ -68,7 +102,7 @@ impl BuildSnapshot {
         self.targets.is_empty()
     }
 
-    pub fn targets(&self) -> &[Eligible] {
+    pub fn targets(&self) -> &[SnapshotTarget] {
         &self.targets
     }
 }
@@ -79,22 +113,25 @@ pub fn snapshot_targets(
     identity: &SpaceIdentity,
 ) -> rusqlite::Result<BuildSnapshot> {
     let tx = conn.unchecked_transaction()?;
-    let rows = classify(&tx, None)?;
+    let states = scan(&tx, None, false)?;
     tx.commit()?;
     Ok(BuildSnapshot {
         space_id: identity.space_id().to_string(),
-        targets: rows.into_iter().map(|c| c.target).collect(),
+        targets: states
+            .into_iter()
+            .map(|s| SnapshotTarget { members: s.members })
+            .collect(),
     })
 }
 
 /// 切替の判断に使った件数（値は持たない）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Counts {
-    /// 候補の数。
+    /// 候補の数（`content_sha256` の種類数。以下の件数もすべて SHA 単位）。
     pub snapshot: usize,
-    /// 世代が変わった・削除された・対象でなくなった候補（公開の対象から除く）。
+    /// 構成員がすべて、世代が変わった・削除された・対象でなくなった候補（公開の対象から除く）。
     pub stale: usize,
-    /// 今も同じ世代の候補（失敗を含む。成功率の分母）。
+    /// 構成員が 1 枚でも今も同じ世代の候補（失敗を含む。成功率の分母）。
     pub valid: usize,
     pub indexed: usize,
     pub pending: usize,
@@ -191,12 +228,11 @@ pub fn try_activate(
         Err(SpaceError::Db(e)) => return Err(ActivateError::Db(e)),
         Err(_) => return Err(ActivateError::Corrupt),
     }
-    // 今の対象（SHA ごとの代表）。候補は、代表の写真・世代まで同じものだけが有効
-    let current: std::collections::HashMap<String, super::index::Classified> =
-        classify(&tx, Some(identity))?
-            .into_iter()
-            .map(|c| (c.target.input_sha256.clone(), c))
-            .collect();
+    // 今の対象（SHA ごと）。候補は、構築開始時の構成員が 1 枚でも同じ世代で残っていれば有効
+    let current: std::collections::HashMap<String, ShaState> = scan(&tx, Some(identity), false)?
+        .into_iter()
+        .map(|s| (s.input_sha256().to_string(), s))
+        .collect();
     let mut counts = Counts {
         snapshot: snapshot.targets.len(),
         stale: 0,
@@ -207,12 +243,12 @@ pub fn try_activate(
         coverage: 0.0,
     };
     for target in &snapshot.targets {
-        match current.get(&target.input_sha256) {
-            Some(now) if now.target == *target => {
+        match current.get(target.input_sha256()) {
+            Some(now) if target.members.iter().any(|m| now.members.contains(m)) => {
                 counts.valid += 1;
                 if now.has_vector {
                     counts.indexed += 1;
-                } else if now.failed_code.is_some() {
+                } else if now.failed_reason.is_some() {
                     counts.failed_excluded += 1;
                 } else {
                     counts.pending += 1;

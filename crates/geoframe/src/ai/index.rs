@@ -31,13 +31,13 @@
 //! `kind`・`target_key`（空間と SHA）・`input_hash`・`processor_version`（識別の全項目から決まる）の 4 つを厳密に
 //! 照合するので、他の空間や古い版の失敗では対象を除かない。
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use rusqlite::types::Value;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::jobs::{JobKey, JobKind, object_exists};
+use super::jobs::{ErrorCode, JobKey, JobKind, object_exists};
 use super::settings::Normalization;
 use super::space::{self, IdentityError, SpaceIdentity, VectorError};
 
@@ -351,18 +351,26 @@ pub fn store_prepared(
         Err(SpaceError::Db(e)) => return Err(StoreError::Db(e)),
         Err(_) => return Err(StoreError::Corrupt),
     }
-    let existing: Option<Vec<u8>> = tx
+    // 既存の行が有効かは、読み取り・公開と同じ検査（次元の列・型・`space::decode`）で決める
+    let existing: Option<bool> = tx
         .query_row(
-            "SELECT vector FROM ai_embedding_vectors WHERE space_id=?1 AND input_sha256=?2",
+            "SELECT vector, dimension FROM ai_embedding_vectors WHERE space_id=?1 AND input_sha256=?2",
             params![vector.identity.space_id(), vector.input_sha256],
-            |row| row.get(0),
+            |row| {
+                Ok(match (row.get_ref(0)?, row.get_ref(1)?) {
+                    (ValueRef::Blob(blob), ValueRef::Integer(dim))
+                        if dim == i64::from(vector.identity.dimension()) =>
+                    {
+                        space::decode(&vector.identity, blob).is_ok()
+                    }
+                    _ => false,
+                })
+            },
         )
         .optional()?;
     let outcome = match existing {
-        Some(blob) if space::decode(&vector.identity, &blob).is_ok() => {
-            return Ok(Stored::Existing);
-        }
-        Some(_) => {
+        Some(true) => return Ok(Stored::Existing),
+        Some(false) => {
             tx.execute(
                 "UPDATE ai_embedding_vectors SET sent_sha256=?3, dimension=?4, vector=?5, created_at=?6
                  WHERE space_id=?1 AND input_sha256=?2",
@@ -451,14 +459,48 @@ impl fmt::Debug for Eligible {
     }
 }
 
-/// 今の対象の 1 件（`content_sha256` ごとの代表）と、その空間での状態。
-#[derive(Debug, Clone, PartialEq)]
-pub struct Classified {
-    pub target: Eligible,
-    /// その空間に有効（長さが合う）ベクトルがある。
+/// 今の対象の `content_sha256` 1 種類と、その空間での状態。公開・進捗・検索はすべてこの 1 つの判定
+/// ([`scan`]) から数える（件数が食い違う別経路を持たない）。
+#[derive(Clone)]
+pub struct ShaState {
+    /// その SHA の今の写真（世代の合うもの。写真 ID の昇順。先頭が代表）。
+    pub members: Vec<Eligible>,
+    /// その空間に**検査を通った**ベクトルがある（長さ・次元・有限数・ゼロでないノルム・L2 の単位ノルム・
+    /// 型を [`space::decode`] で確かめたもの）。壊れた行は `false`（`corrupt` が立つ）。
     pub has_vector: bool,
-    /// 現在の入力・処理版（[`image_embedding_key`]）のジョブが `failed` のとき、その理由コード。
-    pub failed_code: Option<String>,
+    /// ベクトルの行はあるが検査に通らない（再生成の対象。`pending` か `failed` として数える）。
+    pub corrupt: bool,
+    /// 現在の入力・処理版（[`image_embedding_key`]）のジョブが `failed` のとき、その理由。保存された文字列は
+    /// そのまま持たず、固定の [`ErrorCode`] か `other` に直したもの（[`reason_code`]）。
+    pub failed_reason: Option<&'static str>,
+    /// 検査を通った単位ベクトル（`scan` を `with_values` で呼んだときだけ）。
+    pub(super) unit: Option<Vec<f32>>,
+}
+
+impl fmt::Debug for ShaState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShaState")
+            .field("members", &self.members.len())
+            .field("has_vector", &self.has_vector)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ShaState {
+    pub fn input_sha256(&self) -> &str {
+        &self.members[0].input_sha256
+    }
+
+    /// 代表（最小の写真 ID）。
+    pub fn representative(&self) -> &Eligible {
+        &self.members[0]
+    }
+}
+
+/// 保存された失敗の理由を、固定の理由コードに直す（未知の文字列・空・改行入りは `other`）。
+/// [`super::ops`] の理由の集計と同じ規則。
+pub fn reason_code(stored: &str) -> &'static str {
+    ErrorCode::parse(stored).map_or("other", ErrorCode::as_str)
 }
 
 /// 対象の結合（写真と、世代の合う品質特徴量）。
@@ -469,70 +511,110 @@ pub(super) const ELIGIBLE_JOIN: &str = "FROM photos p JOIN photo_quality_feature
 pub(super) const ELIGIBLE_WHERE: &str = "p.display IS NOT NULL AND p.display!='' AND f.error=''
    AND f.content_sha256 IS NOT NULL AND f.content_sha256!=''";
 
-/// 今の対象を、`content_sha256` ごとの代表（最小の写真 ID）にして返す。`space` があれば、その空間のベクトルの有無と
-/// 失敗したジョブを添える（なければ両方なし）。表が無い（旧 DB）ときもエラーにしない。
-pub fn classify(
+/// 今の対象を `content_sha256` ごとにまとめ（写真 ID の昇順に最初に現れる順）、`space` があれば、その空間の
+/// ベクトルの検査結果と失敗したジョブを添える（なければベクトルなし・失敗なし）。表が無い（旧 DB）ときも
+/// エラーにしない。呼び出し側の読み取り（または書き込み）トランザクションの中で呼ぶ。
+///
+/// `with_values` なら、検査を通した単位ベクトルも持つ（検索用）。それ以外は検査だけして捨てる。
+pub(super) fn scan(
     conn: &Connection,
     space: Option<&SpaceIdentity>,
-) -> rusqlite::Result<Vec<Classified>> {
-    let has_vectors = object_exists(conn, "table", "ai_embedding_vectors")?;
-    let has_jobs = object_exists(conn, "table", "ai_jobs")?;
-    let (has_vector_sql, failed_sql) = match space {
-        Some(_) => (
-            if has_vectors {
-                "EXISTS(SELECT 1 FROM ai_embedding_vectors v
-                         WHERE v.space_id=?1 AND v.input_sha256=f.content_sha256
-                           AND v.dimension=?2 AND length(v.vector)=?2*4)"
-            } else {
-                "0"
-            },
-            if has_jobs {
-                "(SELECT j.last_error_code FROM ai_jobs j
-                   WHERE j.kind='image_embedding' AND j.state='failed'
-                     AND j.target_key=?1||char(31)||f.content_sha256
-                     AND j.input_hash=f.content_sha256 AND j.processor_version=?3)"
-            } else {
-                "NULL"
-            },
-        ),
-        None => ("0", "NULL"),
+    with_values: bool,
+) -> rusqlite::Result<Vec<ShaState>> {
+    let has_jobs = space.is_some() && object_exists(conn, "table", "ai_jobs")?;
+    let failed_sql = if has_jobs {
+        "(SELECT COALESCE(j.last_error_code,'') FROM ai_jobs j
+           WHERE j.kind='image_embedding' AND j.state='failed'
+             AND j.target_key=?1||char(31)||f.content_sha256
+             AND j.input_hash=f.content_sha256 AND j.processor_version=?2 LIMIT 1)"
+    } else {
+        "NULL"
     };
     let sql = format!(
-        "SELECT p.id, f.content_sha256, p.display, p.md5, p.mtime, {has_vector_sql}, {failed_sql}
+        "SELECT p.id, f.content_sha256, p.display, p.md5, p.mtime, {failed_sql}
          {ELIGIBLE_JOIN} WHERE {ELIGIBLE_WHERE} ORDER BY p.id"
     );
     let mut stmt = conn.prepare(&sql)?;
-    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<Classified> {
-        Ok(Classified {
-            target: Eligible {
+    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Eligible, Option<String>)> {
+        Ok((
+            Eligible {
                 photo_id: row.get(0)?,
                 input_sha256: row.get(1)?,
                 display: row.get(2)?,
                 md5: row.get(3)?,
                 mtime: row.get(4)?,
             },
-            has_vector: row.get::<_, i64>(5)? != 0,
-            failed_code: row.get(6)?,
-        })
+            if has_jobs { row.get(5)? } else { None },
+        ))
     };
-    // 使う番号（?1 空間 ID・?2 次元・?3 処理版）は表の有無で変わる。文が持つ数だけを束縛する
-    let all: Vec<Value> = match space {
-        Some(identity) => vec![
-            Value::Text(identity.space_id().to_string()),
-            Value::Integer(i64::from(identity.dimension())),
-            Value::Text(image_embedding_processor_version(identity)),
-        ],
-        None => Vec::new(),
+    let rows = match space {
+        Some(identity) if has_jobs => stmt
+            .query_map(
+                params![
+                    identity.space_id(),
+                    image_embedding_processor_version(identity)
+                ],
+                map,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
+        _ => stmt
+            .query_map([], map)?
+            .collect::<rusqlite::Result<Vec<_>>>()?,
     };
-    let used = stmt.parameter_count();
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(all.into_iter().take(used)), map)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut seen = HashSet::new();
-    Ok(rows
-        .into_iter()
-        .filter(|c| seen.insert(c.target.input_sha256.clone()))
-        .collect())
+    let mut order: Vec<ShaState> = Vec::new();
+    let mut by_sha: HashMap<String, usize> = HashMap::new();
+    for (member, failed) in rows {
+        match by_sha.get(&member.input_sha256) {
+            Some(&i) => order[i].members.push(member),
+            None => {
+                by_sha.insert(member.input_sha256.clone(), order.len());
+                order.push(ShaState {
+                    members: vec![member],
+                    has_vector: false,
+                    corrupt: false,
+                    failed_reason: failed.as_deref().map(reason_code),
+                    unit: None,
+                });
+            }
+        }
+    }
+    if let Some(identity) = space
+        && object_exists(conn, "table", "ai_embedding_vectors")?
+    {
+        let mut stmt = conn.prepare(
+            "SELECT input_sha256, dimension, vector FROM ai_embedding_vectors WHERE space_id=?1",
+        )?;
+        let mut rows = stmt.query([identity.space_id()])?;
+        while let Some(row) = rows.next()? {
+            let sha: String = match row.get_ref(0)? {
+                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                _ => continue,
+            };
+            let Some(&i) = by_sha.get(&sha) else {
+                continue; // 今の対象でない（古い世代の SHA）。読まない
+            };
+            let state = &mut order[i];
+            // 次元の列・型・長さ・値は、検索と同じ検査（`space::decode` / `unit`）を通す
+            let checked = match (row.get_ref(1)?, row.get_ref(2)?) {
+                (ValueRef::Integer(dim), ValueRef::Blob(blob))
+                    if dim == i64::from(identity.dimension()) =>
+                {
+                    space::decode(identity, blob).and_then(|values| space::unit(identity, &values))
+                }
+                _ => Err(VectorError::Dimension),
+            };
+            match checked {
+                Ok(unit) => {
+                    state.has_vector = true;
+                    if with_values {
+                        state.unit = Some(unit);
+                    }
+                }
+                Err(_) => state.corrupt = true,
+            }
+        }
+    }
+    Ok(order)
 }
 
 // ---------------------------------------------------------------- 状態
@@ -561,22 +643,23 @@ pub struct Progress {
     /// ベクトルが無く、現在の入力・処理版のジョブが `failed` で、対象から除かれる数。
     pub failed_excluded: i64,
     /// `failed_excluded` の理由コードごとの件数（コード順）。
-    pub failed_reasons: Vec<(String, i64)>,
+    /// 固定の理由コード（[`reason_code`]）ごとの件数（コード順。未知の保存値は `other` にまとめる）。
+    pub failed_reasons: Vec<(&'static str, i64)>,
 }
 
 impl Progress {
-    fn from_classified(rows: &[Classified]) -> Self {
+    pub(super) fn from_states(states: &[ShaState]) -> Self {
         let mut p = Progress {
-            eligible: rows.len() as i64,
+            eligible: states.len() as i64,
             ..Progress::default()
         };
-        let mut reasons: std::collections::BTreeMap<String, i64> = Default::default();
-        for row in rows {
-            if row.has_vector {
+        let mut reasons: BTreeMap<&'static str, i64> = BTreeMap::new();
+        for state in states {
+            if state.has_vector {
                 p.indexed += 1;
-            } else if let Some(code) = &row.failed_code {
+            } else if let Some(reason) = state.failed_reason {
                 p.failed_excluded += 1;
-                *reasons.entry(code.clone()).or_insert(0) += 1;
+                *reasons.entry(reason).or_insert(0) += 1;
             } else {
                 p.pending += 1;
             }
@@ -591,7 +674,8 @@ impl Progress {
 pub struct IndexStatus {
     pub active: ActiveState,
     pub progress: Progress,
-    /// 検索で読むときに壊れていた数（[`super::search::load_active_index`] だけが数える。ここでは 0）。
+    /// 今の対象のうち、ベクトルの行が検査に通らない `content_sha256` の数（`pending`/`failed_excluded` に数え、
+    /// 再生成の対象。検索・公開と同じ検査）。
     pub corrupt: i64,
     /// active 以外の保存済み空間のベクトルにある `input_sha256` の種類数。
     pub other_space_shas: i64,
@@ -635,9 +719,11 @@ pub(super) fn active_in(
 /// 状態の本体（ポインタと数を同じ接続・同じ読み取りの中で読む）。
 pub(super) fn status_in(
     conn: &Connection,
-) -> rusqlite::Result<(IndexStatus, Option<SpaceIdentity>)> {
+    with_values: bool,
+) -> rusqlite::Result<(IndexStatus, Option<SpaceIdentity>, Vec<ShaState>)> {
     let (active, identity) = active_in(conn)?;
-    let progress = Progress::from_classified(&classify(conn, identity.as_ref())?);
+    let states = scan(conn, identity.as_ref(), with_values)?;
+    let progress = Progress::from_states(&states);
     let has_vectors = object_exists(conn, "table", "ai_embedding_vectors")?;
     let active_id = identity.as_ref().map(SpaceIdentity::space_id);
     let other_space_shas = if has_vectors {
@@ -696,13 +782,14 @@ pub(super) fn status_in(
         IndexStatus {
             active,
             progress,
-            corrupt: 0,
+            corrupt: states.iter().filter(|s| s.corrupt).count() as i64,
             other_space_shas,
             legacy_shas,
             other_shas,
             spaces,
         },
         identity,
+        states,
     ))
 }
 
@@ -710,7 +797,7 @@ pub(super) fn status_in(
 /// トランザクションの中で読むので、並行する切替の前後が混ざらない。
 pub fn status(conn: &Connection) -> rusqlite::Result<IndexStatus> {
     let tx = conn.unchecked_transaction()?;
-    let (status, _) = status_in(&tx)?;
+    let (status, _, _) = status_in(&tx, false)?;
     tx.commit()?;
     Ok(status)
 }
@@ -718,7 +805,7 @@ pub fn status(conn: &Connection) -> rusqlite::Result<IndexStatus> {
 /// 指定した空間（まだ active でない構築中のものを含む）の進み具合。
 pub fn progress(conn: &Connection, identity: &SpaceIdentity) -> rusqlite::Result<Progress> {
     let tx = conn.unchecked_transaction()?;
-    let rows = classify(&tx, Some(identity))?;
+    let states = scan(&tx, Some(identity), false)?;
     tx.commit()?;
-    Ok(Progress::from_classified(&rows))
+    Ok(Progress::from_states(&states))
 }

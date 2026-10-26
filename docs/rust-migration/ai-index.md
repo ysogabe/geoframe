@@ -32,7 +32,7 @@
 
 - `input_sha256` は品質特徴量が解析した元 derivative の SHA（`photo_quality_features.content_sha256`）。旧 `photo_embeddings`・`photo_ai_features` には**書かない**。
 - 保存: 次元・NaN/Infinity・ゼロノルムを拒否。L2 は最大要素で割ってから f64 で足すので、極端な大きさでもオーバーフロー・アンダーフローしない。同じ `(space_id, input_sha256)` が有効なら最初のベクトルを残す（`Existing`）。壊れた既存の行は置き換える（`Repaired`）。writer 上の短い 1 トランザクションで、検査・正規化は writer の外（`PreparedVector::new`）で先にできる。
-- 読み取り: BLOB も長さ・有限数・ノルム（L2 は単位ベクトル）・空間の識別で検査し、壊れた行は**読み飛ばして数える**（全応答の失敗やパニックにしない。再生成の対象 `pending`）。
+- 読み取り: BLOB も型（BLOB）・`dimension` の列・長さ・有限数・ゼロでないノルム・ノルム（L2 は単位ベクトル）・空間の識別で検査し（`space::decode`）、壊れた行は**読み飛ばして数える**（全応答の失敗やパニックにしない）。**公開・進捗・`status`・検索は同じ 1 つの判定（`index::scan`）から数える**ので、壊れた行（NaN/Infinity/ゼロ/単位でない L2/短い BLOB/BLOB でない型）は成功に数えず、`pending`（現在のジョブが `failed` なら `failed_excluded`）として再生成の対象になり、`status.corrupt` が実件数になる（`store_vector` は壊れた既存の行を置き換える）。検査は writer の 1 トランザクションの中でローカルに行う（外部通信・重い変換は持ち込まない）。
 - 旧 DB（`INGEST=0`）はこれらの表が無いまま読める（`index::status` は `NoTables`）。`--dry-run` の「作る表・索引」は、AI の表の分として 3 件（2 表・1 索引）増える（6 → 9）。既存の表・列・行は変えない。
 
 ## 3. 索引の顔ぶれ（固定の全 index 表は作らない）
@@ -44,15 +44,15 @@
 | 更新（`md5`・`mtime`）・`display` の変化 | 世代が合わなくなり対象から外れる（古い SHA のベクトルは参照されない） |
 | 回転 | `display` の名前が変わるので同じ（品質テーブルに無い `rotation` 列は仮定しない） |
 | 削除 | 結合から消える |
-| 同じ内容の複製 | `content_sha256` ごとに 1 件（代表は最小の写真 ID。旧 `ai_pipeline` の正本と同じ）。検索結果の `photo_ids` に全て持つ |
+| 同じ内容の複製 | `content_sha256` ごとに 1 件（代表は最小の写真 ID。旧 `ai_pipeline` の正本と同じ）。検索結果の `photo_ids` に全て持つ。代表が削除・更新されても、同じ内容の写真が残っていれば SHA は対象のまま（代表はその時点の最小の ID に変わる） |
 | `hidden`・`favorite` | 対象を変えない（検索側が `include_hidden` などで絞る。旧 E6 と同じ） |
 | 新しい写真 | ベクトルが保存された時点で有効な結合により対象になる（スナップショットなし） |
 
 ## 4. 切替（`settings.ai_active_space`）
 
-1. 構築の開始時に `snapshot_targets` が今の対象と各世代（写真 ID・SHA・`display`・`md5`・`mtime`）を候補として持つ。
+1. 構築の開始時に `snapshot_targets` が今の対象と各世代を候補として持つ。候補は `content_sha256` ごとで、**その SHA の構成員すべて**（写真 ID・`display`・`md5`・`mtime`）を持つ（`BuildSnapshot::targets()` → `SnapshotTarget::members()`）。
 2. 後続のワーカー（T4.4）が `image_embedding_key(identity, input_sha256)`（**空間と入力 SHA 単位**。`target_key`＝空間 ID と SHA、`input_hash`＝SHA、`processor_version`＝識別の全項目のハッシュ。URL・ポリシー・設定全体のハッシュ・閾値は入れない）でジョブを積み、`store_vector` で保存する。
-3. `try_activate(conn, snapshot, identity, min_coverage)` を writer 上で呼ぶ。**1 つの書き込みトランザクションの中で**候補を再検査し、変更・削除・回転された候補を除く（`stale`）。残り（`valid`）のうち、ベクトルあり=`indexed`、現在のキー（`kind`・`target_key`・`input_hash`・`processor_version`）のジョブが `failed`=`failed_excluded`、それ以外=`pending`。
+3. `try_activate(conn, snapshot, identity, min_coverage)` を writer 上で呼ぶ。**1 つの書き込みトランザクションの中で**候補を再検査する。SHA は、**構築開始時の構成員のうち 1 枚でも今も同じ世代の対象**ならまだ有効（代表が消えても同じ内容の写真が残れば分母・待ちに残る）で、構成員がすべて変更・削除・回転された SHA だけを除く（`stale`）。後から同じ SHA の写真が追加されても、元の構成員が全滅していれば有効にならない（追加分は差分として後続で処理する）。件数はすべて SHA 単位。残り（`valid`）のうち、ベクトルあり=`indexed`、現在のキー（`kind`・`target_key`・`input_hash`・`processor_version`）のジョブが `failed`=`failed_excluded`、それ以外=`pending`。
 
 | 結果 | 条件 | ポインタ |
 |---|---|---|
@@ -68,7 +68,7 @@
 
 ## 5. 読み取り（後続の E5/E6 が使う型付き境界）
 
-- `index::status(conn)` → `IndexStatus`（`ActiveState`＝`NoTables`/`Unset`/`Active`/`Unusable`、`Progress`＝`eligible`/`indexed`/`pending`/`failed_excluded`＋理由コード別件数、`other_space_shas`・`legacy_shas`・`other_shas`（空間間の同じ SHA は重複計数しない）、`spaces`、`corrupt`）。件数だけで、写真の値・SHA・ベクトルは持たない。E5 の `pipeline`・`embedding_model` 等はこの値から作る（接続は T4.4）。
+- `index::status(conn)` → `IndexStatus`（`ActiveState`＝`NoTables`/`Unset`/`Active`/`Unusable`、`Progress`＝`eligible`/`indexed`/`pending`/`failed_excluded`＋理由コード別件数（`failed_reasons: Vec<(&'static str, i64)>`。保存された `last_error_code` は固定の `ErrorCode` か `other` に直す（`index::reason_code`。`ai-jobs status` の理由の集計と同じ規則）ので、未知の文字列・改行は出力に出ない。未知でも `failed` は失敗として数え、`pending` に混ぜない）、`other_space_shas`・`legacy_shas`・`other_shas`（空間間の同じ SHA は重複計数しない）、`spaces`、`corrupt`）。件数だけで、写真の値・SHA・ベクトルは持たない。E5 の `pipeline`・`embedding_model` 等はこの値から作る（接続は T4.4）。
 - `index::progress(conn, &identity)` は構築中（まだ active でない）空間の進み具合。
 - `search::load_active_index(conn)` → `Loaded { status, index: Option<ActiveIndex> }`。ポインタ・識別・対象・ベクトル・状態を **1 つの読み取りトランザクション**で読むので、並行する切替の前後が混ざらない。ポインタが無い・未登録・表が無いなら `index: None`（旧結果参照。意味検索は 503 のまま）。
 - 検索は `QueryVector::new(&identity, &values)`（次元・有限・非ゼロを検査）→ `ActiveIndex::search(&query, limit)`。識別が索引と**全項目**同じでなければ `IdentityMismatch`。全項目を線形に走るコサイン類似度（6,500×768 の規模で足りる想定。ANN・外部ベクトル DB は無し）。他の空間・旧結果のベクトルは読まない（混在 0）。

@@ -10,7 +10,8 @@
 //! 別の空間・旧 `photo_embeddings` / `photo_ai_features` のベクトルは読まない（混在 0）。同じ `content_sha256` の
 //! 写真は 1 つの項目にまとめ、`photo_ids`（昇順。先頭が代表）に全て持つ。BLOB は長さ・有限数・ノルム・空間の
 //! 識別で検査し、壊れた行は**読み飛ばして数える**（`status.corrupt`。全体の失敗やパニックにしない）。壊れた行は
-//! `pending` に数えて再生成の対象になる（[`super::index::store_prepared`] が置き換える）。
+//! `pending` に数えて再生成の対象になる（[`super::index::store_prepared`] が置き換える）。検査は公開・進捗と
+//! 同じ 1 つの判定（[`super::index`] の `scan`）なので、`status` と索引の中身は食い違わない。
 //!
 //! # 検索
 //!
@@ -21,13 +22,11 @@
 //!
 //! このモジュールは**型付きの境界**で、E5/E6 の HTTP との接続は T4.4。
 
-use std::collections::HashMap;
 use std::fmt;
 
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
-use super::index::{ELIGIBLE_JOIN, ELIGIBLE_WHERE, IndexStatus, Progress, classify, status_in};
-use super::jobs::object_exists;
+use super::index::{IndexStatus, status_in};
 use super::space::{self, SpaceIdentity, VectorError};
 
 /// 索引の 1 項目（`content_sha256` ごと）。値は `Debug` に出さない。
@@ -195,82 +194,27 @@ pub fn load_active_index(conn: &Connection) -> rusqlite::Result<Loaded> {
     Ok(loaded)
 }
 
-/// [`load_active_index`] の本体（呼び出し側の読み取りトランザクションの中で動く）。
+/// [`load_active_index`] の本体（呼び出し側の読み取りトランザクションの中で動く）。公開・進捗と同じ判定
+/// ([`super::index::scan`]) の結果から作るので、`status` の件数と索引の中身が食い違わない。
 pub(super) fn load_in(tx: &Connection) -> rusqlite::Result<Loaded> {
-    let (mut status, identity) = status_in(tx)?;
+    let (status, identity, states) = status_in(tx, true)?;
     let Some(identity) = identity else {
         return Ok(Loaded {
             status,
             index: None,
         });
     };
-    let mut entries: Vec<IndexEntry> = Vec::new();
-    let mut by_sha: HashMap<String, usize> = HashMap::new();
-    let mut corrupt: HashMap<String, ()> = HashMap::new();
-    if object_exists(tx, "table", "ai_embedding_vectors")? {
-        let mut stmt = tx.prepare(&format!(
-            "SELECT p.id, f.content_sha256, v.vector {ELIGIBLE_JOIN}
-             JOIN ai_embedding_vectors v
-               ON v.space_id=?1 AND v.input_sha256=f.content_sha256
-             WHERE {ELIGIBLE_WHERE} ORDER BY p.id"
-        ))?;
-        let mut rows = stmt.query(params![identity.space_id()])?;
-        while let Some(row) = rows.next()? {
-            let photo_id: i64 = row.get(0)?;
-            let sha: String = row.get(1)?;
-            if let Some(&i) = by_sha.get(&sha) {
-                entries[i].photo_ids.push(photo_id);
-                continue;
-            }
-            if corrupt.contains_key(&sha) {
-                continue;
-            }
-            // 型が違う（BLOB でない）値も壊れた行として扱う
-            let blob: Vec<u8> = match row.get(2) {
-                Ok(blob) => blob,
-                Err(_) => {
-                    corrupt.insert(sha, ());
-                    continue;
-                }
-            };
-            match space::decode(&identity, &blob).and_then(|values| space::unit(&identity, &values))
-            {
-                Ok(unit) => {
-                    by_sha.insert(sha.clone(), entries.len());
-                    entries.push(IndexEntry {
-                        photo_ids: vec![photo_id],
-                        input_sha256: sha,
-                        unit,
-                    });
-                }
-                Err(_) => {
-                    corrupt.insert(sha, ());
-                }
-            }
-        }
-    }
-    // 壊れた行は「ベクトルが無い」ものとして数え直す（再生成の対象）
-    if !corrupt.is_empty() {
-        let rows = classify(tx, Some(&identity))?;
-        let mut progress = Progress {
-            eligible: rows.len() as i64,
-            ..Progress::default()
-        };
-        let mut reasons: std::collections::BTreeMap<String, i64> = Default::default();
-        for row in &rows {
-            if by_sha.contains_key(&row.target.input_sha256) {
-                progress.indexed += 1;
-            } else if let Some(code) = &row.failed_code {
-                progress.failed_excluded += 1;
-                *reasons.entry(code.clone()).or_insert(0) += 1;
-            } else {
-                progress.pending += 1;
-            }
-        }
-        progress.failed_reasons = reasons.into_iter().collect();
-        status.progress = progress;
-    }
-    status.corrupt = corrupt.len() as i64;
+    let entries = states
+        .into_iter()
+        .filter_map(|state| {
+            let unit = state.unit?;
+            Some(IndexEntry {
+                input_sha256: state.members[0].input_sha256.clone(),
+                photo_ids: state.members.iter().map(|m| m.photo_id).collect(),
+                unit,
+            })
+        })
+        .collect();
     Ok(Loaded {
         status,
         index: Some(ActiveIndex { identity, entries }),
