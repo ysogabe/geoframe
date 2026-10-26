@@ -21,6 +21,13 @@
 //! 画像 Embedding）は、`target_key` にその識別を含める（`supersede` は同じ `kind`・`target_key` の
 //! 別世代だけを無効にする）。
 //!
+//! # 失敗の履歴（`terminal`）
+//!
+//! 入力が A→B→A と往復しても、同じキーの試行回数は増やせない。`obsolete` からの復活（[`enqueue`]）は
+//! `attempts`・`defer_count`・`interruption_count`・待ち時刻を引き継ぎ、一度でも `failed`（上限・恒久失敗・
+//! 中断上限）になったキーは `terminal` の印で覚え、`obsolete` から戻すときも `failed` に戻して claim させない。
+//! カウンタを 0 にして再び走らせるのは、明示の手動再試行（[`retry_failed`] の [`Recheck::Requeue`]）だけ。
+//!
 //! # 所有（run_id・claim_token）
 //!
 //! 時限の lease は無い（`.ingest.lock` で 1 プロセス・1 ワーカーに限るため）。[`claim_next`] が `running` にし、
@@ -71,6 +78,7 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ai_jobs(
   attempts INTEGER NOT NULL DEFAULT 0,
   defer_count INTEGER NOT NULL DEFAULT 0,
   interruption_count INTEGER NOT NULL DEFAULT 0,
+  terminal INTEGER NOT NULL DEFAULT 0,
   next_attempt_at INTEGER NOT NULL DEFAULT 0,
   run_id TEXT,
   claim_token TEXT,
@@ -289,13 +297,29 @@ fn object_exists(conn: &Connection, kind: &str, name: &str) -> rusqlite::Result<
     .map(|found| found.is_some())
 }
 
-/// まだ無い表・索引の名前（読み取りだけ。`--dry-run` 用）。
+/// `ai_jobs.terminal`（失敗の履歴）を後から足した列の名前。`pending` / `migrate` にはこの名前で出る。
+const TERMINAL_COLUMN: &str = "ai_jobs.terminal";
+
+fn has_terminal_column(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT 1 FROM pragma_table_info('ai_jobs') WHERE name='terminal'",
+        [],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+}
+
+/// まだ無い表・索引・列の名前（読み取りだけ。`--dry-run` 用）。
 pub fn pending(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut missing = Vec::new();
     for table in TABLES {
         if !object_exists(conn, "table", table)? {
             missing.push((*table).to_string());
         }
+    }
+    if object_exists(conn, "table", "ai_jobs")? && !has_terminal_column(conn)? {
+        missing.push(TERMINAL_COLUMN.to_string());
     }
     for index in INDEXES {
         if !object_exists(conn, "index", index)? {
@@ -307,6 +331,10 @@ pub fn pending(conn: &Connection) -> rusqlite::Result<Vec<String>> {
 
 /// `ai_jobs` とその索引を作る（`IF NOT EXISTS`。既にあれば何も書かない）。作った名前を返す。
 /// 書き込み用の接続で呼ぶ。他の表・行には触れない。
+///
+/// `terminal` 列の無い旧い `ai_jobs` には列を足し、既に失敗の履歴があるものに印を付ける: `failed` と、
+/// 失敗・中断の上限に達したままの `obsolete`、恒久的な失敗の理由（`input_too_large`・`input_invalid`）が残る
+/// `obsolete`。恒久的な失敗でも理由がこの 2 つでない旧い `obsolete` は、履歴が残っておらず復元できない。
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
     let missing = pending(conn)?;
     if missing.is_empty() {
@@ -314,6 +342,16 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(SCHEMA)?;
+    if !has_terminal_column(&tx)? {
+        tx.execute_batch("ALTER TABLE ai_jobs ADD COLUMN terminal INTEGER NOT NULL DEFAULT 0")?;
+        tx.execute(
+            "UPDATE ai_jobs SET terminal=1
+             WHERE state='failed'
+                OR (state='obsolete' AND (attempts>=?1 OR interruption_count>=?2
+                                          OR last_error_code IN ('input_too_large','input_invalid')))",
+            params![MAX_ATTEMPTS, MAX_INTERRUPTIONS],
+        )?;
+    }
     tx.commit()?;
     Ok(missing)
 }
@@ -325,14 +363,22 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
 pub enum Enqueued {
     /// 新しい `pending` を作った。
     Created,
-    /// 同じキーの `obsolete` が、入力が戻ったので `pending` に戻った（カウンタは 0 から）。
+    /// 同じキーの未完了の `obsolete` が、入力が戻ったので `pending` に戻った。カウンタ（失敗・反復・中断）と
+    /// 待ち時刻はそのまま引き継ぐ（入力の往復で数え直さない）。
     Revived,
-    /// 同じキーが既にある（この状態のまま。`succeeded`・`failed` を含めて何も変えない）。
+    /// 同じキーが既にある（この状態のまま）。`succeeded` は再課金しない。`failed` は手動の再試行
+    /// （[`retry_failed`]）まで戻らない。一度 `failed` になって `obsolete` にされたキー（[`supersede`]・
+    /// 再検査の `Obsolete`）も、入力が戻ると `failed` に戻り、`Existing(Failed)` になる。
     Existing(JobState),
 }
 
-/// 冪等に積む。同じキーのジョブは増えない。`succeeded` は再課金を避けるため触らず、`failed` は
-/// 手動の再試行（[`retry_failed`]）だけが戻す。
+/// 冪等に積む。同じキーのジョブは増えない。**カウンタを 0 に戻すのは [`retry_failed`] の
+/// [`Recheck::Requeue`] だけ**で、`enqueue` は決して戻さない（入力の A→B→A の往復で失敗の履歴を消して、
+/// 同じ入力の有償の試行を際限なく足せないようにする）。
+/// - 無い: `pending` を作る（`Created`）。
+/// - `succeeded`・`failed`・未完了: 何も変えない（`Existing`）。
+/// - `obsolete`: 一度も `failed` になっていなければ `pending` に戻し（`Revived`）、`failed` になったことが
+///   あれば `failed` に戻して（`Existing(Failed)`）claim できないままにする。
 pub fn enqueue(conn: &mut Connection, key: &JobKey, now: i64) -> rusqlite::Result<Enqueued> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let inserted = tx.execute(
@@ -352,8 +398,8 @@ pub fn enqueue(conn: &mut Connection, key: &JobKey, now: i64) -> rusqlite::Resul
         tx.commit()?;
         return Ok(Enqueued::Created);
     }
-    let (id, state): (i64, String) = tx.query_row(
-        "SELECT id,state FROM ai_jobs
+    let (id, state, terminal): (i64, String, bool) = tx.query_row(
+        "SELECT id,state,terminal FROM ai_jobs
          WHERE kind=?1 AND target_key=?2 AND input_hash=?3 AND processor_version=?4",
         params![
             key.kind.as_str(),
@@ -361,20 +407,24 @@ pub fn enqueue(conn: &mut Connection, key: &JobKey, now: i64) -> rusqlite::Resul
             key.input_hash,
             key.processor_version
         ],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )?;
     let state = JobState::parse(&state).unwrap_or(JobState::Failed);
     if state != JobState::Obsolete {
         return Ok(Enqueued::Existing(state));
     }
+    // カウンタ・待ち時刻・理由には触れない
+    let (back, outcome) = if terminal {
+        ("failed", Enqueued::Existing(JobState::Failed))
+    } else {
+        ("pending", Enqueued::Revived)
+    };
     tx.execute(
-        "UPDATE ai_jobs SET state='pending', attempts=0, defer_count=0, interruption_count=0,
-                next_attempt_at=?2, claim_token=NULL, last_error_code='', updated_at=?2
-         WHERE id=?1",
-        params![id, now],
+        "UPDATE ai_jobs SET state=?2, claim_token=NULL, updated_at=?3 WHERE id=?1",
+        params![id, back, now],
     )?;
     tx.commit()?;
-    Ok(Enqueued::Revived)
+    Ok(outcome)
 }
 
 /// 同じ `kind`・`target_key` の、`keep` と違う世代（`input_hash` か `processor_version` が違う）の
@@ -615,7 +665,8 @@ pub fn record_failure(
     tx.execute(
         "UPDATE ai_jobs SET state=?2, attempts=?3, defer_count=?4,
                 next_attempt_at=CASE WHEN ?2='failed' THEN next_attempt_at ELSE ?5 END,
-                claim_token=NULL, last_error_code=?6, updated_at=?7
+                terminal=CASE WHEN ?2='failed' THEN 1 ELSE terminal END, claim_token=NULL,
+                last_error_code=?6, updated_at=?7
          WHERE id=?1",
         params![
             claimed.id,
@@ -652,7 +703,7 @@ pub fn reclaim_interrupted(
 ) -> rusqlite::Result<Reclaimed> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let failed = tx.execute(
-        "UPDATE ai_jobs SET state='failed', interruption_count=interruption_count+1,
+        "UPDATE ai_jobs SET state='failed', interruption_count=interruption_count+1, terminal=1,
                 claim_token=NULL, last_error_code='interrupted', updated_at=?2
          WHERE state='running' AND run_id IS NOT ?1 AND interruption_count+1>=?3",
         params![current_run_id, now, MAX_INTERRUPTIONS],
@@ -695,9 +746,11 @@ pub enum RetryScope {
 /// 手動の再試行で、失敗したジョブを今の状態に照らして検査した結果。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recheck {
-    /// 入力・ポリシーが今も有効で、結果も無い。カウンタを 0 にして `pending` に戻す。
+    /// 入力・ポリシーが今も有効で、結果も無い。カウンタと失敗の履歴（`terminal`）を 0 にして `pending` に戻す。
+    /// カウンタを消す唯一の経路（[`enqueue`] は消さない）。
     Requeue,
-    /// 入力が変わった・ポリシーで許されない。`obsolete`。
+    /// 入力が変わった・ポリシーで許されない。`obsolete`（失敗の履歴は残り、入力が戻って [`enqueue`] されても
+    /// `failed` のまま。再び走らせるには改めて手動の再試行が要る）。
     Obsolete,
     /// 現在の結果表に適合する結果が既にある。`succeeded`（再計算・再課金しない）。
     Satisfied,
@@ -753,7 +806,7 @@ where
             Recheck::Requeue => {
                 tx.execute(
                     "UPDATE ai_jobs SET state='pending', attempts=0, defer_count=0,
-                            interruption_count=0, next_attempt_at=?2, claim_token=NULL,
+                            interruption_count=0, terminal=0, next_attempt_at=?2, claim_token=NULL,
                             last_error_code='', updated_at=?2
                      WHERE id=?1 AND state='failed'",
                     params![id, now],

@@ -353,6 +353,418 @@ fn a_new_input_generation_obsoletes_the_old_jobs_but_not_results() {
     assert_eq!(s.row(running.id).attempts, 0);
 }
 
+// ---------------------------------------------------------------- 入力の往復と失敗の履歴
+
+impl Setup {
+    fn supersede(&self, keep: &JobKey, now: i64) -> usize {
+        let keep = keep.clone();
+        self.writer.call(move |c| supersede(c, &keep, now)).unwrap()
+    }
+
+    /// 入力が `to` に変わった（`from` の世代は無効）ことを、本番と同じ順（supersede→enqueue）で表す。
+    fn switch_input(&self, to: &JobKey, now: i64) -> Enqueued {
+        self.supersede(to, now);
+        self.enqueue(to, now)
+    }
+
+    /// 何度 claim しても取れる全てのジョブの対象（A の再実行を確かめるための総当たり）。
+    fn drain_targets(&self, now: i64) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut n = 0;
+        while let Some(c) = self.claim(now, "drain", &format!("drain-{n}")) {
+            out.push((c.key.target_key.clone(), c.key.input_hash.clone()));
+            n += 1;
+        }
+        out
+    }
+
+    fn terminal(&self, id: i64) -> bool {
+        self.writer
+            .call(move |c| {
+                c.query_row("SELECT terminal FROM ai_jobs WHERE id=?1", [id], |r| {
+                    r.get(0)
+                })
+            })
+            .unwrap()
+    }
+}
+
+/// 通常の失敗 5 回・恒久失敗・反復失敗・中断 3 回のどれで `failed` になっても、入力を A→B→A と往復して
+/// 同じキーを `enqueue` し直しても、カウンタも `failed` も戻らず、claim もできない。
+#[test]
+fn a_failed_key_stays_failed_across_input_round_trips() {
+    type Drive = fn(&Setup, &JobKey) -> i64;
+    // 戻り値: failed になったジョブの id
+    fn by_attempts(s: &Setup, k: &JobKey) -> i64 {
+        s.enqueue(k, T0);
+        let mut now = T0;
+        loop {
+            let c = s.claim(now, "run", &format!("a{now}")).unwrap();
+            if s.fail(&c, now, Failure::Attempt) == Some(JobState::Failed) {
+                return c.id;
+            }
+            now = s.row(c.id).next;
+        }
+    }
+    fn by_permanent(s: &Setup, k: &JobKey) -> i64 {
+        s.enqueue(k, T0);
+        let c = s.claim(T0, "run", "p").unwrap();
+        assert_eq!(s.fail(&c, T0, Failure::Permanent), Some(JobState::Failed));
+        c.id
+    }
+    fn by_repeated(s: &Setup, k: &JobKey) -> i64 {
+        s.enqueue(k, T0);
+        let mut now = T0;
+        loop {
+            let c = s.claim(now, "run", &format!("r{now}")).unwrap();
+            if s.fail(&c, now, Failure::Repeated) == Some(JobState::Failed) {
+                return c.id;
+            }
+            now = s.row(c.id).next;
+        }
+    }
+    fn by_interruptions(s: &Setup, k: &JobKey) -> i64 {
+        s.enqueue(k, T0);
+        let mut id = 0;
+        for n in 1..=3u32 {
+            let c = s
+                .claim(
+                    T0 + 100 * i64::from(n),
+                    &format!("run-{n}"),
+                    &format!("i{n}"),
+                )
+                .unwrap();
+            id = c.id;
+            let next = format!("run-{}", n + 1);
+            s.writer
+                .call(move |conn| reclaim_interrupted(conn, &next, T0 + 100 * i64::from(n) + 50))
+                .unwrap();
+        }
+        assert_eq!(s.row(id).state, JobState::Failed);
+        id
+    }
+    let modes: [(&str, Drive); 4] = [
+        ("attempts", by_attempts),
+        ("permanent", by_permanent),
+        ("repeated", by_repeated),
+        ("interruptions", by_interruptions),
+    ];
+    for (name, drive) in modes {
+        let s = setup(&format!("ai-roundtrip-{name}"));
+        let a = embed("photo", "A");
+        let b = embed("photo", "B");
+        let id = drive(&s, &a);
+        let failed = s.row(id);
+        assert_eq!(failed.state, JobState::Failed, "{name}");
+        assert!(s.terminal(id), "{name}");
+
+        for round in 0..3 {
+            let now = T0 + 10_000 + round * 10;
+            // A→B（A は failed → obsolete。B は新しく pending）
+            let to_b = s.switch_input(&b, now);
+            assert_eq!(
+                to_b,
+                if round == 0 {
+                    Enqueued::Created
+                } else {
+                    Enqueued::Revived // 前の往復で B は obsolete になっている
+                }
+            );
+            assert_eq!(s.row(id).state, JobState::Obsolete, "{name}");
+            // B→A: failed の履歴は消えず、failed に戻る（Revived でも Created でもない）
+            assert_eq!(
+                s.switch_input(&a, now + 1),
+                Enqueued::Existing(JobState::Failed),
+                "{name}"
+            );
+            let back = s.row(id);
+            assert_eq!(back.state, JobState::Failed, "{name}");
+            assert_eq!(
+                (
+                    back.attempts,
+                    back.defer_count,
+                    back.interruptions,
+                    back.next,
+                    back.code.as_str()
+                ),
+                (
+                    failed.attempts,
+                    failed.defer_count,
+                    failed.interruptions,
+                    failed.next,
+                    failed.code.as_str()
+                ),
+                "{name}: カウンタ・理由は往復で変わらない"
+            );
+            assert!(!back.has_token);
+        }
+        // 実際に取れない: 十分先の時刻まで総当たりしても A は一度も claim されない（B だけ）
+        let ran = s.drain_targets(T0 + 10_000_000);
+        assert!(ran.iter().all(|(_, input)| input != "A"), "{name}: {ran:?}");
+        assert_eq!(s.sql::<i64>("SELECT COUNT(*) FROM ai_jobs"), 2, "{name}");
+
+        // 明示の手動再試行だけがカウンタを戻して再び走らせる
+        let r = s
+            .writer
+            .call(move |c| {
+                retry_failed(c, T0 + 20_000_000, RetryScope::Id(id), |_, _| {
+                    Ok(Recheck::Requeue)
+                })
+            })
+            .unwrap();
+        assert_eq!(r.requeued, 1, "{name}");
+        let requeued = s.row(id);
+        assert_eq!(
+            (
+                requeued.state,
+                requeued.attempts,
+                requeued.defer_count,
+                requeued.interruptions
+            ),
+            (JobState::Pending, 0, 0, 0),
+            "{name}"
+        );
+        assert!(!s.terminal(id), "{name}");
+        let c = s.claim(T0 + 20_000_000, "run-x", "tx").unwrap();
+        assert_eq!((c.id, c.attempts), (id, 0), "{name}");
+    }
+}
+
+/// 手動の再検査が `Obsolete` と判断した `failed` も、入力が戻って `enqueue` されただけでは再び走らない。
+#[test]
+fn retry_obsolete_does_not_release_a_failed_key_on_enqueue() {
+    let s = setup("ai-retry-obsolete");
+    let a = embed("photo", "A");
+    s.enqueue(&a, T0);
+    let c = s.claim(T0, "run", "t").unwrap();
+    s.fail(&c, T0, Failure::Permanent);
+    let r = s
+        .writer
+        .call(|conn| retry_failed(conn, T0 + 1, RetryScope::All, |_, _| Ok(Recheck::Obsolete)))
+        .unwrap();
+    assert_eq!(r.obsolete, 1);
+    assert_eq!(s.row(c.id).state, JobState::Obsolete);
+
+    assert_eq!(s.enqueue(&a, T0 + 2), Enqueued::Existing(JobState::Failed));
+    assert_eq!(s.row(c.id).state, JobState::Failed);
+    assert!(s.drain_targets(T0 + 10_000_000).is_empty());
+    // 失敗として手動の再試行の対象に戻っている
+    let r = s
+        .writer
+        .call(|conn| retry_failed(conn, T0 + 3, RetryScope::All, |_, _| Ok(Recheck::Requeue)))
+        .unwrap();
+    assert_eq!(r.requeued, 1);
+}
+
+/// 成功済みのキーは入力が往復しても再送しない（結果は変わらず、新しい行も増えない）。
+#[test]
+fn a_succeeded_key_is_not_resent_after_input_round_trips() {
+    let s = setup("ai-roundtrip-success");
+    let (a, b) = (embed("photo", "A"), embed("photo", "B"));
+    s.enqueue(&a, T0);
+    let c = s.claim(T0, "run", "t").unwrap();
+    let done = s
+        .writer
+        .call({
+            let c = c.clone();
+            move |conn| complete(conn, &c, T0, |_| Ok(InputCheck::Current))
+        })
+        .unwrap();
+    assert_eq!(done, Completion::Succeeded);
+    let before = s.row(c.id);
+    s.switch_input(&b, T0 + 1);
+    assert_eq!(
+        s.switch_input(&a, T0 + 2),
+        Enqueued::Existing(JobState::Succeeded)
+    );
+    assert_eq!(s.row(c.id), before);
+    // 戻った A が現世代なので B は無効。成功済みの A は走らず、何も取れない
+    assert!(s.drain_targets(T0 + 1_000_000).is_empty());
+}
+
+/// 失敗に至っていない途中のカウンタ・待ち時刻は、入力の往復で消えず、早まらない。
+#[test]
+fn partial_counters_and_backoff_survive_input_round_trips() {
+    let s = setup("ai-roundtrip-partial");
+    let (a, b) = (embed("photo", "A"), embed("photo", "B"));
+    s.enqueue(&a, T0);
+    // 通常の失敗 2 回（attempts=2・120 秒のバックオフ）
+    let mut now = T0;
+    let mut id = 0;
+    for n in 1..=2 {
+        let c = s.claim(now, "run", &format!("a{n}")).unwrap();
+        id = c.id;
+        s.fail(&c, now, Failure::Attempt);
+        now = s.row(id).next;
+    }
+    // さらに 1 回、反復失敗（defer_count=1）と、1 回の中断
+    let c = s.claim(now, "run", "d").unwrap();
+    s.fail(&c, now, Failure::Repeated);
+    now = s.row(id).next;
+    let c = s.claim(now, "run-old", "i").unwrap();
+    assert_eq!(c.id, id);
+    s.writer
+        .call(move |conn| reclaim_interrupted(conn, "run-new", now + 5))
+        .unwrap();
+    let before = s.row(id);
+    assert_eq!(
+        (
+            before.state,
+            before.attempts,
+            before.defer_count,
+            before.interruptions
+        ),
+        (JobState::Pending, 2, 1, 1)
+    );
+    let wait_until = now + 5;
+    assert_eq!(before.next, wait_until);
+
+    // 往復（待ち時刻より前のうちに）
+    s.switch_input(&b, now + 6);
+    assert_eq!(s.row(id).state, JobState::Obsolete);
+    assert_eq!(s.switch_input(&a, now + 7), Enqueued::Revived);
+    let after = s.row(id);
+    assert_eq!(after.state, JobState::Pending);
+    assert_eq!(
+        (
+            after.attempts,
+            after.defer_count,
+            after.interruptions,
+            after.next,
+            after.code.as_str()
+        ),
+        (2, 1, 1, before.next, before.code.as_str())
+    );
+    assert!(!s.terminal(id));
+
+    // 待ち時刻までは取れない。残りの失敗で上限に達する（往復で 5 回分を取り戻していない）
+    assert!(s.claim(before.next - 1, "run-new", "early").is_none());
+    let mut now = before.next;
+    for expected in [JobState::Pending, JobState::Pending, JobState::Failed] {
+        let c = s.claim(now, "run-new", &format!("z{now}")).unwrap();
+        assert_eq!(c.id, id);
+        assert_eq!(s.fail(&c, now, Failure::Attempt), Some(expected));
+        now = s.row(id).next;
+    }
+    assert_eq!(s.row(id).attempts, 5);
+}
+
+/// 中断の上限も往復で戻らない: 2 回中断された A が往復しても、3 回目の中断で `failed`。
+#[test]
+fn the_interruption_limit_is_not_reset_by_input_round_trips() {
+    let s = setup("ai-roundtrip-interrupt");
+    let (a, b) = (embed("photo", "A"), embed("photo", "B"));
+    s.enqueue(&a, T0);
+    let mut id = 0;
+    for n in 1..=2u32 {
+        let c = s.claim(T0, &format!("run-{n}"), &format!("t{n}")).unwrap();
+        id = c.id;
+        let next = format!("run-{}", n + 1);
+        s.writer
+            .call(move |conn| reclaim_interrupted(conn, &next, T0))
+            .unwrap();
+    }
+    s.switch_input(&b, T0 + 1);
+    assert_eq!(s.switch_input(&a, T0 + 2), Enqueued::Revived);
+    assert_eq!(s.row(id).interruptions, 2);
+    // B も同じく取られうるので、A を指定して取る
+    let mut taken = None;
+    while let Some(c) = s.claim(T0 + 10, "run-3", &format!("t3-{}", taken.is_some())) {
+        if c.id == id {
+            taken = Some(c);
+            break;
+        }
+    }
+    assert!(taken.is_some());
+    let r = s
+        .writer
+        .call(|conn| reclaim_interrupted(conn, "run-4", T0 + 20))
+        .unwrap();
+    assert_eq!(r.failed, 1);
+    assert_eq!(s.row(id).state, JobState::Failed);
+}
+
+/// 旧い `ai_jobs`（`terminal` 列が無い）に列を足し、失敗の履歴を可能な範囲で復元する。冪等で、
+/// 他の表・行は変えない。
+#[test]
+fn migrate_adds_the_terminal_column_to_an_older_ai_jobs_table() {
+    let dir = TempDir::new("ai-migrate-old-table");
+    let mut conn = Connection::open(dir.path().join("catalog.db")).unwrap();
+    schema::migrate(&mut conn).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE ai_jobs(
+           id INTEGER PRIMARY KEY,
+           kind TEXT NOT NULL CHECK(kind IN
+             ('image_embedding','location_clue','location_suggest','location_geocode','photo_judge')),
+           target_key TEXT NOT NULL, input_hash TEXT NOT NULL, processor_version TEXT NOT NULL,
+           state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN
+             ('pending','running','deferred','succeeded','failed','obsolete')),
+           attempts INTEGER NOT NULL DEFAULT 0, defer_count INTEGER NOT NULL DEFAULT 0,
+           interruption_count INTEGER NOT NULL DEFAULT 0, next_attempt_at INTEGER NOT NULL DEFAULT 0,
+           run_id TEXT, claim_token TEXT, last_error_code TEXT NOT NULL DEFAULT '',
+           created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+           UNIQUE(kind, target_key, input_hash, processor_version));
+         CREATE INDEX idx_ai_jobs_runnable ON ai_jobs(state, next_attempt_at, id);
+         INSERT INTO ai_jobs(id,kind,target_key,input_hash,processor_version,state,attempts,
+                             interruption_count,last_error_code,created_at,updated_at) VALUES
+           (1,'image_embedding','p','failed','v','failed',5,0,'timeout',1,1),
+           (2,'image_embedding','p','obs-attempts','v','obsolete',5,0,'timeout',1,1),
+           (3,'image_embedding','p','obs-interrupted','v','obsolete',0,3,'interrupted',1,1),
+           (4,'image_embedding','p','obs-permanent','v','obsolete',0,0,'input_invalid',1,1),
+           (5,'image_embedding','p','obs-plain','v','obsolete',2,0,'timeout',1,1),
+           (6,'image_embedding','p','pending','v','pending',1,0,'timeout',1,1),
+           (7,'image_embedding','p','done','v','succeeded',0,0,'',1,1);",
+    )
+    .unwrap();
+    let photos_before = dump(&conn);
+    assert_eq!(pending(&conn).unwrap(), ["ai_jobs.terminal"]);
+    assert_eq!(migrate(&mut conn).unwrap(), ["ai_jobs.terminal"]);
+    assert!(pending(&conn).unwrap().is_empty());
+    assert_eq!(dump(&conn), photos_before);
+
+    let terminals: Vec<i64> = conn
+        .prepare("SELECT terminal FROM ai_jobs ORDER BY id")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(terminals, [1, 1, 1, 1, 0, 0, 0]);
+    let counters: i64 = conn
+        .query_row(
+            "SELECT SUM(attempts)+SUM(interruption_count) FROM ai_jobs",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(counters, 5 + 5 + 3 + 2 + 1);
+
+    // 冪等: 2 回目は何も書かない
+    let changes = conn.total_changes();
+    assert!(migrate(&mut conn).unwrap().is_empty());
+    assert_eq!(conn.total_changes(), changes);
+
+    // 復元した履歴は効く: 旧い obsolete の失敗キーを enqueue しても failed に戻り、plain は pending
+    assert_eq!(
+        enqueue(
+            &mut conn,
+            &JobKey::new(JobKind::ImageEmbedding, "p", "obs-attempts", "v"),
+            T0
+        )
+        .unwrap(),
+        Enqueued::Existing(JobState::Failed)
+    );
+    assert_eq!(
+        enqueue(
+            &mut conn,
+            &JobKey::new(JobKind::ImageEmbedding, "p", "obs-plain", "v"),
+            T0
+        )
+        .unwrap(),
+        Enqueued::Revived
+    );
+}
+
 // ---------------------------------------------------------------- claim
 
 #[test]
