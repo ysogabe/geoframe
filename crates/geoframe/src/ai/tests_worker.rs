@@ -30,22 +30,22 @@ use crate::testutil::TempDir;
 use crate::writer::Writer;
 
 /// 2026-10-26T01:00:00Z（UTC 日の途中）。
-const T0: i64 = 1_792_972_800 + 3_600;
+pub(super) const T0: i64 = 1_792_972_800 + 3_600;
 
 // ---------------------------------------------------------------- 準備
 
-struct Env {
+pub(super) struct Env {
     _dir: TempDir,
-    config: Arc<Config>,
+    pub(super) config: Arc<Config>,
     ingest: Option<Ingest>,
     clock: Arc<AtomicI64>,
 }
 
-fn env(tag: &str) -> Env {
+pub(super) fn env(tag: &str) -> Env {
     env_with(tag, SAMPLE, true)
 }
 
-fn env_with(tag: &str, ai_json: &str, ingest_on: bool) -> Env {
+pub(super) fn env_with(tag: &str, ai_json: &str, ingest_on: bool) -> Env {
     let dir = TempDir::new(tag);
     let ai_path = dir.path().join("ai.json");
     std::fs::write(&ai_path, ai_json).unwrap();
@@ -82,7 +82,7 @@ fn env_with(tag: &str, ai_json: &str, ingest_on: bool) -> Env {
 }
 
 impl Env {
-    fn writer(&self) -> Writer {
+    pub(super) fn writer(&self) -> Writer {
         self.ingest.as_ref().unwrap().writer.clone()
     }
 
@@ -95,7 +95,7 @@ impl Env {
         self.clock.store(now, Ordering::SeqCst);
     }
 
-    fn advance(&self, secs: i64) {
+    pub(super) fn advance(&self, secs: i64) {
         self.clock.fetch_add(secs, Ordering::SeqCst);
     }
 
@@ -113,7 +113,7 @@ impl Env {
     }
 
     /// 1 周期だけ同期的に動かす。
-    fn cycle(&self, handlers: &[Arc<Fake>], stop: &StopFlag) {
+    pub(super) fn cycle(&self, handlers: &[Arc<Fake>], stop: &StopFlag) {
         let handlers = handlers
             .iter()
             .map(|h| Arc::clone(h) as Arc<dyn Handler>)
@@ -121,7 +121,7 @@ impl Env {
         Core::new(&self.deps(handlers, stop, "run-test")).cycle();
     }
 
-    fn row(&self, kind: JobKind, target: &str) -> Option<Row> {
+    pub(super) fn row(&self, kind: JobKind, target: &str) -> Option<Row> {
         let (k, t) = (kind.as_str(), target.to_string());
         self.writer()
             .call(move |c| {
@@ -150,17 +150,17 @@ impl Env {
             .unwrap()
     }
 
-    fn state(&self, kind: JobKind, target: &str) -> JobState {
+    pub(super) fn state(&self, kind: JobKind, target: &str) -> JobState {
         self.row(kind, target).expect("ジョブがある").state
     }
 
-    fn results(&self) -> i64 {
+    pub(super) fn results(&self) -> i64 {
         self.writer()
             .call(|c| c.query_row("SELECT COUNT(*) FROM ai_test_results", [], |r| r.get(0)))
             .unwrap()
     }
 
-    fn enqueue(&self, key: &JobKey) {
+    pub(super) fn enqueue(&self, key: &JobKey) {
         let key = key.clone();
         let now = self.clock.load(Ordering::SeqCst);
         self.writer()
@@ -170,20 +170,20 @@ impl Env {
 }
 
 #[derive(Debug, PartialEq)]
-struct Row {
-    state: JobState,
-    attempts: u32,
-    interruptions: u32,
-    code: String,
-    has_token: bool,
-    next: i64,
+pub(super) struct Row {
+    pub(super) state: JobState,
+    pub(super) attempts: u32,
+    pub(super) interruptions: u32,
+    pub(super) code: String,
+    pub(super) has_token: bool,
+    pub(super) next: i64,
 }
 
 pub(super) fn key(kind: JobKind, target: &str) -> JobKey {
     JobKey::new(kind, target, "in-1", "p1")
 }
 
-fn persist_result(target: String, check: InputCheck) -> Persist {
+pub(super) fn persist_result(target: String, check: InputCheck) -> Persist {
     Box::new(move |conn: &Connection| {
         conn.execute("INSERT INTO ai_test_results(target) VALUES (?1)", [&target])?;
         Ok(check)

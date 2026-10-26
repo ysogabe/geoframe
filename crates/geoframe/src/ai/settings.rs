@@ -339,6 +339,30 @@ impl AiSettings {
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         Some(PauseKey::new(PauseScope::Task, fingerprint(&refs)))
     }
+
+    /// Provider（接続先・認証が同じ全用途）の**一時待機**の識別（[`super::waits`]）。永続停止の識別
+    /// （[`AiSettings::provider_pause_key`]）とは別の名前空間で、モデル・許可・上限では変わらない。
+    pub fn provider_fingerprint(&self, task: TaskKind) -> Option<String> {
+        let t = self.task(task)?;
+        let mut parts = vec!["wait-provider".to_string()];
+        parts.extend(self.provider_identity(t));
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        Some(fingerprint(&refs))
+    }
+
+    /// 用途が使うサービスの一時待機の識別。LAN は同じサービス ID（`location_clue` は固定の `decision`）を使う用途が
+    /// 同じ識別になり、同じ入口の別サービスは別。クラウドはモデル単位。
+    pub fn service_key(&self, task: TaskKind) -> Option<String> {
+        let t = self.task(task)?;
+        let name = match t.provider {
+            ProviderKind::Local => t
+                .service_id
+                .clone()
+                .unwrap_or_else(|| super::decision::SERVICE_ID.to_string()),
+            ProviderKind::Cloud => format!("cloud:{}", t.model),
+        };
+        Some(fingerprint(&["wait-service", &name]))
+    }
 }
 
 /// 長さ付きで連結した SHA-256 の 16 進。ハッシュの区切りの曖昧さ（`ab`+`c` と `a`+`bc`）を作らない。

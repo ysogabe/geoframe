@@ -1,26 +1,40 @@
 //! P4: AI の実行基盤。永続ジョブ（[`jobs`]）、設定（[`settings`]）、クラウド送信の予算（[`budget`]）、
-//! Provider の一時停止（[`pause`]）、起動 ID と停止開始の記録（[`runs`]）、背景ワーカー（[`worker`]）、
-//! 管理操作（[`ops`]。CLI と STATUS）。HTTP・Provider・用途別の handler は後続のタスク。
+//! Provider の一時停止（[`pause`]）、共有の一時待機（[`waits`]）、起動 ID と停止開始の記録（[`runs`]）、背景ワーカー
+//! （[`worker`]）、管理操作（[`ops`]。CLI と STATUS）。T4.2 で AI 専用の HTTP（[`http`]・[`dest`]・[`lanes`]）、
+//! Discovery（[`discovery`]）、Decision（[`decision`]・[`image_input`]）、LAN の共通部分（[`provider`]）を足した。
+//! 用途別の handler の登録は後続のタスク。
 //! 設計は `docs/rust-migration/p4-design.md` §3・§4。
 //!
-//! 追加の表（`ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_worker_runs`）は Python と同じスキーマの再現
+//! 追加の表（`ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`）は Python と同じスキーマの再現
 //! （[`crate::schema::migrate`]）には入れず、取り込みが有効な起動で [`migrate`] が足す。`INGEST=0`
 //! （読み取り専用）の起動では作らず、表が無い旧 DB は `db::REQUIRED_SCHEMA` を満たしたまま読める。
 
 use rusqlite::{Connection, TransactionBehavior};
 
 pub mod budget;
+pub mod decision;
+pub mod dest;
+pub mod discovery;
+pub mod http;
+pub mod image_input;
 pub mod jobs;
+pub mod lanes;
 pub mod ops;
 pub mod pause;
+pub mod provider;
 pub mod runs;
 pub mod settings;
+pub mod waits;
 pub mod worker;
 
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod tests_http;
+#[cfg(test)]
 mod tests_ops;
+#[cfg(test)]
+mod tests_provider;
 #[cfg(test)]
 mod tests_settings;
 #[cfg(test)]
@@ -34,6 +48,7 @@ pub fn pending(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     missing.extend(missing_tables(conn, budget::TABLES)?);
     missing.extend(missing_tables(conn, pause::TABLES)?);
     missing.extend(missing_tables(conn, runs::TABLES)?);
+    missing.extend(missing_tables(conn, waits::TABLES)?);
     Ok(missing)
 }
 
@@ -44,6 +59,7 @@ pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
     created.extend(create_tables(conn, budget::TABLES, budget::SCHEMA)?);
     created.extend(create_tables(conn, pause::TABLES, pause::SCHEMA)?);
     created.extend(create_tables(conn, runs::TABLES, runs::SCHEMA)?);
+    created.extend(create_tables(conn, waits::TABLES, waits::SCHEMA)?);
     Ok(created)
 }
 

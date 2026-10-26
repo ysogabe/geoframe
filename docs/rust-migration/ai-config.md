@@ -1,6 +1,6 @@
 # AI設定（`GEOFRAME_AI_CONFIG`）v1
 
-- 状態: T4.1bで実装。設計は[p4-design.md](p4-design.md) §3。接続先の固定・認証・実際の送信はT4.2以降で、ここは**設定の読み取りと検査**まで。
+- 状態: T4.1bで実装（T4.2でHTTP基盤を追加）。設計は[p4-design.md](p4-design.md) §3。ここは**設定の読み取りと検査**。接続先の固定・Discovery・Decisionの入出力・共有の一時待機は[ai-provider.md](ai-provider.md)（T4.2）。クラウドの認証・実際の送信はT4.6以降。
 - `GEOFRAME_AI_CONFIG`（Rustだけの項目）は、用途別のrouting・クラウド許可・ベクトル空間をまとめた小さなJSONのパス。**未設定なら新しい外部AI呼び出しは無効**（写真の配信・管理・保存済み推薦の読み取りは動く）。相対パスは起動したカレントディレクトリ基準。
 
 ## 読み込みの決まり
@@ -56,7 +56,7 @@
 | キー | 必須 | 既定・規則 |
 |---|---|---|
 | `version` | 必須 | `1` |
-| `local_base_url` | LANの用途があるとき | `http`／`https`の`scheme://host[:port]`だけ（末尾の`/`は可）。userinfo・query・fragment・パス・空白・制御文字・非ASCII・`%`は不正。ホストはIPリテラルかDNS名の書式（解決・privateの判定はしない。接続時の固定はT4.2）。APIのパスは実装が固定で付ける |
+| `local_base_url` | LANの用途があるとき | `http`／`https`の`scheme://host[:port]`だけ（末尾の`/`は可）。userinfo・query・fragment・パス・空白・制御文字・非ASCII・`%`は不正。ホストはIPリテラルかDNS名の書式（ここでは解決・privateの判定をしない。接続時にprivate/loopbackだけへ固定する: [ai-provider.md](ai-provider.md)）。APIのパスは実装が固定で付ける |
 | `embedding_space` | 画像・検索語のEmbeddingを使うとき | 画像と検索語に共通のベクトル空間の識別。`space_id`・`model_id`・`revision`・`image_preprocess`・`text_preprocess`は英数字で始まる64字以内（英数字と`.` `_` `-` `:`）、`dimension`は1〜4096、`normalization`は`l2`か`none`。**無い間はEmbeddingの用途は無効**（版が分からない接続を有効にしない）。後続のタスクがProviderの応答と照合する検査済みのメタデータで、ここでAPIは呼ばない |
 | `tasks.<用途>` | 任意 | 用途は`image_embedding`・`query_embedding`・`photo_judge`・`location_clue`・`location_suggest`の5つ（geocodeはLLMのroutingが無い）。書かない用途は無効 |
 | `provider` | 必須 | `local`（LANの入口）か`cloud`（実装が組み立てる固定のHTTPS宛先） |
@@ -94,7 +94,7 @@
 
 ## ハッシュ・停止
 
-設定全体のハッシュ・用途の送信ポリシーのハッシュ（SHA-256）は監査と送信可否の検査用で、**ジョブの冪等キーには入れない**（URL・許可・上限だけの変更で成功済みの結果を再送しないため）。Providerの一時停止（認証の失敗・403・モデル404・契約不一致。`ai_provider_pauses`）は、接続先・認証・モデルなど**その理由に関係する設定だけ**から識別を作り、再起動では解除されず、関係する設定が変わるか管理CLI（`geoframe ai-jobs release-pause`。下の「管理操作」）の明示の解除で効かなくなる。全ジョブを`failed`にはしない。
+設定全体のハッシュ・用途の送信ポリシーのハッシュ（SHA-256）は監査と送信可否の検査用で、**ジョブの冪等キーには入れない**（URL・許可・上限だけの変更で成功済みの結果を再送しないため）。Providerの一時停止（認証の失敗・403・モデル404・契約不一致。`ai_provider_pauses`）は、接続先・認証・モデルなど**その理由に関係する設定だけ**から識別を作り、再起動では解除されず、関係する設定が変わるか管理CLI（`geoframe ai-jobs release-pause`。下の「管理操作」）の明示の解除で効かなくなる。全ジョブを`failed`にはしない。到達不能・GPU lease・429などの**一時待機**（`ai_provider_waits`）は別物で、`until`（60〜3600秒先）が過ぎれば自然に消え、停止とは混同しない（[ai-provider.md](ai-provider.md)）。
 
 ## 背景ワーカー（T4.1c）
 
@@ -114,7 +114,8 @@
 | `PolicyDisabled` | `deferred/policy_disabled`（失敗に数えない） | 後続のhandlerは`Disabled`をこれに対応付ける |
 | `Paused` | `deferred/provider_paused` | |
 | `Budget(予約の結果)` | `deferred`。1日の枠切れ・周期の枠切れは`budget_exhausted`（待ちは3600秒・周期窓の長さ）、時計の巻き戻りは`clock_rewound`（600秒）、順番待ちの超過などは`internal` | その用途を待ちの間は送らない。**予算をリセットする救済は無い**（時計が履歴に追いつくまで送らない） |
-| `Unavailable` | `deferred/unavailable`（60秒後以降） | その用途を60秒送らない（用途単位。同じ入口の他の用途は進む。Provider全体の到達不能を複数用途へ広げるのはT4.2のDiscovery） |
+| `Unavailable` | `deferred/unavailable`（60秒後以降） | その用途を60秒送らない（この起動の中の用途単位。Provider全体へ広げる待ちは次の`ProviderWait`） |
+| `ProviderWait(scope, reason, retry_after)` | `deferred/unavailable`または`rate_limited`（60〜3600秒） | 共有の一時待機を`ai_provider_waits`に記録し、`scope=Entrance`なら同じProviderの他の用途もclaimの前に飛ばし、`Service`なら同じサービスを使う用途だけ。別のProvider・別のサービスは進む。再起動後も`until`まで効く。詳細は[ai-provider.md](ai-provider.md) |
 | `RateLimited` | `deferred/rate_limited`（Retry-Afterを60〜3600秒に収める） | その用途をその間送らない |
 | `Attempt` / `Repeated` / `Permanent` | 失敗1回（5回で`failed`）／反復失敗（3回目から失敗に数える）／即`failed` | `jobs::Failure`と同じ |
 | `ProviderPause` / `TaskPause` | 失敗に数えず後回し | 停止をDBに記録（再起動では解除されない） |
@@ -152,7 +153,7 @@ STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解�
 
 ### 限界・後続
 
-- handlerが未登録の間、`ai-jobs retry`は全ての`failed`を保持する（`unsupported`）。再検査の中身（入力・処理版・ポリシー・既存結果の確認）は各handlerの`recheck`で、T4.2・T4.4・T4.6が実装する。
+- handlerが未登録の間、`ai-jobs retry`は全ての`failed`を保持する（`unsupported`）。再検査の中身（入力・処理版・ポリシー・既存結果の確認）は各handlerの`recheck`で、T4.4・T4.6が実装する。
 - `Disabled`から`RunError::PolicyDisabled`への対応付け、401/403/404/契約不一致から`ProviderPause`／`TaskPause`への対応付け、429のRetry-After、予算エラー（`Budget`）の扱いは、各handlerが`before_send`の結果をそのまま返すことで揃う（ワーカーがジョブの状態へ対応付ける）。
-- 対話の検索語Embedding（`query_embedding`）の予約・キャッシュ、結果の保存先の表、HTTP通信そのものはT4.2・T4.4。
+- HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。対話の検索語Embedding（`query_embedding`）の予約・キャッシュ、結果の保存先の表、画像／文EmbeddingのアダプターはT4.4、Decisionの質問・clue保存・クラウドはT4.6。
 

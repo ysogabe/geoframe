@@ -27,11 +27,12 @@ use crate::writer::{OpenMode, WriteError, Writer};
 /// 2026-10-26T00:00:00Z（UTC 日の始まり）。
 const D0: i64 = 1_792_972_800;
 const DAY: i64 = 86_400;
-const AI_TABLES: [&str; 5] = [
+const AI_TABLES: [&str; 6] = [
     "ai_jobs",
     "idx_ai_jobs_runnable",
     "ai_request_usage",
     "ai_provider_pauses",
+    "ai_provider_waits",
     "ai_worker_runs",
 ];
 
@@ -94,7 +95,8 @@ fn master_without_ai(conn: &Connection) -> Vec<String> {
         .prepare(
             "SELECT type||':'||name||':'||COALESCE(sql,'') FROM sqlite_master
              WHERE name NOT LIKE '%ai_jobs%' AND name NOT LIKE '%ai_request_usage%'
-               AND name NOT LIKE '%ai_provider_pauses%' AND name NOT LIKE '%ai_worker_runs%' ORDER BY rowid",
+               AND name NOT LIKE '%ai_provider_pauses%' AND name NOT LIKE '%ai_provider_waits%'
+               AND name NOT LIKE '%ai_worker_runs%' ORDER BY rowid",
         )
         .unwrap();
     stmt.query_map([], |r| r.get(0))
@@ -199,11 +201,21 @@ fn a_t4_1a_database_gets_only_the_new_tables_and_keeps_its_jobs() {
 
     assert_eq!(
         sorted(super::pending(&conn).unwrap()),
-        ["ai_provider_pauses", "ai_request_usage", "ai_worker_runs"]
+        [
+            "ai_provider_pauses",
+            "ai_provider_waits",
+            "ai_request_usage",
+            "ai_worker_runs"
+        ]
     );
     assert_eq!(
         sorted(super::migrate(&mut conn).unwrap()),
-        ["ai_provider_pauses", "ai_request_usage", "ai_worker_runs"]
+        [
+            "ai_provider_pauses",
+            "ai_provider_waits",
+            "ai_request_usage",
+            "ai_worker_runs"
+        ]
     );
     let jobs_after: Vec<String> = conn
         .prepare("SELECT * FROM ai_jobs ORDER BY id")
@@ -236,6 +248,7 @@ fn an_old_database_without_the_ai_tables_is_readable_read_only() {
         "ai_jobs",
         "ai_request_usage",
         "ai_provider_pauses",
+        "ai_provider_waits",
         "ai_worker_runs",
     ] {
         assert!(!table_exists(&ro, name), "{name}");

@@ -62,6 +62,7 @@ use super::jobs::{
 use super::pause::{self, PauseReason};
 use super::runs;
 use super::settings::{AiConfig, Disabled, Gate, TaskKind};
+use super::waits::{self, Wait, WaitKey, WaitReason, WaitScope};
 use crate::config::Config;
 use crate::ingest::LockHold;
 use crate::stop::{StopFlag, join_within};
@@ -148,6 +149,11 @@ pub enum RunError {
     Unavailable,
     /// 429。`retry_after_secs` を 60〜3600 秒に収めて後回し。その用途をその間送らない。
     RateLimited { retry_after_secs: Option<u32> },
+    /// 同じ Provider を使う用途で**共有する一時待機**（到達不能・GPU lease・429・サービスが未準備）。失敗に数えず後回し
+    /// （ジョブの `next_attempt_at` も遅らせる）。範囲は [`WaitScope`]: 入口全体なら同じ Provider の他の用途も claim の前に
+    /// 飛ばし、サービス単体ならそのサービスを使う用途だけ。別の Provider は巻き込まない。DB に残り、再起動後も効く
+    /// （[`super::waits`]）。永続の停止（[`RunError::ProviderPause`]）とは別。
+    ProviderWait(Wait),
     /// 失敗 1 回（応答構造の不正・クラウドへの送信後の時間切れ／5xx など課金され得る試行）。5 回で `failed`。
     Attempt(ErrorCode),
     /// Provider は使えるのに、同じジョブだけが反復して失敗する（5xx・時間切れ）。
@@ -185,6 +191,11 @@ impl<'a> RunCtx<'a> {
         self.stop.is_stopped()
     }
 
+    /// 停止の合図（外部 I/O の枠を取る・待つときに渡す）。
+    pub fn stop(&self) -> &StopFlag {
+        self.stop
+    }
+
     /// 外部へ送る**直前**に呼ぶ（送信のたびに）。順に確かめ、全部通ったときだけ接続情報を返す:
     /// 1. 停止の合図（[`RunError::Stopping`]）
     /// 2. 今の設定の送信可否（[`RunError::PolicyDisabled`]）
@@ -193,6 +204,16 @@ impl<'a> RunCtx<'a> {
     ///    予約は失敗・中断しても巻き戻らない。
     /// 5. 許可を返す直前にもう一度、停止の合図（予約の順番待ちのあいだに来た合図も尊重する）。
     pub fn before_send(&self) -> Result<Gate<'a>, RunError> {
+        self.check(true)
+    }
+
+    /// Discovery などの**読み取り**の前に呼ぶ。[`RunCtx::before_send`] と同じ確認のうち、クラウドの送信枠の予約
+    /// （手順 4）だけをしない。推論の要求を出す前の確認で送信枠を使わないための区別。
+    pub fn before_probe(&self) -> Result<Gate<'a>, RunError> {
+        self.check(false)
+    }
+
+    fn check(&self, reserve: bool) -> Result<Gate<'a>, RunError> {
         if self.stop.is_stopped() {
             return Err(RunError::Stopping);
         }
@@ -207,7 +228,7 @@ impl<'a> RunCtx<'a> {
                 Ok(Some(_)) | Err(_) => return Err(RunError::Paused),
             }
         }
-        if let Some(send_budget) = gate.budget {
+        if let Some(send_budget) = gate.budget.filter(|_| reserve) {
             let task = self.task;
             let clock = Arc::clone(self.clock);
             let deadline = Instant::now() + BUDGET_WAIT;
@@ -317,8 +338,10 @@ pub(super) struct Core {
     handlers: Vec<Arc<dyn Handler>>,
     clock: Clock,
     run_id: String,
-    /// Provider 側の都合（利用不可・429・予算切れ）で、この時刻（Unix 秒）まで送らない用途。
+    /// Provider 側の都合（利用不可・429・予算切れ）で、この時刻（Unix 秒）まで送らない用途（この起動の中だけ）。
     blocked: HashMap<TaskKind, i64>,
+    /// 共有の一時待機（DB から周期の最初に読み、新しい待ちは記録と同時に足す。再起動後も残る）。
+    waits: HashMap<WaitKey, i64>,
 }
 
 impl Core {
@@ -331,6 +354,7 @@ impl Core {
             clock: Arc::clone(&deps.clock),
             run_id: deps.run_id.clone(),
             blocked: HashMap::new(),
+            waits: HashMap::new(),
         }
     }
 
@@ -346,6 +370,8 @@ impl Core {
                 return;
             }
         };
+        // 共有の一時待機（再起動をまたいで残る）を読み直す。読めなければ空のまま進む（待ちは各 handler の確認が補う）
+        self.waits = waits::load(&read, (self.clock)()).unwrap_or_default();
         self.reconcile(&read);
         let mut processed: HashMap<TaskKind, u32> = HashMap::new();
         loop {
@@ -398,12 +424,27 @@ impl Core {
                 if self.blocked.get(&task).is_some_and(|until| *until > now) {
                     return false;
                 }
+                if self.wait_blocks(task, now) {
+                    return false;
+                }
                 match self.config.ai.settings() {
                     Some(settings) => matches!(pause::status(read, settings, task), Ok(None)),
                     None => false,
                 }
             })
             .collect()
+    }
+
+    /// 共有の一時待機が用途を止めているか（入口全体の待ち、または用途が使うサービスの待ち）。
+    fn wait_blocks(&self, task: TaskKind, now: i64) -> bool {
+        let Some(settings) = self.config.ai.settings() else {
+            return false;
+        };
+        let Some(provider) = settings.provider_fingerprint(task) else {
+            return false;
+        };
+        let service = settings.service_key(task);
+        waits::blocks(&self.waits, &provider, service.as_deref(), now)
     }
 
     fn handler(&self, kind: JobKind) -> Option<Arc<dyn Handler>> {
@@ -598,6 +639,10 @@ impl Core {
             RunError::Attempt(code) => (code, Failure::Attempt, None),
             RunError::Repeated(code) => (code, Failure::Repeated, None),
             RunError::Permanent(code) => (code, Failure::Permanent, None),
+            RunError::ProviderWait(wait) => {
+                self.wait_and_defer(claimed, task, wait);
+                return;
+            }
             RunError::ProviderPause(reason) | RunError::TaskPause(reason) => {
                 let provider = matches!(error, RunError::ProviderPause(_));
                 self.pause_and_defer(claimed, task, reason, provider);
@@ -612,6 +657,54 @@ impl Core {
 
     fn cycle_secs(&self, task: TaskKind) -> u32 {
         self.config.ai.legacy().cycle(task).1
+    }
+
+    /// 共有の一時待機を DB に残し（再起動後も効く）、ジョブは失敗に数えず、`next_attempt_at` を待ちの終わりまで遅らせる
+    /// （1 回の依頼）。範囲が入口全体なら、同じ Provider の他の用途も次の claim から飛ばされる。
+    fn wait_and_defer(&mut self, claimed: &Claimed, task: TaskKind, wait: Wait) {
+        let secs = wait.secs();
+        let now = (self.clock)();
+        let until = now + i64::from(secs);
+        let key = self.config.ai.settings().and_then(|s| {
+            let provider = s.provider_fingerprint(task)?;
+            let service = match wait.scope {
+                WaitScope::Entrance => None,
+                WaitScope::Service => Some(s.service_key(task)?),
+            };
+            Some(WaitKey { provider, service })
+        });
+        let code = if wait.reason == WaitReason::RateLimited {
+            ErrorCode::RateLimited
+        } else {
+            ErrorCode::Unavailable
+        };
+        if let Some(key) = &key {
+            let entry = self.waits.entry(key.clone()).or_insert(until);
+            *entry = (*entry).max(until);
+        } else {
+            // 設定から識別が作れないときは、この起動の中の用途の待ちにする
+            self.blocked.insert(task, until);
+        }
+        let (c, clock, reason) = (claimed.clone(), Arc::clone(&self.clock), wait.reason);
+        let result = self.writer.call(move |conn| {
+            let now = clock();
+            if let Some(key) = &key {
+                waits::set(conn, key, reason, until, now)?;
+            }
+            jobs::record_failure(
+                conn,
+                &c,
+                now,
+                code,
+                Failure::Defer {
+                    retry_after_secs: Some(secs),
+                },
+            )
+        });
+        if let Err(e) = result {
+            // ジョブは running のまま残り、次の起動の回収が数える。待ちはこの起動の中では効く
+            tracing::warn!("[ai] 待機を記録できません: {e}");
+        }
     }
 
     /// 停止を DB に残し、ジョブは失敗に数えず後回しにする（1 回の依頼）。

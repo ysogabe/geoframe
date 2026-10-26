@@ -171,7 +171,7 @@ fn dry_run_writes_nothing_and_reports_counts() {
     assert!(stdout.contains("dry-run: 何も書きません"), "{stdout}");
     assert!(
         stdout.contains(
-            "スキーマ: 作る表・索引 5 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
+            "スキーマ: 作る表・索引 6 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
         ),
         "{stdout}"
     );
@@ -308,8 +308,8 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
             |r| r.get(0),
         )
         .unwrap();
-    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_worker_runs`
-    assert_eq!(tables, 15);
+    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`
+    assert_eq!(tables, 16);
 }
 
 #[test]
@@ -321,9 +321,9 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     envs.push(("GEOFRAME_INGEST", "1".into()));
     let out = run_owned(&["sync", "--data-dir", dir.0.to_str().unwrap()], &envs);
     assert!(out.status.success(), "{}", text(&out.stdout));
-    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・起動 ID）だけ。ほかの表・列は変えない
+    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID）だけ。ほかの表・列は変えない
     assert!(
-        text(&out.stdout).contains("スキーマを更新しました: 作成 5件 / 列の追加 0件"),
+        text(&out.stdout).contains("スキーマを更新しました: 作成 6件 / 列の追加 0件"),
         "{}",
         text(&out.stdout)
     );
@@ -733,6 +733,7 @@ fn serve_with_ingest_adds_the_ai_tables_once_and_never_needs_the_network_or_cred
         "ai_jobs",
         "ai_request_usage",
         "ai_provider_pauses",
+        "ai_provider_waits",
         "ai_worker_runs",
     ] {
         let n: i64 = conn
