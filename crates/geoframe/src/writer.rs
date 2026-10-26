@@ -33,7 +33,8 @@
 //! [`Writer::call_within`] は、順番待ちを含めて期限までに**始まらなかった**依頼を実行しない（書き込みスレッドが
 //! 取り出した時点で期限を過ぎていれば、`f` を呼ばずに [`WriteError::Expired`]）。待つ側は期限で戻るので、
 //! 対話的な要求（検索語の送信枠の予約など）が書き込みの順番待ちで塞がれない。期限が来たあとに待つ側が去っても、
-//! すでに始まっていた依頼は最後まで実行され確定する（巻き戻さない）。戻り値が `Expired` でも書き込みが確定して
+//! すでに始まっていた依頼は最後まで実行され確定する（巻き戻さない）。返信が溜まっていても、待つ側が受け取った
+//! のが期限のあとなら成功を返さず `Expired` にする。戻り値が `Expired` でも書き込みが確定して
 //! いることがあるので、呼び出し側は「確定しなかった」と決めつけず、保守的に扱う（送信枠なら消費済みとみなす）。
 //! 後始末・パニックの扱い・接続の復旧は [`Writer::call`] と同じ経路。
 //!
@@ -138,6 +139,10 @@ pub struct Writer {
     /// 同期サイクルの段が「計画を読んでから書くまで」の間に更新 API を割り込ませる試験のため。
     #[cfg(test)]
     before_call: Option<Hook>,
+    /// 試験用: 依頼を積んだあと、返信を待つ直前に 1 回だけ呼ぶ閉包（呼び出したスレッドで）。
+    /// 『書き込みスレッドが期限内に始めて返信を済ませ、待つ側がまだ受け取っていない』状態を作るため。
+    #[cfg(test)]
+    before_wait: Option<Hook>,
 }
 
 impl fmt::Debug for Writer {
@@ -182,6 +187,8 @@ impl Writer {
             jobs,
             #[cfg(test)]
             before_call: None,
+            #[cfg(test)]
+            before_wait: None,
         }
     }
 
@@ -191,6 +198,15 @@ impl Writer {
     pub(crate) fn interrupt_next_call(&self, f: impl FnOnce() + Send + 'static) -> Self {
         Self {
             before_call: Some(Arc::new(Mutex::new(Some(Box::new(f))))),
+            ..self.clone()
+        }
+    }
+
+    /// 試験用: 次の依頼を積んだあと返信を待つ直前に `f` を 1 回だけ呼ぶ複製を返す（元の `Writer` には効かない）。
+    #[cfg(test)]
+    pub(crate) fn interrupt_before_next_wait(&self, f: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            before_wait: Some(Arc::new(Mutex::new(Some(Box::new(f))))),
             ..self.clone()
         }
     }
@@ -259,12 +275,29 @@ impl Writer {
         self.jobs
             .send(job)
             .map_err(|_| WriteError::Task("書き込みスレッドが停止しています"))?;
+        #[cfg(test)]
+        if let Some(hook) = &self.before_wait {
+            let hook = hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let stopped = || WriteError::Task("書き込みスレッドが停止しています");
         match gone {
             None => answer.recv().map_err(|_| stopped())?,
             Some((deadline, gone)) => {
                 match answer.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
-                    Ok(result) => result,
+                    // 返信が溜まっていても、受け取ったのが期限のあとなら成功として返さない（待つ側が
+                    // 受け取る前に停止して期限を過ぎると、`recv_timeout` は溜まった返信を返せる）。
+                    // 書き込みは確定しているので、呼び出し側は Expired でも消費済みとして扱う
+                    Ok(result) => {
+                        if Instant::now() >= deadline {
+                            gone.store(true, Ordering::SeqCst);
+                            Err(WriteError::Expired)
+                        } else {
+                            result
+                        }
+                    }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
                         // まだ始まっていない依頼は実行されない。始まっていれば最後まで進む（巻き戻さない）
                         gone.store(true, Ordering::SeqCst);
@@ -586,6 +619,38 @@ mod tests {
         assert!(matches!(waiter.join().unwrap(), Err(WriteError::Expired)));
         release_tx.send(()).unwrap();
         w.call(|_| Ok(())).unwrap();
+        assert_eq!(count(&w), 1);
+    }
+
+    /// 書き込みスレッドが期限内に依頼を終えて返信を済ませていても、待つ側が受け取るのが期限後なら
+    /// 成功を返さない（`recv_timeout(0)` は溜まった返信を返せるので、受け取った結果の側でも期限を照合する）。
+    /// 順序は同期で固定する: 積む → 期限内に実行・返信 → 待つ直前で待つ側が停止し期限を過ぎる → 再開。
+    #[test]
+    fn call_within_does_not_return_a_buffered_success_after_the_deadline() {
+        let dir = TempDir::new("writer-within-buffered");
+        let w = writer(&dir);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let (ran_tx, ran_rx) = mpsc::channel::<()>();
+        let original = w.clone();
+        let paused = w.interrupt_before_next_wait(move || {
+            // 依頼が実行されたことを待ち、続けて同期の依頼を通す: 書き込みスレッドは 1 つずつ処理するので、
+            // これが戻った時点で先の依頼の返信は（受け手が居ない箱に）積まれている
+            ran_rx.recv().unwrap();
+            original.call(|_| Ok(())).unwrap();
+            // 期限を過ぎるまで、待つ側（このスレッド）を止める
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let err = paused
+            .call_within(deadline, move |c| {
+                let n = c.execute("INSERT INTO t(v) VALUES ('buffered')", [])?;
+                ran_tx.send(()).unwrap();
+                Ok(n)
+            })
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Expired), "{err:?}");
+        // 書き込み自体は期限内に始まって確定している。Expired でも消費は戻らない（保守的）
         assert_eq!(count(&w), 1);
     }
 

@@ -2,7 +2,8 @@
 //! （`now` の UNIX 秒）だけを使い、外部通信はしない。
 //!
 //! - スキーマ: 追加だけで既存の表・行・`ai_jobs` を変えない／冪等／旧 DB を読み取り専用で読める
-//! - 予約: UTC 日・周期窓・上限 0・競合・再起動・設定変更でも履歴を消さない・失敗しても巻き戻さない
+//! - 予約: UTC 日・ローリングの周期窓（周期長の変更・旧い固定窓の行でも消費を失わない）・上限 0・競合・再起動・
+//!   設定変更でも履歴を消さない・失敗しても巻き戻さない・掃除や再起動をまたぐ時計の巻き戻しを拒否
 //! - 対話的な予約: writer が塞がっていれば期限で戻り、期限切れの予約は実行されない
 //! - 停止: 理由コードの保持・再起動で解除されない・関係する設定変更だけで効かなくなる・ジョブに触れない
 
@@ -289,38 +290,291 @@ fn the_daily_limit_is_exact_and_resets_only_at_the_next_utc_day() {
         d.reserve(JUDGE, b, D0 + DAY - 1),
         Reservation::DailyExhausted
     );
+    // 用途ごとに別の枠
+    assert_eq!(
+        d.reserve(TaskKind::LocationSuggest, b, D0 + DAY - 1),
+        Reservation::Granted
+    );
+    assert_eq!(d.usage(JUDGE, D0 + 10, 60).day, 3);
     // 日を跨ぐと別の日の枠（前の日の件数は残る）
     assert_eq!(d.reserve(JUDGE, b, D0 + DAY), Reservation::Granted);
     assert_eq!(d.usage(JUDGE, D0 + DAY, 60).day, 1);
     assert_eq!(d.usage(JUDGE, D0 + DAY - 1, 60).day, 3);
-    // 用途ごとに別の枠
-    assert_eq!(
-        d.reserve(TaskKind::LocationSuggest, b, D0 + 10),
-        Reservation::Granted
-    );
-    assert_eq!(d.usage(JUDGE, D0 + 10, 60).day, 3);
+}
+
+fn cycle_rows(d: &Db) -> i64 {
+    d.writer
+        .call(|c| {
+            c.query_row(
+                "SELECT COUNT(*) FROM ai_request_usage WHERE scope='cycle'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap()
 }
 
 #[test]
-fn the_cycle_window_limits_and_a_denied_reservation_consumes_nothing() {
+fn the_cycle_window_rolls_and_a_denied_reservation_consumes_nothing() {
     let d = db("budget-cycle");
     let b = budget(100, 2, 60);
     assert_eq!(d.reserve(JUDGE, b, D0), Reservation::Granted);
     assert_eq!(d.reserve(JUDGE, b, D0 + 59), Reservation::Granted);
-    assert_eq!(d.reserve(JUDGE, b, D0 + 30), Reservation::CycleExhausted);
+    // 直近 60 秒に 2 件: 窓の境目をまたいでも 3 件目は通らない（固定窓の倍の突破を作らない）
+    assert_eq!(d.reserve(JUDGE, b, D0 + 59), Reservation::CycleExhausted);
     // 拒否では日の枠も周期窓も増えない
-    assert_eq!(d.usage(JUDGE, D0, 60), Usage { day: 2, cycle: 2 });
-    // 次の窓は新しい枠（日の件数は積み上がる）
+    assert_eq!(d.usage(JUDGE, D0 + 59, 60), Usage { day: 2, cycle: 2 });
+    assert_eq!(cycle_rows(&d), 2);
+    // 予約から丁度 60 秒で窓から外れる（D0 の分だけ）
+    assert_eq!(d.usage(JUDGE, D0 + 59, 60).cycle, 2);
+    assert_eq!(d.usage(JUDGE, D0 + 60, 60).cycle, 1);
     assert_eq!(d.reserve(JUDGE, b, D0 + 60), Reservation::Granted);
-    assert_eq!(d.usage(JUDGE, D0 + 60, 60), Usage { day: 3, cycle: 1 });
+    assert_eq!(d.usage(JUDGE, D0 + 60, 60), Usage { day: 3, cycle: 2 });
+    assert_eq!(d.reserve(JUDGE, b, D0 + 60), Reservation::CycleExhausted);
 
     // 日の枠が尽きたときの拒否は、周期窓を消費しない
+    let rows = cycle_rows(&d);
     let tight = budget(3, 10, 60);
     assert_eq!(
-        d.reserve(JUDGE, tight, D0 + 120),
+        d.reserve(JUDGE, tight, D0 + 200),
         Reservation::DailyExhausted
     );
-    assert_eq!(d.usage(JUDGE, D0 + 120, 60).cycle, 0);
+    assert_eq!(d.usage(JUDGE, D0 + 200, 60).cycle, 0);
+    assert_eq!(cycle_rows(&d), rows);
+    // 用途ごとに別の枠
+    assert_eq!(
+        d.reserve(TaskKind::LocationSuggest, b, D0 + 200),
+        Reservation::Granted
+    );
+    assert_eq!(d.usage(JUDGE, D0 + 200, 60).cycle, 0);
+}
+
+/// 周期の長さを同じ時刻に変えても、窓の中で使った分は数え直されない（短くしても長くしても）。
+/// 日の上限には十分な余裕を残し、周期窓だけが効いていることを確かめる。
+#[test]
+fn changing_the_cycle_length_never_restores_a_spent_cycle_slot() {
+    let t = D0 + 100;
+    for (first, then) in [(60, 120), (120, 60), (60, 30), (30, 60), (60, 86_400)] {
+        let d = db("budget-cycle-len");
+        assert_eq!(
+            d.reserve(JUDGE, budget(100, 1, first), t),
+            Reservation::Granted,
+            "{first}->{then}"
+        );
+        // 同時刻に周期の長さだけ変える: 復活しない
+        assert_eq!(
+            d.reserve(JUDGE, budget(100, 1, then), t),
+            Reservation::CycleExhausted,
+            "{first}->{then}"
+        );
+        // 元の長さに戻しても同じ
+        assert_eq!(
+            d.reserve(JUDGE, budget(100, 1, first), t),
+            Reservation::CycleExhausted
+        );
+        assert_eq!(d.usage(JUDGE, t, then), Usage { day: 1, cycle: 1 });
+        // 再起動をまたいでも
+        let d = d.restart();
+        assert_eq!(
+            d.reserve(JUDGE, budget(100, 1, then), t + 1),
+            Reservation::CycleExhausted
+        );
+    }
+    // 窓が明けるのは設定した長さの経過後。長い設定へ変えると明けるのも遅くなる（使った時刻から数える）
+    let d = db("budget-cycle-len-expiry");
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, 60), t),
+        Reservation::Granted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, 120), t + 60),
+        Reservation::CycleExhausted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, 120), t + 119),
+        Reservation::CycleExhausted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, 60), t + 59),
+        Reservation::CycleExhausted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, 60), t + 60),
+        Reservation::Granted
+    );
+    // 周期の上限だけを上げれば、使った分を差し引いた残りが使える
+    let d = db("budget-cycle-limit");
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, 60), t),
+        Reservation::Granted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 3, 60), t),
+        Reservation::Granted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 3, 60), t),
+        Reservation::Granted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 3, 60), t),
+        Reservation::CycleExhausted
+    );
+    // 窓の長さが 0 は 1 秒、とても長い値は 1 日として扱う（溢れない・外れない）
+    let d = db("budget-cycle-len-edge");
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, u32::MAX), t),
+        Reservation::Granted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, u32::MAX), t + 86_399),
+        Reservation::CycleExhausted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, u32::MAX), t + 86_400),
+        Reservation::Granted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, 0), t + 86_400),
+        Reservation::CycleExhausted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 1, 0), t + 86_401),
+        Reservation::Granted
+    );
+}
+
+/// 以前の固定窓の行（`window_start` が窓の始まり）も、最後に足した時刻の予約として消費に数える。
+/// 周期長の変更と組み合わせても、使った分は失われず、スキーマの追加（移行）でも書き換えない。
+#[test]
+fn rows_written_by_the_fixed_window_scheme_still_count_and_are_not_rewritten() {
+    let d = db("budget-legacy-rows");
+    // 固定窓の方式が書いた行: 周期 60 の窓 [D0+60, D0+120) に 2 件（最後は D0+100）と、UTC 日の 3 件
+    d.writer
+        .call(|c| {
+            c.execute_batch(&format!(
+                "INSERT INTO ai_request_usage VALUES
+                   ('photo_judge','day',{D0},3,{u}),
+                   ('photo_judge','cycle',{w},2,{u}),
+                   ('query_embedding','cycle',{w},1,{u})",
+                u = D0 + 100,
+                w = D0 + 60
+            ))
+        })
+        .unwrap();
+    let rows = |d: &Db| -> Vec<String> {
+        d.writer
+            .call(|c| {
+                c.prepare("SELECT task||scope||window_start||':'||count||':'||updated_at FROM ai_request_usage ORDER BY 1")?
+                    .query_map([], |r| r.get(0))?
+                    .collect()
+            })
+            .unwrap()
+    };
+    let before = rows(&d);
+    // スキーマの追加（再実行）は何も書き換えない
+    assert!(d.writer.call(super::migrate).unwrap().is_empty());
+    assert_eq!(rows(&d), before);
+
+    // 日の枠が尽きている（3/3）: 周期長を何にしても通らない
+    for secs in [30, 60, 120] {
+        assert_eq!(
+            d.reserve(JUDGE, budget(3, 100, secs), D0 + 100),
+            Reservation::DailyExhausted
+        );
+    }
+    // 日に余裕があっても、周期窓の 2 件は D0+100 に数える: 周期長を 60 → 120 に変えても復活しない
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 2, 60), D0 + 110),
+        Reservation::CycleExhausted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 2, 120), D0 + 110),
+        Reservation::CycleExhausted
+    );
+    assert_eq!(d.usage(JUDGE, D0 + 110, 120), Usage { day: 3, cycle: 2 });
+    // 保守的に最後の時刻から数えるので、窓の始まりより 40 秒あとまで有効（60 秒窓で D0+160 に外れる）
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 2, 60), D0 + 159),
+        Reservation::CycleExhausted
+    );
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 2, 60), D0 + 160),
+        Reservation::Granted
+    );
+    // 別の用途の行は、その用途のまま
+    assert_eq!(d.usage(TaskKind::QueryEmbedding, D0 + 110, 60).cycle, 1);
+}
+
+/// 別の用途の予約が古い周期窓の行を掃除したあとで時計を戻しても、使った枠は復活しない（再起動をまたいでも）。
+#[test]
+fn a_clock_set_back_after_cleanup_cannot_restore_spent_slots() {
+    let d = db("budget-rewind");
+    let b = budget(100, 1, 60);
+    let t = D0 + 100;
+    assert_eq!(d.reserve(JUDGE, b, t), Reservation::Granted);
+    // 3 日後に別の用途が予約し、2 日より古い周期窓の行（JUDGE の分）が掃除される
+    let later = D0 + 3 * DAY;
+    assert_eq!(
+        d.reserve(TaskKind::LocationSuggest, b, later),
+        Reservation::Granted
+    );
+    assert_eq!(cycle_rows(&d), 1, "JUDGE の古い周期窓の行は掃除済み");
+    let snapshot = |d: &Db| -> Vec<String> {
+        d.writer
+            .call(|c| {
+                c.prepare("SELECT task||scope||window_start||':'||count||':'||updated_at FROM ai_request_usage ORDER BY 1")?
+                    .query_map([], |r| r.get(0))?
+                    .collect()
+            })
+            .unwrap()
+    };
+    let before = snapshot(&d);
+
+    // 時計を元の時刻へ戻す: 周期窓（行が無い）も日の枠（その日の分は残っている）も作り直させない
+    assert_eq!(d.reserve(JUDGE, b, t), Reservation::ClockRewound);
+    assert_eq!(
+        d.reserve(JUDGE, budget(100, 5, 60), t),
+        Reservation::ClockRewound
+    );
+    assert_eq!(
+        d.reserve(TaskKind::PhotoJudge, b, later - 1),
+        Reservation::ClockRewound
+    );
+    assert_eq!(snapshot(&d), before, "拒否では何も書かない");
+    // 再起動をまたいでも、履歴の高水位から同じに拒否される
+    let d = d.restart();
+    assert_eq!(d.reserve(JUDGE, b, t), Reservation::ClockRewound);
+    assert_eq!(
+        d.reserve(TaskKind::ImageEmbedding, b, later - 1),
+        Reservation::ClockRewound
+    );
+    assert_eq!(snapshot(&d), before);
+    // 高水位と同じ時刻、以後の時刻は通常どおり（用途ごとの枠は別）
+    assert_eq!(
+        d.reserve(TaskKind::ImageEmbedding, b, later),
+        Reservation::Granted
+    );
+    assert_eq!(d.reserve(JUDGE, b, later + 1), Reservation::Granted);
+    // 上限 0 は DB を見ずに従来の拒否理由のまま
+    assert_eq!(
+        d.reserve(JUDGE, budget(0, 5, 60), t),
+        Reservation::DailyExhausted
+    );
+}
+
+/// 日の枠が尽きたあと、前の日へ時計を戻しても、その日の枠は作り直せない。
+#[test]
+fn a_clock_set_back_to_an_earlier_utc_day_is_refused() {
+    let d = db("budget-rewind-day");
+    let b = budget(1, 100, 60);
+    assert_eq!(d.reserve(JUDGE, b, D0 + 10), Reservation::Granted);
+    assert_eq!(d.reserve(JUDGE, b, D0 + DAY + 10), Reservation::Granted);
+    assert_eq!(
+        d.reserve(JUDGE, budget(5, 100, 60), D0 + 20),
+        Reservation::ClockRewound
+    );
+    assert_eq!(d.usage(JUDGE, D0 + 20, 60).day, 1);
 }
 
 #[test]
@@ -539,6 +793,30 @@ fn a_reservation_that_had_already_started_stays_consumed_after_the_waiter_left()
     // 始まっていた予約は最後まで走って確定する: 枠は消費済み（保守的）で、巻き戻らない
     release_tx.send(()).unwrap();
     d.writer.call(|c| c.execute_batch("SELECT 1")).unwrap();
+    assert_eq!(d.usage(JUDGE, D0, 60), Usage { day: 1, cycle: 1 });
+}
+
+/// 書き込みスレッドが期限内に予約を確定して返信しても、待つ側が受け取るのが期限後なら `Granted` を返さない
+/// （待つ側が受け取る直前で停止し、返信が溜まったまま期限を過ぎる順を同期で作る）。枠は消費済みのまま。
+#[test]
+fn a_reply_received_after_the_deadline_is_busy_not_granted() {
+    let d = db("budget-buffered-reply");
+    let b = budget(5, 5, 60);
+    let deadline = Instant::now() + Duration::from_millis(300);
+    let original = d.writer.clone();
+    let paused = d.writer.interrupt_before_next_wait(move || {
+        // 予約が確定したことを writer 経由で確かめる。この読み取りは予約の依頼のあとに処理されるので、
+        // 見えた時点で予約の返信は積まれている。そのあと期限を過ぎるまで待つ側を止める
+        while original.call(|c| usage(c, JUDGE, D0, 60)).unwrap().day == 0 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        while Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+    let outcome = reserve_interactive(Some(&paused), JUDGE, b, D0, deadline);
+    assert_eq!(outcome, Reservation::Busy);
+    assert!(!outcome.is_granted());
     assert_eq!(d.usage(JUDGE, D0, 60), Usage { day: 1, cycle: 1 });
 }
 

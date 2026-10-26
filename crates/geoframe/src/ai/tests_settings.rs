@@ -494,6 +494,8 @@ fn a_bad_legacy_env_value_disables_only_ai_and_never_echoes_the_value() {
         ("GEOFRAME_AI_POLL_S", "sentinel-9a1"),
         ("GEOFRAME_AI_POLL_S", "nan"),
         ("GEOFRAME_AI_POLL_S", "inf"),
+        ("GEOFRAME_AI_POLL_S", "-5"),
+        ("GEOFRAME_AI_POLL_S", "-0.5"),
         ("GEOFRAME_AI_EMBED_PER_CYCLE", "-1"),
         ("GEOFRAME_AI_EMBED_PER_CYCLE", "1.5"),
         ("GEOFRAME_AI_JUDGE_PER_CYCLE", "sentinel-9a1"),
@@ -545,8 +547,8 @@ fn legacy_env_values_map_to_cycle_limits() {
     assert_eq!(l.cycle(TaskKind::LocationClue), (40, 46));
     assert_eq!(l.cycle(TaskKind::LocationSuggest), (5, 46));
     assert_eq!(l.poll().as_secs_f64(), 45.5);
-    // 周期は 30 秒未満を 30 に切り上げる（現行の max(30, …)）。負でも
-    for raw in ["1", "0", "-5"] {
+    // 周期は 30 秒未満を 30 に切り上げる（現行の max(30, …)）。負は切り上げずに不正（上の試験）
+    for raw in ["1", "0", "0.5", "29.9"] {
         assert_eq!(
             env_config(&[("GEOFRAME_AI_POLL_S", raw)])
                 .legacy()

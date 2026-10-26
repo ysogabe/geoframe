@@ -225,7 +225,8 @@ impl fmt::Debug for TaskSettings {
     }
 }
 
-/// 画像と検索語に共通のベクトル空間の識別（接続契約の確定後に Provider の応答と照合する、検査済みのメタデータ）。
+/// 画像と検索語に共通のベクトル空間の識別（検査済みのメタデータ。形式を確かめただけで、モデルが実際にこの空間を
+/// 出力することも用途間の同一性も保証しない。それらは後続の SpaceIdentity が Provider の応答と照合する）。
 #[derive(Clone, PartialEq, Eq)]
 pub struct EmbeddingSpace {
     pub space_id: String,
@@ -789,6 +790,7 @@ impl Default for LegacyAi {
 
 impl LegacyAi {
     /// 環境変数から読む。数値が不正（数でない・負・有限でない）なら `None`（値は残さない）。
+    /// 周期は負だけを不正とし、0 や 30 未満の正値は 30 に切り上げる。
     /// フラグは現行と同じく `1` だけが有効。
     fn from_env(get: &dyn Fn(&str) -> Option<String>) -> Option<Self> {
         fn int(get: &dyn Fn(&str) -> Option<String>, key: &str, default: u32) -> Option<u32> {
@@ -803,7 +805,8 @@ impl LegacyAi {
                 .trim()
                 .parse::<f64>()
                 .ok()
-                .filter(|v| v.is_finite())?
+                // 負は不正（clamp の前に検査する。0 や小さな正値は 30 に切り上げる）
+                .filter(|v| v.is_finite() && *v >= 0.0)?
                 .clamp(MIN_AI_POLL_S, MAX_AI_POLL_S),
             None => DEFAULT_AI_POLL_S,
         };
@@ -953,6 +956,9 @@ impl AiConfig {
         if cycle_limit == 0 {
             return Err(Disabled::CycleLimitZero);
         }
+        // ここで確かめるのは `embedding_space` のメタデータが**書かれていること**だけ。この用途のモデルが
+        // その空間を実際に出力することの保証ではない（Provider の応答との照合・用途間の同一性の検査は、
+        // 後続の SpaceIdentity の責務。この gate を通っても、空間が一致するとは限らない）
         if matches!(task, TaskKind::ImageEmbedding | TaskKind::QueryEmbedding)
             && settings.embedding_space.is_none()
         {
@@ -1050,6 +1056,7 @@ pub struct Gate<'a> {
     pub embedding_space: Option<&'a EmbeddingSpace>,
     /// 1 周期の上限（LAN のワーカーの処理数にも、クラウドの周期窓にも使う）。
     pub cycle_limit: u32,
+    /// 周期窓（直近この秒数のローリング窓）の長さ。
     pub cycle_secs: u32,
     /// クラウドの用途だけ。送る直前に [`super::budget::reserve`] で枠を予約する。
     pub budget: Option<SendBudget>,
