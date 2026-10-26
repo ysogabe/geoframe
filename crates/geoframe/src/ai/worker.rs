@@ -736,6 +736,8 @@ impl AiWorker {
     /// 短いほどまで待ち（この間 token は有効で、有効な応答は確定される）、そのあと**最後の戻し**
     /// （[`jobs::release_for_shutdown`]）を共通期限つきで writer へ頼む。writer が忙しくても期限を越えて待たない。
     /// 終わらなかったスレッドは残り、`LockHold` をプロセスの終了まで持つ（2 つ目の書き手を作らない）。
+    /// 期限つきの依頼が writer で始まっていれば、writer スレッド自身も `LockHold` を持つ（`Writer::open_held`）ので、
+    /// この呼び出しや `Ingest` が先に終わっても、その SQL と接続の close が済むまでロックは外れない。
     /// スレッドが終わったかを返す。
     pub fn shutdown(
         self,

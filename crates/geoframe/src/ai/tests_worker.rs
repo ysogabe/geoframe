@@ -982,6 +982,47 @@ fn the_shutdown_never_waits_past_the_common_deadline_even_when_the_writer_is_bus
     assert_eq!(marked, None);
 }
 
+/// 回帰（T4.1c 修正3）: 停止の記録・最後の戻しの SQL が、別の接続に書き込みを握られて writer スレッドで
+/// 待っている。ワーカーも `Ingest` も（`Writer` の複製も）drop されたあとも、その SQL が終わって接続が閉じる
+/// まで `.ingest.lock` は外れない。writer スレッドがロックを持つので、依頼を出したスレッドの寿命には依らない。
+/// （書き込み中の SQL の開始を同期で捉える版は `ingest` の試験。ここは本番の配線 = worker の `deps.writer` が
+/// `Ingest::start` の writer であることを、停止の流れ全体で確かめる。）
+#[test]
+fn the_lock_survives_the_worker_and_ingest_while_the_stop_sql_waits_for_the_database() {
+    let mut e = env("stop-sql-lock");
+    let stop = StopFlag::with_budget(Duration::from_millis(400));
+    let started = startup(&e.config, &e.writer(), &e.clock()).unwrap();
+    let worker = spawn(e.deps(Vec::new(), &stop, &started.run_id));
+    let blocker = Connection::open(e.config.db_path()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    stop.stop();
+    let began = Instant::now();
+    let joined = worker.shutdown(&e.writer(), &stop, Duration::from_secs(10), &e.clock());
+    assert!(joined, "handler が無いワーカーのスレッドは終わる");
+    assert!(began.elapsed() < Duration::from_millis(1_500));
+
+    let lock_path = e.config.data_dir.join(".ingest.lock");
+    let lock_is_free = || {
+        let f = std::fs::File::options()
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        f.try_lock().is_ok()
+    };
+    // 外側（ワーカー・Ingest・Writer の複製）を全て手放す
+    drop(e.ingest.take());
+    assert!(!lock_is_free(), "SQL が待っているのにロックが外れた");
+
+    blocker.execute_batch("ROLLBACK").unwrap();
+    drop(blocker);
+    let limit = Instant::now() + Duration::from_secs(20);
+    while !lock_is_free() {
+        assert!(Instant::now() < limit, "ロックが外れない");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 // ---------------------------------------------------------------- 起動の回収
 
 #[test]

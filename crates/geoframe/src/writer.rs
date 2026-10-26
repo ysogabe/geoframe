@@ -27,6 +27,10 @@
 //!   いたものも）は実行せずに同じ [`WriteError::Task`] を返す。開いたままのトランザクションを次の依頼が
 //!   引き継いで、後続の `COMMIT` で前の依頼の行まで確定する事故を防ぐ。再接続はしない（再起動で直る）。
 //! - 全ての `Writer` が drop されるとスレッドが終わり、接続が閉じる（WAL がチェックポイントされる）。
+//! - [`Writer::open_held`] で渡したもの（取り込みでは `.ingest.lock` の所有権）は**書き込みスレッドが持ち**、
+//!   スレッドが終わるとき、接続を閉じ終わってから手放す（正常終了・後始末の失敗・スレッドのパニックのどれでも）。
+//!   `Writer` の側（送る側）は持たないので、依頼の呼び出し側（期限で去ったスレッド・drop 済みの `Ingest`）の
+//!   寿命とは無関係に、始まった SQL・後始末・接続の close が終わるまでロックが残る。
 //!
 //! # 期限つきの依頼
 //!
@@ -154,20 +158,38 @@ impl fmt::Debug for Writer {
 impl Writer {
     /// 接続を開き、書き込みスレッドを起動する。開けないときはここで失敗する（スレッドは作らない）。
     pub fn open(path: &Path, mode: OpenMode) -> Result<Self, WriteError> {
-        let conn = open_read_write(path, mode).map_err(WriteError::Open)?;
-        Ok(Self::spawn(conn))
+        Self::open_held(path, mode, ())
     }
 
-    fn spawn(conn: Connection) -> Self {
-        Self::spawn_with(conn, rollback_and_verify)
+    /// [`Writer::open`] に、**書き込みスレッドの寿命いっぱい持つもの**（`.ingest.lock` の
+    /// [`crate::ingest::LockHold`] など）を渡す形。取り込みの本番の経路はこちらだけを使う。
+    ///
+    /// `held` は書き込みスレッドが所有し、スレッドが終わる（全ての `Writer` の drop・後始末の失敗・
+    /// スレッド自身のパニック）とき、**SQLite の接続を閉じ終わってから**手放す。期限つきの依頼
+    /// （[`Writer::call_within`]）の呼び出し側が期限で去っても、始まった SQL・後始末・接続の close が
+    /// 済むまでは手放されない。`Writer`（送る側）は `held` を持たない（受け取る側が `held` を持つので、
+    /// 持ち合う循環にならず、全ての `Writer` の drop でスレッドが終わる）。開けないときは `held` は
+    /// ここで捨てられる。
+    pub fn open_held(
+        path: &Path,
+        mode: OpenMode,
+        held: impl Send + 'static,
+    ) -> Result<Self, WriteError> {
+        let conn = open_read_write(path, mode).map_err(WriteError::Open)?;
+        Ok(Self::spawn_with(conn, rollback_and_verify, held))
     }
 
     /// 後始末を差し替えられる形（故障注入の試験用に分けてある）。
-    fn spawn_with(mut conn: Connection, cleanup: Cleanup) -> Self {
+    fn spawn_with(conn: Connection, cleanup: Cleanup, held: impl Send + 'static) -> Self {
         let (jobs, inbox) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("db-writer".into())
             .spawn(move || {
+                // 宣言の逆順に手放す: 接続（close）→ 残った依頼 → `held`。閉包の捕捉のままでは drop の順が
+                // 決まらないので、本体の局所変数に移して順を固定する。パニックの巻き戻しでも同じ順
+                let held = held;
+                let inbox = inbox;
+                let mut conn = conn;
                 // 全ての Writer が drop されると recv が Err になり、スレッドが終わる
                 while let Ok(job) = inbox.recv() {
                     let reply = job(&mut conn);
@@ -181,6 +203,9 @@ impl Writer {
                         break;
                     }
                 }
+                drop(conn);
+                drop(inbox);
+                drop(held);
             })
             .expect("書き込みスレッドを起動できません");
         Self {
@@ -314,6 +339,43 @@ impl Writer {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    /// `open_held` に渡す試験用の持ち物。手放されたとき、そのときの `-wal` の有無（接続が閉じ終わって
+    /// いれば、最後の接続の close でチェックポイントされて消えている）を知らせる。
+    struct Probe {
+        wal: std::path::PathBuf,
+        dropped: mpsc::Sender<bool>,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(self.wal.exists());
+        }
+    }
+
+    /// WAL 付きの空き DB（表 `t`）を、接続を全て閉じた状態で用意する。
+    fn prepared_db(dir: &TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("w.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        drop(conn);
+        path
+    }
+
+    fn probe(path: &Path) -> (Probe, mpsc::Receiver<bool>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Probe {
+                wal: path.with_extension("db-wal"),
+                dropped: tx,
+            },
+            rx,
+        )
+    }
+
+    const SETTLE: Duration = Duration::from_secs(20);
 
     fn writer(dir: &TempDir) -> Writer {
         let w = Writer::open(&dir.path().join("w.db"), OpenMode::CreateIfMissing).unwrap();
@@ -490,6 +552,7 @@ mod tests {
         let w = Writer::spawn_with(
             open_read_write(&path, OpenMode::MustExist).unwrap(),
             |conn| conn.is_autocommit(),
+            (),
         );
         // 失敗するジョブ: BEGIN して行を入れ、エラーで戻る（コミットしない）
         let err = w
@@ -690,7 +753,7 @@ mod tests {
     fn call_within_on_a_stopped_writer_reports_task_not_success() {
         let dir = TempDir::new("writer-within-stopped");
         let conn = Connection::open(dir.path().join("w.db")).unwrap();
-        let w = Writer::spawn_with(conn, |_| false);
+        let w = Writer::spawn_with(conn, |_| false, ());
         let deadline = Instant::now() + Duration::from_secs(30);
         assert!(matches!(
             w.call_within(deadline, |_| Ok(1)),
@@ -707,9 +770,125 @@ mod tests {
     fn a_successful_job_is_not_reported_when_cleanup_fails() {
         let dir = TempDir::new("writer-cleanup-fail");
         let conn = Connection::open(dir.path().join("w.db")).unwrap();
-        let w = Writer::spawn_with(conn, |_| false);
+        let w = Writer::spawn_with(conn, |_| false, ());
         let err = w.call(|_| Ok(1)).unwrap_err();
         assert!(matches!(err, WriteError::Task(_)));
         assert!(matches!(w.call(|_| Ok(2)), Err(WriteError::Task(_))));
+    }
+    // ------------------------------------------------------------ 書き込みスレッドが持つもの（open_held）
+
+    /// 別の接続が書き込みを握っていて、期限つきの依頼の SQL が待っている。呼び出し側は期限で去り、外側の
+    /// `Writer` を全て drop しても、始まった SQL・後始末・接続の close が終わるまで持ち物は手放されない。
+    #[test]
+    fn held_value_outlives_every_outer_writer_until_the_started_job_and_close_finish() {
+        let dir = TempDir::new("writer-held-stuck");
+        let path = prepared_db(&dir);
+        let (probe, dropped) = probe(&path);
+        let w = Writer::open_held(&path, OpenMode::MustExist, probe).unwrap();
+
+        // 別の接続が書き込みを握る（writer の INSERT は busy で待つ）
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let waiter = {
+            let w = w.clone();
+            thread::spawn(move || {
+                w.call_within(Instant::now() + Duration::from_millis(150), move |c| {
+                    started_tx.send(()).unwrap();
+                    c.execute("INSERT INTO t(v) VALUES ('stuck')", [])?;
+                    // blocker の接続を閉じ終えるまで、依頼を終えない（close の順序を固定する）
+                    let _ = proceed_rx.recv();
+                    Ok(())
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(matches!(waiter.join().unwrap(), Err(WriteError::Expired)));
+        drop(w);
+        // 外側が全ていなくなっても、SQL は待ったまま: 持ち物は手放されていない
+        assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        // 解放: 元の SQL が終わる。ここから先も、依頼・後始末・close が済むまでは手放されない
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        proceed_tx.send(()).unwrap();
+        let wal_left = dropped.recv_timeout(SETTLE).unwrap();
+        assert!(!wal_left, "接続を閉じ終わる前に持ち物を手放した");
+        let check = Connection::open(&path).unwrap();
+        let n: i64 = check
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "始まっていた依頼は最後まで確定する");
+    }
+
+    /// パニックした依頼を含めて、全ての `Writer` が drop されるまでは持ち続け、drop のあと接続を閉じてから手放す。
+    #[test]
+    fn held_value_is_kept_while_any_writer_lives_and_released_after_close() {
+        let dir = TempDir::new("writer-held-normal");
+        let path = prepared_db(&dir);
+        let (probe, dropped) = probe(&path);
+        let w = Writer::open_held(&path, OpenMode::MustExist, probe).unwrap();
+        w.call(|c| c.execute("INSERT INTO t(v) VALUES ('a')", []))
+            .unwrap();
+        let w2 = w.clone();
+        assert!(w.call::<(), _>(|_| panic!("job")).is_err());
+        drop(w);
+        w2.call(|c| c.execute("INSERT INTO t(v) VALUES ('b')", []))
+            .unwrap();
+        assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(w2);
+        assert!(!dropped.recv_timeout(SETTLE).unwrap());
+    }
+
+    /// 後始末の失敗でスレッドが止まる経路でも、接続を閉じてから持ち物を手放す（キューに残った依頼は実行されない）。
+    #[test]
+    fn held_value_is_released_after_close_when_cleanup_stops_the_writer() {
+        let dir = TempDir::new("writer-held-cleanup");
+        let path = prepared_db(&dir);
+        let (probe, dropped) = probe(&path);
+        let w = Writer::spawn_with(
+            open_read_write(&path, OpenMode::MustExist).unwrap(),
+            |_| false,
+            probe,
+        );
+        let err = w
+            .call(|c| c.execute("INSERT INTO t(v) VALUES ('a')", []))
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Task(_)), "{err:?}");
+        // `w` はまだ生きているが、スレッドは止まって持ち物を手放す
+        assert!(!dropped.recv_timeout(SETTLE).unwrap());
+        drop(w);
+    }
+
+    /// 書き込みスレッド自身がパニックしても（巻き戻しで）接続の close のあとに手放す。
+    #[test]
+    fn held_value_is_released_after_close_when_the_writer_thread_panics() {
+        let dir = TempDir::new("writer-held-panic");
+        let path = prepared_db(&dir);
+        let (probe, dropped) = probe(&path);
+        let w = Writer::spawn_with(
+            open_read_write(&path, OpenMode::MustExist).unwrap(),
+            |_| panic!("cleanup"),
+            probe,
+        );
+        assert!(
+            w.call(|c| c.execute("INSERT INTO t(v) VALUES ('a')", []))
+                .is_err()
+        );
+        assert!(!dropped.recv_timeout(SETTLE).unwrap());
+        drop(w);
+    }
+
+    /// 接続を開けなかったときは、スレッドを作らずその場で手放す。
+    #[test]
+    fn held_value_is_dropped_when_the_open_fails() {
+        let dir = TempDir::new("writer-held-open");
+        let path = dir.path().join("none.db");
+        let (probe, dropped) = probe(&path);
+        assert!(Writer::open_held(&path, OpenMode::MustExist, probe).is_err());
+        assert!(dropped.try_recv().is_ok());
     }
 }
