@@ -287,7 +287,7 @@ pub fn unix_now() -> i64 {
 
 // ---------------------------------------------------------------- 表の作成
 
-fn object_exists(conn: &Connection, kind: &str, name: &str) -> rusqlite::Result<bool> {
+pub(super) fn object_exists(conn: &Connection, kind: &str, name: &str) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT 1 FROM sqlite_master WHERE type=?1 AND name=?2",
         [kind, name],

@@ -171,7 +171,7 @@ fn dry_run_writes_nothing_and_reports_counts() {
     assert!(stdout.contains("dry-run: 何も書きません"), "{stdout}");
     assert!(
         stdout.contains(
-            "スキーマ: 作る表・索引 2 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
+            "スキーマ: 作る表・索引 4 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
         ),
         "{stdout}"
     );
@@ -308,8 +308,8 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
             |r| r.get(0),
         )
         .unwrap();
-    // Python と同じ 11 表と、P4 のジョブ表 `ai_jobs`
-    assert_eq!(tables, 12);
+    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`
+    assert_eq!(tables, 14);
 }
 
 #[test]
@@ -321,9 +321,9 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     envs.push(("GEOFRAME_INGEST", "1".into()));
     let out = run_owned(&["sync", "--data-dir", dir.0.to_str().unwrap()], &envs);
     assert!(out.status.success(), "{}", text(&out.stdout));
-    // 本番相当の DB に足されるのは P4 のジョブ表（`ai_jobs` と索引）だけ。ほかの表・列は変えない
+    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止）だけ。ほかの表・列は変えない
     assert!(
-        text(&out.stdout).contains("スキーマを更新しました: 作成 2件 / 列の追加 0件"),
+        text(&out.stdout).contains("スキーマを更新しました: 作成 4件 / 列の追加 0件"),
         "{}",
         text(&out.stdout)
     );
@@ -360,10 +360,17 @@ fn free_port() -> u16 {
 }
 
 fn get_healthz(port: u16) -> Option<String> {
+    get(port, "/healthz")
+}
+
+fn get(port: u16, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .ok()?;
     let mut body = String::new();
     stream.read_to_string(&mut body).ok()?;
@@ -371,6 +378,16 @@ fn get_healthz(port: u16) -> Option<String> {
 }
 
 fn serve(data: &Path, port: u16, ingest: Option<(&str, &Staging)>) -> Child {
+    serve_with_env(data, port, ingest, &[])
+}
+
+/// `extra` は追加の環境変数（AI の設定など）。
+fn serve_with_env(
+    data: &Path,
+    port: u16,
+    ingest: Option<(&str, &Staging)>,
+    extra: &[(&str, &str)],
+) -> Child {
     let mut command = Command::new(BIN);
     command
         .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
@@ -381,6 +398,7 @@ fn serve(data: &Path, port: u16, ingest: Option<(&str, &Staging)>) -> Child {
     if let Some((value, staging)) = ingest {
         command.env("GEOFRAME_INGEST", value).envs(staging.envs());
     }
+    command.envs(extra.iter().copied());
     command.spawn().unwrap()
 }
 
@@ -519,6 +537,150 @@ fn serve_with_ingest_creates_the_database_runs_the_cycle_and_stops_cleanly() {
     assert!(data.join("tmp").is_dir());
     // ログに値は出ない（パス以外の個別の値が無いことの確認として、データ置き場以外のパスを出していない）
     assert!(!stdout.contains(".cache.json"), "{stdout}");
+}
+
+/// 目印（ログに出てはいけない文字列）を入れた、不正な AI 設定ファイルを置く。
+const AI_SENTINEL_KEY: &str = "sentinel-key-4c1f";
+const AI_SENTINEL_VALUE: &str = "sentinel-value-93ab";
+
+fn broken_ai_config(dir: &Dir, body: &str) -> PathBuf {
+    let path = dir.0.join("sentinel-ai-path-5e72.json");
+    fs::write(&path, body).unwrap();
+    path
+}
+
+/// AI の設定が不正でも（JSON・旧環境変数の数値のどちらでも）、写真の配信は動く: 起動して `/healthz` と
+/// フィード（`/api/v1/photos`）に答え、ログには種類のコードだけが出る（パス・中身・値は出ない）。
+/// 取り込みが無効なので DB にも書かない。
+#[test]
+fn serve_with_a_broken_ai_config_still_serves_health_and_the_feed() {
+    type LegacyEnv = Option<(&'static str, &'static str)>;
+    let cases: [(&str, &str, LegacyEnv); 4] = [
+        // (本文, 期待するコード, 追加の旧環境変数)
+        (
+            r#"{"version":1,"sentinel-key-4c1f":"sentinel-value-93ab"}"#,
+            "unknown_key",
+            None,
+        ),
+        (
+            r#"{"version":1,"version":1,"x":"sentinel-value-93ab"}"#,
+            "duplicate_key",
+            None,
+        ),
+        (
+            r#"{"version":1 "sentinel-key-4c1f":"sentinel-value-93ab""#,
+            "syntax",
+            None,
+        ),
+        // JSON は正しくても、旧設定の数値が不正なら AI だけ無効
+        (
+            r#"{"version":1}"#,
+            "legacy_env",
+            Some(("GEOFRAME_AI_POLL_S", "sentinel-value-93ab")),
+        ),
+    ];
+    for (n, (body, code, legacy)) in cases.into_iter().enumerate() {
+        let dir = Dir::new(&format!("serve-ai-broken-{n}"));
+        production_shaped_db(&dir.0);
+        let config = broken_ai_config(&dir, body);
+        let before = snapshot(&dir.0);
+        let mut extra = vec![("GEOFRAME_AI_CONFIG", config.to_str().unwrap())];
+        extra.extend(legacy);
+        let port = free_port();
+        let mut child = serve_with_env(&dir.0, port, None, &extra);
+        wait_healthy(&mut child, port);
+        let feed = get(port, "/api/v1/photos").expect("フィードに答えない");
+        assert!(feed.starts_with("HTTP/1.1 200"), "{code}: {feed}");
+        assert!(
+            feed.contains("\"file\":\"derivatives/a.jpg\""),
+            "{code}: {feed}"
+        );
+        let (status, stdout) = terminate(child);
+        assert!(status.success(), "{stdout}");
+        assert!(
+            stdout.contains(&format!("ai=invalid:{code}")),
+            "{code}: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("AI の設定が不正です（種類: {code}）")),
+            "{code}: {stdout}"
+        );
+        for secret in [AI_SENTINEL_KEY, AI_SENTINEL_VALUE, "sentinel-ai-path-5e72"] {
+            assert!(!stdout.contains(secret), "{code}: {stdout}");
+        }
+        assert_eq!(snapshot(&dir.0), before, "{code}");
+    }
+}
+
+/// 取り込みが有効なときも、不正な AI 設定で起動は止まらない。追加の AI 表（送信予算・Provider 停止）は
+/// 取り込みの起動で足され、2 回目の起動では何も作らない。有効な設定は起動時にネットワーク・認証ファイル
+/// （ここでは存在しないパス）に触れず、予約アドレスの入口・クラウド許可があっても起動する。
+#[test]
+fn serve_with_ingest_adds_the_ai_tables_once_and_never_needs_the_network_or_credentials() {
+    let dir = Dir::new("serve-ai-ingest");
+    let data = dir.0.join("data");
+    let staging = Staging::new("serve-ai-ingest");
+    let valid = dir.0.join("ai-valid.json");
+    fs::write(
+        &valid,
+        format!(
+            r#"{{"version":1,"local_base_url":"http://192.0.2.10:8100","tasks":{{
+              "location_clue":{{"provider":"local","model":"example-decision"}},
+              "photo_judge":{{"provider":"cloud","model":"example-judge","allow_cloud":true,
+                "daily_request_limit":10,"credential_path":"{}/no-such-credentials.json",
+                "project":"example-project","region":"example-region1"}}}}}}"#,
+            dir.0.display()
+        ),
+    )
+    .unwrap();
+    let broken = broken_ai_config(&dir, r#"{"version":"sentinel-value-93ab"}"#);
+
+    for (round, (config, expected)) in [
+        (&valid, "ai=ready:tasks=2"),
+        (&broken, "ai=invalid:bad_value"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let port = free_port();
+        let mut child = serve_with_env(
+            &data,
+            port,
+            Some(("1", &staging)),
+            &[("GEOFRAME_AI_CONFIG", config.to_str().unwrap())],
+        );
+        wait_healthy(&mut child, port);
+        let (status, stdout) = terminate(child);
+        assert!(status.success(), "{stdout}");
+        assert!(stdout.contains(expected), "{stdout}");
+        if round == 0 {
+            assert!(stdout.contains("[db] スキーマを更新しました"), "{stdout}");
+        } else {
+            // 2 回目: AI の表は作らない（何も更新しない）
+            assert!(stdout.contains("[db] スキーマは最新です"), "{stdout}");
+        }
+        for secret in [
+            AI_SENTINEL_VALUE,
+            "no-such-credentials",
+            "192.0.2.10",
+            "example-judge",
+            "example-project",
+            "ai-valid.json",
+        ] {
+            assert!(!stdout.contains(secret), "{stdout}");
+        }
+    }
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    for table in ["ai_jobs", "ai_request_usage", "ai_provider_pauses"] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "{table}");
+    }
 }
 
 #[test]

@@ -50,34 +50,28 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+use crate::ai::settings::AiConfig;
+
 pub const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_DATA_DIR: &str = "var";
 pub const DB_FILE_NAME: &str = "catalog.db";
 
-/// P2 以降で読む `GEOFRAME_*`（現行の `config.py` にある項目）。P1 では**読まず、警告も出さない**。
+/// まだ読まない `GEOFRAME_*`（現行の `config.py` にある項目）。**読まず、警告も出さない**。
 /// `docs/reference/configuration.md` の項目がここか [`SUPPORTED_ENV`] のどちらかに載っているかを
 /// テストで確かめている（Python 側で項目が増えたのに Rust の分類が漏れるのを防ぐ）。
 pub const UNSUPPORTED_ENV: &[&str] = &[
-    // P4: AI・位置候補
-    "GEOFRAME_AI_ENABLED",
-    "GEOFRAME_AI_EMBED_PER_CYCLE",
-    "GEOFRAME_AI_JUDGE_PER_CYCLE",
-    "GEOFRAME_AI_POLL_S",
+    // P4: AI・位置候補（後続のタスク。周期・上限・フラグは T4.1b から `SUPPORTED_ENV`）
     "GEOFRAME_AI_TIME_WINDOW_MIN",
     "GEOFRAME_AI_SIMILARITY",
     "GEOFRAME_AI_VISUAL_SIMILARITY",
     "GEOFRAME_AI_SHORTLIST_MAX",
     "GEOFRAME_AI_JUDGE_SHUFFLE_RATE",
-    "GEOFRAME_AI_SEARCH_PER_MIN",
     "GEOFRAME_LOCAL_EMBED_MODEL_DIR",
     "GEOFRAME_LOCAL_EMBED_THREADS",
     "GEOFRAME_RANK_MODEL",
-    "GEOFRAME_LOC_SUGGEST",
     "GEOFRAME_DECISION_URL",
     "GEOFRAME_LOC_SUGGEST_MODEL",
-    "GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE",
-    "GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE",
 ];
 
 /// P1 で読む `GEOFRAME_*`（`GEOFRAME_LOG` は Rust だけの項目なので Python の一覧には無い）。
@@ -106,6 +100,16 @@ pub const SUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_INFER_OFFSET_MIN",
     // T2.6: 簡易品質
     "GEOFRAME_QUALITY_PER_CYCLE",
+    // T4.1b: AI の周期・上限・フラグ（`ai::settings::LegacyAi`）。新しい呼び出しの routing は
+    // `GEOFRAME_AI_CONFIG`（Rust だけの項目）の JSON で、旧 `GEOFRAME_DECISION_URL`・`GEOFRAME_LOC_SUGGEST_MODEL` は読まない
+    "GEOFRAME_AI_ENABLED",
+    "GEOFRAME_AI_POLL_S",
+    "GEOFRAME_AI_EMBED_PER_CYCLE",
+    "GEOFRAME_AI_JUDGE_PER_CYCLE",
+    "GEOFRAME_AI_SEARCH_PER_MIN",
+    "GEOFRAME_LOC_SUGGEST",
+    "GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE",
+    "GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE",
 ];
 
 pub const DEFAULT_INFER_MIN: f64 = 15.0;
@@ -256,6 +260,9 @@ pub struct Config {
     /// `None` のときはバイナリに埋め込んだ `app/travel_blog/plans/*.json`（現行の `PLAN_DIR` と同じ内容）。
     /// 旅程の中身は利用者の情報なので、パスもログの要約には載せない（埋め込みかディレクトリかだけ）。
     pub blog_plans_dir: Option<PathBuf>,
+    /// AI の設定（T4.1b）。旧 `GEOFRAME_AI_*` の周期・上限・フラグと、任意の `GEOFRAME_AI_CONFIG`（JSON）。
+    /// **不正でも `Config` は作れる**（AI だけが無効で、種類のコードを持つ）。パス・JSON の中身は載せない。
+    pub ai: AiConfig,
 }
 
 impl Config {
@@ -474,6 +481,7 @@ impl Config {
             drive_key,
             drive_folder,
             blog_plans_dir,
+            ai: AiConfig::load(&get),
         })
     }
 
@@ -530,7 +538,7 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} blog_plans={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} blog_plans={} ai={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
@@ -549,6 +557,7 @@ impl Config {
             } else {
                 "embedded"
             },
+            self.ai.summary(),
         )
     }
 }

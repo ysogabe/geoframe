@@ -81,6 +81,7 @@ P1の検証の記録は[p1-acceptance.md](p1-acceptance.md)、P2の検証の記�
 | 同期1サイクルで`local_derivatives`が処理する枚数（0以上の整数。T2.3） | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25`（§13.1） |
 | 同期1サイクルで品質を解析する枚数（0以上の整数。0は1として扱う。T2.6） | なし | `GEOFRAME_QUALITY_PER_CYCLE` | `GEOFRAME_FETCH_PER_CYCLE`と同じ（§16.1） |
 | 旅行ブログの旅程JSONを読むディレクトリ（**Rustだけの項目**。あれば埋め込みの代わりに、そこの`*.json`だけを読む。相対はカレントディレクトリ基準。T3.5） | なし | `GEOFRAME_BLOG_PLANS_DIR` | （未設定＝バイナリに埋め込んだ`app/travel_blog/plans/*.json`。§20.1） |
+| AIの設定ファイル（JSON v1。用途別のrouting・クラウド許可・ベクトル空間。**Rustだけの項目**。未設定なら新しい外部AI呼び出しは無効。不正でもAIだけ無効で起動する。T4.1b。書式・旧`GEOFRAME_AI_*`の対応は[ai-config.md](ai-config.md)） | なし | `GEOFRAME_AI_CONFIG` | （未設定） |
 
 - **空文字の環境変数は未設定と同じ**に扱う。現行の`GEOFRAME_DATA_DIR`が`or`で空文字を未設定扱いにするのと同じで、`EnvironmentFile`に`KEY=`と書いた事故を避ける。
 - **不正な値は起動を断る**（終了コード2）。メッセージには環境変数の名前と理由だけを書き、値は書かない。`GEOFRAME_HOST`はIPアドレスだけ（現行Pythonはホスト名も通すが、本番は`0.0.0.0`か`127.0.0.1`）。

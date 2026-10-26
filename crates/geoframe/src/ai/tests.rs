@@ -119,7 +119,7 @@ struct Row {
 
 // ---------------------------------------------------------------- スキーマ
 
-fn dump(conn: &Connection) -> Vec<String> {
+pub(super) fn dump(conn: &Connection) -> Vec<String> {
     let mut out = Vec::new();
     for table in schema::TABLES {
         let mut stmt = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
@@ -199,7 +199,7 @@ fn migrate_adds_only_ai_jobs_and_is_idempotent() {
     assert_eq!(dump(&conn), before_rows);
 }
 
-fn table_exists(conn: &Connection, name: &str) -> bool {
+pub(super) fn table_exists(conn: &Connection, name: &str) -> bool {
     conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
         [name],

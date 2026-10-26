@@ -258,6 +258,12 @@ fn serve(overrides: &Overrides) -> ExitCode {
             "GEOFRAME_EMBED_BACKEND が gemini・local のどちらでもないので gemini を使います"
         );
     }
+    // AI の設定が不正でも写真の配信・管理は続ける（新しい AI 呼び出しだけが無効）。パス・値は出さず、種類のコードだけ
+    if let Some(code) = config.ai.invalid() {
+        tracing::warn!(
+            "AI の設定が不正です（種類: {code}）。新しい AI 呼び出しだけ無効にして続けます"
+        );
+    }
 
     // 取り込み（GEOFRAME_INGEST=1）: writer を開き、スキーマの作成・移行と起動時の掃除をする。
     // 無効（既定）のときは P1 と同じ読み取り専用で、DB が無ければ下で断る
