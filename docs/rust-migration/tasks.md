@@ -93,7 +93,7 @@ P3で守ること（各タスクの委任文に入れる）:
 
 | ID | 内容 | AC（P4-PRD） | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T4.1a | 追加ai_jobsスキーマ、冪等enqueue、claim・結果確定の原子性、入力失効、後回し・失敗・中断の上限、起動回収のrepository | AC1, AC2, AC4, AC10a | P3 | full | 未着手 | | | 外部通信なし、偽時計・合成DB。既存必須スキーマへ追加AI表を強制しない |
+| T4.1a | 追加ai_jobsスキーマ、冪等enqueue、claim・結果確定の原子性、入力失効、後回し・失敗・中断の上限、起動回収のrepository | AC1, AC2, AC4, AC10a | P3 | full | 実装中 | 7a16640 | | 外部通信なし、偽時計・合成DB。既存必須スキーマへ追加AI表を強制しない |
 | T4.1b | AI設定JSON・用途別ポリシー、変更と冪等性の分離、永続の周期／日予算、無効設定時の配信継続 | AC1, AC4, AC5, AC10a | T4.1a | full | 未着手 | | | クラウド既定無効。値・パスをログに出さない。Providerの本接続はT4.2 |
 | T4.1c | AIワーカーの起動条件・LockHold、SIGTERM時の共通期限、停止後回収、ガード付きai-jobs状態／retry CLI | AC1, AC3, AC4, AC5, AC10a | T4.1a, T4.1b | full | 未着手 | | | コード内テストexecutorだけで検証、本番向けのスタブ設定は作らない。実AI handlerは後続で登録 |
 | T4.2 | AI専用HTTP・Discovery/available・送信先制限・用途別許可・Decision、非同期処理からの安全な呼出し | AC2, AC3, AC4, AC5, AC10a | T4.1c | full | 未着手 | | | GPU管理操作なし。写真の送信・認証・redirect・proxy・本文制限をスタブで確認 |
