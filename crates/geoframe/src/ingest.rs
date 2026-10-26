@@ -90,6 +90,12 @@ impl LockHold {
     pub(crate) fn for_test(dir: &Path) -> Self {
         Self(Arc::new(File::create(dir.join("hold-for-test")).unwrap()))
     }
+
+    /// 試験用: この所有権を持っている数（複製の数）。スレッドが残っているかを確かめる。
+    #[cfg(test)]
+    pub(crate) fn holders(&self) -> usize {
+        Arc::strong_count(&self.0)
+    }
 }
 
 /// 取り込みの書き手一式。drop してもスレッドが [`LockHold`] を持つ間はロックが残る。

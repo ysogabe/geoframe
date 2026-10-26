@@ -726,6 +726,103 @@ fn a_valid_response_that_arrives_after_the_stop_signal_is_still_committed() {
     assert_eq!(e.results(), 1);
 }
 
+/// 予算の予約の順番待ちのあいだ（writer への依頼を出してから実行されるまで）に停止の合図が来ても、許可は返らない。
+/// 時刻は writer の依頼の中で取る（`reserve` の引数）ので、その時計の呼び出しで合図を立てて、依頼の実行中に
+/// 来た合図を同期的に再現する。取れた予約は戻さない。
+#[test]
+fn a_stop_that_arrives_while_the_budget_reservation_waits_denies_the_send_but_keeps_the_reservation()
+ {
+    let e = env("stop-during-budget");
+    let stop = StopFlag::new();
+    let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let clock: Clock = {
+        let (armed, stop) = (Arc::clone(&armed), stop.clone());
+        Arc::new(move || {
+            if armed.swap(false, Ordering::SeqCst) {
+                stop.stop(); // 予約の依頼が実行される瞬間に SIGTERM
+            }
+            T0
+        })
+    };
+    let (sent, outcome) = (Arc::new(AtomicUsize::new(0)), Arc::new(Mutex::new(None)));
+    let judge = {
+        let (sent, outcome, armed) = (Arc::clone(&sent), Arc::clone(&outcome), Arc::clone(&armed));
+        Fake::new(JobKind::PhotoJudge, move |ctx, _| {
+            armed.store(true, Ordering::SeqCst);
+            let result = ctx.before_send().map(|_| ());
+            *outcome.lock().unwrap() = Some(result);
+            result?;
+            sent.fetch_add(1, Ordering::SeqCst);
+            Err(RunError::Unavailable)
+        })
+        .with_keys(&[key(JobKind::PhotoJudge, "j1")])
+    };
+    let mut deps = e.deps(dyn_handlers(&[Arc::clone(&judge)]), &stop, "run-test");
+    deps.clock = clock;
+    Core::new(&deps).cycle();
+    assert_eq!(
+        *outcome.lock().unwrap(),
+        Some(Err(RunError::Stopping)),
+        "予約が取れたあとでも、停止していれば許可しない"
+    );
+    assert_eq!(sent.load(Ordering::SeqCst), 0);
+    let row = e.row(JobKind::PhotoJudge, "j1").unwrap();
+    assert_eq!(
+        (row.state, row.code.as_str(), row.attempts, row.has_token),
+        (JobState::Deferred, "shutdown", 0, false)
+    );
+    // 取れた予約は戻さない（送ったものとして数える側）
+    let used: i64 = e
+        .writer()
+        .call(|c| {
+            c.query_row(
+                "SELECT COALESCE(SUM(count),0) FROM ai_request_usage WHERE scope='day'",
+                [],
+                |r| r.get(0),
+            )
+        })
+        .unwrap();
+    assert_eq!(used, 1);
+}
+
+/// writer への claim の依頼が順番待ちのあいだに停止の合図が来たら、依頼が実行されても pending→running に
+/// ならず、token も作られない。呼び出し側の事前確認は通っている（合図は依頼を出す瞬間に立てる）。
+#[test]
+fn a_stop_that_arrives_while_the_claim_request_waits_for_the_writer_claims_nothing() {
+    let e = env("stop-during-claim");
+    let stop = StopFlag::new();
+    let clue = Fake::ok(JobKind::LocationClue);
+    e.enqueue(&key(JobKind::LocationClue, "c"));
+    // claim の観測: running への遷移を DB のトリガーに記録する（停止の後に遷移したかを DB 側から確かめる）
+    e.writer()
+        .call(|c| {
+            c.execute_batch(
+                "CREATE TABLE claim_observer(n INTEGER);
+                 CREATE TRIGGER observe_claim AFTER UPDATE OF state ON ai_jobs
+                   WHEN NEW.state='running' BEGIN INSERT INTO claim_observer VALUES (1); END;",
+            )
+        })
+        .unwrap();
+    let mut deps = e.deps(dyn_handlers(&[Arc::clone(&clue)]), &stop, "run-test");
+    // 最初の writer 呼び出し（reconcile の結果が空なので claim）の依頼を出す瞬間に合図を立てる
+    let trigger = stop.clone();
+    deps.writer = e.writer().interrupt_next_call(move || trigger.stop());
+    assert!(!stop.is_stopped(), "事前確認の時点では合図は無い");
+    Core::new(&deps).cycle();
+    assert!(stop.is_stopped());
+    assert_eq!(clue.runs(), 0, "claim されたジョブは無い");
+    let row = e.row(JobKind::LocationClue, "c").unwrap();
+    assert_eq!(
+        (row.state, row.attempts, row.has_token),
+        (JobState::Pending, 0, false)
+    );
+    let transitions: i64 = e
+        .writer()
+        .call(|c| c.query_row("SELECT COUNT(*) FROM claim_observer", [], |r| r.get(0)))
+        .unwrap();
+    assert_eq!(transitions, 0, "停止後に pending→running の遷移は 0");
+}
+
 #[test]
 fn spawn_and_shutdown_run_the_loop_record_the_stop_and_release_nothing_when_idle() {
     let e = env("spawn");

@@ -191,6 +191,7 @@ impl<'a> RunCtx<'a> {
     /// 3. Provider・用途の停止（[`RunError::Paused`]）
     /// 4. クラウドの用途は送信予算の予約（[`RunError::Budget`]。writer を [`BUDGET_WAIT`] まで待つ）。
     ///    予約は失敗・中断しても巻き戻らない。
+    /// 5. 許可を返す直前にもう一度、停止の合図（予約の順番待ちのあいだに来た合図も尊重する）。
     pub fn before_send(&self) -> Result<Gate<'a>, RunError> {
         if self.stop.is_stopped() {
             return Err(RunError::Stopping);
@@ -221,6 +222,11 @@ impl<'a> RunCtx<'a> {
             if !reservation.is_granted() {
                 return Err(RunError::Budget(reservation));
             }
+        }
+        // 許可を確定する直前にもう一度。予算の順番待ち（writer が塞がっている間）に停止の合図が来たら送らない。
+        // 取れた予約は戻さない（送ったものとして数える側に倒す）
+        if self.stop.is_stopped() {
+            return Err(RunError::Stopping);
         }
         Ok(gate)
     }
@@ -351,18 +357,17 @@ impl Core {
             if kinds.is_empty() {
                 return;
             }
-            let (run_id, now) = (self.run_id.clone(), (self.clock)());
-            let token = match jobs::random_id() {
-                Ok(token) => token,
-                Err(_) => {
-                    tracing::error!("[ai] claim の token を作れません（次の周期に持ち越します）");
-                    return;
+            let (run_id, now, stop) = (self.run_id.clone(), (self.clock)(), self.stop.clone());
+            // writer の順番待ちのあいだに来た合図も尊重する: 依頼の中、claim の直前にもう一度確かめ、
+            // 止まっていれば token も作らず状態も変えない（呼び出し側の確認だけでは、待ちの間の合図を取りこぼす）
+            let claimed = match self.writer.call(move |conn| {
+                if stop.is_stopped() {
+                    return Ok(None);
                 }
-            };
-            let claimed = match self
-                .writer
-                .call(move |conn| jobs::claim_next(conn, now, &run_id, &token, &kinds))
-            {
+                let token = jobs::random_id()
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+                jobs::claim_next(conn, now, &run_id, &token, &kinds)
+            }) {
                 Ok(Some(claimed)) => claimed,
                 Ok(None) => return,
                 Err(e) => {

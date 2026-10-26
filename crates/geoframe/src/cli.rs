@@ -13,7 +13,7 @@ use crate::ai::worker::{self, Clock, WorkerDeps};
 use crate::cache::Cache;
 use crate::config::{Config, Overrides};
 use crate::db::Catalog;
-use crate::ingest::Ingest;
+use crate::ingest::{Ingest, LockHold};
 use crate::server::AppState;
 use crate::stop::{StopFlag, join_within};
 use crate::sync::{CycleReport, Mode, StageCtx, StageResult};
@@ -37,15 +37,22 @@ struct IngestThreads {
 /// 保存はここで、両方の終了を待ってから 1 回だけする。限られた時間内に worker が止まらなかったときも
 /// 保存はする（そのあとの `put` は失われうるが、警告を出す）。
 ///
-/// saver が I/O の最中に期限を超えて残った場合は、保存用の排他（`Cache::save_final`）で重ねて書かない。
-/// 排他は `limit` まで待ち、それでも取れなければ最後の保存は省略する（警告を出す）。省略した分は、
-/// 残った saver の保存が終わったあとの内容に含まれないが、書きかけの一時ファイルと競合して JSON を
+/// 最後の保存（`Cache::save_final`）は `LockHold` を持つ別スレッドで行い、ここは `limit` までしか待たない。
+/// saver が I/O の最中に期限を超えて残った場合も、保存の排他で重ねて書かない。排他の待ちだけでなく、取れたあとの
+/// 書き込み・`fsync` が固まっても、期限が来たら最後の保存は省略して戻る（警告を出す）。省略した分は、
+/// 残ったスレッドの保存が終わったあとの内容に含まれないが、書きかけの一時ファイルと競合して JSON を
 /// 壊すよりは、キャッシュ（位置の逆引き結果で、作り直せる）の直近の更新を失うほうを選ぶ。
 /// 期限を超えて残ったスレッドは `.ingest.lock` を持ち続ける（`LockHold`）ので、そのあいだ別の
 /// 取り込みは始まらない。
 /// 呼ぶ前に `stop` の合図を出しておくこと。各待ちは `limit` と、`stop` の共通期限の残りのうち短いほうまで
 /// （SIGTERM から 60 秒を越えない）。
-fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration, stop: &StopFlag) {
+fn stop_ingest_threads(
+    threads: IngestThreads,
+    cache: &Arc<Cache>,
+    lock: LockHold,
+    limit: Duration,
+    stop: &StopFlag,
+) {
     for (name, handle) in [
         ("同期サイクル", threads.worker),
         ("キャッシュ保存", threads.saver),
@@ -54,8 +61,9 @@ fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration, s
             tracing::warn!("{name}のスレッドが時間内に止まりませんでした（そのまま終了します）");
         }
     }
-    // 省略したときの警告は save_final の中で出す
-    cache.save_final(stop.phase_limit(limit));
+    // 実際の保存は `lock` を持つ別スレッドで行い、ここは共通期限の残りまでしか待たない。省略したときの警告は
+    // save_final の中で出す
+    cache.save_final(lock, stop.phase_limit(limit));
 }
 
 const USAGE: &str = "\
@@ -466,7 +474,13 @@ fn serve(overrides: &Overrides) -> ExitCode {
         ai.shutdown(&ingest.writer, &stop, THREAD_STOP_LIMIT, &ai_clock);
     }
     if let (Some(threads), Some(ingest)) = (threads, &ingest) {
-        stop_ingest_threads(threads, &ingest.cache, THREAD_STOP_LIMIT, &stop);
+        stop_ingest_threads(
+            threads,
+            &ingest.cache,
+            ingest.lock_hold(),
+            THREAD_STOP_LIMIT,
+            &stop,
+        );
     }
     // 期限内に止まらなかったスレッドが残っていても、`.ingest.lock` はそのスレッドが終わる（プロセスが
     // 終わる）まで外れない（スレッドが `LockHold` を持つ）。ここで Ingest を捨てても二重には書かれない
@@ -1297,6 +1311,7 @@ mod tests {
         stop_ingest_threads(
             IngestThreads { worker, saver },
             &cache,
+            crate::ingest::LockHold::for_test(dir.path()),
             Duration::from_secs(10),
             &stop,
         );
@@ -1333,6 +1348,7 @@ mod tests {
         stop_ingest_threads(
             IngestThreads { worker, saver },
             &cache,
+            crate::ingest::LockHold::for_test(dir.path()),
             Duration::from_secs(10),
             &stop,
         );
@@ -1369,6 +1385,7 @@ mod tests {
         stop_ingest_threads(
             IngestThreads { worker, saver },
             &ingest.cache,
+            ingest.lock_hold(),
             Duration::from_millis(100),
             &StopFlag::new(),
         );
@@ -1387,5 +1404,50 @@ mod tests {
             }
         }
         panic!("保存スレッドが終わってもロックが外れない");
+    }
+    /// 最後の保存の実 I/O（一時ファイルが FIFO で、読み手が現れるまで書き込みが戻らない）が固まっても、
+    /// 停止の呼び出しは共通期限の内に戻る。固まった保存は `.ingest.lock` を持ち続け、読み手を付けると手放す。
+    #[test]
+    fn a_stuck_final_save_does_not_push_the_stop_past_the_common_deadline() {
+        use crate::testutil::TempDir;
+        use serde_json::json;
+
+        let dir = TempDir::new("cli-stuck-final-save");
+        let tmp = dir.path().join(".cache.json.tmp");
+        if !std::process::Command::new("mkfifo")
+            .arg(&tmp)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("mkfifo が使えないので省略");
+            return;
+        }
+        let cache = Arc::new(Cache::load(dir.path()));
+        cache.put("geo:1", json!(1));
+        let lock = crate::ingest::LockHold::for_test(dir.path());
+        let stop = StopFlag::with_budget(Duration::from_millis(400));
+        stop.stop();
+        let (worker, saver) = (std::thread::spawn(|| {}), std::thread::spawn(|| {}));
+        let began = std::time::Instant::now();
+        // 1 つあたりの上限は 10 秒でも、共通期限（400ms）の残りまでしか待たない
+        stop_ingest_threads(
+            IngestThreads { worker, saver },
+            &cache,
+            lock.clone(),
+            Duration::from_secs(10),
+            &stop,
+        );
+        let waited = began.elapsed();
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        // 残った保存のスレッドが所有権を持っている（呼び出し側の複製 + スレッドの複製）
+        assert_eq!(lock.holders(), 2);
+        drop(std::fs::File::open(&tmp).unwrap()); // 読み手を付けて解放する
+        for _ in 0..1000 {
+            if lock.holders() == 1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("最後の保存のスレッドが終わらない");
     }
 }
