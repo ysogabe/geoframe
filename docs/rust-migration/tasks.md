@@ -84,11 +84,27 @@ P3で守ること（各タスクの委任文に入れる）:
 |---|---|---|---|---|---|---|---|---|
 | T3.10 | 地名検索にもGEOFRAME_TILE_UAを使い、検証環境でNominatimの実通信と本物のDriveの取り込み・大量削除の保留表示を確認する | AC1, AC2, AC7 | T3.8 | full | 完了 | d7252b7 | 0acfc2c | [drive-acceptance.md](drive-acceptance.md)。通常レビュー（Sol）指摘0、fmt/clippy/739テスト成功。実Drive6535件の冪等性、46原本のRust/Python全件成功、iPhone原本5枚、未登録1行の索引→配信、2000行の保留→解除と画面、Nominatim実通信・キャッシュを確認。一時鍵・原本・複製は削除、元DBと画像は不変 |
 
-## P4〜P5（実装開始時に分け直す）
+## P4: AI Provider・永続ジョブ（実装中）
 
-P4の設計案は[p4-prd.md](p4-prd.md)・[p4-design.md](p4-design.md)（2026-10-26、整合性・安全面ともレビューの必須指摘0）。画像Embedding API #93の本接続に先立ち、T4.1のジョブ基盤、T4.2のProvider・用途別許可、T4.3の索引基盤を進める案。ここでは実装タスクの開始を記録せず、設計確認後に開始SHA・AC・担当を割り当てる。
+- PRD: [p4-prd.md](p4-prd.md)、設計: [p4-design.md](p4-design.md)。2026-10-26にユーザーが推奨順での実装を承認。
+- 作業ブランチ: `feat/rust-migration-p4`。P4として1つのPR。先にT4.1a〜c、T4.2、T4.3を進める。
+- local-model-lab #93は実装開始時もOPEN（2026-10-26再確認）。画像＋文Embeddingの本接続・P4全体の完了は契約確定後。後半の外部依存を、前半を止める理由にしない。
+- 各タスクはt3-full-buildの管理モードで、実装Sonnet・通常レビューSol。security-reviewはP4のPR前に全体で1回。
 
-| ID | 内容 | AC | 種類 | 状態 |
+| ID | 内容 | AC（P4-PRD） | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
+|---|---|---|---|---|---|---|---|---|
+| T4.1a | 追加ai_jobsスキーマ、冪等enqueue、claim・結果確定の原子性、入力失効、後回し・失敗・中断の上限、起動回収のrepository | AC1, AC2, AC4, AC10a | P3 | full | 未着手 | | | 外部通信なし、偽時計・合成DB。既存必須スキーマへ追加AI表を強制しない |
+| T4.1b | AI設定JSON・用途別ポリシー、変更と冪等性の分離、永続の周期／日予算、無効設定時の配信継続 | AC1, AC4, AC5, AC10a | T4.1a | full | 未着手 | | | クラウド既定無効。値・パスをログに出さない。Providerの本接続はT4.2 |
+| T4.1c | AIワーカーの起動条件・LockHold、SIGTERM時の共通期限、停止後回収、ガード付きai-jobs状態／retry CLI | AC1, AC3, AC4, AC5, AC10a | T4.1a, T4.1b | full | 未着手 | | | コード内テストexecutorだけで検証、本番向けのスタブ設定は作らない。実AI handlerは後続で登録 |
+| T4.2 | AI専用HTTP・Discovery/available・送信先制限・用途別許可・Decision、非同期処理からの安全な呼出し | AC2, AC3, AC4, AC5, AC10a | T4.1c | full | 未着手 | | | GPU管理操作なし。写真の送信・認証・redirect・proxy・本文制限をスタブで確認 |
+| T4.3 | 空間別のベクトル保存・active_space、有効世代JOIN、旧選別維持と代表不在時の安全な表示、状態の読み取り | AC4, AC6, AC7, AC9, AC10a | T4.1c | full | 未着手 | | | 固定ベクトルで確認。P4導入前後のfeed/suppressed差を記録。新しいモデルの本接続なし |
+| T4.4 | #93で採用された画像／文EmbeddingアダプターとE5/E6の本接続、対話用枠・検索キャッシュ | AC2, AC3, AC6, AC7, AC10b | T4.2, T4.3, #93の契約 | full | 未着手 | | | API契約待ち。既存text-only APIへ画像を送らない |
+| T4.5 | 同一場面グループ、ルール／既存の重みで代表選択、任意のGemini比較 | AC3, AC4, AC5, AC6, AC8 | T4.3, T4.4 | full | 未着手 | | | 旧選別と部分重複する新判定の自動置換なし |
+| T4.6 | Decisionのclue→日単位の位置候補→別jobで座標化、Vertex認証・用途別アダプター、Python互換run_id | AC2, AC4, AC5, AC8, AC9 | T4.1c, T4.2 | full | 未着手 | | | 画像Embeddingと独立。実クラウド送信の用途・費用の許可は別に確認 |
+| T4.7 | LXCで通しの受入、Provider停止／復帰、miharashi・管理操作、Python切り戻しと結果の記録 | AC1〜9, AC10a, AC10b | T4.1a〜T4.6 | ops | 未着手 | | | 先行部分も節目ごとにLXCで確認。P4完了は全ACの確認後 |
+
+## P5: 切替（未着手）
+
+| ID | 内容 | AC（Issue #54） | 種類 | 状態 |
 |---|---|---|---|---|
-| P4 | AI Provider・永続ジョブ・Embeddingインデックス・位置候補・同一場面・AI検索 | AC2, AC3, AC4, AC7 | full | 未着手 |
 | P5 | バックアップ・復元演習、シャドー比較、本番切替、ロールバック演習、Python依存の撤去 | AC1, AC2, AC5 | full | 未着手 |
