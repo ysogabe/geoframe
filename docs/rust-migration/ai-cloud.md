@@ -56,7 +56,7 @@ Driveは同じ小さな読取り部品を使うが、scope/cache/agent/HTTP/待�
 
 推論は1送信ごとに1予約。401だけ一度cacheを無効化／更新し、再度probe/send gateを通して送る。再401はProviderの`Unauthorized`停止。2枠目が取れなければ再送しない。予約後にDNS/接続/停止で送れなくても消費は戻さない。
 
-`Deadline::for_task`はphoto_judge 120秒、location_suggest 180秒。token交換は最大10秒かつ全体残時間内。Provider枠待ち・token・refresh・再送で全体期限を延ばさない。内部のsleep付きretryは無い。
+`Deadline::for_task`はphoto_judge 120秒、location_suggest 180秒。token交換は最大10秒かつ全体残時間内。Provider枠待ち・token・refresh・送信予約のwriter待ち・再送で全体期限を延ばさない。cloudは内部の`before_send_until`でwriterの待ち上限を既定5秒と全体残時間の短い方にする。期限内に始まらなかった予約は、writerが空いても実行しない。始まった予約は従来どおり取り消さず、HTTPのwrite前に期限切れならProviderWaitのまま。内部のsleep付きretryは無い。
 
 | 失敗 | 分類 |
 | --- | --- |
@@ -80,3 +80,9 @@ Driveは同じ小さな読取り部品を使うが、scope/cache/agent/HTTP/待�
 schema・既存有償結果・一次データの変更は無い。設定不正時のfeed継続、旧DB読み取り、Drive/Decision回帰はworkspace全体で確認する。実クラウド疎通、Google側でのモデル実在・権限・費用、実写真、正常なTLS証明書を伴う本番接続は未確認。実利用は用途・画像・費用の別途許可後。T4.6bはDecision画像準備/clue/写真別handler、T4.6cは日単位候補・有償回答保存・座標化、T4.5は固定promptとdomain parse、T4.4は#93と対話APIの契約を扱う。
 
 T4.6aの実施結果: クラウド25試験、AI全体227試験が成功。`cargo test --workspace`は全28 suite成功、1023 pass・2 ignore。`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、musl release buildが成功し、`file`でstatic-pie、`--version`の起動を確認した。loopbackソケット試験はsandboxの`Operation not permitted`を確認後、権限付きで実行した。
+
+LXCでの初回受入後の検証修正（2026-10-27）: 期限試験はRSA署名速度により2回目の推論が始まらないことがあり、実装の正しい未送信分類を誤って失敗としていた。試験専用の制御時計とtransportを使い、実際のwrite gateを通る前／後、token／401更新の期限切れを固定する。HTTPに渡す残時間を1000→800→600→400 msと厳密に検査し、予約数も0／1／2で固定した。認証CPU時間をwall clockで推測するsleepは廃止した。別途、送信予約が全体期限より長い固定5秒を待てる実装上の隙間を修正し、cacheを事前準備した実writerの待ちを200 msで切る回帰試験を追加した。
+
+wire上限試験の失敗も試験入力の計算量が原因だった。既存gzip helperを拡張し、[RFC 1952 §2.3.1.1](https://www.rfc-editor.org/rfc/rfc1952#section-2.3.1.1)に従う大きなFEXTRAを持つ34 memberで圧縮前上限を超える入力を作る。展開後は空のまま。展開後上限+1の圧縮入力とは分け、合法headerの復号と展開後上限ちょうどの成功も確認する。両超過は正確な`ResponseTooLarge`かつ`started=true`を要求する。
+
+否定対照は、wire上限の無効化で空の正常応答になって試験が失敗、各HTTPで期限を再開始すると残時間の比較が失敗、writerの全体期限制限を外すと待ち時間の検査が失敗することを確認し、すべて復元した。修正後はfmt／workspace全targets clippy（`-D warnings`）／workspace全28 suite（1024 pass・2 ignore）／musl releaseが成功。ローカルmusl debugのcloud全26件（元の失敗2件と新writer回帰を含む）も成功した。LXCでの再実行は親タスクが担当する。通常レビューはOpusのレート制限により未実施のまま。

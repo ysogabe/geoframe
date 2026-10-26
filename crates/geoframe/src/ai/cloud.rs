@@ -170,7 +170,7 @@ impl CloudClient {
         for round in 0..2 {
             // token 更新や枠待ち中に停止・pause された場合にも送らない。
             ctx.before_probe()?;
-            ctx.before_send()?;
+            ctx.before_send_until(deadline)?;
             let reply = self
                 .provider
                 .api

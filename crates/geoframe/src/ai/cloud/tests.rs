@@ -530,76 +530,248 @@ fn unsent_dns_and_connect_failures_wait_with_zero_attempts_but_keep_the_reservat
     }
 }
 
+// Manual time advances only at scripted I/O boundaries, on the calling thread.
+// RSA/DB/CPU speed therefore cannot decide which request has started.
+thread_local! {
+    static IO_NOW: std::cell::Cell<std::time::Instant> = std::cell::Cell::new(std::time::Instant::now());
+}
+fn io_now() -> std::time::Instant {
+    IO_NOW.with(std::cell::Cell::get)
+}
+fn advance_io(ms: u64) {
+    IO_NOW.with(|t| t.set(t.get() + Duration::from_millis(ms)));
+}
+
+#[derive(Debug)]
+struct Exchange {
+    host: &'static str,
+    budget_ms: u64,
+    work_ms: u64,
+    before_write: bool,
+    status: &'static str,
+}
+#[derive(Debug, Clone)]
+struct ScriptConnector(Arc<Mutex<std::collections::VecDeque<Exchange>>>);
+impl Connector for ScriptConnector {
+    type Out = Box<dyn ureq::unversioned::transport::Transport>;
+    fn connect(
+        &self,
+        d: &ureq::unversioned::transport::ConnectionDetails,
+        _: Option<()>,
+    ) -> Result<Option<Self::Out>, ureq::Error> {
+        let step = self
+            .0
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("unexpected HTTP request");
+        assert_eq!(d.uri.host(), Some(step.host));
+        // Assert exactly what production passes to ureq, before any fake I/O.
+        assert_eq!(
+            d.config.timeouts().global,
+            Some(Duration::from_millis(step.budget_ms))
+        );
+        if step.before_write {
+            advance_io(step.budget_ms);
+            return Err(ureq::Error::Timeout(ureq::Timeout::Global));
+        }
+        Ok(Some(Box::new(ScriptIo {
+            buffers: ureq::unversioned::transport::LazyBuffers::new(16384, 16384),
+            step: Some(step),
+            wrote: false,
+        })))
+    }
+}
+#[derive(Debug)]
+struct ScriptIo {
+    buffers: ureq::unversioned::transport::LazyBuffers,
+    step: Option<Exchange>,
+    wrote: bool,
+}
+impl ureq::unversioned::transport::Transport for ScriptIo {
+    fn buffers(&mut self) -> &mut dyn ureq::unversioned::transport::Buffers {
+        &mut self.buffers
+    }
+    fn transmit_output(
+        &mut self,
+        amount: usize,
+        _: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<(), ureq::Error> {
+        self.wrote |= amount > 0;
+        Ok(())
+    }
+    fn await_input(
+        &mut self,
+        _: ureq::unversioned::transport::NextTimeout,
+    ) -> Result<bool, ureq::Error> {
+        use ureq::unversioned::transport::Buffers;
+        assert!(
+            self.wrote,
+            "timeout/response must follow the real write gate"
+        );
+        let Some(step) = self.step.take() else {
+            return Ok(false);
+        };
+        advance_io(step.work_ms.min(step.budget_ms));
+        if step.work_ms > step.budget_ms {
+            return Err(ureq::Error::Timeout(ureq::Timeout::Global));
+        }
+        let body = if step.host == "oauth.test" {
+            token_body()
+        } else {
+            good_reply()
+        };
+        let head = format!(
+            "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            step.status,
+            body.len()
+        );
+        let response = [head.as_bytes(), &body].concat();
+        self.buffers.input_append_buf()[..response.len()].copy_from_slice(&response);
+        self.buffers.input_appended(response.len());
+        Ok(true)
+    }
+    fn is_open(&mut self) -> bool {
+        false
+    }
+}
+fn exchange(host: &'static str, budget_ms: u64, work_ms: u64, status: &'static str) -> Exchange {
+    Exchange {
+        host,
+        budget_ms,
+        work_ms,
+        before_write: false,
+        status,
+    }
+}
+fn scripted_client(e: &Env, steps: Vec<Exchange>) -> (CloudClient, ScriptConnector) {
+    let script = ScriptConnector(Arc::new(Mutex::new(steps.into())));
+    let dns = FakeDns::new();
+    let transport = |host| {
+        dns.script(host, vec![vec!["127.0.0.1:80".parse().unwrap()]]);
+        Transport::stub(
+            host,
+            80,
+            Arc::new(dns.clone()),
+            script.clone().chain(GateConnector),
+        )
+    };
+    let c = client(e, transport("api.test"), transport("oauth.test"));
+    (c, script)
+}
+fn unreachable() -> RunError {
+    use crate::ai::waits::{Wait, WaitReason, WaitScope};
+    RunError::ProviderWait(Wait::new(WaitScope::Entrance, WaitReason::Unreachable))
+}
+
 #[test]
 fn sent_timeout_is_attempt_and_whole_deadline_includes_auth_and_refresh() {
-    for slow_auth in [true, false] {
+    let auth = |budget, work| exchange("oauth.test", budget, work, "200 OK");
+    let api = |budget, work, status| exchange("api.test", budget, work, status);
+    let mut unsent = api(800, 900, "200 OK");
+    unsent.before_write = true;
+    for (steps, expected, reservations) in [
+        (vec![auth(1000, 1100)], unreachable(), 0),
+        (vec![auth(1000, 200), unsent], unreachable(), 1),
+        (
+            vec![auth(1000, 200), api(800, 900, "200 OK")],
+            RunError::Attempt(ErrorCode::Timeout),
+            1,
+        ),
+        // A sent 401 does not make a subsequent *token* timeout an Attempt.
+        (
+            vec![
+                auth(1000, 200),
+                api(800, 200, "401 Unauthorized"),
+                auth(600, 700),
+            ],
+            unreachable(),
+            1,
+        ),
+        // Refresh returns exactly at the deadline: no second reservation or write.
+        (
+            vec![
+                auth(1000, 200),
+                api(800, 200, "401 Unauthorized"),
+                auth(600, 600),
+            ],
+            unreachable(),
+            1,
+        ),
+        // All four requests use one shrinking deadline; the retry really starts.
+        (
+            vec![
+                auth(1000, 200),
+                api(800, 200, "401 Unauthorized"),
+                auth(600, 200),
+                api(400, 500, "200 OK"),
+            ],
+            RunError::Attempt(ErrorCode::Timeout),
+            2,
+        ),
+    ] {
         let (_dir, e) = fixture(20);
-        let auth = stub(move |s, _| {
-            if slow_auth {
-                std::thread::sleep(Duration::from_millis(160));
-            }
-            respond(s, "200 OK", "", &token_body())
-        });
-        let api = stub(|s, _| {
-            std::thread::sleep(Duration::from_millis(160));
-            respond(s, "200 OK", "", &good_reply())
-        });
-        let dns = FakeDns::new();
-        let c = client(
-            &e,
-            transport(&api, "api.test", &dns),
-            transport(&auth, "oauth.test", &dns),
-        );
-        let start = std::time::Instant::now();
+        let (c, script) = scripted_client(&e, steps);
         let result = call(
             &e,
             &c,
             &request(),
             &StopFlag::new(),
-            &Deadline::after(Duration::from_millis(80)),
-        )
-        .unwrap_err();
-        assert!(start.elapsed() < Duration::from_millis(150));
-        if slow_auth {
-            assert!(matches!(result, RunError::ProviderWait(_)));
-            assert_eq!(usage(&e), 0);
-            assert_eq!(api.requests.lock().unwrap().len(), 0);
-        } else {
-            assert_eq!(result, RunError::Attempt(ErrorCode::Timeout));
-            assert_eq!(usage(&e), 1);
-        }
+            &Deadline::with_clock(Duration::from_secs(1), io_now),
+        );
+        assert_eq!(result.unwrap_err(), expected);
+        assert!(script.0.lock().unwrap().is_empty());
+        assert_eq!(usage(&e), reservations);
     }
-    // first inference + refresh + retry share one deadline, rather than restarting it per HTTP request.
+}
+
+#[test]
+fn writer_reservation_wait_uses_the_remaining_whole_deadline() {
+    use std::sync::mpsc;
     let (_dir, e) = fixture(20);
-    let n = Arc::new(AtomicUsize::new(0));
-    let count = n.clone();
-    let api = stub(move |s, _| {
-        std::thread::sleep(Duration::from_millis(65));
-        if count.fetch_add(1, Ordering::SeqCst) == 0 {
-            respond(s, "401 Unauthorized", "", b"")
-        } else {
-            respond(s, "200 OK", "", &good_reply())
-        }
+    let (c, _) = scripted_client(&e, vec![exchange("oauth.test", 3000, 0, "200 OK")]);
+    let stop = StopFlag::new();
+    // Fill the real auth cache before imposing a short real-time deadline.
+    c.provider
+        .auth
+        .token(
+            &c.provider.cloud.credential_path,
+            &c.provider.token,
+            &Deadline::with_clock(Duration::from_secs(3), io_now),
+            &stop,
+            &*c.provider.clock,
+        )
+        .unwrap();
+    let (release, held) = mpsc::channel();
+    let (entered, ready) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let writer = e.writer();
+        let blocker = scope.spawn(move || {
+            writer
+                .call(move |_| {
+                    entered.send(()).unwrap();
+                    let _ = held.recv_timeout(Duration::from_secs(3));
+                    Ok(())
+                })
+                .unwrap()
+        });
+        ready.recv_timeout(Duration::from_secs(3)).unwrap();
+        let started = std::time::Instant::now();
+        let result = call(
+            &e,
+            &c,
+            &request(),
+            &stop,
+            &Deadline::after(Duration::from_millis(200)),
+        );
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        blocker.join().unwrap();
+        assert_eq!(result.unwrap_err(), unreachable());
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     });
-    let auth = stub(|s, _| respond(s, "200 OK", "", &token_body()));
-    let dns = FakeDns::new();
-    let c = client(
-        &e,
-        transport(&api, "api.test", &dns),
-        transport(&auth, "oauth.test", &dns),
-    );
-    let start = std::time::Instant::now();
-    let result = call(
-        &e,
-        &c,
-        &request(),
-        &StopFlag::new(),
-        &Deadline::after(Duration::from_millis(110)),
-    )
-    .unwrap_err();
-    assert_eq!(result, RunError::Attempt(ErrorCode::Timeout));
-    assert!(start.elapsed() < Duration::from_millis(180));
-    assert_eq!(usage(&e), 2);
+    // Flushing the writer proves the expired queued reservation never runs later.
+    assert_eq!(usage(&e), 0);
 }
 
 #[derive(Debug)]
@@ -966,43 +1138,46 @@ fn tls_sni_keeps_original_name_and_tls_failure_is_unsent() {
 
 #[test]
 fn wire_and_decompressed_response_limits_apply_to_cloud() {
-    use std::io::Write;
-    for wire in [true, false] {
-        let api = stub(move |s, _| {
-            if wire {
-                let head =
-                    b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nConnection: close\r\n\r\n";
-                if s.write_all(head).is_err() {
-                    return;
-                }
-                let chunk = crate::testutil::gzip::padded(b"", 0).repeat(512);
-                for _ in 0..8192 {
-                    if s.write_all(&chunk).is_err() {
-                        return;
-                    }
-                }
-            } else {
-                respond(
-                    s,
-                    "200 OK",
-                    "Content-Encoding: gzip\r\n",
-                    &crate::testutil::gzip::padded(b"", (1 << 20) + 1),
-                );
-            }
-        });
+    use crate::ai::http::MAX_RESPONSE_BYTES;
+    use crate::testutil::gzip;
+    let wire_limit = crate::net::wire_limit(MAX_RESPONSE_BYTES) as usize;
+    // 34 legal members with a large extra field, rather than millions of empty
+    // members. Each contains one valid unknown subfield (RFC 1952 §2.3.1.1).
+    let member = gzip::with_extra(b"", u16::MAX as usize);
+    let wire_body = member.repeat(wire_limit / member.len() + 1);
+    assert!(wire_body.len() > wire_limit);
+    let expanded_body = gzip::padded(b"", MAX_RESPONSE_BYTES as usize + 1);
+    assert!(expanded_body.len() < wire_limit);
+    for (body, expected) in [
+        // Positive controls: valid padding, and the exact decompressed boundary.
+        (member, Ok(Vec::new())),
+        (
+            gzip::padded(b"", MAX_RESPONSE_BYTES as usize),
+            Ok(vec![b' '; MAX_RESPONSE_BYTES as usize]),
+        ),
+        (wire_body, Err(HttpError::ResponseTooLarge)),
+        (expanded_body, Err(HttpError::ResponseTooLarge)),
+    ] {
+        let api = stub(move |s, _| respond(s, "200 OK", "Content-Encoding: gzip\r\n", &body));
         let dns = FakeDns::new();
         let t = transport(&api, "api.test", &dns);
-        let e = t
-            .post(
+        match (
+            t.post(
                 "/generate",
                 b"{}",
                 Some("synthetic-token"),
                 &deadline(),
                 &StopFlag::new(),
-            )
-            .unwrap_err();
-        assert_eq!(e.error, HttpError::ResponseTooLarge);
-        assert!(e.started);
+            ),
+            expected,
+        ) {
+            (Ok(reply), Ok(body)) => assert_eq!(reply.body, body),
+            (Err(error), Err(expected)) => {
+                assert_eq!(error.error, expected);
+                assert!(error.started);
+            }
+            (actual, _) => panic!("unexpected response kind: {actual:?}"),
+        }
     }
 }
 

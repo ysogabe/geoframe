@@ -130,13 +130,37 @@ pub(super) fn classify(error: &ureq::Error) -> HttpError {
 #[derive(Debug, Clone, Copy)]
 pub struct Deadline {
     at: Instant,
+    #[cfg(test)]
+    now: fn() -> Instant,
 }
 
 impl Deadline {
     pub fn after(limit: Duration) -> Self {
         Self {
             at: Instant::now() + limit,
+            #[cfg(test)]
+            now: Instant::now,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_clock(limit: Duration, now: fn() -> Instant) -> Self {
+        Self {
+            at: now() + limit,
+            now,
+        }
+    }
+
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        return (self.now)();
+        #[cfg(not(test))]
+        Instant::now()
+    }
+
+    /// writer の待ちにも同じ残時間を適用する。
+    pub(super) fn wait_until(&self, cap: Duration) -> Instant {
+        Instant::now() + self.remaining().unwrap_or_default().min(cap)
     }
 
     /// Discovery 全体（catalog＋service＋health をまとめて 2 秒）。
@@ -167,12 +191,14 @@ impl Deadline {
     /// 同じ全体期限内の短い操作（認証など）。全体期限を延ばさない。
     pub(super) fn capped(&self, limit: Duration) -> Self {
         Self {
-            at: self.at.min(Instant::now() + limit),
+            at: self.at.min(self.now() + limit),
+            #[cfg(test)]
+            now: self.now,
         }
     }
 
     pub fn remaining(&self) -> Option<Duration> {
-        let left = self.at.saturating_duration_since(Instant::now());
+        let left = self.at.saturating_duration_since(self.now());
         (!left.is_zero()).then_some(left)
     }
 }

@@ -223,18 +223,36 @@ impl<'a> RunCtx<'a> {
     ///    予約は失敗・中断しても巻き戻らない。
     /// 5. 許可を返す直前にもう一度、停止の合図（予約の順番待ちのあいだに来た合図も尊重する）。
     pub fn before_send(&self) -> Result<Gate<'a>, RunError> {
-        self.check(true)
+        self.check(true, None)
+    }
+
+    /// cloud の送信予約は、writer の既定待ち上限と用途全体期限の短い方まで。
+    pub(super) fn before_send_until(
+        &self,
+        deadline: &super::http::Deadline,
+    ) -> Result<Gate<'a>, RunError> {
+        self.check(true, Some(deadline))
     }
 
     /// Discovery などの**読み取り**の前に呼ぶ。[`RunCtx::before_send`] と同じ確認のうち、クラウドの送信枠の予約
     /// （手順 4）だけをしない。推論の要求を出す前の確認で送信枠を使わないための区別。
     pub fn before_probe(&self) -> Result<Gate<'a>, RunError> {
-        self.check(false)
+        self.check(false, None)
     }
 
-    fn check(&self, reserve: bool) -> Result<Gate<'a>, RunError> {
+    fn check(
+        &self,
+        reserve: bool,
+        whole: Option<&super::http::Deadline>,
+    ) -> Result<Gate<'a>, RunError> {
         if self.stop.is_stopped() {
             return Err(RunError::Stopping);
+        }
+        let expired = || whole.is_some_and(|d| d.remaining().is_none());
+        let timeout =
+            || RunError::ProviderWait(Wait::new(WaitScope::Entrance, WaitReason::Unreachable));
+        if expired() {
+            return Err(timeout());
         }
         let gate = self
             .config
@@ -250,12 +268,16 @@ impl<'a> RunCtx<'a> {
         if let Some(send_budget) = gate.budget.filter(|_| reserve) {
             let task = self.task;
             let clock = Arc::clone(self.clock);
-            let deadline = Instant::now() + BUDGET_WAIT;
+            let deadline = whole.map_or_else(
+                || Instant::now() + BUDGET_WAIT,
+                |d| d.wait_until(BUDGET_WAIT),
+            );
             // 時刻は writer の依頼の中で取る（順番待ちのあと）
             let reservation = match self.writer.call_within(deadline, move |conn| {
                 budget::reserve(conn, task, &send_budget, clock())
             }) {
                 Ok(reservation) => reservation,
+                Err(WriteError::Expired) if expired() => return Err(timeout()),
                 Err(WriteError::Expired) => Reservation::Busy,
                 Err(_) => Reservation::Failed,
             };
@@ -267,6 +289,9 @@ impl<'a> RunCtx<'a> {
         // 取れた予約は戻さない（送ったものとして数える側に倒す）
         if self.stop.is_stopped() {
             return Err(RunError::Stopping);
+        }
+        if expired() {
+            return Err(timeout());
         }
         Ok(gate)
     }
