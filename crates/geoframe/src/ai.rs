@@ -2,7 +2,7 @@
 //! Provider の一時停止（[`pause`]）、共有の一時待機（[`waits`]）、起動 ID と停止開始の記録（[`runs`]）、背景ワーカー
 //! （[`worker`]）、管理操作（[`ops`]。CLI と STATUS）。T4.2 で AI 専用の HTTP（[`http`]・[`dest`]・[`gate`]・[`lanes`]）、
 //! Discovery（[`discovery`]）、Decision（[`decision`]・[`image_input`]）、LAN の共通部分（[`provider`]）を足した。
-//! 用途別の handler の登録は後続のタスク。
+//! T4.6a は [`cloud`] に Vertex の明示認証・固定宛先・用途別通信を足した。用途別の handler の登録は後続のタスク。
 //! 設計は `docs/rust-migration/p4-design.md` §3・§4。
 //!
 //! T4.3 で空間別の検索索引（[`space`]・[`index`]・[`activation`]・[`search`]）を足した。旧選別の安全化は
@@ -17,6 +17,7 @@ use rusqlite::{Connection, TransactionBehavior};
 
 pub mod activation;
 pub mod budget;
+pub mod cloud;
 pub mod decision;
 pub mod dest;
 pub mod discovery;

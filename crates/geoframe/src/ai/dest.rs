@@ -1,4 +1,4 @@
-//! LAN の入口への接続先の固定（P4 / T4.2。設計は p4-design.md §5「接続先は管理者設定のみ」）。
+//! AI の接続先の固定（LAN は private/loopback、クラウドは内部の Public policy）:（P4 / T4.2。設計は p4-design.md §5「接続先は管理者設定のみ」）。
 //!
 //! AI 専用の HTTP クライアント（[`super::http`]）の名前解決をここに置き換える。`ureq` が URL の host を
 //! 解決しようとした時点で、**設定した入口の host:port だけ**を、**解決された全アドレスが private／loopback のとき
@@ -12,6 +12,9 @@
 //!   フォールバックされうる混在を許さない）。
 //! - 名前解決は専用の補助スレッドで行い、要求の残り時間（`timeout`）を越えて待たない。同時に走る補助スレッドは
 //!   [`MAX_INFLIGHT_LOOKUPS`] 本まで（遅い DNS でスレッドが増え続けない。上限なら時間切れとして扱う）。
+//!
+//! クラウドは `PinResolver::public`（crate内だけ）で同じ期限・全件検査・pinを使い、通常の公開IPだけに制限する。
+//! 本番の任意host/policy切替入口は無い（`ai::cloud`の固定宛先からのみ構築する）。
 //!
 //! # `ureq` の unversioned API
 //!
@@ -55,6 +58,53 @@ pub fn is_allowed_ip(ip: IpAddr) -> bool {
 
 fn is_allowed_v4(ip: Ipv4Addr) -> bool {
     ip.is_private() || ip.is_loopback()
+}
+
+/// クラウドは通常の公開ユニキャストだけ。IPv4-mapped/変換用 IPv6 も拒否する。
+pub(super) fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v) => {
+            let n = u32::from(v);
+            let within = |base: u32, bits: u32| n >> (32 - bits) == base >> (32 - bits);
+            ![
+                (0x00000000, 8),
+                (0x0a000000, 8),
+                (0x64400000, 10),
+                (0x7f000000, 8),
+                (0xa9fe0000, 16),
+                (0xac100000, 12),
+                (0xc0000000, 24),
+                (0xc0000200, 24),
+                (0xc01fc400, 24),
+                (0xc034c100, 24),
+                (0xc0af3000, 24),
+                (0xc0586300, 24),
+                (0xc0a80000, 16),
+                (0xc6120000, 15),
+                (0xc6336400, 24),
+                (0xcb007100, 24),
+                (0xe0000000, 3),
+            ]
+            .into_iter()
+            .any(|(base, bits)| within(base, bits))
+        }
+        IpAddr::V6(v) => {
+            let n = u128::from(v);
+            // 2000::/3 の通常 global unicast だけ。IETF特殊用途 2001::/23、文書用、6to4を除く。
+            n >> 125 == 1
+                && n >> 105 != u128::from(0x2001u16) << 7
+                && n >> 96 != 0x20010db8
+                && n >> 112 != 0x2002
+                && n >> 108 != 0x3fff0
+                && n >> 80 != 0x2620004f8000
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum Policy {
+    Lan,
+    Public,
 }
 
 /// 検査の結果、拒否した理由（ログ・エラーには種類だけ）。
@@ -117,6 +167,9 @@ pub struct PinResolver {
     port: u16,
     lookup: Arc<dyn Lookup>,
     inflight: Arc<AtomicUsize>,
+    policy: Policy,
+    #[cfg(test)]
+    loopback_stub: bool,
 }
 
 impl fmt::Debug for PinResolver {
@@ -133,6 +186,49 @@ impl PinResolver {
             port,
             lookup,
             inflight: Arc::new(AtomicUsize::new(0)),
+            policy: Policy::Lan,
+            #[cfg(test)]
+            loopback_stub: false,
+        }
+    }
+
+    pub(super) fn public(host: &str, lookup: Arc<dyn Lookup>) -> Self {
+        let mut resolver = Self::new(host, 443, lookup);
+        resolver.policy = Policy::Public;
+        resolver
+    }
+
+    #[cfg(test)]
+    pub(super) fn stub(host: &str, port: u16, lookup: Arc<dyn Lookup>) -> Self {
+        let mut resolver = Self::new(host, port, lookup);
+        resolver.policy = Policy::Public;
+        resolver.loopback_stub = true;
+        resolver
+    }
+
+    fn vet(&self, addrs: &[SocketAddr]) -> Result<(), Denied> {
+        if addrs.len() > MAX_ADDRS {
+            return Err(Denied::TooMany);
+        }
+        if addrs.is_empty() {
+            return Err(Denied::Disallowed);
+        }
+        let allowed = |ip| {
+            #[cfg(test)]
+            if self.loopback_stub {
+                return matches!(ip, IpAddr::V4(v) if v.is_loopback());
+            }
+            match self.policy {
+                Policy::Lan => is_allowed_ip(ip),
+                Policy::Public => is_public_ip(ip),
+            }
+        };
+        if addrs.iter().all(|a| {
+            (matches!(self.policy, Policy::Lan) || a.port() == self.port) && allowed(a.ip())
+        }) {
+            Ok(())
+        } else {
+            Err(Denied::Disallowed)
         }
     }
 
@@ -194,7 +290,7 @@ impl Resolver for PinResolver {
         if addrs.is_empty() {
             return Err(ureq::Error::HostNotFound);
         }
-        vet(&addrs).map_err(deny)?;
+        self.vet(&addrs).map_err(deny)?;
         // 名前解決を待っている間に停止が来ていれば、接続しない（要求の書き込み前の確認は gate.rs）
         if super::gate::stopped() {
             return Err(ureq::Error::Other(Box::new(super::gate::StopRequested)));

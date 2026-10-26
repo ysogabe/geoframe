@@ -1,6 +1,7 @@
 //! AI 専用の HTTP クライアント（P4 / T4.2。設計は p4-design.md §5）。
 //!
-//! 取り込みの同期が使う [`crate::net::agent`] は**変えない**。AI の外部通信は、ここだけを通す。
+//! 取り込みの同期が使う [`crate::net::agent`] は**変えない**。LAN は [`AiHttp`] を通す。
+//! クラウドの非公開transport（[`super::cloud`]）も、ここのagent構築・期限・本文制限を共有する。
 //!
 //! # 固定の振る舞い
 //!
@@ -109,7 +110,7 @@ impl From<LaneError> for HttpError {
     }
 }
 
-fn classify(error: &ureq::Error) -> HttpError {
+pub(super) fn classify(error: &ureq::Error) -> HttpError {
     if gate::is_stop(error) {
         return HttpError::Stopping;
     }
@@ -158,7 +159,15 @@ impl Deadline {
             TaskKind::QueryEmbedding => Self::interactive(),
             TaskKind::ImageEmbedding => Self::background(60),
             TaskKind::LocationClue => Self::background(150),
-            TaskKind::PhotoJudge | TaskKind::LocationSuggest => Self::background(180),
+            TaskKind::PhotoJudge => Self::background(120),
+            TaskKind::LocationSuggest => Self::background(180),
+        }
+    }
+
+    /// 同じ全体期限内の短い操作（認証など）。全体期限を延ばさない。
+    pub(super) fn capped(&self, limit: Duration) -> Self {
+        Self {
+            at: self.at.min(Instant::now() + limit),
         }
     }
 
@@ -321,21 +330,7 @@ impl AiHttp {
         let host = authority.host();
         let pinned_host = host.trim_start_matches('[').trim_end_matches(']');
         // ureq の unversioned API は、このファイルのこの 1 か所（と dest.rs の Resolver・gate.rs の Connector）だけ
-        let config = ureq::Agent::config_builder()
-            .max_redirects(0)
-            .proxy(None)
-            .http_status_as_error(false)
-            .timeout_connect(Some(CONNECT_TIMEOUT))
-            .timeout_global(Some(BACKGROUND_MAX_TIMEOUT))
-            .max_idle_connections(2)
-            .max_idle_connections_per_host(2)
-            .user_agent(concat!("geoframe/", env!("CARGO_PKG_VERSION")))
-            .build();
-        let agent = ureq::Agent::with_parts(
-            config,
-            connector,
-            PinResolver::new(pinned_host, port, lookup),
-        );
+        let agent = build_agent(connector, PinResolver::new(pinned_host, port, lookup));
         Ok(Self(Arc::new(Inner {
             agent,
             scheme,
@@ -450,35 +445,55 @@ impl Session {
                 .send(body),
         };
         drop(armed);
-        let mut response = result.map_err(|e| classify(&e))?;
-        let status = response.status().as_u16();
-        if (300..400).contains(&status) {
-            return Err(HttpError::Redirect(status));
-        }
-        let retry_after_secs = response
-            .headers()
-            .get("retry-after")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| {
-                let v = v.trim();
-                (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
-                    .then(|| v.parse::<u32>().ok())
-                    .flatten()
-            });
-        let body = if (200..300).contains(&status) {
-            net::read_body_limited(response.body_mut(), MAX_RESPONSE_BYTES).map_err(|e| {
-                match classify(&e) {
-                    HttpError::Net(Failure::Other) => HttpError::BodyUnreadable,
-                    other => other,
-                }
-            })?
-        } else {
-            Vec::new()
-        };
-        Ok(Reply {
-            status,
-            retry_after_secs,
-            body,
-        })
+        read_reply(result.map_err(|e| classify(&e))?)
     }
+}
+
+/// LAN とクラウドが共有する、proxy/redirect 無効の agent。公開の任意URL入口ではない。
+pub(super) fn build_agent(connector: impl Connector, resolver: PinResolver) -> ureq::Agent {
+    let config = ureq::Agent::config_builder()
+        .max_redirects(0)
+        .proxy(None)
+        .http_status_as_error(false)
+        .timeout_connect(Some(CONNECT_TIMEOUT))
+        .timeout_global(Some(BACKGROUND_MAX_TIMEOUT))
+        .max_idle_connections(2)
+        .max_idle_connections_per_host(2)
+        .user_agent(concat!("geoframe/", env!("CARGO_PKG_VERSION")))
+        .build();
+    ureq::Agent::with_parts(config, connector, resolver)
+}
+
+pub(super) fn read_reply(
+    mut response: ureq::http::Response<ureq::Body>,
+) -> Result<Reply, HttpError> {
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        return Err(HttpError::Redirect(status));
+    }
+    let retry_after_secs = response
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| {
+            let v = v.trim();
+            (!v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| v.parse::<u32>().ok())
+                .flatten()
+        });
+    let body = if (200..300).contains(&status) {
+        net::read_body_limited(response.body_mut(), MAX_RESPONSE_BYTES).map_err(
+            |e| match classify(&e) {
+                HttpError::Net(Failure::Other) => HttpError::BodyUnreadable,
+                other => other,
+            },
+        )?
+    } else {
+        Vec::new()
+    };
+    Ok(Reply {
+        status,
+        retry_after_secs,
+        body,
+    })
 }

@@ -159,3 +159,5 @@ STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解�
 - `Disabled`から`RunError::PolicyDisabled`への対応付け、401/403/404/契約不一致から`ProviderPause`／`TaskPause`への対応付け、429のRetry-After、予算エラー（`Budget`）の扱いは、各handlerが`before_send`の結果をそのまま返すことで揃う（ワーカーがジョブの状態へ対応付ける）。
 - HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。空間別のベクトル保存・検索空間の切替・旧選別の安全化はT4.3で実装済み（[ai-index.md](ai-index.md)。切替の成功率の閾値`activation_min_coverage`は、今は`try_activate`の引数と既定0.95で、このJSONには置かない。後続が任意の独立キーとして足す場合は、有限の0〜1だけを許し、不正ならAI設定不正としてAIだけを無効にし、閾値は設定ハッシュ・結果の同一性に入れない）。対話の検索語Embedding（`query_embedding`）の予約・キャッシュ、画像／文EmbeddingのアダプターはT4.4、Decisionの質問・clue保存・クラウドはT4.6。
 
+
+Vertexの明示認証・固定宛先・token/予算/失敗分類は[ai-cloud.md](ai-cloud.md)（T4.6a）。handler登録と実クラウド利用の許可は後続。

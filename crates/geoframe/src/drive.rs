@@ -35,9 +35,7 @@ mod stub;
 mod tests;
 
 use std::fmt;
-use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -76,8 +74,6 @@ pub const PAGE_SIZE: u32 = 1000;
 const MAX_PAGES: u32 = 2000;
 /// 一覧・トークンの応答の大きさの上限。1 ページ 1000 件で数百 KB なので十分。
 const MAX_JSON_BYTES: u64 = 16 << 20;
-/// 鍵ファイルの大きさの上限（実物は 2 KB ほど）。
-const MAX_KEY_BYTES: u64 = 64 << 10;
 /// 原本 1 枚のダウンロードの時間の上限（名前解決から読み切りまで）。agent の 30 秒は大きな原本に足りない。
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 /// トークンの期限のこれだけ前に取り直す。
@@ -88,28 +84,9 @@ const COPY_CHUNK: usize = 256 << 10;
 // ---------------------------------------------------------------------------
 // 失敗
 
-/// 鍵ファイルの失敗の種類。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeyError {
-    /// 通常のファイルではない（ディレクトリなど）、または大きすぎる。
-    NotRegular,
-    /// 読めない（`ErrorKind` だけを持つ）。
-    Unreadable(io::ErrorKind),
-    /// JSON として読めない、または `client_email`・`private_key` が文字列でない。
-    Malformed,
-}
-
-impl fmt::Display for KeyError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotRegular => f.write_str("鍵ファイルが通常のファイルではないか大きすぎます"),
-            Self::Unreadable(kind) => write!(f, "鍵ファイルを読めません（{kind}）"),
-            Self::Malformed => {
-                f.write_str("鍵ファイルが JSON として不正か、必要な項目がありません")
-            }
-        }
-    }
-}
+pub use crate::service_account::KeyError;
+#[cfg(test)]
+use crate::service_account::MAX_KEY_BYTES;
 
 /// Drive との通信の失敗。**固定の語・状態コード・`ErrorKind` だけ**を持つ（URL・本文・鍵・トークンを含まない）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,49 +326,15 @@ impl Default for DriveShared {
     }
 }
 
-/// 鍵ファイルから読む 2 つの値。
-struct ServiceAccount {
-    email: String,
-    private_key: String,
-}
-
-/// 鍵ファイルを読む。通常のファイルだけ（`DRIVE_KEY.exists()` と同じくリンクは辿る）。
-/// 他のユーザーに読める権限なら、プロセスで 1 回だけ警告する（値は出さない）。
-fn load_service_account(path: &Path, warned: &AtomicBool) -> Result<ServiceAccount, KeyError> {
-    // 開く前に種類を見る（FIFO を開くと、書き手が来るまで止まる）。リンクは辿る
-    let before = fs::metadata(path).map_err(|e| KeyError::Unreadable(e.kind()))?;
-    if !before.is_file() {
-        return Err(KeyError::NotRegular);
-    }
-    let file = fs::File::open(path).map_err(|e| KeyError::Unreadable(e.kind()))?;
-    let meta = file
-        .metadata()
-        .map_err(|e| KeyError::Unreadable(e.kind()))?;
-    if !meta.is_file() || meta.len() > MAX_KEY_BYTES {
-        return Err(KeyError::NotRegular);
-    }
-    if meta.permissions().mode() & 0o077 != 0 && !warned.swap(true, Ordering::SeqCst) {
-        tracing::warn!(
-            "[drive] 鍵ファイルが所有者以外にも読める権限です（{:03o}）。0600 にしてください",
-            meta.permissions().mode() & 0o777
-        );
-    }
-    let mut text = String::new();
-    file.take(MAX_KEY_BYTES + 1)
-        .read_to_string(&mut text)
-        .map_err(|e| KeyError::Unreadable(e.kind()))?;
-    let json: Value = serde_json::from_str(&text).map_err(|_| KeyError::Malformed)?;
-    let field = |name: &str| {
-        json.get(name)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-            .ok_or(KeyError::Malformed)
-    };
-    Ok(ServiceAccount {
-        email: field("client_email")?,
-        private_key: field("private_key")?,
-    })
+fn load_service_account(
+    path: &Path,
+    warned: &AtomicBool,
+) -> Result<crate::service_account::ServiceAccount, KeyError> {
+    crate::service_account::load_service_account(
+        path,
+        warned,
+        crate::service_account::Context::Drive,
+    )
 }
 
 /// 現行の `re.fullmatch(r"[A-Za-z0-9_-]{20,}", name)`。フォルダの設定が ID なら、名前の検索をしない。

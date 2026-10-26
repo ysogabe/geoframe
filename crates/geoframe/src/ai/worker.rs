@@ -177,6 +177,25 @@ pub struct RunCtx<'a> {
 }
 
 impl<'a> RunCtx<'a> {
+    #[cfg(test)]
+    pub(super) fn for_test(
+        read: &'a Connection,
+        config: &'a AiConfig,
+        task: TaskKind,
+        stop: &'a StopFlag,
+        writer: &'a Writer,
+        clock: &'a Clock,
+    ) -> Self {
+        Self {
+            read,
+            config,
+            task,
+            stop,
+            writer,
+            clock,
+        }
+    }
+
     /// 読み取り専用の接続（写真・結果・入力世代の読み取り）。トランザクションを長く持たない。
     pub fn read(&self) -> &Connection {
         self.read

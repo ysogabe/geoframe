@@ -56,6 +56,7 @@ struct State {
     stop: StopFlag,
     /// この要求で、すでに書き始めたトランスポート（その後の書き込みは確認しない）。
     writing: Option<u64>,
+    started: bool,
 }
 
 thread_local! {
@@ -71,10 +72,17 @@ pub fn arm(stop: &StopFlag) -> Armed {
         let previous = c.borrow_mut().replace(State {
             stop: stop.clone(),
             writing: None,
+            started: false,
         });
         debug_assert!(previous.is_none(), "gate armed twice");
     });
     Armed(())
+}
+
+impl Armed {
+    pub(super) fn started(&self) -> bool {
+        CURRENT.with(|c| c.borrow().as_ref().is_some_and(|s| s.started))
+    }
 }
 
 impl Drop for Armed {
@@ -103,6 +111,8 @@ fn permit_write(id: u64) -> Result<(), ureq::Error> {
             return Err(ureq::Error::Other(Box::new(StopRequested)));
         }
         state.writing = Some(id);
+        // 最初の write 試行からは、実バイト数が不明でも保守的に送信済み。
+        state.started = true;
         Ok(())
     })
 }

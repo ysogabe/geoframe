@@ -1,7 +1,7 @@
 # AI Provider基盤（T4.2）
 
 - 状態: T4.2で実装。設計は[p4-design.md](p4-design.md) §4.3・§5、設定は[ai-config.md](ai-config.md)。
-- 範囲: **AI専用のHTTP・接続先の固定・Discovery・Decisionの入出力・共有の一時待機**まで。用途別のhandler（Decisionの質問と閾値・clueの保存はT4.6、画像／文EmbeddingはT4.4）、クラウドのアダプター（Vertexの認証・送信）は含まない。`production_handlers()`は空のまま（未登録のjobはclaimも成功化もされない）。
+- 範囲: **AI専用のHTTP・接続先の固定・Discovery・Decisionの入出力・共有の一時待機**まで。用途別のhandler（Decisionの質問と閾値・clueの保存はT4.6、画像／文EmbeddingはT4.4）、クラウドの認証・送信はT4.6aで追加した[ai-cloud.md](ai-cloud.md)を参照。`production_handlers()`は空のまま（未登録のjobはclaimも成功化もされない）。
 - 実LAN・外部AI・クラウド・課金は使っていない（試験はループバックのスタブ・偽のDNS・合成の画像／DBだけ）。
 
 ## 参照した契約（固定した版）
@@ -24,9 +24,9 @@
 | 名前解決 | 接続のたびに全A/AAAAを検査し、private（RFC 1918・IPv6 ULA）とloopbackだけを許す。IPv4-mapped IPv6はIPv4へ正規化。公開・link-local・CGNAT・unspecified・multicast・空・17個以上が**1つでも**あれば全体を拒否（`DestinationDenied`）。検査済みのアドレスをそのまま接続に渡し、**URLをIPに書き換えない**ので`Host`とTLSのSNI・証明書の検証は元のhostのまま。検査後に別のDNS問い合わせはしない（接続の再利用でも要求ごとに解決し直して検査する） |
 | DNS待ち | 要求の全体期限の残りまで。補助スレッドは同時に4本まで（超えたら時間切れ）。遅いDNSでスレッドが増え続けない |
 | リダイレクト | 追わない（`max_redirects(0)`）。3xxは`Redirect(状態)`で、本文を読まず、Locationへ接続しない。認証・呼び出し側のヘッダーを別の宛先へ出す経路は無い |
-| プロキシ | 使わない（`proxy(None)`）。`HTTP_PROXY`/`HTTPS_PROXY`は読まない。クラウドのプロキシは管理者が明示した場合だけ（T4.6以降の境界。設定JSONには足していない） |
+| プロキシ | 使わない（`proxy(None)`）。`HTTP_PROXY`/`HTTPS_PROXY`は読まない。クラウドも環境proxyを使わず、任意proxyの設定入口は無い（[ai-cloud.md](ai-cloud.md)） |
 | ヘッダー | `X-Client-Name: geoframe`・`Accept`・POSTの`Content-Type`・`User-Agent: geoframe/<版>`だけ。`Origin`は付けない |
-| 期限 | Discovery全体2秒（catalog＋service＋health）、対話15秒、背景60〜180秒（Decision 150秒、Embedding 60秒、判定・位置候補180秒）。DNS・接続（5秒まで）・ヘッダー・本文の読み切りを含む |
+| 期限 | Discovery全体2秒（catalog＋service＋health）、対話15秒、背景60〜180秒（Decision 150秒、Embedding 60秒、判定120秒・位置候補180秒）。DNS・接続（5秒まで）・ヘッダー・本文の読み切りを含む |
 | 要求の上限 | 完成したJSON（base64込み）8 MiB。**送る前**に検査し、超えたらDNSも接続もしない（`RequestTooLarge`）。上流のDecisionの本文16 MiBよりこちらを優先 |
 | 応答の上限 | 展開後1 MiB（`net::read_body_limited`。圧縮前の上限も同じ関数が掛ける）。2xx以外の本文は読まない |
 | 枠 | 背景1・対話1で独立。対話の枠が使用中なら待たず`Busy`（定型503に当たる）。対話が枠を待つ間は新しい背景を始めない |

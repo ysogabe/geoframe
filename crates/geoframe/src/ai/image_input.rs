@@ -176,6 +176,11 @@ impl PreparedImage {
         self.jpeg.len().div_ceil(3) * 4
     }
 
+    /// クラウドの inlineData 用。入力は増やさず、この型が作った JPEG だけを返す。
+    pub(crate) fn jpeg_base64(&self) -> String {
+        base64::engine::general_purpose::STANDARD.encode(&self.jpeg)
+    }
+
     /// `data:image/jpeg;base64,<自分が作った JPEG>`。外部 URL・ファイルのパス・他の形式は作れない。
     pub fn data_url(&self) -> String {
         let mut url = String::from("data:image/jpeg;base64,");
