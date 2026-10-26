@@ -866,7 +866,7 @@ fn debug_output_never_contains_urls_paths_or_model_names() {
     for task in TaskKind::ALL {
         text.push_str(&format!("{:?}", s.task(task)));
         if let Ok(gate) = config.gate(task, true) {
-            text.push_str(&format!("{:?}", gate.settings));
+            text.push_str(&format!("{gate:?} {:?}", gate.settings));
         }
     }
     text.push_str(&format!("{:?}", config.summary()));

@@ -1041,8 +1041,8 @@ impl Disabled {
     }
 }
 
-/// 使ってよい用途と、その接続情報・上限（[`AiConfig::gate`]）。
-#[derive(Debug, Clone, Copy)]
+/// 使ってよい用途と、その接続情報・上限（[`AiConfig::gate`]）。`Debug` は URL・モデル名を出さない。
+#[derive(Clone, Copy)]
 pub struct Gate<'a> {
     pub task: TaskKind,
     pub settings: &'a TaskSettings,
@@ -1053,4 +1053,15 @@ pub struct Gate<'a> {
     pub cycle_secs: u32,
     /// クラウドの用途だけ。送る直前に [`super::budget::reserve`] で枠を予約する。
     pub budget: Option<SendBudget>,
+}
+
+impl fmt::Debug for Gate<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gate")
+            .field("task", &self.task)
+            .field("cycle_limit", &self.cycle_limit)
+            .field("cycle_secs", &self.cycle_secs)
+            .field("budget", &self.budget)
+            .finish_non_exhaustive()
+    }
 }
