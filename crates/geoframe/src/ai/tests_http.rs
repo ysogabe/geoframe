@@ -87,6 +87,8 @@ pub(super) struct Captured {
     pub request_line: String,
     pub headers: Vec<(String, String)>,
     pub body_len: usize,
+    /// 本文（256 KiB までのもの。それより大きい要求は空）。
+    pub body: Vec<u8>,
 }
 
 impl Captured {
@@ -196,7 +198,13 @@ fn read_request(
         .find(|(k, _)| k == "content-length")
         .and_then(|(_, v)| v.parse().ok())
         .unwrap_or(0);
+    let keep = length <= 256 * 1024;
     let mut have = buf.len() - head_end;
+    let mut body = if keep {
+        buf[head_end..].to_vec()
+    } else {
+        Vec::new()
+    };
     while have < length {
         let n = stream.read(&mut chunk).ok()?;
         if n == 0 {
@@ -204,11 +212,15 @@ fn read_request(
         }
         total.fetch_add(n, Ordering::SeqCst);
         have += n;
+        if keep {
+            body.extend_from_slice(&chunk[..n]);
+        }
     }
     Some(Captured {
         request_line,
         headers,
         body_len: length,
+        body,
     })
 }
 

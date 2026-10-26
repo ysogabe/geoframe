@@ -15,8 +15,8 @@
 //! # 範囲
 //!
 //! ここは**入出力の形の検査**まで。質問の文面・clue の閾値・結果の保存（`photo_loc_clues`）・位置候補への接続は T4.6。
-//! 画像は [`PreparedImage`]（メタデータなし・寸法検査済みの JPEG／PNG／WebP）だけを受け取り、元画像や URL・パスは
-//! 受けない。
+//! 画像は [`PreparedImage`]（検証済みの RGB 画素列から新しく作った、メタデータなしのベースライン JPEG）だけを受け取り、
+//! 圧縮済みの画像・dataURL・URL・パスは受けない。
 
 use serde_json::{Map, Value, json};
 
@@ -410,7 +410,7 @@ mod tests {
     use crate::ai::image_input::{ImageProfile, fixtures};
 
     fn image() -> PreparedImage {
-        PreparedImage::from_bytes(fixtures::jpeg(32, 24), ImageProfile::Decision).unwrap()
+        fixtures::image(32, 24)
     }
 
     pub(crate) fn questions() -> Vec<Question> {
@@ -477,21 +477,21 @@ mod tests {
 
     #[test]
     fn oversized_request_json_is_refused_before_it_is_sent() {
-        // 画像 1 枚が 8,000,000 バイトに近いと base64 で 8 MiB を超える（上流の 16 MiB より厳しい側を優先）
-        // IDAT で余白を作る（PNG は許可したチャンクだけ通る。IDAT の中身は見ない）
-        let mut padded = fixtures::png(32, 32, None);
-        let iend = padded.split_off(padded.len() - 12);
-        let mut chunk = (6_300_000u32).to_be_bytes().to_vec();
-        chunk.extend_from_slice(b"IDAT");
-        chunk.extend(std::iter::repeat_n(0u8, 6_300_000));
-        chunk.extend_from_slice(&[0; 4]);
-        padded.extend(chunk);
-        padded.extend(iend);
-        let image = PreparedImage::from_bytes(padded, ImageProfile::Decision).unwrap();
-        assert!(image.len() < 8_000_000);
-        // 6.3MB × 4/3 = 8.4MB > 8 MiB (8,388,608)
-        let request = DecisionRequest::new("m", "s", questions(), vec![image]).unwrap();
-        assert_eq!(request.to_json().unwrap_err(), RequestError::TooLarge);
+        // 清浄な（画素から作った）JPEG だけで 8 MiB を超える: 圧縮しにくい 1024×1024 を 1 回だけエンコードし、
+        // 1 枚（base64 で約 5.8MB）は収まり、2 枚は収まらない（上流の 16 MiB より厳しい 8 MiB のほうを優先）
+        let big = PreparedImage::encode_jpeg_rgb(
+            &fixtures::noise_rgb(1024, 1024),
+            1024,
+            1024,
+            100,
+            ImageProfile::Decision,
+        )
+        .unwrap();
+        assert!(big.len() < 8_000_000);
+        let one = DecisionRequest::new("m", "s", questions(), vec![big.clone()]).unwrap();
+        assert!(one.to_json().is_ok(), "1 枚なら 8 MiB に収まる");
+        let two = DecisionRequest::new("m", "s", questions(), vec![big; 2]).unwrap();
+        assert_eq!(two.to_json().unwrap_err(), RequestError::TooLarge);
     }
 
     #[test]

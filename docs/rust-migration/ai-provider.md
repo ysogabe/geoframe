@@ -61,14 +61,13 @@
 
 - 送る前に`GET /llm-decision/health`: `status=ready`かつ`modalities`に`image`があり、`model`が設定の`location_clue`のモデルと同じ。`loading`・`modalities`がnullは一時待ち、`image`が無い・モデル違いは契約エラー。
 - `POST /llm-decision/v1/systemone`: 要求は`{model, state, questions:{名前:{type: choice|noul, instructions, criteria}}, images:[dataURL]}`、応答は`{model, answers, usage}`。応答の形を要求の質問と突き合わせて検査する（`noul`は有限の0〜1、`choice`は要求の選択肢のいずれか、`error`を持つ質問は`Unanswerable`）。質問の文面・閾値・clueの保存はT4.6。
-- 画像は`PreparedImage`（JPEG/PNG/WebPのdataURLだけ）。1枚8,000,000バイト以下・1.6メガピクセル以下・長辺はDecision 1536px（埋め込み用は768px）。メタデータを含むもの・構造が最後まで正しくないものは**断る**（黙って削らない）。外部URL・ファイルのパス・元画像は受けない。縮小・向きの適用・再エンコードは用途（T4.6/T4.4）が既存のderivativeから行い、この版は検査の境界と`PreparedImage::encode_jpeg_rgb`（EXIFを出さないエンコード）までを持つ。
-- **JPEGの検査**（`image_input::jpeg_scan`。最初のSOSで打ち切らず、EOIまで全マーカーを読む）:
-  - 許す: SOF0/1/2（8bit・1か3成分。プログレッシブも可）、DHT・DQT・DRI・SOS・EOI、形が固定のAPP0（`JFIF\0` 1.x・14バイトちょうど・サムネイルなし）とAPP14（`Adobe` 12バイトちょうど）。DQT/DHT/SOF/SOS/DRIは中身の構造まで見て、**ペイロードに余分なバイトがあれば断る**（任意データを隠せない）。
-  - 断る: APP1（EXIF/XMP）、**APP2（ICCプロファイルは任意のタグを持てるので中身を見ずに断る。入力はsRGBのderivativeが前提）**、APP3〜13（IPTCなど）、APP15、COM、JPGn、JFXXやJFIFのサムネイル、算術符号・ロスレス・階層・12bit・4成分、DNL、予約マーカー、SOF後のAPP0/APP14、SOIの重複。
-  - エントロピー符号化部分は、バイトスタッフィング（`FF 00`）・リスタート（`FF D0..D7`。DRIが有効で番号が0から順）・マーカー前の詰め物`FF`を読み分けて**正しく読み飛ばす**（SOSが複数のプログレッシブも同じ）。**EOIが無い（途中で切れた）ものと、EOIの後ろにデータがあるものは断る**（MPFなどを後ろに持つ写真は事前にderivativeで作り直す前提）。
-  - 大きさ・画素数の上限を**先に**適用し、そのあと`zune-jpeg`の厳格モードで全体をデコードして確かめる（1.6MP×3バイトまで。結果は捨てる）。ベースライン/シーケンシャルは末尾のEOIを外して読ませ、EOIを付け足された切れた走査を「ゼロ埋めで成功」にさせない。
-  - 限界: プログレッシブは次のマーカーとしてEOIを読むので、走査の途中で切れてEOIだけ付け足されたものは見抜けない。最後の走査の「全MCUの後ろからEOIまで」に足されたバイト、ハフマン表のシンボル・画素データに隠された任意のバイト列も対象外（ハフマン符号を自前で数える必要がある）。
-- PNGはIHDRで始まりIENDで終わり、IENDの後ろにデータが無いこと。許すチャンクはIHDR/PLTE/IDAT/IEND/tRNS/gAMA/cHRM/sRGB/sBIT/bKGD/pHYsだけ（iCCP・tIME・eXIf・テキスト・未知は断る）。WebPはRIFFの長さがファイルの長さと一致し、チャンクはVP8X/VP8/VP8L/ALPHだけ（ICCP/EXIF/XMP・未知は断る）。PNG/WebPの画素データそのものはデコードしない（この版では寸法の読み取りだけ）。
+- **画像の境界**（`image_input`）: `PreparedImage`は、**検証済みのRGB画素列からこのモジュールが新しく作ったベースラインJPEGだけ**を持つ（フィールドはprivate）。圧縮済みのJPEG/PNG/WebP・dataURL・外部URL・ファイルのパスを取り込む入口は無い（`from_bytes`相当は公開にも内部にも試験用にも置かない）。唯一の入口は`PreparedImage::encode_jpeg_rgb(rgb, width, height, quality, profile)`。
+  - **エンコードの前に**確かめる: 寸法が0でない・長辺がprofile（Decision 1536px／Embedding 768px）以下・画素数1,600,000以下・RGBの長さが`width×height×3`ちょうど（欠けた画素を補わない）。合わなければ何も確保せず固定のエラー（`malformed`・`too_large`・`too_many_pixels`）。出力が8,000,000バイトを超えれば`too_many_bytes`。品質は1〜100に丸める。
+  - エンコーダーは呼ぶたびに新しく作る（`jpeg-encoder`。EXIF・ICC・コメントを出さない。出るのは形が固定のJFIF APP0・DQT・SOF0・DHT・SOS・EOIだけ）。dataURLは`data:image/jpeg;base64,<自分が作ったJPEG>`だけで、他の文字列を混ぜない。`Debug`は寸法だけ（バイト列・画素・dataURLを出さない）。
+  - **構造的な保証**: 元画像の圧縮データ（EXIF・GPS・XMP・コメント・EOIの後ろ・PNGのチャンク・WebPの拡張領域など）は型に入らないので、Providerへ出る道が無い。`image_input`のdoc-testに、`from_bytes`・任意dataURLの受け入れ・private fieldの直接構築がコンパイルできないこと（`compile_fail`）と、正規の入口が使えること（成功する例）を置いた。
+  - **後続のhandler（T4.6/T4.4）の使い方**: 既存のimaging（原本・derivativeのデコード・向きの適用・縮小）でRGBを得て、この入口へ渡す。圧縮データのデコードAPIは`PreparedImage`に足さない。元画像のデコードに失敗した・画素が欠けていた場合の扱いは既存のimaging処理の責務で、ここへは成功して得たRGBだけが来る。
+  - 移行メモ: 旧版（r2まで）は圧縮バイト列を取り込み、独自のJPEG/PNG/WebP解析で検査して**そのバイト列を送った**ため、非画素の追加データ（EOI直前の文字列・PNGの不正長チャンク・WebPのVP8X拡張）と画素の欠損（CRCの合う`IDAT=[0]`のPNG・`VP8X`だけのWebP・走査の途中で切れEOIを付け直したプログレッシブ）が通った。独自parserと圧縮データの再利用をすべて撤去し、`from_bytes`を使っていた呼び出し（Decisionの要求・試験）は`encode_jpeg_rgb`に置き換えた。
+  - **既知の限界**: 画素そのものに埋め込まれた文字や模様（ステガノグラフィ）は検出しない。縮小・向きの適用・EXIF由来の補正は画像の準備をする側（後続）の責務で、`PreparedImage`は渡されたRGBの寸法のまま送る。
 - 入口は`decision::run(ctx, lan, request)`: 組み立て（8 MiB検査）→`before_probe`→背景の枠→Discovery・health→`before_send`→POST。POSTが通信失敗・5xxなら**Discoveryをやり直して分類**する（使えなければ待ち、使えるならそのjobだけの反復失敗）。
 
 ## 分類（`ai::provider`）

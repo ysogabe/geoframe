@@ -151,7 +151,7 @@ impl Lab {
 }
 
 fn image() -> PreparedImage {
-    PreparedImage::from_bytes(fixtures::jpeg(32, 24), ImageProfile::Decision).unwrap()
+    fixtures::image(32, 24)
 }
 
 fn questions() -> Vec<Question> {
@@ -419,17 +419,16 @@ fn post_status_codes_and_bodies_are_classified() {
 fn an_oversized_request_is_a_permanent_error_with_nothing_received() {
     let lab = new_lab();
     let client = lab.client();
-    // 8 MiB を超える JSON（画像 4 枚の base64）
-    let mut padded = fixtures::png(32, 32, None);
-    let iend = padded.split_off(padded.len() - 12);
-    let mut chunk = (2_500_000u32).to_be_bytes().to_vec();
-    chunk.extend_from_slice(b"IDAT");
-    chunk.extend(std::iter::repeat_n(0u8, 2_500_000));
-    chunk.extend_from_slice(&[0; 4]);
-    padded.extend(chunk);
-    padded.extend(iend);
-    let image = PreparedImage::from_bytes(padded, ImageProfile::Decision).unwrap();
-    let request = DecisionRequest::new(MODEL, "s", questions(), vec![image; 4]).unwrap();
+    // 8 MiB を超える JSON（清浄に生成した 1024×1024 の画像 2 枚の base64。大きな画像のエンコードは 1 回だけ）
+    let image = PreparedImage::encode_jpeg_rgb(
+        &fixtures::noise_rgb(1024, 1024),
+        1024,
+        1024,
+        100,
+        ImageProfile::Decision,
+    )
+    .unwrap();
+    let request = DecisionRequest::new(MODEL, "s", questions(), vec![image; 2]).unwrap();
     assert!(request.to_json().is_err());
     let before = lab.requests();
     assert_eq!(
@@ -814,43 +813,54 @@ fn a_stop_during_name_resolution_is_not_counted_as_a_wait_pause_or_attempt() {
     assert_eq!(pause_rows(&e), []);
 }
 
-/// 画素データのあとにメタデータを足した JPEG は準備済み入力にならず、Decision のスタブには何も届かない。
+/// Provider のスタブへ届く画像は、この型が RGB から作った JPEG だけ。圧縮コンテナの追加データは取り込む入口が無く、
+/// 届いた dataURL を復号すると、自分が作った JPEG とバイト単位で同じで、メタデータのマーカーを持たない。
 #[test]
-fn an_image_with_trailing_metadata_never_reaches_the_lab() {
+fn only_the_self_generated_jpeg_reaches_the_lab() {
     let lab = new_lab();
     let client = lab.client();
-    let _ = &client;
-    let base = fixtures::jpeg(32, 24);
-    for tail in [
-        fixtures::segment(0xE1, b"Exif\0\0II*\0"),
-        fixtures::segment(0xFE, b"hidden"),
-    ] {
-        let bad = fixtures::before_eoi(base.clone(), &tail);
-        assert_eq!(
-            PreparedImage::from_bytes(bad, ImageProfile::Decision).unwrap_err(),
-            super::image_input::ImageError::HasMetadata
-        );
-    }
-    // EOI の後ろに足したデータ
-    let mut after = base.clone();
-    after.extend_from_slice(b"trailing");
-    assert_eq!(
-        PreparedImage::from_bytes(after, ImageProfile::Decision).unwrap_err(),
-        super::image_input::ImageError::Malformed
+    let (w, h) = (32u16, 24u16);
+    let expected =
+        PreparedImage::encode_jpeg_rgb(&fixtures::rgb(w, h), w, h, 82, ImageProfile::Decision)
+            .unwrap();
+    let request = DecisionRequest::new(MODEL, "s", questions(), vec![expected.clone()]).unwrap();
+    decision::ask(
+        &session(&client),
+        &request,
+        &Deadline::after(Duration::from_secs(5)),
+    )
+    .unwrap();
+    assert_eq!(lab.posts(), 1);
+    let requests = lab.stub.requests.lock().unwrap();
+    let post = requests
+        .iter()
+        .find(|r| r.request_line.starts_with("POST "))
+        .unwrap();
+    let body: Value = serde_json::from_slice(&post.body).unwrap();
+    let urls = body["images"].as_array().unwrap();
+    assert_eq!(urls.len(), 1);
+    // dataURL は image/jpeg で、自分が作った JPEG と同一。他の文字列を混ぜない
+    assert_eq!(urls[0].as_str().unwrap(), expected.data_url());
+    let jpeg = {
+        use base64::Engine as _;
+        let url = urls[0].as_str().unwrap();
+        base64::engine::general_purpose::STANDARD
+            .decode(url.strip_prefix("data:image/jpeg;base64,").unwrap())
+            .unwrap()
+    };
+    assert_eq!(&jpeg[..2], [0xFF, 0xD8]);
+    assert_eq!(&jpeg[jpeg.len() - 2..], [0xFF, 0xD9]);
+    // メタデータ（APP1〜APP15・COM）のマーカー（FF E1..EF, FF FE）は無い。走査内の FF は FF 00 に詰められる
+    let sos = jpeg.windows(2).position(|x| x == [0xFF, 0xDA]).unwrap();
+    assert!(
+        jpeg[..sos]
+            .windows(2)
+            .all(|x| !(x[0] == 0xFF && matches!(x[1], 0xE1..=0xEF | 0xFE)))
     );
-    // 切れた JPEG（SOS の直後）も同じ
-    let sos = fixtures::marker_positions(&base, 0xDA)[0];
-    let cut =
-        base[..sos + 2 + usize::from(u16::from_be_bytes([base[sos + 2], base[sos + 3]]))].to_vec();
-    assert!(PreparedImage::from_bytes(cut, ImageProfile::Decision).is_err());
-    assert_eq!(
-        (
-            lab.requests(),
-            lab.stub.connections.load(Ordering::SeqCst),
-            lab.stub.bytes.load(Ordering::SeqCst)
-        ),
-        (0, 0, 0)
-    );
+    // 画像以外の本文の項目は固定（余計な項目は無い）
+    let mut keys: Vec<_> = body.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(keys, ["images", "model", "questions", "state"]);
 }
 
 #[test]
