@@ -74,7 +74,7 @@ impl GenerateRequest {
         }
         let body = serde_json::to_vec(&json!({
             "contents": [{"role":"user", "parts":parts}],
-            "generationConfig": {"responseMimeType":"application/json", "responseSchema":schema}
+            "generationConfig": {"temperature":0.1, "responseMimeType":"application/json", "responseJsonSchema":schema}
         }))
         .map_err(|_| RequestError::Invalid)?;
         if body.len() > MAX_REQUEST_BYTES {
@@ -118,9 +118,16 @@ pub(super) fn parse_reply(body: &[u8]) -> Option<JsonReply> {
     let mut text = String::new();
     for part in parts {
         let object = part.as_object()?;
-        if object.len() != 1 {
+        // 単発要求なので署名は再送・保存しない。既知の text 付随メタデータだけ許可。
+        if object
+            .keys()
+            .any(|k| k != "text" && k != "thoughtSignature")
+            || object
+                .get("thoughtSignature")
+                .is_some_and(|s| !s.is_string())
+        {
             return None;
-        } // URL/function call/inlineData/thought は解釈しない
+        } // URL/function call/inlineData/thought 等は引き続き拒否。
         text.push_str(object.get("text")?.as_str()?);
     }
     if text.is_empty() || text.len() as u64 > MAX_RESPONSE_BYTES {

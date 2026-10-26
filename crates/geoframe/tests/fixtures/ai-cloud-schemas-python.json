@@ -1,0 +1,243 @@
+{
+  "source": {
+    "photo_judge": "app/geoframe/ai_pipeline.py:JUDGE_SCHEMA",
+    "location_suggest": "app/geoframe/loc_suggest.py:SCHEMA"
+  },
+  "schemas": {
+    "photo_judge": {
+      "type": "object",
+      "properties": {
+        "same_scene": {
+          "type": "boolean"
+        },
+        "summary": {
+          "type": "string"
+        },
+        "photos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": {
+                "type": "integer"
+              },
+              "subject": {
+                "type": "string",
+                "enum": [
+                  "person",
+                  "dog",
+                  "cat",
+                  "person_and_pet",
+                  "landscape",
+                  "food",
+                  "vehicle",
+                  "other"
+                ]
+              },
+              "pet_state": {
+                "type": "string",
+                "enum": [
+                  "awake",
+                  "sleeping",
+                  "active",
+                  "uncertain",
+                  "not_applicable"
+                ]
+              },
+              "eyes": {
+                "type": "string",
+                "enum": [
+                  "open",
+                  "closed",
+                  "mixed",
+                  "not_visible",
+                  "uncertain",
+                  "not_applicable"
+                ]
+              },
+              "face_crop": {
+                "type": "string",
+                "enum": [
+                  "good",
+                  "intentional_closeup",
+                  "accidental_cut",
+                  "not_visible",
+                  "uncertain",
+                  "not_applicable"
+                ]
+              },
+              "horizon_status": {
+                "type": "string",
+                "enum": [
+                  "level",
+                  "intentional_tilt",
+                  "accidental_tilt",
+                  "uncertain",
+                  "not_applicable"
+                ]
+              },
+              "horizon_score": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100
+              },
+              "subject_sharpness": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100
+              },
+              "aesthetic_score": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100
+              },
+              "keep_score": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 100
+              },
+              "recommended": {
+                "type": "boolean"
+              },
+              "reasons": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "concerns": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            },
+            "required": [
+              "index",
+              "subject",
+              "pet_state",
+              "eyes",
+              "face_crop",
+              "horizon_status",
+              "horizon_score",
+              "subject_sharpness",
+              "aesthetic_score",
+              "keep_score",
+              "recommended",
+              "reasons",
+              "concerns"
+            ]
+          }
+        }
+      },
+      "required": [
+        "same_scene",
+        "summary",
+        "photos"
+      ]
+    },
+    "location_suggest": {
+      "type": "object",
+      "properties": {
+        "country": {
+          "type": "string"
+        },
+        "country_code": {
+          "type": "string",
+          "description": "ISO 3166-1 alpha-2"
+        },
+        "city": {
+          "type": "string"
+        },
+        "place_name": {
+          "type": "string",
+          "description": "日本語の地名（最も細かい場所）"
+        },
+        "geocode_query": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low",
+            "unknown"
+          ]
+        },
+        "precision": {
+          "type": "string",
+          "enum": [
+            "landmark",
+            "district",
+            "city",
+            "region",
+            "country",
+            "unknown"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "photos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": {
+                "type": "integer"
+              },
+              "place_name": {
+                "type": "string"
+              },
+              "geocode_query": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "medium",
+                  "low",
+                  "unknown"
+                ]
+              },
+              "precision": {
+                "type": "string",
+                "enum": [
+                  "landmark",
+                  "district",
+                  "city",
+                  "region",
+                  "country",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "index",
+              "place_name",
+              "geocode_query",
+              "confidence",
+              "precision"
+            ]
+          }
+        }
+      },
+      "required": [
+        "country",
+        "country_code",
+        "city",
+        "place_name",
+        "geocode_query",
+        "confidence",
+        "precision",
+        "evidence",
+        "photos"
+      ]
+    }
+  }
+}

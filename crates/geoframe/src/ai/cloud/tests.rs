@@ -41,6 +41,23 @@ fn good_reply() -> Vec<u8> {
     serde_json::to_vec(&json!({"candidates":[{"finishReason":"STOP", "content":{"parts":[{"text":"{\"marker\":\"synthetic-reply\"}"}]}}]})).unwrap()
 }
 
+const SYNTHETIC_SIGNATURE: &str = "synthetic-thought-signature-never-persist";
+
+fn envelope(parts: Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({"candidates":[{
+        "finishReason":"STOP", "content":{"parts":parts}
+    }]}))
+    .unwrap()
+}
+
+fn signed_reply() -> Vec<u8> {
+    envelope(json!([
+        {"text":"{\"marker\":"},
+        {"text":"\"synthetic-reply\"}"},
+        {"text":"", "thoughtSignature":SYNTHETIC_SIGNATURE}
+    ]))
+}
+
 pub(super) fn transport(server: &Stub, host: &str, dns: &Arc<FakeDns>) -> Transport {
     dns.script(host, vec![vec![server.addr]]);
     Transport::stub(
@@ -208,6 +225,158 @@ fn typed_request_and_envelope_keep_generated_jpeg_and_redact_debug() {
     assert!(reply.json_text().contains("synthetic-reply"));
     assert!(!format!("{reply:?}").contains("synthetic-reply"));
     for body in [b"{}".to_vec(),b"not-json".to_vec(),serde_json::to_vec(&json!({"candidates":[{"finishReason":"MAX_TOKENS","content":{"parts":[{"text":"{}"}]}}]})).unwrap(),serde_json::to_vec(&json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"fileData":{"fileUri":"https://untrusted.invalid"}}]}}]})).unwrap()] { assert!(request::parse_reply(&body).is_none()); }
+}
+
+fn assert_python_schema_envelope(task: TaskKind) {
+    // Generated from AST only by tools/gen_ai_cloud_schema_fixture.py --check.
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/ai-cloud-schemas-python.json"
+    ))
+    .unwrap();
+    let schema = &fixture["schemas"][task.as_str()];
+    assert_eq!(schema["type"], "object");
+    let images = [(1, fixtures::image(32, 24))];
+    let r = match task {
+        TaskKind::PhotoJudge => GenerateRequest::photo_judge("synthetic-prompt", schema, &images),
+        TaskKind::LocationSuggest => {
+            GenerateRequest::location_suggest("synthetic-prompt", schema, &images)
+        }
+        _ => unreachable!(),
+    }
+    .unwrap();
+    let body: Value = serde_json::from_slice(&r.body).unwrap();
+    let config = &body["generationConfig"];
+    assert_eq!(config["responseJsonSchema"], *schema);
+    assert!(config.get("responseSchema").is_none());
+    assert_eq!(config["temperature"], json!(0.1));
+    assert_eq!(config["responseMimeType"], "application/json");
+    assert_eq!(r.task, task);
+}
+
+#[test]
+fn photo_judge_preserves_python_json_schema_and_generation_config() {
+    assert_python_schema_envelope(TaskKind::PhotoJudge);
+}
+
+#[test]
+fn location_suggest_preserves_python_json_schema_and_generation_config() {
+    assert_python_schema_envelope(TaskKind::LocationSuggest);
+}
+
+#[test]
+fn reply_accepts_only_text_with_optional_string_signature_and_discards_it() {
+    for text in ["{}", "[]"] {
+        for parts in [
+            json!([{"text":text}]),
+            json!([{"text":text,"thoughtSignature":SYNTHETIC_SIGNATURE}]),
+            json!([{"text":&text[..1]}, {"text":&text[1..]},
+                {"text":"","thoughtSignature":SYNTHETIC_SIGNATURE}]),
+        ] {
+            let reply = request::parse_reply(&envelope(parts)).unwrap();
+            assert_eq!(reply.json_text(), text);
+            assert!(!reply.json_text().contains(SYNTHETIC_SIGNATURE));
+            assert!(!format!("{reply:?}").contains(SYNTHETIC_SIGNATURE));
+        }
+    }
+}
+
+#[test]
+fn reply_rejects_other_payloads_invalid_signature_json_and_finish_reason() {
+    for (name, value) in [
+        ("functionCall", json!({"name":"synthetic"})),
+        ("fileData", json!({"fileUri":"https://untrusted.invalid"})),
+        (
+            "inlineData",
+            json!({"mimeType":"image/jpeg","data":"synthetic"}),
+        ),
+        ("url", json!("https://untrusted.invalid")),
+        ("thought", json!(true)),
+        ("unknownPayload", json!({})),
+    ] {
+        // Reject the payload both alone and alongside otherwise valid signed text.
+        for with_text in [false, true] {
+            let mut part = json!({"thoughtSignature":SYNTHETIC_SIGNATURE});
+            if with_text {
+                part["text"] = json!("{}");
+            }
+            part[name] = value.clone();
+            assert!(request::parse_reply(&envelope(json!([part]))).is_none());
+        }
+    }
+    for signature in [Value::Null, json!(1), json!(true), json!([]), json!({})] {
+        assert!(
+            request::parse_reply(&envelope(json!([
+                {"text":"{}","thoughtSignature":signature}
+            ])))
+            .is_none()
+        );
+    }
+    for text in ["", "{", "null", "1", "true", "\"text\""] {
+        assert!(
+            request::parse_reply(&envelope(json!([
+                {"text":text,"thoughtSignature":SYNTHETIC_SIGNATURE}
+            ])))
+            .is_none()
+        );
+    }
+    for parts in [
+        json!([]),
+        json!([{}]),
+        json!([{"text":1}]),
+        json!([{"thoughtSignature":SYNTHETIC_SIGNATURE}]),
+    ] {
+        assert!(request::parse_reply(&envelope(parts)).is_none());
+    }
+    for finish in [json!("MAX_TOKENS"), json!("SAFETY"), json!(null)] {
+        let mut body: Value = serde_json::from_slice(&signed_reply()).unwrap();
+        body["candidates"][0]["finishReason"] = finish;
+        assert!(request::parse_reply(&serde_json::to_vec(&body).unwrap()).is_none());
+    }
+    let mut body: Value = serde_json::from_slice(&signed_reply()).unwrap();
+    let candidate = body["candidates"][0].clone();
+    body["candidates"].as_array_mut().unwrap().push(candidate);
+    assert!(request::parse_reply(&serde_json::to_vec(&body).unwrap()).is_none());
+    assert!(request::parse_reply(&vec![b' '; (1 << 20) + 1]).is_none());
+}
+
+#[test]
+fn signed_200_succeeds_once_with_budget_one_and_never_persists_signature() {
+    let (_dir, e) = fixture(1);
+    let auth = stub(|s, _| respond(s, "200 OK", "", &token_body()));
+    let api = stub(|s, _| respond(s, "200 OK", "", &signed_reply()));
+    let dns = FakeDns::new();
+    let c = client(
+        &e,
+        transport(&api, "api.test", &dns),
+        transport(&auth, "oauth.test", &dns),
+    );
+    let handler = Fake::new(JobKind::PhotoJudge, move |ctx, _| {
+        let reply = c.run(ctx, &request())?;
+        assert_eq!(reply.json_text(), "{\"marker\":\"synthetic-reply\"}");
+        assert!(!format!("{reply:?}").contains(SYNTHETIC_SIGNATURE));
+        // Synthetic downstream saving: no production handler or result schema is added.
+        Ok(persist_result(
+            reply.json_text().into(),
+            InputCheck::Current,
+        ))
+    });
+    e.enqueue(&key(JobKind::PhotoJudge, "signed"));
+    let logs = crate::testutil::capture::logs_of(|| {
+        e.cycle(std::slice::from_ref(&handler), &StopFlag::new());
+        e.cycle(std::slice::from_ref(&handler), &StopFlag::new());
+    });
+    assert!(!logs.contains(SYNTHETIC_SIGNATURE));
+    assert_eq!(e.state(JobKind::PhotoJudge, "signed"), JobState::Succeeded);
+    assert_eq!(usage(&e), 1);
+    assert_eq!(api.requests.lock().unwrap().len(), 1);
+    assert_eq!(auth.requests.lock().unwrap().len(), 1);
+    assert_eq!(e.results(), 1);
+    let saved: String = e
+        .writer()
+        .call(|c| c.query_row("SELECT target FROM ai_test_results", [], |r| r.get(0)))
+        .unwrap();
+    assert_eq!(saved, "{\"marker\":\"synthetic-reply\"}");
+    assert!(!saved.contains(SYNTHETIC_SIGNATURE));
 }
 
 #[test]

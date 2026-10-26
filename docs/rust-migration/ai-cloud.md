@@ -22,7 +22,9 @@ let reply = client.run(ctx, &request)?;
 
 位置候補は`GenerateRequest::location_suggest`を使い、`TaskKind::LocationSuggest`のctx/clientと組み合わせる。異なる用途・設定の組合せは拒否する。constructorはtext・重複しない正の画像番号・`PreparedImage`・response schemaを受け、`contents`と`generationConfig`だけを内部構築する。圧縮bytes・dataURL・URL・path・任意inlineDataを受ける入口は無い。完成JSONをbase64込み8 MiBで検査し、超過は鍵／DNS／HTTPより前に断る。
 
-応答は展開後1 MiB、圧縮前は`net::wire_limit`（2 MiB + 64 KiB）で制限。2xx以外の本文は読まない。単一candidate、`finishReason=STOP`、textだけのpartsからJSON object/arrayのテキストを取り出す。切れた応答・不正JSON・function/fileData等は固定`BadResponse`。モデル応答のURLをfetchしない。写真判定／地名／座標などの意味とschema適合の確認、有償回答の保存はT4.5/T4.6cが行う。
+生成設定は既存Pythonの`ai_pipeline.py::_judge_group`・`loc_suggest.py::ask_gemini`に合わせ、`temperature: 0.1`、`responseMimeType: application/json`、`responseJsonSchema: <渡されたJSON Schema>`とする。小文字の`object/array/integer/string/boolean`や`properties/required/enum/minimum/maximum`等はそのまま渡し、`responseSchema`へ変換・併記しない。[Google GenerationConfig Java資料](https://docs.cloud.google.com/java/docs/reference/google-cloud-vertexai/latest/com.google.cloud.vertexai.api.GenerationConfig)はJSON Schemaを受ける代替fieldと排他条件を記載し、[現行REST資料](https://docs.cloud.google.com/gemini-enterprise-agent-platform/reference/rest/Shared.Types/GeminiExample)にも両fieldがある（2026-10-27確認。REST資料では`responseJsonSchema`はdeprecated表記だが、今回は既存Python互換を維持する）。実APIで受理・拒否されたという検証ではない。
+
+応答は展開後1 MiB（署名メタデータ込みの総本文）、圧縮前は`net::wire_limit`（2 MiB + 64 KiB）で制限。2xx以外の本文は読まない。単一candidate、`finishReason=STOP`、各Partが必須`text: string`と任意`thoughtSignature: string`だけである場合に、textを順に連結してJSON object/arrayを取り出す。最後の空text＋署名Partを含む分割JSONも許す。[Googleのthought signatures資料](https://docs.cloud.google.com/gemini-enterprise-agent-platform/models/thinking/thought-signatures)は非functionCallの最後のtext Partにも署名が付くと記載している（2026-10-27確認）。単発要求なので署名は破棄し、`JsonReply`・Debug・ログ・後続の保存へ渡さず、会話履歴として再送もしない。型不正の署名、text以外のpayload（functionCall/fileData/inlineData/URL/未知field等）、切れた応答、不正JSONは固定`BadResponse`。未知payloadを一括無視しない。モデル応答のURLをfetchしない。写真判定／地名／座標などの意味とschema適合の確認、有償回答の保存はT4.5/T4.6cが行う。
 
 ## 固定宛先と通信
 
@@ -86,3 +88,11 @@ LXCでの初回受入後の検証修正（2026-10-27）: 期限試験はRSA署�
 wire上限試験の失敗も試験入力の計算量が原因だった。既存gzip helperを拡張し、[RFC 1952 §2.3.1.1](https://www.rfc-editor.org/rfc/rfc1952#section-2.3.1.1)に従う大きなFEXTRAを持つ34 memberで圧縮前上限を超える入力を作る。展開後は空のまま。展開後上限+1の圧縮入力とは分け、合法headerの復号と展開後上限ちょうどの成功も確認する。両超過は正確な`ResponseTooLarge`かつ`started=true`を要求する。
 
 否定対照は、wire上限の無効化で空の正常応答になって試験が失敗、各HTTPで期限を再開始すると残時間の比較が失敗、writerの全体期限制限を外すと待ち時間の検査が失敗することを確認し、すべて復元した。修正後はfmt／workspace全targets clippy（`-D warnings`）／workspace全28 suite（1024 pass・2 ignore）／musl releaseが成功。ローカルmusl debugのcloud全26件（元の失敗2件と新writer回帰を含む）も成功した。LXCでの再実行は親タスクが担当する。通常レビューはOpusのレート制限により未実施のまま。
+
+Sol簡易レビュー指摘の修正（2026-10-27、修正前HEAD `6c4f509`、原タスク開始 `dd5b4a3`）: 正常text、text＋合成署名、末尾の空text＋署名を持つ分割JSON（object/array）が成功し、他payload・型不正署名・不正JSON・STOP以外・複数candidate・本文超過が拒否される回帰試験を追加した。署名付き200を返すloopback＋合成worker/DBの統合で、daily limit 1でもジョブ成功・推論1要求／予算1・token交換1回、追加cycleでも再送なし、`JsonReply`／Debug／ログ／合成保存値に署名なしを確認した。本番の保存handlerは追加していない。
+
+両用途のschema fixtureは`crates/geoframe/tests/fixtures/ai-cloud-schemas-python.json`。出所は`app/geoframe/ai_pipeline.py:JUDGE_SCHEMA`と`app/geoframe/loc_suggest.py:SCHEMA`で、`tools/gen_ai_cloud_schema_fixture.py`が必要な定数参照とliteral/listだけをASTで展開する。アプリのimport・実行や環境／秘密の探索はしない。`python3 tools/gen_ai_cloud_schema_fixture.py --check`で現行定数との完全一致を確認する。Rustの両用途試験は`include_str!`でfixture全体をコンパイル時に含め、そのままのJSON Schema・`responseSchema`不在・temperature 0.1・JSON MIMEを検査し、LXC上のソース絶対パスからの実行時読取りに依存しない。固定prompt・domain parser・handler登録は後続のまま。
+
+今回の旧版否定対照: `Part.object.len() == 1`の旧制限へ戻すと署名許可parser回帰と署名付き200統合が失敗した。旧`responseSchema`＋temperature省略へ戻すと両用途のschema fixture回帰がともに失敗した。いずれも一度だけ実行し、修正版へ復元した。
+
+修正後の結果: cloud全31件成功。`cargo test --workspace`は全28 suite成功、**1029 pass・0 fail・2 ignore**（今回5件追加、既存Drive回帰を含む）。`cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo build --workspace --release --target x86_64-unknown-linux-musl`が成功し、musl binaryのstatic-pieと`--version`起動も確認した。ソケット制限による`Operation not permitted`の後、loopbackを使う試験は権限付きで実行した。実クラウド・実鍵・実写真・実DB・SSH・本番は未使用。LXCでの再実行と別Solによる修正後レビューは親タスクが担当する。親所有の`tasks.md`・`p4-foundation-acceptance.md`は編集・stageしない。
