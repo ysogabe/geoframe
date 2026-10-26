@@ -103,7 +103,7 @@ P3で守ること（各タスクの委任文に入れる）:
 | T4.4 | #93で採用された画像／文EmbeddingアダプターとE5/E6の本接続、対話用枠・検索キャッシュ | AC2, AC3, AC6, AC7, AC10b | T4.2, T4.3, #93の契約 | full | 未着手 | | | API契約待ち。既存text-only APIへ画像を送らない |
 | T4.5 | 同一場面グループ、ルール／既存の重みで代表選択、任意のGemini比較 | AC3, AC4, AC5, AC6, AC8 | T4.3, T4.4, T4.6a | full | 未着手 | | | 旧選別と部分重複する新判定の自動置換なし |
 | T4.6a | Vertexの明示認証・固定HTTPS宛先・token分離と401更新、用途別クラウド通信境界 | AC2, AC5, AC10a | T4.1c, T4.2 | full | 完了 | dd5b4a3 | e1fea35..1092c7e | 実装Sol（Sonnetは利用上限で開始前中断）。ユーザー指定のSol簡易レビュー2回: 必須1・推奨1→0。署名付き応答とPython生成設定の互換を修正。全1029テスト成功・2件ignore、fmt/clippy・musl成功。LXC cloud31件・Drive74件成功。初回LXCの期限/wire試験も修正しwriter待ちを全体期限へ制限。新規handler・実クラウド送信は後続 |
-| T4.6b | Decision用の画像準備・質問・clue解釈、写真別reconcileと世代CAS、failedを手がかりなしとして記録 | AC2, AC4, AC5, AC8, AC10a | T4.1c, T4.2 | full | 未着手 | | | 一時利用不可と未判定は日を待たせる。写真内容・位置をログへ出さない |
+| T4.6b | Decision用の画像準備・質問・clue解釈、写真別reconcileと世代CAS、failedを手がかりなしとして記録 | AC2, AC4, AC5, AC8, AC10a | T4.1c, T4.2 | full | 実装中 | 3eae4f9 | | 一時利用不可と未判定は日を待たせる。既存Pythonのclue契約とRustの画像・worker境界を調査して実装。写真内容・位置をログへ出さない |
 | T4.6c | 日単位の位置候補・有償回答保存と別jobでの座標化、Python互換run_id／部分集合再利用 | AC2, AC4, AC5, AC8, AC9 | T4.6a, T4.6b | full | 未着手 | | | 実クラウド送信の用途・費用の許可は別に確認。保存済み回答を再送せず、候補だけ保存して手動GPSを保護 |
 | T4.7 | LXCで通しの受入、Provider停止／復帰、miharashi・管理操作、Python切り戻しと結果の記録 | AC1〜9, AC10a, AC10b | T4.1a〜T4.5, T4.6a〜c | ops | 未着手 | | | 先行部分も節目ごとにLXCで確認。P4完了は全ACの確認後 |
 
