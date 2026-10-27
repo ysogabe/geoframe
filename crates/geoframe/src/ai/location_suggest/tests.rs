@@ -555,6 +555,103 @@ fn generations_with_same_python_id_keep_history_and_key_collisions_do_not_overwr
 }
 
 #[test]
+fn successful_generations_never_accumulate_as_failures() {
+    let mut db = Db::new();
+    let first = db.seed();
+    let mut keys = std::collections::HashSet::new();
+    for generation in 1..=8 {
+        db.conn
+            .execute("UPDATE photos SET mtime=?1", [generation])
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE photo_quality_features SET source_mtime=?1",
+                [generation],
+            )
+            .unwrap();
+        let plan = db.plan();
+        assert_eq!(plan.key().target_key, first.key().target_key);
+        assert!(keys.insert(plan.key().input_hash));
+        let claimed = db.save(&plan);
+        assert_eq!(claimed.attempts, 0);
+        assert_eq!(
+            db.n("SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded' AND attempts=0"),
+            generation
+        );
+        assert_eq!(db.n("SELECT COUNT(*) FROM ai_jobs"), generation);
+        assert_eq!(db.n("SELECT attempts FROM photo_loc_runs"), 1);
+        assert_eq!(
+            db.n("SELECT COUNT(*) FROM ai_location_suggest_results WHERE attempts=1"),
+            generation
+        );
+        assert_eq!(
+            db.n("SELECT COUNT(*) FROM ai_location_suggest_results"),
+            generation
+        );
+        let Lookup::Reusable(saved) = db.lookup() else {
+            panic!("current successful generation must remain reusable")
+        };
+        assert_eq!(saved.result_key(), plan.key().input_hash);
+        assert_eq!(saved.attempts(), 1);
+    }
+}
+
+#[test]
+fn verified_done_inherits_real_failures_without_its_successful_request() {
+    let mut db = Db::new();
+    let first = db.seed();
+    let mut claimed = db.claim(&first);
+    for failure in 1..=4 {
+        let now = T + failure * 1000;
+        assert_eq!(
+            jobs::record_failure_with(
+                &mut db.conn,
+                &claimed,
+                now,
+                ErrorCode::Timeout,
+                Failure::Attempt,
+                |_| panic!("nonterminal failure must not project")
+            )
+            .unwrap(),
+            Some(JobState::Pending)
+        );
+        claimed = jobs::claim_next(
+            &db.conn,
+            now + 500,
+            "synthetic-boot",
+            "synthetic-token",
+            &[JobKind::LocationSuggest],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(i64::from(claimed.attempts), failure);
+    }
+    assert_eq!(
+        complete(&mut db.conn, &claimed, &first, &answer(), T + 5000).unwrap(),
+        Completion::Succeeded
+    );
+    assert_eq!(db.n("SELECT attempts FROM photo_loc_runs"), 5);
+    db.conn.execute("UPDATE photos SET mtime=2", []).unwrap();
+    db.conn
+        .execute("UPDATE photo_quality_features SET source_mtime=2", [])
+        .unwrap();
+    let next = db.plan();
+    assert_eq!(next.key().target_key, first.key().target_key);
+    assert_ne!(next.key().input_hash, first.key().input_hash);
+    let claimed = db.save(&next);
+    assert_eq!(claimed.attempts, 4);
+    assert_eq!(
+        db.n("SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded' AND attempts=4"),
+        2
+    );
+    assert_eq!(db.n("SELECT attempts FROM photo_loc_runs"), 5);
+    assert_eq!(
+        db.n("SELECT COUNT(*) FROM ai_location_suggest_results WHERE attempts=5"),
+        2
+    );
+}
+
+#[test]
 fn completion_rejects_stale_token_and_changed_members_rolls_back_on_sql_error() {
     for mutation in [
         "UPDATE photos SET rotation=90 WHERE id=1",
@@ -609,7 +706,7 @@ fn legacy(db: &Db, p: &Plan, status: &str, n: u32) {
 fn legacy_paid_done_collision_and_subset_are_held_and_unchanged() {
     let mut db = Db::new();
     let p = db.seed();
-    legacy(&db, &p, "done", 1);
+    legacy(&db, &p, "done", 5);
     let before = crate::ai::tests::dump(&db.conn);
     assert!(matches!(db.lookup(), Lookup::LegacyUnverified));
     assert!(matches!(
@@ -618,6 +715,19 @@ fn legacy_paid_done_collision_and_subset_are_held_and_unchanged() {
     ));
     assert_eq!(db.n("SELECT COUNT(*) FROM ai_jobs"), 0);
     assert_eq!(before, crate::ai::tests::dump(&db.conn));
+    db.conn.execute("UPDATE photos SET mtime=2", []).unwrap();
+    db.conn
+        .execute("UPDATE photo_quality_features SET source_mtime=2", [])
+        .unwrap();
+    let updated = db.plan();
+    assert_eq!(updated.key().target_key, p.key().target_key);
+    assert_ne!(updated.key().input_hash, p.key().input_hash);
+    assert!(matches!(
+        enqueue(&mut db.conn, &updated, &[], T + 1).unwrap(),
+        Queue::LegacyUnverified
+    ));
+    assert_eq!(db.n("SELECT COUNT(*) FROM ai_jobs"), 0);
+    assert_eq!(db.n("SELECT attempts FROM photo_loc_runs"), 5);
     db.conn
         .execute("UPDATE photos SET lat=1 WHERE id=2", [])
         .unwrap();
@@ -943,7 +1053,13 @@ fn generation_round_trip_restores_only_owned_projection_without_new_job_or_auth(
         .execute("UPDATE photos SET rotation=90", [])
         .unwrap();
     let b = db.plan();
-    db.save(&b);
+    let claimed = db.claim(&b);
+    // Both successful generations now have attempts=1; use the actual later save time
+    // to distinguish their otherwise identical Python projections.
+    assert_eq!(
+        complete(&mut db.conn, &claimed, &b, &answer(), T + 2).unwrap(),
+        Completion::Succeeded
+    );
     db.conn.execute("UPDATE photos SET rotation=0", []).unwrap();
     let day = db.days().remove(0);
     let observed = db.observations(&day);

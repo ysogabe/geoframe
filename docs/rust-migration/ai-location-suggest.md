@@ -80,7 +80,7 @@ repository を単独で使うときは `complete(&mut conn, &claimed, &plan, &an
 
 ## 試行・移行・残る境界
 
-ai_jobs.attempts（課金され得る失敗回数）を唯一の正とする。互換 done.attempts は保存時の ai_jobs.attempts + 1（成功要求を含む回数）、互換 error.attempts は terminal 時の ai_jobs.attempts。別の試行 counter を導入しない。同じ Python run_id の旧 error 等の attempts は新 job INSERT 時に継承し、5以上なら最初から failed / terminal（上限5へ保守的に丸める）。既存キーの enqueue / obsolete往復では reset しない。手動 jobs::retry_failed による reset 後は再 seed しない。過去の paid answer 履歴の元 attempts は変更しない。401更新後の2回目のPOSTは別の送信予算1枠で、jobの1試行とは区別する（既存 CloudClient の保証、c2が維持）。
+ai_jobs.attempts（課金され得る失敗回数）を唯一の正とする。互換 done.attempts は保存時の ai_jobs.attempts + 1（成功要求を含む回数）、互換 error.attempts は terminal 時の ai_jobs.attempts。別の試行 counter を導入しない。同じ Python run_id の attempts は新 job INSERT 時に失敗回数として継承する。ただし、整合性を検証した Rust 履歴と互換全11列が一致する done は、保存時の成功要求1回を引いた saved.attempts - 1 を継承する。世代ごとの成功回数を失敗へ積み上げない。例えば失敗0＋成功の done.attempts=1 からは0、失敗4＋成功の done.attempts=5 からは4を継承する。未検証の旧 done は成功分を引く根拠にせず LegacyUnverified で保留し、自動再送しない。旧 error の attempts は減らさず継承し、5以上なら最初から failed / terminal（上限5へ保守的に丸める）。既存キーの enqueue / obsolete往復では reset しない。手動 jobs::retry_failed による reset 後は再 seed しない。過去の paid answer 履歴の元 attempts は変更しない。401更新後の2回目のPOSTは別の送信予算1枠で、jobの1試行とは区別する（既存 CloudClient の保証、c2が維持）。
 
 新表は ai::pending_active / migrate_active 系だけに置き、REQUIRED_SCHEMA / Python schema には足さない。ガード後の INGEST 起動で、有効な LocationSuggest gate があるときだけ作る。未指定 / 不正 / disabled / allow_cloudなし / daily_limitなしでは作らない。INGEST=0では作成せず旧 DB を read API で読み続ける。dry-run は有効な場合だけ不足1表を追加し、既存表があれば0。冪等移行は既存の Python 全表・全行を変えない。
 
@@ -95,3 +95,13 @@ c2 では Decision ready / CloudClient / 401待ち後の現写真と許可 gate�
 通常 sandbox での全件試験初回は loopback bind の `Operation not permitted` により lib 670 pass / 217 fail / 1 ignored で中断した。loopback を許可した権限付き再実行と、最終の日付 CAS 補強後の再実行は共に全件成功。既存の flaky failure は出ていない。再実行も合成 fixture / loopback のみで、実 LAN / 実クラウド / 実鍵 / 実写真 / 実 DB / SSH / LXC は使用していない。
 
 AST fixture は `python3 tools/gen_location_suggest_fixture.py --check` と既存の cloud schema fixture 照合で確認。Rust の全11列互換 run を、実 Python AST の `_parse_answer` / `run_id_for` / `_reusable_run` で読み戻し、部分集合再利用も成功した。gap等値を分割する変異、旧done衝突の保留を除く変異、保存sentの観測世代照合を除く変異、旧attemptsを0へ落とす変異は、それぞれ対応する新試験が assertion で失敗することを確認し、元へ戻した。c2 の HTTP / worker / 座標化 E2E、LXC、別Solの簡易レビューは親担当の後続作業。
+
+## 修正ラウンド2の検証
+
+開始 HEAD `40ce3f0`（原タスク開始 `8c0b906`）。検証済み Rust done の互換 attempts に含まれる成功1回を、新世代 job の失敗回数へ継承しないよう修正した。schema・公開 API・予算経路・保存時の成功回数投影は変更していない。追加表／dry-run の不足数も従来どおり有効時1表、作成済み0。
+
+追加2試験で、同じ送信 ID / model / prompt のまま mtime と品質行の世代を8回更新し、毎世代 claim / success、全 job の失敗回数0、互換 done.attempts=1、全8回答の履歴保持を確認。実際の record_failure_with を4回経た成功からも、新世代の失敗回数4・互換 done.attempts=5を確認した。既存試験は未検証旧 done.attempts=5＋画像世代変更でも保留／新 job なしを補強し、旧 error の上限5・manual retry だけの reset・世代往復を再確認。継承を旧処理へ戻す否定対照では domain / repository の25 pass・追加2 failとなり、修正版へ復元した。
+
+初回の修正後 focused 試験は26 pass・1 fail。既存 A→B→A 試験が、同じ保存時刻／回答に加えて誤った attempts の差で互換投影を区別していたためで、B を後の保存時刻で確定する fixture に修正した。最終の domain / repository 全27試験は成功し、既存 flake は出ていない。
+
+最終検証は fmt、workspace 全 targets clippy（`-D warnings`）、workspace test 全28 suite **1083 pass / 0 fail / 2 ignored**、musl release build が成功（Cargo は全て `--offline`、test は既知の loopback 制限のため権限付き）。musl は file / ldd で静的リンク、`--version` 起動成功。両 Python AST fixture の `--check` も成功。合成 fixture / loopback のみ使用し、c2・LXC・別Solによる再レビューは親へ引き継ぐ。

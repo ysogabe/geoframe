@@ -380,7 +380,8 @@ pub fn restore_projection(
     Ok(Lookup::Unverified)
 }
 
-/// 既存 error の試行を新 job へ継承する。初回 INSERT だけで seed し、手動 retry 後は reset を妨げない。
+/// 既存 run の失敗回数を新 job へ継承する。検証済み Rust done の成功1回は含めない。
+/// 初回 INSERT だけで seed し、手動 retry 後は reset を妨げない。
 /// この短い tx の外で画像観測/準備を終える。policy/STOP/budget gate は c2 の送信直前に別途必要。
 pub fn enqueue(
     conn: &mut Connection,
@@ -424,17 +425,25 @@ pub fn enqueue_in(
     let mut enqueued = jobs::enqueue_in(conn, &key, now)?;
     if enqueued == Enqueued::Created {
         // A Python run_id is model/prompt/sent-set keyed, even when a new image generation is planned.
-        let legacy = Compat::read(conn)?
+        let (history, _) = history(conn)?;
+        let failure_floor = Compat::read(conn)?
             .into_iter()
             .filter(|c| c.run_id == key.target_key)
-            .map(|c| c.attempts.max(0))
+            .map(|c| {
+                // Only an exact, verified Rust projection proves the successful request.
+                // Unverified legacy done rows were held by classify, never discounted here.
+                history
+                    .iter()
+                    .find(|s| s.compat() == c)
+                    .map_or(c.attempts.max(0), |s| i64::from(s.attempts - 1))
+            })
             .max()
             .unwrap_or(0)
             .min(i64::from(jobs::MAX_ATTEMPTS));
         conn.execute("UPDATE ai_jobs SET attempts=?5, terminal=(?5>=5),state=CASE WHEN ?5>=5 THEN 'failed' ELSE state END
           WHERE kind=?1 AND target_key=?2 AND input_hash=?3 AND processor_version=?4",
-          params![key.kind.as_str(),key.target_key,key.input_hash,key.processor_version,legacy])?;
-        if legacy >= i64::from(jobs::MAX_ATTEMPTS) {
+          params![key.kind.as_str(),key.target_key,key.input_hash,key.processor_version,failure_floor])?;
+        if failure_floor >= i64::from(jobs::MAX_ATTEMPTS) {
             enqueued = Enqueued::Existing(jobs::JobState::Failed);
         }
     }
