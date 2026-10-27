@@ -422,7 +422,7 @@ pub fn enqueue(conn: &mut Connection, key: &JobKey, now: i64) -> rusqlite::Resul
 }
 
 /// [`enqueue`] の本体（呼び出し側のトランザクションの中で動く。コミットしない）。
-fn enqueue_in(tx: &Connection, key: &JobKey, now: i64) -> rusqlite::Result<Enqueued> {
+pub(super) fn enqueue_in(tx: &Connection, key: &JobKey, now: i64) -> rusqlite::Result<Enqueued> {
     let inserted = tx.execute(
         "INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,next_attempt_at,
                              created_at,updated_at)
@@ -574,7 +574,7 @@ pub fn claim_next(
 }
 
 /// この claim が今も有効（`running` で `run_id`・token が合う）か。
-fn owns(conn: &Connection, claimed: &Claimed) -> rusqlite::Result<bool> {
+pub(super) fn owns(conn: &Connection, claimed: &Claimed) -> rusqlite::Result<bool> {
     conn.query_row(
         "SELECT 1 FROM ai_jobs
          WHERE id=?1 AND state='running' AND run_id=?2 AND claim_token=?3",

@@ -192,7 +192,7 @@ fn typed_request_and_envelope_keep_generated_jpeg_and_redact_debug() {
         body["contents"][0]["parts"][2]["inlineData"]["mimeType"],
         "image/jpeg"
     );
-    assert_eq!(body["contents"][0]["parts"][1]["text"], "Image 17");
+    assert_eq!(body["contents"][0]["parts"][1]["text"], "写真17");
     assert!(!format!("{r:?}").contains("synthetic-prompt"));
     for (prompt, schema, images) in [
         ("", json!({}), vec![(1, image.clone())]),

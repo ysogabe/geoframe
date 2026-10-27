@@ -27,7 +27,12 @@ impl std::fmt::Debug for GenerateRequest {
 }
 
 impl GenerateRequest {
-    // T4.5/T4.6c の crate 内固定 prompt/schema 用。domain の意味の判定は後続。
+    #[cfg(test)]
+    pub(crate) fn body_json_for_test(&self) -> Value {
+        serde_json::from_slice(&self.body).unwrap()
+    }
+
+    // T4.5/T4.6c の crate 内固定 prompt/schema 用。
     #[allow(dead_code)]
     pub(crate) fn photo_judge(
         prompt: &str,
@@ -68,7 +73,12 @@ impl GenerateRequest {
         }
         let mut parts = vec![json!({"text": prompt})];
         for (number, image) in images {
-            parts.push(json!({"text": format!("Image {number}")}));
+            let label = if task == TaskKind::LocationSuggest {
+                format!("写真{number}")
+            } else {
+                format!("Image {number}")
+            };
+            parts.push(json!({"text": label}));
             parts
                 .push(json!({"inlineData": {"mimeType":"image/jpeg", "data":image.jpeg_base64()}}));
         }

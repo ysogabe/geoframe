@@ -182,6 +182,13 @@ struct Input {
 impl Input {
     /// DB だけを読む。writer の中でファイルに触れない。
     fn load(conn: &Connection, id: i64) -> rusqlite::Result<Option<Self>> {
+        Self::load_generation(conn, id, true)
+    }
+    fn load_generation(
+        conn: &Connection,
+        id: i64,
+        unlocated: bool,
+    ) -> rusqlite::Result<Option<Self>> {
         let row = conn
             .query_row(
                 "SELECT p.display,p.drive_id,p.md5,p.mtime,p.rotation,p.taken_at,p.hidden,
@@ -189,8 +196,8 @@ impl Input {
              FROM photos p LEFT JOIN photo_quality_features f
                ON f.photo_id=p.id AND f.display IS p.display
               AND f.source_md5 IS p.md5 AND f.source_mtime IS p.mtime
-             WHERE p.id=?1 AND p.lat IS NULL",
-                [id],
+             WHERE p.id=?1 AND (?2=0 OR p.lat IS NULL)",
+                params![id, unlocated],
                 |r| {
                     // hidden は送信直前にも読むが LAN の世代・対象性には含めない。
                     let _: Value = r.get(6)?;
@@ -290,6 +297,88 @@ impl Input {
         } else {
             self.rel.clone()
         }
+    }
+}
+
+/// 日候補の画像世代。clue の処理版や GPS/hidden を画像世代と混同しない。
+/// fallback の実 SHA 観測は writer 外、DB 再照合は writer 内で行う。
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Generation {
+    photo_id: i64,
+    input_hash: String,
+    source_sha256: Option<String>,
+    observed_sha256: Option<String>,
+}
+impl Generation {
+    pub(crate) fn matches_target(&self, key: &JobKey) -> bool {
+        self.input_hash == key.input_hash
+            && key.target_key == self.photo_id.to_string()
+            && key.kind == JobKind::LocationClue
+    }
+    pub fn photo_id(&self) -> i64 {
+        self.photo_id
+    }
+    pub fn source_sha256(&self) -> Option<&str> {
+        self.source_sha256.as_deref()
+    }
+    pub fn observe(conn: &Connection, data: &DataDir, id: i64) -> rusqlite::Result<Option<Self>> {
+        Ok(Input::load_generation(conn, id, false)?.map(|p| Self::from_input(&p.observe(data))))
+    }
+    fn from_input(p: &Input) -> Self {
+        Self {
+            photo_id: p.id,
+            input_hash: p.key("").input_hash,
+            source_sha256: p.quality_sha.clone().or_else(|| p.observed_sha.clone()),
+            observed_sha256: p.observed_sha.clone(),
+        }
+    }
+    /// ファイル I/O はしない。呼出し側は直前/応答後の observe も比較すること。
+    pub fn matches_db(&self, conn: &Connection) -> rusqlite::Result<bool> {
+        Ok(
+            Input::load_generation(conn, self.photo_id, false)?.is_some_and(|mut p| {
+                p.observed_sha = self.observed_sha256.clone();
+                Self::from_input(&p) == *self
+            }),
+        )
+    }
+}
+impl std::fmt::Debug for Generation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Generation(..)")
+    }
+}
+
+/// 保存済み sent の実 source bytes と世代を writer 外で検証した証明。
+/// DB の品質 SHA だけでは、ファイルだけの更新/削除を未変更とみなさない。
+#[derive(Clone)]
+pub struct SourceObservation {
+    generation: Generation,
+}
+impl SourceObservation {
+    pub fn observe(conn: &Connection, data: &DataDir, id: i64) -> rusqlite::Result<Option<Self>> {
+        let Some(mut p) = Input::load_generation(conn, id, false)? else {
+            return Ok(None);
+        };
+        let Ok(bytes) = read_source(data, &p) else {
+            return Ok(None);
+        };
+        let source = sha(&bytes);
+        if p.fallback() {
+            p.observed_sha = Some(source.clone());
+        }
+        let generation = Generation::from_input(&p);
+        Ok((generation.source_sha256() == Some(source.as_str())).then_some(Self { generation }))
+    }
+    pub fn generation(&self) -> &Generation {
+        &self.generation
+    }
+    pub fn photo_id(&self) -> i64 {
+        self.generation.photo_id()
+    }
+}
+impl std::fmt::Debug for SourceObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SourceObservation(..)")
     }
 }
 

@@ -28,6 +28,7 @@ pub mod index;
 pub mod jobs;
 pub mod lanes;
 pub mod location_clue;
+pub mod location_suggest;
 pub mod ops;
 pub mod pause;
 pub mod provider;
@@ -57,26 +58,41 @@ mod tests_worker;
 
 /// まだ無い AI の表・索引・列の名前（読み取りだけ。`--dry-run` 用）。
 pub fn pending(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    pending_active(conn, true, true)
+}
+
+/// 有効な用途の追加表だけを計画する（書き込みなし）。
+pub fn pending_active(
+    conn: &Connection,
+    clue: bool,
+    suggest: bool,
+) -> rusqlite::Result<Vec<String>> {
     let mut missing = jobs::pending(conn)?;
     missing.extend(missing_tables(conn, budget::TABLES)?);
     missing.extend(missing_tables(conn, pause::TABLES)?);
     missing.extend(missing_tables(conn, runs::TABLES)?);
     missing.extend(missing_tables(conn, waits::TABLES)?);
     missing.extend(index::pending(conn)?);
-    missing.extend(missing_tables(conn, location_clue::TABLES)?);
+    if clue {
+        missing.extend(missing_tables(conn, location_clue::TABLES)?);
+    }
+    if suggest {
+        missing.extend(missing_tables(conn, location_suggest::TABLES)?);
+    }
     Ok(missing)
 }
 
 /// AI の表を全部足す（無いものだけ。既に最新なら何も書かない）。作った名前を返す。
 /// 書き込み用の接続で呼ぶ。他の表・行には触れない。
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
-    migrate_active(conn, true)
+    migrate_active(conn, true, true)
 }
 
-/// 本番起動は有効な location_clue がある時だけ、その結果表を作る。
+/// 本番起動は location_clue / location_suggest のそれぞれ有効な用途の結果表だけを作る。
 pub fn migrate_active(
     conn: &mut Connection,
     location_clue_enabled: bool,
+    location_suggest_enabled: bool,
 ) -> rusqlite::Result<Vec<String>> {
     let mut created = jobs::migrate(conn)?;
     created.extend(create_tables(conn, budget::TABLES, budget::SCHEMA)?);
@@ -89,6 +105,13 @@ pub fn migrate_active(
             conn,
             location_clue::TABLES,
             location_clue::SCHEMA,
+        )?);
+    }
+    if location_suggest_enabled {
+        created.extend(create_tables(
+            conn,
+            location_suggest::TABLES,
+            location_suggest::SCHEMA,
         )?);
     }
     Ok(created)

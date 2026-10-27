@@ -167,6 +167,15 @@ impl PreparedImage {
         self.jpeg.len()
     }
 
+    /// 実送信 JPEG の来歴用。圧縮済み入力を取り込む入口は増やさない。
+    pub fn sha256(&self) -> String {
+        ring::digest::digest(&ring::digest::SHA256, &self.jpeg)
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.jpeg.is_empty()
     }

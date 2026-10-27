@@ -158,9 +158,13 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         .ai
         .gate(ai::settings::TaskKind::LocationClue, true)
         .is_ok();
+    let suggest_enabled = config
+        .ai
+        .gate(ai::settings::TaskKind::LocationSuggest, true)
+        .is_ok();
     migration
         .created
-        .extend(writer.call(move |conn| ai::migrate_active(conn, clue_enabled))?);
+        .extend(writer.call(move |conn| ai::migrate_active(conn, clue_enabled, suggest_enabled))?);
     log_migration(&migration);
 
     let cache = Arc::new(Cache::load(&config.data_dir));
@@ -359,16 +363,17 @@ pub struct Plan {
 /// 書かずに計画を作る。DB は読み取り専用の接続で見る。
 pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
     let mut schema = schema::pending(conn)?;
-    let ai_missing = ai::pending(conn)?;
     let clue_enabled = config
         .ai
         .gate(ai::settings::TaskKind::LocationClue, true)
         .is_ok();
-    schema.missing_objects.extend(
-        ai_missing
-            .into_iter()
-            .filter(|n| clue_enabled || n != "ai_location_clues"),
-    );
+    let suggest_enabled = config
+        .ai
+        .gate(ai::settings::TaskKind::LocationSuggest, config.ingest)
+        .is_ok();
+    schema
+        .missing_objects
+        .extend(ai::pending_active(conn, clue_enabled, suggest_enabled)?);
     Ok(Plan {
         schema,
         leftover_files: count_leftovers(&config.data_dir),

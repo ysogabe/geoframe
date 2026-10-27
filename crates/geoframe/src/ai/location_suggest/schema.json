@@ -1,0 +1,103 @@
+{
+  "type": "object",
+  "properties": {
+    "country": {
+      "type": "string"
+    },
+    "country_code": {
+      "type": "string",
+      "description": "ISO 3166-1 alpha-2"
+    },
+    "city": {
+      "type": "string"
+    },
+    "place_name": {
+      "type": "string",
+      "description": "日本語の地名（最も細かい場所）"
+    },
+    "geocode_query": {
+      "type": "string"
+    },
+    "confidence": {
+      "type": "string",
+      "enum": [
+        "high",
+        "medium",
+        "low",
+        "unknown"
+      ]
+    },
+    "precision": {
+      "type": "string",
+      "enum": [
+        "landmark",
+        "district",
+        "city",
+        "region",
+        "country",
+        "unknown"
+      ]
+    },
+    "evidence": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "photos": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "place_name": {
+            "type": "string"
+          },
+          "geocode_query": {
+            "type": "string"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low",
+              "unknown"
+            ]
+          },
+          "precision": {
+            "type": "string",
+            "enum": [
+              "landmark",
+              "district",
+              "city",
+              "region",
+              "country",
+              "unknown"
+            ]
+          }
+        },
+        "required": [
+          "index",
+          "place_name",
+          "geocode_query",
+          "confidence",
+          "precision"
+        ]
+      }
+    }
+  },
+  "required": [
+    "country",
+    "country_code",
+    "city",
+    "place_name",
+    "geocode_query",
+    "confidence",
+    "precision",
+    "evidence",
+    "photos"
+  ]
+}
