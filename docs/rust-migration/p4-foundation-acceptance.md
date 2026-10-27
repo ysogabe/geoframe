@@ -151,8 +151,24 @@
 
 - c1のSol限定再レビューは必須・推奨0。追加2件と関連9件の独立11試験が成功し、前回の成功分継承の欠陥は解消した。LXC27試験の成功と合わせてc1のdomain／repository範囲を完了とする。c2のworker・実送信境界・座標化・候補表示・通し受入は未完了。
 
+- c2を開始（原開始b9bd93f、親開始記録0b1b368）。Solへ、location_suggest／location_geocodeの本番handler登録、Decision readyとtoken／401後の世代・許可検査、共通Geocoderのrate／UA／cache・正常0件と障害の区別、候補CAS・STATUS・Python切り戻しの通しを依頼した。新しい実クラウド送信や費用の許可は追加せず、合成画像／DB・loopbackスタブのみで実装・試験し、親が後に別Sol簡易レビューとLXC受入を行う。
+
+- c2の初回実装子は利用上限で中断し、製品コード変更・追加コミットは無かった。ユーザーの上限回復／再開指示後、親がHEAD0b1b368と親所有acceptance以外の変更なしを確認し、原開始b9bd93fと元の指示を引き継いだ新しいSol実装子で再開した。実装後は別Sol簡易レビューとLXC受入を行う。
+
+- c2実装`5f92c86`はpush済み。本番factoryへ日候補／別geocodeを登録し、Geocoder・cache・LAN／CloudClient共有、各POST直前のDecision ready／画像・集合検査、候補の世代CASと読取検査、固定hold表示を接続した。追加は候補来歴とholdの2表で有効設定時だけ作成する。実装側は追加24試験、全1107テスト成功・2件ignore、fmt/clippy・musl成功、3変異の検出を報告。親は実装差分の空白検査とAST契約一致を確認し、LXCの合成試験・別Sol簡易レビューへ進める。
+
+- 親がc2のmusl試験バイナリを検証LXCで実行。runtime22件と共有Geocoder2件、追加24試験がすべて成功・ignoreなし（runtime約69秒）。合成のDecision→token／Cloud→paid回答保存→別Nominatim→候補API→人のSAVE、保存後障害・再起動でCloud再送0、送信前の待機中変更、旧token／SQL rollback、Pythonの実_apply_run読み戻し、Geocoderの共通rate／cache／UAと停止境界を確認した。今回の一時バイナリ・AST用ソース／JSON・新規ディレクトリは削除し、常駐サービスはactiveを維持。別Solの簡易レビュー結果確認前のためc2は未完了。
+
+- ユーザー指定の別Sol簡易レビューをc2実装差分0b1b368..5f92c86へ依頼した。外部依存#93も再確認し、OPEN・コメント0、最終更新は2026-10-24のままで採用契約は未確定。画像APIを仮定した接続は行わない。
+
+- c2のSol簡易レビューは必須P2が1件、推奨0、独立28試験成功。cleanupのwriter transactionが失敗しても汎用enqueueへ進み、旧error.attempts=5の継承を迂回する経路を採用。親がholdsのDELETE失敗を注入すると、修正前はCloud POSTが1件発生することを再現した。共通workerを小修正し、そのhandlerの汎用enqueueを中止するよう変更。追加回帰試験は新規job／token／Cloud POSTの0件、旧attempts維持、故障解除後もfailed／terminal／attempts5で送信0を確認した。ほかのhandlerは処理を続ける。修正後の全体チェック・LXC・限定再レビューを進める。
+
+- c2修正`5e9bc80`を通常push。親が行った小修正後はfmt・clippy全targets・全28 suite 1108テスト成功／2件ignore、musl release静的ビルドとversion起動が成功した。LXCの新規故障注入1試験も成功し、元の24試験の成功に追加して上限迂回の解消を確認。一時バイナリは削除し、常駐サービスはactive。修正差分に絞った別Sol再レビュー後にc2完了を判断する。
+
+- c2のSol限定再レビューは必須・推奨・参考0。追加1件と既存関連5件の独立6試験が成功し、cleanup失敗後の試行上限迂回は解消した。複数chunk途中の故障はコード確認で、先行commit保持・失敗chunk rollback・当該handlerの残りcleanup／genericenqueue中止・次handler続行を確認。全1108件とLXC追加24＋修正1件の成功と合わせ、c2のruntime範囲を完了とする。
+
 後続タスクの結果は確認後に追記する。
 
 ## 後始末と残る項目
 
-確認後に追記する。P4全体は#93を含む後半の受入まで未完了。
+T4.1a〜c、T4.2、T4.3、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。#93の採用契約／実API後にT4.4（画像・文EmbeddingとE5/E6）、T4.5（同一場面と代表）、T4.7の全体受入を進める。実Provider疎通・日本語検索と並行性能・miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
