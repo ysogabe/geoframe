@@ -105,7 +105,7 @@ P3で守ること（各タスクの委任文に入れる）:
 | T4.6a | Vertexの明示認証・固定HTTPS宛先・token分離と401更新、用途別クラウド通信境界 | AC2, AC5, AC10a | T4.1c, T4.2 | full | 完了 | dd5b4a3 | e1fea35..1092c7e | 実装Sol（Sonnetは利用上限で開始前中断）。ユーザー指定のSol簡易レビュー2回: 必須1・推奨1→0。署名付き応答とPython生成設定の互換を修正。全1029テスト成功・2件ignore、fmt/clippy・musl成功。LXC cloud31件・Drive74件成功。初回LXCの期限/wire試験も修正しwriter待ちを全体期限へ制限。新規handler・実クラウド送信は後続 |
 | T4.6b | Decision用の画像準備・質問・clue解釈、写真別reconcileと世代CAS、failedを手がかりなしとして記録 | AC2, AC4, AC5, AC8, AC10a | T4.1c, T4.2 | full | 完了 | 3eae4f9 | 8be70ed | 別Sol簡易レビュー指摘0、独立32試験成功。全1056テスト成功・2件ignore、fmt/clippy・musl成功。LXC写真別25件・画像2件成功、実serveで初回1POSTと正常保存、再起動再送0、photos不変・health200・SIGTERM約0.12秒以内を確認。日候補・実AIは後続 |
 | T4.6c1 | 日集合・送信順・固定promptと応答型、世代別有償回答repository・Python互換run_id／部分集合再利用 | AC2, AC4, AC8, AC9, AC10a | T4.6a, T4.6b | full | 完了 | 8c0b906 | 40ce3f0..df12428 | 別Sol簡易レビュー2回: 必須1→0（成功分のfailure継承を修正）。全1083テスト成功・2件ignore、fmt/clippy・musl成功、限定独立11試験成功。LXC domain/repository27件成功。世代別回答履歴・旧done保留・Python互換と再利用を確認。実送信・handler登録はc2 |
-| T4.6c2 | 日候補worker・CloudClient接続と別job座標化、Geocoder共有・候補CAS・Python切り戻し | AC2, AC4, AC5, AC8, AC9, AC10a | T4.6c1 | full | 未着手 | | | 保存済み回答から座標化を再開し、有償回答を再送しない。候補だけ保存し手動GPSを保護。実クラウド送信の用途・費用の許可は別に確認 |
+| T4.6c2 | 日候補worker・CloudClient接続と別job座標化、Geocoder共有・候補CAS・Python切り戻し | AC2, AC4, AC5, AC8, AC9, AC10a | T4.6c1 | full | 実装中 | b9bd93f | | 保存済み回答から座標化を再開し、有償回答を再送しない。候補だけ保存し手動GPSを保護。c1契約と調査を元にSolで実装し、別Sol簡易レビュー・LXC受入へ進む。実クラウド送信の用途・費用の許可は別に確認 |
 | T4.7 | LXCで通しの受入、Provider停止／復帰、miharashi・管理操作、Python切り戻しと結果の記録 | AC1〜9, AC10a, AC10b | T4.1a〜T4.5, T4.6a〜b, T4.6c1〜c2 | ops | 未着手 | | | 先行部分も節目ごとにLXCで確認。P4完了は全ACの確認後 |
 
 ## P5: 切替（未着手）
