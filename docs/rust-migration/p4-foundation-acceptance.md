@@ -195,6 +195,15 @@
 - active索引のあるDBでINGEST=0の意味検索と推薦順が200、設定した毎分上限到達後429、前後のdump不変を確認。新AI表のない別の旧DBではE5/空queryは200・非空queryは503で、dump不変。不正構図閾値＋AI_ENABLED=0でもhealth/フィード200、検索503、dump不変・入力値ログ非出力だった。
 - 試験serve4回はSIGTERMで終了コード0・約0.003〜0.032秒。実写真・元DB・実鍵・クラウドAIは使わず、LXCの一時バイナリ・合成DB・画像・設定・ログを削除した。既存常駐サービスはactiveを維持。T4.4bを完了とする。
 
+### T4.5a: 同一場面・ローカル順位・世代別repository
+
+- 実装`f5f26c6`、親の必須修正`df31f98`と推奨修正`64d3860`。同一空間の連結成分、未完了窓の保留、現世代failedの除外、固定式／検証済みrank JSON、全構成員世代と参照CAS、旧群とのExact／Disjoint／Partial分類をdomain・DB APIとして実装した。追加3表は明示migrate/pending方式であり、今回の起動・CLI dry-run増分は0。周期・feed・E5/E6接続はT4.5b、任意Gemini比較はT4.5cに残す。
+- 通常Solレビュー1回目は必須2件。参照を件数だけで比較することと、保存済み構成員・世代・完全性・score等を未検証で返すことを採用して修正した。再レビューは必須0・推奨1、独立36＋13試験成功（追加側に構造破損23ケース）。推奨のヘッダー型不正もmember同様に固定CorruptResultへ分類し、SQLite実行エラーのDatabaseと区別した。
+- 修正後の全workspaceは28 group・1210成功・失敗0・既存ignore2、fmt・clippy・musl releaseが成功。最後の推奨小修正後は専用36試験とfmt/clippyを再確認し、全workspaceの反復はしていない。
+- 親が最終修正を含むmusl release試験バイナリを検証LXCで実行し、専用36件すべて成功・ignore/省略なし。実Python fixture再生成・切り戻し、破損結果拒否とfresh Plan修復、世代/参照CAS・原子保存・旧表保持を確認した。PythonのPillowが未導入だったため、標準配布パッケージと新規依存だけを試験時に導入し、終了後に今回の9パッケージを削除した。標準Python不足を理由に試験を省略していない。
+- 同じLXCで合成6500件×768次元・全同時刻／同方向の性能試験1件成功。snapshot約331ms、compute約233ms、writer/save約590ms、RSSは準備後10,704→save/read後75,476KiBだった。計算中の独立writer書込みも成功した。これは専用試験バイナリ・単回・一成分の値で、全未連結cosineの最悪時間やruntime性能の保証ではない。T4.5bでは不要な毎周期全件保存を避ける。
+- 初回の試験配置はビルド時参照先の親がroot所有で、一時リンク作成がPermission deniedとなり試験実行前に終了した。未存在を確認して/tmpのソースfixtureへのリンクだけをsudoで作成し、全試験を実行した。終了後にリンク、試験バイナリ・ソース・合成DB・導入ログを削除し、常駐サービスactiveを確認。元DB・実写真・外部AI・本番は不変更。T4.5aのdomain・DB範囲を完了とする。
+
 ## 後始末と残る項目
 
-T4.1a〜c、T4.2、T4.3、T4.4a〜b、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。次はT4.5（同一場面と代表）とT4.7の全体受入。LAN DecisionとEmbedding、Rust HTTP経由の日本語検索と背景Embeddingの並行15秒は合成入力で実疎通済み。Vertexの実Provider疎通、miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
+T4.1a〜c、T4.2、T4.3、T4.4a〜b、T4.5a、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。次はT4.5b/c（周期・選別接続と任意Gemini比較）とT4.7の全体受入。LAN DecisionとEmbedding、Rust HTTP経由の日本語検索と背景Embeddingの並行15秒は合成入力で実疎通済み。Vertexの実Provider疎通、miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
