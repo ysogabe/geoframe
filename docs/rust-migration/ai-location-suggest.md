@@ -65,6 +65,8 @@ match location_suggest::lookup(&read, &day, cloud_model, &observed)? {
 
 不在かつ sendable の Day に対して、選別順の `Vec<SendImage>` から `Plan::new` を作る。`enqueue(&mut conn, &plan, &observed, now)` は writer 上の短い tx 用。`enqueue_in(&Connection, ...)` は既存 tx（例: Handler::reconcile_cleanup の Persist）用である。旧 attempts 継承を行うため、**汎用 worker の jobs::enqueue より先にこの入口を使う**。既存の claim / token / Guard / LockHold / budgets / pause / STOP を迂回する新キューは作らない。runtime の reconcile_cleanup がこの入口を汎用enqueueより先に呼び、継承とmanual retry後の非再seedを維持する。
 
+cleanup の writer transaction が失敗した handler は、その周期の汎用 enqueue を中止する。試行履歴の継承が rollback された後に attempts=0 の新 job を作らず、ほかの handler の reconcile は続行する。旧 error の attempts=5 と holds 更新失敗を組み合わせる故障注入試験で、新 job／token／Cloud POST が0、故障解除後も上限を保持することを確認した。
+
 c2 の Handler::run は `plan.request()` を CloudClient へ渡して応答を parse し、実 SHA / 現 policy を再検査した後に、次の短い保存 callback を返せる。
 
 ```rust,ignore
@@ -130,6 +132,12 @@ c2で追加する2表（既存結果/一次列のschema変更なし、追加索�
 否定対照は、①CloudのPOST予約後callbackを外す→token待ち中変更試験、②geocode最終writer CASを外す→HTTP後/commit前変更試験、③Nominatim rate待ちを外す→GET/AI並行間隔試験、の3件で期待するassertion失敗を確認し、元ソースへ復元した。
 
 別Solの通常レビューとLXC受入は親タスクへ返す。実Provider疎通、実写真/費用の許可、#93/E5/E6、P4全体完了は主張しない。
+
+### c2 cleanup失敗時の修正
+
+通常レビューの必須P2を受け、親が共通workerのcleanup失敗後に当該handlerの汎用enqueueを中止する小修正を行った。holdsのDELETEへ故障を注入した追加試験では、修正前に旧error.attempts=5からCloud POSTが1件発生することを再現した。修正後は新規job／token要求／Cloud POSTが0で旧履歴を維持し、故障解除後もattempts=5のterminal failedを継承する。
+
+修正後のfmt、workspace全targets clippy（警告をエラー化）、全28 suite **1108 pass / 0 fail / 2 ignored**、musl release静的ビルド／version起動が成功。親のLXCでも追加故障注入1試験が成功し、一時バイナリを削除した。別Solの限定再レビュー前の記録であり、c2全体の合格はまだ確定していない。
 
 
 ## c1 の検証記録

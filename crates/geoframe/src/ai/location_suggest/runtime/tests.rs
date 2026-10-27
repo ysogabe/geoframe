@@ -601,6 +601,50 @@ fn shared_geocoder_cache_ua_rate_and_typed_empty_failure_stop_have_negative_cont
 }
 
 #[test]
+fn failed_cleanup_never_bypasses_legacy_attempt_limit_through_generic_enqueue() {
+    let l = Lab::new();
+    add(&l.env, 1, 2);
+    l.ready();
+    let run = run_id_for("example-suggest", &[1]);
+    l.env.writer().call(move |c| {
+        c.execute("INSERT INTO photo_loc_runs(run_id,day,model,prompt_version,member_ids_json,sent_ids_json,status,attempts,answer_json,error,analyzed_at) VALUES(?1,'2026-01-02','example-suggest','loc-v2','[1]','[1]','error',5,'','bad_response','synthetic')", [run])?;
+        c.execute_batch("CREATE TRIGGER synthetic_cleanup_failure BEFORE DELETE ON ai_location_suggest_holds BEGIN SELECT RAISE(ABORT,'synthetic cleanup failure'); END;")
+    }).unwrap();
+    assert_eq!(
+        n(&l.env, "SELECT COUNT(*) FROM ai_location_suggest_holds"),
+        1
+    );
+
+    l.cycle();
+    assert_eq!(l.posts(), 0);
+    assert_eq!(l.tokens(), 0);
+    assert_eq!(
+        n(
+            &l.env,
+            "SELECT COUNT(*) FROM ai_jobs WHERE kind='location_suggest'"
+        ),
+        0
+    );
+    assert_eq!(n(&l.env, "SELECT attempts FROM photo_loc_runs"), 5);
+    assert_eq!(
+        n(&l.env, "SELECT COUNT(*) FROM ai_location_suggest_holds"),
+        1
+    );
+
+    sql(&l.env, "DROP TRIGGER synthetic_cleanup_failure");
+    l.cycle();
+    assert_eq!(
+        n(
+            &l.env,
+            "SELECT COUNT(*) FROM ai_jobs WHERE kind='location_suggest' AND state='failed' AND attempts=5 AND terminal=1"
+        ),
+        1
+    );
+    assert_eq!(l.posts(), 0);
+    assert_eq!(l.tokens(), 0);
+}
+
+#[test]
 fn legacy_unknown_paid_answer_holds_with_fixed_status_counts_and_zero_cloud() {
     let l = Lab::new();
     add(&l.env, 1, 2);

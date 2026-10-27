@@ -569,7 +569,7 @@ impl Core {
 
     fn reconcile(&self, read: &Connection) {
         let now = (self.clock)();
-        for handler in &self.handlers {
+        'handlers: for handler in &self.handlers {
             if self.stop.is_stopped() {
                 return;
             }
@@ -603,7 +603,8 @@ impl Core {
                     .is_err()
                 {
                     tracing::warn!("[ai] 失効を記録できません");
-                    break;
+                    // cleanup が担う試行履歴の継承等を汎用 enqueue で迂回しない。
+                    continue 'handlers;
                 }
             }
             let keys = match catch_unwind(AssertUnwindSafe(|| handler.reconcile(read, now))) {
