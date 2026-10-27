@@ -8,8 +8,7 @@
 //!
 //! - `space_id`: この DB 内の空間の名前（`ai_embedding_spaces` の主キー）。
 //! - `provider_space_id`: **Provider が保証する**画像・文に共通の空間 ID。設定ファイルの
-//!   [`EmbeddingSpace`]（形式を検査しただけのメタデータ）には無く、Provider の応答（接続契約が確定した後の
-//!   T4.4）から得る。
+//!   [`EmbeddingSpace`]（形式を検査しただけのメタデータ）には無く、Provider の応答、または明示設定して照合した固定接続契約から得る。
 //! - `model_id`・`revision`・`image_preprocess`・`text_preprocess`・`dimension`（1〜4096）・`normalization`。
 //!
 //! [`EmbeddingSpace`] だけからは識別を作れない（[`SpaceIdentity::from_declared`] は Provider が証明した
@@ -127,7 +126,7 @@ impl SpaceIdentity {
     }
 
     /// 設定の宣言（[`EmbeddingSpace`]）に、**Provider が保証した**共通の空間 ID を添えて識別にする。
-    /// `provider_space_id` は Provider の応答から得たもの（T4.4）。設定の文字列だけでは作れない。
+    /// `provider_space_id` は Provider の応答、または明示設定・照合した固定接続契約から得たもの。設定の文字列だけでは作れない。
     pub fn from_declared(
         declared: &EmbeddingSpace,
         provider_space_id: &str,

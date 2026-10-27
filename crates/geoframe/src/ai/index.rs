@@ -26,7 +26,8 @@
 //!
 //! # ジョブのキー
 //!
-//! 画像 Embedding のジョブは空間と入力の SHA 単位（[`image_embedding_key`]）。後続（T4.4）は同じ関数でキーを作る。
+//! 画像 Embedding の target は空間と入力 SHA（[`image_embedding_key`]）、実際の入力キーは
+//! [`ShaState::job_key`] で全構成員の世代（rotation を含む）も束縛する。
 //! URL・送信ポリシー・設定全体のハッシュはキーに入れない。失敗の判定（[`Progress::failed_excluded`]）は
 //! `kind`・`target_key`（空間と SHA）・`input_hash`・`processor_version`（識別の全項目から決まる）の 4 つを厳密に
 //! 照合するので、他の空間や古い版の失敗では対象を除かない。
@@ -154,14 +155,25 @@ pub fn register_space(
     now: i64,
 ) -> Result<Registered, SpaceError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(existing) = load_space(&tx, identity.space_id())? {
+    let result = register_space_in(&tx, identity, now)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Register inside an existing writer transaction (no I/O).
+pub(super) fn register_space_in(
+    conn: &Connection,
+    identity: &SpaceIdentity,
+    now: i64,
+) -> Result<Registered, SpaceError> {
+    if let Some(existing) = load_space(conn, identity.space_id())? {
         return if existing == *identity {
             Ok(Registered::Existing)
         } else {
             Err(SpaceError::SpaceIdConflict)
         };
     }
-    let same_tuple: Option<String> = tx
+    let same_tuple: Option<String> = conn
         .query_row(
             "SELECT space_id FROM ai_embedding_spaces
              WHERE provider_space_id=?1 AND model_id=?2 AND revision=?3 AND image_preprocess=?4
@@ -181,7 +193,7 @@ pub fn register_space(
     if same_tuple.is_some() {
         return Err(SpaceError::IdentityConflict);
     }
-    tx.execute(
+    conn.execute(
         "INSERT INTO ai_embedding_spaces(space_id,provider_space_id,model_id,revision,
            image_preprocess,text_preprocess,dimension,normalization,created_at)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
@@ -197,7 +209,6 @@ pub fn register_space(
             now,
         ],
     )?;
-    tx.commit()?;
     Ok(Registered::Created)
 }
 
@@ -344,7 +355,18 @@ pub fn store_prepared(
     now: i64,
 ) -> Result<Stored, StoreError> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    match load_space(&tx, vector.identity.space_id()) {
+    let result = store_prepared_in(&tx, vector, now)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+/// Atomic with job success when called from jobs::complete.
+pub(super) fn store_prepared_in(
+    conn: &Connection,
+    vector: &PreparedVector,
+    now: i64,
+) -> Result<Stored, StoreError> {
+    match load_space(conn, vector.identity.space_id()) {
         Ok(Some(registered)) if registered == vector.identity => {}
         Ok(Some(_)) => return Err(StoreError::SpaceMismatch),
         Ok(None) => return Err(StoreError::UnknownSpace),
@@ -352,7 +374,7 @@ pub fn store_prepared(
         Err(_) => return Err(StoreError::Corrupt),
     }
     // 既存の行が有効かは、読み取り・公開と同じ検査（次元の列・型・`space::decode`）で決める
-    let existing: Option<bool> = tx
+    let existing: Option<bool> = conn
         .query_row(
             "SELECT vector, dimension FROM ai_embedding_vectors WHERE space_id=?1 AND input_sha256=?2",
             params![vector.identity.space_id(), vector.input_sha256],
@@ -371,7 +393,7 @@ pub fn store_prepared(
     let outcome = match existing {
         Some(true) => return Ok(Stored::Existing),
         Some(false) => {
-            tx.execute(
+            conn.execute(
                 "UPDATE ai_embedding_vectors SET sent_sha256=?3, dimension=?4, vector=?5, created_at=?6
                  WHERE space_id=?1 AND input_sha256=?2",
                 params![
@@ -386,7 +408,7 @@ pub fn store_prepared(
             Stored::Repaired
         }
         None => {
-            tx.execute(
+            conn.execute(
                 "INSERT INTO ai_embedding_vectors(space_id,input_sha256,sent_sha256,dimension,
                    vector,created_at) VALUES (?1,?2,?3,?4,?5,?6)",
                 params![
@@ -401,7 +423,6 @@ pub fn store_prepared(
             Stored::Inserted
         }
     };
-    tx.commit()?;
     Ok(outcome)
 }
 
@@ -427,7 +448,7 @@ pub fn image_embedding_processor_version(identity: &SpaceIdentity) -> String {
 }
 
 /// 画像 Embedding ジョブの冪等キー（空間と入力 SHA 単位）。`target_key` は空間と SHA、`input_hash` は SHA。
-/// 後続の reconcile・ワーカー（T4.4）は**この関数**でキーを作る。
+/// 内容の target の組立てに使う。ワーカー・failed 検査は `ShaState::job_key` の世代付きキーを使う。
 pub fn image_embedding_key(identity: &SpaceIdentity, input_sha256: &str) -> JobKey {
     JobKey::new(
         JobKind::ImageEmbedding,
@@ -451,6 +472,7 @@ pub struct Eligible {
     pub display: String,
     pub md5: Value,
     pub mtime: Value,
+    pub rotation: Value,
 }
 
 impl fmt::Debug for Eligible {
@@ -470,7 +492,7 @@ pub struct ShaState {
     pub has_vector: bool,
     /// ベクトルの行はあるが検査に通らない（再生成の対象。`pending` か `failed` として数える）。
     pub corrupt: bool,
-    /// 現在の入力・処理版（[`image_embedding_key`]）のジョブが `failed` のとき、その理由。保存された文字列は
+    /// 現在の入力・処理版（[`ShaState::job_key`]）のジョブが `failed` のとき、その理由。保存された文字列は
     /// そのまま持たず、固定の [`ErrorCode`] か `other` に直したもの（[`reason_code`]）。
     pub failed_reason: Option<&'static str>,
     /// 検査を通った単位ベクトル（`scan` を `with_values` で呼んだときだけ）。
@@ -491,10 +513,37 @@ impl ShaState {
         &self.members[0].input_sha256
     }
 
+    /// Content-addressed target, plus all current DB generations. A late response must
+    /// match at least one captured member again inside jobs::complete.
+    pub fn job_key(&self, identity: &SpaceIdentity) -> JobKey {
+        image_embedding_generation_key(identity, self.input_sha256(), &self.members)
+    }
+
     /// 代表（最小の写真 ID）。
     pub fn representative(&self) -> &Eligible {
         &self.members[0]
     }
+}
+
+pub(super) fn image_embedding_generation_key(
+    identity: &SpaceIdentity,
+    input_sha256: &str,
+    members: &[Eligible],
+) -> JobKey {
+    let mut key = image_embedding_key(identity, input_sha256);
+    let mut parts = vec!["image-generations/v1".to_string(), input_sha256.to_string()];
+    for m in members {
+        parts.extend([
+            m.photo_id.to_string(),
+            m.display.clone(),
+            format!("{:?}", m.md5),
+            format!("{:?}", m.mtime),
+            format!("{:?}", m.rotation),
+        ]);
+    }
+    key.input_hash =
+        super::settings::fingerprint(&parts.iter().map(String::as_str).collect::<Vec<_>>());
+    key
 }
 
 /// 保存された失敗の理由を、固定の理由コードに直す（未知の文字列・空・改行入りは `other`）。
@@ -522,48 +571,26 @@ pub(super) fn scan(
     with_values: bool,
 ) -> rusqlite::Result<Vec<ShaState>> {
     let has_jobs = space.is_some() && object_exists(conn, "table", "ai_jobs")?;
-    let failed_sql = if has_jobs {
-        "(SELECT COALESCE(j.last_error_code,'') FROM ai_jobs j
-           WHERE j.kind='image_embedding' AND j.state='failed'
-             AND j.target_key=?1||char(31)||f.content_sha256
-             AND j.input_hash=f.content_sha256 AND j.processor_version=?2 LIMIT 1)"
-    } else {
-        "NULL"
-    };
     let sql = format!(
-        "SELECT p.id, f.content_sha256, p.display, p.md5, p.mtime, {failed_sql}
+        "SELECT p.id, f.content_sha256, p.display, p.md5, p.mtime, p.rotation
          {ELIGIBLE_JOIN} WHERE {ELIGIBLE_WHERE} ORDER BY p.id"
     );
-    let mut stmt = conn.prepare(&sql)?;
-    let map = |row: &rusqlite::Row<'_>| -> rusqlite::Result<(Eligible, Option<String>)> {
-        Ok((
-            Eligible {
+    let rows = conn
+        .prepare(&sql)?
+        .query_map([], |row| {
+            Ok(Eligible {
                 photo_id: row.get(0)?,
                 input_sha256: row.get(1)?,
                 display: row.get(2)?,
                 md5: row.get(3)?,
                 mtime: row.get(4)?,
-            },
-            if has_jobs { row.get(5)? } else { None },
-        ))
-    };
-    let rows = match space {
-        Some(identity) if has_jobs => stmt
-            .query_map(
-                params![
-                    identity.space_id(),
-                    image_embedding_processor_version(identity)
-                ],
-                map,
-            )?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-        _ => stmt
-            .query_map([], map)?
-            .collect::<rusqlite::Result<Vec<_>>>()?,
-    };
+                rotation: row.get(5)?,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut order: Vec<ShaState> = Vec::new();
     let mut by_sha: HashMap<String, usize> = HashMap::new();
-    for (member, failed) in rows {
+    for member in rows {
         match by_sha.get(&member.input_sha256) {
             Some(&i) => order[i].members.push(member),
             None => {
@@ -572,10 +599,27 @@ pub(super) fn scan(
                     members: vec![member],
                     has_vector: false,
                     corrupt: false,
-                    failed_reason: failed.as_deref().map(reason_code),
+                    failed_reason: None,
                     unit: None,
                 });
             }
+        }
+    }
+    if let Some(identity) = space.filter(|_| has_jobs) {
+        let mut failed_stmt = conn.prepare(
+            "SELECT COALESCE(last_error_code,'') FROM ai_jobs
+            WHERE kind='image_embedding' AND target_key=?1 AND input_hash=?2
+            AND processor_version=?3 AND state='failed'",
+        )?;
+        for state in &mut order {
+            let key = state.job_key(identity);
+            let failed: Option<String> = failed_stmt
+                .query_row(
+                    params![key.target_key, key.input_hash, key.processor_version],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            state.failed_reason = failed.as_deref().map(reason_code);
         }
     }
     if let Some(identity) = space

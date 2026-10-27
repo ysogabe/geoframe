@@ -119,7 +119,12 @@ impl Db {
     }
 
     fn fail_job(&mut self, identity: &SpaceIdentity, sha: &str) {
-        let key = index::image_embedding_key(identity, sha);
+        let key = index::scan(&self.conn, Some(identity), false)
+            .unwrap()
+            .iter()
+            .find(|s| s.input_sha256() == sha)
+            .map(|s| s.job_key(identity))
+            .unwrap_or_else(|| index::image_embedding_key(identity, sha));
         jobs::enqueue(&mut self.conn, &key, NOW).unwrap();
         self.conn
             .execute(
@@ -756,7 +761,7 @@ fn only_the_exact_failed_job_excludes_a_target() {
     // obsolete は除かない（入力が戻れば再び走る）
     db.conn
         .execute(
-            "UPDATE ai_jobs SET state='obsolete' WHERE input_hash='s2' AND kind='image_embedding'
+            "UPDATE ai_jobs SET state='obsolete' WHERE target_key='a'||char(31)||'s2' AND kind='image_embedding'
                AND processor_version=?1",
             [index::image_embedding_processor_version(&a)],
         )
@@ -1599,8 +1604,8 @@ fn unknown_failure_reasons_are_folded_into_other_on_every_path() {
         db.fail_job(&a, sha);
         db.conn
             .execute(
-                "UPDATE ai_jobs SET last_error_code=?1 WHERE input_hash=?2 AND kind='image_embedding'",
-                params![code, sha],
+                "UPDATE ai_jobs SET last_error_code=?1 WHERE target_key=?2 AND kind='image_embedding'",
+                params![code, index::image_embedding_key(&a, sha).target_key],
             )
             .unwrap();
     }

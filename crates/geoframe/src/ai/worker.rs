@@ -2,7 +2,7 @@
 //!
 //! 処理の std スレッドが 1 本（ほかに、SIGTERM の直後に停止開始を書くだけの小さなスレッドが 1 本）、既存の writer（[`crate::writer::Writer`]）と `.ingest.lock`
 //! （[`crate::ingest::LockHold`]）を共有して動く。T4.6b/c2 で location_clue / location_suggest / location_geocode を本番登録した。
-//! Embedding / photo_judge は未登録のままで claim しない（fake の Provider・任意宛先の設定は置かない）。
+//! T4.4a で明示契約の local image_embedding を登録した。photo_judge は未登録のままで claim しない（fake の Provider・任意宛先の設定は置かない）。
 //!
 //! # 起動の条件
 //!
@@ -76,6 +76,9 @@ pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
 /// [`InputCheck`] を返す。外部 I/O・長い処理をしない。
 pub type Persist = Box<dyn FnOnce(&Connection) -> rusqlite::Result<InputCheck> + Send>;
 
+/// Local writer operation for publication; contains no network or image work.
+pub type Maintenance = Box<dyn FnOnce(&mut Connection) -> rusqlite::Result<()> + Send>;
+
 /// 1 回の reconcile が writer を塞ぐ長さを区切る件数（1 トランザクションあたり）。
 const ENQUEUE_CHUNK: usize = 200;
 /// 背景の送信予算の予約が writer を待つ上限。過ぎたら送らず後回しにする。
@@ -93,6 +96,13 @@ const BUDGET_WAIT: Duration = Duration::from_secs(5);
 ///   照らして振り分ける。外部へは送らない。
 pub trait Handler: Send + Sync {
     fn kind(&self) -> JobKind;
+    fn claim_scope(&self) -> jobs::ClaimScope {
+        jobs::ClaimScope {
+            kind: self.kind(),
+            target_prefix: None,
+            processor_version: None,
+        }
+    }
     fn reconcile(&self, read: &Connection, now: i64) -> rusqlite::Result<Vec<JobKey>>;
     fn run(&self, ctx: &RunCtx<'_>, job: &Claimed) -> Result<Persist, RunError>;
     /// retry のファイル由来検査は writer の外で準備する。通信はしない。
@@ -103,6 +113,10 @@ pub trait Handler: Send + Sync {
     /// 対象から外れた写真等の旧ジョブを失効する短い writer 操作（現世代を操作内でも再検査）。
     fn reconcile_cleanup(&self, _read: &Connection, _now: i64) -> rusqlite::Result<Vec<Persist>> {
         Ok(Vec::new())
+    }
+    /// Local writer maintenance after reconciliation and every completion/failure.
+    fn maintenance(&self, _read: &Connection, _now: i64) -> rusqlite::Result<Option<Maintenance>> {
+        Ok(None)
     }
     /// DB 外で投影の準備をし、短い writer transaction 内で現世代・terminal 状態を照合する。
     /// terminal failure と起動回収後の修復で共有する。外部 I/O はこの準備側だけで行う。
@@ -131,6 +145,12 @@ pub fn production_handlers(
         return Vec::new();
     };
     let mut handlers = Vec::new();
+    if let Some(client) = lan.clone().and_then(|l| {
+        super::embedding::EmbeddingClient::new(&config.ai, l, TaskKind::ImageEmbedding)
+    }) {
+        handlers.push(super::image_embedding::handler(data.clone(), client));
+    }
+
     if let (Ok(gate), Some(lan)) = (config.ai.gate(TaskKind::LocationClue, true), lan.clone()) {
         handlers.push(super::location_clue::handler(
             data.clone(),
@@ -254,6 +274,10 @@ impl<'a> RunCtx<'a> {
             writer,
             clock,
         }
+    }
+
+    pub(super) fn config(&self) -> &AiConfig {
+        self.config
     }
 
     /// 読み取り専用の接続（写真・結果・入力世代の読み取り）。トランザクションを長く持たない。
@@ -489,6 +513,7 @@ impl Core {
         // 共有の一時待機（再起動をまたいで残る）を読み直す。読めなければ空のまま進む（待ちは各 handler の確認が補う）
         self.waits = waits::load(&read, (self.clock)()).unwrap_or_default();
         self.reconcile(&read);
+        self.maintain(&read);
         let mut processed: HashMap<TaskKind, u32> = HashMap::new();
         loop {
             // claim の直前に毎回確かめる（止まったら新しい claim をしない）
@@ -499,6 +524,11 @@ impl Core {
             if kinds.is_empty() {
                 return;
             }
+            let scopes: Vec<_> = kinds
+                .iter()
+                .filter_map(|k| self.handler(*k))
+                .map(|h| h.claim_scope())
+                .collect();
             let (run_id, now, stop) = (self.run_id.clone(), (self.clock)(), self.stop.clone());
             // writer の順番待ちのあいだに来た合図も尊重する: 依頼の中、claim の直前にもう一度確かめ、
             // 止まっていれば token も作らず状態も変えない（呼び出し側の確認だけでは、待ちの間の合図を取りこぼす）
@@ -508,7 +538,7 @@ impl Core {
                 }
                 let token = jobs::random_id()
                     .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                jobs::claim_next(conn, now, &run_id, &token, &kinds)
+                jobs::claim_next_scoped(conn, now, &run_id, &token, &scopes)
             }) {
                 Ok(Some(claimed)) => claimed,
                 Ok(None) => return,
@@ -520,6 +550,21 @@ impl Core {
             let task = task_for(claimed.key.kind);
             *processed.entry(task).or_insert(0) += 1;
             self.process(&read, claimed, task);
+            self.maintain(&read);
+        }
+    }
+
+    fn maintain(&self, read: &Connection) {
+        for handler in &self.handlers {
+            match handler.maintenance(read, (self.clock)()) {
+                Ok(Some(action)) => {
+                    if self.writer.call(action).is_err() {
+                        tracing::warn!("[ai] 索引の保守に失敗しました");
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => tracing::warn!("[ai] 索引の保守を準備できません"),
+            }
         }
     }
 

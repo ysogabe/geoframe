@@ -2,7 +2,7 @@
 
 空間別のベクトル保存、検索空間の切替、旧選別の安全化、その境界（後続 T4.4・T4.5 への接続）。設計は [p4-design.md](p4-design.md) §6・§7。実装は `crates/geoframe/src/ai/{space,index,activation,search}.rs` と `src/selection.rs`、試験は `ai/tests_index.rs`・`tests/legacy_selection.rs`・`tests/ai_index_python_rollback.rs`・`tests/ingest_cli.rs`。
 
-**この段階で実 Embedding の呼び出し・仮の API・旧ベクトルの輸入は無い**（[local-model-lab #93](https://github.com/ysogabe/local-model-lab/issues/93) は未確定）。固定のベクトルと合成 DB だけで確かめる。
+T4.3の索引基盤に、[T4.4aの固定契約アダプターと画像ワーカー](ai-embedding.md)を接続した。旧ベクトルは輸入しない。実APIのLAN/LXC確認は親担当で、ローカル試験は合成DB/画像とloopbackだけ。
 
 ## 1. SpaceIdentity（同じ空間の条件）
 
@@ -17,7 +17,7 @@
 | `dimension` | 1〜4096 |
 | `normalization` | `l2`（単位ベクトルで保存）／`none`（受け取った値のまま） |
 
-- 設定の `embedding_space`（`ai::settings::EmbeddingSpace`）は**形式を検査しただけのメタデータ**で、Provider の応答による証明ではない。`SpaceIdentity::from_declared` は、Provider が証明した `provider_space_id` を別に要る。
+- 設定の `embedding_space`（`ai::settings::EmbeddingSpace`）は**形式を検査しただけのメタデータ**で、Provider の応答または照合済みの既知固定契約による証明ではない。`SpaceIdentity::from_declared` は、Provider が証明した `provider_space_id` を別に要る。
 - 旧 `photo_ai_features.embedding_model` などの文字列から識別は作れない。**旧ベクトルは `legacy-unverified` のまま残すだけ**で、新しい空間へ輸入せず、旧モデルと同名の設定でも新しい検索語ベクトルと比べない。旧空間を検証済みと宣言する経路は、モデル・重み・前処理の版と実測照合がそろう場合に限る（今回は作らない）。
 - `register_space` は、同じ `space_id` を別の識別で再登録すると `SpaceIdConflict`、同じ識別の組を別の `space_id` で登録すると `IdentityConflict`（表の UNIQUE 制約も同じ組を守る）。
 
@@ -50,8 +50,8 @@
 
 ## 4. 切替（`settings.ai_active_space`）
 
-1. 構築の開始時に `snapshot_targets` が今の対象と各世代を候補として持つ。候補は `content_sha256` ごとで、**その SHA の構成員すべて**（写真 ID・`display`・`md5`・`mtime`）を持つ（`BuildSnapshot::targets()` → `SnapshotTarget::members()`）。
-2. 後続のワーカー（T4.4）が `image_embedding_key(identity, input_sha256)`（**空間と入力 SHA 単位**。`target_key`＝空間 ID と SHA、`input_hash`＝SHA、`processor_version`＝識別の全項目のハッシュ。URL・ポリシー・設定全体のハッシュ・閾値は入れない）でジョブを積み、`store_vector` で保存する。
+1. 構築の開始時に `snapshot_targets` が今の対象と各世代を候補として持つ。候補は `content_sha256` ごとで、**その SHA の構成員すべて**（写真 ID・`display`・`md5`・`mtime`・`rotation`）を持つ（`BuildSnapshot::targets()` → `SnapshotTarget::members()`）。
+2. T4.4aワーカーが `ShaState::job_key(identity)`（targetは空間/SHA、input_hashはSHAと全構成員世代のhash、processor_versionは識別全項目）で積む。URL/ポリシー/閾値はキーに入れない。`PreparedVector` をwriter外で作り、`jobs::complete` 内でvector保存とjob成功を原子的に行う。失敗履歴の継承・破損修復は [ai-embedding.md](ai-embedding.md) を参照。
 3. `try_activate(conn, snapshot, identity, min_coverage)` を writer 上で呼ぶ。**1 つの書き込みトランザクションの中で**候補を再検査する。SHA は、**構築開始時の構成員のうち 1 枚でも今も同じ世代の対象**ならまだ有効（代表が消えても同じ内容の写真が残れば分母・待ちに残る）で、構成員がすべて変更・削除・回転された SHA だけを除く（`stale`）。後から同じ SHA の写真が追加されても、元の構成員が全滅していれば有効にならない（追加分は差分として後続で処理する）。件数はすべて SHA 単位。残り（`valid`）のうち、ベクトルあり=`indexed`、現在のキー（`kind`・`target_key`・`input_hash`・`processor_version`）のジョブが `failed`=`failed_excluded`、それ以外=`pending`。
 
 | 結果 | 条件 | ポインタ |
@@ -97,6 +97,6 @@ Python は追加表と `ai_active_space` を使わず旧表を読む。Rust の�
 
 ## 9. 後続への境界と限界
 
-- **T4.4**: 実 Embedding アダプター（画像・文）、E5/E6 の接続、対話用の枠。`SpaceIdentity` は Provider の応答から作る。ジョブは `image_embedding_key` で作る。ワーカーが保存し、`try_activate` を呼ぶ（既定の閾値か設定）。E5 は `index::status`、E6 は `load_active_index`＋`QueryVector`。
+- **T4.4a実装済み**: [固定契約アダプター・世代付き画像ジョブ・自動切替](ai-embedding.md)。SpaceIdentityは明示した固定契約と実model/能力を照合する。**T4.4b**: E5は `index::status`、E6は共有clientのquery＋`load_active_index`＋`QueryVector`へ接続する。
 - **T4.5**: 新しい同一場面グループ・代表。**旧選別と部分的に重なる新集合は旧選別を自動で置き換えない**（旧は `selection` の有効判定のまま保持。新しい結果は別表に持ち、重なるものは管理確認）。入力集合・世代が一致する選別単位か、有効な旧選別と重ならない新しい集合だけ新判定を使える。旧の写真別判定（品質・`keep_score` 等）は世代が一致すれば空間独立で使える。
 - 未実装: 実 Embedding・E5/E6 の本接続（503 のまま）、設定 JSON の閾値キー、新しい同一場面の表（`ai_scene_*`）、`ai_active_space` を自動で切り替えるワーカー、LXC での実機検証（親が記録）。旧ベクトルの再計算方式は #93 の測定後。

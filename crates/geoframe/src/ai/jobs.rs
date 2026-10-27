@@ -541,25 +541,68 @@ pub fn claim_next(
     token: &str,
     kinds: &[JobKind],
 ) -> rusqlite::Result<Option<Claimed>> {
-    if kinds.is_empty() {
+    let scopes: Vec<_> = kinds
+        .iter()
+        .map(|&kind| ClaimScope {
+            kind,
+            target_prefix: None,
+            processor_version: None,
+        })
+        .collect();
+    claim_next_scoped(conn, now, run_id, token, &scopes)
+}
+
+/// Optional content-space boundary for handlers sharing a job kind. SQL values stay bound.
+#[derive(Clone)]
+pub struct ClaimScope {
+    pub kind: JobKind,
+    pub target_prefix: Option<String>,
+    pub processor_version: Option<String>,
+}
+
+pub fn claim_next_scoped(
+    conn: &Connection,
+    now: i64,
+    run_id: &str,
+    token: &str,
+    scopes: &[ClaimScope],
+) -> rusqlite::Result<Option<Claimed>> {
+    if scopes.is_empty() {
         return Ok(None);
     }
-    // 種類は固定の定数文字列だけ（利用者の入力は入らない）
-    let in_list = kinds
-        .iter()
-        .map(|k| format!("'{}'", k.as_str()))
-        .collect::<Vec<_>>()
-        .join(",");
+    let mut values = vec![
+        Value::from(run_id.to_string()),
+        Value::from(token.to_string()),
+        Value::from(now),
+    ];
+    let mut predicates = Vec::new();
+    for scope in scopes {
+        values.push(Value::from(scope.kind.as_str().to_string()));
+        let mut clause = format!("kind=?{}", values.len());
+        if let Some(prefix) = &scope.target_prefix {
+            values.push(Value::from(prefix.clone()));
+            clause.push_str(&format!(
+                " AND substr(target_key,1,length(?{0}))=?{0}",
+                values.len()
+            ));
+        }
+        if let Some(version) = &scope.processor_version {
+            values.push(Value::from(version.clone()));
+            clause.push_str(&format!(" AND processor_version=?{}", values.len()));
+        }
+        predicates.push(format!("({clause})"));
+    }
+    let predicate = predicates.join(" OR ");
     let sql = format!(
         "UPDATE ai_jobs SET state='running', run_id=?1, claim_token=?2, updated_at=?3
          WHERE id=(SELECT id FROM ai_jobs
                    WHERE state IN ('pending','deferred') AND next_attempt_at<=?3
-                     AND kind IN ({in_list})
+                     AND ({predicate})
                    ORDER BY next_attempt_at, id LIMIT 1)
          RETURNING id, kind, target_key, input_hash, processor_version, attempts, defer_count"
     );
     let row = conn
-        .query_row(&sql, params![run_id, token, now], |row| {
+        .query_row(&sql, params_from_iter(values.iter()), |row| {
             let kind: String = row.get(1)?;
             Ok(Claimed {
                 id: row.get(0)?,

@@ -31,8 +31,8 @@ pub use derivative::{
     DERIV_PX, DecisionRgb, DerivativeInfo, EXPORT_PX, EXPORT_QUALITY, IccOutcome, JPEG_QUALITY,
     Luma, MAX_INPUT_BYTES, MAX_INPUT_PIXELS, Rendered, Stored, decode_luma, derivative_name,
     lock_derivatives, lock_derivatives_waiting, make_derivative, open_limited,
-    prepare_decision_rgb, read_limited, read_opened, render, render_export, rotate_jpeg,
-    store_derivative, target_dims, write_atomic,
+    prepare_decision_rgb, prepare_embedding_rgb, read_limited, read_opened, render, render_export,
+    rotate_jpeg, store_derivative, target_dims, write_atomic,
 };
 pub use error::{DecodeClass, HeicFailure, ImageError};
 pub use exif::{ExifInfo, Format, PhotoMeta, norm_time};

@@ -252,6 +252,7 @@ impl fmt::Debug for EmbeddingSpace {
 pub struct AiSettings {
     local_base_url: Option<String>,
     embedding_space: Option<EmbeddingSpace>,
+    embedding_contract: Option<String>,
     tasks: [Option<TaskSettings>; 5],
     config_hash: String,
 }
@@ -272,6 +273,11 @@ impl AiSettings {
     /// 検査・正規化済みの LAN の入口（`scheme://host[:port]`。末尾の `/` なし）。
     pub fn local_base_url(&self) -> Option<&str> {
         self.local_base_url.as_deref()
+    }
+
+    /// Explicit pinned provider contract; metadata alone never enables the adapter.
+    pub fn embedding_contract(&self) -> Option<&str> {
+        self.embedding_contract.as_deref()
     }
 
     pub fn embedding_space(&self) -> Option<&EmbeddingSpace> {
@@ -335,6 +341,20 @@ impl AiSettings {
             t.model.clone(),
             t.service_id.clone().unwrap_or_default(),
         ];
+        if matches!(task, TaskKind::ImageEmbedding | TaskKind::QueryEmbedding) {
+            parts.push(self.embedding_contract.clone().unwrap_or_default());
+            if let Some(space) = &self.embedding_space {
+                parts.extend([
+                    space.space_id.clone(),
+                    space.model_id.clone(),
+                    space.revision.clone(),
+                    space.image_preprocess.clone(),
+                    space.text_preprocess.clone(),
+                    space.dimension.to_string(),
+                    space.normalization.as_str().to_string(),
+                ]);
+            }
+        }
         parts.extend(self.provider_identity(t));
         let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
         Some(PauseKey::new(PauseScope::Task, fingerprint(&refs)))
@@ -388,6 +408,7 @@ struct RawConfig {
     version: u32,
     local_base_url: Option<String>,
     embedding_space: Option<RawSpace>,
+    embedding_contract: Option<String>,
     #[serde(default)]
     tasks: RawTasks,
 }
@@ -676,6 +697,13 @@ impl AiSettings {
             Some(url) => Some(normalize_base_url(&url).ok_or(AiConfigError::BadValue)?),
             None => None,
         };
+        if raw
+            .embedding_contract
+            .as_deref()
+            .is_some_and(|c| c != super::embedding::CONTRACT)
+        {
+            return Err(AiConfigError::BadValue);
+        }
         let embedding_space = raw.embedding_space.map(validate_space).transpose()?;
         let raw_tasks = [
             (TaskKind::ImageEmbedding, raw.tasks.image_embedding),
@@ -694,6 +722,7 @@ impl AiSettings {
         let mut settings = Self {
             local_base_url,
             embedding_space,
+            embedding_contract: raw.embedding_contract,
             tasks,
             config_hash: String::new(),
         };
@@ -730,6 +759,7 @@ impl AiSettings {
         let mut parts: Vec<String> = vec![
             format!("v{CONFIG_VERSION}"),
             self.local_base_url.clone().unwrap_or_default(),
+            self.embedding_contract.clone().unwrap_or_default(),
         ];
         match &self.embedding_space {
             Some(s) => parts.extend([

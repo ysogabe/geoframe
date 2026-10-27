@@ -554,13 +554,22 @@ pub struct DecisionRgb {
 /// 表示画像を Decision 用に準備する。derivative は既に向き適用済み、直接表示原本だけ EXIF を一度適用する。
 /// 手動 rotation は display に反映済みなので、ここでは受け取らない。長辺 1536 / 面積 1.6MP、縮小のみ。
 pub fn prepare_decision_rgb(bytes: &[u8], apply_exif: bool) -> Result<DecisionRgb, ImageError> {
+    prepare_ai_rgb(bytes, apply_exif, 1536)
+}
+
+/// Same decode/orientation/sRGB pipeline, embedding's fixed 768px limit.
+pub fn prepare_embedding_rgb(bytes: &[u8], apply_exif: bool) -> Result<DecisionRgb, ImageError> {
+    prepare_ai_rgb(bytes, apply_exif, 768)
+}
+
+fn prepare_ai_rgb(bytes: &[u8], apply_exif: bool, longest: u32) -> Result<DecisionRgb, ImageError> {
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ImageError::FileTooLarge);
     }
     let (_, decoded) = decode_any(bytes)?;
     let w = decoded.raster.width;
     let h = decoded.raster.height;
-    let scale = (1536.0 / f64::from(w.max(h)))
+    let scale = (f64::from(longest) / f64::from(w.max(h)))
         .min((1_600_000.0 / (f64::from(w) * f64::from(h))).sqrt())
         .min(1.0);
     let dims = (

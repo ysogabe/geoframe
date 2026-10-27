@@ -1,7 +1,7 @@
 # AI Provider基盤（T4.2）
 
 - 状態: T4.2で実装。設計は[p4-design.md](p4-design.md) §4.3・§5、設定は[ai-config.md](ai-config.md)。
-- 範囲: **AI専用のHTTP・接続先の固定・Discovery・Decisionの入出力・共有の一時待機**まで。用途別のhandler（Decisionの質問と閾値・clueの保存はT4.6、画像／文EmbeddingはT4.4）、クラウドの認証・送信はT4.6aで追加した[ai-cloud.md](ai-cloud.md)を参照。T4.6bで[写真別location_clue](ai-location-clue.md)、T4.6c2で[日候補と別座標化](ai-location-suggest.md)を本番登録した（他の未登録jobはclaimも成功化もされない）。
+- 範囲: **AI専用のHTTP・接続先の固定・Discovery・Decisionの入出力・共有の一時待機**まで。用途別のhandler（Decisionの質問と閾値・clueの保存はT4.6、画像／文Embeddingは[T4.4a](ai-embedding.md)）、クラウドの認証・送信はT4.6aで追加した[ai-cloud.md](ai-cloud.md)を参照。T4.6bで[写真別location_clue](ai-location-clue.md)、T4.6c2で[日候補と別座標化](ai-location-suggest.md)を本番登録した（他の未登録jobはclaimも成功化もされない）。
 - 実LAN・外部AI・クラウド・課金は使っていない（試験はループバックのスタブ・偽のDNS・合成の画像／DBだけ）。
 
 ## 参照した契約（固定した版）
@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | local-model-lab（Discovery） | `main@7f472a5c`（2026-10-26T11:41Z）。以前の`2c78c991`から契約の変化なし | `GET /llm/catalog`（`services[]`の`id`・`apis[]`・`available`）、`GET /llm/services/<id>`（`id`・`state`・`available`・`lease_count`）。`reason`・`url`・`local_url`・`endpoint`は使わない |
 | Decision（d3-lite） | Hugging Face `vllm-sr/d3-lite`の`d3_server.py`（revision `a8d25a91`） | `GET /health`（`status`・`model`・`modalities`）、`POST /v1/systemone`（要求・応答の形と上限）。入口の接頭辞は`/llm-decision` |
-| 画像／文Embedding | local-model-lab #93は**OPEN・採用された画像APIなし**（2026-10-26） | **何も実装していない**。仮のAPI・実providerの実行は追加しない（T4.4） |
+| 画像／文Embedding | local-model-lab `c9b05b590d838b81a6b2f939af34e409f16469ad`（#101/#93） | T4.4aでBF16画像/文共通の固定契約アダプターを実装。[設定・API・試験境界](ai-embedding.md) |
 
 契約が変わったときは、上の版を更新してから`tests_provider.rs`のスタブ（`new_lab`）を直す。
 
@@ -27,7 +27,7 @@
 | プロキシ | 使わない（`proxy(None)`）。`HTTP_PROXY`/`HTTPS_PROXY`は読まない。クラウドも環境proxyを使わず、任意proxyの設定入口は無い（[ai-cloud.md](ai-cloud.md)） |
 | ヘッダー | `X-Client-Name: geoframe`・`Accept`・POSTの`Content-Type`・`User-Agent: geoframe/<版>`だけ。`Origin`は付けない |
 | 期限 | Discovery全体2秒（catalog＋service＋health）、対話15秒、背景60〜180秒（Decision 150秒、Embedding 60秒、判定120秒・位置候補180秒）。DNS・接続（5秒まで）・ヘッダー・本文の読み切りを含む |
-| 要求の上限 | 完成したJSON（base64込み）8 MiB。**送る前**に検査し、超えたらDNSも接続もしない（`RequestTooLarge`）。上流のDecisionの本文16 MiBよりこちらを優先 |
+| 要求の上限 | 完成したJSON（base64込み）8 MiB（Embedding固定endpointだけ4 MiB）。**送る前**に検査し、超えたらDNSも接続もしない（`RequestTooLarge`）。上流のDecisionの本文16 MiBよりこちらを優先 |
 | 応答の上限 | 展開後1 MiB（`net::read_body_limited`。圧縮前の上限も同じ関数が掛ける）。2xx以外の本文は読まない |
 | 枠 | 背景1・対話1で独立。対話の枠が使用中なら待たず`Busy`（定型503に当たる）。対話が枠を待つ間は新しい背景を始めない |
 | 呼出境界 | 同期の`ureq`をtokioのworkerやwriterの上では呼ばない。背景はAIワーカーの専用スレッド、対話は`AiHttp::run_interactive`（枠を先に取り`spawn_blocking`で実行） |
@@ -105,7 +105,7 @@
 
 ## 未実装・後続
 
-- 画像／文Embedding（T4.4）。写真別clueはT4.6b、日候補・別座標化はT4.6c2で登録済み。Decision readyの失敗をCloud認証pauseに流用しない。
+- 画像／文Embeddingの実LAN/LXC検証（アダプターは[T4.4a](ai-embedding.md)で登録済み）。写真別clueはT4.6b、日候補・別座標化はT4.6c2で登録済み。Decision readyの失敗をCloud認証pauseに流用しない。
 - クラウド（Vertex）のアダプター・token読取・401の一度のrefresh・送信後の課金計数（T4.6）。このタスクでクラウドへの実送信はしていない。
-- 対話（検索語Embedding）の予約キャッシュとE5/E6への接続（T4.4）。`AiHttp::run_interactive`は枠と境界だけ。
+- 対話（検索語Embedding）の予約キャッシュとE5/E6への接続（T4.4b）。`AiHttp::run_interactive`は枠と境界だけ。
 - 実LAN・実Decision・実画像での確認はT4.7（LXC）。

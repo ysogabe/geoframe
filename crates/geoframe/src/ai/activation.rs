@@ -6,7 +6,7 @@
 //!    候補は `content_sha256` ごとで、その SHA に属する**すべての写真の世代**（写真 ID・`display`・`md5`・
 //!    `mtime`）を持つ（代表 1 枚だけではない）。
 //! 2. 後続のワーカー（T4.4）が、その空間の画像 Embedding を作り、[`super::index::store_vector`] で保存する
-//!    （ジョブは [`super::index::image_embedding_key`]）。
+//!    （ジョブは [`super::index::ShaState::job_key`]）。
 //! 3. 切替できそうなとき [`try_activate`] を writer 上で呼ぶ。**1 つの書き込みトランザクションの中で**、候補の
 //!    それぞれが**今も同じ世代の対象か**を再検査する。SHA は、**構築開始時の構成員のうち 1 枚でも今も同じ世代の
 //!    対象**ならまだ有効（代表が消えても、同じ内容の写真が変わらず残っていれば分母・待ちに残す）。構成員が
@@ -67,6 +67,11 @@ impl fmt::Debug for SnapshotTarget {
 }
 
 impl SnapshotTarget {
+    /// Same generation-bound key as the production worker and failed-state classifier.
+    pub fn job_key(&self, identity: &SpaceIdentity) -> super::jobs::JobKey {
+        super::index::image_embedding_generation_key(identity, self.input_sha256(), &self.members)
+    }
+
     pub fn input_sha256(&self) -> &str {
         &self.members[0].input_sha256
     }

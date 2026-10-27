@@ -157,7 +157,7 @@ STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解�
 
 - 未登録の種類の`failed`は`ai-jobs retry`でも保持する（`unsupported`）。location_clueはT4.6bの`recheck`で現在の入力・処理版・既存結果を検査し、同世代のfailed投影を無効にしてpendingへ戻す（通信なし）。
 - `Disabled`から`RunError::PolicyDisabled`への対応付け、401/403/404/契約不一致から`ProviderPause`／`TaskPause`への対応付け、429のRetry-After、予算エラー（`Budget`）の扱いは、各handlerが`before_send`の結果をそのまま返すことで揃う（ワーカーがジョブの状態へ対応付ける）。
-- HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。空間別のベクトル保存・検索空間の切替・旧選別の安全化はT4.3で実装済み（[ai-index.md](ai-index.md)。切替の成功率の閾値`activation_min_coverage`は、今は`try_activate`の引数と既定0.95で、このJSONには置かない。後続が任意の独立キーとして足す場合は、有限の0〜1だけを許し、不正ならAI設定不正としてAIだけを無効にし、閾値は設定ハッシュ・結果の同一性に入れない）。対話の検索語Embedding（`query_embedding`）の予約・キャッシュ、画像／文EmbeddingのアダプターはT4.4、Decisionの質問・clue保存・クラウドはT4.6。
+- HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。空間別のベクトル保存・検索空間の切替・旧選別の安全化はT4.3で実装済み（[ai-index.md](ai-index.md)。切替の成功率の閾値`activation_min_coverage`は、今は`try_activate`の引数と既定0.95で、このJSONには置かない。後続が任意の独立キーとして足す場合は、有限の0〜1だけを許し、不正ならAI設定不正としてAIだけを無効にし、閾値は設定ハッシュ・結果の同一性に入れない）。画像／文Embeddingの固定契約アダプター・画像job・自動切替は[T4.4a](ai-embedding.md)で実装済み。対話の検索語Embedding（`query_embedding`）の予約・キャッシュ・E5/E6接続はT4.4b、Decisionの質問・clue保存・クラウドはT4.6。
 
 
 Vertexの明示認証・固定宛先・token/予算/失敗分類は[ai-cloud.md](ai-cloud.md)（T4.6a）。handler登録と実クラウド利用の許可は後続。
@@ -167,3 +167,7 @@ Vertexの明示認証・固定宛先・token/予算/失敗分類は[ai-cloud.md]
 `location_suggest` と `location_geocode` を本番factoryへ登録した。新規Cloud画像送信には有効なlocation_clue設定と、その時点のDecision画像readyも必要。保存済み有償回答の座標化にはCloudClientや認証ファイルが不要で、location_suggestの有効/無効・pause・周期上限を尊重する。実画像や費用の追加許可は導入しない。
 
 有効suggest設定だけが `ai_location_suggest_results` / `ai_location_candidates` / `ai_location_suggest_holds` をmigration/dry-run対象にする。c1済みDBへの不足増分は後者2表。INGEST=0や無効/不正設定の配信継続と、既存CLIのGuard/ingest lockは維持する。statusに固定の保留理由と件数を追加し、写真ID・地名・日付・モデル応答・認証情報は出さない。
+
+## T4.4a: 既知Embedding契約の明示
+
+`embedding_contract`（任意）を追加した。対応値は `local-model-lab-eg2-bf16-c9b05b59-v1` のみ。未知値・未知キー・重複はAIだけ無効にする。未指定や宣言不一致では画像handlerを登録せず、query clientも作れない。BF16の固定revision/前処理/共通空間の照合、合成URLだけの設定例、T4.4bの呼出境界は [ai-embedding.md](ai-embedding.md) を参照。既存の一般 `gate` の成功だけでこのアダプターを使わない。空間の宣言とcontractは用途pauseの識別にも含め、修正後の再開を可能にする。新規schema/dry-run増分は0。coverageは既存APIの既定0.95を使い、設定キーは追加しない。

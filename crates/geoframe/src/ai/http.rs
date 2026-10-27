@@ -235,15 +235,20 @@ pub enum Endpoint<'a> {
     DecisionModels,
     /// `POST /llm-decision/v1/systemone`
     DecisionSystemOne,
+    /// Fixed local-model-lab embedding endpoints.
+    EmbeddingModels,
+    Embeddings,
 }
 
 impl Endpoint<'_> {
     pub fn is_post(&self) -> bool {
-        matches!(self, Self::DecisionSystemOne)
+        matches!(self, Self::DecisionSystemOne | Self::Embeddings)
     }
 
     fn path(&self) -> String {
         match self {
+            Self::EmbeddingModels => "/llm-embed/v1/models".to_string(),
+            Self::Embeddings => "/llm-embed/v1/embeddings".to_string(),
             Self::Catalog => "/llm/catalog".to_string(),
             Self::Service(id) => format!("/llm/services/{}", id.as_str()),
             Self::DecisionHealth => "/llm-decision/health".to_string(),
@@ -437,7 +442,14 @@ impl Session {
         deadline: &Deadline,
     ) -> Result<Reply, HttpError> {
         // 送る前の確認（上限は接続も名前解決もしないうちに）
-        if body.is_some_and(|b| b.len() > MAX_REQUEST_BYTES) {
+        if body.is_some_and(|b| {
+            b.len()
+                > if matches!(endpoint, Endpoint::Embeddings) {
+                    super::embedding::MAX_REQUEST_BYTES
+                } else {
+                    MAX_REQUEST_BYTES
+                }
+        }) {
             return Err(HttpError::RequestTooLarge);
         }
         if self.stop.is_stopped() {

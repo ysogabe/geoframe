@@ -453,8 +453,13 @@ fn safe_path(data: &DataDir, rel: &str) -> Result<std::path::PathBuf, RunError> 
 }
 
 fn read_source(data: &DataDir, input: &Input) -> Result<Vec<u8>, RunError> {
+    read_image_source(data, &input.rel)
+}
+
+/// Shared bounded, locked read only. Decode and network must happen after returning.
+pub(super) fn read_image_source(data: &DataDir, rel: &str) -> Result<Vec<u8>, RunError> {
     let _lock = imaging::lock_derivatives();
-    let path = safe_path(data, &input.rel)?;
+    let path = safe_path(data, rel)?;
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)

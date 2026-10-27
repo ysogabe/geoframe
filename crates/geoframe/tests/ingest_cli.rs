@@ -1502,7 +1502,6 @@ fn ai_jobs_status_shows_the_search_index_with_counts_only_and_writes_nothing() {
 
 #[test]
 fn ai_jobs_status_never_prints_a_stored_failure_reason_that_is_not_a_known_code() {
-    use geoframe::ai::index::image_embedding_key;
     let dir = Dir::new("aiindex-status-reasons");
     let data = data_with_active_space(&dir);
     let space = {
@@ -1534,11 +1533,17 @@ fn ai_jobs_status_never_prints_a_stored_failure_reason_that_is_not_a_known_code(
             rusqlite::params![id, sha],
         )
         .unwrap();
-        let key = image_embedding_key(&space, sha);
+        let snapshot = geoframe::ai::activation::snapshot_targets(&conn, &space).unwrap();
+        let key = snapshot
+            .targets()
+            .iter()
+            .find(|t| t.input_sha256() == sha)
+            .unwrap()
+            .job_key(&space);
         geoframe::ai::jobs::enqueue(&mut conn, &key, 0).unwrap();
         conn.execute(
             "UPDATE ai_jobs SET state='failed', terminal=1, last_error_code=?1 WHERE input_hash=?2",
-            rusqlite::params![code, sha],
+            rusqlite::params![code, key.input_hash],
         )
         .unwrap();
     }

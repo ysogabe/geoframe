@@ -1,0 +1,940 @@
+//! Synthetic files/DB and loopback only, through production factory and real worker core.
+use super::*;
+use crate::ai::embedding::tests::{config_json, models, reply};
+use crate::ai::embedding::{self, MODEL};
+use crate::ai::http::Deadline;
+use crate::ai::jobs::{Completion, Failure};
+use crate::ai::provider::LanClient;
+use crate::ai::settings::TaskKind;
+use crate::ai::tests_http::{Captured, Stub, respond, stub};
+use crate::ai::tests_worker::{Env, T0, env_with};
+use crate::ai::worker::{self, Core};
+use crate::stop::StopFlag;
+use base64::Engine;
+use serde_json::{Value, json};
+use std::fs;
+use std::sync::mpsc;
+use std::time::Duration;
+
+type Hook = Arc<dyn Fn(&Captured) + Send + Sync>;
+pub(in crate::ai) struct Lab {
+    pub(in crate::ai) stub: Stub,
+    state: Arc<Mutex<State>>,
+}
+struct State {
+    available: bool,
+    lease: Value,
+    status: u16,
+    post: Value,
+    models: Value,
+    hook: Option<Hook>,
+}
+impl Lab {
+    pub(in crate::ai) fn new() -> Self {
+        let state = Arc::new(Mutex::new(State {
+            available: true,
+            lease: json!(0),
+            status: 200,
+            post: reply(),
+            models: models(),
+            hook: None,
+        }));
+        let shared = state.clone();
+        let stub = stub(move |stream, req| {
+            let hook = shared.lock().unwrap().hook.clone();
+            if let Some(h) = hook {
+                h(req);
+            }
+            let st = shared.lock().unwrap();
+            let line = &req.request_line;
+            let (status, body) = if line.starts_with("GET /llm/catalog ") {
+                (
+                    200,
+                    json!({"services":[{"id":"embed","available":st.available,
+                    "url":"http://192.0.2.1:9/trap","local_url":"http://192.0.2.1:9/trap",
+                    "apis":[{"method":"POST","path":"/v1/embeddings"},{"method":"GET","path":"/v1/models"}]}]}),
+                )
+            } else if line.starts_with("GET /llm/services/embed ") {
+                (
+                    200,
+                    json!({"id":"embed","state":"running","available":st.available,"lease_count":st.lease,
+                    "endpoint":"192.0.2.1:9"}),
+                )
+            } else if line.starts_with("GET /llm-embed/v1/models ") {
+                (200, st.models.clone())
+            } else if line.starts_with("POST /llm-embed/v1/embeddings ") {
+                (st.status, st.post.clone())
+            } else {
+                (404, json!({}))
+            };
+            drop(st);
+            respond(
+                stream,
+                &format!("{status} X"),
+                "Retry-After: 60\r\n",
+                &serde_json::to_vec(&body).unwrap(),
+            );
+        });
+        Self { stub, state }
+    }
+    pub(in crate::ai) fn env(&self, tag: &str) -> Env {
+        let e = env_with(
+            tag,
+            &config_json(&format!("http://{}", self.stub.addr)),
+            true,
+        );
+        sql(&e, "DELETE FROM photos");
+        fs::create_dir_all(e.config.data_dir.join("derivatives")).unwrap();
+        e
+    }
+    pub(in crate::ai) fn posts(&self) -> Vec<Captured> {
+        self.stub
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.request_line.starts_with("POST "))
+            .cloned()
+            .collect()
+    }
+    fn hook(&self, f: impl Fn(&Captured) + Send + Sync + 'static) {
+        self.state.lock().unwrap().hook = Some(Arc::new(f));
+    }
+}
+fn sql(e: &Env, s: &str) {
+    let s = s.to_string();
+    e.writer().call(move |c| c.execute_batch(&s)).unwrap();
+}
+fn n(e: &Env, s: &str) -> i64 {
+    let s = s.to_string();
+    e.writer()
+        .call(move |c| c.query_row(&s, [], |r| r.get(0)))
+        .unwrap()
+}
+fn pointer(e: &Env) -> Option<String> {
+    use rusqlite::OptionalExtension;
+    e.writer()
+        .call(|c| {
+            c.query_row(
+                "SELECT value FROM settings WHERE key='ai_active_space'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()
+        })
+        .unwrap()
+}
+fn handlers(e: &Env) -> Vec<Arc<dyn Handler>> {
+    worker::production_handlers_for_test(&e.config, LanClient::new(&e.config.ai))
+}
+fn cycle(e: &Env) {
+    Core::new(&e.deps(handlers(e), &StopFlag::new(), "embed-test")).cycle();
+}
+fn jpeg(seed: u8) -> Vec<u8> {
+    let mut out = Vec::new();
+    let pixels = (0..32 * 24 * 3)
+        .map(|i| seed.wrapping_add((i % 17) as u8))
+        .collect::<Vec<_>>();
+    jpeg_encoder::Encoder::new(&mut out, 90)
+        .encode(&pixels, 32, 24, jpeg_encoder::ColorType::Rgb)
+        .unwrap();
+    out
+}
+fn photo(e: &Env, id: i64, bytes: &[u8]) -> String {
+    let rel = format!("derivatives/synthetic-{id}.jpg");
+    fs::write(e.config.data_dir.join(&rel), bytes).unwrap();
+    let hash = sha(bytes);
+    let h = hash.clone();
+    e.writer().call(move|c|{
+        c.execute("INSERT INTO photos(id,source,name,display,md5,mtime,taken_at,hidden,favorite,rotation)
+            VALUES(?1,'local','synthetic',?2,'m',1,'2026-01-02 03:04',1,1,0)",params![id,rel])?;
+        c.execute("INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,error,analyzed_at)
+            VALUES(?1,?2,'m',1,?3,'','synthetic')",params![id,rel,h])?;Ok(())
+    }).unwrap();
+    hash
+}
+fn dump(e: &Env, table: &str) -> Vec<Vec<rusqlite::types::Value>> {
+    let q = format!("SELECT * FROM {table} ORDER BY 1");
+    e.writer()
+        .call(move |c| {
+            let mut stmt = c.prepare(&q)?;
+            let columns = stmt.column_count();
+            stmt.query_map([], |r| (0..columns).map(|i| r.get(i)).collect())?
+                .collect()
+        })
+        .unwrap()
+}
+fn prepare(e: &Env) -> (Arc<dyn Handler>, Claimed) {
+    let h = handlers(e).into_iter().next().unwrap();
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    for action in h.reconcile_cleanup(&read, T0).unwrap() {
+        e.writer()
+            .call(move |c| {
+                let tx = c.transaction()?;
+                action(&tx)?;
+                tx.commit()
+            })
+            .unwrap();
+    }
+    let keys = h.reconcile(&read, T0).unwrap();
+    let job = e
+        .writer()
+        .call(move |c| {
+            jobs::enqueue_batch(c, &keys, T0)?;
+            jobs::claim_next(c, T0, "run", "token", &[JobKind::ImageEmbedding])
+        })
+        .unwrap()
+        .unwrap();
+    (h, job)
+}
+#[test]
+fn factory_to_reconcile_claim_image_atomic_store_and_publish_restart_sends_zero() {
+    let lab = Lab::new();
+    let e = lab.env("embed-e2e");
+    let raw = jpeg(17);
+    let mut source = raw[..2].to_vec();
+    let marker = b"Exif\0\0synthetic-private-gps";
+    source.extend([0xff, 0xe1]);
+    source.extend(((marker.len() + 2) as u16).to_be_bytes());
+    source.extend(marker);
+    source.extend(&raw[2..]);
+    source.extend(b"synthetic-private-tail");
+    photo(&e, 1, &source);
+    let before = dump(&e, "photos");
+    let quality = dump(&e, "photo_quality_features");
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 1);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        1
+    );
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 1);
+    assert_eq!(pointer(&e).as_deref(), Some("eg2-test-v1"));
+    assert_eq!(dump(&e, "photos"), before);
+    assert_eq!(dump(&e, "photo_quality_features"), quality);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM photo_embeddings"), 0);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM photo_ai_features"), 0);
+    cycle(&e);
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 1);
+    let posts = lab.posts();
+    let body: Value = serde_json::from_slice(&posts[0].body).unwrap();
+    assert_eq!(body["input"].as_array().unwrap().len(), 1);
+    assert_eq!(body["model"], MODEL);
+    assert_eq!(body["encoding_format"], "float");
+    let encoded = body["input"][0]["image"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("data:image/jpeg;base64,")
+        .unwrap();
+    let sent = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .unwrap();
+    assert_ne!(sent, source);
+    assert!(!sent.windows(4).any(|w| w == b"Exif"));
+    assert!(!sent.windows(17).any(|w| w == b"synthetic-private"));
+    assert!(!sent.windows(11).any(|w| w == b"ICC_PROFILE"));
+    let identity = embedding::configured_identity(&e.config.ai, TaskKind::ImageEmbedding).unwrap();
+    let sent_hash = sha(&sent);
+    e.writer()
+        .call(move |c| {
+            let (stored, blob): (String, Vec<u8>) = c.query_row(
+                "SELECT sent_sha256,vector FROM ai_embedding_vectors",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )?;
+            assert_eq!(stored, sent_hash);
+            let values = super::super::space::decode(&identity, &blob).unwrap();
+            assert!((values[0] - 0.6).abs() < 1e-6);
+            Ok(())
+        })
+        .unwrap();
+}
+#[test]
+fn missing_or_corrupt_success_regenerates_only_that_vector_and_reuses_valid_success() {
+    let lab = Lab::new();
+    let e = lab.env("embed-repair");
+    photo(&e, 1, &jpeg(1));
+    photo(&e, 2, &jpeg(2));
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 2);
+    sql(
+        &e,
+        "UPDATE ai_embedding_vectors SET vector=zeroblob(dimension*4) WHERE input_sha256=(SELECT content_sha256 FROM photo_quality_features WHERE photo_id=1)",
+    );
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 3);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        2
+    );
+    sql(
+        &e,
+        "DELETE FROM ai_embedding_vectors WHERE input_sha256=(SELECT content_sha256 FROM photo_quality_features WHERE photo_id=2)",
+    );
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 4);
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 4);
+    // Lost job rows can reuse independently verified vectors without a send.
+    sql(&e, "DELETE FROM ai_jobs");
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 4);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        2
+    );
+}
+#[test]
+fn discovery_unavailable_lease_and_429_defer_then_resume() {
+    for mode in [0, 1, 2] {
+        let lab = Lab::new();
+        let e = lab.env("embed-wait");
+        photo(&e, 1, &jpeg(2));
+        photo(&e, 2, &jpeg(3));
+        {
+            let mut s = lab.state.lock().unwrap();
+            match mode {
+                0 => s.available = false,
+                1 => s.lease = json!(1),
+                _ => s.status = 429,
+            };
+        }
+        cycle(&e);
+        assert_eq!(n(&e, "SELECT SUM(attempts) FROM ai_jobs"), 0);
+        assert_eq!(
+            n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='deferred'"),
+            1
+        );
+        assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_provider_waits"), 1);
+        assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_provider_pauses"), 0);
+        assert_eq!(lab.posts().len(), if mode == 2 { 1 } else { 0 });
+        // New worker sees the persisted wait and sends nothing.
+        cycle(&e);
+        assert_eq!(lab.posts().len(), if mode == 2 { 1 } else { 0 });
+        {
+            let mut s = lab.state.lock().unwrap();
+            s.available = true;
+            s.lease = json!(0);
+            s.status = 200;
+        }
+        e.advance(61);
+        cycle(&e);
+        assert_eq!(
+            n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+            2
+        );
+    }
+}
+#[test]
+fn unauthorized_pauses_provider_and_model_or_capability_pauses_task() {
+    for mode in [0, 1, 2] {
+        let lab = Lab::new();
+        let e = lab.env("embed-pause");
+        photo(&e, 1, &jpeg(4));
+        {
+            let mut s = lab.state.lock().unwrap();
+            match mode {
+                0 => s.status = 401,
+                1 => s.post["model"] = json!("wrong"),
+                _ => s.models["data"][0]["modalities"] = json!(["text"]),
+            };
+        }
+        cycle(&e);
+        assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_provider_pauses"), 1);
+        assert_eq!(
+            n(
+                &e,
+                "SELECT COUNT(*) FROM ai_provider_pauses WHERE scope='provider'"
+            ),
+            if mode == 0 { 1 } else { 0 }
+        );
+        assert_eq!(n(&e, "SELECT SUM(attempts) FROM ai_jobs"), 0);
+        assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 0);
+        let posts = lab.posts().len();
+        e.advance(3600);
+        cycle(&e);
+        assert_eq!(lab.posts().len(), posts);
+        // Explicit release allows recovery; neither scope is silently cleared.
+        {
+            let mut s = lab.state.lock().unwrap();
+            s.status = 200;
+            s.post = reply();
+            s.models = models();
+        }
+        sql(&e, "DELETE FROM ai_provider_pauses");
+        e.advance(61);
+        cycle(&e);
+        assert_eq!(
+            n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+            1
+        );
+    }
+}
+#[test]
+fn one_bad_image_hits_terminal_limit_other_images_continue_and_retry_adds_difference() {
+    let lab = Lab::new();
+    let e = lab.env("embed-repeat");
+    photo(&e, 1, &jpeg(5));
+    lab.state.lock().unwrap().status = 500;
+    for _ in 0..8 {
+        cycle(&e);
+        e.advance(3601);
+    }
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE state='failed' AND terminal=1"
+        ),
+        1
+    );
+    let posts = lab.posts().len();
+    cycle(&e);
+    assert_eq!(lab.posts().len(), posts);
+    lab.state.lock().unwrap().status = 200;
+    photo(&e, 2, &jpeg(6));
+    cycle(&e);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        1
+    );
+    // Below 95%, old pointer is preserved, then a manual retry adds just the failed SHA.
+    assert!(pointer(&e).is_none());
+    let h = handlers(&e).remove(0);
+    e.writer()
+        .call(move |c| {
+            jobs::retry_failed(c, T0 + 50000, jobs::RetryScope::All, |c, k| h.recheck(c, k))
+        })
+        .unwrap();
+    e.advance(50001);
+    cycle(&e);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        2
+    );
+    assert_eq!(pointer(&e).as_deref(), Some("eg2-test-v1"));
+    let posts = lab.posts().len();
+    cycle(&e);
+    assert_eq!(lab.posts().len(), posts);
+}
+#[test]
+fn old_pointer_remains_pending_all_failed_never_publishes_and_99_of_100_does() {
+    let lab = Lab::new();
+    let e = lab.env("embed-coverage");
+    sql(&e, "INSERT INTO settings VALUES('ai_active_space','old')");
+    let identity = embedding::configured_identity(&e.config.ai, TaskKind::ImageEmbedding).unwrap();
+    for i in 1..=100 {
+        let hash = photo(&e, i, &jpeg(i as u8));
+        if i < 100 {
+            let identity = identity.clone();
+            e.writer()
+                .call(move |c| {
+                    index::register_space(c, &identity, T0).unwrap();
+                    index::store_vector(c, &identity, &hash, &"a".repeat(64), &vec![1.0; 768], T0)
+                        .unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+    lab.state.lock().unwrap().available = false;
+    cycle(&e);
+    assert_eq!(pointer(&e).as_deref(), Some("old"));
+    // Terminal current failed member excludes exactly one SHA, reusing 99 valid vectors.
+    sql(
+        &e,
+        "UPDATE ai_jobs SET state='failed',terminal=1,last_error_code='input_invalid' WHERE target_key LIKE '%'||char(31)||(SELECT content_sha256 FROM photo_quality_features WHERE photo_id=100)",
+    );
+    e.advance(61);
+    lab.state.lock().unwrap().available = true;
+    cycle(&e);
+    assert_eq!(pointer(&e).as_deref(), Some("eg2-test-v1"));
+    assert_eq!(lab.posts().len(), 0);
+    let lab = Lab::new();
+    let e = lab.env("embed-all-fail");
+    photo(&e, 1, b"invalid synthetic jpeg");
+    sql(&e, "INSERT INTO settings VALUES('ai_active_space','old')");
+    cycle(&e);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='failed'"),
+        1
+    );
+    assert_eq!(pointer(&e).as_deref(), Some("old"));
+    assert_eq!(lab.posts().len(), 0);
+}
+#[test]
+fn generation_changes_after_discovery_prevent_send_and_after_post_prevent_commit() {
+    for after_post in [false, true] {
+        for mutation in [
+            "UPDATE photos SET rotation=90 WHERE id=1",
+            "UPDATE photos SET md5='new' WHERE id=1",
+            "UPDATE photos SET mtime=2 WHERE id=1",
+            "UPDATE photos SET display='derivatives/other.jpg' WHERE id=1",
+            "DELETE FROM photos WHERE id=1",
+        ] {
+            let lab = Lab::new();
+            let e = lab.env("embed-generation-race");
+            photo(&e, 1, &jpeg(7));
+            let writer = e.writer();
+            let mutation = mutation.to_string();
+            lab.hook(move |r| {
+                if r.request_line.starts_with(if after_post {
+                    "POST "
+                } else {
+                    "GET /llm-embed/v1/models "
+                }) {
+                    let q = mutation.clone();
+                    writer.call(move |c| c.execute_batch(&q)).unwrap();
+                }
+            });
+            cycle(&e);
+            assert_eq!(lab.posts().len(), usize::from(after_post));
+            assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 0);
+            assert_eq!(
+                n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+                0
+            );
+        }
+    }
+}
+#[test]
+fn actual_file_change_and_deletion_after_discovery_or_post_are_rejected() {
+    for after_post in [false, true] {
+        for delete in [false, true] {
+            let lab = Lab::new();
+            let e = lab.env("embed-file-race");
+            photo(&e, 1, &jpeg(8));
+            let path = e.config.data_dir.join("derivatives/synthetic-1.jpg");
+            lab.hook(move |r| {
+                if r.request_line.starts_with(if after_post {
+                    "POST "
+                } else {
+                    "GET /llm-embed/v1/models "
+                }) {
+                    if delete {
+                        let _ = fs::remove_file(&path);
+                    } else {
+                        fs::write(&path, jpeg(9)).unwrap();
+                    }
+                }
+            });
+            cycle(&e);
+            assert_eq!(lab.posts().len(), usize::from(after_post));
+            assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 0);
+        }
+    }
+}
+#[test]
+fn stop_after_discovery_sends_zero_but_sent_result_can_complete_and_save_is_not_overwritten() {
+    for before_post in [true, false] {
+        let lab = Lab::new();
+        let e = lab.env("embed-stop");
+        photo(&e, 1, &jpeg(10));
+        let stop = StopFlag::new();
+        let signal = stop.clone();
+        let writer = e.writer();
+        lab.hook(move |r| {
+            if r.request_line.starts_with(if before_post {
+                "GET /llm-embed/v1/models "
+            } else {
+                "POST "
+            }) {
+                writer
+                    .call(|c| {
+                        c.execute(
+                            "UPDATE photos SET lat=1,lon=2,hidden=0,favorite=0 WHERE id=1",
+                            [],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                signal.stop();
+            }
+        });
+        Core::new(&e.deps(handlers(&e), &stop, "embed-stop")).cycle();
+        assert_eq!(lab.posts().len(), usize::from(!before_post));
+        assert_eq!(
+            n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+            i64::from(!before_post)
+        );
+        assert_eq!(
+            n(
+                &e,
+                "SELECT COUNT(*) FROM photos WHERE lat=1 AND lon=2 AND hidden=0 AND favorite=0"
+            ),
+            1
+        );
+    }
+}
+#[test]
+fn completion_checks_token_and_db_generation_and_rolls_back_vector_and_job_together() {
+    for stale_token in [false, true] {
+        let lab = Lab::new();
+        let e = lab.env("embed-cas");
+        photo(&e, 1, &jpeg(11));
+        let (h, job) = prepare(&e);
+        let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+        let writer = e.writer();
+        let stop = StopFlag::new();
+        let clock = e.clock();
+        let ctx = RunCtx::for_test(
+            &read,
+            &e.config.ai,
+            TaskKind::ImageEmbedding,
+            &stop,
+            &writer,
+            &clock,
+        );
+        let action = h.run(&ctx, &job).unwrap();
+        if stale_token {
+            sql(&e, "UPDATE ai_jobs SET claim_token='replacement'");
+        } else {
+            sql(&e, "UPDATE photos SET rotation=180 WHERE id=1");
+        }
+        let result = e
+            .writer()
+            .call(move |c| jobs::complete(c, &job, T0, action))
+            .unwrap();
+        assert_eq!(
+            result,
+            if stale_token {
+                Completion::Rejected
+            } else {
+                Completion::Obsolete
+            }
+        );
+        assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 0);
+    }
+    let lab = Lab::new();
+    let e = lab.env("embed-atomic");
+    photo(&e, 1, &jpeg(12));
+    sql(
+        &e,
+        "CREATE TRIGGER reject_success BEFORE UPDATE OF state ON ai_jobs WHEN NEW.state='succeeded' BEGIN SELECT RAISE(ABORT,'synthetic'); END;",
+    );
+    cycle(&e);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 0);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        0
+    );
+}
+#[tokio::test]
+async fn http_wait_holds_neither_writer_nor_image_lock_and_query_can_run_in_parallel() {
+    let lab = Lab::new();
+    let e = lab.env("embed-parallel");
+    photo(&e, 1, &jpeg(13));
+    let lan = LanClient::new(&e.config.ai).unwrap();
+    let (entered, wait) = mpsc::channel();
+    let (release, hold) = mpsc::channel();
+    let hold = Arc::new(Mutex::new(hold));
+    lab.hook(move |r| {
+        if r.request_line.starts_with("POST ") && r.body.windows(7).any(|s| s == b"\"image\"") {
+            entered.send(()).unwrap();
+            hold.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap();
+        }
+    });
+    let h = worker::production_handlers_for_test(&e.config, Some(lan.clone()));
+    let deps = e.deps(h, &StopFlag::new(), "parallel");
+    let join = std::thread::spawn(move || Core::new(&deps).cycle());
+    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    e.writer()
+        .call(|c| {
+            c.execute("INSERT INTO settings VALUES('writer-available','1')", [])?;
+            Ok(())
+        })
+        .unwrap();
+    {
+        let _lock = imaging::lock_derivatives();
+    }
+    let client = EmbeddingClient::new(&e.config.ai, lan.clone(), TaskKind::QueryEmbedding).unwrap();
+    let result = lan
+        .http()
+        .run_interactive(&StopFlag::new(), move |s| {
+            client.query(&s, "合成", &Deadline::interactive(), || Ok(()))
+        })
+        .await
+        .unwrap();
+    release.send(()).unwrap();
+    join.join().unwrap();
+    assert!(result.is_ok());
+    assert_eq!(lab.posts().len(), 2);
+}
+#[test]
+fn generation_churn_preserves_terminal_and_interruption_history_other_spaces_are_untouched() {
+    let lab = Lab::new();
+    let e = lab.env("embed-history");
+    photo(&e, 1, &jpeg(14));
+    let (_, job) = prepare(&e);
+    e.writer()
+        .call(move |c| {
+            jobs::record_failure(c, &job, T0, ErrorCode::InputInvalid, Failure::Permanent)
+        })
+        .unwrap();
+    sql(&e,"UPDATE ai_jobs SET attempts=5,interruption_count=3; UPDATE photos SET rotation=90;
+        INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,created_at,updated_at)
+        VALUES('image_embedding','other-space'||char(31)||'abc','other','other','pending',0,0)");
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 0);
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE state='failed' AND terminal=1 AND attempts=5 AND interruption_count=3"
+        ),
+        1
+    );
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE target_key LIKE 'other-space%' AND state='pending'"
+        ),
+        1
+    );
+}
+#[test]
+fn cleanup_failure_cannot_fall_through_to_enqueue_and_disabled_factory_sends_nothing() {
+    let lab = Lab::new();
+    let e = lab.env("embed-cleanup-fail");
+    photo(&e, 1, &jpeg(15));
+    sql(
+        &e,
+        "CREATE TRIGGER no_space BEFORE INSERT ON ai_embedding_spaces BEGIN SELECT RAISE(ABORT,'synthetic'); END;",
+    );
+    cycle(&e);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_jobs"), 0);
+    assert_eq!(lab.posts().len(), 0);
+    for json in [
+        "{}".to_string(),
+        config_json(&format!("http://{}", lab.stub.addr)).replace(embedding::CONTRACT, "unknown"),
+        config_json(&format!("http://{}", lab.stub.addr)).replace(embedding::REVISION, "unknown"),
+    ] {
+        let e = env_with("embed-disabled", &json, true);
+        assert!(handlers(&e).is_empty());
+    }
+    let e = lab.env("embed-ingest-off");
+    let mut config = (*e.config).clone();
+    config.ingest = false;
+    assert!(worker::production_handlers_for_test(&config, LanClient::new(&config.ai)).is_empty());
+}
+#[test]
+fn new_duplicate_generation_reuses_verified_vector_without_send() {
+    let lab = Lab::new();
+    let e = lab.env("embed-duplicate");
+    let bytes = jpeg(16);
+    photo(&e, 1, &bytes);
+    cycle(&e);
+    photo(&e, 2, &bytes);
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 1);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 1);
+    // Changed bytes get a new SHA/job and preserve the old stored result.
+    let bytes = jpeg(18);
+    fs::write(
+        e.config.data_dir.join("derivatives/synthetic-2.jpg"),
+        &bytes,
+    )
+    .unwrap();
+    let hash = sha(&bytes);
+    e.writer()
+        .call(move |c| {
+            c.execute(
+                "UPDATE photo_quality_features SET content_sha256=?1 WHERE photo_id=2",
+                [hash],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 2);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 2);
+}
+
+#[test]
+fn changed_configuration_rejects_an_old_handler_without_a_send_or_migration_delta() {
+    let lab = Lab::new();
+    let e = lab.env("embed-config-old");
+    photo(&e, 1, &jpeg(19));
+    let (h, job) = prepare(&e);
+    let settings = config_json(&format!("http://{}", lab.stub.addr))
+        .replace(embedding::REVISION, "unknown-revision");
+    let newer = env_with("embed-config-new", &settings, true);
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    let writer = e.writer();
+    let clock = e.clock();
+    let stop = StopFlag::new();
+    let ctx = RunCtx::for_test(
+        &read,
+        &newer.config.ai,
+        TaskKind::ImageEmbedding,
+        &stop,
+        &writer,
+        &clock,
+    );
+    assert!(matches!(h.run(&ctx, &job), Err(RunError::PolicyDisabled)));
+    assert_eq!(lab.posts().len(), 0);
+    assert!(
+        crate::ai::pending_active(&read, false, false)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        crate::ingest::plan(&e.config, &read)
+            .unwrap()
+            .schema
+            .missing_objects
+            .is_empty()
+    );
+}
+#[test]
+fn pause_written_during_discovery_is_checked_before_inference() {
+    let lab = Lab::new();
+    let e = lab.env("embed-last-pause");
+    photo(&e, 1, &jpeg(20));
+    let writer = e.writer();
+    let config = e.config.clone();
+    lab.hook(move |r| {
+        if r.request_line.starts_with("GET /llm-embed/v1/models ") {
+            let key = config
+                .ai
+                .settings()
+                .unwrap()
+                .task_pause_key(TaskKind::ImageEmbedding)
+                .unwrap();
+            writer
+                .call(move |c| {
+                    crate::ai::pause::pause(
+                        c,
+                        TaskKind::ImageEmbedding,
+                        &key,
+                        crate::ai::pause::PauseReason::ContractMismatch,
+                        T0,
+                    )
+                })
+                .unwrap();
+        }
+    });
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 0);
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE state='deferred' AND attempts=0"
+        ),
+        1
+    );
+}
+#[test]
+fn lease_started_during_post_is_reprobed_without_spending_failure_attempts() {
+    let lab = Lab::new();
+    let e = lab.env("embed-lease-race");
+    photo(&e, 1, &jpeg(21));
+    let state = lab.state.clone();
+    lab.hook(move |r| {
+        if r.request_line.starts_with("POST ") {
+            let mut s = state.lock().unwrap();
+            s.status = 502;
+            s.lease = json!(1);
+            s.available = false;
+        }
+    });
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 1);
+    assert_eq!(n(&e, "SELECT SUM(attempts) FROM ai_jobs"), 0);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='deferred'"),
+        1
+    );
+    {
+        let mut s = lab.state.lock().unwrap();
+        s.hook = None;
+        s.lease = json!(0);
+        s.available = true;
+        s.status = 200;
+    }
+    e.advance(61);
+    cycle(&e);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        1
+    );
+}
+#[test]
+fn service_wait_and_task_pause_allow_another_purpose_to_continue() {
+    use crate::ai::tests_worker::{Fake, key};
+    for pause in [false, true] {
+        let lab = Lab::new();
+        let mut config: Value =
+            serde_json::from_str(&config_json(&format!("http://{}", lab.stub.addr))).unwrap();
+        config["tasks"]["location_clue"] = json!({"provider":"local","model":"example-decision"});
+        let e = env_with("embed-other-purpose", &config.to_string(), true);
+        sql(&e, "DELETE FROM photos");
+        fs::create_dir_all(e.config.data_dir.join("derivatives")).unwrap();
+        photo(&e, 1, &jpeg(22));
+        if pause {
+            lab.state.lock().unwrap().models["data"][0]["modalities"] = json!(["text"]);
+        } else {
+            lab.state.lock().unwrap().available = false;
+        }
+        let fake = Fake::new(JobKind::LocationClue, |ctx, job| {
+            ctx.before_send()?;
+            Ok(crate::ai::tests_worker::persist_result(
+                job.key.target_key.clone(),
+                InputCheck::Current,
+            ))
+        });
+        let other = key(JobKind::LocationClue, "synthetic-other");
+        e.enqueue(&other);
+        let mut handlers = handlers(&e);
+        handlers.retain(|h| h.kind() != JobKind::LocationClue);
+        handlers.push(fake.clone());
+        Core::new(&e.deps(handlers, &StopFlag::new(), "other-purpose")).cycle();
+        assert_eq!(fake.runs(), 1);
+        assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_test_results"), 1);
+        assert_eq!(lab.posts().len(), 0);
+    }
+}
+
+#[test]
+fn reverting_to_an_older_generation_cannot_revive_a_lower_failure_budget() {
+    let lab = Lab::new();
+    let e = lab.env("embed-revert-history");
+    photo(&e, 1, &jpeg(23));
+    lab.state.lock().unwrap().status = 500;
+    cycle(&e);
+    e.advance(3601);
+    sql(&e, "UPDATE photos SET rotation=90");
+    cycle(&e);
+    sql(
+        &e,
+        "UPDATE ai_jobs SET terminal=1,state='failed',attempts=5 WHERE state='deferred'",
+    );
+    let posts = lab.posts().len();
+    // This key already exists as obsolete with a lower attempt count; it must inherit
+    // the terminal current lineage before enqueue has any chance to revive it.
+    sql(&e, "UPDATE photos SET rotation=0");
+    e.advance(3601);
+    cycle(&e);
+    assert_eq!(lab.posts().len(), posts);
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE state='failed' AND terminal=1 AND attempts=5"
+        ),
+        1
+    );
+    // Explicit retry clears the current lineage, and a later generation may then run.
+    let h = handlers(&e).remove(0);
+    let now = e.clock()();
+    e.writer()
+        .call(move |c| jobs::retry_failed(c, now, jobs::RetryScope::All, |c, k| h.recheck(c, k)))
+        .unwrap();
+    sql(&e, "UPDATE photos SET rotation=90");
+    e.advance(3601);
+    lab.state.lock().unwrap().status = 200;
+    cycle(&e);
+    assert_eq!(lab.posts().len(), posts + 1);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 1);
+}
