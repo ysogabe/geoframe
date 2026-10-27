@@ -569,7 +569,7 @@ fn current_pointer_membership_must_match_ids_not_only_count() {
 
 #[test]
 fn stored_scene_corruption_is_rejected_by_reads_and_unchanged_checks() {
-    for case in 0..11 {
+    for case in 0..12 {
         let mut c = pair();
         let p = plan(&c);
         save(&mut c, &p, 0, &|| false).unwrap();
@@ -618,6 +618,12 @@ fn stored_scene_corruption_is_rejected_by_reads_and_unchanged_checks() {
                 .unwrap(),
             9 => c
                 .execute("UPDATE ai_scene_members SET score=101 WHERE rank=2", [])
+                .unwrap(),
+            10 => c
+                .execute(
+                    "UPDATE ai_scene_groups SET shortlist='review-invalid-type'",
+                    [],
+                )
                 .unwrap(),
             _ => {
                 c.execute_batch(

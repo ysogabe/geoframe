@@ -674,13 +674,15 @@ fn read_members(conn: &Connection, result_id: &str) -> Result<Vec<Member>, Error
         })
     })?
     .collect::<rusqlite::Result<_>>()
-    .map_err(|e| {
-        if e.sqlite_error_code().is_some() {
-            Error::Database
-        } else {
-            Error::CorruptResult
-        }
-    })
+    .map_err(stored_row_error)
+}
+
+fn stored_row_error(error: rusqlite::Error) -> Error {
+    if error.sqlite_error_code().is_some() {
+        Error::Database
+    } else {
+        Error::CorruptResult
+    }
 }
 
 /// Shared by current reads and the save fast path; all members must describe one complete result.
@@ -838,7 +840,8 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
                 ))
             },
         )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(stored_row_error)?;
     drop(stmt);
     let mut groups = Vec::new();
     for (
