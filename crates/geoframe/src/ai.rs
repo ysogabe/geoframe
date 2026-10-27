@@ -2,14 +2,14 @@
 //! Provider の一時停止（[`pause`]）、共有の一時待機（[`waits`]）、起動 ID と停止開始の記録（[`runs`]）、背景ワーカー
 //! （[`worker`]）、管理操作（[`ops`]。CLI と STATUS）。T4.2 で AI 専用の HTTP（[`http`]・[`dest`]・[`gate`]・[`lanes`]）、
 //! Discovery（[`discovery`]）、Decision（[`decision`]・[`image_input`]）、LAN の共通部分（[`provider`]）を足した。
-//! T4.6a は [`cloud`] に Vertex の明示認証・固定宛先・用途別通信を足した。用途別の handler の登録は後続のタスク。
+//! T4.6a は [`cloud`] に Vertex の明示認証・固定宛先・用途別通信を足した。T4.6b は [`location_clue`] の写真別 Decision を本番登録する。
 //! 設計は `docs/rust-migration/p4-design.md` §3・§4。
 //!
 //! T4.3 で空間別の検索索引（[`space`]・[`index`]・[`activation`]・[`search`]）を足した。旧選別の安全化は
 //! [`crate::selection`]（旧表だけを読むので、AI の表が無い旧 DB でも動く）。
 //!
 //! 追加の表（`ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・
-//! `ai_embedding_spaces`・`ai_embedding_vectors`）は Python と同じスキーマの再現
+//! `ai_embedding_spaces`・`ai_embedding_vectors`・`ai_location_clues`）は Python と同じスキーマの再現
 //! （[`crate::schema::migrate`]）には入れず、取り込みが有効な起動で [`migrate`] が足す。`INGEST=0`
 //! （読み取り専用）の起動では作らず、表が無い旧 DB は `db::REQUIRED_SCHEMA` を満たしたまま読める。
 
@@ -27,6 +27,7 @@ pub mod image_input;
 pub mod index;
 pub mod jobs;
 pub mod lanes;
+pub mod location_clue;
 pub mod ops;
 pub mod pause;
 pub mod provider;
@@ -62,18 +63,34 @@ pub fn pending(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     missing.extend(missing_tables(conn, runs::TABLES)?);
     missing.extend(missing_tables(conn, waits::TABLES)?);
     missing.extend(index::pending(conn)?);
+    missing.extend(missing_tables(conn, location_clue::TABLES)?);
     Ok(missing)
 }
 
 /// AI の表を全部足す（無いものだけ。既に最新なら何も書かない）。作った名前を返す。
 /// 書き込み用の接続で呼ぶ。他の表・行には触れない。
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
+    migrate_active(conn, true)
+}
+
+/// 本番起動は有効な location_clue がある時だけ、その結果表を作る。
+pub fn migrate_active(
+    conn: &mut Connection,
+    location_clue_enabled: bool,
+) -> rusqlite::Result<Vec<String>> {
     let mut created = jobs::migrate(conn)?;
     created.extend(create_tables(conn, budget::TABLES, budget::SCHEMA)?);
     created.extend(create_tables(conn, pause::TABLES, pause::SCHEMA)?);
     created.extend(create_tables(conn, runs::TABLES, runs::SCHEMA)?);
     created.extend(create_tables(conn, waits::TABLES, waits::SCHEMA)?);
     created.extend(index::migrate(conn)?);
+    if location_clue_enabled {
+        created.extend(create_tables(
+            conn,
+            location_clue::TABLES,
+            location_clue::SCHEMA,
+        )?);
+    }
     Ok(created)
 }
 

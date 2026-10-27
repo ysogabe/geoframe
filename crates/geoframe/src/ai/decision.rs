@@ -380,6 +380,17 @@ pub fn run(
     lan: &LanClient,
     request: &DecisionRequest,
 ) -> Result<DecisionReply, RunError> {
+    run_checked(ctx, lan, request, || Ok(()))
+}
+
+/// Discovery / health 待ちの後、推論 POST の直前にも写真の世代・実入力を照合する。
+/// callback は writer / transaction / 画像 lock を保持せずに戻すこと。
+pub fn run_checked(
+    ctx: &RunCtx<'_>,
+    lan: &LanClient,
+    request: &DecisionRequest,
+    before_post: impl FnOnce() -> Result<(), RunError>,
+) -> Result<DecisionReply, RunError> {
     request
         .to_json()
         .map_err(|_| RunError::Permanent(ErrorCode::InputTooLarge))?;
@@ -390,6 +401,7 @@ pub fn run(
         .map_err(|e| e.into_run_error(false))?;
     probe(&session, model).map_err(|e| e.into_run_error(false))?;
     ctx.before_send()?;
+    before_post()?;
     let deadline = Deadline::for_task(ctx.task());
     match ask(&session, request, &deadline) {
         Ok(reply) => Ok(reply),

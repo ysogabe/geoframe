@@ -154,7 +154,13 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
     }
     let mut migration = writer.call(schema::migrate)?;
     // P4: AI の表（ジョブ・送信予算・Provider 停止・起動 ID）。Python と同じスキーマの再現（schema::migrate）とは別に足す
-    migration.created.extend(writer.call(ai::migrate)?);
+    let clue_enabled = config
+        .ai
+        .gate(ai::settings::TaskKind::LocationClue, true)
+        .is_ok();
+    migration
+        .created
+        .extend(writer.call(move |conn| ai::migrate_active(conn, clue_enabled))?);
     log_migration(&migration);
 
     let cache = Arc::new(Cache::load(&config.data_dir));
@@ -353,7 +359,16 @@ pub struct Plan {
 /// 書かずに計画を作る。DB は読み取り専用の接続で見る。
 pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
     let mut schema = schema::pending(conn)?;
-    schema.missing_objects.extend(ai::pending(conn)?);
+    let ai_missing = ai::pending(conn)?;
+    let clue_enabled = config
+        .ai
+        .gate(ai::settings::TaskKind::LocationClue, true)
+        .is_ok();
+    schema.missing_objects.extend(
+        ai_missing
+            .into_iter()
+            .filter(|n| clue_enabled || n != "ai_location_clues"),
+    );
     Ok(Plan {
         schema,
         leftover_files: count_leftovers(&config.data_dir),

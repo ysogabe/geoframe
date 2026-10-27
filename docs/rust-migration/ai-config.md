@@ -98,7 +98,7 @@
 
 ## 背景ワーカー（T4.1c）
 
-専用スレッド1本が、既存のwriter（`Ingest.writer`）と`.ingest.lock`（`LockHold`）を共有して動く（`ai::worker`）。**いまの配布バイナリは用途別の処理（handler）を1つも登録していない**（`production_handlers()`は空。fakeのProvider・スタブの設定は置かない）。実際のAI処理は後続のタスク（T4.2のDecision、T4.4の画像Embedding、T4.6の位置候補）が`Handler`を実装して登録する。登録が無い種類のジョブは、claimも成功化もされず`pending`/`deferred`のまま残る。
+専用スレッド1本が、既存のwriter（`Ingest.writer`）と`.ingest.lock`（`LockHold`）を共有して動く（`ai::worker`）。T4.6bで有効な[写真別location_clue](ai-location-clue.md)を本番登録した（fakeのProvider・スタブの設定は置かない）。他用途の処理は後続タスクが追加する。登録が無い種類のジョブは、claimも成功化もされず`pending`/`deferred`のまま残る。
 
 - **起動の条件**: `GEOFRAME_INGEST=1`かつ`GEOFRAME_AI_ENABLED=1`かつ有効な背景用途が1つ以上。`query_embedding`は利用者を待たせる対話の用途で、永続キューの背景ジョブではない。`INGEST=0`では何も起動せず、AIの表を作らず、ジョブの回収もProvider停止の整理もしない。
 - **起動の準備**（`INGEST=1`なら、ワーカーが無効でも。ロックを取ったあと）: ①前の起動の`running`を回収する。停止開始が記録された起動のものは数えず`deferred/shutdown`、記録の無いもの（`SIGKILL`・クラッシュ・電源断）は`interruption_count`を加算して3回で`failed`。②設定が**有効なときだけ**、関係する設定が変わって効かなくなったProvider停止を整理する（`release_unmatched`）。設定が未指定・不正のときは、現在の識別が分からないので既存の停止を1件も消さない。
@@ -155,7 +155,7 @@ STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解�
 
 ### 限界・後続
 
-- handlerが未登録の間、`ai-jobs retry`は全ての`failed`を保持する（`unsupported`）。再検査の中身（入力・処理版・ポリシー・既存結果の確認）は各handlerの`recheck`で、T4.4・T4.6が実装する。
+- 未登録の種類の`failed`は`ai-jobs retry`でも保持する（`unsupported`）。location_clueはT4.6bの`recheck`で現在の入力・処理版・既存結果を検査し、同世代のfailed投影を無効にしてpendingへ戻す（通信なし）。
 - `Disabled`から`RunError::PolicyDisabled`への対応付け、401/403/404/契約不一致から`ProviderPause`／`TaskPause`への対応付け、429のRetry-After、予算エラー（`Budget`）の扱いは、各handlerが`before_send`の結果をそのまま返すことで揃う（ワーカーがジョブの状態へ対応付ける）。
 - HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。空間別のベクトル保存・検索空間の切替・旧選別の安全化はT4.3で実装済み（[ai-index.md](ai-index.md)。切替の成功率の閾値`activation_min_coverage`は、今は`try_activate`の引数と既定0.95で、このJSONには置かない。後続が任意の独立キーとして足す場合は、有限の0〜1だけを許し、不正ならAI設定不正としてAIだけを無効にし、閾値は設定ハッシュ・結果の同一性に入れない）。対話の検索語Embedding（`query_embedding`）の予約・キャッシュ、画像／文EmbeddingのアダプターはT4.4、Decisionの質問・clue保存・クラウドはT4.6。
 

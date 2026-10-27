@@ -1,7 +1,7 @@
 # AI Provider基盤（T4.2）
 
 - 状態: T4.2で実装。設計は[p4-design.md](p4-design.md) §4.3・§5、設定は[ai-config.md](ai-config.md)。
-- 範囲: **AI専用のHTTP・接続先の固定・Discovery・Decisionの入出力・共有の一時待機**まで。用途別のhandler（Decisionの質問と閾値・clueの保存はT4.6、画像／文EmbeddingはT4.4）、クラウドの認証・送信はT4.6aで追加した[ai-cloud.md](ai-cloud.md)を参照。`production_handlers()`は空のまま（未登録のjobはclaimも成功化もされない）。
+- 範囲: **AI専用のHTTP・接続先の固定・Discovery・Decisionの入出力・共有の一時待機**まで。用途別のhandler（Decisionの質問と閾値・clueの保存はT4.6、画像／文EmbeddingはT4.4）、クラウドの認証・送信はT4.6aで追加した[ai-cloud.md](ai-cloud.md)を参照。T4.6bで[写真別location_clue](ai-location-clue.md)だけを本番登録した（他の未登録jobはclaimも成功化もされない）。
 - 実LAN・外部AI・クラウド・課金は使っていない（試験はループバックのスタブ・偽のDNS・合成の画像／DBだけ）。
 
 ## 参照した契約（固定した版）
@@ -67,7 +67,7 @@
   - **構造的な保証**: 元画像の圧縮データ（EXIF・GPS・XMP・コメント・EOIの後ろ・PNGのチャンク・WebPの拡張領域など）は型に入らないので、Providerへ出る道が無い。`image_input`のdoc-testに、`from_bytes`・任意dataURLの受け入れ・private fieldの直接構築がコンパイルできないこと（`compile_fail`）と、正規の入口が使えること（成功する例）を置いた。
   - **後続のhandler（T4.6/T4.4）の使い方**: 既存のimaging（原本・derivativeのデコード・向きの適用・縮小）でRGBを得て、この入口へ渡す。圧縮データのデコードAPIは`PreparedImage`に足さない。元画像のデコードに失敗した・画素が欠けていた場合の扱いは既存のimaging処理の責務で、ここへは成功して得たRGBだけが来る。
   - 移行メモ: 旧版（r2まで）は圧縮バイト列を取り込み、独自のJPEG/PNG/WebP解析で検査して**そのバイト列を送った**ため、非画素の追加データ（EOI直前の文字列・PNGの不正長チャンク・WebPのVP8X拡張）と画素の欠損（CRCの合う`IDAT=[0]`のPNG・`VP8X`だけのWebP・走査の途中で切れEOIを付け直したプログレッシブ）が通った。独自parserと圧縮データの再利用をすべて撤去し、`from_bytes`を使っていた呼び出し（Decisionの要求・試験）は`encode_jpeg_rgb`に置き換えた。
-  - **既知の限界**: 画素そのものに埋め込まれた文字や模様（ステガノグラフィ）は検出しない。縮小・向きの適用・EXIF由来の補正は画像の準備をする側（後続）の責務で、`PreparedImage`は渡されたRGBの寸法のまま送る。
+  - **既知の限界**: 画素そのものに埋め込まれた文字や模様（ステガノグラフィ）は検出しない。縮小・向きの適用・EXIF由来の補正は画像の準備をする側（clueは `imaging::prepare_decision_rgb`）の責務で、`PreparedImage`は渡されたRGBの寸法のまま送る。
 - 入口は`decision::run(ctx, lan, request)`: 組み立て（8 MiB検査）→`before_probe`→背景の枠→Discovery・health→`before_send`→POST。POSTが通信失敗・5xxなら**Discoveryをやり直して分類**する（使えなければ待ち、使えるならそのjobだけの反復失敗）。
 
 ## 分類（`ai::provider`）
@@ -105,7 +105,7 @@
 
 ## 未実装・後続
 
-- 用途別handlerの登録（Decisionのclue→T4.6、画像／文Embedding→T4.4）。それまで配布バイナリはAI処理をしない。
+- 日候補・座標化のhandler（T4.6c）、画像／文Embedding（T4.4）。写真別clueはT4.6bで登録済み。
 - クラウド（Vertex）のアダプター・token読取・401の一度のrefresh・送信後の課金計数（T4.6）。このタスクでクラウドへの実送信はしていない。
 - 対話（検索語Embedding）の予約キャッシュとE5/E6への接続（T4.4）。`AiHttp::run_interactive`は枠と境界だけ。
 - 実LAN・実Decision・実画像での確認はT4.7（LXC）。

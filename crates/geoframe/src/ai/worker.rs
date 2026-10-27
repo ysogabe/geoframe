@@ -1,10 +1,8 @@
 //! AI の背景ワーカー（P4 / T4.1c。設計は p4-design.md §4）。
 //!
 //! 処理の std スレッドが 1 本（ほかに、SIGTERM の直後に停止開始を書くだけの小さなスレッドが 1 本）、既存の writer（[`crate::writer::Writer`]）と `.ingest.lock`
-//! （[`crate::ingest::LockHold`]）を共有して動く。**この版は用途別の実装を持たない**: 実際の AI 処理は
-//! [`Handler`] を実装して [`production_handlers`] に登録する後続のタスク（T4.2 の Decision・T4.4 の画像
-//! Embedding・T4.6 の位置候補）が足す。いまの配布バイナリの登録は空で、ワーカーは起動時の回収と停止の記録だけを
-//! 行い、ジョブを 1 件も claim しない（fake の Provider・スタブの設定は置かない）。
+//! （[`crate::ingest::LockHold`]）を共有して動く。T4.6b で [`super::location_clue`] を本番登録した。
+//! 他の用途は未登録のままで claim しない（fake の Provider・任意宛先の設定は置かない）。
 //!
 //! # 起動の条件
 //!
@@ -60,10 +58,12 @@ use super::jobs::{
     MIN_DEFER_SECS, Recheck,
 };
 use super::pause::{self, PauseReason};
+use super::provider::LanClient;
 use super::runs;
 use super::settings::{AiConfig, Disabled, Gate, TaskKind};
 use super::waits::{self, Wait, WaitKey, WaitReason, WaitScope};
 use crate::config::Config;
+use crate::datadir::DataDir;
 use crate::ingest::LockHold;
 use crate::stop::{StopFlag, join_within};
 use crate::writer::{WriteError, Writer};
@@ -83,8 +83,8 @@ const BUDGET_WAIT: Duration = Duration::from_secs(5);
 
 /// 用途別の処理（後続のタスクが実装して [`production_handlers`] に登録する）。`kind` ごとに 1 つ。
 ///
-/// - `reconcile`: 現在の写真・有効な結果から、**まだ結果の無い**対象のキーを導く。現在の結果表に
-///   適合する答えがあるものはキーにしない（job 行の有無だけで再計算を決めない）。`input_hash`・
+/// - `reconcile`: 現在の写真・有効な結果から対象のキーを導く。現在の結果表に
+///   適合する答えは再利用する（成功キーを渡しても enqueue は再実行しない）。`input_hash`・
 ///   `processor_version` は結果を左右する入力・処理版だけから作り、URL・タイムアウト・許可は入れない。
 /// - `run`: claim したジョブを writer の外で実行する。写真・入力は [`RunCtx::read`] で読み、
 ///   **外部へ送る直前に必ず [`RunCtx::before_send`]**（停止・ポリシー・Provider 停止・送信予算を再評価する）。
@@ -95,12 +95,44 @@ pub trait Handler: Send + Sync {
     fn kind(&self) -> JobKind;
     fn reconcile(&self, read: &Connection, now: i64) -> rusqlite::Result<Vec<JobKey>>;
     fn run(&self, ctx: &RunCtx<'_>, job: &Claimed) -> Result<Persist, RunError>;
+    /// retry のファイル由来検査は writer の外で準備する。通信はしない。
+    fn prepare_retry(&self) -> rusqlite::Result<()> {
+        Ok(())
+    }
     fn recheck(&self, conn: &Connection, key: &JobKey) -> rusqlite::Result<Recheck>;
+    /// 対象から外れた写真等の旧ジョブを失効する短い writer 操作（現世代を操作内でも再検査）。
+    fn reconcile_cleanup(&self, _read: &Connection, _now: i64) -> rusqlite::Result<Vec<Persist>> {
+        Ok(Vec::new())
+    }
+    /// DB 外で投影の準備をし、短い writer transaction 内で現世代・terminal 状態を照合する。
+    /// terminal failure と起動回収後の修復で共有する。外部 I/O はこの準備側だけで行う。
+    fn projection(
+        &self,
+        _read: &Connection,
+        _key: &JobKey,
+        _now: i64,
+    ) -> rusqlite::Result<Option<Persist>> {
+        Ok(None)
+    }
 }
 
-/// 配布バイナリに登録する handler。T4.2・T4.4・T4.6 がここへ足す。**いまは空**（実 AI 処理も fake も無い）。
-pub fn production_handlers() -> Vec<Arc<dyn Handler>> {
-    Vec::new()
+/// 有効な location_clue だけを登録する。他の用途・fake は登録しない。
+/// LAN client は呼び出し側で一度作り、同じ provider の利用者と共有する。
+pub fn production_handlers(config: &Config, lan: Option<LanClient>) -> Vec<Arc<dyn Handler>> {
+    if !config.ingest {
+        return Vec::new();
+    }
+    let Ok(gate) = config.ai.gate(TaskKind::LocationClue, true) else {
+        return Vec::new();
+    };
+    let (Some(lan), Ok(data)) = (lan, DataDir::open(&config.data_dir)) else {
+        return Vec::new();
+    };
+    vec![super::location_clue::handler(
+        data,
+        lan,
+        gate.settings.model.clone(),
+    )]
 }
 
 /// ジョブの種類を使う設定上の用途。`location_geocode` は LLM の routing を持たず、位置候補（`location_suggest`）の
@@ -137,6 +169,8 @@ pub enum RunError {
     Stopping,
     /// 送る前に入力が古いと分かった。ジョブは `obsolete`（新しい入力は別のジョブ）。
     InputChanged,
+    /// 現在の品質特徴量の解析待ち。その写真だけ後回し、他の写真は進める。
+    InputPending,
     /// 設定・許可が今は送信を許さない（[`Disabled`]。後続の handler は `Disabled` をこれに対応付ける）。
     /// 失敗に数えず後回し。
     PolicyDisabled,
@@ -199,6 +233,10 @@ impl<'a> RunCtx<'a> {
     /// 読み取り専用の接続（写真・結果・入力世代の読み取り）。トランザクションを長く持たない。
     pub fn read(&self) -> &Connection {
         self.read
+    }
+
+    pub fn now(&self) -> i64 {
+        (self.clock)()
     }
 
     pub fn task(&self) -> TaskKind {
@@ -336,8 +374,8 @@ pub fn startup(config: &Config, writer: &Writer, clock: &Clock) -> Option<Starte
                 );
             }
         }
-        Err(e) => {
-            tracing::error!("[ai] 前の起動のジョブを回収できません（AI を始めません）: {e}");
+        Err(_) => {
+            tracing::error!("[ai] 前の起動のジョブを回収できません（AI を始めません）");
             return None;
         }
     }
@@ -352,7 +390,7 @@ pub fn startup(config: &Config, writer: &Writer, clock: &Clock) -> Option<Starte
             Ok(n) => tracing::info!(
                 "[ai] 関係する設定が変わって効かなくなった Provider 停止を {n} 件整理しました"
             ),
-            Err(e) => tracing::warn!("[ai] Provider 停止の整理に失敗しました: {e}"),
+            Err(_) => tracing::warn!("[ai] Provider 停止の整理に失敗しました"),
         }
     }
     Some(Started { run_id })
@@ -409,8 +447,8 @@ impl Core {
         }
         let read = match crate::db::open_read_only(&self.config.db_path()) {
             Ok(conn) => conn,
-            Err(e) => {
-                tracing::warn!("[ai] DB を読み取り用に開けません（次の周期に持ち越します）: {e}");
+            Err(_) => {
+                tracing::warn!("[ai] DB を読み取り用に開けません（次の周期に持ち越します）");
                 return;
             }
         };
@@ -440,8 +478,8 @@ impl Core {
             }) {
                 Ok(Some(claimed)) => claimed,
                 Ok(None) => return,
-                Err(e) => {
-                    tracing::warn!("[ai] ジョブを claim できません（次の周期に持ち越します）: {e}");
+                Err(_) => {
+                    tracing::warn!("[ai] ジョブを claim できません（次の周期に持ち越します）");
                     return;
                 }
             };
@@ -506,10 +544,38 @@ impl Core {
             if self.config.ai.gate(task_for(kind), true).is_err() {
                 continue;
             }
+            let cleanup = match handler.reconcile_cleanup(read, now) {
+                Ok(actions) => actions,
+                Err(_) => {
+                    tracing::warn!("[ai] 失効検査に失敗しました");
+                    continue;
+                }
+            };
+            let mut cleanup = cleanup.into_iter();
+            loop {
+                let chunk: Vec<_> = cleanup.by_ref().take(ENQUEUE_CHUNK).collect();
+                if chunk.is_empty() || self.stop.is_stopped() {
+                    break;
+                }
+                if self
+                    .writer
+                    .call(move |conn| {
+                        let tx = conn.transaction()?;
+                        for action in chunk {
+                            action(&tx)?;
+                        }
+                        tx.commit()
+                    })
+                    .is_err()
+                {
+                    tracing::warn!("[ai] 失効を記録できません");
+                    break;
+                }
+            }
             let keys = match catch_unwind(AssertUnwindSafe(|| handler.reconcile(read, now))) {
                 Ok(Ok(keys)) => keys,
-                Ok(Err(e)) => {
-                    tracing::warn!("[ai] {} の reconcile に失敗しました: {e}", kind.as_str());
+                Ok(Err(_)) => {
+                    tracing::warn!("[ai] {} の reconcile に失敗しました", kind.as_str());
                     continue;
                 }
                 Err(_) => {
@@ -523,17 +589,34 @@ impl Core {
                 if self.stop.is_stopped() {
                     break;
                 }
-                let (chunk, clock) = (chunk.to_vec(), Arc::clone(&self.clock));
-                match self
-                    .writer
-                    .call(move |conn| jobs::enqueue_batch(conn, &chunk, clock()))
+                let projections = match chunk
+                    .iter()
+                    .map(|key| handler.projection(read, key, now))
+                    .collect::<rusqlite::Result<Vec<_>>>()
                 {
+                    Ok(items) => items,
+                    Err(_) => {
+                        tracing::warn!("[ai] 投影の準備に失敗しました");
+                        break;
+                    }
+                };
+                let (chunk, clock) = (chunk.to_vec(), Arc::clone(&self.clock));
+                match self.writer.call(move |conn| {
+                    let done = jobs::enqueue_batch(conn, &chunk, clock())?;
+                    // 起動回収で failed になったもの・未投影も次周期で冪等に修復する。
+                    let tx = conn.transaction()?;
+                    for project in projections.into_iter().flatten() {
+                        project(&tx)?;
+                    }
+                    tx.commit()?;
+                    Ok(done)
+                }) {
                     Ok(done) => {
                         created += done.created;
                         revived += done.revived;
                     }
-                    Err(e) => {
-                        tracing::warn!("[ai] ジョブを積めません: {e}");
+                    Err(_) => {
+                        tracing::warn!("[ai] ジョブを積めません");
                         break;
                     }
                 }
@@ -611,8 +694,8 @@ impl Core {
                 "[ai] {} のジョブの応答は無効になった claim のものなので保存しません",
                 claimed.key.kind.as_str()
             ),
-            Err(e) => {
-                tracing::warn!("[ai] 結果を確定できません: {e}");
+            Err(_) => {
+                tracing::warn!("[ai] 結果を確定できません");
                 // 結果の保存の失敗は当該ジョブの失敗（成功だけが残ることは無い）
                 self.record(claimed, ErrorCode::Internal, Failure::Attempt);
             }
@@ -621,12 +704,30 @@ impl Core {
 
     fn record(&self, claimed: &Claimed, code: ErrorCode, failure: Failure) {
         let (c, clock) = (claimed.clone(), Arc::clone(&self.clock));
-        if let Err(e) = self
+        let project = (|| {
+            let read = crate::db::open_read_only(&self.config.db_path()).map_err(|_| ())?;
+            self.handler(claimed.key.kind)
+                .map(|h| h.projection(&read, &claimed.key, clock()))
+                .transpose()
+                .map(|v| v.flatten())
+                .map_err(|_| ())
+        })();
+        let Ok(project) = project else {
+            tracing::warn!("[ai] 失敗投影の準備に失敗しました");
+            return;
+        };
+        if self
             .writer
-            .call(move |conn| jobs::record_failure(conn, &c, clock(), code, failure))
+            .call(move |conn| {
+                jobs::record_failure_with(conn, &c, clock(), code, failure, |tx| match project {
+                    Some(p) => p(tx),
+                    None => Ok(InputCheck::Current),
+                })
+            })
+            .is_err()
         {
-            // running のまま残り、次の起動の回収が数える
-            tracing::warn!("[ai] 失敗を記録できません: {e}");
+            // running のまま残り、次の起動の回収が数える。値・SQL エラー本文は出さない。
+            tracing::warn!("[ai] 失敗を記録できません");
         }
     }
 
@@ -648,11 +749,12 @@ impl Core {
             }
             RunError::InputChanged => {
                 let (c, clock) = (claimed.clone(), Arc::clone(&self.clock));
-                if let Err(e) = self
+                if self
                     .writer
                     .call(move |conn| jobs::mark_obsolete(conn, &c, clock()))
+                    .is_err()
                 {
-                    tracing::warn!("[ai] ジョブを無効にできません: {e}");
+                    tracing::warn!("[ai] ジョブを無効にできません");
                 }
                 return;
             }
@@ -668,6 +770,10 @@ impl Core {
                 let (code, secs) = budget_wait(reservation, self.cycle_secs(task));
                 let (code, f) = defer(code, Some(secs));
                 (code, f, Some(i64::from(secs)))
+            }
+            RunError::InputPending => {
+                let (code, f) = defer(ErrorCode::InputPending, None);
+                (code, f, None)
             }
             RunError::Unavailable => {
                 let (code, f) = defer(ErrorCode::Unavailable, None);
@@ -745,9 +851,9 @@ impl Core {
                 },
             )
         });
-        if let Err(e) = result {
+        if result.is_err() {
             // ジョブは running のまま残り、次の起動の回収が数える。待ちはこの起動の中では効く
-            tracing::warn!("[ai] 待機を記録できません: {e}");
+            tracing::warn!("[ai] 待機を記録できません");
         }
     }
 
@@ -788,7 +894,7 @@ impl Core {
                 task.as_str(),
                 reason.as_str()
             ),
-            Err(e) => tracing::warn!("[ai] 停止を記録できません: {e}"),
+            Err(_) => tracing::warn!("[ai] 停止を記録できません"),
         }
     }
 }
@@ -838,7 +944,7 @@ pub fn spawn(deps: WorkerDeps) -> AiWorker {
                     runs::mark_stop_requested(conn, &id, clock())
                 }) {
                     Ok(()) => {}
-                    Err(e) => tracing::warn!("[ai] 停止開始を記録できません: {e}"),
+                    Err(_) => tracing::warn!("[ai] 停止開始を記録できません"),
                 }
             })
             .expect("AI の停止記録のスレッドを起動できません")
@@ -898,8 +1004,8 @@ impl AiWorker {
         }) {
             Ok(0) => {}
             Ok(n) => tracing::info!("[ai] 実行中だったジョブ {n} 件を停止として戻しました"),
-            Err(e) => {
-                tracing::warn!("[ai] 実行中のジョブを戻せません（次の起動の回収に任せます）: {e}")
+            Err(_) => {
+                tracing::warn!("[ai] 実行中のジョブを戻せません（次の起動の回収に任せます）")
             }
         }
         joined

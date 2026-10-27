@@ -260,6 +260,7 @@ pub fn retry(
             report.policy_disabled += failed_count(writer, kind)?;
             continue;
         }
+        handler.prepare_retry().map_err(WriteError::Query)?;
         let (handler, clock) = (Arc::clone(handler), Arc::clone(clock));
         let done = writer.call(move |conn| {
             jobs::retry_failed(conn, clock(), RetryScope::Kind(kind), |c, key| {

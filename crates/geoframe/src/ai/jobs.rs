@@ -171,6 +171,8 @@ pub enum ErrorCode {
     BadResponse,
     InputTooLarge,
     InputInvalid,
+    /// 画像は読めるが現在の品質 SHA の解析待ち。
+    InputPending,
     PolicyDisabled,
     /// 正常停止で戻した。
     Shutdown,
@@ -187,7 +189,7 @@ pub enum ErrorCode {
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Unavailable,
         Self::RateLimited,
         Self::Timeout,
@@ -195,6 +197,7 @@ impl ErrorCode {
         Self::BadResponse,
         Self::InputTooLarge,
         Self::InputInvalid,
+        Self::InputPending,
         Self::PolicyDisabled,
         Self::Shutdown,
         Self::Interrupted,
@@ -218,6 +221,7 @@ impl ErrorCode {
             Self::BadResponse => "bad_response",
             Self::InputTooLarge => "input_too_large",
             Self::InputInvalid => "input_invalid",
+            Self::InputPending => "input_pending",
             Self::PolicyDisabled => "policy_disabled",
             Self::Shutdown => "shutdown",
             Self::Interrupted => "interrupted",
@@ -692,7 +696,25 @@ pub fn record_failure(
     code: ErrorCode,
     failure: Failure,
 ) -> rusqlite::Result<Option<JobState>> {
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    record_failure_with(conn, claimed, now, code, failure, |_| {
+        Ok(InputCheck::Current)
+    })
+}
+
+/// terminal failed の投影を同じトランザクションで確定する。旧 token では callback も呼ばない。
+/// callback の Changed は失敗履歴を保持した obsolete（新世代の結果は書かない）。
+pub fn record_failure_with<F>(
+    conn: &mut Connection,
+    claimed: &Claimed,
+    now: i64,
+    code: ErrorCode,
+    failure: Failure,
+    project: F,
+) -> rusqlite::Result<Option<JobState>>
+where
+    F: FnOnce(&Connection) -> rusqlite::Result<InputCheck>,
+{
+    let mut tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if !owns(&tx, claimed)? {
         return Ok(None);
     }
@@ -749,6 +771,26 @@ pub fn record_failure(
             now
         ],
     )?;
+    let changed = if state == JobState::Failed {
+        let mut savepoint = tx.savepoint()?;
+        if project(&savepoint)? == InputCheck::Changed {
+            savepoint.rollback()?;
+            true
+        } else {
+            savepoint.commit()?;
+            false
+        }
+    } else {
+        false
+    };
+    if changed {
+        tx.execute(
+            "UPDATE ai_jobs SET state='obsolete' WHERE id=?1",
+            [claimed.id],
+        )?;
+        tx.commit()?;
+        return Ok(Some(JobState::Obsolete));
+    }
     tx.commit()?;
     Ok(Some(state))
 }

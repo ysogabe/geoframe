@@ -1,5 +1,5 @@
 //! AI の背景ワーカー（起動の準備・1 周期・停止・回収）の試験。合成の DB・偽の時計・**このテストだけの fake handler**
-//! だけを使い、外部通信はしない（配布バイナリの登録は空。fake は本番の経路に無い）。
+//! だけを使い、外部通信はしない（fake は本番の経路に無い）。
 //!
 //! - 正常な完了・再起動（冪等）・未登録の種類は claim も成功化もされない・使えない用途は飛ばして他が進む
 //! - 古い token の応答・入力が変わった応答は保存されない
@@ -86,7 +86,7 @@ impl Env {
         self.ingest.as_ref().unwrap().writer.clone()
     }
 
-    fn clock(&self) -> Clock {
+    pub(super) fn clock(&self) -> Clock {
         let c = Arc::clone(&self.clock);
         Arc::new(move || c.load(Ordering::SeqCst))
     }
@@ -99,7 +99,12 @@ impl Env {
         self.clock.fetch_add(secs, Ordering::SeqCst);
     }
 
-    fn deps(&self, handlers: Vec<Arc<dyn Handler>>, stop: &StopFlag, run_id: &str) -> WorkerDeps {
+    pub(super) fn deps(
+        &self,
+        handlers: Vec<Arc<dyn Handler>>,
+        stop: &StopFlag,
+        run_id: &str,
+    ) -> WorkerDeps {
         WorkerDeps {
             config: Arc::clone(&self.config),
             writer: self.writer(),
@@ -269,10 +274,14 @@ fn dyn_handlers(list: &[Arc<Fake>]) -> Vec<Arc<dyn Handler>> {
 // ---------------------------------------------------------------- 起動の条件・登録
 
 #[test]
-fn the_shipped_binary_registers_no_handlers_and_a_worker_starts_only_with_ingest_and_a_background_task()
+fn the_shipped_binary_registers_only_location_clue_and_a_worker_starts_only_with_ingest_and_a_background_task()
  {
-    // 配布バイナリの登録は空（fake・本番のスタブは置かない）
-    assert!(production_handlers().is_empty());
+    // 配布バイナリは location_clue のみ（fake・本番のスタブは置かない）
+    let e = env("production-registration");
+    let handlers =
+        production_handlers(&e.config, crate::ai::provider::LanClient::new(&e.config.ai));
+    assert_eq!(handlers.len(), 1);
+    assert_eq!(handlers[0].kind(), JobKind::LocationClue);
 
     // 取り込み有効 ＋ AI 有効 ＋ 有効な背景用途あり
     assert!(should_start(&env("start-ok").config));

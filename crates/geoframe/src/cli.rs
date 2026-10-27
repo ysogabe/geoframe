@@ -529,7 +529,10 @@ fn start_ai(
         writer: ingest.writer.clone(),
         stop: stop.clone(),
         lock: ingest.lock_hold(),
-        handlers: worker::production_handlers(),
+        handlers: worker::production_handlers(
+            config,
+            crate::ai::provider::LanClient::new(&config.ai),
+        ),
         clock: Arc::clone(clock),
         poll: config.ai.legacy().poll(),
         run_id: started.run_id,
@@ -1027,7 +1030,8 @@ fn format_index_status(status: &crate::ai::index::IndexStatus) -> String {
 }
 
 fn ai_jobs_retry(config: &Config, ingest: &Ingest, target: RetryTarget, clock: &Clock) -> ExitCode {
-    let handlers = worker::production_handlers();
+    let handlers =
+        worker::production_handlers(config, crate::ai::provider::LanClient::new(&config.ai));
     match ops::retry(&ingest.writer, &config.ai, &handlers, target, clock) {
         Ok(r) => {
             println!(
@@ -1036,8 +1040,8 @@ fn ai_jobs_retry(config: &Config, ingest: &Ingest, target: RetryTarget, clock: &
             );
             ExitCode::SUCCESS
         }
-        Err(e) => {
-            eprintln!("geoframe: 再試行に失敗しました: {e}");
+        Err(_) => {
+            eprintln!("geoframe: 再試行に失敗しました");
             ExitCode::FAILURE
         }
     }

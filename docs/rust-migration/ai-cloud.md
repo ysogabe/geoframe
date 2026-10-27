@@ -1,6 +1,6 @@
 # Vertex クラウド通信基盤（T4.6a）
 
-P4-AC2/5/10aの認証・通信境界を実装した。写真比較・位置候補のhandler、判定prompt・domain parse、画像／文Embedding APIは含まない。`production_handlers()`は空。実クラウド・実写真・実鍵・実DBは使わず、合成入力とloopbackだけで試験する。
+P4-AC2/5/10aの認証・通信境界を実装した。写真比較・位置候補のhandler、判定prompt・domain parse、画像／文Embedding APIは含まない。T4.6bで写真別LAN location_clueを登録済みだが、クラウドのhandlerは未登録。実クラウド・実写真・実鍵・実DBは使わず、合成入力とloopbackだけで試験する。
 
 ## 呼出しと共有
 
