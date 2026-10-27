@@ -24,7 +24,7 @@ use rusqlite::Connection;
 
 /// 有効な旧メンバー（列: `group_id`・`photo_id`・`recommended`・`shown`）。`shown` は、その写真が今のフィード
 /// に出せる（`hidden=0`・`display` あり・位置あり・品質の表示条件を満たす）かどうか。
-const VALID_MEMBERS: &str = "SELECT m.group_id AS group_id, m.photo_id AS photo_id,
+pub(crate) const VALID_MEMBERS: &str = "SELECT m.group_id AS group_id, m.photo_id AS photo_id,
        m.recommended AS recommended,
        (mp.lat IS NOT NULL AND mp.lon IS NOT NULL AND mp.display IS NOT NULL AND mp.display!=''
         AND COALESCE(mp.hidden,0)=0

@@ -1,6 +1,6 @@
 # AI の検索索引・空間・旧選別（P4 / T4.3）
 
-空間別のベクトル保存、検索空間の切替、旧選別の安全化、その境界（後続 T4.4・T4.5 への接続）。設計は [p4-design.md](p4-design.md) §6・§7。実装は `crates/geoframe/src/ai/{space,index,activation,search}.rs` と `src/selection.rs`、試験は `ai/tests_index.rs`・`tests/legacy_selection.rs`・`tests/ai_index_python_rollback.rs`・`tests/ingest_cli.rs`。
+空間別のベクトル保存、検索空間の切替、旧選別の安全化、その境界（後続 T4.4・T4.5 への接続）。 T4.5aのpure同一場面・順位・世代別repository APIは[ai-scenes.md](ai-scenes.md)を参照（周期/選別接続はT4.5b）。設計は [p4-design.md](p4-design.md) §6・§7。実装は `crates/geoframe/src/ai/{space,index,activation,search}.rs` と `src/selection.rs`、試験は `ai/tests_index.rs`・`tests/legacy_selection.rs`・`tests/ai_index_python_rollback.rs`・`tests/ingest_cli.rs`。
 
 T4.3の索引基盤に、[T4.4aの固定契約アダプターと画像ワーカー](ai-embedding.md)を接続した。旧ベクトルは輸入しない。実APIのLAN/LXC確認は親担当で、ローカル試験は合成DB/画像とloopbackだけ。
 

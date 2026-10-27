@@ -101,9 +101,14 @@ fn is_close(a: f64, b: f64) -> bool {
     (a - b).abs() <= (1e-9 * a.abs().max(b.abs())).max(0.0)
 }
 
-fn normalize(value: f64, values: &[f64]) -> f64 {
-    let lo = values.iter().copied().fold(f64::INFINITY, f64::min);
-    let hi = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+fn range(values: &[f64]) -> (f64, f64) {
+    (
+        values.iter().copied().fold(f64::INFINITY, f64::min),
+        values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    )
+}
+
+fn normalize(value: f64, (lo, hi): (f64, f64)) -> f64 {
     if is_close(lo, hi) {
         0.5
     } else {
@@ -130,19 +135,33 @@ struct Ranked {
 }
 
 fn rank_group(photos: &[&QualityPhoto]) -> Vec<Ranked> {
-    let sharpness: Vec<f64> = photos.iter().map(|p| p.metrics.sharpness).collect();
-    let exposure: Vec<f64> = photos.iter().map(|p| p.metrics.exposure_score).collect();
-    let contrast: Vec<f64> = photos.iter().map(|p| p.metrics.contrast).collect();
+    rank_metrics(&photos.iter().map(|p| p.metrics).collect::<Vec<_>>())
+}
+
+/// Same fixed formula as Python quality.rank_group, without photo identifiers or DB values.
+pub fn rank_scores(metrics: &[Metrics]) -> Vec<f64> {
+    if metrics.is_empty() {
+        return Vec::new();
+    }
+    rank_metrics(metrics).into_iter().map(|r| r.score).collect()
+}
+
+fn rank_metrics(metrics: &[Metrics]) -> Vec<Ranked> {
+    let sharpness: Vec<f64> = metrics.iter().map(|m| m.sharpness).collect();
+    let exposure: Vec<f64> = metrics.iter().map(|m| m.exposure_score).collect();
+    let contrast: Vec<f64> = metrics.iter().map(|m| m.contrast).collect();
+    let sharpness_range = range(&sharpness);
+    let exposure_range = range(&exposure);
+    let contrast_range = range(&contrast);
     let median_sharpness = median(&sharpness);
     let max_sharpness = sharpness.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    photos
+    metrics
         .iter()
-        .map(|photo| {
-            let m = &photo.metrics;
-            let sharp_rel = normalize(m.sharpness, &sharpness);
-            let exposure_rel =
-                0.55 * (m.exposure_score / 100.0) + 0.45 * normalize(m.exposure_score, &exposure);
-            let contrast_rel = normalize(m.contrast, &contrast);
+        .map(|m| {
+            let sharp_rel = normalize(m.sharpness, sharpness_range);
+            let exposure_rel = 0.55 * (m.exposure_score / 100.0)
+                + 0.45 * normalize(m.exposure_score, exposure_range);
+            let contrast_rel = normalize(m.contrast, contrast_range);
             let clip_penalty = ((m.black_clip + m.white_clip) * 0.8).min(0.20);
             let score = round1(
                 100.0
