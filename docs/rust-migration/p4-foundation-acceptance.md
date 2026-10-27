@@ -171,6 +171,18 @@
 
 後続タスクの結果は確認後に追記する。
 
+### T4.4a: 固定契約Embedding・画像ジョブ・索引公開（2026-10-28）
+
+- local-model-labのPR #101反映後、画像・日本語共通空間のAPIを独立確認し、#93を完了した。採用した固定契約と当初のCPU先行案との差、未実測範囲は同Issueの完了コメントと`p4-design.md`に記録。モデル名・次元だけから版を推測せず、明示した既知契約を照合する。
+- 実装`b297f6b`のSol簡易レビューは必須3・推奨1・参考1。世代往復でのterminal解除、POST全体期限後の再probe失敗による無限待機、同spaceの別processorへの失効越境を修正した。`3205f09`の再レビューはすべて解消・新規指摘0、独立61試験成功。修正方式・5件の否定対照・6500件のwriter分割測定は`t44a-review-fixes.md`を参照。
+- 実装側の最終検証は全28 result groupで1146成功・失敗0・既存ignore2。fmt・clippy全targets・musl releaseの静的リンクと起動が成功。追加は`ai_image_embedding_lineage`の1表で、直前版の適用済みDBに対するdry-run不足は+1。Python互換schemaと`REQUIRED_SCHEMA`は不変。
+- 親が最新のmusl unit executableを検証LXCへ配置し、画像ジョブ27件とEmbedding契約・通信11件、計38試験すべて成功（失敗・ignore0）。画像suiteには履歴保持・processor境界・chunk故障／停止・6500件分割の回帰を含む。全workspace試験をLXCで重複実行したものではない。
+- 独立した合成DBとPNG3種類、同内容の複製1枚を用意し、配布用muslの実serveから実LANの`/llm-embed/v1/embeddings`へ接続。4枚/3SHAのsucceededジョブと3ベクトルを保存し、active pointerの自動公開を確認。すべて768次元の有限値で、Rust側の再正規化後ノルムは0.99999999〜1.00000001だった。旧特徴量・旧ベクトル表への輸入や変更はない。
+- 同じ固定契約でビルドしたRustのライブラリAPIから日本語の説明3件を取得し、保存したactive indexへ照合。3件とも対応する合成画像が最上位となり、各要求は約17〜20ms。これはHTTP検索routeや背景処理との同一プロセス並行性能の確認ではなく、その受入はT4.4bへ残す。
+- 再起動で成功済みjob行とvector行が不変。1枚のDB世代だけを更新し、品質行の世代も合わせた場合も、同じSHAのvector行を変えず新世代jobが成功した。fixtureで明示更新したmtime以外のphotos全列は不変。新AI表のない別の旧schema合成DBへINGEST=0でserveし、dump不変・AI表作成0・healthz200を確認した。
+- 初回ハーネスは通常同期による位置推定を発火させるfixtureを使っていたため、基準となる位置を除いてAIの不変条件を切り分けた。また起動履歴が毎回1行へ整理される仕様に合わせ、再起動を履歴件数ではなく起動IDの変化で確認するよう修正した。製品コードはこの受入中に変更していない。
+- 4回の試験serveはSIGTERMで終了コード0、約0.003〜0.064秒で停止。実写真・元DB・実鍵・クラウドAIは使わず、GPU管理やlease操作もしていない。LXCの試験用バイナリ・合成DB・画像・設定・ログを削除し、既存常駐サービスはactiveを維持した。T4.4aを完了とする。
+
 ## 後始末と残る項目
 
-T4.1a〜c、T4.2、T4.3、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。#93の採用契約／実API後にT4.4（画像・文EmbeddingとE5/E6）、T4.5（同一場面と代表）、T4.7の全体受入を進める。LAN Decisionは上記の合成1枚で疎通済みだが、Embedding／Vertexの実Provider疎通・日本語検索と並行性能・miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
+T4.1a〜c、T4.2、T4.3、T4.4a、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。#93の採用契約を使い、T4.4b（E5/E6・対話とLRU）、T4.5（同一場面と代表）、T4.7の全体受入を進める。LAN DecisionとEmbeddingは合成入力で実疎通済み。Rust HTTP経由の日本語検索と背景Embeddingの並行15秒、Vertexの実Provider疎通、miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
