@@ -120,6 +120,19 @@
 - 修正`1092c7e`でtextに付随する文字列のthoughtSignatureのみ許可し、返却・保存・ログへ残さず破棄する。生成設定をresponseJsonSchemaとtemperature 0.1へ揃え、両Python定数をASTで抽出したfixtureをコンパイル時に埋め込んで一致を検証。実装側はcloud31件、全1029テスト成功・2件ignore、fmt/clippy・musl成功を報告。署名付き200の予算1・要求1、署名の非露出、旧parser／旧生成設定の否定対照も確認。親もpush済み・差分空白検査・Python定数とfixtureの一致を確認し、修正差分に絞ったSol簡易再レビューを依頼した。
 - Sol簡易再レビューは指摘0。前回2件の解消と危険なpayloadの拒否維持、依存・予算・停止・期限への変更なしを確認。独立のparser2件・schema2件・署名付き統合1件の計5試験成功。親が同じmuslバイナリを検証LXCで実行し、cloud31件すべて成功・ignoreなし（約18秒）。一時バイナリを削除し、T4.6aを完了とする。単発generateContentの基盤の完了であり、実クラウド・正常TLS疎通・handler登録は後続のまま。
 
+### T4.6b: 写真別Decision・画像準備・clue保存
+
+- LunaがPythonのclue対象・質問・保存契約と、Rustの画像／worker接続点を分けて読み取り調査した。親も該当コードを確認し、既存のLANクライアント・永続workerへ接続するSol実装を依頼した。実AI・秘密・実データは未使用。
+- LAN判定は現行同様hiddenで対象を絞らず、クラウド候補のhidden規則とは分ける。旧clueは処理版・完全な入力世代が無いためRustで無根拠にtrusted化せずLAN再判定し、Rustの付帯情報とPython互換行を同時確定する。途中失敗は互換error行にせず、failed到達時だけ投影し、再起動と手動retryでも整合を保つ。
+- displayが直接指すローカルJPEG/PNG原本も読み取り対象とし、DATA_DIR内の安全な通常ファイル読み取りを行う。既回転derivativeにrotationを重ねず、直接原本はEXIF向きを一度適用。画像を読み終えたらロックを解放し、デコード・縮小・新規JPEG化・HTTP中にwriter／画像ロックを保持しない方針を設計へ記録した。
+
+
+- 実装`8be70ed`はpush済み。写真別handlerの本登録、追加`ai_location_clues`と世代別の検証済み結果、Python互換投影、terminal失敗時の原子保存と再起動修復を追加。実装側は全1056テスト成功・2件ignore、fmt/clippy全target・musl成功を報告。親はpush済み・差分空白検査・Python質問fixtureとの一致、musl試験バイナリの生成を確認した。
+- ユーザー指定の別Solによる簡易通常レビューは必須・推奨・参考0。担当AC2/4/5/8/10aの写真別範囲は充足と判定され、location_clue25件・画像前処理2件・共通worker回帰5件の計32試験が独立成功した。実クラウド・実LAN・日候補・Embedding等はこの判定に含めない。
+- 親がmusl試験バイナリを検証LXCで実行し、写真別25件と画像前処理2件の全27件成功・ignoreなし。初回はPythonの実読み戻し1件だけ、コンパイル時のfixtureパスの中間ディレクトリ不足で失敗し、配置を補ってその1件を再実行した。質問／閾値、正常・failedのPython再利用とretry後の未判定、入力世代・画像SHAの競合、停止・ロック・秘匿を確認。一時バイナリ・ソースfixture・新規ディレクトリは削除し、常駐サービスはactiveを維持した。
+
+- 検証LXCの別の合成DATA_DIRで配布用muslの実`serve`を起動し、loopbackの偽Decisionへ初回1POST→正常clueと成功job保存、healthz 200、photos全列不変を確認。終了後の再起動では追加POSTもDiscoveryも0、保存済み結果を再利用した。SIGTERMからの終了は2回とも約0.12秒以内で、検証用常駐サービスはactiveを維持。一時ハーネスのlisten指定・SQL列名の誤りを直して確認し、製品コードの変更は不要だった。合成DB・画像・設定・ログ・バイナリは全削除した。T4.6bの写真別範囲を完了とする。
+
 後続タスクの結果は確認後に追記する。
 
 ## 後始末と残る項目
