@@ -500,6 +500,11 @@ fn a_bad_legacy_env_value_disables_only_ai_and_never_echoes_the_value() {
         ("GEOFRAME_AI_EMBED_PER_CYCLE", "1.5"),
         ("GEOFRAME_AI_JUDGE_PER_CYCLE", "sentinel-9a1"),
         ("GEOFRAME_AI_SEARCH_PER_MIN", "99999999999"),
+        ("GEOFRAME_AI_VISUAL_SIMILARITY", "sentinel-9a1"),
+        ("GEOFRAME_AI_VISUAL_SIMILARITY", "nan"),
+        ("GEOFRAME_AI_VISUAL_SIMILARITY", "inf"),
+        ("GEOFRAME_AI_VISUAL_SIMILARITY", "-0.1"),
+        ("GEOFRAME_AI_VISUAL_SIMILARITY", "1.1"),
         ("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "sentinel-9a1"),
         ("GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE", "sentinel-9a1"),
     ];
@@ -527,6 +532,35 @@ fn a_bad_legacy_env_value_disables_only_ai_and_never_echoes_the_value() {
         let text = format!("{c:?} {}", c.log_summary());
         assert!(!text.contains(value) || value.len() < 4, "{text}");
         assert!(!text.contains("sentinel-9a1"), "{text}");
+    }
+}
+
+#[test]
+fn visual_similarity_is_validated_without_preventing_startup_when_ai_is_off() {
+    let c = config_env(&HashMap::from([
+        (
+            "GEOFRAME_AI_VISUAL_SIMILARITY".into(),
+            "sentinel-visual".into(),
+        ),
+        ("GEOFRAME_AI_ENABLED".into(), "0".into()),
+    ]))
+    .expect("AI settings must not prevent serving");
+    assert_eq!(c.ai.invalid(), Some(AiConfigError::LegacyEnv));
+    assert!(!c.ai.legacy().enabled);
+    assert!(!format!("{c:?} {}", c.log_summary()).contains("sentinel-visual"));
+
+    for (backend, expected) in [("gemini", 0.90), ("local", 0.91)] {
+        let mut env = HashMap::from([("GEOFRAME_EMBED_BACKEND".into(), backend.into())]);
+        assert_eq!(config_env(&env).unwrap().ai_visual_similarity, expected);
+        for value in ["0", "1", "0.8_5"] {
+            env.insert("GEOFRAME_AI_VISUAL_SIMILARITY".into(), value.into());
+            let c = config_env(&env).unwrap();
+            assert!(c.ai.invalid().is_none());
+            assert_eq!(
+                c.ai_visual_similarity,
+                crate::pyquery::py_float(value).unwrap()
+            );
+        }
     }
 }
 

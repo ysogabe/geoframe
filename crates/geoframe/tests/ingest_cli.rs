@@ -613,7 +613,7 @@ fn broken_ai_config(dir: &Dir, body: &str) -> PathBuf {
 #[test]
 fn serve_with_a_broken_ai_config_still_serves_health_and_the_feed() {
     type LegacyEnv = Option<(&'static str, &'static str)>;
-    let cases: [(&str, &str, LegacyEnv); 4] = [
+    let cases: [(&str, &str, LegacyEnv); 5] = [
         // (本文, 期待するコード, 追加の旧環境変数)
         (
             r#"{"version":1,"sentinel-key-4c1f":"sentinel-value-93ab"}"#,
@@ -636,6 +636,11 @@ fn serve_with_a_broken_ai_config_still_serves_health_and_the_feed() {
             "legacy_env",
             Some(("GEOFRAME_AI_POLL_S", "sentinel-value-93ab")),
         ),
+        (
+            r#"{"version":1}"#,
+            "legacy_env",
+            Some(("GEOFRAME_AI_VISUAL_SIMILARITY", AI_SENTINEL_VALUE)),
+        ),
     ];
     for (n, (body, code, legacy)) in cases.into_iter().enumerate() {
         let dir = Dir::new(&format!("serve-ai-broken-{n}"));
@@ -644,6 +649,9 @@ fn serve_with_a_broken_ai_config_still_serves_health_and_the_feed() {
         let before = snapshot(&dir.0);
         let mut extra = vec![("GEOFRAME_AI_CONFIG", config.to_str().unwrap())];
         extra.extend(legacy);
+        if legacy.is_some_and(|(key, _)| key == "GEOFRAME_AI_VISUAL_SIMILARITY") {
+            extra.push(("GEOFRAME_AI_ENABLED", "0"));
+        }
         let port = free_port();
         let mut child = serve_with_env(&dir.0, port, None, &extra);
         wait_healthy(&mut child, port);

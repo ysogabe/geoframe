@@ -915,6 +915,7 @@ enum AiState {
 pub struct AiConfig {
     legacy: LegacyAi,
     state: AiState,
+    visual_similarity: Option<f64>,
 }
 
 impl fmt::Debug for AiConfig {
@@ -928,6 +929,7 @@ impl Default for AiConfig {
         Self {
             legacy: LegacyAi::default(),
             state: AiState::Unset,
+            visual_similarity: None,
         }
     }
 }
@@ -941,7 +943,23 @@ impl AiConfig {
             return Self {
                 legacy: LegacyAi::default(),
                 state: AiState::Invalid(AiConfigError::LegacyEnv),
+                visual_similarity: None,
             };
+        };
+        let visual_similarity = match get("GEOFRAME_AI_VISUAL_SIMILARITY") {
+            None => None,
+            Some(raw) => {
+                let Some(value) = crate::pyquery::py_float(&raw)
+                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                else {
+                    return Self {
+                        legacy,
+                        state: AiState::Invalid(AiConfigError::LegacyEnv),
+                        visual_similarity: None,
+                    };
+                };
+                Some(value)
+            }
         };
         let state = match get("GEOFRAME_AI_CONFIG") {
             None => AiState::Unset,
@@ -953,7 +971,16 @@ impl AiConfig {
                 },
             },
         };
-        Self { legacy, state }
+        Self {
+            legacy,
+            state,
+            visual_similarity,
+        }
+    }
+
+    /// 構図比較の検証済み閾値。未指定・不正なら呼び出し側の安全な既定値を使う。
+    pub(crate) fn visual_similarity(&self) -> Option<f64> {
+        self.visual_similarity
     }
 
     pub fn legacy(&self) -> &LegacyAi {

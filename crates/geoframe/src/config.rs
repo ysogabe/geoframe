@@ -349,23 +349,6 @@ impl Config {
             },
             None => (EmbedBackend::Gemini, false),
         };
-        let ai_visual_similarity = get("GEOFRAME_AI_VISUAL_SIMILARITY")
-            .filter(|s| !s.is_empty())
-            .map(|s| {
-                crate::pyquery::py_float(&s)
-                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-                    .ok_or_else(|| {
-                        ConfigError(
-                            "GEOFRAME_AI_VISUAL_SIMILARITY は0〜1の有限数で指定してください".into(),
-                        )
-                    })
-            })
-            .transpose()?
-            .unwrap_or(if embed_backend == EmbedBackend::Local {
-                0.91
-            } else {
-                0.90
-            });
         // 現行は `int(...)`。負の値は掃除が毎回すべてのタイルを消す意味になるので、Rust は断る
         let tile_cache_max_mb = match get("GEOFRAME_TILE_CACHE_MAX_MB") {
             Some(raw) => raw
@@ -478,6 +461,14 @@ impl Config {
                 ))
             })?;
 
+        let ai = AiConfig::load(&get);
+        let ai_visual_similarity =
+            ai.visual_similarity()
+                .unwrap_or(if embed_backend == EmbedBackend::Local {
+                    0.91
+                } else {
+                    0.90
+                });
         Ok(Self {
             listen,
             data_dir,
@@ -500,7 +491,7 @@ impl Config {
             drive_key,
             drive_folder,
             blog_plans_dir,
-            ai: AiConfig::load(&get),
+            ai,
         })
     }
 

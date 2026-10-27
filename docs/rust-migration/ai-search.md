@@ -11,6 +11,7 @@ T4.4bは `GET /api/ai/status`・`GET /api/ai/search` を既存画面へ接続す
 - `include_hidden` は最初の値が `1` または `true` のときだけ真。mode、group/card全項目、整数/null/bool、丸め4桁、favorite/recommended/score/keep_scoreの安定並び、構図代表・件数はPython fixtureと比較する。空結果はPythonと同じく `include_hidden` を省略する。
 - **意図したPythonとの差**: 非空queryは新しいactive identityと明示した固定query契約が必要。旧DB・未構築・不適合は、候補0件でも503（Pythonの旧実装はDB行0件ならProvider確認前に200 empty）。適合するactive空間があり、検索対象がhidden/品質条件等で0件なら200 empty。旧ベクトルへ新queryを掛ける例外は設けない。
 - **空queryは保存済み結果を使う**。新active/Provider/設定ファイルが無くても、世代が合う旧モデルの結果から200 recommended/emptyを返す。AI_ENABLED=0は空queryも503。新activeの有効vectorを持つ新写真は旧判定が無くても候補に入り、keep_scoreが無ければ品質点を使う。
+- `GEOFRAME_AI_VISUAL_SIMILARITY` は0〜1の有限数を受け、未指定時は従来のbackend別既定値を使う。不正値はAI側の`legacy_env`エラーとして保持し、推論を無効にして写真配信は継続する。AI_ENABLED=0の指定も保持する。構図比較の内部値には安全な既定値を入れ、不正な入力値はログへ出さない。
 
 ## 一つのLAN client、期限と停止
 
@@ -61,3 +62,12 @@ pipelineは `index_state`（no_tables/unset/unusable/active）、`query_compatib
 - 背景POSTを同期ゲートで保持して対話query/フィード/E5/管理STATUS/setlocを2秒上限内に確認。writer busy中のLAN検索も成功し、エラー記録は200msで打ち切って共有メモリ待機を保った。短い同一DeadlineでPOST timeout後の再probeとcache失敗非保存、外側キャンセル後の枠/LockHoldを確認。時間依存の大量反復なし。
 
 性能はこの開発ホスト上の合成値であり、画像推論時間や実LANの背景8件中query15秒を証明しない。実Provider/実写真/実DB/SSH/鍵/Cloud/本番サービスは未使用、`/var/lib/geoframe` は参照・変更していない。
+
+### 中断した通常レビューの指摘への修正（2026-10-28）
+
+通常レビューは利用上限で最終報告前に中断したが、新規の構図閾値環境変数が不正な場合に`Config::load`全体が失敗し、AI_ENABLED=0でもserveが終了する再現が残った。親がこの小修正を行い、構図閾値を`AiConfig`で検査して、不正なら既存の`legacy_env`へ分類するよう変更した。検証済みの閾値だけを`Config`へ渡し、内部値はbackend別既定値へ戻す。明示AI無効フラグ・配信の継続・入力値の非出力を保つ。設定JSONやDBスキーマ、Providerの契約に変更はない。
+
+- 追加回帰は旧コードで意図した`ConfigError`により失敗することを確認した。修正後はAI設定21試験が成功。不正文字列・NaN・Infinity・範囲外、AI_ENABLED=0、未指定の既定値と有効な境界値を検査した。
+- 実プロセスの既存起動結合試験に構図閾値不正＋AI_ENABLED=0のケースを追加し、healthz・フィード200、終了コード0、DB不変、固定エラーコードとログ非露出を確認した。
+- `cargo fmt --all --check`、全targetsのclippy（警告をエラー扱い）、全workspace **28 group・1173成功・失敗0・既存ignore2**、musl releaseビルドが成功した。静的リンク（INTERP/NEEDED無し）とversion起動も確認した。性能の追加測定を目的とした反復はしていない。
+- 中断したレビューの途中結果はquery24件・丸め1件・共有境界17件の成功報告までで、正式な完了判定には数えない。修正後コミットを対象に、新しい別Solレビューで残る確認と最終判定を行う。実LAN/LXCのHTTP並行受入は引き続き親担当。
