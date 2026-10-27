@@ -133,6 +133,8 @@ c2で追加する2表（既存結果/一次列のschema変更なし、追加索�
 
 別Solの通常レビューとLXC受入は親タスクへ返す。実Provider疎通、実写真/費用の許可、#93/E5/E6、P4全体完了は主張しない。
 
+親の受入結果は[p4-foundation-acceptance.md](p4-foundation-acceptance.md)に記録した。c2のSolレビューは修正後指摘0、LXC追加24件と修正回帰1件が成功。実LAN Decisionも合成画像1枚で正常clue保存を確認した。Vertex／Embeddingの実接続とP4全体受入は未完了。
+
 ### c2 cleanup失敗時の修正
 
 通常レビューの必須P2を受け、親が共通workerのcleanup失敗後に当該handlerの汎用enqueueを中止する小修正を行った。holdsのDELETEへ故障を注入した追加試験では、修正前に旧error.attempts=5からCloud POSTが1件発生することを再現した。修正後は新規job／token要求／Cloud POSTが0で旧履歴を維持し、故障解除後もattempts=5のterminal failedを継承する。

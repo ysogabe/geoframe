@@ -167,8 +167,10 @@
 
 - c2のSol限定再レビューは必須・推奨・参考0。追加1件と既存関連5件の独立6試験が成功し、cleanup失敗後の試行上限迂回は解消した。複数chunk途中の故障はコード確認で、先行commit保持・失敗chunk rollback・当該handlerの残りcleanup／genericenqueue中止・次handler続行を確認。全1108件とLXC追加24＋修正1件の成功と合わせ、c2のruntime範囲を完了とする。
 
+- 親が検証LXCから実LAN Decisionのservice／healthを読み取り確認し、available・running・lease0・画像対応readyを確認。専用の合成DBと合成PNG1枚、location_clueだけの設定で配布用muslの実serveを起動し、Discovery／画像準備／実systemone／世代CAS／互換clue保存まで成功した。jobはsucceeded・attempts0、正常clue1件、photos全列不変、healthz200、SIGTERM終了約0.06秒。クラウドAI設定・実鍵・実写真・元DBは使用せず、GPU管理／lease操作も行っていない。今回の合成DB・画像・設定・ログ・バイナリは全削除し、常駐サービスはactiveを維持。これはDecision単体疎通で、Vertex／Embeddingの実接続やP4全ACの確認を代替しない。
+
 後続タスクの結果は確認後に追記する。
 
 ## 後始末と残る項目
 
-T4.1a〜c、T4.2、T4.3、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。#93の採用契約／実API後にT4.4（画像・文EmbeddingとE5/E6）、T4.5（同一場面と代表）、T4.7の全体受入を進める。実Provider疎通・日本語検索と並行性能・miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
+T4.1a〜c、T4.2、T4.3、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。#93の採用契約／実API後にT4.4（画像・文EmbeddingとE5/E6）、T4.5（同一場面と代表）、T4.7の全体受入を進める。LAN Decisionは上記の合成1枚で疎通済みだが、Embedding／Vertexの実Provider疎通・日本語検索と並行性能・miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
