@@ -116,6 +116,16 @@ AIのjoinは既存と同じ最大10秒。HTTP終了、タイル掃除、同期�
 
 ## 6. 索引・旧データ・切替
 
+### 採用されたEmbedding接続契約（2026-10-27、T4.4）
+
+local-model-labの[#101](https://github.com/ysogabe/local-model-lab/pull/101)が反映され、[#93](https://github.com/ysogabe/local-model-lab/issues/93#issuecomment-6444034979)の画像対応APIを確認した。仕様の参照は同リポジトリの`c9b05b590d838b81a6b2f939af34e409f16469ad`、`docs/guides/resident-image-embedding.md`と`scripts/embedding_server.py`に固定する。以前のtext-onlyという記述は当時の状態であり、この契約を確認した構成に限って画像を送る。
+
+- 設定したLAN入口と固定パス`/llm-embed/v1/embeddings`、service_id=`embed`を使う。Discoveryと`/llm-embed/v1/models`の画像・文章能力、実際の応答modelを照合する。
+- model=`embeddinggemma-2-bf16`、重みrevision=`914f7f89142e33e77833254d9c9b90c3cef7303b`、768次元、L2正規化。上流はBF16のため、受信後も既存のベクトル検査・L2再正規化を通す。旧Q8_0名は入力aliasとして受理されるだけで、新空間の識別に使わない。
+- JSONの`input`は文章、`{"image":"data:image/jpeg;base64,..."}`、またはその配列。画像は既存の安全なRGB由来JPEGだけを渡す。要求全体はbase64込み4MiB以下、バッチは最大8件。画像ジョブは原則1画像ずつ送り、対話検索を長いバッチの後ろに並べない。検索文の接頭辞は`task: search result | query: `で、画像には付けない。
+- 応答は`data[index].embedding`。revision・前処理版・共通空間IDを独立フィールドでは返さないため、§6.2の固定契約設定で識別する。重みrevision、固定サーバー処理、クライアントの画像縮小/JPEGと検索文前処理の版を区別し、設定や実能力が契約に合わなければ送信・保存しない。モデル名や768次元だけから版を推測しない。
+- 上流は逐次処理。背景1枠・対話1枠と15秒の条件を変えず、LXCで両要求の並行成功を確認してから接続完了とする。長時間負荷やCPU画像APIの計測を実施済みとは扱わない。
+
 ### 6.1 保存形式
 
 現規模は約6,500枚・768次元で、float32のベクトル本体は約20MiB。最初はSQLiteのfloat32 LE BLOBと線形コサイン検索で十分な規模と判断する。ANNサーバーや別のベクトルDBは導入せず、LXCで時間とRSSを測り、必要なら後で検討する。

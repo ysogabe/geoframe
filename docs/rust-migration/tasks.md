@@ -92,6 +92,7 @@ P3で守ること（各タスクの委任文に入れる）:
 - 各タスクはt3-full-buildの管理モードで、実装Sonnet・通常レビューSol。security-reviewはP4のPR前に全体で1回。
 - 2026-10-27のユーザー指定: Claudeが利用できない間は、実装がSolでも通常レビューを別のSol子タスクで簡易に実施する。変更点と認証・送信許可・予算・停止・秘匿の重要境界を確認し、全workspaceや既存範囲の不要な再実行は省く。進行中の修正が完了してから、新しいレビュー子タスクへ修正後コミットを渡す。
 - 2026-10-27に#93のOPEN・契約未確定を再確認。T4.3の次は独立して進められるT4.6を、認証／通信、Decisionの写真別処理、日単位候補／座標化の3タスクへ分ける。要求・ACは元のT4.6のまま。実クラウド送信の許可はこの分割や実装では追加しない。
+- 2026-10-27にlocal-model-labのPR #101反映後の画像対応BF16を独立確認し、[#93を完了](https://github.com/ysogabe/local-model-lab/issues/93#issuecomment-6444034979)。採用契約は同リポジトリの`c9b05b590d838b81a6b2f939af34e409f16469ad`に固定する。ユーザーが実装継続を承認。T4.4はアダプター・画像索引のaと、検索API・対話キャッシュのbへ分割する。要求・ACは変えず、完了にはLXCでの実API・並行応答確認も必要。
 
 | ID | 内容 | AC（P4-PRD） | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
@@ -100,8 +101,9 @@ P3で守ること（各タスクの委任文に入れる）:
 | T4.1c | AIワーカーの起動条件・LockHold、SIGTERM時の共通期限、停止後回収、ガード付きai-jobs状態／retry CLI | AC1, AC3, AC4, AC5, AC10a | T4.1a, T4.1b | full | 完了 | 79fffe2 | cf201d6..1cddeda | 通常レビューSol2回・Opus代替1回: 必須3→1→0。停止後送信/claim、保存I/O期限、writer接続終了までのLockHoldを修正。全883テスト成功・2件ignore、fmt/clippy・musl成功。LXCでCLI排他/旧DB不変、回帰44件と追加23件成功。実handler登録・Provider共通待ちは後続 |
 | T4.2 | AI専用HTTP・Discovery/available・送信先制限・用途別許可・Decision、非同期処理からの安全な呼出し | AC2, AC3, AC4, AC5, AC10a | T4.1c | full | 完了 | 65ffea4 | b4c9e18..96412e1 | レビューSol3回: 必須2→2→0。停止Gateとwait表示、RGB由来の自生成JPEGだけを送る型へ修正。全949テスト成功・2件ignore、fmt/clippy・musl成功、型境界とallocation0を独立確認。LXCでAI158/176件・最終画像/Decision/Provider27件成功、waitのCLI/API/実STATUSと期限切れ非表示確認。実handler/Vertex/#93は後続 |
 | T4.3 | 空間別のベクトル保存・active_space、有効世代JOIN、旧選別維持と代表不在時の安全な表示、状態の読み取り | AC4, AC6, AC7, AC9, AC10a | T4.1c | full | 完了 | 103babf | a0c0954..31e4ce2 | レビューSol2回: 必須3→0（破損vectorの公開・同SHA複製の世代・未知理由の生出力を修正）。全998テスト成功・2件ignore、fmt/clippy・musl成功、独立97試験成功。LXC索引35件・旧選別10件成功。feed3065不変、suppressed差455件を可視代表不在で説明。合成6500×768の公開約222〜279ms・最大RSS約30MiB。実Embeddingは後続 |
-| T4.4 | #93で採用された画像／文EmbeddingアダプターとE5/E6の本接続、対話用枠・検索キャッシュ | AC2, AC3, AC6, AC7, AC10b | T4.2, T4.3, #93の契約 | full | 未着手 | | | API契約待ち。既存text-only APIへ画像を送らない |
-| T4.5 | 同一場面グループ、ルール／既存の重みで代表選択、任意のGemini比較 | AC3, AC4, AC5, AC6, AC8 | T4.3, T4.4, T4.6a | full | 未着手 | | | 旧選別と部分重複する新判定の自動置換なし |
+| T4.4a | 採用済みBF16画像／文アダプター、固定契約による空間識別、画像ジョブ・世代CAS・索引の自動切替 | AC2, AC3, AC4, AC6, AC10b | T4.2, T4.3, #93の契約 | full | 実装中 | 6fe7fd7 | | LAN固定パス・4MiB・安全なJPEG・L2再正規化。旧ベクトルの輸入なし。HTTP検索への接続はb |
+| T4.4b | E5/E6の本接続、対話用枠・15秒の全体期限・検索語LRU、空間切替と旧DBの互換 | AC2, AC3, AC6, AC7, AC10b | T4.4a | full | 未着手 | | | 保存済み検索語の再利用、背景画像処理中の成功応答、writer busy・無効設定・INGEST=0の制御を確認 |
+| T4.5 | 同一場面グループ、ルール／既存の重みで代表選択、任意のGemini比較 | AC3, AC4, AC5, AC6, AC8 | T4.3, T4.4b, T4.6a | full | 未着手 | | | 旧選別と部分重複する新判定の自動置換なし |
 | T4.6a | Vertexの明示認証・固定HTTPS宛先・token分離と401更新、用途別クラウド通信境界 | AC2, AC5, AC10a | T4.1c, T4.2 | full | 完了 | dd5b4a3 | e1fea35..1092c7e | 実装Sol（Sonnetは利用上限で開始前中断）。ユーザー指定のSol簡易レビュー2回: 必須1・推奨1→0。署名付き応答とPython生成設定の互換を修正。全1029テスト成功・2件ignore、fmt/clippy・musl成功。LXC cloud31件・Drive74件成功。初回LXCの期限/wire試験も修正しwriter待ちを全体期限へ制限。新規handler・実クラウド送信は後続 |
 | T4.6b | Decision用の画像準備・質問・clue解釈、写真別reconcileと世代CAS、failedを手がかりなしとして記録 | AC2, AC4, AC5, AC8, AC10a | T4.1c, T4.2 | full | 完了 | 3eae4f9 | 8be70ed | 別Sol簡易レビュー指摘0、独立32試験成功。全1056テスト成功・2件ignore、fmt/clippy・musl成功。LXC写真別25件・画像2件成功、実serveで初回1POSTと正常保存、再起動再送0、photos不変・health200・SIGTERM約0.12秒以内を確認。日候補はc2で接続済み。親の追加受入で実LAN Decisionへ合成1枚を通し、正常clue・attempts0・一次列不変を確認 |
 | T4.6c1 | 日集合・送信順・固定promptと応答型、世代別有償回答repository・Python互換run_id／部分集合再利用 | AC2, AC4, AC8, AC9, AC10a | T4.6a, T4.6b | full | 完了 | 8c0b906 | 40ce3f0..df12428 | 別Sol簡易レビュー2回: 必須1→0（成功分のfailure継承を修正）。全1083テスト成功・2件ignore、fmt/clippy・musl成功、限定独立11試験成功。LXC domain/repository27件成功。世代別回答履歴・旧done保留・Python互換と再利用を確認。実送信・handler登録はc2 |
