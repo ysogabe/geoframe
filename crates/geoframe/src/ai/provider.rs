@@ -23,6 +23,7 @@
 //! 「送信後の失敗」は、Discovery が `available` を返した直後でも起きる（確認は予約ではない）。GPU の lease が始まった
 //! 直後の 502・接続断は、ジョブの不良ではないので、失敗に数える前に Discovery を 1 回やり直して分類する。
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::http::{AiHttp, HttpError};
@@ -42,6 +43,7 @@ const BACKGROUND_SLOT_WAIT: Duration = Duration::from_secs(2);
 #[derive(Clone, Debug)]
 pub struct LanClient {
     pub(super) http: AiHttp,
+    availability: Arc<Mutex<Availability>>,
 }
 
 impl LanClient {
@@ -50,16 +52,90 @@ impl LanClient {
         let url = config.settings()?.local_base_url()?;
         Some(Self {
             http: AiHttp::new(url).ok()?,
+            availability: Arc::default(),
         })
     }
 
     #[cfg(test)]
     pub(super) fn from_http(http: AiHttp) -> Self {
-        Self { http }
+        Self {
+            http,
+            availability: Arc::default(),
+        }
     }
 
     pub fn http(&self) -> &AiHttp {
         &self.http
+    }
+
+    /// Shared even without a writer (INGEST=0), and while a busy writer prevents persistence.
+    pub(super) fn check_shared(
+        &self,
+        config: &AiConfig,
+        task: super::settings::TaskKind,
+        now: i64,
+    ) -> Result<(), ProviderError> {
+        let Some(settings) = config.settings() else {
+            return Err(ProviderError::contract(false));
+        };
+        let state = self.availability.lock().unwrap();
+        for (key, error) in &state.pauses {
+            if Some(key) == settings.provider_pause_key(task).as_ref()
+                || Some(key) == settings.task_pause_key(task).as_ref()
+            {
+                return Err(*error);
+            }
+        }
+        for (key, until, wait) in &state.waits {
+            if *until > now
+                && settings.provider_fingerprint(task).as_ref() == Some(&key.provider)
+                && (key.service.is_none() || key.service == settings.service_key(task))
+            {
+                return Err(ProviderError::Wait(*wait));
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn record_shared(
+        &self,
+        config: &AiConfig,
+        task: super::settings::TaskKind,
+        error: ProviderError,
+        now: i64,
+    ) {
+        let Some(settings) = config.settings() else {
+            return;
+        };
+        let mut state = self.availability.lock().unwrap();
+        match error {
+            ProviderError::Pause(scope, _) => {
+                let key = if scope == PauseScope::Provider {
+                    settings.provider_pause_key(task)
+                } else {
+                    settings.task_pause_key(task)
+                };
+                if let Some(key) = key
+                    && !state.pauses.iter().any(|(k, _)| *k == key)
+                {
+                    state.pauses.push((key, error));
+                }
+            }
+            ProviderError::Wait(wait) => {
+                if let Some(key) = wait_key(config, task, wait) {
+                    state.waits.retain(|(_, until, _)| *until > now);
+                    let until = now.saturating_add(i64::from(wait.secs()));
+                    if let Some(entry) = state.waits.iter_mut().find(|(k, _, _)| *k == key) {
+                        if until >= entry.1 {
+                            *entry = (key, until, wait);
+                        }
+                    } else {
+                        state.waits.push((key, until, wait));
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     /// 背景の枠を取る。
@@ -71,6 +147,73 @@ impl LanClient {
             .session(Lane::Background, BACKGROUND_SLOT_WAIT, stop)
             .map_err(|e| ProviderError::from_http(e, Phase::Probe))
     }
+}
+
+// No derived Debug: keys carry hashed configuration identities, not useful diagnostics.
+#[derive(Default)]
+struct Availability {
+    waits: Vec<(super::waits::WaitKey, i64, Wait)>,
+    pauses: Vec<(super::pause::PauseKey, ProviderError)>,
+}
+impl std::fmt::Debug for Availability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Availability { .. }")
+    }
+}
+fn wait_key(
+    config: &AiConfig,
+    task: super::settings::TaskKind,
+    wait: Wait,
+) -> Option<super::waits::WaitKey> {
+    let settings = config.settings()?;
+    Some(super::waits::WaitKey {
+        provider: settings.provider_fingerprint(task)?,
+        service: match wait.scope {
+            WaitScope::Entrance => None,
+            WaitScope::Service => Some(settings.service_key(task)?),
+        },
+    })
+}
+/// Record only shared availability, never queries, jobs, usage or schema.
+pub(super) fn record_db(
+    conn: &mut rusqlite::Connection,
+    config: &AiConfig,
+    task: super::settings::TaskKind,
+    error: ProviderError,
+    now: i64,
+) -> rusqlite::Result<()> {
+    let Some(settings) = config.settings() else {
+        return Ok(());
+    };
+    match error {
+        ProviderError::Wait(wait)
+            if super::jobs::object_exists(conn, "table", "ai_provider_waits")? =>
+        {
+            if let Some(key) = wait_key(config, task, wait) {
+                super::waits::set(
+                    conn,
+                    &key,
+                    wait.reason,
+                    now.saturating_add(i64::from(wait.secs())),
+                    now,
+                )?;
+            }
+        }
+        ProviderError::Pause(scope, reason)
+            if super::jobs::object_exists(conn, "table", "ai_provider_pauses")? =>
+        {
+            let key = if scope == PauseScope::Provider {
+                settings.provider_pause_key(task)
+            } else {
+                settings.task_pause_key(task)
+            };
+            if let Some(key) = key {
+                super::pause::pause(conn, task, &key, reason, now)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// どの段階の失敗か（分類が変わる）。

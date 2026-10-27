@@ -68,7 +68,7 @@ T4.3の索引基盤に、[T4.4aの固定契約アダプターと画像ワーカ�
 
 ## 5. 読み取り（後続の E5/E6 が使う型付き境界）
 
-- `index::status(conn)` → `IndexStatus`（`ActiveState`＝`NoTables`/`Unset`/`Active`/`Unusable`、`Progress`＝`eligible`/`indexed`/`pending`/`failed_excluded`＋理由コード別件数（`failed_reasons: Vec<(&'static str, i64)>`。保存された `last_error_code` は固定の `ErrorCode` か `other` に直す（`index::reason_code`。`ai-jobs status` の理由の集計と同じ規則）ので、未知の文字列・改行は出力に出ない。未知でも `failed` は失敗として数え、`pending` に混ぜない）、`other_space_shas`・`legacy_shas`・`other_shas`（空間間の同じ SHA は重複計数しない）、`spaces`、`corrupt`）。件数だけで、写真の値・SHA・ベクトルは持たない。E5 の `pipeline`・`embedding_model` 等はこの値から作る（接続は T4.4）。
+- `index::status(conn)` → `IndexStatus`（`ActiveState`＝`NoTables`/`Unset`/`Active`/`Unusable`、`Progress`＝`eligible`/`indexed`/`pending`/`failed_excluded`＋理由コード別件数（`failed_reasons: Vec<(&'static str, i64)>`。保存された `last_error_code` は固定の `ErrorCode` か `other` に直す（`index::reason_code`。`ai-jobs status` の理由の集計と同じ規則）ので、未知の文字列・改行は出力に出ない。未知でも `failed` は失敗として数え、`pending` に混ぜない）、`other_space_shas`・`legacy_shas`・`other_shas`（空間間の同じ SHA は重複計数しない）、`spaces`、`corrupt`）。件数だけで、写真の値・SHA・ベクトルは持たない。E5 の `pipeline`・`embedding_model` 等はこの値から作る（[T4.4b実装](ai-search.md)）。
 - `index::progress(conn, &identity)` は構築中（まだ active でない）空間の進み具合。
 - `search::load_active_index(conn)` → `Loaded { status, index: Option<ActiveIndex> }`。ポインタ・識別・対象・ベクトル・状態を **1 つの読み取りトランザクション**で読むので、並行する切替の前後が混ざらない。ポインタが無い・未登録・表が無いなら `index: None`（旧結果参照。意味検索は 503 のまま）。
 - 検索は `QueryVector::new(&identity, &values)`（次元・有限・非ゼロを検査）→ `ActiveIndex::search(&query, limit)`。識別が索引と**全項目**同じでなければ `IdentityMismatch`。全項目を線形に走るコサイン類似度（6,500×768 の規模で足りる想定。ANN・外部ベクトル DB は無し）。他の空間・旧結果のベクトルは読まない（混在 0）。
@@ -99,4 +99,4 @@ Python は追加表と `ai_active_space` を使わず旧表を読む。Rust の�
 
 - **T4.4a実装済み**: [固定契約アダプター・世代付き画像ジョブ・自動切替](ai-embedding.md)。SpaceIdentityは明示した固定契約と実model/能力を照合する。**T4.4b**: E5は `index::status`、E6は共有clientのquery＋`load_active_index`＋`QueryVector`へ接続する。
 - **T4.5**: 新しい同一場面グループ・代表。**旧選別と部分的に重なる新集合は旧選別を自動で置き換えない**（旧は `selection` の有効判定のまま保持。新しい結果は別表に持ち、重なるものは管理確認）。入力集合・世代が一致する選別単位か、有効な旧選別と重ならない新しい集合だけ新判定を使える。旧の写真別判定（品質・`keep_score` 等）は世代が一致すれば空間独立で使える。
-- T4.4aで固定契約の画像Embedding・差分修復・`ai_active_space`の自動切替ワーカーを実装済み。T4.4b以降の未実装: E5/E6 HTTPの本接続（503のまま）・query LRU/レート制限、設定JSONの閾値キー、T4.5の新しい同一場面の表（`ai_scene_*`）。実LAN/LXCでのRust経由受入は親担当で未確認。旧Q8_0/Geminiベクトルは輸入しない。lineage追加表とchunk/公開照会の最終方式は [ai-embedding.md](ai-embedding.md) を参照。
+- T4.4aで固定契約の画像Embedding・差分修復・`ai_active_space`の自動切替ワーカーを実装済み。T4.4bで[E5/E6 HTTP・query LRU/レート制限](ai-search.md)を接続済み。残る未実装は設定JSONの閾値キー、T4.5の新しい同一場面の表（`ai_scene_*`）。実LAN/LXCでのRust経由受入は親担当で未確認。旧Q8_0/Geminiベクトルは輸入しない。lineage追加表とchunk/公開照会の最終方式は [ai-embedding.md](ai-embedding.md) を参照。

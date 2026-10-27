@@ -283,3 +283,5 @@ mod testutil {
 }
 
 mod service_account;
+
+mod pycasefold;

@@ -174,16 +174,30 @@ impl EmbeddingClient {
             .map_err(|e| e.into_run_error(false))?;
         let whole = Deadline::for_task(TaskKind::ImageEmbedding);
         ctx.before_probe()?;
+        self.lan
+            .check_shared(ctx.config(), self.task, ctx.now())
+            .map_err(|e| e.into_run_error(false))?;
         let session = self
             .lan
             .background(ctx.stop())
             .map_err(|e| e.into_run_error(false))?;
         self.probe(&session, &whole)
+            .inspect_err(|error| {
+                self.lan
+                    .record_shared(ctx.config(), self.task, *error, ctx.now())
+            })
             .map_err(|e| e.into_run_error(false))?;
         before_send()?;
         // Final check after disk reread and discovery, immediately before POST.
         ctx.before_send()?;
+        self.lan
+            .check_shared(ctx.config(), self.task, ctx.now())
+            .map_err(|e| e.into_run_error(false))?;
         self.send(&session, &body, &whole)
+            .inspect_err(|error| {
+                self.lan
+                    .record_shared(ctx.config(), self.task, *error, ctx.now())
+            })
             .map_err(|e| e.into_run_error(false))
     }
 }

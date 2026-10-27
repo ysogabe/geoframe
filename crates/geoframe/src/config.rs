@@ -64,7 +64,6 @@ pub const UNSUPPORTED_ENV: &[&str] = &[
     // P4: AI・位置候補（後続のタスク。周期・上限・フラグは T4.1b から `SUPPORTED_ENV`）
     "GEOFRAME_AI_TIME_WINDOW_MIN",
     "GEOFRAME_AI_SIMILARITY",
-    "GEOFRAME_AI_VISUAL_SIMILARITY",
     "GEOFRAME_AI_SHORTLIST_MAX",
     "GEOFRAME_AI_JUDGE_SHUFFLE_RATE",
     "GEOFRAME_LOCAL_EMBED_MODEL_DIR",
@@ -107,6 +106,7 @@ pub const SUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_AI_EMBED_PER_CYCLE",
     "GEOFRAME_AI_JUDGE_PER_CYCLE",
     "GEOFRAME_AI_SEARCH_PER_MIN",
+    "GEOFRAME_AI_VISUAL_SIMILARITY",
     "GEOFRAME_LOC_SUGGEST",
     "GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE",
     "GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE",
@@ -225,6 +225,7 @@ pub struct Config {
     /// （負でもよい）。現行は検証なしで `float()` に通すが、Rust は有限の数だけを受ける。
     pub infer_offset_min: f64,
     pub embed_backend: EmbedBackend,
+    pub ai_visual_similarity: f64,
     /// `GEOFRAME_EMBED_BACKEND` が `gemini`・`local` のどちらでもなかった（現行と同じく `gemini` に
     /// 落とした）。起動ログで知らせる。
     pub embed_backend_invalid: bool,
@@ -348,6 +349,23 @@ impl Config {
             },
             None => (EmbedBackend::Gemini, false),
         };
+        let ai_visual_similarity = get("GEOFRAME_AI_VISUAL_SIMILARITY")
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                crate::pyquery::py_float(&s)
+                    .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+                    .ok_or_else(|| {
+                        ConfigError(
+                            "GEOFRAME_AI_VISUAL_SIMILARITY は0〜1の有限数で指定してください".into(),
+                        )
+                    })
+            })
+            .transpose()?
+            .unwrap_or(if embed_backend == EmbedBackend::Local {
+                0.91
+            } else {
+                0.90
+            });
         // 現行は `int(...)`。負の値は掃除が毎回すべてのタイルを消す意味になるので、Rust は断る
         let tile_cache_max_mb = match get("GEOFRAME_TILE_CACHE_MAX_MB") {
             Some(raw) => raw
@@ -469,6 +487,7 @@ impl Config {
             infer_min,
             infer_offset_min,
             embed_backend,
+            ai_visual_similarity,
             embed_backend_invalid,
             tile_cache_max_mb,
             tile_ua,

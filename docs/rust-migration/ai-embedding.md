@@ -1,6 +1,6 @@
 # 画像・日本語検索語Embedding（T4.4a）
 
-T4.4aはLANアダプター、画像ジョブ、ベクトルの原子的保存、自動公開を実装する。E5/E6 HTTP・LRUはT4.4b、group/rankingはT4.5。追加Gemini送信はない。実装は `ai/{embedding,image_embedding}.rs`、共有HTTP・worker・indexと `imaging::prepare_embedding_rgb`。実LAN/実AI/実画像/実DB/SSH/鍵/cloud/本番サービスは使わず、合成DB・合成画像・loopbackで検証する。
+T4.4aはLANアダプター、画像ジョブ、ベクトルの原子的保存、自動公開を実装する。E5/E6 HTTP・LRUは[T4.4b実装](ai-search.md)、group/rankingはT4.5。追加Gemini送信はない。実装は `ai/{embedding,image_embedding}.rs`、共有HTTP・worker・indexと `imaging::prepare_embedding_rgb`。実LAN/実AI/実画像/実DB/SSH/鍵/cloud/本番サービスは使わず、合成DB・合成画像・loopbackで検証する。
 
 ## 固定契約と明示設定
 
@@ -75,7 +75,7 @@ let result = lan.http().run_interactive(&stop, move |session| {
 }).await;
 ```
 
-`query` は同期APIで、上のblocking境界の中だけで呼ぶ。`before_send` callbackは `Result<(), ProviderError>`。受信した `QueryVector` のidentityをactive indexと比較し、旧空間に流用しない。`ProviderError` のWait/PauseをT4.4b側の共有DB状態にも反映すること（この低レベルAPIは対話用DB/writerを所有しない）。`run_interactive` がBusyなら待たず503。LRUキー・64件・E5/E6 JSON・毎分30件・writer200msの対話予約・HTTPへの本接続はT4.4bの範囲で、本タスクはrouteを変更していない。
+`query` は同期APIで、上のblocking境界の中だけで呼ぶ。`before_send` callbackは `Result<(), ProviderError>`。受信した `QueryVector` のidentityをactive indexと比較し、旧空間に流用しない。`ProviderError` のWait/PauseをT4.4b側の共有DB状態にも反映すること（この低レベルAPIは対話用DB/writerを所有しない）。`run_interactive` がBusyなら待たず503。LRUキー・64件・E5/E6 JSON・毎分30件・writer200msの対話待ち・HTTPへの本接続は[T4.4b](ai-search.md)で実装した。Cloud queryは未対応のため予約も送信も行わない。
 
 ## スキーマ・dry-run・検証境界
 

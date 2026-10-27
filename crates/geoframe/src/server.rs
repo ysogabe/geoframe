@@ -57,6 +57,7 @@ const DISK_CACHE_TTL: Duration = Duration::from_secs(60);
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub ai_search: Arc<crate::ai::query::Runtime>,
     pub catalog: Catalog,
     /// データ置き場を**リンクを辿って解決した**絶対パス（起動時に1回。静的配信が、要求されたファイルを
     /// 解決した結果の内外判定に使う）。データ置き場自体がシンボリックリンクでもよい。
@@ -103,7 +104,14 @@ impl AppState {
         let tiles = Arc::new(TileProxy::production(&config, &data_root));
         let blog = Arc::new(BlogEnv::new(config.blog_plans_dir.as_deref(), &data_root));
         let geocoder = Arc::new(Geocoder::production(&config.tile_ua));
+        let ai_search = Arc::new(crate::ai::query::Runtime::new(
+            &config,
+            None,
+            StopFlag::new(),
+            None,
+        ));
         Self {
+            ai_search,
             config,
             catalog,
             data_root: Arc::new(data_root),
@@ -116,6 +124,11 @@ impl AppState {
             blog,
             mass_delete: None,
         }
+    }
+
+    pub fn with_ai_search(mut self, runtime: Arc<crate::ai::query::Runtime>) -> Self {
+        self.ai_search = runtime;
+        self
     }
 
     /// 大量削除の保留の記憶を付ける（取り込みが有効の `serve`。同期サイクルの段と同じもの）。
@@ -623,7 +636,7 @@ fn not_yet_implemented(label: &'static str) -> Response {
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
 ///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
-///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/blog/`（旅行ブログの読み取り。T3.5。完全一致の4つ以外は 404）は [`blog_response`]、`/api/ai/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
+///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/blog/`（旅行ブログの読み取り。T3.5。完全一致の4つ以外は 404）は [`blog_response`]、`/api/ai/status`・`/api/ai/search` は E5/E6、残る `/api/ai/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
 ///    ホワイトリストに当たらず 403 なので、下の静的配信の判定へ回す。
 /// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML。
 /// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
@@ -707,6 +720,33 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 ),
             };
         }
+        if path == "/api/ai/status" {
+            let config = Arc::clone(&state.config);
+            let response = match state
+                .catalog
+                .read(move |c| crate::ai::search_view::status(c, &config))
+                .await
+            {
+                Ok(value) => json_response(StatusCode::OK, value.to_string().into_bytes()),
+                Err(_) => ai_search_error(crate::ai::query::Error::Unavailable),
+            };
+            return labeled(response, "/api/ai/status");
+        }
+        if path == "/api/ai/search" {
+            let response = match state
+                .ai_search
+                .search(
+                    Arc::clone(&state.config),
+                    state.catalog.clone(),
+                    parts.uri.query(),
+                )
+                .await
+            {
+                Ok(value) => json_response(StatusCode::OK, value.to_string().into_bytes()),
+                Err(error) => ai_search_error(error),
+            };
+            return labeled(response, "/api/ai/search");
+        }
         if path.starts_with("/api/ai/") {
             return not_yet_implemented("/api/ai/{*path}");
         }
@@ -753,6 +793,26 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
         }
     };
     labeled(response, target.area.route())
+}
+
+fn ai_search_error(error: crate::ai::query::Error) -> Response {
+    use crate::ai::query::Error;
+    let (status, message) = match error {
+        Error::BadParams => (StatusCode::BAD_REQUEST, "bad_params"),
+        Error::Disabled => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI検索は無効化されています",
+        ),
+        Error::RateLimited => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "検索リクエストが多すぎます。しばらくしてから再試行してください",
+        ),
+        Error::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI検索サービスへ接続できません。しばらくして再試行してください",
+        ),
+    };
+    error_response(status, message)
 }
 
 pub fn router(state: AppState) -> Router {

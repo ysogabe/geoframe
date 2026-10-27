@@ -403,19 +403,31 @@ pub fn run_checked(
         .to_json()
         .map_err(|_| RunError::Permanent(ErrorCode::InputTooLarge))?;
     let gate = ctx.before_probe()?;
+    lan.check_shared(ctx.config(), ctx.task(), ctx.now())
+        .map_err(|e| e.into_run_error(false))?;
     let model = gate.settings.model.as_str();
     let session = lan
         .background(ctx.stop())
         .map_err(|e| e.into_run_error(false))?;
-    probe(&session, model).map_err(|e| e.into_run_error(false))?;
+    probe(&session, model)
+        .inspect_err(|error| lan.record_shared(ctx.config(), ctx.task(), *error, ctx.now()))
+        .map_err(|e| e.into_run_error(false))?;
     ctx.before_send()?;
+    lan.check_shared(ctx.config(), ctx.task(), ctx.now())
+        .map_err(|e| e.into_run_error(false))?;
     before_post()?;
     let deadline = Deadline::for_task(ctx.task());
-    match ask(&session, request, &deadline) {
+    match ask(&session, request, &deadline).inspect_err(|error| {
+        if !matches!(error, ProviderError::Transient(_)) {
+            lan.record_shared(ctx.config(), ctx.task(), *error, ctx.now());
+        }
+    }) {
         Ok(reply) => Ok(reply),
         Err(ProviderError::Transient(code)) => {
             // 確認は予約ではない。lease の開始などで落ちたのなら、ジョブの不良ではない
-            match probe(&session, model) {
+            match probe(&session, model)
+                .inspect_err(|error| lan.record_shared(ctx.config(), ctx.task(), *error, ctx.now()))
+            {
                 Ok(()) => Err(ProviderError::Transient(code).into_run_error(false)),
                 Err(other) => Err(other.into_run_error(false)),
             }

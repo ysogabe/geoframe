@@ -514,7 +514,7 @@ async fn only_the_three_reads_are_implemented() {
         ("///api/admin/photos?per=1", 200),
         ("//api/v1/photos", 200),
         ("//api/admin/geocode?q=x", 200),
-        ("//api/ai/status", 503),
+        ("//api/ai/status", 200),
         // 地図タイル（T3.4）。範囲外は上流へ行かずに 404（`//` は畳んだうえで `/tiles/` に当たる）
         ("//tiles/osm/1/2/0.png", 404),
     ] {

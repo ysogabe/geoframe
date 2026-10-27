@@ -140,6 +140,8 @@ impl Shared {
         if whole.remaining().is_none() {
             return Err(RunError::DependencyWait(ErrorCode::DecisionWait));
         }
+        lan.check_shared(ctx.config(), TaskKind::LocationClue, ctx.now())
+            .map_err(|_| RunError::DependencyWait(ErrorCode::DecisionWait))?;
         let session = lan
             .background(ctx.stop())
             .map_err(|_| RunError::DependencyWait(ErrorCode::DecisionWait))?;

@@ -295,7 +295,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 `site`（`GET`/`HEAD`）は、現行の`do_GET`/`do_HEAD`と同じ順に判定する。
 
-1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。`GET`の`/api/admin/geocode`（地名検索。T3.3、§18）も同じ前方一致。そのあと、`GET`/`HEAD`の`/tiles/`（地図タイル。T3.4、§19。他のどの判定よりも先に、生のパスで見る）は`tiles.rs`が答え、`GET`の`/api/blog/`（旅行ブログの読み取り。T3.5、§20。完全一致の4つ以外は`send_error(404)`と同じHTMLの404）は`blog.rs`が答え、`GET`の`/api/ai/`（P4）は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。`/api/admin/`の残り（`setloc`・`setflag`・`rotate`などの更新ルートへの`GET`、`/api/admin/`そのもの、大文字小文字やエンコードの違い）は、現行でも`do_GET`のどの分岐にも当たらず静的配信のホワイトリストで**403**になるので、T3.3で503をやめて静的配信の判定へ回した（`/api/admin/../static/…`のように`..`を含む形も現行は403で、`geocode-python.json`の`admin_gets`で突き合わせている）。P4に`/api/admin/`配下の`GET`は無い（AI検索は`/api/ai/`）。
+1. `GET`の`/api/admin/status`・`/api/admin/photos`は管理画面の読み取りAPI（T1.4、§10）。**生のパスの前方一致**で、現行と同じ。`GET`の`/api/admin/geocode`（地名検索。T3.3、§18）も同じ前方一致。そのあと、`GET`/`HEAD`の`/tiles/`（地図タイル。T3.4、§19。他のどの判定よりも先に、生のパスで見る）は`tiles.rs`が答え、`GET`の`/api/blog/`（旅行ブログの読み取り。T3.5、§20。完全一致の4つ以外は`send_error(404)`と同じHTMLの404）は`blog.rs`が答え、`GET`の`/api/ai/status`・`/api/ai/search`は[T4.4b](ai-search.md)で実装し（§23）、残る`GET`の`/api/ai/`は、**503**と定型のJSON `{"ok":false,"error":"この機能は Rust 版ではまだ使えません"}`（`Cache-Control: no-store`）。現行の「未知のAPI」の403とは区別して、「禁止」ではなく「まだ無い」と分かるようにした。実装するたびに該当のルートをここから外す。`/api/admin/`の残り（`setloc`・`setflag`・`rotate`などの更新ルートへの`GET`、`/api/admin/`そのもの、大文字小文字やエンコードの違い）は、現行でも`do_GET`のどの分岐にも当たらず静的配信のホワイトリストで**403**になるので、T3.3で503をやめて静的配信の判定へ回した（`/api/admin/../static/…`のように`..`を含む形も現行は403で、`geocode-python.json`の`admin_gets`で突き合わせている）。P4に`/api/admin/`配下の`GET`は無い（AI検索は`/api/ai/`）。
 2. 管理画面のページ（§9.5）。
 3. 静的ファイル（§9.3）。許可は`/favicon.ico`と5つの接頭辞だけで、**それ以外はすべて403**（404ではない。`/nope`・`/api/nope`・`/api/v1/photos/`も403）。
 
@@ -1976,7 +1976,7 @@ Pythonは、①同期サイクルが`display`をNULLにしたあとでも古い�
 
 ### 18.7 `/api/admin/`配下の`GET`の整理（T3.1の残り）
 
-T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のままにしていた。現行は`do_GET`に`status`・`photos`・`geocode`の3つ以外の`/api/admin/`の分岐が無く、静的配信のホワイトリストで**403**になる（`setloc`・`setflag`・`rotate`、`/api/admin/`、`/api/admin/Status`、`%73tatus`のようなエンコード、`..`を含む形を現行で確かめた）。T3.3で503の接頭辞（`/api/admin/`）を外し、同じ静的配信の判定に回した。**P4に`/api/admin/`配下の`GET`は無い**（AI検索は`/api/ai/`、旅行ブログは`/api/blog/`）ので、今後`/api/admin/`で503を返すルートは無い。`/api/blog/`の`GET`（E7〜E10）はT3.5で実装済み（§20。完全一致の4つ以外は404）。`/tiles/`はT3.4で実装した（§19）。503のままなのは`/api/ai/`の`GET`だけで、P4で実装する。
+T3.1は更新ルート（`setloc`・`setflag`）への`GET`をP1の503のままにしていた。現行は`do_GET`に`status`・`photos`・`geocode`の3つ以外の`/api/admin/`の分岐が無く、静的配信のホワイトリストで**403**になる（`setloc`・`setflag`・`rotate`、`/api/admin/`、`/api/admin/Status`、`%73tatus`のようなエンコード、`..`を含む形を現行で確かめた）。T3.3で503の接頭辞（`/api/admin/`）を外し、同じ静的配信の判定に回した。**P4に`/api/admin/`配下の`GET`は無い**（AI検索は`/api/ai/`、旅行ブログは`/api/blog/`）ので、今後`/api/admin/`で503を返すルートは無い。`/api/blog/`の`GET`（E7〜E10）はT3.5で実装済み（§20。完全一致の4つ以外は404）。`/tiles/`はT3.4で実装した（§19）。T4.4bで`/api/ai/status`・`/api/ai/search`を実装した（§23）。それ以外の`/api/ai/`のGETは定型503を維持する。
 
 ### 18.8 Pythonとの差（まとめ）
 
@@ -2276,3 +2276,7 @@ AIの背景ワーカー・Providerの停止・送信予算・ジョブの回収�
 - `tests/ingest_cli.rs`: 実バイナリでSIGTERM後に起動IDと停止開始が残る／`INGEST=0`はAIの回収・表の作成・Provider停止の整理を一切しない／`ai-jobs`のガード・稼働中拒否・出力に秘匿情報を含めない。
 - P4 / T4.3（空間別の検索索引と旧選別の安全化。[ai-index.md](ai-index.md)）: `ai/tests_index.rs`（識別の全項目照合・`space_id`の再利用拒否・ベクトルの検査・L2の安定・壊れた行・顔ぶれ・切替の条件・並行する切替の読み取り・検索の混在0）、`tests/legacy_selection.rs`（代表の削除・更新・回転・hidden化・位置なし・品質非表示後に残りが表示される・favorite・空間切替で旧選別が不変・管理画面の集計とフィードの一致・AI表なしの旧DB）、`tests/ai_index_python_rollback.rs`（Rustの追加表・ポインタがあるDBを現行Pythonに渡しても人手の列・旧の有償結果が不変）、`tests/ingest_cli.rs`（`ai-jobs status`の索引の件数・`deactivate-space`のガード・稼働中拒否）。
 
+
+## 23. AI検索・状態（P4 / T4.4b）
+
+E5/E6を[HTTP/query runtime](ai-search.md)へ接続した。既存GET/HEAD/Host/POST/CSRF/security headersと未知パス規約を維持する。E5はindex実数と有効世代の旧選別、E6は共有LAN・15秒・query LRU64・毎分制限・同一snapshotの写真JSONを返す。旧DBの空検索は保存結果だけで200、新activeが無い非空queryは503。Cloud query送信0、追加schema/dry-run増分0。Python fixture/並行更新/背景分離/性能の具体的な範囲と残受入は上記文書を参照。

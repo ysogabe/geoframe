@@ -437,13 +437,19 @@ fn serve(overrides: &Overrides) -> ExitCode {
             &ai_clock,
             worker::production_handlers(
                 &config,
-                lan,
+                lan.clone(),
                 cloud.as_ref(),
                 Arc::clone(&state.geocoder),
                 Arc::clone(&state.cache),
             ),
         )
     });
+    state = state.with_ai_search(Arc::new(crate::ai::query::Runtime::new(
+        &config,
+        lan,
+        stop.clone(),
+        ingest.as_ref().map(Ingest::lock_hold),
+    )));
     // Drive の状態。大量削除の保留の記憶は、管理画面（サーバーの状態）と `index_drive` で同じものを使う
     let drive = Arc::new(crate::drive::DriveShared::new());
     let mass_delete = drive.mass_delete_board();

@@ -32,9 +32,9 @@ use super::space::{self, SpaceIdentity, VectorError};
 /// 索引の 1 項目（`content_sha256` ごと）。値は `Debug` に出さない。
 #[derive(Clone)]
 pub struct IndexEntry {
-    photo_ids: Vec<i64>,
+    pub(super) photo_ids: Vec<i64>,
     input_sha256: String,
-    unit: Vec<f32>,
+    pub(super) unit: Vec<f32>,
 }
 
 impl fmt::Debug for IndexEntry {
@@ -64,7 +64,7 @@ impl IndexEntry {
 /// 読み込んだ有効な索引。
 pub struct ActiveIndex {
     identity: SpaceIdentity,
-    entries: Vec<IndexEntry>,
+    pub(super) entries: Vec<IndexEntry>,
 }
 
 impl fmt::Debug for ActiveIndex {
@@ -86,7 +86,7 @@ pub struct Loaded {
 #[derive(Clone)]
 pub struct QueryVector {
     identity: SpaceIdentity,
-    unit: Vec<f32>,
+    pub(super) unit: Vec<f32>,
 }
 
 impl fmt::Debug for QueryVector {

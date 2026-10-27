@@ -107,5 +107,5 @@
 
 - 画像／文Embeddingの実LAN/LXC検証（アダプターは[T4.4a](ai-embedding.md)で登録済み）。写真別clueはT4.6b、日候補・別座標化はT4.6c2で登録済み。Decision readyの失敗をCloud認証pauseに流用しない。
 - クラウド（Vertex）のアダプター・token読取・401の一度のrefresh・送信後の課金計数（T4.6）。このタスクでクラウドへの実送信はしていない。
-- 対話（検索語Embedding）の予約キャッシュとE5/E6への接続（T4.4b）。`AiHttp::run_interactive`は枠と境界だけ。
+- [T4.4b](ai-search.md)でE5/E6・LRU64・共有LAN対話枠・全体15秒を接続済み。Cloud queryは未対応で無送信503。実LANの並行性能は親の受入へ残す。
 - 実LAN・実Decision・実画像での確認はT4.7（LXC）。
