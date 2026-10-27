@@ -200,7 +200,7 @@ pub fn background_tasks(ai: &AiConfig, has_writer: bool) -> Vec<TaskKind> {
 
 /// ワーカーを起動するか（上の「起動の条件」）。
 pub fn should_start(config: &Config) -> bool {
-    config.ingest && config.ai.legacy().enabled && !background_tasks(&config.ai, true).is_empty()
+    super::groups::runtime::enabled(config)
 }
 
 // ---------------------------------------------------------------- 実行の文脈・エラー
@@ -411,6 +411,9 @@ impl std::fmt::Debug for Started {
 /// 起動の準備。**ロックを取ったあと**（[`crate::ingest::start`] のあと）に 1 回だけ呼ぶ。失敗したら
 /// ワーカーを起動しない（`None`）。件数だけをログに出す。
 pub fn startup(config: &Config, writer: &Writer, clock: &Clock) -> Option<Started> {
+    if !config.ingest || !config.ai.legacy().enabled {
+        return None;
+    }
     let run_id = match jobs::random_id() {
         Ok(id) => id,
         Err(_) => {
@@ -1002,6 +1005,7 @@ fn budget_wait(reservation: Reservation, cycle_secs: u32) -> (ErrorCode, u32) {
 
 /// 起動したワーカー（スレッド 2 本: 周期の処理と、停止開始の記録）。
 pub struct AiWorker {
+    local: Option<JoinHandle<()>>,
     thread: JoinHandle<()>,
     /// 停止開始を記録するスレッド（SIGTERM の直後に 1 回書いて終わる）。
     marker: JoinHandle<()>,
@@ -1036,6 +1040,41 @@ pub fn spawn(deps: WorkerDeps) -> AiWorker {
             })
             .expect("AI の停止記録のスレッドを起動できません")
     };
+    let local =
+        super::groups::runtime::Runtime::production(Arc::clone(&deps.config)).map(|runtime| {
+            let (config, writer, stop, lock, poll) = (
+                Arc::clone(&deps.config),
+                deps.writer.clone(),
+                deps.stop.clone(),
+                deps.lock.clone(),
+                deps.poll,
+            );
+            std::thread::Builder::new()
+                .name("ai-scenes".into())
+                .spawn(move || {
+                    let _lock = lock;
+                    loop {
+                        if stop.is_stopped() {
+                            break;
+                        }
+                        if catch_unwind(AssertUnwindSafe(|| {
+                            if let Ok(read) = crate::db::open_read_only(&config.db_path())
+                                && runtime.cycle(&read, &writer, &stop).is_err()
+                            {
+                                tracing::warn!("[ai] scene_cycle_failed");
+                            }
+                        }))
+                        .is_err()
+                        {
+                            tracing::warn!("[ai] scene_cycle_failed");
+                        }
+                        if stop.wait(poll) {
+                            break;
+                        }
+                    }
+                })
+                .expect("scene_worker_start_failed")
+        });
     let thread = std::thread::Builder::new()
         .name("ai-worker".into())
         .spawn(move || {
@@ -1055,6 +1094,7 @@ pub fn spawn(deps: WorkerDeps) -> AiWorker {
         })
         .expect("AI ワーカーのスレッドを起動できません");
     AiWorker {
+        local,
         thread,
         marker,
         run_id,
@@ -1077,6 +1117,9 @@ impl AiWorker {
         clock: &Clock,
     ) -> bool {
         let joined = join_within(self.thread, stop.phase_limit(join_cap));
+        let local_joined = self
+            .local
+            .is_none_or(|local| join_within(local, stop.phase_limit(join_cap)));
         // 停止開始の記録（共通期限つきの依頼なので、遅くとも期限で終わる）。プロセスの終了で書き損じない
         join_within(self.marker, stop.phase_limit(join_cap));
         if !joined {
@@ -1095,6 +1138,6 @@ impl AiWorker {
                 tracing::warn!("[ai] 実行中のジョブを戻せません（次の起動の回収に任せます）")
             }
         }
-        joined
+        joined && local_joined
     }
 }

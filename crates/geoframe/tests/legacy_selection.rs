@@ -197,7 +197,7 @@ fn favorites_and_the_other_existing_rules_are_unchanged() {
     let e = env(&scene());
     e.sql("UPDATE photos SET favorite=1 WHERE id=2");
     assert_eq!(e.feed(), [1, 2]); // favorite の免除
-    assert_eq!(e.suppressed(), 2); // 管理画面の集計は従来どおり favorite を含めて数える
+    assert_eq!(e.suppressed(), 1); // 現在のフィードで実際に抑止する写真だけ
     // 未判定・同一場面でないグループは推薦外でも出る
     for (status, same_scene) in [("pending", 1), ("error", 1), ("judged", 0)] {
         let mut sql = String::new();

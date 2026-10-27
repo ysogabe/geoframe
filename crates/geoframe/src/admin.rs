@@ -46,6 +46,7 @@ pub struct AdminContext {
     pub ai_config_invalid: Option<crate::ai::settings::AiConfigError>,
     /// 今の AI 設定の用途ごとの待ちの識別（`ai_waits` を用途に結び直す。ハッシュはメモリの中だけで、応答には出さない）。
     pub ai_waits: crate::ai::waits::Identities,
+    scene_config: Config,
 }
 
 impl AdminContext {
@@ -56,6 +57,7 @@ impl AdminContext {
             embed_model: config.embed_backend.model(),
             ai_config_invalid: config.ai.invalid(),
             ai_waits: crate::ai::waits::Identities::from_config(&config.ai),
+            scene_config: config.clone(),
         }
     }
 }
@@ -102,6 +104,7 @@ fn count_photos(conn: &Connection, condition: &str) -> rusqlite::Result<i64> {
 
 /// `GET /api/admin/status` の `ok`・`sync`・`db`（`disk`・`server_time` は呼び出し側が足す）。
 pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<String, Value>> {
+    let scenes = crate::ai::groups::runtime::Prepared::read(conn, &ctx.scene_config);
     // 読み取りトランザクション1つ（drop で ROLLBACK）。途中の書き込みを見せず、件数をそろえる
     let _snapshot = conn.unchecked_transaction()?;
 
@@ -145,6 +148,13 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
         &ctx.ai_waits,
         crate::ai::jobs::unix_now(),
     );
+    if crate::ai::groups::pending(conn).is_ok_and(|p| p.is_empty()) {
+        let loaded = scenes.and_then(|p| p.load_in(conn));
+        out.insert(
+            "ai_scenes".into(),
+            crate::ai::groups::runtime::summary(loaded.as_ref()),
+        );
+    }
     Ok(out)
 }
 
@@ -671,6 +681,8 @@ pub struct AdminPhoto {
     hint: Option<Option<Hint>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggest: Option<Suggest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scene: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -825,7 +837,17 @@ pub fn photos(
     per: i64,
     filter: Filter,
 ) -> rusqlite::Result<PhotosPage> {
+    let prepared = crate::ai::groups::runtime::Prepared::read(conn, &ctx.scene_config);
     let _snapshot = conn.unchecked_transaction()?;
+    let scenes = prepared.and_then(|p| p.load_in(conn));
+    let mut local = HashMap::new();
+    if let Ok(scenes) = &scenes {
+        for group in scenes.groups() {
+            for m in group.members() {
+                local.insert(m.photo_id,json!({"state":group.state().as_str(),"overlap":group.overlap().as_str(),"rank":m.rank,"score":m.score,"representative":m.representative,"shortlisted":m.shortlisted}));
+            }
+        }
+    }
     let condition = filter.condition();
     let per = per.clamp(1, PER_PAGE_MAX);
     let total = count_photos(conn, condition)?;
@@ -881,6 +903,7 @@ pub fn photos(
             source: cell(row.get_ref(15)?)?,
             hint: None,
             suggest: None,
+            scene: local.remove(&id),
         });
     }
     drop(rows);

@@ -916,6 +916,7 @@ pub struct AiConfig {
     legacy: LegacyAi,
     state: AiState,
     visual_similarity: Option<f64>,
+    scene_options: super::groups::Options,
 }
 
 impl fmt::Debug for AiConfig {
@@ -930,6 +931,7 @@ impl Default for AiConfig {
             legacy: LegacyAi::default(),
             state: AiState::Unset,
             visual_similarity: None,
+            scene_options: super::groups::Options::default(),
         }
     }
 }
@@ -941,9 +943,41 @@ impl AiConfig {
     pub fn load(get: &dyn Fn(&str) -> Option<String>) -> Self {
         let Some(legacy) = LegacyAi::from_env(get) else {
             return Self {
-                legacy: LegacyAi::default(),
+                legacy: LegacyAi {
+                    enabled: get("GEOFRAME_AI_ENABLED").is_none_or(|s| s.trim() == "1"),
+                    ..LegacyAi::default()
+                },
                 state: AiState::Invalid(AiConfigError::LegacyEnv),
                 visual_similarity: None,
+                scene_options: super::groups::Options::default(),
+            };
+        };
+        // Python uses backend-specific defaults; fractional seconds have the same integer-time
+        // comparisons after floor. Invalid scene settings disable AI, never photo serving.
+        let scene_options = (|| {
+            let number = |key: &str, default: f64| match get(key) {
+                None => Some(default),
+                Some(raw) => crate::pyquery::py_float(&raw).filter(|v| v.is_finite()),
+            };
+            let seconds = number("GEOFRAME_AI_TIME_WINDOW_MIN", 15.0)? * 60.0;
+            if !(1.0..=86400.0).contains(&seconds) {
+                return None;
+            }
+            let local = get("GEOFRAME_EMBED_BACKEND")
+                .is_some_and(|s| s.trim().eq_ignore_ascii_case("local"));
+            let similarity = number("GEOFRAME_AI_SIMILARITY", if local { 0.83 } else { 0.82 })?;
+            let shortlist = match get("GEOFRAME_AI_SHORTLIST_MAX") {
+                None => 6,
+                Some(raw) => crate::pyquery::py_int(&raw)?.clamp(2, 6) as usize,
+            };
+            super::groups::Options::new(seconds.floor() as i64, similarity, shortlist).ok()
+        })();
+        let Some(scene_options) = scene_options else {
+            return Self {
+                legacy,
+                state: AiState::Invalid(AiConfigError::LegacyEnv),
+                visual_similarity: None,
+                scene_options: super::groups::Options::default(),
             };
         };
         let visual_similarity = match get("GEOFRAME_AI_VISUAL_SIMILARITY") {
@@ -956,6 +990,7 @@ impl AiConfig {
                         legacy,
                         state: AiState::Invalid(AiConfigError::LegacyEnv),
                         visual_similarity: None,
+                        scene_options: super::groups::Options::default(),
                     };
                 };
                 Some(value)
@@ -975,12 +1010,17 @@ impl AiConfig {
             legacy,
             state,
             visual_similarity,
+            scene_options,
         }
     }
 
     /// 構図比較の検証済み閾値。未指定・不正なら呼び出し側の安全な既定値を使う。
     pub(crate) fn visual_similarity(&self) -> Option<f64> {
         self.visual_similarity
+    }
+
+    pub fn scene_options(&self) -> super::groups::Options {
+        self.scene_options
     }
 
     pub fn legacy(&self) -> &LegacyAi {

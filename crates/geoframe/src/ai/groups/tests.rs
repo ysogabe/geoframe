@@ -1065,7 +1065,7 @@ fn synthetic_6500x768_compute_releases_writer_and_measures_save() {
         time::Instant,
     };
     let dir = TempDir::new("scene-6500");
-    let path = dir.path().join("synthetic.db");
+    let path = dir.path().join("catalog.db");
     let mut c = Connection::open(&path).unwrap();
     c.pragma_update(None, "journal_mode", "WAL").unwrap();
     schema::migrate(&mut c).unwrap();
@@ -1139,7 +1139,29 @@ fn synthetic_6500x768_compute_releases_writer_and_measures_save() {
     assert_eq!(p.groups[0].members.len(), 6500);
     let after_compute = rss();
     let start = Instant::now();
-    let result = save(&mut c, &p, 0, &|| false).unwrap();
+    let config = Arc::new(
+        crate::config::Config::load(
+            |k| match k {
+                "GEOFRAME_INGEST" => Some("1".into()),
+                "GEOFRAME_EMBED_BACKEND" => Some("local".into()),
+                _ => None,
+            },
+            &crate::config::Overrides {
+                data_dir: Some(dir.path().into()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let runtime = runtime::Runtime::production(config).unwrap();
+    let report = runtime
+        .cycle_report(&c, &writer, &crate::stop::StopFlag::new())
+        .unwrap();
+    assert_eq!(
+        (report.stored, report.selected, report.members),
+        (1, 1, 6500)
+    );
+    let result = Saved::Stored;
     let save_time = start.elapsed();
     assert_eq!(result, Saved::Stored);
     assert_eq!(
@@ -1150,7 +1172,7 @@ fn synthetic_6500x768_compute_releases_writer_and_measures_save() {
         1
     );
     eprintln!(
-        "scene synthetic 6500x768 all-same-time: snapshot={snapshot_time:?}, compute={compute_time:?}, writer/save={save_time:?}; RSS before={before}, snapshot={after_snapshot}, compute={after_compute}, after-save/read={}",
+        "scene synthetic 6500x768 all-same-time: snapshot={snapshot_time:?}, compute={compute_time:?}, periodic-total={save_time:?}, report={report:?}; RSS before={before}, snapshot={after_snapshot}, compute={after_compute}, after-save/read={}",
         rss()
     );
 }
@@ -1325,4 +1347,561 @@ fn vector_and_failed_retry_changes_after_plan_refuse_atomic_publication() {
         .unwrap();
     assert_eq!(save(&mut c, &p, 0, &|| false).unwrap(), Saved::Stale);
     assert!(rows(&c, "ai_scene_groups").is_empty());
+}
+
+// T4.5b production-local runtime fixtures. Only synthetic SQLite, rank JSON and vectors.
+struct LocalEnv {
+    _dir: TempDir,
+    config: Arc<crate::config::Config>,
+    ingest: crate::ingest::Ingest,
+    conn: Connection,
+}
+impl LocalEnv {
+    fn new(vars: &[(&str, &str)]) -> Self {
+        let dir = TempDir::new("scene-runtime");
+        let mut env = std::collections::HashMap::from([
+            ("GEOFRAME_INGEST".to_string(), "1".to_string()),
+            ("GEOFRAME_EMBED_BACKEND".to_string(), "local".to_string()),
+        ]);
+        for (k, v) in vars {
+            env.insert(k.to_string(), v.to_string());
+        }
+        let config = Arc::new(
+            crate::config::Config::load(
+                |k| env.get(k).cloned(),
+                &crate::config::Overrides {
+                    data_dir: Some(dir.path().join("data")),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let ingest = crate::ingest::start_with(&config, &crate::guard::Guard::skip()).unwrap();
+        let mut conn = Connection::open(config.db_path()).unwrap();
+        activate(&mut conn, &identity(2));
+        Self {
+            _dir: dir,
+            config,
+            ingest,
+            conn,
+        }
+    }
+    fn cycle(&self) -> usize {
+        runtime::Runtime::production(self.config.clone())
+            .unwrap()
+            .cycle(
+                &self.conn,
+                &self.ingest.writer,
+                &crate::stop::StopFlag::new(),
+            )
+            .unwrap()
+    }
+    fn view(&self) -> Json {
+        crate::ai::search_view::search(
+            &self.conn,
+            &self.config,
+            "",
+            30,
+            false,
+            None,
+            &crate::ai::http::Deadline::interactive(),
+        )
+        .unwrap()
+        .unwrap()
+    }
+    fn status(&self) -> Json {
+        crate::ai::search_view::status(&self.conn, &self.config).unwrap()
+    }
+    fn feed(&self) -> Vec<i64> {
+        crate::photos::list_photos(&self.conn)
+            .unwrap()
+            .iter()
+            .map(|p| p.id)
+            .collect()
+    }
+    fn loaded(&self) -> Loaded {
+        let prepared = runtime::Prepared::read(&self.conn, &self.config).unwrap();
+        let tx = self.conn.unchecked_transaction().unwrap();
+        let result = prepared.load_in(&tx).unwrap();
+        tx.commit().unwrap();
+        result
+    }
+}
+
+#[test]
+fn local_factory_migrates_cycles_projects_and_restart_never_resaves_identical_results() {
+    let mut e = LocalEnv::new(&[]);
+    assert!(pending(&e.conn).unwrap().is_empty());
+    assert_eq!(
+        e.ingest
+            .migration
+            .created
+            .iter()
+            .filter(|s| s.starts_with("ai_scene_"))
+            .count(),
+        3
+    );
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    assert_eq!(e.cycle(), 1);
+    let before = rows(&e.conn, "ai_scene_groups");
+    assert_eq!(e.cycle(), 0);
+    assert_eq!(
+        runtime::Runtime::production(e.config.clone())
+            .unwrap()
+            .cycle(&e.conn, &e.ingest.writer, &crate::stop::StopFlag::new())
+            .unwrap(),
+        0
+    );
+    assert_eq!(rows(&e.conn, "ai_scene_groups"), before);
+    let status = e.status();
+    assert_eq!(status["pipeline"]["scenes"]["local_ranked"], 1);
+    assert_eq!(status["judged"], 0);
+    let view = e.view();
+    assert_eq!(view["mode"], "recommended");
+    assert_eq!(view["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(view["groups"][0]["kind"], "scene");
+    assert_eq!(view["groups"][0]["photos"].as_array().unwrap().len(), 2);
+    assert_eq!(view["groups"][0]["photos"][0]["local_representative"], true);
+    assert!(view["groups"][0]["photos"][0]["recommended"].is_null());
+    assert_eq!(e.feed().len(), 2); // LocalRanked grants no suppression.
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    let admin = crate::admin::status(&e.conn, &ctx).unwrap();
+    assert_eq!(admin["ai_scenes"]["local_ranked"], 1);
+}
+
+#[test]
+fn local_periodic_pending_running_deferred_failed_and_retry_have_one_view() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    photo(&e.conn, 2, 100, 2);
+    for state in ["pending", "running", "deferred"] {
+        let key = index::scan(&e.conn, Some(&identity(2)), false)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.input_sha256() == format!("{:064x}", 2))
+            .unwrap()
+            .job_key(&identity(2));
+        jobs::enqueue(&mut e.conn, &key, 0).unwrap();
+        e.conn
+            .execute("UPDATE ai_jobs SET state=?1", [state])
+            .unwrap();
+        e.cycle();
+        assert_eq!(e.loaded().groups()[0].state(), State::Waiting);
+        assert_eq!(e.status()["pipeline"]["scenes"]["waiting"], 1);
+        assert!(
+            e.view()["groups"][0]["photos"][0]
+                .get("local_rank")
+                .is_none()
+        );
+        assert_eq!(e.feed().len(), 2);
+    }
+    fail(&mut e.conn, 2);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(e.loaded().groups()[0].state(), State::LocalRanked);
+    vector(&mut e.conn, 2, &[1., 0.]);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(e.loaded().groups()[0].members().len(), 2);
+    assert_eq!(e.feed().len(), 2);
+}
+
+#[test]
+fn local_partial_exact_disjoint_and_favorite_keep_paid_selection_unchanged() {
+    let mut e = LocalEnv::new(&[]);
+    for id in 1..=3 {
+        ready(&mut e.conn, id, id * 10);
+    }
+    legacy(&e.conn, &[1, 2]);
+    let old = rows(&e.conn, "photo_ai_group_members");
+    let before = e.feed();
+    assert_eq!(before, vec![1, 3]);
+    e.cycle();
+    assert_eq!(e.loaded().groups()[0].state(), State::ReviewOverlap);
+    assert_eq!(e.feed(), before);
+    e.conn
+        .execute("UPDATE photos SET favorite=1 WHERE id=2", [])
+        .unwrap();
+    e.cycle();
+    assert_eq!(e.feed(), vec![1, 2, 3]);
+    assert_eq!(
+        crate::selection::admin_counts(&e.conn).unwrap().suppressed,
+        0
+    );
+    e.conn
+        .execute(
+            "UPDATE photos SET taken_at='2026-01-01 01:00:00' WHERE id=3",
+            [],
+        )
+        .unwrap();
+    e.cycle();
+    let loaded = e.loaded();
+    assert!(
+        loaded
+            .groups()
+            .iter()
+            .any(|g| g.overlap() == Overlap::Exact)
+    );
+    assert!(
+        loaded
+            .groups()
+            .iter()
+            .any(|g| g.overlap() == Overlap::Disjoint)
+    );
+    assert_eq!(rows(&e.conn, "photo_ai_group_members"), old);
+    assert_eq!(e.feed(), vec![1, 2, 3]);
+}
+
+#[test]
+fn local_cycle_rep_invalidation_and_space_switch_preserve_old_selection_boundary() {
+    for change in [
+        "UPDATE photos SET hidden=1 WHERE id=1",
+        "UPDATE photos SET lat=NULL WHERE id=1",
+        "UPDATE photos SET mtime=2 WHERE id=1",
+        "DELETE FROM photos WHERE id=1",
+        "INSERT INTO photo_quality(photo_id,display,source_md5,source_mtime,content_sha256,group_id,group_kind,rank_in_group,recommended,score,algorithm,analyzed_at) VALUES(1,'synthetic-1','m',1,'synthetic',1,'exact',1,0,50,'synthetic','synthetic')",
+    ] {
+        let mut e = LocalEnv::new(&[]);
+        ready(&mut e.conn, 1, 0);
+        ready(&mut e.conn, 2, 100);
+        legacy(&e.conn, &[1, 2]);
+        e.cycle();
+        let old = e.feed();
+        assert_eq!(old, vec![1]);
+        let other = SpaceIdentity::new(
+            "scene-b",
+            "shared-b",
+            "model-b",
+            "rev-b",
+            "img-b",
+            "txt-b",
+            2,
+            Normalization::Raw,
+        )
+        .unwrap();
+        activate(&mut e.conn, &other);
+        assert_eq!(e.feed(), old);
+        assert!(e.loaded().groups().is_empty());
+        e.conn.execute_batch(change).unwrap();
+        assert!(e.feed().contains(&2));
+    }
+}
+
+#[test]
+fn local_batch_cas_checks_each_group_input_pointer_and_other_space_and_rolls_back_stop() {
+    let mut c = pair();
+    ready(&mut c, 3, 7200);
+    let p = plan(&c);
+    c.execute("UPDATE photos SET favorite=1 WHERE id=1", [])
+        .unwrap();
+    assert_eq!(
+        save_batch(&mut c, &p, &[0, 1], &|| false).unwrap(),
+        vec![Saved::Stale, Saved::Stored]
+    );
+    let fresh = plan(&c);
+    let n = std::cell::Cell::new(0);
+    let before = rows(&c, "ai_scene_groups");
+    assert!(
+        save_batch(&mut c, &fresh, &[0, 1], &|| {
+            n.set(n.get() + 1);
+            n.get() > 3
+        })
+        .unwrap()
+        .iter()
+        .all(|s| *s == Saved::Interrupted)
+    );
+    assert_eq!(rows(&c, "ai_scene_groups"), before);
+    assert_eq!(
+        save_batch(&mut c, &fresh, &[0; 17], &|| false),
+        Err(Error::InvalidOptions)
+    );
+}
+
+#[test]
+fn local_repair_skip_check_does_not_trust_ids_or_broken_members() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    e.cycle();
+    for corrupt in [
+        "UPDATE ai_scene_groups SET lo=hi+1",
+        "UPDATE ai_scene_members SET score=999 WHERE rank=1",
+        "UPDATE ai_scene_groups SET shortlist='broken'",
+        "DELETE FROM ai_scene_members WHERE rank=2",
+        "INSERT INTO ai_scene_active VALUES(999,(SELECT result_id FROM ai_scene_groups LIMIT 1))",
+    ] {
+        e.conn.execute_batch(corrupt).unwrap();
+        let view = e.view();
+        assert_eq!(view["mode"], "recommended"); // Corruption never stops serving.
+        assert!(view["groups"][0]["photos"][0].get("local_rank").is_none());
+        assert_eq!(e.cycle(), 1);
+        assert_eq!(e.loaded().groups().len(), 1);
+        assert_eq!(e.cycle(), 0);
+    }
+}
+
+#[test]
+fn local_model_configuration_changes_invalidate_projection_before_recompute() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    e.conn
+        .execute(
+            "UPDATE photo_quality_features SET sharpness=20 WHERE photo_id=2",
+            [],
+        )
+        .unwrap();
+    e.cycle();
+    let original = e.loaded().groups()[0].processor_version().to_string();
+    std::fs::create_dir_all(e.config.data_dir.join("models")).unwrap();
+    let model = rank_json(&identity(2));
+    std::fs::write(&e.config.rank_model_path, model.to_string()).unwrap();
+    assert!(e.loaded().groups().is_empty());
+    assert_eq!(e.cycle(), 1);
+    assert_ne!(e.loaded().groups()[0].processor_version(), original);
+    assert_eq!(e.loaded().groups()[0].members()[0].photo_id, 1);
+    std::fs::write(&e.config.rank_model_path, b"invalid synthetic weight").unwrap();
+    assert!(e.loaded().groups().is_empty());
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(e.loaded().groups()[0].processor_version(), original);
+    assert!(matches!(
+        e.loaded().groups()[0].rank_used(),
+        RankUsed::Rules(Some(rank::Reason::Invalid))
+    ));
+    let changed = Arc::new(
+        crate::config::Config::load(
+            |k| match k {
+                "GEOFRAME_INGEST" => Some("1".into()),
+                "GEOFRAME_AI_TIME_WINDOW_MIN" => Some("1".into()),
+                "GEOFRAME_EMBED_BACKEND" => Some("local".into()),
+                _ => None,
+            },
+            &crate::config::Overrides {
+                data_dir: Some(e.config.data_dir.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    e.config = changed;
+    assert!(e.loaded().groups().is_empty());
+    assert_eq!(e.cycle(), 2);
+    assert_eq!(e.loaded().groups().len(), 2);
+}
+
+#[test]
+fn local_many_small_components_are_bounded_and_progress_without_rescanning_on_writer_per_group() {
+    let mut e = LocalEnv::new(&[]);
+    for id in 1..=40 {
+        ready(&mut e.conn, id, id * 1800);
+    }
+    assert_eq!(e.cycle(), runtime::GROUPS_PER_CYCLE);
+    assert_eq!(e.loaded().groups().len(), 16);
+    assert_eq!(e.cycle(), 16);
+    assert_eq!(e.cycle(), 8);
+    assert_eq!(e.cycle(), 0);
+    assert_eq!(e.loaded().groups().len(), 40);
+    let p = compute(
+        &snapshot(&e.conn).unwrap().unwrap(),
+        e.config.ai.scene_options(),
+        Err(rank::Reason::Unreadable),
+        &|| false,
+    )
+    .unwrap();
+    assert!(pending_saves(&e.conn, &p, 16).unwrap().is_empty());
+}
+
+#[test]
+fn local_disabled_invalid_and_old_db_read_paths_create_no_scene_tables() {
+    for vars in [
+        vec![("GEOFRAME_AI_ENABLED", "0")],
+        vec![("GEOFRAME_AI_SIMILARITY", "NaN")],
+        vec![("GEOFRAME_AI_TIME_WINDOW_MIN", "private-invalid")],
+    ] {
+        let e = LocalEnv::new(&vars);
+        assert!(runtime::Runtime::production(e.config.clone()).is_none());
+        assert_eq!(pending(&e.conn).unwrap().len(), 3);
+        assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 0);
+        assert_eq!(pending(&e.conn).unwrap().len(), 3);
+        assert_eq!(rows(&e.conn, "photo_ai_groups").len(), 0);
+    }
+    let dir = TempDir::new("scene-readonly");
+    let config = crate::config::Config::load(
+        |_| None,
+        &crate::config::Overrides {
+            data_dir: Some(dir.path().into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let mut c = Connection::open_in_memory().unwrap();
+    schema::migrate(&mut c).unwrap();
+    let before = rows(&c, "sqlite_master");
+    assert!(!runtime::enabled(&config));
+    let view = crate::ai::search_view::status(&c, &config).unwrap();
+    assert_eq!(view["photos"], 0);
+    assert_eq!(rows(&c, "sqlite_master"), before);
+}
+
+#[test]
+fn local_writer_wait_is_bounded_and_expired_or_stopped_work_never_saves_later() {
+    use std::{
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    let (entered, rx) = mpsc::channel();
+    let (release, wait) = mpsc::channel();
+    let writer = e.ingest.writer.clone();
+    let held = std::thread::spawn(move || {
+        writer
+            .call(move |_| {
+                entered.send(()).unwrap();
+                wait.recv().unwrap();
+                Ok(())
+            })
+            .unwrap()
+    });
+    rx.recv_timeout(Duration::from_secs(1)).unwrap();
+    let start = Instant::now();
+    assert_eq!(
+        runtime::Runtime::production(e.config.clone())
+            .unwrap()
+            .cycle_report_until(
+                &e.conn,
+                &e.ingest.writer,
+                &crate::stop::StopFlag::new(),
+                Instant::now() + Duration::from_millis(100)
+            )
+            .map(|r| r.stored),
+        Err(Error::Database)
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    release.send(()).unwrap();
+    held.join().unwrap();
+    e.ingest.writer.call(|_| Ok(())).unwrap();
+    assert!(rows(&e.conn, "ai_scene_groups").is_empty());
+    let stop = crate::stop::StopFlag::new();
+    stop.stop();
+    assert_eq!(
+        runtime::Runtime::production(e.config.clone())
+            .unwrap()
+            .cycle(&e.conn, &e.ingest.writer, &stop)
+            .unwrap(),
+        0
+    );
+    assert!(rows(&e.conn, "ai_scene_groups").is_empty());
+}
+
+#[test]
+fn portable_fixture_starts_without_scene_tables_migrates_and_runs_validated_weight() {
+    let dir = TempDir::new("scene-portable");
+    let destination = dir.path().join("fixture");
+    let output = std::process::Command::new("python3")
+        .args([
+            concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tools/gen_scene_runtime_fixture.py"
+            ),
+            "--output",
+        ])
+        .arg(&destination)
+        .args(["--photos", "2", "--weight"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "synthetic runtime fixture failed");
+    let config = Arc::new(
+        crate::config::Config::load(
+            |k| match k {
+                "GEOFRAME_INGEST" => Some("1".into()),
+                "GEOFRAME_EMBED_BACKEND" => Some("local".into()),
+                _ => None,
+            },
+            &crate::config::Overrides {
+                data_dir: Some(destination),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let conn = crate::db::open_read_only(&config.db_path()).unwrap();
+    assert_eq!(pending(&conn).unwrap().len(), 3);
+    assert_eq!(
+        crate::ingest::plan(&config, &conn)
+            .unwrap()
+            .schema
+            .missing_objects
+            .len(),
+        10
+    );
+    let old = rows(&conn, "photos");
+    let ingest = crate::ingest::start_with(&config, &crate::guard::Guard::skip()).unwrap();
+    assert_eq!(ingest.migration.created.len(), 10);
+    assert_eq!(
+        runtime::Runtime::production(config.clone())
+            .unwrap()
+            .cycle(&conn, &ingest.writer, &crate::stop::StopFlag::new())
+            .unwrap(),
+        1
+    );
+    let status = crate::ai::search_view::status(&conn, &config).unwrap();
+    assert_eq!(status["pipeline"]["scenes"]["linear"], 1);
+    assert_eq!(rows(&conn, "photos"), old);
+}
+
+#[test]
+fn local_batch_old_expected_active_cannot_replace_new_processor_even_with_same_members() {
+    let mut c = pair();
+    let old = plan(&c);
+    let new = compute(
+        &snapshot(&c).unwrap().unwrap(),
+        Options::new(900, 0.8, 6).unwrap(),
+        Err(rank::Reason::Unconfigured),
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(
+        save_batch(&mut c, &new, &[0], &|| false).unwrap(),
+        vec![Saved::Stored]
+    );
+    assert_eq!(
+        save_batch(&mut c, &old, &[0], &|| false).unwrap(),
+        vec![Saved::Stale]
+    );
+    assert_eq!(
+        load_current(&c, new.groups()[0].processor_version())
+            .unwrap()
+            .groups()
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn local_verified_weight_component_fallback_is_usable_but_a_changed_weight_must_be_replanned() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    e.conn
+        .execute("UPDATE photo_quality_features SET luminance=NULL", [])
+        .unwrap();
+    std::fs::create_dir_all(e.config.data_dir.join("models")).unwrap();
+    let mut model = rank_json(&identity(2));
+    model["base_features"] = json!(["luminance"]);
+    std::fs::write(&e.config.rank_model_path, model.to_string()).unwrap();
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(e.loaded().groups().len(), 1);
+    assert_eq!(
+        e.loaded().groups()[0].rank_used(),
+        RankUsed::Rules(Some(rank::Reason::MissingFeature))
+    );
+    assert_eq!(
+        e.view()["groups"][0]["photos"][0]["local_representative"],
+        true
+    );
+    model["base_features"] = json!(["sharpness"]);
+    std::fs::write(&e.config.rank_model_path, model.to_string()).unwrap();
+    assert!(e.loaded().groups().is_empty());
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(e.loaded().groups()[0].rank_used(), RankUsed::Linear);
 }

@@ -27,7 +27,10 @@ use crate::writer::{OpenMode, WriteError, Writer};
 /// 2026-10-26T00:00:00Z（UTC 日の始まり）。
 const D0: i64 = 1_792_972_800;
 const DAY: i64 = 86_400;
-const AI_TABLES: [&str; 14] = [
+const AI_TABLES: [&str; 17] = [
+    "ai_scene_groups",
+    "ai_scene_members",
+    "ai_scene_active",
     "ai_jobs",
     "ai_image_embedding_lineage",
     "idx_ai_jobs_runnable",
@@ -102,7 +105,7 @@ fn master_without_ai(conn: &Connection) -> Vec<String> {
     let mut stmt = conn
         .prepare(
             "SELECT type||':'||name||':'||COALESCE(sql,'') FROM sqlite_master
-             WHERE name NOT LIKE '%ai_jobs%' AND name NOT LIKE '%ai_image_embedding_lineage%' AND name NOT LIKE '%ai_request_usage%'
+             WHERE name NOT LIKE '%ai_scene_%' AND name NOT LIKE '%ai_jobs%' AND name NOT LIKE '%ai_image_embedding_lineage%' AND name NOT LIKE '%ai_request_usage%'
                AND name NOT LIKE '%ai_provider_pauses%' AND name NOT LIKE '%ai_provider_waits%'
                AND name NOT LIKE '%ai_worker_runs%' AND name NOT LIKE '%ai_embedding_%'
                AND name NOT LIKE '%ai_embedding_vectors%' AND name NOT LIKE '%ai_location_clues%' AND name NOT LIKE '%ai_location_suggest_results%' AND name NOT LIKE '%ai_location_candidates%' AND name NOT LIKE '%ai_location_suggest_holds%' ORDER BY rowid",
@@ -220,6 +223,9 @@ fn a_t4_1a_database_gets_only_the_new_tables_and_keeps_its_jobs() {
             "ai_provider_pauses",
             "ai_provider_waits",
             "ai_request_usage",
+            "ai_scene_active",
+            "ai_scene_groups",
+            "ai_scene_members",
             "ai_worker_runs",
             "idx_ai_embedding_vectors_sha"
         ]
@@ -236,6 +242,9 @@ fn a_t4_1a_database_gets_only_the_new_tables_and_keeps_its_jobs() {
             "ai_provider_pauses",
             "ai_provider_waits",
             "ai_request_usage",
+            "ai_scene_active",
+            "ai_scene_groups",
+            "ai_scene_members",
             "ai_worker_runs",
             "idx_ai_embedding_vectors_sha"
         ]

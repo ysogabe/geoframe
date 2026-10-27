@@ -921,3 +921,48 @@ fn debug_output_never_contains_urls_paths_or_model_names() {
     }
     assert!(!text.contains(dir.path().to_str().unwrap()), "{text}");
 }
+
+#[test]
+fn scene_options_follow_python_backend_window_shortlist_and_invalid_values_disable_only_ai() {
+    use crate::ai::groups::Options;
+    let s =
+        crate::ai::space::SpaceIdentity::new("s", "p", "m", "r", "i", "t", 2, Normalization::Raw)
+            .unwrap();
+    for (env, expected) in [
+        (vec![], Options::new(900, 0.82, 6).unwrap()),
+        (
+            vec![("GEOFRAME_EMBED_BACKEND", "local")],
+            Options::default(),
+        ),
+        (
+            vec![
+                ("GEOFRAME_AI_TIME_WINDOW_MIN", "1.25"),
+                ("GEOFRAME_AI_SIMILARITY", "0.7"),
+                ("GEOFRAME_AI_SHORTLIST_MAX", "99"),
+            ],
+            Options::new(75, 0.7, 6).unwrap(),
+        ),
+        (
+            vec![("GEOFRAME_AI_SHORTLIST_MAX", "-4")],
+            Options::new(900, 0.82, 2).unwrap(),
+        ),
+    ] {
+        let ai = env_config(&env);
+        assert_eq!(
+            ai.scene_options().processor_version(&s, None),
+            expected.processor_version(&s, None)
+        );
+    }
+    for (key, bad) in [
+        ("GEOFRAME_AI_SIMILARITY", "NaN"),
+        ("GEOFRAME_AI_SIMILARITY", "1.1"),
+        ("GEOFRAME_AI_TIME_WINDOW_MIN", "0"),
+        ("GEOFRAME_AI_TIME_WINDOW_MIN", "Infinity"),
+        ("GEOFRAME_AI_SHORTLIST_MAX", "synthetic-invalid"),
+    ] {
+        let ai = env_config(&[(key, bad), ("GEOFRAME_AI_ENABLED", "0")]);
+        assert_eq!(ai.invalid(), Some(AiConfigError::LegacyEnv));
+        assert!(!ai.legacy().enabled);
+        assert!(!format!("{ai:?}").contains(bad));
+    }
+}

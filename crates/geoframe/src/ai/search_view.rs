@@ -84,10 +84,35 @@ pub fn search(
     if whole.remaining().is_none() {
         return Ok(Err(Error::Unavailable));
     }
+    let prepared = super::groups::runtime::Prepared::read(conn, config);
     let tx = conn.unchecked_transaction()?;
+    let scenes = prepared.and_then(|p| p.load_in(&tx));
     let loaded = super::search::load_in(&tx)?;
     if vector.is_some_and(|v| loaded.index.as_ref().map(|i| i.identity()) != Some(v.identity())) {
         return Ok(Err(Error::Unavailable));
+    }
+    let mut local = HashMap::new();
+    let mut scene_meta = HashMap::new();
+    if let Ok(scenes) = &scenes {
+        for g in scenes.groups() {
+            if g.state() == super::groups::State::Waiting {
+                continue;
+            }
+            let state = if g.state() == super::groups::State::LocalRanked {
+                "local_ranked"
+            } else {
+                "review_overlap"
+            };
+            let overlap = match g.overlap() {
+                super::groups::Overlap::Exact => "exact",
+                super::groups::Overlap::Disjoint => "disjoint",
+                super::groups::Overlap::Partial => "partial",
+            };
+            scene_meta.insert(g.result_id().to_string(),json!({"kind":"scene","summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null,"scene_state":state,"scene_overlap":overlap}));
+            for m in g.members() {
+                local.insert(m.photo_id, (g.result_id(), state, overlap, m));
+            }
+        }
     }
     let has_active = loaded.index.is_some();
     let mut active = HashMap::new();
@@ -129,13 +154,22 @@ pub fn search(
         card["reasons"] = list(r.get("reasons_json")?);
         card["concerns"] = list(r.get("concerns_json")?);
         let ai_group: Option<String> = r.get("ai_group_id")?;
-        let key = ai_group.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+        let mut key = ai_group.filter(|s| !s.is_empty()).unwrap_or_else(|| {
             if card["quality_group_kind"] == "similar" { format!("local-similar-{}",card["quality_group_id"]) } else { format!("photo-{id}") }
         });
+        if let Some((result,state,overlap,m)) = local.get(&id) {
+            card["local_rank"] = json!(m.rank);
+            card["local_score"] = json!(m.score);
+            card["local_representative"] = json!(m.representative);
+            card["scene_state"] = json!(state);
+            card["scene_overlap"] = json!(overlap);
+            // Partial overlap remains a management result; the old selection unit is retained.
+            if *state == "local_ranked" { key = result.to_string(); }
+        }
         let values = new.map(|(v,_)| Arc::clone(v)).or_else(|| {
             if has_active { None } else { legacy_vector(r.get("embedding").ok().flatten(), r.get("embedding_dim").ok().flatten()) }
         });
-        let score = if vector.is_some() { new.unwrap().1 } else { card["keep_score"].as_f64().or_else(|| card["quality_score"].as_f64()).unwrap_or_default()/100.0 };
+        let score = if vector.is_some() { new.unwrap().1 } else { card["local_score"].as_f64().or_else(|| card["keep_score"].as_f64()).or_else(|| card["quality_score"].as_f64()).unwrap_or_default()/100.0 };
         Ok(Some(Photo { id, key, card, vector:values, score }))
     })?;
     let mut photos = rows
@@ -151,7 +185,7 @@ pub fn search(
             json!({"ok":true,"query":query,"mode":"empty","groups":[],"searched_photos":0}),
         ));
     }
-    let mut meta = HashMap::new();
+    let mut meta = scene_meta;
     let mut stmt = tx.prepare("SELECT group_id,kind,summary,min_similarity,max_similarity,avg_similarity FROM photo_ai_groups")?;
     for row in stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, json!({"kind":r.get::<_,String>(1)?,"summary":r.get::<_,String>(2)?,"min_similarity":r.get::<_,Option<f64>>(3)?,"max_similarity":r.get::<_,Option<f64>>(4)?,"avg_similarity":r.get::<_,Option<f64>>(5)?}))))? { let (k,v)=row?; meta.insert(k,v); }
     drop(stmt);
@@ -198,6 +232,11 @@ pub fn search(
                         .as_bool()
                         .unwrap_or(false)
                         .cmp(&a.card["recommended"].as_bool().unwrap_or(false))
+                })
+                .then_with(|| {
+                    b.card["local_representative"]
+                        .as_bool()
+                        .cmp(&a.card["local_representative"].as_bool())
                 })
                 .then_with(|| b.score.total_cmp(&a.score))
                 .then_with(|| {
@@ -266,7 +305,9 @@ pub fn search(
 }
 
 pub fn status(conn: &Connection, config: &Config) -> rusqlite::Result<Value> {
+    let prepared = super::groups::runtime::Prepared::read(conn, config);
     let tx = conn.unchecked_transaction()?;
+    let scenes = prepared.and_then(|p| p.load_in(&tx));
     let (index, identity, _) = super::index::status_in(&tx, false)?;
     let model = config.embed_backend.model();
     let (legacy, judged, recommended): (i64,i64,i64) = tx.query_row(&format!("SELECT COUNT(DISTINCT a.content_sha256),COALESCE(SUM(a.recommended IS NOT NULL),0),COALESCE(SUM(a.recommended=1),0) {JOINS} WHERE a.embedding_model=?1"),[model],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -283,6 +324,8 @@ pub fn status(conn: &Connection, config: &Config) -> rusqlite::Result<Value> {
         group_status.insert(k, v);
     }
     drop(stmt);
+    let scene_summary = super::groups::runtime::summary(scenes.as_ref());
+    let selection = crate::selection::admin_counts(&tx)?;
     tx.commit()?;
     let active = identity.is_some();
     let photos = if active {
@@ -304,7 +347,7 @@ pub fn status(conn: &Connection, config: &Config) -> rusqlite::Result<Value> {
     Ok(
         json!({"ok":true,"photos":photos,"judged":if active {all_judged}else{judged},"recommended":if active {all_recommended}else{recommended},"groups":group_status.values().sum::<i64>(),"eligible":index.progress.eligible,"pending_embeddings":if active {index.progress.pending}else{(index.progress.eligible-legacy).max(0)},"group_status":group_status,
         "embedding_model":identity.as_ref().map_or(model,|i|i.model_id()),"embedding_backend":if active {if identity.as_ref().is_some_and(|i| i.provider_space_id() == super::embedding::PROVIDER_SPACE) {"local_http"} else {"active_index"}}else{match config.embed_backend {EmbedBackend::Local=>"local",EmbedBackend::Gemini=>"gemini"}},"other_model_embeddings":if active {index.other_shas}else{other},
-        "pipeline":{"index_state":state,"query_compatible":compatible,"indexed":index.progress.indexed,"pending":index.progress.pending,"failed_excluded":index.progress.failed_excluded,"failed_reasons":index.progress.failed_reasons.into_iter().collect::<BTreeMap<_,_>>(),"corrupt":index.corrupt,"selection_judged":all_judged,"selection_recommended":all_recommended}}),
+        "pipeline":{"index_state":state,"query_compatible":compatible,"indexed":index.progress.indexed,"pending":index.progress.pending,"failed_excluded":index.progress.failed_excluded,"failed_reasons":index.progress.failed_reasons.into_iter().collect::<BTreeMap<_,_>>(),"corrupt":index.corrupt,"selection_judged":all_judged,"selection_recommended":all_recommended,"selection_groups":selection.groups,"selection_suppressed":selection.suppressed,"scenes":scene_summary}}),
     )
 }
 

@@ -6,7 +6,11 @@ use super::{rank, settings::fingerprint, space::SpaceIdentity};
 use crate::quality::{Metrics, rank_scores};
 
 mod repository;
-pub use repository::{Loaded, Saved, load_current, migrate, pending, save, snapshot};
+pub use repository::{
+    Loaded, Saved, load_current, load_current_in, migrate, pending, pending_saves, save,
+    save_batch, snapshot,
+};
+pub mod runtime;
 #[cfg(test)]
 mod tests;
 
@@ -173,11 +177,29 @@ pub enum State {
     LocalRanked,
     ReviewOverlap,
 }
+impl State {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::LocalRanked => "local_ranked",
+            Self::ReviewOverlap => "review_overlap",
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Overlap {
     Disjoint,
     Exact,
     Partial,
+}
+impl Overlap {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disjoint => "disjoint",
+            Self::Exact => "exact",
+            Self::Partial => "partial",
+        }
+    }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RankUsed {

@@ -67,8 +67,7 @@ pub struct AdminCounts {
     pub groups: i64,
     /// そのうち `judged` でないもの。
     pub group_pending: i64,
-    /// 抑止される有効なメンバーの数（フィードの [`ai_visible`] の抑止側と同じ条件。`favorite` の免除は含めない
-    /// ＝従来の集計と同じ）。
+    /// 抑止される有効なメンバーの数（フィードの [`ai_visible`] の抑止側と同じ条件。`favorite` の免除も含む）。
     pub suppressed: i64,
 }
 
@@ -89,6 +88,7 @@ pub fn admin_counts(conn: &Connection) -> rusqlite::Result<AdminCounts> {
             "SELECT COUNT(*) FROM ({VALID_MEMBERS}) m
                JOIN photo_ai_groups g ON g.group_id=m.group_id
               WHERE g.status='judged' AND g.same_scene=1 AND COALESCE(m.recommended,0)!=1
+                AND m.shown=1 AND EXISTS(SELECT 1 FROM photos sp WHERE sp.id=m.photo_id AND COALESCE(sp.favorite,0)!=1)
                 AND {rep}"
         ),
         [],

@@ -71,3 +71,7 @@ pipelineは `index_state`（no_tables/unset/unusable/active）、`query_compatib
 - 実プロセスの既存起動結合試験に構図閾値不正＋AI_ENABLED=0のケースを追加し、healthz・フィード200、終了コード0、DB不変、固定エラーコードとログ非露出を確認した。
 - `cargo fmt --all --check`、全targetsのclippy（警告をエラー扱い）、全workspace **28 group・1173成功・失敗0・既存ignore2**、musl releaseビルドが成功した。静的リンク（INTERP/NEEDED無し）とversion起動も確認した。性能の追加測定を目的とした反復はしていない。
 - 中断したレビューの途中結果はquery24件・丸め1件・共有境界17件の成功報告までで、正式な完了判定には数えない。修正後コミットを対象に、新しい別Solレビューで残る確認と最終判定を行う。実LAN/LXCのHTTP並行受入は引き続き親担当。
+
+## T4.5b接続
+
+[scene runtimeの設定・移行・受入範囲](ai-scenes.md#t45b-周期選別ビューe5e6のruntime接続2026-10-28)を参照。E6は同一snapshotで検証した現世代のLocalRanked Exact/Disjointをscene groupとして使い、ローカル順位/代表と旧有償recommendedを別フィールドにする。Partialは旧groupを保持して管理情報を付ける。Waiting/破損/旧processorは代表に採用しない。空queryはProvider/Discovery/送信0、非空queryの15秒/LRU64/入力検査/毎分制限/共有LAN lane・Wait/Pauseは変更しない。E5 pipelineにscene状態件数と共通旧選別のgroups/suppressedを追加し、ローカル順位をjudgedへ足さない。管理STATUS/写真にも同じ結果を投影する。rankfile読取とfallbackの順位検査は最終read transaction外、最終active pointer/本体/現入力の照合は同一snapshot内で行う。新しいCloud経路は無い。

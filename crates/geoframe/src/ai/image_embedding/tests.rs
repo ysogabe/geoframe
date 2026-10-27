@@ -776,7 +776,7 @@ fn changed_configuration_rejects_an_old_handler_without_a_send_or_migration_delt
     assert!(matches!(h.run(&ctx, &job), Err(RunError::PolicyDisabled)));
     assert_eq!(lab.posts().len(), 0);
     assert!(
-        crate::ai::pending_active(&read, false, false)
+        crate::ai::pending_active(&read, false, false, false)
             .unwrap()
             .is_empty()
     );
@@ -1421,7 +1421,7 @@ fn lineage_migration_reports_one_additive_table_and_preserves_existing_jobs() {
     e.writer()
         .call(|c| {
             assert_eq!(
-                crate::ai::pending_active(c, false, false)?,
+                crate::ai::pending_active(c, false, false, false)?,
                 vec!["ai_image_embedding_lineage"]
             );
             assert_eq!(jobs::migrate(c)?, vec!["ai_image_embedding_lineage"]);
@@ -1442,4 +1442,106 @@ fn lineage_migration_reports_one_additive_table_and_preserves_existing_jobs() {
         1
     );
     assert!(lab.posts().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn production_worker_connects_images_local_cycles_e5_e6_and_local_advances_during_slow_provider()
+ {
+    use crate::ai::{groups, query, search_view};
+    use std::time::Instant;
+    let lab = Lab::new();
+    let e = lab.env("scene-production-e2e");
+    photo(&e, 1, &jpeg(41));
+    photo(&e, 2, &jpeg(42));
+    sql(
+        &e,
+        "UPDATE photos SET lat=1,lon=2,hidden=0,favorite=0; UPDATE photo_quality_features SET sharpness=5,luminance=128,exposure_score=90,black_clip=0,white_clip=0,contrast=100",
+    );
+    let lan = LanClient::new(&e.config.ai).unwrap();
+    let stop = StopFlag::new();
+    let started = worker::startup(&e.config, &e.writer(), &e.clock()).unwrap();
+    let handlers = worker::production_handlers_for_test(&e.config, Some(lan.clone()));
+    assert_eq!(handlers.len(), 1);
+    let background = worker::spawn(e.deps(handlers, &stop, &started.run_id));
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    let until = Instant::now() + Duration::from_secs(3);
+    loop {
+        if search_view::status(&read, &e.config).unwrap()["pipeline"]["scenes"]["local_ranked"] == 1
+        {
+            break;
+        }
+        assert!(Instant::now() < until, "production scene cycle timeout");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(lab.posts().len(), 2);
+    let catalog = crate::db::Catalog::open(&e.config.db_path())
+        .unwrap()
+        .with_writer(e.writer());
+    let rt = Arc::new(query::Runtime::new(
+        &e.config,
+        Some(lan.clone()),
+        stop.clone(),
+        None,
+    ));
+    let view = rt
+        .search(e.config.clone(), catalog.clone(), Some("q="))
+        .await
+        .unwrap();
+    assert_eq!(view["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(view["groups"][0]["kind"], "scene");
+    assert_eq!(lab.posts().len(), 2); // Empty search makes no probe or POST.
+    let semantic = rt
+        .search(e.config.clone(), catalog.clone(), Some("q=synthetic"))
+        .await
+        .unwrap();
+    assert_eq!(semantic["mode"], "semantic");
+    assert_eq!(semantic["groups"][0]["photos"].as_array().unwrap().len(), 2);
+    assert_eq!(lab.posts().len(), 3);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let release = Arc::new(Mutex::new(release_rx));
+    lab.hook(move |r| {
+        if r.request_line.starts_with("POST ") {
+            entered_tx.send(()).unwrap();
+            release
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+        }
+    });
+    photo(&e, 3, &jpeg(43));
+    sql(
+        &e,
+        "UPDATE photos SET taken_at='2026-01-03 03:04' WHERE id=3",
+    );
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    sql(&e, "UPDATE photos SET favorite=1 WHERE id=1");
+    let until = Instant::now() + Duration::from_secs(2);
+    loop {
+        let prepared = groups::runtime::Prepared::read(&read, &e.config).unwrap();
+        let tx = read.unchecked_transaction().unwrap();
+        let current = prepared.load_in(&tx).unwrap();
+        tx.commit().unwrap();
+        if current
+            .groups()
+            .iter()
+            .any(|g| g.members().iter().any(|m| m.photo_id == 1 && m.favorite))
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < until,
+            "local worker was blocked by provider"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(crate::photos::list_photos(&read).unwrap().len(), 2); // third has no location
+    assert_eq!(
+        search_view::status(&read, &e.config).unwrap()["pipeline"]["scenes"]["local_ranked"],
+        1
+    );
+    stop.stop();
+    release_tx.send(()).unwrap();
+    assert!(background.shutdown(&e.writer(), &stop, Duration::from_secs(2), &e.clock()));
 }

@@ -297,12 +297,12 @@ fn the_shipped_binary_registers_only_location_clue_and_a_worker_starts_only_with
     let e = env_with("start-query-only", only_query, true);
     assert_eq!(e.config.ai.enabled_tasks(true), [TaskKind::QueryEmbedding]);
     assert!(background_tasks(&e.config.ai, true).is_empty());
-    assert!(!should_start(&e.config));
+    assert!(should_start(&e.config));
     assert!(!should_start(&env_with("start-bad", "{", true).config));
     let mut vars = HashMap::new();
     vars.insert("GEOFRAME_INGEST".to_string(), "1".to_string());
     let unset = Config::load(|k| vars.get(k).cloned(), &Overrides::default()).unwrap();
-    assert!(!should_start(&unset));
+    assert!(should_start(&unset));
     // 旧設定で AI を無効にすると、設定が有効でも起動しない
     let dir = TempDir::new("start-off");
     let path = dir.path().join("ai.json");

@@ -169,6 +169,17 @@ fn dry_run_writes_nothing_and_reports_counts() {
     let stdout = text(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
     assert!(stdout.contains("dry-run: 何も書きません"), "{stdout}");
+    let local_plan = run(
+        &["sync", "--dry-run", "--data-dir", data.to_str().unwrap()],
+        &[
+            ("GEOFRAME_INGEST", "1"),
+            ("GEOFRAME_DRIVE_KEY", missing_key.to_str().unwrap()),
+        ],
+    );
+    assert!(local_plan.status.success());
+    assert!(text(&local_plan.stdout).contains("スキーマ: 作る表・索引 13 / 足す列 0"));
+    assert_eq!(snapshot(data), before);
+
     assert!(
         stdout.contains(
             "スキーマ: 作る表・索引 10 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
@@ -309,7 +320,7 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
         )
         .unwrap();
     // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・`ai_embedding_spaces`・`ai_embedding_vectors`
-    assert_eq!(tables, 19);
+    assert_eq!(tables, 22);
 }
 
 #[test]
@@ -323,7 +334,7 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     assert!(out.status.success(), "{}", text(&out.stdout));
     // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表）だけ。ほかの表・列は変えない
     assert!(
-        text(&out.stdout).contains("スキーマを更新しました: 作成 10件 / 列の追加 0件"),
+        text(&out.stdout).contains("スキーマを更新しました: 作成 13件 / 列の追加 0件"),
         "{}",
         text(&out.stdout)
     );
@@ -1028,7 +1039,7 @@ fn serve_with_ingest_and_a_valid_ai_config_records_its_run_and_the_stop_and_exit
         assert!(!stdout.contains(secret), "{secret}\n{stdout}");
     }
 
-    // AI の設定が無い取り込み有効の起動は、回収だけして背景ワーカーは起動しない
+    // Provider設定が無くても、保存vectorのためローカル周期は起動する
     let dir = Dir::new("serve-ai-off");
     let data = dir.0.join("d");
     let port = free_port();
@@ -1036,7 +1047,36 @@ fn serve_with_ingest_and_a_valid_ai_config_records_its_run_and_the_stop_and_exit
     wait_healthy(&mut child, port);
     let (status, stdout) = terminate(child);
     assert!(status.success());
-    assert!(stdout.contains("背景ワーカーは起動しません"), "{stdout}");
+    assert!(stdout.contains("背景ワーカーを起動します"), "{stdout}");
+    let dir = Dir::new("serve-ai-disabled");
+    let data = dir.0.join("d");
+    let port = free_port();
+    let mut child = serve_with_env(
+        &data,
+        port,
+        Some(("1", &staging)),
+        &[("GEOFRAME_AI_ENABLED", "0")],
+    );
+    wait_healthy(&mut child, port);
+    let (status, stdout) = terminate(child);
+    assert!(status.success());
+    assert!(!stdout.contains("背景ワーカーを起動します"));
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM ai_worker_runs", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'ai_scene_%'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
 }
 
 /// 置き場の全体（相対パスと中身）。ディレクトリの有無も含めて、断られたあとに変わっていないことを見る。

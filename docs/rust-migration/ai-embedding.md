@@ -98,3 +98,7 @@ let result = lan.http().run_interactive(&stop, move |session| {
 ### レビュー修正の検証
 
 必須3件・推奨の分割/照会改善・文書の追従を採用。最終suite数、否定対照、6500件測定、移行影響と残課題は [t44a-review-fixes.md](t44a-review-fixes.md) を参照。T4.4b以降と実LAN/LXCの受入を完了扱いにはしない。
+
+## T4.5b接続
+
+画像handlerと索引公開の既存経路を維持し、保存済みactive vectorからの場面・順位更新を専用ローカル周期へ接続した。[設定・移行・型付きAPI・合成fixture](ai-scenes.md#t45b-周期選別ビューe5e6のruntime接続2026-10-28)を参照。LanClient/laneや画像lockを追加せず、Provider停止中もローカル周期・feed・管理は進む。画像追加/修復・現世代failed/retryの変化はsnapshot guardで検知する。起動移行/dry-runは有効INGESTにscene3表の不足分だけ追加（用途専用表無しで10→13）、既存index/画像lineage/Python/REQUIRED_SCHEMAは不変。本番factory→合成RGB画像Embedding→ローカル周期→E5/E6のE2Eと、POST待ち中の独立進行をloopbackで検証する。実LAN/LXC/実weight/任意Gemini比較は今回未実施。

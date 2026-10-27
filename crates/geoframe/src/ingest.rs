@@ -162,9 +162,10 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         .ai
         .gate(ai::settings::TaskKind::LocationSuggest, true)
         .is_ok();
-    migration
-        .created
-        .extend(writer.call(move |conn| ai::migrate_active(conn, clue_enabled, suggest_enabled))?);
+    let scenes = ai::groups::runtime::enabled(config);
+    migration.created.extend(
+        writer.call(move |conn| ai::migrate_active(conn, clue_enabled, suggest_enabled, scenes))?,
+    );
     log_migration(&migration);
 
     let cache = Arc::new(Cache::load(&config.data_dir));
@@ -371,9 +372,12 @@ pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
         .ai
         .gate(ai::settings::TaskKind::LocationSuggest, config.ingest)
         .is_ok();
-    schema
-        .missing_objects
-        .extend(ai::pending_active(conn, clue_enabled, suggest_enabled)?);
+    schema.missing_objects.extend(ai::pending_active(
+        conn,
+        clue_enabled,
+        suggest_enabled,
+        ai::groups::runtime::enabled(config),
+    )?);
     Ok(Plan {
         schema,
         leftover_files: count_leftovers(&config.data_dir),

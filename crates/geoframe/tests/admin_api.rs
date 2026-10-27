@@ -86,7 +86,13 @@ async fn status_matches_python_and_the_prefix_forms_return_the_same() {
 /// 追加のキーを除いた応答。既存のキーの意味・値は Python 版のフィクスチャのまま。
 fn without_ai_ops(mut body: Value) -> Value {
     let map = body.as_object_mut().unwrap();
-    for key in ["ai_config_invalid", "ai_jobs", "ai_pauses", "ai_waits"] {
+    for key in [
+        "ai_config_invalid",
+        "ai_jobs",
+        "ai_pauses",
+        "ai_waits",
+        "ai_scenes",
+    ] {
         map.remove(key);
     }
     body
@@ -132,7 +138,8 @@ async fn ai_jobs_and_pauses_appear_as_counts_and_fixed_reasons_when_the_tables_h
     // AI の表があっても行が無ければ何も足さない
     geoframe::ai::migrate(&mut server.writer).unwrap();
     let (_, body) = server.json("/api/admin/status").await;
-    assert_eq!(body, fixture["status"]["gemini"]);
+    assert_eq!(body["ai_scenes"]["state"], "no_index");
+    assert_eq!(without_ai_ops(body), fixture["status"]["gemini"]);
 
     server
         .writer

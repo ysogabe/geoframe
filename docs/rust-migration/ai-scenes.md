@@ -112,3 +112,60 @@ AC4は現入力/完全空間/新参照CASと一次列不変、AC6は空間/破�
 再レビューでは必須2件とも解消、必須0・推奨1だった。独立の専用36試験と追加13試験（構造破損23ケースを含む）が成功。推奨のヘッダー型変換エラーも、memberと共通の分類へ変更し、SQLite実行エラーは`Database`、保存値の型不正は`CorruptResult`とした。shortlistへ文字列を注入する12番目の破損ケースで拒否と修復を確認し、専用36試験・fmt・全targets clippyが成功した。この小修正後に全workspaceは反復していない。
 
 検証LXCでは同じ修正を含むmusl release試験バイナリで専用36件すべて成功（省略・ignoreなし）。Python fixture再生成と実切り戻しも含む。合成6,500件×768次元・全同時刻／同方向を1回測定し、snapshot 330.608ms、compute 232.508ms、writer/save 590.046ms、RSSは準備後10,704→snapshot後71,612→compute後74,568→save/read後75,476KiBだった。writer外計算中にも独立Writer操作が成功した。これは専用試験バイナリの単回値で、実画像・Provider・runtimeの性能保証や全未連結cosineの最悪時間の測定ではない。周期処理への接続はT4.5bで行う。
+
+## T4.5b: 周期・選別ビュー・E5/E6のruntime接続（2026-10-28）
+
+原開始SHA **64d3860** を維持し、親の開始記録HEAD `25ac12c05db3b4040d70fcaebea62e9ab5d00ce7` から同じcheckout/`feat/rust-migration-p4`で実装した。上のT4.5aの「未接続」は当時の境界であり、今回の接続点は `groups/runtime.rs`、`worker.rs`、`ai.rs`、`ingest.rs`、`search_view.rs`、`admin.rs`。新しいクラウド送信・photo_judge handler・有償判定の置換は追加しない。P4-AC3/4/6/8/9/10aの今回のローカルruntime・合成HTTP範囲を扱い、T4.5c、独立Solレビュー、親の最終LXC/実API受入、P4全体の完了とは区別する。
+
+### 起動・設定・仕事量
+
+`INGEST=1 && AI_ENABLED=1 && ai.invalid().is_none()` で `Runtime::production(Arc<Config>)` とローカル専用スレッドを起動する。AI設定ファイルが未指定でも、DBに既にある完全なactive identityと適合vectorから処理できる。Providerの登録/Discovery、LAN lane、photo_judgeの許可/予算には依存しない。画像・Decision・日候補の既存workerと単一Writer/StopFlag/LockHoldを共有し、Provider応答中も独立して進む。AI無効時はworker startupの回収・run記録もしない。既存INGESTの基本移行と、AI背景処理の無効化を区別する。
+
+| 既存設定 | 今回の適用 |
+| --- | --- |
+| GEOFRAME_AI_POLL_S | 既存60秒、最小30秒の周期を共有 |
+| GEOFRAME_AI_TIME_WINDOW_MIN | 既定15分。1〜86400秒の有限値、整数撮影秒との比較に同値な秒のfloorを使う |
+| GEOFRAME_AI_SIMILARITY | Pythonのbackend別既定（local 0.83、gemini 0.82）、有限-1〜1 |
+| GEOFRAME_AI_SHORTLIST_MAX | Pythonと同じ整数・2〜6 clamp、既定6 |
+| GEOFRAME_RANK_MODEL | 明示パス、未指定/空ならDATA_DIR/models/rank_model.json。writer/tx外で毎回検証 |
+
+不正な数値は既存`legacy_env`としてAIだけを無効にし、明示AI_ENABLED=0と写真配信を保つ。重みの欠落/不正/空間不適合は既存の固定Reasonと固定式fallback。モデル名/次元から旧重み互換を推測しない。完全identity、写真/品質/failed、設定、実効係数digestの変化は次周期で再計画する。fallback理由だけが変わった場合も保存ヘッダーの照合で更新する。
+
+周期はsnapshot→モデル読取→compute→保存値照合をwriter外で行う。`pending_saves(conn, plan, limit)` は全ヘッダー・全members・正確な参照集合を比較し、正常同一結果をwriterへ再依頼しない。破損をID一致だけで省略しない。1周期最大16成分、原則8192構成員（単一成分は原子性のため分割しない）。未処理分は次周期へ持ち越す。共通の協調的期限10秒を計算・writer待ち・保存で共有し、停止/期限時は未確定をrollbackする。単一SQL/DB読取を強制中断する実時間保証ではない。
+
+`save_batch(conn, plan, indexes, stopped)` は最大16成分の短いtransactionで現在入力を1回共有読取し、各成分の完全guard/構造/expected_active CASを保つ。Staleの成分以外を進められる。SQLエラー・停止はbatch全体rollback。旧`save`/`load_current`と破損分類・fresh Plan修復は維持する。時刻範囲、photo ID、旧群の所属、参照集合の読取内索引を作り、成分ごとの全写真map構築やactive参照の全走査を除いた。新しいDB索引は追加していない。成分計算自体の窓内cosineは最悪O(n²d)であり、writerへ持ち込まない。
+
+### 読取API・選別・後続cへの境界
+
+- `Prepared::read(conn, config)` はactive metadataとrankfileを最終read transactionの外で準備し、`Prepared::load_in(conn)` は呼出側の同一snapshot内でactive本体/完全空間/現世代/現processor/全members/参照を検査する。途中の空間切替では結果を使わない。モデルが成分単位でMissingFeature/Overflow等へfallbackする場合は、別の現入力snapshotからwriter/tx外でその理由を再検証し、最終snapshotでも同じguardである場合だけ採用する。新weightが利用可能になった古い固定式結果を正常扱いしない。
+- E6の既存card/group JSON形・型を維持し、有効な成分にだけ`local_rank/local_score/local_representative/scene_state/scene_overlap`を追加する。LocalRanked Exact/Disjointをscene groupとして使い、空queryは保存順位、意味検索は同じactive vectorのcosineを使う。favoriteと世代適合する旧判定の優先を保つ。PartialはReviewOverlapとして管理情報を残し、旧groupの単位を保持する。Waitingは検索の代表/順位にしない。
+- E5 `pipeline.scenes` と管理STATUS `ai_scenes` に`state/local_ranked/waiting/review_overlap/rules/linear`の固定コード・件数を追加。管理写真の任意`scene`に状態/重複/順位/score/代表/shortlistを付ける。旧DBはschemaを作らず、管理追加キーも3表が存在する時だけ。破損したsceneはunavailable/未採用にして配信全体を止めない。
+- E5 `selection_groups/selection_suppressed` はfeedと共通の旧選別から数える。LocalRanked/Waiting/ReviewOverlapはjudgedへ加算しない。`selection::admin_counts.suppressed`は表示可能な非favoriteの実際の抑止数へ揃えた。合成管理fixtureでは、位置無しの旧非推薦を除くため1→0。選別表・抑止集合・フィード件数は周期の前後で不変であり、この集計の修正を新しい抑止解除と混同しない。
+- `ai_scene_active`はローカル結果の参照であり、feed非表示の許可ではない。旧有償表は今回一切書換えない。検索空間の切替、新しい未判定成分、pending窓による新規feed抑止は0。旧代表の更新/削除/hidden/位置無し/品質非表示時の安全な表示とfavorite免除は共通選別SQLを維持する。
+
+後続T4.5cは`Group`の現入力世代/処理版/全members/shortlist/順位/Overlap/LegacyOriginを使える。置換候補は現入力集合・世代の一致するExact、またはDisjointのみで、Partialは管理確認のまま。`paid_reuse_verified()==false`は維持する。今回のscene参照やローカル代表を有償判定済みの証拠にしない。新Gemini回答の送信集合・prompt・モデル・世代・token CASと抑止採用はcが別途実装する。
+
+### 移行・dry-run・Python
+
+T4.5aの3表を`ai::pending_active/migrate_active`へ接続した。引数は従来のconn/clue/suggestに`scenes: bool`を追加し、INGEST guard/lock後の起動が有効性を渡す。全部入り`ai::pending/migrate`も3表を含む。列追加0・追加明示索引0・新規schema定義0（既存3表の起動配線）。REQUIRED_SCHEMA・Python schema・旧行は不変。
+
+用途専用表なしのPython相当DBでは、有効INGESTの不足objectは10→13、全用途込みの明示移行は14→17。既にaの3表があれば増分0。INGEST0/AI0/不正AI設定では今回の3表を作らず、readonly読取も追加しない。INGEST0のdry-runは従来の基本10件を仮計画するだけ、有効INGESTのdry-runは13件を報告する。Python切り戻しの既存合成試験では新表を無視してfeed/status/旧group再構築を実行し、一次列と新表を維持する。
+
+### 親のLXC用fixture
+
+`tools/gen_scene_runtime_fixture.py --output <存在しない専用ディレクトリ> [--photos 6500] [--many-components] [--weight]` は標準ライブラリだけで合成DBを作る。既存パスの更新は拒否し、アプリのimport・本番DB・実weight・鍵・外部通信は無い。旧Python schema＋合成768次元active indexだけを作り、scene3表は未作成。共通空間はsynthetic専用で、実BF16/Geminiとの互換宣言はしない。任意weightはこの合成空間の完全fingerprintを持つ。
+
+このfixtureは有効INGESTで不足10 object（既にindexの3 objectがあるため）→migration→ローカル周期→E5/E6空検索・管理・再起動のLXC確認に使える。`GEOFRAME_EMBED_BACKEND=local`、専用DATA_DIR、AI_ENABLED=1、AI_CONFIG未指定で外部送信0。実画像ファイルは作らないため画像配信の受入には使わない。意味検索/遅延Provider/画像E2Eは合成RGBとloopback stub付きのunit executable `production_worker_connects_images_local_cycles_e5_e6_and_local_advances_during_slow_provider`、性能は`synthetic_6500x768_compute_releases_writer_and_measures_save`を使う。全同時刻・同方向は最悪cosineケースではない。多数の独立窓は`local_many_small_components_are_bounded_and_progress_without_rescanning_on_writer_per_group`で16/16/8/0を確認する。
+
+### T4.5b最終検証記録
+
+- `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`git diff --check`: 成功。
+- 最終 `RUST_TEST_THREADS=4 cargo test --workspace`: **28 result group、1225 passed / 0 failed / 2 ignored / 0 measured / 0 filtered**。内訳lib1033成功/既存ignore1、main0、integration188成功、doctest4成功/既存ignore1。T4.5bの追加15試験を含み、条件付き省略0。Python/Pillow/Nodeの既存回帰・Python切り戻しも実行した。
+- 本番factoryと実Worker spawnから、合成RGB2画像→loopback Embedding→active公開→ローカル周期→E5/E6保存済み推薦・意味検索を確認。空queryの追加POST0。追加画像POSTを同期ゲートで保持し、別スレッドのローカル順位更新、feed/E5の進行と停止/joinを確認した。
+- 否定対照2件: pending_savesの全member照合を外すと破損修復試験が失敗、expected_active CASを外すと新processor確定後の旧batch PlanがStoredとなって試験が失敗した。両方とも意図したassert/exit101を確認し、finallyで復元。復元後の全suiteは上記の成功数。故障注入を通常suiteの製品失敗へ加算しない。
+- 初回loopback bindはsandboxのPermissionDeniedで失敗し、socket権限付きで成功。移行3表/管理の実抑止数と追加キー/未指定Providerでのローカル起動に関する旧fixture期待値を更新した。最終通常suiteに失敗は無い。実写真/実DB/実weight/鍵/本番/LAN/SSH/Cloud/lease操作は未使用。
+- `cargo build --workspace --release --target x86_64-unknown-linux-musl`: 成功。`file`: static-pie linked、`readelf -l/-d`: INTERP/NEEDED無し。`--version`: geoframe 0.1.0。19,933,224 bytes、SHA-256 `c27038073bb371bb49be4a795056bdd36aa4e9844fe2b0b5f049cf935a4676a7`。
+- musl release unit executableの既存6500性能fixtureを実周期保存へ拡張し、対象を1回測定（1成功、ignore0）。この開発ホスト、6500写真/6500 SHA×768、全同時刻・同方向、重み無し、外部通信無し。実周期はsnapshot **138.881ms**、モデル読取込みcompute **77.592ms**、writer待ち **28.77µs**、writer内CAS/batch-save **198.391ms**、周期全体 **425.234ms**、選択/保存1成分・6500構成員。期限/時間の性能assertは置いていない。同時に通常回帰試験が稼働していた値で、専有ホストの性能保証ではない。
+- 同fixtureの事前分離snapshot/computeは148.236ms/73.149ms。RSSは準備後→分離snapshot後→分離compute後→周期保存/読取後が **11964→72440→75020→78444KiB**。事前snapshot/Plan、allocator/SQLite cacheを含む各時点の値で、周期単独の増分・peakではない。computeを同期ゲートで保持した間の別writer更新も成功した。多数小成分の試験は40成分を16/16/8/0保存、期限切れwriter依頼の後着保存0を確認した。
+
+独立Solレビュー、実LAN/LXC、実weightでの品質評価、任意Gemini判定と有償抑止への適用、P4全体security-reviewは未実施として親へ引き継ぐ。成分計算の最悪O(n²d)、大きい単一成分の原子的保存、協調停止、履歴を自動GCしない点は既知の境界。今回の合成runtime試験でP4全体完了・P5移行可能とはしない。

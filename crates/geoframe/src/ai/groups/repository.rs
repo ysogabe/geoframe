@@ -157,6 +157,10 @@ struct Legacy {
 pub(super) struct Raw {
     identity: SpaceIdentity,
     rows: Vec<Row>,
+    by_id: HashMap<i64, usize>,
+    timed: BTreeMap<i64, Vec<usize>>,
+    legacy_by_id: HashMap<i64, Vec<usize>>,
+    pointers: HashMap<String, BTreeSet<i64>>,
     vectors: HashMap<String, Vector>,
     failed: BTreeMap<(String, String), String>,
     generations: HashMap<String, String>,
@@ -176,11 +180,15 @@ impl Raw {
     /// Only the component's influence interval and its SHA dependencies participate.
     /// Changes in other time windows cannot starve a completed component.
     pub(super) fn guard(&self, lo: i64, hi: i64) -> String {
-        let rows: Vec<_> = self
-            .rows
-            .iter()
-            .filter(|r| r.captured.is_some_and(|t| lo <= t && t <= hi))
+        if lo > hi {
+            return fingerprint(&["invalid_scene_interval"]);
+        }
+        let mut rows: Vec<_> = self
+            .timed
+            .range(lo..=hi)
+            .flat_map(|(_, indexes)| indexes.iter().map(|i| &self.rows[*i]))
             .collect();
+        rows.sort_unstable_by_key(|r| r.id());
         let shas: BTreeSet<_> = rows.iter().filter_map(|r| r.sha()).collect();
         let ids: BTreeSet<_> = rows.iter().map(|r| r.id()).collect();
         let mut parts = vec![self.identity.fingerprint()];
@@ -199,19 +207,21 @@ impl Raw {
             let key = self.generations.get(sha).cloned().unwrap_or_default();
             parts.push(self.failed.get(&(target, key)).cloned().unwrap_or_default());
         }
-        for legacy in &self.legacy {
-            if legacy.ids.iter().any(|id| ids.contains(id)) {
-                parts.push(legacy.origin.digest.clone());
-            }
+        let matches: BTreeSet<_> = ids
+            .iter()
+            .flat_map(|id| self.legacy_by_id.get(id).into_iter().flatten().copied())
+            .collect();
+        for i in matches {
+            parts.push(self.legacy[i].origin.digest.clone());
         }
         fingerprint(&parts.iter().map(String::as_str).collect::<Vec<_>>())
     }
     pub(super) fn overlap(&self, ids: &[i64]) -> (Overlap, Vec<LegacyOrigin>) {
-        let matches: Vec<_> = self
-            .legacy
+        let indexes: BTreeSet<_> = ids
             .iter()
-            .filter(|g| g.ids.iter().any(|id| ids.contains(id)))
+            .flat_map(|id| self.legacy_by_id.get(id).into_iter().flatten().copied())
             .collect();
+        let matches: Vec<_> = indexes.into_iter().map(|i| &self.legacy[i]).collect();
         let overlap = if matches.is_empty() {
             Overlap::Disjoint
         } else if matches.len() == 1 && matches[0].ids == ids && matches[0].total == ids.len() {
@@ -295,16 +305,37 @@ fn raw_in(conn: &Connection, scope: Option<(i64, i64)>) -> Result<Option<Raw>, E
         }
     }
     let legacy = legacy_in(conn)?;
-    let active = if jobs::object_exists(conn, "table", "ai_scene_active")? {
+    let active: BTreeMap<i64, String> = if jobs::object_exists(conn, "table", "ai_scene_active")? {
         conn.prepare("SELECT photo_id,result_id FROM ai_scene_active ORDER BY photo_id")?
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
     } else {
         BTreeMap::new()
     };
+    let by_id = rows.iter().enumerate().map(|(i, r)| (r.id(), i)).collect();
+    let mut timed = BTreeMap::<i64, Vec<usize>>::new();
+    for (i, row) in rows.iter().enumerate() {
+        if let Some(t) = row.captured {
+            timed.entry(t).or_default().push(i);
+        }
+    }
+    let mut legacy_by_id = HashMap::<i64, Vec<usize>>::new();
+    for (i, g) in legacy.iter().enumerate() {
+        for id in &g.ids {
+            legacy_by_id.entry(*id).or_default().push(i);
+        }
+    }
+    let mut pointers = HashMap::<String, BTreeSet<i64>>::new();
+    for (id, result) in &active {
+        pointers.entry(result.clone()).or_default().insert(*id);
+    }
     Ok(Some(Raw {
         identity,
         rows,
+        by_id,
+        timed,
+        legacy_by_id,
+        pointers,
         vectors,
         failed,
         generations,
@@ -527,20 +558,67 @@ pub fn save(
     group_index: usize,
     stopped: &dyn Fn() -> bool,
 ) -> Result<Saved, Error> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(raw) = raw_in(&tx, None)? else {
+        return Ok(Saved::Stale);
+    };
+    let saved = save_in(&tx, &raw, plan, group_index, stopped)?;
+    if matches!(saved, Saved::Stored | Saved::Unchanged) {
+        tx.commit()?;
+    }
+    Ok(saved)
+}
+
+/// Bounded shared validation: one current-input scan per short batch, never per component.
+/// Every group still checks its full influence guard, structure and expected-active CAS.
+pub fn save_batch(
+    conn: &mut Connection,
+    plan: &Plan,
+    indexes: &[usize],
+    stopped: &dyn Fn() -> bool,
+) -> Result<Vec<Saved>, Error> {
+    if indexes.len() > 16 {
+        return Err(Error::InvalidOptions);
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if stopped() {
+        return Ok(vec![Saved::Interrupted; indexes.len()]);
+    }
+    let Some(raw) = raw_in(&tx, None)? else {
+        return Ok(vec![Saved::Stale; indexes.len()]);
+    };
+    let mut saved = Vec::new();
+    for &i in indexes {
+        let result = save_in(&tx, &raw, plan, i, stopped)?;
+        if result == Saved::Interrupted {
+            return Ok(vec![Saved::Interrupted; indexes.len()]);
+        }
+        saved.push(result);
+    }
+    if stopped() {
+        return Ok(vec![Saved::Interrupted; indexes.len()]);
+    }
+    tx.commit()?;
+    Ok(saved)
+}
+
+fn save_in(
+    tx: &Connection,
+    raw: &Raw,
+    plan: &Plan,
+    group_index: usize,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Saved, Error> {
     let Some(group) = plan.groups.get(group_index) else {
         return Err(Error::CorruptResult);
     };
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if stopped() {
         return Ok(Saved::Interrupted);
     }
-    let Some(raw) = raw_in(&tx, Some((group.lo, group.hi)))? else {
-        return Ok(Saved::Stale);
-    };
     if raw.identity != plan.identity || raw.guard(group.lo, group.hi) != group.guard {
         return Ok(Saved::Stale);
     }
-    if !valid_group(&raw, group, plan.options)? {
+    if !valid_group(raw, group, plan.options)? {
         return Err(Error::CorruptResult);
     }
     let values = group_values(&plan.identity, group, plan.options)?;
@@ -552,7 +630,7 @@ pub fn save(
         )
         .optional()?;
     let stored_members_match = if existing.as_ref() == Some(&values) {
-        match read_members(&tx, &group.result_id) {
+        match read_members(tx, &group.result_id) {
             Ok(members) => members == group.members,
             Err(Error::CorruptResult) => false,
             Err(error) => return Err(error),
@@ -560,7 +638,7 @@ pub fn save(
     } else {
         false
     };
-    if stored_members_match && (group.state == State::Waiting || pointers_match(&tx, group)?) {
+    if stored_members_match && (group.state == State::Waiting || raw_pointers_match(raw, group)) {
         return Ok(Saved::Unchanged);
     }
     let ids: Vec<_> = group.members.iter().map(|m| m.photo_id).collect();
@@ -608,15 +686,63 @@ pub fn save(
     if stopped() {
         return Ok(Saved::Interrupted);
     }
-    tx.commit()?;
     Ok(Saved::Stored)
 }
-fn pointers_match(conn: &Connection, group: &Group) -> Result<bool, Error> {
-    let ids = conn
-        .prepare("SELECT photo_id FROM ai_scene_active WHERE result_id=?1 ORDER BY photo_id")?
-        .query_map([&group.result_id], |r| r.get::<_, i64>(0))?
-        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
-    Ok(ids == group.members.iter().map(|m| m.photo_id).collect())
+fn raw_pointers_match(raw: &Raw, group: &Group) -> bool {
+    raw.pointers.get(&group.result_id).is_some_and(|ids| {
+        ids.len() == group.members.len() && group.members.iter().all(|m| ids.contains(&m.photo_id))
+    })
+}
+
+/// Writer-free skip check against the computed plan; includes every header/member and pointer.
+/// Never trusts result IDs alone. A mismatch is repaired only through the usual writer CAS.
+pub fn pending_saves(conn: &Connection, plan: &Plan, limit: usize) -> Result<Vec<usize>, Error> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    if !pending(conn)?.is_empty() {
+        return Err(Error::Database);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut pointers = HashMap::<String, BTreeSet<i64>>::new();
+    for row in tx
+        .prepare("SELECT result_id,photo_id FROM ai_scene_active")?
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+    {
+        let (result, id) = row?;
+        pointers.entry(result).or_default().insert(id);
+    }
+    let mut pending = Vec::new();
+    let mut stmt = tx.prepare("SELECT * FROM ai_scene_groups WHERE result_id=?1")?;
+    for (i, g) in plan.groups.iter().enumerate() {
+        let existing = stmt
+            .query_row([&g.result_id], |r| {
+                (0..16)
+                    .map(|j| r.get::<_, Value>(j))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .optional()?;
+        let matches = existing.as_ref() == Some(&group_values(&plan.identity, g, plan.options)?)
+            && match read_members(&tx, &g.result_id) {
+                Ok(m) => m == g.members,
+                Err(Error::CorruptResult) => false,
+                Err(e) => return Err(e),
+            }
+            && (g.state == State::Waiting
+                || pointers.get(&g.result_id).is_some_and(|ids| {
+                    ids.len() == g.members.len()
+                        && g.members.iter().all(|m| ids.contains(&m.photo_id))
+                }));
+        if !matches {
+            pending.push(i);
+            if pending.len() == limit {
+                break;
+            }
+        }
+    }
+    drop(stmt);
+    tx.commit()?;
+    Ok(pending)
 }
 
 fn group_values(
@@ -702,11 +828,10 @@ fn valid_group(raw: &Raw, group: &Group, options: Options) -> Result<bool, Error
     if members.len() != group.members.len() {
         return Ok(false);
     }
-    let current: BTreeMap<_, _> = raw.rows.iter().map(|r| (r.id(), r)).collect();
     let waiting = group.state == State::Waiting;
     let (mut lo, mut hi) = (i64::MAX, i64::MIN);
     for (i, m) in group.members.iter().enumerate() {
-        let Some(row) = current.get(&m.photo_id) else {
+        let Some(row) = raw.by_id.get(&m.photo_id).map(|i| &raw.rows[*i]) else {
             return Ok(false);
         };
         let Some(time) = row.captured else {
@@ -780,8 +905,8 @@ fn encode<T: serde::Serialize>(v: &T) -> Result<String, Error> {
 }
 
 pub struct Loaded {
-    identity: Option<SpaceIdentity>,
-    groups: Vec<Group>,
+    pub(super) identity: Option<SpaceIdentity>,
+    pub(super) groups: Vec<Group>,
 }
 impl std::fmt::Debug for Loaded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -802,44 +927,54 @@ impl Loaded {
 /// `processor_version` is required: callers cannot accidentally accept another ranking configuration.
 pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded, Error> {
     let tx = conn.unchecked_transaction()?;
-    let Some(raw) = raw_in(&tx, None)? else {
+    let loaded = load_current_in(&tx, &[processor_version])?;
+    tx.commit()?;
+    Ok(loaded)
+}
+
+pub fn load_current_in(tx: &Connection, processors: &[&str]) -> Result<Loaded, Error> {
+    load_projection_in(tx, processors, false)
+}
+pub fn load_projection_in(
+    tx: &Connection,
+    processors: &[&str],
+    include_waiting: bool,
+) -> Result<Loaded, Error> {
+    let Some(raw) = raw_in(tx, None)? else {
         return Ok(Loaded {
             identity: None,
             groups: Vec::new(),
         });
     };
-    if !pending(&tx)?.is_empty() {
+    if !pending(tx)?.is_empty() {
         return Ok(Loaded {
             identity: Some(raw.identity),
             groups: Vec::new(),
         });
     }
     let mut stmt=tx.prepare("SELECT result_id,input_generation,processor_version,state,overlap,rank_used,lo,hi,input_guard,weight_digest,legacy_json,window_s,similarity,shortlist,space_id FROM ai_scene_groups g
-      WHERE space_fingerprint=?1 AND processor_version=?2 AND state!='waiting'
-      AND EXISTS(SELECT 1 FROM ai_scene_active a WHERE a.result_id=g.result_id) ORDER BY result_id")?;
+      WHERE space_fingerprint=?1 AND (?2 OR state!='waiting')
+      ORDER BY result_id")?;
     let rows = stmt
-        .query_map(
-            params![raw.identity.fingerprint(), processor_version],
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, String>(8)?,
-                    r.get::<_, Option<String>>(9)?,
-                    r.get::<_, String>(10)?,
-                    r.get::<_, i64>(11)?,
-                    r.get::<_, f64>(12)?,
-                    r.get::<_, i64>(13)?,
-                    r.get::<_, String>(14)?,
-                ))
-            },
-        )?
+        .query_map(params![raw.identity.fingerprint(), include_waiting], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, String>(8)?,
+                r.get::<_, Option<String>>(9)?,
+                r.get::<_, String>(10)?,
+                r.get::<_, i64>(11)?,
+                r.get::<_, f64>(12)?,
+                r.get::<_, i64>(13)?,
+                r.get::<_, String>(14)?,
+            ))
+        })?
         .collect::<rusqlite::Result<Vec<_>>>()
         .map_err(stored_row_error)?;
     drop(stmt);
@@ -862,10 +997,17 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
         space_id,
     ) in rows
     {
-        if raw.guard(lo, hi) != guard {
+        if lo > hi {
+            return Err(Error::CorruptResult);
+        }
+        if (state != "waiting" && !raw.pointers.contains_key(&result_id))
+            || !processors.contains(&processor_version.as_str())
+            || raw.guard(lo, hi) != guard
+        {
             continue;
         }
         let state = match state.as_str() {
+            "waiting" => State::Waiting,
             "local_ranked" => State::LocalRanked,
             "review_overlap" => State::ReviewOverlap,
             _ => return Err(Error::CorruptResult),
@@ -878,7 +1020,7 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
         };
         let rank_used = serde_json::from_str(&rank_used).map_err(|_| Error::CorruptResult)?;
         let legacy = serde_json::from_str(&legacy).map_err(|_| Error::CorruptResult)?;
-        let members = read_members(&tx, &result_id)?;
+        let members = read_members(tx, &result_id)?;
         let group = Group {
             result_id,
             input_generation,
@@ -900,11 +1042,10 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
         if space_id != raw.identity.space_id() || !valid_group(&raw, &group, options)? {
             return Err(Error::CorruptResult);
         }
-        if pointers_match(&tx, &group)? {
+        if group.state == State::Waiting || raw_pointers_match(&raw, &group) {
             groups.push(group);
         }
     }
-    tx.commit()?;
     Ok(Loaded {
         identity: Some(raw.identity),
         groups,

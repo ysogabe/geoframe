@@ -226,6 +226,8 @@ pub struct Config {
     pub infer_offset_min: f64,
     pub embed_backend: EmbedBackend,
     pub ai_visual_similarity: f64,
+    /// Optional validated linear rank file. Never included in diagnostics.
+    pub rank_model_path: PathBuf,
     /// `GEOFRAME_EMBED_BACKEND` が `gemini`・`local` のどちらでもなかった（現行と同じく `gemini` に
     /// 落とした）。起動ログで知らせる。
     pub embed_backend_invalid: bool,
@@ -469,6 +471,10 @@ impl Config {
                 } else {
                     0.90
                 });
+        let rank_model_path = get("GEOFRAME_RANK_MODEL")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("models/rank_model.json"));
         Ok(Self {
             listen,
             data_dir,
@@ -479,6 +485,7 @@ impl Config {
             infer_offset_min,
             embed_backend,
             ai_visual_similarity,
+            rank_model_path,
             embed_backend_invalid,
             tile_cache_max_mb,
             tile_ua,
