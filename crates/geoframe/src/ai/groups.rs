@@ -185,7 +185,7 @@ pub enum RankUsed {
     Linear,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct Member {
     pub photo_id: i64,
     pub generation: String,

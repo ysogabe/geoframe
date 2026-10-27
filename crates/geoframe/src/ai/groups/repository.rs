@@ -2,7 +2,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, types::Value};
+use rusqlite::{
+    Connection, OptionalExtension, TransactionBehavior, params,
+    types::{Value, ValueRef},
+};
 
 use super::*;
 use crate::ai::space;
@@ -70,6 +73,19 @@ impl Row {
             Value::Integer(id) => id,
             _ => 0,
         }
+    }
+    fn generation(&self) -> String {
+        let mut values = self.values[..6].to_vec();
+        values.extend_from_slice(&self.values[11..21]);
+        row_digest(&values)
+    }
+    fn shown(&self) -> bool {
+        let v = &self.values;
+        text(&v[1]).is_some_and(|s| !s.is_empty())
+            && number(&v[6]).unwrap_or(0.0) == 0.0
+            && number(&v[8]).is_some()
+            && number(&v[9]).is_some()
+            && (text(&v[21]) != Some("exact") || number(&v[22]) == Some(1.0))
     }
     fn sha(&self) -> Option<&str> {
         text(&self.values[12]).filter(|s| valid_sha(s))
@@ -446,14 +462,8 @@ pub fn snapshot(conn: &Connection) -> Result<Option<Snapshot>, Error> {
                 Readiness::PendingEmbedding
             }
         };
-        let mut generation_values = v[..6].to_vec();
-        generation_values.extend_from_slice(&v[11..21]);
-        let generation = row_digest(&generation_values);
-        let shown = text(&v[1]).is_some_and(|s| !s.is_empty())
-            && number(&v[6]).unwrap_or(0.0) == 0.0
-            && number(&v[8]).is_some()
-            && number(&v[9]).is_some()
-            && (text(&v[21]) != Some("exact") || number(&v[22]) == Some(1.0));
+        let generation = row.generation();
+        let shown = row.shown();
         photos.push(Photo {
             input: Input {
                 photo_id: row.id(),
@@ -530,21 +540,27 @@ pub fn save(
     if raw.identity != plan.identity || raw.guard(group.lo, group.hi) != group.guard {
         return Ok(Saved::Stale);
     }
-    let existing: Option<(String, String, String)> = tx
+    if !valid_group(&raw, group, plan.options)? {
+        return Err(Error::CorruptResult);
+    }
+    let values = group_values(&plan.identity, group, plan.options)?;
+    let existing: Option<Vec<Value>> = tx
         .query_row(
-            "SELECT input_guard,state,rank_used FROM ai_scene_groups WHERE result_id=?1",
+            "SELECT * FROM ai_scene_groups WHERE result_id=?1",
             [&group.result_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            |r| (0..16).map(|i| r.get(i)).collect(),
         )
         .optional()?;
-    if existing
-        == Some((
-            group.guard.clone(),
-            state_name(group.state).into(),
-            encode(&group.rank_used)?,
-        ))
-        && (group.state == State::Waiting || pointers_match(&tx, group)?)
-    {
+    let stored_members_match = if existing.as_ref() == Some(&values) {
+        match read_members(&tx, &group.result_id) {
+            Ok(members) => members == group.members,
+            Err(Error::CorruptResult) => false,
+            Err(error) => return Err(error),
+        }
+    } else {
+        false
+    };
+    if stored_members_match && (group.state == State::Waiting || pointers_match(&tx, group)?) {
         return Ok(Saved::Unchanged);
     }
     let ids: Vec<_> = group.members.iter().map(|m| m.photo_id).collect();
@@ -552,11 +568,12 @@ pub fn save(
         return Ok(Saved::Stale);
     }
     tx.execute("INSERT INTO ai_scene_groups VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
-       ON CONFLICT(result_id) DO UPDATE SET state=excluded.state,overlap=excluded.overlap,rank_used=excluded.rank_used,
-       lo=excluded.lo,hi=excluded.hi,input_guard=excluded.input_guard,legacy_json=excluded.legacy_json",
-       params![group.result_id,plan.identity.space_id(),plan.identity.fingerprint(),group.input_generation,group.processor_version,
-           plan.options.window_s,plan.options.similarity,plan.options.shortlist as i64,state_name(group.state),overlap_name(group.overlap),
-           encode(&group.rank_used)?,group.weight_digest,group.lo,group.hi,group.guard,encode(&group.legacy)?])?;
+       ON CONFLICT(result_id) DO UPDATE SET space_id=excluded.space_id,space_fingerprint=excluded.space_fingerprint,
+       input_generation=excluded.input_generation,processor_version=excluded.processor_version,window_s=excluded.window_s,
+       similarity=excluded.similarity,shortlist=excluded.shortlist,state=excluded.state,overlap=excluded.overlap,
+       rank_used=excluded.rank_used,weight_digest=excluded.weight_digest,lo=excluded.lo,hi=excluded.hi,
+       input_guard=excluded.input_guard,legacy_json=excluded.legacy_json",
+       rusqlite::params_from_iter(values.iter()))?;
     tx.execute(
         "DELETE FROM ai_scene_members WHERE result_id=?1",
         [&group.result_id],
@@ -580,6 +597,14 @@ pub fn save(
         }
     }
     drop(insert);
+    if group.state != State::Waiting {
+        tx.execute(
+            "DELETE FROM ai_scene_active WHERE result_id=?1 AND NOT EXISTS(
+            SELECT 1 FROM ai_scene_members m WHERE m.result_id=ai_scene_active.result_id
+            AND m.photo_id=ai_scene_active.photo_id)",
+            [&group.result_id],
+        )?;
+    }
     if stopped() {
         return Ok(Saved::Interrupted);
     }
@@ -587,12 +612,152 @@ pub fn save(
     Ok(Saved::Stored)
 }
 fn pointers_match(conn: &Connection, group: &Group) -> Result<bool, Error> {
-    let n: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM ai_scene_active WHERE result_id=?1",
-        [&group.result_id],
-        |r| r.get(0),
+    let ids = conn
+        .prepare("SELECT photo_id FROM ai_scene_active WHERE result_id=?1 ORDER BY photo_id")?
+        .query_map([&group.result_id], |r| r.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+    Ok(ids == group.members.iter().map(|m| m.photo_id).collect())
+}
+
+fn group_values(
+    identity: &SpaceIdentity,
+    group: &Group,
+    options: Options,
+) -> Result<Vec<Value>, Error> {
+    Ok(vec![
+        group.result_id.clone().into(),
+        identity.space_id().to_string().into(),
+        identity.fingerprint().into(),
+        group.input_generation.clone().into(),
+        group.processor_version.clone().into(),
+        options.window_s.into(),
+        options.similarity.into(),
+        (options.shortlist as i64).into(),
+        state_name(group.state).to_string().into(),
+        overlap_name(group.overlap).to_string().into(),
+        encode(&group.rank_used)?.into(),
+        group.weight_digest.clone().map_or(Value::Null, Value::Text),
+        group.lo.into(),
+        group.hi.into(),
+        group.guard.clone().into(),
+        encode(&group.legacy)?.into(),
+    ])
+}
+
+fn flag(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<bool> {
+    match row.get_ref(index)? {
+        ValueRef::Integer(0) => Ok(false),
+        ValueRef::Integer(1) => Ok(true),
+        value => Err(rusqlite::Error::FromSqlConversionFailure(
+            index,
+            value.data_type(),
+            Box::new(Error::CorruptResult),
+        )),
+    }
+}
+
+fn read_members(conn: &Connection, result_id: &str) -> Result<Vec<Member>, Error> {
+    let mut stmt = conn.prepare(
+        "SELECT photo_id,generation,rank,score,shortlisted,representative,shown,favorite
+        FROM ai_scene_members WHERE result_id=?1 ORDER BY rank",
     )?;
-    Ok(n == group.members.len() as i64)
+    stmt.query_map([result_id], |r| {
+        Ok(Member {
+            photo_id: r.get(0)?,
+            generation: r.get(1)?,
+            rank: r.get::<_, i64>(2)? as usize,
+            score: r.get(3)?,
+            shortlisted: flag(r, 4)?,
+            representative: flag(r, 5)?,
+            shown: flag(r, 6)?,
+            favorite: flag(r, 7)?,
+        })
+    })?
+    .collect::<rusqlite::Result<_>>()
+    .map_err(|e| {
+        if e.sqlite_error_code().is_some() {
+            Error::Database
+        } else {
+            Error::CorruptResult
+        }
+    })
+}
+
+/// Shared by current reads and the save fast path; all members must describe one complete result.
+fn valid_group(raw: &Raw, group: &Group, options: Options) -> Result<bool, Error> {
+    if group.members.is_empty()
+        || (matches!(group.rank_used, RankUsed::Linear) != group.weight_digest.is_some())
+        || group
+            .weight_digest
+            .as_deref()
+            .is_some_and(|d| !valid_sha(d))
+        || group.processor_version
+            != options.processor_version(&raw.identity, group.weight_digest.as_deref())
+    {
+        return Ok(false);
+    }
+    let members: BTreeMap<_, _> = group.members.iter().map(|m| (m.photo_id, m)).collect();
+    if members.len() != group.members.len() {
+        return Ok(false);
+    }
+    let current: BTreeMap<_, _> = raw.rows.iter().map(|r| (r.id(), r)).collect();
+    let waiting = group.state == State::Waiting;
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    for (i, m) in group.members.iter().enumerate() {
+        let Some(row) = current.get(&m.photo_id) else {
+            return Ok(false);
+        };
+        let Some(time) = row.captured else {
+            return Ok(false);
+        };
+        lo = lo.min(time);
+        hi = hi.max(time);
+        if m.generation != row.generation()
+            || m.rank != i + 1
+            || m.shown != row.shown()
+            || m.favorite != (number(&row.values[7]) == Some(1.0))
+            || m.shortlisted != (!waiting && m.rank <= options.shortlist)
+            || m.representative != (!waiting && m.rank == 1)
+            || if waiting {
+                m.score.is_some()
+            } else {
+                !m.score
+                    .is_some_and(|s| s.is_finite() && (0.0..=100.0).contains(&s))
+            }
+        {
+            return Ok(false);
+        }
+    }
+    if group.lo != lo.saturating_sub(options.window_s)
+        || group.hi != hi.saturating_add(options.window_s)
+    {
+        return Ok(false);
+    }
+    if !waiting
+        && group.members.windows(2).any(|m| {
+            let order = m[0].score.unwrap().total_cmp(&m[1].score.unwrap());
+            order.is_lt() || (order.is_eq() && m[0].photo_id > m[1].photo_id)
+        })
+    {
+        return Ok(false);
+    }
+    let generation = fingerprint(
+        &members
+            .values()
+            .map(|m| m.generation.as_str())
+            .collect::<Vec<_>>(),
+    );
+    if group.input_generation != generation
+        || group.result_id
+            != fingerprint(&["scene-result-v1", &group.processor_version, &generation])
+    {
+        return Ok(false);
+    }
+    let ids: Vec<_> = members.keys().copied().collect();
+    let (overlap, legacy) = raw.overlap(&ids);
+    Ok(group.overlap == overlap
+        && encode(&group.legacy)? == encode(&legacy)?
+        && (waiting || (group.state == State::ReviewOverlap) == (overlap == Overlap::Partial)))
 }
 fn state_name(state: State) -> &'static str {
     match state {
@@ -647,7 +812,7 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
             groups: Vec::new(),
         });
     }
-    let mut stmt=tx.prepare("SELECT result_id,input_generation,processor_version,state,overlap,rank_used,lo,hi,input_guard,weight_digest,legacy_json FROM ai_scene_groups g
+    let mut stmt=tx.prepare("SELECT result_id,input_generation,processor_version,state,overlap,rank_used,lo,hi,input_guard,weight_digest,legacy_json,window_s,similarity,shortlist,space_id FROM ai_scene_groups g
       WHERE space_fingerprint=?1 AND processor_version=?2 AND state!='waiting'
       AND EXISTS(SELECT 1 FROM ai_scene_active a WHERE a.result_id=g.result_id) ORDER BY result_id")?;
     let rows = stmt
@@ -666,6 +831,10 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
                     r.get::<_, String>(8)?,
                     r.get::<_, Option<String>>(9)?,
                     r.get::<_, String>(10)?,
+                    r.get::<_, i64>(11)?,
+                    r.get::<_, f64>(12)?,
+                    r.get::<_, i64>(13)?,
+                    r.get::<_, String>(14)?,
                 ))
             },
         )?
@@ -684,6 +853,10 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
         guard,
         weight_digest,
         legacy,
+        window_s,
+        similarity,
+        shortlist,
+        space_id,
     ) in rows
     {
         if raw.guard(lo, hi) != guard {
@@ -702,21 +875,7 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
         };
         let rank_used = serde_json::from_str(&rank_used).map_err(|_| Error::CorruptResult)?;
         let legacy = serde_json::from_str(&legacy).map_err(|_| Error::CorruptResult)?;
-        let mut stmt=tx.prepare("SELECT photo_id,generation,rank,score,shortlisted,representative,shown,favorite FROM ai_scene_members WHERE result_id=?1 ORDER BY rank")?;
-        let members = stmt
-            .query_map([&result_id], |r| {
-                Ok(Member {
-                    photo_id: r.get(0)?,
-                    generation: r.get(1)?,
-                    rank: r.get::<_, i64>(2)? as usize,
-                    score: r.get(3)?,
-                    shortlisted: r.get(4)?,
-                    representative: r.get(5)?,
-                    shown: r.get(6)?,
-                    favorite: r.get(7)?,
-                })
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let members = read_members(&tx, &result_id)?;
         let group = Group {
             result_id,
             input_generation,
@@ -732,7 +891,13 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
             weight_digest,
             expected_active: String::new(),
         };
-        if !group.members.is_empty() && pointers_match(&tx, &group)? {
+        let shortlist = usize::try_from(shortlist).map_err(|_| Error::CorruptResult)?;
+        let options =
+            Options::new(window_s, similarity, shortlist).map_err(|_| Error::CorruptResult)?;
+        if space_id != raw.identity.space_id() || !valid_group(&raw, &group, options)? {
+            return Err(Error::CorruptResult);
+        }
+        if pointers_match(&tx, &group)? {
             groups.push(group);
         }
     }

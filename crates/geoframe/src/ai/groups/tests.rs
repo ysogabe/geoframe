@@ -537,6 +537,127 @@ fn waiting_never_publishes_and_empty_plan_keeps_old_selection() {
     assert!(p.groups.is_empty());
     assert!(rows(&c, "photo_ai_groups") == old);
 }
+
+#[test]
+fn current_pointer_membership_must_match_ids_not_only_count() {
+    let mut c = pair();
+    let p = plan(&c);
+    save(&mut c, &p, 0, &|| false).unwrap();
+    c.execute(
+        "UPDATE ai_scene_active SET photo_id=999 WHERE photo_id=2",
+        [],
+    )
+    .unwrap();
+    assert!(
+        load_current(&c, p.groups[0].processor_version())
+            .unwrap()
+            .groups()
+            .is_empty()
+    );
+    assert_ne!(save(&mut c, &p, 0, &|| false).unwrap(), Saved::Unchanged);
+    let fresh = plan(&c);
+    assert_eq!(save(&mut c, &fresh, 0, &|| false).unwrap(), Saved::Stored);
+    assert_eq!(
+        load_current(&c, fresh.groups[0].processor_version())
+            .unwrap()
+            .groups()
+            .len(),
+        1
+    );
+    assert_eq!(rows(&c, "ai_scene_active").len(), 2);
+}
+
+#[test]
+fn stored_scene_corruption_is_rejected_by_reads_and_unchanged_checks() {
+    for case in 0..11 {
+        let mut c = pair();
+        let p = plan(&c);
+        save(&mut c, &p, 0, &|| false).unwrap();
+        match case {
+            0 => c
+                .execute(
+                    "UPDATE ai_scene_members SET generation='synthetic-wrong' WHERE photo_id=2",
+                    [],
+                )
+                .unwrap(),
+            1 => {
+                c.execute("DELETE FROM ai_scene_members WHERE photo_id=2", [])
+                    .unwrap();
+                c.execute("DELETE FROM ai_scene_active WHERE photo_id=2", [])
+                    .unwrap()
+            }
+            2 => c
+                .execute(
+                    "UPDATE ai_scene_members SET score=?1 WHERE photo_id=2",
+                    [f64::INFINITY],
+                )
+                .unwrap(),
+            3 => c
+                .execute("UPDATE ai_scene_members SET rank=3 WHERE rank=2", [])
+                .unwrap(),
+            4 => c
+                .execute(
+                    "UPDATE ai_scene_members SET representative=1 WHERE rank=2",
+                    [],
+                )
+                .unwrap(),
+            5 => c
+                .execute("UPDATE ai_scene_members SET shortlisted=2 WHERE rank=2", [])
+                .unwrap(),
+            6 => c
+                .execute(
+                    "UPDATE ai_scene_groups SET input_generation='synthetic-wrong'",
+                    [],
+                )
+                .unwrap(),
+            7 => c
+                .execute("UPDATE ai_scene_groups SET shortlist=1", [])
+                .unwrap(),
+            8 => c
+                .execute("UPDATE ai_scene_members SET shown=0 WHERE rank=2", [])
+                .unwrap(),
+            9 => c
+                .execute("UPDATE ai_scene_members SET score=101 WHERE rank=2", [])
+                .unwrap(),
+            _ => {
+                c.execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                    UPDATE ai_scene_groups SET result_id='synthetic-wrong-result';
+                    UPDATE ai_scene_members SET result_id='synthetic-wrong-result';
+                    UPDATE ai_scene_active SET result_id='synthetic-wrong-result';",
+                )
+                .unwrap();
+                0
+            }
+        };
+        assert!(
+            matches!(
+                load_current(&c, p.groups[0].processor_version()),
+                Err(Error::CorruptResult)
+            ),
+            "case {case}"
+        );
+        assert_ne!(
+            save(&mut c, &p, 0, &|| false).unwrap(),
+            Saved::Unchanged,
+            "case {case}"
+        );
+        let fresh = plan(&c);
+        assert_eq!(
+            save(&mut c, &fresh, 0, &|| false).unwrap(),
+            Saved::Stored,
+            "case {case}"
+        );
+        assert_eq!(
+            load_current(&c, fresh.groups[0].processor_version())
+                .unwrap()
+                .groups()
+                .len(),
+            1,
+            "case {case}"
+        );
+    }
+}
 #[test]
 fn overlap_disjoint_exact_partial_and_visibility_share_selection_rules() {
     for ids in [vec![1, 2], vec![1, 3], vec![3, 4]] {
