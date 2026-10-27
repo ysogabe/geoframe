@@ -83,7 +83,7 @@ impl Lab {
     }
 }
 fn handlers(e: &Env) -> Vec<Arc<dyn Handler>> {
-    worker::production_handlers(&e.config, LanClient::new(&e.config.ai))
+    worker::production_handlers_for_test(&e.config, LanClient::new(&e.config.ai))
 }
 fn cycle(e: &Env) {
     cycle_stop(e, &StopFlag::new());
@@ -1016,7 +1016,7 @@ fn config_scope_and_cloud_permissions_do_not_change_success_identity_and_disable
     config.ai = crate::ai::settings::AiConfig::load(&|k| {
         (k == "GEOFRAME_AI_CONFIG").then(|| settings_path.to_str().unwrap().to_string())
     });
-    let h = worker::production_handlers(&config, LanClient::new(&config.ai));
+    let h = worker::production_handlers_for_test(&config, LanClient::new(&config.ai));
     let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
     assert_eq!(h[0].reconcile(&read, T0).unwrap()[0], old);
     assert!(matches!(
@@ -1028,7 +1028,7 @@ fn config_scope_and_cloud_permissions_do_not_change_success_identity_and_disable
     Core::new(&deps).cycle();
     assert_eq!(lab.posts().len(), 1);
     config.ingest = false;
-    assert!(worker::production_handlers(&config, LanClient::new(&config.ai)).is_empty());
+    assert!(worker::production_handlers_for_test(&config, LanClient::new(&config.ai)).is_empty());
     for json in ["{}", r#"{"version":1,"tasks":{}}"#] {
         let disabled = env_with("clue-no-schema", json, true);
         assert!(handlers(&disabled).is_empty());

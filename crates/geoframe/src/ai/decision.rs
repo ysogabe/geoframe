@@ -318,6 +318,14 @@ pub fn check_health(body: &[u8], configured_model: &str) -> Result<(), ProviderE
 /// 送る前の確認: Discovery（catalog・service）と health。全体で 1 つの Discovery 期限（2 秒）を共有する。
 pub fn probe(session: &Session, configured_model: &str) -> Result<(), ProviderError> {
     let deadline = Deadline::discovery();
+    probe_until(session, configured_model, &deadline)
+}
+
+pub(super) fn probe_until(
+    session: &Session,
+    configured_model: &str,
+    deadline: &Deadline,
+) -> Result<(), ProviderError> {
     let id = service_id();
     discovery::check(
         session,
@@ -325,10 +333,10 @@ pub fn probe(session: &Session, configured_model: &str) -> Result<(), ProviderEr
             service: &id,
             apis: REQUIRED_APIS,
         },
-        &deadline,
+        deadline,
     )?;
     let reply = session
-        .get(Endpoint::DecisionHealth, &deadline)
+        .get(Endpoint::DecisionHealth, deadline)
         .map_err(|e| ProviderError::from_http(e, Phase::Probe))?;
     if !reply.is_success() {
         return Err(ProviderError::from_status(

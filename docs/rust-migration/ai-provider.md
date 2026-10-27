@@ -1,7 +1,7 @@
 # AI Provider基盤（T4.2）
 
 - 状態: T4.2で実装。設計は[p4-design.md](p4-design.md) §4.3・§5、設定は[ai-config.md](ai-config.md)。
-- 範囲: **AI専用のHTTP・接続先の固定・Discovery・Decisionの入出力・共有の一時待機**まで。用途別のhandler（Decisionの質問と閾値・clueの保存はT4.6、画像／文EmbeddingはT4.4）、クラウドの認証・送信はT4.6aで追加した[ai-cloud.md](ai-cloud.md)を参照。T4.6bで[写真別location_clue](ai-location-clue.md)だけを本番登録した（他の未登録jobはclaimも成功化もされない）。
+- 範囲: **AI専用のHTTP・接続先の固定・Discovery・Decisionの入出力・共有の一時待機**まで。用途別のhandler（Decisionの質問と閾値・clueの保存はT4.6、画像／文EmbeddingはT4.4）、クラウドの認証・送信はT4.6aで追加した[ai-cloud.md](ai-cloud.md)を参照。T4.6bで[写真別location_clue](ai-location-clue.md)、T4.6c2で[日候補と別座標化](ai-location-suggest.md)を本番登録した（他の未登録jobはclaimも成功化もされない）。
 - 実LAN・外部AI・クラウド・課金は使っていない（試験はループバックのスタブ・偽のDNS・合成の画像／DBだけ）。
 
 ## 参照した契約（固定した版）
@@ -105,7 +105,7 @@
 
 ## 未実装・後続
 
-- 日候補・座標化のhandler（T4.6c）、画像／文Embedding（T4.4）。写真別clueはT4.6bで登録済み。
+- 画像／文Embedding（T4.4）。写真別clueはT4.6b、日候補・別座標化はT4.6c2で登録済み。Decision readyの失敗をCloud認証pauseに流用しない。
 - クラウド（Vertex）のアダプター・token読取・401の一度のrefresh・送信後の課金計数（T4.6）。このタスクでクラウドへの実送信はしていない。
 - 対話（検索語Embedding）の予約キャッシュとE5/E6への接続（T4.4）。`AiHttp::run_interactive`は枠と境界だけ。
 - 実LAN・実Decision・実画像での確認はT4.7（LXC）。

@@ -3,6 +3,7 @@
 
 python3 tools/gen_location_suggest_fixture.py [--check]
 --roundtrip reads synthetic Rust rows from stdin and runs the actual Python parser/reuse functions.
+--apply-roundtrip also applies the run using injected synthetic geocode hits and an in-memory row collector.
 """
 import argparse
 import ast
@@ -17,14 +18,17 @@ FIXTURE = ROOT / 'crates/geoframe/tests/fixtures/location-suggest-python.json'
 FUNCTIONS = {'passes', '_rank_key', 'group_days', 'pick_send', 'run_id_for', '_parse_answer', '_reusable_run'}
 
 
-def functions(model='synthetic-suggest', gap=43200):
+def functions(model='synthetic-suggest', gap=43200, apply=False):
     tree = ast.parse((ROOT / SOURCE).read_text())
-    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in FUNCTIONS]
-    assert {n.name for n in nodes} == FUNCTIONS
-    # Only these named, reviewed pure functions are compiled. No top-level app code/import executes.
+    selected = FUNCTIONS | ({'_geocode', '_apply_run'} if apply else set())
+    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in selected]
+    assert {n.name for n in nodes} == selected
+    # Only these named, reviewed functions are compiled; apply I/O is injected. No top-level app code/import executes.
     env = {name: extract(SOURCE, name) for name in
            ('CLUE_MIN', 'MAX_SEND', 'PROMPT_VERSION', 'PRECISIONS', 'CONFIDENCES')}
     env.update(hashlib=hashlib, json=json, GROUP_GAP_S=gap, LOC_SUGGEST_MODEL=model)
+    if apply:
+        env['COARSER'] = extract(SOURCE, 'COARSER')
     exec(compile(ast.Module(body=nodes, type_ignores=[]), SOURCE, 'exec'), env)
     return env
 
@@ -38,11 +42,12 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true')
     parser.add_argument('--roundtrip', action='store_true')
+    parser.add_argument('--apply-roundtrip', action='store_true')
     args = parser.parse_args()
-    if args.roundtrip:
+    if args.roundtrip or args.apply_roundtrip:
         import sys
         v = json.load(sys.stdin)
-        f = functions(v['model'])
+        f = functions(v['model'], apply=args.apply_roundtrip)
         row = v['run']
         assert len(row) == 11
         assert row['run_id'] == f['run_id_for'](v['model'], json.loads(row['sent_ids_json']))
@@ -50,6 +55,13 @@ def main():
         envelope = {'candidates': [{'content': {'parts': [{'text': row['answer_json']}]}}]}
         assert f['_parse_answer'](envelope, len(json.loads(row['sent_ids_json']))) == answer
         assert f['_reusable_run'](row['day'], [{'id': i} for i in v['subset']], [row]) == row
+        if args.apply_roundtrip:
+            rows = []
+            f['nominatim_search'] = lambda q, cc: v['hits'].get(q, [])
+            f['dbm'] = lambda sql, values: rows.extend(values)
+            assert f['_apply_run'](row, [{'id': i} for i in v['subset']]) == len(v['subset'])
+            print(json.dumps(rows, ensure_ascii=False))
+            return
         print('Python AST parser / run_id / subset reuse accepted Rust eleven-column projection')
         return
     f = functions()

@@ -279,7 +279,7 @@ fn the_shipped_binary_registers_only_location_clue_and_a_worker_starts_only_with
     // 配布バイナリは location_clue のみ（fake・本番のスタブは置かない）
     let e = env("production-registration");
     let handlers =
-        production_handlers(&e.config, crate::ai::provider::LanClient::new(&e.config.ai));
+        production_handlers_for_test(&e.config, crate::ai::provider::LanClient::new(&e.config.ai));
     assert_eq!(handlers.len(), 1);
     assert_eq!(handlers[0].kind(), JobKind::LocationClue);
 

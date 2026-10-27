@@ -1,4 +1,4 @@
-//! 日候補の固定 domain と有償回答 repository。handler/HTTP/座標化は T4.6c2。
+//! 日候補の固定 domain・有償回答 repository・本番 handler / 別座標化（T4.6c1/c2）。
 //! writer 内では DB のみを読み、画像準備・ファイル観測は呼出し側で行う。
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -12,12 +12,15 @@ use crate::datadir::DataDir;
 
 mod answer;
 mod repository;
+mod runtime;
 pub use answer::{Answer, Confidence, PhotoAnswer, Precision};
 pub use repository::{
     Lookup, Queue, SavedAnswer, complete, enqueue, enqueue_in, lookup, persist_answer,
     project_failure, restore_projection, saved_sent_ids,
 };
 pub(super) use repository::{SCHEMA, TABLES};
+pub(super) use runtime::handlers;
+pub use runtime::{candidate_current, hold_counts};
 #[cfg(test)]
 mod tests;
 
@@ -38,6 +41,7 @@ pub enum DomainError {
     Pending,
     NoImages,
     BadResponse,
+    TooLarge,
 }
 
 fn sha(bytes: &[u8]) -> String {
@@ -77,7 +81,7 @@ pub fn processor_version(model: &str) -> String {
 }
 
 /// cloud 許可範囲の一つの時刻集合。写真情報は Debug に出さない。
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Day {
     day: String,
     members: Vec<Generation>,
@@ -85,6 +89,7 @@ pub struct Day {
     pending: bool,
     gap_s: f64,
     include_hidden: bool,
+    visibility: Vec<(i64, bool)>,
 }
 impl std::fmt::Debug for Day {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -119,6 +124,16 @@ impl Day {
         }
         for g in &self.members {
             if !g.matches_db(conn)? {
+                return Ok(false);
+            }
+        }
+        for (id, hidden) in &self.visibility {
+            let current: bool = conn.query_row(
+                "SELECT COALESCE(hidden,0)!=0 FROM photos WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            if current != *hidden {
                 return Ok(false);
             }
         }
@@ -228,6 +243,17 @@ pub fn group_days(
                 .then(a.0.cmp(&b.0))
         });
         let sent_ids = passing.into_iter().take(MAX_SEND).map(|p| p.0).collect();
+        let visibility = group
+            .iter()
+            .map(|p| {
+                conn.query_row(
+                    "SELECT COALESCE(hidden,0)!=0 FROM photos WHERE id=?1",
+                    [p.0],
+                    |r| Ok((p.0, r.get(0)?)),
+                )
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| DomainError::InvalidInput)?;
         days.push(Day {
             day: group[0].1.clone(),
             members: group.into_iter().map(|p| p.3.0).collect(),
@@ -235,6 +261,7 @@ pub fn group_days(
             pending,
             gap_s: gap,
             include_hidden,
+            visibility,
         });
     }
     Ok(days)
@@ -325,7 +352,10 @@ impl Plan {
             &schema(),
             &numbered,
         )
-        .map_err(|_| DomainError::InvalidInput)?;
+        .map_err(|e| match e {
+            super::cloud::RequestError::TooLarge => DomainError::TooLarge,
+            _ => DomainError::InvalidInput,
+        })?;
         let manifest = Manifest {
             day: day.day.clone(),
             model: model.into(),

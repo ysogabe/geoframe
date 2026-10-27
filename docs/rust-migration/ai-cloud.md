@@ -1,14 +1,14 @@
 # Vertex クラウド通信基盤（T4.6a）
 
-P4-AC2/5/10aの認証・通信境界を実装した。写真比較・位置候補のhandler、判定prompt・domain parse、画像／文Embedding APIは含まない。T4.6bで写真別LAN location_clueを登録済みだが、クラウドのhandlerは未登録。実クラウド・実写真・実鍵・実DBは使わず、合成入力とloopbackだけで試験する。
+P4-AC2/5/10aの認証・通信境界を実装した。写真比較・位置候補のhandler、判定prompt・domain parse、画像／文Embedding APIは含まない。T4.6bで写真別LAN location_clue、T4.6c2で[日候補と別座標化handler](ai-location-suggest.md)を本番登録した。実クラウド・実写真・実鍵・実DBは使わず、合成入力とloopbackだけで試験する。
 
 ## 呼出しと共有
 
-`ai::cloud::CloudClients::new(&config.ai)`を、後続のhandler構築時にプロセスで一度作り、cloneして共有する。構築時は設定文字列だけを検査し、鍵読取り・DNS・HTTPは行わない。同じ認証パス・project・regionの用途は同じProviderを参照し、agentと背景1／対話1の`Lanes`を共有する。token取得は既に取得した枠の内側で行い、二重に枠を取らない。LANとは枠を分ける。現時点の登録対象は`photo_judge`・`location_suggest`だけ。対話実処理とEmbeddingの登録・契約はT4.4（#93待ち）。別々に`CloudClients::new`して枠を増やさない。
+`ai::cloud::CloudClients::new(&config.ai)`を、serveのhandler構築前にプロセスで一度作り、cloneして共有する。構築時は設定文字列だけを検査し、鍵読取り・DNS・HTTPは行わない。同じ認証パス・project・regionの用途は同じProviderを参照し、agentと背景1／対話1の`Lanes`を共有する。token取得は既に取得した枠の内側で行い、二重に枠を取らない。LANとは枠を分ける。現時点の登録対象は`photo_judge`・`location_suggest`だけ。対話実処理とEmbeddingの登録・契約はT4.4（#93待ち）。別々に`CloudClients::new`して枠を増やさない。
 
-公開入口は`CloudClients::client(TaskKind)`→`CloudClient::run(&RunCtx, &GenerateRequest)`。任意のURL・header・JSONを送れる公開APIは無い。同期HTTPはAI専用スレッドで呼び、writer・DB transaction・画像lockを保持しない。
+公開入口は`CloudClients::client(TaskKind)`→`CloudClient::run`または`run_checked`。後者は同じ全体期限内でtoken前・各POST予約後に入力/Decisionを再検査し、401更新後も省略しない。任意のURL・header・JSONを送れる公開APIは無い。同期HTTPはAI専用スレッドで呼び、writer・DB transaction・画像lockを保持しない。
 
-`GenerateRequest`のconstructorはcrate内だけ。後続の固定prompt/schemaから次のように作る（例はcrate内での使い方。まだhandlerに登録しない）。
+`GenerateRequest`のconstructorはcrate内だけ。後続の固定prompt/schemaから次のように作る（例はcrate内での使い方。photo_judgeのhandler登録はT4.5）。
 
 ```rust,ignore
 let requests = CloudClients::new(&config.ai)?; // 一度作って共有

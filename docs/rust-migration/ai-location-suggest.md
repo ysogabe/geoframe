@@ -1,6 +1,6 @@
-# 日候補の domain・有償回答保存（T4.6c1）
+# 日候補・有償回答保存・座標化（T4.6c1/c2）
 
-AC2/4/8/9/10a のうち日集合・固定要求・応答型・世代別保存／再利用の domain / DB 部分を実装した。`production_handlers` への登録、CloudClient の実行、Decision の送信前 ready 確認、Nominatim 座標化、候補の HTTP/UI 統合は T4.6c2。Embedding #93・グループ・LXC・実 AI の受入は含まない。写真一次列と `photo_loc_suggestions` には書かない。
+AC2/4/5/8/9/10a の位置候補 runtime を本番 factory へ接続した。`location_clue` → `location_suggest`（paid回答の保存）→ 別 `location_geocode`（候補の投影）を既存 worker / writer / Guard / LockHold で処理する。候補は既存の管理API/UIに表示し、人のSAVEだけが写真の位置をmanualへ変える。Embedding #93・グループ・LXC・実Providerの受入は含まない。実写真送信や費用の追加許可を意味しない。
 
 ## 固定契約
 
@@ -27,11 +27,11 @@ Python の不正型で例外になる穴は互換の対象にしない。
 
 ## 来歴・履歴・互換行
 
-`ai_location_suggest_results` を1表だけ追加する（WITHOUT ROWID、result_key 主キー）。追加索引なし。列は result_key、manifest_json、answer_json、attempts（1..5）、analyzed_at、integrity_sha256。既存 `photo_loc_runs` の11列、`photo_loc_suggestions` の14列と意味を変えない。
+c1 の `ai_location_suggest_results` を追加する（WITHOUT ROWID、result_key 主キー）。追加索引なし。列は result_key、manifest_json、answer_json、attempts（1..5）、analyzed_at、integrity_sha256。既存 `photo_loc_runs` の11列、`photo_loc_suggestions` の14列と意味を変えない。
 
 manifest は day / model / prompt_version / processor_version / 順序付き全 members の Generation / 順序付き sent の photo_id・source SHA・JPEG SHA を持つ。その正規化 JSON の SHA が Rust の結果キーかつ job input_hash。job target_key は Python run_id、processor_version は model / prompt版 / `location-suggest-v1` / 画像前処理版の SHA。URL / timeout / policy 全体の hash を結果同一性に混ぜない。members は16,384件、manifest は4MiBまで。
 
-Generation は T4.6b の写真入力世代（display / 読取相対パス / md5 / mtime / rotation / taken_at / 現品質 SHA / fallback 実 SHA / 品質失敗）を共有し、clue 処理版とは分離する。GPS / hidden を画像世代に混ぜない。`Generation::observe` は lat 非NULLの写真も読める。再利用にはさらに `SourceObservation::observe` が全 sent の実 bytes と SHA を安全な読取境界で writer 外にて検証する。通常 display も実ファイルの変更・削除を未変更と推測せず、実 bytes と品質 SHA の不一致・読取不能・観測不足は Unverified で保留し、自動再送もしない。sent を人が SAVE した後もこの観測を必要とする。普通の display は品質 SHA を使い、fallback は安全な読取境界で実 SHA を writer 外で観測する。DB 内の `matches_db` は渡された fallback 観測を使って DB 世代だけを検査する。c2 は再利用と候補 CAS の前にも SourceObservation を更新し、画像準備・送信直前・応答後に実 bytes と source SHA を検査し、DB がまだ同じだからファイルも同じと推測しない。
+Generation は T4.6b の写真入力世代（display / 読取相対パス / md5 / mtime / rotation / taken_at / 現品質 SHA / fallback 実 SHA / 品質失敗）を共有し、clue 処理版とは分離する。GPS / hidden を画像世代に混ぜない。`Generation::observe` は lat 非NULLの写真も読める。再利用にはさらに `SourceObservation::observe` が全 sent の実 bytes と SHA を安全な読取境界で writer 外にて検証する。通常 display も実ファイルの変更・削除を未変更と推測せず、実 bytes と品質 SHA の不一致・読取不能・観測不足は Unverified で保留し、自動再送もしない。sent を人が SAVE した後もこの観測を必要とする。普通の display は品質 SHA を使い、fallback は安全な読取境界で実 SHA を writer 外で観測する。DB 内の `matches_db` は渡された fallback 観測を使って DB 世代だけを検査する。runtime は再利用と候補 CAS の前にも SourceObservation を更新し、画像準備・送信直前・応答後に実 bytes と source SHA を検査し、DB がまだ同じだからファイルも同じと推測しない。
 
 同じ Python run_id に新世代が現れても、過去の paid answer は別 result_key の履歴として残す。同じ result_key は冪等で、違う answer への置換を拒否する。integrity SHA は manifest / 正規化 answer / attempts / analyzed_at を結び、読み取り時にキー・型・整合性を再検証する。これは壊れた付帯情報の検出であり、DB を任意に整合的に改ざんできる管理者に対する署名ではない。
 
@@ -41,7 +41,7 @@ Generation は T4.6b の写真入力世代（display / 読取相対パス / md5 
 
 A→B→A のように互換行が別の**検証済み Rust 履歴**Bを指す場合は `ProjectionPending`。`restore_projection` が同じ tx 内で来歴と現世代を再検査して A を再投影し、再送0で再利用する。Python 由来の不明な行は復元の根拠にしない。座標化後の短い候補 tx では `SavedAnswer::applicable` で DB 世代だけでなく履歴・互換行を再照合する（lookup後の改変も拒否）。
 
-## c2 の接続手順
+## runtime の接続手順
 
 以下の API は CloudClient / 認証を必要としない。画像準備・観測と HTTP は writer 外で行う。
 
@@ -63,7 +63,7 @@ match location_suggest::lookup(&read, &day, cloud_model, &observed)? {
 }
 ```
 
-不在かつ sendable の Day に対して、選別順の `Vec<SendImage>` から `Plan::new` を作る。`enqueue(&mut conn, &plan, &observed, now)` は writer 上の短い tx 用。`enqueue_in(&Connection, ...)` は既存 tx（例: Handler::reconcile_cleanup の Persist）用である。旧 attempts 継承を行うため、**汎用 worker の jobs::enqueue より先にこの入口を使う**。既存の claim / token / Guard / LockHold / budgets / pause / STOP を迂回する新キューは作らない。c1 では handler も CloudClients も構築・登録しない。
+不在かつ sendable の Day に対して、選別順の `Vec<SendImage>` から `Plan::new` を作る。`enqueue(&mut conn, &plan, &observed, now)` は writer 上の短い tx 用。`enqueue_in(&Connection, ...)` は既存 tx（例: Handler::reconcile_cleanup の Persist）用である。旧 attempts 継承を行うため、**汎用 worker の jobs::enqueue より先にこの入口を使う**。既存の claim / token / Guard / LockHold / budgets / pause / STOP を迂回する新キューは作らない。runtime の reconcile_cleanup がこの入口を汎用enqueueより先に呼び、継承とmanual retry後の非再seedを維持する。
 
 c2 の Handler::run は `plan.request()` を CloudClient へ渡して応答を parse し、実 SHA / 現 policy を再検査した後に、次の短い保存 callback を返せる。
 
@@ -82,11 +82,55 @@ repository を単独で使うときは `complete(&mut conn, &claimed, &plan, &an
 
 ai_jobs.attempts（課金され得る失敗回数）を唯一の正とする。互換 done.attempts は保存時の ai_jobs.attempts + 1（成功要求を含む回数）、互換 error.attempts は terminal 時の ai_jobs.attempts。別の試行 counter を導入しない。同じ Python run_id の attempts は新 job INSERT 時に失敗回数として継承する。ただし、整合性を検証した Rust 履歴と互換全11列が一致する done は、保存時の成功要求1回を引いた saved.attempts - 1 を継承する。世代ごとの成功回数を失敗へ積み上げない。例えば失敗0＋成功の done.attempts=1 からは0、失敗4＋成功の done.attempts=5 からは4を継承する。未検証の旧 done は成功分を引く根拠にせず LegacyUnverified で保留し、自動再送しない。旧 error の attempts は減らさず継承し、5以上なら最初から failed / terminal（上限5へ保守的に丸める）。既存キーの enqueue / obsolete往復では reset しない。手動 jobs::retry_failed による reset 後は再 seed しない。過去の paid answer 履歴の元 attempts は変更しない。401更新後の2回目のPOSTは別の送信予算1枠で、jobの1試行とは区別する（既存 CloudClient の保証、c2が維持）。
 
-新表は ai::pending_active / migrate_active 系だけに置き、REQUIRED_SCHEMA / Python schema には足さない。ガード後の INGEST 起動で、有効な LocationSuggest gate があるときだけ作る。未指定 / 不正 / disabled / allow_cloudなし / daily_limitなしでは作らない。INGEST=0では作成せず旧 DB を read API で読み続ける。dry-run は有効な場合だけ不足1表を追加し、既存表があれば0。冪等移行は既存の Python 全表・全行を変えない。
+新表は ai::pending_active / migrate_active 系だけに置き、REQUIRED_SCHEMA / Python schema には足さない。ガード後の INGEST 起動で、有効な LocationSuggest gate があるときだけ作る。未指定 / 不正 / disabled / allow_cloudなし / daily_limitなしでは作らない。INGEST=0では作成せず旧 DB を read API で読み続ける。dry-run は有効な場合だけ不足表を追加する。c1以前からは3表、c1導入済みからは2表、全て作成済みなら0（下記）。冪等移行は既存の Python 全表・全行を変えない。
 
 受信後は有償回答の保存を優先し、保存済み回答からの座標化再開では再送しない。ただし受信直後から DB commit 前の crash / DB失敗では保存がなく再送の可能性が残る（既存 at-least-once の限界）。外部 exactly-once、新しい課金済み先行扱い、外部の冪等契約は保証しない。現世代に適用できない応答や旧 token を現在結果にしない。この c1 は既に確定した旧世代の履歴を保持するが、現世代 CAS が失敗した応答を別 tx で勝手に成功扱いする経路は作らない。
 
-c2 では Decision ready / CloudClient / 401待ち後の現写真と許可 gate、別 location_geocode job、Geocoder共有と0件/障害の区別、候補 CAS（photos.lat/lon不変）、handler登録、HTTP/UI/Python切り戻しの通し試験を実装する。これらとLXCは今回の合格主張に含めない。
+## 本番依存・新規送信・停止
+
+`serve` は AppState を先に構築し、その **同じArc<Geocoder>** と Ingest.cache を `production_handlers(config, lan, cloud, geocoder, cache)` へ渡す。Geocoder のrate Mutexを二重に作らない。LanClientはclueとready probeで共有し、CloudClientsはプロセスで一度構築する。retryの構築は認証・DNS・HTTPを行わず、既存CLI guard / ingest lock / writer内でだけ変更する。
+
+各周期は再利用を新規送信より先に判定する。保存回答はPending/送信画像0/CloudClientなし/認証ファイルなしでも座標化できる（location_suggestの設定・pause・周期上限は従う）。新規送信には有効なlocation_clue設定と現Decisionのavailable・画像対応readyが必要。`CloudClient::run_checked` は全体180秒を一度作り、tokenより前と各POST予約のwriter待ち後にcallbackを呼ぶ。401 refresh後の再送も同じcallback・期限・別の予算1枠を通す。callbackはDecisionを固定Discovery/healthで再確認し、その後DB集合・Readyの順位/送信順・hidden・実source SHAを検査する。Decision障害は固定`decision_wait`へ後回しにし、Cloud認証のpauseへ誤分類しない。
+
+画像はclueの限定読取り境界を共用する。DataDir内通常ファイル、リンク/FIFO/traversal拒否、限定read中だけ画像lock、writer外のdecode/sRGB/直接原本のEXIF一度適用、derivativeへ重複回転なし、1536pxかつ1.6MP以下、fresh JPEG q88。base64込み8MiB超過等は日と世代に結び付く恒久失敗jobにし、その日を自動で再送・ログ反復させず他の日を進める。枚数やprompt版を変えて収めない。
+
+STOPは既存HTTP GateConnectorがDNS/TCP/TLS待ち後のHTTP初writeでも検査する。Cloudの送信済み有効回答は停止中でも保存できる。既存SIGTERM60秒/unit90秒・join上限・LockHoldの所有を変更しない。
+
+## 座標化と候補の来歴
+
+paid回答のparse後にgeocodeを待たず、c1の回答履歴・Python全11列run・job成功を同txで保存する。次周期のreconcileが保存result_key＋現在の日集合/世代/hidden＋`nominatim-day-photo-coarser-v1`からgeocodejobを導く。CloudのURLや他用途のpolicy hashを入力キーへ混ぜない。
+
+GeocoderのAI入口`nominatim_checked`は `Success(Vec)`（空可）/ `Transient` / `Stopping`。既存search()/GETのVec応答は維持する。AIは固定Nominatimだけを使い、GSIへは出ない。UAはConfig.tile_ua、cacheキー`geocode_osm:`・cap5000・全体1秒1要求のMutexをGETと共有する。AIのHTTP agentはredirect/proxyなしと初writeのstop gateを持つ。rate Mutex待ちは停止・8秒の待ち上限を検査し、rate sleepはStopFlagで中断できる。送信済みの有効応答は受信・cache可能。
+
+Python `_geocode` / `_apply_run`に合わせ、日queryを引き、正常0件のときだけcomma先頭を除いて一度検索しCOARSERへ粗くする。写真別の有効回答は保存sent順でIDを解決し、現在のclue順位で読み替えない。写真地点が引けなければ日の地点とprecisionへfallbackする。未送信member/Failedは日scope、正常0件は座標なし候補として完了する。通信障害はgeocodejobだけでattempt上限5へ再試行し、manual retryだけが上限をresetする。途中で成功した問い合わせは共有cacheから再開する。Cloudへの再送理由にしない。
+
+c2で追加する2表（既存結果/一次列のschema変更なし、追加索引なし）:
+
+| 表 | 内容 |
+| --- | --- |
+| `ai_location_candidates` | photo_id主キー、result_key、現在Dayの世代/hidden snapshot JSON、投影した既存候補14列のsnapshot JSON。Rust由来と証明できる行だけを検査/復元する |
+| `ai_location_suggest_holds` | 固定reason主キーとcountだけ。pending / legacy_unverified / unverified / projection_pending / decision_wait / no_images |
+
+候補とgeocode成功は同writer tx/tokenで確定し、直前に更新したSourceObservationとSavedAnswer::applicableで全世代・現在集合・互換runを再検査する。SQL失敗は候補・付帯行・成功をrollbackし、有償回答を残す。成功後に互換候補だけが欠けた場合は、現世代と所有snapshotを検証してHTTPなしで復元する。Pythonが別内容に書き換えた候補へ偽の新来歴を付けたり、その行を消したりしない。
+
+管理API読取りも同じ来歴検査を通す。Rustが書いたのと一致する候補が更新/回転/削除/追加/SAVE/hidden/時刻変更で古くなれば表示しない。旧候補やPythonによる別内容の行は従来どおり参照する。`photos`の列は候補作成で一切UPDATEしない。status/CLIは`ai_location_holds`と固定job理由`decision_wait`/`geocode_wait`を件数だけ追加し、無い場合キーを省略する。地名/ID/hash/run_id/日付/本文/認証を新しいログや追加statusへ出さない。
+
+新表は有効なsuggest gate時だけmigration/dry-run対象にし、REQUIRED_SCHEMAへ足さない。INGEST=0、設定未指定/不正/無効、allow_cloud=false、日/周期上限0では新規Cloud token/DNS/POSTを行わない。旧AI表だけの読取りやPython切り戻しの既存run/suggestion列を維持する。
+
+## c2 の検証・引継ぎ
+
+試験は合成RGB/JPEG・合成DB・未登録のRSA fixture・loopbackだけ。実LAN/クラウド/画像/鍵/DB、SSH、LXCは使わない。fixtureは`include_str!`で埋め込み、既存の `tests/fixtures/jwt-test-pkcs8.b64` / `location-suggest-python.json` / `location-clue-python.json` 等を使用する。新たな外部配置fixtureは不要。LXCでRust単体試験を再ビルド/実行するときは更新済み`tools/gen_location_suggest_fixture.py`と既存`app/geoframe/loc_suggest.py`もソースツリーに含める（既存c1と同じPython3前提）。
+
+新規試験は `ai::location_suggest::runtime::tests` と `geocode::tests::ai_*`。factoryからDecision/token/generate/paid保存/別Nominatim/実候補API/人のSAVE、障害と再起動でCloud POST不変、Decision未準備/停止や未許可でPOST0、token/401/応答/地名問い合わせ中の入力変更、世代失効、6枚/rank/Failed/hidden/巨大body、旧token/SQL rollback、geocode上限5/manual retry、共有cache/UA/rate、STOP待ち後/初write/受信中を確認する。c1のattempts継承・旧done保留・Python全11列互換試験も維持する。`--apply-roundtrip`では実Python ASTの`_geocode` / `_apply_run`を合成地名応答と書込みcollectorで実行し、Rustの全11列paid runとmanual SAVE後の部分集合14列候補を読み戻して一致を確認する。
+
+最終確認（2026-10-27）: `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`、`cargo build --workspace --release --target x86_64-unknown-linux-musl` が成功。**全28 suite、1107 pass / 0 fail / 2 ignored**。追加24試験（runtime22＋Geocoder停止/共有rate2）、既存c1の27試験を維持。fileはstatic-pie linked、`--version`は `geoframe 0.1.0`。Pythonのlocation-suggest / location-clue / cloud-schema AST fixture checkも成功。
+
+通常sandboxのruntime試験初回はloopback bindの `Operation not permitted` で12失敗したため、許可された権限付き実行へ切り替えた。新fixtureの分単位時刻/Decision usage、HTTP試験のHost、通信先差替え走査が試験ファイルを識別する配置を修正した。初回workspaceの908 pass / 2 failはHostと試験配置の不備で、修正後は上記全件成功。既存flakeは観測していない。
+
+否定対照は、①CloudのPOST予約後callbackを外す→token待ち中変更試験、②geocode最終writer CASを外す→HTTP後/commit前変更試験、③Nominatim rate待ちを外す→GET/AI並行間隔試験、の3件で期待するassertion失敗を確認し、元ソースへ復元した。
+
+別Solの通常レビューとLXC受入は親タスクへ返す。実Provider疎通、実写真/費用の許可、#93/E5/E6、P4全体完了は主張しない。
+
 
 ## c1 の検証記録
 

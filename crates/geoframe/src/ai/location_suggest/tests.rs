@@ -973,12 +973,13 @@ fn guarded_start_creates_suggest_table_only_for_valid_enabled_configuration() {
         );
         assert_eq!(before, crate::ai::tests::dump(&read));
         assert!(
-            crate::ai::worker::production_handlers(
+            crate::ai::worker::production_handlers_for_test(
                 &cfg,
                 crate::ai::provider::LanClient::new(&cfg.ai)
             )
             .iter()
-            .all(|h| h.kind() != JobKind::LocationSuggest && h.kind() != JobKind::LocationGeocode)
+            .filter(|h| h.kind() == JobKind::LocationSuggest || h.kind() == JobKind::LocationGeocode)
+            .count() == if want { 2 } else { 0 }
         );
         drop(ingest);
     }

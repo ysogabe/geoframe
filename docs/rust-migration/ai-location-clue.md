@@ -1,6 +1,6 @@
 # 写真別 location_clue（T4.6b）
 
-AC2/4/5/8/10a の写真別 LAN 判定までを実装した。実機・実 LAN・実 Decision・実写真は未確認で、P4 完了や本番切替を意味しない。Embedding (#93)、グループ、日候補・クラウド・座標化は登録しない。試験は合成画像／DBと loopback Discovery / Decision のみ。
+AC2/4/5/8/10a の写真別 LAN 判定までを実装した。実機・実 LAN・実 Decision・実写真は未確認で、P4 完了や本番切替を意味しない。このclue handlerはLAN専用。日候補・クラウド・座標化の本番登録は[T4.6c2](ai-location-suggest.md)で追加した。Embedding (#93)・グループは対象外。試験は合成画像／DBと loopback Discovery / Decision のみ。
 
 ## 本番入口と後続 API
 

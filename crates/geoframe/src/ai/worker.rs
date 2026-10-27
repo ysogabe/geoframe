@@ -1,8 +1,8 @@
 //! AI の背景ワーカー（P4 / T4.1c。設計は p4-design.md §4）。
 //!
 //! 処理の std スレッドが 1 本（ほかに、SIGTERM の直後に停止開始を書くだけの小さなスレッドが 1 本）、既存の writer（[`crate::writer::Writer`]）と `.ingest.lock`
-//! （[`crate::ingest::LockHold`]）を共有して動く。T4.6b で [`super::location_clue`] を本番登録した。
-//! 他の用途は未登録のままで claim しない（fake の Provider・任意宛先の設定は置かない）。
+//! （[`crate::ingest::LockHold`]）を共有して動く。T4.6b/c2 で location_clue / location_suggest / location_geocode を本番登録した。
+//! Embedding / photo_judge は未登録のままで claim しない（fake の Provider・任意宛先の設定は置かない）。
 //!
 //! # 起動の条件
 //!
@@ -116,23 +116,47 @@ pub trait Handler: Send + Sync {
     }
 }
 
-/// 有効な location_clue だけを登録する。他の用途・fake は登録しない。
-/// LAN client は呼び出し側で一度作り、同じ provider の利用者と共有する。
-pub fn production_handlers(config: &Config, lan: Option<LanClient>) -> Vec<Arc<dyn Handler>> {
+/// プロセスで一度作った依存を注入する。GETとAIのGeocoder/cacheを分割しない。
+pub fn production_handlers(
+    config: &Config,
+    lan: Option<LanClient>,
+    cloud: Option<&super::cloud::CloudClients>,
+    geocoder: Arc<crate::geocode::Geocoder>,
+    cache: Arc<crate::cache::Cache>,
+) -> Vec<Arc<dyn Handler>> {
     if !config.ingest {
         return Vec::new();
     }
-    let Ok(gate) = config.ai.gate(TaskKind::LocationClue, true) else {
+    let Ok(data) = DataDir::open(&config.data_dir) else {
         return Vec::new();
     };
-    let (Some(lan), Ok(data)) = (lan, DataDir::open(&config.data_dir)) else {
-        return Vec::new();
-    };
-    vec![super::location_clue::handler(
-        data,
+    let mut handlers = Vec::new();
+    if let (Ok(gate), Some(lan)) = (config.ai.gate(TaskKind::LocationClue, true), lan.clone()) {
+        handlers.push(super::location_clue::handler(
+            data.clone(),
+            lan,
+            gate.settings.model.clone(),
+        ));
+    }
+    handlers.extend(super::location_suggest::handlers(
+        config, data, lan, cloud, geocoder, cache,
+    ));
+    handlers
+}
+
+#[cfg(test)]
+pub(super) fn production_handlers_for_test(
+    config: &Config,
+    lan: Option<LanClient>,
+) -> Vec<Arc<dyn Handler>> {
+    let cloud = super::cloud::CloudClients::new(&config.ai).ok();
+    production_handlers(
+        config,
         lan,
-        gate.settings.model.clone(),
-    )]
+        cloud.as_ref(),
+        Arc::new(crate::geocode::Geocoder::production(&config.tile_ua)),
+        Arc::new(crate::cache::Cache::memory_only()),
+    )
 }
 
 /// ジョブの種類を使う設定上の用途。`location_geocode` は LLM の routing を持たず、位置候補（`location_suggest`）の
@@ -171,6 +195,8 @@ pub enum RunError {
     InputChanged,
     /// 現在の品質特徴量の解析待ち。その写真だけ後回し、他の写真は進める。
     InputPending,
+    /// 依存サービスだけの待ち。Cloud Provider の認証停止へ波及させない。
+    DependencyWait(ErrorCode),
     /// 設定・許可が今は送信を許さない（[`Disabled`]。後続の handler は `Disabled` をこれに対応付ける）。
     /// 失敗に数えず後回し。
     PolicyDisabled,
@@ -276,6 +302,14 @@ impl<'a> RunCtx<'a> {
     /// （手順 4）だけをしない。推論の要求を出す前の確認で送信枠を使わないための区別。
     pub fn before_probe(&self) -> Result<Gate<'a>, RunError> {
         self.check(false, None)
+    }
+
+    pub(super) fn dependency_allowed(&self, task: TaskKind) -> bool {
+        self.config.gate(task, true).is_ok()
+            && self
+                .config
+                .settings()
+                .is_some_and(|s| matches!(pause::status(self.read, s, task), Ok(None)))
     }
 
     fn check(
@@ -773,6 +807,10 @@ impl Core {
             }
             RunError::InputPending => {
                 let (code, f) = defer(ErrorCode::InputPending, None);
+                (code, f, None)
+            }
+            RunError::DependencyWait(code) => {
+                let (code, f) = defer(code, None);
                 (code, f, None)
             }
             RunError::Unavailable => {

@@ -420,9 +420,30 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let stop = StopFlag::new();
     // AI（取り込みが有効のときだけ）: 前の起動の running の回収と、有効な背景用途があるときの背景ワーカー
     let ai_clock: Clock = Arc::new(jobs::unix_now);
-    let ai_worker = ingest
-        .as_ref()
-        .and_then(|ingest| start_ai(&config, ingest, &stop, &ai_clock));
+    // 地名検索の `.cache.json`。取り込みが有効なら同期サイクルと同じキャッシュ（保存は保存スレッドが行う）。
+    // 無効なら、読んでメモリに入れるだけでディスクへは書かない（本番の書き手は P5 の切替まで Python）
+    let cache = match &ingest {
+        Some(ingest) => Arc::clone(&ingest.cache),
+        None => Arc::new(Cache::load_memory_only(&config.data_dir)),
+    };
+    let mut state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
+    let cloud = crate::ai::cloud::CloudClients::new(&config.ai).ok();
+    let lan = crate::ai::provider::LanClient::new(&config.ai);
+    let ai_worker = ingest.as_ref().and_then(|ingest| {
+        start_ai(
+            &config,
+            ingest,
+            &stop,
+            &ai_clock,
+            worker::production_handlers(
+                &config,
+                lan,
+                cloud.as_ref(),
+                Arc::clone(&state.geocoder),
+                Arc::clone(&state.cache),
+            ),
+        )
+    });
     // Drive の状態。大量削除の保留の記憶は、管理画面（サーバーの状態）と `index_drive` で同じものを使う
     let drive = Arc::new(crate::drive::DriveShared::new());
     let mass_delete = drive.mass_delete_board();
@@ -442,13 +463,6 @@ fn serve(overrides: &Overrides) -> ExitCode {
             ingest.lock_hold(),
         ),
     });
-    // 地名検索の `.cache.json`。取り込みが有効なら同期サイクルと同じキャッシュ（保存は保存スレッドが行う）。
-    // 無効なら、読んでメモリに入れるだけでディスクへは書かない（本番の書き手は P5 の切替まで Python）
-    let cache = match &ingest {
-        Some(ingest) => Arc::clone(&ingest.cache),
-        None => Arc::new(Cache::load_memory_only(&config.data_dir)),
-    };
-    let mut state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
     if ingest.is_some() {
         state = state.with_mass_delete_board(mass_delete);
     }
@@ -512,6 +526,7 @@ fn start_ai(
     ingest: &Ingest,
     stop: &StopFlag,
     clock: &Clock,
+    handlers: Vec<Arc<dyn worker::Handler>>,
 ) -> Option<worker::AiWorker> {
     let started = worker::startup(config, &ingest.writer, clock)?;
     if !worker::should_start(config) {
@@ -529,10 +544,7 @@ fn start_ai(
         writer: ingest.writer.clone(),
         stop: stop.clone(),
         lock: ingest.lock_hold(),
-        handlers: worker::production_handlers(
-            config,
-            crate::ai::provider::LanClient::new(&config.ai),
-        ),
+        handlers,
         clock: Arc::clone(clock),
         poll: config.ai.legacy().poll(),
         run_id: started.run_id,
@@ -959,6 +971,9 @@ fn format_ai_report(report: &ops::Report) -> String {
     for (state, code, count) in &report.reasons {
         let _ = writeln!(out, "理由 {} {code}: {count} 件", state.as_str());
     }
+    for (code, count) in &report.location_holds {
+        let _ = writeln!(out, "日候補 保留 {code}: {count} 件");
+    }
     for w in &report.waits.waits {
         let scope = match w.scope {
             crate::ai::waits::WaitScope::Entrance => "入口全体",
@@ -1030,8 +1045,15 @@ fn format_index_status(status: &crate::ai::index::IndexStatus) -> String {
 }
 
 fn ai_jobs_retry(config: &Config, ingest: &Ingest, target: RetryTarget, clock: &Clock) -> ExitCode {
-    let handlers =
-        worker::production_handlers(config, crate::ai::provider::LanClient::new(&config.ai));
+    // Construction only: retry never obtains a token or contacts any service.
+    let cloud = crate::ai::cloud::CloudClients::new(&config.ai).ok();
+    let handlers = worker::production_handlers(
+        config,
+        crate::ai::provider::LanClient::new(&config.ai),
+        cloud.as_ref(),
+        Arc::new(crate::geocode::Geocoder::production(&config.tile_ua)),
+        Arc::clone(&ingest.cache),
+    );
     match ops::retry(&ingest.writer, &config.ai, &handlers, target, clock) {
         Ok(r) => {
             println!(

@@ -58,6 +58,7 @@ pub struct Report {
     pub waits: waits::WaitView,
     /// 検索索引（空間別ベクトル）の状態（件数だけ。空間の表が無い旧 DB でも読める）。
     pub index: index::IndexStatus,
+    pub location_holds: Vec<(&'static str, i64)>,
 }
 
 /// 設定の状態。
@@ -87,6 +88,7 @@ pub fn report_at(conn: &Connection, ai: &AiConfig, now: i64) -> rusqlite::Result
         pauses: pause::list(conn)?,
         waits: waits::view(conn, now, &waits::Identities::from_config(ai))?,
         index: index::status(conn)?,
+        location_holds: super::location_suggest::hold_counts(conn)?,
     })
 }
 
@@ -143,6 +145,14 @@ pub fn insert_admin_status(
     wait_ids: &waits::Identities,
     now: i64,
 ) {
+    if let Ok(holds) = super::location_suggest::hold_counts(conn)
+        && !holds.is_empty()
+    {
+        out.insert(
+            "ai_location_holds".into(),
+            json!(holds.into_iter().collect::<BTreeMap<_, _>>()),
+        );
+    }
     if let Some(code) = invalid {
         out.insert(
             "ai_config_invalid".into(),

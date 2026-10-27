@@ -27,6 +27,104 @@ use crate::testutil::{TempDir, capture, synthetic_catalog};
 
 const START: Duration = Duration::from_secs(100);
 
+#[test]
+fn ai_stop_after_rate_wait_and_connector_first_write_blocks_new_queries() {
+    struct StopClock(StopFlag);
+    impl Clock for StopClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn sleep(&self, _: Duration) {
+            self.0.stop();
+        }
+    }
+    let clock = TestClock::new(START);
+    let stub = StubUpstreams::start(clock);
+    stub.set(Upstream::Osm, Some(Reply::json("[]")));
+    let stop = StopFlag::new();
+    let geocoder = Geocoder::with_parts(
+        Endpoints::stub(&stub.base_url()),
+        Box::new(StopClock(stop.clone())),
+        8,
+    );
+    let cache = Cache::memory_only();
+    assert!(matches!(
+        geocoder.nominatim_checked(&cache, "合成最初", "", &stop),
+        Outcome::Success(_)
+    ));
+    assert!(matches!(
+        geocoder.nominatim_checked(&cache, "合成待機", "", &stop),
+        Outcome::Stopping
+    ));
+    assert_eq!(stub.take_seen().len(), 1);
+
+    let stop = StopFlag::new();
+    let s = stop.clone();
+    let mut geocoder = Geocoder::with_endpoints(Endpoints::stub(&stub.base_url()));
+    geocoder.ai_agent = ureq::Agent::with_parts(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .build(),
+        DefaultConnector::new()
+            .chain(crate::ai::gate::HookConnector(Arc::new(move || {
+                s.stop();
+            })))
+            .chain(GateConnector),
+        DefaultResolver::default(),
+    );
+    assert!(matches!(
+        geocoder.nominatim_checked(&cache, "合成接続後", "", &stop),
+        Outcome::Stopping
+    ));
+    assert!(stub.take_seen().is_empty());
+}
+
+#[test]
+fn ai_inflight_response_is_cached_after_stop_and_get_ai_parallel_share_rate_mutex() {
+    let clock = TestClock::new(START);
+    let stub = StubUpstreams::start(clock.clone());
+    stub.set(Upstream::Gsi, Some(Reply::json("[]")));
+    stub.set(Upstream::Osm, Some(Reply::json("[]")));
+    let geocoder = Arc::new(Geocoder::with_parts(
+        Endpoints::stub(&stub.base_url()),
+        Box::new(SharedClock(clock)),
+        8,
+    ));
+    let cache = Arc::new(Cache::memory_only());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|s| {
+        let (g, c, b) = (geocoder.clone(), cache.clone(), barrier.clone());
+        s.spawn(move || {
+            b.wait();
+            g.search(&c, "合成GET");
+        });
+        barrier.wait();
+        assert!(matches!(
+            geocoder.nominatim_checked(&cache, "合成AI", "", &StopFlag::new()),
+            Outcome::Success(_)
+        ));
+    });
+    let seen: Vec<_> = stub
+        .take_seen()
+        .into_iter()
+        .filter(|r| r.upstream == Upstream::Osm)
+        .collect();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].at >= seen[0].at + NOMINATIM_MIN_INTERVAL);
+    let stop = StopFlag::new();
+    let s = stop.clone();
+    stub.set_hook(move |upstream| {
+        if upstream == Upstream::Osm {
+            s.stop();
+        }
+    });
+    assert!(
+        matches!(geocoder.nominatim_checked(&cache,"合成受信中","",&stop),Outcome::Success(v) if v.is_empty())
+    );
+    assert!(cache.get("geocode_osm:合成受信中").is_some());
+}
+
 fn fixture() -> Value {
     let text = fs::read_to_string(format!(
         "{}/tests/fixtures/geocode-python.json",

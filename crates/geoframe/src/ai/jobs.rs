@@ -186,10 +186,12 @@ pub enum ErrorCode {
     BudgetExhausted,
     /// 時計が送信予算の履歴より前に戻っている（予算をリセットする救済は無い。時計が追いつくまで送らない）。
     ClockRewound,
+    DecisionWait,
+    GeocodeWait,
 }
 
 impl ErrorCode {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::Unavailable,
         Self::RateLimited,
         Self::Timeout,
@@ -206,6 +208,8 @@ impl ErrorCode {
         Self::ProviderPaused,
         Self::BudgetExhausted,
         Self::ClockRewound,
+        Self::DecisionWait,
+        Self::GeocodeWait,
     ];
 
     pub fn parse(text: &str) -> Option<Self> {
@@ -230,6 +234,8 @@ impl ErrorCode {
             Self::ProviderPaused => "provider_paused",
             Self::BudgetExhausted => "budget_exhausted",
             Self::ClockRewound => "clock_rewound",
+            Self::DecisionWait => "decision_wait",
+            Self::GeocodeWait => "geocode_wait",
         }
     }
 }

@@ -2,7 +2,7 @@
 //!
 //! プロセスで [`CloudClients::new`] を一度呼び、clone を共有する。同じ Provider の photo_judge /
 //! location_suggest / token 交換は背景1・対話1を共有する。構築時の鍵読取り・DNS・HTTP は無い。
-//! 入口は [`CloudClient::run`] だけ。任意 URL/header/JSON の公開 POST は無い。
+//! 入口は [`CloudClient::run`] / [`CloudClient::run_checked`]。任意 URL/header/JSON の公開 POST は無い。
 mod auth;
 mod request;
 mod target;
@@ -101,6 +101,49 @@ impl CloudClients {
     pub fn client(&self, task: TaskKind) -> Option<CloudClient> {
         self.clients.get(&task).cloned()
     }
+
+    #[cfg(test)]
+    pub(in crate::ai) fn loopback(
+        config: &AiConfig,
+        api: std::net::SocketAddr,
+        token: std::net::SocketAddr,
+    ) -> Self {
+        use super::gate::GateConnector;
+        use super::tests_http::FakeDns;
+        use ureq::unversioned::transport::{Connector, DefaultConnector};
+        let mut clients = Self::new(config).unwrap();
+        let mut shared = HashMap::new();
+        for client in clients.clients.values_mut() {
+            let id = Arc::as_ptr(&client.provider) as usize;
+            client.provider = shared
+                .entry(id)
+                .or_insert_with(|| {
+                    let dns = FakeDns::new();
+                    dns.script(&client.target.host, vec![vec![api]]);
+                    dns.script(target::TOKEN_HOST, vec![vec![token]]);
+                    Arc::new(Provider {
+                        cloud: client.provider.cloud.clone(),
+                        api: Transport::stub(
+                            &client.target.host,
+                            api.port(),
+                            Arc::new(dns.clone()),
+                            DefaultConnector::new().chain(GateConnector),
+                        ),
+                        token: Transport::stub(
+                            target::TOKEN_HOST,
+                            token.port(),
+                            Arc::new(dns),
+                            DefaultConnector::new().chain(GateConnector),
+                        ),
+                        auth: client.provider.auth.clone(),
+                        lanes: client.provider.lanes.clone(),
+                        clock: Arc::new(|| Some(crate::ai::tests_worker::T0 as u64)),
+                    })
+                })
+                .clone();
+        }
+        clients
+    }
 }
 
 /// Provider ごとの共有基盤を参照する用途別の入口。Debug はモデル・宛先・認証パスを出さない。
@@ -131,11 +174,32 @@ impl CloudClient {
         self.run_until(ctx, request, &Deadline::for_task(self.task))
     }
 
+    /// 入力と依存サービスを token より前、および各 POST の予約待ち後に再検査する。
+    /// callback の I/O にも同じ全体期限を渡す。401 refresh でも期限を作り直さない。
+    pub fn run_checked(
+        &self,
+        ctx: &RunCtx<'_>,
+        request: &GenerateRequest,
+        check: impl Fn(&Deadline) -> Result<(), RunError>,
+    ) -> Result<JsonReply, RunError> {
+        self.run_checked_until(ctx, request, &Deadline::for_task(self.task), check)
+    }
+
     fn run_until(
         &self,
         ctx: &RunCtx<'_>,
         request: &GenerateRequest,
         deadline: &Deadline,
+    ) -> Result<JsonReply, RunError> {
+        self.run_checked_until(ctx, request, deadline, |_| Ok(()))
+    }
+
+    fn run_checked_until(
+        &self,
+        ctx: &RunCtx<'_>,
+        request: &GenerateRequest,
+        deadline: &Deadline,
+        check: impl Fn(&Deadline) -> Result<(), RunError>,
     ) -> Result<JsonReply, RunError> {
         // 準備を完了し、上限/用途を鍵・DNS・token より先に検査する。
         if request.body.len() > super::http::MAX_REQUEST_BYTES {
@@ -151,6 +215,7 @@ impl CloudClient {
         {
             return Err(contract());
         }
+        check(deadline)?;
         let wait = deadline
             .remaining()
             .unwrap_or_default()
@@ -171,6 +236,7 @@ impl CloudClient {
             // token 更新や枠待ち中に停止・pause された場合にも送らない。
             ctx.before_probe()?;
             ctx.before_send_until(deadline)?;
+            check(deadline)?;
             let reply = self
                 .provider
                 .api

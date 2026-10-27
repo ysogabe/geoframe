@@ -1,6 +1,6 @@
 # AI設定（`GEOFRAME_AI_CONFIG`）v1
 
-- 状態: T4.1bで実装（T4.2でHTTP基盤を追加）。設計は[p4-design.md](p4-design.md) §3。ここは**設定の読み取りと検査**。接続先の固定・Discovery・Decisionの入出力・共有の一時待機は[ai-provider.md](ai-provider.md)（T4.2）。クラウドの認証・実際の送信はT4.6以降。
+- 状態: T4.1bで実装（T4.2でHTTP基盤を追加）。設計は[p4-design.md](p4-design.md) §3。ここは**設定の読み取りと検査**。接続先の固定・Discovery・Decisionの入出力・共有の一時待機は[ai-provider.md](ai-provider.md)（T4.2）。クラウドの認証・送信は[ai-cloud.md](ai-cloud.md)、日候補の本番接続は[ai-location-suggest.md](ai-location-suggest.md)を参照。
 - `GEOFRAME_AI_CONFIG`（Rustだけの項目）は、用途別のrouting・クラウド許可・ベクトル空間をまとめた小さなJSONのパス。**未設定なら新しい外部AI呼び出しは無効**（写真の配信・管理・保存済み推薦の読み取りは動く）。相対パスは起動したカレントディレクトリ基準。
 
 ## 読み込みの決まり
@@ -134,7 +134,7 @@ handlerの**panic**は当該ジョブの失敗1回（`panic`。5回で`failed`�
 | コマンド | 内容 |
 |---|---|
 | `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、検索空間の有無・登録数と索引の件数（対象・保存済み・待ち・失敗で除外・壊れ。[ai-index.md](ai-index.md)）、用途ごとの使える／使えない（固定の理由コード）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途、有効な共有の一時待機（用途・範囲・固定の理由・UTCの期限） |
-| `geoframe ai-jobs retry (--kind <種類>｜--all)` | `failed`だけを、登録済みhandlerが現在の入力・既存の結果に照らして再検査し、`Requeue`（カウンタ・履歴を0に戻して`pending`）／`Obsolete`／`Satisfied`（成功済み扱い。再計算しない）へ振り分ける。**外部へは送らない**。成功済み・待機中は変えない。検査できないものは戻さず`failed`のまま件数だけ報告する: handler未登録の種類（**いまの配布バイナリは全て**）、設定で今は使えない用途 |
+| `geoframe ai-jobs retry (--kind <種類>｜--all)` | `failed`だけを、登録済みhandlerが現在の入力・既存の結果に照らして再検査し、`Requeue`（カウンタ・履歴を0に戻して`pending`）／`Obsolete`／`Satisfied`（成功済み扱い。再計算しない）へ振り分ける。**外部へは送らない**。成功済み・待機中は変えない。検査できないものは戻さず`failed`のまま件数だけ報告する: handler未登録の種類（Embedding / photo_judge等）、設定で今は使えない用途 |
 | `geoframe ai-jobs release-pause (--task <用途>｜--all)` | Provider・用途の停止の明示解除。`--task`は今の設定でその用途に当たる停止だけ（設定が未指定・不正なら何もせず終了コード2）、`--all`は全部 |
 | `geoframe ai-jobs deactivate-space` | 有効な検索空間（`settings.ai_active_space`）を外して旧結果参照へ戻す（P4 / T4.3。[ai-index.md](ai-index.md)）。旧結果・空間・ベクトル・ジョブは消さない。稼働中は拒否 |
 
@@ -161,3 +161,9 @@ STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解�
 
 
 Vertexの明示認証・固定宛先・token/予算/失敗分類は[ai-cloud.md](ai-cloud.md)（T4.6a）。handler登録と実クラウド利用の許可は後続。
+
+## T4.6c2 日候補の運用境界
+
+`location_suggest` と `location_geocode` を本番factoryへ登録した。新規Cloud画像送信には有効なlocation_clue設定と、その時点のDecision画像readyも必要。保存済み有償回答の座標化にはCloudClientや認証ファイルが不要で、location_suggestの有効/無効・pause・周期上限を尊重する。実画像や費用の追加許可は導入しない。
+
+有効suggest設定だけが `ai_location_suggest_results` / `ai_location_candidates` / `ai_location_suggest_holds` をmigration/dry-run対象にする。c1済みDBへの不足増分は後者2表。INGEST=0や無効/不正設定の配信継続と、既存CLIのGuard/ingest lockは維持する。statusに固定の保留理由と件数を追加し、写真ID・地名・日付・モデル応答・認証情報は出さない。

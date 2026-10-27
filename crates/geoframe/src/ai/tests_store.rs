@@ -27,14 +27,16 @@ use crate::writer::{OpenMode, WriteError, Writer};
 /// 2026-10-26T00:00:00Z（UTC 日の始まり）。
 const D0: i64 = 1_792_972_800;
 const DAY: i64 = 86_400;
-const AI_TABLES: [&str; 11] = [
+const AI_TABLES: [&str; 13] = [
     "ai_jobs",
     "idx_ai_jobs_runnable",
     "ai_request_usage",
     "ai_provider_pauses",
     "ai_provider_waits",
     "ai_worker_runs",
+    "ai_location_candidates",
     "ai_location_clues",
+    "ai_location_suggest_holds",
     "ai_location_suggest_results",
     "ai_embedding_spaces",
     "ai_embedding_vectors",
@@ -102,7 +104,7 @@ fn master_without_ai(conn: &Connection) -> Vec<String> {
              WHERE name NOT LIKE '%ai_jobs%' AND name NOT LIKE '%ai_request_usage%'
                AND name NOT LIKE '%ai_provider_pauses%' AND name NOT LIKE '%ai_provider_waits%'
                AND name NOT LIKE '%ai_worker_runs%' AND name NOT LIKE '%ai_embedding_%'
-               AND name NOT LIKE '%ai_embedding_vectors%' AND name NOT LIKE '%ai_location_clues%' AND name NOT LIKE '%ai_location_suggest_results%' ORDER BY rowid",
+               AND name NOT LIKE '%ai_embedding_vectors%' AND name NOT LIKE '%ai_location_clues%' AND name NOT LIKE '%ai_location_suggest_results%' AND name NOT LIKE '%ai_location_candidates%' AND name NOT LIKE '%ai_location_suggest_holds%' ORDER BY rowid",
         )
         .unwrap();
     stmt.query_map([], |r| r.get(0))
@@ -210,7 +212,9 @@ fn a_t4_1a_database_gets_only_the_new_tables_and_keeps_its_jobs() {
         [
             "ai_embedding_spaces",
             "ai_embedding_vectors",
+            "ai_location_candidates",
             "ai_location_clues",
+            "ai_location_suggest_holds",
             "ai_location_suggest_results",
             "ai_provider_pauses",
             "ai_provider_waits",
@@ -224,7 +228,9 @@ fn a_t4_1a_database_gets_only_the_new_tables_and_keeps_its_jobs() {
         [
             "ai_embedding_spaces",
             "ai_embedding_vectors",
+            "ai_location_candidates",
             "ai_location_clues",
+            "ai_location_suggest_holds",
             "ai_location_suggest_results",
             "ai_provider_pauses",
             "ai_provider_waits",
@@ -266,7 +272,9 @@ fn an_old_database_without_the_ai_tables_is_readable_read_only() {
         "ai_provider_pauses",
         "ai_provider_waits",
         "ai_worker_runs",
+        "ai_location_candidates",
         "ai_location_clues",
+        "ai_location_suggest_holds",
         "ai_location_suggest_results",
         "ai_embedding_spaces",
         "ai_embedding_vectors",

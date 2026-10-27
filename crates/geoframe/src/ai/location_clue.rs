@@ -376,6 +376,35 @@ impl SourceObservation {
         self.generation.photo_id()
     }
 }
+
+/// 同じ限定読取・向き・sRGB・縮小境界を日候補でも使う。writer 外でのみ呼ぶ。
+pub(super) fn prepare_image(
+    conn: &Connection,
+    data: &DataDir,
+    generation: &Generation,
+) -> Result<PreparedImage, RunError> {
+    let input = Input::load_generation(conn, generation.photo_id(), false)
+        .map_err(|_| RunError::Attempt(ErrorCode::Internal))?
+        .ok_or(RunError::InputChanged)?
+        .observe(data);
+    if Generation::from_input(&input) != *generation {
+        return Err(RunError::InputChanged);
+    }
+    let bytes = read_source(data, &input)?;
+    if generation.source_sha256() != Some(sha(&bytes).as_str()) {
+        return Err(RunError::InputChanged);
+    }
+    let rgb = imaging::prepare_decision_rgb(&bytes, !input.rel.starts_with("derivatives/"))
+        .map_err(image_error)?;
+    PreparedImage::encode_jpeg_rgb(
+        &rgb.pixels,
+        rgb.width as u16,
+        rgb.height as u16,
+        88,
+        ImageProfile::Decision,
+    )
+    .map_err(|_| RunError::Permanent(ErrorCode::InputInvalid))
+}
 impl std::fmt::Debug for SourceObservation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("SourceObservation(..)")

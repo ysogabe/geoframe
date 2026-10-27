@@ -50,9 +50,15 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+use crate::ai::gate::{self, GateConnector};
 use crate::cache::Cache;
 use crate::net::{self, Failure};
 use crate::pyquery::{py_float, py_quote, py_strip};
+use crate::stop::StopFlag;
+use ureq::unversioned::{
+    resolver::DefaultResolver,
+    transport::{Connector, DefaultConnector},
+};
 
 /// 短すぎる入力は無駄な要求になるので弾く（現行の `GEOCODE_MIN_LEN`。コードポイント数）。
 pub const MIN_LEN: usize = 2;
@@ -134,6 +140,11 @@ pub(crate) trait Clock: Send + Sync {
     /// 任意の起点からの経過（単調）。
     fn now(&self) -> Duration;
     fn sleep(&self, duration: Duration);
+    fn sleep_checked(&self, duration: Duration, stop: &StopFlag) {
+        if !stop.is_stopped() {
+            self.sleep(duration);
+        }
+    }
 }
 
 struct SystemClock {
@@ -147,6 +158,9 @@ impl Clock for SystemClock {
 
     fn sleep(&self, duration: Duration) {
         std::thread::sleep(duration);
+    }
+    fn sleep_checked(&self, duration: Duration, stop: &StopFlag) {
+        stop.wait(duration);
     }
 }
 
@@ -182,6 +196,7 @@ fn body_failure(e: &ureq::Error) -> Failure {
 pub struct Geocoder {
     endpoints: Endpoints,
     agent: ureq::Agent,
+    ai_agent: ureq::Agent,
     clock: Box<dyn Clock>,
     /// 上流へ送る User-Agent。連絡先が入りうるので、`Debug`・ログには載せない（この型は `Debug` を持たない）。
     user_agent: String,
@@ -192,6 +207,13 @@ pub struct Geocoder {
     /// **ロックは待ちと通信のあいだ持ち続ける**（全体で 1 秒 1 件にするため）。
     nominatim_last: Mutex<Option<Duration>>,
     slots: Arc<Semaphore>,
+}
+
+/// AI は正常な0件と障害を区別する。本文・検索語を失敗型へ含めない。
+pub enum Outcome {
+    Success(Vec<Value>),
+    Transient,
+    Stopping,
 }
 
 impl Geocoder {
@@ -238,6 +260,17 @@ impl Geocoder {
         Self {
             endpoints,
             agent: net::agent(),
+            ai_agent: ureq::Agent::with_parts(
+                ureq::Agent::config_builder()
+                    .timeout_connect(Some(Duration::from_secs(5)))
+                    .timeout_global(Some(TIMEOUT))
+                    .max_redirects(0)
+                    .proxy(None)
+                    .http_status_as_error(false)
+                    .build(),
+                DefaultConnector::new().chain(GateConnector),
+                DefaultResolver::default(),
+            ),
             clock,
             user_agent: USER_AGENT.to_string(),
             min_interval: NOMINATIM_MIN_INTERVAL,
@@ -279,6 +312,37 @@ impl Geocoder {
     /// 現行の `nominatim_search`。`countrycode`（ISO 3166-1 の 2 文字）を渡すとその国に絞る。
     /// 検索語は呼び出し側が整える（ここでは `strip` しない）。
     pub fn nominatim_search(&self, cache: &Cache, q: &str, countrycode: &str) -> Vec<Value> {
+        match self.nominatim(cache, q, countrycode, None) {
+            Outcome::Success(items) => items,
+            _ => Vec::new(),
+        }
+    }
+
+    /// 固定Nominatimのみ。GET検索と同じrate Mutex / cache / UA / capを使う。
+    pub fn nominatim_checked(
+        &self,
+        cache: &Cache,
+        q: &str,
+        countrycode: &str,
+        stop: &StopFlag,
+    ) -> Outcome {
+        if stop.is_stopped() {
+            return Outcome::Stopping;
+        }
+        // AI domain の上限は512 bytes。既存GETの200文字制限を暗黙に適用しない。
+        if q.len() > 512 || q.chars().any(char::is_control) {
+            return Outcome::Transient;
+        }
+        self.nominatim(cache, q, countrycode, Some(stop))
+    }
+
+    fn nominatim(
+        &self,
+        cache: &Cache,
+        q: &str,
+        countrycode: &str,
+        stop: Option<&StopFlag>,
+    ) -> Outcome {
         let cc = normalize_country(countrycode);
         let key = if cc.is_empty() {
             format!("{CACHE_PREFIX}{q}")
@@ -286,23 +350,49 @@ impl Geocoder {
             format!("{CACHE_PREFIX}{cc}:{q}")
         };
         if let Some(Value::Array(hit)) = cache.get(&key) {
-            return hit;
+            return Outcome::Success(hit);
         }
         // ロックは、待ちから通信・キャッシュへの保存まで持ち続ける（全体で 1 秒 1 件にするため。保存の前に放すと、
         // 待っていた同じ語の要求がキャッシュを見逃して、もう一度問い合わせてしまう）
-        let mut last = self
-            .nominatim_last
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut last = if let Some(stop) = stop {
+            let until = Instant::now() + TIMEOUT;
+            loop {
+                if stop.is_stopped() {
+                    return Outcome::Stopping;
+                }
+                match self.nominatim_last.try_lock() {
+                    Ok(lock) => break lock,
+                    Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+                    Err(_) if Instant::now() >= until => return Outcome::Transient,
+                    Err(_) => {
+                        stop.wait(Duration::from_millis(10));
+                    }
+                }
+            }
+        } else {
+            self.nominatim_last
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+        };
+        if stop.is_some_and(StopFlag::is_stopped) {
+            return Outcome::Stopping;
+        }
         // 待っている間に、別の要求が同じ語を入れたかもしれない
         if let Some(Value::Array(hit)) = cache.get(&key) {
-            return hit;
+            return Outcome::Success(hit);
         }
         if let Some(at) = *last
             && let Some(wait) = (at + self.min_interval).checked_sub(self.clock.now())
             && !wait.is_zero()
         {
-            self.clock.sleep(wait);
+            if let Some(stop) = stop {
+                self.clock.sleep_checked(wait, stop);
+            } else {
+                self.clock.sleep(wait);
+            }
+        }
+        if stop.is_some_and(StopFlag::is_stopped) {
+            return Outcome::Stopping;
         }
         let mut url = self
             .endpoints
@@ -313,15 +403,22 @@ impl Geocoder {
             url.push_str("&countrycodes=");
             url.push_str(&cc);
         }
-        let data = self.get_json(&url);
+        let data = if let Some(stop) = stop {
+            self.get_json_checked(&url, &self.ai_agent, Some(stop))
+        } else {
+            self.get_json(&url)
+        };
         *last = Some(self.clock.now());
         let list = match data {
             Ok(Value::Array(list)) => list,
             // 想定外の形式（エラー応答など）はキャッシュしない
-            Ok(_) => return Vec::new(),
+            Ok(_) => return Outcome::Transient,
             Err(fail) => {
+                if stop.is_some_and(StopFlag::is_stopped) {
+                    return Outcome::Stopping;
+                }
                 tracing::warn!("[geo] 地名検索失敗（Nominatim）: {}", fail.describe());
-                return Vec::new();
+                return Outcome::Transient;
             }
         };
         let mut out: Vec<Value> = list
@@ -340,13 +437,22 @@ impl Geocoder {
                 self.cache_cap
             );
         }
-        out
+        Outcome::Success(out)
     }
 
     /// GET して JSON にする。現行の `http_json`: 状態コードが 2xx 以外、本文が UTF-8 でない・JSON でないときは失敗。
     fn get_json(&self, url: &str) -> Result<Value, Fail> {
-        let mut response = self
-            .agent
+        self.get_json_checked(url, &self.agent, None)
+    }
+
+    fn get_json_checked(
+        &self,
+        url: &str,
+        agent: &ureq::Agent,
+        stop: Option<&StopFlag>,
+    ) -> Result<Value, Fail> {
+        let _armed = stop.map(gate::arm);
+        let mut response = agent
             .get(url)
             .header("User-Agent", self.user_agent.as_str())
             .config()

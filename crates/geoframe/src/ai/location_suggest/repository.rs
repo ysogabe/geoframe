@@ -4,7 +4,11 @@ use crate::ai::jobs::{self, Claimed, Completion, Enqueued, ErrorCode, InputCheck
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
-pub(in crate::ai) const TABLES: &[&str] = &["ai_location_suggest_results"];
+pub(in crate::ai) const TABLES: &[&str] = &[
+    "ai_location_suggest_results",
+    "ai_location_candidates",
+    "ai_location_suggest_holds",
+];
 pub(in crate::ai) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ai_location_suggest_results(
  result_key TEXT PRIMARY KEY CHECK(length(result_key)=64),
  manifest_json TEXT NOT NULL,
@@ -12,6 +16,16 @@ pub(in crate::ai) const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ai_location_s
  attempts INTEGER NOT NULL CHECK(attempts BETWEEN 1 AND 5),
  analyzed_at TEXT NOT NULL,
  integrity_sha256 TEXT NOT NULL CHECK(length(integrity_sha256)=64)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS ai_location_candidates(
+ photo_id INTEGER PRIMARY KEY,
+ result_key TEXT NOT NULL,
+ day_json TEXT NOT NULL,
+ row_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS ai_location_suggest_holds(
+ reason TEXT PRIMARY KEY CHECK(reason IN ('pending','legacy_unverified','unverified','projection_pending','decision_wait','no_images')),
+ count INTEGER NOT NULL CHECK(count>=0)
 ) WITHOUT ROWID;";
 
 #[derive(Clone)]
@@ -27,6 +41,9 @@ impl std::fmt::Debug for SavedAnswer {
     }
 }
 impl SavedAnswer {
+    pub(super) fn model(&self) -> &str {
+        &self.manifest.model
+    }
     pub fn answer(&self) -> &Answer {
         &self.answer
     }
@@ -221,7 +238,7 @@ fn valid_manifest(m: &Manifest) -> bool {
         })
 }
 // Any corrupt history is conservatively a fixed hold, never a reason to bill again.
-fn history(conn: &Connection) -> rusqlite::Result<(Vec<SavedAnswer>, bool)> {
+pub(super) fn history(conn: &Connection) -> rusqlite::Result<(Vec<SavedAnswer>, bool)> {
     if !jobs::object_exists(conn, "table", TABLES[0])? {
         return Ok((Vec::new(), false));
     }
@@ -363,17 +380,27 @@ pub fn restore_projection(
     observed: &[SourceObservation],
 ) -> rusqlite::Result<Lookup> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = restore_projection_in(&tx, day, model, observed)?;
+    tx.commit()?;
+    Ok(result)
+}
+
+pub(super) fn restore_projection_in(
+    tx: &Connection,
+    day: &Day,
+    model: &str,
+    observed: &[SourceObservation],
+) -> rusqlite::Result<Lookup> {
     let run = (!day.sent_ids.is_empty()).then(|| run_id_for(model, &day.sent_ids));
-    let outcome = classify(&tx, day, model, run.as_deref(), observed)?;
+    let outcome = classify(tx, day, model, run.as_deref(), observed)?;
     if !matches!(outcome, Lookup::ProjectionPending) {
         return Ok(outcome);
     }
-    let (history, _) = history(&tx)?;
+    let (history, _) = history(tx)?;
     for s in history {
-        if s.manifest.model == model && s.matches_inputs(&tx, day, observed)? == InputMatch::Current
+        if s.manifest.model == model && s.matches_inputs(tx, day, observed)? == InputMatch::Current
         {
-            s.compat().write(&tx)?;
-            tx.commit()?;
+            s.compat().write(tx)?;
             return Ok(Lookup::Reusable(Box::new(s)));
         }
     }

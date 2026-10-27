@@ -763,7 +763,11 @@ fn nearest_hint(anchors: &[Anchor], taken_at: &str) -> Option<Hint> {
 }
 
 /// 位置なし写真の AI 撮影地候補（画面に出すだけで、DB の位置にはしない）。
-fn suggestions(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMap<i64, Suggest>> {
+fn suggestions(
+    conn: &Connection,
+    ctx: &AdminContext,
+    ids: &[i64],
+) -> rusqlite::Result<HashMap<i64, Suggest>> {
     let mut out = HashMap::new();
     if ids.is_empty() {
         return Ok(out);
@@ -776,6 +780,12 @@ fn suggestions(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMap<i64, 
     ))?;
     let mut rows = stmt.query(params_from_iter(ids))?;
     while let Some(row) = rows.next()? {
+        if let Some(root) = ctx.deriv_dir.parent()
+            && let Ok(data) = crate::datadir::DataDir::open(root)
+            && !crate::ai::location_suggest::candidate_current(conn, &data, row.get(0)?)?
+        {
+            continue;
+        }
         let evidence = match row.get_ref(6)? {
             ValueRef::Text(t) => match serde_json::from_slice::<Value>(t) {
                 Ok(list @ Value::Array(_)) => list,
@@ -887,7 +897,7 @@ pub fn photos(
             item.hint = Some(nearest_hint(&anchors, &item.taken_at));
         }
     }
-    let mut found = suggestions(conn, &no_loc_ids)?;
+    let mut found = suggestions(conn, ctx, &no_loc_ids)?;
     for item in &mut items {
         item.suggest = found.remove(&item.id);
     }
