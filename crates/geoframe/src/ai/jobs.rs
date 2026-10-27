@@ -51,7 +51,7 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params, params_from_iter};
 
 /// このモジュールが作る表・索引（主キー・UNIQUE の自動索引は表に付いてくる）。
-pub const TABLES: &[&str] = &["ai_jobs"];
+pub const TABLES: &[&str] = &["ai_jobs", "ai_image_embedding_lineage"];
 pub const INDEXES: &[&str] = &["idx_ai_jobs_runnable"];
 
 /// 通常の失敗の上限（5 回目で `failed`）。
@@ -87,7 +87,13 @@ const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS ai_jobs(
   updated_at INTEGER NOT NULL,
   UNIQUE(kind, target_key, input_hash, processor_version)
 );
-CREATE INDEX IF NOT EXISTS idx_ai_jobs_runnable ON ai_jobs(state, next_attempt_at, id);";
+CREATE INDEX IF NOT EXISTS idx_ai_jobs_runnable ON ai_jobs(state, next_attempt_at, id);
+CREATE TABLE IF NOT EXISTS ai_image_embedding_lineage(
+  target_key TEXT NOT NULL,
+  processor_version TEXT NOT NULL,
+  job_id INTEGER NOT NULL REFERENCES ai_jobs(id) ON DELETE CASCADE,
+  PRIMARY KEY(target_key, processor_version)
+);";
 
 // ---------------------------------------------------------------- 型
 
@@ -525,6 +531,82 @@ fn supersede_in(conn: &Connection, keep: &JobKey, now: i64) -> rusqlite::Result<
             now
         ],
     )
+}
+
+/// Supersede generations only within this processor. Other callers retain `supersede` semantics.
+pub(super) fn supersede_processor_in(
+    conn: &Connection,
+    keep: &JobKey,
+    now: i64,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE ai_jobs SET state='obsolete',claim_token=NULL,updated_at=?4
+        WHERE kind=?1 AND target_key=?2 AND processor_version=?3 AND input_hash!=?5
+        AND state IN ('pending','running','deferred','failed')",
+        params![
+            keep.kind.as_str(),
+            keep.target_key,
+            keep.processor_version,
+            now,
+            keep.input_hash
+        ],
+    )
+}
+
+/// Bind a content lineage to its current generation in the caller's writer transaction.
+/// A pointer survives absence and references live counters, including explicit retry changes.
+/// Existing exact-key terminal is never cleared here. Only explicit retry can clear history.
+pub(super) fn enqueue_image_lineage_in(
+    conn: &Connection,
+    key: &JobKey,
+    now: i64,
+) -> rusqlite::Result<Enqueued> {
+    let previous: Option<i64> = conn
+        .query_row(
+            "SELECT job_id FROM ai_image_embedding_lineage
+        WHERE target_key=?1 AND processor_version=?2",
+            params![key.target_key, key.processor_version],
+            |r| r.get(0),
+        )
+        .optional()?;
+    // Upgrade from an untracked queue: prefer the active unfinished generation over old successes.
+    // If all generations disappeared before upgrade their order is unrecoverable; retain terminal
+    // conservatively. Normal operation never guesses ordering from wall time or row creation IDs.
+    let previous = match previous {
+        Some(id) => Some(id),
+        None => conn
+            .query_row(
+                "SELECT id FROM ai_jobs WHERE kind='image_embedding'
+            AND target_key=?1 AND processor_version=?2
+            ORDER BY (state IN ('pending','running','deferred','failed')) DESC,
+                terminal DESC, updated_at DESC,id DESC LIMIT 1",
+                params![key.target_key, key.processor_version],
+                |r| r.get(0),
+            )
+            .optional()?,
+    };
+    let outcome = enqueue_in(conn, key, now)?;
+    if let Some(previous) = previous {
+        conn.execute("UPDATE ai_jobs SET
+            attempts=MAX(ai_jobs.attempts,h.attempts),defer_count=MAX(ai_jobs.defer_count,h.defer_count),
+            interruption_count=MAX(ai_jobs.interruption_count,h.interruption_count),
+            terminal=MAX(ai_jobs.terminal,h.terminal),next_attempt_at=MAX(ai_jobs.next_attempt_at,h.next_attempt_at),
+            last_error_code=CASE WHEN ai_jobs.terminal THEN ai_jobs.last_error_code ELSE h.last_error_code END,
+            state=CASE WHEN ai_jobs.terminal OR h.terminal THEN 'failed' ELSE ai_jobs.state END
+            FROM ai_jobs h WHERE h.id=?4 AND ai_jobs.id!=h.id
+            AND ai_jobs.kind='image_embedding' AND ai_jobs.target_key=?1
+            AND ai_jobs.input_hash=?2 AND ai_jobs.processor_version=?3",
+            params![key.target_key,key.input_hash,key.processor_version,previous])?;
+    }
+    conn.execute(
+        "INSERT INTO ai_image_embedding_lineage(target_key,processor_version,job_id)
+        SELECT target_key,processor_version,id FROM ai_jobs WHERE kind='image_embedding'
+        AND target_key=?1 AND input_hash=?2 AND processor_version=?3
+        ON CONFLICT(target_key,processor_version) DO UPDATE SET job_id=excluded.job_id",
+        params![key.target_key, key.input_hash, key.processor_version],
+    )?;
+    supersede_processor_in(conn, key, now)?;
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------- claim
@@ -983,6 +1065,23 @@ where
                      WHERE id=?1 AND state='failed'",
                     params![id, now],
                 )?;
+                // An explicit retry starts a new budget for this tracked content lineage,
+                // including obsolete generations. Otherwise an old terminal could reappear
+                // when membership returns to a previously visited generation.
+                if key.kind == JobKind::ImageEmbedding {
+                    tx.execute("INSERT INTO ai_image_embedding_lineage(target_key,processor_version,job_id)
+                        VALUES(?1,?2,?3) ON CONFLICT(target_key,processor_version)
+                        DO UPDATE SET job_id=excluded.job_id",
+                        params![key.target_key,key.processor_version,id])?;
+                    tx.execute(
+                        "UPDATE ai_jobs SET attempts=0,defer_count=0,interruption_count=0,
+                        terminal=0,next_attempt_at=?3,last_error_code=''
+                        WHERE kind='image_embedding' AND target_key=?1 AND processor_version=?2
+                        AND id!=?4 AND EXISTS(SELECT 1 FROM ai_image_embedding_lineage
+                            WHERE target_key=?1 AND processor_version=?2 AND job_id=?4)",
+                        params![key.target_key, key.processor_version, now, id],
+                    )?;
+                }
                 done.requeued += 1;
             }
             Recheck::Obsolete => {

@@ -108,8 +108,14 @@ impl EmbeddingClient {
     ) -> Result<Vec<f32>, ProviderError> {
         let result = (|| {
             let reply = session
-                .post_json(Endpoint::Embeddings, body, whole)
-                .map_err(|e| ProviderError::from_http(e, Phase::Send))?;
+                .post_json_tracked(
+                    Endpoint::Embeddings,
+                    body,
+                    &whole.reserving(DISCOVERY_TIMEOUT),
+                )
+                .map_err(|(e, started)| {
+                    ProviderError::from_http(e, if started { Phase::Send } else { Phase::Probe })
+                })?;
             if !reply.is_success() {
                 return Err(ProviderError::from_status(
                     reply.status,

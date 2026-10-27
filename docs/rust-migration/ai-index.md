@@ -33,7 +33,7 @@ T4.3の索引基盤に、[T4.4aの固定契約アダプターと画像ワーカ�
 - `input_sha256` は品質特徴量が解析した元 derivative の SHA（`photo_quality_features.content_sha256`）。旧 `photo_embeddings`・`photo_ai_features` には**書かない**。
 - 保存: 次元・NaN/Infinity・ゼロノルムを拒否。L2 は最大要素で割ってから f64 で足すので、極端な大きさでもオーバーフロー・アンダーフローしない。同じ `(space_id, input_sha256)` が有効なら最初のベクトルを残す（`Existing`）。壊れた既存の行は置き換える（`Repaired`）。writer 上の短い 1 トランザクションで、検査・正規化は writer の外（`PreparedVector::new`）で先にできる。
 - 読み取り: BLOB も型（BLOB）・`dimension` の列・長さ・有限数・ゼロでないノルム・ノルム（L2 は単位ベクトル）・空間の識別で検査し（`space::decode`）、壊れた行は**読み飛ばして数える**（全応答の失敗やパニックにしない）。**公開・進捗・`status`・検索は同じ 1 つの判定（`index::scan`）から数える**ので、壊れた行（NaN/Infinity/ゼロ/単位でない L2/短い BLOB/BLOB でない型）は成功に数えず、`pending`（現在のジョブが `failed` なら `failed_excluded`）として再生成の対象になり、`status.corrupt` が実件数になる（`store_vector` は壊れた既存の行を置き換える）。検査は writer の 1 トランザクションの中でローカルに行う（外部通信・重い変換は持ち込まない）。
-- 旧 DB（`INGEST=0`）はこれらの表が無いまま読める（`index::status` は `NoTables`）。`--dry-run` の「作る表・索引」は、AI の表の分として 3 件（2 表・1 索引）増える（6 → 9）。既存の表・列・行は変えない。
+- 旧 DB（`INGEST=0`）はこれらの表が無いまま読める（`index::status` は `NoTables`）。`--dry-run` の「作る表・索引」は、AI の表の分として 3 件（2 表・1 索引）増える（T4.3時点6 → 9、T4.4aレビュー修正のlineage表を含めると10）。既存の表・列・行は変えない。
 
 ## 3. 索引の顔ぶれ（固定の全 index 表は作らない）
 
@@ -99,4 +99,4 @@ Python は追加表と `ai_active_space` を使わず旧表を読む。Rust の�
 
 - **T4.4a実装済み**: [固定契約アダプター・世代付き画像ジョブ・自動切替](ai-embedding.md)。SpaceIdentityは明示した固定契約と実model/能力を照合する。**T4.4b**: E5は `index::status`、E6は共有clientのquery＋`load_active_index`＋`QueryVector`へ接続する。
 - **T4.5**: 新しい同一場面グループ・代表。**旧選別と部分的に重なる新集合は旧選別を自動で置き換えない**（旧は `selection` の有効判定のまま保持。新しい結果は別表に持ち、重なるものは管理確認）。入力集合・世代が一致する選別単位か、有効な旧選別と重ならない新しい集合だけ新判定を使える。旧の写真別判定（品質・`keep_score` 等）は世代が一致すれば空間独立で使える。
-- 未実装: 実 Embedding・E5/E6 の本接続（503 のまま）、設定 JSON の閾値キー、新しい同一場面の表（`ai_scene_*`）、`ai_active_space` を自動で切り替えるワーカー、LXC での実機検証（親が記録）。旧ベクトルの再計算方式は #93 の測定後。
+- T4.4aで固定契約の画像Embedding・差分修復・`ai_active_space`の自動切替ワーカーを実装済み。T4.4b以降の未実装: E5/E6 HTTPの本接続（503のまま）・query LRU/レート制限、設定JSONの閾値キー、T4.5の新しい同一場面の表（`ai_scene_*`）。実LAN/LXCでのRust経由受入は親担当で未確認。旧Q8_0/Geminiベクトルは輸入しない。lineage追加表とchunk/公開照会の最終方式は [ai-embedding.md](ai-embedding.md) を参照。

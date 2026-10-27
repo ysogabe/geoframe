@@ -286,3 +286,198 @@ fn after_discovery_caller_can_deny_query_and_stopping_denies_first_write() {
     );
     assert_eq!(lab.posts().len(), 0);
 }
+
+/// POST waits until a subsequent catalog request releases it. Thus receiving the POST,
+/// its timeout and the reprobe order are synchronized, with no server sleep/race.
+#[test]
+fn sent_post_timeout_reserves_reprobe_and_reaches_terminal_but_real_lease_waits() {
+    use crate::ai::jobs::{self, Failure, JobKey, JobKind};
+    use crate::ai::waits::{WaitReason, WaitScope};
+    use crate::ai::worker::RunError;
+    use std::sync::{Condvar, Mutex};
+    for mode in ["available", "lease", "not_ready", "unreachable", "stopping"] {
+        let stop = StopFlag::new();
+        let post_stop = stop.clone();
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let pending = release.clone();
+        let server = stub(move |stream, req| {
+            let line = &req.request_line;
+            if line.starts_with("POST ") {
+                if mode == "stopping" {
+                    post_stop.stop();
+                }
+                let (lock, cv) = &*pending;
+                let done = lock.lock().unwrap();
+                // Upper bound only prevents a fixture leak when the negative control
+                // deliberately removes the reprobe reservation.
+                let _guard = cv
+                    .wait_timeout_while(done, Duration::from_secs(5), |done| !*done)
+                    .unwrap();
+                return;
+            }
+            let (lock, cv) = &*pending;
+            *lock.lock().unwrap() = true;
+            cv.notify_all();
+            if mode == "unreachable" {
+                return;
+            }
+            let body = if line.starts_with("GET /llm/catalog ") {
+                json!({"services":[{"id":"embed","available":true,"apis":[{"method":"GET","path":"/v1/models"},{"method":"POST","path":"/v1/embeddings"}]}]})
+            } else if line.starts_with("GET /llm/services/embed ") {
+                json!({"id":"embed","state":if mode == "not_ready" {"stopped"} else {"running"},"available":true,"lease_count":if mode == "lease" {1} else {0}})
+            } else {
+                models()
+            };
+            respond(stream, "200 OK", "", &serde_json::to_vec(&body).unwrap());
+        });
+        let e = env_with(
+            "embedding-reserved-timeout",
+            &config_json(&format!("http://{}", server.addr)),
+            true,
+        );
+        let lan = LanClient::new(&e.config.ai).unwrap();
+        let client =
+            EmbeddingClient::new(&e.config.ai, lan.clone(), TaskKind::ImageEmbedding).unwrap();
+        let session = lan
+            .http()
+            .session(Lane::Background, Duration::ZERO, &stop)
+            .unwrap();
+        let result = client.send(
+            &session,
+            b"{}",
+            &Deadline::after(Duration::from_millis(900)),
+        );
+        let requests = server.requests.lock().unwrap();
+        assert!(requests[0].request_line.starts_with("POST "));
+        if mode == "stopping" {
+            assert_eq!(result, Err(ProviderError::Stopping));
+            assert_eq!(requests.len(), 1);
+        } else if mode == "unreachable" {
+            assert_eq!(
+                result,
+                Err(ProviderError::wait(
+                    WaitScope::Entrance,
+                    WaitReason::Unreachable
+                ))
+            );
+            assert_eq!(requests.len(), 2);
+        } else if mode == "not_ready" {
+            assert_eq!(
+                result,
+                Err(ProviderError::wait(
+                    WaitScope::Service,
+                    WaitReason::NotReady
+                ))
+            );
+            assert_eq!(requests.len(), 3);
+        } else if mode == "lease" {
+            assert_eq!(
+                result,
+                Err(ProviderError::wait(WaitScope::Entrance, WaitReason::Leased))
+            );
+            assert_eq!(requests.len(), 3);
+        } else {
+            assert_eq!(result, Err(ProviderError::Transient(ErrorCode::Timeout)));
+            let error = result.unwrap_err();
+            assert_eq!(
+                error.into_run_error(false),
+                RunError::Repeated(ErrorCode::Timeout)
+            );
+            assert_eq!(requests.len(), 4);
+            // Actual bounded queue transition using fake Unix time: the repeated timeout
+            // now advances attempts and reaches failed rather than blocking the entrance.
+            e.writer().call(move|c| {
+                let key=JobKey::new(JobKind::ImageEmbedding,"timeout-fixture","input","processor");
+                jobs::enqueue(c,&key,1)?;
+                c.execute("UPDATE ai_jobs SET attempts=4,defer_count=2 WHERE target_key='timeout-fixture'",[])?;
+                let job=jobs::claim_next(c,1,"run","token",&[JobKind::ImageEmbedding])?.unwrap();
+                assert_eq!(jobs::record_failure(c,&job,1,ErrorCode::Timeout,Failure::Repeated)?,Some(jobs::JobState::Failed));
+                Ok(())
+            }).unwrap();
+        }
+        if mode != "stopping" {
+            assert!(requests[1].request_line.starts_with("GET /llm/catalog "));
+        }
+        // Release even when the fixture returns early, so no background POST survives.
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+}
+
+#[test]
+fn timeout_before_first_write_is_wait_and_dns_or_connect_stop_stays_stopping() {
+    use crate::ai::waits::{WaitReason, WaitScope};
+    for stop_at in ["none", "dns", "connect"] {
+        let server = stub(|stream, _| respond(stream, "200 OK", "", b"{}"));
+        let dns = FakeDns::new();
+        dns.script("lab.test", vec![vec![server.addr]]);
+        let stop = StopFlag::new();
+        let hook_stop = stop.clone();
+        if stop_at == "dns" {
+            dns.on_lookup(move || hook_stop.stop());
+        }
+        // DNS timeout gives the gate a strict non-write result. The callback runs on the
+        // resolver thread; no global clock or sleeps in the test thread are needed.
+        if stop_at == "none" {
+            dns.set_delay(Duration::from_millis(150));
+        }
+        let e = env_with(
+            "embedding-before-write",
+            &config_json("http://lab.test:8123"),
+            true,
+        );
+        let lan = LanClient::new(&e.config.ai).unwrap();
+        let client = EmbeddingClient::new(&e.config.ai, lan, TaskKind::ImageEmbedding).unwrap();
+        let on_connect = stop.clone();
+        let http = AiHttp::with_lookup_and_connect_hook(
+            "http://lab.test:8123",
+            Arc::new(dns),
+            Arc::new(move || {
+                if stop_at == "connect" {
+                    on_connect.stop();
+                }
+            }),
+        )
+        .unwrap();
+        let session = http
+            .session(Lane::Background, Duration::ZERO, &stop)
+            .unwrap();
+        let result = client.send(&session, b"{}", &Deadline::after(Duration::from_millis(90)));
+        if stop_at == "none" {
+            assert_eq!(
+                result,
+                Err(ProviderError::wait(
+                    WaitScope::Entrance,
+                    WaitReason::Unreachable
+                ))
+            );
+        } else {
+            assert_eq!(result, Err(ProviderError::Stopping));
+        }
+        assert!(server.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn reserved_deadline_is_nested_and_never_restarts_query_or_request_budget() {
+    use std::time::Instant;
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    static TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    fn now() -> Instant {
+        *START.get_or_init(Instant::now) + Duration::from_secs(TICK.load(Ordering::SeqCst))
+    }
+    let whole = Deadline::with_clock(Duration::from_secs(15), now);
+    TICK.store(4, Ordering::SeqCst);
+    let post = whole.reserving(DISCOVERY_TIMEOUT);
+    assert_eq!(post.remaining(), Some(Duration::from_secs(9)));
+    TICK.store(13, Ordering::SeqCst);
+    assert_eq!(post.remaining(), None);
+    assert_eq!(
+        whole.capped(DISCOVERY_TIMEOUT).remaining(),
+        Some(Duration::from_secs(2))
+    );
+    TICK.store(15, Ordering::SeqCst);
+    assert_eq!(whole.remaining(), None);
+    assert_eq!(whole.capped(DISCOVERY_TIMEOUT).remaining(), None);
+}

@@ -142,7 +142,7 @@ pub(super) fn dump(conn: &Connection) -> Vec<String> {
 
 fn master(conn: &Connection) -> Vec<String> {
     let mut stmt = conn
-        .prepare("SELECT type||':'||name||':'||COALESCE(sql,'') FROM sqlite_master WHERE name NOT LIKE '%ai_jobs%' AND name NOT LIKE 'sqlite_autoindex_ai_jobs%' ORDER BY rowid")
+        .prepare("SELECT type||':'||name||':'||COALESCE(sql,'') FROM sqlite_master WHERE name NOT LIKE '%ai_jobs%' AND name NOT LIKE '%ai_image_embedding_lineage%' ORDER BY rowid")
         .unwrap();
     stmt.query_map([], |r| r.get(0))
         .unwrap()
@@ -172,10 +172,21 @@ fn migrate_adds_only_ai_jobs_and_is_idempotent() {
     let before_master = master(&conn);
 
     // dry-run 相当は何があるか教える
-    assert_eq!(pending(&conn).unwrap(), ["ai_jobs", "idx_ai_jobs_runnable"]);
+    assert_eq!(
+        pending(&conn).unwrap(),
+        [
+            "ai_jobs",
+            "ai_image_embedding_lineage",
+            "idx_ai_jobs_runnable"
+        ]
+    );
     assert_eq!(
         migrate(&mut conn).unwrap(),
-        ["ai_jobs", "idx_ai_jobs_runnable"]
+        [
+            "ai_jobs",
+            "ai_image_embedding_lineage",
+            "idx_ai_jobs_runnable"
+        ]
     );
     assert!(pending(&conn).unwrap().is_empty());
     // 追加だけ: 既存の表の行・定義は 1 つも変わらない（写真・旧 AI・手動の列）
@@ -217,7 +228,7 @@ fn an_old_database_without_ai_jobs_is_readable_read_only() {
     let ro = crate::db::open_read_only(&path).unwrap();
     crate::db::check_schema(&ro).unwrap();
     assert!(status_counts(&ro).unwrap().is_empty());
-    assert_eq!(pending(&ro).unwrap().len(), 2);
+    assert_eq!(pending(&ro).unwrap().len(), 3);
     // 読み取り専用の接続は ai_jobs を作れない（作らない）
     assert!(!table_exists(&ro, "ai_jobs"));
 }
@@ -717,8 +728,14 @@ fn migrate_adds_the_terminal_column_to_an_older_ai_jobs_table() {
     )
     .unwrap();
     let photos_before = dump(&conn);
-    assert_eq!(pending(&conn).unwrap(), ["ai_jobs.terminal"]);
-    assert_eq!(migrate(&mut conn).unwrap(), ["ai_jobs.terminal"]);
+    assert_eq!(
+        pending(&conn).unwrap(),
+        ["ai_image_embedding_lineage", "ai_jobs.terminal"]
+    );
+    assert_eq!(
+        migrate(&mut conn).unwrap(),
+        ["ai_image_embedding_lineage", "ai_jobs.terminal"]
+    );
     assert!(pending(&conn).unwrap().is_empty());
     assert_eq!(dump(&conn), photos_before);
 

@@ -197,6 +197,16 @@ impl Deadline {
         }
     }
 
+    /// Reserve time for classification after an inference timeout, inside the same deadline.
+    /// Short test/caller deadlines reserve one third; normal embedding calls reserve 2 seconds.
+    pub(super) fn reserving(&self, reserve: Duration) -> Self {
+        Self {
+            at: self.at - reserve.min(self.remaining().unwrap_or_default() / 3),
+            #[cfg(test)]
+            now: self.now,
+        }
+    }
+
     pub fn remaining(&self) -> Option<Duration> {
         let left = self.at.saturating_duration_since(self.now());
         (!left.is_zero()).then_some(left)
@@ -435,11 +445,33 @@ impl Session {
         self.send(endpoint, Some(body), deadline)
     }
 
+    /// Whether the first write was attempted, including failures before DNS/connect completed.
+    pub(super) fn post_json_tracked(
+        &self,
+        endpoint: Endpoint<'_>,
+        body: &[u8],
+        deadline: &Deadline,
+    ) -> Result<Reply, (HttpError, bool)> {
+        let mut started = false;
+        self.send_recorded(endpoint, Some(body), deadline, &mut started)
+            .map_err(|e| (e, started))
+    }
+
     fn send(
         &self,
         endpoint: Endpoint<'_>,
         body: Option<&[u8]>,
         deadline: &Deadline,
+    ) -> Result<Reply, HttpError> {
+        self.send_recorded(endpoint, body, deadline, &mut false)
+    }
+
+    fn send_recorded(
+        &self,
+        endpoint: Endpoint<'_>,
+        body: Option<&[u8]>,
+        deadline: &Deadline,
+        started: &mut bool,
     ) -> Result<Reply, HttpError> {
         // 送る前の確認（上限は接続も名前解決もしないうちに）
         if body.is_some_and(|b| {
@@ -482,6 +514,7 @@ impl Session {
                 .build()
                 .send(body),
         };
+        *started = armed.started();
         drop(armed);
         read_reply(result.map_err(|e| classify(&e))?)
     }

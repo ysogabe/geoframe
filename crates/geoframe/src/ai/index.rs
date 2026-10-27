@@ -570,14 +570,38 @@ pub(super) fn scan(
     space: Option<&SpaceIdentity>,
     with_values: bool,
 ) -> rusqlite::Result<Vec<ShaState>> {
-    let has_jobs = space.is_some() && object_exists(conn, "table", "ai_jobs")?;
+    scan_filtered(conn, space, with_values, None)
+}
+
+pub(super) fn scan_sha(
+    conn: &Connection,
+    identity: &SpaceIdentity,
+    sha: &str,
+) -> rusqlite::Result<Option<ShaState>> {
+    Ok(scan_filtered(conn, Some(identity), false, Some(sha))?.pop())
+}
+
+fn scan_filtered(
+    conn: &Connection,
+    space: Option<&SpaceIdentity>,
+    with_values: bool,
+    sha: Option<&str>,
+) -> rusqlite::Result<Vec<ShaState>> {
+    // Targeted image-worker reads need members/result only. Failure classification is
+    // performed once in bulk by full progress/activation scans, never once per SHA.
+    let has_jobs = sha.is_none() && space.is_some() && object_exists(conn, "table", "ai_jobs")?;
     let sql = format!(
         "SELECT p.id, f.content_sha256, p.display, p.md5, p.mtime, p.rotation
-         {ELIGIBLE_JOIN} WHERE {ELIGIBLE_WHERE} ORDER BY p.id"
+         {ELIGIBLE_JOIN} WHERE {ELIGIBLE_WHERE} {} ORDER BY p.id",
+        if sha.is_some() {
+            "AND f.content_sha256=?1"
+        } else {
+            ""
+        }
     );
     let rows = conn
         .prepare(&sql)?
-        .query_map([], |row| {
+        .query_map(rusqlite::params_from_iter(sha), |row| {
             Ok(Eligible {
                 photo_id: row.get(0)?,
                 input_sha256: row.get(1)?,
@@ -606,29 +630,38 @@ pub(super) fn scan(
         }
     }
     if let Some(identity) = space.filter(|_| has_jobs) {
-        let mut failed_stmt = conn.prepare(
-            "SELECT COALESCE(last_error_code,'') FROM ai_jobs
-            WHERE kind='image_embedding' AND target_key=?1 AND input_hash=?2
-            AND processor_version=?3 AND state='failed'",
-        )?;
+        let processor = image_embedding_processor_version(identity);
+        let prefix = format!("{}\u{1f}", identity.space_id());
+        let failed = conn
+            .prepare(
+                "SELECT target_key,input_hash,last_error_code FROM ai_jobs
+            WHERE kind='image_embedding' AND processor_version=?1 AND state='failed'
+            AND substr(target_key,1,length(?2))=?2",
+            )?
+            .query_map(params![processor, prefix], |r| {
+                Ok((
+                    (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<HashMap<_, _>>>()?;
         for state in &mut order {
             let key = state.job_key(identity);
-            let failed: Option<String> = failed_stmt
-                .query_row(
-                    params![key.target_key, key.input_hash, key.processor_version],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            state.failed_reason = failed.as_deref().map(reason_code);
+            state.failed_reason = failed
+                .get(&(key.target_key, key.input_hash))
+                .map(|s| reason_code(s));
         }
     }
     if let Some(identity) = space
         && object_exists(conn, "table", "ai_embedding_vectors")?
     {
         let mut stmt = conn.prepare(
-            "SELECT input_sha256, dimension, vector FROM ai_embedding_vectors WHERE space_id=?1",
+            if sha.is_some() { "SELECT input_sha256, dimension, vector FROM ai_embedding_vectors WHERE space_id=?1 AND input_sha256=?2" }
+            else { "SELECT input_sha256, dimension, vector FROM ai_embedding_vectors WHERE space_id=?1" },
         )?;
-        let mut rows = stmt.query([identity.space_id()])?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(
+            std::iter::once(identity.space_id()).chain(sha),
+        ))?;
         while let Some(row) = rows.next()? {
             let sha: String = match row.get_ref(0)? {
                 ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),

@@ -1,6 +1,7 @@
 //! Production background image embedding. One fresh JPEG and one inference per job.
 //! Content vectors are shared by SHA; jobs additionally bind every current member generation.
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, params};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use super::activation::{self, BuildSnapshot};
@@ -39,10 +40,12 @@ impl ImageEmbedding {
         Ok(result)
     }
     fn current(&self, read: &Connection, key: &JobKey) -> rusqlite::Result<Option<ShaState>> {
-        Ok(self
-            .states(read)?
-            .into_iter()
-            .find(|s| s.job_key(self.identity()) == *key))
+        let prefix = format!("{}\u{1f}", self.identity().space_id());
+        let Some(sha) = key.target_key.strip_prefix(&prefix) else {
+            return Ok(None);
+        };
+        Ok(index::scan_sha(read, self.identity(), sha)?
+            .filter(|s| s.job_key(self.identity()) == *key))
     }
 }
 fn sha(bytes: &[u8]) -> String {
@@ -90,9 +93,8 @@ fn persist(
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
         } else {
             // Reused vector might have been damaged after the read. Do not succeed without it.
-            let valid = index::scan(conn, Some(&identity), false)?
-                .iter()
-                .any(|s| s.input_sha256() == member.input_sha256 && s.has_vector);
+            let valid = index::scan_sha(conn, &identity, &member.input_sha256)?
+                .is_some_and(|s| s.has_vector);
             if !valid {
                 return Err(rusqlite::Error::InvalidQuery);
             }
@@ -111,20 +113,10 @@ impl Handler for ImageEmbedding {
             processor_version: Some(index::image_embedding_processor_version(self.identity())),
         }
     }
-    fn reconcile(&self, read: &Connection, _now: i64) -> rusqlite::Result<Vec<JobKey>> {
-        // Cleanup owns enqueue/history transfer. A generation appearing after cleanup must
-        // wait for the next cycle rather than slip through the generic enqueue path.
-        let mut keys = Vec::new();
-        for state in self.states(read)? {
-            let key = state.job_key(self.identity());
-            let exists: bool = read.query_row("SELECT EXISTS(SELECT 1 FROM ai_jobs
-                WHERE kind='image_embedding' AND target_key=?1 AND input_hash=?2 AND processor_version=?3
-                AND state!='obsolete')", params![key.target_key,key.input_hash,key.processor_version], |r|r.get(0))?;
-            if exists {
-                keys.push(key);
-            }
-        }
-        Ok(keys)
+    fn reconcile(&self, _read: &Connection, _now: i64) -> rusqlite::Result<Vec<JobKey>> {
+        // Cleanup enqueues and supersedes atomically with the lineage pointer. There is
+        // deliberately no later generic enqueue based on a potentially stale read snapshot.
+        Ok(Vec::new())
     }
 
     fn reconcile_cleanup(&self, read: &Connection, now: i64) -> rusqlite::Result<Vec<Persist>> {
@@ -136,57 +128,62 @@ impl Handler for ImageEmbedding {
             *snapshot = Some(activation::snapshot_targets(read, self.identity())?);
         }
         let identity = self.identity().clone();
-        Ok(vec![Box::new(move |conn| {
-            index::register_space_in(conn, &identity, now)
+        let prefix = format!("{}\u{1f}", identity.space_id());
+        let processor = index::image_embedding_processor_version(&identity);
+        // Plan only on the read connection. Each action is one content target, so the
+        // worker's ENQUEUE_CHUNK bounds actual writer work and permits stopping between chunks.
+        let mut targets: HashSet<String> = self
+            .states(read)?
+            .into_iter()
+            .map(|s| s.input_sha256().to_string())
+            .collect();
+        for target in read
+            .prepare(
+                "SELECT DISTINCT target_key FROM ai_jobs
+            WHERE kind='image_embedding' AND processor_version=?1
+            AND substr(target_key,1,length(?2))=?2
+            AND state IN ('pending','running','deferred','failed')",
+            )?
+            .query_map(params![processor, prefix], |r| r.get::<_, String>(0))?
+        {
+            if let Some(sha) = target?.strip_prefix(&prefix) {
+                targets.insert(sha.to_string());
+            }
+        }
+        let mut targets: Vec<_> = targets.into_iter().collect();
+        targets.sort();
+        let mut actions: Vec<Persist> = Vec::with_capacity(targets.len() + 1);
+        let register = identity.clone();
+        actions.push(Box::new(move |conn| {
+            index::register_space_in(conn, &register, now)
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
-            let states = index::scan(conn, Some(&identity), false)?;
-            let keys: Vec<_> = states.iter().map(|s| s.job_key(&identity)).collect();
-            // Transfer failure/interruption history before generic enqueue can obsolete it.
-            // Never clear terminal, counters or a provider wait by changing only DB generation.
-            for (s, key) in states.iter().zip(&keys) {
-                let history: Option<(i64,i64,i64,bool,i64,String)> = conn.query_row(
-                    "SELECT attempts,defer_count,interruption_count,terminal,next_attempt_at,last_error_code
-                     FROM ai_jobs WHERE kind='image_embedding' AND target_key=?1 AND processor_version=?2
-                     ORDER BY (state='obsolete'),updated_at DESC,id DESC LIMIT 1", params![key.target_key,key.processor_version],
-                     |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?;
-                let (attempts, defers, interruptions, terminal, next, code) =
-                    history.unwrap_or_default();
-                let previous: Option<String> = conn.query_row("SELECT state FROM ai_jobs
-                    WHERE kind='image_embedding' AND target_key=?1 AND input_hash=?2 AND processor_version=?3",
-                    params![key.target_key,key.input_hash,key.processor_version], |r|r.get(0)).optional()?;
-                jobs::enqueue_in(conn, key, now)?;
-                if previous.as_deref().is_none_or(|s| s == "obsolete") && !s.has_vector {
-                    conn.execute("UPDATE ai_jobs SET attempts=?4,interruption_count=?5,terminal=?6,defer_count=?8,
-                        next_attempt_at=MAX(next_attempt_at,?7), state=CASE WHEN ?6 THEN 'failed' ELSE 'pending' END,
-                        last_error_code=?9
-                        WHERE kind='image_embedding' AND target_key=?1 AND input_hash=?2 AND processor_version=?3",
-                        params![key.target_key,key.input_hash,key.processor_version,attempts,interruptions,terminal,next,defers,code])?;
-                }
-                if !s.has_vector {
-                    // Repair only a demonstrably missing/corrupt result. Successful keys with valid
-                    // vectors are never reset. Preserve counters and all terminal limits.
-                    conn.execute("UPDATE ai_jobs SET state=CASE WHEN terminal THEN 'failed' ELSE 'pending' END,
-                        claim_token=NULL,updated_at=?4 WHERE kind='image_embedding' AND state='succeeded'
-                        AND target_key=?1 AND input_hash=?2 AND processor_version=?3",
-                        params![key.target_key,key.input_hash,key.processor_version,now])?;
-                }
-            }
-            let prefix = format!("{}\u{1f}", identity.space_id());
-            let old = conn.prepare("SELECT target_key,input_hash,processor_version FROM ai_jobs
-                WHERE kind='image_embedding' AND state IN ('pending','running','deferred','failed')")?
-                .query_map([], |r| Ok(JobKey::new(JobKind::ImageEmbedding,r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for key in old
-                .into_iter()
-                .filter(|k| k.target_key.starts_with(&prefix) && !keys.contains(k))
-            {
-                conn.execute("UPDATE ai_jobs SET state='obsolete',claim_token=NULL,updated_at=?4
-                    WHERE kind='image_embedding' AND target_key=?1 AND input_hash=?2 AND processor_version=?3
-                    AND state IN ('pending','running','deferred','failed')",
-                    params![key.target_key,key.input_hash,key.processor_version,now])?;
-            }
             Ok(InputCheck::Current)
-        })])
+        }));
+        for sha in targets {
+            let identity = identity.clone();
+            actions.push(Box::new(move |conn| {
+                // Fresh indexed SHA read inside this chunk's transaction: membership and
+                // result corruption can change after planning or between writer chunks.
+                if let Some(state) = index::scan_sha(conn,&identity,&sha)? {
+                    let key = state.job_key(&identity);
+                    jobs::enqueue_image_lineage_in(conn,&key,now)?;
+                    if !state.has_vector {
+                        conn.execute("UPDATE ai_jobs SET state=CASE WHEN terminal THEN 'failed' ELSE 'pending' END,
+                            claim_token=NULL,updated_at=?4 WHERE kind='image_embedding' AND state='succeeded'
+                            AND target_key=?1 AND input_hash=?2 AND processor_version=?3",
+                            params![key.target_key,key.input_hash,key.processor_version,now])?;
+                    }
+                } else {
+                    conn.execute("UPDATE ai_jobs SET state='obsolete',claim_token=NULL,updated_at=?3
+                        WHERE kind='image_embedding' AND target_key=?1 AND processor_version=?2
+                        AND state IN ('pending','running','deferred','failed')",
+                        params![format!("{}\u{1f}{sha}",identity.space_id()),
+                            index::image_embedding_processor_version(&identity),now])?;
+                }
+                Ok(InputCheck::Current)
+            }));
+        }
+        Ok(actions)
     }
     fn run(&self, ctx: &RunCtx<'_>, job: &Claimed) -> Result<Persist, RunError> {
         ctx.before_probe()?;
@@ -271,7 +268,29 @@ impl Handler for ImageEmbedding {
             Some(_) => Recheck::Requeue,
         })
     }
-    fn maintenance(&self, _read: &Connection, _now: i64) -> rusqlite::Result<Option<Maintenance>> {
+    fn maintenance(&self, read: &Connection, _now: i64) -> rusqlite::Result<Option<Maintenance>> {
+        // The active pointer never needs republishing. Missing vectors with queued work
+        // also cannot publish yet. Avoid full writer scans after every job completion.
+        // This is only a read-side optimization; the eventual activation still validates
+        // all members and vectors atomically in the writer transaction.
+        let skip: bool = read.query_row(
+            "SELECT CASE WHEN EXISTS(SELECT 1 FROM settings WHERE key='ai_active_space' AND value=?3)
+            THEN 1 ELSE EXISTS(SELECT 1 FROM ai_jobs
+            WHERE kind='image_embedding' AND processor_version=?1
+            AND substr(target_key,1,length(?2))=?2
+            AND state IN ('pending','running','deferred')
+            AND NOT EXISTS(SELECT 1 FROM ai_embedding_vectors v WHERE v.space_id=?3
+                AND v.input_sha256=substr(ai_jobs.target_key,length(?2)+1))) END",
+            params![
+                index::image_embedding_processor_version(self.identity()),
+                format!("{}\u{1f}", self.identity().space_id()),
+                self.identity().space_id()
+            ],
+            |r| r.get(0),
+        )?;
+        if skip {
+            return Ok(None);
+        }
         let snapshot = self
             .snapshot
             .lock()

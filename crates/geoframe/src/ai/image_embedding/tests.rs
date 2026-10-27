@@ -938,3 +938,508 @@ fn reverting_to_an_older_generation_cannot_revive_a_lower_failure_budget() {
     assert_eq!(lab.posts().len(), posts + 1);
     assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 1);
 }
+
+// Regressions adapted from the independent review reproductions. Every cleanup action
+// is executed in a writer transaction, matching production's bounded batches.
+fn cleanup(e: &Env, h: &Arc<dyn Handler>, now: i64) {
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    for action in h.reconcile_cleanup(&read, now).unwrap() {
+        e.writer()
+            .call(move |c| {
+                let tx = c.transaction()?;
+                action(&tx)?;
+                tx.commit()
+            })
+            .unwrap();
+    }
+}
+
+#[test]
+fn old_success_cannot_mask_current_terminal_after_temporary_absence() {
+    let lab = Lab::new();
+    let e = lab.env("lineage-old-success");
+    let bytes = jpeg(26);
+    photo(&e, 1, &bytes);
+    cycle(&e);
+    photo(&e, 2, &bytes);
+    e.advance(61);
+    cycle(&e);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        2
+    );
+    assert_eq!(lab.posts().len(), 1);
+    sql(&e, "DELETE FROM ai_embedding_vectors");
+    lab.state.lock().unwrap().status = 422;
+    e.advance(61);
+    cycle(&e);
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE id=2 AND state='failed' AND terminal=1"
+        ),
+        1
+    );
+    sql(&e, "UPDATE photos SET md5='temporarily-stale'");
+    e.advance(61);
+    cycle(&e);
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE id=2 AND state='obsolete' AND terminal=1"
+        ),
+        1
+    );
+    sql(&e, "UPDATE photos SET md5='m'");
+    e.advance(61);
+    let h = handlers(&e).remove(0);
+    cleanup(&e, &h, e.clock()());
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE id=2 AND state='failed' AND terminal=1 AND last_error_code='input_invalid'"
+        ),
+        1
+    );
+    // A new duplicate generation must inherit B, never the older success A.
+    photo(&e, 3, &bytes);
+    cleanup(&e, &h, e.clock()());
+    cycle(&e);
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE id=3 AND state='failed' AND terminal=1 AND last_error_code='input_invalid'"
+        ),
+        1
+    );
+    assert_eq!(lab.posts().len(), 2);
+}
+
+#[test]
+fn same_second_roundtrip_and_absence_preserve_all_terminal_and_wait_history() {
+    for mode in ["attempt", "permanent", "interruption", "defer"] {
+        let lab = Lab::new();
+        let e = lab.env(&format!("lineage-{mode}"));
+        photo(&e, 1, &jpeg(25));
+        let h = handlers(&e).remove(0);
+        cleanup(&e, &h, T0); // A, id 1
+        sql(&e, "UPDATE photos SET rotation=90");
+        cleanup(&e, &h, T0); // B, id 2
+        sql(&e, "UPDATE photos SET rotation=0");
+        cleanup(&e, &h, T0); // A again
+        e.writer()
+            .call(move |c| {
+                let job =
+                    jobs::claim_next_scoped(c, T0, "run", "token", &[h.claim_scope()])?.unwrap();
+                assert_eq!(job.id, 1);
+                match mode {
+                    "permanent" => {
+                        jobs::record_failure(
+                            c,
+                            &job,
+                            T0,
+                            ErrorCode::InputInvalid,
+                            Failure::Permanent,
+                        )?;
+                    }
+                    "attempt" => {
+                        c.execute("UPDATE ai_jobs SET attempts=4,defer_count=6 WHERE id=1", [])?;
+                        jobs::record_failure(c, &job, T0, ErrorCode::Timeout, Failure::Attempt)?;
+                    }
+                    "interruption" => {
+                        c.execute(
+                            "UPDATE ai_jobs SET interruption_count=2,defer_count=6 WHERE id=1",
+                            [],
+                        )?;
+                        jobs::reclaim_interrupted(c, "restart", T0)?;
+                    }
+                    _ => {
+                        jobs::record_failure(
+                            c,
+                            &job,
+                            T0,
+                            ErrorCode::Timeout,
+                            Failure::Defer {
+                                retry_after_secs: Some(300),
+                            },
+                        )?;
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        // Capture the authoritative history before absence. Timestamps and generated IDs
+        // are deliberately misleading, and a fresh handler simulates process restart.
+        let before=e.writer().call(|c|c.query_row("SELECT attempts,defer_count,interruption_count,terminal,next_attempt_at,last_error_code FROM ai_jobs WHERE id=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,bool>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?)))).unwrap();
+        let h = handlers(&e).remove(0);
+        sql(&e, "UPDATE photos SET md5='absent'");
+        cleanup(&e, &h, T0);
+        sql(&e, "UPDATE photos SET md5='m'");
+        cleanup(&e, &h, T0);
+        let after=e.writer().call(|c|c.query_row("SELECT attempts,defer_count,interruption_count,terminal,next_attempt_at,last_error_code FROM ai_jobs WHERE id=1",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,bool>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?)))).unwrap();
+        assert_eq!(before, after, "{mode}");
+        // Another entirely new generation inherits every field, even after absence.
+        sql(&e, "UPDATE photos SET rotation=180");
+        cleanup(&e, &h, T0);
+        let inherited=e.writer().call(|c|c.query_row("SELECT attempts,defer_count,interruption_count,terminal,next_attempt_at,last_error_code FROM ai_jobs WHERE id=3",[],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,bool>(3)?,r.get::<_,i64>(4)?,r.get::<_,String>(5)?)))).unwrap();
+        assert_eq!(before, inherited, "{mode}");
+        assert_eq!(
+            n(
+                &e,
+                "SELECT COUNT(*) FROM ai_jobs WHERE id=3 AND state='failed'"
+            ),
+            i64::from(mode != "defer")
+        );
+        assert!(lab.posts().is_empty());
+    }
+}
+
+#[test]
+fn explicit_retry_resets_old_lineage_history_before_existing_and_new_generations() {
+    for tracked in [true, false] {
+        let lab = Lab::new();
+        let e = lab.env("lineage-retry");
+        photo(&e, 1, &jpeg(27));
+        let (h, job) = prepare(&e);
+        e.writer()
+            .call(move |c| {
+                jobs::record_failure(c, &job, T0, ErrorCode::InputInvalid, Failure::Permanent)
+            })
+            .unwrap();
+        sql(&e, "UPDATE photos SET rotation=90");
+        cleanup(&e, &h, T0);
+        assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE terminal=1"), 2);
+        if !tracked {
+            sql(&e, "DELETE FROM ai_image_embedding_lineage");
+        }
+        let retry = h.clone();
+        e.writer()
+            .call(move |c| {
+                jobs::retry_failed(c, T0, jobs::RetryScope::All, |c, k| retry.recheck(c, k))
+            })
+            .unwrap();
+        assert_eq!(
+            n(
+                &e,
+                "SELECT COUNT(*) FROM ai_jobs WHERE terminal=1 OR attempts!=0 OR defer_count!=0 OR interruption_count!=0 OR last_error_code!=''"
+            ),
+            0
+        );
+        sql(&e, "UPDATE photos SET md5='absent'");
+        cleanup(&e, &h, T0);
+        sql(&e, "UPDATE photos SET md5='m',rotation=0");
+        cleanup(&e, &h, T0);
+        assert_eq!(
+            n(
+                &e,
+                "SELECT COUNT(*) FROM ai_jobs WHERE id=1 AND state='pending' AND terminal=0"
+            ),
+            1
+        );
+        sql(&e, "UPDATE photos SET rotation=180");
+        cleanup(&e, &h, T0);
+        cycle(&e);
+        assert_eq!(lab.posts().len(), 1);
+        assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE terminal=1"), 0);
+    }
+}
+
+#[test]
+fn cleanup_and_supersede_protect_other_processors_and_spaces_in_all_states_and_races() {
+    let lab = Lab::new();
+    let e = lab.env("processor-boundary");
+    photo(&e, 1, &jpeg(28));
+    let h = handlers(&e).remove(0);
+    cleanup(&e, &h, T0);
+    sql(&e,"INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,claim_token,created_at,updated_at)
+        SELECT kind,target_key,'other-'||st,s,st,'other-token',0,0 FROM ai_jobs
+        CROSS JOIN (SELECT 'pending' st UNION ALL SELECT 'running' UNION ALL SELECT 'deferred' UNION ALL SELECT 'failed')
+        CROSS JOIN (SELECT 'foreign-processor' s)
+        WHERE id=1;");
+    sql(&e,"INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,claim_token,created_at,updated_at)
+        SELECT kind,'other-space'||char(31)||'sha',input_hash,processor_version,state,claim_token,0,0
+        FROM ai_jobs WHERE processor_version='foreign-processor';");
+    sql(&e,"INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,claim_token,created_at,updated_at)
+        SELECT 'image_embedding','other-space'||char(31)||'sha','same-'||st,processor_version,st,'space-token',0,0
+        FROM ai_jobs CROSS JOIN (SELECT 'pending' st UNION ALL SELECT 'running' UNION ALL SELECT 'deferred' UNION ALL SELECT 'failed') WHERE id=1;");
+    let before=e.writer().call(|c| {
+        c.prepare("SELECT id,target_key,input_hash,processor_version,state,claim_token FROM ai_jobs WHERE id!=1 ORDER BY id")?
+        .query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()
+    }).unwrap();
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    let actions = h.reconcile_cleanup(&read, T0).unwrap();
+    // Change generation after planning. The writer must use the new generation and limit
+    // both cleanup and supersede to this processor.
+    sql(&e, "UPDATE photos SET rotation=90");
+    for action in actions {
+        e.writer()
+            .call(move |c| {
+                let tx = c.transaction()?;
+                action(&tx)?;
+                tx.commit()
+            })
+            .unwrap();
+    }
+    sql(&e, "UPDATE photos SET md5='absent'");
+    cleanup(&e, &h, T0);
+    let after=e.writer().call(|c| {
+        c.prepare("SELECT id,target_key,input_hash,processor_version,state,claim_token FROM ai_jobs WHERE processor_version='foreign-processor' OR target_key LIKE 'other-space%' ORDER BY id")?
+        .query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,String>(3)?,r.get::<_,String>(4)?,r.get::<_,Option<String>>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()
+    }).unwrap();
+    assert_eq!(before, after);
+    assert!(h.reconcile(&read, T0).unwrap().is_empty()); // generic supersede cannot re-enter
+    let scope = h.claim_scope();
+    assert!(
+        e.writer()
+            .call(move |c| jobs::claim_next_scoped(c, T0, "run", "claim", &[scope]))
+            .unwrap()
+            .is_none()
+    );
+}
+
+fn synthetic_targets(e: &Env, count: usize) {
+    sql(e,&format!("WITH RECURSIVE nums(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM nums WHERE i<{count})
+        INSERT INTO photos(id,source,name,display,md5,mtime,rotation)
+        SELECT i,'local','synthetic','derivatives/'||i||'.jpg','m',1,0 FROM nums;
+        INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,error,analyzed_at)
+        SELECT id,display,md5,mtime,printf('%064x',id),'','synthetic' FROM photos;"));
+}
+
+#[test]
+fn cleanup_chunk_failure_rolls_back_only_that_chunk_and_restart_repairs_lineage() {
+    let lab = Lab::new();
+    let e = lab.env("cleanup-partial");
+    synthetic_targets(&e, 450);
+    sql(&e,"CREATE TRIGGER fail_middle BEFORE INSERT ON ai_jobs WHEN (SELECT COUNT(*) FROM ai_jobs)>=225
+        BEGIN SELECT RAISE(ABORT,'synthetic-middle-chunk'); END;");
+    struct GuardedCleanup(Arc<dyn Handler>);
+    impl Handler for GuardedCleanup {
+        fn kind(&self) -> JobKind {
+            self.0.kind()
+        }
+        fn claim_scope(&self) -> jobs::ClaimScope {
+            self.0.claim_scope()
+        }
+        fn reconcile(&self, _: &Connection, _: i64) -> rusqlite::Result<Vec<JobKey>> {
+            panic!("generic reconcile must be skipped after a middle cleanup chunk fails")
+        }
+        fn reconcile_cleanup(&self, c: &Connection, now: i64) -> rusqlite::Result<Vec<Persist>> {
+            self.0.reconcile_cleanup(c, now)
+        }
+        fn run(&self, ctx: &RunCtx<'_>, job: &Claimed) -> Result<Persist, RunError> {
+            self.0.run(ctx, job)
+        }
+        fn recheck(&self, c: &Connection, k: &JobKey) -> rusqlite::Result<Recheck> {
+            self.0.recheck(c, k)
+        }
+    }
+    let h = Arc::new(GuardedCleanup(handlers(&e).remove(0)));
+    Core::new(&e.deps(vec![h], &StopFlag::new(), "middle-cleanup-failure")).cycle();
+    // register + 199 targets committed in chunk 1. The whole second chunk rolled back,
+    // and no generic enqueue could bypass the failed cleanup to create remaining rows.
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_jobs"), 199);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_image_embedding_lineage"),
+        199
+    );
+    assert_eq!(lab.posts().len(), 0);
+    sql(
+        &e,
+        "DROP TRIGGER fail_middle;
+        UPDATE ai_jobs SET state='failed',terminal=1,attempts=5,defer_count=7,
+            interruption_count=3,last_error_code='timeout',next_attempt_at=9999999999;",
+    );
+    let h = handlers(&e).remove(0);
+    cleanup(&e, &h, T0);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_jobs"), 450);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_image_embedding_lineage"),
+        450
+    );
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE terminal=1 AND attempts=5 AND defer_count=7 AND interruption_count=3 AND next_attempt_at=9999999999 AND last_error_code='timeout'"
+        ),
+        199
+    );
+}
+
+#[test]
+fn stop_between_cleanup_chunks_preserves_committed_history_and_next_cycle_repairs() {
+    // Stop from SQLite's COMMIT trace of the actual worker's first cleanup chunk.
+    // No timing race and no fabricated manual chunk execution.
+    static STOP: Mutex<Option<StopFlag>> = Mutex::new(None);
+    fn trace(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+            && sql == "COMMIT"
+            && let Some(stop) = STOP.lock().unwrap().as_ref()
+        {
+            stop.stop();
+        }
+    }
+    let lab = Lab::new();
+    let e = lab.env("cleanup-stop");
+    synthetic_targets(&e, 450);
+    let stop = StopFlag::new();
+    *STOP.lock().unwrap() = Some(stop.clone());
+    e.writer()
+        .call(|c| {
+            c.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(trace),
+            );
+            Ok(())
+        })
+        .unwrap();
+    Core::new(&e.deps(handlers(&e), &stop, "stopped-cleanup")).cycle();
+    e.writer()
+        .call(|c| {
+            c.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+            Ok(())
+        })
+        .unwrap();
+    *STOP.lock().unwrap() = None;
+    assert!(stop.is_stopped());
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_jobs"), 199);
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE state='pending' AND claim_token IS NULL"
+        ),
+        199
+    );
+    assert!(lab.posts().is_empty());
+    let h = handlers(&e).remove(0);
+    cleanup(&e, &h, T0);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_jobs"), 450);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_image_embedding_lineage"),
+        450
+    );
+}
+
+#[test]
+fn scale_6500_reports_bounded_writer_chunks_and_bulk_failure_queries() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static SQL: AtomicUsize = AtomicUsize::new(0);
+    static FAIL: AtomicUsize = AtomicUsize::new(0);
+    fn trace(event: rusqlite::trace::TraceEvent<'_>) {
+        if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+            SQL.fetch_add(1, Ordering::SeqCst);
+            if sql.starts_with("SELECT target_key,input_hash,last_error_code") {
+                FAIL.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+    let lab = Lab::new();
+    let e = lab.env("cleanup-scale-6500");
+    synthetic_targets(&e, 6500);
+    let h = handlers(&e).remove(0);
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    let mut actions = h.reconcile_cleanup(&read, T0).unwrap().into_iter();
+    let mut total = Duration::ZERO;
+    let mut max = Duration::ZERO;
+    let mut chunks = 0;
+    // Measure without SQL tracing overhead. Actual worker groups at most 200 actions.
+    loop {
+        let chunk: Vec<_> = actions.by_ref().take(200).collect();
+        if chunk.is_empty() {
+            break;
+        }
+        let elapsed = e
+            .writer()
+            .call(move |c| {
+                let start = std::time::Instant::now();
+                let tx = c.transaction()?;
+                for action in chunk {
+                    action(&tx)?;
+                }
+                tx.commit()?;
+                Ok(start.elapsed())
+            })
+            .unwrap();
+        total += elapsed;
+        max = max.max(elapsed);
+        chunks += 1;
+    }
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_jobs"), 6500);
+    assert_eq!(chunks, 33);
+    // While genuinely missing vectors remain, maintenance performs a single read query
+    // and submits no writer closure. At completion, scan classifies all failed SHAs in 1 SQL.
+    assert!(h.maintenance(&read, T0).unwrap().is_none());
+    sql(
+        &e,
+        "UPDATE ai_jobs SET state='failed',terminal=1,last_error_code='input_invalid'",
+    );
+    let action = h.maintenance(&read, T0).unwrap().unwrap();
+    let elapsed = e
+        .writer()
+        .call(move |c| {
+            c.trace_v2(
+                rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+                Some(trace),
+            );
+            SQL.store(0, Ordering::SeqCst);
+            FAIL.store(0, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            action(c)?;
+            let elapsed = start.elapsed();
+            c.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+            Ok(elapsed)
+        })
+        .unwrap();
+    let full_sql = SQL.load(Ordering::SeqCst);
+    let failed_sql = FAIL.load(Ordering::SeqCst);
+    assert_eq!(failed_sql, 1);
+    assert_eq!(pointer(&e), None); // all failed never publishes
+    eprintln!(
+        "6500 synthetic targets, debug={}: cleanup {} writer chunks total {:?}, max {:?}; all-failed activation writer {:?}, SQL {}, failed SELECTs {}; pending maintenance writer closures 0",
+        cfg!(debug_assertions),
+        chunks,
+        total,
+        max,
+        elapsed,
+        full_sql,
+        failed_sql
+    );
+}
+
+#[test]
+fn lineage_migration_reports_one_additive_table_and_preserves_existing_jobs() {
+    let lab = Lab::new();
+    let e = lab.env("lineage-migration");
+    photo(&e, 1, &jpeg(29));
+    let (_, job) = prepare(&e);
+    e.writer()
+        .call(move |c| {
+            jobs::record_failure(c, &job, T0, ErrorCode::InputInvalid, Failure::Permanent)
+        })
+        .unwrap();
+    let before = dump(&e, "ai_jobs");
+    sql(&e, "DROP TABLE ai_image_embedding_lineage");
+    e.writer()
+        .call(|c| {
+            assert_eq!(
+                crate::ai::pending_active(c, false, false)?,
+                vec!["ai_image_embedding_lineage"]
+            );
+            assert_eq!(jobs::migrate(c)?, vec!["ai_image_embedding_lineage"]);
+            let changes = c.total_changes();
+            assert!(jobs::migrate(c)?.is_empty());
+            assert_eq!(c.total_changes(), changes);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(before, dump(&e, "ai_jobs"));
+    let h = handlers(&e).remove(0);
+    cleanup(&e, &h, T0);
+    assert_eq!(
+        n(
+            &e,
+            "SELECT COUNT(*) FROM ai_jobs WHERE state='failed' AND terminal=1"
+        ),
+        1
+    );
+    assert!(lab.posts().is_empty());
+}

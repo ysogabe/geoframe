@@ -171,7 +171,7 @@ fn dry_run_writes_nothing_and_reports_counts() {
     assert!(stdout.contains("dry-run: 何も書きません"), "{stdout}");
     assert!(
         stdout.contains(
-            "スキーマ: 作る表・索引 9 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
+            "スキーマ: 作る表・索引 10 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
         ),
         "{stdout}"
     );
@@ -309,7 +309,7 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
         )
         .unwrap();
     // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・`ai_embedding_spaces`・`ai_embedding_vectors`
-    assert_eq!(tables, 18);
+    assert_eq!(tables, 19);
 }
 
 #[test]
@@ -323,7 +323,7 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     assert!(out.status.success(), "{}", text(&out.stdout));
     // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表）だけ。ほかの表・列は変えない
     assert!(
-        text(&out.stdout).contains("スキーマを更新しました: 作成 9件 / 列の追加 0件"),
+        text(&out.stdout).contains("スキーマを更新しました: 作成 10件 / 列の追加 0件"),
         "{}",
         text(&out.stdout)
     );

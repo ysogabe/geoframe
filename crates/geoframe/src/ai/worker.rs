@@ -633,7 +633,10 @@ impl Core {
             let mut cleanup = cleanup.into_iter();
             loop {
                 let chunk: Vec<_> = cleanup.by_ref().take(ENQUEUE_CHUNK).collect();
-                if chunk.is_empty() || self.stop.is_stopped() {
+                if self.stop.is_stopped() {
+                    return;
+                }
+                if chunk.is_empty() {
                     break;
                 }
                 if self
