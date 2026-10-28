@@ -615,15 +615,16 @@ pub(super) fn enqueue_image_lineage_in(
 ///
 /// - 通常は `next_attempt_at`（積んだ時刻。失敗・反復・中断のバックオフで戻ったジョブは、戻した時刻の
 ///   ぶんだけ後ろ＝待ち行列の後ろへ）。
-/// - **失敗・反復・中断の履歴が無い `deferred`**（正常停止の `shutdown`、Provider の停止・到達不能・待機などの
-///   後回し。ジョブ自身の不良ではない）は、積んだ時刻（`created_at`）。期限を過ぎたら元の位置に戻り、あとから積まれた
+/// - **反復の失敗の履歴が無い `deferred`**（`defer_count=0`。正常停止の `shutdown`、Provider の停止・到達不能・待機
+///   などの後回しで、ジョブ自身の不良ではない。それまでに 1 回失敗していても、後回しになった理由が違えば対象）は、
+///   積んだ時刻（`created_at`）。期限を過ぎたら元の位置に戻り、あとから積まれた
 ///   `pending` の後ろに回り続けない（後回しの期限は `next_attempt_at` にあり、並びのキーにすると、多数の `pending`
-///   が残るあいだ取られない）。手動の再試行・中断の回収・失敗のバックオフで `pending` に戻ったものは対象外
-///   （`pending` は従来どおり）。
+///   が残るあいだ取られない）。反復の失敗（`Failure::Repeated`。`defer_count>0`）の `deferred` と、手動の再試行・
+///   中断の回収・失敗のバックオフで `pending` に戻ったものは対象外（従来どおり戻した時刻の順）。
 ///
 /// 既存の索引（`idx_ai_jobs_runnable`）はそのまま使え、新しい索引・列は要らない。
-const CLAIM_ORDER_KEY: &str = "CASE WHEN state='deferred' AND attempts=0 AND defer_count=0
-        AND interruption_count=0 THEN created_at ELSE next_attempt_at END";
+const CLAIM_ORDER_KEY: &str =
+    "CASE WHEN state='deferred' AND defer_count=0 THEN created_at ELSE next_attempt_at END";
 
 /// 実行できる 1 件を取り、`running`・`run_id`・`token` を付ける（1 文なので 1 回の短いトランザクション）。
 /// 実行できるのは `pending`／`deferred` で `next_attempt_at <= now` のもの。並びは [`CLAIM_ORDER_KEY`]、次に `id`

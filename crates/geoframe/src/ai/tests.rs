@@ -1310,6 +1310,47 @@ fn unavailable_deferred_waits_for_its_deadline_then_goes_back_to_its_place() {
     assert_eq!(s.claim(due, "run", "t-due").unwrap().id, first.id);
 }
 
+/// 1 回失敗して（`attempts=1`）から、停止で後回しになったジョブも、ジョブ自身の不良による後回しではないので、
+/// 期限が来たら元の位置に戻る。
+#[test]
+fn a_job_that_failed_once_returns_to_its_place_after_a_shutdown_deferral() {
+    let s = setup("ai-claim-order-failed-once");
+    s.enqueue(&embed("first", "1"), T0);
+    for i in 0..50 {
+        s.enqueue(&embed(&format!("later-{i}"), "1"), T0 + 1);
+    }
+    let first = s.claim(T0 + 2, "run", "tok").unwrap();
+    assert_eq!(
+        s.fail(&first, T0 + 3, Failure::Attempt),
+        Some(JobState::Pending)
+    );
+    let due = s.row(first.id).next;
+    assert_eq!(s.row(first.id).attempts, 1);
+    // 失敗のバックオフで戻った pending は待ち行列の後ろ。先の 50 件を取り終えたあとに取り直し、停止で戻す
+    // （attempts=1・defer_count=0 の deferred/shutdown）
+    for i in 0..50 {
+        let c = s.claim(due, "other-run", &format!("t{i}")).unwrap();
+        assert_ne!(c.id, first.id);
+    }
+    let again = s.claim(due, "run", "tok-2").unwrap();
+    assert_eq!(again.id, first.id);
+    // 今度は後ろにも先にも pending を積んでおく
+    for i in 0..20 {
+        s.enqueue(&embed(&format!("newer-{i}"), "1"), due + 1);
+    }
+    let released = s
+        .writer
+        .call(move |conn| release_for_shutdown(conn, "run", due + 10))
+        .unwrap();
+    assert_eq!(released, 1);
+    let row = s.row(first.id);
+    assert_eq!(
+        (row.state, row.attempts, row.defer_count),
+        (JobState::Deferred, 1, 0)
+    );
+    assert_eq!(s.claim(due + 10, "run-2", "tok-3").unwrap().id, first.id);
+}
+
 /// ジョブ自身の不良（反復の失敗）で後回しにしたものは、従来どおり待ち行列の後ろへ回る（元の位置には戻らない）。
 #[test]
 fn repeated_failure_still_goes_to_the_back_of_the_queue() {
