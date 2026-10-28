@@ -126,6 +126,23 @@ c2で追加する2表（既存結果/一次列のschema変更なし、追加索�
 - **ジョブのキー**: `input_hash`は送信JPEGのSHAを含まない計画（日・モデル・処理版・世代・送る写真のsource SHA）のハッシュ（`SavedAnswer::plan_hash`）に変えた。JPEGは元画像のSHAと処理版（`PREPROCESS_VERSION`を含む）から決まるので同一性は失わず、画像を作らずにキーを決められる。履歴の`result_key`（JPEGのSHAを含む）は変えない。旧キーのジョブは新キーとは別の行になる（P4は未デプロイ）。
 - 準備の恒久失敗（巨大body・画像不正）は、そのジョブ自身の恒久失敗になる（これまでの`-preparation`キーの別jobではない。`Intent`を作れない日だけ従来の別キー）。terminalなら`photo_loc_runs`にerror行を投影する。
 
+- **起動回収で`failed`になったキーの失敗行**: 中断の上限（3回）で`reclaim_interrupted_in`が`failed`にしたジョブは、終端のcallbackが走らず`photo_loc_runs`のerror行が書かれない。周期の`prepare`は失敗の履歴で止まっているキーを積まないが、そのキーについても`reproject_failure_in`（`project_failure`の冪等版）を掃除の書き込みに積む。`ai_jobs`の回数・理由と`photo_loc_runs`のerror行（`status='error'`・`attempts`・`error`）が同じなら何も書かないので、毎周期は書き込まない。これでPythonへ戻したとき、その日を未試行とみなして有償の送信をやり直すことがない。
+- **クラウド鍵の権限拒否**: 権限がゆるい・所有者が実行ユーザーと違う鍵は、読まずに拒否して停止理由は他の認証失敗と同じ`unauthorized`のまま。理由は`[ai]`の固定文のwarnを1回だけ出す（パス・値は出さない。復旧は0600・実行ユーザーの所有にして`geoframe ai-jobs release-pause`）。`ai_provider_pauses.reason`はCHECK制約で固定の4値（`unauthorized`／`forbidden`／`model_not_found`／`contract_mismatch`）のため、`key_insecure`のような新しい停止理由は足していない（足すには既存DBの表を作り直す移行が要る。P5以降の検討）。
+
+### 記録: 画面用の行（`photo_loc_suggestions`）を周期で消す
+
+Rustの`location_suggest`は、**自分が書いた投影の行**（`ai_location_candidates.row_json`と画面の行が一致するもの）を、次の場合に周期（`reconcile_cleanup`の`retract_stale_projection`）で`photo_loc_suggestions`から`DELETE`する。
+
+- 画像ファイルの差し替え・消失（ファイルを観測する周期だけが分かる）
+- 人がSAVEして位置が決まった
+- hiddenになった
+- 日の構成が変わった（追加・削除・時刻変更・回転など）
+- 履歴（`ai_location_suggest_results`）が壊れた
+
+候補（`ai_location_candidates`）と有償回答は消さないので、有効に戻れば座標化の投影の復元が行を戻す（再送しない）。Pythonが書き換えた行（`row_json`と一致しない行）と、候補の無い旧行には触れない。Pythonは`photo_loc_suggestions`のうち`lat IS NULL`の行しか読まないので、切り戻しても害はない。
+
+**棚卸しとの違い**: [inventory.md](inventory.md)の`photo_loc_suggestions`の「掃除する処理なし」は**Python側**の挙動（位置が確定した写真の行も残る）で、この文書の「周期で消す」はRust側が自分の投影だけに行う掃除である。同じ表でも、Rustの行は上の条件で消えうるが、Pythonが書いた行は消えない。
+
 ## c2 の検証・引継ぎ
 
 試験は合成RGB/JPEG・合成DB・未登録のRSA fixture・loopbackだけ。実LAN/クラウド/画像/鍵/DB、SSH、LXCは使わない。fixtureは`include_str!`で埋め込み、既存の `tests/fixtures/jwt-test-pkcs8.b64` / `location-suggest-python.json` / `location-clue-python.json` 等を使用する。新たな外部配置fixtureは不要。LXCでRust単体試験を再ビルド/実行するときは更新済み`tools/gen_location_suggest_fixture.py`と既存`app/geoframe/loc_suggest.py`もソースツリーに含める（既存c1と同じPython3前提）。

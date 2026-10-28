@@ -284,6 +284,12 @@ impl LocationSuggest {
             match Intent::new(day.clone(), &self.shared.model) {
                 Ok(intent) => {
                     if failed.contains(&key_triple(&intent.key())) {
+                        // 起動回収などで `failed` になったキーは、終端の callback が走らず投影が書かれていない
+                        // ことがある。送らないまま、旧実装が読む失敗の行（`photo_loc_runs`）だけを揃える
+                        // （同じ内容が書かれていれば何もしない）。
+                        actions.push(Box::new(move |tx| {
+                            repository::reproject_failure_in(tx, &intent, now)
+                        }));
                         continue;
                     }
                     let p = intent.clone();

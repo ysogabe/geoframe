@@ -258,3 +258,52 @@ fn a_loosely_permitted_key_is_refused_before_any_dns_or_exchange() {
     assert_eq!(dns.calls.load(Ordering::SeqCst), 0);
     assert!(server.requests.lock().unwrap().is_empty());
 }
+
+#[test]
+fn a_refused_key_logs_one_fixed_warning_without_path_and_keeps_the_pause_reason() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("cloud-loose-key-log");
+    let p = dir.path().join("secret-key-name");
+    write_key(&p);
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let server = stub(|s, _| respond(s, "200 OK", "", &token_body()));
+    let dns = FakeDns::new();
+    let http = transport(&server, "oauth.test", &dns);
+    let auth = Auth::default();
+    let logs = crate::testutil::capture::logs_of(|| {
+        for _ in 0..3 {
+            let error = auth
+                .token(
+                    &p,
+                    &http,
+                    &Deadline::after(Duration::from_secs(1)),
+                    &StopFlag::new(),
+                    &|| Some(1000),
+                )
+                .unwrap_err();
+            assert_eq!(error, unauthorized());
+        }
+    });
+    assert_eq!(logs.matches("権限または所有者が安全でない").count(), 1);
+    assert!(logs.contains("release-pause"));
+    assert!(!logs.contains("secret-key-name") && !logs.contains(dir.path().to_str().unwrap()));
+    // 権限以外の失敗（壊れた JSON など）では、この警告を出さない。
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(&p, "{").unwrap();
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let logs = crate::testutil::capture::logs_of(|| {
+        assert_eq!(
+            Auth::default()
+                .token(
+                    &p,
+                    &http,
+                    &Deadline::after(Duration::from_secs(1)),
+                    &StopFlag::new(),
+                    &|| Some(1000),
+                )
+                .unwrap_err(),
+            unauthorized()
+        );
+    });
+    assert!(!logs.contains("安全でない"));
+}

@@ -24,51 +24,79 @@ struct Cached {
     space: String,
     digest: Option<String>,
 }
-static DIGESTS: Mutex<Option<HashMap<PathBuf, Cached>>> = Mutex::new(None);
-#[cfg(test)]
-pub(super) static LOADS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// 重みファイルの digest の記憶。本番はプロセスで 1 つ（[`cached_digest`]）。件数に上限（[`MAX_CACHED_PATHS`]）が
+/// あるので、試験は自分の記憶を作り、ほかの試験が入れたパスの影響を受けないようにする。
+pub(super) struct DigestCache {
+    map: Mutex<Option<HashMap<PathBuf, Cached>>>,
+    #[cfg(test)]
+    loads: std::sync::atomic::AtomicUsize,
+}
+static DIGESTS: DigestCache = DigestCache::new();
+
+impl DigestCache {
+    pub(super) const fn new() -> Self {
+        Self {
+            map: Mutex::new(None),
+            #[cfg(test)]
+            loads: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// ファイルを読んで解析し直した回数。
+    #[cfg(test)]
+    pub(super) fn loads(&self) -> usize {
+        self.loads.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 重みファイルの digest（読めない・不正なら `None`）。ファイルの mtime・大きさ・dev・ino と空間が
+    /// 同じ間は前回の結果を返し、変わったときだけ読み直す。
+    pub(super) fn digest(&self, path: &Path, identity: &SpaceIdentity) -> Option<String> {
+        let meta = std::fs::metadata(path).ok()?;
+        let stamp = (
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.len(),
+            meta.dev(),
+            meta.ino(),
+        );
+        let space = identity.fingerprint();
+        if let Some(hit) = self
+            .map
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .and_then(|m| m.get(path))
+            .filter(|c| c.stamp == stamp && c.space == space)
+        {
+            return hit.digest.clone();
+        }
+        #[cfg(test)]
+        self.loads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let digest = Model::load(path, identity)
+            .ok()
+            .map(|m| m.digest().to_owned());
+        let mut cache = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let map = cache.get_or_insert_with(HashMap::new);
+        if map.len() >= MAX_CACHED_PATHS && !map.contains_key(path) {
+            map.clear();
+        }
+        map.insert(
+            path.to_path_buf(),
+            Cached {
+                stamp,
+                space,
+                digest: digest.clone(),
+            },
+        );
+        digest
+    }
+}
 
 /// 読み取り経路（状態・検索・管理一覧）が使う、重みファイルの digest（読めない・不正なら `None`）。
-/// 呼ぶたびに最大 8 MiB を読んで解析し直さないよう、ファイルの mtime・大きさ・dev・ino と空間が
-/// 同じ間は前回の結果を返す。変わったときだけ読み直す。
+/// 呼ぶたびに最大 8 MiB を読んで解析し直さないよう、[`DigestCache`] で変わったときだけ読み直す。
 pub fn cached_digest(path: &Path, identity: &SpaceIdentity) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
-    let stamp = (
-        meta.mtime(),
-        meta.mtime_nsec(),
-        meta.len(),
-        meta.dev(),
-        meta.ino(),
-    );
-    let space = identity.fingerprint();
-    if let Some(hit) = DIGESTS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .and_then(|m| m.get(path))
-        .filter(|c| c.stamp == stamp && c.space == space)
-    {
-        return hit.digest.clone();
-    }
-    #[cfg(test)]
-    LOADS.lock().unwrap().push(path.to_path_buf());
-    let digest = Model::load(path, identity)
-        .ok()
-        .map(|m| m.digest().to_owned());
-    let mut cache = DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = cache.get_or_insert_with(HashMap::new);
-    if map.len() >= MAX_CACHED_PATHS && !map.contains_key(path) {
-        map.clear();
-    }
-    map.insert(
-        path.to_path_buf(),
-        Cached {
-            stamp,
-            space,
-            digest: digest.clone(),
-        },
-    );
-    digest
+    DIGESTS.digest(path, identity)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -842,39 +842,34 @@ fn rank_digest_reads_the_weight_file_again_only_when_it_changes() {
     let dir = crate::testutil::TempDir::new("rank-digest-cache");
     let path = dir.path().join("weights.json");
     let id = identity(2);
-    let loads = || {
-        rank::LOADS
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|p| **p == path)
-            .count()
-    };
+    // この試験だけの記憶（本番の共有の記憶は、ほかの試験のパスで満杯になりうる）。
+    let cache = rank::DigestCache::new();
+    let loads = || cache.loads();
     let write = |weight: f64| {
         let mut j = rank_json(&id);
         j["base_weights"] = json!([weight]);
         std::fs::write(&path, j.to_string()).unwrap();
     };
     write(-1.0);
-    let first = rank::cached_digest(&path, &id).unwrap();
+    let first = cache.digest(&path, &id).unwrap();
     for _ in 0..5 {
-        assert_eq!(rank::cached_digest(&path, &id).as_deref(), Some(&*first));
+        assert_eq!(cache.digest(&path, &id).as_deref(), Some(&*first));
     }
     assert_eq!(loads(), 1, "unchanged file is not parsed again");
     // 内容と大きさが変われば読み直す。
     write(-12.5);
-    let second = rank::cached_digest(&path, &id).unwrap();
+    let second = cache.digest(&path, &id).unwrap();
     assert_ne!(first, second);
     assert_eq!(loads(), 2);
     // 不正な内容も、変わるまでは読み直さない（結果は None のまま）。
     std::fs::write(&path, b"invalid synthetic weight, longer").unwrap();
     for _ in 0..3 {
-        assert_eq!(rank::cached_digest(&path, &id), None);
+        assert_eq!(cache.digest(&path, &id), None);
     }
     assert_eq!(loads(), 3);
     // ファイルが無ければ読まずに None。
     std::fs::remove_file(&path).unwrap();
-    assert_eq!(rank::cached_digest(&path, &id), None);
+    assert_eq!(cache.digest(&path, &id), None);
     assert_eq!(loads(), 3);
 }
 #[test]

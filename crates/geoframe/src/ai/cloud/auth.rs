@@ -12,14 +12,17 @@ use super::{
 };
 use crate::{
     jwt::{GoogleAssertion, Rs256Signer},
-    service_account::{self, Context},
+    service_account::{self, Context, KeyError},
     stop::StopFlag,
 };
 use serde::Deserialize;
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Arc, Mutex, atomic::AtomicBool},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -170,7 +173,16 @@ impl Auth {
             return Err(unauthorized());
         }
         let account = service_account::load_service_account(path, &self.warned, Context::Ai)
-            .map_err(|_| unauthorized())?;
+            .map_err(|error| {
+                // 権限・所有者で拒否したときだけ、理由を 1 回だけ残す（パスも値も出さない）。
+                // 停止の理由は他の認証失敗と同じ `unauthorized` のまま（保存できる理由の列挙は固定）。
+                if error == KeyError::Insecure && !self.warned.swap(true, Ordering::SeqCst) {
+                    tracing::warn!(
+                        "[ai] クラウドの認証ファイルの権限または所有者が安全でないため使いません（0600・実行ユーザーの所有にしてから geoframe ai-jobs release-pause を実行）"
+                    );
+                }
+                unauthorized()
+            })?;
         let signer = Rs256Signer::from_pem(&account.private_key).map_err(|_| unauthorized())?;
         signer
             .sign(&GoogleAssertion::new(&account.email, SCOPE, TOKEN_URL, now))

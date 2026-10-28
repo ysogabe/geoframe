@@ -1400,3 +1400,61 @@ fn python_eleven_column_paid_run_reusable_and_apply_run_match_rust_subset_projec
     );
     assert_eq!(l.posts(), 1);
 }
+
+#[test]
+fn interrupted_failed_key_gets_its_failure_row_once_and_is_never_resent() {
+    let l = Lab::new();
+    add(&l.env, 1, 2);
+    l.ready();
+    l.state.lock().unwrap().cloud_status = 503;
+    l.cycle();
+    assert_eq!(
+        n(
+            &l.env,
+            "SELECT COUNT(*) FROM ai_jobs WHERE kind='location_suggest' AND state='pending' AND attempts=1"
+        ),
+        1
+    );
+    // 実行中のまま落ち、あと 1 回で上限になっていたジョブを、次の起動が回収して `failed` にする。
+    sql(
+        &l.env,
+        "UPDATE ai_jobs SET state='running',run_id='previous-run',claim_token='previous-token',
+            interruption_count=2 WHERE kind='location_suggest'",
+    );
+    let reclaimed = l
+        .env
+        .writer()
+        .call(|c| jobs::reclaim_interrupted(c, "current-run", jobs::unix_now()))
+        .unwrap();
+    assert_eq!(reclaimed.failed, 1);
+    assert_eq!(n(&l.env, "SELECT COUNT(*) FROM photo_loc_runs"), 0);
+    sql(
+        &l.env,
+        "CREATE TABLE synthetic_writes(n INTEGER);
+         CREATE TRIGGER synthetic_run_insert AFTER INSERT ON photo_loc_runs BEGIN INSERT INTO synthetic_writes VALUES(1); END;
+         CREATE TRIGGER synthetic_run_update AFTER UPDATE ON photo_loc_runs BEGIN INSERT INTO synthetic_writes VALUES(1); END;",
+    );
+    let (posts, tokens) = (l.posts(), l.tokens());
+
+    l.cycle();
+    assert_eq!(
+        n(
+            &l.env,
+            "SELECT COUNT(*) FROM photo_loc_runs WHERE status='error' AND attempts=1"
+        ),
+        1
+    );
+    assert_eq!(n(&l.env, "SELECT COUNT(*) FROM synthetic_writes"), 1);
+    // 次の周期以降は、同じ内容を書き直さない。送信もしない。
+    l.cycle();
+    l.cycle();
+    assert_eq!(n(&l.env, "SELECT COUNT(*) FROM synthetic_writes"), 1);
+    assert_eq!((l.posts(), l.tokens()), (posts, tokens));
+    assert_eq!(
+        n(
+            &l.env,
+            "SELECT COUNT(*) FROM ai_jobs WHERE kind='location_suggest' AND state='failed' AND terminal=1"
+        ),
+        1
+    );
+}

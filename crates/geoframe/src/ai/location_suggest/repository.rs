@@ -654,6 +654,40 @@ pub fn project_failure(conn: &Connection, plan: &Intent, now: i64) -> rusqlite::
     Ok(InputCheck::Current)
 }
 
+/// 周期の掃除から、`failed` のキーの失敗の行を揃える（[`project_failure`] の冪等版）。
+/// 行がすでに同じ回数・同じ理由なら何も書かない（毎周期の書き込みと履歴の読み込みを避ける）。
+pub fn reproject_failure_in(
+    conn: &Connection,
+    plan: &Intent,
+    now: i64,
+) -> rusqlite::Result<InputCheck> {
+    let key = plan.key();
+    let job = conn
+        .query_row(
+            "SELECT attempts,last_error_code FROM ai_jobs WHERE kind='location_suggest' AND target_key=?1 AND input_hash=?2 AND processor_version=?3 AND state='failed' AND claim_token IS NULL",
+            params![key.target_key, key.input_hash, key.processor_version],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((attempts, code)) = job else {
+        return Ok(InputCheck::Changed);
+    };
+    let error = ErrorCode::parse(&code).map_or("other", ErrorCode::as_str);
+    if jobs::object_exists(conn, "table", "photo_loc_runs")? {
+        let written = conn
+            .query_row(
+                "SELECT 1 FROM photo_loc_runs WHERE run_id=?1 AND status='error' AND attempts=?2 AND error=?3",
+                params![key.target_key, attempts, error],
+                |_| Ok(()),
+            )
+            .optional()?;
+        if written.is_some() {
+            return Ok(InputCheck::Current);
+        }
+    }
+    project_failure(conn, plan, now)
+}
+
 pub(super) fn row_snapshot(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT json_array(photo_id,run_id,scope,place_name,day_place_name,geocode_query,precision,confidence,evidence_json,lat,lon,geocode_title,model,analyzed_at) FROM photo_loc_suggestions WHERE photo_id=?1",
         [id],|r| r.get(0)).optional()
