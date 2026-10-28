@@ -79,6 +79,11 @@ impl Runtime {
         if !config.ai.legacy().enabled {
             return Err(Error::Disabled);
         }
+        // 入力の検査が先: 不正な要求は回数を消費しない。
+        let query = pyquery::py_words(params.get("q").map_or("", String::as_str));
+        if query.chars().count() > 300 {
+            return Err(Error::BadParams);
+        }
         {
             let now = (self.now)();
             let mut memory = self.memory.lock().unwrap();
@@ -93,10 +98,6 @@ impl Runtime {
                 return Err(Error::RateLimited);
             }
             memory.window.push_back(now);
-        }
-        let query = pyquery::py_words(params.get("q").map_or("", String::as_str));
-        if query.chars().count() > 300 {
-            return Err(Error::BadParams);
         }
         let hidden = params
             .get("include_hidden")

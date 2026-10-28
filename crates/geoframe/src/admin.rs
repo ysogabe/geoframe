@@ -774,11 +774,7 @@ fn nearest_hint(anchors: &[Anchor], taken_at: &str) -> Option<Hint> {
 }
 
 /// 位置なし写真の AI 撮影地候補（画面に出すだけで、DB の位置にはしない）。
-fn suggestions(
-    conn: &Connection,
-    ctx: &AdminContext,
-    ids: &[i64],
-) -> rusqlite::Result<HashMap<i64, Suggest>> {
+fn suggestions(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMap<i64, Suggest>> {
     let mut out = HashMap::new();
     if ids.is_empty() {
         return Ok(out);
@@ -790,11 +786,10 @@ fn suggestions(
            FROM photo_loc_suggestions WHERE photo_id IN ({marks})"
     ))?;
     let mut rows = stmt.query(params_from_iter(ids))?;
+    // 画像ファイルは開かない（一覧の GET で行ごとにファイルを読んで SHA を取らない）。履歴の読込みも 1 回。
+    let mut filter = crate::ai::location_suggest::CandidateFilter::new(conn)?;
     while let Some(row) = rows.next()? {
-        if let Some(root) = ctx.deriv_dir.parent()
-            && let Ok(data) = crate::datadir::DataDir::open(root)
-            && !crate::ai::location_suggest::candidate_current(conn, &data, row.get(0)?)?
-        {
+        if !filter.current(conn, row.get(0)?)? {
             continue;
         }
         let evidence = match row.get_ref(6)? {
@@ -920,7 +915,7 @@ pub fn photos(
             item.hint = Some(nearest_hint(&anchors, &item.taken_at));
         }
     }
-    let mut found = suggestions(conn, ctx, &no_loc_ids)?;
+    let mut found = suggestions(conn, &no_loc_ids)?;
     for item in &mut items {
         item.suggest = found.remove(&item.id);
     }

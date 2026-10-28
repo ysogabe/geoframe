@@ -17,11 +17,13 @@ use crate::{
 use rusqlite::{OptionalExtension, params};
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
 
+/// 1 回の reconcile が積む送信候補の最大数。実際に送る数は周期の上限・日の上限・失敗の上限が別に抑える。
+const MAX_QUEUE: usize = 32;
 const GEOCODE_VERSION: &str = "nominatim-day-photo-coarser-v1";
 const HOLDS: &[&str] = &[
     "pending",
@@ -73,24 +75,31 @@ impl Shared {
         let observations = self.observations(conn, &saved_sent_ids(conn, day, &self.model)?)?;
         Ok((lookup(conn, day, &self.model, &observations)?, observations))
     }
-    fn plan(&self, conn: &Connection, day: Day) -> Result<Plan, RunError> {
-        let images = day
-            .sent_ids()
-            .iter()
-            .map(|id| {
-                let g = day
-                    .members()
-                    .iter()
-                    .find(|g| g.photo_id() == *id)
-                    .ok_or(RunError::InputChanged)?;
-                Ok(SendImage {
-                    photo_id: *id,
-                    source_sha256: g.source_sha256().ok_or(RunError::InputChanged)?.into(),
-                    image: location_clue::prepare_image(conn, &self.data, g)?,
-                })
-            })
-            .collect::<Result<Vec<_>, RunError>>()?;
-        Plan::new(day, &self.model, images).map_err(|e| {
+    /// 送る直前に 1 枚ずつ画像を作る（読み込み・デコード・縮小・JPEG）。件数は送る日の分だけ。
+    fn plan(
+        &self,
+        conn: &Connection,
+        intent: Intent,
+        stopping: &dyn Fn() -> bool,
+    ) -> Result<Plan, RunError> {
+        let mut images = Vec::new();
+        for id in intent.day().sent_ids() {
+            if stopping() {
+                return Err(RunError::Stopping);
+            }
+            let g = intent
+                .day()
+                .members()
+                .iter()
+                .find(|g| g.photo_id() == *id)
+                .ok_or(RunError::InputChanged)?;
+            images.push(SendImage {
+                photo_id: *id,
+                source_sha256: g.source_sha256().ok_or(RunError::InputChanged)?.into(),
+                image: location_clue::prepare_image(conn, &self.data, g)?,
+            });
+        }
+        intent.plan(images).map_err(|e| {
             RunError::Permanent(match e {
                 DomainError::TooLarge => ErrorCode::InputTooLarge,
                 _ => ErrorCode::InputInvalid,
@@ -202,13 +211,13 @@ pub(in crate::ai) fn handlers(
 
 #[derive(Clone)]
 enum Work {
-    Send(Box<Plan>),
+    Send(Box<Intent>),
     Invalid(Day, JobKey, ErrorCode),
 }
 impl Work {
     fn key(&self) -> JobKey {
         match self {
-            Self::Send(p) => p.key(),
+            Self::Send(i) => i.key(),
             Self::Invalid(_, k, _) => k.clone(),
         }
     }
@@ -219,18 +228,39 @@ struct LocationSuggest {
     retry_saved: Mutex<Vec<GeoPlan>>,
 }
 impl LocationSuggest {
-    fn prepare(&self, read: &Connection, now: i64) -> rusqlite::Result<Vec<Persist>> {
+    /// 送れる日を `Intent`（日・モデル・キー）として集める。**画像は作らない**（読み込み・デコード・縮小は
+    /// 送る直前の `run` で 1 件ずつ）。積む数は [`MAX_QUEUE`] まで。`skip_failed` が真のとき、失敗の履歴で止まっている
+    /// キーは数えず積まない（外さないと先頭の日が毎周期選ばれ続け、後ろの日がジョブにならない）。
+    fn prepare(
+        &self,
+        read: &Connection,
+        now: i64,
+        skip_failed: bool,
+    ) -> rusqlite::Result<Vec<Persist>> {
         let mut work = Vec::new();
         let mut actions: Vec<Persist> = Vec::new();
         let mut holds = BTreeMap::<&'static str, i64>::new();
+        let failed = if skip_failed {
+            failed_keys(read)?
+        } else {
+            HashSet::new()
+        };
+        // 今も有効な投影（写真 → 結果・日の集合）。これ以外の自分の投影は、下で画面から外す。
+        let mut valid = BTreeMap::<i64, (String, String)>::new();
         for day in self.shared.days(read)? {
             let (lookup, observed) = self.shared.lookup(read, &day)?;
             let reason = match lookup {
-                Lookup::Reusable(_) => continue,
+                Lookup::Reusable(saved) => {
+                    let (result, json) = (saved.result_key(), encoded(&day));
+                    for g in day.members() {
+                        valid.insert(g.photo_id(), (result.clone(), json.clone()));
+                    }
+                    continue;
+                }
                 Lookup::ProjectionPending => {
-                    let (d, m) = (day.clone(), self.shared.model.clone());
+                    let (d, m, o) = (day.clone(), self.shared.model.clone(), observed.clone());
                     actions.push(Box::new(move |tx| {
-                        repository::restore_projection_in(tx, &d, &m, &observed)?;
+                        repository::restore_projection_in(tx, &d, &m, &o)?;
                         Ok(InputCheck::Current)
                     }));
                     Some("projection_pending")
@@ -248,31 +278,39 @@ impl LocationSuggest {
                 *holds.entry(reason).or_default() += 1;
                 continue;
             }
-            match self.shared.plan(read, day.clone()) {
-                Ok(plan) => {
-                    let observed = self.shared.observations(read, &plan.sent_ids())?;
-                    let p = plan.clone();
+            if work.len() >= MAX_QUEUE {
+                continue;
+            }
+            match Intent::new(day.clone(), &self.shared.model) {
+                Ok(intent) => {
+                    if failed.contains(&key_triple(&intent.key())) {
+                        continue;
+                    }
+                    let p = intent.clone();
                     actions.push(Box::new(move |tx| {
                         enqueue_in(tx, &p, &observed, now)?;
                         Ok(InputCheck::Current)
                     }));
-                    work.push(Work::Send(Box::new(plan)));
+                    work.push(Work::Send(Box::new(intent)));
                 }
-                Err(RunError::Permanent(code)) => {
+                Err(_) => {
                     let key = JobKey::new(
                         JobKind::LocationSuggest,
                         run_id_for(&self.shared.model, day.sent_ids()),
                         sha(encoded(&day).as_bytes()),
                         format!("{}-preparation", processor_version(&self.shared.model)),
                     );
-                    work.push(Work::Invalid(day, key, code));
-                }
-                // Input changed while reading: defer this day to the next snapshot, not all AI.
-                Err(_) => {
-                    *holds.entry("pending").or_default() += 1;
+                    work.push(Work::Invalid(day, key, ErrorCode::InputInvalid));
                 }
             }
         }
+        // 画像ファイルだけが差し替わった・消えた場合は、画面の一覧（DB だけで判定する）では分からない。
+        // ファイルを観測するこの周期が、有効でなくなった自分の投影を画面の行から外す。候補（`ai_location_candidates`）は
+        // 残すので、有効に戻れば座標化の投影が復元する。
+        actions.push(Box::new(move |tx| {
+            retract_stale_projection(tx, &valid)?;
+            Ok(InputCheck::Current)
+        }));
         actions.push(Box::new(move |tx| {
             tx.execute("DELETE FROM ai_location_suggest_holds", [])?;
             for (reason, count) in holds {
@@ -300,7 +338,7 @@ impl Handler for LocationSuggest {
         JobKind::LocationSuggest
     }
     fn reconcile_cleanup(&self, read: &Connection, now: i64) -> rusqlite::Result<Vec<Persist>> {
-        self.prepare(read, now)
+        self.prepare(read, now, true)
     }
     fn reconcile(&self, _: &Connection, _: i64) -> rusqlite::Result<Vec<JobKey>> {
         Ok(self
@@ -313,17 +351,25 @@ impl Handler for LocationSuggest {
     }
     fn run(&self, ctx: &RunCtx<'_>, job: &Claimed) -> Result<Persist, RunError> {
         let work = self.work(&job.key).ok_or(RunError::InputChanged)?;
-        let plan = match work {
+        let intent = match work {
             Work::Invalid(day, _, code) => {
                 if !day.matches_db(ctx.read()).map_err(db_error)? {
                     return Err(RunError::InputChanged);
                 }
                 return Err(RunError::Permanent(code));
             }
-            Work::Send(p) => *p,
+            Work::Send(i) => *i,
         };
-        self.shared.check_plan(ctx.read(), &plan)?;
+        // 画像を作る（読み込み・デコード）前に、安い照合で足切りする: 世代・クラウドの有無・許可・停止・pause・送信枠。
+        if !intent.matches_db(ctx.read()).map_err(db_error)? {
+            return Err(RunError::InputChanged);
+        }
         let cloud = self.shared.cloud.as_ref().ok_or(RunError::PolicyDisabled)?;
+        ctx.budget_left()?;
+        let plan = self
+            .shared
+            .plan(ctx.read(), intent, &|| ctx.is_stopping())?;
+        self.shared.check_plan(ctx.read(), &plan)?;
         let reply = cloud.run_checked(ctx, plan.request(), |deadline| {
             self.shared.ready(ctx, deadline)?;
             self.shared.check_plan(ctx.read(), &plan)
@@ -358,7 +404,7 @@ impl Handler for LocationSuggest {
         let read =
             crate::db::open_read_only(&self.shared.data.root().join(crate::config::DB_FILE_NAME))
                 .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        drop(self.prepare(&read, jobs::unix_now())?);
+        drop(self.prepare(&read, jobs::unix_now(), false)?);
         let mut saved = Vec::new();
         for day in self.shared.days(&read)? {
             if let (Lookup::Reusable(answer), observed) = self.shared.lookup(&read, &day)? {
@@ -382,7 +428,7 @@ impl Handler for LocationSuggest {
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
         {
-            if p.saved.result_key() == key.input_hash
+            if p.saved.plan_hash() == key.input_hash
                 && p.saved.run_id() == key.target_key
                 && processor_version(p.saved.model()) == key.processor_version
                 && p.saved.applicable(conn, &p.day, &p.observed)?
@@ -709,11 +755,6 @@ impl Candidate {
         Ok(())
     }
 }
-fn row_snapshot(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
-    conn.query_row("SELECT json_array(photo_id,run_id,scope,place_name,day_place_name,geocode_query,precision,confidence,evidence_json,lat,lon,geocode_title,model,analyzed_at) FROM photo_loc_suggestions WHERE photo_id=?1",
-        [id],|r| r.get(0)).optional()
-}
-
 fn restore_row(conn: &Connection, id: i64, row: &str) -> rusqlite::Result<()> {
     let Ok(Value::Array(values)) = serde_json::from_str::<Value>(row) else {
         return Ok(());
@@ -739,43 +780,32 @@ fn restore_row(conn: &Connection, id: i64, row: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Only rows proven to be our projection are filtered. Independently written legacy rows retain their meaning.
-pub fn candidate_current(conn: &Connection, data: &DataDir, id: i64) -> rusqlite::Result<bool> {
-    if !jobs::object_exists(conn, "table", "ai_location_candidates")? {
-        return Ok(true);
+/// 自分の投影（`row_json` と画面の行が一致）のうち、今の有効な結果・日と違うものの画面の行を消す。
+/// Python が書き換えた行（一致しない）や、候補の無い行には触れない。
+fn retract_stale_projection(
+    tx: &Connection,
+    valid: &BTreeMap<i64, (String, String)>,
+) -> rusqlite::Result<()> {
+    if !jobs::object_exists(tx, "table", "ai_location_candidates")? {
+        return Ok(());
     }
-    let row: Option<(String, String, String)> = conn
-        .query_row(
-            "SELECT result_key,day_json,row_json FROM ai_location_candidates WHERE photo_id=?1",
-            [id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let Some((result, day, row)) = row else {
-        return Ok(true);
-    };
-    if row_snapshot(conn, id)?.as_ref() != Some(&row) {
-        return Ok(true);
+    let rows = tx
+        .prepare("SELECT photo_id,result_key,day_json,row_json FROM ai_location_candidates")?
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, result, day, row) in rows {
+        if valid.get(&id) != Some(&(result, day)) && row_snapshot(tx, id)?.as_ref() == Some(&row) {
+            tx.execute("DELETE FROM photo_loc_suggestions WHERE photo_id=?1", [id])?;
+        }
     }
-    let Ok(day) = serde_json::from_str::<Day>(&day) else {
-        return Ok(false);
-    };
-    let (history, corrupt) = repository::history(conn)?;
-    if corrupt {
-        return Ok(false);
-    }
-    let Some(saved) = history.into_iter().find(|s| s.result_key() == result) else {
-        return Ok(false);
-    };
-    let observed = saved
-        .sent_ids()
-        .iter()
-        .map(|id| SourceObservation::observe(conn, data, *id))
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
-    saved.applicable(conn, &day, &observed)
+    Ok(())
 }
 
 pub fn hold_counts(conn: &Connection) -> rusqlite::Result<Vec<(&'static str, i64)>> {
@@ -796,3 +826,22 @@ pub fn hold_counts(conn: &Connection) -> rusqlite::Result<Vec<(&'static str, i64
 
 #[cfg(test)]
 mod tests;
+
+type KeyTriple = (String, String, String);
+fn key_triple(key: &JobKey) -> KeyTriple {
+    (
+        key.target_key.clone(),
+        key.input_hash.clone(),
+        key.processor_version.clone(),
+    )
+}
+/// 失敗の履歴で止まっている location_suggest のキー。`obsolete` でも `terminal` なら enqueue が `failed` に戻すので
+/// 同じ扱い。手動の再試行（`terminal` を 0 にして `pending` へ）をすれば、ここから外れる。
+fn failed_keys(conn: &Connection) -> rusqlite::Result<HashSet<KeyTriple>> {
+    conn.prepare(
+        "SELECT target_key,input_hash,processor_version FROM ai_jobs
+         WHERE kind='location_suggest' AND (state='failed' OR (state='obsolete' AND terminal=1))",
+    )?
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    .collect()
+}

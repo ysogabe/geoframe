@@ -95,6 +95,11 @@ impl Lab {
         let key = crate::testutil::TempDir::new("judge-runtime-key");
         let key_path = key.path().join("synthetic.json");
         std::fs::write(&key_path,serde_json::to_vec(&json!({"client_email":"synthetic@example.invalid","private_key":format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",include_str!("../../../../tests/fixtures/jwt-test-pkcs8.b64").trim())})).unwrap()).unwrap();
+        std::fs::set_permissions(
+            &key_path,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
         let state = Arc::new(Mutex::new(State {
             cloud_status: 200,
             token_status: 200,

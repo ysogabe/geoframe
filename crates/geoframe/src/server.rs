@@ -53,6 +53,9 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// ディスク使用量（`/api/admin/status` の `disk`）のキャッシュ時間。全走査になるので現行と同じく 60 秒。
 const DISK_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// `/api/ai/status` の応答のキャッシュ時間。呼ぶたびにベクトルの BLOB を全件検査しないための短い時間。
+const AI_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+
 /// ハンドラが共有する状態。複製は安い。
 #[derive(Clone)]
 pub struct AppState {
@@ -69,6 +72,9 @@ pub struct AppState {
     pub admin: Arc<AdminContext>,
     /// `disk` の直近の計測。ロックを持ったまま測るので、同時に来ても全走査は1回で済む。
     disk_cache: Arc<Mutex<Option<(Instant, Value)>>>,
+    /// `/api/ai/status` の直近の応答（[`AI_STATUS_CACHE_TTL`]）。ロックを持ったまま計算するので、同時に来ても
+    /// 全件検査は 1 回で済む。
+    ai_status_cache: Arc<Mutex<Option<(Instant, Value)>>>,
     /// `.cache.json` のメモリキャッシュ。取り込みが有効（`GEOFRAME_INGEST=1`）のときは同期サイクルと同じもの
     /// （保存は保存スレッドに任せる）。無効のときはメモリだけ（ディスクへは書かない。[`Cache::load_memory_only`]）。
     pub cache: Arc<Cache>,
@@ -118,6 +124,7 @@ impl AppState {
             static_slots: Arc::new(Semaphore::new(STATIC_FILE_SLOTS)),
             admin,
             disk_cache: Arc::new(Mutex::new(None)),
+            ai_status_cache: Arc::new(Mutex::new(None)),
             cache: Arc::new(Cache::memory_only()),
             geocoder,
             tiles,
@@ -279,6 +286,23 @@ async fn disk_info(state: &AppState) -> std::io::Result<Value> {
     let data = tokio::task::spawn_blocking(move || admin::disk_info(&root, max_mb))
         .await
         .map_err(|_| std::io::Error::other("ディスク使用量の測定が異常終了しました"))??;
+    *cache = Some((Instant::now(), data.clone()));
+    Ok(data)
+}
+
+/// `GET /api/ai/status`。[`AI_STATUS_CACHE_TTL`] 以内の計算があればそれを返す（失敗は保存しない）。
+async fn ai_status(state: &AppState) -> Result<Value, crate::db::CatalogError> {
+    let mut cache = state.ai_status_cache.lock().await;
+    if let Some((at, data)) = cache.as_ref()
+        && at.elapsed() < AI_STATUS_CACHE_TTL
+    {
+        return Ok(data.clone());
+    }
+    let config = Arc::clone(&state.config);
+    let data = state
+        .catalog
+        .read(move |c| crate::ai::search_view::status(c, &config))
+        .await?;
     *cache = Some((Instant::now(), data.clone()));
     Ok(data)
 }
@@ -721,12 +745,7 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
             };
         }
         if path == "/api/ai/status" {
-            let config = Arc::clone(&state.config);
-            let response = match state
-                .catalog
-                .read(move |c| crate::ai::search_view::status(c, &config))
-                .await
-            {
+            let response = match ai_status(&state).await {
                 Ok(value) => json_response(StatusCode::OK, value.to_string().into_bytes()),
                 Err(_) => ai_search_error(crate::ai::query::Error::Unavailable),
             };

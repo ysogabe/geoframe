@@ -14,13 +14,14 @@ mod answer;
 mod repository;
 mod runtime;
 pub use answer::{Answer, Confidence, PhotoAnswer, Precision};
+use repository::row_snapshot;
 pub use repository::{
-    Lookup, Queue, SavedAnswer, complete, enqueue, enqueue_in, lookup, persist_answer,
-    project_failure, restore_projection, saved_sent_ids,
+    CandidateFilter, Lookup, Queue, SavedAnswer, complete, enqueue, enqueue_in, lookup,
+    persist_answer, project_failure, restore_projection, saved_sent_ids,
 };
 pub(super) use repository::{SCHEMA, TABLES};
 pub(super) use runtime::handlers;
-pub use runtime::{candidate_current, hold_counts};
+pub use runtime::hold_counts;
 #[cfg(test)]
 mod tests;
 
@@ -282,7 +283,39 @@ struct Manifest {
     members: Vec<Generation>,
     sent: Vec<Sent>,
 }
+/// ジョブの同一性: 送信 JPEG の SHA を除いた計画。JPEG は元画像の SHA と処理版（`PREPROCESS_VERSION` を含む）から
+/// 決まるので、画像を作らなくても同じ入力は同じ値になる（キーを作るために日ごとの画像のデコードをしない）。
+#[derive(Serialize)]
+struct PlanIdentity<'a> {
+    day: &'a str,
+    model: &'a str,
+    prompt_version: &'a str,
+    processor_version: &'a str,
+    members: &'a [Generation],
+    sent: Vec<(i64, &'a str)>,
+}
+impl PlanIdentity<'_> {
+    fn hash(&self) -> String {
+        sha(encoded(self).as_bytes())
+    }
+}
 impl Manifest {
+    /// ジョブの `input_hash`。履歴の `result_key`（JPEG の SHA を含む）とは別物。
+    fn plan_hash(&self) -> String {
+        PlanIdentity {
+            day: &self.day,
+            model: &self.model,
+            prompt_version: &self.prompt_version,
+            processor_version: &self.processor_version,
+            members: &self.members,
+            sent: self
+                .sent
+                .iter()
+                .map(|s| (s.photo_id, s.source_sha256.as_str()))
+                .collect(),
+        }
+        .hash()
+    }
     fn result_key(&self) -> String {
         sha(encoded(self).as_bytes())
     }
@@ -300,33 +333,81 @@ pub struct SendImage {
     pub source_sha256: String,
     pub image: PreparedImage,
 }
-/// 実送信画像 SHA と番号順まで固定された計画。URL/timeout/policy 全体を同一性へ混ぜない。
+/// 送る日の計画（画像を作る前）。ジョブのキーはこれだけで決まる。画像の準備は [`Intent::plan`] が送る直前に行う。
 #[derive(Clone)]
-pub struct Plan {
+pub struct Intent {
     day: Day,
-    manifest: Manifest,
-    request: GenerateRequest,
+    model: String,
+    key: JobKey,
 }
-impl std::fmt::Debug for Plan {
+impl std::fmt::Debug for Intent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("Plan(..)")
+        f.write_str("Intent(..)")
     }
 }
-impl Plan {
-    pub fn new(day: Day, model: &str, images: Vec<SendImage>) -> Result<Self, DomainError> {
+impl Intent {
+    pub fn new(day: Day, model: &str) -> Result<Self, DomainError> {
         if day.pending {
             return Err(DomainError::Pending);
         }
         if day.sent_ids.is_empty() {
             return Err(DomainError::NoImages);
         }
-        if model.is_empty()
-            || model.len() > 256
-            || model.chars().any(char::is_control)
-            || !images
-                .iter()
-                .map(|i| i.photo_id)
-                .eq(day.sent_ids.iter().copied())
+        if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+            return Err(DomainError::InvalidInput);
+        }
+        let sent = day
+            .sent_ids
+            .iter()
+            .map(|id| {
+                day.members
+                    .iter()
+                    .find(|g| g.photo_id() == *id)
+                    .and_then(Generation::source_sha256)
+                    .filter(|sha| valid_hash(sha))
+                    .map(|sha| (*id, sha))
+                    .ok_or(DomainError::InvalidInput)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let processor = processor_version(model);
+        let key = JobKey::new(
+            JobKind::LocationSuggest,
+            run_id_for(model, &day.sent_ids),
+            PlanIdentity {
+                day: &day.day,
+                model,
+                prompt_version: PROMPT_VERSION,
+                processor_version: &processor,
+                members: &day.members,
+                sent,
+            }
+            .hash(),
+            &processor,
+        );
+        Ok(Self {
+            day,
+            model: model.into(),
+            key,
+        })
+    }
+    pub fn key(&self) -> JobKey {
+        self.key.clone()
+    }
+    pub fn day(&self) -> &Day {
+        &self.day
+    }
+    pub fn sent_ids(&self) -> Vec<i64> {
+        self.day.sent_ids.clone()
+    }
+    pub fn matches_db(&self, conn: &Connection) -> rusqlite::Result<bool> {
+        self.day.matches_db(conn)
+    }
+    /// 準備した画像から送信計画を作る。画像は `sent_ids` の順で、元画像の SHA が世代と一致していること。
+    pub fn plan(self, images: Vec<SendImage>) -> Result<Plan, DomainError> {
+        if !images
+            .iter()
+            .map(|i| i.photo_id)
+            .eq(self.day.sent_ids.iter().copied())
         {
             return Err(DomainError::InvalidInput);
         }
@@ -334,7 +415,7 @@ impl Plan {
         let mut numbered = Vec::new();
         for (n, i) in images.into_iter().enumerate() {
             if !valid_hash(&i.source_sha256)
-                || !day.members.iter().any(|g| {
+                || !self.day.members.iter().any(|g| {
                     g.photo_id() == i.photo_id && g.source_sha256() == Some(&i.source_sha256)
                 })
             {
@@ -348,7 +429,7 @@ impl Plan {
             numbered.push(((n + 1) as u32, i.image));
         }
         let request = GenerateRequest::location_suggest(
-            &PROMPT.replace("{date}", &day.day),
+            &PROMPT.replace("{date}", &self.day.day),
             &schema(),
             &numbered,
         )
@@ -357,37 +438,49 @@ impl Plan {
             _ => DomainError::InvalidInput,
         })?;
         let manifest = Manifest {
-            day: day.day.clone(),
-            model: model.into(),
+            day: self.day.day.clone(),
+            model: self.model.clone(),
             prompt_version: PROMPT_VERSION.into(),
-            processor_version: processor_version(model),
-            members: day.members.clone(),
+            processor_version: processor_version(&self.model),
+            members: self.day.members.clone(),
             sent,
         };
         if encoded(&manifest).len() > MAX_MANIFEST_BYTES {
             return Err(DomainError::InvalidInput);
         }
-        Ok(Self {
-            day,
+        debug_assert_eq!(manifest.plan_hash(), self.key.input_hash);
+        Ok(Plan {
+            intent: self,
             manifest,
             request,
         })
     }
-    pub fn key(&self) -> JobKey {
-        JobKey::new(
-            JobKind::LocationSuggest,
-            self.manifest.run_id(),
-            self.manifest.result_key(),
-            &self.manifest.processor_version,
-        )
+}
+
+/// 実送信画像 SHA と番号順まで固定された計画。URL/timeout/policy 全体を同一性へ混ぜない。
+/// ジョブのキー・照合は [`Intent`] のもの（`Deref`）。
+#[derive(Clone)]
+pub struct Plan {
+    intent: Intent,
+    manifest: Manifest,
+    request: GenerateRequest,
+}
+impl std::ops::Deref for Plan {
+    type Target = Intent;
+    fn deref(&self) -> &Intent {
+        &self.intent
+    }
+}
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Plan(..)")
+    }
+}
+impl Plan {
+    pub fn new(day: Day, model: &str, images: Vec<SendImage>) -> Result<Self, DomainError> {
+        Intent::new(day, model)?.plan(images)
     }
     pub fn request(&self) -> &GenerateRequest {
         &self.request
-    }
-    pub fn sent_ids(&self) -> Vec<i64> {
-        self.manifest.sent_ids()
-    }
-    pub fn matches_db(&self, conn: &Connection) -> rusqlite::Result<bool> {
-        self.day.matches_db(conn)
     }
 }

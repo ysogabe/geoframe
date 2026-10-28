@@ -185,15 +185,23 @@ fn missing_huge_fifo_json_and_bad_pem_are_fixed_auth_failures_without_dns() {
                         .success()
                 );
             }
-            "json" => std::fs::write(&p, b"{synthetic-secret").unwrap(),
-            "pem" => std::fs::write(
-                &p,
-                serde_json::to_vec(
-                    &json!({"client_email":"synthetic-secret","private_key":"synthetic-secret"}),
+            "json" => {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::write(&p, b"{synthetic-secret").unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            "pem" => {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::write(
+                    &p,
+                    serde_json::to_vec(
+                        &json!({"client_email":"synthetic-secret","private_key":"synthetic-secret"}),
+                    )
+                    .unwrap(),
                 )
-                .unwrap(),
-            )
-            .unwrap(),
+                .unwrap();
+                std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+            }
             _ => {}
         }
         let error = Auth::default()
@@ -225,4 +233,28 @@ fn missing_huge_fifo_json_and_bad_pem_are_fixed_auth_failures_without_dns() {
         )
         .is_ok()
     );
+}
+
+#[test]
+fn a_loosely_permitted_key_is_refused_before_any_dns_or_exchange() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = TempDir::new("cloud-loose-key");
+    let p = dir.path().join("key");
+    write_key(&p);
+    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let server = stub(|s, _| respond(s, "200 OK", "", &token_body()));
+    let dns = FakeDns::new();
+    let http = transport(&server, "oauth.test", &dns);
+    let error = Auth::default()
+        .token(
+            &p,
+            &http,
+            &Deadline::after(Duration::from_secs(1)),
+            &StopFlag::new(),
+            &|| Some(1000),
+        )
+        .unwrap_err();
+    assert_eq!(error, unauthorized());
+    assert_eq!(dns.calls.load(Ordering::SeqCst), 0);
+    assert!(server.requests.lock().unwrap().is_empty());
 }

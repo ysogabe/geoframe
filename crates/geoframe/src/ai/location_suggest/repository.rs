@@ -50,6 +50,10 @@ impl SavedAnswer {
     pub fn result_key(&self) -> String {
         self.manifest.result_key()
     }
+    /// このジョブの `input_hash`（送信 JPEG の SHA を含まない同一性）。
+    pub fn plan_hash(&self) -> String {
+        self.manifest.plan_hash()
+    }
     pub fn run_id(&self) -> String {
         self.manifest.run_id()
     }
@@ -106,6 +110,34 @@ impl SavedAnswer {
                 .iter()
                 .any(|s| s.result_key() == self.result_key() && s.compat() == self.compat())
             && Compat::read(conn)?.iter().any(|c| *c == self.compat()))
+    }
+    /// [`Self::applicable`] のファイルを開かない版。観測の代わりに保存時の世代を使い、DB の世代だけで判定する。
+    fn applicable_stored(
+        &self,
+        conn: &Connection,
+        day: &Day,
+        history: &[SavedAnswer],
+        runs: &[Compat],
+    ) -> rusqlite::Result<bool> {
+        let stored: Vec<_> = self
+            .manifest
+            .members
+            .iter()
+            .filter(|g| {
+                self.manifest
+                    .sent
+                    .iter()
+                    .any(|s| s.photo_id == g.photo_id())
+            })
+            .map(SourceObservation::stored)
+            .collect();
+        if self.matches_inputs(conn, day, &stored)? != InputMatch::Current {
+            return Ok(false);
+        }
+        Ok(history
+            .iter()
+            .any(|s| s.result_key() == self.result_key() && s.compat() == self.compat())
+            && runs.iter().any(|c| *c == self.compat()))
     }
     fn matches_inputs(
         &self,
@@ -412,7 +444,7 @@ pub(super) fn restore_projection_in(
 /// この短い tx の外で画像観測/準備を終える。policy/STOP/budget gate は c2 の送信直前に別途必要。
 pub fn enqueue(
     conn: &mut Connection,
-    plan: &Plan,
+    plan: &Intent,
     observed: &[SourceObservation],
     now: i64,
 ) -> rusqlite::Result<Queue> {
@@ -425,7 +457,7 @@ pub fn enqueue(
 /// Handler::reconcile_cleanup の Persist 用。既存 writer tx 内で使い、直接 jobs::enqueue より先に呼ぶ。
 pub fn enqueue_in(
     conn: &Connection,
-    plan: &Plan,
+    plan: &Intent,
     observed: &[SourceObservation],
     now: i64,
 ) -> rusqlite::Result<Queue> {
@@ -438,8 +470,8 @@ pub fn enqueue_in(
     match classify(
         conn,
         &plan.day,
-        &plan.manifest.model,
-        Some(&plan.manifest.run_id()),
+        &plan.model,
+        Some(&plan.key.target_key),
         observed,
     )? {
         Lookup::Reusable(s) => return Ok(Queue::Reusable(s)),
@@ -558,7 +590,7 @@ pub fn persist_answer(
 
 /// jobs::record_failure_with の terminal callback。ai_jobs の試行が唯一の正。
 /// retry/defer の中間投影はせず、旧 paid done は上書きしない。
-pub fn project_failure(conn: &Connection, plan: &Plan, now: i64) -> rusqlite::Result<InputCheck> {
+pub fn project_failure(conn: &Connection, plan: &Intent, now: i64) -> rusqlite::Result<InputCheck> {
     if conn.is_autocommit() {
         return Err(rusqlite::Error::InvalidQuery);
     }
@@ -570,9 +602,9 @@ pub fn project_failure(conn: &Connection, plan: &Plan, now: i64) -> rusqlite::Re
         return Ok(InputCheck::Changed);
     }
     let mut c = Compat {
-        run_id: plan.manifest.run_id(),
-        day: plan.manifest.day.clone(),
-        model: plan.manifest.model.clone(),
+        run_id: plan.key.target_key.clone(),
+        day: plan.day.day.clone(),
+        model: plan.model.clone(),
         prompt_version: PROMPT_VERSION.into(),
         member_ids_json: encoded(
             &plan
@@ -597,7 +629,7 @@ pub fn project_failure(conn: &Connection, plan: &Plan, now: i64) -> rusqlite::Re
     }
     if history
         .iter()
-        .any(|s| s.result_key() == plan.manifest.result_key())
+        .any(|s| s.manifest.plan_hash() == plan.key.input_hash)
     {
         return Ok(InputCheck::Changed);
     }
@@ -620,4 +652,80 @@ pub fn project_failure(conn: &Connection, plan: &Plan, now: i64) -> rusqlite::Re
         .into();
     c.write(conn)?;
     Ok(InputCheck::Current)
+}
+
+pub(super) fn row_snapshot(conn: &Connection, id: i64) -> rusqlite::Result<Option<String>> {
+    conn.query_row("SELECT json_array(photo_id,run_id,scope,place_name,day_place_name,geocode_query,precision,confidence,evidence_json,lat,lon,geocode_title,model,analyzed_at) FROM photo_loc_suggestions WHERE photo_id=?1",
+        [id],|r| r.get(0)).optional()
+}
+
+/// 管理画面の一覧に候補を出してよいかの判定（`GET /api/admin/photos`）。**DB だけを読み、画像ファイルは開かない**。
+/// 履歴・互換行の読込みは最初に必要になったときの 1 回だけで、同じ日・同じ結果の行は判定を使い回す。
+/// 画像ファイルの実バイトを調べる照合（ファイルだけが差し替わった場合）は worker と SAVE の経路が行い、
+/// ここでは保存時に観測した世代（`Generation`）が今の DB と同じかどうかで見る。
+pub struct CandidateFilter {
+    table: bool,
+    loaded: Option<Loaded>,
+    memo: std::collections::HashMap<(String, String), bool>,
+}
+struct Loaded {
+    history: Vec<SavedAnswer>,
+    corrupt: bool,
+    runs: Vec<Compat>,
+}
+impl CandidateFilter {
+    pub fn new(conn: &Connection) -> rusqlite::Result<Self> {
+        Ok(Self {
+            table: jobs::object_exists(conn, "table", "ai_location_candidates")?,
+            loaded: None,
+            memo: std::collections::HashMap::new(),
+        })
+    }
+    /// 自分の投影だと証明できる行だけを絞る。Python などが独立に書いた行は意味を保って出す。
+    pub fn current(&mut self, conn: &Connection, id: i64) -> rusqlite::Result<bool> {
+        if !self.table {
+            return Ok(true);
+        }
+        let row: Option<(String, String, String)> = conn
+            .query_row(
+                "SELECT result_key,day_json,row_json FROM ai_location_candidates WHERE photo_id=?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?;
+        let Some((result, day, row)) = row else {
+            return Ok(true);
+        };
+        if row_snapshot(conn, id)?.as_ref() != Some(&row) {
+            return Ok(true);
+        }
+        let key = (day, result);
+        if let Some(known) = self.memo.get(&key) {
+            return Ok(*known);
+        }
+        let known = self.judge(conn, &key.0, &key.1)?;
+        self.memo.insert(key, known);
+        Ok(known)
+    }
+    fn judge(&mut self, conn: &Connection, day: &str, result: &str) -> rusqlite::Result<bool> {
+        let Ok(day) = serde_json::from_str::<Day>(day) else {
+            return Ok(false);
+        };
+        if self.loaded.is_none() {
+            let (history, corrupt) = history(conn)?;
+            self.loaded = Some(Loaded {
+                history,
+                corrupt,
+                runs: Compat::read(conn)?,
+            });
+        }
+        let loaded = self.loaded.as_ref().expect("loaded above");
+        if loaded.corrupt {
+            return Ok(false);
+        }
+        let Some(saved) = loaded.history.iter().find(|s| s.result_key() == result) else {
+            return Ok(false);
+        };
+        saved.applicable_stored(conn, &day, &loaded.history, &loaded.runs)
+    }
 }

@@ -369,6 +369,12 @@ impl SourceObservation {
         let generation = Generation::from_input(&p);
         Ok((generation.source_sha256() == Some(source.as_str())).then_some(Self { generation }))
     }
+    /// ファイルを開かず、保存時に観測した世代をそのまま使う（DB だけで判定する表示用。観測の証明ではない）。
+    pub(in crate::ai) fn stored(generation: &Generation) -> Self {
+        Self {
+            generation: generation.clone(),
+        }
+    }
     pub fn generation(&self) -> &Generation {
         &self.generation
     }
@@ -383,6 +389,8 @@ pub(super) fn prepare_image(
     data: &DataDir,
     generation: &Generation,
 ) -> Result<PreparedImage, RunError> {
+    #[cfg(test)]
+    PREPARED.with(|n| n.set(n.get() + 1));
     let input = Input::load_generation(conn, generation.photo_id(), false)
         .map_err(|_| RunError::Attempt(ErrorCode::Internal))?
         .ok_or(RunError::InputChanged)?
@@ -456,8 +464,26 @@ fn read_source(data: &DataDir, input: &Input) -> Result<Vec<u8>, RunError> {
     read_image_source(data, &input.rel)
 }
 
+#[cfg(test)]
+thread_local! {
+    static SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREPARED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// 試験用: このスレッドが送信用の画像を作り始めた（読み込み・デコード・縮小・JPEG）回数。
+#[cfg(test)]
+pub(crate) fn prepared_images() -> usize {
+    PREPARED.with(std::cell::Cell::get)
+}
+/// 試験用: このスレッドが画像ファイルを読み始めた回数（読みを伴わない経路の検証に使う）。
+#[cfg(test)]
+pub(crate) fn source_reads() -> usize {
+    SOURCE_READS.with(std::cell::Cell::get)
+}
+
 /// Shared bounded, locked read only. Decode and network must happen after returning.
 pub(super) fn read_image_source(data: &DataDir, rel: &str) -> Result<Vec<u8>, RunError> {
+    #[cfg(test)]
+    SOURCE_READS.with(|n| n.set(n.get() + 1));
     let _lock = imaging::lock_derivatives();
     let path = safe_path(data, rel)?;
     let file = OpenOptions::new()

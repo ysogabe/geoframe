@@ -144,12 +144,13 @@ impl Prepared {
             && let Some(identity) = &identity
         {
             let options = config.ai.scene_options();
-            match rank::Model::load(&config.rank_model_path, identity) {
-                Ok(model) => {
-                    processors.push(options.processor_version(identity, Some(model.digest())));
-                    processors.push(options.fallback_processor_version(identity, model.digest()));
+            // 重みファイルは変わったときだけ読み直す（状態・検索・管理一覧の呼び出しごとに読まない）。
+            match rank::cached_digest(&config.rank_model_path, identity) {
+                Some(digest) => {
+                    processors.push(options.processor_version(identity, Some(&digest)));
+                    processors.push(options.fallback_processor_version(identity, &digest));
                 }
-                Err(_) => processors.push(options.processor_version(identity, None)),
+                None => processors.push(options.processor_version(identity, None)),
             }
         }
         Ok(Self {

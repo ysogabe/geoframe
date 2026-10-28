@@ -536,7 +536,8 @@ fn generations_with_same_python_id_keep_history_and_key_collisions_do_not_overwr
     let Lookup::Reusable(s) = db.lookup() else {
         panic!("current generation")
     };
-    assert_eq!(s.result_key(), p2.key().input_hash);
+    assert_eq!(s.plan_hash(), p2.key().input_hash);
+    assert_eq!(s.result_key(), p2.manifest.result_key());
     // Duplicate result is immutable even if a caller tries another completion with a live token.
     db.conn
         .execute(
@@ -591,7 +592,8 @@ fn successful_generations_never_accumulate_as_failures() {
         let Lookup::Reusable(saved) = db.lookup() else {
             panic!("current successful generation must remain reusable")
         };
-        assert_eq!(saved.result_key(), plan.key().input_hash);
+        assert_eq!(saved.plan_hash(), plan.key().input_hash);
+        assert_eq!(saved.result_key(), plan.manifest.result_key());
         assert_eq!(saved.attempts(), 1);
     }
 }
@@ -1072,7 +1074,8 @@ fn generation_round_trip_restores_only_owned_projection_without_new_job_or_auth(
     else {
         panic!("restore verified A")
     };
-    assert_eq!(saved.result_key(), a.key().input_hash);
+    assert_eq!(saved.plan_hash(), a.key().input_hash);
+    assert_eq!(saved.result_key(), a.manifest.result_key());
     assert!(saved.applicable(&db.conn, &day, &observed).unwrap());
     assert_eq!(db.n("SELECT COUNT(*) FROM ai_jobs"), 2);
     assert_eq!(db.n("SELECT COUNT(*) FROM ai_location_suggest_results"), 2);
@@ -1119,7 +1122,7 @@ fn db_callbacks_require_a_transaction_and_worker_style_enqueue_seeds_legacy() {
 }
 
 #[test]
-fn invalid_plan_never_accepts_wrong_source_or_order_and_sent_jpeg_changes_identity() {
+fn invalid_plan_never_accepts_wrong_source_or_order_and_sent_jpeg_changes_result_identity_only() {
     let db = Db::new();
     let p = db.seed();
     let day = db.days().remove(0);
@@ -1178,8 +1181,10 @@ fn invalid_plan_never_accepts_wrong_source_or_order_and_sent_jpeg_changes_identi
         })
         .collect();
     let other = Plan::new(day, MODEL, images).unwrap();
-    assert_ne!(p.key().input_hash, other.key().input_hash);
-    assert_eq!(p.key().target_key, other.key().target_key);
+    // 送信 JPEG が違えば履歴の同一性（result_key）は変わるが、ジョブのキーは変わらない
+    // （JPEG は元画像の SHA と処理版から決まるので、画像を作る前にキーを決められる）。
+    assert_ne!(p.manifest.result_key(), other.manifest.result_key());
+    assert_eq!(p.key(), other.key());
     let failed = db
         .targets()
         .into_iter()
@@ -1229,6 +1234,13 @@ fn past_prompt_and_processor_are_preserved_but_not_reused_as_current_results() {
         } else {
             old.manifest.processor_version = sha(b"past-processor");
         }
+        // 過去の処理版は、ジョブのキーも別（処理版を含む）。
+        old.intent.key = JobKey::new(
+            JobKind::LocationSuggest,
+            old.manifest.run_id(),
+            old.manifest.plan_hash(),
+            &old.manifest.processor_version,
+        );
         db.save(&old);
         assert!(matches!(db.lookup(), Lookup::Absent));
         db.save(&current);
@@ -1236,7 +1248,8 @@ fn past_prompt_and_processor_are_preserved_but_not_reused_as_current_results() {
         let Lookup::Reusable(saved) = db.lookup() else {
             panic!("current process")
         };
-        assert_eq!(saved.result_key(), current.key().input_hash);
+        assert_eq!(saved.plan_hash(), current.key().input_hash);
+        assert_eq!(saved.result_key(), current.manifest.result_key());
     }
 }
 

@@ -336,6 +336,25 @@ impl<'a> RunCtx<'a> {
         self.check(false, None)
     }
 
+    /// 重い準備（画像のデコードなど）の前の足切り。[`RunCtx::before_probe`] の確認に加えて、クラウドの送信枠が
+    /// **残っているか**を予約せずに読む。送る直前の予約（[`RunCtx::before_send`]）の代わりにはならない。
+    /// 枠が無ければ、予約と同じ理由（日・周期）の [`RunError::Budget`]。
+    pub fn budget_left(&self) -> Result<(), RunError> {
+        let gate = self.before_probe()?;
+        let Some(b) = gate.budget else {
+            return Ok(());
+        };
+        let usage = budget::usage(self.read, self.task, (self.clock)(), b.cycle_secs)
+            .map_err(|_| RunError::Budget(Reservation::Failed))?;
+        if b.daily == 0 || usage.day >= b.daily {
+            return Err(RunError::Budget(Reservation::DailyExhausted));
+        }
+        if b.cycle == 0 || usage.cycle >= b.cycle {
+            return Err(RunError::Budget(Reservation::CycleExhausted));
+        }
+        Ok(())
+    }
+
     pub(super) fn dependency_allowed(&self, task: TaskKind) -> bool {
         self.config.gate(task, true).is_ok()
             && self

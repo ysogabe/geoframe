@@ -54,6 +54,8 @@ impl Lab {
         let key = crate::testutil::TempDir::new("suggest-runtime-key");
         let path = key.path().join("synthetic.json");
         std::fs::write(&path,serde_json::to_vec(&json!({"client_email":"synthetic@example.invalid","private_key":format!("-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",include_str!("../../../../tests/fixtures/jwt-test-pkcs8.b64").trim())})).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+            .unwrap();
         let state = Arc::new(Mutex::new(State {
             available: true,
             loading: false,
@@ -207,6 +209,26 @@ impl Lab {
             .filter(|r| r.request_line.starts_with("POST /token "))
             .count()
     }
+    /// worker の `reconcile_cleanup` を、その周期と同じ形（writer の短い tx）で 1 回だけ実行する。送信はしない。
+    fn cleanup(&self) {
+        let read = crate::db::open_read_only(&self.env.config.db_path()).unwrap();
+        let handler = self
+            .handlers()
+            .into_iter()
+            .find(|h| h.kind() == jobs::JobKind::LocationSuggest)
+            .unwrap();
+        let actions = handler.reconcile_cleanup(&read, jobs::unix_now()).unwrap();
+        self.env
+            .writer()
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                for action in actions {
+                    action(&tx)?;
+                }
+                tx.commit()
+            })
+            .unwrap();
+    }
     fn hook(&self, h: impl Fn(&str) + Send + Sync + 'static) {
         self.state.lock().unwrap().hook = Some(Arc::new(h));
     }
@@ -236,6 +258,9 @@ fn n(e: &Env, s: &str) -> i64 {
         .unwrap()
 }
 fn add(e: &Env, id: i64, day: u32) {
+    add_on(e, id, &format!("2026-01-{day:02}"));
+}
+fn add_on(e: &Env, id: i64, date: &str) {
     let mut bytes = Vec::new();
     jpeg_encoder::Encoder::new(&mut bytes, 88)
         .encode(
@@ -246,9 +271,10 @@ fn add(e: &Env, id: i64, day: u32) {
         )
         .unwrap();
     let rel = format!("photos/synthetic-{id}.jpg");
+    let date = date.to_string();
     std::fs::write(e.config.data_dir.join(&rel), &bytes).unwrap();
     e.writer().call(move|c| {
-        c.execute("INSERT INTO photos(id,source,name,display,taken_at,hidden,favorite,rotation) VALUES(?1,'local','synthetic',?2,?3,0,1,0)",params![id,rel,format!("2026-01-{day:02} 03:04")])?;
+        c.execute("INSERT INTO photos(id,source,name,display,taken_at,hidden,favorite,rotation) VALUES(?1,'local','synthetic',?2,?3,0,1,0)",params![id,rel,format!("{date} 03:04")])?;
         c.execute("INSERT INTO photo_quality_features(photo_id,display,content_sha256,analyzed_at,error) VALUES(?1,?2,?3,'synthetic','')",params![id,rel,sha(&bytes)])?;
         Ok(())
     }).unwrap();
@@ -530,6 +556,7 @@ fn new_candidate_visibility_invalidates_on_db_or_file_change_and_preserves_legac
         let l = Lab::new();
         add(&l.env, 1, 2);
         l.done();
+        let original = std::fs::read(l.env.config.data_dir.join("photos/synthetic-1.jpg")).unwrap();
         match change {
             "rotation" => sql(&l.env, "UPDATE photos SET rotation=90 WHERE id=1"),
             "hidden" => sql(&l.env, "UPDATE photos SET hidden=1 WHERE id=1"),
@@ -551,11 +578,136 @@ fn new_candidate_visibility_invalidates_on_db_or_file_change_and_preserves_legac
                 "UPDATE photo_loc_suggestions SET place_name='legacy canary' WHERE photo_id=1",
             ),
         }
+        let file_only = matches!(change, "source" | "delete");
+        // 一覧（GET）は DB だけで判定する。DB の変化は即座に反映し、ファイルだけの変化は次の周期まで分からない。
+        let listing = l.listing();
+        let p = &listing["items"][0];
+        assert_eq!(
+            !p["suggest"].is_null(),
+            change == "legacy" || file_only,
+            "{change}"
+        );
+        // ファイルを観測する周期の側が、有効でなくなった投影を画面の行から外す。
+        l.cleanup();
         let listing = l.listing();
         let p = &listing["items"][0];
         assert_eq!(!p["suggest"].is_null(), change == "legacy", "{change}");
         assert_eq!(l.posts(), 1);
+        if change == "source" {
+            // 元の内容に戻れば、再送せずに投影が復元する。
+            std::fs::write(
+                l.env.config.data_dir.join("photos/synthetic-1.jpg"),
+                &original,
+            )
+            .unwrap();
+            l.cycle();
+            assert!(!l.listing()["items"][0]["suggest"].is_null());
+            assert_eq!(l.posts(), 1);
+        }
     }
+}
+
+#[test]
+fn listing_candidates_never_opens_image_files() {
+    let l = Lab::new();
+    for id in 1..=3 {
+        add(&l.env, id, 2);
+    }
+    l.done();
+    assert!(!l.listing()["items"][0]["suggest"].is_null());
+    // すべての画像ファイルを読めない状態にしても、一覧の応答は変わらない。
+    let before = l.listing();
+    for id in 1..=3 {
+        std::fs::remove_file(
+            l.env
+                .config
+                .data_dir
+                .join(format!("photos/synthetic-{id}.jpg")),
+        )
+        .unwrap();
+    }
+    let reads = crate::ai::location_clue::source_reads();
+    assert_eq!(l.listing(), before);
+    assert_eq!(crate::ai::location_clue::source_reads(), reads);
+    assert_eq!(l.posts(), 1);
+}
+
+/// 日ごとに 1 枚、離れた日付の写真を n 日分入れる。
+fn add_days(e: &Env, n: i64) {
+    for id in 1..=n {
+        add_on(
+            e,
+            id,
+            &format!("2026-{:02}-{:02}", 1 + (id - 1) / 28, 1 + (id - 1) % 28),
+        );
+    }
+}
+fn suggest_jobs(e: &Env) -> i64 {
+    n(
+        e,
+        "SELECT COUNT(*) FROM ai_jobs WHERE kind='location_suggest'",
+    )
+}
+
+#[test]
+fn reconcile_decodes_no_images_and_each_cycle_prepares_only_the_days_it_sends() {
+    let l = Lab::new();
+    add_days(&l.env, 40);
+    l.ready();
+    let (decoded, posts) = (crate::ai::location_clue::prepared_images(), l.posts());
+    l.cycle();
+    let (decoded, posts) = (
+        crate::ai::location_clue::prepared_images() - decoded,
+        l.posts() - posts,
+    );
+    // 積むのは 32 日まで。画像を作るのは、この周期に実際に送った日の分だけ（積んだ日・送れる日の分ではない）。
+    assert_eq!(suggest_jobs(&l.env), 32);
+    assert!(posts >= 1, "the cycle sends something");
+    assert_eq!(decoded, posts, "one image per sent single-photo day");
+    // 周期を重ねても、デコードは送った分だけ。
+    for _ in 0..3 {
+        let (decoded, posts) = (crate::ai::location_clue::prepared_images(), l.posts());
+        l.cycle();
+        assert_eq!(
+            crate::ai::location_clue::prepared_images() - decoded,
+            l.posts() - posts
+        );
+    }
+}
+
+#[test]
+fn exhausted_send_budget_prepares_no_images() {
+    let l = Lab::configured(|doc| {
+        doc["tasks"]["location_suggest"]["daily_request_limit"] = json!(1);
+    });
+    add_days(&l.env, 5);
+    l.ready();
+    l.cycle();
+    assert_eq!(l.posts(), 1);
+    let decoded = crate::ai::location_clue::prepared_images();
+    for _ in 0..3 {
+        l.cycle();
+    }
+    // 1 日の枠を使い切ったあとは、画像を作らず、送りもしない。
+    assert_eq!(crate::ai::location_clue::prepared_images(), decoded);
+    assert_eq!(l.posts(), 1);
+}
+
+#[test]
+fn days_stuck_in_failure_do_not_use_the_queue_limit_and_later_days_still_become_jobs() {
+    let l = Lab::new();
+    add_days(&l.env, 34);
+    l.ready();
+    l.cycle();
+    assert_eq!(suggest_jobs(&l.env), 32);
+    sql(
+        &l.env,
+        "UPDATE ai_jobs SET state='failed',terminal=1,attempts=5
+          WHERE kind='location_suggest' AND state!='succeeded'",
+    );
+    l.cycle();
+    // 失敗で止まったキーは候補から外れ、32 件の枠の後ろにいた日もジョブになる。
+    assert_eq!(suggest_jobs(&l.env), 34);
 }
 
 #[test]

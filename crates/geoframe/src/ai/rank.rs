@@ -1,5 +1,12 @@
 //! Optional linear-v1 weights. No inference, paths, names or JSON in diagnostics.
-use std::{fmt, io::Read, os::unix::fs::OpenOptionsExt, path::Path};
+use std::{
+    collections::HashMap,
+    fmt,
+    io::Read,
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    path::{Path, PathBuf},
+    sync::Mutex,
+};
 
 use serde::Deserialize;
 
@@ -8,6 +15,61 @@ use crate::quality::{Metrics, sha256_hex};
 
 pub const MAX_BYTES: usize = 8 * 1024 * 1024;
 const MAX_COMPONENTS: usize = 256;
+const MAX_CACHED_PATHS: usize = 8;
+
+/// 変更の判定: (mtime 秒, ナノ秒, 大きさ, dev, ino)。
+type Stamp = (i64, i64, u64, u64, u64);
+struct Cached {
+    stamp: Stamp,
+    space: String,
+    digest: Option<String>,
+}
+static DIGESTS: Mutex<Option<HashMap<PathBuf, Cached>>> = Mutex::new(None);
+#[cfg(test)]
+pub(super) static LOADS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// 読み取り経路（状態・検索・管理一覧）が使う、重みファイルの digest（読めない・不正なら `None`）。
+/// 呼ぶたびに最大 8 MiB を読んで解析し直さないよう、ファイルの mtime・大きさ・dev・ino と空間が
+/// 同じ間は前回の結果を返す。変わったときだけ読み直す。
+pub fn cached_digest(path: &Path, identity: &SpaceIdentity) -> Option<String> {
+    let meta = std::fs::metadata(path).ok()?;
+    let stamp = (
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.len(),
+        meta.dev(),
+        meta.ino(),
+    );
+    let space = identity.fingerprint();
+    if let Some(hit) = DIGESTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(path))
+        .filter(|c| c.stamp == stamp && c.space == space)
+    {
+        return hit.digest.clone();
+    }
+    #[cfg(test)]
+    LOADS.lock().unwrap().push(path.to_path_buf());
+    let digest = Model::load(path, identity)
+        .ok()
+        .map(|m| m.digest().to_owned());
+    let mut cache = DIGESTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = cache.get_or_insert_with(HashMap::new);
+    if map.len() >= MAX_CACHED_PATHS && !map.contains_key(path) {
+        map.clear();
+    }
+    map.insert(
+        path.to_path_buf(),
+        Cached {
+            stamp,
+            space,
+            digest: digest.clone(),
+        },
+    );
+    digest
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Reason {

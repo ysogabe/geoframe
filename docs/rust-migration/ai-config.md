@@ -166,6 +166,8 @@ Vertexの明示認証・固定宛先・token/予算/失敗分類は[ai-cloud.md]
 
 `location_suggest` と `location_geocode` を本番factoryへ登録した。新規Cloud画像送信には有効なlocation_clue設定と、その時点のDecision画像readyも必要。保存済み有償回答の座標化にはCloudClientや認証ファイルが不要で、location_suggestの有効/無効・pause・周期上限を尊重する。実画像や費用の追加許可は導入しない。
 
+`location_suggest` がクラウドへ送る内容は、**画像（最大6枚）と撮影日（YYYY-MM-DD）**。座標・地名・ファイル名・写真IDは送らない（撮影日はプロンプトの`{date}`に入る）。
+
 有効suggest設定だけが `ai_location_suggest_results` / `ai_location_candidates` / `ai_location_suggest_holds` をmigration/dry-run対象にする。c1済みDBへの不足増分は後者2表。INGEST=0や無効/不正設定の配信継続と、既存CLIのGuard/ingest lockは維持する。statusに固定の保留理由と件数を追加し、写真ID・地名・日付・モデル応答・認証情報は出さない。
 
 ## T4.4a: 既知Embedding契約の明示

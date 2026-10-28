@@ -29,7 +29,10 @@ pub(super) fn pem() -> String {
     )
 }
 pub(super) fn write_key(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
     std::fs::write(path, serde_json::to_vec(&json!({"client_email":"synthetic@example.invalid", "private_key":pem(), "token_uri":"http://untrusted.invalid/never"})).unwrap()).unwrap();
+    // AI の鍵は所有者だけが読める権限でなければ使われない。
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 pub(super) fn token_body() -> Vec<u8> {
     serde_json::to_vec(

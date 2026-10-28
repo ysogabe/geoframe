@@ -230,18 +230,27 @@ async fn parser_unicode_groups_duplicates_query_limit_and_fixed_errors() {
     );
 }
 #[tokio::test]
-async fn monotonic_rate_boundary_counts_empty_hits_and_invalid_query_after_disabled_order() {
+async fn monotonic_rate_boundary_counts_empty_hits_but_not_invalid_queries() {
     let mut e = Env::new(None, &[("GEOFRAME_AI_SEARCH_PER_MIN", "2")], false);
     let time = Arc::new(AtomicU64::new(0));
     let t = Arc::clone(&time);
     Arc::get_mut(&mut e.runtime).unwrap().now =
         Arc::new(move || Duration::from_millis(t.load(Ordering::SeqCst)));
     assert!(e.search("").await.is_ok());
+    // 不正な検索語は回数を消費しない（入力の検査が回数の計上より先）。
+    for _ in 0..5 {
+        assert_eq!(
+            e.search(&format!("q={}", "x".repeat(301))).await,
+            Err(Error::BadParams)
+        );
+    }
+    assert!(e.search("").await.is_ok());
+    assert_eq!(e.search("").await, Err(Error::RateLimited));
+    // 回数を使い切ったあとの不正な検索語は、制限ではなく入力の誤りとして返る。
     assert_eq!(
         e.search(&format!("q={}", "x".repeat(301))).await,
         Err(Error::BadParams)
     );
-    assert_eq!(e.search("").await, Err(Error::RateLimited));
     time.store(59999, Ordering::SeqCst);
     assert_eq!(e.search("").await, Err(Error::RateLimited));
     time.store(60000, Ordering::SeqCst);
@@ -1083,6 +1092,31 @@ async fn request(
         data[i + 4..].to_vec(),
     )
 }
+#[tokio::test]
+async fn http_ai_status_is_served_from_a_short_cache_and_does_not_rescan_vectors_per_request() {
+    let e = Env::new(Some("http://127.0.0.1:1"), &[], true);
+    let addr = server(&e).await;
+    let get = || async {
+        let (status, _, body) = request(addr, "GET", "/api/ai/status", "", "").await;
+        assert_eq!(status, 200);
+        serde_json::from_slice::<Value>(&body).unwrap()
+    };
+    let first = get().await;
+    assert_eq!(first["pipeline"]["corrupt"], 0);
+    e.conn
+        .execute(
+            "UPDATE ai_embedding_vectors SET vector=zeroblob(3072) WHERE input_sha256=?1",
+            [format!("{:064x}", 1)],
+        )
+        .unwrap();
+    // 検査を直接やり直せば壊れたベクトルが見える（対照）。HTTP は短い間、前回の結果を返す。
+    assert_eq!(
+        search_view::status(&e.conn, &e.config).unwrap()["pipeline"]["corrupt"],
+        1
+    );
+    assert_eq!(get().await, first);
+}
+
 #[tokio::test]
 async fn http_exact_routes_head_guards_errors_headers_and_python_cards() {
     let e = Env::new(None, &[], false);

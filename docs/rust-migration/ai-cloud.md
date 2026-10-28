@@ -44,9 +44,9 @@ let reply = client.run(ctx, &request)?;
 
 ## 認証とcache
 
-AI JSONの明示`credential_path`だけを遅延読取りする。Drive鍵、ADC、環境のGoogle認証を探索しない。通常ファイル・64 KiBまで、リンクは辿る。FIFOを開く前のmetadata検査と`O_NONBLOCK`で差替え時の待ちも防ぐ。開いた後のmetadataと読取り後の上限も検査する。共有部品`service_account`は`client_email`・`private_key`だけを読む。鍵JSONの`token_uri`は無視する。
+AI JSONの明示`credential_path`だけを遅延読取りする。Drive鍵、ADC、環境のGoogle認証を探索しない。通常ファイル・64 KiBまで、リンクは辿る。**権限がゆるい鍵は使わない**: 開いた後の`fstat`で、`mode & 0o077`が0でない（所有者以外に読める）か、所有者が実行ユーザー（euid）と違えば、読まずに拒否する（固定`Unauthorized`。その用途のクラウドは送らず、配信・他の用途は続く。Driveは従来どおり警告のみで使う）。リンクは辿り、判定は実体に対して行う。root所有でグループ可読にする運用は**認めない**（設計に根拠が無く、迷ったら拒否側に倒した）。0600で実行ユーザーの所有にする。拒否はProviderの`Unauthorized`停止として扱うので、直したあとは`geoframe ai-jobs release-pause`で解除する。FIFOを開く前のmetadata検査と`O_NONBLOCK`で差替え時の待ちも防ぐ。開いた後のmetadataと読取り後の上限も検査する。共有部品`service_account`は`client_email`・`private_key`だけを読む。鍵JSONの`token_uri`は無視する。
 
-既存`jwt::Rs256Signer`/`GoogleAssertion`でRS256署名する。scopeは`https://www.googleapis.com/auth/cloud-platform`、audienceは固定token URL、JWTはiatから3600秒。鍵JSON/PEM/署名失敗は固定`Unauthorized`。権限警告はAI用固定文だけ。path/email/private key/token/assertion/本文/モデル/URLは新しいDebug・ログ・errorへ出さない。
+既存`jwt::Rs256Signer`/`GoogleAssertion`でRS256署名する。scopeは`https://www.googleapis.com/auth/cloud-platform`、audienceは固定token URL、JWTはiatから3600秒。鍵JSON/PEM/署名失敗は固定`Unauthorized`。権限の拒否と、Driveの警告に使う文は固定文だけ。path/email/private key/token/assertion/本文/モデル/URLは新しいDebug・ログ・errorへ出さない。
 
 AI専用cacheはcredential path + scope + audienceのキーを持ち、DriveSharedと混在しない。期限の60秒前でrefreshし、注入時計で期限・時計巻戻りを試験する。空／CRLF／非ASCII／16 KiB超token、不正expiry（60秒以下・3600秒超・負・非整数）を拒否する。cache mutexはメモリ操作中だけで、ファイル／署名／HTTP中に保持しない。並行交換の重複は許容。401による削除は、実際に拒否されたtokenのArcが現在cacheと同一の場合だけ行い、古い401が新tokenを消さない。同じパスの鍵差替えは次回のtoken更新時に読む。
 
