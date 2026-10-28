@@ -238,7 +238,7 @@ impl Handler for PhotoJudge {
             PERSIST_TIMES
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .push(started.elapsed());
+                .push((tx.path().map(str::to_owned), started.elapsed()));
             out
         }))
     }
@@ -262,9 +262,10 @@ impl Handler for PhotoJudge {
     }
 }
 
-/// 試験用: writer の中の `persist` の所要時間（計測の試験が読む）。
+/// 試験用: writer の中の `persist` の所要時間を、DB のパス（試験ごとに別）と組で記録する。
+/// 計測の試験は自分の DB の分だけを読むので、他の試験と同時に動いても数が合う。
 #[cfg(test)]
-static PERSIST_TIMES: Mutex<Vec<std::time::Duration>> = Mutex::new(Vec::new());
+static PERSIST_TIMES: Mutex<Vec<(Option<String>, std::time::Duration)>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
 mod tests;

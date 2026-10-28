@@ -221,12 +221,10 @@ impl Lab {
         self.cycle_stop(&StopFlag::new());
     }
     fn cycle_stop(&self, stop: &StopFlag) {
-        Core::new(
-            &self
-                .env
-                .deps_for(self.config(), self.handlers(), stop, "judge"),
-        )
-        .cycle();
+        self.cycle_with(self.handlers(), stop);
+    }
+    fn cycle_with(&self, handlers: Vec<Arc<dyn Handler>>, stop: &StopFlag) {
+        Core::new(&self.env.deps_for(self.config(), handlers, stop, "judge")).cycle();
     }
     fn posts(&self) -> usize {
         self.cloud
@@ -647,6 +645,78 @@ fn input_changed_during_the_response_is_not_adopted() {
     }
 }
 
+/// 本物の handler を包み、保存（writer の IMMEDIATE tx の中の `persist`）の直前に、同じ tx で SQL を実行する。
+/// 応答後の `check_input`（writer の外）を通り抜けた後で入力が変わった場合を作る。
+struct MutateBeforePersist {
+    inner: Arc<dyn Handler>,
+    sql: &'static str,
+}
+impl Handler for MutateBeforePersist {
+    fn kind(&self) -> JobKind {
+        self.inner.kind()
+    }
+    fn reconcile(&self, read: &rusqlite::Connection, now: i64) -> rusqlite::Result<Vec<JobKey>> {
+        self.inner.reconcile(read, now)
+    }
+    fn run(
+        &self,
+        ctx: &crate::ai::worker::RunCtx<'_>,
+        job: &crate::ai::jobs::Claimed,
+    ) -> Result<crate::ai::worker::Persist, crate::ai::worker::RunError> {
+        let persist = self.inner.run(ctx, job)?;
+        let sql = self.sql;
+        Ok(Box::new(move |tx| {
+            assert!(!tx.is_autocommit(), "persist runs inside the writer tx");
+            tx.execute_batch(sql)?;
+            persist(tx)
+        }))
+    }
+    fn recheck(
+        &self,
+        conn: &rusqlite::Connection,
+        key: &JobKey,
+    ) -> rusqlite::Result<crate::ai::jobs::Recheck> {
+        self.inner.recheck(conn, key)
+    }
+}
+
+#[test]
+fn the_cas_inside_the_writer_tx_rejects_a_sent_photo_changed_after_the_pre_commit_check() {
+    // check_input は writer の外で通り抜けている。その後・保存の直前（同じ tx）に写真が変わった場合、
+    // `persist` 自身の `input_current` が不採用にする。
+    let cases: [(&str, &'static str, bool); 5] = [
+        ("unchanged (control)", "SELECT 1", true),
+        (
+            "rotation",
+            "UPDATE photos SET rotation=90 WHERE id=2",
+            false,
+        ),
+        ("delete", "DELETE FROM photos WHERE id=2", false),
+        ("hidden", "UPDATE photos SET hidden=1 WHERE id=2", false),
+        ("md5", "UPDATE photos SET md5='changed' WHERE id=2", false),
+    ];
+    for (label, sql, stored) in cases {
+        let l = Lab::new();
+        l.scene(1..=3, 0);
+        assert_eq!(l.scenes(), 1);
+        let handlers: Vec<Arc<dyn Handler>> = l
+            .handlers()
+            .into_iter()
+            .map(|inner| Arc::new(MutateBeforePersist { inner, sql }) as Arc<dyn Handler>)
+            .collect();
+        assert_eq!(handlers.len(), 1);
+        l.cycle_with(handlers, &StopFlag::new());
+        assert_eq!(l.posts(), 1, "{label}: the answer was paid for");
+        assert_eq!(l.judgments(), i64::from(stored), "{label}");
+        let state = l.job().unwrap().0;
+        assert_eq!(
+            state,
+            if stored { "succeeded" } else { "obsolete" },
+            "{label}"
+        );
+    }
+}
+
 /// 旧い有効な判定が一部だけ重なる（Partial になる）ようにする。
 fn make_partial(l: &Lab) {
     l.exec("INSERT INTO photo_ai_groups(group_id,kind,algorithm,analyzed_at,status,same_scene,judge_model,judge_version) VALUES('old','scene','old','synthetic','judged',1,'m','v')");
@@ -895,10 +965,13 @@ print(json.dumps(dict(feed=len(feed), status=isinstance(status,dict), loaded=len
 }
 
 fn view(l: &Lab) -> Value {
+    view_with(l, &l.config())
+}
+fn view_with(l: &Lab, config: &Config) -> Value {
     let read = crate::db::open_read_only(&l.config().db_path()).unwrap();
     crate::ai::search_view::search(
         &read,
-        &l.config(),
+        config,
         "",
         30,
         false,
@@ -958,6 +1031,22 @@ fn an_adopted_answer_is_shown_for_its_disjoint_scene_only_and_never_hides_a_phot
         d["tasks"].as_object_mut().unwrap().remove("photo_judge");
     });
     assert!(view(&l)["groups"][0].get("judge_source").is_none());
+}
+
+/// 同じ DB・同じ AI 設定で、AI 全体（`GEOFRAME_AI_ENABLED=0`）だけを止めた設定。
+fn config_ai_off(l: &Lab) -> Config {
+    let path = l._key.path().join("ai-off.json");
+    std::fs::write(&path, Lab::doc(&l.key_path, |_| {})).unwrap();
+    let vars = std::collections::HashMap::from([
+        ("GEOFRAME_AI_CONFIG", path.to_str().unwrap().to_string()),
+        ("GEOFRAME_INGEST", "1".to_string()),
+        ("GEOFRAME_AI_ENABLED", "0".to_string()),
+    ]);
+    let overrides = crate::config::Overrides {
+        listen: None,
+        data_dir: Some(l.config().data_dir.clone()),
+    };
+    Config::load(|k| vars.get(k).cloned(), &overrides).unwrap()
 }
 
 fn ids(view: &Value, group: usize) -> Vec<i64> {
@@ -1035,11 +1124,46 @@ fn an_adopted_recommendation_picks_the_representative_and_order_inside_the_group
         order
     );
     assert_eq!(feed(&l), 6);
-    // favorite と recommended は Gemini の推薦より前に来る。
+    // 許可を外した設定では、並びにも Gemini の推薦を使わない（回答前と同じ並びに戻る）。履歴は残る。
+    l.reconfigure(|d| d["tasks"]["photo_judge"]["allow_cloud"] = json!(false));
+    let off = view(&l);
+    assert!(!shown(&off));
+    for g in 0..2 {
+        assert_eq!(ids(&off, g), ids(&before, g), "group {g}: the unpaid order");
+    }
+    assert_eq!(l.judgments(), 2);
+    l.reconfigure(|_| {});
+    assert!(shown(&view(&l)));
+    // favorite は Gemini の推薦より前に来る。
     l.exec("UPDATE photos SET favorite=1 WHERE id=3");
     let favored = view(&l);
     let first_group = (0..2).find(|g| ids(&favored, *g).contains(&3)).unwrap();
     assert_eq!(ids(&favored, first_group)[0], 3);
+    l.exec("UPDATE photos SET favorite=0 WHERE id=3");
+    // 旧い群（今は有効でない）から残った写真ごとの recommended=1 も、Gemini の推薦より前に来る。
+    // Gemini の推薦でも局所の代表でもない写真に付けて、並びの先頭がそれになることを見る。
+    let g = (0..2).find(|g| ids(&after, *g).contains(&1)).unwrap();
+    let gemini = after["groups"][g]["photos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["gemini_recommended"] == true)
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let other = [1, 2, 3]
+        .into_iter()
+        .find(|id| *id != gemini && *id != local_first[g])
+        .unwrap();
+    l.exec(&format!("INSERT INTO photo_ai_features(photo_id,display,source_md5,source_mtime,content_sha256,embedding_model,embedding_dim,embedding,analyzed_at,error,recommended)
+       SELECT p.id,p.display,p.md5,p.mtime,f.content_sha256,'old-model',2,zeroblob(8),'synthetic','',1 FROM photos p JOIN photo_quality_features f ON f.photo_id=p.id WHERE p.id={other}"));
+    let legacy = view(&l);
+    assert!(shown(&legacy), "the answer is still adopted");
+    assert_eq!(legacy["groups"][g]["photos"][0]["id"], other);
+    assert_eq!(legacy["groups"][g]["photos"][0]["recommended"], true);
+    assert_eq!(legacy["groups"][g]["photos"][1]["id"], gemini);
+    assert_eq!(legacy["groups"][g]["photos"][1]["gemini_recommended"], true);
+    assert_eq!(ids(&legacy, g).len(), 3, "nothing is dropped");
     // 別場面（同一場面でない）の応答は全員が推薦扱いで差がつかず、群の中の並びを変えない。
     let none = Lab::new();
     none.state.lock().unwrap().same_scene = false;
@@ -1085,6 +1209,11 @@ fn the_stored_answer_is_displayed_only_while_the_current_setting_allows_the_clou
         assert!(!shown(&view(&l)), "{label}");
         assert_eq!(l.judgments(), 1, "{label}: the history stays");
     }
+    // AI 全体を止めた設定（GEOFRAME_AI_ENABLED=0）でも表示に使わない。履歴は消さない。
+    let off = config_ai_off(&l);
+    assert!(!off.ai.legacy().enabled);
+    assert!(!shown(&view_with(&l, &off)), "AI disabled");
+    assert_eq!(l.judgments(), 1, "AI disabled: the history stays");
     // 許可を戻せば、同じ回答がまた表示に使われる（再課金なし）。
     l.reconfigure(|_| {});
     assert!(shown(&view(&l)));
@@ -1224,13 +1353,20 @@ fn synthetic_6500_photo_catalog_measures_the_writer_time_of_the_paid_answer_cas(
             })
             .unwrap();
         assert_eq!(l.scenes(), 5, "the other photos form no scene");
-        super::PERSIST_TIMES.lock().unwrap().clear();
         for _ in 0..4 {
             l.env.advance(3600);
             l.cycle();
         }
         assert_eq!(l.judgments(), 5);
-        let persist = super::PERSIST_TIMES.lock().unwrap().clone();
+        // 他の試験と同時に動いても、この Lab の DB の分だけを数える。
+        let db = l.config().db_path();
+        let persist: Vec<Duration> = super::PERSIST_TIMES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path.as_deref().map(std::path::Path::new) == Some(db.as_path()))
+            .map(|(_, took)| *took)
+            .collect();
         assert_eq!(persist.len(), 5);
         let config = l.config();
         let full: Vec<Duration> = (0..5)

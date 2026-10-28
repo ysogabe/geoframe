@@ -38,13 +38,17 @@ handlerは`photo_judge`が`provider=cloud`・`allow_cloud=true`・日の上限�
 4. hiddenが許可内。
 5. 同じ`input_key`の回答が未保存（同内容なら成功、異なる内容は書き換えない）。
 
-tx内で読むのは、claim・**送った写真（最大6枚）の行**・履歴1件・ジョブ1件だけで、全写真・全構成員は読まない（`groups::generations_in`）。単一writerを止める時間が写真の数に比例しない。以前は`Prepared::load_in`をtx内で呼び、6500枚で約14ms（下記）だった。
+tx内で読むのは、claim・**送った写真（最大6枚）の行**・`hidden_ok`（hiddenを許可しない用途のとき、写真ごとに1回）・履歴1件（`lookup`の中の`table_present`が1回）・ジョブ1件だけで、全写真・全構成員は読まない（`groups::generations_in`）。単一writerを止める時間が写真の数に比例しない。以前は`Prepared::load_in`をtx内で呼び、6500枚で約14ms（下記）だった。
 
 **場面の状態はtxでは見ない**。応答待ちに場面が一時的にWaitingやPartialになっても、送った入力（写真IDと世代）が同じなら有償回答は履歴`ai_scene_judgments`に残す。同じshortlistで場面ができ直せば、鍵が同じなので再課金せず再利用される（`a_paid_answer_survives_the_scene_turning_partial_or_waiting_…`）。表示は今までどおり`applies_to`（現shortlistの写真と世代）とDisjointで照合し直すので、PartialやWaitingの場面には出ない。送る直前（`check`、`run_checked`の毎POST前）は従来どおり全構成員を読んで「Disjointの置換候補が今も在る」ことを確かめ、条件を外れた場面には送らない。
 
 応答待ちにグループの結果ID（shortlist以外の構成員の追加など）だけが変わった場合も、送った画像と世代が同じなので採用する。writer内で画像・ファイル・通信は行わない（応答後のファイルSHA再確認はwriterの外）。
 
 **採用の効果は表示と再利用と、群の中の代表・並び**。E6の`kind:"scene"`（Disjoint）のグループに、`summary`・`same_scene`・`judge_model`・`judge_source:"gemini"`、各写真に`gemini_recommended`・`gemini_keep_score`を付ける。さらに、適用できる回答がある場面だけ、群の中の順序を「favorite → recommended → **Geminiの推薦** → 場面の代表 → …」とする（R7。クラスタの代表も並びの先頭から決まる）。`local_representative`・`local_rank`はローカルの値のまま。群どうしの並び（keep_scoreの尺度）・件数・フィードは変えない。
+
+注意点（並びの副作用）:
+- Disjointの場面でも、有効でない旧い群（判定が外れた・置き換えられた群）から残った写真ごとの`recommended=1`があると、それはGeminiの推薦より前に来る（favorite → recommended → Geminiの推薦）。
+- Geminiの推薦で並びが変わると、類似クラスタの代表（`visual_representative`）とUIの初期の折りたたみが変わることがある。JSONからは何も消えず、hiddenにもフィードの抑止にもしない。
 
 表示に使うのは、**今の設定がphoto_judgeをクラウド・`allow_cloud`で使っていて、モデルが同じとき**の回答だけ（`display_model`。モデルは鍵に含まれる）。許可を外した設定・ローカル設定・別モデル・用途なしでは表示にも並びにも使わず、履歴は消さない。許可を戻せば同じ回答がまた使われる。日の上限0は送信の止めであって表示の許可ではない。管理STATUSの`ai_scenes.paid_judgments`は履歴の総数。**フィードの抑止・旧`photo_ai_*`表・`photos`の人手の列は一切変えない**。未判定・Waiting・Partialも抑止の根拠にしない。
 
