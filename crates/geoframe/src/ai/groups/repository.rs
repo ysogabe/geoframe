@@ -1982,6 +1982,30 @@ pub struct Annotation {
     pub shortlisted: bool,
 }
 
+/// Current input generation (the hex stored with each member) of the given photos only. Photos that
+/// do not exist are absent. Reads those rows alone (no vector, no other photo), so a writer-side
+/// check of a few photos does not grow with the catalog.
+pub fn generations_in(tx: &Connection, ids: &[i64]) -> Result<HashMap<i64, String>, Error> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let marks = (1..=ids.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = tx.prepare(&format!("{PHOTO_ROWS} WHERE p.id IN ({marks})"))?;
+    let mut scratch = Vec::new();
+    let rows = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
+        Row::from_sql(r, &mut scratch, false)
+    })?;
+    let mut out = HashMap::new();
+    for row in rows {
+        let row = row?;
+        out.insert(row.id(), row.generation());
+    }
+    Ok(out)
+}
+
 /// Scene positions of the given photos only (a page). Reads those photos' rows and their stored
 /// members; a member is used only when its generation still equals the photo's current generation,
 /// the result carries the current space and processor, and (unless waiting) the active pointer

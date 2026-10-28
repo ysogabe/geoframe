@@ -12,8 +12,9 @@ use crate::quality::{Metrics, rank_scores};
 mod repository;
 use repository::Retire;
 pub use repository::{
-    Annotation, Loaded, Saved, current, load_current, load_current_in, migrate, mismatched,
-    pending, pending_retire, pending_saves, save, save_batch, save_batch_counted, snapshot,
+    Annotation, Loaded, Saved, current, generations_in, load_current, load_current_in, migrate,
+    mismatched, pending, pending_retire, pending_saves, save, save_batch, save_batch_counted,
+    snapshot,
 };
 pub mod runtime;
 #[cfg(test)]

@@ -302,7 +302,7 @@ fn dyn_handlers(list: &[Arc<Fake>]) -> Vec<Arc<dyn Handler>> {
 // ---------------------------------------------------------------- 起動の条件・登録
 
 #[test]
-fn the_shipped_binary_registers_only_location_clue_and_a_worker_starts_only_with_ingest_and_a_background_task()
+fn the_shipped_binary_registers_location_clue_and_the_permitted_photo_judge_and_a_worker_starts_only_with_ingest_and_a_background_task()
  {
     // 配布バイナリは location_clue と、許可の揃った photo_judge だけ（fake・本番のスタブは置かない）
     let e = env("production-registration");

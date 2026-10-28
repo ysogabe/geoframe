@@ -5,7 +5,7 @@ use crate::ai::{
     groups::runtime::Runtime,
     index,
     jobs::JobState,
-    settings::Normalization,
+    settings::{Normalization, TaskKind},
     space::SpaceIdentity,
     tests_http::{Stub, respond, stub},
     tests_worker::{Env, env_with},
@@ -22,6 +22,9 @@ struct State {
     cloud_status: u16,
     token_status: u16,
     bad_json: bool,
+    /// 推薦する画像の番号（1 始まり）。
+    recommend: usize,
+    same_scene: bool,
     hook: Option<Hook>,
 }
 struct Lab {
@@ -94,6 +97,8 @@ impl Lab {
             cloud_status: 200,
             token_status: 200,
             bad_json: false,
+            recommend: 1,
+            same_scene: true,
             hook: None,
         }));
         let s = state.clone();
@@ -115,12 +120,13 @@ impl Lab {
                 .matches("inlineData")
                 .count();
             let photos: Vec<Value> = (1..=n)
-                .map(|i| json!({"index":i,"subject":"other","pet_state":"not_applicable","eyes":"not_applicable","face_crop":"not_applicable","horizon_status":"not_applicable","horizon_score":50,"subject_sharpness":70,"aesthetic_score":60,"keep_score":90-i,"recommended":i==1,"reasons":["合成の理由"],"concerns":[]}))
+                .map(|i| json!({"index":i,"subject":"other","pet_state":"not_applicable","eyes":"not_applicable","face_crop":"not_applicable","horizon_status":"not_applicable","horizon_score":50,"subject_sharpness":70,"aesthetic_score":60,"keep_score":90-i,"recommended":i==s.recommend,"reasons":["合成の理由"],"concerns":[]}))
                 .collect();
             let text = if s.bad_json {
                 "not json".to_string()
             } else {
-                json!({"same_scene":true,"summary":"合成の要約","photos":photos}).to_string()
+                json!({"same_scene":s.same_scene,"summary":"合成の要約","photos":photos})
+                    .to_string()
             };
             let v =
                 json!({"candidates":[{"finishReason":"STOP","content":{"parts":[{"text":text}]}}]});
@@ -504,6 +510,38 @@ fn per_post_budget_cycle_limit_and_failure_cap_are_kept() {
 }
 
 #[test]
+fn posts_per_cycle_never_exceed_the_cycle_limit_even_with_more_sendable_scenes() {
+    // 4 つの場面が同時に送れる。1 周期の POST は周期の上限（GEOFRAME_AI_JUDGE_PER_CYCLE。既定 2）以下。
+    // 送信後の時間切れを有償の試行に数えることと、中断 3 回の扱いは共通層（worker/jobs/cloud）の試験で確かめる。
+    let l = Lab::new();
+    for (ids, base) in [
+        (1..=2, 0),
+        (11..=12, 20_000),
+        (21..=22, 40_000),
+        (31..=32, 60_000),
+    ] {
+        l.scene(ids, base);
+    }
+    assert_eq!(l.scenes(), 4);
+    let limit = l.config().ai.legacy().cycle(TaskKind::PhotoJudge).0 as usize;
+    assert_eq!(limit, 2, "the default per-cycle limit");
+    l.cycle();
+    assert!(l.posts() <= limit, "{} posts in one cycle", l.posts());
+    assert_eq!(l.posts(), limit);
+    assert_eq!(l.judgments(), limit as i64);
+    // 同じ周期の窓の中の再実行でも上限を超えない。窓が進めば残りが順に送られ、全部で 1 場面 1 回。
+    l.cycle();
+    assert!(l.posts() <= limit);
+    for _ in 0..4 {
+        let before = l.posts();
+        l.env.advance(3600);
+        l.cycle();
+        assert!(l.posts() - before <= limit);
+    }
+    assert_eq!((l.posts(), l.judgments()), (4, 4));
+}
+
+#[test]
 fn exact_partial_waiting_and_hidden_are_never_sent() {
     // Exact: 旧い有償判定が有効な集合は再課金しない。
     let legacy = |l: &Lab, ids: &[i64]| {
@@ -609,27 +647,86 @@ fn input_changed_during_the_response_is_not_adopted() {
     }
 }
 
+/// 旧い有効な判定が一部だけ重なる（Partial になる）ようにする。
+fn make_partial(l: &Lab) {
+    l.exec("INSERT INTO photo_ai_groups(group_id,kind,algorithm,analyzed_at,status,same_scene,judge_model,judge_version) VALUES('old','scene','old','synthetic','judged',1,'m','v')");
+    for (rank, id) in [1, 2].iter().enumerate() {
+        l.exec(&format!("INSERT INTO photo_ai_features(photo_id,display,source_md5,source_mtime,content_sha256,embedding_model,embedding_dim,embedding,analyzed_at,error)
+           SELECT p.id,p.display,p.md5,p.mtime,f.content_sha256,'old-model',2,zeroblob(8),'synthetic','' FROM photos p JOIN photo_quality_features f ON f.photo_id=p.id WHERE p.id={id}"));
+        l.exec(&format!("INSERT INTO photo_ai_group_members(group_id,photo_id,rank_in_group,recommended,shortlisted,local_score) VALUES('old',{id},{},{},1,50)", rank + 1, i32::from(rank == 0)));
+    }
+}
+fn shown(view: &Value) -> bool {
+    view["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|g| g.get("judge_source").is_some())
+}
+
 #[test]
-fn partial_overlap_appearing_during_the_response_is_not_adopted() {
+fn a_paid_answer_survives_the_scene_turning_partial_or_waiting_and_is_reused_when_it_forms_again() {
+    // Partial: 応答待ちに旧判定と一部重なった。送った入力（写真 ID・世代）は同じなので履歴に残るが、
+    // Partial の場面には表示も再送もしない。
     let l = Arc::new(Lab::new());
     l.scene(1..=3, 0);
     l.scenes();
     let l2 = l.clone();
     l.hook(move |event| {
         if event == "cloud" {
-            // 旧い有効な判定が一部だけ重なる集合になった。
-            l2.exec("INSERT INTO photo_ai_groups(group_id,kind,algorithm,analyzed_at,status,same_scene,judge_model,judge_version) VALUES('old','scene','old','synthetic','judged',1,'m','v')");
-            for (rank, id) in [1, 2].iter().enumerate() {
-                l2.exec(&format!("INSERT INTO photo_ai_features(photo_id,display,source_md5,source_mtime,content_sha256,embedding_model,embedding_dim,embedding,analyzed_at,error)
-                   SELECT p.id,p.display,p.md5,p.mtime,f.content_sha256,'old-model',2,zeroblob(8),'synthetic','' FROM photos p JOIN photo_quality_features f ON f.photo_id=p.id WHERE p.id={id}"));
-                l2.exec(&format!("INSERT INTO photo_ai_group_members(group_id,photo_id,rank_in_group,recommended,shortlisted,local_score) VALUES('old',{id},{},{},1,50)", rank + 1, i32::from(rank == 0)));
-            }
+            make_partial(&l2);
             l2.scenes();
         }
     });
     l.cycle();
     assert_eq!(l.posts(), 1);
-    assert_eq!(l.judgments(), 0);
+    assert_eq!(l.judgments(), 1, "the paid answer is kept in the history");
+    assert_eq!(l.job().unwrap().0, "succeeded");
+    assert_eq!(
+        l.n("SELECT COUNT(*) FROM ai_scene_groups WHERE state='review_overlap'"),
+        1
+    );
+    assert!(!shown(&view(&l)), "a partial scene shows no comparison");
+    l.env.advance(3600);
+    l.cycle();
+    assert_eq!(l.posts(), 1, "a partial scene is not sent");
+    // 旧判定が外れて同じ shortlist の Disjoint の場面ができ直す: 再課金せず、保存済みの回答が表示に使われる。
+    l.exec("DELETE FROM photo_ai_group_members; DELETE FROM photo_ai_groups");
+    assert_eq!(l.scenes(), 1);
+    for _ in 0..2 {
+        l.env.advance(3600);
+        l.cycle();
+    }
+    assert_eq!((l.posts(), l.judgments()), (1, 1), "no second charge");
+    assert!(shown(&view(&l)));
+
+    // Waiting: 応答待ちに、場面の窓へ解析前の写真が入った。履歴には残り、窓が戻ると再課金なしで表示に使う。
+    let l = Arc::new(Lab::new());
+    l.scene(1..=3, 0);
+    l.scenes();
+    let l2 = l.clone();
+    l.hook(move |event| {
+        if event == "cloud" {
+            l2.exec("INSERT INTO photos(id,source,name,display,md5,mtime,rotation,taken_at) VALUES(99,'local','synthetic','photos/missing.jpg','m',1,0,'2026-01-01 00:00:30')");
+            l2.scenes();
+        }
+    });
+    l.cycle();
+    assert_eq!((l.posts(), l.judgments()), (1, 1));
+    assert_eq!(l.job().unwrap().0, "succeeded");
+    assert_eq!(
+        l.n("SELECT COUNT(*) FROM ai_scene_groups WHERE state='waiting'"),
+        1
+    );
+    assert!(!shown(&view(&l)));
+    l.exec("DELETE FROM photos WHERE id=99");
+    assert_eq!(l.scenes(), 1);
+    for _ in 0..2 {
+        l.env.advance(3600);
+        l.cycle();
+    }
+    assert_eq!((l.posts(), l.judgments()), (1, 1), "no second charge");
+    assert!(shown(&view(&l)));
 }
 
 #[test]
@@ -863,6 +960,203 @@ fn an_adopted_answer_is_shown_for_its_disjoint_scene_only_and_never_hides_a_phot
     assert!(view(&l)["groups"][0].get("judge_source").is_none());
 }
 
+fn ids(view: &Value, group: usize) -> Vec<i64> {
+    view["groups"][group]["photos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_i64().unwrap())
+        .collect()
+}
+
+#[test]
+fn an_adopted_recommendation_picks_the_representative_and_order_inside_the_group_only() {
+    // 合成の応答は 2 番目の画像を推薦する（ローカルの順位 1 位とは別の写真）。
+    let l = Lab::new();
+    l.state.lock().unwrap().recommend = 2;
+    l.scene(1..=3, 0);
+    l.scene(11..=13, 20_000);
+    l.scenes();
+    let before = view(&l);
+    let local_first: Vec<i64> = (0..2)
+        .map(|g| {
+            before["groups"][g]["photos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["local_representative"] == true)
+                .unwrap()["id"]
+                .as_i64()
+                .unwrap()
+        })
+        .collect();
+    assert!(
+        (0..2).all(|g| ids(&before, g)[0] == local_first[g]),
+        "without a comparison the local representative leads"
+    );
+    let order: Vec<_> = before["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["group_id"].clone())
+        .collect();
+    let feed = |l: &Lab| {
+        crate::photos::list_photos(&crate::db::open_read_only(&l.config().db_path()).unwrap())
+            .unwrap()
+            .len()
+    };
+    l.env.advance(3600);
+    l.cycle();
+    assert_eq!(l.judgments(), 2);
+    let after = view(&l);
+    for g in 0..2 {
+        let photos = after["groups"][g]["photos"].as_array().unwrap();
+        let gemini = photos
+            .iter()
+            .find(|p| p["gemini_recommended"] == true)
+            .unwrap();
+        // 群の中の先頭（クラスタの代表）は Gemini の推薦。局所の代表の表示はそのまま。
+        assert_eq!(photos[0]["id"], gemini["id"], "group {g}");
+        assert_ne!(gemini["id"].as_i64().unwrap(), local_first[g]);
+        assert_eq!(photos[0]["visual_representative"], true);
+        let local = photos.iter().find(|p| p["local_rank"] == 1).unwrap();
+        assert_eq!(local["local_representative"], true);
+        assert_eq!(local["id"].as_i64().unwrap(), local_first[g]);
+        assert_eq!(photos.len(), 3, "nothing is dropped");
+    }
+    // 群どうしの並びと件数は変わらず、フィードの抑止にも使わない。
+    assert_eq!(
+        after["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| g["group_id"].clone())
+            .collect::<Vec<_>>(),
+        order
+    );
+    assert_eq!(feed(&l), 6);
+    // favorite と recommended は Gemini の推薦より前に来る。
+    l.exec("UPDATE photos SET favorite=1 WHERE id=3");
+    let favored = view(&l);
+    let first_group = (0..2).find(|g| ids(&favored, *g).contains(&3)).unwrap();
+    assert_eq!(ids(&favored, first_group)[0], 3);
+    // 別場面（同一場面でない）の応答は全員が推薦扱いで差がつかず、群の中の並びを変えない。
+    let none = Lab::new();
+    none.state.lock().unwrap().same_scene = false;
+    none.state.lock().unwrap().recommend = 2;
+    none.scene(1..=3, 0);
+    none.scenes();
+    let unpaid = ids(&view(&none), 0);
+    none.cycle();
+    assert_eq!(none.judgments(), 1);
+    let paid = view(&none);
+    assert!(shown(&paid));
+    assert_eq!(ids(&paid, 0), unpaid);
+}
+
+#[test]
+fn the_stored_answer_is_displayed_only_while_the_current_setting_allows_the_cloud_judge() {
+    let l = Lab::new();
+    l.scene(1..=3, 0);
+    l.paid();
+    assert!(shown(&view(&l)));
+    // 許可を外した設定・ローカル・別のモデル・用途なし: 表示しない。履歴は消さない。
+    type Change = fn(&mut Value);
+    let variants: [(&str, Change); 4] = [
+        ("cloud not allowed", |d| {
+            d["tasks"]["photo_judge"]["allow_cloud"] = json!(false)
+        }),
+        (
+            "local provider",
+            |d| {
+                d["tasks"]["photo_judge"] =
+                    json!({"provider":"local","model":"m","service_id":"svc"})
+            },
+        ),
+        ("other model", |d| {
+            d["tasks"]["photo_judge"]["model"] = json!("other-judge-model")
+        }),
+        ("task absent", |d| {
+            d["tasks"].as_object_mut().unwrap().remove("photo_judge");
+        }),
+    ];
+    for (label, change) in variants {
+        l.reconfigure(change);
+        assert!(!shown(&view(&l)), "{label}");
+        assert_eq!(l.judgments(), 1, "{label}: the history stays");
+    }
+    // 許可を戻せば、同じ回答がまた表示に使われる（再課金なし）。
+    l.reconfigure(|_| {});
+    assert!(shown(&view(&l)));
+    assert_eq!(l.posts(), 1);
+    // 日の上限 0 は送信の止めであって表示の許可ではない（保存済みの回答は表示できる）。
+    l.reconfigure(|d| d["tasks"]["photo_judge"]["daily_request_limit"] = json!(0));
+    assert!(shown(&view(&l)));
+}
+
+thread_local! {
+    static CATALOG_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+fn count_catalog_read(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(stmt, _) = event
+        && stmt.sql().contains("sqlite_master")
+    {
+        CATALOG_READS.with(|n| n.set(n.get() + 1));
+    }
+}
+
+#[test]
+fn the_history_table_is_looked_up_once_per_request_however_many_scenes_are_returned() {
+    let reads = |scenes: i64| {
+        let l = Lab::new();
+        for n in 0..scenes {
+            l.scene(n * 10 + 1..=n * 10 + 3, n * 20_000);
+        }
+        assert_eq!(l.scenes(), scenes as usize);
+        l.env.advance(3600);
+        for _ in 0..scenes {
+            l.env.advance(3600);
+            l.cycle();
+        }
+        assert_eq!(l.judgments(), scenes);
+        let read = crate::db::open_read_only(&l.config().db_path()).unwrap();
+        CATALOG_READS.with(|n| n.set(0));
+        read.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+            Some(count_catalog_read),
+        );
+        let out = crate::ai::search_view::search(
+            &read,
+            &l.config(),
+            "",
+            30,
+            false,
+            None,
+            &crate::ai::http::Deadline::interactive(),
+        )
+        .unwrap()
+        .unwrap();
+        read.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        assert_eq!(
+            out["groups"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|g| g.get("judge_source").is_some())
+                .count() as i64,
+            scenes
+        );
+        CATALOG_READS.with(Cell::get)
+    };
+    use std::cell::Cell;
+    let (one, three) = (reads(1), reads(3));
+    assert!(one > 0);
+    assert_eq!(
+        one, three,
+        "the lookup does not grow with the scenes returned"
+    );
+}
+
 #[test]
 fn a_response_for_a_claim_that_was_returned_meanwhile_is_not_saved() {
     let l = Arc::new(Lab::new());
@@ -885,4 +1179,112 @@ fn a_response_for_a_claim_that_was_returned_meanwhile_is_not_saved() {
         "a late answer of an invalidated claim is never stored"
     );
     assert_eq!(l.job().unwrap().0, "deferred");
+}
+
+/// Measurement only (`--ignored --nocapture`): time inside the single writer for the paid answer's CAS,
+/// with and without 6500 photos in the catalog. "full" is the earlier CAS (the whole catalog read through
+/// `Prepared::load_in` in the writer transaction); "persist" is the CAS in the writer now (the sent
+/// photos' rows only). The other photos have quality features and a (2-dimensional) vector but no
+/// capture time, so they belong to no scene; the vectors are smaller than the real 768 dimensions, which
+/// makes "full" a lower bound.
+#[test]
+#[ignore = "measurement: synthetic 6500-photo catalog, writer time of the paid answer's CAS"]
+fn synthetic_6500_photo_catalog_measures_the_writer_time_of_the_paid_answer_cas() {
+    use std::time::{Duration, Instant};
+    fn median(mut v: Vec<Duration>) -> f64 {
+        v.sort();
+        v[v.len() / 2].as_secs_f64() * 1000.
+    }
+    for others in [0_i64, 6500] {
+        let l = Lab::new();
+        for (ids, base) in [
+            (1..=2, 0),
+            (11..=12, 20_000),
+            (21..=22, 40_000),
+            (31..=32, 60_000),
+            (41..=42, 80_000),
+        ] {
+            l.scene(ids, base);
+        }
+        let space = identity().space_id().to_string();
+        let blob = crate::ai::space::encode(&[1., 0.]);
+        l.env
+            .writer()
+            .call(move |c| {
+                let tx = c.transaction()?;
+                for n in 0..others {
+                    let (photo, sha) = (1000 + n, format!("{:064x}", 1000 + n));
+                    let display = format!("photos/synthetic-{photo}.jpg");
+                    tx.execute("INSERT INTO photos(id,source,name,display,md5,mtime,rotation,lat,lon,hidden,favorite) VALUES(?1,'local','synthetic',?2,'m',1,0,1,2,0,0)", params![photo, display])?;
+                    tx.execute("INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,phash,sharpness,luminance,exposure_score,black_clip,white_clip,contrast,error,analyzed_at)
+                       VALUES(?1,?2,'m',1,?3,'0',5,128,90,0,0,100,'','synthetic')", params![photo, display, sha])?;
+                    tx.execute("INSERT INTO ai_embedding_vectors VALUES(?1,?2,?3,2,?4,0)", params![space, sha, "f".repeat(64), blob])?;
+                }
+                tx.commit()
+            })
+            .unwrap();
+        assert_eq!(l.scenes(), 5, "the other photos form no scene");
+        super::PERSIST_TIMES.lock().unwrap().clear();
+        for _ in 0..4 {
+            l.env.advance(3600);
+            l.cycle();
+        }
+        assert_eq!(l.judgments(), 5);
+        let persist = super::PERSIST_TIMES.lock().unwrap().clone();
+        assert_eq!(persist.len(), 5);
+        let config = l.config();
+        let full: Vec<Duration> = (0..5)
+            .map(|_| {
+                let config = config.clone();
+                l.env
+                    .writer()
+                    .call(move |c| {
+                        let started = Instant::now();
+                        let tx = c.unchecked_transaction()?;
+                        let prepared = crate::ai::groups::runtime::Prepared::read(&tx, &config)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                        let loaded = prepared
+                            .load_in(&tx)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?;
+                        let wanted = loaded
+                            .groups()
+                            .iter()
+                            .find_map(Candidate::from_group)
+                            .unwrap();
+                        let found = repository::candidate_current(&tx, &prepared, &wanted)?;
+                        assert!(found.is_some());
+                        tx.commit()?;
+                        Ok(started.elapsed())
+                    })
+                    .unwrap()
+            })
+            .collect();
+        eprintln!(
+            "PERSIST_CAS photos={} full_catalog_cas_ms_median={:.2} persist_ms_median={:.3} persist_ms_max={:.3}",
+            others + 10,
+            median(full),
+            median(persist.clone()),
+            persist.iter().max().unwrap().as_secs_f64() * 1000.
+        );
+        // E6 with the five stored answers shown, against the same read when the setting no longer allows them.
+        let e6 = |l: &Lab| {
+            median(
+                (0..10)
+                    .map(|_| {
+                        let started = Instant::now();
+                        assert!(!view(l)["groups"].as_array().unwrap().is_empty());
+                        started.elapsed()
+                    })
+                    .collect(),
+            )
+        };
+        assert!(shown(&view(&l)));
+        let with = e6(&l);
+        l.reconfigure(|d| d["tasks"]["photo_judge"]["allow_cloud"] = json!(false));
+        eprintln!(
+            "PERSIST_CAS photos={} e6_with_5_answers_ms_median={with:.1} e6_without_ms_median={:.1}",
+            others + 10,
+            e6(&l)
+        );
+    }
 }

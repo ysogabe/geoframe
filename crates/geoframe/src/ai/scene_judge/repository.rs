@@ -91,11 +91,22 @@ fn valid_manifest(m: &Manifest) -> bool {
         })
 }
 
+/// 履歴の表があるか。1 リクエスト・1 周期で 1 回だけ確かめ、以降は [`lookup_in`] で読む。
+pub(super) fn table_present(conn: &Connection) -> rusqlite::Result<bool> {
+    jobs::object_exists(conn, "table", TABLES[0])
+}
+
 /// 回答 1 件を読み、キー・整合 hash・manifest・正規化済み verdict を全て照合する。
+/// 表が無ければ `Unverified`（送らず・再課金もしない）。
 pub fn lookup(conn: &Connection, input_key: &str) -> rusqlite::Result<Lookup> {
-    if !jobs::object_exists(conn, "table", TABLES[0])? {
+    if !table_present(conn)? {
         return Ok(Lookup::Unverified);
     }
+    lookup_in(conn, input_key)
+}
+
+/// [`lookup`] のうち表の存在を確かめない部分。呼出し側が [`table_present`] で確かめ済みのときだけ使う。
+pub(super) fn lookup_in(conn: &Connection, input_key: &str) -> rusqlite::Result<Lookup> {
     let row = conn
         .query_row(
             "SELECT manifest_json,verdict_json,attempts,analyzed_at,integrity_sha256
@@ -143,14 +154,15 @@ pub fn lookup(conn: &Connection, input_key: &str) -> rusqlite::Result<Lookup> {
 
 /// 履歴にある回答の総数（STATUS 用。表が無ければ 0）。
 pub(in crate::ai) fn count(conn: &Connection) -> rusqlite::Result<i64> {
-    if !jobs::object_exists(conn, "table", TABLES[0])? {
+    if !table_present(conn)? {
         return Ok(0);
     }
     conn.query_row("SELECT COUNT(*) FROM ai_scene_judgments", [], |r| r.get(0))
 }
 
 /// 現世代の置換候補（shortlist の写真と世代が一致する LocalRanked の Exact / Disjoint グループ）が
-/// 今も在るか。`prepared` は writer 外で `Prepared::read` したもの。tx 内で現世代の検査をやり直す。
+/// 今も在るか。全写真・全構成員を読むので、writer の tx 内では使わない（送る直前の確認用）。
+/// `prepared` は `Prepared::read` したもの。
 pub(super) fn candidate_current(
     conn: &Connection,
     prepared: &Prepared,
@@ -164,6 +176,24 @@ pub(super) fn candidate_current(
         .iter()
         .filter_map(Candidate::from_group)
         .find(|c| c == wanted))
+}
+
+/// 送った入力が今も有効か: 送った各写真が今もあり、世代が送信時と同じで（表示ファイル・品質解析・
+/// 向き・更新時刻・撮影時刻が変わっていない）、hidden が許可内。場面（グループ）の状態は見ない。
+/// 読むのは送った写真（最大 [`MAX_SEND`] 枚）の行だけで、写真の数に比例しない。
+pub(super) fn input_current(
+    conn: &Connection,
+    candidate: &Candidate,
+    include_hidden: bool,
+) -> rusqlite::Result<bool> {
+    let ids = candidate.sent_ids();
+    let current =
+        crate::ai::groups::generations_in(conn, &ids).map_err(|_| rusqlite::Error::InvalidQuery)?;
+    Ok(candidate
+        .sent
+        .iter()
+        .all(|(id, generation)| current.get(id) == Some(generation))
+        && hidden_ok(conn, &ids, include_hidden)?)
 }
 
 /// hidden を許可していない用途では、送る写真に hidden が一枚でもあれば不可。
@@ -190,15 +220,17 @@ pub(super) fn hidden_ok(
     Ok(true)
 }
 
-/// `Handler::run` が返す Persist 用（`jobs::complete` の tx 内のみ）。有効な token・現世代の置換候補・
-/// hidden 許可を同じ tx で再照合して不変履歴へ書く。旧 token・入力が変わった結果・Partial になった
-/// 集合では何も書かない。ファイル・HTTP はここで行わない。
+/// `Handler::run` が返す Persist 用（`jobs::complete` の tx 内のみ）。有効な token・送った入力の現在性
+/// （送った写真の ID と世代・hidden 許可）・未保存を同じ tx で再照合して不変履歴へ書く。読むのは claim・
+/// 送った写真の行・履歴 1 件・ジョブ 1 件だけで、単一 writer を止める時間は写真の数に比例しない。
+/// 場面（グループ）の状態は見ない: 応答待ちに Waiting や Partial になっても、送った入力が同じなら
+/// 有償回答は履歴に残し（再課金を避ける）、表示に使えるかは読むときに `applies_to` と Disjoint で決める。
+/// 入力が変わった結果・旧 token では何も書かない。ファイル・HTTP はここで行わない。
 pub fn persist(
     conn: &Connection,
     claimed: &Claimed,
     plan: &Plan,
     verdict: &Verdict,
-    prepared: &Prepared,
     include_hidden: bool,
     now: i64,
 ) -> rusqlite::Result<InputCheck> {
@@ -208,8 +240,7 @@ pub fn persist(
     if !jobs::owns(conn, claimed)?
         || claimed.key != plan.key()
         || verdict.photos().len() != plan.manifest.sent.len()
-        || !hidden_ok(conn, &plan.sent_ids(), include_hidden)?
-        || candidate_current(conn, prepared, &plan.candidate)?.is_none()
+        || !input_current(conn, &plan.candidate, include_hidden)?
     {
         return Ok(InputCheck::Changed);
     }

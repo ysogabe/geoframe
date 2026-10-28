@@ -1,6 +1,6 @@
 //! 本番の photo_judge handler。画像準備・ファイル観測・通信は writer / DB tx の外で行い、
 //! 保存は `jobs::complete` の短い tx 内の CAS（[`persist`]）だけ。
-use super::repository::{candidate_current, hidden_ok};
+use super::repository::{candidate_current, hidden_ok, input_current, lookup_in, table_present};
 use super::*;
 use crate::{
     ai::{
@@ -68,6 +68,11 @@ impl PhotoJudge {
         let loaded = prepared
             .load_in(&tx)
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
+        // 履歴の表が無いとき（Unverified と同じ扱い）は何も送らない。存在の確認は 1 回だけ。
+        if !table_present(&tx)? {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
         let mut found = Vec::new();
         for group in loaded.groups() {
             let Some(candidate) = Candidate::from_group(group).filter(Candidate::sendable) else {
@@ -75,7 +80,7 @@ impl PhotoJudge {
             };
             if hidden_ok(&tx, &candidate.sent_ids(), self.include_hidden)?
                 && matches!(
-                    lookup(&tx, &candidate.input_key(&self.model))?,
+                    lookup_in(&tx, &candidate.input_key(&self.model))?,
                     Lookup::Absent
                 )
             {
@@ -98,13 +103,29 @@ impl PhotoJudge {
             .find(|c| c.key(&self.model) == *key)
             .cloned()
     }
-    /// 送る直前・応答後の現在性: 現世代の Disjoint 候補が同じ shortlist で在り、hidden が許可内で、回答が未保存。
+    /// 送る直前の現在性: 現世代の Disjoint 候補が同じ shortlist で在り、hidden が許可内で、回答が未保存。
     fn check(&self, conn: &Connection, wanted: &Candidate) -> Result<(), RunError> {
         let prepared = Prepared::read(conn, &self.config).map_err(scene_error)?;
         let tx = conn.unchecked_transaction().map_err(db_error)?;
         let current = candidate_current(&tx, &prepared, wanted).map_err(db_error)?;
         let current = current.is_some_and(|c| c.sendable())
             && hidden_ok(&tx, &wanted.sent_ids(), self.include_hidden).map_err(db_error)?
+            && matches!(
+                lookup(&tx, &wanted.input_key(&self.model)).map_err(db_error)?,
+                Lookup::Absent
+            );
+        tx.commit().map_err(db_error)?;
+        if current {
+            Ok(())
+        } else {
+            Err(RunError::InputChanged)
+        }
+    }
+    /// 応答後の現在性: 送った入力（写真の ID と世代）が今も同じで、hidden が許可内で、回答が未保存。
+    /// 場面の状態は見ない（有償回答は、場面が一時的に Waiting や Partial になっても履歴に残す）。
+    fn check_input(&self, conn: &Connection, wanted: &Candidate) -> Result<(), RunError> {
+        let tx = conn.unchecked_transaction().map_err(db_error)?;
+        let current = input_current(&tx, wanted, self.include_hidden).map_err(db_error)?
             && matches!(
                 lookup(&tx, &wanted.input_key(&self.model)).map_err(db_error)?,
                 Lookup::Absent
@@ -205,13 +226,20 @@ impl Handler for PhotoJudge {
         })?;
         let verdict = Verdict::parse(reply.json_text(), plan.sent_ids().len())
             .map_err(|_| RunError::Attempt(ErrorCode::BadResponse))?;
-        // 有償の応答を受けた後。追加の外部 I/O（通信）はせず、現在性だけを確かめて保存へ渡す。
-        self.check(ctx.read(), plan.candidate())?;
+        // 有償の応答を受けた後。追加の外部 I/O（通信）はせず、送った入力の現在性だけを確かめて保存へ渡す。
+        self.check_input(ctx.read(), plan.candidate())?;
         self.unchanged(ctx, &plan)?;
-        let prepared = Prepared::read(ctx.read(), &self.config).map_err(scene_error)?;
         let (claimed, now, hidden) = (job.clone(), ctx.now(), self.include_hidden);
         Ok(Box::new(move |tx| {
-            persist(tx, &claimed, &plan, &verdict, &prepared, hidden, now)
+            #[cfg(test)]
+            let started = std::time::Instant::now();
+            let out = persist(tx, &claimed, &plan, &verdict, hidden, now);
+            #[cfg(test)]
+            PERSIST_TIMES
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(started.elapsed());
+            out
         }))
     }
     fn prepare_retry(&self) -> rusqlite::Result<()> {
@@ -233,6 +261,10 @@ impl Handler for PhotoJudge {
         })
     }
 }
+
+/// 試験用: writer の中の `persist` の所要時間（計測の試験が読む）。
+#[cfg(test)]
+static PERSIST_TIMES: Mutex<Vec<std::time::Duration>> = Mutex::new(Vec::new());
 
 #[cfg(test)]
 mod tests;

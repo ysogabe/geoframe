@@ -187,20 +187,46 @@ impl Manifest {
     }
 }
 
-/// 表示用: 現世代の Disjoint の場面に有効な保存済み回答。E6 の表示にだけ使い、フィードの抑止・
-/// 旧選別（`photo_ai_*`）の根拠にはしない。履歴の読取は PK 1 件（返す場面の数だけ）。
-pub(super) fn applied(
-    conn: &rusqlite::Connection,
-    model: &str,
-    group: &Group,
-) -> rusqlite::Result<Option<Saved>> {
-    let Some(candidate) = Candidate::from_group(group).filter(Candidate::sendable) else {
-        return Ok(None);
-    };
-    Ok(match lookup(conn, &candidate.input_key(model))? {
-        Lookup::Reusable(saved) if saved.applies_to(&candidate) => Some(*saved),
-        _ => None,
-    })
+/// 表示に使ってよい回答のモデル。今の設定が photo_judge をクラウド・`allow_cloud` で使っているときだけ
+/// （許可を外した設定では、履歴は消さずに表示にも使わない）。
+pub(super) fn display_model(config: &crate::config::Config) -> Option<&str> {
+    use super::settings::{ProviderKind, TaskKind};
+    if !config.ai.legacy().enabled {
+        return None;
+    }
+    let task = config.ai.settings()?.task(TaskKind::PhotoJudge)?;
+    (task.provider == ProviderKind::Cloud && task.allow_cloud).then_some(task.model.as_str())
+}
+
+/// 表示用の保存済み回答の読み手。履歴の表の存在は開くときに 1 回だけ確かめる。
+pub(super) struct Archive<'a> {
+    conn: &'a rusqlite::Connection,
+    model: &'a str,
+}
+impl<'a> Archive<'a> {
+    /// 表示に使えないとき（設定が許可していない・表が無い）は `None`。
+    pub(super) fn open(
+        conn: &'a rusqlite::Connection,
+        config: &'a crate::config::Config,
+    ) -> rusqlite::Result<Option<Self>> {
+        let Some(model) = display_model(config) else {
+            return Ok(None);
+        };
+        Ok(repository::table_present(conn)?.then_some(Self { conn, model }))
+    }
+    /// 現世代の Disjoint の場面に有効な保存済み回答。E6 の表示と、群の中の代表・並びにだけ使い、
+    /// フィードの抑止・旧選別（`photo_ai_*`）の根拠にはしない。履歴の読取は PK 1 件（返す場面の数だけ）。
+    pub(super) fn applied(&self, group: &Group) -> rusqlite::Result<Option<Saved>> {
+        let Some(candidate) = Candidate::from_group(group).filter(Candidate::sendable) else {
+            return Ok(None);
+        };
+        Ok(
+            match repository::lookup_in(self.conn, &candidate.input_key(self.model))? {
+                Lookup::Reusable(saved) if saved.applies_to(&candidate) => Some(*saved),
+                _ => None,
+            },
+        )
+    }
 }
 
 /// writer 外で用意した 1 枚。画像の入口は RGB から作り直した `PreparedImage` だけ。

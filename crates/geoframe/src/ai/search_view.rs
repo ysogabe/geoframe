@@ -31,6 +31,8 @@ struct Photo {
     scene_representative: bool,
     /// Stored scene position, written into the card only for the groups that are returned.
     scene: Option<SceneMark>,
+    /// The adopted Gemini comparison recommends this photo (set only for the returned disjoint scenes).
+    gemini: bool,
 }
 /// A returned scene's group-level facts (the JSON is built only for returned groups).
 struct SceneGroup<'a> {
@@ -231,7 +233,7 @@ pub fn search(
             if has_active { None } else { legacy_vector(r.get("embedding").ok().flatten(), r.get("embedding_dim").ok().flatten()) }
         });
         let score = if vector.is_some() { new.unwrap().1 } else { card["keep_score"].as_f64().or_else(|| card["quality_score"].as_f64()).unwrap_or_default()/100.0 };
-        Ok(Some(Photo { id, key, card, vector:values, score, scene_rank, scene_representative, scene }))
+        Ok(Some(Photo { id, key, card, vector:values, score, scene_rank, scene_representative, scene, gemini:false }))
     })?;
     let mut photos = rows
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -276,18 +278,34 @@ pub fn search(
         }
     }
     let threshold = config.ai_visual_similarity;
-    // A paid Gemini comparison is shown on the disjoint scenes it was adopted for (information only).
-    let judge_model = config
-        .ai
-        .settings()
-        .and_then(|s| s.task(super::settings::TaskKind::PhotoJudge))
-        .map(|t| t.model.as_str());
+    // A paid Gemini comparison is used on the disjoint scenes it was adopted for: shown, and it picks the
+    // representative and the order inside the group. It never hides a photo or reorders the groups. The
+    // history table is looked up once per request, and only when a returned scene needs it.
+    let mut archive: Option<Option<super::scene_judge::Archive>> = None;
     let mut result = Vec::new();
     for (key, best) in group_order {
         if whole.remaining().is_none() {
             return Ok(Err(Error::Unavailable));
         }
         let mut rows = members.remove(&key).unwrap();
+        let scene = scene_groups.get(&key);
+        let saved = match scene.filter(|s| s.own_meta) {
+            Some(scene) => {
+                if archive.is_none() {
+                    archive = Some(super::scene_judge::Archive::open(conn, config)?);
+                }
+                match archive.as_ref().and_then(Option::as_ref) {
+                    Some(archive) => archive.applied(scene.group)?,
+                    None => None,
+                }
+            }
+            None => None,
+        };
+        if let Some(saved) = &saved {
+            for row in &mut rows {
+                row.gemini = saved.verdict().recommended(saved.position(row.id));
+            }
+        }
         // Python's second stable sort starts from the original database order.
         rows.sort_by_key(|p| p.id);
         rows.sort_by(|a, b| {
@@ -300,6 +318,7 @@ pub fn search(
                         .unwrap_or(false)
                         .cmp(&a.card["recommended"].as_bool().unwrap_or(false))
                 })
+                .then_with(|| b.gemini.cmp(&a.gemini))
                 .then_with(|| b.scene_representative.cmp(&a.scene_representative))
                 .then_with(|| {
                     // Recommended listing follows the scene's own rank; a query keeps its similarity order.
@@ -370,7 +389,6 @@ pub fn search(
                 row.card["scene_overlap"] = json!(mark.overlap);
             }
         }
-        let scene = scene_groups.get(&key);
         let mut group = meta.remove(&*key).unwrap_or_else(|| {
             if scene.is_some_and(|s| s.own_meta) {
                 json!({"kind":"scene","summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null})
@@ -382,10 +400,7 @@ pub fn search(
             group["scene_state"] = json!(scene.state);
             group["scene_overlap"] = json!(scene.overlap);
             group["scene_result_id"] = json!(scene.result_id);
-            if scene.own_meta
-                && let Some(model) = judge_model
-                && let Some(saved) = super::scene_judge::applied(conn, model, scene.group)?
-            {
+            if let Some(saved) = &saved {
                 group["summary"] = json!(saved.verdict().summary());
                 group["same_scene"] = json!(saved.verdict().same_scene());
                 group["judge_model"] = json!(saved.model());

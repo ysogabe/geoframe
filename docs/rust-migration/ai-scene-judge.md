@@ -28,19 +28,42 @@ handlerは`photo_judge`が`provider=cloud`・`allow_cloud=true`・日の上限�
 
 ## 適用（CAS）
 
-応答の受信後（追加の通信なし）に、現在性をもう一度確かめて、`jobs::complete`の短いwriter transactionへ渡す。tx内（`persist`）で次を同時に照合し、一つでも外れれば何も書かずジョブを`obsolete`にする（有償応答は破棄）。
+検査は2つに分ける。**送った入力が今も有効か**（写真ID・世代・hidden・token・未保存）と、**グループの状態が表示に使えるか**（LocalRankedのDisjoint）。前者だけが保存の条件で、後者は読むときに決める。
+
+応答の受信後（追加の通信なし）に、送った入力の現在性（`check_input`。ファイルSHAの再確認を含む）をもう一度確かめて、`jobs::complete`の短いwriter transactionへ渡す。tx内（`persist`）で次を同時に照合し、一つでも外れれば何も書かずジョブを`obsolete`にする（有償応答は破棄）。
 
 1. claim tokenと起動IDが有効（古いtokenの遅延応答は`Rejected`）。
 2. ジョブの鍵が計画と一致。
-3. `Prepared::load_in`（現空間・現処理版・現入力世代・参照）で、**同じshortlist（写真IDと世代）を持つLocalRankedのExactまたはDisjointのグループ**が今も在る。Partialになった・Waitingに戻った・shortlistが変わった・写真が更新/回転/削除された場合は採用しない。
+3. 送った各写真が今もあり、世代（表示ファイル・md5・mtime・向き・撮影時刻・品質解析）が送信時と同じ。写真の回転・更新・削除・解析のやり直しは不採用。
 4. hiddenが許可内。
 5. 同じ`input_key`の回答が未保存（同内容なら成功、異なる内容は書き換えない）。
 
-応答待ちの間にグループの結果ID（shortlist以外の構成員の追加など）だけが変わった場合は、送った画像と世代が同じなので採用する。writer内で画像・ファイル・通信は行わない（応答後のファイルSHA再確認はwriterの外）。
+tx内で読むのは、claim・**送った写真（最大6枚）の行**・履歴1件・ジョブ1件だけで、全写真・全構成員は読まない（`groups::generations_in`）。単一writerを止める時間が写真の数に比例しない。以前は`Prepared::load_in`をtx内で呼び、6500枚で約14ms（下記）だった。
 
-**採用の効果は表示と再利用だけ**。E6の`kind:"scene"`（Disjoint）のグループに、`summary`・`same_scene`・`judge_model`・`judge_source:"gemini"`、各写真に`gemini_recommended`・`gemini_keep_score`を付ける（現世代で、設定中の`photo_judge`モデルの回答のみ。既存キーの意味・並びは変えない）。管理STATUSの`ai_scenes.paid_judgments`は履歴の総数。**フィードの抑止・旧`photo_ai_*`表・`photos`の人手の列は一切変えない**。未判定・Waiting・Partialも抑止の根拠にしない。
+**場面の状態はtxでは見ない**。応答待ちに場面が一時的にWaitingやPartialになっても、送った入力（写真IDと世代）が同じなら有償回答は履歴`ai_scene_judgments`に残す。同じshortlistで場面ができ直せば、鍵が同じなので再課金せず再利用される（`a_paid_answer_survives_the_scene_turning_partial_or_waiting_…`）。表示は今までどおり`applies_to`（現shortlistの写真と世代）とDisjointで照合し直すので、PartialやWaitingの場面には出ない。送る直前（`check`、`run_checked`の毎POST前）は従来どおり全構成員を読んで「Disjointの置換候補が今も在る」ことを確かめ、条件を外れた場面には送らない。
 
-E6の表示用の回答は、場面を読んだ読取transactionを閉じたあとに主キー1件ずつ読む（返す場面の数だけ）。履歴は追記専用で、鍵が場面の構成員・世代そのものから導かれるため、別snapshotで読んでも古い入力の回答を現在の場面に付けることはない（`applies_to`が現在のshortlistの写真と世代を再照合する）。
+応答待ちにグループの結果ID（shortlist以外の構成員の追加など）だけが変わった場合も、送った画像と世代が同じなので採用する。writer内で画像・ファイル・通信は行わない（応答後のファイルSHA再確認はwriterの外）。
+
+**採用の効果は表示と再利用と、群の中の代表・並び**。E6の`kind:"scene"`（Disjoint）のグループに、`summary`・`same_scene`・`judge_model`・`judge_source:"gemini"`、各写真に`gemini_recommended`・`gemini_keep_score`を付ける。さらに、適用できる回答がある場面だけ、群の中の順序を「favorite → recommended → **Geminiの推薦** → 場面の代表 → …」とする（R7。クラスタの代表も並びの先頭から決まる）。`local_representative`・`local_rank`はローカルの値のまま。群どうしの並び（keep_scoreの尺度）・件数・フィードは変えない。
+
+表示に使うのは、**今の設定がphoto_judgeをクラウド・`allow_cloud`で使っていて、モデルが同じとき**の回答だけ（`display_model`。モデルは鍵に含まれる）。許可を外した設定・ローカル設定・別モデル・用途なしでは表示にも並びにも使わず、履歴は消さない。許可を戻せば同じ回答がまた使われる。日の上限0は送信の止めであって表示の許可ではない。管理STATUSの`ai_scenes.paid_judgments`は履歴の総数。**フィードの抑止・旧`photo_ai_*`表・`photos`の人手の列は一切変えない**。未判定・Waiting・Partialも抑止の根拠にしない。
+
+E6の表示用の回答は、場面を読んだ読取transactionを閉じたあとに主キー1件ずつ読む（返す場面の数だけ）。履歴の表の存在は1リクエストで1回だけ確かめる（`Archive::open`。場面を返さなければ0回）。履歴は追記専用で、鍵が場面の構成員・世代そのものから導かれるため、別snapshotで読んでも古い入力の回答を現在の場面に付けることはない。
+
+### 計測（合成・release・LXC前のこの機体の値）
+
+`synthetic_6500_photo_catalog_measures_the_writer_time_of_the_paid_answer_cas`（`#[ignore]`、`--ignored --nocapture`）。場面5つ＋撮影時刻なしの合成写真（品質解析と2次元ベクトルあり）。「全体CAS」は以前のtx内の照合（`Prepared::load_in`で全写真を読む）、「persist」は今のwriter内の`persist`。ベクトルが実物（768次元）より小さいので、全体CASは下限。
+
+| 写真数 | 全体CAS（中央値） | persist（中央値／最大） |
+| --- | --- | --- |
+| 10 | 0.44 ms | 0.065 ms／0.16 ms |
+| 6510 | 13.99 ms | 0.168 ms／0.19 ms |
+
+E6（5つの回答を表示する）は6510枚で 56.7 ms、許可を外して回答を使わない場合は 56.4 ms（差は誤差）。既存の`synthetic_6500x768_read_paths_measure`（履歴なし）の場面の層は、E6 空クエリ 108 ms に対し、場面の表なし 79 ms で約29 ms（前回の約30 msと同等）。
+
+### 周期・予算の試験の範囲
+
+周期の上限は`GEOFRAME_AI_JUDGE_PER_CYCLE`（既定2）。4つの場面が同時に送れる状態でも、1周期のPOSTは上限（2）以下で、窓が進めば残りが順に送られ、全部で1場面1回（`posts_per_cycle_never_exceed_…`）。日の予算1・失敗5回の打切りは`per_post_budget_…`。**送信後の時間切れを有償の試行として数えること、中断3回の扱い**は、この層ではなく共通層の試験で確かめている（`cloud::tests::sent_timeout_is_attempt_and_whole_deadline_includes_auth_and_refresh`、`tests_worker::three_unplanned_interruptions_make_the_job_failed_and_isolate_it`）。
 
 ## 表・移行・停止
 
@@ -52,16 +75,18 @@ E6の表示用の回答は、場面を読んだ読取transactionを閉じたあ�
 
 - 切り戻し: 旧AI表（`photo_ai_*`）には書かない。追加表のあるDBでPythonのfeed/status/`_rebuild_groups`が動き、人手の列・新しい表（`ai_scene_*`・`ai_scene_judgments`）が変化しないことを`the_schema_is_additive_and_python_rollback_*`で確認する（Python3のみ使用、Gemini/モデル呼出しなし）。PythonのAIサイクル全体（Pillow・モデル）はLXCで実行する。
 - prompt本文・`JUDGE_VERSION`・`MAX_JUDGE_ATTEMPTS`・schemaはPythonのAST定数と一致（試験）。生成設定は`temperature 0.1`・`responseMimeType`・`responseJsonSchema`（T4.6a）。
-- 意図差: (1) 画像の前に「Image n」ラベルのtextが入る（T4.6aの`photo_judge`の形。Pythonの`_judge_group`は画像のみ）。(2) 提示順は常に順位順（Pythonは`AI_JUDGE_SHUFFLE_RATE`既定0.2で並べ替える。MT19937の再現は行わない）。(3) 結果は新表に保存し、旧`photo_ai_groups/features`へ投影しない。(4) 送信集合の鍵に世代を含み、Pythonのgroup_id（shortlistのcontent SHA）とは一致しない。
+- 意図差: (1) 画像の前に「Image n」ラベルのtextが入る（T4.6aの`photo_judge`の形。Pythonの`_judge_group`は画像のみ）。(2) 提示順は常に順位順（Pythonは`AI_JUDGE_SHUFFLE_RATE`既定0.2で並べ替える。MT19937の再現は行わない）。(3) 結果は新表に保存し、旧`photo_ai_groups/features`へ投影しない。(4) 送信集合の鍵に世代を含み、Pythonのgroup_id（shortlistのcontent SHA）とは一致しない。(5) `Verdict::parse`は同じ写真番号が重複した応答を拒否する（Pythonの`{item["index"]: item}`は後の値で上書きする）。
 
 ## 管理者が判断する点
 
 1. **Disjointの比較結果でフィードの抑止を有効にするか**（既定は無効）。有効にするには、検証済みの結果を旧`photo_ai_groups/members/features`へPython互換の形で投影し、既存の選別SQL（代表が存在する場合だけ非推薦を抑止、favorite免除）に載せる処理が要る。投影は旧表への書込みとPython側の再構築との競合を伴うため、今回は実装していない。
 2. **Exact（旧Python判定が有効）の再比較**。既定は再課金しない。再比較には旧判定の由来の根拠（prompt・回転・送信集合）か、費用を許容する判断が要る。
 3. **Partialの扱い**。管理確認のまま。解消方針（旧選別の置換、片方の無効化）は未決定。
-4. **shuffle率・Image nラベル**。Pythonとの完全一致が要るなら別途。
+4. **shuffle率・Image nラベル**。Pythonとの完全一致が要るなら別途。また、順位順だけの提示（Pythonは20%を並べ替える）はImage 1（ローカル順位1位）への偏りを生むおそれがある。**実際のAPIで、推薦がImage 1に偏っていないかを確かめる点**として残す（試験のスタブでは確かめられない。確かめるときは、同じ場面で提示順を入れ替えた比較で推薦が写真に付いてくるかを見る）。
 5. 実クラウド送信の許可・費用・上限値（`daily_request_limit`・`GEOFRAME_AI_JUDGE_PER_CYCLE`）はこの実装で追加していない。
 
 ## 試験
 
-`ai::scene_judge`の専用20件: domain/固定定数/応答検査/保存の読み戻し/鍵の性質/request形/migration（`tests.rs`）、loopbackスタブ+合成写真+実worker/Core（`runtime/tests.rs`）。未許可の4通り（許可なし・日の上限0・用途なし・ローカル設定）でスタブ受信0・表なし・ローカルのグループは作られる、許可時のEXIF/GPS(canary)除去・6枚上限・生成設定・一次列不変、再利用（周期・再起動・他用途/上限の設定変更で再送0、モデル変更で再比較）、日の予算1と失敗上限5（POST数と`ai_request_usage`）、Exact/Partial/Waiting/hidden/単独は送らない、応答中の回転・削除・hidden・md5・ファイル差替えとPartial化は不採用、トークン段階の失敗→許可を外す→戻す、停止（claim前0・送信中の応答は確定）、破損履歴は再課金せず、Python切り戻し、E6表示と抑止なし。
+`ai::scene_judge`の専用25件＋計測1件（`#[ignore]`）。domain 7件: 固定定数/応答検査/保存の読み戻し/鍵の性質/request形/migration（`tests.rs`）。loopbackスタブ+合成写真+実worker/Core 18件（`runtime/tests.rs`）: 未許可の4通り（許可なし・日の上限0・用途なし・ローカル設定）でスタブ受信0・表なし・ローカルのグループは作られる、許可時のEXIF/GPS(canary)除去・6枚上限・生成設定・一次列不変、再利用（周期・再起動・他用途/上限の設定変更で再送0、モデル変更で再比較）、日の予算1・失敗上限5・周期上限（POSTと`ai_request_usage`）、Exact/Partial/Waiting/hidden/単独は送らない、応答中の回転・削除・hidden・md5・ファイル差替えは不採用、応答中にPartial/Waitingになっても履歴に残り場面ができ直すと再課金なしで再利用、トークン段階の失敗→許可を外す→戻す、停止（claim前0・送信中の応答は確定）、破損履歴は再課金せず、Python切り戻し、E6表示と抑止なし、Geminiの推薦による群の中の代表・並び（群どうしの並び・フィード不変、favoriteが先）、設定が許可しているときだけ表示（許可なし・ローカル・別モデル・用途なしでは表示せず履歴は残る）、履歴の表の確認が返す場面の数に比例しない。
+
+LXCで実行する試験: PythonのAIサイクル全体（Pillow・モデル）を含む切り戻し、`synthetic_6500x768_read_paths_measure`と上記の計測の再測定（本番相当の機材）。
