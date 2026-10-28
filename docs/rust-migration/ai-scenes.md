@@ -231,6 +231,10 @@ T4.5aの3表を`ai::pending_active/migrate_active`へ接続した。引数は従
 
 検証（3回目の修正）: `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`git diff --check` は成功。`cargo test --workspace`（`RUST_TEST_THREADS=4`）は28 group、**1244成功 / 失敗0 / ignore4**（ignoreは既存2＋計測2: 読み取り経路とWaiting多数のwriter時間）。新しい試験は7件。musl release試験バイナリ（`cargo test --release --target x86_64-unknown-linux-musl --no-run -p geoframe`）はビルド成功。
 
+**既知の境界（4回目のレビューの記録）。**
+- 撮影時刻が壊れた写真だけでできたWaitingは、waitingの件数（助言値）に残り続ける。`local_ranked`・E6・フィードには影響しない。
+- `pending_retire`は、外す候補1件ごとに主キーのSELECTを1文出す。空間の切替直後は、候補の数に比例して読みが増える（writerは呼ばない）。別の空間の参照は外さず、その空間へ戻れば元の結果がそのまま現在になる（`references_kept_while_another_space_is_active_are_not_retired_and_return_with_their_space`、`a_plan_of_one_space_retires_nothing_once_another_space_is_active`）。
+
 ### 読み取りの重さ（2回目のレビュー時の計測。場面の層以外の「既知の重さ」は ai-search.md）
 
 6,500写真×768次元・場面2,500件（1,000場面×5枚＋1,500単独。旧選別の厳密20/部分20）の合成DBで、同じ4経路＋管理の写真一覧を、(a)場面を保存した、(b)場面の3表は在るが空、(c)3表が無い、の3条件で測り、(a)と(b)/(c)の差を場面の層が足す時間とした。release、20回の中央値、この機体（CPU 16）。musl版（本番と同じ静的リンクの試験バイナリ）3回と、参考のglibc版1回。

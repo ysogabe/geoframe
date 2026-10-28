@@ -2729,6 +2729,91 @@ fn references_of_other_spaces_or_options_are_not_retired() {
 }
 
 #[test]
+fn references_kept_while_another_space_is_active_are_not_retired_and_return_with_their_space() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(references(&e), 2);
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 1);
+    let tables = e.scene_tables();
+    // Another space becomes active; it has no vector yet, so the photos are not ready there.
+    let other = SpaceIdentity::new(
+        "scene-b",
+        "shared-b",
+        "model-b",
+        "rev-b",
+        "img-b",
+        "txt-b",
+        2,
+        Normalization::Raw,
+    )
+    .unwrap();
+    activate(&mut e.conn, &other);
+    // The plan does see references that belong to no component of this space...
+    let snap = snapshot(&e.conn).unwrap().unwrap();
+    let plan_b = compute(
+        &snap,
+        Options::default(),
+        Err(rank::Reason::Unconfigured),
+        &|| false,
+    )
+    .unwrap();
+    assert_eq!(plan_b.retire_len(), 2);
+    // ...but they are the stored result of the first space: nothing is retired, nothing is written.
+    assert_eq!(pending_retire(&e.conn, &plan_b).unwrap(), 0);
+    for _ in 0..3 {
+        let report = e.report();
+        assert_eq!((report.stored, report.selected, report.retired), (0, 0, 0));
+        assert_eq!(report.writer_save, std::time::Duration::ZERO);
+        assert_eq!(e.scene_tables(), tables);
+        assert_eq!(references(&e), 2);
+    }
+    // Back to the first space: the same stored result is current again, with no cycle needed to rebuild.
+    activate(&mut e.conn, &identity(2));
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 1);
+    assert_eq!(scene_marks(&e.view()), 2);
+    let report = e.report();
+    assert_eq!((report.stored, report.selected, report.retired), (0, 0, 0));
+    assert_eq!(e.scene_tables(), tables);
+}
+
+#[test]
+fn a_plan_of_one_space_retires_nothing_once_another_space_is_active() {
+    let mut c = pair();
+    let first = plan(&c);
+    assert_eq!(save(&mut c, &first, 0, &|| false).unwrap(), Saved::Stored);
+    c.execute(
+        "DELETE FROM ai_embedding_vectors WHERE input_sha256=?1",
+        [sha_hex(2)],
+    )
+    .unwrap();
+    let stale = plan(&c);
+    assert_eq!(pending_retire(&c, &stale).unwrap(), 1);
+    // The active space is switched between the plan and the writer: the plan is not this space's to apply.
+    let other = SpaceIdentity::new(
+        "scene-b",
+        "shared-b",
+        "model-b",
+        "rev-b",
+        "img-b",
+        "txt-b",
+        2,
+        Normalization::Raw,
+    )
+    .unwrap();
+    activate(&mut c, &other);
+    let tables = ["ai_scene_groups", "ai_scene_members", "ai_scene_active"].map(|t| rows(&c, t));
+    let (saved, retired) = save_batch_counted(&mut c, &stale, &[], &|| false).unwrap();
+    assert!(saved.is_empty());
+    assert_eq!(retired, 0);
+    assert_eq!(
+        ["ai_scene_groups", "ai_scene_members", "ai_scene_active"].map(|t| rows(&c, t)),
+        tables
+    );
+}
+
+#[test]
 fn a_sixteen_column_scene_table_makes_the_status_unavailable_and_hides_the_admin_counts() {
     let mut e = LocalEnv::new(&[]);
     ready(&mut e.conn, 1, 0);

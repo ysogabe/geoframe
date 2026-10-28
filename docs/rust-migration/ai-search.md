@@ -94,4 +94,14 @@ pipelineは `index_state`（no_tables/unset/unusable/active）、`query_compatib
 | 管理STATUSの品質・件数の集計 | 管理STATUS | 合計約7ms | 品質の集計と写真の件数。1文あたり約1ms |
 | E5 statusの旧集計（`COUNT(DISTINCT content_sha256)`等） | E5 | 合計約8ms | 旧特徴量・旧選別の件数。`index::status_in` の他の文（約3ms）を含まない |
 
-合計は、E5 status 約47ms（場面あり約51ms）、管理STATUS 約7ms（場面あり約11.5ms）、E6 約101ms（場面あり約131ms）。この修正前は管理STATUSとE5が約310〜430ms（場面の層の件数の `GROUP BY` が約250ms以上）だった。残る大きい塊は、E5・E6がともに全vector BLOBを毎回読んで検査していること（約40〜48ms）と、E6の全写真のcard組立て（約40ms）。直すには、検査済みの結果の保持（要invalidation）や検索の並びと切り出しの段階的な読みが要り、T4.5bの範囲外。
+合計は、E5 status 約47ms（場面あり55.5ms）、管理STATUS 約7ms（場面あり16.3ms）、E6 約101ms（場面あり約131ms）。この修正前は管理STATUSとE5が約310〜430ms（場面の層の件数の `GROUP BY` が約250ms以上）だった。残る大きい塊は、E5・E6がともに全vector BLOBを毎回読んで検査していること（約40〜48ms）と、E6の全写真のcard組立て（約40ms）。直すには、検査済みの結果の保持（要invalidation）や検索の並びと切り出しの段階的な読みが要り、T4.5bの範囲外。
+
+場面の層を含む値は、3回目の修正後の再計測（E5 55.5ms・管理STATUS 16.3ms は上と同じ、この機体・musl・20回の中央値）。同じ測定を、検証環境（CPU 2つ）でも1回測った。
+
+| 経路 | 場面あり | 3表が空 |
+| --- | --- | --- |
+| E6 空 query | 381ms | 295ms |
+| E6 意味検索 | 384ms | 297ms |
+| E5 status | 170ms | 155ms |
+| 管理 STATUS | 39ms | 18ms |
+| 管理の写真一覧 | 2.8ms | 2.5ms |
