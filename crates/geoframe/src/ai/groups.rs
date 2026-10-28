@@ -7,8 +7,8 @@ use crate::quality::{Metrics, rank_scores};
 
 mod repository;
 pub use repository::{
-    Loaded, Saved, load_current, load_current_in, migrate, pending, pending_saves, save,
-    save_batch, snapshot,
+    Annotation, Loaded, Saved, load_current, load_current_in, migrate, pending, pending_saves,
+    save, save_batch, snapshot,
 };
 pub mod runtime;
 #[cfg(test)]
@@ -19,6 +19,8 @@ pub enum Error {
     InvalidOptions,
     Database,
     CorruptResult,
+    /// The bounded wait for the single writer expired; nothing was saved by this cycle.
+    WriterBusy,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -67,6 +69,25 @@ impl Options {
             "quality-rank-v1:linear-v1",
             weight_digest.unwrap_or("rules"),
         ])
+    }
+    /// Processor of a component that a present weight could not score (fixed-rule fallback). The
+    /// weight digest is part of the version, so a changed weight never accepts the old fallback.
+    pub fn fallback_processor_version(&self, identity: &SpaceIdentity, digest: &str) -> String {
+        self.processor_version(identity, Some(&format!("fallback:{digest}")))
+    }
+    /// The processor a stored component must carry for the ranking it used.
+    pub(crate) fn group_processor_version(
+        &self,
+        identity: &SpaceIdentity,
+        rank_used: RankUsed,
+        weight_digest: Option<&str>,
+    ) -> String {
+        match (rank_used, weight_digest) {
+            (RankUsed::Fallback(_), Some(digest)) => {
+                self.fallback_processor_version(identity, digest)
+            }
+            _ => self.processor_version(identity, weight_digest),
+        }
     }
 }
 impl Default for Options {
@@ -203,8 +224,13 @@ impl Overlap {
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RankUsed {
+    /// No usable weight at all (fixed rules for every component).
     Rules(Option<rank::Reason>),
+    /// A verified weight scored this component.
     Linear,
+    /// A verified weight exists but could not score this component (fixed-rule fallback). The
+    /// weight digest is recorded, so reads accept it only while that same weight is installed.
+    Fallback(rank::Reason),
 }
 
 #[derive(Clone, PartialEq)]
@@ -269,6 +295,9 @@ pub struct Group {
     lo: i64,
     hi: i64,
     guard: String,
+    /// Digest of the vectors the result was computed from. Checked by the writer's CAS only;
+    /// read paths never load vector BLOBs, so a changed vector is replanned by the next cycle.
+    vector_guard: String,
     weight_digest: Option<String>,
     expected_active: String,
 }
@@ -432,13 +461,20 @@ pub fn compute(
                     .collect();
                 match model.scores(&snapshot.identity, &inputs) {
                     Ok(scores) => (scores, RankUsed::Linear, Some(model.digest().to_string())),
-                    Err(reason) => (rank_scores(&metrics), RankUsed::Rules(Some(reason)), None),
+                    Err(reason) => (
+                        rank_scores(&metrics),
+                        RankUsed::Fallback(reason),
+                        Some(model.digest().to_string()),
+                    ),
                 }
             }
             Err(reason) => (rank_scores(&metrics), RankUsed::Rules(Some(reason)), None),
         };
-        let processor_version =
-            options.processor_version(&snapshot.identity, weight_digest.as_deref());
+        let processor_version = options.group_processor_version(
+            &snapshot.identity,
+            rank_used,
+            weight_digest.as_deref(),
+        );
         let input_generation = fingerprint(
             &bucket
                 .iter()
@@ -487,6 +523,7 @@ pub fn compute(
             lo,
             hi,
             guard: snapshot.raw.guard(lo, hi),
+            vector_guard: snapshot.raw.vector_guard(lo, hi),
             expected_active: snapshot.raw.pointer_guard(&ids),
             weight_digest,
         });

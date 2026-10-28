@@ -1,6 +1,10 @@
 //! Local scene scheduling is independent of Provider routing, discovery, lanes and paid budgets.
 use super::{rank, *};
-use crate::{config::Config, stop::StopFlag, writer::Writer};
+use crate::{
+    config::Config,
+    stop::StopFlag,
+    writer::{WriteError, Writer},
+};
 use rusqlite::Connection;
 use std::{
     sync::Arc,
@@ -103,7 +107,10 @@ impl Runtime {
                 });
                 Ok((result, began.duration_since(queued), began.elapsed()))
             })
-            .map_err(|_| Error::Database)?;
+            .map_err(|e| match e {
+                WriteError::Expired => Error::WriterBusy,
+                _ => Error::Database,
+            })?;
         report.stored = result
             .0?
             .into_iter()
@@ -117,112 +124,108 @@ impl Runtime {
 
 /// Rank-file I/O occurs before entering the API read transaction. The identity is compared
 /// again inside that transaction: a concurrent space switch cannot use these processors.
+///
+/// Read paths never recompute a ranking. Whether a stored component used the installed weight,
+/// or is a fixed-rule fallback of that same weight, is decided by the cycle and recorded in the
+/// component's processor version (the weight digest is part of it); a changed or removed weight
+/// therefore stops matching until the next cycle replaces the result.
 pub struct Prepared {
     identity: Option<SpaceIdentity>,
     processors: Vec<String>,
-    fallback: Option<std::collections::HashMap<String, String>>,
 }
 impl Prepared {
     pub fn read(conn: &Connection, config: &Config) -> Result<Self, Error> {
         let identity = crate::ai::index::active_in(conn)?.1;
         let mut processors = Vec::new();
-        let mut fallback = None;
         if config.ai.invalid().is_none()
             && let Some(identity) = &identity
         {
-            let model = rank::Model::load(&config.rank_model_path, identity);
-            processors.push(
-                config
-                    .ai
-                    .scene_options()
-                    .processor_version(identity, model.as_ref().ok().map(|m| m.digest())),
-            );
-            if let Ok(model) = &model {
-                let rules = config.ai.scene_options().processor_version(identity, None);
-                // A model may fall back for one component. Verify that fallback with current
-                // immutable inputs outside any transaction; never accept an old rules result
-                // merely because its processor predates the newly installed weight.
-                let tx = conn.unchecked_transaction()?;
-                let candidates = super::repository::load_projection_in(&tx, &[&rules], true)?;
-                tx.commit()?;
-                let mut allowed = std::collections::HashMap::new();
-                if !candidates.groups().is_empty()
-                    && let Some(snapshot) = snapshot(conn)?
-                {
-                    let photos: std::collections::HashMap<_, _> =
-                        snapshot.photos.iter().map(|p| (p.id, p)).collect();
-                    for group in candidates.groups() {
-                        if snapshot.identity() != identity
-                            || snapshot.raw.guard(group.lo, group.hi) != group.guard
-                        {
-                            continue;
-                        }
-                        let inputs: Option<Vec<_>> = group
-                            .members()
-                            .iter()
-                            .map(|m| {
-                                let p = photos.get(&m.photo_id)?;
-                                Some((p.metrics?, p.vector.as_ref()?.as_slice()))
-                            })
-                            .collect();
-                        if let Some(inputs) = inputs
-                            && let Err(reason) = model.scores(identity, &inputs)
-                            && group.rank_used() == RankUsed::Rules(Some(reason))
-                        {
-                            allowed.insert(group.result_id.clone(), group.guard.clone());
-                        }
-                    }
+            let options = config.ai.scene_options();
+            match rank::Model::load(&config.rank_model_path, identity) {
+                Ok(model) => {
+                    processors.push(options.processor_version(identity, Some(model.digest())));
+                    processors.push(options.fallback_processor_version(identity, model.digest()));
                 }
-                processors.push(rules);
-                fallback = Some(allowed);
+                Err(_) => processors.push(options.processor_version(identity, None)),
             }
         }
         Ok(Self {
             identity,
             processors,
-            fallback,
         })
     }
+    fn processors(&self) -> Vec<&str> {
+        self.processors.iter().map(String::as_str).collect()
+    }
+    /// Validated projection (per-component input guard). Used by the search view.
     pub fn load_in(&self, conn: &Connection) -> Result<Loaded, Error> {
-        let mut loaded = super::repository::load_projection_in(
-            conn,
-            &self
-                .processors
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            true,
-        )?;
+        let loaded = super::repository::load_projection_in(conn, &self.processors(), true)?;
         if loaded.identity() != self.identity.as_ref() {
             return Ok(Loaded {
                 identity: loaded.identity,
                 groups: Vec::new(),
             });
         }
-        if let Some(allowed) = &self.fallback {
-            loaded.groups.retain(|g| {
-                matches!(g.rank_used(), RankUsed::Linear)
-                    || allowed.get(g.result_id()) == Some(&g.guard)
-            });
-        }
         Ok(loaded)
+    }
+    /// Counts from the stored headers only (status views).
+    pub fn summary_in(&self, conn: &Connection) -> serde_json::Value {
+        let counts = super::repository::header_counts_in(conn, &self.processors());
+        summary(counts.as_ref().map_err(|e| *e), self.identity.as_ref())
+    }
+    /// Stored positions of one page of photos (management list).
+    pub fn annotations_in(
+        &self,
+        conn: &Connection,
+        ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, Annotation>, Error> {
+        let (identity, found) = super::repository::annotations_in(conn, &self.processors(), ids)?;
+        Ok(if identity == self.identity {
+            found
+        } else {
+            Default::default()
+        })
+    }
+}
+
+/// Status counts for a prepared (or failed-to-prepare) read.
+pub fn status_summary(prepared: &Result<Prepared, Error>, conn: &Connection) -> serde_json::Value {
+    match prepared {
+        Ok(prepared) => prepared.summary_in(conn),
+        Err(_) => summary(Err(Error::Database), None),
     }
 }
 
 /// Fixed codes and counts only; local ranking never increments paid-judgment counts.
-pub fn summary(loaded: Result<&Loaded, &Error>) -> serde_json::Value {
-    let Ok(loaded) = loaded else {
+/// A space switched after `Prepared::read` yields zero counts, as for the validated projection.
+fn summary(
+    counts: Result<&super::repository::HeaderCounts, Error>,
+    prepared: Option<&SpaceIdentity>,
+) -> serde_json::Value {
+    let Ok((identity, groups)) = counts else {
         return serde_json::json!({"state":"unavailable","local_ranked":0,"waiting":0,"review_overlap":0,"rules":0,"linear":0});
     };
-    let count = |state| {
-        loaded
-            .groups()
-            .iter()
-            .filter(|g| g.state() == state)
-            .count()
+    let groups: &[(State, RankUsed, i64)] = if identity.as_ref() == prepared {
+        groups
+    } else {
+        &[]
     };
-    serde_json::json!({"state":if loaded.identity().is_some(){"active"}else{"no_index"},
+    let count = |state| {
+        groups
+            .iter()
+            .filter(|g| g.0 == state)
+            .map(|g| g.2)
+            .sum::<i64>()
+    };
+    let by_rank = |rank: fn(&RankUsed) -> bool| {
+        groups
+            .iter()
+            .filter(|g| rank(&g.1))
+            .map(|g| g.2)
+            .sum::<i64>()
+    };
+    serde_json::json!({"state":if identity.is_some(){"active"}else{"no_index"},
         "local_ranked":count(State::LocalRanked),"waiting":count(State::Waiting),"review_overlap":count(State::ReviewOverlap),
-        "rules":loaded.groups().iter().filter(|g| matches!(g.rank_used(),RankUsed::Rules(_))).count(),
-        "linear":loaded.groups().iter().filter(|g| g.rank_used()==RankUsed::Linear).count()})
+        "rules":by_rank(|r| matches!(r,RankUsed::Rules(_)|RankUsed::Fallback(_))),
+        "linear":by_rank(|r| *r==RankUsed::Linear)})
 }

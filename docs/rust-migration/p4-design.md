@@ -36,7 +36,7 @@ P4を実装順に前半・後半へ分け、フェーズとしてのPRは1つの
 - 構造: `local_base_url`、サービスID、`tasks`（`image_embedding`、`query_embedding`、`photo_judge`、`location_clue`、`location_suggest`）ごとの`provider/model/allow_cloud/daily_request_limit`、接続契約確定後の`embedding_space`。秘密はファイル内に埋めず認証ファイルのパスを指定する。
 - `allow_cloud`の既定false。`provider=cloud`でも許可が無ければその用途はpolicy_disabled。画像と検索語の許可は独立。`location_clue`はLANのDecisionに限定する。
 - `GEOFRAME_EMBED_BACKEND=local`はRustで推論エンジンを起動する意味にしない。旧設定値は旧データの表示用識別にだけ使い、新規呼び出しには明示したroutingを使う。廃止するCPUモデル用設定は文書化する。
-- AIワーカー: `GEOFRAME_INGEST=1 && GEOFRAME_AI_ENABLED=1 && 有効な用途あり`の時だけ起動。`Ingest.writer`と`LockHold`を共有する。読み取り専用起動でテーブル作成・job回収・結果保存を行わない。writerが無い起動ではクラウドのquery_embeddingもpolicy_disabled（定型503）とし、予算を迂回して送らない。LANの文Embeddingと適合するメモリキャッシュの利用は許す。
+- AIワーカー: `GEOFRAME_INGEST=1 && GEOFRAME_AI_ENABLED=1 && AI設定が不正でない`時に起動する。Provider用途の有無とは独立に、保存済みvectorだけを使う同一場面の局所計算スレッド（`ai-scenes`）が動き、Providerのジョブ周期（`ai-worker`）は有効な背景用途があるときだけ仕事をする。`INGEST=1`なら`AI_ENABLED=0`・設定不正でも、起動時のjob回収とProvider停止の整理（設定が有効なときだけ）は行う。`Ingest.writer`と`LockHold`を共有する。読み取り専用起動でテーブル作成・job回収・結果保存を行わない。writerが無い起動ではクラウドのquery_embeddingもpolicy_disabled（定型503）とし、予算を迂回して送らない。LANの文Embeddingと適合するメモリキャッシュの利用は許す。
 - 設定変更は再起動で適用する。設定ハッシュと用途のポリシー版は送信可否の検査・監査用に保持するが、結果の冪等キーには入れない。実際の送信前に現在の設定を再評価し、結果確定時は結果のモデル・処理版と入力世代を照合する。タイムアウト・URL・別用途の許可だけを変えても成功結果を再送しない。
 
 既存ランクモデルは`GEOFRAME_RANK_MODEL`を維持。既存JSON形式をサイズ・数値範囲・有限数で検証し、未配置なら既存の固定式を使う。不正な明示ファイルは定型エラーで検知し、ユーザーの重みを黙って別の意味へ読み替えない。

@@ -1039,7 +1039,7 @@ fn serve_with_ingest_and_a_valid_ai_config_records_its_run_and_the_stop_and_exit
         assert!(!stdout.contains(secret), "{secret}\n{stdout}");
     }
 
-    // Provider設定が無くても、保存vectorのためローカル周期は起動する
+    // AI の設定ファイルが無くても、保存済み vector だけで動く同一場面の局所計算のために、ワーカーは起動する
     let dir = Dir::new("serve-ai-off");
     let data = dir.0.join("d");
     let port = free_port();
@@ -1061,12 +1061,13 @@ fn serve_with_ingest_and_a_valid_ai_config_records_its_run_and_the_stop_and_exit
     let (status, stdout) = terminate(child);
     assert!(status.success());
     assert!(!stdout.contains("背景ワーカーを起動します"));
+    // AI を無効にしても、起動時の回収（起動 ID の行）は行う。ワーカー（局所計算を含む）は起動しない
     let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
     assert_eq!(
         conn.query_row("SELECT COUNT(*) FROM ai_worker_runs", [], |r| r
             .get::<_, i64>(0))
             .unwrap(),
-        0
+        1
     );
     assert_eq!(
         conn.query_row(

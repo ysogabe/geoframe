@@ -6,11 +6,17 @@
 //!
 //! # 起動の条件
 //!
-//! `GEOFRAME_INGEST=1` かつ `GEOFRAME_AI_ENABLED=1` かつ有効な背景用途が 1 つ以上（[`should_start`]）。
+//! `GEOFRAME_INGEST=1` かつ `GEOFRAME_AI_ENABLED=1` かつ AI の設定が不正でない（[`should_start`]）。
+//! 起動するスレッドは 2 種類で、どちらも Provider や外部 I/O を使わない順に独立している:
+//! - `ai-scenes`: 同一場面の局所計算（[`super::groups::runtime`]）。保存済みの画像 vector だけを使い、
+//!   Provider の設定・用途の有無に関係なく動く。
+//! - `ai-worker`: 有効な背景用途（Provider 経由のジョブ）の周期。背景用途が 0 件なら周期は何もしない。
+//!
 //! `query_embedding` は利用者を待たせる対話の用途で、永続キューの背景ジョブではない。`INGEST=0` では
 //! 何も起動せず、AI の表を作らず、ジョブの回収も Provider 停止の整理もしない（読み取り専用）。
 //!
-//! 起動時の準備（[`startup`]。ロックを取ったあと・`INGEST=1` のときだけ、ワーカーが無効でも）:
+//! 起動時の準備（[`startup`]。ロックを取ったあと・`INGEST=1` のときだけ、ワーカーが無効
+//! （`GEOFRAME_AI_ENABLED=0` を含む）でも）:
 //! 1. 前の起動の `running` を回収する（[`super::runs::startup`]）。停止開始が記録された起動のものは数えず
 //!    `deferred/shutdown`、それ以外（`SIGKILL`・クラッシュ）は `interruption_count` を加算して 3 回で `failed`。
 //! 2. AI の設定が**有効**なときだけ、関係する設定が変わって効かなくなった Provider 停止を整理する
@@ -411,9 +417,6 @@ impl std::fmt::Debug for Started {
 /// 起動の準備。**ロックを取ったあと**（[`crate::ingest::start`] のあと）に 1 回だけ呼ぶ。失敗したら
 /// ワーカーを起動しない（`None`）。件数だけをログに出す。
 pub fn startup(config: &Config, writer: &Writer, clock: &Clock) -> Option<Started> {
-    if !config.ingest || !config.ai.legacy().enabled {
-        return None;
-    }
     let run_id = match jobs::random_id() {
         Ok(id) => id,
         Err(_) => {
@@ -1058,10 +1061,15 @@ pub fn spawn(deps: WorkerDeps) -> AiWorker {
                             break;
                         }
                         if catch_unwind(AssertUnwindSafe(|| {
-                            if let Ok(read) = crate::db::open_read_only(&config.db_path())
-                                && runtime.cycle(&read, &writer, &stop).is_err()
-                            {
-                                tracing::warn!("[ai] scene_cycle_failed");
+                            if let Ok(read) = crate::db::open_read_only(&config.db_path()) {
+                                match runtime.cycle(&read, &writer, &stop) {
+                                    Ok(_) => {}
+                                    // 書き込みの順番待ちが期限を過ぎただけ（混雑）。次の周期にやり直す
+                                    Err(super::groups::Error::WriterBusy) => {
+                                        tracing::warn!("[ai] scene_writer_busy")
+                                    }
+                                    Err(_) => tracing::warn!("[ai] scene_cycle_failed"),
+                                }
                             }
                         }))
                         .is_err()

@@ -1075,6 +1075,42 @@ fn a_run_with_a_recorded_stop_is_reclaimed_without_counting_an_interruption() {
 }
 
 #[test]
+fn startup_reclaims_running_jobs_even_when_ai_is_disabled_but_never_starts_the_worker() {
+    let e = env("reclaim-ai-off");
+    let writer = e.writer();
+    // AI が有効だった前の起動が、claim 済みのまま落ちた（SIGKILL・クラッシュ）
+    let first = startup(&e.config, &writer, &e.clock()).unwrap();
+    e.enqueue(&key(JobKind::LocationClue, "c"));
+    let id = first.run_id.clone();
+    writer
+        .call(move |c| jobs::claim_next(c, T0, &id, "tok", &[JobKind::LocationClue]))
+        .unwrap()
+        .expect("claim できる");
+    // 同じデータで AI を無効に戻して起動する
+    let mut vars = HashMap::new();
+    vars.insert("GEOFRAME_INGEST".to_string(), "1".to_string());
+    vars.insert("GEOFRAME_AI_ENABLED".to_string(), "0".to_string());
+    let off = Config::load(
+        |k| vars.get(k).cloned(),
+        &Overrides {
+            listen: None,
+            data_dir: Some(e.config.data_dir.clone()),
+        },
+    )
+    .unwrap();
+    assert!(!should_start(&off));
+    e.set_clock(T0 + 100);
+    let second = startup(&off, &writer, &e.clock()).expect("無効でも回収は行う");
+    assert_ne!(first.run_id, second.run_id);
+    let row = e.row(JobKind::LocationClue, "c").unwrap();
+    assert_eq!(
+        (row.state, row.interruptions, row.has_token),
+        (JobState::Pending, 1, false),
+        "running が残り続けない（中断として数える）"
+    );
+}
+
+#[test]
 fn three_unplanned_interruptions_make_the_job_failed_and_isolate_it() {
     let e = env("reclaim-sigkill");
     let writer = e.writer();

@@ -12,6 +12,8 @@ use crate::ai::space;
 use crate::ai::{index, jobs, settings::fingerprint};
 
 const TABLES: &[&str] = &["ai_scene_groups", "ai_scene_members", "ai_scene_active"];
+/// Columns of `ai_scene_groups` in table order.
+const HEADER_COLUMNS: usize = 17;
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS ai_scene_groups(
  result_id TEXT PRIMARY KEY, space_id TEXT NOT NULL, space_fingerprint TEXT NOT NULL,
@@ -19,7 +21,8 @@ CREATE TABLE IF NOT EXISTS ai_scene_groups(
  window_s INTEGER NOT NULL, similarity REAL NOT NULL, shortlist INTEGER NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('waiting','local_ranked','review_overlap')),
  overlap TEXT NOT NULL, rank_used TEXT NOT NULL, weight_digest TEXT,
- lo INTEGER NOT NULL, hi INTEGER NOT NULL, input_guard TEXT NOT NULL, legacy_json TEXT NOT NULL
+ lo INTEGER NOT NULL, hi INTEGER NOT NULL, input_guard TEXT NOT NULL, legacy_json TEXT NOT NULL,
+ vector_guard TEXT NOT NULL
 ) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS ai_scene_members(
  result_id TEXT NOT NULL REFERENCES ai_scene_groups(result_id), photo_id INTEGER NOT NULL,
@@ -162,6 +165,8 @@ pub(super) struct Raw {
     legacy_by_id: HashMap<i64, Vec<usize>>,
     pointers: HashMap<String, BTreeSet<i64>>,
     vectors: HashMap<String, Vector>,
+    /// Vector BLOBs are loaded only for the cycle's snapshot and the writer's CAS.
+    with_vectors: bool,
     failed: BTreeMap<(String, String), String>,
     generations: HashMap<String, String>,
     legacy: Vec<Legacy>,
@@ -195,12 +200,6 @@ impl Raw {
         parts.extend(rows.iter().map(|r| r.digest.clone()));
         for sha in shas {
             parts.push(sha.into());
-            parts.push(
-                self.vectors
-                    .get(sha)
-                    .map_or("missing", |v| &v.digest)
-                    .into(),
-            );
             // All duplicate generations, including those outside this time interval, affect failed classification.
             parts.push(self.generations.get(sha).cloned().unwrap_or_default());
             let target = index::image_embedding_key(&self.identity, sha).target_key;
@@ -215,6 +214,22 @@ impl Raw {
             parts.push(self.legacy[i].origin.digest.clone());
         }
         fingerprint(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+    }
+    /// Digest of the vector BLOBs of the same interval. Only meaningful when the vectors were loaded
+    /// (the cycle and the writer); read paths validate with [`Raw::guard`] alone.
+    pub(super) fn vector_guard(&self, lo: i64, hi: i64) -> String {
+        debug_assert!(self.with_vectors);
+        let shas: BTreeSet<_> = self
+            .timed
+            .range(lo..=hi)
+            .flat_map(|(_, indexes)| indexes.iter().filter_map(|i| self.rows[*i].sha()))
+            .collect();
+        let mut parts = vec!["scene-vectors-v1"];
+        for sha in shas {
+            parts.push(sha);
+            parts.push(self.vectors.get(sha).map_or("missing", |v| &v.digest));
+        }
+        fingerprint(&parts)
     }
     pub(super) fn overlap(&self, ids: &[i64]) -> (Overlap, Vec<LegacyOrigin>) {
         let indexes: BTreeSet<_> = ids
@@ -233,19 +248,20 @@ impl Raw {
     }
 }
 
-fn raw_in(conn: &Connection, scope: Option<(i64, i64)>) -> Result<Option<Raw>, Error> {
-    let (_, identity) = index::active_in(conn)?;
-    let Some(identity) = identity else {
-        return Ok(None);
-    };
-    let mut stmt = conn.prepare("SELECT p.id,p.display,p.md5,p.mtime,p.rotation,p.taken_at,
+const PHOTO_ROWS: &str = "/* scene-raw */ SELECT p.id,p.display,p.md5,p.mtime,p.rotation,p.taken_at,
        p.hidden,p.favorite,p.lat,p.lon,p.loc_source,f.photo_id,f.content_sha256,
        f.sharpness,f.luminance,f.exposure_score,f.black_clip,f.white_clip,f.contrast,f.error,f.phash,
        q.group_kind,q.recommended
        FROM photos p LEFT JOIN photo_quality_features f ON f.photo_id=p.id AND f.display=p.display
         AND f.source_md5 IS p.md5 AND f.source_mtime IS p.mtime
-       LEFT JOIN photo_quality q ON q.photo_id=p.id AND q.display=p.display AND q.source_md5 IS p.md5 AND q.source_mtime IS p.mtime
-       ORDER BY p.id")?;
+       LEFT JOIN photo_quality q ON q.photo_id=p.id AND q.display=p.display AND q.source_md5 IS p.md5 AND q.source_mtime IS p.mtime";
+
+fn raw_in(conn: &Connection, with_vectors: bool) -> Result<Option<Raw>, Error> {
+    let (_, identity) = index::active_in(conn)?;
+    let Some(identity) = identity else {
+        return Ok(None);
+    };
+    let mut stmt = conn.prepare(&format!("{PHOTO_ROWS} ORDER BY p.id"))?;
     let rows = stmt
         .query_map([], |r| {
             (0..23)
@@ -269,15 +285,11 @@ fn raw_in(conn: &Connection, scope: Option<(i64, i64)>) -> Result<Option<Raw>, E
             )
         })
         .collect();
-    let wanted: BTreeSet<_> = rows
-        .iter()
-        .filter(|r| scope.is_none_or(|(lo, hi)| r.captured.is_some_and(|t| lo <= t && t <= hi)))
-        .filter_map(|r| r.sha())
-        .collect();
+    let wanted: BTreeSet<_> = rows.iter().filter_map(|r| r.sha()).collect();
     let mut vectors = HashMap::new();
-    if jobs::object_exists(conn, "table", "ai_embedding_vectors")? {
+    if with_vectors && jobs::object_exists(conn, "table", "ai_embedding_vectors")? {
         let mut stmt = conn.prepare(
-            "SELECT input_sha256,dimension,vector FROM ai_embedding_vectors WHERE space_id=?1",
+            "/* scene-vectors */ SELECT input_sha256,dimension,vector FROM ai_embedding_vectors WHERE space_id=?1",
         )?;
         let mut found = stmt.query([identity.space_id()])?;
         while let Some(row) = found.next()? {
@@ -337,6 +349,7 @@ fn raw_in(conn: &Connection, scope: Option<(i64, i64)>) -> Result<Option<Raw>, E
         legacy_by_id,
         pointers,
         vectors,
+        with_vectors,
         failed,
         generations,
         legacy,
@@ -432,7 +445,7 @@ fn legacy_in(conn: &Connection) -> Result<Vec<Legacy>, Error> {
 /// Captures one consistent read snapshot; vector validation and all ranking happen after COMMIT.
 pub fn snapshot(conn: &Connection) -> Result<Option<Snapshot>, Error> {
     let tx = conn.unchecked_transaction()?;
-    let raw = raw_in(&tx, None)?;
+    let raw = raw_in(&tx, true)?;
     tx.commit()?;
     let Some(raw) = raw else {
         return Ok(None);
@@ -559,7 +572,7 @@ pub fn save(
     stopped: &dyn Fn() -> bool,
 ) -> Result<Saved, Error> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(raw) = raw_in(&tx, None)? else {
+    let Some(raw) = raw_in(&tx, true)? else {
         return Ok(Saved::Stale);
     };
     let saved = save_in(&tx, &raw, plan, group_index, stopped)?;
@@ -577,14 +590,14 @@ pub fn save_batch(
     indexes: &[usize],
     stopped: &dyn Fn() -> bool,
 ) -> Result<Vec<Saved>, Error> {
-    if indexes.len() > 16 {
+    if indexes.len() > super::runtime::GROUPS_PER_CYCLE {
         return Err(Error::InvalidOptions);
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if stopped() {
         return Ok(vec![Saved::Interrupted; indexes.len()]);
     }
-    let Some(raw) = raw_in(&tx, None)? else {
+    let Some(raw) = raw_in(&tx, true)? else {
         return Ok(vec![Saved::Stale; indexes.len()]);
     };
     let mut saved = Vec::new();
@@ -615,7 +628,10 @@ fn save_in(
     if stopped() {
         return Ok(Saved::Interrupted);
     }
-    if raw.identity != plan.identity || raw.guard(group.lo, group.hi) != group.guard {
+    if raw.identity != plan.identity
+        || raw.guard(group.lo, group.hi) != group.guard
+        || raw.vector_guard(group.lo, group.hi) != group.vector_guard
+    {
         return Ok(Saved::Stale);
     }
     if !valid_group(raw, group, plan.options)? {
@@ -626,7 +642,7 @@ fn save_in(
         .query_row(
             "SELECT * FROM ai_scene_groups WHERE result_id=?1",
             [&group.result_id],
-            |r| (0..16).map(|i| r.get(i)).collect(),
+            |r| (0..HEADER_COLUMNS).map(|i| r.get(i)).collect(),
         )
         .optional()?;
     let stored_members_match = if existing.as_ref() == Some(&values) {
@@ -645,12 +661,12 @@ fn save_in(
     if raw.pointer_guard(&ids) != group.expected_active {
         return Ok(Saved::Stale);
     }
-    tx.execute("INSERT INTO ai_scene_groups VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)
+    tx.execute("INSERT INTO ai_scene_groups VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
        ON CONFLICT(result_id) DO UPDATE SET space_id=excluded.space_id,space_fingerprint=excluded.space_fingerprint,
        input_generation=excluded.input_generation,processor_version=excluded.processor_version,window_s=excluded.window_s,
        similarity=excluded.similarity,shortlist=excluded.shortlist,state=excluded.state,overlap=excluded.overlap,
        rank_used=excluded.rank_used,weight_digest=excluded.weight_digest,lo=excluded.lo,hi=excluded.hi,
-       input_guard=excluded.input_guard,legacy_json=excluded.legacy_json",
+       input_guard=excluded.input_guard,legacy_json=excluded.legacy_json,vector_guard=excluded.vector_guard",
        rusqlite::params_from_iter(values.iter()))?;
     tx.execute(
         "DELETE FROM ai_scene_members WHERE result_id=?1",
@@ -717,7 +733,7 @@ pub fn pending_saves(conn: &Connection, plan: &Plan, limit: usize) -> Result<Vec
     for (i, g) in plan.groups.iter().enumerate() {
         let existing = stmt
             .query_row([&g.result_id], |r| {
-                (0..16)
+                (0..HEADER_COLUMNS)
                     .map(|j| r.get::<_, Value>(j))
                     .collect::<rusqlite::Result<Vec<_>>>()
             })
@@ -767,6 +783,7 @@ fn group_values(
         group.hi.into(),
         group.guard.clone().into(),
         encode(&group.legacy)?.into(),
+        group.vector_guard.clone().into(),
     ])
 }
 
@@ -814,13 +831,18 @@ fn stored_row_error(error: rusqlite::Error) -> Error {
 /// Shared by current reads and the save fast path; all members must describe one complete result.
 fn valid_group(raw: &Raw, group: &Group, options: Options) -> Result<bool, Error> {
     if group.members.is_empty()
-        || (matches!(group.rank_used, RankUsed::Linear) != group.weight_digest.is_some())
+        || (matches!(group.rank_used, RankUsed::Linear | RankUsed::Fallback(_))
+            != group.weight_digest.is_some())
         || group
             .weight_digest
             .as_deref()
             .is_some_and(|d| !valid_sha(d))
         || group.processor_version
-            != options.processor_version(&raw.identity, group.weight_digest.as_deref())
+            != options.group_processor_version(
+                &raw.identity,
+                group.rank_used,
+                group.weight_digest.as_deref(),
+            )
     {
         return Ok(false);
     }
@@ -940,7 +962,8 @@ pub fn load_projection_in(
     processors: &[&str],
     include_waiting: bool,
 ) -> Result<Loaded, Error> {
-    let Some(raw) = raw_in(tx, None)? else {
+    // No vector BLOB is read here: validation uses rows, SHAs, failed jobs, legacy state and the stored guard.
+    let Some(raw) = raw_in(tx, false)? else {
         return Ok(Loaded {
             identity: None,
             groups: Vec::new(),
@@ -952,7 +975,7 @@ pub fn load_projection_in(
             groups: Vec::new(),
         });
     }
-    let mut stmt=tx.prepare("SELECT result_id,input_generation,processor_version,state,overlap,rank_used,lo,hi,input_guard,weight_digest,legacy_json,window_s,similarity,shortlist,space_id FROM ai_scene_groups g
+    let mut stmt=tx.prepare("SELECT result_id,input_generation,processor_version,state,overlap,rank_used,lo,hi,input_guard,weight_digest,legacy_json,window_s,similarity,shortlist,space_id,vector_guard FROM ai_scene_groups g
       WHERE space_fingerprint=?1 AND (?2 OR state!='waiting')
       ORDER BY result_id")?;
     let rows = stmt
@@ -973,6 +996,7 @@ pub fn load_projection_in(
                 r.get::<_, f64>(12)?,
                 r.get::<_, i64>(13)?,
                 r.get::<_, String>(14)?,
+                r.get::<_, String>(15)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -995,6 +1019,7 @@ pub fn load_projection_in(
         similarity,
         shortlist,
         space_id,
+        vector_guard,
     ) in rows
     {
         if lo > hi {
@@ -1033,6 +1058,7 @@ pub fn load_projection_in(
             lo,
             hi,
             guard,
+            vector_guard,
             weight_digest,
             expected_active: String::new(),
         };
@@ -1050,4 +1076,162 @@ pub fn load_projection_in(
         identity: Some(raw.identity),
         groups,
     })
+}
+
+fn processors_sql(processors: &[&str]) -> String {
+    (0..processors.len())
+        .map(|i| format!("?{}", i + 2))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+fn parse_state(state: &str) -> Result<State, Error> {
+    match state {
+        "waiting" => Ok(State::Waiting),
+        "local_ranked" => Ok(State::LocalRanked),
+        "review_overlap" => Ok(State::ReviewOverlap),
+        _ => Err(Error::CorruptResult),
+    }
+}
+
+/// The active identity and `(state, ranking, count)` of the current stored headers.
+pub type HeaderCounts = (Option<SpaceIdentity>, Vec<(State, RankUsed, i64)>);
+
+/// Header-only counts for the status views: no photo row, vector or member is read.
+/// The result is advisory (no per-component guard); the cycle replaces a stale header at the next poll.
+pub fn header_counts_in(tx: &Connection, processors: &[&str]) -> Result<HeaderCounts, Error> {
+    let (_, identity) = index::active_in(tx)?;
+    let Some(identity) = identity else {
+        return Ok((None, Vec::new()));
+    };
+    if !pending(tx)?.is_empty() || processors.is_empty() {
+        return Ok((Some(identity), Vec::new()));
+    }
+    let mut stmt = tx.prepare(&format!(
+        "SELECT state,rank_used,COUNT(*) FROM ai_scene_groups g
+          WHERE space_fingerprint=?1 AND processor_version IN ({})
+            AND (state='waiting' OR EXISTS(SELECT 1 FROM ai_scene_active a WHERE a.result_id=g.result_id))
+          GROUP BY state,rank_used",
+        processors_sql(processors)
+    ))?;
+    let params =
+        std::iter::once(identity.fingerprint()).chain(processors.iter().map(|p| p.to_string()));
+    let counts = stmt
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(stored_row_error)?;
+    let mut out = Vec::new();
+    for (state, rank_used, n) in counts {
+        out.push((
+            parse_state(&state)?,
+            serde_json::from_str(&rank_used).map_err(|_| Error::CorruptResult)?,
+            n,
+        ));
+    }
+    Ok((Some(identity), out))
+}
+
+/// One photo's stored scene position, for the management list.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Annotation {
+    pub state: State,
+    pub overlap: Overlap,
+    pub rank: usize,
+    pub score: Option<f64>,
+    pub representative: bool,
+    pub shortlisted: bool,
+}
+
+/// Scene positions of the given photos only (a page). Reads those photos' rows and their stored
+/// members; a member is used only when its generation still equals the photo's current generation,
+/// the result carries the current space and processor, and (unless waiting) the active pointer
+/// still names it. Advisory: the per-component guard is not recomputed here.
+pub fn annotations_in(
+    tx: &Connection,
+    processors: &[&str],
+    ids: &[i64],
+) -> Result<(Option<SpaceIdentity>, HashMap<i64, Annotation>), Error> {
+    let (_, identity) = index::active_in(tx)?;
+    let Some(identity) = identity else {
+        return Ok((None, HashMap::new()));
+    };
+    if ids.is_empty() || processors.is_empty() || !pending(tx)?.is_empty() {
+        return Ok((Some(identity), HashMap::new()));
+    }
+    let marks = |from: usize| {
+        (0..ids.len())
+            .map(|i| format!("?{}", from + i))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut generations = HashMap::new();
+    let mut stmt = tx.prepare(&format!("{PHOTO_ROWS} WHERE p.id IN ({})", marks(1)))?;
+    let found = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
+        (0..23)
+            .map(|i| r.get::<_, Value>(i))
+            .collect::<rusqlite::Result<Vec<_>>>()
+    })?;
+    for row in found {
+        let row = Row::new(row?);
+        generations.insert(row.id(), row.generation());
+    }
+    drop(stmt);
+    let first = 2 + processors.len();
+    let mut stmt = tx.prepare(&format!(
+        "SELECT m.photo_id,m.generation,g.state,g.overlap,m.rank,m.score,m.representative,m.shortlisted
+           FROM ai_scene_members m JOIN ai_scene_groups g ON g.result_id=m.result_id
+          WHERE m.photo_id IN ({}) AND g.space_fingerprint=?1 AND g.processor_version IN ({})
+            AND (g.state='waiting' OR EXISTS(SELECT 1 FROM ai_scene_active a
+                  WHERE a.photo_id=m.photo_id AND a.result_id=g.result_id))
+          ORDER BY m.photo_id,(g.state='waiting'),g.result_id",
+        marks(first),
+        processors_sql(processors)
+    ))?;
+    let mut values: Vec<Value> = vec![identity.fingerprint().into()];
+    values.extend(processors.iter().map(|p| Value::Text(p.to_string())));
+    values.extend(ids.iter().map(|id| Value::Integer(*id)));
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(values), |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                flag(r, 6)?,
+                flag(r, 7)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(stored_row_error)?;
+    let mut out = HashMap::new();
+    for (id, generation, state, overlap, rank, score, representative, shortlisted) in rows {
+        if out.contains_key(&id) || generations.get(&id) != Some(&generation) {
+            continue;
+        }
+        let overlap = match overlap.as_str() {
+            "disjoint" => Overlap::Disjoint,
+            "exact" => Overlap::Exact,
+            "partial" => Overlap::Partial,
+            _ => return Err(Error::CorruptResult),
+        };
+        out.insert(
+            id,
+            Annotation {
+                state: parse_state(&state)?,
+                overlap,
+                rank: usize::try_from(rank).map_err(|_| Error::CorruptResult)?,
+                score,
+                representative,
+                shortlisted,
+            },
+        );
+    }
+    Ok((Some(identity), out))
 }

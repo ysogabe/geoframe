@@ -74,4 +74,9 @@ pipelineは `index_state`（no_tables/unset/unusable/active）、`query_compatib
 
 ## T4.5b接続
 
-[scene runtimeの設定・移行・受入範囲](ai-scenes.md#t45b-周期選別ビューe5e6のruntime接続2026-10-28)を参照。E6は同一snapshotで検証した現世代のLocalRanked Exact/Disjointをscene groupとして使い、ローカル順位/代表と旧有償recommendedを別フィールドにする。Partialは旧groupを保持して管理情報を付ける。Waiting/破損/旧processorは代表に採用しない。空queryはProvider/Discovery/送信0、非空queryの15秒/LRU64/入力検査/毎分制限/共有LAN lane・Wait/Pauseは変更しない。E5 pipelineにscene状態件数と共通旧選別のgroups/suppressedを追加し、ローカル順位をjudgedへ足さない。管理STATUS/写真にも同じ結果を投影する。rankfile読取とfallbackの順位検査は最終read transaction外、最終active pointer/本体/現入力の照合は同一snapshot内で行う。新しいCloud経路は無い。
+[scene runtimeの設定・移行・受入範囲](ai-scenes.md#t45b-周期選別ビューe5e6のruntime接続2026-10-28)を参照。E6は同一snapshotで検証した現世代のLocalRanked Exact/Disjointをscene groupとして使う。
+
+- **キー・情報**: Disjointは`result_id`、Exactは旧groupの`group_id`（有償判定の`kind/summary/*_similarity`を引き継ぎ、`scene_state/scene_overlap/scene_result_id`を足す）。Partial（ReviewOverlap）は旧groupのキー・score・並びを変えず、`scene_*`と`local_*`を情報として付けるだけ。Waiting/破損/旧processorは採用しない。
+- **群の並び**: 意味検索はcosine、空queryは旧来の`keep_score`（無ければ`quality_score`）/100。場面の点は群内で0〜100に正規化されるので群をまたぐ比較には使わず、`groups`件での打ち切りでも単独写真・旧判定の群が場面に押し出されない。
+- **群の中の並び**: favorite → recommended → 場面の代表 → 空queryのときだけ場面の順位 → score → keep_score。意味検索では代表の次はcosine順。Exactも同じ（旧推薦の`recommended`は場面の順位より優先）。
+- 空queryはProvider/Discovery/送信0、非空queryの15秒/LRU64/入力検査/毎分制限/共有LAN lane・Wait/Pauseは変更しない。E5 pipelineにscene状態件数（保存済みヘッダーの件数のみ）と`selection_groups`・`selection_suppressed`（フィードが実際に隠す数。管理の`suppressed`とは別）を追加し、ローカル順位をjudgedへ足さない。管理STATUS/写真にも同じ結果を投影する（頁の分だけ）。読み取りはvector BLOBを読まず順位を再計算しない（検索自体が使うvector読みと、E5の既存のindex状態の読みは除く）。新しいCloud経路は無い。

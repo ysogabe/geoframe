@@ -23,7 +23,12 @@ struct Photo {
     key: String,
     card: Value,
     vector: Option<Arc<Vec<f32>>>,
+    /// Placement score: the similarity (semantic) or the old `keep_score`/`quality_score` scale.
+    /// A local scene score is normalised inside its own scene, so it is never used across groups.
     score: f64,
+    /// Rank inside a local-ranked scene. Partial-overlap (review) scenes carry none.
+    scene_rank: Option<usize>,
+    scene_representative: bool,
 }
 fn list(v: Option<String>) -> Value {
     v.and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -91,26 +96,34 @@ pub fn search(
     if vector.is_some_and(|v| loaded.index.as_ref().map(|i| i.identity()) != Some(v.identity())) {
         return Ok(Err(Error::Unavailable));
     }
+    // Scene results are attached as information. Only a local-ranked scene (disjoint or an exact
+    // copy of an old group) orders anything; a partial overlap is left to the old selection.
     let mut local = HashMap::new();
     let mut scene_meta = HashMap::new();
+    let mut scene_extra = HashMap::new();
     if let Ok(scenes) = &scenes {
         for g in scenes.groups() {
             if g.state() == super::groups::State::Waiting {
                 continue;
             }
-            let state = if g.state() == super::groups::State::LocalRanked {
-                "local_ranked"
-            } else {
-                "review_overlap"
-            };
-            let overlap = match g.overlap() {
-                super::groups::Overlap::Exact => "exact",
-                super::groups::Overlap::Disjoint => "disjoint",
-                super::groups::Overlap::Partial => "partial",
-            };
-            scene_meta.insert(g.result_id().to_string(),json!({"kind":"scene","summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null,"scene_state":state,"scene_overlap":overlap}));
+            let (state, overlap) = (g.state().as_str(), g.overlap().as_str());
+            let ordering = g.state() == super::groups::State::LocalRanked;
+            // An exact scene is the old group itself: it keeps the old key (and so the paid summary,
+            // kind and similarities). A disjoint scene gets its own key.
+            let exact = g
+                .legacy_origins()
+                .first()
+                .filter(|_| g.overlap() == super::groups::Overlap::Exact)
+                .map(|o| o.group_id().to_string());
+            let key = ordering.then(|| exact.clone().unwrap_or_else(|| g.result_id().to_string()));
+            if let Some(key) = &key {
+                scene_extra.insert(key.clone(), json!({"scene_state":state,"scene_overlap":overlap,"scene_result_id":g.result_id()}));
+                if exact.is_none() {
+                    scene_meta.insert(key.clone(),json!({"kind":"scene","summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null}));
+                }
+            }
             for m in g.members() {
-                local.insert(m.photo_id, (g.result_id(), state, overlap, m));
+                local.insert(m.photo_id, (key.clone(), state, overlap, m));
             }
         }
     }
@@ -157,20 +170,23 @@ pub fn search(
         let mut key = ai_group.filter(|s| !s.is_empty()).unwrap_or_else(|| {
             if card["quality_group_kind"] == "similar" { format!("local-similar-{}",card["quality_group_id"]) } else { format!("photo-{id}") }
         });
-        if let Some((result,state,overlap,m)) = local.get(&id) {
+        let (mut scene_rank, mut scene_representative) = (None, false);
+        if let Some((scene_key,state,overlap,m)) = local.get(&id) {
             card["local_rank"] = json!(m.rank);
             card["local_score"] = json!(m.score);
             card["local_representative"] = json!(m.representative);
             card["scene_state"] = json!(state);
             card["scene_overlap"] = json!(overlap);
-            // Partial overlap remains a management result; the old selection unit is retained.
-            if *state == "local_ranked" { key = result.to_string(); }
+            if let Some(scene_key) = scene_key {
+                key = scene_key.clone();
+                (scene_rank, scene_representative) = (Some(m.rank), m.representative);
+            }
         }
         let values = new.map(|(v,_)| Arc::clone(v)).or_else(|| {
             if has_active { None } else { legacy_vector(r.get("embedding").ok().flatten(), r.get("embedding_dim").ok().flatten()) }
         });
-        let score = if vector.is_some() { new.unwrap().1 } else { card["local_score"].as_f64().or_else(|| card["keep_score"].as_f64()).or_else(|| card["quality_score"].as_f64()).unwrap_or_default()/100.0 };
-        Ok(Some(Photo { id, key, card, vector:values, score }))
+        let score = if vector.is_some() { new.unwrap().1 } else { card["keep_score"].as_f64().or_else(|| card["quality_score"].as_f64()).unwrap_or_default()/100.0 };
+        Ok(Some(Photo { id, key, card, vector:values, score, scene_rank, scene_representative }))
     })?;
     let mut photos = rows
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -233,10 +249,16 @@ pub fn search(
                         .unwrap_or(false)
                         .cmp(&a.card["recommended"].as_bool().unwrap_or(false))
                 })
+                .then_with(|| b.scene_representative.cmp(&a.scene_representative))
                 .then_with(|| {
-                    b.card["local_representative"]
-                        .as_bool()
-                        .cmp(&a.card["local_representative"].as_bool())
+                    // Recommended listing follows the scene's own rank; a query keeps its similarity order.
+                    if vector.is_some() {
+                        std::cmp::Ordering::Equal
+                    } else {
+                        a.scene_rank
+                            .unwrap_or(usize::MAX)
+                            .cmp(&b.scene_rank.unwrap_or(usize::MAX))
+                    }
                 })
                 .then_with(|| b.score.total_cmp(&a.score))
                 .then_with(|| {
@@ -291,6 +313,11 @@ pub fn search(
             row.card["visual_cluster_size"] = json!(sizes[i]);
         }
         let mut group = meta.remove(&key).unwrap_or_else(|| json!({"kind":if key.starts_with("local-similar-") {"similar"} else {"single"},"summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null}));
+        if let Some(Value::Object(extra)) = scene_extra.get(&key) {
+            extra
+                .iter()
+                .for_each(|(k, v)| group[k.as_str()] = v.clone());
+        }
         group["group_id"] = json!(key);
         group["best_similarity"] = json!(round4(best));
         group["visual_similarity_threshold"] = json!(threshold);
@@ -307,7 +334,6 @@ pub fn search(
 pub fn status(conn: &Connection, config: &Config) -> rusqlite::Result<Value> {
     let prepared = super::groups::runtime::Prepared::read(conn, config);
     let tx = conn.unchecked_transaction()?;
-    let scenes = prepared.and_then(|p| p.load_in(&tx));
     let (index, identity, _) = super::index::status_in(&tx, false)?;
     let model = config.embed_backend.model();
     let (legacy, judged, recommended): (i64,i64,i64) = tx.query_row(&format!("SELECT COUNT(DISTINCT a.content_sha256),COALESCE(SUM(a.recommended IS NOT NULL),0),COALESCE(SUM(a.recommended=1),0) {JOINS} WHERE a.embedding_model=?1"),[model],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
@@ -324,7 +350,7 @@ pub fn status(conn: &Connection, config: &Config) -> rusqlite::Result<Value> {
         group_status.insert(k, v);
     }
     drop(stmt);
-    let scene_summary = super::groups::runtime::summary(scenes.as_ref());
+    let scene_summary = super::groups::runtime::status_summary(&prepared, &tx);
     let selection = crate::selection::admin_counts(&tx)?;
     tx.commit()?;
     let active = identity.is_some();
@@ -347,7 +373,7 @@ pub fn status(conn: &Connection, config: &Config) -> rusqlite::Result<Value> {
     Ok(
         json!({"ok":true,"photos":photos,"judged":if active {all_judged}else{judged},"recommended":if active {all_recommended}else{recommended},"groups":group_status.values().sum::<i64>(),"eligible":index.progress.eligible,"pending_embeddings":if active {index.progress.pending}else{(index.progress.eligible-legacy).max(0)},"group_status":group_status,
         "embedding_model":identity.as_ref().map_or(model,|i|i.model_id()),"embedding_backend":if active {if identity.as_ref().is_some_and(|i| i.provider_space_id() == super::embedding::PROVIDER_SPACE) {"local_http"} else {"active_index"}}else{match config.embed_backend {EmbedBackend::Local=>"local",EmbedBackend::Gemini=>"gemini"}},"other_model_embeddings":if active {index.other_shas}else{other},
-        "pipeline":{"index_state":state,"query_compatible":compatible,"indexed":index.progress.indexed,"pending":index.progress.pending,"failed_excluded":index.progress.failed_excluded,"failed_reasons":index.progress.failed_reasons.into_iter().collect::<BTreeMap<_,_>>(),"corrupt":index.corrupt,"selection_judged":all_judged,"selection_recommended":all_recommended,"selection_groups":selection.groups,"selection_suppressed":selection.suppressed,"scenes":scene_summary}}),
+        "pipeline":{"index_state":state,"query_compatible":compatible,"indexed":index.progress.indexed,"pending":index.progress.pending,"failed_excluded":index.progress.failed_excluded,"failed_reasons":index.progress.failed_reasons.into_iter().collect::<BTreeMap<_,_>>(),"corrupt":index.corrupt,"selection_judged":all_judged,"selection_recommended":all_recommended,"selection_groups":selection.groups,"selection_suppressed":selection.feed_suppressed,"scenes":scene_summary}}),
     )
 }
 

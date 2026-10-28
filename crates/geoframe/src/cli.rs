@@ -418,7 +418,7 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let config = Arc::new(config);
     // 同期サイクルとキャッシュ保存のスレッド。HTTP サーバーの起動を待たない
     let stop = StopFlag::new();
-    // AI（取り込みが有効のときだけ）: 前の起動の running の回収と、有効な背景用途があるときの背景ワーカー
+    // AI（取り込みが有効のときだけ）: 前の起動の running の回収と、AI が有効なときの背景ワーカー
     let ai_clock: Clock = Arc::new(jobs::unix_now);
     // 地名検索の `.cache.json`。取り込みが有効なら同期サイクルと同じキャッシュ（保存は保存スレッドが行う）。
     // 無効なら、読んでメモリに入れるだけでディスクへは書かない（本番の書き手は P5 の切替まで Python）
@@ -526,7 +526,7 @@ fn serve(overrides: &Overrides) -> ExitCode {
 
 /// AI の起動の準備と、背景ワーカーの起動。取り込みが有効（ロックを取ったあと）の `serve` だけが呼ぶ。
 /// 回収と Provider 停止の整理は、ワーカーが無効でも行う（AI を無効に戻したあとに `running` が残り続けない
-/// ように）。ワーカーは `GEOFRAME_AI_ENABLED=1` と有効な背景用途があるときだけ。
+/// ように）。ワーカーは `GEOFRAME_AI_ENABLED=1` で AI の設定が不正でないときだけ（Provider のジョブは有効な背景用途があるときだけ処理する）。
 fn start_ai(
     config: &Arc<Config>,
     ingest: &Ingest,
@@ -536,13 +536,11 @@ fn start_ai(
 ) -> Option<worker::AiWorker> {
     let started = worker::startup(config, &ingest.writer, clock)?;
     if !worker::should_start(config) {
-        tracing::info!(
-            "[ai] 背景ワーカーは起動しません（AI が無効、または有効な背景用途がありません）"
-        );
+        tracing::info!("[ai] 背景ワーカーは起動しません（AI が無効、または AI の設定が不正です）");
         return None;
     }
     tracing::info!(
-        "[ai] 背景ワーカーを起動します（用途 {} 件）",
+        "[ai] 背景ワーカーを起動します（Provider 用途 {} 件と、同一場面の局所計算）",
         worker::background_tasks(&config.ai, true).len()
     );
     Some(worker::spawn(WorkerDeps {

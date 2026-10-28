@@ -346,7 +346,7 @@ pub async fn photos_from(path: &Path) -> Response {
 /// **意図した差（P4 / T4.3）**: `db.ai` の `groups`・`group_pending`・`suppressed` だけは Python の値でなく、
 /// Rust の「世代の合う有効な旧メンバーだけを数える」値に直してある（合成 DB の `photo_ai_group_members` の
 /// うち、`photo_ai_features`・`photo_quality_features` の世代が今の写真と合うのは `ai-1` の写真 6・7 だけ。
-/// 8 は `md5` が古く、9・10 は特徴量の行が無い）。T4.5bのsuppressedは表示可能な非favoriteだけを数えるため0（写真7は位置無し）。他の値はPythonのまま。
+/// 8 は `md5` が古く、9・10 は特徴量の行が無い）。他の値は Python のまま。
 pub fn admin_fixture() -> Value {
     let mut fixture = read_json(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/admin-api-python.json"),
@@ -357,7 +357,7 @@ pub fn admin_fixture() -> Value {
                 if let Some(Value::Object(ai)) = map.get_mut("db").and_then(|d| d.get_mut("ai")) {
                     ai.insert("groups".into(), 1.into());
                     ai.insert("group_pending".into(), 0.into());
-                    ai.insert("suppressed".into(), 0.into());
+                    ai.insert("suppressed".into(), 1.into());
                 }
                 map.values_mut().for_each(patch);
             }

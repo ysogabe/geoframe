@@ -67,8 +67,12 @@ pub struct AdminCounts {
     pub groups: i64,
     /// そのうち `judged` でないもの。
     pub group_pending: i64,
-    /// 抑止される有効なメンバーの数（フィードの [`ai_visible`] の抑止側と同じ条件。`favorite` の免除も含む）。
+    /// 抑止される有効なメンバーの数（フィードの [`ai_visible`] の抑止側と同じ条件。`favorite` の免除は含めない
+    /// ＝従来の集計と同じ）。
     pub suppressed: i64,
+    /// いまのフィードが実際に隠す写真の数（`suppressed` のうち、表示できて `favorite` でないもの）。
+    /// E5 の `selection_suppressed` 用で、管理画面の `suppressed` には使わない。
+    pub feed_suppressed: i64,
 }
 
 /// 管理画面の `groups`・`group_pending`・`suppressed`（読み取りだけ）。
@@ -88,6 +92,16 @@ pub fn admin_counts(conn: &Connection) -> rusqlite::Result<AdminCounts> {
             "SELECT COUNT(*) FROM ({VALID_MEMBERS}) m
                JOIN photo_ai_groups g ON g.group_id=m.group_id
               WHERE g.status='judged' AND g.same_scene=1 AND COALESCE(m.recommended,0)!=1
+                AND {rep}"
+        ),
+        [],
+        |row| row.get(0),
+    )?;
+    let feed_suppressed = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM ({VALID_MEMBERS}) m
+               JOIN photo_ai_groups g ON g.group_id=m.group_id
+              WHERE g.status='judged' AND g.same_scene=1 AND COALESCE(m.recommended,0)!=1
                 AND m.shown=1 AND EXISTS(SELECT 1 FROM photos sp WHERE sp.id=m.photo_id AND COALESCE(sp.favorite,0)!=1)
                 AND {rep}"
         ),
@@ -98,5 +112,6 @@ pub fn admin_counts(conn: &Connection) -> rusqlite::Result<AdminCounts> {
         groups,
         group_pending: pending,
         suppressed,
+        feed_suppressed,
     })
 }

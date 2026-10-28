@@ -49,7 +49,7 @@
 
 | 追加表 | 内容 |
 | --- | --- |
-| ai_scene_groups | space_id/完全fingerprint、全入力世代、処理版、窓/閾値/shortlist上限、状態/順位方式/重みdigest、影響範囲/入力guard、旧選別由来 |
+| ai_scene_groups | space_id/完全fingerprint、全入力世代、処理版、窓/閾値/shortlist上限、状態/順位方式/重みdigest、影響範囲/入力guard、旧選別由来、vector_guard（vector BLOBのdigest。writerのCASだけが使う） |
 | ai_scene_members | result_id/photo_id、各世代、順位/score/shortlist/代表/表示可否/favorite。rank一意 |
 | ai_scene_active | photo_id→確定済みローカル結果への参照。選別やフィードのactiveではない |
 
@@ -57,7 +57,7 @@
 
 保存は1成分/1短transaction。計算済みPlanを渡し、完全active空間・影響する全写真/品質の現値・vector bytes・現failedキー・同SHA全複製世代・有効旧選別由来・計画時の新結果参照を再照合する。別処理版の計画が先に採用されていれば後着の旧計画はStale。結果/全members/active参照は同時に確定する。SQL故障/最後の停止は全rollback、同じPlanの再保存はUnchanged。重い成分計算/順位/PCA/ファイル読取はwriterへ持ち込まない。CASの全現写真メタデータ走査と関連vector bytesの比較hashはwriterで必要な直線作業として残す。影響外の写真追加はguardに入らず、変更が続いても別の窓を進められる。影響範囲内の追加は保留/再計画し、古い顔ぶれを公開しない。
 
-読み取りはpointerとrowsを同snapshotで読む。版/空間/世代/guardが不一致の結果は返さず、全構成員のactive参照がその結果に揃う場合だけ返す。過去の結果や別空間/別版、有償旧結果をGCしない。未完成/空集合/全failedで旧表を削除・解除しない。
+読み取りはpointerとrowsを同snapshotで読む。vector BLOBは読まない（入力guardは写真/品質行・SHA・failedキー・同SHA複製世代・有効旧選別から作り、vector bytesのdigestは別の`vector_guard`としてwriterのCASとサイクルだけが照合する）。版/空間/世代/guardが不一致の結果は返さず、全構成員のactive参照がその結果に揃う場合だけ返す。過去の結果や別空間/別版、有償旧結果をGCしない。未完成/空集合/全failedで旧表を削除・解除しない。
 
 旧選別は `selection::VALID_MEMBERS` の世代・表示可能推薦ルールを共有し、judged/same_scene=1で表示可能推薦のある旧群だけを有効単位とする。新全構成員と有効旧単位が同一で全旧構成員も現有効ならExact、どの有効旧単位とも重ならなければDisjoint、それ以外はPartial。複数旧群をまとめる場合もPartial。旧群を変造/削除せず、旧ID・judge model/version・旧group/member全行と有効性のdigestを保存する。`LegacyOrigin::paid_reuse_verified()` はfalse。旧列だけでは完全prompt/rotation等の由来は証明できず、この一致を有償回答再利用の許可にしない。cは新たな検証済み回答のprompt/モデル/実送信集合/画像世代を持つ必要がある。
 
@@ -119,7 +119,7 @@ AC4は現入力/完全空間/新参照CASと一次列不変、AC6は空間/破�
 
 ### 起動・設定・仕事量
 
-`INGEST=1 && AI_ENABLED=1 && ai.invalid().is_none()` で `Runtime::production(Arc<Config>)` とローカル専用スレッドを起動する。AI設定ファイルが未指定でも、DBに既にある完全なactive identityと適合vectorから処理できる。Providerの登録/Discovery、LAN lane、photo_judgeの許可/予算には依存しない。画像・Decision・日候補の既存workerと単一Writer/StopFlag/LockHoldを共有し、Provider応答中も独立して進む。AI無効時はworker startupの回収・run記録もしない。既存INGESTの基本移行と、AI背景処理の無効化を区別する。
+`INGEST=1 && AI_ENABLED=1 && ai.invalid().is_none()` で `Runtime::production(Arc<Config>)` とローカル専用スレッドを起動する。AI設定ファイルが未指定でも、DBに既にある完全なactive identityと適合vectorから処理できる。Providerの登録/Discovery、LAN lane、photo_judgeの許可/予算には依存しない。画像・Decision・日候補の既存workerと単一Writer/StopFlag/LockHoldを共有し、Provider応答中も独立して進む。`INGEST=1`なら`AI_ENABLED=0`（や不正設定）でも、worker startupの起動ID記録と前の起動の`running`回収は行う（AIを無効に戻したあと`running`が残り続けないため。Provider停止の整理は設定が有効なときだけ）。ワーカー（ローカル周期を含む）を起動しないだけで、AI無効ならscene3表も作らない。
 
 | 既存設定 | 今回の適用 |
 | --- | --- |
@@ -137,10 +137,10 @@ AC4は現入力/完全空間/新参照CASと一次列不変、AC6は空間/破�
 
 ### 読取API・選別・後続cへの境界
 
-- `Prepared::read(conn, config)` はactive metadataとrankfileを最終read transactionの外で準備し、`Prepared::load_in(conn)` は呼出側の同一snapshot内でactive本体/完全空間/現世代/現processor/全members/参照を検査する。途中の空間切替では結果を使わない。モデルが成分単位でMissingFeature/Overflow等へfallbackする場合は、別の現入力snapshotからwriter/tx外でその理由を再検証し、最終snapshotでも同じguardである場合だけ採用する。新weightが利用可能になった古い固定式結果を正常扱いしない。
-- E6の既存card/group JSON形・型を維持し、有効な成分にだけ`local_rank/local_score/local_representative/scene_state/scene_overlap`を追加する。LocalRanked Exact/Disjointをscene groupとして使い、空queryは保存順位、意味検索は同じactive vectorのcosineを使う。favoriteと世代適合する旧判定の優先を保つ。PartialはReviewOverlapとして管理情報を残し、旧groupの単位を保持する。Waitingは検索の代表/順位にしない。
-- E5 `pipeline.scenes` と管理STATUS `ai_scenes` に`state/local_ranked/waiting/review_overlap/rules/linear`の固定コード・件数を追加。管理写真の任意`scene`に状態/重複/順位/score/代表/shortlistを付ける。旧DBはschemaを作らず、管理追加キーも3表が存在する時だけ。破損したsceneはunavailable/未採用にして配信全体を止めない。
-- E5 `selection_groups/selection_suppressed` はfeedと共通の旧選別から数える。LocalRanked/Waiting/ReviewOverlapはjudgedへ加算しない。`selection::admin_counts.suppressed`は表示可能な非favoriteの実際の抑止数へ揃えた。合成管理fixtureでは、位置無しの旧非推薦を除くため1→0。選別表・抑止集合・フィード件数は周期の前後で不変であり、この集計の修正を新しい抑止解除と混同しない。
+- `Prepared::read(conn, config)` はactive metadataとrankfileを最終read transactionの外で準備し、`Prepared::load_in(conn)` は呼出側の同一snapshot内でactive本体/完全空間/現世代/現processor/全members/参照を検査する。途中の空間切替では結果を使わない。読み取りは順位を**再計算しない**（vector BLOBを読まず、`snapshot`も`model.scores`も走らせない）。重みが成分を採点できず固定式へ落ちた成分は、周期が `RankUsed::Fallback(理由)` と重みdigest（`weight_digest`と処理版の`fallback:<digest>`）を保存する。読み取りは、重みがあれば `[Linear(D), Fallback(D)]`、無ければ `[固定式]` の処理版だけを採用する。重みを差し替える/外すと、古い固定式・Linear・Fallbackのどれも次の周期が置き換えるまで採用しない（旧選別が残る）。
+- E6の既存card/group JSON形・型を維持し、有効な成分にだけ`local_rank/local_score/local_representative/scene_state/scene_overlap`を追加する（ReviewOverlapのメンバーにも情報として付く）。**並び・キー**: LocalRankedだけが順序に関わる。Disjointは`result_id`をgroup keyにし（`kind:"scene"`、summary空）、Exactは旧groupの`group_id`をそのままkeyにして有償判定の`kind/summary/min・max・avg_similarity`を引き継ぎ、`scene_state/scene_overlap/scene_result_id`を足す。Partial（ReviewOverlap）は情報を付けるだけで、key・score・並びのどれにも使わず旧来のkeep_score順を保つ。群の並び（上位`groups`件で切る基準）は、意味検索ならcosine、空queryなら旧来の`keep_score`（無ければ`quality_score`）/100。場面の点（`local_score`）は群の中で0〜100に正規化されるので、群をまたぐ比較には使わない（使うと最上位が常に100になり、場面が単独写真・旧判定の群を押し出す）。群の中の順序は、favorite → recommended → 場面の代表 → （空queryのときだけ）場面の順位 → score → keep_score。意味検索では代表の次はcosine順。Waitingは検索の代表/順位にしない。
+- E5 `pipeline.scenes` と管理STATUS `ai_scenes` に`state/local_ranked/waiting/review_overlap/rules/linear`の固定コード・件数を追加する。件数は保存済みヘッダーの`GROUP BY`だけ（現空間・現処理版・active参照のあるものだけ。写真行もvectorもmembersも読まず、成分ごとの入力guardは検証しない＝周期が置き換えるまで古い成分を含み得る助言値）。`rules`は固定式＋Fallbackの数。管理写真の任意`scene`は、そのページの写真の分だけ保存済みmembersを読み、メンバーの世代が写真の現世代と一致し（waiting以外は）active参照が指すものだけ採用する（成分のguardは再計算しない助言値）。他の写真・vector BLOBは読まない。旧DBはschemaを作らず、管理追加キーも3表が存在する時だけ。破損したsceneはunavailable/未採用にして配信全体を止めない。
+- E5 `selection_groups/selection_suppressed` はfeedと共通の旧選別から数える。LocalRanked/Waiting/ReviewOverlapはjudgedへ加算しない。管理画面の`db.ai.suppressed`は従来（Python版）の意味のまま（favoriteの免除を含めて数える）で、管理fixtureも1のまま。E5の`selection_suppressed`は別の集計`selection::AdminCounts::feed_suppressed`（表示可能な非favoriteの、いまのフィードが実際に隠す数）。選別表・抑止集合・フィード件数は周期の前後で不変。
 - `ai_scene_active`はローカル結果の参照であり、feed非表示の許可ではない。旧有償表は今回一切書換えない。検索空間の切替、新しい未判定成分、pending窓による新規feed抑止は0。旧代表の更新/削除/hidden/位置無し/品質非表示時の安全な表示とfavorite免除は共通選別SQLを維持する。
 
 後続T4.5cは`Group`の現入力世代/処理版/全members/shortlist/順位/Overlap/LegacyOriginを使える。置換候補は現入力集合・世代の一致するExact、またはDisjointのみで、Partialは管理確認のまま。`paid_reuse_verified()==false`は維持する。今回のscene参照やローカル代表を有償判定済みの証拠にしない。新Gemini回答の送信集合・prompt・モデル・世代・token CASと抑止採用はcが別途実装する。
@@ -169,3 +169,17 @@ T4.5aの3表を`ai::pending_active/migrate_active`へ接続した。引数は従
 - 同fixtureの事前分離snapshot/computeは148.236ms/73.149ms。RSSは準備後→分離snapshot後→分離compute後→周期保存/読取後が **11964→72440→75020→78444KiB**。事前snapshot/Plan、allocator/SQLite cacheを含む各時点の値で、周期単独の増分・peakではない。computeを同期ゲートで保持した間の別writer更新も成功した。多数小成分の試験は40成分を16/16/8/0保存、期限切れwriter依頼の後着保存0を確認した。
 
 独立Solレビュー、実LAN/LXC、実weightでの品質評価、任意Gemini判定と有償抑止への適用、P4全体security-reviewは未実施として親へ引き継ぐ。成分計算の最悪O(n²d)、大きい単一成分の原子的保存、協調停止、履歴を自動GCしない点は既知の境界。今回の合成runtime試験でP4全体完了・P5移行可能とはしない。
+
+### T4.5bレビュー修正（読み取りの軽量化ほか）
+
+- **読み取りはvector BLOBを読まず、順位を再計算しない。** 以前は `Prepared::read` → `load_in` → `raw_in` が要求ごとに全写真・全vector BLOBを読んでdigestを作り、重みがあると `snapshot` と `model.scores` も走らせた。入力guardを2つに分けた: `input_guard`（写真/品質行・SHA・現failedキー・複製世代・有効旧選別。BLOB不要）と `vector_guard`（vector BLOBのdigest。`ai_scene_groups`の最終列で追加）。読み取り（E6・検証付き投影）は `input_guard` と参照と構造だけを照合し、`raw_in(with_vectors=false)` は `ai_embedding_vectors` を読む文を発行しない。`vector_guard` を照合するのはサイクルのsnapshotとwriterの `save`/`save_batch` のCASだけ。したがって、保存後にvectorだけが変わった成分は、次のサイクルが置き換えるまで読み取りでは検出されない（writerのCASと再計画では検出する）。`ai_scene_*` 表は本ブランチで初めて起動時に作られるため、列追加は既存表の変更ではなく表定義の一部。
+- **fallbackの正当性は周期の側で決めて保存する。** 重みがあるのに成分を採点できない場合は `RankUsed::Fallback(理由)`（重みdigestを`weight_digest`に、処理版に`fallback:<digest>`を含める）。重みが無い・不正なときの固定式は従来どおり `Rules(理由)`。読み取りは重みの有無で採用する処理版を決めるだけ（上の項）。
+- **件数と頁の注記は、さらに絞って読む。** 管理STATUS・E5の件数は保存ヘッダーの `GROUP BY` だけ、管理の写真一覧は頁の写真の分だけ（写真行はその頁の分、保存済みmembersはその頁の写真の分）。成分のguardは再計算しない助言値で、検証付きの投影はE6が使う。E6は全写真の行を1回読む（vector BLOBは読まない）。検索自体が必要とする `search::load_in` のvector読みと、E5の `index::status_in`（破損数のための既存のscan）は従来のまま範囲外。
+- **Exactは旧groupのkeyと情報を引き継ぎ、Partialは情報だけ**、群の並びは旧来のkeep_score尺度（上のE6の項）。
+- **書き込みの順番待ちの期限切れ**（混雑）は `groups::Error::WriterBusy` として、DB失敗と別の警告コード `scene_writer_busy` に分けた。
+- **管理 `db.ai.suppressed`** はPython版の意味に戻し、E5の `selection_suppressed` は別集計 `feed_suppressed` にした。
+- **起動時の回収**は `AI_ENABLED=0` でも行う（上の起動の項）。
+
+追加した試験（`ai/groups/tests.rs`、`ai/tests_worker.rs`、`tests/legacy_selection.rs`）: 4つの読み取りAPIがvector BLOBを読まず（SQLトレースの印で計測）、重みと固定式Fallbackの両方がある条件で全写真の走査がE6の1回だけ（snapshot再計算なし）であること／重みの係数を変えると旧結果を採用しないこと、Partialが並びに影響しないこと、Exactのkind・summary・類似度が残ること、群の並びが旧来の尺度で `groups=1/2` の打ち切りでも単独写真と旧判定の群が押し出されないこと、管理の注記が写真の世代で絞られること、`suppressed`／`feed_suppressed`の区別、AI無効でも起動時に`running`を回収すること。性能に関する再計測は管理者が行う。
+
+検証（この修正）: `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`git diff --check` は成功。`cargo test --workspace`（`RUST_TEST_THREADS=4`）は28 group、**1231成功 / 失敗0 / 既存ignore2**（修正前は1225。追加6件）。musl release（`x86_64-unknown-linux-musl`）はビルド成功、static-pie（INTERP・NEEDED無し）、`--version` は `geoframe 0.1.0`。

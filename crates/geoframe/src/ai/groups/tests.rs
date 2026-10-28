@@ -955,7 +955,7 @@ fn pca_fold_scores_constant_fifty_overflow_missing_feature_and_fallback() {
     let p = compute(&snap, Options::default(), Ok(&m), &|| false).unwrap();
     assert_eq!(
         p.groups[0].rank_used,
-        RankUsed::Rules(Some(rank::Reason::Overflow))
+        RankUsed::Fallback(rank::Reason::Overflow)
     );
     assert_eq!(
         p.groups[0].members[0].score,
@@ -973,8 +973,9 @@ fn pca_fold_scores_constant_fifty_overflow_missing_feature_and_fallback() {
     let p = compute(&snap, Options::default(), Ok(&m), &|| false).unwrap();
     assert_eq!(
         p.groups[0].rank_used,
-        RankUsed::Rules(Some(rank::Reason::MissingFeature))
+        RankUsed::Fallback(rank::Reason::MissingFeature)
     );
+    assert!(p.groups[0].weight_digest.is_some());
 }
 #[test]
 fn nonfinite_json_scores_span_and_invalid_options_rejected() {
@@ -1161,16 +1162,15 @@ fn synthetic_6500x768_compute_releases_writer_and_measures_save() {
         (report.stored, report.selected, report.members),
         (1, 1, 6500)
     );
-    let result = Saved::Stored;
     let save_time = start.elapsed();
-    assert_eq!(result, Saved::Stored);
-    assert_eq!(
-        load_current(&c, p.groups[0].processor_version())
-            .unwrap()
-            .groups()
-            .len(),
-        1
-    );
+    let loaded = load_current(&c, p.groups[0].processor_version()).unwrap();
+    assert_eq!(loaded.groups().len(), 1);
+    assert_eq!(loaded.groups()[0].members().len(), 6500);
+    // 同じ入力の 2 周期目は、何も選ばず何も保存しない（書き込みを再び占有しない）
+    let again = runtime
+        .cycle_report(&c, &writer, &crate::stop::StopFlag::new())
+        .unwrap();
+    assert_eq!((again.stored, again.selected, again.members), (0, 0, 0));
     eprintln!(
         "scene synthetic 6500x768 all-same-time: snapshot={snapshot_time:?}, compute={compute_time:?}, periodic-total={save_time:?}, report={report:?}; RSS before={before}, snapshot={after_snapshot}, compute={after_compute}, after-save/read={}",
         rss()
@@ -1523,10 +1523,9 @@ fn local_partial_exact_disjoint_and_favorite_keep_paid_selection_unchanged() {
         .unwrap();
     e.cycle();
     assert_eq!(e.feed(), vec![1, 2, 3]);
-    assert_eq!(
-        crate::selection::admin_counts(&e.conn).unwrap().suppressed,
-        0
-    );
+    // 管理画面の `suppressed` は従来どおり favorite を含め、フィードで実際に隠す数は 0
+    let counts = crate::selection::admin_counts(&e.conn).unwrap();
+    assert_eq!((counts.suppressed, counts.feed_suppressed), (1, 0));
     e.conn
         .execute(
             "UPDATE photos SET taken_at='2026-01-01 01:00:00' WHERE id=3",
@@ -1774,7 +1773,8 @@ fn local_writer_wait_is_bounded_and_expired_or_stopped_work_never_saves_later() 
                 Instant::now() + Duration::from_millis(100)
             )
             .map(|r| r.stored),
-        Err(Error::Database)
+        // 書き込みの順番待ちの期限切れは、DB の失敗と別のコード（混雑）
+        Err(Error::WriterBusy)
     );
     assert!(start.elapsed() < Duration::from_secs(1));
     release.send(()).unwrap();
@@ -1893,7 +1893,7 @@ fn local_verified_weight_component_fallback_is_usable_but_a_changed_weight_must_
     assert_eq!(e.loaded().groups().len(), 1);
     assert_eq!(
         e.loaded().groups()[0].rank_used(),
-        RankUsed::Rules(Some(rank::Reason::MissingFeature))
+        RankUsed::Fallback(rank::Reason::MissingFeature)
     );
     assert_eq!(
         e.view()["groups"][0]["photos"][0]["local_representative"],
@@ -1904,4 +1904,271 @@ fn local_verified_weight_component_fallback_is_usable_but_a_changed_weight_must_
     assert!(e.loaded().groups().is_empty());
     assert_eq!(e.cycle(), 1);
     assert_eq!(e.loaded().groups()[0].rank_used(), RankUsed::Linear);
+}
+
+// ---- T4.5b review fixes: read paths, ordering and inheritance -------------------------------
+
+std::thread_local! {
+    static SQL_LOG: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+fn log_sql(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event {
+        SQL_LOG.with(|log| log.borrow_mut().push(sql.to_string()));
+    }
+}
+/// Statements executed on `c` (this thread) while `f` runs.
+fn traced<T>(c: &Connection, f: impl FnOnce() -> T) -> (T, Vec<String>) {
+    SQL_LOG.with(|log| log.borrow_mut().clear());
+    c.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(log_sql),
+    );
+    let out = f();
+    c.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+    (
+        out,
+        SQL_LOG.with(|log| std::mem::take(&mut *log.borrow_mut())),
+    )
+}
+/// Full scans of every photo row for the scene guard.
+fn full_scans(sql: &[String]) -> usize {
+    sql.iter()
+        .filter(|s| s.contains("scene-raw") && !s.contains("WHERE p.id IN"))
+        .count()
+}
+/// Loads of the vector BLOB column by the scene layer.
+fn vector_loads(sql: &[String]) -> usize {
+    sql.iter().filter(|s| s.contains("scene-vectors")).count()
+}
+fn keep(c: &Connection, id: i64, score: i64) {
+    c.execute(
+        "INSERT INTO photo_ai_features(photo_id,display,source_md5,source_mtime,content_sha256,embedding_model,embedding_dim,embedding,analyzed_at,error,keep_score)
+         SELECT id,display,md5,mtime,?2,'old-model',2,zeroblob(8),'synthetic','',?3 FROM photos WHERE id=?1
+         ON CONFLICT(photo_id) DO UPDATE SET keep_score=excluded.keep_score",
+        params![id, format!("{id:064x}"), score],
+    )
+    .unwrap();
+}
+fn sharp(c: &Connection, id: i64, value: f64) {
+    c.execute(
+        "UPDATE photo_quality_features SET sharpness=?2 WHERE photo_id=?1",
+        params![id, value],
+    )
+    .unwrap();
+}
+fn ids(view: &Json) -> Vec<Vec<i64>> {
+    view["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| {
+            g["photos"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|p| p["id"].as_i64().unwrap())
+                .collect()
+        })
+        .collect()
+}
+fn view_n(e: &LocalEnv, groups: usize) -> Json {
+    crate::ai::search_view::search(
+        &e.conn,
+        &e.config,
+        "",
+        groups,
+        false,
+        None,
+        &crate::ai::http::Deadline::interactive(),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+#[test]
+fn read_apis_load_no_vector_blobs_and_never_recompute_the_snapshot_even_with_a_weight_file() {
+    let mut e = LocalEnv::new(&[]);
+    for (id, at) in [(1, 0), (2, 100), (3, 5000), (4, 5100)] {
+        ready(&mut e.conn, id, at);
+    }
+    // 重みはあるが、写真 1・2 の成分だけ特徴量不足で固定式 fallback になる
+    e.conn
+        .execute(
+            "UPDATE photo_quality_features SET luminance=NULL WHERE photo_id IN (1,2)",
+            [],
+        )
+        .unwrap();
+    std::fs::create_dir_all(e.config.data_dir.join("models")).unwrap();
+    let mut model = rank_json(&identity(2));
+    model["base_features"] = json!(["luminance"]);
+    std::fs::write(&e.config.rank_model_path, model.to_string()).unwrap();
+    // 周期は vector を読む（対照: 計測の印が付いている）
+    let (stored, cycle_sql) = traced(&e.conn, || e.cycle());
+    assert_eq!(stored, 2);
+    assert!(vector_loads(&cycle_sql) >= 1);
+    let kinds: Vec<_> = e.loaded().groups().iter().map(|g| g.rank_used()).collect();
+    assert!(kinds.contains(&RankUsed::Linear));
+    assert!(kinds.contains(&RankUsed::Fallback(rank::Reason::MissingFeature)));
+
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    let (view, e6) = traced(&e.conn, || e.view());
+    assert_eq!(view["groups"].as_array().unwrap().len(), 2);
+    let (status, e5) = traced(&e.conn, || e.status());
+    assert_eq!(status["pipeline"]["scenes"]["linear"], 1);
+    assert_eq!(status["pipeline"]["scenes"]["rules"], 1);
+    let (admin, status_sql) = traced(&e.conn, || crate::admin::status(&e.conn, &ctx).unwrap());
+    assert_eq!(admin["ai_scenes"]["local_ranked"], 2);
+    let (page, photos_sql) = traced(&e.conn, || {
+        crate::admin::photos(&e.conn, &ctx, 1, 2, crate::admin::Filter::All).unwrap()
+    });
+    let page = serde_json::to_value(&page).unwrap();
+    assert_eq!(page["items"][0]["scene"]["state"], "local_ranked");
+    assert!(page["items"][2].is_null()); // 2 件の頁
+
+    // どの読み取りも、場面のために vector BLOB を読まない
+    for (name, sql) in [
+        ("E6", &e6),
+        ("E5", &e5),
+        ("admin status", &status_sql),
+        ("admin photos", &photos_sql),
+    ] {
+        assert_eq!(vector_loads(sql), 0, "{name}");
+    }
+    // 全写真の行の走査は、E6 の検証付き読み取りの 1 回だけ（snapshot の再計算も、fallback の再検証も無い）。
+    // 件数だけの STATUS・E5 と、頁の注記だけの管理一覧は走査しない
+    assert_eq!(full_scans(&e6), 1);
+    assert_eq!(full_scans(&e5), 0);
+    assert_eq!(full_scans(&status_sql), 0);
+    assert_eq!(full_scans(&photos_sql), 0);
+
+    // 検証付きの読み取り単体でも、準備（rankfile）と本体で BLOB を読まない
+    let (_, direct) = traced(&e.conn, || {
+        assert_eq!(e.loaded().groups().len(), 2);
+    });
+    assert_eq!((vector_loads(&direct), full_scans(&direct)), (0, 1));
+
+    // 同じ重みの別の係数では、古い fallback も Linear も採用しない（周期の再計画まで）
+    model["base_weights"] = json!([-2.0]);
+    std::fs::write(&e.config.rank_model_path, model.to_string()).unwrap();
+    assert!(e.loaded().groups().is_empty());
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 0);
+    assert_eq!(e.cycle(), 2);
+    assert_eq!(e.loaded().groups().len(), 2);
+}
+
+#[test]
+fn partial_overlap_is_information_only_and_keeps_the_old_keep_score_order() {
+    let mut e = LocalEnv::new(&[]);
+    for id in 1..=3 {
+        ready(&mut e.conn, id, id * 10);
+    }
+    legacy(&e.conn, &[1, 2]);
+    // 旧来の keep_score では 2 → 3 → 1。場面の順位（鮮明度）では 1 → 3 → 2
+    for (id, keep_score, sharpness) in [(1, 30, 90.0), (2, 90, 10.0), (3, 60, 50.0)] {
+        keep(&e.conn, id, keep_score);
+        sharp(&e.conn, id, sharpness);
+    }
+    e.cycle();
+    assert_eq!(e.loaded().groups()[0].state(), State::ReviewOverlap);
+    let view = e.view();
+    assert_eq!(ids(&view), vec![vec![2, 1], vec![3]]);
+    let first = &view["groups"][0];
+    assert_eq!(first["group_id"], "old");
+    assert_eq!(first["photos"][0]["scene_state"], "review_overlap");
+    assert_eq!(first["photos"][0]["scene_overlap"], "partial");
+    // 情報としては付く（順位・代表）が、並びには使われない
+    assert_eq!(first["photos"][1]["local_rank"], 1);
+    assert_eq!(first["photos"][1]["local_representative"], true);
+}
+
+#[test]
+fn an_exact_scene_inherits_the_old_group_key_and_its_paid_fields() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    legacy(&e.conn, &[1, 2]);
+    e.conn
+        .execute(
+            "UPDATE photo_ai_groups SET summary='kept summary',min_similarity=0.8,max_similarity=0.9,avg_similarity=0.85",
+            [],
+        )
+        .unwrap();
+    sharp(&e.conn, 1, 10.0);
+    sharp(&e.conn, 2, 90.0);
+    e.cycle();
+    assert_eq!(e.loaded().groups()[0].overlap(), Overlap::Exact);
+    let view = e.view();
+    let group = &view["groups"][0];
+    assert_eq!(view["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(group["group_id"], "old");
+    assert_eq!(group["kind"], "scene");
+    assert_eq!(group["summary"], "kept summary");
+    assert_eq!(group["min_similarity"], 0.8);
+    assert_eq!(group["max_similarity"], 0.9);
+    assert_eq!(group["avg_similarity"], 0.85);
+    assert_eq!(group["scene_state"], "local_ranked");
+    assert_eq!(group["scene_overlap"], "exact");
+    assert!(group["scene_result_id"].is_string());
+    // 推薦一覧では場面の順位（鮮明度）が並びを決める（正確な重複でも同じ）
+    assert_eq!(ids(&view), vec![vec![2, 1]]);
+}
+
+#[test]
+fn group_placement_uses_the_old_score_scale_so_scenes_do_not_always_win() {
+    let mut e = LocalEnv::new(&[]);
+    // 場面 S（1・2）は旧来の点が低い。単独の 3 と旧判定の群（4・5。6 を含む場面とは部分重複）は高い
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    ready(&mut e.conn, 3, 20_000);
+    ready(&mut e.conn, 4, 40_000);
+    ready(&mut e.conn, 5, 40_050);
+    ready(&mut e.conn, 6, 40_100);
+    legacy(&e.conn, &[4, 5]);
+    for (id, score) in [(1, 10), (2, 20), (3, 80), (4, 70), (5, 60), (6, 5)] {
+        keep(&e.conn, id, score);
+    }
+    e.cycle();
+    let all = view_n(&e, 30);
+    let order = ids(&all);
+    // 上位は旧来の点の順: 単独 3（80）→ 旧判定の群（70）→ 場面 S（20）
+    assert_eq!(order[0], vec![3]);
+    assert_eq!(order[1], vec![4, 5]);
+    assert_eq!(order[2], vec![1, 2]); // 場面の中は場面の順位（同点は ID 順）
+    // 打ち切っても、点の高い単独写真と旧判定の群が場面に押し出されない
+    assert_eq!(ids(&view_n(&e, 1)), vec![vec![3]]);
+    assert_eq!(ids(&view_n(&e, 2)), vec![vec![3], vec![4, 5]]);
+    // 場面の点（群の中で 0〜100 に正規化）は並びにも similarity にも使わない
+    assert_eq!(all["groups"][0]["photos"][0]["similarity"], 0.8);
+}
+
+#[test]
+fn admin_scene_annotations_follow_the_photo_generation_and_the_current_space() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    e.cycle();
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    let page = |e: &LocalEnv| {
+        serde_json::to_value(
+            crate::admin::photos(&e.conn, &ctx, 1, 10, crate::admin::Filter::All).unwrap(),
+        )
+        .unwrap()
+    };
+    assert_eq!(page(&e)["items"][0]["scene"]["rank"], 1);
+    // 写真の世代が変わったら、その写真の古い注記は出さない（もう片方は残る）
+    e.conn
+        .execute("UPDATE photos SET mtime=2 WHERE id=1", [])
+        .unwrap();
+    let after = page(&e);
+    let by_id = |id: i64| {
+        after["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap()
+            .clone()
+    };
+    assert!(by_id(1).get("scene").is_none());
+    assert_eq!(by_id(2)["scene"]["state"], "local_ranked");
 }

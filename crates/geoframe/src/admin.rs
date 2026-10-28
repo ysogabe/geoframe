@@ -149,10 +149,9 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
         crate::ai::jobs::unix_now(),
     );
     if crate::ai::groups::pending(conn).is_ok_and(|p| p.is_empty()) {
-        let loaded = scenes.and_then(|p| p.load_in(conn));
         out.insert(
             "ai_scenes".into(),
-            crate::ai::groups::runtime::summary(loaded.as_ref()),
+            crate::ai::groups::runtime::status_summary(&scenes, conn),
         );
     }
     Ok(out)
@@ -839,15 +838,6 @@ pub fn photos(
 ) -> rusqlite::Result<PhotosPage> {
     let prepared = crate::ai::groups::runtime::Prepared::read(conn, &ctx.scene_config);
     let _snapshot = conn.unchecked_transaction()?;
-    let scenes = prepared.and_then(|p| p.load_in(conn));
-    let mut local = HashMap::new();
-    if let Ok(scenes) = &scenes {
-        for group in scenes.groups() {
-            for m in group.members() {
-                local.insert(m.photo_id,json!({"state":group.state().as_str(),"overlap":group.overlap().as_str(),"rank":m.rank,"score":m.score,"representative":m.representative,"shortlisted":m.shortlisted}));
-            }
-        }
-    }
     let condition = filter.condition();
     let per = per.clamp(1, PER_PAGE_MAX);
     let total = count_photos(conn, condition)?;
@@ -903,11 +893,21 @@ pub fn photos(
             source: cell(row.get_ref(15)?)?,
             hint: None,
             suggest: None,
-            scene: local.remove(&id),
+            scene: None,
         });
     }
     drop(rows);
     drop(stmt);
+
+    // 場面の注記は、このページの写真の分だけ保存済みの値から読む（ベクトルも他の写真も読まない）
+    let mut scenes = prepared
+        .and_then(|p| p.annotations_in(conn, &items.iter().map(|i| i.id).collect::<Vec<_>>()))
+        .unwrap_or_default();
+    for item in &mut items {
+        item.scene = scenes.remove(&item.id).map(|a| {
+            json!({"state":a.state.as_str(),"overlap":a.overlap.as_str(),"rank":a.rank,"score":a.score,"representative":a.representative,"shortlisted":a.shortlisted})
+        });
+    }
 
     // ヒントは、錨（位置あり写真）が1枚でもあるときだけ全行に付く（近い写真が無ければ null）
     let anchors = if filter.with_hints() {
