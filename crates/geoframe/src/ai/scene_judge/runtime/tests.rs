@@ -767,3 +767,93 @@ print(json.dumps(dict(feed=len(feed), status=isinstance(status,dict), loaded=len
     assert_eq!(l.judgments(), 1);
     assert_eq!(JobState::parse("succeeded"), Some(JobState::Succeeded));
 }
+
+fn view(l: &Lab) -> Value {
+    let read = crate::db::open_read_only(&l.config().db_path()).unwrap();
+    crate::ai::search_view::search(
+        &read,
+        &l.config(),
+        "",
+        30,
+        false,
+        None,
+        &crate::ai::http::Deadline::interactive(),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+#[test]
+fn an_adopted_answer_is_shown_for_its_disjoint_scene_only_and_never_hides_a_photo() {
+    let l = Lab::new();
+    l.scene(1..=3, 0);
+    l.scenes();
+    let before = view(&l);
+    assert_eq!(before["groups"][0]["kind"], "scene");
+    assert!(before["groups"][0].get("judge_source").is_none());
+    let feed = |l: &Lab| {
+        crate::photos::list_photos(&crate::db::open_read_only(&l.config().db_path()).unwrap())
+            .unwrap()
+            .len()
+    };
+    assert_eq!(feed(&l), 3);
+    l.cycle();
+    assert_eq!(l.judgments(), 1);
+    let after = view(&l);
+    let group = &after["groups"][0];
+    assert_eq!(group["judge_source"], "gemini");
+    assert_eq!(group["summary"], "合成の要約");
+    assert_eq!(group["same_scene"], true);
+    assert_eq!(group["scene_overlap"], "disjoint");
+    let photos = group["photos"].as_array().unwrap();
+    assert_eq!(
+        photos
+            .iter()
+            .filter(|p| p["gemini_recommended"] == true)
+            .count(),
+        1
+    );
+    assert!(photos.iter().all(|p| p["gemini_keep_score"].is_number()));
+    // 旧い意味の項目・並び・フィードは変えない（Gemini の推薦で何も隠さない）。
+    assert!(photos.iter().all(|p| p["recommended"].is_null()));
+    assert_eq!(feed(&l), 3);
+    assert_eq!(l.n("SELECT COUNT(*) FROM photo_ai_groups"), 0);
+    // 送った写真が変われば（世代が変わり）回答はもう表示に使わない。履歴は残る。
+    l.exec("UPDATE photos SET rotation=90 WHERE id=2");
+    l.scenes();
+    let changed = view(&l);
+    assert!(changed["groups"][0].get("judge_source").is_none());
+    assert_eq!(l.judgments(), 1);
+    // 許可を外した設定（task が無い）では表示にも使わない。
+    let l = Lab::new();
+    l.scene(1..=3, 0);
+    l.paid();
+    l.reconfigure(|d| {
+        d["tasks"].as_object_mut().unwrap().remove("photo_judge");
+    });
+    assert!(view(&l)["groups"][0].get("judge_source").is_none());
+}
+
+#[test]
+fn a_response_for_a_claim_that_was_returned_meanwhile_is_not_saved() {
+    let l = Arc::new(Lab::new());
+    l.scene(1..=3, 0);
+    l.scenes();
+    let (l2, stop) = (l.clone(), StopFlag::new());
+    let s2 = stop.clone();
+    l.hook(move |event| {
+        if event == "cloud" {
+            s2.stop();
+            // 起動回収・最後の戻し相当: claim token を失効させて deferred に戻す。
+            l2.exec("UPDATE ai_jobs SET state='deferred',claim_token=NULL,last_error_code='shutdown' WHERE kind='photo_judge'");
+        }
+    });
+    l.cycle_stop(&stop);
+    assert_eq!(l.posts(), 1);
+    assert_eq!(
+        l.judgments(),
+        0,
+        "a late answer of an invalidated claim is never stored"
+    );
+    assert_eq!(l.job().unwrap().0, "deferred");
+}

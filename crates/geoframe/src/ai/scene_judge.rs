@@ -187,6 +187,22 @@ impl Manifest {
     }
 }
 
+/// 表示用: 現世代の Disjoint の場面に有効な保存済み回答。E6 の表示にだけ使い、フィードの抑止・
+/// 旧選別（`photo_ai_*`）の根拠にはしない。履歴の読取は PK 1 件（返す場面の数だけ）。
+pub(super) fn applied(
+    conn: &rusqlite::Connection,
+    model: &str,
+    group: &Group,
+) -> rusqlite::Result<Option<Saved>> {
+    let Some(candidate) = Candidate::from_group(group).filter(Candidate::sendable) else {
+        return Ok(None);
+    };
+    Ok(match lookup(conn, &candidate.input_key(model))? {
+        Lookup::Reusable(saved) if saved.applies_to(&candidate) => Some(*saved),
+        _ => None,
+    })
+}
+
 /// writer 外で用意した 1 枚。画像の入口は RGB から作り直した `PreparedImage` だけ。
 pub struct SendImage {
     pub photo_id: i64,

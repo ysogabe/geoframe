@@ -39,6 +39,7 @@ struct SceneGroup<'a> {
     result_id: &'a str,
     /// A scene without an old group of its own (not an exact copy of one) gets scene metadata.
     own_meta: bool,
+    group: &'a super::groups::Group,
 }
 #[derive(Clone, Copy)]
 struct SceneMark {
@@ -168,6 +169,7 @@ pub fn search(
                         overlap,
                         result_id: g.result_id(),
                         own_meta: exact.is_none(),
+                        group: g,
                     },
                 );
             }
@@ -274,6 +276,12 @@ pub fn search(
         }
     }
     let threshold = config.ai_visual_similarity;
+    // A paid Gemini comparison is shown on the disjoint scenes it was adopted for (information only).
+    let judge_model = config
+        .ai
+        .settings()
+        .and_then(|s| s.task(super::settings::TaskKind::PhotoJudge))
+        .map(|t| t.model.as_str());
     let mut result = Vec::new();
     for (key, best) in group_order {
         if whole.remaining().is_none() {
@@ -374,6 +382,24 @@ pub fn search(
             group["scene_state"] = json!(scene.state);
             group["scene_overlap"] = json!(scene.overlap);
             group["scene_result_id"] = json!(scene.result_id);
+            if scene.own_meta
+                && let Some(model) = judge_model
+                && let Some(saved) = super::scene_judge::applied(conn, model, scene.group)?
+            {
+                group["summary"] = json!(saved.verdict().summary());
+                group["same_scene"] = json!(saved.verdict().same_scene());
+                group["judge_model"] = json!(saved.model());
+                group["judge_source"] = json!("gemini");
+                for row in &mut rows {
+                    let position = saved.position(row.id);
+                    row.card["gemini_recommended"] = json!(saved.verdict().recommended(position));
+                    row.card["gemini_keep_score"] = json!(
+                        position
+                            .and_then(|i| saved.verdict().photos().get(i))
+                            .map(super::scene_judge::PhotoVerdict::keep_score)
+                    );
+                }
+            }
         }
         group["group_id"] = json!(&*key);
         group["best_similarity"] = json!(round4(best));

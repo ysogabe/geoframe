@@ -145,6 +145,8 @@ AC4は現入力/完全空間/新参照CASと一次列不変、AC6は空間/破�
 
 後続T4.5cは`Group`の現入力世代/処理版/全members/shortlist/順位/Overlap/LegacyOriginを使える。置換候補は現入力集合・世代の一致するExact、またはDisjointのみで、Partialは管理確認のまま。`paid_reuse_verified()==false`は維持する。今回のscene参照やローカル代表を有償判定済みの証拠にしない。新Gemini回答の送信集合・prompt・モデル・世代・token CASと抑止採用はcが別途実装する。
 
+→ T4.5cの実装・判断点は[ai-scene-judge.md](ai-scene-judge.md)（新Gemini回答の送信集合・世代・token CASを実装。フィード抑止の採用は既定で無効のまま管理者判断）。
+
 ### 移行・dry-run・Python
 
 T4.5aの3表を`ai::pending_active/migrate_active`へ接続した。引数は従来のconn/clue/suggestに`scenes: bool`を追加し、INGEST guard/lock後の起動が有効性を渡す。全部入り`ai::pending/migrate`も3表を含む。列追加0・追加明示索引0・新規schema定義0（既存3表の起動配線）。REQUIRED_SCHEMA・Python schema・旧行は不変。
