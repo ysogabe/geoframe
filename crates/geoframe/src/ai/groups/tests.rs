@@ -2172,3 +2172,285 @@ fn admin_scene_annotations_follow_the_photo_generation_and_the_current_space() {
     assert!(by_id(1).get("scene").is_none());
     assert_eq!(by_id(2)["scene"]["state"], "local_ranked");
 }
+
+/// Measurement only (`--ignored --nocapture`): cost of the stored-scene read paths on a synthetic
+/// 6500x768 catalog. The scenes are computed once with a verified weight (some components fall back
+/// to the fixed rule: missing luminance), published through the repository, and mixed with old
+/// exact/partial groups. The read functions are called directly; nothing leaves the process.
+#[test]
+#[ignore = "measurement: synthetic 6500x768 read paths"]
+fn synthetic_6500x768_read_paths_measure() {
+    use crate::ai::{http::Deadline, search::QueryVector, search_view};
+    use std::time::{Duration, Instant};
+    const SCENES: i64 = 1000;
+    const SCENE_SIZE: i64 = 5;
+    const SINGLES: i64 = 1500;
+    const OLD_GROUPS: i64 = 200; // components below this carry an old group (exact / partial)
+    const SLOT_S: i64 = 2000; // components are further apart than the 900 s window
+    const SLOTS_PER_DAY: i64 = 43;
+    const CALLS: usize = 20;
+    fn rss_kib(key: &str) -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find(|l| l.starts_with(key))
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    fn measure<T>(name: &str, mut run: impl FnMut() -> T, check: impl Fn(&T)) {
+        let before = rss_kib("VmRSS:");
+        let mut times = Vec::new();
+        for _ in 0..CALLS {
+            let start = Instant::now();
+            let out = run();
+            times.push(start.elapsed());
+            check(&out);
+        }
+        let first = times[0];
+        times.sort();
+        let ms = |d: Duration| d.as_secs_f64() * 1000.;
+        eprintln!(
+            "READ_PATH {name}: calls={CALLS} first_ms={:.1} median_ms={:.1} max_ms={:.1} rss_before_kib={before} rss_after_kib={}",
+            ms(first),
+            ms((times[CALLS / 2 - 1] + times[CALLS / 2]) / 2),
+            ms(times[CALLS - 1]),
+            rss_kib("VmRSS:")
+        );
+    }
+
+    let mut e = LocalEnv::new(&[]);
+    // `LocalEnv` already registered a 2-dimensional space under the shared test id.
+    let s = SpaceIdentity::new(
+        "scene-768",
+        "shared-768",
+        "model-a",
+        "rev-a",
+        "img-a",
+        "txt-a",
+        768,
+        Normalization::Raw,
+    )
+    .unwrap();
+    activate(&mut e.conn, &s);
+    // A verified weight on `luminance`: components whose photos lack it fall back to the fixed rule.
+    std::fs::create_dir_all(e.config.data_dir.join("models")).unwrap();
+    let mut weight = rank_json(&s);
+    weight["base_features"] = json!(["luminance"]);
+    std::fs::write(&e.config.rank_model_path, weight.to_string()).unwrap();
+
+    let components: Vec<Vec<i64>> = (0..SCENES)
+        .map(|c| (1..=SCENE_SIZE).map(|k| c * SCENE_SIZE + k).collect())
+        .chain((0..SINGLES).map(|k| vec![SCENES * SCENE_SIZE + k + 1]))
+        .collect();
+    assert_eq!(components.iter().map(Vec::len).sum::<usize>(), 6500);
+    let stamp = |c: i64, k: i64| {
+        let t = (c / SLOTS_PER_DAY) * 86400 + (c % SLOTS_PER_DAY) * SLOT_S + k * 30;
+        let (day, sec) = (t / 86400, t % 86400);
+        format!(
+            "2026-{:02}-{:02} {:02}:{:02}:{:02}",
+            1 + day / 28,
+            1 + day % 28,
+            sec / 3600,
+            (sec / 60) % 60,
+            sec % 60
+        )
+    };
+    let tx = e.conn.transaction().unwrap();
+    {
+        let mut photo = tx.prepare("INSERT INTO photos(id,source,name,display,md5,mtime,rotation,taken_at,lat,lon) VALUES(?1,'local','synthetic',?2,'m',1,0,?3,1,2)").unwrap();
+        let mut quality = tx.prepare("INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,phash,sharpness,luminance,exposure_score,black_clip,white_clip,contrast,error,analyzed_at)
+           VALUES(?1,?2,'m',1,?3,'0',?4,?5,90,0,0,100,'','synthetic')").unwrap();
+        let mut vector = tx
+            .prepare("INSERT INTO ai_embedding_vectors VALUES(?4,?1,?2,768,?3,0)")
+            .unwrap();
+        for (c, ids) in components.iter().enumerate() {
+            let c = c as i64;
+            for (k, &id) in ids.iter().enumerate() {
+                let sha = format!("{id:064x}");
+                let display = format!("synthetic-{id}");
+                let luminance = (c % 4 != 0).then_some(128.0);
+                let mut v = vec![0.0_f32; 768];
+                v[0] = 1.;
+                v[1 + (id % 700) as usize] = 0.02;
+                photo
+                    .execute(params![id, display, stamp(c, k as i64)])
+                    .unwrap();
+                quality
+                    .execute(params![id, display, sha, 1.0 + (id % 9) as f64, luminance])
+                    .unwrap();
+                vector
+                    .execute(params![
+                        sha,
+                        "f".repeat(64),
+                        crate::ai::space::encode(&v),
+                        s.space_id()
+                    ])
+                    .unwrap();
+            }
+        }
+    }
+    // Old selection: every tenth component exactly, and the one after it only partly.
+    let (mut exact, mut partial) = (0, 0);
+    for c in 0..OLD_GROUPS {
+        let (kind, ids) = match c % 10 {
+            0 => ("exact", &components[c as usize][..]),
+            1 => ("partial", &components[c as usize][..3]),
+            _ => continue,
+        };
+        if kind == "exact" {
+            exact += 1;
+        } else {
+            partial += 1;
+        }
+        let group = format!("old-{kind}-{c}");
+        tx.execute("INSERT INTO photo_ai_groups(group_id,kind,algorithm,analyzed_at,status,same_scene,judge_model,judge_version) VALUES(?1,'scene','old','synthetic','judged',1,'synthetic-model','old-prompt')",[&group]).unwrap();
+        for (rank, id) in ids.iter().enumerate() {
+            tx.execute("INSERT INTO photo_ai_features(photo_id,display,source_md5,source_mtime,content_sha256,embedding_model,embedding_dim,embedding,analyzed_at,error)
+               SELECT id,display,md5,mtime,?2,'old-model',2,zeroblob(8),'synthetic','' FROM photos WHERE id=?1",params![id,format!("{id:064x}")]).unwrap();
+            tx.execute("INSERT INTO photo_ai_group_members(group_id,photo_id,rank_in_group,recommended,shortlisted,local_score) VALUES(?1,?2,?3,?4,1,50)",params![group,id,rank as i64+1,rank==0]).unwrap();
+        }
+    }
+    tx.commit().unwrap();
+
+    // Publish the scenes the way the cycle does (one weight, bounded batches), without 150+ full cycles.
+    let started = Instant::now();
+    let snap = snapshot(&e.conn).unwrap().unwrap();
+    let model = rank::Model::load(&e.config.rank_model_path, snap.identity());
+    assert!(model.is_ok());
+    let plan = compute(
+        &snap,
+        e.config.ai.scene_options(),
+        model.as_ref().map_err(|r| *r),
+        &|| false,
+    )
+    .unwrap();
+    let count = |f: &dyn Fn(&Group) -> bool| plan.groups().iter().filter(|g| f(g)).count() as i64;
+    let local_ranked = count(&|g| g.state() == State::LocalRanked);
+    let review_overlap = count(&|g| g.state() == State::ReviewOverlap);
+    let linear = count(&|g| g.rank_used() == RankUsed::Linear);
+    let fallback = count(&|g| matches!(g.rank_used(), RankUsed::Fallback(_)));
+    assert_eq!(plan.groups().len() as i64, SCENES + SINGLES);
+    assert_eq!(count(&|g| g.overlap() == Overlap::Exact), exact);
+    assert_eq!(review_overlap, partial);
+    assert_eq!(linear + fallback, SCENES + SINGLES);
+    assert!(linear > 0 && fallback > 0);
+    let pending = pending_saves(&e.conn, &plan, usize::MAX).unwrap();
+    assert_eq!(pending.len(), plan.groups().len());
+    let plan = Arc::new(plan);
+    for chunk in pending.chunks(runtime::GROUPS_PER_CYCLE) {
+        let (p, indexes) = (Arc::clone(&plan), chunk.to_vec());
+        let saved = e
+            .ingest
+            .writer
+            .call(move |c| Ok(save_batch(c, &p, &indexes, &|| false)))
+            .unwrap()
+            .unwrap();
+        assert!(saved.iter().all(|s| *s == Saved::Stored));
+    }
+    eprintln!(
+        "READ_PATH setup: groups={} (local_ranked={local_ranked} review_overlap={review_overlap} exact={exact} linear={linear} fallback={fallback}) publish_ms={:.0} rss_kib={} hwm_kib={}",
+        plan.groups().len(),
+        started.elapsed().as_secs_f64() * 1000.,
+        rss_kib("VmRSS:"),
+        rss_kib("VmHWM:")
+    );
+    let scenes = |v: &Json| {
+        json!([
+            v["local_ranked"],
+            v["review_overlap"],
+            v["linear"],
+            v["rules"]
+        ])
+    };
+    let expected = json!([local_ranked, review_overlap, linear, fallback]);
+
+    // E6: every returned card must carry its stored scene (an empty read would be a silent miss).
+    let cards = |view: &Json| -> Vec<Json> {
+        view["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|g| g["photos"].as_array().unwrap().clone())
+            .collect()
+    };
+    let check_view = |view: &Json| {
+        assert_eq!(view["searched_photos"], 6500);
+        let cards = cards(view);
+        assert!(!cards.is_empty());
+        assert!(cards.iter().all(|c| c["scene_state"].is_string()));
+        assert!(cards.iter().any(|c| c["scene_state"] == "local_ranked"));
+        assert!(cards.iter().any(|c| c["scene_overlap"] == "exact"));
+    };
+    measure(
+        "E6 empty query",
+        || {
+            search_view::search(
+                &e.conn,
+                &e.config,
+                "",
+                12,
+                false,
+                None,
+                &Deadline::interactive(),
+            )
+            .unwrap()
+            .unwrap()
+        },
+        check_view,
+    );
+    let mut q = vec![0.0_f32; 768];
+    q[0] = 1.;
+    let query = QueryVector::new(&s, &q).unwrap();
+    measure(
+        "E6 semantic query",
+        || {
+            search_view::search(
+                &e.conn,
+                &e.config,
+                "synthetic",
+                12,
+                false,
+                Some(&query),
+                &Deadline::interactive(),
+            )
+            .unwrap()
+            .unwrap()
+        },
+        check_view,
+    );
+    measure(
+        "E5 status",
+        || search_view::status(&e.conn, &e.config).unwrap(),
+        |status| {
+            assert_eq!(status["pipeline"]["scenes"]["state"], "active");
+            assert_eq!(scenes(&status["pipeline"]["scenes"]), expected);
+        },
+    );
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    measure(
+        "admin STATUS",
+        || crate::admin::status(&e.conn, &ctx).unwrap(),
+        |status| {
+            assert_eq!(status["ai_scenes"]["state"], "active");
+            assert_eq!(scenes(&status["ai_scenes"]), expected);
+        },
+    );
+    measure(
+        "admin photos page (per=50)",
+        || crate::admin::photos(&e.conn, &ctx, 1, 50, crate::admin::Filter::All).unwrap(),
+        |page| {
+            let page = serde_json::to_value(page).unwrap();
+            let items = page["items"].as_array().unwrap();
+            assert_eq!(items.len(), 50);
+            assert!(items.iter().all(|i| i["scene"]["state"].is_string()));
+            assert_eq!(items[0]["scene"]["overlap"], "exact");
+            assert_eq!(items[5]["scene"]["overlap"], "partial");
+            assert_eq!(items[5]["scene"]["state"], "review_overlap");
+        },
+    );
+    eprintln!("READ_PATH peak: hwm_kib={}", rss_kib("VmHWM:"));
+}
