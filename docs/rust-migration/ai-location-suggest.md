@@ -119,6 +119,13 @@ c2で追加する2表（既存結果/一次列のschema変更なし、追加索�
 
 新表は有効なsuggest gate時だけmigration/dry-run対象にし、REQUIRED_SCHEMAへ足さない。INGEST=0、設定未指定/不正/無効、allow_cloud=false、日/周期上限0では新規Cloud token/DNS/POSTを行わない。旧AI表だけの読取りやPython切り戻しの既存run/suggestion列を維持する。
 
+## セキュリティレビュー後の修正（P4）
+
+- **管理一覧は画像を読まない**: `GET /api/admin/photos` の候補の表示判定（`CandidateFilter`）はDBだけを見る。履歴・互換runの読込みは最初に必要になったときの1回で、同じ日・同じ結果の行は判定を使い回す。保存時に観測した世代（`Generation`）が今のDBと同じかで判定するので、更新/回転/追加/SAVE/hidden/時刻変更は即座に消える。**ファイルだけが差し替わった・消えた**場合は一覧では分からず、ファイルを観測する次の周期（`reconcile_cleanup`）が、有効でなくなった自分の投影（`ai_location_candidates.row_json`と一致する行）を`photo_loc_suggestions`から外す。`ai_location_candidates`は残すので、元に戻れば座標化の投影復元が行を戻す（再送しない）。Pythonが書き換えた行には触れない。
+- **周期の準備は画像を作らない**: `reconcile`は送れる日を`Intent`（日・モデル・キー）として集めるだけ。上限は1回に32日（`MAX_QUEUE`）で、失敗の履歴（`failed`／`terminal`の`obsolete`）で止まっているキーは数えず積まない（手動retryの`prepare_retry`は外さない）。上限を超えた日は次の周期以降に積まれる（保留理由は増やさない）。画像の読み込み・デコード・縮小・JPEGは`run`が、**送る直前に1件ずつ**行う。その前に安い照合（世代・クラウドの有無・許可・停止・pause・送信枠が残っているか。`RunCtx::budget_left`は予約せず読むだけ）で足切りするので、枠が尽きていれば画像は作らない。送る直前の`check_plan`・`run_checked`内の再検査は従来どおり。
+- **ジョブのキー**: `input_hash`は送信JPEGのSHAを含まない計画（日・モデル・処理版・世代・送る写真のsource SHA）のハッシュ（`SavedAnswer::plan_hash`）に変えた。JPEGは元画像のSHAと処理版（`PREPROCESS_VERSION`を含む）から決まるので同一性は失わず、画像を作らずにキーを決められる。履歴の`result_key`（JPEGのSHAを含む）は変えない。旧キーのジョブは新キーとは別の行になる（P4は未デプロイ）。
+- 準備の恒久失敗（巨大body・画像不正）は、そのジョブ自身の恒久失敗になる（これまでの`-preparation`キーの別jobではない。`Intent`を作れない日だけ従来の別キー）。terminalなら`photo_loc_runs`にerror行を投影する。
+
 ## c2 の検証・引継ぎ
 
 試験は合成RGB/JPEG・合成DB・未登録のRSA fixture・loopbackだけ。実LAN/クラウド/画像/鍵/DB、SSH、LXCは使わない。fixtureは`include_str!`で埋め込み、既存の `tests/fixtures/jwt-test-pkcs8.b64` / `location-suggest-python.json` / `location-clue-python.json` 等を使用する。新たな外部配置fixtureは不要。LXCでRust単体試験を再ビルド/実行するときは更新済み`tools/gen_location_suggest_fixture.py`と既存`app/geoframe/loc_suggest.py`もソースツリーに含める（既存c1と同じPython3前提）。

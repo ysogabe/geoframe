@@ -6,7 +6,7 @@ T4.4bは `GET /api/ai/status`・`GET /api/ai/search` を既存画面へ接続す
 
 - 両APIは完全一致のGET。先頭の `//` は従来どおり畳む。HEAD/POSTは既存ガードで403、その他メソッドは501。Host検査・CSRF・CORS非対応・静的ホワイトリストは従来どおり。残る `/api/ai/*` は既存の定型503。JSONは `application/json; charset=utf-8`・`Cache-Control: no-store`。
 - E6はPythonの `parse_qs` の最初の非空値・`int` と同じ既存 `pyquery` を使う。`groups` は既定12、1〜30へclamp。Unicode数字・符号・数字間の `_`・重複param・不正UTF-8の扱いも共通。不正groupsは400 `bad_params`。例外文字列や入力値はエラーに含めない。
-- groups変換 → AI_ENABLED判定 → 毎分制限 → query正規化/300 Unicode文字検査 → DBの順。空検索・hit・長すぎるqueryも受付窓を消費するが、不正groupsとAI無効は消費しない。毎分制限はプロセス共有の直近60秒、境界 `>=60秒` で除去、既存 `LegacyAi.search_per_min`（既定30）を尊重する。monotonic時計を注入可能にして同じlockで判定/記録する。429は定型文。
+- groups変換 → AI_ENABLED判定 → query正規化/300 Unicode文字検査 → 毎分制限 → DBの順（P4セキュリティレビュー後に、入力の検査を回数の計上より前へ。Pythonとの差）。空検索・hitも受付窓を消費するが、不正groups・長すぎるquery・AI無効は消費しない（長すぎるqueryは制限中でも400）。毎分制限はプロセス共有の直近60秒、境界 `>=60秒` で除去、既存 `LegacyAi.search_per_min`（既定30）を尊重する。monotonic時計を注入可能にして同じlockで判定/記録する。429は定型文。
 - 正規化はPythonの `" ".join(query.strip().split())`。Unicode whitespaceにFS/GS/RS/USも含める。大文字小文字は表示・送信queryに残し、cache keyだけfull casefoldする。`pycasefold.rs` はPython Unicode表から生成し、`tools/gen_ai_query_unicode.py --check` で再現する（生成環境Unicode 14.0）。NUL等の非空白制御文字はPythonと同様保持し、JSONでescapeする。
 - `include_hidden` は最初の値が `1` または `true` のときだけ真。mode、group/card全項目、整数/null/bool、丸め4桁、favorite/recommended/score/keep_scoreの安定並び、構図代表・件数はPython fixtureと比較する。空結果はPythonと同じく `include_hidden` を省略する。
 - **意図したPythonとの差**: 非空queryは新しいactive identityと明示した固定query契約が必要。旧DB・未構築・不適合は、候補0件でも503（Pythonの旧実装はDB行0件ならProvider確認前に200 empty）。適合するactive空間があり、検索対象がhidden/品質条件等で0件なら200 empty。旧ベクトルへ新queryを掛ける例外は設けない。
@@ -107,3 +107,5 @@ pipelineは `index_state`（no_tables/unset/unusable/active）、`query_compatib
 | E5 status | 170ms | 155ms |
 | 管理 STATUS | 39ms | 18ms |
 | 管理の写真一覧 | 2.8ms | 2.5ms |
+
+**`/api/ai/status`の負荷（P4レビュー後）**: 応答を5秒キャッシュする（`AppState`の`ai_status_cache`。計算中はロックを持つので同時に来ても全件検査は1回）。ベクトルのBLOBの全件検査は呼ぶたびにはしない。順位付けの重みファイル（最大8 MiB）は`rank::cached_digest`が、mtime・大きさ・dev/inode・空間が変わったときだけ読み直す（状態・検索・管理一覧・scene判定が共有）。
