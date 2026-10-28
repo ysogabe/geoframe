@@ -27,7 +27,8 @@ use crate::writer::{OpenMode, WriteError, Writer};
 /// 2026-10-26T00:00:00Z（UTC 日の始まり）。
 const D0: i64 = 1_792_972_800;
 const DAY: i64 = 86_400;
-const AI_TABLES: [&str; 17] = [
+const AI_TABLES: [&str; 18] = [
+    "ai_scene_judgments",
     "ai_scene_groups",
     "ai_scene_members",
     "ai_scene_active",
@@ -225,6 +226,7 @@ fn a_t4_1a_database_gets_only_the_new_tables_and_keeps_its_jobs() {
             "ai_request_usage",
             "ai_scene_active",
             "ai_scene_groups",
+            "ai_scene_judgments",
             "ai_scene_members",
             "ai_worker_runs",
             "idx_ai_embedding_vectors_sha"
@@ -244,6 +246,7 @@ fn a_t4_1a_database_gets_only_the_new_tables_and_keeps_its_jobs() {
             "ai_request_usage",
             "ai_scene_active",
             "ai_scene_groups",
+            "ai_scene_judgments",
             "ai_scene_members",
             "ai_worker_runs",
             "idx_ai_embedding_vectors_sha"

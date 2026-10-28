@@ -174,7 +174,14 @@ impl Prepared {
     /// Counts from the stored headers only (status views).
     pub fn summary_in(&self, conn: &Connection) -> serde_json::Value {
         let counts = super::repository::header_counts_in(conn, &self.processors());
-        summary(counts.as_ref().map_err(|e| *e), self.identity.as_ref())
+        let mut summary = summary(counts.as_ref().map_err(|e| *e), self.identity.as_ref());
+        // 保存済みの Gemini 比較の件数（履歴の総数。用途が無効でも過去の回答は残る）。
+        if let Some(map) = summary.as_object_mut()
+            && let Ok(n) = crate::ai::scene_judge::stored_count(conn)
+        {
+            map.insert("paid_judgments".into(), n.into());
+        }
+        summary
     }
     /// Stored positions of one page of photos (management list).
     pub fn annotations_in(

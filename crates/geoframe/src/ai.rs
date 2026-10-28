@@ -38,6 +38,7 @@ pub mod provider;
 pub mod query;
 pub mod rank;
 pub mod runs;
+pub mod scene_judge;
 pub mod search;
 pub mod search_view;
 pub mod settings;
@@ -64,7 +65,7 @@ mod tests_worker;
 
 /// まだ無い AI の表・索引・列の名前（読み取りだけ。`--dry-run` 用）。
 pub fn pending(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    pending_active(conn, true, true, true)
+    pending_active(conn, true, true, true, true)
 }
 
 /// 有効な用途の追加表だけを計画する（書き込みなし）。
@@ -73,6 +74,7 @@ pub fn pending_active(
     clue: bool,
     suggest: bool,
     scenes: bool,
+    judge: bool,
 ) -> rusqlite::Result<Vec<String>> {
     let mut missing = jobs::pending(conn)?;
     missing.extend(missing_tables(conn, budget::TABLES)?);
@@ -89,13 +91,16 @@ pub fn pending_active(
     if scenes {
         missing.extend(groups::pending(conn).map_err(scene_sql_error)?);
     }
+    if judge {
+        missing.extend(missing_tables(conn, scene_judge::TABLES)?);
+    }
     Ok(missing)
 }
 
 /// AI の表を全部足す（無いものだけ。既に最新なら何も書かない）。作った名前を返す。
 /// 書き込み用の接続で呼ぶ。他の表・行には触れない。
 pub fn migrate(conn: &mut Connection) -> rusqlite::Result<Vec<String>> {
-    migrate_active(conn, true, true, true)
+    migrate_active(conn, true, true, true, true)
 }
 
 /// 本番起動は location_clue / location_suggest のそれぞれ有効な用途の結果表だけを作る。
@@ -104,6 +109,7 @@ pub fn migrate_active(
     location_clue_enabled: bool,
     location_suggest_enabled: bool,
     scenes: bool,
+    judge: bool,
 ) -> rusqlite::Result<Vec<String>> {
     let mut created = jobs::migrate(conn)?;
     created.extend(create_tables(conn, budget::TABLES, budget::SCHEMA)?);
@@ -127,6 +133,13 @@ pub fn migrate_active(
     }
     if scenes {
         created.extend(groups::migrate(conn).map_err(scene_sql_error)?);
+    }
+    if judge {
+        created.extend(create_tables(
+            conn,
+            scene_judge::TABLES,
+            scene_judge::SCHEMA,
+        )?);
     }
     Ok(created)
 }

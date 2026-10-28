@@ -163,9 +163,10 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         .gate(ai::settings::TaskKind::LocationSuggest, true)
         .is_ok();
     let scenes = ai::groups::runtime::enabled(config);
-    migration.created.extend(
-        writer.call(move |conn| ai::migrate_active(conn, clue_enabled, suggest_enabled, scenes))?,
-    );
+    let judge = ai::scene_judge::enabled(config);
+    migration.created.extend(writer.call(move |conn| {
+        ai::migrate_active(conn, clue_enabled, suggest_enabled, scenes, judge)
+    })?);
     log_migration(&migration);
 
     let cache = Arc::new(Cache::load(&config.data_dir));
@@ -375,11 +376,13 @@ pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
         .gate(ai::settings::TaskKind::LocationSuggest, config.ingest)
         .is_ok();
     let scenes = ai::groups::runtime::enabled(config);
+    let judge = ai::scene_judge::enabled(config);
     schema.missing_objects.extend(ai::pending_active(
         conn,
         clue_enabled,
         suggest_enabled,
         scenes,
+        judge,
     )?);
     let scene_mismatch = if scenes {
         ai::groups::mismatched(conn)

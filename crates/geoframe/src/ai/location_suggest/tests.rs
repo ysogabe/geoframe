@@ -877,20 +877,20 @@ fn migration_is_additive_idempotent_and_pending_reports_exactly_one_new_table() 
         .unwrap();
     let before = crate::ai::tests::dump(&db.conn);
     assert_eq!(
-        crate::ai::pending_active(&db.conn, false, true, false).unwrap(),
+        crate::ai::pending_active(&db.conn, false, true, false, false).unwrap(),
         ["ai_location_suggest_results"]
     );
     assert_eq!(
-        crate::ai::migrate_active(&mut db.conn, false, true, false).unwrap(),
+        crate::ai::migrate_active(&mut db.conn, false, true, false, false).unwrap(),
         ["ai_location_suggest_results"]
     );
     assert!(
-        crate::ai::migrate_active(&mut db.conn, false, true, false)
+        crate::ai::migrate_active(&mut db.conn, false, true, false, false)
             .unwrap()
             .is_empty()
     );
     assert!(
-        crate::ai::pending_active(&db.conn, false, true, false)
+        crate::ai::pending_active(&db.conn, false, true, false, false)
             .unwrap()
             .is_empty()
     );

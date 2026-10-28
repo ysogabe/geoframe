@@ -776,7 +776,7 @@ fn changed_configuration_rejects_an_old_handler_without_a_send_or_migration_delt
     assert!(matches!(h.run(&ctx, &job), Err(RunError::PolicyDisabled)));
     assert_eq!(lab.posts().len(), 0);
     assert!(
-        crate::ai::pending_active(&read, false, false, false)
+        crate::ai::pending_active(&read, false, false, false, false)
             .unwrap()
             .is_empty()
     );
@@ -1421,7 +1421,7 @@ fn lineage_migration_reports_one_additive_table_and_preserves_existing_jobs() {
     e.writer()
         .call(|c| {
             assert_eq!(
-                crate::ai::pending_active(c, false, false, false)?,
+                crate::ai::pending_active(c, false, false, false, false)?,
                 vec!["ai_image_embedding_lineage"]
             );
             assert_eq!(jobs::migrate(c)?, vec!["ai_image_embedding_lineage"]);

@@ -2,7 +2,7 @@
 //!
 //! 処理の std スレッドが 1 本（ほかに、SIGTERM の直後に停止開始を書くだけの小さなスレッドが 1 本）、既存の writer（[`crate::writer::Writer`]）と `.ingest.lock`
 //! （[`crate::ingest::LockHold`]）を共有して動く。T4.6b/c2 で location_clue / location_suggest / location_geocode を本番登録した。
-//! T4.4a で明示契約の local image_embedding を登録した。photo_judge は未登録のままで claim しない（fake の Provider・任意宛先の設定は置かない）。
+//! T4.4a で明示契約の local image_embedding を登録した。T4.5c で photo_judge（任意の Gemini 比較）を、用途の許可・クラウド接続・場面計算が揃うときだけ登録する（揃わなければ未登録で claim しない。fake の Provider・任意宛先の設定は置かない）。
 //!
 //! # 起動の条件
 //!
@@ -164,6 +164,8 @@ pub fn production_handlers(
             gate.settings.model.clone(),
         ));
     }
+    // 任意の Gemini 比較。用途の許可・クラウド接続・場面計算が揃ったときだけ登録される（無ければ claim されない）。
+    handlers.extend(super::scene_judge::handler(config, data.clone(), cloud));
     handlers.extend(super::location_suggest::handlers(
         config, data, lan, cloud, geocoder, cache,
     ));

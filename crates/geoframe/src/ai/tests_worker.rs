@@ -99,14 +99,42 @@ impl Env {
         self.clock.fetch_add(secs, Ordering::SeqCst);
     }
 
+    /// 同じ data dir を別の AI 設定で読み直す（設定を変えて再起動した状態）。
+    pub(super) fn reconfigure(&self, ai_json: &str) -> Arc<Config> {
+        let path = self._dir.path().join("ai-reconfigured.json");
+        std::fs::write(&path, ai_json).unwrap();
+        let vars: HashMap<String, String> = HashMap::from([
+            (
+                "GEOFRAME_AI_CONFIG".to_string(),
+                path.to_str().unwrap().to_string(),
+            ),
+            ("GEOFRAME_INGEST".to_string(), "1".to_string()),
+        ]);
+        let overrides = Overrides {
+            listen: None,
+            data_dir: Some(self.config.data_dir.clone()),
+        };
+        Arc::new(Config::load(|k| vars.get(k).cloned(), &overrides).unwrap())
+    }
+
     pub(super) fn deps(
         &self,
         handlers: Vec<Arc<dyn Handler>>,
         stop: &StopFlag,
         run_id: &str,
     ) -> WorkerDeps {
+        self.deps_for(Arc::clone(&self.config), handlers, stop, run_id)
+    }
+
+    pub(super) fn deps_for(
+        &self,
+        config: Arc<Config>,
+        handlers: Vec<Arc<dyn Handler>>,
+        stop: &StopFlag,
+        run_id: &str,
+    ) -> WorkerDeps {
         WorkerDeps {
-            config: Arc::clone(&self.config),
+            config,
             writer: self.writer(),
             stop: stop.clone(),
             lock: self.ingest.as_ref().unwrap().lock_hold(),
@@ -276,12 +304,14 @@ fn dyn_handlers(list: &[Arc<Fake>]) -> Vec<Arc<dyn Handler>> {
 #[test]
 fn the_shipped_binary_registers_only_location_clue_and_a_worker_starts_only_with_ingest_and_a_background_task()
  {
-    // 配布バイナリは location_clue のみ（fake・本番のスタブは置かない）
+    // 配布バイナリは location_clue と、許可の揃った photo_judge だけ（fake・本番のスタブは置かない）
     let e = env("production-registration");
     let handlers =
         production_handlers_for_test(&e.config, crate::ai::provider::LanClient::new(&e.config.ai));
-    assert_eq!(handlers.len(), 1);
-    assert_eq!(handlers[0].kind(), JobKind::LocationClue);
+    assert_eq!(
+        handlers.iter().map(|h| h.kind()).collect::<Vec<_>>(),
+        [JobKind::LocationClue, JobKind::PhotoJudge]
+    );
 
     // 取り込み有効 ＋ AI 有効 ＋ 有効な背景用途あり
     assert!(should_start(&env("start-ok").config));
