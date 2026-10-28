@@ -84,7 +84,7 @@ P3で守ること（各タスクの委任文に入れる）:
 |---|---|---|---|---|---|---|---|---|
 | T3.10 | 地名検索にもGEOFRAME_TILE_UAを使い、検証環境でNominatimの実通信と本物のDriveの取り込み・大量削除の保留表示を確認する | AC1, AC2, AC7 | T3.8 | full | 完了 | d7252b7 | 0acfc2c | [drive-acceptance.md](drive-acceptance.md)。通常レビュー（Sol）指摘0、fmt/clippy/739テスト成功。実Drive6535件の冪等性、46原本のRust/Python全件成功、iPhone原本5枚、未登録1行の索引→配信、2000行の保留→解除と画面、Nominatim実通信・キャッシュを確認。一時鍵・原本・複製は削除、元DBと画像は不変 |
 
-## P4: AI Provider・永続ジョブ（実装中）
+## P4: AI Provider・永続ジョブ（PR待ち）
 
 - PRD: [p4-prd.md](p4-prd.md)、設計: [p4-design.md](p4-design.md)。2026-10-26にユーザーが推奨順での実装を承認。
 - 作業ブランチ: `feat/rust-migration-p4`。P4として1つのPR。先にT4.1a〜c、T4.2、T4.3を進める。
@@ -113,6 +113,7 @@ P3で守ること（各タスクの委任文に入れる）:
 | T4.6c2 | 日候補worker・CloudClient接続と別job座標化、Geocoder共有・候補CAS・Python切り戻し | AC2, AC4, AC5, AC8, AC9, AC10a | T4.6c1 | full | 完了 | b9bd93f | 5f92c86..5e9bc80 | 別Sol簡易レビュー2回: 必須1→0（cleanup失敗後のattempts継承迂回を修正）。全1108テスト成功・2件ignore、fmt/clippy・musl成功、限定独立6試験成功。LXC追加24件＋故障注入1件成功。保存済み回答からの再開・共有Geocoder・候補CAS／API／SAVE・Python互換を確認。実クラウド許可とP4全体受入は別 |
 | T4.7 | LXCで通しの受入、Provider停止／復帰、miharashi・管理操作、Python切り戻しと結果の記録 | AC1〜9, AC10a, AC10b | T4.1a〜T4.5, T4.6a〜b, T4.6c1〜c2 | ops | 完了 | fb10168 | 5c24316..7c5bedd | 受入はOpus。[p4-acceptance.md](p4-acceptance.md)。配布用muslで本物の写真とLANのEmbedding・Decisionを使用。6,439件のEmbeddingで7回の再起動でも再送・重複0、Provider停止・無応答中もフィード・画像・STATUS・位置修正は200で復帰後に再開、無応答中のSIGTERMは10.1秒で停止、miharashi定常200・停止再開300とも終了0、日本語の意味検索0.36〜0.44秒（背景の再Embedding中も最大0.55秒）、Python切り戻しで人手の列は全行不変・フィード差は回転した代表の群だけ。直すべき不具合0、見つかった4件のうち2件はT4.8で修正。実クラウド（Vertex/Gemini）はユーザーの許可待ちで未確認。検証LXCは受入前の状態に戻した（`.dump`一致、3,065件） |
 | T4.8 | 受入で見つかったことの修正: 期限を過ぎた後回しのジョブが待ちの後ろに回る、公開前の索引の進み具合が見えない | AC1, AC2, AC6, AC7 | T4.7 | quick | 完了 | 7c5bedd | f550d3f..3e4d9b3 | 実装Sonnet。claimの並びを、ジョブ自身の不良でない後回し（defer_count=0）は登録時刻で並べる（索引・スキーマ変更なし、7,000件で1回0.83ms）。E5の`pipeline.building`と`ai-jobs status`に公開前の件数・成功率・公開条件を出す（BLOBを読まない）。全1,279成功、故障注入6通りで試験が落ちることを確認。残る2件（初回のDecisionの全件再判定で約4時間CPU、初回Embedding中の意味検索503で約48分）はP5の手順・判断事項 |
+| T4.9 | P4全体レビュー・security-reviewの反映: 構築後の追加写真で索引の公開が待たされる、Gemini比較の失敗上限32件が後続を止める、P5への引き継ぎ、位置なし写真の一覧の重さ（画像を読む）、撮影地推定の準備の毎周期デコード、AI状態のキャッシュ、検索の回数計上の順、AI鍵の権限、失敗行の投影 | AC1, AC2, AC5, AC6, AC7, AC9, AC10a | T4.1a〜T4.8 | full | 完了 | 618358f | f6aeddd..7893e59 | P4全体レビュー（要求との突き合わせ、Sol）: 必須3（索引公開の判定を構築開始時のsnapshotに合わせる、失敗キーを候補選びで飛ばす、P5の計画への引き継ぎ）・推奨1（途中段階の文書）。security-review（Opus）: High 0・Medium 2（一覧はDBだけで判定し画像を読まない、推定の画像は送る直前に1件ずつ作る）・Low 8のうち4を反映（AI状態の5秒キャッシュと重みの再読込、検索語の検査を回数より先に、AI鍵の権限・所有者が違えば使わず配信は続ける、送信項目の文書化）。修正後の最終レビュー（Opus）: 必須0・推奨3を反映（中断の上限で失敗したキーの失敗行の投影、鍵を拒否した理由の警告、キャッシュ試験の分離）。実装Sonnet。全1,293成功。検証LXCでlib全1,100件成功（2コアで全件を並列に流すとプロセスのファイル数の上限1,024に当たるので、上限を上げ、リポジトリのfixtureとPillowを一時的に置いて実行。終了後に削除）。P5の条件（初回Embeddingで意味検索503が約48分、Decisionの全件再判定で約4時間CPU、実クラウドの許可、鍵の権限、PythonのAI有効の切り戻し）は[plan.md](plan.md)のP5へ |
 
 ## P5: 切替（未着手）
 
