@@ -40,6 +40,8 @@ handlerは`photo_judge`が`provider=cloud`・`allow_cloud=true`・日の上限�
 
 **採用の効果は表示と再利用だけ**。E6の`kind:"scene"`（Disjoint）のグループに、`summary`・`same_scene`・`judge_model`・`judge_source:"gemini"`、各写真に`gemini_recommended`・`gemini_keep_score`を付ける（現世代で、設定中の`photo_judge`モデルの回答のみ。既存キーの意味・並びは変えない）。管理STATUSの`ai_scenes.paid_judgments`は履歴の総数。**フィードの抑止・旧`photo_ai_*`表・`photos`の人手の列は一切変えない**。未判定・Waiting・Partialも抑止の根拠にしない。
 
+E6の表示用の回答は、場面を読んだ読取transactionを閉じたあとに主キー1件ずつ読む（返す場面の数だけ）。履歴は追記専用で、鍵が場面の構成員・世代そのものから導かれるため、別snapshotで読んでも古い入力の回答を現在の場面に付けることはない（`applies_to`が現在のshortlistの写真と世代を再照合する）。
+
 ## 表・移行・停止
 
 追加は1表のみ（`ai_scene_judgments`、WITHOUT ROWID、明示索引0・列追加0）。`ai::pending_active/migrate_active`の引数に`judge: bool`を足し、`scene_judge::enabled`が真のときだけ起動のINGEST guard後に作る。有効INGESTで許可が揃う場合の不足objectは+1（SAMPLE相当の許可なしでは増分0）。INGEST=0・許可なし・ローカル設定では作らず、読み取りも追加しない。全部入りの`pending/migrate`は1表を含む。

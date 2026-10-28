@@ -424,26 +424,41 @@ fn a_saved_answer_is_reused_across_cycles_restarts_and_unrelated_settings() {
 
 #[test]
 fn a_reused_answer_survives_membership_changes_outside_the_shortlist_only() {
+    // 7 枚（同点は ID 順なので shortlist は 1..=6）。shortlist の外（ID 9）が増えても再送 0。
     let l = Lab::new();
-    l.scene(1..=3, 0);
+    l.scene(1..=7, 0);
     l.paid();
-    // 同じ場面に写真が増えても shortlist（上位 6 枚）が変わらなければ再送しない。
-    l.add(9, 5, 99, false);
-    l.scenes();
-    l.env.advance(3600);
-    l.cycle();
-    let shortlist = l.n("SELECT COUNT(*) FROM ai_scene_members WHERE shortlisted=1");
-    assert!(shortlist >= 3);
-    assert!(
-        l.posts() <= 2,
-        "a changed shortlist may be compared once; never repeatedly"
+    assert_eq!(
+        l.n("SELECT COUNT(*) FROM ai_scene_members WHERE shortlisted=1"),
+        6
     );
-    let posts = l.posts();
+    l.add(9, 5, 99, false);
+    assert_eq!(l.scenes(), 1, "the group is re-saved with its new member");
+    assert_eq!(l.n("SELECT COUNT(*) FROM ai_scene_active"), 8);
+    assert_eq!(
+        l.n(
+            "SELECT COUNT(*) FROM ai_scene_members m JOIN ai_scene_active a
+             ON a.result_id=m.result_id AND a.photo_id=m.photo_id
+             WHERE m.shortlisted=1 AND m.photo_id=9"
+        ),
+        0
+    );
     for _ in 0..2 {
         l.env.advance(3600);
         l.cycle();
     }
-    assert_eq!(l.posts(), posts);
+    assert_eq!((l.posts(), l.judgments()), (1, 1));
+    // shortlist に入る写真（ID 0）が増えれば送信集合が変わるので、別の由来として 1 回だけ再比較する。
+    let l = Lab::new();
+    l.scene(1..=7, 0);
+    l.paid();
+    l.add(0, 5, 98, false);
+    l.scenes();
+    for _ in 0..3 {
+        l.env.advance(3600);
+        l.cycle();
+    }
+    assert_eq!((l.posts(), l.judgments()), (2, 2));
 }
 
 #[test]
@@ -690,6 +705,20 @@ fn damaged_history_holds_without_billing_and_manual_retry_requeues_only_unpaid_i
         lookup(&read, &"0".repeat(64)).unwrap(),
         Lookup::Absent
     ));
+    // 手動の再試行（ai-jobs retry）も、破損した履歴の入力を成功とも未送信とも見なさず、再送しない。
+    l.exec("UPDATE ai_jobs SET state='failed',terminal=1,attempts=5,last_error_code='bad_response' WHERE kind='photo_judge'");
+    let report = crate::ai::ops::retry(
+        &l.env.writer(),
+        &l.config().ai,
+        &l.handlers(),
+        crate::ai::ops::RetryTarget::Kind(JobKind::PhotoJudge),
+        &l.env.clock(),
+    )
+    .unwrap();
+    assert_eq!(report.requeued, 0);
+    l.env.advance(3600);
+    l.cycle();
+    assert_eq!(l.posts(), 1);
 }
 
 #[test]
