@@ -225,6 +225,20 @@
   場面が無くてもかかる分（E5の破損数の走査、E6のvector読み）はT4.5bより前の処理で、ai-search.mdに既知の重さとして記録した。RSSは呼び出しごとに増えず、ピーク約135MiB。
 - 写真を新たに非表示にしない、単一writer、世代CASは各回のレビューで保たれていることを確認した。既知の境界（壊れた撮影時刻のWaitingが件数に残る、空間の切替直後の候補ごとの読み）はai-scenes.mdに記載。T4.5bを完了とする。
 
+### T4.5c: 任意のGemini比較・有償結果の再利用・世代CAS
+
+- 実装はSonnet（`78a6b04`・`f30ad4a`・`8a08880`）。実装しなかったOpusが2回レビューし、必須は0・0。推奨は全て反映した（`9e8a85c`、仕上げ`aa9b0ec`）。設計は[ai-scene-judge.md](ai-scene-judge.md)。
+  - 送るのは、photo_judgeがcloud・allow_cloud・日の上限1以上・場面の計算が有効のときだけ。対象は現世代のLocalRankedでDisjoint、shortlist 2〜6枚、hiddenなし。条件がそろわなければhandler・表・ジョブを作らず、token・DNS・POSTは0。
+  - 画像はRGBの画素から長辺768px・JPEG q82で作り直すのでEXIF/GPSが入らない。SHAを確かめたバイト列と送るバイト列は同じ。毎POSTの予算、失敗5回、中断3回、送信後の時間切れの計上は既存の共通層のまま。
+  - 有償回答は、prompt版・モデル・処理版・送った（写真ID, 世代）を鍵に履歴へ保存する。応答待ちに場面がWaitingやPartialになっても、入力が同じなら保存し、場面ができ直したら再課金せずに使う。
+  - 保存のCASは、token・ジョブの鍵・送った写真の世代とhidden・未保存を、送った写真の分だけIMMEDIATEの中で照合する（全写真を読まない）。
+  - E6では、適用できる回答がある場面だけ、群の中の順序を favorite → recommended → Geminiの推薦 → 場面の代表 にする。群どうしの並び・フィード・旧`photo_ai_*`表は変えない。許可を外すと表示にも並びにも使わない（履歴は残る）。
+  - 既定の判断: フィードの抑止には使わない、Exact（旧Pythonの有償判定が有効）は再送しない、Partialは管理確認のまま。Pythonとの意図した差（Image nラベル、順位順の提示、重複indexの拒否、新しい表だけに保存）は文書に記載。
+- 全workspace 1271成功・失敗0。scene_judgeの専用26件と計測1件。故障注入で、writer内の入力照合・並びの順序・AI停止時の表示の条件を外すと、それぞれ試験が落ちることを確かめた。
+- 親が検証LXCでmuslの試験バイナリを実行し、scene_judge 25件、場面・ストア・ワーカー・検索の122件が成功した（Python切り戻しの試験のため`python3-pil`と依存を一時導入し、終了後に全て削除。常駐サービスはactiveのまま）。
+- LXCでの計測（合成6510枚）: 有償回答の保存のwriter内CASは中央値0.31ms（旧方式の全写真照合は46.7ms）。読み取りは、E6空query 388ms、E5 status 201ms、管理STATUS 46ms（T4.5b完了時の381・170・39msから、回答件数の集計の分だけ増えた）。
+- 実クラウド（Vertex/Gemini）への送信の許可・日の上限は設定していない（ユーザーの判断事項）。順位順で提示することによるImage 1への偏りは、実APIで確かめる点として残す。T4.5cを完了とする。
+
 ## 後始末と残る項目
 
-T4.1a〜c、T4.2、T4.3、T4.4a〜b、T4.5a〜b、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。次はT4.5c（任意Gemini比較）とT4.7の全体受入。LAN DecisionとEmbedding、Rust HTTP経由の日本語検索と背景Embeddingの並行15秒は合成入力で実疎通済み。Vertexの実Provider疎通、miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
+T4.1a〜c、T4.2、T4.3、T4.4a〜b、T4.5a〜c、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。次はT4.7の全体受入。LAN DecisionとEmbedding、Rust HTTP経由の日本語検索と背景Embeddingの並行15秒は合成入力で実疎通済み。Vertexの実Provider疎通、miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
