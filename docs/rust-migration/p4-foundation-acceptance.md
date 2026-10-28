@@ -241,4 +241,4 @@
 
 ## 後始末と残る項目
 
-T4.1a〜c、T4.2、T4.3、T4.4a〜b、T4.5a〜c、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。P4全体は未完了。次はT4.7の全体受入。LAN DecisionとEmbedding、Rust HTTP経由の日本語検索と背景Embeddingの並行15秒は合成入力で実疎通済み。Vertexの実Provider疎通、miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。
+T4.1a〜c、T4.2、T4.3、T4.4a〜b、T4.5a〜c、T4.6a〜b、T4.6c1〜c2の担当実装・レビュー・合成LXC受入は完了した。（ここまではT4.7の前の時点の記録。）T4.7の通しの受入は[p4-acceptance.md](p4-acceptance.md)、受入で見つかったことの修正はT4.8、P5へ引き継ぐ条件は[plan.md](plan.md)のP5に記録した。LAN DecisionとEmbedding、Rust HTTP経由の日本語検索と背景Embeddingの並行15秒は合成入力で実疎通済み。Vertexの実Provider疎通、miharashi・切り戻しを含む全AC、およびブランチ全体レビューとsecurity-reviewはPR前の関門として残す。実クラウドの用途・画像送信・費用の許可はこの実装やスタブ試験へ拡張しない。

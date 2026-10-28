@@ -108,6 +108,11 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 - 本番の切替は**ユーザーの立ち会いのもとで**行う。
 - **P2から持ち越した実Drive確認はT3.10で完了（2026-10-25）**（[drive-acceptance.md](drive-acceptance.md)）。①一覧6535件のdry-run・実同期とも変更・取得0、DB不変 ②原本46枚をRust/Pythonで比較して成功46/46・Rustだけの失敗0 ③iPhoneのHEIC原本5枚成功（8ビット標本。全モードは未網羅）④複製DBの未登録行1件を実Drive一覧から追加し、取得・位置・配信200・再同期の差分0まで確認。④は合成JPEGのDriveアップロードに代え、既存の実Drive写真を未登録にした確認。Drive側への追加・削除は行っていない。
 - **P3から持ち越した画面と実通信の項目は完了（2026-10-25）**: ①画面の目視 ②OSMタイル ③Nominatimの連絡先入りUA共用と実通信・キャッシュ ④大量削除の保留のAPI・画面・解除。③④の結果と確認範囲は[drive-acceptance.md](drive-acceptance.md)。
+- **P4の受入で分かった切替の条件**（[p4-acceptance.md](p4-acceptance.md) §8・§9。担当は管理者、判断はユーザー。**これがそろうまで本番でAIを有効にしない**）:
+  1. **初回のEmbeddingと索引の公開の順序**。新しい空間の索引は、構築開始時の対象の待ちが0になってから公開する設計で、公開までは意味検索（E6の非空query）が503になる。受入の速さ（1本ずつ・150件/30秒）では約6,500件で約48分。切替の前に、本番のコピーで初回の構築を済ませてから入れるか、切替のあと公開まで意味検索が使えないことを受け入れるかを決め、手順に書く。公開までの進み具合はE5の`pipeline.building`と`ai-jobs status`（`GEOFRAME_AI_CONFIG`を付ける）で見る。
+  2. **Decisionの全件再判定**。Rustは旧Pythonの手がかりを信用せず全件判定し直す（T4.6b）。入口のDecisionは今CPUで動いていて1件約12秒・約4コアなので、本番の約1,216件で約4時間、入口の機体（本番機）のCPUを使い続ける。周期の上限で絞って夜間に分けるか、入口の配置（GPU）を変えるかを決める。
+  3. **実クラウド（Vertex/Gemini）**。認証・実TLS・送った画像にEXIF/GPSが無いことの実物確認・予算・位置候補の作成と座標化・Gemini比較は、スタブでだけ確かめてある。用途ごとの送信・画像送信・費用（`daily_request_limit`）の許可はユーザーが決める。許可がある場合は、日の上限を小さくして検証環境で実通信を確かめ、その記録をP4の受入の追記としてから本番で有効にする。許可が無い場合は、クラウドの用途を無効のまま切り替える（ローカルの代表選択とLANのDecisionの手がかりは動く）。
+  4. **PythonのAIを有効にした切り戻し**は未確認（[p4-acceptance.md](p4-acceptance.md) §7.7）。ロールバックの演習で、Pythonを戻したときにAIを有効にするか、無効のまま戻すかを決めて確かめる。
 - **取り込みのガードを外す**（T2.1で入れた暫定。[server.md §11.1.1](server.md#1111-本番への誤指定の防止ガード)）。P2〜P4の間、`GEOFRAME_INGEST=1`の`serve`・`sync`は、検証環境の印`/etc/geoframe/staging`が無い、または`geoframe-server`が非稼働と確認できないと、書き込みの前に終了コード2で断る。本番機には印が無いので、**このガードを外さない限り、本番でRustは取り込みを始められない**。切替の手順で次をこの順に行う:
   1. 本番で`geoframe-server`を止めて`disable`し、停止を確認する（`systemctl is-active`が`inactive`）。Pythonの書き込みが無いことの担保は、ガードではなくこの手順が持つ。ガードは`LoadState`を見ず`ActiveState`だけで判定する（unitファイルを消しても動いているサービスは止まらない）ので、**止める前にunitファイルを消さない**（消すなら停止の確認のあと）。
   2. コードからガードを外す（またはガードの印を本番用に置き換え、`GEOFRAME_INGEST=1`に加えて明示のフラグを要る形にする）。消すもの: `guard.rs`・`lib.rs`の`pub mod guard`・`ingest::start`の`guard.check()`（`start_with`）・`IngestError::Refused`と`cli.rs`の`exit_for_ingest_error`・`tests/ingest_cli.rs`の`Staging`と`GEOFRAME_TEST_*`・ガードのテスト。残った箇所は`grep -rn "guard\|検証環境の印\|GEOFRAME_TEST_" crates deploy docs`で探す。
