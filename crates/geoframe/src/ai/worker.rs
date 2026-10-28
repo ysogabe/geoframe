@@ -1068,6 +1068,10 @@ pub fn spawn(deps: WorkerDeps) -> AiWorker {
                                     Err(super::groups::Error::WriterBusy) => {
                                         tracing::warn!("[ai] scene_writer_busy")
                                     }
+                                    // 場面の表が想定外の列を持つ（移行できない）。配信は続け、周期だけを止める
+                                    Err(super::groups::Error::SchemaMismatch) => {
+                                        tracing::warn!("[ai] scene_schema_mismatch")
+                                    }
                                     Err(_) => tracing::warn!("[ai] scene_cycle_failed"),
                                 }
                             }

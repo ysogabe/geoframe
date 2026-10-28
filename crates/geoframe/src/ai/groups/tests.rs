@@ -1916,6 +1916,14 @@ fn log_sql(event: rusqlite::trace::TraceEvent<'_>) {
         SQL_LOG.with(|log| log.borrow_mut().push(sql.to_string()));
     }
 }
+std::thread_local! {
+    static PROFILE: std::cell::RefCell<Vec<(String, std::time::Duration)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+fn log_profile(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Profile(stmt, d) = event {
+        PROFILE.with(|p| p.borrow_mut().push((stmt.sql().to_string(), d)));
+    }
+}
 /// Statements executed on `c` (this thread) while `f` runs.
 fn traced<T>(c: &Connection, f: impl FnOnce() -> T) -> (T, Vec<String>) {
     SQL_LOG.with(|log| log.borrow_mut().clear());
@@ -2173,6 +2181,277 @@ fn admin_scene_annotations_follow_the_photo_generation_and_the_current_space() {
     assert_eq!(by_id(2)["scene"]["state"], "local_ranked");
 }
 
+// ---- 2nd review: vector presence in the input guard, current-only counts, schema shape ----------
+
+fn scene_count(c: &Connection, sql: &str) -> i64 {
+    c.query_row(sql, [], |r| r.get(0)).unwrap()
+}
+fn scene_marks(view: &Json) -> usize {
+    view["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["photos"].as_array().unwrap().iter())
+        .filter(|c| c["scene_state"].is_string())
+        .count()
+}
+fn sha_hex(id: i64) -> String {
+    format!("{id:064x}")
+}
+fn states(e: &LocalEnv) -> Vec<State> {
+    e.loaded().groups().iter().map(|g| g.state()).collect()
+}
+
+#[test]
+fn a_deleted_vector_stops_the_stored_scene_and_no_cycle_brings_it_back() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(states(&e), vec![State::LocalRanked]);
+    assert_eq!(scene_marks(&e.view()), 2);
+    e.conn
+        .execute(
+            "DELETE FROM ai_embedding_vectors WHERE input_sha256=?1",
+            [sha_hex(2)],
+        )
+        .unwrap();
+    // Before any cycle: the existence of the vector is part of the input guard, so the old R{1,2}
+    // is no longer current for the reads (E6, status of the projection).
+    assert!(e.loaded().groups().is_empty());
+    assert_eq!(scene_marks(&e.view()), 0);
+    // The cycle states "waiting" for the photo that still has a vector, and removes its old reference.
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(states(&e), vec![State::Waiting]);
+    assert_eq!(e.loaded().groups()[0].members().len(), 1);
+    assert_eq!(
+        scene_count(
+            &e.conn,
+            "SELECT COUNT(*) FROM ai_scene_active WHERE photo_id=1"
+        ),
+        0
+    );
+    for _ in 0..3 {
+        assert_eq!(e.cycle(), 0);
+        assert_eq!(states(&e), vec![State::Waiting]);
+        assert_eq!(scene_marks(&e.view()), 0);
+    }
+    let scenes = e.status()["pipeline"]["scenes"].clone();
+    assert_eq!(
+        (&scenes["local_ranked"], &scenes["waiting"]),
+        (&json!(0), &json!(1))
+    );
+    // The vector comes back: the same ranked result is current again and the placeholder is gone.
+    vector(&mut e.conn, 2, &[1., 0.]);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(states(&e), vec![State::LocalRanked]);
+    assert_eq!(
+        scene_count(
+            &e.conn,
+            "SELECT COUNT(*) FROM ai_scene_groups WHERE state='waiting'"
+        ),
+        0
+    );
+    assert_eq!(scene_marks(&e.view()), 2);
+}
+
+#[test]
+fn a_damaged_vector_is_dropped_by_the_search_check_and_the_cycle_waits() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    assert_eq!(e.cycle(), 1);
+    // Same length, non-finite values: the row still exists, so the cheap stored guard cannot see it.
+    e.conn
+        .execute(
+            "UPDATE ai_embedding_vectors SET vector=?2 WHERE input_sha256=?1",
+            params![sha_hex(2), crate::ai::space::encode(&[f32::NAN, 0.])],
+        )
+        .unwrap();
+    // The reads do not attach the old result: E6 requires every member to pass its own vector check.
+    assert_eq!(scene_marks(&e.view()), 0);
+    // The cycle's snapshot sees the damaged vector and states waiting; the old reference is removed.
+    assert_eq!(e.cycle(), 1);
+    assert!(states(&e).iter().all(|s| *s == State::Waiting));
+    assert_eq!(
+        scene_count(
+            &e.conn,
+            "SELECT COUNT(*) FROM ai_scene_active WHERE photo_id=1"
+        ),
+        0
+    );
+    for _ in 0..3 {
+        assert_eq!(e.cycle(), 0);
+        assert_eq!(scene_marks(&e.view()), 0);
+        assert!(!states(&e).contains(&State::LocalRanked));
+    }
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 0);
+}
+
+#[test]
+fn a_replaced_waiting_placeholder_does_not_stay_counted() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    photo(&e.conn, 3, 200, 3); // quality row without a vector yet
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(states(&e), vec![State::Waiting]);
+    assert_eq!(e.status()["pipeline"]["scenes"]["waiting"], 1);
+    vector(&mut e.conn, 3, &[1., 0.]);
+    assert_eq!(e.cycle(), 1);
+    let scenes = e.status()["pipeline"]["scenes"].clone();
+    assert_eq!(
+        (&scenes["local_ranked"], &scenes["waiting"]),
+        (&json!(1), &json!(0))
+    );
+    assert_eq!(
+        scene_count(
+            &e.conn,
+            "SELECT COUNT(*) FROM ai_scene_groups WHERE state='waiting'"
+        ),
+        0
+    );
+    assert_eq!(
+        scene_count(
+            &e.conn,
+            "SELECT COUNT(*) FROM ai_scene_members m WHERE NOT EXISTS(SELECT 1 FROM ai_scene_groups g WHERE g.result_id=m.result_id)"
+        ),
+        0
+    );
+}
+
+#[test]
+fn a_deleted_photo_leaves_no_reference_and_is_not_counted() {
+    let mut e = LocalEnv::new(&[]);
+    for (id, seconds) in [(1, 0), (2, 100), (3, 200)] {
+        ready(&mut e.conn, id, seconds);
+    }
+    ready(&mut e.conn, 9, 50_000); // a singleton elsewhere
+    assert_eq!(e.cycle(), 2);
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 2);
+    e.conn.execute("DELETE FROM photos WHERE id=2", []).unwrap();
+    // Counted by what is current: the result that names the missing photo no longer counts.
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 1);
+    assert_eq!(e.cycle(), 1);
+    let scenes = e.status()["pipeline"]["scenes"].clone();
+    assert_eq!(scenes["local_ranked"], 2);
+    assert_eq!(
+        scene_count(
+            &e.conn,
+            "SELECT COUNT(*) FROM ai_scene_active WHERE photo_id=2"
+        ),
+        0
+    );
+    // A singleton whose photo is deleted: not counted at once, its reference goes with the next write.
+    e.conn.execute("DELETE FROM photos WHERE id=9", []).unwrap();
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 1);
+    ready(&mut e.conn, 10, 80_000);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(
+        scene_count(
+            &e.conn,
+            "SELECT COUNT(*) FROM ai_scene_active WHERE photo_id=9"
+        ),
+        0
+    );
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 2);
+}
+
+#[test]
+fn a_sixteen_column_scene_table_is_migrated_and_its_old_rows_are_replaced_by_the_cycle() {
+    let mut c = pair();
+    let plan = plan(&c);
+    let version = plan.groups()[0].processor_version().to_string();
+    assert_eq!(save(&mut c, &plan, 0, &|| false).unwrap(), Saved::Stored);
+    // The intermediate development shape: the same rows without the last column.
+    c.execute_batch(
+        "PRAGMA foreign_keys=OFF; ALTER TABLE ai_scene_groups DROP COLUMN vector_guard;",
+    )
+    .unwrap();
+    assert_eq!(pending(&c).unwrap(), vec!["ai_scene_groups.vector_guard"]);
+    // Until migrated, nothing is read from or written to it, with a fixed error instead of a silent no-op.
+    assert_eq!(
+        pending_saves(&c, &plan, 8).unwrap_err(),
+        Error::SchemaMismatch
+    );
+    assert_eq!(
+        repository::header_counts_in(&c, &[&version]).unwrap_err(),
+        Error::SchemaMismatch
+    );
+    assert!(load_current(&c, &version).unwrap().groups().is_empty());
+    assert_eq!(
+        migrate(&mut c).unwrap(),
+        vec!["ai_scene_groups.vector_guard"]
+    );
+    assert!(pending(&c).unwrap().is_empty());
+    assert!(migrate(&mut c).unwrap().is_empty());
+    let plan = self::plan(&c); // the stored references changed since the first plan
+    // The old row is still a current result for the reads (its input guard is unchanged) ...
+    assert_eq!(load_current(&c, &version).unwrap().groups().len(), 1);
+    assert_eq!(
+        scene_count(
+            &c,
+            "SELECT COUNT(*) FROM ai_scene_groups WHERE vector_guard=''"
+        ),
+        1
+    );
+    // ... and the cycle replaces it, because the stored header differs from the plan's.
+    assert_eq!(pending_saves(&c, &plan, 8).unwrap(), vec![0]);
+    assert_eq!(save(&mut c, &plan, 0, &|| false).unwrap(), Saved::Stored);
+    assert_eq!(
+        scene_count(
+            &c,
+            "SELECT COUNT(*) FROM ai_scene_groups WHERE vector_guard=''"
+        ),
+        0
+    );
+    assert!(pending_saves(&c, &plan, 8).unwrap().is_empty());
+}
+
+#[test]
+fn a_scene_table_of_another_shape_stops_the_cycle_with_a_fixed_error_and_delivery_continues() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    e.conn
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF; DROP TABLE ai_scene_active; DROP TABLE ai_scene_members; DROP TABLE ai_scene_groups;
+             CREATE TABLE ai_scene_groups(result_id TEXT PRIMARY KEY, unexpected TEXT);
+             CREATE TABLE ai_scene_members(result_id TEXT, photo_id INTEGER);
+             CREATE TABLE ai_scene_active(photo_id INTEGER PRIMARY KEY, result_id TEXT);",
+        )
+        .unwrap();
+    assert_eq!(
+        pending(&e.conn).unwrap(),
+        vec!["ai_scene_groups", "ai_scene_members"]
+    );
+    // Not repaired and not reported as created.
+    assert!(migrate(&mut e.conn).unwrap().is_empty());
+    assert_eq!(
+        pending(&e.conn).unwrap(),
+        vec!["ai_scene_groups", "ai_scene_members"]
+    );
+    let err = runtime::Runtime::production(e.config.clone())
+        .unwrap()
+        .cycle(&e.conn, &e.ingest.writer, &crate::stop::StopFlag::new())
+        .unwrap_err();
+    assert_eq!(err, Error::SchemaMismatch);
+    assert_eq!(err.to_string(), "scene_SchemaMismatch");
+    // Reads and the feed carry on; the scene status says unavailable.
+    assert_eq!(e.status()["pipeline"]["scenes"]["state"], "unavailable");
+    let view = e.view();
+    assert!(!view["groups"].as_array().unwrap().is_empty());
+    assert_eq!(scene_marks(&view), 0);
+    assert!(e.loaded().groups().is_empty());
+    assert_eq!(e.feed().len(), 2);
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    assert!(
+        !crate::admin::status(&e.conn, &ctx)
+            .unwrap()
+            .contains_key("ai_scenes")
+    );
+}
+
 /// Measurement only (`--ignored --nocapture`): cost of the stored-scene read paths on a synthetic
 /// 6500x768 catalog. The scenes are computed once with a verified weight (some components fall back
 /// to the fixed rule: missing luminance), published through the repository, and mixed with old
@@ -2201,7 +2480,7 @@ fn synthetic_6500x768_read_paths_measure() {
             .parse()
             .unwrap()
     }
-    fn measure<T>(name: &str, mut run: impl FnMut() -> T, check: impl Fn(&T)) {
+    fn measure<T>(name: &str, mut run: impl FnMut() -> T, check: impl Fn(&T)) -> f64 {
         let before = rss_kib("VmRSS:");
         let mut times = Vec::new();
         for _ in 0..CALLS {
@@ -2213,13 +2492,42 @@ fn synthetic_6500x768_read_paths_measure() {
         let first = times[0];
         times.sort();
         let ms = |d: Duration| d.as_secs_f64() * 1000.;
+        let median = ms((times[CALLS / 2 - 1] + times[CALLS / 2]) / 2);
         eprintln!(
-            "READ_PATH {name}: calls={CALLS} first_ms={:.1} median_ms={:.1} max_ms={:.1} rss_before_kib={before} rss_after_kib={}",
+            "READ_PATH {name}: calls={CALLS} first_ms={:.1} median_ms={median:.1} max_ms={:.1} rss_before_kib={before} rss_after_kib={}",
             ms(first),
-            ms((times[CALLS / 2 - 1] + times[CALLS / 2]) / 2),
             ms(times[CALLS - 1]),
             rss_kib("VmRSS:")
         );
+        median
+    }
+    fn profile(name: &str, c: &Connection, run: impl FnOnce()) {
+        PROFILE.with(|p| p.borrow_mut().clear());
+        c.trace_v2(
+            rusqlite::trace::TraceEventCodes::SQLITE_TRACE_PROFILE,
+            Some(log_profile),
+        );
+        let start = Instant::now();
+        run();
+        let total = start.elapsed();
+        c.trace_v2(rusqlite::trace::TraceEventCodes::empty(), None);
+        let mut by_sql: BTreeMap<String, (usize, Duration)> = BTreeMap::new();
+        for (sql, d) in PROFILE.with(|p| std::mem::take(&mut *p.borrow_mut())) {
+            let key: String = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+            let key = key.chars().take(110).collect::<String>();
+            let slot = by_sql.entry(key).or_default();
+            slot.0 += 1;
+            slot.1 += d;
+        }
+        let mut rows: Vec<_> = by_sql.into_iter().collect();
+        rows.sort_by_key(|(_, (_, d))| std::cmp::Reverse(*d));
+        eprintln!(
+            "PROFILE {name}: total_ms={:.1}",
+            total.as_secs_f64() * 1000.
+        );
+        for (sql, (n, d)) in rows.iter().take(10) {
+            eprintln!("PROFILE   {:>7.1} ms x{n}: {sql}", d.as_secs_f64() * 1000.);
+        }
     }
 
     let mut e = LocalEnv::new(&[]);
@@ -2377,80 +2685,213 @@ fn synthetic_6500x768_read_paths_measure() {
             .flat_map(|g| g["photos"].as_array().unwrap().clone())
             .collect()
     };
-    let check_view = |view: &Json| {
-        assert_eq!(view["searched_photos"], 6500);
-        let cards = cards(view);
-        assert!(!cards.is_empty());
-        assert!(cards.iter().all(|c| c["scene_state"].is_string()));
-        assert!(cards.iter().any(|c| c["scene_state"] == "local_ranked"));
-        assert!(cards.iter().any(|c| c["scene_overlap"] == "exact"));
-    };
-    measure(
-        "E6 empty query",
-        || {
-            search_view::search(
-                &e.conn,
-                &e.config,
-                "",
-                12,
-                false,
-                None,
-                &Deadline::interactive(),
-            )
-            .unwrap()
-            .unwrap()
-        },
-        check_view,
-    );
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
     let mut q = vec![0.0_f32; 768];
     q[0] = 1.;
     let query = QueryVector::new(&s, &q).unwrap();
-    measure(
+    // The same four routes (plus the management page) in three conditions: scenes published,
+    // scene tables present but empty, scene tables absent. The difference is what the scene layer adds.
+    let routes = |phase: &str, with_scenes: bool| -> [f64; 5] {
+        let tag = |name: &str| format!("{phase}: {name}");
+        let check_view = |view: &Json| {
+            assert_eq!(view["searched_photos"], 6500);
+            let cards = cards(view);
+            assert!(!cards.is_empty());
+            assert_eq!(
+                cards.iter().all(|c| c["scene_state"].is_string()),
+                with_scenes
+            );
+            assert_eq!(
+                cards.iter().any(|c| c["scene_overlap"] == "exact"),
+                with_scenes
+            );
+        };
+        let e6_empty = measure(
+            &tag("E6 empty query"),
+            || {
+                search_view::search(
+                    &e.conn,
+                    &e.config,
+                    "",
+                    12,
+                    false,
+                    None,
+                    &Deadline::interactive(),
+                )
+                .unwrap()
+                .unwrap()
+            },
+            check_view,
+        );
+        let e6_semantic = measure(
+            &tag("E6 semantic query"),
+            || {
+                search_view::search(
+                    &e.conn,
+                    &e.config,
+                    "synthetic",
+                    12,
+                    false,
+                    Some(&query),
+                    &Deadline::interactive(),
+                )
+                .unwrap()
+                .unwrap()
+            },
+            check_view,
+        );
+        let e5 = measure(
+            &tag("E5 status"),
+            || search_view::status(&e.conn, &e.config).unwrap(),
+            |status| {
+                if with_scenes {
+                    assert_eq!(status["pipeline"]["scenes"]["state"], "active");
+                    assert_eq!(scenes(&status["pipeline"]["scenes"]), expected);
+                } else {
+                    assert_eq!(status["pipeline"]["scenes"]["local_ranked"], 0);
+                }
+            },
+        );
+        let admin = measure(
+            &tag("admin STATUS"),
+            || crate::admin::status(&e.conn, &ctx).unwrap(),
+            |status| {
+                if with_scenes {
+                    assert_eq!(status["ai_scenes"]["state"], "active");
+                    assert_eq!(scenes(&status["ai_scenes"]), expected);
+                }
+            },
+        );
+        let photos = measure(
+            &tag("admin photos page (per=50)"),
+            || crate::admin::photos(&e.conn, &ctx, 1, 50, crate::admin::Filter::All).unwrap(),
+            |page| {
+                let page = serde_json::to_value(page).unwrap();
+                let items = page["items"].as_array().unwrap();
+                assert_eq!(items.len(), 50);
+                assert_eq!(
+                    items.iter().all(|i| i["scene"]["state"].is_string()),
+                    with_scenes
+                );
+            },
+        );
+        [e6_empty, e6_semantic, e5, admin, photos]
+    };
+    let with = routes("scenes", true);
+    // Breakdown of the stored-scene work, per function, on the published scenes.
+    let timed = |name: &str, f: &mut dyn FnMut()| {
+        let mut times = Vec::new();
+        for _ in 0..CALLS {
+            let start = Instant::now();
+            f();
+            times.push(start.elapsed().as_secs_f64() * 1000.);
+        }
+        times.sort_by(f64::total_cmp);
+        eprintln!(
+            "BREAKDOWN {name}: median_ms={:.2}",
+            (times[CALLS / 2 - 1] + times[CALLS / 2]) / 2.
+        );
+    };
+    {
+        use crate::ai::groups::runtime::{Prepared, status_summary};
+        let prepared = Prepared::read(&e.conn, &e.config);
+        timed("scene: Prepared::read (active_in + rankfile)", &mut || {
+            Prepared::read(&e.conn, &e.config).unwrap();
+        });
+        timed("scene: load_in (validated projection, E6)", &mut || {
+            let tx = e.conn.unchecked_transaction().unwrap();
+            assert!(
+                !prepared
+                    .as_ref()
+                    .unwrap()
+                    .load_in(&tx)
+                    .unwrap()
+                    .groups()
+                    .is_empty()
+            );
+        });
+        timed(
+            "scene: status_summary (header counts, E5/admin)",
+            &mut || {
+                let tx = e.conn.unchecked_transaction().unwrap();
+                assert_eq!(status_summary(&prepared, &tx)["state"], "active");
+            },
+        );
+        timed("scene: annotations_in (50 photos)", &mut || {
+            let tx = e.conn.unchecked_transaction().unwrap();
+            let ids: Vec<i64> = (1..=50).collect();
+            assert!(
+                !prepared
+                    .as_ref()
+                    .unwrap()
+                    .annotations_in(&tx, &ids)
+                    .unwrap()
+                    .is_empty()
+            );
+        });
+        timed("prior: index::status_in (corrupt count, scan)", &mut || {
+            let tx = e.conn.unchecked_transaction().unwrap();
+            crate::ai::index::status_in(&tx, false).unwrap();
+        });
+        timed("prior: search::load_in (E6 vectors)", &mut || {
+            let tx = e.conn.unchecked_transaction().unwrap();
+            crate::ai::search::load_in(&tx).unwrap();
+        });
+        timed(
+            "prior: selection::admin_counts (old selection)",
+            &mut || {
+                let tx = e.conn.unchecked_transaction().unwrap();
+                crate::selection::admin_counts(&tx).unwrap();
+            },
+        );
+    }
+    // Per-statement time of the two status routes (SQLite profile; includes the Rust work between steps).
+    profile("E5 status", &e.conn, || {
+        search_view::status(&e.conn, &e.config).unwrap();
+    });
+    profile("admin STATUS", &e.conn, || {
+        crate::admin::status(&e.conn, &ctx).unwrap();
+    });
+    profile("E6 empty query", &e.conn, || {
+        search_view::search(
+            &e.conn,
+            &e.config,
+            "",
+            12,
+            false,
+            None,
+            &Deadline::interactive(),
+        )
+        .unwrap()
+        .unwrap();
+    });
+    e.conn.execute("DELETE FROM ai_scene_active", []).unwrap();
+    e.conn.execute("DELETE FROM ai_scene_members", []).unwrap();
+    e.conn.execute("DELETE FROM ai_scene_groups", []).unwrap();
+    let empty = routes("empty scene tables", false);
+    e.conn
+        .execute_batch(
+            "DROP TABLE ai_scene_active; DROP TABLE ai_scene_members; DROP TABLE ai_scene_groups;",
+        )
+        .unwrap();
+    let absent = routes("absent scene tables", false);
+    let names = [
+        "E6 empty query",
         "E6 semantic query",
-        || {
-            search_view::search(
-                &e.conn,
-                &e.config,
-                "synthetic",
-                12,
-                false,
-                Some(&query),
-                &Deadline::interactive(),
-            )
-            .unwrap()
-            .unwrap()
-        },
-        check_view,
-    );
-    measure(
         "E5 status",
-        || search_view::status(&e.conn, &e.config).unwrap(),
-        |status| {
-            assert_eq!(status["pipeline"]["scenes"]["state"], "active");
-            assert_eq!(scenes(&status["pipeline"]["scenes"]), expected);
-        },
-    );
-    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
-    measure(
         "admin STATUS",
-        || crate::admin::status(&e.conn, &ctx).unwrap(),
-        |status| {
-            assert_eq!(status["ai_scenes"]["state"], "active");
-            assert_eq!(scenes(&status["ai_scenes"]), expected);
-        },
-    );
-    measure(
-        "admin photos page (per=50)",
-        || crate::admin::photos(&e.conn, &ctx, 1, 50, crate::admin::Filter::All).unwrap(),
-        |page| {
-            let page = serde_json::to_value(page).unwrap();
-            let items = page["items"].as_array().unwrap();
-            assert_eq!(items.len(), 50);
-            assert!(items.iter().all(|i| i["scene"]["state"].is_string()));
-            assert_eq!(items[0]["scene"]["overlap"], "exact");
-            assert_eq!(items[5]["scene"]["overlap"], "partial");
-            assert_eq!(items[5]["scene"]["state"], "review_overlap");
-        },
-    );
+        "admin photos page",
+    ];
+    for i in 0..5 {
+        eprintln!(
+            "SCENE_LAYER {}: with_scenes_ms={:.1} empty_tables_ms={:.1} absent_tables_ms={:.1} added_vs_empty_ms={:.1} added_vs_absent_ms={:.1}",
+            names[i],
+            with[i],
+            empty[i],
+            absent[i],
+            with[i] - empty[i],
+            with[i] - absent[i]
+        );
+    }
     eprintln!("READ_PATH peak: hwm_kib={}", rss_kib("VmHWM:"));
 }

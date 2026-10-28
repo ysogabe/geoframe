@@ -80,3 +80,18 @@ pipelineは `index_state`（no_tables/unset/unusable/active）、`query_compatib
 - **群の並び**: 意味検索はcosine、空queryは旧来の`keep_score`（無ければ`quality_score`）/100。場面の点は群内で0〜100に正規化されるので群をまたぐ比較には使わず、`groups`件での打ち切りでも単独写真・旧判定の群が場面に押し出されない。
 - **群の中の並び**: favorite → recommended → 場面の代表 → 空queryのときだけ場面の順位 → score → keep_score。意味検索では代表の次はcosine順。Exactも同じ（旧推薦の`recommended`は場面の順位より優先）。
 - 空queryはProvider/Discovery/送信0、非空queryの15秒/LRU64/入力検査/毎分制限/共有LAN lane・Wait/Pauseは変更しない。E5 pipelineにscene状態件数（保存済みヘッダーの件数のみ）と`selection_groups`・`selection_suppressed`（フィードが実際に隠す数。管理の`suppressed`とは別）を追加し、ローカル順位をjudgedへ足さない。管理STATUS/写真にも同じ結果を投影する（頁の分だけ）。読み取りはvector BLOBを読まず順位を再計算しない（検索自体が使うvector読みと、E5の既存のindex状態の読みは除く）。新しいCloud経路は無い。
+
+### 既知の重さ（T4.5b より前からある処理。この作業では直さない）
+
+6,500写真×768次元の合成DB、release、20回の中央値、この機体（musl静的リンクの試験バイナリ。括弧内はglibc）。場面の層が足す分は [ai-scenes.md](ai-scenes.md) の「読み取りの重さ」に分けた。下は場面の有無によらずかかる、以前からの時間。計測は `ai::groups::tests::synthetic_6500x768_read_paths_measure`（`--ignored`、3表を空にした/落とした対照と、関数別・SQL文別の内訳つき）。
+
+| 処理 | 使う経路 | 時間 | 中身 |
+| --- | --- | --- | --- |
+| `index::status_in`（破損数のscan） | E5 status | 41.6ms（33.6） | active空間の全vector BLOB（`SELECT input_sha256,dimension,vector`）を読み、長さ・次元・有限数・ノルムを検査する。SQL文が約21ms、残りは検査 |
+| `search::load_in` | E6（空・意味検索） | 47.6ms（36.5） | 同じ検査に加えて単位ベクトルを持つ。vectorを全部読む |
+| E6の写真行SQLとcardの組立て | E6 | 約37〜45ms | 全写真の列と旧選別の結合を読み、cardのJSONを作る（上位 `groups` 件だけ出力するが、並びのため全件を作る） |
+| `selection::admin_counts`（旧選別の集計） | E5・管理STATUS | 1.6ms（1.2） | 旧選別の有効判定の集計3文 |
+| 管理STATUSの品質・件数の集計 | 管理STATUS | 合計約7ms | 品質の集計と写真の件数。1文あたり約1ms |
+| E5 statusの旧集計（`COUNT(DISTINCT content_sha256)`等） | E5 | 合計約8ms | 旧特徴量・旧選別の件数。`index::status_in` の他の文（約3ms）を含まない |
+
+合計は、E5 status 約47ms（場面あり約51ms）、管理STATUS 約7ms（場面あり約11.5ms）、E6 約101ms（場面あり約131ms）。この修正前は管理STATUSとE5が約310〜430ms（場面の層の件数の `GROUP BY` が約250ms以上）だった。残る大きい塊は、E5・E6がともに全vector BLOBを毎回読んで検査していること（約40〜48ms）と、E6の全写真のcard組立て（約40ms）。直すには、検査済みの結果の保持（要invalidation）や検索の並びと切り出しの段階的な読みが要り、T4.5bの範囲外。

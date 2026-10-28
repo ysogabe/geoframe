@@ -20,7 +20,7 @@ const JOINS: &str = "FROM photos p
 
 struct Photo {
     id: i64,
-    key: String,
+    key: Arc<str>,
     card: Value,
     vector: Option<Arc<Vec<f32>>>,
     /// Placement score: the similarity (semantic) or the old `keep_score`/`quality_score` scale.
@@ -29,6 +29,24 @@ struct Photo {
     /// Rank inside a local-ranked scene. Partial-overlap (review) scenes carry none.
     scene_rank: Option<usize>,
     scene_representative: bool,
+    /// Stored scene position, written into the card only for the groups that are returned.
+    scene: Option<SceneMark>,
+}
+/// A returned scene's group-level facts (the JSON is built only for returned groups).
+struct SceneGroup<'a> {
+    state: &'static str,
+    overlap: &'static str,
+    result_id: &'a str,
+    /// A scene without an old group of its own (not an exact copy of one) gets scene metadata.
+    own_meta: bool,
+}
+#[derive(Clone, Copy)]
+struct SceneMark {
+    rank: usize,
+    score: Option<f64>,
+    representative: bool,
+    state: &'static str,
+    overlap: &'static str,
 }
 fn list(v: Option<String>) -> Value {
     v.and_then(|s| serde_json::from_str::<Value>(&s).ok())
@@ -96,14 +114,38 @@ pub fn search(
     if vector.is_some_and(|v| loaded.index.as_ref().map(|i| i.identity()) != Some(v.identity())) {
         return Ok(Err(Error::Unavailable));
     }
+    let has_active = loaded.index.is_some();
+    let mut active = HashMap::new();
+    if let Some(index) = loaded.index {
+        for entry in index.entries {
+            let values = Arc::new(entry.unit);
+            let score = vector.map_or(0.0, |v| cosine(&values, &v.unit));
+            for id in entry.photo_ids {
+                active.insert(id, (Arc::clone(&values), score));
+            }
+        }
+    }
     // Scene results are attached as information. Only a local-ranked scene (disjoint or an exact
     // copy of an old group) orders anything; a partial overlap is left to the old selection.
-    let mut local = HashMap::new();
-    let mut scene_meta = HashMap::new();
-    let mut scene_extra = HashMap::new();
+    let mut local: HashMap<i64, (Option<Arc<str>>, SceneMark)> = HashMap::with_capacity(
+        scenes
+            .as_ref()
+            .map_or(0, |s| s.groups().iter().map(|g| g.members().len()).sum()),
+    );
+    // Only the groups that are returned get their JSON; building it for every scene would be per-request work
+    // proportional to the library.
+    let mut scene_groups: HashMap<Arc<str>, SceneGroup> = HashMap::new();
     if let Ok(scenes) = &scenes {
         for g in scenes.groups() {
-            if g.state() == super::groups::State::Waiting {
+            // Waiting is never a representative or a rank. A result whose photos do not all have a
+            // vector that passed the search's own check (deleted, wrong shape, non-finite values) is
+            // not used either: the cheap stored-scene guard cannot see a damaged BLOB, this can.
+            if g.state() == super::groups::State::Waiting
+                || !has_active
+                || g.members()
+                    .iter()
+                    .any(|m| !active.contains_key(&m.photo_id))
+            {
                 continue;
             }
             let (state, overlap) = (g.state().as_str(), g.overlap().as_str());
@@ -115,26 +157,29 @@ pub fn search(
                 .first()
                 .filter(|_| g.overlap() == super::groups::Overlap::Exact)
                 .map(|o| o.group_id().to_string());
-            let key = ordering.then(|| exact.clone().unwrap_or_else(|| g.result_id().to_string()));
+            let key = ordering.then(|| {
+                Arc::<str>::from(exact.clone().unwrap_or_else(|| g.result_id().to_string()))
+            });
             if let Some(key) = &key {
-                scene_extra.insert(key.clone(), json!({"scene_state":state,"scene_overlap":overlap,"scene_result_id":g.result_id()}));
-                if exact.is_none() {
-                    scene_meta.insert(key.clone(),json!({"kind":"scene","summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null}));
-                }
+                scene_groups.insert(
+                    Arc::clone(key),
+                    SceneGroup {
+                        state,
+                        overlap,
+                        result_id: g.result_id(),
+                        own_meta: exact.is_none(),
+                    },
+                );
             }
             for m in g.members() {
-                local.insert(m.photo_id, (key.clone(), state, overlap, m));
-            }
-        }
-    }
-    let has_active = loaded.index.is_some();
-    let mut active = HashMap::new();
-    if let Some(index) = loaded.index {
-        for entry in index.entries {
-            let values = Arc::new(entry.unit);
-            let score = vector.map_or(0.0, |v| cosine(&values, &v.unit));
-            for id in entry.photo_ids {
-                active.insert(id, (Arc::clone(&values), score));
+                let mark = SceneMark {
+                    rank: m.rank,
+                    score: m.score,
+                    representative: m.representative,
+                    state,
+                    overlap,
+                };
+                local.insert(m.photo_id, (key.clone(), mark));
             }
         }
     }
@@ -167,26 +212,24 @@ pub fn search(
         card["reasons"] = list(r.get("reasons_json")?);
         card["concerns"] = list(r.get("concerns_json")?);
         let ai_group: Option<String> = r.get("ai_group_id")?;
-        let mut key = ai_group.filter(|s| !s.is_empty()).unwrap_or_else(|| {
-            if card["quality_group_kind"] == "similar" { format!("local-similar-{}",card["quality_group_id"]) } else { format!("photo-{id}") }
-        });
-        let (mut scene_rank, mut scene_representative) = (None, false);
-        if let Some((scene_key,state,overlap,m)) = local.get(&id) {
-            card["local_rank"] = json!(m.rank);
-            card["local_score"] = json!(m.score);
-            card["local_representative"] = json!(m.representative);
-            card["scene_state"] = json!(state);
-            card["scene_overlap"] = json!(overlap);
-            if let Some(scene_key) = scene_key {
-                key = scene_key.clone();
-                (scene_rank, scene_representative) = (Some(m.rank), m.representative);
-            }
-        }
+        let scene_entry = local.get(&id);
+        let scene_key = scene_entry.and_then(|(k, _)| k.as_ref());
+        let key: Arc<str> = match scene_key {
+            Some(k) => Arc::clone(k),
+            None => ai_group.filter(|s| !s.is_empty()).unwrap_or_else(|| {
+                if card["quality_group_kind"] == "similar" { format!("local-similar-{}",card["quality_group_id"]) } else { format!("photo-{id}") }
+            }).into(),
+        };
+        let (scene_rank, scene_representative) = match (scene_key, scene_entry) {
+            (Some(_), Some((_, mark))) => (Some(mark.rank), mark.representative),
+            _ => (None, false),
+        };
+        let scene = scene_entry.map(|(_, mark)| *mark);
         let values = new.map(|(v,_)| Arc::clone(v)).or_else(|| {
             if has_active { None } else { legacy_vector(r.get("embedding").ok().flatten(), r.get("embedding_dim").ok().flatten()) }
         });
         let score = if vector.is_some() { new.unwrap().1 } else { card["keep_score"].as_f64().or_else(|| card["quality_score"].as_f64()).unwrap_or_default()/100.0 };
-        Ok(Some(Photo { id, key, card, vector:values, score, scene_rank, scene_representative }))
+        Ok(Some(Photo { id, key, card, vector:values, score, scene_rank, scene_representative, scene }))
     })?;
     let mut photos = rows
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -201,7 +244,7 @@ pub fn search(
             json!({"ok":true,"query":query,"mode":"empty","groups":[],"searched_photos":0}),
         ));
     }
-    let mut meta = scene_meta;
+    let mut meta = HashMap::new();
     let mut stmt = tx.prepare("SELECT group_id,kind,summary,min_similarity,max_similarity,avg_similarity FROM photo_ai_groups")?;
     for row in stmt.query_map([], |r| Ok((r.get::<_,String>(0)?, json!({"kind":r.get::<_,String>(1)?,"summary":r.get::<_,String>(2)?,"min_similarity":r.get::<_,Option<f64>>(3)?,"max_similarity":r.get::<_,Option<f64>>(4)?,"avg_similarity":r.get::<_,Option<f64>>(5)?}))))? { let (k,v)=row?; meta.insert(k,v); }
     drop(stmt);
@@ -224,7 +267,7 @@ pub fn search(
             }
         }
     }
-    let mut members = HashMap::<String, Vec<Photo>>::new();
+    let mut members = HashMap::<Arc<str>, Vec<Photo>>::new();
     for photo in photos {
         if seen.contains(&photo.key) {
             members.entry(photo.key.clone()).or_default().push(photo);
@@ -311,14 +354,28 @@ pub fn search(
             row.card["visual_similarity"] = json!(round4(similarity));
             row.card["visual_representative"] = json!(representative);
             row.card["visual_cluster_size"] = json!(sizes[i]);
+            if let Some(mark) = row.scene {
+                row.card["local_rank"] = json!(mark.rank);
+                row.card["local_score"] = json!(mark.score);
+                row.card["local_representative"] = json!(mark.representative);
+                row.card["scene_state"] = json!(mark.state);
+                row.card["scene_overlap"] = json!(mark.overlap);
+            }
         }
-        let mut group = meta.remove(&key).unwrap_or_else(|| json!({"kind":if key.starts_with("local-similar-") {"similar"} else {"single"},"summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null}));
-        if let Some(Value::Object(extra)) = scene_extra.get(&key) {
-            extra
-                .iter()
-                .for_each(|(k, v)| group[k.as_str()] = v.clone());
+        let scene = scene_groups.get(&key);
+        let mut group = meta.remove(&*key).unwrap_or_else(|| {
+            if scene.is_some_and(|s| s.own_meta) {
+                json!({"kind":"scene","summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null})
+            } else {
+                json!({"kind":if key.starts_with("local-similar-") {"similar"} else {"single"},"summary":"","min_similarity":null,"max_similarity":null,"avg_similarity":null})
+            }
+        });
+        if let Some(scene) = scene {
+            group["scene_state"] = json!(scene.state);
+            group["scene_overlap"] = json!(scene.overlap);
+            group["scene_result_id"] = json!(scene.result_id);
         }
-        group["group_id"] = json!(key);
+        group["group_id"] = json!(&*key);
         group["best_similarity"] = json!(round4(best));
         group["visual_similarity_threshold"] = json!(threshold);
         group["visual_cluster_count"] = json!(reps.len());

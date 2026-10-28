@@ -393,11 +393,14 @@ pub(crate) fn fingerprint(parts: &[&str]) -> String {
         ctx.update(&(part.len() as u64).to_le_bytes());
         ctx.update(part.as_bytes());
     }
-    ctx.finish()
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let digest = ctx.finish();
+    let mut out = String::with_capacity(64);
+    for b in digest.as_ref() {
+        out.push(DIGITS[usize::from(b >> 4)] as char);
+        out.push(DIGITS[usize::from(b & 15)] as char);
+    }
+    out
 }
 
 // ---------------------------------------------------------------- JSON の読み込み

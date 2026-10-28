@@ -11,7 +11,46 @@ use super::*;
 use crate::ai::space;
 use crate::ai::{index, jobs, settings::fingerprint};
 
-const TABLES: &[&str] = &["ai_scene_groups", "ai_scene_members", "ai_scene_active"];
+/// Tables and their columns in table order. A table that exists with other columns is never trusted.
+const TABLES: &[(&str, &[&str])] = &[
+    (
+        "ai_scene_groups",
+        &[
+            "result_id",
+            "space_id",
+            "space_fingerprint",
+            "input_generation",
+            "processor_version",
+            "window_s",
+            "similarity",
+            "shortlist",
+            "state",
+            "overlap",
+            "rank_used",
+            "weight_digest",
+            "lo",
+            "hi",
+            "input_guard",
+            "legacy_json",
+            "vector_guard",
+        ],
+    ),
+    (
+        "ai_scene_members",
+        &[
+            "result_id",
+            "photo_id",
+            "generation",
+            "rank",
+            "score",
+            "shortlisted",
+            "representative",
+            "shown",
+            "favorite",
+        ],
+    ),
+    ("ai_scene_active", &["photo_id", "result_id"]),
+];
 /// Columns of `ai_scene_groups` in table order.
 const HEADER_COLUMNS: usize = 17;
 const SCHEMA: &str = "
@@ -34,77 +73,219 @@ CREATE TABLE IF NOT EXISTS ai_scene_active(
  photo_id INTEGER PRIMARY KEY, result_id TEXT NOT NULL REFERENCES ai_scene_groups(result_id)
 );
 ";
+/// The one development shape of `ai_scene_groups` that predates `vector_guard`. The scene tables are
+/// derived data that no release carried, so this single missing trailing column is added in place
+/// (the rows are replaced by the next cycle); any other shape is not repaired.
+const OUTDATED_COLUMN: &str = "vector_guard";
 
-pub fn pending(conn: &Connection) -> Result<Vec<String>, Error> {
-    TABLES
-        .iter()
-        .filter_map(|name| match jobs::object_exists(conn, "table", name) {
-            Ok(true) => None,
-            Ok(false) => Some(Ok((*name).to_string())),
-            Err(e) => Some(Err(e.into())),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Absent,
+    Current,
+    /// `ai_scene_groups` without its last column (`vector_guard`).
+    Outdated,
+    Unknown,
+}
+fn classify(table: &str, columns: &[&str], found: &[String]) -> Shape {
+    if found.is_empty() {
+        Shape::Absent
+    } else if found.iter().map(String::as_str).eq(columns.iter().copied()) {
+        Shape::Current
+    } else if table == "ai_scene_groups"
+        && columns.split_last().is_some_and(|(last, rest)| {
+            *last == OUTDATED_COLUMN && found.iter().map(String::as_str).eq(rest.iter().copied())
         })
-        .collect()
+    {
+        Shape::Outdated
+    } else {
+        Shape::Unknown
+    }
+}
+/// One statement for all three tables (a PRAGMA per table costs about a millisecond per read).
+fn shapes(conn: &Connection) -> Result<Vec<(&'static str, Shape)>, Error> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT m.name,i.name FROM sqlite_master m, pragma_table_info(m.name) i
+          WHERE m.type='table' AND m.name IN ('ai_scene_groups','ai_scene_members','ai_scene_active')
+          ORDER BY m.name,i.cid",
+    )?;
+    let mut columns: HashMap<String, Vec<String>> = HashMap::new();
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        columns
+            .entry(row.get(0)?)
+            .or_default()
+            .push(row.get::<_, String>(1)?);
+    }
+    Ok(TABLES
+        .iter()
+        .map(|(name, expected)| {
+            let found = columns.remove(*name).unwrap_or_default();
+            (*name, classify(name, expected, &found))
+        })
+        .collect())
+}
+/// Every scene table exists with exactly the current columns.
+fn ready(conn: &Connection) -> Result<bool, Error> {
+    Ok(shapes(conn)?.iter().all(|(_, s)| *s == Shape::Current))
+}
+/// Like [`ready`], but a table with other columns than any this code writes is a fixed error
+/// (`SchemaMismatch`) instead of a silently empty result.
+fn ready_or_mismatch(conn: &Connection) -> Result<bool, Error> {
+    let shapes = shapes(conn)?;
+    if shapes
+        .iter()
+        .any(|(_, s)| matches!(s, Shape::Outdated | Shape::Unknown))
+    {
+        return Err(Error::SchemaMismatch);
+    }
+    Ok(shapes.iter().all(|(_, s)| *s == Shape::Current))
+}
+
+/// Missing tables by name, and `ai_scene_groups.vector_guard` for the one outdated shape. A table with
+/// other columns is reported by its name (it is not repaired; see [`migrate`]).
+pub fn pending(conn: &Connection) -> Result<Vec<String>, Error> {
+    Ok(shapes(conn)?
+        .into_iter()
+        .filter_map(|(name, shape)| match shape {
+            Shape::Current => None,
+            Shape::Absent | Shape::Unknown => Some(name.to_string()),
+            Shape::Outdated => Some(format!("{name}.{OUTDATED_COLUMN}")),
+        })
+        .collect())
 }
 /// Requires the caller's INGEST guard and Writer. This API is never invoked by readonly paths.
+/// Missing tables are created and the outdated `ai_scene_groups` gets its `vector_guard` column. A table
+/// of any other shape is left untouched (and not reported as created): the cycle and the scene reads
+/// then fail with the fixed `SchemaMismatch` while delivery continues, until the derived scene tables
+/// are dropped.
 pub fn migrate(conn: &mut Connection) -> Result<Vec<String>, Error> {
-    let missing = pending(conn)?;
-    if missing.is_empty() {
-        return Ok(missing);
+    let created: Vec<String> = shapes(conn)?
+        .into_iter()
+        .filter_map(|(name, shape)| match shape {
+            Shape::Absent => Some(name.to_string()),
+            Shape::Outdated => Some(format!("{name}.{OUTDATED_COLUMN}")),
+            Shape::Current | Shape::Unknown => None,
+        })
+        .collect();
+    if created.is_empty() {
+        return Ok(created);
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     tx.execute_batch(SCHEMA)?;
+    if shapes(&tx)?
+        .iter()
+        .any(|(name, s)| *name == "ai_scene_groups" && *s == Shape::Outdated)
+    {
+        tx.execute_batch(&format!(
+            "ALTER TABLE ai_scene_groups ADD COLUMN {OUTDATED_COLUMN} TEXT NOT NULL DEFAULT ''"
+        ))?;
+    }
     tx.commit()?;
-    Ok(missing)
+    Ok(created)
 }
 
 #[derive(Clone)]
 struct Row {
+    id: i64,
+    /// All 23 columns for the cycle's snapshot only. Reads keep none: the facts they need are the
+    /// fields below, and the digests cover every column.
     values: Vec<Value>,
-    digest: String,
+    /// Digest of every column: any change of the photo or its quality changes it.
+    digest: [u8; 32],
+    /// Digest of the columns that make the photo's generation (its hex form is stored with each member).
+    generation_digest: [u8; 32],
     captured: Option<i64>,
+    /// A valid `content_sha256` (lower-case hex), and its index into [`Raw::shas`].
+    sha: Option<[u8; 64]>,
+    sha_ix: Option<usize>,
+    shown: bool,
+    favorite: bool,
+    eligible: bool,
 }
 impl Row {
-    fn new(values: Vec<Value>) -> Self {
-        Self {
-            digest: row_digest(&values),
-            captured: captured(&values[5]),
-            values,
+    /// One row of [`PHOTO_ROWS`]. `scratch` is a reusable buffer for the typed encoding of the
+    /// columns (one hash call per digest); the encoding is taken from the borrowed column values.
+    fn from_sql(
+        r: &rusqlite::Row<'_>,
+        scratch: &mut Vec<u8>,
+        full: bool,
+    ) -> rusqlite::Result<Self> {
+        scratch.clear();
+        let mut ends = [0usize; 23];
+        for (i, end) in ends.iter_mut().enumerate() {
+            encode_ref(scratch, r.get_ref(i)?);
+            *end = scratch.len();
         }
+        // The generation covers id..taken_at (columns 0..6) and the quality identity (columns 11..21).
+        let mut generation = ring::digest::Context::new(&ring::digest::SHA256);
+        generation.update(&scratch[..ends[5]]);
+        generation.update(&scratch[ends[10]..ends[20]]);
+        let generation_digest = finish32(generation);
+        // The full digest is the generation digest plus the remaining columns, so no byte is hashed twice.
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+        digest.update(&generation_digest);
+        digest.update(&scratch[ends[5]..ends[10]]);
+        digest.update(&scratch[ends[20]..]);
+        let value_text = |i: usize| match r.get_ref(i) {
+            Ok(ValueRef::Text(t)) => std::str::from_utf8(t).ok(),
+            _ => None,
+        };
+        let value_number = |i: usize| match r.get_ref(i) {
+            Ok(ValueRef::Integer(n)) => Some(n as f64),
+            Ok(ValueRef::Real(n)) if n.is_finite() => Some(n),
+            _ => None,
+        };
+        let display = value_text(1).is_some_and(|s| !s.is_empty());
+        let sha = value_text(12).filter(|s| valid_sha(s)).map(|s| {
+            let mut out = [0u8; 64];
+            out.copy_from_slice(s.as_bytes());
+            out
+        });
+        let values = if full {
+            (0..23)
+                .map(|i| r.get::<_, Value>(i))
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            id: match r.get_ref(0)? {
+                ValueRef::Integer(id) => id,
+                _ => 0,
+            },
+            digest: finish32(digest),
+            generation_digest,
+            captured: value_text(5).and_then(captured_text),
+            shown: display
+                && value_number(6).unwrap_or(0.0) == 0.0
+                && value_number(8).is_some()
+                && value_number(9).is_some()
+                && (value_text(21) != Some("exact") || value_number(22) == Some(1.0)),
+            favorite: value_number(7) == Some(1.0),
+            eligible: display && sha.is_some() && value_text(19) == Some(""),
+            sha,
+            sha_ix: None,
+            values,
+        })
     }
     fn id(&self) -> i64 {
-        match self.values[0] {
-            Value::Integer(id) => id,
-            _ => 0,
-        }
+        self.id
     }
     fn generation(&self) -> String {
-        let mut values = self.values[..6].to_vec();
-        values.extend_from_slice(&self.values[11..21]);
-        row_digest(&values)
+        hex(&self.generation_digest)
+    }
+    /// Whether a stored (hex) generation is this photo's current one, without building the string.
+    fn generation_is(&self, stored: &str) -> bool {
+        hex_is(&self.generation_digest, stored)
     }
     fn shown(&self) -> bool {
-        let v = &self.values;
-        text(&v[1]).is_some_and(|s| !s.is_empty())
-            && number(&v[6]).unwrap_or(0.0) == 0.0
-            && number(&v[8]).is_some()
-            && number(&v[9]).is_some()
-            && (text(&v[21]) != Some("exact") || number(&v[22]) == Some(1.0))
+        self.shown
     }
     fn sha(&self) -> Option<&str> {
-        text(&self.values[12]).filter(|s| valid_sha(s))
+        self.sha.as_ref().and_then(|s| std::str::from_utf8(s).ok())
     }
-    fn eligible(&self) -> Option<index::Eligible> {
-        if text(&self.values[19]) != Some("") {
-            return None;
-        }
-        Some(index::Eligible {
-            photo_id: self.id(),
-            input_sha256: self.sha()?.into(),
-            display: text(&self.values[1]).filter(|s| !s.is_empty())?.into(),
-            md5: self.values[2].clone(),
-            mtime: self.values[3].clone(),
-            rotation: self.values[4].clone(),
-        })
+    fn is_eligible(&self) -> bool {
+        self.eligible
     }
 }
 fn text(v: &Value) -> Option<&str> {
@@ -126,27 +307,62 @@ fn valid_sha(s: &str) -> bool {
         && s.bytes()
             .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
 }
-fn row_digest(values: &[Value]) -> String {
-    // Typed, length-delimited binary hashing. Never format DB values via Debug/log.
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    for v in values {
-        let (tag, bytes) = match v {
-            Value::Null => (0, Vec::new()),
-            Value::Integer(i) => (1, i.to_le_bytes().to_vec()),
-            Value::Real(n) => (2, n.to_bits().to_le_bytes().to_vec()),
-            Value::Text(s) => (3, s.as_bytes().to_vec()),
-            Value::Blob(b) => (4, b.clone()),
-        };
-        digest.update(&[tag]);
-        digest.update(&(bytes.len() as u64).to_le_bytes());
-        digest.update(&bytes);
+/// Typed binary encoding for hashing: a tag, then a fixed-size payload for numbers and a length-prefixed
+/// payload for text and blobs, so no two different value sequences encode alike. Never format DB
+/// values via Debug/log.
+fn encode_ref(out: &mut Vec<u8>, v: ValueRef<'_>) {
+    match v {
+        ValueRef::Null => out.push(0),
+        ValueRef::Integer(i) => {
+            out.push(1);
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        ValueRef::Real(n) => {
+            out.push(2);
+            out.extend_from_slice(&n.to_bits().to_le_bytes());
+        }
+        ValueRef::Text(t) => {
+            out.push(3);
+            out.extend_from_slice(&(t.len() as u64).to_le_bytes());
+            out.extend_from_slice(t);
+        }
+        ValueRef::Blob(b) => {
+            out.push(4);
+            out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+            out.extend_from_slice(b);
+        }
     }
-    digest
-        .finish()
-        .as_ref()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+}
+fn finish32(ctx: ring::digest::Context) -> [u8; 32] {
+    let mut out = [0; 32];
+    out.copy_from_slice(ctx.finish().as_ref());
+    out
+}
+/// `stored` is the lower-case hex of `bytes`.
+fn hex_is(bytes: &[u8], stored: &str) -> bool {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let stored = stored.as_bytes();
+    stored.len() == bytes.len() * 2
+        && bytes.iter().enumerate().all(|(i, b)| {
+            stored[2 * i] == DIGITS[usize::from(b >> 4)]
+                && stored[2 * i + 1] == DIGITS[usize::from(b & 15)]
+        })
+}
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(DIGITS[usize::from(b >> 4)] as char);
+        out.push(DIGITS[usize::from(b & 15)] as char);
+    }
+    out
+}
+fn row_digest(values: &[Value]) -> String {
+    let mut encoded = Vec::new();
+    for v in values {
+        encode_ref(&mut encoded, ValueRef::from(v));
+    }
+    hex(ring::digest::digest(&ring::digest::SHA256, &encoded).as_ref())
 }
 struct Vector {
     values: Vec<Value>,
@@ -157,19 +373,43 @@ struct Legacy {
     ids: Vec<i64>,
     total: usize,
 }
+type Sha = [u8; 64];
+/// What the scene guard needs to know about one `content_sha256`, computed once per read.
+struct ShaPart {
+    sha: Sha,
+    /// Rows whose photo is eligible for this sha (the duplicates of its generation), as a range of
+    /// [`Raw::sha_rows`] in photo id order.
+    members: std::ops::Range<usize>,
+    /// A vector row exists for the sha in the active space (its BLOB is not looked at here).
+    vector: bool,
+    /// Fixed reason code when the current generation's embedding job has failed.
+    failed: Option<&'static str>,
+    digest: [u8; 32],
+}
+impl ShaPart {
+    fn sha(&self) -> &str {
+        std::str::from_utf8(&self.sha).unwrap_or_default()
+    }
+}
+fn to_sha(s: &str) -> Option<Sha> {
+    Sha::try_from(s.as_bytes()).ok()
+}
 pub(super) struct Raw {
     identity: SpaceIdentity,
+    identity_fingerprint: String,
+    /// In photo id order.
     rows: Vec<Row>,
-    by_id: HashMap<i64, usize>,
-    timed: BTreeMap<i64, Vec<usize>>,
+    /// `(captured seconds, row index)` ascending; the rows with a valid capture time.
+    timed: Vec<(i64, usize)>,
     legacy_by_id: HashMap<i64, Vec<usize>>,
-    pointers: HashMap<String, BTreeSet<i64>>,
-    vectors: HashMap<String, Vector>,
+    /// result id -> the photos whose reference names it, ascending.
+    pointers: HashMap<String, Vec<i64>>,
+    shas: Vec<ShaPart>,
     /// Vector BLOBs are loaded only for the cycle's snapshot and the writer's CAS.
+    vectors: HashMap<String, Vector>,
     with_vectors: bool,
-    failed: BTreeMap<(String, String), String>,
-    generations: HashMap<String, String>,
     legacy: Vec<Legacy>,
+    /// photo -> result of its reference. Only the cycle and the writer need it (reads use `pointers`).
     active: BTreeMap<i64, String>,
 }
 impl Raw {
@@ -182,47 +422,87 @@ impl Raw {
             .collect();
         fingerprint(&parts.iter().map(String::as_str).collect::<Vec<_>>())
     }
+    fn sha_part(&self, row: &Row) -> Option<&ShaPart> {
+        row.sha_ix.map(|i| &self.shas[i])
+    }
+    fn row(&self, id: i64) -> Option<&Row> {
+        self.rows
+            .binary_search_by_key(&id, |r| r.id)
+            .ok()
+            .map(|i| &self.rows[i])
+    }
+    /// Rows whose capture time lies in `lo..=hi`.
+    fn in_interval(&self, lo: i64, hi: i64) -> &[(i64, usize)] {
+        let start = self.timed.partition_point(|(t, _)| *t < lo);
+        let end = self.timed.partition_point(|(t, _)| *t <= hi);
+        &self.timed[start..end.max(start)]
+    }
     /// Only the component's influence interval and its SHA dependencies participate.
-    /// Changes in other time windows cannot starve a completed component.
+    /// Changes in other time windows cannot starve a completed component. A SHA contributes its
+    /// duplicate generations (also outside the interval), whether a vector row exists for it, and a
+    /// failed embedding of the current generation. No vector BLOB is read for this.
     pub(super) fn guard(&self, lo: i64, hi: i64) -> String {
+        match self.guard_digest(lo, hi) {
+            Some(digest) => hex(&digest),
+            None => fingerprint(&["invalid_scene_interval"]),
+        }
+    }
+    /// Whether `stored` (hex) is the current guard of the interval, without building the string.
+    fn guard_is(&self, lo: i64, hi: i64, stored: &str) -> bool {
+        self.guard_digest(lo, hi)
+            .is_some_and(|digest| hex_is(&digest, stored))
+    }
+    fn guard_digest(&self, lo: i64, hi: i64) -> Option<[u8; 32]> {
         if lo > hi {
-            return fingerprint(&["invalid_scene_interval"]);
+            return None;
         }
         let mut rows: Vec<_> = self
-            .timed
-            .range(lo..=hi)
-            .flat_map(|(_, indexes)| indexes.iter().map(|i| &self.rows[*i]))
+            .in_interval(lo, hi)
+            .iter()
+            .map(|(_, i)| &self.rows[*i])
             .collect();
         rows.sort_unstable_by_key(|r| r.id());
-        let shas: BTreeSet<_> = rows.iter().filter_map(|r| r.sha()).collect();
-        let ids: BTreeSet<_> = rows.iter().map(|r| r.id()).collect();
-        let mut parts = vec![self.identity.fingerprint()];
-        parts.extend(rows.iter().map(|r| r.digest.clone()));
-        for sha in shas {
-            parts.push(sha.into());
-            // All duplicate generations, including those outside this time interval, affect failed classification.
-            parts.push(self.generations.get(sha).cloned().unwrap_or_default());
-            let target = index::image_embedding_key(&self.identity, sha).target_key;
-            let key = self.generations.get(sha).cloned().unwrap_or_default();
-            parts.push(self.failed.get(&(target, key)).cloned().unwrap_or_default());
+        let mut shas: Vec<_> = rows.iter().filter_map(|r| r.sha_ix).collect();
+        shas.sort_unstable_by(|a, b| self.shas[*a].sha.cmp(&self.shas[*b].sha));
+        shas.dedup();
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        ctx.update(b"scene-input-v2");
+        ctx.update(&(self.identity_fingerprint.len() as u64).to_le_bytes());
+        ctx.update(self.identity_fingerprint.as_bytes());
+        ctx.update(&(rows.len() as u64).to_le_bytes());
+        for row in &rows {
+            ctx.update(&row.digest);
         }
-        let matches: BTreeSet<_> = ids
+        ctx.update(&(shas.len() as u64).to_le_bytes());
+        for ix in shas {
+            ctx.update(&self.shas[ix].digest);
+        }
+        let matches: BTreeSet<_> = rows
             .iter()
-            .flat_map(|id| self.legacy_by_id.get(id).into_iter().flatten().copied())
+            .flat_map(|r| {
+                self.legacy_by_id
+                    .get(&r.id())
+                    .into_iter()
+                    .flatten()
+                    .copied()
+            })
             .collect();
+        ctx.update(&(matches.len() as u64).to_le_bytes());
         for i in matches {
-            parts.push(self.legacy[i].origin.digest.clone());
+            let digest = &self.legacy[i].origin.digest;
+            ctx.update(&(digest.len() as u64).to_le_bytes());
+            ctx.update(digest.as_bytes());
         }
-        fingerprint(&parts.iter().map(String::as_str).collect::<Vec<_>>())
+        Some(finish32(ctx))
     }
     /// Digest of the vector BLOBs of the same interval. Only meaningful when the vectors were loaded
     /// (the cycle and the writer); read paths validate with [`Raw::guard`] alone.
     pub(super) fn vector_guard(&self, lo: i64, hi: i64) -> String {
         debug_assert!(self.with_vectors);
         let shas: BTreeSet<_> = self
-            .timed
-            .range(lo..=hi)
-            .flat_map(|(_, indexes)| indexes.iter().filter_map(|i| self.rows[*i].sha()))
+            .in_interval(lo, hi)
+            .iter()
+            .filter_map(|(_, i)| self.rows[*i].sha())
             .collect();
         let mut parts = vec!["scene-vectors-v1"];
         for sha in shas {
@@ -256,102 +536,196 @@ const PHOTO_ROWS: &str = "/* scene-raw */ SELECT p.id,p.display,p.md5,p.mtime,p.
         AND f.source_md5 IS p.md5 AND f.source_mtime IS p.mtime
        LEFT JOIN photo_quality q ON q.photo_id=p.id AND q.display=p.display AND q.source_md5 IS p.md5 AND q.source_mtime IS p.mtime";
 
+/// The eligible duplicates of one sha, as the embedding job's generation key wants them. Only needed
+/// for a sha that has a failed job, so the columns are read here instead of being kept for every row.
+fn eligible_members(
+    conn: &Connection,
+    part: &ShaPart,
+    rows: &[Row],
+    sha_rows: &[usize],
+) -> Result<Vec<index::Eligible>, Error> {
+    let mut out = Vec::new();
+    for &i in &sha_rows[part.members.clone()] {
+        let id = rows[i].id;
+        let member = conn
+            .query_row(
+                "SELECT display,md5,mtime,rotation FROM photos WHERE id=?1",
+                [id],
+                |r| {
+                    Ok(index::Eligible {
+                        photo_id: id,
+                        input_sha256: part.sha().to_string(),
+                        display: r.get(0)?,
+                        md5: r.get(1)?,
+                        mtime: r.get(2)?,
+                        rotation: r.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        out.extend(member);
+    }
+    Ok(out)
+}
+
 fn raw_in(conn: &Connection, with_vectors: bool) -> Result<Option<Raw>, Error> {
     let (_, identity) = index::active_in(conn)?;
     let Some(identity) = identity else {
         return Ok(None);
     };
     let mut stmt = conn.prepare(&format!("{PHOTO_ROWS} ORDER BY p.id"))?;
-    let rows = stmt
-        .query_map([], |r| {
-            (0..23)
-                .map(|i| r.get::<_, Value>(i))
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })?
-        .map(|r| r.map(Row::new))
+    let mut scratch = Vec::new();
+    let mut rows = stmt
+        .query_map([], |r| Row::from_sql(r, &mut scratch, with_vectors))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut by_sha: BTreeMap<&str, Vec<index::Eligible>> = BTreeMap::new();
-    for row in &rows {
-        if let Some(eligible) = row.eligible() {
-            by_sha.entry(row.sha().unwrap()).or_default().push(eligible);
+    drop(stmt);
+    // One entry per distinct valid sha, in first-seen (photo id) order; eligible duplicates grouped.
+    let mut shas: Vec<ShaPart> = Vec::new();
+    let mut by_sha: HashMap<Sha, usize> = HashMap::new();
+    let mut eligible_rows: Vec<(usize, usize)> = Vec::new();
+    for (i, row) in rows.iter_mut().enumerate() {
+        let Some(sha) = row.sha else { continue };
+        let ix = *by_sha.entry(sha).or_insert_with(|| {
+            shas.push(ShaPart {
+                sha,
+                members: 0..0,
+                vector: false,
+                failed: None,
+                digest: [0; 32],
+            });
+            shas.len() - 1
+        });
+        row.sha_ix = Some(ix);
+        if row.is_eligible() {
+            eligible_rows.push((ix, i));
         }
     }
-    let generations = by_sha
-        .into_iter()
-        .map(|(sha, members)| {
-            (
-                sha.to_string(),
-                index::image_embedding_generation_key(&identity, sha, &members).input_hash,
-            )
-        })
-        .collect();
-    let wanted: BTreeSet<_> = rows.iter().filter_map(|r| r.sha()).collect();
+    eligible_rows.sort_unstable();
+    let sha_rows: Vec<usize> = eligible_rows.iter().map(|(_, i)| *i).collect();
+    let mut at = 0;
+    for chunk in eligible_rows.chunk_by(|a, b| a.0 == b.0) {
+        shas[chunk[0].0].members = at..at + chunk.len();
+        at += chunk.len();
+    }
+    // Existence of a vector row per sha. Reads take it from the primary key alone; the cycle and
+    // the writer load the BLOBs (same rows, so the same answer).
     let mut vectors = HashMap::new();
-    if with_vectors && jobs::object_exists(conn, "table", "ai_embedding_vectors")? {
-        let mut stmt = conn.prepare(
-            "/* scene-vectors */ SELECT input_sha256,dimension,vector FROM ai_embedding_vectors WHERE space_id=?1",
-        )?;
-        let mut found = stmt.query([identity.space_id()])?;
-        while let Some(row) = found.next()? {
-            let Value::Text(sha) = row.get::<_, Value>(0)? else {
-                continue;
-            };
-            if !wanted.contains(sha.as_str()) {
-                continue;
+    if jobs::object_exists(conn, "table", "ai_embedding_vectors")? {
+        if with_vectors {
+            let mut stmt = conn.prepare(
+                "/* scene-vectors */ SELECT input_sha256,dimension,vector FROM ai_embedding_vectors WHERE space_id=?1",
+            )?;
+            let mut found = stmt.query([identity.space_id()])?;
+            while let Some(row) = found.next()? {
+                let Value::Text(sha) = row.get::<_, Value>(0)? else {
+                    continue;
+                };
+                let Some(&ix) = to_sha(&sha).and_then(|k| by_sha.get(&k)) else {
+                    continue;
+                };
+                shas[ix].vector = true;
+                let values = vec![row.get(1)?, row.get(2)?];
+                let digest = row_digest(&values);
+                vectors.insert(sha, Vector { values, digest });
             }
-            let values = vec![row.get(1)?, row.get(2)?];
-            let digest = row_digest(&values);
-            vectors.insert(sha, Vector { values, digest });
+        } else {
+            let mut stmt = conn.prepare(
+                "/* scene-vector-keys */ SELECT input_sha256 FROM ai_embedding_vectors WHERE space_id=?1",
+            )?;
+            let mut found = stmt.query([identity.space_id()])?;
+            while let Some(row) = found.next()? {
+                let key = match row.get_ref(0)? {
+                    ValueRef::Text(t) => std::str::from_utf8(t).ok().and_then(to_sha),
+                    _ => None,
+                };
+                if let Some(&ix) = key.and_then(|k| by_sha.get(&k)) {
+                    shas[ix].vector = true;
+                }
+            }
         }
     }
-    let mut failed = BTreeMap::new();
+    // A failed job counts when its key is the current generation of its sha. The generation key is
+    // only built for shas that have a failed job at all.
     if jobs::object_exists(conn, "table", "ai_jobs")? {
+        let prefix = format!("{}\u{1f}", identity.space_id());
         let mut stmt = conn.prepare("SELECT target_key,input_hash,last_error_code FROM ai_jobs WHERE kind='image_embedding' AND state='failed' AND processor_version=?1 ORDER BY target_key,input_hash")?;
         let mut found = stmt.query([index::image_embedding_processor_version(&identity)])?;
         while let Some(row) = found.next()? {
-            let reason: String = row.get(2)?;
-            failed.insert(
-                (row.get(0)?, row.get(1)?),
-                index::reason_code(&reason).into(),
-            );
+            let (target, input_hash, reason): (String, String, String) =
+                (row.get(0)?, row.get(1)?, row.get(2)?);
+            let Some(&ix) = target
+                .strip_prefix(&prefix)
+                .and_then(to_sha)
+                .and_then(|k| by_sha.get(&k))
+            else {
+                continue;
+            };
+            let members = eligible_members(conn, &shas[ix], &rows, &sha_rows)?;
+            let key = index::image_embedding_generation_key(&identity, shas[ix].sha(), &members);
+            if key.target_key == target && key.input_hash == input_hash {
+                shas[ix].failed = Some(index::reason_code(&reason));
+            }
         }
+    }
+    for part in &mut shas {
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        ctx.update(b"scene-sha-v1");
+        ctx.update(&part.sha);
+        ctx.update(&(part.members.len() as u64).to_le_bytes());
+        for &i in &sha_rows[part.members.clone()] {
+            ctx.update(&rows[i].generation_digest);
+        }
+        ctx.update(&[u8::from(part.vector)]);
+        let failed = part.failed.unwrap_or_default();
+        ctx.update(&(failed.len() as u64).to_le_bytes());
+        ctx.update(failed.as_bytes());
+        part.digest = finish32(ctx);
     }
     let legacy = legacy_in(conn)?;
-    let active: BTreeMap<i64, String> = if jobs::object_exists(conn, "table", "ai_scene_active")? {
-        conn.prepare("SELECT photo_id,result_id FROM ai_scene_active ORDER BY photo_id")?
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?
-    } else {
-        BTreeMap::new()
-    };
-    let by_id = rows.iter().enumerate().map(|(i, r)| (r.id(), i)).collect();
-    let mut timed = BTreeMap::<i64, Vec<usize>>::new();
-    for (i, row) in rows.iter().enumerate() {
-        if let Some(t) = row.captured {
-            timed.entry(t).or_default().push(i);
+    let mut active = BTreeMap::new();
+    let mut pointers = HashMap::<String, Vec<i64>>::new();
+    if jobs::object_exists(conn, "table", "ai_scene_active")? {
+        let mut stmt =
+            conn.prepare("SELECT photo_id,result_id FROM ai_scene_active ORDER BY photo_id")?;
+        let mut found = stmt.query([])?;
+        while let Some(row) = found.next()? {
+            let (id, result): (i64, String) = (row.get(0)?, row.get(1)?);
+            match pointers.get_mut(&result) {
+                Some(ids) => ids.push(id),
+                None => {
+                    pointers.insert(result.clone(), vec![id]);
+                }
+            }
+            if with_vectors {
+                active.insert(id, result);
+            }
         }
     }
+    let timed = {
+        let mut timed: Vec<(i64, usize)> = rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| r.captured.map(|t| (t, i)))
+            .collect();
+        timed.sort_unstable();
+        timed
+    };
     let mut legacy_by_id = HashMap::<i64, Vec<usize>>::new();
     for (i, g) in legacy.iter().enumerate() {
         for id in &g.ids {
             legacy_by_id.entry(*id).or_default().push(i);
         }
     }
-    let mut pointers = HashMap::<String, BTreeSet<i64>>::new();
-    for (id, result) in &active {
-        pointers.entry(result.clone()).or_default().insert(*id);
-    }
     Ok(Some(Raw {
+        identity_fingerprint: identity.fingerprint(),
         identity,
         rows,
-        by_id,
         timed,
         legacy_by_id,
         pointers,
+        shas,
         vectors,
         with_vectors,
-        failed,
-        generations,
         legacy,
         active,
     }))
@@ -484,7 +858,7 @@ pub fn snapshot(conn: &Connection) -> Result<Option<Snapshot>, Error> {
             } else {
                 Readiness::InvalidTime
             }
-        } else if row.eligible().is_none() {
+        } else if !row.is_eligible() {
             if text(&v[19]).is_some_and(|e| !e.is_empty()) {
                 Readiness::FailedQuality
             } else {
@@ -493,20 +867,18 @@ pub fn snapshot(conn: &Connection) -> Result<Option<Snapshot>, Error> {
         } else if vectors.is_some() && metrics.is_some() {
             Readiness::Ready
         } else {
-            let sha = sha.unwrap();
-            let target = index::image_embedding_key(&raw.identity, sha).target_key;
-            let generation = raw.generations.get(sha).cloned().unwrap_or_default();
-            if vectors.is_none() && raw.failed.contains_key(&(target, generation)) {
+            let part = raw.sha_part(row).unwrap();
+            if vectors.is_none() && part.failed.is_some() {
                 Readiness::FailedEmbedding
             } else if metrics.is_none() {
                 Readiness::PendingQuality
-            } else if raw.vectors.contains_key(sha) {
+            } else if part.vector {
                 Readiness::CorruptVector
             } else {
                 Readiness::PendingEmbedding
             }
         };
-        let generation = row.generation();
+        let generation = row.generation().to_string();
         let shown = row.shown();
         photos.push(Photo {
             input: Input {
@@ -526,7 +898,7 @@ pub fn snapshot(conn: &Connection) -> Result<Option<Snapshot>, Error> {
             vector: vectors.map(|(v, _)| v.clone()),
             norm: vectors.map_or(0.0, |(_, norm)| *norm),
             shown,
-            favorite: number(&v[7]) == Some(1.0),
+            favorite: row.favorite,
         });
     }
     Ok(Some(Snapshot {
@@ -576,6 +948,9 @@ pub fn save(
         return Ok(Saved::Stale);
     };
     let saved = save_in(&tx, &raw, plan, group_index, stopped)?;
+    if saved == Saved::Stored {
+        tidy(&tx, plan, &[group_index])?;
+    }
     if matches!(saved, Saved::Stored | Saved::Unchanged) {
         tx.commit()?;
     }
@@ -608,6 +983,13 @@ pub fn save_batch(
         }
         saved.push(result);
     }
+    let stored: Vec<_> = indexes
+        .iter()
+        .zip(&saved)
+        .filter(|(_, s)| **s == Saved::Stored)
+        .map(|(i, _)| *i)
+        .collect();
+    tidy(&tx, plan, &stored)?;
     if stopped() {
         return Ok(vec![Saved::Interrupted; indexes.len()]);
     }
@@ -634,7 +1016,12 @@ fn save_in(
     {
         return Ok(Saved::Stale);
     }
-    if !valid_group(raw, group, plan.options)? {
+    let expected = plan.options.group_processor_version(
+        &plan.identity,
+        group.rank_used,
+        group.weight_digest.as_deref(),
+    );
+    if !valid_group(raw, group, plan.options, &expected)? {
         return Err(Error::CorruptResult);
     }
     let values = group_values(&plan.identity, group, plan.options)?;
@@ -654,7 +1041,7 @@ fn save_in(
     } else {
         false
     };
-    if stored_members_match && (group.state == State::Waiting || raw_pointers_match(raw, group)) {
+    if stored_members_match && references_match(raw, group) {
         return Ok(Saved::Unchanged);
     }
     let ids: Vec<_> = group.members.iter().map(|m| m.photo_id).collect();
@@ -688,6 +1075,12 @@ fn save_in(
         ])?;
         if group.state != State::Waiting {
             tx.execute("INSERT INTO ai_scene_active VALUES(?1,?2) ON CONFLICT(photo_id) DO UPDATE SET result_id=excluded.result_id",params![m.photo_id,group.result_id])?;
+        } else {
+            // A waiting component has no local result: no earlier result stays referenced for its photos.
+            tx.execute(
+                "DELETE FROM ai_scene_active WHERE photo_id=?1",
+                [m.photo_id],
+            )?;
         }
     }
     drop(insert);
@@ -706,8 +1099,86 @@ fn save_in(
 }
 fn raw_pointers_match(raw: &Raw, group: &Group) -> bool {
     raw.pointers.get(&group.result_id).is_some_and(|ids| {
-        ids.len() == group.members.len() && group.members.iter().all(|m| ids.contains(&m.photo_id))
+        ids.len() == group.members.len()
+            && group
+                .members
+                .iter()
+                .all(|m| ids.binary_search(&m.photo_id).is_ok())
     })
+}
+/// The component's references are as the cycle writes them: exactly its members point at a ranked
+/// result; a waiting component has none (its photos reference no local result).
+fn references_match(raw: &Raw, group: &Group) -> bool {
+    if group.state == State::Waiting {
+        group
+            .members
+            .iter()
+            .all(|m| !raw.active.contains_key(&m.photo_id))
+    } else {
+        raw_pointers_match(raw, group)
+    }
+}
+
+/// Housekeeping in the transaction of the stored components. It removes only derived placeholders and
+/// references, never a ranked result and nothing of another space or option set:
+/// * a waiting header of the same space and options that shares a photo with a stored component (the
+///   photo now has a newer statement), or that names a photo that no longer exists, with its members;
+/// * references of photos that no longer exist.
+///
+/// Ranked results that a newer result replaced stay as history; they no longer count because the
+/// references of the replaced members point at the newer result.
+fn tidy(tx: &Connection, plan: &Plan, stored: &[usize]) -> Result<(), Error> {
+    if stored.is_empty() {
+        return Ok(());
+    }
+    let kept: BTreeSet<&str> = stored
+        .iter()
+        .map(|&i| plan.groups[i].result_id.as_str())
+        .collect();
+    let touched: BTreeSet<i64> = stored
+        .iter()
+        .flat_map(|&i| plan.groups[i].members.iter().map(|m| m.photo_id))
+        .collect();
+    let options = plan.options;
+    let waiting = tx
+        .prepare(
+            "SELECT result_id FROM ai_scene_groups WHERE state='waiting' AND space_fingerprint=?1
+              AND window_s=?2 AND similarity=?3 AND shortlist=?4",
+        )?
+        .query_map(
+            params![
+                plan.identity.fingerprint(),
+                options.window_s,
+                options.similarity,
+                options.shortlist as i64
+            ],
+            |r| r.get::<_, String>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut members = tx.prepare("SELECT photo_id FROM ai_scene_members WHERE result_id=?1")?;
+    let mut exists = tx.prepare("SELECT 1 FROM photos WHERE id=?1")?;
+    for result in waiting.iter().filter(|r| !kept.contains(r.as_str())) {
+        let photos = members
+            .query_map([result], |r| r.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut stale = false;
+        for photo in photos {
+            stale = touched.contains(&photo) || !exists.exists([photo])?;
+            if stale {
+                break;
+            }
+        }
+        if stale {
+            tx.execute("DELETE FROM ai_scene_members WHERE result_id=?1", [result])?;
+            tx.execute("DELETE FROM ai_scene_groups WHERE result_id=?1", [result])?;
+        }
+    }
+    drop((members, exists));
+    tx.execute(
+        "DELETE FROM ai_scene_active WHERE NOT EXISTS(SELECT 1 FROM photos p WHERE p.id=ai_scene_active.photo_id)",
+        [],
+    )?;
+    Ok(())
 }
 
 /// Writer-free skip check against the computed plan; includes every header/member and pointer.
@@ -716,16 +1187,18 @@ pub fn pending_saves(conn: &Connection, plan: &Plan, limit: usize) -> Result<Vec
     if limit == 0 {
         return Ok(Vec::new());
     }
-    if !pending(conn)?.is_empty() {
+    if !ready_or_mismatch(conn)? {
         return Err(Error::Database);
     }
     let tx = conn.unchecked_transaction()?;
     let mut pointers = HashMap::<String, BTreeSet<i64>>::new();
+    let mut referenced = BTreeSet::<i64>::new();
     for row in tx
         .prepare("SELECT result_id,photo_id FROM ai_scene_active")?
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
     {
         let (result, id) = row?;
+        referenced.insert(id);
         pointers.entry(result).or_default().insert(id);
     }
     let mut pending = Vec::new();
@@ -744,11 +1217,14 @@ pub fn pending_saves(conn: &Connection, plan: &Plan, limit: usize) -> Result<Vec
                 Err(Error::CorruptResult) => false,
                 Err(e) => return Err(e),
             }
-            && (g.state == State::Waiting
-                || pointers.get(&g.result_id).is_some_and(|ids| {
+            && if g.state == State::Waiting {
+                g.members.iter().all(|m| !referenced.contains(&m.photo_id))
+            } else {
+                pointers.get(&g.result_id).is_some_and(|ids| {
                     ids.len() == g.members.len()
                         && g.members.iter().all(|m| ids.contains(&m.photo_id))
-                }));
+                })
+            };
         if !matches {
             pending.push(i);
             if pending.len() == limit {
@@ -800,7 +1276,7 @@ fn flag(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<bool> {
 }
 
 fn read_members(conn: &Connection, result_id: &str) -> Result<Vec<Member>, Error> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT photo_id,generation,rank,score,shortlisted,representative,shown,favorite
         FROM ai_scene_members WHERE result_id=?1 ORDER BY rank",
     )?;
@@ -820,6 +1296,101 @@ fn read_members(conn: &Connection, result_id: &str) -> Result<Vec<Member>, Error
     .map_err(stored_row_error)
 }
 
+/// One `ai_scene_members` row as selected by [`read_all_members`] (columns 1..=8), read in place.
+fn member_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Member> {
+    let wrong = |i: usize, v: ValueRef<'_>| {
+        rusqlite::Error::InvalidColumnType(i, String::new(), v.data_type())
+    };
+    let integer = |i: usize| match r.get_ref(i)? {
+        ValueRef::Integer(n) => Ok(n),
+        v => Err(wrong(i, v)),
+    };
+    let generation = match r.get_ref(2)? {
+        ValueRef::Text(t) => std::str::from_utf8(t)
+            .map_err(|_| wrong(2, ValueRef::Text(t)))?
+            .to_string(),
+        v => return Err(wrong(2, v)),
+    };
+    let score = match r.get_ref(4)? {
+        ValueRef::Null => None,
+        ValueRef::Real(n) => Some(n),
+        ValueRef::Integer(n) => Some(n as f64),
+        v => return Err(wrong(4, v)),
+    };
+    Ok(Member {
+        photo_id: integer(1)?,
+        generation,
+        rank: integer(3)? as usize,
+        score,
+        shortlisted: flag(r, 5)?,
+        representative: flag(r, 6)?,
+        shown: flag(r, 7)?,
+        favorite: flag(r, 8)?,
+    })
+}
+
+/// Members of every stored component of the space (waiting ones only when asked), in one pass.
+/// A damaged row makes only its own component `CorruptResult`; an SQL failure fails the read.
+fn read_all_members(
+    conn: &Connection,
+    fingerprint: &str,
+    include_waiting: bool,
+    processors: &[&str],
+) -> Result<HashMap<String, Result<Vec<Member>, Error>>, Error> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.result_id,m.photo_id,m.generation,m.rank,m.score,m.shortlisted,m.representative,m.shown,m.favorite
+           FROM ai_scene_groups g JOIN ai_scene_members m ON m.result_id=g.result_id
+          WHERE g.space_fingerprint=?1 AND (?2 OR g.state!='waiting') AND g.processor_version IN ({})
+          ORDER BY m.result_id,m.photo_id",
+        marks_from(3, processors.len())
+    ))?;
+    let mut out: HashMap<String, Result<Vec<Member>, Error>> = HashMap::new();
+    let mut current: Option<(String, Result<Vec<Member>, Error>)> = None;
+    let mut values: Vec<Value> = vec![
+        fingerprint.to_string().into(),
+        Value::Integer(i64::from(include_waiting)),
+    ];
+    values.extend(processors.iter().map(|p| Value::Text(p.to_string())));
+    let mut rows = stmt.query(rusqlite::params_from_iter(values))?;
+    while let Some(r) = rows.next()? {
+        let same = match (&current, r.get_ref(0)) {
+            (Some((id, _)), Ok(value)) => value.as_str().is_ok_and(|v| v == id),
+            _ => false,
+        };
+        if !same {
+            if let Some((id, members)) = current.take() {
+                out.insert(id, members);
+            }
+            current = Some((
+                r.get(0).map_err(stored_row_error)?,
+                Ok(Vec::with_capacity(4)),
+            ));
+        }
+        let member = member_row(r);
+        let Some((_, slot)) = current.as_mut() else {
+            continue;
+        };
+        match member {
+            Ok(member) => {
+                if let Ok(members) = slot {
+                    members.push(member);
+                }
+            }
+            Err(e) => match stored_row_error(e) {
+                Error::Database => return Err(Error::Database),
+                e => *slot = Err(e),
+            },
+        }
+    }
+    if let Some((id, members)) = current.take() {
+        out.insert(id, members);
+    }
+    for members in out.values_mut().filter_map(|m| m.as_mut().ok()) {
+        members.sort_by_key(|m| m.rank);
+    }
+    Ok(out)
+}
+
 fn stored_row_error(error: rusqlite::Error) -> Error {
     if error.sqlite_error_code().is_some() {
         Error::Database
@@ -829,7 +1400,12 @@ fn stored_row_error(error: rusqlite::Error) -> Error {
 }
 
 /// Shared by current reads and the save fast path; all members must describe one complete result.
-fn valid_group(raw: &Raw, group: &Group, options: Options) -> Result<bool, Error> {
+fn valid_group(
+    raw: &Raw,
+    group: &Group,
+    options: Options,
+    expected_processor: &str,
+) -> Result<bool, Error> {
     if group.members.is_empty()
         || (matches!(group.rank_used, RankUsed::Linear | RankUsed::Fallback(_))
             != group.weight_digest.is_some())
@@ -837,23 +1413,19 @@ fn valid_group(raw: &Raw, group: &Group, options: Options) -> Result<bool, Error
             .weight_digest
             .as_deref()
             .is_some_and(|d| !valid_sha(d))
-        || group.processor_version
-            != options.group_processor_version(
-                &raw.identity,
-                group.rank_used,
-                group.weight_digest.as_deref(),
-            )
+        || group.processor_version != expected_processor
     {
         return Ok(false);
     }
-    let members: BTreeMap<_, _> = group.members.iter().map(|m| (m.photo_id, m)).collect();
-    if members.len() != group.members.len() {
+    let mut members: Vec<&Member> = group.members.iter().collect();
+    members.sort_unstable_by_key(|m| m.photo_id);
+    if members.windows(2).any(|w| w[0].photo_id == w[1].photo_id) {
         return Ok(false);
     }
     let waiting = group.state == State::Waiting;
     let (mut lo, mut hi) = (i64::MAX, i64::MIN);
     for (i, m) in group.members.iter().enumerate() {
-        let Some(row) = raw.by_id.get(&m.photo_id).map(|i| &raw.rows[*i]) else {
+        let Some(row) = raw.row(m.photo_id) else {
             return Ok(false);
         };
         let Some(time) = row.captured else {
@@ -861,10 +1433,10 @@ fn valid_group(raw: &Raw, group: &Group, options: Options) -> Result<bool, Error
         };
         lo = lo.min(time);
         hi = hi.max(time);
-        if m.generation != row.generation()
+        if !row.generation_is(&m.generation)
             || m.rank != i + 1
             || m.shown != row.shown()
-            || m.favorite != (number(&row.values[7]) == Some(1.0))
+            || m.favorite != row.favorite
             || m.shortlisted != (!waiting && m.rank <= options.shortlist)
             || m.representative != (!waiting && m.rank == 1)
             || if waiting {
@@ -892,7 +1464,7 @@ fn valid_group(raw: &Raw, group: &Group, options: Options) -> Result<bool, Error
     }
     let generation = fingerprint(
         &members
-            .values()
+            .iter()
             .map(|m| m.generation.as_str())
             .collect::<Vec<_>>(),
     );
@@ -902,10 +1474,19 @@ fn valid_group(raw: &Raw, group: &Group, options: Options) -> Result<bool, Error
     {
         return Ok(false);
     }
-    let ids: Vec<_> = members.keys().copied().collect();
-    let (overlap, legacy) = raw.overlap(&ids);
+    let ids: Vec<_> = members.iter().map(|m| m.photo_id).collect();
+    // Most components touch no old selection: nothing to classify or compare then.
+    let (overlap, legacy) = if ids.iter().any(|id| raw.legacy_by_id.contains_key(id)) {
+        raw.overlap(&ids)
+    } else {
+        (Overlap::Disjoint, Vec::new())
+    };
     Ok(group.overlap == overlap
-        && encode(&group.legacy)? == encode(&legacy)?
+        && if legacy.is_empty() {
+            group.legacy.is_empty()
+        } else {
+            encode(&group.legacy)? == encode(&legacy)?
+        }
         && (waiting || (group.state == State::ReviewOverlap) == (overlap == Overlap::Partial)))
 }
 fn state_name(state: State) -> &'static str {
@@ -957,99 +1538,147 @@ pub fn load_current(conn: &Connection, processor_version: &str) -> Result<Loaded
 pub fn load_current_in(tx: &Connection, processors: &[&str]) -> Result<Loaded, Error> {
     load_projection_in(tx, processors, false)
 }
+/// The processor version that stored components with these ranking inputs must carry (derived once per
+/// distinct set of inputs per read), with the parsed ranking it came from.
+struct ExpectedProcessor {
+    rank_key: String,
+    weight_digest: Option<String>,
+    window_s: i64,
+    similarity_bits: u64,
+    shortlist: usize,
+    version: String,
+    rank_used: RankUsed,
+}
+
 pub fn load_projection_in(
     tx: &Connection,
     processors: &[&str],
     include_waiting: bool,
 ) -> Result<Loaded, Error> {
-    // No vector BLOB is read here: validation uses rows, SHAs, failed jobs, legacy state and the stored guard.
+    // No vector BLOB is read here: validation uses rows, SHAs, vector rows' existence, failed jobs, legacy
+    // state and the stored guard. Scene tables that are missing or of another shape yield no groups.
+    let (_, identity) = index::active_in(tx)?;
+    let Some(identity) = identity else {
+        return Ok(Loaded {
+            identity: None,
+            groups: Vec::new(),
+        });
+    };
+    if !ready(tx)? {
+        return Ok(Loaded {
+            identity: Some(identity),
+            groups: Vec::new(),
+        });
+    }
+    let identity_fingerprint = identity.fingerprint();
+    // No stored component of this space and these processors: nothing to validate, so the photo scan
+    // is skipped. Components of other processors (history) are neither read nor counted in the cost.
+    let query_params = |extra: &[&str]| {
+        let mut values: Vec<Value> = vec![
+            identity_fingerprint.clone().into(),
+            Value::Integer(i64::from(include_waiting)),
+        ];
+        values.extend(extra.iter().map(|p| Value::Text(p.to_string())));
+        values
+    };
+    let processor_marks = marks_from(3, processors.len());
+    let any: bool = !processors.is_empty()
+        && tx.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM ai_scene_groups WHERE space_fingerprint=?1 AND (?2 OR state!='waiting') AND processor_version IN ({processor_marks}))"),
+            rusqlite::params_from_iter(query_params(processors)),
+            |r| r.get(0),
+        )?;
+    if !any {
+        return Ok(Loaded {
+            identity: Some(identity),
+            groups: Vec::new(),
+        });
+    }
     let Some(raw) = raw_in(tx, false)? else {
         return Ok(Loaded {
             identity: None,
             groups: Vec::new(),
         });
     };
-    if !pending(tx)?.is_empty() {
-        return Ok(Loaded {
-            identity: Some(raw.identity),
-            groups: Vec::new(),
-        });
-    }
-    let mut stmt=tx.prepare("SELECT result_id,input_generation,processor_version,state,overlap,rank_used,lo,hi,input_guard,weight_digest,legacy_json,window_s,similarity,shortlist,space_id,vector_guard FROM ai_scene_groups g
-      WHERE space_fingerprint=?1 AND (?2 OR state!='waiting')
-      ORDER BY result_id")?;
-    let rows = stmt
-        .query_map(params![raw.identity.fingerprint(), include_waiting], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-                r.get::<_, i64>(6)?,
-                r.get::<_, i64>(7)?,
-                r.get::<_, String>(8)?,
-                r.get::<_, Option<String>>(9)?,
-                r.get::<_, String>(10)?,
-                r.get::<_, i64>(11)?,
-                r.get::<_, f64>(12)?,
-                r.get::<_, i64>(13)?,
-                r.get::<_, String>(14)?,
-                r.get::<_, String>(15)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .map_err(stored_row_error)?;
-    drop(stmt);
+    let mut all_members = read_all_members(tx, &identity_fingerprint, include_waiting, processors)?;
+    // (rank_used, weight digest, window, similarity bits, shortlist) -> expected processor version.
+    let mut expected_processors: Vec<ExpectedProcessor> = Vec::new();
     let mut groups = Vec::new();
-    for (
-        result_id,
-        input_generation,
-        processor_version,
-        state,
-        overlap,
-        rank_used,
-        lo,
-        hi,
-        guard,
-        weight_digest,
-        legacy,
-        window_s,
-        similarity,
-        shortlist,
-        space_id,
-        vector_guard,
-    ) in rows
-    {
+    // Rows are read in place: the strings of a component that is not used are never copied.
+    let mut stmt = tx.prepare(&format!(
+        "SELECT result_id,input_generation,processor_version,state,overlap,rank_used,lo,hi,input_guard,weight_digest,legacy_json,window_s,similarity,shortlist,space_id,vector_guard FROM ai_scene_groups
+          WHERE space_fingerprint=?1 AND (?2 OR state!='waiting') AND processor_version IN ({processor_marks})
+          ORDER BY result_id"
+    ))?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(query_params(processors)))?;
+    while let Some(r) = rows.next()? {
+        let str_at = |i: usize| -> Result<&str, Error> {
+            r.get_ref(i)
+                .map_err(stored_row_error)?
+                .as_str()
+                .map_err(|_| Error::CorruptResult)
+        };
+        let int_at = |i: usize| r.get::<_, i64>(i).map_err(stored_row_error);
+        let (lo, hi) = (int_at(6)?, int_at(7)?);
         if lo > hi {
             return Err(Error::CorruptResult);
         }
-        if (state != "waiting" && !raw.pointers.contains_key(&result_id))
-            || !processors.contains(&processor_version.as_str())
-            || raw.guard(lo, hi) != guard
+        let (result_id, state, processor_version, guard) =
+            (str_at(0)?, str_at(3)?, str_at(2)?, str_at(8)?);
+        if (state != "waiting" && !raw.pointers.contains_key(result_id))
+            || !processors.contains(&processor_version)
+            || !raw.guard_is(lo, hi, guard)
         {
             continue;
         }
-        let state = match state.as_str() {
+        let state = match state {
             "waiting" => State::Waiting,
             "local_ranked" => State::LocalRanked,
             "review_overlap" => State::ReviewOverlap,
             _ => return Err(Error::CorruptResult),
         };
-        let overlap = match overlap.as_str() {
+        let overlap = match str_at(4)? {
             "disjoint" => Overlap::Disjoint,
             "exact" => Overlap::Exact,
             "partial" => Overlap::Partial,
             _ => return Err(Error::CorruptResult),
         };
-        let rank_used = serde_json::from_str(&rank_used).map_err(|_| Error::CorruptResult)?;
-        let legacy = serde_json::from_str(&legacy).map_err(|_| Error::CorruptResult)?;
-        let members = read_members(tx, &result_id)?;
+        let rank_key = str_at(5)?;
+        let legacy_json = str_at(10)?;
+        let legacy = if legacy_json == "[]" {
+            Vec::new()
+        } else {
+            serde_json::from_str(legacy_json).map_err(|_| Error::CorruptResult)?
+        };
+        let weight_digest = match r.get_ref(9).map_err(stored_row_error)? {
+            ValueRef::Null => None,
+            ValueRef::Text(t) => Some(
+                std::str::from_utf8(t)
+                    .map_err(|_| Error::CorruptResult)?
+                    .to_string(),
+            ),
+            _ => return Err(Error::CorruptResult),
+        };
+        let (window_s, similarity) = (int_at(11)?, r.get::<_, f64>(12).map_err(stored_row_error)?);
+        let shortlist = usize::try_from(int_at(13)?).map_err(|_| Error::CorruptResult)?;
+        let options =
+            Options::new(window_s, similarity, shortlist).map_err(|_| Error::CorruptResult)?;
+        let known = expected_processors.iter().position(|e| {
+            e.rank_key == rank_key
+                && e.weight_digest == weight_digest
+                && e.window_s == window_s
+                && e.similarity_bits == similarity.to_bits()
+                && e.shortlist == shortlist
+        });
+        let rank_used = match known {
+            Some(i) => expected_processors[i].rank_used,
+            None => serde_json::from_str(rank_key).map_err(|_| Error::CorruptResult)?,
+        };
+        let members = all_members.remove(result_id).unwrap_or(Ok(Vec::new()))?;
         let group = Group {
-            result_id,
-            input_generation,
-            processor_version,
+            result_id: result_id.to_string(),
+            input_generation: str_at(1)?.to_string(),
+            processor_version: processor_version.to_string(),
             state,
             overlap,
             rank_used,
@@ -1057,15 +1686,35 @@ pub fn load_projection_in(
             legacy,
             lo,
             hi,
-            guard,
-            vector_guard,
+            guard: guard.to_string(),
+            vector_guard: str_at(15)?.to_string(),
             weight_digest,
             expected_active: String::new(),
         };
-        let shortlist = usize::try_from(shortlist).map_err(|_| Error::CorruptResult)?;
-        let options =
-            Options::new(window_s, similarity, shortlist).map_err(|_| Error::CorruptResult)?;
-        if space_id != raw.identity.space_id() || !valid_group(&raw, &group, options)? {
+        // The expected processor depends only on these inputs; derive it once per distinct set.
+        let known = match known {
+            Some(i) => i,
+            None => {
+                let version = options.group_processor_version(
+                    &raw.identity,
+                    group.rank_used,
+                    group.weight_digest.as_deref(),
+                );
+                expected_processors.push(ExpectedProcessor {
+                    rank_key: rank_key.to_string(),
+                    weight_digest: group.weight_digest.clone(),
+                    window_s,
+                    similarity_bits: similarity.to_bits(),
+                    shortlist,
+                    version,
+                    rank_used: group.rank_used,
+                });
+                expected_processors.len() - 1
+            }
+        };
+        let expected = &expected_processors[known].version;
+        if str_at(14)? != raw.identity.space_id() || !valid_group(&raw, &group, options, expected)?
+        {
             return Err(Error::CorruptResult);
         }
         if group.state == State::Waiting || raw_pointers_match(&raw, &group) {
@@ -1078,6 +1727,13 @@ pub fn load_projection_in(
     })
 }
 
+/// `?first,?first+1,...` for the processor list.
+fn marks_from(first: usize, count: usize) -> String {
+    (0..count)
+        .map(|i| format!("?{}", first + i))
+        .collect::<Vec<_>>()
+        .join(",")
+}
 fn processors_sql(processors: &[&str]) -> String {
     (0..processors.len())
         .map(|i| format!("?{}", i + 2))
@@ -1096,20 +1752,28 @@ fn parse_state(state: &str) -> Result<State, Error> {
 /// The active identity and `(state, ranking, count)` of the current stored headers.
 pub type HeaderCounts = (Option<SpaceIdentity>, Vec<(State, RankUsed, i64)>);
 
-/// Header-only counts for the status views: no photo row, vector or member is read.
-/// The result is advisory (no per-component guard); the cycle replaces a stale header at the next poll.
+/// Header counts for the status views: no photo row, vector or member payload is read.
+/// A header counts only while it is current by what the cycle writes: every member photo still exists
+/// and, unless it is waiting, every member's active reference names this result. The cycle removes the
+/// references a newer result supersedes and the waiting placeholder it replaces (see [`tidy`]), so a
+/// result that was replaced or lost a photo no longer counts. The per-component input guard is not
+/// recomputed (advisory): a result whose inputs changed counts until the next cycle replaces it.
 pub fn header_counts_in(tx: &Connection, processors: &[&str]) -> Result<HeaderCounts, Error> {
     let (_, identity) = index::active_in(tx)?;
     let Some(identity) = identity else {
         return Ok((None, Vec::new()));
     };
-    if !pending(tx)?.is_empty() || processors.is_empty() {
+    if processors.is_empty() || !ready_or_mismatch(tx)? {
         return Ok((Some(identity), Vec::new()));
     }
     let mut stmt = tx.prepare(&format!(
         "SELECT state,rank_used,COUNT(*) FROM ai_scene_groups g
           WHERE space_fingerprint=?1 AND processor_version IN ({})
-            AND (state='waiting' OR EXISTS(SELECT 1 FROM ai_scene_active a WHERE a.result_id=g.result_id))
+            AND EXISTS(SELECT 1 FROM ai_scene_members m WHERE m.result_id=g.result_id)
+            AND NOT EXISTS(SELECT 1 FROM ai_scene_members m WHERE m.result_id=g.result_id
+              AND (NOT EXISTS(SELECT 1 FROM photos p WHERE p.id=m.photo_id)
+                OR (g.state!='waiting' AND NOT EXISTS(SELECT 1 FROM ai_scene_active a
+                      WHERE a.photo_id=m.photo_id AND a.result_id=g.result_id))))
           GROUP BY state,rank_used",
         processors_sql(processors)
     ))?;
@@ -1160,7 +1824,7 @@ pub fn annotations_in(
     let Some(identity) = identity else {
         return Ok((None, HashMap::new()));
     };
-    if ids.is_empty() || processors.is_empty() || !pending(tx)?.is_empty() {
+    if ids.is_empty() || processors.is_empty() || !ready(tx)? {
         return Ok((Some(identity), HashMap::new()));
     }
     let marks = |from: usize| {
@@ -1171,26 +1835,34 @@ pub fn annotations_in(
     };
     let mut generations = HashMap::new();
     let mut stmt = tx.prepare(&format!("{PHOTO_ROWS} WHERE p.id IN ({})", marks(1)))?;
+    let mut scratch = Vec::new();
     let found = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
-        (0..23)
-            .map(|i| r.get::<_, Value>(i))
-            .collect::<rusqlite::Result<Vec<_>>>()
+        Row::from_sql(r, &mut scratch, false)
     })?;
     for row in found {
-        let row = Row::new(row?);
-        generations.insert(row.id(), row.generation());
+        let row = row?;
+        generations.insert(row.id(), row.generation().to_string());
     }
     drop(stmt);
     let first = 2 + processors.len();
+    // Ranked members are found through the photo's reference (primary key) and waiting ones through
+    // the few waiting headers; the members table has no index by photo and is never scanned.
+    let columns =
+        "m.photo_id,m.generation,g.state,g.overlap,m.rank,m.score,m.representative,m.shortlisted";
     let mut stmt = tx.prepare(&format!(
-        "SELECT m.photo_id,m.generation,g.state,g.overlap,m.rank,m.score,m.representative,m.shortlisted
-           FROM ai_scene_members m JOIN ai_scene_groups g ON g.result_id=m.result_id
-          WHERE m.photo_id IN ({}) AND g.space_fingerprint=?1 AND g.processor_version IN ({})
-            AND (g.state='waiting' OR EXISTS(SELECT 1 FROM ai_scene_active a
-                  WHERE a.photo_id=m.photo_id AND a.result_id=g.result_id))
-          ORDER BY m.photo_id,(g.state='waiting'),g.result_id",
-        marks(first),
-        processors_sql(processors)
+        "SELECT * FROM (
+           SELECT {columns},g.result_id AS result_id FROM ai_scene_active a
+             JOIN ai_scene_members m ON m.result_id=a.result_id AND m.photo_id=a.photo_id
+             JOIN ai_scene_groups g ON g.result_id=m.result_id
+            WHERE a.photo_id IN ({ids}) AND g.space_fingerprint=?1 AND g.processor_version IN ({processors})
+           UNION ALL
+           SELECT {columns},g.result_id AS result_id FROM ai_scene_groups g
+             JOIN ai_scene_members m ON m.result_id=g.result_id
+            WHERE g.state='waiting' AND g.space_fingerprint=?1 AND g.processor_version IN ({processors})
+              AND m.photo_id IN ({ids}))
+          ORDER BY photo_id,(state='waiting'),result_id",
+        ids = marks(first),
+        processors = processors_sql(processors)
     ))?;
     let mut values: Vec<Value> = vec![identity.fingerprint().into()];
     values.extend(processors.iter().map(|p| Value::Text(p.to_string())));

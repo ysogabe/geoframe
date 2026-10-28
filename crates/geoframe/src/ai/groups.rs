@@ -21,6 +21,8 @@ pub enum Error {
     CorruptResult,
     /// The bounded wait for the single writer expired; nothing was saved by this cycle.
     WriterBusy,
+    /// A scene table exists with columns this code does not write. It is neither read nor repaired.
+    SchemaMismatch,
 }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -574,10 +576,7 @@ impl Union {
     }
 }
 
-fn captured(value: &rusqlite::types::Value) -> Option<i64> {
-    let rusqlite::types::Value::Text(text) = value else {
-        return None;
-    };
+fn captured_text(text: &str) -> Option<i64> {
     crate::geo::naive_seconds_with_seconds(text)
         .or_else(|| crate::geo::naive_seconds(text))
         .map(|v| v as i64)
