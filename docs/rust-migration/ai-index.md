@@ -96,8 +96,9 @@ T4.3の索引基盤に、[T4.4aの固定契約アダプターと画像ワーカ�
 
 Python は追加表と `ai_active_space` を使わず旧表を読む。Rust の追加表・ポインタがある DB を現行 Python の `api_photos`・`api_ai_status`・`_remove_noncanonical_embeddings`・`_load_photos`・`_valid_rows` に渡しても、手動の位置・お気に入り・非表示・回転、旧の有償結果、Rust の追加表・ポインタは変わらず、世代の合う旧選別ではフィードの顔ぶれが Rust と一致する（`tests/ai_index_python_rollback.rs`。Python が無い環境では省く）。
 
-## 9. 後続への境界と限界
+## 9. 境界と実装状況
 
-- **T4.4a実装済み**: [固定契約アダプター・世代付き画像ジョブ・自動切替](ai-embedding.md)。SpaceIdentityは明示した固定契約と実model/能力を照合する。**T4.4b**: E5は `index::status`、E6は共有clientのquery＋`load_active_index`＋`QueryVector`へ接続する。
-- **T4.5**: 新しい同一場面グループ・代表。**旧選別と部分的に重なる新集合は旧選別を自動で置き換えない**（旧は `selection` の有効判定のまま保持。新しい結果は別表に持ち、重なるものは管理確認）。入力集合・世代が一致する選別単位か、有効な旧選別と重ならない新しい集合だけ新判定を使える。旧の写真別判定（品質・`keep_score` 等）は世代が一致すれば空間独立で使える。
-- T4.4aで固定契約の画像Embedding・差分修復・`ai_active_space`の自動切替ワーカーを実装済み。T4.4bで[E5/E6 HTTP・query LRU/レート制限](ai-search.md)を接続済み。残る未実装は設定JSONの閾値キー、T4.5の新しい同一場面の表（`ai_scene_*`）。実LAN/LXCでのRust経由受入は親担当で未確認。旧Q8_0/Geminiベクトルは輸入しない。lineage追加表とchunk/公開照会の最終方式は [ai-embedding.md](ai-embedding.md) を参照。
+- **画像Embeddingの接続**: [固定契約アダプター・世代付き画像ジョブ・自動切替](ai-embedding.md)（T4.4a）と、[E5/E6 HTTP・query LRU/レート制限](ai-search.md)（T4.4b）を接続済み。E5は `index::status`、E6は共有clientのquery＋`load_active_index`＋`QueryVector`を使う。SpaceIdentityは明示した固定契約と実model/能力を照合する。
+- **同一場面グループ・代表**: [ai-scenes.md](ai-scenes.md)（T4.5a/b。`ai_scene_groups`／`ai_scene_members`／`ai_scene_active`）と、任意のGemini比較[ai-scene-judge.md](ai-scene-judge.md)（T4.5c）で実装済み。**旧選別と部分的に重なる新集合は旧選別を自動で置き換えない**（旧は `selection` の有効判定のまま保持。新しい結果は別表に持ち、重なるものは管理確認）。入力集合・世代が一致する選別単位か、有効な旧選別と重ならない新しい集合だけ新判定を使える。旧の写真別判定（品質・`keep_score` 等）は世代が一致すれば空間独立で使える。
+- **自動切替の待ち**: 構築開始時の候補（`BuildSnapshot`）の対象だけが公開を待たせる。writer の保守の前に読み取り側で公開を省くかを判断するときも、候補の対象のジョブだけを見る（構築を始めたあとに足した写真のジョブは、pending/deferred のままでも公開を妨げない。公開後の差分として索引へ加わる）。
+- **未実装**: 切替の成功率の閾値`activation_min_coverage`の設定JSONキー（今は`try_activate`の引数と既定0.95）。旧Q8_0/Geminiベクトルは輸入しない。lineage追加表とchunk/公開照会の最終方式は [ai-embedding.md](ai-embedding.md) を参照。実LAN/LXCでのRust経由の受入は[p4-acceptance.md](p4-acceptance.md)に記録する。

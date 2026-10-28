@@ -17,6 +17,8 @@ use rusqlite::params;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
 
+use super::MAX_QUEUE;
+
 type Hook = Arc<dyn Fn(&str) + Send + Sync>;
 struct State {
     cloud_status: u16,
@@ -886,6 +888,63 @@ fn damaged_history_holds_without_billing_and_manual_retry_requeues_only_unpaid_i
     l.env.advance(3600);
     l.cycle();
     assert_eq!(l.posts(), 1);
+}
+
+#[test]
+fn scenes_stopped_by_the_failure_cap_do_not_starve_the_ones_behind_them_until_a_manual_retry() {
+    // MAX_QUEUE + 1 の送れる場面（同じ大きさ）。先頭の MAX_QUEUE 件が失敗の上限に達して回答が無い。
+    let l = Lab::new();
+    for scene in 0..=MAX_QUEUE as i64 {
+        l.scene(2 * scene + 1..=2 * scene + 2, scene * 2_400);
+    }
+    // 場面の計算は 1 周期に GROUPS_PER_CYCLE 件までなので、全部できるまで回す。
+    let built: usize = (0..3).map(|_| l.scenes()).sum();
+    assert_eq!(built, MAX_QUEUE + 1);
+    let handler = l.handlers().remove(0);
+    let reconcile = |h: &Arc<dyn Handler>| {
+        let read = crate::db::open_read_only(&l.config().db_path()).unwrap();
+        h.reconcile(&read, crate::ai::tests_worker::T0).unwrap()
+    };
+    let first = reconcile(&handler);
+    assert_eq!(first.len(), MAX_QUEUE);
+    let queued = first.clone();
+    l.env
+        .writer()
+        .call(move |c| {
+            crate::ai::jobs::enqueue_batch(c, &queued, crate::ai::tests_worker::T0)?;
+            c.execute_batch(
+                "UPDATE ai_jobs SET state='failed',terminal=1,attempts=5,last_error_code='bad_response'
+                 WHERE kind='photo_judge'",
+            )
+        })
+        .unwrap();
+    // 失敗で止まったキーは候補から外れ、後ろの 1 場面だけが残る（直す前は同じ 32 件が返り続けた）。
+    let next = reconcile(&handler);
+    assert_eq!(next.len(), 1);
+    assert!(first.iter().all(|k| *k != next[0]));
+    // 実際の周期でも、後ろの場面が送られ、失敗の履歴（上限・試行数）はそのまま残る。
+    l.cycle();
+    assert_eq!(l.posts(), 1);
+    assert_eq!(l.judgments(), 1);
+    assert_eq!(
+        l.n("SELECT COUNT(*) FROM ai_jobs WHERE kind='photo_judge' AND state='failed' AND terminal=1 AND attempts=5"),
+        MAX_QUEUE as i64
+    );
+    // 手動の再試行で失敗の履歴が消えたキーは、また候補に戻る（回答のある後ろの場面は戻らない）。
+    let report = crate::ai::ops::retry(
+        &l.env.writer(),
+        &l.config().ai,
+        &l.handlers(),
+        crate::ai::ops::RetryTarget::Kind(JobKind::PhotoJudge),
+        &l.env.clock(),
+    )
+    .unwrap();
+    assert_eq!(report.requeued, MAX_QUEUE);
+    assert_eq!(
+        l.n("SELECT COUNT(*) FROM ai_jobs WHERE kind='photo_judge' AND state='pending' AND terminal=0 AND attempts=0"),
+        MAX_QUEUE as i64
+    );
+    assert_eq!(reconcile(&handler).len(), MAX_QUEUE);
 }
 
 #[test]

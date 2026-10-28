@@ -463,6 +463,54 @@ fn old_pointer_remains_pending_all_failed_never_publishes_and_99_of_100_does() {
     assert_eq!(lab.posts().len(), 0);
 }
 #[test]
+fn photos_added_after_the_build_started_do_not_hold_publication_back_and_join_as_a_delta() {
+    let lab = Lab::new();
+    let e = lab.env("embed-late-photo");
+    // One handler set for the whole service lifetime: the build snapshot lives in it.
+    let hs = handlers(&e);
+    let cycle = |e: &Env| Core::new(&e.deps(hs.clone(), &StopFlag::new(), "embed-test")).cycle();
+    photo(&e, 1, &jpeg(1));
+    photo(&e, 2, &jpeg(2));
+    // Build starts (snapshot = photos 1 and 2) while the provider is unavailable.
+    lab.state.lock().unwrap().available = false;
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 0);
+    assert_eq!(pointer(&e), None);
+    // A photo added after the build started. Its job stays queued (429) after the
+    // snapshot's own targets complete.
+    photo(&e, 3, &jpeg(3));
+    let state = lab.state.clone();
+    let posts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    lab.hook(move |r| {
+        if r.request_line.starts_with("POST ")
+            && posts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 2
+        {
+            state.lock().unwrap().status = 429;
+        }
+    });
+    e.advance(61);
+    lab.state.lock().unwrap().available = true;
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 3);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 2);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='deferred'"),
+        1
+    );
+    assert_eq!(pointer(&e).as_deref(), Some("eg2-test-v1"));
+    // The late photo joins as a delta afterwards, without a second publication.
+    lab.state.lock().unwrap().status = 200;
+    e.advance(3600);
+    cycle(&e);
+    assert_eq!(lab.posts().len(), 4);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_embedding_vectors"), 3);
+    assert_eq!(
+        n(&e, "SELECT COUNT(*) FROM ai_jobs WHERE state='succeeded'"),
+        3
+    );
+    assert_eq!(pointer(&e).as_deref(), Some("eg2-test-v1"));
+}
+#[test]
 fn generation_changes_after_discovery_prevent_send_and_after_post_prevent_commit() {
     for after_post in [false, true] {
         for mutation in [

@@ -1,13 +1,13 @@
 # AI設定（`GEOFRAME_AI_CONFIG`）v1
 
-- 状態: T4.1bで実装（T4.2でHTTP基盤を追加）。設計は[p4-design.md](p4-design.md) §3。ここは**設定の読み取りと検査**。接続先の固定・Discovery・Decisionの入出力・共有の一時待機は[ai-provider.md](ai-provider.md)（T4.2）。クラウドの認証・送信は[ai-cloud.md](ai-cloud.md)、日候補の本番接続は[ai-location-suggest.md](ai-location-suggest.md)を参照。
+- 状態: T4.1bで実装し、T4.2〜T4.6で用途・接続を追加した（最終の状態を書く。当時の記録は節ごとに明示）。設計は[p4-design.md](p4-design.md) §3。ここは**設定の読み取りと検査**。接続先の固定・Discovery・Decisionの入出力・共有の一時待機は[ai-provider.md](ai-provider.md)（T4.2）。クラウドの認証・送信は[ai-cloud.md](ai-cloud.md)、日候補の本番接続は[ai-location-suggest.md](ai-location-suggest.md)を参照。
 - `GEOFRAME_AI_CONFIG`（Rustだけの項目）は、用途別のrouting・クラウド許可・ベクトル空間をまとめた小さなJSONのパス。**未設定なら新しい外部AI呼び出しは無効**（写真の配信・管理・保存済み推薦の読み取りは動く）。相対パスは起動したカレントディレクトリ基準。
 
 ## 読み込みの決まり
 
 - 通常のファイルだけ・**64KiBまで**・UTF-8のJSONオブジェクト。**全ての階層で未知のキーと重複したキーは不正**（秘密をうっかり書き足しても受けない）。
 - 起動時にDNS・ネットワーク・認証ファイルの読み取りをしない。URL・パスは文字列として検査するだけ。
-- **誤った設定はAIだけを無効にする**: JSONが不正、または旧環境変数の数値が不正でも、`serve`は起動して写真を配信する。ログには種類のコード（下の表）だけを出し、パス・中身・URL・モデル名・`serde`のエラー文は出さない。起動ログの`ai=`は`unset`／`invalid:<コード>`／`ready:tasks=<件数>`。STATUSへの`ai_config_invalid`の表示はT4.1c。
+- **誤った設定はAIだけを無効にする**: JSONが不正、または旧環境変数の数値が不正でも、`serve`は起動して写真を配信する。ログには種類のコード（下の表）だけを出し、パス・中身・URL・モデル名・`serde`のエラー文は出さない。起動ログの`ai=`は`unset`／`invalid:<コード>`／`ready:tasks=<件数>`。STATUSの`ai_config_invalid`は下の「管理画面のSTATUS」。
 - 設定の変更は再起動で反映する。
 
 | コード | 意味 |
@@ -96,9 +96,9 @@
 
 設定全体のハッシュ・用途の送信ポリシーのハッシュ（SHA-256）は監査と送信可否の検査用で、**ジョブの冪等キーには入れない**（URL・許可・上限だけの変更で成功済みの結果を再送しないため）。Providerの一時停止（認証の失敗・403・モデル404・契約不一致。`ai_provider_pauses`）は、接続先・認証・モデルなど**その理由に関係する設定だけ**から識別を作り、再起動では解除されず、関係する設定が変わるか管理CLI（`geoframe ai-jobs release-pause`。下の「管理操作」）の明示の解除で効かなくなる。全ジョブを`failed`にはしない。到達不能・GPU lease・429などの**一時待機**（`ai_provider_waits`）は別物で、`until`（60〜3600秒先）が過ぎれば自然に消え、停止とは混同しない（[ai-provider.md](ai-provider.md)）。
 
-## 背景ワーカー（T4.1c）
+## 背景ワーカー
 
-専用スレッド1本が、既存のwriter（`Ingest.writer`）と`.ingest.lock`（`LockHold`）を共有して動く（`ai::worker`）。T4.6bで有効な[写真別location_clue](ai-location-clue.md)を本番登録した（fakeのProvider・スタブの設定は置かない）。他用途の処理は後続タスクが追加する。登録が無い種類のジョブは、claimも成功化もされず`pending`/`deferred`のまま残る。
+専用スレッド1本が、既存のwriter（`Ingest.writer`）と`.ingest.lock`（`LockHold`）を共有して動く（`ai::worker`。T4.1cで導入）。本番で登録するhandlerは、画像Embedding（`embedding_contract`が揃うとき。[ai-embedding.md](ai-embedding.md)）・写真別[location_clue](ai-location-clue.md)・日候補の[location_suggest／location_geocode](ai-location-suggest.md)・任意のGemini比較[photo_judge](ai-scene-judge.md)（用途のクラウド許可とクラウド接続が揃うとき）で、設定が無効・接続や契約が揃わない用途は登録されない（fakeのProvider・スタブの設定は置かない）。登録が無い種類のジョブは、claimも成功化もされず`pending`/`deferred`のまま残る。
 
 - **起動の条件**: `GEOFRAME_INGEST=1`かつ`GEOFRAME_AI_ENABLED=1`かつ有効な背景用途が1つ以上。`query_embedding`は利用者を待たせる対話の用途で、永続キューの背景ジョブではない。`INGEST=0`では何も起動せず、AIの表を作らず、ジョブの回収もProvider停止の整理もしない。
 - **起動の準備**（`INGEST=1`なら、ワーカーが無効でも。ロックを取ったあと）: ①前の起動の`running`を回収する。停止開始が記録された起動のものは数えず`deferred/shutdown`、記録の無いもの（`SIGKILL`・クラッシュ・電源断）は`interruption_count`を加算して3回で`failed`。②設定が**有効なときだけ**、関係する設定が変わって効かなくなったProvider停止を整理する（`release_unmatched`）。設定が未指定・不正のときは、現在の識別が分からないので既存の停止を1件も消さない。
@@ -111,7 +111,7 @@
 |---|---|---|
 | `Stopping` | `deferred/shutdown`（失敗に数えない） | 送っていない |
 | `InputChanged` | `obsolete` | |
-| `PolicyDisabled` | `deferred/policy_disabled`（失敗に数えない） | 後続のhandlerは`Disabled`をこれに対応付ける |
+| `PolicyDisabled` | `deferred/policy_disabled`（失敗に数えない） | 各handlerは`Disabled`をこれに対応付ける |
 | `Paused` | `deferred/provider_paused` | |
 | `Budget(予約の結果)` | `deferred`。1日の枠切れ・周期の枠切れは`budget_exhausted`（待ちは3600秒・周期窓の長さ）、時計の巻き戻りは`clock_rewound`（600秒）、順番待ちの超過などは`internal` | その用途を待ちの間は送らない。**予算をリセットする救済は無い**（時計が履歴に追いつくまで送らない） |
 | `Unavailable` | `deferred/unavailable`（60秒後以降） | その用途を60秒送らない（この起動の中の用途単位。Provider全体へ広げる待ちは次の`ProviderWait`） |
@@ -134,7 +134,7 @@ handlerの**panic**は当該ジョブの失敗1回（`panic`。5回で`failed`�
 | コマンド | 内容 |
 |---|---|
 | `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、検索空間の有無・登録数と索引の件数（対象・保存済み・待ち・失敗で除外・壊れ。[ai-index.md](ai-index.md)）、用途ごとの使える／使えない（固定の理由コード）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途、有効な共有の一時待機（用途・範囲・固定の理由・UTCの期限） |
-| `geoframe ai-jobs retry (--kind <種類>｜--all)` | `failed`だけを、登録済みhandlerが現在の入力・既存の結果に照らして再検査し、`Requeue`（カウンタ・履歴を0に戻して`pending`）／`Obsolete`／`Satisfied`（成功済み扱い。再計算しない）へ振り分ける。**外部へは送らない**。成功済み・待機中は変えない。検査できないものは戻さず`failed`のまま件数だけ報告する: handler未登録の種類（Embedding / photo_judge等）、設定で今は使えない用途 |
+| `geoframe ai-jobs retry (--kind <種類>｜--all)` | `failed`だけを、登録済みhandlerが現在の入力・既存の結果に照らして再検査し、`Requeue`（カウンタ・履歴を0に戻して`pending`）／`Obsolete`／`Satisfied`（成功済み扱い。再計算しない）へ振り分ける。**外部へは送らない**。成功済み・待機中は変えない。検査できないものは戻さず`failed`のまま件数だけ報告する: handler未登録の種類（設定が無効、または固定契約・クラウド接続が揃わず登録されない用途）、設定で今は使えない用途 |
 | `geoframe ai-jobs release-pause (--task <用途>｜--all)` | Provider・用途の停止の明示解除。`--task`は今の設定でその用途に当たる停止だけ（設定が未指定・不正なら何もせず終了コード2）、`--all`は全部 |
 | `geoframe ai-jobs deactivate-space` | 有効な検索空間（`settings.ai_active_space`）を外して旧結果参照へ戻す（P4 / T4.3。[ai-index.md](ai-index.md)）。旧結果・空間・ベクトル・ジョブは消さない。稼働中は拒否 |
 
@@ -153,14 +153,14 @@ Rustだけが返す追加フィールドで、**あるときだけ**付く（AI�
 
 STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解除・再試行のコマンドを文字で示す（画面からは操作できない）。
 
-### 限界・後続
+### 限界・実装状況
 
-- 未登録の種類の`failed`は`ai-jobs retry`でも保持する（`unsupported`）。location_clueはT4.6bの`recheck`で現在の入力・処理版・既存結果を検査し、同世代のfailed投影を無効にしてpendingへ戻す（通信なし）。
+- 未登録の種類の`failed`は`ai-jobs retry`でも保持する（`unsupported`）。登録済みの種類（画像Embedding・location_clue・location_suggest・photo_judge）は、各handlerの`recheck`が現在の入力・処理版・既存結果を検査して、`pending`へ戻す・`obsolete`にする・成功済み扱いにするのいずれかへ振り分ける（通信なし）。location_clueは同世代のfailed投影も無効にする。
 - `Disabled`から`RunError::PolicyDisabled`への対応付け、401/403/404/契約不一致から`ProviderPause`／`TaskPause`への対応付け、429のRetry-After、予算エラー（`Budget`）の扱いは、各handlerが`before_send`の結果をそのまま返すことで揃う（ワーカーがジョブの状態へ対応付ける）。
-- HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。空間別のベクトル保存・検索空間の切替・旧選別の安全化はT4.3で実装済み（[ai-index.md](ai-index.md)。切替の成功率の閾値`activation_min_coverage`は、今は`try_activate`の引数と既定0.95で、このJSONには置かない。後続が任意の独立キーとして足す場合は、有限の0〜1だけを許し、不正ならAI設定不正としてAIだけを無効にし、閾値は設定ハッシュ・結果の同一性に入れない）。画像／文Embeddingの固定契約アダプター・画像job・自動切替は[T4.4a](ai-embedding.md)で実装済み。対話の検索語Embedding（`query_embedding`）の予約・キャッシュ・E5/E6接続はT4.4b、Decisionの質問・clue保存・クラウドはT4.6。
+- HTTP通信・Discovery・Decisionの入出力・共有の一時待機はT4.2で実装済み（[ai-provider.md](ai-provider.md)）。空間別のベクトル保存・検索空間の切替・旧選別の安全化はT4.3で実装済み（[ai-index.md](ai-index.md)。切替の成功率の閾値`activation_min_coverage`は、今は`try_activate`の引数と既定0.95で、このJSONには置かない。後続が任意の独立キーとして足す場合は、有限の0〜1だけを許し、不正ならAI設定不正としてAIだけを無効にし、閾値は設定ハッシュ・結果の同一性に入れない）。画像／文Embeddingの固定契約アダプター・画像job・自動切替は[T4.4a](ai-embedding.md)、対話の検索語Embedding（`query_embedding`）の予約・キャッシュ・E5/E6接続は[T4.4b](ai-search.md)、Decisionの質問・clue保存・クラウドは[T4.6](ai-location-clue.md)で実装済み。
 
 
-Vertexの明示認証・固定宛先・token/予算/失敗分類は[ai-cloud.md](ai-cloud.md)（T4.6a）。handler登録と実クラウド利用の許可は後続。
+Vertexの明示認証・固定宛先・token/予算/失敗分類は[ai-cloud.md](ai-cloud.md)（T4.6a）。handlerの登録（photo_judge・location_suggest）は用途のクラウド許可とクラウド接続が揃うときだけで、実クラウド利用の許可はその用途ごとの設定（`allow_cloud`）が決める。
 
 ## T4.6c2 日候補の運用境界
 

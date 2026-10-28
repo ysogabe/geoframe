@@ -269,26 +269,14 @@ impl Handler for ImageEmbedding {
         })
     }
     fn maintenance(&self, read: &Connection, _now: i64) -> rusqlite::Result<Option<Maintenance>> {
-        // The active pointer never needs republishing. Missing vectors with queued work
-        // also cannot publish yet. Avoid full writer scans after every job completion.
-        // This is only a read-side optimization; the eventual activation still validates
-        // all members and vectors atomically in the writer transaction.
-        let skip: bool = read.query_row(
-            "SELECT CASE WHEN EXISTS(SELECT 1 FROM settings WHERE key='ai_active_space' AND value=?3)
-            THEN 1 ELSE EXISTS(SELECT 1 FROM ai_jobs
-            WHERE kind='image_embedding' AND processor_version=?1
-            AND substr(target_key,1,length(?2))=?2
-            AND state IN ('pending','running','deferred')
-            AND NOT EXISTS(SELECT 1 FROM ai_embedding_vectors v WHERE v.space_id=?3
-                AND v.input_sha256=substr(ai_jobs.target_key,length(?2)+1))) END",
-            params![
-                index::image_embedding_processor_version(self.identity()),
-                format!("{}\u{1f}", self.identity().space_id()),
-                self.identity().space_id()
-            ],
+        // The active pointer never needs republishing. Without a build snapshot there is
+        // nothing to publish. Both are cheap in-memory/point checks, so test them first.
+        let active: bool = read.query_row(
+            "SELECT EXISTS(SELECT 1 FROM settings WHERE key='ai_active_space' AND value=?1)",
+            [self.identity().space_id()],
             |r| r.get(0),
         )?;
-        if skip {
+        if active {
             return Ok(None);
         }
         let snapshot = self
@@ -299,6 +287,37 @@ impl Handler for ImageEmbedding {
         let Some(snapshot) = snapshot else {
             return Ok(None);
         };
+        // Missing vectors with queued work cannot publish yet. Only the build snapshot's
+        // targets count: photos added after the build started must not hold publication
+        // back (they join as a delta afterwards), exactly like `try_activate`. This is only
+        // a read-side optimization, keyed by SHA only; the eventual activation still validates
+        // all members (generations) and vectors atomically in the writer transaction.
+        let wanted: HashSet<&str> = snapshot
+            .targets()
+            .iter()
+            .map(activation::SnapshotTarget::input_sha256)
+            .collect();
+        let prefix = format!("{}\u{1f}", self.identity().space_id());
+        let mut queued = read.prepare(
+            "SELECT substr(target_key,length(?2)+1) FROM ai_jobs
+            WHERE kind='image_embedding' AND processor_version=?1
+            AND substr(target_key,1,length(?2))=?2
+            AND state IN ('pending','running','deferred')
+            AND NOT EXISTS(SELECT 1 FROM ai_embedding_vectors v WHERE v.space_id=?3
+                AND v.input_sha256=substr(ai_jobs.target_key,length(?2)+1))",
+        )?;
+        let mut rows = queued.query(params![
+            index::image_embedding_processor_version(self.identity()),
+            prefix,
+            self.identity().space_id()
+        ])?;
+        while let Some(row) = rows.next()? {
+            if wanted.contains(row.get::<_, String>(0)?.as_str()) {
+                return Ok(None);
+            }
+        }
+        drop(rows);
+        drop(queued);
         let (identity, shared) = (self.identity().clone(), self.snapshot.clone());
         Ok(Some(Box::new(move |conn| {
             let result = activation::try_activate_default(conn, &snapshot, &identity)

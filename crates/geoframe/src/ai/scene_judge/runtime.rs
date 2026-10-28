@@ -17,6 +17,7 @@ use crate::{
     imaging,
 };
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// 1 回の reconcile が積む最大件数。実際に送る数は周期の上限・日の上限・失敗の上限が別に抑える。
@@ -52,6 +53,21 @@ struct PhotoJudge {
     work: Mutex<Vec<Candidate>>,
 }
 
+fn key_triple(key: JobKey) -> (String, String, String) {
+    (key.target_key, key.input_hash, key.processor_version)
+}
+
+/// 失敗の履歴で止まっている photo_judge のキー。`obsolete` でも `terminal` なら、enqueue が `failed` に
+/// 戻すので同じ扱い。手動の再試行（`terminal` を 0 にして `pending` へ）をすれば、ここから外れる。
+fn failed_keys(conn: &Connection) -> rusqlite::Result<HashSet<(String, String, String)>> {
+    conn.prepare(
+        "SELECT target_key,input_hash,processor_version FROM ai_jobs
+         WHERE kind='photo_judge' AND (state='failed' OR (state='obsolete' AND terminal=1))",
+    )?
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    .collect()
+}
+
 fn db_error(_: rusqlite::Error) -> RunError {
     RunError::Attempt(ErrorCode::Internal)
 }
@@ -61,7 +77,11 @@ fn scene_error(_: crate::ai::groups::Error) -> RunError {
 
 impl PhotoJudge {
     /// 現世代の置換候補のうち、まだ回答が無く（再利用できず）送ってよいもの。大きい場面から最大 [`MAX_QUEUE`]。
-    fn scan(&self, read: &Connection) -> rusqlite::Result<Vec<Candidate>> {
+    ///
+    /// `skip_failed` が真のとき、同じキーが失敗の履歴（上限・恒久失敗・中断上限）で止まっているものは
+    /// 候補から外す。失敗は enqueue が残すので、外さないと先頭の [`MAX_QUEUE`] 件が毎周期選ばれ続け、
+    /// 後ろの場面がジョブにもならない。手動の再試行は失敗のキーを `work` から引くので、偽で呼ぶ。
+    fn scan(&self, read: &Connection, skip_failed: bool) -> rusqlite::Result<Vec<Candidate>> {
         let prepared =
             Prepared::read(read, &self.config).map_err(|_| rusqlite::Error::InvalidQuery)?;
         let tx = read.unchecked_transaction()?;
@@ -73,11 +93,19 @@ impl PhotoJudge {
             tx.commit()?;
             return Ok(Vec::new());
         }
+        let failed = if skip_failed {
+            failed_keys(&tx)?
+        } else {
+            HashSet::new()
+        };
         let mut found = Vec::new();
         for group in loaded.groups() {
             let Some(candidate) = Candidate::from_group(group).filter(Candidate::sendable) else {
                 continue;
             };
+            if !failed.is_empty() && failed.contains(&key_triple(candidate.key(&self.model))) {
+                continue;
+            }
             if hidden_ok(&tx, &candidate.sent_ids(), self.include_hidden)?
                 && matches!(
                     lookup_in(&tx, &candidate.input_key(&self.model))?,
@@ -202,7 +230,7 @@ impl Handler for PhotoJudge {
         JobKind::PhotoJudge
     }
     fn reconcile(&self, read: &Connection, _now: i64) -> rusqlite::Result<Vec<JobKey>> {
-        let work = self.scan(read)?;
+        let work = self.scan(read, true)?;
         let keys = work.iter().map(|c| c.key(&self.model)).collect();
         *self.work.lock().unwrap_or_else(PoisonError::into_inner) = work;
         Ok(keys)
@@ -245,7 +273,7 @@ impl Handler for PhotoJudge {
     fn prepare_retry(&self) -> rusqlite::Result<()> {
         let read = crate::db::open_read_only(&self.data.root().join(crate::config::DB_FILE_NAME))
             .map_err(|_| rusqlite::Error::InvalidQuery)?;
-        *self.work.lock().unwrap_or_else(PoisonError::into_inner) = self.scan(&read)?;
+        *self.work.lock().unwrap_or_else(PoisonError::into_inner) = self.scan(&read, false)?;
         Ok(())
     }
     fn recheck(&self, conn: &Connection, key: &JobKey) -> rusqlite::Result<Recheck> {

@@ -24,6 +24,8 @@ handlerは`photo_judge`が`provider=cloud`・`allow_cloud=true`・日の上限�
 
 画像は`prepare_embedding_rgb`（EXIF向き適用・長辺768px・1.6MP）→RGBから`PreparedImage`を新規生成（JPEG q82）。圧縮済みバイト・EXIF・GPS・ファイル名は入口が無く構造的に送れない。送る前に、読んだ元ファイルのSHAが品質解析済みの`content_sha256`と一致することを確かめる。shortlist上限（設定の2〜6）がそのまま送信枚数の上限で、リクエスト全体はbase64込み8MiB（既存の`GenerateRequest`）。
 
+1周期に積む候補は、回答が無い現世代の置換候補から大きい場面順に最大32件で、**同じキーが失敗の履歴（上限・恒久失敗・中断上限）で止まっているものは飛ばす**（enqueueは既存のfailedを残すので、飛ばさないと先頭の32件が毎周期選ばれ続けて後ろの場面がジョブにもならない）。手動の再試行でカウンタと履歴が0に戻ったキーは、また候補に戻る（再試行の再検査は、失敗のキーも含めて数える）。
+
 毎POSTの前の予算は既存の`RunCtx::before_send_until`（日・周期の予約。予約は戻さない）、失敗は既存のworker分類（応答不正は`BadResponse`で5回で`failed`、停止・認証・429・予算切れは失敗に数えず待機）。送信の応答は`JsonReply`から`Verdict::parse`で検査する（全写真番号の揃い・列挙・0〜100の範囲・型。範囲外の番号は無視、重複・欠落は拒否）。同一場面なのに推薦が0枚なら`keep_score`最大の1枚を推薦にする（Pythonと同じ）。
 
 ## 適用（CAS）

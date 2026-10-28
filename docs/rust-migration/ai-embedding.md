@@ -51,7 +51,7 @@ production factoryは `INGEST=1` かつ有効なlocal image_embeddingだけを�
 
 cleanupはread側でSHAの集合をHashSetへ計画し、1 SHA/closure・最大200 closure/transaction（空間登録も1 closure）へ分割する。各writer区間で対象SHAの世代とvectorを索引付きで再読し、継承・登録・processor限定supersede・失効を原子的に行う。generic reconcileは空で、後段の汎用enqueue/supersedeへ履歴継承を迂回する経路はない。途中chunk失敗ではそのtransactionだけrollbackし、workerは後段enqueueを飛ばす。chunk間停止・再起動後は次周期の再計画で修復する。succeededの有効vectorはresetせず、欠落/破損を確認できた成功結果だけを再生成へ戻す（カウンタ・terminal保持）。有効vectorを新世代や再起動で再送しない。
 
-進捗/公開のfailed照会はprocessor/spaceごとに1回のbulk SELECTとHashMap照合にする。単一SHAの実行/cleanup/再利用検査は全件scanを行わない。maintenanceは公開済みポインタや未完成vector付きのpending/running/deferredをread側の1 SQLで検知した周期にはwriter全件検査を省く。公開できる段階では既存のwriter transaction内で全対象・vectorを再検証する。
+進捗/公開のfailed照会はprocessor/spaceごとに1回のbulk SELECTとHashMap照合にする。単一SHAの実行/cleanup/再利用検査は全件scanを行わない。maintenanceは公開済みポインタ、または**構築開始時の`BuildSnapshot`の対象**に未完成vector付きのpending/running/deferredがあることをread側の1 SQLで検知した周期には、writer全件検査を省く（構築後に足した写真のジョブは、省く判断に使わない。`try_activate`と同じく、公開を待たせない）。公開できる段階では既存のwriter transaction内で全対象・vectorを再検証する。
 
 画像は共有の安全なファイルread（通常ファイル・O_NOFOLLOW/サイズ制限・実fdがDataDir内）だけを画像lock内で行う。decode、EXIF一度適用、sRGB、縮小、新規JPEG化、HTTPはwriter/tx/画像lock外。送信直前はDiscovery後にもDB世代と実source SHAを再読し、その後に最終 `before_send`（停止・設定・pause・budget）を通す。応答後も実source SHAを確認し、完了時にtokenとDB世代をCASする。SAVEのlat/lon・hidden/favoriteは画像世代と混同せず、一次列を上書きしない。停止後の新規送信は0、既に送った有効な結果は既存の停止/tokenルールで確定する。
 
