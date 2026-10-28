@@ -22,6 +22,8 @@ pub fn enabled(config: &Config) -> bool {
 #[derive(Debug, Default)]
 pub struct CycleReport {
     pub stored: usize,
+    /// References of photos outside the plan (not ready any more) that this cycle dropped.
+    pub retired: usize,
     pub selected: usize,
     pub members: usize,
     pub snapshot: Duration,
@@ -83,6 +85,7 @@ impl Runtime {
         };
         report.compute = computing.elapsed();
         let mut indexes = pending_saves(read, &plan, GROUPS_PER_CYCLE)?;
+        let retire = pending_retire(read, &plan)?;
         let mut members = 0;
         indexes.retain(|&i| {
             let n = plan.groups()[i].members().len();
@@ -92,7 +95,9 @@ impl Runtime {
             members += n;
             true
         });
-        if indexes.is_empty() || cancelled() {
+        // A cycle with nothing to store still writes when a reference of a photo that is not ready any
+        // more exists; with neither, it writes nothing.
+        if (indexes.is_empty() && retire == 0) || cancelled() {
             return Ok(report);
         }
         report.selected = indexes.len();
@@ -102,7 +107,7 @@ impl Runtime {
         let result = writer
             .call_within(deadline, move |c| {
                 let began = Instant::now();
-                let result = save_batch(c, &plan, &indexes, &|| {
+                let result = save_batch_counted(c, &plan, &indexes, &|| {
                     stop.is_stopped() || Instant::now() >= deadline
                 });
                 Ok((result, began.duration_since(queued), began.elapsed()))
@@ -111,11 +116,9 @@ impl Runtime {
                 WriteError::Expired => Error::WriterBusy,
                 _ => Error::Database,
             })?;
-        report.stored = result
-            .0?
-            .into_iter()
-            .filter(|s| *s == Saved::Stored)
-            .count();
+        let (saved, retired) = result.0?;
+        report.stored = saved.into_iter().filter(|s| *s == Saved::Stored).count();
+        report.retired = retired;
         report.writer_wait = result.1;
         report.writer_save = result.2;
         Ok(report)

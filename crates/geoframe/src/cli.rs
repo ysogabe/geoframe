@@ -613,6 +613,12 @@ fn sync_dry_run(config: &Config, allow_mass_delete: bool) -> ExitCode {
                 },
                 s.embeddings_to_copy
             );
+            if !plan.scene_mismatch.is_empty() {
+                println!(
+                    "AI の場面の表: 列が想定と違う表 {} 個（足す予定には数えません。直さず、場面は使われません。派生の表を落として再作成するまで）",
+                    plan.scene_mismatch.len()
+                );
+            }
             println!(
                 "掃除: 消す .dl_* {} 件 / 消す書きかけの .part {} 件 / 捨てる .cache.json の旧キー {} 件",
                 plan.leftover_files, plan.part_files, plan.legacy_cache_keys

@@ -1,5 +1,5 @@
 //! Explicit migration only. Call on the guarded INGEST writer; no automatic startup wiring.
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use rusqlite::{
@@ -141,17 +141,31 @@ fn ready_or_mismatch(conn: &Connection) -> Result<bool, Error> {
     Ok(shapes.iter().all(|(_, s)| *s == Shape::Current))
 }
 
-/// Missing tables by name, and `ai_scene_groups.vector_guard` for the one outdated shape. A table with
-/// other columns is reported by its name (it is not repaired; see [`migrate`]).
+/// What [`migrate`] would add: missing tables by name, and `ai_scene_groups.vector_guard` for the one
+/// outdated shape. A table with other columns is not in this list (migrate does not touch it): it is
+/// reported by [`mismatched`], so a dry-run does not announce work that never happens.
 pub fn pending(conn: &Connection) -> Result<Vec<String>, Error> {
     Ok(shapes(conn)?
         .into_iter()
         .filter_map(|(name, shape)| match shape {
-            Shape::Current => None,
-            Shape::Absent | Shape::Unknown => Some(name.to_string()),
+            Shape::Current | Shape::Unknown => None,
+            Shape::Absent => Some(name.to_string()),
             Shape::Outdated => Some(format!("{name}.{OUTDATED_COLUMN}")),
         })
         .collect())
+}
+/// Scene tables that exist with columns this code does not write (and that [`migrate`] leaves alone).
+/// The cycle and the scene reads fail with `SchemaMismatch` for them until the derived tables are dropped.
+pub fn mismatched(conn: &Connection) -> Result<Vec<String>, Error> {
+    Ok(shapes(conn)?
+        .into_iter()
+        .filter(|(_, shape)| *shape == Shape::Unknown)
+        .map(|(name, _)| name.to_string())
+        .collect())
+}
+/// All three scene tables exist in exactly the current shape (nothing pending, nothing mismatched).
+pub fn current(conn: &Connection) -> bool {
+    ready(conn).unwrap_or(false)
 }
 /// Requires the caller's INGEST guard and Writer. This API is never invoked by readonly paths.
 /// Missing tables are created and the outdated `ai_scene_groups` gets its `vector_guard` column. A table
@@ -373,6 +387,14 @@ struct Legacy {
     ids: Vec<i64>,
     total: usize,
 }
+/// A photo that holds a local-result reference but is in no component of the plan that proposes to drop
+/// it, with the state of the photo (its row, its sha's facts and its vector bytes) the plan saw.
+#[derive(Clone)]
+pub(super) struct Retire {
+    pub(super) photo_id: i64,
+    pub(super) result_id: String,
+    guard: [u8; 32],
+}
 type Sha = [u8; 64];
 /// What the scene guard needs to know about one `content_sha256`, computed once per read.
 struct ShaPart {
@@ -510,6 +532,46 @@ impl Raw {
             parts.push(self.vectors.get(sha).map_or("missing", |v| &v.digest));
         }
         fingerprint(&parts)
+    }
+    /// Digest of everything that decides whether one photo can belong to a component: its row and
+    /// quality, its sha's facts (duplicates, vector row, failed job), the vector bytes. Equal digests
+    /// mean the photo is in the same readiness state. Needs the vectors (the cycle and the writer).
+    fn photo_guard(&self, id: i64) -> [u8; 32] {
+        debug_assert!(self.with_vectors);
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        ctx.update(b"scene-photo-v1");
+        match self.row(id) {
+            None => ctx.update(&[0]),
+            Some(row) => {
+                ctx.update(&[1]);
+                ctx.update(&row.digest);
+                match self.sha_part(row) {
+                    Some(part) => {
+                        ctx.update(&part.digest);
+                        let vector = self
+                            .vectors
+                            .get(part.sha())
+                            .map_or("missing", |v| &v.digest);
+                        ctx.update(&(vector.len() as u64).to_le_bytes());
+                        ctx.update(vector.as_bytes());
+                    }
+                    None => ctx.update(&[0; 32]),
+                }
+            }
+        }
+        finish32(ctx)
+    }
+    /// References of photos that no component of the plan contains, in photo id order.
+    pub(super) fn retire_candidates(&self, planned: &HashSet<i64>) -> Vec<Retire> {
+        self.active
+            .iter()
+            .filter(|(id, _)| !planned.contains(id))
+            .map(|(id, result)| Retire {
+                photo_id: *id,
+                result_id: result.clone(),
+                guard: self.photo_guard(*id),
+            })
+            .collect()
     }
     pub(super) fn overlap(&self, ids: &[i64]) -> (Overlap, Vec<LegacyOrigin>) {
         let indexes: BTreeSet<_> = ids
@@ -949,7 +1011,7 @@ pub fn save(
     };
     let saved = save_in(&tx, &raw, plan, group_index, stopped)?;
     if saved == Saved::Stored {
-        tidy(&tx, plan, &[group_index])?;
+        tidy(&tx, plan, &[group_index], &[])?;
     }
     if matches!(saved, Saved::Stored | Saved::Unchanged) {
         tx.commit()?;
@@ -965,36 +1027,130 @@ pub fn save_batch(
     indexes: &[usize],
     stopped: &dyn Fn() -> bool,
 ) -> Result<Vec<Saved>, Error> {
+    save_batch_counted(conn, plan, indexes, stopped).map(|(saved, _)| saved)
+}
+
+/// [`save_batch`] that also reports how many references of photos outside the plan were dropped.
+///
+/// The same transaction drops the reference of every photo that holds one but is in no component of the
+/// plan (a vector that was deleted or damaged, a failed embedding, a lost capture time, a deleted
+/// photo ...): such a photo has no local result, and nothing else would ever remove its reference when
+/// the cycle stores no component. The reference is dropped only while the photo is in the state the plan
+/// saw (its row, its sha's facts and its vector bytes) and the reference still names the result the plan
+/// saw; a photo that became ready meanwhile keeps it for the next cycle to decide. Only references to
+/// results of the plan's space and options are dropped; ranked results and the headers stay as history.
+/// `indexes` may be empty: the batch then only drops references.
+pub fn save_batch_counted(
+    conn: &mut Connection,
+    plan: &Plan,
+    indexes: &[usize],
+    stopped: &dyn Fn() -> bool,
+) -> Result<(Vec<Saved>, usize), Error> {
     if indexes.len() > super::runtime::GROUPS_PER_CYCLE {
         return Err(Error::InvalidOptions);
     }
+    let interrupted = || Ok((vec![Saved::Interrupted; indexes.len()], 0));
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if stopped() {
-        return Ok(vec![Saved::Interrupted; indexes.len()]);
+        return interrupted();
     }
     let Some(raw) = raw_in(&tx, true)? else {
-        return Ok(vec![Saved::Stale; indexes.len()]);
+        return Ok((vec![Saved::Stale; indexes.len()], 0));
     };
     let mut saved = Vec::new();
     for &i in indexes {
         let result = save_in(&tx, &raw, plan, i, stopped)?;
         if result == Saved::Interrupted {
-            return Ok(vec![Saved::Interrupted; indexes.len()]);
+            return interrupted();
         }
         saved.push(result);
     }
+    let Some(released) = release_in(&tx, &raw, plan, stopped)? else {
+        return interrupted();
+    };
     let stored: Vec<_> = indexes
         .iter()
         .zip(&saved)
         .filter(|(_, s)| **s == Saved::Stored)
         .map(|(i, _)| *i)
         .collect();
-    tidy(&tx, plan, &stored)?;
+    tidy(&tx, plan, &stored, &released)?;
     if stopped() {
-        return Ok(vec![Saved::Interrupted; indexes.len()]);
+        return interrupted();
     }
     tx.commit()?;
-    Ok(saved)
+    Ok((saved, released.len()))
+}
+
+/// A reference may be dropped unless its header exists and belongs to another space or option set.
+const RETIRABLE: &str = "NOT EXISTS(SELECT 1 FROM ai_scene_groups g WHERE g.result_id=?2 AND NOT (g.space_fingerprint=?3 AND g.window_s=?4 AND g.similarity=?5 AND g.shortlist=?6))";
+
+fn plan_params(plan: &Plan, photo: i64, result: &str) -> Vec<Value> {
+    vec![
+        photo.into(),
+        result.to_string().into(),
+        plan.identity.fingerprint().into(),
+        plan.options.window_s.into(),
+        plan.options.similarity.into(),
+        (plan.options.shortlist as i64).into(),
+    ]
+}
+
+/// Drops the references the plan retires that are still valid to drop (see [`save_batch_counted`]).
+/// `None` when stopped. Returns the photos whose reference was dropped.
+fn release_in(
+    tx: &Connection,
+    raw: &Raw,
+    plan: &Plan,
+    stopped: &dyn Fn() -> bool,
+) -> Result<Option<Vec<i64>>, Error> {
+    let mut released = Vec::new();
+    if raw.identity != plan.identity {
+        return Ok(Some(released));
+    }
+    let mut delete = tx.prepare_cached(&format!(
+        "DELETE FROM ai_scene_active WHERE photo_id=?1 AND result_id=?2 AND {RETIRABLE}"
+    ))?;
+    for (n, retire) in plan.retire.iter().enumerate() {
+        if n % 256 == 0 && stopped() {
+            return Ok(None);
+        }
+        if raw.active.get(&retire.photo_id) != Some(&retire.result_id)
+            || raw.photo_guard(retire.photo_id) != retire.guard
+        {
+            continue;
+        }
+        let params = plan_params(plan, retire.photo_id, &retire.result_id);
+        if delete.execute(rusqlite::params_from_iter(params))? > 0 {
+            released.push(retire.photo_id);
+        }
+    }
+    Ok(Some(released))
+}
+
+/// How many references the plan retires still exist (and are of this plan's space and options): the
+/// cycle writes for them even when it stores no component, and for nothing else. Writer-free.
+pub fn pending_retire(conn: &Connection, plan: &Plan) -> Result<usize, Error> {
+    if plan.retire.is_empty() {
+        return Ok(0);
+    }
+    if !ready_or_mismatch(conn)? {
+        return Err(Error::Database);
+    }
+    let tx = conn.unchecked_transaction()?;
+    let mut stmt = tx.prepare(&format!(
+        "SELECT 1 FROM ai_scene_active WHERE photo_id=?1 AND result_id=?2 AND {RETIRABLE}"
+    ))?;
+    let mut count = 0;
+    for retire in &plan.retire {
+        let params = plan_params(plan, retire.photo_id, &retire.result_id);
+        if stmt.exists(rusqlite::params_from_iter(params))? {
+            count += 1;
+        }
+    }
+    drop(stmt);
+    tx.commit()?;
+    Ok(count)
 }
 
 fn save_in(
@@ -1119,61 +1275,64 @@ fn references_match(raw: &Raw, group: &Group) -> bool {
     }
 }
 
-/// Housekeeping in the transaction of the stored components. It removes only derived placeholders and
-/// references, never a ranked result and nothing of another space or option set:
-/// * a waiting header of the same space and options that shares a photo with a stored component (the
-///   photo now has a newer statement), or that names a photo that no longer exists, with its members;
+/// Housekeeping in the transaction of the stored components and of the released references. It removes
+/// only derived placeholders and references, never a ranked result and nothing of another space or
+/// option set:
+/// * a waiting header of the same space and options that shares a photo with a stored component or a
+///   released reference (the photo now has a newer statement), or that names a photo that no longer
+///   exists, with its members;
 /// * references of photos that no longer exist.
 ///
 /// Ranked results that a newer result replaced stay as history; they no longer count because the
 /// references of the replaced members point at the newer result.
-fn tidy(tx: &Connection, plan: &Plan, stored: &[usize]) -> Result<(), Error> {
-    if stored.is_empty() {
+fn tidy(tx: &Connection, plan: &Plan, stored: &[usize], released: &[i64]) -> Result<(), Error> {
+    if stored.is_empty() && released.is_empty() {
         return Ok(());
     }
-    let kept: BTreeSet<&str> = stored
+    let kept: Vec<&str> = stored
         .iter()
         .map(|&i| plan.groups[i].result_id.as_str())
         .collect();
     let touched: BTreeSet<i64> = stored
         .iter()
         .flat_map(|&i| plan.groups[i].members.iter().map(|m| m.photo_id))
+        .chain(released.iter().copied())
         .collect();
     let options = plan.options;
-    let waiting = tx
+    // One statement over the waiting headers of this space and options (a placeholder is stale when it
+    // shares a photo with what this transaction decided or names a photo that is gone).
+    let stale = tx
         .prepare(
-            "SELECT result_id FROM ai_scene_groups WHERE state='waiting' AND space_fingerprint=?1
-              AND window_s=?2 AND similarity=?3 AND shortlist=?4",
+            "SELECT g.result_id FROM ai_scene_groups g
+              WHERE g.state='waiting' AND g.space_fingerprint=?1 AND g.window_s=?2 AND g.similarity=?3
+                AND g.shortlist=?4 AND g.result_id NOT IN (SELECT value FROM json_each(?5))
+                AND EXISTS(SELECT 1 FROM ai_scene_members m WHERE m.result_id=g.result_id
+                      AND (m.photo_id IN (SELECT value FROM json_each(?6))
+                           OR NOT EXISTS(SELECT 1 FROM photos p WHERE p.id=m.photo_id)))",
         )?
         .query_map(
             params![
                 plan.identity.fingerprint(),
                 options.window_s,
                 options.similarity,
-                options.shortlist as i64
+                options.shortlist as i64,
+                encode(&kept)?,
+                encode(&touched)?
             ],
             |r| r.get::<_, String>(0),
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut members = tx.prepare("SELECT photo_id FROM ai_scene_members WHERE result_id=?1")?;
-    let mut exists = tx.prepare("SELECT 1 FROM photos WHERE id=?1")?;
-    for result in waiting.iter().filter(|r| !kept.contains(r.as_str())) {
-        let photos = members
-            .query_map([result], |r| r.get::<_, i64>(0))?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut stale = false;
-        for photo in photos {
-            stale = touched.contains(&photo) || !exists.exists([photo])?;
-            if stale {
-                break;
-            }
-        }
-        if stale {
-            tx.execute("DELETE FROM ai_scene_members WHERE result_id=?1", [result])?;
-            tx.execute("DELETE FROM ai_scene_groups WHERE result_id=?1", [result])?;
-        }
+    if !stale.is_empty() {
+        let stale = encode(&stale)?;
+        tx.execute(
+            "DELETE FROM ai_scene_members WHERE result_id IN (SELECT value FROM json_each(?1))",
+            [&stale],
+        )?;
+        tx.execute(
+            "DELETE FROM ai_scene_groups WHERE result_id IN (SELECT value FROM json_each(?1))",
+            [&stale],
+        )?;
     }
-    drop((members, exists));
     tx.execute(
         "DELETE FROM ai_scene_active WHERE NOT EXISTS(SELECT 1 FROM photos p WHERE p.id=ai_scene_active.photo_id)",
         [],
@@ -1754,16 +1913,22 @@ pub type HeaderCounts = (Option<SpaceIdentity>, Vec<(State, RankUsed, i64)>);
 
 /// Header counts for the status views: no photo row, vector or member payload is read.
 /// A header counts only while it is current by what the cycle writes: every member photo still exists
-/// and, unless it is waiting, every member's active reference names this result. The cycle removes the
-/// references a newer result supersedes and the waiting placeholder it replaces (see [`tidy`]), so a
-/// result that was replaced or lost a photo no longer counts. The per-component input guard is not
-/// recomputed (advisory): a result whose inputs changed counts until the next cycle replaces it.
+/// and can still belong to a component (it has a display, a capture time, its quality features and a
+/// vector row of the active space: all primary-key lookups) and, unless it is waiting, every member's
+/// active reference names this result. The cycle removes the references a newer result supersedes, the
+/// waiting placeholder it replaces and the references of photos that are not ready any more (see
+/// [`tidy`], [`save_batch_counted`]); the count does not wait for it. The per-component input guard is
+/// not recomputed (advisory): a result whose inputs changed in another way counts until the next cycle
+/// replaces it.
 pub fn header_counts_in(tx: &Connection, processors: &[&str]) -> Result<HeaderCounts, Error> {
     let (_, identity) = index::active_in(tx)?;
     let Some(identity) = identity else {
         return Ok((None, Vec::new()));
     };
-    if processors.is_empty() || !ready_or_mismatch(tx)? {
+    if processors.is_empty()
+        || !ready_or_mismatch(tx)?
+        || !jobs::object_exists(tx, "table", "ai_embedding_vectors")?
+    {
         return Ok((Some(identity), Vec::new()));
     }
     let mut stmt = tx.prepare(&format!(
@@ -1771,14 +1936,20 @@ pub fn header_counts_in(tx: &Connection, processors: &[&str]) -> Result<HeaderCo
           WHERE space_fingerprint=?1 AND processor_version IN ({})
             AND EXISTS(SELECT 1 FROM ai_scene_members m WHERE m.result_id=g.result_id)
             AND NOT EXISTS(SELECT 1 FROM ai_scene_members m WHERE m.result_id=g.result_id
-              AND (NOT EXISTS(SELECT 1 FROM photos p WHERE p.id=m.photo_id)
+              AND (NOT EXISTS(SELECT 1 FROM photos p
+                       JOIN photo_quality_features f ON f.photo_id=p.id AND f.display=p.display
+                        AND f.source_md5 IS p.md5 AND f.source_mtime IS p.mtime AND f.error=''
+                       JOIN ai_embedding_vectors v ON v.space_id=?{space} AND v.input_sha256=f.content_sha256
+                      WHERE p.id=m.photo_id AND p.display!='' AND p.taken_at!='')
                 OR (g.state!='waiting' AND NOT EXISTS(SELECT 1 FROM ai_scene_active a
                       WHERE a.photo_id=m.photo_id AND a.result_id=g.result_id))))
           GROUP BY state,rank_used",
-        processors_sql(processors)
+        processors_sql(processors),
+        space = processors.len() + 2
     ))?;
-    let params =
-        std::iter::once(identity.fingerprint()).chain(processors.iter().map(|p| p.to_string()));
+    let params = std::iter::once(identity.fingerprint())
+        .chain(processors.iter().map(|p| p.to_string()))
+        .chain(std::iter::once(identity.space_id().to_string()));
     let counts = stmt
         .query_map(rusqlite::params_from_iter(params), |r| {
             Ok((
@@ -1833,7 +2004,9 @@ pub fn annotations_in(
             .collect::<Vec<_>>()
             .join(",")
     };
-    let mut generations = HashMap::new();
+    // Only photos that can still belong to a component: a capture time, quality features and a vector
+    // row of the active space (the same facts the cycle's readiness rests on, without the BLOB).
+    let mut candidates: Vec<(i64, String, String)> = Vec::new();
     let mut stmt = tx.prepare(&format!("{PHOTO_ROWS} WHERE p.id IN ({})", marks(1)))?;
     let mut scratch = Vec::new();
     let found = stmt.query_map(rusqlite::params_from_iter(ids), |r| {
@@ -1841,9 +2014,32 @@ pub fn annotations_in(
     })?;
     for row in found {
         let row = row?;
-        generations.insert(row.id(), row.generation().to_string());
+        if let (Some(_), true, Some(sha)) = (row.captured, row.is_eligible(), row.sha()) {
+            candidates.push((row.id(), row.generation(), sha.to_string()));
+        }
     }
     drop(stmt);
+    let mut generations = HashMap::new();
+    if !candidates.is_empty() && jobs::object_exists(tx, "table", "ai_embedding_vectors")? {
+        let mut shas: Vec<&str> = candidates.iter().map(|c| c.2.as_str()).collect();
+        shas.sort_unstable();
+        shas.dedup();
+        let mut stmt = tx.prepare(&format!(
+            "SELECT input_sha256 FROM ai_embedding_vectors WHERE space_id=?1 AND input_sha256 IN ({})",
+            marks_from(2, shas.len())
+        ))?;
+        let params = std::iter::once(identity.space_id()).chain(shas.iter().copied());
+        let present = stmt
+            .query_map(rusqlite::params_from_iter(params), |r| {
+                r.get::<_, String>(0)
+            })?
+            .collect::<rusqlite::Result<HashSet<_>>>()?;
+        for (id, generation, sha) in candidates {
+            if present.contains(&sha) {
+                generations.insert(id, generation);
+            }
+        }
+    }
     let first = 2 + processors.len();
     // Ranked members are found through the photo's reference (primary key) and waiting ones through
     // the few waiting headers; the members table has no index by photo and is never scanned.

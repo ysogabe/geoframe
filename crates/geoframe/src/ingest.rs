@@ -359,6 +359,8 @@ pub struct Plan {
     /// 消す書きかけの `*.part`（[`sweep_part_files`]）。
     pub part_files: usize,
     pub legacy_cache_keys: usize,
+    /// AI の場面の表のうち、列が想定と違うもの（作り直しの対象ではない。足す予定の `schema` には数えない）。
+    pub scene_mismatch: Vec<String>,
 }
 
 /// 書かずに計画を作る。DB は読み取り専用の接続で見る。
@@ -372,14 +374,22 @@ pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
         .ai
         .gate(ai::settings::TaskKind::LocationSuggest, config.ingest)
         .is_ok();
+    let scenes = ai::groups::runtime::enabled(config);
     schema.missing_objects.extend(ai::pending_active(
         conn,
         clue_enabled,
         suggest_enabled,
-        ai::groups::runtime::enabled(config),
+        scenes,
     )?);
+    let scene_mismatch = if scenes {
+        ai::groups::mismatched(conn)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    } else {
+        Vec::new()
+    };
     Ok(Plan {
         schema,
+        scene_mismatch,
         leftover_files: count_leftovers(&config.data_dir),
         skipped_dirs: count_skipped_dirs(&config.data_dir),
         part_files: count_part_files(&config.data_dir),

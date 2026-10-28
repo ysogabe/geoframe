@@ -139,7 +139,7 @@ AC4は現入力/完全空間/新参照CASと一次列不変、AC6は空間/破�
 
 - `Prepared::read(conn, config)` はactive metadataとrankfileを最終read transactionの外で準備し、`Prepared::load_in(conn)` は呼出側の同一snapshot内でactive本体/完全空間/現世代/現processor/全members/参照を検査する。途中の空間切替では結果を使わない。読み取りは順位を**再計算しない**（vector BLOBを読まず、`snapshot`も`model.scores`も走らせない）。重みが成分を採点できず固定式へ落ちた成分は、周期が `RankUsed::Fallback(理由)` と重みdigest（`weight_digest`と処理版の`fallback:<digest>`）を保存する。読み取りは、重みがあれば `[Linear(D), Fallback(D)]`、無ければ `[固定式]` の処理版だけを採用する。重みを差し替える/外すと、古い固定式・Linear・Fallbackのどれも、次の周期が新しい結果を保存するまで採用しない（旧選別が残る）。
 - E6の既存card/group JSON形・型を維持し、有効な成分にだけ`local_rank/local_score/local_representative/scene_state/scene_overlap`を追加する（ReviewOverlapのメンバーにも情報として付く）。**並び・キー**: LocalRankedだけが順序に関わる。Disjointは`result_id`をgroup keyにし（`kind:"scene"`、summary空）、Exactは旧groupの`group_id`をそのままkeyにして有償判定の`kind/summary/min・max・avg_similarity`を引き継ぎ、`scene_state/scene_overlap/scene_result_id`を足す。Partial（ReviewOverlap）は情報を付けるだけで、key・score・並びのどれにも使わず旧来のkeep_score順を保つ。群の並び（上位`groups`件で切る基準）は、意味検索ならcosine、空queryなら旧来の`keep_score`（無ければ`quality_score`）/100。場面の点（`local_score`）は群の中で0〜100に正規化されるので、群をまたぐ比較には使わない（使うと最上位が常に100になり、場面が単独写真・旧判定の群を押し出す）。群の中の順序は、favorite → recommended → 場面の代表 → （空queryのときだけ）場面の順位 → score → keep_score。意味検索では代表の次はcosine順。Waitingは検索の代表/順位にしない。
-- E5 `pipeline.scenes` と管理STATUS `ai_scenes` に`state/local_ranked/waiting/review_overlap/rules/linear`の固定コード・件数を追加する。件数は保存済みヘッダーの`GROUP BY`だけで、写真行もvectorもmembersの本体も読まず、成分ごとの入力guardは検証しない助言値。ただし**現在の結果だけ**を数える（現空間・現処理版で、構成員の写真がすべて存在し、waiting以外は全構成員の`ai_scene_active`がその結果を指すもの）。置き換えられた結果と消えた写真を含む結果は数えない（詳細は下の「現在性と片付け」）。入力が変わったが周期がまだ置き換えていない結果は、次の周期まで数える。`rules`は固定式＋Fallbackの数。管理写真の任意`scene`は、そのページの写真の分だけ保存済みmembersを読み（写真の参照 `ai_scene_active` の主キーと、少数のwaiting見出しからたどる。members表に写真での索引は無いので走査しない）、メンバーの世代が写真の現世代と一致し（waiting以外は）active参照が指すものだけ採用する（成分のguardは再計算しない助言値）。他の写真・vector BLOBは読まない。旧DBはschemaを作らず、管理追加キーも3表が**想定の列で**存在する時だけ。破損したsceneはunavailable/未採用にして配信全体を止めない。
+- E5 `pipeline.scenes` と管理STATUS `ai_scenes` に`state/local_ranked/waiting/review_overlap/rules/linear`の固定コード・件数を追加する。件数は保存済みヘッダーの`GROUP BY`だけで、写真行もvectorのBLOBもmembersの本体も読まず、成分ごとの入力guardは検証しない助言値。ただし**現在の結果だけ**を数える（現空間・現処理版で、構成員の写真がすべて存在して成分に入れる状態＝表示・撮影時刻・現世代の品質特徴・現空間のvector行を持ち、waiting以外は全構成員の`ai_scene_active`がその結果を指すもの。いずれも主キーの探索）。置き換えられた結果、消えた写真・vectorを失った写真・撮影時刻を失った写真を含む結果は、周期を待たずに数えない（詳細は下の「現在性と片付け」）。入力が変わったが周期がまだ置き換えていない結果は、次の周期まで数える。`rules`は固定式＋Fallbackの数。管理写真の任意`scene`は、そのページの写真の分だけ保存済みmembersを読み（写真の参照 `ai_scene_active` の主キーと、少数のwaiting見出しからたどる。members表に写真での索引は無いので走査しない）、写真が成分に入れる状態（撮影時刻・品質特徴・現空間のvector行。頁の分だけ主キーで確かめる）で、メンバーの世代が写真の現世代と一致し（waiting以外は）active参照が指すものだけ採用する（成分のguardは再計算しない助言値）。他の写真・vector BLOBは読まない。旧DBはschemaを作らず、管理追加キーも3表が**想定の列で**存在する時だけ。破損したsceneはunavailable/未採用にして配信全体を止めない。
 - E5 `selection_groups/selection_suppressed` はfeedと共通の旧選別から数える。LocalRanked/Waiting/ReviewOverlapはjudgedへ加算しない。管理画面の`db.ai.suppressed`は従来（Python版）の意味のまま（favoriteの免除を含めて数える）で、管理fixtureも1のまま。E5の`selection_suppressed`は別の集計`selection::AdminCounts::feed_suppressed`（表示可能な非favoriteの、いまのフィードが実際に隠す数）。選別表・抑止集合・フィード件数は周期の前後で不変。
 - `ai_scene_active`はローカル結果の参照であり、feed非表示の許可ではない。旧有償表は今回一切書換えない。検索空間の切替、新しい未判定成分、pending窓による新規feed抑止は0。旧代表の更新/削除/hidden/位置無し/品質非表示時の安全な表示とfavorite免除は共通選別SQLを維持する。
 
@@ -188,11 +188,48 @@ T4.5aの3表を`ai::pending_active/migrate_active`へ接続した。引数は従
 
 **M1 vectorが消える/壊れた後の古い結果（b0469ae からの後退）。** 原因: `Waiting` を保存しても `ai_scene_active` を書かず、vector行の有無が `input_guard` に入っていなかったので、旧 `LocalRanked{1,2}` の参照は揃ったまま残り、guardも変わらず、周期を何回まわしても旧結果を現在の結果として返した。対応は2つを併用した（Waitingの現在性＝「検索の代表・順位にしない」「現世代の失効」とは矛盾しない）。(1) vector行の有無を `input_guard` に入れた（上の項）。vectorの削除で旧結果の guard が変わり、読み取りは直ちに採用しない。(2) 同じ取引で、`Waiting` を保存するときは、その構成員の写真の `ai_scene_active` 参照を消す（待機中の写真は、どのローカル結果も指さない）。壊れたBLOB（行はあるので (1) では見えない）は、E6が場面の全構成員に検索側の検査を通ったvectorを要求して場面を使わず、次の周期がWaitingにして参照を消す。`pending_saves`/`save` は、Waitingの構成員に参照が残っていれば未保存として扱い、参照を持ったまま省略しない。
 
-**R1 件数のずれ。** 古いWaitingと、削除した写真の参照が、E5・管理の件数を実際からずらし続けていた。件数は「現在」に限って数える（上のE5の項: 構成員の写真がすべて存在し、waiting以外は全構成員の参照がその結果を指すもの）。さらに、周期が書く同じ取引（`save`/`save_batch` の `tidy`）で次を片付ける。(a) 同じ空間・同じ設定（窓・閾値・shortlist）のWaiting見出しで、保存した成分と写真を共有するもの（その写真には新しい結論がある）か、存在しない写真を含むもの。構成員行ごと。(b) 存在しない写真の参照。選んだ理由: ここで消すのはWaiting（順位も代表も持たない、後から必ず置き換わる派生の置き場）と、指す先の無い参照だけで、`LocalRanked`/`ReviewOverlap` の結果や別空間・別設定・別版の結果、旧有償表は消さない（過去の結果を自動で消さない原則を保つ）。置き換えられた結果は履歴として残り、構成員の参照が新しい結果を指すので数えられない。同じ空間・同じ設定のWaitingは、処理版（重みdigest）が違っても片付ける（Waitingは順位を持たず、重みで中身が変わらないため）。設定（窓・閾値・shortlist）が違うものは触らない。保存を伴わない削除（ある写真1枚だけの成分でその写真を消したとき）は、次に何かが保存されるまで参照が残るが、存在しない写真は数えない。
+**R1 件数のずれ。** 古いWaitingと、削除した写真の参照が、E5・管理の件数を実際からずらし続けていた。件数は「現在」に限って数える（上のE5の項: 構成員の写真がすべて存在し、waiting以外は全構成員の参照がその結果を指すもの）。さらに、周期が書く同じ取引（`save`/`save_batch` の `tidy`）で次を片付ける。(a) 同じ空間・同じ設定（窓・閾値・shortlist）のWaiting見出しで、保存した成分と写真を共有するもの（その写真には新しい結論がある）か、存在しない写真を含むもの。構成員行ごと。(b) 存在しない写真の参照。選んだ理由: ここで消すのはWaiting（順位も代表も持たない、後から必ず置き換わる派生の置き場）と、指す先の無い参照だけで、`LocalRanked`/`ReviewOverlap` の結果や別空間・別設定・別版の結果、旧有償表は消さない（過去の結果を自動で消さない原則を保つ）。置き換えられた結果は履歴として残り、構成員の参照が新しい結果を指すので数えられない。同じ空間・同じ設定のWaitingは、処理版（重みdigest）が違っても片付ける（Waitingは順位を持たず、重みで中身が変わらないため）。設定（窓・閾値・shortlist）が違うものは触らない。保存を伴わない削除（ある写真1枚だけの成分でその写真を消したとき）の参照は、3回目のレビューの修正（下の「現在性と片付け」）で、保存が無い周期でも外すようにした。
 
-**R2 列が16の `ai_scene_groups`。** 開発中の16列（`vector_guard` 無し）の表がある DB では、`pending()` が「表がある」と判断して空を返し、列が足されず、周期と読み取りが毎回 `Database` エラーだった。`pending()`/`migrate()`/読み取り/周期は、表ごとに `pragma_table_info` で列の名前と順を確かめる（1文）。方針: 表は派生データで、どのリリースにも載っていないため、この1つの形（最後の列 `vector_guard` だけ無い）に限り `ALTER TABLE ... ADD COLUMN vector_guard TEXT NOT NULL DEFAULT ''` で移行する（`pending()` は `ai_scene_groups.vector_guard` を返す）。旧行は `vector_guard=''` で保存ヘッダーが計画と違うため、次の周期が書き直す（旧行の `input_guard` が現在の式と合わなければ読み取りは採用せず飛ばす。`CorruptResult` にはしない）。それ以外の形の表は直さず、`migrate` は作成扱いにしない。周期は固定の `SchemaMismatch`（ログは `scene_schema_mismatch`）で止まり、E5の`scenes.state`は`unavailable`、管理STATUSは`ai_scenes`を足さず、E6・写真配信は続く。再び使うには派生の3表を落として再作成する。
+**R2 列が16の `ai_scene_groups`。** 開発中の16列（`vector_guard` 無し）の表がある DB では、`pending()` が「表がある」と判断して空を返し、列が足されず、周期と読み取りが毎回 `Database` エラーだった。`pending()`/`migrate()`/読み取り/周期は、表ごとに `pragma_table_info` で列の名前と順を確かめる（1文）。方針: 表は派生データで、どのリリースにも載っていないため、この1つの形（最後の列 `vector_guard` だけ無い）に限り `ALTER TABLE ... ADD COLUMN vector_guard TEXT NOT NULL DEFAULT ''` で移行する（`pending()` は `ai_scene_groups.vector_guard` を返す）。旧行は `vector_guard=''` で保存ヘッダーが計画と違うため、次の周期が書き直す（旧行の `input_guard` が現在の式と合わなければ読み取りは採用せず飛ばす。`CorruptResult` にはしない）。それ以外の形の表は直さず、`migrate` は作成扱いにしない（3回目のレビュー修正で、`pending()` の「足す予定」にも数えず、別の `mismatched()` で返す）。周期は固定の `SchemaMismatch`（ログは `scene_schema_mismatch`）で止まり、E5の`scenes.state`は`unavailable`、管理STATUSは`ai_scenes`を足さず、E6・写真配信は続く。再び使うには派生の3表を落として再作成する。
 
 追加した試験（`ai/groups/tests.rs`）: vector行の削除（周期の前後・繰り返し・復帰）、vector BLOBの破損（NaN）、置き換えられたWaitingが件数に残らない、写真の削除、16列表の移行と書き直し、別の列構成の表（`SchemaMismatch`・配信継続）。vector存在をguardから外す／`tidy`を外す故障を入れると、それぞれ該当の試験が意図どおり失敗することを確認し、原状へ戻した。
+
+### 現在性と片付け
+
+ローカル結果（`LocalRanked`/`ReviewOverlap`）は、次を全部満たすあいだだけ「現在の結果」。
+
+1. 完全空間・処理版が現在のもの。
+2. 構成員の写真がすべて存在し、**成分に入れる状態**（表示・撮影時刻・現世代の品質特徴・現空間のvector行を持つ。vectorが壊れていないことは周期だけが見る）。
+3. waiting以外は、全構成員の`ai_scene_active`がその結果を指す。
+4. （E6・検証付きの投影だけ）成分の入力guard（vector行の有無を含む）が現在の値と一致する。
+
+件数（E5 `pipeline.scenes`・管理STATUS `ai_scenes`）と管理の注記は1〜3（助言値）で、周期を待たずに安全側へ倒れる。周期の書き込みが、保存済みの状態を現在に合わせる。
+
+| 何を | いつ | どう |
+| --- | --- | --- |
+| 成分を保存 | 保存値がplanと違う成分 | 取引の中でCAS（完全guard・構造・参照の期待値）。Waitingは構成員の参照を消す |
+| **Ready でなくなった写真の参照を外す**（3回目） | planのどの成分にも入らない写真で、参照がまだある周期（成分の保存が0件でも） | 同じ取引。同じ空間・同じ設定（窓・閾値・shortlist）の結果への参照だけ。planが見た写真の状態（行・shaの事実・vectorのバイト）が書き込み時にも同じで、参照が同じ結果を指すときだけ。違えば（planのあとにReadyに戻った等）外さず、次の周期が決める |
+| 置き換えられたWaiting見出し | 保存した成分、または外した参照と写真を共有する、同じ空間・設定のWaiting | 同じ取引で、見出しと構成員行を消す（1文のSQL） |
+| 存在しない写真の参照・Waiting | 何かを保存した、または外した周期 | 同じ取引で消す |
+| ローカル結果の見出し・別空間/別設定の結果・旧有償表 | 一切 | 消さない（履歴） |
+
+書き込みを依頼するのは、保存すべき成分があるか、外すべき参照が実際に残っているときだけ（`pending_saves`・`pending_retire`。どちらもwriter外の読取）。両方無い周期は何も書かない。対象の無い周期を毎回writerへ送らない。単一Writer・世代のCAS・協調的な期限と停止は変えない（外す処理も停止で全rollback）。消しすぎても、次の周期がReadyな写真の結果を作り直す派生データで、現在の正しい結果の参照を消し続ける往復は、planが見た状態との照合で起こさない。
+
+### T4.5b 3回目のレビュー修正（Ready でなくなった写真の参照ほか）
+
+**必須1 Ready でなくなった写真の参照が、どの周期でも消えなかった。** 原因: writerが`ai_scene_active`を消すのは保存する群の構成員と存在しない写真だけで、vectorの削除・破損、embeddingのfailed、撮影時刻の喪失などでどの成分にも入らなくなった写真の参照は誰も消さず、成分の保存が無い周期では片付けも動かなかった。E5・管理STATUSは古い`local_ranked`を数え続け、管理の写真一覧は消えた写真を代表・順位つきで出し続けた（E6と`load_current`は入力guardで0件）。対応: (1) `Plan`が、snapshotで参照を持つがどの成分にも入らない写真を、その写真の状態の要約（行のdigest・shaのdigest・vector BLOBのdigest）つきで持つ。(2) `save_batch`（周期の経路）が同じ取引で、状態が一致し参照が同じ結果を指すときだけ、同じ空間・同じ設定の結果への参照を外す。(3) 件数は構成員の「成分に入れる状態」を主キーで確かめ、注記は頁の写真のvector行等を確かめる。(4) 周期は外す参照が残るときだけ、成分の保存が0件でもwriterを呼ぶ。`CycleReport::retired`で数える。`save`（単一成分の旧API）は変えていない。
+
+**記録1 `pending()` が形の違う表を「未作成」として返し続けた。** `pending()`は`migrate`が足すもの（無い表・古い16列の`vector_guard`）だけを返し、列が想定と違う表は別の`mismatched()`で返す。dry-runは「足す予定」に数えず、`ingest::Plan::scene_mismatch`として別の行（「AI の場面の表: 列が想定と違う表」）で出す。管理STATUSの`ai_scenes`は、3表が想定の列で揃う（`current()`）ときだけ出す。
+
+**記録2 16列の表でE5が`unavailable`になる経路。** 周期（`SchemaMismatch`）・`header_counts_in`・管理の追加キー・E6・写真配信を、E5の段まで試験した。
+
+**記録3 tidyの軽量化。** Waiting見出しを1文のSQL（`json_each`でkept/touchedを渡し、構成員の存在確認を内側のEXISTSに寄せる）で選び、見出し1件ごとのSQLをやめた。state用の明示索引は足していない（索引を足すと移行のobject数・dry-runの件数・文書の13/17が変わる）。最初の作成中のようにWaitingが多い条件の測定: 合成8,000写真・Waiting見出し4,000件（2構成員ずつ、保存する成分と写真を共有しない）の状態で、別の1成分を保存する1バッチのwriter時間は、Waiting 0件で8.4ms、4,000件で10.1ms（release、この機体、単回）。差の約1.7msがWaiting走査の分で、時間の閾値assertは置かない（`thousands_of_waiting_placeholders_measure_the_writer_batch`、`--ignored`）。
+
+**記録4 文書の見出し。** 「詳細は下の『現在性と片付け』」に対応する見出し（上）を足した。
+
+追加した試験（`ai/groups/tests.rs`）: 全vector削除（周期前の件数・管理注記も0、1周期で参照を外し、以後は書き込み0・復帰）、vectorを失った写真・embeddingがfailedになった写真・撮影時刻を失った写真それぞれの参照・件数・管理の写真一覧、planのあとにReadyへ戻った写真の参照を外さないこと、別の設定のplanが他の設定の結果の参照に触れないこと、16列の表のE5・管理・cycle、形の違う表が`mismatched()`に出て`pending()`と`dry-run`の足す予定に出ないこと。故障注入（解放を外す／件数のvector条件を外す／写真の状態の照合を外す／注記のvector条件を外す）は、それぞれ該当の試験が意図どおり失敗することを確認し、原状へ戻した。
+
+検証（3回目の修正）: `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`git diff --check` は成功。`cargo test --workspace`（`RUST_TEST_THREADS=4`）は28 group、**1244成功 / 失敗0 / ignore4**（ignoreは既存2＋計測2: 読み取り経路とWaiting多数のwriter時間）。新しい試験は7件。musl release試験バイナリ（`cargo test --release --target x86_64-unknown-linux-musl --no-run -p geoframe`）はビルド成功。
 
 ### 読み取りの重さ（2回目のレビュー時の計測。場面の層以外の「既知の重さ」は ai-search.md）
 
@@ -209,3 +246,17 @@ T4.5aの3表を`ai::pending_active/migrate_active`へ接続した。引数は従
 修正前（5733f10）の同じ測定では、場面の層はE6が約68ms、E5が約307ms、管理STATUSが約309ms、写真一覧が約13ms足していた（glibc版。E5・管理STATUSの原因は、件数の`GROUP BY`が各見出しについて `ai_scene_active` を `result_id` で全走査していたこと）。E6の場面の層は目標（30ms以下）の境界値で、余裕は無い（ばらつき27〜31ms）。内訳（musl、E6の1回あたり、場面の層）は、`load_in` 約21ms（写真行とdigest 約7.5ms、構成員の読み 約5〜8ms、見出しの読みと検証 約6ms）、E6側の付与とメモリ 約9ms。これ以上は、構成員をヘッダーに圧縮して持つなどの保存形式の変更が要る。
 
 内訳（`load_in` の関数ごと・musl中央値）: Prepared::read 0.09ms / load_in 20.9ms / status_summary（見出しの件数）4.2ms / annotations_in（50枚）0.35ms。
+
+### 読み取りの重さ（3回目のレビュー修正後の再計測）
+
+同じ合成DB・同じ測定（6,500写真×768次元、場面2,500件、release、20回の中央値）を、musl版の試験バイナリで1回実行した。
+
+| 経路 | (a) 場面あり | (b) 3表空 | (c) 3表なし | 場面の層が足す分 (a)-(b) |
+| --- | --- | --- | --- | --- |
+| E6 空query | 131.9ms | 101.4ms | 101.4ms | **30.5ms** |
+| E6 意味検索 | 135.1ms | 104.4ms | 104.1ms | **30.7ms** |
+| E5 status | 55.5ms | 45.9ms | 46.0ms | **9.6ms** |
+| 管理 STATUS | 16.3ms | 6.8ms | 6.9ms | **9.5ms** |
+| 管理の写真一覧 (per=50) | 1.1ms | 0.8ms | 0.6ms | **0.3ms** |
+
+E6・写真一覧は2回目の修正後と同じ。E5と管理STATUSは、件数の`GROUP BY`が構成員ごとに「成分に入れる状態」（photos・品質特徴・vector行の主キー探索3回）を足したぶんだけ増えた（件数の1文が約4ms→約9〜10ms。E5 2.2〜4.4→9.6ms、管理STATUS 4.0〜4.4→9.5ms）。これが「周期を待たずに安全側へ倒れる」代価。実行計画は全てSEARCH（走査なし）。1回の単独値で、同時に他の試験は動かしていない。

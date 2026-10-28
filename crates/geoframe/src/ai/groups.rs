@@ -1,14 +1,19 @@
 //! Scene components and local ranking. Snapshot I/O, pure computation and atomic repository
 //! publication are separate steps; no feed suppression or worker registration here.
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 use super::{rank, settings::fingerprint, space::SpaceIdentity};
 use crate::quality::{Metrics, rank_scores};
 
 mod repository;
+use repository::Retire;
 pub use repository::{
-    Annotation, Loaded, Saved, load_current, load_current_in, migrate, pending, pending_saves,
-    save, save_batch, snapshot,
+    Annotation, Loaded, Saved, current, load_current, load_current_in, migrate, mismatched,
+    pending, pending_retire, pending_saves, save, save_batch, save_batch_counted, snapshot,
 };
 pub mod runtime;
 #[cfg(test)]
@@ -352,6 +357,10 @@ pub struct Plan {
     identity: SpaceIdentity,
     options: Options,
     groups: Vec<Group>,
+    /// Photos that hold a local-result reference but belong to no component of this plan (they are not
+    /// ready: vector gone or damaged, embedding failed, no capture time, deleted ...), each with the
+    /// state of the photo this plan saw. The writer drops the reference only while that state holds.
+    retire: Vec<Retire>,
 }
 impl fmt::Debug for Plan {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -366,6 +375,11 @@ impl Plan {
     }
     pub fn identity(&self) -> &SpaceIdentity {
         &self.identity
+    }
+    /// How many photos' references this plan proposes to drop (see [`pending_retire`] for those that
+    /// still exist).
+    pub fn retire_len(&self) -> usize {
+        self.retire.len()
     }
 }
 
@@ -536,9 +550,14 @@ pub fn compute(
             .cmp(&a.members.len())
             .then(a.result_id.cmp(&b.result_id))
     });
+    let planned: HashSet<i64> = groups
+        .iter()
+        .flat_map(|g| g.members.iter().map(|m| m.photo_id))
+        .collect();
     Some(Plan {
         identity: snapshot.identity.clone(),
         options,
+        retire: snapshot.raw.retire_candidates(&planned),
         groups,
     })
 }

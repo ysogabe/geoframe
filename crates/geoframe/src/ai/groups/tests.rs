@@ -2179,6 +2179,23 @@ fn admin_scene_annotations_follow_the_photo_generation_and_the_current_space() {
     };
     assert!(by_id(1).get("scene").is_none());
     assert_eq!(by_id(2)["scene"]["state"], "local_ranked");
+    // The note is advisory (the component guard is not recomputed), but it only names a photo that can
+    // still belong to a component. The cycle then drops the changed photo's reference as well.
+    e.cycle();
+    assert_eq!(
+        scene_count(
+            &e.conn,
+            "SELECT COUNT(*) FROM ai_scene_active WHERE photo_id=1"
+        ),
+        0
+    );
+    assert!(
+        page(&e)["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["id"] != 1 || p.get("scene").is_none())
+    );
 }
 
 // ---- 2nd review: vector presence in the input guard, current-only counts, schema shape ----------
@@ -2421,15 +2438,31 @@ fn a_scene_table_of_another_shape_stops_the_cycle_with_a_fixed_error_and_deliver
              CREATE TABLE ai_scene_active(photo_id INTEGER PRIMARY KEY, result_id TEXT);",
         )
         .unwrap();
+    // A table of another shape is not "to be created": it is its own class, so a dry-run does not
+    // announce work that never happens (and the status keeps hiding the scene counts).
+    assert!(pending(&e.conn).unwrap().is_empty());
     assert_eq!(
-        pending(&e.conn).unwrap(),
+        mismatched(&e.conn).unwrap(),
         vec!["ai_scene_groups", "ai_scene_members"]
     );
+    assert!(!current(&e.conn));
     // Not repaired and not reported as created.
     assert!(migrate(&mut e.conn).unwrap().is_empty());
+    assert!(pending(&e.conn).unwrap().is_empty());
     assert_eq!(
-        pending(&e.conn).unwrap(),
+        mismatched(&e.conn).unwrap(),
         vec!["ai_scene_groups", "ai_scene_members"]
+    );
+    let dry = crate::ingest::plan(&e.config, &e.conn).unwrap();
+    assert_eq!(
+        dry.scene_mismatch,
+        vec!["ai_scene_groups", "ai_scene_members"]
+    );
+    assert!(
+        !dry.schema
+            .missing_objects
+            .iter()
+            .any(|o| o.starts_with("ai_scene_"))
     );
     let err = runtime::Runtime::production(e.config.clone())
         .unwrap()
@@ -2450,6 +2483,346 @@ fn a_scene_table_of_another_shape_stops_the_cycle_with_a_fixed_error_and_deliver
             .unwrap()
             .contains_key("ai_scenes")
     );
+}
+
+// ---- 3rd review: a photo that is not ready any more keeps no local-result reference -------------
+
+fn references(e: &LocalEnv) -> i64 {
+    scene_count(&e.conn, "SELECT COUNT(*) FROM ai_scene_active")
+}
+fn reference_of(e: &LocalEnv, id: i64) -> i64 {
+    scene_count(
+        &e.conn,
+        &format!("SELECT COUNT(*) FROM ai_scene_active WHERE photo_id={id}"),
+    )
+}
+/// `items` of the management photo list keyed by id: whether the photo carries a `scene`.
+fn admin_scenes(e: &LocalEnv) -> Vec<(i64, Option<Json>)> {
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    let page = serde_json::to_value(
+        crate::admin::photos(&e.conn, &ctx, 1, 50, crate::admin::Filter::All).unwrap(),
+    )
+    .unwrap();
+    let mut out: Vec<_> = page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["id"].as_i64().unwrap(), p.get("scene").cloned()))
+        .collect();
+    out.sort_by_key(|p| p.0);
+    out
+}
+fn admin_local_ranked(e: &LocalEnv) -> Json {
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    crate::admin::status(&e.conn, &ctx).unwrap()["ai_scenes"]["local_ranked"].clone()
+}
+impl LocalEnv {
+    fn report(&self) -> runtime::CycleReport {
+        runtime::Runtime::production(self.config.clone())
+            .unwrap()
+            .cycle_report(
+                &self.conn,
+                &self.ingest.writer,
+                &crate::stop::StopFlag::new(),
+            )
+            .unwrap()
+    }
+    fn scene_tables(&self) -> Vec<Vec<Vec<Value>>> {
+        ["ai_scene_groups", "ai_scene_members", "ai_scene_active"]
+            .iter()
+            .map(|t| rows(&self.conn, t))
+            .collect()
+    }
+}
+
+#[test]
+fn when_every_vector_is_gone_no_reference_stays_in_any_cycle_and_nothing_counts() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(references(&e), 2);
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 1);
+    assert_eq!(admin_local_ranked(&e), 1);
+    assert!(admin_scenes(&e).iter().all(|(_, s)| s.is_some()));
+    e.conn
+        .execute("DELETE FROM ai_embedding_vectors", [])
+        .unwrap();
+    // Before any cycle the counts and the management notes already fall back to "nothing current".
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 0);
+    assert_eq!(admin_local_ranked(&e), 0);
+    assert!(admin_scenes(&e).iter().all(|(_, s)| s.is_none()));
+    assert!(e.loaded().groups().is_empty());
+    // The first cycle stores nothing, but still drops the references (it writes for them alone).
+    let first = e.report();
+    assert_eq!((first.stored, first.selected, first.retired), (0, 0, 2));
+    assert_eq!(references(&e), 0);
+    // The ranked header stays as history and is not counted; later cycles write nothing at all.
+    assert_eq!(
+        scene_count(&e.conn, "SELECT COUNT(*) FROM ai_scene_groups"),
+        1
+    );
+    let tables = e.scene_tables();
+    for _ in 0..4 {
+        let report = e.report();
+        assert_eq!((report.stored, report.selected, report.retired), (0, 0, 0));
+        assert_eq!(e.scene_tables(), tables);
+        assert_eq!(references(&e), 0);
+        let scenes = e.status()["pipeline"]["scenes"].clone();
+        assert_eq!(
+            (&scenes["local_ranked"], &scenes["waiting"]),
+            (&json!(0), &json!(0))
+        );
+        assert_eq!(admin_local_ranked(&e), 0);
+        assert!(admin_scenes(&e).iter().all(|(_, s)| s.is_none()));
+    }
+    assert_eq!(scene_marks(&e.view()), 0);
+    // Vectors come back: the same ranked result is current again.
+    vector(&mut e.conn, 1, &[1., 0.]);
+    vector(&mut e.conn, 2, &[1., 0.]);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(references(&e), 2);
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 1);
+    assert_eq!(scene_marks(&e.view()), 2);
+}
+
+/// Photos 1 and 2 form R{1,2}, photo 9 is a singleton far away. `lose` makes photo 2 not ready.
+fn photo_two_becomes_not_ready(lose: impl FnOnce(&mut Connection)) -> LocalEnv {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    ready(&mut e.conn, 9, 50_000);
+    assert_eq!(e.cycle(), 2);
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 2);
+    lose(&mut e.conn);
+    // At once, before any cycle: R{1,2} and the note of photo 2 are not current any more.
+    assert_eq!(e.status()["pipeline"]["scenes"]["local_ranked"], 1);
+    assert_eq!(admin_local_ranked(&e), 1);
+    let notes = admin_scenes(&e);
+    assert!(notes.iter().find(|n| n.0 == 2).unwrap().1.is_none());
+    assert!(notes.iter().find(|n| n.0 == 9).unwrap().1.is_some());
+    for _ in 0..4 {
+        e.cycle();
+    }
+    // The reference of photo 2 is gone for good; it stays gone in later cycles and photo 9 keeps its own.
+    assert_eq!(reference_of(&e, 2), 0);
+    assert_eq!(reference_of(&e, 9), 1);
+    let report = e.report();
+    assert_eq!((report.stored, report.selected, report.retired), (0, 0, 0));
+    assert_eq!(reference_of(&e, 2), 0);
+    assert_eq!(admin_scenes(&e).iter().find(|n| n.0 == 2).unwrap().1, None);
+    assert!(scene_marks(&e.view()) >= 1);
+    e
+}
+fn has_no_scene_mark(e: &LocalEnv, id: i64) -> bool {
+    !e.view()["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["photos"].as_array().unwrap().iter())
+        .any(|c| c["id"] == id && c["scene_state"].is_string())
+}
+
+#[test]
+fn a_photo_whose_vector_is_gone_loses_its_reference_while_the_rest_stays() {
+    let e = photo_two_becomes_not_ready(|c| {
+        c.execute(
+            "DELETE FROM ai_embedding_vectors WHERE input_sha256=?1",
+            [sha_hex(2)],
+        )
+        .unwrap();
+    });
+    // Photo 1 is next to a photo whose embedding is missing: a waiting placeholder, no reference.
+    assert_eq!(reference_of(&e, 1), 0);
+    assert_eq!(states(&e), vec![State::Waiting, State::LocalRanked]);
+    assert!(has_no_scene_mark(&e, 2));
+}
+
+#[test]
+fn a_photo_whose_embedding_failed_loses_its_reference() {
+    let e = photo_two_becomes_not_ready(|c| {
+        c.execute(
+            "DELETE FROM ai_embedding_vectors WHERE input_sha256=?1",
+            [sha_hex(2)],
+        )
+        .unwrap();
+        fail(c, 2);
+    });
+    // A failed photo is excluded instead of holding its neighbours back: photo 1 is a ranked singleton.
+    assert_eq!(reference_of(&e, 1), 1);
+    assert_eq!(states(&e), vec![State::LocalRanked, State::LocalRanked]);
+    assert!(has_no_scene_mark(&e, 2));
+}
+
+#[test]
+fn a_photo_that_lost_its_capture_time_loses_its_reference() {
+    let e = photo_two_becomes_not_ready(|c| {
+        c.execute("UPDATE photos SET taken_at=NULL WHERE id=2", [])
+            .unwrap();
+    });
+    assert_eq!(reference_of(&e, 1), 1); // alone and ranked: the missing time is not a pending window
+    assert!(has_no_scene_mark(&e, 2));
+}
+
+#[test]
+fn a_reference_is_kept_when_the_photo_became_ready_again_after_the_plan() {
+    let mut c = pair();
+    let first = plan(&c);
+    assert_eq!(save(&mut c, &first, 0, &|| false).unwrap(), Saved::Stored);
+    c.execute(
+        "DELETE FROM ai_embedding_vectors WHERE input_sha256=?1",
+        [sha_hex(2)],
+    )
+    .unwrap();
+    let stale = plan(&c);
+    assert_eq!(pending_retire(&c, &stale).unwrap(), 1);
+    // The vector is back before the writer runs: the state the plan saw no longer holds, so the
+    // reference stays (the next cycle decides) instead of being dropped and re-created back and forth.
+    vector(&mut c, 2, &[1., 0.]);
+    let (saved, retired) = save_batch_counted(&mut c, &stale, &[], &|| false).unwrap();
+    assert!(saved.is_empty());
+    assert_eq!(retired, 0);
+    assert_eq!(
+        scene_count(&c, "SELECT COUNT(*) FROM ai_scene_active WHERE photo_id=2"),
+        1
+    );
+    // The plan taken now sees both ready: the stored result is unchanged and there is nothing to retire.
+    let now = plan(&c);
+    assert_eq!(now.retire_len(), 0);
+    assert!(pending_saves(&c, &now, 8).unwrap().is_empty());
+    assert_eq!(pending_retire(&c, &now).unwrap(), 0);
+}
+
+#[test]
+fn references_of_other_spaces_or_options_are_not_retired() {
+    let mut c = pair();
+    let first = plan(&c);
+    assert_eq!(save(&mut c, &first, 0, &|| false).unwrap(), Saved::Stored);
+    c.execute(
+        "DELETE FROM ai_embedding_vectors WHERE input_sha256=?1",
+        [sha_hex(2)],
+    )
+    .unwrap();
+    // The same photos under other options: their stored result is not this plan's to touch.
+    let other = Options::new(60, 0.9, 3).unwrap();
+    let snap = snapshot(&c).unwrap().unwrap();
+    let plan_other = compute(&snap, other, Err(rank::Reason::Unconfigured), &|| false).unwrap();
+    assert_eq!(plan_other.retire_len(), 1);
+    assert_eq!(pending_retire(&c, &plan_other).unwrap(), 0);
+    let (_, retired) = save_batch_counted(&mut c, &plan_other, &[], &|| false).unwrap();
+    assert_eq!(retired, 0);
+    assert_eq!(
+        scene_count(&c, "SELECT COUNT(*) FROM ai_scene_active WHERE photo_id=2"),
+        1
+    );
+    // The default options own it and drop it.
+    let own = plan(&c);
+    assert_eq!(pending_retire(&c, &own).unwrap(), 1);
+    assert_eq!(
+        save_batch_counted(&mut c, &own, &[], &|| false).unwrap().1,
+        1
+    );
+    assert_eq!(
+        scene_count(&c, "SELECT COUNT(*) FROM ai_scene_active WHERE photo_id=2"),
+        0
+    );
+}
+
+#[test]
+fn a_sixteen_column_scene_table_makes_the_status_unavailable_and_hides_the_admin_counts() {
+    let mut e = LocalEnv::new(&[]);
+    ready(&mut e.conn, 1, 0);
+    ready(&mut e.conn, 2, 100);
+    assert_eq!(e.cycle(), 1);
+    assert_eq!(e.status()["pipeline"]["scenes"]["state"], "active");
+    // The intermediate development shape appears under a running service (no migration ran).
+    e.conn
+        .execute_batch(
+            "PRAGMA foreign_keys=OFF; ALTER TABLE ai_scene_groups DROP COLUMN vector_guard;",
+        )
+        .unwrap();
+    assert_eq!(
+        pending(&e.conn).unwrap(),
+        vec!["ai_scene_groups.vector_guard"]
+    );
+    assert!(mismatched(&e.conn).unwrap().is_empty());
+    // E5: the scene block says so, with zero counts; the rest of the status and the feed carry on.
+    let status = e.status();
+    assert_eq!(status["pipeline"]["scenes"]["state"], "unavailable");
+    assert_eq!(status["pipeline"]["scenes"]["local_ranked"], 0);
+    assert_eq!(e.feed().len(), 2);
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    assert!(
+        !crate::admin::status(&e.conn, &ctx)
+            .unwrap()
+            .contains_key("ai_scenes")
+    );
+    assert!(admin_scenes(&e).iter().all(|(_, s)| s.is_none()));
+    assert_eq!(scene_marks(&e.view()), 0);
+    let err = runtime::Runtime::production(e.config.clone())
+        .unwrap()
+        .cycle(&e.conn, &e.ingest.writer, &crate::stop::StopFlag::new())
+        .unwrap_err();
+    assert_eq!(err, Error::SchemaMismatch);
+}
+
+/// Measurement only (`--ignored --nocapture`): writer time of one batch that stores a component while
+/// thousands of waiting placeholders exist (the first creation of the scenes of a large catalog).
+/// The placeholders are synthetic headers of the plan's space and options, two members each; the stored
+/// component is two ready photos elsewhere, so the batch's housekeeping has to look at every placeholder.
+#[test]
+#[ignore = "measurement: writer time with thousands of waiting placeholders"]
+fn thousands_of_waiting_placeholders_measure_the_writer_batch() {
+    use std::time::Instant;
+    const PHOTOS: i64 = 8000;
+    for waiting in [0_i64, 4000] {
+        let dir = TempDir::new("scene-waiting-measure");
+        let mut c = Connection::open(dir.path().join("catalog.db")).unwrap();
+        c.pragma_update(None, "journal_mode", "WAL").unwrap();
+        schema::migrate(&mut c).unwrap();
+        index::migrate(&mut c).unwrap();
+        jobs::migrate(&mut c).unwrap();
+        migrate(&mut c).unwrap();
+        activate(&mut c, &identity(2));
+        let tx = c.transaction().unwrap();
+        for id in 1..=PHOTOS {
+            tx.execute("INSERT INTO photos(id,source,name,display,md5,mtime,rotation,lat,lon) VALUES(?1,'local','synthetic',?2,'m',1,0,1,2)",params![id,format!("synthetic-{id}")]).unwrap();
+        }
+        let options = Options::default();
+        for n in 0..waiting {
+            let id = format!("waiting-{n}");
+            tx.execute("INSERT INTO ai_scene_groups VALUES(?1,'scene-a',?2,'g','p',?3,?4,?5,'waiting','disjoint','null',NULL,0,1,'x','[]','v')",
+                params![id, identity(2).fingerprint(), options.window_s, options.similarity, options.shortlist as i64]).unwrap();
+            for (rank, photo) in [n * 2 + 1, n * 2 + 2].into_iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO ai_scene_members VALUES(?1,?2,'g',?3,NULL,0,0,1,0)",
+                    params![id, photo, rank as i64 + 1],
+                )
+                .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        ready(&mut c, 10_001, 0);
+        ready(&mut c, 10_002, 100);
+        let plan = plan(&c);
+        assert_eq!(plan.groups().len(), 1);
+        let start = Instant::now();
+        let (saved, _) = save_batch_counted(&mut c, &plan, &[0], &|| false).unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(saved, vec![Saved::Stored]);
+        // The placeholders share no photo with the stored component and name existing photos: kept.
+        assert_eq!(
+            scene_count(
+                &c,
+                "SELECT COUNT(*) FROM ai_scene_groups WHERE state='waiting'"
+            ),
+            waiting
+        );
+        eprintln!(
+            "WAITING_TIDY placeholders={waiting} photos={PHOTOS} writer_batch_ms={:.1}",
+            elapsed.as_secs_f64() * 1000.
+        );
+    }
 }
 
 /// Measurement only (`--ignored --nocapture`): cost of the stored-scene read paths on a synthetic

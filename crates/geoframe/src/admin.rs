@@ -148,7 +148,7 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
         &ctx.ai_waits,
         crate::ai::jobs::unix_now(),
     );
-    if crate::ai::groups::pending(conn).is_ok_and(|p| p.is_empty()) {
+    if crate::ai::groups::current(conn) {
         out.insert(
             "ai_scenes".into(),
             crate::ai::groups::runtime::status_summary(&scenes, conn),
