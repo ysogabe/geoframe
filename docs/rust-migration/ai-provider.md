@@ -92,6 +92,7 @@
 
 - `RunError::ProviderWait(Wait{scope, reason, retry_after_secs})`。`scope`は`Entrance`（同じProviderの全用途）か`Service`（そのサービスを使う用途だけ）。
 - 識別は`AiSettings::provider_fingerprint`（接続先・認証のハッシュ）と`service_key`（サービスIDのハッシュ。`location_clue`は固定の`decision`、クラウドはモデル単位）。別のProvider・別のサービスは巻き込まない。
+- **claimの並び**（T4.7の受入の修正）: 期限（`next_attempt_at`）は取れるかの絞り込みで、並びは「取れるようになった時刻」。`shutdown`・`unavailable`・待機などで`deferred`になったジョブ（失敗・反復・中断の履歴が無い）は、期限を過ぎると積んだ時刻（`created_at`）の位置に戻り、あとから積まれた`pending`の後ろに回り続けない。ジョブ自身の不良（失敗のバックオフ・反復の失敗・中断の回収）で戻ったものは、従来どおり戻した時刻の順（待ち行列の後ろ）。期限前の`deferred`は取られない。claimの原子性・token・失敗と中断の上限・用途ごとの許可・周期の枠は変わらない。新しい索引・列は無く、旧DBの移行・`--dry-run`の表示・Pythonへの切り戻しに影響しない。期限の来た`pending`が7,000件あっても1回のclaimは約1ms未満（旧の約0.02msから増える）（並べ替えは期限の来た行だけ。画像1枚あたりの処理時間に比べ無視できる）。
 - ワーカーは待ちを`ai_provider_waits`に記録し（同じWriterの1回の依頼でjobの`next_attempt_at`も遅らせる）、周期の最初にDBから読み直す。待っている用途は**claimの前に**飛ばす。再起動後も`until`まで連打しない。既存の`blocked`（`Unavailable`・`RateLimited`・予算切れ）はこの起動の中の用途単位で、そのまま残る。
 - 待ちは成功済みの結果にも他のjobにも触れず、設定の変更や待ちだけで過去の成功結果を再送しない。
 - **管理表示**（`ai-jobs status`・`/api/admin/status`の`ai_waits`・管理画面STATUS）: 有効な待ち（`until`が今より先）を**今の設定の用途に結び直して**出す。保存された識別（Providerとサービスのハッシュ）は用途名に引き直すだけで、ハッシュ・接続先・サービスID・モデル・Providerの自由文の`reason`は出さない。出すのは用途名・範囲（`entrance`＝入口全体／`service`＝サービス単体）・固定の理由（`unreachable`・`leased`・`not_ready`・`rate_limited`・`busy`）・期限だけ。入口全体の待ちは同じProviderの全用途の行になり、サービス単体の待ちはそのサービスの用途だけ。今の設定に当たらない待ち（古い設定の残り）は何も止めていないので出さない。設定が未指定・不正で結び直せないときは、有効な待ちの**件数**（`unidentified`）だけ。期限切れの行は残っていても出さない。再起動の前後は同じDBの行から読み直すので同じ表示になる。

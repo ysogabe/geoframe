@@ -450,6 +450,15 @@ pub fn status(conn: &Connection, config: &Config) -> rusqlite::Result<Value> {
     drop(stmt);
     let scene_summary = super::groups::runtime::status_summary(&prepared, &tx);
     let selection = crate::selection::admin_counts(&tx)?;
+    let building = super::index::building_in(
+        &tx,
+        super::embedding::configured_identity(
+            &config.ai,
+            super::settings::TaskKind::ImageEmbedding,
+        )
+        .as_ref(),
+        identity.as_ref().map(super::space::SpaceIdentity::space_id),
+    )?;
     tx.commit()?;
     let active = identity.is_some();
     let photos = if active {
@@ -468,11 +477,29 @@ pub fn status(conn: &Connection, config: &Config) -> rusqlite::Result<Value> {
             .as_ref()
             == Some(i)
     });
-    Ok(
-        json!({"ok":true,"photos":photos,"judged":if active {all_judged}else{judged},"recommended":if active {all_recommended}else{recommended},"groups":group_status.values().sum::<i64>(),"eligible":index.progress.eligible,"pending_embeddings":if active {index.progress.pending}else{(index.progress.eligible-legacy).max(0)},"group_status":group_status,
+    let mut out = json!({"ok":true,"photos":photos,"judged":if active {all_judged}else{judged},"recommended":if active {all_recommended}else{recommended},"groups":group_status.values().sum::<i64>(),"eligible":index.progress.eligible,"pending_embeddings":if active {index.progress.pending}else{(index.progress.eligible-legacy).max(0)},"group_status":group_status,
         "embedding_model":identity.as_ref().map_or(model,|i|i.model_id()),"embedding_backend":if active {if identity.as_ref().is_some_and(|i| i.provider_space_id() == super::embedding::PROVIDER_SPACE) {"local_http"} else {"active_index"}}else{match config.embed_backend {EmbedBackend::Local=>"local",EmbedBackend::Gemini=>"gemini"}},"other_model_embeddings":if active {index.other_shas}else{other},
-        "pipeline":{"index_state":state,"query_compatible":compatible,"indexed":index.progress.indexed,"pending":index.progress.pending,"failed_excluded":index.progress.failed_excluded,"failed_reasons":index.progress.failed_reasons.into_iter().collect::<BTreeMap<_,_>>(),"corrupt":index.corrupt,"selection_judged":all_judged,"selection_recommended":all_recommended,"selection_groups":selection.groups,"selection_suppressed":selection.feed_suppressed,"scenes":scene_summary}}),
-    )
+        "pipeline":{"index_state":state,"query_compatible":compatible,"indexed":index.progress.indexed,"pending":index.progress.pending,"failed_excluded":index.progress.failed_excluded,"failed_reasons":index.progress.failed_reasons.into_iter().collect::<BTreeMap<_,_>>(),"corrupt":index.corrupt,"selection_judged":all_judged,"selection_recommended":all_recommended,"selection_groups":selection.groups,"selection_suppressed":selection.feed_suppressed,"scenes":scene_summary}});
+    if let Some(building) = building {
+        out["pipeline"]["building"] = building_json(&building);
+    }
+    Ok(out)
+}
+
+/// `pipeline.building`: 公開前の空間（設定が指す画像 Embedding の空間で、まだ検索に使われていないもの）の進み具合。
+/// 件数と固定のコードだけ（空間の ID・モデル・SHA は出さない）。`indexed` はベクトルの行の有無（BLOB は読まない）。
+fn building_json(building: &super::index::Building) -> Value {
+    let p = &building.progress;
+    json!({
+        "eligible": p.eligible,
+        "indexed": p.indexed,
+        "pending": p.pending,
+        "failed_excluded": p.failed_excluded,
+        "failed_reasons": p.failed_reasons.iter().copied().collect::<BTreeMap<_, _>>(),
+        "coverage": round4(building.coverage),
+        "min_coverage": building.min_coverage,
+        "publish": building.publish.as_str(),
+    })
 }
 
 #[cfg(test)]

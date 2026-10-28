@@ -1011,6 +1011,7 @@ fn format_ai_report(report: &ops::Report) -> String {
         let _ = writeln!(out, "停止中の Provider・用途: なし");
     }
     out.push_str(&format_index_status(&report.index));
+    out.push_str(&format_building_status(report.building.as_ref()));
     for p in &report.pauses {
         let _ = writeln!(
             out,
@@ -1050,6 +1051,42 @@ fn format_index_status(status: &crate::ai::index::IndexStatus) -> String {
         out,
         "他の空間・旧結果のベクトル: {} 種類（うち旧結果 {}。新しい空間には使わない）",
         status.other_shas, status.legacy_shas
+    );
+    out
+}
+
+/// `ai-jobs status` の公開前の空間の部分（件数と固定のコードだけ）。設定（`GEOFRAME_AI_CONFIG`）が無い・空間が未登録・
+/// 既に有効なときは何も出さない。保存済みはベクトルの有無だけを数える（検査は公開時）。
+fn format_building_status(building: Option<&crate::ai::index::Building>) -> String {
+    use crate::ai::index::PublishState;
+    use std::fmt::Write;
+    let Some(b) = building else {
+        return String::new();
+    };
+    let p = &b.progress;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "公開前の空間: 対象 {} / 保存済み {} / 待ち {} / 失敗で除外 {}（成功率 {:.1}%）",
+        p.eligible,
+        p.indexed,
+        p.pending,
+        p.failed_excluded,
+        b.coverage * 100.0
+    );
+    for (code, count) in &p.failed_reasons {
+        let _ = writeln!(out, "公開前の空間 除外の理由 {code}: {count} 件");
+    }
+    let verdict = match b.publish {
+        PublishState::Waiting => "待ち 0 になるまで公開しない",
+        PublishState::NoVectors => "保存済みが 0 件のため公開しない",
+        PublishState::BelowThreshold => "成功率が閾値に届かず公開しない（管理確認が要る）",
+        PublishState::Ready => "公開できる状態（次の切替の試みで公開）",
+    };
+    let _ = writeln!(
+        out,
+        "公開の条件: 待ち 0 かつ 成功率 {:.0}% 以上 → {verdict}",
+        b.min_coverage * 100.0
     );
     out
 }
@@ -1457,6 +1494,38 @@ mod tests {
         ] {
             assert!(!out.contains(secret), "{secret}\n{out}");
         }
+    }
+
+    /// 公開前の空間の進み具合は、件数と公開の条件（固定の文）だけを出す。無いときは何も出さない。
+    #[test]
+    fn building_space_progress_prints_counts_and_the_publish_rule_only() {
+        use crate::ai::index::{Building, Progress, PublishState};
+        assert_eq!(format_building_status(None), "");
+        let building = Building {
+            progress: Progress {
+                eligible: 6439,
+                indexed: 2000,
+                pending: 4300,
+                failed_excluded: 139,
+                failed_reasons: vec![("timeout", 139)],
+            },
+            min_coverage: 0.95,
+            coverage: 2000.0 / 6439.0,
+            publish: PublishState::Waiting,
+        };
+        let out = format_building_status(Some(&building));
+        assert!(
+            out.contains("公開前の空間: 対象 6439 / 保存済み 2000 / 待ち 4300 / 失敗で除外 139（成功率 31.1%）"),
+            "{out}"
+        );
+        assert!(
+            out.contains("公開前の空間 除外の理由 timeout: 139 件"),
+            "{out}"
+        );
+        assert!(
+            out.contains("公開の条件: 待ち 0 かつ 成功率 95% 以上 → 待ち 0 になるまで公開しない"),
+            "{out}"
+        );
     }
 
     /// 停止の各待ちは、1 つあたりの上限が長くても SIGTERM からの共通期限の残りを越えない。

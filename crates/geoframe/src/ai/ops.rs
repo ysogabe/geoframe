@@ -58,6 +58,9 @@ pub struct Report {
     pub waits: waits::WaitView,
     /// 検索索引（空間別ベクトル）の状態（件数だけ。空間の表が無い旧 DB でも読める）。
     pub index: index::IndexStatus,
+    /// 公開前の空間（設定が指す画像 Embedding の空間で、まだ検索に使われていないもの）の進み具合。設定が無い・
+    /// 空間が未登録・既に有効なときは `None`（CLI は `GEOFRAME_AI_CONFIG` を付けて実行したときだけ分かる）。
+    pub building: Option<index::Building>,
     pub location_holds: Vec<(&'static str, i64)>,
 }
 
@@ -77,6 +80,16 @@ pub fn report(conn: &Connection, ai: &AiConfig) -> rusqlite::Result<Report> {
 
 /// [`report`] の、待ちの期限を見る時刻（UTC の Unix 秒）を指定できる形。
 pub fn report_at(conn: &Connection, ai: &AiConfig, now: i64) -> rusqlite::Result<Report> {
+    let index = index::status(conn)?;
+    let active = match &index.active {
+        index::ActiveState::Active(space_id) => Some(space_id.as_str()),
+        _ => None,
+    };
+    let building = index::building_in(
+        conn,
+        super::embedding::configured_identity(ai, TaskKind::ImageEmbedding).as_ref(),
+        active,
+    )?;
     Ok(Report {
         config: config_state(ai),
         tasks: TaskKind::ALL
@@ -87,7 +100,8 @@ pub fn report_at(conn: &Connection, ai: &AiConfig, now: i64) -> rusqlite::Result
         reasons: reason_counts(conn)?,
         pauses: pause::list(conn)?,
         waits: waits::view(conn, now, &waits::Identities::from_config(ai))?,
-        index: index::status(conn)?,
+        index,
+        building,
         location_holds: super::location_suggest::hold_counts(conn)?,
     })
 }

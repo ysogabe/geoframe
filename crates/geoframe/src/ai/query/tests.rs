@@ -519,6 +519,122 @@ fn status_counts_actual_index_corrupt_pending_and_selection_without_raw_reasons_
         "unset"
     );
 }
+/// 公開前（まだ `ai_active_space` が指さない）の空間の進み具合を、E5 の `pipeline.building` と
+/// `ops::report`（`ai-jobs status`）に出す。既存のキーの型・意味は変えず、BLOB は読まず、件数と固定のコードだけ。
+#[test]
+fn status_reports_the_building_space_progress_and_the_publish_rule_without_reading_blobs() {
+    let mut e = Env::new(Some("http://127.0.0.1:1"), &[], true);
+    let identity = embedding::configured_identity(&e.config.ai, TaskKind::ImageEmbedding).unwrap();
+    // 有効な空間なら「公開前」ではない
+    assert!(
+        search_view::status(&e.conn, &e.config).unwrap()["pipeline"]
+            .get("building")
+            .is_none()
+    );
+    assert!(
+        crate::ai::ops::report(&e.conn, &e.config.ai)
+            .unwrap()
+            .building
+            .is_none()
+    );
+    // 登録済み・ベクトル 8 件・未公開（旧結果参照）。既存のキーは従来どおり（索引が無いので全件が待ち）
+    activation::deactivate(&mut e.conn).unwrap();
+    let status = search_view::status(&e.conn, &e.config).unwrap();
+    assert_eq!(status["pipeline"]["indexed"], 0);
+    assert_eq!(status["pipeline"]["pending"], 8);
+    assert_eq!(
+        status["pipeline"]["building"],
+        json!({"eligible":8,"indexed":8,"pending":0,"failed_excluded":0,"failed_reasons":{},
+               "coverage":1.0,"min_coverage":0.95,"publish":"ready"})
+    );
+    // ベクトル 2 件を消し、1 件は現在のジョブが failed（理由は固定のコードにまとめる）、1 件は未登録（待ち）
+    let sha = |n: i64| format!("{n:064x}");
+    for n in [1, 2] {
+        e.conn
+            .execute(
+                "DELETE FROM ai_embedding_vectors WHERE input_sha256=?1",
+                [sha(n)],
+            )
+            .unwrap();
+    }
+    let key = index::scan(&e.conn, Some(&identity), false)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.input_sha256() == sha(1))
+        .unwrap()
+        .job_key(&identity);
+    crate::ai::jobs::enqueue(&mut e.conn, &key, 1).unwrap();
+    e.conn.execute("UPDATE ai_jobs SET state='failed',terminal=1,last_error_code='synthetic-private-reason' WHERE target_key=?1",[&key.target_key]).unwrap();
+    let status = search_view::status(&e.conn, &e.config).unwrap();
+    let building = &status["pipeline"]["building"];
+    assert_eq!(
+        (
+            &building["eligible"],
+            &building["indexed"],
+            &building["pending"],
+            &building["failed_excluded"],
+            &building["publish"]
+        ),
+        (
+            &json!(8),
+            &json!(6),
+            &json!(1),
+            &json!(1),
+            &json!("waiting")
+        )
+    );
+    assert_eq!(building["failed_reasons"], json!({"other":1}));
+    assert_eq!(building["coverage"], 0.75);
+    let text = status.to_string();
+    assert!(!text.contains("synthetic-private-reason") && !text.contains("eg2-test-v1"));
+    assert!(!text.contains(identity.space_id()));
+    // 残りの待ちも失敗にすると、待ちは 0 でも成功率が閾値（95%）に届かない
+    let key = index::scan(&e.conn, Some(&identity), false)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.input_sha256() == sha(2))
+        .unwrap()
+        .job_key(&identity);
+    crate::ai::jobs::enqueue(&mut e.conn, &key, 1).unwrap();
+    e.conn.execute("UPDATE ai_jobs SET state='failed',terminal=1,last_error_code='timeout' WHERE target_key=?1",[&key.target_key]).unwrap();
+    let report = crate::ai::ops::report(&e.conn, &e.config.ai).unwrap();
+    let b = report.building.unwrap();
+    assert_eq!(
+        (
+            b.progress.indexed,
+            b.progress.pending,
+            b.progress.failed_excluded
+        ),
+        (6, 0, 2)
+    );
+    assert_eq!(b.publish, index::PublishState::BelowThreshold);
+    assert_eq!(
+        b.progress.failed_reasons,
+        vec![("other", 1), ("timeout", 1)]
+    );
+    // BLOB は読まない: 壊れたベクトルも「行がある」として数える（検査は公開時。`corrupt` は有効な空間の読みだけ）
+    e.conn
+        .execute(
+            "UPDATE ai_embedding_vectors SET vector=zeroblob(3072) WHERE input_sha256=?1",
+            [sha(3)],
+        )
+        .unwrap();
+    let status = search_view::status(&e.conn, &e.config).unwrap();
+    assert_eq!(status["pipeline"]["building"]["indexed"], 6);
+    // 設定が無い・空間が未登録なら、キーを足さない（既存の応答のまま）
+    let none = Env::new(None, &[], false);
+    assert!(
+        search_view::status(&none.conn, &none.config).unwrap()["pipeline"]
+            .get("building")
+            .is_none()
+    );
+    let unregistered = Env::new(Some("http://127.0.0.1:1"), &[], false);
+    assert!(
+        search_view::status(&unregistered.conn, &unregistered.config).unwrap()["pipeline"]
+            .get("building")
+            .is_none()
+    );
+}
 #[test]
 fn identity_full_metadata_isolation_and_visual_does_not_mix_legacy_vectors() {
     let mut e = Env::new(Some("http://127.0.0.1:1"), &[], true);

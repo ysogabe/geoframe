@@ -88,6 +88,7 @@ T4.3の索引基盤に、[T4.4aの固定契約アダプターと画像ワーカ�
 
 ## 7. CLI
 
+- **公開前の空間の進み具合**（T4.7の受入の修正。`index::building_in`・`Building`）: 設定が指す画像Embeddingの空間（`configured_identity(ImageEmbedding)`）が、空間の表に**登録済み（識別が同じ）で、まだ`ai_active_space`が指さない**ときだけ読む。今の対象（`content_sha256`の種類）に対する`eligible`／`indexed`（ベクトルの行がある）／`pending`／`failed_excluded`（現在の入力・処理版のジョブが`failed`。理由は固定のコードか`other`）と、`coverage`（`indexed / eligible`）、公開の閾値`min_coverage`（既定0.95）、公開の条件に照らした`publish`: `waiting`（待ちが1件でもある）・`no_vectors`（待ち0・保存済み0）・`below_threshold`（待ち0・成功率が閾値未満）・`ready`（待ち0・成功率が閾値以上。次の切替の試みで公開）。規則は`try_activate`と同じだが、構築開始時の候補の固定（`snapshot`）は使わず今の対象で数えるので、公開の判定とは写真の増減の分だけずれうる。**軽い読み**: 全vectorのBLOBは読まず、ベクトルの有無は主キーの被覆索引（`space_id`→`input_sha256`）だけで数える。形・値の検査（壊れた行）は公開時で、壊れた行は公開前の表示では「保存済み」に数え、公開の検査で待ちに戻る（`status.corrupt`は有効な空間の読みだけ）。設定が無い・空間が未登録・既に有効なときは出さない。E5の`pipeline.building`、`ai-jobs status`の`公開前の空間:`・`公開の条件:`の行（**`GEOFRAME_AI_CONFIG`を付けて実行したときだけ**空間が分かる。付けなければ出ない）、どちらも件数と固定のコードだけで空間ID・モデル・SHAは出さない。
 - `geoframe ai-jobs status`: 読み取りだけ。検索空間の有無・登録数、対象/保存済み/待ち/失敗で除外/壊れの件数、除外の理由コード別件数、他の空間・旧結果のベクトル数（空間 ID・モデル・SHA は出さない）。表が無い旧 DB でも書き込み 0。
 - `geoframe ai-jobs deactivate-space`: `ai_active_space` を外し旧結果参照へ戻す。`GEOFRAME_INGEST=1`・検証環境のガード・`.ingest.lock`・writer を通る（サービス稼働中は終了コード 1、INGEST 無し・ガード違反は 2）。旧結果・空間・ベクトル・ジョブは消さない。Python→Rust で再切替したら reconcile が追加・変更分を拾う（新結果表を消す必要はない）。
 

@@ -1253,6 +1253,110 @@ fn shutdown_returns_running_jobs_without_counting_and_revokes_the_token() {
     assert!(s.claim(T0 + 5, "run-next", "t2").is_some());
 }
 
+// ---------------------------------------------------------------- claim の順番（期限は絞り込み。後回しは元の位置、反復の失敗は後ろ）
+
+/// 多数の `pending` があっても、期限を過ぎた `deferred` は元の位置（積んだ順）に戻り、次の claim で取られる。
+/// 期限は「取れるか」の絞り込みで、並びのキーではない。
+#[test]
+fn overdue_shutdown_deferred_is_claimed_before_the_pending_enqueued_after_it() {
+    let s = setup("ai-claim-order-shutdown");
+    // 先頭の 1 件を取って停止で戻す（next_attempt_at は戻した時刻 T0+100）。後ろに 50 件の pending
+    s.enqueue(&embed("first", "1"), T0);
+    for i in 0..50 {
+        s.enqueue(&embed(&format!("later-{i}"), "1"), T0 + 1);
+    }
+    let first = s.claim(T0 + 2, "run", "tok").unwrap();
+    assert_eq!(first.key.target_key, "first");
+    let released = s
+        .writer
+        .call(|conn| release_for_shutdown(conn, "run", T0 + 100))
+        .unwrap();
+    assert_eq!(released, 1);
+    assert_eq!(s.row(first.id).next, T0 + 100);
+    // 期限（T0+100）の時点で、後ろの pending（next_attempt_at=T0+1）より先に、戻した 1 件が取られる
+    let again = s.claim(T0 + 100, "run-2", "tok-2").unwrap();
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.key.target_key, "first");
+}
+
+/// 期限前の `deferred` は取られない（期限は絞り込み）。期限が来れば、後ろの pending より先に取られる。
+#[test]
+fn unavailable_deferred_waits_for_its_deadline_then_goes_back_to_its_place() {
+    let s = setup("ai-claim-order-unavailable");
+    s.enqueue(&embed("first", "1"), T0);
+    for i in 0..50 {
+        s.enqueue(&embed(&format!("later-{i}"), "1"), T0 + 1);
+    }
+    let first = s.claim(T0 + 2, "run", "tok").unwrap();
+    assert_eq!(
+        s.fail(
+            &first,
+            T0 + 10,
+            Failure::Defer {
+                retry_after_secs: None
+            }
+        ),
+        Some(JobState::Deferred)
+    );
+    let due = s.row(first.id).next;
+    assert_eq!(due, T0 + 10 + i64::from(MIN_DEFER_SECS));
+    // 期限の前は、後ろの pending だけが取られる（deferred は絞り込みで外れる）
+    for i in 0..3 {
+        let other = s.claim(due - 1, "run", &format!("t{i}")).unwrap();
+        assert_ne!(other.id, first.id);
+        assert!(other.key.target_key.starts_with("later-"));
+    }
+    // 期限の時点で、残りの pending が多数あっても deferred が取られる
+    assert_eq!(s.claim(due, "run", "t-due").unwrap().id, first.id);
+}
+
+/// ジョブ自身の不良（反復の失敗）で後回しにしたものは、従来どおり待ち行列の後ろへ回る（元の位置には戻らない）。
+#[test]
+fn repeated_failure_still_goes_to_the_back_of_the_queue() {
+    let s = setup("ai-claim-order-repeated");
+    s.enqueue(&embed("first", "1"), T0);
+    for i in 0..5 {
+        s.enqueue(&embed(&format!("later-{i}"), "1"), T0 + 1);
+    }
+    let first = s.claim(T0 + 2, "run", "tok").unwrap();
+    assert_eq!(first.key.target_key, "first");
+    assert_eq!(
+        s.fail(&first, T0 + 10, Failure::Repeated),
+        Some(JobState::Deferred)
+    );
+    let due = s.row(first.id).next;
+    assert!(due > T0 + 10);
+    // 期限を過ぎても、先に積まれた pending（積んだ時刻が期限より前）が先。反復の失敗のジョブは最後
+    for i in 0..5 {
+        let c = s.claim(due, "run", &format!("t{i}")).unwrap();
+        assert_eq!(c.key.target_key, format!("later-{i}"));
+    }
+    assert_eq!(s.claim(due, "run", "t-last").unwrap().id, first.id);
+}
+
+/// 取られる順は積んだ順のまま（後回しを挟まない通常の並び）。上限・用途の絞り込みも従来どおり効く。
+#[test]
+fn claim_order_without_deferrals_is_enqueue_order_and_scopes_still_filter() {
+    let s = setup("ai-claim-order-plain");
+    let a = s.enqueue(&key(JobKind::PhotoJudge, "judge", "1"), T0);
+    assert_eq!(a, Enqueued::Created);
+    s.enqueue(&embed("e1", "1"), T0 + 1);
+    s.enqueue(&embed("e2", "1"), T0 + 2);
+    // 種類の絞り込み: 先に積まれた PhotoJudge は対象外なら飛ばされる
+    let only_embed = s
+        .writer
+        .call(|c| claim_next(c, T0 + 5, "run", "t1", &[JobKind::ImageEmbedding]))
+        .unwrap()
+        .unwrap();
+    assert_eq!(only_embed.key.target_key, "e1");
+    assert_eq!(
+        s.claim(T0 + 5, "run", "t2").unwrap().key.target_key,
+        "judge"
+    );
+    assert_eq!(s.claim(T0 + 5, "run", "t3").unwrap().key.target_key, "e2");
+    assert!(s.claim(T0 + 5, "run", "t4").is_none());
+}
+
 // ---------------------------------------------------------------- 手動の再試行
 
 #[test]

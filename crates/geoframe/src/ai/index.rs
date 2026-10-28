@@ -587,6 +587,56 @@ fn scan_filtered(
     with_values: bool,
     sha: Option<&str>,
 ) -> rusqlite::Result<Vec<ShaState>> {
+    let (mut order, by_sha) = scan_members(conn, space, sha)?;
+    if let Some(identity) = space
+        && object_exists(conn, "table", "ai_embedding_vectors")?
+    {
+        let mut stmt = conn.prepare(
+            if sha.is_some() { "SELECT input_sha256, dimension, vector FROM ai_embedding_vectors WHERE space_id=?1 AND input_sha256=?2" }
+            else { "SELECT input_sha256, dimension, vector FROM ai_embedding_vectors WHERE space_id=?1" },
+        )?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(
+            std::iter::once(identity.space_id()).chain(sha),
+        ))?;
+        while let Some(row) = rows.next()? {
+            let sha: String = match row.get_ref(0)? {
+                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                _ => continue,
+            };
+            let Some(&i) = by_sha.get(&sha) else {
+                continue; // 今の対象でない（古い世代の SHA）。読まない
+            };
+            let state = &mut order[i];
+            // 次元の列・型・長さ・値は、検索と同じ検査（`space::decode` / `unit`）を通す
+            let checked = match (row.get_ref(1)?, row.get_ref(2)?) {
+                (ValueRef::Integer(dim), ValueRef::Blob(blob))
+                    if dim == i64::from(identity.dimension()) =>
+                {
+                    space::decode(identity, blob).and_then(|values| space::unit(identity, &values))
+                }
+                _ => Err(VectorError::Dimension),
+            };
+            match checked {
+                Ok(unit) => {
+                    state.has_vector = true;
+                    if with_values {
+                        state.unit = Some(unit);
+                    }
+                }
+                Err(_) => state.corrupt = true,
+            }
+        }
+    }
+    Ok(order)
+}
+
+/// 今の対象を `content_sha256` ごとにまとめ、`space` があれば現在の入力・処理版の失敗の理由を添える（ベクトルは
+/// 読まない）。[`scan_filtered`] の前半で、構築中の空間の進み具合（[`building_in`]）もこれだけを使う。
+fn scan_members(
+    conn: &Connection,
+    space: Option<&SpaceIdentity>,
+    sha: Option<&str>,
+) -> rusqlite::Result<(Vec<ShaState>, HashMap<String, usize>)> {
     // Targeted image-worker reads need members/result only. Failure classification is
     // performed once in bulk by full progress/activation scans, never once per SHA.
     let has_jobs = sha.is_none() && space.is_some() && object_exists(conn, "table", "ai_jobs")?;
@@ -652,46 +702,7 @@ fn scan_filtered(
                 .map(|s| reason_code(s));
         }
     }
-    if let Some(identity) = space
-        && object_exists(conn, "table", "ai_embedding_vectors")?
-    {
-        let mut stmt = conn.prepare(
-            if sha.is_some() { "SELECT input_sha256, dimension, vector FROM ai_embedding_vectors WHERE space_id=?1 AND input_sha256=?2" }
-            else { "SELECT input_sha256, dimension, vector FROM ai_embedding_vectors WHERE space_id=?1" },
-        )?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(
-            std::iter::once(identity.space_id()).chain(sha),
-        ))?;
-        while let Some(row) = rows.next()? {
-            let sha: String = match row.get_ref(0)? {
-                ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
-                _ => continue,
-            };
-            let Some(&i) = by_sha.get(&sha) else {
-                continue; // 今の対象でない（古い世代の SHA）。読まない
-            };
-            let state = &mut order[i];
-            // 次元の列・型・長さ・値は、検索と同じ検査（`space::decode` / `unit`）を通す
-            let checked = match (row.get_ref(1)?, row.get_ref(2)?) {
-                (ValueRef::Integer(dim), ValueRef::Blob(blob))
-                    if dim == i64::from(identity.dimension()) =>
-                {
-                    space::decode(identity, blob).and_then(|values| space::unit(identity, &values))
-                }
-                _ => Err(VectorError::Dimension),
-            };
-            match checked {
-                Ok(unit) => {
-                    state.has_vector = true;
-                    if with_values {
-                        state.unit = Some(unit);
-                    }
-                }
-                Err(_) => state.corrupt = true,
-            }
-        }
-    }
-    Ok(order)
+    Ok((order, by_sha))
 }
 
 // ---------------------------------------------------------------- 状態
@@ -885,4 +896,100 @@ pub fn progress(conn: &Connection, identity: &SpaceIdentity) -> rusqlite::Result
     let states = scan(&tx, Some(identity), false)?;
     tx.commit()?;
     Ok(Progress::from_states(&states))
+}
+
+// ---------------------------------------------------------------- 公開前の空間の進み具合
+
+/// 公開前の空間が今の条件でどうなるか（[`super::activation::try_activate`] と同じ規則。固定のコード）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PublishState {
+    /// 待ち（ベクトルが無く、現在の入力・処理版の `failed` でもない）が 1 件でもある。公開しない。
+    Waiting,
+    /// 待ちは無いが、保存済みが 0 件（全件失敗・対象 0）。公開しない。
+    NoVectors,
+    /// 待ちは無いが、成功率が閾値に届かない。公開しない（管理確認が要る）。
+    BelowThreshold,
+    /// 待ちが無く、成功率が閾値以上。次の切替の試みで公開される。
+    Ready,
+}
+
+impl PublishState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::NoVectors => "no_vectors",
+            Self::BelowThreshold => "below_threshold",
+            Self::Ready => "ready",
+        }
+    }
+}
+
+/// まだ検索に使われていない（`ai_active_space` が指さない）空間の構築の進み具合。件数と固定のコードだけで、
+/// 空間の ID・モデル・SHA は持たない。
+#[derive(Debug, Clone, PartialEq)]
+pub struct Building {
+    /// 今の対象に対する数。`indexed` は**ベクトルの行があるかだけ**を数える（BLOB は読まない。形・値の検査は
+    /// 公開時に行い、壊れた行はそこで待ちに戻る）。
+    pub progress: Progress,
+    /// 公開の成功率の閾値（[`DEFAULT_ACTIVATION_MIN_COVERAGE`]）。
+    pub min_coverage: f64,
+    /// `indexed / eligible`（対象 0 なら 0）。公開の分母は失敗を含む。
+    pub coverage: f64,
+    pub publish: PublishState,
+}
+
+/// 公開前の空間 `candidate`（設定が指す画像 Embedding の識別）の進み具合を読む（読み取りだけ。全 vector の BLOB は
+/// 読まず、ベクトルの有無は主キーの索引だけで数える）。次のときは `None`: 設定が無い・空間の表が無い・その空間が
+/// 未登録（登録済みの識別と違うものも）・既に `active` の空間。
+pub(super) fn building_in(
+    conn: &Connection,
+    candidate: Option<&SpaceIdentity>,
+    active: Option<&str>,
+) -> rusqlite::Result<Option<Building>> {
+    let Some(identity) = candidate.filter(|c| Some(c.space_id()) != active) else {
+        return Ok(None);
+    };
+    if !object_exists(conn, "table", "ai_embedding_spaces")?
+        || !object_exists(conn, "table", "ai_embedding_vectors")?
+    {
+        return Ok(None);
+    }
+    match load_space(conn, identity.space_id()) {
+        Ok(Some(registered)) if registered == *identity => {}
+        Ok(_) | Err(SpaceError::Corrupt) => return Ok(None),
+        Err(SpaceError::Db(e)) => return Err(e),
+        Err(_) => return Ok(None),
+    }
+    let (mut states, by_sha) = scan_members(conn, Some(identity), None)?;
+    let mut stmt =
+        conn.prepare("SELECT input_sha256 FROM ai_embedding_vectors WHERE space_id=?1")?;
+    let mut rows = stmt.query([identity.space_id()])?;
+    while let Some(row) = rows.next()? {
+        if let ValueRef::Text(t) = row.get_ref(0)?
+            && let Some(&i) = by_sha.get(String::from_utf8_lossy(t).as_ref())
+        {
+            states[i].has_vector = true;
+        }
+    }
+    let progress = Progress::from_states(&states);
+    let coverage = if progress.eligible > 0 {
+        progress.indexed as f64 / progress.eligible as f64
+    } else {
+        0.0
+    };
+    let publish = if progress.pending > 0 {
+        PublishState::Waiting
+    } else if progress.indexed == 0 {
+        PublishState::NoVectors
+    } else if coverage < DEFAULT_ACTIVATION_MIN_COVERAGE {
+        PublishState::BelowThreshold
+    } else {
+        PublishState::Ready
+    };
+    Ok(Some(Building {
+        progress,
+        min_coverage: DEFAULT_ACTIVATION_MIN_COVERAGE,
+        coverage,
+        publish,
+    }))
 }

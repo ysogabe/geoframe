@@ -37,6 +37,8 @@ Cacheはquery vectorだけのLRU64件。keyは全SpaceIdentityのSHA-256（space
 
 既存トップレベルkeyと型を維持する。新activeがあればphotos/eligible/pendingは `index::status_in` の検査済み実数。`failed_excluded` はpendingと分ける。旧参照時は世代適合する旧モデルのdistinct SHAをphotosへ返す。judged/recommended/groups/group_statusは現在の旧選別ビューの有効結果で数え、新空間だけで旧選別を解除しない。他モデル件数も旧参照時は有効世代、新active時は既存 `other_shas` の重複除去規則を使う。
 
+**公開前の空間の進み具合**（T4.7の受入の修正）: 設定が指す画像Embeddingの空間が登録済みでまだactiveでないとき（切替前の構築中。activeが別の空間で背景の再構築中のときも）だけ、`pipeline.building`を足す: `{eligible, indexed, pending, failed_excluded, failed_reasons{固定コード: 件数}, coverage（indexed/eligible, 4桁）, min_coverage（0.95）, publish: waiting|no_vectors|below_threshold|ready}`。既存の`pipeline.indexed`・`pending`などの型・意味は変えない（索引が無い間の`indexed 0`・`pending 全件`はそのまま）。読みは軽く、全vectorのBLOBは読まず主キーの被覆索引だけで有無を数える（形・値の検査は公開時）。詳細と規則は[ai-index.md](ai-index.md)。設定が無い・空間が未登録・既にactiveならキーを足さない。
+
 pipelineは `index_state`（no_tables/unset/unusable/active）、`query_compatible`、indexed/pending/failed_excluded/corrupt、固定理由別件数、選別件数だけ。生の `photo_ai_status` JSONはコピーしない。未構築・不適合をcompleteとは表示しない。space ID/SHA/URL/Provider自由文のreasonは出さず、未知のfailed理由は `other`。新空間のembedding_backendは固定契約ならlocal_http、その他の保存済み空間はactive_index。
 
 ## Schema・移行・dry-run
