@@ -1255,10 +1255,15 @@ print(json.dumps(dict(feed=len(feed), status=isinstance(status,dict), loaded=len
     let output = std::process::Command::new("python3")
         .args(["-I", "-c", &script])
         .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .env("GEOFRAME_DATA_DIR", dir.path())
         .output()
         .unwrap();
-    assert!(output.status.success(), "synthetic Python rollback failed");
+    assert!(
+        output.status.success(),
+        "synthetic Python rollback failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let text = String::from_utf8(output.stdout).unwrap();
     let result: Json = serde_json::from_str(text.lines().last().unwrap()).unwrap();
     assert_eq!(result["status"], true);
