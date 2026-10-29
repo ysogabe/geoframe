@@ -88,6 +88,8 @@
 
 永続停止（`ai_provider_pauses`）と一時待機（`ai_provider_waits`）は混同しない。永続停止は管理操作か関係する設定の変更まで続き、一時待機は`until`（60〜3600秒先）が過ぎれば消える。
 
+永続停止の**表示**: 停止の識別は接続先・認証（クラウドは認証ファイル・project・region）だけなので、同じ識別の用途（例: `photo_judge`と`location_suggest`）はまとめて止まる。表の行は停止を起こした用途しか持たないため、`ai-jobs status`の用途の行と管理STATUSの`ai_task_blocks`は、用途ごとに`pause::status`（送信側と同じ判定）で停止にかかっているかを引き直して、**止まっている全用途**と待ちのジョブの件数を出す（DBのスキーマ・ジョブの状態は変えない。ジョブは止まっている間`pending`／`deferred`のまま残り、claimの対象から外れる）。表を読めない用途は「確認できない」と出す（送信側は読めないとき送らない）。形は[ai-config.md](ai-config.md)の「管理操作」「管理画面のSTATUS」。
+
 ## 共有の一時待機（`ai::waits`・`worker`）
 
 - `RunError::ProviderWait(Wait{scope, reason, retry_after_secs})`。`scope`は`Entrance`（同じProviderの全用途）か`Service`（そのサービスを使う用途だけ）。

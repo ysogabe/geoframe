@@ -56,7 +56,12 @@ const MAX_AI_POLL_S: f64 = 86_400.0;
 pub const DEFAULT_EMBED_PER_CYCLE: u32 = 12;
 pub const DEFAULT_JUDGE_PER_CYCLE: u32 = 2;
 pub const DEFAULT_SEARCH_PER_MIN: u32 = 30;
-pub const DEFAULT_CLUE_PER_CYCLE: u32 = 60;
+/// `location_clue` の1周期の上限の既定。`config.py` は 60 だが、Rust のワーカーは1スレッドで用途を順に処理するので、
+/// 1件約12秒の判定が60件続いて（約12分）他の用途を止めないよう 10 件（約2分）にする。
+pub const DEFAULT_CLUE_PER_CYCLE: u32 = 10;
+/// 仕事が残っているときの次の周期までの待ち（`GEOFRAME_AI_BACKLOG_POLL_S`。Rust だけの項目）。
+pub const DEFAULT_AI_BACKLOG_POLL_S: f64 = 5.0;
+pub const MIN_AI_BACKLOG_POLL_S: f64 = 1.0;
 pub const DEFAULT_GEMINI_PER_CYCLE: u32 = 2;
 /// 検索語のクラウド Embedding の周期窓（`GEOFRAME_AI_SEARCH_PER_MIN` は毎分）。
 pub const QUERY_CYCLE_SECS: u32 = 60;
@@ -816,6 +821,9 @@ pub struct LegacyAi {
     pub enabled: bool,
     /// `GEOFRAME_AI_POLL_S`（秒。30 未満は 30 に切り上げる。既定 60）。
     pub poll_secs: f64,
+    /// `GEOFRAME_AI_BACKLOG_POLL_S`（Rust だけ。claim できる仕事が残って周期を終えたときの次の周期までの秒。
+    /// 1〜`poll_secs` に収める。不正な値は既定の 5）。
+    pub backlog_poll_secs: f64,
     /// `GEOFRAME_AI_EMBED_PER_CYCLE`（画像 Embedding。既定 12）。
     pub embed_per_cycle: u32,
     /// `GEOFRAME_AI_JUDGE_PER_CYCLE`（写真比較。既定 2）。
@@ -824,7 +832,7 @@ pub struct LegacyAi {
     pub search_per_min: u32,
     /// `GEOFRAME_LOC_SUGGEST`（`1` のときだけ。既定 `1`。`enabled` も要る）。
     pub loc_suggest: bool,
-    /// `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`（Decision の判定。既定 60）。
+    /// `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`（Decision の判定。Rust の既定は 10。`config.py` は 60）。
     pub clue_per_cycle: u32,
     /// `GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`（位置候補の Gemini。既定 2）。
     pub gemini_per_cycle: u32,
@@ -835,6 +843,7 @@ impl Default for LegacyAi {
         Self {
             enabled: true,
             poll_secs: DEFAULT_AI_POLL_S,
+            backlog_poll_secs: DEFAULT_AI_BACKLOG_POLL_S,
             embed_per_cycle: DEFAULT_EMBED_PER_CYCLE,
             judge_per_cycle: DEFAULT_JUDGE_PER_CYCLE,
             search_per_min: DEFAULT_SEARCH_PER_MIN,
@@ -867,9 +876,20 @@ impl LegacyAi {
                 .clamp(MIN_AI_POLL_S, MAX_AI_POLL_S),
             None => DEFAULT_AI_POLL_S,
         };
+        // Rust だけの項目。調整用の値なので、不正でも AI は無効にせず黙って既定へ戻す（値は残さない。ログの初期化は
+        // 設定の読み込みより後なので、ここで警告は出せない）。範囲は 1〜poll_secs
+        let backlog_poll_secs = match get("GEOFRAME_AI_BACKLOG_POLL_S") {
+            Some(raw) => match raw.trim().parse::<f64>() {
+                Ok(v) if v.is_finite() && v >= 0.0 => v,
+                _ => DEFAULT_AI_BACKLOG_POLL_S,
+            },
+            None => DEFAULT_AI_BACKLOG_POLL_S,
+        }
+        .clamp(MIN_AI_BACKLOG_POLL_S, poll_secs);
         Some(Self {
             enabled: flag("GEOFRAME_AI_ENABLED"),
             poll_secs,
+            backlog_poll_secs,
             embed_per_cycle: int(get, "GEOFRAME_AI_EMBED_PER_CYCLE", DEFAULT_EMBED_PER_CYCLE)?,
             judge_per_cycle: int(get, "GEOFRAME_AI_JUDGE_PER_CYCLE", DEFAULT_JUDGE_PER_CYCLE)?,
             search_per_min: int(get, "GEOFRAME_AI_SEARCH_PER_MIN", DEFAULT_SEARCH_PER_MIN)?,
@@ -890,6 +910,11 @@ impl LegacyAi {
     /// AI ワーカーの周期。
     pub fn poll(&self) -> Duration {
         Duration::from_secs_f64(self.poll_secs)
+    }
+
+    /// 仕事が残っているときの次の周期までの待ち。
+    pub fn backlog_poll(&self) -> Duration {
+        Duration::from_secs_f64(self.backlog_poll_secs)
     }
 
     /// 用途の 1 周期の上限と、その窓の長さ（秒）。検索語は毎分、そのほかはワーカーの周期。

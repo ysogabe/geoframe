@@ -180,6 +180,19 @@ function aiOpsCells(d){
       '設定を直して再起動するか、サービスを止めて geoframe ai-jobs release-pause --task <用途> で解除'));
     cells.push(c);
   }
+  /* ai_task_blocks: 停止にかかって送られていない用途（停止を起こした用途と、同じ認証・接続先を使う用途）。
+     {task, scope: provider|task, reason, waiting}。waiting はその用途の待ち（pending+deferred）の件数。 */
+  const blocks = d.ai_task_blocks;
+  if(blocks && blocks.length){
+    const c = cell('AI送信が止まっている用途', blocks.length, '件', 'bad');
+    blocks.forEach(b => {
+      c.appendChild(el('span', 'k',
+        b.task + ': ' + (b.scope === 'provider' ? 'Provider全体' : '用途') + 'の停止（' +
+        (AI_PAUSE_REASON[b.reason] || b.reason) + '）で ' + (Number(b.waiting) || 0) + ' 件が待ち'));
+    });
+    c.appendChild(el('span', 'k', '停止中は待ちのジョブを送りません。解除すると再開します'));
+    cells.push(c);
+  }
   return cells;
 }
 function loadStatus(){

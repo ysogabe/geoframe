@@ -55,4 +55,18 @@ assert.match(unidentified, /3 件|3\s*件/);
 const odd = render({ai_waits: {items: [{task: 't', scope: 'x', reason: 'y', until: 'bad'}]}});
 assert.match(odd, /期限 --/);
 
+// 停止にかかる用途: 用途名・範囲・理由の日本語・待ちの件数だけ。無ければ描かない
+const blocks = render({ai_task_blocks: [
+  {task: 'photo_judge', scope: 'provider', reason: 'forbidden', waiting: 2},
+  {task: 'location_suggest', scope: 'provider', reason: 'forbidden', waiting: 3},
+  {task: 'location_clue', scope: 'task', reason: 'model_not_found', waiting: 0},
+]});
+assert.match(blocks, /AI送信が止まっている用途/);
+assert.match(blocks, /photo_judge: Provider全体の停止（権限エラー（403））で 2 件が待ち/);
+assert.match(blocks, /location_suggest: Provider全体の停止（権限エラー（403））で 3 件が待ち/);
+assert.match(blocks, /location_clue: 用途の停止（モデルが無い（404））で 0 件が待ち/);
+assert.equal(render({ai_task_blocks: []}), '');
+const oddBlock = render({ai_task_blocks: [{task: 't', scope: 'x', reason: 'y', waiting: 'bad'}]});
+assert.match(oddBlock, /t: 用途の停止（y）で 0 件が待ち/);
+
 console.log('ok');

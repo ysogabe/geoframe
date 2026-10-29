@@ -90,6 +90,7 @@ fn without_ai_ops(mut body: Value) -> Value {
         "ai_config_invalid",
         "ai_jobs",
         "ai_pauses",
+        "ai_task_blocks",
         "ai_waits",
         "ai_scenes",
     ] {
@@ -176,6 +177,81 @@ async fn ai_jobs_and_pauses_appear_as_counts_and_fixed_reasons_when_the_tables_h
     );
     let text = body.to_string();
     assert!(!text.contains("SECRET"), "{text}");
+}
+
+/// Provider の停止は、停止を起こした用途だけでなく、同じ停止にかかる全用途を `ai_task_blocks` に出す
+/// （用途名・範囲・固定の理由・待ちの件数だけ）。`ai_pauses` の形は変わらない。停止が無ければキーを足さない。
+#[tokio::test]
+async fn a_provider_pause_lists_every_task_behind_it_with_waiting_counts_only() {
+    use geoframe::ai::pause::{PauseReason, pause};
+    use geoframe::ai::settings::{AiConfig, TaskKind};
+
+    let fixture = admin_fixture();
+    let cfg_dir = TempDir::new("admin-ai-blocks");
+    let path = cfg_dir.path().join("ai-secret-blocks.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,
+            "tasks":{
+              "photo_judge":{"provider":"cloud","model":"secret-model-j","allow_cloud":true,
+                "daily_request_limit":9,"credential_path":"/secret/cred-q7.json",
+                "project":"secret-project-q7","region":"secret-region-q7"},
+              "location_suggest":{"provider":"cloud","model":"secret-model-s","allow_cloud":true,
+                "daily_request_limit":9,"credential_path":"/secret/cred-q7.json",
+                "project":"secret-project-q7","region":"secret-region-q7"}}}"#,
+    )
+    .unwrap();
+    let path = path.to_str().unwrap().to_string();
+    let config = AiConfig::load(&|k| (k == "GEOFRAME_AI_CONFIG").then(|| path.clone()));
+    assert_eq!(config.invalid(), None);
+    let key = config
+        .settings()
+        .unwrap()
+        .provider_pause_key(TaskKind::LocationSuggest)
+        .unwrap();
+
+    let mut server = Server::start(&[("GEOFRAME_AI_CONFIG", &path)]).await;
+    geoframe::ai::migrate(&mut server.writer).unwrap();
+    let (_, body) = server.json("/api/admin/status").await;
+    assert!(body.get("ai_task_blocks").is_none(), "{body}");
+
+    server
+        .writer
+        .execute_batch(
+            "INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,
+                                 last_error_code,created_at,updated_at) VALUES
+               ('photo_judge','SECRET-T1','SECRET-H1','SECRET-P','pending','',1,1),
+               ('photo_judge','SECRET-T2','SECRET-H2','SECRET-P','deferred','provider_paused',1,1),
+               ('location_geocode','SECRET-T3','SECRET-H3','SECRET-P','deferred','',1,1),
+               ('location_suggest','SECRET-T4','SECRET-H4','SECRET-P','failed','interrupted',1,1)",
+        )
+        .unwrap();
+    pause(
+        &mut server.writer,
+        TaskKind::LocationSuggest,
+        &key,
+        PauseReason::Forbidden,
+        1,
+    )
+    .unwrap();
+    let (status, body) = server.json("/api/admin/status").await;
+    assert_eq!(status, 200);
+    assert_eq!(
+        body["ai_task_blocks"],
+        json!([
+            {"task": "photo_judge", "scope": "provider", "reason": "forbidden", "waiting": 2},
+            {"task": "location_suggest", "scope": "provider", "reason": "forbidden", "waiting": 1},
+        ])
+    );
+    assert_eq!(
+        body["ai_pauses"],
+        json!([{"task": "location_suggest", "scope": "provider", "reason": "forbidden"}])
+    );
+    assert_eq!(without_ai_ops(body.clone()), fixture["status"]["gemini"]);
+    let text = body.to_string();
+    for secret in ["SECRET", "secret-", "cred-q7", "ai-secret-blocks"] {
+        assert!(!text.contains(secret), "{secret}\n{text}");
+    }
 }
 
 /// 有効な共有の一時待機だけが、今の設定の用途に結び直されて固定の語と UTC の期限で出る。期限切れ・古い設定の待ちは

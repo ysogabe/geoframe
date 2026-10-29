@@ -551,6 +551,7 @@ fn start_ai(
         handlers,
         clock: Arc::clone(clock),
         poll: config.ai.legacy().poll(),
+        backlog_poll: config.ai.legacy().backlog_poll(),
         run_id: started.run_id,
     }))
 }
@@ -952,18 +953,33 @@ fn format_ai_report(report: &ops::Report) -> String {
         ops::ConfigState::Ready => "有効".to_string(),
     };
     let _ = writeln!(out, "AI 設定: {config}");
-    for (task, state) in &report.tasks {
-        match state {
-            Ok(()) => {
-                let _ = writeln!(out, "用途 {}: 使える", task.as_str());
+    for t in &report.tasks {
+        let name = t.task.as_str();
+        match (t.gate, t.pause) {
+            (Err(reason), _) => {
+                let _ = writeln!(out, "用途 {name}: 使えない（{}）", reason.as_str());
             }
-            Err(reason) => {
+            (Ok(()), ops::TaskPause::None) => {
+                let _ = writeln!(out, "用途 {name}: 使える");
+            }
+            (Ok(()), ops::TaskPause::Paused(p)) => {
+                let scope = match p.scope {
+                    crate::ai::pause::PauseScope::Provider => "Provider全体",
+                    crate::ai::pause::PauseScope::Task => "用途",
+                };
                 let _ = writeln!(
                     out,
-                    "用途 {}: 使えない（{}）",
-                    task.as_str(),
-                    reason.as_str()
+                    "用途 {name}: 使えない（停止中: {scope}・{}）",
+                    p.reason.as_str()
                 );
+                let _ = writeln!(
+                    out,
+                    "用途 {name} の待ち: {} 件（停止中のため送っていません）",
+                    t.waiting
+                );
+            }
+            (Ok(()), ops::TaskPause::Unknown) => {
+                let _ = writeln!(out, "用途 {name}: 使えない（停止の確認ができません）");
             }
         }
     }
@@ -1480,7 +1496,15 @@ mod tests {
             out.contains("停止中 provider location_clue: forbidden"),
             "{out}"
         );
-        assert!(out.contains("用途 location_clue: 使える"), "{out}");
+        // 設定では使えるが、Provider の停止中。停止を起こした用途そのもの（待ちのジョブは failed だけで 0 件）
+        assert!(
+            out.contains("用途 location_clue: 使えない（停止中: Provider全体・forbidden）"),
+            "{out}"
+        );
+        assert!(
+            out.contains("用途 location_clue の待ち: 0 件（停止中のため送っていません）"),
+            "{out}"
+        );
         assert!(
             out.contains("用途 photo_judge: 使えない（task_not_configured）"),
             "{out}"
@@ -1494,6 +1518,181 @@ mod tests {
         ] {
             assert!(!out.contains(secret), "{secret}\n{out}");
         }
+    }
+
+    /// 設定（クラウドの 2 用途が同じ認証・project・region、LAN の 2 用途が同じ入口）と、待ちのジョブを持つ DB を作る。
+    fn ai_status_fixture(tag: &str) -> (crate::testutil::TempDir, Config, crate::writer::Writer) {
+        use crate::ai::jobs::{JobKey, JobKind, enqueue};
+        use crate::testutil::TempDir;
+        use crate::writer::{OpenMode, Writer};
+
+        let dir = TempDir::new(tag);
+        let ai_json = dir.path().join("secret-ai-config.json");
+        std::fs::write(
+            &ai_json,
+            r#"{"version":1,"local_base_url":"http://192.0.2.55:9100",
+                "tasks":{
+                  "location_clue":{"provider":"local","model":"secret-model-clue"},
+                  "photo_judge":{"provider":"cloud","model":"secret-model-judge","allow_cloud":true,
+                    "daily_request_limit":10,"credential_path":"/secret/cred/path.json",
+                    "project":"secret-project-x","region":"secret-region-y"},
+                  "location_suggest":{"provider":"cloud","model":"secret-model-suggest","allow_cloud":true,
+                    "daily_request_limit":10,"credential_path":"/secret/cred/path.json",
+                    "project":"secret-project-x","region":"secret-region-y"}}}"#,
+        )
+        .unwrap();
+        let config = Config::load(
+            |k| (k == "GEOFRAME_AI_CONFIG").then(|| ai_json.to_str().unwrap().to_string()),
+            &Overrides {
+                listen: None,
+                data_dir: Some(dir.path().join("data")),
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let writer = Writer::open(&config.db_path(), OpenMode::CreateIfMissing).unwrap();
+        writer.call(crate::schema::migrate).unwrap();
+        writer.call(crate::ai::migrate).unwrap();
+        writer
+            .call(|c| {
+                for (kind, target, state) in [
+                    (JobKind::PhotoJudge, "a", "pending"),
+                    (JobKind::PhotoJudge, "b", "deferred"),
+                    (JobKind::LocationSuggest, "c", "pending"),
+                    (JobKind::LocationGeocode, "d", "deferred"),
+                    (JobKind::LocationSuggest, "e", "failed"),
+                    (JobKind::LocationClue, "f", "pending"),
+                ] {
+                    let k = JobKey::new(kind, target, "SECRET-HASH", "p");
+                    enqueue(c, &k, 100)?;
+                    c.execute(
+                        "UPDATE ai_jobs SET state=?2 WHERE target_key=?1",
+                        rusqlite::params![target, state],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        (dir, config, writer)
+    }
+
+    fn ai_status_output(config: &Config) -> String {
+        let read = crate::db::open_read_only(&config.db_path()).unwrap();
+        format_ai_report(&ops::report(&read, &config.ai).unwrap())
+    }
+
+    fn assert_no_secret(out: &str, dir: &crate::testutil::TempDir) {
+        for secret in [
+            "SECRET",
+            "192.0.2.55",
+            "secret-",
+            "/secret/cred",
+            "path.json",
+            "ai-config.json",
+            dir.path().to_str().unwrap(),
+        ] {
+            assert!(!out.contains(secret), "{secret}\n{out}");
+        }
+    }
+
+    /// 同じ認証・project・region の Provider 停止は、停止を起こした用途だけでなく、同じ停止にかかる全用途を
+    /// 「使えない（停止中）」と待ちの件数つきで出す。別の Provider の用途は変えない。
+    #[test]
+    fn a_provider_pause_shows_every_task_behind_it_with_the_waiting_counts() {
+        use crate::ai::pause::{self, PauseReason};
+        let (dir, config, writer) = ai_status_fixture("cli-ai-pause-provider");
+        let before = ai_status_output(&config);
+        assert!(before.contains("用途 photo_judge: 使える\n"), "{before}");
+        assert!(
+            before.contains("用途 location_suggest: 使える\n"),
+            "{before}"
+        );
+        assert!(!before.contains("の待ち:"), "{before}");
+        assert!(!before.contains("（停止中"), "{before}");
+
+        let settings = config.ai.settings().unwrap().clone();
+        writer
+            .call(move |c| {
+                let key = settings
+                    .provider_pause_key(TaskKind::LocationSuggest)
+                    .unwrap();
+                pause::pause(
+                    c,
+                    TaskKind::LocationSuggest,
+                    &key,
+                    PauseReason::Forbidden,
+                    100,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let out = ai_status_output(&config);
+        for line in [
+            "用途 photo_judge: 使えない（停止中: Provider全体・forbidden）",
+            "用途 photo_judge の待ち: 2 件（停止中のため送っていません）",
+            "用途 location_suggest: 使えない（停止中: Provider全体・forbidden）",
+            // location_geocode は location_suggest に数える。failed は待ちではない
+            "用途 location_suggest の待ち: 2 件（停止中のため送っていません）",
+            // 別の Provider（LAN）は止まらない
+            "用途 location_clue: 使える",
+            "停止中 provider location_suggest: forbidden",
+        ] {
+            assert!(out.contains(line), "{line}\n{out}");
+        }
+        assert!(!out.contains("用途 location_clue の待ち"), "{out}");
+        assert_no_secret(&out, &dir);
+    }
+
+    #[test]
+    fn a_task_pause_shows_only_that_task_and_a_broken_lookup_says_it_cannot_confirm() {
+        use crate::ai::pause::{self, PauseReason};
+        let (dir, config, writer) = ai_status_fixture("cli-ai-pause-task");
+        let settings = config.ai.settings().unwrap().clone();
+        writer
+            .call(move |c| {
+                let key = settings.task_pause_key(TaskKind::PhotoJudge).unwrap();
+                pause::pause(
+                    c,
+                    TaskKind::PhotoJudge,
+                    &key,
+                    PauseReason::ModelNotFound,
+                    100,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let out = ai_status_output(&config);
+        assert!(
+            out.contains("用途 photo_judge: 使えない（停止中: 用途・model_not_found）"),
+            "{out}"
+        );
+        assert!(
+            out.contains("用途 photo_judge の待ち: 2 件（停止中のため送っていません）"),
+            "{out}"
+        );
+        // 同じ認証の別の用途は止まらない
+        assert!(out.contains("用途 location_suggest: 使える\n"), "{out}");
+        assert_no_secret(&out, &dir);
+
+        // 識別で引けないとき（一覧は読める）は、確認できないと出す
+        writer
+            .call(|c| {
+                c.execute_batch(
+                    "DROP TABLE ai_provider_pauses;
+                     CREATE TABLE ai_provider_pauses(scope TEXT, task TEXT, reason TEXT, created_at INTEGER);",
+                )
+            })
+            .unwrap();
+        let out = ai_status_output(&config);
+        assert!(
+            out.contains("用途 photo_judge: 使えない（停止の確認ができません）"),
+            "{out}"
+        );
+        assert!(
+            out.contains("用途 location_clue: 使えない（停止の確認ができません）"),
+            "{out}"
+        );
+        assert_no_secret(&out, &dir);
     }
 
     /// 公開前の空間の進み具合は、件数と公開の条件（固定の文）だけを出す。無いときは何も出さない。

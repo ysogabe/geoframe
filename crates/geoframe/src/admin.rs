@@ -42,8 +42,8 @@ pub struct AdminContext {
     pub infer_windows_s: Vec<f64>,
     /// 管理画面の AI の件数が数える `embedding_model`。
     pub embed_model: &'static str,
-    /// AI の設定が不正なときの固定のコード（`ai_config_invalid`。値・パスは持たない）。
-    pub ai_config_invalid: Option<crate::ai::settings::AiConfigError>,
+    /// AI の設定（`ai_config_invalid`・`ai_task_blocks` を作る。応答にはコード・用途名・件数だけを出す）。
+    pub ai: crate::ai::settings::AiConfig,
     /// 今の AI 設定の用途ごとの待ちの識別（`ai_waits` を用途に結び直す。ハッシュはメモリの中だけで、応答には出さない）。
     pub ai_waits: crate::ai::waits::Identities,
     scene_config: Config,
@@ -55,7 +55,7 @@ impl AdminContext {
             deriv_dir: data_root.join("derivatives"),
             infer_windows_s: config.infer_windows_s(),
             embed_model: config.embed_backend.model(),
-            ai_config_invalid: config.ai.invalid(),
+            ai: config.ai.clone(),
             ai_waits: crate::ai::waits::Identities::from_config(&config.ai),
             scene_config: config.clone(),
         }
@@ -144,7 +144,7 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
     crate::ai::ops::insert_admin_status(
         &mut out,
         conn,
-        ctx.ai_config_invalid,
+        &ctx.ai,
         &ctx.ai_waits,
         crate::ai::jobs::unix_now(),
     );

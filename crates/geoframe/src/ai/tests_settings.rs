@@ -2,6 +2,7 @@
 //! 通信・認証ファイルの読み取りはしない。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::pause::PauseScope;
 use super::settings::*;
@@ -440,7 +441,10 @@ fn an_unset_config_disables_new_calls_and_changes_nothing_else() {
         ),
         (60.0, 12, 2, 30)
     );
-    assert_eq!((l.clue_per_cycle, l.gemini_per_cycle), (60, 2));
+    // Rust の既定: 位置の手がかりは 10 件（`config.py` は 60）。逐次のワーカーで 1 用途が他を長く止めないため
+    assert_eq!((l.clue_per_cycle, l.gemini_per_cycle), (10, 2));
+    assert_eq!(l.backlog_poll_secs, 5.0);
+    assert_eq!(l.backlog_poll(), Duration::from_secs(5));
     assert!(c.log_summary().contains("ai=unset"));
 }
 
@@ -609,6 +613,37 @@ fn legacy_env_values_map_to_cycle_limits() {
             .legacy()
             .loc_suggest
     );
+}
+
+#[test]
+fn the_backlog_poll_has_a_default_a_range_of_one_to_the_poll_and_falls_back_on_garbage() {
+    let backlog = |env: &[(&str, &str)]| env_config(env).legacy().backlog_poll_secs;
+    assert_eq!(backlog(&[]), 5.0);
+    assert_eq!(backlog(&[("GEOFRAME_AI_BACKLOG_POLL_S", "12.5")]), 12.5);
+    // 範囲は 1〜周期（POLL_S）。外れた数は端へ
+    assert_eq!(backlog(&[("GEOFRAME_AI_BACKLOG_POLL_S", "0")]), 1.0);
+    assert_eq!(backlog(&[("GEOFRAME_AI_BACKLOG_POLL_S", "0.2")]), 1.0);
+    assert_eq!(backlog(&[("GEOFRAME_AI_BACKLOG_POLL_S", "1")]), 1.0);
+    assert_eq!(backlog(&[("GEOFRAME_AI_BACKLOG_POLL_S", "999")]), 60.0);
+    assert_eq!(
+        backlog(&[
+            ("GEOFRAME_AI_POLL_S", "45"),
+            ("GEOFRAME_AI_BACKLOG_POLL_S", "999")
+        ]),
+        45.0
+    );
+    // 周期の最小は 30 秒なので、既定の 5 秒が周期を超えることは無い
+    assert_eq!(backlog(&[("GEOFRAME_AI_POLL_S", "1")]), 5.0);
+    // 不正な値（数でない・負・有限でない）は既定へ。AI の設定自体は無効にしない
+    for raw in ["abc", "-3", "nan", "inf", "", "5s"] {
+        let c = env_config(&[("GEOFRAME_AI_BACKLOG_POLL_S", raw)]);
+        assert_eq!(c.invalid(), None, "{raw}");
+        assert_eq!(c.legacy().backlog_poll_secs, 5.0, "{raw}");
+    }
+    // 周期の窓（クラウドの送信予算）は POLL_S のまま。短い待ちでは変わらない
+    let c = env_config(&[("GEOFRAME_AI_BACKLOG_POLL_S", "2")]);
+    assert_eq!(c.legacy().cycle(TaskKind::LocationSuggest), (2, 60));
+    assert_eq!(c.legacy().poll(), Duration::from_secs(60));
 }
 
 // ---------------------------------------------------------------- 送信の可否
