@@ -1640,12 +1640,54 @@ fn jobs_that_cannot_be_claimed_do_not_count_as_a_backlog() {
 }
 
 #[test]
-fn a_cloud_task_stopped_by_its_cycle_window_does_not_ask_for_the_short_wait() {
-    // photo_judge の 1 周期の上限（既定 2）は送信予算の窓で、待っても開かない
+fn a_cloud_kind_that_reserves_the_send_budget_does_not_ask_for_the_short_wait() {
+    // photo_judge の 1 周期の上限（既定 2）は送信枠の窓。送信枠に当たるたびの予約の失敗を繰り返さないよう、
+    // クラウドへ送る種類の残りは通常の周期で進める（この試験の Fake は予約を行わず、上限だけで止まる）
     let e = env("backlog-cloud");
     let judge = Fake::ok(JobKind::PhotoJudge).with_keys(&keys(JobKind::PhotoJudge, 5));
     assert!(!e.cycle_backlog(&[Arc::clone(&judge)], &StopFlag::new()));
     assert_eq!(judge.runs(), 2);
+}
+
+/// location_suggest をクラウドで許可した設定（送信枠あり。1 周期の上限は既定 2）。
+fn cloud_suggest_json() -> String {
+    variant(
+        r#""model": "example-suggest","#,
+        r#""model": "example-suggest", "allow_cloud": true, "daily_request_limit": 20,"#,
+    )
+}
+
+#[test]
+fn leftover_geocode_jobs_ask_for_the_short_wait_but_leftover_cloud_suggest_jobs_do_not() {
+    let stop = StopFlag::new();
+    let json = cloud_suggest_json();
+
+    // location_geocode は location_suggest の上限に数えるが送信枠を使わない: 上限で止まって残れば短い待ち
+    let e = env_with("backlog-geocode", &json, true);
+    assert!(
+        e.config
+            .ai
+            .gate(TaskKind::LocationSuggest, true)
+            .unwrap()
+            .budget
+            .is_some()
+    );
+    let geocode = Fake::ok(JobKind::LocationGeocode).with_keys(&keys(JobKind::LocationGeocode, 3));
+    assert!(e.cycle_backlog(&[Arc::clone(&geocode)], &stop));
+    assert_eq!(geocode.runs(), 2);
+
+    // 上限ちょうどで残りが無ければ通常の待ち
+    let e = env_with("backlog-geocode-exact", &json, true);
+    let geocode = Fake::ok(JobKind::LocationGeocode).with_keys(&keys(JobKind::LocationGeocode, 2));
+    assert!(!e.cycle_backlog(&[Arc::clone(&geocode)], &stop));
+    assert_eq!(geocode.runs(), 2);
+
+    // クラウドへ送る推定だけが残るときは通常の待ち
+    let e = env_with("backlog-suggest", &json, true);
+    let suggest = Fake::ok(JobKind::LocationSuggest).with_keys(&keys(JobKind::LocationSuggest, 4));
+    let geocode = Fake::ok(JobKind::LocationGeocode);
+    assert!(!e.cycle_backlog(&[Arc::clone(&suggest), Arc::clone(&geocode)], &stop));
+    assert_eq!((suggest.runs(), geocode.runs()), (2, 0));
 }
 
 #[test]

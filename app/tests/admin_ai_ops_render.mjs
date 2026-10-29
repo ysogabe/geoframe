@@ -69,4 +69,9 @@ assert.equal(render({ai_task_blocks: []}), '');
 const oddBlock = render({ai_task_blocks: [{task: 't', scope: 'x', reason: 'y', waiting: 'bad'}]});
 assert.match(oddBlock, /t: 用途の停止（y）で 0 件が待ち/);
 
+// 件数を集計できなかったとき（null）は 0 件と区別して「件数不明」。停止の情報は残る
+const unknownBlock = render({ai_task_blocks: [{task: 'photo_judge', scope: 'provider', reason: 'forbidden', waiting: null}]});
+assert.match(unknownBlock, /photo_judge: Provider全体の停止（権限エラー（403））で 待ちは件数不明/);
+assert.doesNotMatch(unknownBlock, /0 件/);
+
 console.log('ok');

@@ -202,6 +202,12 @@ pub fn task_for(kind: JobKind) -> TaskKind {
     }
 }
 
+/// その種類の `run` がクラウドの送信枠を予約するか（[`RunCtx::before_send`]）。`location_geocode` は座標化を
+/// Nominatim で行い、`before_probe` だけで送信枠を使わない。枠のない用途（LAN）では意味を持たない。
+fn reserves_send_budget(kind: JobKind) -> bool {
+    !matches!(kind, JobKind::LocationGeocode)
+}
+
 /// 背景ジョブの用途（`query_embedding` は対話用で含めない）。
 pub fn background_tasks(ai: &AiConfig, has_writer: bool) -> Vec<TaskKind> {
     ai.enabled_tasks(has_writer)
@@ -592,8 +598,10 @@ impl Core {
     }
 
     /// 1 周期の上限に達して止めた用途に、今 claim できるジョブが残っているか（[`Core::cycle`] の戻り値）。
-    /// 上限以外の理由で使えない用途（無効・停止・Provider 側の待ち・一時待機）と、クラウドの送信枠のある用途
-    /// （窓の上限は待っても開かない）は数えない。読めないときは `false`（空回りより通常の周期を選ぶ）。
+    /// 上限以外の理由で使えない用途（無効・停止・Provider 側の待ち・一時待機）は数えない。クラウドの送信枠のある
+    /// 用途では、**送信枠を予約する種類**（[`reserves_send_budget`]）の残りは数えない（送信枠に当たるたびの予約の失敗と
+    /// deferred を繰り返さないよう、通常の周期で進める。クラウドへの送信は速めない）。送信枠を使わない種類
+    /// （`location_geocode`）の残りは数える。読めないときは `false`（空回りより通常の周期を選ぶ）。
     fn has_backlog(&self, read: &Connection, processed: &HashMap<TaskKind, u32>) -> bool {
         if self.stop.is_stopped() {
             return false;
@@ -610,8 +618,7 @@ impl Core {
             let Ok(gate) = self.config.ai.gate(task, true) else {
                 return false;
             };
-            if gate.budget.is_some()
-                || processed.get(&task).copied().unwrap_or(0) < gate.cycle_limit
+            if processed.get(&task).copied().unwrap_or(0) < gate.cycle_limit
                 || !self.task_runnable(read, task, now)
             {
                 return false;
@@ -620,6 +627,7 @@ impl Core {
                 .handlers
                 .iter()
                 .filter(|h| task_for(h.kind()) == task)
+                .filter(|h| gate.budget.is_none() || !reserves_send_budget(h.kind()))
                 .map(|h| h.claim_scope())
                 .collect();
             jobs::has_claimable(read, now, &scopes).unwrap_or(false)

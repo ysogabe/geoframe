@@ -784,7 +784,7 @@ fn a_provider_pause_marks_every_task_behind_it_and_counts_their_waiting_jobs() {
         let t = task_report(&report, task);
         assert_eq!(
             (t.gate, t.pause, t.waiting),
-            (Ok(()), paused, waiting),
+            (Ok(()), paused, Some(waiting)),
             "{task:?}"
         );
     }
@@ -794,7 +794,7 @@ fn a_provider_pause_marks_every_task_behind_it_and_counts_their_waiting_jobs() {
         TaskKind::LocationClue,
     ] {
         let t = task_report(&report, task);
-        assert_eq!((t.pause, t.waiting), (TaskPause::None, 0), "{task:?}");
+        assert_eq!((t.pause, t.waiting), (TaskPause::None, Some(0)), "{task:?}");
     }
     // 既存の一覧は停止を起こした用途だけ
     assert_eq!(report.pauses.len(), 1);
@@ -851,7 +851,7 @@ fn a_task_pause_marks_only_that_task_and_a_task_not_usable_by_settings_is_not_li
                 scope: PauseScope::Task,
                 reason: PauseReason::ModelNotFound
             }),
-            1
+            Some(1)
         )
     );
     assert_eq!(
@@ -911,7 +911,7 @@ fn without_a_pause_nothing_is_marked_and_no_key_is_added() {
         report
             .tasks
             .iter()
-            .all(|t| t.pause == TaskPause::None && t.waiting == 0)
+            .all(|t| t.pause == TaskPause::None && t.waiting == Some(0))
     );
     let mut out = Map::new();
     ops::insert_admin_status(
@@ -942,7 +942,7 @@ fn a_pause_lookup_that_fails_is_reported_as_unknown_and_not_as_a_block() {
         let t = task_report(&report, task);
         assert_eq!(
             (t.gate, t.pause, t.waiting),
-            (Ok(()), TaskPause::Unknown, 0)
+            (Ok(()), TaskPause::Unknown, Some(0))
         );
     }
     // 確認できないものは「停止中」として出さない（送信側は読めないときも送らない）
@@ -955,4 +955,51 @@ fn a_pause_lookup_that_fails_is_reported_as_unknown_and_not_as_a_block() {
         T0,
     );
     assert!(out.get("ai_task_blocks").is_none(), "{out:?}");
+}
+
+#[test]
+fn a_job_count_that_cannot_be_read_leaves_the_pause_and_makes_the_waiting_count_unknown() {
+    let d = db("ops-blocks-counts-unreadable", Some(&suggest_allowed()));
+    d.pause_with(TaskKind::LocationSuggest, true, PauseReason::Forbidden);
+    // ジョブの表はあるが集計できない（列が違う）。表が無い旧 DB（0 件）とは区別する
+    d.writer
+        .call(|c| c.execute_batch("DROP TABLE ai_jobs; CREATE TABLE ai_jobs(x INTEGER);"))
+        .unwrap();
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        &d.config,
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
+    assert!(out.get("ai_jobs").is_none(), "{out:?}");
+    assert_eq!(
+        out.get("ai_task_blocks").unwrap(),
+        &serde_json::json!([
+            {"task": "photo_judge", "scope": "provider", "reason": "forbidden", "waiting": null},
+            {"task": "location_suggest", "scope": "provider", "reason": "forbidden", "waiting": null},
+        ])
+    );
+}
+
+#[test]
+fn a_missing_job_table_is_zero_waiting_not_unknown() {
+    let d = db("ops-blocks-no-job-table", Some(&suggest_allowed()));
+    d.pause_with(TaskKind::LocationSuggest, true, PauseReason::Forbidden);
+    d.writer
+        .call(|c| c.execute_batch("DROP TABLE ai_jobs;"))
+        .unwrap();
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        &d.config,
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
+    assert_eq!(
+        out.get("ai_task_blocks").unwrap()[0]["waiting"],
+        serde_json::json!(0)
+    );
 }

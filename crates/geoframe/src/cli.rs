@@ -972,11 +972,20 @@ fn format_ai_report(report: &ops::Report) -> String {
                     "用途 {name}: 使えない（停止中: {scope}・{}）",
                     p.reason.as_str()
                 );
-                let _ = writeln!(
-                    out,
-                    "用途 {name} の待ち: {} 件（停止中のため送っていません）",
-                    t.waiting
-                );
+                match t.waiting {
+                    Some(n) => {
+                        let _ = writeln!(
+                            out,
+                            "用途 {name} の待ち: {n} 件（停止中のため送っていません）"
+                        );
+                    }
+                    None => {
+                        let _ = writeln!(
+                            out,
+                            "用途 {name} の待ち: 件数を読めません（停止中のため送っていません）"
+                        );
+                    }
+                }
             }
             (Ok(()), ops::TaskPause::Unknown) => {
                 let _ = writeln!(out, "用途 {name}: 使えない（停止の確認ができません）");
@@ -1641,6 +1650,44 @@ mod tests {
         }
         assert!(!out.contains("用途 location_clue の待ち"), "{out}");
         assert_no_secret(&out, &dir);
+    }
+
+    /// ジョブの件数を集計できていないとき、停止の情報は残し、待ちは 0 件ではなく「件数を読めません」と出す。
+    #[test]
+    fn a_waiting_count_that_could_not_be_read_is_not_printed_as_zero() {
+        use crate::ai::pause::{self, PauseReason};
+        let (_dir, config, writer) = ai_status_fixture("cli-ai-pause-unknown-count");
+        let settings = config.ai.settings().unwrap().clone();
+        writer
+            .call(move |c| {
+                let key = settings.task_pause_key(TaskKind::PhotoJudge).unwrap();
+                pause::pause(
+                    c,
+                    TaskKind::PhotoJudge,
+                    &key,
+                    PauseReason::ModelNotFound,
+                    100,
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let read = crate::db::open_read_only(&config.db_path()).unwrap();
+        let mut report = ops::report(&read, &config.ai).unwrap();
+        for t in &mut report.tasks {
+            if matches!(t.pause, ops::TaskPause::Paused(_)) {
+                t.waiting = None;
+            }
+        }
+        let out = format_ai_report(&report);
+        assert!(
+            out.contains("用途 photo_judge: 使えない（停止中: 用途・model_not_found）"),
+            "{out}"
+        );
+        assert!(
+            out.contains("用途 photo_judge の待ち: 件数を読めません（停止中のため送っていません）"),
+            "{out}"
+        );
+        assert!(!out.contains("用途 photo_judge の待ち: 0 件"), "{out}");
     }
 
     #[test]

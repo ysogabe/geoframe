@@ -62,15 +62,16 @@ pub struct TaskReport {
     pub gate: Result<(), Disabled>,
     pub pause: TaskPause,
     /// 停止中のとき、その用途の待ちのジョブ（`pending`＋`deferred`。`location_geocode` は `location_suggest`
-    /// に数える）の件数。停止中でないときは 0。
-    pub waiting: i64,
+    /// に数える）の件数。停止中でないときは `Some(0)`。ジョブの件数を集計できなかったときは `None`（不明。
+    /// 0 件とは区別する。ジョブの表が無い旧 DB は集計できているので `Some(0)`）。
+    pub waiting: Option<i64>,
 }
 
-/// 用途ごとの状態を読む（読み取りだけ）。`counts` は [`jobs::status_counts`]。
+/// 用途ごとの状態を読む（読み取りだけ）。`counts` は [`jobs::status_counts`] で、集計できなかったときは `None`。
 fn task_reports(
     conn: &Connection,
     ai: &AiConfig,
-    counts: &[(JobKind, JobState, i64)],
+    counts: Option<&[(JobKind, JobState, i64)]>,
 ) -> Vec<TaskReport> {
     TaskKind::ALL
         .into_iter()
@@ -85,16 +86,18 @@ fn task_reports(
                 _ => TaskPause::None,
             };
             let waiting = if matches!(pause, TaskPause::Paused(_)) {
-                counts
-                    .iter()
-                    .filter(|(kind, state, _)| {
-                        task_for(*kind) == task
-                            && matches!(state, JobState::Pending | JobState::Deferred)
-                    })
-                    .map(|(_, _, n)| n)
-                    .sum()
+                counts.map(|counts| {
+                    counts
+                        .iter()
+                        .filter(|(kind, state, _)| {
+                            task_for(*kind) == task
+                                && matches!(state, JobState::Pending | JobState::Deferred)
+                        })
+                        .map(|(_, _, n)| n)
+                        .sum()
+                })
             } else {
-                0
+                Some(0)
             };
             TaskReport {
                 task,
@@ -156,7 +159,7 @@ pub fn report_at(conn: &Connection, ai: &AiConfig, now: i64) -> rusqlite::Result
     let job_counts = jobs::status_counts(conn)?;
     Ok(Report {
         config: config_state(ai),
-        tasks: task_reports(conn, ai, &job_counts),
+        tasks: task_reports(conn, ai, Some(&job_counts)),
         jobs: job_counts,
         reasons: reason_counts(conn)?,
         pauses: pause::list(conn)?,
@@ -209,7 +212,9 @@ fn reason_counts(conn: &Connection) -> rusqlite::Result<Vec<(JobState, &'static 
 /// - `ai_pauses`: `[{"task", "scope", "reason"}]`（Provider・用途の停止。解除は CLI）。
 /// - `ai_task_blocks`: `[{"task", "scope", "reason", "waiting"}]`（設定で使える用途のうち、Provider・用途の停止にかかって
 ///   送られていないもの。`ai_pauses` が停止を起こした用途だけなのに対し、同じ停止にかかる**全用途**。`scope` は
-///   `provider`／`task`、`waiting` はその用途の待ち＝`pending`＋`deferred` の件数）。停止にかかる用途が無ければ足さない。
+///   `provider`／`task`、`waiting` はその用途の待ち＝`pending`＋`deferred` の件数。
+///   ジョブの件数を集計できなかったときは `null`＝不明で、停止の情報（`task`・`scope`・`reason`〕は残す）。停止にかかる用途が無ければ
+///   足さない。
 /// - `ai_waits`: `{"items": [{"task", "scope": "entrance"|"service", "reason", "until": "YYYY-MM-DDTHH:MM:SSZ"}],
 ///   "unidentified": 件数}`（まだ有効な共有の一時待機。`items` は今の設定の用途に結び直したもので、`unidentified` は
 ///   設定が使えず結び直せない件数。どちらも空ならキーを足さない。`unidentified` は 0 なら出さない。接続先・モデル・
@@ -275,8 +280,8 @@ pub fn insert_admin_status(
             .collect();
         out.insert("ai_pauses".into(), Value::Array(list));
     }
-    // 停止にかかる全用途（待ちの件数が読めないときは 0 として出す）
-    let blocks: Vec<Value> = task_reports(conn, ai, counts.as_deref().unwrap_or_default())
+    // 停止にかかる全用途（待ちの件数が集計できないときは null＝不明）
+    let blocks: Vec<Value> = task_reports(conn, ai, counts.as_deref().ok())
         .into_iter()
         .filter_map(|t| match t.pause {
             TaskPause::Paused(p) => Some(json!({
