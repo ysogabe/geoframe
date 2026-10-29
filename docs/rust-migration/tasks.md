@@ -135,7 +135,7 @@ P3で守ること（各タスクの委任文に入れる）:
 | ID | 内容 | AC（P5-PRD） | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
 | T5.1 | ガードの見直し（印の検査を外しPython版の検査は残す、終了コード、rootと`catalog.db`が無いCLIの拒否）、`geoframe-rs.service`の見直し（置き場所・`After=`・設定のファイル・StartLimit・ReadOnlyPaths・制限）、`rust-deploy.sh --production`とその試験、`deploy-pull.sh`の拒否、`geoframe-admin.sh` | AC1, AC2 | - | full | 完了 | 859070f | feccb6b..7f737d4 | 実装Sonnet（feccb6b..2221433、修正7248346）。レビュー（Sol）2回: 必須2→0（`--production`で試験用の環境変数・確認先の上書きが効く→固定値＋`GEOFRAME_RS_*`があれば断る、件数の下限の桁で比較が壊れる→1〜9桁）。推奨（deploy-pullの状態の厳密な解析、server.mdの試験表、環境変数の拒否を1つずつ試す）を反映。設計からの外れ: 読み取りだけの`serve`もrootで断る、deploy-pullは状態を取れないときも断る。deployの試験3本をCIに追加。実systemdでの確認（制限一式・Conflicts/After・ホスト名の形）はT5.4 |
-| T5.2 | STATUSの`db.loc.clue_pending`をRustの判定の待ちを含む値に直す | AC8 | - | full | 実装中 | 96ca50b | | |
+| T5.2 | STATUSの`db.loc.clue_pending`をRustの判定の待ちを含む値に直す | AC8 | - | full | 完了 | 1f0bb79 | cdbbb5d..（下記） | 実装Sonnet（cdbbb5d、修正e77cd2b・3125954）。レビュー（Sol）3回: 必須1→1→0（総待ちをtimerの条件にしていた→`clue_runnable`・`clue_pause`を足しtimerが使う、fallbackの写真のA→B→Aで待ちが残る→保存行をすべて照合）。推奨（STATUSでファイルを読まない・30秒キャッシュ、起動後の一時的な0に停滞の猶予）を反映。見送り: 1写真に多数の世代がある場合の計測（回転・差し替えの回数は少なく、30秒キャッシュがある）、品質待ちと一時的な後回しを区別するキー（品質待ちだけが残ると約16分で終了コード1。文書に記載）。旧Pythonの判定済みDBでの確認はT5.4 |
 | T5.3 | 手順書`cutover.md`と`deploy/README.md` §7の本番向けの記述 | AC3〜AC6, AC9 | T5.1, T5.2 | full | 未着手 | | | |
 | T5.4 | 検証環境での演習（設計§演習の1〜9）と`p5-acceptance.md` | AC1〜AC5, AC8 | T5.3 | ops | 未着手 | | | |
 | T5.5 | 本番の切替（ユーザーの立ち会い）と記録 | AC6 | P5aのマージ | ops | 未着手 | | | |
