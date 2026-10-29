@@ -40,7 +40,6 @@
 - `app/tests/admin_ai_ops_render.mjs`（nodeで`admin.js`を試す）。
 - ルートの`README.md`にPythonの起動・設定・試験の手順がある。
 
-
 ## 方針
 
 ### ガード（R1）
@@ -137,7 +136,6 @@ unitの守り:
 
 STATUSの`db.loc.clue_pending`を、Rustの位置の手がかりのジョブの待ち（未処理・後回し中で、まだ判定を保存していない写真の数）を含む値にする。旧Pythonの`photo_loc_clues`だけで数える今の計算を、Rustの判定の保存結果も見る計算に直す。`loc_decision_morning.py`はこの値だけを見るので、直せば切替のあとも待ちを見落とさない。今はDecisionが常駐していてtimerは何もしないが、常駐をやめる運用に戻したときのために直す。
 
-
 ### Pythonへ戻す・切り替え直す（R5）
 
 戻す（AIは無効。既定は**DBを保ったまま**戻す）:
@@ -162,7 +160,7 @@ STATUSの`db.loc.clue_pending`を、Rustの位置の手がかりのジョブの�
   - 設定は本番と同じ3つのファイル（共通・`geoframe-rs`・`geoframe-py-rollback`）で置く。
   - 本番の配布の経路を通すため、演習のあいだだけ検証環境の印を退避し、`sudo deploy/rust-deploy.sh --production=<検証環境のホスト名> …`を、P5aのコミットにした`/opt/geoframe-pyref`のcheckoutからその機体で直接動かす（本番では`/opt/geoframe`。新しいバイナリは印を見ない）。
 - **データ**: 演習の前に検証環境の`/var/lib/geoframe`（P4の状態・`models/`を含む）を退避する。本番のバックアップ（検証環境が`deploy/backup-pull.sh`で回収しているもの）から作った新しいコピーを置く。`drive_key.json`とAIの鍵は入れない。`GEOFRAME_DRIVE_KEY`は存在しないパスにする（取り込みのサイクルはDriveへ出ずに失敗せず終わることを確かめる。実Driveの取り込みはT3.10で確認済み）。コピーを検証環境へ置く操作が分類器に止められたら、ユーザーに実行してもらう。
-- **AI**: ②で本番の役のPythonを動かすときは、P4の受入（[p4-acceptance.md](p4-acceptance.md) §7）と同じくAIを無効・鍵なしにする。Rustの演習のAI設定はローカルの用途だけ。
+- **AI**: 流れの2で本番の役のPythonを動かすときは、P4の受入（[p4-acceptance.md](p4-acceptance.md) §7）と同じくAIを無効・鍵なしにする。Rustの演習のAI設定はローカルの用途だけ。
 - **流れ**:
   1. 復元の演習（§復元。回転を1件してから古いバックアップへ戻し、画像の欠けを確かめる）。
   2. Pythonを本番の役で動かし、手順書のとおり（`--check-only`・保全・`--production`の配布を含む）にRustへ切り替える。停止時間を測る。
@@ -174,7 +172,7 @@ STATUSの`db.loc.clue_pending`を、Rustの位置の手がかりのジョブの�
   8. `Conflicts=`と`After=`の試験（手順とは別）: 両方をunmaskし、片方がactiveのまま他方を`systemctl start`する。両方の向きで、旧プロセスの終了の時刻と新しいプロセスの起動・最初の書き込みの時刻をjournalで比べる。終わったら通常のmaskの状態に戻す。`systemd-analyze security geoframe-rs`の結果を記録する。
   9. 元に戻す: 一時的なPython版のunitとdrop-inを消して`daemon-reload`、設定のファイルを消す、印を戻す、`/var/lib/geoframe`を退避から戻す、`geoframe-pyref.service`（8090）と`geoframe-rs.service`を演習の前の形に戻す、本番のコピーを消す。
 - 記録（`p5-acceptance.md`）には件数・ハッシュ・時間・固定の理由だけを書く。差分の中身（ファイル名・座標・地名）は作業用の置き場に残し、演習のあと消す。
-- 演習のバイナリを保管し、sha256を記録する。本番には同じものを入れる。
+- 演習のバイナリを保管し、sha256を記録する。本番には同じものを入れる。`p5-acceptance.md`には、演習のcommit（ブランチ）と、本番で`--expect-commit`に渡すP5aのマージのcommitの両方と、そのあいだの差が無いことの確認を記録する。
 
 ### unitの見直し（T5.1）
 
@@ -232,7 +230,7 @@ STATUSの`db.loc.clue_pending`を、Rustの位置の手がかりのジョブの�
 | AC5 | 演習の記録（戻したあとの手動の列・下書き・AIの通信なし・品質の2つの場合、切り替え直し、戻す時間） |
 | AC6 | 本番の切替の記録 |
 | AC7 | CI（RustのジョブにPythonの導入なし）、`crates`に`python`の起動が無いことの検査、埋め込みの表の前後比較 |
-| AC8 | `cargo test`（Rustの待ちがあるとき`clue_pending`が0でない）、演習の⑦ |
+| AC8 | `cargo test`（Rustの待ちがあるとき`clue_pending`が0でない）、演習の7 |
 | AC9 | 文書のレビュー |
 
 ## リスクと対策
@@ -249,7 +247,7 @@ STATUSの`db.loc.clue_pending`を、Rustの位置の手がかりのジョブの�
 | CLIが別のDATA_DIRを相手にする | `geoframe-admin.sh`で同じ設定のファイル、`catalog.db`が無ければ断る |
 | 戻すときの設定が切替の前のPythonを変える | drop-inはPythonを止めた後に置く |
 | Python版が`app/.env`で持つ値をRustが読まない | 準備で`/etc/default/geoframe-rs`へ移し、演習で同じ設定を使う |
-| Decisionの待ちを見落とす | `clue_pending`の計算を直す、演習の⑦、Decisionの常駐を確かめる |
+| Decisionの待ちを見落とす | `clue_pending`の計算を直す、演習の7、Decisionの常駐を確かめる |
 | 猶予期間のあとは数分で戻せない | 期間を決め、そのあいだは本番のcheckout・venv・unitを残す |
 | 撤去で配る画面が変わる | 埋め込みの表のパスと中身のハッシュを前後で比べる |
 
@@ -257,7 +255,7 @@ STATUSの`db.loc.clue_pending`を、Rustの位置の手がかりのジョブの�
 
 | ID | 内容 | 種類 | PR |
 | --- | --- | --- | --- |
-| T5.1 | ガードの見直し（印の検査を外し、Python版の検査は残す。終了コード・rootの拒否・`catalog.db`が無いCLIの拒否）、`geoframe-rs.service`の見直し（置き場所・`After=`・設定のファイル・`StartLimit`・`ReadOnlyPaths`・制限・記述）、`rust-deploy.sh --production`とその試験、`deploy-pull.sh`の拒否、`geoframe-admin.sh` | full | P5a |
+| T5.1 | ガードの見直し（印の検査を外し、Python版の検査は残す。終了コード・rootの拒否・`catalog.db`が無いCLIの拒否）、`geoframe-rs.service`の見直し（置き場所・`After=`・設定のファイル・`StartLimit`・`ReadOnlyPaths`・制限・記述）、`rust-deploy.sh --production`とその試験（rootで動くので、checkoutの`git`の検査は所有者で動かすか`safe.directory`を付けて「dubious ownership」で落ちないようにする）、`deploy-pull.sh`の拒否、`geoframe-admin.sh` | full | P5a |
 | T5.2 | STATUSの`db.loc.clue_pending`をRustの判定の待ちを含む値に直す | full | P5a |
 | T5.3 | 手順書`cutover.md`（準備・保全・復元・切替・確認・止める判断・AIの書き込み系の操作・戻す・切り替え直す・切替のあとの数日・クラウドAIの有効化・猶予期間とそのあとの片付け・猶予期間のあとの戻し）、`deploy/README.md` §7の本番向けの記述 | full | P5a |
 | T5.4 | 検証環境での演習（§演習の1〜9）と`p5-acceptance.md`。比較用Pythonの更新と、本番と同じ配置の一時的なPython版を含む | ops | P5a |
