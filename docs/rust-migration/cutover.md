@@ -1156,7 +1156,7 @@ curl -fsS $BASE/api/v1/photos -o "$WORK/py-feed-2.json"; python3 -I "$WORK/check
   - 画像の欠けが 0。管理画面が動く（ユーザーが確かめる）。
   - 報告は**不一致の件数だけ**（座標・パス・ファイル名を書かない）。
 - 品質（簡易品質）の切り戻し — [server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)。**比較の基準は Rust から戻す直前の値**（`rs-end-counts.txt`・`rs-end-quality.tsv`・止める前の一覧 `rs-end-feed.json`。切替の前の値ではない）。Python が再構築したかは `algorithm` で見分ける（`counts diff` の `algorithm:` の行。全行が `rust-phash-v1:…` のままなら再構築していない、全行が `poc-phash-v1:…` に変わっていれば再構築した）。次の**2つの場合を分けて**記録する:
-  1. **そのまま戻した直後**（Python がまだ再構築していない）: Python は前回の `photo_quality` を保つので、`counts diff` の `quality_rows`・`quality_groups`・`kind:` の行は基準と**同じ**（取り込みで `photos` が増えていても同じ。新しい写真は、解析が終わって再構築されるまで品質の行に入らない）。`algorithm` は `rust-phash-v1:…` のまま。`/api/v1/photos` の件数が、止める前の件数（`rs-end-feed.json`）から、§6.2 で記録した「既知の差」の件数（Python が再び隠す分）を引き、Python が取り込みで足した写真（`photos` の増えた分のうち表示できるもの）を足した数と一致する（既知の差も取り込みも 0 件なら同じ）。
+  1. **そのまま戻した直後**（Python がまだ再構築していない）: Python は前回の `photo_quality` を保つので、`counts diff` の `quality_rows`・`quality_groups`・`kind:` の行は基準と**同じ**（取り込みで `photos` が増えていても同じ。新しい写真は、解析が終わって再構築されるまで品質の行に入らない）。`algorithm` は `rust-phash-v1:…` のまま。`/api/v1/photos` の件数が、止める前の件数（`rs-end-feed.json`）から、§6.2 で記録した「既知の差」の件数（Python が再び隠す分）を引き、Python が取り込みで足した写真（`photos` の増えた分のうち表示できるもの。`py-feed-2.json` と `rs-end-feed.json` を `ids.py` と `comm -13` で突き合わせて数える）を足した数と一致する（既知の差も取り込みも 0 件なら同じ）。
   2. **再構築が走った後**（新しい写真が入る・何かで `dirty` になる）: Python は**今の特徴量の全体から作り直す**ので、写真が増減・更新していれば、件数・グループ数・`kind` が基準と違うのは正常。**不変を求めるのは、写真と特徴量が固定されているときだけ**。`quality_diff.py` の出力で次のとおり分けて確かめ、記録する:
      - **追加・削除・更新が 0 件**（`追加 0 削除 0 更新 0`。演習が `dirty` だけを立てる場合、または本番で取り込み・削除・更新が無かった場合）: `quality_rows`・`quality_groups`・`kind:` の件数は基準と**同じ**で、`quality_diff.py` が「**変わらない**」だけ（`追加・削除・更新に連なる変化 0`・`説明できない変化 0`。顔ぶれ・`kind` は変わらない）。変わりうるのは順位・推奨・スコア・`group_id` の振り直しと、完全重複のグループで表に出る写しの入れ替わりだけ（`quality_diff.py` は顔ぶれと `kind` だけを見るので、これらは差として出ない）。
      - **追加・削除・更新があった**（本番で取り込みを伴った場合）: 件数が基準と違ってよい。差を**追加・削除・更新の分と、それ以外に分ける**: ①`追加 a 削除 d 更新 u` を記録する（`photos` の増減と、同じ ID の `display`・`md5`・`mtime` の変化。回転も更新）。②`説明できない変化` が **0**（顔ぶれか `kind` が変わった群は、すべて追加・削除・更新した写真を含む群だけ。新しい写真が既存の群に入る・新しい群を作る・削除や更新で群が縮む／消える／分かれる、は説明できる）。③`quality_rows`・グループ数・`kind:` の「前→後」を記録する。0 でなければ失敗として扱う（ユーザーに件数だけ報告し、`quality_diff.py` の出力を記録する）。
@@ -1482,7 +1482,7 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 | --- | --- | --- | --- |
 | 1 | 復元の演習（回転を 1 件してから古いバックアップへ戻す） | §10 | 起動前の `integrity_check`・`.dump` の一致・所有者、起動後の画像の欠け。**§10.5 の画像の欠けの直し方を確定して書き込む**（確定するまで本番の切替に進まない） |
 | 2 | Python を本番の役で動かし、Rust へ切り替える | §1.5〜§1.10・§2〜§6（§7 は 1 つ実施） | `--check-only`・保全・`--production` の配布。T0〜T1（5 分以内）。`--wait-secs` の測定。`ai-jobs status` と書き込み系の操作を 1 つ（`ai-jobs retry`） |
-| 3 | シャドー比較 | §15.3 | `compare_with_python.py` の想定外の差 0 |
+| 3 | シャドー比較 | §15.3 | `compare_with_python.py` の `DIFF` がすべて §15.3 のキー単位の許容に当てはまる（`shadow_judge.py` が終了コード 0。許容外 0） |
 | 4 | Rust の期間の操作 | §15.4 | 手動の位置・お気に入り・除外・回転・下書きの保存を、それぞれ 1 件以上 |
 | 5 | 戻す（AI 無効） | §8 | ID ごとの状態・下書きの全ハッシュ・`.cache.json` が保たれる。AI の通信が出ない。品質の 2 つの場合（そのまま／`dirty` の再構築）の両方 |
 | 6 | 切り替え直す | §9 | 再び Rust で配信が戻る |
@@ -1524,39 +1524,10 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 
 - **実行する段**: 流れ 2（§2〜§6）が済み、配信が安定したあと、**流れ 4 の操作の前**（同じ時点の DB を 2 つの複製に分けるため）。
 - **別のコピーの置き方**: Rust と比較用 Python は、**同じ内容の別の複製**を使う（Python は書き込むので、同じ DB を Rust と共有しない）。①Rust を §7 の形で止める。②`sqlite3 .backup` で DB を 2 つの DATA_DIR（例: `/var/lib/geoframe-shadow-rs`・`/var/lib/geoframe-shadow-py`。`geoframe` 所有・`0750`）に取り、`derivatives/` はハードリンクで複製する（`cp -al`）。2 つの `.dump` の SHA-256 が一致することを確かめる。③Rust を Rust 用の複製で `GEOFRAME_INGEST` 無し（読み取り専用）・`127.0.0.1:8081`、比較用 Python を Python 用の複製で `GEOFRAME_AI_ENABLED=0`・`GEOFRAME_LOC_SUGGEST=0`・Drive の鍵なし・`127.0.0.1:8090` に、`systemd-run --uid=geoframe` の一時 unit で起動する。④流れ 2 で止めた本番役の Rust を起動し直す。
-- **実行と判定**:
+- **判定の補助スクリプト**（演習だけで使う。本番の §1.4 には置かない。先に作る）:
 
 ```sh
 cd "$WORK"
-python3 /opt/geoframe-pyref/tools/compare_with_python.py --rust http://127.0.0.1:8081 --python http://127.0.0.1:8090 | tee shadow-out.txt; echo "compare rc=${PIPESTATUS[0]}"
-# フィードの Rust だけの写真を、§6.2 と同じ extra.py で調べる（複製の DB は読み取り専用で開く。取り込みは 0 のはず）
-curl -fsS http://127.0.0.1:8081/api/v1/photos -o shadow-rs-feed.json && curl -fsS http://127.0.0.1:8090/api/v1/photos -o shadow-py-feed.json
-python3 -I ids.py shadow-rs-feed.json | LC_ALL=C sort > shadow-rs-ids.txt; python3 -I ids.py shadow-py-feed.json | LC_ALL=C sort > shadow-py-ids.txt
-comm -23 shadow-py-ids.txt shadow-rs-ids.txt | wc -l                       # Python だけ: 0
-comm -13 shadow-py-ids.txt shadow-rs-ids.txt > shadow-rs-only.txt
-python3 -I extra.py shadow-rs-feed.json shadow-rs-only.txt /var/lib/geoframe-shadow-rs/catalog.db shadow-unexplained.txt; echo "extra rc=$?"
-# STATUS の整数の値の差（許容は下の表）
-diff <(curl -fsS http://127.0.0.1:8081/api/admin/status | python3 -I status_counts.py) <(curl -fsS http://127.0.0.1:8090/api/admin/status | python3 -I status_counts.py)
-KNOWN=<extra.py の「既知の差」の件数>
-python3 -I shadow_judge.py shadow-out.txt "$KNOWN"; echo "judge rc=$?"
-```
-
-- **想定外の差 0 の判定**: `compare_with_python.py` は、意図した差があるかぎり終了コード 1 になる（出力の最後は `想定外の差 N 項目`）。合格にするのは、**`DIFF` の行がすべて下の表のキー単位の許容に当てはまり、`shadow_judge.py` が終了コード 0**のとき。表に無い `DIFF`・キーは 1 つでも想定外（件数だけの増減でほかの差を免除しない）。
-- **キー単位の許容**（`compare_with_python.py` の出力の形で書く。キーの表記は `key_paths` のもの）:
-
-| 節 | 許容する差（出力に出る形） | 条件と、件数の確かめ方 |
-| --- | --- | --- |
-| 1 フィード | `JSON が一致しない: Rust のみ K 件、Python のみ 0 件、共通 N 件のうち値の差 0 件、共通分の並びは同じ` の **1 行だけ**。`差のあるキー:` の行は **1 つも無い** | K は `extra.py` の「既知の差」の件数と**一致**し、「取り込み 0」「説明できない 0」（複製どうしの比較では取り込みは起きない。`hidden` の写真の再出現もここで拾う）。`Python のみ 0`・`値の差 0`・並びが同じが外れたら想定外 |
-| 2 STATUS | `ai_jobs(片方に無い)`・`ai_scenes(片方に無い)`（Rust だけの追加キー。[ai-config.md](ai-config.md)・[ai-scenes.md](ai-scenes.md)。AI の表があるときだけ出る） | `status_counts.py` は `db` の整数だけを見るので `diff` には出ない。判定は `shadow_judge.py` が出力のキー名で行う |
-| 2 STATUS | `db.ai.groups`・`db.ai.suppressed`（値の差。[p4-acceptance.md §7.3](p4-acceptance.md)。旧選別の世代切れ・代表が表示できない分を Rust は数えない） | `status_counts.py` の `diff` で、**Rust の値 ≤ Python の値**の向きだけ。ほかの `db.*` の行の差が出たら想定外。出なくてもよい |
-| 2 STATUS | `db.loc.clue_runnable(片方に無い)`・`db.loc.clue_pause(片方に無い)`（T5.2 の追加。Rust だけ） | 比較用の Rust は取り込みなし（`GEOFRAME_INGEST` 無し）なので**通常は出ない**。出たら取り込みを渡していないかを疑う。この 2 つの「片方に無い」だけを許し、`db.loc.clue_pending` の値の差は許さない（`diff` に出たら想定外） |
-| 3 管理写真 | `items[].scene(片方に無い)`（Rust だけの追加キー。場面の注記。[ai-scenes.md](ai-scenes.md)） | `状態コードが一致` の行が `OK`（状態コードの差が 0）。`差のあるキー:` の行が `items[].scene(片方に無い)` だけ（`… N 件` はそのキーのあるクエリの数。0 件で行が無くてもよい） |
-| 4 表示用画像 | なし | `OK` の行だけ |
-| 5 ページ・拒否・メソッド・Host | なし | `OK` の行だけ。例外は 1 つ: `Python と状態コード・本文が一致` の `DIFF` は、`Rust の埋め込みファイルがリポジトリの実ファイルとバイト一致` が `OK` で、差が比較用 Python の `app/` の版違いだけ（[p4-acceptance.md §7.2](p4-acceptance.md) の 12/14 が前例）と確かめたときだけ（`shadow_judge.py` は想定外として数えるので、人が確かめて記録する） |
-
-- 内訳（Rust だけの写真の件数 K・取り込み／既知の差／説明できない、STATUS の差のキー、管理写真の差の件数）を `p5-acceptance.md` に記録する。
-
-```sh
 cat > shadow_judge.py <<'PY'
 # 使い方: python3 -I shadow_judge.py <compare_with_python.py の出力> <extra.py の既知の差の件数>
 # 出力の DIFF の行とキーを、§15.3 の許容と照らす。出すのは件数とキー名だけ。許容外があれば終了コード 1。
@@ -1608,7 +1579,40 @@ for b in bad:
     print("  許容外 " + b)
 sys.exit(1 if bad else 0)
 PY
+chmod 0600 shadow_judge.py
 ```
+
+- **実行と判定**:
+
+```sh
+cd "$WORK"
+python3 /opt/geoframe-pyref/tools/compare_with_python.py --rust http://127.0.0.1:8081 --python http://127.0.0.1:8090 | tee shadow-out.txt; echo "compare rc=${PIPESTATUS[0]}"
+# フィードの Rust だけの写真を、§6.2 と同じ extra.py で調べる（複製の DB は読み取り専用で開く。取り込みは 0 のはず）
+curl -fsS http://127.0.0.1:8081/api/v1/photos -o shadow-rs-feed.json && curl -fsS http://127.0.0.1:8090/api/v1/photos -o shadow-py-feed.json
+python3 -I ids.py shadow-rs-feed.json | LC_ALL=C sort > shadow-rs-ids.txt; python3 -I ids.py shadow-py-feed.json | LC_ALL=C sort > shadow-py-ids.txt
+comm -23 shadow-py-ids.txt shadow-rs-ids.txt | wc -l                       # Python だけ: 0
+comm -13 shadow-py-ids.txt shadow-rs-ids.txt > shadow-rs-only.txt
+python3 -I extra.py shadow-rs-feed.json shadow-rs-only.txt /var/lib/geoframe-shadow-rs/catalog.db shadow-unexplained.txt; echo "extra rc=$?"
+# STATUS の整数の値の差（許容は下の表）
+diff <(curl -fsS http://127.0.0.1:8081/api/admin/status | python3 -I status_counts.py) <(curl -fsS http://127.0.0.1:8090/api/admin/status | python3 -I status_counts.py)
+KNOWN=<extra.py の「既知の差」の件数>
+python3 -I shadow_judge.py shadow-out.txt "$KNOWN"; echo "judge rc=$?"
+```
+
+- **想定外の差 0 の判定**: `compare_with_python.py` は、意図した差があるかぎり終了コード 1 になる（出力の最後は `想定外の差 N 項目`）。合格にするのは、**`DIFF` の行がすべて下の表のキー単位の許容に当てはまり、`shadow_judge.py` が終了コード 0**のとき。表に無い `DIFF`・キーは 1 つでも想定外（件数だけの増減でほかの差を免除しない）。
+- **キー単位の許容**（`compare_with_python.py` の出力の形で書く。キーの表記は `key_paths` のもの）:
+
+| 節 | 許容する差（出力に出る形） | 条件と、件数の確かめ方 |
+| --- | --- | --- |
+| 1 フィード | `JSON が一致しない: Rust のみ K 件、Python のみ 0 件、共通 N 件のうち値の差 0 件、共通分の並びは同じ` の **1 行だけ**。`差のあるキー:` の行は **1 つも無い** | K は `extra.py` の「既知の差」の件数と**一致**し、「取り込み 0」「説明できない 0」（複製どうしの比較では取り込みは起きない。`hidden` の写真の再出現もここで拾う）。`Python のみ 0`・`値の差 0`・並びが同じが外れたら想定外 |
+| 2 STATUS | `ai_jobs(片方に無い)`・`ai_scenes(片方に無い)`（Rust だけの追加キー。[ai-config.md](ai-config.md)・[ai-scenes.md](ai-scenes.md)。AI の表があるときだけ出る） | `status_counts.py` は `db` の整数だけを見るので `diff` には出ない。判定は `shadow_judge.py` が出力のキー名で行う |
+| 2 STATUS | `db.ai.groups`・`db.ai.suppressed`（値の差。[p4-acceptance.md §7.3](p4-acceptance.md)。旧選別の世代切れ・代表が表示できない分を Rust は数えない） | `status_counts.py` の `diff` で、**Rust の値 ≤ Python の値**の向きだけ。ほかの `db.*` の行の差が出たら想定外。出なくてもよい |
+| 2 STATUS | `db.loc.clue_runnable(片方に無い)`・`db.loc.clue_pause(片方に無い)`（T5.2 の追加。Rust だけ） | 比較用の Rust は取り込みなし（`GEOFRAME_INGEST` 無し）なので**通常は出ない**。出たら取り込みを渡していないかを疑う。この 2 つの「片方に無い」だけを許し、`db.loc.clue_pending` の値の差は許さない（`diff` に出たら想定外） |
+| 3 管理写真 | `items[].scene(片方に無い)`（Rust だけの追加キー。場面の注記。[ai-scenes.md](ai-scenes.md)） | `状態コードが一致` の行が `OK`（状態コードの差が 0）。`差のあるキー:` の行が `items[].scene(片方に無い)` だけ（`… N 件` はそのキーのあるクエリの数。0 件で行が無くてもよい） |
+| 4 表示用画像 | なし | `OK` の行だけ |
+| 5 ページ・拒否・メソッド・Host | なし | `OK` の行だけ。例外は 1 つ: `Python と状態コード・本文が一致` の `DIFF` は、`Rust の埋め込みファイルがリポジトリの実ファイルとバイト一致` が `OK` で、差が比較用 Python の `app/` の版違いだけ（[p4-acceptance.md §7.2](p4-acceptance.md) の 12/14 が前例）と確かめたときだけ（`shadow_judge.py` は想定外として数えるので、人が確かめて記録する） |
+
+- 内訳（Rust だけの写真の件数 K・取り込み／既知の差／説明できない、STATUS の差のキー、管理写真の差の件数）を `p5-acceptance.md` に記録する。
 
 - 終わったら一時 unit を止め、複製を消す（§15.6）。
 
@@ -1646,7 +1650,7 @@ pgrep -x sqlite3; echo "sqlite3 rc=$?"                                          
 ls -A /var/backups/geoframe | grep '^\.' || echo "一時ファイルなし"                              # .tmp-・.p5-copy. が残っていない
 ```
 
-   - `geoframe-pyref.service`（8090）など、演習の前から動いている通常のサービスは止めない（`pgrep -u geoframe -a` に出るのはその分だけ）。シャドー比較の複製（`/var/lib/geoframe-shadow-*`）は、一時 unit が `inactive` になったことで開いているものが無いと見る。**どれかが残っていれば先へ進まない**。
+   - `geoframe-pyref.service`（8090）など、演習の前から動いている通常のサービスは止めない（`/var/lib/geoframe-pyref` など**別の DATA_DIR** なので、`dbopen.sh`（`/var/lib/geoframe` だけを見る）には出ない。`pgrep -u geoframe -a` に出るのはその分だけ）。シャドー比較の複製（`/var/lib/geoframe-shadow-*`）は、一時 unit が `inactive` になったことで開いているものが無いと見る。**どれかが残っていれば先へ進まない**。
 
 2. **本番へ入れる演習済みのバイナリそのものを保管する**（`$WORK` を消す前。ビルドし直したものは別のバイト列になりうるので、**これを保管する**）:
 
