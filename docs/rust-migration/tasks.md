@@ -134,7 +134,7 @@ P3で守ること（各タスクの委任文に入れる）:
 
 | ID | 内容 | AC（P5-PRD） | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T5.1 | ガードの見直し（印の検査を外しPython版の検査は残す、終了コード、rootと`catalog.db`が無いCLIの拒否）、`geoframe-rs.service`の見直し（置き場所・`After=`・設定のファイル・StartLimit・ReadOnlyPaths・制限）、`rust-deploy.sh --production`とその試験、`deploy-pull.sh`の拒否、`geoframe-admin.sh` | AC1, AC2 | - | full | 未着手 | | | |
+| T5.1 | ガードの見直し（印の検査を外しPython版の検査は残す、終了コード、rootと`catalog.db`が無いCLIの拒否）、`geoframe-rs.service`の見直し（置き場所・`After=`・設定のファイル・StartLimit・ReadOnlyPaths・制限）、`rust-deploy.sh --production`とその試験、`deploy-pull.sh`の拒否、`geoframe-admin.sh` | AC1, AC2 | - | full | 実装中 | c8c3d6e | | |
 | T5.2 | STATUSの`db.loc.clue_pending`をRustの判定の待ちを含む値に直す | AC8 | - | full | 未着手 | | | |
 | T5.3 | 手順書`cutover.md`と`deploy/README.md` §7の本番向けの記述 | AC3〜AC6, AC9 | T5.1, T5.2 | full | 未着手 | | | |
 | T5.4 | 検証環境での演習（設計§演習の1〜9）と`p5-acceptance.md` | AC1〜AC5, AC8 | T5.3 | ops | 未着手 | | | |
