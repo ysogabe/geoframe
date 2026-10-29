@@ -3,21 +3,31 @@ Description=GEOFRAME server, Rust 版 (geoframe serve, http://localhost:8080/)
 Documentation=file:///opt/geoframe/deploy/README.md
 
 # Python 版（geoframe-server.service）と同じ理由で time-sync.target は待たない。
-# 時刻のずれは下記 Environment=TZ で別途担保する。
-After=network-online.target
+# 時刻のずれは /etc/default/geoframe-rs の TZ で別途担保する。
+#
+# After=geoframe-server.service は Conflicts= と対で、順序をそろえる。Conflicts= で相手の停止と自分の起動が
+# 同じ処理に入ったとき、systemd は順序の向きにかかわらず停止を起動より先に済ませる。これで、どちらの向きで
+# 起動しても、旧プロセスが終わってから新しいプロセスが起動する（geoframe-server.service が無い機体では何も起きない）。
+After=network-online.target geoframe-server.service
 Wants=network-online.target
 
-# P1〜P4 は検証環境専用で、本番の切替は P5（docs/rust-migration/plan.md）。
-# 本番機にはこの unit を入れない。Python 版と同じ待ち受けポート・データ置き場が既定なので、
-# 同じ機体で並走させるときは待ち受けとデータ置き場を分ける（deploy/README.md）。
+# 本体は /usr/local/lib/systemd/system/geoframe-rs.service に置く（deploy/rust-deploy.sh が入れる）。
+# /etc/systemd/system/ には、systemctl mask のリンク（/dev/null）と drop-in（*.service.d/）だけを置く:
+# mask は /etc/systemd/system/<unit> に /dev/null へのリンクを作るので、そこに本体のファイルがあると失敗する。
+# Python 版（geoframe-server.service）も同じ置き場所にする。両方を enable したまま再起動したときの衝突を、
+# 止める側を mask することで防ぐ（切替の手順は docs/rust-migration/cutover.md）。
 #
-# Conflicts= は検証環境だけの安全装置（この unit 自体が検証環境専用）。取り込みのガード
-# （docs/rust-migration/server.md §11.1.1）は Python が止まっていることを起動時に 1 回しか確かめない
-# ので、その後に geoframe-server.service が起動されても、Rust が書き込み続けて二重に書くことが
-# ないよう、systemd に「Python を起動したら Rust を止める（Rust を起動したら Python を止める）」
-# 関係を持たせる。geoframe-server.service が無い機体（検証環境）では何も起きない。
-# P5 の切替でこの行をどうするかは docs/rust-migration/plan.md P5 の「ガードを外す手順」の 5。
+# Conflicts=: Python 版が起動されたら Rust を止める（Rust を起動したら Python を止める）。取り込みのガード
+# （docs/rust-migration/server.md §11.1.1）は Python が止まっていることを起動時に 1 回しか確かめないので、
+# その後に geoframe-server.service が systemd 経由で起動されても、二重に書かないようにする。
 Conflicts=geoframe-server.service
+
+# Restart=on-failure の再起動の上限。ガードが Python 版の状態を取得できなかったとき（終了コード 1）は、
+# systemd がまだ使えない起動直後のような一時的な失敗かもしれないので 5 秒おきに再試行するが、取れない
+# 状態が続くなら 120 秒に 5 回で止める（DB が開けないなどの失敗の無限ループも同じ上限で止まる）。
+# 止まったあとは systemctl reset-failed geoframe-rs のあとで起動する。
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -33,26 +43,24 @@ ExecStart=/usr/local/bin/geoframe serve
 StateDirectory=geoframe
 StateDirectoryMode=0750
 
-# --- データルート ---
-Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe
-
-# Drive のサービスアカウント鍵（T2.4）。Python 版の unit と同じ場所。Rust は相対パスをカレント
-# ディレクトリ基準で読むので、unit で絶対パスを与える。鍵が無ければ Drive の段は通信せずに飛ばす。
-# GEOFRAME_INGEST が 0（既定）のときは、鍵があっても Drive には接続しない（段が動かない）。
-Environment=GEOFRAME_DRIVE_KEY=/var/lib/geoframe/drive_key.json
-
-# 撮影時刻はローカル時刻（naive）で比較・表示する。TZ 未設定（=UTC）だと 9 時間ずれる。
-# Rust 版は TZ を解釈せず libc の localtime に渡すだけなので、Python 版と同じく unit で
-# 明示する（docs/rust-migration/server.md §1.2）。
-Environment=TZ=Asia/Tokyo
-
-# 運用トグル。先頭の "-" はファイルが無くても起動失敗にしない指定。
-# Environment=/EnvironmentFile= は記載順に評価され後勝ちなので、上の Environment= より
-# 後に置く（/etc/default/geoframe で同名キーを指定すれば意図的に上書きできる）。
+# --- 設定 ---
+# データ置き場（GEOFRAME_DATA_DIR）・Drive の鍵のパス（GEOFRAME_DRIVE_KEY）・TZ・GEOFRAME_INGEST などの
+# Rust だけの値は、unit に書かず /etc/default/geoframe-rs に置く（0600 root:root。値は文書に書かない）。
+# 中身を読めるのは systemd（root）だけで、サービスと geoframe-admin.sh が同じファイルを読むので、unit と
+# すべての CLI が同じ DATA_DIR を指す。撮影時刻はローカル時刻（naive）で比較・表示するので、TZ が無い
+# （=UTC）と 9 時間ずれる。Rust 版は TZ を解釈せず libc の localtime に渡すだけなので、設定に必ず TZ を置く。
+#
+# 先頭の "-" はファイルが無くても起動失敗にしない指定。
+#   /etc/default/geoframe     … Python 版と共通の設定（無くてもよい）
+#   /etc/default/geoframe-rs  … Rust だけの設定。"-" 無し: 無ければ起動しない（誤った DATA_DIR で空の DB を作らない）
+# 優先順位: EnvironmentFile= は、unit の中で書いた順に関係なく Environment= に勝つ（この unit に
+# Environment= は無い）。EnvironmentFile= どうしは、指定した順に読み、同じ名前は後のものが勝つ。
+# だから geoframe-rs の値が共通のファイルの同名の値を上書きする（ただし同じ名前を両方に置かない）。
 # 待ち受けは --listen を書かず、GEOFRAME_HOST/GEOFRAME_PORT（既定 0.0.0.0:8080）で決まる。
 # Python 版と同じ機体で並走するときは、README の「Rust 版を Python 版と並走させる」の
 # drop-in で --listen を足す（--listen は GEOFRAME_HOST/GEOFRAME_PORT より優先される）。
 EnvironmentFile=-/etc/default/geoframe
+EnvironmentFile=/etc/default/geoframe-rs
 
 # 停止（SIGTERM）の全体は、受信から 60 秒の共通期限でHTTP・タイル掃除・同期・AI・キャッシュ保存・runtime の停止を
 # それぞれ残り時間で打ち切る（docs/rust-migration/server.md §22）。AI のワーカーの join は最大 10 秒。
@@ -80,6 +88,23 @@ SystemCallFilter=@system-service
 # Rust 版は C 拡張を動的に読み込まず JIT も使わないので、Python 版（Pillow のため付けられない）と
 # 違って付けられる。
 MemoryDenyWriteExecute=true
+# 特権（capability）は要らない（1024 以上のポートで待ち受け、自分のデータ置き場にだけ書く）。
+CapabilityBoundingSet=
+# AF_UNIX は Python 版の検査（systemctl show。systemd への D-Bus）に要る。AF_INET/AF_INET6 は HTTP と
+# 外向きの HTTPS。それ以外（AF_NETLINK など）は使わない。
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictSUIDSGID=true
+PrivateDevices=true
+SystemCallArchitectures=native
+# 作るファイル（catalog.db の -wal/-shm、.cache.json、derivatives/ など）は、所有者と geoframe グループだけが
+# 読める。geoframe-admin.sh も同じ UMask で動かす。
+UMask=0027
 
 # 書き込み可能にする範囲は、取り込み用の書き込み接続（writer。docs/rust-migration/server.md §11）が
 # 実際に書く分だけ。StateDirectory の中は書けるので、下で ReadOnlyPaths に挙げなかったものが書ける:
@@ -91,18 +116,19 @@ MemoryDenyWriteExecute=true
 #     ので、GEOFRAME_INGEST が 0 でも書く・消す（読み取り専用にする photos/ の下には無い）
 #   travel_blog/drafts/ … 旅行ブログの下書き（E15。一次データ）    blog_exports/ … 書き出し（E16。作業領域と退避先を含む）
 #     どちらも writer が動いているとき（GEOFRAME_INGEST=1）だけ書く。GEOFRAME_INGEST=0 の間は、保存・書き出しの
-#     要求は書かずに 503 を返す（P5 の切替まで、本番で下書きを書くのは Python 版。docs/rust-migration/server.md §21）
-# ただし GEOFRAME_INGEST=1 を設定しない限り（既定は 0）、writer は作られず、catalog.db・derivatives/ には
-# 何も書かない（上の tile_cache/ は除く）。P5 の切替まで本番の書き手は Python 版なので、
-# /etc/default/geoframe で明示するまで Rust は DB に書かない。
-# GEOFRAME_INGEST=1 でも、P5 までは検証環境の印（/etc/geoframe/staging）が無い、または geoframe-server が
-# 非稼働と確認できないと、書き込みの前に終了コード 2 で断る（docs/rust-migration/server.md §11.1.1）。
-# 終了コード 2 は下の RestartPreventExitStatus=2 により再起動ループにならない。
-# 引き続き読み取り専用にするもの（先頭の "-" は無いパスを無視する指定。ReadOnlyPaths は
+#     要求は書かずに 503 を返す（docs/rust-migration/server.md §21）
+# GEOFRAME_INGEST=1 を設定しない限り（既定は 0）、writer は作られず、catalog.db・derivatives/ には何も書かない
+# （上の tile_cache/ は除く）。Python 版と共通の /etc/default/geoframe をそのまま読んでも、Rust は DB に書かない。
+# GEOFRAME_INGEST=1 でも、root で実行している・Python 版（geoframe-server）が稼働中だと、書き込みの前に
+# 終了コード 2 で断る（状態を取得できないときは 1）（docs/rust-migration/server.md §11.1.1）。
+# 終了コード 2 は上の RestartPreventExitStatus=2 により再起動ループにならない。
+# 読み取り専用にするもの（先頭の "-" は無いパスを無視する指定。ReadOnlyPaths は
 # StateDirectory の書き込み許可より後に効く）:
 #   photos/ … ローカル原本。索引は読むだけ（T2.3 の --organize が動かすときに見直す）
+#   drive_key.json … Drive のサービスアカウント鍵（GEOFRAME_DRIVE_KEY の既定の置き場）。読むだけ
+#   models/ … ローカルのモデル（読むだけ。取り込みは書かない）
 # （旅行ブログの travel_blog/・blog_exports/ は T3.6 で外した。上のとおり取り込みが有効なときだけ書く）
-ReadOnlyPaths=-/var/lib/geoframe/photos
+ReadOnlyPaths=-/var/lib/geoframe/photos -/var/lib/geoframe/drive_key.json -/var/lib/geoframe/models
 # 注意: catalog.db を別の inode に置き換えた（mv で復元した）場合は、再起動するまで古い方を見続ける。
 # 復元後は必ず再起動する（docs/rust-migration/server.md §2.4）。
 

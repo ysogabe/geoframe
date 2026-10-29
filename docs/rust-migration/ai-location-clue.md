@@ -60,6 +60,23 @@ display が空なら、検証した drive_id の `derivatives/<id>.jpg` を既�
 
 `ai-jobs retry` はサービス停止後の既存 guard / ingest lock / writer を維持し、通信せず現入力・処理版・適合結果を検査する。fallback の retry は `prepare_retry` で writer 外にて実 SHA を観測し、writer 内ではその値と読み直した DB 世代を照合する。未投影の中断上限にも対応し、次周期の reconcile と送信直前にも実ファイルを再検査する。Requeue なら同じ世代の failed メタデータと対応する互換 failed 投影を同じ tx で無効にし、未判定へ戻す。succeeded・別世代・手動 GPS は消さない。再成功は正常 clue へ置き換える。実際の Python `_load_targets` / `passes` でも正常／failed 行の再利用と retry 後の未判定を試験する。
 
+## STATUSの`clue_pending`・`clue_runnable`・`clue_pause`
+
+`GET /api/admin/status` の `db.loc` は、**Rustが位置の手がかりを判定するとき**、次の3つを使う。管理画面の「手がかり判定待ち」は `clue_pending`、毎朝のDecisionのtimer `deploy/loc_decision_morning.py` は、起動の判断に `clue_runnable`（無ければ `clue_pending`）を、起動後の止め方に `clue_pending`・`clue_pause`・`clue_runnable` を読む（下の「timerの読み方」）。
+
+- `clue_pending`（総待ち）: 位置なしで撮影時刻が読める写真のうち、Rustの保存結果（`ai_location_clues`）が**今の入力の世代**（上の「世代・結果版」の入力のハッシュとDecisionのモデルの処理版）に合っていないものの数。ジョブが未登録・待ち・後回し・再試行待ちの写真と、品質の解析待ちの写真を含む。`photo_loc_clues`に旧Pythonの判定済みの行があっても数える（Rustは旧Pythonの行を信用しない）。保存済みの写真と、恒久失敗で`error`の行を保存した写真（`Failed`。判定済みで、再送もしない）は数えない。保存が済むと`photo_loc_clues`にも投影されるので、全部保存されれば0。
+- `clue_runnable`（timer用）: `clue_pending` のうち、**今Decisionが動けば進む**写真の数。次は数えない（Decisionを起動しても進まないため）: ①用途がProviderまたは用途の停止（`ai_provider_pauses`）にかかっているとき（全体を0にする。送信側・`ai-jobs status`と同じ `ops::task_pause`。停止の表を読めないときも0）、②品質の解析待ち・品質の解析に失敗した写真（画像を送らず後回し・恒久失敗になる）、③`ai_jobs`の `next_attempt_at` が先の後回し・再試行待ちだけの写真、④失敗の履歴（`failed`）だけで明示の再試行（`ai-jobs retry`）まで動かない写真。ジョブがまだ無い・期限が来ている・実行中の写真は数える。共有の一時待機（`ai_provider_waits`。Decisionが落ちているときの未到達を含む）と日・周期の上限は**見ない**（Decisionの未起動こそtimerが起こす理由で、待機は短いため）。
+- `clue_pause`: `clue_runnable` を0にした停止の理由の固定コード（`unauthorized`・`forbidden`・`model_not_found`・`contract_mismatch`、読めないときは `unknown`）。停止がなければ空文字。URL・モデル名・hashは出さない。停止は値に入れてキャッシュせず、毎回読む（`release-pause` がすぐ見える）。
+- 「Rustが判定するとき」: **設定上**、`GEOFRAME_INGEST=1`で`ai.gate(location_clue)`が通る＝AIが有効・Decisionの用途が設定済み・位置候補が有効（ワーカーのハンドラ登録の設定上の条件。LANクライアントの生成とデータ置き場を開けることまでは、STATUSは確かめない）。そうでないとき（AI未設定・設定の誤り・無効・用途なし・取り込み無効）は、Rustが減らすことのない値を出してtimerに待たせないよう、`clue_pending` は**従来の値**（旧Pythonの`photo_loc_clues`の世代一致で数えた未判定の数）のままにし、`clue_runnable`・`clue_pause` は**出さない**（timerは `clue_pending` を使う）。
+- 他のキー（`targets`・`clue_passed`・`days`・`days_with_clue`など）は旧Pythonの行から数える従来の値のまま。そのため、Rustが判定するときは `targets − clue_pending` は「旧Pythonの行で判定済み」の数とは一致しない。
+- 計算（`location_clue::wait_counts`）: **画像ファイルは開かない**（`lock_derivatives`も取らない）。1枚につき主キーでの数回の問い合わせで、画像の中身（BLOB）は読まない。`display`の無いfallbackの写真は、世代にファイルの実SHAが入っていて読まずには組み立てられないので、保存された行（`ai_location_clues`の世代ごとの行。`analyzed_at`の新しい順）それぞれの `source_sha256`（無ければ観測なし）で今のDBの入力から世代を組み直し、その行の `input_hash` と一致して、互換行（`photo_loc_clues`）との照合を含む判定が合う最初の行で判定済みとする。最新の1行だけでは足りない: 回転や差し替えを「A→B→A」と元へ戻すと、ワーカーは保存済みのAの結果を再利用して互換行へ投影し直すが、Aの `analyzed_at` は更新しないので、最新の行はBのままである。ファイルだけが変わった場合は、ワーカーが次の周期で観測して新しい世代のジョブを積むまでSTATUSは気づかない（現世代と違うジョブが `pending`／`running`／`deferred` で生きていれば待ちに戻す）。結果は**30秒キャッシュ**（Decisionのモデルごと。モデルが変われば使わない）し、再計算は同時に1つだけ（計算中の別の要求は終わりを待って値を使う）。千件の位置なし写真で約20〜30ms（release）。
+
+### timerの読み方（`loc_decision_morning.py`）
+
+- 起動前: `clue_runnable`（無ければ `clue_pending`）が0なら起動しない。
+- 起動後: 進み具合は総待ち `clue_pending` の減り方で追う。`clue_pending` が0なら止める。`clue_pause` が空でない（固定の停止。待っても進まない）ならすぐ止める。`clue_runnable` が一時的に0になっただけ（最後の1件が429などで後回し）で `clue_pending` が残り `clue_pause` が空なら、Decision を動かしたまま待つ。総待ちが15分（`STALL_S`）減らなければ止める（終了コード1）。2時間の上限・GPUの判定は従来どおり。`clue_runnable` が無い（旧Pythonなど）ときは `clue_pending` だけで見る。
+- 補足: 品質の解析待ちなど、Decisionでは進められない待ちだけが残ったときも `clue_runnable` は0になるため、その分は猶予のあいだ待ってから止まる（停滞の判定は「15分を超えて減らない」で、確認は60秒ごとなので、実際には約16分）。このときの終了コードは1で、timerのサービスは失敗として記録される（Decisionは`finally`で止め、自動の再起動は無い）。正常な待ちでも失敗の記録になりうるのは既知の制約で、品質の待ちと一時的な後回しを区別するSTATUSのキーは足していない（P5のT5.2で見送り）。
+
 ## 画像境界と停止
 
 `imaging::lock_derivatives` の中で、DataDir の読み取り用検査を通して通常ファイルを上限付きで読み切る。DB の traversal・絶対パス・リンク（親／末尾、内部向きも拒否）・FIFO・ディレクトリを拒否する。open は O_NOFOLLOW / O_NONBLOCK、fd の実体も `/proc/self/fd` から DATA_DIR 内と確認してから読む。既存 DataDir や他 reader は変更しない。削除用 derivative_file を読み取りの根拠にしない。

@@ -3,12 +3,14 @@
 //! - `sync --dry-run` は何も書かない（DB・キャッシュ・`tmp/`・ロックのファイル）。
 //! - `GEOFRAME_INGEST` が無いと、`sync` も `serve` も書かない（既定は無効）。
 //! - `GEOFRAME_INGEST=1` なら、DB が無くても作って 1 サイクル回し、`serve` はそのまま常駐する。
-//! - 本番への誤指定の防止（`guard.rs`）: 検証環境の印が無い・Python が非稼働と確認できないときは、
-//!   書き込みの前に終了コード 2 で断り、置き場を一切変えない。
+//! - 書き込みの前の守り（`guard.rs`）: Python 版が稼働中・root での実行は、書き込みの前に終了コード 2 で
+//!   断り、置き場を一切変えない。Python 版の状態を取得できないときは終了コード 1。書き込み系の CLI は、
+//!   DATA_DIR に `catalog.db` が無ければ作らずに終了コード 2。
 //!
-//! 取り込みを有効にして動かすテストは、デバッグビルドだけにある差し替え（`GEOFRAME_TEST_STAGING_MARKER`・
-//! `GEOFRAME_TEST_PYTHON_STATE`）で、印と Python の状態を与える。この機体は本番機で、本物の印は無く
-//! `geoframe-server` が動いているので、差し替えなしでは取り込みのテストは全て断られる。
+//! 取り込みを有効にして動かすテストは、デバッグビルドだけにある差し替え（`GEOFRAME_TEST_PYTHON_STATE`・
+//! `GEOFRAME_TEST_EUID`）で、Python の状態と実効 UID を与える。この機体は本番機で `geoframe-server` が
+//! 動いており、root で `cargo test` を回すこともありうるので、差し替えなしでは結果が機体に左右される。
+//! 実行するバイナリには、差し替えなしで書き込みの経路に入る呼び出しを残さない。
 
 use std::fs;
 use std::io::{Read, Write};
@@ -40,36 +42,28 @@ impl Drop for Dir {
     }
 }
 
-/// 検証環境の印（置き場の外の別ディレクトリに作る）。取り込みを動かすテストに渡す環境変数を返す。
-struct Staging {
+/// 取り込みを動かすテストに渡す環境変数。置き場の外の別ディレクトリに、存在しない鍵のパスを置く。
+struct IngestEnv {
     _dir: Dir,
-    marker: PathBuf,
+    no_key: PathBuf,
 }
 
-impl Staging {
+impl IngestEnv {
     fn new(tag: &str) -> Self {
-        let dir = Dir::new(&format!("{tag}-staging"));
-        let marker = dir.0.join("staging");
-        fs::write(&marker, b"").unwrap();
-        Self { _dir: dir, marker }
+        let dir = Dir::new(&format!("{tag}-ingest-env"));
+        let no_key = dir.0.join("no_such_drive_key.json");
+        Self { _dir: dir, no_key }
     }
 
-    /// 印があり、Python が未導入（`LoadState=not-found`）の環境。
+    /// root ではなく（実効 UID 1000）、Python が未導入（`LoadState=not-found`）の環境。
     fn envs(&self) -> Vec<(&'static str, String)> {
         vec![
-            (
-                "GEOFRAME_TEST_STAGING_MARKER",
-                self.marker.to_str().unwrap().to_string(),
-            ),
+            ("GEOFRAME_TEST_EUID", "1000".into()),
             ("GEOFRAME_TEST_PYTHON_STATE", "not-found/inactive".into()),
             // 鍵は無い（置き場の外の、存在しないパス）。Drive の段は通信せずに飛ばす
             (
                 "GEOFRAME_DRIVE_KEY",
-                self.marker
-                    .with_file_name("no_such_drive_key.json")
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
+                self.no_key.to_str().unwrap().to_string(),
             ),
         ]
     }
@@ -127,6 +121,7 @@ fn run(args: &[&str], envs: &[(&str, &str)]) -> Output {
     Command::new(BIN)
         .args(args)
         .env_clear()
+        .env("GEOFRAME_TEST_EUID", "1000")
         .envs(envs.iter().copied())
         .output()
         .unwrap()
@@ -136,6 +131,7 @@ fn run_owned(args: &[&str], envs: &[(&str, String)]) -> Output {
     Command::new(BIN)
         .args(args)
         .env_clear()
+        .env("GEOFRAME_TEST_EUID", "1000")
         .envs(envs.iter().map(|(k, v)| (*k, v.as_str())))
         .output()
         .unwrap()
@@ -275,10 +271,14 @@ fn sync_without_ingest_refuses_and_writes_nothing() {
 }
 
 #[test]
-fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
+fn sync_with_ingest_creates_the_schema_in_an_empty_database_file_and_runs_one_cycle() {
     let dir = Dir::new("ingest");
-    let staging = Staging::new("ingest");
+    let staging = IngestEnv::new("ingest");
     let data = dir.0.join("new-data");
+    // 書き込み系の CLI は DB を作らない。空のファイル（SQLite は空のファイルを空の DB として開く）なら、
+    // スキーマを作って 1 サイクル回す
+    fs::create_dir_all(&data).unwrap();
+    fs::write(data.join("catalog.db"), b"").unwrap();
     let mut envs = staging.envs();
     envs.push(("GEOFRAME_INGEST", "1".into()));
     let out = run_owned(&["sync", "--data-dir", data.to_str().unwrap()], &envs);
@@ -306,11 +306,6 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
         stdout.contains("写真: 表示可能 0 / 取得待ち 0 / 全0"),
         "{stdout}"
     );
-    // 作ったことは warn で知らせる
-    assert!(
-        stdout.contains("DB が無かったので新しく作ります"),
-        "{stdout}"
-    );
     let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
     let tables: i64 = conn
         .query_row(
@@ -326,7 +321,7 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
 #[test]
 fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     let dir = Dir::new("ingest-prod");
-    let staging = Staging::new("ingest-prod");
+    let staging = IngestEnv::new("ingest-prod");
     production_shaped_db(&dir.0);
     let mut envs = staging.envs();
     envs.push(("GEOFRAME_INGEST", "1".into()));
@@ -388,7 +383,7 @@ fn get(port: u16, path: &str) -> Option<String> {
     Some(body)
 }
 
-fn serve(data: &Path, port: u16, ingest: Option<(&str, &Staging)>) -> Child {
+fn serve(data: &Path, port: u16, ingest: Option<(&str, &IngestEnv)>) -> Child {
     serve_with_env(data, port, ingest, &[])
 }
 
@@ -396,7 +391,7 @@ fn serve(data: &Path, port: u16, ingest: Option<(&str, &Staging)>) -> Child {
 fn serve_with_env(
     data: &Path,
     port: u16,
-    ingest: Option<(&str, &Staging)>,
+    ingest: Option<(&str, &IngestEnv)>,
     extra: &[(&str, &str)],
 ) -> Child {
     let mut command = Command::new(BIN);
@@ -404,6 +399,7 @@ fn serve_with_env(
         .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
         .args(["--data-dir", data.to_str().unwrap()])
         .env_clear()
+        .env("GEOFRAME_TEST_EUID", "1000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some((value, staging)) = ingest {
@@ -543,6 +539,7 @@ fn serve_without_ingest_still_prunes_the_tile_cache_at_start_and_stops_cleanly()
         .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
         .args(["--data-dir", dir.0.to_str().unwrap()])
         .env_clear()
+        .env("GEOFRAME_TEST_EUID", "1000")
         .env("GEOFRAME_TILE_CACHE_MAX_MB", "1")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -586,7 +583,7 @@ fn serve_with_ingest_creates_the_database_runs_the_cycle_and_stops_cleanly() {
     let dir = Dir::new("serve-ingest");
     let data = dir.0.join("new-data");
     let port = free_port();
-    let staging = Staging::new("serve-ingest");
+    let staging = IngestEnv::new("serve-ingest");
     let mut child = serve(&data, port, Some(("1", &staging)));
     wait_healthy(&mut child, port);
     // 起動直後の 1 サイクルが回るのを待つ（ログは標準出力。終了後にまとめて見る）
@@ -696,7 +693,7 @@ fn serve_with_a_broken_ai_config_still_serves_health_and_the_feed() {
 fn serve_with_ingest_adds_the_ai_tables_once_and_never_needs_the_network_or_credentials() {
     let dir = Dir::new("serve-ai-ingest");
     let data = dir.0.join("data");
-    let staging = Staging::new("serve-ai-ingest");
+    let staging = IngestEnv::new("serve-ai-ingest");
     let valid = dir.0.join("ai-valid.json");
     fs::write(
         &valid,
@@ -771,7 +768,7 @@ fn a_second_ingest_process_on_the_same_data_dir_is_refused() {
     let dir = Dir::new("serve-lock");
     let data = dir.0.join("d");
     let port = free_port();
-    let staging = Staging::new("serve-lock");
+    let staging = IngestEnv::new("serve-lock");
     let mut child = serve(&data, port, Some(("1", &staging)));
     wait_healthy(&mut child, port);
     let mut envs = staging.envs();
@@ -829,7 +826,7 @@ fn ai_jobs_status_is_read_only_prints_only_counts_and_works_on_a_database_withou
     let dir = Dir::new("aijobs-status-old");
     production_shaped_db(&dir.0);
     let before = snapshot(&dir.0);
-    // 検証環境の印も INGEST も要らない（読み取りだけ）
+    // INGEST も、Python 版の非稼働も要らない（読み取りだけ）
     let out = run(
         &["ai-jobs", "status", "--data-dir", dir.0.to_str().unwrap()],
         &[],
@@ -895,16 +892,19 @@ fn ai_jobs_writes_need_ingest_the_guard_and_a_stopped_service() {
         let out = run(args, &[("GEOFRAME_INGEST", "0")]);
         assert_eq!(out.status.code(), Some(2));
     }
-    // INGEST=1 でも、検証環境の印が無ければ書く前に断る → 2
+    // INGEST=1 でも、Python 版が稼働中なら書く前に断る → 2
     let out = run(
         &["ai-jobs", "retry", "--all", "--data-dir", arg],
-        &[("GEOFRAME_INGEST", "1")],
+        &[
+            ("GEOFRAME_INGEST", "1"),
+            ("GEOFRAME_TEST_PYTHON_STATE", "loaded/active"),
+        ],
     );
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_untouched_after_refusal(&data, &before);
 
-    // 稼働中の serve（ロックを持つ）があるときは、印があっても断る → 1。ジョブも停止も変わらない
-    let staging = Staging::new("aijobs-guard");
+    // 稼働中の serve（ロックを持つ）があるときは、ガードを通っても断る → 1。ジョブも停止も変わらない
+    let staging = IngestEnv::new("aijobs-guard");
     let port = free_port();
     let mut child = serve(&data, port, Some(("1", &staging)));
     wait_healthy(&mut child, port);
@@ -942,7 +942,7 @@ fn ai_jobs_writes_need_ingest_the_guard_and_a_stopped_service() {
 fn ai_jobs_retry_keeps_what_it_cannot_check_and_release_pause_removes_the_stops() {
     let dir = Dir::new("aijobs-write");
     let data = data_with_ai_rows(&dir);
-    let staging = Staging::new("aijobs-write");
+    let staging = IngestEnv::new("aijobs-write");
     let mut envs = staging.envs();
     envs.push(("GEOFRAME_INGEST", "1".into()));
     let arg = data.to_str().unwrap();
@@ -1003,7 +1003,7 @@ fn ai_jobs_retry_keeps_what_it_cannot_check_and_release_pause_removes_the_stops(
 fn serve_with_ingest_and_a_valid_ai_config_records_its_run_and_the_stop_and_exits_cleanly() {
     let dir = Dir::new("serve-ai-run");
     let data = dir.0.join("d");
-    let staging = Staging::new("serve-ai-run");
+    let staging = IngestEnv::new("serve-ai-run");
     let ai = dir.0.join("ai.json");
     fs::write(
         &ai,
@@ -1100,34 +1100,32 @@ fn data_with_leftovers(dir: &Dir) -> PathBuf {
     data
 }
 
-#[test]
-fn without_the_staging_marker_ingest_is_refused_before_any_write() {
-    let dir = Dir::new("guard-nomarker");
-    let missing_marker = dir.0.join("no-such-marker");
-    let data = data_with_leftovers(&dir);
-    let before = snapshot(&data);
-    let envs = vec![
-        ("GEOFRAME_INGEST", "1".to_string()),
-        (
-            "GEOFRAME_TEST_STAGING_MARKER",
-            missing_marker.to_str().unwrap().to_string(),
-        ),
-        // Python が止まっていても、印が無ければ断る
-        ("GEOFRAME_TEST_PYTHON_STATE", "not-found/inactive".into()),
-    ];
+/// 書き込み系の CLI（`ingest::start_existing` を通るもの）の引数。`data` は DATA_DIR。
+fn write_commands(data: &Path) -> Vec<Vec<String>> {
+    let d = data.to_str().unwrap().to_string();
+    let with = |args: &[&str]| -> Vec<String> {
+        args.iter()
+            .map(|a| a.to_string())
+            .chain(["--data-dir".to_string(), d.clone()])
+            .collect()
+    };
+    vec![
+        with(&["sync"]),
+        with(&["organize"]),
+        with(&["quality-scan"]),
+        with(&["ai-jobs", "retry", "--all"]),
+        with(&["ai-jobs", "release-pause", "--all"]),
+        with(&["ai-jobs", "deactivate-space"]),
+    ]
+}
 
-    let out = run_owned(&["sync", "--data-dir", data.to_str().unwrap()], &envs);
-    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
-    assert!(
-        text(&out.stderr).contains("検証環境の印"),
-        "{}",
-        text(&out.stderr)
-    );
-    assert_untouched_after_refusal(&data, &before);
-    // 開いている .dl_* は消されない（Python のダウンロードを壊さない）
-    assert!(data.join("derivatives/.dl_open").exists());
+fn run_args(args: &[String], envs: &[(&str, String)]) -> Output {
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_owned(&args, envs)
+}
 
-    let out = run_owned(
+fn serve_once(data: &Path, envs: &[(&str, String)]) -> Output {
+    run_owned(
         &[
             "serve",
             "--listen",
@@ -1135,53 +1133,171 @@ fn without_the_staging_marker_ingest_is_refused_before_any_write() {
             "--data-dir",
             data.to_str().unwrap(),
         ],
-        &envs,
-    );
-    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stdout));
-    assert!(
-        text(&out.stdout).contains("検証環境の印"),
-        "{}",
-        text(&out.stdout)
-    );
-    assert_untouched_after_refusal(&data, &before);
-
-    // 置き場そのものが無いときも、作られない
-    let fresh = dir.0.join("fresh");
-    let out = run_owned(&["sync", "--data-dir", fresh.to_str().unwrap()], &envs);
-    assert_eq!(out.status.code(), Some(2));
-    assert!(!fresh.exists());
+        envs,
+    )
 }
 
 #[test]
-fn the_staging_marker_alone_is_not_enough_while_python_runs_or_is_unknown() {
-    let dir = Dir::new("guard-python");
-    let staging = Staging::new("guard-python");
+fn root_is_refused_before_any_write_by_serve_and_every_write_command() {
+    let dir = Dir::new("guard-root");
     let data = data_with_leftovers(&dir);
     let before = snapshot(&data);
-    for state in [
-        "loaded/active",
-        "loaded/activating",
-        "loaded/reloading",
-        "unavailable",
-    ] {
-        let mut envs = staging.envs();
+    // Python が止まっていて、INGEST=1 でも、root なら断る
+    let envs = vec![
+        ("GEOFRAME_INGEST", "1".to_string()),
+        ("GEOFRAME_TEST_EUID", "0".to_string()),
+        ("GEOFRAME_TEST_PYTHON_STATE", "not-found/inactive".into()),
+    ];
+    for args in write_commands(&data) {
+        let out = run_args(&args, &envs);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert!(text(&out.stderr).contains("root"), "{}", text(&out.stderr));
+        assert_untouched_after_refusal(&data, &before);
+    }
+    // serve は、取り込みが有効でも無効（読み取り専用）でも、root では起動しない
+    for envs in [envs.clone(), vec![("GEOFRAME_TEST_EUID", "0".to_string())]] {
+        let out = serve_once(&data, &envs);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stdout));
+        assert!(text(&out.stdout).contains("root"), "{}", text(&out.stdout));
+        assert_untouched_after_refusal(&data, &before);
+    }
+    // 書かない sync --dry-run は root でも動く（ガードの対象外）
+    let out = run_owned(
+        &["sync", "--dry-run", "--data-dir", data.to_str().unwrap()],
+        &[("GEOFRAME_TEST_EUID", "0".to_string())],
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn a_running_python_is_refused_with_2_and_an_unreadable_state_with_1() {
+    let dir = Dir::new("guard-python");
+    let env = IngestEnv::new("guard-python");
+    let data = data_with_leftovers(&dir);
+    let before = snapshot(&data);
+    let with_state = |state: &str| {
+        let mut envs = env.envs();
         envs.retain(|(k, _)| *k != "GEOFRAME_TEST_PYTHON_STATE");
         envs.push(("GEOFRAME_TEST_PYTHON_STATE", state.into()));
         envs.push(("GEOFRAME_INGEST", "1".into()));
-        let out = run_owned(&["sync", "--data-dir", data.to_str().unwrap()], &envs);
-        assert_eq!(out.status.code(), Some(2), "{state}: {}", text(&out.stderr));
-        assert!(
-            text(&out.stderr).contains("geoframe-server.service"),
+        envs
+    };
+    // 稼働中・未知の状態は 2（再起動しても直らない）。状態を取得できない（unavailable・形の違う値）は 1
+    for (state, code) in [
+        ("loaded/active", 2),
+        ("not-found/active", 2),
+        ("loaded/activating", 2),
+        ("loaded/reloading", 2),
+        ("loaded/something-new", 2),
+        ("unavailable", 1),
+        ("garbage", 1),
+    ] {
+        let envs = with_state(state);
+        for args in write_commands(&data) {
+            let out = run_args(&args, &envs);
+            assert_eq!(
+                out.status.code(),
+                Some(code),
+                "{state} {args:?}: {}",
+                text(&out.stderr)
+            );
+            assert!(
+                text(&out.stderr).contains("geoframe-server.service"),
+                "{state}: {}",
+                text(&out.stderr)
+            );
+            assert_untouched_after_refusal(&data, &before);
+        }
+        let out = serve_once(&data, &envs);
+        assert_eq!(
+            out.status.code(),
+            Some(code),
             "{state}: {}",
-            text(&out.stderr)
+            text(&out.stdout)
+        );
+        assert!(
+            text(&out.stdout).contains("geoframe-server.service"),
+            "{state}: {}",
+            text(&out.stdout)
         );
         assert_untouched_after_refusal(&data, &before);
+    }
+    // 開いている .dl_* は消されない（Python のダウンロードを壊さない）
+    assert!(data.join("derivatives/.dl_open").exists());
+    // 止まっている（印は要らない）なら通る。failed でも通る
+    for state in ["loaded/inactive", "loaded/failed", "not-found/inactive"] {
+        let mut envs = with_state(state);
+        envs.push((
+            "GEOFRAME_DRIVE_KEY",
+            dir.0.join("no-key").to_str().unwrap().into(),
+        ));
+        let out = run_owned(&["sync", "--data-dir", data.to_str().unwrap()], &envs);
+        assert!(out.status.success(), "{state}: {}", text(&out.stderr));
     }
 }
 
 #[test]
-fn dry_run_and_read_only_serve_need_neither_the_marker_nor_a_stopped_python() {
-    // この機体（本番）では印が無く Python が動いている。それでも書かないコマンドは動く
+fn write_commands_refuse_a_missing_database_and_create_nothing_but_serve_creates_it() {
+    let dir = Dir::new("guard-nodb");
+    let env = IngestEnv::new("guard-nodb");
+    let mut envs = env.envs();
+    envs.push(("GEOFRAME_INGEST", "1".into()));
+    // DATA_DIR そのものが無い（指定の誤り）。作らない
+    let missing = dir.0.join("no-such-data-dir");
+    for args in write_commands(&missing) {
+        let out = run_args(&args, &envs);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert!(
+            text(&out.stderr).contains("catalog.db"),
+            "{}",
+            text(&out.stderr)
+        );
+        assert!(!missing.exists(), "{args:?}");
+    }
+    // DATA_DIR はあるが catalog.db が無い。ロックも tmp/ も DB も作らない
+    let empty = dir.0.join("empty-data-dir");
+    fs::create_dir_all(empty.join("photos")).unwrap();
+    let before = snapshot(&empty);
+    for args in write_commands(&empty) {
+        let out = run_args(&args, &envs);
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(snapshot(&empty), before, "{args:?}");
+        assert!(!empty.join(".ingest.lock").exists() && !empty.join("tmp").exists());
+        assert!(!empty.join("catalog.db").exists());
+    }
+    // 書かない sync --dry-run は今までどおり DB を作らない（終了コードは別の理由。置き場が変わらないことだけ見る）
+    let _ = run_owned(
+        &["sync", "--dry-run", "--data-dir", empty.to_str().unwrap()],
+        &envs,
+    );
+    assert!(!empty.join("catalog.db").exists());
+    // `serve` は GEOFRAME_INGEST=1 なら DB を作る（今までどおり）
+    let port = free_port();
+    let mut child = serve(&empty, port, Some(("1", &env)));
+    wait_healthy(&mut child, port);
+    let (status, _) = terminate(child);
+    assert!(status.success());
+    assert!(empty.join("catalog.db").is_file());
+}
+
+#[test]
+fn dry_run_and_read_only_serve_need_no_stopped_python() {
+    // Python が動いていても、書かないコマンドは動く
     let dir = Dir::new("guard-readonly");
     let data = data_with_leftovers(&dir);
     let dry = run_owned(
@@ -1190,7 +1306,12 @@ fn dry_run_and_read_only_serve_need_neither_the_marker_nor_a_stopped_python() {
     );
     assert!(dry.status.success(), "{}", text(&dry.stderr));
     let port = free_port();
-    let mut child = serve(&data, port, None);
+    let mut child = serve_with_env(
+        &data,
+        port,
+        None,
+        &[("GEOFRAME_TEST_PYTHON_STATE", "loaded/active")],
+    );
     wait_healthy(&mut child, port);
     let (status, _) = terminate(child);
     assert!(status.success());
@@ -1222,7 +1343,7 @@ fn data_with_a_photo(dir: &Dir) -> PathBuf {
 }
 
 #[test]
-fn organize_without_ingest_or_marker_refuses_and_moves_nothing() {
+fn organize_without_ingest_or_with_a_running_python_refuses_and_moves_nothing() {
     let dir = Dir::new("organize-refused");
     let data = data_with_a_photo(&dir);
     let before = snapshot(&data);
@@ -1230,15 +1351,10 @@ fn organize_without_ingest_or_marker_refuses_and_moves_nothing() {
     let out = run(&["organize", "--data-dir", data.to_str().unwrap()], &[]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_eq!(snapshot(&data), before);
-    // 印が無い（Python が止まっていても断る）
-    let missing = dir.0.join("no-such-marker");
+    // Python 版が稼働中なら断る
     let envs = vec![
         ("GEOFRAME_INGEST", "1".to_string()),
-        (
-            "GEOFRAME_TEST_STAGING_MARKER",
-            missing.to_str().unwrap().to_string(),
-        ),
-        ("GEOFRAME_TEST_PYTHON_STATE", "not-found/inactive".into()),
+        ("GEOFRAME_TEST_PYTHON_STATE", "loaded/active".into()),
     ];
     let out = run_owned(&["organize", "--data-dir", data.to_str().unwrap()], &envs);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
@@ -1278,7 +1394,7 @@ fn organize_dry_run_reports_counts_and_changes_nothing() {
 #[test]
 fn organize_moves_photos_without_a_location_when_the_guard_passes() {
     let dir = Dir::new("organize-apply");
-    let staging = Staging::new("organize-apply");
+    let staging = IngestEnv::new("organize-apply");
     let data = data_with_a_photo(&dir);
     let mut envs = staging.envs();
     envs.push(("GEOFRAME_INGEST", "1".into()));
@@ -1353,21 +1469,16 @@ fn data_with_derivatives(dir: &Dir) -> PathBuf {
 }
 
 #[test]
-fn quality_scan_without_ingest_or_marker_refuses_and_changes_nothing() {
+fn quality_scan_without_ingest_or_with_a_running_python_refuses_and_changes_nothing() {
     let dir = Dir::new("qscan-refused");
     let data = data_with_derivatives(&dir);
     let before = snapshot(&data);
     let out = run(&["quality-scan", "--data-dir", data.to_str().unwrap()], &[]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_eq!(snapshot(&data), before);
-    let missing = dir.0.join("no-such-marker");
     let envs = vec![
         ("GEOFRAME_INGEST", "1".to_string()),
-        (
-            "GEOFRAME_TEST_STAGING_MARKER",
-            missing.to_str().unwrap().to_string(),
-        ),
-        ("GEOFRAME_TEST_PYTHON_STATE", "not-found/inactive".into()),
+        ("GEOFRAME_TEST_PYTHON_STATE", "loaded/active".into()),
     ];
     let out = run_owned(
         &["quality-scan", "--data-dir", data.to_str().unwrap()],
@@ -1405,7 +1516,7 @@ fn quality_scan_dry_run_counts_without_analyzing_or_writing() {
 #[test]
 fn quality_scan_analyzes_everything_and_rebuilds_when_the_guard_passes() {
     let dir = Dir::new("qscan-apply");
-    let staging = Staging::new("qscan-apply");
+    let staging = IngestEnv::new("qscan-apply");
     let data = data_with_derivatives(&dir);
     let mut envs = staging.envs();
     envs.push(("GEOFRAME_INGEST", "1".into()));
@@ -1634,16 +1745,22 @@ fn deactivate_space_needs_ingest_the_guard_and_a_stopped_service_and_keeps_every
     let before = snapshot(&data);
     let arg = data.to_str().unwrap();
     let args = ["ai-jobs", "deactivate-space", "--data-dir", arg];
-    // INGEST が無い → 2。印が無い → 2。どちらも何も書かない
+    // INGEST が無い → 2。Python 版が稼働中 → 2。どちらも何も書かない
     let out = run(&args, &[]);
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert!(text(&out.stderr).contains("GEOFRAME_INGEST=1"));
-    let out = run(&args, &[("GEOFRAME_INGEST", "1")]);
+    let out = run(
+        &args,
+        &[
+            ("GEOFRAME_INGEST", "1"),
+            ("GEOFRAME_TEST_PYTHON_STATE", "loaded/active"),
+        ],
+    );
     assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
     assert_untouched_after_refusal(&data, &before);
 
-    // 稼働中の serve（ロックを持つ）があるときは、印があっても断る → 1。ポインタは変わらない
-    let staging = Staging::new("aiindex-deactivate");
+    // 稼働中の serve（ロックを持つ）があるときは、ガードを通っても断る → 1。ポインタは変わらない
+    let staging = IngestEnv::new("aiindex-deactivate");
     let port = free_port();
     let mut child = serve(&data, port, Some(("1", &staging)));
     wait_healthy(&mut child, port);

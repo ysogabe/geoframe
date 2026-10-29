@@ -619,6 +619,25 @@ fn source_matches(input: &Input, stored: &Stored) -> bool {
     }
 }
 
+/// 保存された判定が `input`（`observed_sha` を含む今の世代）に合っているか。`rel` は旧 Python の投影の `display`。
+fn judge(conn: &Connection, input: &Input, model: &str, rel: &str) -> rusqlite::Result<Readiness> {
+    let key = input.key(model);
+    Ok(match Stored::load(conn, &key)? {
+        Some(s)
+            if s.valid(model) && source_matches(input, &s) && s.compatible(conn, input, rel)? =>
+        {
+            if s.error.is_empty() {
+                Readiness::Ready(Clue::new(s.clue.unwrap(), &s.kind).unwrap())
+            } else if job_state(conn, &key)?.is_some_and(|(state, _)| state == "failed") {
+                Readiness::Failed
+            } else {
+                Readiness::Pending
+            }
+        }
+        _ => Readiness::Pending,
+    })
+}
+
 /// 現在の写真を時刻/id 順に読む。旧 clue の自動 trusted 移行はしない。
 pub fn load_targets(
     conn: &Connection,
@@ -627,32 +646,137 @@ pub fn load_targets(
 ) -> rusqlite::Result<Vec<Target>> {
     let mut targets = Vec::new();
     for input in inputs(conn)?.into_iter().map(|p| p.observe(data)) {
-        let key = input.key(model);
-        let readiness = match Stored::load(conn, &key)? {
-            Some(s)
-                if s.valid(model)
-                    && source_matches(&input, &s)
-                    && s.compatible(conn, &input, &input.projection_rel(data))? =>
-            {
-                if s.error.is_empty() {
-                    Readiness::Ready(Clue::new(s.clue.unwrap(), &s.kind).unwrap())
-                } else if job_state(conn, &key)?.is_some_and(|(state, _)| state == "failed") {
-                    Readiness::Failed
-                } else {
-                    Readiness::Pending
-                }
-            }
-            _ => Readiness::Pending,
-        };
+        let readiness = judge(conn, &input, model, &input.projection_rel(data))?;
         targets.push(Target {
             photo_id: input.id,
-            taken_at: input.taken_at,
+            taken_at: input.taken_at.clone(),
             epoch: input.epoch,
-            key,
+            key: input.key(model),
             readiness,
         });
     }
     Ok(targets)
+}
+
+/// STATUS 用の待ちの件数（[`wait_counts`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Waits {
+    /// Rust の判定が今の入力の世代に対して保存されていない写真の数（`db.loc.clue_pending`）。
+    pub pending: usize,
+    /// そのうち、Provider が止まっていなければ今 Decision が動けば進むもの（`db.loc.clue_runnable` の素）。
+    pub runnable: usize,
+}
+
+/// STATUS 用: `display` の無い fallback の写真の判定を、画像を読まずに調べる。世代（`input_hash`）は実 bytes の
+/// SHA を含むので、保存された行（世代ごとに 1 行）それぞれの SHA で今の DB の入力から世代を組み直し、一致して
+/// 検証（[`judge`]。互換行との一致を含む）を通る行を探す。最新の行だけでは足りない: 回転や差し替えを元へ
+/// 戻すと、ワーカーは保存済みの古い世代の結果を再利用して互換行へ投影し直すが、その行の解析日時は更新しない。
+/// ファイルだけが変わった場合は、ワーカーが次の周期で観測して新しい世代のジョブを積むまで気づけないので、
+/// 一致した世代と違うジョブが生きているとき（`pending`／`running`／`deferred`）は待ちに戻す。
+fn recorded_fallback(conn: &Connection, input: &Input, model: &str) -> rusqlite::Result<Readiness> {
+    if !jobs::object_exists(conn, "table", "ai_location_clues")? {
+        return Ok(Readiness::Pending);
+    }
+    let version = processor_version(model);
+    let mut stmt = conn.prepare_cached(
+        "SELECT input_hash,source_sha256 FROM ai_location_clues WHERE photo_id=?1
+        AND processor_version=?2 ORDER BY analyzed_at DESC,input_hash",
+    )?;
+    let rows = stmt
+        .query_map(params![input.id, version], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (hash, source) in rows {
+        let mut observed = vec![source.filter(|s| s.len() == 64), None];
+        observed.dedup();
+        for observed_sha in observed {
+            let mut seen = input.clone();
+            seen.observed_sha = observed_sha;
+            if seen.key(model).input_hash != hash {
+                continue;
+            }
+            // 投影の `display` は、ファイルがあれば rel、無ければ空（`projection_rel`）。どちらも許す
+            for rel in [seen.rel.as_str(), ""] {
+                let readiness = judge(conn, &seen, model, rel)?;
+                if readiness == Readiness::Pending {
+                    continue;
+                }
+                let other_live: bool = jobs::object_exists(conn, "table", "ai_jobs")?
+                    && conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM ai_jobs WHERE kind='location_clue'
+                        AND target_key=?1 AND processor_version=?2 AND input_hash!=?3
+                        AND state IN ('pending','running','deferred'))",
+                        params![input.id.to_string(), version, hash],
+                        |r| r.get(0),
+                    )?;
+                return Ok(if other_live {
+                    Readiness::Pending
+                } else {
+                    readiness
+                });
+            }
+        }
+    }
+    Ok(Readiness::Pending)
+}
+
+/// 待ちの写真に、今 Decision を動かして進められる仕事があるか。次は数えない:
+/// 品質の解析待ち（画像は送らず後回しになる）・品質の解析に失敗した写真（Decision を使わず恒久失敗になる）・
+/// 期限（`next_attempt_at`）が先の後回しや再試行待ちだけのもの・失敗の履歴だけのもの（明示の再試行まで動かない）。
+/// ジョブがまだ無い・期限が来ている・実行中なら数える。
+fn runnable(conn: &Connection, input: &Input, model: &str, now: i64) -> rusqlite::Result<bool> {
+    if input.quality_failed || (input.quality_pending && !input.fallback()) {
+        return Ok(false);
+    }
+    if !jobs::object_exists(conn, "table", "ai_jobs")? {
+        return Ok(true);
+    }
+    // fallback の世代はファイルの SHA を含み、読まずには組み立てられない。ジョブは対象の全世代を見る
+    let any_hash = input.fallback();
+    let mut stmt = conn.prepare_cached(
+        "SELECT state,next_attempt_at FROM ai_jobs WHERE kind='location_clue' AND target_key=?1
+        AND processor_version=?2 AND (?3 OR input_hash=?4)",
+    )?;
+    let rows = stmt
+        .query_map(
+            params![
+                input.id.to_string(),
+                processor_version(model),
+                any_hash,
+                input.key(model).input_hash
+            ],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    let live = |state: &str| matches!(state, "pending" | "running" | "deferred");
+    if rows.iter().any(|(state, _)| live(state)) {
+        return Ok(rows
+            .iter()
+            .any(|(state, at)| state == "running" || (live(state) && *at <= now)));
+    }
+    // 生きたジョブが無い。現世代の失敗の履歴だけがあるなら、明示の再試行まで動かない
+    Ok(any_hash || !rows.iter().any(|(state, _)| state == "failed"))
+}
+
+/// STATUS 用: 待ちの写真の数と、そのうち今 Decision が動けば進むものの数。**画像ファイルは開かない**（DB だけ）。
+/// Provider の停止は見ない（呼び出し側が [`crate::ai::ops::task_pause`] と合わせる）。
+pub fn wait_counts(conn: &Connection, model: &str, now: i64) -> rusqlite::Result<Waits> {
+    let mut waits = Waits::default();
+    for input in inputs(conn)? {
+        let readiness = if input.fallback() {
+            recorded_fallback(conn, &input, model)?
+        } else {
+            judge(conn, &input, model, &input.rel)?
+        };
+        if readiness == Readiness::Pending {
+            waits.pending += 1;
+            if runnable(conn, &input, model, now)? {
+                waits.runnable += 1;
+            }
+        }
+    }
+    Ok(waits)
 }
 
 fn job_state(conn: &Connection, key: &JobKey) -> rusqlite::Result<Option<(String, String)>> {

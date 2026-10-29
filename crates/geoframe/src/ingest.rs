@@ -2,17 +2,19 @@
 //!
 //! # 有効にする条件
 //!
-//! **`GEOFRAME_INGEST=1` のときだけ**動く（既定は無効）。P5 の切替まで、本番の書き手は Python
-//! （`geoframe-server`）なので、`/etc/default/geoframe` をそのまま使って Rust を起動しても DB に
-//! 書かない。無効のときの `serve` は P1 と同じ読み取り専用で、DB が無ければ起動を断る。
+//! **`GEOFRAME_INGEST=1` のときだけ**動く（既定は無効）。Python 版（`geoframe-server`）と共通の
+//! `/etc/default/geoframe` をそのまま使って Rust を起動しても DB に書かない。無効のときの `serve` は
+//! P1 と同じ読み取り専用で、DB が無ければ起動を断る。
 //!
 //! # 起動の順序（有効のとき）
 //!
 //! 現行は `load_cache` → `purge_cache_legacy` → `db()`（スキーマ・移行）→ `tile_cache_prune`
 //! → `prepare_tmp_dir`。Rust は次の順にする（失敗したら起動しない）。
 //!
-//! 0. **ガード**（[`crate::guard`]）。検証環境の印が無い・Python 版が非稼働と確認できないなら、何も
-//!    書かずに断る（終了コード 2）。データ置き場の作成より前。P5 の切替で外す。
+//! 0. **ガード**（[`crate::guard`]）。root で実行している・Python 版が非稼働と確認できないなら、何も
+//!    書かずに断る（終了コード 2。状態を取得できないときだけ 1）。データ置き場の作成より前。
+//!    書き込み系の CLI（[`start_existing`]）は、さらに DB（`catalog.db`）が無ければ作らずに断る（終了コード 2）。
+//!    `serve` は無ければ作る（次の 2）。
 //! 1. データ置き場を用意し、`DATA_DIR/.ingest.lock` を排他で取る。別の `geoframe`（`serve` か `sync`）が
 //!    すでに取り込み中なら断る。**Python との二重書き込みは防げない**（Python はこのロックを見ない）
 //!    ので、Python が動いている間は取り込まない（0 のガードが、起動時に 1 回だけ確かめる）。
@@ -29,7 +31,7 @@
 
 use std::fs::{self, File, TryLockError};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::Connection;
@@ -45,8 +47,10 @@ const LOCK_FILE: &str = ".ingest.lock";
 
 #[derive(Debug)]
 pub enum IngestError {
-    /// 本番への誤指定の防止（[`crate::guard`]）で断った。何も書いていない。
+    /// ガード（[`crate::guard`]）で断った。何も書いていない。
     Refused(GuardError),
+    /// 書き込み系の CLI で、`DATA_DIR` に `catalog.db` が無い。DB は作らず、何も書いていない。
+    NoDatabase(PathBuf),
     /// データ置き場を用意できない・ロックのファイルを開けない。
     Io(io::ErrorKind),
     /// 別の `geoframe` がすでに取り込み中。
@@ -58,6 +62,12 @@ impl std::fmt::Display for IngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(e) => write!(f, "{e}"),
+            Self::NoDatabase(path) => write!(
+                f,
+                "DB（{}）が無いので、書き込みを始めません。GEOFRAME_DATA_DIR が正しいか確認してください。\
+                 DB を新しく作るのは GEOFRAME_INGEST=1 の serve だけです",
+                path.display()
+            ),
             Self::Io(kind) => write!(f, "取り込みの準備に失敗しました: {kind}"),
             Self::Locked => f.write_str(
                 "別の geoframe が取り込み中です（serve か sync が動いています）。二重に書かないよう起動を断ります",
@@ -118,15 +128,36 @@ impl Ingest {
     }
 }
 
-/// 取り込みを始める準備（上の「起動の順序」）。最初に[ガード](crate::guard)を通す。
+/// 取り込みを始める準備（上の「起動の順序」）。最初に[ガード](crate::guard)を通す。`serve` 用:
+/// DB が無ければ新しく作る。
 pub fn start(config: &Config) -> Result<Ingest, IngestError> {
-    start_with(config, &Guard::production())
+    start_impl(config, &Guard::production(), false)
 }
 
-/// [`start`] のガードを差し替えられる形（単体テスト用。配布するバイナリの経路は [`start`] だけ）。
+/// 書き込み系の CLI（`sync`・`organize`・`quality-scan`・`ai-jobs` の書く操作）用の [`start`]。
+/// DB が無ければ、何も作らずに断る（`GEOFRAME_DATA_DIR` の誤りで別の空の DB を作らないため）。
+pub fn start_existing(config: &Config) -> Result<Ingest, IngestError> {
+    start_impl(config, &Guard::production(), true)
+}
+
+/// [`start`] のガードを差し替えられる形（単体テスト用。配布するバイナリの経路は [`start`]・[`start_existing`] だけ）。
+#[cfg(test)]
 pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, IngestError> {
+    start_impl(config, guard, false)
+}
+
+/// [`start_existing`] のガードを差し替えられる形（単体テスト用）。
+#[cfg(test)]
+pub(crate) fn start_existing_with(config: &Config, guard: &Guard) -> Result<Ingest, IngestError> {
+    start_impl(config, guard, true)
+}
+
+fn start_impl(config: &Config, guard: &Guard, must_exist: bool) -> Result<Ingest, IngestError> {
     // 最初の書き込み（データ置き場の作成・ロック・移行・掃除・キャッシュ保存）より前に断る
     guard.check().map_err(IngestError::Refused)?;
+    if must_exist && !config.db_path().is_file() {
+        return Err(IngestError::NoDatabase(config.db_path()));
+    }
     fs::create_dir_all(&config.data_dir).map_err(|e| IngestError::Io(e.kind()))?;
     let lock = File::options()
         .create(true)
@@ -533,7 +564,7 @@ mod tests {
         fs::create_dir_all(root.join("derivatives")).unwrap();
         fs::write(root.join("derivatives/a.jpg.1.aa.part"), b"x").unwrap();
         // ガードが断れば消さない
-        let guard = Guard::production_with_marker_for_test(dir.path().join("no-such-marker"));
+        let guard = Guard::refusing_for_test();
         assert!(super::start_with(&config, &guard).is_err());
         assert!(root.join("derivatives/a.jpg.1.aa.part").exists());
         // 通れば消える
@@ -865,6 +896,44 @@ mod tests {
         );
     }
 
+    /// 書き込み系の CLI の入口（`start_existing`）は、DB が無ければ何も作らずに断る。`serve` の入口は作る。
+    #[test]
+    fn start_existing_refuses_a_missing_database_without_creating_anything() {
+        let dir = TempDir::new("ingest-nodb");
+        let root = dir.path().join("data");
+        let overrides = Overrides {
+            listen: None,
+            data_dir: Some(root.clone()),
+        };
+        let config = Config::load(|_| None, &overrides).unwrap();
+        assert!(matches!(
+            super::start_existing_with(&config, &Guard::skip()),
+            Err(IngestError::NoDatabase(_))
+        ));
+        assert!(!root.exists(), "置き場も作らない");
+        // 置き場だけがあっても DB が無ければ断る。ロックのファイルも作らない
+        fs::create_dir_all(&root).unwrap();
+        assert!(matches!(
+            super::start_existing_with(&config, &Guard::skip()),
+            Err(IngestError::NoDatabase(_))
+        ));
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        // DB があれば通る（`serve` の入口で作った DB）
+        drop(super::start_with(&config, &Guard::skip()).unwrap());
+        assert!(config.db_path().is_file());
+        // （書き込みスレッドが終わるまでロックが残るので、外れるのを待つ）
+        for _ in 0..200 {
+            match super::start_existing_with(&config, &Guard::skip()) {
+                Ok(_) => return,
+                Err(IngestError::Locked) => {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(e) => panic!("{e}"),
+            }
+        }
+        panic!("ロックが外れない");
+    }
+
     /// ガードが断ったら、データ置き場も DB もロックも作られない（最初の書き込みより前に止まる）。
     #[test]
     fn a_refused_guard_writes_nothing() {
@@ -875,11 +944,11 @@ mod tests {
             data_dir: Some(root.clone()),
         };
         let config = Config::load(|_| None, &overrides).unwrap();
-        // 印の無い（通常はここで止まる）ガード。置き場そのものが無い状態から
-        let guard = Guard::production_with_marker_for_test(dir.path().join("no-such-marker"));
+        // Python 版が稼働中と答える（必ず断る）ガード。置き場そのものが無い状態から
+        let guard = Guard::refusing_for_test();
         assert!(matches!(
             super::start_with(&config, &guard),
-            Err(IngestError::Refused(GuardError::NoMarker(_)))
+            Err(IngestError::Refused(GuardError::PythonNotStopped(_)))
         ));
         assert!(!root.exists());
         // 既存の置き場でも、DB・キャッシュ・tmp・derivatives・ロックは作られず、中身も変わらない

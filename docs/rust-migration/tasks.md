@@ -124,8 +124,20 @@ P3で守ること（各タスクの委任文に入れる）:
 |---|---|---|---|---|---|---|
 | T4.10 | Provider全体の停止で止まる用途を`ai-jobs status`と管理画面のSTATUSに出す（`ai_task_blocks`）。待ちがあるときのワーカーの周期を短くする（`GEOFRAME_AI_BACKLOG_POLL_S`既定5秒、手がかりの1周期の件数を60→10） | full | 完了 | a2924d5 | 42009d7..0075a1e | PR #62。実装Sonnet。security-review（Opus）: 指摘0。レビュー（Sol）2回: 必須1→0。座標化の残りは短い待ちにし、クラウドに送る用途は予算の周期を早めないよう外したまま（Solも同意）。検証LXC（77dd1e4、約2時間40分）: ダミー鍵で起こした停止で、同じ鍵の両用途が「停止中: Provider全体」と待ちの件数を表示。解除で戻り、手がかりは1周期10件・約2分おきで、合間にEmbeddingが進んだ。持ち越し: 鍵の権限で止まったときも画面は「認証エラー（401）」と出る（理由コードの共有。journalには本当の理由が出る）。周期の開始・終了のログ行が無い |
 
-## P5: 切替（未着手）
+## P5: 切替（実装中）
 
-| ID | 内容 | AC（Issue #54） | 種類 | 状態 |
-|---|---|---|---|---|
-| P5 | バックアップ・復元演習、シャドー比較、本番切替、ロールバック演習、Python依存の撤去 | AC1, AC2, AC5 | full | 未着手 |
+- PRD: [p5-prd.md](p5-prd.md)、設計: [p5-design.md](p5-design.md)。2026-10-30にユーザーが承認。
+- 2026-10-29のユーザーの決定: Pythonの撤去はP5に含める。Pythonへ戻すときはAIを無効にする。クラウドAIは切替の数日後に有効にする。切替の日時は演習のあとに決める。
+- PRは2つ: P5a（T5.1〜T5.4。切替の前にマージ）、P5b（T5.6a〜b。切替のあと）。作業ブランチ: P5aは`feat/rust-migration-p5`。
+- 各タスクはt3-full-buildの管理モード（実装Sonnet・通常レビューSol）。security-reviewはPRの前に全体で1回。
+- 設計のレビュー: Sol（設計）・Opus（安全面）を2回ずつ。必須は1回目14件・2回目8件で、すべて反映。
+
+| ID | 内容 | AC（P5-PRD） | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
+|---|---|---|---|---|---|---|---|---|
+| T5.1 | ガードの見直し（印の検査を外しPython版の検査は残す、終了コード、rootと`catalog.db`が無いCLIの拒否）、`geoframe-rs.service`の見直し（置き場所・`After=`・設定のファイル・StartLimit・ReadOnlyPaths・制限）、`rust-deploy.sh --production`とその試験、`deploy-pull.sh`の拒否、`geoframe-admin.sh` | AC1, AC2 | - | full | 完了 | 859070f | feccb6b..7f737d4 | 実装Sonnet（feccb6b..2221433、修正7248346）。レビュー（Sol）2回: 必須2→0（`--production`で試験用の環境変数・確認先の上書きが効く→固定値＋`GEOFRAME_RS_*`があれば断る、件数の下限の桁で比較が壊れる→1〜9桁）。推奨（deploy-pullの状態の厳密な解析、server.mdの試験表、環境変数の拒否を1つずつ試す）を反映。設計からの外れ: 読み取りだけの`serve`もrootで断る、deploy-pullは状態を取れないときも断る。deployの試験3本をCIに追加。実systemdでの確認（制限一式・Conflicts/After・ホスト名の形）はT5.4 |
+| T5.2 | STATUSの`db.loc.clue_pending`をRustの判定の待ちを含む値に直す | AC8 | - | full | 完了 | 1f0bb79 | cdbbb5d..98aca91 | 実装Sonnet（cdbbb5d、修正e77cd2b・3125954）。レビュー（Sol）3回: 必須1→1→0（総待ちをtimerの条件にしていた→`clue_runnable`・`clue_pause`を足しtimerが使う、fallbackの写真のA→B→Aで待ちが残る→保存行をすべて照合）。推奨（STATUSでファイルを読まない・30秒キャッシュ、起動後の一時的な0に停滞の猶予）を反映。見送り: 1写真に多数の世代がある場合の計測（回転・差し替えの回数は少なく、30秒キャッシュがある）、品質待ちと一時的な後回しを区別するキー（品質待ちだけが残ると約16分で終了コード1。文書に記載）。旧Pythonの判定済みDBでの確認はT5.4 |
+| T5.3 | 手順書`cutover.md`と`deploy/README.md` §7の本番向けの記述 | AC3〜AC6, AC9 | T5.1, T5.2 | full | 完了 | 1eaa6c2 | ca527eb..9587dc7 | [cutover.md](cutover.md)。実装Sonnet（ca527eb・7b97d99、修正644ccec..5b2ffbf・8546e74..8ba42fe・91964bd）。レビュー（Sol）4回: 必須7→7→2→0（タイマーの再開・展開の失敗・鍵の権限・戻したあとの状態の控えと比較・品質の2つの場合・増えた写真の判定・画像の欠けを前提未達と明記、hiddenの再出現・代表の品質条件・/procの読めないfd・演習のtimer・シャドー比較のキー単位の許容・後片付けの順序・品質の入力に特徴量とtaken_at）。推奨（fuserの代わり、値を出さない、manual_hintを本番と検証環境で分ける、非ゼロの規則の一本化、T5.4のチェックリスト§15、合格条件の例外の書き方）を反映。**T5.4で確定するもの**: §10.5の画像の欠けの直し方（確定まで本番切替に進まない）、/procをrootで、cache_load.pyを本番のvenvで、Conflicts=の両方向、systemd-analyze security |
+| T5.4 | 検証環境での演習（設計§演習の1〜9）と`p5-acceptance.md` | AC1〜AC5, AC8 | T5.3 | ops | 完了 | 712e61a | a207b04..f60a2d1 | [p5-acceptance.md](p5-acceptance.md)。演習Opus（1回目は本番の新しいバックアップを読めず開始前に停止→ユーザーが写しを置いて再開）。AC1〜AC5・AC8の演習の部分は合格: 停止から再開まで43秒・42秒、戻すのに3秒、写真3,065/3,065、シャドー比較の許容外0、Conflicts=/After=は両方向で旧プロセスが先に終了、drop-inでPythonのAIが止まる、旧Pythonの判定済みDBで`clue_pending`が減る。§10.5の画像の欠けの直し方を確定（本番では1件を先に試す）。手順書の直し15件。スクリプト・Rustの不具合0。演習のバイナリ: commit 712e61a、sha256 65755b96…（保管済み。本番はこれを入れる）。検証環境は演習の前と差0 |
+| T5.5 | 本番の切替（ユーザーの立ち会い）と記録 | AC6 | P5aのマージ | ops | 未着手 | | | |
+| T5.6a | 埋め込みの元を`web/`へ移し、Rustの試験からPythonの実行を外す | AC7 | T5.5 | full | 未着手 | | | |
+| T5.6b | Pythonの実装・道具・CIのジョブ・Python版のunitと配布の撤去、文書の書き直し、設定の参照の試験 | AC7 | T5.6a | full | 未着手 | | | |

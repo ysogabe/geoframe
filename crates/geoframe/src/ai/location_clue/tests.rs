@@ -2,6 +2,7 @@
 use super::*;
 use crate::ai::jobs::{Completion, Failure, JobState};
 use crate::ai::ops::{self, RetryTarget};
+use crate::ai::settings::TaskKind;
 use crate::ai::tests_http::{Captured, Stub, respond, stub};
 use crate::ai::tests_settings::variant;
 use crate::ai::tests_worker::{Env, T0, env_with};
@@ -1274,4 +1275,373 @@ fn retry_prepares_fallback_sha_outside_writer_and_handles_unprojected_interrupti
         assert_eq!(lab.posts().len(), before + 1);
         assert!(matches!(targets(&e)[0].readiness, Readiness::Ready(_)));
     }
+}
+
+// ---- STATUS の `db.loc.clue_pending`（R9）----
+
+fn clue_pending_with(e: &Env, config: &crate::config::Config) -> i64 {
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    let ctx = crate::admin::AdminContext::new(config, &config.data_dir);
+    let status = crate::admin::status(&read, &ctx).unwrap();
+    status["db"]["loc"]["clue_pending"].as_i64().unwrap()
+}
+fn clue_pending(e: &Env) -> i64 {
+    clue_pending_with(e, &e.config)
+}
+/// 旧 Python が今の画像に対して判定済みとした行（`add` の写真は md5・mtime が NULL）。
+fn legacy_clue(e: &Env, id: i64, rel: &str) {
+    let rel = rel.to_string();
+    e.writer()
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO photo_loc_clues(photo_id,display,source_md5,source_mtime,clue,kind,model,analyzed_at,error)
+                 VALUES(?1,?2,NULL,NULL,0.9,'street','python-model','2026-01-01T00:00:00Z','')",
+                params![id, rel],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn status_clue_pending_counts_rust_waits_even_when_python_rows_are_fresh() {
+    let lab = Lab::new();
+    let e = lab.env("clue-status");
+    // 対象の無い DB
+    assert_eq!(clue_pending(&e), 0);
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&e, 2, "photos/bad.jpg", Some(b"broken image"), 0);
+    add(&e, 3, "", None, 0);
+    fs::write(e.config.data_dir.join("derivatives/fake3.jpg"), jpeg()).unwrap();
+    for (id, rel) in [
+        (1, "photos/a.jpg"),
+        (2, "photos/bad.jpg"),
+        (3, "derivatives/fake3.jpg"),
+    ] {
+        legacy_clue(&e, id, rel);
+    }
+    // 旧 Python の行だけで数えると 0（Rust を判定者としない設定）。Rust の保存結果は 1 件も無い
+    let mut python_only = (*e.config).clone();
+    python_only.ingest = false;
+    assert_eq!(clue_pending_with(&e, &python_only), 0);
+    assert_eq!(clue_pending(&e), 3);
+    // 判定を保存したら 0（恒久失敗は判定済み）
+    cycle(&e);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_location_clues"), 3);
+    assert_eq!(clue_pending(&e), 0);
+    // 品質の解析待ちの写真は待ちに数える。解析が済んで保存されれば 0 に戻る
+    add(&e, 4, "photos/pending.jpg", Some(&jpeg()), 0);
+    legacy_clue(&e, 4, "photos/pending.jpg");
+    cycle(&e);
+    assert_eq!(clue_pending(&e), 1);
+    let hash = sha(&jpeg());
+    e.writer().call(move |c| {
+        c.execute("INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,error,analyzed_at)
+            VALUES(4,'photos/pending.jpg',NULL,NULL,?1,'','2026-01-01T00:00:00Z')",[hash])?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(clue_pending(&e), 1);
+    e.advance(30);
+    cycle(&e);
+    assert_eq!(clue_pending(&e), 0);
+}
+
+#[test]
+fn status_clue_pending_follows_the_decision_model_and_falls_back_to_python_rows_when_rust_does_not_judge()
+ {
+    let lab = Lab::new();
+    let e = lab.env("clue-status-model");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&e, 2, "photos/b.jpg", Some(&jpeg()), 1);
+    legacy_clue(&e, 1, "photos/a.jpg");
+    cycle(&e);
+    assert_eq!(clue_pending(&e), 0);
+    // Decision のモデルが変わると、保存済みの結果は今の世代ではなく、全件が待ちに戻る
+    let base = fs::read_to_string(e.config.data_dir.parent().unwrap().join("ai.json")).unwrap();
+    let path = e.config.data_dir.parent().unwrap().join("other-model.json");
+    fs::write(&path, base.replace("example-decision", "other-decision")).unwrap();
+    let mut config = (*e.config).clone();
+    config.ai = crate::ai::settings::AiConfig::load(&|k| {
+        (k == "GEOFRAME_AI_CONFIG").then(|| path.to_str().unwrap().to_string())
+    });
+    assert_eq!(clue_pending_with(&e, &config), 2);
+    // Rust が判定しない設定（用途なし・取り込み無効）では、旧 Python の行の世代一致で数える従来の値
+    sql(&e, "DELETE FROM photo_loc_clues WHERE photo_id=2");
+    let mut off = (*e.config).clone();
+    off.ingest = false;
+    assert_eq!(clue_pending_with(&e, &off), 1);
+    let unset = env_with("clue-status-unset", "{}", true);
+    sql(&unset, "DELETE FROM photos");
+    fs::create_dir_all(unset.config.data_dir.join("photos")).unwrap();
+    add(&unset, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&unset, 2, "photos/b.jpg", Some(&jpeg()), 1);
+    legacy_clue(&unset, 1, "photos/a.jpg");
+    assert_eq!(clue_pending(&unset), 1);
+}
+
+// ---- STATUS の `db.loc.clue_runnable`・`clue_pause`（timer 用。今 Decision が動けば進む待ち）----
+
+fn loc_status_with(e: &Env, ctx: &crate::admin::AdminContext) -> serde_json::Value {
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    crate::admin::status(&read, ctx).unwrap()["db"]["loc"].clone()
+}
+/// (clue_pending, clue_runnable, clue_pause)
+fn waits(e: &Env) -> (i64, i64, String) {
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    let loc = loc_status_with(e, &ctx);
+    (
+        loc["clue_pending"].as_i64().unwrap(),
+        loc["clue_runnable"].as_i64().unwrap(),
+        loc["clue_pause"].as_str().unwrap().to_string(),
+    )
+}
+fn insert_job(e: &Env, key: &JobKey, state: &str, next_attempt_at: i64) {
+    let (target, hash, version, state) = (
+        key.target_key.clone(),
+        key.input_hash.clone(),
+        key.processor_version.clone(),
+        state.to_string(),
+    );
+    e.writer()
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,next_attempt_at,created_at,updated_at)
+                 VALUES('location_clue',?1,?2,?3,?4,?5,0,0)",
+                params![target, hash, version, state, next_attempt_at],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn status_clue_runnable_counts_only_waits_decision_can_advance() {
+    let lab = Lab::new();
+    let e = lab.env("clue-runnable");
+    assert_eq!(waits(&e), (0, 0, String::new()));
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    // ジョブがまだ無い待ちは、動けば進む
+    assert_eq!(waits(&e), (1, 1, String::new()));
+    // 品質の解析待ち（画像を送らず後回しになる）だけなら進められない
+    add(&e, 2, "photos/q.jpg", Some(&jpeg()), 0);
+    assert_eq!(waits(&e), (2, 1, String::new()));
+    sql(&e, "DELETE FROM photos WHERE id=1");
+    assert_eq!(waits(&e), (1, 0, String::new()));
+    // 品質の解析に失敗した写真も、Decision を使わずに恒久失敗になる
+    add(&e, 3, "photos/f.jpg", Some(&jpeg()), 2);
+    assert_eq!(waits(&e), (2, 0, String::new()));
+}
+
+#[test]
+fn status_clue_runnable_ignores_deferrals_before_their_due_time_and_failed_history() {
+    let lab = Lab::new();
+    let e = lab.env("clue-runnable-defer");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    let key = targets(&e)[0].key.clone();
+    let now = crate::ai::jobs::unix_now();
+    // 期限が先の後回しだけ
+    insert_job(&e, &key, "deferred", now + 3600);
+    assert_eq!(waits(&e), (1, 0, String::new()));
+    // 期限が来れば動く
+    sql(
+        &e,
+        &format!("UPDATE ai_jobs SET next_attempt_at={}", now - 1),
+    );
+    assert_eq!(waits(&e), (1, 1, String::new()));
+    // 実行中も動いている扱い
+    sql(&e, "UPDATE ai_jobs SET state='running', next_attempt_at=0");
+    assert_eq!(waits(&e), (1, 1, String::new()));
+    // 失敗の履歴だけ（明示の再試行まで動かない）
+    sql(&e, "UPDATE ai_jobs SET state='failed'");
+    assert_eq!(waits(&e), (1, 0, String::new()));
+}
+
+#[test]
+fn status_clue_runnable_is_zero_while_the_provider_is_paused_and_follows_release() {
+    let lab = Lab::new();
+    let e = lab.env("clue-runnable-pause");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&e, 2, "", None, 0);
+    fs::write(e.config.data_dir.join("derivatives/fake2.jpg"), jpeg()).unwrap();
+    assert_eq!(waits(&e), (2, 2, String::new()));
+    let settings = e.config.ai.settings().unwrap();
+    let provider = settings.provider_pause_key(TaskKind::LocationClue).unwrap();
+    e.writer()
+        .call(move |c| {
+            crate::ai::pause::pause(
+                c,
+                TaskKind::LocationClue,
+                &provider,
+                crate::ai::pause::PauseReason::Unauthorized,
+                1,
+            )
+        })
+        .unwrap();
+    // 総待ちは保つ。動けないので runnable は 0 で、理由コードだけ出す
+    assert_eq!(waits(&e), (2, 0, "unauthorized".to_string()));
+    sql(&e, "DELETE FROM ai_provider_pauses");
+    assert_eq!(waits(&e), (2, 2, String::new()));
+    // 用途の停止も同じ
+    let task = settings.task_pause_key(TaskKind::LocationClue).unwrap();
+    e.writer()
+        .call(move |c| {
+            crate::ai::pause::pause(
+                c,
+                TaskKind::LocationClue,
+                &task,
+                crate::ai::pause::PauseReason::ModelNotFound,
+                1,
+            )
+        })
+        .unwrap();
+    assert_eq!(waits(&e), (2, 0, "model_not_found".to_string()));
+}
+
+/// 古い世代 A の解析日時を B より前にして、「最新の 1 行」が B になるようにする（互換行も合わせる）。
+fn age_stored_clues(e: &Env, at: &str) {
+    let at = at.to_string();
+    e.writer()
+        .call(move |c| {
+            c.execute("UPDATE ai_location_clues SET analyzed_at=?1", params![at])?;
+            c.execute("UPDATE photo_loc_clues SET analyzed_at=?1", params![at])?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn status_fallback_wait_clears_after_the_worker_reuses_an_older_generation_a_b_a() {
+    // 差し替え（実 bytes の SHA が変わる）と回転（DB の世代だけが変わる）の 2 通り
+    for rotate in [false, true] {
+        let lab = Lab::new();
+        let e = lab.env("clue-status-aba");
+        add(&e, 1, "", None, 0);
+        let path = e.config.data_dir.join("derivatives/fake1.jpg");
+        fs::write(&path, jpeg()).unwrap();
+        // A: 成功。解析日時を古くして、あとの B が最新の行になるようにする
+        cycle(&e);
+        assert_eq!(lab.posts().len(), 1);
+        age_stored_clues(&e, "2026-01-01T00:00:00Z");
+        assert_eq!(waits(&e), (0, 0, String::new()));
+        // B: 別の世代で成功
+        if rotate {
+            sql(&e, "UPDATE photos SET rotation=90");
+        } else {
+            fs::write(&path, imaging::rotate_jpeg(&jpeg(), 90).unwrap().jpeg).unwrap();
+        }
+        cycle(&e);
+        assert_eq!(lab.posts().len(), 2);
+        assert_eq!(waits(&e), (0, 0, String::new()));
+        // A へ戻す。ワーカーが保存済みの A を再利用して互換行へ投影し直す（送信は増えない）が、A の日時は古いまま
+        if rotate {
+            sql(&e, "UPDATE photos SET rotation=0");
+        } else {
+            fs::write(&path, jpeg()).unwrap();
+        }
+        // ワーカーが観測するまで、ファイルだけの変更は見えない（B のまま）
+        if !rotate {
+            assert_eq!(waits(&e), (0, 0, String::new()));
+        }
+        cycle(&e);
+        assert_eq!(lab.posts().len(), 2);
+        assert_eq!(
+            n(
+                &e,
+                "SELECT COUNT(*) FROM photo_loc_clues WHERE analyzed_at='2026-01-01T00:00:00Z'"
+            ),
+            1
+        );
+        assert!(matches!(targets(&e)[0].readiness, Readiness::Ready(_)));
+        assert_eq!(waits(&e), (0, 0, String::new()));
+    }
+}
+
+#[test]
+fn status_clue_runnable_is_absent_when_rust_does_not_judge() {
+    let lab = Lab::new();
+    let e = lab.env("clue-runnable-off");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    let mut off = (*e.config).clone();
+    off.ingest = false;
+    let ctx = crate::admin::AdminContext::new(&off, &off.data_dir);
+    let loc = loc_status_with(&e, &ctx);
+    assert!(loc.get("clue_runnable").is_none() && loc.get("clue_pause").is_none());
+    assert_eq!(loc["clue_pending"], 1);
+}
+
+#[test]
+fn status_never_opens_image_files_and_judges_fallback_photos_from_stored_rows() {
+    let lab = Lab::new();
+    let e = lab.env("clue-status-no-read");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&e, 2, "", None, 0);
+    add(&e, 3, "", None, 0);
+    fs::write(e.config.data_dir.join("derivatives/fake2.jpg"), jpeg()).unwrap();
+    // fake3 の derivative は無い（読めない fallback）
+    let before = source_reads();
+    assert_eq!(waits(&e), (3, 3, String::new()));
+    cycle(&e);
+    let after_cycle = source_reads();
+    assert!(after_cycle > before);
+    // 保存済み・恒久失敗の fallback も含め、待ちは 0。STATUS は 1 回もファイルを読まない
+    assert_eq!(waits(&e), (0, 0, String::new()));
+    assert_eq!(source_reads(), after_cycle);
+    // ワーカーが観測するまで、ファイルだけの変更は見えない。観測して新しい世代のジョブが積まれたら待ちに戻る
+    fs::write(e.config.data_dir.join("derivatives/fake2.jpg"), {
+        let mut v = Vec::new();
+        jpeg_encoder::Encoder::new(&mut v, 80)
+            .encode(&[30; 32 * 24 * 3], 32, 24, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        v
+    })
+    .unwrap();
+    assert_eq!(waits(&e), (0, 0, String::new()));
+    let changed = Input::load(&crate::db::open_read_only(&e.config.db_path()).unwrap(), 2)
+        .unwrap()
+        .unwrap()
+        .observe(&data(&e))
+        .key("example-decision");
+    insert_job(&e, &changed, "pending", 0);
+    assert_eq!(waits(&e), (1, 1, String::new()));
+    assert_eq!(source_reads(), after_cycle + 1); // 試験自身の observe の 1 回だけ
+}
+
+#[test]
+fn status_clue_waits_are_cached_per_model_and_recomputed_after_the_ttl() {
+    let lab = Lab::new();
+    let e = lab.env("clue-status-cache");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    let cached = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    let fresh = crate::admin::AdminContext::new(&e.config, &e.config.data_dir)
+        .with_clue_ttl(Duration::ZERO);
+    assert_eq!(loc_status_with(&e, &cached)["clue_pending"], 1);
+    add(&e, 2, "photos/b.jpg", Some(&jpeg()), 1);
+    // TTL の間は前の値。TTL を過ぎた（0）文脈は数え直す
+    assert_eq!(loc_status_with(&e, &cached)["clue_pending"], 1);
+    assert_eq!(loc_status_with(&e, &fresh)["clue_pending"], 2);
+    // 停止はキャッシュに入れず、毎回読む
+    let provider = e
+        .config
+        .ai
+        .settings()
+        .unwrap()
+        .provider_pause_key(TaskKind::LocationClue)
+        .unwrap();
+    e.writer()
+        .call(move |c| {
+            crate::ai::pause::pause(
+                c,
+                TaskKind::LocationClue,
+                &provider,
+                crate::ai::pause::PauseReason::Forbidden,
+                1,
+            )
+        })
+        .unwrap();
+    let loc = loc_status_with(&e, &cached);
+    assert_eq!(
+        (loc["clue_pending"].as_i64(), loc["clue_runnable"].as_i64()),
+        (Some(1), Some(0))
+    );
+    assert_eq!(loc["clue_pause"], "forbidden");
 }

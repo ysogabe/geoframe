@@ -56,6 +56,17 @@
 # 実行場所: 本番機（N100）上で root として実行する。Mac では実行しない。
 #           Mac からは deploy/deploy.sh（ssh + sudo の薄いラッパー）経由で呼ぶ。
 #
+# ============================================================================
+# Rust 版へ切り替えたあとは、このスクリプトは何もせずに断る（終了コード 3）
+# ============================================================================
+#   次のどちらかなら、サービスにも git にも触れず、理由を表示して終わる（--dry-run でも）:
+#   - checkout の固定の印 /etc/geoframe/checkout-pinned がある。切替の手順で置き、戻しの猶予期間が終わるまで
+#     外さない。unit の状態に依らないので、Python 版へ戻したあとも断り続ける。Python 版の更新は、手順書の
+#     とおり、固定した commit への手での git reset だけにする（docs/rust-migration/cutover.md）。
+#   - geoframe-rs.service が enabled・active・masked のどれか（Rust 版が本番を動かしている／動かしていた）。
+#     状態を取得できないときも断る（確かめられないものは通さない）。
+#   切替のあとの本番の更新は deploy/rust-deploy.sh --production（バイナリの入れ替え）で行う。
+#
 set -euo pipefail
 
 # --- 対象は固定。引数で切り替えられないようにする ---
@@ -65,6 +76,9 @@ REPO_DIR="/opt/geoframe"
 VENV_PIP="/opt/geoframe/app/.venv/bin/pip"
 REQUIREMENTS="/opt/geoframe/app/requirements.txt"
 SERVICE="geoframe-server"
+# 切替のあとは更新を断る（上の説明）。固定の定数で、引数では変えられない
+PIN_FILE="/etc/geoframe/checkout-pinned"
+RUST_SERVICE="geoframe-rs.service"
 HEALTH_URL="http://localhost:8080/api/admin/status"
 HEALTH_TIMEOUT=30
 
@@ -74,6 +88,12 @@ OLD_HEAD=""
 NEW_HEAD=""
 
 log() { echo "[deploy-pull] $*" >&2; }
+# 断る（終了コード 3）。何も変更していない
+refuse() {
+    echo "[deploy-pull] 拒否: $*" >&2
+    echo "[deploy-pull] サービスにも git にも触れていない（終了コード 3）。docs/rust-migration/cutover.md を見ること" >&2
+    exit 3
+}
 die() { echo "[deploy-pull] ERROR: $*" >&2; exit 1; }
 
 # サービス停止後に失敗した場合、サービスは停止したままになる。
@@ -98,6 +118,12 @@ usage() {
 
 対象は固定で /opt/geoframe（引数では変えられない）。root で実行すること。
 Mac からは deploy/deploy.sh --target user@host を使うこと。
+
+Rust 版へ切り替えた機体では、何もせずに断る（終了コード 3）: checkout の固定の印
+/etc/geoframe/checkout-pinned がある、または geoframe-rs.service が enabled・active・masked のどれか
+（状態を取得できないときも）。--dry-run でも同じ。
+systemctl show の LoadState・UnitFileState・ActiveState は 1 行ずつちょうど 1 行（欠け・重複は断る）で、導入済みの
+unit の UnitFileState は disabled・static・indirect・generated・transient のどれか（空・未知の値は断る）。
 USAGE
 }
 
@@ -119,6 +145,45 @@ wait_for_health() {
     done
     log "HTTP 応答が 200 ではない（最後の値: '${code:-なし}'）"
     return 1
+}
+
+# Rust 版へ切り替えたあとなら断る（ファイル先頭の説明）。systemctl show の答えは、LoadState・UnitFileState・
+# ActiveState の 3 行がそれぞれちょうど 1 行あるときだけ読む（欠け・重複は、最後の行が勝つ読み方だと矛盾する行を
+# 取り違えるので断る。crates/geoframe/src/guard.rs の parse_show と同じ厳しさ）。LoadState と ActiveState は値が空でも
+# 断る。UnitFileState は、unit が無い（not-found）ときだけ空でよく、導入済みの unit では既知の『有効でない』値
+# （disabled・static・indirect・generated・transient）だけを通す。取得できない・読み取れない・未知の値は断る。
+refuse_after_cutover() {
+    local out load="" file="" active="" line n_load=0 n_file=0 n_active=0
+    if [ -e "$PIN_FILE" ] || [ -L "$PIN_FILE" ]; then
+        refuse "checkout の固定の印（${PIN_FILE}）がある。本番は Rust 版へ切り替え済みで、この checkout を更新しない（猶予期間が終わるまで外さない）"
+    fi
+    out="$(systemctl show --property=LoadState,UnitFileState,ActiveState "$RUST_SERVICE" 2>/dev/null)" \
+        || refuse "${RUST_SERVICE} の状態を取得できない。Rust 版が動いていないと確認できないので更新しない"
+    while IFS= read -r line; do
+        case "$line" in
+            LoadState=*)      load="${line#LoadState=}";     n_load=$((n_load + 1)) ;;
+            UnitFileState=*)  file="${line#UnitFileState=}"; n_file=$((n_file + 1)) ;;
+            ActiveState=*)    active="${line#ActiveState=}"; n_active=$((n_active + 1)) ;;
+        esac
+    done <<<"$out"
+    { [ "$n_load" -eq 1 ] && [ "$n_file" -eq 1 ] && [ "$n_active" -eq 1 ] && [ -n "$load" ] && [ -n "$active" ]; } \
+        || refuse "${RUST_SERVICE} の状態を読み取れない（LoadState・UnitFileState・ActiveState の行の欠け・重複・空）。Rust 版が動いていないと確認できないので更新しない"
+    case "$load" in
+        masked) refuse "${RUST_SERVICE} が mask されている（Rust 版へ切り替え済み）。この checkout を更新しない" ;;
+        not-found)
+            # 未導入。UnitFileState も空のはず（unit ファイルが無いのに有効の印があるのは矛盾）
+            [ -z "$file" ] || refuse "${RUST_SERVICE} が not-found なのに UnitFileState が空でない。状態を確認できないので更新しない" ;;
+        *)
+            case "$file" in
+                enabled*|masked*) refuse "${RUST_SERVICE} が ${file}（Rust 版へ切り替え済み）。この checkout を更新しない" ;;
+                disabled|static|indirect|generated|transient) ;;
+                *) refuse "${RUST_SERVICE} の UnitFileState が不明（'${file:-空}'）。有効でないと確認できないので更新しない" ;;
+            esac ;;
+    esac
+    case "$active" in
+        inactive|failed) ;;
+        *) refuse "${RUST_SERVICE} が ${active}（Rust 版が動いている）。この checkout を更新しない" ;;
+    esac
 }
 
 # ============================================================================
@@ -147,6 +212,9 @@ main() {
             *) echo "ERROR: 不明な引数: $1" >&2; usage >&2; exit 2 ;;
         esac
     done
+
+    # Rust 版へ切り替えた機体では、何もせずに断る。最初の検査（root の確認より前。何にも触れない）
+    refuse_after_cutover
 
     # root 必須。systemctl stop/start と、root 所有の /opt/geoframe への
     # 書き込み（git reset --hard）に必要。dry-run でも git fetch が .git へ

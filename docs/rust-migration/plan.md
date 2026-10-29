@@ -102,6 +102,9 @@ LAN内のLXDホスト上の`lxc-geoframe`を、移行完了まで検証環境と
 
 ### P5: 切替（PR 6）
 
+- **P5のPRD・設計（2026-10-30 承認）**: [p5-prd.md](p5-prd.md)・[p5-design.md](p5-design.md)。PRは2つ（P5a 準備→本番切替→P5b Pythonの撤去）。以下の項目は設計に取り込み済み。
+- **本番切替の手順書**: [cutover.md](cutover.md)（準備・保全・切替・確認・AIの書き込み系の操作・Pythonへ戻す・切り替え直す・復元・切替のあとの数日・クラウドAIの有効化・戻しの猶予期間と片付け。検証環境の演習でも使う）。
+
 - 本番`catalog.db`のバックアップと復元の演習、検証環境でのシャドー比較、本番でPythonを止めてRustを起動、スモークテスト、ロールバックと再切替の演習。
 - **ロールバック（Rust→Python）での簡易品質**（[server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)。試験は`tools/gen_quality_fixture.py`の`switchbacks`）: ①`photo_quality.algorithm`は特徴量の由来ではなく結果を作った実装の印で、Pythonは読まない（書き換えは不要・無意味）。②切り戻した直後はPythonの変化なしのサイクルがRustの`photo_quality`をそのまま保つので、配信は変わらない。③後で`dirty`になると、PythonがRust製の特徴量を含めて全行を再構築する。**グループの顔ぶれ・`kind`と`/api/v1/photos`の件数は変わらず**、同じSHAの写しの指標の差から出る順位・推奨・スコア（とそれによる`group_id`の振り直し）だけが変わりうる（完全重複の写しのうち表に出る方が入れ替わることがある）。④Pythonだけで解析した結果に戻したいときは、切り戻す前にRustが解析した特徴量の行（`analyzed_at`がRustへの切替の日時以降）を消し、Pythonに解析し直させる。これはRustの結果を保つ方法ではなく、Rustの別算法のpHashで結びついていた組が離れて、グループの顔ぶれ・`kind`・配信件数が変わりうる（試験`bridge_by_copy`）。演習では、③の場合は件数・行数・グループ数が変わらないこと、④の場合は解析し直しのあとの件数・行数・グループ数を記録することを手順に入れる。
 - `deploy/`の手順・unit・READMEをRust用に改め、PythonのCIと依存を外す。Python実装の削除は切替後に安定を確かめてから。
