@@ -1497,6 +1497,65 @@ fn status_clue_runnable_is_zero_while_the_provider_is_paused_and_follows_release
     assert_eq!(waits(&e), (2, 0, "model_not_found".to_string()));
 }
 
+/// 古い世代 A の解析日時を B より前にして、「最新の 1 行」が B になるようにする（互換行も合わせる）。
+fn age_stored_clues(e: &Env, at: &str) {
+    let at = at.to_string();
+    e.writer()
+        .call(move |c| {
+            c.execute("UPDATE ai_location_clues SET analyzed_at=?1", params![at])?;
+            c.execute("UPDATE photo_loc_clues SET analyzed_at=?1", params![at])?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn status_fallback_wait_clears_after_the_worker_reuses_an_older_generation_a_b_a() {
+    // 差し替え（実 bytes の SHA が変わる）と回転（DB の世代だけが変わる）の 2 通り
+    for rotate in [false, true] {
+        let lab = Lab::new();
+        let e = lab.env("clue-status-aba");
+        add(&e, 1, "", None, 0);
+        let path = e.config.data_dir.join("derivatives/fake1.jpg");
+        fs::write(&path, jpeg()).unwrap();
+        // A: 成功。解析日時を古くして、あとの B が最新の行になるようにする
+        cycle(&e);
+        assert_eq!(lab.posts().len(), 1);
+        age_stored_clues(&e, "2026-01-01T00:00:00Z");
+        assert_eq!(waits(&e), (0, 0, String::new()));
+        // B: 別の世代で成功
+        if rotate {
+            sql(&e, "UPDATE photos SET rotation=90");
+        } else {
+            fs::write(&path, imaging::rotate_jpeg(&jpeg(), 90).unwrap().jpeg).unwrap();
+        }
+        cycle(&e);
+        assert_eq!(lab.posts().len(), 2);
+        assert_eq!(waits(&e), (0, 0, String::new()));
+        // A へ戻す。ワーカーが保存済みの A を再利用して互換行へ投影し直す（送信は増えない）が、A の日時は古いまま
+        if rotate {
+            sql(&e, "UPDATE photos SET rotation=0");
+        } else {
+            fs::write(&path, jpeg()).unwrap();
+        }
+        // ワーカーが観測するまで、ファイルだけの変更は見えない（B のまま）
+        if !rotate {
+            assert_eq!(waits(&e), (0, 0, String::new()));
+        }
+        cycle(&e);
+        assert_eq!(lab.posts().len(), 2);
+        assert_eq!(
+            n(
+                &e,
+                "SELECT COUNT(*) FROM photo_loc_clues WHERE analyzed_at='2026-01-01T00:00:00Z'"
+            ),
+            1
+        );
+        assert!(matches!(targets(&e)[0].readiness, Readiness::Ready(_)));
+        assert_eq!(waits(&e), (0, 0, String::new()));
+    }
+}
+
 #[test]
 fn status_clue_runnable_is_absent_when_rust_does_not_judge() {
     let lab = Lab::new();

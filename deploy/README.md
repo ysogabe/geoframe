@@ -242,8 +242,12 @@ Decision が常駐している間は、この節のタイマーは「人が起�
 3. GPU が空いていなければ何もせず、翌朝にもう一度見る。空いているとみなすのは、llm-manager の
    lease が0件、ほかのプロセスの VRAM が1GB未満、GPU 使用率が10%未満、Ollama がモデルを
    読み込んでいない、のすべてを満たすとき。llm-manager か Ollama の状態を取れないときも使わない
-4. Decision を起動し、1. の判定待ち（`clue_runnable`）が0になったら止める。2時間を過ぎた、15分間判定が進まない、
-   別の処理が lease を取った・GPU を使い始めたときも止める（続きは翌朝）
+4. Decision を起動したあとは、総待ち `clue_pending` の減り方で進み具合を追い、次のどれかで止める
+   （続きは翌朝）。`clue_pending` が0になった、`db.loc.clue_pause` が空でない（Provider・用途の停止。待っても
+   進まない）、総待ちが15分間減らない、2時間を過ぎた、別の処理が lease を取った・GPU を使い始めた。
+   `clue_runnable` が一時的に0になっただけ（最後の1件が429などで後回し）で総待ちが残っていれば、
+   15分の猶予のあいだは Decision を動かしたまま待つ。旧 Python など `clue_runnable` が無いときは
+   `clue_pending` だけで見る
 
 判定が終わった日の Gemini への問い合わせは geoframe-server が続けるので、Decision を止めても
 候補づくりは進みます。

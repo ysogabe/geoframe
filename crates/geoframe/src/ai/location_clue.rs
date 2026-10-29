@@ -668,52 +668,54 @@ pub struct Waits {
 }
 
 /// STATUS 用: `display` の無い fallback の写真の判定を、画像を読まずに調べる。世代（`input_hash`）は実 bytes の
-/// SHA を含むので、保存された最新の行がその SHA で作った世代と、今の DB の入力から組み直した世代が一致するかで
-/// 決める。ファイルだけが変わった場合は、ワーカーが次の周期で観測して新しい世代のジョブを積むまで気づけない
-/// ので、現世代と違うジョブが生きているとき（`pending`／`running`／`deferred`）は待ちに戻す。
+/// SHA を含むので、保存された行（世代ごとに 1 行）それぞれの SHA で今の DB の入力から世代を組み直し、一致して
+/// 検証（[`judge`]。互換行との一致を含む）を通る行を探す。最新の行だけでは足りない: 回転や差し替えを元へ
+/// 戻すと、ワーカーは保存済みの古い世代の結果を再利用して互換行へ投影し直すが、その行の解析日時は更新しない。
+/// ファイルだけが変わった場合は、ワーカーが次の周期で観測して新しい世代のジョブを積むまで気づけないので、
+/// 一致した世代と違うジョブが生きているとき（`pending`／`running`／`deferred`）は待ちに戻す。
 fn recorded_fallback(conn: &Connection, input: &Input, model: &str) -> rusqlite::Result<Readiness> {
     if !jobs::object_exists(conn, "table", "ai_location_clues")? {
         return Ok(Readiness::Pending);
     }
     let version = processor_version(model);
-    let latest: Option<(String, Option<String>)> = conn
-        .query_row(
-            "SELECT input_hash,source_sha256 FROM ai_location_clues WHERE photo_id=?1
-            AND processor_version=?2 ORDER BY analyzed_at DESC,input_hash LIMIT 1",
-            params![input.id, version],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .optional()?;
-    let Some((hash, source)) = latest else {
-        return Ok(Readiness::Pending);
-    };
-    let mut observed = vec![source.filter(|s| s.len() == 64), None];
-    observed.dedup();
-    for observed_sha in observed {
-        let mut seen = input.clone();
-        seen.observed_sha = observed_sha;
-        if seen.key(model).input_hash != hash {
-            continue;
-        }
-        // 投影の `display` は、ファイルがあれば rel、無ければ空（`projection_rel`）。どちらも許す
-        for rel in [seen.rel.as_str(), ""] {
-            let readiness = judge(conn, &seen, model, rel)?;
-            if readiness == Readiness::Pending {
+    let mut stmt = conn.prepare_cached(
+        "SELECT input_hash,source_sha256 FROM ai_location_clues WHERE photo_id=?1
+        AND processor_version=?2 ORDER BY analyzed_at DESC,input_hash",
+    )?;
+    let rows = stmt
+        .query_map(params![input.id, version], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (hash, source) in rows {
+        let mut observed = vec![source.filter(|s| s.len() == 64), None];
+        observed.dedup();
+        for observed_sha in observed {
+            let mut seen = input.clone();
+            seen.observed_sha = observed_sha;
+            if seen.key(model).input_hash != hash {
                 continue;
             }
-            let other_live: bool = jobs::object_exists(conn, "table", "ai_jobs")?
-                && conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM ai_jobs WHERE kind='location_clue'
-                    AND target_key=?1 AND processor_version=?2 AND input_hash!=?3
-                    AND state IN ('pending','running','deferred'))",
-                    params![input.id.to_string(), version, hash],
-                    |r| r.get(0),
-                )?;
-            return Ok(if other_live {
-                Readiness::Pending
-            } else {
-                readiness
-            });
+            // 投影の `display` は、ファイルがあれば rel、無ければ空（`projection_rel`）。どちらも許す
+            for rel in [seen.rel.as_str(), ""] {
+                let readiness = judge(conn, &seen, model, rel)?;
+                if readiness == Readiness::Pending {
+                    continue;
+                }
+                let other_live: bool = jobs::object_exists(conn, "table", "ai_jobs")?
+                    && conn.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM ai_jobs WHERE kind='location_clue'
+                        AND target_key=?1 AND processor_version=?2 AND input_hash!=?3
+                        AND state IN ('pending','running','deferred'))",
+                        params![input.id.to_string(), version, hash],
+                        |r| r.get(0),
+                    )?;
+                return Ok(if other_live {
+                    Readiness::Pending
+                } else {
+                    readiness
+                });
+            }
         }
     }
     Ok(Readiness::Pending)

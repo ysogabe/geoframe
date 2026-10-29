@@ -8,11 +8,16 @@ geoframe-loc-decision.timer（Decision を動かすユーザーのユーザーun
    解析待ち・期限前の後回しだけの写真は含まない）。無ければ（旧 Python など）db.loc.clue_pending
    （Rust が判定するときは総待ち＝Rust の保存結果が今の入力に合っていない写真の数。Rust が判定
    しないときは旧 Python の行で数えた値）を使う。clue_pending が残っていても clue_runnable が
-   0 なら Decision を起動しない（起動しても進まないため）。起動後もこの値が減らなければ停滞とみなす
+   0 なら Decision を起動しない（起動しても進まないため）
 2. 人が Decision（llm-decision）を起動済みなら何もしない（止めるのも人に任せる）
 3. GPU が空いていなければ何もしない（翌朝もう一度見る）
-4. Decision を起動し、1. の判定待ち（clue_runnable、無ければ clue_pending）が0になったら止める。上限の時間を過ぎた・判定が
-   進まない・別の処理が GPU を使い始めたときも止める（続きは翌朝）
+4. Decision を起動したあとは、clue_pending（総待ち）の減り方で進み具合を追い、次のどれかで止める
+   - 総待ち（clue_pending）が0になった
+   - 固定の停止（db.loc.clue_pause が空でない。Provider・用途の停止）。待っても進まないのですぐ止める
+   - 総待ちが STALL_S（15分）減らない。clue_runnable が一時的に0になっても（最後の1件が429などで
+     後回しになったとき）総待ちが残っていれば、この猶予のあいだは Decision を動かしたまま待つ
+   - 上限の時間（RUN_LIMIT_S）を過ぎた・別の処理が GPU を使い始めた
+   clue_runnable が無い（旧 Python など）ときは clue_pending だけで見る（0 になれば止める）。続きは翌朝
 
 なお gpu-eval の Decision は今は常駐しているので、現状では 2. で「人が起動済み」と
 みなして何もしない（常駐をやめて必要なあいだだけ起動する運用に戻したときのために残している）。
@@ -39,6 +44,7 @@ import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 GEOFRAME_STATUS_URL = os.environ.get(
     "LOC_MORNING_GEOFRAME_STATUS_URL", "http://127.0.0.1:8080/api/admin/status")
@@ -73,16 +79,22 @@ def get_json(url: str, timeout: float = 5.0, headers: dict | None = None):
         return json.loads(r.read().decode("utf-8"))
 
 
-def clue_work(status: dict) -> int:
-    """STATUS から、今 Decision を動かせば進む判定待ちの数を取る。
+class ClueState(NamedTuple):
+    """STATUS の db.loc から読んだ判定待ち"""
+    work: int      # 今 Decision を動かせば進む数（clue_runnable。無ければ clue_pending）
+    total: int     # 総待ち（clue_pending）
+    pause: str     # 固定の停止の理由コード（clue_pause。無ければ空）
 
-    clue_runnable があればそれ、無ければ（旧 Python など）clue_pending。"""
+
+def clue_state(status: dict) -> ClueState:
     loc = status["db"]["loc"]
-    return int(loc["clue_runnable"] if "clue_runnable" in loc else loc["clue_pending"])
+    total = int(loc["clue_pending"])
+    work = int(loc["clue_runnable"]) if "clue_runnable" in loc else total
+    return ClueState(work, total, str(loc.get("clue_pause") or ""))
 
 
-def clue_pending() -> int:
-    return clue_work(get_json(GEOFRAME_STATUS_URL))
+def read_clue_state() -> ClueState:
+    return clue_state(get_json(GEOFRAME_STATUS_URL))
 
 
 def gpu_busy_reasons(status: dict | None, ollama_models: list | None,
@@ -214,10 +226,11 @@ def wait_for_restore(sleep, clock, deadline: float) -> None:
 
 def run(sleep=time.sleep, clock=time.monotonic) -> int:
     try:
-        pending = clue_pending()
+        state = read_clue_state()
     except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
         log(f"geoframe の STATUS を取れない: {exc}")
         return 1
+    pending = state.work      # 起動前は、今 Decision を動かして進められる数で決める
     mine = owned()
     active = decision_active()
     if active and not mine:
@@ -255,29 +268,36 @@ def run(sleep=time.sleep, clock=time.monotonic) -> int:
             sleep(2)
         log(f"Decision が応答した（{clock() - start:.0f}秒）")
         own = {decision_pid()} - {None}
-        last_progress, best = clock(), pending
+        # 起動後の進み具合は総待ちの減り方で追う。clue_runnable は後回しで一時的に0になりうる
+        last_progress, best = clock(), state.total
         while True:
             sleep(POLL_S)
+            before = state
             try:
-                pending = clue_pending()
+                state = read_clue_state()
             except (urllib.error.URLError, OSError, ValueError, KeyError) as exc:
                 log(f"geoframe の STATUS を取れない（続ける）: {exc}")
-                pending = best
-            if pending == 0:
+                state = before
+            if state.total == 0:
                 log("判定待ちが0になった")
                 return 0
-            if pending < best:
-                best, last_progress = pending, clock()
+            if state.pause:
+                log(f"判定が止まっている（{state.pause}）。残り {state.total} 枚は翌朝")
+                return 0
+            if state.work == 0 and before.work > 0:
+                log(f"今動かせる判定待ちが0（総待ち {state.total} 枚。後回しの再試行を待つ）")
+            if state.total < best:
+                best, last_progress = state.total, clock()
             if clock() - start > RUN_LIMIT_S:
-                log(f"上限の {RUN_LIMIT_S // 60} 分を過ぎた。残り {pending} 枚は翌朝")
+                log(f"上限の {RUN_LIMIT_S // 60} 分を過ぎた。残り {state.total} 枚は翌朝")
                 return 0
             if clock() - last_progress > STALL_S:
-                log(f"{STALL_S // 60} 分間判定が進まない。残り {pending} 枚は翌朝")
+                log(f"{STALL_S // 60} 分間判定が進まない。残り {state.total} 枚は翌朝")
                 return 1
             status, models = read_gpu_state()
             reasons = gpu_busy_reasons(status, models, own_pids=own, strict=False)
             if reasons:
-                log(f"ほかの処理が GPU を使い始めたので譲る（残り {pending} 枚は翌朝）: "
+                log(f"ほかの処理が GPU を使い始めたので譲る（残り {state.total} 枚は翌朝）: "
                     + " / ".join(reasons))
                 if paused_by_manager(status):
                     wait_for_restore(sleep, clock, start + RUN_LIMIT_S)
