@@ -733,15 +733,18 @@ setup; no_prod_marker; prod_rollback
 expect "本番: .prev が無い --rollback は終了コード1" test "$rc" = 1
 
 # 環境変数で検査を外せない（--production は GEOFRAME_RS_* を使わず、あれば断る。sudo -E など環境を引き継ぐ実行を想定）
-envrefuse() { # envrefuse <名前=値...>: その環境変数を付けて、全部正しい指定で動かす（prodsh を通さず、環境をそのまま渡す）
+envrefuse() { # envrefuse <名前=値...>: 既にある GEOFRAME_RS_* を全部外し、指定の環境変数だけを付けて、全部正しい指定で動かす（prodsh を通さず、環境をそのまま渡す）
     SHA_OK="$(pbin)"; : > "$T_LOG"
-    env "$@" bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" \
+    local unset_args=() name
+    for name in $(compgen -e | grep '^GEOFRAME_RS_' || true); do unset_args+=(-u "$name"); done
+    env "${unset_args[@]}" "$@" bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" \
         --expect-commit="$HEAD_SHA" --expect-min-photos=1 --wait-secs=2 > "$T/out" 2>&1
     rc=$?
 }
 for kv in "GEOFRAME_RS_TEST_MARKER=$T/env/etc/other-marker" "GEOFRAME_RS_TEST_UNIT_DIR=$T/env/units" "GEOFRAME_RS_TEST_ETC_UNIT_DIR=$T/env/etc-units" \
           "GEOFRAME_RS_TEST_ENV_FILE=$T/env/etc/geoframe-rs" "GEOFRAME_RS_TEST_ROOT_UID=$(id -u)" "GEOFRAME_RS_CHECK_BASE=http://127.0.0.1:1" \
-          "GEOFRAME_RS_BIN=$MOCK_BIN" "GEOFRAME_RS_WAIT_SECS=2" "GEOFRAME_RS_LOCAL_BIN=$T/stage/geoframe"; do
+          "GEOFRAME_RS_BIN=$MOCK_BIN" "GEOFRAME_RS_WAIT_SECS=2" "GEOFRAME_RS_LOCAL_BIN=$T/stage/geoframe" \
+          "GEOFRAME_RS_TEST_MARKER=" "GEOFRAME_RS_UNKNOWN_NAME=1"; do
     setup; no_prod_marker; : > "$T/env/calls.log"; envrefuse "$kv"
     expect "本番: 環境に ${kv%%=*} があれば断る（終了コード4・何も変えず、systemctl にも触れない）" test "$rc" = 4 -a ! -s "$T/env/calls.log" -a "$(content "$MOCK_BIN")" = OLD-BIN
 done

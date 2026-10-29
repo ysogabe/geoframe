@@ -180,7 +180,7 @@ fi
 # 本番の指定（--production）のとき、ラッパーが同じプロセスの環境変数で渡す（ssh は通らないので消えない）。
 # 検証環境（ssh）では空: prod_host=期待するホスト名  min_photos=配布後の /api/v1/photos の件数の下限
 # skip_py=1 で Python 版の状態の検査を除く（--check-only）
-prod_host="${RD_PROD_HOST:-}" min_photos="${RD_MIN_PHOTOS:-}" skip_py="${RD_SKIP_PY:-0}"="${RD_MIN_PHOTOS:-}" skip_py="${RD_SKIP_PY:-0}"
+prod_host="${RD_PROD_HOST:-}" min_photos="${RD_MIN_PHOTOS:-}" skip_py="${RD_SKIP_PY:-0}"
 
 mode="" bin="" base="" wait_secs="" stage="" unit_path=""
 # 配布前の状態と、どこまで変更したか（失敗時の復元に使う）
