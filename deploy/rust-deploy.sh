@@ -122,7 +122,8 @@ unit とバイナリ（geoframe.failed へ退避）を撤去する。
 
 終了コード: 0 成功 / 1 失敗したが配布前の状態へ戻した / 3 戻す途中で失敗した（手作業の復旧が要る。
             手順が表示される）/ 4 誤配布の防止のため拒否した（何も変更していない）/ 2 引数の誤り。
-            初回の本番の配布が 0 でなければ、すぐ Python 版へ戻す手順（cutover.md）を行うこと。
+            Python 版を止めたあとの初回の本番の配布が 0 でなければ、すぐ Python 版へ戻す手順（cutover.md §8）を行うこと。
+            ただし 2・4（何も変えずに断った）は、原因がすぐ直せて配信停止の期限内に再実行できるときだけ再実行してよい（cutover.md §0.4）。
 
 誤配布の防止（変更の前に検査。--rollback も同じ）:
   検証環境:
@@ -363,7 +364,12 @@ fail() { fail_step="$*"; say "失敗: $*"; }
 restore_done=0
 manual_hint() {
     say "================================================================"
-    say "自動で戻せなかった（失敗した操作: ${fail_step:-不明}）。検証環境で root として手で戻すこと:"
+    if [ -n "$prod_host" ]; then
+        say "自動で戻せなかった（失敗した操作: ${fail_step:-不明}）。本番機で root として手で戻すこと:"
+        say "  （Python 版へ戻すのは docs/rust-migration/cutover.md §8。先に下の 1. で geoframe-rs を止めてから行う）"
+    else
+        say "自動で戻せなかった（失敗した操作: ${fail_step:-不明}）。検証環境で root として手で戻すこと:"
+    fi
     say "  1. まず止める（Restart=on-failure で、失敗した状態が 5 秒おきに再起動されうる）:"
     say "       systemctl stop ${unit_name}"
     say "  2. 状態を見る:  ls -l ${bin} ${bin}.prev ${bin}.failed ${unit_path} ${unit_path}.prev"

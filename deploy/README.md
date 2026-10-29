@@ -586,8 +586,8 @@ checkout の`HEAD`が`--expect-commit`（40 桁）と違う／追跡下のファ
 `--bin`の写し（root 所有の一時ディレクトリへ写してから`sha256`を取る。入れるのはその写し）が`--expect-sha256`と違う。
 配布のあと`/api/v1/photos`の件数が`--expect-min-photos`より少なければ、DATA_DIR の誤りなどとして失敗にし、配布前の状態へ戻す。
 数の引数は桁を絞る: `--expect-min-photos`は 1 以上 999999999 以下（9 桁まで）、`--wait-secs`は 0〜3600。範囲外・数でない値は終了コード 2 で断る（Bash の整数比較は大きすぎる値で異常終了し、
-`if`の中では「下限を満たした」ように進んでしまうため）。確認の本体も、比較が成り立つときだけ通し、比較の異常は失敗として戻す。初回の配布が 0 でなければ、
-すぐ Python 版へ戻す（手順は`cutover.md`）。入れる unit は、その checkout の`deploy/geoframe-rs.service`。
+`if`の中では「下限を満たした」ように進んでしまうため）。確認の本体も、比較が成り立つときだけ通し、比較の異常は失敗として戻す。Python 版を止めたあとの初回の配布が 0 でなければ、
+すぐ Python 版へ戻す（手順は`cutover.md` §8）。ただし終了コード 2・4（何も変えずに断った）は、原因がすぐ直せて配信停止の期限内に再実行できるときだけ再実行する（`cutover.md` §0.4）。入れる unit は、その checkout の`deploy/geoframe-rs.service`。
 
 サービスを止めて CLI を動かすとき（AI の書き込み系の操作など）は、`sudo deploy/geoframe-admin.sh ai-jobs …`を使う（root で直接`geoframe`を動かさない。動かす前に DATA_DIR のパスが表示される）。
 `deploy-pull.sh`（Python 版の更新）は、`/etc/geoframe/checkout-pinned`がある、または`geoframe-rs`が enabled・active・masked のとき、何もせずに終了コード 3 で断る。

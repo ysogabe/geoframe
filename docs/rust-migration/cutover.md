@@ -4,7 +4,7 @@
 
 - 要求・設計: [p5-prd.md](p5-prd.md)・[p5-design.md](p5-design.md)
 - 使う道具: [`rust-deploy.sh`](../../deploy/rust-deploy.sh)・[`deploy-pull.sh`](../../deploy/deploy-pull.sh)・[`geoframe-admin.sh`](../../deploy/geoframe-admin.sh)・[`geoframe-rs.service`](../../deploy/geoframe-rs.service)・[`geoframe-server.service`](../../deploy/geoframe-server.service)・[`backup-catalog.sh`](../../deploy/backup-catalog.sh)・[deploy/README.md §7](../../deploy/README.md)
-- 検証環境（lxc-geoframe）の演習（T5.4）でも、この手順書を使う。本番と違う所は「**演習では**」で注記する（[§0.6](#06-演習では本番との違い)にまとめた）。
+- 検証環境（lxc-geoframe）の演習（T5.4）でも、この手順書を使う。本番と違う所は「**演習では**」で注記する（[§0.6](#06-演習では本番との違い)にまとめた）。演習に固有の確認（省く節・置き換える節・シャドー比較・`Conflicts=` の試験・元に戻す手順）は [§15 演習（T5.4）のチェックリスト](#15-演習t54のチェックリスト)にまとめた。
 
 **この手順書のコマンドは、本番機で、ユーザーの立ち会いのもと、段ごとの許可を得てからだけ実行する。** 手順書を書く・読む・レビューする作業では実行しない。
 
@@ -26,6 +26,7 @@
 | 12 | クラウド AI の有効化（数日後） | AI 設定を変えて再起動 |
 | 13 | 戻しの猶予期間と片付け | 片付ける（ユーザーの許可で） |
 | 14 | 記録 | `p5-acceptance.md` に書く |
+| 15 | 演習（T5.4）のチェックリスト | 検証環境だけ |
 
 ## 0. 前提と役割
 
@@ -66,7 +67,7 @@
 | `/etc/geoframe/checkout-pinned` | §3 で置く。**猶予期間が終わるまで外さない** | §13 |
 | `/var/lib/geoframe`（DATA_DIR） | Python が止まったあと、Rust（`geoframe`ユーザー）が書く | §4 のバックアップ・§10 |
 | `/var/backups/geoframe` | §4 で `p5-precutover-<時刻>.db.gz` を足す | 消さない（P5 の記録が終わるまで） |
-| `geoframe-backup.timer` | §4 で止め、§6 で戻す | §6・§10 |
+| `geoframe-backup.timer` | §4.1 で止める。**止めたら、どの出口（成功・中断・Python へ戻す・復元）でも [§4.5](#45-バックアップのタイマーを戻す共通の出口) で戻す** | §4.5 |
 | 作業用の置き場（`/root/p5-cutover`） | 控え・tar・バイナリ・補助スクリプト（`0700 root`。リポジトリの外） | 記録のあと、ユーザーの許可で消す |
 
 ### 0.4 時間の目安と止める判断
@@ -83,13 +84,15 @@
 
 - **配信が止まっている**（`/healthz` か `/api/v1/photos` が 200 にならない）: T0 から **10 分**で直らなければ戻す。
 - **配信は続いているが機能に問題がある**（写真の欠け・管理操作の失敗・取り込みの失敗）: T1 から **30 分**のうちに原因と直し方が見えなければ戻す。
-- **`rust-deploy.sh --production` の終了コードが 0 でない**: 待たずに**すぐ §8**（理由は [§5](#5-rust-を入れる)）。
+- **`rust-deploy.sh --production` の終了コードが 0 でない**（Python を止めたあとの §5 では、何も変えずに断った 2・4 も含めて、規則は一つ）: 終了コード 1・3 は待たずに**すぐ §8**。終了コード 2・4 は、**原因がすぐ直せて、T0 から 10 分の配信停止の期限内に再実行して 0 になる見込みがあるときだけ**、1 回再実行する。再実行も 0 でないとき、原因が分からないとき、直すのに配布物や設定の入れ直しが要るとき、期限に間に合わないときは**すぐ §8**（理由は [§5](#5-rust-を入れる)）。
 - どちらにも当たらない迷いは、ユーザーに聞く。時間が過ぎていても、原因が見えていて直る見込みが数分ならユーザーが続けてよい（その判断を記録する）。
 
 ### 0.5 共通の約束と補助スクリプト
 
 - **コマンドは root のシェル（`sudo -i`）で打つ**前提で書く。`/var/lib/geoframe` は `0750 geoframe` なので、`sudo` を付けてばらばらに打つと、glob（`catalog.db*`）とリダイレクト（`>`）が一般ユーザーのシェルで展開されて失敗する。ばらばらに打つなら `sudo sh -c '…'` に包む。サービスのユーザーで動かす所だけ `sudo -u geoframe` と書いてある。
-- **環境変数 `GEOFRAME_RS_*` を持ったシェルでは `rust-deploy.sh --production` を動かさない**（持っていれば終了コード 4 で断られる）。確かめ方は §1.8。
+- **環境変数 `GEOFRAME_RS_*` を持ったシェルでは `rust-deploy.sh --production` を動かさない**（持っていれば終了コード 4 で断られる）。確かめ方は §1.8（**名前だけ**を出す。`env | grep` は値まで出すので使わない）。
+- **ログは秘密を除いて出す処理ではない**。`journalctl … | grep` や `cut -c1-200` は、行を選ぶ・長さを切るだけで、値を隠さない。特に **Python 版のログには写真のファイル名・パスが出る**（`[fetch]` の行など）。Python 版の journal は、**件数（`grep -c`）か固定の語の有無だけ**を画面に出し、生の行を安全な出力として扱わない。行の中身が要るとき（起動しない原因を調べるなど）は `$WORK` に保存して読み（`journalctl … > "$WORK/py-journal.txt"`。`0600 root`）、報告・`p5-acceptance.md` へは例外の型・ステータスコード・件数だけを写す。Rust 版のログは定型文だけを出す設計（段の名前・種類・件数・写真の `id`）なので、画面に出してよい。
+- **「DB を開いているプロセスが無い」の確認は `dbopen.sh`（§1.4）を使う**（§4.2・§8.1・§10.1）。`fuser` があれば `fuser`、無ければ `/proc` の走査で調べる。**終了コード 0（開いているプロセスが無いと確認できた）のときだけ「無い」と扱う。** 1（ある）はもちろん、2（`fuser` も `/proc` も使えない・root でない・対象のファイルが無い・`fuser` が致命的なエラー）は「確認できなかった」であり、先へ進まない。`fuser: command not found` や空の出力を「無い」と読まない。
 - **秘密と実値を画面から文書へ写さない**: ホスト名・件数・SHA・ファイル名・座標・地名・設定の値は、`p5-acceptance.md` にも書かない（書くもの・書かないものは §14）。設定のファイルは、モード・所有者・**名前だけ**を確かめ、中身は読まない。
 - 変数（値は自分で埋める。ここへ書き戻さない）:
 
@@ -99,10 +102,11 @@ HOST='<本番のホスト名>'                # hostname の出力
 COMMIT='<P5aのマージのコミット（40桁）>'
 SHA='<演習で記録したバイナリのsha256（64桁）>'
 BIN="$WORK/geoframe"                  # 切替に使うバイナリ（§1.8 で置く）
+PYAPP=/opt/geoframe/app               # Python 版のコードと venv（$PYAPP/.venv）。演習では /opt/geoframe-pyref/app
 BASE=http://127.0.0.1:8080
 ```
 
-補助スクリプトは §1.4 で `$WORK` に作る（標準ライブラリだけ。`python3 -I` で動かす）。出すのは件数・ID・固定のキー名だけで、写真の値は出さない。
+補助スクリプトは §1.4 で `$WORK` に作る（Python は標準ライブラリだけで `python3 -I` で動かす。シェルは `dbopen.sh`・`dumpsha.sh`・`drafts_sha.sh`）。出すのは件数・固定のキー名だけで、写真の値（ID ごとの座標・下書きのパス・ファイル名）は画面に出さず、`$WORK` のファイルにだけ置く。
 
 ### 0.6 演習では（本番との違い）
 
@@ -116,13 +120,13 @@ BASE=http://127.0.0.1:8080
 | `/etc/systemd/system/geoframe-rs.service` の古い本体 | 無い | 退避する（新しい置き場所より優先されるので `rust-deploy.sh` が断る） |
 | Python 版 unit | 本番の本体を `/etc/systemd/system/` から移す | 比較用 Python（`/opt/geoframe-pyref` の checkout と venv）を、`geoframe-server.service` の名前・同じ DATA_DIR・8080 で `/usr/local/lib/systemd/system/` に一時的に置く（§3.2 の「移す」は省く） |
 | `deploy-pull.sh`（§1.1） | 使う | 使わない（`/opt/geoframe` 固定の道具）。checkout は手で更新する |
-| `fuser`（psmisc） | 無ければユーザーの許可で導入 | 有無を確かめ、無ければ導入 |
+| `fuser`（psmisc） | 無くてよい（`dbopen.sh` が `/proc` で代わる） | 同じ。有無と、`dbopen.sh` がどちらの経路で判定したかを記録する |
 | 設定のファイルの値 | 本番の値 | `GEOFRAME_DRIVE_KEY` は存在しないパス（取り込みは Drive へ出ずに終わる）。AI 設定はローカルの用途だけ。Python 役は AI 無効・鍵なし |
 | データ | 本番 | 本番のバックアップから作った新しいコピー（鍵は入れない） |
 | §6 の miharashi・管理画面 | 実機 | 検証環境の方法（`tools/miharashi-feed-check`・`compare_with_python.py` など）。結果は `p5-acceptance.md` |
 | 時間 | 本番の T0〜T1 を記録 | `--wait-secs` の値と、停止から配信の再開までを**測る** |
 | 立ち会い・許可 | ユーザー | 演習の開始の許可だけでよい |
-| 終わったあと | 猶予期間 | 一時的な Python 版 unit・drop-in・設定のファイル・印の退避を元に戻す（設計 §演習 9） |
+| 終わったあと | 猶予期間 | 一時的な Python 版 unit・drop-in・設定のファイル・印の退避を元に戻す（設計 §演習 9。[§15.6](#156-元に戻す流れ-9)） |
 
 ## 1. 準備（前日まで）
 
@@ -175,12 +179,14 @@ git -C /opt/geoframe diff --stat "$DRILL" "$COMMIT" -- crates Cargo.toml Cargo.l
 ### 1.3 道具の有無
 
 ```sh
-command -v fuser sqlite3 curl python3 tar gzip sha256sum file
+command -v sqlite3 curl python3 tar gzip sha256sum file xargs readlink
+command -v fuser || echo "fuser なし（dbopen.sh が /proc の走査で代わる。導入しなくてよい）"
 sqlite3 --version
+test -x "$PYAPP/.venv/bin/python" && echo "Python 版の venv あり"
 ```
 
-- 確かめること: すべて出る。**`fuser`（psmisc）が無ければ**、導入（`apt install psmisc`）をユーザーに提案する。許可が出なければ §4.2 の代わりの確認（`find /proc`）を使う。`jq` は使わない（補助スクリプトが `python3 -I`）。
-- 失敗したら: 無い道具があれば、その段の前に導入の許可を取る（本番の依存を勝手に足さない）。
+- 確かめること: `fuser` 以外はすべて出る。**`fuser`（psmisc）は無くてよい**: `dbopen.sh`（§1.4）が `/proc` の走査で代わる（本番の依存を足さない）。どちらの経路で判定したかは `dbopen.sh` の出力に出る。`jq` は使わない（補助スクリプトが `python3 -I`）。
+- 失敗したら: `fuser` 以外の道具が無ければ、その段の前に導入の許可を取る（本番の依存を勝手に足さない）。`$PYAPP/.venv` が無いと §8.1 の `.cache.json` の確認ができない（Python 版は venv がなければ戻せない）ので、切替の前に直す。
 
 ### 1.4 作業用の置き場と補助スクリプト
 
@@ -196,14 +202,75 @@ for p in json.load(open(sys.argv[1])):
 PY
 
 cat > extra.py <<'PY'
-# 使い方: python3 -I extra.py <フィードのJSON> <ID の一覧>   一覧の写真の件数と、属する群の数だけを出す
-import json, sys
+# 使い方: python3 -I extra.py <Rust のフィードの JSON> <増えた ID の一覧> <展開した切替前のバックアップ> [<説明できない ID の出力先>]
+# Rust のフィードにだけある写真（増えた分）が、既知の差（p4-acceptance.md §7.3）などで説明できるかを、
+# 切替の前の DB（バックアップを展開したもの。§6.8）の事実と照らして調べる。出すのは件数だけ。
+# 分け方（上から順に当てる）:
+#   取り込み … 切替の前の DB に無い、または表示できる状態でなかった（display か位置が無い）。Rust の取り込みで増えた
+#   既知の差 … 切替の前の DB で、旧グループ（photo_ai_groups: judged・同一場面）の推薦でない・お気に入りでない写真で、
+#              そのグループの推薦写真（代表）がすべて表示できないか特徴量の世代（display・md5・mtime・SHA-256）が合わない、
+#              またはその写真自身の特徴量の世代が合わない（Rust は世代が合わない代表・メンバーを有効と見なさず、隠すのをやめる）
+#   説明できない … 上のどちらでもない。終了コード 1（ID は出力先のファイルにだけ書く。画面には出さない）
+import json, sqlite3, sys
+
 feed = json.load(open(sys.argv[1]))
-ids = {l.strip() for l in open(sys.argv[2]) if l.strip()}
-rows = [p for p in feed if str(p["id"]) in ids]
-def groups(key):
-    return len({p.get(key) for p in rows if p.get(key) is not None})
-print("件数", len(rows), "ai_group", groups("ai_group"), "quality_group", groups("quality_group"))
+ids = {int(l) for l in open(sys.argv[2]) if l.strip()}
+con = sqlite3.connect("file:%s?mode=ro&immutable=1" % sys.argv[3], uri=True)
+con.row_factory = sqlite3.Row
+
+def one(sql, *a):
+    return con.execute(sql, a).fetchone()
+
+def shown(p):
+    return bool(p and p["display"] and p["lat"] is not None and p["lon"] is not None and not p["hidden"])
+
+def generation_ok(pid, p):
+    af = one("SELECT display, source_md5, source_mtime, content_sha256 FROM photo_ai_features WHERE photo_id=?", pid)
+    qf = one("SELECT display, source_md5, source_mtime, content_sha256, error FROM photo_quality_features WHERE photo_id=?", pid)
+    if not af or not qf or qf["error"] != "":
+        return False
+    for f in (af, qf):
+        if f["display"] != p["display"] or f["source_md5"] != p["md5"] or f["source_mtime"] != p["mtime"]:
+            return False
+    return af["content_sha256"] == qf["content_sha256"]
+
+def usable_representative(pid):
+    p = one("SELECT display, md5, mtime, lat, lon, hidden FROM photos WHERE id=?", pid)
+    return shown(p) and generation_ok(pid, p)
+
+rows = [p for p in feed if p["id"] in ids]
+def groups(key):          # 空文字・None は群ではない
+    return len({p.get(key) for p in rows if p.get(key) not in (None, "")})
+
+fetched = known = 0
+known_groups = set()
+unexplained = []
+for i in sorted(ids):
+    p = one("SELECT display, md5, mtime, lat, lon, hidden, favorite FROM photos WHERE id=?", i)
+    if p is None or not shown(p):
+        fetched += 1
+        continue
+    explained = False
+    if not p["favorite"]:
+        for m in con.execute("""SELECT m.group_id g FROM photo_ai_group_members m JOIN photo_ai_groups g ON g.group_id=m.group_id
+                                 WHERE m.photo_id=? AND m.recommended=0 AND g.status='judged' AND g.same_scene=1""", (i,)):
+            reps = [r["photo_id"] for r in con.execute(
+                "SELECT photo_id FROM photo_ai_group_members WHERE group_id=? AND recommended=1", (m["g"],))]
+            if not generation_ok(i, p) or not any(usable_representative(r) for r in reps):
+                explained = True
+                known_groups.add(m["g"])
+    if explained:
+        known += 1
+    else:
+        unexplained.append(i)
+
+print("増えた", len(ids), "件（フィードに", len(rows), "件）: 取り込み", fetched, "既知の差", known,
+      "（旧グループ", len(known_groups), "群）説明できない", len(unexplained))
+print("ai_group（空を除く）", groups("ai_group"), "群 quality_group", groups("quality_group"), "群")
+if unexplained and len(sys.argv) > 4:
+    with open(sys.argv[4], "w") as out:
+        out.write("".join("%d\n" % i for i in unexplained))
+sys.exit(1 if unexplained else 0)
 PY
 
 cat > status_counts.py <<'PY'
@@ -227,11 +294,13 @@ for k in ("ai_task_blocks", "ai_config_invalid", "ai_pauses", "ai_waits"):
 PY
 
 cat > check_files.py <<'PY'
-# 使い方: python3 -I check_files.py <フィードのJSON>   フィードの file を全部 GET し、200 でない数だけを出す
+# 使い方: python3 -I check_files.py <フィードのJSON> [<200 でない写真の ID の出力先>]
+# フィードの file を全部 GET し、200 でない数だけを出す（ID は出力先のファイルにだけ書く）
 import http.client, json, sys, urllib.parse
 feed = json.load(open(sys.argv[1]))
 conn = http.client.HTTPConnection("127.0.0.1", 8080, timeout=30)
-bad = n = 0
+bad = []
+n = 0
 for p in feed:
     f = p.get("file")
     if not isinstance(f, str):
@@ -241,8 +310,10 @@ for p in feed:
     r = conn.getresponse()
     r.read()
     if r.status != 200:
-        bad += 1
-print("確かめた", n, "200でない", bad)
+        bad.append(p["id"])
+print("確かめた", n, "200でない", len(bad))
+if len(sys.argv) > 2:
+    open(sys.argv[2], "w").write("".join("%s\n" % i for i in bad))
 PY
 
 cat > counts.sql <<'SQL'
@@ -254,11 +325,127 @@ SELECT 'rotated', count(*) FROM photos WHERE rotation IS NOT NULL AND rotation<>
 SELECT 'quality_rows', count(*) FROM photo_quality;
 SELECT 'quality_groups', count(DISTINCT group_id) FROM photo_quality;
 SELECT 'algorithm:' || algorithm, count(*) FROM photo_quality GROUP BY algorithm;
+SELECT 'kind:' || group_kind, count(*) FROM photo_quality GROUP BY group_kind;
 SQL
-chmod 0600 *.py counts.sql
+
+cat > state_snapshot.sql <<'SQL'
+.headers off
+.mode list
+.separator "\t"
+SELECT id, ifnull(loc_source,''), ifnull(lat,''), ifnull(lon,''), ifnull(favorite,0), ifnull(hidden,0), ifnull(rotation,0), ifnull(display,'')
+  FROM photos
+ WHERE loc_source='manual' OR favorite=1 OR hidden=1 OR (rotation IS NOT NULL AND rotation<>0)
+ ORDER BY id;
+SQL
+
+cat > state_diff.py <<'PY'
+# 使い方: python3 -I state_diff.py <前の .tsv> <後の .tsv>   ID ごとの行（手動の位置・お気に入り・除外・回転・display）を比べ、件数だけを出す。
+# 値は画面に出さない（座標が入っている）。違いがあれば終了コード 1。
+import sys
+def load(path):
+    d = {}
+    for line in open(path, encoding="utf-8"):
+        line = line.rstrip("\n")
+        if line:
+            d[line.split("\t", 1)[0]] = line
+    return d
+a, b = load(sys.argv[1]), load(sys.argv[2])
+changed = sum(1 for k in a.keys() & b.keys() if a[k] != b[k])
+only_a, only_b = len(a.keys() - b.keys()), len(b.keys() - a.keys())
+print("前", len(a), "件 後", len(b), "件: 値が違う", changed, "前だけ", only_a, "後だけ", only_b)
+sys.exit(1 if changed or only_a or only_b else 0)
+PY
+
+cat > cache_load.py <<'PY'
+# 使い方: sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe GEOFRAME_AI_ENABLED=0 GEOFRAME_LOC_SUGGEST=0 \
+#           $PYAPP/.venv/bin/python -I -B - $PYAPP < cache_load.py
+# Python 版が起動時にやる読み方（store.load_cache → purge_cache_legacy）を、Python 版自身の関数で、メモリの中だけで行う。
+# .cache.json には書かない。load_cache は読めないとき黙って {} にして、あとで空の内容で上書きするので、
+# ファイルを別に JSON として読んだ件数と照らす。出すのは件数だけ。読めない・件数が合わないときは終了コード 1。
+import json, sys
+sys.path.insert(0, sys.argv[1])
+from geoframe import config, store
+try:
+    raw = json.loads(config.CACHE_FILE.read_text(encoding="utf-8"))
+except FileNotFoundError:
+    print(".cache.json: 無い（Python は空で始める）"); sys.exit(0)
+except Exception as e:
+    print(".cache.json: JSON として読めない（", type(e).__name__, "）。Python は空で始めて上書きする"); sys.exit(1)
+if not isinstance(raw, dict):
+    print(".cache.json: 辞書でない。Python は使えない"); sys.exit(1)
+store.load_cache()
+loaded = len(store._cache)
+legacy = store.purge_cache_legacy()      # メモリの上だけ。起動時に捨てられるキー（現役でない接頭辞）の数
+print("file_keys=%d python_loaded=%d python_will_drop=%d python_keeps=%d" % (len(raw), loaded, legacy, loaded - legacy))
+sys.exit(0 if loaded == len(raw) else 1)
+PY
+
+cat > dbopen.sh <<'SH'
+#!/bin/bash
+# 使い方: dbopen.sh   /var/lib/geoframe/catalog.db*（-wal・-shm を含む）を開いているプロセスの有無を調べる。root で動かす
+# 終了コード: 0 開いているプロセスは無いと確認できた / 1 ある / 2 確認できなかった（「無い」と扱わない）
+# fuser があれば fuser、無ければ /proc/<pid>/fd の走査。
+set -u
+shopt -s nullglob
+[ "$(id -u)" = 0 ] || { echo "確認できない: root で実行すること" >&2; exit 2; }
+files=(/var/lib/geoframe/catalog.db*)
+[ "${#files[@]}" -gt 0 ] || { echo "確認できない: 対象のファイルが無い" >&2; exit 2; }
+if command -v fuser >/dev/null 2>&1; then
+    out=$(fuser -v "${files[@]}" 2>&1); rc=$?
+    if [ "$rc" = 0 ]; then echo "開いているプロセスがある（fuser）:"; echo "$out"; exit 1; fi
+    # fuser は「プロセスが無い」も「致命的なエラー」も rc=1 を返す。出力が空のときだけ「無い」と読む
+    if [ "$rc" = 1 ] && [ -z "$out" ]; then echo "開いているプロセスは無い（fuser）"; exit 0; fi
+    echo "確認できない: fuser が rc=$rc でエラーを出した" >&2; exit 2
+fi
+compgen -G '/proc/[0-9]*/fd/*' >/dev/null || { echo "確認できない: /proc を調べられない" >&2; exit 2; }
+hits=()
+for fd in /proc/[0-9]*/fd/*; do
+    t=$(readlink -- "$fd" 2>/dev/null) || continue
+    case "$t" in
+        /var/lib/geoframe/catalog.db*) p=${fd#/proc/}; hits+=("${p%%/*}") ;;
+    esac
+done
+if [ "${#hits[@]}" -gt 0 ]; then echo "開いているプロセスがある（/proc）: pid ${hits[*]}"; exit 1; fi
+echo "開いているプロセスは無い（/proc の fd を走査）"
+exit 0
+SH
+
+cat > dumpsha.sh <<'SH'
+#!/bin/bash
+# 使い方: dumpsha.sh <sqlite3 の URI> [実行ユーザー]   .dump の SHA-256 を 1 行で出す。
+# 途中（sudo・sqlite3・sha256sum）のどれかが失敗したら何も出さずに非ゼロで終わる。出力が空のときのハッシュも断る。
+set -euo pipefail
+[ "$#" -ge 1 ] || { echo "使い方: dumpsha.sh <URI> [user]" >&2; exit 2; }
+if [ -n "${2:-}" ]; then run=(sudo -u "$2" sqlite3); else run=(sqlite3); fi
+sha=$("${run[@]}" "$1" .dump | sha256sum | cut -d' ' -f1)
+if [ "${#sha}" != 64 ] || [ "$sha" = e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 ]; then
+    echo "NG: .dump が空" >&2; exit 1
+fi
+echo "$sha"
+SH
+
+cat > drafts_sha.sh <<'SH'
+#!/bin/bash
+# 使い方: drafts_sha.sh <出力ファイル>   旅行ブログの下書き（DATA_DIR/travel_blog/drafts）の全ファイルの sha256 を、パスの順に書く。
+# 下書きが無ければ空のファイル。読めない・途中で失敗したら出力を作らずに非ゼロ。件数だけを画面に出す。
+set -euo pipefail
+trap 'rm -f -- "$1.part"' EXIT
+d=/var/lib/geoframe/travel_blog/drafts
+if [ -d "$d" ]; then
+    ( cd "$d" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum ) > "$1.part"
+else
+    : > "$1.part"
+fi
+mv -- "$1.part" "$1"
+echo "下書き: $(wc -l < "$1") ファイル"
+SH
+
+chmod 0600 *.py *.sql
+chmod 0700 *.sh
 ```
 
-- 確かめること: `ls -l "$WORK"` で全部 `-rw-------` root。`counts.sql` は §4・§8・§10 で、`sudo -u geoframe sqlite3 '<URI>' < "$WORK/counts.sql"` の形で使う（リダイレクトは root のシェルが開くので、`geoframe` が `$WORK` を読めなくてよい）。
+- 確かめること: `ls -l "$WORK"` で `.py`・`.sql` が `-rw-------`、`.sh` が `-rwx------`（全部 root）。`counts.sql` と `state_snapshot.sql` は、`sudo -u geoframe sqlite3 '<URI>' < "$WORK/….sql"` の形で使う（リダイレクトは root のシェルが開くので、`geoframe` が `$WORK` を読めなくてよい）。`cache_load.py` も同じ理由で標準入力から渡す。
+- 書き換えない。`$WORK` のファイルを手で直したら、演習の記録に「何を直したか」を残す。
 
 ### 1.5 設定のファイルの分割とモード
 
@@ -312,7 +499,14 @@ PY
 
 - 確かめること: モード `640`・所有者 `root:geoframe`。用途の行がすべて `local`（`photo_judge`・`location_suggest` が**無い**か、`cloud` でない）。`embedding_space`／`embedding_contract` などの中身は [ai-config.md](ai-config.md)・[ai-embedding.md](ai-embedding.md) のとおりで、ここでは読まない。
 - 鍵（Drive の鍵。クラウド AI を有効にするとき同じ鍵を使う）の所有者とモード: `KEY=$(sed -n 's/^GEOFRAME_DRIVE_KEY=//p' /etc/default/geoframe-rs | tail -n 1 | tr -d "\"'"); stat -c '%a %U:%G' "$KEY"` が **`600 geoframe:geoframe`**（実行ユーザーの所有で、他から読めない）。**root 所有やグループ可読は、クラウドで拒否される**（[ai-cloud.md](ai-cloud.md)。拒否は `Unauthorized` 停止になり、直しても自動では戻らず `release-pause` が要る）。中身は読まない。
-- 失敗したら: モード・所有者を直すのは設定の変更なので、ユーザーの許可を得てから（`chown root:geoframe`・`chmod 0640`）。
+- 失敗したら: モード・所有者を直すのは設定の変更なので、ユーザーの許可を得てから。**AI 設定の JSON と鍵は要件が違う**ので、同じ値で直さない:
+
+| 対象 | 要件 | 直し方 | 直したあとの確認 |
+| --- | --- | --- | --- |
+| AI 設定の JSON（`$AI_CFG`） | `0640 root:geoframe`（サービスが読むだけ。書き換えられない） | `chown root:geoframe "$AI_CFG" && chmod 0640 "$AI_CFG"` | `stat -c '%a %U:%G' "$AI_CFG"` が `640 root:geoframe` |
+| 鍵（`$KEY`。Drive の鍵・クラウド AI の鍵） | `0600 geoframe:geoframe`（実行ユーザーの所有で、他から読めない。**root 所有・グループ可読は不可**） | `chown geoframe:geoframe "$KEY" && chmod 0600 "$KEY"` | `stat -c '%a %U:%G' "$KEY"` が `600 geoframe:geoframe`。親のディレクトリを `geoframe` が辿れること（`namei -m "$KEY"`。出力はパスを含むので画面だけで見て、報告に写さない） |
+
+  鍵を `root:geoframe`・`0640` にしてはいけない（クラウドで `Unauthorized` 停止になる）。鍵の中身は読まない・`cp` しない（所有者を変えるだけ）。Python 版が動いているあいだに鍵の所有者を変えるときは、Python も `geoframe` ユーザーで動いているので影響しない（`geoframe-server.service` の `User=geoframe`）が、直した直後に `systemctl is-active geoframe-server` と `/api/admin/status` が 200 であることを確かめる。
 
 ### 1.7 Decision が常駐していること
 
@@ -329,14 +523,14 @@ curl -fsS -H 'X-Client-Name: geoframe' "<local_base_urlの値>/llm-decision/heal
 ### 1.8 切替に使うバイナリを置く
 
 ```sh
-env | grep '^GEOFRAME_RS_' || echo "GEOFRAME_RS_* なし（正常）"
+compgen -e | grep '^GEOFRAME_RS_' || echo "GEOFRAME_RS_* なし（正常）"     # 名前だけを調べる（env | grep は値まで出す）
 install -m 0755 -o root -g root '<受け取ったバイナリ>' "$BIN"
 sha256sum "$BIN"                      # = $SHA（演習で記録した値）
 file "$BIN"                           # statically linked / static-pie linked
 ls -l /usr/local/bin/geoframe* 2>&1   # 無い（初回の配布）
 ```
 
-- 確かめること: `sha256sum` が `$SHA` と**完全に一致**。静的リンク。`GEOFRAME_RS_*` が環境に無い。`/usr/local/bin/geoframe` が**無い**（あれば初回の配布ではない。理由をユーザーに聞く）。
+- 確かめること: `sha256sum` が `$SHA` と**完全に一致**。静的リンク。`GEOFRAME_RS_*` が環境に無い（名前だけを調べる。値は読まない・写さない）。`/usr/local/bin/geoframe` が**無い**（あれば初回の配布ではない。理由をユーザーに聞く）。
 - 失敗したら: バイナリが違う（sha256 が合わない）ときは進まない。演習で使ったものを受け取り直す。`rust-deploy.sh` も同じ検査をして断るが、ここで先に分かっていれば当日に止まらない。
 
 ### 1.9 本番の状態の確認
@@ -385,8 +579,7 @@ curl -fsS $BASE/api/v1/photos -o py-feed.json
 python3 -I ids.py py-feed.json | LC_ALL=C sort > py-ids.txt
 COUNT=$(wc -l < py-ids.txt); echo "Python の写真: $COUNT 件"
 curl -fsS $BASE/api/admin/status | python3 -I status_counts.py > py-status.txt
-( cd /var/lib/geoframe/travel_blog/drafts 2>/dev/null && find . -type f -exec sha256sum {} + | LC_ALL=C sort -k2 ) > drafts-before.sha
-wc -l < drafts-before.sha
+"$WORK/drafts_sha.sh" "$WORK/drafts-before.sha"; echo "rc=$?"          # 下書きの全ファイルの sha256。rc=0
 MIN=$((COUNT * 98 / 100)); echo "--expect-min-photos=$MIN"     # 控えた件数より少し下
 WAIT='<演習で測った --wait-secs の値>'
 /opt/geoframe/deploy/rust-deploy.sh --production="$HOST" --bin="$BIN" \
@@ -396,7 +589,7 @@ WAIT='<演習で測った --wait-secs の値>'
 - 確かめること:
   - 一覧の件数が §1 以降で大きく変わっていない。`py-status.txt` に `db.loc.clue_pending` がある。`ai_task_blocks` などの AI の追加キーは Python では `なし`。
   - `--check-only` が終了コード 0。**これは §5 のコマンドから `--check-only` を除いただけ**にしておく（同じ引数を通す）。
-  - 控えたもの（`py-feed.json`・`py-ids.txt`・`py-status.txt`・`drafts-before.sha`）は `$WORK` にあり、リポジトリには入れない（リポジトリには**件数だけ**）。
+  - 控えたもの（`py-feed.json`・`py-ids.txt`・`py-status.txt`・`drafts-before.sha`。下書きのパスが入るので画面に出さない）は `$WORK` にあり、リポジトリには入れない（リポジトリには**件数だけ**）。
 - 失敗したら: `--check-only` が 0 でなければ切替を始めない。理由を直して§2 をやり直す。
 
 ## 3. Python を止める
@@ -487,7 +680,8 @@ systemctl enable --now geoframe-server
 curl -fsS -o /dev/null -w '%{http_code}\n' $BASE/api/admin/status    # 200
 ```
 
-原因をユーザーに報告して延期する。
+- Python が 200 を返したら、**§4.1 でバックアップのタイマーを止めたあと（§4 の途中）に来たときは、続けて [§4.5](#45-バックアップのタイマーを戻す共通の出口) を実行する**（§3 の途中で来たときは、タイマーを止めていないので `systemctl is-active geoframe-backup.timer` が `active` のことを確かめるだけでよい）。
+- 原因をユーザーに報告して延期する。
 
 ## 4. 保全
 
@@ -501,18 +695,18 @@ systemctl is-active geoframe-backup.timer geoframe-backup.service    # どちら
 ```
 
 - 確かめること: 両方 `inactive`。`geoframe-backup.service`（oneshot）が走っていたら終わるのを待つ。
-- 切替が終わったら戻す（§6.6）。**途中で止めたときも戻す**。
+- **ここから先、タイマーは止まったまま**になる。切替が終わったら（§6.6）戻す。**中断・切り戻し・復元のどの出口でも、サービスを復旧したあとに [§4.5](#45-バックアップのタイマーを戻す共通の出口) で戻す**（§4 の失敗→§3 の「止まったとき」、§5 の失敗→§8、§6 の判断→§8、§9 の途中、§10）。出口ごとの戻す場所は §4.5 の表。
 
 ### 4.2 書き手がいないこと
 
 ```sh
-fuser -v /var/lib/geoframe/catalog.db*; echo "fuser rc=$?"      # 出力が空・rc=1
-pgrep -u geoframe -a; echo "pgrep rc=$?"                         # 出力が空・rc=1
+"$WORK/dbopen.sh"; echo "dbopen rc=$?"          # rc=0（開いているプロセスが無いと確認できた）
+pgrep -u geoframe -a; echo "pgrep rc=$?"         # 出力が空・rc=1
 ```
 
-- `fuser`（psmisc）が無いときの代わり: `find /proc/[0-9]*/fd -lname '/var/lib/geoframe/catalog.db*' -print 2>/dev/null`（出力が空）。
+- `dbopen.sh` は `fuser` があれば `fuser`、無ければ `/proc` の走査で調べる（§0.5）。**rc=0 のときだけ「無い」**。rc=1（ある）も rc=2（確認できなかった）も先へ進まない。`pgrep` は **rc=1 だけが「無い」**（rc=2・3 は確認できなかった）。
 - 確かめること: DB を開いているプロセスも、`geoframe` ユーザーのプロセスも**無い**（unit の外で動いている Python なども無い）。
-- 失敗したら: **何かが出たら先へ進まない**。`ps -fp <pid>` で何かを確かめ、ユーザーに報告する（勝手に kill しない）。
+- 失敗したら: **何かが出たら・確認できなかったら先へ進まない**。`ps -o pid,user,comm -p <pid>` で何かを確かめ、ユーザーに報告する（勝手に kill しない。`ps -f` は引数を出すので使わない）。確認できなかったとき（rc=2）は、原因（root でない・`/proc` が読めない・`fuser` のエラー）を直して `dbopen.sh` をやり直す。
 
 ### 4.3 DB のバックアップ
 
@@ -546,7 +740,7 @@ ls -A /var/backups/geoframe | grep '^\.' || echo "一時ファイルなし"   # 
 ```
 
 - 確かめること: `integrity_check` が **`ok` の 1 行だけ**（`.dump` の SHA-256 と件数は、時間のかかる読み取りなので停止時間の外の §6.8 で取る。この段で要るのは `integrity_check` と `gzip -t` だけ）。バックアップは `p5-precutover-<時刻>.db.gz`・`0640`・`geoframe` 所有（`catalog-*` に当たらない名前なので、7 日の世代削除の対象外）。**P5 の記録が終わるまで消さない。**
-- 失敗したら: `.backup` が失敗・`integrity_check` が `ok` でないときは先へ進まない（配信は止まったまま）。**ここで原因が分からなければ、§3 の「止まったとき」で Python を戻す**（DB は Python が止まって以降、誰も書いていない）。
+- 失敗したら: `.backup` が失敗・`integrity_check` が `ok` でないときは先へ進まない（配信は止まったまま）。**ここで原因が分からなければ、§3 の「止まったとき」で Python を戻し、続けて [§4.5](#45-バックアップのタイマーを戻す共通の出口) でタイマーを戻す**（DB は Python が止まって以降、誰も書いていない）。
 
 ### 4.4 一次データの tar
 
@@ -564,14 +758,38 @@ sha256sum "$WORK/p5-primary-$TS.tar"
 ```
 
 - 確かめること: tar が `0600 root`・`/var/lib/geoframe` の外（`$WORK`）にある。「無い:」と出たものは、本当に無いか（下書きを書いたことがない等）をユーザーに確かめる。**鍵（Drive の鍵・AI の鍵）は動かさないので tar に入れない**。tar には秘密（`.env`・設定のファイル）が入るので、持ち出さない・文書に中身を書かない。
-- 失敗したら: tar が作れなければ先へ進まない（`app/.env` や設定のファイルは Python 側の設定の唯一の控え）。
+- 失敗したら: tar が作れなければ先へ進まない（`app/.env` や設定のファイルは Python 側の設定の唯一の控え）。原因が直せなければ §3 の「止まったとき」→ §4.5。
+
+### 4.5 バックアップのタイマーを戻す（共通の出口）
+
+§4.1 で止めたタイマーを、**サービス（Python か Rust）が配信に戻ったあと**に、どの出口でも戻す。何度実行してもよい（すでに `active` なら何も変わらない）。
+
+```sh
+systemctl start geoframe-backup.timer
+if [ "$(systemctl is-active geoframe-backup.timer)" = active ] && [ "$(systemctl is-enabled geoframe-backup.timer)" = enabled ]; then
+    echo "タイマー OK（active / enabled）"; else echo "NG: タイマーが active / enabled に戻っていない"; fi
+systemctl is-active geoframe-backup.service       # inactive（走っていない）か activating（走行中）。failed なら journal の種類を報告
+systemctl list-timers geoframe-backup.timer       # NEXT が先の時刻
+```
+
+- 確かめること: `タイマー OK`。`NG` が出たら先へ進まず、ユーザーに報告する。
+- 戻す場所（出口ごと）:
+
+| 出口 | サービスの復旧 | タイマーを戻す |
+| --- | --- | --- |
+| §3 の途中で止まった | §3 の「止まったとき」 | 止めていない。`is-active` が `active` なのを確かめるだけ |
+| §4 の途中で止まった（4.2〜4.4 の失敗） | §3 の「止まったとき」 | その直後に §4.5 |
+| §5 の終了コードが 0 でない・§6 の判断で戻す | §8（§8.3 で Python が 200 になったあと） | §8.3 の最後に §4.5（§6.6 を済ませていても、もう一度確かめる） |
+| §9 の切り替え直しの途中で戻す | 同じく §8 | 同じく §8.3 の最後に §4.5 |
+| §10 の復元 | §10.5 | §10.6（= §4.5。途中で止めたときも戻す） |
+| 切替が成功した | — | §6.6（= §4.5） |
 
 ## 5. Rust を入れる
 
 目的: 演習で使ったバイナリそのものを、`rust-deploy.sh --production` で入れる（unit の導入・enable・起動・確認まで）。許可を得てから。
 
 ```sh
-env | grep '^GEOFRAME_RS_' || echo "GEOFRAME_RS_* なし（正常）"
+compgen -e | grep '^GEOFRAME_RS_' || echo "GEOFRAME_RS_* なし（正常）"     # 名前だけ。出たらこのシェルでは実行しない
 /opt/geoframe/deploy/rust-deploy.sh --production="$HOST" --bin="$BIN" \
     --expect-sha256="$SHA" --expect-commit="$COMMIT" \
     --expect-min-photos="$MIN" --wait-secs="$WAIT"; echo "rc=$?"
@@ -592,11 +810,11 @@ env | grep '^GEOFRAME_RS_' || echo "GEOFRAME_RS_* なし（正常）"
 | --- | --- | --- |
 | **0** | 成功 | §6 へ |
 | **1** | 失敗したが配布前の状態へ戻した。初回の配布なので、止めて `disable` し、unit を撤去し、バイナリは `geoframe.failed` へ退避してある | **すぐ §8**（Rust は無い状態。Python を起動する） |
-| **3** | 失敗し、戻す途中でも失敗した。手作業の復旧手順が出る（文言は「検証環境で」とあるが本番でも同じ操作） | まず `systemctl stop geoframe-rs` で止めてから、**§8**。出た手順と状態（`ls -l /usr/local/bin/geoframe*`・`systemctl status geoframe-rs`）を報告 |
-| **4** | 誤配布の防止で拒否した（何も変えていない。理由が出る。ホスト名・印・mask・設定のファイル・Python が稼働中・古い置き場所など） | 理由が数分で直せるなら直して再実行。直せなければ **§8** |
-| **2** | 引数の誤り（何も変えていない） | 引数を直して再実行 |
+| **3** | 失敗し、戻す途中でも失敗した。手作業の復旧手順が出る（本番では「本番機で root として手で戻すこと」と出て、Python 版へ戻すのは §8 と案内する） | まず `systemctl stop geoframe-rs` で止めてから、**§8**。出た手順と状態（`ls -l /usr/local/bin/geoframe*`・`systemctl status geoframe-rs`）を報告 |
+| **4** | 誤配布の防止で拒否した（何も変えていない。理由が出る。ホスト名・印・mask・設定のファイル・Python が稼働中・古い置き場所など） | 下の**一つの規則**（再実行は条件つき。それ以外は **§8**） |
+| **2** | 引数の誤り（何も変えていない） | 同じ規則 |
 
-- **0 でなければ待たずに §8**。Python は止まったままなので、迷っている時間がそのまま停止時間になる。
+- **非ゼロのときの規則は一つ**（[§0.4](#04-時間の目安と止める判断)）: 終了コード 1・3 は待たずに**すぐ §8**。何も変えずに断った 2・4 は、**原因がすぐ直せて、T0 から 10 分の配信停止の期限内に再実行して 0 になる見込みがあるときだけ**、1 回だけ再実行する（引数の綴りの誤り・環境変数 `GEOFRAME_RS_*` を持ったシェルで打った、など）。再実行も 0 でない・原因が分からない・直すのに設定やバイナリの入れ直しが要る・期限に間に合わないときは**すぐ §8**。Python は止まったままなので、迷っている時間がそのまま停止時間になる。
 - **`--rollback --production` は、初回の切替の戻しには使えない**。初回の配布は `.prev`（直前のバイナリ）を作らないので「`.prev` が無い」で終了コード 1 になる。`--rollback --production` は、**Rust を一度入れたあとで更新に失敗した**ときに、Rust の直前の版へ戻す道具（§11 以降）。
 - 確かめること（0 のとき）: 「確認 OK（/healthz 200、/api/v1/photos は配列で N 件 >= 下限 M）」「完了: geoframe <版>」が出る。
 
@@ -624,7 +842,7 @@ T1=$(date +%s); date '+%F %T'; echo "停止から再開まで $((T1 - T0)) 秒"
 
 ### 6.2 写真の集合の比べ方
 
-Python の配信にあった写真が**すべて**Rust の配信にあり、増えた分は既知の差の範囲であること。
+Python の配信にあった写真が**すべて**Rust の配信にあり、増えた分は既知の差の範囲であること。増えた分の検査には、切替の前の DB（§4.3 のバックアップを展開したもの）を使うので、**先に [§6.8](#68-保全の控え停止時間の外で) を実行する**（`$WORK/precutover.db` ができる。T1 のあとなので停止時間に入らない）。
 
 ```sh
 cd "$WORK"
@@ -633,15 +851,20 @@ python3 -I ids.py rs-feed.json | LC_ALL=C sort > rs-ids.txt
 wc -l < py-ids.txt; wc -l < rs-ids.txt
 comm -23 py-ids.txt rs-ids.txt | wc -l                    # Python だけにあった写真: 0 でなければ失敗
 comm -13 py-ids.txt rs-ids.txt > rs-only.txt; wc -l < rs-only.txt    # Rust だけの写真（増えた分）
-python3 -I extra.py rs-feed.json rs-only.txt
+python3 -I extra.py rs-feed.json rs-only.txt "$WORK/precutover.db" "$WORK/unexplained-ids.txt"; echo "extra rc=$?"
 python3 -I check_files.py rs-feed.json                    # 画像: 200でない 0
+rm -f "$WORK/precutover.db"                               # 検査が済んだら消す（§6.8 の控えは残る）
 ```
 
 - 確かめること:
   - **Python だけにあった写真が 0**（`comm -23` が 0）。1 件でもあれば失敗。
-  - 増えた分（`rs-only.txt`）は、[p4-acceptance.md §7.3](p4-acceptance.md) の既知の差で説明できること: 旧グループの**推薦写真（代表）を回転した**ために旧特徴量の世代が合わなくなり、Rust は世代が合わない代表を有効と見なさず、残りの写真を隠すのをやめる（P4 の受入では 18 の旧グループで 45 件）。増えた写真が、回転済みの代表のいる群（`extra.py` の群の数）に限られること。**0 件でも異常ではない**（受入の前は 3,065 件で同数）。説明できない増加は、§0.4 の 30 分で原因を見る。
+  - **増えた分（`rs-only.txt`）のすべてが説明できること**（`extra.py` が終了コード 0・「説明できない 0」）。`extra.py` は、切替の前の DB の旧グループ（`photo_ai_groups`）・代表・特徴量の世代と、増えた ID を ID ごとに照らし、次に分けて件数だけを出す:
+    - **取り込み**: 切替の前の DB に無い・まだ表示できなかった（`display` か位置が無い）写真が、Rust の取り込みで表示可能になった。
+    - **既知の差**（[p4-acceptance.md §7.3](p4-acceptance.md)）: 旧グループの**推薦写真（代表）を回転した**ために特徴量の世代が合わなくなり、Rust は世代が合わない代表（またはメンバー）を有効と見なさず、残りの写真を隠すのをやめる（P4 の受入では 18 の旧グループで 45 件）。
+    - **説明できない**: 上のどちらでもない。**0 でなければ失敗として扱う**（ID は `$WORK/unexplained-ids.txt` にだけ書かれ、画面には出ない）。§0.4 の 30 分で原因を見る。
+  - 群の数は `ai_group`（空文字は群に数えない）と `quality_group` を別々に数えて記録する。**0 件でも異常ではない**（受入の前は 3,065 件で同数）。
   - 画像（フィードの `file`）が全部 200（`200でない 0`）。
-- 失敗したら: Python だけの写真が出た・画像が欠けたときは、件数（と群の数）だけをユーザーに報告し、30 分のうちに原因が見えなければ §8。
+- 失敗したら: Python だけの写真が出た・説明できない増加が出た・画像が欠けたときは、件数だけをユーザーに報告し、30 分のうちに原因が見えなければ §8。
 
 ### 6.3 STATUS
 
@@ -676,11 +899,7 @@ journalctl -u geoframe-rs --since '<T0の時刻>' -p warning --no-pager | cut -c
 
 ### 6.6 バックアップのタイマーを戻す
 
-```sh
-systemctl start geoframe-backup.timer
-systemctl is-active geoframe-backup.timer; systemctl is-enabled geoframe-backup.timer   # active / enabled
-systemctl list-timers geoframe-backup.timer
-```
+[§4.5](#45-バックアップのタイマーを戻す共通の出口) のコマンドを実行する（`タイマー OK`・`NEXT` が先の時刻）。
 
 ### 6.7 そのほかの確認
 
@@ -694,17 +913,27 @@ systemctl show geoframe-rs -p NRestarts -p Result                 # NRestarts=0
 
 ### 6.8 保全の控え（停止時間の外で）
 
-バックアップ（§4.3）の `.dump` の SHA-256 と件数を、**配信が戻ったあとで**、バックアップのファイルから取る（本番の DB には触れない。root の作業用の置き場で展開する）。
+バックアップ（§4.3）の `.dump` の SHA-256・件数・ID ごとの状態を、**配信が戻ったあとで**、バックアップのファイルから取る（本番の DB には触れない。root の作業用の置き場で展開する）。展開が途中で失敗したまま先へ進まないよう、**`&&` でつないで、どれか 1 つでも失敗したら全体を失敗とする**（`gzip -dc` の終了コード・展開後のサイズが 0 でないこと・`integrity_check` が `ok`・`.dump` のハッシュが取れること。`.dump | sha256sum` の上流の失敗は `dumpsha.sh` が `pipefail` で検出する）。`set -e` に頼らない（`||` や `if` の中に貼ると効かなくなるため）。`$OUT` は §4.3 のバックアップのパス（シェルを替えたなら `OUT=/var/backups/geoframe/p5-precutover-<時刻>.db.gz` と置き直す）。
 
 ```sh
-gzip -dc "$OUT" > "$WORK/precutover.db"
-sqlite3 "file:$WORK/precutover.db?immutable=1" 'PRAGMA integrity_check'                 # ok の 1 行
-DUMPSHA=$(sqlite3 "file:$WORK/precutover.db?immutable=1" .dump | sha256sum | cut -d' ' -f1); echo "dump sha256: $DUMPSHA"
-sqlite3 "file:$WORK/precutover.db?immutable=1" < "$WORK/counts.sql" | tee "$WORK/precutover-counts.txt"
-rm -f "$WORK/precutover.db"
+PRE="file:$WORK/precutover.db?immutable=1"
+rm -f -- "$WORK/precutover.db.part"
+if gzip -dc -- "$OUT" > "$WORK/precutover.db.part" \
+   && [ -s "$WORK/precutover.db.part" ] \
+   && mv -- "$WORK/precutover.db.part" "$WORK/precutover.db" \
+   && [ "$(sqlite3 "$PRE" 'PRAGMA integrity_check')" = ok ] \
+   && "$WORK/dumpsha.sh" "$PRE" > "$WORK/precutover.dumpsha" \
+   && sqlite3 "$PRE" < "$WORK/counts.sql" > "$WORK/precutover-counts.txt" \
+   && sqlite3 "$PRE" < "$WORK/state_snapshot.sql" > "$WORK/precutover-state.tsv"; then
+    echo "展開と控え OK"; echo "dump sha256: $(cat "$WORK/precutover.dumpsha")"; cat "$WORK/precutover-counts.txt"
+else
+    rm -f -- "$WORK/precutover.db" "$WORK/precutover.db.part" "$WORK/precutover.dumpsha" "$WORK/precutover-counts.txt" "$WORK/precutover-state.tsv"
+    echo "NG: 展開か控えに失敗した。先へ進まず、バックアップの gzip -t と容量を調べる"
+fi
 ```
 
-- 確かめること: `integrity_check` が `ok`。`DUMPSHA` を控える（§10 の復元で照合し、`p5-acceptance.md` に書く）。`precutover-counts.txt` に photos・manual・favorite・hidden・rotated・quality_rows・quality_groups・algorithm 別の件数が出る（§8 で比べる）。
+- 確かめること: `展開と控え OK`。`DUMPSHA`（`$WORK/precutover.dumpsha` の値）を控える（§10 の復元で照合し、`p5-acceptance.md` に書く）。`precutover-counts.txt` に photos・manual・favorite・hidden・rotated・quality_rows・quality_groups・algorithm 別の件数が出る（§10 の復元の確認に使う）。`precutover-state.tsv` は ID ごとの手動の位置・お気に入り・除外・回転・表示ファイル（座標が入るので画面に出さない）。`precutover.db` は §6.2 の検査（`extra.py`）が済むまで残す（済んだら消す）。
+- 失敗したら（`NG`）: 一時ファイルと途中の控えは消えている。バックアップのファイル自体の `gzip -t` が失敗するなら、**そのバックアップは使えない**ので、ユーザーに報告する（§10 の復元の前提が崩れる。`backup-catalog.sh` の最新の世代など別のバックアップを検討する）。
 - 戻す（§8）が先になったときは、戻したあとでこの 6.8 を行ってよい（バックアップのファイルは変わらない）。
 
 ここまでで切替は完了。T1 から **30 分**は様子を見る（§0.4）。時間・件数を記録する（§14）。
@@ -741,24 +970,47 @@ curl -fsS -o /dev/null -w '%{http_code}\n' $BASE/healthz             # 200
 
 ## 8. Python へ戻す
 
-目的: 問題が出たとき（§0.4 の基準・§5 の終了コード）に Rust を止め、Python に戻す。**AI は無効**で戻す（drop-in が効く）。既定は **DB を保ったまま**戻す（Python は Rust が足した表・列を無視して読める。[p4-acceptance.md §7](p4-acceptance.md)）。DB が壊れたときだけ §10。許可を得て（迷う時間が停止時間なので、§5 の失敗では即実行してよい）。
+目的: 問題が出たとき（§0.4 の基準・§5 の終了コード）に Rust を止め、Python に戻す。**AI は無効**で戻す（drop-in が効く）。既定は **DB を保ったまま**戻す（Python は Rust が足した表・列を無視して読める。[p4-acceptance.md §7](p4-acceptance.md)）。DB が壊れたときだけ §10。許可を得て（迷う時間が停止時間なので、§5 の失敗では即実行してよい）。**どの経路で戻しても、Python が 200 を返したら [§4.5](#45-バックアップのタイマーを戻す共通の出口) でバックアップのタイマーを戻す**（§8.3 の最後）。
 
 ### 8.1 Rust を止めて mask する
 
 ```sh
 TR=$(date +%s); date '+%F %T'                      # 戻し始めた時刻
+curl -fsS --max-time 20 $BASE/api/v1/photos -o "$WORK/rs-end-feed.json" || echo "Rust の一覧を取れなかった（応答しない）"   # 止める前の一覧（§8.4 の件数の基準）
 systemctl stop geoframe-rs
 systemctl disable geoframe-rs || true
 systemctl mask geoframe-rs
 systemctl is-active geoframe-rs                    # inactive
 systemctl is-enabled geoframe-rs                   # masked
-fuser -v /var/lib/geoframe/catalog.db*; echo "fuser rc=$?"      # 空・rc=1（Rust が DB を開いていない）
+"$WORK/dbopen.sh"; echo "dbopen rc=$?"             # rc=0（Rust が DB を開いていない）。rc=1・2 は先へ進まない（§0.5）
 ```
 
-- 初回の配布の失敗で unit が外れているとき（`not-found`）も同じ手順で通る（mask は unit が無くても効く）。
+- 初回の配布の失敗で unit が外れているとき（`not-found`）も同じ手順で通る（mask は unit が無くても効く）。このとき Rust は書いていないので、`rs-end-feed.json` は無くてよい。
 - **mask が失敗したらここで止まる**。`/etc/systemd/system/geoframe-rs.service` に本体が無いか（`ls -l`）を見る。
 
-### 8.2 Python を起動する
+### 8.2 戻す直前の控え（Rust を止めたあと・Python を起動する前）
+
+Python が起動すると、取り込みの 1 サイクルが始まって DB が動く。**Rust の期間に付いた手動の位置・お気に入り・除外・回転・下書き**が戻したあとも保たれているかを比べるために、Python を起動する**前**の値を取る（数秒）。実値（座標・パス）は `$WORK` のファイルにだけ置き、画面と報告には**件数だけ**を出す。
+
+```sh
+DB_RO='file:/var/lib/geoframe/catalog.db?mode=ro'
+sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/counts.sql" > "$WORK/rs-end-counts.txt"; echo "counts rc=$?"
+sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/state_snapshot.sql" > "$WORK/rs-end-state.tsv"; echo "state rc=$?"; wc -l < "$WORK/rs-end-state.tsv"
+"$WORK/drafts_sha.sh" "$WORK/drafts-rs-end.sha"; echo "drafts rc=$?"
+[ -e /var/lib/geoframe/.cache.json ] && cp -p -- /var/lib/geoframe/.cache.json "$WORK/cache-rs-end.json"
+sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe GEOFRAME_AI_ENABLED=0 GEOFRAME_LOC_SUGGEST=0 \
+    "$PYAPP/.venv/bin/python" -I -B - "$PYAPP" < "$WORK/cache_load.py"; echo "cache rc=$?"
+```
+
+- 確かめること:
+  - `counts rc=0`・`state rc=0`・`drafts rc=0`。`rs-end-counts.txt` が**品質の切り戻しの基準**（§8.4。切替の前の値ではなく、Rust から戻す直前の値）。
+  - `cache_load.py`（Python 版自身の `store.load_cache` と `purge_cache_legacy` を、メモリの上だけで動かす）が `rc=0` で、`python_loaded` と `file_keys` が**同じ**（`load_cache` は読めないとき黙って空にするため、別に JSON として読んだ件数と照らす）。`python_will_drop` は起動時に Python が捨てる現役でないキーの数（件数だけ記録する）。
+- 失敗したら:
+  - `counts`・`state` が `unable to open database file`（停止直後に `-shm` が無い）なら、§4.3 の「コピーして取る」と同じ要領でコピーから取る。DB が開けない・`malformed` なら **DB を疑う**（§10 の復元。失うものを先に読む）。
+  - `cache_load.py` が `rc≠0`（JSON として読めない・辞書でない・件数が合わない）でも、**配信の回復を優先して Python を起動してよい**（Python は黙って空のキャッシュで始め、最初の保存で置き換える。キャッシュは地名の再問い合わせで作り直される）。`cache-rs-end.json` に退避してあるので、記録して続ける。
+  - 控えが取れないまま Python を起動するとき（`rs-end-*` が無い）は、§8.4 の比べる基準を `precutover-counts.txt`・`precutover-state.tsv`（§6.8）に替え、「Rust の期間の操作の分だけの差」を許す。ユーザーに伝える。
+
+### 8.3 Python を起動する
 
 ```sh
 systemctl unmask geoframe-server
@@ -768,42 +1020,53 @@ systemctl enable --now geoframe-server
 systemctl is-active geoframe-server                # active
 curl -fsS -o /dev/null -w '%{http_code}\n' $BASE/api/admin/status    # 200（Python の確認は deploy-pull.sh と同じ /api/admin/status）
 curl -fsS -o /dev/null -w '%{http_code}\n' $BASE/api/v1/photos       # 200
-TB=$(date +%s); date '+%F %T'; echo "戻すのにかかった時間 $((TB - TR)) 秒"
+TB=$(date +%s); T_PY=$(date '+%F %T'); echo "$T_PY"; echo "戻すのにかかった時間 $((TB - TR)) 秒"
 ```
 
 - `show` の確認が**起動の前**であることが重要（drop-in が読まれていなければ、AI が有効な Python が起動して課金・送信が始まる）。`EnvironmentFiles` に `geoframe-py-rollback`（`ignore_errors=no`）が出なければ、`enable --now` をしない。
-- 失敗したら（Python が起動しない）: `journalctl -u geoframe-server -n 50 --no-pager`。典型: ①`/etc/default/geoframe-py-rollback` が無い（`-` 無しなので起動しない）、②`/opt/geoframe/app` の権限（`status=200/CHDIR`）、③8080 を Rust が持っている（`ss -ltnp 'sport = :8080'`。Rust が止まっていない）。
+- 失敗したら（Python が起動しない）: `journalctl -u geoframe-server -n 50 --no-pager > "$WORK/py-journal.txt"` に保存してから読む（Python 版のログは写真のファイル名・パスを含みうる。§0.5）。典型: ①`/etc/default/geoframe-py-rollback` が無い（`-` 無しなので起動しない）、②`/opt/geoframe/app` の権限（`status=200/CHDIR`）、③8080 を Rust が持っている（`ss -ltnp 'sport = :8080'`。Rust が止まっていない）。報告には終了コードと `status=` の種類だけを写す。
+- **Python が 200 を返したら、ここで [§4.5](#45-バックアップのタイマーを戻す共通の出口) を実行する**（§4.1 でタイマーを止めた経路は、ここで戻さないと止まったままになる。§5 の失敗・§6 の判断・§9 の途中のすべて）。
 
-### 8.3 確かめる
+### 8.4 確かめる
+
+**ユーザーが管理画面で操作を始める前に**行う（操作が入ると比べる基準がずれる）。
 
 ```sh
+SINCE="$T_PY"
 PID=$(systemctl show -p MainPID --value geoframe-server)
 tr '\0' '\n' < /proc/$PID/environ | grep -E '^GEOFRAME_(AI_ENABLED|LOC_SUGGEST)='    # 両方 =0
-journalctl -u geoframe-server --since '<8.2の時刻>' -p err --no-pager | cut -c1-200  # 例外が無い
-journalctl -u geoframe-server --since '<8.2の時刻>' --no-pager | grep -iE 'gemini|vertex|aiplatform|embed|decision|loc_suggest'   # AI の送信を示す行が無い（「無効」の行は可）
-python3 -I -c 'import json; json.load(open("/var/lib/geoframe/.cache.json")); print(".cache.json: 読める")'
-sudo -u geoframe sqlite3 'file:/var/lib/geoframe/catalog.db?mode=ro' < "$WORK/counts.sql" > "$WORK/after-return-counts.txt"
-diff "$WORK/precutover-counts.txt" "$WORK/after-return-counts.txt"      # precutover-counts.txt は §6.8 で取る
-( cd /var/lib/geoframe/travel_blog/drafts && sha256sum -c --quiet "$WORK/drafts-before.sha" )   # 出力なし＝下書きが変わっていない／消えていない（drafts-before.sha が空なら、この行は飛ばす）
+journalctl -u geoframe-server --since "$SINCE" -p err --no-pager | wc -l                      # 例外の行数: 0（件数だけ。行は画面に出さない）
+journalctl -u geoframe-server --since "$SINCE" --no-pager | grep -ciE 'gemini|vertex|aiplatform|embed|decision|loc_suggest'   # AI を示す語の行数: 0（件数だけ）
+journalctl -u geoframe-server --since "$SINCE" --no-pager | grep -F 'レガシーキー削除'          # 件数だけの行（「N件 / 現役M件を維持」）。出なくてもよい
+sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe GEOFRAME_AI_ENABLED=0 GEOFRAME_LOC_SUGGEST=0 \
+    "$PYAPP/.venv/bin/python" -I -B - "$PYAPP" < "$WORK/cache_load.py"; echo "cache rc=$?"     # rc=0・python_will_drop=0
+sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/counts.sql" > "$WORK/py-after-counts.txt"
+diff "$WORK/rs-end-counts.txt" "$WORK/py-after-counts.txt"; echo "counts diff rc=$?"
+sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/state_snapshot.sql" > "$WORK/py-after-state.tsv"
+python3 -I "$WORK/state_diff.py" "$WORK/rs-end-state.tsv" "$WORK/py-after-state.tsv"; echo "state rc=$?"
+"$WORK/drafts_sha.sh" "$WORK/drafts-py-after.sha"; diff "$WORK/drafts-rs-end.sha" "$WORK/drafts-py-after.sha" | grep -c '^[<>]'     # 0
 curl -fsS $BASE/api/v1/photos -o "$WORK/py-feed-2.json"; python3 -I "$WORK/check_files.py" "$WORK/py-feed-2.json"
 ```
 
 - 確かめること:
-  - **Python の AI が無効**: プロセスの環境の `GEOFRAME_AI_ENABLED`・`GEOFRAME_LOC_SUGGEST` が `0`（共通の `/etc/default/geoframe` が `1` でも、drop-in が勝つ）。journal に AI の送信を示す行が無い（Python 版のログの文言は演習で出たものを見本にする）。
-  - 件数: `photos`・手動の位置（`manual`）・お気に入り・除外（`hidden`）・回転（`rotated`）が、Rust の期間にした操作を含めて保たれている。切替の直後に戻したなら §4 の控えと同じ。Rust の期間にユーザーが操作したなら、その分の差だけ。下書き: 消えていない（Rust の期間に保存した分は `sha256sum -c` に「変更」と出るが、消えたものは出てはいけない）。
-  - `.cache.json` を Python が読める。画像の欠けが 0。
-  - 管理画面が動く（ユーザーが確かめる）。
-- 品質（簡易品質）の切り戻し — [server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)。次の**2つの場合**のどちらかを記録する:
-  1. **そのまま戻した直後**（Python の変化なしのサイクル）: `photo_quality` の行数（`quality_rows`）・グループ数（`quality_groups`）・`/api/v1/photos` の件数が戻す前と**同じ**。`algorithm` は `rust-phash-v1:…` のまま。
-  2. **`dirty` の再構築が走った後**（新しい写真が入る・何かで `dirty` になった）: 件数・グループの顔ぶれ・`kind` は変わらない。変わりうるのは順位・推奨・スコア・`group_id` の振り直しと、完全重複のグループで表に出る写しの入れ替わり。`algorithm` は全行 `poc-phash-v1:…`。行数・グループ数を記録する。
+  - **Python の AI が無効**: プロセスの環境の `GEOFRAME_AI_ENABLED`・`GEOFRAME_LOC_SUGGEST` が `0`（共通の `/etc/default/geoframe` が `1` でも、drop-in が勝つ）。journal の例外の行数が 0、AI を示す語の行数が 0。**0 でないときは、行を画面に出さず**、`$WORK/py-journal.txt` に保存してユーザーと読み、送信か定型の「無効」の行かを区別する（Python 版のログの文言は演習で出たものを見本にする）。
+  - **`.cache.json` を Python の読み込みの経路で確かめた**: `cache_load.py` が `rc=0`、`python_will_drop=0`（起動時の掃除が済んでいる）、`file_keys` が §8.2 の `python_keeps` 以上。
+  - **手動の位置・お気に入り・除外・回転が、ID ごとに保たれている**: `state_diff.py` が「値が違う 0・前だけ 0・後だけ 0」（`rs-end-state.tsv` との比較。Rust の期間にユーザーが付けた分も含めて、戻す直前と同じ）。件数（`counts diff`）は `manual`・`favorite`・`hidden`・`rotated` の行が同じ。`photos` の行だけが増えているのは Python の取り込みが動いた（新しい写真が入ったので、下の品質の 2 が後で走る）。
+  - **旅行ブログの下書きの全ファイルが同じ**: `diff | grep -c` が **0**（ハッシュも件数も、消えたものも増えたものも無い）。
+  - 画像の欠けが 0。管理画面が動く（ユーザーが確かめる）。
+  - 報告は**不一致の件数だけ**（座標・パス・ファイル名を書かない）。
+- 品質（簡易品質）の切り戻し — [server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)。**比較の基準は Rust から戻す直前の値**（`rs-end-counts.txt`・止める前の一覧 `rs-end-feed.json`。切替の前の値ではない）。次の**2つの場合を分けて**記録する:
+  1. **そのまま戻した直後**（Python の変化なしのサイクル）: `counts diff` の `quality_rows`・`quality_groups`・`kind:` の行が基準と**同じ**。`algorithm` は `rust-phash-v1:…` のまま。`/api/v1/photos` の件数が、止める前の件数（`rs-end-feed.json`）から、§6.2 で記録した「既知の差」の件数（Python が再び隠す分）を引いた数と一致する（既知の差が 0 件なら同じ）。
+  2. **`dirty` の再構築が走った後**（新しい写真が入る・何かで `dirty` になる。`algorithm` が全行 `poc-phash-v1:…` に変わったことで分かる）: `quality_rows`・`quality_groups`・`kind:` の件数は基準と同じ（顔ぶれ・`kind` は変わらない）。変わりうるのは順位・推奨・スコア・`group_id` の振り直しと、完全重複のグループで表に出る写しの入れ替わりだけ。再構築のあとの行数・グループ数を記録する。
+  - **本番の確認と演習の違い**: 本番では 1 を必ず記録し、2 は**自然に走ったときだけ**記録する（走らなければ「走らなかった」と記録する。本番の DB を `dirty` にして走らせない）。**T5.4 の演習では両方を実施・記録する**（2 は演習の複製の DB だけで `photo_quality_dirty` を立てて再構築させる。手順は [§15](#15-演習t54のチェックリスト)）。
   - Python だけで解析した結果に戻したいとき（Rust の結果を保つ方法ではない）は、**Python を起動する前に**、server.md §16.10 の手順 2（`photo_quality_features` の Rust が解析した行の削除）を、ユーザーの許可を得て行う。件数・グループが変わりうる。
-- 失敗したら: 件数が減った・手動の列が消えた・下書きが消えたときは、**DB を疑う**（§10 の復元。失うものを先に読む）。配信が動いているなら、まず原因を調べる。
+- 失敗したら: 件数が減った・手動の列が消えた（`state_diff.py` が 0 でない）・下書きが消えたときは、**DB を疑う**（§10 の復元。失うものを先に読む）。`cache_load.py` が `rc≠0` なら `cache-rs-end.json` と見比べて記録する（キャッシュは作り直せる）。配信が動いているなら、まず原因を調べる。
 
-### 8.4 戻したあとの注意
+### 8.5 戻したあとの注意
 
 - **checkout の固定の印（`/etc/geoframe/checkout-pinned`）は外さない**（Python へ戻したあとも `deploy-pull.sh` は P5b 以降を取り込まない）。Python の更新が要るときは、`/opt/geoframe` を P5a のマージのコミットへ**手で**戻す: `git -C /opt/geoframe reset --hard "$COMMIT" && systemctl restart geoframe-server`。
 - Rust のバイナリ・unit・`/etc/default/geoframe-rs` は残す（mask されているので起動しない）。Python のあいだは `GEOFRAME_INGEST=1` の書き込みは動かない。
-- `geoframe-backup.timer` が動いていること（`systemctl is-active geoframe-backup.timer`）。
+- `geoframe-backup.timer` が動いていること: §8.3 の最後に [§4.5](#45-バックアップのタイマーを戻す共通の出口) を実行した（`タイマー OK`）。
 - 原因と戻した時刻をユーザーに報告し、`p5-acceptance.md` に記録する。
 
 ## 9. 切り替え直す
@@ -829,8 +1092,10 @@ systemctl mask geoframe-server
 systemctl is-active geoframe-server; systemctl is-enabled geoframe-server    # inactive / masked
 ```
 
-4. **§4 の保全を取り直す**（`$TS` を新しくする。名前は `p5-precutover-…` のままでよい。前回のものは消さない）。`geoframe-backup.timer` を止めてから。
+4. **§4 の保全を取り直す**（`$TS` を新しくする。名前は `p5-precutover-…` のままでよい。前回のものは消さない）。`geoframe-backup.timer` を止めてから（§4.1。**止めたタイマーは、どの出口でも §4.5 で戻す**）。
 5. **§5 → §6** を実行する（T1 と時間も記録し直す）。バイナリは同じものでよい（`--expect-sha256` は同じ）。
+
+**3 以降で止まって Python へ戻すとき**: §3 の「止まったとき」は使わない（それは drop-in を外して AI が有効の切替の前の状態へ戻す手順で、ここでは AI が有効な Python を起動してしまう）。**§8（8.1 は Rust が動いていなければ省く）の 8.3 で、drop-in を残したまま Python を起動**し、Python が 200 になったら §4.5 でタイマーを戻す。
 
 `p5-rollback.conf` は Python だけに効くので、Rust の AI の設定は変わらない。checkout の固定の印はそのまま。
 
@@ -847,8 +1112,10 @@ CUR=geoframe-rs                                    # いま動いている方（
 systemctl stop "$CUR"
 systemctl stop geoframe-backup.timer
 systemctl is-active geoframe-backup.service        # inactive
-fuser -v /var/lib/geoframe/catalog.db*; echo "fuser rc=$?"      # 空・rc=1
+"$WORK/dbopen.sh"; echo "dbopen rc=$?"             # rc=0（DB を開いているプロセスが無いと確認できた）。rc=1・2 は先へ進まない（§0.5）
 ```
+
+- **ここで中断したときも、サービスを起動し直したあとにタイマーを戻す**（[§4.5](#45-バックアップのタイマーを戻す共通の出口)）。
 
 ### 10.2 いまの DB を 3 つ一緒に退避する
 
@@ -866,20 +1133,36 @@ ls -l "$ASIDE"
 
 ### 10.3 一時名へ展開して検査する
 
+展開が途中で失敗したファイルを DB として使わないよう、**展開の終了コードと「空でないこと」を条件にし、失敗したら一時ファイルを消して止める**。
+
 ```sh
 BK=/var/backups/geoframe/p5-precutover-<時刻>.db.gz          # 復元に使うバックアップ
 TMP=/var/lib/geoframe/.catalog.db.restore-$TS                  # 同じディレクトリの一時名
-gzip -dc "$BK" > "$TMP"
-chown geoframe:geoframe "$TMP"
-chmod --reference="$ASIDE/catalog.db" "$TMP" 2>/dev/null || chmod 0640 "$TMP"    # 元と同じモード
-sudo -u geoframe sqlite3 "file:$TMP?immutable=1" 'PRAGMA integrity_check'                 # ok の 1 行
-sudo -u geoframe sqlite3 "file:$TMP?immutable=1" .dump | sha256sum | cut -d' ' -f1        # = バックアップの .dump の SHA-256
+DUMPSHA=$(cat "$WORK/precutover.dumpsha")                      # 取ったときに控えた値（§6.8）。他のバックアップなら、$WORK に別に展開して dumpsha.sh で取った値
+if gzip -t -- "$BK" && gzip -dc -- "$BK" > "$TMP" && [ -s "$TMP" ] \
+   && chown geoframe:geoframe "$TMP" \
+   && { chmod --reference="$ASIDE/catalog.db" "$TMP" 2>/dev/null || chmod 0640 "$TMP"; }; then
+    echo "展開 OK"
+else
+    rm -f -- "$TMP"; echo "NG: 展開に失敗した。一時ファイルを消した。先へ進まない（いまの DB は $ASIDE にある）"
+fi
 ```
 
-- 確かめること: `integrity_check` が `ok`。`.dump` の SHA-256 が、**取ったときに控えた値**（`p5-precutover-*` なら §6.8 の `$DUMPSHA`）と一致する。他のバックアップ（`catalog-*.db.gz`）は控えが無いので、`$WORK` に別に展開して同じ方法でハッシュを取り、照合の基準にする（`/var/lib/geoframe` の外・root の `sqlite3` で）。
-- 失敗したら: 一致しなければ、その一時ファイルを置かない（`rm "$TMP"`）。別のバックアップを試す。**いまの DB は `$ASIDE` にあるので、戻せる**（`mv "$ASIDE"/catalog.db* /var/lib/geoframe/`）。
+`展開 OK` のときだけ、検査する（どちらも失敗したら、その一時ファイルを置かない）:
+
+```sh
+RESTORED=$(sudo -u geoframe sqlite3 "file:$TMP?immutable=1" 'PRAGMA integrity_check'); echo "integrity_check: $RESTORED"     # ok の 1 行
+DUMPNOW=$("$WORK/dumpsha.sh" "file:$TMP?immutable=1" geoframe); echo "dump sha256: $DUMPNOW (rc=$?)"                    # 上流の失敗・空の出力は rc≠0
+if [ "$RESTORED" = ok ] && [ -n "$DUMPNOW" ] && [ "$DUMPNOW" = "$DUMPSHA" ]; then echo "検査 OK（integrity_check ok・.dump が一致）"
+else rm -f -- "$TMP"; echo "NG: 検査に失敗した。一時ファイルを消した。別のバックアップを試すか、\$ASIDE へ戻す"; fi
+```
+
+- 確かめること: `integrity_check` が `ok`。`.dump` の SHA-256 が、**取ったときに控えた値**（`p5-precutover-*` なら §6.8 の `$WORK/precutover.dumpsha`）と一致する。他のバックアップ（`catalog-*.db.gz`）は控えが無いので、`$WORK` に別に展開して同じ方法（`dumpsha.sh`。root の `sqlite3`）でハッシュを取り、照合の基準にする（`/var/lib/geoframe` の外で）。
+- 失敗したら: 展開に失敗した・一致しなければ、その一時ファイルを置かない（上のコマンドが消す）。別のバックアップを試す。**いまの DB は `$ASIDE` にあるので、戻せる**（`mv "$ASIDE"/catalog.db* /var/lib/geoframe/`）。
 
 ### 10.4 置き換えて、所有者を確かめる
+
+**§10.3 が `検査 OK` のときだけ**行う。
 
 ```sh
 mv -f "$TMP" /var/lib/geoframe/catalog.db
@@ -897,22 +1180,26 @@ DB を別の inode に置き換えたので、**必ず（再）起動する**（
 systemctl start "$CUR"
 curl -fsS -o /dev/null -w '%{http_code}\n' $BASE/api/v1/photos     # 200
 curl -fsS $BASE/api/v1/photos -o "$WORK/restored-feed.json"
-python3 -I "$WORK/check_files.py" "$WORK/restored-feed.json"        # 画像の欠け（200でない）の数
+python3 -I "$WORK/check_files.py" "$WORK/restored-feed.json" "$WORK/missing-ids.txt"        # 画像の欠け（200でない）の数。ID は missing-ids.txt にだけ
 sudo -u geoframe sqlite3 'file:/var/lib/geoframe/catalog.db?mode=ro' < "$WORK/counts.sql"
 ```
 
 - 確かめること: 配信が 200。表示の画像の欠けが 0。
-- **画像の欠け**: 回転は新しい画像を作って古い画像を消す。DB だけを古い時点に戻すと、`display` が消えた画像を指す行ができる。`fetch_derivatives` は `display IS NULL` の行だけを取り直すので、**取り込みのサイクルでは自動では直らない**。管理画面の回転は、今の画像が無いと 400 で、回転では直らない。件数（`check_files.py` の「200でない」）を記録し、直し方は **演習（T5.4）で確かめて `p5-acceptance.md` に記録した手順**に従う（候補: 該当行の `display` を `NULL` に戻して取得し直させる。DB への書き込みなので、サービスを止めて `geoframe` ユーザーで、ユーザーの許可を得て行う）。
+- **画像の欠け**: 回転は新しい画像を作って古い画像を消す。DB だけを古い時点に戻すと、`display` が消えた画像を指す行ができる。`fetch_derivatives` は `display IS NULL` の行だけを取り直すので、**取り込みのサイクルでは自動では直らない**。管理画面の回転は、今の画像が無いと 400 で、回転では直らない。件数（`check_files.py` の「200でない」と、ID を書いた `$WORK/missing-ids.txt` の行数）を記録する。
+- **直し方は未確定である**。**T5.4 の演習で、対象の限定・取り直し・回転の保持・再確認まで確かめ、確定した手順をここに書く。それまでは本番切替の前提を満たしていない**（この節の手順が確定するまで、§3 以降の本番の切替を始めない。復元の後に画像が欠けたとき、本番で場当たりの書き込みをしないため）。
+- 演習で確かめる案（**確定した手順ではない**。DB への書き込みなので、サービスを止めて `geoframe` ユーザーで、ユーザーの許可を得て行う）:
+  1. **対象の限定**: `python3 -I "$WORK/check_files.py" "$WORK/restored-feed.json" "$WORK/missing-ids.txt"` で欠けた写真の ID を集め、DB の `source='drive'` の行に限る（`local` の行は別。原本が `photos/` にあれば `local` の段が取り直す）。件数が想定（復元で巻き戻った回転の件数）と合うこと。
+  2. **取り直し**: 対象の行だけ `display=NULL`（`fetched_at=NULL`）にする。**`rotation` は変えない**（`fetch_derivatives` は DB の `rotation` で `derivative_name(drive_id, rotation)` の名前と向きの画像を作る。復元した DB の `rotation` と画像が一致する）。取り込みの 1 サイクルは `GEOFRAME_FETCH_PER_CYCLE` 枚ずつなので、対象が多ければ複数サイクルかかる。
+  3. **回転の保持の確認**: 取り直しの前後で `state_snapshot.sql` の出力を `state_diff.py` で比べ、`rotation`・手動の位置・お気に入り・除外が変わっていない（`display` だけが変わりうる）こと。
+  4. **再確認**: `check_files.py` の「200でない」が 0、`/api/admin/status` の `db.no_display`・`sync.pending` が元に戻ること。
+- **鍵を置かない演習では、Drive からの取り直しそのものは確かめられない**（演習は `GEOFRAME_DRIVE_KEY` が存在しないパスで、取り込みは Drive へ出ずに終わる。実 Drive は T3.10 で確認済み）。代わりに確かめること: ①対象の限定と `display=NULL` への更新が `rotation` を変えないこと（1・3）、②取り込みのサイクルが対象の行を「取り直し待ち」に数えること（`db.no_display`・`sync.pending` が対象の件数だけ増える）、③取り直しの処理本体が、回転した写真を同じ名前・同じ向きで取り直すこと（`cargo test` の `a_rotated_photo_is_fetched_again_with_the_same_name_and_orientation`。`crates/geoframe/src/drive/tests.rs`）、④`local` の行は原本が `photos/` にあれば演習でも取り直せるか。**実 Drive からの取り直しは、本番で復元するときに、対象を 1 件に限って先に取り直し（200 になり向きが合うことを確かめてから残りへ広げる）、という手順に組み込む**。鍵を置いた演習をユーザーが別に許可したときは、1〜4 を実 Drive で確かめ、その旨を `p5-acceptance.md` に記録する。
 - 失敗したら: 起動しない・画像の欠けが多い・件数が想定と違うときは、`$ASIDE` の DB に戻せる（止める→3 つを入れ替える→起動）。原因をユーザーに報告する。
 
 ### 10.6 タイマーを戻す
 
-```sh
-systemctl start geoframe-backup.timer
-systemctl is-active geoframe-backup.timer                          # active
-```
+[§4.5](#45-バックアップのタイマーを戻す共通の出口) のコマンドを実行する（`タイマー OK`）。
 
-途中で止めたときも戻す。`$ASIDE` は P5 の記録が終わるまで消さない（ユーザーの許可で消す）。
+**途中で止めたときも、サービスを起動し直したあとに戻す**（§10.1 で止めたまま終わらない）。`$ASIDE` は P5 の記録が終わるまで消さない（ユーザーの許可で消す）。
 
 ## 11. 切替のあとの数日
 
@@ -1071,7 +1358,9 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 
 - 日付、立ち会い、許可を得た段（事前にまとめて許可した範囲）。
 - `COMMIT`（P5a のマージのコミット）と演習のコミット、その差が無いことの確認。バイナリの sha256。
-- 件数: Python の写真の件数、Rust の件数、Python だけ（0）・Rust だけの件数と群の数、`--expect-min-photos`、`db.loc.clue_pending` の初期値。保全の `.dump` の SHA-256、`photo_quality` の行数・グループ数（`algorithm` 別）、手動・お気に入り・除外・回転の件数。
+- 件数: Python の写真の件数、Rust の件数、Python だけ（0）・Rust だけの件数と、その内訳（`extra.py` の取り込み・既知の差・**説明できない（0）**）と群の数（`ai_group` は空を除く）、`--expect-min-photos`、`db.loc.clue_pending` の初期値。保全の `.dump` の SHA-256、`photo_quality` の行数・グループ数（`algorithm` 別）、手動・お気に入り・除外・回転の件数。
+- 戻した場合の確認: `state_diff.py` の不一致の件数（値が違う・前だけ・後だけ）、下書きの全ハッシュの不一致の件数、`.cache.json` の読み込み（`file_keys`・`python_keeps`・`python_will_drop`）、品質の 2 つの場合（そのまま／`dirty` の再構築）の件数。基準は Rust から戻す直前の値。
+- バックアップのタイマー: 止めた時刻と、戻した出口（§4.5 の表のどれか）、`タイマー OK` の確認。`dbopen.sh` が使った経路（`fuser`／`/proc`）。
 - 時間: T0〜T1（停止から配信の再開まで）、`--wait-secs`、各段の時間。戻した場合は戻すのにかかった時間。
 - 終了コード（`rust-deploy.sh`）、止める判断を使ったか、その理由。
 - 取り込みの 1 サイクルの結果（表示可能／取得待ち／全の件数）、`clue_pending` が 0 になった時刻、索引の公開の時刻、最初のバックアップの成功。
@@ -1080,3 +1369,87 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 **書かないもの**
 
 - ホスト名・LAN のアドレス・ユーザー名、写真のファイル名・座標・地名、設定の値（`GEOFRAME_*` の値・AI 設定の JSON の中身・URL・モデル名・project・region・鍵のパス）、鍵・トークン、差分の中身。これらは作業用の置き場（`$WORK`）に残し、記録が終わったらユーザーの許可で消す。
+
+## 15. 演習（T5.4）のチェックリスト
+
+検証環境（lxc-geoframe）で、本番の切替の前に、この手順書を通しで演習する。設計は [p5-design.md §演習](p5-design.md)。**本番の機体では実行しない**（この節は検証環境だけ）。本番と違う所は [§0.6](#06-演習では本番との違い)、各節の「演習では」の注記と、ここで足す。記録は `p5-acceptance.md`（書くもの・書かないものは §14）。
+
+### 15.1 設計の流れ 1〜9 と、この手順書の対応
+
+| 設計の流れ | 内容 | 手順書の節 | 演習で確かめるもの（合格の条件） |
+| --- | --- | --- | --- |
+| 1 | 復元の演習（回転を 1 件してから古いバックアップへ戻す） | §10 | 起動前の `integrity_check`・`.dump` の一致・所有者、起動後の画像の欠け。**§10.5 の画像の欠けの直し方を確定して書き込む**（確定するまで本番の切替に進まない） |
+| 2 | Python を本番の役で動かし、Rust へ切り替える | §1.5〜§1.10・§2〜§6（§7 は 1 つ実施） | `--check-only`・保全・`--production` の配布。T0〜T1（5 分以内）。`--wait-secs` の測定。`ai-jobs status` と書き込み系の操作を 1 つ（`ai-jobs retry`） |
+| 3 | シャドー比較 | §15.3 | `compare_with_python.py` の想定外の差 0 |
+| 4 | Rust の期間の操作 | §15.4 | 手動の位置・お気に入り・除外・回転・下書きの保存を、それぞれ 1 件以上 |
+| 5 | 戻す（AI 無効） | §8 | ID ごとの状態・下書きの全ハッシュ・`.cache.json` が保たれる。AI の通信が出ない。品質の 2 つの場合（そのまま／`dirty` の再構築）の両方 |
+| 6 | 切り替え直す | §9 | 再び Rust で配信が戻る |
+| 7 | 旧 Python の判定済みの行がある DB での `clue_pending` | §6.3・§11.1 | `db.loc.clue_pending` が 0 でなく、Decision が動けば進む |
+| 8 | `Conflicts=` と `After=` の試験 | §15.5 | 両方の向きで、旧プロセスの終了が新プロセスの起動・最初の書き込みより前 |
+| 9 | 元に戻す | §15.6 | 演習の前の状態と一致 |
+
+### 15.2 演習の前の準備と、各節の省略・置き換え
+
+**演習の前に控える**（元に戻すときの基準。値は文書に書かず、`$WORK` に置く）: `systemctl list-unit-files 'geoframe*'`・各 unit の `is-enabled`／`is-active`・`ls -l /etc/systemd/system/geoframe* /usr/local/lib/systemd/system/geoframe* /usr/local/bin/geoframe* /etc/default/geoframe* /etc/geoframe`・`/usr/local/bin/geoframe` の sha256・`/var/lib/geoframe` の退避先の名前。
+
+| 節 | 演習では |
+| --- | --- |
+| §0.5 変数 | `WORK=/root/p5-cutover`（検証環境の root）・`HOST` は検証環境の `hostname`・`COMMIT` は演習の checkout（`/opt/geoframe-pyref`）の `HEAD`・`PYAPP=/opt/geoframe-pyref/app`。コマンドの `/opt/geoframe/…` は `/opt/geoframe-pyref/…` に読み替える |
+| §1.1 | 省く。`/opt/geoframe-pyref` を手で P5a のコミットにする（`git -C /opt/geoframe-pyref status --short` が空であること） |
+| §1.2 | 省く（演習のコミットが基準）。**本番の §1.2 で、演習のコミットと P5a のマージのコミットの差が無いことを確かめる**ので、演習のコミットを `p5-acceptance.md` に記録する |
+| §1.3 | 同じ。`fuser` は無くてよい（`dbopen.sh` がどちらの経路で判定したかを記録する） |
+| §1.4 | 同じ（`$WORK` を作り、補助スクリプトを置く。ここで作ったスクリプトを、そのまま本番で使う。直したら記録する） |
+| §1.5 | 同じ 3 つの設定のファイル。`GEOFRAME_DRIVE_KEY` は**存在しないパス**。`GEOFRAME_AI_CONFIG` はローカルの用途だけ。`TZ` は本番と同じ |
+| §1.6 | AI 設定の JSON の確認は同じ。**鍵は置かないので、鍵の所有者・モードの確認（表の鍵の行）は省く**（クラウドの `Unauthorized` 拒否は `ai-cloud.md` の試験で済み） |
+| §1.7 | 検証環境の Decision の `health` を確かめる。無ければ §15.1 の流れ 7 は「待ちが 0 でなく、`clue_runnable` の表示が出る」ところまで |
+| §1.8 | 演習で使うバイナリ（`rust-deploy.sh` の検証環境の経路が作る musl の成果物と同じ手順でビルドしたもの）を `$BIN` に置き、**その sha256 を記録して `$SHA` とする**（本番の `--expect-sha256` に渡す）。**初回の配布を再現するため**、検証環境にいまある `/usr/local/bin/geoframe*` と `geoframe-rs.service`（`/usr/local/lib/systemd/system/` と `/etc/systemd/system/`）を、演習の前に退避して「無い」状態にする（§15.6 で戻す） |
+| §1.9 | `hostname` は検証環境のもの。検証環境の印 `/etc/geoframe/staging` は**退避**する（§15.6 で戻す）。Python 版 unit は最初から `/usr/local/lib/systemd/system/geoframe-server.service`（比較用 Python を `geoframe-server.service` の名前・`/var/lib/geoframe`・8080 で一時的に置く。`deploy/geoframe-server.service` の `WorkingDirectory=`・`ExecStart=` を `/opt/geoframe-pyref` の checkout と venv に向けたもの）。`FragmentPath` の期待値はその場所で、「通常のファイル」の判定は省く |
+| §1.10 | 同じ |
+| §2 | 同じ。Python 役は AI 無効・鍵なし（共通の `/etc/default/geoframe` は `GEOFRAME_AI_ENABLED=0`。**流れ 5 の前に `1` へ書き換える**） |
+| §3.1〜§3.6 | 同じ。§3.2（unit の本体を移す）は省き、`/etc/systemd/system/` に本体が無いことだけ確かめる。drop-in・mask・固定の印は同じ |
+| §4 | 同じ。バックアップ先 `/var/backups/geoframe` が無ければ作る（`geoframe` 所有・`0750`）。**検証環境に `geoframe-backup.timer` が無いときは**、同名の何もしない `oneshot` の service と timer（`ExecStart=/bin/true`）を `/run/systemd/system/` に一時的に置いて §4.1・§4.5 の動作を確かめる（再起動で消える。§15.6 で消す） |
+| §5 | 同じ。`--wait-secs` は**測る**（起動から `/healthz` 200 までの秒数を数回測り、余裕を足した値を本番の `$WAIT` に使う） |
+| §6 | §6.4 の miharashi・管理画面は検証環境の方法（`tools/miharashi-feed-check`・`compare_with_python.py`）。§6.5 の取り込みは Drive へ出ずに終わる（鍵が無いため）ことを確かめる。§6.2 の `extra.py` は演習の複製 DB で実行する（説明できない 0） |
+| §7 | `ai-jobs status` と、サービスを止めて行う書き込み系を 1 つ（`ai-jobs retry --kind location_clue` など。外へ送らないもの） |
+| §8 | 同じ。`$PYAPP` を演習の venv に向ける。共通の `/etc/default/geoframe` を `GEOFRAME_AI_ENABLED=1` にして戻し、drop-in が勝つこと（プロセスの環境が `0`）を確かめる。**品質は 2 つの場合の両方**（§15.4 の最後） |
+| §9 | 同じ |
+| §10 | 流れ 1。**§10.5 の画像の欠けの直し方を確定する**（対象の限定・取り直し・回転の保持・再確認。鍵が無いので Drive からの取り直しは確かめられない。代わりの確認は §10.5） |
+| §11 | Decision の全件再判定・索引の公開は、検証環境で動く範囲で進み方を確かめる（本番機の CPU を使う確認は本番で）。バックアップの timer は本番で |
+| §12 | 省く（鍵が無い）。設定の書き方は `ai-config.md` の試験で済み |
+| §13 | 省く。代わりに §15.6 |
+
+### 15.3 シャドー比較（流れ 3）
+
+- **実行する段**: 流れ 2（§2〜§6）が済み、配信が安定したあと、**流れ 4 の操作の前**（同じ時点の DB を 2 つの複製に分けるため）。
+- **別のコピーの置き方**: Rust と比較用 Python は、**同じ内容の別の複製**を使う（Python は書き込むので、同じ DB を Rust と共有しない）。①Rust を §7 の形で止める。②`sqlite3 .backup` で DB を 2 つの DATA_DIR（例: `/var/lib/geoframe-shadow-rs`・`/var/lib/geoframe-shadow-py`。`geoframe` 所有・`0750`）に取り、`derivatives/` はハードリンクで複製する（`cp -al`）。2 つの `.dump` の SHA-256 が一致することを確かめる。③Rust を Rust 用の複製で `GEOFRAME_INGEST` 無し（読み取り専用）・`127.0.0.1:8081`、比較用 Python を Python 用の複製で `GEOFRAME_AI_ENABLED=0`・`GEOFRAME_LOC_SUGGEST=0`・Drive の鍵なし・`127.0.0.1:8090` に、`systemd-run --uid=geoframe` の一時 unit で起動する。④流れ 2 で止めた本番役の Rust を起動し直す。
+- **実行**: `python3 /opt/geoframe-pyref/tools/compare_with_python.py --rust http://127.0.0.1:8081 --python http://127.0.0.1:8090`。
+- **想定外の差 0 の判定**: 終了コード 0（差の件数が 0）であること。終了コード 1 のときは、出た差の内訳（件数とキー名・パス）が、**既知の差だけ**で説明できなければ失敗: `/healthz`（Python に無い）と、フィードの Rust だけの写真（§6.2 の `extra.py` が「既知の差」と判定した件数と一致する）。それ以外は想定外で、0 でなければならない。内訳の件数を記録する。
+- 終わったら一時 unit を止め、複製を消す（§15.6）。
+
+### 15.4 Rust の期間の操作（流れ 4）と、品質の 2 つの場合（流れ 5）
+
+- 流れ 3 のあと、管理画面（検証環境の `127.0.0.1:8080`）で: 手動の位置を 1 件以上、お気に入りを 1 件以上、除外を 1 件以上、回転を 1 件以上、旅行ブログの下書きの保存を 1 件以上。ID・値は `$WORK` に残さなくてよい（§8.2 の `rs-end-*` が控える）。
+- 戻す（§8）。§8.4 の「そのまま戻した直後」を記録する（品質の場合 1）。
+- **品質の場合 2（`dirty` の再構築）**は、演習の複製の DB だけで起こす（**本番の DB では行わない**）: ①Python を止める（§8.1 と同じ要領で、`geoframe-server` を `stop`）。②`geoframe` ユーザーで `UPDATE settings SET value='1' WHERE key='photo_quality_dirty'` を実行する（`sudo -u geoframe sqlite3 /var/lib/geoframe/catalog.db`）。③Python を起動し（§8.3 の `systemctl start geoframe-server`）、同期サイクルが 1 回回って未解析が 0 のとき再構築が走る（`algorithm` が全行 `poc-phash-v1:…` になる）まで待つ。④`counts.sql` を取り直し、§8.4 の 2 の基準（`rs-end-counts.txt`＝Rust から戻す直前の値）と比べる。行数・グループ数・`kind:` が同じで、変わったものがあれば順位・推奨・スコア・`group_id`・完全重複の写しの入れ替わりに限られること。
+- `p5-acceptance.md` には、場合 1・2 それぞれの `quality_rows`・`quality_groups`・`kind:` 別・`algorithm` 別の件数と、`/api/v1/photos` の件数を記録する。
+
+### 15.5 `Conflicts=` と `After=` の試験（流れ 8。手順書の切替とは別）
+
+目的: `geoframe-rs.service` の `Conflicts=geoframe-server.service` と `After=geoframe-server.service` で、**どちらの向きでも旧プロセスが終わってから新しいプロセスが書き始める**ことを確かめる。
+
+1. 両方を unmask する（Rust は `GEOFRAME_INGEST=1`、Python は drop-in 付き・AI 無効）。`systemctl show geoframe-rs -p Conflicts -p After` に `geoframe-server.service` が出ること。
+2. **向き A（Python が動いているときに Rust を起動）**: Python を起動して `active` にし、`systemctl start geoframe-rs`。時刻は次の 2 つで比べる: systemd の行（`journalctl -t systemd -o short-precise --since '<開始時刻>' --no-pager | grep -E 'geoframe-(rs|server)'`。「Stopped」「Started」など）と、Rust の定型文（`journalctl -u geoframe-rs -o short-precise --since '<開始時刻>' --no-pager | grep -E '\[guard\]|サイクル完了'`）。**Python の停止の完了の時刻 < Rust の起動・最初の書き込み（サイクル）の時刻**。Python 版自身のログの行は画面に出さない（§0.5）。
+3. **向き B（Rust が動いているときに Python を起動）**: Rust を `active`（取り込みが動いている）にして、`systemctl start geoframe-server`。**Rust の停止の完了の時刻 < Python の起動の時刻**を、同じ systemd の行で比べる。Rust の停止は `TimeoutStopSec=90s` までかかりうる。
+4. 終わったら通常の状態（Rust のみ active、Python は mask）に戻す。`systemd-analyze security geoframe-rs --no-pager | tail -1` の総合の評価（数値と段階だけ）を記録する。
+5. 記録するもの: 向きごとの「旧プロセスの停止の完了」と「新プロセスの起動」の時刻の差（秒）。どちらも旧が先であること。
+
+### 15.6 元に戻す（流れ 9）
+
+演習の前に控えたもの（§15.2）と一致させる。**一つずつ、戻したことを確かめる**:
+
+1. 一時的な `geoframe-server.service`（`/usr/local/lib/systemd/system/`）と drop-in `p5-rollback.conf`、`/etc/default/geoframe-py-rollback`、共通の `/etc/default/geoframe` の演習用の値を消す／戻す。`systemctl unmask` の済んでいない mask を戻し、`systemctl daemon-reload`。
+2. 演習で作った `/etc/default/geoframe-rs` ほかの設定のファイルを、演習の前の状態に戻す。`/etc/geoframe/checkout-pinned` を消す。
+3. 検証環境の印 `/etc/geoframe/staging` を戻す（退避を `mv` で戻す）。
+4. `/usr/local/bin/geoframe*` と `geoframe-rs.service`（両方の置き場所）・`geoframe-pyref.service`（8090）を、演習の前の形に戻す（退避から戻す。演習で入れたバイナリ・`.prev`・`.failed` を消す）。
+5. `/var/lib/geoframe` を退避から戻し、本番のコピー・`/var/lib/geoframe-shadow-*`・一時 unit（`systemd-run` のもの）・`/run/systemd/system/` に置いた timer のダミー・`/var/backups/geoframe` の演習用バックアップ・`$WORK` を消す（ユーザーの許可で。バイナリと `sha256` の記録は `p5-acceptance.md` にだけ残す）。
+6. 確認: §15.2 で控えたコマンドをもう一度実行し、**差が 0**（`diff`）。検証環境の通常のサービス（`geoframe-pyref.service` 8090 など）が演習の前と同じ状態で動いていること。

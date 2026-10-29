@@ -262,6 +262,7 @@ echo "[4] 復元の mv の失敗（手作業の手順を出し、終了コード
 setup; echo 1 > "$T/env/ctl/fail_restart"; touch "$T/env/ctl/poison_prev"; run deploy
 expect "mv の失敗: 終了コード3" test "$rc" = 3
 expect "mv の失敗: 手作業の復旧手順が出る" grep -q '手で戻すこと' "$T/out"
+expect "mv の失敗（検証環境）: 手順の文言は『検証環境で』で、本番の案内（cutover.md）は出ない" bash -c 'grep -q "検証環境で root として手で戻すこと" "$1" && ! grep -q "本番機で root" "$1" && ! grep -q "cutover.md" "$1"' _ "$T/out"
 expect "mv の失敗: 失敗した操作が出る" grep -q "失敗した操作: mv " "$T/out"
 expect "mv の失敗: 『戻した』と表示しない" no_restored
 setup; run deploy; chmod a-w "$T/env/bin"; run rollback; chmod u+w "$T/env/bin"
@@ -693,6 +694,7 @@ expect "本番: 初回の配布の失敗は止めて unit を外す（終了コ�
 expect "本番: 初回の失敗が Python 版へ戻す手順を案内する" grep -q 'cutover.md' "$T/out"
 setup; no_prod_marker; echo 1 > "$T/env/ctl/fail_restart"; touch "$T/env/ctl/poison_prev"; prod
 expect "本番: 戻せなかった失敗は終了コード3" test "$rc" = 3
+expect "本番: 戻せなかった失敗の手順は『本番機で』で、検証環境とは言わず、Python 版へ戻すのは cutover.md §8 と案内する" bash -c 'grep -q "本番機で root として手で戻すこと" "$1" && ! grep -q "検証環境で root" "$1" && grep -q "cutover.md §8" "$1"' _ "$T/out"
 # unit の置き場所
 setup; no_prod_marker; rm -rf "$T/env/units"; prod
 expect "本番: unit の置き場所が無くても作って入れる" test "$rc" = 0 -a -f "$MOCK_UNIT"
