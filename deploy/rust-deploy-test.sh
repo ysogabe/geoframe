@@ -163,7 +163,7 @@ setup() {
     rm -rf "$T/env" "$T/stage"
     mkdir -p "$T/env/bin" "$T/env/units" "$T/env/etc" "$T/env/etc-units" "$T/env/state" "$T/env/ctl" "$T/stage"
     touch "$T/env/etc/staging"
-    : > "$GEOFRAME_RS_TEST_ENV_FILE"; chmod 0600 "$GEOFRAME_RS_TEST_ENV_FILE"
+    printf 'GEOFRAME_SECRET_FOR_TEST=ENV-SECRET\n' > "$GEOFRAME_RS_TEST_ENV_FILE"; chmod 0600 "$GEOFRAME_RS_TEST_ENV_FILE"
     printf 'OLD-BIN\n' > "$T/stage/old.bin"
     printf 'NEW-BIN\n' > "$T/stage/geoframe"
     printf 'NEW-UNIT\n' > "$T/stage/geoframe-rs.service"
@@ -631,6 +631,8 @@ setup; no_prod_marker; GEOFRAME_RS_TEST_ROOT_UID=$(( $(id -u) + 1 )) prod
 expect "本番: root（期待する UID）でなければ拒否（終了コード4）" test "$rc" = 4
 expect "本番: root でなくて何も変えていない" nothing_changed_args
 expect "本番: 設定のファイルの中身を読まない（ログに出ない）" bash -c '! grep -q "ENV-SECRET" "$1"' _ "$T/out"
+setup; no_prod_marker; prod
+expect "本番: 成功した配布のログにも設定のファイルの中身が出ない（ファイルには値がある）" bash -c 'grep -q ENV-SECRET "$2" && ! grep -q "ENV-SECRET" "$1"' _ "$T/out" "$GEOFRAME_RS_TEST_ENV_FILE"
 
 # 安全に使う git
 setup; no_prod_marker

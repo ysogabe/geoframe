@@ -447,7 +447,7 @@ sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements.t
 > ロールバックした状態は`origin/main`より古いため、次に`deploy-pull.sh`を実行すると
 > 再び`origin/main`へ進みます。問題のあるコミットはGitHub側で修正してください。
 
-## 7. Rust 版（移行中。検証環境専用）
+## 7. Rust 版（移行中。本番の切替は P5）
 
 Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作業（[Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)）の途中経過です。
 **Rust 版は既定で読み取り専用（`GEOFRAME_INGEST`を設定しない限り DB に書かない）です。本番の切替は P5**（[計画](../docs/rust-migration/plan.md)）で、
