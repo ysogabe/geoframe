@@ -179,7 +179,7 @@ fn python_fixture_is_reproducible_without_weight_or_data_access() {
         ))
         .arg("--check")
         .env_clear()
-        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
         .output()
         .unwrap();
     assert!(output.status.success(), "synthetic Python fixture failed");

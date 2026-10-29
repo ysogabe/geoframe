@@ -108,6 +108,18 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
 
+      - name: Pythonを準備
+        # AI の試験（ai/groups・ai/scene_judge）は Python の本体を呼び、同じ DB を読み直して戻せることを確かめる。
+        # Python の本体は Pillow を読み込むので、Python のジョブと同じ版と依存関係を入れる
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: app/requirements.txt
+
+      - name: Python依存関係をインストール
+        run: python -m pip install -r app/requirements.txt
+
       - name: musl-toolsをインストール
         # rusqlite の bundled が SQLite（C）をビルドするため、musl 用の C コンパイラが要る
         run: sudo apt-get update && sudo apt-get install -y musl-tools

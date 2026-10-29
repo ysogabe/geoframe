@@ -106,7 +106,8 @@ LOCAL_EMBED_THREADS = max(1, int(os.environ.get("GEOFRAME_LOCAL_EMBED_THREADS", 
 # （embeddinggemma-2の0.83は、実写真でGemini Embedding 2の0.82と同じ分位点に当たる値）
 AI_SIMILARITY = float(os.environ.get("GEOFRAME_AI_SIMILARITY")
                       or ("0.83" if EMBED_BACKEND == "local" else "0.82"))
-# 検索結果で「同じ構図」に畳むcosine類似度しきい値。既定はモデルごとに違う
+# 検索結果で「同じ構図」に畳むcosine類似度しきい値。既定はモデルごとに違う。
+# RustはT4.4bから対応し、0〜1の有限数のみ受け付ける
 AI_VISUAL_SIMILARITY = float(os.environ.get("GEOFRAME_AI_VISUAL_SIMILARITY")
                              or ("0.91" if EMBED_BACKEND == "local" else "0.90"))
 # 同一場面グループの中の順位に使う学習済みモデル（JSON）。無ければ鮮明度・露出などの
@@ -178,7 +179,8 @@ TILE_SOURCES = {
     "gsi": ("https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png", 18, 4),
 }
 # OSM tile usage policy 準拠に必須。実運用では連絡先入り（例 "GeoFrame/0.1 (me@example.com)"）を
-# GEOFRAME_TILE_UA に設定しておくこと。既定値のままだとブロックされうる
+# GEOFRAME_TILE_UA に設定しておくこと。既定値のままだとブロックされうる。
+# Rust版では地名検索（地理院・Nominatim）の User-Agent にも同じ値を使う（Python 版の地名検索は固定の`GeoFrame/0.2`）
 TILE_UA = os.environ.get("GEOFRAME_TILE_UA", "GeoFrame/0.1 (personal photo frame)")
 # タイルキャッシュの上限（全レイヤー共有）。容量を抑えたい場合は
 # GEOFRAME_TILE_CACHE_MAX_MB で上書きする。
