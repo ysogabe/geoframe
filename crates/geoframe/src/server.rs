@@ -15,6 +15,7 @@
 //! - リクエストログは [`access_log`] が一手に引き受け、出す項目は
 //!   メソッド・ルートのテンプレート・状態コード・所要時間だけ（[`crate::logging`]）。
 
+use std::future::IntoFuture;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -39,6 +40,7 @@ use crate::db::Catalog;
 use crate::drive::MassDeleteBoard;
 use crate::geocode::{self, Geocoder};
 use crate::limits::{ConnBusy, ConnLimits, LimitedListener, STATIC_FILE_SLOTS};
+use crate::stop::StopFlag;
 use crate::tiles::{self, CacheStatus, TileProxy};
 use crate::writer::Writer;
 use crate::{csrf, hostcheck, photos, post, pyquery, statics, sysinfo, webpath};
@@ -51,10 +53,14 @@ const HEALTH_TIMEOUT: Duration = Duration::from_secs(3);
 /// ディスク使用量（`/api/admin/status` の `disk`）のキャッシュ時間。全走査になるので現行と同じく 60 秒。
 const DISK_CACHE_TTL: Duration = Duration::from_secs(60);
 
+/// `/api/ai/status` の応答のキャッシュ時間。呼ぶたびにベクトルの BLOB を全件検査しないための短い時間。
+const AI_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+
 /// ハンドラが共有する状態。複製は安い。
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub ai_search: Arc<crate::ai::query::Runtime>,
     pub catalog: Catalog,
     /// データ置き場を**リンクを辿って解決した**絶対パス（起動時に1回。静的配信が、要求されたファイルを
     /// 解決した結果の内外判定に使う）。データ置き場自体がシンボリックリンクでもよい。
@@ -66,6 +72,9 @@ pub struct AppState {
     pub admin: Arc<AdminContext>,
     /// `disk` の直近の計測。ロックを持ったまま測るので、同時に来ても全走査は1回で済む。
     disk_cache: Arc<Mutex<Option<(Instant, Value)>>>,
+    /// `/api/ai/status` の直近の応答（[`AI_STATUS_CACHE_TTL`]）。ロックを持ったまま計算するので、同時に来ても
+    /// 全件検査は 1 回で済む。
+    ai_status_cache: Arc<Mutex<Option<(Instant, Value)>>>,
     /// `.cache.json` のメモリキャッシュ。取り込みが有効（`GEOFRAME_INGEST=1`）のときは同期サイクルと同じもの
     /// （保存は保存スレッドに任せる）。無効のときはメモリだけ（ディスクへは書かない。[`Cache::load_memory_only`]）。
     pub cache: Arc<Cache>,
@@ -100,19 +109,33 @@ impl AppState {
         let admin = Arc::new(AdminContext::new(&config, &data_root));
         let tiles = Arc::new(TileProxy::production(&config, &data_root));
         let blog = Arc::new(BlogEnv::new(config.blog_plans_dir.as_deref(), &data_root));
+        let geocoder = Arc::new(Geocoder::production(&config.tile_ua));
+        let ai_search = Arc::new(crate::ai::query::Runtime::new(
+            &config,
+            None,
+            StopFlag::new(),
+            None,
+        ));
         Self {
+            ai_search,
             config,
             catalog,
             data_root: Arc::new(data_root),
             static_slots: Arc::new(Semaphore::new(STATIC_FILE_SLOTS)),
             admin,
             disk_cache: Arc::new(Mutex::new(None)),
+            ai_status_cache: Arc::new(Mutex::new(None)),
             cache: Arc::new(Cache::memory_only()),
-            geocoder: Arc::new(Geocoder::production()),
+            geocoder,
             tiles,
             blog,
             mass_delete: None,
         }
+    }
+
+    pub fn with_ai_search(mut self, runtime: Arc<crate::ai::query::Runtime>) -> Self {
+        self.ai_search = runtime;
+        self
     }
 
     /// 大量削除の保留の記憶を付ける（取り込みが有効の `serve`。同期サイクルの段と同じもの）。
@@ -263,6 +286,23 @@ async fn disk_info(state: &AppState) -> std::io::Result<Value> {
     let data = tokio::task::spawn_blocking(move || admin::disk_info(&root, max_mb))
         .await
         .map_err(|_| std::io::Error::other("ディスク使用量の測定が異常終了しました"))??;
+    *cache = Some((Instant::now(), data.clone()));
+    Ok(data)
+}
+
+/// `GET /api/ai/status`。[`AI_STATUS_CACHE_TTL`] 以内の計算があればそれを返す（失敗は保存しない）。
+async fn ai_status(state: &AppState) -> Result<Value, crate::db::CatalogError> {
+    let mut cache = state.ai_status_cache.lock().await;
+    if let Some((at, data)) = cache.as_ref()
+        && at.elapsed() < AI_STATUS_CACHE_TTL
+    {
+        return Ok(data.clone());
+    }
+    let config = Arc::clone(&state.config);
+    let data = state
+        .catalog
+        .read(move |c| crate::ai::search_view::status(c, &config))
+        .await?;
     *cache = Some((Instant::now(), data.clone()));
     Ok(data)
 }
@@ -620,7 +660,7 @@ fn not_yet_implemented(label: &'static str) -> Response {
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
 ///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
-///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/blog/`（旅行ブログの読み取り。T3.5。完全一致の4つ以外は 404）は [`blog_response`]、`/api/ai/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
+///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/blog/`（旅行ブログの読み取り。T3.5。完全一致の4つ以外は 404）は [`blog_response`]、`/api/ai/status`・`/api/ai/search` は E5/E6、残る `/api/ai/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
 ///    ホワイトリストに当たらず 403 なので、下の静的配信の判定へ回す。
 /// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML。
 /// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
@@ -704,6 +744,28 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 ),
             };
         }
+        if path == "/api/ai/status" {
+            let response = match ai_status(&state).await {
+                Ok(value) => json_response(StatusCode::OK, value.to_string().into_bytes()),
+                Err(_) => ai_search_error(crate::ai::query::Error::Unavailable),
+            };
+            return labeled(response, "/api/ai/status");
+        }
+        if path == "/api/ai/search" {
+            let response = match state
+                .ai_search
+                .search(
+                    Arc::clone(&state.config),
+                    state.catalog.clone(),
+                    parts.uri.query(),
+                )
+                .await
+            {
+                Ok(value) => json_response(StatusCode::OK, value.to_string().into_bytes()),
+                Err(error) => ai_search_error(error),
+            };
+            return labeled(response, "/api/ai/search");
+        }
         if path.starts_with("/api/ai/") {
             return not_yet_implemented("/api/ai/{*path}");
         }
@@ -752,6 +814,26 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
     labeled(response, target.area.route())
 }
 
+fn ai_search_error(error: crate::ai::query::Error) -> Response {
+    use crate::ai::query::Error;
+    let (status, message) = match error {
+        Error::BadParams => (StatusCode::BAD_REQUEST, "bad_params"),
+        Error::Disabled => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI検索は無効化されています",
+        ),
+        Error::RateLimited => (
+            StatusCode::TOO_MANY_REQUESTS,
+            "検索リクエストが多すぎます。しばらくしてから再試行してください",
+        ),
+        Error::Unavailable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "AI検索サービスへ接続できません。しばらくして再試行してください",
+        ),
+    };
+    error_response(status, message)
+}
+
 pub fn router(state: AppState) -> Router {
     Router::new()
         // `any`: メソッドの絞り込みは `guard`（GET/HEAD/POST 以外は 501、POST は 403）が済ませている。
@@ -774,15 +856,13 @@ pub fn router(state: AppState) -> Router {
 }
 
 /// SIGINT / SIGTERM（systemd の停止）を待つ。
-async fn shutdown_signal() {
+async fn wait_for_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate()).expect("SIGTERM を登録できません");
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = term.recv() => {}
     }
-    // 実行中の旅行ブログの書き出しは、次の画像の前で作業領域を片付けて止まる（前の書き出しは残る）
-    crate::blog_write::request_stop();
 }
 
 /// 接続ごとの付随情報（`axum::extract::ConnectInfo`）。長い処理を持つ `POST` が、その間だけ無通信の期限を
@@ -802,7 +882,24 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, Limi
     }
 }
 
-pub async fn serve(state: AppState) -> std::io::Result<()> {
+/// サーバーを動かし、SIGINT / SIGTERM で止まる。
+pub async fn serve(state: AppState, stop: StopFlag) -> std::io::Result<()> {
+    serve_until(state, stop, wait_for_signal()).await
+}
+
+/// [`serve`] の停止の合図を差し替えられる形（試験用に分けてある。配布するバイナリの経路は [`serve`] だけ）。
+///
+/// `signal` が完了した**直後に**共有の `stop` を立てる。HTTP の graceful shutdown が終わってから合図する
+/// 順序だと、同期・AI・キャッシュ保存のスレッドが HTTP の終了待ちの間も新しい仕事を始めてしまうので、
+/// 停止の起点（共通期限の 60 秒）は SIGTERM の受信時刻にする。HTTP の終了待ちは共通期限の 3/4
+/// （[`StopFlag::http_limit`]）で打ち切り、終わらない接続はプロセスの終了で切る（残り 1/4 は AI・同期・
+/// キャッシュ保存・runtime の停止のため）。bind に失敗したときはすぐ `Err` を返す（呼び出し側が続けて
+/// スレッドを止める）。
+pub async fn serve_until(
+    state: AppState,
+    stop: StopFlag,
+    signal: impl std::future::Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
     tracing::info!("{} で待ち受けます", listener.local_addr()?);
     tracing::info!(
@@ -811,12 +908,34 @@ pub async fn serve(state: AppState) -> std::io::Result<()> {
     );
     // 接続の総数・送信の停滞・無通信の上限（limits.rs）
     let listener = LimitedListener::new(listener, ConnLimits::default());
-    axum::serve(
+    let signalled = Arc::new(tokio::sync::Notify::new());
+    let shutdown = {
+        let (stop, signalled) = (stop.clone(), Arc::clone(&signalled));
+        async move {
+            signal.await;
+            // 合図の直後に共有の停止を立てる（HTTP の終了待ちを待たない）
+            stop.stop();
+            // 実行中の旅行ブログの書き出しは、次の画像の前で作業領域を片付けて止まる（前の書き出しは残る）
+            crate::blog_write::request_stop();
+            signalled.notify_one();
+        }
+    };
+    let server = axum::serve(
         listener,
         router(state).into_make_service_with_connect_info::<ConnInfo>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(shutdown)
+    .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result?,
+        () = async {
+            signalled.notified().await;
+            tokio::time::sleep(stop.http_limit()).await;
+        } => {
+            tracing::warn!("HTTP の終了待ちが期限に達したので、残りの接続を切って停止します");
+        }
+    }
     tracing::info!("停止しました");
     Ok(())
 }

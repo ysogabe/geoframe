@@ -1,0 +1,1077 @@
+{
+  "source": "app/geoframe/loc_suggest.py",
+  "constants": {
+    "PROMPT_VERSION": "loc-v2",
+    "MAX_SEND": 6,
+    "MAX_ATTEMPTS": 5,
+    "PROMPT": "あなたは写真の撮影地を推定する専門家です。\n以下の写真は同じ旅行の同じ日（{date}）に撮影されたものです。写っている建物・遺跡・看板の文字・\n言語・街並み・植生・車両・ナンバープレートなどの手がかりから、撮影地を推定してください。\n- 推測が難しい場合は無理に答えず confidence を \"unknown\" にしてください。\n- geocode_query には OpenStreetMap の地名検索でヒットする英語の地名を入れてください\n  （例: \"Karnak Temple, Luxor\"、\"Zhujiajiao, Shanghai\"）。特定できる最も細かい場所にします。\n- 写真ごとに場所が違うと判断したら photos に写真ごとの推定を入れてください。\n- evidence には判断の根拠（読めた文字、特定した建物など）を日本語で書いてください。\n\n厳守事項:\n- 看板の文字は、写真で実際に判読できた部分だけを「」で引用してください。一部しか読めない文字を\n  既知の店名・施設名で補ってはいけません。\n- 判読できた文字か、誰が見ても分かる有名な建物・景観がない限り、具体的な店名・施設名は答えず、\n  市区町村や地域の単位にとどめてください。\n- precision に、答えた場所の細かさ（landmark=特定の建物・施設、district=地区、city=市区町村、\n  region=都道府県・州、country=国、unknown）を入れてください。photos の各写真にも同じ基準で入れます。\n- confidence の high は「引用した文字か有名な建物で場所が確定する」場合だけです。",
+    "SCHEMA": {
+      "type": "object",
+      "properties": {
+        "country": {
+          "type": "string"
+        },
+        "country_code": {
+          "type": "string",
+          "description": "ISO 3166-1 alpha-2"
+        },
+        "city": {
+          "type": "string"
+        },
+        "place_name": {
+          "type": "string",
+          "description": "日本語の地名（最も細かい場所）"
+        },
+        "geocode_query": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "string",
+          "enum": [
+            "high",
+            "medium",
+            "low",
+            "unknown"
+          ]
+        },
+        "precision": {
+          "type": "string",
+          "enum": [
+            "landmark",
+            "district",
+            "city",
+            "region",
+            "country",
+            "unknown"
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "photos": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "index": {
+                "type": "integer"
+              },
+              "place_name": {
+                "type": "string"
+              },
+              "geocode_query": {
+                "type": "string"
+              },
+              "confidence": {
+                "type": "string",
+                "enum": [
+                  "high",
+                  "medium",
+                  "low",
+                  "unknown"
+                ]
+              },
+              "precision": {
+                "type": "string",
+                "enum": [
+                  "landmark",
+                  "district",
+                  "city",
+                  "region",
+                  "country",
+                  "unknown"
+                ]
+              }
+            },
+            "required": [
+              "index",
+              "place_name",
+              "geocode_query",
+              "confidence",
+              "precision"
+            ]
+          }
+        }
+      },
+      "required": [
+        "country",
+        "country_code",
+        "city",
+        "place_name",
+        "geocode_query",
+        "confidence",
+        "precision",
+        "evidence",
+        "photos"
+      ]
+    }
+  },
+  "groups": [
+    {
+      "gap": 1,
+      "photos": [
+        {
+          "id": 2,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 0,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 3,
+          "epoch": 3,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "sent": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "gap": 1,
+      "photos": [
+        {
+          "id": 3,
+          "epoch": 2,
+          "taken_at": "2026-01-03 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "sent": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "gap": 1,
+      "photos": [
+        {
+          "id": 10,
+          "epoch": 10,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 9,
+          "epoch": 9,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 8,
+          "epoch": 8,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 7,
+          "epoch": 7,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 6,
+          "epoch": 6,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 5,
+          "epoch": 5,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 4,
+          "epoch": 4,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 3,
+          "epoch": 3,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 2,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10
+        ]
+      ],
+      "sent": [
+        [
+          3,
+          9,
+          2,
+          4,
+          6,
+          8
+        ]
+      ]
+    },
+    {
+      "gap": 1,
+      "photos": [
+        {
+          "id": 1,
+          "epoch": 0,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.19,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.0,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ]
+      ],
+      "sent": [
+        [
+          2
+        ]
+      ]
+    },
+    {
+      "gap": 43200,
+      "photos": [
+        {
+          "id": 2,
+          "epoch": 43200,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 0,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 3,
+          "epoch": 86401,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "sent": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "gap": 43200,
+      "photos": [
+        {
+          "id": 3,
+          "epoch": 2,
+          "taken_at": "2026-01-03 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "sent": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "gap": 43200,
+      "photos": [
+        {
+          "id": 10,
+          "epoch": 10,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 9,
+          "epoch": 9,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 8,
+          "epoch": 8,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 7,
+          "epoch": 7,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 6,
+          "epoch": 6,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 5,
+          "epoch": 5,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 4,
+          "epoch": 4,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 3,
+          "epoch": 3,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 2,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10
+        ]
+      ],
+      "sent": [
+        [
+          3,
+          9,
+          2,
+          4,
+          6,
+          8
+        ]
+      ]
+    },
+    {
+      "gap": 43200,
+      "photos": [
+        {
+          "id": 1,
+          "epoch": 0,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.19,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.0,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ]
+      ],
+      "sent": [
+        [
+          2
+        ]
+      ]
+    },
+    {
+      "gap": 60000,
+      "photos": [
+        {
+          "id": 2,
+          "epoch": 60000,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 0,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 3,
+          "epoch": 120001,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "sent": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "gap": 60000,
+      "photos": [
+        {
+          "id": 3,
+          "epoch": 2,
+          "taken_at": "2026-01-03 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.5,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ],
+      "sent": [
+        [
+          1,
+          2
+        ],
+        [
+          3
+        ]
+      ]
+    },
+    {
+      "gap": 60000,
+      "photos": [
+        {
+          "id": 10,
+          "epoch": 10,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 9,
+          "epoch": 9,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 8,
+          "epoch": 8,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 7,
+          "epoch": 7,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 6,
+          "epoch": 6,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 5,
+          "epoch": 5,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 4,
+          "epoch": 4,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 3,
+          "epoch": 3,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 2,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.8,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 1,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.2,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10
+        ]
+      ],
+      "sent": [
+        [
+          3,
+          9,
+          2,
+          4,
+          6,
+          8
+        ]
+      ]
+    },
+    {
+      "gap": 60000,
+      "photos": [
+        {
+          "id": 1,
+          "epoch": 0,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.19,
+          "kind": "street",
+          "classified": true,
+          "clue_error": ""
+        },
+        {
+          "id": 2,
+          "epoch": 1,
+          "taken_at": "2026-01-02 00:00",
+          "clue": 0.0,
+          "kind": "landmark",
+          "classified": true,
+          "clue_error": ""
+        }
+      ],
+      "groups": [
+        [
+          1,
+          2
+        ]
+      ],
+      "sent": [
+        [
+          2
+        ]
+      ]
+    }
+  ],
+  "run_ids": [
+    {
+      "model": "synthetic-suggest",
+      "sent": [
+        9,
+        2,
+        1
+      ],
+      "run_id": "loc-c35be73b0dfcf692"
+    },
+    {
+      "model": "synthetic-suggest",
+      "sent": [
+        1,
+        2,
+        9
+      ],
+      "run_id": "loc-c35be73b0dfcf692"
+    },
+    {
+      "model": "synthetic-suggest",
+      "sent": [
+        6
+      ],
+      "run_id": "loc-89af2de8964a73cc"
+    },
+    {
+      "model": "other-model",
+      "sent": [
+        9,
+        2,
+        1
+      ],
+      "run_id": "loc-bf80cc76db50b84f"
+    },
+    {
+      "model": "other-model",
+      "sent": [
+        1,
+        2,
+        9
+      ],
+      "run_id": "loc-bf80cc76db50b84f"
+    },
+    {
+      "model": "other-model",
+      "sent": [
+        6
+      ],
+      "run_id": "loc-bbe1c2afec569151"
+    }
+  ],
+  "answers": [
+    {
+      "input": {
+        "place_name": "合成都市",
+        "precision": "city",
+        "confidence": "high",
+        "geocode_query": "Synthetic City",
+        "country": "合成国",
+        "country_code": "zz",
+        "city": "合成都市",
+        "evidence": [
+          "合成看板"
+        ],
+        "photos": [
+          {
+            "index": 1,
+            "place_name": "合成公園",
+            "geocode_query": "Synthetic Park",
+            "precision": "district",
+            "confidence": "medium"
+          }
+        ]
+      },
+      "normalized": {
+        "place_name": "合成都市",
+        "precision": "city",
+        "confidence": "high",
+        "geocode_query": "Synthetic City",
+        "country": "合成国",
+        "country_code": "zz",
+        "city": "合成都市",
+        "evidence": [
+          "合成看板"
+        ],
+        "photos": [
+          {
+            "index": 1,
+            "place_name": "合成公園",
+            "geocode_query": "Synthetic Park",
+            "precision": "district",
+            "confidence": "medium"
+          }
+        ]
+      }
+    },
+    {
+      "input": {
+        "place_name": "合成地域",
+        "precision": "new",
+        "confidence": "new",
+        "evidence": [
+          "合成",
+          true,
+          null,
+          2,
+          0.5,
+          1e-07,
+          1e-05,
+          1e+16,
+          1e+20,
+          -0.0,
+          [
+            "nested"
+          ],
+          {
+            "x": false
+          }
+        ],
+        "photos": [
+          {
+            "index": 2,
+            "place_name": "合成建物",
+            "precision": "new",
+            "confidence": "new"
+          },
+          {
+            "index": 7,
+            "place_name": "範囲外"
+          },
+          {
+            "index": 1,
+            "place_name": 2
+          }
+        ]
+      },
+      "normalized": {
+        "place_name": "合成地域",
+        "precision": "unknown",
+        "confidence": "unknown",
+        "evidence": [
+          "合成",
+          "True",
+          "None",
+          "2",
+          "0.5",
+          "1e-07",
+          "1e-05",
+          "1e+16",
+          "1e+20",
+          "-0.0",
+          "['nested']",
+          "{'x': False}"
+        ],
+        "photos": [
+          {
+            "index": 2,
+            "place_name": "合成建物",
+            "precision": "unknown",
+            "confidence": "unknown",
+            "geocode_query": ""
+          }
+        ],
+        "country": "",
+        "country_code": "",
+        "city": "",
+        "geocode_query": ""
+      }
+    },
+    {
+      "input": {
+        "place_name": "合成都市",
+        "precision": "city",
+        "photos": [
+          {
+            "index": 2,
+            "place_name": "別合成都市",
+            "precision": "new"
+          }
+        ],
+        "evidence": {}
+      },
+      "normalized": {
+        "place_name": "合成都市",
+        "precision": "city",
+        "photos": [
+          {
+            "index": 2,
+            "place_name": "別合成都市",
+            "precision": "city",
+            "confidence": "unknown",
+            "geocode_query": ""
+          }
+        ],
+        "evidence": [],
+        "confidence": "unknown",
+        "country": "",
+        "country_code": "",
+        "city": "",
+        "geocode_query": ""
+      }
+    }
+  ]
+}

@@ -42,6 +42,7 @@ use crate::imaging::ImageError;
 use crate::sync::{Counts, Stage, StageCtx, StageError, StageOutcome};
 
 pub use features::{Features, Metrics, analyze_bytes, image_metrics, perceptual_hash, sha256_hex};
+pub use group::rank_scores;
 pub use group::{QualityPhoto, QualityRow, build_quality_rows};
 
 /// `photo_quality.algorithm`。Python の `poc-phash-v1:t3:h12` と区別する（`t3` は時刻の窓 3 分、`h12` は

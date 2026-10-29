@@ -1,4 +1,4 @@
-//! OS に直接聞く小さな関数: ディスクの使用量（`statvfs`）と現地時刻（`localtime_r`）。管理画面の
+//! OS に直接聞く小さな関数: ディスクの使用量（`statvfs`）・現地時刻（`localtime_r`）・実効ユーザー ID（`geteuid`）。管理画面の
 //! `/api/admin/status` の `disk` と `server_time` が、Python の `shutil.disk_usage`・`time.strftime` と
 //! 同じ値になるように使う。**このクレートで `unsafe` を使うのはここだけ**（`lib.rs` が `deny` している）。
 //!
@@ -44,6 +44,12 @@ pub fn disk_usage(path: &Path) -> io::Result<DiskUsage> {
         used: frsize.saturating_mul(blocks.saturating_sub(u64::from(st.f_bfree))),
         free: frsize.saturating_mul(u64::from(st.f_bavail)),
     })
+}
+
+/// このプロセスの実効ユーザー ID（鍵ファイルの所有者の検査用）。
+pub fn effective_uid() -> u32 {
+    // SAFETY: `geteuid` は引数を取らず、失敗しない。
+    unsafe { libc::geteuid() }
 }
 
 /// 今の現地時刻を `YYYY-MM-DD HH:MM:SS` で（`time.strftime("%Y-%m-%d %H:%M:%S")` と同じ形）。

@@ -6,15 +6,23 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::ai::jobs::{self, JobKind};
+use crate::ai::ops::{self, PauseTarget, RetryTarget};
+use crate::ai::settings::TaskKind;
+use crate::ai::worker::{self, Clock, WorkerDeps};
 use crate::cache::Cache;
 use crate::config::{Config, Overrides};
 use crate::db::Catalog;
+use crate::ingest::{Ingest, LockHold};
 use crate::server::AppState;
-use crate::stop::StopFlag;
+use crate::stop::{StopFlag, join_within};
 use crate::sync::{CycleReport, Mode, StageCtx, StageResult};
 
-/// 停止のときに、取り込みのスレッドを待つ上限。
+/// 停止のときに、取り込みの各スレッド（同期・AI・キャッシュ保存・タイル掃除）を待つ 1 つあたりの上限。
+/// 実際に待つのは、これと SIGTERM からの共通期限（[`StopFlag::phase_limit`]）の残りの短いほう。
 const THREAD_STOP_LIMIT: Duration = Duration::from_secs(10);
+/// 停止の最後の runtime の停止を待つ上限（共通期限の残りでも制限する）。
+const RUNTIME_STOP_LIMIT: Duration = Duration::from_secs(5);
 
 /// 取り込みの 2 つのスレッド。
 struct IngestThreads {
@@ -29,35 +37,33 @@ struct IngestThreads {
 /// 保存はここで、両方の終了を待ってから 1 回だけする。限られた時間内に worker が止まらなかったときも
 /// 保存はする（そのあとの `put` は失われうるが、警告を出す）。
 ///
-/// saver が I/O の最中に期限を超えて残った場合は、保存用の排他（`Cache::save_final`）で重ねて書かない。
-/// 排他は `limit` まで待ち、それでも取れなければ最後の保存は省略する（警告を出す）。省略した分は、
-/// 残った saver の保存が終わったあとの内容に含まれないが、書きかけの一時ファイルと競合して JSON を
+/// 最後の保存（`Cache::save_final`）は `LockHold` を持つ別スレッドで行い、ここは `limit` までしか待たない。
+/// saver が I/O の最中に期限を超えて残った場合も、保存の排他で重ねて書かない。排他の待ちだけでなく、取れたあとの
+/// 書き込み・`fsync` が固まっても、期限が来たら最後の保存は省略して戻る（警告を出す）。省略した分は、
+/// 残ったスレッドの保存が終わったあとの内容に含まれないが、書きかけの一時ファイルと競合して JSON を
 /// 壊すよりは、キャッシュ（位置の逆引き結果で、作り直せる）の直近の更新を失うほうを選ぶ。
 /// 期限を超えて残ったスレッドは `.ingest.lock` を持ち続ける（`LockHold`）ので、そのあいだ別の
 /// 取り込みは始まらない。
-/// 呼ぶ前に `stop` の合図を出しておくこと。
-fn stop_ingest_threads(threads: IngestThreads, cache: &Cache, limit: Duration) {
+/// 呼ぶ前に `stop` の合図を出しておくこと。各待ちは `limit` と、`stop` の共通期限の残りのうち短いほうまで
+/// （SIGTERM から 60 秒を越えない）。
+fn stop_ingest_threads(
+    threads: IngestThreads,
+    cache: &Arc<Cache>,
+    lock: LockHold,
+    limit: Duration,
+    stop: &StopFlag,
+) {
     for (name, handle) in [
         ("同期サイクル", threads.worker),
         ("キャッシュ保存", threads.saver),
     ] {
-        if !join_within(handle, limit) {
+        if !join_within(handle, stop.phase_limit(limit)) {
             tracing::warn!("{name}のスレッドが時間内に止まりませんでした（そのまま終了します）");
         }
     }
-    // 省略したときの警告は save_final の中で出す
-    cache.save_final(limit);
-}
-
-fn join_within(handle: std::thread::JoinHandle<()>, limit: Duration) -> bool {
-    let started = std::time::Instant::now();
-    while !handle.is_finished() {
-        if started.elapsed() > limit {
-            return false;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    handle.join().is_ok()
+    // 実際の保存は `lock` を持つ別スレッドで行い、ここは共通期限の残りまでしか待たない。省略したときの警告は
+    // save_final の中で出す
+    cache.save_final(lock, stop.phase_limit(limit));
 }
 
 const USAGE: &str = "\
@@ -103,6 +109,24 @@ const USAGE: &str = "\
                                         GEOFRAME_QUALITY_PER_CYCLE 件ずつ全部解析して、グループ（完全重複・類似）と推奨を
                                         作り直す。--dry-run は解析せず、件数（消す孤児・解析する枚数・再構築するか）だけ。
                                         書く実行は GEOFRAME_INGEST=1 が要り、sync と同じ印・Python の確認を通す
+  geoframe ai-jobs status [--data-dir <dir>]
+                                        AI ジョブ・用途の状態を件数と固定の理由コードだけで出す（読み取り専用。AI の表が無い
+                                        旧 DB でも 0 件。対象・入力・モデル・接続先・パスは出さない）
+  geoframe ai-jobs retry (--kind <種類> | --all) [--data-dir <dir>]
+                                        失敗（failed）のジョブだけを、現在の入力・設定・既存の結果に照らして再検査し、
+                                        再実行待ち／無効／成功済みに振り分ける（外部へは送らない）。検査できない種類
+                                        （用途別の処理が未登録・設定で使えない用途）は戻さず件数だけ報告する。
+                                        種類: image_embedding / location_clue / location_suggest / location_geocode / photo_judge
+  geoframe ai-jobs release-pause (--task <用途> | --all) [--data-dir <dir>]
+                                        Provider・用途の停止（認証・契約の不一致で自動的に止まったもの）を明示的に解除する。
+                                        用途: image_embedding / query_embedding / photo_judge / location_clue / location_suggest。
+                                        --task は今の設定でその用途に当たる停止だけ、--all は全部
+  geoframe ai-jobs deactivate-space [--data-dir <dir>]
+                                        有効な検索空間（settings.ai_active_space）を外し、旧結果参照へ戻す。旧結果・
+                                        新しい空間・ベクトル・ジョブは消さない
+                                        retry・release-pause・deactivate-space は書くので、サービスを止めてから実行する
+                                        （稼働中は .ingest.lock により断る）。GEOFRAME_INGEST=1 と、sync と同じ印・Python の
+                                        確認が要る
 終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または取り込みを断った（本番への誤指定の防止）";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -126,6 +150,88 @@ pub enum Command {
         dry_run: bool,
         data_dir: Option<PathBuf>,
     },
+    AiJobs(AiJobsCommand),
+}
+
+/// `geoframe ai-jobs …`。
+#[derive(Debug, PartialEq, Eq)]
+pub enum AiJobsCommand {
+    Status {
+        data_dir: Option<PathBuf>,
+    },
+    Retry {
+        target: RetryTarget,
+        data_dir: Option<PathBuf>,
+    },
+    ReleasePause {
+        target: PauseTarget,
+        data_dir: Option<PathBuf>,
+    },
+    DeactivateSpace {
+        data_dir: Option<PathBuf>,
+    },
+}
+
+fn parse_ai_jobs<I: Iterator<Item = String>>(mut args: I) -> Result<AiJobsCommand, String> {
+    let sub = args.next().ok_or(
+        "ai-jobs にはサブコマンドが要ります（status・retry・release-pause・deactivate-space）",
+    )?;
+    let (mut data_dir, mut all, mut kind, mut task) = (None, false, None, None);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--data-dir" => {
+                data_dir = Some(PathBuf::from(
+                    args.next().ok_or("--data-dir に値が要ります")?,
+                ));
+            }
+            "--all" if sub == "retry" || sub == "release-pause" => all = true,
+            "--kind" if sub == "retry" => {
+                let value = args.next().ok_or("--kind に値が要ります")?;
+                kind =
+                    Some(JobKind::parse(&value).ok_or(
+                        "--kind の値が不正です（image_embedding など。--help の一覧を参照）",
+                    )?);
+            }
+            "--task" if sub == "release-pause" => {
+                let value = args.next().ok_or("--task に値が要ります")?;
+                task =
+                    Some(TaskKind::parse(&value).ok_or(
+                        "--task の値が不正です（image_embedding など。--help の一覧を参照）",
+                    )?);
+            }
+            other => return Err(format!("ai-jobs {sub} の引数 {other:?} は不明です")),
+        }
+    }
+    match sub.as_str() {
+        "status" => Ok(AiJobsCommand::Status { data_dir }),
+        "retry" => match (all, kind) {
+            (true, None) => Ok(AiJobsCommand::Retry {
+                target: RetryTarget::All,
+                data_dir,
+            }),
+            (false, Some(kind)) => Ok(AiJobsCommand::Retry {
+                target: RetryTarget::Kind(kind),
+                data_dir,
+            }),
+            _ => Err("ai-jobs retry には --kind <種類> か --all のどちらか 1 つが要ります".into()),
+        },
+        "release-pause" => match (all, task) {
+            (true, None) => Ok(AiJobsCommand::ReleasePause {
+                target: PauseTarget::All,
+                data_dir,
+            }),
+            (false, Some(task)) => Ok(AiJobsCommand::ReleasePause {
+                target: PauseTarget::Task(task),
+                data_dir,
+            }),
+            _ => Err(
+                "ai-jobs release-pause には --task <用途> か --all のどちらか 1 つが要ります"
+                    .into(),
+            ),
+        },
+        "deactivate-space" => Ok(AiJobsCommand::DeactivateSpace { data_dir }),
+        other => Err(format!("ai-jobs のサブコマンド {other:?} は不明です")),
+    }
 }
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String> {
@@ -144,6 +250,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Command, String>
             Some(_) => Err("selfcheck-net に引数はありません".into()),
         },
         Some("img-probe") => crate::imaging::probe::parse(args).map(Command::ImgProbe),
+        Some("ai-jobs") => parse_ai_jobs(args).map(Command::AiJobs),
         Some("serve") => {
             let mut overrides = Overrides::default();
             while let Some(arg) = args.next() {
@@ -235,6 +342,7 @@ pub fn run<I: IntoIterator<Item = String>>(args: I) -> ExitCode {
         } => sync(dry_run, allow_mass_delete, data_dir),
         Command::Organize { dry_run, data_dir } => organize(dry_run, data_dir),
         Command::QualityScan { dry_run, data_dir } => quality_scan(dry_run, data_dir),
+        Command::AiJobs(command) => ai_jobs(command),
     }
 }
 
@@ -256,6 +364,12 @@ fn serve(overrides: &Overrides) -> ExitCode {
     if config.embed_backend_invalid {
         tracing::warn!(
             "GEOFRAME_EMBED_BACKEND が gemini・local のどちらでもないので gemini を使います"
+        );
+    }
+    // AI の設定が不正でも写真の配信・管理は続ける（新しい AI 呼び出しだけが無効）。パス・値は出さず、種類のコードだけ
+    if let Some(code) = config.ai.invalid() {
+        tracing::warn!(
+            "AI の設定が不正です（種類: {code}）。新しい AI 呼び出しだけ無効にして続けます"
         );
     }
 
@@ -304,6 +418,38 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let config = Arc::new(config);
     // 同期サイクルとキャッシュ保存のスレッド。HTTP サーバーの起動を待たない
     let stop = StopFlag::new();
+    // AI（取り込みが有効のときだけ）: 前の起動の running の回収と、AI が有効なときの背景ワーカー
+    let ai_clock: Clock = Arc::new(jobs::unix_now);
+    // 地名検索の `.cache.json`。取り込みが有効なら同期サイクルと同じキャッシュ（保存は保存スレッドが行う）。
+    // 無効なら、読んでメモリに入れるだけでディスクへは書かない（本番の書き手は P5 の切替まで Python）
+    let cache = match &ingest {
+        Some(ingest) => Arc::clone(&ingest.cache),
+        None => Arc::new(Cache::load_memory_only(&config.data_dir)),
+    };
+    let mut state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
+    let cloud = crate::ai::cloud::CloudClients::new(&config.ai).ok();
+    let lan = crate::ai::provider::LanClient::new(&config.ai);
+    let ai_worker = ingest.as_ref().and_then(|ingest| {
+        start_ai(
+            &config,
+            ingest,
+            &stop,
+            &ai_clock,
+            worker::production_handlers(
+                &config,
+                lan.clone(),
+                cloud.as_ref(),
+                Arc::clone(&state.geocoder),
+                Arc::clone(&state.cache),
+            ),
+        )
+    });
+    state = state.with_ai_search(Arc::new(crate::ai::query::Runtime::new(
+        &config,
+        lan,
+        stop.clone(),
+        ingest.as_ref().map(Ingest::lock_hold),
+    )));
     // Drive の状態。大量削除の保留の記憶は、管理画面（サーバーの状態）と `index_drive` で同じものを使う
     let drive = Arc::new(crate::drive::DriveShared::new());
     let mass_delete = drive.mass_delete_board();
@@ -323,13 +469,6 @@ fn serve(overrides: &Overrides) -> ExitCode {
             ingest.lock_hold(),
         ),
     });
-    // 地名検索の `.cache.json`。取り込みが有効なら同期サイクルと同じキャッシュ（保存は保存スレッドが行う）。
-    // 無効なら、読んでメモリに入れるだけでディスクへは書かない（本番の書き手は P5 の切替まで Python）
-    let cache = match &ingest {
-        Some(ingest) => Arc::clone(&ingest.cache),
-        None => Arc::new(Cache::load_memory_only(&config.data_dir)),
-    };
-    let mut state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
     if ingest.is_some() {
         state = state.with_mass_delete_board(mass_delete);
     }
@@ -347,22 +486,35 @@ fn serve(overrides: &Overrides) -> ExitCode {
         stop.clone(),
         crate::tiles::PRUNE_INTERVAL,
     );
-    let result = runtime.block_on(crate::server::serve(state));
+    // SIGTERM の直後に共有の停止の合図が立つ（HTTP の終了待ちより前。起点は SIGTERM の受信時刻）。以降の各
+    // 処理は SIGTERM から 60 秒の共通期限の残りまでしか待たない。bind に失敗してここへ来たときも、続けて
+    // スレッドを止める（`stop` は冪等）
+    let result = runtime.block_on(crate::server::serve(state, stop.clone()));
     // 取り込みのスレッドを止める（サイクルの最中なら今の段が終わるまで。待つのは限られた時間だけ）
     stop.stop();
-    if !join_within(pruner, THREAD_STOP_LIMIT) {
+    if !join_within(pruner, stop.phase_limit(THREAD_STOP_LIMIT)) {
         tracing::warn!(
             "タイルキャッシュの掃除のスレッドが時間内に止まりませんでした（そのまま終了します）"
         );
     }
+    if let (Some(ai), Some(ingest)) = (ai_worker, &ingest) {
+        // join の間は token が有効（有効な応答は確定される）。終わらなければ戻して token を失効させる
+        ai.shutdown(&ingest.writer, &stop, THREAD_STOP_LIMIT, &ai_clock);
+    }
     if let (Some(threads), Some(ingest)) = (threads, &ingest) {
-        stop_ingest_threads(threads, &ingest.cache, THREAD_STOP_LIMIT);
+        stop_ingest_threads(
+            threads,
+            &ingest.cache,
+            ingest.lock_hold(),
+            THREAD_STOP_LIMIT,
+            &stop,
+        );
     }
     // 期限内に止まらなかったスレッドが残っていても、`.ingest.lock` はそのスレッドが終わる（プロセスが
     // 終わる）まで外れない（スレッドが `LockHold` を持つ）。ここで Ingest を捨てても二重には書かれない
     drop(ingest);
     // 固まった spawn_blocking（DB の読み取り）を待ち続けて、停止が終わらないことがないように
-    runtime.shutdown_timeout(Duration::from_secs(5));
+    runtime.shutdown_timeout(stop.phase_limit(RUNTIME_STOP_LIMIT));
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -370,6 +522,37 @@ fn serve(overrides: &Overrides) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// AI の起動の準備と、背景ワーカーの起動。取り込みが有効（ロックを取ったあと）の `serve` だけが呼ぶ。
+/// 回収と Provider 停止の整理は、ワーカーが無効でも行う（AI を無効に戻したあとに `running` が残り続けない
+/// ように）。ワーカーは `GEOFRAME_AI_ENABLED=1` で AI の設定が不正でないときだけ（Provider のジョブは有効な背景用途があるときだけ処理する）。
+fn start_ai(
+    config: &Arc<Config>,
+    ingest: &Ingest,
+    stop: &StopFlag,
+    clock: &Clock,
+    handlers: Vec<Arc<dyn worker::Handler>>,
+) -> Option<worker::AiWorker> {
+    let started = worker::startup(config, &ingest.writer, clock)?;
+    if !worker::should_start(config) {
+        tracing::info!("[ai] 背景ワーカーは起動しません（AI が無効、または AI の設定が不正です）");
+        return None;
+    }
+    tracing::info!(
+        "[ai] 背景ワーカーを起動します（Provider 用途 {} 件と、同一場面の局所計算）",
+        worker::background_tasks(&config.ai, true).len()
+    );
+    Some(worker::spawn(WorkerDeps {
+        config: Arc::clone(config),
+        writer: ingest.writer.clone(),
+        stop: stop.clone(),
+        lock: ingest.lock_hold(),
+        handlers,
+        clock: Arc::clone(clock),
+        poll: config.ai.legacy().poll(),
+        run_id: started.run_id,
+    }))
 }
 
 /// `geoframe sync [--dry-run]`: 同期サイクルを 1 回だけ動かす（棚卸し §5 の手動トリガー）。
@@ -430,6 +613,12 @@ fn sync_dry_run(config: &Config, allow_mass_delete: bool) -> ExitCode {
                 },
                 s.embeddings_to_copy
             );
+            if !plan.scene_mismatch.is_empty() {
+                println!(
+                    "AI の場面の表: 列が想定と違う表 {} 個（足す予定には数えません。直さず、場面は使われません。派生の表を落として再作成するまで）",
+                    plan.scene_mismatch.len()
+                );
+            }
             println!(
                 "掃除: 消す .dl_* {} 件 / 消す書きかけの .part {} 件 / 捨てる .cache.json の旧キー {} 件",
                 plan.leftover_files, plan.part_files, plan.legacy_cache_keys
@@ -677,6 +866,292 @@ fn one_off(
     body(&ctx)
 }
 
+/// `geoframe ai-jobs …`。`status` は読み取りだけ（ガード・ロック不要。AI の表が無い旧 DB でも 0 件）。
+/// `retry`・`release-pause` は書くので、`organize` などと同じく `GEOFRAME_INGEST=1`・検証環境のガード・
+/// `.ingest.lock`・writer を通す（稼働中の `serve` はロックを持っているので断る）。出力は件数・用途・固定の
+/// 理由コードだけで、対象のキー・入力・token・起動 ID・モデル・URL・パス・写真の値は出さない。
+fn ai_jobs(command: AiJobsCommand) -> ExitCode {
+    let data_dir = match &command {
+        AiJobsCommand::Status { data_dir }
+        | AiJobsCommand::Retry { data_dir, .. }
+        | AiJobsCommand::ReleasePause { data_dir, .. }
+        | AiJobsCommand::DeactivateSpace { data_dir } => data_dir.clone(),
+    };
+    let overrides = Overrides {
+        listen: None,
+        data_dir,
+    };
+    let config = match Config::load(|key| std::env::var(key).ok(), &overrides) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("geoframe: 設定が不正です: {e}");
+            return ExitCode::from(2);
+        }
+    };
+    crate::logging::init(config.log_level);
+    crate::logging::install_panic_hook();
+    if let AiJobsCommand::Status { .. } = command {
+        return ai_jobs_status(&config);
+    }
+    if !config.ingest {
+        eprintln!(
+            "geoframe: ai-jobs の retry・release-pause・deactivate-space は GEOFRAME_INGEST=1 のときだけ動きます（読み取りだけなら ai-jobs status）"
+        );
+        return ExitCode::from(2);
+    }
+    let ingest = match crate::ingest::start(&config) {
+        Ok(ingest) => ingest,
+        Err(e) => {
+            eprintln!("geoframe: {e}");
+            if matches!(e, crate::ingest::IngestError::Locked) {
+                eprintln!("geoframe: サービスを止めてから実行してください（稼働中は書きません）");
+            }
+            return exit_for_ingest_error(&e);
+        }
+    };
+    let clock: Clock = Arc::new(jobs::unix_now);
+    match command {
+        AiJobsCommand::Retry { target, .. } => ai_jobs_retry(&config, &ingest, target, &clock),
+        AiJobsCommand::ReleasePause { target, .. } => {
+            ai_jobs_release_pause(&config, &ingest, target)
+        }
+        AiJobsCommand::DeactivateSpace { .. } => ai_jobs_deactivate_space(&ingest),
+        AiJobsCommand::Status { .. } => ExitCode::SUCCESS,
+    }
+}
+
+fn ai_jobs_status(config: &Config) -> ExitCode {
+    let read = match crate::db::open_read_only(&config.db_path()) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("geoframe: DB を読み取り用に開けません: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match ops::report(&read, &config.ai) {
+        Ok(report) => {
+            print!("{}", format_ai_report(&report));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("geoframe: AI ジョブの状態を読めません: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `ai-jobs status` の出力（件数・用途・固定コードだけ）。
+fn format_ai_report(report: &ops::Report) -> String {
+    use std::fmt::Write;
+    let mut out = String::new();
+    let config = match report.config {
+        ops::ConfigState::Unset => "未指定（新しい外部 AI 呼び出しは無効）".to_string(),
+        ops::ConfigState::Invalid(code) => {
+            format!("不正（種類: {code}。新しい AI 呼び出しだけ無効）")
+        }
+        ops::ConfigState::Ready => "有効".to_string(),
+    };
+    let _ = writeln!(out, "AI 設定: {config}");
+    for (task, state) in &report.tasks {
+        match state {
+            Ok(()) => {
+                let _ = writeln!(out, "用途 {}: 使える", task.as_str());
+            }
+            Err(reason) => {
+                let _ = writeln!(
+                    out,
+                    "用途 {}: 使えない（{}）",
+                    task.as_str(),
+                    reason.as_str()
+                );
+            }
+        }
+    }
+    if report.jobs.is_empty() {
+        let _ = writeln!(out, "ジョブ: 0 件");
+    }
+    for (kind, state, count) in &report.jobs {
+        let _ = writeln!(
+            out,
+            "ジョブ {} {}: {count} 件",
+            kind.as_str(),
+            state.as_str()
+        );
+    }
+    for (state, code, count) in &report.reasons {
+        let _ = writeln!(out, "理由 {} {code}: {count} 件", state.as_str());
+    }
+    for (code, count) in &report.location_holds {
+        let _ = writeln!(out, "日候補 保留 {code}: {count} 件");
+    }
+    for w in &report.waits.waits {
+        let scope = match w.scope {
+            crate::ai::waits::WaitScope::Entrance => "入口全体",
+            crate::ai::waits::WaitScope::Service => "サービス単体",
+        };
+        let _ = writeln!(
+            out,
+            "待機中 {} {scope}: {}（期限 {} UTC）",
+            w.task.as_str(),
+            w.reason.as_str(),
+            crate::ai::waits::utc_iso(w.until)
+        );
+    }
+    if report.waits.unidentified > 0 {
+        let _ = writeln!(
+            out,
+            "待機中 用途を特定できない（設定が使えない）: {} 件",
+            report.waits.unidentified
+        );
+    }
+    if report.waits.is_empty() {
+        let _ = writeln!(out, "共有の一時待機: なし");
+    }
+    if report.pauses.is_empty() {
+        let _ = writeln!(out, "停止中の Provider・用途: なし");
+    }
+    out.push_str(&format_index_status(&report.index));
+    out.push_str(&format_building_status(report.building.as_ref()));
+    for p in &report.pauses {
+        let _ = writeln!(
+            out,
+            "停止中 {} {}: {}",
+            p.scope.as_str(),
+            p.task.as_str(),
+            p.reason.as_str()
+        );
+    }
+    out
+}
+
+/// `ai-jobs status` の検索索引の部分（件数と固定のコードだけ。空間の ID・モデル・SHA は出さない）。
+fn format_index_status(status: &crate::ai::index::IndexStatus) -> String {
+    use crate::ai::index::ActiveState;
+    use std::fmt::Write;
+    let mut out = String::new();
+    let active = match status.active {
+        ActiveState::NoTables => "なし（空間の表が無い。旧結果参照）",
+        ActiveState::Unset => "なし（旧結果参照）",
+        ActiveState::Active(_) => "あり",
+        ActiveState::Unusable => "なし（指す空間が未登録・不正。旧結果参照）",
+    };
+    let p = &status.progress;
+    let _ = writeln!(out, "検索空間: {active}（登録 {} 件）", status.spaces);
+    if matches!(status.active, ActiveState::Active(_)) {
+        let _ = writeln!(
+            out,
+            "検索索引: 対象 {} / 保存済み {} / 待ち {} / 失敗で除外 {} / 壊れ {}",
+            p.eligible, p.indexed, p.pending, p.failed_excluded, status.corrupt
+        );
+        for (code, count) in &p.failed_reasons {
+            let _ = writeln!(out, "検索索引 除外の理由 {code}: {count} 件");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "他の空間・旧結果のベクトル: {} 種類（うち旧結果 {}。新しい空間には使わない）",
+        status.other_shas, status.legacy_shas
+    );
+    out
+}
+
+/// `ai-jobs status` の公開前の空間の部分（件数と固定のコードだけ）。設定（`GEOFRAME_AI_CONFIG`）が無い・空間が未登録・
+/// 既に有効なときは何も出さない。保存済みはベクトルの有無だけを数える（検査は公開時）。
+fn format_building_status(building: Option<&crate::ai::index::Building>) -> String {
+    use crate::ai::index::PublishState;
+    use std::fmt::Write;
+    let Some(b) = building else {
+        return String::new();
+    };
+    let p = &b.progress;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "公開前の空間: 対象 {} / 保存済み {} / 待ち {} / 失敗で除外 {}（成功率 {:.1}%）",
+        p.eligible,
+        p.indexed,
+        p.pending,
+        p.failed_excluded,
+        b.coverage * 100.0
+    );
+    for (code, count) in &p.failed_reasons {
+        let _ = writeln!(out, "公開前の空間 除外の理由 {code}: {count} 件");
+    }
+    let verdict = match b.publish {
+        PublishState::Waiting => "待ち 0 になるまで公開しない",
+        PublishState::NoVectors => "保存済みが 0 件のため公開しない",
+        PublishState::BelowThreshold => "成功率が閾値に届かず公開しない（管理確認が要る）",
+        PublishState::Ready => "公開できる状態（次の切替の試みで公開）",
+    };
+    let _ = writeln!(
+        out,
+        "公開の条件: 待ち 0 かつ 成功率 {:.0}% 以上 → {verdict}",
+        b.min_coverage * 100.0
+    );
+    out
+}
+
+fn ai_jobs_retry(config: &Config, ingest: &Ingest, target: RetryTarget, clock: &Clock) -> ExitCode {
+    // Construction only: retry never obtains a token or contacts any service.
+    let cloud = crate::ai::cloud::CloudClients::new(&config.ai).ok();
+    let handlers = worker::production_handlers(
+        config,
+        crate::ai::provider::LanClient::new(&config.ai),
+        cloud.as_ref(),
+        Arc::new(crate::geocode::Geocoder::production(&config.tile_ua)),
+        Arc::clone(&ingest.cache),
+    );
+    match ops::retry(&ingest.writer, &config.ai, &handlers, target, clock) {
+        Ok(r) => {
+            println!(
+                "再実行待ちに戻した {} / 無効にした {} / 成功済みとした {} / 検査できず保持（処理が未登録）{} / 検査できず保持（設定で使えない）{}",
+                r.requeued, r.obsolete, r.satisfied, r.unsupported, r.policy_disabled
+            );
+            ExitCode::SUCCESS
+        }
+        Err(_) => {
+            eprintln!("geoframe: 再試行に失敗しました");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn ai_jobs_deactivate_space(ingest: &Ingest) -> ExitCode {
+    match ingest.writer.call(crate::ai::activation::deactivate) {
+        Ok(true) => {
+            println!("有効な検索空間を外した（旧結果参照へ戻した）");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            println!("有効な検索空間は設定されていない（何も変えていない）");
+            ExitCode::SUCCESS
+        }
+        Err(_) => {
+            eprintln!("geoframe: 検索空間の解除に失敗しました");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn ai_jobs_release_pause(config: &Config, ingest: &Ingest, target: PauseTarget) -> ExitCode {
+    match ops::release_pause(&ingest.writer, &config.ai, target) {
+        Ok(n) => {
+            println!("停止を解除した: {n} 件");
+            ExitCode::SUCCESS
+        }
+        Err(ops::ReleaseError::ConfigUnavailable) => {
+            eprintln!(
+                "geoframe: AI の設定が未指定・不正、またはその用途が未設定なので、今の設定に当たる停止を特定できません（全部を解除するなら --all）"
+            );
+            ExitCode::from(2)
+        }
+        Err(ops::ReleaseError::Write) => {
+            eprintln!("geoframe: 停止の解除に失敗しました");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// 取り込みを始められなかったときの終了コード。ガードが断ったのは 2（設定の誤りと同じ扱いで、
 /// unit の `RestartPreventExitStatus=2` により再起動ループにしない。再起動しても直らない）。
 fn exit_for_ingest_error(e: &crate::ingest::IngestError) -> ExitCode {
@@ -835,6 +1310,255 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parses_ai_jobs() {
+        use crate::ai::ops::{PauseTarget, RetryTarget};
+        assert_eq!(
+            p(&["ai-jobs", "status"]),
+            Ok(Command::AiJobs(AiJobsCommand::Status { data_dir: None }))
+        );
+        assert_eq!(
+            p(&["ai-jobs", "status", "--data-dir", "/srv/x"]),
+            Ok(Command::AiJobs(AiJobsCommand::Status {
+                data_dir: Some(PathBuf::from("/srv/x"))
+            }))
+        );
+        assert_eq!(
+            p(&["ai-jobs", "retry", "--kind", "photo_judge"]),
+            Ok(Command::AiJobs(AiJobsCommand::Retry {
+                target: RetryTarget::Kind(JobKind::PhotoJudge),
+                data_dir: None
+            }))
+        );
+        assert_eq!(
+            p(&["ai-jobs", "retry", "--all", "--data-dir", "/srv/x"]),
+            Ok(Command::AiJobs(AiJobsCommand::Retry {
+                target: RetryTarget::All,
+                data_dir: Some(PathBuf::from("/srv/x"))
+            }))
+        );
+        assert_eq!(
+            p(&["ai-jobs", "release-pause", "--task", "image_embedding"]),
+            Ok(Command::AiJobs(AiJobsCommand::ReleasePause {
+                target: PauseTarget::Task(TaskKind::ImageEmbedding),
+                data_dir: None
+            }))
+        );
+        assert_eq!(
+            p(&["ai-jobs", "deactivate-space", "--data-dir", "/srv/x"]),
+            Ok(Command::AiJobs(AiJobsCommand::DeactivateSpace {
+                data_dir: Some("/srv/x".into())
+            }))
+        );
+        assert_eq!(
+            p(&["ai-jobs", "deactivate-space"]),
+            Ok(Command::AiJobs(AiJobsCommand::DeactivateSpace {
+                data_dir: None
+            }))
+        );
+        assert_eq!(
+            p(&["ai-jobs", "release-pause", "--all"]),
+            Ok(Command::AiJobs(AiJobsCommand::ReleasePause {
+                target: PauseTarget::All,
+                data_dir: None
+            }))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_ai_jobs_input_without_echoing_values() {
+        for args in [
+            &["ai-jobs"][..],
+            &["ai-jobs", "nope"],
+            // 対象は 1 つだけ。何も付けない・両方付ける・種類違いは断る（生の対象 ID は受け付けない）
+            &["ai-jobs", "retry"],
+            &["ai-jobs", "retry", "--all", "--kind", "photo_judge"],
+            &["ai-jobs", "retry", "--kind"],
+            &["ai-jobs", "retry", "--id", "7"],
+            &["ai-jobs", "release-pause"],
+            &["ai-jobs", "release-pause", "--all", "--task", "photo_judge"],
+            &["ai-jobs", "release-pause", "--kind", "photo_judge"],
+            &["ai-jobs", "status", "--all"],
+            &["ai-jobs", "status", "--data-dir"],
+            &["ai-jobs", "deactivate-space", "--all"],
+            &["ai-jobs", "deactivate-space", "--space", "x"],
+        ] {
+            assert!(p(args).is_err(), "{args:?}");
+        }
+        let err = p(&["ai-jobs", "retry", "--kind", "secret-kind-value"]).unwrap_err();
+        assert!(!err.contains("secret-kind-value"), "{err}");
+        let err = p(&["ai-jobs", "release-pause", "--task", "secret-task-value"]).unwrap_err();
+        assert!(!err.contains("secret-task-value"), "{err}");
+    }
+
+    /// `ai-jobs status` の出力は件数・用途・固定コードだけ。
+    #[test]
+    fn the_ai_jobs_status_output_has_only_counts_and_fixed_codes() {
+        use crate::ai::jobs::{JobKey, enqueue};
+        use crate::ai::pause::{self, PauseReason};
+        use crate::testutil::TempDir;
+        use crate::writer::{OpenMode, Writer};
+
+        let dir = TempDir::new("cli-ai-status");
+        let ai_json = dir.path().join("ai.json");
+        std::fs::write(
+            &ai_json,
+            r#"{"version":1,"local_base_url":"http://192.0.2.55:9100",
+                "tasks":{"location_clue":{"provider":"local","model":"secret-model-name"}}}"#,
+        )
+        .unwrap();
+        let config = Config::load(
+            |k| (k == "GEOFRAME_AI_CONFIG").then(|| ai_json.to_str().unwrap().to_string()),
+            &Overrides {
+                listen: None,
+                data_dir: Some(dir.path().join("data")),
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("data")).unwrap();
+        let writer = Writer::open(&config.db_path(), OpenMode::CreateIfMissing).unwrap();
+        writer.call(crate::schema::migrate).unwrap();
+        writer.call(crate::ai::migrate).unwrap();
+        let settings = config.ai.settings().unwrap().clone();
+        writer
+            .call(move |c| {
+                let k = JobKey::new(JobKind::LocationClue, "SECRET-TARGET", "SECRET-HASH", "p");
+                enqueue(c, &k, 100)?;
+                c.execute(
+                    "UPDATE ai_jobs SET state='failed', last_error_code='interrupted',
+                            claim_token='SECRET-TOKEN', run_id='SECRET-RUN'",
+                    [],
+                )?;
+                let key = settings.provider_pause_key(TaskKind::LocationClue).unwrap();
+                pause::pause(c, TaskKind::LocationClue, &key, PauseReason::Forbidden, 100)?;
+                Ok(())
+            })
+            .unwrap();
+        // 共有の一時待機（入口全体と、設定に当たらない古い待ち）
+        let wait_settings = config.ai.settings().unwrap().clone();
+        writer
+            .call(move |c| {
+                let now = crate::ai::jobs::unix_now();
+                let entrance = crate::ai::waits::WaitKey {
+                    provider: wait_settings
+                        .provider_fingerprint(TaskKind::LocationClue)
+                        .unwrap(),
+                    service: None,
+                };
+                crate::ai::waits::set(
+                    c,
+                    &entrance,
+                    crate::ai::waits::WaitReason::Leased,
+                    now + 1_800,
+                    now,
+                )?;
+                let stale = crate::ai::waits::WaitKey {
+                    provider: "SECRET-OLD-PROVIDER".into(),
+                    service: None,
+                };
+                crate::ai::waits::set(
+                    c,
+                    &stale,
+                    crate::ai::waits::WaitReason::Unreachable,
+                    now + 1_800,
+                    now,
+                )
+            })
+            .unwrap();
+        let read = crate::db::open_read_only(&config.db_path()).unwrap();
+        let report = ops::report(&read, &config.ai).unwrap();
+        let out = format_ai_report(&report);
+        assert!(
+            out.contains("待機中 location_clue 入口全体: leased（期限 20")
+                && out.contains(" UTC）"),
+            "{out}"
+        );
+        assert!(!out.contains("共有の一時待機: なし"), "{out}");
+        assert!(out.contains("ジョブ location_clue failed: 1 件"), "{out}");
+        assert!(out.contains("理由 failed interrupted: 1 件"), "{out}");
+        assert!(
+            out.contains("停止中 provider location_clue: forbidden"),
+            "{out}"
+        );
+        assert!(out.contains("用途 location_clue: 使える"), "{out}");
+        assert!(
+            out.contains("用途 photo_judge: 使えない（task_not_configured）"),
+            "{out}"
+        );
+        for secret in [
+            "SECRET",
+            "192.0.2.55",
+            "secret-model-name",
+            "ai.json",
+            dir.path().to_str().unwrap(),
+        ] {
+            assert!(!out.contains(secret), "{secret}\n{out}");
+        }
+    }
+
+    /// 公開前の空間の進み具合は、件数と公開の条件（固定の文）だけを出す。無いときは何も出さない。
+    #[test]
+    fn building_space_progress_prints_counts_and_the_publish_rule_only() {
+        use crate::ai::index::{Building, Progress, PublishState};
+        assert_eq!(format_building_status(None), "");
+        let building = Building {
+            progress: Progress {
+                eligible: 6439,
+                indexed: 2000,
+                pending: 4300,
+                failed_excluded: 139,
+                failed_reasons: vec![("timeout", 139)],
+            },
+            min_coverage: 0.95,
+            coverage: 2000.0 / 6439.0,
+            publish: PublishState::Waiting,
+        };
+        let out = format_building_status(Some(&building));
+        assert!(
+            out.contains("公開前の空間: 対象 6439 / 保存済み 2000 / 待ち 4300 / 失敗で除外 139（成功率 31.1%）"),
+            "{out}"
+        );
+        assert!(
+            out.contains("公開前の空間 除外の理由 timeout: 139 件"),
+            "{out}"
+        );
+        assert!(
+            out.contains("公開の条件: 待ち 0 かつ 成功率 95% 以上 → 待ち 0 になるまで公開しない"),
+            "{out}"
+        );
+    }
+
+    /// 停止の各待ちは、1 つあたりの上限が長くても SIGTERM からの共通期限の残りを越えない。
+    #[test]
+    fn the_stop_phases_never_wait_past_the_common_deadline() {
+        use crate::testutil::TempDir;
+        let dir = TempDir::new("cli-stop-deadline");
+        let cache = Arc::new(Cache::load(dir.path()));
+        let stop = StopFlag::with_budget(Duration::from_millis(300));
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (release2, wait2) = std::sync::mpsc::channel::<()>();
+        // どちらのスレッドも止まらない（I/O で固まっているつもり）
+        let worker = std::thread::spawn(move || {
+            let _ = wait.recv();
+        });
+        let saver = std::thread::spawn(move || {
+            let _ = wait2.recv();
+        });
+        stop.stop();
+        let began = std::time::Instant::now();
+        stop_ingest_threads(
+            IngestThreads { worker, saver },
+            &cache,
+            crate::ingest::LockHold::for_test(dir.path()),
+            Duration::from_secs(10),
+            &stop,
+        );
+        let waited = began.elapsed();
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        release.send(()).unwrap();
+        release2.send(()).unwrap();
+    }
+
     /// 停止の順序: worker が止まる直前の最後の `put` も、最後の保存に入る。
     #[test]
     fn the_final_save_waits_for_the_worker_to_finish() {
@@ -862,7 +1586,9 @@ mod tests {
         stop_ingest_threads(
             IngestThreads { worker, saver },
             &cache,
+            crate::ingest::LockHold::for_test(dir.path()),
             Duration::from_secs(10),
+            &stop,
         );
         let saved = std::fs::read_to_string(dir.path().join(".cache.json")).unwrap();
         assert!(saved.contains("geo:late"), "{saved}");
@@ -897,7 +1623,9 @@ mod tests {
         stop_ingest_threads(
             IngestThreads { worker, saver },
             &ingest.cache,
+            ingest.lock_hold(),
             Duration::from_millis(100),
+            &StopFlag::new(),
         );
         // serve の末尾と同じく Ingest を捨てる。固まった保存スレッドはまだ生きている
         drop(ingest);
@@ -914,5 +1642,50 @@ mod tests {
             }
         }
         panic!("保存スレッドが終わってもロックが外れない");
+    }
+    /// 最後の保存の実 I/O（一時ファイルが FIFO で、読み手が現れるまで書き込みが戻らない）が固まっても、
+    /// 停止の呼び出しは共通期限の内に戻る。固まった保存は `.ingest.lock` を持ち続け、読み手を付けると手放す。
+    #[test]
+    fn a_stuck_final_save_does_not_push_the_stop_past_the_common_deadline() {
+        use crate::testutil::TempDir;
+        use serde_json::json;
+
+        let dir = TempDir::new("cli-stuck-final-save");
+        let tmp = dir.path().join(".cache.json.tmp");
+        if !std::process::Command::new("mkfifo")
+            .arg(&tmp)
+            .status()
+            .is_ok_and(|s| s.success())
+        {
+            eprintln!("mkfifo が使えないので省略");
+            return;
+        }
+        let cache = Arc::new(Cache::load(dir.path()));
+        cache.put("geo:1", json!(1));
+        let lock = crate::ingest::LockHold::for_test(dir.path());
+        let stop = StopFlag::with_budget(Duration::from_millis(400));
+        stop.stop();
+        let (worker, saver) = (std::thread::spawn(|| {}), std::thread::spawn(|| {}));
+        let began = std::time::Instant::now();
+        // 1 つあたりの上限は 10 秒でも、共通期限（400ms）の残りまでしか待たない
+        stop_ingest_threads(
+            IngestThreads { worker, saver },
+            &cache,
+            lock.clone(),
+            Duration::from_secs(10),
+            &stop,
+        );
+        let waited = began.elapsed();
+        assert!(waited < Duration::from_secs(2), "{waited:?}");
+        // 残った保存のスレッドが所有権を持っている（呼び出し側の複製 + スレッドの複製）
+        assert_eq!(lock.holders(), 2);
+        drop(std::fs::File::open(&tmp).unwrap()); // 読み手を付けて解放する
+        for _ in 0..1000 {
+            if lock.holders() == 1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("最後の保存のスレッドが終わらない");
     }
 }

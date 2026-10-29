@@ -54,6 +54,12 @@ Environment=TZ=Asia/Tokyo
 # drop-in で --listen を足す（--listen は GEOFRAME_HOST/GEOFRAME_PORT より優先される）。
 EnvironmentFile=-/etc/default/geoframe
 
+# 停止（SIGTERM）の全体は、受信から 60 秒の共通期限でHTTP・タイル掃除・同期・AI・キャッシュ保存・runtime の停止を
+# それぞれ残り時間で打ち切る（docs/rust-migration/server.md §22）。AI のワーカーの join は最大 10 秒。
+# 期限のあとにプロセスが終わるまでの余裕を含めて 90 秒待ち、それでも終わらなければ systemd が SIGKILL する
+# （残った実行中の AI ジョブは、次の起動が中断として回収する。停止開始が記録されていれば数えない）。
+TimeoutStopSec=90s
+
 # 異常終了は再起動する。ただし設定不正（終了コード 2）は再起動しても直らないので、
 # 再起動ループにせず failed のまま止める。DB が開けない・スキーマ不足（終了コード 1）は
 # Python より先に起動した場合などで再試行に意味があるので再起動対象。

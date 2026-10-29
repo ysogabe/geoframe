@@ -1072,3 +1072,73 @@ fn bigtiffは専用のエラーで断る() {
         Err(ImageError::NotAnImage)
     ));
 }
+
+#[test]
+fn decision_rgb_applies_raw_exif_once_and_never_reapplies_display_rotation() {
+    let raw = with_exif(&jpeg_rgb(60, 40), &exif_tiff(6));
+    let input = prepare_decision_rgb(&raw, true).unwrap();
+    assert_eq!((input.width, input.height), (40, 60));
+    let untreated = prepare_decision_rgb(&raw, false).unwrap();
+    assert_eq!((untreated.width, untreated.height), (60, 40));
+    let derivative = render(&raw, 90).unwrap();
+    let displayed = prepare_decision_rgb(&derivative.jpeg, false).unwrap();
+    assert_eq!((displayed.width, displayed.height), derivative.info.output);
+    let png = png_with_exif(
+        &png_encode(&two_tone(60, 40), 60, 40, image::ExtendedColorType::Rgb8),
+        &exif_tiff(6),
+    );
+    let prepared = prepare_decision_rgb(&png, true).unwrap();
+    assert_eq!((prepared.width, prepared.height), (40, 60));
+}
+
+#[test]
+fn decision_rgb_converts_icc_and_gray_respects_both_limits_and_encodes_cleanly() {
+    use crate::ai::image_input::{ImageProfile, PreparedImage};
+    // 色変換は既存 render と同じ実装。RGB 画素で結果を比較する（再エンコードの誤差なし）。
+    let mid: Vec<u8> = (0..32 * 24).flat_map(|_| [200, 100, 100]).collect();
+    let encoded = jpeg_encode(
+        &mid,
+        32,
+        24,
+        jpeg_encoder::ColorType::Rgb,
+        Some(&p3_profile()),
+    );
+    let converted = prepare_decision_rgb(&encoded, true).unwrap();
+    let plain = jpeg_encode(&mid, 32, 24, jpeg_encoder::ColorType::Rgb, None);
+    let dropped = prepare_decision_rgb(&plain, true).unwrap();
+    assert!(converted.pixels[0] > dropped.pixels[0]);
+    let gray = png_encode(&[120; 32 * 24], 32, 24, image::ExtendedColorType::L8);
+    let gray = prepare_decision_rgb(&gray, true).unwrap();
+    assert_eq!(gray.pixels, vec![120; 32 * 24 * 3]);
+    for (w, h) in [(2000, 2000), (3000, 1000), (1000, 3000), (13, 7)] {
+        let source = with_exif(&jpeg_rgb(w, h), &exif_tiff(6));
+        let rgb = prepare_decision_rgb(&source, true).unwrap();
+        assert!(rgb.width.max(rgb.height) <= 1536);
+        assert!(u64::from(rgb.width) * u64::from(rgb.height) <= 1_600_000);
+        assert!(rgb.width <= h && rgb.height <= w);
+        assert!(
+            (f64::from(rgb.width) / f64::from(rgb.height) - f64::from(h) / f64::from(w)).abs()
+                < 0.005
+        );
+        assert_eq!(rgb.pixels.len(), (rgb.width * rgb.height * 3) as usize);
+        let image = PreparedImage::encode_jpeg_rgb(
+            &rgb.pixels,
+            rgb.width as u16,
+            rgb.height as u16,
+            88,
+            ImageProfile::Decision,
+        )
+        .unwrap();
+        let out = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            image
+                .data_url()
+                .strip_prefix("data:image/jpeg;base64,")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_clean(&out);
+        assert!(!out.windows(b"SynthMaker".len()).any(|v| v == b"SynthMaker"));
+    }
+    assert!(prepare_decision_rgb(b"broken", true).is_err());
+}

@@ -28,8 +28,10 @@
 //! - [`Cache::save_if_due`] は、変更があり、前回の保存から [`SAVE_INTERVAL`] 以上たっているときだけ書く
 //!   （SD/eMMC の寿命のため、最短 60 秒間隔）。一時ファイル `.cache.json.tmp` に書いて `rename` で
 //!   差し替える（書きかけで落ちても現役のキーを失わない）。失敗したら次の tick で再試行する。
-//!   保存の全体は保存用の排他で 1 つずつにする。停止時の [`Cache::save_final`] は、保存スレッドが
-//!   I/O の最中ならそれを期限まで待ち、順番が来なければ書かずに省略する（重ねて書かない）。
+//!   保存の全体は保存用の排他で 1 つずつにする。停止時の [`Cache::save_final`] は、実際の保存を
+//!   `LockHold` を持つ別スレッドで行い、呼び出し側は共通の残り時間までしか待たない（排他の待ちだけでなく
+//!   書き込み・`fsync` の最中も。期限が来たら保存を省略して戻り、残ったスレッドが終えるまで排他とロックを
+//!   持つので、重ねて書かない・JSON を壊さない）。
 //! - 凍結（[`Cache::load_frozen`]）は `--dry-run` 用で、`put`・`purge`・保存をしない。
 //! - メモリだけ（[`Cache::load_memory_only`]・[`Cache::memory_only`]）は、取り込みが無効（`GEOFRAME_INGEST=0`）の
 //!   `serve` の地名検索用で、読み込み（無ければ空）と `put` はするが、**ディスクへは書かない**（`purge`・保存をしない）。
@@ -39,6 +41,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
@@ -69,7 +72,8 @@ pub enum SaveOutcome {
     Saved,
     /// 書けなかった（次の tick で再試行する）。
     Failed,
-    /// 別のスレッドが保存の最中で、期限内に順番が来なかったので書かなかった（`save_final` だけ）。
+    /// 期限内に保存を始められなかった・終わらなかった（`save_final` だけ）。別の保存が終わらない、期限切れ、
+    /// 実際の書き込みが固まった、のいずれか。固まった書き込みは別スレッドに残る。
     Skipped,
 }
 
@@ -244,33 +248,87 @@ impl Cache {
         })
     }
 
-    /// 停止時の最後の保存。ほかの保存（保存スレッドが I/O の最中に止まりきらなかった場合）の終了を
-    /// `wait` まで待ち、それでも順番が来なければ**書かずに** [`SaveOutcome::Skipped`] を返す。
-    /// 無期限には待たない（停止が終わらなくなる）。重ねて書くよりは、この回の更新を捨てるほうを選ぶ。
-    pub fn save_final(&self, wait: Duration) -> SaveOutcome {
-        self.save_with(Instant::now(), true, Some(wait), |body| {
-            self.write_atomically(body)
-        })
+    /// 停止時の最後の保存。**呼び出し側は `limit` を越えて待たない**（SIGTERM からの共通期限の残り）。
+    ///
+    /// 実際の保存（排他の待ち・本文の書き込み・`fsync`・`rename`）は別スレッドで行い、そのスレッドは `lock`
+    /// （[`LockHold`]）を保存が終わるまで持つ。`limit` を過ぎても終わらない（別の保存が終わらない・書き込みの
+    /// I/O が固まった）ときは待たずに [`SaveOutcome::Skipped`] で戻る。残ったスレッドは排他と `.ingest.lock`
+    /// を持ち続けるので、ほかの保存と重ならず（キャッシュは壊れない）、別の取り込みも始まらない。
+    /// `limit` が 0（期限切れ）なら、スレッドも作らず保存を始めない。変更が無ければ [`SaveOutcome::Clean`]。
+    pub fn save_final(self: &Arc<Self>, lock: LockHold, limit: Duration) -> SaveOutcome {
+        self.save_final_with(lock, limit, |cache, body| cache.write_atomically(body))
     }
 
-    /// 保存の本体。`wait` が `None` なら排他を無期限に待つ。`write` は本文を書く処理（試験で遅延や
-    /// 失敗を差し込めるよう、呼び出し側から渡す。本番の呼び出しは [`Cache::write_atomically`] を渡す）。
+    /// [`Cache::save_final`] の本体。`write` は本文を書く処理（試験が固まる I/O を差し込む）。
+    fn save_final_with(
+        self: &Arc<Self>,
+        lock: LockHold,
+        limit: Duration,
+        write: impl FnOnce(&Cache, &[u8]) -> std::io::Result<()> + Send + 'static,
+    ) -> SaveOutcome {
+        if self.mode != Mode::Persistent {
+            return SaveOutcome::Clean;
+        }
+        let deadline = Instant::now() + limit;
+        // 期限切れなら保存を始めない（スレッドも作らない）
+        if limit.is_zero() {
+            tracing::warn!("停止の期限が尽きているので、キャッシュの最後の保存を省略します");
+            return SaveOutcome::Skipped;
+        }
+        let (done, outcome) = std::sync::mpsc::sync_channel(1);
+        let cache = Arc::clone(self);
+        let spawned = std::thread::Builder::new()
+            .name("cache-final-save".into())
+            .spawn(move || {
+                let _lock = lock; // 保存が終わる（書き込みが固まったままなら、プロセスが終わる）まで持つ
+                let result = cache.save_with(Instant::now(), true, Some(deadline), |body| {
+                    write(&cache, body)
+                });
+                let _ = done.send(result); // 呼び出し側が去っていれば捨てる
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "キャッシュの最後の保存のスレッドを起動できません: {}",
+                e.kind()
+            );
+            return SaveOutcome::Failed;
+        }
+        match outcome.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(result) => result,
+            Err(RecvTimeoutError::Timeout) => {
+                tracing::warn!(
+                    "キャッシュの最後の保存が期限内に終わらないので待たずに戻ります（直近の更新は失われます）"
+                );
+                SaveOutcome::Skipped
+            }
+            Err(RecvTimeoutError::Disconnected) => SaveOutcome::Failed,
+        }
+    }
+
+    /// 保存の本体。`deadline` が `None` なら排他を無期限に待つ。`Some` なら、排他の待ちも、取れたあとの
+    /// 保存の開始も、その時刻までに限る（過ぎていれば書かず [`SaveOutcome::Skipped`]）。`write` は本文を
+    /// 書く処理（試験で遅延や失敗を差し込めるよう、呼び出し側から渡す。本番の呼び出しは
+    /// [`Cache::write_atomically`] を渡す）。
     fn save_with(
         &self,
         now: Instant,
         force: bool,
-        wait: Option<Duration>,
+        deadline: Option<Instant>,
         write: impl FnOnce(&[u8]) -> std::io::Result<()>,
     ) -> SaveOutcome {
         if self.mode != Mode::Persistent {
             return SaveOutcome::Clean;
         }
-        let Some(_exclusive) = self.lock_save(wait) else {
+        let Some(_exclusive) = self.lock_save(deadline) else {
             tracing::warn!(
                 "別の保存が終わらないので、キャッシュの最後の保存を省略します（直近の更新は失われます）"
             );
             return SaveOutcome::Skipped;
         };
+        // 排他を取れたあと、実際に保存を始める直前にも期限を確かめる（スナップショットも取らない）
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return SaveOutcome::Skipped;
+        }
         let body = {
             let mut state = self.state();
             if !state.dirty {
@@ -299,16 +357,15 @@ impl Cache {
         }
     }
 
-    /// 保存の排他を取る。`wait` が `Some` なら、その時間までしか待たず、取れなければ `None`。
-    fn lock_save(&self, wait: Option<Duration>) -> Option<MutexGuard<'_, ()>> {
-        let Some(wait) = wait else {
+    /// 保存の排他を取る。`deadline` が `Some` なら、その時刻までしか待たず、取れなければ `None`。
+    fn lock_save(&self, deadline: Option<Instant>) -> Option<MutexGuard<'_, ()>> {
+        let Some(deadline) = deadline else {
             return Some(
                 self.save_lock
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner),
             );
         };
-        let deadline = Instant::now() + wait;
         loop {
             match self.save_lock.try_lock() {
                 Ok(guard) => return Some(guard),
@@ -556,7 +613,7 @@ mod tests {
     fn memory_only_cache_reads_and_puts_but_never_writes_the_disk() {
         let dir = TempDir::new("cache-memory");
         write_file(&dir, r#"{"exif:x": 1, "geo:1": 2}"#);
-        let cache = Cache::load_memory_only(dir.path());
+        let cache = Arc::new(Cache::load_memory_only(dir.path()));
         assert_eq!(cache.get("geo:1"), Some(json!(2)));
         // 旧キーの破棄はしない（Python が書き手の間は、ファイルにも手を付けない）
         assert_eq!(cache.purge_legacy(), 0);
@@ -566,7 +623,7 @@ mod tests {
         assert_eq!(cache.save_now(), SaveOutcome::Clean);
         assert_eq!(cache.save_if_due(Instant::now()), SaveOutcome::Clean);
         assert_eq!(
-            cache.save_final(Duration::from_millis(10)),
+            cache.save_final(LockHold::for_test(dir.path()), Duration::from_millis(10)),
             SaveOutcome::Clean
         );
         assert_eq!(read_file(&dir), r#"{"exif:x": 1, "geo:1": 2}"#);
@@ -632,7 +689,7 @@ mod tests {
         cache.put("geo:2", json!(2));
         let started = Instant::now();
         assert_eq!(
-            cache.save_final(Duration::from_millis(100)),
+            cache.save_final(LockHold::for_test(dir.path()), Duration::from_millis(100)),
             SaveOutcome::Skipped
         );
         assert!(started.elapsed() >= Duration::from_millis(100));
@@ -644,7 +701,10 @@ mod tests {
         // 固まりが解けたら、保存は 1 つずつ終わり、省略された分も次の保存で残る
         release_tx.send(()).unwrap();
         assert_eq!(stuck.join().unwrap(), SaveOutcome::Saved);
-        assert_eq!(cache.save_final(Duration::from_secs(5)), SaveOutcome::Saved);
+        assert_eq!(
+            cache.save_final(LockHold::for_test(dir.path()), Duration::from_secs(5)),
+            SaveOutcome::Saved
+        );
         let text = read_file(&dir);
         assert!(text.contains("geo:1") && text.contains("geo:2"), "{text}");
         serde_json::from_str::<Value>(&text).expect("JSON が壊れていない");
@@ -670,9 +730,149 @@ mod tests {
         };
         entered_rx.recv().unwrap();
         cache.put("geo:2", json!(2));
-        assert_eq!(cache.save_final(Duration::from_secs(5)), SaveOutcome::Saved);
+        assert_eq!(
+            cache.save_final(LockHold::for_test(dir.path()), Duration::from_secs(5)),
+            SaveOutcome::Saved
+        );
         assert_eq!(slow.join().unwrap(), SaveOutcome::Saved);
         let text = read_file(&dir);
         assert!(text.contains("geo:1") && text.contains("geo:2"), "{text}");
+    }
+    /// 最後の保存の本文の書き込み（排他を取れたあと）で固まる I/O を、チャネルで解放できる形で差し込む。
+    /// 戻り値は（書き込みに入ったことの通知、解放の合図、書き込みに入った回数）。
+    #[allow(clippy::type_complexity)]
+    fn controllable_write() -> (
+        impl FnOnce(&Cache, &[u8]) -> std::io::Result<()> + Send + 'static,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let write = move |cache: &Cache, body: &[u8]| {
+            entered_tx.send(()).unwrap();
+            let _ = release_rx.recv(); // 解放されるまで I/O が固まっているつもり
+            cache.write_atomically(body)
+        };
+        (write, entered_rx, release_tx)
+    }
+
+    /// 残ったスレッドが `lock` を手放す（終わる）のを待つ。解放済みなので有限の短い待ちで終わる。
+    fn wait_until_released(lock: &LockHold) {
+        for _ in 0..1000 {
+            if lock.holders() == 1 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("最後の保存のスレッドが終わらない");
+    }
+
+    /// 排他を取れたあとの書き込みが固まっても、呼び出し側は期限内に戻る。残ったスレッドは `LockHold` と
+    /// 保存の排他を持ち続け、ほかの保存は重ならず、解放後に回収され、キャッシュは壊れない。
+    #[test]
+    fn the_final_save_returns_by_the_deadline_when_the_write_itself_is_stuck() {
+        let dir = TempDir::new("cache-final-stuck-write");
+        let cache = Arc::new(Cache::load(dir.path()));
+        cache.put("geo:1", json!(1));
+        let lock = LockHold::for_test(dir.path());
+        let (write, entered, release) = controllable_write();
+        let began = Instant::now();
+        let outcome = cache.save_final_with(lock.clone(), Duration::from_millis(150), write);
+        let waited = began.elapsed();
+        entered
+            .try_recv()
+            .expect("書き込みに入っていた（排他は取れた）");
+        assert_eq!(outcome, SaveOutcome::Skipped);
+        assert!(
+            waited >= Duration::from_millis(150) && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        // 残ったスレッドは LockHold を持つ（呼び出し側の複製 + スレッドの複製）
+        assert_eq!(lock.holders(), 2);
+        // 固まっている間のほかの保存は排他で重ならない（何も書かず省略）
+        cache.put("geo:2", json!(2));
+        assert_eq!(
+            cache.save_final(lock.clone(), Duration::from_millis(60)),
+            SaveOutcome::Skipped
+        );
+        assert!(!dir.path().join(".cache.json").exists());
+        // 解放すると、残った保存が終わり、LockHold が手放される。以後の保存は両方の更新を含めて書ける
+        release.send(()).unwrap();
+        wait_until_released(&lock);
+        assert_eq!(
+            cache.save_final(lock.clone(), Duration::from_secs(5)),
+            SaveOutcome::Saved
+        );
+        let text = read_file(&dir);
+        assert!(text.contains("geo:1") && text.contains("geo:2"), "{text}");
+        serde_json::from_str::<Value>(&text).expect("JSON が壊れていない");
+        assert!(!dir.path().join(".cache.json.tmp").exists());
+    }
+
+    /// 期限が 0（切れている）なら、スレッドも作らず、書き込みも始めない。
+    #[test]
+    fn an_expired_deadline_starts_neither_a_thread_nor_a_write() {
+        let dir = TempDir::new("cache-final-expired");
+        let cache = Arc::new(Cache::load(dir.path()));
+        cache.put("geo:1", json!(1));
+        let lock = LockHold::for_test(dir.path());
+        let (write, entered, _release) = controllable_write();
+        let began = Instant::now();
+        assert_eq!(
+            cache.save_final_with(lock.clone(), Duration::ZERO, write),
+            SaveOutcome::Skipped
+        );
+        assert!(began.elapsed() < Duration::from_millis(500));
+        assert!(entered.try_recv().is_err(), "書き込みに入らない");
+        assert_eq!(lock.holders(), 1, "スレッドを作らない");
+        assert!(!dir.path().join(".cache.json").exists());
+        assert!(cache.state().dirty, "更新は残る");
+    }
+
+    /// 排他を取れたのが期限のあとなら、スナップショットも書き込みも始めない（実保存の直前の確認）。
+    #[test]
+    fn a_save_that_gets_the_exclusion_after_the_deadline_does_not_start() {
+        let dir = TempDir::new("cache-final-late");
+        let cache = Cache::load(dir.path());
+        cache.put("geo:1", json!(1));
+        let expired = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let mut wrote = false;
+        let outcome = cache.save_with(Instant::now(), true, Some(expired), |_| {
+            wrote = true;
+            Ok(())
+        });
+        assert_eq!(outcome, SaveOutcome::Skipped);
+        assert!(!wrote);
+        assert!(cache.state().dirty, "スナップショットを取っていない");
+    }
+
+    /// 実際の書き込み（`write_atomically`）が、FIFO の一時ファイルで固まる場合。読み手が現れるまで
+    /// `File::create` が戻らない。呼び出し側は期限内に戻り、読み手を付けると残ったスレッドが終わる。
+    #[test]
+    fn the_real_write_stuck_on_a_fifo_does_not_stop_the_caller_past_the_deadline() {
+        let dir = TempDir::new("cache-final-fifo");
+        let tmp = dir.path().join(".cache.json.tmp");
+        let made = std::process::Command::new("mkfifo").arg(&tmp).status();
+        if !made.is_ok_and(|s| s.success()) {
+            eprintln!("mkfifo が使えないので、FIFO の試験は省略");
+            return;
+        }
+        let cache = Arc::new(Cache::load(dir.path()));
+        cache.put("geo:1", json!(1));
+        let lock = LockHold::for_test(dir.path());
+        let began = Instant::now();
+        let outcome = cache.save_final(lock.clone(), Duration::from_millis(200));
+        let waited = began.elapsed();
+        assert_eq!(outcome, SaveOutcome::Skipped);
+        assert!(
+            waited >= Duration::from_millis(200) && waited < Duration::from_secs(3),
+            "{waited:?}"
+        );
+        assert_eq!(lock.holders(), 2, "固まった保存は LockHold を持ち続ける");
+        // 読み手を付けて解放する（書き込みは終わるが、FIFO への fsync は失敗しうる）。スレッドは終わる
+        let reader = std::fs::File::open(&tmp).unwrap();
+        drop(reader);
+        wait_until_released(&lock);
     }
 }

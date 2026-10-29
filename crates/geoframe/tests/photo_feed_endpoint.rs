@@ -13,8 +13,8 @@ mod common;
 use std::time::Duration;
 
 use common::{
-    TempDir, build_catalog, build_empty_catalog, get, photos_from, python_fixture, spawn,
-    validator, violations,
+    TempDir, build_catalog, build_empty_catalog, get, legacy_generation_sql, photos_from,
+    python_fixture, spawn, validator, violations,
 };
 use geoframe::db::Catalog;
 use geoframe::feed::Photo;
@@ -209,6 +209,8 @@ async fn selection_rules() {
     sql += &photo(16, &[]);
     sql += &ai_member("g2", 15, 1, 0);
     sql += &ai_member("g3", 16, 1, 0);
+    // 旧メンバーが有効（特徴量の世代が合う）なので、従来どおり抑止される
+    sql += &legacy_generation_sql(&[12, 13, 14, 15, 16]);
 
     let list = feed(&sql).await;
     assert_eq!(ids(&list), [1, 5, 6, 8, 9, 10, 11, 12, 14, 15, 16]);

@@ -90,8 +90,21 @@ pub fn py_strip(s: &str) -> &str {
     s.trim_matches(is_py_space)
 }
 
-fn is_py_space(c: char) -> bool {
+pub(crate) fn is_py_space(c: char) -> bool {
     c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
+}
+
+/// Python `" ".join(s.strip().split())` including FS/GS/RS/US.
+pub fn py_words(s: &str) -> String {
+    s.split(is_py_space)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Unicode full case folding, generated from Python (not locale-dependent lowercasing).
+pub fn py_casefold(s: &str) -> String {
+    s.chars().map(crate::pycasefold::fold).collect()
 }
 
 /// Python の `float(str)`。受け付けない形（`ValueError`）は `None`。`inf`・`nan`・桁あふれ（`1e400`）は

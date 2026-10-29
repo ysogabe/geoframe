@@ -27,6 +27,20 @@
 //!   いたものも）は実行せずに同じ [`WriteError::Task`] を返す。開いたままのトランザクションを次の依頼が
 //!   引き継いで、後続の `COMMIT` で前の依頼の行まで確定する事故を防ぐ。再接続はしない（再起動で直る）。
 //! - 全ての `Writer` が drop されるとスレッドが終わり、接続が閉じる（WAL がチェックポイントされる）。
+//! - [`Writer::open_held`] で渡したもの（取り込みでは `.ingest.lock` の所有権）は**書き込みスレッドが持ち**、
+//!   スレッドが終わるとき、接続を閉じ終わってから手放す（正常終了・後始末の失敗・スレッドのパニックのどれでも）。
+//!   `Writer` の側（送る側）は持たないので、依頼の呼び出し側（期限で去ったスレッド・drop 済みの `Ingest`）の
+//!   寿命とは無関係に、始まった SQL・後始末・接続の close が終わるまでロックが残る。
+//!
+//! # 期限つきの依頼
+//!
+//! [`Writer::call_within`] は、順番待ちを含めて期限までに**始まらなかった**依頼を実行しない（書き込みスレッドが
+//! 取り出した時点で期限を過ぎていれば、`f` を呼ばずに [`WriteError::Expired`]）。待つ側は期限で戻るので、
+//! 対話的な要求（検索語の送信枠の予約など）が書き込みの順番待ちで塞がれない。期限が来たあとに待つ側が去っても、
+//! すでに始まっていた依頼は最後まで実行され確定する（巻き戻さない）。返信が溜まっていても、待つ側が受け取った
+//! のが期限のあとなら成功を返さず `Expired` にする。戻り値が `Expired` でも書き込みが確定して
+//! いることがあるので、呼び出し側は「確定しなかった」と決めつけず、保守的に扱う（送信枠なら消費済みとみなす）。
+//! 後始末・パニックの扱い・接続の復旧は [`Writer::call`] と同じ経路。
 //!
 //! # ログ・エラー
 //!
@@ -36,11 +50,12 @@
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
-use std::sync::mpsc;
 #[cfg(test)]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{Connection, OpenFlags};
 
@@ -64,6 +79,8 @@ pub enum WriteError {
     Query(rusqlite::Error),
     /// 依頼がパニックした・書き込みスレッドが止まっている。文言は定型。
     Task(&'static str),
+    /// 期限つきの依頼（[`Writer::call_within`]）が期限までに終わらなかった。始まっていなければ実行されない。
+    Expired,
 }
 
 impl fmt::Display for WriteError {
@@ -72,6 +89,7 @@ impl fmt::Display for WriteError {
             Self::Open(e) => write!(f, "DB を書き込み用に開けません: {e}"),
             Self::Query(e) => write!(f, "DB の書き込みに失敗しました: {e}"),
             Self::Task(m) => write!(f, "DB の書き込みタスクが異常終了しました: {m}"),
+            Self::Expired => f.write_str("DB の書き込みの順番待ちが期限を過ぎました"),
         }
     }
 }
@@ -125,6 +143,10 @@ pub struct Writer {
     /// 同期サイクルの段が「計画を読んでから書くまで」の間に更新 API を割り込ませる試験のため。
     #[cfg(test)]
     before_call: Option<Hook>,
+    /// 試験用: 依頼を積んだあと、返信を待つ直前に 1 回だけ呼ぶ閉包（呼び出したスレッドで）。
+    /// 『書き込みスレッドが期限内に始めて返信を済ませ、待つ側がまだ受け取っていない』状態を作るため。
+    #[cfg(test)]
+    before_wait: Option<Hook>,
 }
 
 impl fmt::Debug for Writer {
@@ -136,20 +158,38 @@ impl fmt::Debug for Writer {
 impl Writer {
     /// 接続を開き、書き込みスレッドを起動する。開けないときはここで失敗する（スレッドは作らない）。
     pub fn open(path: &Path, mode: OpenMode) -> Result<Self, WriteError> {
-        let conn = open_read_write(path, mode).map_err(WriteError::Open)?;
-        Ok(Self::spawn(conn))
+        Self::open_held(path, mode, ())
     }
 
-    fn spawn(conn: Connection) -> Self {
-        Self::spawn_with(conn, rollback_and_verify)
+    /// [`Writer::open`] に、**書き込みスレッドの寿命いっぱい持つもの**（`.ingest.lock` の
+    /// [`crate::ingest::LockHold`] など）を渡す形。取り込みの本番の経路はこちらだけを使う。
+    ///
+    /// `held` は書き込みスレッドが所有し、スレッドが終わる（全ての `Writer` の drop・後始末の失敗・
+    /// スレッド自身のパニック）とき、**SQLite の接続を閉じ終わってから**手放す。期限つきの依頼
+    /// （[`Writer::call_within`]）の呼び出し側が期限で去っても、始まった SQL・後始末・接続の close が
+    /// 済むまでは手放されない。`Writer`（送る側）は `held` を持たない（受け取る側が `held` を持つので、
+    /// 持ち合う循環にならず、全ての `Writer` の drop でスレッドが終わる）。開けないときは `held` は
+    /// ここで捨てられる。
+    pub fn open_held(
+        path: &Path,
+        mode: OpenMode,
+        held: impl Send + 'static,
+    ) -> Result<Self, WriteError> {
+        let conn = open_read_write(path, mode).map_err(WriteError::Open)?;
+        Ok(Self::spawn_with(conn, rollback_and_verify, held))
     }
 
     /// 後始末を差し替えられる形（故障注入の試験用に分けてある）。
-    fn spawn_with(mut conn: Connection, cleanup: Cleanup) -> Self {
+    fn spawn_with(conn: Connection, cleanup: Cleanup, held: impl Send + 'static) -> Self {
         let (jobs, inbox) = mpsc::channel::<Job>();
         thread::Builder::new()
             .name("db-writer".into())
             .spawn(move || {
+                // 宣言の逆順に手放す: 接続（close）→ 残った依頼 → `held`。閉包の捕捉のままでは drop の順が
+                // 決まらないので、本体の局所変数に移して順を固定する。パニックの巻き戻しでも同じ順
+                let held = held;
+                let inbox = inbox;
+                let mut conn = conn;
                 // 全ての Writer が drop されると recv が Err になり、スレッドが終わる
                 while let Ok(job) = inbox.recv() {
                     let reply = job(&mut conn);
@@ -163,12 +203,17 @@ impl Writer {
                         break;
                     }
                 }
+                drop(conn);
+                drop(inbox);
+                drop(held);
             })
             .expect("書き込みスレッドを起動できません");
         Self {
             jobs,
             #[cfg(test)]
             before_call: None,
+            #[cfg(test)]
+            before_wait: None,
         }
     }
 
@@ -182,10 +227,37 @@ impl Writer {
         }
     }
 
+    /// 試験用: 次の依頼を積んだあと返信を待つ直前に `f` を 1 回だけ呼ぶ複製を返す（元の `Writer` には効かない）。
+    #[cfg(test)]
+    pub(crate) fn interrupt_before_next_wait(&self, f: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            before_wait: Some(Arc::new(Mutex::new(Some(Box::new(f))))),
+            ..self.clone()
+        }
+    }
+
     /// `f` を書き込みスレッドの接続で実行し、結果を返す（呼び出しスレッドはその間ブロックされる）。
     ///
     /// `f` の中で `BEGIN`／`COMMIT` を自分で扱ってよい。コミットしないまま戻ると `ROLLBACK` される。
     pub fn call<T, F>(&self, f: F) -> Result<T, WriteError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
+    {
+        self.dispatch(None, f)
+    }
+
+    /// [`Writer::call`] の期限つき。`deadline` までに（順番待ちを含めて）依頼が始まらなければ `f` を実行せず
+    /// [`WriteError::Expired`] を返す。冒頭の「期限つきの依頼」を参照。
+    pub fn call_within<T, F>(&self, deadline: Instant, f: F) -> Result<T, WriteError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
+    {
+        self.dispatch(Some(deadline), f)
+    }
+
+    fn dispatch<T, F>(&self, deadline: Option<Instant>, f: F) -> Result<T, WriteError>
     where
         T: Send + 'static,
         F: FnOnce(&mut Connection) -> rusqlite::Result<T> + Send + 'static,
@@ -198,10 +270,20 @@ impl Writer {
             }
         }
         let (reply, answer) = mpsc::sync_channel(1);
+        // 期限つきのとき、待つ側が去ったことを書き込みスレッドへ伝える旗（期限の判定は両側で行う）
+        let gone = deadline.map(|d| (d, Arc::new(AtomicBool::new(false))));
+        let job_gone = gone.clone();
         let job: Job = Box::new(move |conn| {
-            let result = catch_unwind(AssertUnwindSafe(|| f(conn)))
-                .map_err(|_| WriteError::Task("書き込みがパニックしました"))
-                .and_then(|r| r.map_err(WriteError::Query));
+            let expired = job_gone
+                .as_ref()
+                .is_some_and(|(d, gone)| gone.load(Ordering::SeqCst) || Instant::now() >= *d);
+            let result = if expired {
+                Err(WriteError::Expired)
+            } else {
+                catch_unwind(AssertUnwindSafe(|| f(conn)))
+                    .map_err(|_| WriteError::Task("書き込みがパニックしました"))
+                    .and_then(|r| r.map_err(WriteError::Query))
+            };
             Box::new(move |clean| {
                 // 後始末に失敗したら、結果が成功でも返さない（確定していない可能性がある）
                 let result = if clean {
@@ -218,9 +300,38 @@ impl Writer {
         self.jobs
             .send(job)
             .map_err(|_| WriteError::Task("書き込みスレッドが停止しています"))?;
-        answer
-            .recv()
-            .map_err(|_| WriteError::Task("書き込みスレッドが停止しています"))?
+        #[cfg(test)]
+        if let Some(hook) = &self.before_wait {
+            let hook = hook.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let stopped = || WriteError::Task("書き込みスレッドが停止しています");
+        match gone {
+            None => answer.recv().map_err(|_| stopped())?,
+            Some((deadline, gone)) => {
+                match answer.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    // 返信が溜まっていても、受け取ったのが期限のあとなら成功として返さない（待つ側が
+                    // 受け取る前に停止して期限を過ぎると、`recv_timeout` は溜まった返信を返せる）。
+                    // 書き込みは確定しているので、呼び出し側は Expired でも消費済みとして扱う
+                    Ok(result) => {
+                        if Instant::now() >= deadline {
+                            gone.store(true, Ordering::SeqCst);
+                            Err(WriteError::Expired)
+                        } else {
+                            result
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // まだ始まっていない依頼は実行されない。始まっていれば最後まで進む（巻き戻さない）
+                        gone.store(true, Ordering::SeqCst);
+                        Err(WriteError::Expired)
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => Err(stopped()),
+                }
+            }
+        }
     }
 }
 
@@ -228,6 +339,43 @@ impl Writer {
 mod tests {
     use super::*;
     use crate::testutil::TempDir;
+
+    /// `open_held` に渡す試験用の持ち物。手放されたとき、そのときの `-wal` の有無（接続が閉じ終わって
+    /// いれば、最後の接続の close でチェックポイントされて消えている）を知らせる。
+    struct Probe {
+        wal: std::path::PathBuf,
+        dropped: mpsc::Sender<bool>,
+    }
+
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            let _ = self.dropped.send(self.wal.exists());
+        }
+    }
+
+    /// WAL 付きの空き DB（表 `t`）を、接続を全て閉じた状態で用意する。
+    fn prepared_db(dir: &TempDir) -> std::path::PathBuf {
+        let path = dir.path().join("w.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch("CREATE TABLE t(k INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        drop(conn);
+        path
+    }
+
+    fn probe(path: &Path) -> (Probe, mpsc::Receiver<bool>) {
+        let (tx, rx) = mpsc::channel();
+        (
+            Probe {
+                wal: path.with_extension("db-wal"),
+                dropped: tx,
+            },
+            rx,
+        )
+    }
+
+    const SETTLE: Duration = Duration::from_secs(20);
 
     fn writer(dir: &TempDir) -> Writer {
         let w = Writer::open(&dir.path().join("w.db"), OpenMode::CreateIfMissing).unwrap();
@@ -404,6 +552,7 @@ mod tests {
         let w = Writer::spawn_with(
             open_read_write(&path, OpenMode::MustExist).unwrap(),
             |conn| conn.is_autocommit(),
+            (),
         );
         // 失敗するジョブ: BEGIN して行を入れ、エラーで戻る（コミットしない）
         let err = w
@@ -436,14 +585,310 @@ mod tests {
         assert_eq!(n, 0);
     }
 
+    // ------------------------------------------------------------ 期限つきの依頼（call_within）
+
+    /// 依頼を 1 つ、解放の合図が来るまで書き込みスレッドで止めておく。止まったことを確かめてから返す。
+    fn block(w: &Writer) -> (mpsc::Sender<()>, thread::JoinHandle<()>) {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let w = w.clone();
+        let handle = thread::spawn(move || {
+            w.call(move |_| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok(())
+            })
+            .unwrap();
+        });
+        started_rx.recv().unwrap();
+        (release_tx, handle)
+    }
+
+    #[test]
+    fn call_within_returns_normally_when_the_writer_is_free() {
+        let dir = TempDir::new("writer-within-ok");
+        let w = writer(&dir);
+        let n = w
+            .call_within(Instant::now() + Duration::from_secs(30), |c| {
+                c.execute("INSERT INTO t(v) VALUES ('x')", [])
+            })
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(count(&w), 1);
+    }
+
+    /// 順番待ちの間に期限が来た依頼は、writer が空いても実行されない（DB に書かない）。
+    #[test]
+    fn call_within_never_runs_a_job_whose_deadline_passed_in_the_queue() {
+        let dir = TempDir::new("writer-within-queue");
+        let w = writer(&dir);
+        let (release, blocker) = block(&w);
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        let started = Instant::now();
+        let err = w
+            .call_within(started + Duration::from_millis(80), move |c| {
+                flag.store(true, Ordering::SeqCst);
+                c.execute("INSERT INTO t(v) VALUES ('late')", [])
+            })
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Expired), "{err:?}");
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(80), "{waited:?}");
+        assert!(waited < Duration::from_secs(5), "{waited:?}");
+
+        release.send(()).unwrap();
+        blocker.join().unwrap();
+        // キューの順に、塞いでいた依頼のあとで期限切れの依頼が取り出されて捨てられる。同期の依頼で追い付く
+        assert_eq!(count(&w), 0);
+        assert!(!ran.load(Ordering::SeqCst));
+        // writer は何事もなく使える
+        w.call(|c| c.execute("INSERT INTO t(v) VALUES ('ok')", []))
+            .unwrap();
+        assert_eq!(count(&w), 1);
+    }
+
+    #[test]
+    fn call_within_with_a_passed_deadline_does_not_run_even_on_an_idle_writer() {
+        let dir = TempDir::new("writer-within-passed");
+        let w = writer(&dir);
+        let err = w
+            .call_within(Instant::now(), |c| {
+                c.execute("INSERT INTO t(v) VALUES ('x')", [])
+            })
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Expired), "{err:?}");
+        assert_eq!(count(&w), 0);
+    }
+
+    /// すでに始まっていた依頼は、待つ側が期限で去っても最後まで実行されて確定する（巻き戻さない）。
+    #[test]
+    fn call_within_lets_a_started_job_finish_after_the_waiter_left() {
+        let dir = TempDir::new("writer-within-started");
+        let w = writer(&dir);
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let waiter = {
+            let w = w.clone();
+            thread::spawn(move || {
+                w.call_within(Instant::now() + Duration::from_millis(80), move |c| {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    c.execute("INSERT INTO t(v) VALUES ('started')", [])
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(matches!(waiter.join().unwrap(), Err(WriteError::Expired)));
+        release_tx.send(()).unwrap();
+        w.call(|_| Ok(())).unwrap();
+        assert_eq!(count(&w), 1);
+    }
+
+    /// 書き込みスレッドが期限内に依頼を終えて返信を済ませていても、待つ側が受け取るのが期限後なら
+    /// 成功を返さない（`recv_timeout(0)` は溜まった返信を返せるので、受け取った結果の側でも期限を照合する）。
+    /// 順序は同期で固定する: 積む → 期限内に実行・返信 → 待つ直前で待つ側が停止し期限を過ぎる → 再開。
+    #[test]
+    fn call_within_does_not_return_a_buffered_success_after_the_deadline() {
+        let dir = TempDir::new("writer-within-buffered");
+        let w = writer(&dir);
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let (ran_tx, ran_rx) = mpsc::channel::<()>();
+        let original = w.clone();
+        let paused = w.interrupt_before_next_wait(move || {
+            // 依頼が実行されたことを待ち、続けて同期の依頼を通す: 書き込みスレッドは 1 つずつ処理するので、
+            // これが戻った時点で先の依頼の返信は（受け手が居ない箱に）積まれている
+            ran_rx.recv().unwrap();
+            original.call(|_| Ok(())).unwrap();
+            // 期限を過ぎるまで、待つ側（このスレッド）を止める
+            while Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let err = paused
+            .call_within(deadline, move |c| {
+                let n = c.execute("INSERT INTO t(v) VALUES ('buffered')", [])?;
+                ran_tx.send(()).unwrap();
+                Ok(n)
+            })
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Expired), "{err:?}");
+        // 書き込み自体は期限内に始まって確定している。Expired でも消費は戻らない（保守的）
+        assert_eq!(count(&w), 1);
+    }
+
+    /// 後始末・パニックの扱いは `call` と同じ: 開いたトランザクションは戻され、パニックは `Task` で、
+    /// 接続はそのまま使える。
+    #[test]
+    fn call_within_rolls_back_and_contains_panics_like_call() {
+        let dir = TempDir::new("writer-within-panic");
+        let w = writer(&dir);
+        let deadline = || Instant::now() + Duration::from_secs(30);
+        w.call_within(deadline(), |c| {
+            c.execute_batch("BEGIN; INSERT INTO t(v) VALUES ('x')")
+        })
+        .unwrap();
+        assert_eq!(count(&w), 0);
+        assert!(w.call(|c| Ok(c.is_autocommit())).unwrap());
+        let err = w
+            .call_within(deadline(), |c| -> rusqlite::Result<()> {
+                c.execute_batch("BEGIN; INSERT INTO t(v) VALUES ('x')")?;
+                panic!("secret-value");
+            })
+            .unwrap_err();
+        let WriteError::Task(message) = err else {
+            panic!("パニックが Task にならなかった");
+        };
+        assert!(!message.contains("secret-value"));
+        assert_eq!(count(&w), 0);
+        w.call_within(deadline(), |c| {
+            c.execute("INSERT INTO t(v) VALUES ('y')", [])
+        })
+        .unwrap();
+        assert_eq!(count(&w), 1);
+    }
+
+    /// 後始末に失敗して止まった writer では、期限つきの依頼も実行されず `Task`（成功は返らない）。
+    #[test]
+    fn call_within_on_a_stopped_writer_reports_task_not_success() {
+        let dir = TempDir::new("writer-within-stopped");
+        let conn = Connection::open(dir.path().join("w.db")).unwrap();
+        let w = Writer::spawn_with(conn, |_| false, ());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        assert!(matches!(
+            w.call_within(deadline, |_| Ok(1)),
+            Err(WriteError::Task(_))
+        ));
+        assert!(matches!(
+            w.call_within(deadline, |_| Ok(2)),
+            Err(WriteError::Task(_))
+        ));
+    }
+
     /// 返信は後始末のあとに届く: 成功したジョブでも、後始末に失敗したら成功は返らない。
     #[test]
     fn a_successful_job_is_not_reported_when_cleanup_fails() {
         let dir = TempDir::new("writer-cleanup-fail");
         let conn = Connection::open(dir.path().join("w.db")).unwrap();
-        let w = Writer::spawn_with(conn, |_| false);
+        let w = Writer::spawn_with(conn, |_| false, ());
         let err = w.call(|_| Ok(1)).unwrap_err();
         assert!(matches!(err, WriteError::Task(_)));
         assert!(matches!(w.call(|_| Ok(2)), Err(WriteError::Task(_))));
+    }
+    // ------------------------------------------------------------ 書き込みスレッドが持つもの（open_held）
+
+    /// 別の接続が書き込みを握っていて、期限つきの依頼の SQL が待っている。呼び出し側は期限で去り、外側の
+    /// `Writer` を全て drop しても、始まった SQL・後始末・接続の close が終わるまで持ち物は手放されない。
+    #[test]
+    fn held_value_outlives_every_outer_writer_until_the_started_job_and_close_finish() {
+        let dir = TempDir::new("writer-held-stuck");
+        let path = prepared_db(&dir);
+        let (probe, dropped) = probe(&path);
+        let w = Writer::open_held(&path, OpenMode::MustExist, probe).unwrap();
+
+        // 別の接続が書き込みを握る（writer の INSERT は busy で待つ）
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let waiter = {
+            let w = w.clone();
+            thread::spawn(move || {
+                w.call_within(Instant::now() + Duration::from_millis(150), move |c| {
+                    started_tx.send(()).unwrap();
+                    c.execute("INSERT INTO t(v) VALUES ('stuck')", [])?;
+                    // blocker の接続を閉じ終えるまで、依頼を終えない（close の順序を固定する）
+                    let _ = proceed_rx.recv();
+                    Ok(())
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+        assert!(matches!(waiter.join().unwrap(), Err(WriteError::Expired)));
+        drop(w);
+        // 外側が全ていなくなっても、SQL は待ったまま: 持ち物は手放されていない
+        assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+
+        // 解放: 元の SQL が終わる。ここから先も、依頼・後始末・close が済むまでは手放されない
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        proceed_tx.send(()).unwrap();
+        let wal_left = dropped.recv_timeout(SETTLE).unwrap();
+        assert!(!wal_left, "接続を閉じ終わる前に持ち物を手放した");
+        let check = Connection::open(&path).unwrap();
+        let n: i64 = check
+            .query_row("SELECT COUNT(*) FROM t", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "始まっていた依頼は最後まで確定する");
+    }
+
+    /// パニックした依頼を含めて、全ての `Writer` が drop されるまでは持ち続け、drop のあと接続を閉じてから手放す。
+    #[test]
+    fn held_value_is_kept_while_any_writer_lives_and_released_after_close() {
+        let dir = TempDir::new("writer-held-normal");
+        let path = prepared_db(&dir);
+        let (probe, dropped) = probe(&path);
+        let w = Writer::open_held(&path, OpenMode::MustExist, probe).unwrap();
+        w.call(|c| c.execute("INSERT INTO t(v) VALUES ('a')", []))
+            .unwrap();
+        let w2 = w.clone();
+        assert!(w.call::<(), _>(|_| panic!("job")).is_err());
+        drop(w);
+        w2.call(|c| c.execute("INSERT INTO t(v) VALUES ('b')", []))
+            .unwrap();
+        assert!(matches!(dropped.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        drop(w2);
+        assert!(!dropped.recv_timeout(SETTLE).unwrap());
+    }
+
+    /// 後始末の失敗でスレッドが止まる経路でも、接続を閉じてから持ち物を手放す（キューに残った依頼は実行されない）。
+    #[test]
+    fn held_value_is_released_after_close_when_cleanup_stops_the_writer() {
+        let dir = TempDir::new("writer-held-cleanup");
+        let path = prepared_db(&dir);
+        let (probe, dropped) = probe(&path);
+        let w = Writer::spawn_with(
+            open_read_write(&path, OpenMode::MustExist).unwrap(),
+            |_| false,
+            probe,
+        );
+        let err = w
+            .call(|c| c.execute("INSERT INTO t(v) VALUES ('a')", []))
+            .unwrap_err();
+        assert!(matches!(err, WriteError::Task(_)), "{err:?}");
+        // `w` はまだ生きているが、スレッドは止まって持ち物を手放す
+        assert!(!dropped.recv_timeout(SETTLE).unwrap());
+        drop(w);
+    }
+
+    /// 書き込みスレッド自身がパニックしても（巻き戻しで）接続の close のあとに手放す。
+    #[test]
+    fn held_value_is_released_after_close_when_the_writer_thread_panics() {
+        let dir = TempDir::new("writer-held-panic");
+        let path = prepared_db(&dir);
+        let (probe, dropped) = probe(&path);
+        let w = Writer::spawn_with(
+            open_read_write(&path, OpenMode::MustExist).unwrap(),
+            |_| panic!("cleanup"),
+            probe,
+        );
+        assert!(
+            w.call(|c| c.execute("INSERT INTO t(v) VALUES ('a')", []))
+                .is_err()
+        );
+        assert!(!dropped.recv_timeout(SETTLE).unwrap());
+        drop(w);
+    }
+
+    /// 接続を開けなかったときは、スレッドを作らずその場で手放す。
+    #[test]
+    fn held_value_is_dropped_when_the_open_fails() {
+        let dir = TempDir::new("writer-held-open");
+        let path = dir.path().join("none.db");
+        let (probe, dropped) = probe(&path);
+        assert!(Writer::open_held(&path, OpenMode::MustExist, probe).is_err());
+        assert!(dropped.try_recv().is_ok());
     }
 }

@@ -544,6 +544,58 @@ pub fn decode_luma(bytes: &[u8]) -> Result<Luma, ImageError> {
     })
 }
 
+/// AI へ渡す RGB 画素だけ。元の圧縮データ・EXIF・ICC は含まない。
+pub struct DecisionRgb {
+    pub width: u32,
+    pub height: u32,
+    pub pixels: Vec<u8>,
+}
+
+/// 表示画像を Decision 用に準備する。derivative は既に向き適用済み、直接表示原本だけ EXIF を一度適用する。
+/// 手動 rotation は display に反映済みなので、ここでは受け取らない。長辺 1536 / 面積 1.6MP、縮小のみ。
+pub fn prepare_decision_rgb(bytes: &[u8], apply_exif: bool) -> Result<DecisionRgb, ImageError> {
+    prepare_ai_rgb(bytes, apply_exif, 1536)
+}
+
+/// Same decode/orientation/sRGB pipeline, embedding's fixed 768px limit.
+pub fn prepare_embedding_rgb(bytes: &[u8], apply_exif: bool) -> Result<DecisionRgb, ImageError> {
+    prepare_ai_rgb(bytes, apply_exif, 768)
+}
+
+fn prepare_ai_rgb(bytes: &[u8], apply_exif: bool, longest: u32) -> Result<DecisionRgb, ImageError> {
+    if bytes.len() as u64 > MAX_INPUT_BYTES {
+        return Err(ImageError::FileTooLarge);
+    }
+    let (_, decoded) = decode_any(bytes)?;
+    let w = decoded.raster.width;
+    let h = decoded.raster.height;
+    let scale = (f64::from(longest) / f64::from(w.max(h)))
+        .min((1_600_000.0 / (f64::from(w) * f64::from(h))).sqrt())
+        .min(1.0);
+    let dims = (
+        (f64::from(w) * scale).floor().max(1.0) as u32,
+        (f64::from(h) * scale).floor().max(1.0) as u32,
+    );
+    let mut raster = resize(decoded.raster, dims)?;
+    if let Some(profile) = decoded.icc
+        && raster.channels == 3
+    {
+        // render と同じく不正な ICC は捨てる。自由文のエラーを外へ出さない。
+        to_srgb(&mut raster, &profile);
+    }
+    if apply_exif {
+        raster = orient(raster, orientation_of(decoded.orientation))?;
+    }
+    if raster.channels == 1 {
+        raster.data = raster.data.iter().flat_map(|&v| [v, v, v]).collect();
+    }
+    Ok(DecisionRgb {
+        width: raster.width,
+        height: raster.height,
+        pixels: raster.data,
+    })
+}
+
 /// バイト列から derivative の JPEG を作る。`rotation` は時計回りの角度（0・90・180・270。負・360 超は剰余）。
 pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
     // ファイルから読む経路は [`read_limited`] が見るが、バイト列を直接渡す呼び出しにも同じ上限をかける

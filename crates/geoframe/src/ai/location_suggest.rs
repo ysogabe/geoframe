@@ -1,0 +1,486 @@
+//! 日候補の固定 domain・有償回答 repository・本番 handler / 別座標化（T4.6c1/c2）。
+//! writer 内では DB のみを読み、画像準備・ファイル観測は呼出し側で行う。
+use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+
+use super::cloud::GenerateRequest;
+use super::image_input::PreparedImage;
+use super::jobs::{JobKey, JobKind};
+pub use super::location_clue::SourceObservation;
+use super::location_clue::{self, Generation, Readiness, Target};
+use crate::datadir::DataDir;
+
+mod answer;
+mod repository;
+mod runtime;
+pub use answer::{Answer, Confidence, PhotoAnswer, Precision};
+use repository::row_snapshot;
+pub use repository::{
+    CandidateFilter, Lookup, Queue, SavedAnswer, complete, enqueue, enqueue_in, lookup,
+    persist_answer, project_failure, restore_projection, saved_sent_ids,
+};
+pub(super) use repository::{SCHEMA, TABLES};
+pub(super) use runtime::handlers;
+pub use runtime::hold_counts;
+#[cfg(test)]
+mod tests;
+
+pub const PROMPT_VERSION: &str = "loc-v2";
+pub const PROCESS_VERSION: &str = "location-suggest-v1";
+pub const MAX_SEND: usize = 6;
+const MAX_MEMBERS: usize = 16_384;
+const MAX_MANIFEST_BYTES: usize = 4 * 1024 * 1024;
+pub const PROMPT: &str = include_str!("location_suggest/prompt.txt");
+
+pub fn schema() -> serde_json::Value {
+    serde_json::from_str(include_str!("location_suggest/schema.json")).expect("fixed schema")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DomainError {
+    InvalidInput,
+    Pending,
+    NoImages,
+    BadResponse,
+    TooLarge,
+}
+
+fn sha(bytes: &[u8]) -> String {
+    ring::digest::digest(&ring::digest::SHA256, bytes)
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+fn encoded<T: Serialize>(v: &T) -> String {
+    serde_json::to_string(v).expect("bounded domain")
+}
+fn valid_hash(v: &str) -> bool {
+    v.len() == 64
+        && v.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+pub fn run_id_for(model: &str, sent_ids: &[i64]) -> String {
+    run_id_with_prompt(PROMPT_VERSION, model, sent_ids)
+}
+fn run_id_with_prompt(prompt: &str, model: &str, sent_ids: &[i64]) -> String {
+    let mut ids = sent_ids.to_vec();
+    ids.sort_unstable();
+    let ids = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    format!(
+        "loc-{}",
+        &sha(format!("{prompt}|{model}|{ids}").as_bytes())[..16]
+    )
+}
+pub fn processor_version(model: &str) -> String {
+    sha(format!(
+        "{model}\0{PROMPT_VERSION}\0{PROCESS_VERSION}\0{}",
+        location_clue::PREPROCESS_VERSION
+    )
+    .as_bytes())
+}
+
+/// cloud 許可範囲の一つの時刻集合。写真情報は Debug に出さない。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Day {
+    day: String,
+    members: Vec<Generation>,
+    sent_ids: Vec<i64>,
+    pending: bool,
+    gap_s: f64,
+    include_hidden: bool,
+    visibility: Vec<(i64, bool)>,
+}
+impl std::fmt::Debug for Day {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Day(..)")
+    }
+}
+impl Day {
+    pub fn date(&self) -> &str {
+        &self.day
+    }
+    pub fn members(&self) -> &[Generation] {
+        &self.members
+    }
+    pub fn sent_ids(&self) -> &[i64] {
+        &self.sent_ids
+    }
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+    pub fn sendable(&self) -> bool {
+        !self.pending && !self.sent_ids.is_empty()
+    }
+    /// 短い writer transaction 用。集合への追加/削除/SAVE と全構成員の世代を照合。
+    pub fn matches_db(&self, conn: &Connection) -> rusqlite::Result<bool> {
+        let groups = db_groups(conn, self.include_hidden, self.gap_s)?;
+        let ids: Vec<i64> = self.members.iter().map(Generation::photo_id).collect();
+        if !groups
+            .iter()
+            .any(|g| g[0].1 == self.day && g.iter().map(|p| p.0).eq(ids.iter().copied()))
+        {
+            return Ok(false);
+        }
+        for g in &self.members {
+            if !g.matches_db(conn)? {
+                return Ok(false);
+            }
+        }
+        for (id, hidden) in &self.visibility {
+            let current: bool = conn.query_row(
+                "SELECT COALESCE(hidden,0)!=0 FROM photos WHERE id=?1",
+                [id],
+                |r| r.get(0),
+            )?;
+            if current != *hidden {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+// 日付文字列は Python と同じ taken_at[:10]（時差の UTC 日へ丸めない）。
+fn split<T>(mut rows: Vec<(i64, String, i64, T)>, gap: f64) -> Vec<Vec<(i64, String, i64, T)>> {
+    rows.sort_by_key(|p| (p.2, p.0));
+    let mut groups: Vec<Vec<(i64, String, i64, T)>> = Vec::new();
+    for p in rows {
+        if groups
+            .last()
+            .is_none_or(|g| (p.2 as f64 - g.last().unwrap().2 as f64) > gap || p.1 != g[0].1)
+        {
+            groups.push(Vec::new());
+        }
+        groups.last_mut().unwrap().push(p);
+    }
+    groups
+}
+type DbGroup = Vec<(i64, String, i64, ())>;
+fn db_groups(conn: &Connection, hidden: bool, gap: f64) -> rusqlite::Result<Vec<DbGroup>> {
+    let mut stmt = conn.prepare(
+        "SELECT id,taken_at FROM photos WHERE lat IS NULL AND (?1 OR COALESCE(hidden,0)=0)",
+    )?;
+    let mut out = Vec::new();
+    for r in stmt.query_map([hidden], |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
+    })? {
+        let (id, t) = r?;
+        if let Some(t) = t
+            && let Some(e) = crate::photos::parse_epoch(&t)
+        {
+            out.push((id, t.chars().take(10).collect(), e, ()));
+        }
+    }
+    Ok(split(out, gap))
+}
+
+/// load_targets の全写真から hidden を独立除外してから group/pick する。
+/// infer_windows_s は Config::infer_windows_s() を渡す。外部 I/O は fallback 観測のみ。
+pub fn group_days(
+    conn: &Connection,
+    data: &DataDir,
+    targets: Vec<Target>,
+    include_hidden: bool,
+    infer_windows_s: &[f64],
+) -> Result<Vec<Day>, DomainError> {
+    let gap = infer_windows_s
+        .iter()
+        .copied()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .max_by(f64::total_cmp)
+        .ok_or(DomainError::InvalidInput)?;
+    if infer_windows_s.iter().any(|v| !v.is_finite() || *v < 0.0) {
+        return Err(DomainError::InvalidInput);
+    }
+    let mut rows = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for t in targets {
+        if !seen.insert(t.photo_id) {
+            return Err(DomainError::InvalidInput);
+        }
+        let hidden: bool = conn
+            .query_row(
+                "SELECT COALESCE(hidden,0)!=0 FROM photos WHERE id=?1",
+                [t.photo_id],
+                |r| r.get(0),
+            )
+            .map_err(|_| DomainError::InvalidInput)?;
+        if hidden && !include_hidden {
+            continue;
+        }
+        let generation = Generation::observe(conn, data, t.photo_id)
+            .map_err(|_| DomainError::InvalidInput)?
+            .ok_or(DomainError::InvalidInput)?;
+        // A changed target is not promoted to a fresh Ready clue.
+        if !generation.matches_target(&t.key) {
+            return Err(DomainError::InvalidInput);
+        }
+        rows.push((
+            t.photo_id,
+            t.taken_at.chars().take(10).collect(),
+            t.epoch,
+            (generation, t.readiness),
+        ));
+    }
+    let mut days = Vec::new();
+    for group in split(rows, gap) {
+        if group.len() > MAX_MEMBERS {
+            return Err(DomainError::InvalidInput);
+        }
+        let pending = group.iter().any(|p| p.3.1 == Readiness::Pending);
+        let mut passing: Vec<_> = group
+            .iter()
+            .filter_map(|p| match &p.3.1 {
+                Readiness::Ready(c) if c.passes() => Some((p.0, c)),
+                _ => None,
+            })
+            .collect();
+        passing.sort_by(|a, b| {
+            (a.1.kind() != "landmark")
+                .cmp(&(b.1.kind() != "landmark"))
+                .then_with(|| b.1.score().total_cmp(&a.1.score()))
+                .then(a.0.cmp(&b.0))
+        });
+        let sent_ids = passing.into_iter().take(MAX_SEND).map(|p| p.0).collect();
+        let visibility = group
+            .iter()
+            .map(|p| {
+                conn.query_row(
+                    "SELECT COALESCE(hidden,0)!=0 FROM photos WHERE id=?1",
+                    [p.0],
+                    |r| Ok((p.0, r.get(0)?)),
+                )
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|_| DomainError::InvalidInput)?;
+        days.push(Day {
+            day: group[0].1.clone(),
+            members: group.into_iter().map(|p| p.3.0).collect(),
+            sent_ids,
+            pending,
+            gap_s: gap,
+            include_hidden,
+            visibility,
+        });
+    }
+    Ok(days)
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct Sent {
+    photo_id: i64,
+    source_sha256: String,
+    jpeg_sha256: String,
+}
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+struct Manifest {
+    day: String,
+    model: String,
+    prompt_version: String,
+    processor_version: String,
+    members: Vec<Generation>,
+    sent: Vec<Sent>,
+}
+/// ジョブの同一性: 送信 JPEG の SHA を除いた計画。JPEG は元画像の SHA と処理版（`PREPROCESS_VERSION` を含む）から
+/// 決まるので、画像を作らなくても同じ入力は同じ値になる（キーを作るために日ごとの画像のデコードをしない）。
+#[derive(Serialize)]
+struct PlanIdentity<'a> {
+    day: &'a str,
+    model: &'a str,
+    prompt_version: &'a str,
+    processor_version: &'a str,
+    members: &'a [Generation],
+    sent: Vec<(i64, &'a str)>,
+}
+impl PlanIdentity<'_> {
+    fn hash(&self) -> String {
+        sha(encoded(self).as_bytes())
+    }
+}
+impl Manifest {
+    /// ジョブの `input_hash`。履歴の `result_key`（JPEG の SHA を含む）とは別物。
+    fn plan_hash(&self) -> String {
+        PlanIdentity {
+            day: &self.day,
+            model: &self.model,
+            prompt_version: &self.prompt_version,
+            processor_version: &self.processor_version,
+            members: &self.members,
+            sent: self
+                .sent
+                .iter()
+                .map(|s| (s.photo_id, s.source_sha256.as_str()))
+                .collect(),
+        }
+        .hash()
+    }
+    fn result_key(&self) -> String {
+        sha(encoded(self).as_bytes())
+    }
+    fn sent_ids(&self) -> Vec<i64> {
+        self.sent.iter().map(|s| s.photo_id).collect()
+    }
+    fn run_id(&self) -> String {
+        run_id_with_prompt(&self.prompt_version, &self.model, &self.sent_ids())
+    }
+}
+
+/// c2 が writer 外で source SHA を検査して用意する入力。画像の入口は PreparedImage のみ。
+pub struct SendImage {
+    pub photo_id: i64,
+    pub source_sha256: String,
+    pub image: PreparedImage,
+}
+/// 送る日の計画（画像を作る前）。ジョブのキーはこれだけで決まる。画像の準備は [`Intent::plan`] が送る直前に行う。
+#[derive(Clone)]
+pub struct Intent {
+    day: Day,
+    model: String,
+    key: JobKey,
+}
+impl std::fmt::Debug for Intent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Intent(..)")
+    }
+}
+impl Intent {
+    pub fn new(day: Day, model: &str) -> Result<Self, DomainError> {
+        if day.pending {
+            return Err(DomainError::Pending);
+        }
+        if day.sent_ids.is_empty() {
+            return Err(DomainError::NoImages);
+        }
+        if model.is_empty() || model.len() > 256 || model.chars().any(char::is_control) {
+            return Err(DomainError::InvalidInput);
+        }
+        let sent = day
+            .sent_ids
+            .iter()
+            .map(|id| {
+                day.members
+                    .iter()
+                    .find(|g| g.photo_id() == *id)
+                    .and_then(Generation::source_sha256)
+                    .filter(|sha| valid_hash(sha))
+                    .map(|sha| (*id, sha))
+                    .ok_or(DomainError::InvalidInput)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let processor = processor_version(model);
+        let key = JobKey::new(
+            JobKind::LocationSuggest,
+            run_id_for(model, &day.sent_ids),
+            PlanIdentity {
+                day: &day.day,
+                model,
+                prompt_version: PROMPT_VERSION,
+                processor_version: &processor,
+                members: &day.members,
+                sent,
+            }
+            .hash(),
+            &processor,
+        );
+        Ok(Self {
+            day,
+            model: model.into(),
+            key,
+        })
+    }
+    pub fn key(&self) -> JobKey {
+        self.key.clone()
+    }
+    pub fn day(&self) -> &Day {
+        &self.day
+    }
+    pub fn sent_ids(&self) -> Vec<i64> {
+        self.day.sent_ids.clone()
+    }
+    pub fn matches_db(&self, conn: &Connection) -> rusqlite::Result<bool> {
+        self.day.matches_db(conn)
+    }
+    /// 準備した画像から送信計画を作る。画像は `sent_ids` の順で、元画像の SHA が世代と一致していること。
+    pub fn plan(self, images: Vec<SendImage>) -> Result<Plan, DomainError> {
+        if !images
+            .iter()
+            .map(|i| i.photo_id)
+            .eq(self.day.sent_ids.iter().copied())
+        {
+            return Err(DomainError::InvalidInput);
+        }
+        let mut sent = Vec::new();
+        let mut numbered = Vec::new();
+        for (n, i) in images.into_iter().enumerate() {
+            if !valid_hash(&i.source_sha256)
+                || !self.day.members.iter().any(|g| {
+                    g.photo_id() == i.photo_id && g.source_sha256() == Some(&i.source_sha256)
+                })
+            {
+                return Err(DomainError::InvalidInput);
+            }
+            sent.push(Sent {
+                photo_id: i.photo_id,
+                source_sha256: i.source_sha256,
+                jpeg_sha256: i.image.sha256(),
+            });
+            numbered.push(((n + 1) as u32, i.image));
+        }
+        let request = GenerateRequest::location_suggest(
+            &PROMPT.replace("{date}", &self.day.day),
+            &schema(),
+            &numbered,
+        )
+        .map_err(|e| match e {
+            super::cloud::RequestError::TooLarge => DomainError::TooLarge,
+            _ => DomainError::InvalidInput,
+        })?;
+        let manifest = Manifest {
+            day: self.day.day.clone(),
+            model: self.model.clone(),
+            prompt_version: PROMPT_VERSION.into(),
+            processor_version: processor_version(&self.model),
+            members: self.day.members.clone(),
+            sent,
+        };
+        if encoded(&manifest).len() > MAX_MANIFEST_BYTES {
+            return Err(DomainError::InvalidInput);
+        }
+        debug_assert_eq!(manifest.plan_hash(), self.key.input_hash);
+        Ok(Plan {
+            intent: self,
+            manifest,
+            request,
+        })
+    }
+}
+
+/// 実送信画像 SHA と番号順まで固定された計画。URL/timeout/policy 全体を同一性へ混ぜない。
+/// ジョブのキー・照合は [`Intent`] のもの（`Deref`）。
+#[derive(Clone)]
+pub struct Plan {
+    intent: Intent,
+    manifest: Manifest,
+    request: GenerateRequest,
+}
+impl std::ops::Deref for Plan {
+    type Target = Intent;
+    fn deref(&self) -> &Intent {
+        &self.intent
+    }
+}
+impl std::fmt::Debug for Plan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Plan(..)")
+    }
+}
+impl Plan {
+    pub fn new(day: Day, model: &str, images: Vec<SendImage>) -> Result<Self, DomainError> {
+        Intent::new(day, model)?.plan(images)
+    }
+    pub fn request(&self) -> &GenerateRequest {
+        &self.request
+    }
+}

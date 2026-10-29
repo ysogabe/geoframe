@@ -1,8 +1,10 @@
 //! `GET /api/v1/photos` の中身: DB から写真を選び、並べ、タイトルと旅番号を付ける（T1.2）。
 //!
 //! 現行 Python の `app/geoframe/photos.py:api_photos` / `assign_trips` を、同じ行・同じ並び・同じ
-//! 値になるように移したもの。SQL（品質・AI の JOIN と表示条件）は文字列まで同じで、違うのは
-//! `ORDER BY` が `taken_at` の NULL を空文字として扱う点だけ（[`feed`] のモジュール説明）。
+//! 値になるように移したもの。SQL（品質・AI の JOIN と表示条件）は、`ORDER BY` が `taken_at` の NULL を
+//! 空文字として扱う点（[`feed`] のモジュール説明）と、旧 AI 選別の抑止条件（`AI_VISIBLE`）を除いて同じ。
+//! 抑止条件は P4 / T4.3 で安全にした意図した差で、メンバーの世代と、表示可能な推薦写真が同じグループに
+//! あることを検査する（[`crate::selection`]）。管理画面の集計と同じ SQL を共有する。
 //! 応答の型は [`crate::feed::Photo`]。
 //!
 //! # 同順位（同じ `taken_at`）の並び
@@ -48,10 +50,6 @@ LEFT JOIN photo_ai_groups aig ON aig.group_id=aim.group_id";
 const AI_COLUMNS: &str = "aig.group_id AS ai_group, aig.status AS ai_status,
   aig.same_scene AS ai_same_scene, aim.rank_in_group AS ai_rank,
   aim.recommended AS ai_recommended, aim.local_score AS ai_local_score";
-/// 完成済みかつ同一場面と確認されたグループだけを絞る。favorite は常に利用者の明示選択を優先。
-const AI_VISIBLE: &str = "(aig.group_id IS NULL OR aig.status!='judged' OR aig.same_scene!=1
-  OR aim.recommended=1 OR COALESCE(p.favorite,0)=1)";
-
 /// 旅を区切る間隔。これを**超える**空きで次の旅になる（ちょうど48時間は同じ旅）。
 const TRIP_GAP_SECONDS: i64 = 48 * 3600;
 
@@ -59,6 +57,8 @@ const TRIP_GAP_SECONDS: i64 = 48 * 3600;
 pub fn list_photos(conn: &Connection) -> rusqlite::Result<Vec<Photo>> {
     // Python の `p.*` の代わりに使う列だけを並べる（行と並びは同じ）。ORDER BY の
     // `COALESCE(p.taken_at,'')` は NULL を空文字として最後に回すための唯一の違い。
+    // 旧選別の抑止条件。メンバーの世代と表示可能な推薦写真の存在を検査する（[`crate::selection`]）
+    let ai_visible = crate::selection::ai_visible();
     let sql = format!(
         "SELECT p.id, p.fetched_at, p.favorite, p.display, p.name, p.title, p.lat, p.lon,
                 p.taken_at, p.place, p.pref, p.city, p.elev, p.loc_source,
@@ -66,7 +66,7 @@ pub fn list_photos(conn: &Connection) -> rusqlite::Result<Vec<Photo>> {
          {QUALITY_JOIN}
          {AI_JOIN}
          WHERE p.lat IS NOT NULL AND p.display IS NOT NULL
-           AND COALESCE(p.hidden,0)=0 AND {QUALITY_VISIBLE} AND {AI_VISIBLE}
+           AND COALESCE(p.hidden,0)=0 AND {QUALITY_VISIBLE} AND {ai_visible}
          ORDER BY CASE WHEN COALESCE(p.taken_at,'')='' THEN 1 ELSE 0 END, COALESCE(p.taken_at,'')"
     );
     let mut stmt = conn.prepare(&sql)?;

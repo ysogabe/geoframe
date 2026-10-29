@@ -169,9 +169,20 @@ fn dry_run_writes_nothing_and_reports_counts() {
     let stdout = text(&out.stdout);
     assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
     assert!(stdout.contains("dry-run: 何も書きません"), "{stdout}");
+    let local_plan = run(
+        &["sync", "--dry-run", "--data-dir", data.to_str().unwrap()],
+        &[
+            ("GEOFRAME_INGEST", "1"),
+            ("GEOFRAME_DRIVE_KEY", missing_key.to_str().unwrap()),
+        ],
+    );
+    assert!(local_plan.status.success());
+    assert!(text(&local_plan.stdout).contains("スキーマ: 作る表・索引 13 / 足す列 0"));
+    assert_eq!(snapshot(data), before);
+
     assert!(
         stdout.contains(
-            "スキーマ: 作る表・索引 0 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
+            "スキーマ: 作る表・索引 10 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
         ),
         "{stdout}"
     );
@@ -308,7 +319,8 @@ fn sync_with_ingest_creates_the_database_and_runs_one_cycle() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 11);
+    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・`ai_embedding_spaces`・`ai_embedding_vectors`
+    assert_eq!(tables, 22);
 }
 
 #[test]
@@ -320,7 +332,12 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     envs.push(("GEOFRAME_INGEST", "1".into()));
     let out = run_owned(&["sync", "--data-dir", dir.0.to_str().unwrap()], &envs);
     assert!(out.status.success(), "{}", text(&out.stdout));
-    assert!(text(&out.stdout).contains("スキーマは最新です"));
+    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表）だけ。ほかの表・列は変えない
+    assert!(
+        text(&out.stdout).contains("スキーマを更新しました: 作成 13件 / 列の追加 0件"),
+        "{}",
+        text(&out.stdout)
+    );
     let conn = rusqlite::Connection::open(dir.0.join("catalog.db")).unwrap();
     let null_places: i64 = conn
         .query_row("SELECT COUNT(*) FROM photos WHERE place IS NULL", [], |r| {
@@ -354,10 +371,17 @@ fn free_port() -> u16 {
 }
 
 fn get_healthz(port: u16) -> Option<String> {
+    get(port, "/healthz")
+}
+
+fn get(port: u16, path: &str) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
     stream
-        .write_all(b"GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .write_all(
+            format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .as_bytes(),
+        )
         .ok()?;
     let mut body = String::new();
     stream.read_to_string(&mut body).ok()?;
@@ -365,6 +389,16 @@ fn get_healthz(port: u16) -> Option<String> {
 }
 
 fn serve(data: &Path, port: u16, ingest: Option<(&str, &Staging)>) -> Child {
+    serve_with_env(data, port, ingest, &[])
+}
+
+/// `extra` は追加の環境変数（AI の設定など）。
+fn serve_with_env(
+    data: &Path,
+    port: u16,
+    ingest: Option<(&str, &Staging)>,
+    extra: &[(&str, &str)],
+) -> Child {
     let mut command = Command::new(BIN);
     command
         .args(["serve", "--listen", &format!("127.0.0.1:{port}")])
@@ -375,6 +409,7 @@ fn serve(data: &Path, port: u16, ingest: Option<(&str, &Staging)>) -> Child {
     if let Some((value, staging)) = ingest {
         command.env("GEOFRAME_INGEST", value).envs(staging.envs());
     }
+    command.envs(extra.iter().copied());
     command.spawn().unwrap()
 }
 
@@ -427,6 +462,64 @@ fn serve_without_ingest_stays_read_only() {
     assert!(stdout.contains("ingest=0"), "{stdout}");
     // 既定では書かない: tmp/・ロックのファイルも作らず、DB もそのまま
     assert_eq!(snapshot(&dir.0), before);
+}
+
+/// `INGEST=0` では AI の回収・表の作成・Provider 停止の整理を一切しない（旧 DB 全行不変）。AI の設定が有効で、
+/// `running` のジョブと今の設定に当たらない停止が残っていても、そのまま。
+#[test]
+fn serve_without_ingest_never_reclaims_creates_or_releases_anything_for_ai() {
+    let dir = Dir::new("serve-ro-ai");
+    let data = data_with_ai_rows(&dir);
+    {
+        let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+        conn.execute_batch(
+            "UPDATE ai_jobs SET state='running', run_id='old-run', claim_token='old-token'
+             WHERE kind='location_clue'",
+        )
+        .unwrap();
+    }
+    let ai = dir.0.join("ai.json");
+    fs::write(
+        &ai,
+        r#"{"version":1,"local_base_url":"http://192.0.2.10:8100",
+            "tasks":{"location_clue":{"provider":"local","model":"example-decision"}}}"#,
+    )
+    .unwrap();
+    let before = snapshot(&data);
+    let port = free_port();
+    let mut child = serve_with_env(
+        &data,
+        port,
+        None,
+        &[("GEOFRAME_AI_CONFIG", ai.to_str().unwrap())],
+    );
+    wait_healthy(&mut child, port);
+    let (status, stdout) = terminate(child);
+    assert!(status.success(), "{stdout}");
+    assert!(!stdout.contains("背景ワーカー"), "{stdout}");
+    assert_eq!(snapshot(&data), before, "INGEST=0 は DB の全行を変えない");
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    let running: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM ai_jobs WHERE state='running'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let pauses: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ai_provider_pauses", [], |r| r.get(0))
+        .unwrap();
+    let runs: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='ai_worker_runs'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!((running, pauses), (1, 1));
+    // data_with_ai_rows が足した表の一覧には ai_worker_runs もある（migrate の結果）。serve は増減させない
+    assert_eq!(runs, 1);
+    assert!(!data.join(".ingest.lock").exists());
 }
 
 /// 取り込みが無効（既定）でも、地図タイルのキャッシュは掃除する（B4。同期サイクルは動かないので、サーバー側の
@@ -515,6 +608,164 @@ fn serve_with_ingest_creates_the_database_runs_the_cycle_and_stops_cleanly() {
     assert!(!stdout.contains(".cache.json"), "{stdout}");
 }
 
+/// 目印（ログに出てはいけない文字列）を入れた、不正な AI 設定ファイルを置く。
+const AI_SENTINEL_KEY: &str = "sentinel-key-4c1f";
+const AI_SENTINEL_VALUE: &str = "sentinel-value-93ab";
+
+fn broken_ai_config(dir: &Dir, body: &str) -> PathBuf {
+    let path = dir.0.join("sentinel-ai-path-5e72.json");
+    fs::write(&path, body).unwrap();
+    path
+}
+
+/// AI の設定が不正でも（JSON・旧環境変数の数値のどちらでも）、写真の配信は動く: 起動して `/healthz` と
+/// フィード（`/api/v1/photos`）に答え、ログには種類のコードだけが出る（パス・中身・値は出ない）。
+/// 取り込みが無効なので DB にも書かない。
+#[test]
+fn serve_with_a_broken_ai_config_still_serves_health_and_the_feed() {
+    type LegacyEnv = Option<(&'static str, &'static str)>;
+    let cases: [(&str, &str, LegacyEnv); 5] = [
+        // (本文, 期待するコード, 追加の旧環境変数)
+        (
+            r#"{"version":1,"sentinel-key-4c1f":"sentinel-value-93ab"}"#,
+            "unknown_key",
+            None,
+        ),
+        (
+            r#"{"version":1,"version":1,"x":"sentinel-value-93ab"}"#,
+            "duplicate_key",
+            None,
+        ),
+        (
+            r#"{"version":1 "sentinel-key-4c1f":"sentinel-value-93ab""#,
+            "syntax",
+            None,
+        ),
+        // JSON は正しくても、旧設定の数値が不正なら AI だけ無効
+        (
+            r#"{"version":1}"#,
+            "legacy_env",
+            Some(("GEOFRAME_AI_POLL_S", "sentinel-value-93ab")),
+        ),
+        (
+            r#"{"version":1}"#,
+            "legacy_env",
+            Some(("GEOFRAME_AI_VISUAL_SIMILARITY", AI_SENTINEL_VALUE)),
+        ),
+    ];
+    for (n, (body, code, legacy)) in cases.into_iter().enumerate() {
+        let dir = Dir::new(&format!("serve-ai-broken-{n}"));
+        production_shaped_db(&dir.0);
+        let config = broken_ai_config(&dir, body);
+        let before = snapshot(&dir.0);
+        let mut extra = vec![("GEOFRAME_AI_CONFIG", config.to_str().unwrap())];
+        extra.extend(legacy);
+        if legacy.is_some_and(|(key, _)| key == "GEOFRAME_AI_VISUAL_SIMILARITY") {
+            extra.push(("GEOFRAME_AI_ENABLED", "0"));
+        }
+        let port = free_port();
+        let mut child = serve_with_env(&dir.0, port, None, &extra);
+        wait_healthy(&mut child, port);
+        let feed = get(port, "/api/v1/photos").expect("フィードに答えない");
+        assert!(feed.starts_with("HTTP/1.1 200"), "{code}: {feed}");
+        assert!(
+            feed.contains("\"file\":\"derivatives/a.jpg\""),
+            "{code}: {feed}"
+        );
+        let (status, stdout) = terminate(child);
+        assert!(status.success(), "{stdout}");
+        assert!(
+            stdout.contains(&format!("ai=invalid:{code}")),
+            "{code}: {stdout}"
+        );
+        assert!(
+            stdout.contains(&format!("AI の設定が不正です（種類: {code}）")),
+            "{code}: {stdout}"
+        );
+        for secret in [AI_SENTINEL_KEY, AI_SENTINEL_VALUE, "sentinel-ai-path-5e72"] {
+            assert!(!stdout.contains(secret), "{code}: {stdout}");
+        }
+        assert_eq!(snapshot(&dir.0), before, "{code}");
+    }
+}
+
+/// 取り込みが有効なときも、不正な AI 設定で起動は止まらない。追加の AI 表（送信予算・Provider 停止）は
+/// 取り込みの起動で足され、2 回目の起動では何も作らない。有効な設定は起動時にネットワーク・認証ファイル
+/// （ここでは存在しないパス）に触れず、予約アドレスの入口・クラウド許可があっても起動する。
+#[test]
+fn serve_with_ingest_adds_the_ai_tables_once_and_never_needs_the_network_or_credentials() {
+    let dir = Dir::new("serve-ai-ingest");
+    let data = dir.0.join("data");
+    let staging = Staging::new("serve-ai-ingest");
+    let valid = dir.0.join("ai-valid.json");
+    fs::write(
+        &valid,
+        format!(
+            r#"{{"version":1,"local_base_url":"http://192.0.2.10:8100","tasks":{{
+              "location_clue":{{"provider":"local","model":"example-decision"}},
+              "photo_judge":{{"provider":"cloud","model":"example-judge","allow_cloud":true,
+                "daily_request_limit":10,"credential_path":"{}/no-such-credentials.json",
+                "project":"example-project","region":"example-region1"}}}}}}"#,
+            dir.0.display()
+        ),
+    )
+    .unwrap();
+    let broken = broken_ai_config(&dir, r#"{"version":"sentinel-value-93ab"}"#);
+
+    for (round, (config, expected)) in [
+        (&valid, "ai=ready:tasks=2"),
+        (&broken, "ai=invalid:bad_value"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let port = free_port();
+        let mut child = serve_with_env(
+            &data,
+            port,
+            Some(("1", &staging)),
+            &[("GEOFRAME_AI_CONFIG", config.to_str().unwrap())],
+        );
+        wait_healthy(&mut child, port);
+        let (status, stdout) = terminate(child);
+        assert!(status.success(), "{stdout}");
+        assert!(stdout.contains(expected), "{stdout}");
+        if round == 0 {
+            assert!(stdout.contains("[db] スキーマを更新しました"), "{stdout}");
+        } else {
+            // 2 回目: AI の表は作らない（何も更新しない）
+            assert!(stdout.contains("[db] スキーマは最新です"), "{stdout}");
+        }
+        for secret in [
+            AI_SENTINEL_VALUE,
+            "no-such-credentials",
+            "192.0.2.10",
+            "example-judge",
+            "example-project",
+            "ai-valid.json",
+        ] {
+            assert!(!stdout.contains(secret), "{stdout}");
+        }
+    }
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    for table in [
+        "ai_jobs",
+        "ai_request_usage",
+        "ai_provider_pauses",
+        "ai_provider_waits",
+        "ai_worker_runs",
+    ] {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                [table],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "{table}");
+    }
+}
+
 #[test]
 fn a_second_ingest_process_on_the_same_data_dir_is_refused() {
     let dir = Dir::new("serve-lock");
@@ -540,6 +791,293 @@ fn a_second_ingest_process_on_the_same_data_dir_is_refused() {
     assert!(dry.status.success(), "{}", text(&dry.stdout));
     let (status, _) = terminate(child);
     assert!(status.success());
+}
+
+/// AI の表（空）と、`failed` のジョブ・Provider 停止の行を持つ本番相当の DB（`geoframe::ai::migrate` で足す）。
+fn data_with_ai_rows(dir: &Dir) -> PathBuf {
+    let data = dir.0.join("ai-data");
+    fs::create_dir_all(&data).unwrap();
+    production_shaped_db(&data);
+    let mut conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    geoframe::ai::migrate(&mut conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,attempts,terminal,
+                             last_error_code,created_at,updated_at) VALUES
+           ('location_clue','SECRET-T1','SECRET-H1','SECRET-P','failed',5,1,'bad_response',1,1),
+           ('photo_judge','SECRET-T2','SECRET-H2','SECRET-P','failed',5,1,'interrupted',1,1),
+           ('image_embedding','SECRET-T3','SECRET-H3','SECRET-P','succeeded',0,0,'',1,1);
+         INSERT INTO ai_provider_pauses(scope,subject,task,reason,created_at)
+           VALUES ('provider','SECRET-SUBJECT','image_embedding','unauthorized',1)",
+    )
+    .unwrap();
+    data
+}
+
+fn ai_job_states(data: &Path) -> Vec<(String, String, i64)> {
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    let mut stmt = conn
+        .prepare("SELECT kind, state, attempts FROM ai_jobs ORDER BY id")
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn ai_jobs_status_is_read_only_prints_only_counts_and_works_on_a_database_without_ai_tables() {
+    let dir = Dir::new("aijobs-status-old");
+    production_shaped_db(&dir.0);
+    let before = snapshot(&dir.0);
+    // 検証環境の印も INGEST も要らない（読み取りだけ）
+    let out = run(
+        &["ai-jobs", "status", "--data-dir", dir.0.to_str().unwrap()],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(stdout.contains("AI 設定: 未指定"), "{stdout}");
+    assert!(stdout.contains("ジョブ: 0 件"), "{stdout}");
+    assert!(stdout.contains("停止中の Provider・用途: なし"), "{stdout}");
+    assert_eq!(snapshot(&dir.0), before);
+    assert!(!dir.0.join(".ingest.lock").exists() && !dir.0.join("tmp").exists());
+    let conn = rusqlite::Connection::open(dir.0.join("catalog.db")).unwrap();
+    let ai_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'ai\\_%' ESCAPE '\\'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ai_tables, 0, "読み取りは AI の表を作らない");
+
+    // 行がある DB: 件数・固定の理由・用途だけ
+    let dir = Dir::new("aijobs-status-rows");
+    let data = data_with_ai_rows(&dir);
+    let before = snapshot(&data);
+    let out = run(
+        &["ai-jobs", "status", "--data-dir", data.to_str().unwrap()],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains("ジョブ location_clue failed: 1 件"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("ジョブ image_embedding succeeded: 1 件"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("理由 failed interrupted: 1 件"), "{stdout}");
+    assert!(
+        stdout.contains("停止中 provider image_embedding: unauthorized"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("SECRET"), "{stdout}");
+    assert_eq!(snapshot(&data), before);
+}
+
+#[test]
+fn ai_jobs_writes_need_ingest_the_guard_and_a_stopped_service() {
+    let dir = Dir::new("aijobs-guard");
+    let data = data_with_ai_rows(&dir);
+    let before = snapshot(&data);
+    let arg = data.to_str().unwrap();
+    // INGEST が無い → 2
+    for args in [
+        &["ai-jobs", "retry", "--all", "--data-dir", arg][..],
+        &["ai-jobs", "release-pause", "--all", "--data-dir", arg],
+    ] {
+        let out = run(args, &[]);
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        assert!(text(&out.stderr).contains("GEOFRAME_INGEST=1"));
+        let out = run(args, &[("GEOFRAME_INGEST", "0")]);
+        assert_eq!(out.status.code(), Some(2));
+    }
+    // INGEST=1 でも、検証環境の印が無ければ書く前に断る → 2
+    let out = run(
+        &["ai-jobs", "retry", "--all", "--data-dir", arg],
+        &[("GEOFRAME_INGEST", "1")],
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_untouched_after_refusal(&data, &before);
+
+    // 稼働中の serve（ロックを持つ）があるときは、印があっても断る → 1。ジョブも停止も変わらない
+    let staging = Staging::new("aijobs-guard");
+    let port = free_port();
+    let mut child = serve(&data, port, Some(("1", &staging)));
+    wait_healthy(&mut child, port);
+    let mut envs = staging.envs();
+    envs.push(("GEOFRAME_INGEST", "1".into()));
+    for args in [
+        &["ai-jobs", "retry", "--all", "--data-dir", arg][..],
+        &["ai-jobs", "release-pause", "--all", "--data-dir", arg],
+    ] {
+        let out = run_owned(args, &envs);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+        assert!(
+            text(&out.stderr).contains("サービスを止めてから"),
+            "{}",
+            text(&out.stderr)
+        );
+    }
+    // 稼働中でも status は読める
+    let status = run(&["ai-jobs", "status", "--data-dir", arg], &[]);
+    assert!(status.status.success());
+    let (stopped, _) = terminate(child);
+    assert!(stopped.success());
+    // serve が起動時に足した行はなく、ジョブは failed のまま
+    assert_eq!(
+        ai_job_states(&data),
+        [
+            ("location_clue".to_string(), "failed".to_string(), 5),
+            ("photo_judge".to_string(), "failed".to_string(), 5),
+            ("image_embedding".to_string(), "succeeded".to_string(), 0),
+        ]
+    );
+}
+
+#[test]
+fn ai_jobs_retry_keeps_what_it_cannot_check_and_release_pause_removes_the_stops() {
+    let dir = Dir::new("aijobs-write");
+    let data = data_with_ai_rows(&dir);
+    let staging = Staging::new("aijobs-write");
+    let mut envs = staging.envs();
+    envs.push(("GEOFRAME_INGEST", "1".into()));
+    let arg = data.to_str().unwrap();
+
+    // 用途別の処理はまだ登録されていない（配布バイナリは空）ので、failed は検査できず保持。成功済みも触れない
+    let out = run_owned(&["ai-jobs", "retry", "--all", "--data-dir", arg], &envs);
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains(
+            "再実行待ちに戻した 0 / 無効にした 0 / 成功済みとした 0 / 検査できず保持（処理が未登録）2 / 検査できず保持（設定で使えない）0"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("SECRET"), "{stdout}");
+    let states = ai_job_states(&data);
+    assert_eq!(states.iter().filter(|(_, s, _)| s == "failed").count(), 2);
+    assert!(
+        states
+            .iter()
+            .all(|(_, _, attempts)| *attempts == 0 || *attempts == 5)
+    );
+
+    // 設定が未指定の用途指定の解除は、停止を特定できないので何も消さない → 2。--all だけが消す
+    let out = run_owned(
+        &[
+            "ai-jobs",
+            "release-pause",
+            "--task",
+            "image_embedding",
+            "--data-dir",
+            arg,
+        ],
+        &envs,
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    let pauses = |data: &Path| -> i64 {
+        rusqlite::Connection::open(data.join("catalog.db"))
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ai_provider_pauses", [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(pauses(&data), 1);
+    let out = run_owned(
+        &["ai-jobs", "release-pause", "--all", "--data-dir", arg],
+        &envs,
+    );
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("停止を解除した: 1 件"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(pauses(&data), 0);
+}
+
+#[test]
+fn serve_with_ingest_and_a_valid_ai_config_records_its_run_and_the_stop_and_exits_cleanly() {
+    let dir = Dir::new("serve-ai-run");
+    let data = dir.0.join("d");
+    let staging = Staging::new("serve-ai-run");
+    let ai = dir.0.join("ai.json");
+    fs::write(
+        &ai,
+        r#"{"version":1,"local_base_url":"http://192.0.2.10:8100",
+            "tasks":{"location_clue":{"provider":"local","model":"example-decision"}}}"#,
+    )
+    .unwrap();
+    let port = free_port();
+    let mut child = serve_with_env(
+        &data,
+        port,
+        Some(("1", &staging)),
+        &[("GEOFRAME_AI_CONFIG", ai.to_str().unwrap())],
+    );
+    wait_healthy(&mut child, port);
+    let began = Instant::now();
+    let (status, stdout) = terminate(child);
+    assert!(status.success(), "{stdout}");
+    assert!(began.elapsed() < Duration::from_secs(10), "停止が遅い");
+    // 有効な背景用途があるので背景ワーカーが起動し、起動 ID の行と停止開始が残っている（配布バイナリの handler は空）
+    assert!(stdout.contains("[ai] 背景ワーカーを起動します"), "{stdout}");
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    let rows: Vec<(i64, Option<i64>)> = conn
+        .prepare("SELECT started_at, stop_requested_at FROM ai_worker_runs")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].1.is_some(), "SIGTERM の直後の停止開始が記録される");
+    for secret in ["192.0.2.10", "example-decision", "ai.json"] {
+        assert!(!stdout.contains(secret), "{secret}\n{stdout}");
+    }
+
+    // AI の設定ファイルが無くても、保存済み vector だけで動く同一場面の局所計算のために、ワーカーは起動する
+    let dir = Dir::new("serve-ai-off");
+    let data = dir.0.join("d");
+    let port = free_port();
+    let mut child = serve(&data, port, Some(("1", &staging)));
+    wait_healthy(&mut child, port);
+    let (status, stdout) = terminate(child);
+    assert!(status.success());
+    assert!(stdout.contains("背景ワーカーを起動します"), "{stdout}");
+    let dir = Dir::new("serve-ai-disabled");
+    let data = dir.0.join("d");
+    let port = free_port();
+    let mut child = serve_with_env(
+        &data,
+        port,
+        Some(("1", &staging)),
+        &[("GEOFRAME_AI_ENABLED", "0")],
+    );
+    wait_healthy(&mut child, port);
+    let (status, stdout) = terminate(child);
+    assert!(status.success());
+    assert!(!stdout.contains("背景ワーカーを起動します"));
+    // AI を無効にしても、起動時の回収（起動 ID の行）は行う。ワーカー（局所計算を含む）は起動しない
+    let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM ai_worker_runs", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'ai_scene_%'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
 }
 
 /// 置き場の全体（相対パスと中身）。ディレクトリの有無も含めて、断られたあとに変わっていないことを見る。
@@ -906,4 +1444,260 @@ fn quality_scan_analyzes_everything_and_rebuilds_when_the_guard_passes() {
     assert_eq!(dirty, "0");
     // 出力にファイル名を出さない
     assert!(!stdout.contains("a.jpg") && !text(&out.stderr).contains("a.jpg"));
+}
+
+// ---------------------------------------------------------------- 検索索引（P4 / T4.3）
+
+/// 本番相当の DB に、新しい空間（登録）・ベクトル・有効な検索空間のポインタを足す。旧結果（`photo_ai_features`・
+/// `photo_embeddings`）は別に持たせ、新しい空間の操作で変わらないことを後で確かめる。
+fn data_with_active_space(dir: &Dir) -> PathBuf {
+    use geoframe::ai::settings::Normalization;
+    use geoframe::ai::space::SpaceIdentity;
+    let data = dir.0.join("space-data");
+    fs::create_dir_all(&data).unwrap();
+    production_shaped_db(&data);
+    let mut conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    geoframe::ai::migrate(&mut conn).unwrap();
+    conn.execute_batch(
+        "INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,
+                                            error,analyzed_at)
+           VALUES (1,'derivatives/a.jpg',NULL,NULL,'SECRET-SHA','','t');
+         INSERT INTO photo_ai_features(photo_id,display,source_md5,source_mtime,content_sha256,
+                embedding_model,embedding_dim,embedding,analyzed_at)
+           VALUES (1,'derivatives/a.jpg',NULL,NULL,'SECRET-SHA','old-model',3,X'0102','t');
+         INSERT INTO photo_embeddings VALUES ('SECRET-SHA','old-model',3,X'0102','t');",
+    )
+    .unwrap();
+    let space = SpaceIdentity::new(
+        "space-1",
+        "shared-1",
+        "model-a",
+        "rev-1",
+        "img-v1",
+        "txt-v1",
+        3,
+        Normalization::L2,
+    )
+    .unwrap();
+    geoframe::ai::index::register_space(&mut conn, &space, 0).unwrap();
+    geoframe::ai::index::store_vector(&mut conn, &space, "SECRET-SHA", "sent", &[1.0, 0.0, 0.0], 0)
+        .unwrap();
+    let snapshot = geoframe::ai::activation::snapshot_targets(&conn, &space).unwrap();
+    assert!(
+        geoframe::ai::activation::try_activate(&mut conn, &snapshot, &space, 0.95)
+            .unwrap()
+            .published()
+    );
+    data
+}
+
+fn active_pointer(data: &Path) -> Option<String> {
+    rusqlite::Connection::open(data.join("catalog.db"))
+        .unwrap()
+        .query_row(
+            "SELECT value FROM settings WHERE key='ai_active_space'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
+fn count(data: &Path, table: &str) -> i64 {
+    rusqlite::Connection::open(data.join("catalog.db"))
+        .unwrap()
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn ai_jobs_status_shows_the_search_index_with_counts_only_and_writes_nothing() {
+    // 空間の表が無い旧 DB: 新しい空間なし・旧結果参照。書き込み 0（AI の表も作らない）
+    let dir = Dir::new("aiindex-status-old");
+    production_shaped_db(&dir.0);
+    let before = snapshot(&dir.0);
+    let out = run(
+        &["ai-jobs", "status", "--data-dir", dir.0.to_str().unwrap()],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains("検索空間: なし（空間の表が無い。旧結果参照）（登録 0 件）"),
+        "{stdout}"
+    );
+    assert_eq!(snapshot(&dir.0), before);
+
+    // 有効な空間がある DB: 件数だけ（空間の ID・SHA・モデルは出さない）
+    let dir = Dir::new("aiindex-status-active");
+    let data = data_with_active_space(&dir);
+    let before = snapshot(&data);
+    let out = run(
+        &["ai-jobs", "status", "--data-dir", data.to_str().unwrap()],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(stdout.contains("検索空間: あり（登録 1 件）"), "{stdout}");
+    assert!(
+        stdout.contains("検索索引: 対象 1 / 保存済み 1 / 待ち 0 / 失敗で除外 0 / 壊れ 0"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("旧結果 1"), "{stdout}");
+    for secret in ["SECRET", "space-1", "model-a", "shared-1", "old-model"] {
+        assert!(!stdout.contains(secret), "{secret}: {stdout}");
+    }
+    assert_eq!(snapshot(&data), before);
+}
+
+#[test]
+fn ai_jobs_status_never_prints_a_stored_failure_reason_that_is_not_a_known_code() {
+    let dir = Dir::new("aiindex-status-reasons");
+    let data = data_with_active_space(&dir);
+    let space = {
+        let conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+        geoframe::ai::index::load_space(&conn, "space-1")
+            .unwrap()
+            .unwrap()
+    };
+    let mut conn = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    for (id, sha, code) in [
+        (
+            101,
+            "SECRET-SHA-2",
+            "synthetic-private-value\nINJECTED-LINE",
+        ),
+        (102, "SECRET-SHA-3", "other-private"),
+        (103, "SECRET-SHA-4", "bad_response"),
+    ] {
+        conn.execute(
+            "INSERT INTO photos(id,source,name,display,md5,mtime,lat,lon)
+             VALUES(?1,'drive','synthetic',?2,?3,?1,35,139)",
+            rusqlite::params![id, format!("derivatives/p{id}.jpg"), format!("m{id}")],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,
+                                                error,analyzed_at)
+             SELECT id,display,md5,mtime,?2,'','t' FROM photos WHERE id=?1",
+            rusqlite::params![id, sha],
+        )
+        .unwrap();
+        let snapshot = geoframe::ai::activation::snapshot_targets(&conn, &space).unwrap();
+        let key = snapshot
+            .targets()
+            .iter()
+            .find(|t| t.input_sha256() == sha)
+            .unwrap()
+            .job_key(&space);
+        geoframe::ai::jobs::enqueue(&mut conn, &key, 0).unwrap();
+        conn.execute(
+            "UPDATE ai_jobs SET state='failed', terminal=1, last_error_code=?1 WHERE input_hash=?2",
+            rusqlite::params![code, key.input_hash],
+        )
+        .unwrap();
+    }
+    drop(conn);
+    let before = snapshot(&data);
+    let out = run(
+        &["ai-jobs", "status", "--data-dir", data.to_str().unwrap()],
+        &[],
+    );
+    let stdout = text(&out.stdout);
+    assert!(out.status.success(), "{stdout}\n{}", text(&out.stderr));
+    assert!(
+        stdout.contains("検索索引 除外の理由 bad_response: 1 件"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("検索索引 除外の理由 other: 2 件"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("失敗で除外 3"), "{stdout}");
+    for marker in [
+        "synthetic-private-value",
+        "INJECTED",
+        "other-private",
+        "SECRET",
+    ] {
+        assert!(
+            !stdout.contains(marker) && !text(&out.stderr).contains(marker),
+            "{marker}: {stdout}"
+        );
+    }
+    assert_eq!(snapshot(&data), before);
+}
+
+#[test]
+fn deactivate_space_needs_ingest_the_guard_and_a_stopped_service_and_keeps_every_result() {
+    let dir = Dir::new("aiindex-deactivate");
+    let data = data_with_active_space(&dir);
+    let before = snapshot(&data);
+    let arg = data.to_str().unwrap();
+    let args = ["ai-jobs", "deactivate-space", "--data-dir", arg];
+    // INGEST が無い → 2。印が無い → 2。どちらも何も書かない
+    let out = run(&args, &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert!(text(&out.stderr).contains("GEOFRAME_INGEST=1"));
+    let out = run(&args, &[("GEOFRAME_INGEST", "1")]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+    assert_untouched_after_refusal(&data, &before);
+
+    // 稼働中の serve（ロックを持つ）があるときは、印があっても断る → 1。ポインタは変わらない
+    let staging = Staging::new("aiindex-deactivate");
+    let port = free_port();
+    let mut child = serve(&data, port, Some(("1", &staging)));
+    wait_healthy(&mut child, port);
+    let mut envs = staging.envs();
+    envs.push(("GEOFRAME_INGEST", "1".into()));
+    let out = run_owned(&args, &envs);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("サービスを止めてから"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(active_pointer(&data).as_deref(), Some("space-1"));
+    let (stopped, _) = terminate(child);
+    assert!(stopped.success());
+
+    // 停止後は外せる。旧結果・空間・ベクトル・ジョブは消さず、設定の ai_active_space だけが消える
+    let legacy = (
+        count(&data, "photo_ai_features"),
+        count(&data, "photo_embeddings"),
+        count(&data, "ai_embedding_spaces"),
+        count(&data, "ai_embedding_vectors"),
+    );
+    let out = run_owned(&args, &envs);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("有効な検索空間を外した（旧結果参照へ戻した）"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(active_pointer(&data), None);
+    assert_eq!(
+        legacy,
+        (
+            count(&data, "photo_ai_features"),
+            count(&data, "photo_embeddings"),
+            count(&data, "ai_embedding_spaces"),
+            count(&data, "ai_embedding_vectors"),
+        )
+    );
+    assert_eq!(legacy, (1, 1, 1, 1));
+    // 2 回目は何も変えない
+    let out = run_owned(&args, &envs);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("有効な検索空間は設定されていない"),
+        "{}",
+        text(&out.stdout)
+    );
+    // status は旧結果参照へ戻ったと示す
+    let out = run(&["ai-jobs", "status", "--data-dir", arg], &[]);
+    assert!(
+        text(&out.stdout).contains("検索空間: なし（旧結果参照）（登録 1 件）"),
+        "{}",
+        text(&out.stdout)
+    );
 }

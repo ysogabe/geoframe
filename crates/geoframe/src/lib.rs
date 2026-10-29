@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod ai;
 pub mod backoff;
 pub mod blog;
 pub mod blog_write;
@@ -34,6 +35,7 @@ pub mod pyval;
 pub mod quality;
 pub mod rotate;
 pub mod schema;
+pub mod selection;
 pub mod server;
 pub mod statics;
 pub mod stop;
@@ -251,6 +253,21 @@ mod testutil {
             out
         }
 
+        /// One gzip member with a legal unknown extra subfield (RFC 1952 §2.3.1.1).
+        /// `extra` includes the subfield ID/length; the decoded body is unchanged.
+        pub fn with_extra(body: &[u8], extra: usize) -> Vec<u8> {
+            assert!((4..=u16::MAX as usize).contains(&extra));
+            let member = padded(body, 0);
+            let mut out = member[..10].to_vec();
+            out[3] = 4; // FEXTRA
+            out.extend_from_slice(&(extra as u16).to_le_bytes());
+            out.extend_from_slice(b"GF"); // unknown, non-reserved subfield ID
+            out.extend_from_slice(&((extra - 4) as u16).to_le_bytes());
+            out.resize(out.len() + extra - 4, 0);
+            out.extend_from_slice(&member[10..]);
+            out
+        }
+
         #[test]
         fn is_far_smaller_than_what_it_expands_to() {
             let gz = padded(b"{}", 2 << 20);
@@ -264,3 +281,7 @@ mod testutil {
         }
     }
 }
+
+mod service_account;
+
+mod pycasefold;

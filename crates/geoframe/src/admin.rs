@@ -42,6 +42,11 @@ pub struct AdminContext {
     pub infer_windows_s: Vec<f64>,
     /// 管理画面の AI の件数が数える `embedding_model`。
     pub embed_model: &'static str,
+    /// AI の設定が不正なときの固定のコード（`ai_config_invalid`。値・パスは持たない）。
+    pub ai_config_invalid: Option<crate::ai::settings::AiConfigError>,
+    /// 今の AI 設定の用途ごとの待ちの識別（`ai_waits` を用途に結び直す。ハッシュはメモリの中だけで、応答には出さない）。
+    pub ai_waits: crate::ai::waits::Identities,
+    scene_config: Config,
 }
 
 impl AdminContext {
@@ -50,6 +55,9 @@ impl AdminContext {
             deriv_dir: data_root.join("derivatives"),
             infer_windows_s: config.infer_windows_s(),
             embed_model: config.embed_backend.model(),
+            ai_config_invalid: config.ai.invalid(),
+            ai_waits: crate::ai::waits::Identities::from_config(&config.ai),
+            scene_config: config.clone(),
         }
     }
 }
@@ -96,6 +104,7 @@ fn count_photos(conn: &Connection, condition: &str) -> rusqlite::Result<i64> {
 
 /// `GET /api/admin/status` の `ok`・`sync`・`db`（`disk`・`server_time` は呼び出し側が足す）。
 pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<String, Value>> {
+    let scenes = crate::ai::groups::runtime::Prepared::read(conn, &ctx.scene_config);
     // 読み取りトランザクション1つ（drop で ROLLBACK）。途中の書き込みを見せず、件数をそろえる
     let _snapshot = conn.unchecked_transaction()?;
 
@@ -130,6 +139,21 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
             "loc": loc_status(conn, ctx)?,
         }),
     );
+    // P4（Rust だけが返す追加フィールド）: AI の設定の誤り・ジョブ・停止・共有の一時待機の集計。あるときだけ足すので、
+    // AI の表も設定の誤りも停止も無い DB（Python 版と同じ応答）には 1 つも足さない
+    crate::ai::ops::insert_admin_status(
+        &mut out,
+        conn,
+        ctx.ai_config_invalid,
+        &ctx.ai_waits,
+        crate::ai::jobs::unix_now(),
+    );
+    if crate::ai::groups::current(conn) {
+        out.insert(
+            "ai_scenes".into(),
+            crate::ai::groups::runtime::status_summary(&scenes, conn),
+        );
+    }
     Ok(out)
 }
 
@@ -280,19 +304,16 @@ fn ai_summary(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Value> 
             AND f.source_md5 IS p.md5 AND f.source_mtime IS p.mtime
           WHERE f.error='' AND f.content_sha256 IS NOT NULL",
     )?;
+    // groups・group_pending・suppressed は、フィードと同じ旧選別の有効判定から数える（crate::selection）
+    let selection = crate::selection::admin_counts(conn)?;
     Ok(json!({
         "embedded": embedded,
         "detailed": detailed,
         "eligible": eligible,
         "pending": (eligible - embedded).max(0),
-        "groups": count(conn, "SELECT COUNT(*) c FROM photo_ai_groups")?,
-        "group_pending": count(conn, "SELECT COUNT(*) c FROM photo_ai_groups WHERE status!='judged'")?,
-        "suppressed": count(
-            conn,
-            "SELECT COUNT(*) c FROM photo_ai_group_members m
-               JOIN photo_ai_groups g ON g.group_id=m.group_id
-              WHERE g.status='judged' AND g.same_scene=1 AND m.recommended=0",
-        )?,
+        "groups": selection.groups,
+        "group_pending": selection.group_pending,
+        "suppressed": selection.suppressed,
     }))
 }
 
@@ -659,6 +680,8 @@ pub struct AdminPhoto {
     hint: Option<Option<Hint>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     suggest: Option<Suggest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scene: Option<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -763,7 +786,12 @@ fn suggestions(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMap<i64, 
            FROM photo_loc_suggestions WHERE photo_id IN ({marks})"
     ))?;
     let mut rows = stmt.query(params_from_iter(ids))?;
+    // 画像ファイルは開かない（一覧の GET で行ごとにファイルを読んで SHA を取らない）。履歴の読込みも 1 回。
+    let mut filter = crate::ai::location_suggest::CandidateFilter::new(conn)?;
     while let Some(row) = rows.next()? {
+        if !filter.current(conn, row.get(0)?)? {
+            continue;
+        }
         let evidence = match row.get_ref(6)? {
             ValueRef::Text(t) => match serde_json::from_slice::<Value>(t) {
                 Ok(list @ Value::Array(_)) => list,
@@ -803,6 +831,7 @@ pub fn photos(
     per: i64,
     filter: Filter,
 ) -> rusqlite::Result<PhotosPage> {
+    let prepared = crate::ai::groups::runtime::Prepared::read(conn, &ctx.scene_config);
     let _snapshot = conn.unchecked_transaction()?;
     let condition = filter.condition();
     let per = per.clamp(1, PER_PAGE_MAX);
@@ -859,10 +888,21 @@ pub fn photos(
             source: cell(row.get_ref(15)?)?,
             hint: None,
             suggest: None,
+            scene: None,
         });
     }
     drop(rows);
     drop(stmt);
+
+    // 場面の注記は、このページの写真の分だけ保存済みの値から読む（ベクトルも他の写真も読まない）
+    let mut scenes = prepared
+        .and_then(|p| p.annotations_in(conn, &items.iter().map(|i| i.id).collect::<Vec<_>>()))
+        .unwrap_or_default();
+    for item in &mut items {
+        item.scene = scenes.remove(&item.id).map(|a| {
+            json!({"state":a.state.as_str(),"overlap":a.overlap.as_str(),"rank":a.rank,"score":a.score,"representative":a.representative,"shortlisted":a.shortlisted})
+        });
+    }
 
     // ヒントは、錨（位置あり写真）が1枚でもあるときだけ全行に付く（近い写真が無ければ null）
     let anchors = if filter.with_hints() {

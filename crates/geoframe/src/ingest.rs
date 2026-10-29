@@ -18,7 +18,7 @@
 //!    ので、Python が動いている間は取り込まない（0 のガードが、起動時に 1 回だけ確かめる）。
 //! 2. writer を開く。DB が無ければ**新しく作る**（`schema::migrate` が空から作る）。作ったときは warn
 //!    で知らせる（`GEOFRAME_DATA_DIR` の誤りで空の DB を静かに作ってしまうのを見つけるため）。
-//! 3. スキーマの作成・移行（[`crate::schema::migrate`]）。
+//! 3. スキーマの作成・移行（[`crate::schema::migrate`]）と、P4 の AI 表（ジョブ・送信予算・Provider 停止・起動 ID）の追加（[`crate::ai::migrate`]）。
 //! 4. `.cache.json` を読み、旧キーを捨て、捨てたものがあれば即保存する。
 //! 5. `DATA_DIR/tmp/` を用意し、`tmp/` と `derivatives/` の `.dl_*` を消す（[`prepare_tmp_dir`]）。
 //! 6. `derivatives/` の書きかけの `*.part`（プロセスが `SIGKILL`・電源断で落ちて残ったもの）を消す
@@ -34,6 +34,7 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
+use crate::ai;
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::guard::{Guard, GuardError};
@@ -80,6 +81,10 @@ impl From<WriteError> for IngestError {
 /// 超えても待ちきらない）ので、ロックの寿命を `Ingest` だけに結びつけない。そうしないと、旧スレッドが
 /// まだ書ける間に別の `sync`／`serve` が起動して、DB やキャッシュの一時ファイルで競合する。
 /// 各スレッドは自分の複製をスレッドの終了（パニックを含む）まで持ち、プロセスが終わればOS が外す。
+///
+/// **DB の書き込みスレッド（[`Writer`]）も複製を持つ**（[`Writer::open_held`]）。期限つきの依頼
+/// （`call_within`）は呼び出し側が期限で去っても、始まった SQL・後始末が最後まで進むため、依頼を出した
+/// スレッドの複製だけでは足りない。書き込みスレッドは接続を閉じ終わってから複製を手放す。
 #[derive(Clone)]
 pub struct LockHold(#[allow(dead_code)] Arc<File>);
 
@@ -88,6 +93,12 @@ impl LockHold {
     #[cfg(test)]
     pub(crate) fn for_test(dir: &Path) -> Self {
         Self(Arc::new(File::create(dir.join("hold-for-test")).unwrap()))
+    }
+
+    /// 試験用: この所有権を持っている数（複製の数）。スレッドが残っているかを確かめる。
+    #[cfg(test)]
+    pub(crate) fn holders(&self) -> usize {
+        Arc::strong_count(&self.0)
     }
 }
 
@@ -101,6 +112,7 @@ pub struct Ingest {
 
 impl Ingest {
     /// ロックの所有権の複製。書き込みうるスレッドに渡し、そのスレッドが終わるまで持たせる。
+    /// （DB の書き込みスレッドは、`start` が [`Writer::open_held`] で渡し済み。）
     pub fn lock_hold(&self) -> LockHold {
         self.lock.clone()
     }
@@ -128,15 +140,33 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         Err(TryLockError::Error(e)) => return Err(IngestError::Io(e.kind())),
     }
 
+    let lock = LockHold(Arc::new(lock));
+
     let db_path = config.db_path();
     let existed = db_path.exists();
-    let writer = Writer::open(&db_path, OpenMode::CreateIfMissing)?;
+    // 書き込みスレッドもロックの複製を持つ（接続を閉じ終わってから手放す）。`Ingest` の drop・期限で去った
+    // 呼び出し側とは無関係に、始まった SQL・後始末・close が済むまでロックが残る
+    let writer = Writer::open_held(&db_path, OpenMode::CreateIfMissing, lock.clone())?;
     if !existed {
         tracing::warn!(
             "DB が無かったので新しく作ります（GEOFRAME_DATA_DIR が正しいか確認してください）"
         );
     }
-    let migration = writer.call(schema::migrate)?;
+    let mut migration = writer.call(schema::migrate)?;
+    // P4: AI の表（ジョブ・送信予算・Provider 停止・起動 ID）。Python と同じスキーマの再現（schema::migrate）とは別に足す
+    let clue_enabled = config
+        .ai
+        .gate(ai::settings::TaskKind::LocationClue, true)
+        .is_ok();
+    let suggest_enabled = config
+        .ai
+        .gate(ai::settings::TaskKind::LocationSuggest, true)
+        .is_ok();
+    let scenes = ai::groups::runtime::enabled(config);
+    let judge = ai::scene_judge::enabled(config);
+    migration.created.extend(writer.call(move |conn| {
+        ai::migrate_active(conn, clue_enabled, suggest_enabled, scenes, judge)
+    })?);
     log_migration(&migration);
 
     let cache = Arc::new(Cache::load(&config.data_dir));
@@ -174,7 +204,7 @@ pub(crate) fn start_with(config: &Config, guard: &Guard) -> Result<Ingest, Inges
         writer,
         cache,
         migration,
-        lock: LockHold(Arc::new(lock)),
+        lock,
     })
 }
 
@@ -330,12 +360,39 @@ pub struct Plan {
     /// 消す書きかけの `*.part`（[`sweep_part_files`]）。
     pub part_files: usize,
     pub legacy_cache_keys: usize,
+    /// AI の場面の表のうち、列が想定と違うもの（作り直しの対象ではない。足す予定の `schema` には数えない）。
+    pub scene_mismatch: Vec<String>,
 }
 
 /// 書かずに計画を作る。DB は読み取り専用の接続で見る。
 pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
+    let mut schema = schema::pending(conn)?;
+    let clue_enabled = config
+        .ai
+        .gate(ai::settings::TaskKind::LocationClue, true)
+        .is_ok();
+    let suggest_enabled = config
+        .ai
+        .gate(ai::settings::TaskKind::LocationSuggest, config.ingest)
+        .is_ok();
+    let scenes = ai::groups::runtime::enabled(config);
+    let judge = ai::scene_judge::enabled(config);
+    schema.missing_objects.extend(ai::pending_active(
+        conn,
+        clue_enabled,
+        suggest_enabled,
+        scenes,
+        judge,
+    )?);
+    let scene_mismatch = if scenes {
+        ai::groups::mismatched(conn)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
+    } else {
+        Vec::new()
+    };
     Ok(Plan {
-        schema: schema::pending(conn)?,
+        schema,
+        scene_mismatch,
         leftover_files: count_leftovers(&config.data_dir),
         skipped_dirs: count_skipped_dirs(&config.data_dir),
         part_files: count_part_files(&config.data_dir),
@@ -573,7 +630,23 @@ mod tests {
 
         let ingest = start(&config).unwrap();
         assert!(config.db_path().exists());
-        assert_eq!(ingest.migration.created.len(), 16);
+        // Python と同じスキーマの 16（表 11・索引 5）と、P4 の AI 表（`ai_jobs`・その索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表・その索引）
+        assert_eq!(ingest.migration.created.len(), 16 + 10);
+        for name in [
+            "ai_jobs",
+            "ai_image_embedding_lineage",
+            "ai_request_usage",
+            "ai_provider_pauses",
+            "ai_provider_waits",
+            "ai_worker_runs",
+            "ai_embedding_spaces",
+            "ai_embedding_vectors",
+        ] {
+            assert!(
+                ingest.migration.created.contains(&name.to_string()),
+                "{name}"
+            );
+        }
         assert!(!ingest.migration.places_reset);
         crate::db::Catalog::open(&config.db_path()).unwrap();
         // 旧キーは即保存された
@@ -586,6 +659,20 @@ mod tests {
         assert!(root.join("tmp").is_dir());
     }
 
+    /// 直前の `Ingest` を drop したあとの起動。ロックは書き込みスレッドが接続を閉じ終えてから外れる
+    /// （非同期）ので、取れるまで上限つきで待つ。
+    fn restart(config: &Config) -> Result<Ingest, IngestError> {
+        let limit = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            match start(config) {
+                Err(IngestError::Locked) if std::time::Instant::now() < limit => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                other => return other,
+            }
+        }
+    }
+
     #[test]
     fn a_second_ingest_on_the_same_data_dir_is_refused() {
         let dir = TempDir::new("ingest-lock");
@@ -594,7 +681,7 @@ mod tests {
         assert!(matches!(start(&config), Err(IngestError::Locked)));
         drop(first);
         // 外れたら取れる
-        assert!(start(&config).is_ok());
+        assert!(restart(&config).is_ok());
     }
 
     /// `Ingest` を drop しても、スレッドが [`LockHold`] を持つ間は次の取り込みを断り、手放したら取れる。
@@ -607,23 +694,156 @@ mod tests {
         drop(first);
         assert!(matches!(start(&config), Err(IngestError::Locked)));
         drop(hold);
-        assert!(start(&config).is_ok());
+        assert!(restart(&config).is_ok());
+    }
+
+    /// 別の `File` から `.ingest.lock` を取れるか（取れたら手放す）。
+    fn lock_is_free(config: &Config) -> bool {
+        let f = File::options()
+            .write(true)
+            .open(config.data_dir.join(LOCK_FILE))
+            .unwrap();
+        f.try_lock().is_ok()
+    }
+
+    /// 回帰（T4.1c 修正3）: 別の接続が書き込みを握り、期限つきの依頼の SQL が書き込みスレッドで待っている。
+    /// 呼び出し側が期限で去り、`Ingest` も `Writer` も drop されても、その SQL が終わって接続が閉じるまで
+    /// `.ingest.lock` は外れない（外れていると、別の `sync`／`serve` が起動して同じ DB に書ける）。
+    #[test]
+    fn the_lock_is_held_by_the_writer_thread_until_a_started_job_and_the_close_finish() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = TempDir::new("ingest-lock-writer");
+        let config = config(&dir);
+        let ingest = start(&config).unwrap();
+        let writer = ingest.writer.clone();
+
+        let blocker = Connection::open(config.db_path()).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (started_tx, started_rx) = mpsc::channel::<()>();
+        let (proceed_tx, proceed_rx) = mpsc::channel::<()>();
+        let waiter = std::thread::spawn(move || {
+            writer.call_within(Instant::now() + Duration::from_millis(150), move |c| {
+                started_tx.send(()).unwrap();
+                c.execute(
+                    "INSERT INTO ai_provider_pauses(scope, subject, task, reason, created_at)
+                     VALUES ('provider', 'p', 'photo_judge', 'unauthorized', 1)",
+                    [],
+                )?;
+                // blocker を閉じ終えるまで依頼を終えない
+                let _ = proceed_rx.recv();
+                Ok(())
+            })
+        });
+        started_rx.recv().unwrap();
+        assert!(matches!(
+            waiter.join().unwrap(),
+            Err(crate::writer::WriteError::Expired)
+        ));
+        // 呼び出し側も `Ingest` も（その複製も）いなくなる
+        drop(ingest);
+        assert!(!lock_is_free(&config), "SQL の実行中にロックが外れた");
+        assert!(matches!(start(&config), Err(IngestError::Locked)));
+
+        blocker.execute_batch("ROLLBACK").unwrap();
+        drop(blocker);
+        assert!(!lock_is_free(&config), "依頼の終わる前にロックが外れた");
+        proceed_tx.send(()).unwrap();
+        // 依頼・後始末・接続の close が済むと外れる（スレッドの終了を待つだけの、上限つきの待ち）
+        let limit = Instant::now() + Duration::from_secs(20);
+        while !lock_is_free(&config) {
+            assert!(Instant::now() < limit, "ロックが外れない");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // 始まっていた依頼は確定している
+        let conn = Connection::open(config.db_path()).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_provider_pauses", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        drop(conn);
+        assert!(restart(&config).is_ok());
     }
 
     #[test]
     fn restarting_on_an_existing_database_changes_nothing() {
         let dir = TempDir::new("ingest-restart");
         let config = config(&dir);
-        drop(start(&config).unwrap());
-        let again = start(&config).unwrap();
+        drop(restart(&config).unwrap());
+        let again = restart(&config).unwrap();
         assert!(again.migration.is_noop(), "{:?}", again.migration);
+    }
+
+    /// P4 より前の DB（`ai_jobs` が無い）を `--dry-run` で見ると、ジョブ表を作ると数える（書かない）。
+    /// 実際の起動はそれだけを足し、次の起動からは何もしない。
+    #[test]
+    fn plan_counts_the_ai_jobs_table_that_a_start_would_add() {
+        let dir = TempDir::new("ingest-plan-ai");
+        let config = config(&dir);
+        drop(restart(&config).unwrap());
+        {
+            let conn = Connection::open(config.db_path()).unwrap();
+            conn.execute_batch("DROP TABLE ai_jobs").unwrap();
+        }
+        let conn = crate::db::open_read_only(&config.db_path()).unwrap();
+        let plan = plan(&config, &conn).unwrap();
+        assert_eq!(
+            plan.schema.missing_objects,
+            ["ai_jobs", "idx_ai_jobs_runnable"]
+        );
+        assert!(plan.schema.missing_columns.is_empty());
+        drop(conn);
+        let again = restart(&config).unwrap();
+        assert_eq!(again.migration.created, ["ai_jobs", "idx_ai_jobs_runnable"]);
+        drop(again);
+        assert!(restart(&config).unwrap().migration.is_noop());
+    }
+
+    /// T4.1a の状態（`ai_jobs` だけある）の DB を `--dry-run` で見ると、送信予算・Provider 停止の表だけを作ると
+    /// 数える。実際の起動はそれだけを足し、`ai_jobs` の行は変えない。
+    #[test]
+    fn plan_counts_the_budget_and_pause_tables_added_after_the_jobs_table() {
+        let dir = TempDir::new("ingest-plan-ai-store");
+        let config = config(&dir);
+        drop(restart(&config).unwrap());
+        {
+            let conn = Connection::open(config.db_path()).unwrap();
+            conn.execute_batch(
+                "DROP TABLE ai_request_usage; DROP TABLE ai_provider_pauses;
+                 INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,created_at,updated_at)
+                   VALUES ('image_embedding','t','h','p',1,1)",
+            )
+            .unwrap();
+        }
+        let conn = crate::db::open_read_only(&config.db_path()).unwrap();
+        let plan = plan(&config, &conn).unwrap();
+        assert_eq!(
+            plan.schema.missing_objects,
+            ["ai_request_usage", "ai_provider_pauses"]
+        );
+        drop(conn);
+        let again = restart(&config).unwrap();
+        assert_eq!(
+            again.migration.created,
+            ["ai_request_usage", "ai_provider_pauses"]
+        );
+        drop(again);
+        let conn = Connection::open(config.db_path()).unwrap();
+        let jobs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ai_jobs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(jobs, 1);
+        drop(conn);
+        assert!(restart(&config).unwrap().migration.is_noop());
     }
 
     #[test]
     fn plan_counts_without_writing() {
         let dir = TempDir::new("ingest-plan");
         let config = config(&dir);
-        drop(start(&config).unwrap());
+        drop(restart(&config).unwrap());
         fs::write(config.data_dir.join("tmp/.dl_a"), b"x").unwrap();
         fs::write(
             config.data_dir.join(".cache.json"),

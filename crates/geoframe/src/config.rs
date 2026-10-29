@@ -14,7 +14,7 @@
 //! | カメラ時計のずれの補正（推定する写真の時刻に足す。負でもよい） | なし | `GEOFRAME_INFER_OFFSET_MIN` | `0`（分） |
 //! | embedding の場所（管理画面の AI 件数が数えるモデル） | なし | `GEOFRAME_EMBED_BACKEND` | `gemini` |
 //! | タイルキャッシュの上限（管理画面のディスク表示と、掃除） | なし | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` |
-//! | 地図タイルの上流へ送る User-Agent（連絡先入りにする。ログには出さない） | なし | `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` |
+//! | 地図タイル・地名検索の上流へ送る User-Agent（連絡先入りにする。ログには出さない） | なし | `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` |
 //! | 地図タイルの上流取得の毎分の上限（全体。0 は上流へ行かない） | なし | `GEOFRAME_TILE_FETCH_PER_MIN` | `240` |
 //! | 取り込み（DB への書き込み・同期サイクル）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_INGEST`（`0`/`1`） | `0`（無効） |
 //! | 同期サイクルの間隔（分） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10` |
@@ -50,34 +50,27 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
+use crate::ai::settings::AiConfig;
+
 pub const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_DATA_DIR: &str = "var";
 pub const DB_FILE_NAME: &str = "catalog.db";
 
-/// P2 以降で読む `GEOFRAME_*`（現行の `config.py` にある項目）。P1 では**読まず、警告も出さない**。
+/// まだ読まない `GEOFRAME_*`（現行の `config.py` にある項目）。**読まず、警告も出さない**。
 /// `docs/reference/configuration.md` の項目がここか [`SUPPORTED_ENV`] のどちらかに載っているかを
 /// テストで確かめている（Python 側で項目が増えたのに Rust の分類が漏れるのを防ぐ）。
 pub const UNSUPPORTED_ENV: &[&str] = &[
-    // P4: AI・位置候補
-    "GEOFRAME_AI_ENABLED",
-    "GEOFRAME_AI_EMBED_PER_CYCLE",
-    "GEOFRAME_AI_JUDGE_PER_CYCLE",
-    "GEOFRAME_AI_POLL_S",
+    // P4: AI・位置候補（後続のタスク。周期・上限・フラグは T4.1b から `SUPPORTED_ENV`）
     "GEOFRAME_AI_TIME_WINDOW_MIN",
     "GEOFRAME_AI_SIMILARITY",
-    "GEOFRAME_AI_VISUAL_SIMILARITY",
     "GEOFRAME_AI_SHORTLIST_MAX",
     "GEOFRAME_AI_JUDGE_SHUFFLE_RATE",
-    "GEOFRAME_AI_SEARCH_PER_MIN",
     "GEOFRAME_LOCAL_EMBED_MODEL_DIR",
     "GEOFRAME_LOCAL_EMBED_THREADS",
     "GEOFRAME_RANK_MODEL",
-    "GEOFRAME_LOC_SUGGEST",
     "GEOFRAME_DECISION_URL",
     "GEOFRAME_LOC_SUGGEST_MODEL",
-    "GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE",
-    "GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE",
 ];
 
 /// P1 で読む `GEOFRAME_*`（`GEOFRAME_LOG` は Rust だけの項目なので Python の一覧には無い）。
@@ -106,6 +99,17 @@ pub const SUPPORTED_ENV: &[&str] = &[
     "GEOFRAME_INFER_OFFSET_MIN",
     // T2.6: 簡易品質
     "GEOFRAME_QUALITY_PER_CYCLE",
+    // T4.1b: AI の周期・上限・フラグ（`ai::settings::LegacyAi`）。新しい呼び出しの routing は
+    // `GEOFRAME_AI_CONFIG`（Rust だけの項目）の JSON で、旧 `GEOFRAME_DECISION_URL`・`GEOFRAME_LOC_SUGGEST_MODEL` は読まない
+    "GEOFRAME_AI_ENABLED",
+    "GEOFRAME_AI_POLL_S",
+    "GEOFRAME_AI_EMBED_PER_CYCLE",
+    "GEOFRAME_AI_JUDGE_PER_CYCLE",
+    "GEOFRAME_AI_SEARCH_PER_MIN",
+    "GEOFRAME_AI_VISUAL_SIMILARITY",
+    "GEOFRAME_LOC_SUGGEST",
+    "GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE",
+    "GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE",
 ];
 
 pub const DEFAULT_INFER_MIN: f64 = 15.0;
@@ -221,12 +225,15 @@ pub struct Config {
     /// （負でもよい）。現行は検証なしで `float()` に通すが、Rust は有限の数だけを受ける。
     pub infer_offset_min: f64,
     pub embed_backend: EmbedBackend,
+    pub ai_visual_similarity: f64,
+    /// Optional validated linear rank file. Never included in diagnostics.
+    pub rank_model_path: PathBuf,
     /// `GEOFRAME_EMBED_BACKEND` が `gemini`・`local` のどちらでもなかった（現行と同じく `gemini` に
     /// 落とした）。起動ログで知らせる。
     pub embed_backend_invalid: bool,
     /// 地図タイルのキャッシュの上限（MB。0 以上）。`GEOFRAME_TILE_CACHE_MAX_MB`。
     pub tile_cache_max_mb: i64,
-    /// 地図タイルの上流へ送る User-Agent。`GEOFRAME_TILE_UA`（印字可能な ASCII だけ）。連絡先が入りうるので、
+    /// 地図タイル・地名検索の上流へ送る User-Agent。`GEOFRAME_TILE_UA`（印字可能な ASCII だけ）。連絡先が入りうるので、
     /// `Debug`・起動ログには載せない。
     pub tile_ua: String,
     /// 地図タイルの上流取得（キャッシュミス）の毎分の上限（全体。0 以上）。`GEOFRAME_TILE_FETCH_PER_MIN`。
@@ -256,6 +263,9 @@ pub struct Config {
     /// `None` のときはバイナリに埋め込んだ `app/travel_blog/plans/*.json`（現行の `PLAN_DIR` と同じ内容）。
     /// 旅程の中身は利用者の情報なので、パスもログの要約には載せない（埋め込みかディレクトリかだけ）。
     pub blog_plans_dir: Option<PathBuf>,
+    /// AI の設定（T4.1b）。旧 `GEOFRAME_AI_*` の周期・上限・フラグと、任意の `GEOFRAME_AI_CONFIG`（JSON）。
+    /// **不正でも `Config` は作れる**（AI だけが無効で、種類のコードを持つ）。パス・JSON の中身は載せない。
+    pub ai: AiConfig,
 }
 
 impl Config {
@@ -453,6 +463,18 @@ impl Config {
                 ))
             })?;
 
+        let ai = AiConfig::load(&get);
+        let ai_visual_similarity =
+            ai.visual_similarity()
+                .unwrap_or(if embed_backend == EmbedBackend::Local {
+                    0.91
+                } else {
+                    0.90
+                });
+        let rank_model_path = get("GEOFRAME_RANK_MODEL")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| data_dir.join("models/rank_model.json"));
         Ok(Self {
             listen,
             data_dir,
@@ -462,6 +484,8 @@ impl Config {
             infer_min,
             infer_offset_min,
             embed_backend,
+            ai_visual_similarity,
+            rank_model_path,
             embed_backend_invalid,
             tile_cache_max_mb,
             tile_ua,
@@ -474,6 +498,7 @@ impl Config {
             drive_key,
             drive_folder,
             blog_plans_dir,
+            ai,
         })
     }
 
@@ -530,7 +555,7 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} blog_plans={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} blog_plans={} ai={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
@@ -549,6 +574,7 @@ impl Config {
             } else {
                 "embedded"
             },
+            self.ai.summary(),
         )
     }
 }

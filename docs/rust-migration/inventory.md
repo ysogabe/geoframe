@@ -28,8 +28,8 @@
 | E2 | GET `/api/admin/status` | なし | `sync{ready,pending,total}`（**Rustは保留があるときだけ`mass_delete_hold`を足す**。T3.7⑤）、`db{件数内訳、by_loc_source、infer_buckets、quality、ai、loc}`、`disk`（60秒キャッシュ）、`server_time` | なし | なし | `admin.py:api_admin_status`、`loc_suggest.py:loc_status`、`admin.py:disk_info` | `admin.js`（STATUSタブ）、`deploy/loc_decision_morning.py`（`db.loc.clue_pending` を読む） | **生パスの前方一致**（`/api/admin/status?x` も `/api/admin/statusX` も通る） | P1（AI・位置候補の列は読み取りのみ。テーブルが空でも動くこと） |
 | E3 | GET `/api/admin/photos` | `page`(1)、`per`(50、上限200)、`filter`(all/noloc/fav/hidden/inferred/manual/suggest。未知はall) | `items[]`（id name thumb taken_at lat lon loc_source infer_dt_s infer_bucket place pref city fav hidden rotation source、位置なしでは `hint`・`suggest`）、`page pages total filter`。並びは時刻（NULL・空は最後）→id | なし | なし | `admin.py:api_admin_photos` / `admin.py:_thumb_for` / `admin.py:_nearest_hint` / `admin.py:_suggestions` | `admin.js`（一覧） | 生パスの前方一致。`int()` 失敗は400 `bad_params` | P1 |
 | E4 | GET `/api/admin/geocode` | `q`（2文字未満は空配列） | `{ok, items[{title,lat,lon,source:'gsi'|'osm'}]}`。GSIが0件のときだけNom。失敗は空配列で握りつぶす | なし（`.cache.json` のメモリキャッシュを更新） | GSI、Nom（1秒1件の全体ロック） | `geo.py:geocode_search` / `geo.py:_gsi_geocode` / `geo.py:nominatim_search` | `admin.js`（地名検索） | 生パスの前方一致 | P3 |
-| E5 | GET `/api/ai/status` | なし | embedding件数、グループ、パイプライン状態（`photo_ai_status` 設定）、モデル切替直後の他モデル行数 | なし | なし | `ai_search.py:api_ai_status` | `ai-search.js` | 完全一致 | P4 |
-| E6 | GET `/api/ai/search` | `q`（300字以内、空なら「推薦順」）、`groups`(12、1〜30)、`include_hidden`(1/true) | `groups[{group_id kind summary 類似度 photos[]}]`、`mode` は `semantic`/`recommended`/`empty`。分あたり30件を超えると429、`GEOFRAME_AI_ENABLED=0` は503、上流障害は503（定型文）。**不正な `groups`（数値でない等）・`q` の不正は400**（現行は例外文字列 `str(e)` をそのまま返す。Rustでは定型文にする） | なし（クエリのembeddingをメモリLRU 64件にキャッシュ） | Gemini（または local embedding）で検索語を1回embedding | `ai_search.py:api_ai_search` / `ai_search.py:_embed_query` / `ai_search.py:_search_rate_limit_allowed` | `ai-search.js` | 完全一致 | P4 |
+| E5 | GET `/api/ai/status` | なし | embedding件数、グループ、パイプライン状態（`photo_ai_status` 設定）、モデル切替直後の他モデル行数 | なし | なし | `ai_search.py:api_ai_status` | `ai-search.js` | 完全一致 | P4（E5/E6は[T4.4b実装](ai-search.md)） |
+| E6 | GET `/api/ai/search` | `q`（300字以内、空なら「推薦順」）、`groups`(12、1〜30)、`include_hidden`(1/true) | `groups[{group_id kind summary 類似度 photos[]}]`、`mode` は `semantic`/`recommended`/`empty`。分あたり30件を超えると429、`GEOFRAME_AI_ENABLED=0` は503、上流障害は503（定型文）。**不正な `groups`（数値でない等）・`q` の不正は400**（現行は例外文字列 `str(e)` をそのまま返す。Rustでは定型文にする） | なし（クエリのembeddingをメモリLRU 64件にキャッシュ） | Gemini（または local embedding）で検索語を1回embedding | `ai_search.py:api_ai_search` / `ai_search.py:_embed_query` / `ai_search.py:_search_rate_limit_allowed` | `ai-search.js` | 完全一致 | P4（E5/E6は[T4.4b実装](ai-search.md)） |
 | E7 | GET `/api/blog/trips` | なし | 旅程JSON（`app/travel_blog/plans/*.json`）の一覧と、下書き・書き出しの有無 | なし | なし | `travel_blog.py:api_blog_trips` / `travel_blog.py:list_plans` | `blog-admin.js` | 完全一致 | P3 |
 | E8 | GET `/api/blog/trip` | `trip_id`（`^[a-z0-9][a-z0-9-]{0,79}$`） | 旅程JSONそのもの。不正は400、無ければ404 | なし | なし | `travel_blog.py:api_blog_trip` / `travel_blog.py:load_plan` | `blog-admin.js` | 完全一致 | P3 |
 | E9 | GET `/api/blog/candidates` | `trip_id` | 日ごとの写真候補（`hidden` でない写真を日付範囲で選び、粗い地名だけ返す。正確なGPSは返さない） | なし | なし | `travel_blog.py:api_blog_candidates` / `travel_blog.py:_segment_candidates` | `blog-admin.js` | 完全一致 | P3 |
@@ -106,7 +106,7 @@ SQLite、WAL。接続は**プロセスで1本**（`check_same_thread=False`）�
 | `photo_ai_group_members` | `(group_id, photo_id)` PK、`rank_in_group`、`recommended`、`shortlisted`、`local_score` | 派生（有償：`recommended` は判定結果） | 上と同じ（`replace_photo_ai_groups` / `complete_photo_ai_group`） | `photos.py:api_photos`（JOIN）、`ai_search.py:_valid_rows` | 毎サイクル全差し替え |
 | `photo_loc_clues` | `photo_id` PK、`display`、`source_md5`、`source_mtime`、`clue`、`kind`、`model`、`analyzed_at`、`error` | 派生（無償だが、Decision（GPU）が必要） | `loc_suggest.py:_classify`（upsert） | `loc_suggest.py:_load_targets` | **掃除する処理なし**（写真が消えても行が残る。読む側が `display`/md5/mtime の一致で無効化する） |
 | `photo_loc_runs` | `run_id` PK、`day`、`model`、`prompt_version`、`member_ids_json`、`sent_ids_json`、`status`(`pending`/`done`/`error`)、`attempts`、`answer_json`、`error`、`analyzed_at` | 派生（有償：Geminiの回答） | `loc_suggest.py:loc_suggest_cycle`（`INSERT OR REPLACE`） | `loc_suggest.py:loc_suggest_cycle` / `loc_status` | **掃除する処理なし** |
-| `photo_loc_suggestions` | `photo_id` PK、`run_id`、`scope`(`photo`/`day`)、`place_name`、`day_place_name`、`geocode_query`、`precision`、`confidence`、`evidence_json`、`lat`、`lon`、`geocode_title`、`model`、`analyzed_at` | 派生（有償）。**`photos.lat/lon` には書かない**。人が管理画面で確認してSAVEしたとき（E12）だけ `manual` として `photos` に入る | `loc_suggest.py:_apply_run`（`INSERT OR REPLACE`） | `admin.py:_suggestions`、`admin.py:FILTERS['suggest']`、`loc_suggest.py:loc_suggest_cycle` / `loc_status` | **掃除する処理なし**（位置が確定した写真の行も残る。読む側は `lat IS NULL` で絞る） |
+| `photo_loc_suggestions` | `photo_id` PK、`run_id`、`scope`(`photo`/`day`)、`place_name`、`day_place_name`、`geocode_query`、`precision`、`confidence`、`evidence_json`、`lat`、`lon`、`geocode_title`、`model`、`analyzed_at` | 派生（有償）。**`photos.lat/lon` には書かない**。人が管理画面で確認してSAVEしたとき（E12）だけ `manual` として `photos` に入る | `loc_suggest.py:_apply_run`（`INSERT OR REPLACE`） | `admin.py:_suggestions`、`admin.py:FILTERS['suggest']`、`loc_suggest.py:loc_suggest_cycle` / `loc_status` | **Python側に掃除する処理なし**（位置が確定した写真の行も残る。読む側は `lat IS NULL` で絞る）。ただしRustの`location_suggest`は、自分が書いた投影の行だけを周期で`DELETE`する（ファイルの差し替え・SAVE・hidden・日の構成の変化・履歴の破損。Pythonが書いた行には触れない。[ai-location-suggest.md](ai-location-suggest.md)） |
 
 ### 2.2 `photos` の列
 
@@ -264,7 +264,7 @@ store.py の永続キャッシュ。JSONオブジェクト。読み書きは `ca
 | `GEOFRAME_QUALITY_PER_CYCLE` | `FETCH_PER_CYCLE` | 引き継ぐ | | P2 |
 | `GEOFRAME_INFER_MIN` | `15` | 引き継ぐ | 段階窓は `{INFER_MIN, 2時間, 12時間}` | P2 |
 | `GEOFRAME_INFER_OFFSET_MIN` | `0` | 引き継ぐ | カメラ時計のずれ | P2 |
-| `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` | 引き継ぐ | 本番では連絡先入りを設定する運用。検証環境でのOSMのタイルの実取得は、設定のあとに行う持ち越し（P5の本番切替の前。[plan.md](plan.md) P3・P5）。Nominatimへ送るUser-Agent（`GeoFrame/0.2`）は別で、決定も同じ期限 | P3 |
+| `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` | 引き継ぐ | 本番では連絡先入りを設定する運用。検証環境でのOSMのタイルの実取得は、設定のあとに行う持ち越し（P5の本番切替の前。[plan.md](plan.md) P3・P5）。地名検索（地理院・Nominatim）にも同じ値を使う（T3.10。Pythonは地名検索に固定の`GeoFrame/0.2`） | P3 |
 | `GEOFRAME_TILE_CACHE_MAX_MB` | `16384` | 引き継ぐ | | P3 |
 | `GEOFRAME_TILE_FETCH_PER_MIN` | `240` | 引き継ぐ | | P3 |
 | `GEOFRAME_AI_ENABLED` | `1` | 引き継ぐ（意味は「AIジョブ全体の有効化」） | `0` で E6 が503 | P4 |
@@ -387,7 +387,7 @@ Pythonの現行ログには、Rustでは出さないほうがよいものが含�
 | 品質・AI行の有効性判定 | `display` / `md5` / `mtime`（`IS` 比較）が現在の `photos` と一致する行だけ採用。画像が変わると自動で無効になる | `photos.py:QUALITY_JOIN`、`ai_search.py:_valid_rows` ほか |
 | 品質の「全員分そろってから再構築」 | 未解析が残る間は前回の `photo_quality` を維持 | `quality.py:rebuild_quality_if_ready` |
 | AIグループの判定引き継ぎ | `judge_version` が同じ `group_id` の判定結果は再構築しても保持 | `ai_pipeline.py:_rebuild_groups` |
-| 配信の抑制（E1） | 完全重複の非推奨を除外、AIが「同一場面で推奨外」としたもの（お気に入りを除く）を除外 | `photos.py:QUALITY_VISIBLE` / `AI_VISIBLE` |
+| 配信の抑制（E1） | 完全重複の非推奨を除外、AIが「同一場面で推奨外」としたもの（お気に入りを除く）を除外。**Rust（P4 / T4.3）は、メンバーの世代が今の写真と合い、同じグループに有効で表示可能な推奨写真があるときだけ抑止する**（[ai-index.md §6](ai-index.md)。意図した変更） | `photos.py:QUALITY_VISIBLE` / `AI_VISIBLE` |
 | クラウド送信の関門 | 位置候補は Decision の判定が済んだ「日」だけをGeminiへ送る | `loc_suggest.py:loc_suggest_cycle` |
 | ブログ書き出しの個人情報除去 | 再エンコード時にEXIFを渡さない、候補APIは粗い地名だけを返す | `travel_blog.py:_export_image` / `_location_label` |
 | 書き込みの原子性 | 品質・AIグループは `BEGIN IMMEDIATE` で全削除→全挿入。derivative・キャッシュ・下書きは tmp→`os.replace`/`rename`。ブログ書き出しは staging→`.previous` を経由して置換 | `store.py`、`util.py:make_derivative`、`travel_blog.py:export_blog` |
@@ -411,3 +411,7 @@ Pythonの現行ログには、Rustでは出さないほうがよいものが含�
 - **オフライン逆ジオコーダ（`reverse_geocode`）**: 任意の依存で、本番に入っているかは不明。入っていないと国外の写真は `place` が空で確定する。
 - **本番の `/etc/default/geoframe` の内容**: リポジトリ外。どの `GEOFRAME_*` が実際に上書きされているか（特に `GEOFRAME_AI_ENABLED`、`GEOFRAME_EMBED_BACKEND`、`GEOFRAME_TILE_UA`、`GEOFRAME_ALLOWED_HOSTS`）は不明。P1の開始前に、**値は伏せて、設定されているキーの名前だけ**を確認する。
 - **Decision（local-model-lab）の `/health` の応答形**: コードが読むのは `status=='ready'` と `modalities` に `image` が含まれることだけ。lab側の契約（local-model-lab #93 など）は未確認。
+
+### E5/E6 Rust接続（T4.4b）
+
+[HTTP/query契約と合成検証](ai-search.md)を参照。E6の新規送信は確定したLAN BF16契約だけ。旧Cloud/localのベクトルは空検索の同モデル構図比較だけに使い、新queryと混ぜない。Cloud queryは未対応で無送信503。非空queryの新active無しは候補0件でも503、空queryの保存済み推薦はProvider無しで200。新scene/rankはT4.5。

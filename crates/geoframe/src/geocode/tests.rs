@@ -20,12 +20,110 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use super::stub::{Reply, SharedClock, StubUpstreams, TestClock, Upstream};
 use super::*;
 use crate::cache::{Cache, SaveOutcome};
-use crate::config::{Config, Overrides};
+use crate::config::{Config, DEFAULT_TILE_UA, Overrides};
 use crate::db::Catalog;
 use crate::server::{AppState, router};
 use crate::testutil::{TempDir, capture, synthetic_catalog};
 
 const START: Duration = Duration::from_secs(100);
+
+#[test]
+fn ai_stop_after_rate_wait_and_connector_first_write_blocks_new_queries() {
+    struct StopClock(StopFlag);
+    impl Clock for StopClock {
+        fn now(&self) -> Duration {
+            Duration::ZERO
+        }
+        fn sleep(&self, _: Duration) {
+            self.0.stop();
+        }
+    }
+    let clock = TestClock::new(START);
+    let stub = StubUpstreams::start(clock);
+    stub.set(Upstream::Osm, Some(Reply::json("[]")));
+    let stop = StopFlag::new();
+    let geocoder = Geocoder::with_parts(
+        Endpoints::stub(&stub.base_url()),
+        Box::new(StopClock(stop.clone())),
+        8,
+    );
+    let cache = Cache::memory_only();
+    assert!(matches!(
+        geocoder.nominatim_checked(&cache, "合成最初", "", &stop),
+        Outcome::Success(_)
+    ));
+    assert!(matches!(
+        geocoder.nominatim_checked(&cache, "合成待機", "", &stop),
+        Outcome::Stopping
+    ));
+    assert_eq!(stub.take_seen().len(), 1);
+
+    let stop = StopFlag::new();
+    let s = stop.clone();
+    let mut geocoder = Geocoder::with_endpoints(Endpoints::stub(&stub.base_url()));
+    geocoder.ai_agent = ureq::Agent::with_parts(
+        ureq::Agent::config_builder()
+            .proxy(None)
+            .max_redirects(0)
+            .build(),
+        DefaultConnector::new()
+            .chain(crate::ai::gate::HookConnector(Arc::new(move || {
+                s.stop();
+            })))
+            .chain(GateConnector),
+        DefaultResolver::default(),
+    );
+    assert!(matches!(
+        geocoder.nominatim_checked(&cache, "合成接続後", "", &stop),
+        Outcome::Stopping
+    ));
+    assert!(stub.take_seen().is_empty());
+}
+
+#[test]
+fn ai_inflight_response_is_cached_after_stop_and_get_ai_parallel_share_rate_mutex() {
+    let clock = TestClock::new(START);
+    let stub = StubUpstreams::start(clock.clone());
+    stub.set(Upstream::Gsi, Some(Reply::json("[]")));
+    stub.set(Upstream::Osm, Some(Reply::json("[]")));
+    let geocoder = Arc::new(Geocoder::with_parts(
+        Endpoints::stub(&stub.base_url()),
+        Box::new(SharedClock(clock)),
+        8,
+    ));
+    let cache = Arc::new(Cache::memory_only());
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    std::thread::scope(|s| {
+        let (g, c, b) = (geocoder.clone(), cache.clone(), barrier.clone());
+        s.spawn(move || {
+            b.wait();
+            g.search(&c, "合成GET");
+        });
+        barrier.wait();
+        assert!(matches!(
+            geocoder.nominatim_checked(&cache, "合成AI", "", &StopFlag::new()),
+            Outcome::Success(_)
+        ));
+    });
+    let seen: Vec<_> = stub
+        .take_seen()
+        .into_iter()
+        .filter(|r| r.upstream == Upstream::Osm)
+        .collect();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].at >= seen[0].at + NOMINATIM_MIN_INTERVAL);
+    let stop = StopFlag::new();
+    let s = stop.clone();
+    stub.set_hook(move |upstream| {
+        if upstream == Upstream::Osm {
+            s.stop();
+        }
+    });
+    assert!(
+        matches!(geocoder.nominatim_checked(&cache,"合成受信中","",&stop),Outcome::Success(v) if v.is_empty())
+    );
+    assert!(cache.get("geocode_osm:合成受信中").is_some());
+}
 
 fn fixture() -> Value {
     let text = fs::read_to_string(format!(
@@ -695,7 +793,7 @@ async fn a_real_clock_keeps_the_interval_between_received_requests() {
         });
     }
     let interval = Duration::from_millis(300);
-    let mut geocoder = Geocoder::production();
+    let mut geocoder = Geocoder::production(DEFAULT_TILE_UA);
     geocoder.endpoints = Endpoints::stub(&stub.base_url());
     geocoder.min_interval = interval;
     let cache = Cache::memory_only();
@@ -842,9 +940,17 @@ fn failure_logs_never_contain_the_query_titles_or_coordinates() {
         Endpoints::stub(&stub.base_url()),
         Box::new(SharedClock(Arc::clone(&clock))),
         MAX_IN_FLIGHT,
-    );
+    )
+    .with_user_agent("GeoFrame-Test/1 (secret-contact.test)");
     let cache = Cache::memory_only();
-    let secrets = ["秘密の検索語", "秘密の地名", "31.4159", "27.1828"];
+    let secrets = [
+        "秘密の検索語",
+        "秘密の地名",
+        "31.4159",
+        "27.1828",
+        "GeoFrame-Test",
+        "secret-contact",
+    ];
     let poisoned = r#"[{"geometry":{"coordinates":[27.1828,31.4159]},"properties":{"title":"秘密の地名"}},"text"]"#;
     let logs = capture::logs_of(|| {
         for (gsi, osm) in [
@@ -888,6 +994,74 @@ fn failure_logs_never_contain_the_query_titles_or_coordinates() {
     assert!(
         !logs.contains("127.0.0.1") && !logs.contains("http://"),
         "{logs}"
+    );
+}
+
+// ---------------------------------------------------------------- User-Agent（`GEOFRAME_TILE_UA`と共用）
+
+/// 本番の組み立て（`AppState::new`）は、設定の `GEOFRAME_TILE_UA` を地名検索にも渡す。未設定なら地図タイルと同じ既定。
+#[test]
+fn the_app_state_hands_the_configured_tile_user_agent_to_the_geocoder() {
+    let dir = TempDir::new("geocode-ua");
+    let (path, _writer) = synthetic_catalog(dir.path(), 0);
+    let state_with = |env: &'static [(&str, &str)]| {
+        let config = Config::load(
+            |k| {
+                env.iter()
+                    .find(|(name, _)| *name == k)
+                    .map(|(_, v)| (*v).to_string())
+            },
+            &Overrides::default(),
+        )
+        .unwrap();
+        AppState::new(Arc::new(config), Catalog::open(&path).unwrap())
+    };
+    let state = state_with(&[("GEOFRAME_TILE_UA", " GeoFrame-Test/1 (synthetic contact) ")]);
+    assert_eq!(
+        state.geocoder.user_agent(),
+        "GeoFrame-Test/1 (synthetic contact)"
+    );
+    assert_eq!(state_with(&[]).geocoder.user_agent(), DEFAULT_TILE_UA);
+    assert_eq!(
+        state_with(&[("GEOFRAME_TILE_UA", "")])
+            .geocoder
+            .user_agent(),
+        DEFAULT_TILE_UA
+    );
+}
+
+/// 地理院にも Nominatim にも、設定した User-Agent が届く。通信先を替える入口は既定（`GeoFrame/0.2`）のまま。
+#[test]
+fn the_configured_user_agent_reaches_both_upstreams() {
+    let ua = "GeoFrame-Test/1 (synthetic contact)";
+    let clock = TestClock::new(START);
+    let stub = StubUpstreams::start(Arc::clone(&clock));
+    let parts = || {
+        Geocoder::with_parts(
+            Endpoints::stub(&stub.base_url()),
+            Box::new(SharedClock(Arc::clone(&clock))),
+            MAX_IN_FLIGHT,
+        )
+    };
+    let search = |geocoder: &Geocoder| {
+        stub.set(Upstream::Gsi, Some(Reply::json("[]")));
+        stub.set(Upstream::Osm, Some(Reply::json("[]")));
+        geocoder.search(&Cache::memory_only(), "ab");
+        stub.take_seen()
+            .into_iter()
+            .map(|s| (s.upstream, s.user_agent))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        search(&parts()),
+        [
+            (Upstream::Gsi, USER_AGENT.into()),
+            (Upstream::Osm, USER_AGENT.into())
+        ]
+    );
+    assert_eq!(
+        search(&parts().with_user_agent(ua)),
+        [(Upstream::Gsi, ua.into()), (Upstream::Osm, ua.into())]
     );
 }
 

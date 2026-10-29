@@ -51,6 +51,8 @@ md-5 = "0.11.0"
 mimalloc = { version = "0.1.48", default-features = false }
 
 [dev-dependencies]
+# Count SQL in the synthetic 6500-target regression; no production tracing or new crate.
+rusqlite = { version = "0.40.2", features = ["trace"] }
 # 時間を止めて進める（limits.rs の無通信の期限の検査）。新しい crate は増えない
 tokio = { version = "1.54.1", features = ["test-util"] }
 # 契約テストで応答を JSON Schema と突き合わせる。Schema は内部参照（`#/$defs/...`）だけなので、HTTP・ファイルの

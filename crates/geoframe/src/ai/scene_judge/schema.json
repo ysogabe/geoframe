@@ -1,0 +1,132 @@
+{
+  "type": "object",
+  "properties": {
+    "same_scene": {
+      "type": "boolean"
+    },
+    "summary": {
+      "type": "string"
+    },
+    "photos": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "index": {
+            "type": "integer"
+          },
+          "subject": {
+            "type": "string",
+            "enum": [
+              "person",
+              "dog",
+              "cat",
+              "person_and_pet",
+              "landscape",
+              "food",
+              "vehicle",
+              "other"
+            ]
+          },
+          "pet_state": {
+            "type": "string",
+            "enum": [
+              "awake",
+              "sleeping",
+              "active",
+              "uncertain",
+              "not_applicable"
+            ]
+          },
+          "eyes": {
+            "type": "string",
+            "enum": [
+              "open",
+              "closed",
+              "mixed",
+              "not_visible",
+              "uncertain",
+              "not_applicable"
+            ]
+          },
+          "face_crop": {
+            "type": "string",
+            "enum": [
+              "good",
+              "intentional_closeup",
+              "accidental_cut",
+              "not_visible",
+              "uncertain",
+              "not_applicable"
+            ]
+          },
+          "horizon_status": {
+            "type": "string",
+            "enum": [
+              "level",
+              "intentional_tilt",
+              "accidental_tilt",
+              "uncertain",
+              "not_applicable"
+            ]
+          },
+          "horizon_score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "subject_sharpness": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "aesthetic_score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "keep_score": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 100
+          },
+          "recommended": {
+            "type": "boolean"
+          },
+          "reasons": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "concerns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        },
+        "required": [
+          "index",
+          "subject",
+          "pet_state",
+          "eyes",
+          "face_crop",
+          "horizon_status",
+          "horizon_score",
+          "subject_sharpness",
+          "aesthetic_score",
+          "keep_score",
+          "recommended",
+          "reasons",
+          "concerns"
+        ]
+      }
+    }
+  },
+  "required": [
+    "same_scene",
+    "summary",
+    "photos"
+  ]
+}
