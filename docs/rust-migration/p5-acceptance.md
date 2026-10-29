@@ -35,7 +35,7 @@
 | AC2（演習の部分: 本番と同じ経路） | 合格 | `rust-deploy.sh --production` を 2 回（切替・切り替え直し）通して終了コード 0。`--check-only` は 3 回（§1.10・§2・§9.2）とも 0。印がある・Python が稼働中のときは終了コード 4 で何も変えずに断った。`--expect-min-photos`（3,003・3,006）を下限として確認が通った。`deploy-pull.sh --dry-run` は固定の印で 3（§1・§2・§5） |
 | AC3 | 合格 | §10 の手順で、起動の前に `integrity_check` ok・`.dump` の SHA-256 がバックアップの控えと一致・DATA_DIR の直下に `geoframe` 以外の所有のファイル 0。起動のあと配信 200。画像の欠けは 1 件（バックアップのあとに回転した 1 件だけで、想定と一致）。直し方を確定して §10.5 に書いた（§7） |
 | AC4 | 合格 | 新しい本番のコピーと本番と同じ配置で、手順書のとおり切り替えた。T0〜T1 は 43 秒（5 分以内）。Python のフィードの 3,065 件がすべて Rust にあり、Rust だけ 0 件。シャドー比較は許容外 0（`shadow_judge.py` 終了コード 0）。取り込みの 1 サイクル（Drive の段は鍵が無いので省略）と、ローカルの AI（Embedding 108 件・手がかり 6 件が成功）が動いた。miharashi の取得 200 件・Retrying 0（§2・§3） |
-| AC5 | 合格 | Rust→Python は 3 秒。共通の設定が `GEOFRAME_AI_ENABLED=1` のまま、Python のプロセスの環境は `GEOFRAME_AI_ENABLED=0`・`GEOFRAME_LOC_SUGGEST=0`（drop-in が勝つ）。AI を示す語の journal の行 0、例外の行 0。Rust の期間の手動の位置・お気に入り・除外・回転（ID ごと 20 行）が不一致 0、下書きの全ハッシュの差 0、`.cache.json` は Python の経路で読めた。品質は場合 1・2 とも件数が基準と同じで「説明できない変化 0」。再び Rust へ切り替えて 42 秒で配信が戻った（§4・§5） |
+| AC5 | 合格 | Rust→Python は 3 秒。共通の設定が `GEOFRAME_AI_ENABLED=1` のまま、Python のプロセスの環境は `GEOFRAME_AI_ENABLED=0`・`GEOFRAME_LOC_SUGGEST=0`（drop-in が勝つ）。AI を示す語の journal の行 0、例外の行 0。Rust の期間の手動の位置・お気に入り・除外・回転（ID ごと 20 行）が不一致 0、下書きの全ハッシュの差 0、`.cache.json` は Python の経路で読めた。品質は場合 1・2 とも件数が基準と同じで「説明できない変化 0」。再び Rust へ切り替えて 42 秒で配信が戻った（§4・§5）。Rust が作った品質の結果（`rust-phash-v1`）を戻す経路は演習で起きず、§4.4 の根拠（CI の `switchbacks` と Rust の試験、品質の実装に P5 の変更なし）で代えた |
 | AC8（演習の部分） | 合格 | 旧 Python の判定済みの行（`photo_loc_clues` 1,216 行。Python の STATUS は `clue_pending=0`）がある DB で、Rust の `db.loc.clue_pending` が 1,215（`clue_runnable` も 1,215・`clue_pause` は空）。Decision が動いて 1,215 → 1,210 → 1,209 と減った（§6） |
 
 ### 1. 準備（[cutover.md §15.2](cutover.md#152-演習の前の準備と各節の省略置き換え)・§1）
@@ -157,6 +157,11 @@
 - 特徴量の追加 1 は、Rust の期間に回転した写真を、戻したあと Python が解析し直したもの（写真は変わっていないので、群は変わらない）。
 - フィードの 3,065 → 3,068 は、既知の差 0 と、**Python の最初のサイクルの位置の推定**で位置が付いた既存の写真 3 件（3 件とも `loc_source='inferred'` で、Rust の期間に手動の位置を付けた写真が錨。Rust の期間には次のサイクルがまだ回っていなかった）。`photos` の件数は増えていない。手順書の場合 1 の数え方に、この場合を足した（§9 の 6）。
 - 場合 2 は、Python を止め、`geoframe` で `photo_quality_dirty` を `1` にして起動した。再構築は起動から約 5 秒で終わった（`dirty` が `0` に戻り、`max(analyzed_at)` が変わった。`algorithm` が元から `poc-phash-v1` なので、それでは見分けられない。§9 の 7）。
+
+- **Rust が作った品質の結果を Python へ戻す経路（`rust-phash-v1` を基準にした場合）は、この演習では起きなかった**。P5 の全体レビュー（Sol）の指摘を受け、次の根拠でこの経路の確認に代える（管理者の判断。2026-10-30）:
+  - `tools/gen_quality_fixture.py` の `switchbacks`（Rust が作った `photo_quality`・特徴量の DB に Python 本体を流し、①そのまま戻した直後は全列が一致して `algorithm` が `rust-phash-v1` のまま、②`dirty` の再構築で全行が `poc-phash-v1` になり、グループの顔ぶれ・`kind` が変わらない、を確かめる）と、Rust 側の `crates/geoframe/src/quality/tests.rs` の切り戻しの試験（[server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)）。どちらも CI（`python3 tools/gen_quality_fixture.py --check` と `cargo test`）で回っている。
+  - P5（`origin/main...` の演習のコミット）で、品質の実装（`crates/geoframe/src/quality.rs`・`quality/`・`selection.rs`・`sync.rs`）、Python の実装（`app/geoframe/`）、`tools/gen_quality_fixture.py` に変更が無い（`git diff --stat` が空）。
+  - 本番では、切替のあと新しい写真が入れば Rust の再構築が走る。猶予期間の中で Python へ戻すときは、cutover.md §8.4 の品質の確認（基準が `rust-phash-v1` の場合の `algorithm` の見分け方を含む）をそのまま使う。
 
 ### 5. 流れ 6: 切り替え直す（§9）
 
