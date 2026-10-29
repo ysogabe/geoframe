@@ -2,6 +2,7 @@
 use super::*;
 use crate::ai::jobs::{Completion, Failure, JobState};
 use crate::ai::ops::{self, RetryTarget};
+use crate::ai::settings::TaskKind;
 use crate::ai::tests_http::{Captured, Stub, respond, stub};
 use crate::ai::tests_settings::variant;
 use crate::ai::tests_worker::{Env, T0, env_with};
@@ -1376,4 +1377,212 @@ fn status_clue_pending_follows_the_decision_model_and_falls_back_to_python_rows_
     add(&unset, 2, "photos/b.jpg", Some(&jpeg()), 1);
     legacy_clue(&unset, 1, "photos/a.jpg");
     assert_eq!(clue_pending(&unset), 1);
+}
+
+// ---- STATUS の `db.loc.clue_runnable`・`clue_pause`（timer 用。今 Decision が動けば進む待ち）----
+
+fn loc_status_with(e: &Env, ctx: &crate::admin::AdminContext) -> serde_json::Value {
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    crate::admin::status(&read, ctx).unwrap()["db"]["loc"].clone()
+}
+/// (clue_pending, clue_runnable, clue_pause)
+fn waits(e: &Env) -> (i64, i64, String) {
+    let ctx = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    let loc = loc_status_with(e, &ctx);
+    (
+        loc["clue_pending"].as_i64().unwrap(),
+        loc["clue_runnable"].as_i64().unwrap(),
+        loc["clue_pause"].as_str().unwrap().to_string(),
+    )
+}
+fn insert_job(e: &Env, key: &JobKey, state: &str, next_attempt_at: i64) {
+    let (target, hash, version, state) = (
+        key.target_key.clone(),
+        key.input_hash.clone(),
+        key.processor_version.clone(),
+        state.to_string(),
+    );
+    e.writer()
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO ai_jobs(kind,target_key,input_hash,processor_version,state,next_attempt_at,created_at,updated_at)
+                 VALUES('location_clue',?1,?2,?3,?4,?5,0,0)",
+                params![target, hash, version, state, next_attempt_at],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn status_clue_runnable_counts_only_waits_decision_can_advance() {
+    let lab = Lab::new();
+    let e = lab.env("clue-runnable");
+    assert_eq!(waits(&e), (0, 0, String::new()));
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    // ジョブがまだ無い待ちは、動けば進む
+    assert_eq!(waits(&e), (1, 1, String::new()));
+    // 品質の解析待ち（画像を送らず後回しになる）だけなら進められない
+    add(&e, 2, "photos/q.jpg", Some(&jpeg()), 0);
+    assert_eq!(waits(&e), (2, 1, String::new()));
+    sql(&e, "DELETE FROM photos WHERE id=1");
+    assert_eq!(waits(&e), (1, 0, String::new()));
+    // 品質の解析に失敗した写真も、Decision を使わずに恒久失敗になる
+    add(&e, 3, "photos/f.jpg", Some(&jpeg()), 2);
+    assert_eq!(waits(&e), (2, 0, String::new()));
+}
+
+#[test]
+fn status_clue_runnable_ignores_deferrals_before_their_due_time_and_failed_history() {
+    let lab = Lab::new();
+    let e = lab.env("clue-runnable-defer");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    let key = targets(&e)[0].key.clone();
+    let now = crate::ai::jobs::unix_now();
+    // 期限が先の後回しだけ
+    insert_job(&e, &key, "deferred", now + 3600);
+    assert_eq!(waits(&e), (1, 0, String::new()));
+    // 期限が来れば動く
+    sql(
+        &e,
+        &format!("UPDATE ai_jobs SET next_attempt_at={}", now - 1),
+    );
+    assert_eq!(waits(&e), (1, 1, String::new()));
+    // 実行中も動いている扱い
+    sql(&e, "UPDATE ai_jobs SET state='running', next_attempt_at=0");
+    assert_eq!(waits(&e), (1, 1, String::new()));
+    // 失敗の履歴だけ（明示の再試行まで動かない）
+    sql(&e, "UPDATE ai_jobs SET state='failed'");
+    assert_eq!(waits(&e), (1, 0, String::new()));
+}
+
+#[test]
+fn status_clue_runnable_is_zero_while_the_provider_is_paused_and_follows_release() {
+    let lab = Lab::new();
+    let e = lab.env("clue-runnable-pause");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&e, 2, "", None, 0);
+    fs::write(e.config.data_dir.join("derivatives/fake2.jpg"), jpeg()).unwrap();
+    assert_eq!(waits(&e), (2, 2, String::new()));
+    let settings = e.config.ai.settings().unwrap();
+    let provider = settings.provider_pause_key(TaskKind::LocationClue).unwrap();
+    e.writer()
+        .call(move |c| {
+            crate::ai::pause::pause(
+                c,
+                TaskKind::LocationClue,
+                &provider,
+                crate::ai::pause::PauseReason::Unauthorized,
+                1,
+            )
+        })
+        .unwrap();
+    // 総待ちは保つ。動けないので runnable は 0 で、理由コードだけ出す
+    assert_eq!(waits(&e), (2, 0, "unauthorized".to_string()));
+    sql(&e, "DELETE FROM ai_provider_pauses");
+    assert_eq!(waits(&e), (2, 2, String::new()));
+    // 用途の停止も同じ
+    let task = settings.task_pause_key(TaskKind::LocationClue).unwrap();
+    e.writer()
+        .call(move |c| {
+            crate::ai::pause::pause(
+                c,
+                TaskKind::LocationClue,
+                &task,
+                crate::ai::pause::PauseReason::ModelNotFound,
+                1,
+            )
+        })
+        .unwrap();
+    assert_eq!(waits(&e), (2, 0, "model_not_found".to_string()));
+}
+
+#[test]
+fn status_clue_runnable_is_absent_when_rust_does_not_judge() {
+    let lab = Lab::new();
+    let e = lab.env("clue-runnable-off");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    let mut off = (*e.config).clone();
+    off.ingest = false;
+    let ctx = crate::admin::AdminContext::new(&off, &off.data_dir);
+    let loc = loc_status_with(&e, &ctx);
+    assert!(loc.get("clue_runnable").is_none() && loc.get("clue_pause").is_none());
+    assert_eq!(loc["clue_pending"], 1);
+}
+
+#[test]
+fn status_never_opens_image_files_and_judges_fallback_photos_from_stored_rows() {
+    let lab = Lab::new();
+    let e = lab.env("clue-status-no-read");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&e, 2, "", None, 0);
+    add(&e, 3, "", None, 0);
+    fs::write(e.config.data_dir.join("derivatives/fake2.jpg"), jpeg()).unwrap();
+    // fake3 の derivative は無い（読めない fallback）
+    let before = source_reads();
+    assert_eq!(waits(&e), (3, 3, String::new()));
+    cycle(&e);
+    let after_cycle = source_reads();
+    assert!(after_cycle > before);
+    // 保存済み・恒久失敗の fallback も含め、待ちは 0。STATUS は 1 回もファイルを読まない
+    assert_eq!(waits(&e), (0, 0, String::new()));
+    assert_eq!(source_reads(), after_cycle);
+    // ワーカーが観測するまで、ファイルだけの変更は見えない。観測して新しい世代のジョブが積まれたら待ちに戻る
+    fs::write(e.config.data_dir.join("derivatives/fake2.jpg"), {
+        let mut v = Vec::new();
+        jpeg_encoder::Encoder::new(&mut v, 80)
+            .encode(&[30; 32 * 24 * 3], 32, 24, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        v
+    })
+    .unwrap();
+    assert_eq!(waits(&e), (0, 0, String::new()));
+    let changed = Input::load(&crate::db::open_read_only(&e.config.db_path()).unwrap(), 2)
+        .unwrap()
+        .unwrap()
+        .observe(&data(&e))
+        .key("example-decision");
+    insert_job(&e, &changed, "pending", 0);
+    assert_eq!(waits(&e), (1, 1, String::new()));
+    assert_eq!(source_reads(), after_cycle + 1); // 試験自身の observe の 1 回だけ
+}
+
+#[test]
+fn status_clue_waits_are_cached_per_model_and_recomputed_after_the_ttl() {
+    let lab = Lab::new();
+    let e = lab.env("clue-status-cache");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    let cached = crate::admin::AdminContext::new(&e.config, &e.config.data_dir);
+    let fresh = crate::admin::AdminContext::new(&e.config, &e.config.data_dir)
+        .with_clue_ttl(Duration::ZERO);
+    assert_eq!(loc_status_with(&e, &cached)["clue_pending"], 1);
+    add(&e, 2, "photos/b.jpg", Some(&jpeg()), 1);
+    // TTL の間は前の値。TTL を過ぎた（0）文脈は数え直す
+    assert_eq!(loc_status_with(&e, &cached)["clue_pending"], 1);
+    assert_eq!(loc_status_with(&e, &fresh)["clue_pending"], 2);
+    // 停止はキャッシュに入れず、毎回読む
+    let provider = e
+        .config
+        .ai
+        .settings()
+        .unwrap()
+        .provider_pause_key(TaskKind::LocationClue)
+        .unwrap();
+    e.writer()
+        .call(move |c| {
+            crate::ai::pause::pause(
+                c,
+                TaskKind::LocationClue,
+                &provider,
+                crate::ai::pause::PauseReason::Forbidden,
+                1,
+            )
+        })
+        .unwrap();
+    let loc = loc_status_with(&e, &cached);
+    assert_eq!(
+        (loc["clue_pending"].as_i64(), loc["clue_runnable"].as_i64()),
+        (Some(1), Some(0))
+    );
+    assert_eq!(loc["clue_pause"], "forbidden");
 }

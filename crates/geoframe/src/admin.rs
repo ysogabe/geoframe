@@ -6,8 +6,9 @@
 //! 使用量は Python と同じく 60 秒キャッシュ）。位置候補の列（`db.loc`）は、DB の `photo_loc_clues`・
 //! `photo_loc_runs`・`photo_loc_suggestions` と `settings.photo_loc_status`（Python のワーカーが前回の
 //! 処理時に書いた Decision の状態）から計算する。Rust は Decision に問い合わせず、その値を書き換えない。
-//! ただし `clue_pending` は、Rust が位置の手がかりを判定するときは Rust の保存結果（`ai_location_clues`）が今の
-//! 入力に合っていない写真の数にする（`ai::location_clue::pending_count`）。
+//! ただし Rust が位置の手がかりを判定するときは、`clue_pending` を Rust の保存結果（`ai_location_clues`）が今の
+//! 入力に合っていない写真の数にし、`clue_runnable`・`clue_pause` を足す（`ai::location_clue::wait_counts`。
+//! **画像ファイルは開かず DB だけを読み**、結果は短い間キャッシュする）。
 //!
 //! 1回の応答の件数は**1つの読み取りトランザクション**の中で数える（Python は件数ごとにロックを取り直す
 //! ので、書き込みが挟まると合計がずれうる。Rust は一貫した断面を返す）。仕様と Python との差は
@@ -17,15 +18,17 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use rusqlite::types::{Type, ValueRef};
 use rusqlite::{Connection, Row, params_from_iter};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::ai::ops::TaskPause;
 use crate::ai::settings::TaskKind;
 use crate::config::Config;
-use crate::datadir::DataDir;
 use crate::photos::parse_epoch;
 use crate::sysinfo;
 
@@ -50,10 +53,11 @@ pub struct AdminContext {
     pub ai: crate::ai::settings::AiConfig,
     /// 今の AI 設定の用途ごとの待ちの識別（`ai_waits` を用途に結び直す。ハッシュはメモリの中だけで、応答には出さない）。
     pub ai_waits: crate::ai::waits::Identities,
-    /// Rust が位置の手がかり（Decision）を判定するとき（`location_clue` の用途が使えて取り込みが有効＝ワーカーに
-    /// ハンドラが登録される）の、データ置き場と Decision のモデル。無ければ `None`（`clue_pending` は旧 Python の
-    /// 行だけで数える）。
-    rust_clue: Option<(DataDir, String)>,
+    /// 設定上、Rust が位置の手がかり（Decision）を判定するとき（取り込みが有効で `location_clue` の用途が使える）の、
+    /// Decision のモデルと待ちの件数のキャッシュ。実際のハンドラ登録にはさらに LAN クライアントの生成とデータ置き場の
+    /// 解決が要るが、STATUS は設定だけで決める。無ければ `None`（`clue_pending` は旧 Python の行だけで数え、
+    /// `clue_runnable`・`clue_pause` は出さない）。
+    rust_clue: Option<RustClue>,
     scene_config: Config,
 }
 
@@ -71,16 +75,71 @@ impl AdminContext {
     }
 }
 
-/// `worker::production_handlers` が `LocationClue` のハンドラを登録する条件と同じ。
-fn rust_clue(config: &Config) -> Option<(DataDir, String)> {
+impl AdminContext {
+    /// 試験用: 待ちの件数のキャッシュの有効時間を変える（`Duration::ZERO` で毎回再計算）。
+    #[cfg(test)]
+    pub(crate) fn with_clue_ttl(mut self, ttl: Duration) -> Self {
+        if let Some(rust) = &mut self.rust_clue {
+            rust.cache = Arc::new(ClueCache::new(ttl));
+        }
+        self
+    }
+}
+
+/// 設定上 Rust が判定するとき: 取り込みが有効で、`location_clue` の用途が使える（`worker::production_handlers` が
+/// ハンドラを登録する設定上の条件。LAN クライアントの生成とデータ置き場を開けることは、ここでは確かめない）。
+fn rust_clue(config: &Config) -> Option<RustClue> {
     if !config.ingest {
         return None;
     }
     let gate = config.ai.gate(TaskKind::LocationClue, true).ok()?;
-    Some((
-        DataDir::open(&config.data_dir).ok()?,
-        gate.settings.model.clone(),
-    ))
+    Some(RustClue {
+        model: gate.settings.model.clone(),
+        cache: Arc::new(ClueCache::new(CLUE_WAITS_TTL)),
+    })
+}
+
+/// 待ちの件数を再計算するまでの間隔。STATUS は 5 秒ごとの画面更新や timer から呼ばれる。
+const CLUE_WAITS_TTL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone)]
+struct RustClue {
+    model: String,
+    cache: Arc<ClueCache>,
+}
+
+/// 待ちの件数の短いキャッシュ。モデルが変わったら使わない。再計算は 1 つずつ（計算中の別の要求は終わるのを待ち、
+/// 出来た値を使う）。停止の有無は値に含めず毎回読む（`ai-jobs release-pause` の効果がすぐ見えるように）。
+#[derive(Debug)]
+struct ClueCache {
+    ttl: Duration,
+    slot: Mutex<Option<(String, Instant, crate::ai::location_clue::Waits)>>,
+}
+
+impl ClueCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            slot: Mutex::new(None),
+        }
+    }
+
+    fn get(
+        &self,
+        model: &str,
+        compute: impl FnOnce() -> rusqlite::Result<crate::ai::location_clue::Waits>,
+    ) -> rusqlite::Result<crate::ai::location_clue::Waits> {
+        let mut slot = self.slot.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((cached, at, waits)) = slot.as_ref()
+            && cached == model
+            && at.elapsed() < self.ttl
+        {
+            return Ok(*waits);
+        }
+        let waits = compute()?;
+        *slot = Some((model.to_string(), Instant::now(), waits));
+        Ok(waits)
+    }
 }
 
 fn conversion_error(message: &'static str) -> rusqlite::Error {
@@ -514,12 +573,32 @@ fn loc_status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Value> 
     }
     // 待ち: Rust が判定するときは、Rust の判定が今の入力の世代に対して保存されていない写真の数（旧 Python の
     // `photo_loc_clues` の行があっても数える）。Rust が判定しないとき（AI 無効・用途なし・取り込み無効）は、
-    // 旧 Python の行の世代一致で数える従来の値のまま
+    // 旧 Python の行の世代一致で数える従来の値のまま。`clue_runnable` は timer 用で、そのうち今 Decision が動けば
+    // 進む件数（Provider の停止中は 0。品質待ち・期限前の後回しは数えない）
+    let mut clue = Map::new();
     let clue_pending = match &ctx.rust_clue {
-        Some((data, model)) => crate::ai::location_clue::pending_count(conn, data, model)?,
+        Some(rust) => {
+            let waits = rust.cache.get(&rust.model, || {
+                crate::ai::location_clue::wait_counts(
+                    conn,
+                    &rust.model,
+                    crate::ai::jobs::unix_now(),
+                )
+            })?;
+            let (runnable, pause) =
+                match crate::ai::ops::task_pause(conn, &ctx.ai, TaskKind::LocationClue) {
+                    TaskPause::None => (waits.runnable, ""),
+                    TaskPause::Paused(paused) => (0, paused.reason.as_str()),
+                    // 停止の表を読めないとき、送信側は送らない
+                    TaskPause::Unknown => (0, "unknown"),
+                };
+            clue.insert("clue_runnable".into(), json!(runnable));
+            clue.insert("clue_pause".into(), json!(pause));
+            waits.pending
+        }
         None => targets.iter().filter(|t| !t.classified).count(),
     };
-    Ok(json!({
+    let mut loc = json!({
         "decision": last.get("decision").cloned().unwrap_or_else(|| json!("")),
         "last_at": last.get("at").cloned().unwrap_or_else(|| json!("")),
         "targets": targets.len(),
@@ -530,7 +609,11 @@ fn loc_status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Value> 
         "runs_done": runs.get("done").copied().unwrap_or(0),
         "runs_error": runs.get("error").copied().unwrap_or(0),
         "suggested": suggested,
-    }))
+    });
+    if let Value::Object(map) = &mut loc {
+        map.extend(clue);
+    }
+    Ok(loc)
 }
 
 // ---- ディスク（`admin.disk_info`）----

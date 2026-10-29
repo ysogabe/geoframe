@@ -3,12 +3,15 @@
 
 geoframe-loc-decision.timer（Decision を動かすユーザーのユーザーunit、毎朝5:00）から呼ばれる。
 
-1. geoframe の STATUS で判定待ち（db.loc.clue_pending）が無ければ何もしない
-   （Rust 版が判定するときは Rust の保存結果が今の入力に合っていない写真の数。旧 Python の
-   判定済みの行があっても数える。Rust が判定しないときは従来どおり旧 Python の行で数える）
+1. geoframe の STATUS で、今 Decision を動かせば進む判定待ちが無ければ何もしない。
+   数えるのは db.loc.clue_runnable（Rust 版が判定するときだけ出る。Provider の停止中・品質の
+   解析待ち・期限前の後回しだけの写真は含まない）。無ければ（旧 Python など）db.loc.clue_pending
+   （Rust が判定するときは総待ち＝Rust の保存結果が今の入力に合っていない写真の数。Rust が判定
+   しないときは旧 Python の行で数えた値）を使う。clue_pending が残っていても clue_runnable が
+   0 なら Decision を起動しない（起動しても進まないため）。起動後もこの値が減らなければ停滞とみなす
 2. 人が Decision（llm-decision）を起動済みなら何もしない（止めるのも人に任せる）
 3. GPU が空いていなければ何もしない（翌朝もう一度見る）
-4. Decision を起動し、判定待ちが0になったら止める。上限の時間を過ぎた・判定が
+4. Decision を起動し、1. の判定待ち（clue_runnable、無ければ clue_pending）が0になったら止める。上限の時間を過ぎた・判定が
    進まない・別の処理が GPU を使い始めたときも止める（続きは翌朝）
 
 なお gpu-eval の Decision は今は常駐しているので、現状では 2. で「人が起動済み」と
@@ -70,8 +73,16 @@ def get_json(url: str, timeout: float = 5.0, headers: dict | None = None):
         return json.loads(r.read().decode("utf-8"))
 
 
+def clue_work(status: dict) -> int:
+    """STATUS から、今 Decision を動かせば進む判定待ちの数を取る。
+
+    clue_runnable があればそれ、無ければ（旧 Python など）clue_pending。"""
+    loc = status["db"]["loc"]
+    return int(loc["clue_runnable"] if "clue_runnable" in loc else loc["clue_pending"])
+
+
 def clue_pending() -> int:
-    return int(get_json(GEOFRAME_STATUS_URL)["db"]["loc"]["clue_pending"])
+    return clue_work(get_json(GEOFRAME_STATUS_URL))
 
 
 def gpu_busy_reasons(status: dict | None, ollama_models: list | None,

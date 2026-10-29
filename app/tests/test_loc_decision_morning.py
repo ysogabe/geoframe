@@ -108,6 +108,38 @@ class RunTest(unittest.TestCase):
         clock = FakeClock()
         return m.run(sleep=clock.sleep, clock=clock)
 
+    def use_status(self, *locs):
+        """clue_pending を本物に戻し、STATUS（get_json）だけを偽物にする。最後の値は繰り返す"""
+        statuses = [{"db": {"loc": loc}} for loc in locs]
+        m.clue_pending = self.saved["clue_pending"]
+        real = m.get_json
+        self.addCleanup(setattr, m, "get_json", real)
+        m.get_json = lambda url, *a, **k: statuses.pop(0) if len(statuses) > 1 else statuses[0]
+
+    def test_total_pending_but_nothing_runnable_does_not_start(self):
+        # Provider の停止中など。総待ちは残っても、起動しても進まない
+        self.use_status({"clue_pending": 40, "clue_runnable": 0, "clue_pause": "unauthorized"})
+        self.assertEqual(self.run_script(), 0)
+        self.assertEqual(self.calls, [])
+        self.assertFalse(m.owned())
+
+    def test_old_status_without_runnable_uses_pending(self):
+        self.use_status({"clue_pending": 3}, {"clue_pending": 0})
+        self.assertEqual(self.run_script(), 0)
+        self.assertEqual(self.calls, ["start", "stop"])
+
+    def test_runnable_reaching_zero_stops_even_if_total_pending_remains(self):
+        self.use_status({"clue_pending": 9, "clue_runnable": 4},
+                        {"clue_pending": 9, "clue_runnable": 2},
+                        {"clue_pending": 7, "clue_runnable": 0})
+        self.assertEqual(self.run_script(), 0)
+        self.assertEqual(self.calls, ["start", "stop"])
+
+    def test_runnable_not_decreasing_is_a_stall(self):
+        self.use_status({"clue_pending": 9, "clue_runnable": 4})
+        self.assertEqual(self.run_script(), 1)
+        self.assertEqual(self.calls, ["start", "stop"])
+
     def test_nothing_pending(self):
         self.pending = [0]
         self.assertEqual(self.run_script(), 0)
@@ -187,6 +219,36 @@ class RunTest(unittest.TestCase):
         self.gpu = [(FREE, [])] + [(LEASED, [])] * 500
         self.assertEqual(self.run_script(), 0)
         self.assertTrue(m.owned(), "lease が続いている間は、翌朝止めるために印を残す")
+
+
+class ClueWorkTest(unittest.TestCase):
+    """STATUS の読み方: clue_runnable があればそれを、無ければ clue_pending を使う"""
+
+    @staticmethod
+    def status(**loc):
+        return {"db": {"loc": loc}}
+
+    def test_runnable_wins_over_total_pending(self):
+        self.assertEqual(m.clue_work(self.status(clue_pending=5, clue_runnable=2)), 2)
+        self.assertEqual(m.clue_work(self.status(clue_pending=5, clue_runnable=0)), 0)
+
+    def test_falls_back_to_pending_without_runnable(self):
+        self.assertEqual(m.clue_work(self.status(clue_pending=4)), 4)
+        self.assertEqual(m.clue_work(self.status(clue_pending=0)), 0)
+
+    def test_missing_keys_are_an_error(self):
+        with self.assertRaises(KeyError):
+            m.clue_work(self.status(clue_runnable_x=1))
+
+    def test_clue_pending_reads_status_url(self):
+        saved = m.get_json
+        try:
+            m.get_json = lambda url, *a, **k: self.status(clue_pending=7, clue_runnable=3)
+            self.assertEqual(m.clue_pending(), 3)
+            m.get_json = lambda url, *a, **k: self.status(clue_pending=7)
+            self.assertEqual(m.clue_pending(), 7)
+        finally:
+            m.get_json = saved
 
 
 class DecisionEntranceTest(unittest.TestCase):

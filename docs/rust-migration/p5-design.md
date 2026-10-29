@@ -134,7 +134,7 @@ unitの守り:
 
 ### Decisionの待ちの表示（R9）
 
-STATUSの`db.loc.clue_pending`を、Rustの位置の手がかりのジョブの待ち（未処理・後回し中で、まだ判定を保存していない写真の数）を含む値にする。旧Pythonの`photo_loc_clues`だけで数える今の計算を、Rustの判定の保存結果も見る計算に直す。`loc_decision_morning.py`はこの値だけを見るので、直せば切替のあとも待ちを見落とさない。今はDecisionが常駐していてtimerは何もしないが、常駐をやめる運用に戻したときのために直す。
+STATUSの`db.loc.clue_pending`を、Rustの位置の手がかりのジョブの待ち（未処理・後回し中で、まだ判定を保存していない写真の数）を含む総待ちにする。旧Pythonの`photo_loc_clues`だけで数える今の計算を、Rustの判定の保存結果も見る計算に直す。ただし総待ちには、Providerの停止中・品質の解析待ち・期限前の後回しのように、Decisionを起動しても進まないものも入るので、timer用に `db.loc.clue_runnable`（今Decisionが動けば進む数。Providerの停止中は0）と停止の理由コード `clue_pause` を足し、`loc_decision_morning.py`は `clue_runnable`（無ければ`clue_pending`）を見る。STATUSは画像ファイルを開かず（fallbackの写真は保存された行とワーカーのジョブから判断）、結果を30秒キャッシュする（[ai-location-clue.md](ai-location-clue.md#statusのclue_pendingclue_runnableclue_pause)）。直せば切替のあとも待ちを見落とさず、無駄な起動もしない。今はDecisionが常駐していてtimerは何もしないが、常駐をやめる運用に戻したときのために直す。
 
 ### Pythonへ戻す・切り替え直す（R5）
 

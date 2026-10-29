@@ -67,6 +67,19 @@ pub struct TaskReport {
     pub waiting: Option<i64>,
 }
 
+/// `ai-jobs status` と STATUS が使う、用途の停止の判定（送信側 [`pause::status`] と同じ）。設定で使えない用途は
+/// 評価せず [`TaskPause::None`]。停止の表を読めなければ [`TaskPause::Unknown`]（送信側は送らない）。
+pub fn task_pause(conn: &Connection, ai: &AiConfig, task: TaskKind) -> TaskPause {
+    match (ai.gate(task, true), ai.settings()) {
+        (Ok(_), Some(settings)) => match pause::status(conn, settings, task) {
+            Ok(None) => TaskPause::None,
+            Ok(Some(paused)) => TaskPause::Paused(paused),
+            Err(_) => TaskPause::Unknown,
+        },
+        _ => TaskPause::None,
+    }
+}
+
 /// 用途ごとの状態を読む（読み取りだけ）。`counts` は [`jobs::status_counts`] で、集計できなかったときは `None`。
 fn task_reports(
     conn: &Connection,
@@ -77,14 +90,7 @@ fn task_reports(
         .into_iter()
         .map(|task| {
             let gate = ai.gate(task, true).map(|_| ());
-            let pause = match (gate, ai.settings()) {
-                (Ok(()), Some(settings)) => match pause::status(conn, settings, task) {
-                    Ok(None) => TaskPause::None,
-                    Ok(Some(paused)) => TaskPause::Paused(paused),
-                    Err(_) => TaskPause::Unknown,
-                },
-                _ => TaskPause::None,
-            };
+            let pause = task_pause(conn, ai, task);
             let waiting = if matches!(pause, TaskPause::Paused(_)) {
                 counts.map(|counts| {
                     counts

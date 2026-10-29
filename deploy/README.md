@@ -234,12 +234,15 @@ Decision が常駐している間は、この節のタイマーは「人が起�
 必要なときだけ Decision を動かすタイマーを用意しています
 （[`loc_decision_morning.py`](loc_decision_morning.py)。確認の要求には `X-Client-Name: geoframe-loc-morning` を付けます）。
 
-1. STATUS の判定待ち（`db.loc.clue_pending`）が0なら何もしない（Rust 版が判定するときは、Rust の保存結果が今の入力に合っていない写真の数。旧 Python の判定済みの行があっても数える）
+1. STATUS で、今 Decision を動かせば進む判定待ちが0なら何もしない。数えるのは `db.loc.clue_runnable`
+   （Rust 版が判定するときだけ出る。Provider の停止中・品質の解析待ち・期限前の後回しだけの写真は含まない。
+   理由は `db.loc.clue_pause`）で、無ければ（旧 Python など）`db.loc.clue_pending`。総待ち `clue_pending` が
+   残っていても `clue_runnable` が0なら起動しない（起動しても進まないため）
 2. 人が Decision を起動済みなら何もしない（止めるのも人に任せる）
 3. GPU が空いていなければ何もせず、翌朝にもう一度見る。空いているとみなすのは、llm-manager の
    lease が0件、ほかのプロセスの VRAM が1GB未満、GPU 使用率が10%未満、Ollama がモデルを
    読み込んでいない、のすべてを満たすとき。llm-manager か Ollama の状態を取れないときも使わない
-4. Decision を起動し、判定待ちが0になったら止める。2時間を過ぎた、15分間判定が進まない、
+4. Decision を起動し、1. の判定待ち（`clue_runnable`）が0になったら止める。2時間を過ぎた、15分間判定が進まない、
    別の処理が lease を取った・GPU を使い始めたときも止める（続きは翌朝）
 
 判定が終わった日の Gemini への問い合わせは geoframe-server が続けるので、Decision を止めても
