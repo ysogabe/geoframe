@@ -311,7 +311,7 @@ PY
 ```
 
 - 確かめること: モード `640`・所有者 `root:geoframe`。用途の行がすべて `local`（`photo_judge`・`location_suggest` が**無い**か、`cloud` でない）。`embedding_space`／`embedding_contract` などの中身は [ai-config.md](ai-config.md)・[ai-embedding.md](ai-embedding.md) のとおりで、ここでは読まない。
-- 鍵（Drive の鍵。クラウド AI を有効にするとき同じ鍵を使う）の所有者とモード: `stat -c '%a %U:%G' "${GEOFRAME_DRIVE_KEY のパス}"` が **`600 geoframe:`**（実行ユーザーの所有で、他から読めない）。**root 所有やグループ可読は、クラウドで拒否される**（[ai-cloud.md](ai-cloud.md)。拒否は `Unauthorized` 停止になり、直しても自動では戻らず `release-pause` が要る）。中身は読まない。
+- 鍵（Drive の鍵。クラウド AI を有効にするとき同じ鍵を使う）の所有者とモード: `KEY=$(sed -n 's/^GEOFRAME_DRIVE_KEY=//p' /etc/default/geoframe-rs | tail -n 1 | tr -d "\"'"); stat -c '%a %U:%G' "$KEY"` が **`600 geoframe:geoframe`**（実行ユーザーの所有で、他から読めない）。**root 所有やグループ可読は、クラウドで拒否される**（[ai-cloud.md](ai-cloud.md)。拒否は `Unauthorized` 停止になり、直しても自動では戻らず `release-pause` が要る）。中身は読まない。
 - 失敗したら: モード・所有者を直すのは設定の変更なので、ユーザーの許可を得てから（`chown root:geoframe`・`chmod 0640`）。
 
 ### 1.7 Decision が常駐していること
@@ -538,8 +538,6 @@ rm -rf "$CP"
 
 ```sh
 sudo -u geoframe sqlite3 "file:$SNAP?immutable=1" 'PRAGMA integrity_check'          # ok の 1 行
-DUMPSHA=$(sudo -u geoframe sqlite3 "file:$SNAP?immutable=1" .dump | sha256sum | cut -d' ' -f1); echo "dump sha256: $DUMPSHA"
-sudo -u geoframe sqlite3 "file:$SNAP?immutable=1" < "$WORK/counts.sql" | tee "$WORK/precutover-counts.txt"
 gzip -9 -c -- "$SNAP" > "$OUT.part" \
   && chown geoframe:geoframe "$OUT.part" && chmod 0640 "$OUT.part" \
   && mv "$OUT.part" "$OUT" && gzip -t "$OUT" && rm -f -- "$SNAP"
@@ -547,7 +545,7 @@ ls -l "$OUT"                                       # -rw-r----- geoframe geofram
 ls -A /var/backups/geoframe | grep '^\.' || echo "一時ファイルなし"   # .tmp-・.p5-copy. が残っていない
 ```
 
-- 確かめること: `integrity_check` が **`ok` の 1 行だけ**。`DUMPSHA` を控える（§10 の復元で照合する）。`precutover-counts.txt` に photos・manual・favorite・hidden・rotated・quality_rows・quality_groups・algorithm 別の件数が出る（§8 で比べる）。バックアップは `p5-precutover-<時刻>.db.gz`・`0640`・`geoframe` 所有（`catalog-*` に当たらない名前なので、7 日の世代削除の対象外）。**P5 の記録が終わるまで消さない。**
+- 確かめること: `integrity_check` が **`ok` の 1 行だけ**（`.dump` の SHA-256 と件数は、時間のかかる読み取りなので停止時間の外の §6.8 で取る。この段で要るのは `integrity_check` と `gzip -t` だけ）。バックアップは `p5-precutover-<時刻>.db.gz`・`0640`・`geoframe` 所有（`catalog-*` に当たらない名前なので、7 日の世代削除の対象外）。**P5 の記録が終わるまで消さない。**
 - 失敗したら: `.backup` が失敗・`integrity_check` が `ok` でないときは先へ進まない（配信は止まったまま）。**ここで原因が分からなければ、§3 の「止まったとき」で Python を戻す**（DB は Python が止まって以降、誰も書いていない）。
 
 ### 4.4 一次データの tar
@@ -694,6 +692,21 @@ systemctl show geoframe-rs -p NRestarts -p Result                 # NRestarts=0
 
 - 確かめること: `deploy-pull.sh` が固定の印で断る（rc=3）。`ai-jobs status` が動く。`NRestarts=0`。
 
+### 6.8 保全の控え（停止時間の外で）
+
+バックアップ（§4.3）の `.dump` の SHA-256 と件数を、**配信が戻ったあとで**、バックアップのファイルから取る（本番の DB には触れない。root の作業用の置き場で展開する）。
+
+```sh
+gzip -dc "$OUT" > "$WORK/precutover.db"
+sqlite3 "file:$WORK/precutover.db?immutable=1" 'PRAGMA integrity_check'                 # ok の 1 行
+DUMPSHA=$(sqlite3 "file:$WORK/precutover.db?immutable=1" .dump | sha256sum | cut -d' ' -f1); echo "dump sha256: $DUMPSHA"
+sqlite3 "file:$WORK/precutover.db?immutable=1" < "$WORK/counts.sql" | tee "$WORK/precutover-counts.txt"
+rm -f "$WORK/precutover.db"
+```
+
+- 確かめること: `integrity_check` が `ok`。`DUMPSHA` を控える（§10 の復元で照合し、`p5-acceptance.md` に書く）。`precutover-counts.txt` に photos・manual・favorite・hidden・rotated・quality_rows・quality_groups・algorithm 別の件数が出る（§8 で比べる）。
+- 戻す（§8）が先になったときは、戻したあとでこの 6.8 を行ってよい（バックアップのファイルは変わらない）。
+
 ここまでで切替は完了。T1 から **30 分**は様子を見る（§0.4）。時間・件数を記録する（§14）。
 
 ## 7. AI の書き込み系の操作
@@ -753,7 +766,7 @@ systemctl daemon-reload
 systemctl show -p FragmentPath -p DropInPaths -p EnvironmentFiles geoframe-server    # drop-in と 2 つの EnvironmentFile
 systemctl enable --now geoframe-server
 systemctl is-active geoframe-server                # active
-curl -fsS -o /dev/null -w '%{http_code}\n' $BASE/api/admin/status    # 200（Python の確認。Python に /healthz は無い）
+curl -fsS -o /dev/null -w '%{http_code}\n' $BASE/api/admin/status    # 200（Python の確認は deploy-pull.sh と同じ /api/admin/status）
 curl -fsS -o /dev/null -w '%{http_code}\n' $BASE/api/v1/photos       # 200
 TB=$(date +%s); date '+%F %T'; echo "戻すのにかかった時間 $((TB - TR)) 秒"
 ```
@@ -770,8 +783,8 @@ journalctl -u geoframe-server --since '<8.2の時刻>' -p err --no-pager | cut -
 journalctl -u geoframe-server --since '<8.2の時刻>' --no-pager | grep -iE 'gemini|vertex|aiplatform|embed|decision|loc_suggest'   # AI の送信を示す行が無い（「無効」の行は可）
 python3 -I -c 'import json; json.load(open("/var/lib/geoframe/.cache.json")); print(".cache.json: 読める")'
 sudo -u geoframe sqlite3 'file:/var/lib/geoframe/catalog.db?mode=ro' < "$WORK/counts.sql" > "$WORK/after-return-counts.txt"
-diff "$WORK/precutover-counts.txt" "$WORK/after-return-counts.txt"
-( cd /var/lib/geoframe/travel_blog/drafts && sha256sum -c --quiet "$WORK/drafts-before.sha" )   # 出力なし＝下書きが変わっていない／消えていない
+diff "$WORK/precutover-counts.txt" "$WORK/after-return-counts.txt"      # precutover-counts.txt は §6.8 で取る
+( cd /var/lib/geoframe/travel_blog/drafts && sha256sum -c --quiet "$WORK/drafts-before.sha" )   # 出力なし＝下書きが変わっていない／消えていない（drafts-before.sha が空なら、この行は飛ばす）
 curl -fsS $BASE/api/v1/photos -o "$WORK/py-feed-2.json"; python3 -I "$WORK/check_files.py" "$WORK/py-feed-2.json"
 ```
 
@@ -795,27 +808,29 @@ curl -fsS $BASE/api/v1/photos -o "$WORK/py-feed-2.json"; python3 -I "$WORK/check
 
 ## 9. 切り替え直す
 
-目的: Python へ戻したあと、原因を直してもう一度 Rust にする。許可を得て。
+目的: Python へ戻したあと、原因を直してもう一度 Rust にする。許可を得て。**Python が動いているうちに控えを取り直す**（止めたあとはフィードを取れない）。
 
-1. **Python を止めて mask する**（drop-in は残したまま）:
+1. **`geoframe-rs` を unmask する**（`--check-only` も `--production` も、mask を理由に断る）。Rust は `disabled`（または unit が無ければ `not-found`）になり、起動しない:
 
 ```sh
+systemctl unmask geoframe-rs
+systemctl is-enabled geoframe-rs                   # disabled（unit が残っているとき）／ not-found（失敗で外れたとき）
+systemctl is-active geoframe-rs                    # inactive
+```
+
+2. **§2 をやり直す**: Python の `/api/v1/photos` の ID の一覧・件数・STATUS・下書きのハッシュを控え直す（Python のあいだに写真が増減している）。`--check-only` を通す（`--expect-min-photos` も新しい件数から）。
+3. **Python を止めて mask する**（drop-in は残したまま。ここで T0 を取り直す）:
+
+```sh
+T0=$(date +%s); date '+%F %T'
 systemctl stop geoframe-server
 systemctl disable geoframe-server || true
 systemctl mask geoframe-server
 systemctl is-active geoframe-server; systemctl is-enabled geoframe-server    # inactive / masked
 ```
 
-2. **`geoframe-rs` を unmask する**（先にしないと `rust-deploy.sh` が mask を理由に断る）:
-
-```sh
-systemctl unmask geoframe-rs
-systemctl is-enabled geoframe-rs                   # disabled（unit が残っているとき）／ not-found（失敗で外れたとき）
-```
-
-3. **§2 をやり直す**（Python の `/api/v1/photos` の ID の一覧・件数・STATUS を控え直す。Python のあいだに写真が増減している）。`--check-only` も通す。
 4. **§4 の保全を取り直す**（`$TS` を新しくする。名前は `p5-precutover-…` のままでよい。前回のものは消さない）。`geoframe-backup.timer` を止めてから。
-5. **§5 → §6** を実行する。バイナリは同じものでよい（`--expect-sha256` は同じ）。
+5. **§5 → §6** を実行する（T1 と時間も記録し直す）。バイナリは同じものでよい（`--expect-sha256` は同じ）。
 
 `p5-rollback.conf` は Python だけに効くので、Rust の AI の設定は変わらない。checkout の固定の印はそのまま。
 
@@ -861,7 +876,7 @@ sudo -u geoframe sqlite3 "file:$TMP?immutable=1" 'PRAGMA integrity_check'       
 sudo -u geoframe sqlite3 "file:$TMP?immutable=1" .dump | sha256sum | cut -d' ' -f1        # = バックアップの .dump の SHA-256
 ```
 
-- 確かめること: `integrity_check` が `ok`。`.dump` の SHA-256 が、**取ったときに控えた値**（`p5-precutover-*` なら §4.3 の `$DUMPSHA`）と一致する。他のバックアップ（`catalog-*.db.gz`）は控えが無いので、`$WORK` に別に展開して同じ方法でハッシュを取り、照合の基準にする（`/var/lib/geoframe` の外・root の `sqlite3` で）。
+- 確かめること: `integrity_check` が `ok`。`.dump` の SHA-256 が、**取ったときに控えた値**（`p5-precutover-*` なら §6.8 の `$DUMPSHA`）と一致する。他のバックアップ（`catalog-*.db.gz`）は控えが無いので、`$WORK` に別に展開して同じ方法でハッシュを取り、照合の基準にする（`/var/lib/geoframe` の外・root の `sqlite3` で）。
 - 失敗したら: 一致しなければ、その一時ファイルを置かない（`rm "$TMP"`）。別のバックアップを試す。**いまの DB は `$ASIDE` にあるので、戻せる**（`mv "$ASIDE"/catalog.db* /var/lib/geoframe/`）。
 
 ### 10.4 置き換えて、所有者を確かめる
