@@ -124,8 +124,20 @@ P3で守ること（各タスクの委任文に入れる）:
 |---|---|---|---|---|---|---|
 | T4.10 | Provider全体の停止で止まる用途を`ai-jobs status`と管理画面のSTATUSに出す（`ai_task_blocks`）。待ちがあるときのワーカーの周期を短くする（`GEOFRAME_AI_BACKLOG_POLL_S`既定5秒、手がかりの1周期の件数を60→10） | full | 完了 | a2924d5 | 42009d7..0075a1e | PR #62。実装Sonnet。security-review（Opus）: 指摘0。レビュー（Sol）2回: 必須1→0。座標化の残りは短い待ちにし、クラウドに送る用途は予算の周期を早めないよう外したまま（Solも同意）。検証LXC（77dd1e4、約2時間40分）: ダミー鍵で起こした停止で、同じ鍵の両用途が「停止中: Provider全体」と待ちの件数を表示。解除で戻り、手がかりは1周期10件・約2分おきで、合間にEmbeddingが進んだ。持ち越し: 鍵の権限で止まったときも画面は「認証エラー（401）」と出る（理由コードの共有。journalには本当の理由が出る）。周期の開始・終了のログ行が無い |
 
-## P5: 切替（未着手）
+## P5: 切替（実装中）
 
-| ID | 内容 | AC（Issue #54） | 種類 | 状態 |
-|---|---|---|---|---|
-| P5 | バックアップ・復元演習、シャドー比較、本番切替、ロールバック演習、Python依存の撤去 | AC1, AC2, AC5 | full | 未着手 |
+- PRD: [p5-prd.md](p5-prd.md)、設計: [p5-design.md](p5-design.md)。2026-10-30にユーザーが承認。
+- 2026-10-29のユーザーの決定: Pythonの撤去はP5に含める。Pythonへ戻すときはAIを無効にする。クラウドAIは切替の数日後に有効にする。切替の日時は演習のあとに決める。
+- PRは2つ: P5a（T5.1〜T5.4。切替の前にマージ）、P5b（T5.6a〜b。切替のあと）。作業ブランチ: P5aは`feat/rust-migration-p5`。
+- 各タスクはt3-full-buildの管理モード（実装Sonnet・通常レビューSol）。security-reviewはPRの前に全体で1回。
+- 設計のレビュー: Sol（設計）・Opus（安全面）を2回ずつ。必須は1回目14件・2回目8件で、すべて反映。
+
+| ID | 内容 | AC（P5-PRD） | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
+|---|---|---|---|---|---|---|---|---|
+| T5.1 | ガードの見直し（印の検査を外しPython版の検査は残す、終了コード、rootと`catalog.db`が無いCLIの拒否）、`geoframe-rs.service`の見直し（置き場所・`After=`・設定のファイル・StartLimit・ReadOnlyPaths・制限）、`rust-deploy.sh --production`とその試験、`deploy-pull.sh`の拒否、`geoframe-admin.sh` | AC1, AC2 | - | full | 未着手 | | | |
+| T5.2 | STATUSの`db.loc.clue_pending`をRustの判定の待ちを含む値に直す | AC8 | - | full | 未着手 | | | |
+| T5.3 | 手順書`cutover.md`と`deploy/README.md` §7の本番向けの記述 | AC3〜AC6, AC9 | T5.1, T5.2 | full | 未着手 | | | |
+| T5.4 | 検証環境での演習（設計§演習の1〜9）と`p5-acceptance.md` | AC1〜AC5, AC8 | T5.3 | ops | 未着手 | | | |
+| T5.5 | 本番の切替（ユーザーの立ち会い）と記録 | AC6 | P5aのマージ | ops | 未着手 | | | |
+| T5.6a | 埋め込みの元を`web/`へ移し、Rustの試験からPythonの実行を外す | AC7 | T5.5 | full | 未着手 | | | |
+| T5.6b | Pythonの実装・道具・CIのジョブ・Python版のunitと配布の撤去、文書の書き直し、設定の参照の試験 | AC7 | T5.6a | full | 未着手 | | | |
