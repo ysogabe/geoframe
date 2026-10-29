@@ -376,33 +376,49 @@ cat > quality_snapshot.sql <<'SQL'
 .headers off
 .mode list
 .separator "\t"
-SELECT 'P', id, ifnull(display,''), ifnull(md5,''), ifnull(mtime,'') FROM photos ORDER BY id;
+-- P: 写真と、群の形成の入力（display・md5・mtime・taken_at）。F: 今の写真に合っている有効な特徴量（群の形成が使う SHA と pHash）。Q: 群の結果
+SELECT 'P', id, ifnull(display,''), ifnull(md5,''), ifnull(mtime,''), ifnull(taken_at,'') FROM photos ORDER BY id;
+SELECT 'F', f.photo_id, f.content_sha256, f.phash
+  FROM photos p JOIN photo_quality_features f
+    ON f.photo_id=p.id AND f.display=p.display AND f.source_md5 IS p.md5 AND f.source_mtime IS p.mtime
+ WHERE p.display IS NOT NULL AND p.display!='' AND f.error=''
+   AND f.content_sha256 IS NOT NULL AND f.phash IS NOT NULL
+   AND f.sharpness IS NOT NULL AND f.luminance IS NOT NULL AND f.exposure_score IS NOT NULL
+   AND f.black_clip IS NOT NULL AND f.white_clip IS NOT NULL AND f.contrast IS NOT NULL
+ ORDER BY f.photo_id;
 SELECT 'Q', photo_id, group_id, group_kind FROM photo_quality ORDER BY photo_id;
 SQL
 
 cat > quality_diff.py <<'PY'
 # 使い方: python3 -I quality_diff.py <前の quality .tsv> <後の quality .tsv>
-# 簡易品質の「グループの顔ぶれと kind」を、写真の追加・削除・更新と分けて比べる。出すのは件数だけ（値は画面に出さない）。
-#   追加・削除・更新 … photos の ID の増減、同じ ID で display・md5・mtime が変わったもの
+# 簡易品質の「グループの顔ぶれと kind」を、写真の変更・特徴量の変更と分けて比べる。出すのは件数だけ（値は画面に出さない）。
+#   写真の変更 … photos の ID の増減（追加・削除）、同じ ID で display・md5・mtime・taken_at が変わったもの（更新）
+#                taken_at は 3 分の窓の判定に使われるので、群の形成の入力として見る
+#   特徴量の変更 … 今の写真に合っている有効な特徴量の行（SHA・pHash を使う行）の増減（追加・削除）と、同じ ID で SHA か pHash が変わったもの（更新）
+#                  既存の写真の未解析分を Python が解析して有効な特徴量が増えるのは、写真が変わらなくても起こる正常な変化
 #   群の比べ方 … group_id は振り直されうるので、顔ぶれ（写真の ID の集合）と kind で比べる。前後の群を、共通の写真でつないだ
 #                まとまりに分け、前後で顔ぶれも kind も同じものを「変わらない」、そうでないものを「変わった」とする。
-#                「変わった」まとまりが追加・削除・更新された写真を含めば「説明できる」、含まなければ「説明できない」
-# 追加・削除・更新が 0 件なら、「説明できる変化」も 0 でなければならない（写真・特徴量が同じなら顔ぶれ・kind は変わらない）。
-# 終了コード 1 = 説明できない変化がある。
+#                「変わった」まとまりが、写真か特徴量が変わった ID を含めば「説明できる」、含まなければ「説明できない」
+# 写真の変更も特徴量の変更も 0 件なら、「変わらない」だけでなければならない（入力が同じなら顔ぶれ・kind は変わらない）。
+# 終了コード 1 = 説明できない変化がある（入力が変わっていない群が変わった）。
 import sys
 def load(path):
-    photos, groups = {}, {}
+    photos, feats, groups = {}, {}, {}
     for line in open(path, encoding="utf-8"):
         f = line.rstrip("\n").split("\t")
         if f[0] == "P":
-            photos[f[1]] = tuple(f[2:5])
+            photos[f[1]] = tuple(f[2:6])
+        elif f[0] == "F":
+            feats[f[1]] = tuple(f[2:4])
         elif f[0] == "Q":
             groups.setdefault(f[2], [f[3], set()])[1].add(f[1])
-    return photos, [(k, frozenset(m)) for k, m in groups.values()]
-(pa, ga), (pb, gb) = load(sys.argv[1]), load(sys.argv[2])
-added, deleted = pb.keys() - pa.keys(), pa.keys() - pb.keys()
-updated = {i for i in pa.keys() & pb.keys() if pa[i] != pb[i]}
-touched = added | deleted | updated
+    return photos, feats, [(k, frozenset(m)) for k, m in groups.values()]
+(pa, fa, ga), (pb, fb, gb) = load(sys.argv[1]), load(sys.argv[2])
+p_add, p_del = pb.keys() - pa.keys(), pa.keys() - pb.keys()
+p_upd = {i for i in pa.keys() & pb.keys() if pa[i] != pb[i]}
+f_add, f_del = fb.keys() - fa.keys(), fa.keys() - fb.keys()
+f_upd = {i for i in fa.keys() & fb.keys() if fa[i] != fb[i]}
+touched = p_add | p_del | p_upd | f_add | f_del | f_upd
 
 parent = {}
 def find(x):
@@ -427,10 +443,11 @@ for c in clusters.values():
         explained += 1
     else:
         unexplained += 1
-print("写真: 追加", len(added), "削除", len(deleted), "更新", len(updated),
+print("写真: 追加", len(p_add), "削除", len(p_del), "更新", len(p_upd),
+      "/ 特徴量: 追加", len(f_add), "削除", len(f_del), "更新", len(f_upd),
       "/ quality_rows", sum(len(m) for _, m in ga), "→", sum(len(m) for _, m in gb),
       "/ グループ", len(ga), "→", len(gb),
-      "/ 変わらない", same, "追加・削除・更新に連なる変化", explained, "説明できない変化", unexplained)
+      "/ 変わらない", same, "入力の変更に連なる変化", explained, "説明できない変化", unexplained)
 sys.exit(1 if unexplained else 0)
 PY
 
@@ -1091,7 +1108,7 @@ Python が起動すると、取り込みの 1 サイクルが始まって DB が
 DB_RO='file:/var/lib/geoframe/catalog.db?mode=ro'
 sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/counts.sql" > "$WORK/rs-end-counts.txt"; echo "counts rc=$?"
 sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/state_snapshot.sql" > "$WORK/rs-end-state.tsv"; echo "state rc=$?"; wc -l < "$WORK/rs-end-state.tsv"
-sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/quality_snapshot.sql" > "$WORK/rs-end-quality.tsv"; echo "quality rc=$?"     # 品質の群の顔ぶれと、写真の世代（座標は入らない。display は名前なので画面に出さない）
+sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/quality_snapshot.sql" > "$WORK/rs-end-quality.tsv"; echo "quality rc=$?"     # 品質の群の顔ぶれと、群の形成の入力（写真の display・md5・mtime・taken_at と、有効な特徴量の SHA・pHash）。座標は入らない。display・taken_at は画面に出さない
 "$WORK/drafts_sha.sh" "$WORK/drafts-rs-end.sha"; echo "drafts rc=$?"
 comm -23 <(sed 's/^[0-9a-f]\{64\}  //' "$WORK/drafts-before.sha" | LC_ALL=C sort) \
          <(sed 's/^[0-9a-f]\{64\}  //' "$WORK/drafts-rs-end.sha" | LC_ALL=C sort) | wc -l     # 0（切替の前にあった下書きが、Rust の期間に消えていない）
@@ -1143,7 +1160,7 @@ diff "$WORK/rs-end-counts.txt" "$WORK/py-after-counts.txt"; echo "counts diff rc
 sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/state_snapshot.sql" > "$WORK/py-after-state.tsv"
 python3 -I "$WORK/state_diff.py" "$WORK/rs-end-state.tsv" "$WORK/py-after-state.tsv"; echo "state rc=$?"
 sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/quality_snapshot.sql" > "$WORK/py-after-quality.tsv"
-python3 -I "$WORK/quality_diff.py" "$WORK/rs-end-quality.tsv" "$WORK/py-after-quality.tsv"; echo "quality rc=$?"     # 件数だけ。品質の群の変化を、写真の追加・削除・更新と分ける
+python3 -I "$WORK/quality_diff.py" "$WORK/rs-end-quality.tsv" "$WORK/py-after-quality.tsv"; echo "quality rc=$?"     # 件数だけ。品質の群の変化を、写真の変更・特徴量の変更と分ける
 "$WORK/drafts_sha.sh" "$WORK/drafts-py-after.sha"; diff "$WORK/drafts-rs-end.sha" "$WORK/drafts-py-after.sha" | grep -c '^[<>]'     # 0
 curl -fsS $BASE/api/v1/photos -o "$WORK/py-feed-2.json"; python3 -I "$WORK/check_files.py" "$WORK/py-feed-2.json"
 ```
@@ -1158,9 +1175,9 @@ curl -fsS $BASE/api/v1/photos -o "$WORK/py-feed-2.json"; python3 -I "$WORK/check
 - 品質（簡易品質）の切り戻し — [server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)。**比較の基準は Rust から戻す直前の値**（`rs-end-counts.txt`・`rs-end-quality.tsv`・止める前の一覧 `rs-end-feed.json`。切替の前の値ではない）。Python が再構築したかは `algorithm` で見分ける（`counts diff` の `algorithm:` の行。全行が `rust-phash-v1:…` のままなら再構築していない、全行が `poc-phash-v1:…` に変わっていれば再構築した）。次の**2つの場合を分けて**記録する:
   1. **そのまま戻した直後**（Python がまだ再構築していない）: Python は前回の `photo_quality` を保つので、`counts diff` の `quality_rows`・`quality_groups`・`kind:` の行は基準と**同じ**（取り込みで `photos` が増えていても同じ。新しい写真は、解析が終わって再構築されるまで品質の行に入らない）。`algorithm` は `rust-phash-v1:…` のまま。`/api/v1/photos` の件数が、止める前の件数（`rs-end-feed.json`）から、§6.2 で記録した「既知の差」の件数（Python が再び隠す分）を引き、Python が取り込みで足した写真（`photos` の増えた分のうち表示できるもの。`py-feed-2.json` と `rs-end-feed.json` を `ids.py` と `comm -13` で突き合わせて数える）を足した数と一致する（既知の差も取り込みも 0 件なら同じ）。
   2. **再構築が走った後**（新しい写真が入る・何かで `dirty` になる）: Python は**今の特徴量の全体から作り直す**ので、写真が増減・更新していれば、件数・グループ数・`kind` が基準と違うのは正常。**不変を求めるのは、写真と特徴量が固定されているときだけ**。`quality_diff.py` の出力で次のとおり分けて確かめ、記録する:
-     - **追加・削除・更新が 0 件**（`追加 0 削除 0 更新 0`。演習が `dirty` だけを立てる場合、または本番で取り込み・削除・更新が無かった場合）: `quality_rows`・`quality_groups`・`kind:` の件数は基準と**同じ**で、`quality_diff.py` が「**変わらない**」だけ（`追加・削除・更新に連なる変化 0`・`説明できない変化 0`。顔ぶれ・`kind` は変わらない）。変わりうるのは順位・推奨・スコア・`group_id` の振り直しと、完全重複のグループで表に出る写しの入れ替わりだけ（`quality_diff.py` は顔ぶれと `kind` だけを見るので、これらは差として出ない）。
-     - **追加・削除・更新があった**（本番で取り込みを伴った場合）: 件数が基準と違ってよい。差を**追加・削除・更新の分と、それ以外に分ける**: ①`追加 a 削除 d 更新 u` を記録する（`photos` の増減と、同じ ID の `display`・`md5`・`mtime` の変化。回転も更新）。②`説明できない変化` が **0**（顔ぶれか `kind` が変わった群は、すべて追加・削除・更新した写真を含む群だけ。新しい写真が既存の群に入る・新しい群を作る・削除や更新で群が縮む／消える／分かれる、は説明できる）。③`quality_rows`・グループ数・`kind:` の「前→後」を記録する。0 でなければ失敗として扱う（ユーザーに件数だけ報告し、`quality_diff.py` の出力を記録する）。
-  - **本番の確認と演習の違い**: 本番では 1 を必ず記録し、2 は**自然に走ったときだけ**記録する（走らなければ「走らなかった」と記録する。本番の DB を `dirty` にして走らせない）。**T5.4 の演習では両方を実施・記録する**（2 は演習の複製の DB だけで `photo_quality_dirty` を立てて再構築させる。このときは写真と特徴量が固定なので「追加・削除・更新が 0 件」の側で確かめる。手順は [§15](#15-演習t54のチェックリスト)）。
+     - **写真の変更も特徴量の変更も 0 件**（`写真: 追加 0 削除 0 更新 0 / 特徴量: 追加 0 削除 0 更新 0`。演習が `dirty` だけを立てる場合、または本番で取り込み・削除・更新も、未解析分の解析も無かった場合）: `quality_rows`・`quality_groups`・`kind:` の件数は基準と**同じ**で、`quality_diff.py` が「**変わらない**」だけ（`入力の変更に連なる変化 0`・`説明できない変化 0`。顔ぶれ・`kind` は変わらない）。変わりうるのは順位・推奨・スコア・`group_id` の振り直しと、完全重複のグループで表に出る写しの入れ替わりだけ（`quality_diff.py` は顔ぶれと `kind` だけを見るので、これらは差として出ない）。
+     - **写真か特徴量の変更があった**（本番で取り込みを伴った場合。**取り込みが無くても、Rust の期間に解析し切れなかった既存の写真を Python が解析すれば、特徴量の追加が起きて群ができる**。これは正常）: 件数が基準と違ってよい。差を**入力の変更の分と、それ以外に分ける**: ①`写真: 追加 a 削除 d 更新 u / 特徴量: 追加 fa 削除 fd 更新 fu` を、**別々に**記録する（写真の更新は、同じ ID の `display`・`md5`・`mtime`・`taken_at` の変化で、回転も入る。`taken_at` は 3 分の窓の判定に使われるので群を変えうる。特徴量は、今の写真に合っている有効な行〈SHA・pHash〉の増減と、同じ ID での SHA・pHash の変化）。②`説明できない変化` が **0**（顔ぶれか `kind` が変わった群は、すべて、写真か特徴量が変わった ID を含む群だけ。新しい写真や、未解析だった写真が既存の群に入る・新しい群を作る・削除や更新で群が縮む／消える／分かれる、は説明できる）。③`quality_rows`・グループ数・`kind:` の「前→後」を記録する。`説明できない変化` が 0 でなければ失敗として扱う（入力が変わっていない群が変わっている。ユーザーに件数だけ報告し、`quality_diff.py` の出力を記録する）。
+  - **本番の確認と演習の違い**: 本番では 1 を必ず記録し、2 は**自然に走ったときだけ**記録する（走らなければ「走らなかった」と記録する。本番の DB を `dirty` にして走らせない）。**T5.4 の演習では両方を実施・記録する**（2 は演習の複製の DB だけで `photo_quality_dirty` を立てて再構築させる。このときは写真と特徴量が固定なので「写真の変更も特徴量の変更も 0 件」の側で確かめる。手順は [§15](#15-演習t54のチェックリスト)）。
   - Python だけで解析した結果に戻したいとき（Rust の結果を保つ方法ではない）は、**Python を起動する前に**、server.md §16.10 の手順 2（`photo_quality_features` の Rust が解析した行の削除）を、ユーザーの許可を得て行う。件数・グループが変わりうる。
 - 失敗したら: 件数が減った・手動の列が消えた（`state_diff.py` が 0 でない）・下書きが消えたときは、**DB を疑う**（§10 の復元。失うものを先に読む）。`cache_load.py` が `rc≠0` なら `cache-rs-end.json` と見比べて記録する（キャッシュは作り直せる）。配信が動いているなら、まず原因を調べる。
 
@@ -1599,7 +1616,10 @@ KNOWN=<extra.py の「既知の差」の件数>
 python3 -I shadow_judge.py shadow-out.txt "$KNOWN"; echo "judge rc=$?"
 ```
 
-- **想定外の差 0 の判定**: `compare_with_python.py` は、意図した差があるかぎり終了コード 1 になる（出力の最後は `想定外の差 N 項目`）。合格にするのは、**`DIFF` の行がすべて下の表のキー単位の許容に当てはまり、`shadow_judge.py` が終了コード 0**のとき。表に無い `DIFF`・キーは 1 つでも想定外（件数だけの増減でほかの差を免除しない）。
+- **想定外の差 0 の判定**: `compare_with_python.py` は、意図した差があるかぎり終了コード 1 になる（出力の最後は `想定外の差 N 項目`）。合格にするのは、次の**すべて**を満たすとき。表に無い `DIFF`・キーは 1 つでも想定外（件数だけの増減でほかの差を免除しない）。
+  1. `DIFF` の行がすべて下の表のキー単位の許容に当てはまり、`shadow_judge.py` が**終了コード 0**（`許容外 0`）。
+  2. **STATUS の `db.ai.groups`・`db.ai.suppressed` の大小関係を人が確かめた**: `status_counts.py` の `diff` で **Rust の値 ≤ Python の値**の向きだけ（`shadow_judge.py` はキー名だけを見て大小は見ない）。ほかの `db.*` の行の差が出ていない。
+  3. **例外（終了コード 1 でも合格にできる唯一の場合）**: 下の表の節 5 の `Python と状態コード・本文が一致` の `DIFF` が残って `shadow_judge.py` が終了コード 1 になるときは、`shadow_judge.py` の `許容外` の行が**すべてその節 5 の `DIFF`（とその `差のあるキー`）に由来**し、ほかの節・項目の `許容外` が **0** で、人が表の条件（`Rust の埋め込みファイルがリポジトリの実ファイルとバイト一致` が `OK`、差が比較用 Python の `app/` の版違いだけ）を確かめて `p5-acceptance.md` に記録したときだけ合格にする（P4 の 12/14 相当）。1 と 2 は同じ。条件を確かめられない・記録していない場合は、終了コード 1 のまま不合格として扱う。
 - **キー単位の許容**（`compare_with_python.py` の出力の形で書く。キーの表記は `key_paths` のもの）:
 
 | 節 | 許容する差（出力に出る形） | 条件と、件数の確かめ方 |
@@ -1620,7 +1640,7 @@ python3 -I shadow_judge.py shadow-out.txt "$KNOWN"; echo "judge rc=$?"
 
 - 流れ 3 のあと、管理画面（検証環境の `127.0.0.1:8080`）で: 手動の位置を 1 件以上、お気に入りを 1 件以上、除外を 1 件以上、回転を 1 件以上、旅行ブログの下書きの保存を 1 件以上。ID・値は `$WORK` に残さなくてよい（§8.2 の `rs-end-*` が控える）。
 - 戻す（§8）。§8.4 の「そのまま戻した直後」を記録する（品質の場合 1）。
-- **品質の場合 2（`dirty` の再構築）**は、演習の複製の DB だけで起こす（**本番の DB では行わない**）: ①Python を止める（§8.1 と同じ要領で、`geoframe-server` を `stop`）。②`geoframe` ユーザーで `UPDATE settings SET value='1' WHERE key='photo_quality_dirty'` を実行する（`sudo -u geoframe sqlite3 /var/lib/geoframe/catalog.db`）。③Python を起動し（§8.3 の `systemctl start geoframe-server`）、同期サイクルが 1 回回って未解析が 0 のとき再構築が走る（`algorithm` が全行 `poc-phash-v1:…` になる）まで待つ。④`counts.sql` と `quality_snapshot.sql` を取り直し、§8.4 の 2 の基準（`rs-end-counts.txt`・`rs-end-quality.tsv`＝Rust から戻す直前の値）と比べる。写真と特徴量は固定なので、`quality_diff.py` が `追加 0 削除 0 更新 0`・`説明できない変化 0`（`追加・削除・更新に連なる変化` も 0）、`counts diff` の `quality_rows`・`quality_groups`・`kind:` が同じ（変わったものがあれば順位・推奨・スコア・`group_id`・完全重複の写しの入れ替わりに限られ、`quality_diff.py` には出ない）。演習のあいだに写真が増減していて「追加・削除・更新」が 0 でないときは、§8.4 の「あった」側で分けて記録する。
+- **品質の場合 2（`dirty` の再構築）**は、演習の複製の DB だけで起こす（**本番の DB では行わない**）: ①Python を止める（§8.1 と同じ要領で、`geoframe-server` を `stop`）。②`geoframe` ユーザーで `UPDATE settings SET value='1' WHERE key='photo_quality_dirty'` を実行する（`sudo -u geoframe sqlite3 /var/lib/geoframe/catalog.db`）。③Python を起動し（§8.3 の `systemctl start geoframe-server`）、同期サイクルが 1 回回って未解析が 0 のとき再構築が走る（`algorithm` が全行 `poc-phash-v1:…` になる）まで待つ。④`counts.sql` と `quality_snapshot.sql` を取り直し、§8.4 の 2 の基準（`rs-end-counts.txt`・`rs-end-quality.tsv`＝Rust から戻す直前の値）と比べる。写真と特徴量は固定なので、`quality_diff.py` が `写真: 追加 0 削除 0 更新 0 / 特徴量: 追加 0 削除 0 更新 0`・`説明できない変化 0`（`入力の変更に連なる変化` も 0）、`counts diff` の `quality_rows`・`quality_groups`・`kind:` が同じ（変わったものがあれば順位・推奨・スコア・`group_id`・完全重複の写しの入れ替わりに限られ、`quality_diff.py` には出ない）。演習のあいだに写真の増減・更新や特徴量の追加があって「写真の変更」か「特徴量の変更」が 0 でないときは、§8.4 の「あった」側で分けて記録する。
 - `p5-acceptance.md` には、場合 1・2 それぞれの `quality_rows`・`quality_groups`・`kind:` 別・`algorithm` 別の件数と、`/api/v1/photos` の件数を記録する。
 
 ### 15.5 `Conflicts=` と `After=` の試験（流れ 8。手順書の切替とは別）
@@ -1635,7 +1655,7 @@ python3 -I shadow_judge.py shadow-out.txt "$KNOWN"; echo "judge rc=$?"
 
 ### 15.6 元に戻す（流れ 9）
 
-演習の前に控えたもの（§15.2）と一致させる。**順番が大事**: Rust が `active` のまま、バイナリ・unit・DATA_DIR を戻さない。先に演習で動かしているものを止め、DB を使うものが無いことを確かめ、本番へ入れるバイナリを保管してから、ファイルを戻す。**一つずつ、戻したことを確かめる**:
+演習の前に控えたもの（§15.2）と一致させる。**順番が大事**: Rust が `active` のまま、バイナリ・unit・DATA_DIR を戻さない。先に演習で動かしているものを止め、DB を使うものが無いことを確かめ、本番へ入れるバイナリを保管してから、ファイルを戻す。**戻し終わるまで、何も起動しない**: すべてを止めたまま、設定・バイナリ・unit・`/var/lib/geoframe` を戻し、DB の使用者が無いことをもう一度確かめて演習のデータを片付けたあと、サービスを起動し、**最後に**タイマーを戻す（演習の DB を開いたまま `/var/lib/geoframe` を入れ替えない）。**一つずつ、戻したことを確かめる**:
 
 1. **演習のサービス・タイマーを止める**。バックアップのタイマーを先に止め、走っているバックアップ（`geoframe-backup.service`）は**終わるのを待つ**（止めない。途中で止めると一時ファイルが残る）:
 
@@ -1659,17 +1679,25 @@ sha256sum "$BIN" /usr/local/bin/geoframe      # どちらも $SHA と一致（§
 ```
 
    - 検証環境の**外**（検証環境を動かしているホスト側の保管先。検証環境のコンテナ・スナップショットを消しても残る場所。LXC なら `lxc file pull` で取り出す）へ `$BIN` を**コピー**し、保管先で `sha256sum` を取り直して **`$SHA` と完全に一致**することを確かめる。保管先のファイルは書き込み不可（`chmod 0444`）にし、名前に sha256 の先頭 12 桁を入れる。本番の §1.8 の `<受け取ったバイナリ>` はこのファイル。
-   - 記録: `$SHA`（64 桁）、保管先の場所の名前、演習の commit を `p5-acceptance.md` に書く。**保管先の `sha256sum` が一致するまで、下の 5（`$WORK` を消す）に進まない。**
+   - 記録: `$SHA`（64 桁）、保管先の場所の名前、演習の commit を `p5-acceptance.md` に書く。**保管先の `sha256sum` が一致するまで、下の 3 以降（ファイルと `/var/lib/geoframe` を戻す・`$WORK` を消す）に進まない。**
 
-3. ファイルを戻す（演習の前に控えた形へ）:
+3. ファイルを戻す（演習の前に控えた形へ。**すべて止めたまま。ここでは何も起動しない**）:
    1. 一時的な `geoframe-server.service`（`/usr/local/lib/systemd/system/`）と drop-in `p5-rollback.conf`、`/etc/default/geoframe-py-rollback`、共通の `/etc/default/geoframe` の演習用の値を消す／戻す。
    2. 演習で作った `/etc/default/geoframe-rs` ほかの設定のファイルを、演習の前の状態に戻す。`/etc/geoframe/checkout-pinned` を消す。
    3. 検証環境の印 `/etc/geoframe/staging` を戻す（退避を `mv` で戻す）。
    4. `/usr/local/bin/geoframe*` と `geoframe-rs.service`（両方の置き場所）・`geoframe-pyref.service`（8090）を、演習の前の形に戻す（退避から戻す。演習で入れたバイナリ・`.prev`・`.failed` を消す）。
    5. §15.2 で置いたダミーの `geoframe-backup.service`・`geoframe-backup.timer`（`/etc/systemd/system/`）は `systemctl disable geoframe-backup.timer` のあとで消す。演習の前から実物があったなら、その状態に戻す。
 
-4. **systemd に反映し、演習の前の enabled／masked／active に戻す**: ファイルを戻したら `systemctl daemon-reload` のあと `systemctl reset-failed`。§15.2 で控えた各 unit について、控えが `enabled` なら `enable`、`disabled` なら `disable`、`masked` なら `mask`、`not-found`（unit が無かった）なら `unmask` で mask の残りを消し（`/etc/systemd/system/geoframe-*.service` が `/dev/null` への symlink で残っていないこと）、`active` だったものだけ `start`・`inactive` だったものは止めたままにする。`geoframe-pyref.service`（8090）ほか通常のサービスは、止めていなければそのまま、止めたなら控えの状態にする。
+4. **systemd に反映し、演習の前の enabled／masked に戻す（起動しない）**: ファイルを戻したら `systemctl daemon-reload` のあと `systemctl reset-failed`。§15.2 で控えた各 unit について、控えが `enabled` なら `enable`、`disabled` なら `disable`、`masked` なら `mask`、`not-found`（unit が無かった）なら `unmask` で mask の残りを消す（`/etc/systemd/system/geoframe-*.service` が `/dev/null` への symlink で残っていないこと）。**`enable --now` は使わない**（起動は 6・7）。この時点で `geoframe-rs`・`geoframe-server`・`geoframe-backup.timer`・`geoframe-backup.service` が**すべて `inactive` のまま**であること（`systemctl is-active`）。
 
-5. `/var/lib/geoframe` を退避から戻し、本番のコピー・`/var/lib/geoframe-shadow-*`・一時 unit（`systemd-run` のもの）・`/var/backups/geoframe` の演習用バックアップ・`$WORK` を消す（ユーザーの許可で。**2 の保管先の確認が済んでから**。バイナリと `sha256` の記録は `p5-acceptance.md` にだけ残す）。
+5. **`/var/lib/geoframe` を戻し、演習のデータを片付ける（止めたまま）**:
+   1. もう一度 `"$WORK/dbopen.sh"; echo "dbopen rc=$?"` が **rc=0**、`pgrep -x sqlite3` が空（rc=1）。1 のあと、ファイルを戻すあいだに DB を開いたものが無い。**rc=0 でなければ先へ進まない**。
+   2. **2 の保管先の確認が済んでいること**を確かめる（バイナリと `sha256` の記録は `p5-acceptance.md` にだけ残す）。
+   3. `/var/lib/geoframe` を退避から戻す。戻したあと `"$WORK/dbopen.sh"` が rc=0（戻した DB を開いているものが無い）。
+   4. 本番のコピー・`/var/lib/geoframe-shadow-*`・一時 unit（`systemd-run` のもの）・`/var/backups/geoframe` の演習用バックアップを消す（ユーザーの許可で）。`$WORK` は 8 の確認で控えを使うので、まだ消さない。
 
-6. 確認: §15.2 で控えたコマンドをもう一度実行し、**差が 0**（`diff`。`is-enabled`／`is-active` の行を含む）。検証環境の通常のサービス（`geoframe-pyref.service` 8090 など）が演習の前と同じ状態で動いていること。`systemctl list-timers` と `systemctl list-units 'geoframe*'` に、演習のダミーや一時 unit が残っていない。
+6. **サービスを起動する（演習の前に `active` だったものだけ）**: 控えが `active` だった unit だけを `start` する（`inactive` だったものは止めたまま。`geoframe-pyref.service`（8090）ほか通常のサービスは、止めなかったならそのまま、止めたなら控えの状態にする）。起動したものが `active` で、Python が `active` だったなら `/healthz` に答えること。まだタイマーは戻さない。
+
+7. **最後にタイマーを戻す**: 控えで `geoframe-backup.timer` が `active` だったときだけ `start`（`enabled`／`disabled` は 4 で戻した）。演習の前から無かったなら無いまま。
+
+8. 確認: §15.2 で控えたコマンドをもう一度実行し、**差が 0**（`diff`。`is-enabled`／`is-active` の行を含む）。検証環境の通常のサービス（`geoframe-pyref.service` 8090 など）が演習の前と同じ状態で動いていること。`systemctl list-timers` と `systemctl list-units 'geoframe*'` に、演習のダミーや一時 unit が残っていない。確認が済んだら `$WORK` を消す。
