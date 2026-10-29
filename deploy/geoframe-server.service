@@ -40,9 +40,10 @@ Environment=PYTHONUNBUFFERED=1
 
 # 運用トグル（Drive同期ON/OFF・AI ON/OFF等の段階的有効化に使う）。
 # 先頭の"-"はファイルが存在しなくても起動失敗にしない指定。
-# systemdはEnvironment=/EnvironmentFile=を記載順に評価し後勝ちなので、
-# ここは上記Environment=より後に置くこと（/etc/default/geoframe側で
-# 同名キーを指定すれば意図的に上書きできる。順序を入れ替えないこと）。
+# EnvironmentFile=は、unit内で書いた順に関係なくEnvironment=より優先される
+# （/etc/default/geoframe側で同名キーを指定すれば、上記Environment=の値を意図的に上書きできる）。
+# EnvironmentFile=どうしは、指定した順に読み、同名キーは後のものが勝つ
+# （切替のあとのPythonへの戻しのdrop-inが、AIを止める値をこのファイルより優先させる）。
 EnvironmentFile=-/etc/default/geoframe
 
 Restart=always
