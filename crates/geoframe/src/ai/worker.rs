@@ -31,6 +31,10 @@
 //! 2. **処理**: 使える登録済みの種類だけで [`super::jobs::claim_next`] し、writer の外で [`Handler::run`]、
 //!    writer で確定（[`super::jobs::complete`]）または失敗の記録、を空になるまで繰り返す。
 //!
+//! 周期の終わりに、1 周期の上限に達して止めた用途に今 claim できるジョブが残っていれば、次の周期までは
+//! `GEOFRAME_AI_BACKLOG_POLL_S`（既定 5 秒）だけ待つ（[`Core::cycle`] の戻り値・[`next_wait`]）。claim できないジョブ
+//! （停止・一時待ち・期限前の deferred・クラウドの送信枠）だけが残るときは、通常の周期のまま。
+//!
 //! 使えない種類は claim の対象から外すだけで、他の種類は進む: 未登録の種類・設定で無効（[`Disabled`]）・
 //! Provider／用途の停止中・Provider 側の待ち（利用不可・429・予算切れ）・1 周期の上限に達した用途。
 //! 未登録の種類のジョブは claim も成功化もされず `pending`/`deferred` のまま残る。
@@ -196,6 +200,12 @@ pub fn task_for(kind: JobKind) -> TaskKind {
         JobKind::LocationSuggest | JobKind::LocationGeocode => TaskKind::LocationSuggest,
         JobKind::PhotoJudge => TaskKind::PhotoJudge,
     }
+}
+
+/// その種類の `run` がクラウドの送信枠を予約するか（[`RunCtx::before_send`]）。`location_geocode` は座標化を
+/// Nominatim で行い、`before_probe` だけで送信枠を使わない。枠のない用途（LAN）では意味を持たない。
+fn reserves_send_budget(kind: JobKind) -> bool {
+    !matches!(kind, JobKind::LocationGeocode)
 }
 
 /// 背景ジョブの用途（`query_embedding` は対話用で含めない）。
@@ -494,6 +504,8 @@ pub struct WorkerDeps {
     pub clock: Clock,
     /// 周期（試験は短くする。本番は `config.ai.legacy().poll()`）。
     pub poll: Duration,
+    /// 仕事が残っているときの次の周期までの待ち（本番は `config.ai.legacy().backlog_poll()`）。
+    pub backlog_poll: Duration,
     pub run_id: String,
 }
 
@@ -526,15 +538,19 @@ impl Core {
     }
 
     /// 1 周期: reconcile のあと、使える種類のジョブが無くなる（または停止・上限）まで処理する。
-    pub(super) fn cycle(&mut self) {
+    ///
+    /// 戻り値は**仕事が残っているか**: 1 周期の上限に達して止めた用途に、今 claim できるジョブがまだあるとき `true`
+    /// （次の周期を短い待ち [`WorkerDeps::backlog_poll`] で始める）。全部やり終えた・停止・一時待ち・期限前の deferred
+    /// だけが残る・クラウドの送信枠（窓の上限）で止まった、は `false`（通常の周期を待つ。claim できないジョブで空回りしない）。
+    pub(super) fn cycle(&mut self) -> bool {
         if self.handlers.is_empty() || self.stop.is_stopped() {
-            return;
+            return false;
         }
         let read = match crate::db::open_read_only(&self.config.db_path()) {
             Ok(conn) => conn,
             Err(_) => {
                 tracing::warn!("[ai] DB を読み取り用に開けません（次の周期に持ち越します）");
-                return;
+                return false;
             }
         };
         // 共有の一時待機（再起動をまたいで残る）を読み直す。読めなければ空のまま進む（待ちは各 handler の確認が補う）
@@ -545,11 +561,11 @@ impl Core {
         loop {
             // claim の直前に毎回確かめる（止まったら新しい claim をしない）
             if self.stop.is_stopped() {
-                return;
+                return false;
             }
             let kinds = self.usable_kinds(&read, &processed);
             if kinds.is_empty() {
-                return;
+                return self.has_backlog(&read, &processed);
             }
             let scopes: Vec<_> = kinds
                 .iter()
@@ -568,16 +584,65 @@ impl Core {
                 jobs::claim_next_scoped(conn, now, &run_id, &token, &scopes)
             }) {
                 Ok(Some(claimed)) => claimed,
-                Ok(None) => return,
+                Ok(None) => return self.has_backlog(&read, &processed),
                 Err(_) => {
                     tracing::warn!("[ai] ジョブを claim できません（次の周期に持ち越します）");
-                    return;
+                    return false;
                 }
             };
             let task = task_for(claimed.key.kind);
             *processed.entry(task).or_insert(0) += 1;
             self.process(&read, claimed, task);
             self.maintain(&read);
+        }
+    }
+
+    /// 1 周期の上限に達して止めた用途に、今 claim できるジョブが残っているか（[`Core::cycle`] の戻り値）。
+    /// 上限以外の理由で使えない用途（無効・停止・Provider 側の待ち・一時待機）は数えない。クラウドの送信枠のある
+    /// 用途では、**送信枠を予約する種類**（[`reserves_send_budget`]）の残りは数えない（送信枠に当たるたびの予約の失敗と
+    /// deferred を繰り返さないよう、通常の周期で進める。クラウドへの送信は速めない）。送信枠を使わない種類
+    /// （`location_geocode`）の残りは数える。読めないときは `false`（空回りより通常の周期を選ぶ）。
+    fn has_backlog(&self, read: &Connection, processed: &HashMap<TaskKind, u32>) -> bool {
+        if self.stop.is_stopped() {
+            return false;
+        }
+        let now = (self.clock)();
+        let mut tasks: Vec<TaskKind> = Vec::new();
+        for handler in &self.handlers {
+            let task = task_for(handler.kind());
+            if !tasks.contains(&task) {
+                tasks.push(task);
+            }
+        }
+        tasks.into_iter().any(|task| {
+            let Ok(gate) = self.config.ai.gate(task, true) else {
+                return false;
+            };
+            if processed.get(&task).copied().unwrap_or(0) < gate.cycle_limit
+                || !self.task_runnable(read, task, now)
+            {
+                return false;
+            }
+            let scopes: Vec<_> = self
+                .handlers
+                .iter()
+                .filter(|h| task_for(h.kind()) == task)
+                .filter(|h| gate.budget.is_none() || !reserves_send_budget(h.kind()))
+                .map(|h| h.claim_scope())
+                .collect();
+            jobs::has_claimable(read, now, &scopes).unwrap_or(false)
+        })
+    }
+
+    /// 上限以外の理由で止められていないか（[`Core::usable_kinds`] の、上限を除いた条件）。
+    fn task_runnable(&self, read: &Connection, task: TaskKind, now: i64) -> bool {
+        if self.blocked.get(&task).is_some_and(|until| *until > now) || self.wait_blocks(task, now)
+        {
+            return false;
+        }
+        match self.config.ai.settings() {
+            Some(settings) => matches!(pause::status(read, settings, task), Ok(None)),
+            None => false,
         }
     }
 
@@ -609,16 +674,7 @@ impl Core {
                 if processed.get(&task).copied().unwrap_or(0) >= gate.cycle_limit {
                     return false;
                 }
-                if self.blocked.get(&task).is_some_and(|until| *until > now) {
-                    return false;
-                }
-                if self.wait_blocks(task, now) {
-                    return false;
-                }
-                match self.config.ai.settings() {
-                    Some(settings) => matches!(pause::status(read, settings, task), Ok(None)),
-                    None => false,
-                }
+                self.task_runnable(read, task, now)
             })
             .collect()
     }
@@ -1013,6 +1069,15 @@ impl Core {
     }
 }
 
+/// 次の周期までの待ち: 仕事が残っているなら短い待ち、そうでなければ通常の周期（短い待ちは通常の周期を超えない）。
+pub(super) fn next_wait(backlog: bool, poll: Duration, backlog_poll: Duration) -> Duration {
+    if backlog {
+        backlog_poll.min(poll)
+    } else {
+        poll
+    }
+}
+
 /// 送信予算の予約が通らなかったときの、固定の理由と待つ秒数（60〜3600 秒）。
 fn budget_wait(reservation: Reservation, cycle_secs: u32) -> (ErrorCode, u32) {
     let clamp = |s: u32| s.clamp(MIN_DEFER_SECS, MAX_DEFER_SECS);
@@ -1113,14 +1178,20 @@ pub fn spawn(deps: WorkerDeps) -> AiWorker {
         .spawn(move || {
             // スレッドが終わるまで `.ingest.lock` を手放さない（呼び出し側が先に終わっても）
             let _lock = deps.lock.clone();
-            let poll = deps.poll;
+            let (poll, backlog_poll) = (deps.poll, deps.backlog_poll);
             let stop = deps.stop.clone();
             let mut core = Core::new(&deps);
             loop {
-                if catch_unwind(AssertUnwindSafe(|| core.cycle())).is_err() {
-                    tracing::error!("[ai] 周期の処理がパニックしました（次の周期に持ち越します）");
-                }
-                if stop.wait(poll) {
+                let backlog = match catch_unwind(AssertUnwindSafe(|| core.cycle())) {
+                    Ok(backlog) => backlog,
+                    Err(_) => {
+                        tracing::error!(
+                            "[ai] 周期の処理がパニックしました（次の周期に持ち越します）"
+                        );
+                        false
+                    }
+                };
+                if stop.wait(next_wait(backlog, poll, backlog_poll)) {
                     break;
                 }
             }

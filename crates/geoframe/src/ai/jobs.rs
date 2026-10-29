@@ -657,21 +657,8 @@ pub struct ClaimScope {
     pub processor_version: Option<String>,
 }
 
-pub fn claim_next_scoped(
-    conn: &Connection,
-    now: i64,
-    run_id: &str,
-    token: &str,
-    scopes: &[ClaimScope],
-) -> rusqlite::Result<Option<Claimed>> {
-    if scopes.is_empty() {
-        return Ok(None);
-    }
-    let mut values = vec![
-        Value::from(run_id.to_string()),
-        Value::from(token.to_string()),
-        Value::from(now),
-    ];
+/// `scopes` に合うジョブの絞り込み（`values` の `?1`〜`?3` は呼び出し側が先に積む。以降へ束縛値を足す）。
+fn scope_predicate(scopes: &[ClaimScope], values: &mut Vec<Value>) -> String {
     let mut predicates = Vec::new();
     for scope in scopes {
         values.push(Value::from(scope.kind.as_str().to_string()));
@@ -689,7 +676,43 @@ pub fn claim_next_scoped(
         }
         predicates.push(format!("({clause})"));
     }
-    let predicate = predicates.join(" OR ");
+    predicates.join(" OR ")
+}
+
+/// [`claim_next_scoped`] が今取れるジョブ（`pending`／`deferred` で期限が来ているもの）が `scopes` にあるか。
+/// 読み取りだけで、何も変えない。空なら `false`。
+pub fn has_claimable(conn: &Connection, now: i64, scopes: &[ClaimScope]) -> rusqlite::Result<bool> {
+    if scopes.is_empty() || !object_exists(conn, "table", "ai_jobs")? {
+        return Ok(false);
+    }
+    let mut values = vec![Value::from(now)];
+    let predicate = scope_predicate(scopes, &mut values);
+    let sql = format!(
+        "SELECT 1 FROM ai_jobs
+         WHERE state IN ('pending','deferred') AND next_attempt_at<=?1 AND ({predicate})
+         LIMIT 1"
+    );
+    conn.query_row(&sql, params_from_iter(values.iter()), |_| Ok(()))
+        .optional()
+        .map(|found| found.is_some())
+}
+
+pub fn claim_next_scoped(
+    conn: &Connection,
+    now: i64,
+    run_id: &str,
+    token: &str,
+    scopes: &[ClaimScope],
+) -> rusqlite::Result<Option<Claimed>> {
+    if scopes.is_empty() {
+        return Ok(None);
+    }
+    let mut values = vec![
+        Value::from(run_id.to_string()),
+        Value::from(token.to_string()),
+        Value::from(now),
+    ];
+    let predicate = scope_predicate(scopes, &mut values);
     let sql = format!(
         "UPDATE ai_jobs SET state='running', run_id=?1, claim_token=?2, updated_at=?3
          WHERE id=(SELECT id FROM ai_jobs

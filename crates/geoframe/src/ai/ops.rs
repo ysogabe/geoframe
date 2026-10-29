@@ -43,12 +43,78 @@ pub enum ConfigState {
     Ready,
 }
 
+/// 用途が停止（[`pause`]）にかかっているか。設定で使える用途だけを評価する。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskPause {
+    /// かかっていない（設定で使えない用途も、ここでは評価しないのでこれ）。
+    None,
+    /// Provider 全体または用途の停止にかかっている（範囲と固定の理由コードだけ）。
+    Paused(pause::Paused),
+    /// 停止の表を読めず、確認できない（送信側は読めないとき送らない）。
+    Unknown,
+}
+
+/// 用途ごとの状態（設定で使えるか・停止中か・停止中の待ちの件数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskReport {
+    pub task: TaskKind,
+    /// `Err` は設定で使えない理由。
+    pub gate: Result<(), Disabled>,
+    pub pause: TaskPause,
+    /// 停止中のとき、その用途の待ちのジョブ（`pending`＋`deferred`。`location_geocode` は `location_suggest`
+    /// に数える）の件数。停止中でないときは `Some(0)`。ジョブの件数を集計できなかったときは `None`（不明。
+    /// 0 件とは区別する。ジョブの表が無い旧 DB は集計できているので `Some(0)`）。
+    pub waiting: Option<i64>,
+}
+
+/// 用途ごとの状態を読む（読み取りだけ）。`counts` は [`jobs::status_counts`] で、集計できなかったときは `None`。
+fn task_reports(
+    conn: &Connection,
+    ai: &AiConfig,
+    counts: Option<&[(JobKind, JobState, i64)]>,
+) -> Vec<TaskReport> {
+    TaskKind::ALL
+        .into_iter()
+        .map(|task| {
+            let gate = ai.gate(task, true).map(|_| ());
+            let pause = match (gate, ai.settings()) {
+                (Ok(()), Some(settings)) => match pause::status(conn, settings, task) {
+                    Ok(None) => TaskPause::None,
+                    Ok(Some(paused)) => TaskPause::Paused(paused),
+                    Err(_) => TaskPause::Unknown,
+                },
+                _ => TaskPause::None,
+            };
+            let waiting = if matches!(pause, TaskPause::Paused(_)) {
+                counts.map(|counts| {
+                    counts
+                        .iter()
+                        .filter(|(kind, state, _)| {
+                            task_for(*kind) == task
+                                && matches!(state, JobState::Pending | JobState::Deferred)
+                        })
+                        .map(|(_, _, n)| n)
+                        .sum()
+                })
+            } else {
+                Some(0)
+            };
+            TaskReport {
+                task,
+                gate,
+                pause,
+                waiting,
+            }
+        })
+        .collect()
+}
+
 /// 状態の集計（件数と固定の理由だけ）。
 #[derive(Debug, Clone)]
 pub struct Report {
     pub config: ConfigState,
-    /// 用途ごとの今の使えるか（`Err` は使えない理由。`writer` がある起動として評価）。
-    pub tasks: Vec<(TaskKind, Result<(), Disabled>)>,
+    /// 用途ごとの今の使えるか・停止にかかっているか（`writer` がある起動として評価）。
+    pub tasks: Vec<TaskReport>,
     /// 種類・状態ごとの件数。
     pub jobs: Vec<(JobKind, JobState, i64)>,
     /// 後回し・失敗・待機中のジョブの理由コードごとの件数（状態、固定の理由コード）。
@@ -90,13 +156,11 @@ pub fn report_at(conn: &Connection, ai: &AiConfig, now: i64) -> rusqlite::Result
         super::embedding::configured_identity(ai, TaskKind::ImageEmbedding).as_ref(),
         active,
     )?;
+    let job_counts = jobs::status_counts(conn)?;
     Ok(Report {
         config: config_state(ai),
-        tasks: TaskKind::ALL
-            .into_iter()
-            .map(|t| (t, ai.gate(t, true).map(|_| ())))
-            .collect(),
-        jobs: jobs::status_counts(conn)?,
+        tasks: task_reports(conn, ai, Some(&job_counts)),
+        jobs: job_counts,
         reasons: reason_counts(conn)?,
         pauses: pause::list(conn)?,
         waits: waits::view(conn, now, &waits::Identities::from_config(ai))?,
@@ -146,6 +210,11 @@ fn reason_counts(conn: &Connection) -> rusqlite::Result<Vec<(JobState, &'static 
 /// - `ai_jobs`: `{"total", "by_state": {状態: 件数}, "by_kind": {種類: {状態: 件数}}, "reasons": {状態: {理由: 件数}}}`。
 ///   理由は固定のコード（`clock_rewound`・`budget_exhausted`・`provider_paused`・`interrupted` など）だけ。
 /// - `ai_pauses`: `[{"task", "scope", "reason"}]`（Provider・用途の停止。解除は CLI）。
+/// - `ai_task_blocks`: `[{"task", "scope", "reason", "waiting"}]`（設定で使える用途のうち、Provider・用途の停止にかかって
+///   送られていないもの。`ai_pauses` が停止を起こした用途だけなのに対し、同じ停止にかかる**全用途**。`scope` は
+///   `provider`／`task`、`waiting` はその用途の待ち＝`pending`＋`deferred` の件数。
+///   ジョブの件数を集計できなかったときは `null`＝不明で、停止の情報（`task`・`scope`・`reason`〕は残す）。停止にかかる用途が無ければ
+///   足さない。
 /// - `ai_waits`: `{"items": [{"task", "scope": "entrance"|"service", "reason", "until": "YYYY-MM-DDTHH:MM:SSZ"}],
 ///   "unidentified": 件数}`（まだ有効な共有の一時待機。`items` は今の設定の用途に結び直したもので、`unidentified` は
 ///   設定が使えず結び直せない件数。どちらも空ならキーを足さない。`unidentified` は 0 なら出さない。接続先・モデル・
@@ -155,7 +224,7 @@ fn reason_counts(conn: &Connection) -> rusqlite::Result<Vec<(JobState, &'static 
 pub fn insert_admin_status(
     out: &mut Map<String, Value>,
     conn: &Connection,
-    invalid: Option<AiConfigError>,
+    ai: &AiConfig,
     wait_ids: &waits::Identities,
     now: i64,
 ) {
@@ -167,19 +236,20 @@ pub fn insert_admin_status(
             json!(holds.into_iter().collect::<BTreeMap<_, _>>()),
         );
     }
-    if let Some(code) = invalid {
+    if let Some(code) = ai.invalid() {
         out.insert(
             "ai_config_invalid".into(),
             json!({"code": code.code(), "disabled_tasks": TaskKind::ALL.len()}),
         );
     }
-    if let Ok(counts) = jobs::status_counts(conn)
+    let counts = jobs::status_counts(conn);
+    if let Ok(counts) = counts.as_deref()
         && !counts.is_empty()
     {
         let mut by_state: BTreeMap<&str, i64> = BTreeMap::new();
         let mut by_kind: BTreeMap<&str, BTreeMap<&str, i64>> = BTreeMap::new();
         let mut total = 0;
-        for (kind, state, count) in counts {
+        for &(kind, state, count) in counts {
             *by_state.entry(state.as_str()).or_insert(0) += count;
             by_kind
                 .entry(kind.as_str())
@@ -209,6 +279,20 @@ pub fn insert_admin_status(
             })
             .collect();
         out.insert("ai_pauses".into(), Value::Array(list));
+    }
+    // 停止にかかる全用途（待ちの件数が集計できないときは null＝不明）
+    let blocks: Vec<Value> = task_reports(conn, ai, counts.as_deref().ok())
+        .into_iter()
+        .filter_map(|t| match t.pause {
+            TaskPause::Paused(p) => Some(json!({
+                "task": t.task.as_str(), "scope": p.scope.as_str(),
+                "reason": p.reason.as_str(), "waiting": t.waiting
+            })),
+            _ => None,
+        })
+        .collect();
+    if !blocks.is_empty() {
+        out.insert("ai_task_blocks".into(), Value::Array(blocks));
     }
     if let Ok(view) = waits::view(conn, now, wait_ids)
         && !view.is_empty()

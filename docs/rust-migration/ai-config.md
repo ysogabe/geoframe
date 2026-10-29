@@ -83,12 +83,15 @@
 |---|---|---|
 | `GEOFRAME_AI_ENABLED` | `1` | `1`以外は全用途を無効（AI検索E6は現行どおり503） |
 | `GEOFRAME_AI_POLL_S` | `60` | AIワーカーの周期（秒。30未満は30。上限は86400） |
+| `GEOFRAME_AI_BACKLOG_POLL_S` | `5` | **Rustだけ**。仕事が残っているときの次の周期までの待ち（秒。1〜`GEOFRAME_AI_POLL_S`に収める。数でない・負・有限でない値は既定の`5`へ戻し、AIは無効にしない。[背景ワーカー](#背景ワーカー)の「1周期」） |
 | `GEOFRAME_AI_EMBED_PER_CYCLE` | `12` | `image_embedding`の1周期の上限 |
 | `GEOFRAME_AI_JUDGE_PER_CYCLE` | `2` | `photo_judge`の1周期の上限 |
 | `GEOFRAME_AI_SEARCH_PER_MIN` | `30` | `query_embedding`の毎分（60秒の窓）の上限 |
 | `GEOFRAME_LOC_SUGGEST` | `1` | `1`以外は`location_clue`・`location_suggest`を無効 |
-| `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE` | `60` | `location_clue`の1周期の上限 |
+| `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE` | `10` | `location_clue`の1周期の上限。**Rustの既定は`config.py`の`60`と違う**（下の注） |
 | `GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE` | `2` | `location_suggest`の1周期の上限 |
+
+**Rustだけ既定が違う項目**: `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`はRustでは`10`（`config.py`は`60`のまま変えない）。Rustのワーカーは専用の1スレッドが用途を順に処理するので、1件約12秒の手がかり判定が60件続く（約12分）と、その間ほかの用途（画像Embedding・位置候補）が進まない。10件なら約2分で次の用途へ回る。`GEOFRAME_AI_BACKLOG_POLL_S`はPythonに無いRustだけの項目なので`docs/reference/configuration.md`（`config.py`から生成）には載せない。クラウドの日の上限・周期の窓（`GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`など。窓の長さは`GEOFRAME_AI_POLL_S`のまま）は変えないので、周期が速くなっても日の上限は守られる。
 
 `GEOFRAME_DECISION_URL`・`GEOFRAME_LOC_SUGGEST_MODEL`・`GEOFRAME_LOCAL_EMBED_*`は**読まない**（routingとモデルは上のJSON。Decisionは`local_base_url`に固定のパスを付ける）。廃止するCPUモデル用の設定は後続のタスクで文書化する。
 
@@ -103,7 +106,8 @@
 - **起動の条件**: `GEOFRAME_INGEST=1`かつ`GEOFRAME_AI_ENABLED=1`かつ有効な背景用途が1つ以上。`query_embedding`は利用者を待たせる対話の用途で、永続キューの背景ジョブではない。`INGEST=0`では何も起動せず、AIの表を作らず、ジョブの回収もProvider停止の整理もしない。
 - **起動の準備**（`INGEST=1`なら、ワーカーが無効でも。ロックを取ったあと）: ①前の起動の`running`を回収する。停止開始が記録された起動のものは数えず`deferred/shutdown`、記録の無いもの（`SIGKILL`・クラッシュ・電源断）は`interruption_count`を加算して3回で`failed`。②設定が**有効なときだけ**、関係する設定が変わって効かなくなったProvider停止を整理する（`release_unmatched`）。設定が未指定・不正のときは、現在の識別が分からないので既存の停止を1件も消さない。
 - **種類と用途**: `image_embedding`→`image_embedding`、`location_clue`→`location_clue`、`location_suggest`・`location_geocode`→`location_suggest`（geocodeはLLMのroutingを持たず、位置候補の後続として同じ用途の有効・無効・停止・上限に従う）、`photo_judge`→`photo_judge`。
-- **1周期**（`GEOFRAME_AI_POLL_S`ごと、起動直後にも）: ①reconcile: 使える用途のhandlerが現在の写真・結果から導いたキーを積む（冪等。別世代は`obsolete`）。設定で許可されない用途は積まない。②登録済みで使える種類だけでclaim→writerの外で`Handler::run`→writerで確定（token・入力世代の確認つき）、を空になるまで繰り返す。使えない種類は**claimの対象から外すだけ**で、他の種類は進む: 未登録、設定で無効（`Disabled`）、Provider・用途の停止中、Provider側の待ち（利用不可・429・予算切れ）、1周期の上限（上の表の`*_PER_CYCLE`。LANの用途にも効く）に達した用途。
+- **1周期**（`GEOFRAME_AI_POLL_S`ごと、起動直後にも。仕事が残っているときだけ`GEOFRAME_AI_BACKLOG_POLL_S`、既定5秒ごと。下の「次の周期までの待ち」）: ①reconcile: 使える用途のhandlerが現在の写真・結果から導いたキーを積む（冪等。別世代は`obsolete`）。設定で許可されない用途は積まない。②登録済みで使える種類だけでclaim→writerの外で`Handler::run`→writerで確定（token・入力世代の確認つき）、を空になるまで繰り返す。使えない種類は**claimの対象から外すだけ**で、他の種類は進む: 未登録、設定で無効（`Disabled`）、Provider・用途の停止中、Provider側の待ち（利用不可・429・予算切れ）、1周期の上限（上の表の`*_PER_CYCLE`。LANの用途にも効く）に達した用途。
+- **次の周期までの待ち**: 1周期を終えたら、通常は`GEOFRAME_AI_POLL_S`だけ待つ。ただし**1周期の上限に達して止めた用途に、いま`claim`できるジョブ（`pending`／期限の来た`deferred`）が残っているとき**は、`GEOFRAME_AI_BACKLOG_POLL_S`（既定5秒、1〜`POLL_S`）だけ待って次の周期を始める。残りが無くなる（上限に達しない周期で終わる）と通常の待ちに戻る。次のものは「残り」に数えず、通常の待ちのまま（`claim`できないジョブだけが残る状態で空回りしない）: 停止中のProvider・用途、Provider側の待ち（利用不可・429・予算切れ）と共有の一時待機、期限前の`deferred`、設定で使えない用途、停止の合図が立った後。**クラウドの送信枠（日・周期窓）のある用途では、送信枠を予約して送る種類（`photo_judge`・`location_suggest`の推定）の残り**も数えず、通常の周期で進める（送信枠に当たるたびの予約の失敗と`deferred`を繰り返さないため。クラウドへの送信は速めない）。同じ用途でも送信枠を使わない`location_geocode`（座標化はNominatim）の残りは、`location_suggest`の上限に達していれば数える。待ちは停止の合図（SIGTERM）で即座に抜け、ワーカーのjoin期限（10秒）・全体の期限（60秒）は変わらない。同一場面の局所計算のスレッド（`ai-scenes`）は通常の周期のまま。
 - **送る直前の確認**: handlerは外部へ送る**直前に毎回**`RunCtx::before_send`を呼ぶ。停止の合図→今の設定の送信可否→Provider・用途の停止→（クラウドの用途は）送信予算の予約、の順に再評価し、全部通ったときだけ接続情報（`Gate`）を返す。送る直前に、DBの行・入力世代・hiddenを読み直して古ければ`RunError::InputChanged`（ジョブは`obsolete`で送らない）。writerやトランザクションを外部I/Oの間は持たない（`RunCtx::read`は読み取り専用の接続）。
 - **実行エラーの分類**（`RunError`。固定のenum。例外の本文・URL・応答は持たない）:
 
@@ -133,7 +137,7 @@ handlerの**panic**は当該ジョブの失敗1回（`panic`。5回で`failed`�
 
 | コマンド | 内容 |
 |---|---|
-| `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、検索空間の有無・登録数と索引の件数（対象・保存済み・待ち・失敗で除外・壊れ。[ai-index.md](ai-index.md)）、用途ごとの使える／使えない（固定の理由コード）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途、有効な共有の一時待機（用途・範囲・固定の理由・UTCの期限） |
+| `geoframe ai-jobs status` | **読み取りだけ**（ガード・ロック不要。稼働中でも使える。AIの表が無い旧DBは0件）。設定の状態、検索空間の有無・登録数と索引の件数（対象・保存済み・待ち・失敗で除外・壊れ。[ai-index.md](ai-index.md)）、用途ごとの使える／使えない（固定の理由コード。設定では使えても**Provider・用途の停止にかかっている用途**は`使えない（停止中: Provider全体|用途・<理由コード>）`と、その用途の待ち（`pending`＋`deferred`。`location_geocode`は`location_suggest`に数える）の件数`用途 <用途> の待ち: N 件（停止中のため送っていません）`。停止の確認ができないときは`使えない（停止の確認ができません）`）、種類×状態の件数、後回し・失敗・待機の理由コードごとの件数、停止中のProvider・用途（停止を起こした用途だけ。同じ接続先・認証・project・regionの用途は上の用途の行に出る）、有効な共有の一時待機（用途・範囲・固定の理由・UTCの期限） |
 | `geoframe ai-jobs retry (--kind <種類>｜--all)` | `failed`だけを、登録済みhandlerが現在の入力・既存の結果に照らして再検査し、`Requeue`（カウンタ・履歴を0に戻して`pending`）／`Obsolete`／`Satisfied`（成功済み扱い。再計算しない）へ振り分ける。**外部へは送らない**。成功済み・待機中は変えない。検査できないものは戻さず`failed`のまま件数だけ報告する: handler未登録の種類（設定が無効、または固定契約・クラウド接続が揃わず登録されない用途）、設定で今は使えない用途 |
 | `geoframe ai-jobs release-pause (--task <用途>｜--all)` | Provider・用途の停止の明示解除。`--task`は今の設定でその用途に当たる停止だけ（設定が未指定・不正なら何もせず終了コード2）、`--all`は全部 |
 | `geoframe ai-jobs deactivate-space` | 有効な検索空間（`settings.ai_active_space`）を外して旧結果参照へ戻す（P4 / T4.3。[ai-index.md](ai-index.md)）。旧結果・空間・ベクトル・ジョブは消さない。稼働中は拒否 |
@@ -149,9 +153,10 @@ Rustだけが返す追加フィールドで、**あるときだけ**付く（AI�
 | `ai_config_invalid` | `{"code": <設定の誤りの固定コード>, "disabled_tasks": 5}`（設定が不正なときだけ。値・パスは出さない。写真の配信・管理は続く） |
 | `ai_jobs` | `{"total", "by_state", "by_kind", "reasons"}`（ジョブが1件でもあるとき。`reasons`は状態ごとの理由コードの件数で、`clock_rewound`・`budget_exhausted`・`provider_paused`・`interrupted`など。固定のコード以外は`other`にまとめる） |
 | `ai_pauses` | `[{"task", "scope", "reason"}]`（停止中のProvider・用途。解除はCLI） |
+| `ai_task_blocks` | `[{"task", "scope": "provider"\|"task", "reason", "waiting"}]`（設定で使える用途のうち、Provider・用途の停止にかかって送られていないもの。`ai_pauses`が停止を起こした用途だけなのに対し、同じ停止にかかる**全用途**。`waiting`はその用途の待ち＝`pending`＋`deferred`（`location_geocode`は`location_suggest`）の件数。ジョブの件数を集計できなかったときは`null`（件数不明。0件とは区別する。ジョブの表が無い旧DBは集計できているので0）で、停止の情報（`task`・`scope`・`reason`）は残す。停止にかかる用途が無ければキーを足さない。停止の確認ができない用途は載せない。用途名・範囲・固定の理由コード・件数だけで、鍵のパス・project・region・URL・モデル・識別のhashは出さない。送信側の判断は変えない） |
 | `ai_waits` | `{"items": [{"task", "scope": "entrance"\|"service", "reason", "until": "YYYY-MM-DDTHH:MM:SSZ"}], "unidentified": n}`（まだ有効な共有の一時待機を今の設定の用途に結び直したもの。`unidentified`は設定が使えず結び直せない件数で0なら出さない。待ちが無ければキーを出さない。期限はUTC。接続先・モデル・ハッシュは出さない。[ai-provider.md](ai-provider.md)の「共有の一時待機」） |
 
-STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し、解除・再試行のコマンドを文字で示す（画面からは操作できない）。
+STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し（`ai_task_blocks`は「AI送信が止まっている用途」に`<用途>: Provider全体の停止（権限エラー（403））で N 件が待ち`の形。`waiting`が`null`のときは`で 待ちは件数不明`。`geoframe ai-jobs status`はジョブの件数を読めないと状態の取得エラーで終了する。表示の側は`用途 X の待ち: 件数を読めません（停止中のため送っていません）`に対応しているが、今はこの経路では出ない）、解除・再試行のコマンドを文字で示す（画面からは操作できない）。
 
 ### 限界・実装状況
 

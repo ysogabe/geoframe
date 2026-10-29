@@ -21,6 +21,7 @@ use super::pause::{self, PauseReason};
 use super::runs;
 use super::settings::TaskKind;
 use super::tests_settings::{SAMPLE, variant};
+use super::waits::{Wait, WaitReason, WaitScope};
 use super::worker::*;
 use crate::config::{Config, Overrides};
 use crate::guard::Guard;
@@ -46,6 +47,16 @@ pub(super) fn env(tag: &str) -> Env {
 }
 
 pub(super) fn env_with(tag: &str, ai_json: &str, ingest_on: bool) -> Env {
+    env_with_vars(tag, ai_json, ingest_on, &[])
+}
+
+/// 旧環境変数（1 周期の上限など）を足して作る。
+pub(super) fn env_with_vars(
+    tag: &str,
+    ai_json: &str,
+    ingest_on: bool,
+    extra: &[(&str, &str)],
+) -> Env {
     let dir = TempDir::new(tag);
     let ai_path = dir.path().join("ai.json");
     std::fs::write(&ai_path, ai_json).unwrap();
@@ -56,6 +67,9 @@ pub(super) fn env_with(tag: &str, ai_json: &str, ingest_on: bool) -> Env {
     );
     if ingest_on {
         vars.insert("GEOFRAME_INGEST".into(), "1".into());
+    }
+    for (k, v) in extra {
+        vars.insert((*k).into(), (*v).into());
     }
     let overrides = Overrides {
         listen: None,
@@ -141,17 +155,23 @@ impl Env {
             handlers,
             clock: self.clock(),
             poll: Duration::from_millis(20),
+            backlog_poll: Duration::from_millis(20),
             run_id: run_id.to_string(),
         }
     }
 
     /// 1 周期だけ同期的に動かす。
     pub(super) fn cycle(&self, handlers: &[Arc<Fake>], stop: &StopFlag) {
+        self.cycle_backlog(handlers, stop);
+    }
+
+    /// 1 周期だけ同期的に動かし、仕事が残っているか（次の周期を短い待ちで始めるか）を返す。
+    pub(super) fn cycle_backlog(&self, handlers: &[Arc<Fake>], stop: &StopFlag) -> bool {
         let handlers = handlers
             .iter()
             .map(|h| Arc::clone(h) as Arc<dyn Handler>)
             .collect();
-        Core::new(&self.deps(handlers, stop, "run-test")).cycle();
+        Core::new(&self.deps(handlers, stop, "run-test")).cycle()
     }
 
     pub(super) fn row(&self, kind: JobKind, target: &str) -> Option<Row> {
@@ -1371,6 +1391,7 @@ fn db_reads_and_writes_keep_working_while_a_handler_waits_for_a_slow_provider() 
             handlers,
             clock,
             poll: Duration::from_millis(20),
+            backlog_poll: Duration::from_millis(20),
             run_id: "slow-run".into(),
         };
         Core::new(&deps).cycle();
@@ -1491,4 +1512,220 @@ fn debug_output_of_the_job_views_hides_targets_tokens_and_ids() {
     };
     assert!(!format!("{started:?}").contains("SECRET"));
     assert_eq!(ErrorCode::ClockRewound.as_str(), "clock_rewound");
+}
+
+// ---------------------------------------------------------------- 仕事が残っているときの短い待ち
+
+fn keys(kind: JobKind, n: usize) -> Vec<JobKey> {
+    (0..n).map(|i| key(kind, &format!("t{i}"))).collect()
+}
+
+#[test]
+fn the_wait_is_short_only_while_work_remains_and_never_longer_than_the_poll() {
+    let (poll, short) = (Duration::from_secs(60), Duration::from_secs(5));
+    assert_eq!(next_wait(true, poll, short), short);
+    assert_eq!(next_wait(false, poll, short), poll);
+    // 短い待ちが周期を超えることは無い
+    assert_eq!(
+        next_wait(true, Duration::from_secs(3), short),
+        Duration::from_secs(3)
+    );
+}
+
+#[test]
+fn a_task_that_stops_at_its_cycle_limit_with_claimable_jobs_left_reports_a_backlog() {
+    let e = env_with_vars(
+        "backlog-limit",
+        SAMPLE,
+        true,
+        &[("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "2")],
+    );
+    let clue = Fake::ok(JobKind::LocationClue).with_keys(&keys(JobKind::LocationClue, 5));
+    let stop = StopFlag::new();
+    // 5 件中 2 件で上限 → まだ 3 件 claim できる → 短い待ち
+    assert!(e.cycle_backlog(&[Arc::clone(&clue)], &stop));
+    assert_eq!(clue.runs(), 2);
+    assert!(e.cycle_backlog(&[Arc::clone(&clue)], &stop));
+    assert_eq!(clue.runs(), 4);
+    // 最後の 1 件は上限に達しないで全部終わる → 通常の周期
+    assert!(!e.cycle_backlog(&[Arc::clone(&clue)], &stop));
+    assert_eq!(clue.runs(), 5);
+    // 何も残っていなければ通常の周期
+    assert!(!e.cycle_backlog(&[Arc::clone(&clue)], &stop));
+    assert_eq!(clue.runs(), 5);
+}
+
+#[test]
+fn finishing_exactly_at_the_limit_with_nothing_left_is_not_a_backlog() {
+    let e = env_with_vars(
+        "backlog-exact",
+        SAMPLE,
+        true,
+        &[("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "2")],
+    );
+    let clue = Fake::ok(JobKind::LocationClue).with_keys(&keys(JobKind::LocationClue, 2));
+    assert!(!e.cycle_backlog(&[Arc::clone(&clue)], &StopFlag::new()));
+    assert_eq!(clue.runs(), 2);
+}
+
+#[test]
+fn jobs_that_cannot_be_claimed_do_not_count_as_a_backlog() {
+    let vars = [("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "1")];
+    let stop = StopFlag::new();
+
+    // 期限前の deferred だけが残る（claim できない）
+    let e = env_with_vars("backlog-future", SAMPLE, true, &vars);
+    e.writer()
+        .call(|c| {
+            jobs::enqueue(c, &key(JobKind::LocationClue, "later"), T0)?;
+            c.execute(
+                "UPDATE ai_jobs SET state='deferred', next_attempt_at=?1 WHERE target_key='later'",
+                [T0 + 3_000],
+            )
+        })
+        .unwrap();
+    let clue = Fake::ok(JobKind::LocationClue).with_keys(&[key(JobKind::LocationClue, "now")]);
+    assert!(!e.cycle_backlog(&[Arc::clone(&clue)], &stop));
+    assert_eq!(clue.runs(), 1);
+    assert_eq!(e.state(JobKind::LocationClue, "later"), JobState::Deferred);
+
+    // 周期の途中で Provider が止まった: 残りは claim できるが、停止中なので数えない
+    let e = env_with_vars("backlog-paused", SAMPLE, true, &vars);
+    let paused = Fake::new(JobKind::LocationClue, |_, _| {
+        Err(RunError::ProviderPause(PauseReason::Forbidden))
+    })
+    .with_keys(&keys(JobKind::LocationClue, 3));
+    assert!(!e.cycle_backlog(&[Arc::clone(&paused)], &stop));
+    assert_eq!(paused.runs(), 1);
+
+    // Provider が使えない（一時待ち）: 残りは期限前になるか、その用途は止まる
+    let e = env_with_vars("backlog-unavailable", SAMPLE, true, &vars);
+    let down = Fake::new(JobKind::LocationClue, |_, _| Err(RunError::Unavailable))
+        .with_keys(&keys(JobKind::LocationClue, 3));
+    assert!(!e.cycle_backlog(&[Arc::clone(&down)], &stop));
+    assert_eq!(down.runs(), 1);
+
+    // 共有の一時待機（入口全体）が効いている間も数えない
+    let e = env_with_vars("backlog-wait", SAMPLE, true, &vars);
+    let waiting = Fake::new(JobKind::LocationClue, |_, _| {
+        Err(RunError::ProviderWait(Wait::new(
+            WaitScope::Entrance,
+            WaitReason::Unreachable,
+        )))
+    })
+    .with_keys(&keys(JobKind::LocationClue, 3));
+    assert!(!e.cycle_backlog(&[Arc::clone(&waiting)], &stop));
+    assert_eq!(waiting.runs(), 1);
+
+    // 設定で使えない用途のジョブは claim の対象外（上限に達していても数えない）
+    let e = env_with_vars(
+        "backlog-disabled",
+        SAMPLE,
+        true,
+        &[
+            ("GEOFRAME_LOC_SUGGEST", "0"),
+            ("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "1"),
+        ],
+    );
+    let clue = Fake::ok(JobKind::LocationClue).with_keys(&keys(JobKind::LocationClue, 3));
+    assert!(!e.cycle_backlog(&[Arc::clone(&clue)], &stop));
+    assert_eq!(clue.runs(), 0);
+
+    // 停止の合図が立っていれば、残っていても短く待たない
+    let e = env_with_vars("backlog-stopping", SAMPLE, true, &vars);
+    let clue = Fake::ok(JobKind::LocationClue).with_keys(&keys(JobKind::LocationClue, 3));
+    let stopped = StopFlag::new();
+    stopped.stop();
+    assert!(!e.cycle_backlog(&[clue], &stopped));
+}
+
+#[test]
+fn a_cloud_kind_that_reserves_the_send_budget_does_not_ask_for_the_short_wait() {
+    // photo_judge の 1 周期の上限（既定 2）は送信枠の窓。送信枠に当たるたびの予約の失敗を繰り返さないよう、
+    // クラウドへ送る種類の残りは通常の周期で進める（この試験の Fake は予約を行わず、上限だけで止まる）
+    let e = env("backlog-cloud");
+    let judge = Fake::ok(JobKind::PhotoJudge).with_keys(&keys(JobKind::PhotoJudge, 5));
+    assert!(!e.cycle_backlog(&[Arc::clone(&judge)], &StopFlag::new()));
+    assert_eq!(judge.runs(), 2);
+}
+
+/// location_suggest をクラウドで許可した設定（送信枠あり。1 周期の上限は既定 2）。
+fn cloud_suggest_json() -> String {
+    variant(
+        r#""model": "example-suggest","#,
+        r#""model": "example-suggest", "allow_cloud": true, "daily_request_limit": 20,"#,
+    )
+}
+
+#[test]
+fn leftover_geocode_jobs_ask_for_the_short_wait_but_leftover_cloud_suggest_jobs_do_not() {
+    let stop = StopFlag::new();
+    let json = cloud_suggest_json();
+
+    // location_geocode は location_suggest の上限に数えるが送信枠を使わない: 上限で止まって残れば短い待ち
+    let e = env_with("backlog-geocode", &json, true);
+    assert!(
+        e.config
+            .ai
+            .gate(TaskKind::LocationSuggest, true)
+            .unwrap()
+            .budget
+            .is_some()
+    );
+    let geocode = Fake::ok(JobKind::LocationGeocode).with_keys(&keys(JobKind::LocationGeocode, 3));
+    assert!(e.cycle_backlog(&[Arc::clone(&geocode)], &stop));
+    assert_eq!(geocode.runs(), 2);
+
+    // 上限ちょうどで残りが無ければ通常の待ち
+    let e = env_with("backlog-geocode-exact", &json, true);
+    let geocode = Fake::ok(JobKind::LocationGeocode).with_keys(&keys(JobKind::LocationGeocode, 2));
+    assert!(!e.cycle_backlog(&[Arc::clone(&geocode)], &stop));
+    assert_eq!(geocode.runs(), 2);
+
+    // クラウドへ送る推定だけが残るときは通常の待ち
+    let e = env_with("backlog-suggest", &json, true);
+    let suggest = Fake::ok(JobKind::LocationSuggest).with_keys(&keys(JobKind::LocationSuggest, 4));
+    let geocode = Fake::ok(JobKind::LocationGeocode);
+    assert!(!e.cycle_backlog(&[Arc::clone(&suggest), Arc::clone(&geocode)], &stop));
+    assert_eq!((suggest.runs(), geocode.runs()), (2, 0));
+}
+
+#[test]
+fn the_worker_uses_the_short_wait_while_work_remains_and_a_stop_ends_even_a_long_poll_at_once() {
+    let e = env_with_vars(
+        "backlog-spawn",
+        SAMPLE,
+        true,
+        &[("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "1")],
+    );
+    let stop = StopFlag::with_budget(Duration::from_secs(5));
+    let started = startup(&e.config, &e.writer(), &e.clock()).unwrap();
+    let clue = Fake::ok(JobKind::LocationClue).with_keys(&keys(JobKind::LocationClue, 4));
+    // 通常の周期は 1 時間。仕事が残っている間だけ 10ms で次の周期へ進む
+    let mut deps = e.deps(dyn_handlers(&[Arc::clone(&clue)]), &stop, &started.run_id);
+    deps.poll = Duration::from_secs(3_600);
+    deps.backlog_poll = Duration::from_millis(10);
+    let worker = spawn(deps);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while clue.runs() < 4 {
+        assert!(Instant::now() < deadline, "短い待ちで進んでいない");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // 4 件目で上限に達したあと、残りは 0 件なので 1 時間の待ちに入る（新しく積んでも 1 周期は動かない）
+    std::thread::sleep(Duration::from_millis(200));
+    clue.keys
+        .lock()
+        .unwrap()
+        .push(key(JobKind::LocationClue, "late"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(clue.runs(), 4, "仕事が残っていないので通常の周期を待つ");
+    // 停止は待ちを即座に抜ける
+    let began = Instant::now();
+    stop.stop();
+    assert!(worker.shutdown(&e.writer(), &stop, Duration::from_secs(10), &e.clock()));
+    assert!(
+        began.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        began.elapsed()
+    );
 }

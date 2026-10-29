@@ -12,8 +12,10 @@ use rusqlite::Connection;
 use serde_json::{Map, Value};
 
 use super::jobs::{self, JobKey, JobKind, JobState, Recheck};
-use super::ops::{self, ConfigState, PauseTarget, ReleaseError, RetryReport, RetryTarget};
-use super::pause::{self, PauseReason};
+use super::ops::{
+    self, ConfigState, PauseTarget, ReleaseError, RetryReport, RetryTarget, TaskPause,
+};
+use super::pause::{self, PauseReason, PauseScope};
 use super::settings::{AiConfig, AiConfigError, TaskKind};
 use super::tests_settings::SAMPLE;
 use super::tests_worker::{Fake, key};
@@ -113,13 +115,18 @@ fn the_report_of_an_old_database_without_ai_tables_is_empty_and_reads_only() {
     assert_eq!(report.config, ConfigState::Unset);
     assert!(report.jobs.is_empty() && report.reasons.is_empty() && report.pauses.is_empty());
     // 用途は全部、理由つきで「使えない」
-    assert!(report.tasks.iter().all(|(_, s)| s.is_err()));
+    assert!(
+        report
+            .tasks
+            .iter()
+            .all(|t| t.gate.is_err() && t.pause == TaskPause::None)
+    );
     // 追加のキーは 1 つも足さない（Python 版と同じ応答のまま）
     let mut out = Map::new();
     ops::insert_admin_status(
         &mut out,
         &ro,
-        None,
+        &config,
         &waits::Identities::from_config(&config),
         T0,
     );
@@ -146,7 +153,7 @@ fn the_config_states_are_fixed_codes_and_an_invalid_config_adds_only_a_code() {
     ops::insert_admin_status(
         &mut out,
         &d.read(),
-        d.config.invalid(),
+        &d.config,
         &waits::Identities::from_config(&d.config),
         T0,
     );
@@ -204,7 +211,7 @@ fn the_admin_keys_carry_counts_and_fixed_reasons_only() {
     ops::insert_admin_status(
         &mut out,
         &d.read(),
-        None,
+        &d.config,
         &waits::Identities::from_config(&d.config),
         T0,
     );
@@ -592,7 +599,7 @@ fn live_shared_waits_are_shown_per_task_with_scope_reason_and_utc_deadline() {
     ops::insert_admin_status(
         &mut out,
         &d.read(),
-        None,
+        &d.config,
         &waits::Identities::from_config(&d.config),
         T0 + 60,
     );
@@ -631,7 +638,7 @@ fn live_shared_waits_are_shown_per_task_with_scope_reason_and_utc_deadline() {
     ops::insert_admin_status(
         &mut out,
         &d.read(),
-        None,
+        &d.config,
         &waits::Identities::from_config(&d.config),
         T0 + 3_600,
     );
@@ -677,7 +684,7 @@ fn unidentifiable_waits_are_only_counted() {
     ] {
         let ids = waits::Identities::from_config(config);
         let mut out = Map::new();
-        ops::insert_admin_status(&mut out, &d.read(), config.invalid(), &ids, T0 + 60);
+        ops::insert_admin_status(&mut out, &d.read(), config, &ids, T0 + 60);
         assert_eq!(
             out.get("ai_waits").unwrap(),
             &serde_json::json!({"items": [], "unidentified": 2})
@@ -696,10 +703,303 @@ fn unidentifiable_waits_are_only_counted() {
     ops::insert_admin_status(
         &mut out,
         &empty.read(),
-        None,
+        &empty.config,
         &waits::Identities::from_config(&empty.config),
         T0,
     );
     assert!(out.is_empty(), "{out:?}");
     assert_eq!(WaitScope::Entrance.as_str(), "entrance");
+}
+
+// ---------------------------------------------------------------- 停止にかかる全用途
+
+/// `location_suggest` もクラウド許可と日の上限つきで使える設定（`photo_judge` と同じ認証・project・region を共有する）。
+fn suggest_allowed() -> String {
+    let json = SAMPLE.replacen(
+        "\"model\": \"example-suggest\",",
+        "\"model\": \"example-suggest\", \"allow_cloud\": true, \"daily_request_limit\": 5,",
+        1,
+    );
+    assert_ne!(json, SAMPLE);
+    json
+}
+
+impl Db {
+    /// 指定の状態のジョブを積む。
+    fn job(&self, kind: JobKind, target: &str, state: &str) {
+        let (k, t, state) = (key(kind, target), target.to_string(), state.to_string());
+        self.writer
+            .call(move |c| {
+                jobs::enqueue(c, &k, T0)?;
+                c.execute(
+                    "UPDATE ai_jobs SET state=?2 WHERE target_key=?1",
+                    rusqlite::params![t, state],
+                )
+            })
+            .unwrap();
+    }
+
+    fn pause_with(&self, task: TaskKind, provider_scope: bool, reason: PauseReason) {
+        let settings = self.config.settings().unwrap().clone();
+        self.writer
+            .call(move |c| {
+                let key = if provider_scope {
+                    settings.provider_pause_key(task)
+                } else {
+                    settings.task_pause_key(task)
+                }
+                .unwrap();
+                pause::pause(c, task, &key, reason, T0).map(|_| ())
+            })
+            .unwrap();
+    }
+}
+
+fn task_report(report: &ops::Report, task: TaskKind) -> ops::TaskReport {
+    *report.tasks.iter().find(|t| t.task == task).unwrap()
+}
+
+#[test]
+fn a_provider_pause_marks_every_task_behind_it_and_counts_their_waiting_jobs() {
+    let d = db("ops-blocks-provider", Some(&suggest_allowed()));
+    d.job(JobKind::PhotoJudge, "j1", "pending");
+    d.job(JobKind::PhotoJudge, "j2", "deferred");
+    d.job(JobKind::PhotoJudge, "j3", "succeeded");
+    d.job(JobKind::LocationSuggest, "s1", "pending");
+    // location_geocode は location_suggest の待ちに数える。failed・running は待ちではない
+    d.job(JobKind::LocationGeocode, "g1", "deferred");
+    d.job(JobKind::LocationSuggest, "s2", "failed");
+    d.job(JobKind::LocationSuggest, "s3", "running");
+    // 別の Provider（LAN）の用途は止まらない
+    d.job(JobKind::LocationClue, "c1", "pending");
+    // 停止を起こしたのは location_suggest だけ。photo_judge も同じ認証・project・region なので止まる
+    d.pause_with(TaskKind::LocationSuggest, true, PauseReason::Forbidden);
+
+    let report = ops::report_at(&d.read(), &d.config, T0 + 60).unwrap();
+    let paused = TaskPause::Paused(pause::Paused {
+        scope: PauseScope::Provider,
+        reason: PauseReason::Forbidden,
+    });
+    for (task, waiting) in [(TaskKind::PhotoJudge, 2), (TaskKind::LocationSuggest, 2)] {
+        let t = task_report(&report, task);
+        assert_eq!(
+            (t.gate, t.pause, t.waiting),
+            (Ok(()), paused, Some(waiting)),
+            "{task:?}"
+        );
+    }
+    for task in [
+        TaskKind::ImageEmbedding,
+        TaskKind::QueryEmbedding,
+        TaskKind::LocationClue,
+    ] {
+        let t = task_report(&report, task);
+        assert_eq!((t.pause, t.waiting), (TaskPause::None, Some(0)), "{task:?}");
+    }
+    // 既存の一覧は停止を起こした用途だけ
+    assert_eq!(report.pauses.len(), 1);
+
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        &d.config,
+        &waits::Identities::from_config(&d.config),
+        T0 + 60,
+    );
+    assert_eq!(
+        out.get("ai_task_blocks").unwrap(),
+        &serde_json::json!([
+            {"task": "photo_judge", "scope": "provider", "reason": "forbidden", "waiting": 2},
+            {"task": "location_suggest", "scope": "provider", "reason": "forbidden", "waiting": 2},
+        ])
+    );
+    assert_eq!(
+        out.get("ai_pauses").unwrap(),
+        &serde_json::json!([{"task": "location_suggest", "scope": "provider", "reason": "forbidden"}])
+    );
+    // 出すのは用途名・範囲・固定の理由・件数だけ
+    let text = Value::Object(out).to_string();
+    for secret in [
+        "credentials.json",
+        "example-project",
+        "example-region1",
+        "192.0.2.10",
+        "example-suggest",
+        "example-judge",
+        "SECRET",
+    ] {
+        assert!(!text.contains(secret), "{secret}\n{text}");
+    }
+    let debug = format!("{report:?}");
+    for secret in ["credentials.json", "example-project", "192.0.2.10"] {
+        assert!(!debug.contains(secret), "{secret}\n{debug}");
+    }
+}
+
+#[test]
+fn a_task_pause_marks_only_that_task_and_a_task_not_usable_by_settings_is_not_listed() {
+    let d = db("ops-blocks-task", Some(&suggest_allowed()));
+    d.job(JobKind::LocationClue, "c1", "deferred");
+    d.pause_with(TaskKind::LocationClue, false, PauseReason::ModelNotFound);
+    let report = ops::report_at(&d.read(), &d.config, T0).unwrap();
+    let t = task_report(&report, TaskKind::LocationClue);
+    assert_eq!(
+        (t.pause, t.waiting),
+        (
+            TaskPause::Paused(pause::Paused {
+                scope: PauseScope::Task,
+                reason: PauseReason::ModelNotFound
+            }),
+            Some(1)
+        )
+    );
+    assert_eq!(
+        report
+            .tasks
+            .iter()
+            .filter(|t| t.pause != TaskPause::None)
+            .count(),
+        1
+    );
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        &d.config,
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
+    assert_eq!(
+        out.get("ai_task_blocks").unwrap(),
+        &serde_json::json!([
+            {"task": "location_clue", "scope": "task", "reason": "model_not_found", "waiting": 1}
+        ])
+    );
+
+    // SAMPLE の location_suggest は allow_cloud が無く設定で使えない。同じ認証の photo_judge が止まっても、
+    // 使えない用途は「停止中」にせず（使えない理由のまま）、ai_task_blocks にも載せない
+    let sample = db("ops-blocks-disabled", Some(SAMPLE));
+    sample.pause_with(TaskKind::PhotoJudge, true, PauseReason::Unauthorized);
+    let report = ops::report_at(&sample.read(), &sample.config, T0).unwrap();
+    let suggest = task_report(&report, TaskKind::LocationSuggest);
+    assert!(suggest.gate.is_err());
+    assert_eq!(suggest.pause, TaskPause::None);
+    assert!(matches!(
+        task_report(&report, TaskKind::PhotoJudge).pause,
+        TaskPause::Paused(_)
+    ));
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &sample.read(),
+        &sample.config,
+        &waits::Identities::from_config(&sample.config),
+        T0,
+    );
+    let blocks = out.get("ai_task_blocks").unwrap().as_array().unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0]["task"], "photo_judge");
+}
+
+#[test]
+fn without_a_pause_nothing_is_marked_and_no_key_is_added() {
+    let d = db("ops-blocks-none", Some(&suggest_allowed()));
+    d.job(JobKind::PhotoJudge, "j1", "pending");
+    let report = ops::report_at(&d.read(), &d.config, T0).unwrap();
+    assert!(
+        report
+            .tasks
+            .iter()
+            .all(|t| t.pause == TaskPause::None && t.waiting == Some(0))
+    );
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        &d.config,
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
+    assert!(out.get("ai_task_blocks").is_none(), "{out:?}");
+    assert!(out.get("ai_pauses").is_none());
+}
+
+#[test]
+fn a_pause_lookup_that_fails_is_reported_as_unknown_and_not_as_a_block() {
+    let d = db("ops-blocks-unknown", Some(&suggest_allowed()));
+    // 一覧（scope・task・reason・created_at）は読めるが、識別（subject）で引けない表
+    d.writer
+        .call(|c| {
+            c.execute_batch(
+                "DROP TABLE ai_provider_pauses;
+                 CREATE TABLE ai_provider_pauses(scope TEXT, task TEXT, reason TEXT, created_at INTEGER);",
+            )
+        })
+        .unwrap();
+    let report = ops::report_at(&d.read(), &d.config, T0).unwrap();
+    for task in [TaskKind::PhotoJudge, TaskKind::LocationSuggest] {
+        let t = task_report(&report, task);
+        assert_eq!(
+            (t.gate, t.pause, t.waiting),
+            (Ok(()), TaskPause::Unknown, Some(0))
+        );
+    }
+    // 確認できないものは「停止中」として出さない（送信側は読めないときも送らない）
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        &d.config,
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
+    assert!(out.get("ai_task_blocks").is_none(), "{out:?}");
+}
+
+#[test]
+fn a_job_count_that_cannot_be_read_leaves_the_pause_and_makes_the_waiting_count_unknown() {
+    let d = db("ops-blocks-counts-unreadable", Some(&suggest_allowed()));
+    d.pause_with(TaskKind::LocationSuggest, true, PauseReason::Forbidden);
+    // ジョブの表はあるが集計できない（列が違う）。表が無い旧 DB（0 件）とは区別する
+    d.writer
+        .call(|c| c.execute_batch("DROP TABLE ai_jobs; CREATE TABLE ai_jobs(x INTEGER);"))
+        .unwrap();
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        &d.config,
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
+    assert!(out.get("ai_jobs").is_none(), "{out:?}");
+    assert_eq!(
+        out.get("ai_task_blocks").unwrap(),
+        &serde_json::json!([
+            {"task": "photo_judge", "scope": "provider", "reason": "forbidden", "waiting": null},
+            {"task": "location_suggest", "scope": "provider", "reason": "forbidden", "waiting": null},
+        ])
+    );
+}
+
+#[test]
+fn a_missing_job_table_is_zero_waiting_not_unknown() {
+    let d = db("ops-blocks-no-job-table", Some(&suggest_allowed()));
+    d.pause_with(TaskKind::LocationSuggest, true, PauseReason::Forbidden);
+    d.writer
+        .call(|c| c.execute_batch("DROP TABLE ai_jobs;"))
+        .unwrap();
+    let mut out = Map::new();
+    ops::insert_admin_status(
+        &mut out,
+        &d.read(),
+        &d.config,
+        &waits::Identities::from_config(&d.config),
+        T0,
+    );
+    assert_eq!(
+        out.get("ai_task_blocks").unwrap()[0]["waiting"],
+        serde_json::json!(0)
+    );
 }

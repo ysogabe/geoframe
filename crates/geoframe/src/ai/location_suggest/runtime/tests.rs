@@ -6,7 +6,7 @@ use crate::ai::{
     ops::{self, RetryTarget},
     provider::LanClient,
     tests_http::{Stub, respond, stub},
-    tests_worker::{Env, env_with},
+    tests_worker::Env,
     worker::{self, Core, Handler},
 };
 use crate::{
@@ -125,7 +125,14 @@ impl Lab {
         doc["tasks"]["location_suggest"]["daily_request_limit"] = json!(100);
         doc["tasks"]["location_suggest"]["credential_path"] = json!(path);
         change(&mut doc);
-        let env = env_with("suggest-runtime", &doc.to_string(), true);
+        // この試験は日候補の流れを見るもの。手がかり判定の1周期の上限は Rust の既定（10）でなく旧来の 60 にそろえ、
+        // 1周期で全写真を判定させる（周期の上限そのものは tests_worker で確かめる）
+        let env = crate::ai::tests_worker::env_with_vars(
+            "suggest-runtime",
+            &doc.to_string(),
+            true,
+            &[("GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE", "60")],
+        );
         sql(&env, "DELETE FROM photos");
         std::fs::create_dir_all(env.config.data_dir.join("photos")).unwrap();
         let clients = CloudClients::loopback(&env.config.ai, cloud.addr, cloud.addr);
