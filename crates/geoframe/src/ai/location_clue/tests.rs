@@ -1275,3 +1275,105 @@ fn retry_prepares_fallback_sha_outside_writer_and_handles_unprojected_interrupti
         assert!(matches!(targets(&e)[0].readiness, Readiness::Ready(_)));
     }
 }
+
+// ---- STATUS の `db.loc.clue_pending`（R9）----
+
+fn clue_pending_with(e: &Env, config: &crate::config::Config) -> i64 {
+    let read = crate::db::open_read_only(&e.config.db_path()).unwrap();
+    let ctx = crate::admin::AdminContext::new(config, &config.data_dir);
+    let status = crate::admin::status(&read, &ctx).unwrap();
+    status["db"]["loc"]["clue_pending"].as_i64().unwrap()
+}
+fn clue_pending(e: &Env) -> i64 {
+    clue_pending_with(e, &e.config)
+}
+/// 旧 Python が今の画像に対して判定済みとした行（`add` の写真は md5・mtime が NULL）。
+fn legacy_clue(e: &Env, id: i64, rel: &str) {
+    let rel = rel.to_string();
+    e.writer()
+        .call(move |c| {
+            c.execute(
+                "INSERT INTO photo_loc_clues(photo_id,display,source_md5,source_mtime,clue,kind,model,analyzed_at,error)
+                 VALUES(?1,?2,NULL,NULL,0.9,'street','python-model','2026-01-01T00:00:00Z','')",
+                params![id, rel],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn status_clue_pending_counts_rust_waits_even_when_python_rows_are_fresh() {
+    let lab = Lab::new();
+    let e = lab.env("clue-status");
+    // 対象の無い DB
+    assert_eq!(clue_pending(&e), 0);
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&e, 2, "photos/bad.jpg", Some(b"broken image"), 0);
+    add(&e, 3, "", None, 0);
+    fs::write(e.config.data_dir.join("derivatives/fake3.jpg"), jpeg()).unwrap();
+    for (id, rel) in [
+        (1, "photos/a.jpg"),
+        (2, "photos/bad.jpg"),
+        (3, "derivatives/fake3.jpg"),
+    ] {
+        legacy_clue(&e, id, rel);
+    }
+    // 旧 Python の行だけで数えると 0（Rust を判定者としない設定）。Rust の保存結果は 1 件も無い
+    let mut python_only = (*e.config).clone();
+    python_only.ingest = false;
+    assert_eq!(clue_pending_with(&e, &python_only), 0);
+    assert_eq!(clue_pending(&e), 3);
+    // 判定を保存したら 0（恒久失敗は判定済み）
+    cycle(&e);
+    assert_eq!(n(&e, "SELECT COUNT(*) FROM ai_location_clues"), 3);
+    assert_eq!(clue_pending(&e), 0);
+    // 品質の解析待ちの写真は待ちに数える。解析が済んで保存されれば 0 に戻る
+    add(&e, 4, "photos/pending.jpg", Some(&jpeg()), 0);
+    legacy_clue(&e, 4, "photos/pending.jpg");
+    cycle(&e);
+    assert_eq!(clue_pending(&e), 1);
+    let hash = sha(&jpeg());
+    e.writer().call(move |c| {
+        c.execute("INSERT INTO photo_quality_features(photo_id,display,source_md5,source_mtime,content_sha256,error,analyzed_at)
+            VALUES(4,'photos/pending.jpg',NULL,NULL,?1,'','2026-01-01T00:00:00Z')",[hash])?;
+        Ok(())
+    }).unwrap();
+    assert_eq!(clue_pending(&e), 1);
+    e.advance(30);
+    cycle(&e);
+    assert_eq!(clue_pending(&e), 0);
+}
+
+#[test]
+fn status_clue_pending_follows_the_decision_model_and_falls_back_to_python_rows_when_rust_does_not_judge()
+ {
+    let lab = Lab::new();
+    let e = lab.env("clue-status-model");
+    add(&e, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&e, 2, "photos/b.jpg", Some(&jpeg()), 1);
+    legacy_clue(&e, 1, "photos/a.jpg");
+    cycle(&e);
+    assert_eq!(clue_pending(&e), 0);
+    // Decision のモデルが変わると、保存済みの結果は今の世代ではなく、全件が待ちに戻る
+    let base = fs::read_to_string(e.config.data_dir.parent().unwrap().join("ai.json")).unwrap();
+    let path = e.config.data_dir.parent().unwrap().join("other-model.json");
+    fs::write(&path, base.replace("example-decision", "other-decision")).unwrap();
+    let mut config = (*e.config).clone();
+    config.ai = crate::ai::settings::AiConfig::load(&|k| {
+        (k == "GEOFRAME_AI_CONFIG").then(|| path.to_str().unwrap().to_string())
+    });
+    assert_eq!(clue_pending_with(&e, &config), 2);
+    // Rust が判定しない設定（用途なし・取り込み無効）では、旧 Python の行の世代一致で数える従来の値
+    sql(&e, "DELETE FROM photo_loc_clues WHERE photo_id=2");
+    let mut off = (*e.config).clone();
+    off.ingest = false;
+    assert_eq!(clue_pending_with(&e, &off), 1);
+    let unset = env_with("clue-status-unset", "{}", true);
+    sql(&unset, "DELETE FROM photos");
+    fs::create_dir_all(unset.config.data_dir.join("photos")).unwrap();
+    add(&unset, 1, "photos/a.jpg", Some(&jpeg()), 1);
+    add(&unset, 2, "photos/b.jpg", Some(&jpeg()), 1);
+    legacy_clue(&unset, 1, "photos/a.jpg");
+    assert_eq!(clue_pending(&unset), 1);
+}

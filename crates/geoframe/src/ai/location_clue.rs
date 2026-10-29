@@ -655,6 +655,16 @@ pub fn load_targets(
     Ok(targets)
 }
 
+/// STATUS の `db.loc.clue_pending` 用: Rust の判定が今の入力の世代に対して保存されていない写真の数
+/// （`Readiness::Pending`。ジョブが未登録・待ち・後回し・再試行待ちのもの）。恒久失敗（`Failed`）は判定済み。
+/// BLOB は読まない。ファイルを読むのは `display` の無い fallback の写真だけ。
+pub fn pending_count(conn: &Connection, data: &DataDir, model: &str) -> rusqlite::Result<usize> {
+    Ok(load_targets(conn, data, model)?
+        .iter()
+        .filter(|t| t.readiness == Readiness::Pending)
+        .count())
+}
+
 fn job_state(conn: &Connection, key: &JobKey) -> rusqlite::Result<Option<(String, String)>> {
     if !jobs::object_exists(conn, "table", "ai_jobs")? {
         return Ok(None);

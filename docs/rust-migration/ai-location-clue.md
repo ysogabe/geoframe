@@ -60,6 +60,16 @@ display が空なら、検証した drive_id の `derivatives/<id>.jpg` を既�
 
 `ai-jobs retry` はサービス停止後の既存 guard / ingest lock / writer を維持し、通信せず現入力・処理版・適合結果を検査する。fallback の retry は `prepare_retry` で writer 外にて実 SHA を観測し、writer 内ではその値と読み直した DB 世代を照合する。未投影の中断上限にも対応し、次周期の reconcile と送信直前にも実ファイルを再検査する。Requeue なら同じ世代の failed メタデータと対応する互換 failed 投影を同じ tx で無効にし、未判定へ戻す。succeeded・別世代・手動 GPS は消さない。再成功は正常 clue へ置き換える。実際の Python `_load_targets` / `passes` でも正常／failed 行の再利用と retry 後の未判定を試験する。
 
+## STATUSの`clue_pending`
+
+`GET /api/admin/status` の `db.loc.clue_pending`（管理画面の「手がかり判定待ち」と、毎朝のDecisionのtimer `deploy/loc_decision_morning.py` が読む値。timerは0なら何もしない）は、**Rustが位置の手がかりを判定するとき**、次の写真の数にする。
+
+- 数える対象: 位置なしで撮影時刻が読める写真のうち、Rustの保存結果（`ai_location_clues`）が**今の入力の世代**（上の「世代・結果版」の入力のハッシュとDecisionのモデルの処理版）に合っていないもの。ジョブが未登録・待ち・後回し・再試行待ちの写真と、品質の解析待ちの写真を含む。`photo_loc_clues`に旧Pythonの判定済みの行があっても数える（Rustは旧Pythonの行を信用しない）。`load_targets` の `Readiness::Pending` の件数と同じ。
+- 数えない: 保存済みの写真と、恒久失敗で`error`の行を保存した写真（`Failed`。判定済みで、再送もしない）。保存が済むと`photo_loc_clues`にも投影されるので、全部保存されれば0。
+- 「Rustが判定するとき」: ワーカーに位置の手がかりのハンドラが登録される条件と同じ（`GEOFRAME_INGEST=1`で、`ai.gate(location_clue)`が通る＝AIが有効・Decisionの用途が設定済み・位置候補が有効）。そうでないとき（AI未設定・設定の誤り・無効・用途なし・取り込み無効）は、Rustが減らすことのない値を出してtimerに待たせないよう、**従来の値**（旧Pythonの`photo_loc_clues`の世代一致で数えた未判定の数）のままにする。
+- 他のキー（`targets`・`clue_passed`・`days`・`days_with_clue`など）は旧Pythonの行から数える従来の値のまま。そのため、Rustが判定するときは `targets − clue_pending` は「旧Pythonの行で判定済み」の数とは一致しない。
+- 計算: STATUSの呼び出しごとに読み取りの接続で数える（キャッシュは無い）。1枚につき主キーでの数回の問い合わせで、画像の中身（BLOB）は読まない。ファイルを読むのは`display`の無いfallbackの写真だけ。
+
 ## 画像境界と停止
 
 `imaging::lock_derivatives` の中で、DataDir の読み取り用検査を通して通常ファイルを上限付きで読み切る。DB の traversal・絶対パス・リンク（親／末尾、内部向きも拒否）・FIFO・ディレクトリを拒否する。open は O_NOFOLLOW / O_NONBLOCK、fd の実体も `/proc/self/fd` から DATA_DIR 内と確認してから読む。既存 DataDir や他 reader は変更しない。削除用 derivative_file を読み取りの根拠にしない。

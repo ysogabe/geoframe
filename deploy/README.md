@@ -234,7 +234,7 @@ Decision が常駐している間は、この節のタイマーは「人が起�
 必要なときだけ Decision を動かすタイマーを用意しています
 （[`loc_decision_morning.py`](loc_decision_morning.py)。確認の要求には `X-Client-Name: geoframe-loc-morning` を付けます）。
 
-1. STATUS の判定待ち（`db.loc.clue_pending`）が0なら何もしない
+1. STATUS の判定待ち（`db.loc.clue_pending`）が0なら何もしない（Rust 版が判定するときは、Rust の保存結果が今の入力に合っていない写真の数。旧 Python の判定済みの行があっても数える）
 2. 人が Decision を起動済みなら何もしない（止めるのも人に任せる）
 3. GPU が空いていなければ何もせず、翌朝にもう一度見る。空いているとみなすのは、llm-manager の
    lease が0件、ほかのプロセスの VRAM が1GB未満、GPU 使用率が10%未満、Ollama がモデルを

@@ -6,6 +6,8 @@
 //! 使用量は Python と同じく 60 秒キャッシュ）。位置候補の列（`db.loc`）は、DB の `photo_loc_clues`・
 //! `photo_loc_runs`・`photo_loc_suggestions` と `settings.photo_loc_status`（Python のワーカーが前回の
 //! 処理時に書いた Decision の状態）から計算する。Rust は Decision に問い合わせず、その値を書き換えない。
+//! ただし `clue_pending` は、Rust が位置の手がかりを判定するときは Rust の保存結果（`ai_location_clues`）が今の
+//! 入力に合っていない写真の数にする（`ai::location_clue::pending_count`）。
 //!
 //! 1回の応答の件数は**1つの読み取りトランザクション**の中で数える（Python は件数ごとにロックを取り直す
 //! ので、書き込みが挟まると合計がずれうる。Rust は一貫した断面を返す）。仕様と Python との差は
@@ -21,7 +23,9 @@ use rusqlite::{Connection, Row, params_from_iter};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
+use crate::ai::settings::TaskKind;
 use crate::config::Config;
+use crate::datadir::DataDir;
 use crate::photos::parse_epoch;
 use crate::sysinfo;
 
@@ -46,6 +50,10 @@ pub struct AdminContext {
     pub ai: crate::ai::settings::AiConfig,
     /// 今の AI 設定の用途ごとの待ちの識別（`ai_waits` を用途に結び直す。ハッシュはメモリの中だけで、応答には出さない）。
     pub ai_waits: crate::ai::waits::Identities,
+    /// Rust が位置の手がかり（Decision）を判定するとき（`location_clue` の用途が使えて取り込みが有効＝ワーカーに
+    /// ハンドラが登録される）の、データ置き場と Decision のモデル。無ければ `None`（`clue_pending` は旧 Python の
+    /// 行だけで数える）。
+    rust_clue: Option<(DataDir, String)>,
     scene_config: Config,
 }
 
@@ -57,9 +65,22 @@ impl AdminContext {
             embed_model: config.embed_backend.model(),
             ai: config.ai.clone(),
             ai_waits: crate::ai::waits::Identities::from_config(&config.ai),
+            rust_clue: rust_clue(config),
             scene_config: config.clone(),
         }
     }
+}
+
+/// `worker::production_handlers` が `LocationClue` のハンドラを登録する条件と同じ。
+fn rust_clue(config: &Config) -> Option<(DataDir, String)> {
+    if !config.ingest {
+        return None;
+    }
+    let gate = config.ai.gate(TaskKind::LocationClue, true).ok()?;
+    Some((
+        DataDir::open(&config.data_dir).ok()?,
+        gate.settings.model.clone(),
+    ))
 }
 
 fn conversion_error(message: &'static str) -> rusqlite::Error {
@@ -491,11 +512,18 @@ fn loc_status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Value> 
             runs.insert(row.get(0)?, row.get(1)?);
         }
     }
+    // 待ち: Rust が判定するときは、Rust の判定が今の入力の世代に対して保存されていない写真の数（旧 Python の
+    // `photo_loc_clues` の行があっても数える）。Rust が判定しないとき（AI 無効・用途なし・取り込み無効）は、
+    // 旧 Python の行の世代一致で数える従来の値のまま
+    let clue_pending = match &ctx.rust_clue {
+        Some((data, model)) => crate::ai::location_clue::pending_count(conn, data, model)?,
+        None => targets.iter().filter(|t| !t.classified).count(),
+    };
     Ok(json!({
         "decision": last.get("decision").cloned().unwrap_or_else(|| json!("")),
         "last_at": last.get("at").cloned().unwrap_or_else(|| json!("")),
         "targets": targets.len(),
-        "clue_pending": targets.iter().filter(|t| !t.classified).count(),
+        "clue_pending": clue_pending,
         "clue_passed": targets.iter().filter(|t| t.classified && t.passes()).count(),
         "days": days,
         "days_with_clue": with_clue,

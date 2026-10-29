@@ -4,6 +4,8 @@
 geoframe-loc-decision.timer（Decision を動かすユーザーのユーザーunit、毎朝5:00）から呼ばれる。
 
 1. geoframe の STATUS で判定待ち（db.loc.clue_pending）が無ければ何もしない
+   （Rust 版が判定するときは Rust の保存結果が今の入力に合っていない写真の数。旧 Python の
+   判定済みの行があっても数える。Rust が判定しないときは従来どおり旧 Python の行で数える）
 2. 人が Decision（llm-decision）を起動済みなら何もしない（止めるのも人に任せる）
 3. GPU が空いていなければ何もしない（翌朝もう一度見る）
 4. Decision を起動し、判定待ちが0になったら止める。上限の時間を過ぎた・判定が
