@@ -240,7 +240,7 @@ pub struct Config {
     /// 0 なら上流へ行かない。
     pub tile_fetch_per_min: i64,
     /// 取り込み（DB への書き込みと同期サイクル）を有効にするか。`GEOFRAME_INGEST`。既定は無効。
-    /// 本番は P5 の切替まで Python が書き手なので、誤って二重に書かないよう、明示しない限り Rust は書かない。
+    /// Python 版と共通の設定をそのまま使っても二重に書かないよう、明示しない限り Rust は書かない。
     pub ingest: bool,
     /// 同期サイクルの間隔（分）。`GEOFRAME_DRIVE_POLL_MIN`（現行と同じく分で、小数も可）。
     pub drive_poll_min: f64,

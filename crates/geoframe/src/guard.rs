@@ -1,54 +1,52 @@
-//! 本番への誤指定を、書き込みを始める前に拒否するガード（P5 の切替まで）。
+//! 書き込みを始める前の守り（Python 版が書き手のあいだの二重書き込みと、root での実行の拒否）。
 //!
 //! # なぜ要るか
 //!
 //! `GEOFRAME_INGEST=1` を立てると Rust は DB の移行・`.cache.json` の更新・`.dl_*` の掃除をする。
-//! 本番機では書き手は Python（`geoframe-server`）で、Python は Rust の `.ingest.lock` を見ない。
-//! そこへ Rust が書くと、Python のダウンロード中の `.dl_*` を消し、`.cache.json` の更新が競合する。
-//! 配布スクリプト（`deploy/rust-deploy.sh`）の拒否は、直接の起動や設定ファイルの書き換えには効かない。
-//! だから**バイナリ自身が**、書き込みの前に次の 2 つを確かめる。どちらかが満たせなければ、何も書かずに
-//! 終了コード 2 で断る（unit の `RestartPreventExitStatus=2` により再起動ループにならない）。
+//! Python 版（`geoframe-server`）が動いているあいだ、書き手は Python で、Python は Rust の
+//! `.ingest.lock` を見ない。そこへ Rust が書くと、Python のダウンロード中の `.dl_*` を消し、
+//! `.cache.json` の更新が競合する。`geoframe-rs.service` の `Conflicts=`／`After=` は systemd 経由の起動だけ
+//! に効くので、手で打つ書き込み系の CLI・直接の起動・設定の書き換えのような経路は、バイナリ自身が守る。
+//! 書き込みの前に次の 2 つを確かめ、満たせなければ何も書かずに断る。
 //!
-//! 1. 検証環境の印 [`STAGING_MARKER`] が通常ファイルとしてある（リンクは不可。配布スクリプトと同じ）。
-//!    本番機には印が無いので、ここで必ず止まる。
+//! 1. **root（実効 UID 0）で実行していない**。root で書くと作られるファイル（`catalog.db-wal`・`.cache.json`・
+//!    `derivatives/` など）が root の所有になり、サービス（`User=geoframe`）が書けなくなる。終了コード 2。
+//!    サービスと同じユーザーで CLI を動かすには `deploy/geoframe-admin.sh` を使う。
 //! 2. Python 版（[`PYTHON_UNIT`]）が非稼働と**確認できる**。`systemctl show` の結果の `ActiveState` が
 //!    `inactive`／`failed` のときだけ通す（`LoadState` は見ない。unit ファイルが無い `not-found` でも、
 //!    動いているサービスは動き続けうるので、`not-found/active` も断る。Python が入っていない機体は
-//!    `not-found/inactive` で通る）。稼働中・状態不明・`systemctl` が無い／使えない／時間内に答えない／
-//!    出力が読めない・`LoadState`／`ActiveState` の行が欠けている・空・重複している、は全て断る
-//!    （判定できないから素通し、にはしない）。
+//!    `not-found/inactive` で通る）。稼働中・未知の状態は終了コード 2（再起動しても直らない）。
+//!    状態を**取得できない**（`systemctl` が無い／使えない／時間内に答えない／出力が読めない・
+//!    `LoadState`／`ActiveState` の行が欠けている・空・重複している）は終了コード 1: 判定できないものは
+//!    通さないが、systemd がまだ使えない起動直後のような一時的な失敗かもしれないので、unit の
+//!    `Restart=on-failure` で再試行させる（`StartLimitIntervalSec=`／`StartLimitBurst=` が上限を持つ）。
 //!
 //! 検査は起動時の 1 回だけ。その後に Python が起動された場合は検知しない。
 //!
+//! 検証環境の印（`/etc/geoframe/staging`）の検査は P5 で外した。切替のあとは本番が Rust の唯一の書き手で、
+//! 印は「本番では書かない」ための暫定だったため。Python 版の検査は、Python へ戻したあとの運用中も要るので残す。
+//!
 //! # 置き場所
 //!
-//! [`crate::ingest::start`] の先頭（データ置き場の作成より前）。`serve` も `sync`（実行）もここを通る。
-//! `sync --dry-run` は書き込み接続を作らず行・写真・キャッシュ・ロックを変えないので、ガードを通さない
-//! （SQLite が読み取りでも作る WAL 関連ファイルだけは、できうる）。ガードを通さないのは書かないからで、
-//! 本番機で実行してよいという意味ではない。向けるのは検証環境の本番コピー（のバックアップのコピー）だけで、
-//! 本番の DB には向けない（docs/rust-migration/plan.md §2。鍵があれば Drive にも接続する）。
+//! [`crate::ingest::start`] の先頭（データ置き場の作成より前）。`serve`（取り込みつき）も `sync`（実行）も
+//! `organize` なども、`ingest::start` を通るものは全てここを通る。`serve` は取り込みが無効（読み取り専用）でも
+//! root では起動しない（[`refuse_root`]。`-wal`／`-shm`・`tile_cache/` が root の所有になるため。Python の検査は
+//! 書かないので通さない）。`sync --dry-run` は書き込み接続を作らず行・写真・キャッシュ・ロックを変えないので、
+//! ガードを通さない（SQLite が読み取りでも作る WAL 関連ファイルだけは、できうる）。ガードを通さないのは
+//! 書かないからで、本番機で実行してよいという意味ではない。向けるのは検証環境の本番コピー（のバックアップの
+//! コピー）だけで、本番の DB には向けない（docs/rust-migration/plan.md §2。鍵があれば Drive にも接続する）。
 //!
 //! # 試験用の差し替え
 //!
-//! デバッグビルド（`cargo test` が作るバイナリ）に限り、環境変数 `GEOFRAME_TEST_STAGING_MARKER`
-//! （印のパス）と `GEOFRAME_TEST_PYTHON_STATE`（`<LoadState>/<ActiveState>`。`unavailable` は取得失敗）で
-//! 差し替えられる。リリースビルド（配布するもの）にはこのコードが無く、環境変数は無視される。
-//!
-//! # P5 で外す
-//!
-//! 本番の切替のときに、このモジュールと `ingest::start` の呼び出しを外す（または本番の印に置き換える）。
-//! 手順は docs/rust-migration/plan.md の P5。
+//! デバッグビルド（`cargo test` が作るバイナリ）に限り、環境変数 `GEOFRAME_TEST_PYTHON_STATE`
+//! （`<LoadState>/<ActiveState>`。形が違う値は取得失敗）と `GEOFRAME_TEST_EUID`（実効 UID の代わりの数値。
+//! 数値でなければ無視して本物を使う）で差し替えられる。リリースビルド（配布するもの）にはこのコードが無く、
+//! 環境変数は無視される。
 
 use std::fmt;
-use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
-
-/// 検証環境の印。`deploy/rust-deploy.sh` が使うものと同じ。検証環境で一度だけ
-/// `sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging` で作る。
-pub const STAGING_MARKER: &str = "/etc/geoframe/staging";
 
 /// 本番の書き手（Python 版）の unit。
 pub const PYTHON_UNIT: &str = "geoframe-server.service";
@@ -61,30 +59,38 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum GuardError {
-    /// 検証環境の印が無い（または通常ファイルでない）。
-    NoMarker(String),
+    /// root（実効 UID 0）で実行している。
+    Root,
     /// Python 版が非稼働と確認できない（稼働中・不明な状態）。状態名だけを持つ。
     PythonNotStopped(String),
     /// Python 版の状態を取得できない。理由は定型文。
     PythonUnknown(&'static str),
 }
 
+impl GuardError {
+    /// 再起動しても直らない拒否か。`false`（状態を取得できない）は一時的な失敗でありうるので、
+    /// 終了コード 1 にして unit の `Restart=on-failure` で再試行させる。
+    pub fn is_permanent(&self) -> bool {
+        !matches!(self, Self::PythonUnknown(_))
+    }
+}
+
 impl fmt::Display for GuardError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoMarker(path) => write!(
-                f,
-                "検証環境の印（{path}）が無いので、取り込み（GEOFRAME_INGEST=1）を始めません。P5 の切替まで、\
-                 取り込みは検証環境でしか動きません。本番機（Python 版が書き手の機体）では動かせません"
+            Self::Root => f.write_str(
+                "root で実行しているので、書き込みを始めません。作られるファイルが root の所有になり、\
+                 サービス（geoframe ユーザー）が書けなくなります。サービスと同じユーザー・設定で動かすには \
+                 deploy/geoframe-admin.sh を使ってください",
             ),
             Self::PythonNotStopped(state) => write!(
                 f,
-                "Python 版（{PYTHON_UNIT}）が非稼働と確認できない（状態: {state}）ので、取り込みを始めません。\
+                "Python 版（{PYTHON_UNIT}）が非稼働と確認できない（状態: {state}）ので、書き込みを始めません。\
                  二重に書くと Python のダウンロードと .cache.json を壊します"
             ),
             Self::PythonUnknown(why) => write!(
                 f,
-                "Python 版（{PYTHON_UNIT}）の状態を取得できない（{why}）ので、取り込みを始めません。\
+                "Python 版（{PYTHON_UNIT}）の状態を取得できない（{why}）ので、書き込みを始めません。\
                  非稼働と確認できないものは通しません"
             ),
         }
@@ -92,6 +98,52 @@ impl fmt::Display for GuardError {
 }
 
 impl std::error::Error for GuardError {}
+
+/// 実効 UID の取り方。
+#[derive(Clone, Copy)]
+enum Euid {
+    /// 本物（`geteuid`）。
+    Real,
+    /// 試験用の固定値。
+    #[cfg(any(test, debug_assertions))]
+    Fixed(u32),
+}
+
+impl Euid {
+    /// 本物。デバッグビルドだけは `GEOFRAME_TEST_EUID` で差し替えられる。
+    fn from_env() -> Self {
+        #[cfg(debug_assertions)]
+        if let Some(uid) = std::env::var("GEOFRAME_TEST_EUID")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            return Self::Fixed(uid);
+        }
+        Self::Real
+    }
+
+    fn get(self) -> u32 {
+        match self {
+            Self::Real => crate::sysinfo::effective_uid(),
+            #[cfg(any(test, debug_assertions))]
+            Self::Fixed(uid) => uid,
+        }
+    }
+
+    fn check(self) -> Result<(), GuardError> {
+        if self.get() == 0 {
+            Err(GuardError::Root)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// root で実行していれば断る。`serve` は取り込みが無効でも、`-wal`／`-shm` と `tile_cache/` を
+/// root の所有で作ってしまうので、起動の最初にこれを通す。
+pub fn refuse_root() -> Result<(), GuardError> {
+    Euid::from_env().check()
+}
 
 enum Probe {
     /// `systemctl show`（本番の経路）。
@@ -105,18 +157,18 @@ enum Probe {
 }
 
 pub struct Guard {
-    marker: PathBuf,
+    euid: Euid,
     probe: Probe,
     #[cfg(test)]
     skip: bool,
 }
 
 impl Guard {
-    /// 実際に使うガード。印は [`STAGING_MARKER`]、Python の判定は `systemctl show`。
+    /// 実際に使うガード。root の判定は `geteuid`、Python の判定は `systemctl show`。
     /// デバッグビルドだけは、上の「試験用の差し替え」を読む。
     pub fn production() -> Self {
         let guard = Self {
-            marker: PathBuf::from(STAGING_MARKER),
+            euid: Euid::Real,
             probe: Probe::Systemctl,
             #[cfg(test)]
             skip: false,
@@ -128,8 +180,8 @@ impl Guard {
 
     #[cfg(debug_assertions)]
     fn with_test_overrides(mut self, get: impl Fn(&str) -> Option<String>) -> Self {
-        if let Some(path) = get("GEOFRAME_TEST_STAGING_MARKER").filter(|v| !v.is_empty()) {
-            self.marker = PathBuf::from(path);
+        if let Some(uid) = get("GEOFRAME_TEST_EUID").and_then(|v| v.parse::<u32>().ok()) {
+            self.euid = Euid::Fixed(uid);
         }
         if let Some(state) = get("GEOFRAME_TEST_PYTHON_STATE").filter(|v| !v.is_empty()) {
             self.probe = Probe::Fixed(
@@ -141,54 +193,46 @@ impl Guard {
         self
     }
 
-    /// 印のパスだけを差し替えた、本番と同じ判定のガード（`ingest` の単体テスト用）。
-    #[cfg(test)]
-    pub fn production_with_marker_for_test(marker: PathBuf) -> Self {
-        Self {
-            marker,
-            probe: Probe::Systemctl,
-            skip: false,
-        }
-    }
-
     /// 検査しない（`ingest` の単体テストが合成の置き場で `start` を呼ぶため）。
     #[cfg(test)]
     pub fn skip() -> Self {
         Self {
-            marker: PathBuf::new(),
+            euid: Euid::Fixed(1000),
             probe: Probe::Systemctl,
             skip: true,
         }
     }
 
-    /// 検証環境の印と Python 版の非稼働を確かめる。何も書かない。
+    /// Python 版が稼働中と答える、必ず断るガード（`ingest` の単体テスト用）。
+    #[cfg(test)]
+    pub fn refusing_for_test() -> Self {
+        Self {
+            euid: Euid::Fixed(1000),
+            probe: Probe::Fixed(Some(("loaded".into(), "active".into()))),
+            skip: false,
+        }
+    }
+
+    /// root でないこと・Python 版の非稼働を確かめる。何も書かない。
     pub fn check(&self) -> Result<(), GuardError> {
         #[cfg(test)]
         if self.skip {
             return Ok(());
         }
-        check_marker(&self.marker)?;
+        self.euid.check()?;
         let (load, active) = self.probe.run()?;
         let verdict = decide(&load, &active);
         if verdict.is_ok() {
             tracing::info!(
-                "[guard] 検証環境の印を確認しました。{PYTHON_UNIT} は {}",
+                "[guard] root ではないことと、{PYTHON_UNIT} が{}ことを確認しました",
                 if load == "not-found" {
-                    "未導入です"
+                    " 未導入である".to_string()
                 } else {
-                    &active
+                    format!(" {active} である")
                 }
             );
         }
         verdict
-    }
-}
-
-/// 配布スクリプトと同じ: 通常ファイルで、シンボリックリンクではない。
-fn check_marker(marker: &std::path::Path) -> Result<(), GuardError> {
-    match fs::symlink_metadata(marker) {
-        Ok(meta) if meta.file_type().is_file() => Ok(()),
-        _ => Err(GuardError::NoMarker(marker.display().to_string())),
     }
 }
 
@@ -309,11 +353,10 @@ fn parse_show(out: &str) -> Result<(String, String), GuardError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testutil::TempDir;
 
-    fn guard(dir: &TempDir, probe: Probe) -> Guard {
+    fn guard(probe: Probe) -> Guard {
         Guard {
-            marker: dir.path().join("staging"),
+            euid: Euid::Fixed(1000),
             probe,
             skip: false,
         }
@@ -324,36 +367,26 @@ mod tests {
     }
 
     #[test]
-    fn without_the_marker_it_refuses_even_if_python_is_stopped() {
-        let dir = TempDir::new("guard-nomarker");
-        let g = guard(&dir, fixed("loaded", "inactive"));
-        assert!(matches!(g.check(), Err(GuardError::NoMarker(_))));
-        // ディレクトリや壊れたリンクは印ではない
-        fs::create_dir(dir.path().join("staging")).unwrap();
-        assert!(matches!(g.check(), Err(GuardError::NoMarker(_))));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlink_is_not_a_marker() {
-        let dir = TempDir::new("guard-link");
-        fs::write(dir.path().join("real"), b"").unwrap();
-        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("staging")).unwrap();
-        let g = guard(&dir, fixed("loaded", "inactive"));
-        assert!(matches!(g.check(), Err(GuardError::NoMarker(_))));
+    fn root_is_refused_even_if_python_is_stopped() {
+        let g = Guard {
+            euid: Euid::Fixed(0),
+            probe: fixed("loaded", "inactive"),
+            skip: false,
+        };
+        assert_eq!(g.check(), Err(GuardError::Root));
+        assert_eq!(Euid::Fixed(0).check(), Err(GuardError::Root));
+        assert_eq!(Euid::Fixed(1000).check(), Ok(()));
     }
 
     #[test]
-    fn the_marker_and_a_stopped_python_pass() {
-        let dir = TempDir::new("guard-pass");
-        fs::write(dir.path().join("staging"), b"").unwrap();
+    fn a_stopped_python_passes_without_any_marker() {
         for (load, active) in [
             ("loaded", "inactive"),
             ("loaded", "failed"),
             ("not-found", "inactive"),
         ] {
             assert_eq!(
-                guard(&dir, fixed(load, active)).check(),
+                guard(fixed(load, active)).check(),
                 Ok(()),
                 "{load}/{active}"
             );
@@ -362,16 +395,7 @@ mod tests {
 
     #[test]
     fn a_running_or_unknown_python_is_refused() {
-        let dir = TempDir::new("guard-running");
-        fs::write(dir.path().join("staging"), b"").unwrap();
         // unit ファイルを消して daemon-reload しても、動いているサービスは止まらない
-        for load in ["loaded", "not-found"] {
-            assert_eq!(
-                guard(&dir, fixed(load, "active")).check(),
-                Err(GuardError::PythonNotStopped("active".into())),
-                "{load}/active"
-            );
-        }
         for active in [
             "active",
             "activating",
@@ -382,7 +406,7 @@ mod tests {
         ] {
             for load in ["loaded", "not-found"] {
                 assert_eq!(
-                    guard(&dir, fixed(load, active)).check(),
+                    guard(fixed(load, active)).check(),
                     Err(GuardError::PythonNotStopped(active.into())),
                     "{load}/{active}"
                 );
@@ -392,19 +416,23 @@ mod tests {
 
     #[test]
     fn an_unavailable_state_is_refused_not_passed() {
-        let dir = TempDir::new("guard-unavailable");
-        fs::write(dir.path().join("staging"), b"").unwrap();
         assert!(matches!(
-            guard(&dir, Probe::Fixed(None)).check(),
+            guard(Probe::Fixed(None)).check(),
             Err(GuardError::PythonUnknown(_))
         ));
     }
 
     #[test]
+    fn only_an_unreadable_state_is_worth_retrying() {
+        // 稼働中・root は再起動しても直らない（終了コード 2）。状態を取れないのは再試行に意味がある（終了コード 1）
+        assert!(GuardError::Root.is_permanent());
+        assert!(GuardError::PythonNotStopped("active".into()).is_permanent());
+        assert!(!GuardError::PythonUnknown("x").is_permanent());
+    }
+
+    #[test]
     fn the_systemctl_output_is_parsed_strictly() {
-        let dir = TempDir::new("guard-shell");
-        fs::write(dir.path().join("staging"), b"").unwrap();
-        let ok = |script| guard(&dir, Probe::Shell(script)).check();
+        let ok = |script| guard(Probe::Shell(script)).check();
         assert_eq!(
             ok("printf 'LoadState=loaded\\nActiveState=inactive\\n'"),
             Ok(())
@@ -452,50 +480,60 @@ mod tests {
     #[test]
     fn a_hung_systemctl_is_killed_and_refused() {
         // 上限（5 秒）まで待つので、このテストだけは数秒かかる
-        let dir = TempDir::new("guard-hung");
-        fs::write(dir.path().join("staging"), b"").unwrap();
         let started = Instant::now();
-        let result = guard(&dir, Probe::Shell("sleep 30")).check();
+        let result = guard(Probe::Shell("sleep 30")).check();
         assert!(matches!(result, Err(GuardError::PythonUnknown(_))));
         assert!(started.elapsed() < Duration::from_secs(20));
     }
 
     #[test]
     fn the_refusal_messages_carry_no_values() {
-        let text = GuardError::NoMarker("/etc/geoframe/staging".into()).to_string();
-        assert!(text.contains("/etc/geoframe/staging") && text.contains("GEOFRAME_INGEST=1"));
         let text = GuardError::PythonNotStopped("active".into()).to_string();
         assert!(text.contains("geoframe-server.service") && text.contains("active"));
+        let text = GuardError::Root.to_string();
+        assert!(text.contains("root") && text.contains("geoframe-admin.sh"));
+        let text = GuardError::PythonUnknown("systemctl が見つかりません").to_string();
+        assert!(text.contains("geoframe-server.service"));
     }
 
     #[cfg(debug_assertions)]
     #[test]
-    fn test_overrides_change_the_marker_path_but_never_remove_the_requirement() {
-        let dir = TempDir::new("guard-override");
-        let env = |key: &str| match key {
-            "GEOFRAME_TEST_STAGING_MARKER" => Some(dir.path().join("m").display().to_string()),
-            "GEOFRAME_TEST_PYTHON_STATE" => Some("loaded/inactive".to_string()),
-            _ => None,
+    fn test_overrides_replace_the_checks_but_never_remove_them() {
+        let base = || Guard {
+            euid: Euid::Real,
+            probe: Probe::Systemctl,
+            skip: false,
         };
-        let g = Guard {
-            marker: PathBuf::from(STAGING_MARKER),
-            probe: Probe::Systemctl,
-            skip: false,
-        }
-        .with_test_overrides(env);
-        // 差し替えた先に印が無ければ断る
-        assert!(matches!(g.check(), Err(GuardError::NoMarker(_))));
-        fs::write(dir.path().join("m"), b"").unwrap();
-        assert_eq!(g.check(), Ok(()));
+        let env = |uid: &'static str, state: &'static str| {
+            move |key: &str| match key {
+                "GEOFRAME_TEST_EUID" => Some(uid.to_string()),
+                "GEOFRAME_TEST_PYTHON_STATE" => Some(state.to_string()),
+                _ => None,
+            }
+        };
+        // 差し替えても、root なら断り、稼働中なら断る
+        assert_eq!(
+            base()
+                .with_test_overrides(env("0", "loaded/inactive"))
+                .check(),
+            Err(GuardError::Root)
+        );
+        assert_eq!(
+            base()
+                .with_test_overrides(env("1000", "loaded/inactive"))
+                .check(),
+            Ok(())
+        );
+        assert_eq!(
+            base()
+                .with_test_overrides(env("1000", "loaded/active"))
+                .check(),
+            Err(GuardError::PythonNotStopped("active".into()))
+        );
         // 値の形が違えば取得失敗として断る（通さない）
-        let bad = Guard {
-            marker: dir.path().join("m"),
-            probe: Probe::Systemctl,
-            skip: false,
-        }
-        .with_test_overrides(|key| {
-            (key == "GEOFRAME_TEST_PYTHON_STATE").then(|| "garbage".to_string())
-        });
-        assert!(matches!(bad.check(), Err(GuardError::PythonUnknown(_))));
+        assert!(matches!(
+            base().with_test_overrides(env("1000", "garbage")).check(),
+            Err(GuardError::PythonUnknown(_))
+        ));
     }
 }
