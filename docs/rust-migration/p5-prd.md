@@ -28,7 +28,7 @@ P0〜P4で、Rust版`geoframe`（単一バイナリ）は検証環境で、本�
 
 ## 要求
 
-- R1（必須）: 本番でRustが書き込みを始められるようにする。検証環境の印の検査を外す。PythonとRustが同時に書かない守りは、バイナリの検査（Python版のunitが非稼働）・unitの`mask`・`Conflicts=`と順序・手順で持つ。
+- R1（必須）: 本番でRustが書き込みを始められるようにする。検証環境の印の検査を外す。PythonとRustが同時に書かない守りは、バイナリの検査（Python版のunitが非稼働）・unitの`mask`・`Conflicts=`と順序・手順で持つ。AIの書き込み系の操作は、サービスと同じユーザー・設定で動かす道具を使う。
 - R2（必須）: 本番へRustのバイナリを配る道具。本番であることを確かめ、演習で使ったのと同じバイナリだけを入れ、空のDBで「成功」としない。失敗したら前の状態へ戻す。
 - R3（必須）: `catalog.db`と、バックアップに入っていない一次データ（旅行ブログの下書きなど）を切替の直前に保全する手順。バックアップから復元する手順と、その演習。
 - R4（必須）: 切替の手順書。止める順・設定・確かめること・止める判断の基準・AIの書き込み系の操作の仕方。
@@ -42,7 +42,7 @@ P0〜P4で、Rust版`geoframe`（単一バイナリ）は検証環境で、本�
 ## 受け入れ条件
 
 - AC1（R1）: `GEOFRAME_INGEST=1`のRustが、印の無い機体で、Python版のunitが無い・非稼働なら起動して書く。Python版が稼働中なら、`serve`と書き込み系のCLI（`sync`・`quality-scan`・`ai-jobs retry|release-pause|deactivate-space`など）は書く前に断る。検証環境の印の検査・`GEOFRAME_TEST_STAGING_MARKER`がバイナリの側に残っていない（`rust-deploy.sh`の印の扱いは除く）。検証環境の演習で、`Conflicts=`と順序により、どちらの向きでも旧プロセスが終わってから新しいプロセスが書き始めることを確かめた。
-- AC2（R2）: `rust-deploy.sh --production=<ホスト名>`は、ホスト名が違う・検証環境の印がある・Python版が稼働中・期待するsha256と違う・作業ツリーが汚れている、のどれかで何も変えずに断る。配布のあと配信の件数が指定の下限より少なければ失敗として戻す。`--rollback --production`が動く。`rust-deploy-test.sh`がこれらを試し、通る。
+- AC2（R2）: `rust-deploy.sh --production=<ホスト名>`は、sshを使わずその機体で動き、ホスト名が違う・検証環境の印がある・Python版が稼働中・`geoframe-rs`がmaskされている・期待するsha256やcommitと違う・作業ツリーが汚れている、のどれかで何も変えずに断る。`--check-only`は変更の前の検査だけを行う。配布のあと配信の件数が指定の下限より少なければ失敗として戻す。`--rollback --production`が動く。`deploy-pull.sh`は、checkoutの固定の印があるとき、または`geoframe-rs`がenabled・active・maskedのとき断る。`rust-deploy-test.sh`と`deploy-pull.sh`の試験がこれらを試し、通る。演習で本番と同じ経路（`--production`）を通した。
 - AC3（R3）: 検証環境で、手順書のとおりにバックアップから復元し、**起動する前に**`integrity_check`がokで`.dump`のSHA-256がバックアップと一致、ファイルの所有者がすべてサービスのユーザーであることを確かめた。起動のあと配信が200で、表示の画像の欠けが無い（あれば数と直し方を記録）。
 - AC4（R4・R6）: 検証環境で、新しい本番のコピーと本番と同じ配置（Python版を`geoframe-server.service`・同じDATA_DIR・8080で置く）を使い、手順書のとおりにPython→Rustへ切り替えた。停止から配信の再開までの時間を測った（5分以内）。Pythonの配信にあった写真がRustの配信にすべてあり、増えた分は既知の差（[p4-acceptance.md §7.3](p4-acceptance.md)）で説明できる。シャドー比較（`tools/compare_with_python.py`）で想定外の差が0。取り込みの1サイクルとローカルのAIが動いた。結果を`p5-acceptance.md`に記録した。
 - AC5（R5）: 検証環境で、Rust→Python（AIは設定で無効）へ戻し、DBを保ったまま配信・管理操作が動き、Rustの期間にした手動の位置・お気に入り・除外・回転・旅行ブログの下書きが保たれた。戻したPythonからAIの通信が出ていないことを確かめた。品質の切り戻し（[server.md §16.10](server.md#1610-rustで作った結果をpythonへ切り戻すp5のロールバック)）は、そのまま戻す場合と`dirty`の再構築が走った場合の件数・行数・グループ数を記録した。そこから再びRustへ切り替えて動いた。戻すのにかかった時間を記録した。
