@@ -32,7 +32,7 @@
 | AC | 結果 | 根拠 |
 | --- | --- | --- |
 | AC1（演習の部分: `Conflicts=`・`After=` の両方向） | 合格 | 向き B（Rust が動いているときに Python を起動）は Rust の停止の完了から 0.009 秒後に Python が起動。向き A（Python が動いているときに Rust を起動）は Python の停止の完了から 0.016 秒後に Rust が起動し、`[guard]` は 0.090 秒後、最初の書き込み（サイクル完了）は 0.255 秒後。どちらも旧が先（§8）。`[guard]` は Python 版が inactive であることを確かめて起動した |
-| AC2（演習の部分: 本番と同じ経路） | 合格 | `rust-deploy.sh --production` を 2 回（切替・切り替え直し）通して終了コード 0。`--check-only` は 4 回 0。印がある・Python が稼働中のときは終了コード 4 で何も変えずに断った。`--expect-min-photos`（3,003・3,006）を下限として確認が通った。`deploy-pull.sh --dry-run` は固定の印で 3（§1・§2・§5） |
+| AC2（演習の部分: 本番と同じ経路） | 合格 | `rust-deploy.sh --production` を 2 回（切替・切り替え直し）通して終了コード 0。`--check-only` は 3 回（§1.10・§2・§9.2）とも 0。印がある・Python が稼働中のときは終了コード 4 で何も変えずに断った。`--expect-min-photos`（3,003・3,006）を下限として確認が通った。`deploy-pull.sh --dry-run` は固定の印で 3（§1・§2・§5） |
 | AC3 | 合格 | §10 の手順で、起動の前に `integrity_check` ok・`.dump` の SHA-256 がバックアップの控えと一致・DATA_DIR の直下に `geoframe` 以外の所有のファイル 0。起動のあと配信 200。画像の欠けは 1 件（バックアップのあとに回転した 1 件だけで、想定と一致）。直し方を確定して §10.5 に書いた（§7） |
 | AC4 | 合格 | 新しい本番のコピーと本番と同じ配置で、手順書のとおり切り替えた。T0〜T1 は 43 秒（5 分以内）。Python のフィードの 3,065 件がすべて Rust にあり、Rust だけ 0 件。シャドー比較は許容外 0（`shadow_judge.py` 終了コード 0）。取り込みの 1 サイクル（Drive の段は鍵が無いので省略）と、ローカルの AI（Embedding 108 件・手がかり 6 件が成功）が動いた。miharashi の取得 200 件・Retrying 0（§2・§3） |
 | AC5 | 合格 | Rust→Python は 3 秒。共通の設定が `GEOFRAME_AI_ENABLED=1` のまま、Python のプロセスの環境は `GEOFRAME_AI_ENABLED=0`・`GEOFRAME_LOC_SUGGEST=0`（drop-in が勝つ）。AI を示す語の journal の行 0、例外の行 0。Rust の期間の手動の位置・お気に入り・除外・回転（ID ごと 20 行）が不一致 0、下書きの全ハッシュの差 0、`.cache.json` は Python の経路で読めた。品質は場合 1・2 とも件数が基準と同じで「説明できない変化 0」。再び Rust へ切り替えて 42 秒で配信が戻った（§4・§5） |
