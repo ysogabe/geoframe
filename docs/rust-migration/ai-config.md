@@ -156,7 +156,7 @@ Rustだけが返す追加フィールドで、**あるときだけ**付く（AI�
 | `ai_task_blocks` | `[{"task", "scope": "provider"\|"task", "reason", "waiting"}]`（設定で使える用途のうち、Provider・用途の停止にかかって送られていないもの。`ai_pauses`が停止を起こした用途だけなのに対し、同じ停止にかかる**全用途**。`waiting`はその用途の待ち＝`pending`＋`deferred`（`location_geocode`は`location_suggest`）の件数。ジョブの件数を集計できなかったときは`null`（件数不明。0件とは区別する。ジョブの表が無い旧DBは集計できているので0）で、停止の情報（`task`・`scope`・`reason`）は残す。停止にかかる用途が無ければキーを足さない。停止の確認ができない用途は載せない。用途名・範囲・固定の理由コード・件数だけで、鍵のパス・project・region・URL・モデル・識別のhashは出さない。送信側の判断は変えない） |
 | `ai_waits` | `{"items": [{"task", "scope": "entrance"\|"service", "reason", "until": "YYYY-MM-DDTHH:MM:SSZ"}], "unidentified": n}`（まだ有効な共有の一時待機を今の設定の用途に結び直したもの。`unidentified`は設定が使えず結び直せない件数で0なら出さない。待ちが無ければキーを出さない。期限はUTC。接続先・モデル・ハッシュは出さない。[ai-provider.md](ai-provider.md)の「共有の一時待機」） |
 
-STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し（`ai_task_blocks`は「AI送信が止まっている用途」に`<用途>: Provider全体の停止（権限エラー（403））で N 件が待ち`の形。`waiting`が`null`のときは`で 待ちは件数不明`。`geoframe ai-jobs status`は`用途 X の待ち: 件数を読めません（停止中のため送っていません）`）、解除・再試行のコマンドを文字で示す（画面からは操作できない）。
+STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し（`ai_task_blocks`は「AI送信が止まっている用途」に`<用途>: Provider全体の停止（権限エラー（403））で N 件が待ち`の形。`waiting`が`null`のときは`で 待ちは件数不明`。`geoframe ai-jobs status`はジョブの件数を読めないと状態の取得エラーで終了する。表示の側は`用途 X の待ち: 件数を読めません（停止中のため送っていません）`に対応しているが、今はこの経路では出ない）、解除・再試行のコマンドを文字で示す（画面からは操作できない）。
 
 ### 限界・実装状況
 
