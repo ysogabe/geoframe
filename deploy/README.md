@@ -459,9 +459,10 @@ sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements.t
 Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作業（[Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)）の途中経過です。
 **Rust 版は既定で読み取り専用（`GEOFRAME_INGEST`を設定しない限り DB に書かない）です。本番の切替は P5**（[計画](../docs/rust-migration/plan.md)）で、
 ユーザーの立ち会いのもと、段ごとの許可を得て行います。切替までは、ここまでの§1〜§6（Python 版）が現行の本番の手順で、変わりません。
-**本番の切替の手順（準備・保全・復元・切替・戻す・切り替え直す）は、T5.3 の手順書`docs/rust-migration/cutover.md`に書く予定です**（まだありません）。
+**本番の切替の手順（準備・保全・切替・確認・AI の書き込み系の操作・戻す・切り替え直す・復元・切替のあとの数日・クラウド AI の有効化・戻しの猶予期間と片付け）は、[`docs/rust-migration/cutover.md`](../docs/rust-migration/cutover.md)にあります。**
+本番の操作はこの節ではなく手順書に従ってください（各段に目的・コマンド・確かめること・失敗したときの対処があります）。
 手順書の外で、本番機（`geoframe-server` が動いている機体）にこの節の unit・スクリプトを使わないでください。`rust-deploy.sh --production`（§7.3）は、
-手順書のとおりの段で、ユーザーの立ち会いのもとでだけ実行します。
+手順書のとおりの段で、ユーザーの立ち会いのもとでだけ実行します。この節は、道具の引数・拒否の条件・終了コードの**リファレンス**です。
 
 | ファイル | 役割 |
 | --- | --- |
@@ -559,7 +560,7 @@ bash deploy/geoframe-admin-test.sh     # geoframe-admin.sh をモックの syste
 検証環境の経路（`--target`）は、印の無い機体には配らない。unit の本体は`/usr/local/lib/systemd/system/geoframe-rs.service`へ入れ、
 `/etc/systemd/system/geoframe-rs.service`に古い本体のファイルがあれば（systemd がそちらを優先するので）何も変更せずに断る（先に退避する。mask のリンクは本体ではないので通る）。
 
-**本番へ（`--production`）。** 本番の切替の手順（`docs/rust-migration/cutover.md`。T5.3 で書く予定でまだ無い）の中で、ユーザーの立ち会いのもとでだけ使う。
+**本番へ（`--production`）。** 本番の切替の手順（[`cutover.md`](../docs/rust-migration/cutover.md)）の中で、ユーザーの立ち会いのもとでだけ使う。段取り・終了コードごとの対処・戻し方は手順書にあり、ここには引数と拒否の条件を書く。
 ssh を使わず、**その機体で root として直接**動く（ビルドもしない）。`sudo`は環境変数を消すので、値はすべて引数で渡す。実行場所は本番の checkout（`/opt/geoframe`）。
 本番の経路は`GEOFRAME_RS_*`（試験用の差し替え・配置先・確認の URL・待ち秒数）を**一切使わない**。配置先（`/usr/local/bin/geoframe`）・確認の URL（`http://127.0.0.1:8080`）・unit の置き場所・
 印・設定のファイル・root の UID は、スクリプトの中の固定値（`PROD_*`）で、環境が 1 つでも`GEOFRAME_RS_*`を持っていれば終了コード 4 で断る（`sudo -E`などで環境を引き継いでも検査を外せない）。
@@ -575,6 +576,8 @@ sudo /opt/geoframe/deploy/rust-deploy.sh --production=<ホスト名> --bin=<バ�
 # 直前のバイナリと unit（.prev）へ戻す
 sudo /opt/geoframe/deploy/rust-deploy.sh --rollback --production=<ホスト名>
 ```
+
+`--rollback --production`は`.prev`（Rust の直前の版）へ戻す道具で、**初回の配布には`.prev`が無いので、初回の切替の戻しには使えない**（初回の失敗は`rust-deploy.sh`が自分で戻す。Python へ戻す手順は[`cutover.md`](../docs/rust-migration/cutover.md) §8）。
 
 次のどれかなら、何も変更せずに終了コード 4（引数の誤りは 2）で断る: `hostname`が`--production`の値と違う／検証環境の印`/etc/geoframe/staging`がある（検証環境に本番の指定は使えない）／
 Python 版（`geoframe-server.service`）が稼働中か状態を取得できない（`--check-only`では除く）／`geoframe-rs`が mask されている（切り替え直すときは先に`unmask`）／
