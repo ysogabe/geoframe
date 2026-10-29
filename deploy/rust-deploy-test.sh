@@ -6,6 +6,10 @@
 # `rust-deploy.sh --print-remote-script` で取り出した本体を一般ユーザーのまま走らせる。
 # 見ること: 誤配布の拒否、成功、各工程（再起動・daemon-reload・enable・unit の導入・確認）の失敗からの
 # 復元、復元の mv の失敗（手作業の手順が出て終了コード 3）、初回の配布の失敗、中断（SIGTERM）。
+# [12] 以降は本番の指定（--production。ssh なし・その機体で直接）: 一時の git リポジトリにスクリプトと unit を
+# 写して走らせ、ホスト名・印・Python 版の稼働・mask・sha256・commit・作業ツリー・件数の下限・--check-only・
+# --rollback・unit の置き場所・古い置き場所の本体を確かめる（root の判定と設定のファイルの所有者は、
+# GEOFRAME_RS_TEST_ROOT_UID＝この試験を動かしているユーザーに差し替える）。
 #
 # 実行: bash deploy/rust-deploy-test.sh
 #
@@ -66,6 +70,7 @@ show)
     fi
     printf 'ActiveState=%s\nLoadState=%s\n' "$act" "$load"; exit 0 ;;
 is-enabled)
+    if [ "$unit" != geoframe-server.service ] && [ -f "$S/masked" ]; then echo masked; exit 1; fi
     if [ -f "$S/enabled" ]; then echo enabled; exit 0; fi
     if [ -f "$MOCK_UNIT" ]; then echo disabled; exit 1; fi
     exit 1 ;;
@@ -91,14 +96,30 @@ esac
 M
 cat > "$T/mock/curl" <<'M'
 #!/usr/bin/env bash
-S="$MOCK_DIR/state"; url="" w=0
-for a in "$@"; do case "$a" in http://*) url="$a" ;; -w) w=1 ;; esac; done
+S="$MOCK_DIR/state"; url="" w=0 out=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        http://*) url="$1" ;;
+        -w) w=1 ;;
+        -o) shift; out="$1" ;;
+    esac
+    shift
+done
 if [ ! -f "$S/active" ]; then [ "$w" = 1 ] && printf 000; exit 7; fi
 case "$url" in
 */healthz) if grep -q BADHEALTH "$MOCK_BIN" 2>/dev/null; then exit 22; fi; exit 0 ;;
-*/api/v1/photos) [ "$w" = 1 ] && { printf 200; exit 0; }; printf '[]'; exit 0 ;;
+*/api/v1/photos)
+    body='[]'; [ -f "$MOCK_DIR/ctl/photos_json" ] && body="$(cat "$MOCK_DIR/ctl/photos_json")"
+    grep -q BADARRAY "$MOCK_BIN" 2>/dev/null && body='{"a":1}'
+    if [ -n "$out" ] && [ "$out" != /dev/null ]; then printf '%s' "$body" > "$out"; else [ -z "$out" ] && printf '%s' "$body"; fi
+    [ "$w" = 1 ] && printf 200
+    exit 0 ;;
 esac
 exit 0
+M
+cat > "$T/mock/hostname" <<'M'
+#!/usr/bin/env bash
+echo "${MOCK_HOSTNAME:-prod-host-for-test}"
 M
 cat > "$T/mock/journalctl" <<'M'
 #!/usr/bin/env bash
@@ -131,13 +152,18 @@ export T_LOG="$T/wrapper.log"
 # --- 場面の用意 ---
 export MOCK_DIR="$T/env" MOCK_BIN="$T/env/bin/geoframe" MOCK_UNIT="$T/env/units/geoframe-rs.service"
 export GEOFRAME_RS_TEST_UNIT_DIR="$T/env/units" GEOFRAME_RS_TEST_MARKER="$T/env/etc/staging"
+# 古い置き場所（/etc/systemd/system）と設定のファイルも一時ディレクトリへ。root の判定はこの試験のユーザーに
+export GEOFRAME_RS_TEST_ETC_UNIT_DIR="$T/env/etc-units" GEOFRAME_RS_TEST_ENV_FILE="$T/env/etc/geoframe-rs"
+export GEOFRAME_RS_TEST_ROOT_UID="$(id -u)"
+REAL_GIT="$(command -v git)"
 export PATH="$T/mock:$PATH"
 
 # 検証環境を作り直す。引数: installed（バイナリ・unit・enable・稼働が済み）| fresh（何も無い）
 setup() {
     rm -rf "$T/env" "$T/stage"
-    mkdir -p "$T/env/bin" "$T/env/units" "$T/env/etc" "$T/env/state" "$T/env/ctl" "$T/stage"
+    mkdir -p "$T/env/bin" "$T/env/units" "$T/env/etc" "$T/env/etc-units" "$T/env/state" "$T/env/ctl" "$T/stage"
     touch "$T/env/etc/staging"
+    : > "$GEOFRAME_RS_TEST_ENV_FILE"; chmod 0600 "$GEOFRAME_RS_TEST_ENV_FILE"
     printf 'OLD-BIN\n' > "$T/stage/old.bin"
     printf 'NEW-BIN\n' > "$T/stage/geoframe"
     printf 'NEW-UNIT\n' > "$T/stage/geoframe-rs.service"
@@ -463,6 +489,222 @@ expect "unit: ReadOnlyPaths から travel_blog を外した（下書きを書け
 expect "unit: ReadOnlyPaths から blog_exports を外した（書き出しを書ける）" bash -c '! grep -q blog_exports <<<"$1"' _ "$unit_ro"
 expect "unit: ReadOnlyPaths は 1 行だけ" test "$(grep -cE '^ReadOnlyPaths=' "$HERE/geoframe-rs.service")" = 1
 expect "unit: 書き込みを広げた分、ProtectSystem=strict は残る" grep -q '^ProtectSystem=strict' "$HERE/geoframe-rs.service"
+
+echo "[11b] unit の本番向けの中身（T5.1）"
+U="$HERE/geoframe-rs.service"
+expect "unit: 本体の置き場所は /usr/local/lib/systemd/system と書いてある" grep -q '/usr/local/lib/systemd/system/geoframe-rs.service' "$U"
+expect "unit: 『検証環境専用』『本番機にはこの unit を入れない』と書いていない" bash -c '! grep -q -e 検証環境専用 -e "本番機にはこの unit を入れない" -e "印が無い" "$1"' _ "$U"
+expect "unit: After= に geoframe-server.service を足し、Conflicts= も残す" bash -c 'grep -qE "^After=.*geoframe-server.service" "$1" && grep -q "^Conflicts=geoframe-server.service" "$1"' _ "$U"
+expect "unit: Environment= を持たない（DATA_DIR・鍵・TZ は設定のファイルへ）" bash -c '! grep -qE "^Environment=" "$1"' _ "$U"
+expect "unit: EnvironmentFile= は共通（- 付き）のあとに geoframe-rs（- 無し）" bash -c 'test "$(grep -E "^EnvironmentFile=" "$1")" = "EnvironmentFile=-/etc/default/geoframe
+EnvironmentFile=/etc/default/geoframe-rs"' _ "$U"
+expect "unit: StartLimitIntervalSec・StartLimitBurst は [Unit] 節" bash -c 'awk "/^\[Service\]/{exit} /^StartLimitIntervalSec=/{a=1} /^StartLimitBurst=/{b=1} END{exit !(a&&b)}" "$1"' _ "$U"
+expect "unit: ReadOnlyPaths に鍵と models/ を足した（1 行のまま）" bash -c 'grep -E "^ReadOnlyPaths=" "$1" | grep -q -e "-/var/lib/geoframe/drive_key.json" && grep -E "^ReadOnlyPaths=" "$1" | grep -q -e "-/var/lib/geoframe/models"' _ "$U"
+for line in 'CapabilityBoundingSet=' 'RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6' ProtectKernelTunables=true ProtectKernelModules=true \
+    ProtectKernelLogs=true ProtectControlGroups=true RestrictNamespaces=true LockPersonality=true RestrictSUIDSGID=true PrivateDevices=true \
+    SystemCallArchitectures=native UMask=0027 MemoryDenyWriteExecute=true NoNewPrivileges=true; do
+    expect "unit: $line" grep -qxF "$line" "$U"
+done
+expect "unit: 優先順位の説明が正しい（EnvironmentFile= が書いた順に関係なく Environment= に勝つ）" bash -c 'grep -q "書いた順に関係なく Environment= に勝つ" "$1" && ! grep -q "後勝ち" "$1"' _ "$U"
+expect "geoframe-server.service: 優先順位の説明が正しい（中身は変えない）" bash -c 'grep -q "書いた順に関係なく" "$1" && ! grep -q "記載順に評価し後勝ち" "$1" && grep -q "^EnvironmentFile=-/etc/default/geoframe$" "$1"' _ "$HERE/geoframe-server.service"
+
+echo "[11c] 古い置き場所の本体と unit の置き場所（検証環境の経路）"
+setup; printf 'ETC-BODY\n' > "$GEOFRAME_RS_TEST_ETC_UNIT_DIR/geoframe-rs.service"; run deploy
+expect "古い置き場所に本体があれば拒否（終了コード4）" test "$rc" = 4
+expect "古い置き場所の拒否で何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a "$(content "$MOCK_UNIT")" = OLD-UNIT
+expect "古い置き場所の拒否が退避を案内する" grep -q '退避' "$T/out"
+setup; printf 'ETC-BODY\n' > "$GEOFRAME_RS_TEST_ETC_UNIT_DIR/geoframe-rs.service"; run rollback
+expect "rollback も古い置き場所に本体があれば拒否（終了コード4）" test "$rc" = 4
+setup; ln -s /dev/null "$GEOFRAME_RS_TEST_ETC_UNIT_DIR/geoframe-rs.service"; run deploy
+expect "古い置き場所が mask のリンク（/dev/null）なら本体ではないので通る" test "$rc" = 0
+setup; rm -rf "$T/env/units"; run deploy
+expect "unit の置き場所が無ければ作って入れる" test "$rc" = 0 -a "$(content "$MOCK_UNIT")" = NEW-UNIT
+
+echo "[11d] /api/v1/photos の数え方（jq・Python に頼らない）"
+eval "$(sed -n '/^count_photos() {/,/^}/p' <<<"$REMOTE")"
+count_of() { printf '%s' "$1" > "$T/photos.json"; count_photos "$T/photos.json"; }
+expect "件数: 空の配列は 0" test "$(count_of '[]')" = 0
+expect "件数: 要素 3（入れ子のオブジェクト・配列を含む）" test "$(count_of '[{"id":1,"a":{"b":[1,{"c":2}]}},{"id":2},{"id":3,"t":[]}]')" = 3
+expect "件数: 文字列の中の括弧・引用符・バックスラッシュに惑わされない" test "$(count_of '[{"n":"a}{\"b\"[{"},{"n":"\\"},{"n":"x]"}]')" = 3
+expect "件数: 改行・空白があっても数える" test "$(count_of $'[\n {"id":1},\n {"id":2}\n]')" = 2
+
+echo "[12] 本番の指定（--production。ssh なし・その機体で直接。一時の git リポジトリで実行）"
+PR="$T/prod-repo"
+mkdir -p "$PR/deploy"
+cp "$HERE/rust-deploy.sh" "$PR/deploy/"; cp "$HERE/geoframe-rs.service" "$PR/deploy/"
+printf 'tracked\n' > "$PR/tracked.txt"
+git -C "$PR" init -q
+git -C "$PR" add -A
+git -C "$PR" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q -m init
+HEAD_SHA="$(git -C "$PR" rev-parse HEAD)"
+PROD_HOST_NAME=prod-host-for-test
+export GEOFRAME_RS_BIN="$MOCK_BIN" GEOFRAME_RS_CHECK_BASE=http://127.0.0.1:1
+pbin() { chmod +x "$T/stage/geoframe"; sha256sum "$T/stage/geoframe" | cut -d' ' -f1; }
+SHA_OK=""
+prod() { # prod <追加の引数...> → 出力は $T/out、終了コードは $rc。既定は全部正しい指定
+    SHA_OK="$(pbin)"; : > "$T_LOG"
+    [ -f "$T/env/ctl/photos_json" ] || printf '[{"id":1}]' > "$T/env/ctl/photos_json"
+    bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" \
+        --expect-commit="$HEAD_SHA" --expect-min-photos=1 --wait-secs=2 "$@" > "$T/out" 2>&1
+    rc=$?
+}
+nothing_changed() { test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a ! -e "$MOCK_BIN.new" -a "$(content "$MOCK_UNIT")" = OLD-UNIT -a ! -e "$MOCK_UNIT.prev"; }
+no_ssh() { ! grep -q -e ssh -e scp "$T_LOG"; }
+no_restart() { ! grep -q '^restart ' "$T/env/calls.log"; }
+no_prod_marker() { rm -f "$GEOFRAME_RS_TEST_MARKER"; }
+
+tmp_dirs() { ls -d /tmp/geoframe-rs-deploy.* 2>/dev/null | wc -l; }
+TMP_BEFORE="$(tmp_dirs)"
+setup; no_prod_marker; prod
+expect "本番: 成功は終了コード0" test "$rc" = 0
+expect "本番: 新しいバイナリが入り、.prev に旧版が残る" test "$(content "$MOCK_BIN")" = NEW-BIN -a "$(content "$MOCK_BIN.prev")" = OLD-BIN
+expect "本番: unit は checkout の deploy/geoframe-rs.service で、置き場所に入る（.prev は旧版）" bash -c 'cmp -s "$1" "$2" && test "$(cat "$3")" = OLD-UNIT' _ "$MOCK_UNIT" "$HERE/geoframe-rs.service" "$MOCK_UNIT.prev"
+expect "本番: 稼働・enable のまま" test -f "$T/env/state/active" -a -f "$T/env/state/enabled"
+expect "本番: ssh も scp も使わない" no_ssh
+expect "本番: root 所有の一時ディレクトリ（バイナリの写し）を残さない" test "$(tmp_dirs)" = "$TMP_BEFORE"
+# 引数の誤り（何も変更しない・終了コード2）
+setup; no_prod_marker; prod --target mock@test
+expect "本番: --target と同時は終了コード2" test "$rc" = 2
+nothing_changed_args() { nothing_changed && no_restart; }
+setup; no_prod_marker; : > "$T_LOG"
+bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" > "$T/out" 2>&1; rc=$?
+expect "本番: --expect-* が欠けていれば終了コード2" test "$rc" = 2
+bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256=zz --expect-commit="$HEAD_SHA" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+expect "本番: sha256 の形が違えば終了コード2" test "$rc" = 2
+bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="${HEAD_SHA:0:12}" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+expect "本番: commit が完全な SHA でなければ終了コード2" test "$rc" = 2
+bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="$HEAD_SHA" --expect-min-photos=0 > "$T/out" 2>&1; rc=$?
+expect "本番: --expect-min-photos=0 は終了コード2" test "$rc" = 2
+bash "$PR/deploy/rust-deploy.sh" --check-only --target mock@test > "$T/out" 2>&1; rc=$?
+expect "本番でないとき --check-only は終了コード2" test "$rc" = 2
+bash "$PR/deploy/rust-deploy.sh" --rollback --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" > "$T/out" 2>&1; rc=$?
+expect "本番: --rollback に --bin は終了コード2" test "$rc" = 2
+
+# 拒否（終了コード4・何も変更しない）
+setup; no_prod_marker; MOCK_HOSTNAME=another-host prod
+expect "本番: ホスト名が違えば拒否（終了コード4）" test "$rc" = 4
+expect "本番: ホスト名の違いで何も変えていない" nothing_changed_args
+setup; prod
+expect "本番: 検証環境の印があれば拒否（終了コード4）" test "$rc" = 4
+expect "本番: 印があるとき何も変えていない" nothing_changed_args
+setup; no_prod_marker; touch "$T/env/state/py_active"; prod
+expect "本番: Python 版が稼働中なら拒否（終了コード4）" test "$rc" = 4
+expect "本番: Python 稼働中で何も変えていない" nothing_changed_args
+setup; no_prod_marker; echo fail > "$T/env/ctl/py_show"; prod
+expect "本番: Python 版の状態を取得できなければ拒否（終了コード4）" test "$rc" = 4
+expect "本番: 状態不明で何も変えていない" nothing_changed_args
+setup; no_prod_marker; echo maintenance > "$T/env/state/py_state"; prod
+expect "本番: Python 版の状態が未知なら拒否（終了コード4）" test "$rc" = 4
+setup; no_prod_marker; touch "$T/env/state/masked"; prod
+expect "本番: geoframe-rs が mask されていれば拒否（終了コード4）" test "$rc" = 4
+expect "本番: mask で何も変えていない" nothing_changed_args
+expect "本番: mask の拒否が unmask を案内する" grep -q 'unmask' "$T/out"
+setup; no_prod_marker; : > "$T_LOG"
+bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$(printf '%064d' 0)" --expect-commit="$HEAD_SHA" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+expect "本番: sha256 が違えば拒否（終了コード4）" test "$rc" = 4
+expect "本番: sha256 の違いで何も変えていない" nothing_changed_args
+setup; no_prod_marker; : > "$T_LOG"
+bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="$(printf '%040d' 0)" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+expect "本番: commit が違えば拒否（終了コード4）" test "$rc" = 4
+expect "本番: commit の違いで何も変えていない" nothing_changed_args
+setup; no_prod_marker; printf 'edited\n' > "$PR/tracked.txt"; prod
+expect "本番: 追跡下のファイルが汚れていれば拒否（終了コード4）" test "$rc" = 4
+expect "本番: 汚れた作業ツリーで何も変えていない" nothing_changed_args
+git -C "$PR" checkout -q -- tracked.txt
+setup; no_prod_marker; printf 'untracked\n' > "$PR/untracked.txt"; printf 'edited\n' >> "$PR/deploy/geoframe-rs.service"; prod
+expect "本番: unit の汚れも拒否する（追跡下の変更）" test "$rc" = 4
+git -C "$PR" checkout -q -- deploy/geoframe-rs.service
+setup; no_prod_marker; prod
+expect "本番: 未追跡のファイルがあっても通る（app/.venv などは汚れではない）" test "$rc" = 0
+rm -f "$PR/untracked.txt"
+setup; no_prod_marker; rm -f "$GEOFRAME_RS_TEST_ENV_FILE"; prod
+expect "本番: /etc/default/geoframe-rs が無ければ拒否（終了コード4）" test "$rc" = 4
+expect "本番: 設定のファイルが無くて何も変えていない" nothing_changed_args
+setup; no_prod_marker; chmod 0644 "$GEOFRAME_RS_TEST_ENV_FILE"; prod
+expect "本番: 設定のファイルのモードが 0600 でなければ拒否（終了コード4）" test "$rc" = 4
+setup; no_prod_marker; rm -f "$GEOFRAME_RS_TEST_ENV_FILE"; ln -s /etc/hostname "$GEOFRAME_RS_TEST_ENV_FILE"; prod
+expect "本番: 設定のファイルがシンボリックリンクなら拒否（終了コード4）" test "$rc" = 4
+setup; no_prod_marker; printf 'ETC-BODY\n' > "$GEOFRAME_RS_TEST_ETC_UNIT_DIR/geoframe-rs.service"; prod
+expect "本番: 古い置き場所に本体があれば拒否（終了コード4）" test "$rc" = 4
+expect "本番: 古い置き場所の拒否で何も変えていない" nothing_changed_args
+setup; no_prod_marker; GEOFRAME_RS_TEST_ROOT_UID=$(( $(id -u) + 1 )) prod
+expect "本番: root（期待する UID）でなければ拒否（終了コード4）" test "$rc" = 4
+expect "本番: root でなくて何も変えていない" nothing_changed_args
+expect "本番: 設定のファイルの中身を読まない（ログに出ない）" bash -c '! grep -q "ENV-SECRET" "$1"' _ "$T/out"
+
+# 安全に使う git
+setup; no_prod_marker
+mkdir -p "$T/gitmock"
+cat > "$T/gitmock/git" <<M
+#!/usr/bin/env bash
+echo "\$*" >> "$T/git.log"
+exec "$REAL_GIT" "\$@"
+M
+chmod +x "$T/gitmock/git"; : > "$T/git.log"
+PATH="$T/gitmock:$PATH" prod
+expect "本番: git に safe.directory（checkout だけ）と fsmonitor 無効を付ける" bash -c 'grep -q "safe.directory=$(cd "$1" && pwd -P)" "$2" && grep -q "core.fsmonitor=false" "$2"' _ "$PR" "$T/git.log"
+expect "本番: git の検査を付けても成功する" test "$rc" = 0
+
+# 件数の下限
+setup; no_prod_marker; printf '[{"id":1},{"id":2},{"id":3}]' > "$T/env/ctl/photos_json"; prod --expect-min-photos=3
+expect "本番: 件数が下限ちょうどなら成功" test "$rc" = 0
+setup; no_prod_marker; printf '[{"id":1},{"id":2}]' > "$T/env/ctl/photos_json"; prod --expect-min-photos=3
+expect "本番: 件数が下限より少なければ失敗して戻す（終了コード1）" test "$rc" = 1
+expect "本番: 件数不足で、バイナリ・unit・稼働・enable が元どおり" back_to_old
+expect "本番: 件数不足の理由が出る" grep -q '下限 3' "$T/out"
+setup; no_prod_marker; printf 'BADARRAY\n' > "$T/stage/geoframe"; prod
+expect "本番: 配列でない応答は失敗して戻す（終了コード1）" test "$rc" = 1
+expect "本番: 配列でない応答で元どおり" back_to_old
+# 失敗時の戻し
+setup; no_prod_marker; echo 1 > "$T/env/ctl/fail_restart"; prod
+expect "本番: restart の失敗は戻して終了コード1" test "$rc" = 1
+expect "本番: restart の失敗で元どおり" back_to_old
+setup; no_prod_marker; printf 'BADHEALTH\n' > "$T/stage/geoframe"; prod
+expect "本番: /healthz が通らなければ戻して終了コード1" test "$rc" = 1
+setup fresh; no_prod_marker; echo 1 > "$T/env/ctl/fail_restart"; prod
+expect "本番: 初回の配布の失敗は止めて unit を外す（終了コード1）" test "$rc" = 1 -a ! -e "$MOCK_UNIT" -a ! -f "$T/env/state/enabled" -a ! -f "$T/env/state/active" -a ! -e "$MOCK_BIN"
+expect "本番: 初回の失敗が Python 版へ戻す手順を案内する" grep -q 'cutover.md' "$T/out"
+setup; no_prod_marker; echo 1 > "$T/env/ctl/fail_restart"; touch "$T/env/ctl/poison_prev"; prod
+expect "本番: 戻せなかった失敗は終了コード3" test "$rc" = 3
+# unit の置き場所
+setup; no_prod_marker; rm -rf "$T/env/units"; prod
+expect "本番: unit の置き場所が無くても作って入れる" test "$rc" = 0 -a -f "$MOCK_UNIT"
+setup; no_prod_marker; ln -s /dev/null "$GEOFRAME_RS_TEST_ETC_UNIT_DIR/geoframe-rs.service"; prod
+expect "本番: 古い置き場所が mask のリンクなら本体ではないので通る" test "$rc" = 0
+
+# --check-only
+setup; no_prod_marker; touch "$T/env/state/py_active"; prod --check-only
+expect "本番: --check-only は Python 版が稼働中でも検査だけ通る（終了コード0）" test "$rc" = 0
+expect "本番: --check-only は何も変えず、再起動もしない" nothing_changed_args
+expect "本番: --check-only は一時の写しだけ作り、配置先に触れない" bash -c '! ls "$1"/geoframe.new "$1"/geoframe.prev 2>/dev/null' _ "$T/env/bin"
+setup; no_prod_marker; MOCK_HOSTNAME=another-host prod --check-only
+expect "本番: --check-only もホスト名が違えば拒否（終了コード4）" test "$rc" = 4
+setup; prod --check-only
+expect "本番: --check-only も印があれば拒否（終了コード4）" test "$rc" = 4
+setup; no_prod_marker; touch "$T/env/state/masked"; prod --check-only
+expect "本番: --check-only も mask されていれば拒否（終了コード4）" test "$rc" = 4
+setup; no_prod_marker; chmod 0644 "$GEOFRAME_RS_TEST_ENV_FILE"; prod --check-only
+expect "本番: --check-only も設定のファイルのモードが違えば拒否（終了コード4）" test "$rc" = 4
+setup; no_prod_marker; : > "$T_LOG"
+bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$(printf '%064d' 0)" --expect-commit="$HEAD_SHA" --expect-min-photos=1 --check-only > "$T/out" 2>&1; rc=$?
+expect "本番: --check-only も sha256 が違えば拒否（終了コード4）" test "$rc" = 4
+
+# --rollback --production
+prod_rollback() { : > "$T_LOG"; bash "$PR/deploy/rust-deploy.sh" --rollback --production="$PROD_HOST_NAME" "$@" > "$T/out" 2>&1; rc=$?; }
+setup; no_prod_marker; prod; prod_rollback
+expect "本番: --rollback --production は旧版へ戻す（終了コード0）" test "$rc" = 0 -a "$(content "$MOCK_BIN")" = OLD-BIN -a "$(content "$MOCK_UNIT")" = OLD-UNIT
+expect "本番: --rollback は ssh を使わない" no_ssh
+setup; no_prod_marker; prod; MOCK_HOSTNAME=another-host prod_rollback
+expect "本番: --rollback もホスト名が違えば拒否（終了コード4・新版のまま）" test "$rc" = 4 -a "$(content "$MOCK_BIN")" = NEW-BIN
+setup; no_prod_marker; prod; touch "$T/env/state/py_active"; prod_rollback
+expect "本番: --rollback も Python 版が稼働中なら拒否（終了コード4）" test "$rc" = 4 -a "$(content "$MOCK_BIN")" = NEW-BIN
+setup; prod_rollback
+expect "本番: --rollback も検証環境の印があれば拒否（終了コード4）" test "$rc" = 4
+setup; no_prod_marker; touch "$T/env/state/masked"; prod_rollback
+expect "本番: --rollback も mask されていれば拒否（終了コード4）" test "$rc" = 4
+setup; no_prod_marker; prod_rollback
+expect "本番: .prev が無い --rollback は終了コード1" test "$rc" = 1
+unset GEOFRAME_RS_BIN GEOFRAME_RS_CHECK_BASE
 
 echo
 echo "結果: ok ${pass} / FAIL ${failn}"
