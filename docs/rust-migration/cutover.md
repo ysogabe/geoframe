@@ -445,6 +445,7 @@ chmod 0700 *.sh
 ```
 
 - 確かめること: `ls -l "$WORK"` で `.py`・`.sql` が `-rw-------`、`.sh` が `-rwx------`（全部 root）。`counts.sql` と `state_snapshot.sql` は、`sudo -u geoframe sqlite3 '<URI>' < "$WORK/….sql"` の形で使う（リダイレクトは root のシェルが開くので、`geoframe` が `$WORK` を読めなくてよい）。`cache_load.py` も同じ理由で標準入力から渡す。
+- 空打ち（読み取りだけ）: `sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe GEOFRAME_AI_ENABLED=0 GEOFRAME_LOC_SUGGEST=0 "$PYAPP/.venv/bin/python" -I -B - "$PYAPP" < "$WORK/cache_load.py"; echo "rc=$?"` が `rc=0`（本番の venv と `app/.env` の下で動くことを、当日の §8.2 より前に確かめる）。`"$WORK/dbopen.sh"` は Python が動いているあいだは rc=1（開いているプロセスがある）になるのが正常で、判定の経路の表示だけ見る。
 - 書き換えない。`$WORK` のファイルを手で直したら、演習の記録に「何を直したか」を残す。
 
 ### 1.5 設定のファイルの分割とモード
@@ -829,6 +830,8 @@ journalctl -u geoframe-rs -n 30 --no-pager                             # [guard]
 
 目的: 配信が戻ったこと、Python の配信にあった写真がすべて Rust にあること、取り込み・AI・管理画面・miharashi が動くことを確かめる。
 
+**実行する順番**: 6.1 → 6.8（バックアップの展開と控え。6.2 の検査に使う）→ 6.2 → 6.3 → 6.4 → 6.5 → 6.6 → 6.7。6.6（タイマー）は他の確認より先に済ませてもよい。
+
 ### 6.1 配信の再開（T1）
 
 ```sh
@@ -997,13 +1000,15 @@ DB_RO='file:/var/lib/geoframe/catalog.db?mode=ro'
 sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/counts.sql" > "$WORK/rs-end-counts.txt"; echo "counts rc=$?"
 sudo -u geoframe sqlite3 "$DB_RO" < "$WORK/state_snapshot.sql" > "$WORK/rs-end-state.tsv"; echo "state rc=$?"; wc -l < "$WORK/rs-end-state.tsv"
 "$WORK/drafts_sha.sh" "$WORK/drafts-rs-end.sha"; echo "drafts rc=$?"
+comm -23 <(sed 's/^[0-9a-f]\{64\}  //' "$WORK/drafts-before.sha" | LC_ALL=C sort) \
+         <(sed 's/^[0-9a-f]\{64\}  //' "$WORK/drafts-rs-end.sha" | LC_ALL=C sort) | wc -l     # 0（切替の前にあった下書きが、Rust の期間に消えていない）
 [ -e /var/lib/geoframe/.cache.json ] && cp -p -- /var/lib/geoframe/.cache.json "$WORK/cache-rs-end.json"
 sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe GEOFRAME_AI_ENABLED=0 GEOFRAME_LOC_SUGGEST=0 \
     "$PYAPP/.venv/bin/python" -I -B - "$PYAPP" < "$WORK/cache_load.py"; echo "cache rc=$?"
 ```
 
 - 確かめること:
-  - `counts rc=0`・`state rc=0`・`drafts rc=0`。`rs-end-counts.txt` が**品質の切り戻しの基準**（§8.4。切替の前の値ではなく、Rust から戻す直前の値）。
+  - `counts rc=0`・`state rc=0`・`drafts rc=0`。**切替の前にあった下書き（§2 の `drafts-before.sha`。§9 の切り替え直しなら、その回の §2）のパスが、Rust の期間に消えていない**（`comm` の行数が 0。Rust の期間に保存して内容が変わった・増えたものは可）。0 でなければ、消えた件数をユーザーに報告する。`rs-end-counts.txt` が**品質の切り戻しの基準**（§8.4。切替の前の値ではなく、Rust から戻す直前の値）。
   - `cache_load.py`（Python 版自身の `store.load_cache` と `purge_cache_legacy` を、メモリの上だけで動かす）が `rc=0` で、`python_loaded` と `file_keys` が**同じ**（`load_cache` は読めないとき黙って空にするため、別に JSON として読んだ件数と照らす）。`python_will_drop` は起動時に Python が捨てる現役でないキーの数（件数だけ記録する）。
 - 失敗したら:
   - `counts`・`state` が `unable to open database file`（停止直後に `-shm` が無い）なら、§4.3 の「コピーして取る」と同じ要領でコピーから取る。DB が開けない・`malformed` なら **DB を疑う**（§10 の復元。失うものを先に読む）。
@@ -1359,7 +1364,7 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 - 日付、立ち会い、許可を得た段（事前にまとめて許可した範囲）。
 - `COMMIT`（P5a のマージのコミット）と演習のコミット、その差が無いことの確認。バイナリの sha256。
 - 件数: Python の写真の件数、Rust の件数、Python だけ（0）・Rust だけの件数と、その内訳（`extra.py` の取り込み・既知の差・**説明できない（0）**）と群の数（`ai_group` は空を除く）、`--expect-min-photos`、`db.loc.clue_pending` の初期値。保全の `.dump` の SHA-256、`photo_quality` の行数・グループ数（`algorithm` 別）、手動・お気に入り・除外・回転の件数。
-- 戻した場合の確認: `state_diff.py` の不一致の件数（値が違う・前だけ・後だけ）、下書きの全ハッシュの不一致の件数、`.cache.json` の読み込み（`file_keys`・`python_keeps`・`python_will_drop`）、品質の 2 つの場合（そのまま／`dirty` の再構築）の件数。基準は Rust から戻す直前の値。
+- 戻した場合の確認: 切替の前にあった下書きが Rust の期間に消えた件数（§8.2 の `comm`）、`state_diff.py` の不一致の件数（値が違う・前だけ・後だけ）、下書きの全ハッシュの不一致の件数、`.cache.json` の読み込み（`file_keys`・`python_keeps`・`python_will_drop`）、品質の 2 つの場合（そのまま／`dirty` の再構築）の件数。基準は Rust から戻す直前の値。
 - バックアップのタイマー: 止めた時刻と、戻した出口（§4.5 の表のどれか）、`タイマー OK` の確認。`dbopen.sh` が使った経路（`fuser`／`/proc`）。
 - 時間: T0〜T1（停止から配信の再開まで）、`--wait-secs`、各段の時間。戻した場合は戻すのにかかった時間。
 - 終了コード（`rust-deploy.sh`）、止める判断を使ったか、その理由。
@@ -1397,7 +1402,7 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 | §0.5 変数 | `WORK=/root/p5-cutover`（検証環境の root）・`HOST` は検証環境の `hostname`・`COMMIT` は演習の checkout（`/opt/geoframe-pyref`）の `HEAD`・`PYAPP=/opt/geoframe-pyref/app`。コマンドの `/opt/geoframe/…` は `/opt/geoframe-pyref/…` に読み替える |
 | §1.1 | 省く。`/opt/geoframe-pyref` を手で P5a のコミットにする（`git -C /opt/geoframe-pyref status --short` が空であること） |
 | §1.2 | 省く（演習のコミットが基準）。**本番の §1.2 で、演習のコミットと P5a のマージのコミットの差が無いことを確かめる**ので、演習のコミットを `p5-acceptance.md` に記録する |
-| §1.3 | 同じ。`fuser` は無くてよい（`dbopen.sh` がどちらの経路で判定したかを記録する） |
+| §1.3 | 同じ。`fuser` は無くてよい（`dbopen.sh` がどちらの経路で判定したかを記録する）。**`fuser` の経路は、psmisc のある状態で一度確かめる**（`dbopen.sh` を、DB を開いているとき rc=1・開いていないとき rc=0・root でないとき rc=2 で。検証環境に psmisc が無ければ導入して確かめ、演習のあと元に戻す） |
 | §1.4 | 同じ（`$WORK` を作り、補助スクリプトを置く。ここで作ったスクリプトを、そのまま本番で使う。直したら記録する） |
 | §1.5 | 同じ 3 つの設定のファイル。`GEOFRAME_DRIVE_KEY` は**存在しないパス**。`GEOFRAME_AI_CONFIG` はローカルの用途だけ。`TZ` は本番と同じ |
 | §1.6 | AI 設定の JSON の確認は同じ。**鍵は置かないので、鍵の所有者・モードの確認（表の鍵の行）は省く**（クラウドの `Unauthorized` 拒否は `ai-cloud.md` の試験で済み） |
@@ -1407,7 +1412,7 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 | §1.10 | 同じ |
 | §2 | 同じ。Python 役は AI 無効・鍵なし（共通の `/etc/default/geoframe` は `GEOFRAME_AI_ENABLED=0`。**流れ 5 の前に `1` へ書き換える**） |
 | §3.1〜§3.6 | 同じ。§3.2（unit の本体を移す）は省き、`/etc/systemd/system/` に本体が無いことだけ確かめる。drop-in・mask・固定の印は同じ |
-| §4 | 同じ。バックアップ先 `/var/backups/geoframe` が無ければ作る（`geoframe` 所有・`0750`）。**検証環境に `geoframe-backup.timer` が無いときは**、同名の何もしない `oneshot` の service と timer（`ExecStart=/bin/true`）を `/run/systemd/system/` に一時的に置いて §4.1・§4.5 の動作を確かめる（再起動で消える。§15.6 で消す） |
+| §4 | 同じ。バックアップ先 `/var/backups/geoframe` が無ければ作る（`geoframe` 所有・`0750`）。**検証環境に `geoframe-backup.timer` が無いときは**、同名の何もしない `oneshot` の service と timer（`ExecStart=/bin/true`。timer に `[Install] WantedBy=timers.target` を付ける）を `/run/systemd/system/` に一時的に置き、`systemctl daemon-reload` のあと `systemctl enable --runtime geoframe-backup.timer` する（`[Install]` が無いと `is-enabled` が `static` になり、§4.5 の `enabled` の判定が NG になる）。この状態で §4.1・§4.5 の動作を確かめる（再起動で消える。§15.6 で消す） |
 | §5 | 同じ。`--wait-secs` は**測る**（起動から `/healthz` 200 までの秒数を数回測り、余裕を足した値を本番の `$WAIT` に使う） |
 | §6 | §6.4 の miharashi・管理画面は検証環境の方法（`tools/miharashi-feed-check`・`compare_with_python.py`）。§6.5 の取り込みは Drive へ出ずに終わる（鍵が無いため）ことを確かめる。§6.2 の `extra.py` は演習の複製 DB で実行する（説明できない 0） |
 | §7 | `ai-jobs status` と、サービスを止めて行う書き込み系を 1 つ（`ai-jobs retry --kind location_clue` など。外へ送らないもの） |
