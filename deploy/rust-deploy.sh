@@ -38,6 +38,17 @@ CHECK_BASE="${GEOFRAME_RS_CHECK_BASE:-http://127.0.0.1:8080}"
 # 再起動のあと、/healthz が通るまで待つ秒数
 WAIT_SECS="${GEOFRAME_RS_WAIT_SECS:-30}"
 
+# 本番の指定（--production）の固定値。環境変数では変えられない（本番の経路は GEOFRAME_RS_* を一切読まず、
+# 1 つでも環境にあれば断る）。変えるのはこのファイルの編集だけ。試験は一時コピーのこの行を書き換える。
+PROD_BIN_PATH="/usr/local/bin/geoframe"
+PROD_CHECK_BASE="http://127.0.0.1:8080"
+PROD_UNIT_DIR="/usr/local/lib/systemd/system"
+PROD_ETC_UNIT_DIR="/etc/systemd/system"
+PROD_MARKER="/etc/geoframe/staging"
+PROD_ENV_FILE="/etc/default/geoframe-rs"
+PROD_ROOT_UID="0"
+PROD_WAIT_SECS_DEFAULT="30"
+
 TARGET_TRIPLE="x86_64-unknown-linux-musl"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_BIN="${GEOFRAME_RS_LOCAL_BIN:-${REPO_ROOT}/target/${TARGET_TRIPLE}/release/geoframe}"
@@ -79,8 +90,9 @@ usage() {
   --bin           配るバイナリ（絶対パス）。root 所有の一時ディレクトリへ写してから sha256 を取り、
                   --expect-sha256（64 桁）と違えば断る。入れるのはその写し（確かめた後で差し替えられない）。
   --expect-min-photos
-                  配布のあと /api/v1/photos の件数がこれより少なければ失敗として戻す（1 以上）。
-  --wait-secs     再起動のあと /healthz を待つ秒数（既定 30。演習で測った値を渡す）。
+                  配布のあと /api/v1/photos の件数がこれより少なければ失敗として戻す（1 以上 999999999 以下。
+                  桁が多い値は断る）。
+  --wait-secs     再起動のあと /healthz を待つ秒数（0〜3600。既定 30。演習で測った値を渡す）。
   --check-only    変更の前の検査だけを行って終わる（ホスト名・検証環境の印が無いこと・commit・作業ツリー・
                   バイナリの sha256・設定のファイル /etc/default/geoframe-rs の有無とモードと所有者・mask の状態・
                   古い置き場所の unit の本体）。Python 版の状態の検査は除く（Python を止める前に実行するため）。
@@ -89,7 +101,8 @@ usage() {
                   ホスト名などの検査は同じ。
   入れる unit は、その checkout の deploy/geoframe-rs.service。
 
-環境変数（任意。検証環境の経路。sudo では消えるので本番では既定値が使われる）:
+環境変数（任意。検証環境の経路だけ。--production は GEOFRAME_RS_* を一切使わず、1 つでも環境にあれば
+終了コード 4 で断る。配置先・確認の URL・unit の置き場所・設定のファイルなどは本番用の固定値）:
   GEOFRAME_RS_BIN          配置先のバイナリ（既定 /usr/local/bin/geoframe）
   GEOFRAME_RS_CHECK_BASE   確認の URL（既定 http://127.0.0.1:8080。その機体の中から叩く）
   GEOFRAME_RS_WAIT_SECS    再起動後に /healthz を待つ秒数（既定 30）
@@ -147,16 +160,27 @@ py_unit="geoframe-server.service"
 # unit の本体の置き場所。/etc/systemd/system/ には mask のリンク（/dev/null）と drop-in だけを置くので、
 # 本体はここへ入れる（mask は /etc/systemd/system/<unit> にリンクを作るため、そこに本体があると失敗する）。
 # 試験用（モック）に差し替えられる。実機では既定のまま。
-unit_dir="${GEOFRAME_RS_TEST_UNIT_DIR:-/usr/local/lib/systemd/system}"
-# 古い置き場所。ここに本体（通常のファイル）があると、systemd は /usr/local/lib より優先して読むので断る
-etc_unit_dir="${GEOFRAME_RS_TEST_ETC_UNIT_DIR:-/etc/systemd/system}"
-marker="${GEOFRAME_RS_TEST_MARKER:-/etc/geoframe/staging}"
-env_file="${GEOFRAME_RS_TEST_ENV_FILE:-/etc/default/geoframe-rs}"
-root_uid="${GEOFRAME_RS_TEST_ROOT_UID:-0}"
+# 本番の指定（--production）のときは、ラッパー（rust-deploy.sh の PROD_*）が RD_* で渡す固定値だけを使い、
+# GEOFRAME_RS_TEST_* は読まない。環境変数で検査の向き先を変えられない（sudo -E などで環境を引き継いでも効かない）。
+# 検証環境（ssh）のときだけ、試験用（モック）に GEOFRAME_RS_TEST_* で差し替えられる。実機では既定のまま。
+if [ -n "${RD_PROD_HOST:-}" ]; then
+    unit_dir="${RD_UNIT_DIR:?}"
+    etc_unit_dir="${RD_ETC_UNIT_DIR:?}"
+    marker="${RD_MARKER:?}"
+    env_file="${RD_ENV_FILE:?}"
+    root_uid="${RD_ROOT_UID:?}"
+else
+    unit_dir="${GEOFRAME_RS_TEST_UNIT_DIR:-/usr/local/lib/systemd/system}"
+    etc_unit_dir="${GEOFRAME_RS_TEST_ETC_UNIT_DIR:-/etc/systemd/system}"
+    marker="${GEOFRAME_RS_TEST_MARKER:-/etc/geoframe/staging}"
+    env_file="${GEOFRAME_RS_TEST_ENV_FILE:-/etc/default/geoframe-rs}"
+    root_uid="${GEOFRAME_RS_TEST_ROOT_UID:-0}"
+fi
+# etc_unit_dir は古い置き場所。ここに本体（通常のファイル）があると、systemd は /usr/local/lib より優先して読むので断る。
 # 本番の指定（--production）のとき、ラッパーが同じプロセスの環境変数で渡す（ssh は通らないので消えない）。
 # 検証環境（ssh）では空: prod_host=期待するホスト名  min_photos=配布後の /api/v1/photos の件数の下限
 # skip_py=1 で Python 版の状態の検査を除く（--check-only）
-prod_host="${RD_PROD_HOST:-}" min_photos="${RD_MIN_PHOTOS:-}" skip_py="${RD_SKIP_PY:-0}"
+prod_host="${RD_PROD_HOST:-}" min_photos="${RD_MIN_PHOTOS:-}" skip_py="${RD_SKIP_PY:-0}"="${RD_MIN_PHOTOS:-}" skip_py="${RD_SKIP_PY:-0}"
 
 mode="" bin="" base="" wait_secs="" stage="" unit_path=""
 # 配布前の状態と、どこまで変更したか（失敗時の復元に使う）
@@ -279,6 +303,9 @@ count_photos() {
 # $1 以上であること（DATA_DIR の誤りで空の DB を作ったまま「成功」にしない）。本文は出力しない。
 check() {
     local min="${1:-}" i=0 code first count body
+    # 数でない・桁が多すぎる値は、整数の比較が異常終了して『下限を満たした』ように進むので、比較の前に断る
+    [[ "$wait_secs" =~ ^[0-9]{1,4}$ ]] || { say "待つ秒数が不正"; return 1; }
+    if [ -n "$min" ] && ! [[ "$min" =~ ^[1-9][0-9]{0,8}$ ]]; then say "件数の下限が不正（1 以上 9 桁まで）"; return 1; fi
     until curl -fsS --max-time 3 -o /dev/null "${base}/healthz" 2>/dev/null; do
         i=$((i + 1))
         [ "$i" -lt "$wait_secs" ] || { say "/healthz が ${wait_secs} 秒以内に通らない"; return 1; }
@@ -296,13 +323,14 @@ check() {
     if [ -n "$min" ]; then
         count="$(count_photos "$body")" || count=""
         rm -f "$body"
-        case "$count" in ''|*[!0-9]*) say "/api/v1/photos の件数を数えられない"; return 1 ;; esac
-        if [ "$count" -lt "$min" ]; then
-            say "/api/v1/photos の件数 ${count} が下限 ${min} より少ない（DATA_DIR の誤りなど）"
-            return 1
+        [[ "$count" =~ ^[0-9]{1,9}$ ]] || { say "/api/v1/photos の件数を数えられない"; return 1; }
+        # 『下限以上』が成り立つときだけ通す。比較が異常終了したとき（数でない値など）も、通さずに失敗にする
+        if [ "$count" -ge "$min" ] 2>/dev/null; then
+            say "確認 OK（/healthz 200、/api/v1/photos は配列で ${count} 件 >= 下限 ${min}）"
+            return 0
         fi
-        say "確認 OK（/healthz 200、/api/v1/photos は配列で ${count} 件 >= 下限 ${min}）"
-        return 0
+        say "/api/v1/photos の件数 ${count} が下限 ${min} より少ない、または比較できない（DATA_DIR の誤りなど）"
+        return 1
     fi
     rm -f "$body"
     say "確認 OK（/healthz 200、/api/v1/photos は配列）"
@@ -563,6 +591,11 @@ rollback_body() {
 main() {
     mode="${1:-}"; bin="${2:-}"; base="${3:-}"; wait_secs="${4:-}"; stage="${5:-}"
     unit_path="${unit_dir}/${unit_name}"
+    # 数の引数は、桁を絞った形だけを受ける（整数の比較が異常終了して検査を素通りするのを防ぐ）
+    [[ "$wait_secs" =~ ^[0-9]{1,4}$ ]] || { say "待つ秒数が不正（数字 4 桁まで）。何も変更していない"; exit 2; }
+    if [ -n "$min_photos" ] && ! [[ "$min_photos" =~ ^[1-9][0-9]{0,8}$ ]]; then
+        say "件数の下限が不正（1 以上 9 桁まで）。何も変更していない"; exit 2
+    fi
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -599,6 +632,15 @@ done
 
 # 本番の指定とそれ以外の引数の組み合わせ（ここで形を確かめる。値を使うのは production_main）
 if [ -n "$PROD_HOST" ]; then
+    # 本番の経路は GEOFRAME_RS_*（試験用の差し替え・配置先・確認の URL・待ち秒数・配るバイナリ）を一切使わない。
+    # 検査の向き先を環境で変えられると、sudo -E などで環境を引き継いだ実行が検査を外せる。ある時点で断る
+    env_rs="$(compgen -e | grep -E '^GEOFRAME_RS_' | tr '\n' ' ')" || env_rs=""
+    if [ -n "$env_rs" ]; then
+        echo "ERROR: 環境に GEOFRAME_RS_* がある（${env_rs% }）。--production はこれらを使わないので、外して実行する（何も変更していない）" >&2
+        exit 4
+    fi
+    BIN_PATH="$PROD_BIN_PATH" CHECK_BASE="$PROD_CHECK_BASE"
+    [ "$WAIT_SET" -eq 1 ] || WAIT_SECS="$PROD_WAIT_SECS_DEFAULT"
     [ "$TARGET_SET" -eq 0 ] || { echo "ERROR: --production と --target は同時に使えない（本番は ssh を使わない）" >&2; exit 2; }
     [ "$DRY_RUN" -eq 0 ] || { echo "ERROR: --production に --dry-run は無い（変更の前の検査だけなら --check-only）" >&2; exit 2; }
     [[ "$PROD_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "ERROR: --production のホスト名は英数字と . _ - だけ" >&2; exit 2; }
@@ -611,7 +653,7 @@ if [ -n "$PROD_HOST" ]; then
         case "$PROD_BIN" in /*) ;; *) echo "ERROR: --bin は絶対パス" >&2; exit 2 ;; esac
         [[ "$PROD_SHA" =~ ^[0-9a-f]{64}$ ]] || { echo "ERROR: --expect-sha256 は小文字 16 進 64 桁" >&2; exit 2; }
         [[ "$PROD_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "ERROR: --expect-commit は小文字 16 進 40 桁の完全な SHA" >&2; exit 2; }
-        [[ "$PROD_MIN" =~ ^[1-9][0-9]*$ ]] || { echo "ERROR: --expect-min-photos は 1 以上の整数" >&2; exit 2; }
+        [[ "$PROD_MIN" =~ ^[1-9][0-9]{0,8}$ ]] || { echo "ERROR: --expect-min-photos は 1 以上 999999999 以下の整数（9 桁まで）" >&2; exit 2; }
     fi
 else
     if [ -n "$PROD_BIN$PROD_SHA$PROD_COMMIT$PROD_MIN" ] || [ "$CHECK_ONLY" -eq 1 ] || [ "$WAIT_SET" -eq 1 ]; then
@@ -627,9 +669,8 @@ case "$BIN_PATH" in
     *) die "GEOFRAME_RS_BIN は絶対パスで指定する。" ;;
 esac
 [[ "$CHECK_BASE" =~ ^http://[A-Za-z0-9._:-]+$ ]] || die "GEOFRAME_RS_CHECK_BASE は http://host:port の形（パスなし）。"
-case "$WAIT_SECS" in
-    ''|*[!0-9]*) die "GEOFRAME_RS_WAIT_SECS は整数。" ;;
-esac
+[[ "$WAIT_SECS" =~ ^[0-9]{1,4}$ ]] && [ "$WAIT_SECS" -le 3600 ] \
+    || { echo "ERROR: 待つ秒数（--wait-secs・GEOFRAME_RS_WAIT_SECS）は 0〜3600 の整数（4 桁まで）" >&2; exit 2; }
 
 # ssh の接続先。'-' 始まりの値が ssh のオプション（-oProxyCommand=…）として解釈されると、
 # 手元で任意コマンドが実行される。deploy.sh と同じく -- で打ち切る。
@@ -648,11 +689,13 @@ remote_run() {
 run_local() {
     local mode="$1"; shift
     RD_PROD_HOST="$PROD_HOST" RD_MIN_PHOTOS="$PROD_MIN" RD_SKIP_PY="$CHECK_ONLY" \
+        RD_UNIT_DIR="$PROD_UNIT_DIR" RD_ETC_UNIT_DIR="$PROD_ETC_UNIT_DIR" RD_MARKER="$PROD_MARKER" \
+        RD_ENV_FILE="$PROD_ENV_FILE" RD_ROOT_UID="$PROD_ROOT_UID" \
         bash -c "$REMOTE_SCRIPT" bash "$mode" "$BIN_PATH" "$CHECK_BASE" "$WAIT_SECS" "$@"
 }
 
 production_main() {
-    local root_uid="${GEOFRAME_RS_TEST_ROOT_UID:-0}" rc=0 head real_root sum
+    local root_uid="$PROD_ROOT_UID" rc=0 head real_root sum
 
     refuse() { log "拒否: $*"; log "何も変更していない（終了コード 4）"; exit 4; }
     [ "$(id -u)" = "$root_uid" ] || refuse "root で実行すること（sudo を付ける）"
@@ -693,7 +736,7 @@ production_main() {
     fi
     log "commit  : ${head:0:12}（作業ツリーに変更なし）"
     log "binary  : sha256 ${sum:0:16}…（一致）, $(stat -c %s "${STAGE_DIR}/geoframe") bytes"
-    log "配置先  : ${BIN_PATH}（直前を ${BIN_PATH}.prev へ）、unit: /usr/local/lib/systemd/system/${UNIT_NAME}"
+    log "配置先  : ${BIN_PATH}（直前を ${BIN_PATH}.prev へ）、unit: ${PROD_UNIT_DIR}/${UNIT_NAME}"
     log "確認    : ${CHECK_BASE}/healthz, ${CHECK_BASE}/api/v1/photos（件数 >= ${PROD_MIN}。${WAIT_SECS} 秒まで待つ）"
 
     if [ "$CHECK_ONLY" -eq 1 ]; then

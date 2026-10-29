@@ -8,8 +8,10 @@
 # 復元、復元の mv の失敗（手作業の手順が出て終了コード 3）、初回の配布の失敗、中断（SIGTERM）。
 # [12] 以降は本番の指定（--production。ssh なし・その機体で直接）: 一時の git リポジトリにスクリプトと unit を
 # 写して走らせ、ホスト名・印・Python 版の稼働・mask・sha256・commit・作業ツリー・件数の下限・--check-only・
-# --rollback・unit の置き場所・古い置き場所の本体を確かめる（root の判定と設定のファイルの所有者は、
-# GEOFRAME_RS_TEST_ROOT_UID＝この試験を動かしているユーザーに差し替える）。
+# --rollback・unit の置き場所・古い置き場所の本体・数の引数の上限・環境変数で検査を外せないことを確かめる。
+# 本番の経路は GEOFRAME_RS_* を読まない（あれば断る）ので、配置先・確認の URL・印・設定のファイル・root の UID は、
+# 一時コピーの中の固定値（PROD_*）を書き換えて向ける（geoframe-admin-test.sh と同じ方式。root の UID は
+# この試験を動かしているユーザー）。検証環境の経路（[1]〜[11]）だけが GEOFRAME_RS_TEST_* で差し替える。
 #
 # 実行: bash deploy/rust-deploy-test.sh
 #
@@ -531,20 +533,43 @@ expect "件数: 改行・空白があっても数える" test "$(count_of $'[\n 
 echo "[12] 本番の指定（--production。ssh なし・その機体で直接。一時の git リポジトリで実行）"
 PR="$T/prod-repo"
 mkdir -p "$PR/deploy"
-cp "$HERE/rust-deploy.sh" "$PR/deploy/"; cp "$HERE/geoframe-rs.service" "$PR/deploy/"
+cp "$HERE/geoframe-rs.service" "$PR/deploy/"
+# 本番の経路は GEOFRAME_RS_* の環境変数を読まない（あれば断る）。配置先・確認の URL・unit の置き場所・印・設定のファイル・
+# root の UID は、スクリプトの中の固定値（PROD_*）で、この写しだけを一時ディレクトリへ向けて書き換える
+# （geoframe-admin-test.sh と同じ方式）。本物のスクリプトは書き換えない
+write_prod_copy() { # write_prod_copy <出力> <root とみなす UID>
+    sed -e "s#^PROD_BIN_PATH=.*#PROD_BIN_PATH=\"$MOCK_BIN\"#" \
+        -e "s#^PROD_CHECK_BASE=.*#PROD_CHECK_BASE=\"http://127.0.0.1:1\"#" \
+        -e "s#^PROD_UNIT_DIR=.*#PROD_UNIT_DIR=\"$T/env/units\"#" \
+        -e "s#^PROD_ETC_UNIT_DIR=.*#PROD_ETC_UNIT_DIR=\"$T/env/etc-units\"#" \
+        -e "s#^PROD_MARKER=.*#PROD_MARKER=\"$T/env/etc/staging\"#" \
+        -e "s#^PROD_ENV_FILE=.*#PROD_ENV_FILE=\"$T/env/etc/geoframe-rs\"#" \
+        -e "s#^PROD_ROOT_UID=.*#PROD_ROOT_UID=\"$2\"#" \
+        "$HERE/rust-deploy.sh" > "$1"
+}
+write_prod_copy "$PR/deploy/rust-deploy.sh" "$(id -u)"
+write_prod_copy "$PR/deploy/rust-deploy-notroot.sh" "$(( $(id -u) + 1 ))"
+expect "本番の試験の準備: 書き換えた写しが元と違うのは固定値の 7 行だけ" bash -c 'test "$(diff "$1" "$2" | grep -c "^>")" = 7' _ "$HERE/rust-deploy.sh" "$PR/deploy/rust-deploy.sh"
+expect "本番の固定値は設計どおり（配置先・確認の URL・unit の置き場所・古い置き場所・印・設定のファイル・root は 0）" bash -c '
+    for l in "PROD_BIN_PATH=\"/usr/local/bin/geoframe\"" "PROD_CHECK_BASE=\"http://127.0.0.1:8080\"" \
+             "PROD_UNIT_DIR=\"/usr/local/lib/systemd/system\"" "PROD_ETC_UNIT_DIR=\"/etc/systemd/system\"" \
+             "PROD_MARKER=\"/etc/geoframe/staging\"" "PROD_ENV_FILE=\"/etc/default/geoframe-rs\"" "PROD_ROOT_UID=\"0\""; do
+        grep -qxF "$l" "$1" || exit 1
+    done' _ "$HERE/rust-deploy.sh"
+# 本番の経路を動かすシェル。GEOFRAME_RS_*（この試験の他の節が、検証環境の経路のために export している）を外して動かす
+prodsh() { local u=() v; for v in $(compgen -e | grep '^GEOFRAME_RS_'); do u+=(-u "$v"); done; env ${u[@]+"${u[@]}"} bash "$@"; }
 printf 'tracked\n' > "$PR/tracked.txt"
 git -C "$PR" init -q
 git -C "$PR" add -A
 git -C "$PR" -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false commit -q -m init
 HEAD_SHA="$(git -C "$PR" rev-parse HEAD)"
 PROD_HOST_NAME=prod-host-for-test
-export GEOFRAME_RS_BIN="$MOCK_BIN" GEOFRAME_RS_CHECK_BASE=http://127.0.0.1:1
 pbin() { chmod +x "$T/stage/geoframe"; sha256sum "$T/stage/geoframe" | cut -d' ' -f1; }
 SHA_OK=""
 prod() { # prod <追加の引数...> → 出力は $T/out、終了コードは $rc。既定は全部正しい指定
     SHA_OK="$(pbin)"; : > "$T_LOG"
     [ -f "$T/env/ctl/photos_json" ] || printf '[{"id":1}]' > "$T/env/ctl/photos_json"
-    bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" \
+    prodsh "${PROD_SCRIPT:-$PR/deploy/rust-deploy.sh}" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" \
         --expect-commit="$HEAD_SHA" --expect-min-photos=1 --wait-secs=2 "$@" > "$T/out" 2>&1
     rc=$?
 }
@@ -567,17 +592,17 @@ setup; no_prod_marker; prod --target mock@test
 expect "本番: --target と同時は終了コード2" test "$rc" = 2
 nothing_changed_args() { nothing_changed && no_restart; }
 setup; no_prod_marker; : > "$T_LOG"
-bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" > "$T/out" 2>&1; rc=$?
 expect "本番: --expect-* が欠けていれば終了コード2" test "$rc" = 2
-bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256=zz --expect-commit="$HEAD_SHA" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256=zz --expect-commit="$HEAD_SHA" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
 expect "本番: sha256 の形が違えば終了コード2" test "$rc" = 2
-bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="${HEAD_SHA:0:12}" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="${HEAD_SHA:0:12}" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
 expect "本番: commit が完全な SHA でなければ終了コード2" test "$rc" = 2
-bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="$HEAD_SHA" --expect-min-photos=0 > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="$HEAD_SHA" --expect-min-photos=0 > "$T/out" 2>&1; rc=$?
 expect "本番: --expect-min-photos=0 は終了コード2" test "$rc" = 2
-bash "$PR/deploy/rust-deploy.sh" --check-only --target mock@test > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --check-only --target mock@test > "$T/out" 2>&1; rc=$?
 expect "本番でないとき --check-only は終了コード2" test "$rc" = 2
-bash "$PR/deploy/rust-deploy.sh" --rollback --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --rollback --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" > "$T/out" 2>&1; rc=$?
 expect "本番: --rollback に --bin は終了コード2" test "$rc" = 2
 
 # 拒否（終了コード4・何も変更しない）
@@ -600,11 +625,11 @@ expect "本番: geoframe-rs が mask されていれば拒否（終了コード4
 expect "本番: mask で何も変えていない" nothing_changed_args
 expect "本番: mask の拒否が unmask を案内する" grep -q 'unmask' "$T/out"
 setup; no_prod_marker; : > "$T_LOG"
-bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$(printf '%064d' 0)" --expect-commit="$HEAD_SHA" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$(printf '%064d' 0)" --expect-commit="$HEAD_SHA" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
 expect "本番: sha256 が違えば拒否（終了コード4）" test "$rc" = 4
 expect "本番: sha256 の違いで何も変えていない" nothing_changed_args
 setup; no_prod_marker; : > "$T_LOG"
-bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="$(printf '%040d' 0)" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" --expect-commit="$(printf '%040d' 0)" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
 expect "本番: commit が違えば拒否（終了コード4）" test "$rc" = 4
 expect "本番: commit の違いで何も変えていない" nothing_changed_args
 setup; no_prod_marker; printf 'edited\n' > "$PR/tracked.txt"; prod
@@ -627,7 +652,7 @@ expect "本番: 設定のファイルがシンボリックリンクなら拒否�
 setup; no_prod_marker; printf 'ETC-BODY\n' > "$GEOFRAME_RS_TEST_ETC_UNIT_DIR/geoframe-rs.service"; prod
 expect "本番: 古い置き場所に本体があれば拒否（終了コード4）" test "$rc" = 4
 expect "本番: 古い置き場所の拒否で何も変えていない" nothing_changed_args
-setup; no_prod_marker; GEOFRAME_RS_TEST_ROOT_UID=$(( $(id -u) + 1 )) prod
+setup; no_prod_marker; PROD_SCRIPT="$PR/deploy/rust-deploy-notroot.sh" prod
 expect "本番: root（期待する UID）でなければ拒否（終了コード4）" test "$rc" = 4
 expect "本番: root でなくて何も変えていない" nothing_changed_args
 expect "本番: 設定のファイルの中身を読まない（ログに出ない）" bash -c '! grep -q "ENV-SECRET" "$1"' _ "$T/out"
@@ -688,11 +713,11 @@ expect "本番: --check-only も mask されていれば拒否（終了コード
 setup; no_prod_marker; chmod 0644 "$GEOFRAME_RS_TEST_ENV_FILE"; prod --check-only
 expect "本番: --check-only も設定のファイルのモードが違えば拒否（終了コード4）" test "$rc" = 4
 setup; no_prod_marker; : > "$T_LOG"
-bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$(printf '%064d' 0)" --expect-commit="$HEAD_SHA" --expect-min-photos=1 --check-only > "$T/out" 2>&1; rc=$?
+prodsh "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$(printf '%064d' 0)" --expect-commit="$HEAD_SHA" --expect-min-photos=1 --check-only > "$T/out" 2>&1; rc=$?
 expect "本番: --check-only も sha256 が違えば拒否（終了コード4）" test "$rc" = 4
 
 # --rollback --production
-prod_rollback() { : > "$T_LOG"; bash "$PR/deploy/rust-deploy.sh" --rollback --production="$PROD_HOST_NAME" "$@" > "$T/out" 2>&1; rc=$?; }
+prod_rollback() { : > "$T_LOG"; prodsh "$PR/deploy/rust-deploy.sh" --rollback --production="$PROD_HOST_NAME" "$@" > "$T/out" 2>&1; rc=$?; }
 setup; no_prod_marker; prod; prod_rollback
 expect "本番: --rollback --production は旧版へ戻す（終了コード0）" test "$rc" = 0 -a "$(content "$MOCK_BIN")" = OLD-BIN -a "$(content "$MOCK_UNIT")" = OLD-UNIT
 expect "本番: --rollback は ssh を使わない" no_ssh
@@ -706,7 +731,71 @@ setup; no_prod_marker; touch "$T/env/state/masked"; prod_rollback
 expect "本番: --rollback も mask されていれば拒否（終了コード4）" test "$rc" = 4
 setup; no_prod_marker; prod_rollback
 expect "本番: .prev が無い --rollback は終了コード1" test "$rc" = 1
-unset GEOFRAME_RS_BIN GEOFRAME_RS_CHECK_BASE
+
+# 環境変数で検査を外せない（--production は GEOFRAME_RS_* を使わず、あれば断る。sudo -E など環境を引き継ぐ実行を想定）
+envrefuse() { # envrefuse <名前=値...>: その環境変数を付けて、全部正しい指定で動かす（prodsh を通さず、環境をそのまま渡す）
+    SHA_OK="$(pbin)"; : > "$T_LOG"
+    env "$@" bash "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$SHA_OK" \
+        --expect-commit="$HEAD_SHA" --expect-min-photos=1 --wait-secs=2 > "$T/out" 2>&1
+    rc=$?
+}
+for kv in "GEOFRAME_RS_TEST_MARKER=$T/env/etc/other-marker" "GEOFRAME_RS_TEST_UNIT_DIR=$T/env/units" "GEOFRAME_RS_TEST_ETC_UNIT_DIR=$T/env/etc-units" \
+          "GEOFRAME_RS_TEST_ENV_FILE=$T/env/etc/geoframe-rs" "GEOFRAME_RS_TEST_ROOT_UID=$(id -u)" "GEOFRAME_RS_CHECK_BASE=http://127.0.0.1:1" \
+          "GEOFRAME_RS_BIN=$MOCK_BIN" "GEOFRAME_RS_WAIT_SECS=2" "GEOFRAME_RS_LOCAL_BIN=$T/stage/geoframe"; do
+    setup; no_prod_marker; : > "$T/env/calls.log"; envrefuse "$kv"
+    expect "本番: 環境に ${kv%%=*} があれば断る（終了コード4・何も変えず、systemctl にも触れない）" test "$rc" = 4 -a ! -s "$T/env/calls.log" -a "$(content "$MOCK_BIN")" = OLD-BIN
+done
+expect "本番: 環境変数で断るとき、理由に GEOFRAME_RS_* が出る" grep -q 'GEOFRAME_RS_' "$T/out"
+# 検査の向き先を環境で変えて印を外そうとしても、印の検査は固定の場所で行われる（印があるまま、印の場所を別のところに向けても断る）
+setup; envrefuse "GEOFRAME_RS_TEST_MARKER=$T/env/etc/no-such-marker"
+expect "本番: 印の検査先を環境で別の場所へ向けても、印があれば断る（終了コード4）" test "$rc" = 4 -a "$(content "$MOCK_BIN")" = OLD-BIN
+# 書き換えていない本物のスクリプトは、固定の本物の場所を使う: 試験を動かすユーザー（root でない）では、root の検査で断る
+if [ "$(id -u)" != 0 ]; then
+    setup; no_prod_marker; : > "$T/env/calls.log"
+    prodsh "$HERE/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$(printf '%064d' 0)" --expect-commit="$HEAD_SHA" --expect-min-photos=1 > "$T/out" 2>&1; rc=$?
+    expect "本番: 書き換えていないスクリプトは root（UID 0）を要求して断る（終了コード4・何も変えない）" test "$rc" = 4 -a ! -s "$T/env/calls.log" -a "$(content "$MOCK_BIN")" = OLD-BIN
+fi
+
+# 数の引数: 桁が多い値や数でない値は引数の検査で断る（終了コード2・何も変えない）。Bash の整数比較は大きすぎる値で
+# 異常終了し、if の中だと『下限を満たした』ように進むので、入口で上限を設ける
+for bad in 999999999999999999999 1000000000 0 01 -1 1.5 abc ""; do
+    setup; no_prod_marker; : > "$T/env/calls.log"
+    prodsh "$PR/deploy/rust-deploy.sh" --production="$PROD_HOST_NAME" --bin="$T/stage/geoframe" --expect-sha256="$(pbin)" --expect-commit="$HEAD_SHA" --expect-min-photos="$bad" > "$T/out" 2>&1; rc=$?
+    expect "本番: --expect-min-photos='${bad}' は終了コード2で断る（何も変えない）" test "$rc" = 2 -a ! -s "$T/env/calls.log" -a "$(content "$MOCK_BIN")" = OLD-BIN
+done
+setup; no_prod_marker; printf '[{"id":1}]' > "$T/env/ctl/photos_json"; prod --expect-min-photos=999999999
+expect "本番: 9 桁の上限（999999999）は受け入れ、件数が足りなければ失敗して戻す（終了コード1）" test "$rc" = 1
+expect "本番: 上限の値で件数が足りない失敗は元どおりに戻る" back_to_old
+setup; no_prod_marker; printf '[]' > "$T/env/ctl/photos_json"; prod --expect-min-photos=999999999999999999999
+expect "本番: 空の配信 × 21 桁の下限は、引数の検査で断る（終了コード2・確認 OK に進まない）" test "$rc" = 2 && ! grep -q '確認 OK' "$T/out"
+for bad in 99999 -1 abc 1.5 ""; do
+    setup; no_prod_marker; : > "$T/env/calls.log"; prod --wait-secs="$bad"
+    expect "本番: --wait-secs='${bad}' は終了コード2で断る（何も変えない）" test "$rc" = 2 -a ! -s "$T/env/calls.log" -a "$(content "$MOCK_BIN")" = OLD-BIN
+done
+setup; no_prod_marker; prod --wait-secs=3601
+expect "本番: --wait-secs が 3600 を超えれば終了コード2" test "$rc" = 2
+# 本体（check）自体も、巨大な下限・数でない値で『確認 OK』に進まない（引数の検査をすり抜けた場合の二重の守り）
+eval "$(sed -n '/^check() {/,/^}/p;/^count_photos() {/,/^}/p;/^say() {/p' <<<"$REMOTE")"
+setup; touch "$T/env/state/active"; printf '[]' > "$T/env/ctl/photos_json"; base=http://127.0.0.1:1 wait_secs=2
+check 999999999999999999999 > "$T/out" 2>&1; rc=$?
+expect "check: 空の配信 × 21 桁の下限は失敗（確認 OK にならない）" test "$rc" = 1 && ! grep -q '確認 OK' "$T/out"
+check abc > "$T/out" 2>&1; rc=$?
+expect "check: 下限が数でなければ失敗" test "$rc" = 1 && ! grep -q '確認 OK' "$T/out"
+printf '[{"id":1},{"id":2}]' > "$T/env/ctl/photos_json"
+check 2 > "$T/out" 2>&1; rc=$?
+expect "check: 件数が下限ちょうどなら成功" test "$rc" = 0 && grep -q '確認 OK' "$T/out"
+check 3 > "$T/out" 2>&1; rc=$?
+expect "check: 件数が下限より少なければ失敗" test "$rc" = 1
+check "" > "$T/out" 2>&1; rc=$?
+expect "check: 下限なしは配列であれば成功" test "$rc" = 0
+wait_secs=99999999999; check 1 > "$T/out" 2>&1; rc=$?
+expect "check: 待つ秒数が長すぎる値は失敗" test "$rc" = 1
+wait_secs=2
+# 本体の入口: 不正な数は何も変更せず終了コード2
+setup; bash -c "$REMOTE" bash deploy "$MOCK_BIN" http://127.0.0.1:1 99999999999 "$T/stage" > "$T/out" 2>&1; rc=$?
+expect "本体: 待つ秒数が不正なら終了コード2で何も変えない" test "$rc" = 2 -a "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev"
+setup; RD_MIN_PHOTOS=999999999999999999999 bash -c "$REMOTE" bash deploy "$MOCK_BIN" http://127.0.0.1:1 2 "$T/stage" > "$T/out" 2>&1; rc=$?
+expect "本体: 件数の下限が不正なら終了コード2で何も変えない" test "$rc" = 2 -a "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev"
 
 echo
 echo "結果: ok ${pass} / FAIL ${failn}"

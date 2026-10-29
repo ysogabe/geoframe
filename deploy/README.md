@@ -536,7 +536,7 @@ deploy/rust-deploy.sh --dry-run        # ビルドと手順の表示だけ（ssh
 deploy/rust-deploy.sh                  # ビルド→検査→転送→入れ替え→/healthz と /api/v1/photos の確認
 deploy/rust-deploy.sh --skip-build     # ビルド済みの成果物をそのまま配る
 deploy/rust-deploy.sh --rollback       # 直前のバイナリ（.prev）へ手で戻す
-bash deploy/rust-deploy-test.sh        # 失敗経路と --production をモックで試験（ssh なし）
+bash deploy/rust-deploy-test.sh        # 失敗経路と --production をモックで試験（ssh なし）。3 つの試験とも CI（test.yml の deploy ジョブ）で回る
 bash deploy/deploy-pull-test.sh        # deploy-pull.sh の拒否（固定の印・geoframe-rs の状態）をモックで試験
 bash deploy/geoframe-admin-test.sh     # geoframe-admin.sh をモックの systemd-run で試験
 ```
@@ -554,6 +554,9 @@ bash deploy/geoframe-admin-test.sh     # geoframe-admin.sh をモックの syste
 
 **本番へ（`--production`）。** 本番の切替の手順（`docs/rust-migration/cutover.md`。T5.3 で書く予定でまだ無い）の中で、ユーザーの立ち会いのもとでだけ使う。
 ssh を使わず、**その機体で root として直接**動く（ビルドもしない）。`sudo`は環境変数を消すので、値はすべて引数で渡す。実行場所は本番の checkout（`/opt/geoframe`）。
+本番の経路は`GEOFRAME_RS_*`（試験用の差し替え・配置先・確認の URL・待ち秒数）を**一切使わない**。配置先（`/usr/local/bin/geoframe`）・確認の URL（`http://127.0.0.1:8080`）・unit の置き場所・
+印・設定のファイル・root の UID は、スクリプトの中の固定値（`PROD_*`）で、環境が 1 つでも`GEOFRAME_RS_*`を持っていれば終了コード 4 で断る（`sudo -E`などで環境を引き継いでも検査を外せない）。
+モックの試験は、一時コピーの`PROD_*`の行を書き換える（`geoframe-admin-test.sh`と同じ方式）。
 
 ```sh
 # 変更の前の検査だけ（Python 版を止める前に。Python 版の状態の検査は除く）
@@ -571,11 +574,15 @@ Python 版（`geoframe-server.service`）が稼働中か状態を取得できな
 古い置き場所（`/etc/systemd/system/geoframe-rs.service`）に本体がある／`/etc/default/geoframe-rs`が通常のファイルとして無い・モードが`0600`でない・所有者が root でない（中身は読まない）／
 checkout の`HEAD`が`--expect-commit`（40 桁）と違う／追跡下のファイルに変更がある（未追跡の`app/.venv`・`.env`・鍵は見ない。root で動くので、この checkout だけ`safe.directory`にして「dubious ownership」で落ちない）／
 `--bin`の写し（root 所有の一時ディレクトリへ写してから`sha256`を取る。入れるのはその写し）が`--expect-sha256`と違う。
-配布のあと`/api/v1/photos`の件数が`--expect-min-photos`より少なければ、DATA_DIR の誤りなどとして失敗にし、配布前の状態へ戻す。初回の配布が 0 でなければ、
+配布のあと`/api/v1/photos`の件数が`--expect-min-photos`より少なければ、DATA_DIR の誤りなどとして失敗にし、配布前の状態へ戻す。
+数の引数は桁を絞る: `--expect-min-photos`は 1 以上 999999999 以下（9 桁まで）、`--wait-secs`は 0〜3600。範囲外・数でない値は終了コード 2 で断る（Bash の整数比較は大きすぎる値で異常終了し、
+`if`の中では「下限を満たした」ように進んでしまうため）。確認の本体も、比較が成り立つときだけ通し、比較の異常は失敗として戻す。初回の配布が 0 でなければ、
 すぐ Python 版へ戻す（手順は`cutover.md`）。入れる unit は、その checkout の`deploy/geoframe-rs.service`。
 
 サービスを止めて CLI を動かすとき（AI の書き込み系の操作など）は、`sudo deploy/geoframe-admin.sh ai-jobs …`を使う（root で直接`geoframe`を動かさない。動かす前に DATA_DIR のパスが表示される）。
 `deploy-pull.sh`（Python 版の更新）は、`/etc/geoframe/checkout-pinned`がある、または`geoframe-rs`が enabled・active・masked のとき、何もせずに終了コード 3 で断る。
+`systemctl show`の`LoadState`・`UnitFileState`・`ActiveState`はそれぞれちょうど 1 行（欠け・重複は断る）で、`LoadState`・`ActiveState`は値が空でないこと、導入済みの unit の`UnitFileState`は
+`disabled`・`static`・`indirect`・`generated`・`transient`のどれかであること（未知の値・空は断る）。未導入（`not-found`／`UnitFileState`が空／`inactive`）は通す。
 
 配置先のバイナリは入れ替えの直前に`/usr/local/bin/geoframe.prev`へ（unit も`.prev`へ）残す。**直前の 1 世代だけ**。
 

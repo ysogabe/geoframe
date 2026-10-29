@@ -77,6 +77,36 @@ expect "状態の出力が空なら断る（終了コード3）" test "$rc" = 3
 MOCK_SHOW='UnitFileState=disabled'; run
 expect "LoadState・ActiveState の行が無ければ断る（終了コード3）" test "$rc" = 3
 expect "どの理由でも値（パス以外）を出さず、終了コード3の旨を表示する" grep -q '終了コード 3' "$T/out"
+# UnitFileState の欠け・空・未知の値（導入済みの unit では、有効でないと確認できなければ断る）
+MOCK_SHOW="$(printf 'LoadState=loaded\nActiveState=inactive')"; run
+expect "導入済みで UnitFileState の行が無ければ断る（終了コード3）" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=not-found\nActiveState=inactive')"; run
+expect "未導入でも UnitFileState の行が無ければ断る（3 行そろわない）" test "$rc" = 3
+for fs in '' weird bad linked alias enabled-runtime; do
+    state loaded "$fs" inactive; run
+    expect "導入済みで UnitFileState が '${fs:-空}' なら断る（終了コード3）" bash -c 'test "$1" = 3 && grep -q "UnitFileState\|enabled" "$2"' _ "$rc" "$T/out"
+done
+state not-found enabled inactive; run
+expect "未導入（not-found）なのに UnitFileState が空でなければ断る（終了コード3）" test "$rc" = 3
+# 重複した行（最後の行で上書きして『止まっている』と取り違えない）
+MOCK_SHOW="$(printf 'LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\nActiveState=active')"; run
+expect "ActiveState が inactive のあとに active（矛盾する重複）なら断る" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=loaded\nUnitFileState=disabled\nActiveState=active\nActiveState=inactive')"; run
+expect "ActiveState が active のあとに inactive（矛盾する重複）なら断る" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\nActiveState=inactive')"; run
+expect "ActiveState が同じ値で 2 行でも断る" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=loaded\nUnitFileState=enabled\nUnitFileState=disabled\nActiveState=inactive')"; run
+expect "UnitFileState が enabled のあとに disabled（矛盾する重複）なら断る" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=loaded\nUnitFileState=disabled\nUnitFileState=disabled\nActiveState=inactive')"; run
+expect "UnitFileState が同じ値で 2 行でも断る" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=masked\nLoadState=loaded\nUnitFileState=disabled\nActiveState=inactive')"; run
+expect "LoadState が masked のあとに loaded（矛盾する重複）なら断る" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=loaded\nLoadState=loaded\nUnitFileState=disabled\nActiveState=inactive')"; run
+expect "LoadState が同じ値で 2 行でも断る" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=loaded\nUnitFileState=disabled\nActiveState=')"; run
+expect "ActiveState の値が空なら断る" test "$rc" = 3
+MOCK_SHOW="$(printf 'LoadState=\nUnitFileState=disabled\nActiveState=inactive')"; run
+expect "LoadState の値が空なら断る" test "$rc" = 3
 
 echo "[2] 通す（その先の確認へ進む。サービスには触れない）"
 state not-found '' inactive; run
@@ -88,6 +118,10 @@ state loaded disabled failed; run
 expect "geoframe-rs が disabled/failed なら通す" reached_next_check
 state loaded static inactive; run
 expect "geoframe-rs が static/inactive なら通す" reached_next_check
+for fs in indirect generated transient; do
+    state loaded "$fs" inactive; run
+    expect "geoframe-rs が ${fs}/inactive なら通す" reached_next_check
+done
 
 echo "[3] ヘルプは検査より前"
 touch "$T/etc/checkout-pinned"; run -h

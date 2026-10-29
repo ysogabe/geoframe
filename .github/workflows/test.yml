@@ -94,6 +94,26 @@ jobs:
         # テストの Golden。store.py の SCHEMA を変えたら tools/gen_schema_fixture.py で再生成する
         run: python3 tools/gen_schema_fixture.py --check
 
+  deploy:
+    name: 配布スクリプト（モックの試験）
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: ソースを取得
+        uses: actions/checkout@v7
+
+      - name: rust-deploy.sh（検証環境・本番の指定・復元・数の引数）
+        # 実機の systemd・ssh・/etc には触れない。モックの systemctl・curl・hostname を PATH に置き、
+        # 一時ディレクトリと一時の git リポジトリだけを使う。sha256sum・stat・install・setsid などは
+        # ubuntu のランナーの標準のもの（coreutils・util-linux）。ランナーは root ではない
+        run: bash deploy/rust-deploy-test.sh
+
+      - name: deploy-pull.sh（Rust 版へ切り替えたあとの拒否）
+        run: bash deploy/deploy-pull-test.sh
+
+      - name: geoframe-admin.sh（サービスと同じユーザー・設定で動かす）
+        run: bash deploy/geoframe-admin-test.sh
+
   rust:
     name: Rust（fmt・clippy・test・musl静的ビルド）
     runs-on: ubuntu-latest
