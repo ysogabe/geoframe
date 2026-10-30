@@ -5,19 +5,29 @@
 //! `Command` の別名、`sh -c "python .."` を見逃す。そこで**プロセスを起動する箇所そのもの**を管理する。
 //!
 //! - `crates` 以下の `.rs` を字句に分け（コメントは捨て、文字列は 1 つの塊にする）、`Command::new(` の形の呼び出し
-//!   （`use .. process::Command as X` や `type X = ..Command;` の別名を含む）を全部数える。最初の引数が文字列なら
+//!   （`use .. process::Command as X` や `type X = ..Command;` の別名、`<std::process::Command>::new(`・
+//!   `<Command as X>::new(` のような山括弧の修飾パスを含む）を全部数える。最初の引数が文字列なら
 //!   その文字列、そうでなければ式のまま（`BIN`、`std::env::current_exe().unwrap()` など）を「起動するもの」とする。
+//!   `<_ as X>::new(` のように型が Command か読めない形は、未対応の起動構文として失敗にする。
 //! - 数えた結果を `ALLOWED`（ファイル・起動するもの・件数）と**完全に**照合する。リストに無い起動が増えても、
 //!   件数が増えても減っても失敗にする。増えたときは、何を起動するかを確かめてからリストに足す。
 //!   式のままの起動はリストに式そのものを書いた場所だけ許す。
-//! - 次は許可リストと無関係に失敗にする: 起動するものが python・python3・python3.x・パス付きの python、
-//!   起動する関数の中に python と読める文字列がある（`let exe = "python"`、`env` に渡す引数など）、
-//!   shell に渡す `-c` の文字列に python がある、`tokio::process`・`CommandExt`・`exec*`・`posix_spawn` など
-//!   `Command::new` 以外の起動の道具を使う。
+//! - 次は許可リストと無関係に失敗にする: 起動するものが python・pypy（`python3.x`・`pypy3.x`・パス付きを含む）、
+//!   起動する関数の中に python の実行ファイル名の文字列がある（`let exe = "python"`、`env` に渡す引数など）、
+//!   shell・`env` などを起動する関数の中や、shell に渡す `-c` の次の引数に、python・pypy の実行ファイル名の語を含む
+//!   命令文がある（`sh -c "pypy3 -V"`、`cd x && python3 y.py`）、`tokio::process`・`CommandExt`・`exec*`・
+//!   `posix_spawn` など `Command::new` 以外の起動の道具を使う。python の実行ファイル名の判定は `runs_python` の
+//!   1 か所で、直接の起動・wrapper・`-c` のどれも同じ判定を使う。
+//!   起動の道具の検査は、API を使う構文（`use` の import、`x::y` のパス、`name(` の呼び出し、`.pre_exec(`）だけを
+//!   見る。同じ名前の変数・フィールド（`let subprocess = 42;`）は対象にしない。
 //!
-//! 限界（捕まえられない書き方）: 文字列を実行時に組み立てる（`format!("py{}", ..)`、連結）、別の関数や別のファイル
-//! から渡る変数や引数、マクロの中で作る `Command`、`Command` を返す関数の呼び出し側（`make().spawn()`）、
-//! 別の名前での再公開を 2 段以上重ねた別名。式のままの起動は許可リストの式が何を指すかを人が確かめる前提。
+//! 限界（捕まえられない書き方）: 文字列を実行時に組み立てる（`format!("py{}", ..)`、連結、`p""ython` のような
+//! shell の引用の連結）、別の関数や別のファイルから渡る変数や引数、マクロの中で作る `Command`、`Command` を返す
+//! 関数の呼び出し側（`make().spawn()`）、別の名前での再公開を 2 段以上重ねた別名、`<T as Trait>::new(` で
+//! Command 以外の型の名前を通して Command を作る関連型、shell の命令文の中で python を別の語に束ねたもの
+//! （`PY=py; ${PY}thon`）。`exec` は試験の補助関数の名前（`env.exec(..)`）と区別できないので、
+//! `CommandExt` を glob で import して `.exec()` を呼ぶ書き方は import の検査（`process::*`・`CommandExt`）に
+//! 頼る。式のままの起動は許可リストの式が何を指すかを人が確かめる前提。
 //! `["python"]` のような JSON のキー、`*-python.json` のような基準のファイル名、コメントや文字列の中の説明は、
 //! 起動するコードではないので対象にしない。
 
@@ -75,6 +85,8 @@ const WRAPPERS: &[&str] = &[
 ];
 
 /// `Command::new` 以外の起動の道具。これらは許可リストにも載せず、使ったら失敗にする。
+/// 起動用の API を使う構文（`use` の import、`x::y` のパス、`name(` の呼び出し、`.name(` のメソッド呼び出し）
+/// だけを見る。同じ名前の変数・フィールド（`let subprocess = 42;`）は対象にしない。
 const OTHER_LAUNCHERS: &[&str] = &[
     "CommandExt",
     "execv",
@@ -93,6 +105,10 @@ const OTHER_LAUNCHERS: &[&str] = &[
     "subprocess",
     "cmd_lib",
 ];
+
+/// `CommandExt` のメソッド。トレイトを glob で import していても、`.name(` で呼べば失敗にする。
+/// （`exec` は試験の補助関数の名前に使われているので入れない。限界に書く。）
+const LAUNCHER_METHODS: &[&str] = &["pre_exec"];
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Exe<S = &'static str> {
@@ -349,8 +365,13 @@ fn is_python_exe(s: &str) -> bool {
     })
 }
 
-fn mentions_python(s: &str) -> bool {
-    s.to_ascii_lowercase().contains("python")
+/// 文字列が python の実行ファイルを指す・起動するか。文字列全体が実行ファイルの名前（`python3`・`pypy3`・
+/// `/usr/bin/python3.12`）の場合と、shell の命令文（`cd x && pypy3 y.py`、`PY=python3 ./run`）の語のどれかが
+/// そうである場合。直接起動・wrapper の引数・shell の `-c` の検査はすべてこの 1 つの判定を使う。
+fn runs_python(s: &str) -> bool {
+    is_python_exe(s)
+        || s.split(|c: char| !(c.is_alphanumeric() || "._/-+".contains(c)))
+            .any(is_python_exe)
 }
 
 fn is_wrapper(exe: &str) -> bool {
@@ -442,6 +463,107 @@ fn is_index(t: &[Tok], i: usize) -> bool {
         && (matches!(t[i - 2].kind, Kind::Ident(_)) || punct(t, i - 2, ')') || punct(t, i - 2, ']'))
 }
 
+/// 位置 `i` の識別子が、`use` の文（`;` まで）の中にあるか。
+fn in_use_statement(t: &[Tok], i: usize) -> bool {
+    for k in (0..i).rev() {
+        match &t[k].kind {
+            Kind::Ident(s) if s == "use" => return true,
+            // `use a::{b, c}` の `}` では止めない
+            Kind::Punct(';') => return false,
+            Kind::Punct('{') if !is_path_sep(t, k.wrapping_sub(2)) => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// `use` の文（位置 `i` を含む）の `;` までの字句の範囲。
+fn use_statement(t: &[Tok], i: usize) -> std::ops::Range<usize> {
+    let start = (0..i)
+        .rev()
+        .find(|&k| ident(t, k) == Some("use"))
+        .unwrap_or(i);
+    let end = (i..t.len()).find(|&k| punct(t, k, ';')).unwrap_or(t.len());
+    start..end
+}
+
+/// `Command::new` 以外の起動の道具を使う構文なら、その理由。名前が同じだけの変数・フィールドは対象にしない。
+fn launcher_use(t: &[Tok], i: usize, name: &str) -> Option<String> {
+    let listed = OTHER_LAUNCHERS.contains(&name);
+    let method = LAUNCHER_METHODS.contains(&name);
+    if !listed && !method {
+        return None;
+    }
+    let after_dot = i > 0 && punct(t, i - 1, '.');
+    let called = punct(t, i + 1, '(');
+    let path = is_path_sep(t, i + 1) || (i >= 2 && is_path_sep(t, i - 2));
+    let used = if method {
+        after_dot && called
+    } else {
+        in_use_statement(t, i) || path || (called && !after_dot)
+    };
+    used.then(|| format!("`{name}` は使えない（Command::new 以外の起動の道具）"))
+}
+
+/// `X::new(` の `X` にあたる字句（`new` の 3 つ前）の読み取りの結果。
+enum Receiver {
+    /// `Command`（またはその別名）の `::new`。値は式の始まりの位置。
+    Command(usize),
+    /// `Command` ではない（`Vec::<T>::new`、`<String>::new` など）。
+    Other,
+    /// 型を読み取れない `<..>::new(`。
+    Unsupported(usize),
+}
+
+fn receiver(t: &[Tok], j: usize, names: &BTreeSet<String>) -> Receiver {
+    match &t[j].kind {
+        Kind::Ident(n) if names.contains(n) => Receiver::Command(j),
+        Kind::Punct('>') => {
+            // 山括弧で囲んだ型の修飾パス（`<Command>::new`、`<std::process::Command as X>::new`）。
+            let mut depth = 0usize;
+            let mut open = None;
+            for k in (j.saturating_sub(80)..=j).rev() {
+                match t[k].kind {
+                    Kind::Punct('>') => depth += 1,
+                    Kind::Punct('<') => {
+                        depth -= 1;
+                        if depth == 0 {
+                            open = Some(k);
+                            break;
+                        }
+                    }
+                    Kind::Punct(';' | '{' | '}') => break,
+                    _ => {}
+                }
+            }
+            let Some(open) = open else {
+                return Receiver::Unsupported(j);
+            };
+            // `Vec::<u8>::new` の `::<..>` は型の引数で、修飾パスではない
+            if open >= 2 && is_path_sep(t, open - 2) {
+                return Receiver::Other;
+            }
+            // `as` の手前の型の、一番外側の最後の識別子
+            let (mut nest, mut last) = (0usize, None);
+            for tok in &t[open + 1..j] {
+                match &tok.kind {
+                    Kind::Punct('<' | '(' | '[') => nest += 1,
+                    Kind::Punct('>' | ')' | ']') => nest = nest.saturating_sub(1),
+                    Kind::Ident(s) if nest == 0 && s == "as" => break,
+                    Kind::Ident(s) if nest == 0 => last = Some(s.as_str()),
+                    _ => {}
+                }
+            }
+            match last {
+                Some(n) if names.contains(n) => Receiver::Command(open),
+                Some("_") | None => Receiver::Unsupported(open),
+                Some(_) => Receiver::Other,
+            }
+        }
+        _ => Receiver::Other,
+    }
+}
+
 /// 1 つのファイルの解析。`outer` は他のファイルで見つかった `Command` の別名。
 fn analyze(text: &str, outer: &BTreeSet<String>) -> Analysis {
     let t = lex(text);
@@ -454,15 +576,29 @@ fn analyze(text: &str, outer: &BTreeSet<String>) -> Analysis {
         let Some(name) = ident(&t, i) else { continue };
 
         // 起動の道具（`Command::new` 以外）
-        if OTHER_LAUNCHERS.contains(&name) {
-            a.problems.push((
-                t[i].line,
-                format!("`{name}` は使えない（Command::new 以外の起動の道具）"),
-            ));
+        if let Some(why) = launcher_use(&t, i, name) {
+            a.problems.push((t[i].line, why));
         }
         if name == "tokio" && is_path_sep(&t, i + 1) && ident(&t, i + 3) == Some("process") {
             a.problems
                 .push((t[i].line, "`tokio::process` は使えない".to_string()));
+        }
+        if name == "tokio"
+            && in_use_statement(&t, i)
+            && use_statement(&t, i).any(|k| ident(&t, k) == Some("process"))
+        {
+            a.problems
+                .push((t[i].line, "`tokio::process` は使えない".to_string()));
+        }
+        if name == "process"
+            && in_use_statement(&t, i)
+            && is_path_sep(&t, i + 1)
+            && punct(&t, i + 3, '*')
+        {
+            a.problems.push((
+                t[i].line,
+                "`process::*` の glob import は使えない（起動の道具が見えなくなる）".to_string(),
+            ));
         }
         if name == "libc"
             && is_path_sep(&t, i + 1)
@@ -471,102 +607,122 @@ fn analyze(text: &str, outer: &BTreeSet<String>) -> Analysis {
             a.problems
                 .push((t[i].line, "`libc::system`・`popen` は使えない".to_string()));
         }
-
-        // Command::new(..)
-        if names.contains(name)
-            && is_path_sep(&t, i + 1)
-            && ident(&t, i + 3) == Some("new")
-            && punct(&t, i + 4, '(')
-        {
-            let first = i + 5;
-            let end = arg_end(&t, first);
-            let arg = &t[first..end];
-            let exe = match arg {
-                [
-                    Tok {
-                        kind: Kind::Str(s), ..
-                    },
-                ] => Exe::Lit(s.clone()),
-                [
-                    Tok {
-                        kind: Kind::Punct('&'),
-                        ..
-                    },
-                    Tok {
-                        kind: Kind::Str(s), ..
-                    },
-                ] => Exe::Lit(s.clone()),
-                _ => Exe::Expr(text_of(arg)),
-            };
-            let line = t[i].line;
-            if let Exe::Lit(s) = &exe {
-                if is_python_exe(s) {
-                    a.problems
-                        .push((line, format!("python を起動している: {s:?}")));
-                }
-                if is_wrapper(s) {
-                    let (from, to) = enclosing_fn(&t, i);
-                    for k in from..to {
-                        if string(&t, k).is_some_and(mentions_python) {
-                            a.problems.push((
-                                t[k].line,
-                                format!("{s:?} を起動する関数に python と読める文字列がある"),
-                            ));
-                        }
-                    }
-                }
-            }
-            // 起動する関数の中に python の実行ファイルの名前の文字列がある
-            // （`let exe = "python"; Command::new(exe)`）
-            let (from, to) = enclosing_fn(&t, i);
-            for k in from..to {
-                if string(&t, k).is_some_and(is_python_exe) && !is_index(&t, k) {
-                    a.problems.push((
-                        t[k].line,
-                        "起動する関数に python の実行ファイルの名前の文字列がある".to_string(),
-                    ));
-                }
-            }
-            // 変数・定数に入れた名前（関数の外の `const PY = "python3"` を含む）
-            if let Exe::Expr(x) = &exe {
-                let var = x.trim_start_matches('&');
-                if !var.is_empty() && var.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    for k in 0..t.len() {
-                        // `NAME = ..;` と `const NAME: &str = ..;`（`==` と `NAME::` は除く）
-                        let defines = (punct(&t, k + 1, '=') && !punct(&t, k + 2, '='))
-                            || (punct(&t, k + 1, ':') && !punct(&t, k + 2, ':'));
-                        if ident(&t, k) == Some(var) && defines {
-                            let mut m = k + 2;
-                            while m < t.len() && !punct(&t, m, ';') {
-                                if string(&t, m).is_some_and(is_python_exe) {
-                                    a.problems.push((
-                                        t[m].line,
-                                        format!(
-                                            "`{var}` に python の実行ファイルの名前が入っている"
-                                        ),
-                                    ));
-                                }
-                                m += 1;
-                            }
-                        }
-                    }
-                }
-            }
-            a.sites.push(Site { line, exe });
-        }
     }
 
-    // shell に文字列を実行させる印の次の引数に python がある（どこで shell を起動しても）
-    for i in 0..t.len() {
-        if string(&t, i).is_some_and(is_shell_command_flag) && punct(&t, i + 1, ',') {
-            let from = i + 2;
-            let to = arg_end(&t, from);
-            if (from..to).any(|k| string(&t, k).is_some_and(mentions_python)) {
+    // Command::new(..)（`Command::new`、`<Command>::new`、`<std::process::Command as X>::new`）
+    for i in 3..t.len() {
+        if ident(&t, i) != Some("new") || !punct(&t, i + 1, '(') || !is_path_sep(&t, i - 2) {
+            continue;
+        }
+        let start = match receiver(&t, i - 3, &names) {
+            Receiver::Command(start) => start,
+            Receiver::Other => continue,
+            Receiver::Unsupported(at) => {
                 a.problems.push((
-                    t[i].line,
-                    "shell の `-c` に渡す文字列に python がある".to_string(),
+                    t[at].line,
+                    "未対応の起動構文（`<..>::new(` の型が Command かどうか読めない）".to_string(),
+                ));
+                continue;
+            }
+        };
+        let first = i + 2;
+        let end = arg_end(&t, first);
+        let arg = &t[first..end];
+        let exe = match arg {
+            [
+                Tok {
+                    kind: Kind::Str(s), ..
+                },
+            ] => Exe::Lit(s.clone()),
+            [
+                Tok {
+                    kind: Kind::Punct('&'),
+                    ..
+                },
+                Tok {
+                    kind: Kind::Str(s), ..
+                },
+            ] => Exe::Lit(s.clone()),
+            _ => Exe::Expr(text_of(arg)),
+        };
+        let line = t[start].line;
+        if let Exe::Lit(s) = &exe {
+            if is_python_exe(s) {
+                a.problems
+                    .push((line, format!("python を起動している: {s:?}")));
+            }
+            if is_wrapper(s) {
+                let (from, to) = enclosing_fn(&t, i);
+                for k in from..to {
+                    if string(&t, k).is_some_and(runs_python) {
+                        a.problems.push((
+                            t[k].line,
+                            format!("{s:?} を起動する関数に python と読める文字列がある"),
+                        ));
+                    }
+                }
+            }
+        }
+        // 起動する関数の中に python の実行ファイルの名前の文字列がある
+        // （`let exe = "python"; Command::new(exe)`）
+        let (from, to) = enclosing_fn(&t, i);
+        for k in from..to {
+            if string(&t, k).is_some_and(is_python_exe) && !is_index(&t, k) {
+                a.problems.push((
+                    t[k].line,
+                    "起動する関数に python の実行ファイルの名前の文字列がある".to_string(),
                 ));
             }
+        }
+        // 変数・定数に入れた名前（関数の外の `const PY = "python3"` を含む）
+        if let Exe::Expr(x) = &exe {
+            let var = x.trim_start_matches('&');
+            if !var.is_empty() && var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                for k in 0..t.len() {
+                    // `NAME = ..;` と `const NAME: &str = ..;`（`==` と `NAME::` は除く）
+                    let defines = (punct(&t, k + 1, '=') && !punct(&t, k + 2, '='))
+                        || (punct(&t, k + 1, ':') && !punct(&t, k + 2, ':'));
+                    if ident(&t, k) == Some(var) && defines {
+                        let mut m = k + 2;
+                        while m < t.len() && !punct(&t, m, ';') {
+                            if string(&t, m).is_some_and(is_python_exe) {
+                                a.problems.push((
+                                    t[m].line,
+                                    format!("`{var}` に python の実行ファイルの名前が入っている"),
+                                ));
+                            }
+                            m += 1;
+                        }
+                    }
+                }
+            }
+        }
+        a.sites.push(Site { line, exe });
+    }
+
+    // shell に文字列を実行させる印（`"-c", "cmd"`、`.arg("-c").arg("cmd")`）の次の引数に python がある
+    // （どこで shell を起動しても）
+    for i in 0..t.len() {
+        if !string(&t, i).is_some_and(is_shell_command_flag) {
+            continue;
+        }
+        let from = if punct(&t, i + 1, ',') {
+            i + 2
+        } else if punct(&t, i + 1, ')')
+            && punct(&t, i + 2, '.')
+            && matches!(ident(&t, i + 3), Some("arg" | "args"))
+            && punct(&t, i + 4, '(')
+        {
+            i + 5
+        } else {
+            continue;
+        };
+        let to = arg_end(&t, from);
+        if (from..to).any(|k| string(&t, k).is_some_and(runs_python)) {
+            a.problems.push((
+                t[i].line,
+                "shell の `-c` に渡す文字列に python がある".to_string(),
+            ));
         }
     }
     a.problems.sort();
@@ -686,7 +842,10 @@ fn the_allow_list_never_names_python() {
     for (file, exe, n) in ALLOWED {
         assert!(*n > 0, "{file} {exe}");
         if let Exe::Lit(s) = exe {
-            assert!(!is_python_exe(s) && !mentions_python(s), "{file} {exe}");
+            assert!(
+                !runs_python(s) && !s.to_ascii_lowercase().contains("python"),
+                "{file} {exe}"
+            );
         }
     }
 }
@@ -773,6 +932,97 @@ fn the_detector_finds_python_launched_in_the_ways_a_string_search_misses() {
     );
     assert_eq!(problems("unsafe { libc::execv(p, a) };"), [1]);
     assert_eq!(problems("unsafe { libc::system(c) };"), [1]);
+    assert_eq!(problems("use tokio::{fs, process::Command};"), [1]);
+    assert_eq!(problems("use std::os::unix::process::*;"), [1]);
+    assert_eq!(problems("c.pre_exec(|| Ok(()));"), [1]);
+    assert_eq!(
+        problems("use duct::cmd;\nlet _ = duct::cmd(\"x\", [\"y\"]);"),
+        [1, 2]
+    );
+    assert_eq!(problems("let s = subprocess::Exec::cmd(\"x\");"), [1]);
+    assert_eq!(problems("posix_spawn(p, f, a, e);"), [1]);
+}
+
+#[test]
+fn the_detector_finds_launches_through_a_qualified_type_path() {
+    // `<型>::new` の形でも起動として数え、python なら失敗にする
+    assert_eq!(
+        problems("<std::process::Command>::new(\"python\").status();"),
+        [1]
+    );
+    assert_eq!(
+        sites("<std::process::Command>::new(\"python\").status();"),
+        [(1, "文字列 \"python\"".to_string())]
+    );
+    assert_eq!(problems("<Command>::new(\"python3\");"), [1]);
+    assert_eq!(problems("<Command as Foo>::new(\"pypy3\");"), [1]);
+    assert_eq!(
+        problems("use std::process::Command as P;\n<P>::new(\"python\");"),
+        [2]
+    );
+    assert_eq!(
+        sites("a;\n<std::process::Command as Foo>::new(BIN);\n<Command>::new(\"kill\");"),
+        [
+            (2, "式 BIN".to_string()),
+            (3, "文字列 \"kill\"".to_string())
+        ]
+    );
+    // 型を読めない形は未対応の起動構文として失敗にする
+    assert_eq!(problems("<_ as Foo>::new(\"x\");"), [1]);
+    assert_eq!(problems("x >::new(\"x\");"), [1]);
+    // Command でない型の `new`・ターボフィッシュは起動として数えない
+    assert_eq!(
+        sites("let a = <String>::new(); let b = <Vec<Command>>::new();"),
+        []
+    );
+    assert_eq!(
+        sites("let a = Vec::<Command>::new(); let b = HashMap::<K, Command>::new();"),
+        []
+    );
+    assert_eq!(problems("let a = Vec::<u8>::new();"), Vec::<usize>::new());
+}
+
+#[test]
+fn the_detector_finds_python_run_through_a_shell_by_any_executable_name() {
+    for cmd in [
+        "pypy3 -V",
+        "pypy -c 1",
+        "pypy3.10 x.py",
+        "/opt/pypy/bin/pypy3 x.py",
+        "cd x && pypy3 y.py",
+        "FOO=1 /usr/bin/python3.12 y.py",
+        "PY=python3; $PY y",
+        "echo $(command -v python3)",
+        "exec ./venv/bin/python -m x",
+    ] {
+        let src = format!("Command::new(\"/bin/sh\").args([\"-c\", {cmd:?}]);");
+        assert_eq!(problems(&src), [1], "{cmd}");
+    }
+    assert_eq!(
+        problems("Command::new(\"bash\").arg(\"-c\").arg(\"pypy3 -V\").status();"),
+        [1]
+    );
+    assert_eq!(
+        problems("Command::new(\"sh\").args([\"-lc\", \"cd x; pypy3 y\"]);"),
+        [1]
+    );
+    // 関数の別の場所に書いた命令文でも、wrapper を起動していれば同じ判定
+    assert_eq!(
+        problems(
+            "fn f() {\n    let s = \"pypy3 -V\";\n    Command::new(\"/bin/sh\").args([\"-c\", s]);\n}"
+        ),
+        [2]
+    );
+    // python と関係ない命令文は誤検知しない
+    for cmd in [
+        "echo hello",
+        "ls /tmp/python/bin",
+        "echo pypy-fixtures pythonic",
+        "cat exif-python.json",
+    ] {
+        let src = format!("Command::new(\"/bin/sh\").args([\"-c\", {cmd:?}]);");
+        assert_eq!(problems(&src), Vec::<usize>::new(), "{cmd}");
+    }
 }
 
 #[test]
@@ -847,6 +1097,19 @@ fn the_detector_ignores_json_keys_fixture_names_comments_and_text() {
         problems("std::process::exit(1); let id = std::process::id(); std::process::abort();"),
         Vec::<usize>::new()
     );
+    // 起動の道具と同じ名前の変数・フィールド・引数・メソッド
+    for src in [
+        "let subprocess = 42;",
+        "let duct = 1; let xshell = duct + 1;",
+        "struct S { subprocess: u8, cmd_lib: u8 }",
+        "fn f(async_process: u8) -> u8 { async_process }",
+        "let n = s.subprocess + s.duct;",
+        "let c = S { subprocess: 1, execv: 2 };",
+        "env.exec(sql.to_string());",
+        "let posix_spawn = true;",
+    ] {
+        assert_eq!(problems(src), Vec::<usize>::new(), "{src}");
+    }
     // Command という名前の別の型（clap の列挙など）
     assert_eq!(
         sites("match c { Command::Serve => 1, Command::Ingest => 2 }"),
@@ -864,8 +1127,12 @@ fn python_exe_names_are_recognised() {
         "./venv/bin/python",
         "Python3",
         "pypy3",
+        "pypy",
+        "pypy3.10",
+        "/opt/pypy/bin/pypy3",
     ] {
         assert!(is_python_exe(s), "{s}");
+        assert!(runs_python(s), "{s}");
     }
     for s in [
         "mkfifo",
@@ -877,5 +1144,6 @@ fn python_exe_names_are_recognised() {
         "sh",
     ] {
         assert!(!is_python_exe(s), "{s}");
+        assert!(!runs_python(s), "{s}");
     }
 }
