@@ -24,7 +24,7 @@
 - ユーザー評価は `favorite` と `hidden`。rating・表示回数はない。
 - `GEOFRAME_INFER_OFFSET_MIN` は位置推定時のカメラ時計補正に使う。写真ごとの補正値・根拠は未保存。
 - 位置なし写真の撮影地候補は`ai_worker`が写真選定の後に別処理として増分実行する（Rustでは`ai/location_clue.rs`・`ai/location_suggest.rs`）。まず同じ機体のDecisionサーバー（gpu-evalの常駐のd3-lite。同じ機体のLAN入口経由で呼び、接続先は`GEOFRAME_AI_CONFIG`のJSONの`local_base_url`）が写真ごとに「撮影地の手がかりがあるか」と被写体の種類を判定し、`photo_loc_clues`へ保存する。同じ日の写真（12時間以上の空きか日付の変わり目で区切る）をまとめ、手がかりあり（`clue`≥0.2または`kind=landmark`）の上位6枚だけをクラウドのGemini（モデルは`GEOFRAME_AI_CONFIG`のJSONで決める）へ送って撮影地を推定させる。判定の済んでいない写真がある日、手がかりのある写真が無い日は送らない。Decisionが応答しない間は判定が進まないので、家の中のペット写真などが判定なしでGoogleへ送られることはない。Decisionはgpu-evalの常駐なので起動を気にしなくてよい（常駐をやめて必要な間だけ起動する運用に戻す場合の毎朝5:00のタイマーは[デプロイ §2.3](../../deploy/README.md#23-撮影地の手がかり判定を毎朝動かす任意)）。推定した地名はNominatimで座標にし、`photo_loc_runs`（問い合わせ1回分）と`photo_loc_suggestions`（写真ごとの候補）へ保存する。候補は`photos.lat/lon`に書かず、管理画面の位置指定で候補の場所へ地図を動かすだけにする。確定は人が地図をクリックしてSAVEしたとき（`manual`）に限る。処理量は`GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`（既定10枚）と`GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`（既定2日）、`GEOFRAME_LOC_SUGGEST=0`で停止できる。
-- 外部AIは写真選定と撮影地候補にだけ使用する。`gemini`では検索時に検索文、取り込み時にEXIF除去・縮小したderivativeをAgent Platformへ送る。`local`ではembeddingをこのサーバーで計算し、Agent Platformへ送るのは比較評価に回す同一場面の候補（最大6枚）だけになる。`ai_caption`列は未使用で、旅行ブログ本文は引き続き決定的な事実アウトラインを生成する。
+- 外部AIは写真選定と撮影地候補にだけ使用する。用途ごとの送り先は`GEOFRAME_AI_CONFIG`のJSONで決める（`GEOFRAME_EMBED_BACKEND`は旧データの識別で、送り先を切り替えない）。画像と検索語のembeddingを`provider: local`にすると、EXIF除去・縮小したderivativeと検索文はLAN内のembeddingサービスへだけ送り、クラウド（Agent Platform）へ送るのは、クラウドを許した用途（同一場面の比較評価に回す候補（最大6枚）と、撮影地の推定）だけになる。`ai_caption`列は未使用で、旅行ブログ本文は引き続き決定的な事実アウトラインを生成する。
 
 ## API・UI
 

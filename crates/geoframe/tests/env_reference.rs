@@ -5,8 +5,10 @@
 //! - 「Rust が読む環境変数」: コードが読む名前の全部。
 //! - 「旧版のみ（削除済み。Rust は読まない）」: 旧 Python 版だけが読んだ名前。コードには出てこない。
 //!
-//! 照合するもの:
-//! 1. `crates` 以下の全 `.rs` にある `"GEOFRAME_…"` の文字列（引用符で囲んだ名前そのもの）は、
+//! 照合するもの（「コード」は試験とコメントを除いた本体: `tests/` の下・`tests.rs`・`tests_*.rs`・`*_tests.rs` の
+//! ファイルと、`#[cfg(test)]` の付いた項目、`//` のコメントを除く。試験やコメントに名前が残っていても、本体が
+//! 読まなくなれば 2 で分かるように）:
+//! 1. `crates` 以下の本体の `.rs` にある `"GEOFRAME_…"` の文字列（引用符で囲んだ名前そのもの）は、
 //!    試験だけの名前（`TEST_ONLY`）を除いて、すべて「Rust が読む」の節に載っている。
 //! 2. 「Rust が読む」の節の名前は、どれもコードに出てくる（綴りの誤り・読まなくなった名前が残らない）。
 //! 3. 「旧版のみ」の節の名前は、コードに出てこない（読むようになったのに節を移し忘れない）。
@@ -19,17 +21,10 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
-/// 試験の中だけで使う名前（文書に載せない）。読む場所:
-/// - `GEOFRAME_TEST_EUID`・`GEOFRAME_TEST_PYTHON_STATE`: `guard.rs` の、デバッグビルドだけの注入口
-///   （実行ユーザーと Python 版の状態を試験から与える）。
-/// - `GEOFRAME_TEST_PROXY_CHILD`・`GEOFRAME_TEST_CLOUD_PROXY_CHILD`: 試験の実行ファイルを子プロセスとして
-///   動かすときの目印（`ai/tests_http.rs`・`ai/cloud/tests.rs`）。
-const TEST_ONLY: &[&str] = &[
-    "GEOFRAME_TEST_CLOUD_PROXY_CHILD",
-    "GEOFRAME_TEST_EUID",
-    "GEOFRAME_TEST_PROXY_CHILD",
-    "GEOFRAME_TEST_PYTHON_STATE",
-];
+/// 本体のコードにあるが、試験のためだけの名前（文書に載せない）。`guard.rs` の、デバッグビルドだけの注入口
+/// （実行ユーザーと Python 版の状態を試験から与える）。試験のファイルの中だけで使う名前（子プロセスの目印など）は、
+/// 本体を走査しないのでここに書かなくてよい。
+const TEST_ONLY: &[&str] = &["GEOFRAME_TEST_EUID", "GEOFRAME_TEST_PYTHON_STATE"];
 
 const SECTION_RUST: &str = "## Rust が読む環境変数";
 const SECTION_OLD_ONLY: &str = "## 旧版のみ（削除済み。Rust は読まない）";
@@ -47,6 +42,74 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
+}
+
+/// 試験だけのファイル（`tests/` の下、`tests.rs`・`tests_*.rs`・`*_tests.rs`）。
+fn is_test_file(path: &Path) -> bool {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    path.components().any(|c| c.as_os_str() == "tests")
+        || name == "tests.rs"
+        || name.starts_with("tests_")
+        || name.ends_with("_tests.rs")
+}
+
+/// 本体だけを残す: `//` のコメント（文字列の中の `//` は残す）と、`#[cfg(test)]` の付いた項目
+/// （次の `;` か、対応する `}` まで）を除く。字句は簡易（文字列と文字リテラルの `"` だけを追う）。
+fn production_source(text: &str) -> String {
+    let mut no_comments = String::with_capacity(text.len());
+    for line in text.lines() {
+        let mut in_str = false;
+        let mut prev = '\0';
+        let mut cut = line.len();
+        for (i, c) in line.char_indices() {
+            if c == '"' && prev != '\\' && !(prev == '\'' && line[i + 1..].starts_with('\'')) {
+                in_str = !in_str;
+            } else if !in_str && c == '/' && prev == '/' {
+                cut = i - 1;
+                break;
+            }
+            prev = if prev == '\\' && c == '\\' { '\0' } else { c };
+        }
+        no_comments.push_str(&line[..cut]);
+        no_comments.push('\n');
+    }
+    let mut out = String::with_capacity(no_comments.len());
+    let mut rest = no_comments.as_str();
+    while let Some(i) = rest.find("#[cfg(test)]") {
+        out.push_str(&rest[..i]);
+        let after = &rest[i..];
+        let semi = after.find(';');
+        let brace = after.find('{');
+        let end = match (semi, brace) {
+            (Some(sc), Some(b)) if sc < b => sc + 1,
+            (_, Some(b)) => {
+                let mut depth = 0usize;
+                let mut in_str = false;
+                let mut prev = '\0';
+                let mut end = after.len();
+                for (k, c) in after[b..].char_indices() {
+                    if c == '"' && prev != '\\' && prev != '\'' {
+                        in_str = !in_str;
+                    } else if !in_str && c == '{' {
+                        depth += 1;
+                    } else if !in_str && c == '}' {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = b + k + 1;
+                            break;
+                        }
+                    }
+                    prev = if prev == '\\' && c == '\\' { '\0' } else { c };
+                }
+                end
+            }
+            (Some(sc), None) => sc + 1,
+            (None, None) => after.len(),
+        };
+        rest = &after[end..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `"GEOFRAME_…"`（引用符で囲んだ、大文字・数字・`_` だけの名前）を集める。末尾が `_` のもの
@@ -94,9 +157,12 @@ fn every_variable_the_code_reads_is_documented() {
     let mut in_code = BTreeSet::new();
     for file in files
         .iter()
-        .filter(|f| f.canonicalize().ok() != this_file.canonicalize().ok())
+        .filter(|f| f.canonicalize().ok() != this_file.canonicalize().ok() && !is_test_file(f))
     {
-        names_in(&std::fs::read_to_string(file).unwrap(), &mut in_code);
+        names_in(
+            &production_source(&std::fs::read_to_string(file).unwrap()),
+            &mut in_code,
+        );
     }
     assert!(in_code.len() >= 25, "名前を集められていない: {in_code:?}");
 
@@ -158,4 +224,36 @@ fn name_scanner_reads_only_complete_quoted_names() {
     );
     let got: Vec<&str> = out.iter().map(String::as_str).collect();
     assert_eq!(got, ["GEOFRAME_AI_CONFIG", "GEOFRAME_PORT"]);
+}
+
+#[test]
+fn names_only_in_tests_or_comments_do_not_count_as_read() {
+    let src = r#"fn port() -> String { std::env::var("GEOFRAME_PORT").unwrap() }
+// 以前は "GEOFRAME_OLD_COMMENT" を読んだ
+let url = "http://example.test/x"; let k = "GEOFRAME_AFTER_URL";
+#[cfg(test)]
+mod tests {
+    fn f() { let s = "}"; std::env::set_var("GEOFRAME_ONLY_IN_TEST", "1"); }
+}
+#[cfg(test)]
+const T: &str = "GEOFRAME_TEST_CONST";
+fn after() { let _ = "GEOFRAME_AFTER_TESTS"; }
+"#;
+    let mut out = BTreeSet::new();
+    names_in(&production_source(src), &mut out);
+    let got: Vec<&str> = out.iter().map(String::as_str).collect();
+    assert_eq!(
+        got,
+        [
+            "GEOFRAME_AFTER_TESTS",
+            "GEOFRAME_AFTER_URL",
+            "GEOFRAME_PORT"
+        ]
+    );
+    assert!(is_test_file(Path::new("crates/geoframe/src/ai/tests.rs")));
+    assert!(is_test_file(Path::new(
+        "crates/geoframe/src/ai/tests_http.rs"
+    )));
+    assert!(is_test_file(Path::new("crates/geoframe/tests/blog_api.rs")));
+    assert!(!is_test_file(Path::new("crates/geoframe/src/config.rs")));
 }

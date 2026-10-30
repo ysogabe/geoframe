@@ -21,5 +21,5 @@
 ## 地図タイルについて
 
 管理ページの位置修正に使う背景地図タイル（OpenStreetMap / 地理院タイル）はここには置かない。
-Rustサーバーの `/tiles/{osm,gsi}/{z}/{x}/{y}.png` プロキシが取得し、
-`GEOFRAME_DATA_DIR/tile_cache/`（既定は `./var/tile_cache/`） にファイルキャッシュする（版管理対象外）。
+`server.py` の `/tiles/{osm,gsi}/{z}/{x}/{y}.png` プロキシが取得し、
+`GEOFRAME_DATA_DIR/tile_cache/`（開発時の既定は `app/var/tile_cache/`） にファイルキャッシュする（版管理対象外）。
