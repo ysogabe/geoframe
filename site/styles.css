@@ -79,6 +79,10 @@ a:hover { color: #0f3f48; }
   border: 1px solid var(--line); border-radius: 999px; background: var(--paper); color: var(--muted);
 }
 
+.hero-figure { margin: 2.5rem 0 0; }
+.hero-figure img { display: block; width: 100%; border-radius: var(--radius); border: 1px solid var(--line); }
+.hero-figure figcaption { margin-top: 0.6rem; font-size: 0.85rem; color: var(--muted); }
+
 /* セクション */
 .section { padding-block: clamp(2.5rem, 6vw, 4.5rem); }
 .section-head { margin-bottom: 2rem; max-width: 42rem; }

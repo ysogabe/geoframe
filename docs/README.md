@@ -7,6 +7,7 @@
 
 | 文書 | 状態 | 内容 |
 |---|---|---|
+| [使い方](USAGE.md) | 現行 | ビルドと起動、外部との通信、設定とデータの扱い、試験の回し方 |
 | [写真パイプライン](architecture/photo-pipeline.md) | 現行 | 写真の取り込みから配信APIまでの流れ |
 | [写真カタログ](architecture/photo-catalog.md) | 参照 | SQLiteとメタデータ分離の設計・設計履歴 |
 | [写真フィードの契約](architecture/photo-feed-contract.md) | 現行 | 表示クライアント（miharashi）へ渡す写真一覧と画像 |

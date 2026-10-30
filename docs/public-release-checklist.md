@@ -75,5 +75,5 @@
 - [ ] Issue・PR・Actionsのログとアーティファクト・Releasesを確認した
 - [ ] 旅程のサンプルの扱いを決めた
 - [ ] Private vulnerability reporting と secret scanning を有効にした
-- [ ] README・LPの説明（認証なし、外部通信と課金、写真とGPSの扱い）が実装と合っている
+- [ ] README・使い方（`docs/USAGE.md`）・LPの説明（認証なし、外部通信と課金、写真とGPSの扱い）が実装と合っている
 - [ ] `python3 tools/check_markdown_links.py`と`python3 tools/check_site.py`が通る

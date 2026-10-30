@@ -50,6 +50,6 @@ python3 -m http.server 8000 --directory site  # 手元で表示（http://127.0.0
 `site/`にJSONやデータベースなどのファイルが無いことを確かめます。CIの「文書・道具」jobでも実行されます。
 許可するホストを増やすときは、`ALLOWED_HOSTS`を変えて理由をPRに書いてください。
 
-文言を変えるときは、READMEと食い違わないようにしてください。特に、**認証が無いこと、外部へ通信する機能
+文言を変えるときは、READMEと使い方（`docs/USAGE.md`）と食い違わないようにしてください。特に、**認証が無いこと、外部へ通信する機能
 （取り込み時の地名・標高補完、Google Drive・地図・クラウドAI）と課金、写真とGPSの扱い**は、実装に合わせて書きます
-（[README](../README.md)、[設定リファレンス](reference/configuration.md)）。
+（[README](../README.md)、[使い方](USAGE.md)、[設定リファレンス](reference/configuration.md)）。
