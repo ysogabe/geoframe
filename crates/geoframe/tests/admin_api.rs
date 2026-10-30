@@ -24,6 +24,22 @@ fn strip_unstable(mut body: Value) -> Value {
     body
 }
 
+/// Python 版に無い追加分を除く: `db.filters` と、`noloc`・`suggest` 以外のフィルタの `hint`。
+fn python_shape(mut body: Value) -> Value {
+    if let Some(db) = body.get_mut("db").and_then(Value::as_object_mut) {
+        db.remove("filters");
+    }
+    let hinted = matches!(body["filter"].as_str(), Some("noloc" | "suggest"));
+    if !hinted && let Some(items) = body.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            if let Some(map) = item.as_object_mut() {
+                map.remove("hint");
+            }
+        }
+    }
+    body
+}
+
 struct Server {
     _dir: TempDir,
     writer: rusqlite::Connection,
@@ -43,9 +59,16 @@ impl Server {
         }
     }
 
-    async fn json(&self, target: &str) -> (u16, Value) {
+    /// Python 版にも無い追加分（`db.filters`・全フィルタのヒント）を除かない、そのままの応答。
+    async fn raw(&self, target: &str) -> (u16, Value) {
         let response = get(self.addr, target).await;
         (response.status, strip_unstable(response.json()))
+    }
+
+    /// Python 版のフィクスチャと比べられる形の応答（追加分を除く）。
+    async fn json(&self, target: &str) -> (u16, Value) {
+        let (status, body) = self.raw(target).await;
+        (status, python_shape(body))
     }
 
     /// フィクスチャの「target・status・body」の並びを順に流して比べる。
@@ -828,7 +851,7 @@ async fn the_mass_delete_hold_appears_only_while_there_is_one() {
     let status = || async {
         let response = get(addr, "/api/admin/status").await;
         assert_eq!(response.status, 200);
-        strip_unstable(response.json())
+        python_shape(strip_unstable(response.json()))
     };
     // 記憶はあるが、まだ何も保留していない（サイクル前も、保留なしのサイクルのあとも同じ）: Python と同じ応答
     assert_eq!(status().await, fixture["status"]["gemini"]);
@@ -881,4 +904,78 @@ async fn without_the_ingest_there_is_no_hold_key() {
     let server = Server::start(&[]).await;
     let (_, body) = server.json("/api/admin/status").await;
     assert!(body["sync"].get("mass_delete_hold").is_none());
+}
+
+const FILTER_NAMES: [&str; 7] = [
+    "all", "noloc", "suggest", "inferred", "manual", "fav", "hidden",
+];
+
+#[tokio::test]
+async fn status_filters_match_each_filtered_total() {
+    let server = Server::start(&[]).await;
+    let (status, body) = server.raw("/api/admin/status").await;
+    assert_eq!(status, 200);
+    let filters = body["db"]["filters"].as_object().expect("db.filters");
+    assert_eq!(filters.len(), 7, "{filters:?}");
+    assert_eq!(filters["all"], body["db"]["total"]);
+    for name in FILTER_NAMES {
+        let (_, page) = server
+            .raw(&format!("/api/admin/photos?filter={name}&per=200"))
+            .await;
+        assert_eq!(page["filter"], name);
+        assert_eq!(filters[name], page["total"], "{name}");
+    }
+}
+
+#[tokio::test]
+async fn hints_go_to_no_location_rows_under_every_filter() {
+    let dir = TempDir::new("hints");
+    let writer = build_admin_catalog(dir.path());
+    writer
+        .execute_batch(
+            "DELETE FROM photo_loc_suggestions; DELETE FROM photo_loc_clues;
+             DELETE FROM photo_ai_group_members; DELETE FROM photo_ai_groups;
+             DELETE FROM photo_ai_features; DELETE FROM photo_quality_features;
+             DELETE FROM photo_quality; DELETE FROM photos;
+             INSERT INTO photos(id, source, name, taken_at, lat, lon, loc_source, city)
+               VALUES (1, 'local', 'anchor', '2025-01-01 10:00', 35.0, 139.0, 'exif', '東京');
+             INSERT INTO photos(id, source, name, taken_at, favorite) VALUES (2, 'local', 'fav-noloc', '2025-01-01 10:05', 1);
+             INSERT INTO photos(id, source, name, taken_at) VALUES (3, 'local', 'plain-noloc', '2025-01-01 10:10');
+             INSERT INTO photos(id, source, name, taken_at, lat, lon, loc_source, hidden)
+               VALUES (4, 'local', 'hidden-loc', '2025-01-01 10:20', 35.1, 139.1, 'exif', 1);",
+        )
+        .unwrap();
+    let catalog = Catalog::open(&dir.path().join("catalog.db")).unwrap();
+    let addr = spawn_with_env(dir.path(), &[], catalog).await;
+    let hinted = |body: &Value| -> Vec<(i64, bool)> {
+        body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| (i["id"].as_i64().unwrap(), i.get("hint").is_some()))
+            .collect()
+    };
+    let all = get(addr, "/api/admin/photos?filter=all&per=200")
+        .await
+        .json();
+    assert_eq!(
+        hinted(&all),
+        [(1, false), (2, true), (3, true), (4, false)],
+        "{all}"
+    );
+    assert_eq!(all["items"][1]["hint"]["label"], "東京");
+    assert_eq!(all["items"][1]["hint"]["dt_s"], 300);
+    let fav = get(addr, "/api/admin/photos?filter=fav&per=200")
+        .await
+        .json();
+    assert_eq!(hinted(&fav), [(2, true)], "{fav}");
+    // ページ内に位置なしの行が無ければ、どの行にも `hint` は付かない
+    let hidden = get(addr, "/api/admin/photos?filter=hidden&per=200")
+        .await
+        .json();
+    assert_eq!(hinted(&hidden), [(4, false)], "{hidden}");
+    let none = get(addr, "/api/admin/photos?filter=manual&per=200")
+        .await
+        .json();
+    assert!(none["items"].as_array().unwrap().is_empty());
 }
