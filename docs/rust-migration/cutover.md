@@ -1527,7 +1527,7 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 片付けのあと（venv・unit が無い）は、**数分では戻せない**。次が要り、ネットワークとビルドに時間がかかる（Pillow などの導入）。猶予期間の中で戻すかを判断するのはこのため。
 
 1. `/opt/geoframe` を P5a のマージのコミットへ: `git -C /opt/geoframe fetch origin && git -C /opt/geoframe reset --hard "$COMMIT"`（Python の実装はそのコミットにある）。
-2. venv を作り直す: [deploy/README.md §1](../../deploy/README.md) の手順（`python3 -m venv app/.venv`・`app/.venv/bin/pip install -r app/requirements.txt`）。
+2. venv を作り直す: [P5a のコミットの deploy/README.md §1](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/deploy/README.md) の手順（`python3 -m venv app/.venv`・`app/.venv/bin/pip install -r app/requirements.txt`）。
 3. Python 版の unit（そのコミットの `deploy/geoframe-server.service`）を `/usr/local/lib/systemd/system/` に置き、§3.3 の drop-in と `/etc/default/geoframe-py-rollback` を作り直す（AI は無効）。固定の印も置き直す。
 4. §8（Rust を止めて mask → Python を unmask して起動 → 確かめる）。
 

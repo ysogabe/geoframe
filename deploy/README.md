@@ -150,8 +150,8 @@ AI設定の`local_base_url`で指します。
 
 同一場面グループの中の順位（Geminiに見せる最大6枚の選択と、その並び）を、過去のGemini比較評価から
 学習した線形モデルで付けられます。モデルは家庭の写真の評価から作るため、リポジトリには入れず、
-`/var/lib/geoframe/models/rank_model.json`（`GEOFRAME_RANK_MODEL`）に置きます。置き換えたあとは、
-再起動すると確実に使われます。
+`/var/lib/geoframe/models/rank_model.json`（`GEOFRAME_RANK_MODEL`）に置きます。読み込みは
+ファイルの更新を検知して自動で行う（AIワーカーのサイクルごとに読み直す）ので、再起動は要りません。
 
 ```sh
 sudo install -o geoframe -g geoframe -m 0640 rank_model.json /var/lib/geoframe/models/rank_model.json
@@ -401,7 +401,7 @@ deploy/rust-deploy.sh --dry-run        # ビルドと手順の表示だけ（ssh
 deploy/rust-deploy.sh                  # ビルド→検査→転送→入れ替え→/healthz と /api/v1/photos の確認
 deploy/rust-deploy.sh --skip-build     # ビルド済みの成果物をそのまま配る
 deploy/rust-deploy.sh --rollback       # 直前のバイナリ（.prev）へ手で戻す
-bash deploy/rust-deploy-test.sh        # 失敗経路と --production をモックで試験（ssh なし）。2 つの試験とも CI（test.yml の「文書・道具」ジョブ）で回る
+bash deploy/rust-deploy-test.sh        # 失敗経路と --production をモックで試験（ssh なし）。2 つの試験とも CI（test.yml の「配布スクリプト（モックの試験）」ジョブ）で回る
 bash deploy/geoframe-admin-test.sh     # geoframe-admin.sh をモックの systemd-run で試験
 ```
 
