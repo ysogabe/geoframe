@@ -15,7 +15,7 @@
 #     に拒否する（検証環境の印がある機体、ホスト名が違う機体、Python 版が稼働中の機体などには配らない）。
 #     本番の手順は docs/rust-migration/cutover.md（T5.3）。
 #
-# deploy.sh（Python 版。本番機で git を取り込む薄いラッパー）とは別物で、こちらはバイナリを配る。やること:
+# 旧 deploy.sh（Python 版。本番機で git を取り込む薄いラッパー。P5b で削除）とは別物で、こちらはバイナリを配る。やること:
 #   0. （検証環境）埋め込む旅程（web/travel_blog/plans）に git 管理外のファイルかリンクがあれば、ビルド前に止める
 #   1. （検証環境）cargo build --release --target x86_64-unknown-linux-musl -p geoframe（完全静的）
 #   2. バイナリと unit を転送（sha256 で照合）。本番では --bin を root 所有の一時ディレクトリへ写してから照合
@@ -679,7 +679,7 @@ esac
     || { echo "ERROR: 待つ秒数（--wait-secs・GEOFRAME_RS_WAIT_SECS）は 0〜3600 の整数（4 桁まで）" >&2; exit 2; }
 
 # ssh の接続先。'-' 始まりの値が ssh のオプション（-oProxyCommand=…）として解釈されると、
-# 手元で任意コマンドが実行される。deploy.sh と同じく -- で打ち切る。
+# 手元で任意コマンドが実行される。-- で打ち切る。
 ssh_run() { ssh -- "$SSH_TARGET" "$@"; }
 
 # リモートの本体を、モードを指定して実行する（-t は付けない。検証環境は NOPASSWD sudo。

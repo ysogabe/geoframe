@@ -509,7 +509,6 @@ for line in 'CapabilityBoundingSet=' 'RestrictAddressFamilies=AF_UNIX AF_INET AF
     expect "unit: $line" grep -qxF "$line" "$U"
 done
 expect "unit: 優先順位の説明が正しい（EnvironmentFile= が書いた順に関係なく Environment= に勝つ）" bash -c 'grep -q "書いた順に関係なく Environment= に勝つ" "$1" && ! grep -q "後勝ち" "$1"' _ "$U"
-expect "geoframe-server.service: 優先順位の説明が正しい（中身は変えない）" bash -c 'grep -q "書いた順に関係なく" "$1" && ! grep -q "記載順に評価し後勝ち" "$1" && grep -q "^EnvironmentFile=-/etc/default/geoframe$" "$1"' _ "$HERE/geoframe-server.service"
 
 echo "[11c] 古い置き場所の本体と unit の置き場所（検証環境の経路）"
 setup; printf 'ETC-BODY\n' > "$GEOFRAME_RS_TEST_ETC_UNIT_DIR/geoframe-rs.service"; run deploy

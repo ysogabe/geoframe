@@ -4,7 +4,7 @@ GeoFrameの写真カタログと旅程JSONを照合し、旅行ブログをレ�
 
 ## 使い方
 
-1. GeoFrameサーバーを通常どおり起動する。
+1. GeoFrameサーバー（`geoframe serve`）を起動する。保存と書き出しは書き込みなので、`GEOFRAME_INGEST=1`（取り込みの有効化）が要る。
 2. `http://localhost:8080/blog-admin` を開く（既存の `/admin` からも移動可能）。
 3. 日別の本文、写真選択、キャプションを確認・編集する。
 4. 「下書き保存」で編集状態を保存する。
@@ -14,6 +14,6 @@ GeoFrameの写真カタログと旅程JSONを照合し、旅行ブログをレ�
 
 ## 旅程の追加
 
-`web/travel_blog/plans/` に既存JSONと同じ形式で `<trip_id>.json` を追加します。`trip_id` は英小文字・数字・ハイフンのみです。写真の候補期間は各 `segments[].date`、`start_local`、`end_local` で決まります。
+`web/travel_blog/plans/` に既存JSONと同じ形式で `<trip_id>.json` を追加します。旅程はバイナリに埋め込まれるので、反映にはビルドし直して配り直します（再ビルドなしで差し替えるときだけ、`GEOFRAME_BLOG_PLANS_DIR`にディレクトリを与えます。[docs/reference/configuration.md](../../docs/reference/configuration.md)）。`trip_id` は英小文字・数字・ハイフンのみです。写真の候補期間は各 `segments[].date`、`start_local`、`end_local` で決まります。
 
 下書きは `GEOFRAME_DATA_DIR/travel_blog/drafts/`、出力は `GEOFRAME_DATA_DIR/blog_exports/` に生成され、Gitの追跡対象外です。元写真と `catalog.db` の写真行は変更しません。
