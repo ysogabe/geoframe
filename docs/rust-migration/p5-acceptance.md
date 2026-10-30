@@ -352,8 +352,12 @@
 - 上限の考え方: まず小さく始め、最初の日に実際の積まれる量を見て決める方針。再起動直後に `photo_judge` の新規 34 件が積まれ（上限の 40 以内）、`location_suggest` は 1 日分が動いた。周期（`GEOFRAME_AI_POLL_S` 60 秒・1 周期の `JUDGE` 2・`LOC_SUGGEST_GEMINI` 2）は既定のまま。日の上限が先に効くので、頻度の調整はこの 2 つの上限で行う。
 - 再起動後の確認: `/healthz` 200、2 用途が「使える」、`ai_config_invalid`・`ai_task_blocks`・`ai_pauses`・`ai_waits` はすべて「なし」。最初の数分で `photo_judge` 成功 4→6、`location_suggest` 成功 1（`location_geocode` 1）、停止・警告なし。
 
-#### 4.3 あとで行うこと
+#### 4.3 §13 戻しの猶予期間の終わりと片付け（2026-10-30 21:20）
 
-- §12.3: 最初の日の送信数が上限（40・30）に収まっているか、費用、journal の警告を見る。上限を上げるのはユーザーの判断。
-- §13: 戻しの猶予期間（既定はクラウド AI を有効にしてから 1 週間）。**開始時に料金を確認して、上限を調整する**（ユーザー）。`/root/p5-cutover` と `p5-precutover-*` はそれまで残す。
-- T5.6a・T5.6b（P5b）は完了（PR はマージ済み）。
+- ユーザーの判断で、猶予期間を既定の 1 週間から短くして当日に終えた（miharashi が Rust から表示していること、20:34 の機体の再起動のあとも Rust が自動で上がり切替の状態が保たれたことを確かめたため）。
+- 最後の保全: `mode=ro` の `.backup`・`integrity_check` は `ok`・`gzip -t` OK（`p5-final-<時刻>.db.gz`。`catalog-*` の世代削除の対象外。消すのはユーザーの判断）。一次データと Python 版の unit の tar も取り、片付けの確認が済んだあと作業の置き場ごと消した。
+- §13.1 の 1〜5: 固定の印を外し、`/opt/geoframe` を `origin/main` へ（`backup-catalog.sh` あり）。venv を消した（`app/.env` はもともと無い）。`unmask`・Python 版の unit と drop-in と `/etc/default/geoframe-py-rollback` を消して `daemon-reload`（`geoframe-server.service` は見つからない）。`geoframe-rs` は enabled・active、`/healthz` 200、AI 設定は有効で停止なし。
+- §13.1 の 6: `p5-precutover-*.db.gz` と作業の置き場（秘密を含む tar・控え・バイナリ・補助スクリプト）を消した。
+- 残したもの: `/opt/geoframe/app/tools/`（切替より前からある git 管理外のファイル。この作業で作ったものではない）。
+- これで Python へは数分では戻せない（[cutover.md §13.2](cutover.md#132-猶予期間のあとに-python-へ戻す演習しない)）。
+- §12.3 の最初の日: `photo_judge` は 40 件（日の上限）で止まり、残りは UTC の日の境のあとに進む。上限を超えた送信は無い。料金を見て上限を決め直すのはユーザー。
