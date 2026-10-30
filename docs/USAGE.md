@@ -39,7 +39,7 @@ GEOFRAME_INGEST=1 ./target/release/geoframe serve --listen 127.0.0.1:8080 --data
   - 地図と地名検索: 管理画面の位置修正で、OpenStreetMapと地理院のタイル、地理院とNominatimの地名検索へ通信します（座標・検索語が上流へ渡ります）。
   - AI: `GEOFRAME_AI_CONFIG`を設定しない限り推論は始まりません。クラウドを許した用途では、縮小してEXIFを除いた写真が外部のAPI（Google CloudのGemini）へ送られ、**課金が発生します**。用途ごとの1周期あたりの上限は設定できます（[設定リファレンス](reference/configuration.md)）。
 - カタログ（`catalog.db`）には、手動で直したGPSやお気に入りが入ります。**公開するときは写真・`catalog.db`・生成した書き出しを含めないでください。**
-- 旅行ブログの旅程の例（`web/travel_blog/plans/`）には、実際の旅程が入っています。公開前に扱いを決める予定です（[公開準備チェックリスト](public-release-checklist.md)）。
+- 旅行ブログの旅程の例（`web/travel_blog/plans/`）は、作者が2025年に実際に行った旅の日程と訪問地です。宿や便名、同行者は含みません。
 - 動作の確認は、x86_64のLinux（`x86_64-unknown-linux-musl`の静的ビルド）で行っています。他の環境は確かめていません。
 
 ## 構成

@@ -41,7 +41,7 @@ sudo install -d -o root -g root -m 0755 /opt/geoframe
 
 ### 1.1 Deploy Keyの用意
 
-リポジトリはPrivateのため、読み取り専用のDeploy Keyで認証します。鍵は
+リポジトリはPublicなのでHTTPSでも取得できますが、本番機はPrivateだった時期から、読み取り専用のDeploy Keyを使ったSSHで取得しています。鍵は
 `/etc/geoframe/ssh/`へ置きます。`geoframe`ユーザーはnologinでホームディレクトリを
 持たず、更新は`root`が実行するため、どのユーザーのホーム（`/root/.ssh`を含む）にも
 依存しない専用の場所に置くのが目的です。

@@ -15,7 +15,7 @@
 | [Rust写真管理APIと外部AI Providerの設計案](architecture/rust-api-and-ai-providers-proposal.md) | 履歴 | Rust単一バイナリ化の設計判断。範囲はP0〜P5bで実装済み（共有crateなど未導入の案も残る）。現行の仕様は上の文書と`rust-migration/`の実装記録 |
 | [Rust移行の実装記録](rust-migration/plan.md) | 履歴・実装記録 | 計画（plan.md）、タスク表、フェーズごとの受入、本番切替の記録（cutover.md）。現行の仕様ではなく、当時の判断と検証の記録 |
 | [紹介ページ（LP）の管理](LP.md) | 現行 | `site/`の静的な紹介ページと、GitHub Pagesの手動公開の手順 |
-| [公開準備チェックリスト](public-release-checklist.md) | 現行 | リポジトリをPublicにする前の確認事項と、未解消の事項 |
+| [公開準備チェックリスト](public-release-checklist.md) | 現行 | 2026-10-30にPublicにしたときの監査の結果と判断の記録 |
 | [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（手で保ち、コードとの照合を`cargo test`が検査） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、更新、バックアップ |
 
