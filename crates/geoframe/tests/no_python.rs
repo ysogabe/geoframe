@@ -447,6 +447,14 @@ fn is_wrapper(exe: &str) -> bool {
 fn aliases_in(t: &[Tok], known: &BTreeSet<String>) -> BTreeSet<String> {
     let mut found = BTreeSet::new();
     let mut last_use = None;
+    // このファイルが `process::Command` を取り込んでいるか（`use std::process::Command; use Command as C;`）
+    let imports_process_command = (0..t.len()).any(|u| {
+        ident(t, u) == Some("use") && {
+            let end = (u..t.len()).find(|&k| punct(t, k, ';')).unwrap_or(t.len());
+            (u..end).any(|k| ident(t, k) == Some("process"))
+                && (u..end).any(|k| ident(t, k) == Some("Command"))
+        }
+    });
     for i in 0..t.len() {
         match ident(t, i) {
             Some("use") => last_use = Some(i),
@@ -455,7 +463,7 @@ fn aliases_in(t: &[Tok], known: &BTreeSet<String>) -> BTreeSet<String> {
                     (u..i).any(|k| ident(t, k) == Some("process")) && !punct_between(t, u, i, ';')
                 });
                 if let Some(alias) = ident(t, i + 2)
-                    && (in_process || name != "Command")
+                    && (in_process || name != "Command" || imports_process_command)
                 {
                     found.insert(alias.to_string());
                 }
@@ -527,8 +535,16 @@ fn is_index(t: &[Tok], i: usize) -> bool {
     punct(t, i.wrapping_sub(1), '[')
         && punct(t, i + 1, ']')
         && i >= 2
-        && (matches!(t[i - 2].kind, Kind::Ident(_)) || punct(t, i - 2, ')') || punct(t, i - 2, ']'))
+        && (matches!(&t[i - 2].kind, Kind::Ident(s) if !ARRAY_KEYWORDS.contains(&s.as_str()))
+            || punct(t, i - 2, ')')
+            || punct(t, i - 2, ']'))
 }
+
+/// 直後に配列の式（`["python"]`）を置けるキーワード。これらの後の `[` は添字ではない。
+const ARRAY_KEYWORDS: &[&str] = &[
+    "as", "box", "break", "const", "else", "if", "in", "let", "loop", "match", "move", "mut",
+    "ref", "return", "static", "unsafe", "while", "yield",
+];
 
 /// 位置 `i` の識別子が、`use` の文（`;` まで）の中にあるか。
 fn in_use_statement(t: &[Tok], i: usize) -> bool {
@@ -983,11 +999,11 @@ const LITERAL_ALLOWED: &[(&str, Allow)] = &[
     ),
     (
         "geoframe/tests/local_index_python.rs",
-        Allow::Exact("python"),
+        Allow::IndexKey("python"),
     ),
     (
         "geoframe/tests/orientation_python.rs",
-        Allow::Exact("python"),
+        Allow::IndexKey("python"),
     ),
     // テストデータの SQL（`place_name` に入れる合成の地名）。
     (
@@ -1771,6 +1787,30 @@ fn the_detector_ignores_json_keys_fixture_names_comments_and_text() {
         sites("match c { Command::Serve => 1, Command::Ingest => 2 }"),
         []
     );
+}
+
+#[test]
+fn a_local_alias_of_imported_command_and_array_literals_are_caught() {
+    // 取り込んだ `process::Command` を、非修飾名から別名にする
+    let src = "use std::process::Command;\nuse Command as C;\nfn launch() {\n    C::new(\"python\").status().unwrap();\n}";
+    assert_eq!(problems(src), [4]);
+    // キーワードの後の `["python"]` は配列の式で、添字ではない（`IndexKey` で許されない）
+    for kw in ["in", "return", "break", "let x =", "else {", "match"] {
+        let src = format!("fn f() {{ {kw} [\"python\"] }}");
+        let lits = analyze(&src, &BTreeSet::new()).literals;
+        assert_eq!(lits.len(), 1, "{kw}");
+        assert!(!lits[0].2, "{kw}: 添字と誤認した");
+    }
+    let src = "fn launch() {\n    for exe in [\"python\"] {\n        Command::new(exe).status().unwrap();\n    }\n}";
+    assert!(!analyze(src, &BTreeSet::new()).literals[0].2);
+    // 本当の添字は今までどおり添字
+    for src in [
+        "let w = &case[\"python\"];",
+        "let w = f()[\"python\"];",
+        "let w = a[0][\"python\"];",
+    ] {
+        assert!(analyze(src, &BTreeSet::new()).literals[0].2, "{src}");
+    }
 }
 
 #[test]
