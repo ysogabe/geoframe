@@ -1759,6 +1759,62 @@ fn local_writer_wait_is_bounded_and_expired_or_stopped_work_never_saves_later() 
 }
 
 #[test]
+fn portable_fixture_starts_without_scene_tables_migrates_and_runs_validated_weight() {
+    // 場面の表が無い合成の DB と重み（Python の生成ツールが作ったものを SQL と JSON に固めた基準）
+    let dir = TempDir::new("scene-portable");
+    let destination = dir.path().join("fixture");
+    std::fs::create_dir_all(destination.join("models")).unwrap();
+    Connection::open(destination.join("catalog.db"))
+        .unwrap()
+        .execute_batch(include_str!(
+            "../../../tests/fixtures/scene-runtime-portable.sql"
+        ))
+        .unwrap();
+    std::fs::write(
+        destination.join("models/rank_model.json"),
+        include_str!("../../../tests/fixtures/scene-runtime-portable-rank-model.json"),
+    )
+    .unwrap();
+    let config = Arc::new(
+        crate::config::Config::load(
+            |k| match k {
+                "GEOFRAME_INGEST" => Some("1".into()),
+                "GEOFRAME_EMBED_BACKEND" => Some("local".into()),
+                _ => None,
+            },
+            &crate::config::Overrides {
+                data_dir: Some(destination),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    );
+    let conn = crate::db::open_read_only(&config.db_path()).unwrap();
+    assert_eq!(pending(&conn).unwrap().len(), 3);
+    assert_eq!(
+        crate::ingest::plan(&config, &conn)
+            .unwrap()
+            .schema
+            .missing_objects
+            .len(),
+        10
+    );
+    let old = rows(&conn, "photos");
+    let ingest = crate::ingest::start_with(&config, &crate::guard::Guard::skip()).unwrap();
+    assert_eq!(ingest.migration.created.len(), 10);
+    assert_eq!(
+        runtime::Runtime::production(config.clone())
+            .unwrap()
+            .cycle(&conn, &ingest.writer, &crate::stop::StopFlag::new())
+            .unwrap(),
+        1
+    );
+    let status = crate::ai::search_view::status(&conn, &config).unwrap();
+    assert_eq!(status["pipeline"]["scenes"]["linear"], 1);
+    assert_eq!(rows(&conn, "photos"), old);
+}
+
+#[test]
 fn local_batch_old_expected_active_cannot_replace_new_processor_even_with_same_members() {
     let mut c = pair();
     let old = plan(&c);
