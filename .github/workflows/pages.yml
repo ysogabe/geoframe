@@ -1,0 +1,45 @@
+name: 紹介ページ（GitHub Pages）
+
+# 公開準備中のため、pushでは公開しない。リポジトリをPublicにし、Pagesの Source を
+# 「GitHub Actions」にしたあとで、所有者が Actions タブから手動で起動する（docs/LP.md）。
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: site/ を公開
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    steps:
+      - name: ソースを取得
+        uses: actions/checkout@v7
+
+      - name: site/ を検査
+        # 公開するのは site/ の静的ファイルだけ。外部の読み込みやデータファイルが混ざっていたら止める
+        run: python3 tools/check_site.py
+
+      - name: Pagesを設定
+        uses: actions/configure-pages@v6
+
+      - name: site/ だけをアーティファクトにする
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: デプロイ
+        id: deployment
+        uses: actions/deploy-pages@v5

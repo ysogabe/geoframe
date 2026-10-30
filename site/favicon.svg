@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="GEOFRAME">
+  <rect width="64" height="64" rx="14" fill="#1f2a2e"/>
+  <rect x="13" y="15" width="38" height="34" rx="3" fill="none" stroke="#f3ece0" stroke-width="3.5"/>
+  <path d="M32 21c-5.2 0-9 3.8-9 8.6 0 6.2 9 14.4 9 14.4s9-8.2 9-14.4C41 24.800 37.200 21 32 21z" fill="#d9a35b"/>
+  <circle cx="32" cy="29.500" r="3.400" fill="#1f2a2e"/>
+</svg>

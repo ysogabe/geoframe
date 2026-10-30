@@ -11,7 +11,10 @@
 | [写真カタログ](architecture/photo-catalog.md) | 参照 | SQLiteとメタデータ分離の設計・設計履歴 |
 | [写真フィードの契約](architecture/photo-feed-contract.md) | 現行 | 表示クライアント（miharashi）へ渡す写真一覧と画像 |
 | [ADR 0008: 写真管理基盤への転換](decisions/0008-photo-platform-and-miharashi-display.md) | 現行 | 表示をmiharashiへ移し、GEOFRAMEを写真管理基盤にした経緯 |
-| [Rust写真管理APIと外部AI Providerの設計案](architecture/rust-api-and-ai-providers-proposal.md) | 計画 | Rust単一バイナリ化、miharashiとの知見共有、local-model-labの画像Embedding API、ローカル／クラウドAIの切り替え |
+| [Rust写真管理APIと外部AI Providerの設計案](architecture/rust-api-and-ai-providers-proposal.md) | 履歴 | Rust単一バイナリ化の設計判断。範囲はP0〜P5bで実装済み（共有crateなど未導入の案も残る）。現行の仕様は上の文書と`rust-migration/`の実装記録 |
+| [Rust移行の実装記録](rust-migration/plan.md) | 履歴・実装記録 | 計画（plan.md）、タスク表、フェーズごとの受入、本番切替の記録（cutover.md）。現行の仕様ではなく、当時の判断と検証の記録 |
+| [紹介ページ（LP）の管理](LP.md) | 現行 | `site/`の静的な紹介ページと、GitHub Pagesの手動公開の手順 |
+| [公開準備チェックリスト](public-release-checklist.md) | 現行 | リポジトリをPublicにする前の確認事項と、未解消の事項 |
 | [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（手で保ち、コードとの照合を`cargo test`が検査） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、更新、バックアップ |
 
@@ -24,7 +27,7 @@
 - [写真カタログとメタデータ分離](architecture/photo-catalog.md)
 - [現行の写真パイプライン](architecture/photo-pipeline.md)
 - [写真フィードの契約（表示クライアント向け）](architecture/photo-feed-contract.md)
-- [Rust写真管理APIと外部AI Providerの設計案（未実装）](architecture/rust-api-and-ai-providers-proposal.md)
+- [Rust写真管理APIと外部AI Providerの設計案（履歴。範囲は実装済み）](architecture/rust-api-and-ai-providers-proposal.md)
 
 ### `decisions/` — 意思決定記録
 
@@ -46,6 +49,18 @@
 `cargo test`（`crates/geoframe/tests/env_reference.rs`）が失敗します。
 
 - [設定リファレンス（環境変数）](reference/configuration.md) — Rustのコードが読む`GEOFRAME_*`の一覧
+
+### `rust-migration/` — Rust移行の実装記録
+
+PythonからRustの単一バイナリへ移した作業（Issue #54、P0〜P5b）の計画、タスク表、フェーズごとの
+設計・受入の記録です。**全体が履歴・実装記録**で、現在のコードの仕様書ではありません。移行中の
+検証環境、日付付きの手順、当時のPython版との比較を含みます。現行の仕様は`architecture/`と
+`reference/`を見てください。読み始めの文書:
+
+- [実装計画](rust-migration/plan.md) / [タスク表](rust-migration/tasks.md)
+- [サーバーの設計](rust-migration/server.md) / [ビルド](rust-migration/build.md)
+- [本番切替の記録](rust-migration/cutover.md)
+- AI: [設定](rust-migration/ai-config.md) / [Provider](rust-migration/ai-provider.md) / [クラウド](rust-migration/ai-cloud.md)
 
 ### `archive/` — 履歴資料
 
@@ -76,6 +91,6 @@
 - 日付付き進捗メモや機体固有runbookは、Git管理外の`local-notes/`へ置きます。
 - 過去資料には履歴資料であることを明記し、計画上の挙動を現行仕様として説明しません。
 - 新しい文書を追加したら、この索引（`docs/README.md`）の該当節にも追加します。
-- 索引に載せた文書の状態（現行・参照・計画）は、実装の進行に合わせて更新します。
+- 索引に載せた文書の状態（現行・参照・履歴・計画）は、実装の進行に合わせて更新します。
 - 相対リンクはCIの`tools/check_markdown_links.py`で検査されます。文書を移動したら、索引と
   参照元のリンクも同じ変更で更新します。
