@@ -19,6 +19,7 @@
 //! | 地図タイル・地名検索の上流へ送る User-Agent（連絡先入りにする。ログには出さない） | なし | `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` |
 //! | 地図タイルの上流取得の毎分の上限（全体。0 は上流へ行かない） | なし | `GEOFRAME_TILE_FETCH_PER_MIN` | `240` |
 //! | 取り込み（DB への書き込み・同期サイクル）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_INGEST`（`0`/`1`） | `0`（無効） |
+//! | 旅行ブログ（`/blog-admin`・`/api/blog/*`）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_BLOG`（`0`/`1`） | `0`（無効） |
 //! | 同期サイクルの間隔（分） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10` |
 //! | ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可） | なし | `GEOFRAME_PHOTOS_DIR` | `photos` |
 //! | 同期 1 サイクルで derivative を作る枚数 | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25` |
@@ -189,6 +190,8 @@ pub struct Config {
     /// 取り込み（DB への書き込みと同期サイクル）を有効にするか。`GEOFRAME_INGEST`。既定は無効。
     /// Python 版と共通の設定をそのまま使っても二重に書かないよう、明示しない限り Rust は書かない。
     pub ingest: bool,
+    /// 旅行ブログ（`/blog-admin`・`/api/blog/*`）を有効にするか。`GEOFRAME_BLOG`。既定は無効。
+    pub blog: bool,
     /// 同期サイクルの間隔（分）。`GEOFRAME_DRIVE_POLL_MIN`（現行と同じく分で、小数も可）。
     pub drive_poll_min: f64,
     /// `GEOFRAME_PHOTOS_DIR` の値そのまま（`DATA_DIR` からの相対、または絶対）。現行と同じく
@@ -353,6 +356,18 @@ impl Config {
             },
             None => false,
         };
+        let blog = match get("GEOFRAME_BLOG") {
+            Some(raw) => match raw.trim() {
+                "1" => true,
+                "0" => false,
+                _ => {
+                    return Err(ConfigError(
+                        "GEOFRAME_BLOG は 0（無効）か 1（有効）で指定してください".into(),
+                    ));
+                }
+            },
+            None => false,
+        };
         // 現行は `float(...)`。0 以下や非数だと Python は空回りか例外になるので、Rust は断る
         let drive_poll_min = match get("GEOFRAME_DRIVE_POLL_MIN") {
             Some(raw) => raw
@@ -438,6 +453,7 @@ impl Config {
             tile_ua,
             tile_fetch_per_min,
             ingest,
+            blog,
             drive_poll_min,
             photos_dir_setting,
             fetch_per_cycle,
@@ -502,7 +518,7 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} blog_plans={} ai={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} blog={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} blog_plans={} ai={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
@@ -512,6 +528,7 @@ impl Config {
             self.infer_offset_min,
             self.embed_backend.model(),
             self.tile_cache_max_mb,
+            if self.blog { "on" } else { "off" },
             if self.ingest { 1 } else { 0 },
             self.drive_poll_min,
             self.fetch_per_cycle,
@@ -867,6 +884,38 @@ mod tests {
             let err = load(&[(key, value)], &Overrides::default()).unwrap_err();
             assert!(err.0.contains(key), "{err}");
             // 1〜2 文字の値（"0"・"2"）は、メッセージの文言と偶然重なるので除く
+            if value.len() > 2 {
+                assert!(!err.0.contains(value), "{err}");
+            }
+        }
+    }
+
+    #[test]
+    fn blog_is_off_by_default_and_read_from_the_environment() {
+        let c = load(&[], &Overrides::default()).unwrap();
+        assert!(!c.blog);
+        assert!(c.log_summary().contains("blog=off ingest=0 "));
+        // 空文字は未設定と同じ
+        assert!(
+            !load(&[("GEOFRAME_BLOG", " ")], &Overrides::default())
+                .unwrap()
+                .blog
+        );
+        assert!(
+            !load(&[("GEOFRAME_BLOG", "0")], &Overrides::default())
+                .unwrap()
+                .blog
+        );
+        let c = load(&[("GEOFRAME_BLOG", "1")], &Overrides::default()).unwrap();
+        assert!(c.blog);
+        assert!(c.log_summary().contains("blog=on ingest=0 "));
+    }
+
+    #[test]
+    fn invalid_blog_is_an_error_without_echoing_the_value() {
+        for value in ["2", "true", "yes", "on"] {
+            let err = load(&[("GEOFRAME_BLOG", value)], &Overrides::default()).unwrap_err();
+            assert!(err.0.contains("GEOFRAME_BLOG"), "{err}");
             if value.len() > 2 {
                 assert!(!err.0.contains(value), "{err}");
             }

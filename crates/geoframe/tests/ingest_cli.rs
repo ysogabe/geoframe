@@ -254,6 +254,32 @@ fn dry_run_does_not_create_a_missing_database() {
 }
 
 #[test]
+fn an_invalid_blog_flag_is_refused_as_a_config_error_before_anything_is_written() {
+    let dir = Dir::new("badblog");
+    production_shaped_db(&dir.0);
+    let before = snapshot(&dir.0);
+    for value in ["2", "true"] {
+        let out = run(
+            &[
+                "serve",
+                "--listen",
+                "127.0.0.1:0",
+                "--data-dir",
+                dir.0.to_str().unwrap(),
+            ],
+            &[("GEOFRAME_BLOG", value)],
+        );
+        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
+        let stderr = text(&out.stderr);
+        assert!(stderr.contains("GEOFRAME_BLOG"), "{stderr}");
+        if value.len() > 1 {
+            assert!(!stderr.contains(value), "{stderr}");
+        }
+    }
+    assert_eq!(snapshot(&dir.0), before);
+}
+
+#[test]
 fn sync_without_ingest_refuses_and_writes_nothing() {
     let dir = Dir::new("noingest");
     production_shaped_db(&dir.0);

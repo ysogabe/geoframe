@@ -72,10 +72,10 @@ impl Site {
         conn.execute_batch(&catalog_sql()).unwrap();
         let plan_arg = plans.is_some().then(|| plan_dir.display().to_string());
         let config = Config::load(
-            |key| {
-                (key == "GEOFRAME_BLOG_PLANS_DIR")
-                    .then(|| plan_arg.clone())
-                    .flatten()
+            |key| match key {
+                "GEOFRAME_BLOG" => Some("1".to_string()),
+                "GEOFRAME_BLOG_PLANS_DIR" => plan_arg.clone(),
+                _ => None,
             },
             &Overrides {
                 data_dir: Some(data.clone()),

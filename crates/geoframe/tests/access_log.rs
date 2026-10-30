@@ -72,8 +72,9 @@ async fn access_log_has_only_method_route_status_and_time() {
             .unwrap();
     }
 
+    // 旅行ブログの読み取り API を通すので有効にする（無効時の 404 は tests/blog_disabled.rs）
     let config = Config::load(
-        |_| None,
+        |key| (key == "GEOFRAME_BLOG").then(|| "1".to_string()),
         &Overrides {
             data_dir: Some(dir.clone()),
             ..Overrides::default()

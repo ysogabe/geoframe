@@ -92,12 +92,26 @@ impl Site {
 
     /// `data_dir` を置き場にしてサーバーを起動する。`allowed` は `GEOFRAME_ALLOWED_HOSTS`。
     async fn serve(&self, data_dir: &Path, allowed: &str) -> std::net::SocketAddr {
+        self.serve_blog(data_dir, allowed, Some("1")).await
+    }
+
+    /// [`Site::serve`] に `GEOFRAME_BLOG` を与える（`None` は未設定）。
+    async fn serve_blog(
+        &self,
+        data_dir: &Path,
+        allowed: &str,
+        blog: Option<&str>,
+    ) -> std::net::SocketAddr {
         let catalog = Catalog::open(&data_dir.join("catalog.db")).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let allowed = allowed.to_string();
         let config = Config::load(
-            |key| (key == "GEOFRAME_ALLOWED_HOSTS").then(|| allowed.clone()),
+            |key| match key {
+                "GEOFRAME_ALLOWED_HOSTS" => Some(allowed.clone()),
+                "GEOFRAME_BLOG" => blog.map(str::to_string),
+                _ => None,
+            },
             &Overrides {
                 listen: Some(addr),
                 data_dir: Some(data_dir.to_path_buf()),
@@ -410,6 +424,68 @@ async fn admin_pages_are_rewritten_to_the_embedded_html() {
     ] {
         assert_eq!(get(addr, target).await.status, 403, "{target}");
     }
+}
+
+#[tokio::test]
+async fn blog_admin_serves_the_admin_page_unless_the_blog_is_enabled() {
+    let site = Site::new();
+    let admin = repo_file("static/admin.html");
+    let blog_admin = repo_file("static/blog-admin.html");
+    assert_ne!(admin, blog_admin);
+    // 未設定・`0`: `/blog-admin` は管理画面の HTML（200）。ヘッダは HTML のまま
+    for blog in [None, Some("0")] {
+        let addr = site.serve_blog(&site.data, "frame.lan", blog).await;
+        for target in [
+            "/blog-admin",
+            "/blog-admin/",
+            "/blog-admin?x=1",
+            "/%62log-admin",
+        ] {
+            let r = get(addr, target).await;
+            assert_eq!(r.status, 200, "{blog:?} {target}");
+            assert_eq!(r.body, admin, "{blog:?} {target}");
+            assert_eq!(
+                r.header("content-type"),
+                Some("text/html"),
+                "{blog:?} {target}"
+            );
+            assert_eq!(
+                r.header("x-frame-options"),
+                Some("deny"),
+                "{blog:?} {target}"
+            );
+            assert_eq!(
+                r.header("content-security-policy"),
+                Some("frame-ancestors 'none'"),
+                "{blog:?} {target}"
+            );
+            assert_eq!(
+                r.header("cache-control"),
+                Some("no-cache"),
+                "{blog:?} {target}"
+            );
+        }
+        let h = head(addr, "/blog-admin").await;
+        assert_eq!(h.status, 200);
+        assert!(h.body.is_empty());
+        // `/static/` 配下の旅行ブログの部品と書き出し済みの `/blog_exports/` は、今までどおり配る
+        let r = get(addr, "/static/blog-admin.html").await;
+        assert_eq!(r.status, 200, "{blog:?}");
+        assert_eq!(r.body, blog_admin, "{blog:?}");
+        assert_eq!(get(addr, "/blog_exports/t/index.html").await.status, 200);
+        // ほかのページは変わらない
+        assert_eq!(get(addr, "/admin").await.body, admin);
+        assert_eq!(
+            get(addr, "/ai-search").await.body,
+            repo_file("static/ai-search.html")
+        );
+    }
+    // `1`: 旅行ブログの HTML
+    let addr = site.serve_blog(&site.data, "frame.lan", Some("1")).await;
+    let r = get(addr, "/blog-admin").await;
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, blog_admin);
+    assert_eq!(r.header("x-frame-options"), Some("deny"));
 }
 
 // ---- ホワイトリスト・ドット・ディレクトリ ---------------------------------------------------

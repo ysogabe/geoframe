@@ -339,7 +339,10 @@ impl Server {
         let plans_dir = plans.path().to_string_lossy().into_owned();
         let addr = spawn_with_env(
             dir.path(),
-            &[("GEOFRAME_BLOG_PLANS_DIR", plans_dir.as_str())],
+            &[
+                ("GEOFRAME_BLOG", "1"),
+                ("GEOFRAME_BLOG_PLANS_DIR", plans_dir.as_str()),
+            ],
             catalog,
         )
         .await;
@@ -1009,7 +1012,10 @@ async fn idle_servers(tag: &str) -> IdleServers {
         .unwrap()
         .with_writer(Writer::open(&path, OpenMode::MustExist).unwrap());
     let plans_dir = plans.path().to_string_lossy().into_owned();
-    let env = [("GEOFRAME_BLOG_PLANS_DIR".to_string(), plans_dir)];
+    let env = [
+        ("GEOFRAME_BLOG".to_string(), "1".to_string()),
+        ("GEOFRAME_BLOG_PLANS_DIR".to_string(), plans_dir),
+    ];
     let config = Config::load(
         |k| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()),
         &Overrides {

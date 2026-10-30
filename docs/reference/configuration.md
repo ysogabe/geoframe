@@ -26,6 +26,7 @@
 - `GEOFRAME_PORT` — 既定値 `8080`。HTTP の待ち受けポート。
 - `GEOFRAME_ALLOWED_HOSTS` — 既定値 空（`localhost` だけ許可）。許可する Host 名をカンマ区切りで足す。IP リテラル宛は無条件に許可するので、ここには名前だけを入れる（Tailscale や固定 DNS 名で開くとき。例: `geoframe.example.test:8080`）。
 - `GEOFRAME_LOG` — Rust だけ。既定値 `info`。ログの詳しさ。
+- `GEOFRAME_BLOG` — Rust だけ。既定値 `0`（無効）。`1` で旅行ブログ（`/blog-admin` のページと `/api/blog/*`）を有効にする。`0` の間は、`/api/blog/*` の読み取りと保存・書き出しは 404 を返し、`/blog-admin` は管理画面を返す。`0`/`1` 以外は設定の誤りで起動しない。
 - `GEOFRAME_INGEST` — Rust だけ。既定値 `0`（無効）。`1` で取り込み（DB への書き込みと同期サイクル）を有効にする。`0` の間は、書き込みの API（旅行ブログの保存・書き出しなど）は書かずに 503 を返す。
 - `GEOFRAME_DRIVE_POLL_MIN` — 既定値 `10`。同期サイクルの間隔（分）。
 - `GEOFRAME_PHOTOS_DIR` — 既定値 `photos`。ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可）。
