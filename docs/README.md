@@ -16,10 +16,17 @@
 | [Rust移行の実装記録](rust-migration/plan.md) | 履歴・実装記録 | 計画（plan.md）、タスク表、フェーズごとの受入、本番切替の記録（cutover.md）。現行の仕様ではなく、当時の判断と検証の記録 |
 | [紹介ページ（LP）の管理](LP.md) | 現行 | `site/`の静的な紹介ページと、GitHub Pagesの手動公開の手順 |
 | [公開準備チェックリスト](public-release-checklist.md) | 現行 | 2026-10-30にPublicにしたときの監査の結果と判断の記録 |
+| [管理画面の整え直し（A）](admin-rework/prd.md) | 計画 | 3ページの管理画面を「状況 / 写真 / 設定」の3タブに統合する PRD と[設計](admin-rework/design.md)（2026-10-30） |
 | [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（手で保ち、コードとの照合を`cargo test`が検査） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、更新、バックアップ |
 
 ## ディレクトリ構成
+
+### `admin-rework/` — 管理画面の整え直し（A）
+
+2026-10-30 開始。3 ページの管理画面を 1 枚の 3 タブに統合し、旅行ブログを設定で無効にし、設定タブを足す計画。
+
+- [PRD](admin-rework/prd.md) / [設計](admin-rework/design.md)
 
 ### `architecture/` — 設計
 
