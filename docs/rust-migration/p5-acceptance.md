@@ -8,8 +8,8 @@
 | 項目 | 値 |
 | --- | --- |
 | 演習のコミット（ブランチ `feat/rust-migration-p5`） | `712e61a038c76a739f291c9f5e7976a86669927a` |
-| P5a のマージのコミット（本番の `--expect-commit`） | （P5a のマージのあとに書き足す） |
-| 演習のコミットとマージのコミットの差（`crates`・`Cargo.*`・`app`・`deploy`。[cutover.md §1.2](cutover.md#12-演習のコミットと-p5a-のマージのコミットに差が無いことを確かめる)） | （本番の §1.2 で書き足す。出力が空であること） |
+| P5a のマージのコミット（本番の `--expect-commit`） | `a804623029ad67d415692d08ea3182fd765eb2a4`（geoframe-ambient-display の PR #63「Rust移行 P5a: 本番切替の準備」） |
+| 演習のコミットとマージのコミットの差（`crates`・`Cargo.*`・`app`・`deploy`。[cutover.md §1.2](cutover.md#12-演習のコミットと-p5a-のマージのコミットに差が無いことを確かめる)） | **空**（本番の §1.2、2026-10-30） |
 | バイナリ | `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`（演習のコミット）。20,272,504 B、static-pie |
 | バイナリの sha256（本番の `--expect-sha256`） | `65755b969077a608a54ddacbd651495f56afd1ca9e6f1f4a32a3466d199406e9` |
 | バイナリの保管先 | 開発機（本番と同じ機体）の `~/.cache/geoframe-t54/geoframe-65755b969077`（`0444`。演習の前と後に sha256 が上と一致）。検証環境へはこれを写して使い、演習で入れた `/usr/local/bin/geoframe` と `$BIN` も同じ sha256 だった（[cutover.md §15.6](cutover.md#156-元に戻す流れ-9) の 2） |
@@ -283,4 +283,62 @@
 
 ## T5.5 本番の切替
 
-（T5.5 で書く）
+2026-10-30、ユーザーの立ち会いで実施（操作は Opus。ユーザーの許可: 準備は「1・3・4 は承認」、§3 からは「開始して」）。
+
+### 0. 結果の要約
+
+| 項目 | 結果 |
+| --- | --- |
+| T0（Python の停止）→ T1（`/healthz`・`/api/v1/photos` が 200） | 08:25:23 → 08:25:55、**32 秒**（目標 5 分） |
+| `rust-deploy.sh --production` | 終了コード 0。「確認 OK（/healthz 200、/api/v1/photos は配列で 3065 件 >= 下限 3003）」「完了: geoframe 0.1.0」 |
+| 写真の集合（AC6） | Python 3,065 件 → Rust 3,065 件。Python だけ 0、Rust だけ 0（`extra.py` rc=0、説明できない 0）。画像 3,065 件すべて 200 |
+| 取り込みのサイクル | 起動直後に 1 回成功（表示可能 5,288 / 取得待ち 0 / 全 6,535。約 9.4 秒）。Drive の鍵を使った本番の取り込み |
+| ローカルの AI | 用途 3 つが「使える」、停止中の Provider・用途なし。Embedding・位置の手がかりのジョブが進んでいる（意味検索は索引の公開まで 503。受入済み） |
+| AC6 | **合格** |
+
+### 1. 準備（§1・§2）
+
+| 節 | 結果 |
+| --- | --- |
+| §1.1 | `deploy-pull.sh` で `/opt/geoframe` を P5a のマージのコミットへ。更新の前に手動のバックアップ。requirements の変更なし。Python は 2 秒で 200 |
+| §1.2 | 演習のコミットとの差（`crates`・`Cargo.*`・`app`・`deploy`）は空 |
+| §1.3 | `fuser` なし（入れていない。`dbopen.sh` は `/proc` の経路）。ほかの道具と venv はある |
+| §1.4 | 補助スクリプト 14 本。`cache_load.py` を本番の venv で空打ち rc=0。`dbopen.sh` は Python 稼働中に rc=1（正常） |
+| §1.5 | 3 つのファイルとも `600 root:root`。`geoframe-rs` は `GEOFRAME_DATA_DIR`・`GEOFRAME_DRIVE_KEY`・`TZ`（Python 版 unit の `Environment=` と同じ値を移した）・`GEOFRAME_INGEST=1`・`GEOFRAME_AI_CONFIG` の 5 つ。共通の設定との重複 0。`GEOFRAME_TILE_UA` は共通の設定にあったので共通のまま。本番に `app/.env` は無かった（移すもの無し） |
+| §1.6 | AI 設定の JSON は本番に無かったので作った（`640 root:geoframe`）。[ai-embedding.md](ai-embedding.md) の固定の契約と、用途 `image_embedding`・`query_embedding`・`location_clue` だけ（すべて `local`、入口は同じ機体）。クラウドの用途は書いていない。鍵は `600 geoframe:geoframe` |
+| §1.7 | Decision は `ready`（`image` を含む） |
+| §1.8〜§1.10 | バイナリの sha256 が上の表と一致、static-pie。`GEOFRAME_RS_*` なし。本番の状態は手順書のとおり。`--check-only` rc=0 |
+| §2 | Python の配信 3,065 件（`--expect-min-photos=3003`）、STATUS 41 行、下書きの sha256 を控えた。同じ引数の `--check-only` rc=0 |
+
+### 2. 切替（§3〜§6）
+
+| 節 | 結果 |
+| --- | --- |
+| §3 | 停止・disable・本体を `/usr/local/lib/systemd/system/` へ・drop-in・`EnvironmentFiles` に 2 つが並ぶ・`masked`/`inactive`・固定の印 |
+| §4 | タイマーとサービスが `inactive`。`dbopen.sh` rc=0（`/proc`）、`pgrep` rc=1。`.backup` rc=0（`mode=ro` で取れた）、`integrity_check` ok、`p5-precutover-20261030-082525.db.gz`（`640 geoframe`、42,843,429 B）、一時ファイルなし。一次データの tar 8 件（`app/.env` は無いもの）。T0 から 19 秒 |
+| §5 | 上の要約のとおり。`geoframe-rs` は `enabled`/`active`、Python は `inactive`。`[guard]` の行 1、警告 0 |
+| §6.8 | 展開と控え OK。`.dump` の SHA-256 `c885071535e5135e4b7b506941db327612ca69b933eaad6f0811a85445869cc1`。件数: photos 6,535・manual 17・favorite 0・hidden 0・rotated 0・quality_rows 559・quality_groups 243（exact 185・similar 374） |
+| §6.2 | 上の要約のとおり。群は `ai_group` 0・`quality_group` 0（フィード上） |
+| §6.3 | `ai_task_blocks`・`ai_config_invalid`・`ai_pauses` はすべて `なし`。Python の控えとの差は `db.ai.suppressed` 2,591 → 2,136（[p4-acceptance.md §7.3](p4-acceptance.md) の既知の差）と、`db.loc.clue_pending` 0 → 1,206・`clue_runnable` 1,206・`clue_pause=''` の行だけ（演習と同じ形） |
+| §6.4 | ユーザーが確認: miharashi の表示が続いている。管理画面（STATUS・写真一覧・地図のタイル・地名検索）が動き、お気に入りの付け外しが成功して元に戻った |
+| §6.5 | 上の要約のとおり |
+| §6.6 | タイマー OK（active / enabled）、次は 12:17 |
+| §6.7 | `deploy-pull.sh --dry-run` rc=3。`geoframe-admin.sh ai-jobs status` が動いた（DATA_DIR が出る。Embedding 成功 24・待ち 6,415、手がかり成功 10・待ち 1,205）。`NRestarts=0` |
+
+### 2b. 切替のあとの負荷（10:39）
+
+- CPU は Decision（同じ機体のローカルの常駐）が約 4.2 コア、`geoframe` は約 1%。機体全体で約 25%、load average 約 4。
+- 進み: 位置の手がかり 成功 610・待ち 605（1 件約 12 秒で、残り約 2 時間）。画像の Embedding 成功 744・待ち 5,695。
+- **意味検索の 503 は約 48 分という見込みより長い**: AI のワーカーは 1 本のスレッドで用途を順に回すので、手がかりの全件再判定のあいだは Embedding が 1 周期に 12 件ずつしか進まない（毎分 5〜6 件）。手がかりが終わってから速くなる。配信・管理には影響しない。§11 で公開の時刻を記録する。
+
+### 3. 手順書と違ったこと
+
+- §4.3: 実行の道具が `rm` を含むコマンドを止めたため、`.tmp-` の削除を `gzip -9 "$SNAP"`（元を置き換える）＋ `gzip -t` ＋ `mv` に置き換えた（結果は同じ。`mode=ro` で取れたので、コピーを使う代わりの経路は使っていない）。
+- §1.5 の「`ai-jobs status` が動くこと」は、Rust のバイナリが入る前なので §6.7 で確かめた。
+
+### 4. あとで行うこと
+
+- §11（数日）: Decision の全件再判定の終わり、索引の公開（意味検索の 503 が終わる）、バックアップのタイマー。
+- §12: クラウド AI の有効化（数日後、ユーザーが日と上限を決める）。
+- §13: 戻しの猶予期間（既定はクラウド AI を有効にしてから 1 週間）。`/root/p5-cutover` と `p5-precutover-*` はそれまで残す。
+- T5.6a・T5.6b（P5b）。
