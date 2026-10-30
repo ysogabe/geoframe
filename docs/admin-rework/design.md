@@ -9,7 +9,7 @@
 3 タブに統合する。旅行ブログは環境変数 `GEOFRAME_BLOG`（既定 `0`）で無効にする。写真タブは一覧と AI 検索を
 同居させ、カードを 1 種類にする。設定タブは新しい読み取り専用 API `GET /api/admin/config` で、起動時の設定を
 出どころつきで表示する。サーバーは Rust（axum）、画面は素の JavaScript（classic script）を `build.rs` で埋め込む
-方式を続ける。PR は 3 本（§10）。
+方式を続ける。PR は 3 本（「実装の順番」）。
 
 ## 今の作り（調査結果）
 
@@ -92,7 +92,7 @@
 | JS の分割 | `admin.js`（共通ヘルパ・タブ・状況・設定・起動）と `photos.js`（写真タブ）。classic script 2 本をこの順で読む。定義だけを置き、初期化は `DOMContentLoaded` の `boot()` 1 か所で行う | 1 本: 1,000 行超で読みにくい。ES modules: 試験の `vm` の読み方を変える必要がある |
 | CSS | `admin.css` 1 本に統合。カード・タグ・トースト・チップは共用の名前。場面のまとまりとビューアだけ `.ps-` を付ける | 2 本のまま: `:root` の変数が衝突する |
 | 設定の出どころ | `load()` の流れとは別に、項目の列挙 `EnvItem`（**新設**の enum）と `Overrides` から `sources` を作る | `get` クロージャで記録: `AiConfig::load` が `&dyn Fn` を要求し、引数優先の経路と `ALLOWED_HOSTS` は `get` を通らず、AI 設定不正の早期 return で未読が残る |
-| 設定 API の秘密 | §6 の表を唯一の仕様にし、`EnvItem` の **ワイルドカード無しの `match`** で出し方と値を組み立てる（項目を足すと分類と組み立てを書くまでコンパイルが通らない）。`Config` を `Serialize` しない | `Config` を丸ごと返す、`sources` の名前から機械的に値を出す: 秘密の漏れを型で防げず、名前が増えたときに既定で出てしまう |
+| 設定 API の秘密 | 「安全面」の表を唯一の仕様にし、`EnvItem` の **ワイルドカード無しの `match`** で出し方と値を組み立てる（項目を足すと分類と組み立てを書くまでコンパイルが通らない）。`Config` を `Serialize` しない | `Config` を丸ごと返す、`sources` の名前から機械的に値を出す: 秘密の漏れを型で防げず、名前が増えたときに既定で出てしまう |
 | 設定 API のメソッド | GET だけ（HEAD は既存の管理 API と同じく 403） | HEAD も 200: `site()` の管理 API は全て GET の分岐の中にあり（`server.rs:669` の説明）、例外を作る理由が無い |
 | 今日の送信数 | `GET /api/admin/config` が読み取り接続で `budget::usage` を呼ぶ。取れなければ `null` にして 200 | 状況 API に足す: 設定タブと状況タブで二重に出る |
 | 版・起動時刻 | `CARGO_PKG_VERSION` と、`serve()` で取った `started_at`（`AppState`） | コミットハッシュ: `build.rs` に git を読む処理を足すことになる。今回は見送り |
@@ -132,7 +132,7 @@ flowchart LR
 - `#v-photos`: 検索バー（`#q`、検索ボタン、「AI おすすめ」ボタン、「除外も検索」チェック、`#search-note`）、
   チップ列（`.chip[data-filter]`、件数 `.chip .n`）、ページング、`#cards`（一覧）、`#groups`（検索結果。場面ごとの
   `section.ps-group`）、`#empty`。PR ① では検索バーの代わりに `/ai-search` への一時的なリンクを置く。
-- `#v-config`: §6 の表（§7 で描く）。
+- `#v-config`: 「安全面」の表の項目（描き方は「テスト計画」の `config_render.mjs` と同じ土台）。
 - モーダル: `#modal`（位置指定。今のまま）、`#viewer`（ビューア。`ai-search.html` の `#photo-modal` を移植、`.ps-viewer`）。
 
 ### 読み込みと起動の順序
@@ -174,7 +174,7 @@ const ps = {filter: 'all', page: 1, view: 'list' /* 'list' | 'search' */,
 
 ### カード（`photos.js` の `cardFor(photo, index)`）
 
-`normalizePhoto(raw, origin)` が一覧（`origin='list'`）と検索（`origin='search'`、**§5 の項目追加の後**）の JSON を
+`normalizePhoto(raw, origin)` が一覧（`origin='list'`）と検索（`origin='search'`、**「`GET /api/ai/search` の変更」の項目追加の後**）の JSON を
 共通の形にする:
 
 | 共通の名前 | 一覧（`/api/admin/photos`） | 検索（`/api/ai/search`、追加後） |
@@ -224,7 +224,7 @@ const ps = {filter: 'all', page: 1, view: 'list' /* 'list' | 'search' */,
     ラベルは `/blog-admin` のまま（アクセスログで `/admin` と区別できる。有効か無効かは起動ログの `blog=on/off` で分かる）。
     `security_headers` は `page_target` を自分で計算するので、HTML のヘッダ（`X-Frame-Options` 等）は今までどおり付く。
   - `/static/blog-admin.html`・`/static/js/blog-admin.js`・`/static/blog-admin.css` と、書き出し済みの `/blog_exports/`
-    は配る（§3 の方針。静的な内容で、API が 404 なら画面は何もできない。書き出しは利用者が自分で作ったもの）。
+    は配る（「方針」の表の判断。静的な内容で、API が 404 なら画面は何もできない。書き出しは利用者が自分で作ったもの）。
 - 有効のとき: 今と同じ。
 - `Config.blog: bool`、`log_summary()` に `blog=on/off`、`config.rs` 冒頭の表、`docs/reference/configuration.md` の
   「基本・取り込み」の節に 1 行、`deploy/README.md` に「旅行ブログは `GEOFRAME_BLOG=1` で戻す。**新しいバイナリへ
@@ -287,7 +287,7 @@ const ps = {filter: 'all', page: 1, view: 'list' /* 'list' | 'search' */,
 }
 ```
 
-- `items` は平らな 1 列で、**`EnvItem::ALL`（§5 の `Config` の変更）の全項目**を必ず含む（値が既定でも出す）。分類・説明文・
+- `items` は平らな 1 列で、**`EnvItem::ALL`（「`Config` の変更」）の全項目**を必ず含む（値が既定でも出す）。分類・説明文・
   単位・並びは画面側（`admin.js` の表）が持つ。API は `key`・`value`・`source` と、分類に応じて `state`・`count`・
   `file`・`modified_at` だけ。
 - `value` は `EnvItem` の**ワイルドカード無しの `match`** で `Config` の型つきの値から作る。`exposure()` が `State`・`Count` の
@@ -320,7 +320,7 @@ const ps = {filter: 'all', page: 1, view: 'list' /* 'list' | 'search' */,
 #[serde(rename_all = "lowercase")]
 pub enum Source { Arg, Env, Default }
 
-/// 設定 API での出し方（§6 の表）。
+/// 設定 API での出し方（「安全面」の表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Exposure { Value, State, Count }
 
