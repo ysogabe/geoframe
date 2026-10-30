@@ -54,8 +54,8 @@ GitHubの`refs/pull/*`は所有者でも消せないため、履歴を書き換�
 - [x] 旅程のサンプルの扱いを決めた
 - [x] README・使い方（`docs/USAGE.md`）・LPの説明（認証なし、外部通信と課金、写真とGPSの扱い）が実装と合っている
 - [x] `python3 tools/check_markdown_links.py`と`python3 tools/check_site.py`が通る
-- [ ] リポジトリをPublicにした
-- [ ] Private vulnerability reporting、secret scanning、push protection を有効にした
-- [ ] GitHub Pages（Source = GitHub Actions）を有効にし、`pages.yml`を手動起動して表示を確かめた
+- [x] リポジトリをPublicにした（2026-10-30、所有者が操作）
+- [x] Private vulnerability reporting、secret scanning、push protection を有効にした（2026-10-30）
+- [x] GitHub Pages（Source = GitHub Actions）を有効にし、`pages.yml`を手動起動して表示を確かめた（2026-10-30、<https://ysogabe.github.io/geoframe/>）
 
 公開のあとに見直すこと: ブランチの保護（`main`）と、Actionsの権限・外部からのPRの承認の設定。
