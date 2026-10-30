@@ -1620,7 +1620,7 @@ Pythonの`build_quality_rows`・`rank_group`と同じ。入力は`id`の昇順�
 ### 16.6 `--dry-run`と`geoframe quality-scan`
 
 - **`sync --dry-run`**: 解析（重い）は**実行しない**。件数だけ: `orphans`（消す孤児）`pending`（未解析）`would_analyze`（今回解析する枚数）`remaining`（今回のあとに残る未解析）`would_rebuild`（0／1: 残りが0で、dirtyか今回の解析か孤児の削除がある）。今回解析する写真が無くて再構築になるときは、`rows`（書く行数）と`changed`（今の`photo_quality`から変わる行数。追加・削除・変更。`analyzed_at`・`algorithm`は比べない）も出す。**取り込み済みの本番コピーでは全部0**（`pending=0`、dirty=0）。`--dry-run`の写しでは、先の段（`local_derivatives`・`fetch_derivatives`）が取得するはずの写真に`display`が入るので、それらも`pending`に数えられる（実行でも同じサイクルの`quality`が解析するので、数え方は同じ。ただし`GEOFRAME_QUALITY_PER_CYCLE`を超える分は次のサイクル以降）。Driveの鍵が置かれた環境の`--dry-run`で`pending`が取得待ちの分だけ増えるのは、この読み方による。
-- **`geoframe quality-scan [--dry-run] [--data-dir <dir>]`**（現行の`server.py --quality-scan`の`quality_backfill`）: 孤児を消し、未解析が0になるまで`GEOFRAME_QUALITY_PER_CYCLE`件ずつ解析し、再構築する。`GEOFRAME_INGEST=1`と、`sync`・`organize`と同じガード（検証環境の印・Pythonが非稼働）を通す。`--dry-run`は`would_analyze`が未解析の全部になる。書いたのに未解析が減らない（行が有効にならない）ときは、無限に回さず失敗にする。出力は件数だけ。
+- **`geoframe quality-scan [--dry-run] [--data-dir <dir>]`**（現行の`server.py --quality-scan`の`quality_backfill`）: 孤児を消し、未解析が0になるまで`GEOFRAME_QUALITY_PER_CYCLE`件ずつ解析し、再構築する。`GEOFRAME_INGEST=1`と既存の`catalog.db`が要り、`sync`・`organize`と同じガード（root では断る）と取り込みのロックを通す。`--dry-run`は`would_analyze`が未解析の全部になる。書いたのに未解析が減らない（行が有効にならない）ときは、無限に回さず失敗にする。出力は件数だけ。
 - `geoframe img-probe --quality <画像>…`: 画像から特徴量（SHA-256・pHash・指標）を出す確認用。DB・`DATA_DIR`に触れない。ファイル名は出さない。16.2の計測に使った。
 
 ### 16.7 Pythonとの差（まとめ）
