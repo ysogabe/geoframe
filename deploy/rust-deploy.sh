@@ -7,12 +7,11 @@
 #
 # (1) 検証環境（lxc-geoframe）へ: 手元でビルドして ssh で配る。接続先に既定値は無い（--target か
 #     GEOFRAME_SSH_TARGET で必ず指定）。誤配布を止めるため、接続先に検証環境の印（/etc/geoframe/staging）が
-#     無いか、Python 版（geoframe-server.service）が非稼働と確認できなければ（稼働中・状態を取得できない
-#     場合も）、何も変更せずに拒否する。
+#     無ければ、何も変更せずに拒否する。
 #
 # (2) 本番へ: --production=<期待するホスト名>。ssh を使わず、その機体で root として直接動く（ビルドもしない）。
 #     本番であること・配るものが演習で使ったものそのものであることを確かめ、確かめられなければ何も変更せず
-#     に拒否する（検証環境の印がある機体、ホスト名が違う機体、Python 版が稼働中の機体などには配らない）。
+#     に拒否する（検証環境の印がある機体、ホスト名が違う機体などには配らない）。
 #     本番の手順は docs/rust-migration/cutover.md（T5.3）。
 #
 # 旧 deploy.sh（Python 版。本番機で git を取り込む薄いラッパー。P5b で削除）とは別物で、こちらはバイナリを配る。やること:
@@ -95,9 +94,9 @@ usage() {
   --wait-secs     再起動のあと /healthz を待つ秒数（0〜3600。既定 30。演習で測った値を渡す）。
   --check-only    変更の前の検査だけを行って終わる（ホスト名・検証環境の印が無いこと・commit・作業ツリー・
                   バイナリの sha256・設定のファイル /etc/default/geoframe-rs の有無とモードと所有者・mask の状態・
-                  古い置き場所の unit の本体）。Python 版の状態の検査は除く（Python を止める前に実行するため）。
+                  古い置き場所の unit の本体）。
   --rollback --production=…
-                  配布せず、配置先の .prev（直前のバイナリと unit）へ戻す。Python 版が非稼働であること、
+                  配布せず、配置先の .prev（直前のバイナリと unit）へ戻す。
                   ホスト名などの検査は同じ。
   入れる unit は、その checkout の deploy/geoframe-rs.service。
 
@@ -129,12 +128,9 @@ unit とバイナリ（geoframe.failed へ退避）を撤去する。
   検証環境:
   - 接続先に検証環境の印 /etc/geoframe/staging（通常ファイル）があること。
     検証環境で一度だけ作る:  sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging
-  - geoframe-server.service（Python 版）の ActiveState が inactive/failed と確認できること
-    （未導入は not-found/inactive で通る。LoadState は見ない: unit ファイルが無くても動いている
-    サービスはありうるので、not-found/active も拒否。稼働中・状態を取得できない・空出力・未知の状態・状態の行の欠け／重複も拒否）。
   本番（--production）:
-  - hostname が期待どおり、検証環境の印が無い、geoframe-rs が mask されていない、Python 版が非稼働
-    （--check-only では除く）、checkout の HEAD と作業ツリー、バイナリの sha256、設定のファイルのモード。
+  - hostname が期待どおり、検証環境の印が無い、geoframe-rs が mask されていない、
+    checkout の HEAD と作業ツリー、バイナリの sha256、設定のファイルのモード。
 
 （検証環境）ビルドの前に、web/travel_blog/plans（バイナリへ埋め込まれる旅程）に git 管理外（未追跡・無視）のファイルか
 リンクがあれば、終了コード 1 で止める（--dry-run・--skip-build でも検査する）。そこへ至るパスの途中（web・
@@ -157,7 +153,6 @@ read -r -d '' REMOTE_SCRIPT <<'REMOTE' || true
 set -u -o pipefail
 
 unit_name="geoframe-rs.service"
-py_unit="geoframe-server.service"
 # unit の本体の置き場所。/etc/systemd/system/ には mask のリンク（/dev/null）と drop-in だけを置くので、
 # 本体はここへ入れる（mask は /etc/systemd/system/<unit> にリンクを作るため、そこに本体があると失敗する）。
 # 試験用（モック）に差し替えられる。実機では既定のまま。
@@ -180,8 +175,7 @@ fi
 # etc_unit_dir は古い置き場所。ここに本体（通常のファイル）があると、systemd は /usr/local/lib より優先して読むので断る。
 # 本番の指定（--production）のとき、ラッパーが同じプロセスの環境変数で渡す（ssh は通らないので消えない）。
 # 検証環境（ssh）では空: prod_host=期待するホスト名  min_photos=配布後の /api/v1/photos の件数の下限
-# skip_py=1 で Python 版の状態の検査を除く（--check-only）
-prod_host="${RD_PROD_HOST:-}" min_photos="${RD_MIN_PHOTOS:-}" skip_py="${RD_SKIP_PY:-0}"
+prod_host="${RD_PROD_HOST:-}" min_photos="${RD_MIN_PHOTOS:-}"
 
 mode="" bin="" base="" wait_secs="" stage="" unit_path=""
 # 配布前の状態と、どこまで変更したか（失敗時の復元に使う）
@@ -209,27 +203,6 @@ unit_state() {
     [ -n "$u_load" ] && [ -n "$u_active" ]
 }
 
-# Python 版（geoframe-server.service）が非稼働と確認できること。
-py_check() {
-    # Python 版は『非稼働と確認できた』ときだけ通す。状態を取得できない（systemd に繋がらない・空出力）や
-    # 未知の状態を非稼働とみなして通すと、稼働中の Python 版と二重に書いてしまう。
-    if ! unit_state "$py_unit"; then
-        say "拒否: Python 版（${py_unit}）の状態を取得できない。非稼働と確認できないので何も変更していない"
-        return 4
-    fi
-    # LoadState は見ない。unit ファイルを消して daemon-reload しても、動いているサービスは動き続けうる
-    # （not-found と active は両立する）。未導入の機体は not-found/inactive になり、そのまま通る。
-    case "$u_active" in
-        inactive|failed) return 0 ;;
-        active|activating|reloading|deactivating)
-            say "拒否: Python 版（${py_unit}）が稼働中（${u_active}）。何も変更していない"
-            return 4 ;;
-        *)
-            say "拒否: Python 版（${py_unit}）の状態が不明（${u_active}）。非稼働と確認できないので何も変更していない"
-            return 4 ;;
-    esac
-}
-
 # 古い置き場所（/etc/systemd/system/geoframe-rs.service）に本体のファイルがあれば断る。systemd は /etc を
 # /usr/local/lib より優先して読むので、新しい置き場所へ入れても効かない。mask のリンク（/dev/null）は本体ではない。
 placement_check() {
@@ -248,20 +221,18 @@ preflight() {
     if [ -n "$prod_host" ]; then preflight_production; else preflight_staging; fi
 }
 
-# 検証環境: 印があり、Python 版が非稼働。
+# 検証環境: 印がある。
 preflight_staging() {
     if [ ! -f "$marker" ] || [ -L "$marker" ]; then
         say "拒否: 検証環境の印（${marker}）が無い。ここは検証環境ではない可能性がある。何も変更していない"
         say "      検証環境なら、一度だけ  install -d /etc/geoframe && touch ${marker}  を実行する"
         return 4
     fi
-    py_check || return $?
     placement_check
 }
 
 # 本番（--production）: ホスト名が期待どおり、検証環境の印が無い、geoframe-rs が mask されていない、
-# 古い置き場所に本体が無い、設定のファイル（/etc/default/geoframe-rs）がある（中身は読まない。モードと所有者だけ）、
-# Python 版が非稼働（--check-only では除く）。
+# 古い置き場所に本体が無い、設定のファイル（/etc/default/geoframe-rs）がある（中身は読まない。モードと所有者だけ）。
 preflight_production() {
     local host mode_owner state
     host="$(hostname 2>/dev/null)" || host=""
@@ -289,7 +260,6 @@ preflight_production() {
         say "拒否: 設定のファイル（${env_file}）のモードが 0600 でない、または所有者が root でない。何も変更していない"
         return 4
     fi
-    if [ "$skip_py" != 1 ]; then py_check || return $?; fi
     return 0
 }
 
@@ -694,7 +664,7 @@ remote_run() {
 # （sudo は環境変数を消すが、ここはもう sudo の中なので消えない）。
 run_local() {
     local mode="$1"; shift
-    RD_PROD_HOST="$PROD_HOST" RD_MIN_PHOTOS="$PROD_MIN" RD_SKIP_PY="$CHECK_ONLY" \
+    RD_PROD_HOST="$PROD_HOST" RD_MIN_PHOTOS="$PROD_MIN" \
         RD_UNIT_DIR="$PROD_UNIT_DIR" RD_ETC_UNIT_DIR="$PROD_ETC_UNIT_DIR" RD_MARKER="$PROD_MARKER" \
         RD_ENV_FILE="$PROD_ENV_FILE" RD_ROOT_UID="$PROD_ROOT_UID" \
         bash -c "$REMOTE_SCRIPT" bash "$mode" "$BIN_PATH" "$CHECK_BASE" "$WAIT_SECS" "$@"
@@ -745,11 +715,7 @@ production_main() {
     log "配置先  : ${BIN_PATH}（直前を ${BIN_PATH}.prev へ）、unit: ${PROD_UNIT_DIR}/${UNIT_NAME}"
     log "確認    : ${CHECK_BASE}/healthz, ${CHECK_BASE}/api/v1/photos（件数 >= ${PROD_MIN}。${WAIT_SECS} 秒まで待つ）"
 
-    if [ "$CHECK_ONLY" -eq 1 ]; then
-        log "検査    : ホスト名・検証環境の印・mask・設定のファイル・古い置き場所の unit（--check-only: Python 版の状態は除く）"
-    else
-        log "検査    : ホスト名・検証環境の印・mask・設定のファイル・古い置き場所の unit・Python 版の非稼働"
-    fi
+    log "検査    : ホスト名・検証環境の印・mask・設定のファイル・古い置き場所の unit"
     run_local preflight "" || rc=$?
     case "$rc" in
         0) ;;
@@ -851,14 +817,14 @@ log "commit  : ${COMMIT}${DIRTY}"
 log "binary  : ${LOCAL_BIN#"$REPO_ROOT"/}（sha256 ${SUM:0:16}…, $(stat -c %s "$LOCAL_BIN") bytes）"
 log "配置先  : ${BIN_PATH}（直前を ${BIN_PATH}.prev へ）、unit: /usr/local/lib/systemd/system/${UNIT_NAME}"
 log "確認    : ${CHECK_BASE}/healthz, ${CHECK_BASE}/api/v1/photos（${WAIT_SECS} 秒まで待つ）"
-log "拒否条件: 検証環境の印 /etc/geoframe/staging が無い、geoframe-server.service（Python 版）が非稼働（ActiveState が inactive／failed）と確認できない、古い置き場所（/etc/systemd/system）に unit の本体がある"
+log "拒否条件: 検証環境の印 /etc/geoframe/staging が無い、古い置き場所（/etc/systemd/system）に unit の本体がある"
 if [ "$DRY_RUN" -eq 1 ]; then
     log "*** DRY-RUN: 転送・配置・再起動は行わない ***"
     exit 0
 fi
 
 # --- 3. 誤配布の検査（何も転送・変更しないうちに。リモートの本体でも変更の前に再検査する）---
-log "検査    : 接続先が検証環境か（印と Python 版の稼働）"
+log "検査    : 接続先が検証環境か（印）"
 rc=0
 remote_run preflight "''" || rc=$?
 case "$rc" in
