@@ -1,7 +1,7 @@
 # 管理画面の整え直し（A） 設計
 
 作成日: 2026-10-30。状態: レビュー 2 回（Sol ×2、安全面 Opus ×1）を反映済み。ユーザー承認待ち。PRD は [prd.md](prd.md)。行番号は 2026-10-30 の
-`main`（`a869e71`）のもの。
+`main`（`a869e71`。PR #69 のあとは `guard.rs`・`cli.rs`・`ingest.rs`・`no_python.rs` がずれる）のもの。
 
 ## 概要
 
@@ -58,7 +58,7 @@
 - 版: `CARGO_PKG_VERSION`（`cli.rs:314-317`）。コミットハッシュと起動時刻は持っていない。
 - 試験: `cargo test` が `tests/admin_ui_ai_waits.rs` から `node web/tests/admin_ai_ops_render.mjs` を起動する
   （ローカルで Node が無ければ省略、**CI では Node 必須**。`.github/workflows/test.yml:124-126`）。Node を使う試験は
-  `tests/no_python.rs:83` の許可リストに要る。環境変数つきの起動は `tests/common/mod.rs:397` の `spawn_with_env`。
+  `tests/no_python.rs:79` の許可リストに要る。環境変数つきの起動は `tests/common/mod.rs:397` の `spawn_with_env`。
 
 ### 画面
 
@@ -403,7 +403,7 @@ pub struct Config { /* 既存 */ pub blog: bool, pub sources: BTreeMap<&'static 
 
 ## テスト計画
 
-Node は CI で必須（runner に同梱。`package.json` は置かない）。Node の試験を足すときは `tests/no_python.rs:83` の
+Node は CI で必須（runner に同梱。`package.json` は置かない）。Node の試験を足すときは `tests/no_python.rs:79` の
 許可リストと、`tests/admin_ui_ai_waits.rs` と同じ起動の殻（新設 `tests/admin_ui_photos.rs`）が要る。`document` の
 代用品は **要素の同一性・子の配列・`classList`・`dataset`・`addEventListener`（登録した関数を保持して `click()` で
 呼べる）・`focus()` と `document.activeElement`** を持つ小さな実装に作り直す（`web/tests/fakedom.mjs`、全部の描画試験が
@@ -427,7 +427,7 @@ Node は CI で必須（runner に同梱。`package.json` は置かない）。N
 
 | リスク | 対策 |
 |---|---|
-| `GEOFRAME_BLOG` の既定が `0` なので、**新しいバイナリへ更新した次回の起動から**、環境ファイルを触らなくてもブログが消える | 意図どおり（ユーザーの決定）。設定リファレンスと `deploy/README.md` に「戻すには `=1`」を書く。本番の更新は猶予期間明けにユーザーが判断 |
+| `GEOFRAME_BLOG` の既定が `0` なので、**新しいバイナリへ更新した次回の起動から**、環境ファイルを触らなくてもブログが消える | 意図どおり（ユーザーの決定）。設定リファレンスと `deploy/README.md` に「戻すには `=1`」を書く。本番の更新はユーザーの立ち会いで行う（猶予期間は 2026-10-30 に終了） |
 | 検索 API の写真に項目を足すと `time_anchors` の読み（位置つき写真の全件）が検索ごとに増える | 返す結果の確定後に 1 回だけ、位置の無い写真が含まれるときだけ読む。一覧の `noloc` ページと同じ負荷（6,500 行で数 ms）。合成 DB の試験で、位置ありだけの結果では錨の問い合わせが無いこと（`time_anchors` の呼び出し回数を数える）と、同じ写真の `hint`・`suggest` が一覧と検索で一致することを確かめる |
 | 一覧の全フィルタで `hint` を付けると `all` のページでも `time_anchors` を読む | ページ内に位置なしの行があるときだけ読む |
 | CSS 統合で `.hidden`・`#toast` が衝突 | 場面・ビューアだけ `.ps-`。`#toast` は `admin.css` の 1 つにする |
@@ -436,7 +436,7 @@ Node は CI で必須（runner に同梱。`package.json` は置かない）。N
 | `today_utc` の読みが失敗する（表が無い旧 DB、ロック） | `null` にして 200。設定の表示は DB に依存しない |
 | `sources` の記録漏れ | `EnvItem::ALL` と `tests/env_reference.rs` の名前の集合を単体試験で突き合わせる |
 | PR ② と ③ は PR ① に依存する | ① を戻すには ②③ を先に戻す。各 PR の本文に依存を書く。① 単独は ②③ のマージ前なら戻せる |
-| 本番反映が猶予期間明けまで待つ | PR のマージと本番の更新を分ける（PRD の制約） |
+| 本番反映はマージと別 | PR のマージと本番の更新を分ける（PRD の制約）。更新は `deploy/README.md` §5 の手順で |
 
 ## 実装の順番
 
