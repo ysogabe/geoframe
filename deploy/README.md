@@ -13,8 +13,8 @@ unitとスクリプトの元にし、変更されるデータを`/var/lib/geofra
 > Python版（`geoframe-server.service`・`deploy-pull.sh`・venv）は、P5bで本リポジトリから削除しました
 > （Python版は、P5aのマージのコミット
 > [`a804623`](https://github.com/ysogabe/geoframe/tree/a804623029ad67d415692d08ea3182fd765eb2a4)
-> まで存在します）。本番の戻しの猶予期間のあいだ、本番の`/opt/geoframe`はそのコミットに固定されたままで、
-> Python版へ戻す手順は[`docs/rust-migration/cutover.md`](../docs/rust-migration/cutover.md)にあります。
+> まで存在します）。本番機のPython版のunitとvenvは片付け済みで、Rust版は`geoframe-server.service`の
+> 有無を見ません。Python版へ戻す手順は[`docs/rust-migration/cutover.md`](../docs/rust-migration/cutover.md)（§8・§13.2）にあります。
 
 ## 前提条件
 
@@ -290,12 +290,6 @@ Python版の更新に使っていた`deploy-pull.sh`（fetch・`git reset --hard
 4. **配布**: `sudo /opt/geoframe/deploy/rust-deploy.sh --production=<ホスト名> --bin=<バイナリ> --expect-sha256=<値> --expect-commit=<SHA> --expect-min-photos=<件数>`
    （引数・拒否の条件・終了コードは§7.3。`--check-only`で変更の前の検査だけ先にできる）。検証環境へは、手元から`deploy/rust-deploy.sh`（ssh・ビルドあり）。
 
-> [!IMPORTANT]
-> 本番の切替の直後は、**戻しの猶予期間**です。このあいだ本番の`/opt/geoframe`はP5aのマージのコミットに
-> 固定されていて（`/etc/geoframe/checkout-pinned`）、この手順の2（checkoutの更新）はしません。
-> 期間が終わってからの片付けと、新しいmainへの更新は
-> [`cutover.md` §13](../docs/rust-migration/cutover.md)の手順に従ってください。
-
 ## 6. ロールバック
 
 Rust版の戻しは2段あります。
@@ -314,7 +308,7 @@ Rust版の戻しは2段あります。
   残るので、確実な記録は更新時に控えたSHAです。GitHub側でforce-pushやsquash mergeが行われて
   `origin/main`の履歴から消えたコミットも、ローカルにオブジェクトが残っていれば戻せます。
 
-Python版へ戻す手順（猶予期間中の数分で戻す・片付けのあとに戻す）は、[`cutover.md` §8・§13.2](../docs/rust-migration/cutover.md)にあります。
+Python版へ戻す手順は、[`cutover.md` §8・§13.2](../docs/rust-migration/cutover.md)にあります。
 
 ## 7. Rust 版の unit と配布の道具
 
@@ -338,30 +332,24 @@ Python版へ戻す手順（猶予期間中の数分で戻す・片付けのあ�
 ### 7.1 unit の要点
 
 - バイナリは`/usr/local/bin/geoframe`、`geoframe serve`をそのまま起動する（`app/`も`.venv`も要らない）。
-- **unit の本体は`/usr/local/lib/systemd/system/geoframe-rs.service`に置く**（`rust-deploy.sh`が入れる。猶予期間中の本番では、Python 版も切替の手順で同じ場所へ移してある）。
+- **unit の本体は`/usr/local/lib/systemd/system/geoframe-rs.service`に置く**（`rust-deploy.sh`が入れる）。
   `/etc/systemd/system/`には、`systemctl mask`のリンクと drop-in（`*.service.d/`）だけを置く（mask は`/etc/systemd/system/<unit>`に`/dev/null`へのリンクを作るので、
   そこに本体のファイルがあると失敗する）。`/etc/systemd/system/geoframe-rs.service`に古い本体があると、systemd はそちらを優先するので、`rust-deploy.sh`は断る（先に退避する）。
-- `User=geoframe`、`StateDirectory=geoframe`（`/var/lib/geoframe`）、`EnvironmentFile=-/etc/default/geoframe`（Python 版と共通）のあとに
+- `User=geoframe`、`StateDirectory=geoframe`（`/var/lib/geoframe`）、`EnvironmentFile=-/etc/default/geoframe`（旧 Python 版と共通の設定。無くてもよい）のあとに
   `EnvironmentFile=/etc/default/geoframe-rs`（Rust だけ。`-`無し: 無ければ起動しない）。**`GEOFRAME_DATA_DIR`・`GEOFRAME_DRIVE_KEY`・`TZ`は unit に書かず、`/etc/default/geoframe-rs`に置く**
   （`0600 root:root`。名前と意味だけを文書に書き、値は書かない）。unit と`geoframe-admin.sh`が同じファイルを読むので、同じ DATA_DIR を指す。
   `EnvironmentFile=`は、unit に書いた順に関係なく`Environment=`に勝ち、`EnvironmentFile=`どうしは後に書いたものが勝つ（同じ名前を両方に置かない）。
 - `TimeoutStopSec=90s`: 停止（SIGTERM）はHTTP・同期・AI・キャッシュ保存・runtimeの停止を合わせて受信から60秒の共通期限で打ち切る（[server.md §22](../docs/rust-migration/server.md)）。unitは期限のあとの余裕を含めて90秒待ち、終わらなければSIGKILLする（実行中のAIジョブは次の起動が回収する）。
 - `RestartPreventExitStatus=2`: 設定不正（終了コード 2）は再起動しても直らないので、再起動ループにせず`failed`で止める。
   DB が開けない（終了コード 1）は再起動対象。`LimitNOFILE=4096`（同時の接続 256＋配信 32＋SQLite で 300 前後を使う）。
-- **取り込み（DB への書き込みと同期サイクル）は`GEOFRAME_INGEST=1`のときだけ動く**（既定は`0`）。Python 版と共通の
-  `/etc/default/geoframe`をそのまま使って Rust 版を起動しても DB には書かない。取り込みを使うときは、`/etc/default/geoframe-rs`（検証環境では drop-in でもよい）で`GEOFRAME_INGEST=1`を足す。
-  **書き込みの前に、root で実行している、または`geoframe-server`が非稼働と確認できないときは、書かずに終了コード 2 で断る**（状態を取得できないときだけ終了コード 1 で、unit の`Restart=on-failure`が上限（`StartLimitBurst=`）まで再試行する）。
+- **取り込み（DB への書き込みと同期サイクル）は`GEOFRAME_INGEST=1`のときだけ動く**（既定は`0`）。`GEOFRAME_INGEST`が無ければ、設定のファイルがどうであっても DB には書かない。取り込みを使うときは、`/etc/default/geoframe-rs`（検証環境では drop-in でもよい）で`GEOFRAME_INGEST=1`を足す。
+  **書き込みの前に、root で実行しているときは、書かずに終了コード 2 で断る**（詳細は[server.md §11.1.1](../docs/rust-migration/server.md)）。**root で直接動かさず**、サービスと同じユーザー・設定で動かすには`deploy/geoframe-admin.sh`を使う。
   **書き込み系の CLI（`sync`・`organize`・`quality-scan`・`ai-jobs retry|release-pause|deactivate-space`）は、`DATA_DIR`に`catalog.db`が無ければ作らずに終了コード 2 で断る**（`serve`は`GEOFRAME_INGEST=1`なら空の DB を作る）。
-  検証環境の印は、バイナリの検査としてはもう見ない（`rust-deploy.sh`の検証環境の経路だけが見る）。**root で直接動かさず**、サービスと同じユーザー・設定で動かすには`deploy/geoframe-admin.sh`を使う。
-  `ActiveState`だけを見る: unit ファイルが無くても動いているサービスは断る（詳細は[server.md §11.1.1](../docs/rust-migration/server.md)）。
   有効にすると、`serve`は DB が無ければ新しく作り、スキーマの作成・移行をして、
-  `GEOFRAME_DRIVE_POLL_MIN`（既定 10 分）ごとに同期サイクルを回す（[server.md §11](../docs/rust-migration/server.md)）。**Python 版と同じ`catalog.db`には絶対に向けない**。
-- `Conflicts=geoframe-server.service`と`After=geoframe-server.service`: 取り込みのガードは Python の非稼働を**起動時に 1 回しか**確かめないので、その後に Python が起動されたときは systemd が Rust を止める（Rust を起動すれば Python が止まる）。
-  `Conflicts=`で相手の停止と自分の起動が同じ処理に入ったとき、systemd は順序の向きにかかわらず停止を起動より先に済ませるので、`After=`と合わせて、旧プロセスが終わってから新しいプロセスが起動する。
-  `geoframe-server.service`が無い機体では何も起きない。反映の確認は`systemctl show geoframe-rs -p Conflicts -p After`。止める側は disable でなく mask する（切替の手順は`cutover.md`）。
-- `StartLimitIntervalSec=120`・`StartLimitBurst=5`: Python 版の状態を取得できない（終了コード 1）などの失敗を 5 秒おきに再試行するが、120 秒に 5 回で止める（止まったら`systemctl reset-failed geoframe-rs`のあとで起動する）。
-- 制限（`geoframe-server.service`にはない、Rust 版だけ付けられるもの）: `CapabilityBoundingSet=`（空）、`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
-  （`AF_UNIX`は Python 版の検査の`systemctl show`に要る）、`ProtectKernelTunables`・`ProtectKernelModules`・`ProtectKernelLogs`・`ProtectControlGroups`、`RestrictNamespaces`、
+  `GEOFRAME_DRIVE_POLL_MIN`（既定 10 分）ごとに同期サイクルを回す（[server.md §11](../docs/rust-migration/server.md)）。
+- `StartLimitIntervalSec=120`・`StartLimitBurst=5`: DB が開けないなどの失敗（終了コード 1）を 5 秒おきに再試行するが、120 秒に 5 回で止める（止まったら`systemctl reset-failed geoframe-rs`のあとで起動する）。
+- 制限（Rust 版だけ付けられるもの）: `CapabilityBoundingSet=`（空）、`RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6`
+  （`AF_UNIX`は以前の Python 版の検査の`systemctl show`に要った。今は使わないが、絞るなら検証環境で確かめてから）、`ProtectKernelTunables`・`ProtectKernelModules`・`ProtectKernelLogs`・`ProtectControlGroups`、`RestrictNamespaces`、
   `LockPersonality`、`RestrictSUIDSGID`、`PrivateDevices`、`SystemCallArchitectures=native`、`UMask=0027`（作るファイルは所有者とグループだけが読める）。
 - `ReadOnlyPaths=`は、`photos/`・`drive_key.json`・`models/`だけ（writer が書く`catalog.db`・`derivatives/`は P2 で、旅行ブログの保存・書き出しが書く`travel_blog/`・`blog_exports/`は P3 / T3.6 で外した。`tmp/`・`.cache.json`・`.ingest.lock`は元から対象外）。
   WAL の DB は読み取りでも同じディレクトリに`-shm`/`-wal`を作るので、ディレクトリ自体は書き込み可のまま。
@@ -369,12 +357,12 @@ Python版へ戻す手順（猶予期間中の数分で戻す・片付けのあ�
 - 地図タイル（`/tiles/`）と地名検索（`/api/admin/geocode`）は外向きに通信する。OSM のタイルは`GEOFRAME_TILE_UA`（連絡先入り。未設定なら既定値）、地名検索（地理院・Nominatim）も同じ`GEOFRAME_TILE_UA`を User-Agent に送る（Python は地名検索に固定の`GeoFrame/0.2`）。地理院・OSM のタイル・Nominatim の実通信は、検証環境で確認済み（P3。OSM と Nominatim は連絡先入りの`GEOFRAME_TILE_UA`を足した2026-10-25。[plan.md](../docs/rust-migration/plan.md)・[drive-acceptance.md](../docs/rust-migration/drive-acceptance.md) §6）。タイルのキャッシュ（`tile_cache/`）は`GEOFRAME_INGEST=0`でも書く（`catalog.db`ではなく`DATA_DIR`の下）。
 - 旅行ブログの旅程 JSON（`web/travel_blog/plans/*.json`）は**バイナリに埋め込まれる**（実行時に`web/`を読まない）。旅程を足す・直すのは再ビルド・再配布。再ビルドなしで差し替えるときだけ、`GEOFRAME_BLOG_PLANS_DIR`にディレクトリを与える（Rust だけの項目。そのディレクトリの`*.json`だけを読み、埋め込みは使わない。[server.md §20.1](../docs/rust-migration/server.md)）。下書きと書き出しは`DATA_DIR`の下（`travel_blog/drafts/`・`blog_exports/`）で、読み取りの API（`/api/blog/trips`・`trip`・`candidates`・`draft`）は`GEOFRAME_INGEST=0`でも動く。
   `catalog.db`を別の inode に置き換えたら（バックアップからの復元など）再起動する。
-- 取り込みを 1 回だけ手で動かす: `geoframe sync`（`GEOFRAME_INGEST=1`が要る）。**書かずに計画だけ**見るなら`geoframe sync --dry-run`（行・写真・キャッシュ・ロックを変えず、件数だけを出す。ただし SQLite が読み取りでも作る`catalog.db-wal`・`-shm`はできうる。Python 版の確認も要らない。ガードを通さないのは書かないからで、本番機で実行してよいという意味ではない: 向けるのは検証環境の本番コピー（そのバックアップのコピー）だけで、本番の`catalog.db`には向けない。docs/rust-migration/plan.md §2）。**Drive の鍵（`GEOFRAME_DRIVE_KEY`）がある機体では、`--dry-run`も Drive の一覧を読みに接続する**（原本のダウンロードも書き込みもしない。鍵が無ければ通信しない）。通信を避けたいときは、**存在しない鍵ファイルの絶対パスを`GEOFRAME_DRIVE_KEY`に明示する**（例: `GEOFRAME_DRIVE_KEY=/nonexistent/drive_key.json geoframe sync --dry-run`）。`--data-dir`を変えても鍵の設定は変わらず、`GEOFRAME_DRIVE_KEY`を空文字にしても既定の`drive_key.json`（カレントディレクトリ基準）に戻るので、どちらも通信を避けられない。Driveの一覧が空、または消す行が多すぎる（50件超かつDriveの行の20%超）ときは、削除を保留して件数だけ警告する。意図した削除は`geoframe sync --allow-mass-delete`の1回だけで外れる（`--dry-run`と併せて件数を見られる。`serve`の定期実行では外せない）。位置の推定（`infer`）と地名（`enrich`）の段は、`--dry-run`でも書かず、**`enrich`は地理院に問い合わせない**（件数だけ。`infer`は推定・取り消しの件数、`enrich`は国外・キャッシュで済む・問い合わせるはずの件数）。取り込み済みの本番コピーでは、`infer`の`inferred`・`updated`・`cancelled`と`enrich`の`candidates`がほぼ0になる。実行では`enrich`が地理院へ問い合わせる（1サイクル40件まで、通信を試した行ごとに0.2秒待ち。件数は`queried`＝試した行、`resolved`＝うち確定した行）。通信の障害（切断・時間切れ・429・5xx）は短い待ちで2回まで取り直し、接続できない・429はすぐ段を中断して失敗にする。5xx・時間切れ・切断は、その座標を30分以上飛ばして次へ進み、続けて3つの座標で起きたら中断する。片方のAPI（逆ジオか標高）だけが障害のあいだは、その座標を確定しない（Pythonは片方の応答だけで確定する）。
+- 取り込みを 1 回だけ手で動かす: `geoframe sync`（`GEOFRAME_INGEST=1`が要る）。**書かずに計画だけ**見るなら`geoframe sync --dry-run`（行・写真・キャッシュ・ロックを変えず、件数だけを出す。ただし SQLite が読み取りでも作る`catalog.db-wal`・`-shm`はできうる。ガードを通さないのは書かないからで、本番機で実行してよいという意味ではない: 向けるのは検証環境の本番コピー（そのバックアップのコピー）だけで、本番の`catalog.db`には向けない。docs/rust-migration/plan.md §2）。**Drive の鍵（`GEOFRAME_DRIVE_KEY`）がある機体では、`--dry-run`も Drive の一覧を読みに接続する**（原本のダウンロードも書き込みもしない。鍵が無ければ通信しない）。通信を避けたいときは、**存在しない鍵ファイルの絶対パスを`GEOFRAME_DRIVE_KEY`に明示する**（例: `GEOFRAME_DRIVE_KEY=/nonexistent/drive_key.json geoframe sync --dry-run`）。`--data-dir`を変えても鍵の設定は変わらず、`GEOFRAME_DRIVE_KEY`を空文字にしても既定の`drive_key.json`（カレントディレクトリ基準）に戻るので、どちらも通信を避けられない。Driveの一覧が空、または消す行が多すぎる（50件超かつDriveの行の20%超）ときは、削除を保留して件数だけ警告する。意図した削除は`geoframe sync --allow-mass-delete`の1回だけで外れる（`--dry-run`と併せて件数を見られる。`serve`の定期実行では外せない）。位置の推定（`infer`）と地名（`enrich`）の段は、`--dry-run`でも書かず、**`enrich`は地理院に問い合わせない**（件数だけ。`infer`は推定・取り消しの件数、`enrich`は国外・キャッシュで済む・問い合わせるはずの件数）。取り込み済みの本番コピーでは、`infer`の`inferred`・`updated`・`cancelled`と`enrich`の`candidates`がほぼ0になる。実行では`enrich`が地理院へ問い合わせる（1サイクル40件まで、通信を試した行ごとに0.2秒待ち。件数は`queried`＝試した行、`resolved`＝うち確定した行）。通信の障害（切断・時間切れ・429・5xx）は短い待ちで2回まで取り直し、接続できない・429はすぐ段を中断して失敗にする。5xx・時間切れ・切断は、その座標を30分以上飛ばして次へ進み、続けて3つの座標で起きたら中断する。片方のAPI（逆ジオか標高）だけが障害のあいだは、その座標を確定しない（Pythonは片方の応答だけで確定する）。
 - **Drive の大量削除の保留（T3.7）**: 一覧から消える行が 50 件を超えかつ Drive の行の 20% を超える、または一覧が空のとき、`index_drive`は削除を保留する。**取り込みが有効な`serve`は、保留中だけ`/api/admin/status`の`sync.mass_delete_hold`に件数・理由・開始時刻を出し、管理画面の STATUS タブに赤い注意を出す**（取り込み無効のときと最初のサイクルの前は出ない。記憶はプロセスの中だけで、再起動後の最初のサイクルでまた付く）。意図した削除なら、`serve`を止めて（`.ingest.lock`が二重の取り込みを断る）`geoframe sync --allow-mass-delete`を 1 回実行し、`serve`を起動し直す。**画面からは解除できない**。手動で直した位置（`loc_source='manual'`）は、Drive の`md5`・ローカルの`mtime`が変わっても書き換わらない（T3.7）。詳細は[server.md §10.6](../docs/rust-migration/server.md)。
-- 品質（`quality`の段。孤児の特徴量を消す→未解析を`GEOFRAME_QUALITY_PER_CYCLE`枚（既定は`GEOFRAME_FETCH_PER_CYCLE`）まで解析→未解析が無くて`photo_quality_dirty=1`のときだけ全写真を再グルーピングして`photo_quality`を全差し替え）は同期サイクルの最後に動く。**`--dry-run`は解析せず**、消す孤児・未解析・今回解析する枚数・再構築をするかを件数で出す（取り込み済みの本番コピーでは全部ほぼ0。Python が作った特徴量の行も有効として使うので、Rust に切り替えても全写真を解析し直さない。Python へ切り戻したときの扱い（`algorithm`は結果を作った実装の印で、Python は読まない）は[server.md §16.10](../docs/rust-migration/server.md)。[server.md §16](../docs/rust-migration/server.md)）。一括解析（現行の`server.py --quality-scan`）は`geoframe quality-scan [--dry-run] [--data-dir <dir>]`（`GEOFRAME_INGEST=1`と、`sync`と同じ印・Python の確認が要る）。
+- 品質（`quality`の段。孤児の特徴量を消す→未解析を`GEOFRAME_QUALITY_PER_CYCLE`枚（既定は`GEOFRAME_FETCH_PER_CYCLE`）まで解析→未解析が無くて`photo_quality_dirty=1`のときだけ全写真を再グルーピングして`photo_quality`を全差し替え）は同期サイクルの最後に動く。**`--dry-run`は解析せず**、消す孤児・未解析・今回解析する枚数・再構築をするかを件数で出す（取り込み済みの本番コピーでは全部ほぼ0。Python が作った特徴量の行も有効として使うので、Rust に切り替えても全写真を解析し直さない。Python へ切り戻したときの扱い（`algorithm`は結果を作った実装の印で、Python は読まない）は[server.md §16.10](../docs/rust-migration/server.md)。[server.md §16](../docs/rust-migration/server.md)）。一括解析（現行の`server.py --quality-scan`）は`geoframe quality-scan [--dry-run] [--data-dir <dir>]`（`GEOFRAME_INGEST=1`と既存の`catalog.db`が要る。root では断り、取り込みのロックで`serve`と二重に動かない）。
   外向き HTTPS の確認は`geoframe selfcheck-net`（状態と HTTP ステータスだけを出す）。
 - **AIの背景ワーカー（P4 / T4.1c）**: `GEOFRAME_INGEST=1`かつ`GEOFRAME_AI_ENABLED=1`かつ有効な背景用途（`GEOFRAME_AI_CONFIG`のJSON。[ai-config.md](../docs/rust-migration/ai-config.md)）があるときだけ起動する。**いまの配布バイナリは用途別の処理を登録していない**ので、ジョブを1件も実行しない（実処理はT4.2・T4.4・T4.6）。`INGEST=0`ではAIの表を作らず、回収もしない。AIの設定が不正でも写真の配信・管理は続き、STATUSタブに設定の誤りの固定コードが出る。
-  状態の確認とやり直しは`geoframe ai-jobs`: `status`（読み取りだけ。稼働中でも可。件数と固定の理由コードだけ）、`retry (--kind <種類>|--all)`（失敗だけを再検査。外部へ送らない。検査できない種類は保持して件数だけ報告）、`release-pause (--task <用途>|--all)`（認証・契約の不一致で止まったProvider・用途の明示解除）。`retry`と`release-pause`は書くので、**サービスを止めてから**`GEOFRAME_INGEST=1`で実行する（`sync`と同じ印・Pythonの確認を通す。稼働中は`.ingest.lock`で断る）。
+  状態の確認とやり直しは`geoframe ai-jobs`: `status`（読み取りだけ。稼働中でも可。件数と固定の理由コードだけ）、`retry (--kind <種類>|--all)`（失敗だけを再検査。外部へ送らない。検査できない種類は保持して件数だけ報告）、`release-pause (--task <用途>|--all)`（認証・契約の不一致で止まったProvider・用途の明示解除）。`retry`と`release-pause`は書くので、**サービスを止めてから**`GEOFRAME_INGEST=1`で実行する（`sync`と同じく root では断る。稼働中は`.ingest.lock`で断る）。
 - **待ち受けは`--listen`を書かない**。`GEOFRAME_HOST`/`GEOFRAME_PORT`（既定`0.0.0.0:8080`）で決まる。
 
 ### 7.2 別のポートで動かす（検証）
@@ -407,11 +395,10 @@ bash deploy/geoframe-admin-test.sh     # geoframe-admin.sh をモックの syste
 
 以下の「検証環境の印」は検証環境の経路（`--target`）の話。本番の指定（`--production`）は次の「本番へ」にある。
 
-**検証環境の印（誤配布の防止）。** 変更の前に、接続先に次の 2 つを確かめ、満たさなければ何も変更せずに終了コード 4 で拒否する（`--rollback`も同じ）。
+**検証環境の印（誤配布の防止）。** 変更の前に、接続先に次を確かめ、満たさなければ何も変更せずに終了コード 4 で拒否する（`--rollback`も同じ）。
 
 - 検証環境の印`/etc/geoframe/staging`（通常ファイル。シンボリックリンクは不可）があること。**検証環境で一度だけ作る**（本番機には作らない）:
   `sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging`（`/etc/geoframe/`は本番機にも SSH の鍵置き場として存在するので、ディレクトリではなくファイルを見る）。
-- Python 版の`geoframe-server.service`が稼働中でないこと（稼働中なら本番機の可能性が高い）。`systemctl show`の`ActiveState`が`inactive`／`failed`のときだけ通し、`LoadState`は見ない（unit ファイルが無い`not-found`でも、動いているサービスは動き続けうるので、`not-found/active`も拒否する。Python が入っていない機体は`not-found/inactive`で通る）。`LoadState=`・`ActiveState=`はそれぞれちょうど1行で値が空でないときだけ受け入れ、重複（同じ値の重複も）は拒否する（先頭の行だけを使うと矛盾した出力を取り違えるため）。
 
 検証環境の経路（`--target`）は、印の無い機体には配らない。unit の本体は`/usr/local/lib/systemd/system/geoframe-rs.service`へ入れ、
 `/etc/systemd/system/geoframe-rs.service`に古い本体のファイルがあれば（systemd がそちらを優先するので）何も変更せずに断る（先に退避する。mask のリンクは本体ではないので通る）。
@@ -423,7 +410,7 @@ ssh を使わず、**その機体で root として直接**動く（ビルドも
 モックの試験は、一時コピーの`PROD_*`の行を書き換える（`geoframe-admin-test.sh`と同じ方式）。
 
 ```sh
-# 変更の前の検査だけ（Python 版を止める前に。Python 版の状態の検査は除く）
+# 変更の前の検査だけ
 sudo /opt/geoframe/deploy/rust-deploy.sh --production=<ホスト名> --bin=<バイナリ> --expect-sha256=<値> \
     --expect-commit=<SHA> --expect-min-photos=<件数> --check-only
 # 配布（unit の導入・enable・起動・確認まで。--wait-secs は演習で測った /healthz を待つ秒数）
@@ -436,7 +423,7 @@ sudo /opt/geoframe/deploy/rust-deploy.sh --rollback --production=<ホスト名>
 `--rollback --production`は`.prev`（Rust の直前の版）へ戻す道具で、**初回の配布には`.prev`が無いので、初回の切替の戻しには使えない**（初回の失敗は`rust-deploy.sh`が自分で戻す。Python へ戻す手順は[`cutover.md`](../docs/rust-migration/cutover.md) §8）。
 
 次のどれかなら、何も変更せずに終了コード 4（引数の誤りは 2）で断る: `hostname`が`--production`の値と違う／検証環境の印`/etc/geoframe/staging`がある（検証環境に本番の指定は使えない）／
-Python 版（`geoframe-server.service`）が稼働中か状態を取得できない（`--check-only`では除く）／`geoframe-rs`が mask されている（切り替え直すときは先に`unmask`）／
+`geoframe-rs`が mask されている（切り替え直すときは先に`unmask`）／
 古い置き場所（`/etc/systemd/system/geoframe-rs.service`）に本体がある／`/etc/default/geoframe-rs`が通常のファイルとして無い・モードが`0600`でない・所有者が root でない（中身は読まない）／
 checkout の`HEAD`が`--expect-commit`（40 桁）と違う／追跡下のファイルに変更がある（未追跡の`app/.venv`・`.env`・鍵は見ない。root で動くので、この checkout だけ`safe.directory`にして「dubious ownership」で落ちない）／
 `--bin`の写し（root 所有の一時ディレクトリへ写してから`sha256`を取る。入れるのはその写し）が`--expect-sha256`と違う。
@@ -472,8 +459,8 @@ sudo install -m 0644 /dev/null /etc/default/geoframe # 出力に影響する設�
 - `status=203/EXEC`（`geoframe-rs`）: `/usr/local/bin/geoframe`が無い、または実行ビットが無い。`rust-deploy.sh`で入れ直す（§7.3）。
   `geoframe-backup.service`が`203/EXEC`なら、`/opt/geoframe/deploy/backup-catalog.sh`の実行ビットが消えている（checkoutの一律`chmod`をしない。§5）。
 - `geoframe-rs`が`failed`で止まる: `journalctl -u geoframe-rs.service`で理由を見る。終了コード2は再起動しても直らない
-  ものです（設定の不正、rootでの実行、Python版（`geoframe-server`）の稼働中。`RestartPreventExitStatus=2`で止まる）。
-  終了コード1（DBが開けない、Python版の状態を取得できない）は再起動の対象で、`StartLimitBurst=`まで再試行して止まります。
+  ものです（設定の不正、rootでの実行。`RestartPreventExitStatus=2`で止まる）。
+  終了コード1（DBが開けない）は再起動の対象で、`StartLimitBurst=`まで再試行して止まります。
   直したあとは`systemctl reset-failed geoframe-rs`のあとで起動します（§7.1）。`/etc/default/geoframe-rs`が無いと
   unitは起動しません（§2）。
 - `fatal: detected dubious ownership in repository at '/opt/geoframe'`: リポジトリの所有者と

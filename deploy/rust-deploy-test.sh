@@ -7,7 +7,7 @@
 # 見ること: 誤配布の拒否、成功、各工程（再起動・daemon-reload・enable・unit の導入・確認）の失敗からの
 # 復元、復元の mv の失敗（手作業の手順が出て終了コード 3）、初回の配布の失敗、中断（SIGTERM）。
 # [12] 以降は本番の指定（--production。ssh なし・その機体で直接）: 一時の git リポジトリにスクリプトと unit を
-# 写して走らせ、ホスト名・印・Python 版の稼働・mask・sha256・commit・作業ツリー・件数の下限・--check-only・
+# 写して走らせ、ホスト名・印・mask・sha256・commit・作業ツリー・件数の下限・--check-only・
 # --rollback・unit の置き場所・古い置き場所の本体・数の引数の上限・環境変数で検査を外せないことを確かめる。
 # 本番の経路は GEOFRAME_RS_* を読まない（あれば断る）ので、配置先・確認の URL・印・設定のファイル・root の UID は、
 # 一時コピーの中の固定値（PROD_*）を書き換えて向ける（geoframe-admin-test.sh と同じ方式。root の UID は
@@ -39,23 +39,21 @@ bump() { # bump <名前>: 制御ファイルの回数が残っていれば1減�
     n=$(cat "$f"); [ "$n" -gt 0 ] || return 1
     echo $((n - 1)) > "$f"; return 0
 }
-# 状態の表示。rs_state / py_state に任意の ActiveState を置ける（active のファイルがあれば active）
+# 状態の表示。rs_state に任意の ActiveState を置ける（active のファイルがあれば active）
 rs_active() { if [ -f "$S/active" ]; then echo active; elif [ -f "$S/rs_state" ]; then cat "$S/rs_state"; else echo inactive; fi; }
-py_active() { if [ -f "$S/py_active" ]; then echo active; elif [ -f "$S/py_state" ]; then cat "$S/py_state"; else echo inactive; fi; }
 cmd="" unit=""
 for a in "$@"; do case "$a" in -*) ;; *) if [ -z "$cmd" ]; then cmd="$a"; else unit="$a"; fi ;; esac; done
 echo "$cmd $unit" >> "$MOCK_DIR/calls.log"
 case "$cmd" in
 is-active)
-    if [ "$unit" = geoframe-server.service ]; then st="$(py_active)"; else st="$(rs_active)"; fi
+    st="$(rs_active)"
     echo "$st"; [ "$st" = active ] ;;
 show)
-    # ctl/py_show, ctl/rs_show: fail（systemd へ繋がらない: 標準エラーだけ・終了コード1）| empty（空出力・終了コード0）|
+    # ctl/rs_show: fail（systemd へ繋がらない: 標準エラーだけ・終了コード1）| empty（空出力・終了コード0）|
     #   dup_conflict（ActiveState が inactive のあとに active）| dup_same（ActiveState が inactive で2行）|
     #   dup_load（LoadState が2行）
-    if [ "$unit" = geoframe-server.service ]; then tag=py; else tag=rs; fi
-    if [ -f "$C/${tag}_show" ]; then
-        case "$(cat "$C/${tag}_show")" in
+    if [ -f "$C/rs_show" ]; then
+        case "$(cat "$C/rs_show")" in
             fail)  echo "Failed to connect to bus: No such file or directory" >&2; exit 1 ;;
             empty) exit 0 ;;
             dup_conflict) printf 'LoadState=loaded\nActiveState=inactive\nActiveState=active\n'; exit 0 ;;
@@ -63,16 +61,11 @@ show)
             dup_load)     printf 'LoadState=loaded\nLoadState=loaded\nActiveState=inactive\n'; exit 0 ;;
         esac
     fi
-    if [ "$tag" = py ]; then
-        load=loaded; [ -f "$S/py_load" ] && load="$(cat "$S/py_load")"
-        act="$(py_active)"
-    else
-        if [ -f "$MOCK_UNIT" ]; then load=loaded; else load=not-found; fi
-        act="$(rs_active)"
-    fi
+    if [ -f "$MOCK_UNIT" ]; then load=loaded; else load=not-found; fi
+    act="$(rs_active)"
     printf 'ActiveState=%s\nLoadState=%s\n' "$act" "$load"; exit 0 ;;
 is-enabled)
-    if [ "$unit" != geoframe-server.service ] && [ -f "$S/masked" ]; then echo masked; exit 1; fi
+    if [ -f "$S/masked" ]; then echo masked; exit 1; fi
     if [ -f "$S/enabled" ]; then echo enabled; exit 0; fi
     if [ -f "$MOCK_UNIT" ]; then echo disabled; exit 1; fi
     exit 1 ;;
@@ -188,45 +181,12 @@ echo "[1] 誤配布の防止"
 setup; rm -f "$GEOFRAME_RS_TEST_MARKER"; run deploy
 expect "印が無ければ拒否（終了コード4）" test "$rc" = 4
 expect "拒否したとき何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a ! -e "$MOCK_BIN.new"
-setup; touch "$T/env/state/py_active"; run deploy
-expect "Python 版が稼働中なら拒否（終了コード4）" test "$rc" = 4
-expect "拒否したとき何も変えていない（Python 版）" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev"
 setup; ln -s /etc/hostname "$T/env/etc/staging2"; rm "$GEOFRAME_RS_TEST_MARKER"; ln -s "$T/env/etc/staging2" "$GEOFRAME_RS_TEST_MARKER"; run deploy
 expect "印がシンボリックリンクなら拒否" test "$rc" = 4
 setup; rm -f "$GEOFRAME_RS_TEST_MARKER"; run rollback
 expect "rollback も印が無ければ拒否" test "$rc" = 4
 setup; run preflight
 expect "preflight は印があれば成功" test "$rc" = 0
-# Python 版の状態を取得できないときは、非稼働とみなさず拒否する（inactive/failed か、unit が無いと確認できたときだけ通す）
-setup; echo fail > "$T/env/ctl/py_show"; run deploy
-expect "Python 版の状態取得が失敗（systemd に繋がらない）なら拒否（終了コード4）" test "$rc" = 4
-expect "状態取得の失敗で拒否したとき何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a ! -e "$MOCK_BIN.new"
-setup; echo empty > "$T/env/ctl/py_show"; run deploy
-expect "Python 版の状態が空出力なら拒否（終了コード4）" test "$rc" = 4
-for dup in dup_conflict dup_same dup_load; do
-    setup; echo "$dup" > "$T/env/ctl/py_show"; run deploy
-    expect "Python 版の状態行が重複（$dup）なら拒否（終了コード4）" test "$rc" = 4
-    expect "重複（$dup）で拒否したとき何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a ! -e "$MOCK_BIN.new"
-    setup; echo "$dup" > "$T/env/ctl/py_show"; run rollback
-    expect "rollback も状態行が重複（$dup）なら拒否（終了コード4）" test "$rc" = 4
-done
-setup; echo maintenance > "$T/env/state/py_state"; run deploy
-expect "Python 版の状態が未知の値なら拒否（終了コード4）" test "$rc" = 4
-setup; echo activating > "$T/env/state/py_state"; run deploy
-expect "Python 版が activating なら拒否（終了コード4）" test "$rc" = 4
-setup; echo fail > "$T/env/ctl/py_show"; run rollback
-expect "rollback も状態取得の失敗なら拒否（終了コード4）" test "$rc" = 4
-setup; echo failed > "$T/env/state/py_state"; run preflight
-expect "Python 版が failed なら通す" test "$rc" = 0
-setup; echo not-found > "$T/env/state/py_load"; run preflight
-expect "Python 版が未導入（not-found/inactive）なら通す" test "$rc" = 0
-setup; echo not-found > "$T/env/state/py_load"; touch "$T/env/state/py_active"; run deploy
-expect "Python 版の unit ファイルが無くても稼働中（not-found/active）なら拒否（終了コード4）" test "$rc" = 4
-expect "not-found/active で拒否したとき何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev" -a ! -e "$MOCK_BIN.new"
-setup; echo not-found > "$T/env/state/py_load"; echo deactivating > "$T/env/state/py_state"; run preflight
-expect "not-found/deactivating も拒否（終了コード4）" test "$rc" = 4
-setup; echo not-found > "$T/env/state/py_load"; touch "$T/env/state/py_active"; run rollback
-expect "rollback も not-found/active なら拒否（終了コード4）" test "$rc" = 4
 
 echo "[2] 成功"
 setup; run deploy
@@ -370,10 +330,6 @@ setup; rm -f "$GEOFRAME_RS_TEST_MARKER"; wrap
 expect "ラッパー: 事前検査の拒否は終了コード4のまま" test "$rc" = 4
 expect "ラッパー: 拒否されたら何も転送しない" bash -c '! grep -q scp "$1"' _ "$T_LOG"
 expect "ラッパー: 何も変えていない" test "$(content "$MOCK_BIN")" = OLD-BIN -a ! -e "$MOCK_BIN.prev"
-setup; touch "$T/env/state/py_active"; wrap
-expect "ラッパー: Python 版が稼働中なら4" test "$rc" = 4
-setup; echo fail > "$T/env/ctl/py_show"; wrap
-expect "ラッパー: Python 版の状態を確認できないなら4" test "$rc" = 4
 setup; wrap
 expect "ラッパー: 成功は0" test "$rc" = 0 -a "$(content "$MOCK_BIN")" = NEW-BIN
 setup; echo 1 > "$T/env/ctl/fail_restart"; wrap
@@ -497,7 +453,7 @@ echo "[11b] unit の本番向けの中身（T5.1）"
 U="$HERE/geoframe-rs.service"
 expect "unit: 本体の置き場所は /usr/local/lib/systemd/system と書いてある" grep -q '/usr/local/lib/systemd/system/geoframe-rs.service' "$U"
 expect "unit: 『検証環境専用』『本番機にはこの unit を入れない』と書いていない" bash -c '! grep -q -e 検証環境専用 -e "本番機にはこの unit を入れない" -e "印が無い" "$1"' _ "$U"
-expect "unit: After= に geoframe-server.service を足し、Conflicts= も残す" bash -c 'grep -qE "^After=.*geoframe-server.service" "$1" && grep -q "^Conflicts=geoframe-server.service" "$1"' _ "$U"
+expect "unit: After= は network-online.target だけで、geoframe-server.service への依存（Conflicts=・After=）を持たない" bash -c 'grep -q "^After=network-online.target$" "$1" && ! grep -qE "^(After|Conflicts|Requires|Wants|Before)=.*geoframe-server" "$1"' _ "$U"
 expect "unit: Environment= を持たない（DATA_DIR・鍵・TZ は設定のファイルへ）" bash -c '! grep -qE "^Environment=" "$1"' _ "$U"
 expect "unit: EnvironmentFile= は共通（- 付き）のあとに geoframe-rs（- 無し）" bash -c 'test "$(grep -E "^EnvironmentFile=" "$1")" = "EnvironmentFile=-/etc/default/geoframe
 EnvironmentFile=/etc/default/geoframe-rs"' _ "$U"
@@ -612,14 +568,6 @@ expect "本番: ホスト名の違いで何も変えていない" nothing_change
 setup; prod
 expect "本番: 検証環境の印があれば拒否（終了コード4）" test "$rc" = 4
 expect "本番: 印があるとき何も変えていない" nothing_changed_args
-setup; no_prod_marker; touch "$T/env/state/py_active"; prod
-expect "本番: Python 版が稼働中なら拒否（終了コード4）" test "$rc" = 4
-expect "本番: Python 稼働中で何も変えていない" nothing_changed_args
-setup; no_prod_marker; echo fail > "$T/env/ctl/py_show"; prod
-expect "本番: Python 版の状態を取得できなければ拒否（終了コード4）" test "$rc" = 4
-expect "本番: 状態不明で何も変えていない" nothing_changed_args
-setup; no_prod_marker; echo maintenance > "$T/env/state/py_state"; prod
-expect "本番: Python 版の状態が未知なら拒否（終了コード4）" test "$rc" = 4
 setup; no_prod_marker; touch "$T/env/state/masked"; prod
 expect "本番: geoframe-rs が mask されていれば拒否（終了コード4）" test "$rc" = 4
 expect "本番: mask で何も変えていない" nothing_changed_args
@@ -701,8 +649,8 @@ setup; no_prod_marker; ln -s /dev/null "$GEOFRAME_RS_TEST_ETC_UNIT_DIR/geoframe-
 expect "本番: 古い置き場所が mask のリンクなら本体ではないので通る" test "$rc" = 0
 
 # --check-only
-setup; no_prod_marker; touch "$T/env/state/py_active"; prod --check-only
-expect "本番: --check-only は Python 版が稼働中でも検査だけ通る（終了コード0）" test "$rc" = 0
+setup; no_prod_marker; prod --check-only
+expect "本番: --check-only は検査だけ通る（終了コード0）" test "$rc" = 0
 expect "本番: --check-only は何も変えず、再起動もしない" nothing_changed_args
 expect "本番: --check-only は一時の写しだけ作り、配置先に触れない" bash -c '! ls "$1"/geoframe.new "$1"/geoframe.prev 2>/dev/null' _ "$T/env/bin"
 setup; no_prod_marker; MOCK_HOSTNAME=another-host prod --check-only
@@ -724,8 +672,6 @@ expect "本番: --rollback --production は旧版へ戻す（終了コード0）
 expect "本番: --rollback は ssh を使わない" no_ssh
 setup; no_prod_marker; prod; MOCK_HOSTNAME=another-host prod_rollback
 expect "本番: --rollback もホスト名が違えば拒否（終了コード4・新版のまま）" test "$rc" = 4 -a "$(content "$MOCK_BIN")" = NEW-BIN
-setup; no_prod_marker; prod; touch "$T/env/state/py_active"; prod_rollback
-expect "本番: --rollback も Python 版が稼働中なら拒否（終了コード4）" test "$rc" = 4 -a "$(content "$MOCK_BIN")" = NEW-BIN
 setup; prod_rollback
 expect "本番: --rollback も検証環境の印があれば拒否（終了コード4）" test "$rc" = 4
 setup; no_prod_marker; touch "$T/env/state/masked"; prod_rollback

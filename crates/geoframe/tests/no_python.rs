@@ -48,10 +48,6 @@ use std::path::{Path, PathBuf};
 /// 許可する起動（`crates` からの相対パス、起動するもの、件数）。起動するものは、文字列なら `Lit`、
 /// 文字列でない式のままなら `Expr`（字句を詰めて並べた形）。
 const ALLOWED: &[(&str, Exe, usize)] = &[
-    // 本番の書き込みの前に、Python 版のサービスの稼働を `systemctl show` で確かめる（読み取りだけ）。
-    ("geoframe/src/guard.rs", Exe::Expr("path"), 1),
-    // 試験用の「状態を返す」代役。引数の `-c` の文字列は試験の中の固定の短い文だけ。
-    ("geoframe/src/guard.rs", Exe::Lit("/bin/sh"), 1),
     // 名前付きパイプ（FIFO）を作って「通常ファイルでない」ものの扱いを確かめる。
     ("geoframe/src/cache.rs", Exe::Lit("mkfifo"), 1),
     ("geoframe/src/cli.rs", Exe::Lit("mkfifo"), 1),
@@ -1015,24 +1011,6 @@ const LITERAL_ALLOWED: &[(&str, Allow)] = &[
     (
         "geoframe/src/ai/location_suggest/runtime/tests.rs",
         Allow::Exact("UPDATE photo_loc_suggestions SET place_name='synthetic Python rewrite'"),
-    ),
-    // 起動の安全確認の説明文（Python 版のサービスが稼働中のとき書き込みを断る理由）。
-    (
-        "geoframe/src/guard.rs",
-        Allow::Exact(
-            "Python 版（{PYTHON_UNIT}）が非稼働と確認できない（状態: {state}）ので、書き込みを始めません。二重に書くと Python のダウンロードと .cache.json を壊します",
-        ),
-    ),
-    (
-        "geoframe/src/guard.rs",
-        Allow::Exact(
-            "Python 版（{PYTHON_UNIT}）の状態を取得できない（{why}）ので、書き込みを始めません。非稼働と確認できないものは通しません",
-        ),
-    ),
-    // `geoframe` の使い方の表示（Python 版の稼働確認の説明を含む。長いので始まりだけで照合する）。
-    (
-        "geoframe/src/cli.rs",
-        Allow::Starts("使い方:\n  geoframe --version"),
     ),
     // Python 版との比較の試験の、失敗時の説明文・表示名（Python は比べる相手の名前で、起動しない）。
     (

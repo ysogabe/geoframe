@@ -75,8 +75,7 @@ const USAGE: &str = "\
   geoframe serve [--listen <addr:port>] [--data-dir <dir>]
                                         サーバーを起動する（DB は <dir>/catalog.db）。GEOFRAME_INGEST=1 のときだけ
                                         取り込み（DB への書き込みと同期サイクル）も動かす。それ以外は読み取り専用。
-                                        書く前に、root で実行している・geoframe-server（Python 版）が稼働中なら、何も書かず
-                                        終了コード 2 で断る（geoframe-server の状態を取得できないときは終了コード 1）。
+                                        書く前に、root で実行しているなら、何も書かず終了コード 2 で断る。
                                         取り込みが無効でも、root では起動しない（終了コード 2）
                                         設定は 起動引数 > 環境変数 GEOFRAME_* > 既定値 の順
                                         （詳細は docs/rust-migration/server.md）
@@ -98,7 +97,7 @@ const USAGE: &str = "\
                                         （serve の定期実行では外せない。--dry-run と併せれば、外した場合の件数を見られる）。
                                         --dry-run はガードを通さないが、本番機で実行してよいという意味ではない
                                         （検証環境の本番コピーに向ける。本番の DB には向けない）。
-                                        書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ root・Python の確認を通す。DATA_DIR に catalog.db が
+                                        書く実行は GEOFRAME_INGEST=1 が要り、serve と同じ root の確認を通す。DATA_DIR に catalog.db が
                                         無ければ、作らずに終了コード 2 で断る（書き込み系の CLI は全て同じ）
   geoframe organize [--dry-run] [--data-dir <dir>]
                                         位置の無いローカル写真を DATA_DIR/_excluded/no_gps/ へ移し、行を削除する
@@ -129,7 +128,7 @@ const USAGE: &str = "\
                                         retry・release-pause・deactivate-space は書くので、サービスを止めてから実行する
                                         （稼働中は .ingest.lock により断る）。GEOFRAME_INGEST=1 と、sync と同じ確認が要る。
                                         サービスと同じユーザー・設定で動かすには deploy/geoframe-admin.sh を使う（root で直接は動かさない）
-終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または書き込みを断った（root での実行・Python 版が稼働中・DB が無い）";
+終了コード: 0 成功 / 1 失敗 / 2 引数・設定の誤り、または書き込みを断った（root での実行・DB が無い）";
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -675,7 +674,7 @@ fn sync_dry_run(config: &Config, allow_mass_delete: bool) -> ExitCode {
     exit_for(&report)
 }
 
-/// 実際に 1 回書く。`GEOFRAME_INGEST=1` が要る（Python 版と共通の設定で、うっかり書かないため）。
+/// 実際に 1 回書く。`GEOFRAME_INGEST=1` が要る（うっかり書かないため）。
 fn sync_apply(config: &Config, allow_mass_delete: bool) -> ExitCode {
     if !config.ingest {
         eprintln!(
@@ -1187,12 +1186,11 @@ fn ai_jobs_release_pause(config: &Config, ingest: &Ingest, target: PauseTarget) 
 
 /// 取り込みを始められなかったときの終了コード。ガードが断ったのは 2（設定の誤りと同じ扱いで、
 /// unit の `RestartPreventExitStatus=2` により再起動ループにしない。再起動しても直らない）。DB が無い
-/// （書き込み系の CLI）も 2。ただし Python 版の状態を取得できないだけのときは 1: 一時的な失敗でありうる
-/// ので、unit の `Restart=on-failure` で再試行させる（上限は `StartLimitIntervalSec=`・`StartLimitBurst=`）。
+/// （書き込み系の CLI）も 2。
 fn exit_for_ingest_error(e: &crate::ingest::IngestError) -> ExitCode {
     use crate::ingest::IngestError;
     match e {
-        IngestError::Refused(guard) if guard.is_permanent() => ExitCode::from(2),
+        IngestError::Refused(_) => ExitCode::from(2),
         IngestError::NoDatabase(_) => ExitCode::from(2),
         _ => ExitCode::FAILURE,
     }

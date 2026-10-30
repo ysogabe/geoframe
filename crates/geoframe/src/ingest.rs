@@ -2,8 +2,7 @@
 //!
 //! # 有効にする条件
 //!
-//! **`GEOFRAME_INGEST=1` のときだけ**動く（既定は無効）。Python 版（`geoframe-server`）と共通の
-//! `/etc/default/geoframe` をそのまま使って Rust を起動しても DB に書かない。無効のときの `serve` は
+//! **`GEOFRAME_INGEST=1` のときだけ**動く（既定は無効）。無効のときの `serve` は
 //! P1 と同じ読み取り専用で、DB が無ければ起動を断る。
 //!
 //! # 起動の順序（有効のとき）
@@ -11,13 +10,12 @@
 //! 現行は `load_cache` → `purge_cache_legacy` → `db()`（スキーマ・移行）→ `tile_cache_prune`
 //! → `prepare_tmp_dir`。Rust は次の順にする（失敗したら起動しない）。
 //!
-//! 0. **ガード**（[`crate::guard`]）。root で実行している・Python 版が非稼働と確認できないなら、何も
-//!    書かずに断る（終了コード 2。状態を取得できないときだけ 1）。データ置き場の作成より前。
+//! 0. **ガード**（[`crate::guard`]）。root で実行しているなら、何も
+//!    書かずに断る（終了コード 2）。データ置き場の作成より前。
 //!    書き込み系の CLI（[`start_existing`]）は、さらに DB（`catalog.db`）が無ければ作らずに断る（終了コード 2）。
 //!    `serve` は無ければ作る（次の 2）。
 //! 1. データ置き場を用意し、`DATA_DIR/.ingest.lock` を排他で取る。別の `geoframe`（`serve` か `sync`）が
-//!    すでに取り込み中なら断る。**Python との二重書き込みは防げない**（Python はこのロックを見ない）
-//!    ので、Python が動いている間は取り込まない（0 のガードが、起動時に 1 回だけ確かめる）。
+//!    すでに取り込み中なら断る。
 //! 2. writer を開く。DB が無ければ**新しく作る**（`schema::migrate` が空から作る）。作ったときは warn
 //!    で知らせる（`GEOFRAME_DATA_DIR` の誤りで空の DB を静かに作ってしまうのを見つけるため）。
 //! 3. スキーマの作成・移行（[`crate::schema::migrate`]）と、P4 の AI 表（ジョブ・送信予算・Provider 停止・起動 ID）の追加（[`crate::ai::migrate`]）。
@@ -332,8 +330,7 @@ fn leftovers(dir: &Path) -> Vec<std::path::PathBuf> {
 /// 対象は `derivatives/` の**直下の通常ファイルだけ**（名前は [`crate::datadir::check_file_name`] を通り、
 /// `.part` で終わるもの）。`derivatives` がシンボリックリンクなら何もしない（リンク先の別の場所を
 /// 掃除しない）。ディレクトリ・シンボリックリンクは対象にしない（`DirEntry::file_type` はリンクを
-/// 辿らない）。取り込みのロックを持つ間は、他に書きかけを作るプロセスがいない（Python は P5 までガードが
-/// 止まっていることを確かめる）ので、残っている `.part` はすべて書きかけの残骸。
+/// 辿らない）。取り込みのロックを持つ間は、他に書きかけを作るプロセスがいないので、残っている `.part` はすべて書きかけの残骸。
 fn part_leftovers(data_dir: &Path) -> Vec<std::path::PathBuf> {
     let dir = data_dir.join("derivatives");
     if !sweepable_dirs(data_dir).dirs.contains(&dir) {
@@ -437,7 +434,7 @@ mod tests {
     use crate::config::Overrides;
     use crate::testutil::TempDir;
 
-    /// 合成の置き場で試すので、ガード（検証環境の印・Python の状態）は通す。
+    /// 合成の置き場で試すので、ガード（root の検査）は通す。
     fn start(config: &Config) -> Result<Ingest, IngestError> {
         super::start_with(config, &Guard::skip())
     }
@@ -944,11 +941,11 @@ mod tests {
             data_dir: Some(root.clone()),
         };
         let config = Config::load(|_| None, &overrides).unwrap();
-        // Python 版が稼働中と答える（必ず断る）ガード。置き場そのものが無い状態から
+        // root と答える（必ず断る）ガード。置き場そのものが無い状態から
         let guard = Guard::refusing_for_test();
         assert!(matches!(
             super::start_with(&config, &guard),
-            Err(IngestError::Refused(GuardError::PythonNotStopped(_)))
+            Err(IngestError::Refused(GuardError::Root))
         ));
         assert!(!root.exists());
         // 既存の置き場でも、DB・キャッシュ・tmp・derivatives・ロックは作られず、中身も変わらない

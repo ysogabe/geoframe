@@ -22,9 +22,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// 本体のコードにあるが、試験のためだけの名前（文書に載せない）。`guard.rs` の、デバッグビルドだけの注入口
-/// （実行ユーザーと Python 版の状態を試験から与える）。試験のファイルの中だけで使う名前（子プロセスの目印など）は、
+/// （実行ユーザーを試験から与える）。試験のファイルの中だけで使う名前（子プロセスの目印など）は、
 /// 本体を走査しないのでここに書かなくてよい。
-const TEST_ONLY: &[&str] = &["GEOFRAME_TEST_EUID", "GEOFRAME_TEST_PYTHON_STATE"];
+const TEST_ONLY: &[&str] = &["GEOFRAME_TEST_EUID"];
 
 const SECTION_RUST: &str = "## Rust が読む環境変数";
 const SECTION_OLD_ONLY: &str = "## 旧版のみ（削除済み。Rust は読まない）";

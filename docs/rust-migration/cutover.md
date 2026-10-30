@@ -1531,6 +1531,8 @@ systemctl status geoframe-server 2>&1 | head -3    # Unit ... could not be found
 3. Python 版の unit（そのコミットの `deploy/geoframe-server.service`）を `/usr/local/lib/systemd/system/` に置き、§3.3 の drop-in と `/etc/default/geoframe-py-rollback` を作り直す（AI は無効）。固定の印も置き直す。
 4. §8（Rust を止めて mask → Python を unmask して起動 → 確かめる）。
 
+この版以降の Rust には、`Conflicts=geoframe-server.service` と Python の非稼働を確かめるガードが無い。Python と Rust が同時に動いても止められないので、§8 のとおり geoframe-rs を止めて mask してから Python を起動すること。
+
 ## 14. 記録
 
 `p5-acceptance.md`（T5.4 の演習と T5.5 の本番）に書く。**リポジトリ・文書・PR には、件数・ハッシュ・時間・commit・sha256 だけを書く。**
