@@ -62,6 +62,14 @@ class CheckSiteTest(unittest.TestCase):
         self.assertIn("許可していない外部ホスト", joined)
         self.assertIn("CSSが外部を読んでいます", joined)
 
+    def test_allowed_navigation_host_cannot_supply_assets(self):
+        for asset in [
+            '<link rel="stylesheet" href="https://github.com/x/a.css">',
+            '<img src="https://github.com/x/a.png" alt="example">',
+        ]:
+            with self.subTest(asset=asset):
+                self.assertTrue(any("外部資産" in e for e in self.errors(body=asset)))
+
     def test_escape_and_data_files_are_rejected(self):
         errs = self.errors(body='<a href="../README.md">r</a>', extra={"photos.json": "{}"})
         joined = "\n".join(errs)

@@ -37,8 +37,9 @@ Rustの単一バイナリへの移行（[実装記録](docs/rust-migration/plan.
 （[公開準備チェックリスト](docs/public-release-checklist.md)）。次のことに注意してください。
 
 - **認証がありません。** 複数人で使う用途、インターネットへ直接出す用途には向きません。
-- **外部へ通信するのは、設定した機能だけです。** 何も設定しなければ、写真はこの機械の外へ出ません。
+- **取り込み中や管理画面の操作時には、外部通信が発生します。** 写真自体のクラウドAI送信は任意ですが、座標の自動送信にも注意してください。
   - Google Driveの取り込み: `GEOFRAME_DRIVE_KEY`にサービスアカウントの鍵を置いたときだけ、Driveの一覧と原本を読みます。
+  - 自動の地名・標高補完: `GEOFRAME_INGEST=1`で取り込むと、国内の未処理座標を地理院の逆ジオコーダ・標高APIへ送ります。Drive・AIの設定や管理画面の操作は不要です。
   - 地図と地名検索: 管理画面の位置修正で、OpenStreetMapと地理院のタイル、地理院とNominatimの地名検索へ通信します（座標・検索語が上流へ渡ります）。
   - AI: `GEOFRAME_AI_CONFIG`を設定しない限り推論は始まりません。クラウドを許した用途では、縮小してEXIFを除いた写真が外部のAPI（Google CloudのGemini）へ送られ、**課金が発生します**。用途ごとの1周期あたりの上限は設定できます（[設定リファレンス](docs/reference/configuration.md)）。
 - カタログ（`catalog.db`）には、手動で直したGPSやお気に入りが入ります。**公開するときは写真・`catalog.db`・生成した書き出しを含めないでください。**
@@ -48,7 +49,9 @@ Rustの単一バイナリへの移行（[実装記録](docs/rust-migration/plan.
 ## 導入
 
 GEOFRAMEはRustの単一バイナリです（Pythonは要りません）。Rustの安定版ツールチェーン
-（[rustup](https://rustup.rs/)）でビルドします。
+（[rustup](https://rustup.rs/)）でビルドします。取り込み付きの起動例は、systemdが利用可能なLinuxで、
+非rootユーザーとして実行してください。起動時に`systemctl show`で旧サービスの非稼働を確認するため、
+systemdへ接続できないコンテナなどでは起動に失敗します。
 
 ```sh
 cargo build --release -p geoframe

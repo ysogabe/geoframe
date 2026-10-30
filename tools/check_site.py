@@ -57,7 +57,12 @@ class PageParser(HTMLParser):
             # og:url は自身の公開URLなので、外部ホストの検査（href・src）には含めない
         for key in ("href", "src", "poster", "action"):
             if a.get(key):
-                self.refs.append((key, a[key]))
+                kind = f"{tag}:{key}"
+                if tag == "a" and key == "href":
+                    kind = "href"
+                elif tag == "link" and a.get("rel", "").lower() == "canonical":
+                    kind = "canonical"
+                self.refs.append((kind, a[key]))
 
 
 def parse(path: Path) -> PageParser:
@@ -107,6 +112,8 @@ def check_site(site: Path) -> list[str]:
             parts = urlsplit(value)
             if parts.scheme in ("http", "https"):
                 check_external(where, value, errors)
+                if kind not in {"href", "canonical", "og:image"}:
+                    errors.append(f"{where}: 外部資産は読み込めません: {value}")
                 continue
             if parts.scheme or value.startswith("//"):
                 errors.append(f"{where}: 使えないリンク: {value}")

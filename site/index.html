@@ -63,7 +63,7 @@
     <section class="shell section" id="flow" aria-labelledby="flow-title">
       <div class="section-head"><p class="eyebrow">Workflow</p><h2 id="flow-title">使い方の流れ</h2><p>取り込みを有効にすると、写真の取り込みから品質解析までが順に進みます。</p></div>
       <ol class="flow">
-        <li><h3>取り込む</h3><p>写真をデータディレクトリに置くか、Google Drive のフォルダを指定します。EXIF の撮影時刻と位置をカタログに記録します。</p></li>
+        <li><h3>取り込む</h3><p>写真をデータディレクトリ内の <code>photos/</code>（起動例では <code>./var/photos/</code>）に置くか、Google Drive のフォルダを指定します。EXIF の撮影時刻と位置をカタログに記録します。</p></li>
         <li><h3>整える</h3><p>表示用画像の生成と品質解析が自動で進みます。位置の無い写真は、管理画面で確認して地図から直せます。</p></li>
         <li><h3>まとめる</h3><p>旅行ブログの下書きを作って確認し、必要なら静的 HTML として書き出します。AI を設定していれば、言葉での検索も使えます。</p></li>
         <li><h3>見せる</h3><p>miharashi などの表示クライアントが、写真フィードを読んで写真を表示します。</p></li>
@@ -73,9 +73,10 @@
     <section class="shell section" id="external" aria-labelledby="external-title">
       <div class="section-head"><p class="eyebrow">Data &amp; network</p><h2 id="external-title">外部との通信と、いまの状態</h2><p>GEOFRAME は自分のサーバーで動かしますが、設定した機能によっては外部のサービスと通信します。</p></div>
       <div class="notice">
-        <h3>何も設定しなければ、写真はこの機械の外へ出ません</h3>
+        <h3>写真の外部送信は任意。取り込み時には座標を送信します</h3>
         <ul>
           <li><strong>Google Drive</strong>: サービスアカウントの鍵を設定したときだけ、Drive のフォルダを読みます。</li>
+          <li><strong>自動の地名・標高補完</strong>: <code>GEOFRAME_INGEST=1</code> で取り込むと、国内の未処理座標を地理院の逆ジオコーダ・標高 API へ送ります。Drive・AI の設定や管理画面の操作は不要です。</li>
           <li><strong>地図と地名検索</strong>: 管理画面で位置を直すとき、OpenStreetMap・地理院のタイルと、地理院・Nominatim の地名検索へ通信します。座標や検索語が上流へ渡ります。</li>
           <li><strong>クラウド AI</strong>: AI の設定ファイルを置き、クラウドを許した用途だけ、縮小して EXIF を除いた写真が外部の API（Google Cloud の Gemini）へ送られます。<strong>課金が発生します。</strong>用途ごとの上限は設定で決められます。</li>
           <li><strong>認証はありません</strong>: 信頼できるローカルネットワークで使うか、認証付きのリバースプロキシの内側に置いてください。インターネットへ直接公開しないでください。</li>
@@ -91,6 +92,7 @@
           <ul>
             <li>動作を確認しているのは、x86_64 の Linux（<code>x86_64-unknown-linux-musl</code> の静的ビルド）です。</li>
             <li>ビルドには Rust の安定版ツールチェーン（<a href="https://rustup.rs/">rustup</a>）が要ります。Python は要りません。</li>
+            <li>systemd が利用可能な Linux で、非 root ユーザーとして実行します。起動時に <code>systemctl show</code> で旧サービスの非稼働を確認するため、systemd へ接続できないコンテナなどでは取り込み付きの起動に失敗します。</li>
             <li>Google Drive と AI の連携は任意です。</li>
             <li>本番の配布（systemd、更新、バックアップ）は、リポジトリの<a href="https://github.com/ysogabe/geoframe-ambient-display/blob/main/deploy/README.md">デプロイガイド</a>にあります。</li>
           </ul>
@@ -102,7 +104,7 @@ cd geoframe-ambient-display
 cargo build --release -p geoframe
 GEOFRAME_INGEST=1 ./target/release/geoframe serve \
   --listen 127.0.0.1:8080 --data-dir ./var</code></pre>
-          <p class="note">ブラウザで <code>http://127.0.0.1:8080/</code> を開くと管理画面が表示されます。<code>GEOFRAME_INGEST=1</code> のときだけ、取り込みと画像の生成が進みます。無いときは、カタログに書き込まない状態で起動します。設定の全項目は<a href="https://github.com/ysogabe/geoframe-ambient-display/blob/main/docs/reference/configuration.md">設定リファレンス</a>にあります。</p>
+          <p class="note">写真は <code>./var/photos/</code> に置きます。ブラウザで <code>http://127.0.0.1:8080/</code> を開くと管理画面が表示されます。<code>GEOFRAME_INGEST=1</code> のときだけ、取り込みと画像の生成が進みます。無いときは、カタログに書き込まない状態で起動します。設定の全項目は<a href="https://github.com/ysogabe/geoframe-ambient-display/blob/main/docs/reference/configuration.md">設定リファレンス</a>にあります。</p>
         </div>
       </div>
     </section>
