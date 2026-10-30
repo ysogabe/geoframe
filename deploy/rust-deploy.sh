@@ -15,8 +15,8 @@
 #     に拒否する（検証環境の印がある機体、ホスト名が違う機体、Python 版が稼働中の機体などには配らない）。
 #     本番の手順は docs/rust-migration/cutover.md（T5.3）。
 #
-# deploy.sh（Python 版。本番機で git を取り込む薄いラッパー）とは別物で、こちらはバイナリを配る。やること:
-#   0. （検証環境）埋め込む旅程（app/travel_blog/plans）に git 管理外のファイルかリンクがあれば、ビルド前に止める
+# 旧 deploy.sh（Python 版。本番機で git を取り込む薄いラッパー。P5b で削除）とは別物で、こちらはバイナリを配る。やること:
+#   0. （検証環境）埋め込む旅程（web/travel_blog/plans）に git 管理外のファイルかリンクがあれば、ビルド前に止める
 #   1. （検証環境）cargo build --release --target x86_64-unknown-linux-musl -p geoframe（完全静的）
 #   2. バイナリと unit を転送（sha256 で照合）。本番では --bin を root 所有の一時ディレクトリへ写してから照合
 #   3. 配置先のバイナリを .prev に残して入れ替え、unit（/usr/local/lib/systemd/system/）を入れて
@@ -136,9 +136,9 @@ unit とバイナリ（geoframe.failed へ退避）を撤去する。
   - hostname が期待どおり、検証環境の印が無い、geoframe-rs が mask されていない、Python 版が非稼働
     （--check-only では除く）、checkout の HEAD と作業ツリー、バイナリの sha256、設定のファイルのモード。
 
-（検証環境）ビルドの前に、app/travel_blog/plans（バイナリへ埋め込まれる旅程）に git 管理外（未追跡・無視）のファイルか
-リンクがあれば、終了コード 1 で止める（--dry-run・--skip-build でも検査する）。そこへ至るパスの途中（app・
-app/travel_blog）がリンクでも止める。読めないディレクトリがあって調べられないときも止める。ログには件数と
+（検証環境）ビルドの前に、web/travel_blog/plans（バイナリへ埋め込まれる旅程）に git 管理外（未追跡・無視）のファイルか
+リンクがあれば、終了コード 1 で止める（--dry-run・--skip-build でも検査する）。そこへ至るパスの途中（web・
+web/travel_blog）がリンクでも止める。読めないディレクトリがあって調べられないときも止める。ログには件数と
 定型文だけを出し、ファイル名は出さない。
 USAGE
 }
@@ -679,7 +679,7 @@ esac
     || { echo "ERROR: 待つ秒数（--wait-secs・GEOFRAME_RS_WAIT_SECS）は 0〜3600 の整数（4 桁まで）" >&2; exit 2; }
 
 # ssh の接続先。'-' 始まりの値が ssh のオプション（-oProxyCommand=…）として解釈されると、
-# 手元で任意コマンドが実行される。deploy.sh と同じく -- で打ち切る。
+# 手元で任意コマンドが実行される。-- で打ち切る。
 ssh_run() { ssh -- "$SSH_TARGET" "$@"; }
 
 # リモートの本体を、モードを指定して実行する（-t は付けない。検証環境は NOPASSWD sudo。
@@ -794,14 +794,14 @@ if [ "$ROLLBACK" -eq 1 ]; then
 fi
 
 # --- 1. 埋め込む旅程の検査 ---
-# crates/geoframe/build.rs は app/travel_blog/plans の *.json をバイナリへ埋め込む。git の管理外（未追跡・
+# crates/geoframe/build.rs は web/travel_blog/plans の *.json をバイナリへ埋め込む。git の管理外（未追跡・
 # .gitignore で無視）のファイルやリンクがあると、同じコミットの表示でも手元だけの旅程が混ざって配られる
 # （下の DIRTY は管理下の変更しか見ない）。名前や内容はログに出さず、件数と真偽だけ。
 check_embedded_plans() {
-    local dir="app/travel_blog/plans" path="" part found links=0 untracked=0 status
-    # リポジトリの根から旅程までの各要素（app・app/travel_blog・plans）がリンクでないこと。親がリンクだと、
+    local dir="web/travel_blog/plans" path="" part found links=0 untracked=0 status
+    # リポジトリの根から旅程までの各要素（web・web/travel_blog・plans）がリンクでないこと。親がリンクだと、
     # リンク先の（git 管理外の）ファイルが、下の検査も build.rs も通って埋め込まれる
-    for part in app travel_blog plans; do
+    for part in web travel_blog plans; do
         path="${path:+${path}/}${part}"
         if [ -L "$path" ]; then
             links=$((links + 1))
@@ -831,7 +831,7 @@ cd "$REPO_ROOT"
 check_embedded_plans
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIRTY=""
-git diff --quiet HEAD -- crates Cargo.toml Cargo.lock app/static app/vendor app/travel_blog/plans 2>/dev/null || DIRTY="（未コミットの変更あり）"
+git diff --quiet HEAD -- crates Cargo.toml Cargo.lock web/static web/vendor web/travel_blog/plans 2>/dev/null || DIRTY="（未コミットの変更あり）"
 if [ "$DO_BUILD" -eq 1 ]; then
     log "ビルド : cargo build --release --target ${TARGET_TRIPLE} -p geoframe（commit ${COMMIT}${DIRTY}）"
     cargo build --release --target "$TARGET_TRIPLE" -p geoframe >&2

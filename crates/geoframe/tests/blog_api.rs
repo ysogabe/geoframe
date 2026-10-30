@@ -1,7 +1,7 @@
 //! 旅行ブログの読み取り API（E7〜E10 `GET /api/blog/…`。T3.5）の結合テスト。
 //!
 //! 期待値は現行 Python の `travel_blog`（`handlers.Handler` 経由）が合成の旅程・下書き・写真に出した応答で、
-//! `tests/fixtures/blog-python.json`（再生成は `python3 tools/gen_blog_fixture.py`）。旅程・下書き・書き出しの印は
+//! `tests/fixtures/blog-python.json`（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_blog_fixture.py` は P5b で削除した。再生成はできない）。旅程・下書き・書き出しの印は
 //! フィクスチャから、写真の行は `blog-catalog.sql` から作り直す。リポジトリにある実際の旅程 JSON は使わない
 //! （埋め込みの検査だけは、実ファイルと表が一致するかを真偽でだけ見る。中身は出力しない）。
 
@@ -542,7 +542,7 @@ async fn only_get_reaches_the_blog_routes() {
 // ---- 埋め込み（既定）----------------------------------------------------------------------
 
 fn repo_plan_files() -> Vec<(String, Value)> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../app/travel_blog/plans");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/travel_blog/plans");
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -561,7 +561,7 @@ fn repo_plan_files() -> Vec<(String, Value)> {
         .collect()
 }
 
-/// `GEOFRAME_BLOG_PLANS_DIR` が無いとき、バイナリに埋め込んだ旅程が、リポジトリの `app/travel_blog/plans/*.json` と
+/// `GEOFRAME_BLOG_PLANS_DIR` が無いとき、バイナリに埋め込んだ旅程が、リポジトリの `web/travel_blog/plans/*.json` と
 /// 同じ内容・同じ並びで返る（実ファイルとの一致を真偽で見るだけ。中身は出力しない）。
 #[tokio::test]
 async fn embedded_plans_are_the_repository_files() {

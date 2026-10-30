@@ -74,7 +74,7 @@ trap 'rm -f -- "$TMP" "$TMP.gz"' EXIT
 log "snapshot: $DB -> $TMP"
 if ! sqlite3 "file:${DB}?mode=ro" ".backup '${TMP}'"; then
     die "sqlite3 .backup に失敗した。サーバー停止中にWAL(-shm)が無いと read-only では開けないことがある。\
- 'systemctl status geoframe-server' を確認し、稼働中に再実行すること。"
+ 'systemctl status geoframe-rs' を確認し、稼働中に再実行すること。"
 fi
 [ -s "$TMP" ] || die "スナップショットが空。取得に失敗している: $TMP"
 

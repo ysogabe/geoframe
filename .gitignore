@@ -16,7 +16,7 @@ drive_key.json
 *.p12
 *.pfx
 
-# データルート（GEOFRAME_DATA_DIR 既定値 = app/var/）
+# データルート（GEOFRAME_DATA_DIR 既定値 = ./var/。起動したカレントディレクトリ基準）
 # catalog.db は Vertex AI 課金済み embedding・手動 GPS 修正・お気に入りを含み
 # 再構築不可。バックアップは必ず sqlite3 .backup で取得する（cp 禁止）。
 var/

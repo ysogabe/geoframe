@@ -1,6 +1,6 @@
 //! JPEG の EOI の欠けや切れ方を、Python（Pillow）の`make_derivative`の結果と突き合わせる。
 //!
-//! 基準は `tools/gen_jpeg_eoi_fixture.py` が作る `tests/fixtures/jpeg-eoi-python.json`。Rust が意図して違える点
+//! 基準は `tests/fixtures/jpeg-eoi-python.json`（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_jpeg_eoi_fixture.py` は P5b で削除した。再生成はできない）。Rust が意図して違える点
 //! （`docs/rust-migration/server.md` §0・§12.8）は下の表に列挙し、それ以外は Python と同じ結果を求める。
 //!
 //! - Python が読むが Rust は失敗にする: EOI が無く、その後ろにゼロ埋めやゴミが続くファイル。Pillow は

@@ -1,7 +1,6 @@
 //! `GET /api/v1/photos`（T1.2）が、現行 Python の `api_photos()` と同じ行・同じ並び・同じ値を返すこと。
 //!
-//! 合成データだけを使う。フィクスチャの DB は `tools/gen_photo_feed_fixture.py` が現行 Python の
-//! スキーマと行（app/tests/photo_feed_fixture.py）から書き出した SQL で、同じ DB を Rust 側でも作り、
+//! 合成データだけを使う。フィクスチャの DB は Python 版のスキーマと行から書き出した SQL（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_photo_feed_fixture.py` は P5b で削除した。再生成はできない）で、同じ DB を Rust 側でも作り、
 //! エンドポイントの出力を Python の出力（photo-feed-python.json）と `serde_json::Value` として
 //! 完全一致させる。除外・並び・旅番号・タイトルなどは、行を絞った小さな DB で個別に確かめる。
 //!

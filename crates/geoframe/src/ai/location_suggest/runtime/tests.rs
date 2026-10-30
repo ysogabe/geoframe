@@ -1347,68 +1347,6 @@ fn geocode_final_writer_cas_rejects_changes_after_http_and_before_commit() {
 }
 
 #[test]
-fn python_eleven_column_paid_run_reusable_and_apply_run_match_rust_subset_projection() {
-    use std::{
-        io::Write,
-        process::{Command, Stdio},
-    };
-    let l = Lab::new();
-    add(&l.env, 1, 2);
-    add(&l.env, 2, 2);
-    l.done();
-    save(&l.env, 1);
-    l.cycle();
-    let read = crate::db::open_read_only(&l.env.config.db_path()).unwrap();
-    let run = read
-        .query_row(
-            "SELECT * FROM photo_loc_runs WHERE status='done'",
-            [],
-            |r| {
-                let mut map = serde_json::Map::new();
-                for (i, name) in r.as_ref().column_names().iter().enumerate() {
-                    map.insert(
-                        (*name).into(),
-                        if *name == "attempts" {
-                            json!(r.get::<_, i64>(i)?)
-                        } else {
-                            json!(r.get::<_, String>(i)?)
-                        },
-                    );
-                }
-                Ok(Value::Object(map))
-            },
-        )
-        .unwrap();
-    let row:String=read.query_row("SELECT json_array(photo_id,run_id,scope,place_name,day_place_name,geocode_query,precision,confidence,evidence_json,lat,lon,geocode_title,model,analyzed_at) FROM photo_loc_suggestions WHERE photo_id=2",[],|r|r.get(0)).unwrap();
-    let input = json!({"model":"example-suggest","run":run,"subset":[2],"hits":{"合成市":[{"title":"合成地点","lat":12.5,"lon":34.5,"source":"osm"}]}});
-    let mut child = Command::new("python3")
-        .arg(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../tools/gen_location_suggest_fixture.py"),
-        )
-        .arg("--apply-roundtrip")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.to_string().as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "synthetic Python apply roundtrip");
-    let python: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(
-        python,
-        json!([serde_json::from_str::<Value>(&row).unwrap()])
-    );
-    assert_eq!(l.posts(), 1);
-}
-
-#[test]
 fn interrupted_failed_key_gets_its_failure_row_once_and_is_never_resent() {
     let l = Lab::new();
     add(&l.env, 1, 2);

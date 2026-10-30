@@ -3,7 +3,7 @@
 //! 現行 Python の `util.extract_exif`（Pillow の `getexif()`）と**同じ結果**になるよう、必要なタグだけを
 //! 自前で読む（外部の EXIF crate を使わないのは、Pillow の読み方 — ASCII の末尾の NUL を **1 つだけ**
 //! 取る、同じタグは後勝ち、`36867 or 36868 or 306` の連鎖で空文字だけが次へ落ちる — を境界まで
-//! 合わせるため）。基準は `tools/gen_exif_fixture.py` が作る `tests/fixtures/exif-python.json`。
+//! 合わせるため）。基準は `tests/fixtures/exif-python.json`（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_exif_fixture.py` は P5b で削除した。再生成はできない）。
 //!
 //! TIFF の構造（IFD0 → Exif IFD・GPS IFD）を読むだけで、範囲外・循環・巨大な個数は**黙って捨てる**
 //! （Pillow も壊れたタグは警告して飛ばす）。EXIF が読めないことは画像が読めないことではないので、

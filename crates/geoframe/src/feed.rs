@@ -13,8 +13,8 @@
 //! （不明は空文字）で、この型の `time` も `String` なので、`null` は読めない。Rust（T1.2）は
 //! NULL を空文字として扱い、「時刻不明」と同じく最後に並べて、旅番号も不明な写真と同じにする。
 //! 本番のコピーには `taken_at` が NULL の行は無い（管理者が確認済み）ので、実データでは差が出ない。
-//! 現行 Python の挙動は `app/tests/test_photo_feed_contract.py` の
-//! `test_null_taken_at_comes_out_as_null_and_first` に記録してある。
+//! 旧 Python 版の挙動は、P5a のマージのコミット a804623 の `app/tests/test_photo_feed_contract.py`（P5b で削除）の
+//! `test_null_taken_at_comes_out_as_null_and_first` に記録してあった。
 //!
 //! [`docs/architecture/photo-feed-contract.md`]: ../../../docs/architecture/photo-feed-contract.md
 //! [`docs/architecture/photo-feed.schema.json`]: ../../../docs/architecture/photo-feed.schema.json

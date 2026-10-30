@@ -7,16 +7,17 @@ GEOFRAMEが表示クライアントへ渡す写真一覧と画像の取得方法
 応答の形は[JSON Schema](photo-feed.schema.json)に定めています。この契約は次のテストで検査します。
 変更するときは、Schema・各テスト・表示クライアント側の読み取りを同時に直してください。
 
-- Python: `app/tests/test_photo_feed_contract.py`が、現行実装の出力をSchemaに照らし、Rustテストが読むフィクスチャ
-  （`crates/geoframe/tests/fixtures/photo-feed-python.json`）が現行実装の出力と一致することを確かめます。
-  フィクスチャの再生成は`python3 tools/gen_photo_feed_fixture.py`（合成データだけ。差の検査は`--check`）。
-  同じ合成DBのSQL（`photo-feed-catalog.sql`。Pythonの本物のスキーマと行）も一緒に書き出される。
+- Pythonで作った基準: フィクスチャ（`crates/geoframe/tests/fixtures/photo-feed-python.json`）と、同じ合成DBのSQL
+  （`photo-feed-catalog.sql`。Pythonの本物のスキーマと行）は、旧Python版（P5aのマージのコミット`a804623`まで存在）に
+  合成データだけを流して作りました。Python側の検査（`app/tests/test_photo_feed_contract.py`）と生成の道具
+  （`tools/gen_photo_feed_fixture.py`）はP5bで削除したので、再生成はできません。フィクスチャは固定の基準として、
+  下のRustのテストが読みます。
 - Rust: `crates/geoframe/tests/photo_feed_contract.rs`が、型（`geoframe::feed::Photo`）の出力と上のフィクスチャを
   同じSchemaで検査し、フィクスチャを型で読み書きし直しても内容が変わらないことを確かめます。
 - miharashiの読み方: `crates/geoframe/tests/photo_feed_miharashi.rs`が、miharashiが読むフィールドと型を再現して
   フィクスチャと型の出力、およびRustのエンドポイントの実出力が読めることを確かめます（miharashiのcrateには依存しません）。
 - Rustのエンドポイント: `crates/geoframe/tests/photo_feed_endpoint.rs`が、フィクスチャと同じ合成DB（上のSQL）に対する
-  `GET /api/v1/photos`の出力が、フィクスチャ（現行Pythonの出力）と`serde_json::Value`として完全に一致することと、
+  `GET /api/v1/photos`の出力が、フィクスチャ（旧Python版の出力）と`serde_json::Value`として完全に一致することと、
   除外・並び・旅番号・タイトル・ヘッダ・503を確かめます。
 
 ## 写真一覧

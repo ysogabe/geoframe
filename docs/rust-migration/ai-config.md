@@ -91,7 +91,7 @@
 | `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE` | `10` | `location_clue`の1周期の上限。**Rustの既定は`config.py`の`60`と違う**（下の注） |
 | `GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE` | `2` | `location_suggest`の1周期の上限 |
 
-**Rustだけ既定が違う項目**: `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`はRustでは`10`（`config.py`は`60`のまま変えない）。Rustのワーカーは専用の1スレッドが用途を順に処理するので、1件約12秒の手がかり判定が60件続く（約12分）と、その間ほかの用途（画像Embedding・位置候補）が進まない。10件なら約2分で次の用途へ回る。`GEOFRAME_AI_BACKLOG_POLL_S`はPythonに無いRustだけの項目なので`docs/reference/configuration.md`（`config.py`から生成）には載せない。クラウドの日の上限・周期の窓（`GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`など。窓の長さは`GEOFRAME_AI_POLL_S`のまま）は変えないので、周期が速くなっても日の上限は守られる。
+**Rustだけ既定が違う項目**: `GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`はRustでは`10`（旧Python版の`config.py`は`60`だった）。Rustのワーカーは専用の1スレッドが用途を順に処理するので、1件約12秒の手がかり判定が60件続く（約12分）と、その間ほかの用途（画像Embedding・位置候補）が進まない。10件なら約2分で次の用途へ回る。`GEOFRAME_AI_BACKLOG_POLL_S`はPythonに無いRustだけの項目で、`docs/reference/configuration.md`の「Rustが読む環境変数」に載せている（P5bから、その文書は手で保ち、コードが読む名前の漏れを`crates/geoframe/tests/env_reference.rs`が検査する）。クラウドの日の上限・周期の窓（`GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`など。窓の長さは`GEOFRAME_AI_POLL_S`のまま）は変えないので、周期が速くなっても日の上限は守られる。
 
 `GEOFRAME_DECISION_URL`・`GEOFRAME_LOC_SUGGEST_MODEL`・`GEOFRAME_LOCAL_EMBED_*`は**読まない**（routingとモデルは上のJSON。Decisionは`local_base_url`に固定のパスを付ける）。廃止するCPUモデル用の設定は後続のタスクで文書化する。
 

@@ -55,8 +55,7 @@ pub fn schema_json() -> Value {
     read_json(repo_root().join("docs/architecture/photo-feed.schema.json"))
 }
 
-/// 現行 Python の `api_photos()` が合成DBに対して出した JSON（再生成は
-/// `python3 tools/gen_photo_feed_fixture.py`）。
+/// 現行 Python の `api_photos()` が合成DBに対して出した JSON（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_photo_feed_fixture.py` は P5b で削除した。再生成はできない）。
 pub fn python_fixture() -> Value {
     read_json(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/photo-feed-python.json"),
@@ -174,8 +173,7 @@ impl Drop for TempDir {
     }
 }
 
-/// フィクスチャを作った合成DB（本物のスキーマ＋行）のSQL。`python3 tools/gen_photo_feed_fixture.py`
-/// が現行 Python から書き出す。
+/// フィクスチャを作った合成DB（本物のスキーマ＋行）のSQL。Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_photo_feed_fixture.py` は P5b で削除した。再生成はできない。
 pub fn catalog_sql() -> String {
     let path =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/photo-feed-catalog.sql");
@@ -340,8 +338,7 @@ pub async fn photos_from(path: &Path) -> Response {
     get(addr, "/api/v1/photos").await
 }
 
-/// 管理画面の読み取り API のフィクスチャ（`python3 tools/gen_admin_fixture.py` が現行 Python から
-/// 書き出す）。
+/// 管理画面の読み取り API のフィクスチャ（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_admin_fixture.py` は P5b で削除した。再生成はできない）。
 ///
 /// **意図した差（P4 / T4.3）**: `db.ai` の `groups`・`group_pending`・`suppressed` だけは Python の値でなく、
 /// Rust の「世代の合う有効な旧メンバーだけを数える」値に直してある（合成 DB の `photo_ai_group_members` の

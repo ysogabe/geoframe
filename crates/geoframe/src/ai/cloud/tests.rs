@@ -231,7 +231,8 @@ fn typed_request_and_envelope_keep_generated_jpeg_and_redact_debug() {
 }
 
 fn assert_python_schema_envelope(task: TaskKind) {
-    // Generated from AST only by tools/gen_ai_cloud_schema_fixture.py --check.
+    // Baseline generated from the Python AST (Python existed up to P5a merge commit a804623); the generator
+    // tools/gen_ai_cloud_schema_fixture.py was deleted in P5b, so it cannot be regenerated.
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/ai-cloud-schemas-python.json"
     ))

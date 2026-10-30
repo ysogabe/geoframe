@@ -9,90 +9,21 @@ permissions:
   contents: read
 
 jobs:
-  app:
-    name: Python・文書
+  docs:
+    name: 文書・道具
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     steps:
       - name: ソースを取得
         uses: actions/checkout@v7
 
-      - name: Pythonを準備
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: app/requirements.txt
-
-      - name: Python依存関係をインストール
-        run: python -m pip install -r app/requirements.txt
-
-      - name: Pythonテスト
-        working-directory: app
-        run: python -m unittest discover -s tests
-
       - name: Markdown相対リンク検査
+        # システムの python3（標準ライブラリだけ。pip も setup-python も使わない）
         run: python3 tools/check_markdown_links.py
 
-      - name: 設定リファレンスの同期検査
-        run: python3 tools/gen_env_reference.py --check
-
-      - name: EXIF・縮小寸法・向き・JPEGのEOI・ローカル索引・Drive索引・位置推定と地名・簡易品質のフィクスチャの同期検査
-        # Rust の画像処理（crates/geoframe/src/imaging）が Python の extract_exif・norm_time・Pillow の
-        # thumbnail・exif_transpose（XMP の向きの補完を含む）と同じ結果になることを確かめるテストの基準。
-        # ローカル索引（crates/geoframe/src/local.rs）は Python の index_local と photos の全列が一致することを
-        # 確かめる基準（HEIC を索引するため pillow-heif が要る。requirements.txt に入っている）。
-        # Drive の索引・取得（crates/geoframe/src/drive）は Python の index_drive・fetch_derivatives を偽の
-        # Drive に流した結果（photos の全列・Drive への問い合わせ・変換できた原本の寸法）と突き合わせる基準。
-        # 位置の推定と地名（crates/geoframe/src/geo）は Python の infer_locations・enrich_rows を、合成の行と
-        # 偽の地理院に流した結果（photos の全列・地理院への要求・.cache.json の geo: キー）と突き合わせる基準。
-        # 簡易品質（crates/geoframe/src/quality）は Python の quality_cycle・quality_backfill を、合成の特徴量
-        # （画像は使わない）に流した結果（photo_quality_features・photo_quality・settings の全列）と突き合わせる基準。
-        # 更新 API（crates/geoframe/src/update.rs・post.rs）は Python の handlers.do_POST・admin_setloc・
-        # admin_setflag に同じ POST（CSRF 対策・ルーティング・エラー応答を含む）を順に流した結果（状態コード・応答・
-        # photos の変化）と突き合わせる基準。回転 API（crates/geoframe/src/rotate.rs）は、合成の derivative を置いた
-        # Python の admin_rotate に同じ POST を順に流した結果（状態コード・応答・photos の変化・ファイルの増減と、
-        # 画像の寸法・四隅の色・EXIF の有無）と突き合わせる基準（tests/rotate_api.rs）。
-        # CSRF 対策の判定（crates/geoframe/src/csrf.rs）は、Python の _csrf_ok・_host_ok を実際のヘッダ解析
-        # （生バイトを Latin-1 にして email のパーサへ）の上で、空白・Latin-1 の全バイト・Origin の書式（角括弧の IPv6 を
-        # 含む）・Host の組み合わせに流した判定（9千件超）と、実際の HTTP サーバーへの POST の結果を残す。Rust が
-        # Python の断るものを通さないことを確かめる基準（tests/csrf_python.rs）。
-        # 地名検索（crates/geoframe/src/geocode.rs）は、Python の handlers.Handler の GET /api/admin/geocode に、
-        # 合成の地理院・Nominatim の応答と偽の時計で流した結果（状態コード・応答・上流への要求のクエリと順・
-        # Nominatim の 1 秒 1 件の待ち・メモリキャッシュの全体）と、float()・urllib.parse.quote・str.isspace の
-        # 出力を残す。Rust が同じ要求・応答・時計で一致することを確かめる基準（geocode/tests.rs）。
-        # 地図タイル（crates/geoframe/src/tiles.rs）は、Python の handlers.Handler の GET/HEAD /tiles/… に、
-        # ループバックの上流のスタブ・偽の時計で流した結果（状態コード・ヘッダ・本文・上流への要求・キャッシュの
-        # ファイル・毎分の流量の窓）と、tile_cache_prune を偽のファイル群に流した結果を残す。Rust が同じ手順で
-        # 一致することを確かめる基準（tiles/tests.rs）。
-        # 旅行ブログの読み取り（crates/geoframe/src/blog.rs）は、Python の handlers.Handler の GET /api/blog/… に、
-        # 合成の旅程 JSON・下書き・書き出しの印・合成の写真の行（blog-catalog.sql）を流した結果を残す。
-        # Rust が同じ入力で JSON として一致することを確かめる基準（tests/blog_api.rs）。
-        # 旅行ブログの保存と書き出し（crates/geoframe/src/blog_write.rs）は、同じ合成の旅程・合成DB・合成の画像に
-        # POST /api/blog/save・export を順に流した結果（応答・保存された下書きと書き出しのファイルの全文・画像の
-        # 寸法と EXIF・ICC の有無）を残す。Rust が同じ手順で一致することを確かめる基準（tests/blog_write_api.rs）。
-        # Python の読み取りが変わったら落ちる
-        run: |
-          python3 tools/gen_exif_fixture.py --check
-          python3 tools/gen_thumbnail_fixture.py --check
-          python3 tools/gen_orientation_fixture.py --check
-          python3 tools/gen_jpeg_eoi_fixture.py --check
-          python3 tools/gen_local_index_fixture.py --check
-          python3 tools/gen_drive_index_fixture.py --check
-          python3 tools/gen_geo_fixture.py --check
-          python3 tools/gen_quality_fixture.py --check
-          python3 tools/gen_update_fixture.py --check
-          python3 tools/gen_rotate_fixture.py --check
-          python3 tools/gen_csrf_fixture.py --check
-          python3 tools/gen_geocode_fixture.py --check
-          python3 tools/gen_tile_fixture.py --check
-          python3 tools/gen_blog_fixture.py --check
-          python3 tools/gen_blog_write_fixture.py --check
-
-      - name: スキーマのフィクスチャの同期検査
-        # Rust のスキーマ（crates/geoframe/src/schema.rs）が Python の空 DB と一致することを確かめる
-        # テストの Golden。store.py の SCHEMA を変えたら tools/gen_schema_fixture.py で再生成する
-        run: python3 tools/gen_schema_fixture.py --check
+      - name: 毎朝のDecision起動（deploy/loc_decision_morning.py）の試験
+        # 本番機のシステムの python3 で動く標準ライブラリだけのスクリプト。pip install なし
+        run: python3 -m unittest discover -s deploy/tests -v
 
   deploy:
     name: 配布スクリプト（モックの試験）
@@ -107,9 +38,6 @@ jobs:
         # 一時ディレクトリと一時の git リポジトリだけを使う。sha256sum・stat・install・setsid などは
         # ubuntu のランナーの標準のもの（coreutils・util-linux）。ランナーは root ではない
         run: bash deploy/rust-deploy-test.sh
-
-      - name: deploy-pull.sh（Rust 版へ切り替えたあとの拒否）
-        run: bash deploy/deploy-pull-test.sh
 
       - name: geoframe-admin.sh（サービスと同じユーザー・設定で動かす）
         run: bash deploy/geoframe-admin-test.sh
@@ -128,18 +56,6 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-unknown-linux-musl
 
-      - name: Pythonを準備
-        # AI の試験（ai/groups・ai/scene_judge）は Python の本体を呼び、同じ DB を読み直して戻せることを確かめる。
-        # Python の本体は Pillow を読み込むので、Python のジョブと同じ版と依存関係を入れる
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: app/requirements.txt
-
-      - name: Python依存関係をインストール
-        run: python -m pip install -r app/requirements.txt
-
       - name: musl-toolsをインストール
         # rusqlite の bundled が SQLite（C）をビルドするため、musl 用の C コンパイラが要る
         run: sudo apt-get update && sudo apt-get install -y musl-tools
@@ -154,6 +70,9 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Rustテスト
+        # 画面描画の試験（web/tests/admin_ai_ops_render.mjs を Node で動かす。tests/admin_ui_ai_waits.rs）と、
+        # コードが読む環境変数が docs/reference/configuration.md に載っているかの検査（tests/env_reference.rs）、
+        # crates に python の起動が無いことの検査（tests/no_python.rs）もここで回る。CI では Node が無ければ失敗にする
         run: cargo test
 
       - name: muslで静的ビルド

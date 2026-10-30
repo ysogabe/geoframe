@@ -5,7 +5,7 @@
 //!
 //! # 置き場
 //!
-//! - 旅程 JSON（git 管理のソース）: 既定ではバイナリに埋め込んだ `app/travel_blog/plans/*.json`
+//! - 旅程 JSON（git 管理のソース）: 既定ではバイナリに埋め込んだ `web/travel_blog/plans/*.json`
 //!   （`embedded.rs`）。`GEOFRAME_BLOG_PLANS_DIR` があればそのディレクトリの `*.json` を読む（[`PlanSource`]）。
 //! - 下書き: `DATA_DIR/travel_blog/drafts/<trip_id>.json`、書き出し: `DATA_DIR/blog_exports/<trip_id>/index.html`
 //!   （一次データ。ここでは読むだけ）。

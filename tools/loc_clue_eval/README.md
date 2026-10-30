@@ -1,15 +1,13 @@
 # 撮影地の手がかり判定の検証データ
 
-位置なし写真の撮影地候補（[app/geoframe/loc_suggest.py](../../app/geoframe/loc_suggest.py)）は、
+位置なし写真の撮影地候補（Rustの`crates/geoframe/src/ai/location_clue.rs`・`location_suggest`）は、
 Decision（gpu-eval の d3-lite）が「撮影地の手がかりがある」と判定した写真だけを Gemini へ送る。
-この関門の基準（`clue ≥ 0.2` または `kind = landmark`）を決めたときのデータと、測り直すための
-スクリプトを置く。仕組み全体は [photo-pipeline.md](../../docs/architecture/photo-pipeline.md) を参照。
+この関門の基準（`clue ≥ 0.2` または `kind = landmark`。Rustでは`location_clue.rs`の`CLUE_MIN`）を決めたときのデータを置く。仕組み全体は [photo-pipeline.md](../../docs/architecture/photo-pipeline.md) を参照。
 
 | ファイル | 内容 |
 |---|---|
 | `labels.json` | 位置なし写真64枚と、目視で付けた「撮影地の手がかりがあるか」（`clue`） |
 | `baseline-2026-10-13.json` | 基準を決めたときの Decision の判定（`clue` 0〜1、`kind`） |
-| `eval_decision.py` | ラベルと突き合わせ、現在の基準・しきい値ごと・kind ごとの結果を出す |
 
 ## ラベルの作り方と限界
 
@@ -31,22 +29,8 @@ landmark と判定された9枚はすべて手がかりあり。nature の8枚�
 
 ## 測り直す
 
-本番のデータを読む2つは、本番機の `/opt/geoframe` で、サーバーと同じ venv（`app/.venv`）の
-Python で実行する（`geoframe` ユーザーは開発用の worktree を読めない）。
-
-```bash
-# 保存済みの判定で（DBもDecisionも使わない）
-python3 tools/loc_clue_eval/eval_decision.py --scores tools/loc_clue_eval/baseline-2026-10-13.json
-
-# ai_worker が photo_loc_clues に保存した判定で（本番のデータを読むので geoframe ユーザーで）
-sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe app/.venv/bin/python tools/loc_clue_eval/eval_decision.py --from-db
-
-# Decision に64枚を問い合わせて（質問文・画像の縮小は loc_suggest.py のものを使う）
-sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe \
-    app/.venv/bin/python tools/loc_clue_eval/eval_decision.py --save /tmp/clue-$(date +%F).json
-```
-
-DB は読み取り専用で開く。`loc_suggest.py` の質問文や基準を変えたら Decision に問い合わせる形で流し、
-取りこぼし（手がかりありなのに送らない写真）と適合率（送った写真のうち手がかりありの割合）を
-このファイルの結果と比べる。`--save` で残した判定は、次回 `--scores` で比べられる。
-`--from-db` では、位置が決まって判定対象から外れた写真は数に入らない。
+測り直すスクリプト（`eval_decision.py`）は、旧Python版の`app/geoframe/loc_suggest.py`の質問文・画像の縮小・合否の判定を
+そのまま使っていたので、Python版の削除（P5b）と一緒に消した（旧版は P5a のマージのコミット
+[`a804623`](https://github.com/ysogabe/geoframe-ambient-display/tree/a804623029ad67d415692d08ea3182fd765eb2a4/tools/loc_clue_eval)
+に残っている）。Rustの基準を測り直すときは、`labels.json`の`clue`と`baseline-2026-10-13.json`の判定を、
+Rustの`location_clue`が使う質問文・縮小・合否の判定に流して比べるスクリプトを新しく書く。

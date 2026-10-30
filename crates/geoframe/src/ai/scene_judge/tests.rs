@@ -2,32 +2,21 @@
 use super::*;
 use crate::ai::image_input::ImageProfile;
 use serde_json::{Value, json};
-use std::process::Command;
 
-fn python_constant(name: &str) -> Value {
-    let script = format!(
-        "import ast,json,sys\n\
-         t=ast.parse(open(sys.argv[1]).read())\n\
-         for n in t.body:\n\
-         \x20\x20if isinstance(n,ast.Assign) and n.targets[0].id=={name:?}:\n\
-         \x20\x20\x20\x20print(json.dumps(ast.literal_eval(n.value)))"
-    );
-    let source =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/geoframe/ai_pipeline.py");
-    let out = Command::new("python3")
-        .args(["-I", "-c", &script])
-        .arg(source)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "AST extraction failed");
-    serde_json::from_slice(&out.stdout).unwrap()
+fn python_constants() -> Value {
+    let f: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/ai-judge-constants-python.json"
+    ))
+    .unwrap();
+    f["constants"].clone()
 }
 
 #[test]
 fn prompt_schema_and_versions_match_the_python_constants() {
-    assert_eq!(json!(PROMPT), python_constant("JUDGE_PROMPT"));
-    assert_eq!(json!(PROMPT_VERSION), python_constant("JUDGE_VERSION"));
-    assert_eq!(python_constant("MAX_JUDGE_ATTEMPTS"), json!(5));
+    let constants = python_constants();
+    assert_eq!(json!(PROMPT), constants["JUDGE_PROMPT"]);
+    assert_eq!(json!(PROMPT_VERSION), constants["JUDGE_VERSION"]);
+    assert_eq!(constants["MAX_JUDGE_ATTEMPTS"], json!(5));
     assert_eq!(crate::ai::jobs::MAX_ATTEMPTS, 5);
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/ai-cloud-schemas-python.json"

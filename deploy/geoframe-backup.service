@@ -2,7 +2,7 @@
 Description=GEOFRAME catalog.db backup (sqlite3 .backup snapshot)
 Documentation=file:///opt/geoframe/deploy/README.md
 
-# geoframe-server が動いていなくてもバックアップ自体は取りたいので
+# geoframe-rs が動いていなくてもバックアップ自体は取りたいので
 # Requires= や After= でサーバーunitに依存させない。
 # ただし backup-catalog.sh のコメントにあるとおり、WALモードのDBを
 # read-only で開くにはサーバー稼働中のほうが確実（-shm が存在するため）。
@@ -13,7 +13,7 @@ User=geoframe
 Group=geoframe
 ExecStart=/opt/geoframe/deploy/backup-catalog.sh
 
-# geoframe-server.service と同じデータルートを見る必要がある
+# geoframe-rs.service と同じデータルートを見る必要がある
 # （既定値も同じだが、片方だけ変えたときに事故らないよう明示する）。
 Environment=GEOFRAME_DATA_DIR=/var/lib/geoframe
 

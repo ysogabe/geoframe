@@ -1,7 +1,7 @@
 //! 回転 API（E14 `POST /api/admin/rotate`）の結合テスト（T3.2）。合成データだけを使う。
 //!
 //! 現行 Python の `admin_rotate` に、合成の derivative（JPEG）を置いて同じ要求を順に流した結果
-//! （`tools/gen_rotate_fixture.py` が書き出すフィクスチャ）と、状態コード・応答の JSON・`photos` の変化・
+//! （Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_rotate_fixture.py` は P5b で削除した。再生成はできない）と、状態コード・応答の JSON・`photos` の変化・
 //! データ置き場のファイルの増減（画像は寸法・四隅の色・EXIF の有無）が一致することを確かめる。意図した差は
 //! フィクスチャの `known_differences` に載るケースだけで、下の `known` が期待値を持つ。
 

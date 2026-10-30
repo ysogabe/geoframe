@@ -12,7 +12,7 @@
 | [写真フィードの契約](architecture/photo-feed-contract.md) | 現行 | 表示クライアント（miharashi）へ渡す写真一覧と画像 |
 | [ADR 0008: 写真管理基盤への転換](decisions/0008-photo-platform-and-miharashi-display.md) | 現行 | 表示をmiharashiへ移し、GEOFRAMEを写真管理基盤にした経緯 |
 | [Rust写真管理APIと外部AI Providerの設計案](architecture/rust-api-and-ai-providers-proposal.md) | 計画 | Rust単一バイナリ化、miharashiとの知見共有、local-model-labの画像Embedding API、ローカル／クラウドAIの切り替え |
-| [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（`config.py`から自動生成） |
+| [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（手で保ち、コードとの照合を`cargo test`が検査） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、更新、バックアップ |
 
 ## ディレクトリ構成
@@ -42,10 +42,10 @@
 
 ### `reference/` — リファレンス
 
-コードから機械的に導ける一覧です。手で書き写さず、生成コマンドで更新します。生成結果が
-古い場合はCI（`tools/gen_env_reference.py --check`）が失敗します。
+コードと照合できる一覧です。手で保ちますが、コードが読む名前が載っていないと
+`cargo test`（`crates/geoframe/tests/env_reference.rs`）が失敗します。
 
-- [設定リファレンス（環境変数）](reference/configuration.md) — `app/geoframe/config.py` から生成
+- [設定リファレンス（環境変数）](reference/configuration.md) — Rustのコードが読む`GEOFRAME_*`の一覧
 
 ### `archive/` — 履歴資料
 

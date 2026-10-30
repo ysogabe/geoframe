@@ -1,6 +1,6 @@
 //! 向き（EXIF の Orientation・XMP の `tiff:Orientation`）を、Python の `make_derivative` の結果と突き合わせる。
 //!
-//! 基準は `tools/gen_orientation_fixture.py` が作る `tests/fixtures/orientation-python.json`（合成の画像と、
+//! 基準は `tests/fixtures/orientation-python.json`（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_orientation_fixture.py` は P5b で削除した。再生成はできない。合成の画像と、
 //! Pillow を通した出力の寸法・四隅の色）。Python と**意図して違える点**（`docs/rust-migration/server.md` §0・§12）は
 //! `rust_differs` に列挙し、それ以外は完全一致を求める。
 
