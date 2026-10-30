@@ -6,7 +6,7 @@
 //! - 「旧版のみ（削除済み。Rust は読まない）」: 旧 Python 版だけが読んだ名前。コードには出てこない。
 //!
 //! 照合するもの（「コード」は試験とコメントを除いた本体: `tests/` の下・`tests.rs`・`tests_*.rs`・`*_tests.rs` の
-//! ファイルと、`#[cfg(test)]` の付いた項目、`//` のコメントを除く。試験やコメントに名前が残っていても、本体が
+//! ファイルと、`#[cfg(test)]` の付いた項目、コメントを除く。試験やコメントに名前が残っていても、本体が
 //! 読まなくなれば 2 で分かるように）:
 //! 1. `crates` 以下の本体の `.rs` にある `"GEOFRAME_…"` の文字列（引用符で囲んだ名前そのもの）は、
 //!    試験だけの名前（`TEST_ONLY`）を除いて、すべて「Rust が読む」の節に載っている。
@@ -53,63 +53,178 @@ fn is_test_file(path: &Path) -> bool {
         || name.ends_with("_tests.rs")
 }
 
-/// 本体だけを残す: `//` のコメント（文字列の中の `//` は残す）と、`#[cfg(test)]` の付いた項目
-/// （次の `;` か、対応する `}` まで）を除く。字句は簡易（文字列と文字リテラルの `"` だけを追う）。
+/// 字句の分類（バイトごと）。`masked` はコメント・文字列・文字リテラルの中身を空白にした写し（区切り記号は残す）。
+/// `comment` はコメントのバイト。境界（`{`・`}`・`;`・`[`・`]`）は `masked` の上で探すので、文字列・生文字列・
+/// 文字リテラル・コメントの中の記号を数えない。
+struct Lexed {
+    masked: Vec<u8>,
+    comment: Vec<bool>,
+}
+
+fn lex(text: &str) -> Lexed {
+    let b = text.as_bytes();
+    let n = b.len();
+    let mut masked = b.to_vec();
+    let mut comment = vec![false; n];
+    let blank = |m: &mut Vec<u8>, from: usize, to: usize| {
+        for x in &mut m[from..to] {
+            if *x != b'\n' {
+                *x = b' ';
+            }
+        }
+    };
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut i = 0;
+    while i < n {
+        let c = b[i];
+        if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            let end = b[i..].iter().position(|&x| x == b'\n').map_or(n, |k| i + k);
+            blank(&mut masked, i, end);
+            comment[i..end].iter_mut().for_each(|x| *x = true);
+            i = end;
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut depth = 0usize;
+            let mut k = i;
+            while k < n {
+                if b[k] == b'/' && b.get(k + 1) == Some(&b'*') {
+                    depth += 1;
+                    k += 2;
+                } else if b[k] == b'*' && b.get(k + 1) == Some(&b'/') {
+                    depth -= 1;
+                    k += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    k += 1;
+                }
+            }
+            blank(&mut masked, i, k);
+            comment[i..k].iter_mut().for_each(|x| *x = true);
+            i = k;
+        } else if c == b'r'
+            && (i == 0 || !ident(b[i - 1]) || matches!(b[i - 1], b'b' | b'c'))
+            && matches!(b.get(i + 1), Some(b'#') | Some(b'"'))
+        {
+            // 生文字列 r"..."・r#"..."#（br・cr も、前の b・c はただの識別子の字として残る）
+            let hashes = b[i + 1..].iter().take_while(|&&x| x == b'#').count();
+            if b.get(i + 1 + hashes) != Some(&b'"') {
+                i += 1;
+                continue;
+            }
+            let open = i + 1 + hashes;
+            let mut k = open + 1;
+            let end = loop {
+                if k >= n {
+                    break n;
+                }
+                if b[k] == b'"'
+                    && b[k + 1..]
+                        .iter()
+                        .take(hashes)
+                        .filter(|&&x| x == b'#')
+                        .count()
+                        == hashes
+                    && k + hashes < n
+                {
+                    break k;
+                }
+                k += 1;
+            };
+            blank(&mut masked, open + 1, end);
+            i = (end + 1 + hashes).min(n);
+        } else if c == b'"' {
+            let mut k = i + 1;
+            while k < n && b[k] != b'"' {
+                k += if b[k] == b'\\' { 2 } else { 1 };
+            }
+            let end = k.min(n);
+            blank(&mut masked, i + 1, end);
+            i = end + 1;
+        } else if c == b'\'' {
+            // 文字リテラル（'x'・'\n'・'\u{..}'・多バイトの 1 文字）。それ以外の ' はライフタイム
+            let end = if b.get(i + 1) == Some(&b'\\') {
+                b[i + 2..]
+                    .iter()
+                    .position(|&x| x == b'\'')
+                    .map(|k| i + 2 + k)
+            } else {
+                let len = text[i + 1..].chars().next().map_or(0, char::len_utf8);
+                (b.get(i + 1 + len) == Some(&b'\'')).then_some(i + 1 + len)
+            };
+            match end {
+                Some(e) => {
+                    blank(&mut masked, i + 1, e);
+                    i = e + 1;
+                }
+                None => i += 1,
+            }
+        } else {
+            i += 1;
+        }
+    }
+    Lexed { masked, comment }
+}
+
+/// `open`（`{` か `[`）に対応する閉じの次の位置。
+fn matching(m: &[u8], open: usize) -> usize {
+    let (o, c) = if m[open] == b'{' {
+        (b'{', b'}')
+    } else {
+        (b'[', b']')
+    };
+    let mut depth = 0usize;
+    for (k, &x) in m.iter().enumerate().skip(open) {
+        if x == o {
+            depth += 1;
+        } else if x == c {
+            depth -= 1;
+            if depth == 0 {
+                return k + 1;
+            }
+        }
+    }
+    m.len()
+}
+
+/// 本体だけを残す: コメントと、`#[cfg(test)]` の付いた項目（続く属性を読み飛ばし、次の `;` か対応する `}` まで）を
+/// 空白にする。文字列の中身はそのまま残す（名前を読むため）。
 fn production_source(text: &str) -> String {
-    let mut no_comments = String::with_capacity(text.len());
-    for line in text.lines() {
-        let mut in_str = false;
-        let mut prev = '\0';
-        let mut cut = line.len();
-        for (i, c) in line.char_indices() {
-            if c == '"' && prev != '\\' && !(prev == '\'' && line[i + 1..].starts_with('\'')) {
-                in_str = !in_str;
-            } else if !in_str && c == '/' && prev == '/' {
-                cut = i - 1;
+    let Lexed { masked, comment } = lex(text);
+    let mut out: Vec<u8> = text
+        .bytes()
+        .zip(&comment)
+        .map(|(x, &c)| if c && x != b'\n' { b' ' } else { x })
+        .collect();
+    let pat = b"#[cfg(test)]";
+    let mut i = 0;
+    while let Some(k) = masked[i..].windows(pat.len()).position(|w| w == pat) {
+        let start = i + k;
+        let mut j = start + pat.len();
+        loop {
+            while j < masked.len() && masked[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if masked.get(j) == Some(&b'#') && masked.get(j + 1) == Some(&b'[') {
+                j = matching(&masked, j + 1);
+            } else {
                 break;
             }
-            prev = if prev == '\\' && c == '\\' { '\0' } else { c };
         }
-        no_comments.push_str(&line[..cut]);
-        no_comments.push('\n');
-    }
-    let mut out = String::with_capacity(no_comments.len());
-    let mut rest = no_comments.as_str();
-    while let Some(i) = rest.find("#[cfg(test)]") {
-        out.push_str(&rest[..i]);
-        let after = &rest[i..];
-        let semi = after.find(';');
-        let brace = after.find('{');
-        let end = match (semi, brace) {
-            (Some(sc), Some(b)) if sc < b => sc + 1,
-            (_, Some(b)) => {
-                let mut depth = 0usize;
-                let mut in_str = false;
-                let mut prev = '\0';
-                let mut end = after.len();
-                for (k, c) in after[b..].char_indices() {
-                    if c == '"' && prev != '\\' && prev != '\'' {
-                        in_str = !in_str;
-                    } else if !in_str && c == '{' {
-                        depth += 1;
-                    } else if !in_str && c == '}' {
-                        depth -= 1;
-                        if depth == 0 {
-                            end = b + k + 1;
-                            break;
-                        }
-                    }
-                    prev = if prev == '\\' && c == '\\' { '\0' } else { c };
-                }
-                end
-            }
-            (Some(sc), None) => sc + 1,
-            (None, None) => after.len(),
+        let end = match masked[j..].iter().position(|&x| x == b';' || x == b'{') {
+            Some(p) if masked[j + p] == b';' => j + p + 1,
+            Some(p) => matching(&masked, j + p),
+            None => masked.len(),
         };
-        rest = &after[end..];
+        for x in &mut out[start..end] {
+            if *x != b'\n' {
+                *x = b' ';
+            }
+        }
+        i = end;
     }
-    out.push_str(rest);
-    out
+    // 空白にしたのは ASCII の範囲の外側も含むので、壊れた UTF-8 は置き換える（名前は ASCII なので影響しない）
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `"GEOFRAME_…"`（引用符で囲んだ、大文字・数字・`_` だけの名前）を集める。末尾が `_` のもの
@@ -250,6 +365,19 @@ fn after() { let _ = "GEOFRAME_AFTER_TESTS"; }
             "GEOFRAME_PORT"
         ]
     );
+    // 文字リテラル・生文字列・続く属性の中の `{`・`;` で境界がずれない
+    for src in [
+        "#[cfg(test)]\nfn t() { let c = '{'; }\nfn main() { std::env::var(\"GEOFRAME_REAL\"); }",
+        "#[cfg(test)]\nfn t() { let c = r#\"a\"{\"#; }\nfn main() { std::env::var(\"GEOFRAME_REAL\"); }",
+        "#[cfg(test)]\n#[doc = \"{\"]\nfn t() { }\nfn main() { std::env::var(\"GEOFRAME_REAL\"); }",
+        "#[cfg(test)]\n#[doc = \";\"]\nfn t() { std::env::var(\"GEOFRAME_IN_TEST\"); }\nfn main() { std::env::var(\"GEOFRAME_REAL\"); }",
+        "/* { \"GEOFRAME_IN_COMMENT\" */\nfn main() { std::env::var(\"GEOFRAME_REAL\"); }",
+    ] {
+        let mut out = BTreeSet::new();
+        names_in(&production_source(src), &mut out);
+        let got: Vec<&str> = out.iter().map(String::as_str).collect();
+        assert_eq!(got, ["GEOFRAME_REAL"], "{src}");
+    }
     assert!(is_test_file(Path::new("crates/geoframe/src/ai/tests.rs")));
     assert!(is_test_file(Path::new(
         "crates/geoframe/src/ai/tests_http.rs"
