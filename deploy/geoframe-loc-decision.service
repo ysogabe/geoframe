@@ -4,7 +4,7 @@ Documentation=file:///opt/geoframe/deploy/README.md
 
 # Decision（llm-decision.service）を動かしているユーザーのユーザーunit
 # （~/.config/systemd/user/）として入れ、同じユーザーから起動・停止する。
-# 判定そのものは geoframe-server（User=geoframe）が行い、このunitは Decision の
+# 判定そのものは geoframe（geoframe-rs.service、User=geoframe）が行い、このunitは Decision の
 # 起動と停止だけを受け持つ。
 
 [Service]

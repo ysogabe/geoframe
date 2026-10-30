@@ -4,19 +4,19 @@ GEOFRAMEへの改善提案を歓迎します。変更を送る前に、次の点
 
 ## 開発環境
 
+Rustの安定版ツールチェーンを使います（Pythonは不要です）。
+
 ```sh
-cd app
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-.venv/bin/python -m unittest discover -s tests
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-環境変数を追加・変更した場合は、リポジトリルートで
-`python3 tools/gen_env_reference.py`を実行して[設定リファレンス](docs/reference/configuration.md)を
-更新してください（CIが`--check`で同期を検査します）。
+環境変数を追加・変更した場合は、[設定リファレンス](docs/reference/configuration.md)を手で更新してください。
+コードが読む`GEOFRAME_*`の名前が載っていないと、`cargo test`（`crates/geoframe/tests/env_reference.rs`）が失敗します。
 
 文書を追加・移動した場合は、リポジトリルートで
-`python3 tools/check_markdown_links.py`を実行し、[ドキュメント索引](docs/README.md)も
+`python3 tools/check_markdown_links.py`（標準ライブラリだけのシステムの`python3`で動きます）を実行し、[ドキュメント索引](docs/README.md)も
 同じ変更で更新してください。
 
 ## 変更時の注意

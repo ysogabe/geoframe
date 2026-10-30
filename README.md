@@ -26,28 +26,30 @@ GEOFRAMEは[写真フィード](docs/architecture/photo-feed-contract.md)を提�
 
 ## クイックスタート
 
-Python 3.10以降を使用します（CIは3.12で検証しています）。
+GEOFRAMEはRustの単一バイナリです（Pythonは要りません）。Rustの安定版ツールチェーン
+（[rustup](https://rustup.rs/)）でビルドします。
 
 ```sh
-cd app
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
-cp .env.example .env
-GEOFRAME_HOST=127.0.0.1 .venv/bin/python server.py
+cargo build --release -p geoframe
+GEOFRAME_INGEST=1 ./target/release/geoframe serve --listen 127.0.0.1:8080 --data-dir ./var
 ```
 
-ブラウザで <http://127.0.0.1:8080/> を開くと管理画面が表示されます。起動すると写真の
-取り込み、表示用画像の生成、品質解析が順に進みます。データディレクトリの既定値は
-`app/var/`で、Gitの追跡対象外です。Google DriveとAIの連携は任意です。
+ブラウザで <http://127.0.0.1:8080/> を開くと管理画面が表示されます。画面のファイル
+（`web/static`・`web/vendor`）と旅行ブログの旅程（`web/travel_blog/plans`）はバイナリに埋め込まれます。
+`GEOFRAME_INGEST=1`のときだけ、写真の取り込み、表示用画像の生成、品質解析が順に進みます
+（無ければ読み取り専用です）。データディレクトリは`./var`（`--data-dir`か`GEOFRAME_DATA_DIR`で変更）で、
+Gitの追跡対象外です。`serve`はrootでは起動しません。Google DriveとAIの連携は任意です。
+本番の配布は[デプロイガイド](deploy/README.md)を参照してください。
 
 ## リポジトリ構成
 
 | パス | 内容 |
 |---|---|
-| [`app/`](app/) | Pythonサーバー、管理画面、テスト |
+| [`crates/`](crates/) | Rustのサーバー（`geoframe`。単体・結合試験を含む） |
+| [`web/`](web/) | 管理画面・旅行ブログの画面・旅程（バイナリに埋め込む）と、画面の試験 |
 | [`docs/`](docs/) | アーキテクチャ、意思決定、リファレンス、履歴資料 |
-| [`deploy/`](deploy/) | systemd、更新、バックアップの構成例 |
-| [`tools/`](tools/) | リポジトリ横断の検査スクリプト |
+| [`deploy/`](deploy/) | systemd、配布、バックアップの構成例と、その試験 |
+| [`tools/`](tools/) | 文書の検査、計測・検証用の道具 |
 
 ## ドキュメント
 
@@ -59,9 +61,9 @@ GEOFRAME_HOST=127.0.0.1 .venv/bin/python server.py
 
 ## 設定とデータ
 
-- ローカル設定は`app/.env.example`を`app/.env`へコピーして編集します。全項目は
+- 設定は起動引数と環境変数（`GEOFRAME_*`）で行います（`.env`は読みません）。全項目は
   [設定リファレンス](docs/reference/configuration.md)にあります。
-- 変更されるデータをソースツリー外へ置く場合は`GEOFRAME_DATA_DIR`を設定します。
+- 変更されるデータをソースツリー外へ置く場合は`--data-dir`か`GEOFRAME_DATA_DIR`を設定します。
 - `.env`、`drive_key.json`、`catalog.db`、写真、表示用画像、生成レポートはGitへ
   コミットしないでください。標準的な配置先は`.gitignore`で除外済みです。
 - `catalog.db`には、手動GPS修正、お気に入り、有料生成したAI埋め込みなど、再生成できない
@@ -70,16 +72,24 @@ GEOFRAME_HOST=127.0.0.1 .venv/bin/python server.py
 
 ## テスト
 
+リポジトリルートで次を実行します。
+
 ```sh
-cd app
-.venv/bin/python -m unittest discover -s tests
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
 ```
 
-文書の相対リンクと設定リファレンスの同期は、リポジトリルートで次を実行して検査します。
+`cargo test`には、管理画面の描画をNodeで確かめる試験（Nodeが無ければ省略）と、コードが読む環境変数が
+[設定リファレンス](docs/reference/configuration.md)に載っているかの検査が含まれます。
+文書と配布の道具は、システムの`python3`（標準ライブラリだけ）とbashで検査します。
 
 ```sh
-python3 tools/check_markdown_links.py
-python3 tools/gen_env_reference.py --check
+python3 tools/check_markdown_links.py                  # 文書の相対リンク
+python3 -m unittest discover -s deploy/tests           # 毎朝のDecision起動（deploy/loc_decision_morning.py）
+node web/tests/admin_ai_ops_render.mjs web/static/js/admin.js
+bash deploy/rust-deploy-test.sh                        # 配布スクリプト（モックの試験）
+bash deploy/geoframe-admin-test.sh
 ```
 
 ## コントリビューションとセキュリティ

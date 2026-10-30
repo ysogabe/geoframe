@@ -57,7 +57,7 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 
 ### 2.1 手順
 
-- **合成の写真15枚**（[`tools/gen_acceptance_photos.py`](../../tools/gen_acceptance_photos.py)。乱数から作った画像。座標は駅・城・歌劇場の公開の代表点、撮影時刻は架空。`mtime`は固定）を、RustとPythonの`photos/`に同じバイト列・同じ`mtime`で置いた。内訳: GPSありのJPEG3枚（東京駅・皇居（長辺3200px）・京都駅（EXIFの向き6））、GPSなしのJPEG5枚（GPSありの写真の10分後・1時間30分後・8時間後・どの合成の写真からも9日後・撮影時刻なし）、同じバイト列のJPEG2枚（1枚は`sub/`の下）、GPSありで2分違いのほぼ同じJPEG2枚、GPSありのHEIC1枚とその5分後のGPSなしのJPEG1枚、国外（シドニー）のJPEG1枚。
+- **合成の写真15枚**（[`tools/gen_acceptance_photos.py`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/tools/gen_acceptance_photos.py)。乱数から作った画像。座標は駅・城・歌劇場の公開の代表点、撮影時刻は架空。`mtime`は固定）を、RustとPythonの`photos/`に同じバイト列・同じ`mtime`で置いた。内訳: GPSありのJPEG3枚（東京駅・皇居（長辺3200px）・京都駅（EXIFの向き6））、GPSなしのJPEG5枚（GPSありの写真の10分後・1時間30分後・8時間後・どの合成の写真からも9日後・撮影時刻なし）、同じバイト列のJPEG2枚（1枚は`sub/`の下）、GPSありで2分違いのほぼ同じJPEG2枚、GPSありのHEIC1枚とその5分後のGPSなしのJPEG1枚、国外（シドニー）のJPEG1枚。
 - **Rust**: 検証環境の中の複製（§1と同じ`catalog.pre`のコピー）に対して、`sync --dry-run`のあと`GEOFRAME_INGEST=1 geoframe sync`を**2サイクル**。
 - **Python**: 別の複製（同じ`catalog.pre`のコピー、`derivatives/`はハードリンク）に、`pyref`のvenvで`from geoframe.catalog import cycle; cycle()`を**2サイクル**（比較用Pythonのサービスのデータ`/var/lib/geoframe-pyref`は触らない）。
 - `.cache.json`は両方に比較用Pythonのもの（`muni_table`だけ）を置いた。**地理院は本物に問い合わせた**: Rustの`enrich`は`candidates=14 foreign=2 cache_hit=6 queried=6 resolved=6`（逆ジオ6＋標高6の要求。dry-runの`would_query=6`と一致）。

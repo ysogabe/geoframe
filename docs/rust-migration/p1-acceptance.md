@@ -14,7 +14,7 @@
 | Rust | `geoframe-rs.service`（[`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)）を**3回目の修正後の**`deploy/rust-deploy.sh`で配り直し（検査・転送・入れ替え・確認OK、終了コード0。バイナリの sha256 は前回と同じ）、`:8080`に常駐（enable済み）。`User=geoframe`、データは`/var/lib/geoframe`（本番2026-10-24 06:17のバックアップのコピー、`catalog.db`は6,535行） |
 | 比較用Python | `geoframe-pyref.service`（`:8090`、データ`/var/lib/geoframe-pyref`）。AI・Drive無効。今回、本番と同じ`GEOFRAME_EMBED_BACKEND=local`を足した |
 | 環境変数 | 両方とも`GEOFRAME_EMBED_BACKEND=local`（本番の`/etc/default/geoframe`にある、出力に影響する設定はこれだけ。ほかの2項目はタイルの`User-Agent`とHost名で、出力に影響せず、前者には連絡先が入っているので写していない） |
-| 比較 | 手元（開発機）から、LAN越しに両方へ同じ要求を送る。[`tools/compare_with_python.py`](../../tools/compare_with_python.py)（標準ライブラリだけ） |
+| 比較 | 手元（開発機）から、LAN越しに両方へ同じ要求を送る。[`tools/compare_with_python.py`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/tools/compare_with_python.py)（標準ライブラリだけ） |
 
 ## 2. 全件比較（Rust と 比較用Python）
 

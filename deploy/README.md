@@ -1,21 +1,33 @@
 # GEOFRAMEのデプロイ
 
 このディレクトリには、Linuxサーバー向けのsystemd unitと運用スクリプトの構成例があります。
-アプリケーションを`/opt/geoframe`へ配置し、変更されるデータを`/var/lib/geoframe`へ保存し、
-権限を制限した`geoframe`ユーザーでサービスを実行する構成を想定しています。
+GEOFRAMEはRustの単一バイナリ（`/usr/local/bin/geoframe`）です。リポジトリのcheckoutを`/opt/geoframe`へ置いて
+unitとスクリプトの元にし、変更されるデータを`/var/lib/geoframe`へ保存し、権限を制限した
+`geoframe`ユーザーでサービス（`geoframe-rs.service`）を実行する構成を想定しています。
 
 > [!WARNING]
 > GEOFRAMEには利用者認証がありません。localhostへバインドするか、信頼できるLAN内だけで
 > 使用してください。ポート8080をインターネットへ直接公開しないでください。
 
+> [!NOTE]
+> Python版（`geoframe-server.service`・`deploy-pull.sh`・venv）は、P5bで本リポジトリから削除しました
+> （Python版は、P5aのマージのコミット
+> [`a804623`](https://github.com/ysogabe/geoframe-ambient-display/tree/a804623029ad67d415692d08ea3182fd765eb2a4)
+> まで存在します）。本番の戻しの猶予期間のあいだ、本番の`/opt/geoframe`はそのコミットに固定されたままで、
+> Python版へ戻す手順は[`docs/rust-migration/cutover.md`](../docs/rust-migration/cutover.md)にあります。
+
 ## 前提条件
 
-- Python 3.10以降を利用できるDebianまたはUbuntu系Linux
-- `python3-venv`、`sqlite3`、`git`、`curl`
-- 同梱unitを使う場合は`systemd`
-- サーバーからgithub.comへのSSH到達性（TCP 22）。コードは本機がgitで取得します（§5参照）
+- x86_64のDebianまたはUbuntu系Linux。`sqlite3`、`git`、`curl`
+- `systemd`（同梱unitを使う場合）
+- サーバー上にPython・venv・Rustのツールチェーンは**要りません**。バイナリは別の機体でビルドして配ります
+  （`x86_64-unknown-linux-musl`の完全静的ビルド。[build.md](../docs/rust-migration/build.md)）。
+- システムの`python3`（標準ライブラリだけ。pipで何も入れない）は、§2.3の毎朝のDecisionタイマー
+  （`loc_decision_morning.py`）を使う機体にだけ要ります。`geoframe-loc-decision.service`は
+  `/usr/bin/python3 -I`で起動します。その試験は`python3 -m unittest discover -s deploy/tests`です。
+- サーバーからgithub.comへのSSH到達性（TCP 22）。`/opt/geoframe`のcheckoutを`git fetch`で更新するときに使います（§5参照）
 
-## 1. アプリケーションの配置
+## 1. checkoutの配置
 
 ログインシェルとホームディレクトリを持たないシステムユーザーを作ります。
 
@@ -23,6 +35,9 @@
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin geoframe
 sudo install -d -o root -g root -m 0755 /opt/geoframe
 ```
+
+`/opt/geoframe`はコードを動かす場所ではなく、`deploy/`のスクリプトとunitの元を置くcheckoutです
+（`rust-deploy.sh --production`はここから実行し、ここの`deploy/geoframe-rs.service`を入れます）。
 
 ### 1.1 Deploy Keyの用意
 
@@ -83,31 +98,6 @@ sudo git fetch origin
 `gc.auto 0`は、自動gcが到達不能になった古いコミットを回収してしまうのを防ぎます
 （ロールバックの手段を残すため。§6参照）。
 
-> [!NOTE]
-> `git clone`は空でないディレクトリに対しては失敗します。rsync方式で運用していた
-> 既存機を移行する場合は、`/opt/geoframe`に`app/.venv`などが既にあるため、
-> cloneではなく既存ディレクトリをそのままgit管理下に置いてください。この手順なら
-> 未追跡の仮想環境を作り直さずに済みます。
->
-> rsync方式では`/opt/geoframe`は`geoframe:geoframe`所有でした。**`git init`より先に
-> 所有者を`root:root`へ揃えてください。** 順序を逆にすると、`root`が`geoframe`所有の
-> ツリーに対してgitを実行することになり`fatal: detected dubious ownership`で止まり、
-> 対処のつもりでトラブルシュートの`safe.directory`例外登録に頼りたくなりますが、
-> それは所有者を直さない限り安全な代替にはなりません（トラブルシュート参照）。
->
-> ```sh
-> sudo chown -R root:root /opt/geoframe
-> cd /opt/geoframe
-> sudo git init
-> sudo git remote add origin git@github.com:ysogabe/geoframe-ambient-display.git
-> # 上記の core.sshCommand / gc.auto を設定してから
-> sudo git fetch origin
-> sudo git reset --hard origin/main
-> # rsync方式で配布された旧update-app.shは追跡外のため`reset --hard`では消えません。
-> # 実行するとGEOFRAMEのデータを削除しうる`--delete`付きrsyncが走るため、移行時に削除します。
-> sudo rm -f /opt/geoframe/deploy/update-app.sh
-> ```
-
 所有者は`root:root`に揃えます。**更新スクリプトは`root`で動くため、リポジトリの
 所有者を`geoframe`などに変えないでください**（`dubious ownership`でgitが停止します。
 トラブルシュート参照）。
@@ -117,17 +107,9 @@ sudo chown -R root:root /opt/geoframe
 sudo find /opt/geoframe -path /opt/geoframe/.git -prune -o -type d -exec chmod 0755 {} +
 ```
 
-仮想環境を作成します。`.venv`はgitの管理外（`.gitignore`済み）なので、更新時に
-作り直されることはありません。
-
-```sh
-sudo python3 -m venv /opt/geoframe/app/.venv
-sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements.txt
-```
-
 ## 2. データと秘密情報の設定
 
-同梱のサーバーunitは`StateDirectory=geoframe`により`/var/lib/geoframe`を作成します。
+同梱のunit（`geoframe-rs.service`）は`StateDirectory=geoframe`により`/var/lib/geoframe`を作成します。
 変更されるデータと、任意のGoogle Drive認証情報はここへ置きます。
 
 ```sh
@@ -136,82 +118,40 @@ sudo install -o geoframe -g geoframe -m 0600 \
   /path/to/drive_key.json /var/lib/geoframe/drive_key.json
 ```
 
-環境固有の値は`/etc/default/geoframe`へ設定します。
+環境固有の値は、systemdの`EnvironmentFile=`で渡します（Rust版は`.env`を読みません）。**値は文書・PR・ログに
+書きません**（ここには名前だけを示します）。全項目は[設定リファレンス](../docs/reference/configuration.md)にあります。
 
-```dotenv
-GEOFRAME_HOST=0.0.0.0
-GEOFRAME_ALLOWED_HOSTS=geoframe.example.test:8080
-GEOFRAME_AI_ENABLED=0
-```
-
-認証情報を含む可能性があるため、読み取り権限を制限します。
+| ファイル | 内容 | モード |
+| --- | --- | --- |
+| `/etc/default/geoframe` | 共通の設定（例: `GEOFRAME_ALLOWED_HOSTS`、`GEOFRAME_TILE_UA`）。無くても起動する | `0600 root:root` |
+| `/etc/default/geoframe-rs` | Rustだけの設定。`GEOFRAME_DATA_DIR`・`GEOFRAME_DRIVE_KEY`・`TZ`を必ず置く（無ければ起動しない）。取り込みを使うときは`GEOFRAME_INGEST=1`も | `0600 root:root` |
+| AI設定のJSON（`GEOFRAME_AI_CONFIG`が指す） | AIの用途ごとの接続先・モデル・上限・予算。鍵のパスは持つが中身は持たない | `0640 root:geoframe` |
 
 ```sh
-sudo chown root:geoframe /etc/default/geoframe
-sudo chmod 0640 /etc/default/geoframe
+sudo install -d /etc/geoframe
+sudo install -o root -g root -m 0600 /dev/null /etc/default/geoframe-rs   # 中身は各自で書く
 ```
 
-unitは`GEOFRAME_DATA_DIR=/var/lib/geoframe`と、上記認証ファイルを指す
-`GEOFRAME_DRIVE_KEY`を設定します。ホストが日本標準時以外の場合はunitの`TZ=`も変更してください。
+LAN内の別端末からHTTP 403になる場合は、アクセスに使った正確なホスト名とポートを
+`GEOFRAME_ALLOWED_HOSTS`へ追加します。IPリテラルによるアクセスは許可されますが、名前付き
+ホストは明示的な許可が必要です。ホストが日本標準時以外の場合は`TZ`も変更してください。
 
-### 2.1 ローカルembedding（任意）
+### 2.1 embeddingとAI（任意）
 
-`GEOFRAME_EMBED_BACKEND=local`にすると、写真と検索語のembeddingをこのサーバーのCPUで
-embeddinggemma-2により計算し、写真をembeddingのためにGoogleへ送らなくなります（比較評価に回す
-同一場面の候補だけは引き続きGeminiへ送ります）。目安はCPU 4スレッドで1枚1.3秒、
-プロセスのメモリ+1.5GBです。既定は`gemini`で、設定しなければ何も変わりません。
-
-1. `catalog.db`をバックアップします（§4）。
-2. 追加の依存を入れます。torchはCPU版です。`deploy-pull.sh`はこのファイルを見ないため、
-   変わったときは同じコマンドで入れ直してください。
-
-   ```sh
-   sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements-local-ai.txt
-   ```
-
-3. モデルを`/var/lib/geoframe/models/embeddinggemma-2`へ置きます（起動時にネットワークから
-   取得しません。サービスは`ProtectHome=true`なので、ホームディレクトリには置けません）。
-   Hugging Faceで`google/embeddinggemma-2`の利用条件に同意したアカウントで取得し、
-   検証済みのリビジョン`914f7f89142e33e77833254d9c9b90c3cef7303b`を使います。
-
-   ```sh
-   sudo install -d -o geoframe -g geoframe -m 0750 /var/lib/geoframe/models
-   sudo cp -rL /path/to/embeddinggemma-2 /var/lib/geoframe/models/embeddinggemma-2
-   sudo chown -R geoframe:geoframe /var/lib/geoframe/models/embeddinggemma-2
-   ```
-
-4. 切り替える前に、全写真のembeddingをキャッシュへ作っておきます。サービスは今のまま動かして
-   かまいません。8スレッドで1秒に約1枚（6,500枚で約2時間）です。省くと、切り替え後に
-   ai_workerが1分12枚ずつ作り直すため数時間かかり、その間は未embeddingの写真を含む場面が
-   グループになりません（写真は表示されたままです）。
-
-   ```sh
-   cd /opt/geoframe/app
-   sudo -u geoframe env GEOFRAME_DATA_DIR=/var/lib/geoframe \
-     nice -n 10 .venv/bin/python -m geoframe.prefill_embeddings --threads 8
-   ```
-
-5. `/etc/default/geoframe`に`GEOFRAME_EMBED_BACKEND=local`を足して再起動します。最初のサイクルで
-   キャッシュから入れ替わり、Geminiの比較評価は写真の中身が同じなら残ります。同一場面の
-   しきい値は既定で0.82から0.83に変わるため、候補の組が変わったグループ（実データでは約800中
-   約210）だけが比べ直しになります（`GEOFRAME_AI_JUDGE_PER_CYCLE`件ずつ）。
-
-   ```sh
-   sudo systemctl restart geoframe-server.service
-   curl --fail http://127.0.0.1:8080/api/ai/status
-   ```
-
-   `embedding_backend`が`local`、`other_model_embeddings`が0になれば入れ替え完了です。
-
-戻すときは`GEOFRAME_EMBED_BACKEND`の行を消して再起動します。Geminiのembeddingはキャッシュに
-残っているので、作り直し（課金）は起きません。
+AIは用途（画像のembedding・検索語のembedding・同一場面の比較・撮影地の手がかりと推定）ごとに、
+`GEOFRAME_AI_CONFIG`のJSONで接続先・モデル・上限を決めます（[ai-config.md](../docs/rust-migration/ai-config.md)、
+embeddingの契約は[ai-embedding.md](../docs/rust-migration/ai-embedding.md)）。このJSONが無ければ、Rust版は
+推論を始めません（写真の配信・取り込み・品質解析は動きます）。旧Python版にあった、このサーバーのCPUで
+embeddinggemma-2を動かす方式（`GEOFRAME_EMBED_BACKEND=local`の`requirements-local-ai.txt`と
+`prefill_embeddings`）はRust版にはありません。ローカルのembeddingは、別のサービスのAPIを
+AI設定の`local_base_url`で指します。
 
 ### 2.2 学習済みの順位付け（任意）
 
 同一場面グループの中の順位（Geminiに見せる最大6枚の選択と、その並び）を、過去のGemini比較評価から
 学習した線形モデルで付けられます。モデルは家庭の写真の評価から作るため、リポジトリには入れず、
-`/var/lib/geoframe/models/rank_model.json`（`GEOFRAME_RANK_MODEL`）に置きます。読み込みは
-ファイルの更新を検知して自動で行うので、再起動は要りません。
+`/var/lib/geoframe/models/rank_model.json`（`GEOFRAME_RANK_MODEL`）に置きます。置き換えたあとは、
+再起動すると確実に使われます。
 
 ```sh
 sudo install -o geoframe -g geoframe -m 0640 rank_model.json /var/lib/geoframe/models/rank_model.json
@@ -227,8 +167,8 @@ sudo install -o geoframe -g geoframe -m 0640 rank_model.json /var/lib/geoframe/m
 
 位置なし写真の撮影地候補は、Decision が動いている間だけ判定が進みます
 （[写真パイプライン](../docs/architecture/photo-pipeline.md)）。gpu-eval の Decision は今は常駐で、
-geoframe は同じ機体の LAN 入口（既定 `GEOFRAME_DECISION_URL=http://127.0.0.1:8100/llm-decision`）経由で
-呼び、どの要求にも呼び出し元の名前 `X-Client-Name: geoframe` を付けます（入口は名前ごとに日ごとにまとめます）。
+geoframe は同じ機体の LAN 入口（AI 設定の`local_base_url`に固定のパスを付ける。
+[ai-config.md](../docs/rust-migration/ai-config.md)）経由で呼び、どの要求にも呼び出し元の名前 `X-Client-Name: geoframe` を付けます（入口は名前ごとに日ごとにまとめます）。
 Decision が常駐している間は、この節のタイマーは「人が起動済み」として何もしません。
 常駐をやめて必要なときだけ動かす運用に戻す場合のために、毎朝5:00に次の順で確かめ、
 必要なときだけ Decision を動かすタイマーを用意しています
@@ -249,7 +189,7 @@ Decision が常駐している間は、この節のタイマーは「人が起�
    15分の猶予のあいだは Decision を動かしたまま待つ。旧 Python など `clue_runnable` が無いときは
    `clue_pending` だけで見る
 
-判定が終わった日の Gemini への問い合わせは geoframe-server が続けるので、Decision を止めても
+判定が終わった日の Gemini への問い合わせは geoframe（`geoframe-rs.service`）が続けるので、Decision を止めても
 候補づくりは進みます。
 
 llm-manager は誰かが lease を取ると Decision を含む常駐を止め、lease が終わると起動し直します。
@@ -258,7 +198,7 @@ llm-manager は誰かが lease を取ると Decision を含む常駐を止め、
 ときは上限の時間まで戻るのを待って止め、それでも戻らなければ翌朝、印のある Decision を
 引き継いで止めます（人が起動した Decision には印が無いので触りません）。
 
-Decision を動かしているユーザーで入れます。
+Decision を動かしているユーザーで入れます（`ExecStart`はシステムの`/usr/bin/python3 -I`。標準ライブラリだけなので、pipもvenvも要りません）。
 
 ```sh
 install -m 0644 /opt/geoframe/deploy/geoframe-loc-decision.service \
@@ -276,24 +216,15 @@ systemctl --user list-timers geoframe-loc-decision.timer
 
 ## 3. サーバーの有効化
 
+unitは`rust-deploy.sh`が`/usr/local/lib/systemd/system/geoframe-rs.service`へ入れます（§7.1・§7.3。手でunitを置かない）。
+本番の初回の切替は、手順書（[`cutover.md`](../docs/rust-migration/cutover.md)）の段に従ってください。有効化したあとの確認とログは次のとおりです。
+
 ```sh
-sudo install -o root -g root -m 0644 \
-  /opt/geoframe/deploy/geoframe-server.service \
-  /etc/systemd/system/geoframe-server.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now geoframe-server.service
+systemctl is-enabled geoframe-rs && systemctl is-active geoframe-rs
+curl --fail http://127.0.0.1:8080/healthz
 curl --fail http://127.0.0.1:8080/api/admin/status
+journalctl -u geoframe-rs.service -f
 ```
-
-ログは次のコマンドで確認します。
-
-```sh
-journalctl -u geoframe-server.service -f
-```
-
-LAN内の別端末からHTTP 403になる場合は、アクセスに使った正確なホスト名とポートを
-`GEOFRAME_ALLOWED_HOSTS`へ追加します。IPリテラルによるアクセスは許可されますが、名前付き
-ホストは明示的な許可が必要です。
 
 ## 4. バックアップ
 
@@ -329,155 +260,85 @@ sudo -u geoframe gzip -t /var/backups/geoframe/latest.db.gz
 
 ## 5. 更新
 
-更新はサーバー自身が`origin/main`を取り込むpull方式です。スクリプトは2つに分かれます。
+Rust版の更新は、**バイナリの入れ替え**です。コードを`/opt/geoframe`で動かすのではなく、別の機体で
+ビルドしたバイナリを`rust-deploy.sh`が`/usr/local/bin/geoframe`へ入れ、unitを入れ直し、確認します。
+Python版の更新に使っていた`deploy-pull.sh`（fetch・`git reset --hard`・`pip install`・再起動）と、そのMac側の
+ラッパー`deploy.sh`は、Pythonの運用専用だったのでP5bで削除しました。
 
-| スクリプト | 実行場所 | 役割 |
-| --- | --- | --- |
-| [`deploy-pull.sh`](deploy-pull.sh) | サーバー上（root） | 実体。fetch、差分表示、サービス停止、`git reset --hard`、依存の再インストール、起動、HTTP正常性確認 |
-| [`deploy.sh`](deploy.sh) | Mac（このリポジトリ内） | 薄いラッパー。`ssh -t <target> "sudo /opt/geoframe/deploy/deploy-pull.sh ..."`を実行するだけ |
+1. **ビルド**（Rustのツールチェーンのある機体で）: `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`
+   （[build.md](../docs/rust-migration/build.md)）。成果物の`sha256`を控える。
+2. **checkoutを手で更新**（本番機の`/opt/geoframe`。unitとスクリプトの元を新しくするため）:
 
-Macから使う場合は、必ず接続先を明示し、最初にdry-runを実行してください。
+   ```sh
+   sudo git -C /opt/geoframe rev-parse HEAD     # 更新の前のSHA。戻すときのために控える
+   sudo git -C /opt/geoframe fetch origin
+   sudo git -C /opt/geoframe reset --hard <SHA>
+   sudo git -C /opt/geoframe rev-parse HEAD     # 更新後のSHA。--expect-commit に渡す
+   ```
 
-```sh
-./deploy/deploy.sh --dry-run --target operator@geoframe.example.test
-./deploy/deploy.sh --target operator@geoframe.example.test
-```
+   **サーバー上で`/opt/geoframe`のファイルを直接編集しないでください。** 配布の道具は追跡下のファイルの変更があると
+   断ります（§7.3）。`git reset --hard`が触るのは追跡下のファイルだけで、`git clean`は実行しません。
+   実データは`/var/lib/geoframe`にあり、リポジトリの外です。ファイルのモードはgitに任せ、
+   一律の`chmod`はしません（`*.sh`の実行ビットを潰すと`geoframe-backup.service`が`203/EXEC`で失敗します）。
+   ディレクトリは`root:root`の755のままにします。`git gc`・`git prune`は実行しません（§6）。
+3. **バックアップ**: DBスキーマを変える更新の前には、必ず手動で取る。
 
-サーバーへ直接入って実行することもできます。
+   ```sh
+   sudo -u geoframe /opt/geoframe/deploy/backup-catalog.sh
+   ```
 
-```sh
-sudo /opt/geoframe/deploy/deploy-pull.sh --dry-run
-sudo /opt/geoframe/deploy/deploy-pull.sh
-```
-
-`--dry-run`は取り込まれるコミットと変更ファイルを表示するだけで、サービスの停止・起動、
-`git reset --hard`、`pip install`のいずれも行いません。`HEAD`が既に`origin/main`と
-同一で、**かつ追跡ファイルが直接編集されていない場合**は「変更なし」と表示してサービスに
-触れずに終了します。サーバー上で直接編集された追跡ファイルがある場合は、取り込むコミットが
-無くても「変更なし」とは扱わず、該当ファイルを一覧表示したうえで`git reset --hard`で正規の
-状態へ戻します（`--dry-run`では一覧表示までで、`reset --hard`は行いません）。
-
-`deploy-pull.sh`は仮想環境そのものを作りません。§1で`.venv`と依存を作成済みであることが
-前提で、以降は`requirements.txt`に差分があるときだけ`pip install`を実行します。
-
-動作上の要点は次のとおりです。
-
-- **`git pull --ff-only`ではなく`git reset --hard`を使います。** GitHub側はsquash merge /
-  force-pushの運用が続く前提で、履歴が線形に伸びるとは限らず、`--ff-only`はforce-pushの
-  たびに失敗して手作業を要求します。サーバーはデプロイ専用でローカル編集を持たない
-  （持ってはいけない）ため、「originが常に正、手元の差分は捨てる」という運用と
-  `reset --hard`の意味が一致します。**サーバー上で`/opt/geoframe`のファイルを直接
-  編集しないでください。次の更新で無言のうちに捨てられます。**これは`origin/main`側に
-  新しいコミットが無い場合も同じです（スクリプトは作業ツリーの汚れも検出し、
-  `reset --hard`で戻します）。
-- **本番データは影響を受けません。** `git reset --hard`が触るのは追跡下のファイルだけで、
-  `git clean`は実行しません。`app/.venv/`、`app/var/`、`.env`、`drive_key.json`はいずれも
-  `.gitignore`済みで追跡されておらず、そのまま残ります。実データは`/var/lib/geoframe`にあり、
-  リポジトリの外です。
-- **ファイルのパーミッションはgitに任せます。** `reset --hard`はインデックスに記録された
-  モード（`100644` / `100755`）を復元するため、rsync方式で必要だった「ファイルを一律644に
-  してから`*.sh`へ`+x`を付け直す」後処理は不要です。むしろ有害で、実行すると
-  `backup-catalog.sh`の実行ビットを潰して`geoframe-backup.service`が`203/EXEC`で
-  失敗します。スクリプトが正規化するのは**ディレクトリの755のみ**です。
-- **`requirements.txt`が変わったときだけ`pip install`が走ります。** 適用前後のコミットの
-  比較に加えて、作業ツリーでの直接編集も判定に含めます。差分の確認自体に失敗した場合は
-  安全側へ倒して再インストールします（判定を誤ってスキップすると、古い`.venv`のまま起動して
-  後から`ImportError`としてしか露見しないためです）。変更が無ければスキップした旨をログへ出します。
-- **`git gc` / `git prune`は実行しません。** ロールバック用に古いコミットオブジェクトを
-  残すためです（§6）。
-- 適用に失敗した場合は、サービスが停止したままになる可能性があります。スクリプトは
-  失敗時に復旧コマンド（適用前のSHAへの`git reset --hard`とサービス起動）をログへ出します。
+4. **配布**: `sudo /opt/geoframe/deploy/rust-deploy.sh --production=<ホスト名> --bin=<バイナリ> --expect-sha256=<値> --expect-commit=<SHA> --expect-min-photos=<件数>`
+   （引数・拒否の条件・終了コードは§7.3。`--check-only`で変更の前の検査だけ先にできる）。検証環境へは、手元から`deploy/rust-deploy.sh`（ssh・ビルドあり）。
 
 > [!IMPORTANT]
-> pull方式では、**サーバーからgithub.comへ外部到達できることが新たに必要**になります。
-> rsync方式ではLAN内で完結していました。ファイアウォールやプロキシでサーバーの外向き
-> 通信を制限している場合は、github.comへのSSH（TCP 22）を許可してください。
-> なお、これは更新時の外向き通信だけで、GEOFRAME自体を外部へ公開するものではありません。
-
-DBスキーマを変更する更新の前には、必ず手動バックアップを取得してください。
-
-```sh
-ssh operator@geoframe.example.test \
-  'sudo -u geoframe /opt/geoframe/deploy/backup-catalog.sh'
-```
+> 本番の切替の直後は、**戻しの猶予期間**です。このあいだ本番の`/opt/geoframe`はP5aのマージのコミットに
+> 固定されていて（`/etc/geoframe/checkout-pinned`）、この手順の2（checkoutの更新）はしません。
+> 期間が終わってからの片付けと、新しいmainへの更新は
+> [`cutover.md` §13](../docs/rust-migration/cutover.md)の手順に従ってください。
 
 ## 6. ロールバック
 
-更新後に問題が起きた場合は、適用前のコミットへ戻します。`deploy-pull.sh`は完了時と
-失敗時の両方に、適用前の`HEAD`（`OLD_HEAD`）のSHAをログへ出しています。
+Rust版の戻しは2段あります。
 
-```
-[deploy-pull] 更新完了: 1a2b3c4... -> 5d6e7f8...
-[deploy-pull] この更新を取り消すには:
-[deploy-pull]   cd /opt/geoframe && sudo git reset --hard 1a2b3c4... && sudo systemctl restart geoframe-server
-```
+- **直前のバイナリとunit（`.prev`）へ戻す**: `sudo /opt/geoframe/deploy/rust-deploy.sh --rollback --production=<ホスト名>`
+  （§7.3）。戻せるのは直前の1世代だけです。初回の配布には`.prev`が無いので使えません。
+- **checkoutを前のコミットへ戻す**: 更新後に、`/opt/geoframe`のunitやスクリプトを前の状態へ戻したいとき。
+  更新の前の`HEAD`は、§5の手順2の最初の`rev-parse`の出力に控えておきます。
 
-出力を控えていない場合は、サーバー上でreflogから探せます。
+  ```sh
+  sudo git -C /opt/geoframe reset --hard <控えたSHA>
+  ```
 
-```sh
-cd /opt/geoframe
-sudo git reflog
-```
+  出力を控えていない場合は、サーバー上でreflogから探せます。reflogのエントリには有効期限があります
+  （既定で到達可能なもの90日、到達不能なもの30日）。`gc.auto 0`（§1.2）によりコミットオブジェクト自体は
+  残るので、確実な記録は更新時に控えたSHAです。GitHub側でforce-pushやsquash mergeが行われて
+  `origin/main`の履歴から消えたコミットも、ローカルにオブジェクトが残っていれば戻せます。
 
-ただしreflogのエントリには有効期限があります（既定で到達可能なもの90日、到達不能なもの30日）。
-`gc.auto 0`によりコミットオブジェクト自体は残りますが、reflogから名前が消えるとSHAを
-探しづらくなります。**確実な記録は`deploy-pull.sh`の実行ログに出るSHA**で、reflogは
-その控えを失った場合の代替手段と考えてください。
+Python版へ戻す手順（猶予期間中の数分で戻す・片付けのあとに戻す）は、[`cutover.md` §8・§13.2](../docs/rust-migration/cutover.md)にあります。
 
-戻す手順です。サービスを止めてから戻し、起動して正常性を確認します。
-`ROLLBACK_SHA`には戻したいコミットのSHAを入れます。
+## 7. Rust 版の unit と配布の道具
 
-```sh
-ROLLBACK_SHA=1a2b3c4
-sudo systemctl stop geoframe-server
-cd /opt/geoframe
-sudo git reset --hard "$ROLLBACK_SHA"
-sudo find /opt/geoframe -path /opt/geoframe/.git -prune -o -path /opt/geoframe/app/.venv -prune -o -type d -exec chmod 755 {} +
-sudo systemctl start geoframe-server
-curl --fail http://127.0.0.1:8080/api/admin/status
-```
-
-戻した先で`requirements.txt`が異なる場合は、依存も戻してください。
-
-```sh
-sudo /opt/geoframe/app/.venv/bin/pip install -r /opt/geoframe/app/requirements.txt
-```
-
-> [!NOTE]
-> GitHub側でforce-pushやsquash mergeが行われると、戻したいコミットが`git log`にも
-> `origin/main`の履歴にも現れなくなります。それでもサーバーのローカルにオブジェクトが
-> 残っていれば`git reset --hard <SHA>`で戻せます。SHAは`git reflog`から探してください。
-> §1.2で`gc.auto 0`を設定しているのは、自動gcがこの到達不能オブジェクトを回収して
-> ロールバック手段を失わせるのを防ぐためです。`deploy-pull.sh`も`git gc` / `git prune`を
-> 実行しません。
->
-> ロールバックした状態は`origin/main`より古いため、次に`deploy-pull.sh`を実行すると
-> 再び`origin/main`へ進みます。問題のあるコミットはGitHub側で修正してください。
-
-## 7. Rust 版（移行中。本番の切替は P5）
-
-Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作業（[Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)）の途中経過です。
-**Rust 版は既定で読み取り専用（`GEOFRAME_INGEST`を設定しない限り DB に書かない）です。本番の切替は P5**（[計画](../docs/rust-migration/plan.md)）で、
-ユーザーの立ち会いのもと、段ごとの許可を得て行います。切替までは、ここまでの§1〜§6（Python 版）が現行の本番の手順で、変わりません。
-**本番の切替の手順（準備・保全・切替・確認・AI の書き込み系の操作・戻す・切り替え直す・復元・切替のあとの数日・クラウド AI の有効化・戻しの猶予期間と片付け）は、[`docs/rust-migration/cutover.md`](../docs/rust-migration/cutover.md)にあります。**
+本番は Rust の単一バイナリで動きます（P5aで切替の道具を入れ、P5bでPython版をリポジトリから外しました。
+計画は[plan.md](../docs/rust-migration/plan.md)）。**Rust 版は既定で読み取り専用です（`GEOFRAME_INGEST`を設定しない限り DB に書かない）。**
+**本番の切替・戻し・復元の手順（準備・保全・切替・確認・AI の書き込み系の操作・戻す・切り替え直す・復元・切替のあとの数日・クラウド AI の有効化・戻しの猶予期間と片付け）は、[`docs/rust-migration/cutover.md`](../docs/rust-migration/cutover.md)にあります。**
 本番の操作はこの節ではなく手順書に従ってください（各段に目的・コマンド・確かめること・失敗したときの対処があります）。
-手順書の外で、本番機（`geoframe-server` が動いている機体）にこの節の unit・スクリプトを使わないでください。`rust-deploy.sh --production`（§7.3）は、
-手順書のとおりの段で、ユーザーの立ち会いのもとでだけ実行します。この節は、道具の引数・拒否の条件・終了コードの**リファレンス**です。
+`rust-deploy.sh --production`（§7.3）は、手順書のとおりの段で、ユーザーの立ち会いのもとでだけ実行します。
+この節は、道具の引数・拒否の条件・終了コードの**リファレンス**です。
 
 | ファイル | 役割 |
 | --- | --- |
-| [`geoframe-rs.service`](geoframe-rs.service) | Rust 版の systemd unit。`geoframe-server.service` と同じハードニングに、Rust 版だけ付けられる`MemoryDenyWriteExecute=true`と、追加の制限を足す |
+| [`geoframe-rs.service`](geoframe-rs.service) | Rust 版の systemd unit。ハードニングに加えて、Rust 版だけ付けられる`MemoryDenyWriteExecute=true`と、追加の制限を足す |
 | [`rust-deploy.sh`](rust-deploy.sh) | 検証環境へ: 手元でビルド（`x86_64-unknown-linux-musl`の完全静的）→ 検証環境の確認 → 転送 → 入れ替え → 確認 → 失敗時の復元。本番へ: `--production=…`（ssh なし・ビルドなし・その機体で root として直接。§7.3） |
 | [`rust-deploy-test.sh`](rust-deploy-test.sh) | `rust-deploy.sh`の本体（検証環境の経路と`--production`）を、モックの`systemctl`/`curl`/`hostname`で試験する（ssh もサービスも使わない） |
 | [`geoframe-admin.sh`](geoframe-admin.sh) | `geoframe`の CLI（`ai-jobs`など）を、サービスと同じユーザー・同じ設定のファイル・同じ制限で動かす（`systemd-run`。root で直接動かさない）。動かす前に DATA_DIR（パスだけ）を出す |
-| [`geoframe-admin-test.sh`](geoframe-admin-test.sh)・[`deploy-pull-test.sh`](deploy-pull-test.sh) | `geoframe-admin.sh`・`deploy-pull.sh`の拒否を、モックの`systemd-run`/`systemctl`で試験する |
-| [`../tools/compare_with_python.py`](../tools/compare_with_python.py) | Rust 版と比較用 Python 版の全件比較（集計だけを出す） |
+| [`geoframe-admin-test.sh`](geoframe-admin-test.sh) | `geoframe-admin.sh`の拒否を、モックの`systemd-run`/`systemctl`で試験する |
+| [`loc_decision_morning.py`](loc_decision_morning.py)・[`tests/`](tests/) | 毎朝のDecision起動（§2.3）。標準ライブラリだけのPython。システムの`python3`で動き、試験は`python3 -m unittest discover -s deploy/tests`（pip不要） |
 | [`../tools/miharashi-feed-check/`](../tools/miharashi-feed-check/README.md) | miharashi の取得・読み込みのコードを、画面なしで Rust 版に向けて動かす確認用ハーネス |
 
 ### 7.1 unit の要点
 
 - バイナリは`/usr/local/bin/geoframe`、`geoframe serve`をそのまま起動する（`app/`も`.venv`も要らない）。
-- **unit の本体は`/usr/local/lib/systemd/system/geoframe-rs.service`に置く**（`rust-deploy.sh`が入れる。Python 版も切替の手順で同じ場所へ移す）。
+- **unit の本体は`/usr/local/lib/systemd/system/geoframe-rs.service`に置く**（`rust-deploy.sh`が入れる。猶予期間中の本番では、Python 版も切替の手順で同じ場所へ移してある）。
   `/etc/systemd/system/`には、`systemctl mask`のリンクと drop-in（`*.service.d/`）だけを置く（mask は`/etc/systemd/system/<unit>`に`/dev/null`へのリンクを作るので、
   そこに本体のファイルがあると失敗する）。`/etc/systemd/system/geoframe-rs.service`に古い本体があると、systemd はそちらを優先するので、`rust-deploy.sh`は断る（先に退避する）。
 - `User=geoframe`、`StateDirectory=geoframe`（`/var/lib/geoframe`）、`EnvironmentFile=-/etc/default/geoframe`（Python 版と共通）のあとに
@@ -504,7 +365,7 @@ Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作�
   `LockPersonality`、`RestrictSUIDSGID`、`PrivateDevices`、`SystemCallArchitectures=native`、`UMask=0027`（作るファイルは所有者とグループだけが読める）。
 - `ReadOnlyPaths=`は、`photos/`・`drive_key.json`・`models/`だけ（writer が書く`catalog.db`・`derivatives/`は P2 で、旅行ブログの保存・書き出しが書く`travel_blog/`・`blog_exports/`は P3 / T3.6 で外した。`tmp/`・`.cache.json`・`.ingest.lock`は元から対象外）。
   WAL の DB は読み取りでも同じディレクトリに`-shm`/`-wal`を作るので、ディレクトリ自体は書き込み可のまま。
-  **`GEOFRAME_INGEST=0`（既定）の間は、旅行ブログの保存・書き出し（`POST /api/blog/save`・`export`）は書かずに 503 を返す**ので、外しても下書き・書き出しは変わらない（P5 の切替まで本番で下書きを書くのは Python 版。書き出しの `dry_run` だけは何も書かないので答える）。取り込みを有効にした検証環境では、Rust も`travel_blog/drafts/`と`blog_exports/`に書く（検証環境で Python と同じ`DATA_DIR`を使うときは、Python と Rust が同じ下書きを書きうる。比較用 Python には別の`DATA_DIR`を使う）。
+  **`GEOFRAME_INGEST=0`（既定）の間は、旅行ブログの保存・書き出し（`POST /api/blog/save`・`export`）は書かずに 503 を返す**ので、外しても下書き・書き出しは変わらない（切替の前に下書きを書いていたのは Python 版。書き出しの `dry_run` だけは何も書かないので答える）。取り込みを有効にした検証環境では、Rust も`travel_blog/drafts/`と`blog_exports/`に書く（検証環境で Python と同じ`DATA_DIR`を使うときは、Python と Rust が同じ下書きを書きうる。比較用 Python には別の`DATA_DIR`を使う）。
 - 地図タイル（`/tiles/`）と地名検索（`/api/admin/geocode`）は外向きに通信する。OSM のタイルは`GEOFRAME_TILE_UA`（連絡先入り。未設定なら既定値）、地名検索（地理院・Nominatim）も同じ`GEOFRAME_TILE_UA`を User-Agent に送る（Python は地名検索に固定の`GeoFrame/0.2`）。地理院は検証環境で実通信を確認した（P3）が、**OSM のタイルと Nominatim の実通信は未確認で、P5 の本番切替の前に済ませる持ち越し**（ユーザーが検証環境の`/etc/default/geoframe`に連絡先入りの`GEOFRAME_TILE_UA`を足したあと。docs/rust-migration/plan.md P3・P5）。タイルのキャッシュ（`tile_cache/`）は`GEOFRAME_INGEST=0`でも書く（`catalog.db`ではなく`DATA_DIR`の下）。
 - 旅行ブログの旅程 JSON（`web/travel_blog/plans/*.json`）は**バイナリに埋め込まれる**（実行時に`web/`を読まない）。旅程を足す・直すのは再ビルド・再配布。再ビルドなしで差し替えるときだけ、`GEOFRAME_BLOG_PLANS_DIR`にディレクトリを与える（Rust だけの項目。そのディレクトリの`*.json`だけを読み、埋め込みは使わない。[server.md §20.1](../docs/rust-migration/server.md)）。下書きと書き出しは`DATA_DIR`の下（`travel_blog/drafts/`・`blog_exports/`）で、読み取りの API（`/api/blog/trips`・`trip`・`candidates`・`draft`）は`GEOFRAME_INGEST=0`でも動く。
   `catalog.db`を別の inode に置き換えたら（バックアップからの復元など）再起動する。
@@ -516,11 +377,10 @@ Python 製のサーバー（`app/`）を Rust の単一バイナリへ移す作�
   状態の確認とやり直しは`geoframe ai-jobs`: `status`（読み取りだけ。稼働中でも可。件数と固定の理由コードだけ）、`retry (--kind <種類>|--all)`（失敗だけを再検査。外部へ送らない。検査できない種類は保持して件数だけ報告）、`release-pause (--task <用途>|--all)`（認証・契約の不一致で止まったProvider・用途の明示解除）。`retry`と`release-pause`は書くので、**サービスを止めてから**`GEOFRAME_INGEST=1`で実行する（`sync`と同じ印・Pythonの確認を通す。稼働中は`.ingest.lock`で断る）。
 - **待ち受けは`--listen`を書かない**。`GEOFRAME_HOST`/`GEOFRAME_PORT`（既定`0.0.0.0:8080`）で決まる。
 
-### 7.2 Rust 版を Python 版と並走させる（P1〜P4 の検証）
+### 7.2 別のポートで動かす（検証）
 
-同じ機体で Python 版と Rust 版を同時に動かすなら、**待ち受けとデータ置き場を分ける**。
-Python 版と Rust 版は同じ`catalog.db`を同時には開かない（Python は起動時の移行・位置推定で DB へ書く）。
-Rust 版へ別のポートを与えるには、drop-in の`ExecStart=`に`--listen`を書く（`--listen`は`GEOFRAME_HOST`/`GEOFRAME_PORT`より優先され、それらを読まない）。
+同じ機体で2つ目の Rust 版（別の`DATA_DIR`）を動かすなど、待ち受けを分けたいときは、drop-in の`ExecStart=`に`--listen`を書く
+（`--listen`は`GEOFRAME_HOST`/`GEOFRAME_PORT`より優先され、それらを読まない）。**同じ`catalog.db`を2つのプロセスで同時には開かない**。
 
 ```sh
 sudo systemctl edit geoframe-rs
@@ -532,9 +392,6 @@ ExecStart=
 ExecStart=/usr/local/bin/geoframe serve --listen 0.0.0.0:8081
 ```
 
-検証環境（lxc-geoframe）では、Python 版を比較用に別のデータ（`/var/lib/geoframe-pyref`）・別のポート（8090）で動かし、
-Rust 版は本番のコピーのデータ（`/var/lib/geoframe`）を`:8080`で読んでいる。
-
 ### 7.3 配布と確認（検証環境と本番）
 
 ```sh
@@ -544,8 +401,7 @@ deploy/rust-deploy.sh --dry-run        # ビルドと手順の表示だけ（ssh
 deploy/rust-deploy.sh                  # ビルド→検査→転送→入れ替え→/healthz と /api/v1/photos の確認
 deploy/rust-deploy.sh --skip-build     # ビルド済みの成果物をそのまま配る
 deploy/rust-deploy.sh --rollback       # 直前のバイナリ（.prev）へ手で戻す
-bash deploy/rust-deploy-test.sh        # 失敗経路と --production をモックで試験（ssh なし）。3 つの試験とも CI（test.yml の deploy ジョブ）で回る
-bash deploy/deploy-pull-test.sh        # deploy-pull.sh の拒否（固定の印・geoframe-rs の状態）をモックで試験
+bash deploy/rust-deploy-test.sh        # 失敗経路と --production をモックで試験（ssh なし）。2 つの試験とも CI（test.yml の「文書・道具」ジョブ）で回る
 bash deploy/geoframe-admin-test.sh     # geoframe-admin.sh をモックの systemd-run で試験
 ```
 
@@ -590,10 +446,6 @@ checkout の`HEAD`が`--expect-commit`（40 桁）と違う／追跡下のファ
 すぐ Python 版へ戻す（手順は`cutover.md` §8）。ただし終了コード 2・4（何も変えずに断った）は、原因がすぐ直せて配信停止の期限内に再実行できるときだけ再実行する（`cutover.md` §0.4）。入れる unit は、その checkout の`deploy/geoframe-rs.service`。
 
 サービスを止めて CLI を動かすとき（AI の書き込み系の操作など）は、`sudo deploy/geoframe-admin.sh ai-jobs …`を使う（root で直接`geoframe`を動かさない。動かす前に DATA_DIR のパスが表示される）。
-`deploy-pull.sh`（Python 版の更新）は、`/etc/geoframe/checkout-pinned`がある、または`geoframe-rs`が enabled・active・masked のとき、何もせずに終了コード 3 で断る。
-`systemctl show`の`LoadState`・`UnitFileState`・`ActiveState`はそれぞれちょうど 1 行（欠け・重複は断る）で、`LoadState`・`ActiveState`は値が空でないこと、導入済みの unit の`UnitFileState`は
-`disabled`・`static`・`indirect`・`generated`・`transient`のどれかであること（未知の値・空は断る）。未導入（`not-found`／`UnitFileState`が空／`inactive`）は通す。
-
 配置先のバイナリは入れ替えの直前に`/usr/local/bin/geoframe.prev`へ（unit も`.prev`へ）残す。**直前の 1 世代だけ**。
 
 **失敗したときの復元。** 入れ替え以降（unit の導入・`daemon-reload`・`enable`・`restart`・確認）のどこで失敗しても、
@@ -615,18 +467,18 @@ sudo chown -R geoframe:geoframe /var/lib/geoframe   # WAL の -shm を作れる�
 sudo install -m 0644 /dev/null /etc/default/geoframe # 出力に影響する設定だけ書く。本番に合わせて GEOFRAME_EMBED_BACKEND=local など
 ```
 
-全件比較（Python 版の応答との一致）は`tools/compare_with_python.py --rust <Rust のURL> --python <比較用 Python のURL>`。
-JSON は型を区別して比べる（`true`と`1`、`false`と`0`、`35`と`35.0`は別）。画像は両方が 200 を返したうえで、バイト列を比べる
-（同じエラー同士は一致に数えない）。`--self-test`で比較関数だけを試せる（接続しない）。
-結果の記録は[P1 の受入確認](../docs/rust-migration/p1-acceptance.md)。
-
 ## トラブルシュート
 
-- `status=200/CHDIR`: `/opt/geoframe/app`と親ディレクトリを`geoframe`ユーザーが通過できるか
-  確認します。
+- `status=203/EXEC`（`geoframe-rs`）: `/usr/local/bin/geoframe`が無い、または実行ビットが無い。`rust-deploy.sh`で入れ直す（§7.3）。
+  `geoframe-backup.service`が`203/EXEC`なら、`/opt/geoframe/deploy/backup-catalog.sh`の実行ビットが消えている（checkoutの一律`chmod`をしない。§5）。
+- `geoframe-rs`が`failed`で止まる: `journalctl -u geoframe-rs.service`で理由を見る。終了コード2は再起動しても直らない
+  ものです（設定の不正、rootでの実行、Python版（`geoframe-server`）の稼働中。`RestartPreventExitStatus=2`で止まる）。
+  終了コード1（DBが開けない、Python版の状態を取得できない）は再起動の対象で、`StartLimitBurst=`まで再試行して止まります。
+  直したあとは`systemctl reset-failed geoframe-rs`のあとで起動します（§7.1）。`/etc/default/geoframe-rs`が無いと
+  unitは起動しません（§2）。
 - `fatal: detected dubious ownership in repository at '/opt/geoframe'`: リポジトリの所有者と
   gitを実行しているユーザーが一致していないときに出ます。`/opt/geoframe`は`root:root`所有、
-  更新は`root`実行が前提です（§1.2）。まず`ls -ld /opt/geoframe`で所有者を確認し、
+  `git`の操作は`root`実行が前提です（§1.2）。まず`ls -ld /opt/geoframe`で所有者を確認し、
   意図せず変わっていれば`sudo chown -R root:root /opt/geoframe`で戻してください
   （所有者を直すのが本筋です）。所有者が正しいのに出る場合だけ、例外として登録します。
   **`--system`（マシン全体・全ユーザーに適用）ではなく`--global`（root専用の

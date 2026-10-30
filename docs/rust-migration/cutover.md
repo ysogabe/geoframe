@@ -3,7 +3,7 @@
 本番の geoframe を Python 版（`geoframe-server`）から Rust 版（`geoframe-rs`）へ切り替え、問題が出たら戻す手順。この文書だけを見て、上から順に実行できるようにしてある。
 
 - 要求・設計: [p5-prd.md](p5-prd.md)・[p5-design.md](p5-design.md)
-- 使う道具: [`rust-deploy.sh`](../../deploy/rust-deploy.sh)・[`deploy-pull.sh`](../../deploy/deploy-pull.sh)・[`geoframe-admin.sh`](../../deploy/geoframe-admin.sh)・[`geoframe-rs.service`](../../deploy/geoframe-rs.service)・[`geoframe-server.service`](../../deploy/geoframe-server.service)・[`backup-catalog.sh`](../../deploy/backup-catalog.sh)・[deploy/README.md §7](../../deploy/README.md)
+- 使う道具: [`rust-deploy.sh`](../../deploy/rust-deploy.sh)・[`deploy-pull.sh`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/deploy/deploy-pull.sh)・[`geoframe-admin.sh`](../../deploy/geoframe-admin.sh)・[`geoframe-rs.service`](../../deploy/geoframe-rs.service)・[`geoframe-server.service`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/deploy/geoframe-server.service)・[`backup-catalog.sh`](../../deploy/backup-catalog.sh)・[deploy/README.md §7](../../deploy/README.md)
 - 検証環境（lxc-geoframe）の演習（T5.4）でも、この手順書を使う。本番と違う所は「**演習では**」で注記する（[§0.6](#06-演習では本番との違い)にまとめた）。演習に固有の確認（省く節・置き換える節・シャドー比較・`Conflicts=` の試験・元に戻す手順）は [§15 演習（T5.4）のチェックリスト](#15-演習t54のチェックリスト)にまとめた。
 
 **この手順書のコマンドは、本番機で、ユーザーの立ち会いのもと、段ごとの許可を得てからだけ実行する。** 手順書を書く・読む・レビューする作業では実行しない。
