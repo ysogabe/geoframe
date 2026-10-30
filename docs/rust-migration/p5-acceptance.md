@@ -336,9 +336,24 @@
 - §4.3: 実行の道具が `rm` を含むコマンドを止めたため、`.tmp-` の削除を `gzip -9 "$SNAP"`（元を置き換える）＋ `gzip -t` ＋ `mv` に置き換えた（結果は同じ。`mode=ro` で取れたので、コピーを使う代わりの経路は使っていない）。
 - §1.5 の「`ai-jobs status` が動くこと」は、Rust のバイナリが入る前なので §6.7 で確かめた。
 
-### 4. あとで行うこと
+### 4. 切替のあと（§11・§12。2026-10-30 午後）
 
-- §11（数日）: Decision の全件再判定の終わり、索引の公開（意味検索の 503 が終わる）、バックアップのタイマー。
-- §12: クラウド AI の有効化（数日後、ユーザーが日と上限を決める）。
-- §13: 戻しの猶予期間（既定はクラウド AI を有効にしてから 1 週間）。`/root/p5-cutover` と `p5-precutover-*` はそれまで残す。
-- T5.6a・T5.6b（P5b）。
+#### 4.1 §11 の確認（14:06）
+
+- Decision の全件再判定は**終わっていた**: `db.loc.clue_pending=0`・`clue_runnable=0`・`clue_pause` が空。`ai-jobs status` の位置の手がかりは成功 1,216 件。
+- 索引は**公開済み**: `index_state=active`・`pending=0`・`building` なし。画像の Embedding は 6,439 件が保存済みで、失敗で除外 0・壊れ 0。意味検索の 503 は解けている（公開の正確な時刻は、確認が午後になったので記録していない。切替の 08:25 から 14:06 までのあいだ）。
+- バックアップのタイマー: Rust 稼働中の 12:17 の回が `Result=success`・`integrity_check: ok`・`latest.db.gz` の `gzip -t` OK。次は 18:17。切替前の控え `p5-precutover-*` は残っている（世代の削除はそれを数えない）。
+- `geoframe-rs`: `NRestarts=0`、`warning` 以上の journal は 0 行。load average は約 0.3（再判定が終わって Decision の負荷が消えた）。
+
+#### 4.2 §12 クラウド AI の有効化（14:07）
+
+- ユーザーの指示（§11 の完了後すぐ・頻度は適切に・料金は §13 の開始時に確認して調整）で有効にした。値（project・鍵のパス）はここに書かない。
+- `tasks` に追加: `photo_judge`（`gemini-3.1-flash-lite`・日の上限 **40**・`include_hidden=false`）と `location_suggest`（`gemini-3.8-flash`・日の上限 **30**）。`region` は PoC で使えた `us`。鍵は Drive の鍵（`600 geoframe:geoframe`）で、AI 設定の JSON は `640 root:geoframe` のまま。直前の控えは `/root/p5-cutover/ai-config.before`。
+- 上限の考え方: まず小さく始め、最初の日に実際の積まれる量を見て決める方針。再起動直後に `photo_judge` の新規 34 件が積まれ（上限の 40 以内）、`location_suggest` は 1 日分が動いた。周期（`GEOFRAME_AI_POLL_S` 60 秒・1 周期の `JUDGE` 2・`LOC_SUGGEST_GEMINI` 2）は既定のまま。日の上限が先に効くので、頻度の調整はこの 2 つの上限で行う。
+- 再起動後の確認: `/healthz` 200、2 用途が「使える」、`ai_config_invalid`・`ai_task_blocks`・`ai_pauses`・`ai_waits` はすべて「なし」。最初の数分で `photo_judge` 成功 4→6、`location_suggest` 成功 1（`location_geocode` 1）、停止・警告なし。
+
+#### 4.3 あとで行うこと
+
+- §12.3: 最初の日の送信数が上限（40・30）に収まっているか、費用、journal の警告を見る。上限を上げるのはユーザーの判断。
+- §13: 戻しの猶予期間（既定はクラウド AI を有効にしてから 1 週間）。**開始時に料金を確認して、上限を調整する**（ユーザー）。`/root/p5-cutover` と `p5-precutover-*` はそれまで残す。
+- T5.6a・T5.6b（P5b）は完了（PR はマージ済み）。
