@@ -1,7 +1,7 @@
 # P1の受入確認（検証環境での記録）
 
 - 日時: 2026-10-24 16:40〜17:10（JST）に実施し、レビュー指摘（Sol）を反映して17:10〜17:25（JST）にやり直し、2回目の指摘を反映して**17:50（JST）に配布と全件比較をやり直した**。以下は、最新の結果
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）/ 計画: [plan.md](plan.md) §4 P1 / タスク: [tasks.md](tasks.md) T1.5
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)（Rust単一バイナリ化）/ 計画: [plan.md](plan.md) §4 P1 / タスク: [tasks.md](tasks.md) T1.5
 - 対象のソース: コミット`d362f47`の実装（`crates/`の実装部分・`Cargo.*`・`app/static`・`app/vendor`は`d641505`から無変更。2回目の修正で`crates/`に足したのは、`limits.rs`の単体試験と`slow_clients`の統合試験だけ）。配布スクリプト・比較スクリプト・ハーネスは、この記録を含む修正コミット
 - バイナリ: `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`（`static-pie linked`、6,170,752 B、sha256 `d5c19e4de35a467b…`）
 - 検証環境（lxc-geoframe。Ubuntu 24.04、2コア、メモリ4GiB）。本番機ではない。接続先の値はGit管理外のメモにあり、ここには書かない
@@ -14,7 +14,7 @@
 | Rust | `geoframe-rs.service`（[`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)）を**3回目の修正後の**`deploy/rust-deploy.sh`で配り直し（検査・転送・入れ替え・確認OK、終了コード0。バイナリの sha256 は前回と同じ）、`:8080`に常駐（enable済み）。`User=geoframe`、データは`/var/lib/geoframe`（本番2026-10-24 06:17のバックアップのコピー、`catalog.db`は6,535行） |
 | 比較用Python | `geoframe-pyref.service`（`:8090`、データ`/var/lib/geoframe-pyref`）。AI・Drive無効。今回、本番と同じ`GEOFRAME_EMBED_BACKEND=local`を足した |
 | 環境変数 | 両方とも`GEOFRAME_EMBED_BACKEND=local`（本番の`/etc/default/geoframe`にある、出力に影響する設定はこれだけ。ほかの2項目はタイルの`User-Agent`とHost名で、出力に影響せず、前者には連絡先が入っているので写していない） |
-| 比較 | 手元（開発機）から、LAN越しに両方へ同じ要求を送る。[`tools/compare_with_python.py`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/tools/compare_with_python.py)（標準ライブラリだけ） |
+| 比較 | 手元（開発機）から、LAN越しに両方へ同じ要求を送る。[`tools/compare_with_python.py`](https://github.com/ysogabe/geoframe/blob/a804623029ad67d415692d08ea3182fd765eb2a4/tools/compare_with_python.py)（標準ライブラリだけ） |
 
 ## 2. 全件比較（Rust と 比較用Python）
 

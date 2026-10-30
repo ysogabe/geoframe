@@ -1,6 +1,6 @@
 # Rust単一バイナリ化 タスク
 
-- 要求: [Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 設計: [設計案](../architecture/rust-api-and-ai-providers-proposal.md) / 計画: [plan.md](plan.md)
+- 要求: [Issue #54](https://github.com/ysogabe/geoframe/issues/54) / 設計: [設計案](../architecture/rust-api-and-ai-providers-proposal.md) / 計画: [plan.md](plan.md)
 - P0=PR #57、P1=#58、P2=#59、P3=#60、P4=#61はsquash merge済み。P4にはT3.10の補足を含む。P4の後の補足（T4.10）はPR #62。
 - PRはフェーズごとに1つ。P2以降のタスクは、そのフェーズの開始時に細かく分け直す。
 - 種類: `ops`は自分で行う運用作業、`quick`/`full`はビルドのスキルに任せる実装。

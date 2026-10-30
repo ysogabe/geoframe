@@ -1,6 +1,6 @@
 # P5の受入確認（T5.4 演習・T5.5 本番の記録）
 
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）/ 要求: [p5-prd.md](p5-prd.md)「受け入れ条件」/ 設計: [p5-design.md](p5-design.md) §演習 / 手順書: [cutover.md](cutover.md)（§15 が演習のチェックリスト）/ タスク: [tasks.md](tasks.md) T5.4・T5.5 / 前フェーズ: [p4-acceptance.md](p4-acceptance.md)
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)（Rust単一バイナリ化）/ 要求: [p5-prd.md](p5-prd.md)「受け入れ条件」/ 設計: [p5-design.md](p5-design.md) §演習 / 手順書: [cutover.md](cutover.md)（§15 が演習のチェックリスト）/ タスク: [tasks.md](tasks.md) T5.4・T5.5 / 前フェーズ: [p4-acceptance.md](p4-acceptance.md)
 - **写真のid・ファイル名・座標・地名・撮影時刻・検索語・旅程・設定の値・ホスト名・LANのアドレス・ユーザー名は書かない。件数・状態コード・時間・ハッシュ・commit・sha256・固定の理由だけ**（[cutover.md §14](cutover.md#14-記録)）
 
 ## 本番で使うもの（T5.5 の前提）
@@ -8,7 +8,7 @@
 | 項目 | 値 |
 | --- | --- |
 | 演習のコミット（ブランチ `feat/rust-migration-p5`） | `712e61a038c76a739f291c9f5e7976a86669927a` |
-| P5a のマージのコミット（本番の `--expect-commit`） | `a804623029ad67d415692d08ea3182fd765eb2a4`（geoframe-ambient-display の PR #63「Rust移行 P5a: 本番切替の準備」） |
+| P5a のマージのコミット（本番の `--expect-commit`） | `a804623029ad67d415692d08ea3182fd765eb2a4`（geoframe の PR #63「Rust移行 P5a: 本番切替の準備」） |
 | 演習のコミットとマージのコミットの差（`crates`・`Cargo.*`・`app`・`deploy`。[cutover.md §1.2](cutover.md#12-演習のコミットと-p5a-のマージのコミットに差が無いことを確かめる)） | **空**（本番の §1.2、2026-10-30） |
 | バイナリ | `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`（演習のコミット）。20,272,504 B、static-pie |
 | バイナリの sha256（本番の `--expect-sha256`） | `65755b969077a608a54ddacbd651495f56afd1ca9e6f1f4a32a3466d199406e9` |

@@ -1,7 +1,7 @@
 # 実装計画: GEOFRAMEのRust単一バイナリ化
 
 - 状態: 実施中（2026-10-24 作成）
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)
 - 要求: Issue #54 の本文（受入条件・非目標）
 - 設計: [Rust単一バイナリの写真管理APIと外部AI Provider](../architecture/rust-api-and-ai-providers-proposal.md)
 - タスク表: [tasks.md](tasks.md)

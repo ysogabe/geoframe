@@ -1,7 +1,7 @@
 # 画像処理の技術PoC（P0 / T0.4）
 
 - 状態: 計測済み（2026-10-24）。**P2のT2.2で、PoCの実装を本体の[`crates/geoframe/src/imaging`](../../crates/geoframe/src/imaging)へ移し、PoCのcrateを削除した**（§10）。この文書の数値は記録として残す
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）。受入条件のAC5（HEICなど純Rustで完結しない依存の明示と検証）とAC7（秘密・位置情報・家庭写真を載せない）を受け持つ
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)（Rust単一バイナリ化）。受入条件のAC5（HEICなど純Rustで完結しない依存の明示と検証）とAC7（秘密・位置情報・家庭写真を載せない）を受け持つ
 - 計画: [plan.md](plan.md)の「画像ライブラリ」「HEIC変換のバックエンドと配布形態」への答え。配布形態は[build.md](build.md)と合わせて読む
 - コード: PoCの`crates/geoframe-imgpoc`は**T2.2で削除した**（コミット`c41c4a9`の木に残っている。`git show c41c4a9:crates/geoframe-imgpoc/src/lib.rs`など）。移した先は本体の`crates/geoframe/src/imaging`（§10）。Pythonの計測スクリプトは[`tools/image-poc`](../../tools/image-poc)
 

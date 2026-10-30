@@ -12,7 +12,7 @@ unitとスクリプトの元にし、変更されるデータを`/var/lib/geofra
 > [!NOTE]
 > Python版（`geoframe-server.service`・`deploy-pull.sh`・venv）は、P5bで本リポジトリから削除しました
 > （Python版は、P5aのマージのコミット
-> [`a804623`](https://github.com/ysogabe/geoframe-ambient-display/tree/a804623029ad67d415692d08ea3182fd765eb2a4)
+> [`a804623`](https://github.com/ysogabe/geoframe/tree/a804623029ad67d415692d08ea3182fd765eb2a4)
 > まで存在します）。本番の戻しの猶予期間のあいだ、本番の`/opt/geoframe`はそのコミットに固定されたままで、
 > Python版へ戻す手順は[`docs/rust-migration/cutover.md`](../docs/rust-migration/cutover.md)にあります。
 
@@ -79,7 +79,7 @@ Deploy Keyを指定します。
 
 ```sh
 sudo env GIT_SSH_COMMAND='ssh -i /etc/geoframe/ssh/geoframe_deploy_key -o IdentitiesOnly=yes -o UserKnownHostsFile=/etc/geoframe/ssh/known_hosts' \
-  git clone git@github.com:ysogabe/geoframe-ambient-display.git /opt/geoframe
+  git clone git@github.com:ysogabe/geoframe.git /opt/geoframe
 ```
 
 cloneしたら、この作業ツリー専用のgit設定を入れます。以降の`git fetch`など毎回の操作で
@@ -501,7 +501,7 @@ sudo install -m 0644 /dev/null /etc/default/geoframe # 出力に影響する設�
     -T git@github.com
   ```
 
-  成功すると`Hi ysogabe/geoframe-ambient-display! You've successfully authenticated, but GitHub does not provide shell access.`
+  成功すると`Hi ysogabe/geoframe! You've successfully authenticated, but GitHub does not provide shell access.`
   のように表示されます（シェルが得られないのは正常です）。`Host key verification failed`の
   場合は`known_hosts`の登録（§1.1）をやり直してください。
 - 管理ページに古いJavaScriptが表示される: ブラウザをハードリロードします。

@@ -100,3 +100,7 @@ node web/tests/admin_ai_ops_render.mjs web/static/js/admin.js
 bash deploy/rust-deploy-test.sh                        # 配布スクリプト（モックの試験）
 bash deploy/geoframe-admin-test.sh
 ```
+
+CI（`.github/workflows/test.yml`）は、PRと`main`へのpushで回ります。「文書・道具」は毎回回し、
+Rustの試験は`crates/`・`web/`・`Cargo.toml`・`Cargo.lock`・`docs/reference/configuration.md`が変わったときだけ、
+配布スクリプトの試験は`deploy/`が変わったときだけ回します（workflow自体を変えたとき、手動で起動したときは全部回します）。

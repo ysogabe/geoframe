@@ -4,7 +4,7 @@
 アクセス解析は使いません。GitHub Pagesで公開する予定ですが、**まだ公開していません**
 （リポジトリの公開準備は[公開準備チェックリスト](public-release-checklist.md)）。
 
-- 公開予定のURL: <https://ysogabe.github.io/geoframe-ambient-display/>
+- 公開予定のURL: <https://ysogabe.github.io/geoframe/>
 - ソース: [`site/`](../site/)（`index.html`、`styles.css`、`favicon.svg`）
 - 公開用のworkflow: [`.github/workflows/pages.yml`](../.github/workflows/pages.yml)（手動起動だけ）
 

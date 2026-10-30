@@ -8,7 +8,7 @@
 - 日付: 2026-09-13
 - 状態: 検討ベースライン（未採用・作業開始前）
 - 対象ハード: Raspberry Pi 400（4GB、USB3ブート想定）
-- 構築手順: [`README_RPI400.md`](https://github.com/ysogabe/geoframe-ambient-display/blob/display-final/deploy/kiosk/README_RPI400.md)（OS導入〜常設化〜負荷測定）
+- 構築手順: [`README_RPI400.md`](https://github.com/ysogabe/geoframe/blob/display-final/deploy/kiosk/README_RPI400.md)（OS導入〜常設化〜負荷測定）
 - 関連: [`rpi-cog-display-design.md`](rpi-cog-display-design.md)（Pi400単体でサーバー+表示を持つ案・アーカイブ）、
   [ADR 0002](../decisions/0002-screen-power-override-via-ha.md) / [0003](../decisions/0003-screen-control-state-machine.md) /
   [0004](../decisions/0004-frontend-display-mode-arbitration.md) / [0005](../decisions/0005-agent-status-via-ha-bus.md) /
@@ -99,8 +99,8 @@ ADR 0002/0003/0005 が守っている「受信面を増やさない」「新規c
 
 | ファイル | 実行場所 | 役割 |
 |---|---|---|
-| [`deploy/kiosk/measure-display-node.sh`](https://github.com/ysogabe/geoframe-ambient-display/blob/display-final/deploy/kiosk/measure-display-node.sh) | 表示機 | RSS/CPU/温度/throttle/GPUクロック/DPMS/通信量/描画FPSをCSVで1行ずつ記録。Pi（`vcgencmd`あり）とx86の両方で動作 |
-| [`tools/measure-display-client.mjs`](https://github.com/ysogabe/geoframe-ambient-display/blob/display-final/tools/measure-display-client.mjs) | 表示機 | CDP経由で描画FPS・フレーム時間分布・長時間タスク・WebGL renderer文字列・viewport・JSヒープを取得 |
+| [`deploy/kiosk/measure-display-node.sh`](https://github.com/ysogabe/geoframe/blob/display-final/deploy/kiosk/measure-display-node.sh) | 表示機 | RSS/CPU/温度/throttle/GPUクロック/DPMS/通信量/描画FPSをCSVで1行ずつ記録。Pi（`vcgencmd`あり）とx86の両方で動作 |
+| [`tools/measure-display-client.mjs`](https://github.com/ysogabe/geoframe/blob/display-final/tools/measure-display-client.mjs) | 表示機 | CDP経由で描画FPS・フレーム時間分布・長時間タスク・WebGL renderer文字列・viewport・JSヒープを取得 |
 
 ### 5.2 事前条件（これを満たさない測定値は捨てる）
 

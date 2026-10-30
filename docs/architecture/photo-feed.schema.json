@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/ysogabe/geoframe-ambient-display/docs/architecture/photo-feed.schema.json",
+  "$id": "https://github.com/ysogabe/geoframe/docs/architecture/photo-feed.schema.json",
   "title": "GEOFRAME 写真フィード（GET /api/v1/photos）",
   "description": "応答は写真オブジェクトの配列。ここに定義するのは表示クライアントが頼ってよい契約フィールドだけ。それ以外のフィールド（品質解析やAIの内部値）は予告なく変わるので、additionalPropertiesで許すだけで検査しない。文書は photo-feed-contract.md。",
   "type": "array",

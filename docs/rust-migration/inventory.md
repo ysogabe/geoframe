@@ -1,7 +1,7 @@
 # 現行実装の棚卸し（Rust移行用）
 
 - 状態: 2026-10-24 時点の `main` 相当（ブランチ `t3/issue-54-implementation-plan`）のPython実装をコードから調べた記録
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md)（T0.2、AC2）
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54) / 計画: [plan.md](plan.md) / タスク: [tasks.md](tasks.md)（T0.2、AC2）
 - 目的: Rustへ移すときに機能・暗黙の挙動・一次データの扱いが漏れないよう、移すべき対象を一覧にする。
 
 この文書は**リポジトリ内のコードだけ**から作った。本番DB・本番機・実写真は見ていない。値の例は合成したものか、記号で書く（実際の座標・ファイル名・IDは載せない）。

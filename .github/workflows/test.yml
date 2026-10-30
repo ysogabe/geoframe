@@ -1,7 +1,10 @@
 name: テスト
 
+# ブランチへの push と PR で同じ試験が二重に回らないよう、push は main だけにする。
+# 文書だけの変更で Rust と配布スクリプトの試験を回さないよう、変更の範囲を見てジョブを選ぶ（changes ジョブ）。
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -9,6 +12,44 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: 変更の範囲
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      deploy: ${{ steps.scope.outputs.deploy }}
+    steps:
+      - name: ソースを取得
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: 変更されたファイルから、回すジョブを決める
+        id: scope
+        # 比べる元が分からないとき（手動起動・新しいブランチ・履歴の書き換え）は全部回す。
+        # Rust の試験はコードのほか、埋め込む画面（web/）と、環境変数の一覧（docs/reference/configuration.md）を読む
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          all() { echo "rust=true" >>"$GITHUB_OUTPUT"; echo "deploy=true" >>"$GITHUB_OUTPUT"; exit 0; }
+          [ "$EVENT" = workflow_dispatch ] && all
+          case "$BASE" in ''|0000000000000000000000000000000000000000) all ;; esac
+          files=$(git diff --name-only "$BASE" "$GITHUB_SHA") || all
+          printf '%s\n' "$files"
+          workflow='^\.github/workflows/test\.yml$'
+          if printf '%s\n' "$files" | grep -qE "^(crates/|web/|Cargo\.(toml|lock)$|docs/reference/configuration\.md$)|$workflow"; then
+            echo "rust=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "rust=false" >>"$GITHUB_OUTPUT"
+          fi
+          if printf '%s\n' "$files" | grep -qE "^deploy/|$workflow"; then
+            echo "deploy=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "deploy=false" >>"$GITHUB_OUTPUT"
+          fi
+
   docs:
     name: 文書・道具
     runs-on: ubuntu-latest
@@ -33,6 +74,8 @@ jobs:
 
   deploy:
     name: 配布スクリプト（モックの試験）
+    needs: changes
+    if: needs.changes.outputs.deploy == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -50,6 +93,8 @@ jobs:
 
   rust:
     name: Rust（fmt・clippy・test・musl静的ビルド）
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:

@@ -31,6 +31,6 @@ landmark と判定された9枚はすべて手がかりあり。nature の8枚�
 
 測り直すスクリプト（`eval_decision.py`）は、旧Python版の`app/geoframe/loc_suggest.py`の質問文・画像の縮小・合否の判定を
 そのまま使っていたので、Python版の削除（P5b）と一緒に消した（旧版は P5a のマージのコミット
-[`a804623`](https://github.com/ysogabe/geoframe-ambient-display/tree/a804623029ad67d415692d08ea3182fd765eb2a4/tools/loc_clue_eval)
+[`a804623`](https://github.com/ysogabe/geoframe/tree/a804623029ad67d415692d08ea3182fd765eb2a4/tools/loc_clue_eval)
 に残っている）。Rustの基準を測り直すときは、`labels.json`の`clue`と`baseline-2026-10-13.json`の判定を、
 Rustの`location_clue`が使う質問文・縮小・合否の判定に流して比べるスクリプトを新しく書く。

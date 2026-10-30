@@ -4,7 +4,7 @@
 
 GEOFRAME(ジオフレーム)は、自宅に置くセルフホスト型の写真管理基盤です。ローカルフォルダや Google Drive の写真を 1 つのカタログにまとめ、撮影地を地図で整え、表示用の画像を用意します。写真を画面に映すのは、別プロジェクトの [Miharashi](https://github.com/ysogabe/miharashi) です。
 
-**紹介ページ(LP): https://ysogabe.github.io/geoframe-ambient-display/** (リポジトリの公開後に開けるようになります)
+**紹介ページ(LP): https://ysogabe.github.io/geoframe/** (リポジトリの公開後に開けるようになります)
 
 ![散らばった写真が地図の上で撮影地ごとに整理され、フォトフレームに映るまでの流れ(イメージ図)](site/images/hero.png)
 

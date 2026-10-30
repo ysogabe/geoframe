@@ -4,4 +4,4 @@
 
 **最新の設計案**: [Rust写真管理APIと外部AI Provider](rust-api-and-ai-providers-proposal.md)
 
-追跡Issue: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)。旧Go案は採用しません。
+追跡Issue: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)。旧Go案は採用しません。

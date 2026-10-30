@@ -127,11 +127,11 @@ GET/HEADヘッダ、フェード開始条件、中間不透明度、途中切断
 
 ## 実装箇所
 
-- 描画・カメラ・地形・線: [`frontend/photo-journey-lite.js`](https://github.com/ysogabe/geoframe-ambient-display/blob/display-final/frontend/photo-journey-lite.js)
-- 移行と中断処理: [`app/static/js/photo-journey-lite.js`](https://github.com/ysogabe/geoframe-ambient-display/blob/display-final/app/static/js/photo-journey-lite.js)
-- スタイル設定: [`app/static/js/photo-journey-settings.js`](https://github.com/ysogabe/geoframe-ambient-display/blob/display-final/app/static/js/photo-journey-settings.js)
-- 写真判定・省略経路: [`app/geoframe/tiles.py`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/app/geoframe/tiles.py)、[`handlers.py`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/app/geoframe/handlers.py)
-- タイル元・ズーム帯: [`app/geoframe/config.py`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/app/geoframe/config.py)
+- 描画・カメラ・地形・線: [`frontend/photo-journey-lite.js`](https://github.com/ysogabe/geoframe/blob/display-final/frontend/photo-journey-lite.js)
+- 移行と中断処理: [`app/static/js/photo-journey-lite.js`](https://github.com/ysogabe/geoframe/blob/display-final/app/static/js/photo-journey-lite.js)
+- スタイル設定: [`app/static/js/photo-journey-settings.js`](https://github.com/ysogabe/geoframe/blob/display-final/app/static/js/photo-journey-settings.js)
+- 写真判定・省略経路: [`app/geoframe/tiles.py`](https://github.com/ysogabe/geoframe/blob/a804623029ad67d415692d08ea3182fd765eb2a4/app/geoframe/tiles.py)、[`handlers.py`](https://github.com/ysogabe/geoframe/blob/a804623029ad67d415692d08ea3182fd765eb2a4/app/geoframe/handlers.py)
+- タイル元・ズーム帯: [`app/geoframe/config.py`](https://github.com/ysogabe/geoframe/blob/a804623029ad67d415692d08ea3182fd765eb2a4/app/geoframe/config.py)
 
 APIの根拠は導入済み `@navaramap/three 0.1.1` の公開型と合成実装で確認した。
 依存パッケージや新しい外部データサービスは追加していない。

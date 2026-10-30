@@ -1,7 +1,7 @@
 # P2の受入確認（検証環境での記録）
 
 - 日時: 2026-10-25に実施
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）/ 計画: [plan.md](plan.md) §4 P2 / タスク: [tasks.md](tasks.md) T2.7 / 前フェーズの記録: [p1-acceptance.md](p1-acceptance.md)
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)（Rust単一バイナリ化）/ 計画: [plan.md](plan.md) §4 P2 / タスク: [tasks.md](tasks.md) T2.7 / 前フェーズの記録: [p1-acceptance.md](p1-acceptance.md)
 - 対象のソース: コミット`35d677d`の実装（T2.5の「時間切れの行を記憶しない」テストの補強を含む。`crates/`の実装部分は`T2.6`から無変更）。比較用の合成の写真の生成スクリプト`tools/gen_acceptance_photos.py`とこの記録は、この記録を含むコミット
 - バイナリ: `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`（`static-pie linked`、16,564,016 B、sha256 `a1fdee065aab9498…`）。`deploy/rust-deploy.sh`で配布（検査・転送・入れ替え・確認OK）
 - 検証環境（lxc-geoframe。Ubuntu 24.04、2コア、メモリ4GiB）。本番機ではない。接続先の値はGit管理外のメモにあり、ここには書かない。本番機（geoframe-server）・本番の`/var/lib/geoframe`・miharashiの本番プロセスには触れていない
@@ -57,7 +57,7 @@ T2.3で行ったローカルの比較（[server.md §13.9](server.md#139-検証�
 
 ### 2.1 手順
 
-- **合成の写真15枚**（[`tools/gen_acceptance_photos.py`](https://github.com/ysogabe/geoframe-ambient-display/blob/a804623029ad67d415692d08ea3182fd765eb2a4/tools/gen_acceptance_photos.py)。乱数から作った画像。座標は駅・城・歌劇場の公開の代表点、撮影時刻は架空。`mtime`は固定）を、RustとPythonの`photos/`に同じバイト列・同じ`mtime`で置いた。内訳: GPSありのJPEG3枚（東京駅・皇居（長辺3200px）・京都駅（EXIFの向き6））、GPSなしのJPEG5枚（GPSありの写真の10分後・1時間30分後・8時間後・どの合成の写真からも9日後・撮影時刻なし）、同じバイト列のJPEG2枚（1枚は`sub/`の下）、GPSありで2分違いのほぼ同じJPEG2枚、GPSありのHEIC1枚とその5分後のGPSなしのJPEG1枚、国外（シドニー）のJPEG1枚。
+- **合成の写真15枚**（[`tools/gen_acceptance_photos.py`](https://github.com/ysogabe/geoframe/blob/a804623029ad67d415692d08ea3182fd765eb2a4/tools/gen_acceptance_photos.py)。乱数から作った画像。座標は駅・城・歌劇場の公開の代表点、撮影時刻は架空。`mtime`は固定）を、RustとPythonの`photos/`に同じバイト列・同じ`mtime`で置いた。内訳: GPSありのJPEG3枚（東京駅・皇居（長辺3200px）・京都駅（EXIFの向き6））、GPSなしのJPEG5枚（GPSありの写真の10分後・1時間30分後・8時間後・どの合成の写真からも9日後・撮影時刻なし）、同じバイト列のJPEG2枚（1枚は`sub/`の下）、GPSありで2分違いのほぼ同じJPEG2枚、GPSありのHEIC1枚とその5分後のGPSなしのJPEG1枚、国外（シドニー）のJPEG1枚。
 - **Rust**: 検証環境の中の複製（§1と同じ`catalog.pre`のコピー）に対して、`sync --dry-run`のあと`GEOFRAME_INGEST=1 geoframe sync`を**2サイクル**。
 - **Python**: 別の複製（同じ`catalog.pre`のコピー、`derivatives/`はハードリンク）に、`pyref`のvenvで`from geoframe.catalog import cycle; cycle()`を**2サイクル**（比較用Pythonのサービスのデータ`/var/lib/geoframe-pyref`は触らない）。
 - `.cache.json`は両方に比較用Pythonのもの（`muni_table`だけ）を置いた。**地理院は本物に問い合わせた**: Rustの`enrich`は`candidates=14 foreign=2 cache_hit=6 queried=6 resolved=6`（逆ジオ6＋標高6の要求。dry-runの`would_query=6`と一致）。

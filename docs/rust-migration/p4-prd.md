@@ -1,7 +1,7 @@
 # P4: AI Provider・永続ジョブ PRD
 
 - 状態: レビュー済み設計案（2026-10-26、必須指摘0）。2026-10-26にユーザーが推奨順での実装を承認。
-- 上位要求: [Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)、[全体設計](../architecture/rust-api-and-ai-providers-proposal.md)、[移行計画](plan.md)。
+- 上位要求: [Issue #54](https://github.com/ysogabe/geoframe/issues/54)、[全体設計](../architecture/rust-api-and-ai-providers-proposal.md)、[移行計画](plan.md)。
 - 現在地: P0〜P3とT3.10の受入確認は完了。P4用ブランチ`feat/rust-migration-p4`で続ける。P4はフェーズとして1つのPRとし、作業は依存順に分ける。
 - 詳細: [P4設計](p4-design.md)。本書のP4-AC番号はIssue #54のAC番号と区別する。
 
