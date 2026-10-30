@@ -1,5 +1,5 @@
 // admin.js の aiOpsCells（AI運用の STATUS 描画）を、最小の DOM の代用品で動かして確かめる。
-// 使い方: node app/tests/admin_ai_ops_render.mjs <admin.js のパス>
+// 使い方: node web/tests/admin_ai_ops_render.mjs <admin.js のパス>
 // 合成の status JSON だけを使い、ネットワークには出ない。
 import fs from 'node:fs';
 import vm from 'node:vm';

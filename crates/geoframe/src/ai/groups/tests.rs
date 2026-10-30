@@ -171,20 +171,6 @@ fn python_components_rank_ties_normalization_and_shortlist_fixture() {
     }
 }
 #[test]
-fn python_fixture_is_reproducible_without_weight_or_data_access() {
-    let output = std::process::Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../tools/gen_scene_fixture.py"
-        ))
-        .arg("--check")
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "synthetic Python fixture failed");
-}
-#[test]
 fn window_equality_excess_and_threshold_equality() {
     let mut c = db();
     ready(&mut c, 1, 0);
@@ -1213,67 +1199,6 @@ fn synthetic_6500x768_compute_releases_writer_and_measures_save() {
 }
 
 #[test]
-fn python_rollback_reads_and_rebuilds_legacy_without_touching_new_results() {
-    let dir = TempDir::new("scene-python-rollback");
-    let path = dir.path().join("catalog.db");
-    let mut c = Connection::open(&path).unwrap();
-    schema::migrate(&mut c).unwrap();
-    index::migrate(&mut c).unwrap();
-    jobs::migrate(&mut c).unwrap();
-    migrate(&mut c).unwrap();
-    activate(&mut c, &identity(2));
-    ready(&mut c, 1, 0);
-    ready(&mut c, 2, 100);
-    legacy(&c, &[1, 2]);
-    let p = plan(&c);
-    save(&mut c, &p, 0, &|| false).unwrap();
-    let tables = [
-        "photos",
-        "photo_ai_groups",
-        "photo_ai_group_members",
-        "photo_ai_features",
-        "ai_scene_groups",
-        "ai_scene_members",
-        "ai_scene_active",
-    ];
-    let before: Vec<_> = tables.iter().map(|t| rows(&c, t)).collect();
-    let script = format!(
-        r#"
-import os, sys, json
-sys.path.insert(0, {app:?})
-from geoframe import ai_pipeline, ai_search, photos, store
-feed=photos.api_photos()
-status=ai_search.api_ai_status()
-loaded=ai_pipeline._load_photos()
-ai_pipeline.load_rank_model=lambda *_: None
-# Exact same synthetic legacy embedding model/shape; no file/HTTP/model calls.
-ai_pipeline._rebuild_groups(loaded)
-print(json.dumps(dict(feed=len(feed), status=isinstance(status,dict), loaded=len(loaded))))
-"#,
-        app = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app")
-    );
-    let output = std::process::Command::new("python3")
-        .args(["-I", "-c", &script])
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("GEOFRAME_DATA_DIR", dir.path())
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "synthetic Python rollback failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let text = String::from_utf8(output.stdout).unwrap();
-    let result: Json = serde_json::from_str(text.lines().last().unwrap()).unwrap();
-    assert_eq!(result["status"], true);
-    // Python intentionally rebuilds legacy groups in its cycle. Human columns and every new table remain exact.
-    for index in [0, 4, 5, 6] {
-        assert!(rows(&c, tables[index]) == before[index]);
-    }
-}
-
-#[test]
 fn no_display_and_failed_with_missing_metrics_do_not_hold_other_members() {
     let mut c = pair();
     photo(&c, 3, 100, 3);
@@ -1831,62 +1756,6 @@ fn local_writer_wait_is_bounded_and_expired_or_stopped_work_never_saves_later() 
         0
     );
     assert!(rows(&e.conn, "ai_scene_groups").is_empty());
-}
-
-#[test]
-fn portable_fixture_starts_without_scene_tables_migrates_and_runs_validated_weight() {
-    let dir = TempDir::new("scene-portable");
-    let destination = dir.path().join("fixture");
-    let output = std::process::Command::new("python3")
-        .args([
-            concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../tools/gen_scene_runtime_fixture.py"
-            ),
-            "--output",
-        ])
-        .arg(&destination)
-        .args(["--photos", "2", "--weight"])
-        .output()
-        .unwrap();
-    assert!(output.status.success(), "synthetic runtime fixture failed");
-    let config = Arc::new(
-        crate::config::Config::load(
-            |k| match k {
-                "GEOFRAME_INGEST" => Some("1".into()),
-                "GEOFRAME_EMBED_BACKEND" => Some("local".into()),
-                _ => None,
-            },
-            &crate::config::Overrides {
-                data_dir: Some(destination),
-                ..Default::default()
-            },
-        )
-        .unwrap(),
-    );
-    let conn = crate::db::open_read_only(&config.db_path()).unwrap();
-    assert_eq!(pending(&conn).unwrap().len(), 3);
-    assert_eq!(
-        crate::ingest::plan(&config, &conn)
-            .unwrap()
-            .schema
-            .missing_objects
-            .len(),
-        10
-    );
-    let old = rows(&conn, "photos");
-    let ingest = crate::ingest::start_with(&config, &crate::guard::Guard::skip()).unwrap();
-    assert_eq!(ingest.migration.created.len(), 10);
-    assert_eq!(
-        runtime::Runtime::production(config.clone())
-            .unwrap()
-            .cycle(&conn, &ingest.writer, &crate::stop::StopFlag::new())
-            .unwrap(),
-        1
-    );
-    let status = crate::ai::search_view::status(&conn, &config).unwrap();
-    assert_eq!(status["pipeline"]["scenes"]["linear"], 1);
-    assert_eq!(rows(&conn, "photos"), old);
 }
 
 #[test]

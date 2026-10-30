@@ -7,8 +7,6 @@ use crate::schema as dbschema;
 use crate::testutil::TempDir;
 use rusqlite::params;
 use serde_json::{Value, json};
-use std::io::Write;
-use std::process::{Command, Stdio};
 
 const MODEL: &str = "synthetic-suggest";
 const T: i64 = 1_800_000_000;
@@ -135,41 +133,9 @@ fn make_plan(day: Day) -> Plan {
 fn answer() -> Answer {
     Answer::parse(r#"{"country":"合成国","country_code":"zz","city":"合成都市","place_name":"合成都市","geocode_query":"Synthetic City","precision":"city","confidence":"medium","evidence":["合成看板"],"photos":[{"index":2,"place_name":"合成公園","geocode_query":"Synthetic Park","precision":"district","confidence":"low"}]}"#,2).unwrap()
 }
-fn run_python(input: &Value) -> String {
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/gen_location_suggest_fixture.py");
-    let mut child = Command::new("python3")
-        .arg(script)
-        .arg("--roundtrip")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(serde_json::to_string(input).unwrap().as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
-    assert!(output.status.success(), "AST Python roundtrip failed");
-    String::from_utf8(output.stdout).unwrap()
-}
 
 #[test]
 fn python_ast_constants_pure_functions_and_answer_normalization_match() {
-    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tools/gen_location_suggest_fixture.py");
-    assert!(
-        Command::new("python3")
-            .arg(script)
-            .arg("--check")
-            .output()
-            .unwrap()
-            .status
-            .success()
-    );
     let f: Value = serde_json::from_str(include_str!(
         "../../../tests/fixtures/location-suggest-python.json"
     ))
@@ -360,7 +326,7 @@ fn answer_bounds_invalid_types_indexes_nonfinite_and_private_debug() {
 }
 
 #[test]
-fn success_is_atomic_python_reads_all_columns_and_subset_reuses_without_auth() {
+fn success_is_atomic_and_subset_reuses_without_auth() {
     let mut db = Db::new();
     let p = db.seed();
     let before = crate::ai::tests::dump(&db.conn);
@@ -384,37 +350,13 @@ fn success_is_atomic_python_reads_all_columns_and_subset_reuses_without_auth() {
             .filter(|s| !s.starts_with("photo_loc_runs:"))
             .collect::<Vec<_>>()
     );
-    let row = db
-        .conn
-        .query_row("SELECT * FROM photo_loc_runs", [], |r| {
-            let names = [
-                "run_id",
-                "day",
-                "model",
-                "prompt_version",
-                "member_ids_json",
-                "sent_ids_json",
-                "status",
-                "attempts",
-                "answer_json",
-                "error",
-                "analyzed_at",
-            ];
-            let mut map = serde_json::Map::new();
-            for (i, n) in names.iter().enumerate() {
-                map.insert(
-                    (*n).into(),
-                    if *n == "attempts" {
-                        json!(r.get::<_, i64>(i)?)
-                    } else {
-                        json!(r.get::<_, String>(i)?)
-                    },
-                );
-            }
-            Ok(Value::Object(map))
-        })
-        .unwrap();
-    assert!(run_python(&json!({"run":row,"model":MODEL,"subset":[1]})).contains("accepted"));
+    assert_eq!(
+        db.conn
+            .query_row("SELECT COUNT(*) FROM photo_loc_runs", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
     db.conn
         .execute(
             "UPDATE photos SET lat=1,lon=2,loc_source='manual' WHERE id=2",

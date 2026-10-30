@@ -1,14 +1,14 @@
-//! 管理画面の静的ファイル（`app/static`・`app/vendor`）と、旅行ブログの旅程 JSON
-//! （`app/travel_blog/plans/*.json`）をバイナリへ埋め込む表を作る。
+//! 管理画面の静的ファイル（`web/static`・`web/vendor`）と、旅行ブログの旅程 JSON
+//! （`web/travel_blog/plans/*.json`）をバイナリへ埋め込む表を作る。
 //!
-//! 単一バイナリは「バイナリ＋設定＋データ」だけで起動できる必要があり、実行時に `app/` を読まない
+//! 単一バイナリは「バイナリ＋設定＋データ」だけで起動できる必要があり、実行時に `web/` を読まない
 //! （docs/rust-migration/plan.md §1）。外部の埋め込み crate を足さず、ここで `include_bytes!` の
 //! 表を生成する（依存を増やさない・musl 静的ビルドへ影響しない・ファイルが増えても再生成される）。
 //!
-//! 生成物は `$OUT_DIR/embedded_files.rs`。パスは `static/admin.html` のような `app/` からの相対で、
+//! 生成物は `$OUT_DIR/embedded_files.rs`。パスは `static/admin.html` のような `web/` からの相対で、
 //! ソート済み（二分探索）。ドットで始まる名前は含めない（配信側もドット始まりは拒否する）。
 //! 旅程 JSON は別の表（`PLAN_FILES`。名前は `<trip_id>.json` のファイル名だけで、`.json` で終わるものだけ。
-//! `app/travel_blog/plans` 直下の通常ファイルに限り、そこへ至るパスの各要素（`app`・`travel_blog`・`plans`）と
+//! `web/travel_blog/plans` 直下の通常ファイルに限り、そこへ至るパスの各要素（`web`・`travel_blog`・`plans`）と
 //! 直下のリンクは辿らずにビルドを止める。エラーにはパス・ファイル名を出さない。検査は`build_plans.rs`）。
 //! 配信の表（`FILES`）には入れない（`/static/`・`/vendor/` の配信とは無関係）。
 //! 各ファイルに内容のハッシュ（FNV-1a 64bit）から作った ETag を付ける。時刻は埋め込まない:
@@ -61,10 +61,10 @@ fn fnv1a(data: &[u8]) -> u64 {
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let app = manifest.join("../../app");
+    let web = manifest.join("../../web");
     let mut files = Vec::new();
     for root in ROOTS {
-        let dir = app.join(root);
+        let dir = web.join(root);
         // ディレクトリ配下の変更・追加・削除で再生成する
         println!("cargo:rerun-if-changed={}", dir.display());
         walk(&dir, root, &mut files);
@@ -85,15 +85,15 @@ fn main() {
     }
     code.push_str("];\n");
 
-    // 旅行ブログの旅程 JSON（git 管理のソース。実行時は `app/` を読まないので埋め込む）。
+    // 旅行ブログの旅程 JSON（git 管理のソース。実行時は `web/` を読まないので埋め込む）。
     // 直下の通常ファイルだけ。リンクは断る（git 管理外のファイルの検査は配布スクリプト）
-    // リポジトリの根から旅程のディレクトリまでの各要素（`app`・`app/travel_blog`・`plans`）にリンクがあれば止める。
+    // リポジトリの根から旅程のディレクトリまでの各要素（`web`・`web/travel_blog`・`plans`）にリンクがあれば止める。
     // エラーはパス・ファイル名を出さず定型文だけ（旅程の名前をビルドのログに残さない）
-    let plans_dir = app.join("travel_blog/plans");
+    let plans_dir = web.join("travel_blog/plans");
     println!("cargo:rerun-if-changed={}", plans_dir.display());
     println!("cargo:rerun-if-changed=build_plans.rs");
     let fail = |e: build_plans::PlanError| -> ! { panic!("{}", e.message()) };
-    build_plans::reject_links(&manifest.join("../.."), &["app", "travel_blog", "plans"])
+    build_plans::reject_links(&manifest.join("../.."), &["web", "travel_blog", "plans"])
         .unwrap_or_else(|e| fail(e));
     let plans = build_plans::plan_files(&plans_dir).unwrap_or_else(|e| fail(e));
     code.push_str("static PLAN_FILES: &[PlanFile] = &[\n");

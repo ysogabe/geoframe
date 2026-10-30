@@ -1,4 +1,4 @@
-//! `build.rs` が旅程 JSON（`app/travel_blog/plans/*.json`）を埋め込む前の検査（リンクと名前）。
+//! `build.rs` が旅程 JSON（`web/travel_blog/plans/*.json`）を埋め込む前の検査（リンクと名前）。
 //!
 //! `build.rs` と、`src/embedded.rs` の単体試験（`#[path]` で同じファイルを読む）が共有する。
 //! エラーにパス・ファイル名・I/O エラーの中身は入れない（旅程の名前は個人の旅の手がかりなので、
@@ -22,13 +22,13 @@ impl PlanError {
     pub fn message(&self) -> &'static str {
         match self {
             PlanError::Link => {
-                "app/travel_blog/plans かその親にシンボリックリンクがある（埋め込まない。実体にすること）"
+                "web/travel_blog/plans かその親にシンボリックリンクがある（埋め込まない。実体にすること）"
             }
             PlanError::Unreadable => {
-                "app/travel_blog/plans に読めないディレクトリかファイルがある（埋め込めない）"
+                "web/travel_blog/plans に読めないディレクトリかファイルがある（埋め込めない）"
             }
             PlanError::BadName => {
-                "app/travel_blog/plans に埋め込めない名前（UTF-8 でない）のファイルがある"
+                "web/travel_blog/plans に埋め込めない名前（UTF-8 でない）のファイルがある"
             }
         }
     }
@@ -114,10 +114,10 @@ mod tests {
         }
     }
 
-    const PLANS: [&str; 3] = ["app", "travel_blog", "plans"];
+    const PLANS: [&str; 3] = ["web", "travel_blog", "plans"];
 
     fn make_repo(t: &Tmp) -> PathBuf {
-        let plans = t.0.join("repo/app/travel_blog/plans");
+        let plans = t.0.join("repo/web/travel_blog/plans");
         fs::create_dir_all(&plans).unwrap();
         fs::write(plans.join("a.json"), "{}").unwrap();
         t.0.join("repo")
@@ -128,7 +128,7 @@ mod tests {
         let t = Tmp::new("plain");
         let root = make_repo(&t);
         assert_eq!(reject_links(&root, &PLANS), Ok(()));
-        let files = plan_files(&root.join("app/travel_blog/plans")).unwrap();
+        let files = plan_files(&root.join("web/travel_blog/plans")).unwrap();
         assert_eq!(files.len(), 1);
         // 途中から無い場合は、検査を通して空の表
         assert_eq!(reject_links(&t.0.join("none"), &PLANS), Ok(()));
@@ -159,7 +159,7 @@ mod tests {
         let t = Tmp::new("dangling");
         let root = t.0.join("repo");
         fs::create_dir_all(&root).unwrap();
-        symlink(t.0.join("gone"), root.join("app")).unwrap();
+        symlink(t.0.join("gone"), root.join("web")).unwrap();
         assert_eq!(reject_links(&root, &PLANS), Err(PlanError::Link));
     }
 
@@ -167,7 +167,7 @@ mod tests {
     fn links_inside_the_directory_are_refused() {
         let t = Tmp::new("inner");
         let root = make_repo(&t);
-        let plans = root.join("app/travel_blog/plans");
+        let plans = root.join("web/travel_blog/plans");
         symlink(plans.join("a.json"), plans.join("b.json")).unwrap();
         assert_eq!(plan_files(&plans), Err(PlanError::Link));
     }
@@ -176,7 +176,7 @@ mod tests {
     fn only_plain_json_files_are_listed() {
         let t = Tmp::new("list");
         let root = make_repo(&t);
-        let plans = root.join("app/travel_blog/plans");
+        let plans = root.join("web/travel_blog/plans");
         fs::write(plans.join(".hidden.json"), "{}").unwrap();
         fs::write(plans.join("note.txt"), "x").unwrap();
         fs::create_dir(plans.join("dir.json")).unwrap();
@@ -193,7 +193,7 @@ mod tests {
     fn a_name_that_is_not_utf8_stops_without_showing_it() {
         let t = Tmp::new("badname");
         let root = make_repo(&t);
-        let plans = root.join("app/travel_blog/plans");
+        let plans = root.join("web/travel_blog/plans");
         let bad = std::ffi::OsStr::from_bytes(b"secret-\xff.json");
         fs::write(plans.join(bad), "{}").unwrap();
         let err = plan_files(&plans).unwrap_err();
@@ -209,7 +209,7 @@ mod tests {
         }
         let t = Tmp::new("unreadable");
         let root = make_repo(&t);
-        let plans = root.join("app/travel_blog/plans");
+        let plans = root.join("web/travel_blog/plans");
         // 読めないファイル
         let locked = plans.join("secret-file.json");
         fs::write(&locked, "{}").unwrap();
@@ -222,9 +222,9 @@ mod tests {
         fs::set_permissions(&plans, fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(plan_files(&plans), Err(PlanError::Unreadable));
         // 途中の親が読めない（symlink_metadata が権限で失敗する）
-        fs::set_permissions(root.join("app"), fs::Permissions::from_mode(0o000)).unwrap();
+        fs::set_permissions(root.join("web"), fs::Permissions::from_mode(0o000)).unwrap();
         assert_eq!(reject_links(&root, &PLANS), Err(PlanError::Unreadable));
-        fs::set_permissions(root.join("app"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(root.join("web"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::set_permissions(&plans, fs::Permissions::from_mode(0o755)).unwrap();
     }
 

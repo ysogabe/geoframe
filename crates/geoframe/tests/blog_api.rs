@@ -542,7 +542,7 @@ async fn only_get_reaches_the_blog_routes() {
 // ---- 埋め込み（既定）----------------------------------------------------------------------
 
 fn repo_plan_files() -> Vec<(String, Value)> {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../app/travel_blog/plans");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/travel_blog/plans");
     let mut files: Vec<_> = std::fs::read_dir(dir)
         .unwrap()
         .map(|e| e.unwrap().path())
@@ -561,7 +561,7 @@ fn repo_plan_files() -> Vec<(String, Value)> {
         .collect()
 }
 
-/// `GEOFRAME_BLOG_PLANS_DIR` が無いとき、バイナリに埋め込んだ旅程が、リポジトリの `app/travel_blog/plans/*.json` と
+/// `GEOFRAME_BLOG_PLANS_DIR` が無いとき、バイナリに埋め込んだ旅程が、リポジトリの `web/travel_blog/plans/*.json` と
 /// 同じ内容・同じ並びで返る（実ファイルとの一致を真偽で見るだけ。中身は出力しない）。
 #[tokio::test]
 async fn embedded_plans_are_the_repository_files() {

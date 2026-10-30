@@ -21,7 +21,7 @@ const MTIME_HTTP: &str = "sun, 01 jun 2025 00:00:00 gmt";
 
 fn repo_file(path: &str) -> Vec<u8> {
     let full = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../app")
+        .join("../../web")
         .join(path);
     std::fs::read(&full).unwrap_or_else(|e| panic!("{full:?}: {e}"))
 }
@@ -329,7 +329,7 @@ async fn every_embedded_file_is_served_byte_for_byte() {
     for dir in ["static", "vendor"] {
         let mut stack = vec![
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../app")
+                .join("../../web")
                 .join(dir),
         ];
         while let Some(path) = stack.pop() {
@@ -340,7 +340,7 @@ async fn every_embedded_file_is_served_byte_for_byte() {
                     continue;
                 }
                 let rel = entry
-                    .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../app"))
+                    .strip_prefix(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web"))
                     .unwrap()
                     .to_str()
                     .unwrap()

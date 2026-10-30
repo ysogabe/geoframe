@@ -14,6 +14,6 @@ GeoFrameの写真カタログと旅程JSONを照合し、旅行ブログをレ�
 
 ## 旅程の追加
 
-`plans/` に既存JSONと同じ形式で `<trip_id>.json` を追加します。`trip_id` は英小文字・数字・ハイフンのみです。写真の候補期間は各 `segments[].date`、`start_local`、`end_local` で決まります。
+`web/travel_blog/plans/` に既存JSONと同じ形式で `<trip_id>.json` を追加します。`trip_id` は英小文字・数字・ハイフンのみです。写真の候補期間は各 `segments[].date`、`start_local`、`end_local` で決まります。
 
 下書きは `GEOFRAME_DATA_DIR/travel_blog/drafts/`、出力は `GEOFRAME_DATA_DIR/blog_exports/` に生成され、Gitの追跡対象外です。元写真と `catalog.db` の写真行は変更しません。

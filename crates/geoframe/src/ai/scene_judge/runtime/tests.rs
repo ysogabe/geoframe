@@ -4,7 +4,6 @@ use crate::ai::{
     cloud::CloudClients,
     groups::runtime::Runtime,
     index,
-    jobs::JobState,
     settings::{Normalization, TaskKind},
     space::SpaceIdentity,
     tests_http::{Stub, respond, stub},
@@ -950,87 +949,6 @@ fn scenes_stopped_by_the_failure_cap_do_not_starve_the_ones_behind_them_until_a_
         MAX_QUEUE as i64
     );
     assert_eq!(reconcile(&handler).len(), MAX_QUEUE);
-}
-
-#[test]
-fn the_schema_is_additive_and_python_rollback_still_reads_and_rebuilds() {
-    let l = Lab::new();
-    l.scene(1..=3, 0);
-    l.paid();
-    let tables = [
-        "photos",
-        "photo_ai_groups",
-        "photo_ai_group_members",
-        "photo_ai_features",
-        "ai_scene_groups",
-        "ai_scene_members",
-        "ai_scene_active",
-        "ai_scene_judgments",
-    ];
-    let snap = |l: &Lab| -> Vec<Vec<Vec<rusqlite::types::Value>>> {
-        tables
-            .iter()
-            .map(|t| {
-                let t = t.to_string();
-                l.env
-                    .writer()
-                    .call(move |c| {
-                        let mut q = c.prepare(&format!("SELECT * FROM {t} ORDER BY 1,2"))?;
-                        let n = q.column_count();
-                        q.query_map([], |r| (0..n).map(|i| r.get(i)).collect())?
-                            .collect()
-                    })
-                    .unwrap()
-            })
-            .collect()
-    };
-    let before = snap(&l);
-    let script = format!(
-        r#"
-import os, sys, json
-sys.path.insert(0, {app:?})
-from geoframe import ai_pipeline, ai_search, photos
-feed=photos.api_photos()
-status=ai_search.api_ai_status()
-loaded=ai_pipeline._load_photos()
-ai_pipeline.load_rank_model=lambda *_: None
-ai_pipeline._rebuild_groups(loaded)
-print(json.dumps(dict(feed=len(feed), status=isinstance(status,dict), loaded=len(loaded))))
-"#,
-        app = concat!(env!("CARGO_MANIFEST_DIR"), "/../../app")
-    );
-    let output = std::process::Command::new("python3")
-        .args(["-I", "-c", &script])
-        .env_clear()
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("GEOFRAME_DATA_DIR", &l.config().data_dir)
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "synthetic Python rollback failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let result: Value = serde_json::from_str(
-        String::from_utf8(output.stdout)
-            .unwrap()
-            .lines()
-            .last()
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(result["status"], true);
-    assert_eq!(
-        result["feed"], 3,
-        "the feed is not narrowed by a paid judgment"
-    );
-    // Python が自分の旧表（groups / members / features）を再構築しても、人手の列と新しい表は同一。
-    let after = snap(&l);
-    for index in [0, 4, 5, 6, 7] {
-        assert!(after[index] == before[index], "{} changed", tables[index]);
-    }
-    assert_eq!(l.judgments(), 1);
-    assert_eq!(JobState::parse("succeeded"), Some(JobState::Succeeded));
 }
 
 fn view(l: &Lab) -> Value {

@@ -1,6 +1,6 @@
-//! バイナリへ埋め込んだ管理画面の静的ファイル（`app/static`・`app/vendor`、`build.rs` が表を作る）。
+//! バイナリへ埋め込んだ管理画面の静的ファイル（`web/static`・`web/vendor`、`build.rs` が表を作る）。
 //!
-//! パスは `static/admin.html` のような `app/` からの相対（先頭の `/` なし）。
+//! パスは `static/admin.html` のような `web/` からの相対（先頭の `/` なし）。
 
 /// 埋め込んだ1ファイル。
 pub struct File {
@@ -10,7 +10,7 @@ pub struct File {
     pub etag: &'static str,
 }
 
-/// 埋め込んだ旅行ブログの旅程 JSON 1つ（`app/travel_blog/plans/<name>`）。
+/// 埋め込んだ旅行ブログの旅程 JSON 1つ（`web/travel_blog/plans/<name>`）。
 pub struct PlanFile {
     /// `<trip_id>.json` のようなファイル名（ディレクトリは含まない）。
     pub name: &'static str,

@@ -105,9 +105,9 @@ pub fn page_target(normalized: &str) -> Option<&'static str> {
 /// 静的に配る領域。許可は `/favicon.ico` と、この5つの接頭辞だけ（ホワイトリスト）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Area {
-    /// `/static/` — 埋め込み（`app/static`）
+    /// `/static/` — 埋め込み（`web/static`）
     Static,
-    /// `/vendor/` — 埋め込み（`app/vendor`）
+    /// `/vendor/` — 埋め込み（`web/vendor`）
     Vendor,
     /// `/derivatives/` — `GEOFRAME_DATA_DIR/derivatives`
     Derivatives,

@@ -260,7 +260,7 @@ pub struct Config {
     /// 起動ログには載せない（フォルダ名は利用者の情報）。
     pub drive_folder: String,
     /// 旅行ブログの旅程 JSON を読むディレクトリ（絶対パス）。`GEOFRAME_BLOG_PLANS_DIR`（Rust だけの項目）。
-    /// `None` のときはバイナリに埋め込んだ `app/travel_blog/plans/*.json`（現行の `PLAN_DIR` と同じ内容）。
+    /// `None` のときはバイナリに埋め込んだ `web/travel_blog/plans/*.json`（現行の `PLAN_DIR` と同じ内容）。
     /// 旅程の中身は利用者の情報なので、パスもログの要約には載せない（埋め込みかディレクトリかだけ）。
     pub blog_plans_dir: Option<PathBuf>,
     /// AI の設定（T4.1b）。旧 `GEOFRAME_AI_*` の周期・上限・フラグと、任意の `GEOFRAME_AI_CONFIG`（JSON）。

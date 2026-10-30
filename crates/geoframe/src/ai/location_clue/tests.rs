@@ -888,67 +888,6 @@ fn image_bytes_are_read_before_releasing_lock_and_no_sql_transaction_is_held_dur
     assert_eq!(lab.posts().len(), 1);
 }
 
-fn python_readiness(e: &Env) -> Vec<(bool, bool)> {
-    let script = r#"
-import ast,sqlite3,sys,json
-from pathlib import Path
-from datetime import datetime
-src=ast.parse(Path(sys.argv[1]).read_text())
-wanted={'_image_rel','_load_targets','passes'}
-funcs=[n for n in src.body if isinstance(n,ast.FunctionDef) and n.name in wanted]
-conn=sqlite3.connect(sys.argv[2]); conn.row_factory=sqlite3.Row
-root=Path(sys.argv[2]).parent
-def epoch(s):
- try: return datetime.strptime(s,'%Y-%m-%d %H:%M').timestamp()
- except Exception: return None
-scope={'dbq':lambda sql:conn.execute(sql).fetchall(),'t_epoch':epoch,
-       'DATA_DIR':root,'DERIV_DIR':root/'derivatives','CLUE_MIN':0.2}
-exec(compile(ast.Module(body=funcs,type_ignores=[]),'loc_suggest.py','exec'),scope)
-rows=scope['_load_targets']()
-print(json.dumps([(r['classified'],scope['passes'](r)) for r in rows]))
-"#;
-    let result = std::process::Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../app/geoframe/loc_suggest.py"))
-        .arg(e.config.db_path())
-        .output()
-        .unwrap();
-    assert!(
-        result.status.success(),
-        "{}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    serde_json::from_slice(&result.stdout).unwrap()
-}
-
-#[test]
-fn actual_python_target_loader_and_passes_reuse_success_and_failure_and_wait_after_retry() {
-    let lab = Lab::new();
-    let e = lab.env("clue-python");
-    add(&e, 1, "photos/normal.jpg", Some(&jpeg()), 1);
-    add(&e, 2, "photos/bad.jpg", Some(b"broken"), 0);
-    add(&e, 3, "photos/pending.jpg", Some(&jpeg()), 0);
-    cycle(&e);
-    assert_eq!(
-        python_readiness(&e),
-        [(true, true), (true, false), (false, false)]
-    );
-    assert_eq!(targets(&e)[1].readiness, Readiness::Failed);
-    ops::retry(
-        &e.writer(),
-        &e.config.ai,
-        &handlers(&e),
-        RetryTarget::All,
-        &e.clock(),
-    )
-    .unwrap();
-    assert_eq!(
-        python_readiness(&e),
-        [(true, true), (false, false), (false, false)]
-    );
-}
-
 #[test]
 fn polling_discovers_later_photos_invalidates_ineligible_jobs_and_reuses_a_b_a_success() {
     let lab = Lab::new();
