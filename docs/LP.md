@@ -1,26 +1,21 @@
 # 紹介ページ（LP）の管理
 
 `site/`は、GEOFRAMEを紹介する静的なページです。素のHTMLとCSSだけで、JavaScript、外部のフォント、CDN、
-アクセス解析は使いません。GitHub Pagesで公開する予定ですが、**まだ公開していません**
-（リポジトリの公開準備は[公開準備チェックリスト](public-release-checklist.md)）。
+アクセス解析は使いません。GitHub Pagesで公開しています（公開したときの確認は[公開準備チェックリスト](public-release-checklist.md)）。
 
-- 公開予定のURL: <https://ysogabe.github.io/geoframe/>
-- ソース: [`site/`](../site/)（`index.html`、`styles.css`、`favicon.svg`）
+- URL: <https://ysogabe.github.io/geoframe/>
+- ソース: [`site/`](../site/)（`index.html`、`styles.css`、`favicon.svg`、`images/`）
 - 公開用のworkflow: [`.github/workflows/pages.yml`](../.github/workflows/pages.yml)（手動起動だけ）
 
-## 公開の手順
+## 更新の手順
 
-公開は、リポジトリの所有者が、準備ができたあとで行います。pushでは公開されません。
+pushではページは更新されません。`site/`の変更を`main`へマージしたあと、所有者が手動で公開します。
 
-1. [公開準備チェックリスト](public-release-checklist.md)の未解消事項を片付け、リポジトリをPublicにする。
-   （Privateのリポジトリでは、無料のプランでGitHub Pagesを使えません。プランと公開範囲はGitHubの設定で確認してください。）
-2. リポジトリの Settings → Pages で、**Source を「GitHub Actions」**にする。
-3. Actions タブで「紹介ページ（GitHub Pages）」を選び、**Run workflow**で手動起動する。
+1. Actions タブで「紹介ページ（GitHub Pages）」を選び、**Run workflow**で手動起動する。
    workflowは`site/`を検査（`tools/check_site.py`）してから、`site/`だけを公開します。
-4. 公開直前にLP内の「公開準備中」の案内とFAQ、READMEの公開状態を更新する。
-5. 完了後、上のURLを開いて表示を確かめる。公開用の環境（`github-pages`）に承認の規則があれば、それに従う。
+2. 完了後、上のURLを開いて表示を確かめる。
 
-公開を止めたいときは、Settings → Pages で公開を取り消します。
+Pages の Source は「GitHub Actions」です。公開を止めたいときは、Settings → Pages で公開を取り消します。
 
 ## 公開するのは`site/`だけ
 

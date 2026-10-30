@@ -34,7 +34,6 @@
       <h1 id="hero-title">撮った写真を、手元で整えて、<span>見せる準備まで。</span></h1>
       <p class="hero-lead">GEOFRAME は、ローカルフォルダや Google Drive の写真を SQLite に索引し、表示用画像の生成、品質解析、撮影地の修正、旅行ブログの下書きまでを 1 つの Rust 製バイナリで行うセルフホスト型の写真管理基盤です。AI による検索や場面の整理は任意で、写真の表示は別プロジェクトの miharashi が担います。</p>
       <div class="hero-actions"><a class="button" href="https://github.com/ysogabe/geoframe">GitHub で見る</a><a class="text-link" href="#setup">ソースからビルドする</a></div>
-      <p class="hero-status">公開準備中です。リポジトリの公開と、このページの公開はこれからです。</p>
       <figure class="hero-figure"><img src="images/hero.png" width="1600" height="800" alt="散らばった写真が地図の上で撮影地ごとに整理され、フォトフレームに映るまでの流れ"><figcaption>イメージ図です。実際の画面ではありません。</figcaption></figure>
     </section>
 
@@ -121,7 +120,6 @@ GEOFRAME_INGEST=1 ./target/release/geoframe serve \
           <details><summary>写真と GPS はどう扱われますか？</summary><p>原本は変更しません。カタログ（SQLite）には、撮影時刻と座標、手で直した位置、お気に入りを保存します。表示用画像と、旅行ブログの書き出しに使う画像は再エンコードするので、EXIF（GPS を含む）は残りません。旅行ブログの画面の API は、正確な座標を返しません。</p></details>
           <details><summary>スライドショーのような表示はできますか？</summary><p>表示は GEOFRAME の仕事ではありません。別プロジェクトの miharashi が、GEOFRAME の写真フィードを読んで表示します。GEOFRAME は、かつて持っていた Web キオスクや各種の表示機能を 2026 年 10 月に miharashi へ移しました。</p></details>
           <details><summary>カタログのバックアップは必要ですか？</summary><p>必要です。カタログ（<code>catalog.db</code>）には、手で直した GPS、お気に入り、有料で生成した AI の埋め込みなど、作り直せないデータが入ります。稼働中のデータベースを <code>cp</code> でコピーせず、SQLite の <code>.backup</code> を使ってください。</p></details>
-          <details><summary>このページはもう公開されていますか？</summary><p>いいえ。リポジトリの公開とあわせて準備中です。公開の前に、履歴と同梱データの確認を所有者が行います。</p></details>
         </div>
       </div>
     </section>
