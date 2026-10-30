@@ -34,9 +34,9 @@
 //! `char` や `u8` の並びから作る名前）、shell の引用の連結（`p""ython`）、変数展開（`PY=py; ${PY}thon`）、
 //! 別の関数や別のファイルから渡る変数や引数、マクロの中で作る `Command`、`Command` を返す関数の呼び出し側
 //! （`make().spawn()`）、別の名前での再公開を 2 段以上重ねた別名、`<T as Trait>::new(` で Command 以外の型の名前を
-//! 通して Command を作る関連型。底の検査は「python と読める文字列が書いてある」ことしか見ないので、`LITERAL_ALLOWED`
-//! に載せたファイル（基準データの JSON のキー `"python"` を使う試験）では、その文字列を実行ファイルとして使う書き方が
-//! あっても、起動の構文の検査（`Command::new` の引数・同じ関数の文字列・変数）に頼る。`exec` は試験の補助関数の名前
+//! 通して Command を作る関連型。底の検査は文字列の中身しか見ない。基準データの JSON のキー `"python"` は、添字
+//! （`case["python"]`）としての出現が**すべて**のファイルだけ許す（`Allow::IndexKey`）。添字でない `"python"` が 1 つでも入れば
+//! 失敗にする。説明文（`Allow::Exact`）の許可は、その文章そのものにしか効かない。`exec` は試験の補助関数の名前
 //! （`env.exec(..)`）と区別できないので、`CommandExt` を glob で import して `.exec()` を呼ぶ書き方は import の検査
 //! （`process::*`・`CommandExt`）に頼る。式のままの起動は許可リストの式が何を指すかを人が確かめる前提。
 //! コメントの中の説明は、起動するコードではないので対象にしない。
@@ -492,9 +492,9 @@ struct Analysis {
     sites: Vec<Site>,
     /// 許可リストと無関係に失敗にする箇所（行、理由）。
     problems: Vec<(usize, String)>,
-    /// python・pypy を実行ファイルとして読める文字列リテラル（行、エスケープを戻した中身）。
+    /// python・pypy を実行ファイルとして読める文字列リテラル（行、エスケープを戻した中身、添字 `x["python"]` か）。
     /// 起動の箇所かどうかに関係なく、実際の `crates` の検査では許可リストに無ければ失敗にする。
-    literals: Vec<(usize, String)>,
+    literals: Vec<(usize, String, bool)>,
 }
 
 /// 位置 `i` を含む関数の字句の範囲（見つからなければ前後の少しの範囲）。
@@ -808,11 +808,11 @@ fn analyze(text: &str, outer: &BTreeSet<String>) -> Analysis {
     }
 
     // 起動の構文に頼らない底: python と読める文字列リテラルは、どこにあっても記録する
-    for tok in &t {
+    for (i, tok) in t.iter().enumerate() {
         if let Kind::Str(s) = &tok.kind
             && runs_python(s)
         {
-            a.literals.push((tok.line, s.clone()));
+            a.literals.push((tok.line, s.clone(), is_index(&t, i)));
         }
     }
 
@@ -962,6 +962,9 @@ enum Allow {
     Exact(&'static str),
     /// 中身がこれで始まる（長い説明文だけ。ほかの項目には使わない）。
     Starts(&'static str),
+    /// 中身が完全に一致し、そのファイルの出現が**すべて**添字（`case["python"]`）のときだけ許す。
+    /// 基準データの JSON のキー用。同じファイルに添字でない `"python"` が 1 つでも入れば失敗にする。
+    IndexKey(&'static str),
 }
 
 /// python・pypy を実行ファイルとして読める文字列リテラルのうち、起動するものではないと確かめたもの
@@ -969,12 +972,15 @@ enum Allow {
 /// 項目が使われなくなったら失敗にする。
 const LITERAL_ALLOWED: &[(&str, Allow)] = &[
     // 基準データ（Python 版が出した値を固めた JSON）のキー `"python"`。添字で読むだけで、起動しない。
-    ("geoframe/src/drive/tests.rs", Allow::Exact("python")),
-    ("geoframe/src/geo/tests.rs", Allow::Exact("python")),
-    ("geoframe/src/imaging/tests.rs", Allow::Exact("python")),
-    ("geoframe/src/quality/tests.rs", Allow::Exact("python")),
-    ("geoframe/tests/exif_python.rs", Allow::Exact("python")),
-    ("geoframe/tests/jpeg_eoi_python.rs", Allow::Exact("python")),
+    ("geoframe/src/drive/tests.rs", Allow::IndexKey("python")),
+    ("geoframe/src/geo/tests.rs", Allow::IndexKey("python")),
+    ("geoframe/src/imaging/tests.rs", Allow::IndexKey("python")),
+    ("geoframe/src/quality/tests.rs", Allow::IndexKey("python")),
+    ("geoframe/tests/exif_python.rs", Allow::IndexKey("python")),
+    (
+        "geoframe/tests/jpeg_eoi_python.rs",
+        Allow::IndexKey("python"),
+    ),
     (
         "geoframe/tests/local_index_python.rs",
         Allow::Exact("python"),
@@ -1244,10 +1250,19 @@ const SELF_FILE: &str = "geoframe/tests/no_python.rs";
 const SELF_EXEMPT_FROM: &str =
     "// ---- 以降の文字列は検出器の入力の例と説明文なので、文字列の検査から外す ----";
 
+/// 許可リストの項目 `allow` が、文字列 `lit`（そのファイルの出現が `all_index` ならすべて添字）を許すか。
+fn allows(allow: &Allow, lit: &str, all_index: bool) -> bool {
+    match allow {
+        Allow::Exact(s) => *s == lit,
+        Allow::Starts(s) => lit.starts_with(s),
+        Allow::IndexKey(s) => *s == lit && all_index,
+    }
+}
+
 #[test]
 fn no_string_literal_under_crates_reads_as_python_outside_the_allow_list() {
-    // (ファイル, 文字列の中身) → 行
-    let mut hits: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    // (ファイル, 文字列の中身) → (行, 添字か)
+    let mut hits: BTreeMap<(String, String), Vec<(usize, bool)>> = BTreeMap::new();
     for (rel, text) in crate_sources() {
         let exempt_from = if rel == SELF_FILE {
             text.lines()
@@ -1256,32 +1271,28 @@ fn no_string_literal_under_crates_reads_as_python_outside_the_allow_list() {
         } else {
             usize::MAX
         };
-        for (line, s) in analyze(&text, &BTreeSet::new()).literals {
+        for (line, s, index) in analyze(&text, &BTreeSet::new()).literals {
             if line < exempt_from {
-                hits.entry((rel.clone(), s)).or_default().push(line);
+                hits.entry((rel.clone(), s))
+                    .or_default()
+                    .push((line, index));
             }
-        }
-    }
-    if std::env::var_os("NP_DUMP").is_some() {
-        for (file, lit) in hits.keys() {
-            eprintln!("(\"{file}\", Allow::Exact({lit:?})),");
         }
     }
 
     let mut used = vec![false; LITERAL_ALLOWED.len()];
     let mut diffs = Vec::new();
-    for ((file, lit), lines) in &hits {
-        let entry = LITERAL_ALLOWED.iter().position(|(f, allow)| {
-            f == file
-                && match allow {
-                    Allow::Exact(s) => s == lit,
-                    Allow::Starts(s) => lit.starts_with(s),
-                }
-        });
+    for ((file, lit), at) in &hits {
+        let all_index = at.iter().all(|(_, index)| *index);
+        let entry = LITERAL_ALLOWED
+            .iter()
+            .position(|(f, allow)| f == file && allows(allow, lit, all_index));
         match entry {
             Some(n) => used[n] = true,
             None => diffs.push(format!(
-                "{file}:{lines:?} python・pypy を実行ファイルとして読める文字列 {lit:?}。起動する文字列でないと確かめてから LITERAL_ALLOWED に足すこと"
+                "{file}:{:?} python・pypy を実行ファイルとして読める文字列 {lit:?}（添字 `x[\"python\"]` でない出現: {:?}）。起動する文字列でないと確かめてから LITERAL_ALLOWED に足すこと",
+                at.iter().map(|(l, _)| *l).collect::<Vec<_>>(),
+                at.iter().filter(|(_, i)| !*i).map(|(l, _)| *l).collect::<Vec<_>>(),
             )),
         }
     }
@@ -1297,6 +1308,23 @@ fn no_string_literal_under_crates_reads_as_python_outside_the_allow_list() {
         "python と読める文字列が許可リストと合わない:\n{}",
         diffs.join("\n")
     );
+}
+
+#[test]
+fn the_literal_allow_list_keeps_prefix_matching_to_one_entry_and_index_keys_to_python() {
+    let starts = LITERAL_ALLOWED
+        .iter()
+        .filter(|(_, a)| matches!(a, Allow::Starts(_)))
+        .count();
+    assert!(
+        starts <= 1,
+        "前置きの照合は長い使い方の表示 1 つだけ（{starts}）"
+    );
+    for (file, allow) in LITERAL_ALLOWED {
+        if let Allow::IndexKey(s) = allow {
+            assert_eq!(*s, "python", "{file}");
+        }
+    }
 }
 
 // ---- 検出器の回帰試験 ----
@@ -1324,7 +1352,7 @@ fn literals(src: &str) -> Vec<usize> {
     let lines: BTreeSet<usize> = analyze(src, &BTreeSet::new())
         .literals
         .into_iter()
-        .map(|(line, _)| line)
+        .map(|(line, _, _)| line)
         .collect();
     lines.into_iter().collect()
 }
@@ -1466,6 +1494,37 @@ fn the_bottom_check_reads_every_kind_of_string_literal_as_a_possible_executable(
     ] {
         assert_eq!(literals(src), Vec::<usize>::new(), "{src}");
     }
+}
+
+#[test]
+fn an_index_key_allowance_covers_only_files_where_every_python_literal_is_an_index() {
+    let key = Allow::IndexKey("python");
+    let all_index = |src: &str| {
+        let found = analyze(src, &BTreeSet::new()).literals;
+        assert!(!found.is_empty(), "{src}");
+        found.iter().all(|(_, _, index)| *index)
+    };
+    // 基準データの JSON のキーとしての添字だけなら許す
+    let json = "let w = &case[\"python\"];\nlet r = row[\"python\"].as_str();\nlet d = doc[\"steps\"][0][\"python\"][\"rows\"];";
+    assert!(all_index(json));
+    assert!(allows(&key, "python", all_index(json)));
+    // 同じファイルに添字でない "python" が 1 つでも入れば許さない（起動に使う形を底で止める）
+    for src in [
+        "let w = &case[\"python\"];\nlet exe = \"python\";",
+        "let w = &case[\"python\"];\nrun(\"python\");",
+        "let w = &case[\"python\"];\nlet exe = [\"python\"];",
+        "let exe = b\"python\";",
+    ] {
+        assert!(!all_index(src), "{src}");
+        assert!(!allows(&key, "python", all_index(src)), "{src}");
+    }
+    // 完全に一致しない文字列には使えない
+    assert!(!allows(&key, "python3", true));
+    assert!(!allows(&key, "python -V", true));
+    // Exact・Starts の照合
+    assert!(allows(&Allow::Exact("a python b"), "a python b", false));
+    assert!(!allows(&Allow::Exact("a python"), "a python b", false));
+    assert!(allows(&Allow::Starts("使い方:"), "使い方: python", false));
 }
 #[test]
 fn the_detector_finds_python_launched_in_the_ways_a_string_search_misses() {
