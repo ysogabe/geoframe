@@ -20,16 +20,26 @@
 //!   1 か所で、直接の起動・wrapper・`-c` のどれも同じ判定を使う。
 //!   起動の道具の検査は、API を使う構文（`use` の import、`x::y` のパス、`name(` の呼び出し、`.pre_exec(`）だけを
 //!   見る。同じ名前の変数・フィールド（`let subprocess = 42;`）は対象にしない。
+//!   `use` の木は階層を追う（`use libc::{system};`・`use crate::{process, tokio::fs};`）。`tokio` 配下の `process`、
+//!   `libc` の `system`・`popen`（グループ・別名・glob を含む）、`Command::new::<T>(..)` の型の引数つきの呼び出しも、
+//!   通常の呼び出しと同じ検査をする。
+//! - **底の検査**（起動の構文に頼らない）: `crates` 以下の全 `.rs` の**すべての文字列リテラル**（通常・生・`b".."`・
+//!   `c".."`・`br#".."#` など。エスケープ `\x70ython` を戻したもの）を `runs_python` で判定し、python・pypy を
+//!   実行ファイルとして読めるものがあれば、起動の箇所かどうかに関係なく失敗にする。上の構文の追跡が漏れても、
+//!   python の名前が文字列として書いてあれば、ここで捕まる。誤検知（基準データの JSON のキー `"python"`、Python 版との
+//!   比較の失敗の説明文など）は `LITERAL_ALLOWED`（ファイル・文字列の中身・理由）で個別に除く。使われなくなった項目は
+//!   失敗にする。この試験ファイル自身は、印の行より後（検出器の入力の例と許可リスト）だけ文字列の検査から外す。
 //!
-//! 限界（捕まえられない書き方）: 文字列を実行時に組み立てる（`format!("py{}", ..)`、連結、`p""ython` のような
-//! shell の引用の連結）、別の関数や別のファイルから渡る変数や引数、マクロの中で作る `Command`、`Command` を返す
-//! 関数の呼び出し側（`make().spawn()`）、別の名前での再公開を 2 段以上重ねた別名、`<T as Trait>::new(` で
-//! Command 以外の型の名前を通して Command を作る関連型、shell の命令文の中で python を別の語に束ねたもの
-//! （`PY=py; ${PY}thon`）。`exec` は試験の補助関数の名前（`env.exec(..)`）と区別できないので、
-//! `CommandExt` を glob で import して `.exec()` を呼ぶ書き方は import の検査（`process::*`・`CommandExt`）に
-//! 頼る。式のままの起動は許可リストの式が何を指すかを人が確かめる前提。
-//! `["python"]` のような JSON のキー、`*-python.json` のような基準のファイル名、コメントや文字列の中の説明は、
-//! 起動するコードではないので対象にしない。
+//! 限界（捕まえられない書き方）: 文字列を実行時に組み立てる（`format!("py{}", ..)`、`concat!`・`+` での連結、
+//! `char` や `u8` の並びから作る名前）、shell の引用の連結（`p""ython`）、変数展開（`PY=py; ${PY}thon`）、
+//! 別の関数や別のファイルから渡る変数や引数、マクロの中で作る `Command`、`Command` を返す関数の呼び出し側
+//! （`make().spawn()`）、別の名前での再公開を 2 段以上重ねた別名、`<T as Trait>::new(` で Command 以外の型の名前を
+//! 通して Command を作る関連型。底の検査は「python と読める文字列が書いてある」ことしか見ないので、`LITERAL_ALLOWED`
+//! に載せたファイル（基準データの JSON のキー `"python"` を使う試験）では、その文字列を実行ファイルとして使う書き方が
+//! あっても、起動の構文の検査（`Command::new` の引数・同じ関数の文字列・変数）に頼る。`exec` は試験の補助関数の名前
+//! （`env.exec(..)`）と区別できないので、`CommandExt` を glob で import して `.exec()` を呼ぶ書き方は import の検査
+//! （`process::*`・`CommandExt`）に頼る。式のままの起動は許可リストの式が何を指すかを人が確かめる前提。
+//! コメントの中の説明は、起動するコードではないので対象にしない。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -263,7 +273,61 @@ fn read_string(c: &[char], mut i: usize, line: &mut usize) -> (String, usize) {
             i += 1;
         }
     }
-    (c[start..i.min(c.len())].iter().collect(), i + 1)
+    let raw: String = c[start..i.min(c.len())].iter().collect();
+    (unescape(&raw), i + 1)
+}
+
+/// 通常の文字列（`"`・`b".."`・`c".."`）のエスケープを戻す（`\x70ython`・`\u{70}ython`・`\n`・行末の `\`）。
+/// 読めないエスケープはそのまま残す。生文字列には使わない。
+fn unescape(s: &str) -> String {
+    let c: Vec<char> = s.chars().collect();
+    let hex = |from: usize, to: usize| -> Option<char> {
+        let digits: String = c.get(from..to)?.iter().collect();
+        char::from_u32(u32::from_str_radix(&digits, 16).ok()?)
+    };
+    let mut out = String::new();
+    let mut i = 0;
+    while i < c.len() {
+        if c[i] != '\\' || i + 1 >= c.len() {
+            out.push(c[i]);
+            i += 1;
+            continue;
+        }
+        let simple = match c[i + 1] {
+            'n' => Some('\n'),
+            'r' => Some('\r'),
+            't' => Some('\t'),
+            '0' => Some('\0'),
+            '\\' | '\'' | '"' => Some(c[i + 1]),
+            _ => None,
+        };
+        if let Some(ch) = simple {
+            out.push(ch);
+            i += 2;
+        } else if c[i + 1] == '\n' {
+            // 行末の `\` は、次の行の先頭の空白までを読み飛ばす
+            i += 2;
+            while i < c.len() && c[i].is_whitespace() {
+                i += 1;
+            }
+        } else if c[i + 1] == 'x'
+            && let Some(ch) = hex(i + 2, i + 4)
+        {
+            out.push(ch);
+            i += 4;
+        } else if c[i + 1] == 'u'
+            && c.get(i + 2) == Some(&'{')
+            && let Some(close) = (i + 3..c.len()).find(|&k| c[k] == '}')
+            && let Some(ch) = hex(i + 3, close)
+        {
+            out.push(ch);
+            i = close + 1;
+        } else {
+            out.push('\\');
+            i += 1;
+        }
+    }
+    out
 }
 
 /// `r` の次（`#` か `"`）から生文字列を読む。生文字列でなければ `None`（`r#ident` など）。
@@ -428,6 +492,9 @@ struct Analysis {
     sites: Vec<Site>,
     /// 許可リストと無関係に失敗にする箇所（行、理由）。
     problems: Vec<(usize, String)>,
+    /// python・pypy を実行ファイルとして読める文字列リテラル（行、エスケープを戻した中身）。
+    /// 起動の箇所かどうかに関係なく、実際の `crates` の検査では許可リストに無ければ失敗にする。
+    literals: Vec<(usize, String)>,
 }
 
 /// 位置 `i` を含む関数の字句の範囲（見つからなければ前後の少しの範囲）。
@@ -477,14 +544,144 @@ fn in_use_statement(t: &[Tok], i: usize) -> bool {
     false
 }
 
-/// `use` の文（位置 `i` を含む）の `;` までの字句の範囲。
-fn use_statement(t: &[Tok], i: usize) -> std::ops::Range<usize> {
-    let start = (0..i)
-        .rev()
-        .find(|&k| ident(t, k) == Some("use"))
-        .unwrap_or(i);
-    let end = (i..t.len()).find(|&k| punct(t, k, ';')).unwrap_or(t.len());
-    start..end
+/// `use` の木（`use a::{b, c::{d as e, *}};`）を 1 本ずつの経路に開いたもの。
+struct UsePath {
+    /// 先頭から順の経路（`self` は親の名前そのものとして畳む）。
+    segs: Vec<String>,
+    /// 末尾が `*`。
+    glob: bool,
+    /// `as X` が付いている。
+    alias: bool,
+}
+
+/// `start` から `end`（`;` の位置）までの `use` の木 1 本を、`prefix` の下の経路に開いて `out` に足す。
+/// 読んだ次の位置を返す（必ず 1 つ以上進む）。
+fn use_tree(
+    t: &[Tok],
+    start: usize,
+    end: usize,
+    prefix: &[String],
+    out: &mut Vec<UsePath>,
+) -> usize {
+    let mut segs = prefix.to_vec();
+    let mut i = start;
+    if is_path_sep(t, i) {
+        i += 2;
+    }
+    while i < end {
+        match &t[i].kind {
+            Kind::Ident(s) if s != "as" => {
+                if !(s == "self" && !segs.is_empty()) {
+                    segs.push(s.clone());
+                }
+                i += 1;
+            }
+            Kind::Punct('*') => {
+                out.push(UsePath {
+                    segs,
+                    glob: true,
+                    alias: false,
+                });
+                return i + 1;
+            }
+            Kind::Punct('{') => {
+                i += 1;
+                while i < end && !punct(t, i, '}') {
+                    let before = i;
+                    i = use_tree(t, i, end, &segs, out);
+                    if punct(t, i, ',') {
+                        i += 1;
+                    }
+                    if i == before {
+                        i += 1;
+                    }
+                }
+                return i + 1;
+            }
+            _ => break,
+        }
+        if is_path_sep(t, i) {
+            i += 2;
+        } else {
+            break;
+        }
+    }
+    let alias = ident(t, i) == Some("as");
+    if alias {
+        i += 2;
+    }
+    out.push(UsePath {
+        segs,
+        glob: false,
+        alias,
+    });
+    i.max(start + 1)
+}
+
+/// `use` の文 1 つ分（`use` の位置から）の、開いた経路。
+fn use_paths(t: &[Tok], use_at: usize) -> Vec<UsePath> {
+    let end = (use_at..t.len())
+        .find(|&k| punct(t, k, ';'))
+        .unwrap_or(t.len());
+    let mut out = Vec::new();
+    use_tree(t, use_at + 1, end, &[], &mut out);
+    out
+}
+
+/// `use` の経路 1 本が、起動の道具に届くものなら、その理由。階層を追うので、同じ文の別の枝の名前
+/// （`use crate::{process, tokio::fs};`）では誤検知しない。
+fn use_path_problem(p: &UsePath) -> Option<String> {
+    let last = p.segs.last().map(String::as_str);
+    if p.segs
+        .windows(2)
+        .any(|w| w[0] == "tokio" && w[1] == "process")
+    {
+        return Some("`tokio::process` は使えない".to_string());
+    }
+    if last == Some("tokio") && (p.glob || p.alias) {
+        return Some(
+            "`tokio` の glob import・別名は使えない（`tokio::process` に届く）".to_string(),
+        );
+    }
+    if last == Some("libc") && (p.glob || p.alias) {
+        return Some(
+            "`libc` の glob import・別名は使えない（`system`・`popen` に届く）".to_string(),
+        );
+    }
+    if p.segs.iter().any(|s| s == "libc") && matches!(last, Some("system" | "popen")) {
+        return Some("`libc::system`・`popen` は使えない".to_string());
+    }
+    if p.glob && last == Some("process") {
+        return Some(
+            "`process::*` の glob import は使えない（起動の道具が見えなくなる）".to_string(),
+        );
+    }
+    None
+}
+
+/// `new` の位置 `i` から、呼び出しの `(` の位置。`new::<&str>(` の型の引数は読み飛ばす。呼び出しでなければ `None`。
+fn call_open(t: &[Tok], i: usize) -> Option<usize> {
+    if punct(t, i + 1, '(') {
+        return Some(i + 1);
+    }
+    if !(is_path_sep(t, i + 1) && punct(t, i + 3, '<')) {
+        return None;
+    }
+    let mut depth = 0usize;
+    for k in i + 3..(i + 3 + 80).min(t.len()) {
+        match t[k].kind {
+            Kind::Punct('<') => depth += 1,
+            Kind::Punct('>') => {
+                depth -= 1;
+                if depth == 0 {
+                    return punct(t, k + 1, '(').then_some(k + 1);
+                }
+            }
+            Kind::Punct(';' | '{' | '}') => return None,
+            _ => {}
+        }
+    }
+    None
 }
 
 /// `Command::new` 以外の起動の道具を使う構文なら、その理由。名前が同じだけの変数・フィールドは対象にしない。
@@ -583,23 +780,6 @@ fn analyze(text: &str, outer: &BTreeSet<String>) -> Analysis {
             a.problems
                 .push((t[i].line, "`tokio::process` は使えない".to_string()));
         }
-        if name == "tokio"
-            && in_use_statement(&t, i)
-            && use_statement(&t, i).any(|k| ident(&t, k) == Some("process"))
-        {
-            a.problems
-                .push((t[i].line, "`tokio::process` は使えない".to_string()));
-        }
-        if name == "process"
-            && in_use_statement(&t, i)
-            && is_path_sep(&t, i + 1)
-            && punct(&t, i + 3, '*')
-        {
-            a.problems.push((
-                t[i].line,
-                "`process::*` の glob import は使えない（起動の道具が見えなくなる）".to_string(),
-            ));
-        }
         if name == "libc"
             && is_path_sep(&t, i + 1)
             && matches!(ident(&t, i + 3), Some("system" | "popen"))
@@ -607,11 +787,39 @@ fn analyze(text: &str, outer: &BTreeSet<String>) -> Analysis {
             a.problems
                 .push((t[i].line, "`libc::system`・`popen` は使えない".to_string()));
         }
+        // 自分で `system`・`popen` を宣言する（`extern "C" { fn system(..); }`）
+        if name == "fn"
+            && matches!(ident(&t, i + 1), Some("system" | "popen"))
+            && punct(&t, i + 2, '(')
+        {
+            a.problems.push((
+                t[i].line,
+                "libc の `system`・`popen` を自分で宣言している".to_string(),
+            ));
+        }
+        // `use` の木は階層を追う（グループ・別名・glob）
+        if name == "use" {
+            for p in use_paths(&t, i) {
+                if let Some(why) = use_path_problem(&p) {
+                    a.problems.push((t[i].line, why));
+                }
+            }
+        }
     }
 
-    // Command::new(..)（`Command::new`、`<Command>::new`、`<std::process::Command as X>::new`）
+    // 起動の構文に頼らない底: python と読める文字列リテラルは、どこにあっても記録する
+    for tok in &t {
+        if let Kind::Str(s) = &tok.kind
+            && runs_python(s)
+        {
+            a.literals.push((tok.line, s.clone()));
+        }
+    }
+
+    // Command::new(..)（`Command::new`、`<Command>::new`、`<std::process::Command as X>::new`、
+    // `Command::new::<&str>(..)`）
     for i in 3..t.len() {
-        if ident(&t, i) != Some("new") || !punct(&t, i + 1, '(') || !is_path_sep(&t, i - 2) {
+        if ident(&t, i) != Some("new") || !is_path_sep(&t, i - 2) {
             continue;
         }
         let start = match receiver(&t, i - 3, &names) {
@@ -625,7 +833,14 @@ fn analyze(text: &str, outer: &BTreeSet<String>) -> Analysis {
                 continue;
             }
         };
-        let first = i + 2;
+        let Some(open) = call_open(&t, i) else {
+            a.problems.push((
+                t[start].line,
+                "`Command::new` を呼び出さずに使っている（関数として渡している）".to_string(),
+            ));
+            continue;
+        };
+        let first = open + 1;
         let end = arg_end(&t, first);
         let arg = &t[first..end];
         let exe = match arg {
@@ -738,6 +953,174 @@ fn is_shell_command_flag(s: &str) -> bool {
         && s[1..].chars().all(|c| c.is_ascii_alphabetic())
 }
 
+// ---- 以降の文字列は検出器の入力の例と説明文なので、文字列の検査から外す ----
+
+/// 文字列の許可リストの 1 項目。
+#[derive(Debug)]
+enum Allow {
+    /// 文字列の中身が完全に一致する。
+    Exact(&'static str),
+    /// 中身がこれで始まる（長い説明文だけ。ほかの項目には使わない）。
+    Starts(&'static str),
+}
+
+/// python・pypy を実行ファイルとして読める文字列リテラルのうち、起動するものではないと確かめたもの
+/// （`crates` からの相対パス、文字列）。起動の箇所かどうかに関係なく、ここに無い文字列があれば失敗にする。
+/// 項目が使われなくなったら失敗にする。
+const LITERAL_ALLOWED: &[(&str, Allow)] = &[
+    // 基準データ（Python 版が出した値を固めた JSON）のキー `"python"`。添字で読むだけで、起動しない。
+    ("geoframe/src/drive/tests.rs", Allow::Exact("python")),
+    ("geoframe/src/geo/tests.rs", Allow::Exact("python")),
+    ("geoframe/src/imaging/tests.rs", Allow::Exact("python")),
+    ("geoframe/src/quality/tests.rs", Allow::Exact("python")),
+    ("geoframe/tests/exif_python.rs", Allow::Exact("python")),
+    ("geoframe/tests/jpeg_eoi_python.rs", Allow::Exact("python")),
+    (
+        "geoframe/tests/local_index_python.rs",
+        Allow::Exact("python"),
+    ),
+    (
+        "geoframe/tests/orientation_python.rs",
+        Allow::Exact("python"),
+    ),
+    // テストデータの SQL（`place_name` に入れる合成の地名）。
+    (
+        "geoframe/src/ai/location_suggest/runtime/tests.rs",
+        Allow::Exact(
+            "SELECT COUNT(*) FROM photo_loc_suggestions WHERE place_name='synthetic Python rewrite'",
+        ),
+    ),
+    (
+        "geoframe/src/ai/location_suggest/runtime/tests.rs",
+        Allow::Exact("UPDATE photo_loc_suggestions SET place_name='synthetic Python rewrite'"),
+    ),
+    // 起動の安全確認の説明文（Python 版のサービスが稼働中のとき書き込みを断る理由）。
+    (
+        "geoframe/src/guard.rs",
+        Allow::Exact(
+            "Python 版（{PYTHON_UNIT}）が非稼働と確認できない（状態: {state}）ので、書き込みを始めません。二重に書くと Python のダウンロードと .cache.json を壊します",
+        ),
+    ),
+    (
+        "geoframe/src/guard.rs",
+        Allow::Exact(
+            "Python 版（{PYTHON_UNIT}）の状態を取得できない（{why}）ので、書き込みを始めません。非稼働と確認できないものは通しません",
+        ),
+    ),
+    // `geoframe` の使い方の表示（Python 版の稼働確認の説明を含む。長いので始まりだけで照合する）。
+    (
+        "geoframe/src/cli.rs",
+        Allow::Starts("使い方:\n  geoframe --version"),
+    ),
+    // Python 版との比較の試験の、失敗時の説明文・表示名（Python は比べる相手の名前で、起動しない）。
+    (
+        "geoframe/src/ai/tests.rs",
+        Allow::Exact("Python と同じスキーマの再現には ai_jobs を入れない"),
+    ),
+    (
+        "geoframe/src/drive/tests.rs",
+        Allow::Exact("{column}: Python と同じ値なら決定による差ではない"),
+    ),
+    (
+        "geoframe/src/drive/tests.rs",
+        Allow::Exact("{name}: Python は idF から動けない"),
+    ),
+    (
+        "geoframe/src/quality/tests.rs",
+        Allow::Exact("{name}: Python が作った photo_quality"),
+    ),
+    (
+        "geoframe/tests/blog_api.rs",
+        Allow::Exact("{target}: 応答が Python と違う"),
+    ),
+    (
+        "geoframe/tests/blog_write_api.rs",
+        Allow::Exact("{name} は Python と同じになった。decided から外す"),
+    ),
+    (
+        "geoframe/tests/csrf_python.rs",
+        Allow::Exact("Python は {python}: {:?}"),
+    ),
+    (
+        "geoframe/tests/csrf_python.rs",
+        Allow::Exact("Python は {python}: {headers:?}"),
+    ),
+    (
+        "geoframe/tests/csrf_python.rs",
+        Allow::Exact(
+            "host: {} 件（Python が通す {python_allows}、HTTP 層が先に 400 にして Python が通すもの {http_layer_only}）",
+        ),
+    ),
+    (
+        "geoframe/tests/csrf_python.rs",
+        Allow::Exact("{name}: Python は書かない（{py_status}）のに Rust が書いた（{status}）"),
+    ),
+    (
+        "geoframe/tests/csrf_python.rs",
+        Allow::Exact(
+            "{name}: {} 件（Python が通す {}、HTTP 層が先に 400 にして Python が通すもの {}、両方が断る 400 {}、既知の差 {}）。HTTP 層が断る値のバイト: {:02x?}",
+        ),
+    ),
+    (
+        "geoframe/tests/csrf_python.rs",
+        Allow::Exact("{name}: 書き込み（Python {py_status}、Rust {status}）"),
+    ),
+    (
+        "geoframe/tests/exif_python.rs",
+        Allow::Exact("未知の Python 例外のケース: {other}"),
+    ),
+    (
+        "geoframe/tests/jpeg_eoi_python.rs",
+        Allow::Exact("{name}: 表の差が Python と同じになった"),
+    ),
+    (
+        "geoframe/tests/jpeg_eoi_python.rs",
+        Allow::Exact("{name}（Python: {}）"),
+    ),
+    (
+        "geoframe/tests/local_index_python.rs",
+        Allow::Exact("{name} {column}: Python と同じ値なら決定による差ではない"),
+    ),
+    (
+        "geoframe/tests/orientation_python.rs",
+        Allow::Exact("{name}: Python が回していない"),
+    ),
+    (
+        "geoframe/tests/rotate_api.rs",
+        Allow::Exact("{name} は Python と同じになった。known_differences から外す"),
+    ),
+    (
+        "geoframe/tests/update_api.rs",
+        Allow::Exact("{name} は Python と同じになった。known_differences から外す"),
+    ),
+    (
+        "geoframe/tests/update_api.rs",
+        Allow::Exact("{name}: Python の結果"),
+    ),
+    // この試験ファイル自身のうち、検出器の本体の文字列。`is_python_exe` の接頭辞と、失敗の説明文。
+    (
+        "geoframe/tests/no_python.rs",
+        Allow::Exact("`{var}` に python の実行ファイルの名前が入っている"),
+    ),
+    ("geoframe/tests/no_python.rs", Allow::Exact("pypy")),
+    ("geoframe/tests/no_python.rs", Allow::Exact("python")),
+    (
+        "geoframe/tests/no_python.rs",
+        Allow::Exact("python を起動している: {s:?}"),
+    ),
+    (
+        "geoframe/tests/no_python.rs",
+        Allow::Exact("shell の `-c` に渡す文字列に python がある"),
+    ),
+    (
+        "geoframe/tests/no_python.rs",
+        Allow::Exact("{s:?} を起動する関数に python と読める文字列がある"),
+    ),
+    (
+        "geoframe/tests/no_python.rs",
+        Allow::Exact("起動する関数に python の実行ファイルの名前の文字列がある"),
+    ),
+];
 // ---- 実際の `crates` の検査 ----
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -754,14 +1137,14 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-#[test]
-fn process_launches_under_crates_match_the_allow_list_and_none_is_python() {
+/// `crates` 以下の全 `.rs`（`crates` からの相対パス、中身）。
+fn crate_sources() -> Vec<(String, String)> {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
     let mut files = Vec::new();
     rust_files(&root, &mut files);
     files.sort();
     assert!(files.len() > 50, "{} files", files.len());
-    let texts: Vec<(String, String)> = files
+    files
         .iter()
         .map(|f| {
             let rel = f
@@ -771,7 +1154,12 @@ fn process_launches_under_crates_match_the_allow_list_and_none_is_python() {
                 .replace('\\', "/");
             (rel, std::fs::read_to_string(f).unwrap())
         })
-        .collect();
+        .collect()
+}
+
+#[test]
+fn process_launches_under_crates_match_the_allow_list_and_none_is_python() {
+    let texts = crate_sources();
 
     // Command の別名は、別のファイルで再公開されて使われることがあるので、全ファイルから集める
     let mut aliases = BTreeSet::from(["Command".to_string()]);
@@ -850,6 +1238,67 @@ fn the_allow_list_never_names_python() {
     }
 }
 
+/// この試験ファイル自身で、文字列の検査から外す範囲の始まりの行（この行より後の文字列は、検出器の入力の例と
+/// 失敗の説明文）。この行より前の文字列は他のファイルと同じ扱いで、`LITERAL_ALLOWED` に書いたものだけ許す。
+const SELF_FILE: &str = "geoframe/tests/no_python.rs";
+const SELF_EXEMPT_FROM: &str =
+    "// ---- 以降の文字列は検出器の入力の例と説明文なので、文字列の検査から外す ----";
+
+#[test]
+fn no_string_literal_under_crates_reads_as_python_outside_the_allow_list() {
+    // (ファイル, 文字列の中身) → 行
+    let mut hits: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    for (rel, text) in crate_sources() {
+        let exempt_from = if rel == SELF_FILE {
+            text.lines()
+                .position(|l| l == SELF_EXEMPT_FROM)
+                .map_or_else(|| panic!("{SELF_FILE} に外す範囲の印の行が無い"), |n| n + 1)
+        } else {
+            usize::MAX
+        };
+        for (line, s) in analyze(&text, &BTreeSet::new()).literals {
+            if line < exempt_from {
+                hits.entry((rel.clone(), s)).or_default().push(line);
+            }
+        }
+    }
+    if std::env::var_os("NP_DUMP").is_some() {
+        for (file, lit) in hits.keys() {
+            eprintln!("(\"{file}\", Allow::Exact({lit:?})),");
+        }
+    }
+
+    let mut used = vec![false; LITERAL_ALLOWED.len()];
+    let mut diffs = Vec::new();
+    for ((file, lit), lines) in &hits {
+        let entry = LITERAL_ALLOWED.iter().position(|(f, allow)| {
+            f == file
+                && match allow {
+                    Allow::Exact(s) => s == lit,
+                    Allow::Starts(s) => lit.starts_with(s),
+                }
+        });
+        match entry {
+            Some(n) => used[n] = true,
+            None => diffs.push(format!(
+                "{file}:{lines:?} python・pypy を実行ファイルとして読める文字列 {lit:?}。起動する文字列でないと確かめてから LITERAL_ALLOWED に足すこと"
+            )),
+        }
+    }
+    for (n, (file, allow)) in LITERAL_ALLOWED.iter().enumerate() {
+        if !used[n] {
+            diffs.push(format!(
+                "{file} {allow:?} は文字列の許可リストにあるが使われていない。LITERAL_ALLOWED から外すこと"
+            ));
+        }
+    }
+    assert!(
+        diffs.is_empty(),
+        "python と読める文字列が許可リストと合わない:\n{}",
+        diffs.join("\n")
+    );
+}
+
 // ---- 検出器の回帰試験 ----
 
 /// 失敗にする箇所の行（同じ行に理由が複数あっても 1 つ）。
@@ -870,6 +1319,154 @@ fn sites(src: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
+/// python と読める文字列リテラルの行。
+fn literals(src: &str) -> Vec<usize> {
+    let lines: BTreeSet<usize> = analyze(src, &BTreeSet::new())
+        .literals
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect();
+    lines.into_iter().collect()
+}
+
+#[test]
+fn the_detector_reads_past_a_turbofish_after_new() {
+    // `new` の後の `::<..>` を読み飛ばして、通常の呼び出しと同じ検査をする
+    assert_eq!(
+        problems("std::process::Command::new::<&str>(\"python\").status();"),
+        [1]
+    );
+    assert_eq!(problems("Command::new::<&str>(\"python3\");"), [1]);
+    assert_eq!(problems("Command::new::<Vec<u8>>(\"pypy3\");"), [1]);
+    assert_eq!(problems("<Command>::new::<&str>(\"python\");"), [1]);
+    assert_eq!(
+        problems("let exe = \"python\";\nCommand::new::<&str>(exe);"),
+        [1]
+    );
+    assert_eq!(
+        problems("Command::new::<&str>(\"sh\").args([\"-c\", \"python -V\"]);"),
+        [1]
+    );
+    assert_eq!(
+        sites("Command::new::<&str>(\"mkfifo\");\nstd::process::Command::new::<&Path>(BIN);"),
+        [
+            (1, "文字列 \"mkfifo\"".to_string()),
+            (2, "式 BIN".to_string())
+        ]
+    );
+    // 関数として渡すだけ（呼び出しの `(` が続かない）のも、読めない起動として失敗にする
+    assert_eq!(problems("let f = Command::new;\nf(\"python\");"), [1]);
+    // Command でない型の `new` は対象外
+    assert_eq!(
+        problems("let a = Vec::<u8>::new(); let b = String::new(); let c = Vec::new;"),
+        Vec::<usize>::new()
+    );
+}
+
+#[test]
+fn the_detector_follows_the_libc_use_tree_to_system_and_popen() {
+    for src in [
+        "use libc::{system};\nfn f() { unsafe { system(c\"python -V\".as_ptr()); } }",
+        "use libc::{c_int, popen};",
+        "use libc::{system as run};",
+        "use libc::{self, system};",
+        "use ::libc::{c_int, system};",
+        "use foo::{bar, libc::{system}};",
+        "use libc::system;",
+        "use libc::*;",
+        "use libc as l;",
+        "use libc::{self as l};",
+        "extern \"C\" { fn system(cmd: *const i8) -> i32; }",
+        "extern \"C\" { pub fn popen(c: *const i8, m: *const i8) -> *mut u8; }",
+    ] {
+        assert!(!problems(src).is_empty(), "{src}");
+    }
+    // 起動と関係ない libc の使い方は誤検知しない
+    for src in [
+        "use libc::{O_NONBLOCK, c_int};",
+        "use libc::O_NOFOLLOW;",
+        "use libc::{self, O_NOFOLLOW};",
+        "use libc;\nlet f = libc::O_NONBLOCK;",
+        "o.custom_flags(libc::O_NONBLOCK);",
+        "let system = 1; let popen = system + 1;",
+        "struct S { system: u8 }",
+    ] {
+        assert_eq!(problems(src), Vec::<usize>::new(), "{src}");
+    }
+}
+
+#[test]
+fn the_detector_follows_the_use_tree_to_tokio_process_only() {
+    for src in [
+        "use tokio::process;",
+        "use tokio::{fs, process};",
+        "use tokio::{fs, process::Command};",
+        "use tokio::process::{Command as C};",
+        "use tokio::{io::{self}, process::{Command, Child}};",
+        "use crate::tokio::process::Command;",
+        "use tokio::*;",
+        "use tokio as t;",
+        "use tokio::{self as t};",
+    ] {
+        assert!(!problems(src).is_empty(), "{src}");
+    }
+    // 同じ文の別の枝の `process` は、`tokio` 配下ではない
+    for src in [
+        "use crate::{process, tokio::fs};",
+        "use crate::{tokio::fs, process::Command};",
+        "use tokio::{fs, io};\nuse std::process::Stdio;",
+        "use tokio::fs::File;\nuse crate::process;",
+        "use std::{process::Stdio, thread};",
+        "use tokio::{self};",
+    ] {
+        assert_eq!(problems(src), Vec::<usize>::new(), "{src}");
+    }
+}
+
+#[test]
+fn the_bottom_check_reads_every_kind_of_string_literal_as_a_possible_executable() {
+    // 起動の構文に頼らず、文字列そのものを見る（どの種類の文字列でも）
+    for (src, line) in [
+        ("let a = \"python\";", 1),
+        ("let a = \"/usr/bin/python3.12\";", 1),
+        ("let a = \"cd x && python3 y.py\";", 1),
+        ("let a = r#\"python\"#;", 1),
+        ("let a = b\"python\";", 1),
+        ("let a = br#\"pypy3 -V\"#;", 1),
+        ("let a = c\"python -V\";", 1),
+        ("let a = cr\"pypy\";", 1),
+        ("x;\nlet a = c\"python -V\".as_ptr();", 2),
+        // エスケープ・行末の `\` で組み立てた名前も戻して読む（行末の `\` は次の行の空白まで詰める）
+        ("let a = \"\\x70ython\";", 1),
+        ("let a = \"py\\u{74}hon -V\";", 1),
+        ("let a = \"\\npython3\";", 1),
+        ("let a = \"py\\\n        thon\";", 1),
+    ] {
+        assert_eq!(literals(src), [line], "{src}");
+    }
+    // 起動の構文のどれにも当たらない形でも、底で捕まる
+    for src in [
+        "use libc::{system};\nfn f() { unsafe { system(c\"python -V\".as_ptr()); } }",
+        "let f = Command::new;\nf(\"python\");",
+        "std::process::Command::new::<&str>(\"python\").status();",
+        "let s = b\"python\"; run(s);",
+    ] {
+        assert!(!literals(src).is_empty(), "{src}");
+    }
+    // python と関係ない文字列は誤検知しない
+    for src in [
+        "let a = \"mkfifo\";",
+        "let a = b\"pythonic\";",
+        "let a = c\"exif-python.json\";",
+        "let a = \"local-index-python.json\";",
+        "let a = \"python_exe\";",
+        "let a = \"/tmp/python/bin\";",
+        "let a = r#\"{\"name\": \"pypy-fixtures\"}\"#;",
+        "// \"python\"\n/* b\"python\" */",
+    ] {
+        assert_eq!(literals(src), Vec::<usize>::new(), "{src}");
+    }
+}
 #[test]
 fn the_detector_finds_python_launched_in_the_ways_a_string_search_misses() {
     // 変数に入れた名前
