@@ -1,7 +1,7 @@
 # Rustバイナリのビルドと配布方式（P0 / T0.3）
 
 - 状態: 検証済み（2026-10-24）
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)（Rust単一バイナリ化）
 - 計画: [plan.md](plan.md)の「musl静的ビルドかglibcビルドか」への答え
 
 ## 1. 結論

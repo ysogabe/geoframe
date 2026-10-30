@@ -1,7 +1,7 @@
 # P4の受入確認（検証環境での記録）
 
 - 日時: 2026-10-28に実施（13:05〜14:45）
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）/ 要求: [p4-prd.md](p4-prd.md)「受け入れ条件」/ 設計: [p4-design.md](p4-design.md) / タスク: [tasks.md](tasks.md) T4.7 / タスクごとの受入: [p4-foundation-acceptance.md](p4-foundation-acceptance.md) / 前フェーズ: [p3-acceptance.md](p3-acceptance.md)
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)（Rust単一バイナリ化）/ 要求: [p4-prd.md](p4-prd.md)「受け入れ条件」/ 設計: [p4-design.md](p4-design.md) / タスク: [tasks.md](tasks.md) T4.7 / タスクごとの受入: [p4-foundation-acceptance.md](p4-foundation-acceptance.md) / 前フェーズ: [p3-acceptance.md](p3-acceptance.md)
 - 対象のソース: コミット`fb10168`（T4.5c完了時点。この受入で製品コードは変えていない）
 - バイナリ: `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`（20,123,280 B、sha256 `6391997214b0feb2…`、static-pie）。`deploy/rust-deploy.sh --skip-build`で配布（検査・転送・入れ替え・確認OK、約4秒）
 - 検証LXC（Ubuntu 24.04）で実施。本番機ではない。接続先の値はGit管理外のメモにあり、ここには書かない。本番機のgeoframe-server・本番の`/var/lib/geoframe`・本番のcatalog.db・本番のmiharashi.service・本番のDrive鍵には触れていない

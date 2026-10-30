@@ -1,7 +1,7 @@
 # P3の受入確認（検証環境での記録）
 
 - 日時: 2026-10-25に実施
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)（Rust単一バイナリ化）/ 計画: [plan.md](plan.md) §4 P3 / タスク: [tasks.md](tasks.md) T3.8 / 前フェーズの記録: [p1-acceptance.md](p1-acceptance.md)・[p2-acceptance.md](p2-acceptance.md)
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54)（Rust単一バイナリ化）/ 計画: [plan.md](plan.md) §4 P3 / タスク: [tasks.md](tasks.md) T3.8 / 前フェーズの記録: [p1-acceptance.md](p1-acceptance.md)・[p2-acceptance.md](p2-acceptance.md)
 - 対象のソース: コミット`83b7c5f`（T3.7完了時点。`crates/`・`app/`は無変更）
 - バイナリ: `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`（17,298,520 B、sha256 `5d044fdc84e27ea9…`）。`deploy/rust-deploy.sh`で配布（検査・転送・入れ替え・確認OK）。配布後の unit は`ReadOnlyPaths`が`photos`だけ（T3.6で`travel_blog`・`blog_exports`を外した版）であることを確認
 - 検証環境（lxc-geoframe。Ubuntu 24.04）。本番機ではない。接続先の値はGit管理外のメモにあり、ここには書かない。本番機（geoframe-server）・本番の`/var/lib/geoframe`・本番の`/etc/default/geoframe`・本番のDrive鍵には触れていない

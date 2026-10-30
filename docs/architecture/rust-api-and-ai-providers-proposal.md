@@ -3,7 +3,7 @@
 - 状態: **履歴（設計案）。この案の範囲はP0〜P5bで実装済み**。現行の挙動は[写真パイプライン](photo-pipeline.md)・[写真フィードの契約](photo-feed-contract.md)・[設定リファレンス](../reference/configuration.md)・[rust-migration/](../rust-migration/)の実装記録が正で、この文書は当時の設計判断として残す。P0のレビュー結果は[実装計画](../rust-migration/plan.md#p0での設計案のレビュー結果)
 - 未導入のまま残る案: miharashiとの共有crate（実際の重複が出るまで作らない。[plan.md](../rust-migration/plan.md)）。AI設定は、本文の「設定例（将来案）」のYAMLではなく、実装した`GEOFRAME_AI_CONFIG`のJSONが正（[ai-config.md](../rust-migration/ai-config.md)。Embeddingは[ai-embedding.md](../rust-migration/ai-embedding.md)）。以降の節の「する」「実装する」は設計時の記述で、現行仕様として読まないこと
 - 作成日: 2026-10-24
-- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54) / [local-model-lab #93](https://github.com/ysogabe/local-model-lab/issues/93)
+- 追跡: [GEOFRAME #54](https://github.com/ysogabe/geoframe/issues/54) / [local-model-lab #93](https://github.com/ysogabe/local-model-lab/issues/93)
 - 現行方針: [ADR 0008](../decisions/0008-photo-platform-and-miharashi-display.md)
 
 ## 目的・判断基準

@@ -1,6 +1,6 @@
 # P5（本番切替）PRD
 
-- 要求の元: [Issue #54](https://github.com/ysogabe/geoframe-ambient-display/issues/54)、[plan.md P5](plan.md#p5-切替pr-6)
+- 要求の元: [Issue #54](https://github.com/ysogabe/geoframe/issues/54)、[plan.md P5](plan.md#p5-切替pr-6)
 - 設計: [p5-design.md](p5-design.md)
 
 ## 背景と目的

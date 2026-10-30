@@ -6,14 +6,16 @@
   <meta name="theme-color" content="#1f2a2e">
   <title>GEOFRAME — 撮った写真を、手元で整えて、見せる準備まで。</title>
   <meta name="description" content="GEOFRAME は、ローカルフォルダや Google Drive の写真を SQLite に索引し、表示用画像の生成、品質解析、撮影地の修正、旅行ブログの下書き、任意の AI 検索までを Rust の単一バイナリで行う、セルフホスト型の写真管理基盤です。写真の表示は miharashi が担います。">
-  <link rel="canonical" href="https://ysogabe.github.io/geoframe-ambient-display/">
+  <link rel="canonical" href="https://ysogabe.github.io/geoframe/">
   <meta property="og:type" content="website">
   <meta property="og:locale" content="ja_JP">
   <meta property="og:site_name" content="GEOFRAME">
   <meta property="og:title" content="GEOFRAME — 撮った写真を、手元で整えて、見せる準備まで。">
   <meta property="og:description" content="ローカルや Google Drive の写真を SQLite に索引し、表示用画像、品質解析、撮影地の修正、旅行ブログ、任意の AI 検索を Rust の単一バイナリで。表示は miharashi が担います。">
-  <meta property="og:url" content="https://ysogabe.github.io/geoframe-ambient-display/">
-  <meta name="twitter:card" content="summary">
+  <meta property="og:url" content="https://ysogabe.github.io/geoframe/">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta property="og:image" content="https://ysogabe.github.io/geoframe/images/hero.png">
+  <meta name="twitter:image" content="https://ysogabe.github.io/geoframe/images/hero.png">
   <meta name="twitter:title" content="GEOFRAME — 撮った写真を、手元で整えて、見せる準備まで。">
   <meta name="twitter:description" content="セルフホスト型の写真管理基盤。Rust の単一バイナリ、SQLite、任意の AI。表示は miharashi が担います。">
   <link rel="icon" type="image/svg+xml" href="favicon.svg">
@@ -31,8 +33,9 @@
       <p class="eyebrow">Self-hosted photo management</p>
       <h1 id="hero-title">撮った写真を、手元で整えて、<span>見せる準備まで。</span></h1>
       <p class="hero-lead">GEOFRAME は、ローカルフォルダや Google Drive の写真を SQLite に索引し、表示用画像の生成、品質解析、撮影地の修正、旅行ブログの下書きまでを 1 つの Rust 製バイナリで行うセルフホスト型の写真管理基盤です。AI による検索や場面の整理は任意で、写真の表示は別プロジェクトの miharashi が担います。</p>
-      <div class="hero-actions"><a class="button" href="https://github.com/ysogabe/geoframe-ambient-display">GitHub で見る</a><a class="text-link" href="#setup">ソースからビルドする</a></div>
+      <div class="hero-actions"><a class="button" href="https://github.com/ysogabe/geoframe">GitHub で見る</a><a class="text-link" href="#setup">ソースからビルドする</a></div>
       <p class="hero-status">公開準備中です。リポジトリの公開と、このページの公開はこれからです。</p>
+      <figure class="hero-figure"><img src="images/hero.png" width="1600" height="800" alt="散らばった写真が地図の上で撮影地ごとに整理され、フォトフレームに映るまでの流れ"><figcaption>イメージ図です。実際の画面ではありません。</figcaption></figure>
     </section>
 
     <section class="shell section" id="overview" aria-labelledby="overview-title">
@@ -44,7 +47,7 @@
           <li><b>写真フィード</b><small><code>GET /api/v1/photos</code> と <code>/derivatives/</code> を HTTP で配信します。</small></li>
           <li><b>miharashi</b><small>フィードを読み、写真を画面に表示する別プロジェクトです。</small></li>
         </ol>
-        <figcaption>説明用の図です。実際の画面ではありません。表示は <a href="https://github.com/ysogabe/miharashi">miharashi</a> が担い、GEOFRAME との接点は<a href="https://github.com/ysogabe/geoframe-ambient-display/blob/main/docs/architecture/photo-feed-contract.md">写真フィードの契約</a>だけです。</figcaption>
+        <figcaption>説明用の図です。実際の画面ではありません。表示は <a href="https://github.com/ysogabe/miharashi">miharashi</a> が担い、GEOFRAME との接点は<a href="https://github.com/ysogabe/geoframe/blob/main/docs/architecture/photo-feed-contract.md">写真フィードの契約</a>だけです。</figcaption>
       </figure>
     </section>
 
@@ -94,17 +97,17 @@
             <li>ビルドには Rust の安定版ツールチェーン（<a href="https://rustup.rs/">rustup</a>）が要ります。Python は要りません。</li>
             <li>systemd が利用可能な Linux で、非 root ユーザーとして実行します。起動時に <code>systemctl show</code> で旧サービスの非稼働を確認するため、systemd へ接続できないコンテナなどでは取り込み付きの起動に失敗します。</li>
             <li>Google Drive と AI の連携は任意です。</li>
-            <li>本番の配布（systemd、更新、バックアップ）は、リポジトリの<a href="https://github.com/ysogabe/geoframe-ambient-display/blob/main/deploy/README.md">デプロイガイド</a>にあります。</li>
+            <li>本番の配布（systemd、更新、バックアップ）は、リポジトリの<a href="https://github.com/ysogabe/geoframe/blob/main/deploy/README.md">デプロイガイド</a>にあります。</li>
           </ul>
         </div>
         <div>
           <h3>起動する</h3>
-<pre tabindex="0"><code>git clone https://github.com/ysogabe/geoframe-ambient-display.git
-cd geoframe-ambient-display
+<pre tabindex="0"><code>git clone https://github.com/ysogabe/geoframe.git
+cd geoframe
 cargo build --release -p geoframe
 GEOFRAME_INGEST=1 ./target/release/geoframe serve \
   --listen 127.0.0.1:8080 --data-dir ./var</code></pre>
-          <p class="note">写真は <code>./var/photos/</code> に置きます。ブラウザで <code>http://127.0.0.1:8080/</code> を開くと管理画面が表示されます。<code>GEOFRAME_INGEST=1</code> のときだけ、取り込みと画像の生成が進みます。無いときは、カタログに書き込まない状態で起動します。設定の全項目は<a href="https://github.com/ysogabe/geoframe-ambient-display/blob/main/docs/reference/configuration.md">設定リファレンス</a>にあります。</p>
+          <p class="note">写真は <code>./var/photos/</code> に置きます。ブラウザで <code>http://127.0.0.1:8080/</code> を開くと管理画面が表示されます。<code>GEOFRAME_INGEST=1</code> のときだけ、取り込みと画像の生成が進みます。無いときは、カタログに書き込まない状態で起動します。設定の全項目は<a href="https://github.com/ysogabe/geoframe/blob/main/docs/reference/configuration.md">設定リファレンス</a>にあります。</p>
         </div>
       </div>
     </section>
@@ -126,17 +129,17 @@ GEOFRAME_INGEST=1 ./target/release/geoframe serve \
     <section class="shell section" id="docs" aria-labelledby="docs-title">
       <div class="section-head"><p class="eyebrow">Read more</p><h2 id="docs-title">ソースと文書</h2></div>
       <div class="doc-links">
-        <a href="https://github.com/ysogabe/geoframe-ambient-display"><strong>GitHub のリポジトリ</strong><span>ソースコード、Issue</span></a>
-        <a href="https://github.com/ysogabe/geoframe-ambient-display/blob/main/README.md"><strong>README</strong><span>機能、いまの状態と制限、導入</span></a>
-        <a href="https://github.com/ysogabe/geoframe-ambient-display/tree/main/docs"><strong>Docs</strong><span>設計、写真フィードの契約、設定リファレンス</span></a>
+        <a href="https://github.com/ysogabe/geoframe"><strong>GitHub のリポジトリ</strong><span>ソースコード、Issue</span></a>
+        <a href="https://github.com/ysogabe/geoframe/blob/main/README.md"><strong>README</strong><span>機能、いまの状態と制限、導入</span></a>
+        <a href="https://github.com/ysogabe/geoframe/tree/main/docs"><strong>Docs</strong><span>設計、写真フィードの契約、設定リファレンス</span></a>
         <a href="https://github.com/ysogabe/miharashi"><strong>miharashi</strong><span>写真を表示する、別プロジェクト</span></a>
       </div>
     </section>
   </main>
 
   <footer class="shell footer">
-    <span>GEOFRAME · <a href="https://github.com/ysogabe/geoframe-ambient-display/blob/main/LICENSE">MIT License</a></span>
-    <span><a href="https://github.com/ysogabe/geoframe-ambient-display">GitHub</a> · <a href="https://github.com/ysogabe/geoframe-ambient-display/tree/main/docs">Docs</a></span>
+    <span>GEOFRAME · <a href="https://github.com/ysogabe/geoframe/blob/main/LICENSE">MIT License</a></span>
+    <span><a href="https://github.com/ysogabe/geoframe">GitHub</a> · <a href="https://github.com/ysogabe/geoframe/tree/main/docs">Docs</a></span>
   </footer>
 </body>
 </html>
