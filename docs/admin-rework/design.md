@@ -92,7 +92,7 @@
 | JS の分割 | `admin.js`（共通ヘルパ・タブ・状況・設定・起動）と `photos.js`（写真タブ）。classic script 2 本をこの順で読む。定義だけを置き、初期化は `DOMContentLoaded` の `boot()` 1 か所で行う | 1 本: 1,000 行超で読みにくい。ES modules: 試験の `vm` の読み方を変える必要がある |
 | CSS | `admin.css` 1 本に統合。カード・タグ・トースト・チップは共用の名前。場面のまとまりとビューアだけ `.ps-` を付ける | 2 本のまま: `:root` の変数が衝突する |
 | 設定の出どころ | `load()` の流れとは別に、項目の列挙 `EnvItem`（**新設**の enum）と `Overrides` から `sources` を作る | `get` クロージャで記録: `AiConfig::load` が `&dyn Fn` を要求し、引数優先の経路と `ALLOWED_HOSTS` は `get` を通らず、AI 設定不正の早期 return で未読が残る |
-| 設定 API の秘密 | 「安全面」の表を唯一の仕様にし、`EnvItem` の **ワイルドカード無しの `match`** で出し方と値を組み立てる（項目を足すと分類と組み立てを書くまでコンパイルが通らない）。`Config` を `Serialize` しない | `Config` を丸ごと返す、`sources` の名前から機械的に値を出す: 秘密の漏れを型で防げず、名前が増えたときに既定で出てしまう |
+| 設定 API の出す範囲 | **全項目を設定どおりの値で出す**（ユーザーの決定。鍵のパス・接続先・連絡先・project を含む）。出さないのは `Config` が持たないもの（鍵の中身・トークン）と内部の値（`embedding_contract`・`config_hash`）だけ。`EnvItem` の **ワイルドカード無しの `match`** で項目ごとに組み立て、`Config` を `Serialize` しない | 伏せる案（有無だけ・件数だけ・同一の印）: 安全面レビューの案だったが、ユーザーが「設定項目の全量が分かるようにしたい」と決めた。`Config` を丸ごと返す: 項目の追加が気づかれずに応答に乗る |
 | 設定 API のメソッド | GET だけ（HEAD は既存の管理 API と同じく 403） | HEAD も 200: `site()` の管理 API は全て GET の分岐の中にあり（`server.rs:669` の説明）、例外を作る理由が無い |
 | 今日の送信数 | `GET /api/admin/config` が読み取り接続で `budget::usage` を呼ぶ。取れなければ `null` にして 200 | 状況 API に足す: 設定タブと状況タブで二重に出る |
 | 版・起動時刻 | `CARGO_PKG_VERSION` と、`serve()` で取った `started_at`（`AppState`） | コミットハッシュ: `build.rs` に git を読む処理を足すことになる。今回は見送り |
@@ -262,44 +262,44 @@ const ps = {filter: 'all', page: 1, view: 'list' /* 'list' | 'search' */,
   "started_at": "2026-10-30 08:25",
   "uptime_s": 47520,
   "items": [
-    {"key": "GEOFRAME_DATA_DIR",      "value": "/srv/example/geoframe", "source": "arg"},
-    {"key": "GEOFRAME_HOST",          "value": "0.0.0.0",               "source": "default"},
-    {"key": "GEOFRAME_ALLOWED_HOSTS", "value": null, "count": 2,         "source": "env"},
-    {"key": "GEOFRAME_INGEST",        "value": "1",                     "source": "env"},
-    {"key": "GEOFRAME_BLOG",          "value": "0",                     "source": "default"},
-    {"key": "GEOFRAME_DRIVE_KEY",     "value": null, "state": "present", "file": "#1", "source": "env"},
-    {"key": "GEOFRAME_DRIVE_FOLDER",  "value": null, "state": "configured", "source": "env"},
-    {"key": "GEOFRAME_BLOG_PLANS_DIR","value": null, "state": "default",    "source": "default"},
-    {"key": "GEOFRAME_TILE_UA",       "value": null, "state": "configured", "source": "env"},
-    {"key": "GEOFRAME_RANK_MODEL",    "value": null, "state": "absent",     "source": "default"},
-    {"key": "GEOFRAME_AI_CONFIG",     "value": null, "state": "loaded",     "source": "env", "modified_at": "2026-10-30 14:07"}
+    {"key": "GEOFRAME_DATA_DIR",      "value": "/srv/example/geoframe",            "source": "arg"},
+    {"key": "GEOFRAME_HOST",          "value": "0.0.0.0",                          "source": "default"},
+    {"key": "GEOFRAME_ALLOWED_HOSTS", "value": "localhost, geoframe.example.test", "source": "env"},
+    {"key": "GEOFRAME_INGEST",        "value": "1",                                "source": "env"},
+    {"key": "GEOFRAME_BLOG",          "value": "0",                                "source": "default"},
+    {"key": "GEOFRAME_DRIVE_KEY",     "value": "/etc/example/drive_key.json",      "state": "present", "source": "env"},
+    {"key": "GEOFRAME_DRIVE_FOLDER",  "value": "ExampleFolder",                    "source": "env"},
+    {"key": "GEOFRAME_BLOG_PLANS_DIR","value": null,                               "source": "default"},
+    {"key": "GEOFRAME_TILE_UA",       "value": "GeoFrame/0.1 (admin@example.test)", "source": "env"},
+    {"key": "GEOFRAME_RANK_MODEL",    "value": "/srv/example/geoframe/models/rank_model.json", "state": "absent", "source": "default"},
+    {"key": "GEOFRAME_AI_CONFIG",     "value": "/etc/example/ai-config.json",      "state": "loaded", "source": "env",
+                                      "modified_at": "2026-10-30 14:07"}
   ],
   "ai": {
-    "configured": true, "invalid": null, "enabled": true, "version": 1, "local_entrance": true,
-    "embedding_space": {"dimension": 768, "normalization": "l2"},
+    "configured": true, "invalid": null, "enabled": true, "version": 1,
+    "local_base_url": "http://192.0.2.10:8100",
+    "embedding_space": {"space_id": "example-space-1", "model_id": "example-embed", "revision": "r1",
+                        "image_preprocess": "img-v1", "text_preprocess": "txt-v1", "dimension": 768, "normalization": "l2"},
     "tasks": [
-      {"task": "image_embedding", "provider": "local", "model": "example-embed", "source": "ai_config"},
+      {"task": "image_embedding", "provider": "local", "model": "example-embed", "service_id": "example-embed-svc", "source": "ai_config"},
       {"task": "photo_judge", "provider": "cloud", "model": "example-judge", "source": "ai_config",
        "allow_cloud": true, "include_hidden": false, "daily_limit": 40, "today_utc": 12,
-       "credential": "present", "credential_file": "#2", "project": "#1", "region": "example-region1", "disabled": null}
+       "credential_path": "/etc/example/credentials.json", "credential": "present",
+       "project": "example-project", "region": "example-region1", "disabled": null}
     ]
   }
 }
 ```
 
-- `items` は平らな 1 列で、**`EnvItem::ALL`（「`Config` の変更」）の全項目**を必ず含む（値が既定でも出す）。分類・説明文・
-  単位・並びは画面側（`admin.js` の表）が持つ。API は `key`・`value`・`source` と、分類に応じて `state`・`count`・
-  `file`・`modified_at` だけ。
-- `value` は `EnvItem` の**ワイルドカード無しの `match`** で `Config` の型つきの値から作る。`exposure()` が `State`・`Count` の
-  項目は `value: null` で、`state` か `count` が代わりに入る。項目を足して分類か組み立ての枝を書き忘れるとコンパイルで落ちる。
+- `items` は平らな 1 列で、**`EnvItem::ALL`（「`Config` の変更」）の全項目**を必ず含む（値が既定でも出す。未設定で既定も
+  無い項目は `value: null`）。分類・説明文・単位・並びは画面側（`admin.js` の表）が持つ。API は `key`・`value`・`source` と、
+  ファイルの項目だけ `state`・`modified_at`。
+- `value` は `EnvItem` の**ワイルドカード無しの `match`** で `Config` の型つきの値から作る（`Display` や `Debug` の文字列化に
+  頼らず、項目ごとに書く）。項目を足して組み立ての枝を書き忘れるとコンパイルで落ちる。**全項目を設定どおりの値で出す**
+  （ユーザーの決定、2026-10-30。「安全面」の表）。
 - `source` は `arg`・`env`・`default`。AI 設定 JSON 由来の値は `ai_config`。
-- `state` の値: ファイルは `present`/`absent`/`unreadable`（要求のたびに `fs::metadata` で見る。エラー文は出さない）、
-  AI 設定 JSON は `loaded`/`invalid`/`absent`、文字列の項目は `configured`/`default`。
-- `file`・`credential_file`・`project` の `#n`: 同じ応答の中で同じ値なら同じ番号（パスや ID を出さずに「同じファイル・
-  同じ project か」を見分ける）。番号は応答ごとに 1 から振り、**ファイル用と project 用で別の番号空間**にする。
-  ファイルの同一性は `fs::canonicalize` した結果（リンクを解いた実体）の一致で、`canonicalize` が失敗したときは設定された
-  絶対パスの文字列の一致で決める。試験: 同じ実体を指す 2 つのパス（シンボリックリンク）は同じ番号、別のファイルは別の番号、
-  同じ project は同じ番号。
+- `state`（`exposure()` が `File` の項目）: `present`/`absent`/`unreadable`（要求のたびに `fs::metadata` で見る。エラー文は
+  出さない）。`GEOFRAME_AI_CONFIG` は `loaded`/`invalid`/`absent` と `modified_at`。
 - `ai.tasks[].disabled` は `Disabled`（`settings.rs:1161-1180`）の固定コード（`allow_cloud_false`・`no_daily_limit` 等）か `null`。
 - `today_utc` は `budget::usage(conn, task, now_utc_unix, config.ai.legacy().cycle(task).1)?.day`（クラウドの用途だけ）。
   **UTC 日の件数**で、画面も「今日（UTC）」と書く。読めない（DB が無い・表が無い・エラー）ときは `null` にして
@@ -322,7 +322,7 @@ pub enum Source { Arg, Env, Default }
 
 /// 設定 API での出し方（「安全面」の表）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Exposure { Value, State, Count }
+pub enum Exposure { Value, File /* 値に加えてファイルの有無 */ }
 
 /// Rust が読む環境変数（1 つ 1 つを列挙。`docs/reference/configuration.md` と `tests/env_reference.rs` が名前を照合する）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -330,7 +330,7 @@ pub enum EnvItem { DataDir, Host, Port, AllowedHosts, Log, Ingest, Blog, DrivePo
 impl EnvItem {
     pub const ALL: &[EnvItem] = &[EnvItem::DataDir, EnvItem::Host, /* … */];
     pub fn name(self) -> &'static str { match self { EnvItem::DataDir => "GEOFRAME_DATA_DIR", /* ワイルドカード無し */ } }
-    pub fn exposure(self) -> Exposure { match self { EnvItem::AllowedHosts => Exposure::Count, /* ワイルドカード無し */ } }
+    pub fn exposure(self) -> Exposure { match self { EnvItem::DriveKey => Exposure::File, /* ワイルドカード無し */ } }
 }
 
 pub struct Config { /* 既存 */ pub blog: bool, pub sources: BTreeMap<&'static str, Source>,
@@ -364,34 +364,32 @@ pub struct Config { /* 既存 */ pub blog: bool, pub sources: BTreeMap<&'static 
 - **認証なし**の前提は変えない。新しい API は GET のみで、書き込みは今の 5 本の POST（CSRF・`INGEST` ガード）のまま。
   CORS のヘッダは出さず、Host 検査があるので、LAN 内の別のページからブラウザ経由で `fetch` しても応答は読めない
   （`Origin` 違いでレスポンスが遮られる）。別の端末から直接開けば読めるのは今の `/api/admin/status` と同じ。
-- **設定 API の項目ごとの扱い（唯一の仕様。PRD の R13・R14・AC8 はこの表を指す）**:
+- **設定 API の項目ごとの扱い（唯一の仕様。PRD の R13・R14・AC8 はこの表を指す）**。2026-10-30 にユーザーが
+  「設定項目の全量が分かるようにしたい。鍵のパスも出す」と決めたので、**設定ファイルの写し**として全項目を値で出す。
+  安全面レビュー（Opus、2026-10-30）が挙げた「既存の『出さない』決まり」は**ログ・`ai-jobs status`・文書・PR** に対するもので、
+  そこは変えない。`/api/admin/config` だけを意図した例外にし、PR ③ で ai-config.md（`:10`）と `config.rs`（`:176`・`:206`・
+  `:209`・`:213`）のコメントに「`/api/admin/config` は出す」を書き足す。根拠: 認証の無い LAN サービスで、同じ LAN の端末は
+  今でも POST で書き込めるため、読める範囲が増えても危険はほとんど増えない（レビューの評価）。残る危険は**画面の共有**
+  （スクリーンショット）なので、設定タブの先頭の案内に「鍵のパス・接続先・連絡先が含まれる。画面を共有しない」と書く。
 
-| 項目 | 出し方（`Exposure`） | 理由 |
+| 項目 | 出し方（`Exposure`） | 備考 |
 |---|---|---|
-| `GEOFRAME_DATA_DIR`・`PHOTOS_DIR`・`HOST`・`PORT`・`LOG`・`INGEST`・`BLOG`・`DRIVE_POLL_MIN`・`FETCH_PER_CYCLE`・`QUALITY_PER_CYCLE`・`INFER_MIN`・`INFER_OFFSET_MIN`・`TILE_CACHE_MAX_MB`・`TILE_FETCH_PER_MIN`・`AI_ENABLED`・`AI_POLL_S`・`AI_BACKLOG_POLL_S`・`AI_EMBED_PER_CYCLE`・`AI_JUDGE_PER_CYCLE`・`AI_SEARCH_PER_MIN`・`LOC_SUGGEST`・`LOC_SUGGEST_CLUE_PER_CYCLE`・`LOC_SUGGEST_GEMINI_PER_CYCLE`・`EMBED_BACKEND`・`AI_TIME_WINDOW_MIN`・`AI_SIMILARITY`・`AI_SHORTLIST_MAX`・`AI_VISUAL_SIMILARITY` | **値**（`Value`） | 動作の数値・固定の名前・データ置き場。`listen`・`data_dir` と数値は起動ログ（`log_summary`、`config.rs:503`）に既に出ている |
-| `GEOFRAME_ALLOWED_HOSTS` | **件数だけ**（`Count`。`count: n`） | 起動ログと `hostcheck::startup_note`（`hostcheck.rs:61`）は「名前そのものは出さず件数だけ」。LAN や Tailscale の名前が入り、設定タブは画面の共有で外に出やすい |
-| `GEOFRAME_DRIVE_FOLDER`・`BLOG_PLANS_DIR` | **設定済みか既定か**（`State`。`configured/default`） | `config.rs:206`・`209` の「利用者の情報なので起動ログに載せない」を守る |
-| `GEOFRAME_RANK_MODEL` | **有無だけ**（`State`。`present/absent/unreadable`） | `config.rs:176` の "Never included in diagnostics" を守る。要るのは「固定の式か学習済みモデルか」だけ |
-| `GEOFRAME_AI_CONFIG` | **状態と更新日時だけ**（`State`。`loaded/invalid/absent`、`modified_at`） | `config.rs:213` の「パス・JSON の中身は載せない」を守る。どのファイルかは環境ファイルを見れば分かる |
-| `GEOFRAME_DRIVE_KEY` | **有無だけ**（`State`。`present/absent/unreadable`、同一ファイルの印 `file: #n`） | 鍵ファイル。パスも出さない（`ai-jobs status` の「パスを出さない」と同じ線）。**ユーザーの承認で「パスも出す」に変えてよい** |
-| `GEOFRAME_TILE_UA` | **設定済みか既定か**（`State`） | 連絡先（メールアドレス）を含む |
-| AI 用途の `provider`・`allow_cloud`・`include_hidden`・`daily_limit`・`today_utc`・`disabled` | **値** | 運用で見る数値と固定のコード。宛先は含まない |
-| AI 用途の `model`・`region` | **値**（**意図した例外**） | ai-config.md（`:10`）と `config.rs:213` は「ログ・`ai-jobs status`・`ai_task_blocks` にモデル名・region を出さない」と決めている。R13 がこの 2 つを求めるので、**`/api/admin/config` だけ**の例外にし、PR ③ で ai-config.md と `config.rs` のコメントに例外を書き足す |
-| AI 用途の `credential_path` | **有無だけ**（`credential: present/absent/unreadable`、同一ファイルの印 `credential_file: #n`） | 鍵ファイル。`DRIVE_KEY` と同じ |
-| AI 用途の `project` | **同一の印だけ**（`project: #n`。値も伏せ字も出さない） | 短い ID では伏せ字が効かない。用途どうしで同じ project かが分かれば足りる |
-| `local_base_url` | **有無だけ**（`local_entrance: true/false`） | 接続先。`Gate` の `Debug` と同じ線 |
-| `embedding_space` | `dimension`・`normalization` だけ | `space_id`・`model_id`・`revision`・`image_preprocess`・`text_preprocess` は出さない（`Debug` 実装と同じ線） |
-| `service_id`・`embedding_contract`・`config_hash`・クラウドの固定宛先・トークン・鍵の中身 | **出さない** | 応答の組み立てに現れない（白リストに無い） |
+| `GEOFRAME_DATA_DIR`・`PHOTOS_DIR`・`HOST`・`PORT`・`ALLOWED_HOSTS`・`LOG`・`INGEST`・`BLOG`・`DRIVE_POLL_MIN`・`FETCH_PER_CYCLE`・`QUALITY_PER_CYCLE`・`DRIVE_FOLDER`・`BLOG_PLANS_DIR`・`INFER_MIN`・`INFER_OFFSET_MIN`・`TILE_UA`・`TILE_CACHE_MAX_MB`・`TILE_FETCH_PER_MIN`・`AI_ENABLED`・`AI_POLL_S`・`AI_BACKLOG_POLL_S`・`AI_EMBED_PER_CYCLE`・`AI_JUDGE_PER_CYCLE`・`AI_SEARCH_PER_MIN`・`LOC_SUGGEST`・`LOC_SUGGEST_CLUE_PER_CYCLE`・`LOC_SUGGEST_GEMINI_PER_CYCLE`・`EMBED_BACKEND`・`AI_TIME_WINDOW_MIN`・`AI_SIMILARITY`・`AI_SHORTLIST_MAX`・`AI_VISUAL_SIMILARITY` | **値**（`Value`） | `ALLOWED_HOSTS` は `localhost` を含めた並び。`TILE_UA` は連絡先入り。`BLOG_PLANS_DIR` 未設定は `null`（埋め込み） |
+| `GEOFRAME_DRIVE_KEY`・`RANK_MODEL`・`AI_CONFIG` | **値（パス）＋ファイルの有無**（`File`。`state`。`AI_CONFIG` は `modified_at` も） | パスは起動時の値、有無は要求のたびに見る。鍵の**中身**は `Config` が持たないので出ない |
+| AI 用途の `provider`・`model`・`service_id`・`allow_cloud`・`include_hidden`・`daily_limit`・`today_utc`・`credential_path`（＋有無）・`project`・`region`・`disabled` | **値** | 認証ファイルの中身は持たないので出ない |
+| `local_base_url`・`embedding_space` の全項目（`space_id`・`model_id`・`revision`・`image_preprocess`・`text_preprocess`・`dimension`・`normalization`） | **値** | — |
+| `embedding_contract`・`config_hash`・クラウドの固定宛先・トークン・鍵の中身 | **出さない** | 内部の値か、`Config` が持たないもの |
 
-- 単体試験（AC8）: 合成の `Config`・`AiConfig` に、**検査に通る形の** ASCII の目印を入れる（鍵のパス
-  `/tmp/mark-key-1.json`、`local_base_url` の `http://mark-host.invalid:8100`、`space_id`・`model_id`・`revision`・
-  `image_preprocess`・`text_preprocess` の `mark-space-…`、`service_id` の `mark-svc`、`TILE_UA` の `mark@example.test`、
-  `project` の `mark-project`、`DRIVE_FOLDER` の `mark-folder`、`RANK_MODEL`・`BLOG_PLANS_DIR`・`AI_CONFIG` のパスの
-  `mark-dir`、`ALLOWED_HOSTS` の `mark-host.example.test`）。応答を作る前に AI 設定が `ready` で用途が 5 つあることを
-  確かめ、そのうえで検査対象ごとに分けて確かめる: (a) 応答の JSON 文字列に `mark` が**含まれず**、出すべき値（`DATA_DIR`・
-  モデル名・region・上限・件数）が**含まれる**。(b) `format!("{:?}", config)` と `log_summary()` に `mark` が含まれず、
-  **モデル名・region も含まれない**（この 2 つは変えないので、今の「出さない」が保たれることの確認）。(c) `router` を通した
-  結合試験で本文全体に `mark` が無い。
+- `Config` の `Debug`（手実装）と `log_summary()`、`ai-jobs status`、`/api/admin/status` の `ai_task_blocks` は**変えない**
+  （ログと CLI は今までどおり伏せる）。
+- 単体試験（AC8）: 合成の `Config`・`AiConfig` に、**検査に通る形の** ASCII の目印を入れる（鍵のパス `/tmp/mark-key-1.json`、
+  `local_base_url` の `http://mark-host.invalid:8100`、`space_id` 等の `mark-space-…`、`service_id` の `mark-svc`、`TILE_UA` の
+  `mark@example.test`、`project` の `mark-project`、`DRIVE_FOLDER` の `mark-folder`、`RANK_MODEL`・`BLOG_PLANS_DIR`・`AI_CONFIG` の
+  パスの `mark-dir`、`ALLOWED_HOSTS` の `mark-host.example.test`）。鍵のパスが指す合成ファイルの中身は `SECRET-mark`。
+  応答を作る前に AI 設定が `ready` で用途が 5 つあることを確かめ、検査対象ごとに分けて確かめる: (a) 応答の JSON に
+  `items` の全項目があり、**上の目印がすべて値として含まれ**、`SECRET-mark`（鍵の中身）が含まれない。(b) `format!("{:?}", config)`
+  と `log_summary()` に目印も `SECRET-mark` も、モデル名・region も含まれない（変えないことの確認）。(c) `router` を通した
+  結合試験で本文に `SECRET-mark` が無い。
 - 404 の応答（GET は `statics::error_page`、POST は `error_response`）の本文に、無効の理由（`GEOFRAME_BLOG`・「無効」）を
   書かない。試験で本文を確かめる。
 - 画面は `textContent` で描く。今ある唯一の `innerHTML`（`admin.js:450`。地名検索の OSM の出典。PR ② で `photos.js` へ
@@ -420,7 +418,7 @@ Node は CI で必須（runner に同梱。`package.json` は置かない）。N
 | AC5 | `photos_render.mjs`: `fetch` の代用品で 503（AI 無効 / 索引なし）・429・400 を返し、`#search-note` の文言が表どおりで `ps.view==='list'` のまま。成功で `ps.view==='search'`、閉じると直前の `filter`・`page` で一覧を読む。空の検索語で「AI おすすめ」と同じ URL |
 | AC6 | `photos_render.mjs`: `normalizePhoto`・`cardFor` に合成の 7 パターン（位置あり / 候補あり / ヒントあり / 手がかりなし / 推定 / 検索結果の位置あり / 検索結果の候補あり）を与え、1 行目とタグの文字列、回転ボタンの有無を確認。`★` を `click()` すると `POST /api/admin/setflag` が呼ばれ、応答で同じ `id` の 2 枚のカードとビューアが更新される。`tests/update_api.rs`・`rotate_api.rs` は変更なし。`tests/ai_search_api.rs`（既存があれば）に `source`・`hint`・`suggest` の有無 |
 | AC7 | 手動（検証環境）。`stepModal` の順序は `photos_render.mjs` で `ps.entries` の並びを確認 |
-| AC8 | `admin_config.rs` の単体試験: 応答には目印が無く出すべき値がある。`Debug`・`log_summary` には目印もモデル名・region も無い。`sources` の `arg/env/default` と `EnvItem::ALL` の一致。`EnvItem::ALL` の名前と `tests/env_reference.rs` の名前の一致。結合試験で本文全体に目印が無い |
+| AC8 | `admin_config.rs` の単体試験: 応答に全項目があり目印が値として含まれ、鍵の中身が無い。`Debug`・`log_summary` には目印も鍵の中身もモデル名・region も無い。`sources` の `arg/env/default` と `EnvItem::ALL` の一致。`EnvItem::ALL` の名前と `tests/env_reference.rs` の名前の一致。結合試験で本文全体に目印が無い |
 | AC9 | `tests/admin_api.rs`: `GET /api/admin/config` が 200 で `items`・`ai` を持ち `Cache-Control: no-store`。HEAD・`POST`・`/api/admin/configX`・末尾 `/` は 403。`INGEST=0` でも 200 で `today_utc` が `null` か数。`photos_render.mjs` 相当の `config_render.mjs`: 設定タブに読み取り専用の案内の文言と、`items` の全項目が描かれる |
 | AC10 | `tests/blog_api.rs`・`blog_write_api.rs`: 既存の試験を `spawn_with_env(GEOFRAME_BLOG=1)` に変え、未設定で GET 4 本と POST 2 本が 404 の試験を足す。無効時に CSRF の違反（`Content-Type` 違い）でも 404、`INGEST=0` でも 404（優先順位）。`tests/env_reference.rs` が通る |
 | AC11 | `cargo test`・`cargo clippy --all-targets -- -D warnings`・`cargo fmt --check`。`photo_feed` の契約試験は触らない |
@@ -465,7 +463,7 @@ Node は CI で必須（runner に同梱。`package.json` は置かない）。N
 ### PR ③: 設定タブ（R1 の設定タブ、R13〜R17）
 
 1. `config.rs`: `Source`・`Exposure`・`EnvItem`・`sources`・`ai_config_modified`。試験。
-2. `server.rs`: `started_at`。`admin_config.rs` 新設（応答の組み立て、`EnvItem` のワイルドカード無しの `match`、`today_utc`、同一ファイル・project の印）。
+2. `server.rs`: `started_at`。`admin_config.rs` 新設（応答の組み立て、`EnvItem` のワイルドカード無しの `match`、`today_utc`、ファイルの有無）。
    `GET /api/admin/config` の経路。
 3. 単体試験（目印の不在、`sources`）と `tests/admin_api.rs`。`innerHTML` の grep の試験。
 4. `admin.html`・`admin.js`: 「設定」タブ、項目の表（説明文・単位・並び）、読み取り専用の案内、「今日（UTC）」。`config_render.mjs`。
