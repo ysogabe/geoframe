@@ -27,8 +27,8 @@
 //! を**最初から含めてある**。しかも `sqlite_master.sql` が、Python が `ALTER` した結果と**1 文字も違わない**
 //! ように書いてある（`ALTER TABLE ADD COLUMN` は元の文の末尾の `)` の前に `\n, 列定義` を挿す。
 //! 定義の終わりの形はその結果の複製）。テスト `fresh_database_matches_the_python_one` が、Python が
-//! 空の置き場から作った DB（`tools/gen_schema_fixture.py` の出力）と、`sqlite_master` の全行・各表の
-//! `table_xinfo`・索引を比べる。Python の `SCHEMA` を変えたらそのテストが落ちる。
+//! 空の置き場から作った DB（P5a まで存在した `tools/gen_schema_fixture.py` の出力。P5b で道具を削除したので再生成はできない）と、
+//! `sqlite_master` の全行・各表の `table_xinfo`・索引を比べる。基準は固定で、Rust の `SCHEMA` を変えたらそのテストが落ちる。
 //!
 //! 本番の DB は古い版から `ALTER` を重ねてきたので、列の**並び**は空の DB と違いうる（例: `infer_dt_s` が
 //! 末尾）。移行はその並びを変えない（列の有無だけを見る）。
@@ -517,7 +517,7 @@ mod tests {
         .collect()
     }
 
-    /// 各表の `table_xinfo` と索引（`gen_schema_fixture.py` と同じ形）。
+    /// 各表の `table_xinfo` と索引（基準の JSON と同じ形）。
     fn tables(conn: &Connection) -> Value {
         let mut out = serde_json::Map::new();
         for o in objects(conn) {

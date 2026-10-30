@@ -1,5 +1,5 @@
 //! POST の CSRF 対策の判定（Content-Type・Origin・Host）を、現行 Python の判定と突き合わせる差分試験（T3.1）。
-//! フィクスチャは `tools/gen_csrf_fixture.py`（`app/tests/csrf_fixture.py`）が、現行の `_csrf_ok`・`_host_ok` を
+//! フィクスチャ（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_csrf_fixture.py` は P5b で削除した。再生成はできない）は、Python 版の `_csrf_ok`・`_host_ok` を
 //! 実際のヘッダ解析（生バイトを Latin-1 にして `email` のパーサへ）の上で動かして作る。
 //!
 //! 方針（管理者）: **Python が断るものを Rust が通すことは、既知の差の 1 つを除いて許さない**。

@@ -1,7 +1,7 @@
 //! 旅行ブログの読み取り API（E7〜E10 `GET /api/blog/…`。T3.5）の結合テスト。
 //!
 //! 期待値は現行 Python の `travel_blog`（`handlers.Handler` 経由）が合成の旅程・下書き・写真に出した応答で、
-//! `tests/fixtures/blog-python.json`（再生成は `python3 tools/gen_blog_fixture.py`）。旅程・下書き・書き出しの印は
+//! `tests/fixtures/blog-python.json`（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_blog_fixture.py` は P5b で削除した。再生成はできない）。旅程・下書き・書き出しの印は
 //! フィクスチャから、写真の行は `blog-catalog.sql` から作り直す。リポジトリにある実際の旅程 JSON は使わない
 //! （埋め込みの検査だけは、実ファイルと表が一致するかを真偽でだけ見る。中身は出力しない）。
 

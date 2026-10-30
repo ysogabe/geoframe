@@ -1,6 +1,6 @@
 //! `index_local`（ローカル写真の索引）を、Python の `drive.index_local` の結果と列ごとに突き合わせる。
 //!
-//! 基準は `tools/gen_local_index_fixture.py` が作る `tests/fixtures/local-index-python.json`:
+//! 基準は `tests/fixtures/local-index-python.json`（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_local_index_fixture.py` は P5b で削除した。再生成はできない）:
 //! 合成の写真の木と操作（追加・更新・削除・手動の位置の書き込み）の列を、Python の `index_local` に
 //! 通した各段階の `photos` の全行（`id` を含む全列）。Rust は同じ木と操作を一時の `DATA_DIR` に作り、
 //! 同じ段階ごとに `IndexLocal` を通して、全列が一致することを求める。

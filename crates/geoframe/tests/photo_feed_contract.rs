@@ -5,7 +5,7 @@
 //! - Python 出力のフィクスチャを型で読み書きし直して、キー・値・null が変わらないことを確かめる
 //!   （T1.5 の全件比較の下ごしらえ）。
 //!
-//! Python 側の検査は app/tests/test_photo_feed_contract.py。契約を変えるときは両方と文書を直す。
+//! Python 側の検査（a804623 の app/tests/test_photo_feed_contract.py）は P5b で削除した。契約を変えるときはこの試験と文書を直す。
 //! miharashi の読み方は photo_feed_miharashi.rs。
 
 mod common;

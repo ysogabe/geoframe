@@ -1,6 +1,6 @@
 //! `GET /api/admin/status`・`GET /api/admin/photos`（T1.4）の結合テスト。合成データだけを使う。
 //!
-//! 現行 Python の出力（`tools/gen_admin_fixture.py` が書き出すフィクスチャ）と、`serde_json::Value`
+//! Python 版の出力（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_admin_fixture.py` は P5b で削除した。再生成はできない）と、`serde_json::Value`
 //! として完全一致することを確かめる。Python の出力と比べない値は `disk`（機体のディスクと実行時刻に
 //! 依存）と `server_time` で、これは形と数え方を別に検査する。
 

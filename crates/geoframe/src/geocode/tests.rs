@@ -1,7 +1,7 @@
 //! 地名検索の試験。
 //!
 //! - `python_fixture_*`: 現行 Python の `handlers.Handler` に流した結果（`tests/fixtures/geocode-python.json`。
-//!   `tools/gen_geocode_fixture.py`）と、同じ要求・同じ応答のスタブ・同じ偽の時計で比べる。状態コード・応答・
+//!   Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_geocode_fixture.py` は P5b で削除した。再生成はできない）と、同じ要求・同じ応答のスタブ・同じ偽の時計で比べる。状態コード・応答・
 //!   上流への要求の順とクエリ・User-Agent・待ち・キャッシュの全体。
 //! - それ以外は、Python との意図した差（本文の上限、同時の処理数、ログ）と、同時の要求で Nominatim が 1 秒 1 件を
 //!   超えないこと、取り込みの有効・無効での `.cache.json` の扱い。

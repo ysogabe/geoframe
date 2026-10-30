@@ -410,7 +410,7 @@ const QUALITY_SQL: &str = "SELECT photo_id,display,source_md5,source_mtime,conte
 #[test]
 fn rustで作った結果をpythonへ切り戻すと_変化なしのサイクルは保ち_dirtyの再構築で指標の差だけが変わる()
  {
-    // P5 の切り戻し（Rust → Python）の試験の Rust 側。Python 側（`tools/gen_quality_fixture.py` の
+    // P5 の切り戻し（Rust → Python）の試験の Rust 側。Python 側（P5a まで存在した `tools/gen_quality_fixture.py`（P5b で削除。再生成はできない）の
     // `switchbacks`）は、Python が作った行 → Rust が新しい写真（同じバイト列の写し）を解析して再構築 →
     // Python の変化なしのサイクル → dirty にして Python が再構築、を Python 本体に流した結果を記録している。
     // ここでは、Rust の実際の結果が、その「Rust の再構築」と全列で一致する（＝Python が受け取る入力が同じ）ことと、

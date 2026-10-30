@@ -1,7 +1,7 @@
 //! 更新 API（E12 `POST /api/admin/setloc`・E13 `POST /api/admin/setflag`）と POST の入口（ルーティング・
 //! CSRF 対策・エラー応答）の結合テスト（T3.1）。合成データだけを使う。
 //!
-//! 現行 Python に同じ要求を順に流した結果（`tools/gen_update_fixture.py` が書き出すフィクスチャ）と、
+//! 現行 Python に同じ要求を順に流した結果（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_update_fixture.py` は P5b で削除した。再生成はできない）と、
 //! 状態コード・応答の JSON・`photos` の変化が一致することを確かめる。意図した差は
 //! フィクスチャの `known_differences` に載るケースだけで、下の `KNOWN` が期待値を持つ。
 

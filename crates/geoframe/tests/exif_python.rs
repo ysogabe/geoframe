@@ -1,6 +1,6 @@
 //! EXIF（撮影時刻・GPS）の読み取りを、Python の `util.extract_exif`・`norm_time` の結果と突き合わせる。
 //!
-//! 基準は `tools/gen_exif_fixture.py` が作る `tests/fixtures/exif-python.json`（合成の JPEG のバイト列と、
+//! 基準は `tests/fixtures/exif-python.json`（Python 版で生成した基準。Python 版は P5a のマージのコミット a804623 まで存在し、生成の道具 `tools/gen_exif_fixture.py` は P5b で削除した。再生成はできない。合成の JPEG のバイト列と、
 //! Pillow を通した結果）。Python と**意図して違える点**（`docs/rust-migration/server.md` §0・§12）は
 //! `rust_differs` に列挙し、それ以外は完全一致を求める。
 

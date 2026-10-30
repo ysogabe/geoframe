@@ -1,4 +1,6 @@
-//! 設定。現行 Python（`app/geoframe/config.py`）と同じ `GEOFRAME_*` の名前・既定値で読む。
+//! 設定。旧 Python 版（`app/geoframe/config.py`。P5b で削除）と同じ `GEOFRAME_*` の名前・既定値で読む
+//!（AI の一部の既定だけ違う）。名前と既定値の一覧は `docs/reference/configuration.md`（手で保ち、
+//! `tests/env_reference.rs` が、コードが読む名前の漏れを検査する）。
 //!
 //! # 優先順位
 //!
@@ -34,7 +36,7 @@
 //!
 //! # `.env`
 //!
-//! Rust は `app/.env` を **読まない**。単一バイナリには `app/` が無く、本番は systemd の
+//! Rust は `.env` を **読まない**（旧 Python 版は `app/.env` を読んだ）。単一バイナリには `app/` が無く、本番は systemd の
 //! `EnvironmentFile=/etc/default/geoframe` が同じ役目を持っているため。手元で試すときは
 //! `set -a; . ./環境ファイル; set +a` してから起動する。詳細は docs/rust-migration/server.md。
 //!
@@ -56,61 +58,6 @@ pub const DEFAULT_HOST: IpAddr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
 pub const DEFAULT_PORT: u16 = 8080;
 pub const DEFAULT_DATA_DIR: &str = "var";
 pub const DB_FILE_NAME: &str = "catalog.db";
-
-/// まだ読まない `GEOFRAME_*`（現行の `config.py` にある項目）。**読まず、警告も出さない**。
-/// `docs/reference/configuration.md` の項目がここか [`SUPPORTED_ENV`] のどちらかに載っているかを
-/// テストで確かめている（Python 側で項目が増えたのに Rust の分類が漏れるのを防ぐ）。
-pub const UNSUPPORTED_ENV: &[&str] = &[
-    // P4: AI・位置候補（後続のタスク。周期・上限・フラグは T4.1b から `SUPPORTED_ENV`）
-    "GEOFRAME_AI_TIME_WINDOW_MIN",
-    "GEOFRAME_AI_SIMILARITY",
-    "GEOFRAME_AI_SHORTLIST_MAX",
-    "GEOFRAME_AI_JUDGE_SHUFFLE_RATE",
-    "GEOFRAME_LOCAL_EMBED_MODEL_DIR",
-    "GEOFRAME_LOCAL_EMBED_THREADS",
-    "GEOFRAME_RANK_MODEL",
-    "GEOFRAME_DECISION_URL",
-    "GEOFRAME_LOC_SUGGEST_MODEL",
-];
-
-/// P1 で読む `GEOFRAME_*`（`GEOFRAME_LOG` は Rust だけの項目なので Python の一覧には無い）。
-pub const SUPPORTED_ENV: &[&str] = &[
-    "GEOFRAME_DATA_DIR",
-    "GEOFRAME_HOST",
-    "GEOFRAME_PORT",
-    "GEOFRAME_ALLOWED_HOSTS",
-    // T1.4: 管理画面の読み取り API（/api/admin/status）の値を Python と同じにするために読む。
-    // 取り込みや AI の処理はまだ Rust に無いので、この3つは表示にだけ効く
-    "GEOFRAME_INFER_MIN",
-    "GEOFRAME_EMBED_BACKEND",
-    "GEOFRAME_TILE_CACHE_MAX_MB",
-    // T3.4: 地図タイルのプロキシ（E11）。キャッシュの上限（`GEOFRAME_TILE_CACHE_MAX_MB`）は掃除（B4）にも使う
-    "GEOFRAME_TILE_UA",
-    "GEOFRAME_TILE_FETCH_PER_MIN",
-    // T2.1: 同期サイクルの間隔
-    "GEOFRAME_DRIVE_POLL_MIN",
-    // T2.3: ローカル写真の索引（index_local・local_derivatives）
-    "GEOFRAME_PHOTOS_DIR",
-    "GEOFRAME_FETCH_PER_CYCLE",
-    // T2.4: Drive の索引と取得
-    "GEOFRAME_DRIVE_KEY",
-    "GEOFRAME_DRIVE_FOLDER",
-    // T2.5: 位置の推定（`GEOFRAME_INFER_MIN` は T1.4 から読んでいて、推定の窓にもなった）
-    "GEOFRAME_INFER_OFFSET_MIN",
-    // T2.6: 簡易品質
-    "GEOFRAME_QUALITY_PER_CYCLE",
-    // T4.1b: AI の周期・上限・フラグ（`ai::settings::LegacyAi`）。新しい呼び出しの routing は
-    // `GEOFRAME_AI_CONFIG`（Rust だけの項目）の JSON で、旧 `GEOFRAME_DECISION_URL`・`GEOFRAME_LOC_SUGGEST_MODEL` は読まない
-    "GEOFRAME_AI_ENABLED",
-    "GEOFRAME_AI_POLL_S",
-    "GEOFRAME_AI_EMBED_PER_CYCLE",
-    "GEOFRAME_AI_JUDGE_PER_CYCLE",
-    "GEOFRAME_AI_SEARCH_PER_MIN",
-    "GEOFRAME_AI_VISUAL_SIMILARITY",
-    "GEOFRAME_LOC_SUGGEST",
-    "GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE",
-    "GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE",
-];
 
 pub const DEFAULT_INFER_MIN: f64 = 15.0;
 /// カメラ時計のずれの補正（分）の既定。現行の `GEOFRAME_INFER_OFFSET_MIN`。
@@ -1084,33 +1031,5 @@ mod tests {
         // 許可ホスト名は件数だけ。名前そのものは出さない
         assert!(!text.contains("private-name"), "{text}");
         assert!(text.contains("allowed_hosts=2"), "{text}");
-    }
-
-    /// `docs/reference/configuration.md` にある `GEOFRAME_*` がすべて、P1 で読む項目か
-    /// 「未対応」の一覧のどちらかに載っていること（Python に項目が増えたら、ここで気づく）。
-    #[test]
-    fn every_documented_variable_is_classified() {
-        let doc = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../docs/reference/configuration.md"),
-        )
-        .unwrap();
-        let mut documented = BTreeSet::new();
-        for line in doc.lines().filter(|l| l.starts_with("- `GEOFRAME_")) {
-            let name = line[3..].split('`').next().unwrap();
-            documented.insert(name.to_string());
-        }
-        assert!(documented.len() >= 30, "{documented:?}");
-        for name in &documented {
-            let known =
-                SUPPORTED_ENV.contains(&name.as_str()) || UNSUPPORTED_ENV.contains(&name.as_str());
-            assert!(known, "{name} が config.rs の分類に無い");
-        }
-        // 逆向き: 分類側にだけある名前（綴りの誤りなど）を防ぐ
-        for name in SUPPORTED_ENV.iter().chain(UNSUPPORTED_ENV) {
-            assert!(
-                documented.contains(*name),
-                "{name} は設定リファレンスに無い"
-            );
-        }
     }
 }
