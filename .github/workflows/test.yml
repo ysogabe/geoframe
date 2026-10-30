@@ -21,6 +21,12 @@ jobs:
         # システムの python3（標準ライブラリだけ。pip も setup-python も使わない）
         run: python3 tools/check_markdown_links.py
 
+      - name: 紹介ページ（site/）の検査
+        # 内部リンク・fragment・資産の存在、外部ホストの許可リスト、スクリプト・外部フォント・データファイルが無いこと。標準ライブラリだけ
+        run: |
+          python3 tools/check_site.py
+          python3 -m unittest discover -s tools/tests -v
+
       - name: 毎朝のDecision起動（deploy/loc_decision_morning.py）の試験
         # 本番機のシステムの python3 で動く標準ライブラリだけのスクリプト。pip install なし
         run: python3 -m unittest discover -s deploy/tests -v
