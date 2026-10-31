@@ -264,7 +264,7 @@ export function buildAdminDom(){
 
   // 設定タブ（admin.html の #v-config と同じ id。.scroll の包みは id が無いので省く）
   const cf = mk('section', {id: 'v-config', cls: 'hidden'}, main);
-  mk('div', {id: 'c-note', cls: 'note'}, cf);
+  mk('div', {id: 'c-note', cls: 'cfg-note'}, cf);
   const rtp = mk('div', {cls: 'panel'}, cf);
   mk('div', {id: 'c-runtime', cls: 'grid'}, rtp);
   mk('table', {id: 'c-files', cls: 'cfg'}, rtp);
@@ -272,7 +272,7 @@ export function buildAdminDom(){
   mk('table', {id: 'c-geo', cls: 'cfg'}, mk('div', {cls: 'panel'}, cf));
   const aip = mk('div', {cls: 'panel'}, cf);
   mk('table', {id: 'c-ai', cls: 'cfg'}, aip);
-  mk('div', {id: 'c-ai-state', cls: 'note'}, aip);
+  mk('div', {id: 'c-ai-state', cls: 'cfg-note'}, aip);
   mk('table', {id: 'c-ai-tasks', cls: 'cfg'}, aip);
   mk('table', {id: 'c-ai-space', cls: 'cfg'}, aip);
   const otp = mk('div', {id: 'c-other-panel', cls: 'panel hidden'}, cf);

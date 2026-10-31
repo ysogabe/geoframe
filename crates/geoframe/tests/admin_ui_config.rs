@@ -5,6 +5,8 @@
 
 use std::process::Command;
 
+use geoframe::config::EnvItem;
+
 #[test]
 fn the_admin_config_tab_renders_every_item_with_its_source_and_the_ai_tasks() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
@@ -32,4 +34,22 @@ fn the_admin_config_tab_renders_every_item_with_its_source_and_the_ai_tasks() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// 設定タブの表（`config.js` の `CONFIG_ITEMS`）の key が、サーバーの `EnvItem::ALL` の全項目と過不足なく一致する。
+/// 打ち間違いや項目の追加漏れがあると、その項目が「その他」に落ちるか、表に出ない。Node が無くても動く。
+#[test]
+fn the_config_tab_table_names_exactly_the_items_the_server_reports() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
+    let js = std::fs::read_to_string(format!("{root}/web/static/js/config.js")).unwrap();
+    let mut table: Vec<String> = js
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("{key: '"))
+        .filter_map(|l| l.split('\'').next())
+        .map(str::to_string)
+        .collect();
+    table.sort();
+    let mut server: Vec<String> = EnvItem::ALL.iter().map(|i| i.name().to_string()).collect();
+    server.sort();
+    assert_eq!(table, server);
 }

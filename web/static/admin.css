@@ -64,16 +64,17 @@ table.kv td:first-child{color:var(--ink-3)}
 table.kv td:last-child{text-align:right;color:var(--ink)}
 
 /* ==== 設定タブ（読み取り専用） ==== */
-.note{border:1px solid rgba(255,179,0,.4);background:rgba(255,179,0,.06);border-radius:6px;
+.cfg-note{border:1px solid rgba(255,179,0,.4);background:rgba(255,179,0,.06);border-radius:6px;
   padding:10px 14px;margin-bottom:16px;font-size:12px;line-height:1.7;color:var(--ink)}
-.note:empty{display:none}
-.note p+p{margin-top:6px}
-.note .err,.err{color:var(--magenta)}
-.note .warn{color:var(--amber)}
+.cfg-note:empty{display:none}
+.cfg-note p+p{margin-top:6px}
+.cfg-note .err{color:var(--magenta)}
+.cfg-note .warn{color:var(--amber)}
+#c-ai-state{margin:12px 0 0}
 .panel h3{font-family:var(--mono);font-size:11px;letter-spacing:.1em;color:var(--ink-2);
   font-weight:normal;margin:16px 0 8px}
 .scroll{overflow-x:auto}
-.dim{color:var(--ink-3)}
+.cfg-note .dim,table.cfg .dim,.legend .dim{color:var(--ink-3)}
 .cell.sm .v{font-size:14px;overflow-wrap:anywhere}
 table.cfg{width:100%;border-collapse:collapse;font-size:12px}
 table.cfg th{text-align:left;font-family:var(--mono);font-size:10px;font-weight:normal;letter-spacing:.1em;
@@ -95,7 +96,7 @@ table.cfg .bar{width:120px;margin-top:4px}
 .st{font-family:var(--mono);font-size:11px}
 .st.good{color:var(--green)}
 .st.bad{color:var(--magenta)}
-.st.dim{color:var(--ink-3)}
+.st.cfg-note .dim,table.cfg .dim,.legend .dim{color:var(--ink-3)}
 .legend{display:flex;flex-direction:column;gap:6px;font-size:12px}
 
 /* ==== 写真グリッド ==== */
