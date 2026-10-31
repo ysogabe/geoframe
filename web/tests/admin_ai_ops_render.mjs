@@ -1,35 +1,24 @@
-// admin.js の aiOpsCells（AI運用の STATUS 描画）を、最小の DOM の代用品で動かして確かめる。
+// admin.js の aiOpsCells（AI運用の STATUS 描画）を、小さな DOM の代用品（fakedom.mjs）で動かして確かめる。
 // 使い方: node web/tests/admin_ai_ops_render.mjs <admin.js のパス>
 // 合成の status JSON だけを使い、ネットワークには出ない。
 import fs from 'node:fs';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
+import {buildAdminDom} from './fakedom.mjs';
 
 const path = process.argv[2];
 assert.ok(path, 'admin.js のパスが要る');
 
-function node(tag){
-  return {
-    tag, className: '', textContent: '', children: [], style: {}, dataset: {},
-    classList: {toggle(){}, add(){}, remove(){}},
-    appendChild(c){ this.children.push(c); return c; },
-    addEventListener(){}, querySelector(){ return node('x'); },
-  };
-}
-const document = {
-  querySelector(){ return node('x'); },
-  querySelectorAll(){ return []; },
-  createElement: node,
-  createTextNode(text){ return {tag: '#text', textContent: String(text), children: []}; },
-  addEventListener(){},
-};
+// DOM の代用品は fakedom.mjs。admin.js を読み込むだけでは起動しない（DOMContentLoaded を発火しない）ので、
+// fetch も location も呼ばれない。
+const document = buildAdminDom();
 const context = vm.createContext({
   document, fetch: () => new Promise(() => {}), setInterval(){}, setTimeout(){}, clearTimeout(){},
   console,
 });
 vm.runInContext(fs.readFileSync(path, 'utf8'), context, {filename: 'admin.js'});
 
-const text = n => [n.textContent, ...n.children.map(text)].join(' ');
+const text = n => n.textContent;
 const render = d => vm.runInContext('aiOpsCells', context)(d).map(text).join('\n');
 
 // 待ちが無い・キーが無い応答（Python 版と同じ）には何も描かない
