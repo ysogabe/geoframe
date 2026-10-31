@@ -32,6 +32,7 @@
 - 表示クライアント向けの写真一覧は `GET /api/v1/photos`（[写真フィードの契約](photo-feed-contract.md)）、管理用ページング一覧は `GET /api/admin/photos`。
 - AI検索は`GET /api/ai/search`、進捗は`GET /api/ai/status`、管理画面の写真タブ（`/ai-search`も同じ画面）。通常の管理画面STATUSにもembedding・比較待ち・表示抑止数を表示する。検索結果の写真にも由来・近い時刻の位置のヒント・撮影地候補を付ける（管理一覧と同じ）。
 - 管理用一覧（`GET /api/admin/photos`）は、位置なし写真にAIの撮影地候補（`suggest`）を付ける。`filter=suggest`で候補のある位置なし写真だけを返す。STATUSにはDecisionの接続状態、手がかり判定の進み具合、推定済みの日数を表示する。表示クライアント向けの写真フィードには候補を含めない。管理用一覧は、どのフィルタでも位置なしの写真に近い時刻の位置のヒント（`hint`）を付ける。`GET /api/admin/status` の `db.filters` は、フィルタごとの件数を返す。
+- 管理画面の設定タブは `GET /api/admin/config`（GETの完全一致。読み取り専用）で、起動時に読んだ設定を項目ごとの出どころ（引数・環境変数・既定）つきで返す。AI用途の送り先・モデル・今日（UTC）の送信数・無効の理由も含み、ユーザーの決定で鍵のパスや接続先も設定どおりに出す（鍵の中身は出さない）。
 - 管理画面の地名検索（`GET /api/admin/geocode`）は地理院のアドレス検索が0件のときだけNominatim（OpenStreetMap）で引き直し、海外の地名も探せる。Nominatimへの問い合わせは全体で1秒1件に絞り、結果はキャッシュする。
 - 旅行ブログ機能は、`GEOFRAME_BLOG=1`のときだけ有効（既定は無効）。`GET /api/blog/*` から写真カタログを読み取り、正確なGPSをレスポンスへ含めない。
 - レビュー状態は再構築可能な写真索引と混ぜず、`GEOFRAME_DATA_DIR/travel_blog/drafts/` のJSONへ保存する。
