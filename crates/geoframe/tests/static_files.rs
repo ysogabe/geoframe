@@ -405,6 +405,14 @@ async fn admin_pages_are_rewritten_to_the_embedded_html() {
         assert_eq!(r.body, admin, "{target}");
         assert_eq!(r.header("content-type"), Some("text/html"), "{target}");
     }
+    // 管理画面は「状況」「写真」の 2 タブで、旅行ブログへのリンクは持たない
+    let html = String::from_utf8(admin).unwrap();
+    assert!(html.contains(r#"data-tab="status""#));
+    assert!(html.contains(r#"data-tab="photos""#));
+    assert!(
+        !html.contains(r#"href="/blog-admin""#),
+        "旅行ブログのリンク"
+    );
     assert_eq!(
         get(addr, "/blog-admin").await.body,
         repo_file("static/blog-admin.html")
@@ -423,6 +431,41 @@ async fn admin_pages_are_rewritten_to_the_embedded_html() {
         "/ai-search/x",
     ] {
         assert_eq!(get(addr, target).await.status, 403, "{target}");
+    }
+}
+
+/// 画面（`web/static` の HTML・JS・CSS）に、Python 時代の記述（`server.py`・`handlers.py`・`loc_suggest.py`）と
+/// 「表示画面」（表示は miharashi の責務で、管理画面からのリンクは無い）が残っていない。
+#[test]
+fn the_screens_no_longer_mention_the_python_era() {
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect(&path, out);
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("html" | "js" | "css")
+            ) {
+                out.push(path);
+            }
+        }
+    }
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/static");
+    let mut files = Vec::new();
+    collect(&root, &mut files);
+    assert!(
+        files.len() >= 7,
+        "web/static の画面ファイルが見つからない: {files:?}"
+    );
+    for file in files {
+        let text = std::fs::read_to_string(&file).unwrap();
+        for old in ["server.py", "handlers.py", "loc_suggest.py", "表示画面"] {
+            assert!(
+                !text.contains(old),
+                "{file:?} に古い記述 {old:?} が残っている"
+            );
+        }
     }
 }
 
