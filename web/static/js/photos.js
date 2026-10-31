@@ -427,6 +427,8 @@ const MAX_QUERY_CHARS = 300;      // API（crates/geoframe/src/ai/query.rs）は
 function search(q){
   q = String(q === undefined ? $('#q').value : q).trim();
   if([...q].length > MAX_QUERY_CHARS){
+    searchSeq++;                       // 先行の検索の応答で注意書きを上書きさせない
+    ps.pending = null;
     setNote('検索語は ' + MAX_QUERY_CHARS + ' 文字以内で入力してください', 'err');
     return;
   }

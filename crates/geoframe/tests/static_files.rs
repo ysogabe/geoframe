@@ -418,10 +418,14 @@ async fn admin_pages_are_rewritten_to_the_embedded_html() {
         get(addr, "/blog-admin").await.body,
         repo_file("static/blog-admin.html")
     );
+    // AI 検索の旧ページは無く、/ai-search は管理画面と同じ本文（写真タブで開く）
     assert_eq!(
         get(addr, "/ai-search").await.body,
-        repo_file("static/ai-search.html")
+        repo_file("static/admin.html")
     );
+    assert_eq!(get(addr, "/static/ai-search.html").await.status, 404);
+    assert_eq!(get(addr, "/static/ai-search.css").await.status, 404);
+    assert_eq!(get(addr, "/static/js/ai-search.js").await.status, 404);
     // 読み替えは完全一致だけ。現行に /blog は無い（403）
     for target in [
         "/blog",
@@ -467,6 +471,35 @@ fn the_screens_no_longer_mention_the_python_era() {
                 "{file:?} に古い記述 {old:?} が残っている"
             );
         }
+    }
+}
+
+/// 画面の JavaScript は DOM を `innerHTML` 等の文字列で組まない（textContent・createElement で組む）。
+#[test]
+fn the_scripts_never_build_html_from_strings() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../web/static/js");
+    let mut checked = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if path.extension().and_then(|e| e.to_str()) != Some("js") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        for bad in [
+            "innerHTML",
+            "outerHTML",
+            "insertAdjacentHTML",
+            "document.write",
+        ] {
+            assert!(!text.contains(bad), "{path:?} に {bad} がある");
+        }
+        checked.push(path.file_name().unwrap().to_string_lossy().into_owned());
+    }
+    for name in ["admin.js", "photos.js"] {
+        assert!(
+            checked.iter().any(|c| c == name),
+            "{name} が見つからない: {checked:?}"
+        );
     }
 }
 
@@ -519,10 +552,7 @@ async fn blog_admin_serves_the_admin_page_unless_the_blog_is_enabled() {
         assert_eq!(get(addr, "/blog_exports/t/index.html").await.status, 200);
         // ほかのページは変わらない
         assert_eq!(get(addr, "/admin").await.body, admin);
-        assert_eq!(
-            get(addr, "/ai-search").await.body,
-            repo_file("static/ai-search.html")
-        );
+        assert_eq!(get(addr, "/ai-search").await.body, admin);
     }
     // `1`: 旅行ブログの HTML
     let addr = site.serve_blog(&site.data, "frame.lan", Some("1")).await;
