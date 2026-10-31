@@ -215,7 +215,7 @@ await test('admin.html と fakedom の骨格（id・タブ・チップ）が一�
   assert.ok(/<input type="text" id="q"/.test(html) && !/id="q"[^>]*maxlength/.test(html),
     '#q に maxlength は付けない（UTF-16 単位で API のコードポイント数とずれる。長さは search() で数える）');
   assert.ok(html.includes('id="viewer"') && !html.includes('photo-modal'), 'ビューアは #viewer');
-  assert.ok(html.includes('href="/ai-search"'), '/ai-search へのリンクは残す（T6 で外す）');
+  assert.ok(!html.includes('href="/ai-search"') && !html.includes('AI 写真検索 ▸'), '旧ページへのリンクは無い');
   const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map(m => m[1]).filter(u => u.startsWith('/static/'));
   assert.deepEqual(scripts, ['/static/js/admin.js', '/static/js/photos.js'], 'admin.js → photos.js の順');
 });
@@ -1278,6 +1278,29 @@ await test('(x) 検索語の長さはコードポイントで数える: 日本�
   await searchFor(env, q300);
   assert.equal(env.searchCalls().length, n0 + 2);
   assert.equal(query(env.searchCalls().at(-1).url).get('q'), q300);
+});
+
+await test('(y) 301 文字を送らないとき、応答待ちの「犬」の検索は無効になり、後から成功・失敗が届いても注意書きと表示は変わらない', async () => {
+  for(const outcome of ['ok', 'fail']){
+    const env = makeEnv({pathname: '/admin'});
+    await env.boot();
+    await openPhotos(env);
+    let release;
+    env.handlers.search = () => new Promise(res => { release = res; });
+    env.$('#q').value = '犬';
+    env.$('#search').click();
+    await settle();
+    assert.equal(note(env), '検索しています…');
+    await searchFor(env, 'あ'.repeat(301));
+    const want = '検索語は 300 文字以内で入力してください';
+    assert.equal(note(env), want);
+    assert.equal(env.ev('ps.pending'), null);
+    release(outcome === 'ok' ? await reply(searchBody('犬', [G2], 'search')) : await respond(500, {ok: false, error: 'boom'}));
+    await settle();
+    assert.equal(note(env), want, outcome);
+    assert.ok(env.$('#search-note').classList.contains('err'), outcome);
+    assert.equal(env.ev('ps.view'), 'list', outcome);
+  }
 });
 
 console.log(`ok (${n})`);

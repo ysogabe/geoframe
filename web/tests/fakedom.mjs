@@ -253,8 +253,6 @@ export function buildAdminDom(){
     mk('span', {cls: 'n'}, b);
   });
   mk('span', {cls: 'spacer'}, bar);
-  const a = mk('a', {cls: 'lnk', text: 'AI 写真検索 ▸'}, bar);
-  a.setAttribute('href', '/ai-search');
   const pager = mk('div', {id: 'pager', cls: 'toolbar'}, ph);
   mk('button', {id: 'prev', cls: 'btn', text: '◀ PREV'}, pager);
   mk('span', {id: 'pageinfo', cls: 'count', text: '--'}, pager);
