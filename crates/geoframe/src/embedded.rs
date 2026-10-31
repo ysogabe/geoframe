@@ -64,6 +64,7 @@ mod tests {
         for path in [
             "static/admin.html",
             "static/blog-admin.html",
+            "static/js/config.js",
             "static/js/photos.js",
             "vendor/fonts.css",
             "vendor/maplibre-gl-4.7.1.min.js",

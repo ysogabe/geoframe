@@ -374,6 +374,7 @@ async fn every_embedded_file_is_served_byte_for_byte() {
         ("/static/admin.css", "text/css"),
         ("/static/js/admin.js", "text/javascript"),
         ("/static/js/photos.js", "text/javascript"),
+        ("/static/js/config.js", "text/javascript"),
         ("/vendor/fonts.css", "text/css"),
         ("/vendor/maplibre-gl-4.7.1.min.js", "text/javascript"),
         ("/vendor/fonts/share-tech-mono-latin.woff2", "font/woff2"),
@@ -406,10 +407,11 @@ async fn admin_pages_are_rewritten_to_the_embedded_html() {
         assert_eq!(r.body, admin, "{target}");
         assert_eq!(r.header("content-type"), Some("text/html"), "{target}");
     }
-    // 管理画面は「状況」「写真」の 2 タブで、旅行ブログへのリンクは持たない
+    // 管理画面は「状況」「写真」「設定」の 3 タブで、旅行ブログへのリンクは持たない
     let html = String::from_utf8(admin).unwrap();
     assert!(html.contains(r#"data-tab="status""#));
     assert!(html.contains(r#"data-tab="photos""#));
+    assert!(html.contains(r#"data-tab="config""#));
     assert!(
         !html.contains(r#"href="/blog-admin""#),
         "旅行ブログのリンク"
@@ -495,7 +497,7 @@ fn the_scripts_never_build_html_from_strings() {
         }
         checked.push(path.file_name().unwrap().to_string_lossy().into_owned());
     }
-    for name in ["admin.js", "photos.js"] {
+    for name in ["admin.js", "photos.js", "config.js"] {
         assert!(
             checked.iter().any(|c| c == name),
             "{name} が見つからない: {checked:?}"
@@ -833,6 +835,7 @@ async fn cache_and_framing_headers_follow_the_current_server() {
         "/static/admin.css",
         "/static/js/admin.js",
         "/static/js/photos.js",
+        "/static/js/config.js",
         "/vendor/fonts.css",
     ] {
         let r = get(addr, target).await;
