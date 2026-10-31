@@ -88,6 +88,9 @@ pub struct AppState {
     /// `serve` だけが持ち、`/api/admin/status` の `sync.mass_delete_hold` に出す。無いとき（取り込み無効・試験）は
     /// キーを出さない。
     pub mass_delete: Option<Arc<MassDeleteBoard>>,
+    /// プロセスの起動時刻（`GET /api/admin/config` の `started_at`・`uptime_s`）。状態を作った時刻で、`serve_until` が
+    /// 待ち受けを始める直前に取り直す。
+    pub started_at: std::time::SystemTime,
 }
 
 impl AppState {
@@ -130,6 +133,7 @@ impl AppState {
             tiles,
             blog,
             mass_delete: None,
+            started_at: std::time::SystemTime::now(),
         }
     }
 
@@ -657,6 +661,8 @@ fn not_yet_implemented(label: &'static str) -> Response {
 /// `/healthz`・`/api/v1/photos` 以外の `GET`/`HEAD`（`POST` と未実装のメソッドは [`guard`] が返す）。
 /// 現行の `do_GET`/`do_HEAD` と同じ順に:
 ///
+/// 0. `GET` の `/api/admin/config`（管理画面の設定タブ）は**完全一致**の読み取り API（[`crate::admin_config`]）。
+///    HEAD・`/api/admin/configX`・末尾 `/` は当たらず、下の静的配信の判定で 403。
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
 ///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
@@ -724,6 +730,14 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
         // axum のルートは完全一致なので、`//api/v1/photos` はここへ来る（現行は200）
         if path == "/api/v1/photos" {
             return labeled(api_photos(State(state)).await, "/api/v1/photos");
+        }
+        // 完全一致（`/api/admin/configX` や末尾 `/` は当たらず、静的配信の判定で 403）。前方一致の
+        // `/api/admin/status` などより前に置く
+        if path == "/api/admin/config" {
+            return labeled(
+                crate::admin_config::response(&state).await,
+                "/api/admin/config",
+            );
         }
         if path.starts_with("/api/admin/status") {
             return labeled(api_admin_status(&state).await, "/api/admin/status");
@@ -921,11 +935,12 @@ pub async fn serve(state: AppState, stop: StopFlag) -> std::io::Result<()> {
 /// キャッシュ保存・runtime の停止のため）。bind に失敗したときはすぐ `Err` を返す（呼び出し側が続けて
 /// スレッドを止める）。
 pub async fn serve_until(
-    state: AppState,
+    mut state: AppState,
     stop: StopFlag,
     signal: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(state.config.listen).await?;
+    state.started_at = std::time::SystemTime::now();
     tracing::info!("{} で待ち受けます", listener.local_addr()?);
     tracing::info!(
         "{}",

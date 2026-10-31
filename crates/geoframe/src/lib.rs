@@ -4,6 +4,7 @@
 #![deny(unsafe_code)]
 
 pub mod admin;
+pub mod admin_config;
 pub mod ai;
 pub mod backoff;
 pub mod blog;
