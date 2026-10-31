@@ -506,7 +506,9 @@ Node は CI で必須（runner に同梱。`package.json` は置かない）。N
   空白だけの値も `Default`。`EnvItem` は 35 項目。
 - **`AppState.started_at`**: `AppState::new()` で取り、`serve_until` が待ち受けの直前に取り直す。
 - **応答**: `disabled` は全用途に付く（`gate(task, true)`）。`service_id` はローカルの用途で常に出し `location_clue` は `null`。
-  `GEOFRAME_AI_CONFIG` の `state` は `absent`/`loaded`/`invalid`。時刻は `YYYY-MM-DD HH:MM:SS`。数値はすべて文字列。
+  `GEOFRAME_AI_CONFIG` の `state` は `absent`/`loaded`/`invalid`。時刻は `YYYY-MM-DD HH:MM:SS`。`items[].value` の数値は
+  文字列（`uptime_s`・`ai.version`・`dimension`・`daily_limit`・`today_utc` は JSON の数値）。HTTP の結合試験は新設の
+  `tests/admin_config_api.rs`。
   `AI_TIME_WINDOW_MIN` は秒を 60 で割った値、`AI_VISUAL_SIMILARITY` は解決後の値。
 - **画面**: `config.js`（`admin.js` → `photos.js` → `config.js` の順）。`initConfig()` が起動時に案内文と凡例を描き、設定タブを
   開くたびに `GET /api/admin/config` を読む。ファイルの 3 項目はファイルの表だけに出す。用途の表は横スクロール。
