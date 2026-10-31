@@ -373,6 +373,7 @@ async fn every_embedded_file_is_served_byte_for_byte() {
         ("/static/admin.html", "text/html"),
         ("/static/admin.css", "text/css"),
         ("/static/js/admin.js", "text/javascript"),
+        ("/static/js/photos.js", "text/javascript"),
         ("/vendor/fonts.css", "text/css"),
         ("/vendor/maplibre-gl-4.7.1.min.js", "text/javascript"),
         ("/vendor/fonts/share-tech-mono-latin.woff2", "font/woff2"),
@@ -801,6 +802,7 @@ async fn cache_and_framing_headers_follow_the_current_server() {
     for target in [
         "/static/admin.css",
         "/static/js/admin.js",
+        "/static/js/photos.js",
         "/vendor/fonts.css",
     ] {
         let r = get(addr, target).await;

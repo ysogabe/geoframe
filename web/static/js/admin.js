@@ -1,9 +1,11 @@
 /* ============================================================
    admin.js — 管理ページ /admin のフロント（classic script / 依存なし）
-   構成: 1) 共通ヘルパ 2) タブ 3) 状況 4) 写真（チップ・一覧・カード） 5) フラグ操作
-        6) 位置指定モーダル（MapLibre・地名検索・AI撮影地候補） 9) 起動
+   構成: 1) 共通ヘルパ 2) タブ 3) 状況 4) 起動
+   写真タブ（一覧・チップ・検索・カード・ビューア・位置指定）は photos.js（この後に読み込む）。
+   共有はグローバル関数: photos.js は ここの $ el fmtDur toast postJSON showTab を使い、
+   admin.js は photos.js の initPhotos openPhotosTab gotoFilter を（呼ぶ時点で解決して）使う。
    読み込んだだけでは location・fetch に触らない。起動は DOMContentLoaded の boot() だけ
-   （描画試験が vm で読み込んで aiOpsCells などを直接呼ぶため）。
+   （描画試験が vm で読み込んで aiOpsCells などを直接呼ぶため。boot の外で photos.js の関数は呼ばない）。
    ============================================================ */
 'use strict';
 
@@ -50,7 +52,6 @@ function postJSON(path, body){
 }
 
 /* ==== 2) タブ ==== */
-let curFilter = 'all', curPage = 1;
 /* 開いたときのタブ。/ と /admin（旅行ブログが無効のときの /blog-admin も同じ HTML）は状況。
    /ai-search を同じ HTML で返す版（写真タブへ統合したあと）では写真タブ。
    パスは先頭の連続する / を 1 つにし、末尾の / を除いて === で比べる */
@@ -66,8 +67,7 @@ function showTab(name){
   $('#v-status').classList.toggle('hidden', tab !== 'status');
   $('#v-photos').classList.toggle('hidden', tab !== 'photos');
   if(tab === 'status'){ loadStatus(); return; }
-  loadFilterCounts();
-  setFilter(curFilter);
+  openPhotosTab();            // photos.js: 件数・索引の枚数・一覧（検索結果を見ていたときはそのまま）
 }
 
 /* ==== 3) STATUS ==== */
@@ -207,15 +207,15 @@ function aiOpsCells(d){
   }
   return cells;
 }
-/* 要対応: 位置なし・AI候補あり。押すと写真タブのそのフィルタへ移る。
-   curFilter を先に変えて showTab を呼ぶ（showTab が一覧を 1 回だけ読む） */
+/* 要対応: 位置なし・AI候補あり。押すと写真タブのそのフィルタへ移る（photos.js の gotoFilter が
+   フィルタを変えて showTab を呼ぶので、一覧は 1 回だけ読まれる） */
 const TODO_ITEMS = [['noloc', '位置なし（要位置指定）'], ['suggest', 'AI候補あり（要確認）']];
 function todoCells(filters){
   if(!filters) return [];
   return TODO_ITEMS.map(([f, label]) => {
     const n = filters[f] || 0;
     const c = cell(label, n.toLocaleString('ja-JP'), '枚', n ? 'warn' : 'good');
-    const go = () => { curFilter = f; showTab('photos'); };
+    const go = () => gotoFilter(f);
     c.classList.add('todo');
     c.setAttribute('role', 'button');
     c.setAttribute('tabindex', '0');
@@ -303,322 +303,16 @@ function loadStatus(){
   }).catch(e => toast('STATUS取得失敗: ' + e.message, true));
 }
 
-/* ==== 4) 写真（チップ・一覧・カード） ==== */
-const SRC_LABEL = {exif: 'EXIF', drive_meta: 'DRIVE', inferred: '推定', manual: '手動'};
-function setFilter(f){
-  curFilter = f; curPage = 1;
-  document.querySelectorAll('.chip').forEach(b => b.classList.toggle('on', b.dataset.filter === f));
-  loadList();
-}
-/* チップの件数は GET /api/admin/status の db.filters（一覧 API の total と同じ条件で数えたもの） */
-let countsSeq = 0;    // ★の直後などに続けて読んだとき、遅れて届いた古い件数でチップを上書きしない
-function loadFilterCounts(){
-  const seq = ++countsSeq;
-  fetch('/api/admin/status').then(r => r.json()).then(d => {
-    if(seq !== countsSeq) return;
-    if(!d.ok) throw new Error(d.error || 'status error');
-    const filters = (d.db && d.db.filters) || {};
-    document.querySelectorAll('.chip').forEach(b => {
-      const n = b.querySelector('.n');
-      const v = filters[b.dataset.filter];
-      if(n) n.textContent = (v === undefined || v === null) ? '' : Number(v).toLocaleString('ja-JP');
-    });
-  }).catch(e => { if(seq === countsSeq) toast('件数取得失敗: ' + e.message, true); });
-}
-let listSeq = 0;      // 速く切り替えたとき、遅れて届いた古い応答で一覧を上書きしない
-function loadList(){
-  const seq = ++listSeq;
-  fetch('/api/admin/photos?filter=' + encodeURIComponent(curFilter) +
-        '&page=' + curPage + '&per=50')
-    .then(r => r.json()).then(d => {
-      if(seq !== listSeq) return;
-      if(!d.ok) throw new Error(d.error || 'list error');
-      curPage = d.page;
-      $('#pageinfo').textContent = d.total + '件 / ' + d.page + ' of ' + d.pages + 'ページ';
-      $('#prev').disabled = d.page <= 1;
-      $('#next').disabled = d.page >= d.pages;
-      $('#empty').classList.toggle('hidden', d.items.length > 0);
-      const box = $('#cards'); box.textContent = '';
-      d.items.forEach(it => box.appendChild(cardFor(it)));
-    }).catch(e => { if(seq === listSeq) toast('一覧取得失敗: ' + e.message, true); });
-}
-/* 1 行目（.l1）がカードの主役。位置があれば地名。位置が無ければ「次に何をするか」:
-   AI候補 → 近い時刻の位置 → 手がかりなし。地名は位置がある行だけ表示する
-   （推定を取り消された行には解決済みの地名が残っていることがあり、出すと誤解を生む） */
-function cardFor(it){
-  const c = el('div', 'card' + (it.hidden ? ' is-hidden' : ''));
-  c.dataset.id = it.id;
-
-  const ph = el('div', 'ph');
-  if(it.thumb){
-    const img = document.createElement('img');
-    img.loading = 'lazy';          // 50枚同時取得を避ける
-    img.decoding = 'async';
-    img.alt = it.name;
-    img.src = it.thumb;
-    // 取得済みderivativeが消えている場合はプレースホルダに落とす
-    img.addEventListener('error', () => {
-      ph.textContent = '';
-      ph.appendChild(el('div', 'noimg', 'NO IMAGE'));
-    });
-    ph.appendChild(img);
-  }else{
-    ph.appendChild(el('div', 'noimg', '画像未取得\n(位置未設定のため)'));
-  }
-  c.appendChild(ph);
-
-  const hasLoc = (it.lat !== null && it.lat !== undefined);
-  const m = el('div', 'meta');
-  if(hasLoc){
-    const loc = [it.pref, it.city, it.place].filter(Boolean).join(' ');
-    m.appendChild(el('div', 'l1', loc || (it.lat.toFixed(4) + ', ' + it.lon.toFixed(4))));
-  }else if(it.suggest){
-    m.appendChild(el('div', 'l1 act', 'AI候補: ' + it.suggest.place_name));
-  }else if(it.hint && it.hint.label){
-    m.appendChild(el('div', 'l1 act hint', '近い時刻の位置: ' + it.hint.label +
-                                           '（' + fmtDur(it.hint.dt_s) + '差）'));
-  }else{
-    m.appendChild(el('div', 'l1 act none', '手がかりなし'));
-  }
-  const l2 = el('div', 'l2');
-  l2.appendChild(el('span', 'dt', it.taken_at || '撮影時刻なし'));
-  l2.appendChild(el('span', 'nm', it.name));
-  m.appendChild(l2);
-  const src = hasLoc ? (it.loc_source || 'none') : 'none';
-  m.appendChild(el('span', 'tag t-' + src, (SRC_LABEL[src] || '位置なし') +
-                   (src === 'inferred' && it.infer_bucket ? ' ' + it.infer_bucket : '')));
-  c.appendChild(m);
-
-  /* ★・🚫 は押した時点の見た目（.on）を基準に反転する。同じ写真のカードが複数あっても
-     setFlag が全部に応答の値を反映するので、どれから押しても食い違わない */
-  const acts = el('div', 'acts');
-  const fav = el('button', 'fav' + (it.fav ? ' on' : ''), '★');
-  fav.title = 'お気に入り';
-  fav.addEventListener('click', () => setFlag(it, {favorite: !fav.classList.contains('on')}));
-  const hid = el('button', 'hid' + (it.hidden ? ' on' : ''), '🚫');
-  hid.title = '表示から除外';
-  hid.addEventListener('click', () => setFlag(it, {hidden: !hid.classList.contains('on')}));
-  const loc2 = el('button', hasLoc ? 'setloc' : 'setloc strong', hasLoc ? '位置' : '位置を付ける');
-  loc2.title = '地図で位置を指定';
-  loc2.addEventListener('click', () => openLocModal(it));
-  acts.appendChild(fav); acts.appendChild(hid); acts.appendChild(loc2);
-  // 横倒し・逆さまで保存された写真を直す（画像があるDriveの写真だけ）
-  if(it.thumb && it.source === 'drive'){
-    const rot = el('button', 'rotate', '↻');
-    rot.title = '時計回りに90°回して表示' + (it.rotation ? '（今 ' + it.rotation + '°）' : '');
-    rot.addEventListener('click', () => rotatePhoto(c, it, rot));
-    acts.appendChild(rot);
-  }
-  c.appendChild(acts);
-  return c;
-}
-
-/* ==== 5) フラグ操作 ==== */
-function setFlag(it, patch){
-  postJSON('/api/admin/setflag', Object.assign({id: it.id}, patch)).then(j => {
-    it.fav = j.favorite; it.hidden = j.hidden;
-    document.querySelectorAll('#cards .card').forEach(card => {
-      if(String(card.dataset.id) !== String(it.id)) return;
-      card.querySelector('.fav').classList.toggle('on', j.favorite);
-      card.querySelector('.hid').classList.toggle('on', j.hidden);
-      card.classList.toggle('is-hidden', j.hidden);
-    });
-    toast('#' + it.id + ' 更新: ' + (j.favorite ? '★' : '☆') + (j.hidden ? ' 🚫除外' : ''));
-    loadFilterCounts();           // ★・除外の件数（チップ）が変わる
-  }).catch(e => toast('更新失敗: ' + e.message, true));
-}
-
-function rotatePhoto(card, it, btn){
-  btn.disabled = true;
-  postJSON('/api/admin/rotate', {id: it.id, delta: 90}).then(j => {
-    it.rotation = j.rotation; it.thumb = j.thumb;
-    const img = card.querySelector('.ph img');
-    if(img) img.src = j.thumb;
-    btn.title = '時計回りに90°回して表示' + (j.rotation ? '（今 ' + j.rotation + '°）' : '');
-    toast('#' + it.id + ' を回しました（' + j.rotation + '°）');
-  }).catch(e => toast('回転失敗: ' + e.message, true))
-    .finally(() => { btn.disabled = false; });
-}
-
-/* ==== 6) 位置指定モーダル（MapLibre） ==== */
-/* 背景タイルは本体と同じ Rust のプロキシ（tiles.rs）経由（ローカルキャッシュを共有できる）。
-   出典表示は地理院タイル・OSMいずれも利用条件で必須なので style に持たせる */
-const TILE_ATTRIB_OSM = "© <a href='https://www.openstreetmap.org/copyright'>OpenStreetMap</a> contributors";
-const TILE_ATTRIB_GSI = "出典: <a href='https://maps.gsi.go.jp/development/ichiran.html'>国土地理院（地理院タイル）</a>";
-let mini = null, miniMarker = null, curPhoto = null, picked = null;
-let suggestMarker = null;     // AI候補の代表点（確定用の miniMarker とは色を分ける）
-
-function ensureMini(){
-  if(mini) return mini;
-  mini = new maplibregl.Map({
-    container: 'minimap',
-    style: {version: 8, sources: {
-        osm: {type: 'raster', tiles: [location.origin + '/tiles/osm/{z}/{x}/{y}.png'],
-              tileSize: 256, maxzoom: 19, attribution: TILE_ATTRIB_OSM},
-        gsi: {type: 'raster', tiles: [location.origin + '/tiles/gsi/{z}/{x}/{y}.png'],
-              tileSize: 256, minzoom: 5, maxzoom: 18,
-              bounds: [122.5, 20.2, 154.5, 46.5], attribution: TILE_ATTRIB_GSI}},
-      layers: [{id: 'bg', type: 'background', paint: {'background-color': '#e8eef4'}},
-               {id: 'osm', type: 'raster', source: 'osm'},
-               {id: 'gsi', type: 'raster', source: 'gsi'}]},
-    center: [139.7, 35.68], zoom: 9,
-    attributionControl: {compact: true}
-  });
-  mini.addControl(new maplibregl.NavigationControl({showCompass: false}), 'top-right');
-  mini.on('click', e => {
-    picked = {lat: +e.lngLat.lat.toFixed(6), lon: +e.lngLat.lng.toFixed(6)};
-    if(!miniMarker) miniMarker = new maplibregl.Marker({color: '#00e5ff'});
-    miniMarker.setLngLat([picked.lon, picked.lat]).addTo(mini);
-    $('#m-pick').textContent = picked.lat.toFixed(5) + ', ' + picked.lon.toFixed(5);
-    $('#m-save').disabled = false;
-  });
-  return mini;
-}
-/* ==== 6b) 地名検索（地図を近くまで移動するショートカット。位置はここでは確定しない） ====
-   国内は地理院、0件なら海外を含めてOpenStreetMap（Nominatim）で引く（サーバー側で切替）。
-   候補クリック後も既存の「地図クリック→SAVE」フローは維持する。検索結果の代表点は
-   住所の代表座標であり実際の撮影地点とは限らないため、自動確定はしない */
-function clearGeocodeResults(){
-  const box = $('#m-results');
-  box.textContent = '';
-  box.classList.add('hidden');
-}
-function doGeocodeSearch(){
-  const q = $('#m-q').value.trim();
-  clearGeocodeResults();
-  if(!q) return;
-  fetch('/api/admin/geocode?q=' + encodeURIComponent(q))
-    .then(r => r.json()).then(d => {
-      const box = $('#m-results');
-      box.classList.remove('hidden');
-      if(!d.ok || !d.items.length){
-        box.appendChild(el('div', 'm-noresult',
-          '見つかりませんでした（海外は「Times Square」のように地名だけで検索してください）'));
-        return;
-      }
-      d.items.forEach(item => {
-        const row = el('div', 'm-result', item.title);
-        row.addEventListener('click', () => {
-          ensureMini().flyTo({center: [item.lon, item.lat], zoom: 14});
-          clearGeocodeResults();
-        });
-        box.appendChild(row);
-      });
-      // 海外の候補はOpenStreetMap（Nominatim）由来。ODbLの出典表示が要る
-      if(d.items.some(item => item.source === 'osm')){
-        const credit = el('div', 'm-noresult');
-        credit.innerHTML = '地名データ ' + TILE_ATTRIB_OSM;
-        box.appendChild(credit);
-      }
-    }).catch(e => toast('検索失敗: ' + e.message, true));
-}
-
-/* ==== 6c) AIの撮影地候補（ai/location_suggest.rs）。候補の場所へ地図を動かすだけで、確定はしない ====
-   地名・根拠はモデルの出力なので必ず textContent で入れる（innerHTMLに渡さない） */
-const PRECISION_LABEL = {landmark: '建物・施設', district: '地区', city: '市区町村',
-                         region: '都道府県・州', country: '国', unknown: '不明'};
-const PRECISION_ZOOM = {landmark: 16, district: 14, city: 11, region: 7, country: 5};
-function suggestCenter(sg){
-  if(!sg || sg.lat === null || sg.lat === undefined || !PRECISION_ZOOM[sg.precision]) return null;
-  return {center: [sg.lon, sg.lat], zoom: PRECISION_ZOOM[sg.precision]};
-}
-function renderSuggest(it){
-  const box = $('#m-suggest');
-  box.textContent = '';
-  const sg = it.suggest;
-  const hasLoc = (it.lat !== null && it.lat !== undefined);
-  box.classList.toggle('hidden', !sg || hasLoc);
-  if(!sg || hasLoc) return;
-  const row = el('div', 'row');
-  row.appendChild(el('span', 'lbl', 'AI候補'));
-  row.appendChild(el('span', 'place', sg.place_name));
-  row.appendChild(el('span', 'meta',
-    '細かさ: ' + (PRECISION_LABEL[sg.precision] || sg.precision) +
-    (sg.scope === 'day' ? '（同じ日の写真から推定）' : '（この写真から推定）') +
-    (sg.scope === 'photo' && sg.day_place_name && sg.day_place_name !== sg.place_name
-       ? ' / この日: ' + sg.day_place_name : '')));
-  const go = suggestCenter(sg);
-  if(go){
-    const btn = el('button', 'btn', '候補へ移動');
-    btn.addEventListener('click', () => ensureMini().flyTo(go));
-    row.appendChild(btn);
-  }
-  box.appendChild(row);
-  if(sg.evidence && sg.evidence.length){
-    box.appendChild(el('div', 'note', '根拠（同じ日の写真をAIに見せたときの説明。「写真N」はそのとき送った写真の番号）'));
-    const ul = el('ul');
-    sg.evidence.slice(0, 6).forEach(e => ul.appendChild(el('li', null, e)));
-    box.appendChild(ul);
-  }
-  box.appendChild(el('div', 'note',
-    (go ? '地図上の点は地名の代表点で、撮影地点ではありません。' : '地図上の位置は特定できませんでした。') +
-    ' 確認して地図をクリックし、SAVEで確定してください（' + sg.model + '）'));
-}
-
-function openLocModal(it){
-  curPhoto = it; picked = null;
-  $('#m-q').value = '';
-  clearGeocodeResults();
-  renderSuggest(it);
-  $('#m-title').textContent = '#' + it.id + '  ' + it.name +
-                              (it.taken_at ? '  /  ' + it.taken_at : '');
-  $('#m-pick').textContent = '';
-  $('#m-save').disabled = true;
-  $('#m-hint').textContent = it.hint && it.hint.label
-    ? ('参考: 近い時刻の写真は「' + it.hint.label + '」付近（' +
-       fmtDur(it.hint.dt_s) + '差）')
-    : '地図をクリックして位置を指定してください';
-  $('#modal').classList.remove('hidden');
-  const m = ensureMini();
-  // 非表示状態で生成されると寸法が0になるため、表示直後にresizeする
-  setTimeout(() => {
-    m.resize();
-    if(miniMarker){ miniMarker.remove(); miniMarker = null; }
-    const c = (it.lat !== null && it.lat !== undefined) ? [it.lon, it.lat]
-            : (it.hint ? [it.hint.lon, it.hint.lat] : null);
-    const sgo = suggestCenter(it.suggest);
-    if(suggestMarker){ suggestMarker.remove(); suggestMarker = null; }
-    if(sgo && !(it.lat !== null && it.lat !== undefined)){
-      suggestMarker = new maplibregl.Marker({color: '#ffb300'}).setLngLat(sgo.center).addTo(m);
-      suggestMarker.getElement().title = 'AI候補: ' + it.suggest.place_name + '（代表点）';
-    }
-    if(c) m.jumpTo({center: c, zoom: 11});
-    else if(sgo) m.jumpTo(sgo);       // 近い時刻の写真が無ければAI候補の場所から始める
-  }, 30);
-}
-function closeLocModal(){ $('#modal').classList.add('hidden'); curPhoto = null; }
-function saveLoc(){
-  if(!curPhoto || !picked) return;
-  $('#m-save').disabled = true;
-  postJSON('/api/admin/setloc', {id: curPhoto.id, lat: picked.lat, lon: picked.lon})
-    .then(() => {
-      toast('#' + curPhoto.id + ' の位置を設定しました');
-      closeLocModal();
-      loadList();
-      loadFilterCounts();         // 位置なしの件数（チップ）が変わる
-    })
-    .catch(e => { toast('位置の保存に失敗: ' + e.message, true); $('#m-save').disabled = false; });
-}
-
-/* ==== 9) 起動 ==== */
+/* ==== 4) 起動 ==== */
+/* 写真タブ（photos.js）は initPhotos() でイベントを結ぶ。photos.js は admin.js の後に読み込まれるが、
+   boot() が呼ばれる時点（DOMContentLoaded）では両方とも定義済み */
 function boot(){
   document.querySelectorAll('nav .tab').forEach(b =>
     b.addEventListener('click', () => showTab(b.dataset.tab)));
-  document.querySelectorAll('.chip').forEach(b =>
-    b.addEventListener('click', () => setFilter(b.dataset.filter)));
-  $('#prev').addEventListener('click', () => { if(curPage > 1){ curPage--; loadList(); } });
-  $('#next').addEventListener('click', () => { curPage++; loadList(); });
-  $('#m-close').addEventListener('click', closeLocModal);
-  $('#m-save').addEventListener('click', saveLoc);
-  $('#m-search').addEventListener('click', doGeocodeSearch);
-  $('#m-q').addEventListener('keydown', e => {
-    if(e.key === 'Enter'){ e.preventDefault(); doGeocodeSearch(); }
-  });
-  $('#modal').addEventListener('click', e => { if(e.target.id === 'modal') closeLocModal(); });
-  document.addEventListener('keydown', e => {
-    if(e.key === 'Escape' && !$('#modal').classList.contains('hidden')) closeLocModal();
-  });
-  showTab(initialTab());
+  initPhotos();
+  const tab = initialTab();
+  showTab(tab);
   setInterval(() => { if(!$('#v-status').classList.contains('hidden')) loadStatus(); }, 30000);
+  if(tab === 'photos') $('#q').focus();     // /ai-search で開いたときは検索欄から始める
 }
 document.addEventListener('DOMContentLoaded', boot);
