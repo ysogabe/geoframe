@@ -13,7 +13,8 @@
    entries は今見えている写真の平らな配列（一覧は 1 枚 1 件、検索は場面の順）。ビューアはこれを前後に動く。
    cards は entries と同じ添字のカードの要素 */
 const ps = {filter: 'all', page: 1, view: 'list', query: '', includeHidden: false,
-            mode: 'recommended', entries: [], cards: []};
+            mode: 'recommended', entries: [], cards: [],
+            pending: null};   // 応答待ちの検索 {query, seq}。query は成功した検索の語（ps.query）とは別
 
 const SRC_LABEL = {exif: 'EXIF', drive_meta: 'DRIVE', inferred: '推定', manual: '手動'};
 const SUBJECT_LABELS = {person: '人物', dog: '犬', cat: '猫', person_and_pet: '人物＋ペット',
@@ -422,9 +423,15 @@ function renderSearch(data){
 /* 検索（検索ボタン・Enter）と「AI おすすめ」（q が空）。成功したときだけ view='search' にする。
    失敗は view・filter・page を変えず、#search-note に理由を出す。古い応答（searchSeq が違う）は捨てる */
 let searchSeq = 0;
+const MAX_QUERY_CHARS = 300;      // API（crates/geoframe/src/ai/query.rs）はコードポイント数で数える
 function search(q){
   q = String(q === undefined ? $('#q').value : q).trim();
+  if([...q].length > MAX_QUERY_CHARS){
+    setNote('検索語は ' + MAX_QUERY_CHARS + ' 文字以内で入力してください', 'err');
+    return;
+  }
   const seq = ++searchSeq;
+  ps.pending = {query: q, seq};
   ps.includeHidden = !!$('#include-hidden').checked;
   setNote(q ? '検索しています…' : 'おすすめを読み込んでいます…', 'busy');
   const url = '/api/ai/search?q=' + encodeURIComponent(q) + '&groups=12' +
@@ -434,6 +441,7 @@ function search(q){
                              () => ({status: r.status, ok: r.ok, data: {}})))
     .then(res => {
       if(seq !== searchSeq) return;
+      ps.pending = null;
       if(!res.ok || !res.data.ok){
         setNote(searchErrorText(res.status, res.data.error), 'err');
         return;
@@ -448,7 +456,15 @@ function search(q){
       setNote([(q ? '「' + q + '」' : 'おすすめ') + ' ' + (res.data.searched_photos || 0) + '枚を検索 / ' +
                returned + '枚 → ' + clusters + '構図', indexNote].filter(Boolean).join(' / '), 'result');
     })
-    .catch(e => { if(seq === searchSeq) setNote(searchErrorText(0, e.message), 'err'); });
+    .catch(e => { if(seq === searchSeq){ ps.pending = null; setNote(searchErrorText(0, e.message), 'err'); } });
+}
+/* 「除外も検索」を切り替えたとき: 応答待ちの検索があればその語で、無ければ表示中の検索結果の語で検索し直す。
+   一覧を見ていて応答待ちも無ければ何もしない。応答待ちの印は searchSeq を進める操作（一覧へ戻す等）で無効になる */
+function researchWithToggle(){
+  ps.includeHidden = !!$('#include-hidden').checked;
+  const pending = ps.pending && ps.pending.seq === searchSeq ? ps.pending : null;
+  if(pending) search(pending.query);
+  else if(ps.view === 'search') search(ps.query);
 }
 /* 「✕ 検索を閉じる」: 一覧へ戻し、直前の filter・page で読み直す */
 function closeSearch(){
@@ -764,6 +780,8 @@ function openLocModal(photo){
   }, 30);
 }
 function closeLocModal(){ $('#modal').classList.add('hidden'); curPhoto = null; }
+/* 写真タブを離れるとき（admin.js の showTab から）: ビューアと位置モーダルを閉じる */
+function closePhotoOverlays(){ closeModal(); closeLocModal(); }
 /* 保存すると、同じ id の全カード（一覧・検索結果）の 1 行目が座標（サーバーは地名を空に戻す）、
    タグが「手動」になる。一覧のときは読み直す（位置なしのフィルタから外れるため） */
 function saveLoc(){
@@ -797,10 +815,7 @@ function initPhotos(){
     // 日本語入力の変換を確定する Enter では検索しない
     if(e.key === 'Enter' && !e.isComposing && e.keyCode !== 229){ e.preventDefault(); search($('#q').value); }
   });
-  $('#include-hidden').addEventListener('change', () => {
-    ps.includeHidden = !!$('#include-hidden').checked;
-    if(ps.view === 'search') search(ps.query);
-  });
+  $('#include-hidden').addEventListener('change', researchWithToggle);
   $('#close-search').addEventListener('click', closeSearch);
 
   $('#m-close').addEventListener('click', closeLocModal);

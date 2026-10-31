@@ -212,7 +212,8 @@ await test('admin.html と fakedom の骨格（id・タブ・チップ）が一�
   });
   assert.ok(!/href="[^"]*blog-admin/.test(html), '旅行ブログのリンクが無い');
   // 検索バー・ビューア・読み込み順
-  assert.ok(/<input type="text" id="q" maxlength="300"/.test(html), '検索語は 300 文字まで');
+  assert.ok(/<input type="text" id="q"/.test(html) && !/id="q"[^>]*maxlength/.test(html),
+    '#q に maxlength は付けない（UTF-16 単位で API のコードポイント数とずれる。長さは search() で数える）');
   assert.ok(html.includes('id="viewer"') && !html.includes('photo-modal'), 'ビューアは #viewer');
   assert.ok(html.includes('href="/ai-search"'), '/ai-search へのリンクは残す（T6 で外す）');
   const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map(m => m[1]).filter(u => u.startsWith('/static/'));
@@ -1175,6 +1176,108 @@ await test('(m2) 飛んでいる検索と一覧が入れ違っても、あとか
   assert.deepEqual(env2.ev('ps.entries.map(e => e.photo.id)'), [101, 102, 103, 201, 202]);
   assert.equal(cards(env2).length, 0, '隠れた #cards にも描かない');
   assert.equal(hidden(env2, '#empty'), true);
+});
+
+await test('(v) 検索の応答待ちに「除外も検索」を切り替えると、要求中の語で include_hidden=1 を付けて検索し直す。古い応答は捨てる', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  await openPhotos(env);
+  await searchFor(env, '犬');                                // 「犬」の結果を表示中
+  env.handlers.search = (url) => new Promise(resolve => env.heldSearch.push(() => {
+    const q = new URLSearchParams(url.split('?')[1]).get('q');
+    resolve({ok: true, status: 200, json: () => Promise.resolve(searchBody(q, [G1]))});
+  }));
+  await searchFor(env, '猫');                                // 応答前
+  assert.equal(env.ev('ps.query'), '犬', '成功時にしか ps.query は変わらない');
+  env.$('#include-hidden').checked = true;
+  env.$('#include-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(env.heldSearch.length, 2);
+  assert.equal(env.searchCalls().at(-1).url, '/api/ai/search?q=' + encodeURIComponent('猫') + '&groups=12&include_hidden=1');
+  env.heldSearch[0]();                                       // 古い「猫」（除外なし）が遅れて届いても捨てる
+  await settle();
+  assert.equal(env.ev('ps.query'), '犬');
+  env.heldSearch[1]();
+  await settle();
+  assert.equal(env.ev('ps.query'), '猫');
+  assert.equal(env.ev('ps.pending'), null);
+  // 応答が済んだら、表示中の語（ps.query）で検索し直す
+  env.$('#include-hidden').checked = false;
+  env.$('#include-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(env.searchCalls().at(-1).url, '/api/ai/search?q=' + encodeURIComponent('猫') + '&groups=12');
+});
+
+await test('(v2) 初回検索（一覧を見ている）の応答前に切り替えても、チェックに合う要求の結果が表示される。要求が無ければ何もしない', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  await openPhotos(env);
+  const n0 = env.searchCalls().length;
+  env.$('#include-hidden').checked = true;                   // 一覧で、要求中の検索も無い → 何もしない
+  env.$('#include-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(env.searchCalls().length, n0);
+  env.$('#include-hidden').checked = false;
+  env.$('#include-hidden').dispatchEvent({type: 'change'});
+  env.handlers.search = (url) => new Promise(resolve => env.heldSearch.push(() => {
+    const q = new URLSearchParams(url.split('?')[1]).get('q');
+    const inc = new URLSearchParams(url.split('?')[1]).get('include_hidden') === '1';
+    resolve({ok: true, status: 200, json: () => Promise.resolve({...searchBody(q, inc ? [G1, G2] : [G2]), include_hidden: inc})});
+  }));
+  await searchFor(env, '犬');                                // 初回検索（応答前）
+  assert.equal(env.ev('ps.view'), 'list');
+  env.$('#include-hidden').checked = true;
+  env.$('#include-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(env.searchCalls().length, n0 + 2);
+  assert.equal(env.searchCalls().at(-1).url, '/api/ai/search?q=' + encodeURIComponent('犬') + '&groups=12&include_hidden=1');
+  env.heldSearch[0]();                                       // 除外なしの古い応答は捨てる
+  await settle();
+  assert.equal(env.ev('ps.view'), 'list');
+  env.heldSearch[1]();
+  await settle();
+  assert.equal(env.ev('ps.view'), 'search');
+  assert.equal(env.document.querySelectorAll('#groups section.ps-group').length, 2, 'チェックどおり除外も含む結果');
+});
+
+await test('(w) 写真タブを離れると、ビューアと位置モーダルが閉じ、背景のスクロール禁止も外れる', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  await openPhotos(env);
+  await searchFor(env, '犬');
+  gcards(env)[1].querySelector('.ph').click();
+  assert.equal(hidden(env, '#viewer'), false);
+  assert.ok(env.document.body.classList.contains('ps-viewer-open'));
+  env.$('.tab[data-tab=status]').click();
+  await settle();
+  assert.equal(hidden(env, '#viewer'), true);
+  assert.ok(!env.document.body.classList.contains('ps-viewer-open'));
+  assert.equal(env.ev('viewerIndex'), -1);
+  env.timers.immediate = true;
+  await openPhotos(env);
+  gcards(env)[2].querySelector('.setloc').click();
+  assert.equal(hidden(env, '#modal'), false);
+  env.$('.tab[data-tab=status]').click();
+  await settle();
+  assert.equal(hidden(env, '#modal'), true);
+});
+
+await test('(x) 検索語の長さはコードポイントで数える: 日本語 300 は送る、絵文字を含む 301 は送らない、UTF-16 で 301 でも 300 なら送る', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  await openPhotos(env);
+  const n0 = env.searchCalls().length;
+  await searchFor(env, 'あ'.repeat(300));
+  assert.equal(env.searchCalls().length, n0 + 1);
+  await searchFor(env, 'あ'.repeat(299) + '😀' + 'い');       // コードポイント 301
+  assert.equal(env.searchCalls().length, n0 + 1, '301 は送らない');
+  assert.equal(note(env), '検索語は 300 文字以内で入力してください');
+  assert.ok(env.$('#search-note').classList.contains('err'));
+  const q300 = 'あ'.repeat(299) + '😀';                        // UTF-16 で 301、コードポイントで 300
+  assert.equal(q300.length, 301);
+  await searchFor(env, q300);
+  assert.equal(env.searchCalls().length, n0 + 2);
+  assert.equal(query(env.searchCalls().at(-1).url).get('q'), q300);
 });
 
 console.log(`ok (${n})`);

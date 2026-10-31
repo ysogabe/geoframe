@@ -66,7 +66,10 @@ function showTab(name){
     b.classList.toggle('on', b.dataset.tab === tab));
   $('#v-status').classList.toggle('hidden', tab !== 'status');
   $('#v-photos').classList.toggle('hidden', tab !== 'photos');
-  if(tab === 'status'){ loadStatus(); return; }
+  if(tab === 'status'){
+    if(typeof closePhotoOverlays === 'function') closePhotoOverlays();   // photos.js: ビューアと位置モーダルを閉じる
+    loadStatus(); return;
+  }
   openPhotosTab();            // photos.js: 件数・索引の枚数・一覧（検索結果を見ていたときはそのまま）
 }
 
