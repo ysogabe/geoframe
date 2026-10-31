@@ -71,7 +71,9 @@ const CONFIG_TASK = {
 const CONFIG_NOTE =
   '読み取り専用です（この画面から設定は変えられません）。起動時に読み込んだ設定を、出どころつきで全項目そのまま出します。' +
   '鍵のパス・接続先・連絡先・project などが含まれるので、この画面を共有（スクリーンショットや画面共有）しないでください。' +
-  '鍵ファイルの中身は出ません。';
+  '鍵ファイルの中身は出ません。' +
+  '設定を変えるには、環境ファイル（systemd の EnvironmentFile。本番は /etc/default/geoframe-rs と /etc/default/geoframe）と' +
+  ' AI 設定 JSON（GEOFRAME_AI_CONFIG）を編集して、サービスを再起動してください。';
 
 const NONE_TEXT = '（未設定）';
 let configSeq = 0;      // 要求番号。古い応答は捨てる

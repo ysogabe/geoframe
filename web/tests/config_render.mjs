@@ -132,7 +132,12 @@ const rowOf = (env, key) => {
 let n = 0;
 async function test(name, fn){ await fn(); n++; console.log('ok - ' + name); }
 
-await test('合成の応答は EnvItem::ALL の 35 項目', () => {
+await test('合成の応答は EnvItem::ALL の 35 項目で、config.js の CONFIG_ITEMS と過不足なく一致する', () => {
+  const ctx = vm.createContext({document: buildAdminDom(), console});
+  loadScripts(ctx);
+  const keys = vm.runInContext('CONFIG_ITEMS.map(m => m.key)', ctx);
+  assert.equal(new Set(keys).size, keys.length, 'CONFIG_ITEMS の key は重複しない');
+  assert.deepEqual([...keys].sort(), [...ALL_KEYS].sort());
   assert.equal(configBody().items.length, 35);
   assert.equal(new Set(ALL_KEYS).size, 35);
 });
@@ -205,6 +210,7 @@ await test('(b) 案内文は読み取り専用と、画面を共有しないこ�
   assert.ok(note.includes('読み取り専用'));
   assert.ok(note.includes('画面を共有'), note);
   assert.ok(note.includes('鍵のパス') && note.includes('接続先') && note.includes('連絡先'));
+  assert.ok(note.includes('編集して') && note.includes('再起動'), note);
   assert.ok(!note.includes('設定を読めませんでした'));
   // 凡例: 出どころ 4 種
   const legend = env.document.querySelectorAll('#c-legend span.src');
@@ -218,7 +224,10 @@ await test('(c) items の 35 項目すべての key と value が画面に出る
   for(const key of ALL_KEYS){
     assert.ok(body.includes(key), key);
     const v = VALUES[key];
-    if(v !== null) assert.ok(rowOf(env, key).textContent.includes(v), key + ' の値 ' + v);
+    const cell = rowOf(env, key).children.filter(td => td.className === 'v')[0];
+    assert.ok(cell, key + ' の値セル');
+    const unit = vm.runInContext('CONFIG_META.get(' + JSON.stringify(key) + ').unit', env.context);
+    assert.equal(cell.textContent, v === null ? '（未設定）' : v + unit, key + ' の値セル');
   }
   const plans = rowOf(env, 'GEOFRAME_BLOG_PLANS_DIR');
   assert.ok(plans.textContent.includes('（未設定）'));
