@@ -330,6 +330,30 @@ fn every_variable_the_code_reads_is_documented() {
     assert!(problems.is_empty(), "\n{}", problems.join("\n"));
 }
 
+/// `config::EnvItem::ALL`（設定 API が全項目を出すための列挙）の名前の集合は、文書の「Rust が読む」の節の名前の
+/// 集合と同じ。名前を足して `ALL` に入れ忘れる（または文書だけ足す）と落ちる。
+#[test]
+fn the_env_item_list_matches_the_documented_names() {
+    let doc =
+        std::fs::read_to_string(workspace_root().join("docs/reference/configuration.md")).unwrap();
+    let documented_names = documented(&doc, SECTION_RUST);
+    let listed: BTreeSet<String> = geoframe::config::EnvItem::ALL
+        .iter()
+        .map(|item| item.name().to_string())
+        .collect();
+    assert_eq!(
+        geoframe::config::EnvItem::ALL.len(),
+        listed.len(),
+        "EnvItem::ALL に名前の重複がある"
+    );
+    let missing: Vec<_> = documented_names.difference(&listed).collect();
+    let extra: Vec<_> = listed.difference(&documented_names).collect();
+    assert!(
+        missing.is_empty() && extra.is_empty(),
+        "文書にあるが EnvItem::ALL に無い: {missing:?} / EnvItem::ALL にあるが文書に無い: {extra:?}"
+    );
+}
+
 #[test]
 fn name_scanner_reads_only_complete_quoted_names() {
     let mut out = BTreeSet::new();

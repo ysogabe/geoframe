@@ -47,11 +47,16 @@
 //! 設定が持つのは**鍵ファイルのパスだけ**で、中身は設定の型に載せない。`Config` の `Debug`・起動
 //! ログ（[`Config::log_summary`]）に出すのは下に挙げた項目だけで、秘密になりうる値が増えたら
 //! この一覧に足さない限りログへ出ない作りにしてある。
+//!
+//! 例外は `GET /api/admin/config`（管理画面の設定タブ。`admin_config.rs`）だけで、ユーザーの決定（2026-10-30）で
+//! 鍵のパス・接続先・連絡先を含む全項目を**設定どおりの値**で出す（鍵の**中身**は `Config` が持たないので出ない）。
+//! ログ・`ai-jobs status` は今までどおり出さない。出どころは [`Config::sources`]、項目の列挙は [`EnvItem`]。
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use crate::ai::settings::AiConfig;
 
@@ -108,6 +113,17 @@ impl LogLevel {
         }
     }
 
+    /// 設定に書く小文字の名前（`GEOFRAME_LOG` の値）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+
     pub fn as_tracing(self) -> tracing::Level {
         match self {
             Self::Error => tracing::Level::ERROR,
@@ -127,6 +143,14 @@ pub enum EmbedBackend {
 }
 
 impl EmbedBackend {
+    /// 設定に書く小文字の名前（`GEOFRAME_EMBED_BACKEND` の値）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Gemini => "gemini",
+            Self::Local => "local",
+        }
+    }
+
     /// `photo_ai_features.embedding_model` に入るモデル名（現行の `ai_search.EMBED_MODEL`）。
     pub fn model(self) -> &'static str {
         match self {
@@ -141,6 +165,189 @@ impl EmbedBackend {
 pub struct Overrides {
     pub listen: Option<SocketAddr>,
     pub data_dir: Option<PathBuf>,
+}
+
+/// 設定値の出どころ（`GET /api/admin/config` の `source`）。AI 設定 JSON 由来の値は API が別に `ai_config` と書く。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Source {
+    /// 起動引数（`--listen`・`--data-dir`）。
+    Arg,
+    /// 環境変数。
+    Env,
+    /// 既定値（環境変数が未設定か空）。
+    Default,
+}
+
+/// 設定 API での出し方。2026-10-30 のユーザーの決定で、どの項目も**値**を出す（`docs/admin-rework/design.md` の「安全面」）。
+/// `File` は値（パス）に加えてファイルの有無も出す項目。ログ・`ai-jobs status` は今までどおり値を出さない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Exposure {
+    Value,
+    /// 値（パス）に加えて、ファイルの有無（`state`）を出す。
+    File,
+}
+
+/// Rust が読む環境変数を 1 つ 1 つ列挙したもの（`docs/reference/configuration.md` の「Rust が読む環境変数」と同じ集合。
+/// `tests/env_reference.rs` が名前を照合する）。[`EnvItem::name`]・[`EnvItem::exposure`] と、設定 API の値の組み立て
+/// （`admin_config.rs`）は**ワイルドカード無しの `match`** なので、項目を足して枝を書き忘れるとコンパイルで落ちる。
+/// [`EnvItem::ALL`] への入れ忘れだけは、`config.rs` と `env_reference.rs` の試験が捕まえる。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EnvItem {
+    DataDir,
+    Host,
+    Port,
+    AllowedHosts,
+    Log,
+    Blog,
+    Ingest,
+    DrivePollMin,
+    PhotosDir,
+    FetchPerCycle,
+    QualityPerCycle,
+    DriveKey,
+    DriveFolder,
+    BlogPlansDir,
+    InferMin,
+    InferOffsetMin,
+    TileUa,
+    TileCacheMaxMb,
+    TileFetchPerMin,
+    AiConfig,
+    AiEnabled,
+    AiPollS,
+    AiBacklogPollS,
+    AiEmbedPerCycle,
+    AiJudgePerCycle,
+    AiSearchPerMin,
+    LocSuggest,
+    LocSuggestCluePerCycle,
+    LocSuggestGeminiPerCycle,
+    EmbedBackend,
+    AiTimeWindowMin,
+    AiSimilarity,
+    AiShortlistMax,
+    AiVisualSimilarity,
+    RankModel,
+}
+
+impl EnvItem {
+    /// 全項目（設定リファレンスの並び）。
+    pub const ALL: &'static [EnvItem] = &[
+        EnvItem::DataDir,
+        EnvItem::Host,
+        EnvItem::Port,
+        EnvItem::AllowedHosts,
+        EnvItem::Log,
+        EnvItem::Blog,
+        EnvItem::Ingest,
+        EnvItem::DrivePollMin,
+        EnvItem::PhotosDir,
+        EnvItem::FetchPerCycle,
+        EnvItem::QualityPerCycle,
+        EnvItem::DriveKey,
+        EnvItem::DriveFolder,
+        EnvItem::BlogPlansDir,
+        EnvItem::InferMin,
+        EnvItem::InferOffsetMin,
+        EnvItem::TileUa,
+        EnvItem::TileCacheMaxMb,
+        EnvItem::TileFetchPerMin,
+        EnvItem::AiConfig,
+        EnvItem::AiEnabled,
+        EnvItem::AiPollS,
+        EnvItem::AiBacklogPollS,
+        EnvItem::AiEmbedPerCycle,
+        EnvItem::AiJudgePerCycle,
+        EnvItem::AiSearchPerMin,
+        EnvItem::LocSuggest,
+        EnvItem::LocSuggestCluePerCycle,
+        EnvItem::LocSuggestGeminiPerCycle,
+        EnvItem::EmbedBackend,
+        EnvItem::AiTimeWindowMin,
+        EnvItem::AiSimilarity,
+        EnvItem::AiShortlistMax,
+        EnvItem::AiVisualSimilarity,
+        EnvItem::RankModel,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            EnvItem::DataDir => "GEOFRAME_DATA_DIR",
+            EnvItem::Host => "GEOFRAME_HOST",
+            EnvItem::Port => "GEOFRAME_PORT",
+            EnvItem::AllowedHosts => "GEOFRAME_ALLOWED_HOSTS",
+            EnvItem::Log => "GEOFRAME_LOG",
+            EnvItem::Blog => "GEOFRAME_BLOG",
+            EnvItem::Ingest => "GEOFRAME_INGEST",
+            EnvItem::DrivePollMin => "GEOFRAME_DRIVE_POLL_MIN",
+            EnvItem::PhotosDir => "GEOFRAME_PHOTOS_DIR",
+            EnvItem::FetchPerCycle => "GEOFRAME_FETCH_PER_CYCLE",
+            EnvItem::QualityPerCycle => "GEOFRAME_QUALITY_PER_CYCLE",
+            EnvItem::DriveKey => "GEOFRAME_DRIVE_KEY",
+            EnvItem::DriveFolder => "GEOFRAME_DRIVE_FOLDER",
+            EnvItem::BlogPlansDir => "GEOFRAME_BLOG_PLANS_DIR",
+            EnvItem::InferMin => "GEOFRAME_INFER_MIN",
+            EnvItem::InferOffsetMin => "GEOFRAME_INFER_OFFSET_MIN",
+            EnvItem::TileUa => "GEOFRAME_TILE_UA",
+            EnvItem::TileCacheMaxMb => "GEOFRAME_TILE_CACHE_MAX_MB",
+            EnvItem::TileFetchPerMin => "GEOFRAME_TILE_FETCH_PER_MIN",
+            EnvItem::AiConfig => "GEOFRAME_AI_CONFIG",
+            EnvItem::AiEnabled => "GEOFRAME_AI_ENABLED",
+            EnvItem::AiPollS => "GEOFRAME_AI_POLL_S",
+            EnvItem::AiBacklogPollS => "GEOFRAME_AI_BACKLOG_POLL_S",
+            EnvItem::AiEmbedPerCycle => "GEOFRAME_AI_EMBED_PER_CYCLE",
+            EnvItem::AiJudgePerCycle => "GEOFRAME_AI_JUDGE_PER_CYCLE",
+            EnvItem::AiSearchPerMin => "GEOFRAME_AI_SEARCH_PER_MIN",
+            EnvItem::LocSuggest => "GEOFRAME_LOC_SUGGEST",
+            EnvItem::LocSuggestCluePerCycle => "GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE",
+            EnvItem::LocSuggestGeminiPerCycle => "GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE",
+            EnvItem::EmbedBackend => "GEOFRAME_EMBED_BACKEND",
+            EnvItem::AiTimeWindowMin => "GEOFRAME_AI_TIME_WINDOW_MIN",
+            EnvItem::AiSimilarity => "GEOFRAME_AI_SIMILARITY",
+            EnvItem::AiShortlistMax => "GEOFRAME_AI_SHORTLIST_MAX",
+            EnvItem::AiVisualSimilarity => "GEOFRAME_AI_VISUAL_SIMILARITY",
+            EnvItem::RankModel => "GEOFRAME_RANK_MODEL",
+        }
+    }
+
+    pub fn exposure(self) -> Exposure {
+        match self {
+            EnvItem::DriveKey | EnvItem::RankModel | EnvItem::AiConfig => Exposure::File,
+            EnvItem::DataDir
+            | EnvItem::Host
+            | EnvItem::Port
+            | EnvItem::AllowedHosts
+            | EnvItem::Log
+            | EnvItem::Blog
+            | EnvItem::Ingest
+            | EnvItem::DrivePollMin
+            | EnvItem::PhotosDir
+            | EnvItem::FetchPerCycle
+            | EnvItem::QualityPerCycle
+            | EnvItem::DriveFolder
+            | EnvItem::BlogPlansDir
+            | EnvItem::InferMin
+            | EnvItem::InferOffsetMin
+            | EnvItem::TileUa
+            | EnvItem::TileCacheMaxMb
+            | EnvItem::TileFetchPerMin
+            | EnvItem::AiEnabled
+            | EnvItem::AiPollS
+            | EnvItem::AiBacklogPollS
+            | EnvItem::AiEmbedPerCycle
+            | EnvItem::AiJudgePerCycle
+            | EnvItem::AiSearchPerMin
+            | EnvItem::LocSuggest
+            | EnvItem::LocSuggestCluePerCycle
+            | EnvItem::LocSuggestGeminiPerCycle
+            | EnvItem::EmbedBackend
+            | EnvItem::AiTimeWindowMin
+            | EnvItem::AiSimilarity
+            | EnvItem::AiShortlistMax
+            | EnvItem::AiVisualSimilarity => Exposure::Value,
+        }
+    }
 }
 
 /// 設定の読み込みエラー。メッセージには設定値そのものを入れない（環境変数の名前と理由だけ）。
@@ -174,7 +381,8 @@ pub struct Config {
     pub infer_offset_min: f64,
     pub embed_backend: EmbedBackend,
     pub ai_visual_similarity: f64,
-    /// Optional validated linear rank file. Never included in diagnostics.
+    /// Optional validated linear rank file. Never included in diagnostics (logs, `Debug`). `GET /api/admin/config`
+    /// alone shows it as configured (user decision, 2026-10-30).
     pub rank_model_path: PathBuf,
     /// `GEOFRAME_EMBED_BACKEND` が `gemini`・`local` のどちらでもなかった（現行と同じく `gemini` に
     /// 落とした）。起動ログで知らせる。
@@ -182,7 +390,7 @@ pub struct Config {
     /// 地図タイルのキャッシュの上限（MB。0 以上）。`GEOFRAME_TILE_CACHE_MAX_MB`。
     pub tile_cache_max_mb: i64,
     /// 地図タイル・地名検索の上流へ送る User-Agent。`GEOFRAME_TILE_UA`（印字可能な ASCII だけ）。連絡先が入りうるので、
-    /// `Debug`・起動ログには載せない。
+    /// `Debug`・起動ログには載せない（`GET /api/admin/config` だけは、ユーザーの決定（2026-10-30）で設定どおりの値を出す）。
     pub tile_ua: String,
     /// 地図タイルの上流取得（キャッシュミス）の毎分の上限（全体。0 以上）。`GEOFRAME_TILE_FETCH_PER_MIN`。
     /// 0 なら上流へ行かない。
@@ -204,18 +412,28 @@ pub struct Config {
     /// `fetch_per_cycle`）。0 でも 1 枚は解析する（現行の `max(1, limit)`）。
     pub quality_per_cycle: u32,
     /// Drive のサービスアカウント鍵 JSON のパス（絶対パス）。`GEOFRAME_DRIVE_KEY`。**持つのはパスだけ**で、
-    /// 中身は [`crate::drive`] が段の中で読む（設定にも起動ログにも載せない）。
+    /// 中身は [`crate::drive`] が段の中で読む（設定にも起動ログにも載せない。パスは `GET /api/admin/config` だけが出す）。
     pub drive_key: PathBuf,
     /// 取り込む Drive のフォルダ。`GEOFRAME_DRIVE_FOLDER`（名前、または 20 字以上の英数字・`_`・`-` なら ID）。
-    /// 起動ログには載せない（フォルダ名は利用者の情報）。
+    /// 起動ログには載せない（フォルダ名は利用者の情報。`GET /api/admin/config` だけが設定どおりに出す）。
     pub drive_folder: String,
     /// 旅行ブログの旅程 JSON を読むディレクトリ（絶対パス）。`GEOFRAME_BLOG_PLANS_DIR`（Rust だけの項目）。
     /// `None` のときはバイナリに埋め込んだ `web/travel_blog/plans/*.json`（現行の `PLAN_DIR` と同じ内容）。
-    /// 旅程の中身は利用者の情報なので、パスもログの要約には載せない（埋め込みかディレクトリかだけ）。
+    /// 旅程の中身は利用者の情報なので、パスもログの要約には載せない（埋め込みかディレクトリかだけ。
+    /// `GET /api/admin/config` だけが設定どおりのパスを出す）。
     pub blog_plans_dir: Option<PathBuf>,
     /// AI の設定（T4.1b）。旧 `GEOFRAME_AI_*` の周期・上限・フラグと、任意の `GEOFRAME_AI_CONFIG`（JSON）。
-    /// **不正でも `Config` は作れる**（AI だけが無効で、種類のコードを持つ）。パス・JSON の中身は載せない。
+    /// **不正でも `Config` は作れる**（AI だけが無効で、種類のコードを持つ）。パス・JSON の中身はログ・`Debug` に載せない
+    /// （`GET /api/admin/config`（管理画面の設定タブ）だけは、ユーザーの決定（2026-10-30）で設定どおりの値を出す）。
     pub ai: AiConfig,
+    /// `GEOFRAME_AI_CONFIG` のパス（絶対パスにしたもの。未設定は `None`）。`GET /api/admin/config` が値として出す
+    /// （設定 API だけの例外。ログ・`Debug` には載せない）。
+    pub ai_config_path: Option<PathBuf>,
+    /// `GEOFRAME_AI_CONFIG` のファイルの更新時刻（起動時に控える。読めなければ `None`）。
+    pub ai_config_modified: Option<SystemTime>,
+    /// 各項目の出どころ（キーは [`EnvItem::name`]、[`EnvItem::ALL`] の全項目）。`load()` の流れとは独立に、最後に作る。
+    /// `Debug`・起動ログには載せない。
+    pub sources: BTreeMap<&'static str, Source>,
 }
 
 impl Config {
@@ -437,6 +655,14 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| data_dir.join("models/rank_model.json"));
+        let ai_config_path = get("GEOFRAME_AI_CONFIG").map(|raw| {
+            let raw = raw.trim();
+            std::path::absolute(raw).unwrap_or_else(|_| PathBuf::from(raw))
+        });
+        let ai_config_modified = ai_config_path
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).and_then(|m| m.modified()).ok());
+        let sources = sources_of(&lookup, overrides);
         Ok(Self {
             listen,
             data_dir,
@@ -462,12 +688,20 @@ impl Config {
             drive_folder,
             blog_plans_dir,
             ai,
+            ai_config_path,
+            ai_config_modified,
+            sources,
         })
     }
 
     /// ローカル写真の置き場（字句のパス。リンクは辿っていない）。現行の `DATA_DIR / GEOFRAME_PHOTOS_DIR`。
     pub fn photos_dir(&self) -> PathBuf {
         self.data_dir.join(&self.photos_dir_setting)
+    }
+
+    /// `GEOFRAME_PHOTOS_DIR` の値そのまま（`DATA_DIR` からの相対、または絶対。設定 API が値として出す）。
+    pub fn photos_dir_setting(&self) -> &std::path::Path {
+        &self.photos_dir_setting
     }
 
     /// 同期サイクルの間隔。
@@ -548,6 +782,34 @@ impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "Config({})", self.log_summary())
     }
+}
+
+/// 各項目の出どころ。`load()` の読み方とは独立に、[`EnvItem::ALL`] を回して作る: 起動引数があれば `Arg`
+/// （`--listen` は `HOST`・`PORT` の両方、`--data-dir` は `DATA_DIR`）、なければ環境変数が空でない（`load()` の
+/// `get` と同じく空白だけは未設定）なら `Env`、それ以外は `Default`。
+fn sources_of(
+    lookup: &impl Fn(&str) -> Option<String>,
+    overrides: &Overrides,
+) -> BTreeMap<&'static str, Source> {
+    EnvItem::ALL
+        .iter()
+        .map(|item| {
+            let name = item.name();
+            let from_arg = match item {
+                EnvItem::Host | EnvItem::Port => overrides.listen.is_some(),
+                EnvItem::DataDir => overrides.data_dir.is_some(),
+                _ => false,
+            };
+            let source = if from_arg {
+                Source::Arg
+            } else if lookup(name).is_some_and(|v| !v.trim().is_empty()) {
+                Source::Env
+            } else {
+                Source::Default
+            };
+            (name, source)
+        })
+        .collect()
 }
 
 /// `GEOFRAME_ALLOWED_HOSTS`（カンマ区切り）をホスト名の集合にする。
@@ -1080,5 +1342,160 @@ mod tests {
         // 許可ホスト名は件数だけ。名前そのものは出さない
         assert!(!text.contains("private-name"), "{text}");
         assert!(text.contains("allowed_hosts=2"), "{text}");
+    }
+
+    #[test]
+    fn every_item_is_listed_once_and_sources_cover_exactly_the_listed_items() {
+        let names: Vec<&str> = EnvItem::ALL.iter().map(|i| i.name()).collect();
+        let unique: BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(names.len(), unique.len(), "名前の重複: {names:?}");
+        assert_eq!(names.len(), 35);
+        assert!(names.iter().all(|n| n.starts_with("GEOFRAME_")));
+        let c = load(&[], &Overrides::default()).unwrap();
+        let keys: BTreeSet<&str> = c.sources.keys().copied().collect();
+        assert_eq!(keys, unique);
+        // 出し方: ファイルの有無も出すのは 3 項目だけ
+        let files: Vec<&str> = EnvItem::ALL
+            .iter()
+            .filter(|i| i.exposure() == Exposure::File)
+            .map(|i| i.name())
+            .collect();
+        assert_eq!(
+            files,
+            [
+                "GEOFRAME_DRIVE_KEY",
+                "GEOFRAME_AI_CONFIG",
+                "GEOFRAME_RANK_MODEL"
+            ]
+        );
+    }
+
+    #[test]
+    fn sources_are_default_arg_or_env() {
+        // 既定だけなら、全項目が既定
+        let c = load(&[], &Overrides::default()).unwrap();
+        assert!(c.sources.values().all(|s| *s == Source::Default));
+        assert_eq!(c.ai_config_path, None);
+        assert_eq!(c.ai_config_modified, None);
+        // 環境変数 1 つ（前後の空白があっても）だけが Env
+        let c = load(&[("GEOFRAME_INGEST", " 1 ")], &Overrides::default()).unwrap();
+        for (name, source) in &c.sources {
+            let expected = if *name == "GEOFRAME_INGEST" {
+                Source::Env
+            } else {
+                Source::Default
+            };
+            assert_eq!(*source, expected, "{name}");
+        }
+        // 空文字・空白だけは未設定と同じ（`get` と同じ判定。ALLOWED_HOSTS も）
+        let c = load(
+            &[
+                ("GEOFRAME_PORT", ""),
+                ("GEOFRAME_ALLOWED_HOSTS", "  "),
+                ("GEOFRAME_AI_POLL_S", " "),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert!(c.sources.values().all(|s| *s == Source::Default));
+        // AI の旧設定・ALLOWED_HOSTS・Rust だけの項目も Env と記録する
+        let c = load(
+            &[
+                ("GEOFRAME_ALLOWED_HOSTS", "a.example.test"),
+                ("GEOFRAME_AI_POLL_S", "45"),
+                ("GEOFRAME_BLOG", "1"),
+                ("GEOFRAME_RANK_MODEL", "/srv/g/rank.json"),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        for name in [
+            "GEOFRAME_ALLOWED_HOSTS",
+            "GEOFRAME_AI_POLL_S",
+            "GEOFRAME_BLOG",
+            "GEOFRAME_RANK_MODEL",
+        ] {
+            assert_eq!(c.sources[name], Source::Env, "{name}");
+        }
+        assert_eq!(c.sources["GEOFRAME_LOG"], Source::Default);
+    }
+
+    #[test]
+    fn command_line_arguments_are_recorded_as_arg_even_when_the_environment_is_set() {
+        let env = [
+            ("GEOFRAME_DATA_DIR", "/srv/from-env"),
+            ("GEOFRAME_HOST", "0.0.0.0"),
+            ("GEOFRAME_PORT", "8081"),
+        ];
+        let both = Overrides {
+            listen: Some("127.0.0.1:9000".parse().unwrap()),
+            data_dir: Some(PathBuf::from("/srv/from-cli")),
+        };
+        let c = load(&env, &both).unwrap();
+        for name in ["GEOFRAME_HOST", "GEOFRAME_PORT", "GEOFRAME_DATA_DIR"] {
+            assert_eq!(c.sources[name], Source::Arg, "{name}");
+        }
+        // 片方だけ: もう片方は環境変数
+        let listen_only = Overrides {
+            listen: both.listen,
+            data_dir: None,
+        };
+        let c = load(&env, &listen_only).unwrap();
+        assert_eq!(c.sources["GEOFRAME_HOST"], Source::Arg);
+        assert_eq!(c.sources["GEOFRAME_PORT"], Source::Arg);
+        assert_eq!(c.sources["GEOFRAME_DATA_DIR"], Source::Env);
+        let dir_only = Overrides {
+            listen: None,
+            data_dir: both.data_dir.clone(),
+        };
+        let c = load(&env, &dir_only).unwrap();
+        assert_eq!(c.sources["GEOFRAME_DATA_DIR"], Source::Arg);
+        assert_eq!(c.sources["GEOFRAME_HOST"], Source::Env);
+        assert_eq!(c.sources["GEOFRAME_PORT"], Source::Env);
+        // 引数があれば、不正な環境変数があっても読まない（出どころは Arg）
+        let c = load(&[("GEOFRAME_PORT", "abc")], &both).unwrap();
+        assert_eq!(c.sources["GEOFRAME_PORT"], Source::Arg);
+    }
+
+    #[test]
+    fn sources_are_made_even_when_the_ai_config_is_invalid_and_stay_out_of_the_log() {
+        let c = load(
+            &[
+                ("GEOFRAME_AI_CONFIG", "/nonexistent-dir/ai.json"),
+                ("GEOFRAME_AI_POLL_S", "bad"),
+            ],
+            &Overrides::default(),
+        )
+        .unwrap();
+        assert!(c.ai.invalid().is_some());
+        assert_eq!(c.sources.len(), EnvItem::ALL.len());
+        assert_eq!(c.sources["GEOFRAME_AI_CONFIG"], Source::Env);
+        assert_eq!(c.sources["GEOFRAME_AI_POLL_S"], Source::Env);
+        // パスは控えるが、読めないファイルの更新時刻は無い
+        assert_eq!(
+            c.ai_config_path,
+            Some(PathBuf::from("/nonexistent-dir/ai.json"))
+        );
+        assert_eq!(c.ai_config_modified, None);
+        // 出どころ・パスは Debug にも起動ログにも載せない
+        for text in [format!("{c:?}"), c.log_summary()] {
+            assert!(!text.contains("nonexistent-dir"), "{text}");
+            assert!(!text.contains("sources"), "{text}");
+        }
+    }
+
+    #[test]
+    fn the_ai_config_modification_time_is_taken_at_load() {
+        let dir = crate::testutil::TempDir::new("cfg-mtime");
+        let path = dir.path().join("ai.json");
+        std::fs::write(&path, br#"{"version":1}"#).unwrap();
+        let c = load(
+            &[("GEOFRAME_AI_CONFIG", path.to_str().unwrap())],
+            &Overrides::default(),
+        )
+        .unwrap();
+        let expected = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(c.ai_config_modified, Some(expected));
+        assert_eq!(c.ai_config_path.as_deref(), Some(path.as_path()));
     }
 }
