@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use rusqlite::Connection;
+use rusqlite::types::ValueRef;
 use serde_json::{Value, json};
 
 use super::http::Deadline;
 use super::query::Error;
 use super::search::QueryVector;
+use crate::admin::{LocFields, decorate_locations};
 use crate::config::{Config, EmbedBackend};
 
 const JOINS: &str = "FROM photos p
@@ -22,6 +24,10 @@ struct Photo {
     id: i64,
     key: Arc<str>,
     card: Value,
+    /// `p.lat IS NULL` as stored (not the JSON `lat`, which can be null for a non-finite value too).
+    no_loc: bool,
+    /// `p.infer_dt_s` when the photo's location was inferred; the bucket label is built from it.
+    infer_dt_s: Option<f64>,
     vector: Option<Arc<Vec<f32>>>,
     /// Placement score: the similarity (semantic) or the old `keep_score`/`quality_score` scale.
     /// A local scene score is normalised inside its own scene, so it is never used across groups.
@@ -55,6 +61,14 @@ fn list(v: Option<String>) -> Value {
     v.and_then(|s| serde_json::from_str::<Value>(&s).ok())
         .filter(Value::is_array)
         .unwrap_or(json!([]))
+}
+/// A stored number as-is (integer or finite real); anything else (NULL, text) is null.
+fn loose_number(value: ValueRef<'_>) -> Value {
+    match value {
+        ValueRef::Integer(i) => json!(i),
+        ValueRef::Real(f) => serde_json::Number::from_f64(f).map_or(Value::Null, Value::Number),
+        _ => Value::Null,
+    }
 }
 fn round4(v: f64) -> f64 {
     // Python round(x, 4) rounds the binary float directly to decimal digits.
@@ -188,6 +202,7 @@ pub fn search(
         }
     }
     let sql = format!("SELECT p.id,p.name,p.display,p.taken_at,p.place,p.pref,p.city,p.lat,p.lon,
+        p.source,p.rotation,p.loc_source,p.infer_dt_s,p.lat IS NULL AS no_loc,
         COALESCE(p.favorite,0) favorite,COALESCE(p.hidden,0) hidden,
         a.embedding_model,a.embedding_dim,{} AS embedding,
         a.subject,a.pet_state,a.eyes,a.face_crop,a.horizon_status,a.horizon_score,
@@ -210,6 +225,17 @@ pub fn search(
         }
         for key in ["lat","lon","quality_score"] { card[key] = json!(r.get::<_,Option<f64>>(key)?); }
         for key in ["horizon_score","subject_sharpness","aesthetic_score","keep_score"] { card[key] = json!(r.get::<_,Option<i64>>(key)?); }
+        // Origin, rotation and how the location was decided: the same names and shapes as `/api/admin/photos`.
+        card["source"] = json!(r.get::<_,Option<String>>("source")?);
+        card["rotation"] = match loose_number(r.get_ref("rotation")?) {
+            Value::Number(n) if n.as_f64() != Some(0.0) => Value::Number(n),
+            _ => json!(0),
+        };
+        let loc_source = r.get::<_,Option<String>>("loc_source")?.unwrap_or_default();
+        let infer_dt_value = loose_number(r.get_ref("infer_dt_s")?);
+        let infer_dt_s = infer_dt_value.as_f64().filter(|_| loc_source == "inferred");
+        card["loc_source"] = json!(loc_source);
+        card["infer_dt_s"] = infer_dt_value;
         card["quality_group_id"] = json!(r.get::<_,Option<i64>>("quality_group_id")?);
         for key in ["favorite","hidden"] { card[key] = json!(r.get::<_,i64>(key)? != 0); }
         for key in ["recommended","quality_recommended"] { card[key] = json!(r.get::<_,Option<i64>>(key)?.map(|v| v != 0)); }
@@ -233,7 +259,7 @@ pub fn search(
             if has_active { None } else { legacy_vector(r.get("embedding").ok().flatten(), r.get("embedding_dim").ok().flatten()) }
         });
         let score = if vector.is_some() { new.unwrap().1 } else { card["keep_score"].as_f64().or_else(|| card["quality_score"].as_f64()).unwrap_or_default()/100.0 };
-        Ok(Some(Photo { id, key, card, vector:values, score, scene_rank, scene_representative, scene, gemini:false }))
+        Ok(Some(Photo { id, key, card, no_loc: r.get("no_loc")?, infer_dt_s, vector:values, score, scene_rank, scene_representative, scene, gemini:false }))
     })?;
     let mut photos = rows
         .collect::<rusqlite::Result<Vec<_>>>()?
@@ -283,6 +309,8 @@ pub fn search(
     // history table is looked up once per request, and only when a returned scene needs it.
     let mut archive: Option<Option<super::scene_judge::Archive>> = None;
     let mut result = Vec::new();
+    let mut locs = Vec::<LocFields>::new();
+    let mut returned = HashSet::new();
     for (key, best) in group_order {
         if whole.remaining().is_none() {
             return Ok(Err(Error::Unavailable));
@@ -421,8 +449,52 @@ pub fn search(
         group["visual_similarity_threshold"] = json!(threshold);
         group["visual_cluster_count"] = json!(reps.len());
         group["collapsed_photo_count"] = json!(rows.len() - reps.len());
+        for row in &rows {
+            if returned.insert(row.id) {
+                locs.push(LocFields::new(
+                    row.id,
+                    row.card["taken_at"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    row.no_loc,
+                    row.card["loc_source"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    row.infer_dt_s,
+                ));
+            }
+        }
         group["photos"] = Value::Array(rows.into_iter().map(|r| r.card).collect());
         result.push(group);
+    }
+    // Origin hints, nearest-time place hints and AI place candidates: once, for the photos that are returned
+    // (anchors are read only when one of them has no location). The same function as the admin list.
+    if whole.remaining().is_none() {
+        return Ok(Err(Error::Unavailable));
+    }
+    let tx = conn.unchecked_transaction()?;
+    decorate_locations(&tx, &config.infer_windows_s(), &mut locs)?;
+    tx.commit()?;
+    let mut decorated: HashMap<i64, LocFields> = locs.into_iter().map(|l| (l.id, l)).collect();
+    for group in &mut result {
+        let Some(cards) = group["photos"].as_array_mut() else {
+            continue;
+        };
+        for card in cards {
+            let Some(fields) = card["id"].as_i64().and_then(|id| decorated.remove(&id)) else {
+                continue;
+            };
+            card["infer_bucket"] = json!(fields.infer_bucket);
+            // Absent keys, like the admin list: `hint` only on a no-location photo while anchors exist.
+            if let Some(hint) = fields.hint {
+                card["hint"] = serde_json::to_value(hint).unwrap_or(Value::Null);
+            }
+            if let Some(suggest) = fields.suggest {
+                card["suggest"] = serde_json::to_value(suggest).unwrap_or(Value::Null);
+            }
+        }
     }
     Ok(Ok(
         json!({"ok":true,"query":query,"mode":if vector.is_some(){"semantic"}else{"recommended"},"groups":result,"searched_photos":searched,"include_hidden":hidden}),
