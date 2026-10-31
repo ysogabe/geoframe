@@ -311,8 +311,11 @@ function setFilter(f){
   loadList();
 }
 /* チップの件数は GET /api/admin/status の db.filters（一覧 API の total と同じ条件で数えたもの） */
+let countsSeq = 0;    // ★の直後などに続けて読んだとき、遅れて届いた古い件数でチップを上書きしない
 function loadFilterCounts(){
+  const seq = ++countsSeq;
   fetch('/api/admin/status').then(r => r.json()).then(d => {
+    if(seq !== countsSeq) return;
     if(!d.ok) throw new Error(d.error || 'status error');
     const filters = (d.db && d.db.filters) || {};
     document.querySelectorAll('.chip').forEach(b => {
@@ -320,7 +323,7 @@ function loadFilterCounts(){
       const v = filters[b.dataset.filter];
       if(n) n.textContent = (v === undefined || v === null) ? '' : Number(v).toLocaleString('ja-JP');
     });
-  }).catch(e => toast('件数取得失敗: ' + e.message, true));
+  }).catch(e => { if(seq === countsSeq) toast('件数取得失敗: ' + e.message, true); });
 }
 let listSeq = 0;      // 速く切り替えたとき、遅れて届いた古い応答で一覧を上書きしない
 function loadList(){

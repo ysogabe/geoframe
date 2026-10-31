@@ -47,15 +47,22 @@ const PATTERNS = [
 
 // 1 回の試験の環境: DOM・fetch・vm の context。calls に fetch の記録が残る。
 function makeEnv({pathname, photos = PATTERNS, hold = false}){
+  const gate = {holdStatus: false};   // true の間の /api/admin/status は、返答を held の関数で手動にする
   const document = buildAdminDom();
   const filters = {...FILTERS};
   const calls = [];
   const held = [];
+  const heldStatus = [];
   const flags = {};
+  const maplibre = {maps: [], markers: []};
   const fetchFake = (url, opts = {}) => {
     const rec = {url, method: opts.method || 'GET', headers: opts.headers, body: opts.body};
     calls.push(rec);
-    if(url === '/api/admin/status') return reply(statusBody(filters));
+    if(url === '/api/admin/status'){
+      const body = statusBody({...filters});     // 要求した時点のサーバーの状態
+      if(!gate.holdStatus) return reply(body);
+      return new Promise(resolve => heldStatus.push(() => resolve({ok: true, status: 200, json: () => Promise.resolve(body)})));
+    }
     if(url.startsWith('/api/admin/photos?')){
       const q = new URLSearchParams(url.split('?')[1]);
       const body = {ok: true, page: Number(q.get('page')), per: 50, pages: 3, total: photos.length,
@@ -70,17 +77,32 @@ function makeEnv({pathname, photos = PATTERNS, hold = false}){
       if(b.hidden !== undefined) cur.hidden = b.hidden;
       return reply({ok: true, favorite: cur.favorite, hidden: cur.hidden});
     }
+    if(url === '/api/admin/rotate'){
+      const b = JSON.parse(opts.body);
+      const rotation = ((flags['r' + b.id] || 0) + b.delta) % 360;
+      flags['r' + b.id] = rotation;
+      return reply({ok: true, rotation, thumb: '/derivatives/rot' + rotation + '.jpg'});
+    }
     return reply({ok: false, error: 'unexpected ' + url});
+  };
+  // MapLibre の代用品: ensureMini() が落ちず、作られた地図・マーカーが数えられる程度
+  const maplibregl = {
+    Map: class { constructor(opts){ this.opts = opts; maplibre.maps.push(this); }
+                 addControl(){} on(){} resize(){} jumpTo(){} flyTo(){} },
+    NavigationControl: class {},
+    Marker: class { constructor(){ maplibre.markers.push(this); }
+                    setLngLat(){ return this; } addTo(){ return this; } remove(){}
+                    getElement(){ return {}; } },
   };
   const context = vm.createContext({
     document, fetch: fetchFake, location: {pathname, origin: 'http://localhost'},
-    setInterval(){}, setTimeout(){}, clearTimeout(){}, console,
+    setInterval(){}, setTimeout(){}, clearTimeout(){}, console, maplibregl,
   });
   vm.runInContext(source, context, {filename: 'admin.js'});
   const photoCalls = () => calls.filter(c => c.url.startsWith('/api/admin/photos?'));
   const statusCalls = () => calls.filter(c => c.url === '/api/admin/status');
   const boot = async () => { document.dispatchEvent({type: 'DOMContentLoaded'}); await settle(); };
-  return {document, context, calls, held, photoCalls, statusCalls, boot, $: s => document.querySelector(s)};
+  return {document, context, calls, held, heldStatus, gate, maplibre, photoCalls, statusCalls, boot, $: s => document.querySelector(s)};
 }
 const query = url => new URLSearchParams(url.split('?')[1]);
 const chipOf = (env, f) => env.$(`.chip[data-filter=${f}]`);
@@ -301,6 +323,76 @@ await test('(e) 同じ id のカード 2 枚: ★ で POST し、応答で 2 枚
     assert.ok(c.querySelector('.hid').classList.contains('on'));
   });
   assert.ok(!c3.classList.contains('is-hidden'));
+});
+
+await test('(e2) 件数取得が 2 回重なっても、最新の要求の件数だけがチップに出る', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  env.gate.holdStatus = true;
+  env.$('.tab[data-tab=photos]').click();                    // 件数取得 A（fav=57 の時点）が未返答
+  await settle();
+  assert.equal(env.heldStatus.length, 1);
+  assert.equal(chipOf(env, 'fav').querySelector('.n').textContent, '', 'A はまだ届いていない');
+  cards(env)[0].querySelector('.fav').click();               // ★ → サーバーは fav=58 → 件数取得 B
+  await settle();
+  assert.equal(env.heldStatus.length, 2);
+  env.heldStatus[1]();                                       // B が先に届く
+  await settle();
+  assert.equal(chipOf(env, 'fav').querySelector('.n').textContent, '58');
+  env.heldStatus[0]();                                       // 遅れて A（57）が届いても
+  await settle();
+  assert.equal(chipOf(env, 'fav').querySelector('.n').textContent, '58', '古い件数で戻らない');
+  assert.equal(env.$('#toast').className, 'show', 'エラーのトーストも出ない');
+});
+
+await test('(e3) 回転ボタン: POST /api/admin/rotate {id, delta:90} → 応答の thumb・rotation でカードが更新される', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  env.$('.tab[data-tab=photos]').click();
+  await settle();
+  const card = cards(env)[0];
+  const rot = card.querySelector('.rotate');
+  assert.equal(card.querySelector('.ph img').src, '/derivatives/x.jpg');
+  rot.click();
+  assert.equal(rot.disabled, true, '応答を待つあいだは押せない');
+  rot.click();                                               // disabled なので 2 回目は届かない
+  await settle();
+  const posts = env.calls.filter(c => c.url === '/api/admin/rotate');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].method, 'POST');
+  assert.equal(posts[0].body, '{"id":1,"delta":90}');
+  assert.equal(posts[0].headers['Content-Type'], 'application/json');
+  assert.equal(card.querySelector('.ph img').src, '/derivatives/rot90.jpg');
+  assert.equal(rot.title, '時計回りに90°回して表示（今 90°）');
+  assert.equal(rot.disabled, false);
+  assert.ok(env.$('#toast').textContent.includes('90°'));
+  // 続けてもう一度
+  rot.click();
+  await settle();
+  assert.equal(card.querySelector('.ph img').src, '/derivatives/rot180.jpg');
+  assert.equal(rot.title, '時計回りに90°回して表示（今 180°）');
+});
+
+await test('(g) 位置ボタン: モーダルが開き、#m-title に id と名前が入り、地図が 1 つだけ作られる', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  env.$('.tab[data-tab=photos]').click();
+  await settle();
+  assert.equal(hidden(env, '#modal'), true);
+  cards(env)[2].querySelector('.setloc').click();            // id 3: 位置なし + 候補 + ヒント
+  assert.equal(hidden(env, '#modal'), false);
+  assert.equal(env.$('#m-title').textContent, '#3  c.jpg  /  2026-10-01 12:00:00');
+  assert.equal(env.$('#m-save').disabled, true);
+  assert.equal(hidden(env, '#m-suggest'), false);
+  assert.ok(env.$('#m-hint').textContent.includes('大阪'));
+  assert.equal(env.maplibre.maps.length, 1);
+  assert.equal(env.maplibre.maps[0].opts.container, 'minimap');
+  env.$('#m-close').click();
+  assert.equal(hidden(env, '#modal'), true);
+  cards(env)[0].querySelector('.setloc').click();            // id 1: 位置あり。地図は作り直さない
+  assert.equal(env.$('#m-title').textContent, '#1  a.jpg  /  2026-10-01 12:00:00');
+  assert.equal(hidden(env, '#m-suggest'), true);
+  assert.equal(env.maplibre.maps.length, 1);
 });
 
 await test('(f) 要対応のセルを押すと写真タブとそのチップが選ばれ、一覧は 1 回だけ読まれる', async () => {

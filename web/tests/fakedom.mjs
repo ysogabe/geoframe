@@ -3,7 +3,7 @@
 //   - 要素の同一性（createElement したものが同じ参照のまま木に入る）、children 配列、親子の付け外し
 //   - textContent（子の文字列をつなぐ getter と、子を置き換える setter）
 //   - className / classList / dataset / setAttribute / getAttribute
-//   - addEventListener（登録した関数を保持し、click() と dispatchEvent({type}) で呼ぶ。バブリングはしない）
+//   - addEventListener（登録した関数を保持し、click() と dispatchEvent({type}) で呼ぶ。バブリングはしない。disabled なボタン等の click() は何も起こさない）
 //   - disabled / value / focus() と document.activeElement
 //   - querySelector / querySelectorAll: #id .class tag tag.class [data-x] [data-x=v] とその組み合わせ、
 //     空白区切りの子孫（"nav .tab" など）
@@ -73,6 +73,8 @@ function matchesChain(el, chain){
   return i < 0;
 }
 
+const FORM_CONTROLS = new Set(['button', 'input', 'select', 'textarea']);
+
 class FakeElement {
   constructor(tag, doc){
     this.nodeType = 1;
@@ -141,7 +143,12 @@ class FakeElement {
     (this.listeners[ev.type] || []).slice().forEach(fn => fn(ev));
     return !ev.defaultPrevented;
   }
-  click(){ return this.dispatchEvent({type: 'click'}); }
+  // ブラウザと同じく、disabled なフォームコントロールの click() はイベントを発火しない
+  // （dispatchEvent() で直接送ったイベントは、本物のブラウザでも届くのでそのまま）
+  click(){
+    if(this.disabled && FORM_CONTROLS.has(this.tag)) return;
+    return this.dispatchEvent({type: 'click'});
+  }
   focus(){ this.ownerDocument.activeElement = this; }
   descendants(){
     const out = [];
