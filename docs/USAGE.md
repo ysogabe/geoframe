@@ -19,7 +19,9 @@ cargo build --release -p geoframe
 GEOFRAME_INGEST=1 ./target/release/geoframe serve --listen 127.0.0.1:8080 --data-dir ./var
 ```
 
-ブラウザで <http://127.0.0.1:8080/> を開くと管理画面が表示されます。画面のファイル
+ブラウザで <http://127.0.0.1:8080/> を開くと管理画面が表示されます。画面は「状況 / 写真 / 設定」の 3 タブです。
+設定タブは読み取り専用で、起動時に読んだ設定の全項目を出どころ（起動引数・環境変数・既定・AI 設定 JSON）つきで出します。
+鍵のパス・接続先・連絡先も含むので、画面は共有しないでください。画面のファイル
 （`web/static`・`web/vendor`）と旅行ブログの旅程（`web/travel_blog/plans`）はバイナリに埋め込まれます。
 
 - `GEOFRAME_INGEST=1`のときだけ、写真の取り込み、表示用画像の生成、品質解析が順に進みます。

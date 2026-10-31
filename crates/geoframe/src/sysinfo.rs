@@ -66,6 +66,12 @@ pub fn local_isoformat() -> String {
     local_timestamp().replacen(' ', "T", 1)
 }
 
+/// `time` の現地時刻を `YYYY-MM-DD HH:MM:SS` で（[`local_timestamp`] と同じ形。1970 年より前・変換できない値は空文字）。
+pub fn local_timestamp_at(time: SystemTime) -> String {
+    time.duration_since(UNIX_EPOCH)
+        .map_or_else(|_| String::new(), |d| format_local(d.as_secs()))
+}
+
 fn format_local(secs: u64) -> String {
     local_parts(secs).map_or_else(String::new, |(text, _)| text)
 }

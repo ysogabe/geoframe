@@ -63,6 +63,42 @@ table.kv td{padding:4px 8px;border-bottom:1px solid rgba(255,255,255,.05)}
 table.kv td:first-child{color:var(--ink-3)}
 table.kv td:last-child{text-align:right;color:var(--ink)}
 
+/* ==== 設定タブ（読み取り専用） ==== */
+.cfg-note{border:1px solid rgba(255,179,0,.4);background:rgba(255,179,0,.06);border-radius:6px;
+  padding:10px 14px;margin-bottom:16px;font-size:12px;line-height:1.7;color:var(--ink)}
+.cfg-note:empty{display:none}
+.cfg-note p+p{margin-top:6px}
+.cfg-note .err{color:var(--magenta)}
+.cfg-note .warn{color:var(--amber)}
+#c-ai-state{margin:12px 0 0}
+.panel h3{font-family:var(--mono);font-size:11px;letter-spacing:.1em;color:var(--ink-2);
+  font-weight:normal;margin:16px 0 8px}
+.scroll{overflow-x:auto}
+.cfg-note .dim,table.cfg .dim,.legend .dim{color:var(--ink-3)}
+.cell.sm .v{font-size:14px;overflow-wrap:anywhere}
+table.cfg{width:100%;border-collapse:collapse;font-size:12px}
+table.cfg th{text-align:left;font-family:var(--mono);font-size:10px;font-weight:normal;letter-spacing:.1em;
+  color:var(--ink-3);padding:4px 8px;border-bottom:1px solid var(--panel-border);white-space:nowrap}
+table.cfg td{padding:6px 8px;border-bottom:1px solid rgba(255,255,255,.05);vertical-align:top}
+table.cfg td.k{font-family:var(--mono);color:var(--ink-2);white-space:nowrap}
+table.cfg td.k small{display:block;font-family:var(--jp);font-size:10px;margin-top:2px}
+table.cfg td.v{font-family:var(--mono);color:var(--ink);overflow-wrap:anywhere}
+table.cfg td.v small{font-size:11px;color:var(--ink-2);margin-left:4px}
+table.cfg td.d{color:var(--ink-3);min-width:220px}
+table.cfg td.m{font-family:var(--mono);color:var(--ink-2);white-space:nowrap}
+table.cfg .bar{width:120px;margin-top:4px}
+.src{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:.06em;
+  padding:1px 6px;border-radius:3px;white-space:nowrap}
+.src.arg{background:rgba(255,179,0,.14);color:var(--amber)}
+.src.env{background:rgba(0,229,255,.16);color:var(--cyan)}
+.src.default{background:rgba(125,147,171,.16);color:var(--ink-2)}
+.src.ai_config{background:rgba(62,240,140,.14);color:var(--green)}
+.st{font-family:var(--mono);font-size:11px}
+.st.good{color:var(--green)}
+.st.bad{color:var(--magenta)}
+.st.cfg-note .dim,table.cfg .dim,.legend .dim{color:var(--ink-3)}
+.legend{display:flex;flex-direction:column;gap:6px;font-size:12px}
+
 /* ==== 写真グリッド ==== */
 .toolbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:14px}
 .toolbar .spacer{flex:1}

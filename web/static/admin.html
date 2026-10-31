@@ -11,9 +11,11 @@
   - geoframe serve（Rust）が / と /admin（旅行ブログが無効のときは /blog-admin も）にこの HTML を返す。
     アセットは絶対パスで参照する
   - 認証なし（家庭内LAN前提）。更新系 POST は Content-Type と Origin で保護する（crates/geoframe/src/csrf.rs）
-  - タブは「状況」と「写真」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
+  - タブは「状況」「写真」「設定」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
     （件数は GET /api/admin/status の db.filters）つきのカードの一覧。一覧と検索結果のカードは同じ 1 種類。
     /ai-search も同じ HTML を返す（写真タブを検索欄にフォーカスして開く。別ページは無い）
+  - 設定タブは読み取り専用。起動時に読んだ設定の全項目を GET /api/admin/config から、タブを開くたびに読んで表にする
+    （案内文・凡例・表の中身は config.js が描く）
   ============================================================
 -->
 <link rel="stylesheet" href="/vendor/maplibre-gl-4.7.1.min.css">
@@ -32,6 +34,7 @@
   <nav>
     <button class="tab on" data-tab="status">▸ 状況</button>
     <button class="tab" data-tab="photos">▸ 写真</button>
+    <button class="tab" data-tab="config">▸ 設定</button>
   </nav>
 </header>
 
@@ -92,6 +95,42 @@
     <div id="cards"></div>
     <div id="groups" class="hidden" aria-live="polite"></div>
     <div class="empty hidden" id="empty">該当する写真がありません</div>
+  </section>
+
+  <!-- ==== CONFIG（読み取り専用。GET /api/admin/config。案内・凡例・表は config.js が描く） ==== -->
+  <section id="v-config" class="hidden">
+    <div class="cfg-note" id="c-note"></div>
+    <div class="panel">
+      <h2>▸ RUNTIME — 起動の状態</h2>
+      <div class="grid" id="c-runtime"></div>
+      <h3>設定ファイル</h3>
+      <div class="scroll"><table class="cfg" id="c-files"></table></div>
+    </div>
+    <div class="panel">
+      <h2>▸ INGEST — 基本・取り込み</h2>
+      <div class="scroll"><table class="cfg" id="c-ingest"></table></div>
+    </div>
+    <div class="panel">
+      <h2>▸ GEO — 位置推定・地図</h2>
+      <div class="scroll"><table class="cfg" id="c-geo"></table></div>
+    </div>
+    <div class="panel">
+      <h2>▸ AI</h2>
+      <div class="scroll"><table class="cfg" id="c-ai"></table></div>
+      <div class="cfg-note" id="c-ai-state"></div>
+      <h3>用途ごとの設定（AI 設定 JSON）</h3>
+      <div class="scroll"><table class="cfg" id="c-ai-tasks"></table></div>
+      <h3>接続先と embedding 空間（AI 設定 JSON）</h3>
+      <div class="scroll"><table class="cfg" id="c-ai-space"></table></div>
+    </div>
+    <div class="panel hidden" id="c-other-panel">
+      <h2>▸ OTHER — その他</h2>
+      <div class="scroll"><table class="cfg" id="c-other"></table></div>
+    </div>
+    <div class="panel">
+      <h2>▸ LEGEND — 出どころ</h2>
+      <div class="legend" id="c-legend"></div>
+    </div>
   </section>
 
 </main>
@@ -169,5 +208,6 @@
 
 <script src="/static/js/admin.js"></script>
 <script src="/static/js/photos.js"></script>
+<script src="/static/js/config.js"></script>
 </body>
 </html>

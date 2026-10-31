@@ -63,6 +63,18 @@ impl Options {
             shortlist,
         })
     }
+    /// 同一場面候補とみなす撮影時刻の窓（秒。`GEOFRAME_AI_TIME_WINDOW_MIN` を秒に直して切り捨てたもの）。
+    pub fn window_s(&self) -> i64 {
+        self.window_s
+    }
+    /// 同一場面候補とみなす cosine 類似度のしきい値（`GEOFRAME_AI_SIMILARITY`）。
+    pub fn similarity(&self) -> f64 {
+        self.similarity
+    }
+    /// 1 グループで比較に回す最大枚数（`GEOFRAME_AI_SHORTLIST_MAX`）。
+    pub fn shortlist(&self) -> usize {
+        self.shortlist
+    }
     pub fn processor_version(
         &self,
         identity: &SpaceIdentity,

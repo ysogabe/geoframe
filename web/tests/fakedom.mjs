@@ -1,4 +1,4 @@
-// vm で admin.js・photos.js を動かす描画試験のための、小さな DOM の代用品（依存なし）。
+// vm で admin.js・photos.js・config.js を動かす描画試験のための、小さな DOM の代用品（依存なし）。
 // 本物のブラウザの全部は真似ない。試験が必要とする範囲だけ:
 //   - 要素の同一性（createElement したものが同じ参照のまま木に入る）、children 配列、親子の付け外し
 //   - textContent（子の文字列をつなぐ getter と、子を置き換える setter）
@@ -216,6 +216,7 @@ export function buildAdminDom(){
   const nav = mk('nav', {}, header);
   mk('button', {cls: 'tab on', text: '▸ 状況', data: {tab: 'status'}}, nav);
   mk('button', {cls: 'tab', text: '▸ 写真', data: {tab: 'photos'}}, nav);
+  mk('button', {cls: 'tab', text: '▸ 設定', data: {tab: 'config'}}, nav);
 
   const main = mk('main', {}, body);
   const st = mk('section', {id: 'v-status'}, main);
@@ -260,6 +261,23 @@ export function buildAdminDom(){
   mk('div', {id: 'cards'}, ph);
   mk('div', {id: 'groups', cls: 'hidden'}, ph);
   mk('div', {id: 'empty', cls: 'empty hidden', text: '該当する写真がありません'}, ph);
+
+  // 設定タブ（admin.html の #v-config と同じ id。.scroll の包みは id が無いので省く）
+  const cf = mk('section', {id: 'v-config', cls: 'hidden'}, main);
+  mk('div', {id: 'c-note', cls: 'cfg-note'}, cf);
+  const rtp = mk('div', {cls: 'panel'}, cf);
+  mk('div', {id: 'c-runtime', cls: 'grid'}, rtp);
+  mk('table', {id: 'c-files', cls: 'cfg'}, rtp);
+  mk('table', {id: 'c-ingest', cls: 'cfg'}, mk('div', {cls: 'panel'}, cf));
+  mk('table', {id: 'c-geo', cls: 'cfg'}, mk('div', {cls: 'panel'}, cf));
+  const aip = mk('div', {cls: 'panel'}, cf);
+  mk('table', {id: 'c-ai', cls: 'cfg'}, aip);
+  mk('div', {id: 'c-ai-state', cls: 'cfg-note'}, aip);
+  mk('table', {id: 'c-ai-tasks', cls: 'cfg'}, aip);
+  mk('table', {id: 'c-ai-space', cls: 'cfg'}, aip);
+  const otp = mk('div', {id: 'c-other-panel', cls: 'panel hidden'}, cf);
+  mk('table', {id: 'c-other', cls: 'cfg'}, otp);
+  mk('div', {id: 'c-legend', cls: 'legend'}, mk('div', {cls: 'panel'}, cf));
 
   const modal = mk('div', {id: 'modal', cls: 'hidden'}, body);
   const box = mk('div', {cls: 'mbox'}, modal);

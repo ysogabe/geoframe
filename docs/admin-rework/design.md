@@ -499,3 +499,18 @@ Node は CI で必須（runner に同梱。`package.json` は置かない）。N
   検証環境での目視（AC3・AC7）は未実施。
 - **見送った指摘**: DB に非有限の実数が入ったときの `infer_bucket` の差（アプリは書かない）、補完が別トランザクション
   （表示用のヒント）、`the_scripts_never_build_html_from_strings` は `web/static/js` の 1 階層だけ（サブディレクトリは無い）。
+
+## 実装との差（PR ③ の完了時に追記。2026-11-01）
+
+- **`Config`**: `ai_config_path` も持つ（`GEOFRAME_AI_CONFIG` の値を出すため。`Debug`・`log_summary` には載せない）。`sources` は
+  空白だけの値も `Default`。`EnvItem` は 35 項目。
+- **`AppState.started_at`**: `AppState::new()` で取り、`serve_until` が待ち受けの直前に取り直す。
+- **応答**: `disabled` は全用途に付く（`gate(task, true)`）。`service_id` はローカルの用途で常に出し `location_clue` は `null`。
+  `GEOFRAME_AI_CONFIG` の `state` は `absent`/`loaded`/`invalid`。時刻は `YYYY-MM-DD HH:MM:SS`。`items[].value` の数値は
+  文字列（`uptime_s`・`ai.version`・`dimension`・`daily_limit`・`today_utc` は JSON の数値）。HTTP の結合試験は新設の
+  `tests/admin_config_api.rs`。
+  `AI_TIME_WINDOW_MIN` は秒を 60 で割った値、`AI_VISUAL_SIMILARITY` は解決後の値。
+- **画面**: `config.js`（`admin.js` → `photos.js` → `config.js` の順）。`initConfig()` が起動時に案内文と凡例を描き、設定タブを
+  開くたびに `GET /api/admin/config` を読む。ファイルの 3 項目はファイルの表だけに出す。用途の表は横スクロール。
+  `disabled` が `null` なら「有効」。API にあって画面の表に無い key は「その他」。`CONFIG_ITEMS` の key と `EnvItem::ALL` の
+  一致は Rust の試験（`tests/admin_ui_config.rs`）が、`config_render.mjs` の `ALL_KEYS` との一致は Node の試験が確かめる。

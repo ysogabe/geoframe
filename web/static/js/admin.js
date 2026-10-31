@@ -1,9 +1,9 @@
 /* ============================================================
    admin.js — 管理ページ /admin のフロント（classic script / 依存なし）
    構成: 1) 共通ヘルパ 2) タブ 3) 状況 4) 起動
-   写真タブ（一覧・チップ・検索・カード・ビューア・位置指定）は photos.js（この後に読み込む）。
-   共有はグローバル関数: photos.js は ここの $ el fmtDur toast postJSON showTab を使い、
-   admin.js は photos.js の initPhotos openPhotosTab gotoFilter を（呼ぶ時点で解決して）使う。
+   写真タブ（一覧・チップ・検索・カード・ビューア・位置指定）は photos.js、設定タブ（読み取り専用）は config.js（この順に後から読み込む）。
+   共有はグローバル関数: photos.js・config.js は ここの $ el cell fmtDur toast postJSON showTab を使い、
+   admin.js は photos.js の initPhotos openPhotosTab gotoFilter と、config.js の initConfig loadConfig を（呼ぶ時点で解決して）使う。
    読み込んだだけでは location・fetch に触らない。起動は DOMContentLoaded の boot() だけ
    （描画試験が vm で読み込んで aiOpsCells などを直接呼ぶため。boot の外で photos.js の関数は呼ばない）。
    ============================================================ */
@@ -61,14 +61,17 @@ function initialTab(){
   return path === '/ai-search' ? 'photos' : 'status';
 }
 function showTab(name){
-  const tab = (name === 'photos') ? 'photos' : 'status';
+  const tab = (name === 'photos' || name === 'config') ? name : 'status';
   document.querySelectorAll('nav .tab').forEach(b =>
     b.classList.toggle('on', b.dataset.tab === tab));
   $('#v-status').classList.toggle('hidden', tab !== 'status');
   $('#v-photos').classList.toggle('hidden', tab !== 'photos');
-  if(tab === 'status'){
-    if(typeof closePhotoOverlays === 'function') closePhotoOverlays();   // photos.js: ビューアと位置モーダルを閉じる
-    loadStatus(); return;
+  $('#v-config').classList.toggle('hidden', tab !== 'config');
+  if(tab !== 'photos' && typeof closePhotoOverlays === 'function') closePhotoOverlays();   // photos.js: ビューアと位置モーダルを閉じる
+  if(tab === 'status'){ loadStatus(); return; }
+  if(tab === 'config'){          // config.js: 開くたびに 1 回読む（周期的には読まない）
+    if(typeof loadConfig === 'function') loadConfig();
+    return;
   }
   openPhotosTab();            // photos.js: 件数・索引の枚数・一覧（検索結果を見ていたときはそのまま）
 }
@@ -307,12 +310,13 @@ function loadStatus(){
 }
 
 /* ==== 4) 起動 ==== */
-/* 写真タブ（photos.js）は initPhotos() でイベントを結ぶ。photos.js は admin.js の後に読み込まれるが、
-   boot() が呼ばれる時点（DOMContentLoaded）では両方とも定義済み */
+/* 写真タブ（photos.js）は initPhotos() でイベントを結ぶ。photos.js・config.js は admin.js の後に読み込まれるが、
+   boot() が呼ばれる時点（DOMContentLoaded）ではすべて定義済み */
 function boot(){
   document.querySelectorAll('nav .tab').forEach(b =>
     b.addEventListener('click', () => showTab(b.dataset.tab)));
   initPhotos();
+  if(typeof initConfig === 'function') initConfig();     // config.js: 案内文と凡例（読み込みはしない）
   const tab = initialTab();
   showTab(tab);
   setInterval(() => { if(!$('#v-status').classList.contains('hidden')) loadStatus(); }, 30000);
