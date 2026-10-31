@@ -26,7 +26,8 @@
 - `GEOFRAME_PORT` — 既定値 `8080`。HTTP の待ち受けポート。
 - `GEOFRAME_ALLOWED_HOSTS` — 既定値 空（`localhost` だけ許可）。許可する Host 名をカンマ区切りで足す。IP リテラル宛は無条件に許可するので、ここには名前だけを入れる（Tailscale や固定 DNS 名で開くとき。例: `geoframe.example.test:8080`）。
 - `GEOFRAME_LOG` — Rust だけ。既定値 `info`。ログの詳しさ。
-- `GEOFRAME_INGEST` — Rust だけ。既定値 `0`（無効）。`1` で取り込み（DB への書き込みと同期サイクル）を有効にする。`0` の間は、書き込みの API（旅行ブログの保存・書き出しなど）は書かずに 503 を返す。
+- `GEOFRAME_BLOG` — Rust だけ。既定値 `0`（無効）。`1` で旅行ブログ（`/blog-admin` のページと `/api/blog/*`）を有効にする。`0` の間は、`/api/blog/*` の読み取りと保存・書き出しは 404 を返し、`/blog-admin` は管理画面を返す。`0`/`1` 以外は設定の誤りで起動しない。
+- `GEOFRAME_INGEST` — Rust だけ。既定値 `0`（無効）。`1` で取り込み（DB への書き込みと同期サイクル）を有効にする。`0` の間は、書き込みの API（位置・お気に入りの更新、`GEOFRAME_BLOG=1` のときの旅行ブログの保存・書き出しなど）は書かずに 503 を返す（旅行ブログが無効なら 404 が優先する）。
 - `GEOFRAME_DRIVE_POLL_MIN` — 既定値 `10`。同期サイクルの間隔（分）。
 - `GEOFRAME_PHOTOS_DIR` — 既定値 `photos`。ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可）。
 - `GEOFRAME_FETCH_PER_CYCLE` — 既定値 `25`。同期 1 サイクルで derivative を作る写真の枚数。初回の Drive 全件取り込みもこの数ずつ進む。

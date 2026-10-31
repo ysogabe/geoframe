@@ -77,6 +77,7 @@ const ALLOWED: &[(&str, Exe, usize)] = &[
     ),
     // 管理画面の描画を Node で確かめる（Node が無ければ省く）。
     ("geoframe/tests/admin_ui_ai_waits.rs", Exe::Lit("node"), 1),
+    ("geoframe/tests/admin_ui_photos.rs", Exe::Lit("node"), 1),
     // ビルドした geoframe の実行ファイル（`CARGO_BIN_EXE_geoframe`）を動かす CLI の試験と、終了信号を送る `kill`。
     ("geoframe/tests/ingest_cli.rs", Exe::Expr("BIN"), 4),
     ("geoframe/tests/ingest_cli.rs", Exe::Lit("kill"), 1),

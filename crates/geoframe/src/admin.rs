@@ -178,6 +178,15 @@ fn count_photos(conn: &Connection, condition: &str) -> rusqlite::Result<i64> {
     )
 }
 
+/// フィルタごとの件数（`Filter::ALL` の順。キーは `Filter::name()`）。
+fn filter_counts(conn: &Connection) -> rusqlite::Result<Map<String, Value>> {
+    let mut out = Map::new();
+    for f in Filter::ALL {
+        out.insert(f.name().into(), count_photos(conn, f.condition())?.into());
+    }
+    Ok(out)
+}
+
 // ============================================================
 // 状態サマリ
 // ============================================================
@@ -211,6 +220,7 @@ pub fn status(conn: &Connection, ctx: &AdminContext) -> rusqlite::Result<Map<Str
             "favorite": count_photos(conn, "COALESCE(favorite,0)=1")?,
             "enrich_pending": count_photos(conn, "lat IS NOT NULL AND place IS NULL")?,
             "no_time": count_photos(conn, "taken_at IS NULL OR taken_at=''")?,
+            "filters": filter_counts(conn)?,
             "by_loc_source": group_counts(conn, "loc_source")?,
             "by_source": group_counts(conn, "source")?,
             "infer_buckets": infer_buckets(conn, &ctx.infer_windows_s)?,
@@ -700,6 +710,17 @@ pub enum Filter {
 }
 
 impl Filter {
+    /// 管理画面のチップの並び（`db.filters` のキーの順）。
+    pub const ALL: [Filter; 7] = [
+        Self::All,
+        Self::NoLoc,
+        Self::Suggest,
+        Self::Inferred,
+        Self::Manual,
+        Self::Fav,
+        Self::Hidden,
+    ];
+
     pub fn parse(name: &str) -> Self {
         match name {
             "noloc" => Self::NoLoc,
@@ -736,11 +757,6 @@ impl Filter {
             // 位置なしのうち、AI の撮影地候補がある写真
             Self::Suggest => "lat IS NULL AND id IN (SELECT photo_id FROM photo_loc_suggestions)",
         }
-    }
-
-    /// 位置なし写真の「近い時刻に居た場所」のヒントを付ける一覧。
-    fn with_hints(self) -> bool {
-        matches!(self, Self::NoLoc | Self::Suggest)
     }
 }
 
@@ -1015,14 +1031,15 @@ pub fn photos(
         });
     }
 
-    // ヒントは、錨（位置あり写真）が1枚でもあるときだけ全行に付く（近い写真が無ければ null）
-    let anchors = if filter.with_hints() {
-        time_anchors(conn)?
-    } else {
+    // ヒントは、どのフィルタでも位置なしの行にだけ付く。錨（位置あり写真）が1枚でもあるときに付き
+    // （近い写真が無ければ null）、ページ内に位置なしの行が無ければ錨も読まない
+    let anchors = if no_loc_ids.is_empty() {
         Vec::new()
+    } else {
+        time_anchors(conn)?
     };
     if !anchors.is_empty() {
-        for item in &mut items {
+        for item in items.iter_mut().filter(|i| i.lat.is_null()) {
             item.hint = Some(nearest_hint(&anchors, &item.taken_at));
         }
     }
@@ -1067,6 +1084,20 @@ mod tests {
         assert_eq!(infer_bucket(Some(1.0), &[3600.0]), "±1時間");
         assert_eq!(infer_bucket(Some(1.0), &[60000.0]), "±16時間");
         assert_eq!(infer_bucket(Some(1.0), &[]), "範囲外");
+    }
+
+    #[test]
+    fn all_lists_every_filter_in_chip_order() {
+        let names: Vec<_> = Filter::ALL.iter().map(|f| f.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "all", "noloc", "suggest", "inferred", "manual", "fav", "hidden"
+            ]
+        );
+        for f in Filter::ALL {
+            assert_eq!(Filter::parse(f.name()), f);
+        }
     }
 
     #[test]

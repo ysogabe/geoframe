@@ -43,7 +43,7 @@ impl Server {
         if with_writer {
             catalog = catalog.with_writer(Writer::open(&path, OpenMode::MustExist).unwrap());
         }
-        let addr = spawn_with_env(dir.path(), &[], catalog).await;
+        let addr = spawn_with_env(dir.path(), &[("GEOFRAME_BLOG", "1")], catalog).await;
         Self { dir, db, addr }
     }
 

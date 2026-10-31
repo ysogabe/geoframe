@@ -127,6 +127,8 @@ sudo install -o geoframe -g geoframe -m 0600 \
 | `/etc/default/geoframe-rs` | Rustだけの設定。`GEOFRAME_DATA_DIR`・`GEOFRAME_DRIVE_KEY`・`TZ`を必ず置く（無ければ起動しない）。取り込みを使うときは`GEOFRAME_INGEST=1`も | `0600 root:root` |
 | AI設定のJSON（`GEOFRAME_AI_CONFIG`が指す） | AIの用途ごとの接続先・モデル・上限・予算。鍵のパスは持つが中身は持たない | `0640 root:geoframe` |
 
+旅行ブログ（`/blog-admin`・`/api/blog/*`）は`GEOFRAME_BLOG=1`で有効になります。既定は無効で、**新しいバイナリへ更新した次回の起動から**、環境ファイルを変えなくても無効になります（使い続けるときは更新の前に`/etc/default/geoframe-rs`へ`GEOFRAME_BLOG=1`を足します）。
+
 ```sh
 sudo install -d /etc/geoframe
 sudo install -o root -g root -m 0600 /dev/null /etc/default/geoframe-rs   # 中身は各自で書く

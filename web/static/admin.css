@@ -51,6 +51,9 @@ main{padding:20px}
 .cell.warn .v{color:var(--amber)}
 .cell.bad .v{color:var(--magenta)}
 .cell.good .v{color:var(--green)}
+/* 「要対応」のセル: 押すと写真タブの該当フィルタへ */
+.cell.todo{cursor:pointer}
+.cell.todo:hover,.cell.todo:focus-visible{border-color:var(--cyan);background:rgba(0,229,255,.1);outline:none}
 .bar{height:5px;background:rgba(255,255,255,.08);border-radius:3px;margin-top:8px;overflow:hidden}
 .bar i{display:block;height:100%;background:var(--cyan)}
 .bar i.warn{background:var(--amber)}
@@ -70,6 +73,15 @@ button.btn:hover{background:rgba(0,229,255,.18)}
 button.btn.on{background:var(--cyan);color:#04202a;border-color:var(--cyan)}
 button.btn:disabled{opacity:.35;cursor:default}
 .count{font-family:var(--mono);font-size:11px;color:var(--ink-2)}
+/* フィルタのチップ（件数つき）と、ツールバー右端のリンク */
+button.chip{background:transparent;border:1px solid var(--panel-border);border-radius:14px;
+  color:var(--ink-2);font-family:var(--jp);font-size:12px;padding:5px 12px;cursor:pointer}
+button.chip:hover{color:var(--ink);background:rgba(0,229,255,.1)}
+button.chip.on{background:var(--cyan);color:#04202a;border-color:var(--cyan)}
+.chip .n{font-family:var(--mono);font-size:11px;margin-left:4px;opacity:.8}
+.toolbar .lnk{font-family:var(--mono);font-size:11px;letter-spacing:.06em;
+  color:var(--cyan);text-decoration:none}
+.toolbar .lnk:hover{text-decoration:underline}
 
 #cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
 .card{background:var(--panel);border:1px solid var(--panel-border);border-radius:6px;
@@ -81,10 +93,15 @@ button.btn:disabled{opacity:.35;cursor:default}
   font-family:var(--mono);font-size:10px;color:var(--ink-3);text-align:center;padding:8px;
   border:1px dashed rgba(125,147,171,.25);letter-spacing:.06em}
 .card .meta{padding:8px 10px;font-size:11px;line-height:1.5;flex:1}
-.card .nm{font-family:var(--mono);font-size:10px;color:var(--ink-2);
+/* 1 行目が主役: 位置があれば地名、無ければ次の一手（AI候補=cyan / 近い時刻の位置=amber / 手がかりなし=magenta） */
+.card .l1{font-size:13px;line-height:1.4;color:var(--ink)}
+.card .l1.act{color:var(--cyan)}
+.card .l1.act.hint{color:var(--amber)}
+.card .l1.act.none{color:var(--magenta)}
+.card .l2{margin-top:2px}
+.card .l2 .dt{display:block;font-family:var(--mono);font-size:11px;color:var(--ink-2)}
+.card .l2 .nm{display:block;font-family:var(--mono);font-size:10px;color:var(--ink-3);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.card .dt{font-family:var(--mono);font-size:11px;color:var(--ink)}
-.card .loc{color:var(--ink-2);font-size:11px;margin-top:2px}
 .card .tag{display:inline-block;font-family:var(--mono);font-size:9px;letter-spacing:.06em;
   padding:1px 5px;border-radius:3px;margin-top:4px}
 .tag.t-exif,.tag.t-drive_meta{background:rgba(62,240,140,.14);color:var(--green)}
@@ -99,6 +116,7 @@ button.btn:disabled{opacity:.35;cursor:default}
 .card .acts button.on.fav{color:var(--amber)}
 .card .acts button.on.hid{color:var(--magenta)}
 .card .acts button.setloc{font-size:10px;letter-spacing:.06em;color:var(--cyan)}
+.card .acts button.setloc.strong{flex:2;background:rgba(0,229,255,.14);font-weight:bold}
 
 /* ==== 位置指定モーダル ==== */
 #modal{position:fixed;inset:0;z-index:50;background:rgba(3,5,10,.86);
@@ -133,7 +151,6 @@ button.btn:disabled{opacity:.35;cursor:default}
 #m-suggest .meta{font-size:11px;color:var(--ink-2)}
 #m-suggest ul{margin:0;padding-left:18px;font-size:12px;color:var(--ink-2)}
 #m-suggest .note{font-size:11px;color:var(--ink-3)}
-.card .meta .ai{color:var(--cyan)}
 #minimap{height:min(52vh,460px);width:100%}
 #minimap .maplibregl-ctrl-attrib{font-size:9px}
 .mfoot{display:flex;align-items:center;gap:12px;padding:12px 16px;
