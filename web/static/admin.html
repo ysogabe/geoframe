@@ -6,12 +6,13 @@
 <title>GEOFRAME ADMIN</title>
 <!--
   ============================================================
-  GeoFrame 管理ページ（Phase 4a/4b/4c）
+  GeoFrame 管理ページ
   ------------------------------------------------------------
-  - server.py 稼働時のみ動く（/ と /admin → static/admin.html に内部マッピング）。
-    そのためアセットは絶対パスで参照する
-  - 認証なし（家庭内LAN前提）。更新系POSTは Content-Type と Origin で保護する
-    （詳細は geoframe/handlers.py の do_POST 節のコメント）
+  - geoframe serve（Rust）が / と /admin（旅行ブログが無効のときは /blog-admin も）にこの HTML を返す。
+    アセットは絶対パスで参照する
+  - 認証なし（家庭内LAN前提）。更新系 POST は Content-Type と Origin で保護する（crates/geoframe/src/csrf.rs）
+  - タブは「状況」と「写真」。写真タブはフィルタのチップ（件数は GET /api/admin/status の db.filters）と
+    カードの一覧。AI 写真検索は当面 /ai-search に別ページとして残す
   ============================================================
 -->
 <link rel="stylesheet" href="/vendor/maplibre-gl-4.7.1.min.css">
@@ -28,17 +29,18 @@
     <div id="servertime">--</div>
   </div>
   <nav>
-    <button class="tab on" data-tab="status">▸ STATUS</button>
-    <button class="tab" data-tab="noloc">▸ 位置なし</button>
-    <button class="tab" data-tab="photos">▸ 全写真</button>
-    <a class="tab" href="/blog-admin">▸ TRAVEL BLOG</a>
-    <a class="tab" href="/ai-search">▸ AI写真検索</a>
+    <button class="tab on" data-tab="status">▸ 状況</button>
+    <button class="tab" data-tab="photos">▸ 写真</button>
   </nav>
 </header>
 
 <main>
   <!-- ==== STATUS ==== -->
   <section id="v-status">
+    <div class="panel">
+      <h2>▸ TODO — 要対応</h2>
+      <div class="grid" id="s-todo"></div>
+    </div>
     <div class="panel">
       <h2>▸ SYNC — 同期状態</h2>
       <div class="grid" id="s-sync"></div>
@@ -58,17 +60,20 @@
     </div>
   </section>
 
-  <!-- ==== 写真一覧（位置なし / 全写真 で共用） ==== -->
-  <section id="v-list" class="hidden">
+  <!-- ==== PHOTOS ==== -->
+  <section id="v-photos" class="hidden">
     <div class="toolbar">
-      <button class="btn flt on" data-filter="all">ALL</button>
-      <button class="btn flt" data-filter="noloc">位置なし</button>
-      <button class="btn flt" data-filter="suggest">AI候補あり</button>
-      <button class="btn flt" data-filter="inferred">推定</button>
-      <button class="btn flt" data-filter="manual">手動</button>
-      <button class="btn flt" data-filter="fav">★お気に入り</button>
-      <button class="btn flt" data-filter="hidden">🚫除外</button>
+      <button class="chip on" data-filter="all">すべて <span class="n"></span></button>
+      <button class="chip" data-filter="noloc">位置なし <span class="n"></span></button>
+      <button class="chip" data-filter="suggest">AI 候補あり <span class="n"></span></button>
+      <button class="chip" data-filter="inferred">推定 <span class="n"></span></button>
+      <button class="chip" data-filter="manual">手動 <span class="n"></span></button>
+      <button class="chip" data-filter="fav">★ お気に入り <span class="n"></span></button>
+      <button class="chip" data-filter="hidden">🚫 除外 <span class="n"></span></button>
       <span class="spacer"></span>
+      <a class="lnk" href="/ai-search">AI 写真検索 ▸</a>
+    </div>
+    <div class="toolbar">
       <button class="btn" id="prev">◀ PREV</button>
       <span class="count" id="pageinfo">--</span>
       <button class="btn" id="next">NEXT ▶</button>
