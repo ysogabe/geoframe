@@ -11,8 +11,9 @@
   - geoframe serve（Rust）が / と /admin（旅行ブログが無効のときは /blog-admin も）にこの HTML を返す。
     アセットは絶対パスで参照する
   - 認証なし（家庭内LAN前提）。更新系 POST は Content-Type と Origin で保護する（crates/geoframe/src/csrf.rs）
-  - タブは「状況」と「写真」。写真タブはフィルタのチップ（件数は GET /api/admin/status の db.filters）と
-    カードの一覧。AI 写真検索は当面 /ai-search に別ページとして残す
+  - タブは「状況」と「写真」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
+    （件数は GET /api/admin/status の db.filters）つきのカードの一覧。一覧と検索結果のカードは同じ 1 種類。
+    /ai-search も同じ HTML を返す（写真タブを検索欄にフォーカスして開く。別ページは無い）
   ============================================================
 -->
 <link rel="stylesheet" href="/vendor/maplibre-gl-4.7.1.min.css">
@@ -62,23 +63,34 @@
 
   <!-- ==== PHOTOS ==== -->
   <section id="v-photos" class="hidden">
-    <div class="toolbar">
-      <button class="chip on" data-filter="all">すべて <span class="n"></span></button>
-      <button class="chip" data-filter="noloc">位置なし <span class="n"></span></button>
-      <button class="chip" data-filter="suggest">AI 候補あり <span class="n"></span></button>
-      <button class="chip" data-filter="inferred">推定 <span class="n"></span></button>
-      <button class="chip" data-filter="manual">手動 <span class="n"></span></button>
-      <button class="chip" data-filter="fav">★ お気に入り <span class="n"></span></button>
-      <button class="chip" data-filter="hidden">🚫 除外 <span class="n"></span></button>
-      <span class="spacer"></span>
-      <a class="lnk" href="/ai-search">AI 写真検索 ▸</a>
+    <div class="searchbar">
+      <input type="text" id="q" autocomplete="off"
+             placeholder="AI で写真を探す（例: 海辺を走っている犬、夕暮れの家族写真）">
+      <button class="btn" id="search" type="button">検索</button>
+      <button class="btn" id="recommend" type="button">AI おすすめ</button>
+      <label class="opt"><input type="checkbox" id="include-hidden"> 除外も検索</label>
+      <button class="btn hidden" id="close-search" type="button">✕ 検索を閉じる</button>
     </div>
+    <div class="search-note dim" id="search-note"></div>
     <div class="toolbar">
+      <div class="chips" id="chips">
+        <button class="chip on" data-filter="all">すべて <span class="n"></span></button>
+        <button class="chip" data-filter="noloc">位置なし <span class="n"></span></button>
+        <button class="chip" data-filter="suggest">AI 候補あり <span class="n"></span></button>
+        <button class="chip" data-filter="inferred">推定 <span class="n"></span></button>
+        <button class="chip" data-filter="manual">手動 <span class="n"></span></button>
+        <button class="chip" data-filter="fav">★ お気に入り <span class="n"></span></button>
+        <button class="chip" data-filter="hidden">🚫 除外 <span class="n"></span></button>
+      </div>
+      <span class="spacer"></span>
+    </div>
+    <div class="toolbar" id="pager">
       <button class="btn" id="prev">◀ PREV</button>
       <span class="count" id="pageinfo">--</span>
       <button class="btn" id="next">NEXT ▶</button>
     </div>
     <div id="cards"></div>
+    <div id="groups" class="hidden" aria-live="polite"></div>
     <div class="empty hidden" id="empty">該当する写真がありません</div>
   </section>
 
@@ -108,8 +120,54 @@
   </div>
 </div>
 
+<!-- ==== ビューア（拡大表示・前後移動。一覧でも検索結果でも ps.entries を前後に動く） ==== -->
+<div id="viewer" class="ps-viewer hidden" role="dialog" aria-modal="true" aria-labelledby="viewer-title">
+  <section class="ps-viewer-shell">
+    <button id="viewer-close" class="ps-viewer-close" type="button" aria-label="詳細を閉じる">×</button>
+    <button id="viewer-prev" class="ps-viewer-nav ps-viewer-prev" type="button" aria-label="前の写真">‹</button>
+    <div id="viewer-media" class="ps-viewer-media">
+      <img id="viewer-image" alt="">
+      <div id="viewer-image-score" class="ps-viewer-imgscore"></div>
+      <div class="ps-swipe-hint">SWIPE / ← →</div>
+    </div>
+    <aside class="ps-viewer-detail">
+      <div class="ps-viewer-overline">
+        <span id="viewer-counter"></span><span id="viewer-group-kind"></span>
+      </div>
+      <h2 id="viewer-title"></h2>
+      <p id="viewer-meta" class="ps-viewer-meta"></p>
+      <div id="viewer-location" class="ps-viewer-location"></div>
+      <div id="viewer-badges" class="tags ps-viewer-badges"></div>
+
+      <div id="viewer-ai">
+        <div id="viewer-scores" class="ps-viewer-scores"></div>
+        <dl id="viewer-analysis" class="ps-viewer-analysis"></dl>
+        <section class="ps-viewer-copy">
+          <h3>AI評価理由</h3>
+          <ul id="viewer-reasons"></ul>
+        </section>
+        <section class="ps-viewer-copy ps-concern">
+          <h3>懸念</h3>
+          <ul id="viewer-concerns"></ul>
+        </section>
+      </div>
+      <section id="viewer-group" class="ps-viewer-copy">
+        <h3>場面グループ</h3>
+        <p id="viewer-group-summary"></p>
+      </section>
+
+      <div class="ps-viewer-actions">
+        <button id="viewer-favorite" class="ps-fav" type="button">☆ favorite</button>
+        <button id="viewer-hidden" class="ps-hid" type="button">○ hidden</button>
+      </div>
+    </aside>
+    <button id="viewer-next" class="ps-viewer-nav ps-viewer-next" type="button" aria-label="次の写真">›</button>
+  </section>
+</div>
+
 <div id="toast"></div>
 
 <script src="/static/js/admin.js"></script>
+<script src="/static/js/photos.js"></script>
 </body>
 </html>

@@ -1,10 +1,10 @@
-// vm で admin.js を動かす描画試験のための、小さな DOM の代用品（依存なし）。
+// vm で admin.js・photos.js を動かす描画試験のための、小さな DOM の代用品（依存なし）。
 // 本物のブラウザの全部は真似ない。試験が必要とする範囲だけ:
 //   - 要素の同一性（createElement したものが同じ参照のまま木に入る）、children 配列、親子の付け外し
 //   - textContent（子の文字列をつなぐ getter と、子を置き換える setter）
 //   - className / classList / dataset / setAttribute / getAttribute
 //   - addEventListener（登録した関数を保持し、click() と dispatchEvent({type}) で呼ぶ。バブリングはしない。disabled なボタン等の click() は何も起こさない）
-//   - disabled / value / focus() と document.activeElement
+//   - disabled / value / checked / focus() と document.activeElement、getBoundingClientRect()（幅 100 の固定）、document.contains()
 //   - querySelector / querySelectorAll: #id .class tag tag.class [data-x] [data-x=v] とその組み合わせ、
 //     空白区切りの子孫（"nav .tab" など）
 //   - document.createElement / createTextNode / getElementById / addEventListener / dispatchEvent
@@ -93,8 +93,10 @@ class FakeElement {
     this.classList = new ClassList(this);
     this.disabled = false;
     this.value = '';
+    this.checked = false;
     this.title = '';
   }
+  getBoundingClientRect(){ return {left: 0, top: 0, width: 100, height: 100}; }
   get childNodes(){ return this.children; }
   get textContent(){ return this.children.map(c => c.textContent).join(''); }
   set textContent(v){
@@ -176,6 +178,7 @@ export function createDocument(){
       (doc.listeners[ev.type] || []).slice().forEach(fn => fn(ev));
       return !ev.defaultPrevented;
     },
+    contains: node => { for(let n = node; n; n = n.parentNode) if(n === doc.body) return true; return false; },
     getElementById: id => doc.body.descendants().find(e => e.id === id) || null,
     querySelector: sel => doc.body.querySelector(sel),
     querySelectorAll: sel => doc.body.querySelectorAll(sel),
@@ -233,20 +236,29 @@ export function buildAdminDom(){
   panel('▸ DISK — ディスク使用量', 's-disk');
 
   const ph = mk('section', {id: 'v-photos', cls: 'hidden'}, main);
+  const sbar = mk('div', {cls: 'searchbar'}, ph);
+  mk('input', {id: 'q'}, sbar);
+  mk('button', {id: 'search', cls: 'btn', text: '検索'}, sbar);
+  mk('button', {id: 'recommend', cls: 'btn', text: 'AI おすすめ'}, sbar);
+  const opt = mk('label', {cls: 'opt'}, sbar);
+  mk('input', {id: 'include-hidden'}, opt);
+  opt.appendChild(document.createTextNode(' 除外も検索'));
+  mk('button', {id: 'close-search', cls: 'btn hidden', text: '✕ 検索を閉じる'}, sbar);
+  mk('div', {id: 'search-note', cls: 'search-note dim'}, ph);
   const bar = mk('div', {cls: 'toolbar'}, ph);
+  const chips = mk('div', {id: 'chips', cls: 'chips'}, bar);
   CHIPS.forEach(([f, label], i) => {
-    const b = mk('button', {cls: i === 0 ? 'chip on' : 'chip', data: {filter: f}}, bar);
+    const b = mk('button', {cls: i === 0 ? 'chip on' : 'chip', data: {filter: f}}, chips);
     b.appendChild(document.createTextNode(label + ' '));
     mk('span', {cls: 'n'}, b);
   });
   mk('span', {cls: 'spacer'}, bar);
-  const a = mk('a', {cls: 'lnk', text: 'AI 写真検索 ▸'}, bar);
-  a.setAttribute('href', '/ai-search');
-  const pager = mk('div', {cls: 'toolbar'}, ph);
+  const pager = mk('div', {id: 'pager', cls: 'toolbar'}, ph);
   mk('button', {id: 'prev', cls: 'btn', text: '◀ PREV'}, pager);
   mk('span', {id: 'pageinfo', cls: 'count', text: '--'}, pager);
   mk('button', {id: 'next', cls: 'btn', text: 'NEXT ▶'}, pager);
   mk('div', {id: 'cards'}, ph);
+  mk('div', {id: 'groups', cls: 'hidden'}, ph);
   mk('div', {id: 'empty', cls: 'empty hidden', text: '該当する写真がありません'}, ph);
 
   const modal = mk('div', {id: 'modal', cls: 'hidden'}, body);
@@ -265,6 +277,34 @@ export function buildAdminDom(){
   mk('span', {id: 'm-pick', cls: 'pick'}, foot);
   const save = mk('button', {id: 'm-save', cls: 'btn', text: 'SAVE'}, foot);
   save.disabled = true;
+
+  // ビューア（admin.html の #viewer と同じ id）
+  const viewer = mk('div', {id: 'viewer', cls: 'ps-viewer hidden'}, body);
+  const shell = mk('section', {cls: 'ps-viewer-shell'}, viewer);
+  mk('button', {id: 'viewer-close', cls: 'ps-viewer-close', text: '×'}, shell);
+  mk('button', {id: 'viewer-prev', cls: 'ps-viewer-nav ps-viewer-prev', text: '‹'}, shell);
+  const media = mk('div', {id: 'viewer-media', cls: 'ps-viewer-media'}, shell);
+  mk('img', {id: 'viewer-image'}, media);
+  mk('div', {id: 'viewer-image-score', cls: 'ps-viewer-imgscore'}, media);
+  const aside = mk('aside', {cls: 'ps-viewer-detail'}, shell);
+  const over = mk('div', {cls: 'ps-viewer-overline'}, aside);
+  mk('span', {id: 'viewer-counter'}, over);
+  mk('span', {id: 'viewer-group-kind'}, over);
+  mk('h2', {id: 'viewer-title'}, aside);
+  mk('p', {id: 'viewer-meta', cls: 'ps-viewer-meta'}, aside);
+  mk('div', {id: 'viewer-location', cls: 'ps-viewer-location'}, aside);
+  mk('div', {id: 'viewer-badges', cls: 'tags ps-viewer-badges'}, aside);
+  const vai = mk('div', {id: 'viewer-ai'}, aside);
+  mk('div', {id: 'viewer-scores', cls: 'ps-viewer-scores'}, vai);
+  mk('dl', {id: 'viewer-analysis', cls: 'ps-viewer-analysis'}, vai);
+  mk('ul', {id: 'viewer-reasons'}, mk('section', {cls: 'ps-viewer-copy'}, vai));
+  mk('ul', {id: 'viewer-concerns'}, mk('section', {cls: 'ps-viewer-copy ps-concern'}, vai));
+  const vgroup = mk('section', {id: 'viewer-group', cls: 'ps-viewer-copy'}, aside);
+  mk('p', {id: 'viewer-group-summary'}, vgroup);
+  const vact = mk('div', {cls: 'ps-viewer-actions'}, aside);
+  mk('button', {id: 'viewer-favorite', cls: 'ps-fav', text: '☆ favorite'}, vact);
+  mk('button', {id: 'viewer-hidden', cls: 'ps-hid', text: '○ hidden'}, vact);
+  mk('button', {id: 'viewer-next', cls: 'ps-viewer-nav ps-viewer-next', text: '›'}, shell);
 
   mk('div', {id: 'toast'}, body);
   return document;

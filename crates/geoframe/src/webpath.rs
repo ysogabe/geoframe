@@ -97,7 +97,7 @@ pub fn page_target(normalized: &str) -> Option<&'static str> {
     match normalized {
         "/" | "/admin" => Some("static/admin.html"),
         "/blog-admin" => Some("static/blog-admin.html"),
-        "/ai-search" => Some("static/ai-search.html"),
+        "/ai-search" => Some("static/admin.html"),
         _ => None,
     }
 }
@@ -297,10 +297,7 @@ mod tests {
             page_target(&norm("/blog-admin")),
             Some("static/blog-admin.html")
         );
-        assert_eq!(
-            page_target(&norm("/ai-search")),
-            Some("static/ai-search.html")
-        );
+        assert_eq!(page_target(&norm("/ai-search")), Some("static/admin.html"));
         // 現行に /blog は無い（403）。接頭辞一致でもない
         for raw in [
             "/blog",

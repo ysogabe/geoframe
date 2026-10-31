@@ -19,6 +19,28 @@ fn fixture() -> Value {
     .unwrap()
 }
 
+/// The Python fixtures predate the location fields the admin screen reads. Check that every card carries the
+/// shared ones, then drop them so the rest is compared with the Python result unchanged.
+fn without_location_fields(mut result: Value) -> Value {
+    for group in result["groups"].as_array_mut().into_iter().flatten() {
+        for card in group["photos"].as_array_mut().into_iter().flatten() {
+            let card = card.as_object_mut().unwrap();
+            for key in [
+                "source",
+                "rotation",
+                "loc_source",
+                "infer_dt_s",
+                "infer_bucket",
+            ] {
+                assert!(card.remove(key).is_some(), "{key}");
+            }
+            card.remove("hint");
+            card.remove("suggest");
+        }
+    }
+    result
+}
+
 struct Env {
     dir: TempDir,
     config: Arc<Config>,
@@ -151,7 +173,10 @@ async fn python_fixture_recommended_and_semantic_all_card_and_group_fields() {
             case["groups"],
             case["hidden"]
         );
-        assert_eq!(e.search(&q).await.unwrap(), case["result"]);
+        assert_eq!(
+            without_location_fields(e.search(&q).await.unwrap()),
+            case["result"]
+        );
     }
     assert_eq!(posts(&stub), 3); // distinct normalized semantic queries; empty queries never send
 }
@@ -169,7 +194,10 @@ async fn legacy_empty_query_matches_python_without_settings_provider_or_new_tabl
             "groups={}&include_hidden={}",
             case["groups"], case["hidden"]
         );
-        assert_eq!(e.search(&q).await.unwrap(), case["result"]);
+        assert_eq!(
+            without_location_fields(e.search(&q).await.unwrap()),
+            case["result"]
+        );
     }
     let mut actual = search_view::status(&e.conn, &e.config).unwrap();
     actual.as_object_mut().unwrap().remove("pipeline");
@@ -1124,7 +1152,7 @@ async fn http_exact_routes_head_guards_errors_headers_and_python_cards() {
     let (status, headers, body) = request(addr, "GET", "/api/ai/search", "", "").await;
     assert_eq!(status, 200);
     assert_eq!(
-        serde_json::from_slice::<Value>(&body).unwrap(),
+        without_location_fields(serde_json::from_slice::<Value>(&body).unwrap()),
         fixture()["cases"][0]["result"]
     );
     assert!(headers.contains("application/json; charset=utf-8"));
@@ -1374,4 +1402,146 @@ fn http_logs_contain_only_route_status_timing_not_query_keys_vectors_or_errors()
     assert!(!logs.contains("synthetic-private-query"));
     assert!(!logs.contains("gemini-embedding-2"));
     assert!(!logs.contains("derivatives/"));
+}
+
+/// 結果の写真（`id` → カード）
+fn cards(result: &Value) -> std::collections::BTreeMap<i64, Value> {
+    result["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|g| g["photos"].as_array().unwrap())
+        .map(|c| (c["id"].as_i64().unwrap(), c.clone()))
+        .collect()
+}
+
+// 試験ごとのスレッドで数える（並行する別の試験の問い合わせを数えない）
+thread_local! { static ANCHOR_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+fn count_anchor_reads(event: rusqlite::trace::TraceEvent<'_>) {
+    if let rusqlite::trace::TraceEvent::Stmt(_, sql) = event
+        && sql.contains("loc_source IN ('exif','drive_meta')")
+    {
+        ANCHOR_READS.with(|n| n.set(n.get() + 1));
+    }
+}
+
+#[test]
+fn search_photos_carry_the_admin_location_fields_and_match_the_admin_list() {
+    let e = Env::new(Some("http://127.0.0.1:1"), &[], true);
+    e.conn.execute_batch(crate::schema::SCHEMA).unwrap();
+    // 1・2 は位置あり（EXIF）。3・6 は位置なし、5 は推定の位置、8 は手動の位置
+    e.conn
+        .execute_batch(
+            "UPDATE photos SET loc_source='exif' WHERE id IN (1,2);
+             UPDATE photos SET lat=NULL, lon=NULL, loc_source=NULL, taken_at='2026-01-01 10:05' WHERE id=3;
+             UPDATE photos SET lat=NULL, lon=NULL, loc_source=NULL, taken_at='2026-01-01 10:20' WHERE id=6;
+             UPDATE photos SET loc_source='inferred', infer_dt_s=600, rotation=90 WHERE id=5;
+             UPDATE photos SET loc_source='manual' WHERE id=8;
+             INSERT INTO photo_loc_suggestions(photo_id,run_id,scope,place_name,precision,confidence,evidence_json,lat,lon,geocode_title,model,analyzed_at)
+               VALUES (6,'r','photo','サンプル寺院','landmark','medium','[\"看板\"]',10.5,20.5,'Sample Temple','m','2026-01-01T00:00:00');",
+        )
+        .unwrap();
+    ANCHOR_READS.with(|n| n.set(0));
+    e.conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(count_anchor_reads),
+    );
+    let result = search_view::search(
+        &e.conn,
+        &e.config,
+        "",
+        30,
+        true,
+        None,
+        &Deadline::interactive(),
+    )
+    .unwrap()
+    .unwrap();
+    // 錨を読むのは、位置なしの写真が結果にあるときの 1 回だけ
+    assert_eq!(ANCHOR_READS.with(std::cell::Cell::get), 1);
+    let found = cards(&result);
+    for id in [1, 2, 3, 5, 6, 8] {
+        assert!(found.contains_key(&id), "{id} in {found:?}");
+    }
+    for card in found.values() {
+        for key in [
+            "source",
+            "rotation",
+            "loc_source",
+            "infer_dt_s",
+            "infer_bucket",
+        ] {
+            assert!(card.get(key).is_some(), "{key} in {card}");
+        }
+    }
+    assert_eq!(found[&1]["source"], "drive");
+    assert_eq!(found[&1]["loc_source"], "exif");
+    assert_eq!(found[&1]["rotation"], 0);
+    assert_eq!(found[&1]["infer_bucket"], "");
+    assert_eq!(found[&5]["rotation"], 90);
+    assert_eq!(found[&5]["infer_dt_s"], 600);
+    assert_eq!(found[&5]["infer_bucket"], "±15分");
+    assert_eq!(found[&3]["loc_source"], "");
+    assert_eq!(found[&3]["infer_dt_s"], Value::Null);
+    // 位置ありの写真には hint・suggest が無い
+    for id in [1, 2, 5, 8] {
+        assert!(found[&id].get("hint").is_none(), "{id}");
+        assert!(found[&id].get("suggest").is_none(), "{id}");
+    }
+    // 位置なしの写真には hint が付き、候補は持つ写真にだけ付く
+    assert!(found[&3]["hint"].is_object());
+    assert!(found[&3].get("suggest").is_none());
+    assert_eq!(found[&6]["suggest"]["place_name"], "サンプル寺院");
+    // 管理画面の一覧（位置なし）と同じ値
+    let ctx = crate::admin::AdminContext::new(&e.config, e.dir.path());
+    let list = crate::admin::photos(&e.conn, &ctx, 1, 200, crate::admin::Filter::NoLoc).unwrap();
+    let list = serde_json::to_value(list).unwrap();
+    let listed = list["items"].as_array().unwrap();
+    assert_eq!(
+        listed
+            .iter()
+            .map(|i| i["id"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        [3, 6]
+    );
+    for item in listed {
+        let card = &found[&item["id"].as_i64().unwrap()];
+        for key in [
+            "hint",
+            "suggest",
+            "infer_bucket",
+            "source",
+            "rotation",
+            "loc_source",
+            "infer_dt_s",
+        ] {
+            assert_eq!(item.get(key), card.get(key), "{key} of {item}");
+        }
+    }
+}
+
+#[test]
+fn search_does_not_read_time_anchors_when_every_returned_photo_has_a_location() {
+    let e = Env::new(Some("http://127.0.0.1:1"), &[], true);
+    ANCHOR_READS.with(|n| n.set(0));
+    e.conn.trace_v2(
+        rusqlite::trace::TraceEventCodes::SQLITE_TRACE_STMT,
+        Some(count_anchor_reads),
+    );
+    let result = search_view::search(
+        &e.conn,
+        &e.config,
+        "",
+        30,
+        true,
+        None,
+        &Deadline::interactive(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!cards(&result).is_empty());
+    assert_eq!(ANCHOR_READS.with(std::cell::Cell::get), 0);
+    for card in cards(&result).values() {
+        assert!(card.get("hint").is_none() && card.get("suggest").is_none());
+    }
 }

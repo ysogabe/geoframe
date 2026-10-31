@@ -802,7 +802,7 @@ pub struct AdminPhoto {
     hidden: bool,
     rotation: Value,
     source: Value,
-    /// 外側が `None`: キーなし。`Some(None)`: `null`（位置なし一覧で、近い写真が無い・7日より離れている）。
+    /// 外側が `None`: キーなし。`Some(None)`: `null`（どのフィルタでも位置なしの行で、近い写真が無い・7日より離れている）。
     #[serde(skip_serializing_if = "Option::is_none")]
     hint: Option<Option<Hint>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -945,6 +945,98 @@ fn suggestions(conn: &Connection, ids: &[i64]) -> rusqlite::Result<HashMap<i64, 
     Ok(out)
 }
 
+/// 位置の補完（近い時刻の位置のヒント・AI の撮影地候補・由来の段階）の入出力。一覧（`photos`）と
+/// AI 検索（`ai::search_view`）が共有する。入力は DB から読んだ値で、`no_loc` は行を読むときの `lat IS NULL`
+/// （JSON にしたあとの値ではない）。
+#[derive(Debug)]
+pub(crate) struct LocFields {
+    pub id: i64,
+    pub taken_at: String,
+    pub no_loc: bool,
+    pub loc_source: String,
+    pub infer_dt_s: Option<f64>,
+    /// 出力。外側が `None`: キーなし（位置ありの行・錨が1枚も無い）。`Some(None)`: `null`。
+    pub hint: Option<Option<Hint>>,
+    /// 出力。候補が無い・古いときは `None`（キーなし）。
+    pub suggest: Option<Suggest>,
+    /// 出力。`loc_source='inferred'` のときだけ段階のラベル、ほかは空文字。
+    pub infer_bucket: String,
+}
+
+impl LocFields {
+    pub(crate) fn new(
+        id: i64,
+        taken_at: String,
+        no_loc: bool,
+        loc_source: String,
+        infer_dt_s: Option<f64>,
+    ) -> Self {
+        Self {
+            id,
+            taken_at,
+            no_loc,
+            loc_source,
+            infer_dt_s,
+            hint: None,
+            suggest: None,
+            infer_bucket: String::new(),
+        }
+    }
+}
+
+/// 錨（位置あり写真）を読む必要があるか: 位置なしの行が1つでもあるときだけ。
+fn needs_anchors(rows: &[LocFields]) -> bool {
+    rows.iter().any(|r| r.no_loc)
+}
+
+/// 位置なしの行の `suggestions` を引く ID の束の大きさ（SQLite の変数の上限に当たらないように分ける）。
+const SUGGEST_CHUNK: usize = 500;
+
+/// `rows` に由来の段階・ヒント・撮影地候補を付ける。`rows` の `id` は重複させない。ヒントは位置なしの行にだけ付き
+/// （錨が1枚でもあるときに付き、近い写真が無ければ `null`）、錨は位置なしの行があるときだけ読む。候補は位置なしの
+/// ID をまとめて引く。
+pub(crate) fn decorate_locations(
+    conn: &Connection,
+    windows_s: &[f64],
+    rows: &mut [LocFields],
+) -> rusqlite::Result<()> {
+    decorate_with(conn, windows_s, rows, time_anchors)
+}
+
+fn decorate_with(
+    conn: &Connection,
+    windows_s: &[f64],
+    rows: &mut [LocFields],
+    load_anchors: impl FnOnce(&Connection) -> rusqlite::Result<Vec<Anchor>>,
+) -> rusqlite::Result<()> {
+    for row in rows.iter_mut() {
+        row.infer_bucket = if row.loc_source == "inferred" {
+            infer_bucket(row.infer_dt_s, windows_s)
+        } else {
+            String::new()
+        };
+    }
+    let anchors = if needs_anchors(rows) {
+        load_anchors(conn)?
+    } else {
+        Vec::new()
+    };
+    if !anchors.is_empty() {
+        for row in rows.iter_mut().filter(|r| r.no_loc) {
+            row.hint = Some(nearest_hint(&anchors, &row.taken_at));
+        }
+    }
+    let no_loc_ids: Vec<i64> = rows.iter().filter(|r| r.no_loc).map(|r| r.id).collect();
+    let mut found = HashMap::new();
+    for chunk in no_loc_ids.chunks(SUGGEST_CHUNK) {
+        found.extend(suggestions(conn, chunk)?);
+    }
+    for row in rows.iter_mut() {
+        row.suggest = found.remove(&row.id);
+    }
+    Ok(())
+}
+
 fn text(row: &Row<'_>, index: usize) -> rusqlite::Result<String> {
     Ok(row.get::<_, Option<String>>(index)?.unwrap_or_default())
 }
@@ -975,15 +1067,24 @@ pub fn photos(
     ))?;
     let mut rows = stmt.query([per, (page - 1) * per])?;
     let mut items = Vec::new();
-    // 位置なしの行（候補を引く対象）と、各行の taken_at（ヒント用）
-    let mut no_loc_ids = Vec::new();
+    // 補完（ヒント・候補・由来）の入力。行を読むときの DB の値で作る
+    let mut loc = Vec::new();
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let loc_source = text(row, 7)?;
         let infer_dt_s = cell(row.get_ref(8)?)?;
-        if matches!(row.get_ref(5)?, ValueRef::Null) {
-            no_loc_ids.push(id);
-        }
+        loc.push(LocFields::new(
+            id,
+            text(row, 4)?,
+            matches!(row.get_ref(5)?, ValueRef::Null),
+            loc_source.clone(),
+            // 段階を出すのは由来が推定の行だけ（ほかの行の infer_dt_s の型は見ない）
+            if loc_source == "inferred" {
+                number(row.get_ref(8)?)?
+            } else {
+                None
+            },
+        ));
         let rotation = match row.get_ref(14)? {
             value if !truthy(value) => Value::from(0),
             value => cell(value)?,
@@ -999,11 +1100,7 @@ pub fn photos(
             taken_at: text(row, 4)?,
             lat: cell(row.get_ref(5)?)?,
             lon: cell(row.get_ref(6)?)?,
-            infer_bucket: if loc_source == "inferred" {
-                infer_bucket(number(row.get_ref(8)?)?, &ctx.infer_windows_s)
-            } else {
-                String::new()
-            },
+            infer_bucket: String::new(),
             loc_source,
             infer_dt_s,
             place: text(row, 9)?,
@@ -1031,21 +1128,13 @@ pub fn photos(
         });
     }
 
-    // ヒントは、どのフィルタでも位置なしの行にだけ付く。錨（位置あり写真）が1枚でもあるときに付き
+    // ヒントは、どのフィルタでも位置なしの行（DB の `lat IS NULL`）にだけ付く。錨が1枚でもあるときに付き
     // （近い写真が無ければ null）、ページ内に位置なしの行が無ければ錨も読まない
-    let anchors = if no_loc_ids.is_empty() {
-        Vec::new()
-    } else {
-        time_anchors(conn)?
-    };
-    if !anchors.is_empty() {
-        for item in items.iter_mut().filter(|i| i.lat.is_null()) {
-            item.hint = Some(nearest_hint(&anchors, &item.taken_at));
-        }
-    }
-    let mut found = suggestions(conn, &no_loc_ids)?;
-    for item in &mut items {
-        item.suggest = found.remove(&item.id);
+    decorate_locations(conn, &ctx.infer_windows_s, &mut loc)?;
+    for (item, fields) in items.iter_mut().zip(loc) {
+        item.infer_bucket = fields.infer_bucket;
+        item.hint = fields.hint;
+        item.suggest = fields.suggest;
     }
     Ok(PhotosPage {
         ok: true,
@@ -1061,6 +1150,45 @@ pub fn photos(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn located(id: i64) -> LocFields {
+        LocFields::new(id, "2025-01-01 10:00".into(), false, "exif".into(), None)
+    }
+
+    #[test]
+    fn anchors_are_read_only_when_a_row_has_no_location() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::schema::SCHEMA).unwrap();
+        conn.execute_batch(
+            "INSERT INTO photos(id, source, name, taken_at, lat, lon, loc_source, city)
+               VALUES (1, 'local', 'anchor', '2025-01-01 10:00', 35.0, 139.0, 'exif', '東京');",
+        )
+        .unwrap();
+        let reads = std::cell::Cell::new(0);
+        let load = |conn: &Connection| {
+            reads.set(reads.get() + 1);
+            time_anchors(conn)
+        };
+        // 位置ありの行だけ・行が無い: 読まない
+        let mut rows = vec![located(1), located(2)];
+        assert!(!needs_anchors(&rows));
+        decorate_with(&conn, &[900.0], &mut rows, load).unwrap();
+        decorate_with(&conn, &[900.0], &mut [], load).unwrap();
+        assert_eq!(reads.get(), 0);
+        assert!(rows.iter().all(|r| r.hint.is_none() && r.suggest.is_none()));
+        // 位置なしの行が混じる: 1 回だけ読み、位置なしの行にだけヒントが付く
+        let mut rows = vec![
+            located(1),
+            LocFields::new(3, "2025-01-01 10:05".into(), true, String::new(), None),
+            LocFields::new(4, "2025-02-01 10:05".into(), true, String::new(), None),
+        ];
+        assert!(needs_anchors(&rows));
+        decorate_with(&conn, &[900.0], &mut rows, load).unwrap();
+        assert_eq!(reads.get(), 1);
+        assert!(rows[0].hint.is_none());
+        assert_eq!(rows[1].hint.as_ref().unwrap().as_ref().unwrap().dt_s, 300);
+        assert!(matches!(rows[2].hint, Some(None))); // 7 日より離れている
+    }
 
     #[test]
     fn bucket_labels_follow_the_windows() {
