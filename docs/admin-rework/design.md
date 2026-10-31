@@ -471,3 +471,31 @@ Node は CI で必須（runner に同梱。`package.json` は置かない）。N
    `config.rs:213` のコメントに「`/api/admin/config` だけはモデル名・region を出す」の例外を書き足す。
 
 ② と ③ は ① の後なら順不同。各 PR の本文に依存関係（① が前提）を書く。
+
+## 実装との差（PR ①・② の完了時に追記。2026-10-31）
+
+実装のレビューで受け入れた、本文の記述と違う点。本文は設計時のまま残し、ここが実装の正。
+
+- **カード**: `cardFor(photo, index, groupUi)` の第 3 引数で、場面の折りたたみ（構図ごと・場面全体）を扱う。正規化後は
+  `visual.size` と AI の点数の項目も持つ。位置の保存後の 1 行目は**地名でなく座標 4 桁＋`手動` のタグ**（`setloc` の応答に
+  地名が無く、サーバーが地名を空に戻して次の取り込みで付け直すため）。保存後は同じ写真の全カードと開いているビューアを
+  更新し、一覧表示中は一覧も読み直す。
+- **写真タブの状態**: `ps` は `filter`・`page`・`view`・`query`・`includeHidden` に加えて `mode`（`semantic`/`recommended`）、
+  `cards`、`pending`（応答待ちの検索語と要求番号）を持つ。`entries` は `{photo, group, groupIndex, photoIndex}` の配列。
+  検索・一覧・件数の要求には番号を付け、古い応答は捨てる。「除外も検索」の切替は、応答待ちがあればその語で、無ければ
+  表示中の語で検索し直す（一覧で応答待ちも無ければ何もしない）。検索語が 300 文字（コードポイント）を超えるときは
+  送らず、先行の検索も無効にする。
+- **状態遷移**: 検索結果ではチップ・ページング・`#cards` を隠す。状況タブへ行って戻ると検索結果を保持し、「要対応」から
+  来たときは一覧に戻す。写真タブを離れるとビューアと位置モーダルを閉じる。
+- **読み込みと起動**: `boot()` はナビのイベント登録 → `initPhotos()` → 初期タブの表示 → 状況の 30 秒更新の登録 →
+  `/ai-search` なら検索欄にフォーカス。`initialTab()` はタブ名を返すだけ。索引の枚数は写真タブを初めて開いたときだけ読む。
+- **場面・ビューア**: DOM の id は `viewer-*`、クラスは `.ps-*`。ビューアは一覧のカードからも開け（AI の欄は隠す）、
+  前後移動は周回する。
+- **テスト**: 検索 API の位置の項目は `crates/geoframe/src/ai/query/tests.rs` の
+  `search_photos_carry_the_admin_location_fields_and_match_the_admin_list`（`tests/` から AI の合成 DB を使えないため）。
+  HTML 文字列を挿入する API の不在は `tests/static_files.rs` の `the_scripts_never_build_html_from_strings`（PR ② で
+  追加済み。PR ③ ではやらない）。描画試験は `node web/tests/photos_render.mjs web/static/js/admin.js web/static/js/photos.js`
+  （2 つの JS を同じ context に読む）。位置の保存は (q)(q2)、ビューアの順序・周回・`Escape` は (p)、折りたたみは (i)。
+  検証環境での目視（AC3・AC7）は未実施。
+- **見送った指摘**: DB に非有限の実数が入ったときの `infer_bucket` の差（アプリは書かない）、補完が別トランザクション
+  （表示用のヒント）、`the_scripts_never_build_html_from_strings` は `web/static/js` の 1 階層だけ（サブディレクトリは無い）。
