@@ -186,7 +186,9 @@ flowchart LR
   （`renderModal`・`stepModal`・先読み・★/除外のハンドラ・画像クリック・`applyPhoto` の「開いている写真」の判定）を
   `vEntries()` に置き換える。`viewerIndex` の名前・意味は変えない（描画試験 `photos_render.mjs:846, 918, 968, 973, 1256` が
   直接見る）。`openModal(index)` は `viewerEntries = null` にしてから開く（写真タブの挙動は不変）。`closeModal()` で
-  `viewerEntries = null`。
+  `viewerEntries = null`。写真タブの再描画（一覧・検索の応答、チップの切り替え、検索を閉じる）で閉じるのは
+  `ps.entries` を使っているビューア（`viewerEntries === null`）だけにする（`closeModalIfOwn()`）。遅れて届いた写真タブの応答で、
+  ライブラリ・選別から開いたビューアを閉じない。`closePhotoOverlays()` は今までどおり全部閉じる。
 - 既存の `openModal(index)` のうち「ビューアを表示する処理」（`hidden` を外す、`body.ps-viewer-open`、`renderModal()`、
   閉じるボタンへのフォーカス、閉じたときのフォーカスの戻し先の記録）を内部関数 `showViewer(index)` に切り出し、
   `openModal` と下の `openModalFor` の両方から呼ぶ。
@@ -229,9 +231,17 @@ ls = {
   付け、別の点を押したら古い応答は捨てる）、届いたら `maplibregl.Popup`（DOM を `el()` で組んで `setDOMContent`）に
   サムネイル・日時・地名・「開く」を出す。取得中は「読み込み中」、失敗は「読めませんでした」の吹き出し。「開く」は届いた
   1 枚で `openModalFor([photo], 0, {ai: false})`。クラスタの件数の文字は、style に `glyphs`（文字の形のデータ）が無く
-  symbol 層が使えないので、`render` のたびに見えているクラスタへ合わせる DOM のマーカー（`pointer-events: none`）で出す
-  （「3 層」は円 2 つ + マーカー）。ツールバーに「この範囲の写真を見る」（`map.getBounds()` を `bbox` にして
+  symbol 層が使えないので、見えているクラスタへ合わせる DOM のマーカー（`pointer-events: none`）で出す。更新は毎フレームの
+  `render` では呼ばず、`moveend`・`zoomend`、点の source の `sourcedata`（`e.sourceId === 'photos' && e.isSourceLoaded`）、
+  `setData` の直後に行う（「3 層」は円 2 つ + マーカー）。Map の生成オプションに `renderWorldCopies: false` と
+  `maxBounds: [[-180, -85], [180, 85]]` を入れて世界を周回させない（経度が ±180 を超えると表示範囲を bbox にできない。日付変更線を
+  またぐ範囲は扱わない）。`currentBbox` は `getBounds()` を ±180/±90 に丸め、丸めた後に `w >= e` なら経度は `[-180, …, 180, …]`
+  にする。「除外も含める」の切り替えでは、旅の一覧・格子・地図の点のうち読み込み済みのものを全部読み直す。地図が見えていない
+  （旅の一覧・格子の上）ときは飛んでいる点の応答を捨てて `pointsStale` の印だけ立て、地図へ戻ったとき（戻る・ビューの切り替え）に
+  点を取り直す。ツールバーに「この範囲の写真を見る」（`map.getBounds()` を `bbox` にして
   格子を読む）と期間の表示（旅から来たときの `from`/`to`、解除ボタン）。タブに戻ったとき `map.resize()` を呼ぶ。
+- `.hidden` で出し入れする要素（`#lib-trips`・`#lib-period` ほか）に ID・クラスで `display` を指定するときは、対になる
+  `#lib-trips.hidden{display:none}` のような規則を置く（詳細度が `.hidden` に勝って消えなくなるため。描画試験 (o) が検査する）。
 - 画像の読み込み失敗（`img` の `error`）は格子・表紙・選別のメンバーで共通のプレースホルダ（`.img-broken`、文字は
   「画像なし」）に差し替える（写真タブのカードと同じ扱い）。
 - 描画試験では `window.maplibregl` を偽物（`Map`・`Popup`・`addSource`・`getSource().setData` を記録するだけ）に

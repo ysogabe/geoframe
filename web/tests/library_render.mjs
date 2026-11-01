@@ -57,7 +57,7 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
   const document = buildAdminDom();
   const calls = [];
   const flags = {};
-  const handlers = {photos: null, points: null, trips: null};   // (params, rec) => Promise | undefined
+  const handlers = {photos: null, points: null, trips: null, tabList: null, search: null};   // (params, rec) => Promise | undefined
   const fake = createFakeMaplibre();
   const fetchFake = (url, opts = {}) => {
     const rec = {url, method: opts.method || 'GET', body: opts.body};
@@ -65,7 +65,9 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
     const params = url.includes('?') ? new URLSearchParams(url.split('?')[1]) : new URLSearchParams();
     if(url === '/api/admin/status') return reply(statusBody());
     if(url === '/api/ai/status') return reply({ok: true, photos: 1, eligible: 1});
+    if(url.startsWith('/api/ai/search?') && handlers.search) return handlers.search(params, rec);
     if(url.startsWith('/api/admin/photos?')){
+      if(handlers.tabList) return handlers.tabList(params, rec);
       return reply({ok: true, page: 1, per: 50, pages: 1, total: TAB_PHOTOS.length, filter: 'all', items: TAB_PHOTOS});
     }
     if(url.startsWith('/api/admin/library/trips')){
@@ -375,15 +377,48 @@ await test('(e) 地図ビュー: points を読み、偽 MapLibre の source に�
     {properties: {cluster_id: 7, point_count: 1200, point_count_abbreviated: '1.2k'}, geometry: {coordinates: [20, 10]}},
     {properties: {cluster_id: 8, point_count: 12, point_count_abbreviated: 12}, geometry: {coordinates: [21, 11]}},
   ];
-  map.fire('render');
+  map.fire('sourcedata', {sourceId: 'photos', isSourceLoaded: true});
   const labels = () => env.fake.markers.filter(m => !m.removed);
   assert.deepEqual(labels().map(m => m.element.textContent), ['1.2k', '12']);
   assert.deepEqual(plain(labels().map(m => m.lngLat)), [[20, 10], [21, 11]]);
-  map.fire('render');
+  map.fire('moveend');
   assert.equal(labels().length, 2, '同じクラスタを重ねて作らない');
   env.fake.features = [env.fake.features[2]];
-  map.fire('render');
+  map.fire('zoomend');
   assert.deepEqual(labels().map(m => m.element.textContent), ['12'], '見えなくなったクラスタの文字は外す');
+});
+
+await test('(e3) クラスタの件数の更新は render（毎フレーム）では呼ばず、moveend・zoomend・点の sourcedata・setData の直後だけ', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-map').click();
+  await settle();
+  const map = mapOf(env);
+  const types = map.handlers.map(h => h.type);
+  assert.ok(!types.includes('render'), 'render には登録しない');
+  for(const t of ['moveend', 'zoomend', 'sourcedata']) assert.ok(types.includes(t), t);
+  const feat = id => ({properties: {cluster_id: id, point_count: 9, point_count_abbreviated: 9}, geometry: {coordinates: [20, 10]}});
+  const labels = () => env.fake.markers.filter(m => !m.removed).length;
+  env.fake.features = [feat(1)];
+  map.fire('render');
+  assert.equal(labels(), 0, 'render では更新しない');
+  map.fire('sourcedata', {sourceId: 'other', isSourceLoaded: true});
+  map.fire('sourcedata', {sourceId: 'photos', isSourceLoaded: false});
+  assert.equal(labels(), 0, '別の source・読み込み途中の sourcedata では更新しない');
+  map.fire('sourcedata', {sourceId: 'photos', isSourceLoaded: true});
+  assert.equal(labels(), 1);
+  env.fake.features = [feat(1), feat(2)];
+  map.fire('moveend');
+  assert.equal(labels(), 2);
+  // setData の直後にも合わせる（読み直しで古い文字は外れ、見えているクラスタの文字が付く）
+  env.fake.features = [feat(3)];
+  env.$('#lib-view-trips').click();
+  env.$('#lib-view-map').click();
+  await settle();
+  const live = env.fake.markers.filter(m => !m.removed);
+  assert.equal(live.length, 1);
+  assert.equal(map.sources.photos.setDataCalls.length, 2);
 });
 
 await test('(e2) クラスタを押すと展開できる zoom まで寄る。単独の点・クラスタの上ではカーソルが指になる', async () => {
@@ -510,6 +545,159 @@ await test('(g) 「この範囲の写真を見る」: 表示範囲を ±180/±90
   await settle();
   q = env.last('/api/admin/library/photos');
   assert.equal(q.get('bbox'), '-180,-90,180,90');
+});
+
+await test('(g2) 地図は周回させない（renderWorldCopies: false・maxBounds）。経度が ±180 を超える表示でも bbox は範囲内で w <= e', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-map').click();
+  await settle();
+  const map = mapOf(env);
+  assert.equal(map.options.renderWorldCopies, false);
+  assert.deepEqual(plain(map.options.maxBounds), [[-180, -85], [180, 85]]);
+  env.fake.bounds = {w: 190, s: 10, e: 210, n: 30};
+  env.$('#lib-bbox').click();
+  await settle();
+  const bbox = env.last('/api/admin/library/photos').get('bbox').split(',').map(Number);
+  assert.deepEqual(bbox, [-180, 10, 180, 30], '潰れた範囲は経度の全域にする');
+  assert.ok(bbox[0] >= -180 && bbox[2] <= 180 && bbox[0] <= bbox[2]);
+  env.$('#lib-back').click();
+  env.fake.bounds = {w: 179, s: 10, e: 210, n: 30};      // 東だけ超える: 範囲内に丸めた w < e
+  env.$('#lib-bbox').click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('bbox'), '179,10,180,30');
+});
+
+await test('(m) 範囲の格子を見ている間に「除外も含める」を切り替えても、地図に戻ると点を hidden=1 で読み直す（設定が食い違わない）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-map').click();
+  await settle();
+  const pointReqs = () => env.reqs('/api/admin/library/points');
+  assert.equal(pointReqs().length, 1);
+  env.$('#lib-bbox').click();
+  await settle();
+  const trips = env.reqs('/api/admin/library/trips').length;
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1', '格子は読み直す');
+  assert.equal(env.reqs('/api/admin/library/trips').length, trips + 1, '旅の一覧も読み直す');
+  assert.equal(pointReqs().length, 1, '地図が見えていないあいだは点を読まない');
+  env.$('#lib-back').click();
+  await settle();
+  assert.equal(pointReqs().length, 2, '地図に戻ったとき読み直す');
+  assert.equal(env.last('/api/admin/library/points').get('hidden'), '1');
+  assert.equal(hidden(env, '#lib-map-box'), false);
+  env.$('#lib-back').click();      // 戻るを重ねても、点を取り直すのは 1 回だけ
+  assert.equal(pointReqs().length, 2);
+  // 旅の一覧の上で切り替えたときも、地図ビューへ移るときに読む（setLibView）。除外を外すと hidden なし
+  env.$('#lib-view-trips').click();
+  env.$('#lib-hidden').checked = false;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(pointReqs().length, 2);
+  env.$('#lib-view-map').click();
+  await settle();
+  assert.equal(pointReqs().length, 3);
+  assert.equal(env.last('/api/admin/library/points').get('hidden'), null);
+  // 点の応答を待っている間に切り替えたら、古い設定の応答は捨てる
+  const held = [];
+  env.handlers.points = () => new Promise(res => held.push(() => res({ok: true, status: 200, json: () =>
+    Promise.resolve(pointsBody({features: [feature(999, 1, 1)]}))})));
+  env.$('#lib-view-trips').click();
+  env.$('#lib-view-map').click();           // 点の要求が飛ぶ（まだ応答なし）
+  env.$('#lib-bbox').click();               // 格子へ
+  await settle();
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  const setData = mapOf(env).sources.photos.setDataCalls.length;
+  held.forEach(f => f());
+  await settle();
+  assert.equal(mapOf(env).sources.photos.setDataCalls.length, setData, '古い応答では地図の点を差し替えない');
+});
+
+await test('(n) 写真タブの一覧・検索の応答が遅れて届いても、ライブラリから開いたビューアは閉じない（写真タブのビューアは閉じる）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  rows(env)[0].querySelector('.lib-trip-photos').click();
+  await settle();
+  // 写真タブの一覧を要求（応答は保留）→ ライブラリのビューアを開く → 応答
+  let releaseList;
+  env.handlers.tabList = () => new Promise(res => { releaseList = () => res({ok: true, status: 200, json: () =>
+    Promise.resolve({ok: true, page: 1, per: 50, pages: 1, total: 2, filter: 'all', items: TAB_PHOTOS})}); });
+  vm.runInContext('loadList()', env.context);
+  tiles(env)[1].click();
+  assert.equal(hidden(env, '#viewer'), false);
+  assert.equal(env.ev('viewerIndex'), 1);
+  releaseList();
+  await settle();
+  assert.equal(env.ev('ps.entries.length'), 2, '一覧の応答は反映される');
+  assert.equal(hidden(env, '#viewer'), false, '一覧の応答でライブラリのビューアは閉じない');
+  assert.equal(env.ev('viewerIndex'), 1);
+  assert.equal(env.ev('viewerEntries.length'), 3);
+  // 検索の応答でも同じ
+  let releaseSearch;
+  env.handlers.search = () => new Promise(res => { releaseSearch = () => res({ok: true, status: 200, json: () =>
+    Promise.resolve({ok: true, mode: 'search', query: 'x', searched_photos: 0, groups: []})}); });
+  vm.runInContext("search('x')", env.context);
+  releaseSearch();
+  await settle();
+  assert.equal(env.ev('ps.view'), 'search');
+  assert.equal(hidden(env, '#viewer'), false, '検索の応答でも閉じない');
+  assert.equal(env.ev('viewerIndex'), 1);
+  // 検索を閉じる・チップの切り替えも同じ
+  vm.runInContext('closeSearch()', env.context);
+  assert.equal(hidden(env, '#viewer'), false);
+  assert.equal(env.ev('viewerIndex'), 1);
+  // closePhotoOverlays は今までどおり全部閉じる
+  vm.runInContext('closePhotoOverlays()', env.context);
+  assert.equal(hidden(env, '#viewer'), true);
+  assert.equal(env.ev('viewerIndex'), -1);
+  // 写真タブ自身のビューア（ps.entries）は、一覧の再描画で閉じる
+  env.handlers.tabList = null;
+  vm.runInContext('loadList()', env.context);
+  await settle();
+  vm.runInContext('openModal(0)', env.context);
+  assert.equal(hidden(env, '#viewer'), false);
+  vm.runInContext('loadList()', env.context);
+  await settle();
+  assert.equal(hidden(env, '#viewer'), true);
+  assert.equal(env.ev('viewerIndex'), -1);
+});
+
+await test('(o) .hidden で出し入れする要素の display は、ID・クラスの規則が .hidden に勝たないよう、対の .hidden 規則を持つ', () => {
+  const css = fs.readFileSync(new URL('../static/admin.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(m => [m[1].trim(), m[2]]);
+  assert.ok(rules.some(([sel, body]) => sel === '.hidden' && /display:\s*none/.test(body)));
+  // library.js が .hidden を付け外しする要素（id）と、その class
+  const html = fs.readFileSync(new URL('../static/admin.html', import.meta.url), 'utf8');
+  const toggled = ['lib-trips', 'lib-map-box', 'lib-grid-box', 'lib-period', 'lib-empty'];
+  const selectorsOf = id => {
+    const tag = html.match(new RegExp('<[^>]*id="' + id + '"[^>]*>'));
+    assert.ok(tag, id);
+    const cls = (tag[0].match(/class="([^"]*)"/) || [, ''])[1].split(/\s+/).filter(c => c && c !== 'hidden');
+    return ['#' + id, ...cls.map(c => '.' + c)];
+  };
+  for(const id of toggled){
+    for(const sel of selectorsOf(id)){
+      const displays = rules.filter(([rsel, body]) => rsel.split(',').map(x => x.trim()).includes(sel) && /(^|;)\s*display:/.test(body));
+      if(!displays.length) continue;
+      assert.ok(rules.some(([rsel, body]) => rsel.split(',').map(x => x.trim()).includes(sel + '.hidden') && /display:\s*none/.test(body)),
+        sel + ' に display があるのに ' + sel + '.hidden{display:none} が無い');
+    }
+  }
+  // 逆向きの確認: .lib-* / #lib-* の display を持つ規則のうち、.hidden を付ける要素のものは上の対を持つ
+  const libDisplay = rules.filter(([sel, body]) => /^[#.]lib-[\w-]+$/.test(sel) && /(^|;)\s*display:/.test(body)).map(([sel]) => sel);
+  const hasPair = sel => rules.some(([rsel]) => rsel === sel + '.hidden');
+  for(const sel of libDisplay){
+    const isToggled = toggled.some(id => selectorsOf(id).includes(sel));
+    if(isToggled) assert.ok(hasPair(sel), sel);
+  }
 });
 
 await test('(h) 旅の「地図で見る」: その期間で points を読み、期間を表示し、解除で全期間に戻る。範囲の写真にも期間が付く', async () => {

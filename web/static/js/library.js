@@ -13,11 +13,12 @@
 /* view: 'trips'（旅の一覧）| 'map'（地図）。grid が true の間は、どちらの上にも格子（#lib-grid-box）を出す（戻るで元の view へ）。
    sel: 格子に出す絞り込み {from, to} | {untimed: true} | {bbox: [w, s, e, n]} と、表示用の label。
    period: 地図の点と範囲の絞り込みに掛ける期間 {from, to}（旅の「地図で見る」で入り、解除ボタンで外す）。
+   pointsStale: 地図が見えていないあいだに設定（除外も含める）が変わったので、地図に戻るとき点を取り直す印。
    seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が格子の読み込みを捨てないため） */
 const ls = {
   view: 'trips', includeHidden: false, grid: false,
   trips: [], untimed: 0,
-  sel: null, period: null,
+  sel: null, period: null, pointsStale: false,
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
   map: null, pendingData: null, labels: new Map(), popup: null,
   seq: {trips: 0, grid: 0, points: 0, popup: 0},
@@ -242,7 +243,8 @@ function addPointLayers(map){
             'circle-stroke-color': '#05080f'}});
 }
 /* クラスタの件数の文字。style に glyphs（文字の形のデータ）が無く symbol 層は使えないので、クラスタごとの DOM の
-   マーカー（クリックは通す）を render のたびに今見えているクラスタに合わせる */
+   マーカー（クリックは通す）を今見えているクラスタに合わせる。毎フレームの render では呼ばず、
+   動き・ズームの終わり（moveend・zoomend）、点の source の読み込み完了（sourcedata）、setData の直後に呼ぶ */
 function syncClusterLabels(){
   const map = ls.map;
   if(!map || !map.getSource(LIB_POINTS_SOURCE) || !map.isSourceLoaded(LIB_POINTS_SOURCE)) return;
@@ -265,11 +267,17 @@ function ensureLibMap(){
   const map = new maplibregl.Map({
     container: 'lib-map', style: tileStyle(),
     center: [137, 36], zoom: 4, attributionControl: {compact: true},
+    // 世界を横に周回させない（経度が ±180 を超えると表示範囲を bbox にできない。日付変更線をまたぐ範囲は扱わない）
+    renderWorldCopies: false, maxBounds: [[-180, -85], [180, 85]],
   });
   ls.map = map;
   map.addControl(new maplibregl.NavigationControl({showCompass: false}), 'top-right');
   map.on('load', () => addPointLayers(map));
-  map.on('render', syncClusterLabels);
+  map.on('moveend', syncClusterLabels);
+  map.on('zoomend', syncClusterLabels);
+  map.on('sourcedata', e => {
+    if(e.sourceId === LIB_POINTS_SOURCE && e.isSourceLoaded) syncClusterLabels();
+  });
   map.on('click', 'lib-clusters', e => {
     const f = e.features && e.features[0];
     if(!f) return;
@@ -299,11 +307,12 @@ function clearClusterLabels(){
 function setPoints(collection){
   clearClusterLabels();        // クラスタの番号は読み直すと振り直されるので、古い文字は全部外す
   const src = ls.map && ls.map.getSource(LIB_POINTS_SOURCE);
-  if(src) src.setData(collection);
+  if(src){ src.setData(collection); syncClusterLabels(); }
   else ls.pendingData = collection;      // 地図の style がまだ → load で source を作るときに入れる
 }
 function loadPoints(){
   ensureLibMap();
+  ls.pointsStale = false;
   const seq = ++ls.seq.points;
   libGet('points', pointsParams()).then(d => {
     if(seq !== ls.seq.points) return;
@@ -341,11 +350,14 @@ function openPointPopup(id, lngLat){
     body.appendChild(open);
   }).catch(() => { if(seq === ls.seq.popup) body.textContent = '読めませんでした'; });
 }
-/* 今の表示範囲を [w, s, e, n] に（lon は ±180・lat は ±90 に丸める。サーバーは範囲外を 400 にする） */
+/* 今の表示範囲を [w, s, e, n] に（lon は ±180・lat は ±90 に丸める。サーバーは範囲外を 400 にする）。
+   地図は周回しない設定だが、丸めた後に w >= e（190〜210 が 180〜180 に潰れる等。日付変更線をまたぐ範囲は扱わない）なら経度は全域にする */
 function clampTo(v, limit){ return Number(Math.max(-limit, Math.min(limit, v)).toFixed(6)); }
 function currentBbox(){
   const b = ls.map.getBounds();
-  return [clampTo(b.getWest(), 180), clampTo(b.getSouth(), 90), clampTo(b.getEast(), 180), clampTo(b.getNorth(), 90)];
+  const w = clampTo(b.getWest(), 180), s = clampTo(b.getSouth(), 90);
+  const e = clampTo(b.getEast(), 180), n = clampTo(b.getNorth(), 90);
+  return w >= e ? [-180, s, 180, n] : [w, s, e, n];
 }
 function viewBbox(){
   if(!ls.map) return;
@@ -377,6 +389,11 @@ function setLibView(view){
   if(view === 'map') loadPoints();
 }
 /* ライブラリタブを開いたとき（admin.js の showTab から）。旅は毎回読み直す。地図ビューなら点も */
+function closeGrid(){
+  ls.grid = false;
+  showLib();
+  if(ls.view === 'map' && ls.pointsStale) loadPoints();
+}
 function openLibraryTab(){
   loadTrips();
   showLib();
@@ -386,13 +403,15 @@ function onLibHiddenChange(){
   ls.includeHidden = !!$('#lib-hidden').checked;
   loadTrips();
   if(ls.grid){ ls.page = 1; loadGrid(); }
-  else if(ls.view === 'map') loadPoints();
+  // 地図が見えていれば点を読み直す。見えていない（旅の一覧・格子の上）なら、飛んでいる応答を捨てて印だけ立て、地図に戻るとき読む
+  if(ls.view === 'map' && !ls.grid) loadPoints();
+  else{ ls.seq.points++; ls.pointsStale = true; }
 }
 function initLibrary(){
   $('#lib-view-trips').addEventListener('click', () => setLibView('trips'));
   $('#lib-view-map').addEventListener('click', () => setLibView('map'));
   $('#lib-hidden').addEventListener('change', onLibHiddenChange);
-  $('#lib-back').addEventListener('click', () => { ls.grid = false; showLib(); });
+  $('#lib-back').addEventListener('click', closeGrid);
   $('#lib-prev').addEventListener('click', () => { if(ls.page > 1){ ls.page--; loadGrid(); } });
   $('#lib-next').addEventListener('click', () => { if(ls.page < ls.pages){ ls.page++; loadGrid(); } });
   $('#lib-bbox').addEventListener('click', viewBbox);

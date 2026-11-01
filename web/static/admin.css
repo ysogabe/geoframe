@@ -333,6 +333,7 @@ button.lib-seg:hover{color:var(--ink);background:rgba(0,229,255,.1)}
 button.lib-seg.on{background:var(--cyan);color:#04202a;border-color:var(--cyan)}
 /* 旅の一覧: 1 旅 1 行（表紙・期間・枚数・場所・操作） */
 #lib-trips{display:flex;flex-direction:column;gap:10px}
+#lib-trips.hidden{display:none}      /* ID の display が .hidden に勝つので、対の規則が要る */
 .lib-trip{display:flex;gap:14px;background:var(--panel);border:1px solid var(--panel-border);
   border-radius:6px;padding:10px}
 .lib-cover{position:relative;flex:none;width:132px;aspect-ratio:4/3;background:#0a1220;border-radius:4px;overflow:hidden}
@@ -367,6 +368,7 @@ button.lib-seg.on{background:var(--cyan);color:#04202a;border-color:var(--cyan)}
 #lib-map{width:100%;height:calc(100vh - 210px);min-height:320px;border:1px solid var(--panel-border);border-radius:6px}
 #lib-map .maplibregl-ctrl-attrib{font-size:9px}
 .lib-period{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--amber)}
+.lib-period.hidden{display:none}
 .lib-cluster-n{pointer-events:none;font-family:var(--mono);font-size:11px;font-weight:bold;color:#04202a}
 .lib-pop{min-width:180px;color:#10202e;font-size:12px;display:flex;flex-direction:column;gap:6px}
 .lib-pop-thumb{position:relative;width:100%;aspect-ratio:4/3;background:#0a1220;border-radius:3px;overflow:hidden}

@@ -233,7 +233,7 @@ function applyView(){
 function setFilter(f){
   ps.filter = f; ps.page = 1; ps.view = 'list';
   searchSeq++;                       // 飛んでいる検索の応答で、選んだ一覧を上書きしない
-  closeModal();
+  closeModalIfOwn();
   document.querySelectorAll('.chip').forEach(b => b.classList.toggle('on', b.dataset.filter === f));
   applyView();
   loadList();
@@ -277,7 +277,7 @@ function loadList(){
       $('#prev').disabled = d.page <= 1;
       $('#next').disabled = d.page >= d.pages;
       $('#empty').classList.toggle('hidden', d.items.length > 0);
-      closeModal();
+      closeModalIfOwn();
       const box = $('#cards'); box.textContent = '';
       ps.entries = []; ps.cards = [];
       d.items.forEach((raw, i) => {
@@ -357,7 +357,7 @@ function applyGroupVisibility(group, section, state){
 }
 /* 検索結果を #groups に描く。ps.entries は場面の順・場面の中は構図の順の平らな配列 */
 function renderSearch(data){
-  closeModal();
+  closeModalIfOwn();
   ps.mode = data.mode;
   ps.query = data.query || '';
   const groups = (data.groups || []).map(g =>
@@ -473,7 +473,7 @@ function researchWithToggle(){
 function closeSearch(){
   searchSeq++;
   ps.view = 'list';
-  closeModal();
+  closeModalIfOwn();
   ps.entries = []; ps.cards = [];
   $('#cards').textContent = '';
   $('#groups').textContent = '';
@@ -616,6 +616,11 @@ function closeModal(){
   viewerAiShown = true;
   if(viewerLastFocus && document.contains(viewerLastFocus)) viewerLastFocus.focus();
   viewerLastFocus = null;
+}
+/* 写真タブの再描画（一覧・検索の応答、チップ、検索を閉じる）で閉じるのは、ps.entries を使っているビューアだけ。
+   ライブラリ・選別から開いた viewerEntries 側のビューアは、写真タブの応答が遅れて届いても閉じない */
+function closeModalIfOwn(){
+  if(viewerEntries === null) closeModal();
 }
 /* 末尾の次は先頭、先頭の前は末尾（回る） */
 function stepModal(delta){
