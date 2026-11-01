@@ -1332,4 +1332,90 @@ await test('(y) 301 文字を送らないとき、応答待ちの「犬」の検
   }
 });
 
+await test('(z) ps.entries と違う配列から openModalFor で開く: ★は渡した写真の id に POST し、ps.entries の写真は変わらず、閉じると開いた要素にフォーカスが戻る', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  await openPhotos(env);
+  assert.equal(env.ev('ps.entries.map(e => e.photo.id)').length, 5);
+  // 一覧とは別の写真（id 900・901。架空の座標）。id 1 は ps.entries にもある同じ写真の別の object
+  const mine = [
+    {id: 900, name: 'lib-a.jpg', thumb: '/derivatives/lib-a.jpg', thumb_url: '/thumb/900.jpg?v=aaaaaaaaaaaa',
+     taken_at: '2030-01-02 03:04', lat: 10.0, lon: 20.0, loc_source: 'exif', place: '', pref: '架空県', city: '試験市',
+     favorite: false, hidden: false, rotation: 0, source: 'drive', ai: null, visual: null},
+    {id: 901, name: 'lib-b.jpg', thumb: '/derivatives/lib-b.jpg', thumb_url: '', taken_at: '2030-01-02 03:05',
+     lat: null, lon: null, loc_source: 'none', place: '', pref: '', city: '', favorite: false, hidden: false,
+     rotation: 0, source: 'local', ai: null, visual: null},
+    {id: 1, name: 'dup.jpg', thumb: '/derivatives/dup.jpg', thumb_url: '', taken_at: '', lat: null, lon: null,
+     loc_source: 'none', place: '', pref: '', city: '', favorite: false, hidden: false, rotation: 0, source: 'drive',
+     ai: null, visual: null},
+  ];
+  vm.runInContext('globalThis.__mine = ' + JSON.stringify(mine), env.context);
+  const opener = env.document.createElement('button');
+  env.document.body.appendChild(opener);
+  opener.focus();
+  vm.runInContext('openModalFor(__mine, 1, {ai: false})', env.context);
+  assert.equal(hidden(env, '#viewer'), false);
+  assert.ok(env.document.body.classList.contains('ps-viewer-open'));
+  assert.equal(env.ev('viewerIndex'), 1);
+  assert.equal(env.$('#viewer-title').textContent, '#901  lib-b.jpg');
+  assert.equal(env.$('#viewer-counter').textContent, '2 / 3', '渡した配列の長さ');
+  assert.equal(hidden(env, '#viewer-ai'), true);
+  assert.equal(hidden(env, '#viewer-group'), true);
+  assert.equal(env.document.activeElement, env.$('#viewer-close'));
+  // 前後は渡した配列の中で回る（AI の欄は出さないまま）
+  vm.runInContext('stepModal(-1)', env.context);
+  assert.equal(env.$('#viewer-title').textContent, '#900  lib-a.jpg');
+  assert.equal(hidden(env, '#viewer-ai'), true);
+  vm.runInContext('stepModal(-1)', env.context);
+  assert.equal(env.$('#viewer-title').textContent, '#1  dup.jpg', '先頭の前は末尾');
+  vm.runInContext('stepModal(1)', env.context);
+  assert.equal(env.$('#viewer-title').textContent, '#900  lib-a.jpg');
+  // ★は渡した写真（id 900）の id で setflag に POST し、ビューアの表示が変わる。ps.entries の写真は変わらない
+  const before = env.calls.filter(c => c.url === '/api/admin/setflag').length;
+  env.$('#viewer-favorite').click();
+  await settle();
+  const posts = env.calls.filter(c => c.url === '/api/admin/setflag');
+  assert.equal(posts.length, before + 1);
+  assert.deepEqual(JSON.parse(posts.at(-1).body), {id: 900, favorite: true});
+  assert.equal(env.$('#viewer-favorite').textContent, '★ favorite');
+  assert.equal(env.ev('__mine[0].favorite'), true, '渡した配列の写真に反映');
+  assert.deepEqual(env.ev('ps.entries.map(e => e.photo.favorite)'), [false, false, false, false, false]);
+  // 同じ id の写真が ps.entries にもあるとき（id 1）は、両方が更新され、一覧のカードも描き直される
+  vm.runInContext('stepModal(1)', env.context);
+  vm.runInContext('stepModal(1)', env.context);
+  assert.equal(env.$('#viewer-title').textContent, '#1  dup.jpg');
+  env.$('#viewer-hidden').click();
+  await settle();
+  assert.deepEqual(env.ev('ps.entries.map(e => e.photo.hidden)'), [true, false, false, false, true]);
+  assert.ok(cards(env)[0].classList.contains('is-hidden'));
+  // 変更の購読: (id, patch) が渡る
+  vm.runInContext('globalThis.__seen = []; onPhotoChange((id, patch) => __seen.push([id, patch]))', env.context);
+  env.$('#viewer-hidden').click();
+  await settle();
+  assert.deepEqual(env.ev('__seen'), [[1, {favorite: false, hidden: false}]]);
+  // 閉じると、開いたときにフォーカスのあった要素へ戻り、以後 ps.entries のビューアに戻る
+  env.$('#viewer-close').click();
+  assert.equal(hidden(env, '#viewer'), true);
+  assert.equal(env.document.activeElement, opener);
+  assert.equal(env.ev('viewerEntries'), null);
+  cards(env)[1].querySelector('.ph').click();
+  assert.equal(env.$('#viewer-counter').textContent, '2 / 5', '写真タブから開くと ps.entries');
+  assert.equal(env.$('#viewer-title').textContent, '#2  b.jpg');
+  // 範囲外・空の配列では開かない
+  env.$('#viewer-close').click();
+  vm.runInContext('openModalFor([], 0, {ai: false}); openModalFor(__mine, 3, {})', env.context);
+  assert.equal(hidden(env, '#viewer'), true);
+});
+
+await test('(z2) tileStyle() は呼ぶたびに新しい style を返し、タイルは現在の origin から組む', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  const a = env.ev('tileStyle()'), b = env.ev('tileStyle()');
+  assert.deepEqual(a, b);
+  assert.equal(a.sources.osm.tiles[0], 'http://localhost/tiles/osm/{z}/{x}/{y}.png');
+  assert.equal(a.sources.gsi.tiles[0], 'http://localhost/tiles/gsi/{z}/{x}/{y}.png');
+  assert.deepEqual(a.layers.map(l => l.id), ['bg', 'osm', 'gsi']);
+  assert.ok(a.sources.osm.attribution.includes('OpenStreetMap'));
+  assert.ok(vm.runInContext('tileStyle() !== tileStyle() && tileStyle().sources !== tileStyle().sources', env.context));
+});
+
 console.log(`ok (${n})`);

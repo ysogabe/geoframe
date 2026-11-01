@@ -485,6 +485,10 @@ function closeSearch(){
 
 /* ==== 5) ビューア（拡大表示・前後移動・スワイプ・キー操作） ==== */
 let viewerIndex = -1;
+/* ビューアが前後に動く配列。null のときは写真タブの ps.entries（既定）。ライブラリなど写真タブ以外から開くときは、
+   openModalFor が渡された配列を {photo, group: null} の形にして入れる。ps.entries は触らない */
+let viewerEntries = null;
+let viewerAiShown = true;        // false のとき（openModalFor の opts.ai === false）AI 評価の欄を出さない
 let viewerLastFocus = null;
 let swipeStart = null;
 let suppressMediaClick = false;
@@ -506,8 +510,10 @@ function fillList(node, values, fallback){
   const items = values && values.length ? values : (fallback ? [fallback] : []);
   items.forEach(v => node.appendChild(el('li', null, v)));
 }
+function vEntries(){ return viewerEntries || ps.entries; }
 function renderModal(){
-  const entry = ps.entries[viewerIndex];
+  const list = vEntries();
+  const entry = list[viewerIndex];
   if(!entry) return;
   const photo = entry.photo, group = entry.group, ai = photo.ai, visual = photo.visual;
   const image = $('#viewer-image');
@@ -515,12 +521,12 @@ function renderModal(){
   image.alt = photo.name;
   $('#viewer-title').textContent = '#' + photo.id + '  ' + photo.name;
   $('#viewer-meta').textContent = photo.taken_at || '撮影時刻なし';
-  $('#viewer-counter').textContent = (viewerIndex + 1) + ' / ' + ps.entries.length;
+  $('#viewer-counter').textContent = (viewerIndex + 1) + ' / ' + list.length;
   $('#viewer-group-kind').textContent = group
     ? (GROUP_KIND_LABEL[group.kind] || group.kind) + ' · GROUP ' + (entry.groupIndex + 1) +
       ' · ' + (entry.photoIndex + 1) + '/' + group.photos.length
     : '';
-  $('#viewer-group').classList.toggle('hidden', !group);
+  $('#viewer-group').classList.toggle('hidden', !group || !viewerAiShown);
   if(group){
     $('#viewer-group-summary').textContent = group.summary ||
       (group.photos.length > 1 ? group.photos.length + '枚の類似写真' : '単独の検索候補');
@@ -536,7 +542,7 @@ function renderModal(){
   }
   paintTags($('#viewer-badges'), photo, true);
 
-  $('#viewer-ai').classList.toggle('hidden', !ai);
+  $('#viewer-ai').classList.toggle('hidden', !ai || !viewerAiShown);
   $('#viewer-scores').textContent = '';
   $('#viewer-analysis').textContent = '';
   if(ai){
@@ -565,17 +571,19 @@ function renderModal(){
   hid.classList.toggle('on', photo.hidden);
   hid.textContent = photo.hidden ? '● hidden' : '○ hidden';
 
-  const multiple = ps.entries.length > 1;
+  const multiple = list.length > 1;
   $('#viewer-prev').disabled = !multiple;
   $('#viewer-next').disabled = !multiple;
   if(multiple && typeof Image === 'function'){
-    const n = ps.entries.length;
-    [ps.entries[(viewerIndex - 1 + n) % n].photo.thumb, ps.entries[(viewerIndex + 1) % n].photo.thumb]
+    const n = list.length;
+    [list[(viewerIndex - 1 + n) % n].photo.thumb, list[(viewerIndex + 1) % n].photo.thumb]
       .forEach(src => { if(src){ const pre = new Image(); pre.src = src; } });
   }
 }
-function openModal(index){
-  if(index < 0 || index >= ps.entries.length) return;
+/* ビューアを表示する処理（openModal と openModalFor で共通）。viewerEntries・viewerAiShown は呼ぶ側が決めておく */
+function showViewer(index){
+  const list = vEntries();
+  if(index < 0 || index >= list.length) return;
   viewerIndex = index;
   viewerLastFocus = document.activeElement;
   renderModal();
@@ -583,18 +591,37 @@ function openModal(index){
   document.body.classList.add('ps-viewer-open');
   $('#viewer-close').focus();
 }
+/* 写真タブから: ps.entries の index 番目を開く */
+function openModal(index){
+  viewerEntries = null;
+  viewerAiShown = true;
+  showViewer(index);
+}
+/* 写真タブ以外（ライブラリ・選別）から: 渡した写真の配列を前後に動くビューアを開く。
+   photos は normalizePhoto を通した形（id・name・thumb・thumb_url・taken_at・lat・lon・place・pref・city・
+   favorite・hidden・rotation・source …）。opts.ai === false で AI 評価・場面グループの欄を出さない。
+   ★・除外の反映は applyPhoto が渡された配列の写真にも行う */
+function openModalFor(photos, index, opts){
+  if(!Array.isArray(photos) || index < 0 || index >= photos.length) return;
+  viewerEntries = photos.map(photo => ({photo, group: null, groupIndex: 0, photoIndex: 0}));
+  viewerAiShown = !(opts && opts.ai === false);
+  showViewer(index);
+}
 function closeModal(){
   if(viewerIndex < 0) return;
   $('#viewer').classList.add('hidden');
   document.body.classList.remove('ps-viewer-open');
   viewerIndex = -1;
+  viewerEntries = null;
+  viewerAiShown = true;
   if(viewerLastFocus && document.contains(viewerLastFocus)) viewerLastFocus.focus();
   viewerLastFocus = null;
 }
 /* 末尾の次は先頭、先頭の前は末尾（回る） */
 function stepModal(delta){
-  if(viewerIndex < 0 || ps.entries.length < 2) return;
-  viewerIndex = (viewerIndex + delta + ps.entries.length) % ps.entries.length;
+  const n = vEntries().length;
+  if(viewerIndex < 0 || n < 2) return;
+  viewerIndex = (viewerIndex + delta + n) % n;
   renderModal();
 }
 
@@ -606,9 +633,21 @@ function applyPhoto(id, patch){
     Object.assign(entry.photo, patch);
     refreshCard(ps.cards[i], entry.photo);
   });
-  const open = ps.entries[viewerIndex];
+  /* openModalFor で渡された配列の写真（ps.entries とは別の object）にも同じ値を入れる。
+     同じ object のとき（ps.entries を渡したとき）は二重に入れても同じ */
+  if(viewerEntries){
+    viewerEntries.forEach(entry => {
+      if(String(entry.photo.id) === String(id)) Object.assign(entry.photo, patch);
+    });
+  }
+  const open = vEntries()[viewerIndex];
   if(open && String(open.photo.id) === String(id)) renderModal();
+  photoChangeListeners.slice().forEach(fn => fn(id, patch));
 }
+/* 写真タブ以外の画面（library.js・curation.js）が、自分のタイルや行を描き直すための購読。
+   applyPhoto が (id, patch) を渡す。登録は各画面の init で 1 回 */
+const photoChangeListeners = [];
+function onPhotoChange(fn){ if(typeof fn === 'function') photoChangeListeners.push(fn); }
 function setFlag(photo, patch){
   postJSON('/api/admin/setflag', Object.assign({id: photo.id}, patch)).then(j => {
     applyPhoto(photo.id, {favorite: !!j.favorite, hidden: !!j.hidden});
@@ -639,19 +678,24 @@ const TILE_ATTRIB_GSI = '出典: ' + "<a href='" + GSI_URL + "'>" + GSI_NAME + '
 let mini = null, miniMarker = null, curPhoto = null, picked = null;
 let suggestMarker = null;     // AI候補の代表点（確定用の miniMarker とは色を分ける）
 
+/* 背景地図の style（位置指定モーダルとライブラリの地図で共有）。呼ぶたびに新しい object を返す
+   （MapLibre は渡された style を書き換えることがある）。location は呼んだ時点で読む */
+function tileStyle(){
+  return {version: 8, sources: {
+      osm: {type: 'raster', tiles: [location.origin + '/tiles/osm/{z}/{x}/{y}.png'],
+            tileSize: 256, maxzoom: 19, attribution: TILE_ATTRIB_OSM},
+      gsi: {type: 'raster', tiles: [location.origin + '/tiles/gsi/{z}/{x}/{y}.png'],
+            tileSize: 256, minzoom: 5, maxzoom: 18,
+            bounds: [122.5, 20.2, 154.5, 46.5], attribution: TILE_ATTRIB_GSI}},
+    layers: [{id: 'bg', type: 'background', paint: {'background-color': '#e8eef4'}},
+             {id: 'osm', type: 'raster', source: 'osm'},
+             {id: 'gsi', type: 'raster', source: 'gsi'}]};
+}
 function ensureMini(){
   if(mini) return mini;
   mini = new maplibregl.Map({
     container: 'minimap',
-    style: {version: 8, sources: {
-        osm: {type: 'raster', tiles: [location.origin + '/tiles/osm/{z}/{x}/{y}.png'],
-              tileSize: 256, maxzoom: 19, attribution: TILE_ATTRIB_OSM},
-        gsi: {type: 'raster', tiles: [location.origin + '/tiles/gsi/{z}/{x}/{y}.png'],
-              tileSize: 256, minzoom: 5, maxzoom: 18,
-              bounds: [122.5, 20.2, 154.5, 46.5], attribution: TILE_ATTRIB_GSI}},
-      layers: [{id: 'bg', type: 'background', paint: {'background-color': '#e8eef4'}},
-               {id: 'osm', type: 'raster', source: 'osm'},
-               {id: 'gsi', type: 'raster', source: 'gsi'}]},
+    style: tileStyle(),
     center: [139.7, 35.68], zoom: 9,
     attributionControl: {compact: true}
   });
@@ -834,16 +878,16 @@ function initPhotos(){
   $('#viewer-next').addEventListener('click', () => stepModal(1));
   $('#viewer').addEventListener('click', e => { if(e.target === $('#viewer')) closeModal(); });
   $('#viewer-favorite').addEventListener('click', () => {
-    const entry = ps.entries[viewerIndex];
+    const entry = vEntries()[viewerIndex];
     if(entry) setFlag(entry.photo, {favorite: !entry.photo.favorite});
   });
   $('#viewer-hidden').addEventListener('click', () => {
-    const entry = ps.entries[viewerIndex];
+    const entry = vEntries()[viewerIndex];
     if(entry) setFlag(entry.photo, {hidden: !entry.photo.hidden});
   });
   const media = $('#viewer-media');
   media.addEventListener('click', e => {
-    if(suppressMediaClick || ps.entries.length < 2) return;
+    if(suppressMediaClick || vEntries().length < 2) return;
     const bounds = media.getBoundingClientRect();
     const position = (e.clientX - bounds.left) / bounds.width;
     if(position < 0.34) stepModal(-1);
