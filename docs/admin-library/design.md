@@ -574,6 +574,35 @@ CASE WHEN q.group_id IS NULL THEN 0
 - 本文: `{"kind", "group_id", "token"}`（同じ検査。`token` が合わなければ 409）。メンバーの `photo_curation` 行を `DELETE`
   するだけ（stale の行も消す）。応答は `confirm` と同じ。
 
+### 実装との対応（`admin_curation.rs`。T7）
+
+設計どおりに作った。実装で決めたこと・設計から細かくずれたことだけを書く。
+
+- **共有の定義**: `groups` の一覧・件数、`confirm`/`reset` のメンバーの読み出し、状況タブの `curation::pending_groups` は
+  `curation::members_from(curation)`（世代の合う `photo_quality` と `photos`、表があれば有効な記録 `c`）、
+  `curation::member_record(curation)`（`representative`/`reviewed`/`stale`/`none` の式）、
+  `curation::not_confirmed`/`all_confirmed`（`HAVING` の条件）から作る。`curation_pending` と
+  `groups?state=unconfirmed` の `total` が一致するのは、同じ `FROM`・`GROUP BY`・`HAVING` から数えるため（AC9）。
+  表が無いとき（`curation=false`）はこれらの片が `photo_curation` を一切書かない。
+- **`ids=` は写真 ID**（その写真が属する、世代の合うグループを返す）。グループ ID ではない。
+- **有効な推奨 `effective` は Rust で求める**（メンバーに有効な `representative` があればその写真だけ、無ければ
+  `recommended`）。SQL の `effective_recommended` と同じ定義で、1 組ぶんのメンバーを読んだ後に付けるので副問い合わせは要らない。
+  `warning` と `selectable` もこの 1 回の読み出しから出す。
+- **グループの `taken_at`** は空でない `taken_at` の最小（無ければ `""`）。並びも同じ値
+  （`COALESCE(MIN(NULLIF(p.taken_at,'')),'') DESC, group_kind, group_id`）。
+- **`confirm` の `representatives: null`** は、人の代表がある組でも**人の代表を外して**全員を `reviewed` にする
+  （解析の推奨に戻って確認済み）。画面の「このままで確認済み」は、有効な人の代表があればそれを入れて送る。
+- **`reset` は `representatives` を見ない**（あっても無視）。`confirm` と `reset` の本文の検査は `kind`・`group_id`・
+  `token` が共通で、エラーはどれも 400 `bad_params`（値は応答に出さない）。
+- **`decided_at`** は `strftime('%Y-%m-%d %H:%M:%S','now')`（SQLite の UTC）。世代の 4 列は `INSERT … SELECT … FROM photo_quality`
+  で `photo_quality` の行の値をそのまま入れる。
+- **失敗の符号**: 本文の形 400 `bad_params` → writer が無ければ 503 → `BEGIN IMMEDIATE` の中で 409 `group_changed`
+  （組が消えた・1 枚になった・`token` 違い）→ 400 `bad_params`（部分集合でない）→ 400 `representative_not_visible`。
+  `photo_curation` 表が無い DB に writer がある（起動時に作る前提で通常は起きない）ときは何も書かず 503。
+  待ち切れなかった `SQLITE_BUSY`/`LOCKED` は 503（既存の `ApiError::Unavailable` を使うので、本文の文面は
+  「書き込みが無効…」の既存の定型文。符号は変えていない）。
+- **HEAD・POST の `groups`、GET の `confirm`/`reset`** は既存の決まりどおり 403。`groups` は `no-store`。
+
 ### `GET /api/admin/status` の変更（PR ③）
 
 - `db.quality.recommended`・`exact_suppressed`・`similar_alternates`（`quality_summary`、`admin.rs:335`）を
