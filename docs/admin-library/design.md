@@ -207,11 +207,12 @@ flowchart LR
 
 ```
 ls = {
-  view: 'trips' | 'map' | 'calendar' | 'places',   // 必須は trips と map（実装は trips と map）
+  view: 'trips' | 'map' | 'calendar' | 'places',   // 必須は trips と map。calendar・places は「あると良い」（PR ② で実装）
   grid: false,          // true の間は、どちらの view の上にも格子を出す（戻るで元の view へ）
   includeHidden: false,
   trips: [], untimed: 0,   // GET /api/admin/library/trips の結果
-  sel: null,            // 格子の絞り込み {from, to} | {untimed} | {bbox} と表示用の label
+  years: [], calUntimed: 0, prefs: [], abroad: 0,   // calendar・places の結果。openYears・openPrefs は開いている行、loaded は読み込み済みの view
+  sel: null,            // 格子の絞り込み {from, to} | {untimed} | {bbox} | {pref, city?} | {abroad} と表示用の label
   period: null,         // 地図の点と範囲に掛ける期間 {from, to}（旅の「地図で見る」で入り、解除で外す）
   pointsStale: false,   // 地図が見えていないあいだに「除外も含める」が変わった印（地図へ戻るとき点を取り直す）
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],   // 格子

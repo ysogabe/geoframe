@@ -36,6 +36,12 @@ const TRIP_A = {key: '2030-05-03 09:12', start: '2030-05-03 09:12', end: '2030-0
 const TRIP_B = {key: '2029-01-01 00:00', start: '2029-01-01 00:00', end: '2029-01-01 00:00', count: 1, noloc: 1,
   places: [], cover: null};
 const tripsBody = () => ({ok: true, trips: [TRIP_A, TRIP_B], untimed: 12});
+const calendarBody = () => ({ok: true, untimed: 5, years: [
+  {year: '2030', count: 30, months: [{month: '05', count: 20}, {month: '12', count: 10}]},
+  {year: '2029', count: 4, months: [{month: '01', count: 4}]}]});
+const placesBody = () => ({ok: true, abroad: 9, prefs: [
+  {pref: '架空県', count: 50, cities: [{city: '試験市', count: 40}, {city: '見本町', count: 8}, {city: '', count: 2}]},
+  {pref: '試験県', count: 3, cities: [{city: 'サンプル市', count: 3}]}]});
 
 const lp = o => ({name: 'lib.jpg', thumb: '/derivatives/lib.jpg', thumb_url: '', taken_at: '2030-05-03 09:12',
   lat: 10.0, lon: 20.0, loc_source: 'exif', place: '', pref: '架空県', city: '試験市',
@@ -57,7 +63,7 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
   const document = buildAdminDom();
   const calls = [];
   const flags = {};
-  const handlers = {photos: null, points: null, trips: null, tabList: null, search: null};   // (params, rec) => Promise | undefined
+  const handlers = {photos: null, points: null, trips: null, calendar: null, places: null, tabList: null, search: null};   // (params, rec) => Promise | undefined
   const fake = createFakeMaplibre();
   const fetchFake = (url, opts = {}) => {
     const rec = {url, method: opts.method || 'GET', body: opts.body};
@@ -78,6 +84,16 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
       const per = Number(params.get('per')) || 60;
       return reply({ok: true, page: Number(params.get('page')) || 1, per, pages: 1, total: gridItems.length,
                     items: gridItems});
+    }
+    if(url.startsWith('/api/admin/library/calendar')){
+      return (handlers.calendar && handlers.calendar(params, rec)) || reply(calendarBody());
+    }
+    if(url.startsWith('/api/admin/library/places')){
+      return (handlers.places && handlers.places(params, rec)) || reply(placesBody());
+    }
+    if(url === '/api/admin/setloc'){
+      const b = JSON.parse(opts.body);
+      return reply({ok: true, lat: b.lat, lon: b.lon});
     }
     if(url.startsWith('/api/admin/library/points')){
       return (handlers.points && handlers.points(params, rec)) || reply(pointsBody());
@@ -683,7 +699,7 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
   assert.ok(rules.some(([sel, body]) => sel === '.hidden' && /display:\s*none/.test(body)));
   // library.js が .hidden を付け外しする要素（id）と、その class
   const html = fs.readFileSync(new URL('../static/admin.html', import.meta.url), 'utf8');
-  const toggled = ['lib-trips', 'lib-map-box', 'lib-grid-box', 'lib-period', 'lib-empty'];
+  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-map-box', 'lib-grid-box', 'lib-period', 'lib-empty'];
   const selectorsOf = id => {
     const tag = html.match(new RegExp('<[^>]*id="' + id + '"[^>]*>'));
     assert.ok(tag, id);
@@ -826,6 +842,245 @@ await test('(l) 旅の読み込み失敗はトーストで知らせ、一覧は�
   await openLib(env);
   assert.ok(env.$('#toast').textContent.includes('旅の一覧を読めませんでした: boom'));
   assert.equal(rows(env).length, 0);
+});
+
+const groupRows = (env, box) => env.$$('#' + box + ' .lib-grow');
+const rowText = row => [row.querySelector('.lib-gname').textContent, row.querySelector('.lib-gcount').textContent];
+const showBtn = row => row.querySelector('.lib-gphotos');
+
+await test('(p) 日付: 年の行（件数つき）を押すと月の行が開き、年・月のどちらからも from/to 付きで格子が出る。日時なしは untimed=1', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  assert.equal(env.reqs('/api/admin/library/calendar').length, 0, '日付を開くまで読まない');
+  env.$('#lib-view-calendar').click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/calendar')[0].url, '/api/admin/library/calendar', '既定は除外を含めない');
+  assert.ok(env.$('#lib-view-calendar').classList.contains('on'));
+  assert.ok(!env.$('#lib-view-trips').classList.contains('on'));
+  assert.equal(hidden(env, '#lib-calendar'), false);
+  assert.equal(hidden(env, '#lib-trips'), true);
+  assert.equal(hidden(env, '#lib-places'), true);
+  assert.equal(env.$('#lib-note').textContent, '2 年');
+  // 年の行だけ（月は閉じている）。新しい年が先
+  let r = groupRows(env, 'lib-calendar');
+  assert.deepEqual(r.map(rowText), [['2030年', '30 枚'], ['2029年', '4 枚']]);
+  assert.equal(r[0].querySelector('.lib-expand').getAttribute('aria-expanded'), 'false');
+  // 末尾に日時なし
+  assert.equal(env.$('#lib-calendar .lib-untimed .lib-trip-range').textContent, '日時なし（5 枚）');
+  // 年を押すと月の行が開く（件数つき）。ほかの年は閉じたまま
+  r[0].querySelector('.lib-expand').click();
+  r = groupRows(env, 'lib-calendar');
+  assert.deepEqual(r.map(rowText), [['2030年', '30 枚'], ['05月', '20 枚'], ['12月', '10 枚'], ['2029年', '4 枚']]);
+  assert.equal(r[0].querySelector('.lib-expand').getAttribute('aria-expanded'), 'true');
+  assert.equal(r[1].querySelector('.lib-expand'), null, '月の行は開閉しない');
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '開いただけでは格子を読まない');
+  // 月の「写真を見る」
+  showBtn(r[2]).click();
+  await settle();
+  let q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('from'), '2030-12-01 00:00');
+  assert.equal(q.get('to'), '2030-12-31 23:59');
+  assert.equal(q.get('pref'), null);
+  assert.equal(hidden(env, '#lib-grid-box'), false);
+  assert.equal(hidden(env, '#lib-calendar'), true);
+  assert.equal(env.$('#lib-sel').textContent, '2030年12月');
+  assert.equal(tiles(env).length, 3);
+  // 戻ると日付の一覧（開いた年は開いたまま）
+  env.$('#lib-back').click();
+  assert.equal(hidden(env, '#lib-calendar'), false);
+  assert.equal(hidden(env, '#lib-grid-box'), true);
+  assert.equal(groupRows(env, 'lib-calendar').length, 4);
+  // 年の「写真を見る」
+  showBtn(groupRows(env, 'lib-calendar')[3]).click();
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('from'), '2029-01-01 00:00');
+  assert.equal(q.get('to'), '2029-12-31 23:59');
+  assert.equal(env.$('#lib-sel').textContent, '2029年');
+  env.$('#lib-back').click();
+  // 年の行をもう一度押すと閉じる
+  groupRows(env, 'lib-calendar')[0].querySelector('.lib-expand').click();
+  assert.deepEqual(groupRows(env, 'lib-calendar').map(rowText), [['2030年', '30 枚'], ['2029年', '4 枚']]);
+  // 日時なし
+  env.$('#lib-calendar .lib-untimed .lib-trip-photos').click();
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('untimed'), '1');
+  assert.equal(q.get('from'), null);
+  assert.equal(env.$('#lib-sel').textContent, '日時なし');
+  // 旅へ戻すと、旅の一覧と旅の件数
+  env.$('#lib-back').click();
+  env.$('#lib-view-trips').click();
+  assert.equal(hidden(env, '#lib-trips'), false);
+  assert.equal(hidden(env, '#lib-calendar'), true);
+  assert.equal(env.$('#lib-note').textContent, '旅 2 件');
+});
+
+await test('(p2) 日付: 「除外も含める」で読み直し（hidden=1）、写真が無ければ空の表示。読み込み失敗はトースト', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-calendar').click();
+  await settle();
+  const before = env.reqs('/api/admin/library/calendar').length;
+  env.handlers.calendar = () => reply({ok: true, years: [{year: '2031', count: 1, months: [{month: '02', count: 1}]}], untimed: 0});
+  const box = env.$('#lib-hidden');
+  box.checked = true;
+  box.dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/calendar').length, before + 1);
+  assert.equal(env.last('/api/admin/library/calendar').get('hidden'), '1');
+  assert.deepEqual(groupRows(env, 'lib-calendar').map(rowText), [['2031年', '1 枚']]);
+  assert.equal(env.$$('#lib-calendar .lib-untimed').length, 0, '日時なし 0 枚なら行を出さない');
+  // 格子を見ているときの切り替えでも、日付の一覧は読み直し、格子には hidden=1 が付く
+  groupRows(env, 'lib-calendar')[0].querySelector('.lib-gphotos').click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1');
+  env.handlers.calendar = () => reply({ok: true, years: [], untimed: 0});
+  box.checked = false;
+  box.dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(env.last('/api/admin/library/calendar').get('hidden'), null);
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), null);
+  env.$('#lib-back').click();
+  assert.equal(env.$('#lib-calendar').textContent, '写真がありません');
+  // 失敗
+  env.handlers.calendar = () => respond(500, {ok: false, error: 'boom'});
+  env.$('#lib-view-places').click();
+  env.$('#lib-view-calendar').click();
+  await settle();
+  assert.ok(env.$('#toast').textContent.includes('日付の一覧を読めませんでした: boom'));
+});
+
+await test('(q) 場所: 都道府県の行を押すと市区町村の行が開き、どちらからも pref（と city）付きで格子が出る。海外・不明は abroad=1', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-places').click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/places')[0].url, '/api/admin/library/places');
+  assert.ok(env.$('#lib-view-places').classList.contains('on'));
+  assert.equal(hidden(env, '#lib-places'), false);
+  assert.equal(hidden(env, '#lib-calendar'), true);
+  assert.equal(env.$('#lib-note').textContent, '2 都道府県');
+  let r = groupRows(env, 'lib-places');
+  assert.deepEqual(r.map(rowText), [['架空県', '50 枚'], ['試験県', '3 枚']]);
+  assert.equal(env.$('#lib-places .lib-untimed .lib-trip-range').textContent, '海外・不明（9 枚）');
+  // 開く
+  r[0].querySelector('.lib-expand').click();
+  r = groupRows(env, 'lib-places');
+  assert.deepEqual(r.map(rowText), [['架空県', '50 枚'], ['試験市', '40 枚'], ['見本町', '8 枚'], ['（市区町村なし）', '2 枚'],
+                                    ['試験県', '3 枚']]);
+  assert.equal(showBtn(r[3]), null, '市区町村が空の項目は city で絞れないので、写真を見るボタンを置かない');
+  // 市区町村 → pref と city
+  showBtn(r[2]).click();
+  await settle();
+  let q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('pref'), '架空県');
+  assert.equal(q.get('city'), '見本町');
+  assert.equal(q.get('from'), null);
+  assert.equal(q.get('abroad'), null);
+  assert.equal(env.$('#lib-sel').textContent, '架空県 見本町');
+  assert.equal(hidden(env, '#lib-grid-box'), false);
+  assert.equal(tiles(env).length, 3);
+  env.$('#lib-back').click();
+  assert.equal(hidden(env, '#lib-places'), false);
+  // 都道府県 → pref だけ
+  showBtn(groupRows(env, 'lib-places')[4]).click();
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('pref'), '試験県');
+  assert.equal(q.get('city'), null);
+  assert.equal(env.$('#lib-sel').textContent, '試験県');
+  env.$('#lib-back').click();
+  // 海外・不明
+  env.$('#lib-places .lib-untimed .lib-trip-photos').click();
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('abroad'), '1');
+  assert.equal(q.get('pref'), null);
+  assert.equal(q.get('city'), null);
+  assert.equal(q.get('untimed'), null);
+  assert.equal(env.$('#lib-sel').textContent, '海外・不明');
+  // 除外を含める → 格子にも場所の一覧にも hidden=1（abroad も付いたまま）
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('hidden'), '1');
+  assert.equal(q.get('abroad'), '1');
+  assert.equal(env.last('/api/admin/library/places').get('hidden'), '1');
+  env.$('#lib-back').click();
+  // 空・失敗
+  env.handlers.places = () => reply({ok: true, prefs: [], abroad: 0});
+  env.$('#lib-view-trips').click();
+  env.$('#lib-view-places').click();
+  await settle();
+  assert.equal(env.$('#lib-places').textContent, '写真がありません');
+  env.handlers.places = () => respond(500, {ok: false, error: 'boom'});
+  env.$('#lib-view-trips').click();
+  env.$('#lib-view-places').click();
+  await settle();
+  assert.ok(env.$('#toast').textContent.includes('場所の一覧を読めませんでした: boom'));
+});
+
+await test('(q2) ライブラリタブを開き直すと、日付・場所のビューのままなら一覧を読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-places').click();
+  await settle();
+  env.$('.tab[data-tab=status]').click();
+  await settle();
+  await openLib(env);
+  assert.equal(env.reqs('/api/admin/library/places').length, 2);
+  assert.equal(hidden(env, '#lib-places'), false);
+  assert.equal(hidden(env, '#lib-trips'), true);
+});
+
+await test('(r) 格子のタイルの 📍 で位置の指定が開く（ビューアは開かない）。保存すると「位置なし」の印が消える', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  rows(env)[0].querySelector('.lib-trip-photos').click();
+  await settle();
+  const t = tiles(env);
+  assert.deepEqual(marksOf(t[1]), ['位置なし']);
+  const btn = t[1].querySelector('.lib-loc');
+  assert.equal(btn.tagName.toLowerCase(), 'button');
+  assert.equal(btn.textContent, '📍');
+  assert.equal(btn.title, '位置を指定');
+  assert.equal(btn.type, 'button');
+  assert.ok(t.every(x => x.querySelector('.lib-loc')), '位置のある写真にも置く（指定し直せる）');
+  assert.equal(hidden(env, '#modal'), true);
+  // 親へ伝わるクリック（バブリング）でも、ボタンで止まってタイルのビューアには届かない。別の場所のクリックなら届く
+  btn.dispatchEvent({type: 'click', bubbles: true});
+  assert.equal(hidden(env, '#modal'), false, '位置の指定が開く');
+  assert.equal(hidden(env, '#viewer'), true, 'タイルのクリック（ビューア）とは混ざらない');
+  assert.ok(!env.document.body.classList.contains('ps-viewer-open'));
+  assert.equal(env.ev('curPhoto.id'), 502);
+  assert.equal(env.$('#m-title').textContent, '#502  b.jpg  /  2030-05-03 09:20');
+  assert.equal(env.$('#m-save').disabled, true, '地図を押すまで保存できない');
+  // キー操作（Enter）もタイルのビューアに届かない
+  btn.dispatchEvent({type: 'keydown', key: 'Enter', bubbles: true});
+  btn.dispatchEvent({type: 'keydown', key: ' ', bubbles: true});
+  assert.equal(hidden(env, '#viewer'), true);
+  // 地図（位置の指定の地図）を押して保存
+  const mini = env.fake.maps.at(-1);
+  mini.fire('click', {lngLat: {lat: 35.123456, lng: 139.654321}});
+  assert.equal(env.$('#m-save').disabled, false);
+  env.$('#m-save').click();
+  await settle();
+  const post = env.reqs('/api/admin/setloc').at(-1);
+  assert.deepEqual(JSON.parse(post.body), {id: 502, lat: 35.123456, lon: 139.654321});
+  assert.equal(hidden(env, '#modal'), true, '保存すると閉じる');
+  assert.deepEqual(marksOf(t[1]), [], '位置なしの印が消える');
+  assert.equal(env.ev('ls.items[1].lat'), 35.123456);
+  assert.equal(env.ev('ls.items[1].loc_source'), 'manual');
+  assert.equal(hidden(env, '#viewer'), true);
+  // ★ など他の印は変わらない（c.jpg は ★ のまま）
+  assert.deepEqual(marksOf(t[2]), ['★']);
 });
 
 console.log(`ok (${n})`);

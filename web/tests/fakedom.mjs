@@ -142,7 +142,12 @@ class FakeElement {
     ev.target = ev.target || this;
     ev.currentTarget = this;
     if(!ev.preventDefault) ev.preventDefault = () => { ev.defaultPrevented = true; };
+    if(!ev.stopPropagation) ev.stopPropagation = () => { ev.propagationStopped = true; };
     (this.listeners[ev.type] || []).slice().forEach(fn => fn(ev));
+    // 親へ伝える（バブリング）のは、試験が `bubbles: true` を付けたイベントだけ（既存の試験は子で止まる前提）
+    if(ev.bubbles && !ev.propagationStopped && this.parentNode && this.parentNode.nodeType === 1){
+      this.parentNode.dispatchEvent(Object.assign(ev, {target: ev.target}));
+    }
     return !ev.defaultPrevented;
   }
   // ブラウザと同じく、disabled なフォームコントロールの click() はイベントを発火しない
@@ -267,6 +272,8 @@ export function buildAdminDom(){
   const lib = mk('section', {id: 'v-library', cls: 'hidden'}, main);
   const lbar = mk('div', {cls: 'toolbar lib-bar'}, lib);
   mk('button', {id: 'lib-view-trips', cls: 'lib-seg on', text: '旅', data: {view: 'trips'}}, lbar);
+  mk('button', {id: 'lib-view-calendar', cls: 'lib-seg', text: '日付', data: {view: 'calendar'}}, lbar);
+  mk('button', {id: 'lib-view-places', cls: 'lib-seg', text: '場所', data: {view: 'places'}}, lbar);
   mk('button', {id: 'lib-view-map', cls: 'lib-seg', text: '地図', data: {view: 'map'}}, lbar);
   const lopt = mk('label', {cls: 'opt'}, lbar);
   mk('input', {id: 'lib-hidden'}, lopt);
@@ -274,6 +281,8 @@ export function buildAdminDom(){
   mk('span', {cls: 'spacer'}, lbar);
   mk('span', {id: 'lib-note', cls: 'count'}, lbar);
   mk('div', {id: 'lib-trips'}, lib);
+  mk('div', {id: 'lib-calendar', cls: 'hidden'}, lib);
+  mk('div', {id: 'lib-places', cls: 'hidden'}, lib);
   const lmapbox = mk('div', {id: 'lib-map-box', cls: 'hidden'}, lib);
   const lmbar = mk('div', {cls: 'toolbar'}, lmapbox);
   mk('button', {id: 'lib-bbox', cls: 'btn', text: 'この範囲の写真を見る'}, lmbar);

@@ -104,12 +104,16 @@
   <section id="v-library" class="hidden">
     <div class="toolbar lib-bar">
       <button class="lib-seg on" id="lib-view-trips" type="button" data-view="trips">旅</button>
+      <button class="lib-seg" id="lib-view-calendar" type="button" data-view="calendar">日付</button>
+      <button class="lib-seg" id="lib-view-places" type="button" data-view="places">場所</button>
       <button class="lib-seg" id="lib-view-map" type="button" data-view="map">地図</button>
       <label class="opt"><input type="checkbox" id="lib-hidden"> 除外も含める</label>
       <span class="spacer"></span>
       <span class="count" id="lib-note"></span>
     </div>
     <div id="lib-trips"></div>
+    <div id="lib-calendar" class="hidden"></div>
+    <div id="lib-places" class="hidden"></div>
     <div id="lib-map-box" class="hidden">
       <div class="toolbar">
         <button class="btn" id="lib-bbox" type="button">この範囲の写真を見る</button>
