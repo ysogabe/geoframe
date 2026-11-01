@@ -397,7 +397,7 @@ await test('(e3) クラスタの件数の更新は render（毎フレーム）�
   const map = mapOf(env);
   const types = map.handlers.map(h => h.type);
   assert.ok(!types.includes('render'), 'render には登録しない');
-  for(const t of ['moveend', 'zoomend', 'sourcedata']) assert.ok(types.includes(t), t);
+  for(const t of ['moveend', 'zoomend', 'idle', 'sourcedata']) assert.ok(types.includes(t), t);
   const feat = id => ({properties: {cluster_id: id, point_count: 9, point_count_abbreviated: 9}, geometry: {coordinates: [20, 10]}});
   const labels = () => env.fake.markers.filter(m => !m.removed).length;
   env.fake.features = [feat(1)];
@@ -411,6 +411,13 @@ await test('(e3) クラスタの件数の更新は render（毎フレーム）�
   env.fake.features = [feat(1), feat(2)];
   map.fire('moveend');
   assert.equal(labels(), 2);
+  // moveend の時点では古いまま（sourcedata も出ない）→ idle で更新先のクラスタに合う
+  env.fake.features = [feat(1), feat(2)];
+  map.fire('moveend');
+  env.fake.features = [feat(5)];
+  assert.equal(labels(), 2, 'idle の前は古いまま');
+  map.fire('idle');
+  assert.equal(labels(), 1, 'idle で更新先のクラスタに合う');
   // setData の直後にも合わせる（読み直しで古い文字は外れ、見えているクラスタの文字が付く）
   env.fake.features = [feat(3)];
   env.$('#lib-view-trips').click();

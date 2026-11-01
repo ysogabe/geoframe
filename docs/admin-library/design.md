@@ -233,7 +233,7 @@ ls = {
   サムネイル・日時・地名・「開く」を出す。取得中は「読み込み中」、失敗は「読めませんでした」の吹き出し。「開く」は届いた
   1 枚で `openModalFor([photo], 0, {ai: false})`。クラスタの件数の文字は、style に `glyphs`（文字の形のデータ）が無く
   symbol 層が使えないので、見えているクラスタへ合わせる DOM のマーカー（`pointer-events: none`）で出す。更新は毎フレームの
-  `render` では呼ばず、`moveend`・`zoomend`、点の source の `sourcedata`（`e.sourceId === 'photos' && e.isSourceLoaded`）、
+  `render` では呼ばず、`moveend`・`zoomend`・`idle`（MapLibre 4.7.1 では前 2 つが描画時の source 更新より先に発火し、更新先のタイルがキャッシュにあると `sourcedata` も出ないため、描画が落ち着いた後に 1 回合わせる）、点の source の `sourcedata`（`e.sourceId === 'photos' && e.isSourceLoaded`）、
   `setData` の直後に行う（「3 層」は円 2 つ + マーカー）。Map の生成オプションに `renderWorldCopies: false` と
   `maxBounds: [[-180, -85], [180, 85]]` を入れて世界を周回させない（経度が ±180 を超えると表示範囲を bbox にできない。日付変更線を
   またぐ範囲は扱わない）。`currentBbox` は `getBounds()` を ±180/±90 に丸め、丸めた後に `w >= e` なら経度は `[-180, …, 180, …]`

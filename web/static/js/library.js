@@ -244,7 +244,7 @@ function addPointLayers(map){
 }
 /* クラスタの件数の文字。style に glyphs（文字の形のデータ）が無く symbol 層は使えないので、クラスタごとの DOM の
    マーカー（クリックは通す）を今見えているクラスタに合わせる。毎フレームの render では呼ばず、
-   動き・ズームの終わり（moveend・zoomend）、点の source の読み込み完了（sourcedata）、setData の直後に呼ぶ */
+   動き・ズームの終わり（moveend・zoomend）、描画が落ち着いたとき（idle）、点の source の読み込み完了（sourcedata）、setData の直後に呼ぶ */
 function syncClusterLabels(){
   const map = ls.map;
   if(!map || !map.getSource(LIB_POINTS_SOURCE) || !map.isSourceLoaded(LIB_POINTS_SOURCE)) return;
@@ -275,6 +275,8 @@ function ensureLibMap(){
   map.on('load', () => addPointLayers(map));
   map.on('moveend', syncClusterLabels);
   map.on('zoomend', syncClusterLabels);
+  // moveend・zoomend は描画での source の更新より先に発火し、更新先のタイルがキャッシュにあると sourcedata も出ないので、描画が落ち着いた後にも 1 回合わせる
+  map.on('idle', syncClusterLabels);
   map.on('sourcedata', e => {
     if(e.sourceId === LIB_POINTS_SOURCE && e.isSourceLoaded) syncClusterLabels();
   });
