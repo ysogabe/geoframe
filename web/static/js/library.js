@@ -405,14 +405,17 @@ function syncClusterLabels(){
     if(!seen.has(id)){ marker.remove(); ls.labels.delete(id); }
   });
 }
+const LIB_MAX_LNG = 179.999;
 function ensureLibMap(){
   if(ls.map) return ls.map;
   if(typeof maplibregl === 'undefined'){ toast('地図を読み込めませんでした', true); return null; }
   const map = new maplibregl.Map({
     container: 'lib-map', style: tileStyle(),
     center: [137, 36], zoom: 4, attributionControl: {compact: true},
-    // 世界を横に周回させない（経度が ±180 を超えると表示範囲を bbox にできない。日付変更線をまたぐ範囲は扱わない）
-    renderWorldCopies: false, maxBounds: [[-180, -85], [180, 85]],
+    // 世界を横に周回させない（経度が ±180 を超えると表示範囲を bbox にできない。日付変更線をまたぐ範囲は扱わない）。
+    // MapLibre 4.7.1 は maxBounds の経度がちょうど ±180 だと初期カメラがズーム 22・経度 180 に潰れるので、わずかに内側にする。
+    // bbox は currentBbox が ±180 に丸める。
+    renderWorldCopies: false, maxBounds: [[-LIB_MAX_LNG, -85], [LIB_MAX_LNG, 85]],
   });
   ls.map = map;
   map.addControl(new maplibregl.NavigationControl({showCompass: false}), 'top-right');
