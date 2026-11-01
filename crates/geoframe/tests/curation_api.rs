@@ -372,6 +372,67 @@ async fn groups_lists_the_three_groups_newest_first_with_their_members() {
 }
 
 #[tokio::test]
+async fn every_member_carries_loc_source_in_groups_confirm_and_reset() {
+    let server = Server::start().await;
+    // 写真 1 は EXIF、写真 2 は手動、写真 3 は NULL（空文字で返る）
+    server
+        .db
+        .execute_batch(
+            "UPDATE photos SET loc_source='exif' WHERE id=1;
+             UPDATE photos SET loc_source='manual' WHERE id=2;
+             UPDATE photos SET loc_source=NULL WHERE id=3;",
+        )
+        .unwrap();
+    let expected = [(1, json!("exif")), (2, json!("manual")), (3, json!(""))];
+    let exact = server.group(1).await;
+    assert_eq!(members(&exact, "loc_source"), expected);
+    // メンバーの鍵の集合（画面が読む形）
+    let keys: std::collections::BTreeSet<&str> = exact["members"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        keys.into_iter().collect::<Vec<_>>(),
+        [
+            "city",
+            "curation",
+            "effective",
+            "favorite",
+            "hidden",
+            "id",
+            "issues",
+            "lat",
+            "loc_source",
+            "lon",
+            "name",
+            "place",
+            "pref",
+            "rank",
+            "reasons",
+            "recommended",
+            "rotation",
+            "score",
+            "selectable",
+            "source",
+            "taken_at",
+            "thumb",
+            "thumb_url"
+        ]
+    );
+    // confirm・reset の応答の組も同じ列を持つ
+    let token = exact["token"].as_str().unwrap();
+    let confirmed = server.confirm("exact", 1, token, Value::Null).await;
+    assert_eq!(confirmed.status, 200, "{}", confirmed.text());
+    assert_eq!(members(&confirmed.json()["group"], "loc_source"), expected);
+    let token = server.token(1).await;
+    let reset = server.reset("exact", 1, &token).await;
+    assert_eq!(reset.status, 200, "{}", reset.text());
+    assert_eq!(members(&reset.json()["group"], "loc_source"), expected);
+}
+
+#[tokio::test]
 async fn the_token_follows_the_documented_recipe() {
     let server = Server::start().await;
     let exact = server.group(1).await;

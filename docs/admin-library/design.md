@@ -305,9 +305,9 @@ cs = {
 - **状況タブ（R18）**: `db.quality.curation_pending` があれば「品質」の欄に `未確認の選別 N 組`、「要対応」にも同じ名前の
   押せるセルを出し、押すと `showTab('curation')`。値が 0 なら `good`、1 以上なら `warn`。キーが無い応答（Python 版・
   `quality` なし）では出さない。`todoCells(filters)` は変えず、`curationTodoCells(quality)` を足した。
-- **既知の欠け**: `groups` のメンバーに `loc_source` が無いので、選別タブから開いたビューアの由来のバッジ（EXIF・DRIVE・推定・
-  手動）は、位置がある写真でも「位置なし」と出る（`tagSpecs` が `loc_source` を見るため）。位置の座標・地名は正しく出る。
-  直すには `groups` のメンバーに `loc_source` を足す（サーバーの 1 列。T7 の `admin_curation.rs` を触るので別の小さな変更にする）。
+- **由来のバッジ**: `groups`・`confirm`・`reset` の応答のメンバーに `loc_source`（`photos.loc_source`。NULL は `""`）を持たせた。
+  選別タブから開いたビューアの由来のバッジ（EXIF・DRIVE・推定・手動）は、位置がある写真でそのとおりに出る
+  （`normalizePhoto` が `loc_source` の無いメンバーを `none` にするため、以前は「位置なし」と出ていた）。
 
 ## インターフェース
 
@@ -557,7 +557,7 @@ CASE WHEN q.group_id IS NULL THEN 0
    "count": 3, "warning": null,
    "members": [{"id": 101, "name": "IMG_0001.jpg", "thumb": "/derivatives/…", "thumb_url": "/thumb/101.jpg?v=…",
                 "taken_at": "2024-05-03 09:12", "place": "…", "pref": "架空県", "city": "架空市", "lat": 10.0, "lon": 20.0,
-                "favorite": false, "hidden": false, "rotation": 0, "source": "drive",
+                "favorite": false, "hidden": false, "rotation": 0, "source": "drive", "loc_source": "exif",
                 "rank": 1, "score": 78.5, "reasons": ["…"], "issues": [],
                 "recommended": true, "effective": true, "curation": "representative" | "reviewed" | "stale" | null}]}]}
 ```

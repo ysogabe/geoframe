@@ -67,7 +67,7 @@ fn load_group(
                 {record}, q.rank_in_group, q.score, q.reasons_json, q.issues_json,
                 p.name, p.drive_id, p.md5, p.mtime, p.taken_at, p.place, p.pref, p.city,
                 p.lat, p.lon, p.favorite, p.hidden, p.rotation, p.source,
-                ({FEED_BASE_WHERE} AND p.lon IS NOT NULL)
+                ({FEED_BASE_WHERE} AND p.lon IS NOT NULL), p.loc_source
            {from}
           WHERE q.group_kind=?1 AND q.group_id=?2
           ORDER BY q.rank_in_group, q.photo_id",
@@ -141,6 +141,8 @@ fn load_group(
         item.insert("hidden".into(), truthy(row.get_ref(22)?).into());
         item.insert("rotation".into(), rotation);
         item.insert("source".into(), cell(row.get_ref(24)?)?);
+        // 位置の由来（ビューアのバッジ用）。NULL は空文字
+        item.insert("loc_source".into(), text(row, 26)?.into());
         item.insert("rank".into(), cell(row.get_ref(7)?)?);
         item.insert("score".into(), cell(row.get_ref(8)?)?);
         item.insert("reasons".into(), json_list(9)?);

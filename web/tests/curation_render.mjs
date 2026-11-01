@@ -33,7 +33,7 @@ const statusBody = () => ({
 });
 const mem = (id, o = {}) => ({
   id, name: 'p' + id + '.jpg', thumb: '/derivatives/p' + id + '.jpg', thumb_url: '/thumb/' + id + '.jpg?v=0123456789ab',
-  taken_at: '2030-05-03 09:12', place: '', pref: '架空県', city: '試験市', lat: 10.0, lon: 20.0,
+  taken_at: '2030-05-03 09:12', place: '', pref: '架空県', city: '試験市', lat: 10.0, lon: 20.0, loc_source: 'exif',
   favorite: false, hidden: false, rotation: 0, source: 'drive',
   rank: 1, score: 80, reasons: [], issues: [], recommended: false, effective: false, curation: null, selectable: true, ...o,
 });
@@ -496,6 +496,23 @@ await test('(i) 画像を押すとビューアが開く（チェックボック�
   assert.equal(hidden(env, '#viewer'), true);
   assert.strictEqual(env.document.activeElement, thumb);
   assert.equal(cardOf(ex, 602).querySelector('input').checked, false);
+});
+
+await test('(i2) 選別タブから開いたビューアの由来バッジは、メンバーの loc_source のとおり（位置あり・exif は EXIF）', async () => {
+  const env = makeEnv();
+  await openWith(env, [grp('exact', 11, 'aaaaaaaaaaaaaaaa', 'unconfirmed', [
+    mem(601, {loc_source: 'exif'}), mem(602, {loc_source: 'manual'}), mem(603, {loc_source: 'drive_meta'}),
+  ])]);
+  const [ex] = sections(env);
+  const badge = id => {
+    cardOf(ex, id).querySelector('.cur-thumb').click();
+    const text = env.$('#viewer-badges').children.map(c => c.textContent);
+    env.$('#viewer-close').click();
+    return text;
+  };
+  assert.deepEqual(badge(601), ['EXIF']);
+  assert.deepEqual(badge(602), ['手動']);
+  assert.deepEqual(badge(603), ['DRIVE']);
 });
 
 await test('(j) ビューアの★: setflag にその写真の id が送られ、段のメンバーのタグだけが変わる（selectable・effective・warning はサーバーの値のまま、読み直さない）', async () => {
