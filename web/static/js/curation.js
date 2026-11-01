@@ -14,17 +14,21 @@
    groups: 今のページの組（members は normalizePhoto を通した写真 + rank・score・… をそのまま持つ）。
    picks: 段ごとの選択（確定前）Map<groupKey, Set<photoId>>。busy: 確定・取り消しの送信中の段（多重送信を防ぐ）。
    nodes: 段の要素 Map<groupKey, section>。reloading: 1 組の読み直しが飛んでいる段。
-   seq: 一覧の要求番号（古い応答を捨てる）。gseq: 段ごとの読み直しの要求番号。
-   gen: データの世代。一覧の要求を出すとき（絞り込み・ページ移動を含む）と確定・取り消しの成功で進める。
-   一覧の応答は、要求したときの gen と違えば（待つ間に確定が成功した）捨てて取り直す。
-   applied: 表示の版。一覧の応答・1 組の読み直しの応答・確定の応答を画面に反映して段が変わるたびに進める（要求を出しただけでは進めない）。
-   POST は送信時の gen と applied を控え、応答のときにどちらかが違えば（その間に別の確定・一覧・読み直しが画面を変えた）
-   段を置き換えず、成功のトーストだけ出して、段が残っていればその段を読み直す */
+   応答の順序は 1 つの規則で守る。ver（表示の版）は画面の段を変えるたび（一覧の反映・段の置き換え・段の削除・確定の直接反映）に進める。
+   要求を出しただけでは進めない。すべての要求（一覧の GET・1 組の GET・確定・取り消しの POST）は発行時の ver を控え、
+   応答のときに ver が違えば古いものとして扱う（発行後に画面が変わっていなければ、そのまま反映する）:
+     一覧の GET → 捨てて一覧を取り直す。1 組の GET → 捨てて、その段が今の一覧に残っていれば読み直す。
+     POST → 段を置き換えず、成功のトーストだけ出して、段が残っていれば読み直す。
+   取り直しは「変化のあと」に出すので、変化が止まれば収束する。
+   seq: 一覧の要求番号（新しい一覧の要求に追い越された応答を捨てる）。gseq: 段ごとの要求番号（同じ段の新しい読み直し・確定に
+   追い越された応答を捨てる。確定の応答は番号を進め、飛んでいる読み直し（reloading）も無効にする）。
+   keep: 絞り込みに合わなくても残す段 Set<groupKey>。確定・取り消しの成功で入れ（直接の反映でも古い応答でも）、
+   一覧の反映・段を外したときに消す。読み直しが★・除外の変更から出ても、keep の段は絞り込み不一致で消さない */
 const cs = {
   state: 'unconfirmed', kind: 'all',
   page: 1, pages: 1, per: 20, total: 0, groups: [],
-  picks: new Map(), busy: new Set(), nodes: new Map(), reloading: new Set(),
-  seq: 0, gseq: new Map(), gen: 0, applied: 0,
+  picks: new Map(), busy: new Set(), nodes: new Map(), reloading: new Set(), keep: new Set(),
+  seq: 0, gseq: new Map(), ver: 0,
 };
 
 const CUR_STATES = ['unconfirmed', 'confirmed', 'all'];
@@ -222,20 +226,21 @@ function curReplace(oldKey, fresh, keepPicks){
     const kept = new Set(fresh.members.filter(m => m.selectable && picks.has(m.id)).map(m => m.id));
     if(kept.size) cs.picks.set(curKey(fresh), kept);
   }
-  cs.applied++;
+  cs.ver++;
   const old = cs.nodes.get(oldKey);
   cs.nodes.delete(oldKey);
   const dup = cs.groups.findIndex((g, j) => j !== i && curKey(g) === curKey(fresh));
   if(dup >= 0){ curRemoveAt(i, old); return; }      // 読み直したら別の段と同じ組だった（組み替わり）→ 重複させない
+  if(cs.keep.delete(oldKey)) cs.keep.add(curKey(fresh));   // 組の鍵が変わっても、残す方針は引き継ぐ
   cs.groups[i] = fresh;
   const section = curSection(fresh);
   cs.nodes.set(curKey(fresh), section);
   if(old) old.replaceWith(section);
 }
 function curRemoveAt(i, node){
-  cs.applied++;
+  cs.ver++;
   const group = cs.groups[i];
-  if(group){ cs.picks.delete(curKey(group)); cs.nodes.delete(curKey(group)); }
+  if(group){ cs.picks.delete(curKey(group)); cs.nodes.delete(curKey(group)); cs.keep.delete(curKey(group)); }
   cs.groups.splice(i, 1);
   if(node) node.remove();
   cs.total = Math.max(0, cs.total - 1);
@@ -257,22 +262,24 @@ function curSubmit(group, path, body, doneText){
   if(cs.busy.has(key)) return;
   cs.busy.add(key);
   curRepaintActions(group);
-  const gen = cs.gen, applied = cs.applied, gseq = cs.gseq.get(key) || 0;   // 送信時のデータの世代・表示の版・この段の読み直しの番号
+  const ver = cs.ver, gseq = cs.gseq.get(key) || 0;   // 送信時の表示の版・この段の要求番号
   curPost(path, body).then(d => {
     cs.busy.delete(key);
-    /* 送ってから一覧（または この段）が読み直されたり、別の確定が画面を変えていたら、応答の組は古いかもしれない → 置き換えない。
-       一覧の「要求」だけでなく「反映」も見る（applied）: 要求を出したあとに POST を送り、一覧の応答が先に反映された場合を拾う */
-    const stale = gen !== cs.gen || applied !== cs.applied || gseq !== (cs.gseq.get(key) || 0);
-    cs.gen++;                                             // 確定の成功: これより前に出した一覧の応答は捨てる
+    /* 送ってから画面が変わっていたり（別の確定・一覧・読み直しの反映）、この段が読み直されていたら、応答の組は古いかもしれない
+       → 置き換えない */
+    const stale = ver !== cs.ver || gseq !== (cs.gseq.get(key) || 0);
     cs.gseq.set(key, (cs.gseq.get(key) || 0) + 1);       // 飛んでいる読み直しの応答は、この確定より古い
+    cs.reloading.delete(key);                             // その読み直しは無効になった（古い応答では後始末されない）
     if(d.group && !stale){
+      cs.keep.add(key);                                   // 確定した段は絞り込みに合わなくても残す（鍵が変われば curReplace が引き継ぐ）
       curReplace(key, curGroup(d.group), false);
       toast(doneText);
     }else{
       if(d.group) toast(doneText);
+      cs.keep.add(key);
       curRepaintActions(group);
       const current = cs.groups.find(g => curKey(g) === key);
-      if(current) curReload(current, false, true);        // 今の一覧に段が残っているときだけ読み直す。確定した段は絞り込みに合わなくても残す
+      if(current) curReload(current, false);              // 今の一覧に段が残っているときだけ読み直す
     }
   }).catch(e => {
     cs.busy.delete(key);
@@ -309,27 +316,36 @@ function curReset(group){
 /* ==== 5) 読み直し・変更の反映 ==== */
 /* 1 組だけ読み直す。state=all&kind=all で引く（既定の unconfirmed だと確認済みになった組を見失う）。
    ids= は写真 ID なので先頭のメンバーで引き、同じ kind の組を取る（再構築で group_id が変わっても拾える）。
-   届いた組が今の絞り込みに合えば描き直し、合わなければ・空なら段を外す。一覧が読み直されていたら応答は捨てる。
-   keepUnmatched: 確定・取り消しの成功に伴う読み直しでは、絞り込みに合わなくても描き直して残す（直接の応答と同じ扱い。組が無いときだけ外す） */
-function curReload(group, keepPicks, keepUnmatched){
+   届いた組が今の絞り込みに合えば描き直し、合わなければ・空なら段を外す（cs.keep の段は、合わなくても描き直して残す）。
+   応答は、新しい一覧の要求に追い越されたとき・同じ段の新しい読み直しや確定に追い越されたときは捨てる（後者は reloading を触らない）。
+   発行後に画面が変わっていた（ver が違う）ときも捨てて、その段が今の一覧に残っていれば同じ条件で読み直す */
+function curReload(group, keepPicks){
   const key = curKey(group);
   const first = group.members[0];
   if(!first) return;
   const gseq = (cs.gseq.get(key) || 0) + 1;
   cs.gseq.set(key, gseq);
-  const seq = cs.seq;
+  const seq = cs.seq, ver = cs.ver;
   cs.reloading.add(key);
+  const latest = () => gseq === cs.gseq.get(key);
   curGet({state: 'all', kind: 'all', ids: first.id}).then(d => {
-    if(seq !== cs.seq || gseq !== cs.gseq.get(key)) return;
+    if(!latest()) return;                                // 後続の要求（読み直し・確定）の状態は消さない
     cs.reloading.delete(key);
+    if(seq !== cs.seq) return;                           // 新しい一覧の要求が出ている。一覧の応答が段を入れ替える
+    if(ver !== cs.ver){                                  // 発行後に画面が変わった（一覧・別の段・確定の反映）→ この応答は古い
+      const current = cs.groups.find(g => curKey(g) === key);
+      if(current) curReload(current, keepPicks);
+      return;
+    }
     const raw = (d.groups || []).find(g => g.kind === group.kind);
     if(!raw){ curRemove(key); return; }
     const fresh = curGroup(raw);
-    if(!keepUnmatched && !curMatches(fresh)){ curRemove(key); return; }
+    if(!cs.keep.has(key) && !curMatches(fresh)){ curRemove(key); return; }
     curReplace(key, fresh, keepPicks);
   }).catch(e => {
-    if(seq !== cs.seq || gseq !== cs.gseq.get(key)) return;
+    if(!latest()) return;
     cs.reloading.delete(key);
+    if(seq !== cs.seq) return;
     toast('組を読み直せませんでした: ' + e.message, true);
   });
 }
@@ -376,19 +392,20 @@ function renderCuration(){
   curPaintList();
 }
 function loadCuration(){
-  const seq = ++cs.seq, gen = ++cs.gen;
+  const seq = ++cs.seq, ver = cs.ver;
   curGet({state: cs.state, kind: cs.kind, page: cs.page, per: cs.per}).then(d => {
     if(seq !== cs.seq) return;
-    if(gen !== cs.gen){ loadCuration(); return; }     // 待っている間に確定が成功した → この応答は古い。読み直す
+    if(ver !== cs.ver){ loadCuration(); return; }     // 待つ間に画面が変わった（確定・段の読み直しの反映）→ この応答は古い。取り直す
     cs.page = d.page; cs.pages = d.pages; cs.total = d.total;
     cs.groups = (d.groups || []).map(curGroup);
     cs.picks.clear();                 // token が変わりうるので、前の選択は持ち越さない
     cs.reloading.clear();
-    cs.applied++;
+    cs.keep.clear();
+    cs.ver++;
     renderCuration();
   }).catch(e => {
     if(seq !== cs.seq) return;
-    if(gen !== cs.gen){ loadCuration(); return; }
+    if(ver !== cs.ver){ loadCuration(); return; }
     toast('選別の組を読めませんでした: ' + e.message, true);
   });
 }

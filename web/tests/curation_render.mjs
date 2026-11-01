@@ -836,6 +836,133 @@ await test('(n5) 未確認の絞り込みで別々の段を並行して確定し
   assert.equal(env.ev('cs.busy.size'), 0);
 });
 
+const ok200 = body => ({ok: true, status: 200, json: () => Promise.resolve(body)});
+const idsReqs = env => env.listReqs().filter(c => c.url.includes('ids='));
+// similar:21 の 612 が除外（選べない）の再確認
+const sm1Hidden = () => grp('similar', 21, 'bbbbbbbbbbbbbbbb', 'recheck', [
+  mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+  mem(612, {rank: 1, score: 85, recommended: true, hidden: true, selectable: false}),
+  mem(613, {rank: 3, score: null, curation: 'stale', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+const sm1Confirmed = () => grp('similar', 21, 'b1b1b1b1b1b1b1b1', 'confirmed', [
+  mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+  mem(612, {rank: 1, score: 85, recommended: true, curation: 'reviewed'}),
+  mem(613, {rank: 3, score: null, curation: 'reviewed', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+const disabled612 = env => cardOf(sectionOf(env, 'similar', 21), 612).querySelector('input').disabled;
+
+await test('(n6) 一覧の要求のあとに出した 1 組の読み直しが先に反映されても、遅れて届いた古い一覧の応答では段を巻き戻さない。一覧は取り直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const held = deferred(), again = deferred(), byId = deferred();
+  const queue = [held, again];
+  env.handlers.groups = params => params.get('ids') ? byId.promise : queue.shift().promise;
+  env.$('#cur-state-all').click();                                   // 一覧の要求（保留）
+  await settle();
+  env.context.applyPhoto(612, {favorite: false, hidden: true});     // 除外 → 段の読み直し（保留）
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  byId.resolve(ok200(listBody([sm1Hidden()])));                     // 段の読み直しが先に反映される
+  await settle();
+  assert.equal(disabled612(env), true, '段の値（除外・選べない）が反映された');
+  const n0 = env.listReqs().length;
+  held.resolve(ok200(listBody(DEFAULT_GROUPS())));                  // 古い一覧（612 は除外でない）が遅れて届く
+  await settle();
+  assert.equal(disabled612(env), true, '古い一覧で巻き戻らない');
+  assert.equal(env.listReqs().length, n0 + 1, '一覧を取り直す');
+  assert.equal(idsReqs(env).length, 1);
+  again.resolve(ok200(listBody([EX1(), sm1Hidden()])));
+  await settle();
+  assert.equal(disabled612(env), true);
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11', 'similar:21']);
+});
+
+await test('(n7) 一覧が反映されたあとに、その前に出した 1 組の読み直しの応答が遅れて届いても、一覧の値のまま。段は読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const held = deferred(), first = deferred(), second = deferred();
+  const idsQueue = [first, second];
+  env.handlers.groups = params => params.get('ids') ? idsQueue.shift().promise : held.promise;
+  env.$('#cur-state-all').click();                                   // 一覧の要求（保留）
+  await settle();
+  env.context.applyPhoto(612, {favorite: false, hidden: true});     // 段の読み直し（保留）
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  held.resolve(ok200(listBody([EX1(), sm1Hidden()])));              // 一覧が先に反映される
+  await settle();
+  assert.equal(disabled612(env), true);
+  first.resolve(ok200(listBody([SM1()])));                          // 遅れた段の応答（612 は除外でない）→ 捨てる
+  await settle();
+  assert.equal(disabled612(env), true, '一覧の値のまま');
+  assert.equal(idsReqs(env).length, 2, '段が一覧に残っているので読み直す');
+  second.resolve(ok200(listBody([sm1Hidden()])));
+  await settle();
+  assert.equal(disabled612(env), true);
+  assert.equal(env.ev('cs.reloading.size'), 0);
+});
+
+await test('(n8) 未確認で A・B を並行して確定し、B の成功が古い応答扱いでも、B の読み直しが★の変更で置き換えられても B は残る', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  assert.equal(env.ev('cs.state'), 'unconfirmed');
+  const a = deferred(), b = deferred(), g1 = deferred(), g2 = deferred();
+  const idsQueue = [g1, g2];
+  const confirmedA = () => grp('exact', 11, 'a1a1a1a1a1a1a1a1', 'confirmed', [
+    mem(601, {rank: 1, recommended: true, effective: true, curation: 'reviewed'}),
+    mem(602, {rank: 2, favorite: true, hidden: true, selectable: false, curation: 'reviewed'})]);
+  env.handlers.confirm = body => body.group_id === 11 ? a.promise : b.promise;
+  env.handlers.groups = params => params.get('ids') ? idsQueue.shift().promise : null;
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  sections(env)[1].querySelector('.cur-do-keep').click();
+  await settle();
+  a.resolve(ok200({ok: true, group: confirmedA()}));
+  await settle();
+  b.resolve(ok200({ok: true, group: sm1Confirmed()}));              // 古い応答扱い → 段の読み直し（g1）
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  assert.equal(env.ev('cs.reloading.size'), 1);
+  env.context.applyPhoto(611, {favorite: true, hidden: false});     // 読み直しの間の★ → 新しい読み直し（g2）。g1 は無効
+  await settle();
+  assert.equal(idsReqs(env).length, 2);
+  g1.resolve(ok200(listBody([sm1Confirmed()])));
+  await settle();
+  assert.equal(sections(env).length, 4, '無効になった応答は何も変えない');
+  g2.resolve(ok200(listBody([sm1Confirmed()])));                    // 確認済みの応答。絞り込み（未確認）には合わない
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11', 'similar:21', 'similar:22', 'similar:23'], 'B は残る');
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.ev('cs.reloading.size'), 0);
+});
+
+await test('(n9) 1 組の読み直しを出したあとに確定が成功して直接反映されたら、遅れた読み直しの応答は捨てる。reloading は残らず、次の★で余計な読み直しが走らない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const post = deferred(), byId = deferred();
+  env.handlers.confirm = () => post.promise;
+  env.handlers.groups = params => params.get('ids') ? byId.promise : null;
+  env.context.applyPhoto(612, {favorite: false, hidden: true});     // 段の読み直し（保留）
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  assert.equal(env.ev('cs.reloading.size'), 1);
+  sections(env)[1].querySelector('.cur-do-keep').click();           // 確定を送信
+  await settle();
+  post.resolve(ok200({ok: true, group: sm1Confirmed()}));           // 直接反映
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.ev('cs.reloading.size'), 0, '飛んでいた読み直しは無効になった');
+  byId.resolve(ok200(listBody([SM1()])));                           // 遅れた読み直しの応答（再確認）→ 捨てる
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.ev('cs.reloading.size'), 0, 'key が残らない');
+  assert.equal(idsReqs(env).length, 1, '読み直しを足さない');
+  env.context.applyPhoto(611, {favorite: true, hidden: false});     // その後の★（除外・位置は変わらない）
+  await settle();
+  assert.equal(idsReqs(env).length, 1, '余計な読み直しが走らない');
+  assert.ok(sectionOf(env, 'similar', 21), '段は消えない');
+});
+
 await test('(o) 一覧の読み込み失敗はトーストで知らせ、一覧は前のまま', async () => {
   const env = makeEnv();
   await env.boot();
