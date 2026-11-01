@@ -274,6 +274,41 @@ cs = {
   合わなければ段を外す。応答が空（組が消えた）でも段を外す。
 - 状況タブの「要対応」に `未確認の選別 N 組` を足す（R18。`db.quality.curation_pending`）。
 
+### 実装との差（画面。T8）
+
+設計どおりに作った（`curation.js`・`admin.html`・`admin.css`・`admin.js`）。画面側で設計とずらした点・決めたことだけを書く。
+
+- **DOM**: メンバーは `label.cur-member > input.cur-pick + button.cur-thumb > img|.img-broken + 順位・点数 + 名前 + 地名 +
+  div.tags.cur-tags + details.cur-why`。画像は `img` を直接ではなく `button.cur-thumb` に入れた。label の中の画像を押すと
+  ブラウザがチェックボックスを切り替えるので、button にして `preventDefault()` し、キーボードでも押せるようにした。
+  絞り込みは `.cur-seg`（`#cur-state-{unconfirmed,confirmed,all}`・`#cur-kind-{all,exact,similar}`）。`.chip` は写真タブが
+  `document` 全体から拾うので使わない。`#cur-groups` に `.hidden` は付けない（`display:flex`）。出し入れするのは `#cur-empty` と
+  タブの `#v-curation` だけ。
+- **タグ**: 解析の推奨（`recommended`）・人の代表（`curation === 'representative'`）・再確認（`curation === 'stale'`）・★・除外。
+  `effective`（いま有効な推奨）は別のタグにせず、枠の色（`.is-effective`）で示す。`selectable` でないメンバーは
+  チェックボックスが無効で `.is-unselectable`。どれもサーバーの値のままで、画面では再計算しない。
+- **「このままで確認済み」**: 確認済みの段では無効（すでに確認済みで何も変わらない）。未確認・再確認の段で、
+  `curation === 'representative'` のメンバーがあればその ID、無ければ `representatives: null`（`stale` は含めない）。
+  **「取り消す」**は `curation` が null でないメンバー（`reviewed`・`stale` を含む）がいる段だけに出す。
+- **確定・取り消しの応答**: 応答の `group` が今の絞り込みに合わなくても、その段はそのまま描き直す（「未確認」の絞り込みで
+  確定した段が目の前で消えない。次に一覧を読み直すと外れる）。選択（`picks`）はその段だけ消す。送信中の段はボタンを無効にし、
+  `cs.busy` で多重送信を防ぐ。
+- **1 組の読み直し**（409・除外や位置の変更・`representative_not_visible`）: `state=all&kind=all&ids=<先頭の写真>` で引き、
+  **同じ `kind` の組**を採る（再構築で `group_id` が変わっても拾える）。無い・空・今の絞り込みに合わないときは段を外す。
+  外してそのページが空になり件数が残るときは、一覧を読み直す（サーバーがページを丸める）。一覧が読み直された後に届いた
+  1 組の応答、同じ段への新しい読み直しより古い応答は捨てる。一覧を読み直すと選択は全部消える（`token` が変わりうる）。
+- **`representative_not_visible`（400）**: トースト「代表に選べない写真があります」に加えて、その段を読み直す。除外・位置が
+  別の画面で変わって `selectable` が古くなっているのが原因なので、読み直して合わせる（選択のうち選べなくなった写真だけが外れる）。
+- **除外・位置の変更の反映**: `onPhotoChange` の patch でメンバーのタグを描き直す。読み込んだ時点の除外・位置（`baseline`）から
+  変わったときだけ、その段を読み直す（`setflag` の応答は `favorite` と `hidden` を両方返すので、★だけでは読み直さない）。
+  読み直しの間は選択のうち選べる写真を残す。
+- **状況タブ（R18）**: `db.quality.curation_pending` があれば「品質」の欄に `未確認の選別 N 組`、「要対応」にも同じ名前の
+  押せるセルを出し、押すと `showTab('curation')`。値が 0 なら `good`、1 以上なら `warn`。キーが無い応答（Python 版・
+  `quality` なし）では出さない。`todoCells(filters)` は変えず、`curationTodoCells(quality)` を足した。
+- **既知の欠け**: `groups` のメンバーに `loc_source` が無いので、選別タブから開いたビューアの由来のバッジ（EXIF・DRIVE・推定・
+  手動）は、位置がある写真でも「位置なし」と出る（`tagSpecs` が `loc_source` を見るため）。位置の座標・地名は正しく出る。
+  直すには `groups` のメンバーに `loc_source` を足す（サーバーの 1 列。T7 の `admin_curation.rs` を触るので別の小さな変更にする）。
+
 ## インターフェース
 
 ### `GET /thumb/<id>.jpg?v=<gen>`（新。PR ①）
