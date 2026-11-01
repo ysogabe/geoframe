@@ -72,9 +72,9 @@ const ORDER_NEWEST: &str = concat!(
     " THEN 1 ELSE 0 END, COALESCE(taken_at,'') DESC, id DESC"
 );
 
-type Params = HashMap<String, String>;
+pub(crate) type Params = HashMap<String, String>;
 
-fn query_params(query: Option<&str>) -> Params {
+pub(crate) fn query_params(query: Option<&str>) -> Params {
     pyquery::parse_qs_first(query.unwrap_or(""))
 }
 
@@ -135,7 +135,7 @@ fn parse_bbox(s: &str) -> Option<[f64; 4]> {
 }
 
 /// `1,2,3`。整数だけ。重複を除く前の個数が [`IDS_MAX`] を超えたら `None`。重複は最初のものだけ残す。
-fn parse_ids(s: &str) -> Option<Vec<i64>> {
+pub(crate) fn parse_ids(s: &str) -> Option<Vec<i64>> {
     let mut out: Vec<i64> = Vec::new();
     let mut count = 0usize;
     for part in s.split(',') {
@@ -246,12 +246,12 @@ fn photos_filter(params: &Params) -> Option<Filter> {
     filter.narrowed.then_some(filter)
 }
 
-fn bad_params() -> Response {
+pub(crate) fn bad_params() -> Response {
     error_response(StatusCode::BAD_REQUEST, "bad_params")
 }
 
 /// 読み取りの結果を JSON の応答にする。読み取りの失敗・順番待ちの超過は `/api/admin/photos` と同じ 503。
-fn respond<E: std::fmt::Display>(result: Result<Value, E>) -> Response {
+pub(crate) fn respond<E: std::fmt::Display>(result: Result<Value, E>) -> Response {
     match result {
         Ok(body) => match serde_json::to_vec(&body) {
             Ok(bytes) => json_response(StatusCode::OK, bytes),

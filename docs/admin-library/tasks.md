@@ -3,7 +3,7 @@
 - PRD: prd.md / 設計: design.md
 - PR は 3 本（PRD の「実装の順番」）。① はこのブランチ、② ③ は ① のマージ後に `main` から切るブランチ（同じ worktree）。
   各 PR の前にブランチ全体の確認（テスト・PRD 突き合わせ・`security-review`）を行う。
-- ブランチ: ① `t3/admin-photo-library-g3-g4`（PR #73 マージ済み） / ② `t3/admin-library-2-library` / ③ `t3/admin-library-3-curation`（予定）
+- ブランチ: ① `t3/admin-photo-library-g3-g4`（PR #73 マージ済み） / ② `t3/admin-library-2-library`（PR #74 マージ済み） / ③ `t3/admin-library-3-curation`
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
@@ -13,6 +13,6 @@
 | T4 | PR ②: `photos.js` のビューア共通化（`viewerEntries`・`showViewer`・`openModalFor`・`onPhotoChange`・`tileStyle()`）、`admin.js` の `showTab`、`library.js`（旅・格子・地図・吹き出し・プレースホルダ）、`admin.html`/`admin.css`、`fake_maplibre.mjs`・`library_render.mjs`・`tests/admin_ui_library.rs` | AC2（画面分）, AC3（画面分）, AC8 | T3 | full | 完了 | 2df3730 | 3fbdf03, a4d40fa, 5c2656e, d52922f, 9ce60b3 | Sol 2 回。採用 必須 4（`.hidden` の詳細度・除外切替で地図の点を読み直す・写真タブの応答でライブラリのビューアを閉じない・経度の周回）＋推奨 2（件数更新の集約・`idle` 同期）。見送りなし。実ブラウザでの目視は未実施（本番機のため） |
 | T5 | PR ②（あると良い）: `calendar`・`places` API と日付・場所の眺め方、格子からの位置指定（R9〜R11） | AC9（一部） | T4 | quick | 完了 | 32ac737 | 26068f3, 1d41c08, ece1674 | Opus 1 回。必須なし。推奨 2（📍 の Escape・年月の格子の範囲）と参考 2 を採用、参考 2（タイル内の `button` の ARIA・📍 保存後の場所一覧の読み直し）は見送り |
 | T5b | PR ②（全体レビューの修正）: 共通ビューアの「画像なし」代替表示（R8）、位置・除外の変更後に地図の点を無効化、`（市区町村なし）` の仕様を文書化、設計書の状態例と AC3 の試験計画、`photo-pipeline.md` に library API | AC2, AC3, AC9 | T5 | quick | 完了 | d889df6 | a958ce2, 3652fe6 | Sol の全体レビュー（必須 1・推奨 3・参考 1）を採用。Sol の再確認へ |
-| T6 | PR ③: `curation.rs`（`TABLES`・`ensure_tables`・`available`・SQL 片・`group_token`）、`photos.rs`・`selection.rs`・`admin.rs` の `quality_summary` の置き換え、フィクスチャ `curation-catalog.sql`、`legacy_selection.rs` の合成ケース、契約の文書と Schema の説明文、性能の測定 | AC4（フィード分）, AC6 | T1 | full | 未着手 | | | |
-| T7 | PR ③: `admin_curation.rs`（`groups`・`confirm`・`reset`）、`post.rs`・`server.rs` の登録、`tests/curation_api.rs` | AC4, AC5（API 分）, AC7（curation 分） | T6 | full | 未着手 | | | |
-| T8 | PR ③: `curation.js`・`admin.html`/`admin.css`・状況タブの `curation_pending`（R18）、`curation_render.mjs`・`tests/admin_ui_curation.rs`、`photo-pipeline.md` の管理 API、設計書の「実装との差」 | AC5（画面分）, AC8, AC9（R18） | T7 | full | 未着手 | | | |
+| T6 | PR ③: `curation.rs`（`TABLES`・`ensure_tables`・`available`・SQL 片・`group_token`）、`photos.rs`・`selection.rs`・`admin.rs` の `quality_summary` の置き換え、フィクスチャ `curation-catalog.sql`、`legacy_selection.rs` の合成ケース、契約の文書と Schema の説明文、性能の測定 | AC4（フィード分）, AC6 | T1 | full | 完了 | 0647b77 | 6ab1840, 34ac26b, 28969db, 3ce6959 | Sol 1 回。指摘なし。性能: 合成 6,500 行で表あり約 5% 増、`EXISTS` のまま |
+| T7 | PR ③: `admin_curation.rs`（`groups`・`confirm`・`reset`）、`post.rs`・`server.rs` の登録、`tests/curation_api.rs` | AC4, AC5（API 分）, AC7（curation 分） | T6 | full | 完了 | 3ce6959 | 57d1905, fd85d6f, 7681a57 | Sol 1 回。指摘なし |
+| T8 | PR ③: `curation.js`・`admin.html`/`admin.css`・状況タブの `curation_pending`（R18）、`curation_render.mjs`・`tests/admin_ui_curation.rs`、`photo-pipeline.md` の管理 API、設計書の「実装との差」 | AC5（画面分）, AC8, AC9（R18） | T7 | full | 完了 | 7681a57 | 00dfff7, 333f80b, 1698200, ff90030, d3f6405, 29b259c, 665159d, a899de6, 4669c73 | Sol 5 回（応答の順序の競合を r1〜r4 で指摘、r5 で指摘なし）。応答の順序は表示の版 `ver` 1 つの規則＋段ごとの `keep` に整理。29b259c は試験基盤（描画試験の暴走対策: fakedom の後方参照を列挙不可に、`same()`/`notSame()`、fetch 回数上限、Rust ラッパー共通化とヒープ上限・120 秒 kill） |

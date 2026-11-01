@@ -1,0 +1,1155 @@
+// admin.js・photos.js・library.js・curation.js（この順に同じ context へ読む）の選別タブ — 段（種類・枚数・状態・メンバー・
+// 点数・タグ）、チェックして「代表にする」、「このままで確認済み」、「取り消す」、409 の読み直し、ビューア、★・除外の反映、
+// 絞り込み、ページング — を、fakedom.mjs の DOM の代用品と fetch の代用品で動かして確かめる。
+// 使い方: node web/tests/curation_render.mjs <admin.js のパス> <photos.js のパス> <library.js のパス> <curation.js のパス>
+// fetch は URL ごとの合成 JSON を返すだけで、ネットワークには出ない。地名・座標はすべて架空の値。
+import fs from 'node:fs';
+import vm from 'node:vm';
+import assert from 'node:assert/strict';
+import {buildAdminDom} from './fakedom.mjs';
+
+const [adminPath, photosPath, libraryPath, curationPath] = process.argv.slice(2);
+assert.ok(adminPath && photosPath && libraryPath && curationPath,
+  'admin.js・photos.js・library.js・curation.js のパスが要る');
+const sources = [[adminPath, 'admin.js'], [photosPath, 'photos.js'], [libraryPath, 'library.js'], [curationPath, 'curation.js']]
+  .map(([p, name]) => [fs.readFileSync(p, 'utf8'), name]);
+const loadScripts = context => sources.forEach(([text, name]) => vm.runInContext(text, context, {filename: name}));
+
+const settle = async () => { for(let i = 0; i < 10; i++) await new Promise(r => setImmediate(r)); };
+const respond = (status, body) =>
+  Promise.resolve({ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body)});
+const reply = body => respond(200, body);
+const clone = v => JSON.parse(JSON.stringify(v));
+const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return {promise, resolve}; };
+
+// ---- 合成データ（架空の県・市・座標） ----
+const statusBody = () => ({
+  ok: true, server_time: '2030-01-01 10:00:00',
+  sync: {ready: 10, pending: 0, total: 10},
+  db: {no_loc: 0, no_display: 0, favorite: 0, hidden: 0, enrich_pending: 0, no_time: 0, by_loc_source: {exif: 10},
+       infer_buckets: {}, by_source: {drive: 10}, filters: {all: 10, noloc: 0, suggest: 0, inferred: 0, manual: 0, fav: 0, hidden: 0}},
+  disk: {used_pct: 10, free_bytes: 1e11, total_bytes: 2e11,
+         dirs: {derivatives: {bytes: 1e6, files: 10}, tile_cache: {bytes: 1e3, files: 1}}},
+});
+const mem = (id, o = {}) => ({
+  id, name: 'p' + id + '.jpg', thumb: '/derivatives/p' + id + '.jpg', thumb_url: '/thumb/' + id + '.jpg?v=0123456789ab',
+  taken_at: '2030-05-03 09:12', place: '', pref: '架空県', city: '試験市', lat: 10.0, lon: 20.0, loc_source: 'exif',
+  favorite: false, hidden: false, rotation: 0, source: 'drive',
+  rank: 1, score: 80, reasons: [], issues: [], recommended: false, effective: false, curation: null, selectable: true, ...o,
+});
+const grp = (kind, group_id, token, state, members, o = {}) =>
+  ({kind, group_id, token, state, taken_at: '2030-05-03 09:12', count: members.length, warning: null, members, ...o});
+// 未確認の exact（記録なし。602 は除外で選べない）
+const EX1 = () => grp('exact', 11, 'aaaaaaaaaaaaaaaa', 'unconfirmed', [
+  mem(601, {rank: 1, score: 88.5, recommended: true, effective: true, reasons: ['ピントが合っている']}),
+  mem(602, {rank: 2, score: 71.5, favorite: true, hidden: true, selectable: false, issues: ['ブレ']}),
+]);
+// 再確認の similar（611 が人の代表、613 は記録が無効、613 は画像なし）
+const SM1 = () => grp('similar', 21, 'bbbbbbbbbbbbbbbb', 'recheck', [
+  mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+  mem(612, {rank: 1, score: 85, recommended: true}),
+  mem(613, {rank: 3, score: null, curation: 'stale', thumb: '', thumb_url: ''}),
+], {taken_at: '2030-05-02 08:00'});
+// 確認済み（人の代表なし）。有効な推奨がフィードに出せない
+const SM2 = () => grp('similar', 22, 'cccccccccccccccc', 'confirmed', [
+  mem(621, {rank: 1, recommended: true, effective: true, hidden: true, selectable: false, curation: 'reviewed'}),
+  mem(622, {rank: 2, curation: 'reviewed'}),
+], {warning: 'representative_not_visible', taken_at: '2030-05-01 07:00'});
+// 確認済み（人の代表あり）
+const SM3 = () => grp('similar', 23, 'dddddddddddddddd', 'confirmed', [
+  mem(631, {rank: 1, curation: 'reviewed'}),
+  mem(632, {rank: 2, effective: true, curation: 'representative'}),
+], {taken_at: '2030-04-30 06:00'});
+const DEFAULT_GROUPS = () => [EX1(), SM1(), SM2(), SM3()];
+const listBody = (groups, o = {}) =>
+  ({ok: true, page: 1, per: 20, pages: 1, total: groups.length, groups, ...o});
+
+function makeEnv({pathname = '/admin'} = {}){
+  const document = buildAdminDom();
+  const calls = [];
+  const flags = {};
+  const handlers = {groups: null, confirm: null, reset: null};   // (params | body, rec) => Promise | undefined
+  const fetchFake = (url, opts = {}) => {
+    const rec = {url, method: opts.method || 'GET', body: opts.body};
+    calls.push(rec);
+    // settle() は setImmediate で待つだけなので、解決済みの応答で読み直しを繰り返すループはいつまでも戻らず、calls が膨らむ
+    if(calls.length > 5000) throw new Error('fetch が 5000 回を超えた（読み直しのループ）: ' + url);
+    const params = url.includes('?') ? new URLSearchParams(url.split('?')[1]) : new URLSearchParams();
+    if(url === '/api/admin/status') return reply(statusBody());
+    if(url.startsWith('/api/admin/curation/groups')){
+      if(handlers.groups){ const r = handlers.groups(params, rec); if(r) return r; }
+      return reply(listBody(DEFAULT_GROUPS()));
+    }
+    if(url === '/api/admin/curation/confirm' || url === '/api/admin/curation/reset'){
+      const h = url.endsWith('confirm') ? handlers.confirm : handlers.reset;
+      const r = h && h(JSON.parse(opts.body), rec);
+      return r || reply({ok: false, error: 'unexpected ' + url});
+    }
+    if(url === '/api/admin/setflag'){
+      const b = JSON.parse(opts.body);
+      const cur = flags[b.id] = flags[b.id] || {favorite: false, hidden: false};
+      if(b.favorite !== undefined) cur.favorite = b.favorite;
+      if(b.hidden !== undefined) cur.hidden = b.hidden;
+      return reply({ok: true, favorite: cur.favorite, hidden: cur.hidden});
+    }
+    return reply({ok: false, error: 'unexpected ' + url});
+  };
+  const context = vm.createContext({
+    document, fetch: fetchFake, location: {pathname, origin: 'http://localhost'},
+    setInterval(){}, setTimeout(){ return 0; }, clearTimeout(){}, console,
+  });
+  loadScripts(context);
+  const reqs = prefix => calls.filter(c => c.url.startsWith(prefix));
+  const listReqs = () => reqs('/api/admin/curation/groups');
+  const lastList = () => {
+    const c = listReqs().at(-1);
+    return c ? new URLSearchParams(c.url.split('?')[1] || '') : null;
+  };
+  const boot = async () => { document.dispatchEvent({type: 'DOMContentLoaded'}); await settle(); };
+  const ev = code => JSON.parse(vm.runInContext('JSON.stringify(' + code + ')', context));
+  const run = code => vm.runInContext(code, context);       // const の状態（cs）は context のプロパティではないので、式で読む
+  return {document, context, calls, handlers, reqs, listReqs, lastList, boot, ev, run, $: s => document.querySelector(s),
+          $$: s => document.querySelectorAll(s)};
+}
+
+const hidden = (env, sel) => env.$(sel).classList.contains('hidden');
+const openCur = async env => { env.$('.tab[data-tab=curation]').click(); await settle(); };
+const sections = env => env.$$('#cur-groups .cur-group');
+const sectionOf = (env, kind, id) => sections(env).find(s => s.dataset.key === kind + ':' + id);
+const cardOf = (section, id) => section.querySelectorAll('.cur-member').find(l => l.dataset.id === String(id));
+const tagsOf = card => card.querySelectorAll('.cur-tags .tag').map(t => t.textContent);
+const body = rec => JSON.parse(rec.body);
+const activeTabs = env => env.$$('nav .tab').filter(t => t.classList.contains('on')).map(t => t.dataset.tab);
+const plain = v => JSON.parse(JSON.stringify(v));
+// ノードの同一性は assert.ok で比べる。assert.strictEqual / equal にノードを渡すと、失敗時の差分作りが文書全体を inspect して
+// 時間とメモリを大きく食う（fakedom.mjs の hidden の注記を参照）
+const same = (a, b, msg) => assert.ok(a === b, msg || '同じノードのはず');
+const notSame = (a, b, msg) => assert.ok(a !== b, msg || '別のノードのはず');
+const posts = (env, url) => env.reqs(url).filter(c => c.method === 'POST');
+const toastText = env => env.$('#toast').textContent;
+const openWith = async (env, groups) => {
+  env.handlers.groups = () => reply(listBody(groups));
+  await env.boot();
+  await openCur(env);
+};
+
+let n = 0;
+async function test(name, fn){ await fn(); n++; console.log('ok - ' + name); }
+
+await test('curation.js を読み込んだだけでは location にも fetch にも触らず、HTML 文字列を組む API も使わない', () => {
+  const touched = [];
+  const sandbox = {document: buildAdminDom(), setInterval(){}, setTimeout(){}, clearTimeout(){}, console};
+  Object.defineProperty(sandbox, 'location', {get(){ touched.push('location'); throw new Error('location'); }});
+  Object.defineProperty(sandbox, 'fetch', {get(){ touched.push('fetch'); throw new Error('fetch'); }});
+  loadScripts(vm.createContext(sandbox));
+  assert.deepEqual(touched, []);
+  for(const [text, name] of sources){
+    assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(text), name);
+  }
+});
+
+await test('(a) タブを開くまで読まず、開くと state=unconfirmed&kind=all で読む。段の見出し（種類・枚数・撮影日時・状態）と注意が描かれる', async () => {
+  const env = makeEnv();
+  await env.boot();
+  assert.equal(hidden(env, '#v-curation'), true, '起動時は状況タブ');
+  assert.deepEqual(env.listReqs(), []);
+  await openCur(env);
+  assert.deepEqual(activeTabs(env), ['curation']);
+  assert.equal(hidden(env, '#v-curation'), false);
+  assert.equal(hidden(env, '#v-status'), true);
+  assert.equal(env.listReqs().length, 1);
+  const q = env.lastList();
+  assert.deepEqual([q.get('state'), q.get('kind'), q.get('page'), q.get('per')], ['unconfirmed', 'all', '1', '20']);
+  const s = sections(env);
+  assert.equal(s.length, 4);
+  assert.deepEqual(s.map(x => x.dataset.key), ['exact:11', 'similar:21', 'similar:22', 'similar:23']);
+  const head = x => ['.cur-kind', '.cur-count', '.cur-time', '.cur-state'].map(c => x.querySelector(c).textContent);
+  assert.deepEqual(head(s[0]), ['exact', '2 枚', '2030-05-03 09:12', '状態: 未確認']);
+  assert.deepEqual(head(s[1]), ['similar', '3 枚', '2030-05-02 08:00', '状態: 再確認']);
+  assert.equal(head(s[2])[3], '状態: 確認済み', '人の代表が無い確認済み');
+  assert.equal(head(s[3])[3], '状態: 確認済み（人の代表）');
+  assert.equal(s[0].querySelector('.cur-warning'), null);
+  assert.equal(s[2].querySelector('.cur-warning').textContent, '代表がフィードに出せません', 'warning はサーバーの値のまま');
+  assert.equal(env.$('#cur-note').textContent, '4 組');
+  assert.equal(env.$('#cur-pageinfo').textContent, '4組 / 1 of 1ページ');
+  assert.equal(hidden(env, '#cur-empty'), true);
+  assert.ok(env.$('#cur-state-unconfirmed').classList.contains('on'));
+  assert.ok(env.$('#cur-kind-all').classList.contains('on'));
+});
+
+await test('(b) メンバー: サーバーの順のまま、順位・点数・タグ・画像（thumb_url。画像なしは代わりの表示）・理由と懸念の折りたたみ・無効なチェックボックス', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const [ex, sm1] = sections(env);
+  const cards = ex.querySelectorAll('.cur-member');
+  assert.deepEqual(cards.map(c => c.dataset.id), ['601', '602']);
+  assert.deepEqual(cards.map(c => c.querySelector('.cur-rank').textContent), ['#1', '#2']);
+  assert.deepEqual(cards.map(c => c.querySelector('.cur-score').textContent), ['点数 88.5', '点数 71.5']);
+  assert.deepEqual(tagsOf(cards[0]), ['解析の推奨']);
+  assert.deepEqual(tagsOf(cards[1]), ['★', '除外']);
+  assert.ok(cards[0].classList.contains('is-effective'), 'effective はサーバーの値');
+  assert.ok(!cards[1].classList.contains('is-effective'));
+  assert.equal(cards[0].querySelector('img').src, '/thumb/601.jpg?v=0123456789ab');
+  assert.equal(cards[0].querySelector('img').loading, 'lazy');
+  // selectable でないメンバーはチェックボックスが無効（画面で計算しない）
+  assert.equal(cards[0].querySelector('input').disabled, false);
+  assert.equal(cards[1].querySelector('input').disabled, true);
+  assert.ok(cards[1].classList.contains('is-unselectable'));
+  // 理由・懸念
+  assert.equal(cards[0].querySelector('.cur-why summary').textContent, '理由 1・懸念 0');
+  assert.deepEqual(cards[0].querySelectorAll('.cur-reasons li').map(x => x.textContent), ['ピントが合っている']);
+  assert.deepEqual(cards[1].querySelectorAll('.cur-issues li').map(x => x.textContent), ['ブレ']);
+  assert.equal(cards[1].querySelector('.cur-why summary').textContent, '理由 0・懸念 1');
+  // 人の代表・再確認のタグ、画像なし・点数なし
+  const c2 = sm1.querySelectorAll('.cur-member');
+  assert.deepEqual(c2.map(c => c.dataset.id), ['611', '612', '613'], '順位順ではなくサーバーが返した並び');
+  assert.deepEqual(tagsOf(c2[0]), ['人の代表']);
+  assert.deepEqual(tagsOf(c2[1]), ['解析の推奨']);
+  assert.deepEqual(tagsOf(c2[2]), ['再確認']);
+  assert.equal(c2[2].querySelector('img'), null);
+  assert.equal(c2[2].querySelector('.img-broken').textContent, '画像なし');
+  assert.equal(c2[2].querySelector('.cur-score').textContent, '点数 --');
+  assert.equal(c2[0].querySelector('.cur-why'), null, '理由も懸念も無ければ折りたたみは出さない');
+  // 画像が読めないときも代わりの表示
+  const img = cards[0].querySelector('img');
+  img.dispatchEvent({type: 'error'});
+  assert.equal(cards[0].querySelector('img'), null);
+  assert.equal(cards[0].querySelector('.img-broken').textContent, '画像なし');
+});
+
+await test('(c) 操作ボタン: 代表にする = チェックが 1 つ以上で有効、「取り消す」= 記録のあるメンバーがいる段だけ、確認済みの段は「このままで確認済み」が無効', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const [ex, sm1, sm2] = sections(env);
+  const pick = s => s.querySelector('.cur-do-pick');
+  assert.equal(pick(ex).disabled, true, '選ぶまでは無効');
+  assert.equal(ex.querySelector('.cur-do-keep').disabled, false);
+  assert.equal(ex.querySelector('.cur-do-reset'), null, '記録が無い段に取り消しは出ない');
+  assert.ok(sm1.querySelector('.cur-do-reset'));
+  assert.ok(sm2.querySelector('.cur-do-reset'), 'reviewed だけでも記録はある');
+  assert.equal(sm2.querySelector('.cur-do-keep').disabled, true);
+  const box = cardOf(ex, 601).querySelector('input');
+  box.checked = true;
+  box.dispatchEvent({type: 'change'});
+  assert.equal(pick(ex).disabled, false);
+  assert.equal(ex.querySelector('.cur-pick-note').textContent, '1 枚を選択中');
+  box.checked = false;
+  box.dispatchEvent({type: 'change'});
+  assert.equal(pick(ex).disabled, true);
+  assert.equal(ex.querySelector('.cur-pick-note').textContent, '');
+});
+
+await test('(d) チェックして「代表にする」: confirm に token 付きの本文が POST され、応答の組でその段だけが描き直される（他の段はそのまま）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const before = sections(env);
+  const [ex, sm1] = before;
+  const box = cardOf(sm1, 612).querySelector('input');
+  box.checked = true;
+  box.dispatchEvent({type: 'change'});
+  const done = grp('similar', 21, 'eeeeeeeeeeeeeeee', 'confirmed', [
+    mem(611, {rank: 2, score: 70, curation: 'reviewed'}),
+    mem(612, {rank: 1, score: 85, recommended: true, effective: true, curation: 'representative'}),
+    mem(613, {rank: 3, score: null, curation: 'reviewed', thumb: '', thumb_url: ''}),
+  ], {taken_at: '2030-05-02 08:00'});
+  env.handlers.confirm = () => reply({ok: true, group: done});
+  sm1.querySelector('.cur-do-pick').click();
+  await settle();
+  const sent = posts(env, '/api/admin/curation/confirm');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(plain(body(sent[0])), {kind: 'similar', group_id: 21, token: 'bbbbbbbbbbbbbbbb', representatives: [612]});
+  assert.equal(sent[0].method, 'POST');
+  const after = sections(env);
+  assert.equal(after.length, 4);
+  same(after[0], ex, '他の段は描き直さない');
+  same(after[2], before[2]);
+  notSame(after[1], sm1);
+  assert.equal(after[1].querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.deepEqual(tagsOf(cardOf(after[1], 612)), ['解析の推奨', '人の代表']);
+  assert.equal(cardOf(after[1], 612).querySelector('input').checked, false, '選択はその段だけ消える');
+  assert.equal(after[1].querySelector('.cur-do-keep').disabled, true, 'token も新しい組のもの');
+  assert.equal(env.ev('cs.groups[1].token'), 'eeeeeeeeeeeeeeee');
+  assert.ok(toastText(env).includes('代表を確定しました'));
+  // 新しい段からの確定は新しい token を送る
+  const box2 = cardOf(after[1], 611).querySelector('input');
+  box2.checked = true;
+  box2.dispatchEvent({type: 'change'});
+  env.handlers.confirm = () => reply({ok: true, group: done});
+  after[1].querySelector('.cur-do-pick').click();
+  await settle();
+  assert.equal(body(posts(env, '/api/admin/curation/confirm')[1]).token, 'eeeeeeeeeeeeeeee');
+  assert.deepEqual(plain(body(posts(env, '/api/admin/curation/confirm')[1]).representatives), [611]);
+});
+
+await test('(d2) 複数選ぶと representatives は段のメンバー順の ID。送信中は段のボタンが無効で、二重に送らない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const sm1 = sections(env)[1];
+  for(const id of [612, 611]){
+    const box = cardOf(sm1, id).querySelector('input');
+    box.checked = true;
+    box.dispatchEvent({type: 'change'});
+  }
+  assert.equal(sm1.querySelector('.cur-pick-note').textContent, '2 枚を選択中');
+  const d = deferred();
+  env.handlers.confirm = () => d.promise;
+  sm1.querySelector('.cur-do-pick').click();
+  assert.equal(sm1.querySelector('.cur-do-pick').disabled, true);
+  assert.equal(sm1.querySelector('.cur-do-keep').disabled, true);
+  assert.equal(sm1.querySelector('.cur-do-reset').disabled, true);
+  sm1.querySelector('.cur-do-pick').click();
+  sm1.querySelector('.cur-do-keep').click();
+  env.context.curConfirmKeep(env.run('cs.groups[1]'));        // ボタン以外から呼んでも二重に送らない
+  await settle();
+  assert.equal(posts(env, '/api/admin/curation/confirm').length, 1);
+  assert.deepEqual(plain(body(posts(env, '/api/admin/curation/confirm')[0]).representatives), [611, 612]);
+  d.resolve({ok: true, status: 200, json: () => Promise.resolve({ok: true, group: grp('similar', 21, '5555555555555555', 'confirmed',
+    [mem(611, {curation: 'reviewed'}), mem(612, {curation: 'representative'}), mem(613, {curation: 'reviewed'})])})});
+  await settle();
+  assert.equal(sections(env).length, 4);
+  assert.equal(sections(env)[1].dataset.key, 'similar:21');
+  assert.equal(sections(env)[1].querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+});
+
+await test('(e) 「このままで確認済み」: 人の代表があればその ID（stale は含めない）、無ければ representatives は null', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const [ex, sm1] = sections(env);
+  env.handlers.confirm = b => reply({ok: true, group: grp(b.kind, b.group_id, 'ffffffffffffffff', 'confirmed',
+    [mem(601, {curation: 'reviewed'}), mem(602, {curation: 'reviewed', selectable: false})])});
+  sm1.querySelector('.cur-do-keep').click();
+  await settle();
+  let sent = posts(env, '/api/admin/curation/confirm');
+  assert.deepEqual(plain(body(sent[0])), {kind: 'similar', group_id: 21, token: 'bbbbbbbbbbbbbbbb', representatives: [611]});
+  ex.querySelector('.cur-do-keep').click();
+  await settle();
+  sent = posts(env, '/api/admin/curation/confirm');
+  assert.equal(sent.length, 2);
+  assert.deepEqual(plain(body(sent[1])), {kind: 'exact', group_id: 11, token: 'aaaaaaaaaaaaaaaa', representatives: null});
+  assert.ok('representatives' in body(sent[1]), 'キーを省かない（null は明示する）');
+  assert.ok(toastText(env).includes('確認済みにしました'));
+});
+
+await test('(f) 「取り消す」: reset に kind・group_id・token だけを POST し、応答の組（未確認）で描き直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const sm3 = sections(env)[3];
+  env.handlers.reset = () => reply({ok: true, group: grp('similar', 23, '1111111111111111', 'unconfirmed',
+    [mem(631, {rank: 1, recommended: true, effective: true}), mem(632, {rank: 2})])});
+  sm3.querySelector('.cur-do-reset').click();
+  await settle();
+  const sent = posts(env, '/api/admin/curation/reset');
+  assert.equal(sent.length, 1);
+  assert.deepEqual(plain(body(sent[0])), {kind: 'similar', group_id: 23, token: 'dddddddddddddddd'});
+  const fresh = sections(env)[3];
+  assert.equal(fresh.querySelector('.cur-state').textContent, '状態: 未確認');
+  assert.equal(fresh.querySelector('.cur-do-reset'), null, '記録が無くなったので取り消しは消える');
+  assert.ok(toastText(env).includes('取り消しました'));
+});
+
+await test('(g) 409 group_changed: 「組が変わりました」のトースト → state=all&kind=all&ids=<先頭の写真> でその段だけ読み直し、今の絞り込みに合えば描き直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const before = sections(env);
+  const sm1 = before[1];
+  const box = cardOf(sm1, 612).querySelector('input');
+  box.checked = true;
+  box.dispatchEvent({type: 'change'});
+  env.handlers.confirm = () => respond(409, {ok: false, error: 'group_changed'});
+  const rebuilt = grp('similar', 31, '2222222222222222', 'recheck', [mem(611, {rank: 1}), mem(612, {rank: 2}), mem(614, {rank: 3})]);
+  env.handlers.groups = params => params.get('ids')
+    ? reply(listBody([grp('exact', 99, 'x'.repeat(16), 'unconfirmed', [mem(611), mem(615)]), rebuilt])) : null;
+  sm1.querySelector('.cur-do-pick').click();
+  await settle();
+  assert.ok(toastText(env).includes('組が変わりました。読み直します'), toastText(env));
+  assert.ok(env.$('#toast').className.includes('err'));
+  const q = env.lastList();
+  assert.deepEqual([q.get('ids'), q.get('state'), q.get('kind')], ['611', 'all', 'all']);
+  assert.equal(env.listReqs().length, 2, '全体は読み直さない（その段だけ）');
+  const after = sections(env);
+  assert.equal(after.length, 4);
+  same(after[0], before[0]);
+  assert.equal(after[1].dataset.key, 'similar:31', '同じ kind の組を取る（group_id が変わっても拾える）');
+  assert.deepEqual(after[1].querySelectorAll('.cur-member').map(c => c.dataset.id), ['611', '612', '614']);
+  assert.equal(cardOf(after[1], 612).querySelector('input').checked, false, 'token が変わったので選択は持ち越さない');
+  assert.equal(env.ev('cs.groups[1].token'), '2222222222222222');
+  assert.equal(after[1].querySelector('.cur-do-pick').disabled, true);
+  // ボタンはまた使える（busy が残っていない）
+  assert.equal(after[1].querySelector('.cur-do-keep').disabled, false);
+});
+
+await test('(g2) 読み直した組が今の絞り込み（未確認）に合わなければ段を外す。応答が空でも外す。件数も減る', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  env.handlers.confirm = () => respond(409, {ok: false, error: 'group_changed'});
+  // 確認済みになって届いた → 未確認の絞り込みには合わない
+  env.handlers.groups = params => params.get('ids')
+    ? reply(listBody([grp('exact', 11, '3333333333333333', 'confirmed', [mem(601), mem(602)])])) : null;
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['similar:21', 'similar:22', 'similar:23']);
+  assert.equal(env.$('#cur-pageinfo').textContent, '3組 / 1 of 1ページ');
+  assert.equal(env.ev('cs.nodes.size'), 3);
+  // 組が消えた（空の応答）
+  env.handlers.groups = params => params.get('ids') ? reply(listBody([])) : null;
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['similar:22', 'similar:23']);
+  // 同じ kind の組が無い（別の kind だけ）も外す
+  env.handlers.groups = params => params.get('ids') ? reply(listBody([EX1()])) : null;
+  env.handlers.reset = () => respond(409, {ok: false, error: 'group_changed'});
+  sections(env)[0].querySelector('.cur-do-reset').click();       // similar:22（確認済みは keep が無効なので取り消しで）
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['similar:23']);
+  // 絞り込みが「すべて」なら確認済みになった組も描き直す
+  env.$('#cur-state-all').click();
+  await settle();
+  env.handlers.groups = params => params.get('ids')
+    ? reply(listBody([grp('exact', 11, '4444444444444444', 'confirmed', [mem(601), mem(602)])])) : null;
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  await settle();
+  assert.equal(sections(env)[0].querySelector('.cur-state').textContent, '状態: 確認済み');
+});
+
+await test('(g3) 段を外してページが空になり、まだ件数が残っているなら一覧を読み直す。全部無くなれば「該当する組がありません」', async () => {
+  const env = makeEnv();
+  await openWith(env, [EX1()]);
+  env.handlers.groups = params => params.get('ids') ? reply(listBody([])) : reply(listBody([EX1()], {total: 21, pages: 2, page: 2}));
+  env.handlers.confirm = () => respond(409, {ok: false, error: 'group_changed'});
+  // total 1 のまま全部消える → 空の表示
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  await settle();
+  assert.equal(sections(env).length, 0);
+  assert.equal(hidden(env, '#cur-empty'), false);
+  assert.equal(env.listReqs().length, 2, '件数が残っていないので全体は読み直さない');
+  // 総数が多いとき: ページが空になったらサーバーに合わせて読み直す
+  const env2 = makeEnv();
+  env2.handlers.groups = () => reply(listBody([EX1()], {total: 21, pages: 2, page: 2}));
+  await env2.boot();
+  await openCur(env2);
+  env2.handlers.groups = params => params.get('ids') ? reply(listBody([])) : reply(listBody([SM1()], {total: 20, pages: 1, page: 1}));
+  env2.handlers.confirm = () => respond(409, {ok: false, error: 'group_changed'});
+  sections(env2)[0].querySelector('.cur-do-keep').click();
+  await settle();
+  assert.equal(env2.listReqs().length, 3);
+  assert.equal(env2.lastList().get('ids'), null);
+  assert.deepEqual(sections(env2).map(s => s.dataset.key), ['similar:21']);
+  assert.equal(env2.$('#cur-pageinfo').textContent, '20組 / 1 of 1ページ');
+});
+
+await test('(h) 400 representative_not_visible は「代表に選べない写真があります」のトースト（段は残り、読み直して selectable を合わせる）。その他の失敗は失敗のトースト', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const sm1 = sections(env)[1];
+  const box = cardOf(sm1, 612).querySelector('input');
+  box.checked = true;
+  box.dispatchEvent({type: 'change'});
+  env.handlers.confirm = () => respond(400, {ok: false, error: 'representative_not_visible'});
+  env.handlers.groups = params => params.get('ids') ? reply(listBody([grp('similar', 21, 'bbbbbbbbbbbbbbbb', 'recheck', [
+    mem(611, {rank: 2, curation: 'representative', effective: true}), mem(612, {rank: 1, selectable: false, hidden: true}),
+    mem(613, {rank: 3, curation: 'stale'})], {taken_at: '2030-05-02 08:00'})])) : null;
+  sm1.querySelector('.cur-do-pick').click();
+  await settle();
+  assert.equal(toastText(env), '代表に選べない写真があります');
+  const fresh = sections(env)[1];
+  assert.equal(fresh.dataset.key, 'similar:21');
+  assert.equal(cardOf(fresh, 612).querySelector('input').disabled, true, '読み直しで selectable がサーバーの値になる');
+  assert.equal(cardOf(fresh, 612).querySelector('input').checked, false, 'もう選べない写真の選択は外れる');
+  assert.equal(fresh.querySelector('.cur-do-pick').disabled, true);
+  // その他の失敗
+  env.handlers.confirm = () => respond(500, {ok: false, error: 'boom'});
+  fresh.querySelector('.cur-do-keep').click();
+  await settle();
+  assert.equal(toastText(env), '選別の更新に失敗: boom');
+  same(sections(env)[1], fresh, '段は描き直さない');
+  assert.equal(fresh.querySelector('.cur-do-keep').disabled, false, 'もう一度押せる');
+  // 通信エラー（JSON でない）
+  env.handlers.reset = () => respond(503, undefined);
+  sections(env)[1].querySelector('.cur-do-reset').click();
+  await settle();
+  assert.ok(toastText(env).startsWith('選別の更新に失敗:'), toastText(env));
+});
+
+await test('(i) 画像を押すとビューアが開く（チェックボックスは切り替えない・AI 評価は出さない）。メンバーの順に前後へ動ける', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const [ex] = sections(env);
+  const thumb = cardOf(ex, 602).querySelector('.cur-thumb');
+  const notCancelled = thumb.dispatchEvent({type: 'click'});
+  assert.equal(notCancelled, false, 'label の既定動作（チェックの切り替え）を止める');
+  assert.equal(hidden(env, '#viewer'), false);
+  assert.ok(env.document.body.classList.contains('ps-viewer-open'));
+  assert.equal(env.ev('viewerIndex'), 1);
+  assert.equal(env.$('#viewer-title').textContent, '#602  p602.jpg');
+  assert.equal(env.$('#viewer-counter').textContent, '2 / 2');
+  assert.equal(hidden(env, '#viewer-ai'), true);
+  assert.equal(hidden(env, '#viewer-group'), true);
+  assert.equal(env.ev('viewerEntries.length'), 2);
+  env.$('#viewer-next').click();
+  assert.equal(env.$('#viewer-title').textContent, '#601  p601.jpg');
+  // 閉じるとフォーカスが画像のボタンへ戻る
+  env.$('#viewer-close').click();
+  assert.equal(hidden(env, '#viewer'), true);
+  same(env.document.activeElement, thumb);
+  assert.equal(cardOf(ex, 602).querySelector('input').checked, false);
+});
+
+await test('(i2) 選別タブから開いたビューアの由来バッジは、メンバーの loc_source のとおり（位置あり・exif は EXIF）', async () => {
+  const env = makeEnv();
+  await openWith(env, [grp('exact', 11, 'aaaaaaaaaaaaaaaa', 'unconfirmed', [
+    mem(601, {loc_source: 'exif'}), mem(602, {loc_source: 'manual'}), mem(603, {loc_source: 'drive_meta'}),
+  ])]);
+  const [ex] = sections(env);
+  const badge = id => {
+    cardOf(ex, id).querySelector('.cur-thumb').click();
+    const text = env.$('#viewer-badges').children.map(c => c.textContent);
+    env.$('#viewer-close').click();
+    return text;
+  };
+  assert.deepEqual(badge(601), ['EXIF']);
+  assert.deepEqual(badge(602), ['手動']);
+  assert.deepEqual(badge(603), ['DRIVE']);
+});
+
+await test('(j) ビューアの★: setflag にその写真の id が送られ、段のメンバーのタグだけが変わる（selectable・effective・warning はサーバーの値のまま、読み直さない）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const ex = sections(env)[0];
+  cardOf(ex, 601).querySelector('.cur-thumb').click();
+  env.$('#viewer-favorite').click();
+  await settle();
+  const flagReq = env.reqs('/api/admin/setflag');
+  assert.equal(flagReq.length, 1);
+  assert.equal(body(flagReq[0]).id, 601);
+  assert.deepEqual(tagsOf(cardOf(ex, 601)), ['解析の推奨', '★']);
+  assert.deepEqual(tagsOf(cardOf(ex, 602)), ['★', '除外'], '他のメンバーは変わらない');
+  assert.equal(cardOf(ex, 601).querySelector('input').disabled, false);
+  assert.ok(cardOf(ex, 601).classList.contains('is-effective'));
+  assert.equal(env.listReqs().length, 1, '★だけなら読み直さない');
+  // もう一度押すと外れる
+  env.$('#viewer-favorite').click();
+  await settle();
+  assert.deepEqual(tagsOf(cardOf(ex, 601)), ['解析の推奨']);
+  assert.equal(env.listReqs().length, 1);
+  same(sections(env)[0], ex);
+});
+
+await test('(j2) 除外が変わると、その段だけを ids= で読み直して selectable・warning をサーバーの値に合わせる。選択のうち選べなくなった写真だけが外れる', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const before = sections(env);
+  const sm1 = before[1];
+  for(const id of [611, 612]){
+    const box = cardOf(sm1, id).querySelector('input');
+    box.checked = true;
+    box.dispatchEvent({type: 'change'});
+  }
+  cardOf(sm1, 612).querySelector('.cur-thumb').click();
+  env.handlers.groups = params => params.get('ids') ? reply(listBody([grp('similar', 21, 'bbbbbbbbbbbbbbbb', 'recheck', [
+    mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+    mem(612, {rank: 1, score: 85, recommended: true, hidden: true, selectable: false}),
+    mem(613, {rank: 3, score: null, curation: 'stale', thumb: '', thumb_url: ''})],
+    {taken_at: '2030-05-02 08:00', warning: 'representative_not_visible'})])) : null;
+  env.$('#viewer-hidden').click();
+  await settle();
+  assert.equal(env.listReqs().length, 2);
+  const q = env.lastList();
+  assert.deepEqual([q.get('ids'), q.get('state'), q.get('kind')], ['611', 'all', 'all']);
+  const after = sections(env);
+  same(after[0], before[0]);
+  notSame(after[1], sm1);
+  assert.equal(after[1].querySelector('.cur-warning').textContent, '代表がフィードに出せません');
+  assert.equal(cardOf(after[1], 612).querySelector('input').disabled, true);
+  assert.deepEqual(tagsOf(cardOf(after[1], 612)), ['解析の推奨', '除外']);
+  assert.equal(cardOf(after[1], 611).querySelector('input').checked, true, '選べる写真の選択は残る');
+  assert.equal(cardOf(after[1], 612).querySelector('input').checked, false);
+  assert.equal(after[1].querySelector('.cur-do-pick').disabled, false);
+  assert.equal(after[1].querySelector('.cur-pick-note').textContent, '1 枚を選択中');
+  // 読み直したあとの★は、新しい段のメンバーにも反映される（開いているビューアの写真は古い object のまま）
+  env.context.applyPhoto(611, {favorite: true, hidden: false});
+  assert.deepEqual(tagsOf(cardOf(sections(env)[1], 611)), ['人の代表', '★']);
+});
+
+await test('(k) 絞り込み: 状態・種類の切り替えで state/kind 付きで page=1 から読み直し、選択中の表示が切り替わる。選択は持ち越さない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const box = cardOf(sections(env)[0], 601).querySelector('input');
+  box.checked = true;
+  box.dispatchEvent({type: 'change'});
+  env.$('#cur-state-confirmed').click();
+  await settle();
+  let q = env.lastList();
+  assert.deepEqual([q.get('state'), q.get('kind'), q.get('page')], ['confirmed', 'all', '1']);
+  assert.ok(env.$('#cur-state-confirmed').classList.contains('on'));
+  assert.ok(!env.$('#cur-state-unconfirmed').classList.contains('on'));
+  env.$('#cur-kind-exact').click();
+  await settle();
+  q = env.lastList();
+  assert.deepEqual([q.get('state'), q.get('kind')], ['confirmed', 'exact']);
+  assert.ok(env.$('#cur-kind-exact').classList.contains('on'));
+  assert.ok(!env.$('#cur-kind-all').classList.contains('on'));
+  env.$('#cur-kind-similar').click();
+  await settle();
+  assert.equal(env.lastList().get('kind'), 'similar');
+  env.$('#cur-state-all').click();
+  env.$('#cur-kind-all').click();
+  await settle();
+  q = env.lastList();
+  assert.deepEqual([q.get('state'), q.get('kind')], ['all', 'all']);
+  assert.equal(env.ev('cs.picks.size'), 0);
+  assert.equal(cardOf(sections(env)[0], 601).querySelector('input').checked, false);
+  // 絞り込みに合う組が無い → 空の表示
+  env.handlers.groups = () => reply(listBody([]));
+  env.$('#cur-state-confirmed').click();
+  await settle();
+  assert.equal(sections(env).length, 0);
+  assert.equal(hidden(env, '#cur-empty'), false);
+  assert.equal(env.$('#cur-empty').textContent, '該当する組がありません');
+  assert.equal(env.$('#cur-note').textContent, '0 組');
+});
+
+await test('(l) ページング: 次へ・前へで page を付けて読み直す。端では無効。絞り込みを変えると 1 ページ目へ', async () => {
+  const env = makeEnv();
+  env.handlers.groups = params => {
+    const page = Number(params.get('page')) || 1;
+    return reply(listBody([EX1()], {page, pages: 3, total: 41}));
+  };
+  await env.boot();
+  await openCur(env);
+  assert.equal(env.$('#cur-pageinfo').textContent, '41組 / 1 of 3ページ');
+  assert.equal(env.$('#cur-prev').disabled, true);
+  assert.equal(env.$('#cur-next').disabled, false);
+  env.$('#cur-next').click();
+  await settle();
+  assert.equal(env.lastList().get('page'), '2');
+  assert.equal(env.$('#cur-pageinfo').textContent, '41組 / 2 of 3ページ');
+  env.$('#cur-next').click();
+  await settle();
+  assert.equal(env.lastList().get('page'), '3');
+  assert.equal(env.$('#cur-next').disabled, true);
+  env.$('#cur-next').click();
+  await settle();
+  assert.equal(env.listReqs().length, 3, '最後のページでは読まない');
+  env.$('#cur-prev').click();
+  await settle();
+  assert.equal(env.lastList().get('page'), '2');
+  env.$('#cur-kind-exact').click();
+  await settle();
+  assert.equal(env.lastList().get('page'), '1');
+});
+
+await test('(m) 古い応答は捨てる: 絞り込みを続けて変えたとき、遅れて届いた前の応答で一覧を上書きしない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const first = deferred(), second = deferred();
+  const queue = [first, second];
+  env.handlers.groups = () => queue.shift().promise;
+  env.$('#cur-state-confirmed').click();
+  env.$('#cur-kind-exact').click();
+  second.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([EX1()]))});
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11']);
+  first.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([SM3(), SM2()]))});
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11'], '先の応答は捨てる');
+  assert.ok(env.$('#cur-kind-exact').classList.contains('on'));
+});
+
+await test('(m2) 一覧が読み直されたら、飛んでいた 1 組の読み直しの応答は捨てる（別のページ・絞り込みへ段を戻さない）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const d = deferred();
+  env.handlers.confirm = () => respond(409, {ok: false, error: 'group_changed'});
+  env.handlers.groups = params => params.get('ids') ? d.promise : null;
+  sections(env)[1].querySelector('.cur-do-keep').click();
+  await settle();
+  env.handlers.groups = () => reply(listBody([EX1()]));
+  env.$('#cur-kind-exact').click();
+  await settle();
+  d.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([SM1()]))});
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11']);
+});
+
+await test('(n) 確定の応答が一覧の読み直しのあとに届いても、そこに無い段は触らない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const d = deferred();
+  env.handlers.confirm = () => d.promise;
+  sections(env)[1].querySelector('.cur-do-keep').click();
+  env.handlers.groups = () => reply(listBody([EX1()]));
+  env.$('#cur-kind-exact').click();
+  await settle();
+  d.resolve({ok: true, status: 200, json: () => Promise.resolve({ok: true, group: SM3()})});
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11']);
+  assert.equal(env.ev('cs.busy.size'), 0);
+});
+
+await test('(n2) 遅れた確定の応答は、送ったあとに読み直した一覧の同じ段を古い値に戻さない。段は読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const post = deferred(), byId = deferred();
+  env.handlers.confirm = () => post.promise;
+  sections(env)[1].querySelector('.cur-do-keep').click();           // 送信（世代 1）
+  const latest = () => grp('similar', 21, 'bbbbbbbbbbbbbbbb', 'recheck', [
+    mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+    mem(612, {rank: 1, score: 85, recommended: true, hidden: true, selectable: false}),
+    mem(613, {rank: 3, score: null, curation: 'stale', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+  env.handlers.groups = params => params.get('ids') ? byId.promise : reply(listBody([EX1(), latest()]));
+  env.$('#cur-state-all').click();                                   // 一覧の読み直し（世代 2）。612 は除外
+  await settle();
+  const fresh = sectionOf(env, 'similar', 21);
+  assert.equal(cardOf(fresh, 612).querySelector('input').disabled, true);
+  post.resolve({ok: true, status: 200, json: () => Promise.resolve({ok: true, group: grp('similar', 21, 'ffffffffffffffff',
+    'confirmed', [mem(611, {rank: 2, curation: 'representative', effective: true}), mem(612, {rank: 1, recommended: true}),
+                  mem(613, {rank: 3, curation: 'reviewed'})], {taken_at: '2030-05-02 08:00'})})});
+  await settle();
+  // 遅れた応答では置き換えない（読み直しの応答はまだ届いていない）
+  same(sectionOf(env, 'similar', 21), fresh, '段は置き換えない');
+  assert.equal(cardOf(fresh, 612).querySelector('input').disabled, true);
+  assert.equal(fresh.querySelector('.cur-state').textContent, '状態: 再確認');
+  assert.equal(env.ev('cs.groups[1].token'), 'bbbbbbbbbbbbbbbb');
+  assert.ok(toastText(env).includes('確認済みにしました'), '確定は成功している');
+  // 代わりにその段を読み直す
+  assert.equal(env.lastList().get('ids'), '611');
+  assert.equal(env.ev('cs.busy.size'), 0);
+  assert.equal(fresh.querySelector('.cur-do-keep').disabled, false, '送信中の表示は解く');
+  byId.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([latest()]))});
+  await settle();
+  assert.equal(cardOf(sectionOf(env, 'similar', 21), 612).querySelector('input').disabled, true);
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 再確認');
+});
+
+await test('(n3) 一覧の読み直しを待つ間に確定が成功したら、遅れて届いた一覧の応答では確認済みの段を戻さない。一覧は読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const held = deferred(), again = deferred();
+  const queue = [held, again];
+  env.handlers.groups = params => params.get('ids') ? null : queue.shift().promise;
+  env.$('#cur-state-all').click();                                   // 一覧の読み直しを保留
+  await settle();
+  const done = () => grp('similar', 21, 'eeeeeeeeeeeeeeee', 'confirmed', [
+    mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+    mem(612, {rank: 1, score: 85, recommended: true, curation: 'reviewed'}),
+    mem(613, {rank: 3, score: null, curation: 'reviewed', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+  env.handlers.confirm = () => reply({ok: true, group: done()});
+  sections(env)[1].querySelector('.cur-do-keep').click();
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.ok(toastText(env).includes('確認済みにしました'));
+  // 確定の前に出した一覧の応答（再確認のまま）が遅れて届く → 捨てる
+  held.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody(DEFAULT_GROUPS()))});
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）',
+    '再確認に戻らない');
+  assert.equal(env.ev('cs.groups[1].token'), 'eeeeeeeeeeeeeeee');
+  assert.equal(env.listReqs().length, 3, '捨てた一覧は読み直す（初回・保留・読み直し）');
+  assert.equal(env.lastList().get('state'), 'all');
+  again.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([EX1(), done(), SM2(), SM3()]))});
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(sections(env).length, 4);
+});
+
+await test('(n4) 一覧の要求のあとに送った確定の応答が、反映済みの一覧より遅く届いても、段を古い値に戻さない。段は読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const held = deferred(), post = deferred(), byId = deferred();
+  env.handlers.confirm = () => post.promise;
+  env.handlers.groups = params => params.get('ids') ? byId.promise : held.promise;
+  env.$('#cur-state-all').click();                                   // 一覧の要求（gen が進む）。応答は保留
+  await settle();
+  sections(env)[1].querySelector('.cur-do-keep').click();           // 一覧の要求のあとに送信（gen は同じ）
+  await settle();
+  const latest = () => grp('similar', 21, 'bbbbbbbbbbbbbbbb', 'recheck', [
+    mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+    mem(612, {rank: 1, score: 85, recommended: true, hidden: true, selectable: false}),
+    mem(613, {rank: 3, score: null, curation: 'stale', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+  held.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([EX1(), latest()]))});   // 一覧の応答を反映
+  await settle();
+  const fresh = sectionOf(env, 'similar', 21);
+  assert.equal(cardOf(fresh, 612).querySelector('input').disabled, true, '一覧の値（除外）が反映された');
+  post.resolve({ok: true, status: 200, json: () => Promise.resolve({ok: true, group: grp('similar', 21, 'ffffffffffffffff',
+    'confirmed', [mem(611, {rank: 2, curation: 'representative', effective: true}), mem(612, {rank: 1, recommended: true}),
+                  mem(613, {rank: 3, curation: 'reviewed'})], {taken_at: '2030-05-02 08:00'})})});
+  await settle();
+  same(sectionOf(env, 'similar', 21), fresh, '段は置き換えない');
+  assert.equal(cardOf(fresh, 612).querySelector('input').disabled, true);
+  assert.equal(fresh.querySelector('.cur-state').textContent, '状態: 再確認');
+  assert.equal(env.ev('cs.groups[1].token'), 'bbbbbbbbbbbbbbbb');
+  assert.ok(toastText(env).includes('確認済みにしました'), '確定は成功している');
+  assert.equal(env.lastList().get('ids'), '611', '段を読み直す');
+  assert.equal(env.ev('cs.busy.size'), 0);
+  byId.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([latest()]))});
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 再確認');
+});
+
+await test('(n5) 未確認の絞り込みで別々の段を並行して確定し、両方成功しても、両方の段が確認済みとして残る', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  assert.equal(env.ev('cs.state'), 'unconfirmed');
+  const a = deferred(), b = deferred();
+  const confirmedA = () => grp('exact', 11, 'a1a1a1a1a1a1a1a1', 'confirmed', [
+    mem(601, {rank: 1, recommended: true, effective: true, curation: 'reviewed'}),
+    mem(602, {rank: 2, favorite: true, hidden: true, selectable: false, curation: 'reviewed'})]);
+  const confirmedB = () => grp('similar', 21, 'b1b1b1b1b1b1b1b1', 'confirmed', [
+    mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+    mem(612, {rank: 1, score: 85, recommended: true, curation: 'reviewed'}),
+    mem(613, {rank: 3, score: null, curation: 'reviewed', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+  env.handlers.confirm = (bodyJson) => bodyJson.group_id === 11 ? a.promise : b.promise;
+  env.handlers.groups = params => params.get('ids') === '611' ? reply(listBody([confirmedB()])) : null;
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  sections(env)[1].querySelector('.cur-do-keep').click();           // A・B を並行して送信
+  await settle();
+  assert.equal(posts(env, '/api/admin/curation/confirm').length, 2);
+  a.resolve({ok: true, status: 200, json: () => Promise.resolve({ok: true, group: confirmedA()})});
+  await settle();
+  b.resolve({ok: true, status: 200, json: () => Promise.resolve({ok: true, group: confirmedB()})});   // 後着（gen が進んだあと）
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11', 'similar:21', 'similar:22', 'similar:23'],
+    '消えない');
+  assert.equal(sectionOf(env, 'exact', 11).querySelector('.cur-state').textContent, '状態: 確認済み');
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.lastList().get('ids'), '611', '後着の段は読み直した');
+  assert.equal(env.ev('cs.busy.size'), 0);
+});
+
+const ok200 = body => ({ok: true, status: 200, json: () => Promise.resolve(body)});
+const idsReqs = env => env.listReqs().filter(c => c.url.includes('ids='));
+// similar:21 の 612 が除外（選べない）の再確認
+const sm1Hidden = () => grp('similar', 21, 'bbbbbbbbbbbbbbbb', 'recheck', [
+  mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+  mem(612, {rank: 1, score: 85, recommended: true, hidden: true, selectable: false}),
+  mem(613, {rank: 3, score: null, curation: 'stale', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+const sm1Confirmed = () => grp('similar', 21, 'b1b1b1b1b1b1b1b1', 'confirmed', [
+  mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+  mem(612, {rank: 1, score: 85, recommended: true, curation: 'reviewed'}),
+  mem(613, {rank: 3, score: null, curation: 'reviewed', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+const disabled612 = env => cardOf(sectionOf(env, 'similar', 21), 612).querySelector('input').disabled;
+
+await test('(n6) 一覧の要求のあとに出した 1 組の読み直しが先に反映されても、遅れて届いた古い一覧の応答では段を巻き戻さない。一覧は取り直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const held = deferred(), again = deferred(), byId = deferred();
+  const queue = [held, again];
+  env.handlers.groups = params => params.get('ids') ? byId.promise : queue.shift().promise;
+  env.$('#cur-state-all').click();                                   // 一覧の要求（保留）
+  await settle();
+  env.context.applyPhoto(612, {favorite: false, hidden: true});     // 除外 → 段の読み直し（保留）
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  byId.resolve(ok200(listBody([sm1Hidden()])));                     // 段の読み直しが先に反映される
+  await settle();
+  assert.equal(disabled612(env), true, '段の値（除外・選べない）が反映された');
+  const n0 = env.listReqs().length;
+  held.resolve(ok200(listBody(DEFAULT_GROUPS())));                  // 古い一覧（612 は除外でない）が遅れて届く
+  await settle();
+  assert.equal(disabled612(env), true, '古い一覧で巻き戻らない');
+  assert.equal(env.listReqs().length, n0 + 1, '一覧を取り直す');
+  assert.equal(idsReqs(env).length, 1);
+  again.resolve(ok200(listBody([EX1(), sm1Hidden()])));
+  await settle();
+  assert.equal(disabled612(env), true);
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11', 'similar:21']);
+});
+
+await test('(n7) 一覧が反映されたあとに、その前に出した 1 組の読み直しの応答が遅れて届いても、一覧の値のまま。段は読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const held = deferred(), first = deferred(), second = deferred();
+  const idsQueue = [first, second];
+  env.handlers.groups = params => params.get('ids') ? idsQueue.shift().promise : held.promise;
+  env.$('#cur-state-all').click();                                   // 一覧の要求（保留）
+  await settle();
+  env.context.applyPhoto(612, {favorite: false, hidden: true});     // 段の読み直し（保留）
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  held.resolve(ok200(listBody([EX1(), sm1Hidden()])));              // 一覧が先に反映される
+  await settle();
+  assert.equal(disabled612(env), true);
+  first.resolve(ok200(listBody([SM1()])));                          // 遅れた段の応答（612 は除外でない）→ 捨てる
+  await settle();
+  assert.equal(disabled612(env), true, '一覧の値のまま');
+  assert.equal(idsReqs(env).length, 2, '段が一覧に残っているので読み直す');
+  second.resolve(ok200(listBody([sm1Hidden()])));
+  await settle();
+  assert.equal(disabled612(env), true);
+  assert.equal(env.ev('cs.reloading.size'), 0);
+});
+
+await test('(n8) 未確認で A・B を並行して確定し、B の成功が古い応答扱いでも、B の読み直しが★の変更で置き換えられても B は残る', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  assert.equal(env.ev('cs.state'), 'unconfirmed');
+  const a = deferred(), b = deferred(), g1 = deferred(), g2 = deferred();
+  const idsQueue = [g1, g2];
+  const confirmedA = () => grp('exact', 11, 'a1a1a1a1a1a1a1a1', 'confirmed', [
+    mem(601, {rank: 1, recommended: true, effective: true, curation: 'reviewed'}),
+    mem(602, {rank: 2, favorite: true, hidden: true, selectable: false, curation: 'reviewed'})]);
+  env.handlers.confirm = body => body.group_id === 11 ? a.promise : b.promise;
+  env.handlers.groups = params => params.get('ids') ? idsQueue.shift().promise : null;
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  sections(env)[1].querySelector('.cur-do-keep').click();
+  await settle();
+  a.resolve(ok200({ok: true, group: confirmedA()}));
+  await settle();
+  b.resolve(ok200({ok: true, group: sm1Confirmed()}));              // 古い応答扱い → 段の読み直し（g1）
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  assert.equal(env.ev('cs.reloading.size'), 1);
+  env.context.applyPhoto(611, {favorite: true, hidden: false});     // 読み直しの間の★ → 新しい読み直し（g2）。g1 は無効
+  await settle();
+  assert.equal(idsReqs(env).length, 2);
+  g1.resolve(ok200(listBody([sm1Confirmed()])));
+  await settle();
+  assert.equal(sections(env).length, 4, '無効になった応答は何も変えない');
+  g2.resolve(ok200(listBody([sm1Confirmed()])));                    // 確認済みの応答。絞り込み（未確認）には合わない
+  await settle();
+  assert.deepEqual(sections(env).map(s => s.dataset.key), ['exact:11', 'similar:21', 'similar:22', 'similar:23'], 'B は残る');
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.ev('cs.reloading.size'), 0);
+});
+
+await test('(n9) 1 組の読み直しを出したあとに確定が成功して直接反映されたら、遅れた読み直しの応答は捨てる。reloading は残らず、次の★で余計な読み直しが走らない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const post = deferred(), byId = deferred();
+  env.handlers.confirm = () => post.promise;
+  env.handlers.groups = params => params.get('ids') ? byId.promise : null;
+  env.context.applyPhoto(612, {favorite: false, hidden: true});     // 段の読み直し（保留）
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  assert.equal(env.ev('cs.reloading.size'), 1);
+  sections(env)[1].querySelector('.cur-do-keep').click();           // 確定を送信
+  await settle();
+  post.resolve(ok200({ok: true, group: sm1Confirmed()}));           // 直接反映
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.ev('cs.reloading.size'), 0, '飛んでいた読み直しは無効になった');
+  byId.resolve(ok200(listBody([SM1()])));                           // 遅れた読み直しの応答（再確認）→ 捨てる
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.ev('cs.reloading.size'), 0, 'key が残らない');
+  assert.equal(idsReqs(env).length, 1, '読み直しを足さない');
+  env.context.applyPhoto(611, {favorite: true, hidden: false});     // その後の★（除外・位置は変わらない）
+  await settle();
+  assert.equal(idsReqs(env).length, 1, '余計な読み直しが走らない');
+  assert.ok(sectionOf(env, 'similar', 21), '段は消えない');
+});
+
+await test('(n10) 古い応答扱いの確定の成功でも版が進み、それより前に出した飛んでいる一覧は捨てて取り直す。確認済みの B が一覧に出る', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const a = deferred(), b = deferred(), held = deferred(), again = deferred(), byId = deferred();
+  const lists = [held, again];
+  const confirmedA = () => grp('exact', 11, 'a1a1a1a1a1a1a1a1', 'confirmed', [
+    mem(601, {rank: 1, recommended: true, effective: true, curation: 'reviewed'}),
+    mem(602, {rank: 2, favorite: true, hidden: true, selectable: false, curation: 'reviewed'})]);
+  env.handlers.confirm = body => body.group_id === 11 ? a.promise : b.promise;
+  env.handlers.groups = params => params.get('ids') ? byId.promise : lists.shift().promise;
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  sections(env)[1].querySelector('.cur-do-keep').click();           // A・B を同じ版で送信
+  await settle();
+  a.resolve(ok200({ok: true, group: confirmedA()}));                // A は直接反映（版が進む）
+  await settle();
+  env.$('#cur-state-confirmed').click();                            // 「確認済み」の一覧（保留。サーバーでは B の確定前）
+  await settle();
+  assert.equal(env.listReqs().filter(c => !c.url.includes('ids=')).length, 2);
+  b.resolve(ok200({ok: true, group: sm1Confirmed()}));              // B は古い応答扱い → 版を進めて B の 1 組を読む
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  const n0 = env.listReqs().length;
+  held.resolve(ok200(listBody([confirmedA(), SM2(), SM3()])));      // B を含まない一覧が届く → 古いので捨てて取り直す
+  await settle();
+  assert.equal(env.listReqs().length, n0 + 1, '一覧を取り直す');
+  byId.resolve(ok200(listBody([sm1Confirmed()])));                  // 1 組の応答は一覧の要求に追い越されている → 捨てる
+  await settle();
+  again.resolve(ok200(listBody([confirmedA(), sm1Confirmed(), SM2(), SM3()])));
+  await settle();
+  assert.deepEqual(sections(env).map(x => x.dataset.key), ['exact:11', 'similar:21', 'similar:22', 'similar:23'], 'B が出る');
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.ev('cs.busy.size'), 0);
+  assert.equal(env.ev('cs.reloading.size'), 0);
+});
+
+await test('(n11) ページ移動で一覧から消えた段への遅れた確定の成功では、cs.keep に旧鍵を入れない', async () => {
+  const env = makeEnv();
+  env.handlers.groups = params => reply(params.get('page') === '2'
+    ? listBody([EX1()], {page: 2, pages: 2, total: 5}) : listBody(DEFAULT_GROUPS(), {pages: 2, total: 5}));
+  await env.boot();
+  await openCur(env);
+  const post = deferred();
+  env.handlers.confirm = () => post.promise;
+  sections(env)[1].querySelector('.cur-do-keep').click();           // similar:21 を確定（保留）
+  await settle();
+  env.$('#cur-next').click();                                       // ページ移動 → similar:21 は一覧から消える
+  await settle();
+  assert.deepEqual(sections(env).map(x => x.dataset.key), ['exact:11']);
+  post.resolve(ok200({ok: true, group: sm1Confirmed()}));           // 遅れた成功
+  await settle();
+  assert.deepEqual(env.ev('[...cs.keep]'), [], '旧鍵が残らない');
+  assert.deepEqual(sections(env).map(x => x.dataset.key), ['exact:11']);
+  assert.equal(idsReqs(env).length, 0, '段が無いので読み直さない');
+  assert.ok(toastText(env).includes('確認済みにしました'));
+});
+
+await test('(n12) keep の段が読み直しで既存の段と同じ鍵になり重複でまとめられても、方針は残る段へ移る。再読込しても絞り込み不一致で消えない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  assert.equal(env.ev('cs.state'), 'unconfirmed');
+  const post = deferred();
+  const sm2Same = () => grp('similar', 22, 'cccccccccccccccc', 'confirmed', [
+    mem(621, {rank: 1, recommended: true, effective: true, curation: 'reviewed'}),
+    mem(622, {rank: 2, curation: 'reviewed'})], {taken_at: '2030-05-01 07:00'});
+  env.handlers.confirm = () => post.promise;
+  env.handlers.groups = params => params.get('ids') === '611' ? reply(listBody([sm2Same()]))
+    : params.get('ids') === '621' ? reply(listBody([sm2Same()])) : null;
+  sections(env)[1].querySelector('.cur-do-keep').click();           // similar:21 を確定
+  await settle();
+  post.resolve(ok200({ok: true, group: sm1Confirmed()}));
+  await settle();
+  assert.deepEqual(env.ev('[...cs.keep]'), ['similar:21']);
+  env.context.applyPhoto(612, {favorite: false, hidden: true});     // 読み直し → similar:22 の組が返る（既存の段と重複）
+  await settle();
+  assert.deepEqual(sections(env).map(x => x.dataset.key), ['exact:11', 'similar:22', 'similar:23']);
+  assert.deepEqual(env.ev('[...cs.keep]'), ['similar:22'], '方針が残る段へ移る');
+  env.context.applyPhoto(622, {favorite: false, hidden: true});     // 残った段を再読込（確認済みは未確認の絞り込みに合わない）
+  await settle();
+  assert.equal(idsReqs(env).filter(c => c.url.includes('ids=621')).length, 1);
+  assert.ok(sectionOf(env, 'similar', 22), '消えない');
+});
+
+await test('(o) 一覧の読み込み失敗はトーストで知らせ、一覧は前のまま', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  env.handlers.groups = () => respond(500, {ok: false, error: 'boom'});
+  env.$('#cur-kind-exact').click();
+  await settle();
+  assert.equal(toastText(env), '選別の組を読めませんでした: boom');
+  assert.equal(sections(env).length, 4);
+  // 1 組の読み直しの失敗
+  env.handlers.confirm = () => respond(409, {ok: false, error: 'group_changed'});
+  env.handlers.groups = () => respond(500, {ok: false, error: 'down'});
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  await settle();
+  assert.equal(toastText(env), '組を読み直せませんでした: down');
+  assert.equal(sections(env).length, 4);
+});
+
+await test('(p) タブを離れるとビューアが閉じ、戻ると開き直して読み直す（絞り込みは前のまま）。状況・写真・ライブラリのタブも切り替わる', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  env.$('#cur-state-all').click();
+  await settle();
+  cardOf(sections(env)[0], 601).querySelector('.cur-thumb').click();
+  assert.equal(hidden(env, '#viewer'), false);
+  env.$('.tab[data-tab=status]').click();
+  await settle();
+  assert.equal(hidden(env, '#viewer'), true);
+  assert.ok(!env.document.body.classList.contains('ps-viewer-open'));
+  assert.equal(env.ev('viewerIndex'), -1);
+  assert.equal(hidden(env, '#v-curation'), true);
+  const n0 = env.listReqs().length;
+  await openCur(env);
+  assert.equal(env.listReqs().length, n0 + 1);
+  assert.equal(env.lastList().get('state'), 'all');
+  assert.ok(env.$('#cur-state-all').classList.contains('on'));
+  // 他のタブへ移るときも
+  cardOf(sections(env)[0], 601).querySelector('.cur-thumb').click();
+  env.$('.tab[data-tab=config]').click();
+  await settle();
+  assert.equal(hidden(env, '#viewer'), true);
+  assert.deepEqual(activeTabs(env), ['config']);
+  env.$('.tab[data-tab=library]').click();
+  await settle();
+  assert.equal(hidden(env, '#v-curation'), true);
+  assert.equal(hidden(env, '#v-library'), false);
+});
+
+await test('(q) .hidden で出し入れする要素の display は、ID・クラスの規則が .hidden に勝たないよう、対の .hidden 規則を持つ', () => {
+  const css = fs.readFileSync(new URL('../static/admin.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map(m => [m[1].trim(), m[2]]);
+  assert.ok(rules.some(([sel, body]) => sel === '.hidden' && /display:\s*none/.test(body)));
+  const html = fs.readFileSync(new URL('../static/admin.html', import.meta.url), 'utf8');
+  // curation.js が .hidden を付け外しする要素（id）と、その class
+  const toggled = ['cur-empty', 'v-curation', 'viewer-noimage'];
+  const selectorsOf = id => {
+    const tag = html.match(new RegExp('<[^>]*id="' + id + '"[^>]*>'));
+    assert.ok(tag, id);
+    const cls = (tag[0].match(/class="([^"]*)"/) || [, ''])[1].split(/\s+/).filter(c => c && c !== 'hidden');
+    return ['#' + id, ...cls.map(c => '.' + c)];
+  };
+  const has = (sel, re) => rules.some(([rsel, b]) => rsel.split(',').map(x => x.trim()).includes(sel) && re.test(b));
+  for(const id of toggled){
+    for(const sel of selectorsOf(id)){
+      if(has(sel, /(^|;)\s*display:/)){
+        assert.ok(has(sel + '.hidden', /display:\s*none/), sel + ' に display があるのに ' + sel + '.hidden{display:none} が無い');
+      }
+    }
+  }
+  // 逆向き: #cur-* / .cur-* の display を持つ規則のうち、.hidden を付ける要素のものは対を持つ
+  const curDisplay = rules.filter(([sel, b]) => /^[#.]cur-[\w-]+$/.test(sel) && /(^|;)\s*display:/.test(b)).map(([sel]) => sel);
+  for(const sel of curDisplay){
+    if(toggled.some(id => selectorsOf(id).includes(sel))) assert.ok(has(sel + '.hidden', /display:\s*none/), sel);
+  }
+  // 段・一覧・メンバーは .hidden を付けない（display を持ってよい）。付ける要素だけが対象であることの確認
+  assert.ok(curDisplay.includes('#cur-groups'));
+  assert.ok(!toggled.includes('cur-groups'));
+});
+
+await test('(r) 状況タブの「未確認の選別」を押すと選別タブへ移る（curation_pending があるときだけ出る）', async () => {
+  const env = makeEnv();
+  const orig = env.context.fetch;
+  env.context.fetch = (url, opts) => {
+    if(url !== '/api/admin/status') return orig(url, opts);
+    const b = statusBody();
+    b.db.quality = {features: 1, pending: 0, analyzed: 4, recommended: 2, exact_suppressed: 1, similar_alternates: 1,
+                    curation_pending: 7};
+    return reply(b);
+  };
+  await env.boot();
+  const todo = env.$('#s-todo').children.find(c => c.textContent.includes('未確認の選別'));
+  assert.ok(todo, '要対応に出る');
+  assert.equal(todo.textContent, '未確認の選別7組');
+  assert.ok(todo.classList.contains('warn') && todo.classList.contains('todo'));
+  const dbCell = env.$('#s-db').children.find(c => c.textContent.includes('未確認の選別'));
+  assert.ok(dbCell && dbCell.classList.contains('warn'));
+  todo.click();
+  await settle();
+  assert.deepEqual(activeTabs(env), ['curation']);
+  assert.equal(hidden(env, '#v-curation'), false);
+  assert.equal(env.lastList().get('state'), 'unconfirmed');
+  assert.equal(sections(env).length, 4);
+});
+
+console.log(`ok (${n})`);

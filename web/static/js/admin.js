@@ -2,7 +2,7 @@
    admin.js — 管理ページ /admin のフロント（classic script / 依存なし）
    構成: 1) 共通ヘルパ 2) タブ 3) 状況 4) 起動
    写真タブ（一覧・チップ・検索・カード・ビューア・位置指定）は photos.js、ライブラリタブ（旅・格子・地図）は library.js、
-   設定タブ（読み取り専用）は config.js（この順に後から読み込む）。
+   選別タブ（重複・類似グループの代表の確認）は curation.js、設定タブ（読み取り専用）は config.js（この順に後から読み込む）。
    共有はグローバル関数: photos.js・config.js は ここの $ el cell fmtDur toast postJSON showTab を使い、
    admin.js は photos.js の initPhotos openPhotosTab gotoFilter と、config.js の initConfig loadConfig を（呼ぶ時点で解決して）使う。
    読み込んだだけでは location・fetch に触らない。起動は DOMContentLoaded の boot() だけ
@@ -62,12 +62,13 @@ function initialTab(){
   return path === '/ai-search' ? 'photos' : 'status';
 }
 function showTab(name){
-  const tab = (name === 'photos' || name === 'library' || name === 'config') ? name : 'status';
+  const tab = (name === 'photos' || name === 'library' || name === 'curation' || name === 'config') ? name : 'status';
   document.querySelectorAll('nav .tab').forEach(b =>
     b.classList.toggle('on', b.dataset.tab === tab));
   $('#v-status').classList.toggle('hidden', tab !== 'status');
   $('#v-photos').classList.toggle('hidden', tab !== 'photos');
   $('#v-library').classList.toggle('hidden', tab !== 'library');
+  $('#v-curation').classList.toggle('hidden', tab !== 'curation');
   $('#v-config').classList.toggle('hidden', tab !== 'config');
   /* どのタブへ移るときも、開いているビューアと位置モーダルを閉じる（photos.js）。ライブラリなど写真タブ以外から
      開いたビューアも同じ #viewer なので、離れるときに閉じる。写真タブに入るときも一度閉じてから一覧を読む */
@@ -75,6 +76,10 @@ function showTab(name){
   if(tab === 'status'){ loadStatus(); return; }
   if(tab === 'library'){         // library.js: 旅の一覧（初回と開くたび）。地図ビューなら地図の大きさを合わせ直す
     if(typeof openLibraryTab === 'function') openLibraryTab();
+    return;
+  }
+  if(tab === 'curation'){        // curation.js: 開くたびに組を読み直す（絞り込みとページは前のまま）
+    if(typeof openCurationTab === 'function') openCurationTab();
     return;
   }
   if(tab === 'config'){          // config.js: 開くたびに 1 回読む（周期的には読まない）
@@ -240,13 +245,29 @@ function todoCells(filters){
     return c;
   });
 }
+/* 要対応: 未確認・再確認の選別グループの数（db.quality.curation_pending。Rust 版の管理 API だけが返す。無ければ出さない）。
+   押すと選別タブへ移る */
+function curationTodoCells(quality){
+  if(!quality || quality.curation_pending === undefined || quality.curation_pending === null) return [];
+  const n = Number(quality.curation_pending) || 0;
+  const c = cell('未確認の選別', n.toLocaleString('ja-JP'), '組', n ? 'warn' : 'good');
+  const go = () => showTab('curation');
+  c.classList.add('todo');
+  c.setAttribute('role', 'button');
+  c.setAttribute('tabindex', '0');
+  c.addEventListener('click', go);
+  c.addEventListener('keydown', e => {
+    if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); go(); }
+  });
+  return [c];
+}
 function loadStatus(){
   fetch('/api/admin/status').then(r => r.json()).then(d => {
     if(!d.ok) throw new Error(d.error || 'status error');
     $('#servertime').textContent = 'SERVER ' + d.server_time;
 
     const td = $('#s-todo'); td.textContent = '';
-    todoCells(d.db.filters).forEach(c => td.appendChild(c));
+    todoCells(d.db.filters).concat(curationTodoCells(d.db.quality)).forEach(c => td.appendChild(c));
 
     const sy = $('#s-sync'); sy.textContent = '';
     sy.appendChild(cell('表示可能', d.sync.ready, '枚', 'good'));
@@ -269,6 +290,10 @@ function loadStatus(){
       db.appendChild(cell('品質推奨', d.db.quality.recommended, '枚'));
       db.appendChild(cell('完全重複の表示抑止', d.db.quality.exact_suppressed, '枚'));
       db.appendChild(cell('類似alternate', d.db.quality.similar_alternates, '枚'));
+      if(d.db.quality.curation_pending !== undefined && d.db.quality.curation_pending !== null){
+        const pending = Number(d.db.quality.curation_pending) || 0;
+        db.appendChild(cell('未確認の選別', pending, '組', pending ? 'warn' : 'good'));
+      }
     }
     if(d.db.ai){
       db.appendChild(cell('AI embedding', d.db.ai.embedded + ' / ' + d.db.ai.eligible, '枚',
@@ -325,6 +350,7 @@ function boot(){
     b.addEventListener('click', () => showTab(b.dataset.tab)));
   initPhotos();
   if(typeof initLibrary === 'function') initLibrary();   // library.js: ボタンとビューアの購読を結ぶ（読み込みはしない）
+  if(typeof initCuration === 'function') initCuration(); // curation.js: 同上（選別タブの絞り込み・ページング）
   if(typeof initConfig === 'function') initConfig();     // config.js: 案内文と凡例（読み込みはしない）
   const tab = initialTab();
   showTab(tab);

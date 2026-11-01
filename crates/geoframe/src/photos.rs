@@ -38,13 +38,22 @@ use rusqlite::{Connection, Row};
 use crate::feed::{Photo, QualityKind};
 
 /// 品質結果は「同じ原本・同じ表示画像」にだけ適用する（`photos.py:QUALITY_JOIN`）。
-const QUALITY_JOIN: &str = "LEFT JOIN photo_quality q
+pub(crate) const QUALITY_JOIN: &str = "LEFT JOIN photo_quality q
   ON q.photo_id=p.id AND q.display=p.display
  AND q.source_md5 IS p.md5 AND q.source_mtime IS p.mtime";
-const QUALITY_COLUMNS: &str = "q.score AS quality_score, q.group_id AS quality_group,
+/// 品質の列。`recommended` は解析の値（`q.recommended`）か、人の代表を反映した有効な推奨の式。
+fn quality_columns(recommended: &str) -> String {
+    format!(
+        "q.score AS quality_score, q.group_id AS quality_group,
   q.group_kind AS quality_kind, q.rank_in_group AS quality_rank,
-  q.recommended AS quality_recommended";
+  {recommended} AS quality_recommended"
+    )
+}
 const QUALITY_VISIBLE: &str = "(q.group_kind IS NULL OR q.group_kind!='exact' OR q.recommended=1)";
+/// フィードに出す写真の、品質以外の述語。`curation/confirm` の代表の検査（`representative_not_visible`）も
+/// これを共有する。別名は `p`。
+pub(crate) const FEED_BASE_WHERE: &str = "p.lat IS NOT NULL AND p.display IS NOT NULL
+           AND COALESCE(p.hidden,0)=0";
 const AI_JOIN: &str = "LEFT JOIN photo_ai_group_members aim ON aim.photo_id=p.id
 LEFT JOIN photo_ai_groups aig ON aig.group_id=aim.group_id";
 const AI_COLUMNS: &str = "aig.group_id AS ai_group, aig.status AS ai_status,
@@ -55,20 +64,8 @@ pub(crate) const TRIP_GAP_SECONDS: i64 = 48 * 3600;
 
 /// 一覧に出す写真を、出す順に返す（旅番号つき）。`Catalog::read` の中で呼ぶ。
 pub fn list_photos(conn: &Connection) -> rusqlite::Result<Vec<Photo>> {
-    // Python の `p.*` の代わりに使う列だけを並べる（行と並びは同じ）。ORDER BY の
-    // `COALESCE(p.taken_at,'')` は NULL を空文字として最後に回すための唯一の違い。
-    // 旧選別の抑止条件。メンバーの世代と表示可能な推薦写真の存在を検査する（[`crate::selection`]）
-    let ai_visible = crate::selection::ai_visible();
-    let sql = format!(
-        "SELECT p.id, p.fetched_at, p.favorite, p.display, p.name, p.title, p.lat, p.lon,
-                p.taken_at, p.place, p.pref, p.city, p.elev, p.loc_source,
-                {QUALITY_COLUMNS}, {AI_COLUMNS} FROM photos p
-         {QUALITY_JOIN}
-         {AI_JOIN}
-         WHERE p.lat IS NOT NULL AND p.display IS NOT NULL
-           AND COALESCE(p.hidden,0)=0 AND {QUALITY_VISIBLE} AND {ai_visible}
-         ORDER BY CASE WHEN COALESCE(p.taken_at,'')='' THEN 1 ELSE 0 END, COALESCE(p.taken_at,'')"
-    );
+    // 人の代表の表（`photo_curation`）があるときだけ、有効な推奨の SQL に切り替える（無ければ従来の SQL のまま）
+    let sql = feed_sql(crate::curation::available(conn)?);
     let mut stmt = conn.prepare(&sql)?;
     let mut rows = stmt.query([])?;
     let mut photos = Vec::new();
@@ -79,6 +76,40 @@ pub fn list_photos(conn: &Connection) -> rusqlite::Result<Vec<Photo>> {
     }
     assign_trips(&mut photos);
     Ok(photos)
+}
+
+/// フィードの SELECT。`curation` が偽なら人の記録を一切見ない従来の SQL（試験で文字列を固定している）。
+///
+/// Python の `p.*` の代わりに使う列だけを並べる（行と並びは同じ）。ORDER BY の
+/// `COALESCE(p.taken_at,'')` は NULL を空文字として最後に回すための唯一の違い。
+pub fn feed_sql(curation: bool) -> String {
+    // 旧選別の抑止条件。メンバーの世代と表示可能な推薦写真の存在を検査する（[`crate::selection`]）
+    let ai_visible = crate::selection::ai_visible(curation);
+    let (quality_join, quality_columns, quality_visible) = if curation {
+        (
+            format!(
+                "{QUALITY_JOIN}\n         {}",
+                crate::curation::join("q", "c")
+            ),
+            quality_columns(&crate::curation::effective_recommended("q", "c")),
+            crate::curation::quality_visible("q", "c"),
+        )
+    } else {
+        (
+            QUALITY_JOIN.to_string(),
+            quality_columns("q.recommended"),
+            QUALITY_VISIBLE.to_string(),
+        )
+    };
+    format!(
+        "SELECT p.id, p.fetched_at, p.favorite, p.display, p.name, p.title, p.lat, p.lon,
+                p.taken_at, p.place, p.pref, p.city, p.elev, p.loc_source,
+                {quality_columns}, {AI_COLUMNS} FROM photos p
+         {quality_join}
+         {AI_JOIN}
+         WHERE {FEED_BASE_WHERE} AND {quality_visible} AND {ai_visible}
+         ORDER BY CASE WHEN COALESCE(p.taken_at,'')='' THEN 1 ELSE 0 END, COALESCE(p.taken_at,'')"
+    )
 }
 
 /// 行を [`Photo`] にする。`trip` は後で [`assign_trips`] が付けるので 0。`lon` が NULL の行は
@@ -354,6 +385,37 @@ pub fn assign_trips(photos: &mut [Photo]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 人の代表の表が無いとき、フィードの SQL は従来の文字列と同じ（AC6）。従来の定義はこの変更前の
+    /// `list_photos` の `format!` をそのまま写したもの（旧 AI 選別の SQL は `selection` の試験が固定している）。
+    #[test]
+    fn without_the_curation_table_the_feed_sql_is_the_legacy_string() {
+        let ai_visible = crate::selection::ai_visible(false);
+        let legacy = format!(
+            "SELECT p.id, p.fetched_at, p.favorite, p.display, p.name, p.title, p.lat, p.lon,
+                p.taken_at, p.place, p.pref, p.city, p.elev, p.loc_source,
+                {legacy_columns}, {AI_COLUMNS} FROM photos p
+         {QUALITY_JOIN}
+         {AI_JOIN}
+         WHERE p.lat IS NOT NULL AND p.display IS NOT NULL
+           AND COALESCE(p.hidden,0)=0 AND {QUALITY_VISIBLE} AND {ai_visible}
+         ORDER BY CASE WHEN COALESCE(p.taken_at,'')='' THEN 1 ELSE 0 END, COALESCE(p.taken_at,'')",
+            legacy_columns = "q.score AS quality_score, q.group_id AS quality_group,
+  q.group_kind AS quality_kind, q.rank_in_group AS quality_rank,
+  q.recommended AS quality_recommended"
+        );
+        assert_eq!(feed_sql(false), legacy);
+        assert!(!feed_sql(false).contains("photo_curation"));
+    }
+
+    #[test]
+    fn with_the_curation_table_the_feed_uses_the_effective_recommendation() {
+        let sql = feed_sql(true);
+        assert!(sql.contains("LEFT JOIN photo_curation c ON"));
+        assert!(!sql.contains("q.recommended AS quality_recommended"));
+        assert!(sql.contains("END AS quality_recommended"));
+        assert!(!sql.contains(QUALITY_VISIBLE));
+    }
 
     fn photo(time: &str) -> Photo {
         Photo {

@@ -256,6 +256,80 @@ fn the_admin_counts_match_what_the_feed_hides() {
     assert_eq!((counts.groups, counts.group_pending), (3, 1));
 }
 
+fn similar_quality(id: i64, group: i64, rank: i64, recommended: i64) -> String {
+    format!(
+        "INSERT INTO photo_quality(photo_id,display,source_md5,source_mtime,content_sha256,group_id,
+           group_kind,rank_in_group,recommended,score,algorithm,analyzed_at)
+         VALUES({id},'derivatives/p{id}.jpg','m{id}',{id}.0,'sha-{id}',{group},'similar',{rank},{recommended},
+           0.5,'t','2025-06-10T00:00:00');\n"
+    )
+}
+
+/// 人が代表に選んだ記録（今の世代の `photo_quality` の行から）。
+fn human_representative(id: i64) -> String {
+    format!(
+        "INSERT OR REPLACE INTO photo_curation(photo_id,display,source_md5,source_mtime,content_sha256,role,decided_at)
+           SELECT photo_id,display,source_md5,source_mtime,content_sha256,'representative','2025-07-20 00:00:00'
+             FROM photo_quality WHERE photo_id={id};\n"
+    )
+}
+
+#[test]
+fn a_human_representative_that_the_legacy_selection_did_not_recommend_is_not_suppressed() {
+    // 品質の similar グループ {1, 2} と、旧 AI の同一場面グループ {1, 2, 3}（推薦は 1）が重なる。
+    // 人が旧 AI の非推薦の 2 を代表にしても、2 は旧 AI の抑止を免れてフィードに出る（favorite と同じ）。
+    let mut sql = scene();
+    sql += &similar_quality(1, 1, 1, 1);
+    sql += &similar_quality(2, 1, 2, 0);
+    let mut e = env(&sql);
+    geoframe::curation::ensure_tables(&mut e.conn).unwrap();
+    // 記録が無ければ従来どおり（2・3 は旧 AI が抑止する）
+    assert_eq!(e.feed(), [1]);
+    assert_eq!(e.feed_suppressed(), 2);
+
+    e.sql(&human_representative(2));
+    assert_eq!(e.feed(), [1, 2]);
+    // フィードが実際に隠すのは 3 だけ。管理画面の `suppressed` は favorite の免除と同じく免除を数えない
+    assert_eq!(e.feed_suppressed(), 1);
+    assert_eq!(e.suppressed(), 2);
+    // グループの数は変わらない
+    let counts = admin_counts(&e.conn).unwrap();
+    assert_eq!((counts.groups, counts.group_pending), (1, 0));
+
+    // 表を落とせば（人の記録を読まない DB）従来の結果に戻る
+    e.sql("DROP TABLE photo_curation");
+    assert_eq!(e.feed(), [1]);
+    assert_eq!(e.feed_suppressed(), 2);
+}
+
+#[test]
+fn the_legacy_representative_is_shown_only_when_the_effective_recommendation_allows_it() {
+    // 品質の exact グループ {1, 2}（解析の推奨は 1）。旧 AI の同一場面グループ {1, 2, 3} の推薦は 2。
+    let mut sql = String::new();
+    for id in 1..=3 {
+        sql += &photo(id, "");
+    }
+    sql += &group("g", "judged", 1);
+    sql += &member("g", 1, 0);
+    sql += &member("g", 2, 1);
+    sql += &member("g", 3, 0);
+    sql += &legacy_generation_sql(&[1, 2, 3]);
+    sql += &exact_quality(1, 1, 1);
+    sql += &exact_quality(2, 2, 0);
+    let mut e = env(&sql);
+    geoframe::curation::ensure_tables(&mut e.conn).unwrap();
+    // 旧 AI の推薦 2 は exact の推奨外で出せない（shown=0）ので、旧 AI は何も抑止しない。出るのは 1 と 3
+    assert_eq!(e.feed(), [1, 3]);
+    assert_eq!(e.feed_suppressed(), 0);
+
+    // 人が 2 を代表にすると、2 が出せるようになり（shown=1）、旧 AI は非推薦の 3 を抑止する。1 は exact で落ちる
+    e.sql(&human_representative(2));
+    assert_eq!(e.feed(), [2]);
+    assert_eq!(e.feed_suppressed(), 1);
+    // 人の代表の写真自身は抑止されない（旧 AI の推薦でもある）
+    assert_eq!(e.suppressed(), 2);
+}
+
 #[test]
 fn switching_the_search_space_never_changes_the_legacy_suppression() {
     let mut e = env(&scene());

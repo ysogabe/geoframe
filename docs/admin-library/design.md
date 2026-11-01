@@ -158,9 +158,10 @@ flowchart LR
 | `crates/geoframe/src/thumb.rs`（新） | `/thumb/<id>.jpg` の経路。ID と版の検証、世代の計算、キャッシュの有無、ID ごとのロックと生成の枠、`spawn_blocking` での生成、失敗の記憶、ETag と 304 |
 | `imaging/derivative.rs` | `pub fn make_thumbnail(src: &Path, long_edge: u32, limits: &DecodeLimits) -> Result<Vec<u8>, ImageError>` を足す（`render` は `MAX_INPUT_BYTES` を決め打ちしている（`derivative.rs:602`）ので、上限を引数で受ける形に分ける。全体を復号する前にファイルの大きさとヘッダの寸法で断る。`resize` を再利用。JPEG 品質 80、EXIF は持ち込まない。書き込みは呼び手が `write_atomic`） |
 | `admin_library.rs`（新） | `GET /api/admin/library/trips`・`/photos`・`/points`（あると良い: `/calendar`・`/places`）。`AdminContext` を再利用 |
-| `curation.rs`（新） | `photo_curation` の DDL（`TABLES` 定数）、`ensure_tables(conn)`（書き込み側の起動時）、`available(conn)`（`sqlite_master` を見る）、SQL 片 `CURATION_JOIN`・`EFFECTIVE_RECOMMENDED`・`QUALITY_VISIBLE_EFFECTIVE`、グループの状態の計算 |
+| `curation.rs`（新） | `photo_curation` の DDL（`TABLES`・`SCHEMA`）、`ensure_tables(conn)`（書き込み側の起動時。`ingest::start_impl` が AI の表の次に呼び、`plan`（`--dry-run`）も `pending` で数える）、`available(conn)`（`sqlite_master` を見る）、SQL 片（別名を受ける関数 `join`・`group_has_pick`・`effective_recommended`・`quality_visible`・`has_valid_representative`。設計書の `CURATION_JOIN`・`GROUP_HAS_PICK`・`EFFECTIVE_RECOMMENDED`・`QUALITY_VISIBLE_EFFECTIVE` に当たる）、`pending_groups(conn)`、グループの状態 `group_state`・`State`・`Record`、`Member`・`group_token`・`mtime_text` |
 | `admin_curation.rs`（新） | `GET /api/admin/curation/groups`、`POST /api/admin/curation/confirm`・`/reset` の処理 |
-| `photos.rs` | `list_photos` が `curation::available` で SQL 片を選ぶ。`quality_recommended`・`quality_role`・`QUALITY_VISIBLE` を有効な推奨に置き換える |
+| `photos.rs` | `list_photos` が `curation::available` で `feed_sql(curation)` を選ぶ（偽なら従来と同じ文字列。単体試験で固定）。`quality_recommended`・`quality_role`・`QUALITY_VISIBLE` を有効な推奨に置き換える。`QUALITY_JOIN`・`FEED_BASE_WHERE`（品質以外の述語）は `pub(crate)` で、`confirm` の `representative_not_visible` が共有する |
+| `selection.rs` | `VALID_MEMBERS` 定数を関数 `valid_members(curation)` にし、`ai_visible(curation)` が引数を受ける（`admin_counts` と `ai/groups/repository.rs` の `legacy_in` は `curation::available` を自分で引く） |
 | `post.rs` | `Route::CurationConfirm`・`Route::CurationReset` |
 | `server.rs` | `/thumb/` の分岐（`/derivatives/` の隣）、`/api/admin/library/`・`/api/admin/curation/` の完全一致の分岐 |
 | `admin.rs` | `status` の `db.quality` に `curation_pending`（あると良い R18） |
@@ -272,6 +273,55 @@ cs = {
   `state=unconfirmed` だと確認済みになった組を見失う）。届いた組が今の絞り込み（`cs.state`・`cs.kind`）に合えば描き直し、
   合わなければ段を外す。応答が空（組が消えた）でも段を外す。
 - 状況タブの「要対応」に `未確認の選別 N 組` を足す（R18。`db.quality.curation_pending`）。
+
+### 実装との差（画面。T8）
+
+設計どおりに作った（`curation.js`・`admin.html`・`admin.css`・`admin.js`）。画面側で設計とずらした点・決めたことだけを書く。
+
+- **DOM**: メンバーは `label.cur-member > input.cur-pick + button.cur-thumb > img|.img-broken + 順位・点数 + 名前 + 地名 +
+  div.tags.cur-tags + details.cur-why`。画像は `img` を直接ではなく `button.cur-thumb` に入れた。label の中の画像を押すと
+  ブラウザがチェックボックスを切り替えるので、button にして `preventDefault()` し、キーボードでも押せるようにした。
+  絞り込みは `.cur-seg`（`#cur-state-{unconfirmed,confirmed,all}`・`#cur-kind-{all,exact,similar}`）。`.chip` は写真タブが
+  `document` 全体から拾うので使わない。`#cur-groups` に `.hidden` は付けない（`display:flex`）。出し入れするのは `#cur-empty` と
+  タブの `#v-curation` だけ。
+- **タグ**: 解析の推奨（`recommended`）・人の代表（`curation === 'representative'`）・再確認（`curation === 'stale'`）・★・除外。
+  `effective`（いま有効な推奨）は別のタグにせず、枠の色（`.is-effective`）で示す。`selectable` でないメンバーは
+  チェックボックスが無効で `.is-unselectable`。どれもサーバーの値のままで、画面では再計算しない。
+- **「このままで確認済み」**: 確認済みの段では無効（すでに確認済みで何も変わらない）。未確認・再確認の段で、
+  `curation === 'representative'` のメンバーがあればその ID、無ければ `representatives: null`（`stale` は含めない）。
+  **「取り消す」**は `curation` が null でないメンバー（`reviewed`・`stale` を含む）がいる段だけに出す。
+- **確定・取り消しの応答**: 応答の `group` が今の絞り込みに合わなくても、その段はそのまま描き直す（「未確認」の絞り込みで
+  確定した段が目の前で消えない。次に一覧を読み直すと外れる）。選択（`picks`）はその段だけ消す。送信中の段はボタンを無効にし、
+  `cs.busy` で多重送信を防ぐ。
+- **応答の順序（版）**: 一覧の要求・1 組の読み直し・確定の応答は、別の応答に追い越されうる。規則は 1 つ:
+  `cs.ver`（表示の版）は**画面の段を変えるたび**（一覧の反映・段の置き換え・段の削除・確定の直接反映）と
+  **書き込み（確定・取り消しの POST）の成功のたび**（直接反映しない古い応答でも。古さの判定は進める前の版で行う）に進め、
+  要求を出しただけでは進めない。**すべての要求**（一覧の GET・1 組の GET・確定・取り消しの POST）は発行時の `ver` を控え、応答のときに `ver` が違えば
+  古いものとして扱う。一覧の GET は捨てて一覧を取り直す。1 組の GET は捨てて、その段が今の一覧に残っていれば同じ条件で読み直す。
+  POST は段を置き換えず、成功のトーストだけ出して、段が残っていれば読み直す（成功で版を進めるので、成功より前に出した飛んでいる
+  一覧・1 組の GET は、サーバーの確定前の値かもしれないとして捨てられ、取り直される）。発行後に画面が変わっていなければ（`ver` 一致）
+  そのまま反映する。取り直しは「変化のあと」に出すので、変化が止まれば収束する。これとは別に、`cs.seq`（一覧の要求番号）で
+  新しい一覧の要求に追い越された応答を、`cs.gseq`（段ごとの要求番号）で同じ段の新しい読み直し・確定に追い越された応答を捨てる。
+  確定の応答は `gseq` を進め、その段の飛んでいる読み直し（`cs.reloading`）も無効にする。
+  **段を残す方針は段ごとに持つ**: `cs.keep`（組の鍵の集合）に、確定・取り消しの成功で、その段が今の一覧にあるときだけ（直接の反映でも古い応答でも。
+  ページ移動などで一覧から消えた段は入れない）入れ、一覧の反映・段を外したときに消す。読み直しで鍵が変わったとき、既存の段と
+  重複してまとめられるときは、残る段へ引き継ぐ。1 組の読み直しは、`keep` の段なら絞り込みに合わなくても描き直して残す（読み直しが★・除外の
+  変更から出ても同じ）。別々の段を並行して確定しても、後着の段は消えない。
+- **1 組の読み直し**（409・除外や位置の変更・`representative_not_visible`）: `state=all&kind=all&ids=<先頭の写真>` で引き、
+  **同じ `kind` の組**を採る（再構築で `group_id` が変わっても拾える）。無い・空・今の絞り込みに合わないとき（`keep` の段を除く）は段を外す。
+  外してそのページが空になり件数が残るときは、一覧を読み直す（サーバーがページを丸める）。一覧が読み直された後に届いた
+  1 組の応答、同じ段への新しい読み直し・確定より古い応答、発行後に画面が変わった（`ver` が違う）応答は捨てる。一覧を読み直すと選択は全部消える（`token` が変わりうる）。
+- **`representative_not_visible`（400）**: トースト「代表に選べない写真があります」に加えて、その段を読み直す。除外・位置が
+  別の画面で変わって `selectable` が古くなっているのが原因なので、読み直して合わせる（選択のうち選べなくなった写真だけが外れる）。
+- **除外・位置の変更の反映**: `onPhotoChange` の patch でメンバーのタグを描き直す。読み込んだ時点の除外・位置（`baseline`）から
+  変わったときだけ、その段を読み直す（`setflag` の応答は `favorite` と `hidden` を両方返すので、★だけでは読み直さない）。
+  読み直しの間は選択のうち選べる写真を残す。
+- **状況タブ（R18）**: `db.quality.curation_pending` があれば「品質」の欄に `未確認の選別 N 組`、「要対応」にも同じ名前の
+  押せるセルを出し、押すと `showTab('curation')`。値が 0 なら `good`、1 以上なら `warn`。キーが無い応答（Python 版・
+  `quality` なし）では出さない。`todoCells(filters)` は変えず、`curationTodoCells(quality)` を足した。
+- **由来のバッジ**: `groups`・`confirm`・`reset` の応答のメンバーに `loc_source`（`photos.loc_source`。NULL は `""`）を持たせた。
+  選別タブから開いたビューアの由来のバッジ（EXIF・DRIVE・推定・手動）は、位置がある写真でそのとおりに出る
+  （`normalizePhoto` が `loc_source` の無いメンバーを `none` にするため、以前は「位置なし」と出ていた）。
 
 ## インターフェース
 
@@ -493,9 +543,13 @@ CASE WHEN q.group_id IS NULL THEN 0
   | 古い世代の `representative` 行だけ残り、再構築で同じ組に戻った | 解析の推奨 | `recheck` |
   | `reviewed` だけ（`representatives: null` で確認） | 解析の推奨 | `confirmed` |
 
-- 性能: 実装時に合成 6,500 行で `EXPLAIN QUERY PLAN` と時間を測る（`idx_photo_quality_group` が `(group_kind, group_id)` に
-  ある）。読み取り接続は `PRAGMA query_only`（`db.rs:228`）なので一時表は使えない。遅ければ `GROUP_HAS_PICK` を
-  `list_photos` の前に 1 回だけ引いた `(group_kind, group_id)` の集合に置き換える（Rust 側で判定）。
+- 性能（測定済み）: 合成 6,500 行（うちグループ入り 1,000 行、代表の記録 100 件。`tests/curation_feed.rs` の
+  `measure_the_feed_with_6500_rows`、`--ignored --nocapture`）で、`list_photos` は表が無い従来の SQL で約 52 ms、
+  表がある SQL で約 54 ms（debug ビルド、20 回の平均。差は 5% 前後）。`EXPLAIN QUERY PLAN` は `photos` を 1 回走査し、
+  `q`・`c`・`q2`（`idx_photo_quality_group`）・`p2`・`c2` はすべて主キーか `idx_photo_quality_group` の検索で、全表走査の
+  副問い合わせは無い。グループ外の写真（6,500 行の大半）は `CASE WHEN q.group_id IS NULL` で `EXISTS` に入らない。
+  よって代替（`GROUP_HAS_PICK` の集合を先に 1 回引いて Rust 側で判定）は採らず、`EXISTS` のままにした。
+  読み取り接続は `PRAGMA query_only`（`db.rs:228`）なので一時表は使えない（代替を採るなら Rust 側の集合になる）。
 - 表が無いとき（`available(conn)=false`）は従来の SQL 片をそのまま使う。`Catalog::read` の接続ごとに `available` を
   1 回引く（`sqlite_master` の 1 行）。書き込み側は起動時に `ensure_tables`（`ai.rs` の AI 表と同じ場所）。
 - 旧 AI 選別（`selection.rs`）: `VALID_MEMBERS` の `shown`（`selection.rs:27-40`）が `mq.recommended=1` を見ているので、
@@ -517,7 +571,7 @@ CASE WHEN q.group_id IS NULL THEN 0
    "count": 3, "warning": null,
    "members": [{"id": 101, "name": "IMG_0001.jpg", "thumb": "/derivatives/…", "thumb_url": "/thumb/101.jpg?v=…",
                 "taken_at": "2024-05-03 09:12", "place": "…", "pref": "架空県", "city": "架空市", "lat": 10.0, "lon": 20.0,
-                "favorite": false, "hidden": false, "rotation": 0, "source": "drive",
+                "favorite": false, "hidden": false, "rotation": 0, "source": "drive", "loc_source": "exif",
                 "rank": 1, "score": 78.5, "reasons": ["…"], "issues": [],
                 "recommended": true, "effective": true, "curation": "representative" | "reviewed" | "stale" | null}]}]}
 ```
@@ -569,11 +623,40 @@ CASE WHEN q.group_id IS NULL THEN 0
 - 本文: `{"kind", "group_id", "token"}`（同じ検査。`token` が合わなければ 409）。メンバーの `photo_curation` 行を `DELETE`
   するだけ（stale の行も消す）。応答は `confirm` と同じ。
 
+### 実装との対応（`admin_curation.rs`。T7）
+
+設計どおりに作った。実装で決めたこと・設計から細かくずれたことだけを書く。
+
+- **共有の定義**: `groups` の一覧・件数、`confirm`/`reset` のメンバーの読み出し、状況タブの `curation::pending_groups` は
+  `curation::members_from(curation)`（世代の合う `photo_quality` と `photos`、表があれば有効な記録 `c`）、
+  `curation::member_record(curation)`（`representative`/`reviewed`/`stale`/`none` の式）、
+  `curation::not_confirmed`/`all_confirmed`（`HAVING` の条件）から作る。`curation_pending` と
+  `groups?state=unconfirmed` の `total` が一致するのは、同じ `FROM`・`GROUP BY`・`HAVING` から数えるため（AC9）。
+  表が無いとき（`curation=false`）はこれらの片が `photo_curation` を一切書かない。
+- **`ids=` は写真 ID**（その写真が属する、世代の合うグループを返す）。グループ ID ではない。
+- **有効な推奨 `effective` は Rust で求める**（メンバーに有効な `representative` があればその写真だけ、無ければ
+  `recommended`）。SQL の `effective_recommended` と同じ定義で、1 組ぶんのメンバーを読んだ後に付けるので副問い合わせは要らない。
+  `warning` と `selectable` もこの 1 回の読み出しから出す。
+- **グループの `taken_at`** は空でない `taken_at` の最小（無ければ `""`）。並びも同じ値
+  （`COALESCE(MIN(NULLIF(p.taken_at,'')),'') DESC, group_kind, group_id`）。
+- **`confirm` の `representatives: null`** は、人の代表がある組でも**人の代表を外して**全員を `reviewed` にする
+  （解析の推奨に戻って確認済み）。画面の「このままで確認済み」は、有効な人の代表があればそれを入れて送る。
+- **`reset` は `representatives` を見ない**（あっても無視）。`confirm` と `reset` の本文の検査は `kind`・`group_id`・
+  `token` が共通で、エラーはどれも 400 `bad_params`（値は応答に出さない）。
+- **`decided_at`** は `strftime('%Y-%m-%d %H:%M:%S','now')`（SQLite の UTC）。世代の 4 列は `INSERT … SELECT … FROM photo_quality`
+  で `photo_quality` の行の値をそのまま入れる。
+- **失敗の符号**: 本文の形 400 `bad_params` → writer が無ければ 503 → `BEGIN IMMEDIATE` の中で 409 `group_changed`
+  （組が消えた・1 枚になった・`token` 違い）→ 400 `bad_params`（部分集合でない）→ 400 `representative_not_visible`。
+  `photo_curation` 表が無い DB に writer がある（起動時に作る前提で通常は起きない）ときは何も書かず 503。
+  待ち切れなかった `SQLITE_BUSY`/`LOCKED` は 503（既存の `ApiError::Unavailable` を使うので、本文の文面は
+  「書き込みが無効…」の既存の定型文。符号は変えていない）。
+- **HEAD・POST の `groups`、GET の `confirm`/`reset`** は既存の決まりどおり 403。`groups` は `no-store`。
+
 ### `GET /api/admin/status` の変更（PR ③）
 
 - `db.quality.recommended`・`exact_suppressed`・`similar_alternates`（`quality_summary`、`admin.rs:335`）を
   `EFFECTIVE_RECOMMENDED` で数える（R19）。人の記録が無い Python のフィクスチャでは値が変わらないので `admin_api.rs` は通る。
-- `db.quality.curation_pending`（あると良い R18）: 状態が `unconfirmed`・`recheck` のグループ数。`python_shape` で除く。
+- `db.quality.curation_pending`（あると良い R18）: 状態が `unconfirmed`・`recheck` のグループ数（`curation::pending_groups`。世代の合う `photo_quality` の行が 2 枚以上のグループのうち、有効な記録の無いメンバーがいるもの。表が無ければすべてのグループ）。`python_shape` で除く。
 
 ### `GET /api/v1/photos`（PR ③。項目は不変）
 

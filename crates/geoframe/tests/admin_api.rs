@@ -28,6 +28,10 @@ fn strip_unstable(mut body: Value) -> Value {
 fn python_shape(mut body: Value) -> Value {
     if let Some(db) = body.get_mut("db").and_then(Value::as_object_mut) {
         db.remove("filters");
+        // Rust 固有の項目（Python には無い）
+        if let Some(quality) = db.get_mut("quality").and_then(Value::as_object_mut) {
+            quality.remove("curation_pending");
+        }
     }
     if let Some(items) = body.get_mut("items").and_then(Value::as_array_mut) {
         for item in items {

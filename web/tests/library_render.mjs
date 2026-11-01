@@ -68,6 +68,7 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
   const fetchFake = (url, opts = {}) => {
     const rec = {url, method: opts.method || 'GET', body: opts.body};
     calls.push(rec);
+    if(calls.length > 5000) throw new Error('fetch が 5000 回を超えた（読み直しのループ）: ' + url);   // settle() は setImmediate で待つだけ
     const params = url.includes('?') ? new URLSearchParams(url.split('?')[1]) : new URLSearchParams();
     if(url === '/api/admin/status') return reply(statusBody());
     if(url === '/api/ai/status') return reply({ok: true, photos: 1, eligible: 1});
@@ -132,6 +133,10 @@ const activeTabs = env => env.$$('nav .tab').filter(t => t.classList.contains('o
 const mapOf = env => env.fake.maps[0];
 // vm の中で作られた配列・object は別の realm なので、deepEqual の前に JSON を通して普通の値にする
 const plain = v => JSON.parse(JSON.stringify(v));
+// ノードの同一性は assert.ok で比べる。assert.equal / strictEqual にノードを渡すと、失敗時の差分作りが文書全体を inspect して
+// 時間とメモリを大きく食う（fakedom.mjs の hidden の注記を参照）
+const same = (a, b, msg) => assert.ok(a === b, msg || '同じノードのはず');
+const notSame = (a, b, msg) => assert.ok(a !== b, msg || '別のノードのはず');
 
 let n = 0;
 async function test(name, fn){ await fn(); n++; console.log('ok - ' + name); }
@@ -296,7 +301,7 @@ await test('(d) タイルを押すとビューアが開き、★は setflag に�
   assert.equal(env.$('#viewer-counter').textContent, '2 / 3');
   assert.equal(hidden(env, '#viewer-ai'), true);
   assert.equal(hidden(env, '#viewer-group'), true);
-  assert.equal(env.document.activeElement, env.$('#viewer-close'));
+  same(env.document.activeElement, env.$('#viewer-close'));
   // 前後は格子の並び
   env.$('#viewer-next').click();
   assert.equal(env.$('#viewer-title').textContent, '#503  c.jpg');
@@ -321,7 +326,7 @@ await test('(d) タイルを押すとビューアが開き、★は setflag に�
   // 閉じると、開いたタイルにフォーカスが戻る
   env.$('#viewer-close').click();
   assert.equal(hidden(env, '#viewer'), true);
-  assert.equal(env.document.activeElement, t[1]);
+  same(env.document.activeElement, t[1]);
   assert.ok(!env.document.body.classList.contains('ps-viewer-open'));
   // Enter でも開ける
   t[0].dispatchEvent({type: 'keydown', key: 'Enter'});

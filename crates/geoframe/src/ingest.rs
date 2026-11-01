@@ -196,6 +196,10 @@ fn start_impl(config: &Config, guard: &Guard, must_exist: bool) -> Result<Ingest
     migration.created.extend(writer.call(move |conn| {
         ai::migrate_active(conn, clue_enabled, suggest_enabled, scenes, judge)
     })?);
+    // 管理画面の選別（人が選んだ代表）の表。`SCHEMA` の再現には含めず、AI の表と同じくここで足す
+    migration
+        .created
+        .extend(writer.call(crate::curation::ensure_tables)?);
     log_migration(&migration);
 
     let cache = Arc::new(Cache::load(&config.data_dir));
@@ -423,6 +427,9 @@ pub fn plan(config: &Config, conn: &Connection) -> rusqlite::Result<Plan> {
         scenes,
         judge,
     )?);
+    schema
+        .missing_objects
+        .extend(crate::curation::pending(conn)?);
     let scene_mismatch = if scenes {
         ai::groups::mismatched(conn)
             .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?
@@ -706,10 +713,11 @@ mod tests {
 
         let ingest = start(&config).unwrap();
         assert!(config.db_path().exists());
-        // Python と同じスキーマの 16（表 11・索引 5）と、P4 の AI 表（`ai_jobs`・その索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表・その索引）
-        assert_eq!(ingest.migration.created.len(), 16 + 10);
+        // Python と同じスキーマの 16（表 11・索引 5）と、P4 の AI 表（`ai_jobs`・その索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表・その索引）と、選別の表（`photo_curation`）
+        assert_eq!(ingest.migration.created.len(), 16 + 11);
         for name in [
             "ai_jobs",
+            "photo_curation",
             "ai_image_embedding_lineage",
             "ai_request_usage",
             "ai_provider_pauses",

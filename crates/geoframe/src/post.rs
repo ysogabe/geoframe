@@ -47,7 +47,7 @@ use serde_json::{Map, Value};
 
 use crate::limits::ConnBusy;
 use crate::server::{AppState, error_response, json_response};
-use crate::{blog_write, csrf, rotate, update, webpath};
+use crate::{admin_curation, blog_write, csrf, rotate, update, webpath};
 
 /// 本文の上限（現行の `MAX_POST_BYTES`）。
 pub const MAX_POST_BYTES: u64 = 64 * 1024;
@@ -60,6 +60,8 @@ pub enum Route {
     Rotate,
     BlogSave,
     BlogExport,
+    CurationConfirm,
+    CurationReset,
 }
 
 impl Route {
@@ -71,6 +73,8 @@ impl Route {
             Self::Rotate => "/api/admin/rotate",
             Self::BlogSave => "/api/blog/save",
             Self::BlogExport => "/api/blog/export",
+            Self::CurationConfirm => "/api/admin/curation/confirm",
+            Self::CurationReset => "/api/admin/curation/reset",
         }
     }
 }
@@ -86,6 +90,8 @@ pub fn route_of(raw_path: &str) -> Option<Route> {
         "/api/admin/rotate" => Some(Route::Rotate),
         "/api/blog/save" => Some(Route::BlogSave),
         "/api/blog/export" => Some(Route::BlogExport),
+        "/api/admin/curation/confirm" => Some(Route::CurationConfirm),
+        "/api/admin/curation/reset" => Some(Route::CurationReset),
         _ => None,
     }
 }
@@ -276,6 +282,7 @@ pub async fn handle(
     let writer = state.writer();
     let data_dir = state.data_root.as_ref().clone();
     let blog = std::sync::Arc::clone(&state.blog);
+    let admin = std::sync::Arc::clone(&state.admin);
     // ここから応答が決まるまでが「処理中」。済んだら（守りを落としたら）無通信の期限が戻る
     let busy_guard = busy.map(ConnBusy::enter);
     let result = tokio::task::spawn_blocking(move || match route {
@@ -284,6 +291,8 @@ pub async fn handle(
         Route::Rotate => rotate::rotate(&payload, writer.as_ref(), &data_dir),
         Route::BlogSave => blog_write::save(&payload, &blog, &data_dir, writer.as_ref()),
         Route::BlogExport => blog_write::export(&payload, &blog, &data_dir, writer.as_ref()),
+        Route::CurationConfirm => admin_curation::confirm(&payload, writer.as_ref(), admin),
+        Route::CurationReset => admin_curation::reset(&payload, writer.as_ref(), admin),
     })
     .await
     .unwrap_or_else(|_| Err(ApiError::Internal("更新の処理が異常終了しました".into())));

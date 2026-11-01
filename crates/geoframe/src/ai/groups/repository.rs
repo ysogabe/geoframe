@@ -794,7 +794,8 @@ fn raw_in(conn: &Connection, with_vectors: bool) -> Result<Option<Raw>, Error> {
 }
 
 fn legacy_in(conn: &Connection) -> Result<Vec<Legacy>, Error> {
-    let valid = crate::selection::VALID_MEMBERS;
+    // 人の代表の表があるときは、`shown` も有効な推奨で判定する（フィードと同じ意味にそろえる）
+    let valid = crate::selection::valid_members(crate::curation::available(conn)?);
     let mut stmt = conn.prepare(&format!("SELECT g.group_id,g.judge_model,g.judge_version,
         (SELECT COUNT(*) FROM photo_ai_group_members m WHERE m.group_id=g.group_id)
         FROM photo_ai_groups g WHERE g.status='judged' AND g.same_scene=1
