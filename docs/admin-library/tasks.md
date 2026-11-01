@@ -3,7 +3,7 @@
 - PRD: prd.md / 設計: design.md
 - PR は 3 本（PRD の「実装の順番」）。① はこのブランチ、② ③ は ① のマージ後に `main` から切るブランチ（同じ worktree）。
   各 PR の前にブランチ全体の確認（テスト・PRD 突き合わせ・`security-review`）を行う。
-- ブランチ: ① `t3/admin-photo-library-g3-g4`（PR #73 マージ済み） / ② `t3/admin-library-2-library`（PR #74 マージ済み） / ③ `t3/admin-library-3-curation`
+- ブランチ: ① `t3/admin-photo-library-g3-g4`（PR #73 マージ済み） / ② `t3/admin-library-2-library`（PR #74 マージ済み） / ③ `t3/admin-library-3-curation`（PR #75 マージ済み）
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
