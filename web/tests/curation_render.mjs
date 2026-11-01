@@ -679,6 +679,74 @@ await test('(n) 確定の応答が一覧の読み直しのあとに届いても�
   assert.equal(env.ev('cs.busy.size'), 0);
 });
 
+await test('(n2) 遅れた確定の応答は、送ったあとに読み直した一覧の同じ段を古い値に戻さない。段は読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const post = deferred(), byId = deferred();
+  env.handlers.confirm = () => post.promise;
+  sections(env)[1].querySelector('.cur-do-keep').click();           // 送信（世代 1）
+  const latest = () => grp('similar', 21, 'bbbbbbbbbbbbbbbb', 'recheck', [
+    mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+    mem(612, {rank: 1, score: 85, recommended: true, hidden: true, selectable: false}),
+    mem(613, {rank: 3, score: null, curation: 'stale', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+  env.handlers.groups = params => params.get('ids') ? byId.promise : reply(listBody([EX1(), latest()]));
+  env.$('#cur-state-all').click();                                   // 一覧の読み直し（世代 2）。612 は除外
+  await settle();
+  const fresh = sectionOf(env, 'similar', 21);
+  assert.equal(cardOf(fresh, 612).querySelector('input').disabled, true);
+  post.resolve({ok: true, status: 200, json: () => Promise.resolve({ok: true, group: grp('similar', 21, 'ffffffffffffffff',
+    'confirmed', [mem(611, {rank: 2, curation: 'representative', effective: true}), mem(612, {rank: 1, recommended: true}),
+                  mem(613, {rank: 3, curation: 'reviewed'})], {taken_at: '2030-05-02 08:00'})})});
+  await settle();
+  // 遅れた応答では置き換えない（読み直しの応答はまだ届いていない）
+  assert.strictEqual(sectionOf(env, 'similar', 21), fresh, '段は置き換えない');
+  assert.equal(cardOf(fresh, 612).querySelector('input').disabled, true);
+  assert.equal(fresh.querySelector('.cur-state').textContent, '状態: 再確認');
+  assert.equal(env.ev('cs.groups[1].token'), 'bbbbbbbbbbbbbbbb');
+  assert.ok(toastText(env).includes('確認済みにしました'), '確定は成功している');
+  // 代わりにその段を読み直す
+  assert.equal(env.lastList().get('ids'), '611');
+  assert.equal(env.ev('cs.busy.size'), 0);
+  assert.equal(fresh.querySelector('.cur-do-keep').disabled, false, '送信中の表示は解く');
+  byId.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([latest()]))});
+  await settle();
+  assert.equal(cardOf(sectionOf(env, 'similar', 21), 612).querySelector('input').disabled, true);
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 再確認');
+});
+
+await test('(n3) 一覧の読み直しを待つ間に確定が成功したら、遅れて届いた一覧の応答では確認済みの段を戻さない。一覧は読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const held = deferred(), again = deferred();
+  const queue = [held, again];
+  env.handlers.groups = params => params.get('ids') ? null : queue.shift().promise;
+  env.$('#cur-state-all').click();                                   // 一覧の読み直しを保留
+  await settle();
+  const done = () => grp('similar', 21, 'eeeeeeeeeeeeeeee', 'confirmed', [
+    mem(611, {rank: 2, score: 70, curation: 'representative', effective: true}),
+    mem(612, {rank: 1, score: 85, recommended: true, curation: 'reviewed'}),
+    mem(613, {rank: 3, score: null, curation: 'reviewed', thumb: '', thumb_url: ''})], {taken_at: '2030-05-02 08:00'});
+  env.handlers.confirm = () => reply({ok: true, group: done()});
+  sections(env)[1].querySelector('.cur-do-keep').click();
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.ok(toastText(env).includes('確認済みにしました'));
+  // 確定の前に出した一覧の応答（再確認のまま）が遅れて届く → 捨てる
+  held.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody(DEFAULT_GROUPS()))});
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）',
+    '再確認に戻らない');
+  assert.equal(env.ev('cs.groups[1].token'), 'eeeeeeeeeeeeeeee');
+  assert.equal(env.listReqs().length, 3, '捨てた一覧は読み直す（初回・保留・読み直し）');
+  assert.equal(env.lastList().get('state'), 'all');
+  again.resolve({ok: true, status: 200, json: () => Promise.resolve(listBody([EX1(), done(), SM2(), SM3()]))});
+  await settle();
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(sections(env).length, 4);
+});
+
 await test('(o) 一覧の読み込み失敗はトーストで知らせ、一覧は前のまま', async () => {
   const env = makeEnv();
   await env.boot();

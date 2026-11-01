@@ -14,12 +14,14 @@
    groups: 今のページの組（members は normalizePhoto を通した写真 + rank・score・… をそのまま持つ）。
    picks: 段ごとの選択（確定前）Map<groupKey, Set<photoId>>。busy: 確定・取り消しの送信中の段（多重送信を防ぐ）。
    nodes: 段の要素 Map<groupKey, section>。reloading: 1 組の読み直しが飛んでいる段。
-   seq: 一覧の要求番号（古い応答を捨てる）。gseq: 段ごとの読み直しの要求番号 */
+   seq: 一覧の要求番号（古い応答を捨てる）。gseq: 段ごとの読み直しの要求番号。
+   gen: 画面の世代。一覧の読み直し（絞り込み・ページ移動を含む）と確定・取り消しの成功で進める。
+   POST は送信時の世代を控え、応答のときに世代が違えば段を置き換えず読み直す。一覧の応答も取得時の世代と違えば捨てる */
 const cs = {
   state: 'unconfirmed', kind: 'all',
   page: 1, pages: 1, per: 20, total: 0, groups: [],
   picks: new Map(), busy: new Set(), nodes: new Map(), reloading: new Set(),
-  seq: 0, gseq: new Map(),
+  seq: 0, gseq: new Map(), gen: 0,
 };
 
 const CUR_STATES = ['unconfirmed', 'confirmed', 'all'];
@@ -242,22 +244,29 @@ function curRemove(key){
 function curRepaintActions(group){
   const key = curKey(group);
   const section = cs.nodes.get(key);
-  if(section) curPaintActions(section, group);
+  const current = cs.groups.find(g => curKey(g) === key) || group;   // 一覧が読み直されていたら今の組で塗る
+  if(section) curPaintActions(section, current);
 }
 function curSubmit(group, path, body, doneText){
   const key = curKey(group);
   if(cs.busy.has(key)) return;
   cs.busy.add(key);
   curRepaintActions(group);
+  const gen = cs.gen, gseq = cs.gseq.get(key) || 0;       // 送信時の画面の世代・この段の読み直しの番号
   curPost(path, body).then(d => {
     cs.busy.delete(key);
+    /* 送ってから一覧（または この段）が読み直されていたら、応答の組は読み直しより古いかもしれない → 置き換えない */
+    const stale = gen !== cs.gen || gseq !== (cs.gseq.get(key) || 0);
+    cs.gen++;                                             // 確定の成功: これより前に出した一覧の応答は捨てる
     cs.gseq.set(key, (cs.gseq.get(key) || 0) + 1);       // 飛んでいる読み直しの応答は、この確定より古い
-    if(d.group){
+    if(d.group && !stale){
       curReplace(key, curGroup(d.group), false);
       toast(doneText);
     }else{
+      if(d.group) toast(doneText);
       curRepaintActions(group);
-      curReload(group, false);
+      const current = cs.groups.find(g => curKey(g) === key);
+      if(current) curReload(current, false);              // 今の一覧に段が残っているときだけ、その段を読み直す
     }
   }).catch(e => {
     cs.busy.delete(key);
@@ -360,15 +369,20 @@ function renderCuration(){
   curPaintList();
 }
 function loadCuration(){
-  const seq = ++cs.seq;
+  const seq = ++cs.seq, gen = ++cs.gen;
   curGet({state: cs.state, kind: cs.kind, page: cs.page, per: cs.per}).then(d => {
     if(seq !== cs.seq) return;
+    if(gen !== cs.gen){ loadCuration(); return; }     // 待っている間に確定が成功した → この応答は古い。読み直す
     cs.page = d.page; cs.pages = d.pages; cs.total = d.total;
     cs.groups = (d.groups || []).map(curGroup);
     cs.picks.clear();                 // token が変わりうるので、前の選択は持ち越さない
     cs.reloading.clear();
     renderCuration();
-  }).catch(e => { if(seq === cs.seq) toast('選別の組を読めませんでした: ' + e.message, true); });
+  }).catch(e => {
+    if(seq !== cs.seq) return;
+    if(gen !== cs.gen){ loadCuration(); return; }
+    toast('選別の組を読めませんでした: ' + e.message, true);
+  });
 }
 function setCurFilter(state, kind){
   cs.state = state;
