@@ -158,9 +158,10 @@ flowchart LR
 | `crates/geoframe/src/thumb.rs`（新） | `/thumb/<id>.jpg` の経路。ID と版の検証、世代の計算、キャッシュの有無、ID ごとのロックと生成の枠、`spawn_blocking` での生成、失敗の記憶、ETag と 304 |
 | `imaging/derivative.rs` | `pub fn make_thumbnail(src: &Path, long_edge: u32, limits: &DecodeLimits) -> Result<Vec<u8>, ImageError>` を足す（`render` は `MAX_INPUT_BYTES` を決め打ちしている（`derivative.rs:602`）ので、上限を引数で受ける形に分ける。全体を復号する前にファイルの大きさとヘッダの寸法で断る。`resize` を再利用。JPEG 品質 80、EXIF は持ち込まない。書き込みは呼び手が `write_atomic`） |
 | `admin_library.rs`（新） | `GET /api/admin/library/trips`・`/photos`・`/points`（あると良い: `/calendar`・`/places`）。`AdminContext` を再利用 |
-| `curation.rs`（新） | `photo_curation` の DDL（`TABLES` 定数）、`ensure_tables(conn)`（書き込み側の起動時）、`available(conn)`（`sqlite_master` を見る）、SQL 片 `CURATION_JOIN`・`EFFECTIVE_RECOMMENDED`・`QUALITY_VISIBLE_EFFECTIVE`、グループの状態の計算 |
+| `curation.rs`（新） | `photo_curation` の DDL（`TABLES`・`SCHEMA`）、`ensure_tables(conn)`（書き込み側の起動時。`ingest::start_impl` が AI の表の次に呼び、`plan`（`--dry-run`）も `pending` で数える）、`available(conn)`（`sqlite_master` を見る）、SQL 片（別名を受ける関数 `join`・`group_has_pick`・`effective_recommended`・`quality_visible`・`has_valid_representative`。設計書の `CURATION_JOIN`・`GROUP_HAS_PICK`・`EFFECTIVE_RECOMMENDED`・`QUALITY_VISIBLE_EFFECTIVE` に当たる）、`pending_groups(conn)`、グループの状態 `group_state`・`State`・`Record`、`Member`・`group_token`・`mtime_text` |
 | `admin_curation.rs`（新） | `GET /api/admin/curation/groups`、`POST /api/admin/curation/confirm`・`/reset` の処理 |
-| `photos.rs` | `list_photos` が `curation::available` で SQL 片を選ぶ。`quality_recommended`・`quality_role`・`QUALITY_VISIBLE` を有効な推奨に置き換える |
+| `photos.rs` | `list_photos` が `curation::available` で `feed_sql(curation)` を選ぶ（偽なら従来と同じ文字列。単体試験で固定）。`quality_recommended`・`quality_role`・`QUALITY_VISIBLE` を有効な推奨に置き換える。`QUALITY_JOIN`・`FEED_BASE_WHERE`（品質以外の述語）は `pub(crate)` で、`confirm` の `representative_not_visible` が共有する |
+| `selection.rs` | `VALID_MEMBERS` 定数を関数 `valid_members(curation)` にし、`ai_visible(curation)` が引数を受ける（`admin_counts` と `ai/groups/repository.rs` の `legacy_in` は `curation::available` を自分で引く） |
 | `post.rs` | `Route::CurationConfirm`・`Route::CurationReset` |
 | `server.rs` | `/thumb/` の分岐（`/derivatives/` の隣）、`/api/admin/library/`・`/api/admin/curation/` の完全一致の分岐 |
 | `admin.rs` | `status` の `db.quality` に `curation_pending`（あると良い R18） |
@@ -493,9 +494,13 @@ CASE WHEN q.group_id IS NULL THEN 0
   | 古い世代の `representative` 行だけ残り、再構築で同じ組に戻った | 解析の推奨 | `recheck` |
   | `reviewed` だけ（`representatives: null` で確認） | 解析の推奨 | `confirmed` |
 
-- 性能: 実装時に合成 6,500 行で `EXPLAIN QUERY PLAN` と時間を測る（`idx_photo_quality_group` が `(group_kind, group_id)` に
-  ある）。読み取り接続は `PRAGMA query_only`（`db.rs:228`）なので一時表は使えない。遅ければ `GROUP_HAS_PICK` を
-  `list_photos` の前に 1 回だけ引いた `(group_kind, group_id)` の集合に置き換える（Rust 側で判定）。
+- 性能（測定済み）: 合成 6,500 行（うちグループ入り 1,000 行、代表の記録 100 件。`tests/curation_feed.rs` の
+  `measure_the_feed_with_6500_rows`、`--ignored --nocapture`）で、`list_photos` は表が無い従来の SQL で約 52 ms、
+  表がある SQL で約 54 ms（debug ビルド、20 回の平均。差は 5% 前後）。`EXPLAIN QUERY PLAN` は `photos` を 1 回走査し、
+  `q`・`c`・`q2`（`idx_photo_quality_group`）・`p2`・`c2` はすべて主キーか `idx_photo_quality_group` の検索で、全表走査の
+  副問い合わせは無い。グループ外の写真（6,500 行の大半）は `CASE WHEN q.group_id IS NULL` で `EXISTS` に入らない。
+  よって代替（`GROUP_HAS_PICK` の集合を先に 1 回引いて Rust 側で判定）は採らず、`EXISTS` のままにした。
+  読み取り接続は `PRAGMA query_only`（`db.rs:228`）なので一時表は使えない（代替を採るなら Rust 側の集合になる）。
 - 表が無いとき（`available(conn)=false`）は従来の SQL 片をそのまま使う。`Catalog::read` の接続ごとに `available` を
   1 回引く（`sqlite_master` の 1 行）。書き込み側は起動時に `ensure_tables`（`ai.rs` の AI 表と同じ場所）。
 - 旧 AI 選別（`selection.rs`）: `VALID_MEMBERS` の `shown`（`selection.rs:27-40`）が `mq.recommended=1` を見ているので、
@@ -573,7 +578,7 @@ CASE WHEN q.group_id IS NULL THEN 0
 
 - `db.quality.recommended`・`exact_suppressed`・`similar_alternates`（`quality_summary`、`admin.rs:335`）を
   `EFFECTIVE_RECOMMENDED` で数える（R19）。人の記録が無い Python のフィクスチャでは値が変わらないので `admin_api.rs` は通る。
-- `db.quality.curation_pending`（あると良い R18）: 状態が `unconfirmed`・`recheck` のグループ数。`python_shape` で除く。
+- `db.quality.curation_pending`（あると良い R18）: 状態が `unconfirmed`・`recheck` のグループ数（`curation::pending_groups`。世代の合う `photo_quality` の行が 2 枚以上のグループのうち、有効な記録の無いメンバーがいるもの。表が無ければすべてのグループ）。`python_shape` で除く。
 
 ### `GET /api/v1/photos`（PR ③。項目は不変）
 
