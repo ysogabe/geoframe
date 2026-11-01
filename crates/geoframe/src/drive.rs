@@ -49,7 +49,7 @@ use crate::stop::StopFlag;
 
 pub use fetch::FetchDerivatives;
 pub use index::IndexDrive;
-pub use index::{HoldReason, MassDeleteBoard, MassDeleteHold};
+pub use index::{Allow, HeldIds, HoldReason, MassDeleteBoard, MassDeleteHold};
 
 /// 読み取り専用のスコープ（現行と同じ）。
 pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.readonly";

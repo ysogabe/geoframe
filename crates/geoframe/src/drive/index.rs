@@ -32,6 +32,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rusqlite::types::ValueRef;
@@ -78,6 +80,58 @@ impl HoldReason {
     }
 }
 
+/// 保留した行の ID の集合（昇順・重複なし）。**メモリの中だけ**で、応答にもログにも出さない。
+///
+/// `Debug` は件数だけ（`HeldIds(len=120)`）で、`Serialize` は付けない（`{:?}` で千件の ID が journal に流れないため）。
+/// `Arc` なので、保留の記憶を読むたびの複製は軽い。
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct HeldIds(Arc<[i64]>);
+
+impl HeldIds {
+    /// 昇順に並べて重複を除く。
+    pub fn new(mut ids: Vec<i64>) -> Self {
+        ids.sort_unstable();
+        ids.dedup();
+        Self(ids.into())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn contains(&self, id: i64) -> bool {
+        self.0.binary_search(&id).is_ok()
+    }
+
+    /// 昇順の ID（印の計算と、集合に限った削除の判定に使う）。
+    pub fn as_slice(&self) -> &[i64] {
+        &self.0
+    }
+}
+
+impl fmt::Debug for HeldIds {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "HeldIds(len={})", self.0.len())
+    }
+}
+
+/// `index_drive` が大量削除の保留をどう扱うか。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Allow {
+    /// 保留する（`serve` の定期実行）。
+    #[default]
+    No,
+    /// 保留を外して消す（`geoframe sync --allow-mass-delete` の 1 回だけ）。
+    Yes,
+    /// 承認した行の集合に限って消す（運用コンソールの「保留の解除」）。消える行がすべて集合の中のときだけ消し、
+    /// 集合に無い行が 1 件でもあれば保留に戻す。取り直した一覧が空のときも集合に関係なく保留に戻す。
+    Only(HeldIds),
+}
+
 /// 保留している削除（`/api/admin/status` の `sync.mass_delete_hold`。T3.7）。写真の名前・座標は持たない。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MassDeleteHold {
@@ -90,6 +144,9 @@ pub struct MassDeleteHold {
     pub since: String,
     /// 直近に保留を確かめた時刻（同）。
     pub checked_at: String,
+    /// 保留した行（消そうとした行）の ID。メモリの中だけ。応答には出さない（`/api/admin/status` の項目は手書きの 5 つ）。
+    /// `Debug` は件数だけ。
+    pub ids: HeldIds,
 }
 
 /// 大量削除の保留の記憶。**プロセスの中だけ**（再起動で消え、次のサイクルでまた付く）。`index_drive` が一覧を
@@ -116,6 +173,16 @@ impl MassDeleteBoard {
 
     /// 計画を作った結果を記録する（`index_drive` が呼ぶ。結合試験も使う）。`observed` は保留した `(行数, 理由, Drive の行数)`、無ければ保留なし。
     pub fn record(&self, observed: Option<(u64, HoldReason, u64)>, now: &str) {
+        self.record_with_ids(observed, HeldIds::default(), now);
+    }
+
+    /// [`MassDeleteBoard::record`] に、保留した行の ID の集合を添える（`index_drive` は常にこちら）。
+    pub fn record_with_ids(
+        &self,
+        observed: Option<(u64, HoldReason, u64)>,
+        ids: HeldIds,
+        now: &str,
+    ) {
         let mut guard = self
             .hold
             .lock()
@@ -129,6 +196,7 @@ impl MassDeleteBoard {
                 .as_ref()
                 .map_or_else(|| now.to_string(), |old| old.since.clone()),
             checked_at: now.to_string(),
+            ids,
         });
     }
 }
@@ -136,24 +204,27 @@ impl MassDeleteBoard {
 /// 同期サイクルの段 `index_drive`。
 pub struct IndexDrive {
     shared: Arc<DriveShared>,
-    /// 大量削除の保留を外す（`geoframe sync --allow-mass-delete` のときだけ true）。
-    allow_mass_delete: bool,
+    /// 大量削除の保留の扱い。
+    allow: Allow,
 }
 
 impl IndexDrive {
     pub fn new(shared: Arc<DriveShared>) -> Self {
-        Self {
-            shared,
-            allow_mass_delete: false,
-        }
+        Self::with_allow(shared, Allow::No)
     }
 
     /// 大量削除の保留を外した段（`geoframe sync --allow-mass-delete` の 1 回だけ）。
     pub fn allowing_mass_delete(shared: Arc<DriveShared>) -> Self {
-        Self {
-            shared,
-            allow_mass_delete: true,
-        }
+        Self::with_allow(shared, Allow::Yes)
+    }
+
+    /// 承認した行の集合に限って消す段（運用コンソールの「保留の解除」）。[`Allow::Only`]。
+    pub fn allowing_only(shared: Arc<DriveShared>, ids: HeldIds) -> Self {
+        Self::with_allow(shared, Allow::Only(ids))
+    }
+
+    pub(crate) fn with_allow(shared: Arc<DriveShared>, allow: Allow) -> Self {
+        Self { shared, allow }
     }
 }
 
@@ -250,6 +321,10 @@ pub(super) struct DrivePlan {
     /// 更新する行のうち、計画を作った時点で `loc_source='manual'` だったもの（位置と地名を書かない。T3.7）。
     /// 書く時点の判定は SQL の条件で行うので、計画のあとに手動の位置が付いた行はこの数に入らないが守られる。
     pub location_kept: u64,
+    /// 保留した（消さなかった）行の ID。保留なしなら空。保留の記憶（[`MassDeleteHold::ids`]）に入れる。
+    pub held_ids: HeldIds,
+    /// [`Allow::Only`] のときだけ: 承認された行の数。
+    pub approved: Option<u64>,
 }
 
 // 計画の中身（名前・座標を持つ `ops`）を出さず、件数だけを出す
@@ -264,6 +339,8 @@ impl fmt::Debug for DrivePlan {
             .field("deletes_withheld", &self.deletes_withheld)
             .field("mass_delete_withheld", &self.mass_delete_withheld)
             .field("location_kept", &self.location_kept)
+            .field("held_ids", &self.held_ids)
+            .field("approved", &self.approved)
             .finish()
     }
 }
@@ -337,13 +414,10 @@ pub(super) fn load_existing(conn: &Connection) -> rusqlite::Result<Vec<ExistingR
     Ok(out)
 }
 
-/// 一覧と DB の行から計画を作る（副作用なし。実行と dry-run が同じ関数を通る）。`allow_mass_delete` は
-/// 削除の保留（0 件の一覧・大量削除）を外す。
-pub(super) fn plan(
-    existing: &[ExistingRow],
-    files: &[RemoteFile],
-    allow_mass_delete: bool,
-) -> DrivePlan {
+/// 一覧と DB の行から計画を作る（副作用なし。実行と dry-run が同じ関数を通る）。`allow` は削除の保留
+/// （0 件の一覧・大量削除）の扱いで、**最初に分岐する**: [`Allow::Yes`] は全部消す、[`Allow::Only`] は承認した集合に
+/// 収まるときだけ消す、[`Allow::No`] は保留する。
+pub(super) fn plan(existing: &[ExistingRow], files: &[RemoteFile], allow: &Allow) -> DrivePlan {
     let by_drive_id: HashMap<&str, &ExistingRow> = existing
         .iter()
         .filter_map(|row| row.drive_id.as_deref().map(|id| (id, row)))
@@ -395,18 +469,42 @@ pub(super) fn plan(
         })
         .map(|row| (row.id, row.display.clone()))
         .collect();
-    if allow_mass_delete {
-        plan.deletes = doomed;
-        plan.deletes.sort_by_key(|(id, _)| *id);
-    } else if files.is_empty() && !doomed.is_empty() {
-        // 空の一覧は成功として返ることがある（共有を外した・フォルダの取り違え）。全行の削除はしない
-        plan.deletes_withheld = doomed.len() as u64;
-    } else if is_mass_delete(doomed.len(), drive_rows) {
-        // 0 件でなくても、ほとんどの行が消える一覧（一部しか見えない共有・フォルダの取り違え）は疑う
-        plan.mass_delete_withheld = doomed.len() as u64;
-    } else {
-        plan.deletes = doomed;
-        plan.deletes.sort_by_key(|(id, _)| *id);
+    let doomed_ids = || HeldIds::new(doomed.iter().map(|(id, _)| *id).collect());
+    match allow {
+        Allow::Yes => {
+            plan.deletes = doomed;
+            plan.deletes.sort_by_key(|(id, _)| *id);
+        }
+        Allow::Only(ids) => {
+            plan.approved = Some(ids.len() as u64);
+            if files.is_empty() && !doomed.is_empty() {
+                // 承認は「一覧に何かあった」状態に対するもの。空の一覧は状況の変化なので、集合に関係なく保留に戻す
+                plan.deletes_withheld = doomed.len() as u64;
+                plan.held_ids = doomed_ids();
+            } else if doomed.iter().all(|(id, _)| ids.contains(*id)) {
+                // 承認した集合に収まる（一部が一覧に戻っていれば、残りだけ）
+                plan.deletes = doomed;
+                plan.deletes.sort_by_key(|(id, _)| *id);
+            } else {
+                // 承認していない行が 1 件でもあれば、件数が同じでも消さない
+                plan.mass_delete_withheld = doomed.len() as u64;
+                plan.held_ids = doomed_ids();
+            }
+        }
+        Allow::No => {
+            if files.is_empty() && !doomed.is_empty() {
+                // 空の一覧は成功として返ることがある（共有を外した・フォルダの取り違え）。全行の削除はしない
+                plan.deletes_withheld = doomed.len() as u64;
+                plan.held_ids = doomed_ids();
+            } else if is_mass_delete(doomed.len(), drive_rows) {
+                // 0 件でなくても、ほとんどの行が消える一覧（一部しか見えない共有・フォルダの取り違え）は疑う
+                plan.mass_delete_withheld = doomed.len() as u64;
+                plan.held_ids = doomed_ids();
+            } else {
+                plan.deletes = doomed;
+                plan.deletes.sort_by_key(|(id, _)| *id);
+            }
+        }
     }
     plan
 }
@@ -483,7 +581,7 @@ pub(super) fn write_plan(
 }
 
 fn counts(plan: &DrivePlan, pages: u32, removed_files: (u64, u64, u64)) -> Counts {
-    Counts(vec![
+    let mut counts = Counts(vec![
         ("remote", plan.remote),
         ("pages", u64::from(pages)),
         ("added", plan.added()),
@@ -497,12 +595,120 @@ fn counts(plan: &DrivePlan, pages: u32, removed_files: (u64, u64, u64)) -> Count
         ("derivative_files_removed", removed_files.0),
         ("derivative_files_unsafe", removed_files.1),
         ("derivative_files_failed", removed_files.2),
-    ])
+    ]);
+    // 承認した集合に限った解除（`Allow::Only`）のときだけ: 承認した件数と、実際に消した件数
+    if let Some(approved) = plan.approved {
+        counts.0.push(("approved", approved));
+        counts.0.push(("deleted", plan.deletes.len() as u64));
+    }
+    counts
 }
 
 /// `DriveError` を段の失敗の文面にする（固定の語と状態コードだけ）。
 pub(super) fn stage_error(e: DriveError) -> StageError {
     StageError::text(format!("Drive: {e}"))
+}
+
+/// 解除前の DB の写し（`tmp/catalog-before-release.db`）の名前。次の解除まで 1 つだけ残る。
+const BACKUP_NAME: &str = "catalog-before-release.db";
+/// 写しの書き込み中の名前。成功したときだけ [`BACKUP_NAME`] に `rename` する。
+const BACKUP_PART_NAME: &str = ".catalog-before-release.db.part";
+/// 写しを作るのに要る空き容量は、`catalog.db` の大きさのこの割合（%）。
+const BACKUP_FREE_PERCENT: u64 = 120;
+
+/// 解除前の写しを作れなかった理由（パスや SQLite の文面は持たない。固定の文だけ）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackupError {
+    /// `tmp/` を用意できない・古い `.part` を消せない。
+    Prepare,
+    /// 空き容量が `catalog.db` の 1.2 倍に足りない（または調べられない）。
+    NoSpace,
+    /// `VACUUM INTO` が失敗した。
+    Copy,
+    /// 完成した写しを置き換えられなかった。
+    Install,
+}
+
+impl BackupError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Prepare => "解除前の DB の写しを置く場所を用意できないので、削除しません",
+            Self::NoSpace => "解除前の DB の写しを作る空き容量が足りないので、削除しません",
+            Self::Copy => "解除前の DB の写しを作れなかったので、削除しません",
+            Self::Install => "解除前の DB の写しを置けなかったので、削除しません",
+        }
+    }
+}
+
+/// 解除前の写しの置き場所。
+#[derive(Debug, Clone)]
+pub(super) struct BackupPaths {
+    dir: PathBuf,
+    db: PathBuf,
+}
+
+impl BackupPaths {
+    fn part(&self) -> PathBuf {
+        self.dir.join(BACKUP_PART_NAME)
+    }
+
+    fn done(&self) -> PathBuf {
+        self.dir.join(BACKUP_NAME)
+    }
+}
+
+/// `dir` の空き容量（バイト）。
+fn free_bytes(dir: &Path) -> io::Result<u64> {
+    crate::sysinfo::disk_usage(dir).map(|usage| usage.free)
+}
+
+/// 大量削除の解除の直前に、`catalog.db` の写し `tmp/catalog-before-release.db` を作る。
+///
+/// 残っている `.part` を消す → 空き容量が `catalog.db` の 1.2 倍あるか確かめる → トランザクションの外で
+/// `VACUUM INTO ?1`（パスは束縛）で `.part` に書く → 成功したら `rename`（前回の写しをここで初めて置き換える）。
+/// 失敗したら `.part` を消し、前回の写しは残す。呼び出し側は失敗したら削除しない。
+/// `conn` は writer の接続で、トランザクションの外（自動コミット）であること。
+pub(super) fn backup_before_release(
+    conn: &Connection,
+    paths: &BackupPaths,
+    free: &dyn Fn(&Path) -> io::Result<u64>,
+) -> Result<(), BackupError> {
+    let part = paths.part();
+    match std::fs::remove_file(&part) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(BackupError::Prepare),
+    }
+    let db_meta = std::fs::metadata(&paths.db).map_err(|_| BackupError::Prepare)?;
+    let needed = db_meta.len().saturating_mul(BACKUP_FREE_PERCENT) / 100;
+    match free(&paths.dir) {
+        Ok(available) if available >= needed => {}
+        _ => return Err(BackupError::NoSpace),
+    }
+    let Some(part_text) = part.to_str() else {
+        return Err(BackupError::Copy);
+    };
+    if conn.execute("VACUUM INTO ?1", [part_text]).is_err() {
+        let _ = std::fs::remove_file(&part);
+        return Err(BackupError::Copy);
+    }
+    // 写しの権限は `catalog.db` と同じにする（見えてよい人だけが読める）。失敗しても写し自体は有効
+    let _ = std::fs::set_permissions(&part, db_meta.permissions());
+    if std::fs::rename(&part, paths.done()).is_err() {
+        let _ = std::fs::remove_file(&part);
+        return Err(BackupError::Install);
+    }
+    Ok(())
+}
+
+/// 削除の書き込みの結果（writer の依頼の中で決まる）。
+enum Written {
+    /// 確定した。
+    Committed,
+    /// 停止の合図で、何も変えずに終えた。
+    Stopped,
+    /// 写しを作れなかったので、何も書かなかった。
+    BackupFailed(BackupError),
 }
 
 impl IndexDrive {
@@ -538,13 +744,18 @@ impl IndexDrive {
             Err(e) => return Err(stage_error(e)),
         };
         let existing = load_existing(ctx.read)?;
-        let plan = plan(&existing, &listing.files, self.allow_mass_delete);
-        if !ctx.is_dry_run() {
+        let plan = plan(&existing, &listing.files, &self.allow);
+        // `Only`（解除）で保留が消える計画のときは、削除が確定してから消す（下）。写し・書き込みが失敗したときに、
+        // 承認した保留の記憶（解除のボタン）まで消えないように。それ以外は計画の直後に記録する
+        let clears_after_commit = matches!(self.allow, Allow::Only(_)) && plan.hold().is_none();
+        if !ctx.is_dry_run() && !clears_after_commit {
             // 一覧を全部読めて計画ができたので、保留の有無を管理画面に見せる（T3.7）。
             // 失敗・省略したサイクルはここに来ないので、直前の記憶のまま
-            self.shared
-                .board
-                .record(plan.hold(), &crate::sysinfo::local_timestamp());
+            self.shared.board.record_with_ids(
+                plan.hold(),
+                plan.held_ids.clone(),
+                &crate::sysinfo::local_timestamp(),
+            );
         }
         if plan.mass_delete_withheld > 0 {
             // 件数だけ（名前は出さない）。保留はサイクルごとに警告する
@@ -582,14 +793,59 @@ impl IndexDrive {
             let writer = ctx.writer()?;
             let now = crate::sysinfo::local_isoformat();
             let ops = plan.ops.clone();
-            // 行を消して確定してから、そのファイルを消す（先にファイルを消して失敗すると、行だけが残る）
-            let committed = writer
-                .call(move |conn| write_plan(conn, &now, &ops, &ids, &stopped))
+            // `Only` で消す行があるときだけ、削除の直前に DB の写しを作る（定期サイクルが毎回 DB 全体を写さないため）
+            let backup = if matches!(self.allow, Allow::Only(_)) && !ids.is_empty() {
+                let tmp = data
+                    .tmp_dir()
+                    .map_err(|_| StageError::fixed(BackupError::Prepare.message()))?;
+                Some(BackupPaths {
+                    dir: tmp,
+                    db: ctx.config.db_path(),
+                })
+            } else {
+                None
+            };
+            // 行を消して確定してから、そのファイルを消す（先にファイルを消して失敗すると、行だけが残る）。
+            // 写しと書き込みは同じ依頼の中（間に別の writer の依頼を挟まない）
+            let written = writer
+                .call(move |conn| {
+                    if let Some(paths) = &backup {
+                        if stopped() {
+                            return Ok(Written::Stopped);
+                        }
+                        if let Err(e) = backup_before_release(conn, paths, &free_bytes) {
+                            return Ok(Written::BackupFailed(e));
+                        }
+                    }
+                    Ok(if write_plan(conn, &now, &ops, &ids, &stopped)? {
+                        Written::Committed
+                    } else {
+                        Written::Stopped
+                    })
+                })
                 .map_err(StageError::from)?;
-            if !committed {
-                return Ok(StageOutcome::Skipped(STOPPED));
+            match written {
+                Written::Committed => {}
+                Written::Stopped => return Ok(StageOutcome::Skipped(STOPPED)),
+                // 保留の記憶には触らない（承認した保留が残る）
+                Written::BackupFailed(e) => return Err(StageError::fixed(e.message())),
             }
             files_removed = remove_derivatives(&data, &plan.deletes, false);
+        }
+        if clears_after_commit && !ctx.is_dry_run() {
+            // 削除が確定した（または消す行・書く操作が無かった）ので、承認した保留を消す
+            self.shared
+                .board
+                .record(None, &crate::sysinfo::local_timestamp());
+        }
+        if let (Allow::Only(_), false) = (&self.allow, ctx.is_dry_run()) {
+            // 件数だけ（名前・ID は出さない）
+            tracing::warn!(
+                "[drive] 保留の解除を実行しました（承認 {} 件・削除 {} 件・保留に戻した {} 件）",
+                plan.approved.unwrap_or(0),
+                plan.deletes.len(),
+                plan.mass_delete_withheld + plan.deletes_withheld
+            );
         }
         Ok(StageOutcome::Done(counts(
             &plan,
@@ -607,5 +863,321 @@ impl Stage for IndexDrive {
     fn run(&self, ctx: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
         let stop = ctx.stop.clone();
         self.run_with(ctx, move || stop.is_stopped())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testutil::TempDir;
+
+    fn row(id: i64) -> ExistingRow {
+        ExistingRow {
+            id,
+            source: "drive".into(),
+            drive_id: Some(format!("d{id}")),
+            md5: Md5Cell::Text("m".into()),
+            display: Some(format!("derivatives/d{id}.jpg")),
+            manual: false,
+        }
+    }
+
+    fn file(id: i64) -> RemoteFile {
+        RemoteFile {
+            id: format!("d{id}"),
+            name: Some("n".into()),
+            md5: Some("m".into()),
+            time: None,
+            lat: None,
+            lon: None,
+        }
+    }
+
+    /// Drive の行 `1..=rows` と、一覧に残る `keep`（ID の配列）。
+    fn world(rows: i64, keep: &[i64]) -> (Vec<ExistingRow>, Vec<RemoteFile>) {
+        (
+            (1..=rows).map(row).collect(),
+            keep.iter().copied().map(file).collect(),
+        )
+    }
+
+    fn ids(range: std::ops::RangeInclusive<i64>) -> HeldIds {
+        HeldIds::new(range.collect())
+    }
+
+    fn deleted_ids(plan: &DrivePlan) -> Vec<i64> {
+        plan.deletes.iter().map(|(id, _)| *id).collect()
+    }
+
+    #[test]
+    fn only_deletes_when_every_doomed_row_was_approved() {
+        // 100 件から 1 件だけ見える。消える 2..=100 をすべて承認している
+        let (existing, files) = world(100, &[1]);
+        let plan = plan(&existing, &files, &Allow::Only(ids(2..=100)));
+        assert_eq!(deleted_ids(&plan), (2..=100).collect::<Vec<_>>());
+        assert_eq!((plan.deletes_withheld, plan.mass_delete_withheld), (0, 0));
+        assert_eq!(plan.approved, Some(99));
+        assert!(plan.hold().is_none());
+        assert!(plan.held_ids.is_empty());
+        let names: Vec<&str> = counts(&plan, 1, (0, 0, 0))
+            .0
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(names.ends_with(&["approved", "deleted"]), "{names:?}");
+    }
+
+    #[test]
+    fn only_deletes_just_the_rest_when_some_rows_came_back() {
+        // 承認した 2..=100 のうち 50 が一覧に戻った: 残りの 98 件だけ消す
+        let (existing, files) = world(100, &[1, 50]);
+        let plan = plan(&existing, &files, &Allow::Only(ids(2..=100)));
+        let expected: Vec<i64> = (2..=100).filter(|id| *id != 50).collect();
+        assert_eq!(deleted_ids(&plan), expected);
+        assert_eq!(plan.approved, Some(99));
+        let counts = counts(&plan, 1, (0, 0, 0));
+        let get = |name: &str| counts.0.iter().find(|(n, _)| *n == name).unwrap().1;
+        assert_eq!(
+            (get("approved"), get("deleted"), get("removed")),
+            (99, 98, 98)
+        );
+    }
+
+    #[test]
+    fn only_withholds_everything_when_one_doomed_row_was_not_approved() {
+        // 承認は 2..=99。100 も消えようとしている（件数は違っても、集合に無い行が 1 件でもあれば全部保留）
+        let (existing, files) = world(100, &[1]);
+        let plan = plan(&existing, &files, &Allow::Only(ids(2..=99)));
+        assert!(plan.deletes.is_empty());
+        assert_eq!((plan.mass_delete_withheld, plan.deletes_withheld), (99, 0));
+        // 保留に戻した集合は、消えようとした行すべて（新しい印のもと）
+        assert_eq!(plan.held_ids, ids(2..=100));
+        assert_eq!(plan.hold(), Some((99, HoldReason::Ratio, 100)));
+        // 件数が同じでも、別の行なら消さない
+        let (existing, files) = world(100, &[1]);
+        let other = HeldIds::new((3..=100).chain([1000]).collect());
+        let plan = super::plan(&existing, &files, &Allow::Only(other));
+        assert!(plan.deletes.is_empty());
+        assert_eq!(plan.mass_delete_withheld, 99);
+    }
+
+    #[test]
+    fn only_withholds_below_the_ratio_too_when_a_row_is_outside_the_set() {
+        // 20 件だけ消える（No なら閾値未満で消す）が、承認した集合に無い行があるので保留に戻す
+        let (existing, files) = world(100, &(1..=80).collect::<Vec<_>>());
+        let no = plan(&existing, &files, &Allow::No);
+        assert_eq!(no.deletes.len(), 20);
+        let only = plan(&existing, &files, &Allow::Only(ids(82..=100)));
+        assert!(only.deletes.is_empty());
+        assert_eq!(only.mass_delete_withheld, 20);
+        assert_eq!(only.held_ids, ids(81..=100));
+        // 収まっていれば、閾値未満でも承認どおりに消す
+        let only = plan(&existing, &files, &Allow::Only(ids(81..=100)));
+        assert_eq!(only.deletes.len(), 20);
+    }
+
+    #[test]
+    fn only_with_an_empty_listing_goes_back_to_the_hold_whatever_the_set_is() {
+        let (existing, files) = world(100, &[]);
+        let plan = plan(&existing, &files, &Allow::Only(ids(1..=100)));
+        assert!(plan.deletes.is_empty());
+        assert_eq!((plan.deletes_withheld, plan.mass_delete_withheld), (100, 0));
+        assert_eq!(plan.hold(), Some((100, HoldReason::EmptyListing, 100)));
+        assert_eq!(plan.held_ids, ids(1..=100));
+        // 空の一覧でも消す行が無ければ、何も保留しない
+        let plan = super::plan(&[], &[], &Allow::Only(ids(1..=3)));
+        assert!(plan.hold().is_none() && plan.deletes.is_empty());
+    }
+
+    #[test]
+    fn only_with_nothing_doomed_deletes_nothing_and_clears_the_hold() {
+        let (existing, files) = world(100, &(1..=100).collect::<Vec<_>>());
+        let plan = plan(&existing, &files, &Allow::Only(ids(2..=100)));
+        assert!(plan.deletes.is_empty() && plan.hold().is_none());
+        assert_eq!(plan.approved, Some(99));
+    }
+
+    #[test]
+    fn yes_and_no_behave_as_the_flag_did() {
+        let (existing, files) = world(100, &[1]);
+        // No: 比率で保留（消す行の ID を覚える）
+        let held = plan(&existing, &files, &Allow::No);
+        assert!(held.deletes.is_empty());
+        assert_eq!(held.mass_delete_withheld, 99);
+        assert_eq!(held.held_ids, ids(2..=100));
+        assert_eq!(held.approved, None);
+        // Yes: 全部消す
+        let all = plan(&existing, &files, &Allow::Yes);
+        assert_eq!(deleted_ids(&all), (2..=100).collect::<Vec<_>>());
+        assert_eq!((all.mass_delete_withheld, all.deletes_withheld), (0, 0));
+        assert!(all.held_ids.is_empty());
+        // 空の一覧: No は保留、Yes は全部消す
+        let (existing, files) = world(3, &[]);
+        let no = plan(&existing, &files, &Allow::No);
+        assert_eq!((no.deletes.len(), no.deletes_withheld), (0, 3));
+        assert_eq!(no.held_ids, ids(1..=3));
+        assert_eq!(plan(&existing, &files, &Allow::Yes).deletes.len(), 3);
+        // 閾値未満の削除は No でも通る
+        let (existing, files) = world(100, &(1..=50).collect::<Vec<_>>());
+        assert_eq!(plan(&existing, &files, &Allow::No).deletes.len(), 50);
+        // approved / deleted は Only のときだけ
+        let names: Vec<&str> = counts(&held, 1, (0, 0, 0))
+            .0
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert!(!names.contains(&"approved") && !names.contains(&"deleted"));
+    }
+
+    #[test]
+    fn held_ids_are_sorted_unique_and_debug_shows_only_the_count() {
+        let held = HeldIds::new(vec![30, 10, 20, 10]);
+        assert_eq!(held.as_slice(), &[10, 20, 30]);
+        assert_eq!(held.len(), 3);
+        assert!(held.contains(20) && !held.contains(21));
+        assert_eq!(format!("{held:?}"), "HeldIds(len=3)");
+        assert!(HeldIds::default().is_empty());
+        let allow = Allow::Only(HeldIds::new((500_000..500_100).collect()));
+        let shown = format!("{allow:?}");
+        assert!(
+            shown.contains("len=100") && !shown.contains("500000"),
+            "{shown}"
+        );
+        let (existing, files) = world(100, &[1]);
+        let shown = format!("{:?}", plan(&existing, &files, &Allow::No));
+        assert!(shown.contains("len=99"), "{shown}");
+    }
+
+    // 解除前の写し -----------------------------------------------------------------
+
+    struct BackupEnv {
+        dir: TempDir,
+        conn: Connection,
+        paths: BackupPaths,
+    }
+
+    fn backup_env(tag: &str) -> BackupEnv {
+        let dir = TempDir::new(tag);
+        let db = dir.path().join("catalog.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY, loc_source TEXT);
+             INSERT INTO photos(loc_source) VALUES ('manual'), ('drive_meta');",
+        )
+        .unwrap();
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        BackupEnv {
+            dir,
+            conn,
+            paths: BackupPaths { dir: tmp, db },
+        }
+    }
+
+    fn plenty(_: &Path) -> io::Result<u64> {
+        Ok(u64::MAX)
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn copy_rows(path: &Path) -> Vec<String> {
+        let copy =
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut stmt = copy
+            .prepare("SELECT loc_source FROM photos ORDER BY id")
+            .unwrap();
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    #[test]
+    fn the_copy_is_written_to_part_then_renamed_and_replaces_the_previous_one() {
+        let e = backup_env("backup-ok");
+        // 前回の写しと、中断の残りの `.part`
+        std::fs::write(e.paths.done(), b"old").unwrap();
+        std::fs::write(e.paths.part(), b"stale").unwrap();
+        backup_before_release(&e.conn, &e.paths, &plenty).unwrap();
+        assert_eq!(names_in(&e.paths.dir), [BACKUP_NAME]);
+        assert_eq!(copy_rows(&e.paths.done()), ["manual", "drive_meta"]);
+        let _ = &e.dir;
+    }
+
+    #[test]
+    fn a_short_disk_stops_before_writing_and_keeps_the_previous_copy() {
+        let e = backup_env("backup-space");
+        std::fs::write(e.paths.done(), b"old").unwrap();
+        let size = std::fs::metadata(&e.paths.db).unwrap().len();
+        // 1.2 倍にあと 1 バイト足りない
+        let short = move |_: &Path| Ok(size * 120 / 100 - 1);
+        assert_eq!(
+            backup_before_release(&e.conn, &e.paths, &short),
+            Err(BackupError::NoSpace)
+        );
+        // ちょうど足りれば作る
+        let exact = move |_: &Path| Ok(size * 120 / 100);
+        // 調べられないときも作らない（安全側）
+        let unknown = |_: &Path| Err(io::Error::from(io::ErrorKind::Other));
+        std::fs::write(e.paths.done(), b"old").unwrap();
+        assert_eq!(
+            backup_before_release(&e.conn, &e.paths, &unknown),
+            Err(BackupError::NoSpace)
+        );
+        assert_eq!(std::fs::read(e.paths.done()).unwrap(), b"old");
+        assert_eq!(names_in(&e.paths.dir), [BACKUP_NAME]);
+        backup_before_release(&e.conn, &e.paths, &exact).unwrap();
+        assert_eq!(copy_rows(&e.paths.done()).len(), 2);
+    }
+
+    #[test]
+    fn a_failing_copy_removes_the_part_and_keeps_the_previous_copy() {
+        let e = backup_env("backup-fail");
+        std::fs::write(e.paths.done(), b"old").unwrap();
+        // 空き容量の確認の最中に `.part` が現れた状況（`VACUUM INTO` は既存の空でないファイルを断る）を作る
+        let part = e.paths.part();
+        let meddle = move |_: &Path| {
+            std::fs::write(&part, b"in the way").unwrap();
+            Ok(u64::MAX)
+        };
+        assert_eq!(
+            backup_before_release(&e.conn, &e.paths, &meddle),
+            Err(BackupError::Copy)
+        );
+        assert_eq!(std::fs::read(e.paths.done()).unwrap(), b"old");
+        assert_eq!(names_in(&e.paths.dir), [BACKUP_NAME]);
+    }
+
+    #[test]
+    fn a_leftover_part_that_cannot_be_removed_stops_before_anything() {
+        let e = backup_env("backup-stuck");
+        std::fs::write(e.paths.done(), b"old").unwrap();
+        // 空でないディレクトリは `remove_file` で消せない（誰で動かしても同じ）
+        std::fs::create_dir_all(e.paths.part().join("inner")).unwrap();
+        assert_eq!(
+            backup_before_release(&e.conn, &e.paths, &plenty),
+            Err(BackupError::Prepare)
+        );
+        assert_eq!(std::fs::read(e.paths.done()).unwrap(), b"old");
+    }
+
+    #[test]
+    fn backup_errors_say_nothing_about_paths() {
+        for e in [
+            BackupError::Prepare,
+            BackupError::NoSpace,
+            BackupError::Copy,
+            BackupError::Install,
+        ] {
+            let text = e.message();
+            assert!(!text.contains('/') && !text.contains(".db"), "{text}");
+        }
     }
 }

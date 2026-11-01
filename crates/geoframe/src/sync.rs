@@ -293,15 +293,32 @@ pub fn default_stages() -> Vec<Box<dyn Stage>> {
 /// `geoframe sync --allow-mass-delete` の 1 回だけ使う段の一覧: `index_drive` が大量削除の保留を外す。
 /// **`serve` の定期実行は [`default_stages`] で、常に保留する**（環境変数・設定では外せない）。
 pub fn default_stages_allowing_mass_delete() -> Vec<Box<dyn Stage>> {
-    stages(Arc::new(crate::drive::DriveShared::new()), true)
+    stages(
+        Arc::new(crate::drive::DriveShared::new()),
+        crate::drive::Allow::Yes,
+    )
+}
+
+/// 運用コンソールの「保留の解除」が走らせる段の一覧: `index_drive` の 1 段だけで、承認した行の集合（`ids`）に限って
+/// 消す（[`crate::drive::Allow::Only`]）。`drive` は `serve` の定期実行と同じもの（保留の記憶・トークンを共有する）。
+pub fn index_drive_stage_only(
+    drive: Arc<crate::drive::DriveShared>,
+    ids: crate::drive::HeldIds,
+) -> Vec<Box<dyn Stage>> {
+    vec![Box::new(crate::drive::IndexDrive::allowing_only(
+        drive, ids,
+    ))]
 }
 
 /// [`default_stages`] の、Drive の状態（通信先・再試行）を指定できる形（試験用）。
 pub(crate) fn default_stages_with(drive: Arc<crate::drive::DriveShared>) -> Vec<Box<dyn Stage>> {
-    stages(drive, false)
+    stages(drive, crate::drive::Allow::No)
 }
 
-fn stages(drive: Arc<crate::drive::DriveShared>, allow_mass_delete: bool) -> Vec<Box<dyn Stage>> {
+fn stages(
+    drive: Arc<crate::drive::DriveShared>,
+    allow: crate::drive::Allow,
+) -> Vec<Box<dyn Stage>> {
     // `enrich` は応答の壊れた座標を覚えるので、プロセスの間 1 つを使い回す（`stages` を呼ぶたびに作る）
     STAGE_NAMES
         .iter()
@@ -309,10 +326,10 @@ fn stages(drive: Arc<crate::drive::DriveShared>, allow_mass_delete: bool) -> Vec
             "index_local" => Box::new(crate::local::IndexLocal) as Box<dyn Stage>,
             "infer" => Box::new(crate::geo::Infer),
             "enrich" => Box::new(crate::geo::Enrich::new()),
-            "index_drive" if allow_mass_delete => Box::new(
-                crate::drive::IndexDrive::allowing_mass_delete(Arc::clone(&drive)),
-            ),
-            "index_drive" => Box::new(crate::drive::IndexDrive::new(Arc::clone(&drive))),
+            "index_drive" => Box::new(crate::drive::IndexDrive::with_allow(
+                Arc::clone(&drive),
+                allow.clone(),
+            )),
             "local_derivatives" => Box::new(crate::local::LocalDerivatives::new()),
             "fetch_derivatives" => {
                 Box::new(crate::drive::FetchDerivatives::new(Arc::clone(&drive)))

@@ -3399,3 +3399,222 @@ fn fetch_waits_for_a_rotation_in_progress_and_leaves_no_orphan() {
     }
     assert_eq!(derivative_names(&e), ["j1.jpg", "j2.jpg"]);
 }
+
+// ---------------------------------------------------------------------------
+// 保留の解除（`Allow::Only`）: 集合に限った削除・削除前の写し・保留の記憶の順序
+
+/// 100 件から 1 件だけ見える一覧で保留を付け、その保留と、承認した集合に限る段を返す。
+fn held_env(tag: &str) -> (Env, MassDeleteHold, IndexDrive) {
+    let e = env(tag);
+    seed_drive_rows(&e, 100);
+    list_first(&e, 1);
+    e.index();
+    let hold = e.shared.mass_delete_board().current().expect("保留が付く");
+    assert_eq!((hold.held, hold.ids.len()), (99, 99));
+    let only = IndexDrive::allowing_only(Arc::clone(&e.shared), hold.ids.clone());
+    (e, hold, only)
+}
+
+fn backup_path(e: &Env) -> PathBuf {
+    e.root().join("tmp/catalog-before-release.db")
+}
+
+#[test]
+fn a_release_deletes_the_approved_rows_after_copying_the_database_and_clears_the_hold() {
+    let (e, _hold, only) = held_env("drive-release-ok");
+    // 手で直した位置は、写しに残る（消えた行と一緒に本 DB からは消える）
+    e.sql("UPDATE photos SET loc_source='manual', lat=1.5, lon=2.5 WHERE drive_id='d50'");
+    let counts = e.done(&only);
+    assert_eq!(
+        (
+            get(&counts, "approved"),
+            get(&counts, "deleted"),
+            get(&counts, "removed"),
+            get(&counts, "mass_delete_withheld"),
+            get(&counts, "deletes_withheld"),
+            get(&counts, "derivative_files_removed")
+        ),
+        (99, 99, 99, 0, 0, 99)
+    );
+    assert_eq!(row_count(&e), 1);
+    assert!(!e.root().join("derivatives/d50.jpg").exists());
+    assert_eq!(e.shared.mass_delete_board().current(), None);
+    // 写しは削除前の 100 行。手動の位置も残る
+    let copy =
+        Connection::open_with_flags(backup_path(&e), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let total: i64 = copy
+        .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 100);
+    let manual: (String, f64, f64) = copy
+        .query_row(
+            "SELECT loc_source, lat, lon FROM photos WHERE drive_id='d50'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(manual, ("manual".to_string(), 1.5, 2.5));
+    assert_eq!(e.tmp_leftovers(), ["catalog-before-release.db"]);
+}
+
+#[test]
+fn rows_that_came_back_are_kept_and_only_the_rest_is_deleted() {
+    let (e, _hold, only) = held_env("drive-release-partial");
+    list_first(&e, 1);
+    e.listing(vec![jpeg("d1", "n", "m"), jpeg("d60", "n", "m")]);
+    let counts = e.done(&only);
+    assert_eq!(
+        (get(&counts, "approved"), get(&counts, "deleted")),
+        (99, 98)
+    );
+    assert_eq!(row_count(&e), 2);
+    assert_eq!(e.shared.mass_delete_board().current(), None);
+}
+
+#[test]
+fn a_row_outside_the_approved_set_puts_everything_back_on_hold_with_a_new_set() {
+    let (e, hold, only) = held_env("drive-release-outsider");
+    // 承認したあとに、もう 1 行が消える側に回った（一覧に無い Drive の行が増えた）
+    e.sql("INSERT INTO photos(source, drive_id, name, md5, favorite) VALUES('drive', 'd101', 'n', 'm', 1)");
+    let counts = e.done(&only);
+    assert_eq!(
+        (
+            get(&counts, "removed"),
+            get(&counts, "mass_delete_withheld"),
+            get(&counts, "deleted")
+        ),
+        (0, 100, 0)
+    );
+    assert_eq!(row_count(&e), 101);
+    assert!(e.tmp_leftovers().is_empty(), "削除しないので写しは作らない");
+    // 新しい保留（新しい集合 = 新しい印）になる。`since` は続く
+    let now = e.shared.mass_delete_board().current().expect("保留のまま");
+    assert_eq!((now.held, now.ids.len()), (100, 100));
+    assert_ne!(now.ids, hold.ids);
+    assert_eq!(now.since, hold.since);
+}
+
+#[test]
+fn an_empty_listing_goes_back_on_hold_even_for_an_approved_set() {
+    let (e, _hold, only) = held_env("drive-release-empty");
+    e.listing(vec![]);
+    let counts = e.done(&only);
+    assert_eq!(
+        (
+            get(&counts, "removed"),
+            get(&counts, "deletes_withheld"),
+            get(&counts, "mass_delete_withheld")
+        ),
+        (0, 100, 0)
+    );
+    assert_eq!(row_count(&e), 100);
+    assert!(e.tmp_leftovers().is_empty());
+    let now = e.shared.mass_delete_board().current().unwrap();
+    assert_eq!((now.reason, now.held), (HoldReason::EmptyListing, 100));
+}
+
+#[test]
+fn a_hold_that_is_no_longer_needed_is_cleared_without_a_copy() {
+    let (e, _hold, only) = held_env("drive-release-recovered");
+    list_first(&e, 100);
+    let counts = e.done(&only);
+    assert_eq!((get(&counts, "approved"), get(&counts, "deleted")), (99, 0));
+    assert_eq!(e.shared.mass_delete_board().current(), None);
+    assert!(e.tmp_leftovers().is_empty());
+}
+
+#[test]
+fn a_copy_that_cannot_be_made_deletes_nothing_and_leaves_the_hold_alone() {
+    let (e, hold, only) = held_env("drive-release-nocopy");
+    // `tmp` が普通のファイル: 写しの置き場を用意できない
+    fs::write(e.root().join("tmp"), b"not a directory").unwrap();
+    let before = e.rows();
+    let result = e.run(&only);
+    let StageResult::Failed(message) = result else {
+        panic!("失敗のはず: {result:?}");
+    };
+    assert!(!message.contains(e.root().to_str().unwrap()), "{message}");
+    assert_eq!(e.rows(), before);
+    assert!(e.root().join("derivatives/d50.jpg").exists());
+    // 保留の記憶は触られない（`checked_at` も同じ）
+    assert_eq!(e.shared.mass_delete_board().current(), Some(hold));
+}
+
+#[test]
+fn a_leftover_part_is_replaced_and_a_failed_write_keeps_the_copy_and_the_hold() {
+    let (e, hold, only) = held_env("drive-release-writefail");
+    fs::create_dir_all(e.root().join("tmp")).unwrap();
+    fs::write(
+        e.root().join("tmp/.catalog-before-release.db.part"),
+        b"stale",
+    )
+    .unwrap();
+    // 書き込みを失敗させる（写しは先に作られる）
+    e.sql(
+        "CREATE TRIGGER block_delete BEFORE DELETE ON photos BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+    );
+    let before = e.rows();
+    assert!(matches!(e.run(&only), StageResult::Failed(_)));
+    assert_eq!(e.rows(), before);
+    assert_eq!(e.shared.mass_delete_board().current(), Some(hold));
+    assert_eq!(e.tmp_leftovers(), ["catalog-before-release.db"]);
+    // 直したあとの再実行で、前回の写しは今回の写しに置き換わる
+    e.sql("DROP TRIGGER block_delete");
+    e.sql("UPDATE photos SET favorite=0 WHERE drive_id='d2'");
+    e.done(&only);
+    assert_eq!(row_count(&e), 1);
+    assert_eq!(e.shared.mass_delete_board().current(), None);
+    let copy =
+        Connection::open_with_flags(backup_path(&e), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let favorite: i64 = copy
+        .query_row("SELECT favorite FROM photos WHERE drive_id='d2'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(favorite, 0);
+}
+
+#[test]
+fn the_flag_and_the_default_stage_never_make_a_copy_even_when_they_delete() {
+    // `No`: 閾値未満の削除は通るが、写しは作らない
+    let e = env("drive-release-nocopy-no");
+    seed_drive_rows(&e, 100);
+    list_first(&e, 80);
+    assert_eq!(get(&e.index(), "removed"), 20);
+    assert!(e.tmp_leftovers().is_empty());
+    // `Yes`: 全部消すが、写しは作らない
+    let e = env("drive-release-nocopy-yes");
+    seed_drive_rows(&e, 100);
+    list_first(&e, 1);
+    let allowing = IndexDrive::allowing_mass_delete(Arc::clone(&e.shared));
+    assert_eq!(get(&e.done(&allowing), "removed"), 99);
+    assert!(e.tmp_leftovers().is_empty());
+}
+
+#[test]
+fn a_dry_run_of_the_release_writes_neither_rows_nor_a_copy_nor_the_hold() {
+    let (e, hold, only) = held_env("drive-release-dry");
+    let before = e.rows();
+    let StageResult::Done(counts) = e.run_with(&only, Mode::DryRun, &StopFlag::new()) else {
+        panic!("完了のはず");
+    };
+    assert_eq!(get(&counts, "deleted"), 99);
+    assert_eq!(e.rows(), before);
+    assert!(e.tmp_leftovers().is_empty());
+    assert_eq!(e.shared.mass_delete_board().current(), Some(hold));
+}
+
+#[test]
+fn a_stop_signal_before_the_release_changes_nothing_and_keeps_the_hold() {
+    let (e, hold, only) = held_env("drive-release-stop");
+    let stop = StopFlag::new();
+    stop.stop();
+    let before = e.rows();
+    let result = e.run_with(&only, Mode::Apply, &stop);
+    assert!(matches!(result, StageResult::Skipped(_)), "{result:?}");
+    assert_eq!(e.rows(), before);
+    assert!(e.tmp_leftovers().is_empty());
+    assert_eq!(e.shared.mass_delete_board().current(), Some(hold));
+}

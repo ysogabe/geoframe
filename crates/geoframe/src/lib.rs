@@ -32,6 +32,7 @@ pub mod limits;
 pub mod local;
 pub mod logging;
 pub mod net;
+pub mod ops;
 pub mod photos;
 pub mod post;
 pub mod pyquery;

@@ -240,6 +240,18 @@ impl DataDir {
         Ok(dir.join(format!(".dl_{drive_id}")))
     }
 
+    /// 一時ファイルの置き場 `tmp/`（無ければ作る）。シンボリックリンクで外へ向けられていれば拒否する
+    /// （[`DataDir::download_tmp`] と同じ検査）。
+    pub fn tmp_dir(&self) -> Result<PathBuf, PathError> {
+        let dir = self.root.join("tmp");
+        fs::create_dir_all(&dir)?;
+        let real = fs::canonicalize(&dir)?;
+        if real != dir {
+            return Err(PathError::Escapes);
+        }
+        Ok(dir)
+    }
+
     /// 絶対パスを `DATA_DIR` からの相対パス（`/` 区切り）にする。外なら `None`。
     pub fn relative(&self, abs: &Path) -> Option<String> {
         let rel = abs.strip_prefix(&self.root).ok()?;
