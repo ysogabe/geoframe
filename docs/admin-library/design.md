@@ -1,6 +1,6 @@
 # 写真ライブラリと選別の確認（B） 設計
 
-作成日: 2026-11-01。状態: 下書き（レビュー前）。PRD: [prd.md](prd.md)。
+作成日: 2026-11-01。状態: 設計レビュー 2 回（Sol）・安全面レビュー 2 回（Opus）を反映済み。ユーザー承認待ち。PRD: [prd.md](prd.md)。
 
 ## 概要
 
@@ -55,8 +55,8 @@
 ### 画像の配信
 
 - `/derivatives/`・`/photos/` は `statics::serve_data`（`statics.rs:312-360`）。領域とファイルを `canonicalize` し、外に出る
-  リンクは 403、同時配信の枠が無ければ 503。`file_response`（`statics.rs:170`）が `Content-Type`・`Content-Length`・
-  `Last-Modified`・`ETag` と 304 を扱う。**`Cache-Control` は付かない**（`server.rs:617`）。
+  リンクは 403、同時配信の枠が無ければ 503。`file_response`（`statics.rs:170`、非公開）が `Content-Type`・`Content-Length`・
+  `Last-Modified` を付け、`If-Modified-Since` の 304 は `serve_data` 側。データ画像には ETag を渡していない（`etag: None`）。**`Cache-Control` は付かない**（`server.rs:617`）。
 - 表示用 derivative は長辺 `DERIV_PX = 2560`・品質 85（`imaging/derivative.rs:36-38`）。`make_derivative`（`:937`）→
   `render`（`:600`）→ `target_dims`（`:366`、公開）→ `resize`（`:392`、**非公開**、`fast_image_resize` CatmullRom）。
   ファイル名は `<drive_id>.jpg` / `<drive_id>.r<rotation>.jpg`（`:83-91`）。書き込みは `lock_derivatives()`（`:734`）で直列化。
@@ -155,7 +155,7 @@ flowchart LR
 
 | ファイル | 役割 |
 |---|---|
-| `crates/geoframe/src/thumb.rs`（新） | `/thumb/<id>.jpg` の経路。ID の検証、世代の計算、キャッシュの有無、生成（`spawn_blocking` ＋ `Semaphore(2)`）、`file_response` で返す |
+| `crates/geoframe/src/thumb.rs`（新） | `/thumb/<id>.jpg` の経路。ID と版の検証、世代の計算、キャッシュの有無、ID ごとのロックと生成の枠、`spawn_blocking` での生成、失敗の記憶、ETag と 304 |
 | `imaging/derivative.rs` | `pub fn make_thumbnail(src: &Path, long_edge: u32, limits: &DecodeLimits) -> Result<Vec<u8>, ImageError>` を足す（`render` は `MAX_INPUT_BYTES` を決め打ちしている（`derivative.rs:602`）ので、上限を引数で受ける形に分ける。全体を復号する前にファイルの大きさとヘッダの寸法で断る。`resize` を再利用。JPEG 品質 80、EXIF は持ち込まない。書き込みは呼び手が `write_atomic`） |
 | `admin_library.rs`（新） | `GET /api/admin/library/trips`・`/photos`・`/points`（あると良い: `/calendar`・`/places`）。`AdminContext` を再利用 |
 | `curation.rs`（新） | `photo_curation` の DDL（`TABLES` 定数）、`ensure_tables(conn)`（書き込み側の起動時）、`available(conn)`（`sqlite_master` を見る）、SQL 片 `CURATION_JOIN`・`EFFECTIVE_RECOMMENDED`・`QUALITY_VISIBLE_EFFECTIVE`、グループの状態の計算 |
