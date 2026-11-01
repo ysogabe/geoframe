@@ -1479,8 +1479,10 @@ mod tests {
             tx.commit().unwrap();
         }
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // 書き手が最初の更新を終えたことを知らせる（写しが書き手の起動より先に終わると、「更新され続ける」前提が崩れる）
+        let started = Arc::new(AtomicUsize::new(0));
         let writer = {
-            let (path, stop) = (path.clone(), Arc::clone(&stop));
+            let (path, stop, started) = (path.clone(), Arc::clone(&stop), Arc::clone(&started));
             std::thread::spawn(move || {
                 let conn = Connection::open(&path).unwrap();
                 conn.busy_timeout(Duration::from_secs(5)).unwrap();
@@ -1495,10 +1497,17 @@ mod tests {
                     )
                     .unwrap();
                     n += 1;
+                    started.store(1, Ordering::SeqCst);
                 }
                 n
             })
         };
+        for _ in 0..1000 {
+            if started.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let read = crate::db::open_read_only(&path).unwrap();
         let before: i64 = read
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
