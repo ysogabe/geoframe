@@ -538,6 +538,58 @@ await test('(f) 要対応のセルを押すと写真タブとそのチップが�
   assert.equal(env.$('#s-todo').children.length, 0);
 });
 
+await test('(f2) 状況タブの「未確認の選別」（db.quality.curation_pending）: 要対応と品質の欄に出て、押すと選別タブへ移る。無ければ出さない', async () => {
+  const withQuality = pending => {
+    const b = statusBody(FILTERS);
+    b.db.quality = {features: 5, pending: 0, analyzed: 4, recommended: 2, exact_suppressed: 1, similar_alternates: 1};
+    if(pending !== undefined) b.db.quality.curation_pending = pending;
+    return b;
+  };
+  const textOf = n => n.textContent;
+  // 件数があるとき: 要対応（押せる）と品質の欄（warn）に出る。既存の要対応 2 つはそのまま先に並ぶ
+  const env = makeEnv({pathname: '/admin'});
+  const orig = env.context.fetch;
+  env.context.fetch = (url, opts) => url === '/api/admin/status' ? reply(withQuality(12)) : orig(url, opts);
+  await env.boot();
+  const todo = env.$('#s-todo').children;
+  assert.equal(todo.length, 3);
+  assert.ok(textOf(todo[0]).includes('位置なし') && textOf(todo[1]).includes('AI候補あり'));
+  assert.equal(textOf(todo[2]), '未確認の選別12組');
+  assert.ok(todo[2].classList.contains('warn') && todo[2].classList.contains('todo'));
+  assert.equal(todo[2].getAttribute('role'), 'button');
+  const dbCell = env.$('#s-db').children.find(c => textOf(c).includes('未確認の選別'));
+  assert.equal(textOf(dbCell), '未確認の選別12組');
+  assert.ok(dbCell.classList.contains('warn'));
+  // キーボード（Enter）でも移れる。選別タブの JS（curation.js）が無くても、タブは切り替わる
+  const enter = {type: 'keydown', key: 'Enter'};
+  todo[2].dispatchEvent(enter);
+  await settle();
+  assert.deepEqual(activeTab(env), ['curation']);
+  assert.equal(hidden(env, '#v-curation'), false);
+  assert.equal(hidden(env, '#v-status'), true);
+  assert.equal(enter.defaultPrevented, true);
+  // 0 件は good。押しても移れる
+  const env0 = makeEnv({pathname: '/admin'});
+  const orig0 = env0.context.fetch;
+  env0.context.fetch = (url, opts) => url === '/api/admin/status' ? reply(withQuality(0)) : orig0(url, opts);
+  await env0.boot();
+  const zero = env0.$('#s-todo').children[2];
+  assert.equal(textOf(zero), '未確認の選別0組');
+  assert.ok(zero.classList.contains('good') && !zero.classList.contains('warn'));
+  zero.click();
+  await settle();
+  assert.deepEqual(activeTab(env0), ['curation']);
+  // curation_pending が無い応答（Python 版・古いサーバー・quality なし）では出さない
+  for(const body of [withQuality(undefined), statusBody(FILTERS)]){
+    const e = makeEnv({pathname: '/admin'});
+    const o = e.context.fetch;
+    e.context.fetch = (url, opts) => url === '/api/admin/status' ? reply(body) : o(url, opts);
+    await e.boot();
+    assert.equal(e.$('#s-todo').children.length, 2);
+    assert.ok(!e.$('#s-db').children.some(c => textOf(c).includes('未確認の選別')));
+  }
+});
+
 // ============ ここから: 検索・統一カード・ビューア・位置の保存 ============
 const openPhotos = async env => { env.$('.tab[data-tab=photos]').click(); await settle(); };
 const searchFor = async (env, q) => { env.$('#q').value = q; env.$('#search').click(); await settle(); };

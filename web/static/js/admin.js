@@ -245,13 +245,29 @@ function todoCells(filters){
     return c;
   });
 }
+/* 要対応: 未確認・再確認の選別グループの数（db.quality.curation_pending。Rust 版の管理 API だけが返す。無ければ出さない）。
+   押すと選別タブへ移る */
+function curationTodoCells(quality){
+  if(!quality || quality.curation_pending === undefined || quality.curation_pending === null) return [];
+  const n = Number(quality.curation_pending) || 0;
+  const c = cell('未確認の選別', n.toLocaleString('ja-JP'), '組', n ? 'warn' : 'good');
+  const go = () => showTab('curation');
+  c.classList.add('todo');
+  c.setAttribute('role', 'button');
+  c.setAttribute('tabindex', '0');
+  c.addEventListener('click', go);
+  c.addEventListener('keydown', e => {
+    if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); go(); }
+  });
+  return [c];
+}
 function loadStatus(){
   fetch('/api/admin/status').then(r => r.json()).then(d => {
     if(!d.ok) throw new Error(d.error || 'status error');
     $('#servertime').textContent = 'SERVER ' + d.server_time;
 
     const td = $('#s-todo'); td.textContent = '';
-    todoCells(d.db.filters).forEach(c => td.appendChild(c));
+    todoCells(d.db.filters).concat(curationTodoCells(d.db.quality)).forEach(c => td.appendChild(c));
 
     const sy = $('#s-sync'); sy.textContent = '';
     sy.appendChild(cell('表示可能', d.sync.ready, '枚', 'good'));
@@ -274,6 +290,10 @@ function loadStatus(){
       db.appendChild(cell('品質推奨', d.db.quality.recommended, '枚'));
       db.appendChild(cell('完全重複の表示抑止', d.db.quality.exact_suppressed, '枚'));
       db.appendChild(cell('類似alternate', d.db.quality.similar_alternates, '枚'));
+      if(d.db.quality.curation_pending !== undefined && d.db.quality.curation_pending !== null){
+        const pending = Number(d.db.quality.curation_pending) || 0;
+        db.appendChild(cell('未確認の選別', pending, '組', pending ? 'warn' : 'good'));
+      }
     }
     if(d.db.ai){
       db.appendChild(cell('AI embedding', d.db.ai.embedded + ' / ' + d.db.ai.eligible, '枚',
