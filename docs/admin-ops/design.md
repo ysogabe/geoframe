@@ -183,7 +183,7 @@ flowchart LR
   end
   subgraph server[geoframe serve]
     opsapi[admin_ops.rs GET /api/admin/ops・POST /api/admin/ops/*]
-    board[ops.rs Board（実行中・待ち・履歴）/ Queue（要求の受け口）]
+    board[ops.rs Board（実行中・待ち・履歴・採番。1 つの Mutex）]
     worker[sync.rs spawn_worker（定期サイクル＋要求）]
     index[drive/index.rs IndexDrive Allow::Only]
     quality[quality.rs scan]
@@ -195,7 +195,7 @@ flowchart LR
   ops -->|POST| opsapi
   opsapi -->|要求を入れる| board
   opsapi -->|retry / release_pause| aiops --> writer
-  board -->|起こす| worker
+  worker -->|100 ms ごとに待ちを見る| board
   worker --> index & quality --> writer
   index --> mdb
   worker -->|結果を書く| board
@@ -225,16 +225,17 @@ flowchart LR
 sequenceDiagram
   participant UI as 運用タブ
   participant API as admin_ops
-  participant Q as Queue/Board
+  participant Q as Board
   participant W as sync-worker
   UI->>API: POST /api/admin/ops/sync
-  API->>Q: enqueue(Request{sync}) → queued(id) / Busy
-  API-->>UI: 200 {request:{id, state:"queued"}} / 409 busy
-  W->>Q: wait_request_or_tick(next_cycle_at)
+  API->>Q: enqueue(Sync) → queued(id) / Busy / TooSoon
+  API-->>UI: 200 {request:{id, state:"queued"}} / 409 busy・too_soon
+  loop 100 ms ごと（stop.wait の前後）
+    W->>Q: take_queued()（待ち → 実行中を同じロックで）
+  end
   Q-->>W: Request
-  W->>Q: start(id)
-  W->>W: run_cycle(stages, ctx)
-  W->>Q: finish(id, CycleReport)
+  W->>W: run(req)（one_cycle と同じ隔離）
+  W->>Q: finish(id, outcome)
   UI->>API: GET /api/admin/ops（数秒ごと）
   API->>Q: snapshot()
   API-->>UI: {worker, hold, history}
@@ -305,7 +306,7 @@ Board {
 Record { id, kind, requested_at, started_at, finished_at, outcome, stages: Vec<StageJson>, report: Option<Report> }
 StageJson { name, result: "done"|"skipped"|"failed"|"panicked"|"not_run", reason: Option<&'static str>, counts: Map<&str,u64> }
 outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開けない・外側のパニック）| "skipped"（drive-release の段が省略）
-       | "exceeded"（drive-release で承認した集合に無い行が消えようとした）| "hold_changed"（実行直前に保留が違った）
+       | "exceeded"（drive-release で承認した集合に無い行が消えようとした、または取り直した一覧が空だった）| "hold_changed"（実行直前に保留が違った）
        | "retried"・"released"（AI 系。PR ②）
 report: Option<Report>  // enum Report { Retry(RetryReport), Release { released: usize } }。自由な Value にしない（Opus の指摘 10）
 ```
@@ -331,7 +332,7 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
                    "stages": [{"name": "index_local", "result": "done", "counts": {"indexed": 3}},
                               {"name": "index_drive", "result": "skipped", "reason": "Drive の鍵がありません"}]}
   },
-  "hold": {"held": 120, "reason": "ratio", "drive_rows": 500, "since": "…", "checked_at": "…", "token": "9f3a…"},
+  "hold": {"held": 120, "reason": "ratio", "drive_rows": 500, "since": "…", "checked_at": "…", "token": "9f3a…", "releasable": true},
   "ai": {"retry_kinds": ["photo_judge"]},
   "history": [ {"id": 12, "kind": "sync", "requested_at": "…", "started_at": "…", "finished_at": null, "outcome": null, "stages": []}, … ]
 }
@@ -349,9 +350,9 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
 
 | 経路 | 本文 | 成功 | 失敗 |
 |---|---|---|---|
-| `/api/admin/ops/sync` | `{}` | 200 `{ok, request:{id, kind:"sync", state:"queued"}}` | 409 `busy`・`too_soon`（前回の手動の同期の終了から 60 秒以内） |
+| `/api/admin/ops/sync` | `{}` | 200 `{ok, request:{id, kind:"sync", state:"queued"}}` | 409 `busy`・`too_soon`（Drive を読む要求の前回の終了から 60 秒以内） |
 | `/api/admin/ops/quality-scan` | `{}` | 同上 `kind:"quality_scan"` | 409 `busy` |
-| `/api/admin/ops/drive-release` | `{"token": "<16 hex>"}` | 同上 `kind:"drive_release"`、`approved: N` | 400 `bad_params`、409 `no_hold`・`hold_changed`・`not_releasable`・`busy` |
+| `/api/admin/ops/drive-release` | `{"token": "<16 hex>"}` | 同上 `kind:"drive_release"`、`approved: N` | 400 `bad_params`、409 `no_hold`・`hold_changed`・`not_releasable`・`busy`・`too_soon` |
 | `/api/admin/ops/ai-retry` | `{"target": "all"}` か `{"target": {"kind": "<JobKind>"}}` | 200 `{ok, report:{requeued, obsolete, satisfied, unsupported, policy_disabled}}` | 400 `bad_params`、500 |
 | `/api/admin/ops/ai-release-pause` | `{"target": "all"}` か `{"target": {"task": "<TaskKind>"}}` | 200 `{ok, released: n}` | 400 `bad_params`、409 `config_unavailable`、500 |
 
@@ -413,8 +414,8 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
   （`photo_ai_features`・`photo_ai_group_members`・`photo_loc_*`・`ai_*`。読む側が `photos` と結合するので効かない）。
   サムネイル（`thumbs/`）は要求時に作る物なので残っても害は無い。確認の段にこの範囲を書く（R6）。
 - **情報の漏れ**: 応答に段の失敗の文面・パス・モデル名・接続先を出さない（方針 6）。アクセスログは既存の `labeled` でテンプレートだけ。
-- **資源**: 要求は 1 つだけ待てる（溢れは 409）。手動の同期は前回の手動の同期の終了から 60 秒は 409 `too_soon`（Drive と地理院を
-  叩き続けない）。AI の操作は同時に 1 つ（`ai_ops_lock`）。GET は DB を読まず `Board` の `Mutex` を短く持つ（スナップショットの
+- **資源**: 要求は 1 つだけ待てる（溢れは 409）。Drive を読む要求（同期・保留の解除）は前回の終了から 60 秒は 409 `too_soon`
+  （Drive と地理院を叩き続けない）。AI の操作は同時に 1 つ（`ai_ops_lock`）。GET は DB を読まず `Board` の `Mutex` を短く持つ（スナップショットの
   複製）。3 秒の読み直しはタブ表示中だけ。`quality::scan` は長く走りうるが、既存の `quality` の段と同じ解析で、停止の合図で止まる。
 - **停止**: 停止は `stop.wait` の `Condvar` で即座に起きる（今までと同じ）。実行中の段は既存どおり「今の段が終わるまで」。
   停止の合図のあとの要求は 503。
