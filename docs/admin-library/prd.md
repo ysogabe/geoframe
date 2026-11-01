@@ -59,7 +59,8 @@
 - R2（必須）: サムネイルの URL は版（元の写真の世代）を含む形で API が返し、ブラウザが長く（1 日以上）キャッシュして
   よい。`/derivatives/` と `/photos/` の配信とヘッダは変えない。
 - R3（必須）: 作れないとき（表示用画像が無い・読めない・`thumbs/` に書けない）は 404 か、元の表示用画像をそのまま返す
-  （サーバーが選び、画面は壊れない）。同時に作る数に上限を設け、超えたぶんは待つ。
+  （サーバーが選び、画面は壊れない）。同時に作る数に上限を設け、超えたぶんは待つ。一度失敗した写真（同じ世代）は
+  起動中は作り直さず、すぐに代わりを返す。
 - R4（あると良い）: 「写真」タブのカードの画像もサムネイルにする（カードの見た目と試験は変えない）。
 
 ### ライブラリ（G3）
@@ -89,7 +90,9 @@
 - R13（必須）: 各段で次の操作ができる。
   - 「この写真を代表にする」: 1 枚以上を選んで確定する。確定後、そのグループの `quality_recommended` は人が選んだ
     写真だけが `true` になる（解析の推奨は使わない）。グループは確認済みになる。
-  - 「このままで確認済み」: 解析の推奨を変えずに確認済みにする。
+  - 「このままで確認済み」: 今の推奨（人の代表があればそれ、無ければ解析の推奨）を変えずに確認済みにする。
+  - 代表に選べるのは、フィードに出せる写真（除外でなく、位置がある）だけ。選べない写真はサーバーが 400 で断り、画面でも
+    選択肢にしない（今の解析の推奨も同じ穴を持つが、人が選ぶ場面では防ぐ）。
   - 「取り消す」: 人の記録を消し、解析の推奨に戻す。グループは未確認に戻る。
 - R14（必須）: 人の記録は専用の表に写真ごとに持ち、`quality-scan` の再構築（`photo_quality` の全行の入れ替え、
   `group_id` の振り直し）で消えない。記録には写真の世代（内容のハッシュ）を付け、写真が変わった（回転・原本の更新）
@@ -101,8 +104,10 @@
 - R17（必須）: `GET /api/v1/photos` の `quality_recommended` と、exact グループの推奨外を落とす条件は、人の選択を
   反映した推奨で決める。それ以外の項目・並び・除外条件は変えない。
 - R18（あると良い）: 状況タブに「未確認・再確認のグループ数」を出し、押すと選別タブに移る。
-- R19（必須）: [写真フィードの契約](../architecture/photo-feed-contract.md) の `quality_recommended` の説明に
-  「管理画面で人が代表に選んだ写真があるグループでは、その写真だけが `true`」を書き足す。Schema と miharashi は変えない。
+- R19（必須）: [写真フィードの契約](../architecture/photo-feed-contract.md) と `photo-feed.schema.json` の
+  `quality_recommended` の説明文に「管理画面で人が代表に選んだ写真があるグループでは、その写真だけが `true`」を書き足す。
+  型・必須の項目・miharashi は変えない。状況タブの `db.quality` の `recommended`・`exact_suppressed` も人の選択を反映した
+  値にする（人の記録が無ければ今と同じ値）。
 
 ### 安全・互換
 
@@ -124,8 +129,8 @@
   320px 以下、`thumbs/` にファイルができる。2 回目は同じ ETag。表示用画像を差し替える（`display`・`mtime` を変える）と
   版が変わりサムネイルが作り直される。表示用画像の無い写真は 404、数字でない ID・`..` を含むパスは 404 か 403。
   `/derivatives/<id>.jpg` の応答ヘッダは変わらない（既存の試験）。
-- AC2（R5, R6, R8）: 結合試験で `GET /api/admin/library/trips` が、合成 DB（時刻差 10 分・1 時間 30 分・8 時間・9 日の写真を
-  含む）を 48 時間超の間隔で区切り、フィードの `trip` と同じ境界になる。描画試験で旅の一覧に期間・枚数・位置なし・
+- AC2（R5, R6, R8）: 結合試験で `GET /api/admin/library/trips` が、合成 DB の写真（時刻差 10 分・1 時間 30 分・8 時間・
+  9 日・ちょうど 48 時間）を、48 時間超の空きだけで区切る（ちょうど 48 時間は同じ旅、位置なしの写真も数える）。描画試験で旅の一覧に期間・枚数・位置なし・
   場所・表紙が描かれ、旅を押すと格子が出て、格子の写真を押すとビューアが開き、ビューアの ★ で `POST /api/admin/setflag`
   が呼ばれ格子のタイルが更新される。
 - AC3（R7）: 結合試験で `GET /api/admin/library/points` が位置のある写真だけを GeoJSON で返し、`from`/`to` で絞れ、
@@ -134,13 +139,16 @@
 - AC4（R12, R13, R14）: 結合試験で、exact 1 組・similar 2 組の合成 DB に対し `GET /api/admin/curation/groups` が 3 組を
   返し、`POST /api/admin/curation/confirm` で代表を変えると、(i) 応答と次の `groups` で人の代表と状態 `confirmed` が
   出る、(ii) `GET /api/v1/photos` の `quality_recommended` がその写真だけ `true` になり、exact グループでは選んだ写真だけが
-  一覧に出る、(iii) `photo_quality` を全削除して解析結果を入れ直しても（`group_id` を変えても）(i)(ii) が保たれる。
-  「このままで確認済み」は推奨を変えずに `confirmed`、「取り消す」で解析の推奨と `unconfirmed` に戻る。
+  一覧に出る、(iii) `photo_quality` を全削除して解析結果を入れ直しても（`group_id` を変えても）(i)(ii) が保たれる、
+  (iv) `GET /api/admin/status` の `db.quality.recommended` が (ii) と同じ数になる。
+  「このままで確認済み」は推奨を変えずに `confirmed`（人の代表がある組ではその代表のまま）、「取り消す」で解析の推奨と
+  `unconfirmed` に戻る。除外か位置なしの写真を代表にする `confirm` は 400 `representative_not_visible` で何も書かない。
 - AC5（R15, R16）: 結合試験で、確認済みのグループに写真を 1 枚足すと状態が `recheck` になり `state=unconfirmed` の
   絞り込みに出る。メンバーの `mtime` を変えると（世代が合わない）同様。メンバーの集合が違う `confirm` は 409
   `group_changed` で何も書かない。
 - AC6（R17, R19）: フィードの契約の試験（`photo_feed_contract.rs` ほか）が、人の記録が無いときは変更なしで通る。
-  契約の文書の `quality_recommended` の説明が更新され、`photo-feed.schema.json` に差分が無い。
+  契約の文書と `photo-feed.schema.json` の `quality_recommended` の説明文が更新され、Schema の差分が `description` だけ
+  （`type`・`required` に差分が無い）。
 - AC7（R20, R21, R23）: 結合試験で、`curation/confirm` は Content-Type や Origin が合わないと 403、`INGEST=0` で 503、
   64 KiB 超で 413 相当の既存の応答。`INGEST=0` かつ `photo_curation` 表の無い DB で `/api/v1/photos`・
   `/api/admin/curation/groups`・`/api/admin/library/*` が 200。新しい GET に POST・HEAD すると既存の決まりどおり

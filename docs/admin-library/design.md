@@ -113,7 +113,8 @@
    カード（`cardFor`）はライブラリでは使わず、軽いタイル（サムネイルだけ）にする。
    - 選ばなかった案: ライブラリ用のビューアを別に作る（★・除外・前後・キー操作が二重になる）。
 6. **旅はサーバーで区切る。** フィードの `assign_trips` と同じ規則（48 時間超）を、除外や位置なしを含む全写真に当てる。
-   旅の識別子は先頭の写真の撮影日時（`YYYY-MM-DD HH:MM`）にする（番号は写真が増えるとずれる）。
+   旅の識別子は先頭の写真の撮影日時（`YYYY-MM-DD HH:MM`）にする（番号は写真が増えるとずれる）。対象の写真が違うので、
+   フィードの `trip` とは境界が違ってよい（位置なしの写真が間にあると、ライブラリでは 1 つの旅につながる）。意図した差。
 7. 地図の点は **1 回の GET で GeoJSON を返し、クラスタは MapLibre に任せる**（6,500 点なら 1 点 20 バイト程度）。
    上限（20,000 点）を超えたら新しい順に切って `truncated: true`。
 
@@ -241,8 +242,10 @@ cs = {
 - 処理: (1) DB で `display`・`drive_id`・`md5`・`mtime` を引く（`thumb_for` と同じ規則で元ファイルを決める。無ければ 404）。
   (2) `thumbs/<id>-<gen>.jpg` があれば `file_response`。(3) 無ければ `Semaphore(2)` を取り（待つ）、取った後にもう一度 (2)。
   `spawn_blocking` で `make_thumbnail(元, tmp/thumb-<id>-<gen>.jpg, 320)` → rename。同じ `<id>-` で始まる古いファイルを消す。
-  (4) 生成に失敗（読めない画像・`thumbs/` に書けない）したら、元の表示用画像を `file_response` で返す（`Cache-Control` は
-  `no-store`）。ログは 1 行（WARN、ID と理由だけ。パスは出さない）。
+  (4) 生成に失敗（読めない画像・`thumbs/` に書けない）したら、元の表示用画像を `file_response` で返す（`Content-Type` は
+  拡張子から。`Cache-Control` は `no-store`）。失敗した `<id>-<gen>` は `AppState` の `thumb_failed: Mutex<HashSet<String>>`
+  に覚え、起動中は Semaphore を取らずにすぐ代わりを返す（壊れた画像が 2 つの枠を塞ぎ続けないため）。ログは失敗の初回に
+  1 行（WARN、ID と理由だけ。パスは出さない）。
 - 応答ヘッダ: `Content-Type: image/jpeg`、`ETag`・`Last-Modified`（`file_response` のまま）、
   `Cache-Control: private, max-age=604800`（URL に世代があるので長くてよい）。
 - 元ファイルの検査は `serve_data` と同じ（`canonicalize` してデータディレクトリの中であること）。パスは DB の `display` と
@@ -353,7 +356,11 @@ CASE WHEN q.group_id IS NULL THEN 0
 ### `POST /api/admin/curation/confirm`（新。PR ③）
 
 - 本文: `{"photo_ids": [int…], "representatives": [int…] | null}`。`photo_ids` は 2〜200 件、重複なし。`representatives` は
-  `photo_ids` の部分集合で 1 件以上、または `null`（解析の推奨のまま確認済み）。
+  `photo_ids` の部分集合で 1 件以上、または `null`（人の代表を持たず、解析の推奨のまま確認済み）。
+  画面の「このままで確認済み」は、段に有効な人の代表があればそれを `representatives` に入れて送る（黙って解析の推奨に
+  戻さない）。
+- 代表の検査: `representatives` の各写真は `hidden=0` かつ `lat`・`lon` がある（フィードに出せる）こと。違えば 400
+  `{"ok": false, "error": "representative_not_visible"}`。画面は除外・位置なしのメンバーのチェックボックスを無効にする。
 - 検査（1 トランザクション、`writer`）: `photo_ids` の全部が世代の合う `photo_quality` に居て、同じ `(group_kind, group_id)`
   で、そのグループのメンバーが `photo_ids` と過不足なく一致する。違えば 409 `{"ok": false, "error": "group_changed"}`。
 - 書き込み: `DELETE FROM photo_curation WHERE photo_id IN (…)` → 各メンバーに `role`（代表なら `representative`、他は
@@ -365,15 +372,20 @@ CASE WHEN q.group_id IS NULL THEN 0
 
 - 本文: `{"photo_ids": [int…]}`（同じ検査）。`DELETE` だけ。応答は `confirm` と同じ。
 
-### `GET /api/admin/status` の追加（あると良い R18。PR ③）
+### `GET /api/admin/status` の変更（PR ③）
 
-- `db.quality.curation_pending`: 状態が `unconfirmed`・`recheck` のグループ数。`tests/admin_api.rs` の `python_shape` で除く。
+- `db.quality.recommended`・`exact_suppressed`・`similar_alternates`（`quality_summary`、`admin.rs:335`）を
+  `EFFECTIVE_RECOMMENDED` で数える（R19）。人の記録が無い Python のフィクスチャでは値が変わらないので `admin_api.rs` は通る。
+- `db.quality.curation_pending`（あると良い R18）: 状態が `unconfirmed`・`recheck` のグループ数。`python_shape` で除く。
 
 ### `GET /api/v1/photos`（PR ③。項目は不変）
 
 - `quality_recommended` と `quality_role`、exact の除外条件を `EFFECTIVE_RECOMMENDED` で計算する。人の記録が無い DB では
-  値も不変。契約の文書の `quality_recommended` の行に「管理画面で人が代表に選んだ写真があるグループでは、その写真だけが
-  `true`（解析の推奨は使わない）」を足す。`photo-feed.schema.json` は変えない。
+  値も不変。契約の文書と `photo-feed.schema.json`（`description` だけ）の `quality_recommended` に「管理画面で人が代表に
+  選んだ写真があるグループでは、その写真だけが `true`（解析の推奨は使わない）」を足す。型・`required` は変えない。
+- 人の代表は `confirm` で「出せる写真」に限っているが、確定後に除外・位置の削除で出せなくなることはある。そのときは
+  解析の推奨と同じく、exact グループが一覧から消える（今の挙動と同じ穴。選別タブで `recheck` にはならないので、
+  リスクの表に書く）。
 
 ## データ
 
@@ -420,6 +432,7 @@ CASE WHEN q.group_id IS NULL THEN 0
 | リスク | 対策 |
 |---|---|
 | 人の代表が `similar` グループで 1 枚だけになり、解析の「上位 2 枚」より miharashi に出る枚数が減る | 意図した挙動として文書に書く。複数選べるので必要なら 2 枚選ぶ |
+| 確定後に代表を除外した・位置を外したため、exact グループがフィードから消える | 解析の推奨と同じ既存の穴。選別タブの段に「代表が出せない」の警告を出す（`groups` の応答で `effective` かつ `hidden`/位置なしのメンバーがあれば `warning: "representative_not_visible"`） |
 | 回転・原本の更新で記録が無効になり、確認し直しになる | `recheck` として目に見える形で戻す（黙って消さない）。`stale` の印で理由が分かる |
 | `quality-scan` の再構築中（`DELETE` と INSERT の間）に `groups` を読む | 再構築は 1 トランザクションなので途中は見えない（`quality.rs:345-`）。`confirm` は writer のトランザクションで検査するので競合しても 409 になるだけ |
 | サムネイルの初回生成で一覧が遅い | `loading=lazy` と同時 2 つの生成。60 枚/ページ。必要なら後で同期の段に前もって作る処理を足す（C） |
