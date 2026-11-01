@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod admin_config;
+pub mod admin_curation;
 pub mod admin_library;
 pub mod ai;
 pub mod backoff;

@@ -114,24 +114,73 @@ pub(crate) fn has_valid_representative(p: &str) -> String {
     )
 }
 
+/// メンバーの人の記録の見え方（`'representative'`・`'reviewed'`・`'stale'`・`'none'`）の式。`c` は [`join`] の別名（有効な
+/// 記録だけ）。有効な記録が無くても `photo_curation` に行があれば世代が合わない記録なので `'stale'`。
+/// 表の外側の別名 `x` は固定なので、呼び手の別名と重ならないこと。
+pub(crate) fn record_case(q: &str, c: &str) -> String {
+    format!(
+        "CASE WHEN {c}.photo_id IS NOT NULL THEN {c}.role
+       WHEN EXISTS (SELECT 1 FROM photo_curation x WHERE x.photo_id={q}.photo_id) THEN 'stale'
+       ELSE 'none' END"
+    )
+}
+
+/// 選別のグループのメンバー（`photos` の別名 `p` と世代の合う `photo_quality` の行 `q`。表があれば有効な記録 `c`）。
+/// `groups`・`confirm`・`reset` の読み取りと、状況タブの [`pending_groups`] が同じ定義から数える。
+/// 表が無ければ（`curation` が偽）`photo_curation` を一切書かない。
+pub(crate) fn members_from(curation: bool) -> String {
+    let base = "FROM photo_quality q JOIN photos p
+       ON p.id=q.photo_id AND p.display=q.display
+      AND p.md5 IS q.source_md5 AND p.mtime IS q.source_mtime";
+    if curation {
+        format!("{base}\n       {}", join("q", "c"))
+    } else {
+        base.to_string()
+    }
+}
+
+/// メンバーの [`Record`] を返す SQL の式（`q`・`c` は [`members_from`] の別名）。表が無ければ記録は無い。
+pub(crate) fn member_record(curation: bool) -> String {
+    if curation {
+        record_case("q", "c")
+    } else {
+        "'none'".to_string()
+    }
+}
+
+/// `GROUP BY q.group_kind, q.group_id` の `HAVING` に足す、グループが確認済みでない（未確認か再確認。
+/// 有効な記録の無いメンバーがいる）条件。表が無ければすべてのグループが未確認。
+pub(crate) fn not_confirmed(curation: bool) -> &'static str {
+    if curation {
+        "SUM(c.photo_id IS NULL)>0"
+    } else {
+        "1"
+    }
+}
+
+/// [`not_confirmed`] の否定（全メンバーに有効な記録がある）。
+pub(crate) fn all_confirmed(curation: bool) -> &'static str {
+    if curation {
+        "SUM(c.photo_id IS NULL)=0"
+    } else {
+        "0"
+    }
+}
+
 /// 状態が未確認・再確認のグループの数（`unconfirmed` + `recheck`。確認済みでないもの全部）。グループは世代の合う
 /// `photo_quality` の行が 2 枚以上のもので、`confirmed` は「全メンバーに有効な記録がある」だけ。
-/// 表が無ければ、すべてのグループが未確認。
+/// 表が無ければ、すべてのグループが未確認。`GET /api/admin/curation/groups?state=unconfirmed` の `total` と
+/// 同じ [`members_from`]・[`not_confirmed`] から数える。
 pub fn pending_groups(conn: &Connection) -> rusqlite::Result<i64> {
-    let (curation_join, missing) = if available(conn)? {
-        (join("q", "c"), "SUM(c.photo_id IS NULL)>0")
-    } else {
-        (String::new(), "1")
-    };
+    let curation = available(conn)?;
     conn.query_row(
         &format!(
             "SELECT COUNT(*) FROM (
-               SELECT 1 FROM photo_quality q JOIN photos p
-                 ON p.id=q.photo_id AND p.display=q.display
-                AND p.md5 IS q.source_md5 AND p.mtime IS q.source_mtime
-               {curation_join}
+               SELECT 1 {from}
               GROUP BY q.group_kind, q.group_id
-             HAVING COUNT(*)>=2 AND {missing})"
+             HAVING COUNT(*)>=2 AND {missing})",
+            from = members_from(curation),
+            missing = not_confirmed(curation)
         ),
         [],
         |row| row.get(0),
