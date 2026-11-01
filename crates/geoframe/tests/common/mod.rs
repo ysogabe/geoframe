@@ -237,6 +237,22 @@ pub fn build_library_catalog(dir: &Path, then: &str) -> (PathBuf, rusqlite::Conn
     build_empty_catalog(dir, &format!("{}\n{then}", library_catalog_sql()))
 }
 
+/// 選別の試験の合成データ（`photos` と `photo_quality` の行だけ。スキーマは `photo-feed-catalog.sql`）。
+pub fn curation_catalog_sql() -> String {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/curation-catalog.sql");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+}
+
+/// `dir/catalog.db` にスキーマだけの合成DBを作り、選別のフィクスチャの行を入れる。`photo_curation` は
+/// 書き込み側の起動時と同じ `curation::ensure_tables` で作る（空）。`then` は続けて流すSQL。戻り値の接続は書き込み用。
+pub fn build_curation_catalog(dir: &Path, then: &str) -> (PathBuf, rusqlite::Connection) {
+    let (path, mut conn) = build_empty_catalog(dir, &curation_catalog_sql());
+    geoframe::curation::ensure_tables(&mut conn).unwrap();
+    conn.execute_batch(then).unwrap();
+    (path, conn)
+}
+
 pub fn app_state(catalog: Catalog) -> AppState {
     let config = Config::load(|_| None, &Overrides::default()).unwrap();
     test_state(Arc::new(config), catalog)

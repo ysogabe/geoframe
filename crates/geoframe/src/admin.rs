@@ -333,14 +333,28 @@ fn infer_buckets(conn: &Connection, windows_s: &[f64]) -> rusqlite::Result<Map<S
 }
 
 fn quality_summary(conn: &Connection) -> rusqlite::Result<Map<String, Value>> {
+    // 人が代表に選んだ写真があるグループは、その写真だけを推奨として数える（表が無ければ解析の推奨のまま）
+    let curation = crate::curation::available(conn)?;
+    let (join, effective) = if curation {
+        (
+            crate::curation::join("q", "c"),
+            crate::curation::effective_recommended("q", "c"),
+        )
+    } else {
+        (String::new(), "q.recommended".to_string())
+    };
     let (analyzed, recommended, exact_suppressed, similar_alternates) = conn.query_row(
-        "SELECT COUNT(*) analyzed,
-                COALESCE(SUM(q.recommended),0) recommended,
-                COALESCE(SUM(q.group_kind='exact' AND q.recommended=0),0) exact_suppressed,
-                COALESCE(SUM(q.group_kind='similar' AND q.recommended=0),0) similar_alternates
-           FROM photo_quality q JOIN photos p
-             ON p.id=q.photo_id AND p.display=q.display
-            AND p.md5 IS q.source_md5 AND p.mtime IS q.source_mtime",
+        &format!(
+            "SELECT COUNT(*) analyzed,
+                COALESCE(SUM(rec),0) recommended,
+                COALESCE(SUM(kind='exact' AND rec=0),0) exact_suppressed,
+                COALESCE(SUM(kind='similar' AND rec=0),0) similar_alternates
+           FROM (SELECT q.group_kind AS kind, {effective} AS rec
+                   FROM photo_quality q JOIN photos p
+                     ON p.id=q.photo_id AND p.display=q.display
+                    AND p.md5 IS q.source_md5 AND p.mtime IS q.source_mtime
+                   {join})"
+        ),
         [],
         |row| {
             Ok((
@@ -356,6 +370,11 @@ fn quality_summary(conn: &Connection) -> rusqlite::Result<Map<String, Value>> {
     out.insert("recommended".into(), recommended.into());
     out.insert("exact_suppressed".into(), exact_suppressed.into());
     out.insert("similar_alternates".into(), similar_alternates.into());
+    // 未確認・再確認の選別のグループ数（R18。Python には無い項目）
+    out.insert(
+        "curation_pending".into(),
+        crate::curation::pending_groups(conn)?.into(),
+    );
     Ok(out)
 }
 
