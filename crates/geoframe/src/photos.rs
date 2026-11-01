@@ -51,7 +51,7 @@ const AI_COLUMNS: &str = "aig.group_id AS ai_group, aig.status AS ai_status,
   aig.same_scene AS ai_same_scene, aim.rank_in_group AS ai_rank,
   aim.recommended AS ai_recommended, aim.local_score AS ai_local_score";
 /// 旅を区切る間隔。これを**超える**空きで次の旅になる（ちょうど48時間は同じ旅）。
-const TRIP_GAP_SECONDS: i64 = 48 * 3600;
+pub(crate) const TRIP_GAP_SECONDS: i64 = 48 * 3600;
 
 /// 一覧に出す写真を、出す順に返す（旅番号つき）。`Catalog::read` の中で呼ぶ。
 pub fn list_photos(conn: &Connection) -> rusqlite::Result<Vec<Photo>> {

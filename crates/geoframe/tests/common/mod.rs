@@ -225,6 +225,18 @@ pub fn build_empty_catalog(dir: &Path, rows: &str) -> (PathBuf, rusqlite::Connec
     )
 }
 
+/// ライブラリ API の合成データ（`photos` の行だけ。スキーマは `photo-feed-catalog.sql`）。
+pub fn library_catalog_sql() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/library-catalog.sql");
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"))
+}
+
+/// `dir/catalog.db` にスキーマだけの合成DBを作り、ライブラリ API のフィクスチャの行と `then` のSQLを流す。
+/// 戻り値の接続は書き込み用。
+pub fn build_library_catalog(dir: &Path, then: &str) -> (PathBuf, rusqlite::Connection) {
+    build_empty_catalog(dir, &format!("{}\n{then}", library_catalog_sql()))
+}
+
 pub fn app_state(catalog: Catalog) -> AppState {
     let config = Config::load(|_| None, &Overrides::default()).unwrap();
     test_state(Arc::new(config), catalog)
