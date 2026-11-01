@@ -672,6 +672,8 @@ fn not_yet_implemented(label: &'static str) -> Response {
 ///
 /// 0. `GET` の `/api/admin/config`（管理画面の設定タブ）は**完全一致**の読み取り API（[`crate::admin_config`]）。
 ///    HEAD・`/api/admin/configX`・末尾 `/` は当たらず、下の静的配信の判定で 403。
+///    `GET` の `/api/admin/library/{trips,photos,points,calendar,places}`（ライブラリ）も**完全一致**の読み取り API
+///    （[`crate::admin_library`]）。HEAD・似た名前・末尾 `/` は 403。
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
 ///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
@@ -746,6 +748,38 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
             return labeled(
                 crate::admin_config::response(&state).await,
                 "/api/admin/config",
+            );
+        }
+        // ライブラリの読み取り API（`crate::admin_library`）。これも完全一致（`/api/admin/library/tripsX` や末尾 `/` は
+        // 静的配信の判定に回って 403）
+        if path == "/api/admin/library/trips" {
+            return labeled(
+                crate::admin_library::trips(&state, parts.uri.query()).await,
+                "/api/admin/library/trips",
+            );
+        }
+        if path == "/api/admin/library/photos" {
+            return labeled(
+                crate::admin_library::photos(&state, parts.uri.query()).await,
+                "/api/admin/library/photos",
+            );
+        }
+        if path == "/api/admin/library/calendar" {
+            return labeled(
+                crate::admin_library::calendar(&state, parts.uri.query()).await,
+                "/api/admin/library/calendar",
+            );
+        }
+        if path == "/api/admin/library/places" {
+            return labeled(
+                crate::admin_library::places(&state, parts.uri.query()).await,
+                "/api/admin/library/places",
+            );
+        }
+        if path == "/api/admin/library/points" {
+            return labeled(
+                crate::admin_library::points(&state, parts.uri.query()).await,
+                "/api/admin/library/points",
             );
         }
         if path.starts_with("/api/admin/status") {

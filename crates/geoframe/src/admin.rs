@@ -147,7 +147,7 @@ fn conversion_error(message: &'static str) -> rusqlite::Error {
 }
 
 /// SQLite の値をそのまま JSON にする（Python は列の型のまま JSON にする）。BLOB は想定外。
-fn cell(value: ValueRef<'_>) -> rusqlite::Result<Value> {
+pub(crate) fn cell(value: ValueRef<'_>) -> rusqlite::Result<Value> {
     Ok(match value {
         ValueRef::Null => Value::Null,
         ValueRef::Integer(i) => Value::from(i),
@@ -158,7 +158,7 @@ fn cell(value: ValueRef<'_>) -> rusqlite::Result<Value> {
 }
 
 /// Python の `bool(値)`: NULL・0・0.0・空の文字列は偽。
-fn truthy(value: ValueRef<'_>) -> bool {
+pub(crate) fn truthy(value: ValueRef<'_>) -> bool {
     match value {
         ValueRef::Null => false,
         ValueRef::Integer(v) => v != 0,
@@ -826,7 +826,11 @@ pub struct PhotosPage {
 
 /// 一覧用サムネイルの URL（現行の `_thumb_for`）。表示ファイルがあればそれ、無くても過去に作った
 /// derivative が残っていれば拾う。Drive へ取りに行くことはしない。
-fn thumb_for(ctx: &AdminContext, display: Option<&str>, drive_id: Option<&str>) -> String {
+pub(crate) fn thumb_for(
+    ctx: &AdminContext,
+    display: Option<&str>,
+    drive_id: Option<&str>,
+) -> String {
     if let Some(display) = display.filter(|d| !d.is_empty()) {
         return format!("/{display}");
     }
@@ -1039,7 +1043,7 @@ fn decorate_with(
     Ok(())
 }
 
-fn text(row: &Row<'_>, index: usize) -> rusqlite::Result<String> {
+pub(crate) fn text(row: &Row<'_>, index: usize) -> rusqlite::Result<String> {
     Ok(row.get::<_, Option<String>>(index)?.unwrap_or_default())
 }
 

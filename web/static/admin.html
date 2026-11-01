@@ -11,9 +11,11 @@
   - geoframe serve（Rust）が / と /admin（旅行ブログが無効のときは /blog-admin も）にこの HTML を返す。
     アセットは絶対パスで参照する
   - 認証なし（家庭内LAN前提）。更新系 POST は Content-Type と Origin で保護する（crates/geoframe/src/csrf.rs）
-  - タブは「状況」「写真」「設定」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
+  - タブは「状況」「写真」「ライブラリ」「設定」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
     （件数は GET /api/admin/status の db.filters）つきのカードの一覧。一覧と検索結果のカードは同じ 1 種類。
     /ai-search も同じ HTML を返す（写真タブを検索欄にフォーカスして開く。別ページは無い）
+  - ライブラリタブは写真を旅（新しい順）と地図で眺める。旅 → サムネイルの格子 → 写真タブと同じビューア。
+    地図は位置のある写真の点をクラスタで出し、点を押すと吹き出し、「この範囲の写真を見る」で格子へ（library.js）
   - 設定タブは読み取り専用。起動時に読んだ設定の全項目を GET /api/admin/config から、タブを開くたびに読んで表にする
     （案内文・凡例・表の中身は config.js が描く）
   ============================================================
@@ -34,6 +36,7 @@
   <nav>
     <button class="tab on" data-tab="status">▸ 状況</button>
     <button class="tab" data-tab="photos">▸ 写真</button>
+    <button class="tab" data-tab="library">▸ ライブラリ</button>
     <button class="tab" data-tab="config">▸ 設定</button>
   </nav>
 </header>
@@ -95,6 +98,46 @@
     <div id="cards"></div>
     <div id="groups" class="hidden" aria-live="polite"></div>
     <div class="empty hidden" id="empty">該当する写真がありません</div>
+  </section>
+
+  <!-- ==== LIBRARY（旅・地図・サムネイルの格子。GET /api/admin/library/*。中身は library.js が描く） ==== -->
+  <section id="v-library" class="hidden">
+    <div class="toolbar lib-bar">
+      <button class="lib-seg on" id="lib-view-trips" type="button" data-view="trips">旅</button>
+      <button class="lib-seg" id="lib-view-calendar" type="button" data-view="calendar">日付</button>
+      <button class="lib-seg" id="lib-view-places" type="button" data-view="places">場所</button>
+      <button class="lib-seg" id="lib-view-map" type="button" data-view="map">地図</button>
+      <label class="opt"><input type="checkbox" id="lib-hidden"> 除外も含める</label>
+      <span class="spacer"></span>
+      <span class="count" id="lib-note"></span>
+    </div>
+    <div id="lib-trips"></div>
+    <div id="lib-calendar" class="hidden"></div>
+    <div id="lib-places" class="hidden"></div>
+    <div id="lib-map-box" class="hidden">
+      <div class="toolbar">
+        <button class="btn" id="lib-bbox" type="button">この範囲の写真を見る</button>
+        <span class="lib-period hidden" id="lib-period">
+          <span id="lib-period-text"></span>
+          <button class="btn" id="lib-period-clear" type="button">期間を解除</button>
+        </span>
+        <span class="spacer"></span>
+        <span class="count" id="lib-map-note"></span>
+      </div>
+      <div id="lib-map"></div>
+    </div>
+    <div id="lib-grid-box" class="hidden">
+      <div class="toolbar">
+        <button class="btn" id="lib-back" type="button">◀ 戻る</button>
+        <span class="lib-sel" id="lib-sel"></span>
+        <span class="spacer"></span>
+        <button class="btn" id="lib-prev" type="button">◀ PREV</button>
+        <span class="count" id="lib-pageinfo">--</span>
+        <button class="btn" id="lib-next" type="button">NEXT ▶</button>
+      </div>
+      <div id="lib-grid"></div>
+      <div class="empty hidden" id="lib-empty">該当する写真がありません</div>
+    </div>
   </section>
 
   <!-- ==== CONFIG（読み取り専用。GET /api/admin/config。案内・凡例・表は config.js が描く） ==== -->
@@ -166,6 +209,7 @@
     <button id="viewer-prev" class="ps-viewer-nav ps-viewer-prev" type="button" aria-label="前の写真">‹</button>
     <div id="viewer-media" class="ps-viewer-media">
       <img id="viewer-image" alt="">
+      <div id="viewer-noimage" class="img-broken hidden"></div>
       <div id="viewer-image-score" class="ps-viewer-imgscore"></div>
       <div class="ps-swipe-hint">SWIPE / ← →</div>
     </div>
@@ -208,6 +252,7 @@
 
 <script src="/static/js/admin.js"></script>
 <script src="/static/js/photos.js"></script>
+<script src="/static/js/library.js"></script>
 <script src="/static/js/config.js"></script>
 </body>
 </html>

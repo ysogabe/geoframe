@@ -186,7 +186,9 @@ flowchart LR
   （`renderModal`・`stepModal`・先読み・★/除外のハンドラ・画像クリック・`applyPhoto` の「開いている写真」の判定）を
   `vEntries()` に置き換える。`viewerIndex` の名前・意味は変えない（描画試験 `photos_render.mjs:846, 918, 968, 973, 1256` が
   直接見る）。`openModal(index)` は `viewerEntries = null` にしてから開く（写真タブの挙動は不変）。`closeModal()` で
-  `viewerEntries = null`。
+  `viewerEntries = null`。写真タブの再描画（一覧・検索の応答、チップの切り替え、検索を閉じる）で閉じるのは
+  `ps.entries` を使っているビューア（`viewerEntries === null`）だけにする（`closeModalIfOwn()`）。遅れて届いた写真タブの応答で、
+  ライブラリ・選別から開いたビューアを閉じない。`closePhotoOverlays()` は今までどおり全部閉じる。
 - 既存の `openModal(index)` のうち「ビューアを表示する処理」（`hidden` を外す、`body.ps-viewer-open`、`renderModal()`、
   閉じるボタンへのフォーカス、閉じたときのフォーカスの戻し先の記録）を内部関数 `showViewer(index)` に切り出し、
   `openModal` と下の `openModalFor` の両方から呼ぶ。
@@ -205,13 +207,18 @@ flowchart LR
 
 ```
 ls = {
-  view: 'trips' | 'map' | 'calendar' | 'places',   // 必須は trips と map
+  view: 'trips' | 'map' | 'calendar' | 'places',   // 必須は trips と map。calendar・places は「あると良い」（PR ② で実装）
+  grid: false,          // true の間は、どちらの view の上にも格子を出す（戻るで元の view へ）
   includeHidden: false,
-  trips: [],            // GET /api/admin/library/trips の結果
-  sel: null,            // 選んだ絞り込み {from, to, bbox, pref, city, label}
-  page: 1, per: 60, total: 0, items: [], tiles: [],   // 格子
-  map: null,            // maplibregl.Map（地図ビューを初めて開いたとき作る）
-  pending: 0,           // 要求番号（古い応答を捨てる。photos.js と同じ流儀）
+  trips: [], untimed: 0,   // GET /api/admin/library/trips の結果
+  years: [], calUntimed: 0, prefs: [], abroad: 0,   // calendar・places の結果。openYears・openPrefs は開いている行、loaded は読み込み済みの view
+  sel: null,            // 格子の絞り込み {from, to} | {untimed} | {bbox} | {pref, city?} | {abroad} と表示用の label
+  period: null,         // 地図の点と範囲に掛ける期間 {from, to}（旅の「地図で見る」で入り、解除で外す）
+  pointsStale: false,   // 地図が見えていないあいだに「除外も含める」・写真の位置・除外が変わった印（地図へ戻るとき点を取り直す）
+  page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],   // 格子
+  map: null, pendingData: null, labels: Map, popup: null,       // maplibregl.Map（地図ビューを初めて開いたとき作る）
+  seq: {trips, grid, points, popup, calendar, places},   // 要求の種類ごとの番号（古い応答を捨てる。種類を分けるのは、
+                                       // 吹き出しの要求が格子の読み込みを捨てないため）
 }
 ```
 
@@ -225,8 +232,18 @@ ls = {
   `getClusterExpansionZoom` で寄る。点を押すと、その時点で `GET /api/admin/library/photos?ids=<id>` を引き（要求番号を
   付け、別の点を押したら古い応答は捨てる）、届いたら `maplibregl.Popup`（DOM を `el()` で組んで `setDOMContent`）に
   サムネイル・日時・地名・「開く」を出す。取得中は「読み込み中」、失敗は「読めませんでした」の吹き出し。「開く」は届いた
-  1 枚で `openModalFor([photo], 0, {ai: false})`。ツールバーに「この範囲の写真を見る」（`map.getBounds()` を `bbox` にして
+  1 枚で `openModalFor([photo], 0, {ai: false})`。クラスタの件数の文字は、style に `glyphs`（文字の形のデータ）が無く
+  symbol 層が使えないので、見えているクラスタへ合わせる DOM のマーカー（`pointer-events: none`）で出す。更新は毎フレームの
+  `render` では呼ばず、`moveend`・`zoomend`・`idle`（MapLibre 4.7.1 では前 2 つが描画時の source 更新より先に発火し、更新先のタイルがキャッシュにあると `sourcedata` も出ないため、描画が落ち着いた後に 1 回合わせる）、点の source の `sourcedata`（`e.sourceId === 'photos' && e.isSourceLoaded`）、
+  `setData` の直後に行う（「3 層」は円 2 つ + マーカー）。Map の生成オプションに `renderWorldCopies: false` と
+  `maxBounds: [[-180, -85], [180, 85]]` を入れて世界を周回させない（経度が ±180 を超えると表示範囲を bbox にできない。日付変更線を
+  またぐ範囲は扱わない）。`currentBbox` は `getBounds()` を ±180/±90 に丸め、丸めた後に `w >= e` なら経度は `[-180, …, 180, …]`
+  にする。「除外も含める」の切り替えでは、旅の一覧・格子・地図の点のうち読み込み済みのものを全部読み直す。地図が見えていない
+  （旅の一覧・格子の上）ときは飛んでいる点の応答を捨てて `pointsStale` の印だけ立て、地図へ戻ったとき（戻る・ビューの切り替え）に
+  点を取り直す。ツールバーに「この範囲の写真を見る」（`map.getBounds()` を `bbox` にして
   格子を読む）と期間の表示（旅から来たときの `from`/`to`、解除ボタン）。タブに戻ったとき `map.resize()` を呼ぶ。
+- `.hidden` で出し入れする要素（`#lib-trips`・`#lib-period` ほか）に ID・クラスで `display` を指定するときは、対になる
+  `#lib-trips.hidden{display:none}` のような規則を置く（詳細度が `.hidden` に勝って消えなくなるため。描画試験 (o) が検査する）。
 - 画像の読み込み失敗（`img` の `error`）は格子・表紙・選別のメンバーで共通のプレースホルダ（`.img-broken`、文字は
   「画像なし」）に差し替える（写真タブのカードと同じ扱い）。
 - 描画試験では `window.maplibregl` を偽物（`Map`・`Popup`・`addSource`・`getSource().setData` を記録するだけ）に
@@ -352,13 +369,17 @@ cs = {
 
 - 旅は `start` の降順。`cover` は旅の中で位置があり除外でない最初の写真（無ければ先頭）。`places` は `pref`・`city` の
   組の件数の上位 3 つ（`pref` が空なら `{"pref": "", "city": "", …}` で「海外・不明」）。
-- 実装: `SELECT id, taken_at, lat, lon, pref, city, hidden, display, drive_id, md5, mtime FROM photos WHERE taken_at IS NOT NULL
-  AND taken_at!='' [AND hidden=0] ORDER BY taken_at, id` を 1 回読み、Rust で 48 時間超の空きで区切る（`photos.rs` の
-  `parse_epoch`・`TRIP_GAP_SECONDS` を `pub(crate)` にして共有）。
+- 実装: `SELECT id, taken_at, lat, lon, pref, city, hidden, display, drive_id, md5, mtime FROM photos WHERE <日時ありの形の判定>
+  [AND hidden=0] ORDER BY taken_at, id` を 1 回読み、Rust で 48 時間超の空きで区切る（`photos.rs` の
+  `parse_epoch`・`TRIP_GAP_SECONDS` を `pub(crate)` にして共有）。日時ありの判定は `photos`・`points` と同じ形の判定
+  （`taken_at GLOB` の 16 桁の形。`untimed` はその否定で、NULL・空・`x` のような形の違う値を数える）。暦として読めない日時
+  （`2025-02-30 10:00` など）は同じ文字列ごとに 1 つの旅（通常は 1 枚。`key`・`start`・`end` はその文字列そのまま。
+  前後の読める写真とは別の旅）にする。
+  このため旅の `count` の合計 + `untimed` は対象の写真の数に常に等しい。
 
 ### `GET /api/admin/library/photos`（新。PR ②）
 
-- 引数: `from`・`to`（`YYYY-MM-DD HH:MM`。各桁が数字で日時として成り立つこと、`from <= to`。両端を含む。`taken_at` は
+- 引数: `from`・`to`（`YYYY-MM-DD HH:MM`。16 桁の形であること（暦の正しさは見ない。`taken_at` 自体も暦を検査していないため、形で揃える）、`from <= to`。両端を含む。`taken_at` は
   分までの 16 文字（`imaging::norm_time`）なので `to` を分まで含めれば旅の最後の写真は欠けない）、
   `bbox=minlon,minlat,maxlon,maxlat`（有限、lon は ±180、lat は ±90、`min <= max`。日付変更線をまたぐ範囲は扱わず、画面が
   `getBounds()` の値を範囲内に丸めてから送る）、`ids=1,2,3`（整数。重複を除く**前**の個数が 200 を超えても 400）、`pref`・`city`（R10。文字数で
@@ -378,9 +399,35 @@ cs = {
 
 ### あると良い（PR ② の時間があれば）
 
-- `GET /api/admin/library/calendar` → `{ok, years: [{year, count, months: [{month, count}]}], untimed}`
-  （`substr(taken_at,1,4)`・`substr(taken_at,1,7)` で GROUP BY）。
-- `GET /api/admin/library/places` → `{ok, prefs: [{pref, count, cities: [{city, count}]}], abroad: n, noloc: n}`。
+どちらも `trips` と同じ流儀（`GET` の完全一致、`no-store`、DB の失敗は 503、`hidden=1` で除外を含む、`photos` 表だけを読む）。
+
+- `GET /api/admin/library/calendar` → `{ok, years: [{year, count, months: [{month, count}]}], untimed}`。
+  日時あり（`trips` と同じ 16 桁の形の判定）の行を `substr(taken_at,1,4)`・`substr(taken_at,1,7)` で数える。`year` は
+  `"2025"` のような 4 桁、`month` は `"06"` のような 2 桁の**文字列**（暦として読めない値も形が合えばそのまま出る。
+  `2025-02-30 10:00` は 2025 年 02 月）。年は新しい順、月は古い順。年の `count` は月の `count` の合計。`untimed` は
+  `trips` と同じ日時なしの件数。年の合計 + `untimed` は対象の写真の数に等しい。
+- `GET /api/admin/library/places` → `{ok, prefs: [{pref, count, cities: [{city, count}]}], abroad: n}`。
+  `pref` が空でない行を `pref`・`city` で数える（`city` が NULL・空なら `city: ""` の 1 項目）。`abroad` は `pref` が NULL か
+  空の件数（位置なしも含む。`trips.places` の「海外・不明」と同じ定義）。並びは都道府県・市区町村とも件数の多い順、
+  同数は名前の順。以前の案にあった `noloc` は返さない（`abroad` と意味が重なるため）。
+- 画面からの格子: 年は `from=YYYY-00-00 00:00&to=YYYY-99-99 99:99`、月は `from=YYYY-MM-00 00:00&to=YYYY-MM-99 99:99`
+  （`photos` の `from`・`to` は形（桁が数字か）だけを見て文字列で比べる。`calendar` も形だけで数えるので、月 `13` や
+  `31 日 24 時台` のような暦に無い値もその年・月に入る。範囲は `00`〜`99` で形いっぱいに取り、それらも漏らさない）。都道府県・市区町村は
+  `pref`・`city`、日時なしは `untimed=1`。
+- `photos` に `abroad=1`（`pref IS NULL OR pref=''`）を足す。`parse_qs` が空の値（`pref=`）を捨てるので、「海外・不明」は
+  `pref=` では絞れないため。`pref`・`city` と同時に受けない（どちらかがあれば 400）。`1` 以外の値は絞り込みにならない
+  （`untimed` と同じ）。
+- 画面（R9〜R11）: 切替に「日付」「場所」を足す（`ls.view` は `calendar` | `places`）。「日付」は年の行（件数つき）を押すと
+  月の行が開き、年・月のどちらからも「写真を見る」で格子。末尾に「日時なし（K 枚）」。「場所」は都道府県の行を押すと
+  市区町村の行が開き、都道府県の行からは格子へ進む。市区町村の行も格子へ進むが、**市区町村が空の項目**（「（市区町村なし）」）は
+  件数だけを出し、押しても格子へは進まない。その写真はその都道府県の格子から見る（`parse_qs` が空の値を捨てるため
+  `city=` では絞れず、`abroad` のような専用の引数は足さない）。末尾に「海外・不明（N 枚）」（`abroad=1`）。格子のタイルに「位置を指定」（📍）の
+  ボタンを置き、押すと写真タブと同じ位置の指定（`openLocModal`）を開く（タイルを押したときのビューアとは混ざらない）。
+  保存すると `applyPhoto` → `libPhotoChanged` でタイルの「位置なし」の印が消える。位置（`lat`・`lon`）か除外（`hidden`）が変わると
+  地図の点も変わるので、`libPhotoChanged` は飛んでいる `points` の応答を捨て（`seq.points` を進め）、地図が見えていれば点を取り直し、
+  見えていない（旅の一覧・範囲の格子の上、別のタブ）なら `pointsStale` を立てて、地図へ戻るとき取り直す。patch に `lat`・`lon`・`hidden` のどれも無ければ（★だけの patch）何もしない。ただし `photos.js` の `setFlag` は応答の `{favorite, hidden}` を常に渡すので、画面の★操作では保守的に 1 回取り直す（表示は正しく、要求が 1 つ増えるだけ）。
+- 共通ビューアの画像が無い（`thumb` が空）・読めない（`error`）ときは、格子・表紙・吹き出しと同じ「画像なし」の代わりの表示
+  （`#viewer-noimage`）を出し、次の写真へ移ると画像の表示に戻す（R8）。
 
 ### `photo_curation` 表（新。PR ③。`curation::TABLES`。`SCHEMA` 定数には足さない）
 
@@ -587,7 +634,7 @@ CASE WHEN q.group_id IS NULL THEN 0
 |---|---|---|
 | AC1 | 合成 JPEG（`image` crate で 1200×800 を作る）を `derivatives/` に置き、`/thumb/<id>.jpg` の 200・寸法・`ETag` の存在と `If-None-Match` の 304・`mtime` 変更後の再生成と古い世代の削除・404（数字でない、無い写真）・403（領域の外へのリンク）・壊れた JPEG は 404 で 2 回目は復号しない（失敗の記憶。生成関数の呼び出し回数を数える）・書けない（`thumbs/` を読み取り専用に）ときは元ファイルが返る・同じ写真への同時 8 要求で生成が 1 回（ID ごとのロック）・`display` が `catalog.db`・`../x`・`tmp/x` を指す行は 404 で本文が DB でない・寸法だけ大きい合成 PNG は 404（上限。全体を復号しない）・GPS 付きの合成 JPEG から作ったサムネイルに APP1（EXIF）が無い・`Sec-Fetch-Site: cross-site` は 403・HEAD は生成しない・`v` が今の世代と違うときは生成せず 404（キャッシュがあればそれ）・`INGEST=0` では生成せず `thumbs/` もできず元の画像が返る・待ち合わせ中に要求を drop しても同時の生成が 2 を超えない・同じ ID の生成途中で要求を drop しても次の要求が二重に生成しない（単体）。`/derivatives/` のヘッダ不変は既存試験 | `tests/thumb.rs`（新）＋ `thumb.rs` の単体試験 |
 | AC2 | 新しいフィクスチャ `tests/fixtures/library-catalog.sql`（10 分・1 時間 30 分・8 時間・ちょうど 48 時間・9 日の差、位置なし、日時なし、除外を含む）で `trips` の境界・`noloc`・`untimed`・`hidden=1` の差を独立した期待値で検証。描画試験で旅 → 格子 → ビューア → ★ → `POST setflag` の `id` → タイルの印の更新（購読者）。写真タブのカードが変わらないことも見る | `tests/library_api.rs`（新）、`web/tests/library_render.mjs`（新）＋ `tests/admin_ui_library.rs` |
-| AC3 | `points` の位置なし除外・`from`/`to`・`bbox` の絞り込み（結合）。`truncated` は切り詰めの関数（`fn truncate_points(rows, max)`）の単体試験（結合試験のバイナリでは `#[cfg(test)]` の定数が効かないため）。描画試験で偽 MapLibre の `setData`、点を押したときの `ids=` 要求と吹き出し、`bbox` 要求 | 同上 |
+| AC3 | `points` の位置なし除外・`from`/`to`・`bbox` の絞り込み（結合）。`truncated` は切り詰めの関数（`fn truncate_points(rows, max)`）の単体試験と、実際の上限を使う結合試験（2024 年の 20,001 点を足して、位置のある写真 20,012 枚のうち 20,000 点で `truncated: true`・`total` が全体の数・古いものから落ちること、範囲で絞れば `truncated: false`）。描画試験で偽 MapLibre の `setData`、点を押したときの `ids=` 要求と吹き出し、`bbox` 要求 | 同上 |
 | AC4 | 新しいフィクスチャ `tests/fixtures/curation-catalog.sql`（`admin-api-catalog.sql` は similar 1 組・exact 1 組なので流用しない）: exact 1 組・similar 2 組（1 組は同じ SHA の 2 枚を含む）。`confirm` → `groups`・`/api/v1/photos`・`status` の `db.quality.recommended`・`photo_quality` の入れ直し（`group_id` を変える）後も保持。`reviewed` のみ・`reset`・上の境界の表の 5 行・代表に記録した後で除外にした写真は `/api/v1/photos` に出ない・`photo_quality` を入れ替える書き込みと同時に `confirm` しても表が半端にならない | `tests/curation_api.rs`（新） |
 | AC5 | 確認済みの組に 1 枚足す → `recheck`。メンバーの `mtime` と `photo_quality` の世代を変える（再解析後を模す）→ `recheck`・`stale`。`token` 違いの `confirm`・`reset` → 409 で表が不変（集合違い・SHA は同じで `mtime` だけ違う・別のタブが先に代表を変えた後の古い `token`・`reset` 後の古い `token` の 4 通り）。`representative_not_visible` → 400 で表が不変 | 同上 |
 | AC6 | 既存のフィードの試験（契約・endpoint・miharashi）が無変更で通る。`photo_curation` 無しの DB で `list_photos` の SQL が従来と同じ結果（単体）。旧 AI の組と重なる合成ケース（人の代表が旧 AI の非推薦でも出る） | 既存 ＋ `photos.rs` の単体試験 ＋ `tests/legacy_selection.rs` |

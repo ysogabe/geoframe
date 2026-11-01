@@ -1,4 +1,4 @@
-// vm で admin.js・photos.js・config.js を動かす描画試験のための、小さな DOM の代用品（依存なし）。
+// vm で admin.js・photos.js・library.js・config.js を動かす描画試験のための、小さな DOM の代用品（依存なし）。
 // 本物のブラウザの全部は真似ない。試験が必要とする範囲だけ:
 //   - 要素の同一性（createElement したものが同じ参照のまま木に入る）、children 配列、親子の付け外し
 //   - textContent（子の文字列をつなぐ getter と、子を置き換える setter）
@@ -142,7 +142,12 @@ class FakeElement {
     ev.target = ev.target || this;
     ev.currentTarget = this;
     if(!ev.preventDefault) ev.preventDefault = () => { ev.defaultPrevented = true; };
+    if(!ev.stopPropagation) ev.stopPropagation = () => { ev.propagationStopped = true; };
     (this.listeners[ev.type] || []).slice().forEach(fn => fn(ev));
+    // 親へ伝える（バブリング）のは、試験が `bubbles: true` を付けたイベントだけ（既存の試験は子で止まる前提）
+    if(ev.bubbles && !ev.propagationStopped && this.parentNode && this.parentNode.nodeType === 1){
+      this.parentNode.dispatchEvent(Object.assign(ev, {target: ev.target}));
+    }
     return !ev.defaultPrevented;
   }
   // ブラウザと同じく、disabled なフォームコントロールの click() はイベントを発火しない
@@ -216,6 +221,7 @@ export function buildAdminDom(){
   const nav = mk('nav', {}, header);
   mk('button', {cls: 'tab on', text: '▸ 状況', data: {tab: 'status'}}, nav);
   mk('button', {cls: 'tab', text: '▸ 写真', data: {tab: 'photos'}}, nav);
+  mk('button', {cls: 'tab', text: '▸ ライブラリ', data: {tab: 'library'}}, nav);
   mk('button', {cls: 'tab', text: '▸ 設定', data: {tab: 'config'}}, nav);
 
   const main = mk('main', {}, body);
@@ -262,6 +268,41 @@ export function buildAdminDom(){
   mk('div', {id: 'groups', cls: 'hidden'}, ph);
   mk('div', {id: 'empty', cls: 'empty hidden', text: '該当する写真がありません'}, ph);
 
+  // ライブラリタブ（admin.html の #v-library と同じ id）
+  const lib = mk('section', {id: 'v-library', cls: 'hidden'}, main);
+  const lbar = mk('div', {cls: 'toolbar lib-bar'}, lib);
+  mk('button', {id: 'lib-view-trips', cls: 'lib-seg on', text: '旅', data: {view: 'trips'}}, lbar);
+  mk('button', {id: 'lib-view-calendar', cls: 'lib-seg', text: '日付', data: {view: 'calendar'}}, lbar);
+  mk('button', {id: 'lib-view-places', cls: 'lib-seg', text: '場所', data: {view: 'places'}}, lbar);
+  mk('button', {id: 'lib-view-map', cls: 'lib-seg', text: '地図', data: {view: 'map'}}, lbar);
+  const lopt = mk('label', {cls: 'opt'}, lbar);
+  mk('input', {id: 'lib-hidden'}, lopt);
+  lopt.appendChild(document.createTextNode(' 除外も含める'));
+  mk('span', {cls: 'spacer'}, lbar);
+  mk('span', {id: 'lib-note', cls: 'count'}, lbar);
+  mk('div', {id: 'lib-trips'}, lib);
+  mk('div', {id: 'lib-calendar', cls: 'hidden'}, lib);
+  mk('div', {id: 'lib-places', cls: 'hidden'}, lib);
+  const lmapbox = mk('div', {id: 'lib-map-box', cls: 'hidden'}, lib);
+  const lmbar = mk('div', {cls: 'toolbar'}, lmapbox);
+  mk('button', {id: 'lib-bbox', cls: 'btn', text: 'この範囲の写真を見る'}, lmbar);
+  const lperiod = mk('span', {id: 'lib-period', cls: 'lib-period hidden'}, lmbar);
+  mk('span', {id: 'lib-period-text'}, lperiod);
+  mk('button', {id: 'lib-period-clear', cls: 'btn', text: '期間を解除'}, lperiod);
+  mk('span', {cls: 'spacer'}, lmbar);
+  mk('span', {id: 'lib-map-note', cls: 'count'}, lmbar);
+  mk('div', {id: 'lib-map'}, lmapbox);
+  const lgrid = mk('div', {id: 'lib-grid-box', cls: 'hidden'}, lib);
+  const lgbar = mk('div', {cls: 'toolbar'}, lgrid);
+  mk('button', {id: 'lib-back', cls: 'btn', text: '◀ 戻る'}, lgbar);
+  mk('span', {id: 'lib-sel', cls: 'lib-sel'}, lgbar);
+  mk('span', {cls: 'spacer'}, lgbar);
+  mk('button', {id: 'lib-prev', cls: 'btn', text: '◀ PREV'}, lgbar);
+  mk('span', {id: 'lib-pageinfo', cls: 'count', text: '--'}, lgbar);
+  mk('button', {id: 'lib-next', cls: 'btn', text: 'NEXT ▶'}, lgbar);
+  mk('div', {id: 'lib-grid'}, lgrid);
+  mk('div', {id: 'lib-empty', cls: 'empty hidden', text: '該当する写真がありません'}, lgrid);
+
   // 設定タブ（admin.html の #v-config と同じ id。.scroll の包みは id が無いので省く）
   const cf = mk('section', {id: 'v-config', cls: 'hidden'}, main);
   mk('div', {id: 'c-note', cls: 'cfg-note'}, cf);
@@ -303,6 +344,7 @@ export function buildAdminDom(){
   mk('button', {id: 'viewer-prev', cls: 'ps-viewer-nav ps-viewer-prev', text: '‹'}, shell);
   const media = mk('div', {id: 'viewer-media', cls: 'ps-viewer-media'}, shell);
   mk('img', {id: 'viewer-image'}, media);
+  mk('div', {id: 'viewer-noimage', cls: 'img-broken hidden'}, media);
   mk('div', {id: 'viewer-image-score', cls: 'ps-viewer-imgscore'}, media);
   const aside = mk('aside', {cls: 'ps-viewer-detail'}, shell);
   const over = mk('div', {cls: 'ps-viewer-overline'}, aside);
