@@ -139,7 +139,14 @@ AI の停止の解除）を、稼働中の `serve` の中で行い、進み具�
      設定ミスで同じ表示になり、通すと Drive の全行が消えるため。CLI の `--allow-mass-delete` だけに残す（Opus の指摘 3。
      PRD の「決まっていないこと」）。
    - 削除の書き込みの直前に、writer で `VACUUM INTO 'DATA_DIR/tmp/catalog-before-release.db'`（既存の写しは消してから。1 つだけ）
-     を作り、失敗したら削除しない（`StageError`）。確認の文言に「解除前の写しが残る」と書く（Opus の指摘 4）。
+     を作り、失敗したら削除しない（`StageError`）。**同じ `writer.call` の中で**「`tmp/` の準備 → トランザクションの外で写し →
+     `write_plan`（その中でトランザクション）」の順に行い、写しと削除のあいだに別の writer の依頼を挟まない（Sol の指摘 5）。
+     確認の文言に「解除前の写しが残る」と書く（Opus の指摘 4）。
+   - **保留の記憶の更新の順序**（`Only` のときだけ既存と変える。Sol の指摘 2）: 既存の `run` は計画の直後に `board.record(plan.hold())`
+     を呼ぶ（`index.rs:541-547`）ので、削除できる計画ならその時点で保留が消え、あとの写し・書き込みが失敗しても解除のボタンが
+     消えてしまう。`Only` では、計画が保留に戻すものなら `record(Some(新しい保留))`、削除できる計画なら **`write_plan` のコミットが
+     済んでから** `record(None)`。写しの失敗・書き込みの失敗・停止による巻き戻しでは記憶を触らない（承認した保留が残る）。
+     `Yes`・`No` の順序は変えない。
    - 受付（承認した件数・理由）と終了（削除した件数・結果の種別）を `tracing::warn!` で固定の語と件数だけ 1 行ずつ出す。
    - `allow_mass_delete: bool` は `enum Allow { No, Yes, Only(Vec<i64>) }` に広げ、CLI の `--allow-mass-delete` は `Yes` のまま
      （引数・挙動は変えない。R18）。`IndexDrive::allowing_only(shared, ids)`。
@@ -248,17 +255,27 @@ loop {
 - `Sync` → 定期と同じ `stages`。
 - `QualityScan` → `[quality::Scan]`（1 段 `quality`）。
 - `DriveRelease { token, ids }` → 実行の直前に `mass_delete.current()` の印と `token` を照らし、違えば実行せず `outcome: hold_changed`。
-  一致すれば `[IndexDrive::allowing_only(drive, ids)]`。段の結果が `Skipped`（鍵なし・認証失敗・停止）なら `outcome: skipped`
-  （理由つき。`done` にしない）。`Done` で `counts` の `deletes_withheld` か `mass_delete_withheld` が **0 より大きければ**
-  `outcome: exceeded`（`counts()` は 0 でも鍵を入れるので、有無では判定しない。Opus の指摘 6）。それ以外は `done`
-  （`counts` の `approved`・`deleted` を画面に必ず出す）。
+  一致すれば `[IndexDrive::allowing_only(drive, ids)]`。唯一の段の `StageResult` から `outcome` を決める対応表（Sol の指摘 3）:
+
+  | `StageResult` | `outcome` |
+  |---|---|
+  | `Skipped(理由)`（鍵なし・認証失敗・一覧の途中で停止） | `skipped`（理由つき） |
+  | `NotRun`（段の前に停止の合図） | `skipped`（理由「停止」） |
+  | `Failed(_)`・`Panicked`（写しの失敗・書き込みの失敗を含む） | `failed` |
+  | `Done(counts)` で `deletes_withheld` か `mass_delete_withheld` が **0 より大きい** | `exceeded`（`counts()` は 0 でも鍵を入れるので有無では判定しない。Opus の指摘 6） |
+  | `Done(counts)` でそれ以外 | `done`（`approved`・`deleted` を画面に必ず出す） |
+
+  他の要求（`Sync`・`QualityScan`）は段が複数なので、失敗・パニックが 1 つでもあれば `partial`、全部 `NotRun` なら `skipped`、
+  それ以外は `done`。DB を開けない・`run_cycle` 自身のパニックはどの要求でも `failed`。
 
 DB を開けない・`run_cycle` 自身がパニックしたときも `board.finish(id, failed)` を必ず呼ぶ（`finish` は `Drop` で保証する
 `Running` のガードにする）。スレッドは終わらせない。
 
-`Board` は `Mutex<Inner { running, queued, next_id, history, last_cycle, next_cycle_at }>` 1 つ。`enqueue(kind, …)` は同じロックの
-中で「`queued` が空」「`running` が同じ種類でない」「停止の合図が無い」を確かめて入れ、どれかに当たれば `Err(Busy)`／
-`Err(Stopping)`。`take_queued` は `queued` を `running` に移して返す（取り出した直後に同じ種類を受け付けない）。
+`Board` は `Mutex<Inner { running, queued, next_id, history, last_cycle, next_cycle_at, last_manual_sync_finished }>` 1 つ。
+`enqueue(kind, …)` は同じロックの中で「`queued` が空」「`running` が同じ種類でない」「停止の合図が無い」「`Sync` なら
+`last_manual_sync_finished` から 60 秒以上」を確かめて入れ、どれかに当たれば `Err(Busy)`／`Err(Stopping)`／`Err(TooSoon)`。
+`last_manual_sync_finished: Option<Instant>` は `Sync` の `finish`（成功・失敗・外側の隔離のガードを含む）で更新し、履歴とは
+別に持つ（履歴から押し出されても効く。Sol の指摘 1）。時計は `Board::new(clock)` で差し替えられるようにし、試験で進める。`take_queued` は `queued` を `running` に移して返す（取り出した直後に同じ種類を受け付けない）。
 定期サイクルの実行中に来た要求は入り、サイクルが終わった直後のループの冒頭で取り出される。
 
 ### `Board` の中身
@@ -271,8 +288,9 @@ Board {
   last_cycle: Option<Record>,                                 // 定期サイクルの直近
   history: VecDeque<Record>,                                  // 要求の履歴。最新 10 件
   next_id: u64,
+  last_manual_sync_finished: Option<Instant>,                 // 手動の同期の最短間隔（60 秒）の基準。履歴とは別
 }
-Record { id, kind, requested_at, started_at, finished_at, outcome, stages: Vec<StageJson>, report: Option<Value> }
+Record { id, kind, requested_at, started_at, finished_at, outcome, stages: Vec<StageJson>, report: Option<Report> }
 StageJson { name, result: "done"|"skipped"|"failed"|"panicked"|"not_run", reason: Option<&'static str>, counts: Map<&str,u64> }
 outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開けない・外側のパニック）| "skipped"（drive-release の段が省略）
        | "exceeded"（drive-release で承認した集合に無い行が消えようとした）| "hold_changed"（実行直前に保留が違った）
@@ -302,7 +320,7 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
                               {"name": "index_drive", "result": "skipped", "reason": "Drive の鍵がありません"}]}
   },
   "hold": {"held": 120, "reason": "ratio", "drive_rows": 500, "since": "…", "checked_at": "…", "token": "9f3a…"},
-  "ai": {"retry_kinds": ["photo_judge"], "failed": {"photo_judge": 4}, "pauses": 1},
+  "ai": {"retry_kinds": ["photo_judge"]},
   "history": [ {"id": 12, "kind": "sync", "requested_at": "…", "started_at": "…", "finished_at": null, "outcome": null, "stages": []}, … ]
 }
 ```
@@ -332,7 +350,9 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
 - `ai-retry`・`ai-release-pause`（PR ②）は `ai_ops_lock` を `try_lock`（取れなければ 409 `busy`）し、`spawn_blocking` の中で
   `ai::ops::retry`／`release_pause` を呼ぶ（CLI と同じ関数、別インスタンスの handlers）。`JobKind`・`TaskKind` の文字列は CLI の
   `--kind`・`--task` と同じ名前。未知なら 400。途中で失敗したとき（種類ごとのトランザクションの一部が済んだあとの失敗）は 500 の
-  定型文で、済んだ種類の件数は履歴の `report` に残す（CLI も同じく途中まで進む）。
+  定型文で、済んだ種類の件数は履歴の `report` に残す。今の `retry` は `Result<RetryReport, WriteError>` で `?` が集計を捨てる
+  （`ops.rs:356-389`）ので、`Err((RetryReport, WriteError))`（部分の集計つきの誤り型）に変え、CLI はこれまでどおり終了コードと
+  出力を保つ（Sol の指摘 4）。
 
 ### 画面（`ops.js`）
 
@@ -392,8 +412,8 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
 | AC1 | `ops_render.mjs`: `ingest:true` の合成応答でボタン 5 つ、`ingest:false` で案内だけ |
 | AC2 | (a) `tests/ops_api.rs`: `ingest_cli.rs` と同じ子プロセスの `serve`（`INGEST=1`、鍵なし）。POST sync → 200 と `id`、`GET /api/admin/ops` を最長 20 秒待って履歴のその `id` が終了、`index_drive` が `skipped`、`index_local` が `done`。(b) `sync.rs` の単体試験（`ingest::start` で一時ディレクトリにロックと writer を作る既存の試験と同じ土台）: チャネルで止まる偽の `Stage` を段の一覧にして `spawn_worker`。実行中に同種の `enqueue` が `Busy`、別種は 1 つ待てて 2 つ目は `Busy`、定期サイクル中の要求がその直後に走る、DB のパスを壊して `failed` の記録と `running` の解除、パニックする偽の段でも同じ、待ち・実行中それぞれで `stop.stop()` から `join_within` が短時間で戻る、停止後の `enqueue` が `Stopping`。(c) 描画試験: 送信中・`running` の `disabled`、終了で段の表 |
 | AC3 | 子プロセスの `serve` に `GEOFRAME_QUALITY_PER_CYCLE=1` と有効な合成 JPEG 3 枚（`imaging` の試験が使う生成の道具）。起動直後の定期サイクルの `last_cycle` が終わったあと、`photo_quality_features` の世代の合う行が 1 枚ぶんだけであることを確かめてから POST quality-scan。記録の段が `quality` 1 つ、`counts` に `analyzed >= 2`・`remaining = 0`・再構築あり、特徴量の行が 3 枚ぶん |
-| AC4 | `drive/index.rs` の単体試験: `plan(existing, files, Allow::Only(ids))` で、`doomed ⊆ ids` なら消える、`doomed ⊂ ids`（一部が戻った）なら残りだけ消え `approved`・`deleted` が出る、集合外が 1 件あれば保留（空の一覧なら `deletes_withheld`、それ以外は `mass_delete_withheld`）。`Yes`・`No` の既存の試験は `Allow` に置き換えて同じ結果。`ops.rs` の単体試験: `token_of` が同じ入力で同じ、4 項目か ID の集合が 1 つ違えば違う。`tests/ops_api.rs`: `spawn_state` で `MassDeleteBoard` に記録を入れ、`token` 取得 → 正しい POST 200（`queued`、`approved`）、違う `token` 409 `hold_changed`、記録を消して 409 `no_hold`、`empty_listing` の記録で 409 `not_releasable`。`sync.rs` の単体試験: 待ちのあいだに `MassDeleteBoard` を書き換えると実行されず `hold_changed`。`tmp/` を書けなくして写しに失敗すると削除せず `failed`。偽の `IndexDrive` 相当の段で `Skipped` → `skipped`。描画試験: 確認の段の件数と範囲、409 で閉じて読み直し、確認中に `token` が変わると閉じる、`empty_listing` で案内だけ |
-| AC5 | `tests/ops_api.rs`: `curation_api.rs` と同じ writer 付きの `spawn_state` に `ai_jobs`（`failed`、handler 未登録の種類）と `ai_provider_pauses` の行。`ai-retry all` → `unsupported` の件数、行は `failed` のまま。`ai-release-pause all` → `released`、行が消える。`task` 指定で設定なし → 409 `config_unavailable`。`ai_ops_lock` を試験から握って 2 つ目の POST が 409 `busy`。`ai/scene_judge` の単体試験: 2 つのインスタンスで `prepare_retry` と `reconcile` を交互に呼んでも `recheck` の結果が変わらない |
+| AC4 | `drive/index.rs` の単体試験: `plan(existing, files, Allow::Only(ids))` で、`doomed ⊆ ids` なら消える、`doomed ⊂ ids`（一部が戻った）なら残りだけ消え `approved`・`deleted` が出る、集合外が 1 件あれば保留（空の一覧なら `deletes_withheld`、それ以外は `mass_delete_withheld`）。`run` の試験（Drive の一覧をスタブ）: 写しの失敗で削除されず保留が残る、成功で写しに削除前の行と `loc_source='manual'` の値が残り本 DB から消え保留が `None`、書き込みの失敗で保留が残る。`Yes`・`No` の既存の試験は `Allow` に置き換えて同じ結果。`ops.rs` の単体試験: `token_of` が同じ入力で同じ、4 項目か ID の集合が 1 つ違えば違う。`tests/ops_api.rs`: `spawn_state` で `MassDeleteBoard` に記録を入れ、`token` 取得 → 正しい POST 200（`queued`、`approved`）、違う `token` 409 `hold_changed`、記録を消して 409 `no_hold`、`empty_listing` の記録で 409 `not_releasable`。`sync.rs` の単体試験: 待ちのあいだに `MassDeleteBoard` を書き換えると実行されず `hold_changed`。`tmp/` を書けなくして写しに失敗すると削除せず `failed`。偽の段で `Skipped` → `skipped`、`NotRun` → `skipped`（停止）、`Failed`・`Panicked` → `failed`。時計を進めて `too_soon` の 3 通り（AC2(b)）。描画試験: 確認の段の件数と範囲、409 で閉じて読み直し、確認中に `token` が変わると閉じる、`empty_listing` で案内だけ |
+| AC5 | `tests/ops_api.rs`: `curation_api.rs` と同じ writer 付きの `spawn_state` に `ai_jobs`（`failed`、handler 未登録の種類）と `ai_provider_pauses` の行。`ai-retry all` → `unsupported` の件数、行は `failed` のまま。`ai-release-pause all` → `released`、行が消える。`task` 指定で設定なし → 409 `config_unavailable`。`ai_ops_lock` を試験から握って 2 つ目の POST が 409 `busy`。`ai/ops.rs` の単体試験: 2 種類のうち後の種類で writer が失敗する合成で `Err((部分の集計, 誤り))`、先の種類はコミット済み。`ai/scene_judge` の単体試験: 2 つのインスタンスで `prepare_retry` と `reconcile` を交互に呼んでも `recheck` の結果が変わらない |
 | AC6 | GET の見出し・`no-store`・HEAD/POST 403・`INGEST=0` で `ingest:false`。`Board` に `Failed("…/data/catalog.db …")` を含む合成の記録と ID つきの保留を入れて、本文に文面も ID も無いことを確かめる。`tests/admin_api.rs` は触らない |
 | AC7 | 5 本の POST に対し、`csrf_python.rs`・`curation_api.rs` と同じ形で 403・503・413・400 |
 | AC8 | `ops_render.mjs`: `last_cycle`・`next_cycle_at`・`history` 10 件の順序 |
@@ -405,8 +425,9 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
 - **品質解析の一括が長い**: 定期サイクルと他の要求が待つ。画面に「実行中（開始時刻）」を出し、PRD の「決まっていないこと」に残す。
   必要なら「1 回 n 枚まで」を後から足せる（`Request::QualityScan { limit }`）。
 - **`admin_ai_ops_render.mjs` の期待値**: 文言を変えると落ちる。期待値だけを合わせ、検証の構造は変えない（R8）。
-- **`cli.rs` の `serve` の組み立ての変更**: `handlers` を `clone` して `AppState` に持たせる。`start_ai` が `None`（AI 無効）でも
-  `retry` は handlers で再検査できる（CLI と同じ）。`production_handlers` は `!config.ingest` で空（`INGEST=0` は 503 なので届かない）。
+- **`cli.rs` の `serve` の組み立ての変更**: `production_handlers` を 2 回呼び、2 組目を `AppState` に持たせる（方針 3）。`start_ai` が
+  `None`（AI 無効）でも `retry` は 2 組目で再検査できる（CLI と同じ）。`production_handlers` は `!config.ingest` で空（`INGEST=0` は
+  503 なので届かない）。
 - **`release_pause` のあとも送られない**: `ai_provider_waits` と `blocked` が残る。R7 の案内で説明し、`/api/admin/status` の
   `ai_waits` を併読させる。
 - **要求の検出の遅れ**: 100 ms 刻みなので最大 100 ms。画面の読み直しは 3 秒なので見えない。`tests/shutdown.rs` は同期ワーカーを
