@@ -254,33 +254,58 @@ cs = {
 
 ### `GET /thumb/<id>.jpg?v=<gen>`（新。PR ①）
 
-- `<id>` は 1〜18 桁の数字だけ。他は 404。`v` は無視してよい（キャッシュの破棄のためだけに URL に含める）。
+- 経路: 正規化した後のパス（`webpath` の判定と同じ段階。`/thumb/` の分岐は静的配信の白名簿より前）が 1 段だけで
+  `^[1-9][0-9]{0,17}\.jpg$` に合うものだけを受ける（先頭の 0・`0`・末尾の `/`・2 段以上は 404）。`i64` に変換し、
+  以後のファイル名には変換後の数値を使う。`v` はサーバーでは見ない（キャッシュの破棄のためだけに URL に含める。鍵にも
+  使わない）。アクセスログのラベルは `labeled(…, "/thumb/{id}")`。
+- GET だけ生成する。HEAD はキャッシュがあれば本文なしで返し、無ければ 404（生成しない）。
+- 別サイトからの生成を防ぐ: `Sec-Fetch-Site` が `cross-site`・`same-site` なら 403（`same-origin`・`none`・ヘッダ無しは通す。
+  Host 検査は IP リテラルを通すので、外部ページの `<img>` が連番の ID で生成とディスク書き込みを起こせるため）。応答に
+  `Cross-Origin-Resource-Policy: same-origin` を付ける。
+- 書き込み側（writer）が無い起動（`INGEST=0`）では生成しない。キャッシュがあれば返し、無ければ 5 の代わりの応答
+  （データディレクトリへの新しい書き込み経路を黙って増やさない）。
 - 世代 `gen` = `blake3`/`sha256` の先頭 12 hex（`display | md5 | mtime` を `|` で連結。`md5`・`mtime` が NULL なら空）。
   API の `thumb_url` は `/thumb/<id>.jpg?v=<gen>`。
 - 処理:
   1. DB で `display`・`drive_id`・`md5`・`mtime` を引く（`thumb_for` と同じ規則で元ファイルを決める。無ければ 404。
-     この 404 は失敗として覚えない）。元ファイルは `derivatives/` か `photos/` の**領域**の中でなければならない
-     （`serve_data` と同じく領域のディレクトリとファイルの両方を `canonicalize` し、領域の外に出るリンクは 403、通常の
-     ファイル以外は 404。`statics.rs:312-345` の検査を関数に切り出して共有する）。
-  2. `thumbs/<id>-<gen>.jpg` があれば返す（`thumbs/` も領域として同じ検査）。
+     この 404 は失敗として覚えない）。`display` は `derivatives/` か `photos/` で始まり、`datadir::lexical` と同じ字面の
+     検査（`..`・絶対パス・NUL を断る）を通るものだけを受け、それ以外は 404。元ファイルはその**領域**の中でなければ
+     ならない（`serve_data` と同じく領域のディレクトリとファイルの両方を `canonicalize` し、領域の外に出るリンクは 403、
+     通常のファイル以外は 404。`statics.rs:312-345` の検査を関数に切り出して共有する）。
+  2. `thumbs/<id>-<gen>.jpg` があれば返す（`thumbs/` も領域として同じ検査。`static_slots` の `try_acquire` を通り、空きが
+     無ければ 503。`serve_data` と同じ）。
   3. 失敗の記憶 `thumb_failed`（下記）に `<id>-<gen>` があれば 5 へ。
   4. **写真 ID ごとのロック**（`AppState.thumb_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>`。使い終わった項目は
-     消す）を取り、取った後に 2 と 3 をもう一度見る（待っているあいだに他の要求が作った・失敗した）。次に `Semaphore(2)` を
-     取り、`spawn_blocking` で `make_thumbnail(元, 320)` → `derivative.rs:951` の `write_atomic(thumbs/<id>-<gen>.jpg, bytes)`
-     （tmp に書いて rename。既存）。成功したら、同じ `<id>-` で始まり今の `<gen>` でないファイルを消す（ID ごとのロックの
-     中なので、別の世代の生成と競合しない）。
-  5. 生成に失敗（復号できない・大きすぎる・`thumbs/` に書けない）したら、元ファイルが拡張子で画像（jpg/jpeg/png/webp/gif）
-     と分かるときだけ元ファイルを返し（`Content-Type` は拡張子から、`Cache-Control: no-store`）、そうでなければ 404。
-     失敗した `<id>-<gen>` は `thumb_failed: Mutex<HashSet<String>>` に覚え（上限 4,096 件。超えたら全部忘れる）、起動中は
-     Semaphore を取らずにすぐ 5 を返す。ログは失敗の初回に 1 行（WARN、ID と理由の種類だけ。パスは出さない）。
+     消す）を取り、取った後に 2 と 3 をもう一度見る（待っているあいだに他の要求が作った・失敗した）。次に生成の枠
+     `Semaphore(THUMB_CONCURRENCY)` を `acquire_owned()` で取る。**待ちは最長 10 秒・待つ数は最大 32** で、超えたら 5 の
+     代わりの応答（接続を握り続けない。`MAX_CONNECTIONS` は miharashi と共有）。取った `OwnedSemaphorePermit` は
+     `spawn_blocking` のクロージャに move し、生成が終わるまで持つ（クライアントが切っても復号が枠を超えて走らない）。
+     クロージャは `make_thumbnail(元, 320)` → `derivative.rs:951` の `write_atomic(thumbs/<id>-<gen>.jpg, bytes)`（同じ
+     ディレクトリに `.part` を `O_EXCL` で作り、`sync_all` して rename。既存）。成功したら古い世代を消す: `thumbs/` の実体が
+     そのディレクトリ自身であること（`derivative_dest` と同じ検査）を確かめ、`symlink_metadata` で通常のファイルで、名前が
+     `^<id>-[0-9a-f]{12}\.jpg$` に合い、今の `<gen>` でないものだけ。消す直前に DB の世代をもう一度引き、自分の世代が今の
+     世代のときだけ消す（回転の直前に始めた生成が、回転後の世代を消さない）。起動時の掃除（`ingest.rs:260-320`）に
+     `thumbs/` の `.part` を加える。
+  5. 代わりの応答: 元ファイルが拡張子で画像（jpg/jpeg/png）と分かるときだけ、`webpath::classify("/<display>")` →
+     `serve_data` と同じ経路で元ファイルを返し（領域の検査・`static_slots`・HEAD の扱いを使い回す）、`Cache-Control:
+     no-store` を付ける（`Last-Modified`・304 は付けない）。画像でなければ 404。
+     失敗の記憶 `thumb_failed: Mutex<HashSet<(i64, [u8; 6])>>` の鍵は **DB から計算した `<id>-<gen>`** だけ（`v` は使わない。
+     上限は写真の枚数 × 世代の数で有限）。覚えるのは「復号できない」「上限を超える」の失敗だけで、`thumbs/` に書けない
+     （ディスクが満杯・権限）失敗は覚えず次の要求で再試行する。上限 10,000 件（超えたら全部忘れる）。ログは失敗の初回に
+     1 行（WARN、ID と分類 `decode`/`limit`/`write` だけ。エラーの文面・パスは出さない）。
 - 応答ヘッダ（キャッシュから返すとき）: `Content-Type: image/jpeg`、`Content-Length`、`Last-Modified`、
   `ETag: "<gen>"`（`thumb.rs` が付ける。`serve_data` のデータ画像は今までどおり ETag 無し）、`If-None-Match` が一致すれば 304、
   `Cache-Control: private, max-age=604800`（URL に世代があるので長くてよい）。`file_response`（`statics.rs:170`。非公開の
   応答の組み立て）は `pub(crate)` にして使う。
 - パスは DB の `display` と `derivatives/<drive_id>.jpg`、`thumbs/<id>-<gen>.jpg` からだけ作る。クライアントの文字列は
   `<id>`（数字）以外使わない。
-- 定数: `THUMB_PX = 320`、`THUMB_QUALITY = 80`、`THUMB_CONCURRENCY = 2`、`THUMB_FAILED_MAX = 4096`。復号の上限は既存の
-  derivative の作成と同じ（`imaging` の画素数の上限をそのまま使う）。
+- 復号の上限はサムネイル専用に厳しくする: 入力 `THUMB_MAX_INPUT_BYTES = 64 MiB`、`THUMB_MAX_INPUT_PIXELS = 50,000,000`
+  （既存の derivative 用は 512 MiB・約 1.79 億画素（`derivative.rs:43-45`）で、ローカルの原本は 2,560px でなく原寸のまま
+  `display` になる（`local.rs:702`）ため、そのままでは 2 枚同時で 1〜2 GB になり得る）。超えたら作らずに代わりの応答へ回し、
+  `limit` として覚える。Drive の写真は 2,560px の derivative から作るので上限に当たらない。JPEG は復号器が対応していれば
+  縮小復号（DCT の 1/2〜1/8）を使う。
+- 定数: `THUMB_PX = 320`、`THUMB_QUALITY = 80`、`THUMB_CONCURRENCY = 2`、`THUMB_WAIT_MAX = 10 s`、`THUMB_QUEUE_MAX = 32`、
+  `THUMB_FAILED_MAX = 10_000`。
 
 ### `GET /api/admin/library/trips`（新。PR ②）
 
@@ -291,7 +316,7 @@ cs = {
 {"ok": true,
  "trips": [{"key": "2024-05-03 09:12", "start": "2024-05-03 09:12", "end": "2024-05-05 18:40",
             "count": 212, "noloc": 7,
-            "places": [{"pref": "京都府", "city": "京都市", "count": 150}, {"pref": "滋賀県", "city": "大津市", "count": 40}],
+            "places": [{"pref": "架空県", "city": "架空市", "count": 150}, {"pref": "試験県", "city": "試験町", "count": 40}],
             "cover": {"id": 1234, "thumb_url": "/thumb/1234.jpg?v=0f3a…"}}],
  "untimed": 12}
 ```
@@ -304,9 +329,13 @@ cs = {
 
 ### `GET /api/admin/library/photos`（新。PR ②）
 
-- 引数: `from`・`to`（`YYYY-MM-DD HH:MM`。両端を含む）、`bbox=minlon,minlat,maxlon,maxlat`、`ids=1,2,3`（最大 200）、
-  `pref`・`city`（R10）、`untimed=1`（日時なし）、`hidden=1`、`page`（既定 1）、`per`（既定 60、1〜200）。
-  絞り込みが 1 つも無ければ 400 `bad_params`。日時・数値の形が違えば 400。
+- 引数: `from`・`to`（`YYYY-MM-DD HH:MM`。各桁が数字で日時として成り立つこと、`from <= to`。両端を含む。`taken_at` は
+  分までの 16 文字（`imaging::norm_time`）なので `to` を分まで含めれば旅の最後の写真は欠けない）、
+  `bbox=minlon,minlat,maxlon,maxlat`（有限、lon は ±180、lat は ±90、`min <= max`。日付変更線をまたぐ範囲は扱わず、画面が
+  `getBounds()` の値を範囲内に丸めてから送る）、`ids=1,2,3`（整数、重複を除いて最大 200）、`pref`・`city`（R10。文字数で
+  64 まで、比較は `=`）、`untimed=1`（日時なし）、`hidden=1`（`1` 以外は既定）、`page`（既定 1。既存の `admin::photos` と
+  同じく `clamp(1, pages)`）、`per`（既定 60、1〜200）。絞り込みが 1 つも無ければ 400 `bad_params`。形が違えば 400。
+  SQL の条件は固定の候補の文字列だけから組み、値はすべてバインドする（`set_flag` の流儀）。
 - 応答: `{ok, page, per, pages, total, items: [LibraryPhoto]}`。
   `LibraryPhoto = {id, name, thumb, thumb_url, taken_at, lat, lon, loc_source, place, pref, city, favorite, hidden, rotation, source}`
   （`thumb` は `thumb_for` と同じ表示用画像。ビューアが使う）。並びは `taken_at` 昇順（空は最後）、`id` 昇順。
@@ -401,7 +430,8 @@ CASE WHEN q.group_id IS NULL THEN 0
 ### `GET /api/admin/curation/groups`（新。PR ③）
 
 - 引数: `state=unconfirmed|confirmed|all`（既定 `unconfirmed`。`unconfirmed` は `recheck` を含む）、
-  `kind=all|exact|similar`、`ids=<photo_id,…>`（そのグループだけ。段の読み直し用）、`page`、`per`（既定 20、1〜50）。
+  `kind=all|exact|similar`、`ids=<photo_id,…>`（そのグループだけ。段の読み直し用。整数、重複を除いて最大 200）、
+  `page`（`clamp(1, pages)`）、`per`（既定 20、1〜50）。
 - 応答:
 
 ```json
@@ -409,7 +439,7 @@ CASE WHEN q.group_id IS NULL THEN 0
  "groups": [{"kind": "similar", "group_id": 17, "token": "3f9c…", "state": "recheck", "taken_at": "2024-05-03 09:12",
    "count": 3, "warning": null,
    "members": [{"id": 101, "name": "IMG_0001.jpg", "thumb": "/derivatives/…", "thumb_url": "/thumb/101.jpg?v=…",
-                "taken_at": "2024-05-03 09:12", "place": "…", "pref": "…", "city": "…", "lat": 35.0, "lon": 135.7,
+                "taken_at": "2024-05-03 09:12", "place": "…", "pref": "架空県", "city": "架空市", "lat": 10.0, "lon": 20.0,
                 "favorite": false, "hidden": false, "rotation": 0, "source": "drive",
                 "rank": 1, "score": 78.5, "reasons": ["…"], "issues": [],
                 "recommended": true, "effective": true, "curation": "representative" | "reviewed" | "stale" | null}]}]}
@@ -429,16 +459,26 @@ CASE WHEN q.group_id IS NULL THEN 0
   `representatives` は 1〜50 件、重複なし、または `null`（人の代表を持たず、解析の推奨のまま確認済み）。
   画面の「このままで確認済み」は、段に有効な人の代表があればそれを `representatives` に入れて送る（黙って解析の推奨に
   戻さない）。
-- 検査（1 トランザクション、`writer`。`BEGIN IMMEDIATE`）: `(kind, group_id)` の世代の合うメンバーを引き、2 枚以上あり、
-  その `token` が本文と一致すること。違えば 409 `{"ok": false, "error": "group_changed"}`（組が消えた・組み替わった・
-  メンバーの内容が変わった、をまとめて扱う）。`representatives` はメンバーの部分集合であること（違えば 400 `bad_params`）。
-- 代表の検査: `representatives` の各写真は `hidden=0` かつ `lat`・`lon` がある（フィードに出せる）こと。違えば 400
-  `{"ok": false, "error": "representative_not_visible"}`。画面は除外・位置なしのメンバーのチェックボックスを無効にする。
+- 本文の型: `kind` は 2 値のどちらか、`group_id` は `as_i64()` で取れて 1 以上、`token` は 16 桁の小文字 hex、
+  `representatives` の各要素は `as_i64()` で取れて 1 以上（`1.0`・負数・0・真偽値・`u64` を超える数は 400）。
+  **`representatives` のキーが無ければ 400**（`null` は明示したときだけ。壊れたクライアントが人の代表を黙って消さない）。
+- 判定の順序は `set_flag` と同じ: 本文の形 400 → `writer_or_unavailable` 503 → トランザクションの中で 409 `group_changed` →
+  400 `representative_not_visible`。AC7 の 503 の試験は正しい形の本文で行う。
+- 検査（`transaction_with_behavior(Immediate)`。`Writer::call` はトランザクションを張らない（`writer.rs:239-241`）ので
+  自分で張る。`quality-scan` の再構築は別の接続から `BEGIN IMMEDIATE` で全行を入れ替えるため、遅延開始で読んでから書くと
+  `SQLITE_BUSY_SNAPSHOT` になる）: `(kind, group_id)` の世代の合うメンバーを引き、2 枚以上あり、その `token` が本文と
+  一致すること。違えば 409 `{"ok": false, "error": "group_changed"}`（組が消えた・組み替わった・メンバーの内容が変わった、
+  をまとめて扱う）。`representatives` はメンバーの部分集合であること（違えば 400 `bad_params`）。待ち切れなかった BUSY は
+  503（500 にしない）。
+- 代表の検査（同じトランザクション）: `representatives` の各写真が、フィードの品質以外の条件（`list_photos` の WHERE から
+  品質の条件を除いた述語を SQL 片として共有: `lat IS NOT NULL AND lon IS NOT NULL AND display IS NOT NULL AND display!=''
+  AND COALESCE(hidden,0)=0`）を満たすこと。違えば 400 `{"ok": false, "error": "representative_not_visible"}`。画面は除外・
+  位置なしのメンバーのチェックボックスを無効にする。旧 AI 選別は人の代表を抑止しない（上の節）ので条件に入れない。
 - 書き込み（同じトランザクション）: `DELETE FROM photo_curation WHERE photo_id IN (<メンバー>)` → 各メンバーに `role`
   （代表なら `representative`、他は `reviewed`）と世代の 4 列・`decided_at` を INSERT。
 - 応答: `{ok: true, group: <groups と同じ 1 組>}`。
-- 失敗: 本文の形が違えば 400 `bad_params`、`INGEST=0` は 503、CSRF は 403（既存）。エラーの本文は `error` の符号だけで、
-  SQL やパスを含めない。
+- 失敗: 本文の形が違えば 400 `bad_params`、`INGEST=0` は 503、CSRF は 403（既存）。エラーの本文は固定の符号だけで、
+  ID の一覧・SQL・パスを含めない。
 
 ### `POST /api/admin/curation/reset`（新。PR ③）
 
@@ -453,8 +493,9 @@ CASE WHEN q.group_id IS NULL THEN 0
 
 ### `GET /api/v1/photos`（PR ③。項目は不変）
 
-- `quality_recommended` と `quality_role`、exact の除外条件を `EFFECTIVE_RECOMMENDED` で計算する。人の記録が無い DB では
-  値も不変。契約の文書と `photo-feed.schema.json`（`description` だけ）の `quality_recommended` に「管理画面で人が代表に
+- `quality_recommended` と `quality_role`、exact の除外条件を `EFFECTIVE_RECOMMENDED` で計算する。`QUALITY_VISIBLE_EFFECTIVE`
+  は既存の `hidden=0`・位置・`display`・`ai_visible()` の条件と AND でつなぐ（人の代表でも、確定後に除外した写真は出ない。
+  AC4 で確かめる）。人の記録が無い DB では値も不変。契約の文書と `photo-feed.schema.json`（`description` だけ）の `quality_recommended` に「管理画面で人が代表に
   選んだ写真があるグループでは、その写真だけが `true`（解析の推奨は使わない）」を足す。型・`required` は変えない。
 - 旧 AI 選別との関係は「`photo_curation` 表」の節のとおり（`shown` に有効な推奨、人の代表は抑止を免れる）。
 - 人の代表は `confirm` で「出せる写真」に限っているが、確定後に除外・位置の削除で出せなくなることはある。そのときは
@@ -465,7 +506,10 @@ CASE WHEN q.group_id IS NULL THEN 0
 
 - `thumbs/`（データディレクトリ直下。`datadir.rs` に項目を足し、`webpath.rs` の `Area` に `Thumbs` を足して `serve_data` と
   同じ領域の検査を受ける）。1 枚 15〜30 KB、6,500 枚で 200 MB 弱。古い世代は再生成時に消す。消しても次の要求で
-  作り直せる（バックアップの対象外。`backup-catalog.sh` は触らない）。
+  作り直せる（バックアップの対象外。`backup-catalog.sh` は触らない）。writer の無い起動では作らない（上の `/thumb/` の節）。
+- `photos.id` は `INTEGER PRIMARY KEY`（AUTOINCREMENT でない）ので ID は再利用され得るが、サムネイルは世代、`photo_curation`
+  は世代の 4 列を鍵に含むので取り違えない。消した写真の `thumbs/<id>-*.jpg` と `photo_curation` の行は残る（URL からは
+  引けない）。掃除は C（運用コンソール）の対象としてリスクの表に書く。
 - `photo_curation`: 書き込み側（`serve` の writer）が起動時に作る。移行は無い。`INGEST=0` の読み取り専用の DB では
   作らず、読む側が無いものとして動く。
 - 旅・集計は毎回 SQL から計算する（6,500 行で 10 ms 台。キャッシュは作らない）。
@@ -476,6 +520,9 @@ CASE WHEN q.group_id IS NULL THEN 0
   `ids` は整数 200 件まで、`pref`/`city` は 64 文字まで（SQL はすべてバインド）。`confirm` の本文は整数の配列だけ。
 - 書き込みは既存の `post.rs` の経路（Host → メソッド → `route_of` → CSRF → 64 KiB → JSON → `writer_or_unavailable`）。
   新しい POST は 2 本だけ、どちらも `photos`・`photo_quality` の存在を検査して 1 トランザクションで書く。
+- 外部公開のとき: `/thumb/`・`/api/admin/library/*`・`/api/admin/curation/*` は管理用の経路で、Cloudflare Access の保護の
+  外（miharashi 用の `/api/v1/photos`・`/derivatives/` の素通し）に入れてはいけない。`/thumb/` は連番の ID で除外した写真も
+  引ける。
 - 権限: 認証は無い（LAN 内、ADR 0008）。新しい API が出す情報（撮影地の座標・地名・サムネイル）は既存の
   `/api/admin/photos` と `/derivatives/` が既に出しているものと同じ範囲。`points` は全写真の座標を 1 回で返すが、
   `/api/admin/photos?per=200` を回せば同じものが取れるので、露出の範囲は変わらない。
@@ -484,6 +531,9 @@ CASE WHEN q.group_id IS NULL THEN 0
   ディレクトリに tmp を作って rename）。ファイル名は `<id>-<gen>.jpg` で固定。生成の失敗で元ファイルを返すのは、拡張子で
   画像と分かるときだけ（`catalog.db` のような画像でないファイルを返さない）。
 - 外部への通信: 無し（地図タイルは既存のプロキシ）。秘密情報は扱わない。ログにパス・座標を出さない。
+- 文書・試験データ・画面写真: 応答の例と新しいフィクスチャは既存の `admin-api-catalog.sql` と同じ流儀（架空の地名、明らかに
+  合成と分かる座標）。試験の画像は `image` crate でコードから作り、本番のデータディレクトリから写さない。PR・文書に貼る
+  画面写真は合成データだけ（本番のコピーで目視した画面は貼らない。写真の集まり方で自宅が分かる）。
 - 資源: サムネイルの生成は同時 2 つ、同じ写真は ID ごとのロックで 1 つ、1 枚 50〜150 ms 程度（2,560px の JPEG の復号が主）。
   初回の旅の一覧で 60 枚なら数秒で埋まる。`spawn_blocking` なので待ち受けは止まらない。復号の画素数の上限は derivative の
   作成と同じ値を使い、超えるものは失敗として覚える。`confirm`・`reset` は 1 トランザクションで検査と書き込みを行い、
@@ -493,10 +543,10 @@ CASE WHEN q.group_id IS NULL THEN 0
 
 | AC | 試験 | 置き場 |
 |---|---|---|
-| AC1 | 合成 JPEG（`image` crate で 1200×800 を作る）を `derivatives/` に置き、`/thumb/<id>.jpg` の 200・寸法・`ETag` の存在と `If-None-Match` の 304・`mtime` 変更後の再生成と古い世代の削除・404（数字でない、無い写真）・403（領域の外へのリンク）・壊れた JPEG で元ファイルを返し 2 回目は復号せず返す（失敗の記憶。生成関数の呼び出し回数を数える）・同じ写真への同時 8 要求で生成が 1 回（ID ごとのロック）。`/derivatives/` のヘッダ不変は既存試験 | `tests/thumb.rs`（新）＋ `thumb.rs` の単体試験 |
+| AC1 | 合成 JPEG（`image` crate で 1200×800 を作る）を `derivatives/` に置き、`/thumb/<id>.jpg` の 200・寸法・`ETag` の存在と `If-None-Match` の 304・`mtime` 変更後の再生成と古い世代の削除・404（数字でない、無い写真）・403（領域の外へのリンク）・壊れた JPEG で元ファイルを返し 2 回目は復号せず返す（失敗の記憶。生成関数の呼び出し回数を数える）・同じ写真への同時 8 要求で生成が 1 回（ID ごとのロック）・`display` が `catalog.db`・`../x`・`tmp/x` を指す行は 404 で本文が DB でない・寸法だけ大きい合成 PNG は代わりの応答（上限）・GPS 付きの合成 JPEG から作ったサムネイルに APP1（EXIF）が無い・`Sec-Fetch-Site: cross-site` は 403・HEAD は生成しない・待ち合わせ中に要求を drop しても同時の生成が 2 を超えない（単体）。`/derivatives/` のヘッダ不変は既存試験 | `tests/thumb.rs`（新）＋ `thumb.rs` の単体試験 |
 | AC2 | 新しいフィクスチャ `tests/fixtures/library-catalog.sql`（10 分・1 時間 30 分・8 時間・ちょうど 48 時間・9 日の差、位置なし、日時なし、除外を含む）で `trips` の境界・`noloc`・`untimed`・`hidden=1` の差を独立した期待値で検証。描画試験で旅 → 格子 → ビューア → ★ → `POST setflag` の `id` → タイルの印の更新（購読者）。写真タブのカードが変わらないことも見る | `tests/library_api.rs`（新）、`web/tests/library_render.mjs`（新）＋ `tests/admin_ui_library.rs` |
 | AC3 | `points` の位置なし除外・`from`/`to`・`bbox` の絞り込み（結合）。`truncated` は切り詰めの関数（`fn truncate_points(rows, max)`）の単体試験（結合試験のバイナリでは `#[cfg(test)]` の定数が効かないため）。描画試験で偽 MapLibre の `setData`、点を押したときの `ids=` 要求と吹き出し、`bbox` 要求 | 同上 |
-| AC4 | 新しいフィクスチャ `tests/fixtures/curation-catalog.sql`（`admin-api-catalog.sql` は similar 1 組・exact 1 組なので流用しない）: exact 1 組・similar 2 組（1 組は同じ SHA の 2 枚を含む）。`confirm` → `groups`・`/api/v1/photos`・`status` の `db.quality.recommended`・`photo_quality` の入れ直し（`group_id` を変える）後も保持。`reviewed` のみ・`reset`・上の境界の表の 5 行 | `tests/curation_api.rs`（新） |
+| AC4 | 新しいフィクスチャ `tests/fixtures/curation-catalog.sql`（`admin-api-catalog.sql` は similar 1 組・exact 1 組なので流用しない）: exact 1 組・similar 2 組（1 組は同じ SHA の 2 枚を含む）。`confirm` → `groups`・`/api/v1/photos`・`status` の `db.quality.recommended`・`photo_quality` の入れ直し（`group_id` を変える）後も保持。`reviewed` のみ・`reset`・上の境界の表の 5 行・代表に記録した後で除外にした写真は `/api/v1/photos` に出ない・`photo_quality` を入れ替える書き込みと同時に `confirm` しても表が半端にならない | `tests/curation_api.rs`（新） |
 | AC5 | 確認済みの組に 1 枚足す → `recheck`。メンバーの `mtime` と `photo_quality` の世代を変える（再解析後を模す）→ `recheck`・`stale`。`token` 違いの `confirm`・`reset` → 409 で表が不変。`representative_not_visible` → 400 で表が不変 | 同上 |
 | AC6 | 既存のフィードの試験（契約・endpoint・miharashi）が無変更で通る。`photo_curation` 無しの DB で `list_photos` の SQL が従来と同じ結果（単体）。旧 AI の組と重なる合成ケース（人の代表が旧 AI の非推薦でも出る） | 既存 ＋ `photos.rs` の単体試験 ＋ `tests/legacy_selection.rs` |
 | AC7 | CSRF 403・`INGEST=0` 503・表の無い DB で各 GET が 200・新しい GET への POST が 403 | `tests/curation_api.rs`・`tests/library_api.rs` |
@@ -520,6 +570,7 @@ CASE WHEN q.group_id IS NULL THEN 0
 | ビューアの共通化で写真タブの挙動が変わる | 既存の `photos_render.mjs` の (p)(q)(q2) をそのまま通す。`openModal(index)`・`viewerIndex` の外部の挙動は変えない。別の配列から開いて正しい ID に POST する試験を足す |
 | 回転のあとカードが古いサムネイルを出す | `POST /api/admin/rotate` の応答に `thumb_url` を足し、`applyPhoto` の patch に含める（描画試験に回転後の `src` を足す） |
 | 回転・原本の更新の直後、残りのメンバーだけで `confirmed` に見える | 設計上の限界として文書化。再解析・再構築で `recheck` に戻る |
+| 消した写真の `thumbs/` のファイルと `photo_curation` の行が残る | 害は無い（URL から引けず、世代で取り違えない）。掃除は C（運用コンソール）で |
 | 偽 MapLibre では地図の見た目を検証できない | A と同じく検証環境で目視。描画試験は source に渡るデータと要求の URL を検証する |
 | `tests/admin_api.rs` の完全一致が落ちる | `status` に足す項目は `python_shape` で除く。`/api/admin/photos` は触らない |
 
