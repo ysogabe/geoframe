@@ -29,7 +29,6 @@ const ls = {
   seq: {trips: 0, grid: 0, points: 0, popup: 0, calendar: 0, places: 0},
 };
 
-const NO_IMAGE_TEXT = '画像なし';
 const LIB_POINTS_SOURCE = 'photos';
 
 function libQuery(obj){
@@ -361,6 +360,13 @@ function libPhotoChanged(id, patch){
     Object.assign(photo, patch);
     if(ls.tiles[i]) paintTile(ls.tiles[i], photo);
   });
+
+  // 位置・除外が変わると地図の点が変わる（★は点に出ない）。飛んでいる点の応答は捨て、地図が見えていれば取り直し、
+  // 見えていない（旅の一覧・範囲の格子の上、別のタブ）なら印だけ立てて、地図に戻るとき（closeGrid・setLibView・openLibraryTab）に読む
+  if(patch && ('lat' in patch || 'lon' in patch || 'hidden' in patch)){
+    if(ls.view === 'map' && !ls.grid && !$('#v-library').classList.contains('hidden')) loadPoints();
+    else{ ls.seq.points++; ls.pointsStale = true; }
+  }
 }
 
 /* ==== 6) 地図 ==== */

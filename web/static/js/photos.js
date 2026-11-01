@@ -487,6 +487,8 @@ function closeSearch(){
 let viewerIndex = -1;
 /* ビューアが前後に動く配列。null のときは写真タブの ps.entries（既定）。ライブラリなど写真タブ以外から開くときは、
    openModalFor が渡された配列を {photo, group: null} の形にして入れる。ps.entries は触らない */
+/* 画像が無い・読めないときの代わりの表示の文言（ビューアと library.js の格子・表紙・吹き出しで共通） */
+const NO_IMAGE_TEXT = '画像なし';
 let viewerEntries = null;
 let viewerAiShown = true;        // false のとき（openModalFor の opts.ai === false）AI 評価の欄を出さない
 let viewerLastFocus = null;
@@ -511,14 +513,25 @@ function fillList(node, values, fallback){
   items.forEach(v => node.appendChild(el('li', null, v)));
 }
 function vEntries(){ return viewerEntries || ps.entries; }
+/* 共通ビューアの画像の代わりの表示（R8）。ok === false のとき画像を隠して「画像なし」を出す */
+function showViewerImage(ok){
+  $('#viewer-image').classList.toggle('hidden', !ok);
+  const none = $('#viewer-noimage');
+  none.textContent = NO_IMAGE_TEXT;
+  none.classList.toggle('hidden', ok);
+}
 function renderModal(){
   const list = vEntries();
   const entry = list[viewerIndex];
   if(!entry) return;
   const photo = entry.photo, group = entry.group, ai = photo.ai, visual = photo.visual;
   const image = $('#viewer-image');
-  image.src = photo.thumb;
+  /* 画像の表示に戻してから入れる（前の写真で「画像なし」を出していても、この写真は読めるかもしれない）。
+     表示用ファイルが無い（thumb が空）ときは最初から代わりの表示。読めないとき（404・復号失敗）は initPhotos の error で */
+  showViewerImage(true);
+  image.src = photo.thumb || '';
   image.alt = photo.name;
+  if(!photo.thumb) showViewerImage(false);
   $('#viewer-title').textContent = '#' + photo.id + '  ' + photo.name;
   $('#viewer-meta').textContent = photo.taken_at || '撮影時刻なし';
   $('#viewer-counter').textContent = (viewerIndex + 1) + ' / ' + list.length;
@@ -879,6 +892,7 @@ function initPhotos(){
   $('#modal').addEventListener('click', e => { if(e.target.id === 'modal') closeLocModal(); });
 
   $('#viewer-close').addEventListener('click', closeModal);
+  $('#viewer-image').addEventListener('error', () => showViewerImage(false));
   $('#viewer-prev').addEventListener('click', () => stepModal(-1));
   $('#viewer-next').addEventListener('click', () => stepModal(1));
   $('#viewer').addEventListener('click', e => { if(e.target === $('#viewer')) closeModal(); });

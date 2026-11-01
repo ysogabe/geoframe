@@ -699,7 +699,7 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
   assert.ok(rules.some(([sel, body]) => sel === '.hidden' && /display:\s*none/.test(body)));
   // library.js が .hidden を付け外しする要素（id）と、その class
   const html = fs.readFileSync(new URL('../static/admin.html', import.meta.url), 'utf8');
-  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-map-box', 'lib-grid-box', 'lib-period', 'lib-empty'];
+  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-map-box', 'lib-grid-box', 'lib-period', 'lib-empty', 'viewer-noimage'];
   const selectorsOf = id => {
     const tag = html.match(new RegExp('<[^>]*id="' + id + '"[^>]*>'));
     assert.ok(tag, id);
@@ -714,6 +714,8 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
         sel + ' に display があるのに ' + sel + '.hidden{display:none} が無い');
     }
   }
+  // 共通ビューアの画像（.ps-viewer-media img の display が .hidden に勝つ）にも対の規則
+  assert.ok(rules.some(([sel, body]) => sel === '.ps-viewer-media img.hidden' && /display:\s*none/.test(body)));
   // 逆向きの確認: .lib-* / #lib-* の display を持つ規則のうち、.hidden を付ける要素のものは上の対を持つ
   const libDisplay = rules.filter(([sel, body]) => /^[#.]lib-[\w-]+$/.test(sel) && /(^|;)\s*display:/.test(body)).map(([sel]) => sel);
   const hasPair = sel => rules.some(([rsel]) => rsel === sel + '.hidden');
@@ -1086,6 +1088,92 @@ await test('(r) 格子のタイルの 📍 で位置の指定が開く（ビュ�
   // 別の場所（タイルの子の画像）から送ったクリックなら、バブリングでタイルに届いてビューアが開く
   t[0].querySelector('img').dispatchEvent({type: 'click', bubbles: true});
   assert.equal(hidden(env, '#viewer'), false, '画像のクリックはビューアを開く');
+});
+
+await test('(s) 共通ビューアの「画像なし」: 格子から開いても地図の吹き出しの「開く」から開いても、thumb が空なら代わりの表示。次の写真で消える', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const shown = () => ({none: !hidden(env, '#viewer-noimage'), img: !hidden(env, '#viewer-image'),
+                        text: env.$('#viewer-noimage').textContent});
+  rows(env)[0].querySelector('.lib-trip-photos').click();
+  await settle();
+  // 格子: 503 は thumb が空
+  tiles(env)[2].click();
+  assert.equal(env.$('#viewer-title').textContent, '#503  c.jpg');
+  assert.deepEqual(shown(), {none: true, img: false, text: '画像なし'});
+  env.$('#viewer-prev').click();             // 502（thumb あり）へ
+  assert.equal(env.$('#viewer-title').textContent, '#502  b.jpg');
+  assert.deepEqual(shown(), {none: false, img: true, text: '画像なし'});
+  // 読めないとき（error）も同じ。次の写真で戻る
+  env.$('#viewer-image').dispatchEvent({type: 'error'});
+  assert.deepEqual(shown(), {none: true, img: false, text: '画像なし'});
+  env.$('#viewer-prev').click();
+  assert.deepEqual(shown(), {none: false, img: true, text: '画像なし'});
+  env.$('#viewer-close').click();
+  // 地図の吹き出しの「開く」: 503 を ids= で引いた 1 枚
+  env.$('#lib-back').click();
+  env.$('#lib-view-map').click();
+  await settle();
+  env.handlers.photos = () => reply({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [P503]});
+  mapOf(env).fire('click', {features: [{properties: {id: 503}, geometry: {coordinates: [20.5, 10.5]}}]}, 'lib-point');
+  await settle();
+  env.fake.popups.at(-1).content.querySelector('.lib-pop-open').click();
+  assert.equal(env.$('#viewer-title').textContent, '#503  c.jpg');
+  assert.deepEqual(shown(), {none: true, img: false, text: '画像なし'});
+});
+
+await test('(t) 位置・除外が変わると地図の点を取り直す: 範囲の格子の上では印だけ立てて戻るとき、地図が見えていればすぐ。★だけなら読まない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-map').click();
+  await settle();
+  const pointReqs = () => env.reqs('/api/admin/library/points');
+  assert.equal(pointReqs().length, 1);
+  // 地図 → 範囲の格子 → 位置を変える → 戻る
+  env.$('#lib-bbox').click();
+  await settle();
+  const held = [];
+  env.handlers.points = () => new Promise(res => held.push(() => res({ok: true, status: 200, json: () =>
+    Promise.resolve(pointsBody({features: [feature(999, 1, 1)]}))})));
+  env.$('#lib-back').click();
+  env.$('#lib-bbox').click();
+  await settle();
+  env.handlers.points = null;
+  const before = pointReqs().length;
+  env.context.libPhotoChanged(502, {lat: 35, lon: 139, loc_source: 'manual'});
+  assert.equal(pointReqs().length, before, '格子の上では読まない');
+  assert.equal(env.ev('ls.pointsStale'), true);
+  env.$('#lib-back').click();
+  await settle();
+  assert.equal(pointReqs().length, before + 1, '戻ると点を取り直す');
+  assert.equal(env.ev('ls.pointsStale'), false);
+  // 飛んでいた古い点の応答は捨てる
+  const setData = mapOf(env).sources.photos.setDataCalls.length;
+  held.forEach(f => f());
+  await settle();
+  assert.equal(mapOf(env).sources.photos.setDataCalls.length, setData);
+  // ★だけの patch では読まない
+  const n = pointReqs().length;
+  env.context.libPhotoChanged(501, {favorite: true});
+  await settle();
+  assert.equal(pointReqs().length, n);
+  assert.equal(env.ev('ls.pointsStale'), false);
+  // 地図が見えている間の除外の patch はすぐ取り直す
+  env.context.libPhotoChanged(501, {hidden: true});
+  await settle();
+  assert.equal(pointReqs().length, n + 1);
+  // 別のタブ（写真タブ）にいるときは読まず、ライブラリへ戻るとき読む
+  env.$('.tab[data-tab=photos]').click();
+  await settle();
+  const m = pointReqs().length;
+  env.context.libPhotoChanged(501, {lat: 36, lon: 140});
+  assert.equal(pointReqs().length, m);
+  assert.equal(env.ev('ls.pointsStale'), true);
+  await openLib(env);
+  assert.equal(pointReqs().length, m + 1);
+  assert.equal(env.ev('ls.pointsStale'), false);
 });
 
 console.log(`ok (${n})`);

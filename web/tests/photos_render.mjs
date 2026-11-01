@@ -1007,6 +1007,25 @@ await test('(p) ビューア: 画像クリックで開き、stepModal が ps.ent
   assert.equal(hidden(env, '#viewer'), true);
 });
 
+await test('(p3) ビューアの画像が読めない（error）と「画像なし」が出て、次の写真に移ると消える。thumb が空なら最初から出る', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  await openPhotos(env);
+  await searchFor(env, '犬');
+  const shown = () => ({none: !hidden(env, '#viewer-noimage'), img: !hidden(env, '#viewer-image'),
+                        text: env.$('#viewer-noimage').textContent});
+  gcards(env)[1].querySelector('.ph').click();
+  assert.deepEqual(shown(), {none: false, img: true, text: '画像なし'});
+  env.$('#viewer-image').dispatchEvent({type: 'error'});
+  assert.deepEqual(shown(), {none: true, img: false, text: '画像なし'});
+  vm.runInContext('stepModal(1)', env.context);
+  assert.deepEqual(shown(), {none: false, img: true, text: '画像なし'}, '次の写真では画像の表示に戻る');
+  // thumb が空の写真は、error を待たずに代わりの表示
+  vm.runInContext("vEntries()[viewerIndex].photo.thumb = ''; renderModal()", env.context);
+  assert.deepEqual(shown(), {none: true, img: false, text: '画像なし'});
+  env.$('#viewer-close').click();
+});
+
 await test('(p2) 一覧のカードも同じビューアで開ける（AI の欄は出さず、一覧の並びで前後へ）。検索を閉じるとビューアも閉じる', async () => {
   const env = makeEnv({pathname: '/admin'});
   await env.boot();

@@ -344,6 +344,7 @@ export function buildAdminDom(){
   mk('button', {id: 'viewer-prev', cls: 'ps-viewer-nav ps-viewer-prev', text: '‹'}, shell);
   const media = mk('div', {id: 'viewer-media', cls: 'ps-viewer-media'}, shell);
   mk('img', {id: 'viewer-image'}, media);
+  mk('div', {id: 'viewer-noimage', cls: 'img-broken hidden'}, media);
   mk('div', {id: 'viewer-image-score', cls: 'ps-viewer-imgscore'}, media);
   const aside = mk('aside', {cls: 'ps-viewer-detail'}, shell);
   const over = mk('div', {cls: 'ps-viewer-overline'}, aside);
