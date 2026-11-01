@@ -272,8 +272,8 @@ cs = {
 - GET だけ生成する。HEAD はキャッシュがあれば本文なしで返し、無ければ 404（生成しない）。
 - 重ねがけ（HTTPS で配るときだけ効く）: `Sec-Fetch-Site` が `cross-site`・`same-site` なら 403（`same-origin`・`none`・
   ヘッダ無しは通す）。応答に `Cross-Origin-Resource-Policy: same-origin` を付ける。
-- 書き込み側（writer）が無い起動（`INGEST=0`）では生成しない。キャッシュがあれば返し、無ければ 5 の代わりの応答
-  （データディレクトリへの新しい書き込み経路を黙って増やさない）。
+- 書き込み側（writer）が無い起動（`INGEST=0`）では生成しない。キャッシュがあれば返し、無ければ 5 の「書けない」と同じく
+  元の表示用画像を返す（データディレクトリへの新しい書き込み経路を黙って増やさない）。
 - 世代 `gen` = SHA-256（依存に既にある `ring::digest::SHA256`。`blake3`/`sha2` は足さない）の先頭 12 hex。入力は
   `display | md5 | mtime | THUMB_VERSION` を `|` で連結（`md5`・`mtime` が NULL なら空。`THUMB_VERSION` は `THUMB_PX`・品質を
   変えたときに上げる定数で、古いファイルと ETag が残らないようにする）。API の `thumb_url` は `/thumb/<id>.jpg?v=<gen>`。
@@ -287,7 +287,7 @@ cs = {
      通常のファイル以外は 404。`statics.rs:312-345` の検査を関数に切り出して共有する）。
   2. `thumbs/<id>-<gen>.jpg` があれば返す（`thumbs/` も領域として同じ検査。`static_slots` の `try_acquire` を通り、空きが
      無ければ 503。`serve_data` と同じ）。
-  3. 失敗の記憶 `thumb_failed`（下記）に `<id>-<gen>` があれば 5 へ。
+  3. 失敗の記憶 `thumb_failed`（下記）に `<id>-<gen>` があれば、ロックも枠も取らずに 404（5 の `decode`/`limit`）。
   4. **写真 ID ごとのロック**（`AppState.thumb_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>`）を
      `lock_owned()` で取り（`OwnedMutexGuard`。生成の枠と一緒に `spawn_blocking` のクロージャへ move し、生成・失敗の記憶・
      古い世代の掃除が終わるまで持つ。要求が drop されても同じ ID の次の要求が先に生成を始めない）、取った後に 2 と 3 を
@@ -324,7 +324,7 @@ cs = {
   `<id>`（数字）以外使わない。
 - 復号の上限はサムネイル専用に厳しくする: 入力 `THUMB_MAX_INPUT_BYTES = 64 MiB`、`THUMB_MAX_INPUT_PIXELS = 50,000,000`
   （既存の derivative 用は 512 MiB・約 1.79 億画素（`derivative.rs:43-45`）で、ローカルの原本は 2,560px でなく原寸のまま
-  `display` になる（`local.rs:702`）ため、そのままでは 2 枚同時で 1〜2 GB になり得る）。超えたら作らずに代わりの応答へ回し、
+  `display` になる（`local.rs:702`）ため、そのままでは 2 枚同時で 1〜2 GB になり得る）。超えたら作らずに 404 にし、
   `limit` として覚える。Drive の写真は 2,560px の derivative から作るので上限に当たらない。JPEG は復号器が対応していれば
   縮小復号（DCT の 1/2〜1/8）を使う。
 - 定数: `THUMB_PX = 320`、`THUMB_QUALITY = 80`、`THUMB_CONCURRENCY = 2`、`THUMB_WAIT_MAX = 10 s`、`THUMB_QUEUE_MAX = 32`、
