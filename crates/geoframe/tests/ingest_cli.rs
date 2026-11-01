@@ -170,12 +170,12 @@ fn dry_run_writes_nothing_and_reports_counts() {
         ],
     );
     assert!(local_plan.status.success());
-    assert!(text(&local_plan.stdout).contains("スキーマ: 作る表・索引 13 / 足す列 0"));
+    assert!(text(&local_plan.stdout).contains("スキーマ: 作る表・索引 14 / 足す列 0"));
     assert_eq!(snapshot(data), before);
 
     assert!(
         stdout.contains(
-            "スキーマ: 作る表・索引 10 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
+            "スキーマ: 作る表・索引 11 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
         ),
         "{stdout}"
     );
@@ -337,8 +337,8 @@ fn sync_with_ingest_creates_the_schema_in_an_empty_database_file_and_runs_one_cy
             |r| r.get(0),
         )
         .unwrap();
-    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・`ai_embedding_spaces`・`ai_embedding_vectors`
-    assert_eq!(tables, 22);
+    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・`ai_embedding_spaces`・`ai_embedding_vectors`、選別の表 `photo_curation`
+    assert_eq!(tables, 23);
 }
 
 #[test]
@@ -350,9 +350,9 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     envs.push(("GEOFRAME_INGEST", "1".into()));
     let out = run_owned(&["sync", "--data-dir", dir.0.to_str().unwrap()], &envs);
     assert!(out.status.success(), "{}", text(&out.stdout));
-    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表）だけ。ほかの表・列は変えない
+    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表）と選別の表 `photo_curation` だけ。ほかの表・列は変えない
     assert!(
-        text(&out.stdout).contains("スキーマを更新しました: 作成 13件 / 列の追加 0件"),
+        text(&out.stdout).contains("スキーマを更新しました: 作成 14件 / 列の追加 0件"),
         "{}",
         text(&out.stdout)
     );

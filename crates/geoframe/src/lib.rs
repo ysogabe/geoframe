@@ -14,6 +14,7 @@ pub mod cache;
 pub mod cli;
 pub mod config;
 pub mod csrf;
+pub mod curation;
 pub mod datadir;
 pub mod db;
 pub mod drive;
