@@ -118,7 +118,8 @@
 
 - R20（必須）: 認証が無い前提の防御（Host 検査、JSON の Content-Type と Origin による CSRF 対策、POST の 64 KiB 上限、
   `INGEST=0` での書き込み API の 503、未知の POST の 403）を変えず、新しい書き込み API も同じ経路を通す。新しい
-  読み取り API は GET のみ、JSON は `Cache-Control: no-store`（画像の `/thumb/` だけ R2 の長いキャッシュを例外にする）。
+  JSON の読み取り API は GET のみで `Cache-Control: no-store`。画像の `/thumb/` は既存の画像の配信に合わせて HEAD も受けるが
+  生成はせず、成功のキャッシュだけ R2 の長いキャッシュを例外にする。
   `/thumb/` の生成は、URL の版が今の世代と一致するときだけ行い、別のサイトのページから（`<img>` の連番で）起こせない
   ようにする。書き込み側の無い起動（`INGEST=0`）では生成しない。
 - R21（必須）: `/thumb/<id>.jpg` は数字の ID だけを受け、読む元ファイルと返すファイルは `derivatives/`・`photos/`・`thumbs/`

@@ -44,7 +44,7 @@
 
 - 経路: `<id>`は数字だけ（`^[1-9][0-9]{0,17}\.jpg$`の1段。先頭の0・末尾の`/`・2段以上は404）。`v`は12桁の小文字hex。どちらも違えば404。クライアントの文字列は`<id>`と`v`以外使わない。静的配信の白名簿より前に判定する。アクセスログのラベルは`/thumb/{id}`。
 - 世代`gen`: `display|md5|mtime|THUMB_VERSION`のSHA-256の先頭12 hex（NULLは空）。回転・原本の更新で`display`や`mtime`が変わるとURLが変わるので、`Cache-Control: private, max-age=604800`で長く持たせる。サムネイルの大きさや品質を変えたら`THUMB_VERSION`を上げる。
-- 元ファイル: `photos.display`（`derivatives/`か`photos/`で始まり、`..`・絶対パス・NUL・ドット始まりの要素を含まないもの）。`display`が無ければ`derivatives/<drive_id>.jpg`（`drive_id`は英数字・`_`・`-`だけ）。元ファイルも返すファイルも領域（`derivatives/`・`photos/`・`thumbs/`）の中に限り、`/derivatives/`と同じ検査をする（領域とファイルをリンクごと解決し、外へ出るリンクは403、通常のファイル以外は404）。
+- 元ファイル: `photos.display`（`derivatives/`か`photos/`で始まり、`..`・絶対パス・NUL・ドット始まりの要素を含まないもの）。`display`が無ければ`derivatives/<drive_id>.jpg`（`drive_id`は英数字・`_`・`-`だけ）。元ファイルも返すファイルも領域（`derivatives/`・`photos/`・`thumbs/`）の中に限り、`/derivatives/`と同じ検査をする（領域とファイルをリンクごと解決し、外へ出るリンクとディレクトリは403、その他の特殊ファイルは404）。
 - キャッシュ: `GEOFRAME_DATA_DIR/thumbs/<id>-<gen>.jpg`。`.part`に書いてから`rename`する（`derivatives/`と同じ）。成功したら同じ写真の古い世代のファイルを消す（消す直前にDBの世代を引き直し、自分の世代が今の世代のときだけ）。起動時に`thumbs/`の書きかけの`.part`も掃除する。応答は`ETag: "<gen>"`・`Last-Modified`・`Cross-Origin-Resource-Policy: same-origin`を付け、`If-None-Match`が一致すれば304。
 - **生成する条件**: `GET`で、`v`がDBから計算した今の世代と一致し、書き込み側がある（`GEOFRAME_INGEST=0`でない）ときだけ。それ以外は生成しない: `HEAD`と古い`v`は、キャッシュがあればそれ、無ければ404。`Sec-Fetch-Site`が`cross-site`・`same-site`なら403（HTTPSで配るときだけ効く重ねがけ）。`INGEST=0`でキャッシュが無いときは、下の「元の画像を返す」と同じ。`gen`は同一オリジンの管理APIを読まないと分からないので、外部のページの`<img>`が連番のIDで生成を起こすことはできない。
 - 資源: 同じ写真は写真IDごとのロックで1つだけ作る。同時に作るのは2つまで。ロックと枠を合わせて待ちは最長10秒・待つ要求は最大32件で、超えたら503と`Retry-After: 5`。取ったロックと枠は`spawn_blocking`の生成が終わるまで持つので、要求が切れても復号が枠を超えて走らない。サムネイル専用の復号の上限は、入力64 MiB・5,000万画素（表示用画像の作成は512 MiB・約1.79億画素）で、全体を復号する前にファイルの大きさとヘッダの寸法で断る。

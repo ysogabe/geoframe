@@ -280,11 +280,11 @@ cs = {
 - 処理:
   1. DB で `display`・`drive_id`・`md5`・`mtime` を引く（`thumb_for` と同じ規則で元ファイルを決める。無ければ 404。
      この 404 は失敗として覚えない）。`display` は `derivatives/` か `photos/` で始まり、`datadir::lexical` と同じ字面の
-     検査（`..`・絶対パス・NUL を断る）を通るものだけを受け、それ以外は 404。`display` が NULL で `drive_id` から
+     検査（`..`・絶対パス・NUL・ドット始まりの要素を断る）を通るものだけを受け、それ以外は 404。`display` が NULL で `drive_id` から
      `derivatives/<drive_id>.jpg` を作るときは、`drive_id` を `datadir::check_drive_id`（`derivative_name` と同じ検査）に
      通す（DB の値が外を指していても返さない）。元ファイルはその**領域**の中でなければ
      ならない（`serve_data` と同じく領域のディレクトリとファイルの両方を `canonicalize` し、領域の外に出るリンクは 403、
-     通常のファイル以外は 404。`statics.rs:312-345` の検査を関数に切り出して共有する）。
+     ディレクトリは 403、その他の特殊ファイルは 404。`statics.rs:312-345` の検査を関数に切り出して共有する）。
   2. `thumbs/<id>-<gen>.jpg` があれば返す（`thumbs/` も領域として同じ検査。`static_slots` の `try_acquire` を通り、空きが
      無ければ 503。`serve_data` と同じ）。
   3. 失敗の記憶 `thumb_failed`（下記）に `<id>-<gen>` があれば、ロックも枠も取らずに 404（5 の `decode`/`limit`）。
@@ -298,7 +298,9 @@ cs = {
      `MAX_CONNECTIONS` は miharashi と共有）。切断で要求が drop されたときの待ち数の減算とロック表の掃除は Drop guard で
      行う。取った `OwnedSemaphorePermit` は
      `spawn_blocking` のクロージャに move し、生成が終わるまで持つ（クライアントが切っても復号が枠を超えて走らない）。
-     クロージャは `make_thumbnail(元, 320, 上限)` → `DataDir::thumb_dest(id, gen)`（`derivative_dest` と同じく `thumbs/` の
+     （実装: ロックと枠は `tokio::spawn` した**所有タスク**が持ち、その中で `spawn_blocking(生成＋`write_atomic`)` →
+     async 側で `catalog.read` による世代の引き直し → `spawn_blocking(古い世代の掃除)` の順に進め、掃除の終わりで離す。
+     要求の future が切断されても所有タスクが続くので保証は同じ。）クロージャは `make_thumbnail(元, 320, 上限)` → `DataDir::thumb_dest(id, gen)`（`derivative_dest` と同じく `thumbs/` の
      実体がそのディレクトリ自身であることを確かめる。リンクなら書かない）→ `derivative.rs:951` の `write_atomic(dest, bytes)`
      （同じディレクトリに `.part` を `O_EXCL` で作り、`sync_all` して rename。既存）。成功したら古い世代を消す: `thumbs/` の実体が
      そのディレクトリ自身であること（`derivative_dest` と同じ検査）を確かめ、`symlink_metadata` で通常のファイルで、名前が
@@ -315,6 +317,10 @@ cs = {
        関数で検査し、`static_slots` を通して別の応答を組む。`Content-Type` は拡張子から、`Cache-Control: no-store`、
        `Last-Modified`・304 は付けない）。覚えないが、60 秒のあいだは同じ ID の生成を試みない（`thumb_write_failed_until:
        Mutex<Option<Instant>>` で全体を止める）。
+     - **生成タスクのパニック**: 元の表示用画像を返す。失敗の記憶にも 60 秒の停止にも入れない。ロックと枠は解放される。
+     - **元ファイルが読めない通常の I/O エラー**: 404。記憶しない。
+     - **DB の読み取りの失敗**（読み取り接続の待ち（既定 10 秒、`db.rs:57`。ロック・枠の待ちとは別）の期限切れを含む）:
+       最初の写真の検索なら 503（`no-store`）。生成後の世代の引き直しなら古い世代の掃除を見送るだけ。
      - ログは失敗の初回に 1 行（WARN、ID と分類 `decode`/`limit`/`write` だけ。エラーの文面・パスは出さない）。
 - 応答ヘッダ（キャッシュから返すとき）: `Content-Type: image/jpeg`、`Content-Length`、`Last-Modified`、
   `ETag: "<gen>"`（`thumb.rs` が付ける。`serve_data` のデータ画像は今までどおり ETag 無し）、`If-None-Match` が一致すれば 304、
@@ -325,8 +331,8 @@ cs = {
 - 復号の上限はサムネイル専用に厳しくする: 入力 `THUMB_MAX_INPUT_BYTES = 64 MiB`、`THUMB_MAX_INPUT_PIXELS = 50,000,000`
   （既存の derivative 用は 512 MiB・約 1.79 億画素（`derivative.rs:43-45`）で、ローカルの原本は 2,560px でなく原寸のまま
   `display` になる（`local.rs:702`）ため、そのままでは 2 枚同時で 1〜2 GB になり得る）。超えたら作らずに 404 にし、
-  `limit` として覚える。Drive の写真は 2,560px の derivative から作るので上限に当たらない。JPEG は復号器が対応していれば
-  縮小復号（DCT の 1/2〜1/8）を使う。
+  `limit` として覚える。Drive の写真は 2,560px の derivative から作るので上限に当たらない。縮小復号（DCT の 1/2〜1/8）は zune-jpeg に
+  API が無いので使わず、上限内の画像を全体復号してから縮小する（ヘッダの寸法での拒否は復号の前）。
 - 定数: `THUMB_PX = 320`、`THUMB_QUALITY = 80`、`THUMB_CONCURRENCY = 2`、`THUMB_WAIT_MAX = 10 s`、`THUMB_QUEUE_MAX = 32`、
   `THUMB_FAILED_MAX = 10_000`。
 
@@ -536,7 +542,10 @@ CASE WHEN q.group_id IS NULL THEN 0
 ## データ
 
 - `thumbs/`（データディレクトリ直下。`datadir.rs` に項目を足し、`webpath.rs` の `Area` に `Thumbs` を足して `serve_data` と
-  同じ領域の検査を受ける）。1 枚 15〜30 KB、6,500 枚で 200 MB 弱。古い世代は再生成時に消す。消しても次の要求で
+  同じ領域の検査を受ける。`Area::Thumbs` は領域の検査を共有するための内部の区分で、`/thumbs/` という配信経路は無い
+  （静的配信の白名簿に入れない）。`thumbs/` がリンクのときは書かず・消さず、起動時の `.part` の掃除も黙って見送る
+  （`derivatives/` のような警告は出さない）。生成関数の差し替えと回数の観測のための API（`with_renderer`・`renders()`・
+  `with_thumbs` など）は結合試験のために通常ビルドにもある）。1 枚 15〜30 KB、6,500 枚で 200 MB 弱。古い世代は再生成時に消す。消しても次の要求で
   作り直せる（バックアップの対象外。`backup-catalog.sh` は触らない）。writer の無い起動では作らない（上の `/thumb/` の節）。
 - `photos.id` は `INTEGER PRIMARY KEY`（AUTOINCREMENT でない）ので ID は再利用され得るが、サムネイルは世代、`photo_curation`
   は世代の 4 列を鍵に含むので取り違えない。消した写真の `thumbs/<id>-*.jpg` と `photo_curation` の行は残る（URL からは
