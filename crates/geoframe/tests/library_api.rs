@@ -1,4 +1,4 @@
-//! `GET /api/admin/library/{trips,photos,points}`（ライブラリ。docs/admin-library/design.md）の結合テスト。
+//! `GET /api/admin/library/{trips,photos,points,calendar,places}`（ライブラリ。docs/admin-library/design.md）の結合テスト。
 //!
 //! 合成データは `tests/fixtures/library-catalog.sql`（冒頭のコメントに旅の構成を書いてある）。期待値はそのコメントと
 //! 行から数えた値で、実装の出力を写していない。
@@ -936,6 +936,287 @@ async fn points_over_the_limit_drop_the_oldest_and_say_so() {
     );
 }
 
+// ---------------------------------------------------------------- calendar・places
+
+/// `calendar` の年（`years[].year`）の並び。
+fn years_of(body: &Value) -> Vec<&str> {
+    body["years"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|y| y["year"].as_str().unwrap())
+        .collect()
+}
+
+/// `calendar` の `year` の月ごとの件数 `[(月, 件数)]`。
+fn months_of(body: &Value, year: &str) -> Vec<(String, i64)> {
+    body["years"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|y| y["year"] == year)
+        .unwrap_or_else(|| panic!("年 {year} が無い: {body}"))["months"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["month"].as_str().unwrap().to_owned(),
+                m["count"].as_i64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn year_count(body: &Value, year: &str) -> i64 {
+    body["years"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|y| y["year"] == year)
+        .unwrap()["count"]
+        .as_i64()
+        .unwrap()
+}
+
+fn m(month: &str, count: i64) -> (String, i64) {
+    (month.to_owned(), count)
+}
+
+#[tokio::test]
+async fn calendar_counts_each_year_and_month_of_the_timed_photos() {
+    let server = Server::start().await;
+    let body = server.ok("/api/admin/library/calendar").await;
+    // フィクスチャの行から数える。除外でない日時ありは 2025-03 が id 1〜10・12・14・15・16 の 14 枚、2025-06 が id 19・20 の 2 枚。
+    // 除外の id 11・13（03）と 17・18（05）は数えない。日時なしは id 21・22（除外の 23 は数えない）
+    assert_eq!(years_of(&body), ["2025"]);
+    assert_eq!(year_count(&body, "2025"), 16);
+    assert_eq!(months_of(&body, "2025"), [m("03", 14), m("06", 2)]);
+    assert_eq!(body["untimed"], 2);
+
+    // 除外を含める: 03 は +11・13 で 16、05 は 17・18 で 2、日時なしは +23
+    let hidden = server.ok("/api/admin/library/calendar?hidden=1").await;
+    assert_eq!(year_count(&hidden, "2025"), 20);
+    assert_eq!(
+        months_of(&hidden, "2025"),
+        [m("03", 16), m("05", 2), m("06", 2)]
+    );
+    assert_eq!(hidden["untimed"], 3);
+    // `1` 以外は既定
+    let other = server.ok("/api/admin/library/calendar?hidden=0").await;
+    assert_eq!(other, body);
+    // 年と月の値は文字列（4 桁・2 桁）
+    let first = &body["years"][0];
+    assert!(first["year"].is_string() && first["months"][0]["month"].is_string());
+}
+
+#[tokio::test]
+async fn calendar_orders_years_newest_first_and_months_oldest_first() {
+    let extra = "
+INSERT INTO photos(id, source, drive_id, path, display, name, md5, mtime, taken_at, lat, lon, loc_source,
+                   place, pref, city, favorite, hidden, rotation) VALUES
+  (31, 'drive', 'drive-l31', NULL, 'derivatives/l31.jpg', 'IMG_L31.jpg', 'md5-l31', 310.0, '2023-12-31 23:59', NULL, NULL, NULL, NULL, '', '', 0, 0, 0),
+  (32, 'drive', 'drive-l32', NULL, 'derivatives/l32.jpg', 'IMG_L32.jpg', 'md5-l32', 320.0, '2024-09-09 09:09', NULL, NULL, NULL, NULL, '', '', 0, 0, 0),
+  (33, 'drive', 'drive-l33', NULL, 'derivatives/l33.jpg', 'IMG_L33.jpg', 'md5-l33', 330.0, '2024-01-01 00:00', NULL, NULL, NULL, NULL, '', '', 0, 0, 0),
+  (34, 'drive', 'drive-l34', NULL, 'derivatives/l34.jpg', 'IMG_L34.jpg', 'md5-l34', 340.0, '2024-09-30 12:00', NULL, NULL, NULL, NULL, '', '', 0, 0, 0);
+";
+    let server = Server::start_with(&[], extra).await;
+    let body = server.ok("/api/admin/library/calendar").await;
+    assert_eq!(years_of(&body), ["2025", "2024", "2023"]);
+    assert_eq!(months_of(&body, "2024"), [m("01", 1), m("09", 2)]);
+    assert_eq!(year_count(&body, "2024"), 3);
+    assert_eq!(months_of(&body, "2023"), [m("12", 1)]);
+    assert_eq!(year_count(&body, "2023"), 1);
+}
+
+#[tokio::test]
+async fn calendar_shows_unreadable_dates_as_they_are_and_skips_misshapen_ones() {
+    let server = Server::start_with(&[], BROKEN_TIMES).await;
+    let body = server.ok("/api/admin/library/calendar").await;
+    // 暦として読めない `2025-02-30 10:00`（id 24）・`2025-03-01 24:30`（id 25）も形が合えばそのまま数える。
+    // 形の違う `x`・`2025-06`（id 26・27）は日時なし（除外の 28 を除いて 4 枚）
+    assert_eq!(
+        months_of(&body, "2025"),
+        [m("02", 1), m("03", 15), m("06", 2)]
+    );
+    assert_eq!(year_count(&body, "2025"), 18);
+    assert_eq!(body["untimed"], 4);
+    // 年の件数は月の件数の合計、年の合計 + 日時なしは除外でない 22 枚
+    assert_eq!(
+        year_count(&body, "2025") + body["untimed"].as_i64().unwrap(),
+        22
+    );
+}
+
+#[tokio::test]
+async fn calendar_of_an_empty_catalog() {
+    let server = Server::start_with(&[], "DELETE FROM photos;").await;
+    let body = server.ok("/api/admin/library/calendar").await;
+    assert_eq!(body, json!({"ok": true, "years": [], "untimed": 0}));
+}
+
+/// `places` の都道府県の `(都道府県, 件数, [(市区町村, 件数)])`。
+type PrefRow = (String, i64, Vec<(String, i64)>);
+fn prefs_of(body: &Value) -> Vec<PrefRow> {
+    body["prefs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["pref"].as_str().unwrap().to_owned(),
+                p["count"].as_i64().unwrap(),
+                p["cities"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|c| {
+                        (
+                            c["city"].as_str().unwrap().to_owned(),
+                            c["count"].as_i64().unwrap(),
+                        )
+                    })
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+fn pref_row(pref: &str, count: i64, cities: &[(&str, i64)]) -> PrefRow {
+    (
+        pref.to_owned(),
+        count,
+        cities.iter().map(|(c, n)| ((*c).to_owned(), *n)).collect(),
+    )
+}
+
+#[tokio::test]
+async fn places_count_prefs_and_cities_and_abroad() {
+    let server = Server::start().await;
+    let body = server.ok("/api/admin/library/places").await;
+    // フィクスチャの行から数える（除外でないもの）。架空県: 試験市は id 1・2・3・7・14・21 の 6、見本町は 8・9 の 2 で 8 枚。
+    // 試験県: サンプル市は 10・19・20 の 3。海外・不明（pref が NULL か空）は 4・5・6・12・15・16・22 の 7
+    assert_eq!(
+        prefs_of(&body),
+        [
+            pref_row("架空県", 8, &[("試験市", 6), ("見本町", 2)]),
+            pref_row("試験県", 3, &[("サンプル市", 3)]),
+        ]
+    );
+    assert_eq!(body["abroad"], 7);
+
+    // 除外を含める: 架空県は +11・13・23（試験市 7、見本町 2+2=4）で 11、試験県は +17・18 で 5
+    let hidden = server.ok("/api/admin/library/places?hidden=1").await;
+    assert_eq!(
+        prefs_of(&hidden),
+        [
+            pref_row("架空県", 11, &[("試験市", 7), ("見本町", 4)]),
+            pref_row("試験県", 5, &[("サンプル市", 5)]),
+        ]
+    );
+    assert_eq!(hidden["abroad"], 7);
+    // 全部で 23 枚（除外を含める）／18 枚（除外を除く）
+    let total =
+        |b: &Value| prefs_of(b).iter().map(|p| p.1).sum::<i64>() + b["abroad"].as_i64().unwrap();
+    assert_eq!(total(&body), 18);
+    assert_eq!(total(&hidden), 23);
+    assert!(body.get("noloc").is_none());
+}
+
+#[tokio::test]
+async fn places_sort_by_count_then_name_and_keep_an_empty_city() {
+    // 同数（2）の「あ県」「い県」、市区町村が空・NULL の行（どちらも city が空の 1 項目に）、
+    // 位置があるのに pref が空の行（海外・不明）
+    let extra = "
+INSERT INTO photos(id, source, drive_id, path, display, name, md5, mtime, taken_at, lat, lon, loc_source,
+                   place, pref, city, favorite, hidden, rotation) VALUES
+  (31, 'drive', 'drive-l31', NULL, 'derivatives/l31.jpg', 'IMG_L31.jpg', 'md5-l31', 310.0, '2024-01-01 00:00', 1.0, 2.0, 'exif', '', 'い県', '', 0, 0, 0),
+  (32, 'drive', 'drive-l32', NULL, 'derivatives/l32.jpg', 'IMG_L32.jpg', 'md5-l32', 320.0, '2024-01-02 00:00', 1.0, 2.0, 'exif', '', 'い県', NULL, 0, 0, 0),
+  (33, 'drive', 'drive-l33', NULL, 'derivatives/l33.jpg', 'IMG_L33.jpg', 'md5-l33', 330.0, '2024-01-03 00:00', 1.0, 2.0, 'exif', '', 'あ県', 'う市', 0, 0, 0),
+  (34, 'drive', 'drive-l34', NULL, 'derivatives/l34.jpg', 'IMG_L34.jpg', 'md5-l34', 340.0, '2024-01-04 00:00', 1.0, 2.0, 'exif', '', 'あ県', 'え市', 0, 0, 0),
+  (35, 'drive', 'drive-l35', NULL, 'derivatives/l35.jpg', 'IMG_L35.jpg', 'md5-l35', 350.0, '2024-01-05 00:00', 1.0, 2.0, 'exif', '', '', '', 0, 0, 0);
+";
+    let server = Server::start_with(&[], extra).await;
+    let body = server.ok("/api/admin/library/places").await;
+    assert_eq!(
+        prefs_of(&body),
+        [
+            pref_row("架空県", 8, &[("試験市", 6), ("見本町", 2)]),
+            pref_row("試験県", 3, &[("サンプル市", 3)]),
+            // 同数は名前の順（あ < い）。市区町村も同数は名前の順（う < え）
+            pref_row("あ県", 2, &[("う市", 1), ("え市", 1)]),
+            pref_row("い県", 2, &[("", 2)]),
+        ]
+    );
+    // 位置があっても pref が空なら海外・不明（フィクスチャの 7 + id 35）
+    assert_eq!(body["abroad"], 8);
+}
+
+#[tokio::test]
+async fn places_of_an_empty_catalog() {
+    let server = Server::start_with(&[], "DELETE FROM photos;").await;
+    let body = server.ok("/api/admin/library/places").await;
+    assert_eq!(body, json!({"ok": true, "prefs": [], "abroad": 0}));
+}
+
+#[tokio::test]
+async fn photos_abroad_are_the_ones_without_a_pref() {
+    let server = Server::start().await;
+    let p = |query: &str| format!("/api/admin/library/photos?{query}");
+    // pref が NULL か空: 4・5・6・12・15・16・22（除外を含めても同じ）
+    let body = server.ok(&p("abroad=1")).await;
+    assert_eq!(ids(&body), [4, 5, 6, 12, 15, 16, 22]);
+    assert_eq!(body["total"], 7);
+    assert_eq!(
+        ids(&server.ok(&p("abroad=1&hidden=1")).await),
+        [4, 5, 6, 12, 15, 16, 22]
+    );
+    // `places` の abroad と同じ件数
+    let places = server.ok("/api/admin/library/places").await;
+    assert_eq!(places["abroad"], body["total"]);
+    // 期間と合わせられる（旅 A の範囲では 4・5・6）
+    assert_eq!(
+        ids(&server
+            .ok(&p(
+                "abroad=1&from=2025-03-01%2009%3A00&to=2025-03-03%2019%3A30"
+            ))
+            .await),
+        [4, 5, 6]
+    );
+    // `1` 以外は絞り込みにならない
+    server.bad(&p("abroad=0")).await;
+    server.bad(&p("abroad=yes")).await;
+    // pref・city とは同時に受けない
+    server
+        .bad(&p(&format!("abroad=1&pref={}", enc("架空県"))))
+        .await;
+    server
+        .bad(&p(&format!("abroad=1&city={}", enc("試験市"))))
+        .await;
+    server
+        .bad(&p(&format!(
+            "abroad=1&pref={}&city={}",
+            enc("架空県"),
+            enc("試験市")
+        )))
+        .await;
+    // 空の値は parse_qs が捨てるので、無いのと同じ
+    assert_eq!(ids(&server.ok(&p("abroad=1&pref=")).await).len(), 7);
+    // 年・月の格子（from/to）の形が通り、calendar の件数と合う
+    let year = server
+        .ok(&p(
+            "from=2025-01-01%2000%3A00&to=2025-12-31%2023%3A59&per=200",
+        ))
+        .await;
+    assert_eq!(year["total"], 16);
+    let month = server
+        .ok(&p(
+            "from=2025-03-01%2000%3A00&to=2025-03-31%2023%3A59&per=200",
+        ))
+        .await;
+    assert_eq!(month["total"], 14);
+}
+
 // ---------------------------------------------------------------- AC7
 
 #[tokio::test]
@@ -960,6 +1241,9 @@ async fn reads_work_without_a_writer_and_without_the_new_tables() {
             "/api/admin/library/trips",
             "/api/admin/library/photos?untimed=1",
             "/api/admin/library/points",
+            "/api/admin/library/photos?abroad=1",
+            "/api/admin/library/calendar",
+            "/api/admin/library/places",
         ] {
             let response = get(server.addr, target).await;
             assert_eq!(response.status, 200, "{target} {env:?}");
@@ -1006,6 +1290,8 @@ async fn only_get_on_the_exact_paths_is_served() {
         "/api/admin/library/trips",
         "/api/admin/library/photos",
         "/api/admin/library/points",
+        "/api/admin/library/calendar",
+        "/api/admin/library/places",
     ];
     // POST・HEAD は既存の管理 API と同じく 403
     for path in routes {
@@ -1025,7 +1311,13 @@ async fn only_get_on_the_exact_paths_is_served() {
         "/api/admin/library/points/",
         "/api/admin/library",
         "/api/admin/library/",
-        "/api/admin/library/calendar",
+        "/api/admin/library/calendarX",
+        "/api/admin/library/calendar/",
+        "/api/admin/library/placesX",
+        "/api/admin/library/places/",
+        "/api/admin/Library/calendar",
+        "/api/admin/library/Places",
+        "/api/admin/library/cal%65ndar",
         "/api/admin/Library/trips",
         "/api/admin/library/Trips",
         "/api/admin/%6Cibrary/trips",
@@ -1034,12 +1326,17 @@ async fn only_get_on_the_exact_paths_is_served() {
         let response = get(server.addr, target).await;
         assert_eq!(response.status, 403, "{target}");
         assert!(!response.text().contains("\"trips\""), "{target}");
+        assert!(!response.text().contains("\"years\""), "{target}");
+        assert!(!response.text().contains("\"prefs\""), "{target}");
     }
     // クエリは無視して 200。先頭の `//` も畳む
     for target in [
         "/api/admin/library/trips?x=1",
         "//api/admin/library/trips",
         "/api/admin/library/points?x=1",
+        "/api/admin/library/calendar?x=1",
+        "/api/admin/library/places?x=1",
+        "//api/admin/library/places",
     ] {
         assert_eq!(get(server.addr, target).await.status, 200, "{target}");
     }

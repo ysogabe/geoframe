@@ -398,9 +398,28 @@ cs = {
 
 ### あると良い（PR ② の時間があれば）
 
-- `GET /api/admin/library/calendar` → `{ok, years: [{year, count, months: [{month, count}]}], untimed}`
-  （`substr(taken_at,1,4)`・`substr(taken_at,1,7)` で GROUP BY）。
-- `GET /api/admin/library/places` → `{ok, prefs: [{pref, count, cities: [{city, count}]}], abroad: n, noloc: n}`。
+どちらも `trips` と同じ流儀（`GET` の完全一致、`no-store`、DB の失敗は 503、`hidden=1` で除外を含む、`photos` 表だけを読む）。
+
+- `GET /api/admin/library/calendar` → `{ok, years: [{year, count, months: [{month, count}]}], untimed}`。
+  日時あり（`trips` と同じ 16 桁の形の判定）の行を `substr(taken_at,1,4)`・`substr(taken_at,1,7)` で数える。`year` は
+  `"2025"` のような 4 桁、`month` は `"06"` のような 2 桁の**文字列**（暦として読めない値も形が合えばそのまま出る。
+  `2025-02-30 10:00` は 2025 年 02 月）。年は新しい順、月は古い順。年の `count` は月の `count` の合計。`untimed` は
+  `trips` と同じ日時なしの件数。年の合計 + `untimed` は対象の写真の数に等しい。
+- `GET /api/admin/library/places` → `{ok, prefs: [{pref, count, cities: [{city, count}]}], abroad: n}`。
+  `pref` が空でない行を `pref`・`city` で数える（`city` が NULL・空なら `city: ""` の 1 項目）。`abroad` は `pref` が NULL か
+  空の件数（位置なしも含む。`trips.places` の「海外・不明」と同じ定義）。並びは都道府県・市区町村とも件数の多い順、
+  同数は名前の順。以前の案にあった `noloc` は返さない（`abroad` と意味が重なるため）。
+- 画面からの格子: 年は `from=YYYY-01-01 00:00&to=YYYY-12-31 23:59`、月は `from=YYYY-MM-01 00:00&to=YYYY-MM-31 23:59`
+  （`photos` の `from`・`to` は形だけを見て文字列で比べるので、月末は `31` でよい）。都道府県・市区町村は
+  `pref`・`city`、日時なしは `untimed=1`。
+- `photos` に `abroad=1`（`pref IS NULL OR pref=''`）を足す。`parse_qs` が空の値（`pref=`）を捨てるので、「海外・不明」は
+  `pref=` では絞れないため。`pref`・`city` と同時に受けない（どちらかがあれば 400）。`1` 以外の値は絞り込みにならない
+  （`untimed` と同じ）。
+- 画面（R9〜R11）: 切替に「日付」「場所」を足す（`ls.view` は `calendar` | `places`）。「日付」は年の行（件数つき）を押すと
+  月の行が開き、年・月のどちらからも「写真を見る」で格子。末尾に「日時なし（K 枚）」。「場所」は都道府県の行を押すと
+  市区町村の行が開き、どちらからも格子。末尾に「海外・不明（N 枚）」（`abroad=1`）。格子のタイルに「位置を指定」（📍）の
+  ボタンを置き、押すと写真タブと同じ位置の指定（`openLocModal`）を開く（タイルを押したときのビューアとは混ざらない）。
+  保存すると `applyPhoto` → `libPhotoChanged` でタイルの「位置なし」の印が消える。
 
 ### `photo_curation` 表（新。PR ③。`curation::TABLES`。`SCHEMA` 定数には足さない）
 

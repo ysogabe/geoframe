@@ -3,6 +3,8 @@
 //! - `GET /api/admin/library/trips`: 撮影日時のある写真を 48 時間超の空きで旅に区切った一覧（新しい順）。
 //! - `GET /api/admin/library/photos`: 期間・範囲・ID・地名・日時なしで絞った写真のページ。
 //! - `GET /api/admin/library/points`: 位置のある写真の GeoJSON（地図用）。
+//! - `GET /api/admin/library/calendar`: 年・月ごとの件数（日付の眺め方）。
+//! - `GET /api/admin/library/places`: 都道府県・市区町村ごとの件数と海外・不明の件数（場所の眺め方）。
 //!
 //! どれも `photos` 表だけを読む（`photo_curation` などの新しい表が無い DB、`GEOFRAME_INGEST=0` の読み取り専用の起動でも
 //! 動く）。経路は完全一致の `GET` のみで、`server.rs` の `site` が呼ぶ。更新はしない。
@@ -10,7 +12,7 @@
 //! クエリは `/api/admin/photos` と同じく `parse_qs` の最初の値で読む（空の値は無かったことになる）。形が違えば
 //! 400 `bad_params`（値は応答にもログにも出さない）。SQL の条件は固定の文字列の候補だけから組み、値はすべてバインドする。
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::http::StatusCode;
@@ -53,6 +55,8 @@ macro_rules! untimed_sql {
 const TIMED: &str = timed_sql!();
 /// 日時なし（[`TIMED`] でない）。
 const UNTIMED: &str = untimed_sql!();
+/// 海外・不明（`pref` が NULL か空）。`trips` の `places` の「海外・不明」と同じ定義。
+const ABROAD: &str = "(pref IS NULL OR pref = '')";
 /// 除外していない（`hidden` が NULL・0）。
 const VISIBLE: &str = "COALESCE(hidden,0)=0";
 /// 日時の順（日時なしは最後）、同じなら ID。
@@ -223,6 +227,15 @@ fn photos_filter(params: &Params) -> Option<Filter> {
     }
     if let Some(city) = params.get("city") {
         filter.push("city = ?", [Sql::Text(parse_name(city)?.to_owned())]);
+        filter.narrowed = true;
+    }
+    // 海外・不明（`pref` が NULL か空。位置なしも入る）。`parse_qs` は空の値（`pref=`）を捨てるので、`pref` では絞れない。
+    // `pref`・`city` とは同時に受けない
+    if params.get("abroad").is_some_and(|v| v == "1") {
+        if params.contains_key("pref") || params.contains_key("city") {
+            return None;
+        }
+        filter.push(ABROAD, []);
         filter.narrowed = true;
     }
     if params.get("untimed").is_some_and(|v| v == "1") {
@@ -607,6 +620,138 @@ fn build_points(conn: &Connection, filter: &Filter, max: usize) -> rusqlite::Res
     }))
 }
 
+// ---------------------------------------------------------------- calendar・places
+
+/// `WHERE` に足す除外の条件（`hidden=1` でなければ除外を除く）。
+fn visible_clause(with_hidden: bool) -> &'static str {
+    if with_hidden {
+        ""
+    } else {
+        " AND COALESCE(hidden,0)=0"
+    }
+}
+
+/// `GET /api/admin/library/calendar`。
+pub async fn calendar(state: &AppState, query: Option<&str>) -> Response {
+    let hidden = include_hidden(&query_params(query));
+    respond(
+        state
+            .catalog
+            .read(move |conn| build_calendar(conn, hidden))
+            .await,
+    )
+}
+
+/// 年・月ごとの件数。日時ありの形（[`TIMED`]）の行を `substr(taken_at,1,4)`・`substr(taken_at,1,7)` で数える
+/// （暦として読めない値も形が合えばそのまま出る）。年は新しい順、月は古い順。
+fn build_calendar(conn: &Connection, with_hidden: bool) -> rusqlite::Result<Value> {
+    // 年・月・日時なしの件数が同じ時点の DB から出るように、1 つの読み取りにまとめる
+    let _snapshot = conn.unchecked_transaction()?;
+    let visible = visible_clause(with_hidden);
+    let count_by = |len: usize| -> rusqlite::Result<Vec<(String, i64)>> {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT substr(taken_at,1,{len}) AS k, COUNT(*) FROM photos
+              WHERE {TIMED}{visible} GROUP BY k ORDER BY k"
+        ))?;
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect()
+    };
+    let years = count_by(4)?;
+    let months = count_by(7)?;
+    let mut by_year: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
+    for (key, count) in &months {
+        // `key` は `YYYY-MM`（TIMED の形なので 7 文字の ASCII）
+        by_year
+            .entry(&key[..4])
+            .or_default()
+            .push(json!({"month": &key[5..], "count": count}));
+    }
+    let years: Vec<Value> = years
+        .iter()
+        .rev()
+        .map(|(year, count)| {
+            json!({
+                "year": year,
+                "count": count,
+                "months": by_year.remove(year.as_str()).unwrap_or_default(),
+            })
+        })
+        .collect();
+    let untimed: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM photos WHERE {UNTIMED}{visible}"),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(json!({"ok": true, "years": years, "untimed": untimed}))
+}
+
+/// `GET /api/admin/library/places`。
+pub async fn places(state: &AppState, query: Option<&str>) -> Response {
+    let hidden = include_hidden(&query_params(query));
+    respond(
+        state
+            .catalog
+            .read(move |conn| build_places(conn, hidden))
+            .await,
+    )
+}
+
+/// 都道府県・市区町村ごとの件数（`pref` が空でない行）と、海外・不明（`pref` が NULL か空。位置なしも入る）の件数。
+/// 並びは件数の多い順、同数なら名前の順。`city` が空の行は `city: ""` の 1 項目にする。
+fn build_places(conn: &Connection, with_hidden: bool) -> rusqlite::Result<Value> {
+    let _snapshot = conn.unchecked_transaction()?;
+    let visible = visible_clause(with_hidden);
+    let mut stmt = conn.prepare(&format!(
+        "SELECT CAST(pref AS TEXT), CAST(COALESCE(city,'') AS TEXT), COUNT(*) FROM photos
+          WHERE NOT {ABROAD}{visible} GROUP BY 1, 2"
+    ))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let abroad: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM photos WHERE {ABROAD}{visible}"),
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(json!({"ok": true, "prefs": group_places(rows), "abroad": abroad}))
+}
+
+/// 都道府県の件数と市区町村の `(名前, 件数)`。
+type PrefGroup = (String, i64, Vec<(String, i64)>);
+
+/// `(pref, city, count)` を都道府県ごとにまとめ、件数の多い順（同数は名前の順）に並べる。
+fn group_places(rows: Vec<(String, String, i64)>) -> Vec<Value> {
+    let mut prefs: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
+    for (pref, city, count) in rows {
+        prefs.entry(pref).or_default().push((city, count));
+    }
+    let mut prefs: Vec<PrefGroup> = prefs
+        .into_iter()
+        .map(|(pref, mut cities)| {
+            cities.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            let total = cities.iter().map(|c| c.1).sum();
+            (pref, total, cities)
+        })
+        .collect();
+    prefs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    prefs
+        .into_iter()
+        .map(|(pref, count, cities)| {
+            let cities: Vec<Value> = cities
+                .into_iter()
+                .map(|(city, count)| json!({"city": city, "count": count}))
+                .collect();
+            json!({"pref": pref, "count": count, "cities": cities})
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -711,11 +856,40 @@ mod tests {
     }
 
     #[test]
+    fn places_are_grouped_by_pref_and_sorted_by_count_then_name() {
+        let rows = vec![
+            ("B県".to_owned(), "い市".to_owned(), 2),
+            ("A県".to_owned(), "".to_owned(), 1),
+            ("A県".to_owned(), "う市".to_owned(), 1),
+            ("A県".to_owned(), "あ市".to_owned(), 1),
+            ("C県".to_owned(), "え市".to_owned(), 4),
+        ];
+        let out = group_places(rows);
+        let prefs: Vec<&str> = out.iter().map(|p| p["pref"].as_str().unwrap()).collect();
+        // C 4、A と B は 3 と 2
+        assert_eq!(prefs, ["C県", "A県", "B県"]);
+        let cities: Vec<&str> = out[1]["cities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["city"].as_str().unwrap())
+            .collect();
+        assert_eq!(cities, ["", "あ市", "う市"]);
+    }
+
+    #[test]
     fn photos_need_a_narrowing_filter() {
         assert!(photos_filter(&params("")).is_none());
         assert!(photos_filter(&params("hidden=1&page=2&per=5")).is_none());
         assert!(photos_filter(&params("untimed=0")).is_none());
         assert!(photos_filter(&params("untimed=1")).is_some());
+        assert!(photos_filter(&params("abroad=0")).is_none());
+        assert!(photos_filter(&params("abroad=1")).is_some());
+        // 海外・不明は pref・city と同時に受けない（空の値は parse_qs が捨てるので、あっても無いのと同じ）
+        assert!(photos_filter(&params("abroad=1&pref=x")).is_none());
+        assert!(photos_filter(&params("abroad=1&city=x")).is_none());
+        assert!(photos_filter(&params("abroad=1&pref=")).is_some());
+        assert!(photos_filter(&params("abroad=0&pref=x")).is_some());
         assert!(photos_filter(&params("pref=%E6%9E%B6%E7%A9%BA%E7%9C%8C")).is_some());
         assert!(photos_filter(&params("ids=1,2&from=bad")).is_none());
     }
