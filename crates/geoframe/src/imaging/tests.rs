@@ -1142,3 +1142,130 @@ fn decision_rgb_converts_icc_and_gray_respects_both_limits_and_encodes_cleanly()
     }
     assert!(prepare_decision_rgb(b"broken", true).is_err());
 }
+
+// ---------------------------------------------------------------------------
+// サムネイル（`make_thumbnail`）
+
+fn thumb_ok(bytes: &[u8]) -> Vec<u8> {
+    thumbnail_from_bytes(bytes, THUMB_PX, &THUMB_LIMITS).unwrap()
+}
+
+#[test]
+fn サムネイルは長辺320に収まり向きを当て小さい画像は拡大しない() {
+    // 横長 1200x800 → 320x213（左が赤・右が青）
+    let wide = thumb_ok(&jpeg_rgb(1200, 800));
+    let (w, h, comps, _) = decode_out(&wide);
+    assert_eq!((w, comps), (320, 3));
+    assert!((212..=214).contains(&h), "{h}");
+    assert!(reddish(px(&wide, 20, h / 2)) && bluish(px(&wide, w - 20, h / 2)));
+    // EXIF の向き 6（右へ 90 度）: 縦長になり、左の赤が上へ来る
+    let turned = thumb_ok(&with_exif(&jpeg_rgb(1200, 800), &exif_tiff(6)));
+    let (w, h, _, _) = decode_out(&turned);
+    assert_eq!(h, 320);
+    assert!((212..=214).contains(&w), "{w}");
+    assert!(reddish(px(&turned, w / 2, 20)) && bluish(px(&turned, w / 2, h - 20)));
+    // 小さい画像は拡大しない
+    let small = thumb_ok(&jpeg_rgb(60, 40));
+    let (w, h, _, _) = decode_out(&small);
+    assert_eq!((w, h), (60, 40));
+    // PNG も読める
+    let png = png_encode(
+        &two_tone(500, 100),
+        500,
+        100,
+        image::ExtendedColorType::Rgb8,
+    );
+    let (w, h, _, _) = decode_out(&thumb_ok(&png));
+    assert_eq!((w, h), (320, 64));
+}
+
+#[test]
+fn サムネイルにexifとgpsとiccを残さない() {
+    let jpeg = with_exif(&jpeg_rgb(600, 400), &exif_tiff(1));
+    let out = thumb_ok(&jpeg);
+    assert_clean(&out);
+    // APP1（0xFFE1）のセグメントが無い
+    let mut pos = 2;
+    while pos + 4 <= out.len() && out[pos] == 0xFF && out[pos + 1] != 0xDA {
+        assert_ne!(out[pos + 1], 0xE1, "APP1 が残っている");
+        pos += 2 + usize::from(u16::from_be_bytes([out[pos + 2], out[pos + 3]]));
+    }
+    // 広色域の ICC は sRGB へ変換して付けない
+    let p3 = jpeg_encode(
+        &two_tone(600, 400),
+        600,
+        400,
+        jpeg_encoder::ColorType::Rgb,
+        Some(&p3_profile()),
+    );
+    assert_clean(&thumb_ok(&p3));
+}
+
+#[test]
+fn サムネイルは上限を超える入力を全体を復号する前に断る() {
+    let tmp = TempDir::new("thumb-limit");
+    // ファイルの大きさ: 疎なファイルは読まずに断る
+    let big = tmp.path().join("big.jpg");
+    std::fs::File::create(&big)
+        .unwrap()
+        .set_len(THUMB_MAX_INPUT_BYTES + 1)
+        .unwrap();
+    assert!(matches!(
+        make_thumbnail(&big, THUMB_PX, &THUMB_LIMITS),
+        Err(ImageError::FileTooLarge)
+    ));
+    // 引数の上限が効く（既定より小さい上限）
+    let small = tmp.path().join("small.jpg");
+    std::fs::write(&small, jpeg_rgb(64, 64)).unwrap();
+    let tight = DecodeLimits {
+        max_bytes: 100,
+        max_pixels: THUMB_MAX_INPUT_PIXELS,
+    };
+    assert!(matches!(
+        make_thumbnail(&small, THUMB_PX, &tight),
+        Err(ImageError::FileTooLarge)
+    ));
+    let (w, h, _, _) = decode_out(&make_thumbnail(&small, THUMB_PX, &THUMB_LIMITS).unwrap());
+    assert_eq!((w, h), (64, 64));
+    // ディレクトリ・無いファイルは入出力か画像でない失敗
+    assert!(make_thumbnail(tmp.path(), THUMB_PX, &THUMB_LIMITS).is_err());
+    assert!(make_thumbnail(&tmp.path().join("none.jpg"), THUMB_PX, &THUMB_LIMITS).is_err());
+
+    // 画素数: 寸法だけ大きい JPEG（SOF を 65535x65535 に書き換え。画素は無い）
+    let mut huge = jpeg_rgb(16, 16);
+    let sof = sof_position(&huge);
+    huge[sof + 5..sof + 9].copy_from_slice(&[0xFF, 0xFF, 0xFF, 0xFF]);
+    assert!(matches!(
+        thumbnail_from_bytes(&huge, THUMB_PX, &THUMB_LIMITS),
+        Err(ImageError::TooManyPixels { .. })
+    ));
+    // 寸法だけ大きい PNG（IHDR を 10000x10000 に書き換える。derivative の上限（約 1.79 億画素）には収まるが
+    // サムネイルの上限（5,000 万画素）は超える）。全体を復号していれば Truncated/Corrupt になる
+    let mut png = png_encode(&two_tone(4, 4), 4, 4, image::ExtendedColorType::Rgb8);
+    png[16..20].copy_from_slice(&10_000u32.to_be_bytes());
+    png[20..24].copy_from_slice(&10_000u32.to_be_bytes());
+    let crc = crc32(&png[12..29]);
+    png[29..33].copy_from_slice(&crc.to_be_bytes());
+    assert!(matches!(
+        thumbnail_from_bytes(&png, THUMB_PX, &THUMB_LIMITS),
+        Err(ImageError::TooManyPixels {
+            width: 10_000,
+            height: 10_000
+        })
+    ));
+    assert!(
+        !matches!(render(&png, 0), Err(ImageError::TooManyPixels { .. })),
+        "derivative の上限なら寸法の検査は通る（全体の復号に進む）"
+    );
+}
+
+#[test]
+fn サムネイルは壊れた入力と切れた入力を失敗にする() {
+    assert!(matches!(
+        thumbnail_from_bytes(b"not an image", THUMB_PX, &THUMB_LIMITS),
+        Err(ImageError::NotAnImage)
+    ));
+    let jpeg = jpeg_rgb(300, 200);
+    let cut = &jpeg[..jpeg.len() / 2];
+    assert!(thumbnail_from_bytes(cut, THUMB_PX, &THUMB_LIMITS).is_err());
+}

@@ -1,6 +1,6 @@
 # 現行写真パイプライン
 
-更新日: 2026-10-30（P5b: Python版の削除に合わせて、実装の記述をRust版へ直した。AIの詳細は[rust-migration/ai-config.md](../rust-migration/ai-config.md)ほか）
+更新日: 2026-11-01（B: 一覧用サムネイル `/thumb/` の節を追加。2026-10-30 の P5b で Python版の削除に合わせて、実装の記述をRust版へ直した。AIの詳細は[rust-migration/ai-config.md](../rust-migration/ai-config.md)ほか）
 
 旅行ブログ連携の調査から出発し、写真の取り込み・品質解析・AI選定・表示APIまでの現行仕様を
 まとめた文書です。
@@ -37,6 +37,22 @@
 - 旅行ブログ機能は、`GEOFRAME_BLOG=1`のときだけ有効（既定は無効）。`GET /api/blog/*` から写真カタログを読み取り、正確なGPSをレスポンスへ含めない。
 - レビュー状態は再構築可能な写真索引と混ぜず、`GEOFRAME_DATA_DIR/travel_blog/drafts/` のJSONへ保存する。
 - エクスポートは `GEOFRAME_DATA_DIR/blog_exports/<trip_id>/`。画像は再エンコードしてEXIFを除去する。
+
+## 一覧用サムネイル（`GET /thumb/<id>.jpg?v=<gen>`）
+
+管理画面の一覧（ライブラリ・選別）が、長辺2560pxの表示用画像を読まずに済むように、長辺320pxのJPEG（品質80）を要求時に作って配る。設計は[admin-library/design.md](../admin-library/design.md)。環境変数は足していない（大きさ・上限・同時数は定数）。
+
+- 経路: `<id>`は数字だけ（`^[1-9][0-9]{0,17}\.jpg$`の1段。先頭の0・末尾の`/`・2段以上は404）。`v`は12桁の小文字hex。どちらも違えば404。クライアントの文字列は`<id>`と`v`以外使わない。静的配信の白名簿より前に判定する。アクセスログのラベルは`/thumb/{id}`。
+- 世代`gen`: `display|md5|mtime|THUMB_VERSION`のSHA-256の先頭12 hex（NULLは空）。回転・原本の更新で`display`や`mtime`が変わるとURLが変わるので、`Cache-Control: private, max-age=604800`で長く持たせる。サムネイルの大きさや品質を変えたら`THUMB_VERSION`を上げる。
+- 元ファイル: `photos.display`（`derivatives/`か`photos/`で始まり、`..`・絶対パス・NUL・ドット始まりの要素を含まないもの）。`display`が無ければ`derivatives/<drive_id>.jpg`（`drive_id`は英数字・`_`・`-`だけ）。元ファイルも返すファイルも領域（`derivatives/`・`photos/`・`thumbs/`）の中に限り、`/derivatives/`と同じ検査をする（領域とファイルをリンクごと解決し、外へ出るリンクは403、通常のファイル以外は404）。
+- キャッシュ: `GEOFRAME_DATA_DIR/thumbs/<id>-<gen>.jpg`。`.part`に書いてから`rename`する（`derivatives/`と同じ）。成功したら同じ写真の古い世代のファイルを消す（消す直前にDBの世代を引き直し、自分の世代が今の世代のときだけ）。起動時に`thumbs/`の書きかけの`.part`も掃除する。応答は`ETag: "<gen>"`・`Last-Modified`・`Cross-Origin-Resource-Policy: same-origin`を付け、`If-None-Match`が一致すれば304。
+- **生成する条件**: `GET`で、`v`がDBから計算した今の世代と一致し、書き込み側がある（`GEOFRAME_INGEST=0`でない）ときだけ。それ以外は生成しない: `HEAD`と古い`v`は、キャッシュがあればそれ、無ければ404。`Sec-Fetch-Site`が`cross-site`・`same-site`なら403（HTTPSで配るときだけ効く重ねがけ）。`INGEST=0`でキャッシュが無いときは、下の「元の画像を返す」と同じ。`gen`は同一オリジンの管理APIを読まないと分からないので、外部のページの`<img>`が連番のIDで生成を起こすことはできない。
+- 資源: 同じ写真は写真IDごとのロックで1つだけ作る。同時に作るのは2つまで。ロックと枠を合わせて待ちは最長10秒・待つ要求は最大32件で、超えたら503と`Retry-After: 5`。取ったロックと枠は`spawn_blocking`の生成が終わるまで持つので、要求が切れても復号が枠を超えて走らない。サムネイル専用の復号の上限は、入力64 MiB・5,000万画素（表示用画像の作成は512 MiB・約1.79億画素）で、全体を復号する前にファイルの大きさとヘッダの寸法で断る。
+- 失敗の扱い:
+  - 復号できない・上限を超える写真は404（`Cache-Control: no-store`）。画面は「画像なし」にする。同じ世代は最大10,000件の記憶に入れ、起動中は作り直さない（ロックも枠も取らずに404。写真が変わって世代が変われば試す）。
+  - サムネイルは作れたが`thumbs/`に書けないとき（ディスクの満杯・権限・`thumbs/`がリンク）と、書き込み側が無くてキャッシュも無いときは、元の表示用画像をそのまま返す（拡張子がjpg/jpeg/pngのときだけ。`no-store`。`Last-Modified`・304は付けない）。書けない失敗のあと60秒は、どの写真も生成を試みない。
+  - ログ（WARN）は失敗の初回に1行で、写真IDと分類（`decode`/`limit`/`write`）だけ。パスやエラーの文面は出さない。
+- 外部公開のとき、`/thumb/`は管理用の経路で、Cloudflare Accessの保護の外に出してはいけない（連番のIDで除外した写真も引ける）。
 
 ## 既知の不足
 

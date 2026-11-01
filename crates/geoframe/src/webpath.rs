@@ -117,6 +117,10 @@ pub enum Area {
     BlogExports,
     /// `/favicon.ico` — 現行も実ファイルが無く 404
     Favicon,
+    /// `GEOFRAME_DATA_DIR/thumbs` — 一覧用サムネイルの置き場。**静的配信の対象ではない**（[`Area::PREFIXED`] に
+    /// 入れない）。`/thumb/<id>.jpg`（[`crate::thumb`]）が、領域の検査（[`crate::statics::resolve_area_file`]）を
+    /// 共有するための名前。
+    Thumbs,
 }
 
 impl Area {
@@ -137,6 +141,7 @@ impl Area {
             Area::Photos => "/photos/",
             Area::BlogExports => "/blog_exports/",
             Area::Favicon => "/favicon.ico",
+            Area::Thumbs => "/thumbs/",
         }
     }
 
@@ -149,6 +154,7 @@ impl Area {
             Area::Photos => "/photos/{*path}",
             Area::BlogExports => "/blog_exports/{*path}",
             Area::Favicon => "/favicon.ico",
+            Area::Thumbs => "/thumb/{id}",
         }
     }
 
@@ -158,6 +164,7 @@ impl Area {
             Area::Derivatives => Some("derivatives"),
             Area::Photos => Some("photos"),
             Area::BlogExports => Some("blog_exports"),
+            Area::Thumbs => Some("thumbs"),
             _ => None,
         }
     }
