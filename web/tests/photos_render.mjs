@@ -204,7 +204,7 @@ await test('admin.html と fakedom の骨格（id・タブ・チップ）が一�
   const want = htmlFacts(html);
   const have = domFacts(buildAdminDom());
   assert.deepEqual(have.ids, want.ids, 'id の集合');
-  assert.deepEqual(have.tabs, ['status', 'photos', 'config']);
+  assert.deepEqual(have.tabs, ['status', 'photos', 'library', 'config']);
   assert.deepEqual(want.tabs, have.tabs, 'data-tab');
   assert.deepEqual(want.filters, CHIPS.map(c => c[0]), 'data-filter');
   assert.deepEqual(have.filters, want.filters);
@@ -219,8 +219,8 @@ await test('admin.html と fakedom の骨格（id・タブ・チップ）が一�
   assert.ok(html.includes('id="viewer"') && !html.includes('photo-modal'), 'ビューアは #viewer');
   assert.ok(!html.includes('href="/ai-search"') && !html.includes('AI 写真検索 ▸'), '旧ページへのリンクは無い');
   const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map(m => m[1]).filter(u => u.startsWith('/static/'));
-  assert.deepEqual(scripts, ['/static/js/admin.js', '/static/js/photos.js', '/static/js/config.js'],
-    'admin.js → photos.js → config.js の順');
+  assert.deepEqual(scripts, ['/static/js/admin.js', '/static/js/photos.js', '/static/js/library.js', '/static/js/config.js'],
+    'admin.js → photos.js → library.js → config.js の順');
 });
 
 await test('画面の JS に HTML 文字列を流し込む API が 1 つも無い', () => {

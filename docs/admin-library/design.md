@@ -205,13 +205,16 @@ flowchart LR
 
 ```
 ls = {
-  view: 'trips' | 'map' | 'calendar' | 'places',   // 必須は trips と map
+  view: 'trips' | 'map' | 'calendar' | 'places',   // 必須は trips と map（実装は trips と map）
+  grid: false,          // true の間は、どちらの view の上にも格子を出す（戻るで元の view へ）
   includeHidden: false,
-  trips: [],            // GET /api/admin/library/trips の結果
-  sel: null,            // 選んだ絞り込み {from, to, bbox, pref, city, label}
-  page: 1, per: 60, total: 0, items: [], tiles: [],   // 格子
-  map: null,            // maplibregl.Map（地図ビューを初めて開いたとき作る）
-  pending: 0,           // 要求番号（古い応答を捨てる。photos.js と同じ流儀）
+  trips: [], untimed: 0,   // GET /api/admin/library/trips の結果
+  sel: null,            // 格子の絞り込み {from, to} | {untimed} | {bbox} と表示用の label
+  period: null,         // 地図の点と範囲に掛ける期間 {from, to}（旅の「地図で見る」で入り、解除で外す）
+  page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],   // 格子
+  map: null, pendingData: null, labels: Map, popup: null,       // maplibregl.Map（地図ビューを初めて開いたとき作る）
+  seq: {trips, grid, points, popup},   // 要求の種類ごとの番号（古い応答を捨てる。種類を分けるのは、
+                                       // 吹き出しの要求が格子の読み込みを捨てないため）
 }
 ```
 
@@ -225,7 +228,9 @@ ls = {
   `getClusterExpansionZoom` で寄る。点を押すと、その時点で `GET /api/admin/library/photos?ids=<id>` を引き（要求番号を
   付け、別の点を押したら古い応答は捨てる）、届いたら `maplibregl.Popup`（DOM を `el()` で組んで `setDOMContent`）に
   サムネイル・日時・地名・「開く」を出す。取得中は「読み込み中」、失敗は「読めませんでした」の吹き出し。「開く」は届いた
-  1 枚で `openModalFor([photo], 0, {ai: false})`。ツールバーに「この範囲の写真を見る」（`map.getBounds()` を `bbox` にして
+  1 枚で `openModalFor([photo], 0, {ai: false})`。クラスタの件数の文字は、style に `glyphs`（文字の形のデータ）が無く
+  symbol 層が使えないので、`render` のたびに見えているクラスタへ合わせる DOM のマーカー（`pointer-events: none`）で出す
+  （「3 層」は円 2 つ + マーカー）。ツールバーに「この範囲の写真を見る」（`map.getBounds()` を `bbox` にして
   格子を読む）と期間の表示（旅から来たときの `from`/`to`、解除ボタン）。タブに戻ったとき `map.resize()` を呼ぶ。
 - 画像の読み込み失敗（`img` の `error`）は格子・表紙・選別のメンバーで共通のプレースホルダ（`.img-broken`、文字は
   「画像なし」）に差し替える（写真タブのカードと同じ扱い）。

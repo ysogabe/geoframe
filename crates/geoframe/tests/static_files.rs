@@ -374,6 +374,7 @@ async fn every_embedded_file_is_served_byte_for_byte() {
         ("/static/admin.css", "text/css"),
         ("/static/js/admin.js", "text/javascript"),
         ("/static/js/photos.js", "text/javascript"),
+        ("/static/js/library.js", "text/javascript"),
         ("/static/js/config.js", "text/javascript"),
         ("/vendor/fonts.css", "text/css"),
         ("/vendor/maplibre-gl-4.7.1.min.js", "text/javascript"),
@@ -497,7 +498,7 @@ fn the_scripts_never_build_html_from_strings() {
         }
         checked.push(path.file_name().unwrap().to_string_lossy().into_owned());
     }
-    for name in ["admin.js", "photos.js", "config.js"] {
+    for name in ["admin.js", "photos.js", "library.js", "config.js"] {
         assert!(
             checked.iter().any(|c| c == name),
             "{name} が見つからない: {checked:?}"
@@ -835,6 +836,7 @@ async fn cache_and_framing_headers_follow_the_current_server() {
         "/static/admin.css",
         "/static/js/admin.js",
         "/static/js/photos.js",
+        "/static/js/library.js",
         "/static/js/config.js",
         "/vendor/fonts.css",
     ] {

@@ -1,0 +1,401 @@
+/* ============================================================
+   library.js — 管理ページのライブラリタブ（classic script / 依存なし）
+   構成: 1) 状態 2) 画像・タイル 3) 旅の一覧 4) 格子（ページ） 5) 地図（MapLibre のクラスタ・吹き出し・範囲）
+        6) 切り替え・初期化
+   admin.js（$ el toast）と photos.js（normalizePhoto openModalFor onPhotoChange tileStyle）の後に読み込む。
+   定義だけを置き、起動は admin.js の boot() が initLibrary() を呼ぶ形（読み込んだだけでは何にも触らない）。
+   サーバーは GET /api/admin/library/{trips,photos,points}（crates/geoframe/src/admin_library.rs）。
+   描画は textContent と DOM API だけ（HTML 文字列を流し込む API は使わない）。
+   ============================================================ */
+'use strict';
+
+/* ==== 1) 状態 ==== */
+/* view: 'trips'（旅の一覧）| 'map'（地図）。grid が true の間は、どちらの上にも格子（#lib-grid-box）を出す（戻るで元の view へ）。
+   sel: 格子に出す絞り込み {from, to} | {untimed: true} | {bbox: [w, s, e, n]} と、表示用の label。
+   period: 地図の点と範囲の絞り込みに掛ける期間 {from, to}（旅の「地図で見る」で入り、解除ボタンで外す）。
+   seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が格子の読み込みを捨てないため） */
+const ls = {
+  view: 'trips', includeHidden: false, grid: false,
+  trips: [], untimed: 0,
+  sel: null, period: null,
+  page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
+  map: null, pendingData: null, labels: new Map(), popup: null,
+  seq: {trips: 0, grid: 0, points: 0, popup: 0},
+};
+
+const NO_IMAGE_TEXT = '画像なし';
+const LIB_POINTS_SOURCE = 'photos';
+
+function libQuery(obj){
+  return Object.keys(obj)
+    .filter(k => obj[k] !== undefined && obj[k] !== null && obj[k] !== '' && obj[k] !== false)
+    .map(k => encodeURIComponent(k) + '=' + encodeURIComponent(obj[k] === true ? '1' : obj[k]))
+    .join('&');
+}
+/* 応答の写真（favorite を持つ）を、写真タブのビューアが読む形にする */
+function libPhoto(raw){ return normalizePhoto(Object.assign({}, raw, {fav: raw.favorite}), 'list'); }
+function libGet(path, params){
+  const query = libQuery(params);
+  return fetch('/api/admin/library/' + path + (query ? '?' + query : ''), {headers: {'Accept': 'application/json'}})
+    .then(r => r.json().then(d => d, () => ({ok: false, error: 'HTTP ' + r.status})))
+    .then(d => {
+      if(!d || !d.ok) throw new Error(d && d.error ? d.error : 'library error');
+      return d;
+    });
+}
+
+/* ==== 2) 画像・タイル ==== */
+/* box に画像を入れる。src が空（表示用ファイルも derivative も無い）か読めないときは「画像なし」の代わりの表示 */
+function placeholder(){ return el('div', 'img-broken', NO_IMAGE_TEXT); }
+function putImage(box, src, alt){
+  if(!src){ box.appendChild(placeholder()); return null; }
+  const img = document.createElement('img');
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.alt = alt || '';
+  img.src = src;
+  img.addEventListener('error', () => {
+    img.remove();
+    box.appendChild(placeholder());
+  });
+  box.appendChild(img);
+  return img;
+}
+/* 印: ★（お気に入り）・🚫（除外）・位置なし。photo の今の値で描き直す */
+function paintTile(tile, photo){
+  tile.classList.toggle('is-hidden', !!photo.hidden);
+  const marks = tile.querySelector('.lib-marks');
+  marks.textContent = '';
+  if(photo.favorite) marks.appendChild(el('span', 'lib-mark fav', '★'));
+  if(photo.hidden) marks.appendChild(el('span', 'lib-mark hid', '🚫'));
+  if(!hasLoc(photo)) marks.appendChild(el('span', 'lib-mark noloc', '位置なし'));
+  const img = tile.querySelector('img');
+  const src = photo.thumb_url || photo.thumb;
+  if(img && src && img.src !== src) img.src = src;
+}
+function tileFor(photo, index){
+  const tile = el('div', 'lib-tile');
+  tile.dataset.id = photo.id;
+  tile.setAttribute('role', 'button');
+  tile.setAttribute('tabindex', '0');
+  tile.setAttribute('aria-label', photo.name + (photo.taken_at ? '（' + photo.taken_at + '）' : '') + 'を拡大');
+  tile.title = photo.name + (photo.taken_at ? '  ' + photo.taken_at : '');
+  putImage(tile, photo.thumb_url || photo.thumb, photo.name);
+  tile.appendChild(el('div', 'lib-marks'));
+  paintTile(tile, photo);
+  const open = () => {
+    tile.focus();           // 閉じたときにこのタイルへフォーカスを戻す（ブラウザによってはクリックでは移らない）
+    openModalFor(ls.items, index, {ai: false});
+  };
+  tile.addEventListener('click', open);
+  tile.addEventListener('keydown', e => {
+    if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); open(); }
+  });
+  return tile;
+}
+
+/* ==== 3) 旅の一覧 ==== */
+function placeLabel(p){
+  const name = [p.pref, p.city].filter(Boolean).join(' ');
+  return (name || '海外・不明') + ' ' + p.count;
+}
+function rangeLabel(from, to){ return from === to ? from : from + ' 〜 ' + to; }
+function tripRow(trip){
+  const row = el('div', 'lib-trip');
+  row.dataset.key = trip.key;
+  const cover = el('div', 'lib-cover');
+  putImage(cover, trip.cover ? (trip.cover.thumb_url || '') : '', '');
+  cover.classList.add('lib-clickable');
+  cover.setAttribute('role', 'button');
+  cover.setAttribute('tabindex', '0');
+  cover.setAttribute('aria-label', rangeLabel(trip.start, trip.end) + 'の写真を見る');
+  const show = () => selectTrip(trip);
+  cover.addEventListener('click', show);
+  cover.addEventListener('keydown', e => {
+    if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); show(); }
+  });
+  row.appendChild(cover);
+
+  const body = el('div', 'lib-trip-body');
+  body.appendChild(el('div', 'lib-trip-range', rangeLabel(trip.start, trip.end)));
+  body.appendChild(el('div', 'lib-trip-count',
+    trip.count + ' 枚（位置なし ' + trip.noloc + '）'));
+  const tags = el('div', 'tags');
+  (trip.places || []).forEach(p => tags.appendChild(el('span', 'tag t-subject', placeLabel(p))));
+  body.appendChild(tags);
+  const acts = el('div', 'lib-trip-acts');
+  const photos = el('button', 'btn lib-trip-photos', '写真を見る');
+  photos.type = 'button';
+  photos.addEventListener('click', show);
+  const map = el('button', 'btn lib-trip-map', '地図で見る');
+  map.type = 'button';
+  map.addEventListener('click', () => mapForTrip(trip));
+  acts.appendChild(photos);
+  acts.appendChild(map);
+  body.appendChild(acts);
+  row.appendChild(body);
+  return row;
+}
+function renderTrips(){
+  const box = $('#lib-trips');
+  box.textContent = '';
+  ls.trips.forEach(t => box.appendChild(tripRow(t)));
+  if(ls.untimed > 0){
+    const row = el('div', 'lib-trip lib-untimed');
+    const body = el('div', 'lib-trip-body');
+    body.appendChild(el('div', 'lib-trip-range', '日時なし（' + ls.untimed + ' 枚）'));
+    const acts = el('div', 'lib-trip-acts');
+    const btn = el('button', 'btn lib-trip-photos', '写真を見る');
+    btn.type = 'button';
+    btn.addEventListener('click', () => openGrid({untimed: true, label: '日時なし'}));
+    acts.appendChild(btn);
+    body.appendChild(acts);
+    row.appendChild(body);
+    box.appendChild(row);
+  }
+  if(!ls.trips.length && !ls.untimed) box.appendChild(el('div', 'empty', '写真がありません'));
+  $('#lib-note').textContent = '旅 ' + ls.trips.length + ' 件';
+}
+function loadTrips(){
+  const seq = ++ls.seq.trips;
+  libGet('trips', {hidden: ls.includeHidden}).then(d => {
+    if(seq !== ls.seq.trips) return;
+    ls.trips = d.trips || [];
+    ls.untimed = d.untimed || 0;
+    renderTrips();
+  }).catch(e => { if(seq === ls.seq.trips) toast('旅の一覧を読めませんでした: ' + e.message, true); });
+}
+function selectTrip(trip){
+  openGrid({from: trip.start, to: trip.end, label: rangeLabel(trip.start, trip.end)});
+}
+function mapForTrip(trip){
+  ls.period = {from: trip.start, to: trip.end};
+  ls.view = 'map';
+  ls.grid = false;
+  showLib();
+  loadPoints();
+}
+
+/* ==== 4) 格子（ページ） ==== */
+function openGrid(sel){
+  ls.sel = sel;
+  ls.page = 1;
+  ls.grid = true;
+  showLib();
+  loadGrid();
+}
+function gridParams(){
+  const s = ls.sel || {};
+  const p = {page: ls.page, per: ls.per, hidden: ls.includeHidden};
+  if(s.untimed){ p.untimed = true; }
+  else if(s.bbox){
+    p.bbox = s.bbox.join(',');
+    if(ls.period){ p.from = ls.period.from; p.to = ls.period.to; }
+  }else{ p.from = s.from; p.to = s.to; }
+  return p;
+}
+function renderGrid(){
+  const box = $('#lib-grid');
+  box.textContent = '';
+  ls.tiles = ls.items.map((photo, i) => tileFor(photo, i));
+  ls.tiles.forEach(t => box.appendChild(t));
+  $('#lib-empty').classList.toggle('hidden', ls.items.length > 0);
+  $('#lib-pageinfo').textContent = ls.total + '件 / ' + ls.page + ' of ' + ls.pages + 'ページ';
+  $('#lib-prev').disabled = ls.page <= 1;
+  $('#lib-next').disabled = ls.page >= ls.pages;
+  $('#lib-sel').textContent = ls.sel ? ls.sel.label : '';
+}
+function loadGrid(){
+  const seq = ++ls.seq.grid;
+  libGet('photos', gridParams()).then(d => {
+    if(seq !== ls.seq.grid) return;
+    ls.page = d.page; ls.pages = d.pages; ls.total = d.total;
+    ls.items = (d.items || []).map(libPhoto);
+    renderGrid();
+  }).catch(e => { if(seq === ls.seq.grid) toast('写真を読めませんでした: ' + e.message, true); });
+}
+/* ★・除外・位置などの変更（photos.js の applyPhoto から）。渡された配列とは別の object（吹き出しの 1 枚など）で
+   変えたときも、自分の格子の同じ写真に同じ値を入れてタイルを描き直す */
+function libPhotoChanged(id, patch){
+  ls.items.forEach((photo, i) => {
+    if(String(photo.id) !== String(id)) return;
+    Object.assign(photo, patch);
+    if(ls.tiles[i]) paintTile(ls.tiles[i], photo);
+  });
+}
+
+/* ==== 5) 地図 ==== */
+const LIB_CLUSTER_COLOR = ['step', ['get', 'point_count'], '#00b8d4', 100, '#ffb300', 1000, '#ff2d95'];
+const LIB_CLUSTER_RADIUS = ['step', ['get', 'point_count'], 14, 100, 19, 1000, 25];
+const EMPTY_POINTS = {type: 'FeatureCollection', features: []};
+
+function addPointLayers(map){
+  map.addSource(LIB_POINTS_SOURCE, {
+    type: 'geojson', data: ls.pendingData || EMPTY_POINTS,
+    cluster: true, clusterRadius: 40, clusterMaxZoom: 16,
+  });
+  map.addLayer({id: 'lib-clusters', type: 'circle', source: LIB_POINTS_SOURCE, filter: ['has', 'point_count'],
+    paint: {'circle-color': LIB_CLUSTER_COLOR, 'circle-radius': LIB_CLUSTER_RADIUS, 'circle-opacity': 0.85,
+            'circle-stroke-width': 2, 'circle-stroke-color': '#05080f'}});
+  map.addLayer({id: 'lib-point', type: 'circle', source: LIB_POINTS_SOURCE, filter: ['!', ['has', 'point_count']],
+    paint: {'circle-color': '#00e5ff', 'circle-radius': 6, 'circle-stroke-width': 2,
+            'circle-stroke-color': '#05080f'}});
+}
+/* クラスタの件数の文字。style に glyphs（文字の形のデータ）が無く symbol 層は使えないので、クラスタごとの DOM の
+   マーカー（クリックは通す）を render のたびに今見えているクラスタに合わせる */
+function syncClusterLabels(){
+  const map = ls.map;
+  if(!map || !map.getSource(LIB_POINTS_SOURCE) || !map.isSourceLoaded(LIB_POINTS_SOURCE)) return;
+  const seen = new Set();
+  map.querySourceFeatures(LIB_POINTS_SOURCE, {filter: ['has', 'point_count']}).forEach(f => {
+    const id = f.properties.cluster_id;
+    if(seen.has(id)) return;
+    seen.add(id);
+    if(ls.labels.has(id)) return;
+    const node = el('div', 'lib-cluster-n', String(f.properties.point_count_abbreviated || f.properties.point_count));
+    ls.labels.set(id, new maplibregl.Marker({element: node}).setLngLat(f.geometry.coordinates).addTo(map));
+  });
+  ls.labels.forEach((marker, id) => {
+    if(!seen.has(id)){ marker.remove(); ls.labels.delete(id); }
+  });
+}
+function ensureLibMap(){
+  if(ls.map) return ls.map;
+  if(typeof maplibregl === 'undefined'){ toast('地図を読み込めませんでした', true); return null; }
+  const map = new maplibregl.Map({
+    container: 'lib-map', style: tileStyle(),
+    center: [137, 36], zoom: 4, attributionControl: {compact: true},
+  });
+  ls.map = map;
+  map.addControl(new maplibregl.NavigationControl({showCompass: false}), 'top-right');
+  map.on('load', () => addPointLayers(map));
+  map.on('render', syncClusterLabels);
+  map.on('click', 'lib-clusters', e => {
+    const f = e.features && e.features[0];
+    if(!f) return;
+    map.getSource(LIB_POINTS_SOURCE).getClusterExpansionZoom(f.properties.cluster_id).then(zoom => {
+      map.easeTo({center: f.geometry.coordinates, zoom});
+    }).catch(() => {});
+  });
+  map.on('click', 'lib-point', e => {
+    const f = e.features && e.features[0];
+    if(f) openPointPopup(f.properties.id, f.geometry.coordinates.slice());
+  });
+  ['lib-clusters', 'lib-point'].forEach(layer => {
+    map.on('mouseenter', layer, () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', layer, () => { map.getCanvas().style.cursor = ''; });
+  });
+  return map;
+}
+function pointsParams(){
+  const p = {hidden: ls.includeHidden};
+  if(ls.period){ p.from = ls.period.from; p.to = ls.period.to; }
+  return p;
+}
+function clearClusterLabels(){
+  ls.labels.forEach(marker => marker.remove());
+  ls.labels.clear();
+}
+function setPoints(collection){
+  clearClusterLabels();        // クラスタの番号は読み直すと振り直されるので、古い文字は全部外す
+  const src = ls.map && ls.map.getSource(LIB_POINTS_SOURCE);
+  if(src) src.setData(collection);
+  else ls.pendingData = collection;      // 地図の style がまだ → load で source を作るときに入れる
+}
+function loadPoints(){
+  ensureLibMap();
+  const seq = ++ls.seq.points;
+  libGet('points', pointsParams()).then(d => {
+    if(seq !== ls.seq.points) return;
+    setPoints({type: 'FeatureCollection', features: d.features || []});
+    const n = (d.features || []).length;
+    $('#lib-map-note').textContent = d.truncated
+      ? n + ' 点（全 ' + d.total + ' 点のうち新しい順）'
+      : n + ' 点';
+  }).catch(e => { if(seq === ls.seq.points) toast('地図の点を読めませんでした: ' + e.message, true); });
+}
+function closePopup(){
+  if(ls.popup){ ls.popup.remove(); ls.popup = null; }
+}
+/* 点を押した時点で 1 枚を引く（点の中身は id だけ）。別の点を押したら古い応答は捨てる */
+function openPointPopup(id, lngLat){
+  const seq = ++ls.seq.popup;
+  closePopup();
+  const body = el('div', 'lib-pop', '読み込み中');
+  ls.popup = new maplibregl.Popup({closeButton: true, maxWidth: '260px'})
+    .setLngLat(lngLat).setDOMContent(body).addTo(ls.map);
+  libGet('photos', {ids: id, hidden: ls.includeHidden}).then(d => {
+    if(seq !== ls.seq.popup) return;
+    const raw = (d.items || [])[0];
+    if(!raw) throw new Error('not found');
+    const photo = libPhoto(raw);
+    body.textContent = '';
+    const thumb = el('div', 'lib-pop-thumb');
+    putImage(thumb, photo.thumb_url || photo.thumb, photo.name);
+    body.appendChild(thumb);
+    body.appendChild(el('div', 'lib-pop-dt', photo.taken_at || '撮影時刻なし'));
+    body.appendChild(el('div', 'lib-pop-place', l1Of(photo).text));
+    const open = el('button', 'btn lib-pop-open', '開く');
+    open.type = 'button';
+    open.addEventListener('click', () => openModalFor([photo], 0, {ai: false}));
+    body.appendChild(open);
+  }).catch(() => { if(seq === ls.seq.popup) body.textContent = '読めませんでした'; });
+}
+/* 今の表示範囲を [w, s, e, n] に（lon は ±180・lat は ±90 に丸める。サーバーは範囲外を 400 にする） */
+function clampTo(v, limit){ return Number(Math.max(-limit, Math.min(limit, v)).toFixed(6)); }
+function currentBbox(){
+  const b = ls.map.getBounds();
+  return [clampTo(b.getWest(), 180), clampTo(b.getSouth(), 90), clampTo(b.getEast(), 180), clampTo(b.getNorth(), 90)];
+}
+function viewBbox(){
+  if(!ls.map) return;
+  const bbox = currentBbox();
+  openGrid({bbox, label: '地図の範囲' + (ls.period ? '・' + rangeLabel(ls.period.from, ls.period.to) : '')});
+}
+
+/* ==== 6) 切り替え・初期化 ==== */
+function showLib(){
+  const trips = ls.view === 'trips', map = ls.view === 'map';
+  $('#lib-trips').classList.toggle('hidden', ls.grid || !trips);
+  $('#lib-map-box').classList.toggle('hidden', ls.grid || !map);
+  $('#lib-grid-box').classList.toggle('hidden', !ls.grid);
+  $('#lib-view-trips').classList.toggle('on', trips);
+  $('#lib-view-map').classList.toggle('on', map);
+  $('#lib-period').classList.toggle('hidden', !ls.period);
+  $('#lib-period-text').textContent = ls.period ? '期間: ' + rangeLabel(ls.period.from, ls.period.to) : '';
+  if(map && !ls.grid){
+    const m = ensureLibMap();
+    if(m) m.resize();           // 隠れているあいだに寸法が変わった（タブ・ビューの切り替え）ので合わせ直す
+  }else{
+    closePopup();
+  }
+}
+function setLibView(view){
+  ls.view = view;
+  ls.grid = false;
+  showLib();
+  if(view === 'map') loadPoints();
+}
+/* ライブラリタブを開いたとき（admin.js の showTab から）。旅は毎回読み直す。地図ビューなら点も */
+function openLibraryTab(){
+  loadTrips();
+  showLib();
+  if(ls.view === 'map' && !ls.grid) loadPoints();
+}
+function onLibHiddenChange(){
+  ls.includeHidden = !!$('#lib-hidden').checked;
+  loadTrips();
+  if(ls.grid){ ls.page = 1; loadGrid(); }
+  else if(ls.view === 'map') loadPoints();
+}
+function initLibrary(){
+  $('#lib-view-trips').addEventListener('click', () => setLibView('trips'));
+  $('#lib-view-map').addEventListener('click', () => setLibView('map'));
+  $('#lib-hidden').addEventListener('change', onLibHiddenChange);
+  $('#lib-back').addEventListener('click', () => { ls.grid = false; showLib(); });
+  $('#lib-prev').addEventListener('click', () => { if(ls.page > 1){ ls.page--; loadGrid(); } });
+  $('#lib-next').addEventListener('click', () => { if(ls.page < ls.pages){ ls.page++; loadGrid(); } });
+  $('#lib-bbox').addEventListener('click', viewBbox);
+  $('#lib-period-clear').addEventListener('click', () => { ls.period = null; showLib(); loadPoints(); });
+  onPhotoChange(libPhotoChanged);
+}
