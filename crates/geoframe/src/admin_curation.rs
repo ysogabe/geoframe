@@ -372,12 +372,13 @@ fn parse_representatives(payload: &Map<String, Value>) -> Result<Option<Vec<i64>
                 return Err(bad_request());
             }
             let mut ids: Vec<i64> = Vec::with_capacity(items.len());
+            let mut seen = std::collections::HashSet::with_capacity(items.len());
             for item in items {
                 let id = item
                     .as_i64()
                     .filter(|id| *id >= 1)
                     .ok_or_else(bad_request)?;
-                if ids.contains(&id) {
+                if !seen.insert(id) {
                     return Err(bad_request());
                 }
                 ids.push(id);
@@ -454,20 +455,19 @@ pub fn confirm(
             return Ok(Outcome::Changed);
         };
         if let Some(ids) = &representatives {
-            if !ids
-                .iter()
-                .all(|id| group.members.iter().any(|m| m.photo_id == *id))
-            {
+            let member_ids: std::collections::HashSet<i64> =
+                group.members.iter().map(|m| m.photo_id).collect();
+            if !ids.iter().all(|id| member_ids.contains(id)) {
                 return Ok(Outcome::NotSubset);
             }
-            let visible = |id: &i64| {
-                group
-                    .members
-                    .iter()
-                    .zip(&group.selectable)
-                    .any(|(m, ok)| m.photo_id == *id && *ok)
-            };
-            if !ids.iter().all(visible) {
+            let visible: std::collections::HashSet<i64> = group
+                .members
+                .iter()
+                .zip(&group.selectable)
+                .filter(|(_, ok)| **ok)
+                .map(|(m, _)| m.photo_id)
+                .collect();
+            if !ids.iter().all(|id| visible.contains(id)) {
                 return Ok(Outcome::NotVisible);
             }
         }
@@ -480,10 +480,13 @@ pub fn confirm(
                         strftime('%Y-%m-%d %H:%M:%S','now')
                    FROM photo_quality WHERE photo_id=?2",
             )?;
+            let chosen: std::collections::HashSet<i64> = representatives
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
             for member in &group.members {
-                let representative = representatives
-                    .as_ref()
-                    .is_some_and(|ids| ids.contains(&member.photo_id));
+                let representative = chosen.contains(&member.photo_id);
                 let role = if representative {
                     "representative"
                 } else {

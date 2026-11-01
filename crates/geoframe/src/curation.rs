@@ -117,7 +117,7 @@ pub(crate) fn has_valid_representative(p: &str) -> String {
 /// メンバーの人の記録の見え方（`'representative'`・`'reviewed'`・`'stale'`・`'none'`）の式。`c` は [`join`] の別名（有効な
 /// 記録だけ）。有効な記録が無くても `photo_curation` に行があれば世代が合わない記録なので `'stale'`。
 /// 表の外側の別名 `x` は固定なので、呼び手の別名と重ならないこと。
-pub(crate) fn record_case(q: &str, c: &str) -> String {
+pub fn record_case(q: &str, c: &str) -> String {
     format!(
         "CASE WHEN {c}.photo_id IS NOT NULL THEN {c}.role
        WHEN EXISTS (SELECT 1 FROM photo_curation x WHERE x.photo_id={q}.photo_id) THEN 'stale'
@@ -128,7 +128,7 @@ pub(crate) fn record_case(q: &str, c: &str) -> String {
 /// 選別のグループのメンバー（`photos` の別名 `p` と世代の合う `photo_quality` の行 `q`。表があれば有効な記録 `c`）。
 /// `groups`・`confirm`・`reset` の読み取りと、状況タブの [`pending_groups`] が同じ定義から数える。
 /// 表が無ければ（`curation` が偽）`photo_curation` を一切書かない。
-pub(crate) fn members_from(curation: bool) -> String {
+pub fn members_from(curation: bool) -> String {
     let base = "FROM photo_quality q JOIN photos p
        ON p.id=q.photo_id AND p.display=q.display
       AND p.md5 IS q.source_md5 AND p.mtime IS q.source_mtime";
@@ -140,7 +140,7 @@ pub(crate) fn members_from(curation: bool) -> String {
 }
 
 /// メンバーの [`Record`] を返す SQL の式（`q`・`c` は [`members_from`] の別名）。表が無ければ記録は無い。
-pub(crate) fn member_record(curation: bool) -> String {
+pub fn member_record(curation: bool) -> String {
     if curation {
         record_case("q", "c")
     } else {

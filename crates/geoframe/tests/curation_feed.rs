@@ -90,23 +90,18 @@ impl Env {
 
     /// グループの状態（世代の合う `photo_quality` の行のメンバーの記録から。`curation::group_state`）。
     fn state(&self, group_id: i64) -> State {
+        // グループ 1 は exact、2・3 は similar（フィクスチャ）
+        let kind = if group_id == 1 { "exact" } else { "similar" };
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT
-                   CASE WHEN c.photo_id IS NOT NULL THEN c.role
-                        WHEN EXISTS(SELECT 1 FROM photo_curation x WHERE x.photo_id=q.photo_id) THEN 'stale'
-                        ELSE 'none' END
-                 FROM photo_quality q JOIN photos p ON p.id=q.photo_id AND p.display=q.display
-                  AND p.md5 IS q.source_md5 AND p.mtime IS q.source_mtime
-                 LEFT JOIN photo_curation c ON c.photo_id=q.photo_id AND c.display=q.display
-                  AND c.source_md5 IS q.source_md5 AND c.source_mtime IS q.source_mtime
-                  AND c.content_sha256=q.content_sha256
-                 WHERE q.group_id=?1 ORDER BY q.photo_id",
-            )
+            .prepare(&format!(
+                "SELECT {record} {from} WHERE q.group_kind=?1 AND q.group_id=?2 ORDER BY q.photo_id",
+                record = geoframe::curation::member_record(true),
+                from = geoframe::curation::members_from(true),
+            ))
             .unwrap();
         let records: Vec<Record> = stmt
-            .query_map([group_id], |row| {
+            .query_map(rusqlite::params![kind, group_id], |row| {
                 Ok(match row.get::<_, String>(0)?.as_str() {
                     "representative" => Record::Representative,
                     "reviewed" => Record::Reviewed,
