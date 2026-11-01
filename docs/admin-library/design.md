@@ -213,6 +213,7 @@ ls = {
   trips: [], untimed: 0,   // GET /api/admin/library/trips の結果
   sel: null,            // 格子の絞り込み {from, to} | {untimed} | {bbox} と表示用の label
   period: null,         // 地図の点と範囲に掛ける期間 {from, to}（旅の「地図で見る」で入り、解除で外す）
+  pointsStale: false,   // 地図が見えていないあいだに「除外も含める」が変わった印（地図へ戻るとき点を取り直す）
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],   // 格子
   map: null, pendingData: null, labels: Map, popup: null,       // maplibregl.Map（地図ビューを初めて開いたとき作る）
   seq: {trips, grid, points, popup},   // 要求の種類ごとの番号（古い応答を捨てる。種類を分けるのは、
