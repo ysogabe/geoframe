@@ -583,7 +583,10 @@ await test('(g2) 地図は周回させない（renderWorldCopies: false・maxBou
   await settle();
   const map = mapOf(env);
   assert.equal(map.options.renderWorldCopies, false);
-  assert.deepEqual(plain(map.options.maxBounds), [[-180, -85], [180, 85]]);
+  assert.deepEqual(plain(map.options.maxBounds), [[-179.999, -85], [179.999, 85]]);
+  // 回帰の見張り: 実際の MapLibre 4.7.1 は maxBounds の経度がちょうど ±180 だと初期カメラがズーム 22・経度 180 に潰れる。
+  // 偽の MapLibre では検出できないので、値そのもので見張る。
+  for(const lng of [plain(map.options.maxBounds)[0][0], plain(map.options.maxBounds)[1][0]]) assert.ok(Math.abs(lng) < 180, `maxBounds の経度は ±180 未満: ${lng}`);
   env.fake.bounds = {w: 190, s: 10, e: 210, n: 30};
   env.$('#lib-bbox').click();
   await settle();
