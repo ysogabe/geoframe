@@ -356,7 +356,8 @@ cs = {
   [AND hidden=0] ORDER BY taken_at, id` を 1 回読み、Rust で 48 時間超の空きで区切る（`photos.rs` の
   `parse_epoch`・`TRIP_GAP_SECONDS` を `pub(crate)` にして共有）。日時ありの判定は `photos`・`points` と同じ形の判定
   （`taken_at GLOB` の 16 桁の形。`untimed` はその否定で、NULL・空・`x` のような形の違う値を数える）。暦として読めない日時
-  （`2025-02-30 10:00` など）は 1 枚だけの旅（`key`・`start`・`end` はその文字列そのまま。次の読める写真も新しい旅）にする。
+  （`2025-02-30 10:00` など）は同じ文字列ごとに 1 つの旅（通常は 1 枚。`key`・`start`・`end` はその文字列そのまま。
+  前後の読める写真とは別の旅）にする。
   このため旅の `count` の合計 + `untimed` は対象の写真の数に常に等しい。
 
 ### `GET /api/admin/library/photos`（新。PR ②）

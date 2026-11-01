@@ -337,6 +337,45 @@ async fn trips_keep_unreadable_times_as_single_photo_trips_and_count_every_photo
     assert_eq!(total_of(&plain), 18);
 }
 
+/// 暦として読めない同じ `taken_at` の行をもう 1 枚（`BROKEN_TIMES` のあとに足す）。
+///   29 `2025-02-30 10:00`（id 24 と同じ文字列。位置なし）
+const SAME_BROKEN_TIME: &str = "
+INSERT INTO photos(id, source, drive_id, path, display, name, md5, mtime, taken_at, lat, lon, loc_source,
+                   place, pref, city, favorite, hidden, rotation) VALUES
+  (29, 'drive', 'drive-l29', NULL, 'derivatives/l29.jpg', 'IMG_L29.jpg', 'md5-l29', 290.0, '2025-02-30 10:00', NULL, NULL, NULL, NULL, '', '', 0, 0, 0);
+";
+
+#[tokio::test]
+async fn trips_merge_photos_with_the_same_unreadable_time_into_one_trip() {
+    let server = Server::start_with(&[], &format!("{BROKEN_TIMES}{SAME_BROKEN_TIME}")).await;
+    let body = server.ok("/api/admin/library/trips").await;
+    // 同じ文字列の 2 枚（id 24・29）は 1 つの旅。`key` が同じ旅が 2 つできない
+    assert_eq!(
+        trip_keys(&body),
+        [E, C, B, "2025-03-03 19:00", G, A, F],
+        "{body}"
+    );
+    let t = trip(&body, F);
+    assert_eq!(
+        (&t["start"], &t["end"], &t["count"], &t["noloc"]),
+        (&json!(F), &json!(F), &json!(2), &json!(1))
+    );
+    // 表紙は位置のある最初の写真（id 24）
+    assert_eq!(t["cover"]["id"], 24);
+    // 旅の枚数 + 日時なし = 除外でない写真 23 枚
+    assert_eq!(total_of(&body), 23);
+    // 画面が旅の `key` をそのまま渡すと、旅の枚数と同じだけ返る
+    let photos = server
+        .ok(&format!(
+            "/api/admin/library/photos?from={}&to={}",
+            enc(F),
+            enc(F)
+        ))
+        .await;
+    assert_eq!(photos["total"], 2);
+    assert_eq!(ids(&photos), [24, 29]);
+}
+
 // ---------------------------------------------------------------- photos
 
 #[tokio::test]

@@ -348,20 +348,24 @@ fn build_trips(
     let mut rows = stmt.query([])?;
     let mut trips: Vec<Trip> = Vec::new();
     let mut last: Option<i64> = None;
+    // 直前の行が暦として読めない日時だったときの、その文字列
+    let mut unreadable: Option<String> = None;
     while let Some(row) = rows.next()? {
         let taken_at = text(row, 1)?;
-        // 形は合うが暦として読めない（`2025-02-30 10:00` など）行は落とさず、1 枚だけの旅にする。
-        // `photos::assign_trips` と同じく新しい旅を始め、次の読める行も新しい旅を始める（`last` を空にして、
-        // 空きを測る相手を無くす。読める行が来たらその時刻で置き直す）
+        // 形は合うが暦として読めない（`2025-02-30 10:00` など）行は落とさず、旅にする。`photos::assign_trips` と同じく
+        // 前後の読める行とは別の旅で（`last` を空にして、空きを測る相手を無くす。読める行が来たらその時刻で置き直す）、
+        // 直前の旅が同じ文字列の「読めない日時の旅」ならそこに足す（同じ `key`・`start`・`end` の旅を 2 つ作らない。
+        // `ORDER BY taken_at, id` なので同じ文字列は隣り合う）
         let epoch = parse_epoch(&taken_at);
-        let starts_new_trip = match (epoch, last) {
-            (Some(e), Some(l)) => e - l > TRIP_GAP_SECONDS,
-            _ => true,
+        let starts_new_trip = match epoch {
+            Some(e) => last.is_none_or(|l| e - l > TRIP_GAP_SECONDS),
+            None => unreadable.as_deref() != Some(taken_at.as_str()),
         };
         if starts_new_trip {
             trips.push(Trip::new(&taken_at));
         }
         last = epoch;
+        unreadable = epoch.is_none().then(|| taken_at.clone());
         let trip = trips.last_mut().expect("直前で足した");
         trip.end.clone_from(&taken_at);
         trip.count += 1;
