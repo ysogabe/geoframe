@@ -264,6 +264,79 @@ async fn trips_of_an_empty_catalog() {
     assert_eq!(body, json!({"ok": true, "trips": [], "untimed": 0}));
 }
 
+/// 暦として読めない・壊れた `taken_at` の行（DB の行として足す。フィクスチャの旅は変えない）。
+///   24 `2025-02-30 10:00`（形は合うが暦が無い。位置あり。旅 A の前）
+///   25 `2025-03-01 24:30`（同上。旅 A の真ん中: id 6 の 03-01 19:00 と id 7 の 03-03 19:00 のあいだ。位置なし）
+///   26 `x`（形が違う。位置あり）・27 `2025-06`（同上。位置なし）・28 `x`（除外）
+const BROKEN_TIMES: &str = "
+INSERT INTO photos(id, source, drive_id, path, display, name, md5, mtime, taken_at, lat, lon, loc_source,
+                   place, pref, city, favorite, hidden, rotation) VALUES
+  (24, 'local', NULL, 'local/l24.jpg', 'derivatives/l24.jpg', 'IMG_L24.jpg', 'md5-l24', 240.0, '2025-02-30 10:00', 36.0, 140.0, 'exif', '試験区', '架空県', '試験市', 0, 0, 0),
+  (25, 'drive', 'drive-l25', NULL, 'derivatives/l25.jpg', 'IMG_L25.jpg', 'md5-l25', 250.0, '2025-03-01 24:30', NULL, NULL, NULL, NULL, '', '', 0, 0, 0),
+  (26, 'local', NULL, 'local/l26.jpg', 'derivatives/l26.jpg', 'IMG_L26.jpg', 'md5-l26', 260.0, 'x', 36.1, 140.1, 'exif', '試験区', '架空県', '試験市', 0, 0, 0),
+  (27, 'drive', 'drive-l27', NULL, 'derivatives/l27.jpg', 'IMG_L27.jpg', 'md5-l27', 270.0, '2025-06', NULL, NULL, NULL, NULL, '', '', 0, 0, 0),
+  (28, 'local', NULL, 'local/l28.jpg', 'derivatives/l28.jpg', 'IMG_L28.jpg', 'md5-l28', 280.0, 'x', 36.2, 140.2, 'exif', '試験区', '架空県', '試験市', 0, 1, 0);
+";
+const F: &str = "2025-02-30 10:00";
+const G: &str = "2025-03-01 24:30";
+
+fn total_of(body: &Value) -> i64 {
+    body["trips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["count"].as_i64().unwrap())
+        .sum::<i64>()
+        + body["untimed"].as_i64().unwrap()
+}
+
+#[tokio::test]
+async fn trips_keep_unreadable_times_as_single_photo_trips_and_count_every_photo() {
+    let server = Server::start_with(&[], BROKEN_TIMES).await;
+    let body = server.ok("/api/admin/library/trips").await;
+    // 新しい順。暦の無い 2 枚は 1 枚だけの旅（前後の旅に合流しない）。旅 A は G で割れ、G の次の読める行（id 7）は新しい旅
+    assert_eq!(
+        trip_keys(&body),
+        [E, C, B, "2025-03-03 19:00", G, A, F],
+        "{body}"
+    );
+    for key in [F, G] {
+        let t = trip(&body, key);
+        assert_eq!(
+            (&t["start"], &t["end"], &t["count"]),
+            (&json!(key), &json!(key), &json!(1)),
+            "{key}"
+        );
+    }
+    assert_eq!(trip(&body, F)["noloc"], 0);
+    assert_eq!(trip(&body, F)["cover"]["id"], 24);
+    assert_eq!(trip(&body, G)["noloc"], 1);
+    let a1 = trip(&body, A);
+    assert_eq!(
+        (&a1["end"], &a1["count"]),
+        (&json!("2025-03-01 19:00"), &json!(6))
+    );
+    let a2 = trip(&body, "2025-03-03 19:00");
+    assert_eq!(
+        (&a2["end"], &a2["count"]),
+        (&json!("2025-03-03 19:30"), &json!(4))
+    );
+    // 日時なしは形の違う値（x・2025-06）を含めた 4 枚（id 21 NULL・22 空・26・27）。除外の 28 は数えない
+    assert_eq!(body["untimed"], 4);
+    // 旅の枚数 + 日時なし = 除外でない写真 22 枚（全 28 枚のうち除外は id 11・13・17・18・23・28 の 6 枚）
+    assert_eq!(total_of(&body), 22);
+
+    let hidden = server.ok("/api/admin/library/trips?hidden=1").await;
+    assert_eq!(hidden["untimed"], 6);
+    assert_eq!(total_of(&hidden), 28);
+    // id 11（03-04 08:00）は G の後の旅に加わる
+    assert_eq!(trip(&hidden, "2025-03-03 19:00")["count"], 5);
+    // 暦の無い日時が無ければ、フィクスチャのままの旅（A は割れない）
+    let plain = Server::start().await;
+    let plain = plain.ok("/api/admin/library/trips").await;
+    assert_eq!(total_of(&plain), 18);
+}
+
 // ---------------------------------------------------------------- photos
 
 #[tokio::test]
@@ -449,6 +522,44 @@ async fn photos_without_a_time_come_from_untimed() {
 }
 
 #[tokio::test]
+async fn photos_treat_the_timed_shape_alike_in_ranges_and_untimed() {
+    let server = Server::start_with(&[], BROKEN_TIMES).await;
+    async fn get_ids(server: &Server, query: &str) -> Vec<i64> {
+        ids(&server
+            .ok(&format!("/api/admin/library/photos?{query}"))
+            .await)
+    }
+    // 暦の無い日時も、旅の `key`・`end` をそのまま `from`・`to` に渡せば、その 1 枚を引ける
+    assert_eq!(
+        get_ids(&server, &format!("from={}&to={}", enc(F), enc(F))).await,
+        [24]
+    );
+    assert_eq!(
+        get_ids(&server, &format!("from={}&to={}", enc(G), enc(G))).await,
+        [25]
+    );
+    // 形で揃える: 2 月 1 日〜3 月 1 日 0 時の範囲に 2025-02-30 10:00 は入る
+    assert_eq!(
+        get_ids(&server, "from=2025-02-01%2000%3A00&to=2025-03-01%2000%3A00").await,
+        [24]
+    );
+    // 日時なしは NULL・空・形の違う値（x・2025-06）。日時なしは並びの最後で、`2025-02-30 10:00` は含まない。
+    // 空・NULL → `2025-06` → `x` の順（`COALESCE(taken_at,'')`、同じなら id）
+    assert_eq!(get_ids(&server, "untimed=1").await, [21, 22, 27, 26]);
+    assert_eq!(
+        get_ids(&server, "untimed=1&hidden=1").await,
+        [21, 22, 23, 27, 26, 28]
+    );
+    // 日時の範囲には、形の違う値（x・2025-06）や空は入らない
+    assert_eq!(
+        get_ids(&server, "from=2025-01-01%2000%3A00&to=2099-01-01%2000%3A00").await,
+        [
+            24, 1, 2, 3, 4, 5, 6, 25, 7, 8, 9, 10, 12, 14, 15, 16, 19, 20
+        ]
+    );
+}
+
+#[tokio::test]
 async fn photos_need_a_narrowing_filter_and_a_valid_shape() {
     let server = Server::start().await;
     for target in [
@@ -461,14 +572,11 @@ async fn photos_need_a_narrowing_filter_and_a_valid_shape() {
         server.bad(target).await;
     }
     for target in [
-        // 日時
+        // 日時（形だけを見る。暦の正しさは見ないので、2025-02-30 10:00・25:00・10:60 は通る）
         "from=2025-06-01",
         "from=2025-6-1%2010%3A00",
         "from=2025-06-01T10%3A00",
         "from=2025-06-01%2010%3A00%3A00",
-        "from=2025-06-01%2025%3A00",
-        "from=2025-02-30%2010%3A00",
-        "from=2025-06-01%2010%3A60",
         "from=%EF%BC%92025-06-01%2010%3A00",
         "to=x",
         "to=2025-06-01%2010%3A00%20",
@@ -714,6 +822,46 @@ async fn points_in_a_range_skip_untimed_photos() {
         empty,
         json!({"ok": true, "truncated": false, "total": 0, "type": "FeatureCollection", "features": []})
     );
+}
+
+#[tokio::test]
+async fn points_use_the_same_timed_shape_and_accept_unreadable_dates() {
+    let server = Server::start_with(&[], BROKEN_TIMES).await;
+    // 位置のある、形は合うが暦の無い日時（id 24）も範囲に入る。旅の `key` をそのまま渡せる
+    let body = server
+        .ok(&format!(
+            "/api/admin/library/points?from={}&to={}",
+            enc(F),
+            enc(F)
+        ))
+        .await;
+    assert_eq!(point_ids(&body), [24]);
+    assert_eq!(body["total"], 1);
+    // 暦の無い id 25 は位置なしなので点にならない
+    let g = server
+        .ok(&format!(
+            "/api/admin/library/points?from={}&to={}",
+            enc(G),
+            enc(G)
+        ))
+        .await;
+    assert_eq!(point_ids(&g), Vec::<i64>::new());
+    // 2 月 1 日〜3 月 1 日 0 時に id 24 は入る
+    let feb = server
+        .ok("/api/admin/library/points?from=2025-02-01%2000%3A00&to=2025-03-01%2000%3A00")
+        .await;
+    assert_eq!(point_ids(&feb), [24]);
+    // 範囲なしでは、日時なし（形の違う `x` の id 26 と NULL の id 21）が最後。`x` は NULL より後ろの値なので新しい順では先
+    let all = server.ok("/api/admin/library/points").await;
+    assert_eq!(
+        point_ids(&all),
+        [20, 19, 14, 10, 9, 8, 7, 3, 2, 1, 24, 26, 21]
+    );
+    // 範囲を付けると、形の違う値（x）は入らない
+    let ranged = server
+        .ok("/api/admin/library/points?from=2025-01-01%2000%3A00")
+        .await;
+    assert_eq!(point_ids(&ranged), [20, 19, 14, 10, 9, 8, 7, 3, 2, 1, 24]);
 }
 
 #[tokio::test]

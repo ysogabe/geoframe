@@ -35,16 +35,38 @@ const PER_DEFAULT: i64 = 60;
 /// 旅の `places` に出す上位の数。
 const PLACES_MAX: usize = 3;
 
-/// 日時なし（`taken_at` が NULL か空）。
-const UNTIMED: &str = "(taken_at IS NULL OR taken_at='')";
-/// 分までの撮影日時（`YYYY-MM-DD HH:MM`）がある。
-const TIMED: &str =
-    "taken_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]'";
+/// 「日時あり」の判定（SQL）。分までの撮影日時の形（`YYYY-MM-DD HH:MM`、16 桁）だけを見る。暦としての正しさは見ない
+/// （`imaging::norm_time` が暦を検査しないので、`2025-02-30 10:00` も取り込まれる）。`trips`・`photos`・`points` と
+/// `from`・`to` の検査はすべてこの形で揃える。`concat!` で他の定数に埋めるため、リテラルはマクロに 1 つだけ置く。
+macro_rules! timed_sql {
+    () => {
+        "taken_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]'"
+    };
+}
+/// 「日時なし」は [`TIMED`] の否定（NULL・空・形の違う値。`''`・`'x'`・`'2025-06'` など）。
+macro_rules! untimed_sql {
+    () => {
+        concat!("(taken_at IS NULL OR NOT (", timed_sql!(), "))")
+    };
+}
+/// 分までの撮影日時の形をしている。
+const TIMED: &str = timed_sql!();
+/// 日時なし（[`TIMED`] でない）。
+const UNTIMED: &str = untimed_sql!();
 /// 除外していない（`hidden` が NULL・0）。
 const VISIBLE: &str = "COALESCE(hidden,0)=0";
 /// 日時の順（日時なしは最後）、同じなら ID。
-const ORDER: &str =
-    "CASE WHEN taken_at IS NULL OR taken_at='' THEN 1 ELSE 0 END, COALESCE(taken_at,''), id";
+const ORDER: &str = concat!(
+    "CASE WHEN ",
+    untimed_sql!(),
+    " THEN 1 ELSE 0 END, COALESCE(taken_at,''), id"
+);
+/// 新しい順（日時なしは最後）、同じなら ID の大きい方が先。
+const ORDER_NEWEST: &str = concat!(
+    "CASE WHEN ",
+    untimed_sql!(),
+    " THEN 1 ELSE 0 END, COALESCE(taken_at,'') DESC, id DESC"
+);
 
 type Params = HashMap<String, String>;
 
@@ -57,7 +79,8 @@ fn include_hidden(params: &Params) -> bool {
     params.get("hidden").is_some_and(|v| v == "1")
 }
 
-/// `YYYY-MM-DD HH:MM`（各桁が ASCII の数字）で、日時として成り立つもの。
+/// `YYYY-MM-DD HH:MM`（各桁が ASCII の数字）の形。暦としての正しさは見ない（[`TIMED`] と同じ形。画面が旅の
+/// `key`・`end` をそのまま渡して、暦として読めない日時の旅も引けるようにする）。
 fn parse_minute(s: &str) -> Option<&str> {
     let b = s.as_bytes();
     let shaped = b.len() == 16
@@ -67,7 +90,7 @@ fn parse_minute(s: &str) -> Option<&str> {
             13 => *c == b':',
             _ => c.is_ascii_digit(),
         });
-    (shaped && parse_epoch(s).is_some()).then_some(s)
+    shaped.then_some(s)
 }
 
 /// `from`・`to`。どちらも形が合い、両方あるときは `from <= to`（固定長の文字列なので文字列の順が時刻の順）。
@@ -146,7 +169,7 @@ impl Filter {
 
     fn range(&mut self, from: Option<String>, to: Option<String>) {
         if from.is_some() || to.is_some() {
-            // 文字列の比較なので、日時なし（NULL・空）や形の違う値が `<=` に紛れ込まないよう、分までの形の行だけにする
+            // 文字列の比較なので、日時なしや形の違う値が `<=` に紛れ込まないよう、分までの形の行（[`TIMED`]）だけにする
             self.conditions.push(TIMED.to_owned());
             self.narrowed = true;
         }
@@ -316,9 +339,10 @@ fn build_trips(
     } else {
         " AND COALESCE(hidden,0)=0"
     };
+    // 「日時あり」は `photos`・`points` と同じ形の判定（[`TIMED`]）。暦として読めない日時もここに入る
     let mut stmt = conn.prepare(&format!(
         "SELECT id, taken_at, lat, lon, pref, city, hidden, display, drive_id, md5, mtime
-           FROM photos WHERE taken_at IS NOT NULL AND taken_at!=''{visible}
+           FROM photos WHERE {TIMED}{visible}
           ORDER BY taken_at, id"
     ))?;
     let mut rows = stmt.query([])?;
@@ -326,15 +350,18 @@ fn build_trips(
     let mut last: Option<i64> = None;
     while let Some(row) = rows.next()? {
         let taken_at = text(row, 1)?;
-        // 日時として読めない文字列は旅に入れない（`photos` の旅番号と違い、独りだけの旅を作らない）
-        let Some(epoch) = parse_epoch(&taken_at) else {
-            continue;
+        // 形は合うが暦として読めない（`2025-02-30 10:00` など）行は落とさず、1 枚だけの旅にする。
+        // `photos::assign_trips` と同じく新しい旅を始め、次の読める行も新しい旅を始める（`last` を空にして、
+        // 空きを測る相手を無くす。読める行が来たらその時刻で置き直す）
+        let epoch = parse_epoch(&taken_at);
+        let starts_new_trip = match (epoch, last) {
+            (Some(e), Some(l)) => e - l > TRIP_GAP_SECONDS,
+            _ => true,
         };
-        // `photos::assign_trips` と同じ規則: 直前の写真との空きが 48 時間を超えたら次の旅
-        if trips.is_empty() || last.is_some_and(|l| epoch - l > TRIP_GAP_SECONDS) {
+        if starts_new_trip {
             trips.push(Trip::new(&taken_at));
         }
-        last = Some(epoch);
+        last = epoch;
         let trip = trips.last_mut().expect("直前で足した");
         trip.end.clone_from(&taken_at);
         trip.count += 1;
@@ -541,8 +568,7 @@ fn build_points(conn: &Connection, filter: &Filter, max: usize) -> rusqlite::Res
     // 新しい順（日時なしは最後）。1 件多く読んで、超えたかを知る
     let mut stmt = conn.prepare(&format!(
         "SELECT id, lat, lon FROM photos WHERE {clause}
-          ORDER BY CASE WHEN taken_at IS NULL OR taken_at='' THEN 1 ELSE 0 END, COALESCE(taken_at,'') DESC, id DESC
-          LIMIT ?"
+          ORDER BY {ORDER_NEWEST} LIMIT ?"
     ))?;
     let mut bound = filter.params.clone();
     bound.push(Sql::Integer(
@@ -598,17 +624,23 @@ mod tests {
     }
 
     #[test]
-    fn minutes_must_be_sixteen_characters_of_a_real_time() {
+    fn minutes_must_be_sixteen_characters_in_the_timed_shape() {
         assert!(parse_minute("2025-06-01 10:00").is_some());
+        // 形だけを見る（暦の正しさは見ない。`taken_at` 自体も暦を検査しない）
+        for shaped in [
+            "2025-02-30 10:00",
+            "2025-06-01 24:00",
+            "2025-06-01 10:60",
+            "2025-13-45 99:99",
+        ] {
+            assert!(parse_minute(shaped).is_some(), "{shaped:?}");
+        }
         for bad in [
             "",
             "2025-06-01",
             "2025-6-1 10:00",
             "2025-06-01T10:00",
             "2025-06-01 10:00:00",
-            "2025-06-01 24:00",
-            "2025-02-30 10:00",
-            "2025-06-01 10:60",
             "２０２５-06-01 10:00",
             "2025-06-01  10:0",
         ] {
@@ -621,6 +653,10 @@ mod tests {
         assert!(parse_range(&params("from=2025-06-01+10:00&to=2025-06-01+10:00")).is_some());
         assert!(parse_range(&params("from=2025-06-01+10:01&to=2025-06-01+10:00")).is_none());
         assert!(parse_range(&params("from=x")).is_none());
+        // 形だけ: 暦が無い日時は通り、形の違うものは通らない
+        assert!(parse_range(&params("from=2025-02-30+10:00&to=2025-02-30+10:00")).is_some());
+        assert!(parse_range(&params("from=2025-6-1+10:00")).is_none());
+        assert!(parse_range(&params("to=2025-06-01T10:00")).is_none());
         assert_eq!(parse_range(&params("")), Some((None, None)));
     }
 

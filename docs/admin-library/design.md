@@ -352,13 +352,16 @@ cs = {
 
 - 旅は `start` の降順。`cover` は旅の中で位置があり除外でない最初の写真（無ければ先頭）。`places` は `pref`・`city` の
   組の件数の上位 3 つ（`pref` が空なら `{"pref": "", "city": "", …}` で「海外・不明」）。
-- 実装: `SELECT id, taken_at, lat, lon, pref, city, hidden, display, drive_id, md5, mtime FROM photos WHERE taken_at IS NOT NULL
-  AND taken_at!='' [AND hidden=0] ORDER BY taken_at, id` を 1 回読み、Rust で 48 時間超の空きで区切る（`photos.rs` の
-  `parse_epoch`・`TRIP_GAP_SECONDS` を `pub(crate)` にして共有）。
+- 実装: `SELECT id, taken_at, lat, lon, pref, city, hidden, display, drive_id, md5, mtime FROM photos WHERE <日時ありの形の判定>
+  [AND hidden=0] ORDER BY taken_at, id` を 1 回読み、Rust で 48 時間超の空きで区切る（`photos.rs` の
+  `parse_epoch`・`TRIP_GAP_SECONDS` を `pub(crate)` にして共有）。日時ありの判定は `photos`・`points` と同じ形の判定
+  （`taken_at GLOB` の 16 桁の形。`untimed` はその否定で、NULL・空・`x` のような形の違う値を数える）。暦として読めない日時
+  （`2025-02-30 10:00` など）は 1 枚だけの旅（`key`・`start`・`end` はその文字列そのまま。次の読める写真も新しい旅）にする。
+  このため旅の `count` の合計 + `untimed` は対象の写真の数に常に等しい。
 
 ### `GET /api/admin/library/photos`（新。PR ②）
 
-- 引数: `from`・`to`（`YYYY-MM-DD HH:MM`。各桁が数字で日時として成り立つこと、`from <= to`。両端を含む。`taken_at` は
+- 引数: `from`・`to`（`YYYY-MM-DD HH:MM`。16 桁の形であること（暦の正しさは見ない。`taken_at` 自体も暦を検査していないため、形で揃える）、`from <= to`。両端を含む。`taken_at` は
   分までの 16 文字（`imaging::norm_time`）なので `to` を分まで含めれば旅の最後の写真は欠けない）、
   `bbox=minlon,minlat,maxlon,maxlat`（有限、lon は ±180、lat は ±90、`min <= max`。日付変更線をまたぐ範囲は扱わず、画面が
   `getBounds()` の値を範囲内に丸めてから送る）、`ids=1,2,3`（整数。重複を除く**前**の個数が 200 を超えても 400）、`pref`・`city`（R10。文字数で
