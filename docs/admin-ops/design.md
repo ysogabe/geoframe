@@ -123,15 +123,26 @@ AI の停止の解除）を、稼働中の `serve` の中で行い、進み具�
      （`attempts`・`defer_count`・`terminal`）もリセットする（`jobs.rs:1105-1123`）。これは CLI と同じで、背景ワーカーが
      `pending`・`deferred` を取り出す条件（`jobs.rs:692`）とは行が重ならないが、「`failed` だけ」ではない。
    結果は応答に入れ、`Board` の履歴にも 1 件として残す（`kind: "ai_retry"`／`"ai_release_pause"`、`report`）。
-4. **大量削除の解除は「印つきの承認」＋「上限つきの許可」の 2 重にする**（R12）。印（`token`）は `MassDeleteHold` の
-   `held`・`reason`・`drive_rows`・`since` から選別タブと同じ作り（SHA-256 の先頭 8 バイトの hex）で作り、POST で一致を
-   確かめる。要求は印を持ち続け、ワーカーが取り出して**実行する直前にもう一度** `MassDeleteBoard::current()` の印と照らし、
-   違えば実行せず履歴に `hold_changed` と残す（待っているあいだの定期サイクルで保留が変わった・消えた場合。Sol の指摘 5）。
-   実行する `index_drive` には `Allow::UpTo(held)` を渡す。`plan()` は **`Allow` で最初に分岐**する: `Yes` は今までどおり全部
-   消す、`UpTo(n)` は空の一覧か比率の閾値かにかかわらず `doomed.len() <= n` なら消し、超えれば保留に戻す（空の一覧なら
-   `deletes_withheld`、それ以外は `mass_delete_withheld`。既存の 2 つの鍵を使い、新しい鍵は足さない）、`No` は今までどおり。
-   `allow_mass_delete: bool` は `enum Allow { No, Yes, UpTo(u64) }` に広げ、CLI の `--allow-mass-delete` は `Yes` のまま
-   （引数・挙動は変えない。R18）。承認は件数に対するもので、同じ件数で消える行の集合が入れ替わったことは検出しない（限界）。
+4. **大量削除の解除は「集合つきの承認」＋「集合に限った許可」＋「消す前の写し」の 3 重にする**（R12）。
+   - `MassDeleteHold` に保留した行の ID の集合（`ids: Vec<i64>`、昇順。メモリの中だけで応答には出さない）を足す。
+     `plan()` の `doomed` がそのまま使える（`index.rs:387-396`）。
+   - 印（`token`）は `held`・`reason`・`drive_rows`・`since` と、並べた ID を改行でつないだものの SHA-256 の先頭 8 バイトの hex
+     （選別タブの `group_token`、`curation.rs:277-301` と同じ作り）。POST で一致を確かめ、要求は印と ID の集合を持ち続ける。
+   - ワーカーが取り出して**実行する直前にもう一度** `MassDeleteBoard::current()` の印と照らし、違えば実行せず履歴に
+     `hold_changed`（待っているあいだの定期サイクルで保留が変わった・消えた場合。Sol の指摘 5）。
+   - 実行する `index_drive` には `Allow::Only(ids)` を渡す。`plan()` は **`Allow` で最初に分岐**する: `Yes` は今までどおり全部消す、
+     `Only(ids)` は取り直した一覧で消える行（`doomed`）が**すべて `ids` に含まれるときだけ** `doomed` を消し、含まれない行が
+     1 件でもあれば保留に戻す（空の一覧なら `deletes_withheld`、それ以外は `mass_delete_withheld`。既存の 2 つの鍵を使う）。
+     `doomed` が `ids` の一部だけ（戻ってきた行がある）なら、その一部だけを消す（結果の `counts` に `approved`・`deleted`）。
+     `No` は今までどおり。承認したのとは別の行は、件数が同じでも消えない（Opus の指摘 1）。
+   - **一覧が空のための保留（`EmptyListing`）は画面から解除しない**（POST は 409 `not_releasable`、画面はボタンを出さず案内）。
+     設定ミスで同じ表示になり、通すと Drive の全行が消えるため。CLI の `--allow-mass-delete` だけに残す（Opus の指摘 3。
+     PRD の「決まっていないこと」）。
+   - 削除の書き込みの直前に、writer で `VACUUM INTO 'DATA_DIR/tmp/catalog-before-release.db'`（既存の写しは消してから。1 つだけ）
+     を作り、失敗したら削除しない（`StageError`）。確認の文言に「解除前の写しが残る」と書く（Opus の指摘 4）。
+   - 受付（承認した件数・理由）と終了（削除した件数・結果の種別）を `tracing::warn!` で固定の語と件数だけ 1 行ずつ出す。
+   - `allow_mass_delete: bool` は `enum Allow { No, Yes, Only(Vec<i64>) }` に広げ、CLI の `--allow-mass-delete` は `Yes` のまま
+     （引数・挙動は変えない。R18）。`IndexDrive::allowing_only(shared, ids)`。
    - 選ばなかった案: `default_stages_allowing_mass_delete` を使う（別の `DriveShared` で記憶が分かれる）。全段を回す
      （削除だけが目的なので `index_drive` 1 段でよい。続きは次の定期サイクル）。件数の手入力（ユーザーの選択で不採用）。
 5. **品質解析の一括は `quality::scan`（CLI と同じ）を `Stage` に包み（`quality::Scan`、`name() = "quality"`）、他の要求と同じ
@@ -157,7 +168,7 @@ flowchart LR
     opsapi[admin_ops.rs GET /api/admin/ops・POST /api/admin/ops/*]
     board[ops.rs Board（実行中・待ち・履歴）/ Queue（要求の受け口）]
     worker[sync.rs spawn_worker（定期サイクル＋要求）]
-    index[drive/index.rs IndexDrive Allow::UpTo]
+    index[drive/index.rs IndexDrive Allow::Only]
     quality[quality.rs scan]
     aiops[ai/ops.rs retry・release_pause]
     writer[(writer)]
@@ -181,8 +192,8 @@ flowchart LR
 | `src/ops.rs`（新） | `Request`・`RequestKind`・`Record`・`Board`（実行中・待ち・履歴・採番を 1 つの `Mutex` で）、`token_of(&MassDeleteHold)`、JSON 化 |
 | `src/sync.rs` | `spawn_worker` に `Board` と `MassDeleteBoard` を渡す。ループを「要求があれば要求、無ければ周期でサイクル」に（100 ms 刻みの `stop.wait`）。`run_cycle` の結果を `Board` へ。`StageResult` を JSON にする補助 |
 | `src/quality.rs` | `Scan`（`quality::scan` を包む `Stage`） |
-| `src/drive/index.rs` | `allow_mass_delete: bool` → `Allow { No, Yes, UpTo(u64) }`。`plan()` の分岐に `UpTo` を足す。`IndexDrive::allowing_up_to(shared, n)` |
-| `src/sync.rs` | `stages(drive, allow)` を `Allow` に。`index_drive_stage_up_to(drive, n)`（1 段だけの `Vec<Box<dyn Stage>>`） |
+| `src/drive/index.rs` | `allow_mass_delete: bool` → `Allow { No, Yes, Only(Vec<i64>) }`。`plan()` の分岐に `Only` を足す。`MassDeleteHold.ids`、`DrivePlan.counts` に `approved`・`deleted`。`IndexDrive::allowing_only(shared, ids)`。削除の直前の `VACUUM INTO` |
+| `src/sync.rs` | `stages(drive, allow)` を `Allow` に。`index_drive_stage_only(drive, ids)`（1 段だけの `Vec<Box<dyn Stage>>`） |
 | `src/admin_ops.rs`（新） | `GET /api/admin/ops` の組み立て、5 本の POST の入力検証と実行 |
 | `src/post.rs` | `Route::OpsSync`・`OpsQualityScan`・`OpsDriveRelease`・`OpsAiRetry`・`OpsAiReleasePause` |
 | `src/server.rs` | `AppState` に `ops: Option<Arc<ops::Board>>`、`ai_retry_handlers: Arc<Vec<Arc<dyn Handler>>>`、`ai_clock: Clock`、`ai_ops_lock: Arc<Mutex<()>>`。`site` に `/api/admin/ops` の完全一致 |
@@ -236,9 +247,11 @@ loop {
 
 - `Sync` → 定期と同じ `stages`。
 - `QualityScan` → `[quality::Scan]`（1 段 `quality`）。
-- `DriveRelease { token, limit }` → 実行の直前に `mass_delete.current()` の印と `token` を照らし、違えば実行せず `outcome: hold_changed`。
-  一致すれば `[IndexDrive::allowing_up_to(drive, limit)]`。`plan()` が超過を保留に戻したときは段の `counts` に
-  `deletes_withheld` か `mass_delete_withheld` が 0 より大きいことで `outcome: exceeded`。
+- `DriveRelease { token, ids }` → 実行の直前に `mass_delete.current()` の印と `token` を照らし、違えば実行せず `outcome: hold_changed`。
+  一致すれば `[IndexDrive::allowing_only(drive, ids)]`。段の結果が `Skipped`（鍵なし・認証失敗・停止）なら `outcome: skipped`
+  （理由つき。`done` にしない）。`Done` で `counts` の `deletes_withheld` か `mass_delete_withheld` が **0 より大きければ**
+  `outcome: exceeded`（`counts()` は 0 でも鍵を入れるので、有無では判定しない。Opus の指摘 6）。それ以外は `done`
+  （`counts` の `approved`・`deleted` を画面に必ず出す）。
 
 DB を開けない・`run_cycle` 自身がパニックしたときも `board.finish(id, failed)` を必ず呼ぶ（`finish` は `Drop` で保証する
 `Running` のガードにする）。スレッドは終わらせない。
@@ -261,8 +274,10 @@ Board {
 }
 Record { id, kind, requested_at, started_at, finished_at, outcome, stages: Vec<StageJson>, report: Option<Value> }
 StageJson { name, result: "done"|"skipped"|"failed"|"panicked"|"not_run", reason: Option<&'static str>, counts: Map<&str,u64> }
-outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開けない・外側のパニック）| "exceeded"（drive-release の上限超え）
-       | "hold_changed"（drive-release の実行直前に保留が違った）| "retried"・"released"（AI 系。PR ②）
+outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開けない・外側のパニック）| "skipped"（drive-release の段が省略）
+       | "exceeded"（drive-release で承認した集合に無い行が消えようとした）| "hold_changed"（実行直前に保留が違った）
+       | "retried"・"released"（AI 系。PR ②）
+report: Option<Report>  // enum Report { Retry(RetryReport), Release { released: usize } }。自由な Value にしない（Opus の指摘 10）
 ```
 
 時刻は `sysinfo::local_timestamp()` と同じ `YYYY-MM-DD HH:MM:SS`（`MassDeleteHold` と揃える）。
@@ -293,25 +308,27 @@ outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開
 ```
 
 - `ingest: false` のときは `worker`・`hold`・`ai` を `null`、`history` を `[]`。
-- `hold` は `MassDeleteBoard::current()` が `Some` のときだけ。`token = hex(sha256("{held}\t{reason}\t{drive_rows}\t{since}")[..8])`。
-- `ai.retry_kinds` は `handlers` に登録のある種類（いまの配布バイナリで `retry` が実際に再検査できる種類）。`failed` は
-  `jobs::status_counts` の `failed` の件数（`/api/admin/status` の `ai_jobs` と同じ元）。`pauses` は `ai_provider_pauses` の行数。
-  これ以上の AI の情報（理由コード・用途）は `/api/admin/status` の `ai_*` を画面が併読する。
+- `hold` は `MassDeleteBoard::current()` が `Some` のときだけ。`token = hex(sha256("{held}\t{reason}\t{drive_rows}\t{since}\n{id1}\n{id2}…")[..8])`。
+  ID は応答に出さない。`releasable: reason == "ratio"` を添える。
+- `ai.retry_kinds` は再試行用の `handlers` に登録のある種類（いまの配布バイナリで `retry` が実際に再検査できる種類。起動時に
+  固定）。**この GET は DB を読まない**（`Board`・`MassDeleteBoard` のスナップショットだけ。3 秒ごとの読み直しがタブの数だけ
+  DB を引かないため。Opus の指摘 9）。AI の件数・理由コード・停止・待ちは `/api/admin/status` を画面が併読する（運用タブを
+  開いたときと AI の操作のあとに 1 回ずつ）。
 
 ### POST（すべて JSON、`post.rs` の経路。`INGEST=0`／`ops` が無いときは 503）
 
 | 経路 | 本文 | 成功 | 失敗 |
 |---|---|---|---|
-| `/api/admin/ops/sync` | `{}` | 200 `{ok, request:{id, kind:"sync", state:"queued"}}` | 409 `busy` |
+| `/api/admin/ops/sync` | `{}` | 200 `{ok, request:{id, kind:"sync", state:"queued"}}` | 409 `busy`・`too_soon`（前回の手動の同期の終了から 60 秒以内） |
 | `/api/admin/ops/quality-scan` | `{}` | 同上 `kind:"quality_scan"` | 409 `busy` |
-| `/api/admin/ops/drive-release` | `{"token": "<16 hex>"}` | 同上 `kind:"drive_release"`、`limit` | 400 `bad_params`、409 `no_hold`・`hold_changed`・`busy` |
+| `/api/admin/ops/drive-release` | `{"token": "<16 hex>"}` | 同上 `kind:"drive_release"`、`approved: N` | 400 `bad_params`、409 `no_hold`・`hold_changed`・`not_releasable`・`busy` |
 | `/api/admin/ops/ai-retry` | `{"target": "all"}` か `{"target": {"kind": "<JobKind>"}}` | 200 `{ok, report:{requeued, obsolete, satisfied, unsupported, policy_disabled}}` | 400 `bad_params`、500 |
 | `/api/admin/ops/ai-release-pause` | `{"target": "all"}` か `{"target": {"task": "<TaskKind>"}}` | 200 `{ok, released: n}` | 400 `bad_params`、409 `config_unavailable`、500 |
 
 - `busy` は `ApiError::Busy("busy")`。`hold_changed`・`no_hold`・`config_unavailable` も `Busy` の符号（409）。停止の合図のあとは
   `Unavailable`（503）。
-- `drive-release` は `token` を検証してから `enqueue`（要求に `token` と `limit = held` を入れる）。検証と実行のあいだに保留が
-  変わる窓は、実行直前の再照合（違えば `hold_changed`）と `UpTo(limit)` の 2 つで塞ぐ。
+- `drive-release` は `token` を検証してから `enqueue`（要求に `token` と `ids` を入れる）。検証と実行のあいだに保留が
+  変わる窓は、実行直前の再照合（違えば `hold_changed`）と `Only(ids)`（集合に無い行は消さない）の 2 つで塞ぐ。
 - `ai-retry`・`ai-release-pause`（PR ②）は `ai_ops_lock` を `try_lock`（取れなければ 409 `busy`）し、`spawn_blocking` の中で
   `ai::ops::retry`／`release_pause` を呼ぶ（CLI と同じ関数、別インスタンスの handlers）。`JobKind`・`TaskKind` の文字列は CLI の
   `--kind`・`--task` と同じ名前。未知なら 400。途中で失敗したとき（種類ごとのトランザクションの一部が済んだあとの失敗）は 500 の
@@ -345,22 +362,26 @@ outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開
   それ以外は 400 `bad_params`（入力の値は応答に入れない）。
 - **権限**: 認証は無い前提（LAN）。Host 検査・CSRF（JSON の Content-Type・同一 Origin）・64 KiB・`INGEST=0` の 503 は既存の経路を
   そのまま通す。GET は `guard` で HEAD・POST を 403 に。操作はどれも**外部へ送らない**（同期は Drive と地理院へ既存の段が
-  アクセスする。`ai-retry` は再検査のみで、送るのは背景ワーカー）。
-- **破壊的操作の二重の守り**: 大量削除は印の一致（画面が見たもの）＋上限（実行時に取り直した一覧で超えたら保留に戻す）。
-  一覧が空の保留（`EmptyListing`）も同じ道（`held` = Drive の全行）。確認の段に「消える行は N 件まで」と明記する。
+  アクセスする。`ai-retry` は再検査のみで、送るのは背景ワーカー）。外部公開時に miharashi 用の `/api/v1/photos`・`/derivatives/` を
+  Cloudflare Access から外す（bypass）設定をするなら、その範囲を `/api/admin/` に広げない（Opus の指摘 11）。
+- **破壊的操作の三重の守り**: 大量削除は印の一致（画面が見た保留と、消える行の集合）＋集合に限った許可（実行時に取り直した
+  一覧で集合の外の行があれば保留に戻す）＋消す前の DB の写し。一覧が空の保留（`EmptyListing`）は画面から解除しない。
+  確認の段に「消える行は承認した N 件のうち、まだ一覧に無いものだけ」と消えるものの範囲を明記する。
   **印は認可ではない。** 認証の無い LAN では、`GET /api/admin/ops` を読める相手は誰でも `token` を得て POST できる。印が守るのは
   「古い画面（保留が変わる前に見た件数）で解除してしまう」ことだけで、相手の正当性は ADR 0008 の前提（家庭 LAN・外部公開時は
   Cloudflare Access）に任せる。`setflag`・`rotate`・選別の `confirm` と同じ境界だが、`drive-release` は管理 API で最も破壊的な
   書き込みなので、この境界を文書と `admin_ops.rs` のコメントに書いておく。
 - **削除で消えるもの**: `write_plan`（`drive/index.rs:421-447`）は `DELETE FROM photos WHERE id=?`（行ごと。手で直した位置
-  `loc_source='manual'`・★・除外も行と一緒に消える）と、`remove_derivatives`（`index.rs:580-592`）で表示用画像を消す。原本（Drive 側）
-  には触れない。`photo_quality` の孤児は次の `quality` の段が消し（`quality.rs:167`）、`photo_curation` の行は残るが読む側が
-  世代で突き合わせるので効かない（B の設計）。サムネイル（`thumbs/`）は要求時に作る物なので残っても害は無い。
-  確認の段にこの範囲を書く（R6）。
+  `loc_source='manual'`・★・除外・回転・タイトル・AI の説明・地名も行と一緒に消える）と、`remove_derivatives`（`index.rs:580-592`）で
+  表示用画像を消す。原本（Drive 側）には触れない。**旅行ブログの下書き**（`blog_write.rs`。一次データで作り直せない）は
+  `photo_id` で写真を参照しているので、行が消えると書き出しで画像が抜ける。孤児として残る表: `photo_quality`（次の `quality` の段が
+  消す。`quality.rs:167`）、`photo_curation`（読む側が世代で突き合わせるので効かない。B の設計）、AI と位置推定の派生の行
+  （`photo_ai_features`・`photo_ai_group_members`・`photo_loc_*`・`ai_*`。読む側が `photos` と結合するので効かない）。
+  サムネイル（`thumbs/`）は要求時に作る物なので残っても害は無い。確認の段にこの範囲を書く（R6）。
 - **情報の漏れ**: 応答に段の失敗の文面・パス・モデル名・接続先を出さない（方針 6）。アクセスログは既存の `labeled` でテンプレートだけ。
-- **資源**: 要求は 1 つだけ待てる（溢れは 409）。AI の操作は同時に 1 つ（`ai_ops_lock`）。GET は `Board` の `Mutex` を短く持つ
-  （スナップショットの複製）。3 秒の読み直しはタブ表示中だけ。`quality::scan` は長く走りうるが、既存の `quality` の段と同じ解析で、
-  停止の合図で止まる。
+- **資源**: 要求は 1 つだけ待てる（溢れは 409）。手動の同期は前回の手動の同期の終了から 60 秒は 409 `too_soon`（Drive と地理院を
+  叩き続けない）。AI の操作は同時に 1 つ（`ai_ops_lock`）。GET は DB を読まず `Board` の `Mutex` を短く持つ（スナップショットの
+  複製）。3 秒の読み直しはタブ表示中だけ。`quality::scan` は長く走りうるが、既存の `quality` の段と同じ解析で、停止の合図で止まる。
 - **停止**: 停止は `stop.wait` の `Condvar` で即座に起きる（今までと同じ）。実行中の段は既存どおり「今の段が終わるまで」。
   停止の合図のあとの要求は 503。
 
@@ -371,9 +392,9 @@ outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開
 | AC1 | `ops_render.mjs`: `ingest:true` の合成応答でボタン 5 つ、`ingest:false` で案内だけ |
 | AC2 | (a) `tests/ops_api.rs`: `ingest_cli.rs` と同じ子プロセスの `serve`（`INGEST=1`、鍵なし）。POST sync → 200 と `id`、`GET /api/admin/ops` を最長 20 秒待って履歴のその `id` が終了、`index_drive` が `skipped`、`index_local` が `done`。(b) `sync.rs` の単体試験（`ingest::start` で一時ディレクトリにロックと writer を作る既存の試験と同じ土台）: チャネルで止まる偽の `Stage` を段の一覧にして `spawn_worker`。実行中に同種の `enqueue` が `Busy`、別種は 1 つ待てて 2 つ目は `Busy`、定期サイクル中の要求がその直後に走る、DB のパスを壊して `failed` の記録と `running` の解除、パニックする偽の段でも同じ、待ち・実行中それぞれで `stop.stop()` から `join_within` が短時間で戻る、停止後の `enqueue` が `Stopping`。(c) 描画試験: 送信中・`running` の `disabled`、終了で段の表 |
 | AC3 | 子プロセスの `serve` に `GEOFRAME_QUALITY_PER_CYCLE=1` と有効な合成 JPEG 3 枚（`imaging` の試験が使う生成の道具）。起動直後の定期サイクルの `last_cycle` が終わったあと、`photo_quality_features` の世代の合う行が 1 枚ぶんだけであることを確かめてから POST quality-scan。記録の段が `quality` 1 つ、`counts` に `analyzed >= 2`・`remaining = 0`・再構築あり、特徴量の行が 3 枚ぶん |
-| AC4 | `drive/index.rs` の単体試験: `plan(existing, files, Allow::UpTo(n))` で、空の一覧で n 以内（消える）・超過（`deletes_withheld`）、比率の閾値未満で超過（`mass_delete_withheld`）、閾値超で n 以内（消える）。`Yes`・`No` の既存の試験は `Allow` に置き換えて同じ結果。`ops.rs` の単体試験: `token_of` が同じ入力で同じ、1 項目違えば違う。`tests/ops_api.rs`: `spawn_state` で `MassDeleteBoard` に記録を入れ、`token` 取得 → 正しい POST 200（`queued`）、違う `token` 409 `hold_changed`、記録を消して 409 `no_hold`。`sync.rs` の単体試験: 待ちのあいだに `MassDeleteBoard` を書き換えると実行されず `hold_changed`。描画試験: 確認の段の件数、409 で閉じて読み直し、確認中に `token` が変わると閉じる |
+| AC4 | `drive/index.rs` の単体試験: `plan(existing, files, Allow::Only(ids))` で、`doomed ⊆ ids` なら消える、`doomed ⊂ ids`（一部が戻った）なら残りだけ消え `approved`・`deleted` が出る、集合外が 1 件あれば保留（空の一覧なら `deletes_withheld`、それ以外は `mass_delete_withheld`）。`Yes`・`No` の既存の試験は `Allow` に置き換えて同じ結果。`ops.rs` の単体試験: `token_of` が同じ入力で同じ、4 項目か ID の集合が 1 つ違えば違う。`tests/ops_api.rs`: `spawn_state` で `MassDeleteBoard` に記録を入れ、`token` 取得 → 正しい POST 200（`queued`、`approved`）、違う `token` 409 `hold_changed`、記録を消して 409 `no_hold`、`empty_listing` の記録で 409 `not_releasable`。`sync.rs` の単体試験: 待ちのあいだに `MassDeleteBoard` を書き換えると実行されず `hold_changed`。`tmp/` を書けなくして写しに失敗すると削除せず `failed`。偽の `IndexDrive` 相当の段で `Skipped` → `skipped`。描画試験: 確認の段の件数と範囲、409 で閉じて読み直し、確認中に `token` が変わると閉じる、`empty_listing` で案内だけ |
 | AC5 | `tests/ops_api.rs`: `curation_api.rs` と同じ writer 付きの `spawn_state` に `ai_jobs`（`failed`、handler 未登録の種類）と `ai_provider_pauses` の行。`ai-retry all` → `unsupported` の件数、行は `failed` のまま。`ai-release-pause all` → `released`、行が消える。`task` 指定で設定なし → 409 `config_unavailable`。`ai_ops_lock` を試験から握って 2 つ目の POST が 409 `busy`。`ai/scene_judge` の単体試験: 2 つのインスタンスで `prepare_retry` と `reconcile` を交互に呼んでも `recheck` の結果が変わらない |
-| AC6 | GET の見出し・`no-store`・HEAD/POST 403・`INGEST=0` で `ingest:false`。`Board` に `Failed("…/data/catalog.db …")` を含む合成の記録を入れて本文に無いことを確かめる。`tests/admin_api.rs` は触らない |
+| AC6 | GET の見出し・`no-store`・HEAD/POST 403・`INGEST=0` で `ingest:false`。`Board` に `Failed("…/data/catalog.db …")` を含む合成の記録と ID つきの保留を入れて、本文に文面も ID も無いことを確かめる。`tests/admin_api.rs` は触らない |
 | AC7 | 5 本の POST に対し、`csrf_python.rs`・`curation_api.rs` と同じ形で 403・503・413・400 |
 | AC8 | `ops_render.mjs`: `last_cycle`・`next_cycle_at`・`history` 10 件の順序 |
 | AC9 | `static_files`・`admin_ai_ops_render` が通る。文書は grep で手で確かめる |
@@ -382,7 +403,7 @@ outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開
 ## リスクと対策
 
 - **品質解析の一括が長い**: 定期サイクルと他の要求が待つ。画面に「実行中（開始時刻）」を出し、PRD の「決まっていないこと」に残す。
-  必要なら `UpTo` と同じ考えで「1 回 n 枚まで」を後から足せる（`Request::QualityScan { limit }`）。
+  必要なら「1 回 n 枚まで」を後から足せる（`Request::QualityScan { limit }`）。
 - **`admin_ai_ops_render.mjs` の期待値**: 文言を変えると落ちる。期待値だけを合わせ、検証の構造は変えない（R8）。
 - **`cli.rs` の `serve` の組み立ての変更**: `handlers` を `clone` して `AppState` に持たせる。`start_ai` が `None`（AI 無効）でも
   `retry` は handlers で再検査できる（CLI と同じ）。`production_handlers` は `!config.ingest` で空（`INGEST=0` は 503 なので届かない）。
@@ -392,15 +413,22 @@ outcome: "done"（失敗 0）| "partial"（失敗あり）| "failed"（DB を開
   起動していないので、停止の回帰は AC2(b) の単体試験で確かめる。
 - **再試行用の handler を 2 組持つ**: `production_handlers` を 2 回呼ぶ。`DataDir::open` と `Arc` の複製だけなので起動の負担は
   小さい。背景ワーカーが無効（`start_ai` が `None`）でも再試行用の組は作る（CLI と同じく再検査できる）。
-- **印の衝突**: `token` は保留の 4 項目から作るので、同じ件数・理由・行数・開始時刻なら同じ（同じ保留）。開始時刻 `since` は
-  保留が続くあいだ変わらないので、件数だけが変わった保留（`checked_at` で更新）は別の印になる。
+- **印の衝突**: `token` は保留の 4 項目と ID の集合から作るので、消える行の集合が 1 件でも違えば別の印になる。開始時刻 `since` は
+  保留が続くあいだ変わらない。
 - **`Allow` への変更**: `IndexDrive` の既存の試験（`index.rs` の `plan` の試験）を `Allow::Yes`／`No` に置き換える。CLI の `--allow-mass-delete` の
   挙動は `Yes` で同じ。
+- **写しの容量と時間**: `VACUUM INTO` は `catalog.db` と同じ程度の空きを `tmp/` に要る。数百 MB 級なら数秒〜数十秒。1 つだけ置き、
+  次の解除で消してから作る。失敗（容量不足）なら削除しないので安全側。
+- **写真 ID の再利用**（既存の問題）: `photos.id` に `AUTOINCREMENT` が無く、ID の大きい行がまとめて消えると次の取り込みが同じ ID を
+  使い、ブログの下書きや世代で照合しない表が別の写真を指しうる。CLI の `--allow-mass-delete` でも同じ。この設計では持ち込まず、
+  別の Issue にする（Opus の指摘 8）。
+- **`EmptyListing` を画面から解除しない**のは設計の判断（ユーザーの承認待ち）。画面から解除したくなったら、理由ごとの別の警告と
+  件数の手入力を足す。
 
 ## 実装の順番
 
 1. `ops.rs`（`Request`・`Record`・`Board`・`token_of`、単体試験）。
-2. `drive/index.rs` の `Allow`、`sync.rs` の `stages(drive, Allow)`・`index_drive_stage_up_to`、`quality::Scan`、`plan` の試験。
+2. `drive/index.rs` の `Allow`・`MassDeleteHold.ids`・写し、`sync.rs` の `stages(drive, Allow)`・`index_drive_stage_only`、`quality::Scan`、`plan` の試験。
 3. `sync.rs` の `spawn_worker` の変更（`Board`・`MassDeleteBoard`、100 ms 刻みの待ち、`run(req)` と隔離、結果の記録）、偽の `Stage` の
    単体試験（AC2(b)、AC4 の `hold_changed`）。`cli.rs` の `serve` で配線。
 4. `admin_ops.rs`（GET の JSON、`sync`・`quality-scan`・`drive-release` の POST）、`post.rs`・`server.rs` の登録、`tests/ops_api.rs`（AC2〜AC4、AC6、AC7）。
