@@ -36,7 +36,7 @@ function hasLoc(photo){ return hasValue(photo.lat); }
 function normalizePhoto(raw, origin){
   const search = origin === 'search';
   const photo = {
-    id: raw.id, name: raw.name || '', thumb: raw.thumb || '', taken_at: raw.taken_at || '',
+    id: raw.id, name: raw.name || '', thumb: raw.thumb || '', thumb_url: raw.thumb_url || '', taken_at: raw.taken_at || '',
     lat: hasValue(raw.lat) ? raw.lat : null, lon: hasValue(raw.lon) ? raw.lon : null,
     place: raw.place || '', pref: raw.pref || '', city: raw.city || '',
     favorite: !!(search ? raw.favorite : raw.fav), hidden: !!raw.hidden,
@@ -135,7 +135,7 @@ function cardFor(photo, index, groupUi){
     img.loading = 'lazy';          // 50枚同時取得を避ける
     img.decoding = 'async';
     img.alt = photo.name;
-    img.src = photo.thumb;
+    img.src = photo.thumb_url || photo.thumb;
     // 取得済みderivativeが消えている場合はプレースホルダに落とす
     img.addEventListener('error', () => {
       img.remove();
@@ -214,7 +214,8 @@ function refreshCard(card, photo){
   loc.textContent = hasLoc(photo) ? '位置' : '位置を付ける';
   loc.classList.toggle('strong', !hasLoc(photo));
   const img = card.querySelector('.ph img');
-  if(img && photo.thumb && img.src !== photo.thumb) img.src = photo.thumb;
+  const cardSrc = photo.thumb_url || photo.thumb;
+  if(img && cardSrc && img.src !== cardSrc) img.src = cardSrc;
   const rot = card.querySelector('.rotate');
   if(rot) rot.title = rotateTitle(photo);
 }
@@ -618,7 +619,7 @@ function setFlag(photo, patch){
 function rotatePhoto(photo, btn){
   btn.disabled = true;
   postJSON('/api/admin/rotate', {id: photo.id, delta: 90}).then(j => {
-    applyPhoto(photo.id, {rotation: j.rotation, thumb: j.thumb});
+    applyPhoto(photo.id, {rotation: j.rotation, thumb: j.thumb, thumb_url: j.thumb_url || ''});
     toast('#' + photo.id + ' を回しました（' + j.rotation + '°）');
   }).catch(e => toast('回転失敗: ' + e.message, true))
     .finally(() => { btn.disabled = false; });

@@ -321,33 +321,44 @@ fn leftovers(dir: &Path) -> Vec<std::path::PathBuf> {
         .collect()
 }
 
-/// `derivatives/` の中の書きかけの `*.part` のファイル一覧。
+/// `derivatives/` と `thumbs/`（一覧用サムネイルのキャッシュ）の中の書きかけの `*.part` のファイル一覧。
 ///
 /// derivative は `<出力名>.<pid>.<乱数>.part`（Rust）または `<名前>.part`（Python）に書いてから `rename`
 /// する。書き込み中に落ちると残り、Rust は名前に乱数を含むので次に同じ derivative を作っても上書き
 /// されない。中身は EXIF を持たない部分的な JPEG（個人情報の問題は無く、容量だけ使う）。
 ///
-/// 対象は `derivatives/` の**直下の通常ファイルだけ**（名前は [`crate::datadir::check_file_name`] を通り、
-/// `.part` で終わるもの）。`derivatives` がシンボリックリンクなら何もしない（リンク先の別の場所を
+/// 対象は `derivatives/`・`thumbs/` の**直下の通常ファイルだけ**（名前は [`crate::datadir::check_file_name`] を通り、
+/// `.part` で終わるもの）。`derivatives`・`thumbs` がシンボリックリンクなら何もしない（リンク先の別の場所を
 /// 掃除しない）。ディレクトリ・シンボリックリンクは対象にしない（`DirEntry::file_type` はリンクを
 /// 辿らない）。取り込みのロックを持つ間は、他に書きかけを作るプロセスがいないので、残っている `.part` はすべて書きかけの残骸。
 fn part_leftovers(data_dir: &Path) -> Vec<std::path::PathBuf> {
-    let dir = data_dir.join("derivatives");
-    if !sweepable_dirs(data_dir).dirs.contains(&dir) {
-        return Vec::new();
+    // `derivatives/` と `thumbs/`（`/thumb/<id>.jpg` のキャッシュ。同じ `write_atomic` で書く）。どちらも
+    // 通常のディレクトリのときだけ（リンクなら何もしない）
+    let derivatives = data_dir.join("derivatives");
+    let mut dirs = Vec::new();
+    if sweepable_dirs(data_dir).dirs.contains(&derivatives) {
+        dirs.push(derivatives);
     }
-    let Ok(entries) = fs::read_dir(&dir) else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter(|e| {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            name.ends_with(".part") && crate::datadir::check_file_name(&name).is_ok()
+    let thumbs = data_dir.join("thumbs");
+    if fs::symlink_metadata(&thumbs).is_ok_and(|m| m.is_dir()) {
+        dirs.push(thumbs);
+    }
+    dirs.iter()
+        .flat_map(|dir| {
+            let Ok(entries) = fs::read_dir(dir) else {
+                return Vec::new();
+            };
+            entries
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.ends_with(".part") && crate::datadir::check_file_name(&name).is_ok()
+                })
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+                .map(|e| e.path())
+                .collect()
         })
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
-        .map(|e| e.path())
         .collect()
 }
 
@@ -521,6 +532,43 @@ mod tests {
             assert!(root.join(kept).exists(), "{kept}");
         }
         assert_eq!(sweep_part_files(root), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sweep_also_covers_the_thumbs_directory_but_not_a_linked_one() {
+        let dir = TempDir::new("ingest-part-thumbs");
+        let root = dir.path();
+        fs::create_dir_all(root.join("thumbs")).unwrap();
+        for f in [
+            "thumbs/12-0123456789ab.jpg.77.00ff.part",
+            "thumbs/12-0123456789ab.jpg",
+            "thumbs/12-0123456789ab.jpg.keep",
+        ] {
+            fs::write(root.join(f), b"x").unwrap();
+        }
+        assert_eq!(count_part_files(root), 1);
+        assert_eq!(sweep_part_files(root), 1);
+        assert!(root.join("thumbs/12-0123456789ab.jpg").exists());
+        assert!(root.join("thumbs/12-0123456789ab.jpg.keep").exists());
+        assert!(
+            !root
+                .join("thumbs/12-0123456789ab.jpg.77.00ff.part")
+                .exists()
+        );
+        // `thumbs` がリンクなら、先の `.part` を掃除しない
+        let elsewhere = TempDir::new("ingest-part-thumbs-elsewhere");
+        fs::write(elsewhere.path().join("1-0123456789ab.jpg.1.aa.part"), b"x").unwrap();
+        let root2 = TempDir::new("ingest-part-thumbs-root2");
+        std::os::unix::fs::symlink(elsewhere.path(), root2.path().join("thumbs")).unwrap();
+        assert_eq!(count_part_files(root2.path()), 0);
+        assert_eq!(sweep_part_files(root2.path()), 0);
+        assert!(
+            elsewhere
+                .path()
+                .join("1-0123456789ab.jpg.1.aa.part")
+                .exists()
+        );
     }
 
     #[cfg(unix)]

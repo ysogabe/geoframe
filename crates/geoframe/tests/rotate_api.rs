@@ -385,7 +385,13 @@ async fn every_request_matches_python_status_body_row_changes_and_files() {
             );
             // Python は違う（だから known）。差が消えたら、この一覧から外す
             let py_same = case["status"].as_u64().unwrap() as u16 == response.status
-                && case["body"] == response.json()
+                && case["body"] == {
+                    let mut body = response.json();
+                    if let Some(map) = body.as_object_mut() {
+                        map.remove("thumb_url");
+                    }
+                    body
+                }
                 && case["changes"] == changes;
             assert!(
                 !py_same,
@@ -400,7 +406,12 @@ async fn every_request_matches_python_status_body_row_changes_and_files() {
             String::from_utf8_lossy(&response.body)
         );
         if !case["body"].is_null() {
-            assert_eq!(response.json(), case["body"], "{name}");
+            // Python 版に無い追加分 `thumb_url`（版付きのサムネイル URL）を除いて比べる
+            let mut body = response.json();
+            if let Some(map) = body.as_object_mut() {
+                map.remove("thumb_url");
+            }
+            assert_eq!(body, case["body"], "{name}");
             assert_eq!(response.header("content-type"), Some(JSON_UTF8), "{name}");
             assert_eq!(response.header("cache-control"), Some("no-store"), "{name}");
         }

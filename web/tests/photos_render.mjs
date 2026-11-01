@@ -99,7 +99,7 @@ function makeEnv({pathname, photos = PATTERNS, hold = false, aiStatus = true}){
   const flags = {};
   const maplibre = {maps: [], markers: []};
   const timers = {immediate: false};  // true の間、短い setTimeout（モーダルの resize 等）はすぐ実行する
-  const handlers = {search: null};    // 検索の応答を差し替える: (url, rec) => Promise
+  const handlers = {search: null, rotateUrl: null};    // 検索の応答を差し替える: (url, rec) => Promise
   const fetchFake = (url, opts = {}) => {
     const rec = {url, method: opts.method || 'GET', headers: opts.headers, body: opts.body};
     calls.push(rec);
@@ -139,7 +139,9 @@ function makeEnv({pathname, photos = PATTERNS, hold = false, aiStatus = true}){
       const b = JSON.parse(opts.body);
       const rotation = ((flags['r' + b.id] || 0) + b.delta) % 360;
       flags['r' + b.id] = rotation;
-      return reply({ok: true, rotation, thumb: '/derivatives/rot' + rotation + '.jpg'});
+      const body = {ok: true, rotation, thumb: '/derivatives/rot' + rotation + '.jpg'};
+      if(handlers.rotateUrl) body.thumb_url = handlers.rotateUrl(b.id, rotation);   // 版付きの小さな画像（省略可）
+      return reply(body);
     }
     if(url === '/api/admin/setloc'){
       const b = JSON.parse(opts.body);
@@ -460,6 +462,32 @@ await test('(e3) 回転ボタン: POST /api/admin/rotate {id, delta:90} → 応�
   await settle();
   assert.equal(card.querySelector('.ph img').src, '/derivatives/rot180.jpg');
   assert.equal(rot.title, '時計回りに90°回して表示（今 180°）');
+});
+
+await test('(e4) カードの画像は thumb_url（無ければ thumb）。回転で thumb_url が変わると src も変わり、ビューアは thumb のまま', async () => {
+  const withUrl = {...base, id: 1, name: 'a.jpg', thumb: '/derivatives/a.jpg', thumb_url: '/thumb/1.jpg?v=aaaaaaaaaaaa'};
+  const noUrl = {...base, id: 2, name: 'b.jpg', thumb: '/derivatives/b.jpg', thumb_url: ''};
+  const env = makeEnv({pathname: '/admin', photos: [withUrl, noUrl]});
+  env.handlers.rotateUrl = (id, rotation) => '/thumb/' + id + '.jpg?v=rot' + String(rotation).padStart(9, '0');
+  await env.boot();
+  env.$('.tab[data-tab=photos]').click();
+  await settle();
+  const [c1, c2] = cards(env);
+  assert.equal(c1.querySelector('.ph img').src, '/thumb/1.jpg?v=aaaaaaaaaaaa', '(a) thumb_url を使う');
+  assert.equal(c2.querySelector('.ph img').src, '/derivatives/b.jpg', '(b) thumb_url が空なら thumb');
+  // (d) ビューアの拡大画像は表示用画像（thumb）のまま
+  c1.querySelector('.ph').click();
+  assert.equal(env.$('#viewer-image').src, '/derivatives/a.jpg');
+  env.$('#viewer-close').click();
+  // (c) 回転の応答の thumb_url でカードの src が新しい値になる
+  c1.querySelector('.rotate').click();
+  await settle();
+  assert.equal(c1.querySelector('.ph img').src, '/thumb/1.jpg?v=rot000000090');
+  // thumb_url の無い応答（古いサーバー）なら thumb に戻る
+  env.handlers.rotateUrl = null;
+  c1.querySelector('.rotate').click();
+  await settle();
+  assert.equal(c1.querySelector('.ph img').src, '/derivatives/rot180.jpg');
 });
 
 await test('(g) 位置ボタン: モーダルが開き、#m-title に id と名前が入り、地図が 1 つだけ作られる', async () => {

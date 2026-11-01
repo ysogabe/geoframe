@@ -91,6 +91,8 @@ pub struct AppState {
     /// プロセスの起動時刻（`GET /api/admin/config` の `started_at`・`uptime_s`）。状態を作った時刻で、`serve_until` が
     /// 待ち受けを始める直前に取り直す。
     pub started_at: std::time::SystemTime,
+    /// 一覧用サムネイル（`GET /thumb/<id>.jpg`）の共有状態（ID ごとのロック・生成の枠・失敗の記憶）。
+    pub thumbs: Arc<crate::thumb::ThumbState>,
 }
 
 impl AppState {
@@ -134,7 +136,14 @@ impl AppState {
             blog,
             mass_delete: None,
             started_at: std::time::SystemTime::now(),
+            thumbs: Arc::new(crate::thumb::ThumbState::new()),
         }
+    }
+
+    /// サムネイルの状態（生成関数）を差し替える。結合テストが、生成の回数を数えたり遅らせたりするためのもの。
+    pub fn with_thumbs(mut self, thumbs: Arc<crate::thumb::ThumbState>) -> Self {
+        self.thumbs = thumbs;
+        self
     }
 
     pub fn with_ai_search(mut self, runtime: Arc<crate::ai::query::Runtime>) -> Self {
@@ -809,6 +818,25 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
         return statics::forbidden();
     };
     let trailing_slash = normalized.trailing_slash;
+    // `/thumb/<id>.jpg`（一覧用サムネイル）。静的配信の白名簿より前に、`GET`・`HEAD` とも。形が合わなければ 404
+    if let Some(rest) = normalized
+        .path
+        .strip_prefix("/thumb/")
+        .or_else(|| (normalized.path == "/thumb").then_some(""))
+    {
+        return labeled(
+            crate::thumb::respond(
+                &state,
+                rest,
+                trailing_slash,
+                parts.uri.query(),
+                method,
+                &parts.headers,
+            )
+            .await,
+            "/thumb/{id}",
+        );
+    }
     if let Some(mut key) = webpath::page_target(&normalized.path) {
         // 旅行ブログが無効のときは、`/blog-admin` にも管理画面を返す（ラベルは `/blog-admin` のまま）
         if key == "static/blog-admin.html" && !state.config.blog {

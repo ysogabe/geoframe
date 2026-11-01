@@ -85,6 +85,37 @@ pub fn check_drive_id(id: &str) -> Result<(), PathError> {
     if ok { Ok(()) } else { Err(PathError::BadName) }
 }
 
+/// DB の相対パス文字列の**字面の検査**（`DATA_DIR` の中を指す相対パスの要素にする）。空・NUL は `Invalid`、
+/// 絶対パス・`..` は `Traversal`、`.` は読み飛ばす。要素が残らない（`.` だけ）のも `Invalid`。
+/// ファイルシステムには触れない。[`DataDir`] の解決と、`/thumb/` が `display` を受ける前の検査が共有する。
+pub(crate) fn relative_parts(rel: &str) -> Result<Vec<&str>, PathError> {
+    if rel.is_empty() || rel.contains('\0') {
+        return Err(PathError::Invalid);
+    }
+    let mut parts = Vec::new();
+    for c in Path::new(rel).components() {
+        match c {
+            Component::Normal(part) => parts.push(part.to_str().ok_or(PathError::Invalid)?),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(PathError::Traversal);
+            }
+        }
+    }
+    if parts.is_empty() {
+        return Err(PathError::Invalid); // `DATA_DIR` そのもの（`.` だけ）は使わない
+    }
+    Ok(parts)
+}
+
+/// サムネイルの世代（12 桁の小文字 hex）か。
+pub fn is_thumb_gen(generation: &str) -> bool {
+    generation.len() == 12
+        && generation
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 impl DataDir {
     /// `DATA_DIR` を開く（存在し、ディレクトリであること）。
     pub fn open(path: &Path) -> Result<Self, PathError> {
@@ -101,22 +132,8 @@ impl DataDir {
 
     /// DB の相対パス文字列を、`DATA_DIR` の中の絶対パスにする（文字列の検査だけ。存在は問わない）。
     fn lexical(&self, rel: &str) -> Result<PathBuf, PathError> {
-        if rel.is_empty() || rel.contains('\0') {
-            return Err(PathError::Invalid);
-        }
         let mut out = self.root.clone();
-        for c in Path::new(rel).components() {
-            match c {
-                Component::Normal(part) => out.push(part),
-                Component::CurDir => {}
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Err(PathError::Traversal);
-                }
-            }
-        }
-        if out == self.root {
-            return Err(PathError::Invalid); // `DATA_DIR` そのもの（`.` だけ）は使わない
-        }
+        out.extend(relative_parts(rel)?);
         Ok(out)
     }
 
@@ -145,6 +162,37 @@ impl DataDir {
             return Err(PathError::Escapes);
         }
         Ok((dir.join(name), format!("derivatives/{name}")))
+    }
+
+    /// サムネイルの書き込み先 `thumbs/<id>-<gen>.jpg`。`thumbs/` を作り、その実体が `DATA_DIR` の直下のその
+    /// ディレクトリ自身であること（リンクでないこと）を確かめる（[`derivative_dest`](Self::derivative_dest) と同じ）。
+    /// `generation` は 12 桁の小文字 hex。
+    pub fn thumb_dest(&self, id: i64, generation: &str) -> Result<PathBuf, PathError> {
+        if id < 1 || !is_thumb_gen(generation) {
+            return Err(PathError::BadName);
+        }
+        let dir = self.root.join("thumbs");
+        fs::create_dir_all(&dir)?;
+        let real = fs::canonicalize(&dir)?;
+        if real != dir {
+            return Err(PathError::Escapes);
+        }
+        Ok(dir.join(format!("{id}-{generation}.jpg")))
+    }
+
+    /// 既にある `thumbs/` の絶対パス（古い世代の掃除用。**作らない**）。リンク・ディレクトリでないものは
+    /// `Escapes`、無ければ入出力の失敗（`NotFound`）。
+    pub fn thumbs_dir(&self) -> Result<PathBuf, PathError> {
+        let dir = self.root.join("thumbs");
+        let meta = fs::symlink_metadata(&dir)?;
+        if !meta.is_dir() {
+            return Err(PathError::Escapes);
+        }
+        let real = fs::canonicalize(&dir)?;
+        if real != dir {
+            return Err(PathError::Escapes);
+        }
+        Ok(dir)
     }
 
     /// 行の `display`（`derivatives/<名前>`）が指す derivative の絶対パス。**消す前の検査用**。
@@ -257,6 +305,59 @@ mod tests {
             d.resolve_existing("photos/none.jpg").unwrap_err(),
             PathError::Io(_)
         ));
+    }
+
+    #[test]
+    fn サムネイルの書き込み先は_thumbs直下で世代の形を検査する() {
+        let (t, d) = setup();
+        let dest = d.thumb_dest(42, "0123456789ab").unwrap();
+        assert_eq!(dest, d.root().join("thumbs/42-0123456789ab.jpg"));
+        assert!(t.path().join("thumbs").is_dir());
+        for (id, generation) in [
+            (0, "0123456789ab"),
+            (-1, "0123456789ab"),
+            (1, "0123456789AB"),
+            (1, "0123456789a"),
+            (1, "../1234567890"),
+            (1, ""),
+        ] {
+            assert_eq!(
+                d.thumb_dest(id, generation).unwrap_err(),
+                PathError::BadName,
+                "{id} {generation}"
+            );
+        }
+        assert_eq!(d.thumbs_dir().unwrap(), d.root().join("thumbs"));
+    }
+
+    #[test]
+    fn サムネイルの置き場がリンクなら書かない() {
+        let (t, d) = setup();
+        let elsewhere = TempDir::new("datadir-thumbs-elsewhere");
+        symlink(elsewhere.path(), t.path().join("thumbs")).unwrap();
+        assert_eq!(
+            d.thumb_dest(1, "0123456789ab").unwrap_err(),
+            PathError::Escapes
+        );
+        assert_eq!(d.thumbs_dir().unwrap_err(), PathError::Escapes);
+        assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn 掃除用の置き場は無ければ作らない() {
+        let (t, d) = setup();
+        assert!(matches!(d.thumbs_dir().unwrap_err(), PathError::Io(_)));
+        assert!(!t.path().join("thumbs").exists());
+    }
+
+    #[test]
+    fn 字面の検査は要素を返し_を読み飛ばす() {
+        assert_eq!(
+            relative_parts("./photos/./sub//b.jpg").unwrap(),
+            ["photos", "sub", "b.jpg"]
+        );
+        assert_eq!(relative_parts(".").unwrap_err(), PathError::Invalid);
+        assert_eq!(relative_parts("a/../b").unwrap_err(), PathError::Traversal);
     }
 
     #[test]

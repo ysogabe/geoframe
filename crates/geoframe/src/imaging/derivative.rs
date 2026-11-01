@@ -140,14 +140,14 @@ struct Decoded {
     orientation: u8,
 }
 
-fn check_pixels(width: u32, height: u32) -> Result<(), ImageError> {
+fn check_pixels(width: u32, height: u32, max_pixels: u64) -> Result<(), ImageError> {
     if width == 0 || height == 0 {
         return Err(ImageError::Decode {
             format: "image",
             class: DecodeClass::Dimensions,
         });
     }
-    if u64::from(width) * u64::from(height) > MAX_INPUT_PIXELS {
+    if u64::from(width) * u64::from(height) > max_pixels {
         return Err(ImageError::TooManyPixels { width, height });
     }
     Ok(())
@@ -191,7 +191,7 @@ fn is_marker_error(e: &zune_jpeg::errors::DecodeErrors) -> bool {
     msg.starts_with("[strict-mode]") || msg.contains("arker")
 }
 
-fn decode_jpeg_once(bytes: &[u8], strict: bool) -> Result<Decoded, JpegFailure> {
+fn decode_jpeg_once(bytes: &[u8], strict: bool, max_pixels: u64) -> Result<Decoded, JpegFailure> {
     use zune_jpeg::JpegDecoder;
     use zune_jpeg::errors::DecodeErrors;
     use zune_jpeg::zune_core::bytestream::ZCursor;
@@ -222,7 +222,7 @@ fn decode_jpeg_once(bytes: &[u8], strict: bool) -> Result<Decoded, JpegFailure> 
             class: DecodeClass::Dimensions,
         }))?;
     let (w, h) = (w as u32, h as u32);
-    check_pixels(w, h).map_err(JpegFailure::Final)?;
+    check_pixels(w, h, max_pixels).map_err(JpegFailure::Final)?;
     // グレーは 1 成分のまま、それ以外（YCbCr・CMYK・YCCK）は RGB に変換して受け取る
     let out = match dec.input_colorspace() {
         Some(ColorSpace::Luma) => ColorSpace::Luma,
@@ -257,8 +257,8 @@ fn decode_jpeg_once(bytes: &[u8], strict: bool) -> Result<Decoded, JpegFailure> 
 /// 部分的な画像を成功として返すので使わない）ため、まず `zune-jpeg` の厳格モードで読む。ただし厳格モードは
 /// マーカーの並びにも厳しく（例: ヘッダの間の余分なバイト）、libjpeg が警告だけで読む写真まで落とす。
 /// そこで、**マーカーの並びだけが理由の失敗は、寛容なモードで読み直す**。データの不足・壊れは読み直さない。
-fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, ImageError> {
-    let decoded = decode_jpeg_with_retry(bytes)?;
+fn decode_jpeg(bytes: &[u8], max_pixels: u64) -> Result<Decoded, ImageError> {
+    let decoded = decode_jpeg_with_retry(bytes, max_pixels)?;
     // 厳格モードのデコーダも、最後の MCU 行の途中で切れた JPEG を成功させてしまう（検証: 切断点の約 2%）。
     // 画像データのあとに EOI が無ければ、切れたファイルとして失敗にする。Pillow は EOI の無い JPEG も
     // 読むが、切れたファイルと見分けられないので、見えないまま下がグレーのderivativeになるよりよい
@@ -274,17 +274,19 @@ fn decode_jpeg(bytes: &[u8]) -> Result<Decoded, ImageError> {
     }
 }
 
-fn decode_jpeg_with_retry(bytes: &[u8]) -> Result<Decoded, ImageError> {
-    match decode_jpeg_once(bytes, true) {
+fn decode_jpeg_with_retry(bytes: &[u8], max_pixels: u64) -> Result<Decoded, ImageError> {
+    match decode_jpeg_once(bytes, true, max_pixels) {
         Ok(d) => Ok(d),
         Err(JpegFailure::Final(e)) => Err(e),
-        Err(JpegFailure::Structure) => decode_jpeg_once(bytes, false).map_err(|f| match f {
-            JpegFailure::Final(e) => e,
-            JpegFailure::Structure => ImageError::Decode {
-                format: "jpeg",
-                class: DecodeClass::Corrupt,
-            },
-        }),
+        Err(JpegFailure::Structure) => {
+            decode_jpeg_once(bytes, false, max_pixels).map_err(|f| match f {
+                JpegFailure::Final(e) => e,
+                JpegFailure::Structure => ImageError::Decode {
+                    format: "jpeg",
+                    class: DecodeClass::Corrupt,
+                },
+            })
+        }
     }
 }
 
@@ -299,7 +301,7 @@ fn image_err(format: &'static str, e: &image::ImageError) -> ImageError {
     ImageError::Decode { format, class }
 }
 
-fn decode_with_image(format: Format, bytes: &[u8]) -> Result<Decoded, ImageError> {
+fn decode_with_image(format: Format, bytes: &[u8], max_pixels: u64) -> Result<Decoded, ImageError> {
     use image::ImageDecoder;
     let name = if format == Format::Png { "png" } else { "tiff" };
     let cursor = Cursor::new(bytes);
@@ -308,7 +310,7 @@ fn decode_with_image(format: Format, bytes: &[u8]) -> Result<Decoded, ImageError
         let mut dec =
             image::codecs::png::PngDecoder::new(cursor).map_err(|e| image_err(name, &e))?;
         let (w, h) = dec.dimensions();
-        check_pixels(w, h)?;
+        check_pixels(w, h, max_pixels)?;
         let icc = dec.icc_profile().ok().flatten();
         (
             DynamicImage::from_decoder(dec).map_err(|e| image_err(name, &e))?,
@@ -318,7 +320,7 @@ fn decode_with_image(format: Format, bytes: &[u8]) -> Result<Decoded, ImageError
         let mut dec =
             image::codecs::tiff::TiffDecoder::new(cursor).map_err(|e| image_err(name, &e))?;
         let (w, h) = dec.dimensions();
-        check_pixels(w, h)?;
+        check_pixels(w, h, max_pixels)?;
         let icc = dec.icc_profile().ok().flatten();
         (
             DynamicImage::from_decoder(dec).map_err(|e| image_err(name, &e))?,
@@ -471,13 +473,13 @@ fn encode_jpeg_with(r: &Raster, quality: u8) -> Result<Vec<u8>, ImageError> {
 
 /// 内容で形式を判別してデコードする。`orientation` には EXIF の向き（EXIF に無ければ XMP の向き。Pillow の
 /// `getexif` と同じ）を入れる。HEIC はデコーダが適用済みなので 1 のまま。
-fn decode_any(bytes: &[u8]) -> Result<(Format, Decoded), ImageError> {
+fn decode_any(bytes: &[u8], max_pixels: u64) -> Result<(Format, Decoded), ImageError> {
     let format = Format::sniff(bytes).ok_or_else(|| not_an_image(bytes))?;
     let mut decoded = match format {
-        Format::Jpeg => decode_jpeg(bytes)?,
-        Format::Png | Format::Tiff => decode_with_image(format, bytes)?,
+        Format::Jpeg => decode_jpeg(bytes, max_pixels)?,
+        Format::Png | Format::Tiff => decode_with_image(format, bytes, max_pixels)?,
         Format::Heic => {
-            let img = heic::decode(bytes, MAX_INPUT_PIXELS)?;
+            let img = heic::decode(bytes, max_pixels)?;
             Decoded {
                 raster: Raster {
                     width: img.width,
@@ -511,7 +513,7 @@ pub fn decode_luma(bytes: &[u8]) -> Result<Luma, ImageError> {
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ImageError::FileTooLarge);
     }
-    let (_, decoded) = decode_any(bytes)?;
+    let (_, decoded) = decode_any(bytes, MAX_INPUT_PIXELS)?;
     let raster = decoded.raster;
     let gray = if raster.channels == 1 {
         raster
@@ -566,7 +568,7 @@ fn prepare_ai_rgb(bytes: &[u8], apply_exif: bool, longest: u32) -> Result<Decisi
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ImageError::FileTooLarge);
     }
-    let (_, decoded) = decode_any(bytes)?;
+    let (_, decoded) = decode_any(bytes, MAX_INPUT_PIXELS)?;
     let w = decoded.raster.width;
     let h = decoded.raster.height;
     let scale = (f64::from(longest) / f64::from(w.max(h)))
@@ -608,7 +610,7 @@ pub fn render(bytes: &[u8], rotation: i32) -> Result<Rendered, ImageError> {
     }
     let manual = manual_orientation(rot as u16);
 
-    let (format, decoded) = decode_any(bytes)?;
+    let (format, decoded) = decode_any(bytes, MAX_INPUT_PIXELS)?;
     let input = (decoded.raster.width, decoded.raster.height);
     let exif_o = orientation_of(decoded.orientation);
 
@@ -661,7 +663,7 @@ pub fn rotate_jpeg(bytes: &[u8], delta: i32) -> Result<Rendered, ImageError> {
     if rot % 90 != 0 {
         return Err(ImageError::BadRotation);
     }
-    let (format, decoded) = decode_any(bytes)?;
+    let (format, decoded) = decode_any(bytes, MAX_INPUT_PIXELS)?;
     let input = (decoded.raster.width, decoded.raster.height);
     let raster = orient(decoded.raster, manual_orientation(rot as u16))?;
     let jpeg = encode_jpeg(&raster)?;
@@ -693,7 +695,7 @@ pub fn render_export(bytes: &[u8]) -> Result<Rendered, ImageError> {
     if bytes.len() as u64 > MAX_INPUT_BYTES {
         return Err(ImageError::FileTooLarge);
     }
-    let (format, decoded) = decode_any(bytes)?;
+    let (format, decoded) = decode_any(bytes, MAX_INPUT_PIXELS)?;
     let input = (decoded.raster.width, decoded.raster.height);
     let exif_o = orientation_of(decoded.orientation);
     let swapped = swaps_axes(exif_o);
@@ -724,6 +726,84 @@ pub fn render_export(bytes: &[u8]) -> Result<Rendered, ImageError> {
         bytes: jpeg.len(),
     };
     Ok(Rendered { jpeg, info })
+}
+
+/// 一覧用サムネイルの長辺（`/thumb/<id>.jpg`）。
+pub const THUMB_PX: u32 = 320;
+/// サムネイルの JPEG の品質。
+pub const THUMB_QUALITY: u8 = 80;
+/// サムネイルの入力ファイルの大きさの上限。derivative 用の [`MAX_INPUT_BYTES`] より厳しい
+/// （ローカルの原本は原寸のまま `display` になるので、2 枚同時に復号しても 1〜2 GB に届かないようにする）。
+pub const THUMB_MAX_INPUT_BYTES: u64 = 64 << 20;
+/// サムネイルの入力の画素数の上限（5,000 万画素 × 3 ch ≒ 150 MB）。
+pub const THUMB_MAX_INPUT_PIXELS: u64 = 50_000_000;
+
+/// 復号の上限。ファイルの大きさと画素数を、全体を復号する前に見る。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    pub max_bytes: u64,
+    pub max_pixels: u64,
+}
+
+/// サムネイル専用の上限（[`THUMB_MAX_INPUT_BYTES`]・[`THUMB_MAX_INPUT_PIXELS`]）。
+pub const THUMB_LIMITS: DecodeLimits = DecodeLimits {
+    max_bytes: THUMB_MAX_INPUT_BYTES,
+    max_pixels: THUMB_MAX_INPUT_PIXELS,
+};
+
+/// `src` から長辺 `long_edge` の JPEG（品質 [`THUMB_QUALITY`]）を作って返す（書き込みは呼び手が
+/// [`write_atomic`]）。ファイルの大きさは読む前に、画素数はヘッダの寸法で全体を復号する前に `limits` と
+/// 比べて断る（[`ImageError::FileTooLarge`]・[`ImageError::TooManyPixels`]）。通常のファイル以外は読まない。
+///
+/// EXIF の向きを当て、ICC は sRGB へ変換し、EXIF（GPS を含む）は出力に残さない。拡大しない。
+pub fn make_thumbnail(
+    src: &Path,
+    long_edge: u32,
+    limits: &DecodeLimits,
+) -> Result<Vec<u8>, ImageError> {
+    let file = fs::File::open(src)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(ImageError::NotAnImage);
+    }
+    if meta.len() > limits.max_bytes {
+        return Err(ImageError::FileTooLarge);
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
+    file.take(limits.max_bytes + 1).read_to_end(&mut bytes)?;
+    thumbnail_from_bytes(&bytes, long_edge, limits)
+}
+
+/// [`make_thumbnail`] のバイト列版（ファイルの大きさの上限も同じく見る）。
+pub fn thumbnail_from_bytes(
+    bytes: &[u8],
+    long_edge: u32,
+    limits: &DecodeLimits,
+) -> Result<Vec<u8>, ImageError> {
+    if bytes.len() as u64 > limits.max_bytes {
+        return Err(ImageError::FileTooLarge);
+    }
+    let (_, decoded) = decode_any(bytes, limits.max_pixels)?;
+    let exif_o = orientation_of(decoded.orientation);
+    let (w, h) = (decoded.raster.width, decoded.raster.height);
+    // 向きを当てたあとの寸法で長辺を収める。縮小してから向きを当てる（`render` と同じ）
+    let swapped = swaps_axes(exif_o);
+    let (ow, oh) = if swapped { (h, w) } else { (w, h) };
+    let out_dims = target_dims(ow, oh, long_edge);
+    let pre = if swapped {
+        (out_dims.1, out_dims.0)
+    } else {
+        out_dims
+    };
+    let icc = decoded.icc;
+    let mut raster = orient(resize(decoded.raster, pre)?, exif_o)?;
+    if let Some(profile) = icc
+        && raster.channels == 3
+    {
+        // 読めない ICC は捨てる（`render` と同じ。自由文のエラーを外へ出さない）
+        to_srgb(&mut raster, &profile);
+    }
+    encode_jpeg_with(&raster, THUMB_QUALITY)
 }
 
 /// derivative のファイルを作る・差し替える・消す処理の直列化。回転（管理画面）と取得（`fetch_derivatives`）が

@@ -24,10 +24,17 @@ fn strip_unstable(mut body: Value) -> Value {
     body
 }
 
-/// Python 版に無い追加分を除く: `db.filters` と、`noloc`・`suggest` 以外のフィルタの `hint`。
+/// Python 版に無い追加分を除く: `db.filters`、`items[].thumb_url`、`noloc`・`suggest` 以外のフィルタの `hint`。
 fn python_shape(mut body: Value) -> Value {
     if let Some(db) = body.get_mut("db").and_then(Value::as_object_mut) {
         db.remove("filters");
+    }
+    if let Some(items) = body.get_mut("items").and_then(Value::as_array_mut) {
+        for item in items {
+            if let Some(map) = item.as_object_mut() {
+                map.remove("thumb_url");
+            }
+        }
     }
     let hinted = matches!(body["filter"].as_str(), Some("noloc" | "suggest"));
     if !hinted && let Some(items) = body.get_mut("items").and_then(Value::as_array_mut) {

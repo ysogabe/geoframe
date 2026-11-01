@@ -202,7 +202,7 @@ pub fn search(
         }
     }
     let sql = format!("SELECT p.id,p.name,p.display,p.taken_at,p.place,p.pref,p.city,p.lat,p.lon,
-        p.source,p.rotation,p.loc_source,p.infer_dt_s,p.lat IS NULL AS no_loc,
+        p.source,p.rotation,p.loc_source,p.md5,p.mtime,p.infer_dt_s,p.lat IS NULL AS no_loc,
         COALESCE(p.favorite,0) favorite,COALESCE(p.hidden,0) hidden,
         a.embedding_model,a.embedding_dim,{} AS embedding,
         a.subject,a.pet_state,a.eyes,a.face_crop,a.horizon_status,a.horizon_score,
@@ -219,7 +219,9 @@ pub fn search(
         let old_model: Option<String> = r.get("embedding_model")?;
         let new = active.get(&id);
         if new.is_none() && (vector.is_some() || old_model.as_deref() != Some(config.embed_backend.model())) { return Ok(None); }
-        let mut card = json!({"id":id,"thumb":format!("/{}",r.get::<_,String>("display")?.trim_start_matches('/'))});
+        let display: String = r.get("display")?;
+        let thumb_url = crate::thumb::thumb_url(id, Some(&display), r.get::<_,Option<String>>("md5")?.as_deref(), r.get::<_,Option<f64>>("mtime")?);
+        let mut card = json!({"id":id,"thumb":format!("/{}",display.trim_start_matches('/')),"thumb_url":thumb_url});
         for key in ["name","taken_at","place","pref","city","subject","pet_state","eyes","face_crop","horizon_status","quality_group_kind"] {
             card[key] = json!(r.get::<_,Option<String>>(key)?.unwrap_or_default());
         }

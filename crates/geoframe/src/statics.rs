@@ -160,14 +160,14 @@ pub fn busy() -> Response {
     response
 }
 
-fn not_modified() -> Response {
+pub(crate) fn not_modified() -> Response {
     let mut response = Response::new(Body::empty());
     *response.status_mut() = StatusCode::NOT_MODIFIED;
     response
 }
 
 /// 200 の応答の共通部。HEAD は本文なし（`Content-Length` は GET と同じ）。
-fn file_response(
+pub(crate) fn file_response(
     method: &Method,
     content_type: &str,
     len: u64,
@@ -225,7 +225,7 @@ fn not_modified_since(headers: &HeaderMap, modified: SystemTime) -> bool {
 }
 
 /// `If-None-Match` が ETag に当たるか（埋め込みファイル用）。`*`、カンマ区切り、弱い比較（`W/`）に対応。
-fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
+pub(crate) fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
     headers
         .get_all(header::IF_NONE_MATCH)
         .iter()
@@ -237,7 +237,7 @@ fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
 
 /// ファイルを `CHUNK` ずつ流す本文。読み取りに失敗したらそこで打ち切る（接続が閉じる）。
 /// 同時配信の枠（`permit`）は本文が最後まで流れるか捨てられる（切断・停滞の打ち切り・`HEAD`）まで持つ。
-fn file_body(file: tokio::fs::File, permit: OwnedSemaphorePermit) -> Body {
+pub(crate) fn file_body(file: tokio::fs::File, permit: OwnedSemaphorePermit) -> Body {
     let stream = futures_util::stream::unfold(Some((file, permit)), |state| async move {
         let (mut file, permit) = state?;
         let mut buf = vec![0u8; CHUNK];
@@ -309,16 +309,79 @@ pub fn serve_embedded_key(
     )
 }
 
+/// 領域の中のファイルを解決できなかった理由（[`resolve_area_file`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Denied {
+    /// 無い・解決できない・通常のファイルでない（404）
+    NotFound,
+    /// 領域の外を指すリンク、またはディレクトリ（403）
+    Forbidden,
+}
+
+impl Denied {
+    pub(crate) fn into_response(self) -> Response {
+        match self {
+            Self::NotFound => not_found(),
+            Self::Forbidden => forbidden(),
+        }
+    }
+}
+
+/// データ置き場の領域（`derivatives/`・`photos/`・`blog_exports/`・`thumbs/`）の中のファイルを、リンクを辿って
+/// 解決する。**ファイルを開く前の検査**で、`serve_data` と `/thumb/` が共有する（読むだけで、ディレクトリは作らない）。
+///
+/// 1. 領域のディレクトリ（`<data_root>/<名前>`）とファイルの両方を**リンクを辿って解決**する。
+///    `data_root` は起動時に解決済み。領域のディレクトリ自体がリンクでもよい（運用者の設定。
+///    別のディスクへ置く場合）が、**中のリンク**は解決後も領域のディレクトリの内側でなければ
+///    [`Denied::Forbidden`]（`derivatives/x.jpg -> ../catalog.db` のような、データ置き場の中でも領域の外を指すものを含む）。
+/// 2. ディレクトリは `Forbidden`（一覧は出さない）、通常のファイル以外・末尾 `/` 付きは `NotFound`。
+///
+/// 戻り値は解決後の絶対パス。
+pub(crate) async fn resolve_area_file(
+    data_root: &Path,
+    area: Area,
+    rel: &[&str],
+    trailing_slash: bool,
+) -> Result<PathBuf, Denied> {
+    let Some(dir_name) = area.data_dir_name() else {
+        return Err(Denied::NotFound);
+    };
+    let area_dir = data_root.join(dir_name);
+    let mut path: PathBuf = area_dir.clone();
+    path.extend(rel);
+
+    // 解決できない（無い・循環・権限）は Python と同じく 404
+    let Ok(area_real) = tokio::fs::canonicalize(&area_dir).await else {
+        return Err(Denied::NotFound);
+    };
+    let Ok(real) = tokio::fs::canonicalize(&path).await else {
+        return Err(Denied::NotFound);
+    };
+    if !real.starts_with(&area_real) {
+        tracing::warn!(
+            "{} の領域の外を指すリンクを拒否しました（ファイル名は記録しません）",
+            area.route()
+        );
+        return Err(Denied::Forbidden);
+    }
+    let Ok(meta) = tokio::fs::metadata(&real).await else {
+        return Err(Denied::NotFound);
+    };
+    if meta.is_dir() {
+        return Err(Denied::Forbidden);
+    }
+    if !meta.is_file() || trailing_slash {
+        return Err(Denied::NotFound);
+    }
+    Ok(real)
+}
+
 /// データ置き場の `derivatives/`・`photos/`・`blog_exports/` のファイルを返す。
 ///
 /// 手順:
-/// 1. 領域のディレクトリ（`<data_root>/<名前>`）とファイルの両方を**リンクを辿って解決**する。
-///    `data_root` は起動時に解決済み。領域のディレクトリ自体がリンクでもよい（運用者の設定。
-///    別のディスクへ置く場合）が、**中のリンク**は解決後も領域のディレクトリの内側でなければ 403
-///    （`derivatives/x.jpg -> ../catalog.db` のような、データ置き場の中でも領域の外を指すものを含む）。
-/// 2. ディレクトリは 403（一覧は出さない）、通常のファイル以外は 404。
-/// 3. 同時配信の枠（`slots`）を取る。空きが無ければ待たずに 503（ファイル記述子を握る数の上限）。
-/// 4. 解決後のパスを開き、開いたハンドルのサイズと更新時刻で `Content-Length`・`Last-Modified`・304 を決める。
+/// 1. 領域とファイルを解決する（[`resolve_area_file`]。外を指すリンクは 403、ディレクトリは 403、通常のファイル以外は 404）。
+/// 2. 同時配信の枠（`slots`）を取る。空きが無ければ待たずに 503（ファイル記述子を握る数の上限）。
+/// 3. 解決後のパスを開き、開いたハンドルのサイズと更新時刻で `Content-Length`・`Last-Modified`・304 を決める。
 ///    枠は応答の本文が捨てられるまで持つ（304 と `HEAD` はすぐ返す）。
 pub async fn serve_data(
     data_root: &Path,
@@ -328,36 +391,10 @@ pub async fn serve_data(
     method: &Method,
     headers: &HeaderMap,
 ) -> Response {
-    let Some(dir_name) = target.area.data_dir_name() else {
-        return not_found();
+    let real = match resolve_area_file(data_root, target.area, &target.rel, trailing_slash).await {
+        Ok(real) => real,
+        Err(denied) => return denied.into_response(),
     };
-    let area_dir = data_root.join(dir_name);
-    let mut path: PathBuf = area_dir.clone();
-    path.extend(&target.rel);
-
-    // 解決できない（無い・循環・権限）は Python と同じく 404
-    let Ok(area_real) = tokio::fs::canonicalize(&area_dir).await else {
-        return not_found();
-    };
-    let Ok(real) = tokio::fs::canonicalize(&path).await else {
-        return not_found();
-    };
-    if !real.starts_with(&area_real) {
-        tracing::warn!(
-            "{} の領域の外を指すリンクを拒否しました（ファイル名は記録しません）",
-            target.area.route()
-        );
-        return forbidden();
-    }
-    let Ok(meta) = tokio::fs::metadata(&real).await else {
-        return not_found();
-    };
-    if meta.is_dir() {
-        return forbidden();
-    }
-    if !meta.is_file() || trailing_slash {
-        return not_found();
-    }
     let Ok(permit) = Arc::clone(slots).try_acquire_owned() else {
         return busy();
     };
