@@ -310,8 +310,8 @@ mod tests {
             assert_ne!(changed, token, "{what}");
             seen.insert(changed);
         }
-        // 変えた項目ごとに別の印になる（取り違えない）
-        assert!(seen.len() > mutations.len() - 2);
+        // 変えた項目ごとに別の印になる（元の印を含めて全部違う。取り違えない）
+        assert_eq!(seen.len(), mutations.len() + 1);
         // 1 枚減っても・増えても変わる
         assert_ne!(group_token(&base[..1]), token);
         assert_ne!(
