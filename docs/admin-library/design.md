@@ -187,15 +187,19 @@ flowchart LR
   `vEntries()` に置き換える。`viewerIndex` の名前・意味は変えない（描画試験 `photos_render.mjs:846, 918, 968, 973, 1256` が
   直接見る）。`openModal(index)` は `viewerEntries = null` にしてから開く（写真タブの挙動は不変）。`closeModal()` で
   `viewerEntries = null`。
+- 既存の `openModal(index)` のうち「ビューアを表示する処理」（`hidden` を外す、`body.ps-viewer-open`、`renderModal()`、
+  閉じるボタンへのフォーカス、閉じたときのフォーカスの戻し先の記録）を内部関数 `showViewer(index)` に切り出し、
+  `openModal` と下の `openModalFor` の両方から呼ぶ。
 - 公開関数 `openModalFor(photos, index, opts)`: `photos` は `{id, name, thumb, thumb_url, taken_at, lat, lon, place, pref, city,
   favorite, hidden, rotation, source}` の配列。`viewerEntries = photos.map(photo => ({photo, group: null}))` にして
-  `viewerIndex = index`、`renderModal()`。`opts.ai=false` で `#viewer-ai`・`#viewer-group` を隠す（一覧から開いたときと同じ扱い）。
+  `showViewer(index)`。`opts.ai=false` で `#viewer-ai`・`#viewer-group` を隠す（一覧から開いたときと同じ扱い）。
 - `applyPhoto(id, patch)` は、`ps.entries`・`viewerEntries`・開いているビューアに加えて、購読者 `photoChangeListeners`
   （`library.js`・`curation.js` が `onPhotoChange(fn)` で登録）に `(id, patch)` を渡す。購読者は自分のタイルを描き直す。
 - `closePhotoOverlays()` は今までどおり `admin.js` の `showTab` が写真タブ以外へ移るときに呼ぶが、ライブラリ・選別から
   開いたビューアも閉じる必要があるので、`showTab` は**どのタブから離れるときも**呼ぶ（`admin.js:70` の条件を外す）。
-- 描画試験: 既存の (p)(q)(q2) をそのまま通す。追加で「`ps.entries` と違う配列から `openModalFor` で開き、★を押すと
-  `POST /api/admin/setflag` の `id` がその配列の写真になり、`ps.entries` の写真は変わらない」を足す（Sol の指摘 8）。
+- 描画試験: 既存の (p)(q)(q2) をそのまま通す。追加で「`ps.entries` と違う配列から `openModalFor` で開くとビューアが表示され
+  （`hidden` が外れ `body.ps-viewer-open`）、★を押すと `POST /api/admin/setflag` の `id` がその配列の写真になり、`ps.entries` の
+  写真は変わらず、閉じると開いた要素にフォーカスが戻る」を足す（Sol の指摘 8）。
 
 ### ライブラリの状態（`library.js`）
 
@@ -214,7 +218,7 @@ ls = {
 - 旅の一覧: 1 旅 1 行（表紙のサムネイル、`start〜end`、`N 枚（位置なし M）`、場所の上位 3 つ、「地図で見る」）。
   押すと `sel = {from: start, to: end}` で格子を読む。末尾に「日時なし（K 枚）」。
 - 格子: `div.lib-tile > img[loading=lazy][src=thumb_url]` ＋ 右下に ★・🚫・位置なしの小さな印。押すと
-  `openViewerFor(ls.items, i, {ai: false})`。ページングは写真タブと同じ部品。
+  `openModalFor(ls.items, i, {ai: false})`。ページングは写真タブと同じ部品。
 - 地図: `ensureLibMap()` が `ensureMini()` と同じ style の組み方（source・出典の定数を `photos.js` から共有関数
   `tileStyle()` に切り出す）で `#lib-map` に作る。`photos` という GeoJSON source（`cluster: true, clusterRadius: 40,
   clusterMaxZoom: 16`）と 3 層（クラスタの円、件数の文字、単独の点）。クラスタを押すと
@@ -244,10 +248,12 @@ cs = {
 - 1 段 = `section.cur-group`: 見出し（`exact 3 枚 2024-05-03 09:12 ／ 状態: 未確認 | 確認済み（人の代表）| 再確認`）、
   メンバーの横並び（`label.cur-member > input[type=checkbox] + img + 点数 + タグ（解析の推奨・人の代表・★・除外）+
   理由/懸念の折りたたみ`）、操作（「選んだ写真を代表にする」= チェックが 1 つ以上で有効、「このままで確認済み」、
-  「取り消す」= 記録があるときだけ）。画像を押すと `openViewerFor(group.members, i, {ai: false})`。
+  「取り消す」= 記録があるときだけ）。画像を押すと `openModalFor(group.members, i, {ai: false})`。
 - 確定は `POST /api/admin/curation/confirm {kind, group_id, token, representatives: [...] | null}`（`token` は `groups` が
   返したメンバー集合の世代の印）。応答の `group` でその段を描き直す。409 `group_changed` なら「組が変わりました。
-  読み直します」のトーストを出し、その段だけ `GET …/groups?ids=<先頭の写真 ID>` で読み直す（消えていれば段を外す）。
+  読み直します」のトーストを出し、その段だけ `GET …/groups?state=all&kind=all&ids=<先頭の写真 ID>` で読み直す（既定の
+  `state=unconfirmed` だと確認済みになった組を見失う）。届いた組が今の絞り込み（`cs.state`・`cs.kind`）に合えば描き直し、
+  合わなければ段を外す。応答が空（組が消えた）でも段を外す。
 - 状況タブの「要対応」に `未確認の選別 N 組` を足す（R18。`db.quality.curation_pending`）。
 
 ## インターフェース
@@ -275,8 +281,11 @@ cs = {
   2. `thumbs/<id>-<gen>.jpg` があれば返す（`thumbs/` も領域として同じ検査。`static_slots` の `try_acquire` を通り、空きが
      無ければ 503。`serve_data` と同じ）。
   3. 失敗の記憶 `thumb_failed`（下記）に `<id>-<gen>` があれば 5 へ。
-  4. **写真 ID ごとのロック**（`AppState.thumb_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>`。使い終わった項目は
-     消す）を取り、取った後に 2 と 3 をもう一度見る（待っているあいだに他の要求が作った・失敗した）。次に生成の枠
+  4. **写真 ID ごとのロック**（`AppState.thumb_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>`）を
+     `lock_owned()` で取り（`OwnedMutexGuard`。生成の枠と一緒に `spawn_blocking` のクロージャへ move し、生成・失敗の記憶・
+     古い世代の掃除が終わるまで持つ。要求が drop されても同じ ID の次の要求が先に生成を始めない）、取った後に 2 と 3 を
+     もう一度見る（待っているあいだに他の要求が作った・失敗した）。表からの削除は `Arc::strong_count == 1`（待っている
+     要求が無い）のときだけ（待機者のいるロックを消すと同じ ID に別のロックができる）。次に生成の枠
      `Semaphore(THUMB_CONCURRENCY)` を `acquire_owned()` で取る。**待ちは最長 10 秒・待つ数は最大 32** で、超えたら 5 の
      代わりの応答（接続を握り続けない。`MAX_CONNECTIONS` は miharashi と共有）。取った `OwnedSemaphorePermit` は
      `spawn_blocking` のクロージャに move し、生成が終わるまで持つ（クライアントが切っても復号が枠を超えて走らない）。
@@ -291,7 +300,8 @@ cs = {
      no-store` を付ける（`Last-Modified`・304 は付けない）。画像でなければ 404。
      失敗の記憶 `thumb_failed: Mutex<HashSet<(i64, [u8; 6])>>` の鍵は **DB から計算した `<id>-<gen>`** だけ（`v` は使わない。
      上限は写真の枚数 × 世代の数で有限）。覚えるのは「復号できない」「上限を超える」の失敗だけで、`thumbs/` に書けない
-     （ディスクが満杯・権限）失敗は覚えず次の要求で再試行する。上限 10,000 件（超えたら全部忘れる）。ログは失敗の初回に
+     （ディスクが満杯・権限）失敗は覚えず次の要求で再試行する。上限 10,000 件（超えたら古いものから捨てる。`VecDeque` と
+     `HashSet` の組）。ログは失敗の初回に
      1 行（WARN、ID と分類 `decode`/`limit`/`write` だけ。エラーの文面・パスは出さない）。
 - 応答ヘッダ（キャッシュから返すとき）: `Content-Type: image/jpeg`、`Content-Length`、`Last-Modified`、
   `ETag: "<gen>"`（`thumb.rs` が付ける。`serve_data` のデータ画像は今までどおり ETag 無し）、`If-None-Match` が一致すれば 304、
@@ -445,18 +455,23 @@ CASE WHEN q.group_id IS NULL THEN 0
                 "recommended": true, "effective": true, "curation": "representative" | "reviewed" | "stale" | null}]}]}
 ```
 
-- `token` = メンバーを `photo_id` 昇順に並べた `"<photo_id>:<content_sha256>"` を改行でつないだ文字列の SHA-256 の先頭
-  16 hex。`confirm`・`reset` が「画面が見た組と今の組が同じか」を確かめるのに使う（全 ID を送らないので枚数の上限が
-  無い。Sol の指摘 4）。
-- `warning`: 有効な推奨（`effective`）の写真がすべて除外か位置なしなら `"representative_not_visible"`（exact の組なら
-  フィードから消えている）。それ以外は `null`。
+- `token` = メンバーを `photo_id` 昇順に並べ、1 枚につき `"<photo_id>\t<display>\t<source_md5|->\t<source_mtime|->\t
+  <content_sha256>\t<解析の recommended 0/1>\t<人の記録: representative|reviewed|stale|none>"`（NULL は `-`、空文字は
+  そのまま。区切りはタブ）を改行でつないだ文字列の SHA-256 の先頭 16 hex。読むとき（`groups`）と書くとき（`confirm`・
+  `reset` の検査）で同じ関数 `curation::group_token(members)` を使う。メンバーの集合・各写真の世代（4 列）・解析の推奨・
+  人の記録のどれが変わっても一致しなくなるので、再構築・再解析・別のタブの確定・`reset` のどれとの競合も 409 になる
+  （全 ID を送らないので枚数の上限が無い。Sol の指摘 4・2 回目の 1・2）。
+- `warning`: 有効な推奨（`effective`）の写真がすべて除外か位置なし（フィードの品質以外の述語を満たさない）なら
+  `"representative_not_visible"`（exact の組ならフィードから消えている）。それ以外は `null`。この定義がリスクの表からも
+  参照される唯一の定義。
 - グループの並び: `taken_at`（グループの最小）の降順、`group_kind`、`group_id`。世代の合わない `photo_quality` の行と
   1 枚しか有効でないグループは出さない。`curation: "stale"` は記録はあるが世代が合わないメンバー。
 
 ### `POST /api/admin/curation/confirm`（新。PR ③）
 
 - 本文: `{"kind": "exact"|"similar", "group_id": int, "token": "<16 hex>", "representatives": [int…] | null}`。
-  `representatives` は 1〜50 件、重複なし、または `null`（人の代表を持たず、解析の推奨のまま確認済み）。
+  `representatives` は 1 件以上（上限は本文の 64 KiB だけ。独自の上限は置かない）、重複なし、または `null`（人の代表を
+  持たず、解析の推奨のまま確認済み）。
   画面の「このままで確認済み」は、段に有効な人の代表があればそれを `representatives` に入れて送る（黙って解析の推奨に
   戻さない）。
 - 本文の型: `kind` は 2 値のどちらか、`group_id` は `as_i64()` で取れて 1 以上、`token` は 16 桁の小文字 hex、
@@ -535,19 +550,19 @@ CASE WHEN q.group_id IS NULL THEN 0
   合成と分かる座標）。試験の画像は `image` crate でコードから作り、本番のデータディレクトリから写さない。PR・文書に貼る
   画面写真は合成データだけ（本番のコピーで目視した画面は貼らない。写真の集まり方で自宅が分かる）。
 - 資源: サムネイルの生成は同時 2 つ、同じ写真は ID ごとのロックで 1 つ、1 枚 50〜150 ms 程度（2,560px の JPEG の復号が主）。
-  初回の旅の一覧で 60 枚なら数秒で埋まる。`spawn_blocking` なので待ち受けは止まらない。復号の画素数の上限は derivative の
-  作成と同じ値を使い、超えるものは失敗として覚える。`confirm`・`reset` は 1 トランザクションで検査と書き込みを行い、
+  初回の旅の一覧で 60 枚なら数秒で埋まる。`spawn_blocking` なので待ち受けは止まらない。復号の上限・待ちの上限・失敗の
+  記憶は `/thumb/` の節の定義が唯一の定義（ここでは繰り返さない）。`confirm`・`reset` は 1 トランザクションで検査と書き込みを行い、
   `token` で画面が見た組との一致を確かめるので、再構築や別のタブの確定と競合しても古い判断で上書きしない。
 
 ## テスト計画
 
 | AC | 試験 | 置き場 |
 |---|---|---|
-| AC1 | 合成 JPEG（`image` crate で 1200×800 を作る）を `derivatives/` に置き、`/thumb/<id>.jpg` の 200・寸法・`ETag` の存在と `If-None-Match` の 304・`mtime` 変更後の再生成と古い世代の削除・404（数字でない、無い写真）・403（領域の外へのリンク）・壊れた JPEG で元ファイルを返し 2 回目は復号せず返す（失敗の記憶。生成関数の呼び出し回数を数える）・同じ写真への同時 8 要求で生成が 1 回（ID ごとのロック）・`display` が `catalog.db`・`../x`・`tmp/x` を指す行は 404 で本文が DB でない・寸法だけ大きい合成 PNG は代わりの応答（上限）・GPS 付きの合成 JPEG から作ったサムネイルに APP1（EXIF）が無い・`Sec-Fetch-Site: cross-site` は 403・HEAD は生成しない・待ち合わせ中に要求を drop しても同時の生成が 2 を超えない（単体）。`/derivatives/` のヘッダ不変は既存試験 | `tests/thumb.rs`（新）＋ `thumb.rs` の単体試験 |
+| AC1 | 合成 JPEG（`image` crate で 1200×800 を作る）を `derivatives/` に置き、`/thumb/<id>.jpg` の 200・寸法・`ETag` の存在と `If-None-Match` の 304・`mtime` 変更後の再生成と古い世代の削除・404（数字でない、無い写真）・403（領域の外へのリンク）・壊れた JPEG で元ファイルを返し 2 回目は復号せず返す（失敗の記憶。生成関数の呼び出し回数を数える）・同じ写真への同時 8 要求で生成が 1 回（ID ごとのロック）・`display` が `catalog.db`・`../x`・`tmp/x` を指す行は 404 で本文が DB でない・寸法だけ大きい合成 PNG は代わりの応答（上限）・GPS 付きの合成 JPEG から作ったサムネイルに APP1（EXIF）が無い・`Sec-Fetch-Site: cross-site` は 403・HEAD は生成しない・待ち合わせ中に要求を drop しても同時の生成が 2 を超えない・同じ ID の生成途中で要求を drop しても次の要求が二重に生成しない（単体）。`/derivatives/` のヘッダ不変は既存試験 | `tests/thumb.rs`（新）＋ `thumb.rs` の単体試験 |
 | AC2 | 新しいフィクスチャ `tests/fixtures/library-catalog.sql`（10 分・1 時間 30 分・8 時間・ちょうど 48 時間・9 日の差、位置なし、日時なし、除外を含む）で `trips` の境界・`noloc`・`untimed`・`hidden=1` の差を独立した期待値で検証。描画試験で旅 → 格子 → ビューア → ★ → `POST setflag` の `id` → タイルの印の更新（購読者）。写真タブのカードが変わらないことも見る | `tests/library_api.rs`（新）、`web/tests/library_render.mjs`（新）＋ `tests/admin_ui_library.rs` |
 | AC3 | `points` の位置なし除外・`from`/`to`・`bbox` の絞り込み（結合）。`truncated` は切り詰めの関数（`fn truncate_points(rows, max)`）の単体試験（結合試験のバイナリでは `#[cfg(test)]` の定数が効かないため）。描画試験で偽 MapLibre の `setData`、点を押したときの `ids=` 要求と吹き出し、`bbox` 要求 | 同上 |
 | AC4 | 新しいフィクスチャ `tests/fixtures/curation-catalog.sql`（`admin-api-catalog.sql` は similar 1 組・exact 1 組なので流用しない）: exact 1 組・similar 2 組（1 組は同じ SHA の 2 枚を含む）。`confirm` → `groups`・`/api/v1/photos`・`status` の `db.quality.recommended`・`photo_quality` の入れ直し（`group_id` を変える）後も保持。`reviewed` のみ・`reset`・上の境界の表の 5 行・代表に記録した後で除外にした写真は `/api/v1/photos` に出ない・`photo_quality` を入れ替える書き込みと同時に `confirm` しても表が半端にならない | `tests/curation_api.rs`（新） |
-| AC5 | 確認済みの組に 1 枚足す → `recheck`。メンバーの `mtime` と `photo_quality` の世代を変える（再解析後を模す）→ `recheck`・`stale`。`token` 違いの `confirm`・`reset` → 409 で表が不変。`representative_not_visible` → 400 で表が不変 | 同上 |
+| AC5 | 確認済みの組に 1 枚足す → `recheck`。メンバーの `mtime` と `photo_quality` の世代を変える（再解析後を模す）→ `recheck`・`stale`。`token` 違いの `confirm`・`reset` → 409 で表が不変（集合違い・SHA は同じで `mtime` だけ違う・別のタブが先に代表を変えた後の古い `token`・`reset` 後の古い `token` の 4 通り）。`representative_not_visible` → 400 で表が不変 | 同上 |
 | AC6 | 既存のフィードの試験（契約・endpoint・miharashi）が無変更で通る。`photo_curation` 無しの DB で `list_photos` の SQL が従来と同じ結果（単体）。旧 AI の組と重なる合成ケース（人の代表が旧 AI の非推薦でも出る） | 既存 ＋ `photos.rs` の単体試験 ＋ `tests/legacy_selection.rs` |
 | AC7 | CSRF 403・`INGEST=0` 503・表の無い DB で各 GET が 200・新しい GET への POST が 403 | `tests/curation_api.rs`・`tests/library_api.rs` |
 | AC8 | `cargo fmt --check`・clippy・`cargo test`。`static_files.rs` の文字列 HTML の禁止が `library.js`・`curation.js` にも効く（`web/static/js` 直下に置く） | CI |
@@ -561,7 +576,7 @@ CASE WHEN q.group_id IS NULL THEN 0
 | リスク | 対策 |
 |---|---|
 | 人の代表が `similar` グループで 1 枚だけになり、解析の「上位 2 枚」より miharashi に出る枚数が減る | 意図した挙動として文書に書く。複数選べるので必要なら 2 枚選ぶ |
-| 確定後に代表を除外した・位置を外したため、exact グループがフィードから消える | 解析の推奨と同じ既存の穴。選別タブの段に「代表が出せない」の警告を出す（`groups` の応答で `effective` かつ `hidden`/位置なしのメンバーがあれば `warning: "representative_not_visible"`） |
+| 確定後に代表を除外した・位置を外したため、exact グループがフィードから消える | 解析の推奨と同じ既存の穴。選別タブの段に「代表が出せない」の警告を出す（`groups` の `warning` の定義に従う） |
 | 回転・原本の更新で記録が無効になり、確認し直しになる | `recheck` として目に見える形で戻す（黙って消さない）。`stale` の印で理由が分かる |
 | `quality-scan` の再構築中（`DELETE` と INSERT の間）に `groups` を読む | 再構築は 1 トランザクションなので途中は見えない（`quality.rs:345-`）。`confirm` は writer のトランザクションで検査するので競合しても 409 になるだけ |
 | サムネイルの初回生成で一覧が遅い | `loading=lazy` と同時 2 つの生成。60 枚/ページ。必要なら後で同期の段に前もって作る処理を足す（C） |
