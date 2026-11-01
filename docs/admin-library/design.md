@@ -91,8 +91,8 @@
 
 ## 方針
 
-1. **人の選択は写真ごとに、内容のハッシュを鍵に持つ**（`photo_curation`）。`photo_quality` の `group_id` に紐付けない
-   （再構築で消える・振り直される）。「グループ G の代表」ではなく「写真 X は、X が属するグループの代表」と記録すれば、
+1. **人の選択は写真ごとに、写真の世代（`display`・`md5`・`mtime`・内容の SHA）を鍵に持つ**（`photo_curation`）。
+   `photo_quality` の `group_id` に紐付けない（再構築で消える・振り直される）。「グループ G の代表」ではなく「写真 X は、X が属するグループの代表」と記録すれば、
    再構築で組み替わっても意味が保たれる。確認済みも写真ごとの印（`reviewed`）にし、「今のメンバー全員に有効な印がある」
    ことを確認済みの定義にする。これで「新しい写真が加わる → 再確認」が表の設計から自然に出る（R15）。
    - 選ばなかった案: `photo_quality` に `human_pick` 列を足して再構築時に引き継ぐ。再構築が「特徴量から作り直す」純粋さを
@@ -100,7 +100,9 @@
      全部無効になり、「再確認」と「未確認」の区別がつかない。
 2. **フィードは「有効な推奨」で判定する。** `QUALITY_JOIN` の隣に `photo_curation` を LEFT JOIN し、グループに有効な
    人の代表が 1 枚でもあればその写真だけ、無ければ解析の `recommended` を使う。契約の項目は変えず、値の由来を文書に
-   足す（R17・R19）。表が無い DB では JOIN を省く SQL に切り替える（R23）。
+   足す（R17・R19）。表が無い DB では JOIN を省く SQL に切り替える（R23）。旧 AI 選別（`selection.rs`）の「表示できる
+   推薦写真」の判定も有効な推奨で行い、人の代表は `favorite` と同じく旧 AI の抑止を免れる（人の判断を機械の判断より
+   優先する。Sol の指摘 3）。
    - 選ばなかった案: 人の選択を管理画面だけに留めて miharashi に効かせない（ユーザーの決定で不採用）。選択を
      `photos.hidden` に落とす（除外は 1 枚ずつ、という決定に反する。exact の推奨外は `hidden` でなく推奨で落ちている）。
 3. **サムネイルは要求時に作ってファイルに貯める**（`/thumb/<id>.jpg?v=<世代>`）。同期の段を足さず、バックログも持たない。
@@ -110,13 +112,15 @@
 4. **新しい項目は新しい API に置く。** `/api/admin/photos`・`/status` は Python 版との一致の試験があるので触らない
    （R18 の件数だけ `db` に足し、`python_shape` で除く）。
 5. **ビューアを「開いた側が渡した配列」で動かす**よう `photos.js` を小さく直し、ライブラリと選別から同じビューアを使う。
-   カード（`cardFor`）はライブラリでは使わず、軽いタイル（サムネイルだけ）にする。
+   `viewerIndex` の名前と `openModal(index)` の外部の挙動は変えず（描画試験が `viewerIndex` を直接見る）、参照する配列だけを
+   `viewerEntries`（既定は `ps.entries`）に置き換える。カード（`cardFor`）はライブラリでは使わず、軽いタイル（サムネイルだけ）にする。
    - 選ばなかった案: ライブラリ用のビューアを別に作る（★・除外・前後・キー操作が二重になる）。
 6. **旅はサーバーで区切る。** フィードの `assign_trips` と同じ規則（48 時間超）を、除外や位置なしを含む全写真に当てる。
    旅の識別子は先頭の写真の撮影日時（`YYYY-MM-DD HH:MM`）にする（番号は写真が増えるとずれる）。対象の写真が違うので、
    フィードの `trip` とは境界が違ってよい（位置なしの写真が間にあると、ライブラリでは 1 つの旅につながる）。意図した差。
 7. 地図の点は **1 回の GET で GeoJSON を返し、クラスタは MapLibre に任せる**（6,500 点なら 1 点 20 バイト程度）。
-   上限（20,000 点）を超えたら新しい順に切って `truncated: true`。
+   上限（20,000 点）を超えたら新しい順に切って `truncated: true`。点の中身は ID だけで、吹き出しに要る情報は押した時点で
+   `library/photos?ids=` を引く。
 
 ## 構成
 
@@ -173,15 +177,25 @@ flowchart LR
 
 ### ビューアの共通化（`photos.js`）
 
-- 新しい内部状態 `viewer = {entries: [], index: -1, opts: {ai: false, onChange: null}}`。`renderModal`・前後移動・キー操作・
-  `closeViewer` は `viewer.entries` を読む。写真タブは今までどおり `openViewer(index)` を呼び、その中で
-  `viewer.entries = ps.entries` を設定する（挙動は不変。既存の描画試験 (p) が担保）。
-- 公開関数 `openViewerFor(photos, index, opts)`: `photos` は `{id, name, thumb, thumb_url, taken_at, lat, lon, place, pref,
-  city, favorite, hidden, rotation, source}` の配列。`entries` は `{photo, group: null}` に包む。`opts.ai=false` で
-  `#viewer-ai`・`#viewer-group` を隠す。
-- `applyPhoto(id, patch)` は、`ps.entries`・開いているビューアに加えて、登録された購読者 `photoChangeListeners`
+今の入口は `openModal(index)`（`photos.js:576`）・`closeModal()`（`:585`）・`stepModal(delta)`（`:595`）・
+`closePhotoOverlays()`（`:786`。`admin.js:70` が写真タブ以外へ移るとき呼ぶ）・`openPhotosTab()`（`:246`。`admin.js:76`）。
+`renderModal`（`:508`）、前後の先読み（`:567-572`）、★・除外のハンドラ（`:835-842`）、画像クリック（`:845`）、`applyPhoto`
+（`:602-611`）が `ps.entries` と `viewerIndex` を直接読む。
+
+- 新しい変数 `let viewerEntries = null;`。`viewerEntries || ps.entries` を返す `vEntries()` を置き、上の**全部の参照**
+  （`renderModal`・`stepModal`・先読み・★/除外のハンドラ・画像クリック・`applyPhoto` の「開いている写真」の判定）を
+  `vEntries()` に置き換える。`viewerIndex` の名前・意味は変えない（描画試験 `photos_render.mjs:846, 918, 968, 973, 1256` が
+  直接見る）。`openModal(index)` は `viewerEntries = null` にしてから開く（写真タブの挙動は不変）。`closeModal()` で
+  `viewerEntries = null`。
+- 公開関数 `openModalFor(photos, index, opts)`: `photos` は `{id, name, thumb, thumb_url, taken_at, lat, lon, place, pref, city,
+  favorite, hidden, rotation, source}` の配列。`viewerEntries = photos.map(photo => ({photo, group: null}))` にして
+  `viewerIndex = index`、`renderModal()`。`opts.ai=false` で `#viewer-ai`・`#viewer-group` を隠す（一覧から開いたときと同じ扱い）。
+- `applyPhoto(id, patch)` は、`ps.entries`・`viewerEntries`・開いているビューアに加えて、購読者 `photoChangeListeners`
   （`library.js`・`curation.js` が `onPhotoChange(fn)` で登録）に `(id, patch)` を渡す。購読者は自分のタイルを描き直す。
-- `onTabLeave()` はタブに依らず呼ばれるようにし（`showTab` が「前のタブ」に対して呼ぶ）、ビューア・位置モーダルを閉じる。
+- `closePhotoOverlays()` は今までどおり `admin.js` の `showTab` が写真タブ以外へ移るときに呼ぶが、ライブラリ・選別から
+  開いたビューアも閉じる必要があるので、`showTab` は**どのタブから離れるときも**呼ぶ（`admin.js:70` の条件を外す）。
+- 描画試験: 既存の (p)(q)(q2) をそのまま通す。追加で「`ps.entries` と違う配列から `openModalFor` で開き、★を押すと
+  `POST /api/admin/setflag` の `id` がその配列の写真になり、`ps.entries` の写真は変わらない」を足す（Sol の指摘 8）。
 
 ### ライブラリの状態（`library.js`）
 
@@ -204,12 +218,16 @@ ls = {
 - 地図: `ensureLibMap()` が `ensureMini()` と同じ style の組み方（source・出典の定数を `photos.js` から共有関数
   `tileStyle()` に切り出す）で `#lib-map` に作る。`photos` という GeoJSON source（`cluster: true, clusterRadius: 40,
   clusterMaxZoom: 16`）と 3 層（クラスタの円、件数の文字、単独の点）。クラスタを押すと
-  `getClusterExpansionZoom` で寄る。点を押すと `maplibregl.Popup`（DOM を `el()` で組んで `setDOMContent`）に
-  サムネイル・日時・地名・「開く」。「開く」は `GET /api/admin/library/photos?ids=<id>` で 1 枚を取り
-  `openViewerFor`。ツールバーに「この範囲の写真を見る」（`map.getBounds()` を `bbox` にして格子を読む）と期間の表示
-  （旅から来たときの `from`/`to`、解除ボタン）。
+  `getClusterExpansionZoom` で寄る。点を押すと、その時点で `GET /api/admin/library/photos?ids=<id>` を引き（要求番号を
+  付け、別の点を押したら古い応答は捨てる）、届いたら `maplibregl.Popup`（DOM を `el()` で組んで `setDOMContent`）に
+  サムネイル・日時・地名・「開く」を出す。取得中は「読み込み中」、失敗は「読めませんでした」の吹き出し。「開く」は届いた
+  1 枚で `openModalFor([photo], 0, {ai: false})`。ツールバーに「この範囲の写真を見る」（`map.getBounds()` を `bbox` にして
+  格子を読む）と期間の表示（旅から来たときの `from`/`to`、解除ボタン）。タブに戻ったとき `map.resize()` を呼ぶ。
+- 画像の読み込み失敗（`img` の `error`）は格子・表紙・選別のメンバーで共通のプレースホルダ（`.img-broken`、文字は
+  「画像なし」）に差し替える（写真タブのカードと同じ扱い）。
 - 描画試験では `window.maplibregl` を偽物（`Map`・`Popup`・`addSource`・`getSource().setData` を記録するだけ）に
-  差し替え、source に渡った GeoJSON と `bbox` 付きの要求を検証する。
+  差し替え、source に渡った GeoJSON と `bbox` 付きの要求、点を押したときの `ids=` の要求と吹き出しの DOM を検証する。
+  実際のクラスタの操作・タブ復帰後の地図の大きさは検証環境で目視。
 
 ### 選別の状態（`curation.js`）
 
@@ -227,9 +245,9 @@ cs = {
   メンバーの横並び（`label.cur-member > input[type=checkbox] + img + 点数 + タグ（解析の推奨・人の代表・★・除外）+
   理由/懸念の折りたたみ`）、操作（「選んだ写真を代表にする」= チェックが 1 つ以上で有効、「このままで確認済み」、
   「取り消す」= 記録があるときだけ）。画像を押すと `openViewerFor(group.members, i, {ai: false})`。
-- 確定は `POST /api/admin/curation/confirm {photo_ids: [...全メンバー], representatives: [...] | null}`。応答の `group` で
-  その段を描き直す。409 `group_changed` なら「組が変わりました。読み直します」のトーストを出し、その段だけ
-  `GET …/groups?ids=` で読み直す。
+- 確定は `POST /api/admin/curation/confirm {kind, group_id, token, representatives: [...] | null}`（`token` は `groups` が
+  返したメンバー集合の世代の印）。応答の `group` でその段を描き直す。409 `group_changed` なら「組が変わりました。
+  読み直します」のトーストを出し、その段だけ `GET …/groups?ids=<先頭の写真 ID>` で読み直す（消えていれば段を外す）。
 - 状況タブの「要対応」に `未確認の選別 N 組` を足す（R18。`db.quality.curation_pending`）。
 
 ## インターフェース
@@ -239,18 +257,30 @@ cs = {
 - `<id>` は 1〜18 桁の数字だけ。他は 404。`v` は無視してよい（キャッシュの破棄のためだけに URL に含める）。
 - 世代 `gen` = `blake3`/`sha256` の先頭 12 hex（`display | md5 | mtime` を `|` で連結。`md5`・`mtime` が NULL なら空）。
   API の `thumb_url` は `/thumb/<id>.jpg?v=<gen>`。
-- 処理: (1) DB で `display`・`drive_id`・`md5`・`mtime` を引く（`thumb_for` と同じ規則で元ファイルを決める。無ければ 404）。
-  (2) `thumbs/<id>-<gen>.jpg` があれば `file_response`。(3) 無ければ `Semaphore(2)` を取り（待つ）、取った後にもう一度 (2)。
-  `spawn_blocking` で `make_thumbnail(元, tmp/thumb-<id>-<gen>.jpg, 320)` → rename。同じ `<id>-` で始まる古いファイルを消す。
-  (4) 生成に失敗（読めない画像・`thumbs/` に書けない）したら、元の表示用画像を `file_response` で返す（`Content-Type` は
-  拡張子から。`Cache-Control` は `no-store`）。失敗した `<id>-<gen>` は `AppState` の `thumb_failed: Mutex<HashSet<String>>`
-  に覚え、起動中は Semaphore を取らずにすぐ代わりを返す（壊れた画像が 2 つの枠を塞ぎ続けないため）。ログは失敗の初回に
-  1 行（WARN、ID と理由だけ。パスは出さない）。
-- 応答ヘッダ: `Content-Type: image/jpeg`、`ETag`・`Last-Modified`（`file_response` のまま）、
-  `Cache-Control: private, max-age=604800`（URL に世代があるので長くてよい）。
-- 元ファイルの検査は `serve_data` と同じ（`canonicalize` してデータディレクトリの中であること）。パスは DB の `display` と
-  `derivatives/<drive_id>.jpg` からだけ作る。
-- 定数: `THUMB_PX = 320`、`THUMB_QUALITY = 80`、`THUMB_CONCURRENCY = 2`。
+- 処理:
+  1. DB で `display`・`drive_id`・`md5`・`mtime` を引く（`thumb_for` と同じ規則で元ファイルを決める。無ければ 404。
+     この 404 は失敗として覚えない）。元ファイルは `derivatives/` か `photos/` の**領域**の中でなければならない
+     （`serve_data` と同じく領域のディレクトリとファイルの両方を `canonicalize` し、領域の外に出るリンクは 403、通常の
+     ファイル以外は 404。`statics.rs:312-345` の検査を関数に切り出して共有する）。
+  2. `thumbs/<id>-<gen>.jpg` があれば返す（`thumbs/` も領域として同じ検査）。
+  3. 失敗の記憶 `thumb_failed`（下記）に `<id>-<gen>` があれば 5 へ。
+  4. **写真 ID ごとのロック**（`AppState.thumb_locks: Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>`。使い終わった項目は
+     消す）を取り、取った後に 2 と 3 をもう一度見る（待っているあいだに他の要求が作った・失敗した）。次に `Semaphore(2)` を
+     取り、`spawn_blocking` で `make_thumbnail(元, 320)` → `derivative.rs:951` の `write_atomic(thumbs/<id>-<gen>.jpg, bytes)`
+     （tmp に書いて rename。既存）。成功したら、同じ `<id>-` で始まり今の `<gen>` でないファイルを消す（ID ごとのロックの
+     中なので、別の世代の生成と競合しない）。
+  5. 生成に失敗（復号できない・大きすぎる・`thumbs/` に書けない）したら、元ファイルが拡張子で画像（jpg/jpeg/png/webp/gif）
+     と分かるときだけ元ファイルを返し（`Content-Type` は拡張子から、`Cache-Control: no-store`）、そうでなければ 404。
+     失敗した `<id>-<gen>` は `thumb_failed: Mutex<HashSet<String>>` に覚え（上限 4,096 件。超えたら全部忘れる）、起動中は
+     Semaphore を取らずにすぐ 5 を返す。ログは失敗の初回に 1 行（WARN、ID と理由の種類だけ。パスは出さない）。
+- 応答ヘッダ（キャッシュから返すとき）: `Content-Type: image/jpeg`、`Content-Length`、`Last-Modified`、
+  `ETag: "<gen>"`（`thumb.rs` が付ける。`serve_data` のデータ画像は今までどおり ETag 無し）、`If-None-Match` が一致すれば 304、
+  `Cache-Control: private, max-age=604800`（URL に世代があるので長くてよい）。`file_response`（`statics.rs:170`。非公開の
+  応答の組み立て）は `pub(crate)` にして使う。
+- パスは DB の `display` と `derivatives/<drive_id>.jpg`、`thumbs/<id>-<gen>.jpg` からだけ作る。クライアントの文字列は
+  `<id>`（数字）以外使わない。
+- 定数: `THUMB_PX = 320`、`THUMB_QUALITY = 80`、`THUMB_CONCURRENCY = 2`、`THUMB_FAILED_MAX = 4096`。復号の上限は既存の
+  derivative の作成と同じ（`imaging` の画素数の上限をそのまま使う）。
 
 ### `GET /api/admin/library/trips`（新。PR ②）
 
@@ -299,40 +329,74 @@ cs = {
 ```sql
 CREATE TABLE IF NOT EXISTS photo_curation(
   photo_id INTEGER PRIMARY KEY,
-  content_sha256 TEXT NOT NULL,                 -- 記録したときの写真の内容（photo_quality.content_sha256）
+  display TEXT NOT NULL,                        -- 記録したときの写真の世代（photo_quality の同名の列と同じ意味）
+  source_md5 TEXT,
+  source_mtime REAL,
+  content_sha256 TEXT NOT NULL,                 -- 記録したときの表示用画像の内容（photo_quality.content_sha256）
   role TEXT NOT NULL CHECK(role IN ('representative','reviewed')),
   decided_at TEXT NOT NULL                      -- 'YYYY-MM-DD HH:MM:SS'（UTC）
 );
 ```
 
-- 有効な記録 = `photo_quality q`（世代の合う行）と `photo_id` と `content_sha256` が一致する行。
-- グループ G（`q.group_kind, q.group_id`）について:
+- 世代の鍵は 4 つ全部（Sol の指摘 1。`content_sha256` は表示用画像のバイト列の SHA なので、原本の `md5`・`mtime` だけが
+  変わっても同じになり得る）。**有効な記録** = `photo_quality q`（`photos` と世代の合う行）と `photo_id`・`display`・
+  `source_md5`・`source_mtime`・`content_sha256` がすべて一致する行。それ以外の記録は **stale**。
+- グループ G（`q.group_kind, q.group_id`。`photos` と世代の合う `photo_quality` の行で、2 枚以上のもの）について:
   - `picks(G)` = 有効な `representative` のメンバー。
   - 有効な推奨 `eff(p)` = `picks(G)` が空でなければ `p ∈ picks(G)`、空なら `q.recommended=1`。
-  - 状態: 全メンバーに有効な記録がある → `confirmed`。記録が 1 つも無い → `unconfirmed`。一部にだけある（新しい写真が
-    加わった、世代が変わった）→ `recheck`。
-- SQL 片（`curation.rs`）:
+  - 状態（Sol の指摘 2。「記録がある」は stale を含む）:
+
+    | メンバーの記録 | 状態 |
+    |---|---|
+    | 1 枚も記録が無い | `unconfirmed` |
+    | 全メンバーに有効な記録がある | `confirmed` |
+    | それ以外（記録の無いメンバーがいる＝写真が加わった、stale のメンバーがいる＝写真が変わった、全員 stale＝再構築で内容が変わった） | `recheck` |
+
+  - 過渡期: 回転・原本の更新の直後は、その写真の `photo_quality` 行が世代違いになり、再解析（`quality` の段）と再構築まで
+    グループから外れる。残りが 1 枚ならグループはいったん消え、再構築後に新しい SHA で戻ってきて、古い記録が stale なので
+    `recheck` になる。残りが 2 枚以上なら、そのあいだ残りだけで `confirmed` に見えることがある（数分〜次の同期まで）。
+    設計上の限界として文書に書く。
+- SQL 片（`curation.rs`）。`gp` は有効な代表の有無だけが要るので `EXISTS` で書く:
 
 ```sql
--- CURATION_JOIN（QUALITY_JOIN の後ろに付ける）
-LEFT JOIN photo_curation c ON c.photo_id=q.photo_id AND c.content_sha256=q.content_sha256
-LEFT JOIN (SELECT q2.group_kind, q2.group_id, COUNT(*) AS picks
-             FROM photo_quality q2 JOIN photos p2 ON p2.id=q2.photo_id AND p2.display=q2.display
-              AND p2.md5 IS q2.source_md5 AND p2.mtime IS q2.source_mtime
-             JOIN photo_curation c2 ON c2.photo_id=q2.photo_id AND c2.content_sha256=q2.content_sha256
-            WHERE c2.role='representative'
-            GROUP BY q2.group_kind, q2.group_id) gp
-       ON gp.group_kind=q.group_kind AND gp.group_id=q.group_id
+-- CURATION_JOIN（QUALITY_JOIN の後ろに付ける。c は有効な記録だけ）
+LEFT JOIN photo_curation c ON c.photo_id=q.photo_id AND c.display=q.display
+  AND c.source_md5 IS q.source_md5 AND c.source_mtime IS q.source_mtime AND c.content_sha256=q.content_sha256
+-- GROUP_HAS_PICK（有効な代表がグループにあるか）
+EXISTS (SELECT 1 FROM photo_quality q2
+          JOIN photos p2 ON p2.id=q2.photo_id AND p2.display=q2.display
+           AND p2.md5 IS q2.source_md5 AND p2.mtime IS q2.source_mtime
+          JOIN photo_curation c2 ON c2.photo_id=q2.photo_id AND c2.display=q2.display
+           AND c2.source_md5 IS q2.source_md5 AND c2.source_mtime IS q2.source_mtime
+           AND c2.content_sha256=q2.content_sha256 AND c2.role='representative'
+         WHERE q2.group_kind=q.group_kind AND q2.group_id=q.group_id)
 -- EFFECTIVE_RECOMMENDED
 CASE WHEN q.group_id IS NULL THEN 0
-     WHEN COALESCE(gp.picks,0)>0 THEN COALESCE(c.role='representative',0)
+     WHEN <GROUP_HAS_PICK> THEN COALESCE(c.role='representative',0)
      ELSE q.recommended END
 -- QUALITY_VISIBLE_EFFECTIVE
 (q.group_kind IS NULL OR q.group_kind!='exact' OR <EFFECTIVE_RECOMMENDED>=1)
 ```
 
+- 境界の期待値（試験で固定する。Sol の指摘 16）:
+
+  | 場面 | `effective` | 状態 |
+  |---|---|---|
+  | similar の中に同じ SHA の 2 枚があり、片方だけ代表に選んだ | 選んだ写真だけ `true`（写真 ID 単位） | `confirmed` |
+  | 完全重複（exact）で 2 枚を代表に選んだ | 2 枚とも `true`（フィードに 2 枚出る） | `confirmed` |
+  | 代表が stale（回転した）、他は `reviewed` のまま | 有効な代表が無いので解析の推奨 | `recheck` |
+  | 古い世代の `representative` 行だけ残り、再構築で同じ組に戻った | 解析の推奨 | `recheck` |
+  | `reviewed` だけ（`representatives: null` で確認） | 解析の推奨 | `confirmed` |
+
+- 性能: 実装時に合成 6,500 行で `EXPLAIN QUERY PLAN` と時間を測る（`idx_photo_quality_group` が `(group_kind, group_id)` に
+  ある）。読み取り接続は `PRAGMA query_only`（`db.rs:228`）なので一時表は使えない。遅ければ `GROUP_HAS_PICK` を
+  `list_photos` の前に 1 回だけ引いた `(group_kind, group_id)` の集合に置き換える（Rust 側で判定）。
 - 表が無いとき（`available(conn)=false`）は従来の SQL 片をそのまま使う。`Catalog::read` の接続ごとに `available` を
   1 回引く（`sqlite_master` の 1 行）。書き込み側は起動時に `ensure_tables`（`ai.rs` の AI 表と同じ場所）。
+- 旧 AI 選別（`selection.rs`）: `VALID_MEMBERS` の `shown`（`selection.rs:27-40`）が `mq.recommended=1` を見ているので、
+  `EFFECTIVE_RECOMMENDED` に置き換える（同じ `curation.rs` の SQL 片を `mq` に当てる）。`ai_visible()` は、写真に有効な
+  `representative` の記録があれば `favorite` と同じく抑止しない（人の代表が旧 AI の非推薦でも消えない）。
+  合成ケース「品質の組と旧 AI の組が重なり、人の代表が旧 AI の非推薦」を `tests/legacy_selection.rs` に足す。
 
 ### `GET /api/admin/curation/groups`（新。PR ③）
 
@@ -342,7 +406,8 @@ CASE WHEN q.group_id IS NULL THEN 0
 
 ```json
 {"ok": true, "page": 1, "per": 20, "pages": 3, "total": 41,
- "groups": [{"kind": "similar", "group_id": 17, "state": "recheck", "taken_at": "2024-05-03 09:12", "count": 3,
+ "groups": [{"kind": "similar", "group_id": 17, "token": "3f9c…", "state": "recheck", "taken_at": "2024-05-03 09:12",
+   "count": 3, "warning": null,
    "members": [{"id": 101, "name": "IMG_0001.jpg", "thumb": "/derivatives/…", "thumb_url": "/thumb/101.jpg?v=…",
                 "taken_at": "2024-05-03 09:12", "place": "…", "pref": "…", "city": "…", "lat": 35.0, "lon": 135.7,
                 "favorite": false, "hidden": false, "rotation": 0, "source": "drive",
@@ -350,27 +415,35 @@ CASE WHEN q.group_id IS NULL THEN 0
                 "recommended": true, "effective": true, "curation": "representative" | "reviewed" | "stale" | null}]}]}
 ```
 
+- `token` = メンバーを `photo_id` 昇順に並べた `"<photo_id>:<content_sha256>"` を改行でつないだ文字列の SHA-256 の先頭
+  16 hex。`confirm`・`reset` が「画面が見た組と今の組が同じか」を確かめるのに使う（全 ID を送らないので枚数の上限が
+  無い。Sol の指摘 4）。
+- `warning`: 有効な推奨（`effective`）の写真がすべて除外か位置なしなら `"representative_not_visible"`（exact の組なら
+  フィードから消えている）。それ以外は `null`。
 - グループの並び: `taken_at`（グループの最小）の降順、`group_kind`、`group_id`。世代の合わない `photo_quality` の行と
-  1 枚しか有効でないグループは出さない。`curation: "stale"` は記録はあるが `content_sha256` が合わないメンバー。
+  1 枚しか有効でないグループは出さない。`curation: "stale"` は記録はあるが世代が合わないメンバー。
 
 ### `POST /api/admin/curation/confirm`（新。PR ③）
 
-- 本文: `{"photo_ids": [int…], "representatives": [int…] | null}`。`photo_ids` は 2〜200 件、重複なし。`representatives` は
-  `photo_ids` の部分集合で 1 件以上、または `null`（人の代表を持たず、解析の推奨のまま確認済み）。
+- 本文: `{"kind": "exact"|"similar", "group_id": int, "token": "<16 hex>", "representatives": [int…] | null}`。
+  `representatives` は 1〜50 件、重複なし、または `null`（人の代表を持たず、解析の推奨のまま確認済み）。
   画面の「このままで確認済み」は、段に有効な人の代表があればそれを `representatives` に入れて送る（黙って解析の推奨に
   戻さない）。
+- 検査（1 トランザクション、`writer`。`BEGIN IMMEDIATE`）: `(kind, group_id)` の世代の合うメンバーを引き、2 枚以上あり、
+  その `token` が本文と一致すること。違えば 409 `{"ok": false, "error": "group_changed"}`（組が消えた・組み替わった・
+  メンバーの内容が変わった、をまとめて扱う）。`representatives` はメンバーの部分集合であること（違えば 400 `bad_params`）。
 - 代表の検査: `representatives` の各写真は `hidden=0` かつ `lat`・`lon` がある（フィードに出せる）こと。違えば 400
   `{"ok": false, "error": "representative_not_visible"}`。画面は除外・位置なしのメンバーのチェックボックスを無効にする。
-- 検査（1 トランザクション、`writer`）: `photo_ids` の全部が世代の合う `photo_quality` に居て、同じ `(group_kind, group_id)`
-  で、そのグループのメンバーが `photo_ids` と過不足なく一致する。違えば 409 `{"ok": false, "error": "group_changed"}`。
-- 書き込み: `DELETE FROM photo_curation WHERE photo_id IN (…)` → 各メンバーに `role`（代表なら `representative`、他は
-  `reviewed`）と `content_sha256`・`decided_at` を INSERT。
+- 書き込み（同じトランザクション）: `DELETE FROM photo_curation WHERE photo_id IN (<メンバー>)` → 各メンバーに `role`
+  （代表なら `representative`、他は `reviewed`）と世代の 4 列・`decided_at` を INSERT。
 - 応答: `{ok: true, group: <groups と同じ 1 組>}`。
-- 失敗: 本文の形が違えば 400 `bad_params`、`INGEST=0` は 503、CSRF は 403（既存）。
+- 失敗: 本文の形が違えば 400 `bad_params`、`INGEST=0` は 503、CSRF は 403（既存）。エラーの本文は `error` の符号だけで、
+  SQL やパスを含めない。
 
 ### `POST /api/admin/curation/reset`（新。PR ③）
 
-- 本文: `{"photo_ids": [int…]}`（同じ検査）。`DELETE` だけ。応答は `confirm` と同じ。
+- 本文: `{"kind", "group_id", "token"}`（同じ検査。`token` が合わなければ 409）。メンバーの `photo_curation` 行を `DELETE`
+  するだけ（stale の行も消す）。応答は `confirm` と同じ。
 
 ### `GET /api/admin/status` の変更（PR ③）
 
@@ -383,14 +456,16 @@ CASE WHEN q.group_id IS NULL THEN 0
 - `quality_recommended` と `quality_role`、exact の除外条件を `EFFECTIVE_RECOMMENDED` で計算する。人の記録が無い DB では
   値も不変。契約の文書と `photo-feed.schema.json`（`description` だけ）の `quality_recommended` に「管理画面で人が代表に
   選んだ写真があるグループでは、その写真だけが `true`（解析の推奨は使わない）」を足す。型・`required` は変えない。
+- 旧 AI 選別との関係は「`photo_curation` 表」の節のとおり（`shown` に有効な推奨、人の代表は抑止を免れる）。
 - 人の代表は `confirm` で「出せる写真」に限っているが、確定後に除外・位置の削除で出せなくなることはある。そのときは
   解析の推奨と同じく、exact グループが一覧から消える（今の挙動と同じ穴。選別タブで `recheck` にはならないので、
   リスクの表に書く）。
 
 ## データ
 
-- `thumbs/`（データディレクトリ直下。`datadir.rs` に項目を足す）。1 枚 15〜30 KB、6,500 枚で 200 MB 弱。古い世代は
-  再生成時に消す。消しても次の要求で作り直せる（バックアップの対象外。`backup-catalog.sh` は触らない）。
+- `thumbs/`（データディレクトリ直下。`datadir.rs` に項目を足し、`webpath.rs` の `Area` に `Thumbs` を足して `serve_data` と
+  同じ領域の検査を受ける）。1 枚 15〜30 KB、6,500 枚で 200 MB 弱。古い世代は再生成時に消す。消しても次の要求で
+  作り直せる（バックアップの対象外。`backup-catalog.sh` は触らない）。
 - `photo_curation`: 書き込み側（`serve` の writer）が起動時に作る。移行は無い。`INGEST=0` の読み取り専用の DB では
   作らず、読む側が無いものとして動く。
 - 旅・集計は毎回 SQL から計算する（6,500 行で 10 ms 台。キャッシュは作らない）。
@@ -404,22 +479,26 @@ CASE WHEN q.group_id IS NULL THEN 0
 - 権限: 認証は無い（LAN 内、ADR 0008）。新しい API が出す情報（撮影地の座標・地名・サムネイル）は既存の
   `/api/admin/photos` と `/derivatives/` が既に出しているものと同じ範囲。`points` は全写真の座標を 1 回で返すが、
   `/api/admin/photos?per=200` を回せば同じものが取れるので、露出の範囲は変わらない。
-- ファイル: サムネイルの読み元はデータディレクトリの中に限り（`canonicalize`）、書き先は `thumbs/` と `tmp/` だけ。
-  ファイル名は `<id>-<gen>.jpg` で固定。
+- ファイル: サムネイルの読み元は `derivatives/`・`photos/` の領域の中に限り（領域とファイルを `canonicalize`、領域の外へ
+  出るリンクは 403、通常のファイル以外は 404。`serve_data` と同じ）、書き先は `thumbs/` だけ（`write_atomic` が同じ
+  ディレクトリに tmp を作って rename）。ファイル名は `<id>-<gen>.jpg` で固定。生成の失敗で元ファイルを返すのは、拡張子で
+  画像と分かるときだけ（`catalog.db` のような画像でないファイルを返さない）。
 - 外部への通信: 無し（地図タイルは既存のプロキシ）。秘密情報は扱わない。ログにパス・座標を出さない。
-- 資源: サムネイルの生成は同時 2 つ、1 枚 50〜150 ms 程度（2,560px の JPEG の復号が主）。初回の旅の一覧で 60 枚なら
-  数秒で埋まる。`spawn_blocking` なので待ち受けは止まらない。
+- 資源: サムネイルの生成は同時 2 つ、同じ写真は ID ごとのロックで 1 つ、1 枚 50〜150 ms 程度（2,560px の JPEG の復号が主）。
+  初回の旅の一覧で 60 枚なら数秒で埋まる。`spawn_blocking` なので待ち受けは止まらない。復号の画素数の上限は derivative の
+  作成と同じ値を使い、超えるものは失敗として覚える。`confirm`・`reset` は 1 トランザクションで検査と書き込みを行い、
+  `token` で画面が見た組との一致を確かめるので、再構築や別のタブの確定と競合しても古い判断で上書きしない。
 
 ## テスト計画
 
 | AC | 試験 | 置き場 |
 |---|---|---|
-| AC1 | 合成 JPEG（`image` crate で 1200×800 を作る）を `derivatives/` に置き、`/thumb/<id>.jpg` の 200・寸法・2 回目の ETag・`mtime` 変更後の再生成・404/403 の各ケース。`/derivatives/` のヘッダ不変は既存試験 | `tests/thumb.rs`（新） |
-| AC2 | `admin-api-catalog.sql` の写真で `trips` の境界がフィードの `trip` と一致。描画試験で旅 → 格子 → ビューア → ★ → タイル更新 | `tests/library_api.rs`（新）、`web/tests/library_render.mjs`（新）＋ `tests/admin_ui_library.rs` |
-| AC3 | `points` の位置なし除外・`from`/`to`・`truncated`（`POINTS_MAX` を試験用に小さくできる `#[cfg(test)]` の定数か、合成 DB に上限超の行）。`bbox` の絞り込み。描画試験で偽 MapLibre の `setData` と `bbox` 要求 | 同上 |
-| AC4 | exact 1 組・similar 2 組（`photo_quality`・`photo_quality_features` を SQL で投入）に `confirm` → `groups`・`/api/v1/photos`・`photo_quality` の入れ直し後も保持。`reviewed` のみ・`reset` | `tests/curation_api.rs`（新） |
-| AC5 | 確認済みの組に 1 枚足す → `recheck`。`mtime` 変更 → `recheck`・`stale`。集合違いの `confirm` → 409 で表が不変 | 同上 |
-| AC6 | 既存のフィードの試験（契約・endpoint・miharashi）が無変更で通る。`photo_curation` 無しの DB で `list_photos` の SQL が従来と同じ結果（単体） | 既存 ＋ `photos.rs` の単体試験 |
+| AC1 | 合成 JPEG（`image` crate で 1200×800 を作る）を `derivatives/` に置き、`/thumb/<id>.jpg` の 200・寸法・`ETag` の存在と `If-None-Match` の 304・`mtime` 変更後の再生成と古い世代の削除・404（数字でない、無い写真）・403（領域の外へのリンク）・壊れた JPEG で元ファイルを返し 2 回目は復号せず返す（失敗の記憶。生成関数の呼び出し回数を数える）・同じ写真への同時 8 要求で生成が 1 回（ID ごとのロック）。`/derivatives/` のヘッダ不変は既存試験 | `tests/thumb.rs`（新）＋ `thumb.rs` の単体試験 |
+| AC2 | 新しいフィクスチャ `tests/fixtures/library-catalog.sql`（10 分・1 時間 30 分・8 時間・ちょうど 48 時間・9 日の差、位置なし、日時なし、除外を含む）で `trips` の境界・`noloc`・`untimed`・`hidden=1` の差を独立した期待値で検証。描画試験で旅 → 格子 → ビューア → ★ → `POST setflag` の `id` → タイルの印の更新（購読者）。写真タブのカードが変わらないことも見る | `tests/library_api.rs`（新）、`web/tests/library_render.mjs`（新）＋ `tests/admin_ui_library.rs` |
+| AC3 | `points` の位置なし除外・`from`/`to`・`bbox` の絞り込み（結合）。`truncated` は切り詰めの関数（`fn truncate_points(rows, max)`）の単体試験（結合試験のバイナリでは `#[cfg(test)]` の定数が効かないため）。描画試験で偽 MapLibre の `setData`、点を押したときの `ids=` 要求と吹き出し、`bbox` 要求 | 同上 |
+| AC4 | 新しいフィクスチャ `tests/fixtures/curation-catalog.sql`（`admin-api-catalog.sql` は similar 1 組・exact 1 組なので流用しない）: exact 1 組・similar 2 組（1 組は同じ SHA の 2 枚を含む）。`confirm` → `groups`・`/api/v1/photos`・`status` の `db.quality.recommended`・`photo_quality` の入れ直し（`group_id` を変える）後も保持。`reviewed` のみ・`reset`・上の境界の表の 5 行 | `tests/curation_api.rs`（新） |
+| AC5 | 確認済みの組に 1 枚足す → `recheck`。メンバーの `mtime` と `photo_quality` の世代を変える（再解析後を模す）→ `recheck`・`stale`。`token` 違いの `confirm`・`reset` → 409 で表が不変。`representative_not_visible` → 400 で表が不変 | 同上 |
+| AC6 | 既存のフィードの試験（契約・endpoint・miharashi）が無変更で通る。`photo_curation` 無しの DB で `list_photos` の SQL が従来と同じ結果（単体）。旧 AI の組と重なる合成ケース（人の代表が旧 AI の非推薦でも出る） | 既存 ＋ `photos.rs` の単体試験 ＋ `tests/legacy_selection.rs` |
 | AC7 | CSRF 403・`INGEST=0` 503・表の無い DB で各 GET が 200・新しい GET への POST が 403 | `tests/curation_api.rs`・`tests/library_api.rs` |
 | AC8 | `cargo fmt --check`・clippy・`cargo test`。`static_files.rs` の文字列 HTML の禁止が `library.js`・`curation.js` にも効く（`web/static/js` 直下に置く） | CI |
 | AC9 | 年 → 月、都道府県 → 市区町村の描画。`curation_pending` と `groups?state=unconfirmed&per=1` の `total` の一致 | `library_render.mjs`・`tests/curation_api.rs` |
@@ -437,33 +516,46 @@ CASE WHEN q.group_id IS NULL THEN 0
 | `quality-scan` の再構築中（`DELETE` と INSERT の間）に `groups` を読む | 再構築は 1 トランザクションなので途中は見えない（`quality.rs:345-`）。`confirm` は writer のトランザクションで検査するので競合しても 409 になるだけ |
 | サムネイルの初回生成で一覧が遅い | `loading=lazy` と同時 2 つの生成。60 枚/ページ。必要なら後で同期の段に前もって作る処理を足す（C） |
 | `thumbs/` がディスクを圧迫する | 200 MB 弱の見積もりを文書に書く。古い世代は再生成時に消す |
-| `list_photos` の SQL が重くなる（サブクエリの JOIN） | `photo_quality` に `(group_kind, group_id)` の索引が既にある。6,500 行で測って 20 ms を超えるなら `gp` を一時表にする |
-| ビューアの共通化で写真タブの挙動が変わる | 既存の `photos_render.mjs` の (p)(q)(q2) をそのまま通す。`openViewer(index)` の外部の挙動は変えない |
+| `list_photos` の SQL が重くなる（`EXISTS` のサブクエリ） | 実装時に合成 6,500 行で `EXPLAIN QUERY PLAN` と時間を測る。遅ければ代表のある組の集合を先に 1 回引いて Rust 側で判定する（読み取り接続は `query_only` なので一時表は使えない） |
+| ビューアの共通化で写真タブの挙動が変わる | 既存の `photos_render.mjs` の (p)(q)(q2) をそのまま通す。`openModal(index)`・`viewerIndex` の外部の挙動は変えない。別の配列から開いて正しい ID に POST する試験を足す |
+| 回転のあとカードが古いサムネイルを出す | `POST /api/admin/rotate` の応答に `thumb_url` を足し、`applyPhoto` の patch に含める（描画試験に回転後の `src` を足す） |
+| 回転・原本の更新の直後、残りのメンバーだけで `confirmed` に見える | 設計上の限界として文書化。再解析・再構築で `recheck` に戻る |
 | 偽 MapLibre では地図の見た目を検証できない | A と同じく検証環境で目視。描画試験は source に渡るデータと要求の URL を検証する |
 | `tests/admin_api.rs` の完全一致が落ちる | `status` に足す項目は `python_shape` で除く。`/api/admin/photos` は触らない |
 
 ## 実装の順番
 
+PR の依存: ② と ③ は ① のサムネイルを使うが、無くても `thumb_url || thumb` で動く（重いだけ）。③ は ② のビューアの
+共通化（`openModalFor`・`onPhotoChange`）に依存する。戻す順番は A と同じ: ① は ②③ のマージ前なら単独で戻せる。② を戻す
+には ③ を先に戻す（Sol の指摘 9。厳密な独立は保てないので、順番を明記する）。
+
 ### PR ①: サムネイル（R1〜R4、R21）
 
-1. `imaging/derivative.rs` に `make_thumbnail`（`render`/`resize` の再利用。単体試験: 寸法と向き）。
-2. `thumb.rs`: 経路・世代・キャッシュ・Semaphore・フォールバック。`server.rs` に `/thumb/` の分岐。`datadir.rs` に `thumbs/`。
+1. `imaging/derivative.rs` に `make_thumbnail`（`render`/`resize` の再利用。単体試験: 寸法と向き）。`statics.rs` の領域の
+   検査と `file_response` を `pub(crate)` に切り出す。`webpath.rs` の `Area` に `Thumbs`。
+2. `thumb.rs`: 経路・世代・キャッシュ・ID ごとのロック・Semaphore・失敗の記憶・フォールバック・ETag と 304。`server.rs` に
+   `/thumb/` の分岐。`datadir.rs` に `thumbs/`。
 3. `tests/thumb.rs`（AC1）。`docs/architecture/photo-pipeline.md` にサムネイルの節（配信の一覧がある文書）。
-4. （R4）`AdminPhoto`（`admin.rs`）と検索 API の写真に `thumb_url` を足し、`tests/admin_api.rs` の `python_shape` で
-   `hint` と同じく除く。カードの `img.src` を `thumb_url`（無ければ `thumb`）にする。描画試験の合成データに `thumb_url` を
-   足すだけで、カードの DOM と検証内容は変えない。
+4. （R4）`AdminPhoto`（`admin.rs`）・検索 API の写真・`POST /api/admin/rotate` の応答に `thumb_url` を足し、
+   `tests/admin_api.rs` の `python_shape` で `hint` と同じく除く（方針 4「新しい項目は新しい API に」の意図した例外。
+   `python_shape` で除ける項目に限る）。カードの `img.src` を `thumb_url`（無ければ `thumb`）にし、`rotatePhoto` の patch に
+   `thumb_url` を含める。描画試験の合成データに `thumb_url` を足し、回転後の `src` の検証を 1 つ足す。
 
 ### PR ②: ライブラリ（R5〜R8。R9〜R11 は時間があれば）
 
-1. `photos.rs` の `parse_epoch`・`TRIP_GAP_SECONDS` を `pub(crate)`。`admin_library.rs` の 3 本（＋あると良い 2 本）と結合試験。
-2. `photos.js` のビューアの共通化（`openViewerFor`・`onPhotoChange`・`tileStyle()`）。既存の描画試験が通ることを先に確認。
+1. `photos.rs` の `parse_epoch`・`TRIP_GAP_SECONDS` を `pub(crate)`。`admin_library.rs` の 3 本（＋あると良い 2 本）と結合試験
+   （新しいフィクスチャ `library-catalog.sql`）。
+2. `photos.js` のビューアの共通化（`viewerEntries`・`openModalFor`・`onPhotoChange`・`tileStyle()`）。既存の描画試験が通ることを
+   先に確認し、別の配列から開く試験を足す。
 3. `admin.html`・`admin.css`・`library.js`（旅 → 格子 → ビューア、地図）。`admin.js` のタブ登録。
 4. `library_render.mjs` ＋ `fake_maplibre.mjs` ＋ `tests/admin_ui_library.rs`。
 5. 検証環境で地図の目視（クラスタ・吹き出し・範囲の絞り込み）。
 
 ### PR ③: 選別の確認（R12〜R19）
 
-1. `curation.rs`（表・`ensure_tables`・`available`・SQL 片）と `photos.rs` の置き換え。フィードの既存試験が通ることを確認。
-2. `admin_curation.rs`（`groups`・`confirm`・`reset`）、`post.rs`・`server.rs` の登録、`tests/curation_api.rs`（AC4・AC5・AC7）。
+1. `curation.rs`（表・`ensure_tables`・`available`・SQL 片・`token`）と `photos.rs`・`selection.rs`・`admin.rs`
+   （`quality_summary`）の置き換え。フィードと旧選別の既存試験が通ることを確認し、重なる合成ケースを足す。性能の測定。
+2. `admin_curation.rs`（`groups`・`confirm`・`reset`）、`post.rs`・`server.rs` の登録、`tests/curation_api.rs`
+   （AC4・AC5・AC7。新しいフィクスチャ `curation-catalog.sql`）。
 3. `curation.js`・`admin.html`・`admin.css`、状況タブの件数（R18）、`curation_render.mjs` ＋ `tests/admin_ui_curation.rs`。
 4. 契約の文書（R19）、`docs/architecture/photo-pipeline.md` の管理 API の一覧、`docs/admin-library/` の「実装との差」。
