@@ -963,6 +963,90 @@ await test('(n9) 1 組の読み直しを出したあとに確定が成功して�
   assert.ok(sectionOf(env, 'similar', 21), '段は消えない');
 });
 
+await test('(n10) 古い応答扱いの確定の成功でも版が進み、それより前に出した飛んでいる一覧は捨てて取り直す。確認済みの B が一覧に出る', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  const a = deferred(), b = deferred(), held = deferred(), again = deferred(), byId = deferred();
+  const lists = [held, again];
+  const confirmedA = () => grp('exact', 11, 'a1a1a1a1a1a1a1a1', 'confirmed', [
+    mem(601, {rank: 1, recommended: true, effective: true, curation: 'reviewed'}),
+    mem(602, {rank: 2, favorite: true, hidden: true, selectable: false, curation: 'reviewed'})]);
+  env.handlers.confirm = body => body.group_id === 11 ? a.promise : b.promise;
+  env.handlers.groups = params => params.get('ids') ? byId.promise : lists.shift().promise;
+  sections(env)[0].querySelector('.cur-do-keep').click();
+  sections(env)[1].querySelector('.cur-do-keep').click();           // A・B を同じ版で送信
+  await settle();
+  a.resolve(ok200({ok: true, group: confirmedA()}));                // A は直接反映（版が進む）
+  await settle();
+  env.$('#cur-state-confirmed').click();                            // 「確認済み」の一覧（保留。サーバーでは B の確定前）
+  await settle();
+  assert.equal(env.listReqs().filter(c => !c.url.includes('ids=')).length, 2);
+  b.resolve(ok200({ok: true, group: sm1Confirmed()}));              // B は古い応答扱い → 版を進めて B の 1 組を読む
+  await settle();
+  assert.equal(idsReqs(env).length, 1);
+  const n0 = env.listReqs().length;
+  held.resolve(ok200(listBody([confirmedA(), SM2(), SM3()])));      // B を含まない一覧が届く → 古いので捨てて取り直す
+  await settle();
+  assert.equal(env.listReqs().length, n0 + 1, '一覧を取り直す');
+  byId.resolve(ok200(listBody([sm1Confirmed()])));                  // 1 組の応答は一覧の要求に追い越されている → 捨てる
+  await settle();
+  again.resolve(ok200(listBody([confirmedA(), sm1Confirmed(), SM2(), SM3()])));
+  await settle();
+  assert.deepEqual(sections(env).map(x => x.dataset.key), ['exact:11', 'similar:21', 'similar:22', 'similar:23'], 'B が出る');
+  assert.equal(sectionOf(env, 'similar', 21).querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
+  assert.equal(env.ev('cs.busy.size'), 0);
+  assert.equal(env.ev('cs.reloading.size'), 0);
+});
+
+await test('(n11) ページ移動で一覧から消えた段への遅れた確定の成功では、cs.keep に旧鍵を入れない', async () => {
+  const env = makeEnv();
+  env.handlers.groups = params => reply(params.get('page') === '2'
+    ? listBody([EX1()], {page: 2, pages: 2, total: 5}) : listBody(DEFAULT_GROUPS(), {pages: 2, total: 5}));
+  await env.boot();
+  await openCur(env);
+  const post = deferred();
+  env.handlers.confirm = () => post.promise;
+  sections(env)[1].querySelector('.cur-do-keep').click();           // similar:21 を確定（保留）
+  await settle();
+  env.$('#cur-next').click();                                       // ページ移動 → similar:21 は一覧から消える
+  await settle();
+  assert.deepEqual(sections(env).map(x => x.dataset.key), ['exact:11']);
+  post.resolve(ok200({ok: true, group: sm1Confirmed()}));           // 遅れた成功
+  await settle();
+  assert.deepEqual(env.ev('[...cs.keep]'), [], '旧鍵が残らない');
+  assert.deepEqual(sections(env).map(x => x.dataset.key), ['exact:11']);
+  assert.equal(idsReqs(env).length, 0, '段が無いので読み直さない');
+  assert.ok(toastText(env).includes('確認済みにしました'));
+});
+
+await test('(n12) keep の段が読み直しで既存の段と同じ鍵になり重複でまとめられても、方針は残る段へ移る。再読込しても絞り込み不一致で消えない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openCur(env);
+  assert.equal(env.ev('cs.state'), 'unconfirmed');
+  const post = deferred();
+  const sm2Same = () => grp('similar', 22, 'cccccccccccccccc', 'confirmed', [
+    mem(621, {rank: 1, recommended: true, effective: true, curation: 'reviewed'}),
+    mem(622, {rank: 2, curation: 'reviewed'})], {taken_at: '2030-05-01 07:00'});
+  env.handlers.confirm = () => post.promise;
+  env.handlers.groups = params => params.get('ids') === '611' ? reply(listBody([sm2Same()]))
+    : params.get('ids') === '621' ? reply(listBody([sm2Same()])) : null;
+  sections(env)[1].querySelector('.cur-do-keep').click();           // similar:21 を確定
+  await settle();
+  post.resolve(ok200({ok: true, group: sm1Confirmed()}));
+  await settle();
+  assert.deepEqual(env.ev('[...cs.keep]'), ['similar:21']);
+  env.context.applyPhoto(612, {favorite: false, hidden: true});     // 読み直し → similar:22 の組が返る（既存の段と重複）
+  await settle();
+  assert.deepEqual(sections(env).map(x => x.dataset.key), ['exact:11', 'similar:22', 'similar:23']);
+  assert.deepEqual(env.ev('[...cs.keep]'), ['similar:22'], '方針が残る段へ移る');
+  env.context.applyPhoto(622, {favorite: false, hidden: true});     // 残った段を再読込（確認済みは未確認の絞り込みに合わない）
+  await settle();
+  assert.equal(idsReqs(env).filter(c => c.url.includes('ids=621')).length, 1);
+  assert.ok(sectionOf(env, 'similar', 22), '消えない');
+});
+
 await test('(o) 一覧の読み込み失敗はトーストで知らせ、一覧は前のまま', async () => {
   const env = makeEnv();
   await env.boot();

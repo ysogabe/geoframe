@@ -14,16 +14,19 @@
    groups: 今のページの組（members は normalizePhoto を通した写真 + rank・score・… をそのまま持つ）。
    picks: 段ごとの選択（確定前）Map<groupKey, Set<photoId>>。busy: 確定・取り消しの送信中の段（多重送信を防ぐ）。
    nodes: 段の要素 Map<groupKey, section>。reloading: 1 組の読み直しが飛んでいる段。
-   応答の順序は 1 つの規則で守る。ver（表示の版）は画面の段を変えるたび（一覧の反映・段の置き換え・段の削除・確定の直接反映）に進める。
+   応答の順序は 1 つの規則で守る。ver（表示の版）は画面の段を変えるたび（一覧の反映・段の置き換え・段の削除・確定の直接反映）と、
+   書き込み（確定・取り消しの POST）の成功のたび（直接反映しない古い応答でも。古さの判定は進める前の版で行う）に進める。
    要求を出しただけでは進めない。すべての要求（一覧の GET・1 組の GET・確定・取り消しの POST）は発行時の ver を控え、
    応答のときに ver が違えば古いものとして扱う（発行後に画面が変わっていなければ、そのまま反映する）:
      一覧の GET → 捨てて一覧を取り直す。1 組の GET → 捨てて、その段が今の一覧に残っていれば読み直す。
-     POST → 段を置き換えず、成功のトーストだけ出して、段が残っていれば読み直す。
+     POST → 段を置き換えず、成功のトーストだけ出して、段が残っていれば読み直す（成功で版を進めるので、成功より前に出した
+     飛んでいる一覧・1 組の GET は、サーバーの確定前の値かもしれないとして捨てられ、取り直される）。
    取り直しは「変化のあと」に出すので、変化が止まれば収束する。
    seq: 一覧の要求番号（新しい一覧の要求に追い越された応答を捨てる）。gseq: 段ごとの要求番号（同じ段の新しい読み直し・確定に
    追い越された応答を捨てる。確定の応答は番号を進め、飛んでいる読み直し（reloading）も無効にする）。
-   keep: 絞り込みに合わなくても残す段 Set<groupKey>。確定・取り消しの成功で入れ（直接の反映でも古い応答でも）、
-   一覧の反映・段を外したときに消す。読み直しが★・除外の変更から出ても、keep の段は絞り込み不一致で消さない */
+   keep: 絞り込みに合わなくても残す段 Set<groupKey>。確定・取り消しの成功で、その段が今の一覧にあるときだけ入れ
+   （直接の反映でも古い応答でも。ページ移動などで一覧から消えた段は入れない）、一覧の反映・段を外したときに消す。
+   鍵が変わる・重複でまとめられるときは、残る段へ引き継ぐ。読み直しが★・除外の変更から出ても、keep の段は絞り込み不一致で消さない */
 const cs = {
   state: 'unconfirmed', kind: 'all',
   page: 1, pages: 1, per: 20, total: 0, groups: [],
@@ -229,9 +232,9 @@ function curReplace(oldKey, fresh, keepPicks){
   cs.ver++;
   const old = cs.nodes.get(oldKey);
   cs.nodes.delete(oldKey);
+  if(cs.keep.delete(oldKey)) cs.keep.add(curKey(fresh));   // 組の鍵が変わっても、重複でまとめられても、残す方針は残る段へ引き継ぐ
   const dup = cs.groups.findIndex((g, j) => j !== i && curKey(g) === curKey(fresh));
   if(dup >= 0){ curRemoveAt(i, old); return; }      // 読み直したら別の段と同じ組だった（組み替わり）→ 重複させない
-  if(cs.keep.delete(oldKey)) cs.keep.add(curKey(fresh));   // 組の鍵が変わっても、残す方針は引き継ぐ
   cs.groups[i] = fresh;
   const section = curSection(fresh);
   cs.nodes.set(curKey(fresh), section);
@@ -266,19 +269,19 @@ function curSubmit(group, path, body, doneText){
   curPost(path, body).then(d => {
     cs.busy.delete(key);
     /* 送ってから画面が変わっていたり（別の確定・一覧・読み直しの反映）、この段が読み直されていたら、応答の組は古いかもしれない
-       → 置き換えない */
+       → 置き換えない（古さは進める前の版で判定する） */
     const stale = ver !== cs.ver || gseq !== (cs.gseq.get(key) || 0);
     cs.gseq.set(key, (cs.gseq.get(key) || 0) + 1);       // 飛んでいる読み直しの応答は、この確定より古い
     cs.reloading.delete(key);                             // その読み直しは無効になった（古い応答では後始末されない）
+    const current = cs.groups.find(g => curKey(g) === key);
+    if(current) cs.keep.add(key);                         // 確定した段は絞り込みに合わなくても残す。一覧から消えた段は入れない
     if(d.group && !stale){
-      cs.keep.add(key);                                   // 確定した段は絞り込みに合わなくても残す（鍵が変われば curReplace が引き継ぐ）
-      curReplace(key, curGroup(d.group), false);
+      curReplace(key, curGroup(d.group), false);          // 版は curReplace が進める（鍵が変われば keep も引き継ぐ）
       toast(doneText);
     }else{
+      cs.ver++;                                           // 書き込みは成功した。飛んでいる一覧・1 組の GET はこの前の値かもしれない
       if(d.group) toast(doneText);
-      cs.keep.add(key);
       curRepaintActions(group);
-      const current = cs.groups.find(g => curKey(g) === key);
       if(current) curReload(current, false);              // 今の一覧に段が残っているときだけ読み直す
     }
   }).catch(e => {
