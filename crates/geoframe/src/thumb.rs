@@ -20,9 +20,10 @@
 //! # 資源
 //!
 //! 写真 ID ごとのロック（同じ写真は 1 つだけ作る）→ 生成の枠 [`THUMB_CONCURRENCY`]。ロックと枠を合わせて待ちは
-//! 最長 [`THUMB_WAIT_MAX`]・待つ数は最大 [`THUMB_QUEUE_MAX`]、超えたら 503。取ったロックと枠は
-//! `spawn_blocking` のクロージャへ move し、生成・書き込み・古い世代の掃除・失敗の記憶が終わるまで持つ
-//! （要求が drop されても、同じ ID の次の要求が先に始まらず、復号が枠を超えて走らない）。
+//! 最長 [`THUMB_WAIT_MAX`]・待つ数は最大 [`THUMB_QUEUE_MAX`]、超えたら 503。枠を取った後と生成の
+//! 直前にも書き込みの停止を確かめる。取ったロックと枠は、`tokio::spawn` した所有タスクが、生成・書き込み・
+//! 今の世代の引き直し・古い世代の掃除・失敗の記憶が終わるまで持つ（要求が drop されても、同じ ID の次の要求が
+//! 先に始まらず、復号が枠を超えて走らない。blocking スレッドから非同期の読み取りを待たない）。
 //!
 //! # 失敗
 //!
@@ -34,7 +35,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -42,7 +45,7 @@ use std::time::Duration;
 use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::response::Response;
 use rusqlite::{Connection, OptionalExtension};
-use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedMutexGuard, Semaphore};
 use tokio::time::Instant;
 
 use crate::datadir::{self, DataDir, check_drive_id, relative_parts};
@@ -325,9 +328,13 @@ pub(crate) struct Job {
     pub src: PathBuf,
     /// 解決済みのデータ置き場。
     pub data_root: PathBuf,
-    /// 今の DB の世代（古い世代を消す直前に引き直す）。引けなければ `None`。
-    pub current_gen: Arc<dyn Fn() -> Option<Gen> + Send + Sync>,
+    /// 今の DB の世代（古い世代を消す直前に、非同期側で引き直す）。引けなければ `None`。
+    pub current_gen: CurrentGen,
 }
+
+/// 今の DB の世代を引く関数（呼ぶたびに新しい future を返す）。
+pub(crate) type CurrentGen =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Option<Gen>> + Send>> + Send + Sync>;
 
 /// 失敗の分類（ログと記憶）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -366,7 +373,8 @@ pub(crate) enum Outcome {
 
 impl ThumbState {
     /// 同じ写真を 1 つだけ作る。ID のロック → 再確認（キャッシュ・失敗の記憶・書き込みの停止）→ 生成の枠 →
-    /// `spawn_blocking`。ロックと枠は生成が終わるまで持つ。
+    /// 枠を取った後にもう一度、書き込みの停止を確かめる → 所有タスク。ロックと枠は所有タスクが、
+    /// 生成・世代の引き直し・古い世代の掃除が終わるまで持つ。
     pub(crate) async fn produce(self: &Arc<Self>, job: Job) -> Outcome {
         let key = (job.id, job.generation);
         let Some(ticket) = WaitTicket::reserve(&self.waiting, self.queue_max) else {
@@ -399,37 +407,59 @@ impl ThumbState {
             Ok(Ok(permit)) => permit,
             _ => return Outcome::Busy,
         };
+        // 枠を待っているあいだに、先行の生成が書けなくなったかもしれない
+        if self.write_blocked() {
+            return Outcome::WriteFailed;
+        }
         drop(ticket);
         let this = Arc::clone(self);
-        // 要求の future が捨てられても、始まった生成は（ロックと枠を持ったまま）最後まで走る
-        let task = tokio::task::spawn_blocking(move || this.run(&job, lock, permit));
+        // 要求の future が捨てられても、始まった生成は最後まで走る。ロック（`OwnedMutexGuard`）と枠
+        // （`OwnedSemaphorePermit`）は所有タスクが持ち、掃除が終わってから放す
+        let task = tokio::spawn(async move {
+            let _held = (lock, permit);
+            this.generate_and_sweep(Arc::new(job)).await
+        });
         match task.await {
             Ok(outcome) => outcome,
-            // 生成の中のパニック。覚えず、元の画像を返す
+            // 所有タスクのパニック。覚えず、元の画像を返す
             Err(_) => Outcome::WriteFailed,
         }
     }
 
-    /// `spawn_blocking` の中。`lock` と `permit` は戻るまで持つ。
-    fn run(&self, job: &Job, lock: IdLock, permit: OwnedSemaphorePermit) -> Outcome {
-        let _held = (lock, permit);
+    /// 所有タスクの中。生成と書き込み（blocking）→ 今の世代の引き直し（非同期）→ 古い世代の掃除（blocking）。
+    async fn generate_and_sweep(self: Arc<Self>, job: Arc<Job>) -> Outcome {
+        let (this, blocking_job) = (Arc::clone(&self), Arc::clone(&job));
+        match tokio::task::spawn_blocking(move || this.render_and_write(&blocking_job)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(outcome)) => return outcome,
+            // 生成の中のパニック。覚えず、元の画像を返す
+            Err(_) => return Outcome::WriteFailed,
+        }
+        let current = (job.current_gen)().await;
+        let _ = tokio::task::spawn_blocking(move || sweep_old(&job, current)).await;
+        Outcome::Generated
+    }
+
+    /// `spawn_blocking` の中。書けたら `Ok(())`、そうでなければ返す結果。
+    fn render_and_write(&self, job: &Job) -> Result<(), Outcome> {
+        // blocking pool で順番を待つあいだに、他の生成が書けなくなったかもしれない
+        if self.write_blocked() {
+            return Err(Outcome::WriteFailed);
+        }
         self.renders.fetch_add(1, Ordering::SeqCst);
         let bytes = match (self.renderer)(&job.src) {
             Ok(bytes) => bytes,
-            Err(ImageError::Io(_)) => return Outcome::Unreadable,
+            Err(ImageError::Io(_)) => return Err(Outcome::Unreadable),
             Err(ImageError::FileTooLarge | ImageError::TooManyPixels { .. }) => {
-                return self.remember_failure(job, Fail::Limit);
+                return Err(self.remember_failure(job, Fail::Limit));
             }
-            Err(_) => return self.remember_failure(job, Fail::Decode),
+            Err(_) => return Err(self.remember_failure(job, Fail::Decode)),
         };
         let dest = DataDir::open(&job.data_root)
             .and_then(|data| data.thumb_dest(job.id, &job.generation.hex()));
         match dest {
-            Ok(dest) if write_atomic(&dest, &bytes).is_ok() => {
-                sweep_old(job);
-                Outcome::Generated
-            }
-            _ => self.remember_write_failure(job),
+            Ok(dest) if write_atomic(&dest, &bytes).is_ok() => Ok(()),
+            _ => Err(self.remember_write_failure(job)),
         }
     }
 
@@ -468,9 +498,10 @@ async fn cache_exists(data_root: &Path, id: i64, generation: Gen) -> bool {
 }
 
 /// 古い世代の掃除。`thumbs/` の実体がそのディレクトリ自身であること、通常のファイルであること、名前が
-/// `^<id>-[0-9a-f]{12}\.jpg$` で今の世代でないことを確かめ、消す直前に DB の世代を引き直して**自分の世代が
-/// 今の世代のときだけ**消す（回転の直前に始めた生成が、回転後の世代を消さない）。
-fn sweep_old(job: &Job) {
+/// `^<id>-[0-9a-f]{12}\.jpg$` で今の世代でないことを確かめ、**自分の世代が今の世代のときだけ**消す
+/// （回転の直前に始めた生成が、回転後の世代を消さない）。`current` は生成のあとに非同期側で引き直した
+/// DB の世代（引けなければ `None` で、消さない）。
+fn sweep_old(job: &Job, current_gen: Option<Gen>) {
     let Ok(dir) = DataDir::open(&job.data_root).and_then(|data| data.thumbs_dir()) else {
         return;
     };
@@ -488,7 +519,7 @@ fn sweep_old(job: &Job) {
         .filter(|entry| fs::symlink_metadata(entry.path()).is_ok_and(|meta| meta.is_file()))
         .map(|entry| entry.path())
         .collect();
-    if stale.is_empty() || (job.current_gen)() != Some(job.generation) {
+    if stale.is_empty() || current_gen != Some(job.generation) {
         return;
     }
     for path in stale {
@@ -736,20 +767,22 @@ pub(crate) async fn respond(
     }
 
     let catalog = state.catalog.clone();
-    let handle = tokio::runtime::Handle::current();
     let job = Job {
         id,
         generation,
         src: src.clone(),
         data_root: state.data_root.as_ref().clone(),
-        // 生成のクロージャ（blocking スレッド）の中から呼ぶので、`block_on` で非同期の読み取りを待つ
+        // 所有タスク（非同期側）が、生成のあとに呼ぶ
         current_gen: Arc::new(move || {
             let catalog = catalog.clone();
-            handle
-                .block_on(catalog.read(move |conn| lookup(conn, id)))
-                .ok()
-                .flatten()
-                .map(|row| row.generation())
+            Box::pin(async move {
+                catalog
+                    .read(move |conn| lookup(conn, id))
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|row| row.generation())
+            })
         }),
     };
     match thumbs.produce(job).await {

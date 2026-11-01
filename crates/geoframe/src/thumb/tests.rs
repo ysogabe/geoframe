@@ -19,7 +19,7 @@ fn job_with(root: &Path, id: i64, generation: Gen, current: Option<Gen>) -> Job 
         generation,
         src: root.join("src.jpg"),
         data_root: root.to_path_buf(),
-        current_gen: Arc::new(move || current),
+        current_gen: Arc::new(move || Box::pin(async move { current })),
     }
 }
 
@@ -628,4 +628,43 @@ async fn 消す直前に世代が変わっていたら消さない() {
     fs::remove_file(root.join("thumbs").join(cache_name(1, gen_of(1)))).unwrap();
     assert_eq!(Arc::new(again).produce(unknown).await, Outcome::Generated);
     assert!(old.exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn 枠を待つあいだに書けなくなったら待機者は生成しない() {
+    let tmp = TempDir::new("thumb-write-after-slot");
+    let root = root_of(&tmp);
+    // thumbs/ がリンク: 先行の 2 つは書けずに失敗する
+    let elsewhere = root.join("elsewhere");
+    fs::create_dir(&elsewhere).unwrap();
+    symlink(&elsewhere, root.join("thumbs")).unwrap();
+    let (gate, now, peak) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let state = state_with(gated(&gate, &now, &peak));
+    let spawn_for = |id: i64| {
+        let state = Arc::clone(&state);
+        let j = job(&root, id);
+        tokio::spawn(async move { state.produce(j).await })
+    };
+    let (a, b) = (spawn_for(1), spawn_for(2));
+    until("枠が埋まる", || now.load(Ordering::SeqCst) == 2).await;
+    // 別の ID の要求は、停止の確認を通って枠を待つ
+    let waiter = spawn_for(3);
+    until("3 つ目が枠を待つ", || {
+        state.waiting.load(Ordering::SeqCst) == 1
+    })
+    .await;
+    assert!(!state.write_blocked());
+    gate.store(true, Ordering::SeqCst);
+    for task in [a, b, waiter] {
+        assert_eq!(task.await.unwrap(), Outcome::WriteFailed);
+    }
+    assert_eq!(state.renders(), 2, "待機者は復号も書き込みも始めない");
+    assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+    assert_eq!(state.lock_table_len(), 0);
+    assert_eq!(state.waiting.load(Ordering::SeqCst), 0);
+    assert_eq!(state.slots.available_permits(), THUMB_CONCURRENCY);
 }
