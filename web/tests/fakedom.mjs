@@ -116,6 +116,15 @@ class FakeElement {
     return child;
   }
   remove(){ if(this.parentNode) this.parentNode.removeChild(this); }
+  replaceWith(node){
+    const parent = this.parentNode;
+    if(!parent) return;
+    if(node.parentNode) node.parentNode.removeChild(node);
+    const i = parent.children.indexOf(this);
+    parent.children.splice(i, 1, node);
+    node.parentNode = parent;
+    this.parentNode = null;
+  }
   replaceChildren(...nodes){
     this.children.forEach(c => { c.parentNode = null; });
     this.children = [];
@@ -222,6 +231,7 @@ export function buildAdminDom(){
   mk('button', {cls: 'tab on', text: '▸ 状況', data: {tab: 'status'}}, nav);
   mk('button', {cls: 'tab', text: '▸ 写真', data: {tab: 'photos'}}, nav);
   mk('button', {cls: 'tab', text: '▸ ライブラリ', data: {tab: 'library'}}, nav);
+  mk('button', {cls: 'tab', text: '▸ 選別', data: {tab: 'curation'}}, nav);
   mk('button', {cls: 'tab', text: '▸ 設定', data: {tab: 'config'}}, nav);
 
   const main = mk('main', {}, body);
@@ -302,6 +312,25 @@ export function buildAdminDom(){
   mk('button', {id: 'lib-next', cls: 'btn', text: 'NEXT ▶'}, lgbar);
   mk('div', {id: 'lib-grid'}, lgrid);
   mk('div', {id: 'lib-empty', cls: 'empty hidden', text: '該当する写真がありません'}, lgrid);
+
+  // 選別タブ（admin.html の #v-curation と同じ id）
+  const cur = mk('section', {id: 'v-curation', cls: 'hidden'}, main);
+  const cbar = mk('div', {cls: 'toolbar cur-bar'}, cur);
+  mk('button', {id: 'cur-state-unconfirmed', cls: 'cur-seg on', text: '未確認'}, cbar);
+  mk('button', {id: 'cur-state-confirmed', cls: 'cur-seg', text: '確認済み'}, cbar);
+  mk('button', {id: 'cur-state-all', cls: 'cur-seg', text: 'すべて'}, cbar);
+  mk('span', {cls: 'cur-sep'}, cbar);
+  mk('button', {id: 'cur-kind-all', cls: 'cur-seg on', text: 'すべて'}, cbar);
+  mk('button', {id: 'cur-kind-exact', cls: 'cur-seg', text: 'exact'}, cbar);
+  mk('button', {id: 'cur-kind-similar', cls: 'cur-seg', text: 'similar'}, cbar);
+  mk('span', {cls: 'spacer'}, cbar);
+  mk('span', {id: 'cur-note', cls: 'count'}, cbar);
+  const cpager = mk('div', {id: 'cur-pager', cls: 'toolbar'}, cur);
+  mk('button', {id: 'cur-prev', cls: 'btn', text: '◀ PREV'}, cpager);
+  mk('span', {id: 'cur-pageinfo', cls: 'count', text: '--'}, cpager);
+  mk('button', {id: 'cur-next', cls: 'btn', text: 'NEXT ▶'}, cpager);
+  mk('div', {id: 'cur-groups'}, cur);
+  mk('div', {id: 'cur-empty', cls: 'empty hidden', text: '該当する組がありません'}, cur);
 
   // 設定タブ（admin.html の #v-config と同じ id。.scroll の包みは id が無いので省く）
   const cf = mk('section', {id: 'v-config', cls: 'hidden'}, main);

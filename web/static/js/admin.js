@@ -2,7 +2,7 @@
    admin.js — 管理ページ /admin のフロント（classic script / 依存なし）
    構成: 1) 共通ヘルパ 2) タブ 3) 状況 4) 起動
    写真タブ（一覧・チップ・検索・カード・ビューア・位置指定）は photos.js、ライブラリタブ（旅・格子・地図）は library.js、
-   設定タブ（読み取り専用）は config.js（この順に後から読み込む）。
+   選別タブ（重複・類似グループの代表の確認）は curation.js、設定タブ（読み取り専用）は config.js（この順に後から読み込む）。
    共有はグローバル関数: photos.js・config.js は ここの $ el cell fmtDur toast postJSON showTab を使い、
    admin.js は photos.js の initPhotos openPhotosTab gotoFilter と、config.js の initConfig loadConfig を（呼ぶ時点で解決して）使う。
    読み込んだだけでは location・fetch に触らない。起動は DOMContentLoaded の boot() だけ
@@ -62,12 +62,13 @@ function initialTab(){
   return path === '/ai-search' ? 'photos' : 'status';
 }
 function showTab(name){
-  const tab = (name === 'photos' || name === 'library' || name === 'config') ? name : 'status';
+  const tab = (name === 'photos' || name === 'library' || name === 'curation' || name === 'config') ? name : 'status';
   document.querySelectorAll('nav .tab').forEach(b =>
     b.classList.toggle('on', b.dataset.tab === tab));
   $('#v-status').classList.toggle('hidden', tab !== 'status');
   $('#v-photos').classList.toggle('hidden', tab !== 'photos');
   $('#v-library').classList.toggle('hidden', tab !== 'library');
+  $('#v-curation').classList.toggle('hidden', tab !== 'curation');
   $('#v-config').classList.toggle('hidden', tab !== 'config');
   /* どのタブへ移るときも、開いているビューアと位置モーダルを閉じる（photos.js）。ライブラリなど写真タブ以外から
      開いたビューアも同じ #viewer なので、離れるときに閉じる。写真タブに入るときも一度閉じてから一覧を読む */
@@ -75,6 +76,10 @@ function showTab(name){
   if(tab === 'status'){ loadStatus(); return; }
   if(tab === 'library'){         // library.js: 旅の一覧（初回と開くたび）。地図ビューなら地図の大きさを合わせ直す
     if(typeof openLibraryTab === 'function') openLibraryTab();
+    return;
+  }
+  if(tab === 'curation'){        // curation.js: 開くたびに組を読み直す（絞り込みとページは前のまま）
+    if(typeof openCurationTab === 'function') openCurationTab();
     return;
   }
   if(tab === 'config'){          // config.js: 開くたびに 1 回読む（周期的には読まない）
@@ -325,6 +330,7 @@ function boot(){
     b.addEventListener('click', () => showTab(b.dataset.tab)));
   initPhotos();
   if(typeof initLibrary === 'function') initLibrary();   // library.js: ボタンとビューアの購読を結ぶ（読み込みはしない）
+  if(typeof initCuration === 'function') initCuration(); // curation.js: 同上（選別タブの絞り込み・ページング）
   if(typeof initConfig === 'function') initConfig();     // config.js: 案内文と凡例（読み込みはしない）
   const tab = initialTab();
   showTab(tab);

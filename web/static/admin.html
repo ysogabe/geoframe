@@ -11,11 +11,13 @@
   - geoframe serve（Rust）が / と /admin（旅行ブログが無効のときは /blog-admin も）にこの HTML を返す。
     アセットは絶対パスで参照する
   - 認証なし（家庭内LAN前提）。更新系 POST は Content-Type と Origin で保護する（crates/geoframe/src/csrf.rs）
-  - タブは「状況」「写真」「ライブラリ」「設定」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
+  - タブは「状況」「写真」「ライブラリ」「選別」「設定」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
     （件数は GET /api/admin/status の db.filters）つきのカードの一覧。一覧と検索結果のカードは同じ 1 種類。
     /ai-search も同じ HTML を返す（写真タブを検索欄にフォーカスして開く。別ページは無い）
   - ライブラリタブは写真を旅（新しい順）と地図で眺める。旅 → サムネイルの格子 → 写真タブと同じビューア。
     地図は位置のある写真の点をクラスタで出し、点を押すと吹き出し、「この範囲の写真を見る」で格子へ（library.js）
+  - 選別タブは品質解析の重複・類似グループを 1 組 1 段で出し、人が代表を選んで確認済みにする
+    （GET /api/admin/curation/groups、POST confirm・reset。中身は curation.js が描く）
   - 設定タブは読み取り専用。起動時に読んだ設定の全項目を GET /api/admin/config から、タブを開くたびに読んで表にする
     （案内文・凡例・表の中身は config.js が描く）
   ============================================================
@@ -37,6 +39,7 @@
     <button class="tab on" data-tab="status">▸ 状況</button>
     <button class="tab" data-tab="photos">▸ 写真</button>
     <button class="tab" data-tab="library">▸ ライブラリ</button>
+    <button class="tab" data-tab="curation">▸ 選別</button>
     <button class="tab" data-tab="config">▸ 設定</button>
   </nav>
 </header>
@@ -138,6 +141,28 @@
       <div id="lib-grid"></div>
       <div class="empty hidden" id="lib-empty">該当する写真がありません</div>
     </div>
+  </section>
+
+  <!-- ==== CURATION（品質解析の重複・類似グループの確認。GET /api/admin/curation/groups。段は curation.js が描く） ==== -->
+  <section id="v-curation" class="hidden">
+    <div class="toolbar cur-bar">
+      <button class="cur-seg on" id="cur-state-unconfirmed" type="button">未確認</button>
+      <button class="cur-seg" id="cur-state-confirmed" type="button">確認済み</button>
+      <button class="cur-seg" id="cur-state-all" type="button">すべて</button>
+      <span class="cur-sep"></span>
+      <button class="cur-seg on" id="cur-kind-all" type="button">すべて</button>
+      <button class="cur-seg" id="cur-kind-exact" type="button">exact</button>
+      <button class="cur-seg" id="cur-kind-similar" type="button">similar</button>
+      <span class="spacer"></span>
+      <span class="count" id="cur-note"></span>
+    </div>
+    <div class="toolbar" id="cur-pager">
+      <button class="btn" id="cur-prev" type="button">◀ PREV</button>
+      <span class="count" id="cur-pageinfo">--</span>
+      <button class="btn" id="cur-next" type="button">NEXT ▶</button>
+    </div>
+    <div id="cur-groups"></div>
+    <div class="empty hidden" id="cur-empty">該当する組がありません</div>
   </section>
 
   <!-- ==== CONFIG（読み取り専用。GET /api/admin/config。案内・凡例・表は config.js が描く） ==== -->
@@ -253,6 +278,7 @@
 <script src="/static/js/admin.js"></script>
 <script src="/static/js/photos.js"></script>
 <script src="/static/js/library.js"></script>
+<script src="/static/js/curation.js"></script>
 <script src="/static/js/config.js"></script>
 </body>
 </html>
