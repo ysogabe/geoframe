@@ -879,8 +879,8 @@ await test('(p) 日付: 年の行（件数つき）を押すと月の行が開�
   showBtn(r[2]).click();
   await settle();
   let q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('from'), '2030-12-01 00:00');
-  assert.equal(q.get('to'), '2030-12-31 23:59');
+  assert.equal(q.get('from'), '2030-12-00 00:00');
+  assert.equal(q.get('to'), '2030-12-99 99:99');
   assert.equal(q.get('pref'), null);
   assert.equal(hidden(env, '#lib-grid-box'), false);
   assert.equal(hidden(env, '#lib-calendar'), true);
@@ -895,8 +895,8 @@ await test('(p) 日付: 年の行（件数つき）を押すと月の行が開�
   showBtn(groupRows(env, 'lib-calendar')[3]).click();
   await settle();
   q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('from'), '2029-01-01 00:00');
-  assert.equal(q.get('to'), '2029-12-31 23:59');
+  assert.equal(q.get('from'), '2029-00-00 00:00');
+  assert.equal(q.get('to'), '2029-99-99 99:99');
   assert.equal(env.$('#lib-sel').textContent, '2029年');
   env.$('#lib-back').click();
   // 年の行をもう一度押すと閉じる
@@ -1062,9 +1062,11 @@ await test('(r) 格子のタイルの 📍 で位置の指定が開く（ビュ�
   assert.equal(env.ev('curPhoto.id'), 502);
   assert.equal(env.$('#m-title').textContent, '#502  b.jpg  /  2030-05-03 09:20');
   assert.equal(env.$('#m-save').disabled, true, '地図を押すまで保存できない');
-  // キー操作（Enter）もタイルのビューアに届かない
-  btn.dispatchEvent({type: 'keydown', key: 'Enter', bubbles: true});
-  btn.dispatchEvent({type: 'keydown', key: ' ', bubbles: true});
+  // キー操作（Enter・Space）もタイルのビューアに届かない。Escape は止めない（document まで届いて位置の指定を閉じられる）
+  const kd = key => { const ev = {type: 'keydown', key, bubbles: true}; btn.dispatchEvent(ev); return ev; };
+  assert.equal(kd('Enter').propagationStopped, true);
+  assert.equal(kd(' ').propagationStopped, true);
+  assert.equal(kd('Escape').propagationStopped, undefined, 'Escape は伝播を止めない');
   assert.equal(hidden(env, '#viewer'), true);
   // 地図（位置の指定の地図）を押して保存
   const mini = env.fake.maps.at(-1);
@@ -1081,6 +1083,9 @@ await test('(r) 格子のタイルの 📍 で位置の指定が開く（ビュ�
   assert.equal(hidden(env, '#viewer'), true);
   // ★ など他の印は変わらない（c.jpg は ★ のまま）
   assert.deepEqual(marksOf(t[2]), ['★']);
+  // 別の場所（タイルの子の画像）から送ったクリックなら、バブリングでタイルに届いてビューアが開く
+  t[0].querySelector('img').dispatchEvent({type: 'click', bubbles: true});
+  assert.equal(hidden(env, '#viewer'), false, '画像のクリックはビューアを開く');
 });
 
 console.log(`ok (${n})`);

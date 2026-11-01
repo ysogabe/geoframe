@@ -103,7 +103,7 @@ function tileFor(photo, index){
   loc.title = '位置を指定';
   loc.setAttribute('aria-label', photo.name + 'の位置を指定');
   loc.addEventListener('click', e => { e.stopPropagation(); openLocModal(photo); });
-  loc.addEventListener('keydown', e => { e.stopPropagation(); });
+  loc.addEventListener('keydown', e => { if(e.key === 'Enter' || e.key === ' ') e.stopPropagation(); });  // Escape は document まで届かせる（位置の指定を閉じる）
   tile.appendChild(loc);
   return tile;
 }
@@ -233,9 +233,9 @@ function toggleIn(set, key, render){
   if(set.has(key)) set.delete(key); else set.add(key);
   render();
 }
-/* 年は 1〜12 月の範囲で、月末は 31 でよい（サーバーは from/to を形だけ見て文字列で比べる） */
-function yearRange(year){ return {from: year + '-01-01 00:00', to: year + '-12-31 23:59'}; }
-function monthRange(year, month){ return {from: year + '-' + month + '-01 00:00', to: year + '-' + month + '-31 23:59'}; }
+/* calendar は形（桁）だけで数えるので、月 13 や 31 日 24 時台のような暦に無い値もその年・月に入る。格子の範囲も 00〜99 で形いっぱいに取る（サーバーは from/to を形だけ見て文字列で比べる） */
+function yearRange(year){ return {from: year + '-00-00 00:00', to: year + '-99-99 99:99'}; }
+function monthRange(year, month){ return {from: year + '-' + month + '-00 00:00', to: year + '-' + month + '-99 99:99'}; }
 function renderCalendar(){
   const box = $('#lib-calendar');
   box.textContent = '';

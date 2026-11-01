@@ -1048,6 +1048,33 @@ async fn calendar_shows_unreadable_dates_as_they_are_and_skips_misshapen_ones() 
     );
 }
 
+/// 暦として読めない月末の行（`calendar` は 03 月に数えるので、月の格子の範囲にも入らなければならない）。
+const LATE_BROKEN_TIME: &str = "
+INSERT INTO photos(id, source, drive_id, path, display, name, md5, mtime, taken_at, lat, lon, loc_source,
+                   place, pref, city, favorite, hidden, rotation) VALUES
+  (29, 'local', NULL, 'local/l29.jpg', 'derivatives/l29.jpg', 'IMG_L29.jpg', 'md5-l29', 290.0, '2025-03-31 24:30', 36.0, 140.0, 'exif', '試験区', '架空県', '試験市', 0, 0, 0);
+";
+
+#[tokio::test]
+async fn calendar_month_counts_match_the_grid_range_even_for_unreadable_dates() {
+    let server = Server::start_with(&[], &format!("{BROKEN_TIMES}{LATE_BROKEN_TIME}")).await;
+    let cal = server.ok("/api/admin/library/calendar").await;
+    let march = months_of(&cal, "2025")
+        .into_iter()
+        .find(|(month, _)| month == "03")
+        .unwrap()
+        .1;
+    let grid = server
+        .ok("/api/admin/library/photos?from=2025-03-00%2000%3A00&to=2025-03-99%2099%3A99&per=200")
+        .await;
+    assert_eq!(grid["total"], march);
+    assert!(ids(&grid).contains(&29), "31 日 24 時台の行も入る");
+    let year = server
+        .ok("/api/admin/library/photos?from=2025-00-00%2000%3A00&to=2025-99-99%2099%3A99&per=200")
+        .await;
+    assert_eq!(year["total"], year_count(&cal, "2025"));
+}
+
 #[tokio::test]
 async fn calendar_of_an_empty_catalog() {
     let server = Server::start_with(&[], "DELETE FROM photos;").await;
@@ -1205,13 +1232,13 @@ async fn photos_abroad_are_the_ones_without_a_pref() {
     // 年・月の格子（from/to）の形が通り、calendar の件数と合う
     let year = server
         .ok(&p(
-            "from=2025-01-01%2000%3A00&to=2025-12-31%2023%3A59&per=200",
+            "from=2025-00-00%2000%3A00&to=2025-99-99%2099%3A99&per=200",
         ))
         .await;
     assert_eq!(year["total"], 16);
     let month = server
         .ok(&p(
-            "from=2025-03-01%2000%3A00&to=2025-03-31%2023%3A59&per=200",
+            "from=2025-03-00%2000%3A00&to=2025-03-99%2099%3A99&per=200",
         ))
         .await;
     assert_eq!(month["total"], 14);

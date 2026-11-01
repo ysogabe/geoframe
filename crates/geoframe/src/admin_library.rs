@@ -623,11 +623,11 @@ fn build_points(conn: &Connection, filter: &Filter, max: usize) -> rusqlite::Res
 // ---------------------------------------------------------------- calendar・places
 
 /// `WHERE` に足す除外の条件（`hidden=1` でなければ除外を除く）。
-fn visible_clause(with_hidden: bool) -> &'static str {
+fn visible_clause(with_hidden: bool) -> String {
     if with_hidden {
-        ""
+        String::new()
     } else {
-        " AND COALESCE(hidden,0)=0"
+        format!(" AND {VISIBLE}")
     }
 }
 
