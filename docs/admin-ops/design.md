@@ -199,7 +199,9 @@ next_cycle_at = now                      // 起動直後に 1 回
 loop {
   match queue.wait_until(next_cycle_at, stop) {   // 要求が来る / 周期が来る / 停止。停止は 1 秒刻みで確かめる
     Woken::Stop => break,
-    Woken::Request(req) => { board.start(&req); let rec = run(req); board.finish(rec); }   // 周期の予定は変えない
+    Woken::Request(req) => { board.start(&req); let rec = run(req); board.finish(rec);
+                             if req.is_sync() { next_cycle_at = now + poll } }   // 手動の同期は定期の 1 回分（続けて 2 回回さない）。
+                                                                                 // 品質解析・保留の解除は周期を変えない
     Woken::Tick => { board.start_cycle(); let rep = one_cycle(...); board.finish_cycle(rep); next_cycle_at = now + poll; }
   }
 }
@@ -311,6 +313,15 @@ outcome: "done"（失敗 0）| "partial"（失敗あり）| "exceeded"（drive-r
   アクセスする。`ai-retry` は再検査のみで、送るのは背景ワーカー）。
 - **破壊的操作の二重の守り**: 大量削除は印の一致（画面が見たもの）＋上限（実行時に取り直した一覧で超えたら保留に戻す）。
   一覧が空の保留（`EmptyListing`）も同じ道（`held` = Drive の全行）。確認の段に「消える行は N 件まで」と明記する。
+  **印は認可ではない。** 認証の無い LAN では、`GET /api/admin/ops` を読める相手は誰でも `token` を得て POST できる。印が守るのは
+  「古い画面（保留が変わる前に見た件数）で解除してしまう」ことだけで、相手の正当性は ADR 0008 の前提（家庭 LAN・外部公開時は
+  Cloudflare Access）に任せる。`setflag`・`rotate`・選別の `confirm` と同じ境界だが、`drive-release` は管理 API で最も破壊的な
+  書き込みなので、この境界を文書と `admin_ops.rs` のコメントに書いておく。
+- **削除で消えるもの**: `write_plan`（`drive/index.rs:421-447`）は `DELETE FROM photos WHERE id=?`（行ごと。手で直した位置
+  `loc_source='manual'`・★・除外も行と一緒に消える）と、`remove_derivatives`（`index.rs:580-592`）で表示用画像を消す。原本（Drive 側）
+  には触れない。`photo_quality` の孤児は次の `quality` の段が消し（`quality.rs:167`）、`photo_curation` の行は残るが読む側が
+  世代で突き合わせるので効かない（B の設計）。サムネイル（`thumbs/`）は要求時に作る物なので残っても害は無い。
+  確認の段にこの範囲を書く（R6）。
 - **情報の漏れ**: 応答に段の失敗の文面・パス・モデル名・接続先を出さない（方針 6）。アクセスログは既存の `labeled` でテンプレートだけ。
 - **資源**: 要求は 1 つだけ待てる（溢れは 409）。GET は `Board` の `Mutex` を短く持つ（スナップショットの複製）。
   3 秒の読み直しはタブ表示中だけ。`quality::scan` は長く走りうるが、既存の `quality` の段と同じ解析（同じ上限）で、停止の合図で止まる。
