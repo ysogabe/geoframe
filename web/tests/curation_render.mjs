@@ -72,6 +72,8 @@ function makeEnv({pathname = '/admin'} = {}){
   const fetchFake = (url, opts = {}) => {
     const rec = {url, method: opts.method || 'GET', body: opts.body};
     calls.push(rec);
+    // settle() は setImmediate で待つだけなので、解決済みの応答で読み直しを繰り返すループはいつまでも戻らず、calls が膨らむ
+    if(calls.length > 5000) throw new Error('fetch が 5000 回を超えた（読み直しのループ）: ' + url);
     const params = url.includes('?') ? new URLSearchParams(url.split('?')[1]) : new URLSearchParams();
     if(url === '/api/admin/status') return reply(statusBody());
     if(url.startsWith('/api/admin/curation/groups')){
@@ -119,6 +121,10 @@ const tagsOf = card => card.querySelectorAll('.cur-tags .tag').map(t => t.textCo
 const body = rec => JSON.parse(rec.body);
 const activeTabs = env => env.$$('nav .tab').filter(t => t.classList.contains('on')).map(t => t.dataset.tab);
 const plain = v => JSON.parse(JSON.stringify(v));
+// ノードの同一性は assert.ok で比べる。assert.strictEqual / equal にノードを渡すと、失敗時の差分作りが文書全体を inspect して
+// 時間とメモリを大きく食う（fakedom.mjs の hidden の注記を参照）
+const same = (a, b, msg) => assert.ok(a === b, msg || '同じノードのはず');
+const notSame = (a, b, msg) => assert.ok(a !== b, msg || '別のノードのはず');
 const posts = (env, url) => env.reqs(url).filter(c => c.method === 'POST');
 const toastText = env => env.$('#toast').textContent;
 const openWith = async (env, groups) => {
@@ -258,9 +264,9 @@ await test('(d) チェックして「代表にする」: confirm に token 付�
   assert.equal(sent[0].method, 'POST');
   const after = sections(env);
   assert.equal(after.length, 4);
-  assert.strictEqual(after[0], ex, '他の段は描き直さない');
-  assert.strictEqual(after[2], before[2]);
-  assert.notStrictEqual(after[1], sm1);
+  same(after[0], ex, '他の段は描き直さない');
+  same(after[2], before[2]);
+  notSame(after[1], sm1);
   assert.equal(after[1].querySelector('.cur-state').textContent, '状態: 確認済み（人の代表）');
   assert.deepEqual(tagsOf(cardOf(after[1], 612)), ['解析の推奨', '人の代表']);
   assert.equal(cardOf(after[1], 612).querySelector('input').checked, false, '選択はその段だけ消える');
@@ -369,7 +375,7 @@ await test('(g) 409 group_changed: 「組が変わりました」のトースト
   assert.equal(env.listReqs().length, 2, '全体は読み直さない（その段だけ）');
   const after = sections(env);
   assert.equal(after.length, 4);
-  assert.strictEqual(after[0], before[0]);
+  same(after[0], before[0]);
   assert.equal(after[1].dataset.key, 'similar:31', '同じ kind の組を取る（group_id が変わっても拾える）');
   assert.deepEqual(after[1].querySelectorAll('.cur-member').map(c => c.dataset.id), ['611', '612', '614']);
   assert.equal(cardOf(after[1], 612).querySelector('input').checked, false, 'token が変わったので選択は持ち越さない');
@@ -464,7 +470,7 @@ await test('(h) 400 representative_not_visible は「代表に選べない写真
   fresh.querySelector('.cur-do-keep').click();
   await settle();
   assert.equal(toastText(env), '選別の更新に失敗: boom');
-  assert.equal(sections(env)[1], fresh, '段は描き直さない');
+  same(sections(env)[1], fresh, '段は描き直さない');
   assert.equal(fresh.querySelector('.cur-do-keep').disabled, false, 'もう一度押せる');
   // 通信エラー（JSON でない）
   env.handlers.reset = () => respond(503, undefined);
@@ -494,7 +500,7 @@ await test('(i) 画像を押すとビューアが開く（チェックボック�
   // 閉じるとフォーカスが画像のボタンへ戻る
   env.$('#viewer-close').click();
   assert.equal(hidden(env, '#viewer'), true);
-  assert.strictEqual(env.document.activeElement, thumb);
+  same(env.document.activeElement, thumb);
   assert.equal(cardOf(ex, 602).querySelector('input').checked, false);
 });
 
@@ -536,7 +542,7 @@ await test('(j) ビューアの★: setflag にその写真の id が送られ�
   await settle();
   assert.deepEqual(tagsOf(cardOf(ex, 601)), ['解析の推奨']);
   assert.equal(env.listReqs().length, 1);
-  assert.strictEqual(sections(env)[0], ex);
+  same(sections(env)[0], ex);
 });
 
 await test('(j2) 除外が変わると、その段だけを ids= で読み直して selectable・warning をサーバーの値に合わせる。選択のうち選べなくなった写真だけが外れる', async () => {
@@ -562,8 +568,8 @@ await test('(j2) 除外が変わると、その段だけを ids= で読み直し
   const q = env.lastList();
   assert.deepEqual([q.get('ids'), q.get('state'), q.get('kind')], ['611', 'all', 'all']);
   const after = sections(env);
-  assert.strictEqual(after[0], before[0]);
-  assert.notStrictEqual(after[1], sm1);
+  same(after[0], before[0]);
+  notSame(after[1], sm1);
   assert.equal(after[1].querySelector('.cur-warning').textContent, '代表がフィードに出せません');
   assert.equal(cardOf(after[1], 612).querySelector('input').disabled, true);
   assert.deepEqual(tagsOf(cardOf(after[1], 612)), ['解析の推奨', '除外']);
@@ -717,7 +723,7 @@ await test('(n2) 遅れた確定の応答は、送ったあとに読み直した
                   mem(613, {rank: 3, curation: 'reviewed'})], {taken_at: '2030-05-02 08:00'})})});
   await settle();
   // 遅れた応答では置き換えない（読み直しの応答はまだ届いていない）
-  assert.strictEqual(sectionOf(env, 'similar', 21), fresh, '段は置き換えない');
+  same(sectionOf(env, 'similar', 21), fresh, '段は置き換えない');
   assert.equal(cardOf(fresh, 612).querySelector('input').disabled, true);
   assert.equal(fresh.querySelector('.cur-state').textContent, '状態: 再確認');
   assert.equal(env.ev('cs.groups[1].token'), 'bbbbbbbbbbbbbbbb');

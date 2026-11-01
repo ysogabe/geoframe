@@ -103,6 +103,7 @@ function makeEnv({pathname, photos = PATTERNS, hold = false, aiStatus = true}){
   const fetchFake = (url, opts = {}) => {
     const rec = {url, method: opts.method || 'GET', headers: opts.headers, body: opts.body};
     calls.push(rec);
+    if(calls.length > 5000) throw new Error('fetch が 5000 回を超えた（読み直しのループ）: ' + url);   // settle() は setImmediate で待つだけ
     if(url === '/api/admin/status'){
       const body = statusBody({...filters});     // 要求した時点のサーバーの状態
       if(!gate.holdStatus) return reply(body);
@@ -186,6 +187,10 @@ const activeTab = env => env.document.querySelectorAll('nav .tab').filter(t => t
 const cards = env => env.document.querySelectorAll('#cards .card');
 const gcards = env => env.document.querySelectorAll('#groups .card');
 const hidden = (env, sel) => env.$(sel).classList.contains('hidden');
+// ノードの同一性は assert.ok で比べる。assert.equal / strictEqual にノードを渡すと、失敗時の差分作りが文書全体を inspect して
+// 時間とメモリを大きく食う（fakedom.mjs の hidden の注記を参照）
+const same = (a, b, msg) => assert.ok(a === b, msg || '同じノードのはず');
+const notSame = (a, b, msg) => assert.ok(a !== b, msg || '別のノードのはず');
 
 let n = 0;
 async function test(name, fn){ await fn(); n++; console.log('ok - ' + name); }
@@ -601,7 +606,7 @@ await test('(h) /ai-search で boot() すると写真タブが選ばれ #q に�
   assert.deepEqual(activeTab(env), ['photos']);
   assert.equal(hidden(env, '#v-photos'), false);
   assert.equal(hidden(env, '#v-status'), true);
-  assert.equal(env.document.activeElement, env.$('#q'));
+  same(env.document.activeElement, env.$('#q'));
   assert.equal(env.photoCalls().length, 1);
   assert.equal(note(env), '索引 6500/6540 枚');
   assert.ok(env.$('#search-note').classList.contains('dim'));
@@ -609,7 +614,7 @@ await test('(h) /ai-search で boot() すると写真タブが選ばれ #q に�
   const adm = makeEnv({pathname: '/admin'});
   await adm.boot();
   assert.deepEqual(activeTab(adm), ['status']);
-  assert.notEqual(adm.document.activeElement, adm.$('#q'));
+  notSame(adm.document.activeElement, adm.$('#q'));
   assert.equal(adm.aiStatusCalls().length, 0);
   await openPhotos(adm);
   assert.equal(note(adm), '索引 6500/6540 枚');
@@ -996,7 +1001,7 @@ await test('(p) ビューア: 画像クリックで開き、stepModal が ps.ent
   gcards(env)[1].querySelector('.ph').click();               // 畳まれていても entries の添字で開ける（id 102）
   assert.equal(hidden(env, '#viewer'), false);
   assert.equal(env.ev('viewerIndex'), 1);
-  assert.equal(env.document.activeElement, env.$('#viewer-close'));
+  same(env.document.activeElement, env.$('#viewer-close'));
   assert.ok(env.document.body.classList.contains('ps-viewer-open'));
   const shown = () => ({
     title: env.$('#viewer-title').textContent, counter: env.$('#viewer-counter').textContent,
@@ -1047,7 +1052,7 @@ await test('(p) ビューア: 画像クリックで開き、stepModal が ps.ent
   assert.equal(hidden(env, '#viewer'), true);
   assert.equal(env.ev('viewerIndex'), -1);
   assert.ok(!env.document.body.classList.contains('ps-viewer-open'));
-  assert.notEqual(env.document.activeElement, env.$('#viewer-close'));
+  notSame(env.document.activeElement, env.$('#viewer-close'));
   // 閉じたあとの矢印は何もしない。背景のクリックでも閉じる
   env.document.dispatchEvent({type: 'keydown', key: 'ArrowRight'});
   assert.equal(env.ev('viewerIndex'), -1);
@@ -1432,7 +1437,7 @@ await test('(z) ps.entries と違う配列から openModalFor で開く: ★は�
   assert.equal(env.$('#viewer-counter').textContent, '2 / 3', '渡した配列の長さ');
   assert.equal(hidden(env, '#viewer-ai'), true);
   assert.equal(hidden(env, '#viewer-group'), true);
-  assert.equal(env.document.activeElement, env.$('#viewer-close'));
+  same(env.document.activeElement, env.$('#viewer-close'));
   // 前後は渡した配列の中で回る（AI の欄は出さないまま）
   vm.runInContext('stepModal(-1)', env.context);
   assert.equal(env.$('#viewer-title').textContent, '#900  lib-a.jpg');
@@ -1467,7 +1472,7 @@ await test('(z) ps.entries と違う配列から openModalFor で開く: ★は�
   // 閉じると、開いたときにフォーカスのあった要素へ戻り、以後 ps.entries のビューアに戻る
   env.$('#viewer-close').click();
   assert.equal(hidden(env, '#viewer'), true);
-  assert.equal(env.document.activeElement, opener);
+  same(env.document.activeElement, opener);
   assert.equal(env.ev('viewerEntries'), null);
   cards(env)[1].querySelector('.ph').click();
   assert.equal(env.$('#viewer-counter').textContent, '2 / 5', '写真タブから開くと ps.entries');

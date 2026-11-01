@@ -12,15 +12,19 @@
 // 組んだ骨格が admin.html とずれていないかは htmlFacts() と domFacts() を突き合わせて試験で確かめる。
 
 const kebabToCamel = s => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+// 親・文書・持ち主への参照は列挙しない。assert の失敗メッセージはノードを depth 1000 で inspect するが、循環の検出は
+// 祖先しか見ないので、列挙できる後方参照があると同じノードが経路ごとに何度も展開され、メモリが指数的に増える
+// （段 2 つの strictEqual の失敗で数 GiB）。列挙しなければ inspect は木を 1 回たどるだけで済む
+const hidden = (obj, name, value) => Object.defineProperty(obj, name, {value, writable: true, enumerable: false, configurable: true});
 
 class FakeText {
-  constructor(data){ this.nodeType = 3; this.data = String(data); this.parentNode = null; }
+  constructor(data){ this.nodeType = 3; this.data = String(data); hidden(this, 'parentNode', null); }
   get textContent(){ return this.data; }
   set textContent(v){ this.data = String(v); }
 }
 
 class ClassList {
-  constructor(owner){ this.owner = owner; }
+  constructor(owner){ hidden(this, 'owner', owner); }
   tokens(){ return this.owner.className.split(/\s+/).filter(Boolean); }
   set(tokens){ this.owner.className = tokens.join(' '); }
   add(...names){
@@ -80,11 +84,11 @@ class FakeElement {
     this.nodeType = 1;
     this.tag = String(tag).toLowerCase();
     this.tagName = this.tag.toUpperCase();
-    this.ownerDocument = doc;
+    hidden(this, 'ownerDocument', doc);
     this.id = '';
     this.className = '';
     this.children = [];
-    this.parentNode = null;
+    hidden(this, 'parentNode', null);
     this.style = {};
     // 本物の dataset と同じく、入れた値は文字列になる（el.dataset.id = 5 は '5'）
     this.dataset = new Proxy({}, {set(t, k, v){ t[k] = String(v); return true; }});

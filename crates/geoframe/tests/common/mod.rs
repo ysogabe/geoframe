@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 mod geocode_stub;
+pub mod node;
 mod tile_stub;
 
 #[allow(unused_imports)]
