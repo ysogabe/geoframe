@@ -115,6 +115,19 @@ pub fn thumb_generation(display: Option<&str>, md5: Option<&str>, mtime: Option<
     Gen(out)
 }
 
+/// API が返す版付きの URL `/thumb/<id>.jpg?v=<世代>`（[`thumb_generation`] と同じ入力）。
+pub(crate) fn thumb_url(
+    id: i64,
+    display: Option<&str>,
+    md5: Option<&str>,
+    mtime: Option<f64>,
+) -> String {
+    format!(
+        "/thumb/{id}.jpg?v={}",
+        thumb_generation(display, md5, mtime).hex()
+    )
+}
+
 /// `thumbs/` の中のファイル名 `<id>-<gen>.jpg`。
 fn cache_name(id: i64, generation: Gen) -> String {
     format!("{id}-{}.jpg", generation.hex())

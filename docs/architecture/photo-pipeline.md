@@ -52,6 +52,7 @@
   - 復号できない・上限を超える写真は404（`Cache-Control: no-store`）。画面は「画像なし」にする。同じ世代は最大10,000件の記憶に入れ、起動中は作り直さない（ロックも枠も取らずに404。写真が変わって世代が変われば試す）。
   - サムネイルは作れたが`thumbs/`に書けないとき（ディスクの満杯・権限・`thumbs/`がリンク）と、書き込み側が無くてキャッシュも無いときは、元の表示用画像をそのまま返す（拡張子がjpg/jpeg/pngのときだけ。`no-store`。`Last-Modified`・304は付けない）。書けない失敗のあと60秒は、どの写真も生成を試みない。
   - ログ（WARN）は失敗の初回に1行で、写真IDと分類（`decode`/`limit`/`write`）だけ。パスやエラーの文面は出さない。
+- `GET /api/admin/photos`・検索API（`/api/ai/search`の写真）・`POST /api/admin/rotate`は、`thumb_url`（`/thumb/<id>.jpg?v=<gen>`。`thumb`が空なら空）で版付きのURLを返す。世代は`thumb_generation`と同じ入力（DBの`display`・`md5`・`mtime`）で作る。
 - 外部公開のとき、`/thumb/`は管理用の経路で、Cloudflare Accessの保護の外に出してはいけない（連番のIDで除外した写真も引ける）。
 
 ## 既知の不足

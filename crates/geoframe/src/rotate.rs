@@ -262,11 +262,28 @@ pub(crate) fn rotate_with(
                     r.get(0)
                 })
                 .optional()?;
-            Ok((changed, current))
+            // 回転後の世代（thumb.rs の lookup と同じ入力）。更新できたときだけ要る
+            let thumb_url = if changed == 0 {
+                String::new()
+            } else {
+                conn.query_row(
+                    "SELECT display, md5, mtime FROM photos WHERE id=?1",
+                    [pid],
+                    |r| {
+                        Ok(crate::thumb::thumb_url(
+                            pid,
+                            r.get::<_, Option<String>>(0)?.as_deref(),
+                            r.get::<_, Option<String>>(1)?.as_deref(),
+                            r.get::<_, Option<f64>>(2)?,
+                        ))
+                    },
+                )?
+            };
+            Ok((changed, current, thumb_url))
         })
     };
 
-    let (changed, current) = match commit {
+    let (changed, current, thumb_url) = match commit {
         Ok(done) => done,
         Err(e) => {
             discard_new(&data, &dest, &new_display, same_file, &old_bytes, None);
@@ -302,6 +319,7 @@ pub(crate) fn rotate_with(
         "id": pid,
         "rotation": new_rotation,
         "thumb": format!("/{new_display}"),
+        "thumb_url": thumb_url,
     }))
 }
 

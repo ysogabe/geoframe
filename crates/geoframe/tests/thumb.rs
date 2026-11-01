@@ -313,6 +313,32 @@ async fn generates_a_small_jpeg_without_exif_and_caches_it() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_admin_photos_thumb_url_is_versioned_and_can_be_fetched() {
+    let site = Site::start(true).await;
+    let v = site.add_standard(1, None);
+    // 表示用画像の無い写真は、`thumb`・`thumb_url` とも空
+    site.add_photo(2, None, None, "md5-b", 11.0);
+    let (status, body) = {
+        let response = get(site.addr, "/api/admin/photos?per=10").await;
+        (response.status, response.json())
+    };
+    assert_eq!(status, 200, "{body}");
+    let items = body["items"].as_array().unwrap();
+    let find = |id: i64| items.iter().find(|i| i["id"] == id).unwrap();
+    let url = find(1)["thumb_url"].as_str().unwrap();
+    assert_eq!(url, format!("/thumb/1.jpg?v={v}"));
+    let hex = url.rsplit("?v=").next().unwrap();
+    assert!(hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+    assert_eq!(find(1)["thumb"], "/derivatives/p1.jpg");
+    assert_eq!(find(2)["thumb"], "");
+    assert_eq!(find(2)["thumb_url"], "");
+    // その URL を GET すると 200 でサムネイルができる
+    let response = get(site.addr, url).await;
+    assert_eq!(response.status, 200);
+    assert_eq!(site.thumb_files(), [format!("1-{v}.jpg")]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_matching_if_none_match_gets_304_with_the_validators() {
     let site = Site::start(true).await;
     let v = site.add_standard(1, None);

@@ -789,6 +789,8 @@ pub struct AdminPhoto {
     id: i64,
     name: Value,
     thumb: String,
+    /// 一覧用の小さな画像（`/thumb/<id>.jpg?v=<世代>`）。`thumb` が空なら空。
+    thumb_url: String,
     taken_at: String,
     lat: Value,
     lon: Value,
@@ -1060,7 +1062,7 @@ pub fn photos(
 
     let mut stmt = conn.prepare(&format!(
         "SELECT id, name, display, drive_id, taken_at, lat, lon, loc_source, infer_dt_s,
-                place, pref, city, favorite, hidden, rotation, source
+                place, pref, city, favorite, hidden, rotation, source, md5, mtime
            FROM photos WHERE {condition}
           ORDER BY CASE WHEN taken_at IS NULL OR taken_at='' THEN 1 ELSE 0 END, taken_at, id
           LIMIT ?1 OFFSET ?2"
@@ -1089,14 +1091,28 @@ pub fn photos(
             value if !truthy(value) => Value::from(0),
             value => cell(value)?,
         };
+        let display: Option<String> = row.get(2)?;
+        let thumb = thumb_for(
+            ctx,
+            display.as_deref(),
+            row.get::<_, Option<String>>(3)?.as_deref(),
+        );
+        // 世代は thumb.rs の lookup と同じ入力（DB の display・md5・mtime）
+        let thumb_url = if thumb.is_empty() {
+            String::new()
+        } else {
+            crate::thumb::thumb_url(
+                id,
+                display.as_deref(),
+                row.get::<_, Option<String>>(16)?.as_deref(),
+                row.get::<_, Option<f64>>(17)?,
+            )
+        };
         items.push(AdminPhoto {
             id,
             name: cell(row.get_ref(1)?)?,
-            thumb: thumb_for(
-                ctx,
-                row.get::<_, Option<String>>(2)?.as_deref(),
-                row.get::<_, Option<String>>(3)?.as_deref(),
-            ),
+            thumb,
+            thumb_url,
             taken_at: text(row, 4)?,
             lat: cell(row.get_ref(5)?)?,
             lon: cell(row.get_ref(6)?)?,

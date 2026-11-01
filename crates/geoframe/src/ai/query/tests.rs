@@ -34,6 +34,14 @@ fn without_location_fields(mut result: Value) -> Value {
             ] {
                 assert!(card.remove(key).is_some(), "{key}");
             }
+            // 一覧用サムネイルの版付き URL（`/thumb/<id>.jpg?v=<12 hex>`。thumb は空にならない）
+            let id = card["id"].as_i64().unwrap();
+            let url = card.remove("thumb_url").unwrap();
+            let url = url.as_str().unwrap();
+            let hex = url
+                .strip_prefix(&format!("/thumb/{id}.jpg?v="))
+                .unwrap_or_else(|| panic!("{url}"));
+            assert!(hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
             card.remove("hint");
             card.remove("suggest");
         }

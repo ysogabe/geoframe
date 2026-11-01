@@ -370,8 +370,16 @@ fn 時計回りに回して名前は回転に従い_4回で元の名前と向き
             ["red", "green", "blue", "yellow"],
         ),
     ];
+    let mut seen_urls = std::collections::HashSet::new();
     for (rotation, display, size, corners) in expected {
-        let out = env.rotate(json!({"id": 1, "delta": 90})).unwrap();
+        let mut out = env.rotate(json!({"id": 1, "delta": 90})).unwrap();
+        // 版付きのサムネイル URL: 回転後の `display` で世代が変わる（回すたびに別の URL）
+        let url = out["thumb_url"].take();
+        let url = url.as_str().unwrap().to_owned();
+        let hex = url.strip_prefix("/thumb/1.jpg?v=").unwrap();
+        assert!(hex.len() == 12 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert!(seen_urls.insert(url), "回すたびに URL が変わる");
+        out.as_object_mut().unwrap().remove("thumb_url");
         assert_eq!(
             out,
             json!({"ok": true, "id": 1, "rotation": rotation, "thumb": format!("/{display}")})
