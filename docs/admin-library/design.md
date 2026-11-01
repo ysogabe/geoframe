@@ -214,10 +214,10 @@ ls = {
   years: [], calUntimed: 0, prefs: [], abroad: 0,   // calendar・places の結果。openYears・openPrefs は開いている行、loaded は読み込み済みの view
   sel: null,            // 格子の絞り込み {from, to} | {untimed} | {bbox} | {pref, city?} | {abroad} と表示用の label
   period: null,         // 地図の点と範囲に掛ける期間 {from, to}（旅の「地図で見る」で入り、解除で外す）
-  pointsStale: false,   // 地図が見えていないあいだに「除外も含める」が変わった印（地図へ戻るとき点を取り直す）
+  pointsStale: false,   // 地図が見えていないあいだに「除外も含める」・写真の位置・除外が変わった印（地図へ戻るとき点を取り直す）
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],   // 格子
   map: null, pendingData: null, labels: Map, popup: null,       // maplibregl.Map（地図ビューを初めて開いたとき作る）
-  seq: {trips, grid, points, popup},   // 要求の種類ごとの番号（古い応答を捨てる。種類を分けるのは、
+  seq: {trips, grid, points, popup, calendar, places},   // 要求の種類ごとの番号（古い応答を捨てる。種類を分けるのは、
                                        // 吹き出しの要求が格子の読み込みを捨てないため）
 }
 ```
@@ -419,9 +419,15 @@ cs = {
   （`untimed` と同じ）。
 - 画面（R9〜R11）: 切替に「日付」「場所」を足す（`ls.view` は `calendar` | `places`）。「日付」は年の行（件数つき）を押すと
   月の行が開き、年・月のどちらからも「写真を見る」で格子。末尾に「日時なし（K 枚）」。「場所」は都道府県の行を押すと
-  市区町村の行が開き、どちらからも格子。末尾に「海外・不明（N 枚）」（`abroad=1`）。格子のタイルに「位置を指定」（📍）の
+  市区町村の行が開き、都道府県の行からは格子へ進む。市区町村の行も格子へ進むが、**市区町村が空の項目**（「（市区町村なし）」）は
+  件数だけを出し、押しても格子へは進まない。その写真はその都道府県の格子から見る（`parse_qs` が空の値を捨てるため
+  `city=` では絞れず、`abroad` のような専用の引数は足さない）。末尾に「海外・不明（N 枚）」（`abroad=1`）。格子のタイルに「位置を指定」（📍）の
   ボタンを置き、押すと写真タブと同じ位置の指定（`openLocModal`）を開く（タイルを押したときのビューアとは混ざらない）。
-  保存すると `applyPhoto` → `libPhotoChanged` でタイルの「位置なし」の印が消える。
+  保存すると `applyPhoto` → `libPhotoChanged` でタイルの「位置なし」の印が消える。位置（`lat`・`lon`）か除外（`hidden`）が変わると
+  地図の点も変わるので、`libPhotoChanged` は飛んでいる `points` の応答を捨て（`seq.points` を進め）、地図が見えていれば点を取り直し、
+  見えていない（旅の一覧・範囲の格子の上、別のタブ）なら `pointsStale` を立てて、地図へ戻るとき取り直す。★だけの変更は点に出ないので何もしない。
+- 共通ビューアの画像が無い（`thumb` が空）・読めない（`error`）ときは、格子・表紙・吹き出しと同じ「画像なし」の代わりの表示
+  （`#viewer-noimage`）を出し、次の写真へ移ると画像の表示に戻す（R8）。
 
 ### `photo_curation` 表（新。PR ③。`curation::TABLES`。`SCHEMA` 定数には足さない）
 
@@ -628,7 +634,7 @@ CASE WHEN q.group_id IS NULL THEN 0
 |---|---|---|
 | AC1 | 合成 JPEG（`image` crate で 1200×800 を作る）を `derivatives/` に置き、`/thumb/<id>.jpg` の 200・寸法・`ETag` の存在と `If-None-Match` の 304・`mtime` 変更後の再生成と古い世代の削除・404（数字でない、無い写真）・403（領域の外へのリンク）・壊れた JPEG は 404 で 2 回目は復号しない（失敗の記憶。生成関数の呼び出し回数を数える）・書けない（`thumbs/` を読み取り専用に）ときは元ファイルが返る・同じ写真への同時 8 要求で生成が 1 回（ID ごとのロック）・`display` が `catalog.db`・`../x`・`tmp/x` を指す行は 404 で本文が DB でない・寸法だけ大きい合成 PNG は 404（上限。全体を復号しない）・GPS 付きの合成 JPEG から作ったサムネイルに APP1（EXIF）が無い・`Sec-Fetch-Site: cross-site` は 403・HEAD は生成しない・`v` が今の世代と違うときは生成せず 404（キャッシュがあればそれ）・`INGEST=0` では生成せず `thumbs/` もできず元の画像が返る・待ち合わせ中に要求を drop しても同時の生成が 2 を超えない・同じ ID の生成途中で要求を drop しても次の要求が二重に生成しない（単体）。`/derivatives/` のヘッダ不変は既存試験 | `tests/thumb.rs`（新）＋ `thumb.rs` の単体試験 |
 | AC2 | 新しいフィクスチャ `tests/fixtures/library-catalog.sql`（10 分・1 時間 30 分・8 時間・ちょうど 48 時間・9 日の差、位置なし、日時なし、除外を含む）で `trips` の境界・`noloc`・`untimed`・`hidden=1` の差を独立した期待値で検証。描画試験で旅 → 格子 → ビューア → ★ → `POST setflag` の `id` → タイルの印の更新（購読者）。写真タブのカードが変わらないことも見る | `tests/library_api.rs`（新）、`web/tests/library_render.mjs`（新）＋ `tests/admin_ui_library.rs` |
-| AC3 | `points` の位置なし除外・`from`/`to`・`bbox` の絞り込み（結合）。`truncated` は切り詰めの関数（`fn truncate_points(rows, max)`）の単体試験（結合試験のバイナリでは `#[cfg(test)]` の定数が効かないため）。描画試験で偽 MapLibre の `setData`、点を押したときの `ids=` 要求と吹き出し、`bbox` 要求 | 同上 |
+| AC3 | `points` の位置なし除外・`from`/`to`・`bbox` の絞り込み（結合）。`truncated` は切り詰めの関数（`fn truncate_points(rows, max)`）の単体試験と、実際の上限を使う結合試験（2024 年の 20,001 点を足して、位置のある写真 20,012 枚のうち 20,000 点で `truncated: true`・`total` が全体の数・古いものから落ちること、範囲で絞れば `truncated: false`）。描画試験で偽 MapLibre の `setData`、点を押したときの `ids=` 要求と吹き出し、`bbox` 要求 | 同上 |
 | AC4 | 新しいフィクスチャ `tests/fixtures/curation-catalog.sql`（`admin-api-catalog.sql` は similar 1 組・exact 1 組なので流用しない）: exact 1 組・similar 2 組（1 組は同じ SHA の 2 枚を含む）。`confirm` → `groups`・`/api/v1/photos`・`status` の `db.quality.recommended`・`photo_quality` の入れ直し（`group_id` を変える）後も保持。`reviewed` のみ・`reset`・上の境界の表の 5 行・代表に記録した後で除外にした写真は `/api/v1/photos` に出ない・`photo_quality` を入れ替える書き込みと同時に `confirm` しても表が半端にならない | `tests/curation_api.rs`（新） |
 | AC5 | 確認済みの組に 1 枚足す → `recheck`。メンバーの `mtime` と `photo_quality` の世代を変える（再解析後を模す）→ `recheck`・`stale`。`token` 違いの `confirm`・`reset` → 409 で表が不変（集合違い・SHA は同じで `mtime` だけ違う・別のタブが先に代表を変えた後の古い `token`・`reset` 後の古い `token` の 4 通り）。`representative_not_visible` → 400 で表が不変 | 同上 |
 | AC6 | 既存のフィードの試験（契約・endpoint・miharashi）が無変更で通る。`photo_curation` 無しの DB で `list_photos` の SQL が従来と同じ結果（単体）。旧 AI の組と重なる合成ケース（人の代表が旧 AI の非推薦でも出る） | 既存 ＋ `photos.rs` の単体試験 ＋ `tests/legacy_selection.rs` |
