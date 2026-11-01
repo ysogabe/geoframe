@@ -1,6 +1,6 @@
 # 運用コンソール（C） PRD
 
-作成日: 2026-11-01。状態: 下書き（レビュー前）。設計: [design.md](design.md)。
+作成日: 2026-11-01。状態: 設計レビュー 2 回（Sol）・安全面レビュー 2 回（Opus）を反映済み。ユーザー承認待ち。設計: [design.md](design.md)。
 
 ## 背景と目的
 
@@ -98,7 +98,8 @@
 - R10（必須）: 同期をいま回す・品質解析の一括・保留の解除は、**定期サイクルと同じ 1 本のスレッド**で順に実行する
   （並行に走らせない）。要求は 1 つだけ待てる。定期サイクルの実行中に来た要求はその直後に走り、待っている要求がある
   とき、または実行中の要求と同じ種類の要求は 409 で断る。手動の同期は前回の手動の同期の終了（成功・失敗を問わない）から
-  60 秒は 409（LAN 内のスクリプトが Drive と地理院を叩き続けないため。終了時刻は履歴とは別に持ち、履歴から押し出されても効く）。受付の判定と「待ち → 実行中」の切り替えは同じロックの中で行い、
+  60 秒は 409（LAN 内のスクリプトが Drive と地理院を叩き続けないため。終了時刻は履歴とは別に持ち、履歴から押し出されても効く）。
+  基準は「Drive を読む要求（同期・保留の解除）の最後の終了」で、保留の解除にも同じ 60 秒がかかる。受付の判定と「待ち → 実行中」の切り替えは同じロックの中で行い、
   取り出した直後に同じ種類を受け付けない）。停止の合図のあとは新しい要求を受け付けない（503）。要求の実行は定期サイクルと
   同じ隔離（段ごとのパニックの隔離と、その外側の隔離）を通り、DB を開けない・パニックしたときも記録を終えて次へ進む。
 - R11（必須）: 同期をいま回す＝定期サイクルと同じ段の並び（`default_stages`）を 1 回。品質解析の一括＝
@@ -139,8 +140,11 @@
 
 - R17（必須）: [deploy/README.md](../../deploy/README.md)・[deploy/geoframe-admin.sh](../../deploy/geoframe-admin.sh)・
   [docs/rust-migration/server.md](../rust-migration/server.md)・[docs/architecture/photo-pipeline.md](../architecture/photo-pipeline.md)・
-  `ai/ops.rs` のモジュールコメントの「サービスを止めてから」「画面からは解除できない」を、「通常は運用タブから。
-  `serve` が動いていないときは CLI」に改める。`docs/README.md` の索引に本 PRD を載せる。
+  `ai/ops.rs` のモジュールコメント・`drive/index.rs` の保留の警告ログの「サービスを止めてから」「画面からは解除できない」
+  「`sync --allow-mass-delete` を一度だけ実行」を、「通常は運用タブから。`serve` が動いていないときは CLI」に改める。
+  deploy/README.md に解除前の写しの戻し方（サービスを止める → `catalog.db`・`-wal`・`-shm` を退かして写しに置き換える →
+  戻した Drive の行の `display`・`fetched_at` を NULL にして表示用画像を取り直させる → 起動）と、写しに含まれないもの
+  （表示用画像、解除後の変更）、バックアップのタイマーには写しが含まれないことを書く。`docs/README.md` の索引に本 PRD を載せる。
 - R18（必須）: `GET /api/v1/photos`・`/derivatives/` の契約（miharashi）と、CLI の引数・終了コードを変えない。
   `cargo test`（描画試験を含む）と `cargo clippy --all-targets -- -D warnings` が通る。
 
@@ -159,9 +163,10 @@
 - AC3（R11）: 結合試験で、`GEOFRAME_QUALITY_PER_CYCLE=1` と有効な合成 JPEG 複数枚で `serve` を起動し、起動直後の定期
   サイクルが終わったあとに未解析が残っていることを確かめてから `POST /api/admin/ops/quality-scan`。その `id` の記録が段
   `quality` 1 つで終わり、件数が `analyzed > 0`・`remaining = 0`・再構築ありで、世代の合う特徴量の行が全枚数ぶんある。
-- AC4（R6, R12）: 単体試験で、`plan()` が `Allow::Only(ids)` のとき、空の一覧でも比率の閾値未満でも、消える行がすべて `ids` に
-  含まれれば削除し（一部が戻っていれば残りだけ）、含まれない行が 1 件でもあれば保留に戻す（空の一覧なら `deletes_withheld`、
-  それ以外は `mass_delete_withheld`）。`Yes`・`No` は今までと同じ。結合試験で、保留を記憶に入れた状態（`spawn_state` で `MassDeleteBoard` に記録）から `GET /api/admin/ops` の
+- AC4（R6, R12）: 単体試験で、`plan()` が `Allow::Only(ids)` のとき、比率の閾値にかかわらず、消える行がすべて `ids` に含まれれば
+  削除し（一部が戻っていれば残りだけ）、含まれない行が 1 件でもあれば保留に戻す（`mass_delete_withheld`）。**取り直した一覧が
+  空なら、集合に含まれていても必ず保留に戻す**（`deletes_withheld`。承認したのは「一覧に何かあった」状態なので、空は状況の変化と
+  見る）。`Yes`・`No` は今までと同じ。写しは `Only` で消す行が 1 件以上あるときだけ作り、`No`・`Yes` と消す行が 0 件のときは作らない。結合試験で、保留を記憶に入れた状態（`spawn_state` で `MassDeleteBoard` に記録）から `GET /api/admin/ops` の
   `hold.token` を取り、正しい `token` の POST が 200、違う `token` が 409 `hold_changed`、保留が無いときが 409 `no_hold`、
   `empty_listing` の保留で 409 `not_releasable`。`plan()` の単体試験で `Allow::Only(ids)` が集合内の行だけ消し、集合外の行が
   1 件でもあれば保留に戻す。`drive/index.rs` の単体試験で、写しの作成に失敗すると削除せず保留が残り、成功すると写しに削除前の行と
