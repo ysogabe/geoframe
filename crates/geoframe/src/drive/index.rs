@@ -33,6 +33,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -206,6 +207,8 @@ pub struct IndexDrive {
     shared: Arc<DriveShared>,
     /// 大量削除の保留の扱い。
     allow: Allow,
+    /// 解除前の写しの空き容量の調べ方（試験で差し替える）。
+    free: fn(&Path) -> io::Result<u64>,
 }
 
 impl IndexDrive {
@@ -224,7 +227,18 @@ impl IndexDrive {
     }
 
     pub(crate) fn with_allow(shared: Arc<DriveShared>, allow: Allow) -> Self {
-        Self { shared, allow }
+        Self {
+            shared,
+            allow,
+            free: free_bytes,
+        }
+    }
+
+    /// 空き容量の調べ方を差し替える（試験用）。
+    #[cfg(test)]
+    pub(super) fn with_free_space(mut self, free: fn(&Path) -> io::Result<u64>) -> Self {
+        self.free = free;
+        self
     }
 }
 
@@ -662,10 +676,41 @@ fn free_bytes(dir: &Path) -> io::Result<u64> {
     crate::sysinfo::disk_usage(dir).map(|usage| usage.free)
 }
 
+/// 空き容量の見積もりの基準にする `catalog.db` の大きさ（バイト）。ファイル長と、接続から見える論理サイズ
+/// （`page_count` × `page_size`。WAL にまだ書き戻していない増加分を含む）の大きいほう。
+fn database_bytes(conn: &Connection, file_len: u64) -> rusqlite::Result<u64> {
+    let pages: i64 = conn.query_row("PRAGMA page_count", [], |r| r.get(0))?;
+    let page_size: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let logical = u64::try_from(pages)
+        .unwrap_or(0)
+        .saturating_mul(u64::try_from(page_size).unwrap_or(0));
+    Ok(file_len.max(logical))
+}
+
+/// `.part` を空のファイルとして、本 DB と同じ権限で作る（作った時点から、見えてよい人だけが読める）。
+/// 権限は umask で狭まることがあるので、作ったあとに確かめ、違えば（まだ空のうちに）合わせる。
+fn create_part(part: &Path, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(part)?;
+    let actual = file.metadata()?.permissions().mode() & 0o7777;
+    if actual != mode {
+        file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        if file.metadata()?.permissions().mode() & 0o7777 != mode {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+    }
+    Ok(())
+}
+
 /// 大量削除の解除の直前に、`catalog.db` の写し `tmp/catalog-before-release.db` を作る。
 ///
-/// 残っている `.part` を消す → 空き容量が `catalog.db` の 1.2 倍あるか確かめる → トランザクションの外で
-/// `VACUUM INTO ?1`（パスは束縛）で `.part` に書く → 成功したら `rename`（前回の写しをここで初めて置き換える）。
+/// 残っている `.part` を消す → 空き容量が `catalog.db`（WAL の増加分を含む論理サイズ）の 1.2 倍あるか確かめる →
+/// `.part` を本 DB と同じ権限の空ファイルとして先に作る → トランザクションの外で `VACUUM INTO ?1`（パスは束縛。
+/// 空のファイルには書ける）で `.part` に書く → 成功したら `rename`（前回の写しをここで初めて置き換える）。
 /// 失敗したら `.part` を消し、前回の写しは残す。呼び出し側は失敗したら削除しない。
 /// `conn` は writer の接続で、トランザクションの外（自動コミット）であること。
 pub(super) fn backup_before_release(
@@ -680,7 +725,8 @@ pub(super) fn backup_before_release(
         Err(_) => return Err(BackupError::Prepare),
     }
     let db_meta = std::fs::metadata(&paths.db).map_err(|_| BackupError::Prepare)?;
-    let needed = db_meta.len().saturating_mul(BACKUP_FREE_PERCENT) / 100;
+    let size = database_bytes(conn, db_meta.len()).map_err(|_| BackupError::Prepare)?;
+    let needed = size.saturating_mul(BACKUP_FREE_PERCENT) / 100;
     match free(&paths.dir) {
         Ok(available) if available >= needed => {}
         _ => return Err(BackupError::NoSpace),
@@ -688,12 +734,14 @@ pub(super) fn backup_before_release(
     let Some(part_text) = part.to_str() else {
         return Err(BackupError::Copy);
     };
+    if create_part(&part, db_meta.permissions().mode() & 0o7777).is_err() {
+        let _ = std::fs::remove_file(&part);
+        return Err(BackupError::Prepare);
+    }
     if conn.execute("VACUUM INTO ?1", [part_text]).is_err() {
         let _ = std::fs::remove_file(&part);
         return Err(BackupError::Copy);
     }
-    // 写しの権限は `catalog.db` と同じにする（見えてよい人だけが読める）。失敗しても写し自体は有効
-    let _ = std::fs::set_permissions(&part, db_meta.permissions());
     if std::fs::rename(&part, paths.done()).is_err() {
         let _ = std::fs::remove_file(&part);
         return Err(BackupError::Install);
@@ -794,6 +842,7 @@ impl IndexDrive {
             let now = crate::sysinfo::local_isoformat();
             let ops = plan.ops.clone();
             // `Only` で消す行があるときだけ、削除の直前に DB の写しを作る（定期サイクルが毎回 DB 全体を写さないため）
+            let free = self.free;
             let backup = if matches!(self.allow, Allow::Only(_)) && !ids.is_empty() {
                 let tmp = data
                     .tmp_dir()
@@ -813,7 +862,7 @@ impl IndexDrive {
                         if stopped() {
                             return Ok(Written::Stopped);
                         }
-                        if let Err(e) = backup_before_release(conn, paths, &free_bytes) {
+                        if let Err(e) = backup_before_release(conn, paths, &free) {
                             return Ok(Written::BackupFailed(e));
                         }
                     }
@@ -1138,10 +1187,10 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_copy_removes_the_part_and_keeps_the_previous_copy() {
-        let e = backup_env("backup-fail");
+    fn a_part_that_cannot_be_created_stops_before_copying_and_keeps_the_previous_copy() {
+        let e = backup_env("backup-inway");
         std::fs::write(e.paths.done(), b"old").unwrap();
-        // 空き容量の確認の最中に `.part` が現れた状況（`VACUUM INTO` は既存の空でないファイルを断る）を作る
+        // 空き容量の確認の最中に `.part` が現れた状況（`create_new` は既存のファイルを断る）を作る
         let part = e.paths.part();
         let meddle = move |_: &Path| {
             std::fs::write(&part, b"in the way").unwrap();
@@ -1149,10 +1198,89 @@ mod tests {
         };
         assert_eq!(
             backup_before_release(&e.conn, &e.paths, &meddle),
-            Err(BackupError::Copy)
+            Err(BackupError::Prepare)
         );
         assert_eq!(std::fs::read(e.paths.done()).unwrap(), b"old");
         assert_eq!(names_in(&e.paths.dir), [BACKUP_NAME]);
+    }
+
+    #[test]
+    fn a_failing_copy_removes_the_part_and_keeps_the_previous_copy() {
+        let e = backup_env("backup-fail");
+        std::fs::write(e.paths.done(), b"old").unwrap();
+        // `VACUUM` はトランザクションの中では動かない
+        e.conn.execute_batch("BEGIN").unwrap();
+        assert_eq!(
+            backup_before_release(&e.conn, &e.paths, &plenty),
+            Err(BackupError::Copy)
+        );
+        e.conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(std::fs::read(e.paths.done()).unwrap(), b"old");
+        assert_eq!(names_in(&e.paths.dir), [BACKUP_NAME]);
+    }
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+    }
+
+    #[test]
+    fn the_copy_has_the_same_permissions_as_the_database() {
+        for mode in [0o600, 0o640, 0o644] {
+            let e = backup_env("backup-mode");
+            std::fs::set_permissions(&e.paths.db, std::fs::Permissions::from_mode(mode)).unwrap();
+            backup_before_release(&e.conn, &e.paths, &plenty).unwrap();
+            assert_eq!(mode_of(&e.paths.done()), mode, "{mode:o}");
+            assert_eq!(copy_rows(&e.paths.done()).len(), 2);
+        }
+    }
+
+    #[test]
+    fn the_part_is_created_empty_with_the_requested_permissions_whatever_the_umask() {
+        let dir = TempDir::new("backup-create-part");
+        // 0o666 は普通の umask（022 など）で狭まる: 作ったあとに合わせる
+        for mode in [0o600, 0o640, 0o666] {
+            let part = dir.path().join(format!("part-{mode:o}"));
+            create_part(&part, mode).unwrap();
+            assert_eq!(mode_of(&part), mode, "{mode:o}");
+            assert_eq!(std::fs::metadata(&part).unwrap().len(), 0);
+            // 既にあるものは断る
+            assert!(create_part(&part, mode).is_err());
+        }
+    }
+
+    #[test]
+    fn the_space_estimate_includes_what_the_wal_has_not_written_back() {
+        let e = backup_env("backup-wal");
+        e.conn
+            .execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE blob (b BLOB);",
+            )
+            .unwrap();
+        e.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let file_len = std::fs::metadata(&e.paths.db).unwrap().len();
+        let before = database_bytes(&e.conn, file_len).unwrap();
+        for _ in 0..50 {
+            e.conn
+                .execute("INSERT INTO blob VALUES (zeroblob(65536))", [])
+                .unwrap();
+        }
+        // 本体のファイルは増えず、WAL だけが増える
+        assert_eq!(std::fs::metadata(&e.paths.db).unwrap().len(), file_len);
+        let logical = database_bytes(&e.conn, file_len).unwrap();
+        assert!(logical > before + 50 * 65536 / 2, "{before} -> {logical}");
+        // ファイル長の 1.2 倍だけでは足りず、論理サイズの 1.2 倍なら作れる
+        let file_only = move |_: &Path| Ok(file_len * 120 / 100);
+        assert_eq!(
+            backup_before_release(&e.conn, &e.paths, &file_only),
+            Err(BackupError::NoSpace)
+        );
+        let enough = move |_: &Path| Ok(logical * 120 / 100);
+        backup_before_release(&e.conn, &e.paths, &enough).unwrap();
+        // ファイル長が論理サイズより大きいとき（空きページがあるなど）は、ファイル長のほうを使う
+        assert_eq!(database_bytes(&e.conn, u64::MAX / 2).unwrap(), u64::MAX / 2);
     }
 
     #[test]

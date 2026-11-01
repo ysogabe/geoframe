@@ -3606,15 +3606,121 @@ fn a_dry_run_of_the_release_writes_neither_rows_nor_a_copy_nor_the_hold() {
     assert_eq!(e.shared.mass_delete_board().current(), Some(hold));
 }
 
-#[test]
-fn a_stop_signal_before_the_release_changes_nothing_and_keeps_the_hold() {
-    let (e, hold, only) = held_env("drive-release-stop");
+/// 停止の判定が `stop_at` 回目（0 始まり）に初めて `true` になる状態で段を動かす。返すのは結果と、判定が呼ばれた回数。
+fn run_stopping_at(e: &Env, stage: &IndexDrive, stop_at: usize) -> (StageOutcome, usize) {
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = Arc::clone(&calls);
+    let read = e.read_for(Mode::Apply);
+    let http = crate::net::agent();
     let stop = StopFlag::new();
-    stop.stop();
+    let ctx = StageCtx {
+        mode: Mode::Apply,
+        config: &e.config,
+        read: &read,
+        writer: Some(&e.writer),
+        cache: &e.cache,
+        http: &http,
+        stop: &stop,
+    };
+    let outcome = stage
+        .run_with(&ctx, move || {
+            counter.fetch_add(1, Ordering::SeqCst) >= stop_at
+        })
+        .unwrap();
+    (outcome, calls.load(Ordering::SeqCst))
+}
+
+fn derivative_count(e: &Env) -> usize {
+    fs::read_dir(e.root().join("derivatives")).unwrap().count()
+}
+
+#[test]
+fn a_stop_signal_at_every_point_of_the_release_changes_nothing_and_keeps_the_hold() {
+    // 停止の判定は、(0) 計画のあと (1) 写しの前 (2) 写しのあと・削除の始まり (3) 削除したあとの COMMIT の直前 で呼ばれる
+    for stop_at in 0..=3 {
+        let (e, hold, only) = held_env("drive-release-stop-points");
+        // 手で直した位置も、止まったあとに残る
+        e.sql("UPDATE photos SET loc_source='manual', lat=1.5, lon=2.5 WHERE drive_id='d50'");
+        let before = e.rows();
+        let (outcome, calls) = run_stopping_at(&e, &only, stop_at);
+        assert!(matches!(outcome, StageOutcome::Skipped(_)), "{stop_at}");
+        assert_eq!(calls, stop_at + 1, "止まったところで判定が終わる");
+        // 本 DB は戻り（99 件の削除は COMMIT されない）、保留は完全に一致したまま、表示用画像も残る
+        assert_eq!(e.rows(), before, "{stop_at}");
+        assert_eq!(derivative_count(&e), 100, "{stop_at}");
+        assert_eq!(
+            e.shared.mass_delete_board().current(),
+            Some(hold),
+            "{stop_at}"
+        );
+        // `.part` は残らない。写しは、作ったあと（2・3）にだけ有る
+        let expected: &[&str] = if stop_at >= 2 {
+            &["catalog-before-release.db"]
+        } else {
+            &[]
+        };
+        assert_eq!(e.tmp_leftovers(), expected, "{stop_at}");
+        // 止めなければ、同じ段がそのまま最後までできる
+        e.done(&only);
+        assert_eq!(row_count(&e), 1, "{stop_at}");
+        assert_eq!(e.shared.mass_delete_board().current(), None, "{stop_at}");
+    }
+}
+
+fn backup_conn(e: &Env) -> Connection {
+    Connection::open_with_flags(backup_path(e), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+}
+
+#[test]
+fn a_copy_that_fails_keeps_the_previous_copy_and_deletes_nothing() {
+    let (e, hold, only) = held_env("drive-release-keep-previous");
+    // 前回の写し
+    fs::create_dir_all(e.root().join("tmp")).unwrap();
+    fs::write(backup_path(&e), b"previous copy").unwrap();
+    // 空き容量が無く、今回の写しを作れない
+    let only = only.with_free_space(|_| Ok(0));
     let before = e.rows();
-    let result = e.run_with(&only, Mode::Apply, &stop);
-    assert!(matches!(result, StageResult::Skipped(_)), "{result:?}");
+    let result = e.run(&only);
+    let StageResult::Failed(message) = result else {
+        panic!("失敗のはず: {result:?}");
+    };
+    assert!(!message.contains(e.root().to_str().unwrap()), "{message}");
     assert_eq!(e.rows(), before);
-    assert!(e.tmp_leftovers().is_empty());
+    assert_eq!(derivative_count(&e), 100);
     assert_eq!(e.shared.mass_delete_board().current(), Some(hold));
+    assert_eq!(fs::read(backup_path(&e)).unwrap(), b"previous copy");
+    assert_eq!(e.tmp_leftovers(), ["catalog-before-release.db"]);
+}
+
+#[test]
+fn a_write_that_fails_after_the_copy_leaves_this_times_copy_with_the_rows_and_the_manual_values() {
+    let (e, hold, only) = held_env("drive-release-copy-then-fail");
+    fs::create_dir_all(e.root().join("tmp")).unwrap();
+    fs::write(backup_path(&e), b"previous copy").unwrap();
+    // 手で直した値。消えるはずの行にある
+    e.sql("UPDATE photos SET loc_source='manual', lat=1.5, lon=2.5 WHERE drive_id='d50'");
+    // 写しは作れるが、削除は失敗する
+    e.sql(
+        "CREATE TRIGGER block_delete BEFORE DELETE ON photos BEGIN SELECT RAISE(ABORT, 'blocked'); END",
+    );
+    let before = e.rows();
+    assert!(matches!(e.run(&only), StageResult::Failed(_)));
+    assert_eq!(e.rows(), before);
+    assert_eq!(derivative_count(&e), 100);
+    assert_eq!(e.shared.mass_delete_board().current(), Some(hold));
+    // 前回の写しは、今回の削除前の内容に置き換わっている
+    assert_eq!(e.tmp_leftovers(), ["catalog-before-release.db"]);
+    let copy = backup_conn(&e);
+    let total: i64 = copy
+        .query_row("SELECT COUNT(*) FROM photos", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 100);
+    let manual: (String, f64, f64) = copy
+        .query_row(
+            "SELECT loc_source, lat, lon FROM photos WHERE drive_id='d50'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(manual, ("manual".to_string(), 1.5, 2.5));
 }
