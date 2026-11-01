@@ -43,6 +43,7 @@ use rusqlite::Connection;
 
 use crate::cache::Cache;
 use crate::config::Config;
+use crate::ops::{Board, OpKind, Outcome, Request, RunKind, outcome_of, stages_json};
 use crate::stop::StopFlag;
 use crate::writer::{WriteError, Writer};
 
@@ -450,8 +451,21 @@ pub fn run_cycle(stages: &[Box<dyn Stage>], ctx: &StageCtx<'_>) -> CycleReport {
     }
 }
 
-/// 同期サイクルのスレッド（現行の `worker`）。起動直後に 1 回、以降 `poll` ごと。`stop` で止まる
-/// （待ちの最中ならすぐ、サイクルの最中なら今の段が終わってから）。
+/// 要求の待ちを見る間隔の上限。停止は `StopFlag` の `Condvar` で即座に起きるので、これは運用の要求の検出の遅れの上限
+/// （設計書の方針 1）。
+const REQUEST_POLL: Duration = Duration::from_millis(100);
+
+/// 同期サイクルのスレッド（現行の `worker`）。起動直後に 1 回、以降 `poll` ごとの定期サイクルに加えて、運用コンソールの
+/// 要求（`board`。[`crate::ops`]）を同じスレッドで直列に処理する。`stop` で止まる（待ちの最中ならすぐ、サイクルの最中なら
+/// 今の段が終わってから）。
+///
+/// - 要求は定期サイクルより先に取り出す。定期サイクルの実行中に来た要求は、サイクルの直後に走る。
+/// - 手動の同期（[`OpKind::Sync`]）のあとは、次の定期サイクルを `poll` 後にする（続けて 2 回回さない）。品質解析・保留の
+///   解除は周期を変えない。
+/// - `drive` は `stages` の `index_drive` と同じもの（保留の記憶・トークンを共有する）。保留の解除の要求は、その記憶
+///   （`drive.mass_delete_board()`）の印と照らしてから `index_drive` だけを走らせる。
+/// - DB を開けない・`run_cycle` 自身のパニックでも、要求は `failed` で記録し、スレッドは続ける。
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_worker(
     config: Arc<Config>,
     writer: Writer,
@@ -460,6 +474,8 @@ pub fn spawn_worker(
     stop: StopFlag,
     poll: Duration,
     lock: crate::ingest::LockHold,
+    board: Arc<Board>,
+    drive: Arc<crate::drive::DriveShared>,
 ) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("sync-worker".into())
@@ -467,9 +483,39 @@ pub fn spawn_worker(
             // スレッドが終わるまで `.ingest.lock` を手放さない（呼び出し側が先に終わっても）
             let _lock = lock;
             let http = crate::net::agent();
+            let env = WorkerEnv {
+                config: &config,
+                writer: &writer,
+                cache: &cache,
+                http: &http,
+                stop: &stop,
+            };
+            let mut next_cycle_at = Instant::now(); // 起動直後に 1 回
             loop {
-                one_cycle(&config, &writer, &cache, &stages, &http, &stop);
-                if stop.wait(poll) {
+                if stop.is_stopped() {
+                    break;
+                }
+                if let Some(request) = board.take_queued() {
+                    run_request(&env, &board, &stages, &drive, &request);
+                    if request.kind == OpKind::Sync {
+                        next_cycle_at = Instant::now() + poll;
+                        board.schedule_next_cycle(poll);
+                    }
+                    continue;
+                }
+                let now = Instant::now();
+                if now >= next_cycle_at {
+                    board.start_cycle();
+                    let guard = board.cycle_guard(poll);
+                    match one_cycle(&env, &stages) {
+                        Some(report) => guard.finish_cycle(&report),
+                        // 段の結果を得られなかった（`Drop` が失敗として終える）
+                        None => drop(guard),
+                    }
+                    next_cycle_at = Instant::now() + poll;
+                    continue;
+                }
+                if stop.wait((next_cycle_at - now).min(REQUEST_POLL)) {
                     break;
                 }
             }
@@ -477,34 +523,83 @@ pub fn spawn_worker(
         .expect("同期サイクルのスレッドを起動できません")
 }
 
-/// サイクル 1 回分。接続を開けないなどの失敗も次の周期に持ち越す（スレッドを終わらせない）。
-fn one_cycle(
-    config: &Config,
-    writer: &Writer,
-    cache: &Cache,
+/// ワーカーが段を走らせるのに使うもの（サイクルの間じゅう変わらない）。
+struct WorkerEnv<'a> {
+    config: &'a Config,
+    writer: &'a Writer,
+    cache: &'a Cache,
+    http: &'a ureq::Agent,
+    stop: &'a StopFlag,
+}
+
+/// 取り出した運用の要求を 1 件処理して、`board` に結果を残す（どの経路でも `running` を外す: [`Board::guard`]）。
+fn run_request(
+    env: &WorkerEnv<'_>,
+    board: &Board,
     stages: &[Box<dyn Stage>],
-    http: &ureq::Agent,
-    stop: &StopFlag,
+    drive: &Arc<crate::drive::DriveShared>,
+    request: &Request,
 ) {
-    let read = match crate::db::open_read_only(&config.db_path()) {
+    let guard = board.guard(request.id);
+    let report = match request.kind {
+        OpKind::Sync => one_cycle(env, stages),
+        OpKind::QualityScan => one_cycle(env, &[Box::new(crate::quality::Scan)]),
+        OpKind::DriveRelease => {
+            // 実行の直前に、待っているあいだに保留が変わっていないか確かめる（印と集合が違えば実行しない）。
+            // 印か集合が無い要求は承認が無いのと同じなので実行しない
+            let current = drive.mass_delete_board().current();
+            let approved = match (&request.token, &request.ids, &current) {
+                (Some(token), Some(ids), Some(hold)) => {
+                    (*token == crate::ops::token_of(hold)).then(|| ids.clone())
+                }
+                _ => None,
+            };
+            let Some(ids) = approved else {
+                tracing::warn!("[ops] 保留の解除: 承認したあとで保留が変わったので実行しません");
+                guard.finish(Outcome::HoldChanged, Vec::new(), None);
+                return;
+            };
+            one_cycle(env, &index_drive_stage_only(Arc::clone(drive), ids))
+        }
+        // AI 系は POST の中で処理し、同期ワーカーの待ちには入らない
+        OpKind::AiRetry | OpKind::AiReleasePause => None,
+    };
+    match report {
+        Some(report) => guard.finish(
+            outcome_of(RunKind::Op(request.kind), &report),
+            stages_json(&report),
+            None,
+        ),
+        None => guard.finish(Outcome::Failed, Vec::new(), None),
+    }
+}
+
+/// サイクル 1 回分（`stages` を順に）。接続を開けない・`run_cycle` 自身のパニックは `None`（次の周期・要求に持ち越す。
+/// スレッドを終わらせない）。
+fn one_cycle(env: &WorkerEnv<'_>, stages: &[Box<dyn Stage>]) -> Option<CycleReport> {
+    let read = match crate::db::open_read_only(&env.config.db_path()) {
         Ok(conn) => conn,
         Err(e) => {
             tracing::warn!("[sync] DB を読み取り用に開けません（次の周期に持ち越します）: {e}");
-            return;
+            return None;
         }
     };
     let ctx = StageCtx {
         mode: Mode::Apply,
-        config,
+        config: env.config,
         read: &read,
-        writer: Some(writer),
-        cache,
-        http,
-        stop,
+        writer: Some(env.writer),
+        cache: env.cache,
+        http: env.http,
+        stop: env.stop,
     };
     // 段ごとの隔離の外側（`run_cycle` 自身）がパニックしても、スレッドは続ける
-    if catch_unwind(AssertUnwindSafe(|| run_cycle(stages, &ctx))).is_err() {
-        tracing::error!("[sync] サイクルがパニックしました（次の周期に持ち越します）");
+    match catch_unwind(AssertUnwindSafe(|| run_cycle(stages, &ctx))) {
+        Ok(report) => Some(report),
+        Err(_) => {
+            tracing::error!("[sync] サイクルがパニックしました（次の周期に持ち越します）");
+            None
+        }
     }
 }
 
@@ -512,6 +607,8 @@ fn one_cycle(
 mod tests {
     use super::*;
     use crate::config::Overrides;
+    use crate::ops::EnqueueError;
+    use crate::stop::join_within;
     use crate::testutil::TempDir;
     use crate::writer::OpenMode;
     use std::sync::Mutex;
@@ -721,6 +818,8 @@ mod tests {
             stop.clone(),
             Duration::from_millis(40),
             crate::ingest::LockHold::for_test(s._dir.path()),
+            Arc::new(Board::with_system_clock(stop.clone())),
+            Arc::new(crate::drive::DriveShared::new()),
         );
         for _ in 0..300 {
             if RUNS.load(Ordering::SeqCst) >= 3 {
@@ -760,6 +859,8 @@ mod tests {
             stop.clone(),
             Duration::from_millis(20),
             crate::ingest::LockHold::for_test(s._dir.path()),
+            Arc::new(Board::with_system_clock(stop.clone())),
+            Arc::new(crate::drive::DriveShared::new()),
         );
         for _ in 0..300 {
             if RUNS.load(Ordering::SeqCst) >= 3 {
@@ -770,6 +871,592 @@ mod tests {
         assert!(RUNS.load(Ordering::SeqCst) >= 3);
         stop.stop();
         handle.join().unwrap();
+    }
+
+    // ---- 運用コンソールの要求（`ops::Board`）を処理するワーカー ----
+
+    /// 進みを自分で決める時計（`ops::Board` に渡す）。時刻の文字列は「基準からの秒数」。
+    struct TestClock {
+        base: Instant,
+        elapsed: Mutex<Duration>,
+    }
+
+    impl TestClock {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                base: Instant::now(),
+                elapsed: Mutex::new(Duration::ZERO),
+            })
+        }
+
+        fn advance(&self, by: Duration) {
+            *self.elapsed.lock().unwrap() += by;
+        }
+
+        fn stamp(&self, after: Duration) -> String {
+            crate::ops::Clock::timestamp(self, after)
+        }
+    }
+
+    impl crate::ops::Clock for TestClock {
+        fn now(&self) -> Instant {
+            self.base + *self.elapsed.lock().unwrap()
+        }
+
+        fn timestamp(&self, after: Duration) -> String {
+            format!("t+{}s", (*self.elapsed.lock().unwrap() + after).as_secs())
+        }
+    }
+
+    /// 動き出したことを知らせ、放してもらう（または停止の合図が来る）まで止まる段。
+    struct Gate {
+        started: Mutex<std::sync::mpsc::Sender<()>>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+        runs: Arc<AtomicUsize>,
+    }
+
+    /// `Gate` を操作する側。
+    struct GateHandle {
+        started: std::sync::mpsc::Receiver<()>,
+        release: std::sync::mpsc::Sender<()>,
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl GateHandle {
+        /// 段が動き出すまで待つ。
+        fn wait_started(&self) {
+            self.started
+                .recv_timeout(Duration::from_secs(10))
+                .expect("段が動き出さない");
+        }
+
+        /// 止まっている段を 1 つ放す。
+        fn release(&self) {
+            self.release.send(()).unwrap();
+        }
+
+        fn runs(&self) -> usize {
+            self.runs.load(Ordering::SeqCst)
+        }
+    }
+
+    fn gate() -> (Box<dyn Stage>, GateHandle) {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let runs = Arc::new(AtomicUsize::new(0));
+        (
+            Box::new(Gate {
+                started: Mutex::new(started_tx),
+                release: Mutex::new(release_rx),
+                runs: Arc::clone(&runs),
+            }),
+            GateHandle {
+                started: started_rx,
+                release: release_tx,
+                runs,
+            },
+        )
+    }
+
+    impl Stage for Gate {
+        fn name(&self) -> &'static str {
+            "gate"
+        }
+
+        fn run(&self, ctx: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            let _ = self.started.lock().unwrap().send(());
+            let release = self.release.lock().unwrap();
+            // 停止の合図が来たら戻る（本物の長い段も項目の合間に `ctx.stop` を見る）
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while release.try_recv().is_err() && Instant::now() < deadline {
+                if ctx.stop.wait(Duration::from_millis(5)) {
+                    break;
+                }
+            }
+            Ok(StageOutcome::Done(Counts(vec![("n", 1)])))
+        }
+    }
+
+    /// 回数だけ数えて終わる段。
+    struct Tick(Arc<AtomicUsize>);
+
+    impl Stage for Tick {
+        fn name(&self) -> &'static str {
+            "tick"
+        }
+
+        fn run(&self, _: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(StageOutcome::Done(Counts::default()))
+        }
+    }
+
+    /// `run_cycle` の外側でパニックする段（`name()` は段ごとの隔離の外で呼ばれる）。
+    struct BadName;
+
+    impl Stage for BadName {
+        fn name(&self) -> &'static str {
+            panic!("secret-name");
+        }
+
+        fn run(&self, _: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
+            Ok(StageOutcome::Done(Counts::default()))
+        }
+    }
+
+    struct Fixed(&'static str, fn() -> Result<StageOutcome, StageError>);
+
+    impl Stage for Fixed {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn run(&self, _: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
+            (self.1)()
+        }
+    }
+
+    /// 要求を処理するワーカーと、その掲示板・時計・保留の記憶。
+    struct Ops {
+        s: Setup,
+        board: Arc<Board>,
+        clock: Arc<TestClock>,
+        stop: StopFlag,
+        mass_delete: Arc<crate::drive::MassDeleteBoard>,
+        handle: Option<JoinHandle<()>>,
+    }
+
+    fn start_ops(tag: &str, stages: Vec<Box<dyn Stage>>, poll: Duration) -> Ops {
+        let s = setup(tag);
+        let clock = TestClock::new();
+        let stop = StopFlag::new();
+        let board = Arc::new(Board::new(stop.clone(), clock.clone()));
+        let drive = Arc::new(crate::drive::DriveShared::new());
+        let mass_delete = drive.mass_delete_board();
+        let handle = spawn_worker(
+            Arc::clone(&s.config),
+            s.writer.clone(),
+            Arc::clone(&s.cache),
+            stages,
+            stop.clone(),
+            poll,
+            crate::ingest::LockHold::for_test(s._dir.path()),
+            Arc::clone(&board),
+            Arc::clone(&drive),
+        );
+        Ops {
+            s,
+            board,
+            clock,
+            stop,
+            mass_delete,
+            handle: Some(handle),
+        }
+    }
+
+    impl Ops {
+        /// 条件が成り立つまで待つ（最大 10 秒）。
+        fn wait_for(&self, what: &str, cond: impl Fn(&crate::ops::Snapshot) -> bool) {
+            for _ in 0..1000 {
+                if cond(&self.board.snapshot()) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            panic!("待っても成り立たない: {what}");
+        }
+
+        /// 履歴が `n` 件になり、実行中が空になるまで待つ。
+        fn wait_history(&self, n: usize) {
+            self.wait_for("履歴", |snap| {
+                snap.history.len() >= n && snap.running.is_none()
+            });
+        }
+
+        /// 最初の定期サイクル（起動直後の 1 回）が終わるまで待つ。
+        fn wait_first_cycle(&self) {
+            self.wait_for("最初のサイクル", |snap| snap.last_cycle.is_some());
+        }
+
+        fn latest(&self) -> crate::ops::Record {
+            self.board.snapshot().history[0].clone()
+        }
+
+        /// 停止して、スレッドが終わるのを待つ（時間内に終わらなければ失敗）。
+        fn stop_and_join(&mut self) {
+            self.stop.stop();
+            let handle = self.handle.take().unwrap();
+            let started = Instant::now();
+            assert!(join_within(handle, Duration::from_secs(5)), "止まらない");
+            assert!(started.elapsed() < Duration::from_secs(2), "停止が遅い");
+        }
+    }
+
+    impl Drop for Ops {
+        fn drop(&mut self) {
+            self.stop.stop();
+            if let Some(handle) = self.handle.take() {
+                let _ = join_within(handle, Duration::from_secs(5));
+            }
+        }
+    }
+
+    const LONG: Duration = Duration::from_secs(3600);
+
+    /// 退けたデータベース（接続は開いたまま。読み取り用の接続だけが開けなくなる）。
+    fn move_db(config: &Config, away: bool) {
+        let db = config.db_path();
+        let moved = db.with_extension("db.away");
+        if away {
+            std::fs::rename(&db, &moved).unwrap();
+        } else {
+            std::fs::rename(&moved, &db).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_request_arriving_during_a_cycle_waits_and_runs_right_after_it() {
+        let (stage, gate) = gate();
+        let ops = start_ops("ops-during-cycle", vec![stage], LONG);
+        gate.wait_started(); // 起動直後の定期サイクルが止まっている
+        assert_eq!(ops.board.snapshot().running.unwrap().kind, RunKind::Cycle);
+        let queued = ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        // 受け付けても、サイクルが終わるまでは走らない
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(gate.runs(), 1);
+        assert_eq!(ops.board.snapshot().queued.unwrap().id, queued.id);
+        gate.release(); // サイクルが終わる → 直後に要求が走る
+        gate.wait_started();
+        let snap = ops.board.snapshot();
+        let running = snap.running.unwrap();
+        assert_eq!(
+            (running.id, running.kind),
+            (queued.id, RunKind::Op(OpKind::Sync))
+        );
+        assert!(snap.queued.is_none());
+        assert_eq!(snap.last_cycle.unwrap().outcome, Outcome::Done);
+        gate.release();
+        ops.wait_history(1);
+        assert_eq!(ops.latest().outcome, Outcome::Done);
+        assert_eq!(gate.runs(), 2);
+    }
+
+    #[test]
+    fn the_same_kind_is_busy_and_another_kind_waits_one_at_a_time() {
+        let (stage, gate) = gate();
+        let ops = start_ops("ops-busy", vec![stage], LONG);
+        gate.wait_started();
+        ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        // 待ちは 1 つだけ（同じ種類も別の種類も入らない）
+        assert_eq!(
+            ops.board.enqueue(OpKind::Sync, None, None),
+            Err(EnqueueError::Busy)
+        );
+        assert_eq!(
+            ops.board.enqueue(OpKind::QualityScan, None, None),
+            Err(EnqueueError::Busy)
+        );
+        gate.release(); // サイクルが終わり、同期が走り出す
+        gate.wait_started();
+        // 実行中の同期と同じ種類は入らない。別の種類は 1 つ待てて、2 つ目は入らない
+        assert_eq!(
+            ops.board.enqueue(OpKind::Sync, None, None),
+            Err(EnqueueError::Busy)
+        );
+        ops.board.enqueue(OpKind::QualityScan, None, None).unwrap();
+        assert_eq!(
+            ops.board.enqueue(OpKind::DriveRelease, None, None),
+            Err(EnqueueError::Busy)
+        );
+        gate.release(); // 同期が終わり、品質解析（本物の `quality::Scan`）が走る
+        ops.wait_history(2);
+        let snap = ops.board.snapshot();
+        assert_eq!(snap.history[0].kind, RunKind::Op(OpKind::QualityScan));
+        assert_eq!(snap.history[0].outcome, Outcome::Done);
+        assert_eq!(snap.history[1].kind, RunKind::Op(OpKind::Sync));
+        // 品質解析の段は `quality` の 1 段だけ
+        assert_eq!(
+            snap.history[0]
+                .stages
+                .iter()
+                .map(|st| st.name)
+                .collect::<Vec<_>>(),
+            ["quality"]
+        );
+        assert_eq!(gate.runs(), 2, "品質解析は定期の段を走らせない");
+    }
+
+    #[test]
+    fn a_failing_db_open_records_failed_and_the_worker_moves_on() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ops = start_ops("ops-db-broken", vec![Box::new(Tick(ticks.clone()))], LONG);
+        ops.wait_first_cycle();
+        move_db(&ops.s.config, true);
+        ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        ops.wait_history(1);
+        let record = ops.latest();
+        assert_eq!(record.outcome, Outcome::Failed);
+        assert!(record.stages.is_empty());
+        assert!(ops.board.snapshot().running.is_none());
+        assert_eq!(ticks.load(Ordering::SeqCst), 1, "段は走っていない");
+        // 失敗した同期も最短の間隔の基準になる
+        assert_eq!(
+            ops.board.enqueue(OpKind::Sync, None, None),
+            Err(EnqueueError::TooSoon)
+        );
+        // 次の要求へ進める（直したあとなら通る）
+        move_db(&ops.s.config, false);
+        ops.board.enqueue(OpKind::QualityScan, None, None).unwrap();
+        ops.wait_history(2);
+        assert_eq!(ops.latest().outcome, Outcome::Done);
+        // 手動の同期の周期の置き直し: 失敗しても次の周期は poll 後
+        assert_eq!(
+            ops.board.snapshot().next_cycle_at,
+            Some(ops.clock.stamp(LONG))
+        );
+    }
+
+    #[test]
+    fn a_failing_db_open_also_ends_the_periodic_cycle_as_failed() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ops = start_ops(
+            "ops-db-broken-cycle",
+            vec![Box::new(Tick(ticks.clone()))],
+            Duration::from_millis(30),
+        );
+        ops.wait_first_cycle();
+        move_db(&ops.s.config, true);
+        ops.wait_for("失敗したサイクル", |snap| {
+            snap.last_cycle
+                .as_ref()
+                .is_some_and(|c| c.outcome == Outcome::Failed)
+        });
+        assert!(ops.board.snapshot().history.is_empty());
+        move_db(&ops.s.config, false);
+        ops.wait_for("直ったサイクル", |snap| {
+            snap.last_cycle
+                .as_ref()
+                .is_some_and(|c| c.outcome == Outcome::Done)
+        });
+    }
+
+    #[test]
+    fn a_panic_inside_run_cycle_is_failed_and_a_stage_panic_is_partial() {
+        let ops = start_ops(
+            "ops-panic",
+            vec![
+                Box::new(Fixed("fails", || Err(StageError::fixed("secret-failure")))),
+                Box::new(Fixed("boom", || panic!("secret-panic"))),
+                Box::new(Fixed("fine", || Ok(StageOutcome::Done(Counts::default())))),
+            ],
+            LONG,
+        );
+        ops.wait_first_cycle();
+        ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        ops.wait_history(1);
+        let record = ops.latest();
+        assert_eq!(record.outcome, Outcome::Partial);
+        let results: Vec<_> = record
+            .stages
+            .iter()
+            .map(|st| (st.name, st.result))
+            .collect();
+        assert_eq!(
+            results,
+            [("fails", "failed"), ("boom", "panicked"), ("fine", "done")]
+        );
+        let json = ops.board.snapshot().to_json().to_string();
+        assert!(!json.contains("secret"), "失敗の文面は出さない: {json}");
+
+        // `run_cycle` 自身のパニックは、段の結果を得られないので失敗。スレッドは続く
+        let ops = start_ops("ops-panic-outer", vec![Box::new(BadName)], LONG);
+        ops.wait_first_cycle();
+        assert_eq!(
+            ops.board.snapshot().last_cycle.unwrap().outcome,
+            Outcome::Failed
+        );
+        ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        ops.wait_history(1);
+        let record = ops.latest();
+        assert_eq!(record.outcome, Outcome::Failed);
+        assert!(record.stages.is_empty());
+        ops.board.enqueue(OpKind::QualityScan, None, None).unwrap();
+        ops.wait_history(2);
+        assert_eq!(ops.latest().outcome, Outcome::Done);
+    }
+
+    #[test]
+    fn stopping_while_waiting_returns_quickly_and_refuses_new_requests() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let mut ops = start_ops("ops-stop-idle", vec![Box::new(Tick(ticks.clone()))], LONG);
+        ops.wait_first_cycle();
+        std::thread::sleep(Duration::from_millis(150)); // 待ちに入っている
+        ops.stop_and_join();
+        assert_eq!(
+            ops.board.enqueue(OpKind::Sync, None, None),
+            Err(EnqueueError::Stopping)
+        );
+        assert_eq!(ticks.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn stopping_while_running_returns_and_the_waiting_request_does_not_start() {
+        let (stage, gate) = gate();
+        let mut ops = start_ops("ops-stop-running", vec![stage], LONG);
+        gate.wait_started();
+        ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        gate.release();
+        gate.wait_started(); // 同期が走っている
+        ops.board.enqueue(OpKind::QualityScan, None, None).unwrap();
+        ops.stop_and_join(); // 段は停止の合図で戻る
+        let snap = ops.board.snapshot();
+        assert_eq!(snap.history.len(), 1, "待っていた要求は走らない");
+        assert_eq!(snap.history[0].kind, RunKind::Op(OpKind::Sync));
+        assert!(snap.running.is_none());
+        assert_eq!(snap.queued.unwrap().kind, OpKind::QualityScan);
+        assert_eq!(
+            ops.board.enqueue(OpKind::AiRetry, None, None),
+            Err(EnqueueError::Stopping)
+        );
+    }
+
+    #[test]
+    fn drive_reads_are_too_soon_for_60_seconds_by_the_boards_clock() {
+        let ops = start_ops("ops-too-soon", vec![Box::new(Tick(Arc::default()))], LONG);
+        ops.wait_first_cycle();
+        ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        ops.wait_history(1);
+        // 1. 同期のすぐあとの同期 2. 保留の解除（Drive を読む要求は共通） 3. 品質解析は対象外
+        assert_eq!(
+            ops.board.enqueue(OpKind::Sync, None, None),
+            Err(EnqueueError::TooSoon)
+        );
+        assert_eq!(
+            ops.board
+                .enqueue(OpKind::DriveRelease, Some("t".into()), None),
+            Err(EnqueueError::TooSoon)
+        );
+        ops.board.enqueue(OpKind::QualityScan, None, None).unwrap();
+        ops.wait_history(2);
+        ops.clock.advance(Duration::from_secs(59));
+        assert_eq!(
+            ops.board.enqueue(OpKind::Sync, None, None),
+            Err(EnqueueError::TooSoon)
+        );
+        ops.clock.advance(Duration::from_secs(1));
+        ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        ops.wait_history(3);
+    }
+
+    fn hold(drive_rows: u64) -> Option<(u64, crate::drive::HoldReason, u64)> {
+        Some((3, crate::drive::HoldReason::Ratio, drive_rows))
+    }
+
+    fn token_of_current(ops: &Ops) -> String {
+        crate::ops::token_of(&ops.mass_delete.current().unwrap())
+    }
+
+    #[test]
+    fn a_drive_release_whose_hold_changed_while_waiting_does_not_run() {
+        use crate::drive::HeldIds;
+        let (stage, gate) = gate();
+        let ops = start_ops("ops-hold-changed", vec![stage], LONG);
+        gate.wait_started(); // 定期サイクルが止まっているあいだに要求を入れる
+        let ids = HeldIds::new(vec![1, 2, 3]);
+        ops.mass_delete
+            .record_with_ids(hold(100), ids.clone(), "t0");
+        let token = token_of_current(&ops);
+        ops.board
+            .enqueue(OpKind::DriveRelease, Some(token.clone()), Some(ids.clone()))
+            .unwrap();
+        // 待っているあいだに、保留が変わる
+        ops.mass_delete
+            .record_with_ids(hold(101), ids.clone(), "t1");
+        gate.release();
+        ops.wait_history(1);
+        let record = ops.latest();
+        assert_eq!(record.outcome, Outcome::HoldChanged);
+        assert!(record.stages.is_empty(), "段は走っていない");
+        assert_eq!(gate.runs(), 1);
+        assert_eq!(ops.mass_delete.current().unwrap().checked_at, "t1");
+        // 保留が消えていても同じ
+        ops.clock.advance(Duration::from_secs(61));
+        ops.mass_delete
+            .record_with_ids(None, HeldIds::default(), "t2");
+        ops.board
+            .enqueue(OpKind::DriveRelease, Some(token), Some(ids))
+            .unwrap();
+        ops.wait_history(2);
+        assert_eq!(ops.latest().outcome, Outcome::HoldChanged);
+        // 印や集合の無い要求は承認が無いのと同じ
+        ops.clock.advance(Duration::from_secs(61));
+        ops.board.enqueue(OpKind::DriveRelease, None, None).unwrap();
+        ops.wait_history(3);
+        assert_eq!(ops.latest().outcome, Outcome::HoldChanged);
+    }
+
+    #[test]
+    fn a_drive_release_with_the_same_hold_runs_only_index_drive_and_maps_skipped() {
+        use crate::drive::HeldIds;
+        let (stage, gate) = gate();
+        let ops = start_ops("ops-release-skipped", vec![stage], LONG);
+        gate.wait_started();
+        let ids = HeldIds::new(vec![5, 7]);
+        ops.mass_delete
+            .record_with_ids(hold(100), ids.clone(), "t0");
+        ops.board
+            .enqueue(
+                OpKind::DriveRelease,
+                Some(token_of_current(&ops)),
+                Some(ids),
+            )
+            .unwrap();
+        gate.release();
+        ops.wait_history(1);
+        // 鍵が無いので `index_drive` は通信せずに省略される → skipped（`Skipped` の対応）
+        let record = ops.latest();
+        assert_eq!(record.outcome, Outcome::Skipped);
+        assert_eq!(
+            record
+                .stages
+                .iter()
+                .map(|st| (st.name, st.result))
+                .collect::<Vec<_>>(),
+            [("index_drive", "skipped")]
+        );
+        assert_eq!(gate.runs(), 1, "定期の段は走らない");
+        // 保留は消さない（削除していない）
+        assert!(ops.mass_delete.current().is_some());
+    }
+
+    #[test]
+    fn a_manual_sync_pushes_the_next_cycle_out_by_one_poll_but_other_requests_do_not() {
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ops = start_ops("ops-next-cycle", vec![Box::new(Tick(ticks.clone()))], LONG);
+        ops.wait_first_cycle();
+        assert_eq!(
+            ops.board.snapshot().next_cycle_at,
+            Some(ops.clock.stamp(LONG))
+        );
+        ops.clock.advance(Duration::from_secs(100));
+        // 品質解析は周期を変えない
+        ops.board.enqueue(OpKind::QualityScan, None, None).unwrap();
+        ops.wait_history(1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            ops.board.snapshot().next_cycle_at,
+            Some("t+3600s".to_string())
+        );
+        // 手動の同期は、今から poll 後にする
+        ops.board.enqueue(OpKind::Sync, None, None).unwrap();
+        ops.wait_history(2);
+        ops.wait_for("周期の置き直し", |snap| {
+            snap.next_cycle_at.as_deref() == Some("t+3700s")
+        });
+        // 続けて定期サイクルは走らない（起動直後の 1 回 + 同期の 1 回）
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(ticks.load(Ordering::SeqCst), 2);
     }
 
     /// 別の接続が更新し続けても、写しは完了する（スナップショットを固定するのでやり直しが起きない）。

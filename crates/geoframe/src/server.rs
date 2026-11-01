@@ -88,6 +88,9 @@ pub struct AppState {
     /// `serve` だけが持ち、`/api/admin/status` の `sync.mass_delete_hold` に出す。無いとき（取り込み無効・試験）は
     /// キーを出さない。
     pub mass_delete: Option<Arc<MassDeleteBoard>>,
+    /// 運用コンソールの掲示板（同期ワーカーが処理する要求の待ち・実行中・履歴）。取り込みが有効の `serve` だけが持つ。
+    /// 無いとき（取り込み無効・試験）は `None`。
+    pub ops: Option<Arc<crate::ops::Board>>,
     /// プロセスの起動時刻（`GET /api/admin/config` の `started_at`・`uptime_s`）。状態を作った時刻で、`serve_until` が
     /// 待ち受けを始める直前に取り直す。
     pub started_at: std::time::SystemTime,
@@ -135,6 +138,7 @@ impl AppState {
             tiles,
             blog,
             mass_delete: None,
+            ops: None,
             started_at: std::time::SystemTime::now(),
             thumbs: Arc::new(crate::thumb::ThumbState::new()),
         }
@@ -154,6 +158,12 @@ impl AppState {
     /// 大量削除の保留の記憶を付ける（取り込みが有効の `serve`。同期サイクルの段と同じもの）。
     pub fn with_mass_delete_board(mut self, board: Arc<MassDeleteBoard>) -> Self {
         self.mass_delete = Some(board);
+        self
+    }
+
+    /// 運用コンソールの掲示板を付ける（取り込みが有効の `serve`。同期ワーカーと同じもの）。
+    pub fn with_ops(mut self, board: Arc<crate::ops::Board>) -> Self {
+        self.ops = Some(board);
         self
     }
 
