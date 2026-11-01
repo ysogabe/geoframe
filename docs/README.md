@@ -17,10 +17,17 @@
 | [紹介ページ（LP）の管理](LP.md) | 現行 | `site/`の静的な紹介ページと、GitHub Pagesの手動公開の手順 |
 | [公開準備チェックリスト](public-release-checklist.md) | 現行 | 2026-10-30にPublicにしたときの監査の結果と判断の記録 |
 | [管理画面の整え直し（A）](admin-rework/prd.md) | 計画 | 3ページの管理画面を「状況 / 写真 / 設定」の3タブに統合する PRD と[設計](admin-rework/design.md)（2026-10-30） |
+| [運用コンソール（C）](admin-ops/prd.md) | 計画 | 同期・品質解析・AI ジョブの再試行・停止の解除・大量削除の保留の解除を稼働中の `serve` の「運用」タブから行う PRD と[設計](admin-ops/design.md)（2026-11-01） |
 | [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（手で保ち、コードとの照合を`cargo test`が検査） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、更新、バックアップ |
 
 ## ディレクトリ構成
+
+### `admin-ops/` — 運用コンソール（C）
+
+2026-11-01 開始。サービスを止めずに、同期・品質解析・AI ジョブの再試行・停止の解除・Drive の大量削除の保留の解除を画面から行う計画。
+
+- [PRD](admin-ops/prd.md) / [設計](admin-ops/design.md)
 
 ### `admin-rework/` — 管理画面の整え直し（A）
 
