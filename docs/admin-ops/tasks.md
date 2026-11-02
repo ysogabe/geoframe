@@ -3,7 +3,7 @@
 - PRD: prd.md / 設計: design.md
 - PR は 2 本（PRD の「実装の順番」）。① はこのブランチ、② は ① のマージ後に `main` から切るブランチ（同じ worktree）。
   各 PR の前にブランチ全体の確認（テスト・PRD 突き合わせ・`security-review`）を行う。
-- ブランチ: ① `t3/admin-ops-console-design` / ② （① のマージ後に決める）
+- ブランチ: ① `t3/admin-ops-console-design`（PR #77 マージ済み、2026-11-02）/ ② `t3/admin-ops-2-ai`
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
@@ -13,5 +13,7 @@
 | T4 | PR ①: `ops.js`・`admin.html`・`admin.css`・`admin.js`（タブ・`showTab`・`boot`・`build.rs`/`embedded.rs`）、状況タブの大量削除の文言、`ops_render.mjs`・`tests/admin_ui_ops.rs` | AC1（3 操作分）, AC2(c), AC4（描画分）, AC8, AC9（static_files 分） | T3 | full | 完了 | c234c1a | 69c8b8c | Sol 1 回。指摘なし。ブラウザでの目視は未実施（本番機のため） |
 | T5 | PR ①: 文書の同期系（`deploy/README.md` の保留の解除と写しの戻し方、`geoframe-admin.sh` の冒頭、`server.md`、`drive/index.rs` の警告ログの文言、`docs/README.md`）、設計書の「実装との差」 | AC9（文書分） | T4 | quick | 完了 | 69c8b8c | f07dc75, de2a78b, ac008c7 | Opus 2 回。採用 11（server.md の決定の表、--help の範囲、organize の分け書き、戻し方の SQL に drive_id、sudo -u geoframe ほか）。見送りなし。ac008c7 は管理側が直接直した（文書のみ） |
 | T5b | PR ①（全体レビューの修正）: 保留解除の要求の終了ログを結果によらず 1 行（承認件数・結果の符号・削除件数）、`server.md:38` の CLI 限定の記述、`drive/index.rs:28` のコメント | AC4（R12）, AC9 | T5 | quick | 完了 | 77620c9 | cec08b0 | Sol の PRD 突き合わせ（必須 2・推奨 1）を採用。再確認で必須なし。推奨 1（成功時の終了ログの行数と report=None 経路の試験）は見送り（実装は確認済み、試験の網羅だけ） |
-| T6 | PR ②: `cli.rs` で再試行用の handlers（2 組目）・`ai_clock`・`ai_ops_lock` を `AppState` へ、`ai::ops::retry` を部分集計つきの誤り型に（CLI の出力・終了コードは不変）、`admin_ops.rs` の `ai-retry`・`ai-release-pause`（閉包の中で `try_lock`）、`tests/ops_api.rs` の AI 分、`scene_judge` の交差の試験 | AC5, AC7（AI 分） | T5（PR ① マージ） | full | 未着手 | | | |
-| T7 | PR ②: `ops.js` の AI の区画と R7 の案内、状況タブの AI の文言と `admin_ai_ops_render.mjs` の期待値、R9（要対応の行）、描画試験、文書の AI 分（`deploy/README.md`、`ai/ops.rs` のコメント、`cli.rs` のコメント） | AC1（5 操作分）, AC9（AI 分） | T6 | full | 未着手 | | | |
+| T6 | PR ②: `cli.rs` で再試行用の handlers（2 組目）・`ai_clock`・`ai_ops_lock` を `AppState` へ、`ai::ops::retry` を部分集計つきの誤り型に（CLI の出力・終了コードは不変）、`admin_ops.rs` の `ai-retry`・`ai-release-pause`（閉包の中で `try_lock`）、`tests/ops_api.rs` の AI 分、`scene_judge` の交差の試験 | AC5, AC7（AI 分） | T5（PR ① マージ） | full | 完了 | 72e9dd5 | 900505c, 44dc023 | Sol 2 回。採用 2（部分成功後の 500 と履歴の部分集計の結合試験、子プロセスの serve で handler の登録を確かめる）。見送りなし |
+| T7 | PR ②: `ops.js` の AI の区画と R7 の案内、状況タブの AI の文言と `admin_ai_ops_render.mjs` の期待値、R9（要対応の行）、描画試験、文書の AI 分（`deploy/README.md`、`ai/ops.rs` のコメント、`cli.rs` のコメント） | AC1（5 操作分）, AC9（AI 分） | T6 | full | 完了 | 44dc023 | cdea6ff, f84865a | Sol 1 回。必須なし。推奨 1（AI の状況の読み直し失敗で古い件数を残さない）を採用。推奨だけなので再レビューは省いた。ブラウザでの目視は未実施 |
+| T7b | PR ②（全体レビューの修正）: 履歴の「新しい順」を完了順（API の順序）に統一し画面の ID 降順の並べ直しを外す、交差と 10 件超の試験、`ai-config.md:165`・`ai/ops.rs:220` の「解除は CLI」の文言 | AC8, AC9 | T7 | quick | 完了 | 17f6334 | 58780d6 | Sol の PRD 突き合わせ（必須 1・推奨 1）を採用。見送りなし |
+| T7c | PR ②（security-review の参考の修正）: AI 操作の失敗の原因を `tracing::error!` でログにだけ出す（応答は定型文のまま）、設計書の「余計な鍵は 400」を「`target` の中の」に限定 | - | T7b | quick | 完了 | 58780d6 | e2e05e1 | Opus の security-review（High 0 / Medium 0）の参考 4 のうち 2 を採用。停止解除の 2 段階化（設計は 1 段）と本文の由来の確認（問題なし）は見送り |

@@ -143,7 +143,16 @@ handlerの**panic**は当該ジョブの失敗1回（`panic`。5回で`failed`�
 | `geoframe ai-jobs release-pause (--task <用途>｜--all)` | Provider・用途の停止の明示解除。`--task`は今の設定でその用途に当たる停止だけ（設定が未指定・不正なら何もせず終了コード2）、`--all`は全部 |
 | `geoframe ai-jobs deactivate-space` | 有効な検索空間（`settings.ai_active_space`）を外して旧結果参照へ戻す（P4 / T4.3。[ai-index.md](ai-index.md)）。旧結果・空間・ベクトル・ジョブは消さない。稼働中は拒否 |
 
-`retry`・`release-pause`・`deactivate-space`は**書く**ので、`GEOFRAME_INGEST=1`、検証環境のガード（`sync`と同じ印・Pythonの確認）、`.ingest.lock`、writerを通す。稼働中の`serve`はロックを持つので、**サービスを止めてから**実行する（稼働中は終了コード1で断る）。出力は件数・用途・固定の理由コードだけで、対象のキー・入力のhash・token・起動ID・モデル・URL・パス・写真の値は出さず、生の対象IDも引数に取らない（範囲は種類・用途単位）。
+`retry`・`release-pause`・`deactivate-space`は**書く**ので、`GEOFRAME_INGEST=1`、検証環境のガード（`sync`と同じ印・Pythonの確認）、`.ingest.lock`、writerを通す。稼働中の`serve`はロックを持つので、CLIは**サービスを止めてから**実行する（稼働中は終了コード1で断る）。
+
+稼働中の`serve`では、`retry`と`release-pause`を管理画面の運用タブから行う（[運用コンソール](../admin-ops/design.md)）。同じ`ai::ops::retry`・`release_pause`を、`serve`のwriterと、背景ワーカーとは別インスタンスのhandler（`prepare_retry`がhandler内の作業一覧を書き換えるので共有しない）で呼ぶ。AIの操作は同時に1つ（実行中は409 `busy`）。
+
+| API（`POST /api/admin/ops/…`） | 本文 | 応答 |
+|---|---|---|
+| `ai-retry` | `{"target": "all"}` または `{"target": {"kind": "<種類>"}}` | 200 `{ok, report: {requeued, obsolete, satisfied, unsupported, policy_disabled}}`。途中で失敗したときは500で、済んだ分は履歴の`report`に残る |
+| `ai-release-pause` | `{"target": "all"}` または `{"target": {"task": "<用途>"}}` | 200 `{ok, released}`。設定が未指定・不正で用途指定の解除ができないときは409 `config_unavailable`（何も消さない。`all`は設定によらない） |
+
+どちらも履歴（`GET /api/admin/ops`の`history`）に`kind`が`ai_retry`・`ai_release_pause`、`outcome`が`retried`・`released`の記録を残し、`GET /api/admin/ops`の`ai.retry_kinds`が再試行できる種類（再試行用のhandlerに登録のあるもの）を返す。解除しても`ai_provider_waits`（一時待機）と各ジョブの再試行の予定時刻は残る。出力は件数・用途・固定の理由コードだけで、対象のキー・入力のhash・token・起動ID・モデル・URL・パス・写真の値は出さず、生の対象IDも引数に取らない（範囲は種類・用途単位）。
 
 ### 管理画面のSTATUS（`GET /api/admin/status`の追加キー）
 
@@ -153,11 +162,11 @@ Rustだけが返す追加フィールドで、**あるときだけ**付く（AI�
 |---|---|
 | `ai_config_invalid` | `{"code": <設定の誤りの固定コード>, "disabled_tasks": 5}`（設定が不正なときだけ。値・パスは出さない。写真の配信・管理は続く） |
 | `ai_jobs` | `{"total", "by_state", "by_kind", "reasons"}`（ジョブが1件でもあるとき。`reasons`は状態ごとの理由コードの件数で、`clock_rewound`・`budget_exhausted`・`provider_paused`・`interrupted`など。固定のコード以外は`other`にまとめる） |
-| `ai_pauses` | `[{"task", "scope", "reason"}]`（停止中のProvider・用途。解除はCLI） |
+| `ai_pauses` | `[{"task", "scope", "reason"}]`（停止中のProvider・用途。解除は通常は運用タブから。`serve`が止まっているときはCLI） |
 | `ai_task_blocks` | `[{"task", "scope": "provider"\|"task", "reason", "waiting"}]`（設定で使える用途のうち、Provider・用途の停止にかかって送られていないもの。`ai_pauses`が停止を起こした用途だけなのに対し、同じ停止にかかる**全用途**。`waiting`はその用途の待ち＝`pending`＋`deferred`（`location_geocode`は`location_suggest`）の件数。ジョブの件数を集計できなかったときは`null`（件数不明。0件とは区別する。ジョブの表が無い旧DBは集計できているので0）で、停止の情報（`task`・`scope`・`reason`）は残す。停止にかかる用途が無ければキーを足さない。停止の確認ができない用途は載せない。用途名・範囲・固定の理由コード・件数だけで、鍵のパス・project・region・URL・モデル・識別のhashは出さない。送信側の判断は変えない） |
 | `ai_waits` | `{"items": [{"task", "scope": "entrance"\|"service", "reason", "until": "YYYY-MM-DDTHH:MM:SSZ"}], "unidentified": n}`（まだ有効な共有の一時待機を今の設定の用途に結び直したもの。`unidentified`は設定が使えず結び直せない件数で0なら出さない。待ちが無ければキーを出さない。期限はUTC。接続先・モデル・ハッシュは出さない。[ai-provider.md](ai-provider.md)の「共有の一時待機」） |
 
-STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し（`ai_task_blocks`は「AI送信が止まっている用途」に`<用途>: Provider全体の停止（権限エラー（403））で N 件が待ち`の形。`waiting`が`null`のときは`で 待ちは件数不明`。`geoframe ai-jobs status`はジョブの件数を読めないと状態の取得エラーで終了する。表示の側は`用途 X の待ち: 件数を読めません（停止中のため送っていません）`に対応しているが、今はこの経路では出ない）、解除・再試行のコマンドを文字で示す（画面からは操作できない）。
+STATUSタブ（`admin.js`）は、これらを赤・黄のセルで出し（`ai_task_blocks`は「AI送信が止まっている用途」に`<用途>: Provider全体の停止（権限エラー（403））で N 件が待ち`の形。`waiting`が`null`のときは`で 待ちは件数不明`。`geoframe ai-jobs status`はジョブの件数を読めないと状態の取得エラーで終了する。表示の側は`用途 X の待ち: 件数を読めません（停止中のため送っていません）`に対応しているが、今はこの経路では出ない）、解除・再試行は運用タブから行う旨と、`serve`が動いていないときのCLIのコマンドを文字で示す。運用タブのAIの区画は、このキー（`ai_jobs.reasons`・`ai_pauses`・`ai_task_blocks`・`ai_waits`）を開いたときと操作のあとに1回ずつ読んで要点を出し、状況タブの要対応には失敗したAIジョブ・AIの停止の行を出す（押すと運用タブへ移る）。
 
 ### 限界・実装状況
 

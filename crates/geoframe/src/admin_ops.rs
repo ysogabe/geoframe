@@ -5,6 +5,9 @@
 //!   `INGEST=0`（掲示板が無い）でも 200 で、`ingest: false` と空の項目だけを返す。
 //! - `POST /api/admin/ops/sync`・`/quality-scan`・`/drive-release`: 要求を掲示板に 1 つ入れるだけで、実行は同期ワーカーの
 //!   1 本のスレッドが順に行う（応答は受付の `request`。進み具合は `GET` で読む）。
+//! - `POST /api/admin/ops/ai-retry`・`/ai-release-pause`: 同期ワーカーの待ち行列には入れず、POST の中（`spawn_blocking`）で
+//!   CLI（`geoframe ai-jobs retry`・`release-pause`）と同じ関数（[`crate::ai::ops`]）を writer 経由で呼び、結果を応答と履歴に
+//!   残す。再試行の handler は背景ワーカーとは別のインスタンス、同時に動くのは 1 つだけ（[`AiOps`]）。外部へは送らない。
 //!
 //! # 安全面
 //!
@@ -18,16 +21,22 @@
 //! 運用固有の失敗は `{"ok": false, "error": "<符号>"}`（409 `busy`・`too_soon`・`no_hold`・`not_releasable`・`hold_changed`）。
 //! 共通の入口（CSRF 403・413・400・500）は `post.rs` のまま。
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, TryLockError};
 
 use axum::http::StatusCode;
 use axum::response::Response;
 use serde_json::{Map, Value, json};
 
+use crate::ai::jobs::JobKind;
+use crate::ai::ops::{PauseTarget, ReleaseError, RetryTarget};
+use crate::ai::settings::TaskKind;
+use crate::ai::worker::{Clock, Handler};
+use crate::config::Config;
 use crate::drive::{HoldReason, MassDeleteBoard};
-use crate::ops::{self, Board, EnqueueError, OpKind, Queued};
+use crate::ops::{self, Board, EnqueueError, OpKind, Outcome, Queued, Report};
 use crate::post::ApiError;
 use crate::server::{AppState, error_response, json_response};
+use crate::writer::Writer;
 
 /// 応答・エラーの符号（固定。値は入れない）。
 const BAD_PARAMS: &str = "bad_params";
@@ -36,6 +45,7 @@ const TOO_SOON: &str = "too_soon";
 const NO_HOLD: &str = "no_hold";
 const NOT_RELEASABLE: &str = "not_releasable";
 const HOLD_CHANGED: &str = "hold_changed";
+const CONFIG_UNAVAILABLE: &str = "config_unavailable";
 
 // ---------------------------------------------------------------- GET
 
@@ -76,10 +86,19 @@ fn build(state: &AppState) -> Value {
             .as_ref()
             .and_then(|b| b.current())
             .map(|hold| ops::hold_json(&hold)),
-        // 再試行できる種類（PR ② で埋める）
-        "ai": { "retry_kinds": [] },
+        // 再試行できる種類（再試行用の handlers に登録のあるもの。起動時に固定。JobKind の定義順）
+        "ai": { "retry_kinds": retry_kinds(&state.ai_retry_handlers) },
         "history": snapshot.history_json(),
     })
+}
+
+/// 再試行用の handlers に登録のある種類の名前（`JobKind` の定義順、重複なし）。
+fn retry_kinds(handlers: &[Arc<dyn Handler>]) -> Vec<&'static str> {
+    JobKind::ALL
+        .into_iter()
+        .filter(|kind| handlers.iter().any(|h| h.kind() == *kind))
+        .map(JobKind::as_str)
+        .collect()
 }
 
 /// 同期の間隔（分）。割り切れるときは整数で出す（`10`）。
@@ -186,6 +205,159 @@ pub fn drive_release(
         "request": request_json(&queued),
         "approved": hold.held,
     }))
+}
+
+// ---------------------------------------------------------------- AI の操作（POST の中で行う）
+
+/// AI の操作（再試行・停止の解除）に要る部品。`AppState` から複製して `spawn_blocking` の閉包へ渡す。
+pub struct AiOps {
+    ops: Option<Arc<Board>>,
+    writer: Option<Writer>,
+    config: Arc<Config>,
+    handlers: Arc<Vec<Arc<dyn Handler>>>,
+    clock: Clock,
+    lock: Arc<Mutex<()>>,
+}
+
+impl AiOps {
+    pub fn of(state: &AppState) -> Self {
+        Self {
+            ops: state.ops.clone(),
+            writer: state.writer(),
+            config: Arc::clone(&state.config),
+            handlers: Arc::clone(&state.ai_retry_handlers),
+            clock: Arc::clone(&state.ai_clock),
+            lock: Arc::clone(&state.ai_ops_lock),
+        }
+    }
+
+    /// 掲示板・writer が無ければ 503（`INGEST=0`）、停止の合図のあとも 503。
+    fn ready(&self) -> Result<(&Arc<Board>, &Writer), ApiError> {
+        let board = board_or_unavailable(self.ops.as_ref())?;
+        let writer = self.writer.as_ref().ok_or(ApiError::Unavailable)?;
+        if board.is_stopping() {
+            return Err(ApiError::Unavailable);
+        }
+        Ok((board, writer))
+    }
+
+    /// 同時に 1 つだけ。鎖は**この関数の中（`spawn_blocking` の閉包）で**取る。async の側で取ると、接続が切れて Future が
+    /// 落ちたときに鎖だけが外れ、書き込みは走り続けてしまうため（取れなければ 409 `busy`）。
+    fn exclusive<T>(&self, run: impl FnOnce() -> T) -> Result<T, ApiError> {
+        let _guard = match self.lock.try_lock() {
+            Ok(guard) => guard,
+            Err(TryLockError::WouldBlock) => return Err(ApiError::Busy(BUSY.into())),
+            // 鎖は何も守っていない（順序だけ）。毒は無視する
+            Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        };
+        Ok(run())
+    }
+}
+
+/// `target`: 文字列 `"all"` か、`{key: "<名前>"}` の 1 つだけを持つオブジェクト（名前は `parse` が知るものだけ）。
+/// `Ok(None)` が全部、`Ok(Some(x))` が指定。
+fn parse_target<T>(
+    payload: &Map<String, Value>,
+    key: &str,
+    parse: fn(&str) -> Option<T>,
+) -> Result<Option<T>, ApiError> {
+    match payload.get("target") {
+        Some(Value::String(all)) if all == "all" => Ok(None),
+        Some(Value::Object(object)) if object.len() == 1 => object
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(parse)
+            .map(Some)
+            .ok_or_else(bad_request),
+        _ => Err(bad_request()),
+    }
+}
+
+/// `POST /api/admin/ops/ai-retry`。`failed` の AI ジョブを再検査して振り分ける（`geoframe ai-jobs retry` と同じ）。
+///
+/// 判定の順序（`update::set_flag` と同じ）: 本文の形 400 → 掲示板・writer が無い／停止の合図のあと 503 → 別の AI の操作が
+/// 実行中 409 `busy` → 実行。途中の種類で失敗したときは 500（定型文）で、済んだ種類の件数は履歴の `report` に残す。
+pub fn ai_retry(payload: &Map<String, Value>, ai: &AiOps) -> Result<Value, ApiError> {
+    let target = match parse_target(payload, "kind", JobKind::parse)? {
+        None => RetryTarget::All,
+        Some(kind) => RetryTarget::Kind(kind),
+    };
+    let (board, writer) = ai.ready()?;
+    ai.exclusive(|| {
+        let started_at = board.timestamp_now();
+        match crate::ai::ops::retry(writer, &ai.config.ai, &ai.handlers, target, &ai.clock) {
+            Ok(report) => {
+                board.record_direct(
+                    OpKind::AiRetry,
+                    started_at,
+                    Outcome::Retried,
+                    Some(Report::Retry(report)),
+                );
+                // 固定の語と件数だけ
+                tracing::warn!(
+                    "AI の再試行: 戻した {} / 無効 {} / 成功済み {} / 処理が未登録 {} / 設定で使えない {}",
+                    report.requeued,
+                    report.obsolete,
+                    report.satisfied,
+                    report.unsupported,
+                    report.policy_disabled
+                );
+                Ok(json!({ "ok": true, "report": Report::Retry(report).to_json() }))
+            }
+            Err((report, cause)) => {
+                board.record_direct(
+                    OpKind::AiRetry,
+                    started_at,
+                    Outcome::Failed,
+                    Some(Report::Retry(report)),
+                );
+                tracing::warn!(
+                    "AI の再試行が途中で失敗した（済んだ分: 戻した {} / 無効 {} / 成功済み {}）",
+                    report.requeued,
+                    report.obsolete,
+                    report.satisfied
+                );
+                // 原因はログにだけ（SQLite のメッセージまでで値を含まない）。応答は固定の文
+                tracing::error!("AI の再試行の失敗の原因: {cause}");
+                Err(ApiError::Internal("AI の再試行に失敗しました".into()))
+            }
+        }
+    })?
+}
+
+/// `POST /api/admin/ops/ai-release-pause`。Provider・用途の停止を明示解除する（`geoframe ai-jobs release-pause` と同じ）。
+///
+/// 判定の順序は [`ai_retry`] と同じ。設定が未指定・不正・その用途が未設定で今の識別が分からないときは、何も消さず 409
+/// `config_unavailable`（全部の解除 `"all"` は設定によらない）。
+pub fn ai_release_pause(payload: &Map<String, Value>, ai: &AiOps) -> Result<Value, ApiError> {
+    let target = match parse_target(payload, "task", TaskKind::parse)? {
+        None => PauseTarget::All,
+        Some(task) => PauseTarget::Task(task),
+    };
+    let (board, writer) = ai.ready()?;
+    ai.exclusive(|| {
+        let started_at = board.timestamp_now();
+        match crate::ai::ops::release_pause(writer, &ai.config.ai, target) {
+            Ok(released) => {
+                board.record_direct(
+                    OpKind::AiReleasePause,
+                    started_at,
+                    Outcome::Released,
+                    Some(Report::Release { released }),
+                );
+                tracing::warn!("AI の停止を解除した: {released} 件");
+                Ok(json!({ "ok": true, "released": released }))
+            }
+            // 何も消していない拒否。他の 409 と同じく履歴には残さない
+            Err(ReleaseError::ConfigUnavailable) => Err(ApiError::Busy(CONFIG_UNAVAILABLE.into())),
+            Err(ReleaseError::Write(cause)) => {
+                board.record_direct(OpKind::AiReleasePause, started_at, Outcome::Failed, None);
+                tracing::warn!("AI の停止の解除に失敗した");
+                tracing::error!("AI の停止の解除の失敗の原因: {cause}");
+                Err(ApiError::Internal("AI の停止の解除に失敗しました".into()))
+            }
+        }
+    })?
 }
 
 #[cfg(test)]

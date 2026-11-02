@@ -361,6 +361,7 @@ export function buildAdminDom(){
   const oact = mk('div', {id: 'o-actions', cls: 'hidden'}, opp);
   mk('button', {id: 'o-sync', cls: 'btn', text: '同期をいま回す'}, mk('div', {cls: 'op-row'}, oact)).disabled = true;
   mk('button', {id: 'o-quality', cls: 'btn', text: '品質解析を一括で回す'}, mk('div', {cls: 'op-row'}, oact)).disabled = true;
+  mk('div', {id: 'o-ai'}, mk('div', {id: 'o-ai-panel', cls: 'panel'}, ops));
   mk('div', {id: 'o-hold'}, mk('div', {id: 'o-hold-panel', cls: 'panel hidden'}, ops));
   mk('div', {id: 'o-cycle'}, mk('div', {id: 'o-cycle-panel', cls: 'panel'}, ops));
   mk('div', {id: 'o-history'}, mk('div', {id: 'o-history-panel', cls: 'panel'}, ops));

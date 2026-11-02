@@ -951,6 +951,63 @@ fn scenes_stopped_by_the_failure_cap_do_not_starve_the_ones_behind_them_until_a_
     assert_eq!(reconcile(&handler).len(), MAX_QUEUE);
 }
 
+/// 運用タブの再試行（別インスタンスの handler）と背景ワーカーの `reconcile` が交互に走っても、再試行の対象が
+/// 作業一覧の置き換えで `Obsolete` にならない。同じインスタンスを共有すると、背景の `reconcile` が作業一覧を置き換え、
+/// `prepare_retry` が作った一覧が失われる。
+#[test]
+fn two_instances_keep_their_own_work_list_between_prepare_retry_and_reconcile() {
+    let l = Lab::new();
+    for scene in 0..=MAX_QUEUE as i64 {
+        l.scene(2 * scene + 1..=2 * scene + 2, scene * 2_400);
+    }
+    let built: usize = (0..3).map(|_| l.scenes()).sum();
+    assert_eq!(built, MAX_QUEUE + 1);
+    let background = l.handlers().remove(0);
+    let retry = l.handlers().remove(0);
+    let read = crate::db::open_read_only(&l.config().db_path()).unwrap();
+    let reconcile = |h: &Arc<dyn Handler>| h.reconcile(&read, crate::ai::tests_worker::T0).unwrap();
+    // 背景が MAX_QUEUE 件を積み、失敗で止まる。次の reconcile は残りの 1 件だけを返す
+    let first = reconcile(&background);
+    assert_eq!(first.len(), MAX_QUEUE);
+    let queued = first.clone();
+    l.env
+        .writer()
+        .call(move |c| {
+            crate::ai::jobs::enqueue_batch(c, &queued, crate::ai::tests_worker::T0)?;
+            c.execute_batch(
+                "UPDATE ai_jobs SET state='failed',terminal=1,attempts=5,last_error_code='bad_response'
+                 WHERE kind='photo_judge'",
+            )
+        })
+        .unwrap();
+    // 再試行の準備（失敗したキーも含む一覧）→ 背景の reconcile（一覧は残りの 1 件に置き換わる）→ 再試行の再検査
+    retry.prepare_retry().unwrap();
+    let next = reconcile(&background);
+    assert_eq!(next.len(), 1);
+    assert!(first.iter().all(|k| *k != next[0]));
+    for key in &first {
+        assert_eq!(
+            retry.recheck(&read, key).unwrap(),
+            crate::ai::jobs::Recheck::Requeue
+        );
+    }
+    // 逆の順序（背景の reconcile → 再試行の準備 → 背景の reconcile）でも、再試行側は変わらない
+    reconcile(&background);
+    retry.prepare_retry().unwrap();
+    reconcile(&background);
+    assert_eq!(
+        retry.recheck(&read, &first[0]).unwrap(),
+        crate::ai::jobs::Recheck::Requeue
+    );
+    // 同じインスタンスを共有していたら、背景の reconcile が一覧を置き換えて対象が Obsolete になる（共有しない理由）
+    background.prepare_retry().unwrap();
+    reconcile(&background);
+    assert_eq!(
+        background.recheck(&read, &first[0]).unwrap(),
+        crate::ai::jobs::Recheck::Obsolete
+    );
+}
+
 fn view(l: &Lab) -> Value {
     view_with(l, &l.config())
 }

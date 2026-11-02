@@ -371,7 +371,7 @@ Python版へ戻す手順は、[`cutover.md` §8・§13.2](../docs/rust-migration
 - 品質（`quality`の段。孤児の特徴量を消す→未解析を`GEOFRAME_QUALITY_PER_CYCLE`枚（既定は`GEOFRAME_FETCH_PER_CYCLE`）まで解析→未解析が無くて`photo_quality_dirty=1`のときだけ全写真を再グルーピングして`photo_quality`を全差し替え）は同期サイクルの最後に動く。**`--dry-run`は解析せず**、消す孤児・未解析・今回解析する枚数・再構築をするかを件数で出す（取り込み済みの本番コピーでは全部ほぼ0。Python が作った特徴量の行も有効として使うので、Rust に切り替えても全写真を解析し直さない。Python へ切り戻したときの扱い（`algorithm`は結果を作った実装の印で、Python は読まない）は[server.md §16.10](../docs/rust-migration/server.md)。[server.md §16](../docs/rust-migration/server.md)）。一括解析（現行の`server.py --quality-scan`）は`geoframe quality-scan [--dry-run] [--data-dir <dir>]`（`GEOFRAME_INGEST=1`と既存の`catalog.db`が要る。root では断り、取り込みのロックで`serve`と二重に動かない）。
   外向き HTTPS の確認は`geoframe selfcheck-net`（状態と HTTP ステータスだけを出す）。
 - **AIの背景ワーカー（P4 / T4.1c）**: `GEOFRAME_INGEST=1`かつ`GEOFRAME_AI_ENABLED=1`かつ有効な背景用途（`GEOFRAME_AI_CONFIG`のJSON。[ai-config.md](../docs/rust-migration/ai-config.md)）があるときだけ起動する。**いまの配布バイナリは用途別の処理を登録していない**ので、ジョブを1件も実行しない（実処理はT4.2・T4.4・T4.6）。`INGEST=0`ではAIの表を作らず、回収もしない。AIの設定が不正でも写真の配信・管理は続き、STATUSタブに設定の誤りの固定コードが出る。
-  状態の確認とやり直しは`geoframe ai-jobs`: `status`（読み取りだけ。稼働中でも可。件数と固定の理由コードだけ）、`retry (--kind <種類>|--all)`（失敗だけを再検査。外部へ送らない。検査できない種類は保持して件数だけ報告）、`release-pause (--task <用途>|--all)`（認証・契約の不一致で止まったProvider・用途の明示解除）。`retry`と`release-pause`は書くので、**サービスを止めてから**`GEOFRAME_INGEST=1`で実行する（`sync`と同じく root では断る。稼働中は`.ingest.lock`で断る）。
+  状態の確認とやり直しは`geoframe ai-jobs`: `status`（読み取りだけ。稼働中でも可。件数と固定の理由コードだけ）、`retry (--kind <種類>|--all)`（失敗だけを再検査。外部へ送らない。検査できない種類は保持して件数だけ報告）、`release-pause (--task <用途>|--all)`（認証・契約の不一致で止まったProvider・用途の明示解除）。`retry`と`release-pause`は、**通常は管理画面の運用タブから**（STATUSタブの要対応の行からも移れる。`POST /api/admin/ops/ai-retry`・`ai-release-pause`。種類ごと／すべて、用途ごと／すべて。結果は運用タブの履歴に残る）。**`serve`が動いていないときはCLI**で、書くので**サービスを止めてから**`GEOFRAME_INGEST=1`で実行する（`sync`と同じく root では断る。稼働中は`.ingest.lock`で断る）。運用タブの解除は、認証が直っていれば背景ワーカーが次に取り出すときからクラウドへ送り直す（料金がかかる。日の上限はそのまま効く）。設定ファイルを直した場合は再起動するまで新しい設定にならず、直っていなければ同じ理由で再び止まる。一時待機（`ai_waits`）と各ジョブの再試行の予定時刻は残るので、その期限までは送らない。
 - **待ち受けは`--listen`を書かない**。`GEOFRAME_HOST`/`GEOFRAME_PORT`（既定`0.0.0.0:8080`）で決まる。
 
 ### 7.2 別のポートで動かす（検証）
@@ -441,7 +441,7 @@ checkout の`HEAD`が`--expect-commit`（40 桁）と違う／追跡下のファ
 `if`の中では「下限を満たした」ように進んでしまうため）。確認の本体も、比較が成り立つときだけ通し、比較の異常は失敗として戻す。Python 版を止めたあとの初回の配布が 0 でなければ、
 すぐ Python 版へ戻す（手順は`cutover.md` §8）。ただし終了コード 2・4（何も変えずに断った）は、原因がすぐ直せて配信停止の期限内に再実行できるときだけ再実行する（`cutover.md` §0.4）。入れる unit は、その checkout の`deploy/geoframe-rs.service`。
 
-サービスを止めて CLI を動かすとき（AI の書き込み系の操作、`serve`が動いていないときの`sync`など）は、`sudo deploy/geoframe-admin.sh <コマンド> …`（例: `ai-jobs …`・`sync --allow-mass-delete`）を使う（root で直接`geoframe`を動かさない。動かす前に DATA_DIR のパスが表示される）。
+`serve`が動いていないときに CLI を動かすとき（AI の書き込み系の操作、`sync`など。稼働中は運用タブから行うので、CLI のときはサービスを止めてから）は、`sudo deploy/geoframe-admin.sh <コマンド> …`（例: `ai-jobs …`・`sync --allow-mass-delete`）を使う（root で直接`geoframe`を動かさない。動かす前に DATA_DIR のパスが表示される）。
 配置先のバイナリは入れ替えの直前に`/usr/local/bin/geoframe.prev`へ（unit も`.prev`へ）残す。**直前の 1 世代だけ**。
 
 **失敗したときの復元。** 入れ替え以降（unit の導入・`daemon-reload`・`enable`・`restart`・確認）のどこで失敗しても、

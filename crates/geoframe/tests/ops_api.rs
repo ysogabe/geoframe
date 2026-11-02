@@ -1,5 +1,5 @@
-//! 運用タブの管理 API（`GET /api/admin/ops`・`POST /api/admin/ops/{sync,quality-scan,drive-release}`。
-//! docs/admin-ops/design.md の PR ①）の結合試験。AC2(a)・AC3・AC4（API 分）・AC6・AC7（3 本分）。
+//! 運用タブの管理 API（`GET /api/admin/ops`・`POST /api/admin/ops/{sync,quality-scan,drive-release,ai-retry,
+//! ai-release-pause}`。docs/admin-ops/design.md）の結合試験。AC2(a)・AC3・AC4（API 分）・AC5・AC6・AC7。
 //!
 //! 2 種類の起動を使う:
 //!
@@ -17,30 +17,70 @@ use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use common::{TempDir, build_empty_catalog, post_raw, request, spawn_state};
+use geoframe::ai::jobs::{Claimed, JobKey, JobKind, Recheck};
+use geoframe::ai::worker::{Clock, Handler, Persist, RunCtx, RunError};
 use geoframe::db::Catalog;
 use geoframe::drive::{HeldIds, HoldReason, MassDeleteBoard};
 use geoframe::ops::{Board, OpKind, Outcome, stages_json};
 use geoframe::stop::StopFlag;
 use geoframe::sync::{Counts, CycleReport, StageReport, StageResult};
+use geoframe::writer::{OpenMode, Writer};
 use serde_json::{Value, json};
 
 const BIN: &str = env!("CARGO_BIN_EXE_geoframe");
 const PYTHON_SCHEMA: &str = include_str!("fixtures/schema-python.json");
 const OPS: &str = "/api/admin/ops";
-const POSTS: [&str; 3] = ["sync", "quality-scan", "drive-release"];
+const POSTS: [&str; 5] = [
+    "sync",
+    "quality-scan",
+    "drive-release",
+    "ai-retry",
+    "ai-release-pause",
+];
+
+/// 各 POST の、形の正しい本文。
+fn valid_body(route: &str, token: &str) -> Value {
+    match route {
+        "drive-release" => json!({ "token": token }),
+        "ai-retry" | "ai-release-pause" => json!({ "target": "all" }),
+        _ => json!({}),
+    }
+}
+
+/// 再検査もしない、種類だけを持つ handler（`ai_retry_handlers` に登録のある種類を作る）。
+struct Stub(JobKind);
+
+impl Handler for Stub {
+    fn kind(&self) -> JobKind {
+        self.0
+    }
+    fn reconcile(&self, _read: &rusqlite::Connection, _now: i64) -> rusqlite::Result<Vec<JobKey>> {
+        Ok(Vec::new())
+    }
+    fn run(&self, _ctx: &RunCtx<'_>, _job: &Claimed) -> Result<Persist, RunError> {
+        Err(RunError::InputChanged)
+    }
+    fn recheck(&self, _conn: &rusqlite::Connection, _key: &JobKey) -> rusqlite::Result<Recheck> {
+        Ok(Recheck::Requeue)
+    }
+}
 
 // ================================================================ 同じプロセスの router
 
 struct Server {
     _dir: TempDir,
+    /// 試験が DB を直接いじる・見るための接続（書き込み用）。
+    db: rusqlite::Connection,
     addr: std::net::SocketAddr,
     board: Arc<Board>,
     mass: Arc<MassDeleteBoard>,
     stop: StopFlag,
+    /// `AppState.ai_ops_lock`（試験が握って「別の AI の操作が実行中」を作る）。
+    ai_lock: Arc<Mutex<()>>,
 }
 
 impl Server {
@@ -49,31 +89,67 @@ impl Server {
         Self::start_with(true).await
     }
 
-    /// `ingest: false` なら `ops` を入れない（`INGEST=0` の `serve` と同じ）。
+    /// `ingest: false` なら `ops` を入れない（`INGEST=0` の `serve` と同じ）。writer は付けない。
     async fn start_with(ingest: bool) -> Self {
+        Self::build(ingest, None, None).await
+    }
+
+    /// 掲示板・writer・AI の表（`ai_jobs`・`ai_provider_pauses`）・AI の操作の部品を持つ `serve`。`handlers` は再試行用。
+    async fn start_ai(handlers: Vec<Arc<dyn Handler>>) -> Self {
+        Self::build(true, Some(handlers), None).await
+    }
+
+    /// `start_ai` に、通信しない AI 設定（`ai_json`。`GEOFRAME_AI_CONFIG` のファイル）を足す。再試行が種類ごとに使える。
+    async fn start_ai_with_config(handlers: Vec<Arc<dyn Handler>>, ai_json: &str) -> Self {
+        Self::build(true, Some(handlers), Some(ai_json)).await
+    }
+
+    async fn build(ingest: bool, ai: Option<Vec<Arc<dyn Handler>>>, ai_json: Option<&str>) -> Self {
         let dir = TempDir::new("ops-api");
-        let (path, _db) = build_empty_catalog(dir.path(), "");
-        let catalog = Catalog::open(&path).unwrap();
+        let ai_config = ai_json.map(|json| {
+            let path = dir.path().join("ai.json");
+            fs::write(&path, json).unwrap();
+            path.to_str().unwrap().to_owned()
+        });
+        let env: Vec<(&str, &str)> = ai_config
+            .iter()
+            .map(|path| ("GEOFRAME_AI_CONFIG", path.as_str()))
+            .collect();
+        let (path, mut db) = build_empty_catalog(dir.path(), "");
+        let mut catalog = Catalog::open(&path).unwrap();
+        if ai.is_some() {
+            geoframe::ai::migrate(&mut db).unwrap();
+            catalog = catalog.with_writer(Writer::open(&path, OpenMode::MustExist).unwrap());
+        }
         let stop = StopFlag::new();
         let board = Arc::new(Board::with_system_clock(stop.clone()));
         let mass = Arc::new(MassDeleteBoard::default());
+        let ai_lock = Arc::new(Mutex::new(()));
         let addr = {
-            let (board, mass) = (Arc::clone(&board), Arc::clone(&mass));
-            spawn_state(dir.path(), &[], catalog, move |state| {
-                if ingest {
-                    state.with_ops(board).with_mass_delete_board(mass)
-                } else {
-                    state
+            let (board, mass, lock) = (Arc::clone(&board), Arc::clone(&mass), Arc::clone(&ai_lock));
+            spawn_state(dir.path(), &env, catalog, move |state| {
+                if !ingest {
+                    return state;
+                }
+                let state = state.with_ops(board).with_mass_delete_board(mass);
+                match ai {
+                    Some(handlers) => {
+                        let clock: Clock = Arc::new(|| 1_792_972_800);
+                        state.with_ai_ops(handlers, clock, lock)
+                    }
+                    None => state,
                 }
             })
             .await
         };
         Self {
             _dir: dir,
+            db,
             addr,
             board,
             mass,
             stop,
+            ai_lock,
         }
     }
 
@@ -229,16 +305,18 @@ async fn without_ingest_get_says_so_and_every_post_is_503() {
     );
     let token = "0123456789abcdef";
     for route in POSTS {
-        let body = if route == "drive-release" {
-            json!({ "token": token })
-        } else {
-            json!({})
-        };
-        let response = server.post(route, &body).await;
+        let response = server.post(route, &valid_body(route, token)).await;
         assert_eq!(response.status, 503, "{route}: {}", response.text());
         assert_eq!(response.json()["ok"], false);
         // 本文の形（400）は掲示板の有無（503）より先
         assert_eq!(server.post_text(route, "not json").await.status, 400);
+    }
+    for route in ["ai-retry", "ai-release-pause"] {
+        assert_eq!(
+            server.post(route, &json!({"target": "nope"})).await.status,
+            400,
+            "{route}"
+        );
     }
     assert_eq!(
         server
@@ -412,12 +490,7 @@ async fn after_the_stop_signal_every_post_is_503() {
     let token = server.hold_ratio(&[1, 2, 3]).await;
     server.stop.stop();
     for route in POSTS {
-        let body = if route == "drive-release" {
-            json!({ "token": token })
-        } else {
-            json!({})
-        };
-        let response = server.post(route, &body).await;
+        let response = server.post(route, &valid_body(route, &token)).await;
         assert_eq!(response.status, 503, "{route}: {}", response.text());
     }
     assert!(server.board.snapshot().queued.is_none());
@@ -612,15 +685,11 @@ async fn a_malformed_token_is_400_bad_params_whatever_the_hold() {
 // ---------------------------------------------------------------- AC7: 入口の検査
 
 #[tokio::test]
-async fn the_common_entrance_checks_apply_to_all_three_posts() {
+async fn the_common_entrance_checks_apply_to_all_five_posts() {
     let server = Server::start().await;
     let token = server.hold_ratio(&[1, 2, 3]).await;
     for route in POSTS {
-        let ok = if route == "drive-release" {
-            json!({ "token": token }).to_string()
-        } else {
-            "{}".to_owned()
-        };
+        let ok = valid_body(route, &token).to_string();
         // Content-Type の不一致
         let response = server
             .post_with(route, &ok, &[("Content-Type", "text/plain")])
@@ -663,6 +732,479 @@ async fn the_common_entrance_checks_apply_to_all_three_posts() {
         .post_with("sync", "{}", &[("Origin", "http://localhost")])
         .await;
     assert_eq!(response.status, 200, "{}", response.text());
+}
+
+/// 再検査で SQLite のエラーを返す handler（失敗の文面はパスと表名を含む。応答・履歴へ出てはならない）。
+struct FailingRecheck(JobKind);
+
+impl Handler for FailingRecheck {
+    fn kind(&self) -> JobKind {
+        self.0
+    }
+    fn reconcile(&self, _read: &rusqlite::Connection, _now: i64) -> rusqlite::Result<Vec<JobKey>> {
+        Ok(Vec::new())
+    }
+    fn run(&self, _ctx: &RunCtx<'_>, _job: &Claimed) -> Result<Persist, RunError> {
+        Err(RunError::InputChanged)
+    }
+    fn recheck(&self, _conn: &rusqlite::Connection, _key: &JobKey) -> rusqlite::Result<Recheck> {
+        Err(rusqlite::Error::InvalidParameterName(
+            SECRET_TEXT.to_owned(),
+        ))
+    }
+}
+
+/// 通信しない AI 設定（ローカルの `location_clue` と `photo_judge` だけ。LAN の入口は使われない値）。
+const LOCAL_AI_JSON: &str = r#"{"version":1,"local_base_url":"http://192.0.2.10:8100",
+  "tasks":{"location_clue":{"provider":"local","model":"example-decision"},
+           "photo_judge":{"provider":"local","model":"example-judge","service_id":"judge1"}}}"#;
+
+// ---------------------------------------------------------------- AC5: AI の再試行・停止の解除
+
+const AI_ROUTES: [&str; 2] = ["ai-retry", "ai-release-pause"];
+
+impl Server {
+    /// `ai_jobs` に 1 行入れる（`input_hash`・版は固定）。
+    fn job(&self, kind: &str, target: &str, state: &str) {
+        self.db
+            .execute(
+                "INSERT INTO ai_jobs(kind, target_key, input_hash, processor_version, state, attempts, terminal,
+                                     created_at, updated_at)
+                 VALUES(?1, ?2, 'h', 'v1', ?3, 5, ?4, 1, 1)",
+                rusqlite::params![kind, target, state, i64::from(state == "failed")],
+            )
+            .unwrap();
+    }
+
+    fn pause(&self, scope: &str, subject: &str, task: &str) {
+        self.db
+            .execute(
+                "INSERT INTO ai_provider_pauses(scope, subject, task, reason, created_at)
+                 VALUES(?1, ?2, ?3, 'forbidden', 1)",
+                rusqlite::params![scope, subject, task],
+            )
+            .unwrap();
+    }
+
+    fn count(&self, sql: &str) -> i64 {
+        self.db.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// 履歴の先頭（最新）の記録。
+    async fn latest(&self) -> Value {
+        self.ops().await["history"][0].clone()
+    }
+}
+
+#[tokio::test]
+async fn ai_retry_keeps_failed_jobs_of_unregistered_kinds_and_reports_the_counts() {
+    // handler が 1 つも無い（配布バイナリでも AI の設定が無ければこの形）
+    let server = Server::start_ai(Vec::new()).await;
+    server.job("image_embedding", "a", "failed");
+    server.job("image_embedding", "b", "failed");
+    server.job("photo_judge", "c", "failed");
+    server.job("photo_judge", "d", "pending");
+    assert_eq!(server.ops().await["ai"], json!({"retry_kinds": []}));
+
+    let response = server.post("ai-retry", &json!({"target": "all"})).await;
+    assert_eq!(response.status, 200, "{}", response.text());
+    assert_eq!(response.header("cache-control"), Some("no-store"));
+    assert_eq!(
+        response.json(),
+        json!({
+            "ok": true,
+            "report": {
+                "requeued": 0, "obsolete": 0, "satisfied": 0, "unsupported": 3, "policy_disabled": 0
+            }
+        })
+    );
+    // 検査できないものは failed のまま（カウンタも触らない）。待ちのジョブにも触れない
+    assert_eq!(
+        server.count(
+            "SELECT COUNT(*) FROM ai_jobs WHERE state='failed' AND attempts=5 AND terminal=1"
+        ),
+        3
+    );
+    assert_eq!(
+        server.count("SELECT COUNT(*) FROM ai_jobs WHERE state='pending'"),
+        1
+    );
+
+    // 種類を指定する
+    let response = server
+        .post("ai-retry", &json!({"target": {"kind": "photo_judge"}}))
+        .await;
+    assert_eq!(response.status, 200, "{}", response.text());
+    assert_eq!(response.json()["report"]["unsupported"], 1);
+
+    // 履歴には 2 件（新しい順）。同期ワーカーの待ち・実行中には出ない
+    let ops = server.ops().await;
+    let history = ops["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2, "{ops}");
+    assert_eq!(history[0]["kind"], "ai_retry");
+    assert_eq!(history[0]["outcome"], "retried");
+    assert_eq!(history[0]["report"]["unsupported"], 1);
+    assert_eq!(history[1]["report"]["unsupported"], 3);
+    assert_eq!(history[0]["stages"], json!([]));
+    assert!(history[0]["requested_at"].is_string() && history[0]["finished_at"].is_string());
+    assert!(ops["worker"]["queued"].is_null() && ops["worker"]["running"].is_null());
+    assert!(server.board.snapshot().queued.is_none());
+}
+
+#[tokio::test]
+async fn ai_retry_reports_registered_kinds_that_the_settings_do_not_allow_as_policy_disabled() {
+    // 登録順に関わらず、`retry_kinds` は JobKind の定義順。AI の設定が無いので、登録済みでも使えない
+    let server = Server::start_ai(vec![
+        Arc::new(Stub(JobKind::PhotoJudge)),
+        Arc::new(Stub(JobKind::ImageEmbedding)),
+    ])
+    .await;
+    assert_eq!(
+        server.ops().await["ai"],
+        json!({"retry_kinds": ["image_embedding", "photo_judge"]})
+    );
+    server.job("image_embedding", "a", "failed");
+    server.job("location_clue", "b", "failed");
+    let response = server.post("ai-retry", &json!({"target": "all"})).await;
+    assert_eq!(response.status, 200, "{}", response.text());
+    assert_eq!(
+        response.json()["report"],
+        json!({
+            "requeued": 0, "obsolete": 0, "satisfied": 0, "unsupported": 1, "policy_disabled": 1
+        })
+    );
+    assert_eq!(
+        server.count("SELECT COUNT(*) FROM ai_jobs WHERE state='failed'"),
+        2
+    );
+}
+
+#[tokio::test]
+async fn ai_release_pause_removes_the_pauses_and_records_it() {
+    let server = Server::start_ai(Vec::new()).await;
+    server.pause("provider", "p1", "image_embedding");
+    server.pause("task", "t1", "photo_judge");
+    let response = server
+        .post("ai-release-pause", &json!({"target": "all"}))
+        .await;
+    assert_eq!(response.status, 200, "{}", response.text());
+    assert_eq!(response.json(), json!({"ok": true, "released": 2}));
+    assert_eq!(server.count("SELECT COUNT(*) FROM ai_provider_pauses"), 0);
+    let record = server.latest().await;
+    assert_eq!(record["kind"], "ai_release_pause");
+    assert_eq!(record["outcome"], "released");
+    assert_eq!(record["report"], json!({"released": 2}));
+
+    // もう無い。0 件でも成功で、履歴には残る
+    let response = server
+        .post("ai-release-pause", &json!({"target": "all"}))
+        .await;
+    assert_eq!(response.status, 200);
+    assert_eq!(response.json()["released"], 0);
+    assert_eq!(server.ops().await["history"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_task_release_without_a_usable_config_is_409_config_unavailable_and_removes_nothing() {
+    let server = Server::start_ai(Vec::new()).await;
+    server.pause("task", "t1", "photo_judge");
+    let response = server
+        .post(
+            "ai-release-pause",
+            &json!({"target": {"task": "photo_judge"}}),
+        )
+        .await;
+    assert_eq!(response.status, 409, "{}", response.text());
+    assert_eq!(error_of(&response), "config_unavailable");
+    assert_eq!(server.count("SELECT COUNT(*) FROM ai_provider_pauses"), 1);
+    // 何も消していない拒否は履歴に残さない
+    assert_eq!(server.ops().await["history"], json!([]));
+}
+
+#[tokio::test]
+async fn the_target_must_be_all_or_one_known_name_of_the_right_kind() {
+    let server = Server::start_ai(Vec::new()).await;
+    server.job("photo_judge", "a", "failed");
+    server.pause("task", "t1", "photo_judge");
+    let bad_retry = [
+        json!({}),
+        json!({"target": null}),
+        json!({"target": "ALL"}),
+        json!({"target": "photo_judge"}),
+        json!({"target": ["all"]}),
+        json!({"target": {}}),
+        json!({"target": {"kind": "nope"}}),
+        json!({"target": {"kind": 1}}),
+        json!({"target": {"kind": null}}),
+        // 用途の名前（JobKind に無い）・別の鍵・余計な鍵
+        json!({"target": {"kind": "query_embedding"}}),
+        json!({"target": {"task": "photo_judge"}}),
+        json!({"target": {"kind": "photo_judge", "task": "photo_judge"}}),
+    ];
+    let bad_release = [
+        json!({}),
+        json!({"target": null}),
+        json!({"target": "everything"}),
+        json!({"target": {"task": "nope"}}),
+        json!({"target": {"task": 7}}),
+        // 種類の名前（TaskKind に無い）・別の鍵・余計な鍵
+        json!({"target": {"task": "location_geocode"}}),
+        json!({"target": {"kind": "photo_judge"}}),
+        json!({"target": {"task": "photo_judge", "kind": "photo_judge"}}),
+    ];
+    for (route, bodies) in [
+        ("ai-retry", &bad_retry[..]),
+        ("ai-release-pause", &bad_release[..]),
+    ] {
+        for body in bodies {
+            let response = server.post(route, body).await;
+            assert_eq!(response.status, 400, "{route} {body}: {}", response.text());
+            assert_eq!(error_of(&response), "bad_params", "{route} {body}");
+        }
+    }
+    // 何も動かしていない
+    assert_eq!(
+        server.count("SELECT COUNT(*) FROM ai_jobs WHERE state='failed'"),
+        1
+    );
+    assert_eq!(server.count("SELECT COUNT(*) FROM ai_provider_pauses"), 1);
+    assert_eq!(server.ops().await["history"], json!([]));
+}
+
+#[tokio::test]
+async fn the_ai_posts_share_the_common_entrance_checks() {
+    let server = Server::start_ai(Vec::new()).await;
+    server.pause("task", "t1", "photo_judge");
+    for route in AI_ROUTES {
+        let ok = valid_body(route, "").to_string();
+        let response = server
+            .post_with(route, &ok, &[("Content-Type", "text/plain")])
+            .await;
+        assert_eq!(response.status, 403, "{route} content-type");
+        let response = server
+            .post_with(route, &ok, &[("Origin", "http://evil.example")])
+            .await;
+        assert_eq!(response.status, 403, "{route} origin");
+        let big = format!(r#"{{"pad":"{}"}}"#, "x".repeat(64 * 1024 + 1));
+        assert_eq!(server.post_text(route, &big).await.status, 413, "{route}");
+        for bad in ["not json", "", "[]", "12", "{\"target\":"] {
+            assert_eq!(
+                server.post_text(route, bad).await.status,
+                400,
+                "{route}: {bad:?}"
+            );
+        }
+    }
+    // 断られた要求は何も動かさない。同じ Origin は通る
+    assert_eq!(server.count("SELECT COUNT(*) FROM ai_provider_pauses"), 1);
+    assert_eq!(server.ops().await["history"], json!([]));
+    let response = server
+        .post_with(
+            "ai-release-pause",
+            &valid_body("ai-release-pause", "").to_string(),
+            &[("Origin", "http://localhost")],
+        )
+        .await;
+    assert_eq!(response.status, 200, "{}", response.text());
+}
+
+#[tokio::test]
+async fn without_a_writer_or_after_the_stop_signal_the_ai_posts_are_503_and_change_nothing() {
+    // 掲示板はあるが writer が無い
+    let server = Server::start().await;
+    for route in AI_ROUTES {
+        let response = server.post(route, &valid_body(route, "")).await;
+        assert_eq!(response.status, 503, "{route}: {}", response.text());
+    }
+    // writer があっても、停止の合図のあとは 503（行は動かさない）
+    let server = Server::start_ai(Vec::new()).await;
+    server.job("image_embedding", "a", "failed");
+    server.pause("task", "t1", "photo_judge");
+    server.stop.stop();
+    for route in AI_ROUTES {
+        let response = server.post(route, &valid_body(route, "")).await;
+        assert_eq!(response.status, 503, "{route}: {}", response.text());
+    }
+    assert_eq!(server.count("SELECT COUNT(*) FROM ai_provider_pauses"), 1);
+    assert_eq!(server.ops().await["history"], json!([]));
+}
+
+// 鎖を握ったまま POST を待つのが目的。サーバー側は `try_lock` で待たないので、デッドロックしない
+#[allow(clippy::await_holding_lock)]
+#[tokio::test]
+async fn a_second_ai_operation_is_409_busy_while_one_holds_the_lock() {
+    let server = Server::start_ai(Vec::new()).await;
+    server.job("image_embedding", "a", "failed");
+    server.pause("task", "t1", "photo_judge");
+    {
+        // 別の AI の操作が実行中（鎖を握る）。再試行も停止の解除も、種類を問わず 409
+        let _held = server.ai_lock.lock().unwrap();
+        for route in AI_ROUTES {
+            let response = server.post(route, &valid_body(route, "")).await;
+            assert_eq!(response.status, 409, "{route}: {}", response.text());
+            assert_eq!(error_of(&response), "busy", "{route}");
+        }
+        assert_eq!(server.count("SELECT COUNT(*) FROM ai_provider_pauses"), 1);
+        assert_eq!(server.ops().await["history"], json!([]));
+    }
+    // 鎖が外れれば通る（失敗の記録も、鎖の残りも無い）
+    for route in AI_ROUTES {
+        let response = server.post(route, &valid_body(route, "")).await;
+        assert_eq!(response.status, 200, "{route}: {}", response.text());
+    }
+}
+
+/// 鎖は `spawn_blocking` の閉包の中で取る。1 つ目の接続が切れても、書き込みが終わるまで鎖は外れない。
+#[tokio::test]
+async fn the_lock_stays_held_after_the_client_disconnects_until_the_write_finishes() {
+    let server = Server::start_ai(Vec::new()).await;
+    server.pause("provider", "p1", "image_embedding");
+    // 別の接続が書き込みの鎖を握り、writer の依頼を待たせる
+    server.db.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let addr = server.addr;
+    let body = json!({"target": "all"}).to_string();
+    let first = tokio::spawn(async move {
+        post_raw(
+            addr,
+            &format!("{OPS}/ai-release-pause"),
+            &[
+                ("Host".into(), "localhost".into()),
+                ("Content-Type".into(), "application/json".into()),
+                ("Content-Length".into(), body.len().to_string()),
+                ("Connection".into(), "close".into()),
+            ],
+            body.as_bytes(),
+        )
+        .await
+    });
+    // 要求が閉包に入り、writer を待つまで
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while server.ai_lock.try_lock().is_ok() {
+        assert!(Instant::now() < deadline, "鎖が取られない");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // 接続を切る
+    first.abort();
+    let _ = first.await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // 終わるまでは、再試行も停止の解除も busy
+    for route in AI_ROUTES {
+        let response = server.post(route, &valid_body(route, "")).await;
+        assert_eq!(response.status, 409, "{route}: {}", response.text());
+        assert_eq!(error_of(&response), "busy", "{route}");
+    }
+    assert!(server.ai_lock.try_lock().is_err());
+    // 書き込みが通ると、切れた接続の分も最後まで走って履歴に残り、鎖が外れる
+    server.db.execute_batch("COMMIT;").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while server.ai_lock.try_lock().is_err() {
+        assert!(Instant::now() < deadline, "鎖が外れない");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(server.count("SELECT COUNT(*) FROM ai_provider_pauses"), 0);
+    let record = server.latest().await;
+    assert_eq!(record["kind"], "ai_release_pause");
+    assert_eq!(record["report"], json!({"released": 1}));
+    let response = server.post("ai-retry", &valid_body("ai-retry", "")).await;
+    assert_eq!(response.status, 200, "{}", response.text());
+}
+
+#[tokio::test]
+async fn a_failed_write_is_a_fixed_500_and_a_failed_record_without_the_database_text() {
+    let server = Server::start_ai(Vec::new()).await;
+    server.job("image_embedding", "a", "failed");
+    server
+        .db
+        .execute_batch("DROP TABLE ai_jobs; DROP TABLE ai_provider_pauses;")
+        .unwrap();
+    for route in AI_ROUTES {
+        let response = server.post(route, &valid_body(route, "")).await;
+        assert_eq!(response.status, 500, "{route}: {}", response.text());
+        let text = response.text().to_owned();
+        for needle in [
+            "ai_jobs",
+            "ai_provider_pauses",
+            "no such table",
+            "catalog.db",
+            "sqlite",
+        ] {
+            assert!(!text.to_lowercase().contains(needle), "{route}: {text}");
+        }
+        assert_eq!(response.json()["ok"], false);
+    }
+    // 履歴には失敗として 2 件（再試行は済んだ分の集計つき。ここでは 0）
+    let ops = server.ops().await;
+    let history = ops["history"].as_array().unwrap();
+    assert_eq!(history.len(), 2, "{ops}");
+    assert_eq!(history[0]["kind"], "ai_release_pause");
+    assert_eq!(history[0]["outcome"], "failed");
+    assert_eq!(history[1]["kind"], "ai_retry");
+    assert_eq!(history[1]["outcome"], "failed");
+    assert_eq!(history[1]["report"]["requeued"], 0);
+    let text = ops.to_string();
+    for needle in [
+        "ai_jobs",
+        "ai_provider_pauses",
+        "no such table",
+        "catalog.db",
+    ] {
+        assert!(!text.contains(needle), "{needle}: {text}");
+    }
+}
+
+#[tokio::test]
+async fn a_failure_in_a_later_kind_keeps_the_earlier_kinds_commit_and_records_the_partial_counts() {
+    // JobKind の定義順は ImageEmbedding, LocationClue, LocationSuggest, LocationGeocode, PhotoJudge。
+    // 先の location_clue は再検査で Requeue（コミット済み）、後の photo_judge の再検査が SQLite のエラーで失敗する
+    let server = Server::start_ai_with_config(
+        vec![
+            Arc::new(Stub(JobKind::LocationClue)),
+            Arc::new(FailingRecheck(JobKind::PhotoJudge)),
+        ],
+        LOCAL_AI_JSON,
+    )
+    .await;
+    assert_eq!(
+        server.ops().await["ai"],
+        json!({"retry_kinds": ["location_clue", "photo_judge"]})
+    );
+    server.job("location_clue", "a", "failed");
+    server.job("location_clue", "b", "failed");
+    server.job("photo_judge", "c", "failed");
+
+    let response = server.post("ai-retry", &json!({"target": "all"})).await;
+    assert_eq!(response.status, 500, "{}", response.text());
+    assert_eq!(response.json()["ok"], false);
+    for needle in ["secret_photos", "catalog.db", "/srv/", "no such table"] {
+        assert!(!response.text().contains(needle), "{}", response.text());
+    }
+
+    // 先の種類はコミット済み（pending に戻り、カウンタも新しい枠）。後の種類は failed のまま
+    assert_eq!(
+        server.count(
+            "SELECT COUNT(*) FROM ai_jobs WHERE kind='location_clue' AND state='pending'
+                AND attempts=0 AND terminal=0"
+        ),
+        2
+    );
+    assert_eq!(
+        server.count(
+            "SELECT COUNT(*) FROM ai_jobs WHERE kind='photo_judge' AND state='failed'
+                AND attempts=5 AND terminal=1"
+        ),
+        1
+    );
+
+    // 履歴には失敗として 1 件。済んだ種類までの集計（requeued=2）が残り、失敗の文面は出ない
+    let ops = server.ops().await;
+    let history = ops["history"].as_array().unwrap();
+    assert_eq!(history.len(), 1, "{ops}");
+    assert_eq!(history[0]["kind"], "ai_retry");
+    assert_eq!(history[0]["outcome"], "failed");
+    assert_eq!(history[0]["report"]["requeued"], 2, "{ops}");
+    for needle in ["secret_photos", "catalog.db", "/srv/", "no such table"] {
+        assert!(!ops.to_string().contains(needle), "{needle}: {ops}");
+    }
 }
 
 // ================================================================ 子プロセスの serve
@@ -914,6 +1456,82 @@ fn a_sync_request_runs_the_stages_in_a_real_serve_and_lands_in_the_history() {
     let text = server.get_ops().to_string();
     assert!(!text.contains("catalog.db"), "{text}");
     assert!(!text.contains(dir.path().to_str().unwrap()), "{text}");
+}
+
+/// AC5（配線）: 本物の `serve` で、AI の再試行・停止の解除が通り、履歴に残る。AI の設定が無いので再試行できる種類は無く、
+/// 失敗したジョブも停止も無い（件数は全部 0）。
+#[test]
+fn the_ai_posts_work_in_a_real_serve_and_land_in_the_history() {
+    let dir = TempDir::new("ops-serve-ai");
+    let data = dir.path().join("data");
+    drop(production_shaped_db(&data));
+    let server = Child1::start(dir.path(), &data, &[]);
+    server.wait_first_cycle();
+    assert_eq!(server.get_ops()["ai"], json!({"retry_kinds": []}));
+
+    let (status, body) = server.post("ai-retry", &json!({"target": "all"}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["report"],
+        json!({"requeued": 0, "obsolete": 0, "satisfied": 0, "unsupported": 0, "policy_disabled": 0})
+    );
+    let (status, body) = server.post("ai-release-pause", &json!({"target": "all"}));
+    assert_eq!((status, &body["released"]), (200, &json!(0)), "{body}");
+    let (status, body) = server.post(
+        "ai-release-pause",
+        &json!({"target": {"task": "photo_judge"}}),
+    );
+    assert_eq!(
+        (status, body["error"].as_str()),
+        (409, Some("config_unavailable")),
+        "{body}"
+    );
+    let ops = server.get_ops();
+    let kinds: Vec<_> = ops["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| (r["kind"].as_str().unwrap(), r["outcome"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        kinds,
+        [("ai_release_pause", "released"), ("ai_retry", "retried")],
+        "{ops}"
+    );
+}
+
+/// AC5（配線）: 本物の `serve` に、通信しない AI 設定（ローカルの Decision だけ）を渡すと、`serve` が運用タブの再試行用に
+/// handler を登録する（`with_ai_ops` が抜けると `retry_kinds` が空のままになる）。失敗したジョブは何も作らないので、
+/// 再試行は全て 0 件で通る。
+#[test]
+fn a_real_serve_registers_the_retry_handlers_of_the_configured_local_tasks() {
+    let dir = TempDir::new("ops-serve-ai-handlers");
+    let data = dir.path().join("data");
+    drop(production_shaped_db(&data));
+    let ai = dir.path().join("ai.json");
+    fs::write(
+        &ai,
+        r#"{"version":1,"local_base_url":"http://192.0.2.10:8100",
+            "tasks":{"location_clue":{"provider":"local","model":"example-decision"}}}"#,
+    )
+    .unwrap();
+    let server = Child1::start(
+        dir.path(),
+        &data,
+        &[("GEOFRAME_AI_CONFIG", ai.to_str().unwrap())],
+    );
+    server.wait_first_cycle();
+    assert_eq!(
+        server.get_ops()["ai"],
+        json!({"retry_kinds": ["location_clue"]})
+    );
+
+    let (status, body) = server.post("ai-retry", &json!({"target": {"kind": "location_clue"}}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["report"],
+        json!({"requeued": 0, "obsolete": 0, "satisfied": 0, "unsupported": 0, "policy_disabled": 0})
+    );
 }
 
 /// AC3: `GEOFRAME_QUALITY_PER_CYCLE=1` の `serve` で、定期サイクルは 1 枚だけ解析する。品質解析の一括は残りを全部解析して

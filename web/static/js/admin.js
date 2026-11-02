@@ -139,7 +139,7 @@ function massDeleteNotice(hold){
 }
 /* AI運用の状態（/api/admin/status の ai_config_invalid・ai_jobs・ai_pauses・ai_waits。Rust版だけが返し、あるときだけ入る）。
    出すのは件数と固定の理由コードだけ（対象・接続先・モデルは返らない）。無ければ空の配列。
-   Provider停止の解除・失敗ジョブの再試行は画面からはできない。コマンドを文字で示すだけ。 */
+   Provider停止の解除・失敗ジョブの再試行は運用タブ（ops.js）から。serve が動いていないときの CLI のコマンドを文字で示す。 */
 const AI_JOB_STATE = {
   pending: '待機', running: '実行中', deferred: '後回し', failed: '失敗', succeeded: '完了', obsolete: '無効'
 };
@@ -188,7 +188,7 @@ function aiOpsCells(d){
         c.appendChild(el('span', 'k', (AI_REASON[code] || code) + ' ' + reasons[code] + '件'));
       });
       if(bad) c.appendChild(el('span', 'k',
-        'サービスを止めて geoframe ai-jobs retry --all で再検査（この画面からは操作できません）'));
+        '運用タブから再試行（serve が動いていないときは geoframe ai-jobs retry --all）'));
       cells.push(c);
     });
   }
@@ -215,7 +215,7 @@ function aiOpsCells(d){
         (AI_PAUSE_REASON[p.reason] || p.reason)));
     });
     c.appendChild(el('span', 'k',
-      '設定を直して再起動するか、サービスを止めて geoframe ai-jobs release-pause --task <用途> で解除'));
+      '設定を直して再起動するか、運用タブから解除（serve が動いていないときは geoframe ai-jobs release-pause --task <用途>）'));
     cells.push(c);
   }
   /* ai_task_blocks: 停止にかかって送られていない用途（停止を起こした用途と、同じ認証・接続先を使う用途）。
@@ -237,29 +237,8 @@ function aiOpsCells(d){
 /* 要対応: 位置なし・AI候補あり。押すと写真タブのそのフィルタへ移る（photos.js の gotoFilter が
    フィルタを変えて showTab を呼ぶので、一覧は 1 回だけ読まれる） */
 const TODO_ITEMS = [['noloc', '位置なし（要位置指定）'], ['suggest', 'AI候補あり（要確認）']];
-function todoCells(filters){
-  if(!filters) return [];
-  return TODO_ITEMS.map(([f, label]) => {
-    const n = filters[f] || 0;
-    const c = cell(label, n.toLocaleString('ja-JP'), '枚', n ? 'warn' : 'good');
-    const go = () => gotoFilter(f);
-    c.classList.add('todo');
-    c.setAttribute('role', 'button');
-    c.setAttribute('tabindex', '0');
-    c.addEventListener('click', go);
-    c.addEventListener('keydown', e => {
-      if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); go(); }
-    });
-    return c;
-  });
-}
-/* 要対応: 未確認・再確認の選別グループの数（db.quality.curation_pending。Rust 版の管理 API だけが返す。無ければ出さない）。
-   押すと選別タブへ移る */
-function curationTodoCells(quality){
-  if(!quality || quality.curation_pending === undefined || quality.curation_pending === null) return [];
-  const n = Number(quality.curation_pending) || 0;
-  const c = cell('未確認の選別', n.toLocaleString('ja-JP'), '組', n ? 'warn' : 'good');
-  const go = () => showTab('curation');
+/* 要対応の行にする: 押す（Enter・Space も）と go を呼ぶ */
+function makeTodo(c, go){
   c.classList.add('todo');
   c.setAttribute('role', 'button');
   c.setAttribute('tabindex', '0');
@@ -267,7 +246,35 @@ function curationTodoCells(quality){
   c.addEventListener('keydown', e => {
     if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); go(); }
   });
-  return [c];
+  return c;
+}
+function todoCells(filters){
+  if(!filters) return [];
+  return TODO_ITEMS.map(([f, label]) => {
+    const n = filters[f] || 0;
+    return makeTodo(cell(label, n.toLocaleString('ja-JP'), '枚', n ? 'warn' : 'good'), () => gotoFilter(f));
+  });
+}
+/* 要対応: 未確認・再確認の選別グループの数（db.quality.curation_pending。Rust 版の管理 API だけが返す。無ければ出さない）。
+   押すと選別タブへ移る */
+function curationTodoCells(quality){
+  if(!quality || quality.curation_pending === undefined || quality.curation_pending === null) return [];
+  const n = Number(quality.curation_pending) || 0;
+  return [makeTodo(cell('未確認の選別', n.toLocaleString('ja-JP'), '組', n ? 'warn' : 'good'), () => showTab('curation'))];
+}
+/* 要対応: 運用タブで対応する分（Rust 版の管理 API だけが返すキー。無ければ・0 なら行を出さない）。押すと運用タブへ移る。
+   大量削除の保留（sync.mass_delete_hold）・失敗した AI ジョブ（ai_jobs.by_state.failed）・AI の停止（ai_pauses） */
+function opsTodoCells(d){
+  const cells = [];
+  const go = () => showTab('ops');
+  const hold = d.sync && d.sync.mass_delete_hold;
+  if(hold) cells.push(makeTodo(cell('Driveの削除の保留（運用タブで対応）', hold.held, '件', 'bad'), go));
+  const failed = d.ai_jobs && d.ai_jobs.by_state ? Number(d.ai_jobs.by_state.failed) || 0 : 0;
+  if(failed) cells.push(makeTodo(cell('失敗したAIジョブ（運用タブで再試行）', failed, '件', 'bad'), go));
+  if(Array.isArray(d.ai_pauses) && d.ai_pauses.length){
+    cells.push(makeTodo(cell('AIの停止（運用タブで解除）', d.ai_pauses.length, '件', 'bad'), go));
+  }
+  return cells;
 }
 function loadStatus(){
   fetch('/api/admin/status').then(r => r.json()).then(d => {
@@ -275,7 +282,7 @@ function loadStatus(){
     $('#servertime').textContent = 'SERVER ' + d.server_time;
 
     const td = $('#s-todo'); td.textContent = '';
-    todoCells(d.db.filters).concat(curationTodoCells(d.db.quality)).forEach(c => td.appendChild(c));
+    todoCells(d.db.filters).concat(curationTodoCells(d.db.quality), opsTodoCells(d)).forEach(c => td.appendChild(c));
 
     const sy = $('#s-sync'); sy.textContent = '';
     sy.appendChild(cell('表示可能', d.sync.ready, '枚', 'good'));

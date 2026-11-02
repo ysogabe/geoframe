@@ -36,9 +36,9 @@ pub enum OpKind {
     QualityScan,
     /// Drive の大量削除の保留の解除。
     DriveRelease,
-    /// AI ジョブの再試行（PR ②。同期ワーカーでは処理しない）。
+    /// AI ジョブの再試行（POST の中で行い、同期ワーカーでは処理しない。`enqueue` しない）。
     AiRetry,
-    /// AI の停止の解除（PR ②。同上）。
+    /// AI の停止の解除（同上）。
     AiReleasePause,
 }
 
@@ -90,9 +90,9 @@ pub enum Outcome {
     Exceeded,
     /// 実行の直前に、保留が承認したものと違っていた（実行しなかった）。
     HoldChanged,
-    /// AI ジョブの再試行（PR ②）。
+    /// AI ジョブの再試行。
     Retried,
-    /// AI の停止の解除（PR ②）。
+    /// AI の停止の解除。
     Released,
 }
 
@@ -249,7 +249,7 @@ pub fn outcome_of(kind: RunKind, report: &CycleReport) -> Outcome {
     }
 }
 
-/// AI 系の要求の結果（PR ② で中身を使う。いまは型だけ）。
+/// AI 系の操作の結果（履歴の `report`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Report {
     Retry(RetryReport),
@@ -257,7 +257,7 @@ pub enum Report {
 }
 
 impl Report {
-    fn to_json(self) -> Value {
+    pub fn to_json(self) -> Value {
         match self {
             Self::Retry(r) => json!({
                 "requeued": r.requeued,
@@ -487,6 +487,36 @@ impl Board {
         inner.history.truncate(HISTORY_LEN);
     }
 
+    /// 現地時刻（`YYYY-MM-DD HH:MM:SS`）。同期ワーカーを通らない操作の開始・終了の時刻に使う。
+    pub fn timestamp_now(&self) -> String {
+        self.clock.timestamp(Duration::ZERO)
+    }
+
+    /// 同期ワーカーを通らない操作（AI の再試行・停止の解除。POST の中で行う）を、終わったものとして履歴に 1 件残す。
+    /// 待ち・実行中・Drive を読む間隔の基準は変えない。履歴は新しい順に [`HISTORY_LEN`] 件。
+    pub fn record_direct(
+        &self,
+        kind: OpKind,
+        started_at: String,
+        outcome: Outcome,
+        report: Option<Report>,
+    ) {
+        let mut inner = self.lock();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.history.push_front(Record {
+            id,
+            kind: RunKind::Op(kind),
+            requested_at: Some(started_at.clone()),
+            started_at,
+            finished_at: self.clock.timestamp(Duration::ZERO),
+            outcome,
+            stages: Vec::new(),
+            report,
+        });
+        inner.history.truncate(HISTORY_LEN);
+    }
+
     /// 定期サイクルを始める（実行中にし、次の予定を消す）。
     pub fn start_cycle(&self) {
         let mut inner = self.lock();
@@ -652,7 +682,8 @@ impl Snapshot {
         })
     }
 
-    /// `GET /api/admin/ops` の `history`（新しい順）。
+    /// `GET /api/admin/ops` の `history`（完了順の新しいほうが先頭）。`id` は受付順に採番するので、
+    /// 並びと一致しないことがある（同期の実行中に終わった AI の記録は、あとで終わる同期より後ろに来る）。
     pub fn history_json(&self) -> Value {
         Value::Array(self.history.iter().map(Record::to_json).collect())
     }
@@ -947,6 +978,25 @@ mod tests {
         }
         let ids: Vec<u64> = board.snapshot().history.iter().map(|r| r.id).collect();
         assert_eq!(ids, (4..=13).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn history_is_in_completion_order_even_when_ids_are_not() {
+        let (board, _clock, _stop) = board();
+        let sync = board.enqueue(OpKind::Sync, None, None).unwrap();
+        let req = board.take_queued().unwrap();
+        assert_eq!(req.id, sync.id);
+        // 同期の実行中に AI の記録が先に終わる（id は同期より大きい）
+        board.record_direct(OpKind::AiRetry, "t".into(), Outcome::Done, None);
+        board.finish(req.id, Outcome::Done, Vec::new(), None);
+        let ids: Vec<u64> = board.snapshot().history.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2], "完了順＝同期（#1）が先頭、AI（#2）が次");
+        // 10 件を超えても、完了の新しいほうから 10 件が残る
+        for _ in 0..10 {
+            run_to_end(&board, OpKind::QualityScan);
+        }
+        let ids: Vec<u64> = board.snapshot().history.iter().map(|r| r.id).collect();
+        assert_eq!(ids, (3..=12).rev().collect::<Vec<_>>());
     }
 
     #[test]

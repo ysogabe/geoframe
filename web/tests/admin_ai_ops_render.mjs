@@ -63,4 +63,14 @@ const unknownBlock = render({ai_task_blocks: [{task: 'photo_judge', scope: 'prov
 assert.match(unknownBlock, /photo_judge: Provider全体の停止（権限エラー（403））で 待ちは件数不明/);
 assert.doesNotMatch(unknownBlock, /0 件/);
 
+// 失敗ジョブ・停止の案内は運用タブから操作できる旨と、serve が動いていないときの CLI（docs/admin-ops R8）
+const failed = render({ai_jobs: {total: 3, by_state: {failed: 3}, reasons: {failed: {unavailable: 3}}}});
+assert.match(failed, /AIジョブ 失敗3件/);
+assert.match(failed, /運用タブから再試行（serve が動いていないときは geoframe ai-jobs retry --all）/);
+assert.doesNotMatch(failed, /この画面からは操作できません|サービスを止めて/);
+const paused = render({ai_pauses: [{task: 'photo_judge', scope: 'provider', reason: 'unauthorized'}]});
+assert.match(paused, /AI停止中（Provider・用途）/);
+assert.match(paused, /設定を直して再起動するか、運用タブから解除（serve が動いていないときは geoframe ai-jobs release-pause --task <用途>）/);
+assert.doesNotMatch(paused, /サービスを止めて/);
+
 console.log('ok');

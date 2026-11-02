@@ -387,6 +387,81 @@ fn a_requeued_job_is_runnable_again_and_the_count_reset_is_the_only_way_back() {
     assert!(claimed.is_some());
 }
 
+/// 再検査（writer の中）で必ず失敗する handler。種類ごとのトランザクションの途中失敗を作る。
+struct FailingRecheck(JobKind);
+
+impl Handler for FailingRecheck {
+    fn kind(&self) -> JobKind {
+        self.0
+    }
+    fn reconcile(&self, _read: &Connection, _now: i64) -> rusqlite::Result<Vec<jobs::JobKey>> {
+        Ok(Vec::new())
+    }
+    fn run(
+        &self,
+        _ctx: &super::worker::RunCtx<'_>,
+        _job: &jobs::Claimed,
+    ) -> Result<super::worker::Persist, super::worker::RunError> {
+        unreachable!("再試行は送らない")
+    }
+    fn recheck(&self, _conn: &Connection, _key: &JobKey) -> rusqlite::Result<Recheck> {
+        Err(rusqlite::Error::InvalidQuery)
+    }
+}
+
+#[test]
+fn a_failure_in_a_later_kind_returns_the_partial_report_and_keeps_the_earlier_kind_committed() {
+    let d = db("ops-retry-partial", Some(SAMPLE));
+    // 種類の順は JobKind::ALL（image_embedding → location_clue）。先の種類は戻せて、後の種類の再検査が失敗する
+    d.failed(JobKind::ImageEmbedding, "e1", "bad_response");
+    d.failed(JobKind::ImageEmbedding, "e2", "bad_response");
+    d.failed(JobKind::LocationClue, "c1", "bad_response");
+    // 失敗した種類より後ろ（photo_judge。handler 未登録）には進まない
+    d.failed(JobKind::PhotoJudge, "j1", "bad_response");
+    let embedding = Fake::ok(JobKind::ImageEmbedding);
+    embedding
+        .verdicts
+        .lock()
+        .unwrap()
+        .insert("e2".to_string(), Recheck::Obsolete);
+    let handlers: Vec<Arc<dyn Handler>> =
+        vec![embedding, Arc::new(FailingRecheck(JobKind::LocationClue))];
+    let (partial, error) = ops::retry(
+        &d.writer,
+        &d.config,
+        &handlers,
+        RetryTarget::All,
+        &d.clock(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, crate::writer::WriteError::Query(_)),
+        "{error}"
+    );
+    // 済んだ種類の集計だけ（失敗した種類・それより後ろは足さない）
+    assert_eq!(
+        partial,
+        RetryReport {
+            requeued: 1,
+            obsolete: 1,
+            satisfied: 0,
+            unsupported: 0,
+            policy_disabled: 0
+        }
+    );
+    // 先の種類はコミット済みで戻らない。失敗した種類のトランザクションは巻き戻り、後ろの種類には触れない
+    assert_eq!(
+        d.state(JobKind::ImageEmbedding, "e1"),
+        ("pending".into(), 0, 0)
+    );
+    assert_eq!(d.state(JobKind::ImageEmbedding, "e2").0, "obsolete");
+    assert_eq!(
+        d.state(JobKind::LocationClue, "c1"),
+        ("failed".into(), 5, 1)
+    );
+    assert_eq!(d.state(JobKind::PhotoJudge, "j1"), ("failed".into(), 5, 1));
+}
+
 // ---------------------------------------------------------------- 停止の解除
 
 #[test]
@@ -473,19 +548,22 @@ fn release_pause_by_task_does_nothing_when_the_config_cannot_identify_the_pause(
                 )
             })
             .unwrap();
-        assert_eq!(
-            ops::release_pause(
-                &d.writer,
-                &d.config,
-                PauseTarget::Task(TaskKind::ImageEmbedding)
+        assert!(
+            matches!(
+                ops::release_pause(
+                    &d.writer,
+                    &d.config,
+                    PauseTarget::Task(TaskKind::ImageEmbedding)
+                ),
+                Err(ReleaseError::ConfigUnavailable)
             ),
-            Err(ReleaseError::ConfigUnavailable)
+            "{tag}"
         );
         assert_eq!(d.writer.call(|c| pause::list(c)).unwrap().len(), 1, "{tag}");
         // 明示した --all だけが、設定が不正でも消す
         assert_eq!(
-            ops::release_pause(&d.writer, &d.config, PauseTarget::All),
-            Ok(1)
+            ops::release_pause(&d.writer, &d.config, PauseTarget::All).unwrap(),
+            1
         );
     }
     // 設定にない用途の解除も何も消さない
@@ -496,14 +574,14 @@ fn release_pause_by_task_does_nothing_when_the_config_cannot_identify_the_pause(
             "",
         )),
     );
-    assert_eq!(
+    assert!(matches!(
         ops::release_pause(
             &d.writer,
             &d.config,
             PauseTarget::Task(TaskKind::LocationClue)
         ),
         Err(ReleaseError::ConfigUnavailable)
-    );
+    ));
 }
 
 // ---------------------------------------------------------------- 共有の一時待機の表示
