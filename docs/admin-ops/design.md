@@ -512,7 +512,7 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
   `ai-retry` は途中の種類で失敗したとき、済んだ種類までの件数を `report` に持つ `failed` の記録を残して 500（定型文）。
 - **判定の順序**（`ai-retry`・`ai-release-pause` とも）: 本文の形（`target` の形・名前。400 `bad_params`）→ 掲示板・writer が無い、または停止の合図のあと
   （503）→ 別の AI の操作が実行中（409 `busy`）→ 実行。`target` は `"all"` か、キー 1 つだけのオブジェクト（`{"kind"}`・`{"task"}`）で、
-  **余計な鍵が付くと 400**。`busy` の排他は `spawn_blocking` の閉包の中で `try_lock` する（async 側で取ると接続が切れたとき鎖だけが外れるため）。
+  **`target` の中の余計な鍵が付くと 400。本文の最上位の余計な鍵は既存の POST と同じく無視**。`busy` の排他は `spawn_blocking` の閉包の中で `try_lock` する（async 側で取ると接続が切れたとき鎖だけが外れるため）。
 - **履歴の `id`**: AI の記録は同期ワーカーを通らない（`Board::record_direct`）。番号は同期系と同じ連番（`next_id`）で、`requested_at` と
   `started_at` は同じ時刻、段（`stages`）は空、`report` は再試行が 5 つの件数・解除が `released`。履歴の件数（10）と順序は同じ。
 - **`GET /api/admin/ops` の `ai.retry_kinds`**: 再試行用の handlers に登録のある種類を `JobKind` の定義順に返す（起動時に固定）。

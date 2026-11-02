@@ -304,7 +304,7 @@ pub fn ai_retry(payload: &Map<String, Value>, ai: &AiOps) -> Result<Value, ApiEr
                 );
                 Ok(json!({ "ok": true, "report": Report::Retry(report).to_json() }))
             }
-            Err((report, _)) => {
+            Err((report, cause)) => {
                 board.record_direct(
                     OpKind::AiRetry,
                     started_at,
@@ -317,7 +317,8 @@ pub fn ai_retry(payload: &Map<String, Value>, ai: &AiOps) -> Result<Value, ApiEr
                     report.obsolete,
                     report.satisfied
                 );
-                // SQLite の文面を持ち込まない（固定の文）
+                // 原因はログにだけ（SQLite のメッセージまでで値を含まない）。応答は固定の文
+                tracing::error!("AI の再試行の失敗の原因: {cause}");
                 Err(ApiError::Internal("AI の再試行に失敗しました".into()))
             }
         }
@@ -349,9 +350,10 @@ pub fn ai_release_pause(payload: &Map<String, Value>, ai: &AiOps) -> Result<Valu
             }
             // 何も消していない拒否。他の 409 と同じく履歴には残さない
             Err(ReleaseError::ConfigUnavailable) => Err(ApiError::Busy(CONFIG_UNAVAILABLE.into())),
-            Err(ReleaseError::Write) => {
+            Err(ReleaseError::Write(cause)) => {
                 board.record_direct(OpKind::AiReleasePause, started_at, Outcome::Failed, None);
                 tracing::warn!("AI の停止の解除に失敗した");
+                tracing::error!("AI の停止の解除の失敗の原因: {cause}");
                 Err(ApiError::Internal("AI の停止の解除に失敗しました".into()))
             }
         }

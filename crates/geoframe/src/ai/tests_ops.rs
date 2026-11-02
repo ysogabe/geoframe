@@ -548,19 +548,22 @@ fn release_pause_by_task_does_nothing_when_the_config_cannot_identify_the_pause(
                 )
             })
             .unwrap();
-        assert_eq!(
-            ops::release_pause(
-                &d.writer,
-                &d.config,
-                PauseTarget::Task(TaskKind::ImageEmbedding)
+        assert!(
+            matches!(
+                ops::release_pause(
+                    &d.writer,
+                    &d.config,
+                    PauseTarget::Task(TaskKind::ImageEmbedding)
+                ),
+                Err(ReleaseError::ConfigUnavailable)
             ),
-            Err(ReleaseError::ConfigUnavailable)
+            "{tag}"
         );
         assert_eq!(d.writer.call(|c| pause::list(c)).unwrap().len(), 1, "{tag}");
         // 明示した --all だけが、設定が不正でも消す
         assert_eq!(
-            ops::release_pause(&d.writer, &d.config, PauseTarget::All),
-            Ok(1)
+            ops::release_pause(&d.writer, &d.config, PauseTarget::All).unwrap(),
+            1
         );
     }
     // 設定にない用途の解除も何も消さない
@@ -571,14 +574,14 @@ fn release_pause_by_task_does_nothing_when_the_config_cannot_identify_the_pause(
             "",
         )),
     );
-    assert_eq!(
+    assert!(matches!(
         ops::release_pause(
             &d.writer,
             &d.config,
             PauseTarget::Task(TaskKind::LocationClue)
         ),
         Err(ReleaseError::ConfigUnavailable)
-    );
+    ));
 }
 
 // ---------------------------------------------------------------- 共有の一時待機の表示

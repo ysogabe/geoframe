@@ -419,11 +419,12 @@ pub enum PauseTarget {
     Task(TaskKind),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ReleaseError {
     /// 設定が未指定・不正・その用途が未設定で、今の識別が分からない（何も消さない）。
     ConfigUnavailable,
-    Write,
+    /// 書き込みの失敗。原因はログにだけ出す（応答・履歴には出さない）。
+    Write(WriteError),
 }
 
 /// Provider・用途の停止を明示解除する。消した件数を返す。
@@ -433,9 +434,7 @@ pub fn release_pause(
     target: PauseTarget,
 ) -> Result<usize, ReleaseError> {
     match target {
-        PauseTarget::All => writer
-            .call(pause::release_all)
-            .map_err(|_| ReleaseError::Write),
+        PauseTarget::All => writer.call(pause::release_all).map_err(ReleaseError::Write),
         PauseTarget::Task(task) => {
             let settings = ai.settings().ok_or(ReleaseError::ConfigUnavailable)?;
             let keys: Vec<_> = [
@@ -458,7 +457,7 @@ pub fn release_pause(
                     }
                     Ok(removed)
                 })
-                .map_err(|_| ReleaseError::Write)
+                .map_err(ReleaseError::Write)
         }
     }
 }

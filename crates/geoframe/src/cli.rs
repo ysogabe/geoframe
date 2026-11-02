@@ -1199,7 +1199,7 @@ fn ai_jobs_release_pause(config: &Config, ingest: &Ingest, target: PauseTarget) 
             );
             ExitCode::from(2)
         }
-        Err(ops::ReleaseError::Write) => {
+        Err(ops::ReleaseError::Write(_)) => {
             eprintln!("geoframe: 停止の解除に失敗しました");
             ExitCode::FAILURE
         }
