@@ -214,6 +214,9 @@ fn replies_are_validated_in_order_and_anything_off_is_unreadable() {
     // 1 日の期間・同じ日・ちょうど 20 年
     assert!(parse_reply(&span("2024-02-29", "2024-02-29"), today()).is_some());
     assert!(parse_reply(&span("2000-01-01", "2020-01-01"), today()).is_some());
+    // ちょうど 20 年（1900-01-01〜1920-01-01 は 7304 日）と 2/29 起点
+    assert!(parse_reply(&span("1900-01-01", "1920-01-01"), today()).is_some());
+    assert!(parse_reply(&span("2000-02-29", "2020-02-29"), today()).is_some());
     // 基準年+1 までは読む
     assert!(parse_reply(&span("2027-01-01", "2027-12-31"), today()).is_some());
 
@@ -256,11 +259,28 @@ fn replies_are_validated_in_order_and_anything_off_is_unreadable() {
         ("1900 年より前", span("1899-01-01", "1899-12-31")),
         ("0000 年", span("0000-01-01", "0000-12-31")),
         ("20 年を 1 日超える", span("2000-01-01", "2020-01-02")),
+        (
+            "20 年を 1 日超える（1900 年は平年で、日数は 7305 日のまま）",
+            span("1900-01-01", "1920-01-02"),
+        ),
+        (
+            "20 年を 1 日超える（2/29 起点）",
+            span("2000-02-29", "2020-03-01"),
+        ),
         ("20 年を大きく超える", span("1900-01-01", "2026-11-02")),
     ];
     for (why, body) in bad {
         assert_eq!(parse_reply(&body, today()), None, "{why}");
     }
+}
+
+#[test]
+fn the_span_limit_is_the_same_month_and_day_20_years_later_clamped_to_the_month_end() {
+    assert_eq!(span_limit(day(1900, 1, 1)), day(1920, 1, 1));
+    assert_eq!(span_limit(day(2000, 2, 29)), day(2020, 2, 29));
+    assert_eq!(span_limit(day(2025, 6, 15)), day(2045, 6, 15));
+    // 20 年後が平年になる 2/29 は 2/28（年の上限の外だが、規則そのものを確かめる）
+    assert_eq!(span_limit(day(1880, 2, 29)), day(1900, 2, 28));
 }
 
 #[tokio::test]
@@ -490,5 +510,19 @@ async fn the_reservation_happens_before_sending_so_concurrent_requests_cannot_ex
     for task in tasks {
         let _ = task.await.unwrap();
     }
-    assert!(lab.sent() <= PER_WINDOW, "{}", lab.sent());
+    // 予約はちょうど上限まで積まれる（送れたかどうかによらない）
+    {
+        let state = runtime.state.lock().unwrap();
+        assert_eq!(state.window.len(), PER_WINDOW);
+        assert_eq!(state.blocked_until, None, "Busy は待ちを置かない");
+    }
+    assert!(
+        lab.sent() >= 1 && lab.sent() <= PER_WINDOW,
+        "{}",
+        lab.sent()
+    );
+    // 枠は空いている。それでも次の要求は上限で断られ、LLM には来ない
+    let before = lab.sent();
+    assert_eq!(runtime.read("あの頃", today()).await, Outcome::Unavailable);
+    assert_eq!(lab.sent(), before);
 }

@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use super::http::{Deadline, Endpoint, HttpError};
 use super::provider::LanClient;
 use crate::config::Config;
-use crate::library_when::{Date, Span, year_ok};
+use crate::library_when::{Date, Span, days_in_month, year_ok};
 use crate::stop::StopFlag;
 
 /// 送るモデル（2026-11-02 の試験で使ったもの）。
@@ -36,8 +36,8 @@ const PER_WINDOW: usize = 20;
 /// 失敗のあとに送らない長さの既定と上限。
 const DEFAULT_WAIT: Duration = Duration::from_secs(60);
 const MAX_WAIT: Duration = Duration::from_secs(300);
-/// 期間の上限（20 年。うるう日が 5 回入る 20 年が 7305 日）。
-const MAX_SPAN_DAYS: i64 = 7305;
+/// 期間の上限（開始日から数えて 20 年。日数ではなく暦で求める。[`span_limit`]）。
+const MAX_SPAN_YEARS: i32 = 20;
 /// 経路（ログ用の固定の文字）。
 const ROUTE: &str = "/llm-vl/v1/chat/completions";
 
@@ -231,8 +231,21 @@ fn parse_reply(body: &[u8], today: Date) -> Option<Span> {
     let ok = from <= to
         && year_ok(from.year, today)
         && year_ok(to.year, today)
-        && to.to_days() - from.to_days() <= MAX_SPAN_DAYS;
+        && to <= span_limit(from);
     ok.then_some(Span { from, to })
+}
+
+/// 開始日 `from` から許す最後の日: `from` の 20 年後の同じ月日。そのうるう年の 2/29 を起点にして 20 年後が平年
+/// （100 の倍数で 400 の倍数でない年）なら 2/28 にする（その月の末日に丸める）。日数で数えると、20 年の中の
+/// うるう日の数（4 回か 5 回）で境目が 1 日ずれる。
+fn span_limit(from: Date) -> Date {
+    let year = from.year + MAX_SPAN_YEARS;
+    let day = from.day.min(days_in_month(year, from.month));
+    Date {
+        year,
+        month: from.month,
+        day,
+    }
 }
 
 /// `YYYY-MM-DD`（ASCII の数字と `-` だけの 10 文字）で、暦に在る日付。
