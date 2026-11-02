@@ -80,6 +80,9 @@ const ALLOWED: &[(&str, Exe, usize)] = &[
     // ビルドした geoframe の実行ファイル（`CARGO_BIN_EXE_geoframe`）を動かす CLI の試験と、終了信号を送る `kill`。
     ("geoframe/tests/ingest_cli.rs", Exe::Expr("BIN"), 4),
     ("geoframe/tests/ingest_cli.rs", Exe::Lit("kill"), 1),
+    // 運用タブの API の結合試験（子プロセスの `serve` と、その停止に使う `kill`）。
+    ("geoframe/tests/ops_api.rs", Exe::Expr("BIN"), 1),
+    ("geoframe/tests/ops_api.rs", Exe::Lit("kill"), 1),
 ];
 
 /// 他のコマンドを起動するコマンド。引数に python があれば python を起動するのと同じなので、

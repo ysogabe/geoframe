@@ -377,6 +377,7 @@ async fn every_embedded_file_is_served_byte_for_byte() {
         ("/static/js/library.js", "text/javascript"),
         ("/static/js/curation.js", "text/javascript"),
         ("/static/js/config.js", "text/javascript"),
+        ("/static/js/ops.js", "text/javascript"),
         ("/vendor/fonts.css", "text/css"),
         ("/vendor/maplibre-gl-4.7.1.min.js", "text/javascript"),
         ("/vendor/fonts/share-tech-mono-latin.woff2", "font/woff2"),
@@ -506,6 +507,7 @@ fn the_scripts_never_build_html_from_strings() {
         "library.js",
         "curation.js",
         "config.js",
+        "ops.js",
     ] {
         assert!(
             checked.iter().any(|c| c == name),
@@ -847,6 +849,7 @@ async fn cache_and_framing_headers_follow_the_current_server() {
         "/static/js/library.js",
         "/static/js/curation.js",
         "/static/js/config.js",
+        "/static/js/ops.js",
         "/vendor/fonts.css",
     ] {
         let r = get(addr, target).await;

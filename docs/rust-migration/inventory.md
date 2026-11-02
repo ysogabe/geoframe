@@ -149,7 +149,7 @@ Rustでも意識して残すか、直すかを決める必要がある。
 | 推定の錨が消えた後のDrive写真 | `display=NULL` になったDrive写真は `fetch_derivatives`（`source='drive' AND display IS NULL`）が取り直し、`fetched_at` が新しくなる。表示側（E1の新着ブースト）で**新着扱いになり直す** | `geo.py:infer_locations`、`drive.py:fetch_derivatives` |
 | 写真の行が消える／idが変わる | 旅行ブログの下書きは画像を `photo_id` で参照する（`travel_blog.py:319` 付近）。行が消えるか再追加で別idになると、下書きの参照が切れる（書き出し時に `_photo_source` が400）。**Rust（T3.7、④）: 書き出しは、行が無い（`missing`）・`hidden`・表示用の画像が使えない（`no_image`）写真だけを飛ばして残りを書き出し、応答の `skipped` で知らせる**（飛ばした写真は manifest・Markdown・HTML から取り除く。全部飛んだら本文だけ。`dry_run` も数える。下書きの保存E15は写真を見ない）。idが変わること自体は今のまま | `travel_blog.py` |
 | `manual` | 再推定の対象外（`loc_source IS NULL OR 'inferred'` のみ再評価）。ほかの未解決写真の錨になる | `geo.py:infer_locations` |
-| 大量削除の保留（Rustで足した保護。T2.4。**T3.7の⑤で管理画面に表示**） | 消す行が50件超かつDriveの行の20%超、または一覧が空のときは、削除を保留する。**意図した削除も配信に残る**（`geoframe sync --allow-mass-delete`の1回だけで外れ、`serve`の定期実行では外せない） | `drive/`（Rust） |
+| 大量削除の保留（Rustで足した保護。T2.4。**T3.7の⑤で管理画面に表示**） | 消す行が50件超かつDriveの行の20%超、または一覧が空のときは、削除を保留する。**意図した削除も配信に残る**（`geoframe sync --allow-mass-delete`の1回だけで外れ、`serve`の定期実行では外せない。2026-11-02 に運用タブからの解除を追加。admin-ops） | `drive/`（Rust） |
 
 **P3で決めたこと**（2026-10-25にユーザーが決定。実装は[tasks.md](tasks.md) T3.7、Rustの挙動は[server.md §0](server.md)・§13.7・§14.8・§10.6・§21.9）:
 

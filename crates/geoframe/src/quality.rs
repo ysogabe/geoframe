@@ -543,6 +543,21 @@ impl Stage for Quality {
     }
 }
 
+/// 運用コンソールの「品質解析の一括」が走らせる段: [`scan`]（CLI の `quality-scan` と同じ）を `Stage` に包む。
+/// 名前は定期サイクルの段と同じ `quality`。長く走るあいだも、停止の合図で段が止まる（`scan` が見る）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Scan;
+
+impl Stage for Scan {
+    fn name(&self) -> &'static str {
+        "quality"
+    }
+
+    fn run(&self, ctx: &StageCtx<'_>) -> Result<StageOutcome, StageError> {
+        scan(ctx)
+    }
+}
+
 /// `geoframe quality-scan`（現行の `server.py --quality-scan` の `quality_backfill`）: 孤児を消し、未解析が
 /// なくなるまで `GEOFRAME_QUALITY_PER_CYCLE` 件ずつ解析し、再構築する。`--dry-run` は同期の段と同じ件数。
 pub fn scan(ctx: &StageCtx<'_>) -> Result<StageOutcome, StageError> {

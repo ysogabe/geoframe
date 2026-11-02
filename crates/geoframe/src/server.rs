@@ -88,6 +88,9 @@ pub struct AppState {
     /// `serve` だけが持ち、`/api/admin/status` の `sync.mass_delete_hold` に出す。無いとき（取り込み無効・試験）は
     /// キーを出さない。
     pub mass_delete: Option<Arc<MassDeleteBoard>>,
+    /// 運用コンソールの掲示板（同期ワーカーが処理する要求の待ち・実行中・履歴）。取り込みが有効の `serve` だけが持つ。
+    /// 無いとき（取り込み無効・試験）は `None`。
+    pub ops: Option<Arc<crate::ops::Board>>,
     /// プロセスの起動時刻（`GET /api/admin/config` の `started_at`・`uptime_s`）。状態を作った時刻で、`serve_until` が
     /// 待ち受けを始める直前に取り直す。
     pub started_at: std::time::SystemTime,
@@ -135,6 +138,7 @@ impl AppState {
             tiles,
             blog,
             mass_delete: None,
+            ops: None,
             started_at: std::time::SystemTime::now(),
             thumbs: Arc::new(crate::thumb::ThumbState::new()),
         }
@@ -154,6 +158,12 @@ impl AppState {
     /// 大量削除の保留の記憶を付ける（取り込みが有効の `serve`。同期サイクルの段と同じもの）。
     pub fn with_mass_delete_board(mut self, board: Arc<MassDeleteBoard>) -> Self {
         self.mass_delete = Some(board);
+        self
+    }
+
+    /// 運用コンソールの掲示板を付ける（取り込みが有効の `serve`。同期ワーカーと同じもの）。
+    pub fn with_ops(mut self, board: Arc<crate::ops::Board>) -> Self {
+        self.ops = Some(board);
         self
     }
 
@@ -674,7 +684,8 @@ fn not_yet_implemented(label: &'static str) -> Response {
 ///    HEAD・`/api/admin/configX`・末尾 `/` は当たらず、下の静的配信の判定で 403。
 ///    `GET` の `/api/admin/library/{trips,photos,points,calendar,places}`（ライブラリ）も**完全一致**の読み取り API
 ///    （[`crate::admin_library`]）。HEAD・似た名前・末尾 `/` は 403。
-///    `GET` の `/api/admin/curation/groups`（選別の確認。[`crate::admin_curation`]）も同じ完全一致。
+///    `GET` の `/api/admin/curation/groups`（選別の確認。[`crate::admin_curation`]）・`/api/admin/ops`（運用タブ。
+///    [`crate::admin_ops`]）も同じ完全一致。
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
 ///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
@@ -750,6 +761,10 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 crate::admin_config::response(&state).await,
                 "/api/admin/config",
             );
+        }
+        // 運用タブの読み取り API（`crate::admin_ops`）。これも完全一致で、前方一致の `/api/admin/status` より前
+        if path == "/api/admin/ops" {
+            return labeled(crate::admin_ops::response(&state).await, "/api/admin/ops");
         }
         // ライブラリの読み取り API（`crate::admin_library`）。これも完全一致（`/api/admin/library/tripsX` や末尾 `/` は
         // 静的配信の判定に回って 403）

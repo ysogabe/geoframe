@@ -1,4 +1,4 @@
-// vm で admin.js・photos.js・library.js・config.js を動かす描画試験のための、小さな DOM の代用品（依存なし）。
+// vm で admin.js・photos.js・library.js・curation.js・config.js・ops.js を動かす描画試験のための、小さな DOM の代用品（依存なし）。
 // 本物のブラウザの全部は真似ない。試験が必要とする範囲だけ:
 //   - 要素の同一性（createElement したものが同じ参照のまま木に入る）、children 配列、親子の付け外し
 //   - textContent（子の文字列をつなぐ getter と、子を置き換える setter）
@@ -237,6 +237,7 @@ export function buildAdminDom(){
   mk('button', {cls: 'tab', text: '▸ ライブラリ', data: {tab: 'library'}}, nav);
   mk('button', {cls: 'tab', text: '▸ 選別', data: {tab: 'curation'}}, nav);
   mk('button', {cls: 'tab', text: '▸ 設定', data: {tab: 'config'}}, nav);
+  mk('button', {cls: 'tab', text: '▸ 運用', data: {tab: 'ops'}}, nav);
 
   const main = mk('main', {}, body);
   const st = mk('section', {id: 'v-status'}, main);
@@ -352,6 +353,17 @@ export function buildAdminDom(){
   const otp = mk('div', {id: 'c-other-panel', cls: 'panel hidden'}, cf);
   mk('table', {id: 'c-other', cls: 'cfg'}, otp);
   mk('div', {id: 'c-legend', cls: 'legend'}, mk('div', {cls: 'panel'}, cf));
+
+  // 運用タブ（admin.html の #v-ops と同じ id）
+  const ops = mk('section', {id: 'v-ops', cls: 'hidden'}, main);
+  const opp = mk('div', {cls: 'panel'}, ops);
+  mk('div', {id: 'o-readonly', cls: 'cfg-note hidden', text: '取り込みが無効なので運用操作はできない（読み取り専用の起動）'}, opp);
+  const oact = mk('div', {id: 'o-actions', cls: 'hidden'}, opp);
+  mk('button', {id: 'o-sync', cls: 'btn', text: '同期をいま回す'}, mk('div', {cls: 'op-row'}, oact)).disabled = true;
+  mk('button', {id: 'o-quality', cls: 'btn', text: '品質解析を一括で回す'}, mk('div', {cls: 'op-row'}, oact)).disabled = true;
+  mk('div', {id: 'o-hold'}, mk('div', {id: 'o-hold-panel', cls: 'panel hidden'}, ops));
+  mk('div', {id: 'o-cycle'}, mk('div', {id: 'o-cycle-panel', cls: 'panel'}, ops));
+  mk('div', {id: 'o-history'}, mk('div', {id: 'o-history-panel', cls: 'panel'}, ops));
 
   const modal = mk('div', {id: 'modal', cls: 'hidden'}, body);
   const box = mk('div', {cls: 'mbox'}, modal);

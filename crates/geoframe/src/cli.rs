@@ -93,7 +93,8 @@ const USAGE: &str = "\
                                         --dry-run では地理院に問い合わせず、件数だけを出す。Drive への通信を避けるなら、
                                         存在しない鍵ファイルの絶対パスを GEOFRAME_DRIVE_KEY に与える。--data-dir では避けられない）。
                                         Drive の一覧が空、または消す行が多すぎる（50 件超かつ Drive の行の 20% 超）ときは
-                                        削除を保留する。意図した削除なら --allow-mass-delete を付けた 1 回だけで外す
+                                        削除を保留する。意図した削除は、serve が動いているあいだは運用タブから解除する。
+                                        動いていないときは --allow-mass-delete を付けた 1 回だけで外す
                                         （serve の定期実行では外せない。--dry-run と併せれば、外した場合の件数を見られる）。
                                         --dry-run はガードを通さないが、本番機で実行してよいという意味ではない
                                         （検証環境の本番コピーに向ける。本番の DB には向けない）。
@@ -460,24 +461,33 @@ fn serve(overrides: &Overrides) -> ExitCode {
     // Drive の状態。大量削除の保留の記憶は、管理画面（サーバーの状態）と `index_drive` で同じものを使う
     let drive = Arc::new(crate::drive::DriveShared::new());
     let mass_delete = drive.mass_delete_board();
-    let threads = ingest.as_ref().map(|ingest| IngestThreads {
-        worker: crate::sync::spawn_worker(
-            Arc::clone(&config),
-            ingest.writer.clone(),
-            Arc::clone(&ingest.cache),
-            crate::sync::default_stages_with(drive),
-            stop.clone(),
-            config.drive_poll(),
-            ingest.lock_hold(),
-        ),
-        saver: crate::cache::spawn_saver(
-            Arc::clone(&ingest.cache),
-            stop.clone(),
-            ingest.lock_hold(),
-        ),
-    });
-    if ingest.is_some() {
-        state = state.with_mass_delete_board(mass_delete);
+    // 運用コンソールの掲示板。要求は同期ワーカーの 1 本のスレッドが直列に処理する（取り込みが有効のときだけ）
+    let ops_board = ingest
+        .is_some()
+        .then(|| Arc::new(crate::ops::Board::with_system_clock(stop.clone())));
+    let threads = ingest
+        .as_ref()
+        .zip(ops_board.as_ref())
+        .map(|(ingest, board)| IngestThreads {
+            worker: crate::sync::spawn_worker(
+                Arc::clone(&config),
+                ingest.writer.clone(),
+                Arc::clone(&ingest.cache),
+                crate::sync::default_stages_with(Arc::clone(&drive)),
+                stop.clone(),
+                config.drive_poll(),
+                ingest.lock_hold(),
+                Arc::clone(board),
+                Arc::clone(&drive),
+            ),
+            saver: crate::cache::spawn_saver(
+                Arc::clone(&ingest.cache),
+                stop.clone(),
+                ingest.lock_hold(),
+            ),
+        });
+    if let Some(board) = ops_board {
+        state = state.with_mass_delete_board(mass_delete).with_ops(board);
     }
     if state.data_root.as_path() != state.config.data_dir.as_path() {
         // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する

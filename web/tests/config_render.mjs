@@ -147,7 +147,7 @@ await test('admin.html と fakedom の骨格（id・タブ・読み込み順）�
   const want = htmlFacts(html);
   const have = domFacts(buildAdminDom());
   assert.deepEqual(have.ids, want.ids, 'id の集合');
-  assert.deepEqual(want.tabs, ['status', 'photos', 'library', 'curation', 'config']);
+  assert.deepEqual(want.tabs, ['status', 'photos', 'library', 'curation', 'config', 'ops']);
   assert.deepEqual(have.tabs, want.tabs);
   for(const id of ['v-config', 'c-note', 'c-runtime', 'c-files', 'c-ingest', 'c-geo', 'c-ai', 'c-ai-state',
                    'c-ai-tasks', 'c-ai-space', 'c-legend']){
@@ -156,7 +156,7 @@ await test('admin.html と fakedom の骨格（id・タブ・読み込み順）�
   assert.ok(html.includes('<section id="v-config" class="hidden">'), '設定タブは最初は隠れている');
   assert.ok(html.includes('data-tab="config">▸ 設定</button>'));
   const scripts = [...html.matchAll(/<script src="([^"]+)"/g)].map(m => m[1]).filter(u => u.startsWith('/static/'));
-  assert.deepEqual(scripts, ['/static/js/admin.js', '/static/js/photos.js', '/static/js/library.js', '/static/js/curation.js', '/static/js/config.js']);
+  assert.deepEqual(scripts, ['/static/js/admin.js', '/static/js/photos.js', '/static/js/library.js', '/static/js/curation.js', '/static/js/config.js', '/static/js/ops.js']);
 });
 
 await test('config.js は HTML 文字列を組まず、読み込んだだけでは fetch にも location にも触らない', () => {
