@@ -4,7 +4,7 @@
 //   - textContent（子の文字列をつなぐ getter と、子を置き換える setter）
 //   - className / classList / dataset / setAttribute / getAttribute
 //   - addEventListener（登録した関数を保持し、click() と dispatchEvent({type}) で呼ぶ。バブリングはしない。disabled なボタン等の click() は何も起こさない）
-//   - disabled / value / checked / focus() と document.activeElement、getBoundingClientRect()（幅 100 の固定）、document.contains()
+//   - disabled / value / checked / focus() と document.activeElement、getBoundingClientRect()（幅は 100。試験が rectWidth を入れれば差し替わる）、document.contains()
 //   - querySelector / querySelectorAll: #id .class tag tag.class [data-x] [data-x=v] とその組み合わせ、
 //     空白区切りの子孫（"nav .tab" など）
 //   - document.createElement / createTextNode / getElementById / addEventListener / dispatchEvent
@@ -101,7 +101,7 @@ class FakeElement {
     this.checked = false;
     this.title = '';
   }
-  getBoundingClientRect(){ return {left: 0, top: 0, width: 100, height: 100}; }
+  getBoundingClientRect(){ return {left: 0, top: 0, width: this.rectWidth === undefined ? 100 : this.rectWidth, height: 100}; }
   get childNodes(){ return this.children; }
   get textContent(){ return this.children.map(c => c.textContent).join(''); }
   set textContent(v){
@@ -298,7 +298,6 @@ export function buildAdminDom(){
   mk('button', {id: 'lib-view-trips', cls: 'lib-seg on', text: '旅', data: {view: 'trips'}}, lbar);
   mk('button', {id: 'lib-view-calendar', cls: 'lib-seg', text: '日付', data: {view: 'calendar'}}, lbar);
   mk('button', {id: 'lib-view-places', cls: 'lib-seg', text: '場所', data: {view: 'places'}}, lbar);
-  mk('button', {id: 'lib-view-map', cls: 'lib-seg', text: '地図', data: {view: 'map'}}, lbar);
   const lopt = mk('label', {cls: 'opt'}, lbar);
   mk('input', {id: 'lib-hidden'}, lopt);
   lopt.appendChild(document.createTextNode(' 除外も含める'));
@@ -311,16 +310,20 @@ export function buildAdminDom(){
   const lmonths = mk('div', {id: 'lib-months', cls: 'hidden'}, lcal);
   lmonths.setAttribute('role', 'group');
   lmonths.setAttribute('aria-label', '月');
-  mk('div', {id: 'lib-places', cls: 'hidden'}, lib);
-  const lmapbox = mk('div', {id: 'lib-map-box', cls: 'hidden'}, lib);
-  const lmbar = mk('div', {cls: 'toolbar'}, lmapbox);
-  mk('button', {id: 'lib-bbox', cls: 'btn', text: 'この範囲の写真を見る'}, lmbar);
-  const lperiod = mk('span', {id: 'lib-period', cls: 'lib-period hidden'}, lmbar);
+  const lplaces = mk('div', {id: 'lib-places', cls: 'lib-place hidden'}, lib);
+  const lside = mk('div', {cls: 'lib-place-side'}, lplaces);
+  const lperiod = mk('div', {id: 'lib-period', cls: 'lib-period hidden'}, lside);
   mk('span', {id: 'lib-period-text'}, lperiod);
-  mk('button', {id: 'lib-period-clear', cls: 'btn', text: '期間を解除'}, lperiod);
+  const lclear = mk('button', {id: 'lib-period-clear', cls: 'btn', text: '✕'}, lperiod);
+  lclear.setAttribute('aria-label', '期間を解除');
+  mk('div', {id: 'lib-place-cards', cls: 'lib-cards lib-place-cards'}, lside);
+  const lmain = mk('div', {id: 'lib-place-main', cls: 'lib-place-main'}, lplaces);
+  const lmbar = mk('div', {cls: 'toolbar'}, lmain);
+  mk('button', {id: 'lib-bbox', cls: 'btn', text: 'この範囲の写真を見る'}, lmbar);
+  mk('button', {id: 'lib-reset', cls: 'btn', text: '全体に戻す'}, lmbar);
   mk('span', {cls: 'spacer'}, lmbar);
   mk('span', {id: 'lib-map-note', cls: 'count'}, lmbar);
-  mk('div', {id: 'lib-map'}, lmapbox);
+  mk('div', {id: 'lib-map'}, lmain);
   const ldetail = mk('div', {id: 'lib-detail', cls: 'hidden'}, lib);
   const ldbar = mk('div', {cls: 'toolbar'}, ldetail);
   mk('h3', {id: 'lib-sel', cls: 'lib-sel'}, ldbar);

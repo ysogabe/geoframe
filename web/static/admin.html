@@ -107,13 +107,12 @@
     <div class="empty hidden" id="empty">該当する写真がありません</div>
   </section>
 
-  <!-- ==== LIBRARY（旅・地図・サムネイルの格子。GET /api/admin/library/*。中身は library.js が描く） ==== -->
+  <!-- ==== LIBRARY（旅・日付・場所と地図・サムネイルの格子。GET /api/admin/library/*。中身は library.js が描く） ==== -->
   <section id="v-library" class="hidden">
     <div class="toolbar lib-bar">
       <button class="lib-seg on" id="lib-view-trips" type="button" data-view="trips">旅</button>
       <button class="lib-seg" id="lib-view-calendar" type="button" data-view="calendar">日付</button>
       <button class="lib-seg" id="lib-view-places" type="button" data-view="places">場所</button>
-      <button class="lib-seg" id="lib-view-map" type="button" data-view="map">地図</button>
       <label class="opt"><input type="checkbox" id="lib-hidden"> 除外も含める</label>
       <span class="spacer"></span>
       <span class="count" id="lib-note"></span>
@@ -126,18 +125,24 @@
       <div class="lib-cards" id="lib-year-cards"></div>
       <div id="lib-months" class="hidden" role="group" aria-label="月"></div>
     </div>
-    <div id="lib-places" class="hidden"></div>
-    <div id="lib-map-box" class="hidden">
-      <div class="toolbar">
-        <button class="btn" id="lib-bbox" type="button">この範囲の写真を見る</button>
-        <span class="lib-period hidden" id="lib-period">
+    <!-- 場所: 左に期間の表示と都道府県のカード、右に地図の操作・地図・（選ぶと）写真の詳細。詳細 #lib-detail は場所のときだけ #lib-place-main の中（地図の下）へ移す -->
+    <div id="lib-places" class="lib-place hidden">
+      <div class="lib-place-side">
+        <div class="lib-period hidden" id="lib-period">
           <span id="lib-period-text"></span>
-          <button class="btn" id="lib-period-clear" type="button">期間を解除</button>
-        </span>
-        <span class="spacer"></span>
-        <span class="count" id="lib-map-note"></span>
+          <button class="btn" id="lib-period-clear" type="button" aria-label="期間を解除" title="期間を解除">✕</button>
+        </div>
+        <div class="lib-cards lib-place-cards" id="lib-place-cards"></div>
       </div>
-      <div id="lib-map"></div>
+      <div class="lib-place-main" id="lib-place-main">
+        <div class="toolbar">
+          <button class="btn" id="lib-bbox" type="button">この範囲の写真を見る</button>
+          <button class="btn" id="lib-reset" type="button">全体に戻す</button>
+          <span class="spacer"></span>
+          <span class="count" id="lib-map-note"></span>
+        </div>
+        <div id="lib-map"></div>
+      </div>
     </div>
     <div id="lib-detail" class="hidden">
       <div class="toolbar">

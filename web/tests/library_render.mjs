@@ -1,6 +1,6 @@
 // admin.js・photos.js・library.js（この順に同じ context へ読む）のライブラリタブ — 旅・日付のカード（選ぶと下の詳細に写真の格子）・
-// 年の月のチップ・除外の切り替え・古い応答の捨て方・ビューア・★の反映・場所の行・地図（偽の MapLibre）・吹き出し・
-// 「この範囲の写真を見る」— を、fakedom.mjs の DOM の代用品と fetch・MapLibre の代用品で動かして確かめる。
+// 年の月のチップ・除外の切り替え・古い応答の捨て方・ビューア・★の反映・場所（都道府県のカード・市区町村のチップ・地図（偽の MapLibre）・
+// 地図の移動の理由・期間・「この範囲の写真を見る」「全体に戻す」）・吹き出し — を、fakedom.mjs の DOM の代用品と fetch・MapLibre の代用品で動かして確かめる。
 // 使い方: node web/tests/library_render.mjs <admin.js のパス> <photos.js のパス> <library.js のパス>
 // fetch は URL ごとの合成 JSON を返すだけで、ネットワークには出ない。座標・地名はすべて架空の値。
 import fs from 'node:fs';
@@ -41,8 +41,10 @@ const calendarBody = () => ({ok: true, untimed: 5, years: [
    months: [{month: '05', count: 20}, {month: '12', count: 10}]},
   {year: '2029', count: 4, cover: null, months: [{month: '01', count: 4}]}]});
 const placesBody = () => ({ok: true, abroad: 9, prefs: [
-  {pref: '架空県', count: 50, cities: [{city: '試験市', count: 40}, {city: '見本町', count: 8}, {city: '', count: 2}]},
-  {pref: '試験県', count: 3, cities: [{city: 'サンプル市', count: 3}]}]});
+  {pref: '架空県', count: 50, cover: {id: 701, thumb_url: '/thumb/701.jpg?v=dddddddddddd'}, bbox: [130, 30, 132, 32],
+   cities: [{city: '見本町', count: 8, bbox: [130.5, 30.5, 130.6, 30.6]}, {city: '試験市', count: 40, bbox: [131, 31, 131.5, 31.5]},
+            {city: '', count: 2, bbox: null}]},
+  {pref: '試験県', count: 3, cover: null, bbox: null, cities: [{city: 'サンプル市', count: 3, bbox: null}]}]});
 
 const lp = o => ({name: 'lib.jpg', thumb: '/derivatives/lib.jpg', thumb_url: '', taken_at: '2030-05-03 09:12',
   lat: 10.0, lon: 20.0, loc_source: 'exif', place: '', pref: '架空県', city: '試験市',
@@ -61,6 +63,9 @@ const TAB_PHOTOS = [1, 2].map(id => ({id, name: 't' + id + '.jpg', thumb: '/deri
   pref: '架空県', city: '試験市', fav: false, hidden: false, rotation: 0, source: 'drive'}));
 
 function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
+  // requestAnimationFrame は試験が flush するまで溜める（描画の確定後に呼ぶ処理）。matchMedia は幅 640px の境の変化を試験から起こす
+  const rafQueue = [];
+  const media = {matches: false, handlers: []};
   const document = buildAdminDom();
   const calls = [];
   const flags = {};
@@ -112,6 +117,9 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
   const context = vm.createContext({
     document, fetch: fetchFake, location: {pathname, origin: 'http://localhost'},
     setInterval(){}, setTimeout(){ return 0; }, clearTimeout(){}, console, maplibregl: fake.maplibregl,
+    requestAnimationFrame: fn => { rafQueue.push(fn); return rafQueue.length; },
+    matchMedia: query => ({media: query, get matches(){ return media.matches; },
+                           addEventListener: (type, fn) => { if(type === 'change') media.handlers.push(fn); }}),
   });
   loadScripts(context);
   const reqs = prefix => calls.filter(c => c.url.startsWith(prefix));
@@ -121,7 +129,9 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
   };
   const boot = async () => { document.dispatchEvent({type: 'DOMContentLoaded'}); await settle(); };
   const ev = code => JSON.parse(vm.runInContext('JSON.stringify(' + code + ')', context));
-  return {document, context, calls, handlers, fake, reqs, last, boot, ev, $: s => document.querySelector(s),
+  const raf = () => { const fns = rafQueue.splice(0); fns.forEach(f => f()); return fns.length; };
+  const narrow = on => { media.matches = on; media.handlers.forEach(f => f({matches: on})); };
+  return {document, context, calls, handlers, fake, reqs, last, boot, ev, raf, narrow, rafQueue, $: s => document.querySelector(s),
           $$: s => document.querySelectorAll(s)};
 }
 
@@ -195,7 +205,7 @@ await test('(a) 旅のカード: 表紙・期間・枚数（位置なし）・�
   assert.equal(env.$('#lib-note').textContent, '旅 2 件');
   assert.equal(hidden(env, '#lib-trips'), false);
   assert.equal(hidden(env, '#lib-detail'), true, '選ぶまで詳細は出さない');
-  assert.equal(hidden(env, '#lib-map-box'), true);
+  assert.equal(hidden(env, '#lib-places'), true);
   assert.equal(env.$('#lib-back'), null, '戻るボタンは無い');
   assert.ok(env.$('#lib-trip-cards').classList.contains('lib-cards'));
   assert.ok(!env.$('#lib-trip-cards').classList.contains('is-strip'), '選択が無いうちは 1 段にしない');
@@ -328,15 +338,17 @@ await test('(c3) 主ボタンはクリック・Enter・Space のどれでも 1 �
   await settle();
   assert.equal(photoReqs(), 3, 'Tab では読まない');
   assert.deepEqual(cards(env).map(x => x.classList.contains('is-selected')), [true, false, false]);
-  // 「地図で見る」（バブリングするクリックでも）: 地図の画面へ移るだけで、主の選択は変わらない・写真も読まない
+  // 「地図で見る」（バブリングするクリックでも）: 場所の画面をその旅の期間で開く。旅の主ボタンの選択は起きない（旅の選択はそのまま）。
+  // 下には期間の写真全体（1 回だけ読む）
   const mapBtn = cards(env)[1].querySelector('.lib-card-map');
   mapBtn.dispatchEvent({type: 'click', bubbles: true});
   await settle();
-  assert.equal(photoReqs(), 3);
+  assert.equal(photoReqs(), 4, '期間の写真を 1 回だけ読む');
   assert.equal(env.ev('ls.sel.trips.key'), '2030-05-03 09:12', '旅の選択はそのまま');
-  assert.equal(env.ev('ls.sel.map'), null);
-  assert.equal(env.ev('ls.view'), 'map');
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'period'});
+  assert.equal(env.ev('ls.view'), 'places');
   assert.equal(env.last('/api/admin/library/points').get('from'), '2029-01-01 00:00');
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2029-01-01 00:00');
 });
 
 await test('(c4) AC16a 詳細の応答を待つあいだに別のカードを選ぶと、遅れた応答は捨てる（gen）。view を替えた・除外を切り替えたときも', async () => {
@@ -524,14 +536,14 @@ await test('(e) 地図ビュー: points を読み、偽 MapLibre の source に�
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   assert.equal(env.reqs('/api/admin/library/points').length, 1);
   assert.equal(env.reqs('/api/admin/library/points')[0].url, '/api/admin/library/points', '期間なし・除外を含めない');
-  assert.equal(hidden(env, '#lib-map-box'), false);
+  assert.equal(hidden(env, '#lib-places'), false);
   assert.equal(hidden(env, '#lib-trips'), true);
   assert.deepEqual(activeTabs(env), ['library']);
-  assert.ok(env.$('#lib-view-map').classList.contains('on'));
+  assert.ok(env.$('#lib-view-places').classList.contains('on'));
   assert.equal(env.fake.maps.length, 1);
   const map = mapOf(env);
   assert.equal(map.options.container, 'lib-map');
@@ -550,11 +562,14 @@ await test('(e) 地図ビュー: points を読み、偽 MapLibre の source に�
   assert.deepEqual(plain(src.setDataCalls[0]),
     {type: 'FeatureCollection', features: [feature(501, 20.0, 10.0), feature(503, 20.5, 10.5)]});
   assert.equal(env.$('#lib-map-note').textContent, '2 点');
-  assert.ok(map.calls.resize >= 1, '表示したとき大きさを合わせる');
+  assert.equal(map.calls.resize, 0, '大きさの合わせ直しは描画の確定後');
+  env.raf();
+  assert.equal(map.calls.resize, 1, '表示したとき大きさを合わせる');
+  assert.deepEqual(plain(map.calls.resizeArgs), [{libMove: true}], 'resize は moveend を起こすので libMove を付ける');
   // 切り捨てのとき
   env.handlers.points = () => reply(pointsBody({truncated: true, total: 25000}));
   env.$('#lib-view-trips').click();
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   assert.equal(env.fake.maps.length, 1, '地図は 1 つを使い回す');
   assert.equal(env.$('#lib-map-note').textContent, '2 点（全 25000 点のうち新しい順）');
@@ -580,7 +595,7 @@ await test('(e3) クラスタの件数の更新は render（毎フレーム）�
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const map = mapOf(env);
   const types = map.handlers.map(h => h.type);
@@ -609,7 +624,7 @@ await test('(e3) クラスタの件数の更新は render（毎フレーム）�
   // setData の直後にも合わせる（読み直しで古い文字は外れ、見えているクラスタの文字が付く）
   env.fake.features = [feat(3)];
   env.$('#lib-view-trips').click();
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const live = env.fake.markers.filter(m => !m.removed);
   assert.equal(live.length, 1);
@@ -620,7 +635,7 @@ await test('(e2) クラスタを押すと展開できる zoom まで寄る。単
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const map = mapOf(env);
   map.fire('click', {features: [{properties: {cluster_id: 7}, geometry: {coordinates: [20.25, 10.5]}}]}, 'lib-clusters');
@@ -637,7 +652,7 @@ await test('(f) 点を押すと ids= で 1 枚を引き、吹き出しは 読み
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const map = mapOf(env);
   let release;
@@ -674,7 +689,7 @@ await test('(f2) 点の要求は新しいものだけが吹き出しに出る（
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const map = mapOf(env);
   const releases = {};
@@ -717,7 +732,7 @@ await test('(g) 「この範囲の写真を見る」: 表示範囲を ±180/±90
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   assert.equal(hidden(env, '#lib-detail'), true);
   env.fake.bounds = {w: 100.1234567, s: 10.5, e: 120.25, n: 30.75};
@@ -727,7 +742,7 @@ await test('(g) 「この範囲の写真を見る」: 表示範囲を ±180/±90
   assert.equal(q.get('bbox'), '100.123457,10.5,120.25,30.75');
   assert.equal(q.get('from'), null);
   assert.equal(hidden(env, '#lib-detail'), false);
-  assert.equal(hidden(env, '#lib-map-box'), false, '地図は残る');
+  assert.equal(hidden(env, '#lib-places'), false, '地図は残る');
   assert.equal(env.$('#lib-sel').textContent, '地図の範囲');
   assert.equal(tiles(env).length, 3);
   assert.deepEqual(plain(env.$('#lib-detail').scrollCalls), [{block: 'nearest', inline: 'nearest'}]);
@@ -741,7 +756,7 @@ await test('(g) 「この範囲の写真を見る」: 表示範囲を ±180/±90
   env.$('#lib-view-trips').click();
   assert.equal(hidden(env, '#lib-detail'), true);
   const photoReqs = env.reqs('/api/admin/library/photos').length;
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs + 1);
   assert.equal(env.last('/api/admin/library/photos').get('bbox'), '-180,-90,180,90');
@@ -751,7 +766,7 @@ await test('(g2) 地図は周回させない（renderWorldCopies: false・maxBou
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const map = mapOf(env);
   assert.equal(map.options.renderWorldCopies, false);
@@ -775,7 +790,7 @@ await test('(m) 「除外も含める」の切り替え: 地図が見えてい�
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const pointReqs = () => env.reqs('/api/admin/library/points');
   assert.equal(pointReqs().length, 1);
@@ -802,7 +817,7 @@ await test('(m) 「除外も含める」の切り替え: 地図が見えてい�
   await settle();
   assert.equal(pointReqs().length, 2);
   assert.equal(env.ev('ls.pointsStale'), true);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   assert.equal(pointReqs().length, 3);
   assert.equal(env.last('/api/admin/library/points').get('hidden'), null);
@@ -812,7 +827,7 @@ await test('(m) 「除外も含める」の切り替え: 地図が見えてい�
   env.handlers.points = () => new Promise(res => held.push(() => res({ok: true, status: 200, json: () =>
     Promise.resolve(pointsBody({features: [feature(999, 1, 1)]}))})));
   env.$('#lib-view-trips').click();
-  env.$('#lib-view-map').click();           // 点の要求が飛ぶ（まだ応答なし）
+  env.$('#lib-view-places').click();           // 点の要求が飛ぶ（まだ応答なし）
   await settle();
   env.$('#lib-view-trips').click();
   env.$('#lib-hidden').checked = true;
@@ -879,7 +894,7 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
   assert.ok(rules.some(([sel, body]) => sel === '.hidden' && /display:\s*none/.test(body)));
   // library.js が .hidden を付け外しする要素（id）と、その class
   const html = fs.readFileSync(new URL('../static/admin.html', import.meta.url), 'utf8');
-  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-map-box', 'lib-months', 'lib-detail', 'lib-period', 'lib-empty', 'viewer-noimage'];
+  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-months', 'lib-detail', 'lib-period', 'lib-empty', 'viewer-noimage'];
   const selectorsOf = id => {
     const tag = html.match(new RegExp('<[^>]*id="' + id + '"[^>]*>'));
     assert.ok(tag, id);
@@ -904,77 +919,179 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
     if(isToggled) assert.ok(hasPair(sel), sel);
   }
   // 古い部品は無い
-  assert.ok(!html.includes('lib-back') && !html.includes('lib-grid-box'));
+  assert.ok(!html.includes('lib-back') && !html.includes('lib-grid-box') && !html.includes('lib-map-box') && !html.includes('lib-view-map'));
 });
-await test('(h) 旅の「地図で見る」: その期間で points を読み、期間を表示し、解除で全期間に戻る。範囲の写真にも期間が付く', async () => {
+const A = '2030-05-03 09:12', Z = '2030-05-05 18:40', B = '2029-01-01 00:00';
+const qOf = c => new URLSearchParams(c.url.split('?')[1] || '');
+const placeQs = env => env.reqs('/api/admin/library/places').map(qOf);
+const pcards = env => env.$$('#lib-place-cards .lib-card');
+const cardName = c => mainOf(c).querySelector('.lib-card-name').textContent;
+const cardCount = c => mainOf(c).querySelector('.lib-card-count').textContent;
+const cityChips = card => card.querySelectorAll('.lib-cities .lib-city');
+const openPlaces = async env => { env.$('#lib-view-places').click(); await settle(); };
+const pointsInTrip = () => reply(pointsBody({features: [feature(501, 130.5, 30.5), feature(503, 131.5, 31.5), feature(502, 131, 31)]}));
+const mapBtnOf = (env, i) => cards(env)[i].querySelector('.lib-card-map');
+
+await test('(h) AC8 旅の「地図で見る」: 場所の画面をその期間で開き、/places・/points・/photos のすべてに同じ from・to。下に旅の写真（1 ページ目）。点の範囲へ fitBounds（libMove 付き）で、カードは絞らない', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  cards(env)[0].querySelector('.lib-card-map').click();
+  env.handlers.points = pointsInTrip;
+  mapBtnOf(env, 0).click();
   await settle();
-  assert.equal(hidden(env, '#lib-map-box'), false);
-  assert.ok(env.$('#lib-view-map').classList.contains('on'));
-  const q = env.last('/api/admin/library/points');
-  assert.equal(q.get('from'), '2030-05-03 09:12');
-  assert.equal(q.get('to'), '2030-05-05 18:40');
+  for(const name of ['places', 'points', 'photos']){
+    const rs = env.reqs('/api/admin/library/' + name).map(qOf);
+    assert.ok(rs.length >= 1, name);
+    rs.forEach(q => { assert.equal(q.get('from'), A, name); assert.equal(q.get('to'), Z, name); });
+  }
+  assert.equal(env.reqs('/api/admin/library/places').length, 2, 'カード用と候補用');
+  assert.equal(env.reqs('/api/admin/library/points').length, 1);
+  assert.equal(env.reqs('/api/admin/library/photos').length, 1);
+  const g = env.last('/api/admin/library/photos');
+  assert.equal(g.get('page'), '1');
+  assert.equal(g.get('pref'), null);
+  assert.equal(g.get('bbox'), null);
+  placeQs(env).forEach(q => assert.equal(q.get('bbox'), null, '地図の絞り込みは外れている'));
+  assert.equal(hidden(env, '#lib-places'), false);
+  assert.ok(env.$('#lib-view-places').classList.contains('on'));
+  assert.equal(hidden(env, '#lib-detail'), false);
+  same(env.$('#lib-detail').parentNode, env.$('#lib-place-main'), '詳細は右の列の地図の下');
+  assert.equal(env.$('#lib-sel').textContent, '期間 ' + A + ' 〜 ' + Z);
   assert.equal(hidden(env, '#lib-period'), false);
-  assert.equal(env.$('#lib-period-text').textContent, '期間: 2030-05-03 09:12 〜 2030-05-05 18:40');
+  assert.equal(env.$('#lib-period-text').textContent, '期間: ' + A + ' 〜 ' + Z);
+  assert.equal(tiles(env).length, 3, '下にその旅の写真');
+  const map = mapOf(env);
+  assert.deepEqual(plain(map.calls.fitBounds), [{bounds: [130.5, 30.5, 131.5, 31.5], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}}]);
+  map.endMove();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/places').length, 2, 'fitBounds の moveend ではカードを絞らない');
+  assert.equal(env.ev('ls.mapBbox'), null);
+  // 範囲の写真を見る: 期間も付く
   env.$('#lib-bbox').click();
   await settle();
-  const g = env.last('/api/admin/library/photos');
-  assert.equal(g.get('bbox'), '100,10,120,30');
-  assert.equal(g.get('from'), '2030-05-03 09:12');
-  assert.equal(g.get('to'), '2030-05-05 18:40');
-  assert.equal(env.$('#lib-sel').textContent, '地図の範囲・2030-05-03 09:12 〜 2030-05-05 18:40');
+  const b = env.last('/api/admin/library/photos');
+  assert.equal(b.get('bbox'), '130.5,30.5,131.5,31.5');
+  assert.equal(b.get('from'), A);
+  assert.equal(b.get('to'), Z);
+  assert.equal(env.$('#lib-sel').textContent, '地図の範囲・' + A + ' 〜 ' + Z);
+  // 解除: カード・候補・点は期間なしで読み直し、範囲の選択はそのまま期間なしで読み直す（ページ 1）
+  const since = env.calls.length;
   env.$('#lib-period-clear').click();
   await settle();
+  const after = env.calls.slice(since).filter(c => c.url.startsWith('/api/admin/library/'));
+  assert.deepEqual(after.map(c => c.url.split('?')[0].split('/').pop()).sort(), ['photos', 'places', 'places', 'points']);
+  after.forEach(c => { const q = qOf(c); assert.equal(q.get('from'), null, c.url); assert.equal(q.get('to'), null, c.url); });
+  const g2 = env.last('/api/admin/library/photos');
+  assert.equal(g2.get('bbox'), '130.5,30.5,131.5,31.5');
+  assert.equal(g2.get('page'), '1');
   assert.equal(hidden(env, '#lib-period'), true);
-  const p = env.last('/api/admin/library/points');
-  assert.equal(p.get('from'), null);
-  assert.equal(p.get('to'), null);
+  assert.equal(env.ev('ls.period'), null);
+  assert.equal(env.$('#lib-sel').textContent, '地図の範囲');
+  assert.equal(hidden(env, '#lib-detail'), false);
 });
-await test('(h2) 旅の「地図で見る」は前の旅の範囲選択を持ち越さない: 旅 A → 地図で見る → この範囲の写真を見る → 旅へ戻る → 旅 B の地図で見る', async () => {
+
+await test('(h3) 期間の写真全体の詳細は、解除すると隠れて、飛んでいる応答も捨てる。解除のあとカード・候補・点は期間なし', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  const A = '2030-05-03 09:12', B = '2029-01-01 00:00';
+  let release;
+  env.handlers.photos = () => new Promise(res => { release = () => res({ok: true, status: 200, json: () =>
+    Promise.resolve({ok: true, page: 1, per: 60, pages: 1, total: 3, items: GRID})}); });
+  mapBtnOf(env, 0).click();                          // 期間の写真（応答は保留）
+  await settle();
+  assert.equal(tiles(env).length, 0);
+  const photoReqs = env.reqs('/api/admin/library/photos').length;
+  env.$('#lib-period-clear').click();
+  await settle();
+  assert.equal(hidden(env, '#lib-detail'), true, '期間の写真全体の詳細は隠れる');
+  assert.equal(env.ev('ls.sel.places'), null);
+  assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs, '詳細は読み直さない');
+  release();                                          // 飛んでいた応答が遅れて届く
+  await settle();
+  assert.equal(tiles(env).length, 0, '飛んでいた応答は捨てる');
+  assert.equal(hidden(env, '#lib-detail'), true);
+  assert.equal(placeQs(env).slice(-2).every(q => q.get('from') === null), true);
+  assert.equal(env.last('/api/admin/library/points').get('from'), null);
+  assert.equal(hidden(env, '#lib-period'), true);
+});
+
+await test('(h4) 期間のあいだの県・市区町村・海外不明は from・to を付けて読み、県を選んでから解除すると、県の詳細を期間なしで読み直す（ページ 1）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  mapBtnOf(env, 0).click();
+  await settle();
+  mainOf(pcards(env)[0]).click();                  // 架空県
+  await settle();
+  let q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('pref'), '架空県');
+  assert.equal(q.get('from'), A);
+  assert.equal(q.get('to'), Z);
+  assert.equal(env.$('#lib-sel').textContent, '架空県');
+  cityChips(pcards(env)[0])[1].click();             // 見本町
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('city'), '見本町');
+  assert.equal(q.get('from'), A);
+  mainOf(pcards(env)[2]).click();                   // 海外・不明
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('abroad'), '1');
+  assert.equal(q.get('from'), A);
+  assert.equal(q.get('to'), Z);
+  mainOf(pcards(env)[0]).click();                   // 架空県をまた選ぶ
+  await settle();
+  env.$('#lib-next').disabled = false;
+  const photoReqs = env.reqs('/api/admin/library/photos').length;
+  env.$('#lib-period-clear').click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs + 1);
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('pref'), '架空県');
+  assert.equal(q.get('from'), null);
+  assert.equal(q.get('to'), null);
+  assert.equal(q.get('page'), '1');
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.equal(tiles(env).length, 3);
+  assert.ok(pcards(env)[0].classList.contains('is-selected'), '県の選択は残る');
+});
+
+await test('(h2) 旅の「地図で見る」は前の旅の範囲選択を持ち越さない: 旅 A → 地図で見る → この範囲の写真を見る（保留）→ 旅へ戻る → 旅 B の地図で見る', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
   let releaseA;
   env.handlers.photos = params => {
     if(params.get('bbox') && params.get('from') === A){       // 旅 A の範囲の写真（応答は保留）
       return new Promise(res => { releaseA = () => res({ok: true, status: 200, json: () => Promise.resolve(
-        {ok: true, page: 1, per: 60, pages: 1, total: 2, items: [P501, P502]})}); });
+        {ok: true, page: 1, per: 60, pages: 1, total: 1, items: [P503]})}); });
     }
     return null;
   };
-  cards(env)[0].querySelector('.lib-card-map').click();      // 旅 A の地図
+  mapBtnOf(env, 0).click();                                    // 旅 A の地図
   await settle();
   env.$('#lib-bbox').click();                                  // この範囲の写真を見る（保留）
   await settle();
   assert.equal(env.last('/api/admin/library/photos').get('from'), A);
+  assert.equal(env.last('/api/admin/library/photos').get('bbox'), '100,10,120,30');
   env.$('#lib-view-trips').click();                            // 旅へ戻る
   await settle();
-  const photoReqs = env.reqs('/api/admin/library/photos').length;
-  cards(env)[1].querySelector('.lib-card-map').click();      // 旅 B の地図
+  mapBtnOf(env, 1).click();                                    // 旅 B の地図
   await settle();
   assert.equal(env.last('/api/admin/library/points').get('from'), B);
-  assert.equal(env.$('#lib-period-text').textContent, '期間: 2029-01-01 00:00');
-  assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs, 'A の期間の写真を読み直さない');
-  assert.equal(hidden(env, '#lib-detail'), true, 'A の範囲選択は解除されている');
-  assert.equal(env.$('#lib-sel').textContent, '');
-  assert.equal(tiles(env).length, 0);
-  assert.equal(env.ev('ls.sel.map'), null);
+  assert.equal(env.$('#lib-period-text').textContent, '期間: ' + B);
+  const q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('from'), B, 'B の期間の写真を読む');
+  assert.equal(q.get('to'), B);
+  assert.equal(q.get('bbox'), null, 'A の範囲選択は持ち越さない');
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'period'});
+  assert.equal(env.$('#lib-sel').textContent, '期間 ' + B);
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['501', '502', '503']);
   // 遅れて A の応答が届いても捨てる
   releaseA();
   await settle();
-  assert.equal(tiles(env).length, 0, '遅れた A の詳細は出さない');
-  assert.equal(hidden(env, '#lib-detail'), true);
-  // B の範囲の写真は B の期間で読む
-  env.handlers.photos = null;
-  env.$('#lib-bbox').click();
-  await settle();
-  const q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('from'), B);
-  assert.equal(q.get('to'), B);
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['501', '502', '503'], '遅れた A の詳細は出さない');
+  assert.equal(env.$('#lib-sel').textContent, '期間 ' + B);
 });
 await test('(i) 点の応答が遅れて入れ違っても、新しい要求の結果だけが source に渡る', async () => {
   const env = makeEnv();
@@ -982,10 +1099,10 @@ await test('(i) 点の応答が遅れて入れ違っても、新しい要求の�
   await openLib(env);
   const release = [];
   env.handlers.points = () => new Promise(res => release.push(body => res({ok: true, status: 200, json: () => Promise.resolve(body)})));
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   env.$('#lib-view-trips').click();
-  env.$('#lib-view-map').click();                  // 2 つ目の要求
+  env.$('#lib-view-places').click();                  // 2 つ目の要求
   await settle();
   assert.equal(release.length, 2);
   release[1](pointsBody({features: [feature(503, 20.5, 10.5)], total: 1}));
@@ -1009,7 +1126,7 @@ await test('(j) 地図の style がまだのうちに届いた点は、load の�
       return super.on(type, a, b);
     }
   };
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const map = mapOf(env);
   assert.equal(map.sources.photos, undefined);
@@ -1047,16 +1164,18 @@ await test('(k) どのタブから離れてもビューアが閉じ、ライブ�
   assert.equal(hidden(env, '#viewer'), true);
   // 地図ビューのままタブを往復する
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const map = mapOf(env);
+  env.raf();
   const resizes = map.calls.resize, trips = env.reqs('/api/admin/library/trips').length;
   env.$('.tab[data-tab=status]').click();
   await settle();
   await openLib(env);
+  env.raf();
   assert.equal(env.reqs('/api/admin/library/trips').length, trips + 1);
   assert.ok(map.calls.resize > resizes);
-  assert.equal(hidden(env, '#lib-map-box'), false);
+  assert.equal(hidden(env, '#lib-places'), false);
   assert.equal(env.fake.maps.length, 1);
   // 写真タブから戻っても、写真タブが開いたビューアはライブラリに持ち越さない
   env.$('.tab[data-tab=photos]').click();
@@ -1235,7 +1354,7 @@ await test('(p3) AC15 除外の切り替え: 見えている一覧・詳細（�
   assert.ok(libCalls.every(c => new URLSearchParams(c.url.split('?')[1] || '').get('hidden') === '1'), 'すべて hidden=1');
   assert.equal(env.last('/api/admin/library/photos').get('page'), '1');
   assert.equal(env.last('/api/admin/library/photos').get('from'), '2030-05-03 09:12', '選択はそのまま');
-  assert.deepEqual(plain(env.ev('ls.loaded')), {trips: true, calendar: false, places: false});
+  assert.deepEqual(plain(env.ev('ls.loaded')), {trips: true, calendar: false, placeCards: false, placeOptions: false});
   // 日付の画面へ移ると、落ちていた一覧を hidden=1 で読む
   env.$('#lib-view-calendar').click();
   await settle();
@@ -1275,93 +1394,156 @@ await test('(p3) AC15 除外の切り替え: 見えている一覧・詳細（�
   await settle();
   held.forEach(f => f());
   await settle();
-  assert.equal(env.ev('ls.loaded.places'), false);
+  assert.equal(env.ev('ls.loaded.placeCards'), false);
+  assert.equal(env.ev('ls.loaded.placeOptions'), false);
   assert.equal(env.ev('ls.prefs.length'), 2, '飛んでいた空の応答で一覧を差し替えない');
+  assert.equal(env.ev('ls.placeOpts.prefs.length'), 2);
 });
-const placeRows = env => env.$$('#lib-places .lib-grow');
-const rowText = row => [row.querySelector('.lib-gname').textContent, row.querySelector('.lib-gcount').textContent];
-const showBtn = row => row.querySelector('.lib-gphotos');
-await test('(q) 場所（今の行の作り）: 都道府県の行を押すと市区町村の行が開き、どちらからも pref（と city）付きで下の詳細に出る。海外・不明は abroad=1', async () => {
+await test('(q) AC1・AC4・AC6 場所: 都道府県のカード（表紙・名前・枚数・主ボタン）と海外・不明。県を押すと pref・fitBounds・市区町村のチップ（件数順）。チップで city と fitBounds。もう一度押すと外れる', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
   env.$('#lib-view-places').click();
   await settle();
-  assert.equal(env.reqs('/api/admin/library/places')[0].url, '/api/admin/library/places');
+  assert.equal(env.$('#lib-view-map'), null, '地図の seg は無い');
+  assert.deepEqual(env.$$('.lib-seg').map(b => b.textContent), ['旅', '日付', '場所']);
+  const ps = env.reqs('/api/admin/library/places');
+  assert.deepEqual(ps.map(c => c.url), ['/api/admin/library/places', '/api/admin/library/places'], 'カード用と候補用。既定は除外を含めない');
   assert.ok(env.$('#lib-view-places').classList.contains('on'));
   assert.equal(hidden(env, '#lib-places'), false);
   assert.equal(hidden(env, '#lib-calendar'), true);
+  assert.equal(hidden(env, '#lib-detail'), true);
   assert.equal(env.$('#lib-note').textContent, '2 都道府県');
-  let r = placeRows(env);
-  assert.deepEqual(r.map(rowText), [['架空県', '50 枚'], ['試験県', '3 枚']]);
-  assert.equal(env.$('#lib-places .lib-summary .lib-summary-text').textContent, '海外・不明（9 枚）');
-  // 開く
-  r[0].querySelector('.lib-expand').click();
-  r = placeRows(env);
-  assert.deepEqual(r.map(rowText), [['架空県', '50 枚'], ['試験市', '40 枚'], ['見本町', '8 枚'], ['（市区町村なし）', '2 枚'],
-                                    ['試験県', '3 枚']]);
-  assert.equal(showBtn(r[3]), null, '市区町村が空の項目は city で絞れないので、写真を見るボタンを置かない');
-  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '開いただけでは読まない');
-  // 市区町村 → pref と city。下の詳細に出て、一覧は残る
-  showBtn(r[2]).click();
+  assert.ok(env.$('#lib-place-cards').classList.contains('lib-cards'));
+  assert.ok(!env.$('#lib-place-cards').classList.contains('is-strip'), '場所のカードは 1 段にしない');
+  let c = pcards(env);
+  assert.deepEqual(c.map(cardName), ['架空県', '試験県', '海外・不明']);
+  assert.deepEqual(c.map(cardCount), ['50 枚', '3 枚', '9 枚']);
+  assert.ok(c.every(x => x.tagName.toLowerCase() === 'div' && x.listeners.click === undefined), 'カードの容器は対話しない');
+  assert.equal(mainOf(c[0]).querySelector('.lib-cover img').src, '/thumb/701.jpg?v=dddddddddddd', '県の表紙');
+  assert.equal(mainOf(c[1]).querySelector('.lib-cover .img-broken').textContent, '画像なし');
+  assert.equal(env.$$('#lib-place-cards .lib-cities').length, 0, '選ぶまでチップは出さない');
+  assert.equal(env.fake.maps[0].calls.fitBounds.length, 0);
+  // 県 → pref と fitBounds
+  mainOf(c[0]).click();
   await settle();
   let q = env.last('/api/admin/library/photos');
   assert.equal(q.get('pref'), '架空県');
-  assert.equal(q.get('city'), '見本町');
-  assert.equal(q.get('from'), null);
-  assert.equal(q.get('abroad'), null);
-  assert.equal(env.$('#lib-sel').textContent, '架空県 見本町');
+  assert.equal(q.get('city'), null);
+  assert.equal(env.$('#lib-sel').textContent, '架空県');
   assert.equal(hidden(env, '#lib-detail'), false);
-  assert.equal(hidden(env, '#lib-places'), false);
-  assert.equal(tiles(env).length, 3);
-  assert.deepEqual(placeRows(env).map(x => x.classList.contains('is-selected')), [true, false, true, false, false], '選んだ市区町村と、その県');
-  // 都道府県 → pref だけ
-  showBtn(placeRows(env)[4]).click();
+  same(env.$('#lib-detail').parentNode, env.$('#lib-place-main'));
+  const map = mapOf(env);
+  assert.deepEqual(plain(map.calls.fitBounds), [{bounds: [130, 30, 132, 32], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}}]);
+  assert.ok(c[0].classList.contains('is-selected'));
+  assert.equal(mainOf(c[0]).getAttribute('aria-pressed'), 'true');
+  assert.ok(c[0].classList.contains('has-cities'));
+  let chips = cityChips(c[0]);
+  assert.deepEqual(chips.map(x => x.textContent), ['試験市40', '見本町8', '（市区町村なし）2'], '件数の多い順');
+  assert.deepEqual(chips.map(x => x.disabled), [false, false, true], 'city が空のものは押せない');
+  chips.forEach(x => { same(x.parentNode.parentNode, c[0], 'チップは主ボタンの兄弟（カードの子）'); });
+  assert.equal(mainOf(c[0]).querySelectorAll('button').length, 0, 'ボタンを入れ子にしない');
+  assert.equal(c[1].querySelector('.lib-cities'), null, '選んでいない県にチップは付かない');
+  assert.equal(mainOf(c[1]).getAttribute('aria-pressed'), 'false');
+  // 市区町村のチップ → city と fitBounds。チップは作り直さない
+  chips[1].click();
   await settle();
   q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('pref'), '試験県');
-  assert.equal(q.get('city'), null);
-  assert.equal(env.$('#lib-sel').textContent, '試験県');
+  assert.equal(q.get('pref'), '架空県');
+  assert.equal(q.get('city'), '見本町');
+  assert.equal(env.$('#lib-sel').textContent, '架空県 見本町');
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1)), {bounds: [130.5, 30.5, 130.6, 30.6], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}});
+  assert.equal(map.calls.fitBounds.length, 2);
+  assert.equal(chips[1].getAttribute('aria-pressed'), 'true');
+  assert.ok(chips[1].classList.contains('is-selected'));
+  assert.equal(mainOf(c[0]).getAttribute('aria-pressed'), 'false', '押された本体は市区町村');
+  assert.ok(c[0].classList.contains('is-selected'), 'その県のカードも選ばれたまま');
+  same(cityChips(c[0])[1], chips[1], 'チップを作り直さない（フォーカスを失わない）');
+  const before = env.reqs('/api/admin/library/photos').length;
+  chips[2].click();                                          // city が空: 押せない
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, before);
+  // bbox が null の県: 選べるが地図は動かさない。前の県のチップは消える
+  mainOf(c[1]).click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('pref'), '試験県');
+  assert.equal(map.calls.fitBounds.length, 2, 'bbox が null なら地図は動かさない');
+  assert.equal(c[0].querySelector('.lib-cities'), null);
+  assert.equal(cityChips(c[1]).length, 1);
+  assert.ok(!c[0].classList.contains('is-selected'));
   // 海外・不明
-  env.$('#lib-places .lib-summary .lib-summary-show').click();
+  mainOf(c[2]).click();
   await settle();
   q = env.last('/api/admin/library/photos');
   assert.equal(q.get('abroad'), '1');
   assert.equal(q.get('pref'), null);
-  assert.equal(q.get('city'), null);
-  assert.equal(q.get('untimed'), null);
   assert.equal(env.$('#lib-sel').textContent, '海外・不明');
-  assert.ok(env.$('#lib-places .lib-summary').classList.contains('is-selected'));
-  // 除外を含める → 詳細にも場所の一覧にも hidden=1（abroad も付いたまま）
+  assert.equal(map.calls.fitBounds.length, 2);
+  assert.ok(c[2].classList.contains('is-selected'));
+  // 同じカードをもう一度押すと外れ、詳細は隠れ、地図は動かさない
+  mainOf(c[2]).click();
+  assert.equal(hidden(env, '#lib-detail'), true);
+  assert.equal(env.ev('ls.sel.places'), null);
+  assert.equal(map.calls.fitBounds.length, 2);
+  // 今の範囲と同じなら fitBounds を呼ばない
+  env.fake.bounds = {w: 130, s: 30, e: 132, n: 32};
+  mainOf(c[0]).click();
+  await settle();
+  assert.equal(map.calls.fitBounds.length, 2, '今の範囲と同じなら呼ばない');
+  assert.equal(env.last('/api/admin/library/photos').get('pref'), '架空県');
+  // 除外を含める: カード用・候補用・点・詳細のすべてが hidden=1
+  const since = env.calls.length;
   env.$('#lib-hidden').checked = true;
   env.$('#lib-hidden').dispatchEvent({type: 'change'});
   await settle();
-  q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('hidden'), '1');
-  assert.equal(q.get('abroad'), '1');
-  assert.equal(env.last('/api/admin/library/places').get('hidden'), '1');
+  const libCalls = env.calls.slice(since).filter(x => x.url.startsWith('/api/admin/library/'));
+  assert.deepEqual(libCalls.map(x => x.url.split('?')[0].split('/').pop()).sort(), ['photos', 'places', 'places', 'points']);
+  assert.ok(libCalls.every(x => qOf(x).get('hidden') === '1'));
+  assert.equal(env.last('/api/admin/library/photos').get('page'), '1');
   // 空・失敗
   env.handlers.places = () => reply({ok: true, prefs: [], abroad: 0});
   env.$('#lib-view-trips').click();
   env.$('#lib-view-places').click();
   await settle();
-  assert.equal(env.$('#lib-places').textContent, '写真がありません');
+  assert.equal(env.$('#lib-place-cards').textContent, '写真がありません');
   env.handlers.places = () => respond(500, {ok: false, error: 'boom'});
   env.$('#lib-view-trips').click();
   env.$('#lib-view-places').click();
   await settle();
   assert.ok(env.$('#toast').textContent.includes('場所の一覧を読めませんでした: boom'));
 });
-await test('(q2) ライブラリタブを開き直すと、日付・場所のビューのままなら一覧を読み直す', async () => {
+
+await test('(q1) 市区町村のチップは最大 30（残りは選べない「ほか N」の行）。県のカードの幅が 480px 以上の地図では fitBounds の余白が 40', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const many = Array.from({length: 35}, (_, i) => ({city: '市' + String(i).padStart(2, '0'), count: 100 - i, bbox: [131, 31, 131.5, 31.5]}));
+  env.handlers.places = () => reply({ok: true, abroad: 0, prefs: [{pref: '多県', count: 999, cover: null, bbox: [130, 30, 132, 32], cities: many}]});
+  await openPlaces(env);
+  env.$('#lib-map').rectWidth = 800;
+  mainOf(pcards(env)[0]).click();
+  await settle();
+  const chips = cityChips(pcards(env)[0]);
+  assert.equal(chips.length, 30);
+  assert.equal(chips[0].textContent, '市00100');
+  assert.equal(chips[29].textContent, '市2971');
+  const more = pcards(env)[0].querySelector('.lib-cities .lib-more');
+  assert.equal(more.textContent, 'ほか 5（上の欄で探せます）');
+  assert.notEqual(more.tagName.toLowerCase(), 'button', '選べない行');
+  assert.deepEqual(plain(mapOf(env).calls.fitBounds[0].options), {padding: 40, maxZoom: 12});
+});
+
+await test('(q2) ライブラリタブを開き直すと、場所のビューのままならカード用・候補用を読み直す', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
   env.$('#lib-view-places').click();
   await settle();
+  assert.equal(env.reqs('/api/admin/library/places').length, 2);
   env.$('.tab[data-tab=status]').click();
   await settle();
   await openLib(env);
-  assert.equal(env.reqs('/api/admin/library/places').length, 2);
+  assert.equal(env.reqs('/api/admin/library/places').length, 4);
   assert.equal(hidden(env, '#lib-places'), false);
   assert.equal(hidden(env, '#lib-trips'), true);
 });
@@ -1436,7 +1618,7 @@ await test('(s) 共通ビューアの「画像なし」: 格子から開いて�
   assert.deepEqual(shown(), {none: false, img: true, text: '画像なし'});
   env.$('#viewer-close').click();
   // 地図の吹き出しの「開く」: 503 を ids= で引いた 1 枚
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   env.handlers.photos = () => reply({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [P503]});
   mapOf(env).fire('click', {features: [{properties: {id: 503}, geometry: {coordinates: [20.5, 10.5]}}]}, 'lib-point');
@@ -1450,7 +1632,7 @@ await test('(t) 位置・除外が変わると地図の点を取り直す: 地�
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const pointReqs = () => env.reqs('/api/admin/library/points');
   assert.equal(pointReqs().length, 1);
@@ -1488,7 +1670,7 @@ await test('(t) 位置・除外が変わると地図の点を取り直す: 地�
   env.context.libPhotoChanged(502, {lat: 37, lon: 141});
   assert.equal(pointReqs().length, n);
   assert.equal(env.ev('ls.pointsStale'), true);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   assert.equal(pointReqs().length, n + 1);
   assert.equal(env.ev('ls.pointsStale'), false);
@@ -1508,7 +1690,7 @@ await test('(u) 偽の MapLibre: fitBounds(bounds, options, eventData)・easeTo(
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  env.$('#lib-view-map').click();
+  env.$('#lib-view-places').click();
   await settle();
   const map = mapOf(env);
   const events = [];
@@ -1532,4 +1714,268 @@ await test('(u) 偽の MapLibre: fitBounds(bounds, options, eventData)・easeTo(
   env.$('#lib-bbox').click();
   await settle();
   assert.equal(env.last('/api/admin/library/photos').get('bbox'), '1,2,3,4', 'getBounds の差し替えが効く');
+});
+
+// ---- AC7: 地図の移動の理由 ----
+// 利用者の移動（ドラッグ・ズーム・クラスタを押したときの easeTo）の moveend には libMove が無い。カード・チップ・「地図で見る」・「全体に戻す」・
+// 自分の resize の移動の moveend には libMove が付く。偽の MapLibre は fitBounds・easeTo を積むだけで、moveend は endMove() を呼んだときに起こす
+// （interrupt() は起こさず捨てる。本物は中断された移動の moveend も起こすので、試験で明示して fire する）
+const withBboxOnly = () => params => params.get('bbox') ? reply({ok: true, abroad: 0, prefs: [
+  {pref: '架空県', count: 7, cover: {id: 701, thumb_url: '/thumb/701.jpg?v=dddddddddddd'}, bbox: [130.5, 30.5, 131, 31],
+   cities: [{city: '見本町', count: 7, bbox: [130.5, 30.5, 130.6, 30.6]}]}]}) : null;
+const bboxReqs = env => placeQs(env).filter(q => q.get('bbox'));
+const userMove = (env, to) => {                  // 利用者のドラッグ相当: 中心・ズーム・表示範囲が変わって libMove の無い moveend
+  const map = mapOf(env);
+  if(to.bounds) env.fake.bounds = to.bounds;
+  if(to.center) env.fake.center = to.center;
+  if(to.zoom !== undefined) env.fake.zoom = to.zoom;
+  map.fire('moveend', {originalEvent: {type: 'mouseup'}});
+};
+
+await test('(v) AC7 ドラッグ・ズーム・クラスタを押したあとの移動では /places?bbox=… を読み直し、カードが範囲の中の県・枚数になり、#lib-note に「地図の範囲: N 都道府県」。候補用は読み直さない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.handlers.places = withBboxOnly();
+  await openPlaces(env);
+  env.raf();                                              // 場所を出したときの resize（libMove 付き）では読まない
+  const map = mapOf(env);
+  assert.equal(bboxReqs(env).length, 0);
+  assert.deepEqual(pcards(env).map(cardName), ['架空県', '試験県', '海外・不明']);
+  // ドラッグ
+  userMove(env, {bounds: {w: 130.25, s: 30.5, e: 131.75, n: 31.5}, center: {lng: 131, lat: 31}});
+  await settle();
+  assert.equal(bboxReqs(env).length, 1);
+  let q = bboxReqs(env)[0];
+  assert.equal(q.get('bbox'), '130.25,30.5,131.75,31.5');
+  assert.equal(q.get('from'), null);
+  assert.deepEqual(plain(env.ev('ls.mapBbox')), [130.25, 30.5, 131.75, 31.5]);
+  assert.deepEqual(pcards(env).map(cardName), ['架空県'], '範囲の中に写真のある県だけ');
+  assert.deepEqual(pcards(env).map(cardCount), ['7 枚'], '範囲の中の枚数');
+  assert.equal(env.$('#lib-note').textContent, '地図の範囲: 1 都道府県');
+  assert.equal(placeQs(env).filter(x => !x.get('bbox')).length, 2, '候補用（bbox なし）は読み直さない');
+  // ズーム
+  userMove(env, {bounds: {w: 130.5, s: 30.75, e: 131.5, n: 31.25}, zoom: 8});
+  await settle();
+  assert.equal(bboxReqs(env).length, 2);
+  assert.equal(bboxReqs(env)[1].get('bbox'), '130.5,30.75,131.5,31.25');
+  // クラスタを押す: easeTo（eventData なし）→ 終わると moveend に libMove が無い
+  mapOf(env).fire('click', {features: [{properties: {cluster_id: 7}, geometry: {coordinates: [131.25, 31.1]}}]}, 'lib-clusters');
+  await settle();
+  assert.equal(map.moves.length, 1);
+  assert.equal(map.moves[0].eventData, undefined, 'クラスタの easeTo は libMove を付けない');
+  env.fake.bounds = {w: 131, s: 31, e: 131.5, n: 31.25};
+  map.endMove();
+  await settle();
+  assert.equal(bboxReqs(env).length, 3);
+  assert.equal(bboxReqs(env)[2].get('bbox'), '131,31,131.5,31.25');
+  // 中心もズームも変わっていない moveend（コンテナの大きさだけが変わった resize。本物の ResizeObserver 経由）は利用者の移動ではない
+  map.resize([]);
+  map.fire('moveend', {});
+  await settle();
+  assert.equal(bboxReqs(env).length, 3, '大きさだけの変化ではカードを絞らない');
+  // この範囲の写真を見る: 表示範囲の bbox
+  env.$('#lib-bbox').click();
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('bbox'), '131,31,131.5,31.25');
+  assert.equal(q.get('from'), null);
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'bbox', bbox: [131, 31, 131.5, 31.25]});
+  assert.equal(env.$('#lib-sel').textContent, '地図の範囲');
+  // 全体に戻す: 日本全体へ（libMove 付き）、絞り込みを外して読み直す。moveend では読まない
+  const reqs = placeQs(env).length;
+  env.$('#lib-reset').click();
+  await settle();
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1)), {bounds: [122, 24, 154, 46], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}});
+  assert.equal(env.ev('ls.mapBbox'), null);
+  assert.equal(placeQs(env).length, reqs + 1);
+  q = placeQs(env).at(-1);
+  assert.equal(q.get('bbox'), null, 'bbox が外れる');
+  assert.deepEqual(pcards(env).map(cardName), ['架空県', '試験県', '海外・不明']);
+  assert.equal(env.$('#lib-note').textContent, '2 都道府県');
+  map.endMove();
+  await settle();
+  assert.equal(placeQs(env).length, reqs + 1, '全体に戻すの moveend では読まない');
+});
+
+await test('(v2) AC7 カード・チップの選択の fitBounds のあとは読まない。カードを続けて 2 回選ぶ（中断された 1 回目の moveend も含め）読まない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.handlers.places = withBboxOnly();
+  await openPlaces(env);
+  env.raf();
+  const map = mapOf(env);
+  const base = placeQs(env).length;
+  mainOf(pcards(env)[0]).click();                      // 県 → fitBounds #1
+  await settle();
+  assert.equal(map.moves.length, 1);
+  map.endMove();                                        // libMove 付きの moveend
+  await settle();
+  assert.equal(placeQs(env).length, base, '選択の fitBounds のあとは読まない');
+  // 続けて 2 回: チップを押す（#2）→ 終わる前に県を押す（#3）
+  cityChips(pcards(env)[0])[0].click();                 // 見本町（#2）
+  await settle();
+  env.fake.bounds = {w: 100, s: 10, e: 120, n: 30};     // 移動の途中の表示範囲（県の範囲とは違う）
+  mainOf(pcards(env)[0]).click();                       // 県を選ぶ（#3）。市区町村の選択から県の選択に替わる
+  await settle();
+  assert.equal(map.moves.length, 2, '#2 と #3 が積まれている');
+  map.interrupt();                                      // 本物は #3 が #2 を中断し、#2 の moveend を（libMove 付きで）起こす
+  map.fire('moveend', {libMove: true});
+  map.endMove();
+  await settle();
+  assert.equal(placeQs(env).length, base, '中断された 1 回目の moveend も含め読まない');
+  assert.equal(env.ev('ls.mapBbox'), null);
+  // 自動の移動の途中で利用者がドラッグ: 移動の moveend（libMove）は読まず、ドラッグの moveend（libMove なし）で読む
+  cityChips(pcards(env)[0])[0].click();                 // fitBounds（積む）
+  await settle();
+  map.endMove();                                        // 中断された移動の moveend（libMove）
+  await settle();
+  assert.equal(placeQs(env).length, base);
+  userMove(env, {bounds: {w: 130.4, s: 30.4, e: 130.7, n: 30.7}, center: {lng: 130.55, lat: 30.55}});
+  await settle();
+  assert.equal(bboxReqs(env).length, 1, '自動の移動の途中のドラッグで読む');
+  assert.equal(bboxReqs(env)[0].get('bbox'), '130.4,30.4,130.7,30.7');
+  // 自動の移動の途中にクラスタを押す: 中断された移動は読まず、クラスタの easeTo の moveend で読む
+  mainOf(pcards(env)[0]).click();                       // 県を選ぶ（市区町村の選択から替わる）→ fitBounds
+  await settle();
+  assert.equal(map.moves.length, 1);
+  map.fire('click', {features: [{properties: {cluster_id: 9}, geometry: {coordinates: [130.55, 30.55]}}]}, 'lib-clusters');
+  await settle();
+  const before = bboxReqs(env).length;
+  map.interrupt();                                      // fitBounds が中断される
+  map.fire('moveend', {libMove: true});
+  await settle();
+  assert.equal(bboxReqs(env).length, before, '中断された自動の移動では読まない');
+  env.fake.bounds = {w: 130.5, s: 30.5, e: 130.6, n: 30.6};
+  map.endMove();                                        // クラスタの easeTo の moveend
+  await settle();
+  assert.equal(bboxReqs(env).length, before + 1);
+  assert.equal(bboxReqs(env).at(-1).get('bbox'), '130.5,30.5,130.6,30.6');
+});
+
+await test('(v3) カード用と候補用の /places は保存先・seq・loaded を分け、逆の順で返してもそれぞれ最新だけを使う。期間・除外が変わると両方を読み直す', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const held = [];
+  env.handlers.places = params => new Promise(res => held.push({bbox: params.get('bbox'), hidden: params.get('hidden'),
+    send: body => res({ok: true, status: 200, json: () => Promise.resolve(body)})}));
+  const body = names => ({ok: true, abroad: 0, prefs: names.map((pref, i) => ({pref, count: 10 - i, cover: null, bbox: null, cities: []}))});
+  await openPlaces(env);
+  assert.equal(held.length, 2, 'カード用と候補用');
+  held[1].send(body(['候補だけ']));                    // 候補用が先に返る
+  await settle();
+  assert.equal(env.ev('ls.loaded.placeOptions'), true);
+  assert.equal(env.ev('ls.loaded.placeCards'), false, 'カード用はまだ');
+  held[0].send(body(['カード甲', 'カード乙']));
+  await settle();
+  assert.deepEqual(pcards(env).map(cardName), ['カード甲', 'カード乙']);
+  assert.deepEqual(plain(env.ev('ls.placeOpts.prefs.map(p => p.pref)')), ['候補だけ'], '候補はカードに混ざらない');
+  assert.deepEqual(plain(env.ev('ls.prefs.map(p => p.pref)')), ['カード甲', 'カード乙']);
+  // 地図を 2 回動かす: 古いカードの応答（後から返る）は捨てる
+  userMove(env, {bounds: {w: 1, s: 2, e: 3, n: 4}, center: {lng: 2, lat: 3}});
+  userMove(env, {bounds: {w: 5, s: 6, e: 7, n: 8}, center: {lng: 6, lat: 7}});
+  await settle();
+  const moves = held.slice(2);
+  assert.deepEqual(moves.map(h => h.bbox), ['1,2,3,4', '5,6,7,8']);
+  moves[1].send(body(['新しい範囲']));
+  await settle();
+  moves[0].send(body(['古い範囲']));
+  await settle();
+  assert.deepEqual(pcards(env).map(cardName), ['新しい範囲']);
+  assert.equal(env.ev('ls.placeOpts.prefs.length'), 1, '地図の移動は候補を読み直さない');
+  // 除外の切り替え: 両方の seq が増え、飛んでいる応答は捨てる。両方を hidden=1 で読み直す
+  userMove(env, {bounds: {w: 9, s: 10, e: 11, n: 12}, center: {lng: 10, lat: 11}});    // カード用（保留）
+  await settle();
+  const stale = held.at(-1);
+  const n = held.length;
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  const fresh = held.slice(n);
+  assert.equal(fresh.length, 2, 'カード用と候補用を読み直す');
+  assert.ok(fresh.every(h => h.hidden === '1'));
+  fresh[1].send(body(['候補新']));
+  fresh[0].send(body(['カード新']));
+  await settle();
+  stale.send(body(['飛んでいた応答']));
+  await settle();
+  assert.deepEqual(pcards(env).map(cardName), ['カード新']);
+  assert.deepEqual(plain(env.ev('ls.placeOpts.prefs.map(p => p.pref)')), ['候補新']);
+  // 見えていない view で期間が変わる（地図で見る）と、両方の seq が増えて loaded が落ちる
+  env.$('#lib-view-trips').click();
+  await settle();
+  const k = held.length;
+  env.$('#lib-hidden').checked = false;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(held.length, k, '見えていなければ読まない');
+  assert.equal(env.ev('ls.loaded.placeCards'), false);
+  assert.equal(env.ev('ls.loaded.placeOptions'), false);
+});
+
+await test('(v4) 地図の大きさ: 場所を出したとき・詳細の出し入れ・幅 640px の境をまたいだとき、描画の確定後に resize({libMove:true})。毎回の選択では予約しない。resize の moveend ではカードを絞らない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  assert.equal(env.rafQueue.length, 0);
+  await openPlaces(env);
+  const map = mapOf(env);
+  assert.equal(map.calls.resize, 0, '描画の確定前は呼ばない');
+  assert.equal(env.raf(), 1);
+  assert.deepEqual(plain(map.calls.resizeArgs), [{libMove: true}]);
+  const base = placeQs(env).length;
+  assert.equal(placeQs(env).filter(q => q.get('bbox')).length, 0, 'resize の moveend で読まない');
+  mainOf(pcards(env)[0]).click();                      // 詳細が出る
+  await settle();
+  assert.equal(env.raf(), 1, '詳細が出たとき');
+  mainOf(pcards(env)[1]).click();                      // 詳細は出たまま切り替わる
+  await settle();
+  assert.equal(env.rafQueue.length, 0, '選択の切り替えでは予約しない');
+  mainOf(pcards(env)[1]).click();                      // 外す → 詳細が隠れる
+  assert.equal(env.raf(), 1, '詳細が隠れたとき');
+  env.narrow(true);                                     // 幅 640px の境をまたいだ
+  assert.equal(env.raf(), 1);
+  env.narrow(false);
+  assert.equal(env.raf(), 1);
+  assert.equal(map.calls.resize, 5);
+  assert.ok(map.calls.resizeArgs.every(a => a && a.libMove === true));
+  assert.equal(placeQs(env).length, base, 'resize ではカードを読み直さない');
+  // 別のタブにいるあいだは合わせない
+  env.$('.tab[data-tab=status]').click();
+  await settle();
+  env.narrow(true);
+  assert.equal(env.raf(), 0, 'タブが見えていなければ予約しない');
+  assert.equal(map.calls.resize, 5, 'タブが見えていなければ resize しない');
+  // 旅の画面では予約しない
+  await openLib(env);
+  env.raf();
+  env.$('#lib-view-trips').click();
+  await settle();
+  env.narrow(false);
+  assert.equal(env.rafQueue.length, 0);
+});
+
+await test('(v5) 詳細 #lib-detail は旅・日付では一覧の下（#v-library の末尾）、場所では右の列の地図の下。場所を出すだけでは詳細を移すだけで消えない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const detail = env.$('#lib-detail');
+  same(detail.parentNode, env.$('#v-library'));
+  pressTrip(env, 0);
+  await settle();
+  same(detail.parentNode, env.$('#v-library'));
+  await openPlaces(env);
+  same(detail.parentNode, env.$('#lib-place-main'));
+  assert.equal(hidden(env, '#lib-detail'), true, '場所の選択は無い');
+  const kids = env.$('#lib-place-main').children;
+  same(kids.at(-1), detail, '地図のあと');
+  assert.equal(env.$('#lib-map').parentNode, env.$('#lib-place-main'));
+  env.$('#lib-view-trips').click();
+  await settle();
+  same(detail.parentNode, env.$('#v-library'));
+  assert.equal(hidden(env, '#lib-detail'), false, '旅の選択の詳細');
+  assert.equal(env.$$('#lib-grid .lib-tile').length, 3);
+  assert.equal(env.ev("typeof ls.sel.map"), 'undefined', '地図の view の選択は無い');
 });

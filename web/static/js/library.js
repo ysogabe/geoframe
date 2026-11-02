@@ -1,7 +1,7 @@
 /* ============================================================
    library.js — 管理ページのライブラリタブ（classic script / 依存なし）
-   構成: 1) 状態 2) 画像・タイル 3) 選択と下の詳細 4) 旅のカード 5) 日付（年のカード・月のチップ）・場所（行）
-        6) 写真の格子（詳細）7) 地図（MapLibre のクラスタ・吹き出し・範囲）8) 切り替え・初期化
+   構成: 1) 状態 2) 画像・タイル 3) 選択と下の詳細 4) 旅のカード 5) 日付（年のカード・月のチップ）
+        6) 場所（都道府県のカード・市区町村のチップ・期間）7) 写真の格子（詳細）8) 地図（MapLibre のクラスタ・吹き出し・範囲・移動の理由）9) 切り替え・初期化
    admin.js（$ el toast）と photos.js（normalizePhoto openModalFor onPhotoChange tileStyle）の後に読み込む。
    定義だけを置き、起動は admin.js の boot() が initLibrary() を呼ぶ形（読み込んだだけでは何にも触らない）。
    サーバーは GET /api/admin/library/{trips,photos,points,calendar,places}（crates/geoframe/src/admin_library.rs）。
@@ -10,28 +10,34 @@
 'use strict';
 
 /* ==== 1) 状態 ==== */
-/* view: 'trips'（旅）| 'calendar'（日付）| 'places'（場所）| 'map'（地図。場所との統合は後の段）。
+/* view: 'trips'（旅）| 'calendar'（日付）| 'places'（場所。都道府県のカード・地図・写真の詳細を 1 つの画面に置く）。
    sel: view ごとの選択（今の選択は sel[view]。null なら一覧だけ）。選択 S は
         {kind:'trip', key, from, to} | {kind:'year', year, from, to} | {kind:'month', year, month, from, to} | {kind:'untimed'}
-        | {kind:'pref', pref} | {kind:'city', pref, city} | {kind:'abroad'} | {kind:'bbox', bbox: [w, s, e, n], period}
+        | {kind:'pref', pref} | {kind:'city', pref, city} | {kind:'abroad'} | {kind:'bbox', bbox: [w, s, e, n]} | {kind:'period'}（場所の画面で、期間の写真全体）
    選ぶと一覧を残したまま #lib-detail に S の写真の格子を出す。同じカードをもう一度押すと選択を外す。
    gen: 選択・view・除外が変わるたびに増やす。読み取りを待つ間にこれが変わった応答は捨てる（seq と二重に守る）。
    anchor: Shift の範囲の起点（後の段で使う）。
-   years / prefs: calendar・places の応答。openPrefs: 開いている都道府県。loaded: 読み込み済みの一覧
-   period: 地図の点と範囲の絞り込みに掛ける期間 {from, to}（旅の「地図で見る」で入り、解除ボタンで外す）。
+   years: calendar の応答。
+   prefs / abroad: 都道府県のカード用の /places の応答（period・hidden・mapBbox を掛ける）。placeOpts: コンボボックスの候補用の /places の応答
+   （period・hidden だけ。mapBbox は掛けない。候補の UI は後の段）。保存先・seq（placeCards・placeOptions）・loaded を別に持つ。
+   loaded: 読み込み済みの一覧
+   period: 場所の画面に掛かる期間 {from, to}（旅の「地図で見る」で入り、解除ボタンで外す）。カード・候補・点・詳細のすべてに掛かる。
+   mapBbox: 利用者が地図を動かしたときのカードの絞り込み [w, s, e, n]。null なら絞らない。
+   fitPoints: 「地図で見る」のあと、点を読めたら点の範囲へ地図を動かす印。cam: 直近の moveend のときの地図の中心とズーム（resize だけの moveend を見分ける）。
+   onPlaces・detailShown・resizeQueued: 地図の大きさを合わせ直す時点を決める印（場所の view を出した・詳細の出し入れ・合わせ直しの予約中）。
    pointsStale: 地図が見えていないあいだに設定（除外も含める）が変わったので、地図に戻るとき点を取り直す印。
    seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が詳細の読み込みを捨てないため） */
 const ls = {
   view: 'trips', includeHidden: false,
   trips: [], untimed: 0,
-  years: [], calUntimed: 0, prefs: [], abroad: 0,
-  openPrefs: new Set(),
-  loaded: {trips: false, calendar: false, places: false},
-  sel: {trips: null, calendar: null, places: null, map: null}, gen: 0, anchor: null,
-  period: null, pointsStale: false,
+  years: [], calUntimed: 0, prefs: [], abroad: 0, placeOpts: {prefs: [], abroad: 0},
+  loaded: {trips: false, calendar: false, placeCards: false, placeOptions: false},
+  sel: {trips: null, calendar: null, places: null}, gen: 0, anchor: null,
+  period: null, mapBbox: null, fitPoints: false, cam: null, pointsStale: false,
+  onPlaces: false, detailShown: false, resizeQueued: false,
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
   map: null, pendingData: null, labels: new Map(), popup: null,
-  seq: {trips: 0, detail: 0, points: 0, popup: 0, calendar: 0, places: 0, when: 0},
+  seq: {trips: 0, detail: 0, points: 0, popup: 0, calendar: 0, placeCards: 0, placeOptions: 0, when: 0},
 };
 
 const LIB_POINTS_SOURCE = 'photos';
@@ -135,7 +141,8 @@ function selLabel(S){
     case 'pref': return S.pref;
     case 'city': return S.pref + ' ' + S.city;
     case 'abroad': return '海外・不明';
-    case 'bbox': return '地図の範囲' + (S.period ? '・' + rangeLabel(S.period.from, S.period.to) : '');
+    case 'bbox': return '地図の範囲' + (ls.period ? '・' + rangeLabel(ls.period.from, ls.period.to) : '');
+    case 'period': return ls.period ? '期間 ' + rangeLabel(ls.period.from, ls.period.to) : '';
     default: return '';
   }
 }
@@ -144,7 +151,7 @@ function selId(S){
     case 'trip': return 'trip:' + S.key;
     case 'year': return 'year:' + S.year;
     case 'month': return 'month:' + S.year + '-' + S.month;
-    case 'bbox': return 'bbox:' + S.bbox.join(',') + (S.period ? '@' + S.period.from + '/' + S.period.to : '');
+    case 'bbox': return 'bbox:' + S.bbox.join(',');
     case 'pref': return 'pref:' + S.pref;
     case 'city': return 'city:' + S.pref + '/' + S.city;
     default: return S.kind;
@@ -185,6 +192,7 @@ function paintBox(view){
 }
 function paintSelection(){
   renderMonths(false);
+  paintCities();
   Object.keys(LIB_BOXES).forEach(paintBox);
 }
 /* 選んだカードを見える所へ（1 段の横スクロールの中でも）。場所・地図の画面は詳細へ */
@@ -243,11 +251,11 @@ function tripCard(trip){
   card.appendChild(map);
   return card;
 }
-/* 表紙の無いカード（日時なし）。押すと untimed の写真 */
-function textCard(key, name, count){
+/* 表紙の無いカード（日時なし・海外不明）。押すと sel の写真 */
+function textCard(key, name, count, onPress){
   const card = el('div', 'lib-card lib-card-text');
   card.dataset.key = key;
-  const main = cardMain(card, () => toggleSel({kind: 'untimed'}));
+  const main = cardMain(card, onPress);
   const body = el('span', 'lib-card-body');
   body.appendChild(el('span', 'lib-card-name', name));
   body.appendChild(el('span', 'lib-card-count', count + ' 枚'));
@@ -259,14 +267,14 @@ function updateLibNote(){
   let text = '';
   if(ls.view === 'trips' && ls.loaded.trips) text = '旅 ' + ls.trips.length + ' 件';
   else if(ls.view === 'calendar' && ls.loaded.calendar) text = ls.years.length + ' 年';
-  else if(ls.view === 'places' && ls.loaded.places) text = ls.prefs.length + ' 都道府県';
+  else if(ls.view === 'places' && ls.loaded.placeCards) text = (ls.mapBbox ? '地図の範囲: ' : '') + ls.prefs.length + ' 都道府県';
   $('#lib-note').textContent = text;
 }
 function renderTrips(){
   const box = $('#lib-trip-cards');
   box.textContent = '';
   ls.trips.forEach(t => box.appendChild(tripCard(t)));
-  if(ls.untimed > 0) box.appendChild(textCard('untimed', '日時なし', ls.untimed));
+  if(ls.untimed > 0) box.appendChild(textCard('untimed', '日時なし', ls.untimed, () => toggleSel({kind: 'untimed'})));
   if(!ls.trips.length && !ls.untimed) box.appendChild(el('div', 'empty', '写真がありません'));
   paintBox('trips');
   updateLibNote();
@@ -281,14 +289,23 @@ function loadTrips(){
     renderTrips();
   }).catch(e => { if(seq === ls.seq.trips) toast('旅の一覧を読めませんでした: ' + e.message, true); });
 }
-/* 「地図で見る」は新しい期間で地図を見直す。以前の地図の範囲選択（別の旅の期間を持つ bbox）は持ち越さず解除し、
-   飛んでいる詳細の応答も捨てる（setLibView が復元する sel.map を空にしてから切り替える） */
+/* 「地図で見る」: 場所の画面をその旅の期間で開く。期間は都道府県のカード・候補・地図の点・写真の格子のすべてに掛かり、
+   下には期間の写真全体を出す（sel.places = period）。以前の選択（別の旅の期間で選んだ県・範囲など）は持ち越さず、
+   地図の絞り込み（mapBbox）も外す。飛んでいる詳細・カード・候補の応答は捨てる。地図は点を読んだあと点の範囲へ動く */
 function mapForTrip(trip){
   ls.period = {from: trip.start, to: trip.end};
-  ls.sel.map = null;
+  ls.sel.places = {kind: 'period'};
+  ls.mapBbox = null;
+  ls.fitPoints = true;
   ls.gen++;
   ls.seq.detail++;
-  setLibView('map');
+  ls.seq.placeCards++;
+  ls.seq.placeOptions++;
+  ls.loaded.placeCards = false;
+  ls.loaded.placeOptions = false;
+  ls.page = 1;
+  clearDetail();
+  setLibView('places', true);
 }
 
 /* ==== 5) 日付（年のカード・月のチップ）・場所（行） ==== */
@@ -337,7 +354,7 @@ function renderCalendar(){
   const box = $('#lib-year-cards');
   box.textContent = '';
   ls.years.forEach(y => box.appendChild(yearCard(y)));
-  if(ls.calUntimed > 0) box.appendChild(textCard('untimed', '日時なし', ls.calUntimed));
+  if(ls.calUntimed > 0) box.appendChild(textCard('untimed', '日時なし', ls.calUntimed, () => toggleSel({kind: 'untimed'})));
   if(!ls.years.length && !ls.calUntimed) box.appendChild(el('div', 'empty', '写真がありません'));
   renderMonths(true);
   paintBox('calendar');
@@ -353,87 +370,145 @@ function loadCalendar(){
     renderCalendar();
   }).catch(e => { if(seq === ls.seq.calendar) toast('日付の一覧を読めませんでした: ' + e.message, true); });
 }
-/* 場所は今の行の作り（後の段でカードと地図に統合する）。年・都道府県の行（押すと市区町村の行を開閉）と、「写真を見る」 */
-function groupRow(title, count, opts){
-  const row = el('div', 'lib-grow' + (opts.sub ? ' lib-sub' : ''));
-  row.dataset.key = opts.key;
-  if(opts.onToggle){
-    const toggle = el('button', 'lib-expand');
-    toggle.type = 'button';
-    toggle.setAttribute('aria-expanded', opts.expanded ? 'true' : 'false');
-    toggle.appendChild(el('span', 'lib-caret', opts.expanded ? '▾' : '▸'));
-    toggle.appendChild(el('span', 'lib-gname', title));
-    toggle.addEventListener('click', opts.onToggle);
-    row.appendChild(toggle);
-  }else{
-    row.appendChild(el('span', 'lib-gname', title));
-  }
-  row.appendChild(el('span', 'lib-gcount', count + ' 枚'));
-  if(opts.onShow){
-    const btn = el('button', 'btn lib-gphotos', '写真を見る');
-    btn.type = 'button';
-    btn.addEventListener('click', opts.onShow);
-    row.appendChild(btn);
-  }
-  return row;
+/* ==== 6) 場所（都道府県のカード・市区町村のチップ・期間・地図の絞り込み） ==== */
+const LIB_CITY_MAX = 30;
+/* 都道府県のカード。主ボタン（表紙・名前・枚数）が県を選び、地図をその県の範囲へ動かす。選んだ県のカードには、主ボタンの兄弟として
+   市区町村のチップの容器（.lib-cities）が付く（paintCities。ボタンを入れ子にしない） */
+function placeCard(p){
+  const card = el('div', 'lib-card lib-pref');
+  card.dataset.key = p.pref;
+  const main = cardMain(card, () => selectPlace({kind: 'pref', pref: p.pref}, p.bbox));
+  const cover = el('span', 'lib-cover');
+  putImage(cover, p.cover ? (p.cover.thumb_url || '') : '', '');
+  main.appendChild(cover);
+  const body = el('span', 'lib-card-body');
+  body.appendChild(el('span', 'lib-card-name', p.pref));
+  body.appendChild(el('span', 'lib-card-count', p.count + ' 枚'));
+  main.appendChild(body);
+  return card;
 }
-function summaryRow(key, text, onShow){
-  const row = el('div', 'lib-summary');
-  row.dataset.key = key;
-  row.appendChild(el('span', 'lib-summary-text', text));
-  const btn = el('button', 'btn lib-summary-show', '写真を見る');
-  btn.type = 'button';
-  btn.addEventListener('click', onShow);
-  row.appendChild(btn);
-  return row;
+/* 市区町村のチップ（件数の多い順に最大 30。残りは選べない「ほか N」の行）。city が空のものは件数だけを出して押せない（サーバーは空の city で絞れない） */
+function buildCities(p){
+  const box = el('div', 'lib-cities');
+  box.setAttribute('role', 'group');
+  box.setAttribute('aria-label', p.pref + 'の市区町村');
+  const cities = (p.cities || []).slice().sort((a, b) => b.count - a.count);
+  cities.slice(0, LIB_CITY_MAX).forEach(c => {
+    const chip = el('button', 'chip lib-city', c.city || '（市区町村なし）');
+    chip.type = 'button';
+    chip.appendChild(el('span', 'n', String(c.count)));
+    if(c.city){
+      chip.dataset.key = p.pref + '/' + c.city;
+      chip.setAttribute('aria-pressed', 'false');
+      chip.addEventListener('click', () => selectPlace({kind: 'city', pref: p.pref, city: c.city}, c.bbox));
+    }else{
+      chip.disabled = true;
+    }
+    box.appendChild(chip);
+  });
+  if(cities.length > LIB_CITY_MAX){
+    box.appendChild(el('span', 'lib-more', 'ほか ' + (cities.length - LIB_CITY_MAX) + '（上の欄で探せます）'));
+  }
+  return box;
+}
+/* 選んでいる県（県・市区町村のどちらを選んでいても）のカードにだけチップを付ける。選択のたびには作り直さない（押したチップのフォーカスを失わないため） */
+function paintCities(){
+  const S = ls.sel.places;
+  const open = S && (S.kind === 'pref' || S.kind === 'city') ? S.pref : null;
+  $('#lib-place-cards').querySelectorAll('.lib-pref').forEach(card => {
+    const box = card.querySelector('.lib-cities');
+    if(open !== null && card.dataset.key === open){
+      card.classList.add('has-cities');
+      const data = box ? null : ls.prefs.find(x => x.pref === open);
+      if(data) card.appendChild(buildCities(data));
+    }else{
+      card.classList.remove('has-cities');
+      if(box) box.remove();
+    }
+  });
 }
 function renderPlaces(){
-  const box = $('#lib-places');
+  const box = $('#lib-place-cards');
   box.textContent = '';
-  ls.prefs.forEach(p => {
-    const open = ls.openPrefs.has(p.pref);
-    const group = el('div', 'lib-group');
-    group.appendChild(groupRow(p.pref, p.count, {
-      key: p.pref, expanded: open,
-      onToggle: () => { if(open) ls.openPrefs.delete(p.pref); else ls.openPrefs.add(p.pref); renderPlaces(); },
-      onShow: () => applySel({kind: 'pref', pref: p.pref}),
-    }));
-    if(open){
-      (p.cities || []).forEach(c => {
-        // 市区町村が空の項目は、サーバーが空の city を絞り込みに使えない（空の値は捨てられる）ので、件数だけを出す
-        group.appendChild(groupRow(c.city || '（市区町村なし）', c.count, {
-          key: p.pref + '/' + c.city, sub: true,
-          onShow: c.city ? () => applySel({kind: 'city', pref: p.pref, city: c.city}) : null,
-        }));
-      });
-    }
-    box.appendChild(group);
-  });
-  if(ls.abroad > 0){
-    box.appendChild(summaryRow('abroad', '海外・不明（' + ls.abroad + ' 枚）', () => applySel({kind: 'abroad'})));
+  ls.prefs.forEach(p => box.appendChild(placeCard(p)));
+  if(ls.abroad > 0) box.appendChild(textCard('abroad', '海外・不明', ls.abroad, () => selectPlace({kind: 'abroad'}, null)));
+  if(!ls.prefs.length && !ls.abroad){
+    box.appendChild(el('div', 'empty', ls.mapBbox ? '地図の範囲に写真がありません' : '写真がありません'));
   }
-  if(!ls.prefs.length && !ls.abroad) box.appendChild(el('div', 'empty', '写真がありません'));
+  paintCities();
   paintBox('places');
   updateLibNote();
 }
-function loadPlaces(){
-  const seq = ++ls.seq.places;
-  libGet('places', {hidden: ls.includeHidden}).then(d => {
-    if(seq !== ls.seq.places) return;
+/* カード・チップを押す: 選択（もう一度押すと外す）と、選んだものの範囲への地図の移動。bbox が null（位置のある写真が無い）なら地図は動かさない */
+function selectPlace(S, bbox){
+  const cur = ls.sel.places;
+  const off = !!cur && selId(cur) === selId(S);
+  ls.fitPoints = false;
+  applySel(off ? null : S);
+  if(!off) fitMapTo(bbox);
+}
+function placeParams(withBbox){
+  const p = {hidden: ls.includeHidden};
+  if(ls.period){ p.from = ls.period.from; p.to = ls.period.to; }
+  if(withBbox && ls.mapBbox) p.bbox = ls.mapBbox.join(',');
+  return p;
+}
+/* 都道府県のカード用の /places（period・hidden・mapBbox を掛ける） */
+function loadPlaceCards(){
+  const seq = ++ls.seq.placeCards;
+  libGet('places', placeParams(true)).then(d => {
+    if(seq !== ls.seq.placeCards) return;
     ls.prefs = d.prefs || [];
     ls.abroad = d.abroad || 0;
-    ls.loaded.places = true;
+    ls.loaded.placeCards = true;
     renderPlaces();
-  }).catch(e => { if(seq === ls.seq.places) toast('場所の一覧を読めませんでした: ' + e.message, true); });
+  }).catch(e => { if(seq === ls.seq.placeCards) toast('場所の一覧を読めませんでした: ' + e.message, true); });
 }
-/* view の一覧を読む（地図は点を別に読む） */
-function loadLibList(view){
+/* コンボボックスの候補用の /places（period・hidden だけ。地図の絞り込みは掛けない）。候補の UI は後の段 */
+function loadPlaceOptions(){
+  const seq = ++ls.seq.placeOptions;
+  libGet('places', placeParams(false)).then(d => {
+    if(seq !== ls.seq.placeOptions) return;
+    ls.placeOpts = {prefs: d.prefs || [], abroad: d.abroad || 0};
+    ls.loaded.placeOptions = true;
+  }).catch(e => { if(seq === ls.seq.placeOptions) toast('場所の候補を読めませんでした: ' + e.message, true); });
+}
+/* 期間（「期間: … ✕」）の解除: カード・候補・点を期間なしで読み直す。期間の写真全体の詳細は隠して飛んでいる応答も捨て、
+   県・市区町村・範囲などを選んでいれば、その選択のまま期間なしで詳細を読み直す（ページ 1） */
+function clearPeriod(){
+  if(!ls.period) return;
+  ls.period = null;
+  ls.fitPoints = false;
+  ls.gen++;
+  ls.seq.detail++;
+  ls.seq.placeCards++;
+  ls.seq.placeOptions++;
+  ls.page = 1;
+  if(ls.sel.places && ls.sel.places.kind === 'period') ls.sel.places = null;
+  clearDetail();
+  if(ls.view === 'places'){
+    showLib();
+    loadPlaceCards();
+    loadPlaceOptions();
+    loadPoints();
+    if(ls.sel.places) loadDetail();
+  }else{
+    ls.loaded.placeCards = false;
+    ls.loaded.placeOptions = false;
+    ls.pointsStale = true;
+  }
+}
+/* view の一覧を読む（場所は都道府県のカードを毎回、候補は force か未読み込みのとき。地図の点は別に読む） */
+function loadLibList(view, force){
   if(view === 'trips') loadTrips();
   else if(view === 'calendar') loadCalendar();
-  else if(view === 'places') loadPlaces();
+  else if(view === 'places'){
+    loadPlaceCards();
+    if(force || !ls.loaded.placeOptions) loadPlaceOptions();
+  }
 }
 
-/* ==== 6) 詳細（写真の格子・ページ） ==== */
+/* ==== 7) 詳細（写真の格子・ページ） ==== */
 function detailParams(S){
   const p = {page: ls.page, per: ls.per, hidden: ls.includeHidden};
   switch(S.kind){
@@ -441,12 +516,12 @@ function detailParams(S){
     case 'abroad': p.abroad = true; break;
     case 'pref': p.pref = S.pref; break;
     case 'city': p.pref = S.pref; p.city = S.city; break;
-    case 'bbox':
-      p.bbox = S.bbox.join(',');
-      if(S.period){ p.from = S.period.from; p.to = S.period.to; }
-      break;
+    case 'bbox': p.bbox = S.bbox.join(','); break;
+    case 'period': break;                          // 期間（下で掛ける）の写真全体
     default: p.from = S.from; p.to = S.to;      // trip・year・month
   }
+  // 場所の画面の期間は、県・市区町村・海外不明・範囲・期間のすべてに掛かる（旅の「地図で見る」）
+  if(ls.view === 'places' && ls.period){ p.from = ls.period.from; p.to = ls.period.to; }
   return p;
 }
 function renderGrid(){
@@ -492,18 +567,18 @@ function libPhotoChanged(id, patch){
   });
 
   // 位置・除外が変わると地図の点が変わる（★は点に出ない）。飛んでいる点の応答は捨て、地図が見えていれば取り直し、
-  // 見えていない（地図以外の view、別のタブ）なら印だけ立てて、地図に戻るとき（setLibView・openLibraryTab）に読む
+  // 見えていない（場所以外の view、別のタブ）なら印だけ立てて、地図に戻るとき（setLibView・openLibraryTab）に読む
   if(patch && ('lat' in patch || 'lon' in patch || 'hidden' in patch)){
     if(mapVisible()) loadPoints();
     else{ ls.seq.points++; ls.pointsStale = true; }
   }
 }
-/* 地図が見えているか: 地図の view で、ライブラリのタブが見えている */
+/* 地図が見えているか: 場所の view で、ライブラリのタブが見えている */
 function mapVisible(){
-  return ls.view === 'map' && !$('#v-library').classList.contains('hidden');
+  return ls.view === 'places' && !$('#v-library').classList.contains('hidden');
 }
 
-/* ==== 7) 地図 ==== */
+/* ==== 8) 地図 ==== */
 const LIB_CLUSTER_COLOR = ['step', ['get', 'point_count'], '#00b8d4', 100, '#ffb300', 1000, '#ff2d95'];
 const LIB_CLUSTER_RADIUS = ['step', ['get', 'point_count'], 14, 100, 19, 1000, 25];
 const EMPTY_POINTS = {type: 'FeatureCollection', features: []};
@@ -540,6 +615,74 @@ function syncClusterLabels(){
   });
 }
 const LIB_MAX_LNG = 179.999;
+/* 地図の移動の理由: カード・チップ・「地図で見る」・「全体に戻す」・自分の resize が地図を動かすときは、この eventData を渡す。
+   MapLibre は fitBounds(bounds, options, eventData)・easeTo(options, eventData)・resize(eventData) の eventData を、その移動の
+   movestart・move・moveend のイベントに載せる。moveend にこれが付いていれば「利用者が動かした」ではないので、カードを絞らない。
+   印を状態に持たないので、移動が途中で別の移動に置き換わっても印が残らない */
+const LIB_MOVE = {libMove: true};
+const LIB_JAPAN = [122, 24, 154, 46];                  // 「全体に戻す」: 日本全体（沖縄から北方領土まで）
+const LIB_NARROW_MAP = 480;                              // 地図の幅がこれ未満なら fitBounds の余白を小さくする
+function mapWidth(){ return $('#lib-map').getBoundingClientRect().width; }
+function fitOptions(){ return {padding: mapWidth() < LIB_NARROW_MAP ? 16 : 40, maxZoom: 12}; }
+/* 今の範囲と同じなら動かさない（bbox が null＝位置のある写真が無いときも動かさない） */
+function fitMapTo(bbox){
+  if(!bbox) return;
+  const map = ensureLibMap();
+  if(!map) return;
+  const cur = currentBbox();
+  if(cur.every((v, i) => Math.abs(v - bbox[i]) < 1e-6)) return;
+  map.fitBounds(bbox, fitOptions(), LIB_MOVE);
+}
+/* 地図の中心とズーム（MapLibre の resize は動いていなくても moveend を起こす。コンテナの大きさが変わっただけ
+   （ウィンドウ幅・スクロールバー・詳細の出し入れ）の moveend を、利用者の移動と取り違えないため） */
+function cameraKey(){
+  const c = ls.map.getCenter();
+  return [c.lng.toFixed(5), c.lat.toFixed(5), ls.map.getZoom().toFixed(3)].join(',');
+}
+/* moveend: libMove の付いたもの（上の移動）は絞らない。付いていない移動（ドラッグ・ズーム・ホイール・クラスタを押したときの easeTo・
+   自動の移動の途中のドラッグ）で、地図の中心かズームが変わっていれば利用者の移動として、表示範囲でカードを読み直す */
+function onMapMoveEnd(e){
+  const cam = cameraKey();
+  const moved = cam !== ls.cam;
+  ls.cam = cam;
+  if(e && e.libMove) return;
+  if(!moved || !mapVisible()) return;
+  ls.fitPoints = false;
+  ls.mapBbox = currentBbox();
+  loadPlaceCards();
+}
+/* 描画の確定後に地図の大きさを合わせ直す（場所の view を出したとき・詳細の出し入れ・幅 640px の境をまたいだとき・タブに戻ったとき） */
+function scheduleMapResize(){
+  if(!ls.map || ls.resizeQueued) return;
+  const run = () => {
+    ls.resizeQueued = false;
+    if(ls.map && mapVisible()) ls.map.resize(LIB_MOVE);
+  };
+  ls.resizeQueued = true;
+  if(typeof requestAnimationFrame === 'function') requestAnimationFrame(run);
+  else run();
+}
+/* 点の座標の範囲 [w, s, e, n]（点が無ければ null） */
+function featuresBbox(features){
+  let box = null;
+  (features || []).forEach(f => {
+    const c = f.geometry && f.geometry.coordinates;
+    if(!c) return;
+    if(!box) box = [c[0], c[1], c[0], c[1]];
+    else{
+      box[0] = Math.min(box[0], c[0]); box[1] = Math.min(box[1], c[1]);
+      box[2] = Math.max(box[2], c[0]); box[3] = Math.max(box[3], c[1]);
+    }
+  });
+  return box;
+}
+/* 「全体に戻す」: 日本全体へ戻し、地図の範囲による絞り込みを外して読み直す */
+function resetMap(){
+  ls.fitPoints = false;
+  ls.mapBbox = null;
+  fitMapTo(LIB_JAPAN);
+  loadPlaceCards();
+}
 function ensureLibMap(){
   if(ls.map) return ls.map;
   if(typeof maplibregl === 'undefined'){ toast('地図を読み込めませんでした', true); return null; }
@@ -552,9 +695,11 @@ function ensureLibMap(){
     renderWorldCopies: false, maxBounds: [[-LIB_MAX_LNG, -85], [LIB_MAX_LNG, 85]],
   });
   ls.map = map;
+  ls.cam = cameraKey();
   map.addControl(new maplibregl.NavigationControl({showCompass: false}), 'top-right');
   map.on('load', () => addPointLayers(map));
   map.on('moveend', syncClusterLabels);
+  map.on('moveend', onMapMoveEnd);
   map.on('zoomend', syncClusterLabels);
   // moveend・zoomend は描画での source の更新より先に発火し、更新先のタイルがキャッシュにあると sourcedata も出ないので、描画が落ち着いた後にも 1 回合わせる
   map.on('idle', syncClusterLabels);
@@ -604,6 +749,10 @@ function loadPoints(){
     $('#lib-map-note').textContent = d.truncated
       ? n + ' 点（全 ' + d.total + ' 点のうち新しい順）'
       : n + ' 点';
+    if(ls.fitPoints){            // 「地図で見る」: 点を読めたら点の範囲へ（点が無ければ動かさない）
+      ls.fitPoints = false;
+      fitMapTo(featuresBbox(d.features));
+    }
   }).catch(e => { if(seq === ls.seq.points) toast('地図の点を読めませんでした: ' + e.message, true); });
 }
 function closePopup(){
@@ -644,39 +793,45 @@ function currentBbox(){
 }
 function viewBbox(){
   if(!ls.map) return;
-  applySel({kind: 'bbox', bbox: currentBbox(), period: ls.period ? {from: ls.period.from, to: ls.period.to} : null});
+  ls.fitPoints = false;
+  applySel({kind: 'bbox', bbox: currentBbox()});
 }
 
-/* ==== 8) 切り替え・初期化 ==== */
+/* ==== 9) 切り替え・初期化 ==== */
 function showLib(){
   const view = ls.view;
-  const trips = view === 'trips', map = view === 'map';
-  const calendar = view === 'calendar', places = view === 'places';
+  const trips = view === 'trips', calendar = view === 'calendar', places = view === 'places';
   $('#lib-trips').classList.toggle('hidden', !trips);
   $('#lib-calendar').classList.toggle('hidden', !calendar);
   $('#lib-places').classList.toggle('hidden', !places);
-  $('#lib-map-box').classList.toggle('hidden', !map);
   const S = ls.sel[view];
-  $('#lib-detail').classList.toggle('hidden', !S);
+  // 詳細は 1 つだけ。旅・日付では一覧の下、場所では地図の下（右の列）に置く
+  const detail = $('#lib-detail');
+  const host = places ? $('#lib-place-main') : $('#v-library');
+  if(detail.parentNode !== host) host.appendChild(detail);
+  detail.classList.toggle('hidden', !S);
   $('#lib-sel').textContent = S ? selLabel(S) : '';
   $('#lib-view-trips').classList.toggle('on', trips);
   $('#lib-view-calendar').classList.toggle('on', calendar);
   $('#lib-view-places').classList.toggle('on', places);
-  $('#lib-view-map').classList.toggle('on', map);
   updateLibNote();
   $('#lib-period').classList.toggle('hidden', !ls.period);
   $('#lib-period-text').textContent = ls.period ? '期間: ' + rangeLabel(ls.period.from, ls.period.to) : '';
   paintSelection();
-  if(map){
-    const m = ensureLibMap();
-    if(m) m.resize();           // 隠れているあいだに寸法が変わった（タブ・ビューの切り替え）ので合わせ直す
+  const shown = places && !!S;
+  if(places){
+    // 場所を出したとき・詳細の出し入れ（スクロールバーで幅が変わる）で、描画の確定後に地図の大きさを合わせる
+    if(ensureLibMap() && (!ls.onPlaces || shown !== ls.detailShown)) scheduleMapResize();
   }else{
     closePopup();
   }
+  ls.onPlaces = places;
+  ls.detailShown = shown;
 }
-/* view を切り替える。view ごとの選択は残り、その view の詳細を読み直す（ページ 1）。飛んでいる詳細の応答は捨てる */
-function setLibView(view){
-  const changed = view !== ls.view;
+/* view を切り替える。view ごとの選択は残り、その view の詳細を読み直す（ページ 1）。飛んでいる詳細の応答は捨てる。
+   force は同じ view のままでも切り替えと同じにする（選択を差し替えたあと） */
+function setLibView(view, force){
+  const changed = force || view !== ls.view;
   if(changed){
     ls.view = view;
     ls.gen++;
@@ -685,16 +840,19 @@ function setLibView(view){
     clearDetail();
   }
   showLib();
-  if(view === 'map') loadPoints();
-  else if(view !== 'trips' || !ls.loaded.trips) loadLibList(view);
+  if(view === 'places') loadPoints();
+  if(view !== 'trips' || !ls.loaded.trips) loadLibList(view);
   if(changed && ls.sel[view]) loadDetail();
 }
 /* ライブラリタブを開いたとき（admin.js の showTab から）。旅は毎回読み直す。選んでいる view の一覧・詳細・地図の点も */
 function openLibraryTab(){
   loadTrips();
-  if(ls.view !== 'trips') loadLibList(ls.view);
+  if(ls.view !== 'trips') loadLibList(ls.view, true);
   showLib();
-  if(ls.view === 'map') loadPoints();
+  if(ls.view === 'places'){
+    loadPoints();
+    scheduleMapResize();        // 隠れているあいだに寸法が変わった（タブの切り替え）ので合わせ直す
+  }
   if(ls.sel[ls.view]){ ls.page = 1; clearDetail(); loadDetail(); }
 }
 /* 除外も含める: すべての種類の飛んでいる応答を捨て、見えている view の一覧・地図の点・詳細を hidden を変えて読み直す（詳細はページ 1）。
@@ -705,8 +863,8 @@ function onLibHiddenChange(){
   Object.keys(ls.seq).forEach(k => { ls.seq[k]++; });
   closePopup();
   Object.keys(ls.loaded).forEach(k => { ls.loaded[k] = false; });
-  loadLibList(ls.view);
-  if(ls.view === 'map') loadPoints();
+  loadLibList(ls.view, true);
+  if(ls.view === 'places') loadPoints();
   else ls.pointsStale = true;
   if(ls.sel[ls.view]){ ls.page = 1; loadDetail(); }
 }
@@ -714,11 +872,18 @@ function initLibrary(){
   $('#lib-view-trips').addEventListener('click', () => setLibView('trips'));
   $('#lib-view-calendar').addEventListener('click', () => setLibView('calendar'));
   $('#lib-view-places').addEventListener('click', () => setLibView('places'));
-  $('#lib-view-map').addEventListener('click', () => setLibView('map'));
   $('#lib-hidden').addEventListener('change', onLibHiddenChange);
   $('#lib-prev').addEventListener('click', () => { if(ls.page > 1){ ls.page--; loadDetail(); } });
   $('#lib-next').addEventListener('click', () => { if(ls.page < ls.pages){ ls.page++; loadDetail(); } });
   $('#lib-bbox').addEventListener('click', viewBbox);
-  $('#lib-period-clear').addEventListener('click', () => { ls.period = null; showLib(); loadPoints(); });
+  $('#lib-reset').addEventListener('click', resetMap);
+  $('#lib-period-clear').addEventListener('click', clearPeriod);
+  // 幅 640px の境をまたぐと地図の大きさが変わる（CSS の @media と同じ境）
+  if(typeof matchMedia === 'function'){
+    const narrow = matchMedia('(max-width: 640px)');
+    const onChange = () => { if(mapVisible()) scheduleMapResize(); };
+    if(narrow.addEventListener) narrow.addEventListener('change', onChange);
+    else if(narrow.addListener) narrow.addListener(onChange);
+  }
   onPhotoChange(libPhotoChanged);
 }

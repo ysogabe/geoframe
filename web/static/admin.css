@@ -359,26 +359,19 @@ button.lib-card-main:focus-visible{outline:2px solid var(--cyan);outline-offset:
 button.chip.is-selected{background:var(--cyan);color:#04202a;border-color:var(--cyan)}
 button.chip:disabled{opacity:.35;cursor:default}
 #lib-detail{margin-top:16px;min-width:0}
-/* 場所の行・海外不明の行（場所の画面は後の段でカード化する） */
-.lib-summary{display:flex;align-items:center;gap:14px;background:var(--panel);border:1px solid var(--panel-border);
-  border-radius:6px;padding:12px 14px}
-.lib-summary-text{font-family:var(--mono);font-size:14px;color:var(--ink)}
-.lib-summary.is-selected{border-color:var(--cyan);box-shadow:0 0 0 1px var(--cyan),0 0 14px rgba(0,229,255,.38)}
-.lib-grow.is-selected{background:rgba(0,229,255,.12)}
-/* 日付・場所の眺め方: 年・都道府県の行（押すと月・市区町村が開く）と下位の行 */
-#lib-places{display:flex;flex-direction:column;gap:8px}
-#lib-places.hidden{display:none}      /* ID の display が .hidden に勝つので、対の規則が要る */
-.lib-group{background:var(--panel);border:1px solid var(--panel-border);border-radius:6px}
-.lib-grow{display:flex;align-items:center;gap:12px;padding:8px 12px}
-.lib-grow.lib-sub{padding-left:40px;border-top:1px solid var(--panel-border)}
-.lib-expand{flex:1;min-width:0;display:flex;align-items:center;gap:8px;background:transparent;border:0;
-  color:var(--ink);font-family:var(--jp);font-size:14px;text-align:left;cursor:pointer;padding:2px 0}
-.lib-expand:hover .lib-gname{color:var(--cyan)}
-.lib-expand:focus-visible{outline:2px solid var(--cyan);outline-offset:2px}
-.lib-caret{font-family:var(--mono);color:var(--ink-2);width:1em}
-.lib-gname{color:var(--ink);font-size:14px}
-.lib-grow.lib-sub .lib-gname{flex:1;min-width:0;font-size:13px}
-.lib-gcount{font-family:var(--mono);font-size:12px;color:var(--ink-2);white-space:nowrap}
+/* 場所: 左の列に期間の表示と都道府県のカード（2 列）、右の列に地図の操作・地図・（選ぶと）写真の詳細。
+   選んだ県のカードの下に市区町村のチップ（カードの子。主ボタンの兄弟で、ボタンを入れ子にしない） */
+.lib-place{display:grid;grid-template-columns:minmax(280px,35%) minmax(0,1fr);gap:14px;align-items:start;min-width:0}
+.lib-place.hidden{display:none}      /* クラスの display が .hidden に勝つので、対の規則が要る */
+.lib-place-side,.lib-place-main{min-width:0}
+.lib-place-side{max-height:calc(100vh - 140px);overflow-y:auto;padding-right:2px}
+.lib-place-cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.lib-place-cards .lib-card.has-cities{grid-column:1/-1}
+.lib-cities{display:flex;flex-wrap:wrap;gap:6px;padding:0 10px 10px}
+.lib-city{font-size:12px}
+.lib-more{font-family:var(--mono);font-size:11px;color:var(--ink-3);align-self:center}
+.lib-place-main .toolbar{margin-bottom:8px}
+.lib-place-main #lib-detail{margin-top:14px}
 /* 格子: サムネイルだけのタイル（右下に ★・🚫・位置なしの印） */
 #lib-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
 .lib-tile{position:relative;aspect-ratio:4/3;background:#0a1220;border:1px solid var(--panel-border);
@@ -403,7 +396,7 @@ button.chip:disabled{opacity:.35;cursor:default}
 /* 地図: 画面の高さの 55%（下に写真の詳細が出る） */
 #lib-map{width:100%;height:55vh;min-height:320px;border:1px solid var(--panel-border);border-radius:6px}
 #lib-map .maplibregl-ctrl-attrib{font-size:9px}
-.lib-period{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;color:var(--amber)}
+.lib-period{display:flex;align-items:center;gap:8px;margin-bottom:8px;font-family:var(--mono);font-size:11px;color:var(--amber)}
 .lib-period.hidden{display:none}
 .lib-cluster-n{pointer-events:none;font-family:var(--mono);font-size:11px;font-weight:bold;color:#04202a}
 .lib-pop{min-width:180px;color:#10202e;font-size:12px;display:flex;flex-direction:column;gap:6px}
@@ -414,7 +407,11 @@ button.chip:disabled{opacity:.35;cursor:default}
 .lib-pop .lib-pop-open{color:#10202e;background:rgba(0,150,180,.12);border-color:rgba(0,150,180,.5)}
 @media(max-width:640px){
   /* 狭い画面: カードの列は横スクロール（折り返さない）。列に min-width:0 を付けて、中身の幅で画面が広がらないようにする */
-  #lib-trips,#lib-calendar,#lib-detail{min-width:0}
+  #lib-trips,#lib-calendar,#lib-places,#lib-detail,.lib-place-side,.lib-place-main{min-width:0}
+  /* 場所は 1 列（カードの列 → 地図 → 詳細）。カードの列は他と同じ横スクロールの 1 段 */
+  .lib-place{grid-template-columns:minmax(0,1fr)}
+  .lib-place-side{max-height:none;overflow-y:visible}
+  .lib-place-cards .lib-card.has-cities{grid-column:auto}
   .lib-cards,.lib-cards.is-strip{grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:minmax(200px,72vw);
     overflow-x:auto;scroll-snap-type:x proximity;padding-bottom:8px}
   #lib-map{height:40vh;min-height:280px}

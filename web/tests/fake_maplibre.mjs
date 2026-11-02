@@ -7,7 +7,12 @@
 //   map.sources[id]         {options, data, setDataCalls: [GeoJSON …]}   addSource / setData の記録
 //   map.layers              addLayer に渡した層の配列
 //   map.fire(type, event, layerId?)  登録されたハンドラを呼ぶ（layerId を付けた登録だけが対象）
-//   map.calls               {resize, easeTo: […], flyTo: […], fitBounds: […]} の記録。easeTo は options だけ、fitBounds は {bounds, options, eventData}
+//   map.calls               {resize, resizeArgs: […], easeTo: […], flyTo: […], fitBounds: […]} の記録。easeTo は options だけ、fitBounds は {bounds, options, eventData}、
+//                           resize は回数と、渡された eventData の並び
+//   map.resize(eventData)   本物と同じく、移動の途中でなければ eventData を載せた moveend を起こす（本物の resize は stop → movestart → move →
+//                           resize → moveend を同期で起こす。eventData の無い resize は「利用者の移動」に見えるので、呼ぶ側は libMove を付ける）
+//   map.getCenter()/getZoom()  fake.center / fake.zoom（既定は経度 137・緯度 36・ズーム 4）。endMove() が移動先へ動かす（fitBounds は範囲の中心でズームを 1 増やす、
+//                           easeTo は options.center・zoom）。試験は fake.center / fake.zoom を直接書き換えて「利用者が動かした」を表す
 //   map.moves               まだ終わっていない移動 [{kind, options, eventData, bounds}]（fitBounds・easeTo を呼ぶと積まれる）
 //   map.endMove()           いちばん古い移動を終え、その移動の eventData を載せた moveend を起こす（本物の MapLibre は
 //                           fitBounds(bounds, options, eventData)・easeTo(options, eventData) の eventData を、その移動の
@@ -18,7 +23,7 @@
 //   fake.features           querySourceFeatures が返すクラスタ（試験が差し替える）
 
 export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, expansionZoom = 11} = {}){
-  const fake = {maps: [], popups: [], markers: [], features: [], bounds: {...bounds}, expansionZoom};
+  const fake = {maps: [], popups: [], markers: [], features: [], bounds: {...bounds}, expansionZoom, center: {lng: 137, lat: 36}, zoom: 4};
 
   class FakeMap {
     constructor(options){
@@ -27,7 +32,7 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
       this.sources = {};
       this.layers = [];
       this.controls = [];
-      this.calls = {resize: 0, easeTo: [], flyTo: [], fitBounds: []};
+      this.calls = {resize: 0, resizeArgs: [], easeTo: [], flyTo: [], fitBounds: []};
       this.moves = [];
       this.canvas = {style: {}};
       this.loaded = false;
@@ -66,7 +71,14 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
       return {getWest: () => b.w, getSouth: () => b.s, getEast: () => b.e, getNorth: () => b.n};
     }
     getCanvas(){ return this.canvas; }
-    resize(){ this.calls.resize++; }
+    resize(eventData){
+      this.calls.resize++;
+      this.calls.resizeArgs.push(eventData === undefined ? null : eventData);
+      if(!this.moves.length) this.fire('moveend', Object.assign({}, eventData));
+      return this;
+    }
+    getCenter(){ return {lng: fake.center.lng, lat: fake.center.lat}; }
+    getZoom(){ return fake.zoom; }
     easeTo(o, eventData){
       this.calls.easeTo.push(o);
       this.moves.push({kind: 'easeTo', options: o, eventData, bounds: null});
@@ -80,7 +92,15 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
     endMove(){
       const move = this.moves.shift();
       if(!move) throw new Error('終える移動が無い');
-      if(move.bounds) fake.bounds = {...move.bounds};
+      if(move.bounds){
+        fake.bounds = {...move.bounds};
+        fake.center = {lng: (move.bounds.w + move.bounds.e) / 2, lat: (move.bounds.s + move.bounds.n) / 2};
+        fake.zoom += 1;
+      }else if(move.options){
+        const c = move.options.center;
+        if(c) fake.center = Array.isArray(c) ? {lng: c[0], lat: c[1]} : {...c};
+        if(move.options.zoom !== undefined) fake.zoom = move.options.zoom;
+      }
       this.fire('moveend', Object.assign({}, move.eventData));
     }
     interrupt(){ return this.moves.shift(); }
