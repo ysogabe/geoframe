@@ -265,6 +265,7 @@ sel:  {trips: null|S, calendar: null|S, places: null|S}   … view ごとの選�
     | {kind:'untimed'} | {kind:'pref', pref} | {kind:'city', pref, city} | {kind:'abroad'} | {kind:'bbox', bbox}
     | {kind:'q', q} | {kind:'period'}（場所の画面で、期間の写真全体）
 anchor: null | {from, to}      … Shift の範囲の起点（押した年・月の形の範囲）。範囲は min(from)〜max(to)
+monthYear: null | 年           … 範囲の選択中に月のチップを出す年（前後の年ボタンで替える）。範囲以外の選択に替わると null
 period: null | {from, to}      … 場所の画面に掛かる期間（旅の「地図で見る」）
 mapBbox: null | [w,s,e,n]      … 利用者が地図を動かしたときのカードの絞り込み
 prefCards / placeOptions        … 都道府県のカード用の /places の応答（period・hidden・mapBbox を掛ける）と、
@@ -274,8 +275,9 @@ gen: 数                        … 選択・view・期間・除外・地図の�
 
 - 年・月・Shift の範囲は今の `yearRange`・`monthRange` の形（`00`〜`99`）で `from`・`to` を作る。言葉の範囲は `when` の応答の暦の日付。
 - `detailParams()` は今の `gridParams` を `kind` ごとに書き直したもの。場所の view では `period` を `pref`・`city`・`abroad`・`bbox`・`period` のすべてに掛ける。
-- **古い応答の捨て方**: 要求の種類ごとの `seq`（`trips`・`detail`・`points`・`popup`・`calendar`・`placeCards`・`placeOptions`・`when`）に加え、`when` の応答は送った時点の `gen` と今の `gen` が同じときだけ使う
-  （読み取りを待つ間に月を選べば `gen` が増え、遅れた応答は捨てる）。除外の切り替えでは、すべての一覧の `seq` を増やして飛んでいる応答を捨ててから、見えている view を読み直す。
+- **古い応答の捨て方**: 要求の種類ごとの `seq`（`trips`・`detail`・`points`・`popup`・`calendar`・`placeCards`・`placeOptions`・`when`・`choose`・`cluster`）に加え、`when` の応答は送った時点の `gen` と今の `gen` が同じときだけ使う
+  （読み取りを待つ間に月を選べば `gen` が増え、遅れた応答は捨てる）。候補の決定（`choose`）とクラスタの展開ズームの応答（`cluster`）も、送った時点の番号と `gen` が今と同じときだけ使う。
+  `cluster` は候補の決定（同じ候補の選び直しも）・「全体に戻す」・利用者の地図の移動・点の差し替えでも増やす。除外の切り替えでは、すべての一覧の `seq` を増やして飛んでいる応答を捨ててから、見えている view を読み直す。
   見えていない view は `loaded` を落とすだけで、次に開くときに読む（飛んでいた応答は `seq` で捨てられるので `loaded` を立て直さない）。
 - 地図が見えているかは「`view === 'places'` かつライブラリのタブが見えている」。`pointsStale` の判断をこれに置き換える。
 
@@ -286,6 +288,7 @@ gen: 数                        … 選択・view・期間・除外・地図の�
   「地図で見る」は `period = 旅の期間`、`sel.places = {kind:'period'}`、`mapBbox = null`、ページ 1 で `setLibView('places')`。地図は点を読んだあと点の範囲へ `fitBounds`。
 - 日付: 年のカードで `{kind:'year'}`、月のチップで `{kind:'month'}`。応答に無い月のチップは `disabled`。
   Shift を押しながら年・月を押すと、`anchor` と押したものの形の範囲の `min(from)`〜`max(to)` で `{kind:'span'}`（逆向き・年またぎ・年と月の混在も同じ）。
+  範囲の選択中は月のチップ列の端に「‹ 前の年」「次の年 ›」のボタンを出し、押すと月のチップを出す年（`monthYear`）だけを替える（選択・起点・読み込みは変えない）。これで 2024年12月を起点に 2025年2月を Shift で押す、のような年をまたぐ月から月の範囲を作れる。
   `#lib-when` の Enter（変換中でないとき）で `GET when?q=`。読み込み中は `#lib-when-note` に「読んでいます…」。成功で `{kind:'words'}` と「<from の日付>〜<to の日付> として検索（規則 / LLM）」。失敗で R8d の文。
 - 場所: 都道府県のカードで `{kind:'pref'}` と `fitBounds(bbox)`。その県のカードの下に市区町村のチップ（件数の多い順、最大 30。残りは「ほか N（上の欄で探せます）」）。
   チップで `{kind:'city'}` と `fitBounds`。`bbox` が `null` なら地図は動かさない。`fitBounds` は `{padding: 地図の幅が 480px 未満なら 16、それ以外は 40, maxZoom: 12}`。

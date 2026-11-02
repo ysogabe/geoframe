@@ -101,7 +101,7 @@
   LLM が無い・AI が無効・失敗・失敗後の待ち・枠が使用中・回数の上限なら `unavailable` を返す（Rust の試験、偽サーバー）。規則で読めた言葉は LLM に送らない。
   `Sec-Fetch-Site` が `cross-site`・`same-site` の要求は 403 で、LLM に送らず回数も数えない。
 - AC12（R8c）: 画面の試験で、言葉を入れると `/api/admin/library/when` を読み、読んだ期間と読み方（規則 / LLM）を表示し、その期間で `/photos` を読む。
-- AC13（R9・R10）: 画面の試験で、写真の無い月のチップが押せない。月を押すとその月、Shift で別の月を押すと間の範囲で `/photos` を読む。
+- AC13（R9・R10）: 画面の試験で、写真の無い月のチップが押せない。月を押すとその月、Shift で別の月を押すと間の範囲で `/photos` を読む。年をまたぐ月から月（前後の年ボタンで別の年の月を出して Shift で押す）も同じ。
 - AC14（R11）: 画面の試験で、「松」と打つと候補が「松」を含む都道府県・市区町村だけになり、「ながの」「nagano」で長野県が出る。
   ↓・Enter で市区町村を選ぶと、その県のカードが選ばれ `/photos?pref=…&city=…` を読む（県だけなら `pref` だけ）。Esc で閉じる。
   日本語入力の変換中の Enter では決めない。ARIA（`role="combobox"`・`aria-expanded`・`aria-activedescendant`・`role="listbox"`・`role="option"`）が付き、候補の `id` は添字から作る。
