@@ -684,7 +684,8 @@ fn not_yet_implemented(label: &'static str) -> Response {
 ///    HEAD・`/api/admin/configX`・末尾 `/` は当たらず、下の静的配信の判定で 403。
 ///    `GET` の `/api/admin/library/{trips,photos,points,calendar,places}`（ライブラリ）も**完全一致**の読み取り API
 ///    （[`crate::admin_library`]）。HEAD・似た名前・末尾 `/` は 403。
-///    `GET` の `/api/admin/curation/groups`（選別の確認。[`crate::admin_curation`]）も同じ完全一致。
+///    `GET` の `/api/admin/curation/groups`（選別の確認。[`crate::admin_curation`]）・`/api/admin/ops`（運用タブ。
+///    [`crate::admin_ops`]）も同じ完全一致。
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
 ///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
@@ -760,6 +761,10 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 crate::admin_config::response(&state).await,
                 "/api/admin/config",
             );
+        }
+        // 運用タブの読み取り API（`crate::admin_ops`）。これも完全一致で、前方一致の `/api/admin/status` より前
+        if path == "/api/admin/ops" {
+            return labeled(crate::admin_ops::response(&state).await, "/api/admin/ops");
         }
         // ライブラリの読み取り API（`crate::admin_library`）。これも完全一致（`/api/admin/library/tripsX` や末尾 `/` は
         // 静的配信の判定に回って 403）
