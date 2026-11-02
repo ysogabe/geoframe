@@ -217,7 +217,7 @@ fn reason_counts(conn: &Connection) -> rusqlite::Result<Vec<(JobState, &'static 
 /// - `ai_config_invalid`: `{"code": 固定コード, "disabled_tasks": 無効になった用途の数}`（設定が不正のとき）。
 /// - `ai_jobs`: `{"total", "by_state": {状態: 件数}, "by_kind": {種類: {状態: 件数}}, "reasons": {状態: {理由: 件数}}}`。
 ///   理由は固定のコード（`clock_rewound`・`budget_exhausted`・`provider_paused`・`interrupted` など）だけ。
-/// - `ai_pauses`: `[{"task", "scope", "reason"}]`（Provider・用途の停止。解除は CLI）。
+/// - `ai_pauses`: `[{"task", "scope", "reason"}]`（Provider・用途の停止。解除は通常は運用タブから。`serve` が止まっているときは CLI）。
 /// - `ai_task_blocks`: `[{"task", "scope", "reason", "waiting"}]`（設定で使える用途のうち、Provider・用途の停止にかかって
 ///   送られていないもの。`ai_pauses` が停止を起こした用途だけなのに対し、同じ停止にかかる**全用途**。`scope` は
 ///   `provider`／`task`、`waiting` はその用途の待ち＝`pending`＋`deferred` の件数。

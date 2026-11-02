@@ -682,7 +682,8 @@ impl Snapshot {
         })
     }
 
-    /// `GET /api/admin/ops` の `history`（新しい順）。
+    /// `GET /api/admin/ops` の `history`（完了順の新しいほうが先頭）。`id` は受付順に採番するので、
+    /// 並びと一致しないことがある（同期の実行中に終わった AI の記録は、あとで終わる同期より後ろに来る）。
     pub fn history_json(&self) -> Value {
         Value::Array(self.history.iter().map(Record::to_json).collect())
     }
@@ -977,6 +978,25 @@ mod tests {
         }
         let ids: Vec<u64> = board.snapshot().history.iter().map(|r| r.id).collect();
         assert_eq!(ids, (4..=13).rev().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn history_is_in_completion_order_even_when_ids_are_not() {
+        let (board, _clock, _stop) = board();
+        let sync = board.enqueue(OpKind::Sync, None, None).unwrap();
+        let req = board.take_queued().unwrap();
+        assert_eq!(req.id, sync.id);
+        // 同期の実行中に AI の記録が先に終わる（id は同期より大きい）
+        board.record_direct(OpKind::AiRetry, "t".into(), Outcome::Done, None);
+        board.finish(req.id, Outcome::Done, Vec::new(), None);
+        let ids: Vec<u64> = board.snapshot().history.iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![1, 2], "完了順＝同期（#1）が先頭、AI（#2）が次");
+        // 10 件を超えても、完了の新しいほうから 10 件が残る
+        for _ in 0..10 {
+            run_to_end(&board, OpKind::QualityScan);
+        }
+        let ids: Vec<u64> = board.snapshot().history.iter().map(|r| r.id).collect();
+        assert_eq!(ids, (3..=12).rev().collect::<Vec<_>>());
     }
 
     #[test]

@@ -380,11 +380,10 @@ function renderOpsCycle(){
   });
 }
 
-/* ---- 区画 4: 履歴（新しい順） ---- */
+/* ---- 区画 4: 履歴（完了の新しい順） ---- */
 function renderOpsHistory(){
+  /* サーバーの順（完了の新しい順）のまま描く。番号は受け付けた順なので、並びと一致しないことがある */
   const history = opsIngest() && Array.isArray(os.snap.history) ? os.snap.history.slice() : [];
-  /* サーバーは新しい順で返すが、画面でも番号の大きい順にそろえる（番号は受け付けた順） */
-  history.sort((a, b) => b.id - a.id);
   opsRebuild('history', $('#o-history'), {loaded: !!os.snap, history}, box => {
     if(!os.snap){ box.appendChild(opsLine('dim', '読み込み中…')); return; }
     if(!history.length){ box.appendChild(opsLine('dim', 'まだ操作の履歴はありません（再起動で消えます）')); return; }

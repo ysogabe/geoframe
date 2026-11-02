@@ -279,13 +279,12 @@ await test('AC8: 直近の定期サイクル（開始・終了・結果・段）
   assert.ok(env.$('#o-cycle').textContent.includes('2030-01-01 10:10:00'));
 });
 
-await test('AC8: 履歴 10 件が新しい順に描かれる（サーバーの並びに関わらず番号の大きい順）', async () => {
-  const ids = [4, 11, 2, 9, 13, 1, 7, 12, 3, 10];
+await test('AC8: 履歴 10 件がサーバーの順（完了順）のまま描かれる（id が逆転していても並べ直さない）', async () => {
+  const ids = [1, 2, 13, 12, 11, 10, 9, 8, 7, 6];
   const env = await bootOpen(opsBody({history: ids.map(i => rec(i))}));
-  assert.deepEqual(recIds(env, '#o-history'), [13, 12, 11, 10, 9, 7, 4, 3, 2, 1]);
+  assert.deepEqual(recIds(env, '#o-history'), ids);
   assert.equal(recIds(env, '#o-history').length, 10);
-  assert.ok(env.$$('#o-history .op-times')[0].textContent.includes('受付 2030-01-01 09:23:00'));
-  // 新しい順で来ても同じ
+  assert.ok(env.$$('#o-history .op-times')[0].textContent.includes('受付 2030-01-01 09:11:00'));
   env.state.body = opsBody({history: [14, 13, 12].map(i => rec(i))});
   await env.tick();
   assert.deepEqual(recIds(env, '#o-history'), [14, 13, 12]);
