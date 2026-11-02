@@ -182,10 +182,13 @@ pub fn parse_rule(text: &str, today: Date) -> Option<Span> {
     if norm.is_empty() || norm.len() > INPUT_MAX_CHARS {
         return None;
     }
-    if let Some(piece) = parse_piece(&norm, today) {
-        return Some(piece.span);
-    }
-    parse_range(&norm, today)
+    let span = match parse_piece(&norm, today) {
+        Some(span) => span,
+        None => parse_range(&norm, today)?,
+    };
+    // 完成した期間の両端の年が読める範囲（1900〜基準年+1）にあること。部品ごとの検査では、
+    // 「2020年代」の終わりや「2027年冬」の翌年に出る終わりを見逃す。
+    (year_ok(span.from.year, today) && year_ok(span.to.year, today)).then_some(span)
 }
 
 // ---- 部品 ----
@@ -239,19 +242,26 @@ fn year_ok(year: i32, today: Date) -> bool {
     (MIN_YEAR..=today.year.saturating_add(1)).contains(&year)
 }
 
-/// 読んだ 1 つの期間。`yearless` は年の書かれていない部品のとき、範囲の右側で左の年を引き継ぐために持つ。
-struct Piece {
-    span: Span,
-    yearless: Option<Yearless>,
-}
-
-impl Piece {
-    fn fixed(span: Span) -> Piece {
-        Piece {
-            span,
-            yearless: None,
-        }
+/// 年を付けずに読む部品（月だけ・季節・行事）を、基準日で年を決めずに構造だけ読む。
+/// 範囲の右側で左の年を引き継ぐときに使う。
+fn parse_yearless(s: &[char]) -> Option<Yearless> {
+    if let Some(yl) = yearless_word(s) {
+        return Some(yl);
     }
+    let (m, i) = num(s, 0, 2)?;
+    if !is_word(s, i, "月") {
+        return None;
+    }
+    let month = m as u32;
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    Some(Yearless {
+        start_month: month,
+        start_day: 1,
+        end_month: month,
+        end_day: 0,
+    })
 }
 
 /// 年なしの語（季節・行事）。`gw` は正規化で小文字になっている。
@@ -314,30 +324,30 @@ fn year_span(year: i32) -> Option<Span> {
 }
 
 /// 文字列全体を 1 つの期間として読む。
-fn parse_piece(s: &[char], today: Date) -> Option<Piece> {
+fn parse_piece(s: &[char], today: Date) -> Option<Span> {
     if s.is_empty() {
         return None;
     }
     // 今週: 基準日の週の月曜〜基準日。先週: 前の週の月〜日。最近: 基準日の 30 日前〜基準日（両端を含む 31 日）。
     if is_word(s, 0, "今週") {
         let monday = today.add_days(-i64::from(today.weekday_mon0()));
-        return Some(Piece::fixed(Span {
+        return Some(Span {
             from: monday,
             to: today,
-        }));
+        });
     }
     if is_word(s, 0, "先週") {
         let monday = today.add_days(-i64::from(today.weekday_mon0()));
-        return Some(Piece::fixed(Span {
+        return Some(Span {
             from: monday.add_days(-7),
             to: monday.add_days(-1),
-        }));
+        });
     }
     if is_word(s, 0, "最近") {
-        return Some(Piece::fixed(Span {
+        return Some(Span {
             from: today.add_days(-30),
             to: today,
-        }));
+        });
     }
     if is_word(s, 0, "今月") {
         return relative_month(today, 0);
@@ -351,20 +361,15 @@ fn parse_piece(s: &[char], today: Date) -> Option<Piece> {
     if let Some(piece) = parse_numeric(s, today) {
         return Some(piece);
     }
-    if let Some(yl) = yearless_word(s) {
-        return Some(Piece {
-            span: yl.latest(today)?,
-            yearless: Some(yl),
-        });
-    }
-    if let Some(piece) = parse_month_only(s, today) {
-        return Some(piece);
+    // 年なしの部品（季節・行事・月だけ）は年なしの規則で決める。
+    if let Some(yl) = parse_yearless(s) {
+        return yl.latest(today);
     }
     parse_with_year_prefix(s, today)
 }
 
 /// `N か月前`（`か`・`ヶ`・`ケ`・`ヵ`・`カ` のどれでも）。N は 1 以上。
-fn parse_months_ago(s: &[char], today: Date) -> Option<Piece> {
+fn parse_months_ago(s: &[char], today: Date) -> Option<Span> {
     let (n, i) = num(s, 0, 4)?;
     if n < 1 || !matches!(s.get(i), Some('か' | 'ヶ' | 'ケ' | 'ヵ' | 'カ')) {
         return None;
@@ -376,17 +381,17 @@ fn parse_months_ago(s: &[char], today: Date) -> Option<Piece> {
 }
 
 /// 基準日の月から `ago` か月前の月。
-fn relative_month(today: Date, ago: i64) -> Option<Piece> {
+fn relative_month(today: Date, ago: i64) -> Option<Span> {
     let (y, m) = add_months(today.year, today.month, -ago);
     if !year_ok(y, today) {
         return None;
     }
-    Some(Piece::fixed(month_span(y, m)?))
+    month_span(y, m)
 }
 
 /// 数字の並びの形: `2025`・`2010年代`・`2024-08`・`2024/8`・`2024-08-15`（区切りは `/` か `-`、
 /// 月と日の 2 つとも同じ区切り）。
-fn parse_numeric(s: &[char], today: Date) -> Option<Piece> {
+fn parse_numeric(s: &[char], today: Date) -> Option<Span> {
     let (y, i) = num(s, 0, 4)?;
     if i != 4 {
         return None;
@@ -396,16 +401,16 @@ fn parse_numeric(s: &[char], today: Date) -> Option<Piece> {
         return None;
     }
     if i == s.len() {
-        return Some(Piece::fixed(year_span(year)?));
+        return year_span(year);
     }
     if is_word(s, i, "年代") {
         if year % 10 != 0 {
             return None;
         }
-        return Some(Piece::fixed(Span {
+        return Some(Span {
             from: Date::new(year, 1, 1)?,
             to: Date::new(year + 9, 12, 31)?,
-        }));
+        });
     }
     let sep = *s.get(i)?;
     if sep != '/' && sep != '-' {
@@ -414,7 +419,7 @@ fn parse_numeric(s: &[char], today: Date) -> Option<Piece> {
     let (m, j) = num(s, i + 1, 2)?;
     let month = m as u32;
     if j == s.len() {
-        return Some(Piece::fixed(month_span(year, month)?));
+        return month_span(year, month);
     }
     if s[j] != sep {
         return None;
@@ -424,34 +429,12 @@ fn parse_numeric(s: &[char], today: Date) -> Option<Piece> {
         return None;
     }
     let day = Date::new(year, month, d as u32)?;
-    Some(Piece::fixed(Span { from: day, to: day }))
-}
-
-/// `8月`（年なし。年なしの規則）。
-fn parse_month_only(s: &[char], today: Date) -> Option<Piece> {
-    let (m, i) = num(s, 0, 2)?;
-    if !is_word(s, i, "月") {
-        return None;
-    }
-    let month = m as u32;
-    if !(1..=12).contains(&month) {
-        return None;
-    }
-    let yl = Yearless {
-        start_month: month,
-        start_day: 1,
-        end_month: month,
-        end_day: 0,
-    };
-    Some(Piece {
-        span: yl.latest(today)?,
-        yearless: Some(yl),
-    })
+    Some(Span { from: day, to: day })
 }
 
 /// 年の前置き（`2024年`・`今年`・`去年`・`昨年`・`おととし`・`一昨年`・`N年前`、あとに `の` が付いてもよい）と、
 /// そのあとの部分（なし＝その年・`8月`・`8月15日`・季節・行事）。
-fn parse_with_year_prefix(s: &[char], today: Date) -> Option<Piece> {
+fn parse_with_year_prefix(s: &[char], today: Date) -> Option<Span> {
     let (year, mut i) = year_prefix(s, today)?;
     if !year_ok(year, today) {
         return None;
@@ -461,10 +444,10 @@ fn parse_with_year_prefix(s: &[char], today: Date) -> Option<Piece> {
     }
     let rest = &s[i..];
     if rest.is_empty() {
-        return Some(Piece::fixed(year_span(year)?));
+        return year_span(year);
     }
     if let Some(yl) = yearless_word(rest) {
-        return Some(Piece::fixed(yl.in_year(year)?));
+        return yl.in_year(year);
     }
     let (m, j) = num(rest, 0, 2)?;
     if !starts_with(rest, j, "月") {
@@ -473,14 +456,14 @@ fn parse_with_year_prefix(s: &[char], today: Date) -> Option<Piece> {
     let month = m as u32;
     let after = j + 1;
     if after == rest.len() {
-        return Some(Piece::fixed(month_span(year, month)?));
+        return month_span(year, month);
     }
     let (d, k) = num(rest, after, 2)?;
     if !is_word(rest, k, "日") {
         return None;
     }
     let day = Date::new(year, month, d as u32)?;
-    Some(Piece::fixed(Span { from: day, to: day }))
+    Some(Span { from: day, to: day })
 }
 
 /// 年の前置きを読み、年と読み進めた位置（`の` の前）を返す。
@@ -552,27 +535,23 @@ fn parse_range(s: &[char], today: Date) -> Option<Span> {
 /// - 右に年が書かれている（`今年2月`・`2023年`）ときは引き継がない。右が左より前なら読めない。
 fn join_range(left: &[char], right: &[char], today: Date) -> Option<Span> {
     let l = parse_piece(left, today)?;
-    let r = parse_piece(right, today)?;
-    let right_span = match r.yearless {
+    // 右が年なしの部品なら、基準日では決めず構造だけ読み、左の年を引き継いでから年を検査する。
+    let right_span = match parse_yearless(right) {
         Some(yl) => {
-            let year = l.span.from.year;
+            let year = l.from.year;
             let mut span = yl.in_year(year)?;
-            if span.from < l.span.from {
-                let next = year + 1;
-                if !year_ok(next, today) {
-                    return None;
-                }
-                span = yl.in_year(next)?;
+            if span.from < l.from {
+                span = yl.in_year(year + 1)?;
             }
             span
         }
-        None => r.span,
+        None => parse_piece(right, today)?,
     };
-    if right_span.from < l.span.from {
+    if right_span.from < l.from {
         return None;
     }
     Some(Span {
-        from: l.span.from,
+        from: l.from,
         to: right_span.to,
     })
 }
@@ -682,6 +661,53 @@ mod tests {
         unreadable("20250年");
         unreadable("200000年前");
         unreadable("127年前");
+    }
+
+    #[test]
+    fn completed_span_years_are_checked() {
+        // 基準年+1（2027）を超えて終わる期間は読めない
+        unreadable("2020年代");
+        unreadable("2027年冬");
+        unreadable("2027年10月〜冬");
+        // 境界の内側は読める
+        ok("2027年", "2027-01-01", "2027-12-31");
+        ok("2026年の冬", "2026-12-01", "2027-02-28");
+        ok("今年の冬", "2026-12-01", "2027-02-28");
+        ok("2010年代", "2010-01-01", "2019-12-31");
+        // 下限側
+        unreadable("1890年代");
+    }
+
+    #[test]
+    fn range_right_side_without_year_inherits_left_year() {
+        // 右の「2月」を基準日だけで決めると 1899 年になって落ちる
+        check_on(
+            "1900-01-01",
+            "1900年1月〜2月",
+            Some(("1900-01-01", "1900-02-28")),
+        );
+        // 翌年に回っても基準年+1 までなら読める。その先は読めない
+        check_on(
+            "1900-01-01",
+            "1900年12月〜2月",
+            Some(("1900-12-01", "1901-02-28")),
+        );
+        check_on("1900-01-01", "1901年12月〜2月", None);
+        check_on(
+            "2026-11-02",
+            "2026年10月〜冬",
+            Some(("2026-10-01", "2027-02-28")),
+        );
+    }
+
+    #[test]
+    fn added_interpretations_are_fixed() {
+        ok("8月〜12月", "2026-08-01", "2026-12-31");
+        unreadable("12-3");
+        unreadable("8/15");
+        unreadable("2024-8/15");
+        ok("2024-8-15", "2024-08-15", "2024-08-15");
+        ok("2024年8月〜10月まで", "2024-08-01", "2024-10-31");
     }
 
     #[test]
