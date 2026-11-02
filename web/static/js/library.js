@@ -18,6 +18,8 @@
    選ぶと一覧を残したまま #lib-detail に S の写真の格子を出す。同じカードをもう一度押すと選択を外す。
    gen: 選択・view・除外が変わるたびに増やす。読み取りを待つ間にこれが変わった応答は捨てる（seq と二重に守る）。
    anchor: Shift の範囲の起点 {from, to, year}（直前に普通に選んだ年・月の形の範囲と、月のチップを出す年）。年・月・範囲の選択以外になると null。
+   monthYear: 範囲の選択中に月のチップを出す年（月のチップ列の「‹ 前の年」「次の年 ›」で切り替える。起点 anchor は変えない）。
+        null なら選択の年（範囲を選んでいるあいだは anchor.year）。範囲（span）以外の選択に替わると null に戻る。
    tripFilter: 旅のカードを絞る検索欄の文字。whenMsg: 日付の言葉の読み込み中・失敗の文 {gen, text}（その gen のあいだだけ出す）。
    combo: 場所のコンボボックスの状態 {open, items, more, active}（items は選べる候補、more は表に入りきらなかった件数、active は強調している添字）。
    years: calendar の応答。
@@ -37,7 +39,7 @@ const ls = {
   trips: [], untimed: 0,
   years: [], calUntimed: 0, prefs: [], abroad: 0, placeOpts: {prefs: [], abroad: 0},
   loaded: {trips: false, calendar: false, placeCards: false, placeOptions: false},
-  sel: {trips: null, calendar: null, places: null}, gen: 0, anchor: null,
+  sel: {trips: null, calendar: null, places: null}, gen: 0, anchor: null, monthYear: null,
   tripFilter: '', whenMsg: null, combo: {open: false, items: [], more: 0, active: -1},
   period: null, mapBbox: null, fitPoints: false, pointsStale: false,
   onPlaces: false, detailShown: false, resizeQueued: false,
@@ -234,6 +236,7 @@ function scrollSelected(){
 function applySel(S){
   ls.sel[ls.view] = S;
   if(ls.view === 'calendar' && !(S && (S.kind === 'year' || S.kind === 'month' || S.kind === 'span'))) ls.anchor = null;
+  if(!(S && S.kind === 'span')) ls.monthYear = null;
   ls.gen++;
   ls.seq.detail++;
   ls.page = 1;
@@ -392,19 +395,45 @@ function yearCard(y){
   main.appendChild(body);
   return card;
 }
+/* 月のチップを出す年: 切り替えた年（monthYear）が一覧にあればそれ。無ければ、年・月を選んでいればその年、範囲を選んでいれば起点の年 */
+function monthsYear(){
+  const S = ls.sel.calendar;
+  const base = S && (S.kind === 'year' || S.kind === 'month') ? S.year : (S && S.kind === 'span' && ls.anchor ? ls.anchor.year : null);
+  if(!base) return null;
+  return ls.monthYear && ls.years.some(x => x.year === ls.monthYear) ? ls.monthYear : base;
+}
+/* 月のチップ列の端の「‹ 前の年」「次の年 ›」。出す年だけを替え、選択も起点（anchor）も変えない
+   （年をまたぐ「月から月」の範囲は、起点の月を押したあとに年を替えて、Shift で終わりの月を押す）。作り直されるので、押した向きの目印へフォーカスを戻す */
+function stepMonthYear(year, dir){
+  ls.monthYear = year;
+  renderMonths(true);
+  const box = $('#lib-months');
+  const nav = box.querySelector('.lib-month-nav[data-dir=' + dir + ']') || box.querySelector('.lib-month-nav');
+  if(nav) nav.focus();
+}
+function monthNav(year, dir){
+  const btn = el('button', 'chip lib-month-nav', dir === 'prev' ? '‹ ' + year + '年' : year + '年 ›');
+  btn.type = 'button';
+  btn.dataset.dir = dir;
+  btn.setAttribute('aria-label', year + '年の月を出す');
+  btn.addEventListener('click', () => stepMonthYear(year, dir));
+  return btn;
+}
 /* 選んだ年（年・月のどちらを選んでいても）の月のチップ。1〜12 月を並べ、応答に無い月は押せない。
    選択のたびには作り直さない（rebuild か、年が変わったときだけ）。フォーカスを失わないため */
 function renderMonths(rebuild){
   const box = $('#lib-months');
-  const S = ls.sel.calendar;
-  // 範囲を選んでいるあいだは、起点の年の月を出し続ける（続けて Shift で別の月を押せるように）
-  const year = S && (S.kind === 'year' || S.kind === 'month') ? S.year : (S && S.kind === 'span' && ls.anchor ? ls.anchor.year : null);
+  // 範囲を選んでいるあいだは、起点の年（か切り替えた年）の月を出し続ける（続けて Shift で別の月を押せるように）
+  const year = monthsYear();
   const y = year ? ls.years.find(x => x.year === year) : null;
   box.classList.toggle('hidden', !y);
   if(!y){ box.textContent = ''; delete box.dataset.year; return; }
   if(!rebuild && box.dataset.year === year) return;
   box.dataset.year = year;
   box.textContent = '';
+  const all = ls.years.map(x => x.year).sort();
+  const at = all.indexOf(year);
+  if(at > 0) box.appendChild(monthNav(all[at - 1], 'prev'));
   const counts = new Map((y.months || []).map(m => [m.month, m.count]));
   const names = [];
   for(let i = 1; i <= 12; i++) names.push(String(i).padStart(2, '0'));
@@ -420,6 +449,7 @@ function renderMonths(rebuild){
     chip.addEventListener('click', e => pickCalendar(e, monthSel(year, m)));
     box.appendChild(chip);
   });
+  if(at < all.length - 1) box.appendChild(monthNav(all[at + 1], 'next'));
 }
 function renderCalendar(){
   const box = $('#lib-year-cards');

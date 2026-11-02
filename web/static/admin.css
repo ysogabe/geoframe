@@ -371,6 +371,7 @@ button.lib-card-main:focus-visible{outline:2px solid var(--cyan);outline-offset:
 /* 日付: 選んだ年の月のチップ（写真の無い月は押せない） */
 #lib-months{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
 #lib-months.hidden{display:none}      /* ID の display が .hidden に勝つので、対の規則が要る */
+#lib-months .lib-month-nav{border-style:dashed;color:var(--ink-2)}      /* 年を替えるだけのボタン（月のチップではない） */
 button.chip.is-selected{background:var(--cyan);color:#04202a;border-color:var(--cyan)}
 button.chip:disabled{opacity:.35;cursor:default}
 #lib-detail{margin-top:16px;min-width:0}

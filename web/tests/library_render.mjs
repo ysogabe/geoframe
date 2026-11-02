@@ -2915,3 +2915,95 @@ await test('(y1) R14 クラスタの展開ズームの応答を待つあいだ�
   assert.equal(map.calls.easeTo.length, eased + 1);
   assert.deepEqual(plain(map.calls.easeTo.at(-1)), {center: [133, 33], zoom: 11});
 });
+
+// ---- R10: 年をまたぐ「月から月」 ----
+// 月のチップ列の端の「‹ 前の年」「次の年 ›」で、出す年だけを替える（選択も起点 anchor も変えない）
+const crossYearCalendar = () => reply({ok: true, untimed: 0, years: [
+  {year: '2025', count: 5, cover: null, months: [{month: '02', count: 3}, {month: '06', count: 2}]},
+  {year: '2024', count: 7, cover: null, months: [{month: '12', count: 7}]}]});
+const navOf = (env, dir) => env.$('#lib-months .lib-month-nav[data-dir=' + dir + ']');
+
+await test('(w5) AC13 年をまたぐ月から月: 月を起点にして年を替え（選択と起点は変わらない）、Shift で別の年の月を押すと from=2024-12…〜to=2025-02… の範囲。逆向きも', async () => {
+  const env = makeEnv();
+  env.handlers.calendar = crossYearCalendar;
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-calendar').click();
+  await settle();
+  const shiftClick = node => node.dispatchEvent({type: 'click', shiftKey: true});
+  const lastQ = () => env.last('/api/admin/library/photos');
+  const sel = () => plain(env.ev('ls.sel.calendar'));
+  const chipYear = () => env.$('#lib-months').dataset.year;
+  // 2024 年を選ぶ → 月のチップは 2024 年。次の年だけの切り替え（前の年は無い）
+  mainOf(yearCards(env)[1]).click();
+  await settle();
+  assert.equal(chipYear(), '2024');
+  assert.equal(navOf(env, 'prev'), null, '2024 より前の年は無い');
+  assert.equal(navOf(env, 'next').textContent, '2025年 ›');
+  assert.equal(navOf(env, 'next').getAttribute('aria-label'), '2025年の月を出す');
+  assert.equal(monthChips(env).length, 12, '月のチップは 12 個のまま（切り替えのボタンは数えない）');
+  // 12 月を起点にする
+  monthChips(env)[11].click();
+  await settle();
+  assert.deepEqual(sel(), {kind: 'month', year: '2024', month: '12', from: '2024-12-00 00:00', to: '2024-12-99 99:99'});
+  const reqs = env.reqs('/api/admin/library/photos').length;
+  const anchor = plain(env.ev('ls.anchor'));
+  // 年を替える: 写真は読み直さず、選択も起点も変わらない。月のチップだけ 2025 年になる
+  navOf(env, 'next').click();
+  await settle();
+  assert.equal(chipYear(), '2025');
+  assert.equal(env.reqs('/api/admin/library/photos').length, reqs, '年の切り替えでは写真を読まない');
+  assert.deepEqual(sel(), {kind: 'month', year: '2024', month: '12', from: '2024-12-00 00:00', to: '2024-12-99 99:99'});
+  assert.deepEqual(plain(env.ev('ls.anchor')), anchor);
+  assert.equal(navOf(env, 'next'), null);
+  assert.equal(navOf(env, 'prev').textContent, '‹ 2024年');
+  assert.equal(monthChips(env)[1].dataset.key, '2025-02');
+  assert.ok(monthChips(env).every(c => !c.classList.contains('is-selected')), '2025 年には選択中の月が無い');
+  same(env.document.activeElement, navOf(env, 'prev'), '押したボタンの代わり（残っている側の切り替え）へフォーカスが移る');
+  // 2025 年 2 月を Shift で押す → 2024 年 12 月から 2025 年 2 月
+  shiftClick(monthChips(env)[1]);
+  await settle();
+  const want = {kind: 'span', from: '2024-12-00 00:00', to: '2025-02-99 99:99'};
+  assert.deepEqual(sel(), want);
+  assert.equal(lastQ().get('from'), '2024-12-00 00:00');
+  assert.equal(lastQ().get('to'), '2025-02-99 99:99');
+  assert.equal(lastQ().get('page'), '1');
+  assert.equal(env.$('#lib-sel').textContent, '2024年12月〜2025年2月');
+  assert.equal(chipYear(), '2025', '範囲を選んだあとも、切り替えた年の月を出したまま');
+  assert.equal(env.ev('ls.anchor.year'), '2024', '起点は 2024 年 12 月のまま');
+  // 続けて 2024 年に戻って Shift で別の月 → 同じ起点から
+  navOf(env, 'prev').click();
+  await settle();
+  assert.equal(chipYear(), '2024');
+  assert.deepEqual(sel(), want, '切り替えても範囲は変わらない');
+  // 普通に月を押すと範囲を捨て、その月が新しい起点。切り替えた年の記憶も消える
+  monthChips(env)[11].click();
+  await settle();
+  assert.equal(sel().kind, 'month');
+  assert.equal(env.ev('ls.monthYear'), null);
+  // 逆向き: 2025 年 2 月を起点にして、2024 年 12 月を Shift
+  mainOf(yearCards(env)[0]).click();
+  await settle();
+  assert.equal(sel().kind, 'year');
+  assert.equal(chipYear(), '2025');
+  monthChips(env)[1].click();
+  await settle();
+  assert.deepEqual(plain(env.ev('ls.anchor')), {from: '2025-02-00 00:00', to: '2025-02-99 99:99', year: '2025'});
+  navOf(env, 'prev').click();
+  await settle();
+  assert.equal(chipYear(), '2024');
+  assert.equal(sel().kind, 'month', '年を替えただけでは選択は変わらない');
+  shiftClick(monthChips(env)[11]);
+  await settle();
+  assert.deepEqual(sel(), want, '逆向きでも同じ範囲');
+  assert.equal(lastQ().get('from'), '2024-12-00 00:00');
+  assert.equal(lastQ().get('to'), '2025-02-99 99:99');
+  // 選択を外す（もう一度範囲を押す）と月は隠れ、年の記憶も消える
+  {
+    env.$$('#lib-year-cards .lib-card')[0].querySelector('.lib-card-main').click();      // 範囲 → 2025 年
+    await settle();
+    assert.equal(sel().kind, 'year');
+    assert.equal(env.ev('ls.monthYear'), null);
+    assert.equal(chipYear(), '2025');
+  }
+});
