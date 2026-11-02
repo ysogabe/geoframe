@@ -3,7 +3,7 @@
 - PRD: prd.md / 設計: design.md
 - PR は 2 本（PRD の「実装の順番」）。① はこのブランチ、② は ① のマージ後に `main` から切るブランチ（同じ worktree）。
   各 PR の前にブランチ全体の確認（テスト・PRD 突き合わせ・`security-review`）を行う。
-- ブランチ: ① `t3/admin-ops-console-design`（PR #77 マージ済み、2026-11-02）/ ② `t3/admin-ops-2-ai`（PR #78 マージ済み、2026-11-02）。C の実装は完了。本番配布と実ブラウザの目視は未実施（ユーザー立ち会い）
+- ブランチ: ① `t3/admin-ops-console-design`（PR #77 マージ済み、2026-11-02）/ ② `t3/admin-ops-2-ai`（PR #78 マージ済み、2026-11-02）。C の実装は完了。2026-11-02 11:3x に本番へ配布済み（main 401a805、バイナリ sha256 49c486c8…、戻し先 `/usr/local/bin/geoframe.prev` は cad9f2c の 4a76ac4a…）。配布後: `/healthz` 200・写真 3799 件・最初の定期サイクルは全段 done・`GET /api/admin/ops` 200。実ブラウザでの運用タブの目視は未実施
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
