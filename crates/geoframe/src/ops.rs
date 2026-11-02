@@ -386,6 +386,11 @@ impl Board {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// 停止の合図が来ているか。受付の前の判定（保留の検査など）を、停止のあとは 503 に揃えるために読む。
+    pub fn is_stopping(&self) -> bool {
+        self.stop.is_stopped()
+    }
+
     /// 要求を 1 つ入れる。同じロックの中で、次をこの順に確かめる: 停止の合図が無い（[`EnqueueError::Stopping`]）、
     /// 待ちが空で同じ種類が実行中でない（[`EnqueueError::Busy`]）、Drive を読む要求なら前回の終了から
     /// [`DRIVE_READ_MIN_INTERVAL`] 以上（[`EnqueueError::TooSoon`]）。

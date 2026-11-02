@@ -149,7 +149,7 @@ fn parse_token(payload: &Map<String, Value>) -> Result<String, ApiError> {
 
 /// `POST /api/admin/ops/drive-release`。画面が見た保留（`token`）の行の集合に限って、大量削除の保留を解除する要求。
 ///
-/// 判定の順序: `token` の形（400）→ 掲示板が無ければ 503 → 保留が無い（409 `no_hold`）→ 一覧が空のための保留
+/// 判定の順序: `token` の形（400）→ 掲示板が無ければ 503 → 停止の合図のあとは 503 → 保留が無い（409 `no_hold`）→ 一覧が空のための保留
 /// （409 `not_releasable`）→ 印の不一致（409 `hold_changed`）→ 受付（409 `busy`・`too_soon`、503）。実行の直前にもワーカーが
 /// 印を照らし直し、削除は承認した行の集合に限られる（`Allow::Only`）。
 pub fn drive_release(
@@ -159,6 +159,10 @@ pub fn drive_release(
 ) -> Result<Value, ApiError> {
     let token = parse_token(payload)?;
     let board = board_or_unavailable(ops)?;
+    // 停止の合図のあとは、保留の判定（409）より先に 503
+    if board.is_stopping() {
+        return Err(ApiError::Unavailable);
+    }
     let hold = mass_delete
         .and_then(|b| b.current())
         .ok_or_else(|| ApiError::Busy(NO_HOLD.into()))?;

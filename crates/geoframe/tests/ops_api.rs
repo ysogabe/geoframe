@@ -423,6 +423,44 @@ async fn after_the_stop_signal_every_post_is_503() {
     assert!(server.board.snapshot().queued.is_none());
 }
 
+#[tokio::test]
+async fn after_the_stop_signal_drive_release_is_503_before_any_hold_check() {
+    let token = "0123456789abcdef";
+    // 保留なし（停止が無ければ 409 no_hold）
+    let server = Server::start().await;
+    server.stop.stop();
+    let response = server
+        .post("drive-release", &json!({ "token": token }))
+        .await;
+    assert_eq!(response.status, 503, "no_hold: {}", response.text());
+
+    // 一覧が空のための保留（停止が無ければ 409 not_releasable）
+    let server = Server::start().await;
+    server.mass.record_with_ids(
+        Some((120, HoldReason::EmptyListing, 120)),
+        HeldIds::new((1..=120).collect()),
+        "2026-11-02 10:00:00",
+    );
+    let empty_token = server.hold_token().await;
+    server.stop.stop();
+    let response = server
+        .post("drive-release", &json!({ "token": empty_token }))
+        .await;
+    assert_eq!(response.status, 503, "not_releasable: {}", response.text());
+
+    // 印の不一致（停止が無ければ 409 hold_changed）
+    let server = Server::start().await;
+    let current = server.hold_ratio(&[1, 2, 3]).await;
+    let first = if current.starts_with('0') { '1' } else { '0' };
+    let other = format!("{first}{}", &current[1..]);
+    server.stop.stop();
+    let response = server
+        .post("drive-release", &json!({ "token": other }))
+        .await;
+    assert_eq!(response.status, 503, "hold_changed: {}", response.text());
+    assert!(server.board.snapshot().queued.is_none());
+}
+
 // ---------------------------------------------------------------- AC4（API 分）: drive-release
 
 #[tokio::test]
@@ -913,10 +951,15 @@ fn a_quality_scan_request_analyzes_what_the_periodic_cycle_left() {
 
     // 定期サイクルは 1 枚だけ解析した: 未解析が 2 枚残り、特徴量の行は 1 枚ぶん
     let db = rusqlite::Connection::open(data.join("catalog.db")).unwrap();
+    // 特徴量の行のうち、写真の表示画像・原本の MD5・mtime と一致するもの（`QUALITY_JOIN` と同じ条件、NULL は `IS`）
     let features = |db: &rusqlite::Connection| -> i64 {
-        db.query_row("SELECT COUNT(*) FROM photo_quality_features", [], |r| {
-            r.get(0)
-        })
+        db.query_row(
+            "SELECT COUNT(*) FROM photos p JOIN photo_quality_features f
+               ON f.photo_id=p.id AND f.display=p.display
+              AND f.source_md5 IS p.md5 AND f.source_mtime IS p.mtime",
+            [],
+            |r| r.get(0),
+        )
         .unwrap()
     };
     assert_eq!(features(&db), 1);
