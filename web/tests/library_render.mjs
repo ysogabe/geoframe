@@ -2801,3 +2801,117 @@ await test('(y) AC15 除外の切り替えで、検索・言葉・候補の読�
   assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1');
   assert.equal(env.last('/api/admin/library/photos').get('city'), '松本市');
 });
+
+// ---- R14: クラスタの展開ズームの応答が、あとの操作より遅れて届く ----
+// 偽の MapLibre は holdExpansion で応答を保留できる。保留中に別の操作をしてから解決しても、古いクラスタへ寄らず（easeTo しない）、
+// libUser の moveend による /places?bbox=… の読み直しも起きない
+await test('(y1) R14 クラスタの展開ズームの応答を待つあいだに、県カード・候補（同じ候補の選び直しも）・全体に戻す・期間の変更・除外・利用者の移動があると、古い応答では地図を動かさない。保留しない操作と、続けて押した 2 回目は動く', async () => {
+  const env = makeEnv();
+  env.handlers.places = () => reply(comboBody());
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  env.raf();
+  const map = mapOf(env);
+  const fake = env.fake;
+  const pendingFor = async action => {                 // クラスタを押し、保留のまま action をして、解決する
+    fake.holdExpansion = true;
+    const before = fake.pendingExpansions.length;
+    map.fire('click', {features: [{properties: {cluster_id: 9}, geometry: {coordinates: [137.5, 36.5]}}]}, 'lib-clusters');
+    assert.equal(fake.pendingExpansions.length, before + 1, '展開ズームの応答は保留された');
+    await action();
+    await settle();
+    fake.pendingExpansions[before].resolve();
+    await settle();
+    fake.holdExpansion = false;
+  };
+  const flushMoves = () => { while(map.moves.length) map.endMove(); };
+  const assertQuiet = msg => {
+    flushMoves();
+    assert.equal(map.calls.easeTo.length, 0, msg + ': easeTo しない');
+    assert.equal(bboxReqs(env).length, 0, msg + ': /places?bbox=… を読み直さない');
+  };
+  // 県のカード
+  await pendingFor(() => { mainOf(pcards(env)[0]).click(); });
+  assert.equal(env.ev('ls.sel.places.pref'), '長野県');
+  assertQuiet('県カード');
+  // 候補（市区町村）
+  await pendingFor(() => {
+    typeInto(comboBox(env), '松本');
+    keyOn(comboBox(env), 'ArrowDown');
+    keyOn(comboBox(env), 'Enter');
+  });
+  assert.equal(env.ev('ls.sel.places.city'), '松本市');
+  assertQuiet('候補');
+  // 同じ候補の選び直し: 選択（gen）は変わらず、地図を動かすだけ
+  const gen = env.ev('ls.gen');
+  await pendingFor(() => {
+    typeInto(comboBox(env), '松本');
+    keyOn(comboBox(env), 'ArrowDown');
+    keyOn(comboBox(env), 'Enter');
+  });
+  assert.equal(env.ev('ls.gen'), gen, '同じ候補の選び直しは選択を変えない（seq.cluster だけで捨てる）');
+  assert.equal(env.ev('ls.sel.places.city'), '松本市');
+  assertQuiet('同じ候補の選び直し');
+  // 全体に戻す（選択は変わらない）
+  const gen2 = env.ev('ls.gen');
+  await pendingFor(() => { env.$('#lib-reset').click(); });
+  assert.equal(env.ev('ls.gen'), gen2);
+  assertQuiet('全体に戻す');
+  // 利用者の地図の移動（この移動の bbox の読み直しは 1 回だけ。古い応答はそれを増やさない）
+  fake.holdExpansion = true;
+  map.fire('click', {features: [{properties: {cluster_id: 9}, geometry: {coordinates: [137.5, 36.5]}}]}, 'lib-clusters');
+  userMove(env, {bounds: {w: 137, s: 36, e: 138, n: 37}, center: {lng: 137.5, lat: 36.5}});
+  await settle();
+  assert.equal(bboxReqs(env).length, 1);
+  fake.pendingExpansions.at(-1).resolve();
+  await settle();
+  fake.holdExpansion = false;
+  flushMoves();
+  assert.equal(map.calls.easeTo.length, 0, '利用者の移動: easeTo しない');
+  assert.equal(bboxReqs(env).length, 1, '利用者の移動: 古い応答で読み直しが増えない');
+  // 期間の変更（旅の「地図で見る」で入り、解除ボタンで外す）
+  const periodsBefore = bboxReqs(env).length;
+  await pendingFor(() => { mapBtnOf(env, 0).click(); });
+  assert.deepEqual(plain(env.ev('ls.period')), {from: '2030-05-03 09:12', to: '2030-05-05 18:40'});
+  flushMoves();
+  assert.equal(map.calls.easeTo.length, 0, '期間に入る: easeTo しない');
+  await pendingFor(() => { env.$('#lib-period-clear').click(); });
+  assert.equal(env.ev('ls.period'), null);
+  flushMoves();
+  assert.equal(map.calls.easeTo.length, 0, '期間の解除: easeTo しない');
+  assert.equal(bboxReqs(env).length, periodsBefore, '期間の変更: 古い応答で読み直しが増えない');
+  // 除外を含める
+  await pendingFor(() => { env.$('#lib-hidden').checked = true; env.$('#lib-hidden').dispatchEvent({type: 'change'}); });
+  flushMoves();
+  assert.equal(map.calls.easeTo.length, 0, '除外: easeTo しない');
+  assert.equal(bboxReqs(env).length, periodsBefore, '除外: 古い応答で読み直しが増えない');
+  // 点を読み直した（setData でクラスタの番号が振り直される）あとの古い応答。選択（gen）は変わらない
+  env.$('#lib-hidden').checked = false; env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  const gen3 = env.ev('ls.gen');
+  const setData = map.sources.photos.setDataCalls.length;
+  await pendingFor(() => { env.context.libPhotoChanged(501, {lat: 36, lon: 140}); });
+  assert.equal(env.ev('ls.gen'), gen3);
+  assert.equal(map.sources.photos.setDataCalls.length, setData + 1, '点を取り直した');
+  flushMoves();
+  assert.equal(map.calls.easeTo.length, 0, '点の読み直し: easeTo しない');
+  // 続けて 2 回押す: 先の応答は捨て、あとのクラスタへだけ寄る
+  fake.holdExpansion = true;
+  const at = fake.pendingExpansions.length;
+  map.fire('click', {features: [{properties: {cluster_id: 1}, geometry: {coordinates: [131, 31]}}]}, 'lib-clusters');
+  map.fire('click', {features: [{properties: {cluster_id: 2}, geometry: {coordinates: [132, 32]}}]}, 'lib-clusters');
+  fake.pendingExpansions[at + 1].resolve(12);
+  await settle();
+  fake.pendingExpansions[at].resolve(9);
+  await settle();
+  fake.holdExpansion = false;
+  assert.deepEqual(plain(map.calls.easeTo), [{center: [132, 32], zoom: 12}], 'あとのクラスタだけ');
+  flushMoves();
+  // 保留しない普通の押し方（何も起きなければ寄る）
+  const eased = map.calls.easeTo.length;
+  map.fire('click', {features: [{properties: {cluster_id: 3}, geometry: {coordinates: [133, 33]}}]}, 'lib-clusters');
+  await settle();
+  assert.equal(map.calls.easeTo.length, eased + 1);
+  assert.deepEqual(plain(map.calls.easeTo.at(-1)), {center: [133, 33], zoom: 11});
+});

@@ -29,7 +29,9 @@
    fitPoints: 「地図で見る」のあと、点を読めたら点の範囲へ地図を動かす印。
    onPlaces・detailShown・resizeQueued: 地図の大きさを合わせ直す時点を決める印（場所の view を出した・詳細の出し入れ・合わせ直しの予約中）。
    pointsStale: 地図が見えていないあいだに設定（除外も含める）が変わったので、地図に戻るとき点を取り直す印。
-   seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が詳細の読み込みを捨てないため） */
+   seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が詳細の読み込みを捨てないため）。
+        cluster はクラスタを押したあとの展開ズームの応答待ち。応答のとき seq.cluster と gen の両方が押した時点のままでなければ地図を動かさない
+        （カード・候補・全体に戻す・利用者の地図の移動・点の読み直しは seq.cluster を進め、選択・view・期間・除外の変更は gen を進める） */
 const ls = {
   view: 'trips', includeHidden: false,
   trips: [], untimed: 0,
@@ -41,7 +43,7 @@ const ls = {
   onPlaces: false, detailShown: false, resizeQueued: false,
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
   map: null, pendingData: null, labels: new Map(), popup: null,
-  seq: {trips: 0, detail: 0, points: 0, popup: 0, calendar: 0, placeCards: 0, placeOptions: 0, when: 0, choose: 0},
+  seq: {trips: 0, detail: 0, points: 0, popup: 0, calendar: 0, placeCards: 0, placeOptions: 0, when: 0, choose: 0, cluster: 0},
 };
 
 const LIB_POINTS_SOURCE = 'photos';
@@ -705,6 +707,7 @@ function chooseComboItem(it){
    （カード・月などの選択は gen を進め、候補を決め直すと seq.choose が進む。どちらが変わっても保留中の選択は捨てる） */
 function choosePlace(S, bbox){
   const cseq = ++ls.seq.choose;
+  ls.seq.cluster++;            // 同じ候補を選び直して選択が変わらないとき（地図を動かすだけ）も、待っているクラスタの展開は捨てる
   const done = () => {
     const cur = ls.sel.places;
     if(cur && selId(cur) === selId(S)) fitMapTo(bbox);
@@ -907,7 +910,9 @@ function isUserMove(e){
   return !!(e.originalEvent || e.libUser);
 }
 function onMapMoveEnd(e){
-  if(!isUserMove(e) || !mapVisible()) return;
+  if(!isUserMove(e)) return;
+  ls.seq.cluster++;            // 利用者が動かした: 待っているクラスタの展開は古い（自分の展開の moveend もここへ来るが、応答は済んでいる）
+  if(!mapVisible()) return;
   ls.fitPoints = false;
   ls.mapBbox = currentBbox();
   loadPlaceCards();
@@ -939,6 +944,7 @@ function featuresBbox(features){
 }
 /* 「全体に戻す」: 日本全体へ戻し、地図の範囲による絞り込みを外して読み直す */
 function resetMap(){
+  ls.seq.cluster++;
   ls.fitPoints = false;
   ls.mapBbox = null;
   fitMapTo(LIB_JAPAN);
@@ -977,7 +983,10 @@ function ensureLibMap(){
   map.on('click', 'lib-clusters', e => {
     const f = e.features && e.features[0];
     if(!f) return;
+    // 応答を待つあいだに別の場所を選んだ・全体に戻した・期間を変えた・利用者が地図を動かした・点を読み直したなら、古いクラスタへは寄らない
+    const cseq = ++ls.seq.cluster, gen = ls.gen;
     map.getSource(LIB_POINTS_SOURCE).getClusterExpansionZoom(f.properties.cluster_id).then(zoom => {
+      if(cseq !== ls.seq.cluster || gen !== ls.gen) return;
       map.easeTo({center: f.geometry.coordinates, zoom}, LIB_USER);
     }).catch(() => {});
   });
@@ -1001,6 +1010,7 @@ function clearClusterLabels(){
   ls.labels.clear();
 }
 function setPoints(collection){
+  ls.seq.cluster++;            // クラスタの番号が振り直される: 待っている展開は古い点のもの
   clearClusterLabels();        // クラスタの番号は読み直すと振り直されるので、古い文字は全部外す
   const src = ls.map && ls.map.getSource(LIB_POINTS_SOURCE);
   if(src){ src.setData(collection); syncClusterLabels(); }

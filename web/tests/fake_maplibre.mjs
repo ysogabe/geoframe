@@ -24,10 +24,11 @@
 //                           interrupt() は移動を終えずに捨てる（別の移動に置き換わった／利用者が割り込んだ）。
 //   fake.getBounds          関数を入れると Map.getBounds() がそれを返す（既定は fake.bounds）
 //   fake.popups / fake.markers   作られた Popup（setLngLat・setDOMContent・addTo・remove の記録）/ Marker
+//   fake.holdExpansion      true にすると getClusterExpansionZoom は応答を保留する。fake.pendingExpansions[i].resolve(zoom?) で解決する（zoom 省略は fake.expansionZoom）
 //   fake.features           querySourceFeatures が返すクラスタ（試験が差し替える）
 
 export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, expansionZoom = 11} = {}){
-  const fake = {maps: [], popups: [], markers: [], features: [], bounds: {...bounds}, expansionZoom, center: {lng: 137, lat: 36}, zoom: 4};
+  const fake = {maps: [], popups: [], markers: [], features: [], pendingExpansions: [], bounds: {...bounds}, expansionZoom, center: {lng: 137, lat: 36}, zoom: 4};
 
   class FakeMap {
     constructor(options){
@@ -72,7 +73,11 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
       if(!rec) return undefined;
       return {
         setData: data => { rec.data = data; rec.setDataCalls.push(data); },
-        getClusterExpansionZoom: clusterId => { rec.expansionAsked = clusterId; return Promise.resolve(fake.expansionZoom); },
+        getClusterExpansionZoom: clusterId => {
+          rec.expansionAsked = clusterId;
+          if(!fake.holdExpansion) return Promise.resolve(fake.expansionZoom);
+          return new Promise(resolve => { fake.pendingExpansions.push({clusterId, resolve: zoom => resolve(zoom === undefined ? fake.expansionZoom : zoom)}); });
+        },
       };
     }
     isSourceLoaded(id){ return !!this.sources[id]; }
