@@ -1738,6 +1738,7 @@ const userMove = (env, to) => {                  // 利用者のドラッグ相�
   if(to.bounds) env.fake.bounds = to.bounds;
   if(to.center) env.fake.center = to.center;
   if(to.zoom !== undefined) env.fake.zoom = to.zoom;
+  map.fire('movestart', {originalEvent: {type: 'mousedown'}});
   map.fire('moveend', {originalEvent: {type: 'mouseup'}});
 };
 
@@ -2916,6 +2917,56 @@ await test('(y1) R14 クラスタの展開ズームの応答を待つあいだ�
   assert.deepEqual(plain(map.calls.easeTo.at(-1)), {center: [133, 33], zoom: 11});
 });
 
+// 無効にするのは利用者の移動の「開始」。過去の展開の moveend（libUser）や、移動の終わりが応答のあとに来る順序で取りこぼさない
+await test('(y2) R14 クラスタの展開の easeTo の途中で別のクラスタを押しても、前の展開の moveend であとの応答は捨てない。応答待ちにドラッグを始めたら、moveend より先に応答が返っても古いクラスタへは寄らない', async () => {
+  const env = makeEnv();
+  env.handlers.places = () => reply(comboBody());
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  env.raf();
+  const map = mapOf(env);
+  const fake = env.fake;
+  const click = (id, at) => map.fire('click', {features: [{properties: {cluster_id: id}, geometry: {coordinates: at}}]}, 'lib-clusters');
+  // (a) A の応答 → A の easeTo の途中で B を押す → A の moveend → B の応答
+  fake.holdExpansion = true;
+  click(1, [131, 31]);
+  fake.pendingExpansions.at(-1).resolve(9);
+  await settle();
+  assert.deepEqual(plain(map.calls.easeTo), [{center: [131, 31], zoom: 9}], 'A へ寄り始めた');
+  click(2, [132, 32]);
+  const pendingB = fake.pendingExpansions.at(-1);
+  map.endMove();                                           // A の moveend（libUser）。B の番号を進めない
+  await settle();
+  pendingB.resolve(12);
+  await settle();
+  fake.holdExpansion = false;
+  assert.deepEqual(plain(map.calls.easeTo), [{center: [131, 31], zoom: 9}, {center: [132, 32], zoom: 12}], 'B の応答は捨てられず B へ寄る');
+  while(map.moves.length) map.endMove();
+  await settle();
+  // (b) 押す → ドラッグ開始 → 応答（ドラッグの moveend より先）→ ドラッグ終了
+  const eased = map.calls.easeTo.length;
+  fake.holdExpansion = true;
+  click(3, [133, 33]);
+  map.fire('movestart', {originalEvent: {type: 'mousedown'}});
+  fake.pendingExpansions.at(-1).resolve(10);
+  await settle();
+  fake.holdExpansion = false;
+  assert.equal(map.calls.easeTo.length, eased, 'ドラッグ中に返った古い応答では寄らない');
+  map.fire('moveend', {originalEvent: {type: 'mouseup'}});
+  await settle();
+  assert.equal(map.calls.easeTo.length, eased, 'ドラッグが終わっても寄らない');
+  // libMove 付きの自動の移動の開始では捨てない
+  fake.holdExpansion = true;
+  click(4, [134, 34]);
+  map.fire('movestart', {libMove: true});
+  fake.pendingExpansions.at(-1).resolve(11);
+  await settle();
+  fake.holdExpansion = false;
+  assert.equal(map.calls.easeTo.length, eased + 1, '自動の移動の開始では応答を捨てない');
+  assert.deepEqual(plain(map.calls.easeTo.at(-1)), {center: [134, 34], zoom: 11});
+});
+
 // ---- R10: 年をまたぐ「月から月」 ----
 // 月のチップ列の端の「‹ 前の年」「次の年 ›」で、出す年だけを替える（選択も起点 anchor も変えない）
 const crossYearCalendar = () => reply({ok: true, untimed: 0, years: [
@@ -2959,7 +3010,18 @@ await test('(w5) AC13 年をまたぐ月から月: 月を起点にして年を�
   assert.equal(navOf(env, 'prev').textContent, '‹ 2024年');
   assert.equal(monthChips(env)[1].dataset.key, '2025-02');
   assert.ok(monthChips(env).every(c => !c.classList.contains('is-selected')), '2025 年には選択中の月が無い');
+  assert.ok(monthChips(env).every(c => c.getAttribute('aria-pressed') === 'false'), '2025 年のチップは押された表示ではない');
   same(env.document.activeElement, navOf(env, 'prev'), '押したボタンの代わり（残っている側の切り替え）へフォーカスが移る');
+  // 選んだ月の年へ戻っても（Shift で範囲にする前）、選択の表示と aria-pressed が残る
+  navOf(env, 'prev').click();
+  await settle();
+  assert.equal(chipYear(), '2024');
+  assert.ok(monthChips(env)[11].classList.contains('is-selected'), '戻ったときも 12 月は選択表示');
+  assert.equal(monthChips(env)[11].getAttribute('aria-pressed'), 'true', '戻ったときも 12 月は aria-pressed=true');
+  assert.ok(monthChips(env).filter(c => c !== monthChips(env)[11]).every(c => !c.classList.contains('is-selected') && c.getAttribute('aria-pressed') === 'false'), '他の月は未選択');
+  navOf(env, 'next').click();
+  await settle();
+  assert.equal(chipYear(), '2025');
   // 2025 年 2 月を Shift で押す → 2024 年 12 月から 2025 年 2 月
   shiftClick(monthChips(env)[1]);
   await settle();
@@ -2976,6 +3038,8 @@ await test('(w5) AC13 年をまたぐ月から月: 月を起点にして年を�
   await settle();
   assert.equal(chipYear(), '2024');
   assert.deepEqual(sel(), want, '切り替えても範囲は変わらない');
+  // 範囲の選択中は月のチップを塗らない（paintBox の規則どおり。月を選んでいたときの表示が年の切り替えで残らない）
+  assert.ok(monthChips(env).every(c => !c.classList.contains('is-selected') && c.getAttribute('aria-pressed') === 'false'), '範囲の選択中は月のチップは未選択表示');
   // 普通に月を押すと範囲を捨て、その月が新しい起点。切り替えた年の記憶も消える
   monthChips(env)[11].click();
   await settle();

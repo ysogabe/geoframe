@@ -18,6 +18,7 @@
 //   map.getCenter()/getZoom()  fake.center / fake.zoom（既定は経度 137・緯度 36・ズーム 4）。endMove() が移動先へ動かす（fitBounds は範囲の中心でズームを 1 増やす、
 //                           easeTo は options.center・zoom）。試験は fake.center / fake.zoom を直接書き換えて「利用者が動かした」を表す
 //   map.moves               まだ終わっていない移動 [{kind, options, eventData, bounds}]（fitBounds・easeTo を呼ぶと積まれる）
+//   map.easeTo / fitBounds / resize は本物と同じく、呼んだ時点で eventData を載せた movestart を起こす（moveend は endMove() で）
 //   map.endMove()           いちばん古い移動を終え、その移動の eventData を載せた moveend を起こす（本物の MapLibre は
 //                           fitBounds(bounds, options, eventData)・easeTo(options, eventData) の eventData を、その移動の
 //                           movestart・move・moveend のイベントに載せる）。fitBounds の移動は終えるとき fake.bounds を移動先にする。
@@ -91,18 +92,23 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
       this.calls.resize++;
       this.calls.resizeArgs.push(eventData === undefined ? null : eventData);
       if(typeof fake.constrain === 'function') fake.constrain();
-      if(!this.moves.length) this.fire('moveend', Object.assign({}, eventData));
+      if(!this.moves.length){
+        this.fire('movestart', Object.assign({}, eventData));
+        this.fire('moveend', Object.assign({}, eventData));
+      }
       return this;
     }
     getCenter(){ return {lng: fake.center.lng, lat: fake.center.lat}; }
     getZoom(){ return fake.zoom; }
     easeTo(o, eventData){
       this.calls.easeTo.push(o);
+      this.fire('movestart', Object.assign({}, eventData));
       this.moves.push({kind: 'easeTo', options: o, eventData, bounds: null});
     }
     // bounds は [[w, s], [e, n]] か [w, s, e, n]
     fitBounds(bounds, options, eventData){
       this.calls.fitBounds.push({bounds, options, eventData});
+      this.fire('movestart', Object.assign({}, eventData));
       const flat = Array.isArray(bounds[0]) ? [bounds[0][0], bounds[0][1], bounds[1][0], bounds[1][1]] : bounds;
       this.moves.push({kind: 'fitBounds', options, eventData, bounds: {w: flat[0], s: flat[1], e: flat[2], n: flat[3]}});
     }

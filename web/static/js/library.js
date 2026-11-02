@@ -33,7 +33,7 @@
    pointsStale: 地図が見えていないあいだに設定（除外も含める）が変わったので、地図に戻るとき点を取り直す印。
    seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が詳細の読み込みを捨てないため）。
         cluster はクラスタを押したあとの展開ズームの応答待ち。応答のとき seq.cluster と gen の両方が押した時点のままでなければ地図を動かさない
-        （カード・候補・全体に戻す・利用者の地図の移動・点の読み直しは seq.cluster を進め、選択・view・期間・除外の変更は gen を進める） */
+        （カード・候補・全体に戻す・利用者の地図の移動の開始（movestart）・点の読み直しは seq.cluster を進め、選択・view・期間・除外の変更は gen を進める） */
 const ls = {
   view: 'trips', includeHidden: false,
   trips: [], untimed: 0,
@@ -407,6 +407,7 @@ function monthsYear(){
 function stepMonthYear(year, dir){
   ls.monthYear = year;
   renderMonths(true);
+  paintBox('calendar');            // 作り直したチップに選択の表示（is-selected・aria-pressed）を戻す
   const box = $('#lib-months');
   const nav = box.querySelector('.lib-month-nav[data-dir=' + dir + ']') || box.querySelector('.lib-month-nav');
   if(nav) nav.focus();
@@ -939,9 +940,13 @@ function isUserMove(e){
   if(!e || e.libMove) return false;
   return !!(e.originalEvent || e.libUser);
 }
+/* 利用者が地図を動かし始めた（ドラッグ・ホイール・ピンチ・キーボード・ズームボタン。movestart に originalEvent が載る）: 待っているクラスタの展開は古い。
+   クラスタの展開自身の移動（libUser 付き）の開始では捨てない。過去の展開の moveend も捨てない（あとから押した別のクラスタの応答を消さないため） */
+function onMapMoveStart(e){
+  if(e && !e.libMove && e.originalEvent) ls.seq.cluster++;
+}
 function onMapMoveEnd(e){
   if(!isUserMove(e)) return;
-  ls.seq.cluster++;            // 利用者が動かした: 待っているクラスタの展開は古い（自分の展開の moveend もここへ来るが、応答は済んでいる）
   if(!mapVisible()) return;
   ls.fitPoints = false;
   ls.mapBbox = currentBbox();
@@ -1003,6 +1008,7 @@ function ensureLibMap(){
   map.addControl(new maplibregl.NavigationControl({showCompass: false}), 'top-right');
   map.on('load', () => addPointLayers(map));
   map.on('moveend', syncClusterLabels);
+  map.on('movestart', onMapMoveStart);
   map.on('moveend', onMapMoveEnd);
   map.on('zoomend', syncClusterLabels);
   // moveend・zoomend は描画での source の更新より先に発火し、更新先のタイルがキャッシュにあると sourcedata も出ないので、描画が落ち着いた後にも 1 回合わせる
@@ -1013,7 +1019,7 @@ function ensureLibMap(){
   map.on('click', 'lib-clusters', e => {
     const f = e.features && e.features[0];
     if(!f) return;
-    // 応答を待つあいだに別の場所を選んだ・全体に戻した・期間を変えた・利用者が地図を動かした・点を読み直したなら、古いクラスタへは寄らない
+    // 応答を待つあいだに別の場所を選んだ・全体に戻した・期間を変えた・利用者が地図を動かし始めた・点を読み直したなら、古いクラスタへは寄らない
     const cseq = ++ls.seq.cluster, gen = ls.gen;
     map.getSource(LIB_POINTS_SOURCE).getClusterExpansionZoom(f.properties.cluster_id).then(zoom => {
       if(cseq !== ls.seq.cluster || gen !== ls.gen) return;
