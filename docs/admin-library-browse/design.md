@@ -91,8 +91,10 @@ flowchart LR
 
 ### 代表写真（年・都道府県で共通）
 
-その組の中で、`hidden` でない → 位置がある → `taken_at` が新しい → `id` が大きい、の順で 1 枚目。`hidden=1` でも除外でない写真を先に選ぶ。
-SQL は `ROW_NUMBER() OVER (PARTITION BY 組 ORDER BY COALESCE(hidden,0), (lat IS NULL OR lon IS NULL), taken_at DESC, id DESC)`（同梱の SQLite は窓関数に対応）で組ごとに 1 行を取り、
+その組の中で、`hidden` でない → 位置がある → 日時がある（`TIMED` の形）→ `taken_at` が新しい → `id` が大きい、の順で 1 枚目。`hidden=1` でも除外でない写真を先に選ぶ。
+日時の有無を先に見るのは、場所の組には日時なしの写真も入り、`'x'` のような形の違う `taken_at` が文字列の降順で本物の日時より先に来るため（T1 で追加）。
+SQL は `ROW_NUMBER() OVER (PARTITION BY 組 ORDER BY COVER_ORDER)`（`COVER_ORDER` = `COALESCE(hidden,0)<>0, (lat IS NULL OR lon IS NULL), CASE WHEN <日時なし> THEN 1 ELSE 0 END, COALESCE(taken_at,'') DESC, id DESC`。
+同梱の SQLite は窓関数に対応）で組ごとに 1 行を取り、
 `thumb_for` を通す。`thumb_url` は旅と同じく空のことがある（画面は「画像なし」の代わりを出す）。
 
 ### `GET /api/admin/library/calendar?hidden=1`
