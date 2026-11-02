@@ -5,7 +5,8 @@
 # 使い方（root で。sudo を付ける）:
 #   sudo /opt/geoframe/deploy/geoframe-admin.sh ai-jobs status
 #   sudo systemctl stop geoframe-rs && sudo /opt/geoframe/deploy/geoframe-admin.sh ai-jobs retry --kind photo_judge
-#   （書き込み系のコマンド ai-jobs retry|release-pause|deactivate-space、sync、organize、quality-scan は、
+#   （sync・organize・quality-scan は、通常は管理画面の運用タブから行う（sync・quality-scan・大量削除の保留の解除）。
+#    CLI は serve が動いていないときだけ使う。書き込み系のコマンド ai-jobs retry|release-pause|deactivate-space は、
 #    サービスを止めてから動かす。稼働中の serve が .ingest.lock を持っているので、動いていると断られる。
 #    ai-jobs status は読むだけなので、サービスを止めなくてよい）
 #

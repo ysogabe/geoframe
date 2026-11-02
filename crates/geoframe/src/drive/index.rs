@@ -23,7 +23,8 @@
 //! - **0 件以外でも、消す行が多すぎるとき**（消す件数が [`MASS_DELETE_MIN`] 件を超え、かつ Drive の行の
 //!   [`MASS_DELETE_PERCENT`]% を超える。例: 6,535 件から 1 件だけ見える一覧）は、**削除だけを保留**して件数と
 //!   警告を出す（追加・更新は通常どおり。`mass_delete_withheld`）。保留を外すのは**一度きりの明示的な操作**
-//!   `geoframe sync --allow-mass-delete` だけで、環境変数・設定・unit では与えられない（`serve` の定期実行は
+//!   （管理画面の運用タブの承認＝`Allow::Only`、または `serve` が動いていないときの
+//!   `geoframe sync --allow-mass-delete`）だけで、環境変数・設定・unit では与えられない（`serve` の定期実行は
 //!   常に保留する）。同じ操作が 0 件の一覧の保留も外す。
 //! - 書き込みは 1 つのトランザクション（追加・更新・削除をまとめる。現行は 1 文ごとのコミット）。
 //! - 消す derivative の名前は `derivatives/<安全な名前>` だけ（現行は `DATA_DIR / display` を無検査で消す）。
@@ -126,7 +127,7 @@ pub enum Allow {
     /// 保留する（`serve` の定期実行）。
     #[default]
     No,
-    /// 保留を外して消す（`geoframe sync --allow-mass-delete` の 1 回だけ）。
+    /// 保留を外して消す（`serve` が動いていないときの `geoframe sync --allow-mass-delete` の 1 回だけ）。
     Yes,
     /// 承認した行の集合に限って消す（運用コンソールの「保留の解除」）。消える行がすべて集合の中のときだけ消し、
     /// 集合に無い行が 1 件でもあれば保留に戻す。取り直した一覧が空のときも集合に関係なく保留に戻す。
@@ -153,7 +154,7 @@ pub struct MassDeleteHold {
 /// 大量削除の保留の記憶。**プロセスの中だけ**（再起動で消え、次のサイクルでまた付く）。`index_drive` が一覧を
 /// 読んで計画を作るたびに書き直し、管理画面の状態（`/api/admin/status`）が読む。DB には書かない。
 ///
-/// - 保留があれば `Some`、計画が保留なしだったら `None` に戻る（`geoframe sync --allow-mass-delete` で消したあと、
+/// - 保留があれば `Some`、計画が保留なしだったら `None` に戻る（`geoframe sync --allow-mass-delete` か運用タブの解除で消したあと、
 ///   または Drive の一覧が元に戻ったあとの、**この `serve` の次のサイクル**）。
 /// - 鍵が無い・認証に失敗・一覧の取得に失敗・停止の合図で中断したサイクルは何も確かめていないので、直前の記憶を変えない
 ///   （`checked_at` が古いままなので、画面では「最後に確かめた時刻」で分かる）。
@@ -216,7 +217,7 @@ impl IndexDrive {
         Self::with_allow(shared, Allow::No)
     }
 
-    /// 大量削除の保留を外した段（`geoframe sync --allow-mass-delete` の 1 回だけ）。
+    /// 大量削除の保留を外した段（`serve` が動いていないときの `geoframe sync --allow-mass-delete` の 1 回だけ）。
     pub fn allowing_mass_delete(shared: Arc<DriveShared>) -> Self {
         Self::with_allow(shared, Allow::Yes)
     }
@@ -809,7 +810,7 @@ impl IndexDrive {
             // 件数だけ（名前は出さない）。保留はサイクルごとに警告する
             tracing::warn!(
                 "[drive] 消す行が多すぎます（Drive の行 {} 件のうち {} 件。一覧は {} 件）。削除は保留します。\
-                 意図した削除なら `geoframe sync --allow-mass-delete` を一度だけ実行してください",
+                 意図した削除なら管理画面の運用タブから解除してください（`serve` が動いていないときは `geoframe sync --allow-mass-delete` を一度だけ実行）",
                 plan.drive_rows,
                 plan.mass_delete_withheld,
                 plan.remote

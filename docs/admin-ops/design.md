@@ -476,3 +476,29 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
 7. `cli.rs` で再試行用の handlers（2 組目）・clock・`ai_ops_lock` を `AppState` へ、`admin_ops.rs` に `ai-retry`・`ai-release-pause`、
    `tests/ops_api.rs`（AC5、AC7 の AI 分）、`scene_judge` の交差の試験。
 8. `ops.js` の AI の区画と R7 の案内、状況タブの AI の文言と `admin_ai_ops_render.mjs` の期待値、R9、描画試験、文書（AI 系）。── PR ②。
+
+## 実装との差（PR ① の完了時に追記。2026-11-02）
+
+実装のレビューで受け入れた、本文の記述と違う点。本文は設計時のまま残し、ここが実装の正。AI の再試行・停止の解除（PR ②）は未実装。
+
+- **`Board` の作り方**: `Board::new(stop, clock)`。定期サイクルの間隔は `Board` に持たせず、`spawn_worker` の `poll` 引数から
+  `schedule_next_cycle(poll)` として渡す。`GET /api/admin/ops` の `poll_minutes` は `Config::drive_poll()` から作り、割り切れるときは整数
+  （`10`）、そうでなければ小数（`1.5`）。
+- **`RunKind { Cycle, Op(OpKind) }`**: 実行中と履歴の記録の種類。定期サイクルは `"cycle"`、運用の要求は `OpKind` の名前。`history` は
+  **終わった記録だけ**（実行中・待ちは別の項目）で、10 件まで。
+- **`MassDeleteBoard::record_with_ids`**: `index_drive` は常にこちらを呼び、`Allow::No`・`Yes` のサイクルでも保留した行の ID を記録する
+  （`record` は ID なしの略記で、結合試験が使う）。
+- **`spawn_worker`**: Drive の共有（`DriveShared`）だけを受け取り、保留の記憶（`MassDeleteBoard`）はそこから取る。手動の `Sync` のあとは
+  `schedule_next_cycle` で次の定期サイクルを `poll` 後にずらす（品質解析・保留の解除は周期を変えない）。
+- **`drive-release` の判定**: `token`・`ids` の無い要求はワーカーの実行直前の照合で `hold_changed` になる。API の判定順は
+  `token` の形（400）→ 掲示板が無ければ 503 → **停止の合図のあとは 503** → 保留が無い（409 `no_hold`）→ 一覧が空のための保留
+  （409 `not_releasable`）→ 印の不一致（409 `hold_changed`）→ 受付（409 `busy`・`too_soon`、503）。停止の 503 を保留の判定より先に
+  返すのは、停止中に「保留が無い」と誤って答えないため。
+- **画面（`ops.js`）**: 区画ごとの描画の署名 `os.sig`（中身が同じなら作り直さず、3 秒ごとの読み直しで押している最中のボタンを消さない）、
+  読み込みの失敗は `loadFailed` で 1 回だけ知らせる。`too_soon`・`busy` では確認の段を開いたまま（待ってやり直せる）にし、`hold_changed`・
+  `no_hold`・`not_releasable` では閉じて読み直す。`ingest:false` のときは操作・定期サイクル・履歴の全区画を隠して案内だけを出す。
+  `sending`（送信中の種類）は応答のあとも読み直しが済むまで外さない。
+- **文書**: `deploy/README.md` に解除の運用タブ・CLI の使い分けと写しの戻し方、`geoframe-admin.sh` の冒頭、`server.md` §10.6 と決定の表、
+  `drive/index.rs` の警告ログ（ID・パスは出さない）と `cli.rs` のヘルプ文を直した。AI 側（`ai-jobs retry`・`release-pause` の
+  「サービスを止めてから」）は PR ② で直す。
+- **試験**: 描画試験 `ops_render.mjs` は `cargo test --test admin_ui_ops` 経由で回す。ブラウザでの目視は未実施（本番機のため）。
