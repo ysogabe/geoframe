@@ -248,17 +248,23 @@ pub enum Endpoint<'a> {
     /// Fixed local-model-lab embedding endpoints.
     EmbeddingModels,
     Embeddings,
+    /// `POST /llm-vl/v1/chat/completions`（日付の言葉の補助。[`super::when`]）
+    VlChat,
 }
 
 impl Endpoint<'_> {
     pub fn is_post(&self) -> bool {
-        matches!(self, Self::DecisionSystemOne | Self::Embeddings)
+        matches!(
+            self,
+            Self::DecisionSystemOne | Self::Embeddings | Self::VlChat
+        )
     }
 
     fn path(&self) -> String {
         match self {
             Self::EmbeddingModels => "/llm-embed/v1/models".to_string(),
             Self::Embeddings => "/llm-embed/v1/embeddings".to_string(),
+            Self::VlChat => "/llm-vl/v1/chat/completions".to_string(),
             Self::Catalog => "/llm/catalog".to_string(),
             Self::Service(id) => format!("/llm/services/{}", id.as_str()),
             Self::DecisionHealth => "/llm-decision/health".to_string(),

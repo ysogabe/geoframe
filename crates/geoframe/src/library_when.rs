@@ -1,9 +1,12 @@
 //! ライブラリの日付の言葉（「去年の夏」「2024年10月〜2月」など）を期間に直す規則（R8a）。
 //! docs/admin-library-browse/design.md の「`GET /api/admin/library/when`」の「規則」の節。
 //!
-//! このファイルは**純粋な関数だけ**を持つ。基準日（今日）は引数で受け取り（サーバーの現地日付を
-//! 取るのは HTTP の処理の側）、入出力・ログ・時計は使わない。入力の文字列は利用者の言葉なので、
-//! どこにも出さない（ログ・エラー文に含めない）。どんな文字列でもパニックせず、`None` か `Some` を返す。
+//! 規則のパーサー（[`parse_rule`] など）は**純粋な関数だけ**を持つ。基準日（今日）は引数で受け取り、
+//! 入出力・ログ・時計は使わない。入力の文字列は利用者の言葉なので、どこにも出さない（ログ・エラー文に
+//! 含めない）。どんな文字列でもパニックせず、`None` か `Some` を返す。
+//!
+//! 末尾の [`response`] が `GET /api/admin/library/when` の処理（サーバーの現地日付を取り、規則で読めなければ
+//! [`crate::ai::when::Runtime`] の LLM に回す）。
 //!
 //! 暦の関数（うるう年・月の日数・曜日・日付の足し引き）は自前の小さなもの。chrono は
 //! dev-dependency にしか無く、新しい crate は足さない。
@@ -13,6 +16,14 @@
 //!    範囲の `-` と取り違えないため、`-` は範囲の区切りに使わない）。
 //! 2. 読めなければ `〜`・`から`（と末尾の `まで`）で 2 つに分けて範囲として読む。
 //! 3. どちらでも読めなければ `None`（呼び出し側が LLM へ回す）。
+
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
+use serde_json::json;
+
+use crate::admin_library::{bad_params, query_params};
+use crate::ai::when::Outcome;
+use crate::server::{AppState, error_response, json_response};
 
 /// 入力（前後の空白を除いたもの、正規化のあと）の文字数の上限。`photos` の `q` の上限
 /// （`NAME_MAX_CHARS`）と同じ値。
@@ -238,7 +249,7 @@ impl Yearless {
 }
 
 /// 年が読める範囲（1900〜基準年+1）か。
-fn year_ok(year: i32, today: Date) -> bool {
+pub(crate) fn year_ok(year: i32, today: Date) -> bool {
     (MIN_YEAR..=today.year.saturating_add(1)).contains(&year)
 }
 
@@ -554,6 +565,74 @@ fn join_range(left: &[char], right: &[char], today: Date) -> Option<Span> {
         from: l.from,
         to: right_span.to,
     })
+}
+
+// ---- GET /api/admin/library/when ----
+
+/// 他のサイトのページが利用者のブラウザ経由で GPU を動かすのを断る（`thumb.rs` と同じ `Sec-Fetch-Site` の検査）。
+/// ヘッダーの無い要求（curl・古いブラウザ・同一オリジン以外の印のないもの）は通す。
+fn cross_site(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| matches!(v, "cross-site" | "same-site"))
+}
+
+/// サーバーの現地日付（本番は JST）。現地時刻が取れなければ UTC の日付。
+fn local_today() -> Date {
+    let stamp = crate::sysinfo::local_timestamp();
+    let parsed = stamp.get(..10).and_then(|day| {
+        let mut parts = day.split('-');
+        let year = parts.next()?.parse().ok()?;
+        let month = parts.next()?.parse().ok()?;
+        let day = parts.next()?.parse().ok()?;
+        Date::new(year, month, day)
+    });
+    parsed.unwrap_or_else(|| {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        Date::from_days(i64::try_from(secs / 86_400).unwrap_or(0))
+    })
+}
+
+fn found(span: Span, source: &str) -> Response {
+    let (from, to) = span.query_range();
+    let body = json!({"ok": true, "from": from, "to": to, "source": source});
+    json_response(StatusCode::OK, body.to_string().into_bytes())
+}
+
+fn not_found(error: &str) -> Response {
+    let body = json!({"ok": false, "error": error});
+    json_response(StatusCode::OK, body.to_string().into_bytes())
+}
+
+/// `GET /api/admin/library/when?q=…`。順番は、`Sec-Fetch-Site`（403。回数を数える前・LLM に送る前）→ `q` の検査
+/// （400）→ 規則 → LLM。規則で読めた要求と 400・403 は LLM の回数に数えない。
+pub async fn response(state: &AppState, query: Option<&str>, headers: &HeaderMap) -> Response {
+    if cross_site(headers) {
+        return error_response(StatusCode::FORBIDDEN, "forbidden");
+    }
+    respond_on(state, query, local_today()).await
+}
+
+async fn respond_on(state: &AppState, query: Option<&str>, today: Date) -> Response {
+    let params = query_params(query);
+    // `parse_qs` がパーセント解除を済ませている。空の値は無かったことになる（= 1 文字もない）
+    let Some(q) = params.get("q").map(|q| q.trim()) else {
+        return bad_params();
+    };
+    if !input_len_ok(q) {
+        return bad_params();
+    }
+    if let Some(span) = parse_rule(q, today) {
+        return found(span, "rule");
+    }
+    match state.when.read(q, today).await {
+        Outcome::Span(span) => found(span, "llm"),
+        Outcome::Unreadable => not_found("unreadable"),
+        Outcome::Unavailable => not_found("unavailable"),
+    }
 }
 
 #[cfg(test)]

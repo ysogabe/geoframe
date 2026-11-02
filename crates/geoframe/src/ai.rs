@@ -44,6 +44,7 @@ pub mod search_view;
 pub mod settings;
 pub mod space;
 pub mod waits;
+pub mod when;
 pub mod worker;
 
 #[cfg(test)]
