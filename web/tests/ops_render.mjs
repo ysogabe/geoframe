@@ -737,6 +737,17 @@ await test('AI の状況: 古い応答は捨てる（先に出した読みが後
   assert.ok(env2.toastErr() && env2.toastText().includes('AI の状況を読めません'), env2.toastText());
   assert.ok(env2.$('#o-ai').textContent.includes('AI の状況を読めません'));
   assert.ok(!env2.$('#o-ai-retry-all').disabled, '状況が読めなくても操作はできる');
+  // 初回成功 → 操作後の取得に失敗: 古い停止状態・件数は残さず「読めません」に切り替える
+  const env3 = makeEnv(aiBody());
+  env3.state.status = PAUSED_STATUS();
+  await env3.boot();
+  await env3.open();
+  assert.ok(env3.$('#o-ai').textContent.includes('AI 停止中: photo_judge'));
+  env3.handlers.status = () => respond(500, {ok: false, error: 'boom'});
+  env3.$('#o-ai-release-all').click();
+  await settle();
+  const t3 = env3.$('#o-ai').textContent;
+  assert.ok(t3.includes('AI の状況を読めません') && !t3.includes('AI 停止中'), t3);
 });
 
 await test('状況タブの要対応: 大量削除の保留・失敗した AI ジョブ・AI の停止の行が出て、押すと運用タブへ移る（無ければ出ない）', async () => {

@@ -443,6 +443,7 @@ function loadOpsStatus(){
     if(seq !== os.statusSeq) return;
     if(!os.statusFailed) toast('AI の状況を読めません: ' + (e && e.message ? e.message : e), true);
     os.statusFailed = true;
+    os.status = null;                                       // 最新の取得に失敗: 古い件数・停止状態は残さない
     renderOps();
   });
 }
