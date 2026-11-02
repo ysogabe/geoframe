@@ -67,6 +67,7 @@ mod tests {
             "static/js/config.js",
             "static/js/curation.js",
             "static/js/library.js",
+            "static/js/ops.js",
             "static/js/photos.js",
             "vendor/fonts.css",
             "vendor/maplibre-gl-4.7.1.min.js",

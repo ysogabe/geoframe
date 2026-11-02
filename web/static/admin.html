@@ -11,7 +11,7 @@
   - geoframe serve（Rust）が / と /admin（旅行ブログが無効のときは /blog-admin も）にこの HTML を返す。
     アセットは絶対パスで参照する
   - 認証なし（家庭内LAN前提）。更新系 POST は Content-Type と Origin で保護する（crates/geoframe/src/csrf.rs）
-  - タブは「状況」「写真」「ライブラリ」「選別」「設定」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
+  - タブは「状況」「写真」「ライブラリ」「選別」「設定」「運用」。写真タブは検索バー（AI 写真検索。結果は場面ごと）と、フィルタのチップ
     （件数は GET /api/admin/status の db.filters）つきのカードの一覧。一覧と検索結果のカードは同じ 1 種類。
     /ai-search も同じ HTML を返す（写真タブを検索欄にフォーカスして開く。別ページは無い）
   - ライブラリタブは写真を旅（新しい順）と地図で眺める。旅 → サムネイルの格子 → 写真タブと同じビューア。
@@ -20,6 +20,8 @@
     （GET /api/admin/curation/groups、POST confirm・reset。中身は curation.js が描く）
   - 設定タブは読み取り専用。起動時に読んだ設定の全項目を GET /api/admin/config から、タブを開くたびに読んで表にする
     （案内文・凡例・表の中身は config.js が描く）
+  - 運用タブは稼働中の serve の中で、同期をいま回す・品質解析の一括・Drive の大量削除の保留の解除を行い、定期サイクルと操作の履歴を
+    表示中は 3 秒ごとに読み直して見せる（GET /api/admin/ops、POST /api/admin/ops/*。中身は ops.js が描く）
   ============================================================
 -->
 <link rel="stylesheet" href="/vendor/maplibre-gl-4.7.1.min.css">
@@ -41,6 +43,7 @@
     <button class="tab" data-tab="library">▸ ライブラリ</button>
     <button class="tab" data-tab="curation">▸ 選別</button>
     <button class="tab" data-tab="config">▸ 設定</button>
+    <button class="tab" data-tab="ops">▸ 運用</button>
   </nav>
 </header>
 
@@ -201,6 +204,36 @@
     </div>
   </section>
 
+  <!-- ==== OPS ==== -->
+  <section id="v-ops" class="hidden">
+    <div class="panel">
+      <h2>▸ OPERATIONS — 操作</h2>
+      <div id="o-readonly" class="cfg-note hidden">取り込みが無効なので運用操作はできない（読み取り専用の起動）</div>
+      <div id="o-actions" class="hidden">
+        <div class="op-row">
+          <button class="btn" id="o-sync" disabled>同期をいま回す</button>
+          <span class="op-hint">Drive とローカルの写真の取り込みを、定期サイクルと同じ段の並びで 1 回行う（前回の同期・解除から 60 秒は待つ）</span>
+        </div>
+        <div class="op-row">
+          <button class="btn" id="o-quality" disabled>品質解析を一括で回す</button>
+          <span class="op-hint">未解析の写真を最後まで解析して選別の組を作り直す（写真が多いと長くかかり、そのあいだ定期サイクルと他の操作は待つ）</span>
+        </div>
+      </div>
+    </div>
+    <div class="panel hidden" id="o-hold-panel">
+      <h2>▸ HOLD — Driveの大量削除の保留</h2>
+      <div id="o-hold"></div>
+    </div>
+    <div class="panel" id="o-cycle-panel">
+      <h2>▸ CYCLE — 定期サイクル</h2>
+      <div id="o-cycle"></div>
+    </div>
+    <div class="panel" id="o-history-panel">
+      <h2>▸ HISTORY — 操作の履歴（新しい順）</h2>
+      <div id="o-history"></div>
+    </div>
+  </section>
+
 </main>
 
 <!-- ==== 位置指定モーダル ==== -->
@@ -280,5 +313,6 @@
 <script src="/static/js/library.js"></script>
 <script src="/static/js/curation.js"></script>
 <script src="/static/js/config.js"></script>
+<script src="/static/js/ops.js"></script>
 </body>
 </html>

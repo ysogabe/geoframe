@@ -1,6 +1,7 @@
 /* ============================================================
    admin.js — 管理ページ /admin のフロント（classic script / 依存なし）
    構成: 1) 共通ヘルパ 2) タブ 3) 状況 4) 起動
+   運用タブ（同期・品質解析・大量削除の保留の解除、定期サイクルと履歴）は ops.js（最後に読み込む）。
    写真タブ（一覧・チップ・検索・カード・ビューア・位置指定）は photos.js、ライブラリタブ（旅・格子・地図）は library.js、
    選別タブ（重複・類似グループの代表の確認）は curation.js、設定タブ（読み取り専用）は config.js（この順に後から読み込む）。
    共有はグローバル関数: photos.js・config.js は ここの $ el cell fmtDur toast postJSON showTab を使い、
@@ -62,7 +63,7 @@ function initialTab(){
   return path === '/ai-search' ? 'photos' : 'status';
 }
 function showTab(name){
-  const tab = (name === 'photos' || name === 'library' || name === 'curation' || name === 'config') ? name : 'status';
+  const tab = (name === 'photos' || name === 'library' || name === 'curation' || name === 'config' || name === 'ops') ? name : 'status';
   document.querySelectorAll('nav .tab').forEach(b =>
     b.classList.toggle('on', b.dataset.tab === tab));
   $('#v-status').classList.toggle('hidden', tab !== 'status');
@@ -70,6 +71,9 @@ function showTab(name){
   $('#v-library').classList.toggle('hidden', tab !== 'library');
   $('#v-curation').classList.toggle('hidden', tab !== 'curation');
   $('#v-config').classList.toggle('hidden', tab !== 'config');
+  $('#v-ops').classList.toggle('hidden', tab !== 'ops');
+  /* 運用タブの 3 秒ごとの読み直しは、どのタブへ移るときも止める（運用タブに入るときだけ openOpsTab が始め直す） */
+  if(typeof stopOpsPolling === 'function') stopOpsPolling();
   /* どのタブへ移るときも、開いているビューアと位置モーダルを閉じる（photos.js）。ライブラリなど写真タブ以外から
      開いたビューアも同じ #viewer なので、離れるときに閉じる。写真タブに入るときも一度閉じてから一覧を読む */
   if(typeof closePhotoOverlays === 'function') closePhotoOverlays();
@@ -84,6 +88,10 @@ function showTab(name){
   }
   if(tab === 'config'){          // config.js: 開くたびに 1 回読む（周期的には読まない）
     if(typeof loadConfig === 'function') loadConfig();
+    return;
+  }
+  if(tab === 'ops'){             // ops.js: 開いているあいだ 3 秒ごとに読み直す（離れると止める）
+    if(typeof openOpsTab === 'function') openOpsTab();
     return;
   }
   openPhotosTab();            // photos.js: 件数・索引の枚数・一覧（検索結果を見ていたときはそのまま）
@@ -113,7 +121,7 @@ function kvTable(node, obj){
 }
 /* Driveの大量削除の保留（/api/admin/status の sync.mass_delete_hold。Rust版だけが返す）の注意表示。
    保留が無い・キーが無い（Python版・取り込み無効）ときは null を返し、何も出さない。
-   解除は画面からはできない。ここには解除のコマンドを文字で示すだけ。 */
+   解除は運用タブ（ops.js）から。ここには案内を文字で示すだけ。 */
 const HOLD_REASON = {
   ratio: 'Driveの一覧に無い行が多すぎる（50件超かつ全体の20%超）',
   empty_listing: 'Driveの一覧が空だった'
@@ -126,7 +134,7 @@ function massDeleteNotice(hold){
     (HOLD_REASON[hold.reason] || hold.reason) + ' / Driveの行 ' + hold.drive_rows + '件'));
   c.appendChild(el('span', 'k', '保留の開始 ' + hold.since + ' / 最後に確認 ' + hold.checked_at));
   c.appendChild(el('span', 'k',
-    '意図した削除なら、サービスを止めて geoframe sync --allow-mass-delete を1回実行（この画面からは解除できません）'));
+    '意図した削除なら運用タブから解除（確かめた件数を超える削除はしない。serve が動いていないときは geoframe sync --allow-mass-delete）'));
   return c;
 }
 /* AI運用の状態（/api/admin/status の ai_config_invalid・ai_jobs・ai_pauses・ai_waits。Rust版だけが返し、あるときだけ入る）。
@@ -352,6 +360,7 @@ function boot(){
   if(typeof initLibrary === 'function') initLibrary();   // library.js: ボタンとビューアの購読を結ぶ（読み込みはしない）
   if(typeof initCuration === 'function') initCuration(); // curation.js: 同上（選別タブの絞り込み・ページング）
   if(typeof initConfig === 'function') initConfig();     // config.js: 案内文と凡例（読み込みはしない）
+  if(typeof initOps === 'function') initOps();           // ops.js: ボタンのイベントを結ぶ（読み込みはしない）
   const tab = initialTab();
   showTab(tab);
   setInterval(() => { if(!$('#v-status').classList.contains('hidden')) loadStatus(); }, 30000);
