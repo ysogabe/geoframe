@@ -1009,6 +1009,8 @@ function ensureLibMap(){
   map.on('load', () => addPointLayers(map));
   map.on('moveend', syncClusterLabels);
   map.on('movestart', onMapMoveStart);
+  // 初めての単発のホイールは、MapLibre 4.7.1 が 40ms の判別を待ってから originalEvent の無い movestart を起こすので、ホイールそのものでも待っているクラスタの展開を捨てる
+  map.on('wheel', () => { ls.seq.cluster++; });
   map.on('moveend', onMapMoveEnd);
   map.on('zoomend', syncClusterLabels);
   // moveend・zoomend は描画での source の更新より先に発火し、更新先のタイルがキャッシュにあると sourcedata も出ないので、描画が落ち着いた後にも 1 回合わせる

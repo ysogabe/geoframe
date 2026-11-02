@@ -277,7 +277,7 @@ gen: 数                        … 選択・view・期間・除外・地図の�
 - `detailParams()` は今の `gridParams` を `kind` ごとに書き直したもの。場所の view では `period` を `pref`・`city`・`abroad`・`bbox`・`period` のすべてに掛ける。
 - **古い応答の捨て方**: 要求の種類ごとの `seq`（`trips`・`detail`・`points`・`popup`・`calendar`・`placeCards`・`placeOptions`・`when`・`choose`・`cluster`）に加え、`when` の応答は送った時点の `gen` と今の `gen` が同じときだけ使う
   （読み取りを待つ間に月を選べば `gen` が増え、遅れた応答は捨てる）。候補の決定（`choose`）とクラスタの展開ズームの応答（`cluster`）も、送った時点の番号と `gen` が今と同じときだけ使う。
-  `cluster` は候補の決定（同じ候補の選び直しも）・「全体に戻す」・利用者の地図の移動・点の差し替えでも増やす。除外の切り替えでは、すべての一覧の `seq` を増やして飛んでいる応答を捨ててから、見えている view を読み直す。
+  `cluster` は候補の決定（同じ候補の選び直しも）・「全体に戻す」・利用者の地図の移動の開始（`originalEvent` のある `movestart`）・ホイール（初めての単発のホイールは `originalEvent` の無い `movestart` になるため `wheel` で）・点の差し替えでも増やす。除外の切り替えでは、すべての一覧の `seq` を増やして飛んでいる応答を捨ててから、見えている view を読み直す。
   見えていない view は `loaded` を落とすだけで、次に開くときに読む（飛んでいた応答は `seq` で捨てられるので `loaded` を立て直さない）。
 - 地図が見えているかは「`view === 'places'` かつライブラリのタブが見えている」。`pointsStale` の判断をこれに置き換える。
 

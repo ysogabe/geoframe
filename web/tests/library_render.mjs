@@ -2918,7 +2918,7 @@ await test('(y1) R14 クラスタの展開ズームの応答を待つあいだ�
 });
 
 // 無効にするのは利用者の移動の「開始」。過去の展開の moveend（libUser）や、移動の終わりが応答のあとに来る順序で取りこぼさない
-await test('(y2) R14 クラスタの展開の easeTo の途中で別のクラスタを押しても、前の展開の moveend であとの応答は捨てない。応答待ちにドラッグを始めたら、moveend より先に応答が返っても古いクラスタへは寄らない', async () => {
+await test('(y2) R14 クラスタの展開の easeTo の途中で別のクラスタを押しても、前の展開の moveend であとの応答は捨てない。応答待ちにドラッグを始めたら、moveend より先に応答が返っても古いクラスタへは寄らない。初めての単発のホイールでも寄らない', async () => {
   const env = makeEnv();
   env.handlers.places = () => reply(comboBody());
   await env.boot();
@@ -2965,6 +2965,18 @@ await test('(y2) R14 クラスタの展開の easeTo の途中で別のクラス
   fake.holdExpansion = false;
   assert.equal(map.calls.easeTo.length, eased + 1, '自動の移動の開始では応答を捨てない');
   assert.deepEqual(plain(map.calls.easeTo.at(-1)), {center: [134, 34], zoom: 11});
+  while(map.moves.length) map.endMove();
+  await settle();
+  // (c) 初めての単発のホイール: MapLibre は判別を待ってから originalEvent の無い movestart を起こす。ホイールそのもので捨てる
+  const eased2 = map.calls.easeTo.length;
+  fake.holdExpansion = true;
+  click(5, [135, 35]);
+  map.fire('wheel', {originalEvent: {type: 'wheel', deltaY: 100}});
+  map.fire('movestart', {});
+  fake.pendingExpansions.at(-1).resolve(12);
+  await settle();
+  fake.holdExpansion = false;
+  assert.equal(map.calls.easeTo.length, eased2, 'ホイールのあとに返った古い応答では寄らない');
 });
 
 // ---- R10: 年をまたぐ「月から月」 ----
