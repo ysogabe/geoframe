@@ -12,6 +12,6 @@
 | T4 | 画面の土台と旅・日付: admin.html・admin.css の部品と見た目、fakedom.mjs・fake_maplibre.mjs、static_files.rs の禁止語、library.js の状態・選択・下の詳細（旅・日付）・古い応答の捨て方・除外。試験の書き直しと回帰。場所・地図はこの段では今の動きのまま | AC1, AC3, AC4, AC5, AC15, AC16, AC16a | T1 | full | 完了 | a9bf10c | 5e8d8ee, 04fa5f3 | Sol: 必須 1（地図で見るで前の範囲の選択を持ち越す）・推奨 1（ページ送りと選択の交差の試験）を 04fa5f3 で修正。選択中のカードを再度押すと選択を外す（戻るの代わり）。HTML を変えると今の library.js の試験が壊れるため、旧 T4（土台）と旧 T5（旅・日付）を 1 段にまとめた |
 | T5 | （T4 に統合） | - | - | - | 完了 | | | 旧 T5 は T4 に統合 |
 | T6 | library.js: 場所と地図の統合（カード・チップ・fitBounds・地図の移動の理由・places?bbox・期間と解除） | AC6, AC7, AC8（画面側） | T5 | full | 完了 | c272636 | 4027d02, 1f7197f | Sol: 必須 2（回転・傾斜、resize の補正を利用者の移動と取る）を 1f7197f で修正: 利用者の移動は originalEvent / libUser で判定、回転・傾斜・Shift の範囲ズームを無効化。再確認は最後の全体レビューで |
-| T7 | library.js: 旅の検索・日付の言葉（when）とピッカー（Shift の範囲）・場所のコンボボックス | AC9, AC12, AC13, AC14（画面側） | T3, T6 | full | 未着手 | | | |
+| T7 | library.js: 旅の検索・日付の言葉（when）とピッカー（Shift の範囲）・場所のコンボボックス | AC9, AC12, AC13, AC14（画面側） | T3, T6 | full | 実装中 | d158c80 | | |
 
 AC17（fmt・clippy・test）は各タスクで通し、最後に全体で確かめる。
