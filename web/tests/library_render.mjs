@@ -2282,11 +2282,14 @@ await test('(w3) AC16a 言葉の応答を待つあいだに月を選ぶと、遅
   keyOn(input, 'Enter');
   await settle();
   env.$('#lib-hidden').checked = true;
+  assert.equal(note.textContent, '読んでいます…');
   env.$('#lib-hidden').dispatchEvent({type: 'change'});
   await settle();
+  assert.equal(note.textContent, '2024-01-01〜2024-01-31 として検索（規則）', '切り替え直後に読んでいますは解け、選んでいる期間の文に戻る');
   held[3](words('2022-01-01', '2022-01-31'));
   await settle();
   assert.equal(env.ev('ls.sel.calendar.from'), '2024-01-01 00:00');
+  assert.equal(note.textContent, '2024-01-01〜2024-01-31 として検索（規則）', '遅れた応答が来ても変わらない');
   // view を替えて戻したあとでも、替える前に出した応答は捨てる
   input.value = 'D';
   keyOn(input, 'Enter');
@@ -2334,7 +2337,7 @@ await test('(w4) AC13 ピッカー: 写真の無い月は押せない。Shift �
   assert.equal(env.$('#lib-sel').textContent, '2030年5月〜2030年12月');
   assert.equal(hidden(env, '#lib-months'), false, '範囲を選んだあとも、起点の年の月は出したまま');
   assert.equal(monthChips(env).length, 12);
-  assert.ok(monthChips(env)[11].classList.contains('is-selected') || true);
+  assert.ok(!monthChips(env)[11].classList.contains('is-selected'), '範囲を選んだ月のチップ自体は押した状態にならない（exact は範囲だけ）');
   // 順向き: 5 月を普通に押して Shift で 12 月
   monthChips(env)[4].click();
   await settle();
@@ -2638,9 +2641,11 @@ await test('(x5) AC14 地図の範囲で隠れている県も選べる: mapBbox 
   const env = makeEnv();
   const held = [];
   env.handlers.places = params => {
-    if(!params.get('bbox')) return reply(comboBody());
-    const body = {ok: true, abroad: 0, prefs: [comboBody().prefs[3]]};     // 地図の範囲には愛媛県だけ
-    return held.hold ? new Promise(res => held.push(() => res(jsonRes(body)))) : reply(body);
+    if(!params.get('bbox')){                                               // 候補を決めたあとの読み直し（地図の絞り込みを外した要求）だけを保留できる
+      const all = comboBody();
+      return held.hold ? new Promise(res => held.push(() => res(jsonRes(all)))) : reply(all);
+    }
+    return reply({ok: true, abroad: 0, prefs: [comboBody().prefs[3]]});    // 地図の範囲には愛媛県だけ
   };
   await env.boot();
   await openLib(env);
@@ -2677,12 +2682,67 @@ await test('(x5) AC14 地図の範囲で隠れている県も選べる: mapBbox 
   keyOn(input, 'Enter');
   await settle();
   assert.equal(env.ev('ls.mapBbox'), null);
+  assert.equal(held.length, 1, 'bbox なしの読み直しが 1 件、保留されている');
   env.$('#lib-view-trips').click();
   await settle();
   const sel = JSON.stringify(plain(env.ev('ls.sel.places')));
   held.forEach(f => f());
   await settle();
   assert.equal(JSON.stringify(plain(env.ev('ls.sel.places'))), sel, '別の画面にいるあいだに来た読み直しでは選ばない');
+});
+
+await test('(x5b) AC14 R14 候補を決めたあとの読み直しの間に、候補の再選択・カードのクリックがあれば、あとから届いた応答は選択を変えない', async () => {
+  const env = makeEnv();
+  const held = [];
+  env.handlers.places = params => {
+    if(!params.get('bbox')){
+      const all = comboBody();
+      return held.hold ? new Promise(res => held.push(() => res(jsonRes(all)))) : reply(all);
+    }
+    return reply({ok: true, abroad: 0, prefs: [comboBody().prefs[3]]});    // 地図の範囲には愛媛県だけ
+  };
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  env.raf();
+  userMove(env, {bounds: {w: 132, s: 33, e: 134, n: 34.5}});
+  await settle();
+  assert.deepEqual(pcards(env).map(cardName), ['愛媛県']);
+  mainOf(pcards(env)[0]).click();                      // 愛媛県を選ぶ（地図の範囲の中なのでカードがある）
+  await settle();
+  const input = comboBox(env);
+  const choose = text => { typeInto(input, text); keyOn(input, 'ArrowDown'); keyOn(input, 'Enter'); };
+  const prefSel = {kind: 'pref', pref: '愛媛県'};
+  // 隠れている長野県 松本市を候補から決める（読み直しを保留）→ 保留中に愛媛県を候補から再選択
+  held.hold = true;
+  choose('松本');
+  await settle();
+  assert.equal(held.length, 1, '読み直しが 1 件保留されている');
+  assert.equal(env.ev('ls.mapBbox'), null);
+  choose('愛媛');
+  await settle();
+  assert.deepEqual(plain(env.ev('ls.sel.places')), prefSel, '同じ県の再選択では選択を外さない');
+  held.forEach(f => f());
+  await settle();
+  assert.deepEqual(plain(env.ev('ls.sel.places')), prefSel, '遅れて届いた応答で松本市に変わらない');
+  assert.equal(env.last('/api/admin/library/photos').get('city'), null);
+  // 保留中にカードをクリックしても、あとから届いた応答は選択を戻さない
+  held.hold = false;
+  held.length = 0;
+  mapOf(env).endMove();
+  userMove(env, {bounds: {w: 132, s: 33, e: 134, n: 34.5}});
+  await settle();
+  assert.equal(env.ev('ls.mapBbox').length, 4);
+  held.hold = true;
+  choose('松本');
+  await settle();
+  assert.equal(held.length, 1);
+  mainOf(pcards(env)[0]).click();                      // 愛媛県のカード（読み直し前の一覧）をもう一度押して外す
+  await settle();
+  assert.equal(env.ev('ls.sel.places'), null);
+  held.forEach(f => f());
+  await settle();
+  assert.equal(env.ev('ls.sel.places'), null, '遅れて届いた応答で松本市が選ばれない');
 });
 
 await test('(y) AC15 除外の切り替えで、検索・言葉・候補の読み込みはすべて hidden=1（詳細はページ 1）。候補用の /places も読み直し、開いているリストは新しい候補になる', async () => {

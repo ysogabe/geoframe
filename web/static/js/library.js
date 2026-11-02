@@ -41,7 +41,7 @@ const ls = {
   onPlaces: false, detailShown: false, resizeQueued: false,
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
   map: null, pendingData: null, labels: new Map(), popup: null,
-  seq: {trips: 0, detail: 0, points: 0, popup: 0, calendar: 0, placeCards: 0, placeOptions: 0, when: 0},
+  seq: {trips: 0, detail: 0, points: 0, popup: 0, calendar: 0, placeCards: 0, placeOptions: 0, when: 0, choose: 0},
 };
 
 const LIB_POINTS_SOURCE = 'photos';
@@ -701,8 +701,10 @@ function chooseComboItem(it){
   choosePlace(it.kind === 'city' ? {kind: 'city', pref: it.pref, city: it.city} : {kind: 'pref', pref: it.pref}, it.bbox);
 }
 /* カードに（city なら県のカードの市区町村にも）出ていない候補は、地図の範囲による絞り込みを外してカードを読み直してから選ぶ
-   （市区町村のチップはカード用の ls.prefs から作るので、読み直したあとに出る）。読み直しの間に別の操作があれば選ばない */
+   （市区町村のチップはカード用の ls.prefs から作るので、読み直したあとに出る）。読み直しの間に別の操作があれば選ばない
+   （カード・月などの選択は gen を進め、候補を決め直すと seq.choose が進む。どちらが変わっても保留中の選択は捨てる） */
 function choosePlace(S, bbox){
+  const cseq = ++ls.seq.choose;
   const done = () => {
     const cur = ls.sel.places;
     if(cur && selId(cur) === selId(S)) fitMapTo(bbox);
@@ -713,7 +715,7 @@ function choosePlace(S, bbox){
   if(!ls.mapBbox || shown){ done(); return; }
   const gen = ls.gen;
   ls.mapBbox = null;
-  loadPlaceCards(() => { if(gen === ls.gen && ls.view === 'places') done(); });
+  loadPlaceCards(() => { if(cseq === ls.seq.choose && gen === ls.gen && ls.view === 'places') done(); });
 }
 function onComboKey(e){
   if(e.isComposing || e.keyCode === 229) return;        // 日本語入力の変換中は変換のためのキー
@@ -1136,6 +1138,8 @@ function onLibHiddenChange(){
   ls.includeHidden = !!$('#lib-hidden').checked;
   ls.gen++;
   Object.keys(ls.seq).forEach(k => { ls.seq[k]++; });
+  ls.whenMsg = null;           // 読み取り中の日付の言葉の応答は上で捨てた。「読んでいます…」は解き、words の選択があればその期間の文に戻す
+  paintWhenNote();
   closePopup();
   Object.keys(ls.loaded).forEach(k => { ls.loaded[k] = false; });
   loadLibList(ls.view, true);
