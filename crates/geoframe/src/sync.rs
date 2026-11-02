@@ -213,6 +213,16 @@ pub(crate) fn simulation_copy_within(
     read: &Connection,
     deadline: Duration,
 ) -> rusqlite::Result<Connection> {
+    simulation_copy_stepping(read, deadline, &mut || {})
+}
+
+/// [`simulation_copy_within`] に、バックアップの 1 step が終わって続きがあるたびに呼ぶ `after_step` を足した形
+/// （試験が、写しの途中で元の DB を更新させるために使う。本番は何もしない閉包を渡す）。
+fn simulation_copy_stepping(
+    read: &Connection,
+    deadline: Duration,
+    after_step: &mut dyn FnMut(),
+) -> rusqlite::Result<Connection> {
     let start = Instant::now();
     let timed_out = || {
         rusqlite::Error::SqliteFailure(
@@ -242,7 +252,8 @@ pub(crate) fn simulation_copy_within(
             }
         }
     }
-    let result = copy_snapshot(read, start, deadline).map_err(|e| e.unwrap_or_else(timed_out));
+    let result =
+        copy_snapshot(read, start, deadline, after_step).map_err(|e| e.unwrap_or_else(timed_out));
     let _ = read.execute_batch("ROLLBACK");
     result
 }
@@ -263,6 +274,7 @@ fn copy_snapshot(
     read: &Connection,
     start: Instant,
     deadline: Duration,
+    after_step: &mut dyn FnMut(),
 ) -> Result<Connection, Option<rusqlite::Error>> {
     use rusqlite::backup::{Backup, StepResult};
     let mut copy = Connection::open_in_memory()?;
@@ -271,7 +283,7 @@ fn copy_snapshot(
         loop {
             match backup.step(COPY_PAGES_PER_STEP)? {
                 StepResult::Done => break,
-                StepResult::More => {}
+                StepResult::More => after_step(),
                 // 元か先がロックされている（rusqlite は他の結果も `#[non_exhaustive]` で持つ）
                 _ => std::thread::sleep(COPY_RETRY_INTERVAL),
             }
@@ -477,6 +489,42 @@ pub fn spawn_worker(
     board: Arc<Board>,
     drive: Arc<crate::drive::DriveShared>,
 ) -> JoinHandle<()> {
+    spawn_worker_impl(
+        config,
+        writer,
+        cache,
+        stages,
+        stop,
+        poll,
+        lock,
+        board,
+        drive,
+        #[cfg(test)]
+        None,
+    )
+}
+
+/// 保留の解除で走らせる段を作る閉包（試験で差し替える）。
+#[cfg(test)]
+type ReleaseStages = Arc<
+    dyn Fn(Arc<crate::drive::DriveShared>, crate::drive::HeldIds) -> Vec<Box<dyn Stage>>
+        + Send
+        + Sync,
+>;
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_worker_impl(
+    config: Arc<Config>,
+    writer: Writer,
+    cache: Arc<Cache>,
+    stages: Vec<Box<dyn Stage>>,
+    stop: StopFlag,
+    poll: Duration,
+    lock: crate::ingest::LockHold,
+    board: Arc<Board>,
+    drive: Arc<crate::drive::DriveShared>,
+    #[cfg(test)] release_stages: Option<ReleaseStages>,
+) -> JoinHandle<()> {
     std::thread::Builder::new()
         .name("sync-worker".into())
         .spawn(move || {
@@ -489,6 +537,8 @@ pub fn spawn_worker(
                 cache: &cache,
                 http: &http,
                 stop: &stop,
+                #[cfg(test)]
+                release_stages: release_stages.clone(),
             };
             let mut next_cycle_at = Instant::now(); // 起動直後に 1 回
             loop {
@@ -530,6 +580,24 @@ struct WorkerEnv<'a> {
     cache: &'a Cache,
     http: &'a ureq::Agent,
     stop: &'a StopFlag,
+    /// 試験で、保留の解除の段を差し替える（本番は `None` 相当で `index_drive_stage_only`）。
+    #[cfg(test)]
+    release_stages: Option<ReleaseStages>,
+}
+
+impl WorkerEnv<'_> {
+    /// 保留の解除で走らせる段（`index_drive` だけ）。
+    fn release_stages(
+        &self,
+        drive: &Arc<crate::drive::DriveShared>,
+        ids: crate::drive::HeldIds,
+    ) -> Vec<Box<dyn Stage>> {
+        #[cfg(test)]
+        if let Some(make) = &self.release_stages {
+            return make(Arc::clone(drive), ids);
+        }
+        index_drive_stage_only(Arc::clone(drive), ids)
+    }
 }
 
 /// 取り出した運用の要求を 1 件処理して、`board` に結果を残す（どの経路でも `running` を外す: [`Board::guard`]）。
@@ -559,7 +627,7 @@ fn run_request(
                 guard.finish(Outcome::HoldChanged, Vec::new(), None);
                 return;
             };
-            one_cycle(env, &index_drive_stage_only(Arc::clone(drive), ids))
+            one_cycle(env, &env.release_stages(drive, ids))
         }
         // AI 系は POST の中で処理し、同期ワーカーの待ちには入らない
         OpKind::AiRetry | OpKind::AiReleasePause => None,
@@ -611,6 +679,7 @@ mod tests {
     use crate::stop::join_within;
     use crate::testutil::TempDir;
     use crate::writer::OpenMode;
+    use std::cell::Cell;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1028,13 +1097,24 @@ mod tests {
     }
 
     fn start_ops(tag: &str, stages: Vec<Box<dyn Stage>>, poll: Duration) -> Ops {
+        start_ops_with(tag, stages, poll, |_| None)
+    }
+
+    /// 保留の解除で走らせる段を差し替えて始める（閉包は停止の合図を受け取る）。
+    fn start_ops_with(
+        tag: &str,
+        stages: Vec<Box<dyn Stage>>,
+        poll: Duration,
+        release_stages: impl FnOnce(&StopFlag) -> Option<ReleaseStages>,
+    ) -> Ops {
         let s = setup(tag);
         let clock = TestClock::new();
         let stop = StopFlag::new();
         let board = Arc::new(Board::new(stop.clone(), clock.clone()));
         let drive = Arc::new(crate::drive::DriveShared::new());
         let mass_delete = drive.mass_delete_board();
-        let handle = spawn_worker(
+        let release_stages = release_stages(&stop);
+        let handle = spawn_worker_impl(
             Arc::clone(&s.config),
             s.writer.clone(),
             Arc::clone(&s.cache),
@@ -1044,6 +1124,7 @@ mod tests {
             crate::ingest::LockHold::for_test(s._dir.path()),
             Arc::clone(&board),
             Arc::clone(&drive),
+            release_stages,
         );
         Ops {
             s,
@@ -1430,6 +1511,95 @@ mod tests {
         assert!(ops.mass_delete.current().is_some());
     }
 
+    /// 保留の解除で走らせる段が `index_drive` の代わりに `stage` になるようにして、承認済みの要求を 1 件流し、
+    /// 要求の履歴の 1 件目を返す。`before` は段を作る直前（要求を取り出したあと）に呼ばれる。
+    fn run_release_with(
+        tag: &str,
+        before: fn(&StopFlag),
+        behavior: fn() -> Result<StageOutcome, StageError>,
+    ) -> (Ops, crate::ops::Record, GateHandle) {
+        use crate::drive::HeldIds;
+        let (gate_stage, gate) = gate();
+        let ops = start_ops_with(tag, vec![gate_stage], LONG, |stop| {
+            let stop = stop.clone();
+            Some(Arc::new(move |_, _| {
+                before(&stop);
+                vec![Box::new(Fixed("index_drive", behavior)) as Box<dyn Stage>]
+            }))
+        });
+        gate.wait_started();
+        let ids = HeldIds::new(vec![5, 7]);
+        ops.mass_delete
+            .record_with_ids(hold(100), ids.clone(), "t0");
+        ops.board
+            .enqueue(
+                OpKind::DriveRelease,
+                Some(token_of_current(&ops)),
+                Some(ids),
+            )
+            .unwrap();
+        gate.release();
+        ops.wait_history(1);
+        let record = ops.latest();
+        (ops, record, gate)
+    }
+
+    fn release_stage_results(record: &crate::ops::Record) -> Vec<(&'static str, &'static str)> {
+        record
+            .stages
+            .iter()
+            .map(|st| (st.name, st.result))
+            .collect()
+    }
+
+    #[test]
+    fn a_drive_release_stopped_before_the_stage_is_skipped_and_leaves_running() {
+        // 要求を取り出したあと、段が走る前に停止の合図が来た（`NotRun`）
+        let (ops, record, gate) = run_release_with(
+            "ops-release-not-run",
+            |stop| stop.stop(),
+            || panic!("停止後なので段は走らない"),
+        );
+        assert_eq!(record.outcome, Outcome::Skipped);
+        assert_eq!(release_stage_results(&record), [("index_drive", "not_run")]);
+        assert!(ops.board.snapshot().running.is_none());
+        assert_eq!(gate.runs(), 1, "定期の段は走らない");
+    }
+
+    #[test]
+    fn a_failing_drive_release_stage_is_failed_and_leaves_running() {
+        let (ops, record, _gate) = run_release_with(
+            "ops-release-failed",
+            |_| {},
+            || Err(StageError::fixed("secret-failure")),
+        );
+        assert_eq!(record.outcome, Outcome::Failed);
+        assert_eq!(release_stage_results(&record), [("index_drive", "failed")]);
+        assert!(ops.board.snapshot().running.is_none());
+        let json = ops.board.snapshot().to_json().to_string();
+        assert!(!json.contains("secret"), "失敗の文面は出さない: {json}");
+        // 保留は消さない
+        assert!(ops.mass_delete.current().is_some());
+    }
+
+    #[test]
+    fn a_panicking_drive_release_stage_is_failed_and_the_worker_goes_on() {
+        let (ops, record, _gate) =
+            run_release_with("ops-release-panicked", |_| {}, || panic!("secret-panic"));
+        assert_eq!(record.outcome, Outcome::Failed);
+        assert_eq!(
+            release_stage_results(&record),
+            [("index_drive", "panicked")]
+        );
+        assert!(ops.board.snapshot().running.is_none());
+        let json = ops.board.snapshot().to_json().to_string();
+        assert!(!json.contains("secret"), "パニックの文面は出さない: {json}");
+        // スレッドは続く: 次の要求を処理できる
+        ops.board.enqueue(OpKind::QualityScan, None, None).unwrap();
+        ops.wait_history(2);
+        assert_eq!(ops.latest().outcome, Outcome::Done);
+    }
+
     #[test]
     fn a_manual_sync_pushes_the_next_cycle_out_by_one_poll_but_other_requests_do_not() {
         let ticks = Arc::new(AtomicUsize::new(0));
@@ -1459,6 +1629,17 @@ mod tests {
         assert_eq!(ticks.load(Ordering::SeqCst), 2);
     }
 
+    /// `counter` が `above` を超えるまで待つ（最大 10 秒）。
+    fn wait_until_grows(counter: &AtomicUsize, above: usize) {
+        for _ in 0..1000 {
+            if counter.load(Ordering::SeqCst) > above {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("書き手の更新が進まない");
+    }
+
     /// 別の接続が更新し続けても、写しは完了する（スナップショットを固定するのでやり直しが起きない）。
     /// 写しは固定した時点の内容で、整合している。
     #[test]
@@ -1479,10 +1660,10 @@ mod tests {
             tx.commit().unwrap();
         }
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        // 書き手が最初の更新を終えたことを知らせる（写しが書き手の起動より先に終わると、「更新され続ける」前提が崩れる）
-        let started = Arc::new(AtomicUsize::new(0));
+        // 書き手が終えた更新の回数（写しの開始から完了までに増えたことを確かめる）
+        let updates = Arc::new(AtomicUsize::new(0));
         let writer = {
-            let (path, stop, started) = (path.clone(), Arc::clone(&stop), Arc::clone(&started));
+            let (path, stop, updates) = (path.clone(), Arc::clone(&stop), Arc::clone(&updates));
             std::thread::spawn(move || {
                 let conn = Connection::open(&path).unwrap();
                 conn.busy_timeout(Duration::from_secs(5)).unwrap();
@@ -1497,28 +1678,40 @@ mod tests {
                     )
                     .unwrap();
                     n += 1;
-                    started.store(1, Ordering::SeqCst);
+                    updates.fetch_add(1, Ordering::SeqCst);
                 }
-                n
             })
         };
-        for _ in 0..1000 {
-            if started.load(Ordering::SeqCst) > 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        // 書き手が動き出すまで待つ
+        wait_until_grows(&updates, 0);
         let read = crate::db::open_read_only(&path).unwrap();
         let before: i64 = read
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap();
+        // 写しの途中（step の合間）ごとに、書き手が新しく更新を終えるのを待つ。これで「写しの最中に更新が
+        // 続いていた」ことが、書き手と写しの速さによらず決まる
+        let steps = Cell::new(0usize);
+        let updates_at_start = updates.load(Ordering::SeqCst);
         let started = Instant::now();
-        let copy = simulation_copy_within(&read, Duration::from_secs(20));
+        let copy = simulation_copy_stepping(&read, Duration::from_secs(20), &mut || {
+            steps.set(steps.get() + 1);
+            wait_until_grows(&updates, updates.load(Ordering::SeqCst));
+        });
         let took = started.elapsed();
+        let updates_at_end = updates.load(Ordering::SeqCst);
         stop.store(true, Ordering::SeqCst);
-        let written = writer.join().unwrap();
+        writer.join().unwrap();
         let copy = copy.expect("更新され続けても完了する");
-        assert!(written > 0, "書き手が動いていなかった");
+        assert!(
+            steps.get() >= 2,
+            "写しが 1 step で終わった: {}",
+            steps.get()
+        );
+        assert!(
+            updates_at_end >= updates_at_start + steps.get(),
+            "写しのあいだに更新が続いていない: {updates_at_start} → {updates_at_end}（{} step）",
+            steps.get()
+        );
         assert!(took < Duration::from_secs(20), "{took:?}");
         let rows: i64 = copy
             .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
