@@ -36,9 +36,9 @@ pub enum OpKind {
     QualityScan,
     /// Drive の大量削除の保留の解除。
     DriveRelease,
-    /// AI ジョブの再試行（PR ②。同期ワーカーでは処理しない）。
+    /// AI ジョブの再試行（POST の中で行い、同期ワーカーでは処理しない。`enqueue` しない）。
     AiRetry,
-    /// AI の停止の解除（PR ②。同上）。
+    /// AI の停止の解除（同上）。
     AiReleasePause,
 }
 
@@ -90,9 +90,9 @@ pub enum Outcome {
     Exceeded,
     /// 実行の直前に、保留が承認したものと違っていた（実行しなかった）。
     HoldChanged,
-    /// AI ジョブの再試行（PR ②）。
+    /// AI ジョブの再試行。
     Retried,
-    /// AI の停止の解除（PR ②）。
+    /// AI の停止の解除。
     Released,
 }
 
@@ -249,7 +249,7 @@ pub fn outcome_of(kind: RunKind, report: &CycleReport) -> Outcome {
     }
 }
 
-/// AI 系の要求の結果（PR ② で中身を使う。いまは型だけ）。
+/// AI 系の操作の結果（履歴の `report`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Report {
     Retry(RetryReport),
@@ -257,7 +257,7 @@ pub enum Report {
 }
 
 impl Report {
-    fn to_json(self) -> Value {
+    pub fn to_json(self) -> Value {
         match self {
             Self::Retry(r) => json!({
                 "requeued": r.requeued,
@@ -482,6 +482,36 @@ impl Board {
             finished_at: self.clock.timestamp(Duration::ZERO),
             outcome,
             stages,
+            report,
+        });
+        inner.history.truncate(HISTORY_LEN);
+    }
+
+    /// 現地時刻（`YYYY-MM-DD HH:MM:SS`）。同期ワーカーを通らない操作の開始・終了の時刻に使う。
+    pub fn timestamp_now(&self) -> String {
+        self.clock.timestamp(Duration::ZERO)
+    }
+
+    /// 同期ワーカーを通らない操作（AI の再試行・停止の解除。POST の中で行う）を、終わったものとして履歴に 1 件残す。
+    /// 待ち・実行中・Drive を読む間隔の基準は変えない。履歴は新しい順に [`HISTORY_LEN`] 件。
+    pub fn record_direct(
+        &self,
+        kind: OpKind,
+        started_at: String,
+        outcome: Outcome,
+        report: Option<Report>,
+    ) {
+        let mut inner = self.lock();
+        let id = inner.next_id;
+        inner.next_id += 1;
+        inner.history.push_front(Record {
+            id,
+            kind: RunKind::Op(kind),
+            requested_at: Some(started_at.clone()),
+            started_at,
+            finished_at: self.clock.timestamp(Duration::ZERO),
+            outcome,
+            stages: Vec::new(),
             report,
         });
         inner.history.truncate(HISTORY_LEN);

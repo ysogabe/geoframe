@@ -91,6 +91,14 @@ pub struct AppState {
     /// 運用コンソールの掲示板（同期ワーカーが処理する要求の待ち・実行中・履歴）。取り込みが有効の `serve` だけが持つ。
     /// 無いとき（取り込み無効・試験）は `None`。
     pub ops: Option<Arc<crate::ops::Board>>,
+    /// 運用タブの AI の再試行（`POST /api/admin/ops/ai-retry`）が使う handler。**背景ワーカーとは別インスタンス**
+    /// （`prepare_retry` が handler の中の作業一覧を書き換えるため。`serve` が `production_handlers` を 2 回呼ぶ）。
+    /// 取り込み無効・試験では空。
+    pub ai_retry_handlers: Arc<Vec<Arc<dyn crate::ai::worker::Handler>>>,
+    /// AI の再試行が使う時計（背景ワーカーと同じ種類）。
+    pub ai_clock: crate::ai::worker::Clock,
+    /// AI の操作（再試行・停止の解除）を同時に 1 つだけにする鎖。POST は `spawn_blocking` の閉包の中で `try_lock` する。
+    pub ai_ops_lock: Arc<std::sync::Mutex<()>>,
     /// プロセスの起動時刻（`GET /api/admin/config` の `started_at`・`uptime_s`）。状態を作った時刻で、`serve_until` が
     /// 待ち受けを始める直前に取り直す。
     pub started_at: std::time::SystemTime,
@@ -139,6 +147,9 @@ impl AppState {
             blog,
             mass_delete: None,
             ops: None,
+            ai_retry_handlers: Arc::new(Vec::new()),
+            ai_clock: Arc::new(crate::ai::jobs::unix_now),
+            ai_ops_lock: Arc::new(std::sync::Mutex::new(())),
             started_at: std::time::SystemTime::now(),
             thumbs: Arc::new(crate::thumb::ThumbState::new()),
         }
@@ -164,6 +175,20 @@ impl AppState {
     /// 運用コンソールの掲示板を付ける（取り込みが有効の `serve`。同期ワーカーと同じもの）。
     pub fn with_ops(mut self, board: Arc<crate::ops::Board>) -> Self {
         self.ops = Some(board);
+        self
+    }
+
+    /// 運用タブの AI の操作（再試行・停止の解除）の部品を付ける（取り込みが有効の `serve`）。`handlers` は背景ワーカーとは
+    /// 別に組み立てたもの、`lock` は同時に 1 つだけにする鎖（試験は握って「実行中」を作れる）。
+    pub fn with_ai_ops(
+        mut self,
+        handlers: Vec<Arc<dyn crate::ai::worker::Handler>>,
+        clock: crate::ai::worker::Clock,
+        lock: Arc<std::sync::Mutex<()>>,
+    ) -> Self {
+        self.ai_retry_handlers = Arc::new(handlers);
+        self.ai_clock = clock;
+        self.ai_ops_lock = lock;
         self
     }
 

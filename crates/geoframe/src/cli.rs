@@ -437,21 +437,25 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let mut state = AppState::new(Arc::clone(&config), catalog).with_cache(cache);
     let cloud = crate::ai::cloud::CloudClients::new(&config.ai).ok();
     let lan = crate::ai::provider::LanClient::new(&config.ai);
-    let ai_worker = ingest.as_ref().and_then(|ingest| {
-        start_ai(
+    // 同じ組み立てを 2 回行う（通信はしない）。1 組目は背景ワーカー、2 組目は運用タブの再試行用。`prepare_retry` は handler の
+    // 中の作業一覧を書き換えるので、背景ワーカーの `reconcile` と同じインスタンスを共有しない。
+    let handlers = || {
+        worker::production_handlers(
             &config,
-            ingest,
-            &stop,
-            &ai_clock,
-            worker::production_handlers(
-                &config,
-                lan.clone(),
-                cloud.as_ref(),
-                Arc::clone(&state.geocoder),
-                Arc::clone(&state.cache),
-            ),
+            lan.clone(),
+            cloud.as_ref(),
+            Arc::clone(&state.geocoder),
+            Arc::clone(&state.cache),
         )
-    });
+    };
+    let ai_retry_handlers = if ingest.is_some() {
+        handlers()
+    } else {
+        Vec::new()
+    };
+    let ai_worker = ingest
+        .as_ref()
+        .and_then(|ingest| start_ai(&config, ingest, &stop, &ai_clock, handlers()));
     state = state.with_ai_search(Arc::new(crate::ai::query::Runtime::new(
         &config,
         lan,
@@ -487,7 +491,14 @@ fn serve(overrides: &Overrides) -> ExitCode {
             ),
         });
     if let Some(board) = ops_board {
-        state = state.with_mass_delete_board(mass_delete).with_ops(board);
+        state = state
+            .with_mass_delete_board(mass_delete)
+            .with_ops(board)
+            .with_ai_ops(
+                ai_retry_handlers,
+                Arc::clone(&ai_clock),
+                Arc::new(std::sync::Mutex::new(())),
+            );
     }
     if state.data_root.as_path() != state.config.data_dir.as_path() {
         // データ置き場がシンボリックリンクのとき、解決先の内側かどうかで静的配信を判定する
@@ -886,7 +897,8 @@ fn one_off(
 
 /// `geoframe ai-jobs …`。`status` は読み取りだけ（ガード・ロック不要。AI の表が無い旧 DB でも 0 件）。
 /// `retry`・`release-pause` は書くので、`organize` などと同じく `GEOFRAME_INGEST=1`・検証環境のガード・
-/// `.ingest.lock`・writer を通す（稼働中の `serve` はロックを持っているので断る）。出力は件数・用途・固定の
+/// `.ingest.lock`・writer を通す（稼働中の `serve` はロックを持っているので、CLI は断る。稼働中は `serve` の運用タブ
+/// （`admin_ops`）が同じ関数を、背景ワーカーとは別インスタンスの handler で呼ぶ）。出力は件数・用途・固定の
 /// 理由コードだけで、対象のキー・入力・token・起動 ID・モデル・URL・パス・写真の値は出さない。
 fn ai_jobs(command: AiJobsCommand) -> ExitCode {
     let data_dir = match &command {

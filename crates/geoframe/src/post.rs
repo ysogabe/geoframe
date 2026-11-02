@@ -65,6 +65,8 @@ pub enum Route {
     OpsSync,
     OpsQualityScan,
     OpsDriveRelease,
+    OpsAiRetry,
+    OpsAiReleasePause,
 }
 
 impl Route {
@@ -81,6 +83,8 @@ impl Route {
             Self::OpsSync => "/api/admin/ops/sync",
             Self::OpsQualityScan => "/api/admin/ops/quality-scan",
             Self::OpsDriveRelease => "/api/admin/ops/drive-release",
+            Self::OpsAiRetry => "/api/admin/ops/ai-retry",
+            Self::OpsAiReleasePause => "/api/admin/ops/ai-release-pause",
         }
     }
 }
@@ -101,6 +105,8 @@ pub fn route_of(raw_path: &str) -> Option<Route> {
         "/api/admin/ops/sync" => Some(Route::OpsSync),
         "/api/admin/ops/quality-scan" => Some(Route::OpsQualityScan),
         "/api/admin/ops/drive-release" => Some(Route::OpsDriveRelease),
+        "/api/admin/ops/ai-retry" => Some(Route::OpsAiRetry),
+        "/api/admin/ops/ai-release-pause" => Some(Route::OpsAiReleasePause),
         _ => None,
     }
 }
@@ -294,6 +300,7 @@ pub async fn handle(
     let admin = std::sync::Arc::clone(&state.admin);
     let ops = state.ops.clone();
     let mass_delete = state.mass_delete.clone();
+    let ai_ops = admin_ops::AiOps::of(state);
     // ここから応答が決まるまでが「処理中」。済んだら（守りを落としたら）無通信の期限が戻る
     let busy_guard = busy.map(ConnBusy::enter);
     let result = tokio::task::spawn_blocking(move || match route {
@@ -309,6 +316,8 @@ pub async fn handle(
         Route::OpsDriveRelease => {
             admin_ops::drive_release(&payload, ops.as_ref(), mass_delete.as_ref())
         }
+        Route::OpsAiRetry => admin_ops::ai_retry(&payload, &ai_ops),
+        Route::OpsAiReleasePause => admin_ops::ai_release_pause(&payload, &ai_ops),
     })
     .await
     .unwrap_or_else(|_| Err(ApiError::Internal("更新の処理が異常終了しました".into())));

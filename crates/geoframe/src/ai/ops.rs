@@ -6,11 +6,13 @@
 //! （`INGEST=0` の旧 Python の DB）でも 0 件として動く。出すのは**件数と固定の理由コード・用途名だけ**で、
 //! 対象のキー・入力の hash・token・起動 ID・モデル名・URL・パス・写真の値は出さない。
 //!
-//! # 書き込み（サービス停止中だけ）
+//! # 書き込み（CLI は停止中だけ。稼働中は運用タブ）
 //!
-//! [`retry`]・[`release_pause`] は writer を通す。呼ぶ側（CLI）が `GEOFRAME_INGEST=1`・検証環境のガード・
-//! `.ingest.lock`（[`crate::ingest::start`]）を済ませてから使う。稼働中の `serve` はロックを持っているので、
-//! その間は始まらない（稼働中拒否）。どちらも外部へは送らない。
+//! [`retry`]・[`release_pause`] は writer を通す。CLI（`geoframe ai-jobs`）は `GEOFRAME_INGEST=1`・検証環境のガード・
+//! `.ingest.lock`（[`crate::ingest::start`]）を済ませてから使うので、稼働中の `serve`（ロックを持っている）がある間は
+//! 始まらない。稼働中は `serve` の運用タブ（[`crate::admin_ops`]）が**同じ関数**を、背景ワーカーとは**別インスタンスの
+//! handler**（`prepare_retry` が handler の中の作業一覧を書き換えるので共有しない）と `serve` の writer で呼ぶ。
+//! どちらも外部へは送らない。
 //!
 //! - `retry`: `failed` のジョブだけを対象に、**登録済みの handler** が現在の入力・既存の結果を再検査して
 //!   `Requeue`／`Obsolete`／`Satisfied` に振り分ける（[`jobs::retry_failed`]）。成功済みの結果は戻さない。
@@ -353,18 +355,36 @@ fn failed_count(writer: &Writer, kind: JobKind) -> Result<usize, WriteError> {
 }
 
 /// `failed` のジョブだけを再検査して振り分ける（上の「書き込み」）。外部へは送らない。
+///
+/// 種類ごとに別のトランザクションで書くので、途中の種類で失敗しても、**先の種類はコミット済み**で戻らない。
+/// そのとき `Err` には**済んだ種類までの集計**を添える（呼び出し側が履歴に残す。CLI は集計を使わない）。
 pub fn retry(
     writer: &Writer,
     ai: &AiConfig,
     handlers: &[Arc<dyn Handler>],
     target: RetryTarget,
     clock: &Clock,
-) -> Result<RetryReport, WriteError> {
+) -> Result<RetryReport, (RetryReport, WriteError)> {
+    let mut report = RetryReport::default();
+    match retry_into(&mut report, writer, ai, handlers, target, clock) {
+        Ok(()) => Ok(report),
+        Err(e) => Err((report, e)),
+    }
+}
+
+/// [`retry`] の本体。種類を 1 つ終えるごとに `report` へ足す（途中で失敗しても済んだ分が残る）。
+fn retry_into(
+    report: &mut RetryReport,
+    writer: &Writer,
+    ai: &AiConfig,
+    handlers: &[Arc<dyn Handler>],
+    target: RetryTarget,
+    clock: &Clock,
+) -> Result<(), WriteError> {
     let kinds: Vec<JobKind> = match target {
         RetryTarget::All => JobKind::ALL.to_vec(),
         RetryTarget::Kind(kind) => vec![kind],
     };
-    let mut report = RetryReport::default();
     for kind in kinds {
         let Some(handler) = handlers.iter().find(|h| h.kind() == kind) else {
             report.unsupported += failed_count(writer, kind)?;
@@ -385,7 +405,7 @@ pub fn retry(
         report.obsolete += done.obsolete;
         report.satisfied += done.satisfied;
     }
-    Ok(report)
+    Ok(())
 }
 
 // ---------------------------------------------------------------- Provider 停止の解除
