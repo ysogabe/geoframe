@@ -1422,6 +1422,41 @@ async fn place_prefs_carry_a_cover_and_a_bbox_and_cities_a_bbox() {
     );
 }
 
+/// 代表の優先順位の試験の追加行（COVER_EXTRA とは別の組だけ。既存の件数・一覧を変えない）。手で数える。
+///   2020 / エ県: 70 除外でない・位置なし（01-01）、71 除外・位置あり（06-01、こちらのほうが新しい）
+///   2019 / オ県: 72 正しい日時・位置あり（03-01）、73 taken_at='x'・位置あり（id が大きい）。どちらも除外でない
+const COVER_ORDER_EXTRA: &str = "
+INSERT INTO photos(id, source, drive_id, path, display, name, md5, mtime, taken_at, lat, lon, loc_source,
+                   place, pref, city, favorite, hidden, rotation) VALUES
+  (70, 'drive', 'drive-o70', NULL, 'derivatives/o70.jpg', 'IMG_O70.jpg', 'md5-o70', 700.0, '2020-01-01 10:00', NULL, NULL, NULL, NULL, 'エ県', 'エ市', 0, 0, 0),
+  (71, 'local', NULL, 'local/o71.jpg', 'derivatives/o71.jpg', 'IMG_O71.jpg', 'md5-o71', 710.0, '2020-06-01 10:00', 32.0, 132.0, 'exif', '架', 'エ県', 'エ市', 0, 1, 0),
+  (72, 'local', NULL, 'local/o72.jpg', 'derivatives/o72.jpg', 'IMG_O72.jpg', 'md5-o72', 720.0, '2019-03-01 10:00', 33.0, 133.0, 'exif', '架', 'オ県', 'オ市', 0, 0, 0),
+  (73, 'local', NULL, 'local/o73.jpg', 'derivatives/o73.jpg', 'IMG_O73.jpg', 'md5-o73', 730.0, 'x', 33.1, 133.1, 'exif', '架', 'オ県', 'オ市', 0, 0, 0);
+";
+
+#[tokio::test]
+async fn cover_prefers_a_visible_unlocated_photo_over_a_hidden_located_one() {
+    let server = Server::start_with(&[], COVER_ORDER_EXTRA).await;
+    // 除外を含めると、除外の 71（位置あり・新しい）より、除外でない 70（位置なし）が代表
+    let places = server.ok("/api/admin/library/places?hidden=1").await;
+    assert_eq!(pref_of(&places, "エ県")["cover"]["id"], 70);
+    let calendar = server.ok("/api/admin/library/calendar?hidden=1").await;
+    assert_eq!(year_of(&calendar, "2020")["cover"]["id"], 70);
+    // 除外を含めなければ 71 は候補に入らず、70 だけが代表の候補
+    let visible = server.ok("/api/admin/library/places").await;
+    assert_eq!(pref_of(&visible, "エ県")["cover"]["id"], 70);
+}
+
+#[tokio::test]
+async fn cover_puts_a_malformed_taken_at_after_a_real_one() {
+    let server = Server::start_with(&[], COVER_ORDER_EXTRA).await;
+    // 73 は id が大きく、'x' は文字の並びで '2019-…' より後ろ（降順で先）だが、日時なし扱いなので 72 が代表
+    let places = server.ok("/api/admin/library/places").await;
+    assert_eq!(pref_of(&places, "オ県")["cover"]["id"], 72);
+    let calendar = server.ok("/api/admin/library/calendar").await;
+    assert_eq!(year_of(&calendar, "2019")["cover"]["id"], 72);
+}
+
 #[tokio::test]
 async fn places_with_a_bbox_count_only_what_is_inside_it() {
     let server = Server::start_with(&[], COVER_EXTRA).await;
