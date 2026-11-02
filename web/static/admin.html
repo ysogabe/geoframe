@@ -118,8 +118,14 @@
       <span class="spacer"></span>
       <span class="count" id="lib-note"></span>
     </div>
-    <div id="lib-trips"></div>
-    <div id="lib-calendar" class="hidden"></div>
+    <!-- 旅・日付: カードは非対話の容器 .lib-card（中に主ボタン button.lib-card-main と、兄弟のボタン）。選ぶと下の #lib-detail に写真 -->
+    <div id="lib-trips">
+      <div class="lib-cards" id="lib-trip-cards"></div>
+    </div>
+    <div id="lib-calendar" class="hidden">
+      <div class="lib-cards" id="lib-year-cards"></div>
+      <div id="lib-months" class="hidden" role="group" aria-label="月"></div>
+    </div>
     <div id="lib-places" class="hidden"></div>
     <div id="lib-map-box" class="hidden">
       <div class="toolbar">
@@ -133,10 +139,9 @@
       </div>
       <div id="lib-map"></div>
     </div>
-    <div id="lib-grid-box" class="hidden">
+    <div id="lib-detail" class="hidden">
       <div class="toolbar">
-        <button class="btn" id="lib-back" type="button">◀ 戻る</button>
-        <span class="lib-sel" id="lib-sel"></span>
+        <h3 class="lib-sel" id="lib-sel"></h3>
         <span class="spacer"></span>
         <button class="btn" id="lib-prev" type="button">◀ PREV</button>
         <span class="count" id="lib-pageinfo">--</span>

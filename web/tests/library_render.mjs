@@ -1,6 +1,6 @@
-// admin.js・photos.js・library.js（この順に同じ context へ読む）のライブラリタブ — 旅の一覧・格子・ビューア・
-// ★の反映・地図（偽の MapLibre）・吹き出し・「この範囲の写真を見る」— を、fakedom.mjs の DOM の代用品と
-// fetch・MapLibre の代用品で動かして確かめる。
+// admin.js・photos.js・library.js（この順に同じ context へ読む）のライブラリタブ — 旅・日付のカード（選ぶと下の詳細に写真の格子）・
+// 年の月のチップ・除外の切り替え・古い応答の捨て方・ビューア・★の反映・場所の行・地図（偽の MapLibre）・吹き出し・
+// 「この範囲の写真を見る」— を、fakedom.mjs の DOM の代用品と fetch・MapLibre の代用品で動かして確かめる。
 // 使い方: node web/tests/library_render.mjs <admin.js のパス> <photos.js のパス> <library.js のパス>
 // fetch は URL ごとの合成 JSON を返すだけで、ネットワークには出ない。座標・地名はすべて架空の値。
 import fs from 'node:fs';
@@ -37,8 +37,9 @@ const TRIP_B = {key: '2029-01-01 00:00', start: '2029-01-01 00:00', end: '2029-0
   places: [], cover: null};
 const tripsBody = () => ({ok: true, trips: [TRIP_A, TRIP_B], untimed: 12});
 const calendarBody = () => ({ok: true, untimed: 5, years: [
-  {year: '2030', count: 30, months: [{month: '05', count: 20}, {month: '12', count: 10}]},
-  {year: '2029', count: 4, months: [{month: '01', count: 4}]}]});
+  {year: '2030', count: 30, cover: {id: 601, thumb_url: '/thumb/601.jpg?v=cccccccccccc'},
+   months: [{month: '05', count: 20}, {month: '12', count: 10}]},
+  {year: '2029', count: 4, cover: null, months: [{month: '01', count: 4}]}]});
 const placesBody = () => ({ok: true, abroad: 9, prefs: [
   {pref: '架空県', count: 50, cities: [{city: '試験市', count: 40}, {city: '見本町', count: 8}, {city: '', count: 2}]},
   {pref: '試験県', count: 3, cities: [{city: 'サンプル市', count: 3}]}]});
@@ -126,7 +127,9 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
 
 const hidden = (env, sel) => env.$(sel).classList.contains('hidden');
 const openLib = async env => { env.$('.tab[data-tab=library]').click(); await settle(); };
-const rows = env => env.$$('#lib-trips .lib-trip');
+const cards = env => env.$$('#lib-trip-cards .lib-card');
+const mainOf = card => card.querySelector('.lib-card-main');
+const pressTrip = (env, i = 0) => mainOf(cards(env)[i]).click();
 const tiles = env => env.$$('#lib-grid .lib-tile');
 const marksOf = tile => tile.querySelectorAll('.lib-mark').map(m => m.textContent);
 const activeTabs = env => env.$$('nav .tab').filter(t => t.classList.contains('on')).map(t => t.dataset.tab);
@@ -150,11 +153,11 @@ await test('library.js を読み込んだだけでは location にも fetch に�
   loadScripts(vm.createContext(sandbox));
   assert.deepEqual(touched, []);
   for(const [text, name] of sources){
-    assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write/.test(text), name);
+    assert.ok(!/innerHTML|outerHTML|insertAdjacentHTML|document\.write|setHTML|srcdoc|createContextualFragment|DOMParser/.test(text), name);
   }
 });
 
-await test('(a) 旅の一覧: 期間・枚数（位置なし）・場所の上位・表紙・日時なしの行が描かれる', async () => {
+await test('(a) 旅のカード: 表紙・期間・枚数（位置なし）・地名のタグ・主ボタン・「地図で見る」・日時なしのカード。カードは非対話の容器で、ボタンを入れ子にしない', async () => {
   const env = makeEnv();
   await env.boot();
   assert.equal(hidden(env, '#v-library'), true, '起動時は状況タブ');
@@ -164,27 +167,44 @@ await test('(a) 旅の一覧: 期間・枚数（位置なし）・場所の上�
   assert.equal(hidden(env, '#v-library'), false);
   assert.equal(env.reqs('/api/admin/library/trips').length, 1);
   assert.equal(env.reqs('/api/admin/library/trips')[0].url, '/api/admin/library/trips', '既定は除外を含めない');
-  const r = rows(env);
-  assert.equal(r.length, 3, '旅 2 つ + 日時なし');
-  assert.equal(r[0].querySelector('.lib-trip-range').textContent, '2030-05-03 09:12 〜 2030-05-05 18:40');
-  assert.equal(r[0].querySelector('.lib-trip-count').textContent, '212 枚（位置なし 7）');
-  assert.deepEqual(r[0].querySelectorAll('.tag').map(t => t.textContent), ['架空県 試験市 150', '海外・不明 40']);
-  const cover = r[0].querySelector('.lib-cover img');
+  const c = cards(env);
+  assert.equal(c.length, 3, '旅 2 つ + 日時なし');
+  assert.ok(c.every(x => x.tagName.toLowerCase() === 'div' && x.classList.contains('lib-card')));
+  assert.equal(c[0].listeners.click, undefined, 'カードの容器は対話しない（click を聞くのは中の主ボタン）');
+  const main = mainOf(c[0]);
+  assert.equal(main.tagName.toLowerCase(), 'button');
+  assert.equal(main.type, 'button');
+  assert.equal(main.getAttribute('aria-pressed'), 'false');
+  same(main.parentNode, c[0]);
+  assert.equal(main.querySelectorAll('button').length, 0, 'ボタンを入れ子にしない');
+  const mapBtn = c[0].querySelector('.lib-card-map');
+  assert.equal(mapBtn.tagName.toLowerCase(), 'button');
+  assert.equal(mapBtn.textContent, '地図で見る');
+  same(mapBtn.parentNode, c[0], '「地図で見る」は主ボタンの兄弟');
+  assert.equal(main.querySelector('.lib-card-name').textContent, '2030-05-03 09:12 〜 2030-05-05 18:40');
+  assert.equal(main.querySelector('.lib-card-count').textContent, '212 枚（位置なし 7）');
+  assert.deepEqual(main.querySelectorAll('.tag').map(t => t.textContent), ['架空県 試験市 150', '海外・不明 40']);
+  const cover = main.querySelector('.lib-cover img');
   assert.equal(cover.src, '/thumb/501.jpg?v=aaaaaaaaaaaa');
   assert.equal(cover.loading, 'lazy');
-  assert.equal(r[1].querySelector('.lib-trip-range').textContent, '2029-01-01 00:00', '1 枚だけの旅は期間を 1 つだけ');
-  assert.equal(r[1].querySelector('.lib-cover .img-broken').textContent, '画像なし', '表紙が無い旅');
-  assert.equal(r[2].querySelector('.lib-trip-range').textContent, '日時なし（12 枚）');
+  assert.equal(mainOf(c[1]).querySelector('.lib-card-name').textContent, '2029-01-01 00:00', '1 枚だけの旅は期間を 1 つだけ');
+  assert.equal(mainOf(c[1]).querySelector('.lib-cover .img-broken').textContent, '画像なし', '表紙が無い旅');
+  assert.equal(mainOf(c[2]).querySelector('.lib-card-name').textContent, '日時なし');
+  assert.equal(mainOf(c[2]).querySelector('.lib-card-count').textContent, '12 枚');
+  assert.equal(c[2].querySelector('.lib-card-map'), null, '日時なしに地図は無い');
   assert.equal(env.$('#lib-note').textContent, '旅 2 件');
   assert.equal(hidden(env, '#lib-trips'), false);
-  assert.equal(hidden(env, '#lib-grid-box'), true);
+  assert.equal(hidden(env, '#lib-detail'), true, '選ぶまで詳細は出さない');
   assert.equal(hidden(env, '#lib-map-box'), true);
+  assert.equal(env.$('#lib-back'), null, '戻るボタンは無い');
+  assert.ok(env.$('#lib-trip-cards').classList.contains('lib-cards'));
+  assert.ok(!env.$('#lib-trip-cards').classList.contains('is-strip'), '選択が無いうちは 1 段にしない');
+  assert.ok(c.every(x => !x.classList.contains('is-selected') && mainOf(x).getAttribute('aria-pressed') === 'false'));
   // 表紙が読めないときも代わりの表示
   cover.dispatchEvent({type: 'error'});
-  assert.equal(r[0].querySelector('.lib-cover img'), null);
-  assert.equal(r[0].querySelector('.lib-cover .img-broken').textContent, '画像なし');
+  assert.equal(main.querySelector('.lib-cover img'), null);
+  assert.equal(main.querySelector('.lib-cover .img-broken').textContent, '画像なし');
 });
-
 await test('(b) 「除外も含める」: 旅は hidden=1 で読み直し、日時なし 0 枚なら行を出さない', async () => {
   const env = makeEnv();
   await env.boot();
@@ -196,7 +216,7 @@ await test('(b) 「除外も含める」: 旅は hidden=1 で読み直し、日�
   await settle();
   assert.equal(env.reqs('/api/admin/library/trips').length, 2);
   assert.equal(env.last('/api/admin/library/trips').get('hidden'), '1');
-  assert.equal(rows(env).length, 1);
+  assert.equal(cards(env).length, 1);
   env.handlers.trips = () => reply({ok: true, trips: [], untimed: 0});
   box.checked = false;
   box.dispatchEvent({type: 'change'});
@@ -205,11 +225,11 @@ await test('(b) 「除外も含める」: 旅は hidden=1 で読み直し、日�
   assert.equal(env.$('#lib-trips').textContent, '写真がありません');
 });
 
-await test('(c) 旅を押すと from/to 付きで写真を読み、サムネイルの格子（印・遅延読み込み・画像なし）が出る。戻るで一覧へ', async () => {
+await test('(c) AC3 旅のカードを押すと、一覧を残したまま #lib-detail に from/to 付きで写真の格子が出る。印・遅延読み込み・画像なしも出る', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  rows(env)[0].querySelector('.lib-trip-photos').click();
+  pressTrip(env, 0);
   await settle();
   const q = env.last('/api/admin/library/photos');
   assert.equal(q.get('from'), '2030-05-03 09:12');
@@ -217,12 +237,18 @@ await test('(c) 旅を押すと from/to 付きで写真を読み、サムネイ�
   assert.equal(q.get('page'), '1');
   assert.equal(q.get('per'), '60');
   assert.equal(q.get('hidden'), null);
-  assert.equal(hidden(env, '#lib-grid-box'), false);
-  assert.equal(hidden(env, '#lib-trips'), true);
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.equal(hidden(env, '#lib-trips'), false, '一覧は残る');
+  assert.equal(cards(env).length, 3);
+  assert.ok(env.$('#lib-trip-cards').classList.contains('is-strip'), '選んでいるあいだは 1 段の横スクロール');
+  assert.ok(cards(env)[0].classList.contains('is-selected'));
+  assert.equal(mainOf(cards(env)[0]).getAttribute('aria-pressed'), 'true');
+  assert.equal(env.$('#lib-back'), null);
   assert.equal(env.$('#lib-sel').textContent, '2030-05-03 09:12 〜 2030-05-05 18:40');
   assert.equal(env.$('#lib-pageinfo').textContent, '3件 / 1 of 1ページ');
   assert.equal(env.$('#lib-prev').disabled, true);
   assert.equal(env.$('#lib-next').disabled, true);
+  assert.deepEqual(plain(cards(env)[0].scrollCalls), [{block: 'nearest', inline: 'nearest'}], '選んだカードを見える所へ');
   const t = tiles(env);
   assert.equal(t.length, 3);
   assert.deepEqual(t.map(x => x.dataset.id), ['501', '502', '503']);
@@ -239,25 +265,125 @@ await test('(c) 旅を押すと from/to 付きで写真を読み、サムネイ�
   img.dispatchEvent({type: 'error'});
   assert.equal(t[0].querySelector('img'), null);
   assert.equal(t[0].querySelector('.img-broken').textContent, '画像なし');
-  // 戻る
-  env.$('#lib-back').click();
-  assert.equal(hidden(env, '#lib-grid-box'), true);
-  assert.equal(hidden(env, '#lib-trips'), false);
-  // 日時なし
-  rows(env)[2].querySelector('.lib-trip-photos').click();
+});
+
+await test('(c1) 別のカードを押すと選択と格子が切り替わる。もう一度押すと選択を外し、詳細を閉じる。日時なしは untimed=1', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const photoReqs = () => env.reqs('/api/admin/library/photos').length;
+  pressTrip(env, 0);
+  await settle();
+  assert.equal(photoReqs(), 1);
+  env.handlers.photos = params => reply({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [params.get('from') === '2029-01-01 00:00' ? P503 : P501]});
+  pressTrip(env, 1);
+  await settle();
+  assert.equal(photoReqs(), 2);
+  const q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('from'), '2029-01-01 00:00');
+  assert.equal(q.get('to'), '2029-01-01 00:00');
+  assert.deepEqual(cards(env).map(x => x.classList.contains('is-selected')), [false, true, false]);
+  assert.deepEqual(cards(env).map(x => mainOf(x).getAttribute('aria-pressed')), ['false', 'true', 'false']);
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['503']);
+  assert.equal(env.$('#lib-sel').textContent, '2029-01-01 00:00');
+  // AC5: 日時なしのカード
+  mainOf(cards(env)[2]).click();
   await settle();
   const u = env.last('/api/admin/library/photos');
   assert.equal(u.get('untimed'), '1');
   assert.equal(u.get('from'), null);
+  assert.equal(u.get('to'), null);
+  assert.equal(env.$('#lib-sel').textContent, '日時なし');
+  assert.deepEqual(cards(env).map(x => x.classList.contains('is-selected')), [false, false, true]);
+  // 選んでいるカードをもう一度押すと外す（読み直さない）
+  const before = photoReqs();
+  mainOf(cards(env)[2]).click();
+  await settle();
+  assert.equal(photoReqs(), before);
+  assert.equal(hidden(env, '#lib-detail'), true);
+  assert.ok(!env.$('#lib-trip-cards').classList.contains('is-strip'), '選択が無ければ元の並びに戻る');
+  assert.ok(cards(env).every(x => !x.classList.contains('is-selected')));
+  assert.equal(env.ev('ls.sel.trips'), null);
 });
 
+await test('(c3) 主ボタンはクリック・Enter・Space のどれでも 1 回だけ読む。「地図で見る」を押しても主の選択は起きない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const photoReqs = () => env.reqs('/api/admin/library/photos').length;
+  assert.equal(photoReqs(), 0);
+  mainOf(cards(env)[0]).click();
+  await settle();
+  assert.equal(photoReqs(), 1, 'クリック');
+  // 本物のブラウザは button の Enter・Space から click を起こす（fakedom も同じ）。keydown でも処理していると二重に読む
+  mainOf(cards(env)[1]).dispatchEvent({type: 'keydown', key: 'Enter'});
+  await settle();
+  assert.equal(photoReqs(), 2, 'Enter');
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2029-01-01 00:00');
+  mainOf(cards(env)[0]).dispatchEvent({type: 'keydown', key: ' '});
+  await settle();
+  assert.equal(photoReqs(), 3, 'Space');
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2030-05-03 09:12');
+  mainOf(cards(env)[1]).dispatchEvent({type: 'keydown', key: 'Tab'});
+  await settle();
+  assert.equal(photoReqs(), 3, 'Tab では読まない');
+  assert.deepEqual(cards(env).map(x => x.classList.contains('is-selected')), [true, false, false]);
+  // 「地図で見る」（バブリングするクリックでも）: 地図の画面へ移るだけで、主の選択は変わらない・写真も読まない
+  const mapBtn = cards(env)[1].querySelector('.lib-card-map');
+  mapBtn.dispatchEvent({type: 'click', bubbles: true});
+  await settle();
+  assert.equal(photoReqs(), 3);
+  assert.equal(env.ev('ls.sel.trips.key'), '2030-05-03 09:12', '旅の選択はそのまま');
+  assert.equal(env.ev('ls.sel.map'), null);
+  assert.equal(env.ev('ls.view'), 'map');
+  assert.equal(env.last('/api/admin/library/points').get('from'), '2029-01-01 00:00');
+});
+
+await test('(c4) AC16a 詳細の応答を待つあいだに別のカードを選ぶと、遅れた応答は捨てる（gen）。view を替えた・除外を切り替えたときも', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const held = {};
+  env.handlers.photos = params => {
+    const key = params.get('from') + (params.get('hidden') ? '#h' : '');
+    if(key === '2030-05-03 09:12') return new Promise(res => { held.A = body => res({ok: true, status: 200, json: () => Promise.resolve(body)}); });
+    return reply({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [key.startsWith('2029') ? P503 : P502]});
+  };
+  const pageOf = body => ({ok: true, page: 1, per: 60, pages: 1, total: body.length, items: body});
+  pressTrip(env, 0);                       // A（応答は保留）
+  await settle();
+  pressTrip(env, 1);                       // B（すぐ応答）
+  await settle();
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['503']);
+  held.A(pageOf([P501, P502]));            // 遅れて A の応答が届く
+  await settle();
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['503'], '遅れた応答は捨てる');
+  assert.equal(env.$('#lib-sel').textContent, '2029-01-01 00:00');
+  assert.deepEqual(cards(env).map(x => x.classList.contains('is-selected')), [false, true, false]);
+  // view を替えると、飛んでいる詳細の応答は捨てる
+  pressTrip(env, 0);                       // A をまた保留
+  await settle();
+  env.$('#lib-view-calendar').click();
+  await settle();
+  held.A(pageOf([P501]));
+  await settle();
+  assert.equal(tiles(env).length, 0, '別の view の詳細に旅の写真を出さない');
+  assert.equal(hidden(env, '#lib-detail'), true);
+  // 戻ると、その view の選択（A）の詳細を読み直す
+  env.handlers.photos = null;
+  env.$('#lib-view-trips').click();
+  await settle();
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['501', '502', '503']);
+  assert.ok(cards(env)[0].classList.contains('is-selected'));
+});
 await test('(c2) 格子のページング: 次へ・前へで page を付けて読み直す。古い応答は捨てる', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
   const pageBody = (page, items) => reply({ok: true, page, per: 60, pages: 3, total: 130, items});
   env.handlers.photos = params => pageBody(Number(params.get('page')), params.get('page') === '2' ? [P502] : GRID);
-  rows(env)[0].querySelector('.lib-trip-photos').click();
+  pressTrip(env, 0);
   await settle();
   assert.equal(env.$('#lib-pageinfo').textContent, '130件 / 1 of 3ページ');
   assert.equal(env.$('#lib-next').disabled, false);
@@ -290,7 +416,7 @@ await test('(d) タイルを押すとビューアが開き、★は setflag に�
   const tabBefore = env.ev('ps.entries.map(e => [e.photo.id, e.photo.favorite, e.photo.hidden])');
   assert.deepEqual(tabBefore, [[1, false, false], [2, false, false]]);
   await openLib(env);
-  rows(env)[0].querySelector('.lib-trip-photos').click();
+  pressTrip(env, 0);
   await settle();
   const t = tiles(env);
   t[1].click();
@@ -338,7 +464,7 @@ await test('(d2) 写真タブなど別の画面での変更も、格子のタイ
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  rows(env)[0].querySelector('.lib-trip-photos').click();
+  pressTrip(env, 0);
   await settle();
   vm.runInContext('applyPhoto(501, {favorite: true, hidden: true})', env.context);
   const t = tiles(env);
@@ -546,35 +672,40 @@ await test('(f2) 点の要求は新しいものだけが吹き出しに出る（
   assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1');
 });
 
-await test('(g) 「この範囲の写真を見る」: 表示範囲を ±180/±90 に丸めた bbox で写真を読み、格子を出す。戻ると地図の大きさを合わせ直す', async () => {
+await test('(g) 「この範囲の写真を見る」: 表示範囲を ±180/±90 に丸めた bbox で写真を読み、地図の下の詳細に出す（地図は残る）', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
   env.$('#lib-view-map').click();
   await settle();
-  const map = mapOf(env);
+  assert.equal(hidden(env, '#lib-detail'), true);
   env.fake.bounds = {w: 100.1234567, s: 10.5, e: 120.25, n: 30.75};
   env.$('#lib-bbox').click();
   await settle();
   let q = env.last('/api/admin/library/photos');
   assert.equal(q.get('bbox'), '100.123457,10.5,120.25,30.75');
   assert.equal(q.get('from'), null);
-  assert.equal(hidden(env, '#lib-grid-box'), false);
-  assert.equal(hidden(env, '#lib-map-box'), true);
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.equal(hidden(env, '#lib-map-box'), false, '地図は残る');
   assert.equal(env.$('#lib-sel').textContent, '地図の範囲');
   assert.equal(tiles(env).length, 3);
-  const resizes = map.calls.resize;
-  env.$('#lib-back').click();
-  assert.equal(hidden(env, '#lib-map-box'), false);
-  assert.ok(map.calls.resize > resizes, '戻ったとき地図の大きさを合わせ直す');
+  assert.deepEqual(plain(env.$('#lib-detail').scrollCalls), [{block: 'nearest', inline: 'nearest'}]);
   // 世界を引いた表示（範囲外の値）は丸める
   env.fake.bounds = {w: -250.5, s: -95, e: 300, n: 91.5};
   env.$('#lib-bbox').click();
   await settle();
   q = env.last('/api/admin/library/photos');
   assert.equal(q.get('bbox'), '-180,-90,180,90');
+  // 別の view へ移ると詳細は隠れ、地図へ戻ると読み直す
+  env.$('#lib-view-trips').click();
+  assert.equal(hidden(env, '#lib-detail'), true);
+  const photoReqs = env.reqs('/api/admin/library/photos').length;
+  env.$('#lib-view-map').click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs + 1);
+  assert.equal(env.last('/api/admin/library/photos').get('bbox'), '-180,-90,180,90');
+  assert.equal(hidden(env, '#lib-detail'), false);
 });
-
 await test('(g2) 地図は周回させない（renderWorldCopies: false・maxBounds）。経度が ±180 を超える表示でも bbox は範囲内で w <= e', async () => {
   const env = makeEnv();
   await env.boot();
@@ -593,14 +724,13 @@ await test('(g2) 地図は周回させない（renderWorldCopies: false・maxBou
   const bbox = env.last('/api/admin/library/photos').get('bbox').split(',').map(Number);
   assert.deepEqual(bbox, [-180, 10, 180, 30], '潰れた範囲は経度の全域にする');
   assert.ok(bbox[0] >= -180 && bbox[2] <= 180 && bbox[0] <= bbox[2]);
-  env.$('#lib-back').click();
   env.fake.bounds = {w: 179, s: 10, e: 210, n: 30};      // 東だけ超える: 範囲内に丸めた w < e
   env.$('#lib-bbox').click();
   await settle();
   assert.equal(env.last('/api/admin/library/photos').get('bbox'), '179,10,180,30');
 });
 
-await test('(m) 範囲の格子を見ている間に「除外も含める」を切り替えても、地図に戻ると点を hidden=1 で読み直す（設定が食い違わない）', async () => {
+await test('(m) 「除外も含める」の切り替え: 地図が見えていれば点も詳細も hidden=1 で読み直し、見えていなければ地図へ移るとき hidden を合わせて読む', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
@@ -614,34 +744,36 @@ await test('(m) 範囲の格子を見ている間に「除外も含める」を�
   env.$('#lib-hidden').checked = true;
   env.$('#lib-hidden').dispatchEvent({type: 'change'});
   await settle();
-  assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1', '格子は読み直す');
-  assert.equal(env.reqs('/api/admin/library/trips').length, trips + 1, '旅の一覧も読み直す');
-  assert.equal(pointReqs().length, 1, '地図が見えていないあいだは点を読まない');
-  env.$('#lib-back').click();
-  await settle();
-  assert.equal(pointReqs().length, 2, '地図に戻ったとき読み直す');
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1', '詳細は読み直す');
+  assert.equal(env.last('/api/admin/library/photos').get('page'), '1');
+  assert.equal(pointReqs().length, 2, '地図が見えているので点も読み直す');
   assert.equal(env.last('/api/admin/library/points').get('hidden'), '1');
-  assert.equal(hidden(env, '#lib-map-box'), false);
-  env.$('#lib-back').click();      // 戻るを重ねても、点を取り直すのは 1 回だけ
-  assert.equal(pointReqs().length, 2);
-  // 旅の一覧の上で切り替えたときも、地図ビューへ移るときに読む（setLibView）。除外を外すと hidden なし
+  assert.equal(env.reqs('/api/admin/library/trips').length, trips, '見えていない旅の一覧は読まない（loaded を落とすだけ）');
+  assert.equal(env.ev('ls.loaded.trips'), false);
+  // 旅の画面へ移ると、落ちていた旅の一覧を hidden=1 で読む
   env.$('#lib-view-trips').click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/trips').length, trips + 1);
+  assert.equal(env.last('/api/admin/library/trips').get('hidden'), '1');
+  // 旅の画面で切り替えると、地図の点は読まず、地図へ移るとき読む（hidden なし）
   env.$('#lib-hidden').checked = false;
   env.$('#lib-hidden').dispatchEvent({type: 'change'});
   await settle();
   assert.equal(pointReqs().length, 2);
+  assert.equal(env.ev('ls.pointsStale'), true);
   env.$('#lib-view-map').click();
   await settle();
   assert.equal(pointReqs().length, 3);
   assert.equal(env.last('/api/admin/library/points').get('hidden'), null);
+  assert.equal(env.ev('ls.pointsStale'), false);
   // 点の応答を待っている間に切り替えたら、古い設定の応答は捨てる
   const held = [];
   env.handlers.points = () => new Promise(res => held.push(() => res({ok: true, status: 200, json: () =>
     Promise.resolve(pointsBody({features: [feature(999, 1, 1)]}))})));
   env.$('#lib-view-trips').click();
   env.$('#lib-view-map').click();           // 点の要求が飛ぶ（まだ応答なし）
-  env.$('#lib-bbox').click();               // 格子へ
   await settle();
+  env.$('#lib-view-trips').click();
   env.$('#lib-hidden').checked = true;
   env.$('#lib-hidden').dispatchEvent({type: 'change'});
   await settle();
@@ -650,12 +782,11 @@ await test('(m) 範囲の格子を見ている間に「除外も含める」を�
   await settle();
   assert.equal(mapOf(env).sources.photos.setDataCalls.length, setData, '古い応答では地図の点を差し替えない');
 });
-
 await test('(n) 写真タブの一覧・検索の応答が遅れて届いても、ライブラリから開いたビューアは閉じない（写真タブのビューアは閉じる）', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  rows(env)[0].querySelector('.lib-trip-photos').click();
+  pressTrip(env, 0);
   await settle();
   // 写真タブの一覧を要求（応答は保留）→ ライブラリのビューアを開く → 応答
   let releaseList;
@@ -707,7 +838,7 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
   assert.ok(rules.some(([sel, body]) => sel === '.hidden' && /display:\s*none/.test(body)));
   // library.js が .hidden を付け外しする要素（id）と、その class
   const html = fs.readFileSync(new URL('../static/admin.html', import.meta.url), 'utf8');
-  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-map-box', 'lib-grid-box', 'lib-period', 'lib-empty', 'viewer-noimage'];
+  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-map-box', 'lib-months', 'lib-detail', 'lib-period', 'lib-empty', 'viewer-noimage'];
   const selectorsOf = id => {
     const tag = html.match(new RegExp('<[^>]*id="' + id + '"[^>]*>'));
     assert.ok(tag, id);
@@ -731,13 +862,14 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
     const isToggled = toggled.some(id => selectorsOf(id).includes(sel));
     if(isToggled) assert.ok(hasPair(sel), sel);
   }
+  // 古い部品は無い
+  assert.ok(!html.includes('lib-back') && !html.includes('lib-grid-box'));
 });
-
 await test('(h) 旅の「地図で見る」: その期間で points を読み、期間を表示し、解除で全期間に戻る。範囲の写真にも期間が付く', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  rows(env)[0].querySelector('.lib-trip-map').click();
+  cards(env)[0].querySelector('.lib-card-map').click();
   await settle();
   assert.equal(hidden(env, '#lib-map-box'), false);
   assert.ok(env.$('#lib-view-map').classList.contains('on'));
@@ -753,7 +885,6 @@ await test('(h) 旅の「地図で見る」: その期間で points を読み、
   assert.equal(g.get('from'), '2030-05-03 09:12');
   assert.equal(g.get('to'), '2030-05-05 18:40');
   assert.equal(env.$('#lib-sel').textContent, '地図の範囲・2030-05-03 09:12 〜 2030-05-05 18:40');
-  env.$('#lib-back').click();
   env.$('#lib-period-clear').click();
   await settle();
   assert.equal(hidden(env, '#lib-period'), true);
@@ -761,7 +892,6 @@ await test('(h) 旅の「地図で見る」: その期間で points を読み、
   assert.equal(p.get('from'), null);
   assert.equal(p.get('to'), null);
 });
-
 await test('(i) 点の応答が遅れて入れ違っても、新しい要求の結果だけが source に渡る', async () => {
   const env = makeEnv();
   await env.boot();
@@ -804,11 +934,11 @@ await test('(j) 地図の style がまだのうちに届いた点は、load の�
   assert.equal(map.sources.photos.setDataCalls.length, 0);
 });
 
-await test('(k) どのタブから離れてもビューアが閉じ、ライブラリへ戻ると旅を読み直して地図の大きさを合わせ直す', async () => {
+await test('(k) どのタブから離れてもビューアが閉じ、ライブラリへ戻ると旅を読み直して地図の大きさを合わせ直す。選択と詳細は残る', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  rows(env)[0].querySelector('.lib-trip-photos').click();
+  pressTrip(env, 0);
   await settle();
   tiles(env)[0].click();
   assert.equal(hidden(env, '#viewer'), false);
@@ -818,8 +948,14 @@ await test('(k) どのタブから離れてもビューアが閉じ、ライブ�
   assert.ok(!env.document.body.classList.contains('ps-viewer-open'));
   assert.equal(env.ev('viewerIndex'), -1);
   assert.equal(hidden(env, '#v-library'), true);
-  // 設定タブへ移るときも
+  // 戻ると、選んでいた旅とその詳細（読み直し）
+  const photoReqs = env.reqs('/api/admin/library/photos').length;
   await openLib(env);
+  assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs + 1);
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.ok(cards(env)[0].classList.contains('is-selected'));
+  assert.equal(tiles(env).length, 3);
+  // 設定タブへ移るときも
   tiles(env)[0].click();
   assert.equal(hidden(env, '#viewer'), false);
   env.$('.tab[data-tab=config]').click();
@@ -827,7 +963,6 @@ await test('(k) どのタブから離れてもビューアが閉じ、ライブ�
   assert.equal(hidden(env, '#viewer'), true);
   // 地図ビューのままタブを往復する
   await openLib(env);
-  env.$('#lib-back').click();
   env.$('#lib-view-map').click();
   await settle();
   const map = mapOf(env);
@@ -844,21 +979,19 @@ await test('(k) どのタブから離れてもビューアが閉じ、ライブ�
   await settle();
   assert.equal(hidden(env, '#viewer'), true);
 });
-
 await test('(l) 旅の読み込み失敗はトーストで知らせ、一覧は前のまま', async () => {
   const env = makeEnv();
   await env.boot();
   env.handlers.trips = () => respond(500, {ok: false, error: 'boom'});
   await openLib(env);
   assert.ok(env.$('#toast').textContent.includes('旅の一覧を読めませんでした: boom'));
-  assert.equal(rows(env).length, 0);
+  assert.equal(cards(env).length, 0);
 });
 
-const groupRows = (env, box) => env.$$('#' + box + ' .lib-grow');
-const rowText = row => [row.querySelector('.lib-gname').textContent, row.querySelector('.lib-gcount').textContent];
-const showBtn = row => row.querySelector('.lib-gphotos');
 
-await test('(p) 日付: 年の行（件数つき）を押すと月の行が開き、年・月のどちらからも from/to 付きで格子が出る。日時なしは untimed=1', async () => {
+const monthChips = env => env.$$('#lib-months .lib-month');
+const yearCards = env => env.$$('#lib-year-cards .lib-card');
+await test('(p) AC4 日付: 年のカード（表紙・年・枚数）と日時なしのカード。年を押すと年の範囲で読み、月のチップ（写真の無い月は押せない）が出る。チップでその月の範囲', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
@@ -872,89 +1005,124 @@ await test('(p) 日付: 年の行（件数つき）を押すと月の行が開�
   assert.equal(hidden(env, '#lib-trips'), true);
   assert.equal(hidden(env, '#lib-places'), true);
   assert.equal(env.$('#lib-note').textContent, '2 年');
-  // 年の行だけ（月は閉じている）。新しい年が先
-  let r = groupRows(env, 'lib-calendar');
-  assert.deepEqual(r.map(rowText), [['2030年', '30 枚'], ['2029年', '4 枚']]);
-  assert.equal(r[0].querySelector('.lib-expand').getAttribute('aria-expanded'), 'false');
-  // 末尾に日時なし
-  assert.equal(env.$('#lib-calendar .lib-untimed .lib-trip-range').textContent, '日時なし（5 枚）');
-  // 年を押すと月の行が開く（件数つき）。ほかの年は閉じたまま
-  r[0].querySelector('.lib-expand').click();
-  r = groupRows(env, 'lib-calendar');
-  assert.deepEqual(r.map(rowText), [['2030年', '30 枚'], ['05月', '20 枚'], ['12月', '10 枚'], ['2029年', '4 枚']]);
-  assert.equal(r[0].querySelector('.lib-expand').getAttribute('aria-expanded'), 'true');
-  assert.equal(r[1].querySelector('.lib-expand'), null, '月の行は開閉しない');
-  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '開いただけでは格子を読まない');
-  // 月の「写真を見る」
-  showBtn(r[2]).click();
+  const c = yearCards(env);
+  assert.equal(c.length, 3, '2 年 + 日時なし');
+  assert.deepEqual(c.map(x => mainOf(x).querySelector('.lib-card-name').textContent), ['2030年', '2029年', '日時なし']);
+  assert.deepEqual(c.map(x => mainOf(x).querySelector('.lib-card-count').textContent), ['30 枚', '4 枚', '5 枚']);
+  assert.equal(mainOf(c[0]).querySelector('.lib-cover img').src, '/thumb/601.jpg?v=cccccccccccc', '年の表紙');
+  assert.equal(mainOf(c[1]).querySelector('.lib-cover .img-broken').textContent, '画像なし', '表紙の無い年');
+  assert.equal(env.$('#lib-year-cards').classList.contains('lib-cards'), true);
+  assert.equal(hidden(env, '#lib-months'), true, '年を選ぶまで月は出さない');
+  assert.equal(hidden(env, '#lib-detail'), true);
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0);
+  // 年のカード → 年の範囲、月のチップ
+  mainOf(c[0]).click();
   await settle();
   let q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('from'), '2030-12-00 00:00');
-  assert.equal(q.get('to'), '2030-12-99 99:99');
-  assert.equal(q.get('pref'), null);
-  assert.equal(hidden(env, '#lib-grid-box'), false);
-  assert.equal(hidden(env, '#lib-calendar'), true);
-  assert.equal(env.$('#lib-sel').textContent, '2030年12月');
+  assert.equal(q.get('from'), '2030-00-00 00:00');
+  assert.equal(q.get('to'), '2030-99-99 99:99');
+  assert.equal(env.$('#lib-sel').textContent, '2030年');
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.equal(hidden(env, '#lib-months'), false);
+  assert.ok(env.$('#lib-year-cards').classList.contains('is-strip'));
+  let chips = monthChips(env);
+  assert.equal(chips.length, 12, '1〜12 月');
+  assert.deepEqual(chips.map(x => x.dataset.key), ['01', '02', '03', '04', '05', '06', '07', '08', '09', '10', '11', '12'].map(m => '2030-' + m));
+  assert.deepEqual(chips.map(x => x.disabled), [true, true, true, true, false, true, true, true, true, true, true, false], '応答に無い月は押せない');
+  assert.equal(chips[4].textContent, '05月20');
+  assert.equal(chips[11].textContent, '12月10');
+  assert.equal(chips[0].textContent, '01月');
   assert.equal(tiles(env).length, 3);
-  // 戻ると日付の一覧（開いた年は開いたまま）
-  env.$('#lib-back').click();
-  assert.equal(hidden(env, '#lib-calendar'), false);
-  assert.equal(hidden(env, '#lib-grid-box'), true);
-  assert.equal(groupRows(env, 'lib-calendar').length, 4);
-  // 年の「写真を見る」
-  showBtn(groupRows(env, 'lib-calendar')[3]).click();
+  // 写真の無い月は押せない
+  const before = env.reqs('/api/admin/library/photos').length;
+  chips[0].click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, before);
+  // 月のチップ → その月の範囲。年のカードも選ばれたまま
+  chips[11].click();
   await settle();
   q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('from'), '2029-00-00 00:00');
-  assert.equal(q.get('to'), '2029-99-99 99:99');
-  assert.equal(env.$('#lib-sel').textContent, '2029年');
-  env.$('#lib-back').click();
-  // 年の行をもう一度押すと閉じる
-  groupRows(env, 'lib-calendar')[0].querySelector('.lib-expand').click();
-  assert.deepEqual(groupRows(env, 'lib-calendar').map(rowText), [['2030年', '30 枚'], ['2029年', '4 枚']]);
-  // 日時なし
-  env.$('#lib-calendar .lib-untimed .lib-trip-photos').click();
+  assert.equal(q.get('from'), '2030-12-00 00:00');
+  assert.equal(q.get('to'), '2030-12-99 99:99');
+  assert.equal(env.$('#lib-sel').textContent, '2030年12月');
+  assert.equal(chips[11].getAttribute('aria-pressed'), 'true');
+  assert.ok(chips[11].classList.contains('is-selected'));
+  assert.equal(chips[4].getAttribute('aria-pressed'), 'false');
+  assert.ok(c[0].classList.contains('is-selected'));
+  assert.equal(mainOf(c[0]).getAttribute('aria-pressed'), 'false', '押された本体は月');
+  same(monthChips(env)[11], chips[11], '選んでもチップは作り直さない（フォーカスを失わない）');
+  // 別の月 → 切り替わる。同じ月をもう一度押すと外れる（年のカードは選ばれたまま消える）
+  chips[4].click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2030-05-00 00:00');
+  assert.equal(chips[11].getAttribute('aria-pressed'), 'false');
+  chips[4].click();
+  assert.equal(hidden(env, '#lib-detail'), true);
+  assert.equal(env.ev('ls.sel.calendar'), null);
+  assert.equal(hidden(env, '#lib-months'), true);
+  // 別の年 → その年の月のチップに替わる
+  mainOf(c[1]).click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2029-00-00 00:00');
+  chips = monthChips(env);
+  assert.equal(chips.length, 12);
+  assert.deepEqual(chips.map(x => x.disabled), [false, ...Array(11).fill(true)]);
+  assert.equal(chips[0].dataset.key, '2029-01');
+  // 年のカードを選んだまま、別の年の月を… は無い。年のカードをもう一度押すと外れ、月も消える
+  mainOf(c[1]).click();
+  assert.equal(hidden(env, '#lib-months'), true);
+  assert.equal(hidden(env, '#lib-detail'), true);
+  // AC5: 日時なし
+  mainOf(c[2]).click();
   await settle();
   q = env.last('/api/admin/library/photos');
   assert.equal(q.get('untimed'), '1');
   assert.equal(q.get('from'), null);
   assert.equal(env.$('#lib-sel').textContent, '日時なし');
-  // 旅へ戻すと、旅の一覧と旅の件数
-  env.$('#lib-back').click();
+  assert.equal(hidden(env, '#lib-months'), true, '日時なしに月は無い');
+  // 旅へ戻すと、旅の一覧と旅の件数。旅の選択は別に持つ（まだ無い）
   env.$('#lib-view-trips').click();
   assert.equal(hidden(env, '#lib-trips'), false);
   assert.equal(hidden(env, '#lib-calendar'), true);
+  assert.equal(hidden(env, '#lib-detail'), true, '旅の選択はまだ無い');
   assert.equal(env.$('#lib-note').textContent, '旅 2 件');
+  // 日付へ戻ると、選んでいた日時なしの詳細を読み直す
+  const photoReqs = env.reqs('/api/admin/library/photos').length;
+  env.$('#lib-view-calendar').click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs + 1);
+  assert.equal(env.last('/api/admin/library/photos').get('untimed'), '1');
+  assert.ok(yearCards(env)[2].classList.contains('is-selected'));
 });
 
-await test('(p2) 日付: 「除外も含める」で読み直し（hidden=1）、写真が無ければ空の表示。読み込み失敗はトースト', async () => {
+await test('(p2) 日付: 暦に無い月（13）も形のとおり並べる。写真が無ければ空の表示。読み込み失敗はトースト', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
+  env.handlers.calendar = () => reply({ok: true, untimed: 0, years: [
+    {year: '2031', count: 3, cover: {id: 7, thumb_url: ''}, months: [{month: '02', count: 1}, {month: '13', count: 2}]}]});
   env.$('#lib-view-calendar').click();
   await settle();
-  const before = env.reqs('/api/admin/library/calendar').length;
-  env.handlers.calendar = () => reply({ok: true, years: [{year: '2031', count: 1, months: [{month: '02', count: 1}]}], untimed: 0});
-  const box = env.$('#lib-hidden');
-  box.checked = true;
-  box.dispatchEvent({type: 'change'});
+  assert.deepEqual(yearCards(env).map(x => mainOf(x).querySelector('.lib-card-name').textContent), ['2031年'], '日時なし 0 枚ならカードを出さない');
+  assert.equal(mainOf(yearCards(env)[0]).querySelector('.lib-cover .img-broken').textContent, '画像なし', 'thumb_url が空なら画像なし');
+  mainOf(yearCards(env)[0]).click();
   await settle();
-  assert.equal(env.reqs('/api/admin/library/calendar').length, before + 1);
-  assert.equal(env.last('/api/admin/library/calendar').get('hidden'), '1');
-  assert.deepEqual(groupRows(env, 'lib-calendar').map(rowText), [['2031年', '1 枚']]);
-  assert.equal(env.$$('#lib-calendar .lib-untimed').length, 0, '日時なし 0 枚なら行を出さない');
-  // 格子を見ているときの切り替えでも、日付の一覧は読み直し、格子には hidden=1 が付く
-  groupRows(env, 'lib-calendar')[0].querySelector('.lib-gphotos').click();
+  const chips = monthChips(env);
+  assert.equal(chips.length, 13);
+  assert.equal(chips[12].dataset.key, '2031-13');
+  assert.equal(chips[12].disabled, false);
+  chips[12].click();
   await settle();
-  assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1');
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2031-13-00 00:00');
+  assert.equal(env.last('/api/admin/library/photos').get('to'), '2031-13-99 99:99');
+  // 応答から年が無くなっても選択は残り、詳細はそのまま（該当が無ければ「該当する写真がありません」）
   env.handlers.calendar = () => reply({ok: true, years: [], untimed: 0});
-  box.checked = false;
-  box.dispatchEvent({type: 'change'});
+  env.$('#lib-view-places').click();
+  env.$('#lib-view-calendar').click();
   await settle();
-  assert.equal(env.last('/api/admin/library/calendar').get('hidden'), null);
-  assert.equal(env.last('/api/admin/library/photos').get('hidden'), null);
-  env.$('#lib-back').click();
-  assert.equal(env.$('#lib-calendar').textContent, '写真がありません');
+  assert.equal(env.$('#lib-year-cards').textContent, '写真がありません');
+  assert.equal(hidden(env, '#lib-months'), true, '年が無ければ月も出さない');
+  assert.notEqual(env.ev('ls.sel.calendar'), null, '選択は残す');
   // 失敗
   env.handlers.calendar = () => respond(500, {ok: false, error: 'boom'});
   env.$('#lib-view-places').click();
@@ -963,7 +1131,73 @@ await test('(p2) 日付: 「除外も含める」で読み直し（hidden=1）�
   assert.ok(env.$('#toast').textContent.includes('日付の一覧を読めませんでした: boom'));
 });
 
-await test('(q) 場所: 都道府県の行を押すと市区町村の行が開き、どちらからも pref（と city）付きで格子が出る。海外・不明は abroad=1', async () => {
+await test('(p3) AC15 除外の切り替え: 見えている一覧・詳細（ページ 1）を hidden=1 で読み直し、見えていない view は loaded を落とすだけ。飛んでいる一覧の応答は捨てる（AC16a）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.handlers.photos = params => reply({ok: true, page: Number(params.get('page')), per: 60, pages: 3, total: 130, items: GRID});
+  pressTrip(env, 0);
+  await settle();
+  env.$('#lib-next').click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('page'), '2');
+  // 切り替え: 出る URL はすべて hidden=1。旅の一覧と詳細（ページ 1）だけ。日付・場所・点は読まない
+  const since = env.calls.length;
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  const libCalls = env.calls.slice(since).filter(c => c.url.startsWith('/api/admin/library/'));
+  assert.deepEqual(libCalls.map(c => c.url.split('?')[0].split('/').pop()).sort(), ['photos', 'trips']);
+  assert.ok(libCalls.every(c => new URLSearchParams(c.url.split('?')[1] || '').get('hidden') === '1'), 'すべて hidden=1');
+  assert.equal(env.last('/api/admin/library/photos').get('page'), '1');
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2030-05-03 09:12', '選択はそのまま');
+  assert.deepEqual(plain(env.ev('ls.loaded')), {trips: true, calendar: false, places: false});
+  // 日付の画面へ移ると、落ちていた一覧を hidden=1 で読む
+  env.$('#lib-view-calendar').click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/calendar').get('hidden'), '1');
+  // 日付の画面で選んでから戻す: 日付の一覧・詳細が hidden なしで読み直される
+  mainOf(yearCards(env)[0]).click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1');
+  env.$('#lib-hidden').checked = false;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(env.last('/api/admin/library/calendar').get('hidden'), null);
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), null);
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2030-00-00 00:00');
+  // 切り替えの前に出した一覧の応答が後から届いても捨てる
+  const held = [];
+  const slow = body => new Promise(res => held.push(() => res({ok: true, status: 200, json: () => Promise.resolve(body)})));
+  env.handlers.calendar = () => slow({ok: true, untimed: 0, years: [{year: '1999', count: 1, cover: null, months: []}]});
+  env.$('#lib-view-places').click();
+  env.$('#lib-view-calendar').click();          // 切り替えの前の一覧（保留）
+  await settle();
+  env.handlers.calendar = () => reply({ok: true, untimed: 0, years: [{year: '2031', count: 1, cover: null, months: []}]});
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.deepEqual(yearCards(env).map(x => mainOf(x).querySelector('.lib-card-name').textContent), ['2031年']);
+  held.forEach(f => f());
+  await settle();
+  assert.deepEqual(yearCards(env).map(x => mainOf(x).querySelector('.lib-card-name').textContent), ['2031年'], '古い一覧の応答は捨てる');
+  // 見えていない view の一覧が飛んでいても、切り替えのあとに loaded を立て直さない
+  env.handlers.places = () => slow({ok: true, prefs: [], abroad: 0});
+  env.$('#lib-view-places').click();
+  await settle();
+  env.$('#lib-view-calendar').click();
+  env.$('#lib-hidden').checked = false;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  held.forEach(f => f());
+  await settle();
+  assert.equal(env.ev('ls.loaded.places'), false);
+  assert.equal(env.ev('ls.prefs.length'), 2, '飛んでいた空の応答で一覧を差し替えない');
+});
+const placeRows = env => env.$$('#lib-places .lib-grow');
+const rowText = row => [row.querySelector('.lib-gname').textContent, row.querySelector('.lib-gcount').textContent];
+const showBtn = row => row.querySelector('.lib-gphotos');
+await test('(q) 場所（今の行の作り）: 都道府県の行を押すと市区町村の行が開き、どちらからも pref（と city）付きで下の詳細に出る。海外・不明は abroad=1', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
@@ -974,16 +1208,17 @@ await test('(q) 場所: 都道府県の行を押すと市区町村の行が開�
   assert.equal(hidden(env, '#lib-places'), false);
   assert.equal(hidden(env, '#lib-calendar'), true);
   assert.equal(env.$('#lib-note').textContent, '2 都道府県');
-  let r = groupRows(env, 'lib-places');
+  let r = placeRows(env);
   assert.deepEqual(r.map(rowText), [['架空県', '50 枚'], ['試験県', '3 枚']]);
-  assert.equal(env.$('#lib-places .lib-untimed .lib-trip-range').textContent, '海外・不明（9 枚）');
+  assert.equal(env.$('#lib-places .lib-summary .lib-summary-text').textContent, '海外・不明（9 枚）');
   // 開く
   r[0].querySelector('.lib-expand').click();
-  r = groupRows(env, 'lib-places');
+  r = placeRows(env);
   assert.deepEqual(r.map(rowText), [['架空県', '50 枚'], ['試験市', '40 枚'], ['見本町', '8 枚'], ['（市区町村なし）', '2 枚'],
                                     ['試験県', '3 枚']]);
   assert.equal(showBtn(r[3]), null, '市区町村が空の項目は city で絞れないので、写真を見るボタンを置かない');
-  // 市区町村 → pref と city
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '開いただけでは読まない');
+  // 市区町村 → pref と city。下の詳細に出て、一覧は残る
   showBtn(r[2]).click();
   await settle();
   let q = env.last('/api/admin/library/photos');
@@ -992,20 +1227,19 @@ await test('(q) 場所: 都道府県の行を押すと市区町村の行が開�
   assert.equal(q.get('from'), null);
   assert.equal(q.get('abroad'), null);
   assert.equal(env.$('#lib-sel').textContent, '架空県 見本町');
-  assert.equal(hidden(env, '#lib-grid-box'), false);
-  assert.equal(tiles(env).length, 3);
-  env.$('#lib-back').click();
+  assert.equal(hidden(env, '#lib-detail'), false);
   assert.equal(hidden(env, '#lib-places'), false);
+  assert.equal(tiles(env).length, 3);
+  assert.deepEqual(placeRows(env).map(x => x.classList.contains('is-selected')), [true, false, true, false, false], '選んだ市区町村と、その県');
   // 都道府県 → pref だけ
-  showBtn(groupRows(env, 'lib-places')[4]).click();
+  showBtn(placeRows(env)[4]).click();
   await settle();
   q = env.last('/api/admin/library/photos');
   assert.equal(q.get('pref'), '試験県');
   assert.equal(q.get('city'), null);
   assert.equal(env.$('#lib-sel').textContent, '試験県');
-  env.$('#lib-back').click();
   // 海外・不明
-  env.$('#lib-places .lib-untimed .lib-trip-photos').click();
+  env.$('#lib-places .lib-summary .lib-summary-show').click();
   await settle();
   q = env.last('/api/admin/library/photos');
   assert.equal(q.get('abroad'), '1');
@@ -1013,7 +1247,8 @@ await test('(q) 場所: 都道府県の行を押すと市区町村の行が開�
   assert.equal(q.get('city'), null);
   assert.equal(q.get('untimed'), null);
   assert.equal(env.$('#lib-sel').textContent, '海外・不明');
-  // 除外を含める → 格子にも場所の一覧にも hidden=1（abroad も付いたまま）
+  assert.ok(env.$('#lib-places .lib-summary').classList.contains('is-selected'));
+  // 除外を含める → 詳細にも場所の一覧にも hidden=1（abroad も付いたまま）
   env.$('#lib-hidden').checked = true;
   env.$('#lib-hidden').dispatchEvent({type: 'change'});
   await settle();
@@ -1021,7 +1256,6 @@ await test('(q) 場所: 都道府県の行を押すと市区町村の行が開�
   assert.equal(q.get('hidden'), '1');
   assert.equal(q.get('abroad'), '1');
   assert.equal(env.last('/api/admin/library/places').get('hidden'), '1');
-  env.$('#lib-back').click();
   // 空・失敗
   env.handlers.places = () => reply({ok: true, prefs: [], abroad: 0});
   env.$('#lib-view-trips').click();
@@ -1034,7 +1268,6 @@ await test('(q) 場所: 都道府県の行を押すと市区町村の行が開�
   await settle();
   assert.ok(env.$('#toast').textContent.includes('場所の一覧を読めませんでした: boom'));
 });
-
 await test('(q2) ライブラリタブを開き直すと、日付・場所のビューのままなら一覧を読み直す', async () => {
   const env = makeEnv();
   await env.boot();
@@ -1048,12 +1281,11 @@ await test('(q2) ライブラリタブを開き直すと、日付・場所のビ
   assert.equal(hidden(env, '#lib-places'), false);
   assert.equal(hidden(env, '#lib-trips'), true);
 });
-
 await test('(r) 格子のタイルの 📍 で位置の指定が開く（ビューアは開かない）。保存すると「位置なし」の印が消える', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
-  rows(env)[0].querySelector('.lib-trip-photos').click();
+  pressTrip(env, 0);
   await settle();
   const t = tiles(env);
   assert.deepEqual(marksOf(t[1]), ['位置なし']);
@@ -1104,7 +1336,7 @@ await test('(s) 共通ビューアの「画像なし」: 格子から開いて�
   await openLib(env);
   const shown = () => ({none: !hidden(env, '#viewer-noimage'), img: !hidden(env, '#viewer-image'),
                         text: env.$('#viewer-noimage').textContent});
-  rows(env)[0].querySelector('.lib-trip-photos').click();
+  pressTrip(env, 0);
   await settle();
   // 格子: 503 は thumb が空
   tiles(env)[2].click();
@@ -1120,7 +1352,6 @@ await test('(s) 共通ビューアの「画像なし」: 格子から開いて�
   assert.deepEqual(shown(), {none: false, img: true, text: '画像なし'});
   env.$('#viewer-close').click();
   // 地図の吹き出しの「開く」: 503 を ids= で引いた 1 枚
-  env.$('#lib-back').click();
   env.$('#lib-view-map').click();
   await settle();
   env.handlers.photos = () => reply({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [P503]});
@@ -1131,7 +1362,7 @@ await test('(s) 共通ビューアの「画像なし」: 格子から開いて�
   assert.deepEqual(shown(), {none: true, img: false, text: '画像なし'});
 });
 
-await test('(t) 位置・除外が変わると地図の点を取り直す: 範囲の格子の上では印だけ立てて戻るとき、地図が見えていればすぐ。★だけなら読まない', async () => {
+await test('(t) 位置・除外が変わると地図の点を取り直す: 地図が見えていればすぐ。見えていない（旅の画面・別のタブ）なら印だけ立てて地図へ戻るとき。★だけなら読まない', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
@@ -1139,39 +1370,44 @@ await test('(t) 位置・除外が変わると地図の点を取り直す: 範�
   await settle();
   const pointReqs = () => env.reqs('/api/admin/library/points');
   assert.equal(pointReqs().length, 1);
-  // 地図 → 範囲の格子 → 位置を変える → 戻る
+  // 地図が見えている間の位置の patch はすぐ取り直す
+  env.context.libPhotoChanged(502, {lat: 35, lon: 139, loc_source: 'manual'});
+  await settle();
+  assert.equal(pointReqs().length, 2);
+  // ★だけの patch では読まない
+  env.context.libPhotoChanged(501, {favorite: true});
+  await settle();
+  assert.equal(pointReqs().length, 2);
+  assert.equal(env.ev('ls.pointsStale'), false);
+  // 地図の下に詳細があっても、地図は見えている
   env.$('#lib-bbox').click();
   await settle();
+  env.context.libPhotoChanged(501, {hidden: true});
+  await settle();
+  assert.equal(pointReqs().length, 3);
+  // 飛んでいた古い点の応答は、取り直したあとで届いても捨てる
   const held = [];
   env.handlers.points = () => new Promise(res => held.push(() => res({ok: true, status: 200, json: () =>
     Promise.resolve(pointsBody({features: [feature(999, 1, 1)]}))})));
-  env.$('#lib-back').click();
-  env.$('#lib-bbox').click();
-  await settle();
+  env.context.libPhotoChanged(501, {lat: 36, lon: 140});
   env.handlers.points = null;
-  const before = pointReqs().length;
-  env.context.libPhotoChanged(502, {lat: 35, lon: 139, loc_source: 'manual'});
-  assert.equal(pointReqs().length, before, '格子の上では読まない');
-  assert.equal(env.ev('ls.pointsStale'), true);
-  env.$('#lib-back').click();
+  env.context.libPhotoChanged(501, {lat: 36.5, lon: 140});
   await settle();
-  assert.equal(pointReqs().length, before + 1, '戻ると点を取り直す');
-  assert.equal(env.ev('ls.pointsStale'), false);
-  // 飛んでいた古い点の応答は捨てる
   const setData = mapOf(env).sources.photos.setDataCalls.length;
   held.forEach(f => f());
   await settle();
   assert.equal(mapOf(env).sources.photos.setDataCalls.length, setData);
-  // ★だけの patch では読まない
-  const n = pointReqs().length;
-  env.context.libPhotoChanged(501, {favorite: true});
+  // 旅の画面にいるときは読まず、地図へ移るとき読む
+  env.$('#lib-view-trips').click();
   await settle();
+  const n = pointReqs().length;
+  env.context.libPhotoChanged(502, {lat: 37, lon: 141});
   assert.equal(pointReqs().length, n);
-  assert.equal(env.ev('ls.pointsStale'), false);
-  // 地図が見えている間の除外の patch はすぐ取り直す
-  env.context.libPhotoChanged(501, {hidden: true});
+  assert.equal(env.ev('ls.pointsStale'), true);
+  env.$('#lib-view-map').click();
   await settle();
   assert.equal(pointReqs().length, n + 1);
+  assert.equal(env.ev('ls.pointsStale'), false);
   // 別のタブ（写真タブ）にいるときは読まず、ライブラリへ戻るとき読む
   env.$('.tab[data-tab=photos]').click();
   await settle();
@@ -1184,4 +1420,32 @@ await test('(t) 位置・除外が変わると地図の点を取り直す: 範�
   assert.equal(env.ev('ls.pointsStale'), false);
 });
 
-console.log(`ok (${n})`);
+await test('(u) 偽の MapLibre: fitBounds(bounds, options, eventData)・easeTo(options, eventData) は eventData を moveend のイベントに載せ、getBounds は差し替えられる', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-map').click();
+  await settle();
+  const map = mapOf(env);
+  const events = [];
+  map.on('moveend', e => events.push(e));
+  map.fitBounds([[130, 30], [140, 40]], {padding: 40, maxZoom: 12}, {libMove: true});
+  map.easeTo({center: [1, 2], zoom: 5}, {from: 'cluster'});
+  map.easeTo({center: [3, 4], zoom: 6});
+  assert.equal(map.moves.length, 3);
+  assert.deepEqual(plain(map.calls.fitBounds), [{bounds: [[130, 30], [140, 40]], options: {padding: 40, maxZoom: 12}, eventData: {libMove: true}}]);
+  assert.deepEqual(plain(map.calls.easeTo.slice(-2)), [{center: [1, 2], zoom: 5}, {center: [3, 4], zoom: 6}], 'easeTo の記録は options だけ');
+  map.endMove();
+  assert.equal(events.at(-1).libMove, true, 'fitBounds の eventData が moveend に載る');
+  assert.deepEqual(plain(env.fake.bounds), {w: 130, s: 30, e: 140, n: 40}, 'fitBounds を終えると表示範囲が移動先になる');
+  map.endMove();
+  assert.equal(events.at(-1).from, 'cluster');
+  assert.equal(events.at(-1).libMove, undefined);
+  map.interrupt();                              // 3 つ目は終えずに捨てる（moveend は起きない）
+  assert.equal(map.moves.length, 0);
+  assert.equal(events.length, 2);
+  env.fake.getBounds = () => ({w: 1, s: 2, e: 3, n: 4});
+  env.$('#lib-bbox').click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('bbox'), '1,2,3,4', 'getBounds の差し替えが効く');
+});

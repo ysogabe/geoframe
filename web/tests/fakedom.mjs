@@ -94,6 +94,7 @@ class FakeElement {
     this.dataset = new Proxy({}, {set(t, k, v){ t[k] = String(v); return true; }});
     this.attributes = {};
     this.listeners = {};
+    hidden(this, 'scrollCalls', []);
     this.classList = new ClassList(this);
     this.disabled = false;
     this.value = '';
@@ -157,6 +158,12 @@ class FakeElement {
     if(!ev.preventDefault) ev.preventDefault = () => { ev.defaultPrevented = true; };
     if(!ev.stopPropagation) ev.stopPropagation = () => { ev.propagationStopped = true; };
     (this.listeners[ev.type] || []).slice().forEach(fn => fn(ev));
+    // 本物のブラウザは、button の上の Enter（keydown）・Space（keyup）から click を起こす。ここでは keydown の Enter・Space から、
+    // preventDefault されていなければ click を 1 回起こす（button 側が keydown でも処理していると二重に動くのを見つけるため）
+    if(ev.type === 'keydown' && this.tag === 'button' && !this.disabled && !ev.defaultPrevented
+       && (ev.key === 'Enter' || ev.key === ' ')){
+      this.dispatchEvent({type: 'click', synthesized: true});
+    }
     // 親へ伝える（バブリング）のは、試験が `bubbles: true` を付けたイベントだけ（既存の試験は子で止まる前提）
     if(ev.bubbles && !ev.propagationStopped && this.parentNode && this.parentNode.nodeType === 1){
       this.parentNode.dispatchEvent(Object.assign(ev, {target: ev.target}));
@@ -170,6 +177,8 @@ class FakeElement {
     return this.dispatchEvent({type: 'click'});
   }
   focus(){ this.ownerDocument.activeElement = this; }
+  // 本物は画面内へスクロールする。ここでは呼ばれた引数を記録するだけ（試験が確かめる）
+  scrollIntoView(options){ this.scrollCalls.push(options === undefined ? null : options); }
   descendants(){
     const out = [];
     const walk = n => n.children.forEach(c => { if(c.nodeType === 1){ out.push(c); walk(c); } });
@@ -295,8 +304,13 @@ export function buildAdminDom(){
   lopt.appendChild(document.createTextNode(' 除外も含める'));
   mk('span', {cls: 'spacer'}, lbar);
   mk('span', {id: 'lib-note', cls: 'count'}, lbar);
-  mk('div', {id: 'lib-trips'}, lib);
-  mk('div', {id: 'lib-calendar', cls: 'hidden'}, lib);
+  const ltrips = mk('div', {id: 'lib-trips'}, lib);
+  mk('div', {id: 'lib-trip-cards', cls: 'lib-cards'}, ltrips);
+  const lcal = mk('div', {id: 'lib-calendar', cls: 'hidden'}, lib);
+  mk('div', {id: 'lib-year-cards', cls: 'lib-cards'}, lcal);
+  const lmonths = mk('div', {id: 'lib-months', cls: 'hidden'}, lcal);
+  lmonths.setAttribute('role', 'group');
+  lmonths.setAttribute('aria-label', '月');
   mk('div', {id: 'lib-places', cls: 'hidden'}, lib);
   const lmapbox = mk('div', {id: 'lib-map-box', cls: 'hidden'}, lib);
   const lmbar = mk('div', {cls: 'toolbar'}, lmapbox);
@@ -307,16 +321,15 @@ export function buildAdminDom(){
   mk('span', {cls: 'spacer'}, lmbar);
   mk('span', {id: 'lib-map-note', cls: 'count'}, lmbar);
   mk('div', {id: 'lib-map'}, lmapbox);
-  const lgrid = mk('div', {id: 'lib-grid-box', cls: 'hidden'}, lib);
-  const lgbar = mk('div', {cls: 'toolbar'}, lgrid);
-  mk('button', {id: 'lib-back', cls: 'btn', text: '◀ 戻る'}, lgbar);
-  mk('span', {id: 'lib-sel', cls: 'lib-sel'}, lgbar);
-  mk('span', {cls: 'spacer'}, lgbar);
-  mk('button', {id: 'lib-prev', cls: 'btn', text: '◀ PREV'}, lgbar);
-  mk('span', {id: 'lib-pageinfo', cls: 'count', text: '--'}, lgbar);
-  mk('button', {id: 'lib-next', cls: 'btn', text: 'NEXT ▶'}, lgbar);
-  mk('div', {id: 'lib-grid'}, lgrid);
-  mk('div', {id: 'lib-empty', cls: 'empty hidden', text: '該当する写真がありません'}, lgrid);
+  const ldetail = mk('div', {id: 'lib-detail', cls: 'hidden'}, lib);
+  const ldbar = mk('div', {cls: 'toolbar'}, ldetail);
+  mk('h3', {id: 'lib-sel', cls: 'lib-sel'}, ldbar);
+  mk('span', {cls: 'spacer'}, ldbar);
+  mk('button', {id: 'lib-prev', cls: 'btn', text: '◀ PREV'}, ldbar);
+  mk('span', {id: 'lib-pageinfo', cls: 'count', text: '--'}, ldbar);
+  mk('button', {id: 'lib-next', cls: 'btn', text: 'NEXT ▶'}, ldbar);
+  mk('div', {id: 'lib-grid'}, ldetail);
+  mk('div', {id: 'lib-empty', cls: 'empty hidden', text: '該当する写真がありません'}, ldetail);
 
   // 選別タブ（admin.html の #v-curation と同じ id）
   const cur = mk('section', {id: 'v-curation', cls: 'hidden'}, main);

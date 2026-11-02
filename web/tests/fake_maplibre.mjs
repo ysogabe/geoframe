@@ -7,7 +7,13 @@
 //   map.sources[id]         {options, data, setDataCalls: [GeoJSON …]}   addSource / setData の記録
 //   map.layers              addLayer に渡した層の配列
 //   map.fire(type, event, layerId?)  登録されたハンドラを呼ぶ（layerId を付けた登録だけが対象）
-//   map.calls               {resize, easeTo: […], flyTo: […]} の記録
+//   map.calls               {resize, easeTo: […], flyTo: […], fitBounds: […]} の記録。easeTo は options だけ、fitBounds は {bounds, options, eventData}
+//   map.moves               まだ終わっていない移動 [{kind, options, eventData, bounds}]（fitBounds・easeTo を呼ぶと積まれる）
+//   map.endMove()           いちばん古い移動を終え、その移動の eventData を載せた moveend を起こす（本物の MapLibre は
+//                           fitBounds(bounds, options, eventData)・easeTo(options, eventData) の eventData を、その移動の
+//                           movestart・move・moveend のイベントに載せる）。fitBounds の移動は終えるとき fake.bounds を移動先にする。
+//                           interrupt() は移動を終えずに捨てる（別の移動に置き換わった／利用者が割り込んだ）。
+//   fake.getBounds          関数を入れると Map.getBounds() がそれを返す（既定は fake.bounds）
 //   fake.popups / fake.markers   作られた Popup（setLngLat・setDOMContent・addTo・remove の記録）/ Marker
 //   fake.features           querySourceFeatures が返すクラスタ（試験が差し替える）
 
@@ -21,7 +27,8 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
       this.sources = {};
       this.layers = [];
       this.controls = [];
-      this.calls = {resize: 0, easeTo: [], flyTo: []};
+      this.calls = {resize: 0, easeTo: [], flyTo: [], fitBounds: []};
+      this.moves = [];
       this.canvas = {style: {}};
       this.loaded = false;
       fake.maps.push(this);
@@ -55,12 +62,28 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
     isSourceLoaded(id){ return !!this.sources[id]; }
     querySourceFeatures(){ return fake.features; }
     getBounds(){
-      const b = fake.bounds;
+      const b = typeof fake.getBounds === 'function' ? fake.getBounds() : fake.bounds;
       return {getWest: () => b.w, getSouth: () => b.s, getEast: () => b.e, getNorth: () => b.n};
     }
     getCanvas(){ return this.canvas; }
     resize(){ this.calls.resize++; }
-    easeTo(o){ this.calls.easeTo.push(o); }
+    easeTo(o, eventData){
+      this.calls.easeTo.push(o);
+      this.moves.push({kind: 'easeTo', options: o, eventData, bounds: null});
+    }
+    // bounds は [[w, s], [e, n]] か [w, s, e, n]
+    fitBounds(bounds, options, eventData){
+      this.calls.fitBounds.push({bounds, options, eventData});
+      const flat = Array.isArray(bounds[0]) ? [bounds[0][0], bounds[0][1], bounds[1][0], bounds[1][1]] : bounds;
+      this.moves.push({kind: 'fitBounds', options, eventData, bounds: {w: flat[0], s: flat[1], e: flat[2], n: flat[3]}});
+    }
+    endMove(){
+      const move = this.moves.shift();
+      if(!move) throw new Error('終える移動が無い');
+      if(move.bounds) fake.bounds = {...move.bounds};
+      this.fire('moveend', Object.assign({}, move.eventData));
+    }
+    interrupt(){ return this.moves.shift(); }
     flyTo(o){ this.calls.flyTo.push(o); }
     jumpTo(){}
   }

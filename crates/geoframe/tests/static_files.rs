@@ -496,6 +496,10 @@ fn the_scripts_never_build_html_from_strings() {
             "outerHTML",
             "insertAdjacentHTML",
             "document.write",
+            "setHTML",
+            "srcdoc",
+            "createContextualFragment",
+            "DOMParser",
         ] {
             assert!(!text.contains(bad), "{path:?} に {bad} がある");
         }

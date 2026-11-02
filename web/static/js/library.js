@@ -1,7 +1,7 @@
 /* ============================================================
    library.js — 管理ページのライブラリタブ（classic script / 依存なし）
-   構成: 1) 状態 2) 画像・タイル 3) 旅の一覧 4) 日付・場所の眺め方 5) 格子（ページ） 6) 地図（MapLibre のクラスタ・吹き出し・範囲）
-        7) 切り替え・初期化
+   構成: 1) 状態 2) 画像・タイル 3) 選択と下の詳細 4) 旅のカード 5) 日付（年のカード・月のチップ）・場所（行）
+        6) 写真の格子（詳細）7) 地図（MapLibre のクラスタ・吹き出し・範囲）8) 切り替え・初期化
    admin.js（$ el toast）と photos.js（normalizePhoto openModalFor onPhotoChange tileStyle）の後に読み込む。
    定義だけを置き、起動は admin.js の boot() が initLibrary() を呼ぶ形（読み込んだだけでは何にも触らない）。
    サーバーは GET /api/admin/library/{trips,photos,points,calendar,places}（crates/geoframe/src/admin_library.rs）。
@@ -10,23 +10,28 @@
 'use strict';
 
 /* ==== 1) 状態 ==== */
-/* view: 'trips'（旅の一覧）| 'map'（地図）| 'calendar'（年 → 月）| 'places'（都道府県 → 市区町村）。
-   grid が true の間は、どれの上にも格子（#lib-grid-box）を出す（戻るで元の view へ）。
-   sel: 格子に出す絞り込み {from, to} | {untimed: true} | {bbox: [w, s, e, n]} | {pref, city?} | {abroad: 1} と、表示用の label。
-   years / prefs: calendar・places の応答。openYears / openPrefs: 開いている年・都道府県。loaded: 読み込み済みの view
+/* view: 'trips'（旅）| 'calendar'（日付）| 'places'（場所）| 'map'（地図。場所との統合は後の段）。
+   sel: view ごとの選択（今の選択は sel[view]。null なら一覧だけ）。選択 S は
+        {kind:'trip', key, from, to} | {kind:'year', year, from, to} | {kind:'month', year, month, from, to} | {kind:'untimed'}
+        | {kind:'pref', pref} | {kind:'city', pref, city} | {kind:'abroad'} | {kind:'bbox', bbox: [w, s, e, n], period}
+   選ぶと一覧を残したまま #lib-detail に S の写真の格子を出す。同じカードをもう一度押すと選択を外す。
+   gen: 選択・view・除外が変わるたびに増やす。読み取りを待つ間にこれが変わった応答は捨てる（seq と二重に守る）。
+   anchor: Shift の範囲の起点（後の段で使う）。
+   years / prefs: calendar・places の応答。openPrefs: 開いている都道府県。loaded: 読み込み済みの一覧
    period: 地図の点と範囲の絞り込みに掛ける期間 {from, to}（旅の「地図で見る」で入り、解除ボタンで外す）。
    pointsStale: 地図が見えていないあいだに設定（除外も含める）が変わったので、地図に戻るとき点を取り直す印。
-   seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が格子の読み込みを捨てないため） */
+   seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が詳細の読み込みを捨てないため） */
 const ls = {
-  view: 'trips', includeHidden: false, grid: false,
+  view: 'trips', includeHidden: false,
   trips: [], untimed: 0,
   years: [], calUntimed: 0, prefs: [], abroad: 0,
-  openYears: new Set(), openPrefs: new Set(),
+  openPrefs: new Set(),
   loaded: {trips: false, calendar: false, places: false},
-  sel: null, period: null, pointsStale: false,
+  sel: {trips: null, calendar: null, places: null, map: null}, gen: 0, anchor: null,
+  period: null, pointsStale: false,
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
   map: null, pendingData: null, labels: new Map(), popup: null,
-  seq: {trips: 0, grid: 0, points: 0, popup: 0, calendar: 0, places: 0},
+  seq: {trips: 0, detail: 0, points: 0, popup: 0, calendar: 0, places: 0, when: 0},
 };
 
 const LIB_POINTS_SOURCE = 'photos';
@@ -107,64 +112,147 @@ function tileFor(photo, index){
   return tile;
 }
 
-/* ==== 3) 旅の一覧 ==== */
+/* ==== 3) 選択と下の詳細 ==== */
 function placeLabel(p){
   const name = [p.pref, p.city].filter(Boolean).join(' ');
   return (name || '海外・不明') + ' ' + p.count;
 }
 function rangeLabel(from, to){ return from === to ? from : from + ' 〜 ' + to; }
-function tripRow(trip){
-  const row = el('div', 'lib-trip');
-  row.dataset.key = trip.key;
-  const cover = el('div', 'lib-cover');
-  putImage(cover, trip.cover ? (trip.cover.thumb_url || '') : '', '');
-  cover.classList.add('lib-clickable');
-  cover.setAttribute('role', 'button');
-  cover.setAttribute('tabindex', '0');
-  cover.setAttribute('aria-label', rangeLabel(trip.start, trip.end) + 'の写真を見る');
-  const show = () => selectTrip(trip);
-  cover.addEventListener('click', show);
-  cover.addEventListener('keydown', e => {
-    if(e.key === 'Enter' || e.key === ' '){ e.preventDefault(); show(); }
-  });
-  row.appendChild(cover);
+/* calendar は形（桁）だけで数えるので、月 13 や 31 日 24 時台のような暦に無い値もその年・月に入る。範囲も 00〜99 で形いっぱいに取る（サーバーは from/to を形だけ見て文字列で比べる） */
+function yearRange(year){ return {from: year + '-00-00 00:00', to: year + '-99-99 99:99'}; }
+function monthRange(year, month){ return {from: year + '-' + month + '-00 00:00', to: year + '-' + month + '-99 99:99'}; }
+function tripSel(trip){ return {kind: 'trip', key: trip.key, from: trip.start, to: trip.end}; }
+function yearSel(year){ return Object.assign({kind: 'year', year}, yearRange(year)); }
+function monthSel(year, month){ return Object.assign({kind: 'month', year, month}, monthRange(year, month)); }
 
-  const body = el('div', 'lib-trip-body');
-  body.appendChild(el('div', 'lib-trip-range', rangeLabel(trip.start, trip.end)));
-  body.appendChild(el('div', 'lib-trip-count',
-    trip.count + ' 枚（位置なし ' + trip.noloc + '）'));
-  const tags = el('div', 'tags');
+/* 選択の見出しと、同じ選択かどうかの印 */
+function selLabel(S){
+  switch(S.kind){
+    case 'trip': return rangeLabel(S.from, S.to);
+    case 'year': return S.year + '年';
+    case 'month': return S.year + '年' + S.month + '月';
+    case 'untimed': return '日時なし';
+    case 'pref': return S.pref;
+    case 'city': return S.pref + ' ' + S.city;
+    case 'abroad': return '海外・不明';
+    case 'bbox': return '地図の範囲' + (S.period ? '・' + rangeLabel(S.period.from, S.period.to) : '');
+    default: return '';
+  }
+}
+function selId(S){
+  switch(S.kind){
+    case 'trip': return 'trip:' + S.key;
+    case 'year': return 'year:' + S.year;
+    case 'month': return 'month:' + S.year + '-' + S.month;
+    case 'bbox': return 'bbox:' + S.bbox.join(',') + (S.period ? '@' + S.period.from + '/' + S.period.to : '');
+    case 'pref': return 'pref:' + S.pref;
+    case 'city': return 'city:' + S.pref + '/' + S.city;
+    default: return S.kind;
+  }
+}
+/* カード・チップ・行の data-key が、選択のどれに当たるか。exact は選んだもの本体、ctx はそれを含む親（月を選んだときの年のカード） */
+function selectedKeys(S){
+  const exact = new Set(), ctx = new Set();
+  if(!S) return {exact, ctx};
+  switch(S.kind){
+    case 'trip': exact.add(S.key); break;
+    case 'year': exact.add(S.year); break;
+    case 'month': exact.add(S.year + '-' + S.month); ctx.add(S.year); break;
+    case 'untimed': exact.add('untimed'); break;
+    case 'pref': exact.add(S.pref); break;
+    case 'city': exact.add(S.pref + '/' + S.city); ctx.add(S.pref); break;
+    case 'abroad': exact.add('abroad'); break;
+    default: break;
+  }
+  return {exact, ctx};
+}
+const LIB_BOXES = {trips: '#lib-trips', calendar: '#lib-calendar', places: '#lib-places'};
+const LIB_CARD_ROWS = {trips: '#lib-trip-cards', calendar: '#lib-year-cards'};
+/* 選択の見た目だけを合わせる（一覧は作り直さない。押したボタンのフォーカスを失わないため） */
+function paintBox(view){
+  const S = ls.sel[view];
+  const keys = selectedKeys(S);
+  $(LIB_BOXES[view]).querySelectorAll('[data-key]').forEach(node => {
+    const key = node.dataset.key;
+    const exact = keys.exact.has(key);
+    node.classList.toggle('is-selected', exact || keys.ctx.has(key));
+    const press = node.classList.contains('lib-card') ? node.querySelector('.lib-card-main')
+      : (node.tagName === 'BUTTON' ? node : null);
+    if(press) press.setAttribute('aria-pressed', exact ? 'true' : 'false');
+  });
+  const row = LIB_CARD_ROWS[view];
+  if(row) $(row).classList.toggle('is-strip', !!S);       // 選んだあいだは 1 段の横スクロール
+}
+function paintSelection(){
+  renderMonths(false);
+  Object.keys(LIB_BOXES).forEach(paintBox);
+}
+/* 選んだカードを見える所へ（1 段の横スクロールの中でも）。場所・地図の画面は詳細へ */
+function scrollSelected(){
+  const S = ls.sel[ls.view];
+  if(!S) return;
+  const row = LIB_CARD_ROWS[ls.view];
+  const node = row ? $(row).querySelector('.lib-card.is-selected') : $('#lib-detail');
+  if(node && node.scrollIntoView) node.scrollIntoView({block: 'nearest', inline: 'nearest'});
+}
+/* 選択を S にして（null なら外して）詳細を読む。古い詳細の応答は gen と seq で捨てる */
+function applySel(S){
+  ls.sel[ls.view] = S;
+  ls.gen++;
+  ls.seq.detail++;
+  ls.page = 1;
+  clearDetail();
+  showLib();
+  scrollSelected();
+  if(S) loadDetail();
+}
+/* カード・チップは aria-pressed のボタン。同じものをもう一度押すと外す */
+function toggleSel(S){
+  const cur = ls.sel[ls.view];
+  applySel(cur && selId(cur) === selId(S) ? null : S);
+}
+
+/* ==== 4) 旅のカード ==== */
+/* カードは非対話の容器。主ボタン（表紙・名前・枚数）が選択を受け、「地図で見る」は兄弟のボタン（ボタンを入れ子にしない）。
+   Enter・Space は button が click を起こすので、click だけを聞く */
+function cardMain(card, onPress){
+  const main = el('button', 'lib-card-main');
+  main.type = 'button';
+  main.setAttribute('aria-pressed', 'false');
+  main.addEventListener('click', onPress);
+  card.appendChild(main);
+  return main;
+}
+function tripCard(trip){
+  const card = el('div', 'lib-card');
+  card.dataset.key = trip.key;
+  const main = cardMain(card, () => toggleSel(tripSel(trip)));
+  const cover = el('span', 'lib-cover');
+  putImage(cover, trip.cover ? (trip.cover.thumb_url || '') : '', '');
+  main.appendChild(cover);
+  const body = el('span', 'lib-card-body');
+  body.appendChild(el('span', 'lib-card-name', rangeLabel(trip.start, trip.end)));
+  body.appendChild(el('span', 'lib-card-count', trip.count + ' 枚（位置なし ' + trip.noloc + '）'));
+  const tags = el('span', 'tags');
   (trip.places || []).forEach(p => tags.appendChild(el('span', 'tag t-subject', placeLabel(p))));
   body.appendChild(tags);
-  const acts = el('div', 'lib-trip-acts');
-  const photos = el('button', 'btn lib-trip-photos', '写真を見る');
-  photos.type = 'button';
-  photos.addEventListener('click', show);
-  const map = el('button', 'btn lib-trip-map', '地図で見る');
+  main.appendChild(body);
+  const map = el('button', 'btn lib-card-map', '地図で見る');
   map.type = 'button';
   map.addEventListener('click', () => mapForTrip(trip));
-  acts.appendChild(photos);
-  acts.appendChild(map);
-  body.appendChild(acts);
-  row.appendChild(body);
-  return row;
+  card.appendChild(map);
+  return card;
 }
-/* 末尾の 1 行（日時なし・海外・不明）。押すと格子 */
-function summaryRow(text, onShow){
-  const row = el('div', 'lib-trip lib-untimed');
-  const body = el('div', 'lib-trip-body');
-  body.appendChild(el('div', 'lib-trip-range', text));
-  const acts = el('div', 'lib-trip-acts');
-  const btn = el('button', 'btn lib-trip-photos', '写真を見る');
-  btn.type = 'button';
-  btn.addEventListener('click', onShow);
-  acts.appendChild(btn);
-  body.appendChild(acts);
-  row.appendChild(body);
-  return row;
-}
-function untimedRow(count){
-  return summaryRow('日時なし（' + count + ' 枚）', () => openGrid({untimed: true, label: '日時なし'}));
+/* 表紙の無いカード（日時なし）。押すと untimed の写真 */
+function textCard(key, name, count){
+  const card = el('div', 'lib-card lib-card-text');
+  card.dataset.key = key;
+  const main = cardMain(card, () => toggleSel({kind: 'untimed'}));
+  const body = el('span', 'lib-card-body');
+  body.appendChild(el('span', 'lib-card-name', name));
+  body.appendChild(el('span', 'lib-card-count', count + ' 枚'));
+  main.appendChild(body);
+  return card;
 }
 /* 上の選択欄の右の件数（view ごと。読み込み前は空） */
 function updateLibNote(){
@@ -175,11 +263,12 @@ function updateLibNote(){
   $('#lib-note').textContent = text;
 }
 function renderTrips(){
-  const box = $('#lib-trips');
+  const box = $('#lib-trip-cards');
   box.textContent = '';
-  ls.trips.forEach(t => box.appendChild(tripRow(t)));
-  if(ls.untimed > 0) box.appendChild(untimedRow(ls.untimed));
+  ls.trips.forEach(t => box.appendChild(tripCard(t)));
+  if(ls.untimed > 0) box.appendChild(textCard('untimed', '日時なし', ls.untimed));
   if(!ls.trips.length && !ls.untimed) box.appendChild(el('div', 'empty', '写真がありません'));
+  paintBox('trips');
   updateLibNote();
 }
 function loadTrips(){
@@ -192,19 +281,74 @@ function loadTrips(){
     renderTrips();
   }).catch(e => { if(seq === ls.seq.trips) toast('旅の一覧を読めませんでした: ' + e.message, true); });
 }
-function selectTrip(trip){
-  openGrid({from: trip.start, to: trip.end, label: rangeLabel(trip.start, trip.end)});
-}
 function mapForTrip(trip){
   ls.period = {from: trip.start, to: trip.end};
-  ls.view = 'map';
-  ls.grid = false;
-  showLib();
-  loadPoints();
+  setLibView('map');
 }
 
-/* ==== 4) 日付・場所の眺め方 ==== */
-/* 年・都道府県の行（押すと下の月・市区町村の行を開閉）と、その下の行。どちらも「写真を見る」で格子 */
+/* ==== 5) 日付（年のカード・月のチップ）・場所（行） ==== */
+function yearCard(y){
+  const card = el('div', 'lib-card');
+  card.dataset.key = y.year;
+  const main = cardMain(card, () => toggleSel(yearSel(y.year)));
+  const cover = el('span', 'lib-cover');
+  putImage(cover, y.cover ? (y.cover.thumb_url || '') : '', '');
+  main.appendChild(cover);
+  const body = el('span', 'lib-card-body');
+  body.appendChild(el('span', 'lib-card-name', y.year + '年'));
+  body.appendChild(el('span', 'lib-card-count', y.count + ' 枚'));
+  main.appendChild(body);
+  return card;
+}
+/* 選んだ年（年・月のどちらを選んでいても）の月のチップ。1〜12 月を並べ、応答に無い月は押せない。
+   選択のたびには作り直さない（rebuild か、年が変わったときだけ）。フォーカスを失わないため */
+function renderMonths(rebuild){
+  const box = $('#lib-months');
+  const S = ls.sel.calendar;
+  const year = S && (S.kind === 'year' || S.kind === 'month') ? S.year : null;
+  const y = year ? ls.years.find(x => x.year === year) : null;
+  box.classList.toggle('hidden', !y);
+  if(!y){ box.textContent = ''; delete box.dataset.year; return; }
+  if(!rebuild && box.dataset.year === year) return;
+  box.dataset.year = year;
+  box.textContent = '';
+  const counts = new Map((y.months || []).map(m => [m.month, m.count]));
+  const names = [];
+  for(let i = 1; i <= 12; i++) names.push(String(i).padStart(2, '0'));
+  counts.forEach((_, m) => { if(!names.includes(m)) names.push(m); });   // 暦に無い月（13 など）も形だけで数えられている
+  names.sort();
+  names.forEach(m => {
+    const chip = el('button', 'chip lib-month', m + '月');
+    chip.type = 'button';
+    chip.dataset.key = year + '-' + m;
+    chip.setAttribute('aria-pressed', 'false');
+    if(counts.has(m)) chip.appendChild(el('span', 'n', String(counts.get(m))));
+    else chip.disabled = true;
+    chip.addEventListener('click', () => toggleSel(monthSel(year, m)));
+    box.appendChild(chip);
+  });
+}
+function renderCalendar(){
+  const box = $('#lib-year-cards');
+  box.textContent = '';
+  ls.years.forEach(y => box.appendChild(yearCard(y)));
+  if(ls.calUntimed > 0) box.appendChild(textCard('untimed', '日時なし', ls.calUntimed));
+  if(!ls.years.length && !ls.calUntimed) box.appendChild(el('div', 'empty', '写真がありません'));
+  renderMonths(true);
+  paintBox('calendar');
+  updateLibNote();
+}
+function loadCalendar(){
+  const seq = ++ls.seq.calendar;
+  libGet('calendar', {hidden: ls.includeHidden}).then(d => {
+    if(seq !== ls.seq.calendar) return;
+    ls.years = d.years || [];
+    ls.calUntimed = d.untimed || 0;
+    ls.loaded.calendar = true;
+    renderCalendar();
+  }).catch(e => { if(seq === ls.seq.calendar) toast('日付の一覧を読めませんでした: ' + e.message, true); });
+}
+/* 場所は今の行の作り（後の段でカードと地図に統合する）。年・都道府県の行（押すと市区町村の行を開閉）と、「写真を見る」 */
 function groupRow(title, count, opts){
   const row = el('div', 'lib-grow' + (opts.sub ? ' lib-sub' : ''));
   row.dataset.key = opts.key;
@@ -228,45 +372,15 @@ function groupRow(title, count, opts){
   }
   return row;
 }
-function toggleIn(set, key, render){
-  if(set.has(key)) set.delete(key); else set.add(key);
-  render();
-}
-/* calendar は形（桁）だけで数えるので、月 13 や 31 日 24 時台のような暦に無い値もその年・月に入る。格子の範囲も 00〜99 で形いっぱいに取る（サーバーは from/to を形だけ見て文字列で比べる） */
-function yearRange(year){ return {from: year + '-00-00 00:00', to: year + '-99-99 99:99'}; }
-function monthRange(year, month){ return {from: year + '-' + month + '-00 00:00', to: year + '-' + month + '-99 99:99'}; }
-function renderCalendar(){
-  const box = $('#lib-calendar');
-  box.textContent = '';
-  ls.years.forEach(y => {
-    const open = ls.openYears.has(y.year);
-    const group = el('div', 'lib-group');
-    group.appendChild(groupRow(y.year + '年', y.count, {
-      key: y.year, expanded: open,
-      onToggle: () => toggleIn(ls.openYears, y.year, renderCalendar),
-      onShow: () => openGrid(Object.assign(yearRange(y.year), {label: y.year + '年'})),
-    }));
-    if(open){
-      (y.months || []).forEach(m => group.appendChild(groupRow(m.month + '月', m.count, {
-        key: y.year + '-' + m.month, sub: true,
-        onShow: () => openGrid(Object.assign(monthRange(y.year, m.month), {label: y.year + '年' + m.month + '月'})),
-      })));
-    }
-    box.appendChild(group);
-  });
-  if(ls.calUntimed > 0) box.appendChild(untimedRow(ls.calUntimed));
-  if(!ls.years.length && !ls.calUntimed) box.appendChild(el('div', 'empty', '写真がありません'));
-  updateLibNote();
-}
-function loadCalendar(){
-  const seq = ++ls.seq.calendar;
-  libGet('calendar', {hidden: ls.includeHidden}).then(d => {
-    if(seq !== ls.seq.calendar) return;
-    ls.years = d.years || [];
-    ls.calUntimed = d.untimed || 0;
-    ls.loaded.calendar = true;
-    renderCalendar();
-  }).catch(e => { if(seq === ls.seq.calendar) toast('日付の一覧を読めませんでした: ' + e.message, true); });
+function summaryRow(key, text, onShow){
+  const row = el('div', 'lib-summary');
+  row.dataset.key = key;
+  row.appendChild(el('span', 'lib-summary-text', text));
+  const btn = el('button', 'btn lib-summary-show', '写真を見る');
+  btn.type = 'button';
+  btn.addEventListener('click', onShow);
+  row.appendChild(btn);
+  return row;
 }
 function renderPlaces(){
   const box = $('#lib-places');
@@ -276,24 +390,25 @@ function renderPlaces(){
     const group = el('div', 'lib-group');
     group.appendChild(groupRow(p.pref, p.count, {
       key: p.pref, expanded: open,
-      onToggle: () => toggleIn(ls.openPrefs, p.pref, renderPlaces),
-      onShow: () => openGrid({pref: p.pref, label: p.pref}),
+      onToggle: () => { if(open) ls.openPrefs.delete(p.pref); else ls.openPrefs.add(p.pref); renderPlaces(); },
+      onShow: () => applySel({kind: 'pref', pref: p.pref}),
     }));
     if(open){
       (p.cities || []).forEach(c => {
         // 市区町村が空の項目は、サーバーが空の city を絞り込みに使えない（空の値は捨てられる）ので、件数だけを出す
         group.appendChild(groupRow(c.city || '（市区町村なし）', c.count, {
           key: p.pref + '/' + c.city, sub: true,
-          onShow: c.city ? () => openGrid({pref: p.pref, city: c.city, label: p.pref + ' ' + c.city}) : null,
+          onShow: c.city ? () => applySel({kind: 'city', pref: p.pref, city: c.city}) : null,
         }));
       });
     }
     box.appendChild(group);
   });
   if(ls.abroad > 0){
-    box.appendChild(summaryRow('海外・不明（' + ls.abroad + ' 枚）', () => openGrid({abroad: 1, label: '海外・不明'})));
+    box.appendChild(summaryRow('abroad', '海外・不明（' + ls.abroad + ' 枚）', () => applySel({kind: 'abroad'})));
   }
   if(!ls.prefs.length && !ls.abroad) box.appendChild(el('div', 'empty', '写真がありません'));
+  paintBox('places');
   updateLibNote();
 }
 function loadPlaces(){
@@ -306,30 +421,27 @@ function loadPlaces(){
     renderPlaces();
   }).catch(e => { if(seq === ls.seq.places) toast('場所の一覧を読めませんでした: ' + e.message, true); });
 }
-/* いまの view に要る一覧を読む（trips は旅のタブを開くとき・設定の変更で別に読む） */
-function loadViewList(){
-  if(ls.view === 'calendar') loadCalendar();
-  else if(ls.view === 'places') loadPlaces();
+/* view の一覧を読む（地図は点を別に読む） */
+function loadLibList(view){
+  if(view === 'trips') loadTrips();
+  else if(view === 'calendar') loadCalendar();
+  else if(view === 'places') loadPlaces();
 }
 
-/* ==== 5) 格子（ページ） ==== */
-function openGrid(sel){
-  ls.sel = sel;
-  ls.page = 1;
-  ls.grid = true;
-  showLib();
-  loadGrid();
-}
-function gridParams(){
-  const s = ls.sel || {};
+/* ==== 6) 詳細（写真の格子・ページ） ==== */
+function detailParams(S){
   const p = {page: ls.page, per: ls.per, hidden: ls.includeHidden};
-  if(s.untimed){ p.untimed = true; }
-  else if(s.abroad){ p.abroad = true; }
-  else if(s.pref){ p.pref = s.pref; if(s.city) p.city = s.city; }
-  else if(s.bbox){
-    p.bbox = s.bbox.join(',');
-    if(ls.period){ p.from = ls.period.from; p.to = ls.period.to; }
-  }else{ p.from = s.from; p.to = s.to; }
+  switch(S.kind){
+    case 'untimed': p.untimed = true; break;
+    case 'abroad': p.abroad = true; break;
+    case 'pref': p.pref = S.pref; break;
+    case 'city': p.pref = S.pref; p.city = S.city; break;
+    case 'bbox':
+      p.bbox = S.bbox.join(',');
+      if(S.period){ p.from = S.period.from; p.to = S.period.to; }
+      break;
+    default: p.from = S.from; p.to = S.to;      // trip・year・month
+  }
   return p;
 }
 function renderGrid(){
@@ -341,16 +453,29 @@ function renderGrid(){
   $('#lib-pageinfo').textContent = ls.total + '件 / ' + ls.page + ' of ' + ls.pages + 'ページ';
   $('#lib-prev').disabled = ls.page <= 1;
   $('#lib-next').disabled = ls.page >= ls.pages;
-  $('#lib-sel').textContent = ls.sel ? ls.sel.label : '';
 }
-function loadGrid(){
-  const seq = ++ls.seq.grid;
-  libGet('photos', gridParams()).then(d => {
-    if(seq !== ls.seq.grid) return;
+/* 選択が変わったとき、前の選択の写真を残さない */
+function clearDetail(){
+  ls.items = [];
+  ls.tiles = [];
+  ls.total = 0;
+  ls.pages = 1;
+  $('#lib-grid').textContent = '';
+  $('#lib-empty').classList.add('hidden');
+  $('#lib-pageinfo').textContent = '--';
+  $('#lib-prev').disabled = true;
+  $('#lib-next').disabled = true;
+}
+function loadDetail(){
+  const S = ls.sel[ls.view];
+  if(!S) return;
+  const seq = ++ls.seq.detail, gen = ls.gen;
+  libGet('photos', detailParams(S)).then(d => {
+    if(seq !== ls.seq.detail || gen !== ls.gen) return;
     ls.page = d.page; ls.pages = d.pages; ls.total = d.total;
     ls.items = (d.items || []).map(libPhoto);
     renderGrid();
-  }).catch(e => { if(seq === ls.seq.grid) toast('写真を読めませんでした: ' + e.message, true); });
+  }).catch(e => { if(seq === ls.seq.detail && gen === ls.gen) toast('写真を読めませんでした: ' + e.message, true); });
 }
 /* ★・除外・位置などの変更（photos.js の applyPhoto から）。渡された配列とは別の object（吹き出しの 1 枚など）で
    変えたときも、自分の格子の同じ写真に同じ値を入れてタイルを描き直す */
@@ -362,14 +487,18 @@ function libPhotoChanged(id, patch){
   });
 
   // 位置・除外が変わると地図の点が変わる（★は点に出ない）。飛んでいる点の応答は捨て、地図が見えていれば取り直し、
-  // 見えていない（旅の一覧・範囲の格子の上、別のタブ）なら印だけ立てて、地図に戻るとき（closeGrid・setLibView・openLibraryTab）に読む
+  // 見えていない（地図以外の view、別のタブ）なら印だけ立てて、地図に戻るとき（setLibView・openLibraryTab）に読む
   if(patch && ('lat' in patch || 'lon' in patch || 'hidden' in patch)){
-    if(ls.view === 'map' && !ls.grid && !$('#v-library').classList.contains('hidden')) loadPoints();
+    if(mapVisible()) loadPoints();
     else{ ls.seq.points++; ls.pointsStale = true; }
   }
 }
+/* 地図が見えているか: 地図の view で、ライブラリのタブが見えている */
+function mapVisible(){
+  return ls.view === 'map' && !$('#v-library').classList.contains('hidden');
+}
 
-/* ==== 6) 地図 ==== */
+/* ==== 7) 地図 ==== */
 const LIB_CLUSTER_COLOR = ['step', ['get', 'point_count'], '#00b8d4', 100, '#ffb300', 1000, '#ff2d95'];
 const LIB_CLUSTER_RADIUS = ['step', ['get', 'point_count'], 14, 100, 19, 1000, 25];
 const EMPTY_POINTS = {type: 'FeatureCollection', features: []};
@@ -510,19 +639,21 @@ function currentBbox(){
 }
 function viewBbox(){
   if(!ls.map) return;
-  const bbox = currentBbox();
-  openGrid({bbox, label: '地図の範囲' + (ls.period ? '・' + rangeLabel(ls.period.from, ls.period.to) : '')});
+  applySel({kind: 'bbox', bbox: currentBbox(), period: ls.period ? {from: ls.period.from, to: ls.period.to} : null});
 }
 
-/* ==== 7) 切り替え・初期化 ==== */
+/* ==== 8) 切り替え・初期化 ==== */
 function showLib(){
-  const trips = ls.view === 'trips', map = ls.view === 'map';
-  const calendar = ls.view === 'calendar', places = ls.view === 'places';
-  $('#lib-trips').classList.toggle('hidden', ls.grid || !trips);
-  $('#lib-calendar').classList.toggle('hidden', ls.grid || !calendar);
-  $('#lib-places').classList.toggle('hidden', ls.grid || !places);
-  $('#lib-map-box').classList.toggle('hidden', ls.grid || !map);
-  $('#lib-grid-box').classList.toggle('hidden', !ls.grid);
+  const view = ls.view;
+  const trips = view === 'trips', map = view === 'map';
+  const calendar = view === 'calendar', places = view === 'places';
+  $('#lib-trips').classList.toggle('hidden', !trips);
+  $('#lib-calendar').classList.toggle('hidden', !calendar);
+  $('#lib-places').classList.toggle('hidden', !places);
+  $('#lib-map-box').classList.toggle('hidden', !map);
+  const S = ls.sel[view];
+  $('#lib-detail').classList.toggle('hidden', !S);
+  $('#lib-sel').textContent = S ? selLabel(S) : '';
   $('#lib-view-trips').classList.toggle('on', trips);
   $('#lib-view-calendar').classList.toggle('on', calendar);
   $('#lib-view-places').classList.toggle('on', places);
@@ -530,42 +661,49 @@ function showLib(){
   updateLibNote();
   $('#lib-period').classList.toggle('hidden', !ls.period);
   $('#lib-period-text').textContent = ls.period ? '期間: ' + rangeLabel(ls.period.from, ls.period.to) : '';
-  if(map && !ls.grid){
+  paintSelection();
+  if(map){
     const m = ensureLibMap();
     if(m) m.resize();           // 隠れているあいだに寸法が変わった（タブ・ビューの切り替え）ので合わせ直す
   }else{
     closePopup();
   }
 }
+/* view を切り替える。view ごとの選択は残り、その view の詳細を読み直す（ページ 1）。飛んでいる詳細の応答は捨てる */
 function setLibView(view){
-  ls.view = view;
-  ls.grid = false;
+  const changed = view !== ls.view;
+  if(changed){
+    ls.view = view;
+    ls.gen++;
+    ls.seq.detail++;
+    ls.page = 1;
+    clearDetail();
+  }
   showLib();
   if(view === 'map') loadPoints();
-  else loadViewList();
+  else if(view !== 'trips' || !ls.loaded.trips) loadLibList(view);
+  if(changed && ls.sel[view]) loadDetail();
 }
-/* ライブラリタブを開いたとき（admin.js の showTab から）。旅は毎回読み直す。地図ビューなら点も */
-function closeGrid(){
-  ls.grid = false;
-  showLib();
-  if(ls.view === 'map' && ls.pointsStale) loadPoints();
-}
+/* ライブラリタブを開いたとき（admin.js の showTab から）。旅は毎回読み直す。選んでいる view の一覧・詳細・地図の点も */
 function openLibraryTab(){
   loadTrips();
-  loadViewList();
+  if(ls.view !== 'trips') loadLibList(ls.view);
   showLib();
-  if(ls.view === 'map' && !ls.grid) loadPoints();
+  if(ls.view === 'map') loadPoints();
+  if(ls.sel[ls.view]){ ls.page = 1; clearDetail(); loadDetail(); }
 }
+/* 除外も含める: すべての種類の飛んでいる応答を捨て、見えている view の一覧・地図の点・詳細を hidden を変えて読み直す（詳細はページ 1）。
+   見えていない view の一覧は loaded を落とすだけ（開くときに読む）。選んでいたものが応答に無くなっても選択は残す */
 function onLibHiddenChange(){
   ls.includeHidden = !!$('#lib-hidden').checked;
-  loadTrips();
-  // 日付・場所は読み込み済みのもの（いま見ている view を含む）を読み直す
-  if(ls.loaded.calendar || ls.view === 'calendar') loadCalendar();
-  if(ls.loaded.places || ls.view === 'places') loadPlaces();
-  if(ls.grid){ ls.page = 1; loadGrid(); }
-  // 地図が見えていれば点を読み直す。見えていない（旅の一覧・格子の上）なら、飛んでいる応答を捨てて印だけ立て、地図に戻るとき読む
-  if(ls.view === 'map' && !ls.grid) loadPoints();
-  else{ ls.seq.points++; ls.pointsStale = true; }
+  ls.gen++;
+  Object.keys(ls.seq).forEach(k => { ls.seq[k]++; });
+  closePopup();
+  Object.keys(ls.loaded).forEach(k => { ls.loaded[k] = false; });
+  loadLibList(ls.view);
+  if(ls.view === 'map') loadPoints();
+  else ls.pointsStale = true;
+  if(ls.sel[ls.view]){ ls.page = 1; loadDetail(); }
 }
 function initLibrary(){
   $('#lib-view-trips').addEventListener('click', () => setLibView('trips'));
@@ -573,9 +711,8 @@ function initLibrary(){
   $('#lib-view-places').addEventListener('click', () => setLibView('places'));
   $('#lib-view-map').addEventListener('click', () => setLibView('map'));
   $('#lib-hidden').addEventListener('change', onLibHiddenChange);
-  $('#lib-back').addEventListener('click', closeGrid);
-  $('#lib-prev').addEventListener('click', () => { if(ls.page > 1){ ls.page--; loadGrid(); } });
-  $('#lib-next').addEventListener('click', () => { if(ls.page < ls.pages){ ls.page++; loadGrid(); } });
+  $('#lib-prev').addEventListener('click', () => { if(ls.page > 1){ ls.page--; loadDetail(); } });
+  $('#lib-next').addEventListener('click', () => { if(ls.page < ls.pages){ ls.page++; loadDetail(); } });
   $('#lib-bbox').addEventListener('click', viewBbox);
   $('#lib-period-clear').addEventListener('click', () => { ls.period = null; showLib(); loadPoints(); });
   onPhotoChange(libPhotoChanged);
