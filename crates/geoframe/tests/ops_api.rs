@@ -91,16 +91,30 @@ impl Server {
 
     /// `ingest: false` なら `ops` を入れない（`INGEST=0` の `serve` と同じ）。writer は付けない。
     async fn start_with(ingest: bool) -> Self {
-        Self::build(ingest, None).await
+        Self::build(ingest, None, None).await
     }
 
     /// 掲示板・writer・AI の表（`ai_jobs`・`ai_provider_pauses`）・AI の操作の部品を持つ `serve`。`handlers` は再試行用。
     async fn start_ai(handlers: Vec<Arc<dyn Handler>>) -> Self {
-        Self::build(true, Some(handlers)).await
+        Self::build(true, Some(handlers), None).await
     }
 
-    async fn build(ingest: bool, ai: Option<Vec<Arc<dyn Handler>>>) -> Self {
+    /// `start_ai` に、通信しない AI 設定（`ai_json`。`GEOFRAME_AI_CONFIG` のファイル）を足す。再試行が種類ごとに使える。
+    async fn start_ai_with_config(handlers: Vec<Arc<dyn Handler>>, ai_json: &str) -> Self {
+        Self::build(true, Some(handlers), Some(ai_json)).await
+    }
+
+    async fn build(ingest: bool, ai: Option<Vec<Arc<dyn Handler>>>, ai_json: Option<&str>) -> Self {
         let dir = TempDir::new("ops-api");
+        let ai_config = ai_json.map(|json| {
+            let path = dir.path().join("ai.json");
+            fs::write(&path, json).unwrap();
+            path.to_str().unwrap().to_owned()
+        });
+        let env: Vec<(&str, &str)> = ai_config
+            .iter()
+            .map(|path| ("GEOFRAME_AI_CONFIG", path.as_str()))
+            .collect();
         let (path, mut db) = build_empty_catalog(dir.path(), "");
         let mut catalog = Catalog::open(&path).unwrap();
         if ai.is_some() {
@@ -113,7 +127,7 @@ impl Server {
         let ai_lock = Arc::new(Mutex::new(()));
         let addr = {
             let (board, mass, lock) = (Arc::clone(&board), Arc::clone(&mass), Arc::clone(&ai_lock));
-            spawn_state(dir.path(), &[], catalog, move |state| {
+            spawn_state(dir.path(), &env, catalog, move |state| {
                 if !ingest {
                     return state;
                 }
@@ -720,6 +734,31 @@ async fn the_common_entrance_checks_apply_to_all_five_posts() {
     assert_eq!(response.status, 200, "{}", response.text());
 }
 
+/// 再検査で SQLite のエラーを返す handler（失敗の文面はパスと表名を含む。応答・履歴へ出てはならない）。
+struct FailingRecheck(JobKind);
+
+impl Handler for FailingRecheck {
+    fn kind(&self) -> JobKind {
+        self.0
+    }
+    fn reconcile(&self, _read: &rusqlite::Connection, _now: i64) -> rusqlite::Result<Vec<JobKey>> {
+        Ok(Vec::new())
+    }
+    fn run(&self, _ctx: &RunCtx<'_>, _job: &Claimed) -> Result<Persist, RunError> {
+        Err(RunError::InputChanged)
+    }
+    fn recheck(&self, _conn: &rusqlite::Connection, _key: &JobKey) -> rusqlite::Result<Recheck> {
+        Err(rusqlite::Error::InvalidParameterName(
+            SECRET_TEXT.to_owned(),
+        ))
+    }
+}
+
+/// 通信しない AI 設定（ローカルの `location_clue` と `photo_judge` だけ。LAN の入口は使われない値）。
+const LOCAL_AI_JSON: &str = r#"{"version":1,"local_base_url":"http://192.0.2.10:8100",
+  "tasks":{"location_clue":{"provider":"local","model":"example-decision"},
+           "photo_judge":{"provider":"local","model":"example-judge","service_id":"judge1"}}}"#;
+
 // ---------------------------------------------------------------- AC5: AI の再試行・停止の解除
 
 const AI_ROUTES: [&str; 2] = ["ai-retry", "ai-release-pause"];
@@ -1113,6 +1152,61 @@ async fn a_failed_write_is_a_fixed_500_and_a_failed_record_without_the_database_
     }
 }
 
+#[tokio::test]
+async fn a_failure_in_a_later_kind_keeps_the_earlier_kinds_commit_and_records_the_partial_counts() {
+    // JobKind の定義順は ImageEmbedding, LocationClue, LocationSuggest, LocationGeocode, PhotoJudge。
+    // 先の location_clue は再検査で Requeue（コミット済み）、後の photo_judge の再検査が SQLite のエラーで失敗する
+    let server = Server::start_ai_with_config(
+        vec![
+            Arc::new(Stub(JobKind::LocationClue)),
+            Arc::new(FailingRecheck(JobKind::PhotoJudge)),
+        ],
+        LOCAL_AI_JSON,
+    )
+    .await;
+    assert_eq!(
+        server.ops().await["ai"],
+        json!({"retry_kinds": ["location_clue", "photo_judge"]})
+    );
+    server.job("location_clue", "a", "failed");
+    server.job("location_clue", "b", "failed");
+    server.job("photo_judge", "c", "failed");
+
+    let response = server.post("ai-retry", &json!({"target": "all"})).await;
+    assert_eq!(response.status, 500, "{}", response.text());
+    assert_eq!(response.json()["ok"], false);
+    for needle in ["secret_photos", "catalog.db", "/srv/", "no such table"] {
+        assert!(!response.text().contains(needle), "{}", response.text());
+    }
+
+    // 先の種類はコミット済み（pending に戻り、カウンタも新しい枠）。後の種類は failed のまま
+    assert_eq!(
+        server.count(
+            "SELECT COUNT(*) FROM ai_jobs WHERE kind='location_clue' AND state='pending'
+                AND attempts=0 AND terminal=0"
+        ),
+        2
+    );
+    assert_eq!(
+        server.count(
+            "SELECT COUNT(*) FROM ai_jobs WHERE kind='photo_judge' AND state='failed'
+                AND attempts=5 AND terminal=1"
+        ),
+        1
+    );
+
+    // 履歴には失敗として 1 件。済んだ種類までの集計（requeued=2）が残り、失敗の文面は出ない
+    let ops = server.ops().await;
+    let history = ops["history"].as_array().unwrap();
+    assert_eq!(history.len(), 1, "{ops}");
+    assert_eq!(history[0]["kind"], "ai_retry");
+    assert_eq!(history[0]["outcome"], "failed");
+    assert_eq!(history[0]["report"]["requeued"], 2, "{ops}");
+    for needle in ["secret_photos", "catalog.db", "/srv/", "no such table"] {
+        assert!(!ops.to_string().contains(needle), "{needle}: {ops}");
+    }
+}
+
 // ================================================================ 子プロセスの serve
 
 /// 取り込みを動かすための環境変数（実効 UID 1000・存在しない Drive の鍵）。
@@ -1403,6 +1497,40 @@ fn the_ai_posts_work_in_a_real_serve_and_land_in_the_history() {
         kinds,
         [("ai_release_pause", "released"), ("ai_retry", "retried")],
         "{ops}"
+    );
+}
+
+/// AC5（配線）: 本物の `serve` に、通信しない AI 設定（ローカルの Decision だけ）を渡すと、`serve` が運用タブの再試行用に
+/// handler を登録する（`with_ai_ops` が抜けると `retry_kinds` が空のままになる）。失敗したジョブは何も作らないので、
+/// 再試行は全て 0 件で通る。
+#[test]
+fn a_real_serve_registers_the_retry_handlers_of_the_configured_local_tasks() {
+    let dir = TempDir::new("ops-serve-ai-handlers");
+    let data = dir.path().join("data");
+    drop(production_shaped_db(&data));
+    let ai = dir.path().join("ai.json");
+    fs::write(
+        &ai,
+        r#"{"version":1,"local_base_url":"http://192.0.2.10:8100",
+            "tasks":{"location_clue":{"provider":"local","model":"example-decision"}}}"#,
+    )
+    .unwrap();
+    let server = Child1::start(
+        dir.path(),
+        &data,
+        &[("GEOFRAME_AI_CONFIG", ai.to_str().unwrap())],
+    );
+    server.wait_first_cycle();
+    assert_eq!(
+        server.get_ops()["ai"],
+        json!({"retry_kinds": ["location_clue"]})
+    );
+
+    let (status, body) = server.post("ai-retry", &json!({"target": {"kind": "location_clue"}}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["report"],
+        json!({"requeued": 0, "obsolete": 0, "satisfied": 0, "unsupported": 0, "policy_disabled": 0})
     );
 }
 
