@@ -479,7 +479,7 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
 
 ## 実装との差（PR ① の完了時に追記。2026-11-02）
 
-実装のレビューで受け入れた、本文の記述と違う点。本文は設計時のまま残し、ここが実装の正。AI の再試行・停止の解除（PR ②）は未実装。
+実装のレビューで受け入れた、本文の記述と違う点。本文は設計時のまま残し、ここが実装の正。AI の再試行・停止の解除（PR ②）の差は下の「PR ② の差」。
 
 - **`Board` の作り方**: `Board::new(stop, clock)`。定期サイクルの間隔は `Board` に持たせず、`spawn_worker` の `poll` 引数から
   `schedule_next_cycle(poll)` として渡す。`GET /api/admin/ops` の `poll_minutes` は `Config::drive_poll()` から作り、割り切れるときは整数
@@ -502,3 +502,41 @@ report: Option<Report>  // enum Report { Retry(RetryReport), Release { released:
   `drive/index.rs` の警告ログ（ID・パスは出さない）と `cli.rs` のヘルプ文を直した。AI 側（`ai-jobs retry`・`release-pause` の
   「サービスを止めてから」）は PR ② で直す。
 - **試験**: 描画試験 `ops_render.mjs` は `cargo test --test admin_ui_ops` 経由で回す。ブラウザでの目視は未実施（本番機のため）。
+
+## 実装との差（PR ② の実装時に追記。2026-11-02）
+
+### T6（サーバー）
+
+- **`release_pause` の書き込み失敗も履歴に残す**: `ReleaseError::Write` は履歴に `outcome: failed`（`report` なし）の記録を残して 500。
+  `ConfigUnavailable`（用途指定で今の設定の識別が分からない）は何も消していない拒否なので、他の 409 と同じく**履歴に残さない**（409 `config_unavailable`）。
+  `ai-retry` は途中の種類で失敗したとき、済んだ種類までの件数を `report` に持つ `failed` の記録を残して 500（定型文）。
+- **判定の順序**（`ai-retry`・`ai-release-pause` とも）: 本文の形（`target` の形・名前。400 `bad_params`）→ 掲示板・writer が無い、または停止の合図のあと
+  （503）→ 別の AI の操作が実行中（409 `busy`）→ 実行。`target` は `"all"` か、キー 1 つだけのオブジェクト（`{"kind"}`・`{"task"}`）で、
+  **余計な鍵が付くと 400**。`busy` の排他は `spawn_blocking` の閉包の中で `try_lock` する（async 側で取ると接続が切れたとき鎖だけが外れるため）。
+- **履歴の `id`**: AI の記録は同期ワーカーを通らない（`Board::record_direct`）。番号は同期系と同じ連番（`next_id`）で、`requested_at` と
+  `started_at` は同じ時刻、段（`stages`）は空、`report` は再試行が 5 つの件数・解除が `released`。履歴の件数（10）と順序は同じ。
+- **`GET /api/admin/ops` の `ai.retry_kinds`**: 再試行用の handlers に登録のある種類を `JobKind` の定義順に返す（起動時に固定）。
+- **試験の仕組み**: `tests/ops_api.rs` の `Server::start_ai_with_config(handlers, ai_json)` が、通信しない AI 設定のファイル（`GEOFRAME_AI_CONFIG`）を
+  足して子プロセスの `serve` を起動する。種類ごとの再試行と、用途指定の解除（設定が要る）はこれで確かめる。
+
+### T7（画面と文書）
+
+- **`/api/admin/status` の併読**: 運用タブを開くたびに `os.status` を捨てて 1 回読み、AI の操作の応答（成功・失敗とも）のあとに履歴の読み直しと
+  あわせてもう 1 回読む。`statusSeq` で古い応答を捨てる。読めなければ 1 回だけ toast し、区画には「AI の状況を読めません」を出す（操作は押せる）。
+  3 秒ごとの周期では読まない。
+- **AI の区画の構成**: 「状況」（失敗の理由別の件数・待機などの件数・設定不正・停止・止まっている用途・一時待機の 1 行ずつ。無ければ「ありません」）、
+  「再試行」（「すべて再試行」は常に出す。`retry_kinds` の種類ごとに「<種類> を再試行」と失敗の件数 = `ai_jobs.by_kind.<種類>.failed`。
+  `retry_kinds` に無い種類で失敗があれば「この版では再検査できない（failed のまま保持）」）、「停止の解除」（「すべて解除」は常に出す。
+  `ai_pauses` の用途ごとに「<用途> の停止を解除」。R7 の案内を常に添える）。AC1 の 5 操作は、保留の解除（保留があるとき）を含めて 5 つ。
+- **排他**: AI の 2 操作は同じ排他なので、画面の `sending` も一方が立てば両方の `disabled` と `click` ハンドラが止まる（`disabled` を外れた `click` も通さない）。
+- **符号の日本語**: AI の 2 操作では `busy`「AI の操作を実行中です」、`config_unavailable`、500 の定型文「内部エラーが発生しました」
+  →「失敗しました（済んだ分は履歴に残ります）」。503 はサーバーの定型文（「書き込みが無効なので更新できません…」。`postJSON` は応答の
+  `error` をそのまま例外の文にする）の先頭で見分けて「取り込みが無効か停止中です」にする（同期系の 503 の表示も同じになる）。
+- **履歴**: AI の記録には段の表を付けず、`report` を「再登録 n・不要 n・済み n・検査不可 n・無効 n」「停止を n 件解除」の 1 行にする。
+- **状況タブの要対応（R9）**: 大量削除の保留（`sync.mass_delete_hold`）・失敗した AI ジョブ（`ai_jobs.by_state.failed` > 0）・AI の停止
+  （`ai_pauses` が空でない）の行は、あるときだけ赤で出し、押すと（Enter・Space も）`showTab('ops')` で運用タブへ移る。行の作りは
+  `makeTodo` に括り出した（位置なし・AI 候補・選別の行も同じ関数を通す）。
+- **`admin_ai_ops_render.mjs`**: 検証の構造は変えず、失敗ジョブ・停止の案内の新しい文言を確かめる検証を足した（元の検証には 191・218 行の文言が含まれていなかった）。
+- **文書**: `deploy/README.md`・`deploy/geoframe-admin.sh`・`docs/rust-migration/ai-config.md`（管理操作の節に運用タブの 2 本の POST の表を追記）を
+  「通常は運用タブから。`serve` が動いていないときは CLI（サービスを止めてから）」に改めた。`ai/ops.rs` のモジュールコメントと `cli.rs` の
+  コメントは T6 で直してある。

@@ -20,8 +20,9 @@
     （GET /api/admin/curation/groups、POST confirm・reset。中身は curation.js が描く）
   - 設定タブは読み取り専用。起動時に読んだ設定の全項目を GET /api/admin/config から、タブを開くたびに読んで表にする
     （案内文・凡例・表の中身は config.js が描く）
-  - 運用タブは稼働中の serve の中で、同期をいま回す・品質解析の一括・Drive の大量削除の保留の解除を行い、定期サイクルと操作の履歴を
-    表示中は 3 秒ごとに読み直して見せる（GET /api/admin/ops、POST /api/admin/ops/*。中身は ops.js が描く）
+  - 運用タブは稼働中の serve の中で、同期をいま回す・品質解析の一括・AI ジョブの再試行・AI の停止の解除・Drive の大量削除の保留の解除を行い、
+    定期サイクルと操作の履歴を表示中は 3 秒ごとに読み直して見せる（GET /api/admin/ops、POST /api/admin/ops/*。AI の件数・理由・停止は
+    GET /api/admin/status を併読する。中身は ops.js が描く）
   ============================================================
 -->
 <link rel="stylesheet" href="/vendor/maplibre-gl-4.7.1.min.css">
@@ -219,6 +220,10 @@
           <span class="op-hint">未解析の写真を最後まで解析して選別の組を作り直す（写真が多いと長くかかり、そのあいだ定期サイクルと他の操作は待つ）</span>
         </div>
       </div>
+    </div>
+    <div class="panel" id="o-ai-panel">
+      <h2>▸ AI — AI ジョブ</h2>
+      <div id="o-ai"></div>
     </div>
     <div class="panel hidden" id="o-hold-panel">
       <h2>▸ HOLD — Driveの大量削除の保留</h2>

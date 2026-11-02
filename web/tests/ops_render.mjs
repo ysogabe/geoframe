@@ -62,8 +62,8 @@ const withWorker = (w, o = {}) => opsBody({worker: {...opsBody().worker, ...w}, 
 function makeEnv(initial = opsBody()){
   const document = buildAdminDom();
   const calls = [];
-  const state = {body: initial};
-  const handlers = {ops: null, sync: null, quality: null, release: null};   // (rec) => Promise | undefined
+  const state = {body: initial, status: statusBody()};
+  const handlers = {ops: null, status: null, sync: null, quality: null, release: null, airetry: null, airelease: null};   // (rec) => Promise | undefined
   const intervals = [];
   const cleared = [];
   const fetchFake = (url, opts = {}) => {
@@ -71,13 +71,17 @@ function makeEnv(initial = opsBody()){
     calls.push(r);
     // 解決済みの応答で読み直しを繰り返すループがあると calls が膨らむ
     if(calls.length > 2000) throw new Error('fetch が 2000 回を超えた（読み直しのループ）: ' + url);
-    if(url === '/api/admin/status') return reply(statusBody());
+    if(url === '/api/admin/status'){
+      const h = handlers.status && handlers.status(r);
+      return h || reply(clone(state.status));
+    }
     if(url === '/api/admin/ops'){
       const h = handlers.ops && handlers.ops(r);
       return h || reply(clone(state.body));
     }
     const post = {'/api/admin/ops/sync': 'sync', '/api/admin/ops/quality-scan': 'quality',
-                  '/api/admin/ops/drive-release': 'release'}[url];
+                  '/api/admin/ops/drive-release': 'release', '/api/admin/ops/ai-retry': 'airetry',
+                  '/api/admin/ops/ai-release-pause': 'airelease'}[url];
     if(post){
       const h = handlers[post] && handlers[post](r);
       return h || reply({ok: true, request: {id: 1, kind: post, state: 'queued'}});
@@ -101,6 +105,7 @@ function makeEnv(initial = opsBody()){
     // 3 秒ごとの読み直し（直近に登録された ops の周期を 1 回進める）
     tick: async () => { const t = intervals.filter(i => i.ms === 3000).at(-1); t.fn(); await settle(); },
     gets: () => calls.filter(c => c.url === '/api/admin/ops' && c.method === 'GET'),
+    statusGets: () => calls.filter(c => c.url === '/api/admin/status'),
     posts: url => calls.filter(c => c.url === url && c.method === 'POST'),
     run: code => vm.runInContext(code, context),
     text: () => $('#v-ops').textContent,
@@ -126,15 +131,16 @@ await test('ops.js を読み込んだだけでは fetch にも location にも�
   for(const bad of ['innerHTML', 'outerHTML', 'insertAdjacentHTML', 'document.write', 'confirm(']) assert.ok(!text.includes(bad), bad);
 });
 
-await test('AC1: 取り込み有効なら操作のボタンが 2 つ（保留が無ければ解除は出ない）、定期サイクルと履歴の区画も出る', async () => {
+await test('AC1: 取り込み有効なら操作のボタンが 4 つ（同期・品質解析・AI のすべて再試行・すべて解除。保留が無ければ保留の解除は出ない）、定期サイクルと履歴の区画も出る', async () => {
   const env = await bootOpen();
   assert.ok(!hidden(env, '#v-ops'));
   assert.ok(hidden(env, '#v-status'));
   assert.ok(hidden(env, '#o-readonly'));
   assert.ok(!hidden(env, '#o-actions'));
   const buttons = env.$$('#v-ops button');
-  assert.deepEqual(buttons.map(b => b.id), ['o-sync', 'o-quality']);
-  assert.deepEqual(buttons.map(b => b.textContent), ['同期をいま回す', '品質解析を一括で回す']);
+  assert.deepEqual(buttons.map(b => b.id), ['o-sync', 'o-quality', 'o-ai-retry-all', 'o-ai-release-all']);
+  assert.deepEqual(buttons.map(b => b.textContent), ['同期をいま回す', '品質解析を一括で回す', 'すべて再試行', 'すべて解除']);
+  assert.ok(!hidden(env, '#o-ai-panel'));
   assert.ok(buttons.every(b => !b.disabled));
   assert.ok(hidden(env, '#o-hold-panel'));
   assert.ok(!hidden(env, '#o-cycle-panel') && !hidden(env, '#o-history-panel'));
@@ -142,10 +148,10 @@ await test('AC1: 取り込み有効なら操作のボタンが 2 つ（保留が
   assert.deepEqual(env.intervals.filter(i => i.ms === 3000).length, 1);
 });
 
-await test('AC1: 保留があれば「解除する…」が 3 つ目のボタンとして出る', async () => {
+await test('AC1: 保留があれば「解除する…」が出る（AI の区画のあと）', async () => {
   const env = await bootOpen(opsBody({hold: HOLD()}));
   assert.ok(!hidden(env, '#o-hold-panel'));
-  assert.deepEqual(env.$$('#v-ops button').map(b => b.id), ['o-sync', 'o-quality', 'o-hold-open']);
+  assert.deepEqual(env.$$('#v-ops button').map(b => b.id), ['o-sync', 'o-quality', 'o-ai-retry-all', 'o-ai-release-all', 'o-hold-open']);
   assert.equal(env.$('#o-hold-open').textContent, '解除する…');
   assert.ok(env.text().includes('120'));
 });
@@ -157,6 +163,8 @@ await test('AC1: ingest:false は案内だけで、ボタンは押せず、保�
   assert.ok(hidden(env, '#o-actions'));
   assert.ok(env.$('#o-sync').disabled && env.$('#o-quality').disabled);
   assert.ok(hidden(env, '#o-hold-panel') && hidden(env, '#o-cycle-panel') && hidden(env, '#o-history-panel'));
+  assert.ok(hidden(env, '#o-ai-panel'), 'AI の区画も隠れる');
+  assert.equal(env.$$('#o-ai button').length, 0);
   env.$('#o-sync').click();
   await settle();
   assert.equal(env.posts('/api/admin/ops/sync').length, 0, 'disabled のボタンは POST を出さない');
@@ -414,7 +422,7 @@ await test('AC4: too_soon・busy・HTTP 503 は日本語で知らせ、too_soon 
 
 await test('AC4: not_releasable の応答で確認が閉じ、一覧が空のための保留（releasable:false）は案内だけでボタンが出ない', async () => {
   const env = await bootOpen(opsBody({hold: HOLD({reason: 'empty_listing', held: 500, releasable: false, token: 'eeeeeeeeeeeeeeee'})}));
-  assert.deepEqual(env.$$('#v-ops button').map(b => b.id), ['o-sync', 'o-quality'], '解除のボタンが無い');
+  assert.deepEqual(env.$$('#v-ops button').map(b => b.id), ['o-sync', 'o-quality', 'o-ai-retry-all', 'o-ai-release-all'], '保留の解除のボタンが無い');
   const t = env.$('#o-hold').textContent;
   assert.ok(t.includes('一覧が空のための保留は、この画面からは解除できません'), t);
   assert.ok(t.includes('serve を止めて CLI（geoframe sync --allow-mass-delete）'), t);
@@ -510,6 +518,253 @@ await test('状況タブの大量削除の注意は「運用タブから解除�
   const t = cell.textContent;
   assert.ok(t.includes('意図した削除なら運用タブから解除（確かめた件数を超える削除はしない。serve が動いていないときは geoframe sync --allow-mass-delete）'), t);
   assert.ok(!t.includes('この画面からは解除できません') && !t.includes('サービスを止めて'), t);
+});
+
+
+// ---- AI の区画（PR ②） ----
+const FAILED_STATUS = () => {
+  const d = statusBody();
+  d.ai_jobs = {total: 9, by_state: {pending: 2, failed: 6, succeeded: 1},
+               by_kind: {image_embedding: {failed: 4}, photo_judge: {failed: 2}, location_clue: {pending: 2, succeeded: 1}},
+               reasons: {failed: {unavailable: 4, rate_limited: 2}}};
+  return d;
+};
+const PAUSED_STATUS = () => {
+  const d = FAILED_STATUS();
+  d.ai_pauses = [{task: 'photo_judge', scope: 'provider', reason: 'unauthorized'},
+                 {task: 'location_clue', scope: 'task', reason: 'model_not_found'}];
+  d.ai_task_blocks = [{task: 'photo_judge', scope: 'provider', reason: 'unauthorized', waiting: 3}];
+  d.ai_waits = {items: [{task: 'image_embedding', scope: 'service', reason: 'not_ready', until: '2030-01-01T10:30:00Z'}], unidentified: 0};
+  return d;
+};
+const aiBody = o => opsBody({ai: {retry_kinds: ['image_embedding', 'location_clue']}, ...o});
+const aiButtons = env => env.$$('#o-ai button');
+const aiButtonIds = env => aiButtons(env).map(b => b.id);
+
+await test('AC1: 5 操作がそろって見える（同期・品質解析・保留の解除・AI の再試行・AI の停止の解除）', async () => {
+  const env = makeEnv(aiBody({hold: HOLD()}));
+  env.state.status = PAUSED_STATUS();
+  await env.boot();
+  await env.open();
+  const labels = env.$$('#v-ops button').map(b => b.textContent);
+  for(const want of ['同期をいま回す', '品質解析を一括で回す', '解除する…', 'すべて再試行', 'image_embedding を再試行',
+                     'location_clue を再試行', 'すべて解除', 'photo_judge の停止を解除', 'location_clue の停止を解除'])
+    assert.ok(labels.includes(want), want + ' が無い: ' + labels.join(' | '));
+  assert.ok(env.$$('#v-ops button').every(b => !b.disabled));
+});
+
+await test('AI の区画: 状況の要点（失敗の理由・停止・止まっている用途・一時待機）を /api/admin/status から出し、開いたときに 1 回だけ読む', async () => {
+  const env = makeEnv(aiBody());
+  env.state.status = PAUSED_STATUS();
+  await env.boot();
+  const before = env.statusGets().length;           // 状況タブの起動時の読み
+  await env.open();
+  assert.equal(env.statusGets().length, before + 1, '運用タブを開いたとき 1 回');
+  const t = env.$('#o-ai').textContent;
+  assert.ok(t.includes('失敗した AI ジョブ 6 件（Provider利用不可 4 件 / 429（待機） 2 件）'), t);
+  assert.ok(t.includes('AI ジョブ: 待機 2 件'), t);
+  assert.ok(t.includes('AI 停止中: photo_judge（Provider全体）: 認証エラー（401）'), t);
+  assert.ok(t.includes('AI 停止中: location_clue（用途）: モデルが無い（404）'), t);
+  assert.ok(t.includes('送信が止まっている用途: photo_judge（認証エラー（401））で 3 件が待ち'), t);
+  assert.ok(t.includes('AI 一時待機: image_embedding（サービス単体）: サービスが未準備 / 期限 2030-01-01 10:30:00 UTC'), t);
+  assert.ok(t.includes('失敗 4 件'), 'image_embedding の失敗の件数が添う');
+  await env.tick();
+  await env.tick();
+  assert.equal(env.statusGets().length, before + 1, '3 秒ごとの読み直しでは status を読まない');
+});
+
+await test('AI の区画: 失敗も停止も無ければ「ありません」の 1 行で、停止ごとの解除ボタンは出ない（すべて解除は出る）', async () => {
+  const env = await bootOpen(aiBody());
+  const t = env.$('#o-ai').textContent;
+  assert.ok(t.includes('失敗・停止・一時待機はありません'), t);
+  assert.deepEqual(aiButtonIds(env), ['o-ai-retry-all', 'o-ai-retry-image_embedding', 'o-ai-retry-location_clue', 'o-ai-release-all']);
+});
+
+await test('AI の区画: retry_kinds に無い種類で失敗があれば「この版では再検査できない（failed のまま保持）」と添え、その種類のボタンは出ない', async () => {
+  const env = makeEnv(aiBody());
+  env.state.status = FAILED_STATUS();                // photo_judge は retry_kinds に無い
+  await env.boot();
+  await env.open();
+  const t = env.$('#o-ai').textContent;
+  assert.ok(t.includes('photo_judge（失敗 2 件）: この版では再検査できない（failed のまま保持）'), t);
+  assert.ok(!t.includes('image_embedding（失敗 4 件）: この版では'), '登録のある種類には付けない');
+  assert.ok(!aiButtonIds(env).includes('o-ai-retry-photo_judge'));
+  assert.ok(env.$('#o-ai').textContent.includes('失敗 4 件'));
+});
+
+await test('再試行: すべて再試行の POST が {target:"all"} で出て、report を toast し、履歴と状況を読み直す。送信中は AI の 2 操作とも押せない', async () => {
+  const env = makeEnv(aiBody());
+  env.state.status = PAUSED_STATUS();
+  await env.boot();
+  await env.open();
+  const d = deferred();
+  env.handlers.airetry = () => d.promise;
+  const opsBefore = env.gets().length;
+  const statusBefore = env.statusGets().length;
+  env.$('#o-ai-retry-all').click();
+  assert.equal(env.posts('/api/admin/ops/ai-retry').length, 1);
+  assert.deepEqual(JSON.parse(env.posts('/api/admin/ops/ai-retry')[0].body), {target: 'all'});
+  assert.ok(aiButtons(env).every(b => b.disabled), '送信中は再試行も停止の解除も全部無効');
+  assert.ok(!env.$('#o-sync').disabled && !env.$('#o-quality').disabled, '同期・品質解析は別の種類なので押せる');
+  env.$('#o-ai-release-all').dispatchEvent({type: 'click'});
+  env.$('#o-ai-retry-all').dispatchEvent({type: 'click'});
+  await settle();
+  assert.equal(env.posts('/api/admin/ops/ai-release-pause').length, 0, '送信中は停止の解除も出ない');
+  assert.equal(env.posts('/api/admin/ops/ai-retry').length, 1, '連打しても 2 本目は出ない');
+  // 応答のあとの読み直しでは、履歴に再試行の記録が増え、状況も新しくなる
+  env.state.body = aiBody({history: [{id: 3, kind: 'ai_retry', requested_at: '2030-01-01 09:20:00', started_at: '2030-01-01 09:20:00',
+    finished_at: '2030-01-01 09:20:01', outcome: 'retried', stages: [],
+    report: {requeued: 4, obsolete: 1, satisfied: 0, unsupported: 1, policy_disabled: 0}}]});
+  env.state.status = statusBody();
+  d.resolve({ok: true, status: 200, json: () => Promise.resolve({ok: true, report: {requeued: 4, obsolete: 1, satisfied: 0, unsupported: 1, policy_disabled: 0}})});
+  await settle();
+  assert.ok(!env.toastErr());
+  assert.ok(env.toastText().includes('再登録 4・不要 1・済み 0・検査不可 1・無効 0'), env.toastText());
+  assert.equal(env.gets().length, opsBefore + 1, '履歴を読み直す');
+  assert.equal(env.statusGets().length, statusBefore + 1, '状況も 1 回読み直す');
+  assert.ok(aiButtons(env).every(b => !b.disabled), '読み直しが済めば外れる');
+  assert.ok(env.$('#o-ai').textContent.includes('失敗・停止・一時待機はありません'), '状況が新しくなった');
+  const h = env.$('#o-history').textContent;
+  assert.ok(h.includes('AI ジョブの再試行 #3') && h.includes('再試行した'), h);
+  assert.ok(h.includes('再登録 4・不要 1・済み 0・検査不可 1・無効 0'), '履歴の 1 行');
+  assert.ok(!env.$('#o-history').textContent.includes('段の記録はありません'), 'AI の記録には段の表を付けない');
+});
+
+await test('再試行: 種類ごとのボタンは {target:{kind}} を送る', async () => {
+  const env = makeEnv(aiBody());
+  env.state.status = FAILED_STATUS();
+  await env.boot();
+  await env.open();
+  env.$('#o-ai-retry-location_clue').click();
+  await settle();
+  assert.deepEqual(JSON.parse(env.posts('/api/admin/ops/ai-retry')[0].body), {target: {kind: 'location_clue'}});
+});
+
+await test('再試行の失敗: busy・500・503 は日本語で toast し、履歴と状況を読み直す', async () => {
+  const env = makeEnv(aiBody());
+  env.state.status = PAUSED_STATUS();
+  await env.boot();
+  await env.open();
+  const cases = [
+    [409, 'busy', 'AI の操作を実行中です'],
+    [500, '内部エラーが発生しました', '失敗しました（済んだ分は履歴に残ります）'],
+    [503, '書き込みが無効なので更新できません（この Rust 版は取り込みが無効です）', '取り込みが無効か停止中です'],
+    [400, 'bad_params', '要求の形が正しくありません'],
+  ];
+  for(const [status, error, want] of cases){
+    env.handlers.airetry = () => respond(status, {ok: false, error});
+    const opsBefore = env.gets().length;
+    const statusBefore = env.statusGets().length;
+    env.$('#o-ai-retry-all').click();
+    await settle();
+    assert.ok(env.toastErr() && env.toastText() === want, error + ' → ' + env.toastText());
+    assert.equal(env.gets().length, opsBefore + 1, '失敗でも履歴を読み直す（部分成功は履歴に残る）');
+    assert.equal(env.statusGets().length, statusBefore + 1);
+    assert.ok(!env.$('#o-ai-retry-all').disabled, '失敗のあとはまた押せる');
+  }
+});
+
+await test('停止の解除: 用途ごとのボタンは {target:{task}}、すべて解除は {target:"all"} を送り、released を toast する。R7 の案内が横にある', async () => {
+  const env = makeEnv(aiBody());
+  env.state.status = PAUSED_STATUS();
+  await env.boot();
+  await env.open();
+  const note = env.$('#o-ai-release-note').textContent;
+  for(const want of ['解除すると、認証が直っていれば背景ワーカーが次に取り出すときからクラウドへ送り直す（料金がかかる。日の上限はそのまま効く）',
+                     '設定ファイルを直した場合は再起動するまで新しい設定にならず、直っていなければ同じ理由で再び止まる',
+                     '一時待機（ai_waits）と各ジョブの再試行の予定時刻は残るので、その期限までは送らない'])
+    assert.ok(note.includes(want), want);
+  env.handlers.airelease = () => reply({ok: true, released: 1});
+  env.$('#o-ai-release-photo_judge').click();
+  await settle();
+  assert.deepEqual(JSON.parse(env.posts('/api/admin/ops/ai-release-pause')[0].body), {target: {task: 'photo_judge'}});
+  assert.ok(env.toastText().includes('停止を 1 件解除しました') && !env.toastErr(), env.toastText());
+  env.handlers.airelease = () => reply({ok: true, released: 2});
+  env.$('#o-ai-release-all').click();
+  await settle();
+  assert.deepEqual(JSON.parse(env.posts('/api/admin/ops/ai-release-pause')[1].body), {target: 'all'});
+  assert.ok(env.toastText().includes('停止を 2 件解除しました'), env.toastText());
+});
+
+await test('停止の解除: 送信中は再試行も押せない。config_unavailable は用途指定の解除ができない旨を出す', async () => {
+  const env = makeEnv(aiBody());
+  env.state.status = PAUSED_STATUS();
+  await env.boot();
+  await env.open();
+  const d = deferred();
+  env.handlers.airelease = () => d.promise;
+  env.$('#o-ai-release-location_clue').click();
+  assert.ok(aiButtons(env).every(b => b.disabled));
+  env.$('#o-ai-retry-all').dispatchEvent({type: 'click'});
+  await settle();
+  assert.equal(env.posts('/api/admin/ops/ai-retry').length, 0);
+  d.resolve({ok: false, status: 409, json: () => Promise.resolve({ok: false, error: 'config_unavailable'})});
+  await settle();
+  assert.ok(env.toastErr() && env.toastText() === 'AI 設定が無いので用途を指定した解除はできません（すべて解除は可能）', env.toastText());
+  assert.ok(aiButtons(env).every(b => !b.disabled));
+  env.handlers.airelease = () => respond(409, {ok: false, error: 'busy'});
+  env.$('#o-ai-release-all').click();
+  await settle();
+  assert.equal(env.toastText(), 'AI の操作を実行中です');
+  // 履歴には停止の解除の記録が日本語で出る（report は released の件数）
+  env.state.body = aiBody({history: [{id: 4, kind: 'ai_release_pause', requested_at: 't', started_at: 't', finished_at: 't',
+    outcome: 'released', stages: [], report: {released: 2}}]});
+  await env.tick();
+  const h = env.$('#o-history').textContent;
+  assert.ok(h.includes('AI の停止の解除 #4') && h.includes('停止を解除した') && h.includes('停止を 2 件解除'), h);
+});
+
+await test('AI の状況: 古い応答は捨てる（先に出した読みが後から返っても上書きしない）。読めなければ 1 回だけ知らせる', async () => {
+  const env = makeEnv(aiBody());
+  env.state.status = statusBody();
+  await env.boot();
+  const slow = deferred();
+  let first = true;
+  env.handlers.status = () => { if(first){ first = false; return slow.promise; } return undefined; };
+  await env.open();                                    // 1 本目（遅い）
+  env.state.status = PAUSED_STATUS();
+  env.$('#o-ai-release-all').click();                  // 解除のあとの読み直しが 2 本目（すぐ返る）
+  await settle();
+  assert.ok(env.$('#o-ai').textContent.includes('AI 停止中: photo_judge'));
+  slow.resolve({ok: true, status: 200, json: () => Promise.resolve(statusBody())});
+  await settle();
+  assert.ok(env.$('#o-ai').textContent.includes('AI 停止中: photo_judge'), '古い応答は捨てる');
+  // 読めないとき
+  const env2 = makeEnv(aiBody());
+  env2.handlers.status = () => respond(500, {ok: false, error: 'boom'});
+  await env2.boot();
+  await env2.open();
+  assert.ok(env2.toastErr() && env2.toastText().includes('AI の状況を読めません'), env2.toastText());
+  assert.ok(env2.$('#o-ai').textContent.includes('AI の状況を読めません'));
+  assert.ok(!env2.$('#o-ai-retry-all').disabled, '状況が読めなくても操作はできる');
+});
+
+await test('状況タブの要対応: 大量削除の保留・失敗した AI ジョブ・AI の停止の行が出て、押すと運用タブへ移る（無ければ出ない）', async () => {
+  const env = makeEnv();
+  env.state.status = PAUSED_STATUS();
+  env.state.status.sync.mass_delete_hold = {held: 120, reason: 'ratio', drive_rows: 500, since: 's', checked_at: 'c'};
+  await env.boot();
+  const rows = env.$('#s-todo').children.filter(c => c.classList.contains('todo'));
+  const texts = rows.map(c => c.textContent);
+  assert.ok(texts.some(t => t.includes('Driveの削除の保留') && t.includes('120')), texts.join(' | '));
+  assert.ok(texts.some(t => t.includes('失敗したAIジョブ') && t.includes('6')), texts.join(' | '));
+  assert.ok(texts.some(t => t.includes('AIの停止') && t.includes('2')), texts.join(' | '));
+  const row = rows.find(c => c.textContent.includes('失敗したAIジョブ'));
+  assert.ok(row.classList.contains('bad') && row.getAttribute('role') === 'button' && row.getAttribute('tabindex') === '0');
+  row.click();
+  await settle();
+  assert.ok(!hidden(env, '#v-ops') && hidden(env, '#v-status'));
+  assert.ok(env.statusGets().length >= 2, '運用タブに入ると AI の状況を読む');
+  // キーボード（Enter）でも移れる
+  await env.leave();
+  env.$('#s-todo').children.find(c => c.textContent.includes('AIの停止')).dispatchEvent({type: 'keydown', key: 'Enter', preventDefault(){}});
+  await settle();
+  assert.ok(!hidden(env, '#v-ops'));
+  // 何も無ければ 3 つの行は出ない
+  const env2 = makeEnv();
+  await env2.boot();
+  const t2 = env2.$('#s-todo').textContent;
+  assert.ok(!t2.includes('失敗したAIジョブ') && !t2.includes('AIの停止') && !t2.includes('Driveの削除の保留'), t2);
 });
 
 console.log(n + ' tests passed');
