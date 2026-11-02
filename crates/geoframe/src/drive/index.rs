@@ -25,7 +25,8 @@
 //!   警告を出す（追加・更新は通常どおり。`mass_delete_withheld`）。保留を外すのは**一度きりの明示的な操作**
 //!   （管理画面の運用タブの承認＝`Allow::Only`、または `serve` が動いていないときの
 //!   `geoframe sync --allow-mass-delete`）だけで、環境変数・設定・unit では与えられない（`serve` の定期実行は
-//!   常に保留する）。同じ操作が 0 件の一覧の保留も外す。
+//!   常に保留する）。0 件の一覧の保留を外せるのは CLI の `Allow::Yes` だけ。運用タブ（`Allow::Only`）は
+//!   一覧が空なら常に保留に戻す。
 //! - 書き込みは 1 つのトランザクション（追加・更新・削除をまとめる。現行は 1 文ごとのコミット）。
 //! - 消す derivative の名前は `derivatives/<安全な名前>` だけ（現行は `DATA_DIR / display` を無検査で消す）。
 //! - 一覧に `id` が無い（現行は例外で全体が失敗）・名前が無い（現行は途中で例外）ファイルは、前者は一覧の失敗、
@@ -889,9 +890,10 @@ impl IndexDrive {
                 .record(None, &crate::sysinfo::local_timestamp());
         }
         if let (Allow::Only(_), false) = (&self.allow, ctx.is_dry_run()) {
-            // 件数だけ（名前・ID は出さない）
-            tracing::warn!(
-                "[drive] 保留の解除を実行しました（承認 {} 件・削除 {} 件・保留に戻した {} 件）",
+            // 段の中の内訳（件数だけ。名前・ID は出さない）。要求の終了と結果は `sync.rs` の `run_request` が
+            // `warn!` で 1 行残す（段が末尾に届かない終わり方もそこで拾う）
+            tracing::info!(
+                "[drive] 保留の解除の内訳（承認 {} 件・削除 {} 件・保留に戻した {} 件）",
                 plan.approved.unwrap_or(0),
                 plan.deletes.len(),
                 plan.mass_delete_withheld + plan.deletes_withheld

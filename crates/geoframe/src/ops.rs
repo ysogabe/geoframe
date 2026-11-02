@@ -200,7 +200,7 @@ pub fn stages_json(report: &CycleReport) -> Vec<StageJson> {
         .collect()
 }
 
-fn count_of(result: &StageResult, name: &str) -> u64 {
+pub(crate) fn count_of(result: &StageResult, name: &str) -> u64 {
     match result {
         StageResult::Done(counts) => counts
             .0

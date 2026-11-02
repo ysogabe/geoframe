@@ -624,6 +624,7 @@ fn run_request(
             };
             let Some(ids) = approved else {
                 tracing::warn!("[ops] 保留の解除: 承認したあとで保留が変わったので実行しません");
+                log_release_end(request, Outcome::HoldChanged, 0);
                 guard.finish(Outcome::HoldChanged, Vec::new(), None);
                 return;
             };
@@ -633,13 +634,36 @@ fn run_request(
         OpKind::AiRetry | OpKind::AiReleasePause => None,
     };
     match report {
-        Some(report) => guard.finish(
-            outcome_of(RunKind::Op(request.kind), &report),
-            stages_json(&report),
-            None,
-        ),
-        None => guard.finish(Outcome::Failed, Vec::new(), None),
+        Some(report) => {
+            let outcome = outcome_of(RunKind::Op(request.kind), &report);
+            if request.kind == OpKind::DriveRelease {
+                let deleted = report
+                    .stages
+                    .first()
+                    .map_or(0, |s| crate::ops::count_of(&s.result, "deleted"));
+                log_release_end(request, outcome, deleted);
+            }
+            guard.finish(outcome, stages_json(&report), None)
+        }
+        None => {
+            if request.kind == OpKind::DriveRelease {
+                log_release_end(request, Outcome::Failed, 0);
+            }
+            guard.finish(Outcome::Failed, Vec::new(), None)
+        }
     }
+}
+
+/// 保留の解除の要求の終了を 1 行残す（受付の `warn!` と対）。履歴は再起動で消えるので、承認した件数と結果を
+/// journal に残す。段がどう終わっても（鍵なし・認証失敗・停止・失敗・パニック・保留の変化を含む）ここを通る。
+/// 固定の語と件数だけ（ID・パス・SQLite の文面は出さない）。
+fn log_release_end(request: &Request, outcome: Outcome, deleted: u64) {
+    tracing::warn!(
+        "[ops] 保留の解除を終えました（承認 {} 件・結果 {}・削除 {} 件）",
+        request.ids.as_ref().map_or(0, crate::drive::HeldIds::len),
+        outcome.as_str(),
+        deleted
+    );
 }
 
 /// サイクル 1 回分（`stages` を順に）。接続を開けない・`run_cycle` 自身のパニックは `None`（次の周期・要求に持ち越す。
@@ -1598,6 +1622,136 @@ mod tests {
         ops.board.enqueue(OpKind::QualityScan, None, None).unwrap();
         ops.wait_history(2);
         assert_eq!(ops.latest().outcome, Outcome::Done);
+    }
+
+    /// 保留の解除の要求を 1 件、ワーカーを介さずこのスレッドで `run_request` に流し、出たログを返す
+    /// （ログの捕捉はスレッドごとなので、ワーカーのスレッドでは捕まらない）。`change_hold` なら、要求のあとで保留を変える。
+    fn release_end_logs(
+        tag: &str,
+        change_hold: bool,
+        before: fn(&StopFlag),
+        behavior: fn() -> Result<StageOutcome, StageError>,
+    ) -> (String, Outcome) {
+        use crate::drive::HeldIds;
+        let s = setup(tag);
+        let stop = StopFlag::new();
+        let board = Board::new(stop.clone(), TestClock::new());
+        let drive = Arc::new(crate::drive::DriveShared::new());
+        let ids = HeldIds::new(vec![5, 7, 9]);
+        drive
+            .mass_delete_board()
+            .record_with_ids(hold(100), ids.clone(), "t0");
+        let token = crate::ops::token_of(&drive.mass_delete_board().current().unwrap());
+        board
+            .enqueue(OpKind::DriveRelease, Some(token), Some(ids))
+            .unwrap();
+        if change_hold {
+            drive
+                .mass_delete_board()
+                .record_with_ids(hold(101), HeldIds::new(vec![5, 7, 9]), "t1");
+        }
+        let request = board.take_queued().unwrap();
+        let http = crate::net::agent();
+        let stop_for_stages = stop.clone();
+        let env = WorkerEnv {
+            config: &s.config,
+            writer: &s.writer,
+            cache: &s.cache,
+            http: &http,
+            stop: &stop,
+            release_stages: Some(Arc::new(move |_, _| {
+                before(&stop_for_stages);
+                vec![Box::new(Fixed("index_drive", behavior)) as Box<dyn Stage>]
+            })),
+        };
+        let logs = crate::testutil::capture::logs_of(|| {
+            run_request(&env, &board, &[], &drive, &request);
+        });
+        (logs, board.snapshot().history[0].outcome)
+    }
+
+    #[test]
+    fn every_drive_release_ending_logs_one_line_with_the_approved_count_and_outcome() {
+        // 終わり方ごとに、承認した 3 件・固定の結果・削除 0 件の行が 1 本だけ出る（受付の行はここでは出ない）
+        let end = |logs: &str| -> Vec<String> {
+            logs.lines()
+                .filter(|l| l.contains("保留の解除を終えました"))
+                .map(str::to_string)
+                .collect()
+        };
+        let check = |tag: &str,
+                     change_hold: bool,
+                     before: fn(&StopFlag),
+                     behavior: fn() -> Result<StageOutcome, StageError>,
+                     outcome: Outcome| {
+            let (logs, got) = release_end_logs(tag, change_hold, before, behavior);
+            assert_eq!(got, outcome, "{tag}");
+            let lines = end(&logs);
+            assert_eq!(lines.len(), 1, "{tag}: 終了ログは 1 行: {logs}");
+            let want = format!("承認 3 件・結果 {}・削除 0 件", outcome.as_str());
+            assert!(lines[0].contains(&want), "{tag}: {}", lines[0]);
+            assert!(lines[0].contains("WARN"), "{tag}: {}", lines[0]);
+            // 終了ログの行には ID も失敗の文面も出ない（他の行の段のログは対象外）
+            for secret in ["secret", "5, 7", "[5"] {
+                assert!(!lines[0].contains(secret), "{tag}: {}", lines[0]);
+            }
+        };
+        // 保留が変わった
+        check(
+            "end-log-hold-changed",
+            true,
+            |_| {},
+            || panic!("走らない"),
+            Outcome::HoldChanged,
+        );
+        // 省略（認証できず飛ばした）
+        check(
+            "end-log-skipped",
+            false,
+            |_| {},
+            || Ok(StageOutcome::Skipped("no-key")),
+            Outcome::Skipped,
+        );
+        // 停止（段が走らない）
+        check(
+            "end-log-not-run",
+            false,
+            |stop| stop.stop(),
+            || panic!("走らない"),
+            Outcome::Skipped,
+        );
+        // 失敗・パニック
+        check(
+            "end-log-failed",
+            false,
+            |_| {},
+            || Err(StageError::fixed("secret-failure")),
+            Outcome::Failed,
+        );
+        check(
+            "end-log-panicked",
+            false,
+            |_| {},
+            || panic!("secret-panic"),
+            Outcome::Failed,
+        );
+        // 成功: 段の `deleted` を載せる
+        let (logs, outcome) = release_end_logs(
+            "end-log-done",
+            false,
+            |_| {},
+            || {
+                Ok(StageOutcome::Done(Counts(vec![
+                    ("approved", 3),
+                    ("deleted", 2),
+                ])))
+            },
+        );
+        assert_eq!(outcome, Outcome::Done);
+        assert!(
+            logs.contains("承認 3 件・結果 done・削除 2 件"),
+            "成功の終了ログ: {logs}"
+        );
     }
 
     #[test]
