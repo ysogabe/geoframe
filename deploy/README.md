@@ -364,7 +364,7 @@ Python版へ戻す手順は、[`cutover.md` §8・§13.2](../docs/rust-migration
 - **解除前の写しの戻し方**: 運用タブの解除（`Only`）で消す行があるときだけ、削除の直前に`DATA_DIR/tmp/catalog-before-release.db`へ`catalog.db`の写しを作る（`.part`に書いてから置き換える。権限は`catalog.db`と同じ。失敗したら削除しない）。次の手順で戻す。
   1. `serve`を止める（`sudo systemctl stop geoframe-rs`）。
   2. `catalog.db`・`catalog.db-wal`・`catalog.db-shm`を別の場所へ退かし、写しを`catalog.db`として置く（所有者・権限は元の`catalog.db`に合わせる）。
-  3. 戻した Drive の行の表示用画像は削除のときに消えていて戻らない。`fetch`に取り直させるため、戻す行の条件を運用者が決めて`UPDATE photos SET display=NULL, fetched_at=NULL WHERE source='drive' AND …`を実行する（列は[schema.rs](../crates/geoframe/src/schema.rs)の`photos`。`fetch`は`display IS NULL`の行だけ取る）。
+  3. 戻した Drive の行の表示用画像は削除のときに消えていて戻らない。`fetch`に取り直させるため、戻す行は、手順 2 で退かした`catalog.db`を`ATTACH`して決める（例: `ATTACH '<退かした catalog.db>' AS cur;`のあと、写しに戻った行のうち`cur.photos`に無い`id`の Drive の行 → `UPDATE photos SET display=NULL, fetched_at=NULL WHERE source='drive' AND id NOT IN (SELECT id FROM cur.photos);`。解除のあとに写真 ID が再利用されていると取り違えるので、`drive_id`も突き合わせる）。Drive 側にファイルが戻っていなければ、次のサイクルでまた保留になる。列は[schema.rs](../crates/geoframe/src/schema.rs)の`photos`。`fetch`は`display IS NULL`の行だけ取る。
   4. `serve`を起動する。
 
   注意: 写しは**解除した時点の DB 全体**なので、そのあとの変更（★・位置・AI の結果）は戻すと失われる。バックアップのタイマー（`catalog.db`だけ）には写しが含まれない。写しは次の解除まで残り、手で消してよい（作った時刻はファイルの更新時刻で見る）。
@@ -441,7 +441,7 @@ checkout の`HEAD`が`--expect-commit`（40 桁）と違う／追跡下のファ
 `if`の中では「下限を満たした」ように進んでしまうため）。確認の本体も、比較が成り立つときだけ通し、比較の異常は失敗として戻す。Python 版を止めたあとの初回の配布が 0 でなければ、
 すぐ Python 版へ戻す（手順は`cutover.md` §8）。ただし終了コード 2・4（何も変えずに断った）は、原因がすぐ直せて配信停止の期限内に再実行できるときだけ再実行する（`cutover.md` §0.4）。入れる unit は、その checkout の`deploy/geoframe-rs.service`。
 
-サービスを止めて CLI を動かすとき（AI の書き込み系の操作、`serve`が動いていないときの`sync`など）は、`sudo deploy/geoframe-admin.sh ai-jobs …`を使う（root で直接`geoframe`を動かさない。動かす前に DATA_DIR のパスが表示される）。
+サービスを止めて CLI を動かすとき（AI の書き込み系の操作、`serve`が動いていないときの`sync`など）は、`sudo deploy/geoframe-admin.sh <コマンド> …`（例: `ai-jobs …`・`sync --allow-mass-delete`）を使う（root で直接`geoframe`を動かさない。動かす前に DATA_DIR のパスが表示される）。
 配置先のバイナリは入れ替えの直前に`/usr/local/bin/geoframe.prev`へ（unit も`.prev`へ）残す。**直前の 1 世代だけ**。
 
 **失敗したときの復元。** 入れ替え以降（unit の導入・`daemon-reload`・`enable`・`restart`・確認）のどこで失敗しても、
