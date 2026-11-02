@@ -6,7 +6,7 @@
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T1 | サーバー: calendar・places の cover、places の bbox（応答）と from/to・bbox（絞り込み）、photos の q。結合試験 | AC2, AC6, AC7, AC8, AC9（サーバー側） | - | full | 未着手 | | | |
+| T1 | サーバー: calendar・places の cover、places の bbox（応答）と from/to・bbox（絞り込み）、photos の q。結合試験 | AC2, AC6, AC7, AC8, AC9（サーバー側） | - | full | 実装中 | 589b82c | | |
 | T2 | 日付の規則のパーサー（library_when.rs、暦の関数）と単体試験 | AC10 | - | full | 未着手 | | | |
 | T3 | LLM: Endpoint::VlChat、ai/when.rs（上限・待ち・停止・検証）、server.rs・cli.rs の配線、GET /api/admin/library/when（Sec-Fetch-Site）。試験 | AC11 | T2 | full | 未着手 | | | |
 | T4 | 画面の土台: admin.html・admin.css の部品と見た目、fakedom.mjs・fake_maplibre.mjs（fitBounds・eventData・getBounds）、static_files.rs の禁止語 | AC1, AC16 | T1 | full | 未着手 | | | |
