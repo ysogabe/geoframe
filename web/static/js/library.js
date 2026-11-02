@@ -14,9 +14,12 @@
    sel: view ごとの選択（今の選択は sel[view]。null なら一覧だけ）。選択 S は
         {kind:'trip', key, from, to} | {kind:'year', year, from, to} | {kind:'month', year, month, from, to} | {kind:'untimed'}
         | {kind:'pref', pref} | {kind:'city', pref, city} | {kind:'abroad'} | {kind:'bbox', bbox: [w, s, e, n]} | {kind:'period'}（場所の画面で、期間の写真全体）
+        | {kind:'span', from, to}（Shift の範囲。形の範囲）| {kind:'words', from, to, source}（日付の言葉。暦の範囲）| {kind:'q', q}（旅の文字検索）
    選ぶと一覧を残したまま #lib-detail に S の写真の格子を出す。同じカードをもう一度押すと選択を外す。
    gen: 選択・view・除外が変わるたびに増やす。読み取りを待つ間にこれが変わった応答は捨てる（seq と二重に守る）。
-   anchor: Shift の範囲の起点（後の段で使う）。
+   anchor: Shift の範囲の起点 {from, to, year}（直前に普通に選んだ年・月の形の範囲と、月のチップを出す年）。年・月・範囲の選択以外になると null。
+   tripFilter: 旅のカードを絞る検索欄の文字。whenMsg: 日付の言葉の読み込み中・失敗の文 {gen, text}（その gen のあいだだけ出す）。
+   combo: 場所のコンボボックスの状態 {open, items, more, active}（items は選べる候補、more は表に入りきらなかった件数、active は強調している添字）。
    years: calendar の応答。
    prefs / abroad: 都道府県のカード用の /places の応答（period・hidden・mapBbox を掛ける）。placeOpts: コンボボックスの候補用の /places の応答
    （period・hidden だけ。mapBbox は掛けない。候補の UI は後の段）。保存先・seq（placeCards・placeOptions）・loaded を別に持つ。
@@ -33,6 +36,7 @@ const ls = {
   years: [], calUntimed: 0, prefs: [], abroad: 0, placeOpts: {prefs: [], abroad: 0},
   loaded: {trips: false, calendar: false, placeCards: false, placeOptions: false},
   sel: {trips: null, calendar: null, places: null}, gen: 0, anchor: null,
+  tripFilter: '', whenMsg: null, combo: {open: false, items: [], more: 0, active: -1},
   period: null, mapBbox: null, fitPoints: false, pointsStale: false,
   onPlaces: false, detailShown: false, resizeQueued: false,
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
@@ -130,6 +134,21 @@ function monthRange(year, month){ return {from: year + '-' + month + '-00 00:00'
 function tripSel(trip){ return {kind: 'trip', key: trip.key, from: trip.start, to: trip.end}; }
 function yearSel(year){ return Object.assign({kind: 'year', year}, yearRange(year)); }
 function monthSel(year, month){ return Object.assign({kind: 'month', year, month}, monthRange(year, month)); }
+/* 形の範囲（00〜99）の端の表示: 「2024年8月」「2024年」。from は始まり側、to は終わり側（月が 99 なら年全体） */
+function shapeLabel(text, isEnd){
+  const year = text.slice(0, 4), month = text.slice(5, 7);
+  const none = isEnd ? '99' : '00';
+  return month === none ? year + '年' : year + '年' + Number(month) + '月';
+}
+function spanLabel(from, to){
+  const a = shapeLabel(from, false), b = shapeLabel(to, true);
+  return a === b ? a : a + '〜' + b;
+}
+/* 暦の範囲の日付の部分（「2025-06-01〜2025-08-31」。同じ日なら 1 つ） */
+function daySpan(from, to){
+  const a = from.slice(0, 10), b = to.slice(0, 10);
+  return a === b ? a : a + '〜' + b;
+}
 
 /* 選択の見出しと、同じ選択かどうかの印 */
 function selLabel(S){
@@ -143,6 +162,9 @@ function selLabel(S){
     case 'abroad': return '海外・不明';
     case 'bbox': return '地図の範囲' + (ls.period ? '・' + rangeLabel(ls.period.from, ls.period.to) : '');
     case 'period': return ls.period ? '期間 ' + rangeLabel(ls.period.from, ls.period.to) : '';
+    case 'span': return spanLabel(S.from, S.to);
+    case 'words': return daySpan(S.from, S.to);
+    case 'q': return '“' + S.q + '” の検索';
     default: return '';
   }
 }
@@ -152,6 +174,9 @@ function selId(S){
     case 'year': return 'year:' + S.year;
     case 'month': return 'month:' + S.year + '-' + S.month;
     case 'bbox': return 'bbox:' + S.bbox.join(',');
+    case 'span': return 'span:' + S.from + '~' + S.to;
+    case 'words': return 'words:' + S.from + '~' + S.to;
+    case 'q': return 'q:' + S.q;
     case 'pref': return 'pref:' + S.pref;
     case 'city': return 'city:' + S.pref + '/' + S.city;
     default: return S.kind;
@@ -206,6 +231,7 @@ function scrollSelected(){
 /* 選択を S にして（null なら外して）詳細を読む。古い詳細の応答は gen と seq で捨てる */
 function applySel(S){
   ls.sel[ls.view] = S;
+  if(ls.view === 'calendar' && !(S && (S.kind === 'year' || S.kind === 'month' || S.kind === 'span'))) ls.anchor = null;
   ls.gen++;
   ls.seq.detail++;
   ls.page = 1;
@@ -265,17 +291,36 @@ function textCard(key, name, count, onPress){
 /* 上の選択欄の右の件数（view ごと。読み込み前は空） */
 function updateLibNote(){
   let text = '';
-  if(ls.view === 'trips' && ls.loaded.trips) text = '旅 ' + ls.trips.length + ' 件';
+  if(ls.view === 'trips' && ls.loaded.trips){
+    const shown = visibleTrips().length;
+    text = ls.tripFilter.trim() ? '旅 ' + shown + ' / ' + ls.trips.length + ' 件' : '旅 ' + ls.trips.length + ' 件';
+  }
   else if(ls.view === 'calendar' && ls.loaded.calendar) text = ls.years.length + ' 年';
   else if(ls.view === 'places' && ls.loaded.placeCards) text = (ls.mapBbox ? '地図の範囲: ' : '') + ls.prefs.length + ' 都道府県';
   $('#lib-note').textContent = text;
 }
+/* 空白（全角も）で分けた小文字の語 */
+function libWords(text){ return text.toLowerCase().split(/[\s\u3000]+/).filter(Boolean); }
+/* 検索欄の文字で絞った旅（rangeLabel と placeLabel の文字に、語のすべてが部分一致するもの） */
+function visibleTrips(){
+  const words = libWords(ls.tripFilter);
+  if(!words.length) return ls.trips;
+  return ls.trips.filter(t => {
+    const text = (rangeLabel(t.start, t.end) + ' ' + (t.places || []).map(placeLabel).join(' ')).toLowerCase();
+    return words.every(w => text.includes(w));
+  });
+}
 function renderTrips(){
   const box = $('#lib-trip-cards');
   box.textContent = '';
-  ls.trips.forEach(t => box.appendChild(tripCard(t)));
-  if(ls.untimed > 0) box.appendChild(textCard('untimed', '日時なし', ls.untimed, () => toggleSel({kind: 'untimed'})));
-  if(!ls.trips.length && !ls.untimed) box.appendChild(el('div', 'empty', '写真がありません'));
+  const filtering = libWords(ls.tripFilter).length > 0;
+  const trips = visibleTrips();
+  trips.forEach(t => box.appendChild(tripCard(t)));
+  // 日時なしのカードには日時も地名も無いので、検索欄に文字があるあいだは出さない
+  if(ls.untimed > 0 && !filtering) box.appendChild(textCard('untimed', '日時なし', ls.untimed, () => toggleSel({kind: 'untimed'})));
+  if(!trips.length && (filtering || !ls.untimed)){
+    box.appendChild(el('div', 'empty', filtering && ls.trips.length ? '一致する旅がありません' : '写真がありません'));
+  }
   paintBox('trips');
   updateLibNote();
 }
@@ -288,6 +333,15 @@ function loadTrips(){
     ls.loaded.trips = true;
     renderTrips();
   }).catch(e => { if(seq === ls.seq.trips) toast('旅の一覧を読めませんでした: ' + e.message, true); });
+}
+/* 検索欄の Enter: 文字の合う写真（/photos?q=）を下に出す。空なら選択を外す（検索でない旅の選択も外れる） */
+function submitTripSearch(){
+  const q = $('#lib-search').value.trim();
+  if(!q){
+    if(ls.sel.trips) applySel(null);
+    return;
+  }
+  applySel({kind: 'q', q});
 }
 /* 「地図で見る」: 場所の画面をその旅の期間で開く。期間は都道府県のカード・候補・地図の点・写真の格子のすべてに掛かり、
    下には期間の写真全体を出す（sel.places = period）。以前の選択（別の旅の期間で選んだ県・範囲など）は持ち越さず、
@@ -309,10 +363,24 @@ function mapForTrip(trip){
 }
 
 /* ==== 5) 日付（年のカード・月のチップ）・場所（行） ==== */
+/* 年のカード・月のチップを押す。普通に押すとその年・月を選び（もう一度押すと外す）、それを anchor（Shift の範囲の起点）にする。
+   Shift を押しながら押すと、anchor と押したものの形の範囲の min(from)〜max(to) を {kind:'span'} で選ぶ（逆向き・年またぎ・年と月の混在も同じ）。
+   anchor が無いときの Shift は普通の選択 */
+function pickCalendar(e, S){
+  if(e && e.shiftKey && ls.anchor){
+    const from = ls.anchor.from < S.from ? ls.anchor.from : S.from;
+    const to = ls.anchor.to > S.to ? ls.anchor.to : S.to;
+    toggleSel({kind: 'span', from, to});
+    return;
+  }
+  const cur = ls.sel.calendar;
+  ls.anchor = cur && selId(cur) === selId(S) ? null : {from: S.from, to: S.to, year: S.year};
+  toggleSel(S);
+}
 function yearCard(y){
   const card = el('div', 'lib-card');
   card.dataset.key = y.year;
-  const main = cardMain(card, () => toggleSel(yearSel(y.year)));
+  const main = cardMain(card, e => pickCalendar(e, yearSel(y.year)));
   const cover = el('span', 'lib-cover');
   putImage(cover, y.cover ? (y.cover.thumb_url || '') : '', '');
   main.appendChild(cover);
@@ -327,7 +395,8 @@ function yearCard(y){
 function renderMonths(rebuild){
   const box = $('#lib-months');
   const S = ls.sel.calendar;
-  const year = S && (S.kind === 'year' || S.kind === 'month') ? S.year : null;
+  // 範囲を選んでいるあいだは、起点の年の月を出し続ける（続けて Shift で別の月を押せるように）
+  const year = S && (S.kind === 'year' || S.kind === 'month') ? S.year : (S && S.kind === 'span' && ls.anchor ? ls.anchor.year : null);
   const y = year ? ls.years.find(x => x.year === year) : null;
   box.classList.toggle('hidden', !y);
   if(!y){ box.textContent = ''; delete box.dataset.year; return; }
@@ -346,7 +415,7 @@ function renderMonths(rebuild){
     chip.setAttribute('aria-pressed', 'false');
     if(counts.has(m)) chip.appendChild(el('span', 'n', String(counts.get(m))));
     else chip.disabled = true;
-    chip.addEventListener('click', () => toggleSel(monthSel(year, m)));
+    chip.addEventListener('click', e => pickCalendar(e, monthSel(year, m)));
     box.appendChild(chip);
   });
 }
@@ -370,6 +439,43 @@ function loadCalendar(){
     renderCalendar();
   }).catch(e => { if(seq === ls.seq.calendar) toast('日付の一覧を読めませんでした: ' + e.message, true); });
 }
+/* 日付の言葉（#lib-when）: Enter（変換中を除く）で GET when?q=。読み込み中は「読んでいます…」、成功で {kind:'words'} を選んで
+   「<from の日付>〜<to の日付> として検索（規則 / LLM）」を #lib-when-note に出し、失敗（unreadable・unavailable・400・403・通信の失敗）は R8d の文を出す。
+   応答は送った時点の gen と今の gen が同じときだけ使う（待つあいだに月を選べば、遅れた応答は選択を変えない） */
+const LIB_WHEN_FAIL = '読めませんでした。ピッカーで選んでください';
+function wordsNote(S){ return daySpan(S.from, S.to) + ' として検索（' + (S.source === 'llm' ? 'LLM' : '規則') + '）'; }
+function paintWhenNote(){
+  const S = ls.sel.calendar;
+  let text = '';
+  if(ls.whenMsg && ls.whenMsg.gen === ls.gen) text = ls.whenMsg.text;
+  else if(S && S.kind === 'words') text = wordsNote(S);
+  $('#lib-when-note').textContent = text;
+}
+function submitWhen(){
+  const q = $('#lib-when').value.trim();
+  const seq = ++ls.seq.when, gen = ls.gen;
+  if(!q){
+    ls.whenMsg = null;
+    const S = ls.sel.calendar;
+    if(S && S.kind === 'words') applySel(null);
+    else paintWhenNote();
+    return;
+  }
+  ls.whenMsg = {gen, text: '読んでいます…'};
+  paintWhenNote();
+  libGet('when', {q}).then(d => {
+    if(typeof d.from !== 'string' || typeof d.to !== 'string') throw new Error('unreadable');
+    return d;
+  }).then(d => {
+    if(seq !== ls.seq.when || gen !== ls.gen) return;
+    applySel({kind: 'words', from: d.from, to: d.to, source: d.source});
+  }, e => {
+    if(seq !== ls.seq.when || gen !== ls.gen) return;
+    ls.whenMsg = {gen, text: LIB_WHEN_FAIL + (e.message === 'unavailable' ? '（LLM が使えません）' : '')};
+    paintWhenNote();
+  });
+}
+
 /* ==== 6) 場所（都道府県のカード・市区町村のチップ・期間・地図の絞り込み） ==== */
 const LIB_CITY_MAX = 30;
 /* 都道府県のカード。主ボタン（表紙・名前・枚数）が県を選び、地図をその県の範囲へ動かす。選んだ県のカードには、主ボタンの兄弟として
@@ -453,8 +559,8 @@ function placeParams(withBbox){
   if(withBbox && ls.mapBbox) p.bbox = ls.mapBbox.join(',');
   return p;
 }
-/* 都道府県のカード用の /places（period・hidden・mapBbox を掛ける） */
-function loadPlaceCards(){
+/* 都道府県のカード用の /places（period・hidden・mapBbox を掛ける）。afterRender は、この読み込みが最新のまま描画できたあとに呼ぶ */
+function loadPlaceCards(afterRender){
   const seq = ++ls.seq.placeCards;
   libGet('places', placeParams(true)).then(d => {
     if(seq !== ls.seq.placeCards) return;
@@ -462,16 +568,168 @@ function loadPlaceCards(){
     ls.abroad = d.abroad || 0;
     ls.loaded.placeCards = true;
     renderPlaces();
+    if(afterRender) afterRender();
   }).catch(e => { if(seq === ls.seq.placeCards) toast('場所の一覧を読めませんでした: ' + e.message, true); });
 }
-/* コンボボックスの候補用の /places（period・hidden だけ。地図の絞り込みは掛けない）。候補の UI は後の段 */
+/* コンボボックスの候補用の /places（period・hidden だけ。地図の絞り込みは掛けない）。開いているリストは新しい候補で作り直す */
 function loadPlaceOptions(){
   const seq = ++ls.seq.placeOptions;
   libGet('places', placeParams(false)).then(d => {
     if(seq !== ls.seq.placeOptions) return;
     ls.placeOpts = {prefs: d.prefs || [], abroad: d.abroad || 0};
     ls.loaded.placeOptions = true;
+    if(ls.combo.open) refreshCombo();
   }).catch(e => { if(seq === ls.seq.placeOptions) toast('場所の候補を読めませんでした: ' + e.message, true); });
+}
+/* ---- 場所のコンボボックス（#lib-place-combo。WAI-ARIA の combobox・リストの自動補完） ----
+   候補は ls.placeOpts（期間・除外だけを掛けた /places）の都道府県と市区町村（city が空は除く）。入力と名前を NFKC・小文字・カタカナ→ひらがなに直して
+   名前の部分一致か、都道府県の読み（ひらがな・ローマ字。県・府・都を除いた形も）の部分一致。並びは都道府県 → 市区町村、それぞれ件数の多い順で上位 20 件、
+   超えたら最後に選べない「ほか N 件」の行。地名は textContent にだけ入れ、候補の id は添字から作る（lib-opt-<添字>） */
+const LIB_OPT_MAX = 20;
+/* 都道府県の読み [ひらがな, ローマ字]（県・府・都の前まで。北海道だけは全体） */
+const LIB_PREF_READINGS = {
+  '北海道': ['ほっかいどう', 'hokkaido'],
+  '青森県': ['あおもり', 'aomori'], '岩手県': ['いわて', 'iwate'], '宮城県': ['みやぎ', 'miyagi'], '秋田県': ['あきた', 'akita'],
+  '山形県': ['やまがた', 'yamagata'], '福島県': ['ふくしま', 'fukushima'],
+  '茨城県': ['いばらき', 'ibaraki'], '栃木県': ['とちぎ', 'tochigi'], '群馬県': ['ぐんま', 'gunma'], '埼玉県': ['さいたま', 'saitama'],
+  '千葉県': ['ちば', 'chiba'], '東京都': ['とうきょう', 'tokyo'], '神奈川県': ['かながわ', 'kanagawa'],
+  '新潟県': ['にいがた', 'niigata'], '富山県': ['とやま', 'toyama'], '石川県': ['いしかわ', 'ishikawa'], '福井県': ['ふくい', 'fukui'],
+  '山梨県': ['やまなし', 'yamanashi'], '長野県': ['ながの', 'nagano'], '岐阜県': ['ぎふ', 'gifu'], '静岡県': ['しずおか', 'shizuoka'],
+  '愛知県': ['あいち', 'aichi'],
+  '三重県': ['みえ', 'mie'], '滋賀県': ['しが', 'shiga'], '京都府': ['きょうと', 'kyoto'], '大阪府': ['おおさか', 'osaka'],
+  '兵庫県': ['ひょうご', 'hyogo'], '奈良県': ['なら', 'nara'], '和歌山県': ['わかやま', 'wakayama'],
+  '鳥取県': ['とっとり', 'tottori'], '島根県': ['しまね', 'shimane'], '岡山県': ['おかやま', 'okayama'], '広島県': ['ひろしま', 'hiroshima'],
+  '山口県': ['やまぐち', 'yamaguchi'],
+  '徳島県': ['とくしま', 'tokushima'], '香川県': ['かがわ', 'kagawa'], '愛媛県': ['えひめ', 'ehime'], '高知県': ['こうち', 'kochi'],
+  '福岡県': ['ふくおか', 'fukuoka'], '佐賀県': ['さが', 'saga'], '長崎県': ['ながさき', 'nagasaki'], '熊本県': ['くまもと', 'kumamoto'],
+  '大分県': ['おおいた', 'oita'], '宮崎県': ['みやざき', 'miyazaki'], '鹿児島県': ['かごしま', 'kagoshima'], '沖縄県': ['おきなわ', 'okinawa'],
+};
+const LIB_PREF_SUFFIX = {'県': ['けん', 'ken'], '府': ['ふ', 'fu'], '都': ['と', 'to']};
+/* NFKC・小文字・カタカナ→ひらがな（ァ〜ヶ を 0x60 引く） */
+function foldText(text){
+  return String(text).normalize('NFKC').toLowerCase().replace(/[ァ-ヶ]/g, c => String.fromCharCode(c.charCodeAt(0) - 0x60));
+}
+/* 都道府県の読みの一致。県・府・都を付けた形（ながのけん・naganoken）も対象にするが、一致の始まりが付けた部分の中なら数えない
+   （「ken」を打っただけで 県 の全部が出ないように） */
+function prefReadingMatch(pref, f){
+  const r = LIB_PREF_READINGS[pref];
+  if(!r) return false;
+  const suffix = LIB_PREF_SUFFIX[pref.slice(-1)] || ['', ''];
+  return [0, 1].some(i => {
+    const at = (r[i] + suffix[i]).indexOf(f);
+    return at >= 0 && at < r[i].length;
+  });
+}
+/* 入力 text に合う候補の表 {items, more}。text が空なら全部（↓ で開いたとき） */
+function comboRows(text){
+  const f = foldText(text.trim());
+  const byCount = (a, b) => b.count - a.count || (a.pref + a.city < b.pref + b.city ? -1 : 1);
+  const prefs = [], cities = [];
+  (ls.placeOpts.prefs || []).forEach(p => {
+    if(!p.pref) return;
+    if(!f || foldText(p.pref).includes(f) || prefReadingMatch(p.pref, f)){
+      prefs.push({kind: 'pref', pref: p.pref, city: '', count: p.count, bbox: p.bbox || null,
+                  label: p.pref + '（' + p.count + '）'});
+    }
+    (p.cities || []).forEach(c => {
+      if(!c.city || (f && !foldText(c.city).includes(f))) return;
+      cities.push({kind: 'city', pref: p.pref, city: c.city, count: c.count, bbox: c.bbox || null,
+                   label: p.pref + ' ' + c.city + '（' + c.count + '）'});
+    });
+  });
+  const all = prefs.sort(byCount).concat(cities.sort(byCount));
+  return {items: all.slice(0, LIB_OPT_MAX), more: Math.max(0, all.length - LIB_OPT_MAX)};
+}
+function optId(i){ return 'lib-opt-' + i; }
+/* 強調している候補と aria 属性を合わせる（リストは作り直さない） */
+function paintCombo(){
+  const c = ls.combo, input = $('#lib-place-combo');
+  input.setAttribute('aria-expanded', c.open ? 'true' : 'false');
+  if(c.open && c.active >= 0) input.setAttribute('aria-activedescendant', optId(c.active));
+  else input.removeAttribute('aria-activedescendant');
+  $('#lib-place-list').classList.toggle('hidden', !c.open);
+  $('#lib-place-list').querySelectorAll('.lib-opt').forEach(row => {
+    const on = c.open && row.id === optId(c.active);
+    row.classList.toggle('is-active', on);
+    row.setAttribute('aria-selected', on ? 'true' : 'false');
+    if(on && row.scrollIntoView) row.scrollIntoView({block: 'nearest'});
+  });
+}
+/* 入力の文字で候補を作り直して開く */
+function refreshCombo(){
+  const c = ls.combo;
+  const rows = comboRows($('#lib-place-combo').value);
+  c.items = rows.items;
+  c.more = rows.more;
+  c.active = -1;
+  c.open = true;
+  const list = $('#lib-place-list');
+  list.textContent = '';
+  c.items.forEach((it, i) => {
+    const row = el('div', 'lib-opt', it.label);
+    row.id = optId(i);
+    row.setAttribute('role', 'option');
+    row.addEventListener('mousedown', e => e.preventDefault());       // 入力欄のフォーカスを保つ（blur で閉じてしまわないように）
+    row.addEventListener('click', () => chooseComboItem(it));
+    list.appendChild(row);
+  });
+  if(c.more > 0){
+    const row = el('div', 'lib-opt lib-opt-more', 'ほか ' + c.more + ' 件（文字を足して絞ってください）');
+    row.id = optId(c.items.length);
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-disabled', 'true');
+    list.appendChild(row);
+  }
+  if(!c.items.length) list.appendChild(el('div', 'lib-opt-none', '候補がありません'));
+  paintCombo();
+}
+function closeCombo(){
+  ls.combo.open = false;
+  ls.combo.active = -1;
+  paintCombo();
+}
+function moveCombo(delta){
+  const c = ls.combo, n = c.items.length;
+  if(!n) return;
+  c.active = c.active < 0 ? (delta > 0 ? 0 : n - 1) : (c.active + delta + n) % n;
+  paintCombo();
+}
+/* 候補を決める。県・市区町村のカードを選んだのと同じ動き（selectPlace）。ただし同じものを選んでいるときは外さず、地図を動かすだけ */
+function chooseComboItem(it){
+  closeCombo();
+  $('#lib-place-combo').value = it.kind === 'city' ? it.city : it.pref;
+  choosePlace(it.kind === 'city' ? {kind: 'city', pref: it.pref, city: it.city} : {kind: 'pref', pref: it.pref}, it.bbox);
+}
+/* カードに（city なら県のカードの市区町村にも）出ていない候補は、地図の範囲による絞り込みを外してカードを読み直してから選ぶ
+   （市区町村のチップはカード用の ls.prefs から作るので、読み直したあとに出る）。読み直しの間に別の操作があれば選ばない */
+function choosePlace(S, bbox){
+  const done = () => {
+    const cur = ls.sel.places;
+    if(cur && selId(cur) === selId(S)) fitMapTo(bbox);
+    else selectPlace(S, bbox);
+  };
+  const card = ls.prefs.find(p => p.pref === S.pref);
+  const shown = !!card && (S.kind !== 'city' || (card.cities || []).some(c => c.city === S.city));
+  if(!ls.mapBbox || shown){ done(); return; }
+  const gen = ls.gen;
+  ls.mapBbox = null;
+  loadPlaceCards(() => { if(gen === ls.gen && ls.view === 'places') done(); });
+}
+function onComboKey(e){
+  if(e.isComposing || e.keyCode === 229) return;        // 日本語入力の変換中は変換のためのキー
+  const c = ls.combo;
+  if(e.key === 'ArrowDown' || e.key === 'ArrowUp'){
+    e.preventDefault();
+    if(!c.open) refreshCombo();
+    moveCombo(e.key === 'ArrowDown' ? 1 : -1);
+  }else if(e.key === 'Enter'){
+    if(c.open && c.active >= 0 && c.items[c.active]){
+      e.preventDefault();
+      chooseComboItem(c.items[c.active]);
+    }
+  }else if(e.key === 'Escape'){
+    if(c.open){ e.preventDefault(); e.stopPropagation(); closeCombo(); }
+  }
 }
 /* 期間（「期間: … ✕」）の解除: カード・候補・点を期間なしで読み直す。期間の写真全体の詳細は隠して飛んでいる応答も捨て、
    県・市区町村・範囲などを選んでいれば、その選択のまま期間なしで詳細を読み直す（ページ 1） */
@@ -518,7 +776,8 @@ function detailParams(S){
     case 'city': p.pref = S.pref; p.city = S.city; break;
     case 'bbox': p.bbox = S.bbox.join(','); break;
     case 'period': break;                          // 期間（下で掛ける）の写真全体
-    default: p.from = S.from; p.to = S.to;      // trip・year・month
+    case 'q': p.q = S.q; break;                    // 旅の文字検索
+    default: p.from = S.from; p.to = S.to;      // trip・year・month・span・words
   }
   // 場所の画面の期間は、県・市区町村・海外不明・範囲・期間のすべてに掛かる（旅の「地図で見る」）
   if(ls.view === 'places' && ls.period){ p.from = ls.period.from; p.to = ls.period.to; }
@@ -822,6 +1081,15 @@ function showLib(){
   $('#lib-view-calendar').classList.toggle('on', calendar);
   $('#lib-view-places').classList.toggle('on', places);
   updateLibNote();
+  // 探す欄は view ごと（旅: 文字検索 / 日付: 言葉 / 場所: コンボボックス）。出ていない欄のリストは閉じる
+  $('#lib-search').classList.toggle('hidden', !trips);
+  $('#lib-when').classList.toggle('hidden', !calendar);
+  $('#lib-when-note').classList.toggle('hidden', !calendar);
+  const combo = $('#lib-place-combo');
+  combo.classList.toggle('hidden', !places);
+  combo.parentNode.classList.toggle('hidden', !places);
+  if(!places && ls.combo.open) closeCombo();
+  paintWhenNote();
   $('#lib-period').classList.toggle('hidden', !ls.period);
   $('#lib-period-text').textContent = ls.period ? '期間: ' + rangeLabel(ls.period.from, ls.period.to) : '';
   paintSelection();
@@ -885,6 +1153,28 @@ function initLibrary(){
   $('#lib-bbox').addEventListener('click', viewBbox);
   $('#lib-reset').addEventListener('click', resetMap);
   $('#lib-period-clear').addEventListener('click', clearPeriod);
+  // 旅の検索: 打つとカードを絞り、Enter（変換中を除く）で文字の合う写真を下に出す。空で Enter なら選択を外す
+  $('#lib-search').addEventListener('input', () => {
+    ls.tripFilter = $('#lib-search').value;
+    renderTrips();
+  });
+  $('#lib-search').addEventListener('keydown', e => {
+    if(e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+    e.preventDefault();
+    submitTripSearch();
+  });
+  $('#lib-when').addEventListener('keydown', e => {
+    if(e.key !== 'Enter' || e.isComposing || e.keyCode === 229) return;
+    e.preventDefault();
+    submitWhen();
+  });
+  const combo = $('#lib-place-combo');
+  combo.addEventListener('input', () => {
+    if(combo.value.trim()) refreshCombo();
+    else closeCombo();
+  });
+  combo.addEventListener('keydown', onComboKey);
+  combo.addEventListener('blur', closeCombo);
   // 幅 640px の境をまたぐと地図の大きさが変わる（CSS の @media と同じ境）
   if(typeof matchMedia === 'function'){
     const narrow = matchMedia('(max-width: 640px)');

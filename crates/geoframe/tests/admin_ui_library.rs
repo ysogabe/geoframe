@@ -155,3 +155,38 @@ fn the_place_screen_has_a_card_column_on_the_left_with_two_columns_of_prefecture
     // 選べない「ほか N」の行はボタンにしない（スタイルは別のクラス）
     assert!(rule_body(&css, ".lib-more").is_some());
 }
+
+/// AC9・AC12・AC14（見た目）: 探す欄（`.lib-in`）・コンボボックスの包み（`.lib-combo`）は `.hidden` で出し入れするので、display を持つ規則には
+/// 対の `.hidden` 規則がある。候補のリストは欄の下に重ね、選んでいる候補（`.is-active`）は色と帯で強調する。
+/// 幅 640px 以下では、探す欄は 1 行を使い切って折り返す
+#[test]
+fn the_library_search_fields_and_place_options_are_styled_and_wrap_on_narrow_screens() {
+    let css = compact_css();
+    let combo = rule_body(&css, ".lib-combo").expect(".lib-combo の規則が無い");
+    assert!(combo.contains("position:relative"), "{combo}");
+    assert!(combo.contains("display:inline-block"), "{combo}");
+    assert!(
+        rule_body(&css, ".lib-combo.hidden").is_some_and(|b| b.contains("display:none")),
+        ".hidden が .lib-combo の display に勝つための対の規則が無い"
+    );
+    let opts = rule_body(&css, ".lib-opts").expect(".lib-opts の規則が無い");
+    assert!(opts.contains("position:absolute"), "{opts}");
+    assert!(opts.contains("overflow-y:auto"), "{opts}");
+    assert!(
+        !opts.contains("display:"),
+        "display を持たない（.hidden で隠れる）: {opts}"
+    );
+    let active = rule_body(&css, ".lib-opt.is-active").expect("選んでいる候補の規則が無い");
+    assert!(active.contains("var(--cyan)"), "{active}");
+    assert!(active.contains("background"), "{active}");
+    let mut from = 0;
+    let mut found = false;
+    while let Some((at, body)) = block_after(&css, "@media(max-width:640px){", from) {
+        from = at + 1;
+        if body.contains(".lib-in,.lib-combo{flex:11100%;width:100%}") {
+            // 空白を除いた形（flex:1 1 100%）
+            found = true;
+        }
+    }
+    assert!(found, "幅 640px 以下の @media に探す欄の折り返しが無い");
+}

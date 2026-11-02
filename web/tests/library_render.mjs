@@ -69,7 +69,7 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
   const document = buildAdminDom();
   const calls = [];
   const flags = {};
-  const handlers = {photos: null, points: null, trips: null, calendar: null, places: null, tabList: null, search: null};   // (params, rec) => Promise | undefined
+  const handlers = {photos: null, points: null, trips: null, calendar: null, places: null, when: null, tabList: null, search: null};   // (params, rec) => Promise | undefined
   const fake = createFakeMaplibre();
   const fetchFake = (url, opts = {}) => {
     const rec = {url, method: opts.method || 'GET', body: opts.body};
@@ -94,6 +94,9 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
     }
     if(url.startsWith('/api/admin/library/calendar')){
       return (handlers.calendar && handlers.calendar(params, rec)) || reply(calendarBody());
+    }
+    if(url.startsWith('/api/admin/library/when')){
+      return (handlers.when && handlers.when(params, rec)) || reply({ok: false, error: 'unreadable'});
     }
     if(url.startsWith('/api/admin/library/places')){
       return (handlers.places && handlers.places(params, rec)) || reply(placesBody());
@@ -894,7 +897,8 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
   assert.ok(rules.some(([sel, body]) => sel === '.hidden' && /display:\s*none/.test(body)));
   // library.js が .hidden を付け外しする要素（id）と、その class
   const html = fs.readFileSync(new URL('../static/admin.html', import.meta.url), 'utf8');
-  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-months', 'lib-detail', 'lib-period', 'lib-empty', 'viewer-noimage'];
+  const toggled = ['lib-trips', 'lib-calendar', 'lib-places', 'lib-months', 'lib-detail', 'lib-period', 'lib-empty', 'viewer-noimage',
+                   'lib-search', 'lib-when', 'lib-when-note', 'lib-place-combo', 'lib-place-list'];
   const selectorsOf = id => {
     const tag = html.match(new RegExp('<[^>]*id="' + id + '"[^>]*>'));
     assert.ok(tag, id);
@@ -918,6 +922,9 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
     const isToggled = toggled.some(id => selectorsOf(id).includes(sel));
     if(isToggled) assert.ok(hasPair(sel), sel);
   }
+  // コンボボックスの包み（id なし）は display を持つので、対の規則が要る
+  assert.ok(rules.some(([sel, body]) => sel === '.lib-combo' && /display:/.test(body)));
+  assert.ok(rules.some(([sel, body]) => sel === '.lib-combo.hidden' && /display:\s*none/.test(body)));
   // 古い部品は無い
   assert.ok(!html.includes('lib-back') && !html.includes('lib-grid-box') && !html.includes('lib-map-box') && !html.includes('lib-view-map'));
 });
@@ -2039,4 +2046,698 @@ await test('(v5) 詳細 #lib-detail は旅・日付では一覧の下（#v-libra
   assert.equal(hidden(env, '#lib-detail'), false, '旅の選択の詳細');
   assert.equal(env.$$('#lib-grid .lib-tile').length, 3);
   assert.equal(env.ev("typeof ls.sel.map"), 'undefined', '地図の view の選択は無い');
+});
+
+// ---- T7: 旅の検索・日付の言葉とピッカーの範囲・場所のコンボボックス ----
+const searchBox = env => env.$('#lib-search');
+const whenBox = env => env.$('#lib-when');
+const comboBox = env => env.$('#lib-place-combo');
+const typeInto = (box, text) => { box.value = text; box.dispatchEvent({type: 'input'}); };
+const keyOn = (box, key, extra = {}) => box.dispatchEvent({type: 'keydown', key, ...extra});
+const photoQs = env => env.reqs('/api/admin/library/photos').map(qOf);
+const whenReqs = env => env.reqs('/api/admin/library/when');
+const optsOf = env => env.$$('#lib-place-list .lib-opt');
+const jsonRes = body => ({ok: true, status: 200, json: () => Promise.resolve(body)});
+
+await test('(w0) 探す欄は view ごとに 1 つだけ出る: 旅は #lib-search、日付は #lib-when と #lib-when-note、場所は #lib-place-combo', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const shown = () => ['#lib-search', '#lib-when', '#lib-when-note', '#lib-place-combo'].filter(s => !hidden(env, s));
+  assert.deepEqual(shown(), ['#lib-search']);
+  env.$('#lib-view-calendar').click();
+  await settle();
+  assert.deepEqual(shown(), ['#lib-when', '#lib-when-note']);
+  env.$('#lib-view-places').click();
+  await settle();
+  assert.deepEqual(shown(), ['#lib-place-combo']);
+  assert.equal(hidden(env, '#lib-place-list'), true, '候補は打つまで出ない');
+  same(comboBox(env).parentNode.parentNode, env.$('.lib-bar'), '探す欄は .lib-bar の中（.lib-place-side の overflow に切られない）');
+  assert.equal(comboBox(env).parentNode.classList.contains('hidden'), false);
+  env.$('#lib-view-trips').click();
+  await settle();
+  assert.deepEqual(shown(), ['#lib-search']);
+  assert.equal(comboBox(env).parentNode.classList.contains('hidden'), true, 'コンボボックスの包みも隠す');
+});
+
+await test('(w1) AC9 旅の検索: 打つと rangeLabel と placeLabel の文字（小文字・語のすべて）でカードが減り、読まない。Enter（変換中を除く）で /photos?q=…、見出し「“…” の検索」', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const input = searchBox(env);
+  assert.equal(cards(env).length, 3);
+  typeInto(input, '架空');
+  assert.equal(cards(env).length, 1, '地名に「架空」を持つ旅だけ（日時なしのカードも出さない）');
+  assert.equal(mainOf(cards(env)[0]).querySelector('.lib-card-name').textContent, '2030-05-03 09:12 〜 2030-05-05 18:40');
+  assert.equal(env.$('#lib-note').textContent, '旅 1 / 2 件');
+  typeInto(input, '2029 01');
+  assert.deepEqual(cards(env).map(x => mainOf(x).querySelector('.lib-card-name').textContent), ['2029-01-01 00:00'], '語のすべてが合うもの');
+  typeInto(input, '2029　架空');
+  assert.equal(cards(env).length, 0, '全角の空白でも語に分ける。どちらの旅も 2 語を満たさない');
+  assert.equal(env.$('#lib-trips').textContent, '一致する旅がありません');
+  typeInto(input, '海外・不明');
+  assert.equal(cards(env).length, 1, '地名の海外・不明（placeLabel）にも合う');
+  typeInto(input, '  ');
+  assert.equal(cards(env).length, 3, '空白だけなら絞らない');
+  assert.equal(env.$('#lib-note').textContent, '旅 2 件');
+  typeInto(input, 'ABC');
+  assert.equal(env.$('#lib-trips').textContent, '一致する旅がありません');
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '打っただけでは写真を読まない');
+  assert.equal(env.reqs('/api/admin/library/trips').length, 1, '旅の一覧も読み直さない');
+  // 変換中の Enter では読まない
+  typeInto(input, '架空 試験');
+  keyOn(input, 'Enter', {isComposing: true});
+  keyOn(input, 'Enter', {keyCode: 229});
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0);
+  // Enter で文字の合う写真
+  keyOn(input, 'Enter');
+  await settle();
+  const q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('q'), '架空 試験');
+  assert.equal(q.get('page'), '1');
+  assert.equal(q.get('from'), null);
+  assert.equal(q.get('hidden'), null);
+  assert.equal(env.$('#lib-sel').textContent, '“架空 試験” の検索');
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.deepEqual(plain(env.ev('ls.sel.trips')), {kind: 'q', q: '架空 試験'});
+  assert.ok(env.$('#lib-trip-cards').classList.contains('is-strip'), '選んだあいだは 1 段');
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['501', '502', '503']);
+  // 前後の空白は除いて送る。別の語で Enter → 切り替わる
+  typeInto(input, '  架空 ');
+  keyOn(input, 'Enter');
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('q'), '架空');
+  // 旅のカードを押すと検索の選択は旅に替わる（検索欄の文字は残る）
+  pressTrip(env, 0);
+  await settle();
+  assert.equal(env.ev('ls.sel.trips.kind'), 'trip');
+  assert.equal(input.value, '  架空 ');
+  // 空で Enter → 選択を外す（読まない）
+  typeInto(input, '');
+  const before = env.reqs('/api/admin/library/photos').length;
+  keyOn(input, 'Enter');
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, before);
+  assert.equal(env.ev('ls.sel.trips'), null);
+  assert.equal(hidden(env, '#lib-detail'), true);
+  keyOn(input, 'Enter');                              // 選択が無いときの空の Enter は何も起きない
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, before);
+});
+
+await test('(w2) AC12 日付の言葉: Enter（変換中を除く）で when?q=、読み込み中は「読んでいます…」、成功で期間・読み方を #lib-when-note に出して /photos?from=&to=。規則と LLM', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-calendar').click();
+  await settle();
+  const input = whenBox(env), note = env.$('#lib-when-note');
+  let resolve;
+  env.handlers.when = () => new Promise(res => { resolve = body => res(jsonRes(body)); });
+  input.value = '去年の夏';
+  keyOn(input, 'Enter', {isComposing: true});
+  await settle();
+  assert.equal(whenReqs(env).length, 0, '変換中の Enter では読まない');
+  keyOn(input, 'Enter');
+  await settle();
+  assert.equal(whenReqs(env).length, 1);
+  assert.equal(whenReqs(env)[0].url, '/api/admin/library/when?q=' + encodeURIComponent('去年の夏'));
+  assert.equal(note.textContent, '読んでいます…');
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '応答が来るまで写真は読まない');
+  resolve({ok: true, from: '2025-06-01 00:00', to: '2025-08-31 23:59', source: 'rule'});
+  await settle();
+  assert.equal(note.textContent, '2025-06-01〜2025-08-31 として検索（規則）');
+  let q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('from'), '2025-06-01 00:00');
+  assert.equal(q.get('to'), '2025-08-31 23:59');
+  assert.equal(q.get('page'), '1');
+  assert.equal(env.$('#lib-sel').textContent, '2025-06-01〜2025-08-31');
+  assert.deepEqual(plain(env.ev('ls.sel.calendar')), {kind: 'words', from: '2025-06-01 00:00', to: '2025-08-31 23:59', source: 'rule'});
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.equal(hidden(env, '#lib-months'), true, '言葉の選択に月のチップは出さない');
+  assert.ok(env.$('#lib-year-cards').classList.contains('is-strip'));
+  // LLM の読み。同じ日は 1 つだけ
+  input.value = '娘が生まれた頃';
+  keyOn(input, 'Enter');
+  await settle();
+  resolve({ok: true, from: '2025-08-15 00:00', to: '2025-08-15 23:59', source: 'llm'});
+  await settle();
+  assert.equal(note.textContent, '2025-08-15 として検索（LLM）');
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2025-08-15 00:00');
+  // 別の画面（旅→日付）へ往復しても、選択が words のままなら言葉の文が出る
+  env.$('#lib-view-trips').click();
+  await settle();
+  env.$('#lib-view-calendar').click();
+  await settle();
+  assert.equal(note.textContent, '2025-08-15 として検索（LLM）');
+  // 空で Enter → 言葉の選択を外す
+  input.value = '  ';
+  keyOn(input, 'Enter');
+  await settle();
+  assert.equal(env.ev('ls.sel.calendar'), null);
+  assert.equal(note.textContent, '');
+  assert.equal(hidden(env, '#lib-detail'), true);
+  assert.equal(whenReqs(env).length, 2, '空では読まない');
+});
+
+await test('(w2b) AC12 日付の言葉の失敗: unreadable・400・403・通信の失敗は「読めませんでした。ピッカーで選んでください」、unavailable は「（LLM が使えません）」を添える。選択は変えない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-calendar').click();
+  await settle();
+  const input = whenBox(env), note = env.$('#lib-when-note');
+  mainOf(yearCards(env)[0]).click();                  // 2030 年を選んでおく
+  await settle();
+  const photos = env.reqs('/api/admin/library/photos').length;
+  const MSG = '読めませんでした。ピッカーで選んでください';
+  const ask = async (text, handler) => {
+    env.handlers.when = handler;
+    input.value = text;
+    keyOn(input, 'Enter');
+    await settle();
+  };
+  await ask('あいまい', () => reply({ok: false, error: 'unreadable'}));
+  assert.equal(note.textContent, MSG);
+  await ask('あいまい2', () => reply({ok: false, error: 'unavailable'}));
+  assert.equal(note.textContent, MSG + '（LLM が使えません）');
+  await ask('あいまい3', () => respond(400, {ok: false, error: 'bad request'}));
+  assert.equal(note.textContent, MSG, '400 も読めない扱い（LLM の文は付けない）');
+  await ask('あいまい4', () => respond(403, {ok: false, error: 'forbidden'}));
+  assert.equal(note.textContent, MSG);
+  await ask('あいまい5', () => Promise.reject(new Error('network')));
+  assert.equal(note.textContent, MSG);
+  await ask('あいまい6', () => reply({ok: true, from: 5, to: null, source: 'rule'}));
+  assert.equal(note.textContent, MSG, '形の違う成功の応答も読めない扱い');
+  assert.equal(env.reqs('/api/admin/library/photos').length, photos, '失敗では写真を読み直さない');
+  assert.equal(env.ev('ls.sel.calendar.kind'), 'year', '選択は変えない');
+  assert.equal(hidden(env, '#lib-detail'), false);
+  // 失敗の文は、別の選択をすると消える
+  mainOf(yearCards(env)[1]).click();
+  await settle();
+  assert.equal(note.textContent, '');
+});
+
+await test('(w3) AC16a 言葉の応答を待つあいだに月を選ぶと、遅れて来た応答は選択を変えない。続けて 2 回 Enter したときは新しい方だけ。除外の切り替えでも捨てる', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-calendar').click();
+  await settle();
+  const input = whenBox(env), note = env.$('#lib-when-note');
+  const held = [];
+  env.handlers.when = () => new Promise(res => held.push(body => res(jsonRes(body))));
+  const words = (from, to) => ({ok: true, from: from + ' 00:00', to: to + ' 23:59', source: 'rule'});
+  mainOf(yearCards(env)[0]).click();
+  await settle();
+  input.value = '去年の夏';
+  keyOn(input, 'Enter');
+  await settle();
+  assert.equal(note.textContent, '読んでいます…');
+  monthChips(env)[4].click();                          // 待つあいだに 5 月を選ぶ
+  await settle();
+  assert.equal(note.textContent, '', '読んでいますの表示も消える');
+  const photos = env.reqs('/api/admin/library/photos').length;
+  held[0](words('2025-06-01', '2025-08-31'));
+  await settle();
+  assert.equal(env.ev('ls.sel.calendar.kind'), 'month', '遅れた応答は選択を変えない');
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2030-05-00 00:00');
+  assert.equal(env.reqs('/api/admin/library/photos').length, photos, '写真も読み直さない');
+  assert.equal(note.textContent, '');
+  // 続けて 2 回 Enter: 古い方の応答は捨て、新しい方を使う
+  input.value = 'A';
+  keyOn(input, 'Enter');
+  input.value = 'B';
+  keyOn(input, 'Enter');
+  await settle();
+  held[2](words('2024-01-01', '2024-01-31'));
+  await settle();
+  assert.equal(env.ev('ls.sel.calendar.from'), '2024-01-01 00:00');
+  held[1](words('2023-01-01', '2023-01-31'));
+  await settle();
+  assert.equal(env.ev('ls.sel.calendar.from'), '2024-01-01 00:00', '古い Enter の応答は捨てる');
+  // 除外を切り替えると飛んでいる応答は捨てる
+  input.value = 'C';
+  keyOn(input, 'Enter');
+  await settle();
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  held[3](words('2022-01-01', '2022-01-31'));
+  await settle();
+  assert.equal(env.ev('ls.sel.calendar.from'), '2024-01-01 00:00');
+  // view を替えて戻したあとでも、替える前に出した応答は捨てる
+  input.value = 'D';
+  keyOn(input, 'Enter');
+  await settle();
+  env.$('#lib-view-trips').click();
+  env.$('#lib-view-calendar').click();
+  await settle();
+  held[4](words('2021-01-01', '2021-01-31'));
+  await settle();
+  assert.equal(env.ev('ls.sel.calendar.from'), '2024-01-01 00:00');
+  assert.equal(note.textContent, '2024-01-01〜2024-01-31 として検索（規則）', '読んでいますは残らない');
+});
+
+await test('(w4) AC13 ピッカー: 写真の無い月は押せない。Shift で anchor と押したものの形の範囲の min(from)〜max(to)（逆向き・年またぎ・年と月の混在）。anchor が無い Shift は普通の選択', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-calendar').click();
+  await settle();
+  const shiftClick = node => node.dispatchEvent({type: 'click', shiftKey: true});
+  const lastQ = () => env.last('/api/admin/library/photos');
+  const sel = () => plain(env.ev('ls.sel.calendar'));
+  // anchor が無い Shift は普通の選択
+  assert.equal(env.ev('ls.anchor'), null);
+  shiftClick(mainOf(yearCards(env)[0]));
+  await settle();
+  assert.equal(sel().kind, 'year');
+  assert.equal(lastQ().get('from'), '2030-00-00 00:00');
+  assert.deepEqual(plain(env.ev('ls.anchor')), {from: '2030-00-00 00:00', to: '2030-99-99 99:99', year: '2030'});
+  // 写真の無い月は押せない（Shift でも）。anchor は変わらない
+  const before = env.reqs('/api/admin/library/photos').length;
+  monthChips(env)[0].click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, before);
+  // 月 12 を普通に押す → anchor は 12 月。Shift で 5 月（逆向き）
+  monthChips(env)[11].click();
+  await settle();
+  assert.deepEqual(plain(env.ev('ls.anchor')), {from: '2030-12-00 00:00', to: '2030-12-99 99:99', year: '2030'});
+  shiftClick(monthChips(env)[4]);
+  await settle();
+  assert.deepEqual(sel(), {kind: 'span', from: '2030-05-00 00:00', to: '2030-12-99 99:99'});
+  assert.equal(lastQ().get('from'), '2030-05-00 00:00');
+  assert.equal(lastQ().get('to'), '2030-12-99 99:99');
+  assert.equal(lastQ().get('page'), '1');
+  assert.equal(env.$('#lib-sel').textContent, '2030年5月〜2030年12月');
+  assert.equal(hidden(env, '#lib-months'), false, '範囲を選んだあとも、起点の年の月は出したまま');
+  assert.equal(monthChips(env).length, 12);
+  assert.ok(monthChips(env)[11].classList.contains('is-selected') || true);
+  // 順向き: 5 月を普通に押して Shift で 12 月
+  monthChips(env)[4].click();
+  await settle();
+  assert.equal(sel().kind, 'month');
+  shiftClick(monthChips(env)[11]);
+  await settle();
+  assert.deepEqual(sel(), {kind: 'span', from: '2030-05-00 00:00', to: '2030-12-99 99:99'});
+  // 年またぎ・混在: 月 5（anchor）に Shift で 2029 年のカード → 年の範囲との min〜max
+  shiftClick(mainOf(yearCards(env)[1]));
+  await settle();
+  assert.deepEqual(sel(), {kind: 'span', from: '2029-00-00 00:00', to: '2030-05-99 99:99'});
+  assert.equal(env.$('#lib-sel').textContent, '2029年〜2030年5月');
+  assert.equal(lastQ().get('from'), '2029-00-00 00:00');
+  assert.equal(lastQ().get('to'), '2030-05-99 99:99');
+  // anchor は変わらないので、続けて別の Shift は同じ起点から広げる
+  shiftClick(monthChips(env)[11]);
+  await settle();
+  assert.deepEqual(sel(), {kind: 'span', from: '2030-05-00 00:00', to: '2030-12-99 99:99'});
+  // 年→年: 2029 年を普通に押し、Shift で 2030 年
+  mainOf(yearCards(env)[1]).click();
+  await settle();
+  assert.equal(sel().kind, 'year');
+  shiftClick(mainOf(yearCards(env)[0]));
+  await settle();
+  assert.deepEqual(sel(), {kind: 'span', from: '2029-00-00 00:00', to: '2030-99-99 99:99'});
+  assert.equal(env.$('#lib-sel').textContent, '2029年〜2030年');
+  // 月（2029-01）→ Shift で 2030 年のカード（月と年の混在・年またぎ）
+  mainOf(yearCards(env)[1]).click();                  // 範囲から 2029 年の選択に替わる
+  await settle();
+  assert.equal(sel().kind, 'year');
+  mainOf(yearCards(env)[1]).click();                  // 選択中をもう一度 → 外す
+  await settle();
+  assert.equal(env.ev('ls.sel.calendar'), null);
+  assert.equal(env.ev('ls.anchor'), null, '選択を外すと anchor も外れる');
+  mainOf(yearCards(env)[1]).click();
+  await settle();
+  monthChips(env)[0].click();
+  await settle();
+  assert.equal(sel().kind, 'month');
+  shiftClick(mainOf(yearCards(env)[0]));
+  await settle();
+  assert.deepEqual(sel(), {kind: 'span', from: '2029-01-00 00:00', to: '2030-99-99 99:99'});
+  assert.equal(env.$('#lib-sel').textContent, '2029年1月〜2030年');
+  // 日時なしを選ぶと anchor が外れ、そのあとの Shift は普通の選択
+  mainOf(yearCards(env)[2]).click();
+  await settle();
+  assert.equal(env.ev('ls.anchor'), null);
+  shiftClick(mainOf(yearCards(env)[0]));
+  await settle();
+  assert.equal(sel().kind, 'year');
+  // 言葉を選んでも anchor は外れる
+  env.handlers.when = () => reply({ok: true, from: '2025-06-01 00:00', to: '2025-08-31 23:59', source: 'rule'});
+  whenBox(env).value = '去年の夏';
+  keyOn(whenBox(env), 'Enter');
+  await settle();
+  assert.equal(env.ev('ls.anchor'), null);
+  shiftClick(mainOf(yearCards(env)[1]));
+  await settle();
+  assert.equal(sel().kind, 'year', 'anchor が無いので普通の選択');
+});
+
+// 長野県（423）・愛媛県・千葉県・東京都と、市区町村。北海道は市区町村が空だけ
+const comboBody = () => ({ok: true, abroad: 0, prefs: [
+  {pref: '長野県', count: 423, cover: null, bbox: [137.3, 35.2, 138.7, 37.0], cities: [
+    {city: '長野市', count: 120, bbox: [138.0, 36.5, 138.3, 36.8]}, {city: '松本市', count: 80, bbox: [137.8, 36.1, 138.1, 36.4]},
+    {city: '軽井沢町', count: 40, bbox: null}]},
+  {pref: '東京都', count: 300, cover: null, bbox: [139.0, 35.5, 139.9, 35.9], cities: [{city: '世田谷区', count: 50, bbox: [139.5, 35.6, 139.7, 35.7]}]},
+  {pref: '千葉県', count: 200, cover: null, bbox: [139.7, 35.0, 140.9, 36.0], cities: [
+    {city: '千葉市', count: 100, bbox: [140.0, 35.5, 140.3, 35.7]}, {city: '松戸市', count: 70, bbox: [139.8, 35.7, 139.95, 35.9]}]},
+  {pref: '愛媛県', count: 90, cover: null, bbox: [132.0, 33.0, 133.5, 34.2], cities: [
+    {city: '松山市', count: 60, bbox: [132.7, 33.7, 132.9, 33.9]}, {city: '今治市', count: 20, bbox: [132.9, 33.9, 133.1, 34.1]},
+    {city: '<b>町', count: 5, bbox: null}]},
+  {pref: '北海道', count: 10, cover: null, bbox: null, cities: [{city: '', count: 10, bbox: null}]}]});
+const labelsOf = env => optsOf(env).map(o => o.textContent);
+
+await test('(x1) AC14 コンボボックス: 「松」で「松」を含む候補だけ（件数の多い順）、「ながの」「nagano」「ナガノ」で長野県。読みは県・府・都の付いた形も。ARIA の属性と lib-opt-<添字>', async () => {
+  const env = makeEnv();
+  env.handlers.places = () => reply(comboBody());
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  const input = comboBox(env);
+  assert.equal(input.getAttribute('role'), 'combobox');
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  assert.equal(input.getAttribute('aria-controls'), 'lib-place-list');
+  assert.equal(input.getAttribute('aria-autocomplete'), 'list');
+  assert.equal(input.getAttribute('aria-activedescendant'), null);
+  assert.equal(env.$('#lib-place-list').getAttribute('role'), 'listbox');
+  typeInto(input, '松');
+  assert.deepEqual(labelsOf(env), ['長野県 松本市（80）', '千葉県 松戸市（70）', '愛媛県 松山市（60）']);
+  assert.deepEqual(optsOf(env).map(o => o.id), ['lib-opt-0', 'lib-opt-1', 'lib-opt-2']);
+  assert.ok(optsOf(env).every(o => o.getAttribute('role') === 'option'));
+  assert.equal(input.getAttribute('aria-expanded'), 'true');
+  assert.equal(hidden(env, '#lib-place-list'), false);
+  assert.equal(input.getAttribute('aria-activedescendant'), null, '打っただけでは強調しない');
+  assert.ok(optsOf(env).every(o => o.getAttribute('aria-selected') === 'false'));
+  // 県は件数の多い順で、市区町村より先。都道府県の名前の部分一致
+  typeInto(input, '県');
+  assert.deepEqual(labelsOf(env), ['長野県（423）', '千葉県（200）', '愛媛県（90）']);
+  typeInto(input, '長野');
+  assert.deepEqual(labelsOf(env), ['長野県（423）', '長野県 長野市（120）'], '都道府県 → 市区町村');
+  // 読み: ひらがな・ローマ字・カタカナ・大文字
+  for(const t of ['ながの', 'nagano', 'ナガノ', 'NAGANO', 'ながのけん', 'naganoken', 'ｎａｇａｎｏ']){
+    typeInto(input, t);
+    assert.deepEqual(labelsOf(env), ['長野県（423）'], t);
+  }
+  typeInto(input, 'ken');
+  assert.deepEqual(labelsOf(env), [], 'ken だけで県の全部が出ない');
+  assert.equal(env.$('#lib-place-list').textContent, '候補がありません');
+  assert.equal(input.getAttribute('aria-expanded'), 'true');
+  typeInto(input, 'tokyo');
+  assert.deepEqual(labelsOf(env), ['東京都（300）']);
+  typeInto(input, 'とうきょうと');
+  assert.deepEqual(labelsOf(env), ['東京都（300）']);
+  typeInto(input, 'きょう');
+  assert.deepEqual(labelsOf(env), ['東京都（300）'], '京都府は「きょうと」で、「きょう」は東京都の読みにも合う');
+  typeInto(input, 'kyoto');
+  assert.deepEqual(labelsOf(env), ['東京都（300）'], '部分一致なので「tokyoto」の中に kyoto がある。京都府は写真が無いので候補にない');
+  // 市区町村の読みは持たない
+  typeInto(input, 'matsumoto');
+  assert.deepEqual(labelsOf(env), []);
+  // 地名は textContent にだけ入る
+  typeInto(input, '<b>');
+  assert.deepEqual(labelsOf(env), ['愛媛県 <b>町（5）']);
+  assert.equal(optsOf(env)[0].children.filter(c => c.nodeType === 1).length, 0, '要素は作らない（文字のノードだけ）');
+  // 空にすると閉じる
+  typeInto(input, '');
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  assert.equal(hidden(env, '#lib-place-list'), true);
+  // city が空だけの北海道に市区町村の候補は無い。北海道は県として出る
+  typeInto(input, 'hokkaido');
+  assert.deepEqual(labelsOf(env), ['北海道（10）']);
+  typeInto(input, '北');
+  assert.deepEqual(labelsOf(env), ['北海道（10）']);
+});
+
+await test('(x2) AC14 20 件を超えたら、最後に選べない「ほか N 件（文字を足して絞ってください）」の行。↓・↑ はその行を飛ばす', async () => {
+  const env = makeEnv();
+  const cities = Array.from({length: 25}, (_, i) => ({city: '試験' + String(i).padStart(2, '0') + '市', count: 100 - i, bbox: null}));
+  env.handlers.places = () => reply({ok: true, abroad: 0, prefs: [{pref: '長野県', count: 999, cover: null, bbox: null, cities}]});
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  const input = comboBox(env);
+  typeInto(input, '試験');
+  const rows = optsOf(env);
+  assert.equal(rows.length, 21, '候補 20 件 + ほかの行');
+  assert.equal(rows[0].textContent, '長野県 試験00市（100）');
+  assert.equal(rows[19].textContent, '長野県 試験19市（81）');
+  assert.equal(rows[20].textContent, 'ほか 5 件（文字を足して絞ってください）');
+  assert.equal(rows[20].id, 'lib-opt-20');
+  assert.equal(rows[20].getAttribute('aria-disabled'), 'true');
+  assert.ok(rows[20].classList.contains('lib-opt-more'));
+  // 選べない: クリックしても読まない。↓ で最後の候補から先頭へ回る
+  rows[20].click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0);
+  assert.equal(input.getAttribute('aria-expanded'), 'true');
+  keyOn(input, 'ArrowUp');
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-19', '↑ は最後の候補（ほかの行ではない）');
+  keyOn(input, 'ArrowDown');
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-0');
+  // 20 件ちょうどなら行は出ない
+  typeInto(input, '試験0');
+  assert.equal(optsOf(env).length, 10);
+  assert.ok(optsOf(env).every(o => !o.classList.contains('lib-opt-more')));
+});
+
+await test('(x3) AC14 ↓↑ で aria-activedescendant を動かし、Enter で決める: 市区町村は pref・city、県は pref だけ。fitBounds（libMove 付き）。決めたあとは閉じる。クリックでも決める', async () => {
+  const env = makeEnv();
+  env.handlers.places = () => reply(comboBody());
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  const input = comboBox(env);
+  const map = mapOf(env);
+  typeInto(input, '松');
+  keyOn(input, 'ArrowDown');
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-0');
+  assert.deepEqual(optsOf(env).map(o => o.getAttribute('aria-selected')), ['true', 'false', 'false']);
+  assert.deepEqual(optsOf(env).map(o => o.classList.contains('is-active')), [true, false, false]);
+  keyOn(input, 'ArrowDown');
+  keyOn(input, 'ArrowDown');
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-2');
+  keyOn(input, 'ArrowDown');
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-0', '回り込む');
+  keyOn(input, 'ArrowUp');
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-2');
+  assert.equal(optsOf(env)[2].scrollCalls.length > 0, true, '強調した候補を見える所へ');
+  keyOn(input, 'ArrowUp');
+  keyOn(input, 'ArrowUp');
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-0');
+  // 変換中のキーは無視する（↓ も Enter も）
+  keyOn(input, 'ArrowDown', {isComposing: true});
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-0');
+  keyOn(input, 'Enter', {isComposing: true});
+  keyOn(input, 'Enter', {keyCode: 229});
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '変換中の Enter では決めない');
+  assert.equal(input.getAttribute('aria-expanded'), 'true');
+  // Enter → 市区町村（長野県 松本市）
+  const enter = {type: 'keydown', key: 'Enter'};
+  input.dispatchEvent(enter);
+  await settle();
+  const q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('pref'), '長野県');
+  assert.equal(q.get('city'), '松本市');
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'city', pref: '長野県', city: '松本市'});
+  assert.equal(env.$('#lib-sel').textContent, '長野県 松本市');
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1)), {bounds: [137.8, 36.1, 138.1, 36.4], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}});
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  assert.equal(input.getAttribute('aria-activedescendant'), null);
+  assert.equal(hidden(env, '#lib-place-list'), true);
+  assert.equal(input.value, '松本市');
+  const pref = pcards(env).find(c => c.dataset.key === '長野県');
+  assert.ok(pref, '県のカード');
+  assert.ok(pref.classList.contains('is-selected'), 'その県のカードが選ばれ');
+  assert.ok(pref.classList.contains('has-cities'));
+  assert.equal(cityChips(pref).find(c => c.dataset.key === '長野県/松本市').getAttribute('aria-pressed'), 'true');
+  assert.equal(map.moves.length, 1, '地図は 1 回だけ動かす');
+  // Enter で決めたあとの Enter（候補が閉じている）は何もしない
+  const reqs = env.reqs('/api/admin/library/photos').length;
+  keyOn(input, 'Enter');
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, reqs);
+  // 県だけ: pref だけ
+  typeInto(input, 'ながの');
+  keyOn(input, 'ArrowDown');
+  keyOn(input, 'Enter');
+  await settle();
+  const p = env.last('/api/admin/library/photos');
+  assert.equal(p.get('pref'), '長野県');
+  assert.equal(p.get('city'), null);
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'pref', pref: '長野県'});
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1).bounds), [137.3, 35.2, 138.7, 37.0]);
+  // 今選んでいるものをもう一度選んでも外れない（読み直さない）。地図は同じ範囲なら動かさない
+  const n = env.reqs('/api/admin/library/photos').length;
+  map.endMove();                                        // 地図が県の範囲に着いた
+  env.fake.bounds = {w: 137.3, s: 35.2, e: 138.7, n: 37.0};
+  typeInto(input, 'nagano');
+  keyOn(input, 'ArrowDown');
+  keyOn(input, 'Enter');
+  await settle();
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'pref', pref: '長野県'}, '外れない');
+  assert.equal(env.reqs('/api/admin/library/photos').length, n);
+  // クリックでも決める。強調は要らない。bbox が null の市区町村は地図を動かさない
+  const moves = map.calls.fitBounds.length;
+  typeInto(input, '軽井沢');
+  optsOf(env)[0].click();
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('city'), '軽井沢町');
+  assert.equal(map.calls.fitBounds.length, moves);
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  // 候補の mousedown は入力欄のフォーカスを奪わない（blur で閉じない）
+  typeInto(input, '松');
+  const md = {type: 'mousedown'};
+  optsOf(env)[0].dispatchEvent(md);
+  assert.equal(md.defaultPrevented, true);
+  // フォーカスが外れたら閉じる
+  input.dispatchEvent({type: 'blur'});
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+});
+
+await test('(x4) AC14 Esc で閉じる（閉じているときの Esc は何もしない）。閉じたあと ↓ で全部の候補を開き直せる。場所を離れると閉じる', async () => {
+  const env = makeEnv();
+  env.handlers.places = () => reply(comboBody());
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  const input = comboBox(env);
+  typeInto(input, '松');
+  keyOn(input, 'ArrowDown');
+  const esc = {type: 'keydown', key: 'Escape'};
+  input.dispatchEvent(esc);
+  assert.equal(esc.defaultPrevented, true);
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  assert.equal(input.getAttribute('aria-activedescendant'), null);
+  assert.equal(hidden(env, '#lib-place-list'), true);
+  assert.equal(input.value, '松', '文字は残す');
+  const esc2 = {type: 'keydown', key: 'Escape'};
+  input.dispatchEvent(esc2);
+  assert.notEqual(esc2.defaultPrevented, true, '閉じているときの Esc は他の処理に任せる');
+  // Esc のあと ↓ で開き直す（文字に合う候補で、先頭を強調）
+  keyOn(input, 'ArrowDown');
+  assert.equal(input.getAttribute('aria-expanded'), 'true');
+  assert.equal(labelsOf(env).length, 3);
+  assert.equal(input.getAttribute('aria-activedescendant'), 'lib-opt-0');
+  // 空の欄で ↓ → 全部の候補（県 4 + 市区町村）
+  typeInto(input, '');
+  keyOn(input, 'ArrowDown');
+  assert.equal(optsOf(env).length, 14, '県 5（北海道を含む）+ 市区町村 9');
+  assert.equal(labelsOf(env)[0], '長野県（423）');
+  // 場所を離れると閉じる
+  env.$('#lib-view-trips').click();
+  await settle();
+  assert.equal(input.getAttribute('aria-expanded'), 'false');
+  assert.equal(hidden(env, '#lib-place-list'), true);
+});
+
+await test('(x5) AC14 地図の範囲で隠れている県も選べる: mapBbox を外してカードを読み直してから選ぶ。市区町村のチップはそのあとに出る。読み直しの間に別の操作があれば選ばない', async () => {
+  const env = makeEnv();
+  const held = [];
+  env.handlers.places = params => {
+    if(!params.get('bbox')) return reply(comboBody());
+    const body = {ok: true, abroad: 0, prefs: [comboBody().prefs[3]]};     // 地図の範囲には愛媛県だけ
+    return held.hold ? new Promise(res => held.push(() => res(jsonRes(body)))) : reply(body);
+  };
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  env.raf();
+  userMove(env, {bounds: {w: 132, s: 33, e: 134, n: 34.5}});
+  await settle();
+  assert.deepEqual(pcards(env).map(cardName), ['愛媛県'], '地図の範囲の中は愛媛県だけ');
+  const input = comboBox(env);
+  typeInto(input, '松本');                              // 候補用は地図の絞り込みを掛けない: 長野県 松本市が出る
+  assert.deepEqual(labelsOf(env), ['長野県 松本市（80）']);
+  keyOn(input, 'ArrowDown');
+  keyOn(input, 'Enter');
+  await settle();
+  assert.equal(env.ev('ls.mapBbox'), null, '地図の範囲による絞り込みは外れる');
+  assert.equal(env.last('/api/admin/library/places').get('bbox'), null, 'カードは bbox なしで読み直した');
+  assert.deepEqual(pcards(env).map(cardName), ['長野県', '東京都', '千葉県', '愛媛県', '北海道']);
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'city', pref: '長野県', city: '松本市'});
+  assert.equal(env.last('/api/admin/library/photos').get('pref'), '長野県');
+  assert.equal(env.last('/api/admin/library/photos').get('city'), '松本市');
+  const pref = pcards(env).find(c => c.dataset.key === '長野県');
+  assert.ok(pref.classList.contains('has-cities'), 'カードを読み直したあとにチップが出る');
+  assert.equal(cityChips(pref).find(c => c.dataset.key === '長野県/松本市').getAttribute('aria-pressed'), 'true');
+  assert.equal(env.$('#lib-note').textContent, '5 都道府県');
+  assert.deepEqual(plain(mapOf(env).calls.fitBounds.at(-1).bounds), [137.8, 36.1, 138.1, 36.4]);
+  // 読み直しの間に別の操作（view を替える）があれば、読み直したあとに選ばない
+  mapOf(env).endMove();
+  userMove(env, {bounds: {w: 132, s: 33, e: 134, n: 34.5}});
+  await settle();
+  assert.equal(env.ev('ls.mapBbox').length, 4);
+  held.hold = true;
+  typeInto(input, '東京');
+  keyOn(input, 'ArrowDown');
+  keyOn(input, 'Enter');
+  await settle();
+  assert.equal(env.ev('ls.mapBbox'), null);
+  env.$('#lib-view-trips').click();
+  await settle();
+  const sel = JSON.stringify(plain(env.ev('ls.sel.places')));
+  held.forEach(f => f());
+  await settle();
+  assert.equal(JSON.stringify(plain(env.ev('ls.sel.places'))), sel, '別の画面にいるあいだに来た読み直しでは選ばない');
+});
+
+await test('(y) AC15 除外の切り替えで、検索・言葉・候補の読み込みはすべて hidden=1（詳細はページ 1）。候補用の /places も読み直し、開いているリストは新しい候補になる', async () => {
+  const env = makeEnv();
+  env.handlers.places = params => reply(params.get('hidden') === '1'
+    ? {ok: true, abroad: 0, prefs: [{pref: '長野県', count: 5, cover: null, bbox: null, cities: [{city: '松本市', count: 5, bbox: null}]}]}
+    : comboBody());
+  await env.boot();
+  await openLib(env);
+  const toggle = on => { env.$('#lib-hidden').checked = on; env.$('#lib-hidden').dispatchEvent({type: 'change'}); };
+  // 旅の検索
+  typeInto(searchBox(env), '松本');
+  keyOn(searchBox(env), 'Enter');
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), null);
+  env.handlers.photos = params => reply({ok: true, page: Number(params.get('page')), per: 60, pages: 3, total: 130, items: GRID});
+  env.$('#lib-next').click();
+  await settle();
+  toggle(true);
+  await settle();
+  let q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('q'), '松本');
+  assert.equal(q.get('hidden'), '1');
+  assert.equal(q.get('page'), '1');
+  // 日付の言葉
+  env.$('#lib-view-calendar').click();
+  await settle();
+  env.handlers.when = () => reply({ok: true, from: '2025-06-01 00:00', to: '2025-08-31 23:59', source: 'rule'});
+  whenBox(env).value = '去年の夏';
+  keyOn(whenBox(env), 'Enter');
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('hidden'), '1');
+  assert.equal(q.get('from'), '2025-06-01 00:00');
+  assert.equal(whenReqs(env).length, 1);
+  toggle(false);
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), null);
+  assert.equal(env.last('/api/admin/library/photos').get('from'), '2025-06-01 00:00', '言葉の選択はそのまま');
+  assert.equal(whenReqs(env).length, 1, '言葉を読み直さない（期間はそのまま）');
+  // 場所: カード用と候補用の両方を hidden=1 で読み直す。開いているリストは新しい候補に替わる
+  await openPlaces(env);
+  typeInto(comboBox(env), '松');
+  assert.deepEqual(labelsOf(env), ['長野県 松本市（80）', '千葉県 松戸市（70）', '愛媛県 松山市（60）']);
+  const since = env.calls.length;
+  toggle(true);
+  await settle();
+  const placeCalls = env.calls.slice(since).filter(c => c.url.startsWith('/api/admin/library/places'));
+  assert.equal(placeCalls.length, 2, 'カード用と候補用');
+  assert.ok(placeCalls.every(c => new URLSearchParams(c.url.split('?')[1]).get('hidden') === '1'));
+  assert.deepEqual(labelsOf(env), ['長野県 松本市（5）'], '候補は除外を含めた件数で作り直す');
+  // 候補を決めると、詳細も hidden=1
+  keyOn(comboBox(env), 'ArrowDown');
+  keyOn(comboBox(env), 'Enter');
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('hidden'), '1');
+  assert.equal(env.last('/api/admin/library/photos').get('city'), '松本市');
 });

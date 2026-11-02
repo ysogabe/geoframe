@@ -113,6 +113,15 @@
       <button class="lib-seg on" id="lib-view-trips" type="button" data-view="trips">旅</button>
       <button class="lib-seg" id="lib-view-calendar" type="button" data-view="calendar">日付</button>
       <button class="lib-seg" id="lib-view-places" type="button" data-view="places">場所</button>
+      <!-- 探す欄は view ごとに 1 つだけ出す（library.js が .hidden を付け外しする）。旅: 文字検索（カードを絞り、Enter で写真）/ 日付: 言葉（Enter で期間に直す）/ 場所: 候補が減るコンボボックス -->
+      <input type="text" class="lib-in" id="lib-search" placeholder="旅を探す（日時・地名）" aria-label="旅を探す" autocomplete="off">
+      <input type="text" class="lib-in hidden" id="lib-when" placeholder="日付の言葉（例: 去年の夏）" aria-label="日付の言葉" autocomplete="off">
+      <span class="lib-when-note hidden" id="lib-when-note" role="status"></span>
+      <span class="lib-combo hidden">
+        <input type="text" class="lib-in hidden" id="lib-place-combo" placeholder="場所を探す（例: 松本・ながの）" aria-label="場所を探す" autocomplete="off"
+               role="combobox" aria-expanded="false" aria-controls="lib-place-list" aria-autocomplete="list">
+        <div class="lib-opts hidden" id="lib-place-list" role="listbox" aria-label="場所の候補"></div>
+      </span>
       <label class="opt"><input type="checkbox" id="lib-hidden"> 除外も含める</label>
       <span class="spacer"></span>
       <span class="count" id="lib-note"></span>

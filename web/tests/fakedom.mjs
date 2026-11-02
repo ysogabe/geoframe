@@ -142,6 +142,12 @@ class FakeElement {
     else if(name === 'class') this.className = v;
     else if(name.startsWith('data-')) this.dataset[kebabToCamel(name.slice(5))] = v;
   }
+  removeAttribute(name){
+    delete this.attributes[name];
+    if(name === 'id') this.id = '';
+    else if(name === 'class') this.className = '';
+    else if(name.startsWith('data-')) delete this.dataset[kebabToCamel(name.slice(5))];
+  }
   getAttribute(name){
     if(name === 'id') return this.id || null;
     if(name === 'class') return this.className || null;
@@ -298,6 +304,14 @@ export function buildAdminDom(){
   mk('button', {id: 'lib-view-trips', cls: 'lib-seg on', text: '旅', data: {view: 'trips'}}, lbar);
   mk('button', {id: 'lib-view-calendar', cls: 'lib-seg', text: '日付', data: {view: 'calendar'}}, lbar);
   mk('button', {id: 'lib-view-places', cls: 'lib-seg', text: '場所', data: {view: 'places'}}, lbar);
+  mk('input', {id: 'lib-search', cls: 'lib-in'}, lbar);
+  mk('input', {id: 'lib-when', cls: 'lib-in hidden'}, lbar);
+  mk('span', {id: 'lib-when-note', cls: 'lib-when-note hidden'}, lbar);
+  const lcombo = mk('span', {cls: 'lib-combo hidden'}, lbar);
+  const lcin = mk('input', {id: 'lib-place-combo', cls: 'lib-in hidden'}, lcombo);
+  [['role', 'combobox'], ['aria-expanded', 'false'], ['aria-controls', 'lib-place-list'], ['aria-autocomplete', 'list']]
+    .forEach(([k, v]) => lcin.setAttribute(k, v));
+  mk('div', {id: 'lib-place-list', cls: 'lib-opts hidden'}, lcombo).setAttribute('role', 'listbox');
   const lopt = mk('label', {cls: 'opt'}, lbar);
   mk('input', {id: 'lib-hidden'}, lopt);
   lopt.appendChild(document.createTextNode(' 除外も含める'));
