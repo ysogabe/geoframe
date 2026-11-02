@@ -407,6 +407,47 @@ await test('(c2) 格子のページング: 次へ・前へで page を付けて�
   assert.notDeepEqual(tiles(env).map(x => x.dataset.id), ['503'], '古い応答は捨てる');
 });
 
+await test('(c2b) ページ送りの応答が保留のまま別の旅を選んでも、遅れて届いた前の旅の 2 ページ目は捨てる（B の選択・写真・ページ表示・送りボタンが保たれる）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const pageOf = (page, pages, total, items) => ({ok: true, page, per: 60, pages, total, items});
+  let releaseA2;
+  env.handlers.photos = params => {
+    if(params.get('from') === '2030-05-03 09:12'){            // 旅 A
+      if(params.get('page') === '2'){
+        return new Promise(res => { releaseA2 = () => res({ok: true, status: 200, json: () => Promise.resolve(pageOf(2, 3, 130, [P502]))}); });
+      }
+      return reply(pageOf(1, 3, 130, GRID));
+    }
+    return reply(pageOf(1, 1, 1, [P503]));                    // 旅 B
+  };
+  pressTrip(env, 0);
+  await settle();
+  assert.equal(env.$('#lib-pageinfo').textContent, '130件 / 1 of 3ページ');
+  env.$('#lib-next').click();                                  // A の 2 ページ目（保留）
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('page'), '2');
+  pressTrip(env, 1);                                           // B を選ぶ（1 ページ目がすぐ返る）
+  await settle();
+  const check = msg => {
+    assert.equal(env.$('#lib-sel').textContent, '2029-01-01 00:00', msg);
+    assert.deepEqual(tiles(env).map(x => x.dataset.id), ['503'], msg);
+    assert.equal(env.$('#lib-pageinfo').textContent, '1件 / 1 of 1ページ', msg);
+    assert.equal(env.$('#lib-next').disabled, true, msg);
+    assert.equal(env.$('#lib-prev').disabled, true, msg);
+    assert.deepEqual(cards(env).map(x => x.classList.contains('is-selected')), [false, true, false], msg);
+  };
+  check('B の 1 ページ目');
+  releaseA2();                                                 // 遅れて A の 2 ページ目が届く
+  await settle();
+  check('遅れた A の応答は捨てる');
+  // その後に B で次へを押せない（A の pages 3 を引きずらない）。押しても読まない
+  const before = env.reqs('/api/admin/library/photos').length;
+  env.$('#lib-next').click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, before);
+});
 await test('(d) タイルを押すとビューアが開き、★は setflag にその写真の id を送って印が変わり、閉じるとタイルへフォーカスが戻る', async () => {
   const env = makeEnv();
   await env.boot();
@@ -891,6 +932,49 @@ await test('(h) 旅の「地図で見る」: その期間で points を読み、
   const p = env.last('/api/admin/library/points');
   assert.equal(p.get('from'), null);
   assert.equal(p.get('to'), null);
+});
+await test('(h2) 旅の「地図で見る」は前の旅の範囲選択を持ち越さない: 旅 A → 地図で見る → この範囲の写真を見る → 旅へ戻る → 旅 B の地図で見る', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  const A = '2030-05-03 09:12', B = '2029-01-01 00:00';
+  let releaseA;
+  env.handlers.photos = params => {
+    if(params.get('bbox') && params.get('from') === A){       // 旅 A の範囲の写真（応答は保留）
+      return new Promise(res => { releaseA = () => res({ok: true, status: 200, json: () => Promise.resolve(
+        {ok: true, page: 1, per: 60, pages: 1, total: 2, items: [P501, P502]})}); });
+    }
+    return null;
+  };
+  cards(env)[0].querySelector('.lib-card-map').click();      // 旅 A の地図
+  await settle();
+  env.$('#lib-bbox').click();                                  // この範囲の写真を見る（保留）
+  await settle();
+  assert.equal(env.last('/api/admin/library/photos').get('from'), A);
+  env.$('#lib-view-trips').click();                            // 旅へ戻る
+  await settle();
+  const photoReqs = env.reqs('/api/admin/library/photos').length;
+  cards(env)[1].querySelector('.lib-card-map').click();      // 旅 B の地図
+  await settle();
+  assert.equal(env.last('/api/admin/library/points').get('from'), B);
+  assert.equal(env.$('#lib-period-text').textContent, '期間: 2029-01-01 00:00');
+  assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs, 'A の期間の写真を読み直さない');
+  assert.equal(hidden(env, '#lib-detail'), true, 'A の範囲選択は解除されている');
+  assert.equal(env.$('#lib-sel').textContent, '');
+  assert.equal(tiles(env).length, 0);
+  assert.equal(env.ev('ls.sel.map'), null);
+  // 遅れて A の応答が届いても捨てる
+  releaseA();
+  await settle();
+  assert.equal(tiles(env).length, 0, '遅れた A の詳細は出さない');
+  assert.equal(hidden(env, '#lib-detail'), true);
+  // B の範囲の写真は B の期間で読む
+  env.handlers.photos = null;
+  env.$('#lib-bbox').click();
+  await settle();
+  const q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('from'), B);
+  assert.equal(q.get('to'), B);
 });
 await test('(i) 点の応答が遅れて入れ違っても、新しい要求の結果だけが source に渡る', async () => {
   const env = makeEnv();

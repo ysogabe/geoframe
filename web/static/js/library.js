@@ -281,8 +281,13 @@ function loadTrips(){
     renderTrips();
   }).catch(e => { if(seq === ls.seq.trips) toast('旅の一覧を読めませんでした: ' + e.message, true); });
 }
+/* 「地図で見る」は新しい期間で地図を見直す。以前の地図の範囲選択（別の旅の期間を持つ bbox）は持ち越さず解除し、
+   飛んでいる詳細の応答も捨てる（setLibView が復元する sel.map を空にしてから切り替える） */
 function mapForTrip(trip){
   ls.period = {from: trip.start, to: trip.end};
+  ls.sel.map = null;
+  ls.gen++;
+  ls.seq.detail++;
   setLibView('map');
 }
 
