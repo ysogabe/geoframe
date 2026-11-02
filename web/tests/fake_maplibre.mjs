@@ -11,6 +11,10 @@
 //                           resize は回数と、渡された eventData の並び
 //   map.resize(eventData)   本物と同じく、移動の途中でなければ eventData を載せた moveend を起こす（本物の resize は stop → movestart → move →
 //                           resize → moveend を同期で起こす。eventData の無い resize は「利用者の移動」に見えるので、呼ぶ側は libMove を付ける）
+//   fake.constrain          関数を入れると map.resize() が moveend の前にこれを呼ぶ（本物の resize は transform.resize() → _constrain() で、maxBounds の端や
+//                           最小ズームの付近では中心・ズームを自動で補正する。試験は中でfake.center / fake.zoom を書き換えて補正を表す）
+//   map.dragRotate / touchZoomRotate / touchPitch / keyboard / boxZoom   入力の handler。disable()・disableRotation() の呼び出しを map.disabled に記録する
+//                           （例: map.disabled = ['dragRotate.disable', 'touchZoomRotate.disableRotation', …]）
 //   map.getCenter()/getZoom()  fake.center / fake.zoom（既定は経度 137・緯度 36・ズーム 4）。endMove() が移動先へ動かす（fitBounds は範囲の中心でズームを 1 増やす、
 //                           easeTo は options.center・zoom）。試験は fake.center / fake.zoom を直接書き換えて「利用者が動かした」を表す
 //   map.moves               まだ終わっていない移動 [{kind, options, eventData, bounds}]（fitBounds・easeTo を呼ぶと積まれる）
@@ -34,6 +38,13 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
       this.controls = [];
       this.calls = {resize: 0, resizeArgs: [], easeTo: [], flyTo: [], fitBounds: []};
       this.moves = [];
+      this.disabled = [];
+      const handler = (name, ...methods) => Object.fromEntries(methods.map(m => [m, () => { this.disabled.push(`${name}.${m}`); }]));
+      this.dragRotate = handler('dragRotate', 'disable');
+      this.touchZoomRotate = handler('touchZoomRotate', 'disable', 'disableRotation');
+      this.touchPitch = handler('touchPitch', 'disable');
+      this.keyboard = handler('keyboard', 'disable', 'disableRotation');
+      this.boxZoom = handler('boxZoom', 'disable');
       this.canvas = {style: {}};
       this.loaded = false;
       fake.maps.push(this);
@@ -74,6 +85,7 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
     resize(eventData){
       this.calls.resize++;
       this.calls.resizeArgs.push(eventData === undefined ? null : eventData);
+      if(typeof fake.constrain === 'function') fake.constrain();
       if(!this.moves.length) this.fire('moveend', Object.assign({}, eventData));
       return this;
     }

@@ -23,7 +23,7 @@
    loaded: 読み込み済みの一覧
    period: 場所の画面に掛かる期間 {from, to}（旅の「地図で見る」で入り、解除ボタンで外す）。カード・候補・点・詳細のすべてに掛かる。
    mapBbox: 利用者が地図を動かしたときのカードの絞り込み [w, s, e, n]。null なら絞らない。
-   fitPoints: 「地図で見る」のあと、点を読めたら点の範囲へ地図を動かす印。cam: 直近の moveend のときの地図の中心とズーム（resize だけの moveend を見分ける）。
+   fitPoints: 「地図で見る」のあと、点を読めたら点の範囲へ地図を動かす印。
    onPlaces・detailShown・resizeQueued: 地図の大きさを合わせ直す時点を決める印（場所の view を出した・詳細の出し入れ・合わせ直しの予約中）。
    pointsStale: 地図が見えていないあいだに設定（除外も含める）が変わったので、地図に戻るとき点を取り直す印。
    seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が詳細の読み込みを捨てないため） */
@@ -33,7 +33,7 @@ const ls = {
   years: [], calUntimed: 0, prefs: [], abroad: 0, placeOpts: {prefs: [], abroad: 0},
   loaded: {trips: false, calendar: false, placeCards: false, placeOptions: false},
   sel: {trips: null, calendar: null, places: null}, gen: 0, anchor: null,
-  period: null, mapBbox: null, fitPoints: false, cam: null, pointsStale: false,
+  period: null, mapBbox: null, fitPoints: false, pointsStale: false,
   onPlaces: false, detailShown: false, resizeQueued: false,
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
   map: null, pendingData: null, labels: new Map(), popup: null,
@@ -633,20 +633,20 @@ function fitMapTo(bbox){
   if(cur.every((v, i) => Math.abs(v - bbox[i]) < 1e-6)) return;
   map.fitBounds(bbox, fitOptions(), LIB_MOVE);
 }
-/* 地図の中心とズーム（MapLibre の resize は動いていなくても moveend を起こす。コンテナの大きさが変わっただけ
-   （ウィンドウ幅・スクロールバー・詳細の出し入れ）の moveend を、利用者の移動と取り違えないため） */
-function cameraKey(){
-  const c = ls.map.getCenter();
-  return [c.lng.toFixed(5), c.lat.toFixed(5), ls.map.getZoom().toFixed(3)].join(',');
+/* 利用者が地図を動かしたか。印は 2 つだけ（カメラの差からは推測しない）:
+   - moveend のイベントに originalEvent がある。MapLibre 4.7.1 は、ドラッグ（慣性の終わりも）・ホイールのズーム・ダブルクリック・タッチ（ピンチ・
+     ダブルタップ）・キーボードの移動、NavigationControl のズームボタンの moveend に originalEvent（元の DOM イベント）を載せる。
+   - 自分のコードが付けた eventData {libUser: true}（クラスタを押したときの easeTo）。
+   それ以外は絞らない: libMove 付きの自動の移動、resize（ResizeObserver 経由は eventData が無く、resize の _constrain が maxBounds の端や
+   最小ズームの付近で中心・ズームを自動で補正して moveend を起こすが、それは利用者の移動ではない）。
+   自動の移動の途中に利用者がドラッグしたとき、中断された移動の moveend は libMove 付き（絞らない）、そのあとのドラッグの moveend は originalEvent 付き（絞る）。 */
+const LIB_USER = {libUser: true};
+function isUserMove(e){
+  if(!e || e.libMove) return false;
+  return !!(e.originalEvent || e.libUser);
 }
-/* moveend: libMove の付いたもの（上の移動）は絞らない。付いていない移動（ドラッグ・ズーム・ホイール・クラスタを押したときの easeTo・
-   自動の移動の途中のドラッグ）で、地図の中心かズームが変わっていれば利用者の移動として、表示範囲でカードを読み直す */
 function onMapMoveEnd(e){
-  const cam = cameraKey();
-  const moved = cam !== ls.cam;
-  ls.cam = cam;
-  if(e && e.libMove) return;
-  if(!moved || !mapVisible()) return;
+  if(!isUserMove(e) || !mapVisible()) return;
   ls.fitPoints = false;
   ls.mapBbox = currentBbox();
   loadPlaceCards();
@@ -695,7 +695,14 @@ function ensureLibMap(){
     renderWorldCopies: false, maxBounds: [[-LIB_MAX_LNG, -85], [LIB_MAX_LNG, 85]],
   });
   ls.map = map;
-  ls.cam = cameraKey();
+  // 回転・傾斜は使わない: 回転・傾斜した地図の表示範囲は bbox（東西南北の矩形）で表せず、カードの絞り込み（currentBbox）と合わなくなる。
+  // 管理画面の地図に回転・傾斜の用途は無い。右ドラッグ・Ctrl ドラッグ（回転・傾斜）、2 本指の回転、2 本指の傾斜、キーボードの回転・傾斜を無効にする。
+  // 範囲選択のズーム（Shift+ドラッグ）も無効にする: MapLibre はこの移動に eventData を渡さず、moveend に originalEvent が載らないので利用者の移動と見分けられない。
+  map.dragRotate.disable();
+  map.touchZoomRotate.disableRotation();
+  map.touchPitch.disable();
+  map.keyboard.disableRotation();
+  map.boxZoom.disable();
   map.addControl(new maplibregl.NavigationControl({showCompass: false}), 'top-right');
   map.on('load', () => addPointLayers(map));
   map.on('moveend', syncClusterLabels);
@@ -710,7 +717,7 @@ function ensureLibMap(){
     const f = e.features && e.features[0];
     if(!f) return;
     map.getSource(LIB_POINTS_SOURCE).getClusterExpansionZoom(f.properties.cluster_id).then(zoom => {
-      map.easeTo({center: f.geometry.coordinates, zoom});
+      map.easeTo({center: f.geometry.coordinates, zoom}, LIB_USER);
     }).catch(() => {});
   });
   map.on('click', 'lib-point', e => {

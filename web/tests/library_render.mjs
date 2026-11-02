@@ -1717,14 +1717,16 @@ await test('(u) 偽の MapLibre: fitBounds(bounds, options, eventData)・easeTo(
 });
 
 // ---- AC7: 地図の移動の理由 ----
-// 利用者の移動（ドラッグ・ズーム・クラスタを押したときの easeTo）の moveend には libMove が無い。カード・チップ・「地図で見る」・「全体に戻す」・
-// 自分の resize の移動の moveend には libMove が付く。偽の MapLibre は fitBounds・easeTo を積むだけで、moveend は endMove() を呼んだときに起こす
+// 利用者の移動の印は 2 つだけ: moveend のイベントの originalEvent（ドラッグ・ホイール・ダブルクリック・タッチ・キーボード・ズームボタン）と、
+// 自分のコードが付けた eventData {libUser:true}（クラスタを押したときの easeTo）。カード・チップ・「地図で見る」・「全体に戻す」・自分の resize の
+// 移動の moveend には libMove が付く。originalEvent も libUser も無い moveend（ResizeObserver 経由の resize とその _constrain の補正）は絞らない。
+// 偽の MapLibre は fitBounds・easeTo を積むだけで、moveend は endMove() を呼んだときに起こす
 // （interrupt() は起こさず捨てる。本物は中断された移動の moveend も起こすので、試験で明示して fire する）
 const withBboxOnly = () => params => params.get('bbox') ? reply({ok: true, abroad: 0, prefs: [
   {pref: '架空県', count: 7, cover: {id: 701, thumb_url: '/thumb/701.jpg?v=dddddddddddd'}, bbox: [130.5, 30.5, 131, 31],
    cities: [{city: '見本町', count: 7, bbox: [130.5, 30.5, 130.6, 30.6]}]}]}) : null;
 const bboxReqs = env => placeQs(env).filter(q => q.get('bbox'));
-const userMove = (env, to) => {                  // 利用者のドラッグ相当: 中心・ズーム・表示範囲が変わって libMove の無い moveend
+const userMove = (env, to) => {                  // 利用者のドラッグ相当: 中心・ズーム・表示範囲が変わり、originalEvent の付いた moveend
   const map = mapOf(env);
   if(to.bounds) env.fake.bounds = to.bounds;
   if(to.center) env.fake.center = to.center;
@@ -1759,21 +1761,31 @@ await test('(v) AC7 ドラッグ・ズーム・クラスタを押したあとの
   await settle();
   assert.equal(bboxReqs(env).length, 2);
   assert.equal(bboxReqs(env)[1].get('bbox'), '130.5,30.75,131.5,31.25');
-  // クラスタを押す: easeTo（eventData なし）→ 終わると moveend に libMove が無い
+  // クラスタを押す: easeTo に libUser を付ける → 終わると moveend に libUser が載る
   mapOf(env).fire('click', {features: [{properties: {cluster_id: 7}, geometry: {coordinates: [131.25, 31.1]}}]}, 'lib-clusters');
   await settle();
   assert.equal(map.moves.length, 1);
-  assert.equal(map.moves[0].eventData, undefined, 'クラスタの easeTo は libMove を付けない');
+  assert.deepEqual(plain(map.moves[0].eventData), {libUser: true}, 'クラスタの easeTo は libUser を付ける（libMove は付けない）');
   env.fake.bounds = {w: 131, s: 31, e: 131.5, n: 31.25};
   map.endMove();
   await settle();
   assert.equal(bboxReqs(env).length, 3);
   assert.equal(bboxReqs(env)[2].get('bbox'), '131,31,131.5,31.25');
-  // 中心もズームも変わっていない moveend（コンテナの大きさだけが変わった resize。本物の ResizeObserver 経由）は利用者の移動ではない
+  // originalEvent も libUser も無い moveend は利用者の移動ではない（ResizeObserver 経由の resize は eventData が配列で originalEvent が無い）。
+  // 中心・ズームが変わっていなくても、変わっていても（resize の _constrain の補正）絞らない
   map.resize([]);
   map.fire('moveend', {});
   await settle();
   assert.equal(bboxReqs(env).length, 3, '大きさだけの変化ではカードを絞らない');
+  const camBefore = {...env.fake.center};
+  env.fake.constrain = () => { env.fake.center = {lng: 131.1, lat: 31.05}; env.fake.zoom = 3; env.fake.bounds = {w: 100, s: 10, e: 150, n: 50}; };
+  map.resize([]);                                      // 偽の resize が中心・ズームを補正して moveend を起こす
+  env.fake.constrain = null;
+  await settle();
+  assert.notDeepEqual(plain(env.fake.center), plain(camBefore), '補正で中心が動いた');
+  assert.equal(bboxReqs(env).length, 3, 'resize の補正（中心・ズームが変わる）でもカードを絞らない');
+  assert.deepEqual(plain(env.ev('ls.mapBbox')), [131, 31, 131.5, 31.25], '絞り込みは前のまま');
+  env.fake.bounds = {w: 131, s: 31, e: 131.5, n: 31.25};
   // この範囲の写真を見る: 表示範囲の bbox
   env.$('#lib-bbox').click();
   await settle();
@@ -1852,6 +1864,55 @@ await test('(v2) AC7 カード・チップの選択の fitBounds のあとは読
   await settle();
   assert.equal(bboxReqs(env).length, before + 1);
   assert.equal(bboxReqs(env).at(-1).get('bbox'), '130.5,30.5,130.6,30.6');
+});
+
+await test('(v2b) AC7 利用者の移動の判定: originalEvent 付き・libUser 付きの moveend だけ読む。印の無い moveend（resize の補正）・libMove 付きでは読まない。originalEvent があっても libMove 付きなら読まない', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.handlers.places = withBboxOnly();
+  await openPlaces(env);
+  env.raf();
+  const map = mapOf(env);
+  assert.equal(bboxReqs(env).length, 0);
+  const fireEnd = async (event, bounds) => {
+    env.fake.bounds = bounds;
+    map.fire('moveend', event);
+    await settle();
+    return bboxReqs(env).length;
+  };
+  // 印の無い moveend: 範囲が変わっていても読まない（ResizeObserver 経由の resize とその補正）
+  assert.equal(await fireEnd(undefined, {w: 1, s: 2, e: 3, n: 4}), 0, 'イベントの内容が無い');
+  assert.equal(await fireEnd({}, {w: 1, s: 2, e: 3, n: 4}), 0, '印が無い');
+  assert.equal(await fireEnd({0: {contentRect: {}}, length: 1}, {w: 1, s: 2, e: 3, n: 4}), 0, 'ResizeObserver の entries 相当');
+  // libMove 付きは読まない
+  assert.equal(await fireEnd({libMove: true}, {w: 5, s: 6, e: 7, n: 8}), 0, 'libMove 付き');
+  assert.equal(await fireEnd({libMove: true, originalEvent: {type: 'mouseup'}}, {w: 5, s: 6, e: 7, n: 8}), 0, 'libMove が優先');
+  assert.equal(env.ev('ls.mapBbox'), null);
+  // originalEvent 付きは読む（ドラッグ・ホイール・ダブルクリック・キーボード・ズームボタン）
+  assert.equal(await fireEnd({originalEvent: {type: 'mouseup'}}, {w: 130.25, s: 30.5, e: 131.75, n: 31.5}), 1, 'originalEvent 付き');
+  assert.equal(bboxReqs(env)[0].get('bbox'), '130.25,30.5,131.75,31.5');
+  // libUser 付き（クラスタを押したときの easeTo）は読む
+  assert.equal(await fireEnd({libUser: true}, {w: 130.5, s: 30.5, e: 131, n: 31}), 2, 'libUser 付き');
+  assert.equal(bboxReqs(env)[1].get('bbox'), '130.5,30.5,131,31');
+  // 場所の画面でない（地図が見えない）ときは読まない
+  env.$('#lib-view-trips').click();
+  await settle();
+  assert.equal(await fireEnd({originalEvent: {type: 'mouseup'}}, {w: 9, s: 9, e: 9.5, n: 9.5}), 2, '地図が見えていない');
+});
+
+await test('(v2c) 地図の回転・傾斜は無効: dragRotate・touchZoomRotate（回転）・touchPitch・keyboard（回転）・boxZoom を disable。NavigationControl はコンパスなし', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-places').click();
+  await settle();
+  const map = mapOf(env);
+  for(const call of ['dragRotate.disable', 'touchZoomRotate.disableRotation', 'touchPitch.disable', 'keyboard.disableRotation', 'boxZoom.disable'])
+    assert.ok(map.disabled.includes(call), call);
+  assert.ok(!map.disabled.includes('touchZoomRotate.disable'), 'ピンチのズームは残す');
+  assert.ok(!map.disabled.includes('keyboard.disable'), '矢印キーの移動・ズームは残す');
+  assert.deepEqual(plain(map.controls.map(c => c.control.options)), [{showCompass: false}]);
 });
 
 await test('(v3) カード用と候補用の /places は保存先・seq・loaded を分け、逆の順で返してもそれぞれ最新だけを使う。期間・除外が変わると両方を読み直す', async () => {
