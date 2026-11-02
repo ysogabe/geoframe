@@ -61,6 +61,9 @@ const AI_STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
 pub struct AppState {
     pub config: Arc<Config>,
     pub ai_search: Arc<crate::ai::query::Runtime>,
+    /// ライブラリの日付の言葉（`GET /api/admin/library/when`）を、規則で読めないときに読ませる LLM の補助。
+    /// `AppState::new` では LLM なし（`serve` が AI 検索と同じ `LanClient` で差し替える）。
+    pub when: Arc<crate::ai::when::Runtime>,
     pub catalog: Catalog,
     /// データ置き場を**リンクを辿って解決した**絶対パス（起動時に1回。静的配信が、要求されたファイルを
     /// 解決した結果の内外判定に使う）。データ置き場自体がシンボリックリンクでもよい。
@@ -132,8 +135,14 @@ impl AppState {
             StopFlag::new(),
             None,
         ));
+        let when = Arc::new(crate::ai::when::Runtime::new(
+            &config,
+            None,
+            StopFlag::new(),
+        ));
         Self {
             ai_search,
+            when,
             config,
             catalog,
             data_root: Arc::new(data_root),
@@ -163,6 +172,12 @@ impl AppState {
 
     pub fn with_ai_search(mut self, runtime: Arc<crate::ai::query::Runtime>) -> Self {
         self.ai_search = runtime;
+        self
+    }
+
+    /// 日付の言葉の LLM の補助を差し替える（`serve` が AI 検索と同じ `LanClient` を渡す。試験は偽の LLM を向ける）。
+    pub fn with_when(mut self, runtime: Arc<crate::ai::when::Runtime>) -> Self {
+        self.when = runtime;
         self
     }
 
@@ -707,7 +722,7 @@ fn not_yet_implemented(label: &'static str) -> Response {
 ///
 /// 0. `GET` の `/api/admin/config`（管理画面の設定タブ）は**完全一致**の読み取り API（[`crate::admin_config`]）。
 ///    HEAD・`/api/admin/configX`・末尾 `/` は当たらず、下の静的配信の判定で 403。
-///    `GET` の `/api/admin/library/{trips,photos,points,calendar,places}`（ライブラリ）も**完全一致**の読み取り API
+///    `GET` の `/api/admin/library/{trips,photos,points,calendar,places,when}`（ライブラリ）も**完全一致**の読み取り API
 ///    （[`crate::admin_library`]）。HEAD・似た名前・末尾 `/` は 403。
 ///    `GET` の `/api/admin/curation/groups`（選別の確認。[`crate::admin_curation`]）・`/api/admin/ops`（運用タブ。
 ///    [`crate::admin_ops`]）も同じ完全一致。
@@ -815,6 +830,12 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
             return labeled(
                 crate::admin_library::places(&state, parts.uri.query()).await,
                 "/api/admin/library/places",
+            );
+        }
+        if path == "/api/admin/library/when" {
+            return labeled(
+                crate::library_when::response(&state, parts.uri.query(), &parts.headers).await,
+                "/api/admin/library/when",
             );
         }
         if path == "/api/admin/library/points" {

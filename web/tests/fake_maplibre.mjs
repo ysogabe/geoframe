@@ -7,12 +7,29 @@
 //   map.sources[id]         {options, data, setDataCalls: [GeoJSON …]}   addSource / setData の記録
 //   map.layers              addLayer に渡した層の配列
 //   map.fire(type, event, layerId?)  登録されたハンドラを呼ぶ（layerId を付けた登録だけが対象）
-//   map.calls               {resize, easeTo: […], flyTo: […]} の記録
+//   map.calls               {resize, resizeArgs: […], easeTo: […], flyTo: […], fitBounds: […]} の記録。easeTo は options だけ、fitBounds は {bounds, options, eventData}、
+//                           resize は回数と、渡された eventData の並び
+//   map.resize(eventData)   本物と同じく、移動の途中でなければ eventData を載せた moveend を起こす（本物の resize は stop → movestart → move →
+//                           resize → moveend を同期で起こす。eventData の無い resize は「利用者の移動」に見えるので、呼ぶ側は libMove を付ける）
+//   fake.constrain          関数を入れると map.resize() が moveend の前にこれを呼ぶ（本物の resize は transform.resize() → _constrain() で、maxBounds の端や
+//                           最小ズームの付近では中心・ズームを自動で補正する。試験は中でfake.center / fake.zoom を書き換えて補正を表す）
+//   map.dragRotate / touchZoomRotate / touchPitch / keyboard / boxZoom   入力の handler。disable()・disableRotation() の呼び出しを map.disabled に記録する
+//                           （例: map.disabled = ['dragRotate.disable', 'touchZoomRotate.disableRotation', …]）
+//   map.getCenter()/getZoom()  fake.center / fake.zoom（既定は経度 137・緯度 36・ズーム 4）。endMove() が移動先へ動かす（fitBounds は範囲の中心でズームを 1 増やす、
+//                           easeTo は options.center・zoom）。試験は fake.center / fake.zoom を直接書き換えて「利用者が動かした」を表す
+//   map.moves               まだ終わっていない移動 [{kind, options, eventData, bounds}]（fitBounds・easeTo を呼ぶと積まれる）
+//   map.easeTo / fitBounds / resize は本物と同じく、呼んだ時点で eventData を載せた movestart を起こす（moveend は endMove() で）
+//   map.endMove()           いちばん古い移動を終え、その移動の eventData を載せた moveend を起こす（本物の MapLibre は
+//                           fitBounds(bounds, options, eventData)・easeTo(options, eventData) の eventData を、その移動の
+//                           movestart・move・moveend のイベントに載せる）。fitBounds の移動は終えるとき fake.bounds を移動先にする。
+//                           interrupt() は移動を終えずに捨てる（別の移動に置き換わった／利用者が割り込んだ）。
+//   fake.getBounds          関数を入れると Map.getBounds() がそれを返す（既定は fake.bounds）
 //   fake.popups / fake.markers   作られた Popup（setLngLat・setDOMContent・addTo・remove の記録）/ Marker
+//   fake.holdExpansion      true にすると getClusterExpansionZoom は応答を保留する。fake.pendingExpansions[i].resolve(zoom?) で解決する（zoom 省略は fake.expansionZoom）
 //   fake.features           querySourceFeatures が返すクラスタ（試験が差し替える）
 
 export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, expansionZoom = 11} = {}){
-  const fake = {maps: [], popups: [], markers: [], features: [], bounds: {...bounds}, expansionZoom};
+  const fake = {maps: [], popups: [], markers: [], features: [], pendingExpansions: [], bounds: {...bounds}, expansionZoom, center: {lng: 137, lat: 36}, zoom: 4};
 
   class FakeMap {
     constructor(options){
@@ -21,7 +38,15 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
       this.sources = {};
       this.layers = [];
       this.controls = [];
-      this.calls = {resize: 0, easeTo: [], flyTo: []};
+      this.calls = {resize: 0, resizeArgs: [], easeTo: [], flyTo: [], fitBounds: []};
+      this.moves = [];
+      this.disabled = [];
+      const handler = (name, ...methods) => Object.fromEntries(methods.map(m => [m, () => { this.disabled.push(`${name}.${m}`); }]));
+      this.dragRotate = handler('dragRotate', 'disable');
+      this.touchZoomRotate = handler('touchZoomRotate', 'disable', 'disableRotation');
+      this.touchPitch = handler('touchPitch', 'disable');
+      this.keyboard = handler('keyboard', 'disable', 'disableRotation');
+      this.boxZoom = handler('boxZoom', 'disable');
       this.canvas = {style: {}};
       this.loaded = false;
       fake.maps.push(this);
@@ -49,18 +74,59 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
       if(!rec) return undefined;
       return {
         setData: data => { rec.data = data; rec.setDataCalls.push(data); },
-        getClusterExpansionZoom: clusterId => { rec.expansionAsked = clusterId; return Promise.resolve(fake.expansionZoom); },
+        getClusterExpansionZoom: clusterId => {
+          rec.expansionAsked = clusterId;
+          if(!fake.holdExpansion) return Promise.resolve(fake.expansionZoom);
+          return new Promise(resolve => { fake.pendingExpansions.push({clusterId, resolve: zoom => resolve(zoom === undefined ? fake.expansionZoom : zoom)}); });
+        },
       };
     }
     isSourceLoaded(id){ return !!this.sources[id]; }
     querySourceFeatures(){ return fake.features; }
     getBounds(){
-      const b = fake.bounds;
+      const b = typeof fake.getBounds === 'function' ? fake.getBounds() : fake.bounds;
       return {getWest: () => b.w, getSouth: () => b.s, getEast: () => b.e, getNorth: () => b.n};
     }
     getCanvas(){ return this.canvas; }
-    resize(){ this.calls.resize++; }
-    easeTo(o){ this.calls.easeTo.push(o); }
+    resize(eventData){
+      this.calls.resize++;
+      this.calls.resizeArgs.push(eventData === undefined ? null : eventData);
+      if(typeof fake.constrain === 'function') fake.constrain();
+      if(!this.moves.length){
+        this.fire('movestart', Object.assign({}, eventData));
+        this.fire('moveend', Object.assign({}, eventData));
+      }
+      return this;
+    }
+    getCenter(){ return {lng: fake.center.lng, lat: fake.center.lat}; }
+    getZoom(){ return fake.zoom; }
+    easeTo(o, eventData){
+      this.calls.easeTo.push(o);
+      this.fire('movestart', Object.assign({}, eventData));
+      this.moves.push({kind: 'easeTo', options: o, eventData, bounds: null});
+    }
+    // bounds は [[w, s], [e, n]] か [w, s, e, n]
+    fitBounds(bounds, options, eventData){
+      this.calls.fitBounds.push({bounds, options, eventData});
+      this.fire('movestart', Object.assign({}, eventData));
+      const flat = Array.isArray(bounds[0]) ? [bounds[0][0], bounds[0][1], bounds[1][0], bounds[1][1]] : bounds;
+      this.moves.push({kind: 'fitBounds', options, eventData, bounds: {w: flat[0], s: flat[1], e: flat[2], n: flat[3]}});
+    }
+    endMove(){
+      const move = this.moves.shift();
+      if(!move) throw new Error('終える移動が無い');
+      if(move.bounds){
+        fake.bounds = {...move.bounds};
+        fake.center = {lng: (move.bounds.w + move.bounds.e) / 2, lat: (move.bounds.s + move.bounds.n) / 2};
+        fake.zoom += 1;
+      }else if(move.options){
+        const c = move.options.center;
+        if(c) fake.center = Array.isArray(c) ? {lng: c[0], lat: c[1]} : {...c};
+        if(move.options.zoom !== undefined) fake.zoom = move.options.zoom;
+      }
+      this.fire('moveend', Object.assign({}, move.eventData));
+    }
+    interrupt(){ return this.moves.shift(); }
     flyTo(o){ this.calls.flyTo.push(o); }
     jumpTo(){}
   }

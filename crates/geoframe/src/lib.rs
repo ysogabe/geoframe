@@ -29,6 +29,7 @@ pub mod hostcheck;
 pub mod imaging;
 pub mod ingest;
 pub mod jwt;
+pub mod library_when;
 pub mod limits;
 pub mod local;
 pub mod logging;

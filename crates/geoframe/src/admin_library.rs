@@ -1,10 +1,11 @@
 //! 管理画面の「ライブラリ」タブの読み取り API（docs/admin-library/design.md）。
 //!
 //! - `GET /api/admin/library/trips`: 撮影日時のある写真を 48 時間超の空きで旅に区切った一覧（新しい順）。
-//! - `GET /api/admin/library/photos`: 期間・範囲・ID・地名・日時なしで絞った写真のページ。
+//! - `GET /api/admin/library/photos`: 期間・範囲・ID・地名・日時なし・文字（`q`）で絞った写真のページ。
 //! - `GET /api/admin/library/points`: 位置のある写真の GeoJSON（地図用）。
-//! - `GET /api/admin/library/calendar`: 年・月ごとの件数（日付の眺め方）。
-//! - `GET /api/admin/library/places`: 都道府県・市区町村ごとの件数と海外・不明の件数（場所の眺め方）。
+//! - `GET /api/admin/library/calendar`: 年・月ごとの件数と、年ごとの代表の写真（日付の眺め方）。
+//! - `GET /api/admin/library/places`: 都道府県・市区町村ごとの件数・範囲（都道府県は代表の写真も）と海外・不明の件数
+//!   （場所の眺め方。期間 `from`・`to` と地図の範囲 `bbox` で絞れる）。
 //!
 //! どれも `photos` 表だけを読む（`photo_curation` などの新しい表が無い DB、`GEOFRAME_INGEST=0` の読み取り専用の起動でも
 //! 動く）。経路は完全一致の `GET` のみで、`server.rs` の `site` が呼ぶ。更新はしない。
@@ -36,6 +37,15 @@ const NAME_MAX_CHARS: usize = 64;
 const PER_DEFAULT: i64 = 60;
 /// 旅の `places` に出す上位の数。
 const PLACES_MAX: usize = 3;
+/// `photos` の `q` の語数の上限（これ以上は 400）。
+const Q_WORDS_MAX: usize = 5;
+/// `q` の 1 語ぶんの条件。検索する 5 列（都道府県・市区町村・地名・ファイル名・撮影日時）のどれかに部分一致する。
+/// ユーザーの文字列は入れず、`?` に語ごとのパターンをバインドする（Rust のソースの `ESCAPE '\\'` は、SQL では `ESCAPE '\'`）。
+const Q_WORD_SQL: &str = "(COALESCE(pref,'') LIKE ? ESCAPE '\\' OR COALESCE(city,'') LIKE ? ESCAPE '\\' \
+     OR COALESCE(place,'') LIKE ? ESCAPE '\\' OR COALESCE(name,'') LIKE ? ESCAPE '\\' \
+     OR COALESCE(taken_at,'') LIKE ? ESCAPE '\\')";
+/// `Q_WORD_SQL` の `?` の数。
+const Q_WORD_PARAMS: usize = 5;
 
 /// 「日時あり」の判定（SQL）。分までの撮影日時の形（`YYYY-MM-DD HH:MM`、16 桁）だけを見る。暦としての正しさは見ない
 /// （`imaging::norm_time` が暦を検査しないので、`2025-02-30 10:00` も取り込まれる）。`trips`・`photos`・`points` と
@@ -156,6 +166,27 @@ fn parse_name(s: &str) -> Option<&str> {
     (s.chars().count() <= NAME_MAX_CHARS).then_some(s)
 }
 
+/// `q`。前後の空白を除いた長さが [`NAME_MAX_CHARS`] 文字まで、空白（全角も）で分けた語が [`Q_WORDS_MAX`] 語まで。
+/// 外れたら `None`（400）。空になれば `Some(空)`（`q` が無いのと同じ）。`parse_qs` がパーセント解除を済ませている。
+fn parse_q(s: &str) -> Option<Vec<&str>> {
+    let s = s.trim();
+    if s.chars().count() > NAME_MAX_CHARS {
+        return None;
+    }
+    let words: Vec<&str> = s.split_whitespace().collect();
+    (words.len() <= Q_WORDS_MAX).then_some(words)
+}
+
+/// `LIKE` のパターン（前後を `%` にした部分一致）。`ESCAPE` の文字は `\`。語の `\` を先に `\\` へ、そのあと `%`・`_` を
+/// `\%`・`\_` へ置き換える（`%`・`_` を先に直すと、足した `\` がもう一度 `\\` になる）。
+fn like_pattern(word: &str) -> String {
+    let escaped = word
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    format!("%{escaped}%")
+}
+
 /// `WHERE` の条件（固定の文字列）とそのバインド値。
 #[derive(Default)]
 struct Filter {
@@ -185,6 +216,28 @@ impl Filter {
         }
     }
 
+    /// 位置があり、範囲（両端を含む）に入る写真だけ。
+    fn bbox(&mut self, [min_lon, min_lat, max_lon, max_lat]: [f64; 4]) {
+        self.push(
+            "lat IS NOT NULL AND lon IS NOT NULL AND lon >= ? AND lon <= ? AND lat >= ? AND lat <= ?",
+            [min_lon, max_lon, min_lat, max_lat].map(Sql::Real),
+        );
+        self.narrowed = true;
+    }
+
+    /// 語ごとに 5 列のどれかに部分一致、語同士は AND。条件は固定の型を語の数だけ並べ、語はパターンとしてバインドする。
+    fn words(&mut self, words: &[&str]) {
+        for word in words {
+            self.conditions.push(Q_WORD_SQL.to_owned());
+            let pattern = like_pattern(word);
+            self.params
+                .extend(std::iter::repeat_n(Sql::Text(pattern), Q_WORD_PARAMS));
+        }
+        if !words.is_empty() {
+            self.narrowed = true;
+        }
+    }
+
     fn hidden(&mut self, include: bool) {
         if !include {
             self.conditions.push(VISIBLE.to_owned());
@@ -206,12 +259,10 @@ fn photos_filter(params: &Params) -> Option<Filter> {
     let (from, to) = parse_range(params)?;
     filter.range(from, to);
     if let Some(bbox) = params.get("bbox") {
-        let [min_lon, min_lat, max_lon, max_lat] = parse_bbox(bbox)?;
-        filter.push(
-            "lat IS NOT NULL AND lon IS NOT NULL AND lon >= ? AND lon <= ? AND lat >= ? AND lat <= ?",
-            [min_lon, max_lon, min_lat, max_lat].map(Sql::Real),
-        );
-        filter.narrowed = true;
+        filter.bbox(parse_bbox(bbox)?);
+    }
+    if let Some(q) = params.get("q") {
+        filter.words(&parse_q(q)?);
     }
     if let Some(ids) = params.get("ids") {
         let ids = parse_ids(ids)?;
@@ -281,6 +332,61 @@ struct Cover {
     thumb_url: String,
     /// 位置があり除外でない（表紙の優先）。
     preferred: bool,
+}
+
+/// 表紙の `thumb_url`。表示ファイルも残った derivative も無ければ空（旅・年・都道府県で共通。画面は代わりの表示を出す）。
+/// 世代は `thumb.rs` の lookup と同じ入力（DB の display・md5・mtime）。
+fn cover_thumb_url(
+    ctx: &AdminContext,
+    id: i64,
+    display: Option<String>,
+    drive_id: Option<String>,
+    md5: Option<String>,
+    mtime: Option<f64>,
+) -> String {
+    if thumb_for(ctx, display.as_deref(), drive_id.as_deref()).is_empty() {
+        String::new()
+    } else {
+        crate::thumb::thumb_url(id, display.as_deref(), md5.as_deref(), mtime)
+    }
+}
+
+/// 年・都道府県の代表の写真を、組ごとに 1 行ずつ取る SQL の並び（旅の表紙と同じ考え方）。除外でない → 位置がある →
+/// 新しい（日時なしは最後）→ ID が大きい。除外を含めたときだけ、除外の写真が後ろに回る。
+const COVER_ORDER: &str = concat!(
+    "COALESCE(hidden,0)<>0, (lat IS NULL OR lon IS NULL), ",
+    "CASE WHEN ",
+    untimed_sql!(),
+    " THEN 1 ELSE 0 END, COALESCE(taken_at,'') DESC, id DESC"
+);
+
+/// `key_sql`（組を決める式）ごとの代表の写真 `{id, thumb_url}`。`clause` を満たす写真だけから選ぶ。
+fn covers(
+    conn: &Connection,
+    ctx: &AdminContext,
+    key_sql: &str,
+    clause: &str,
+    params: &[Sql],
+) -> rusqlite::Result<HashMap<String, Value>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT k, id, display, drive_id, md5, mtime FROM (
+           SELECT {key_sql} AS k, id, display, drive_id, md5, mtime,
+                  ROW_NUMBER() OVER (PARTITION BY {key_sql} ORDER BY {COVER_ORDER}) AS rn
+             FROM photos WHERE {clause})
+          WHERE rn = 1"
+    ))?;
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    let mut out = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let id: i64 = row.get(1)?;
+        let thumb_url =
+            cover_thumb_url(ctx, id, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?);
+        out.insert(
+            row.get::<_, String>(0)?,
+            json!({"id": id, "thumb_url": thumb_url}),
+        );
+    }
+    Ok(out)
 }
 
 struct Trip {
@@ -401,22 +507,17 @@ fn build_trips(
             .as_ref()
             .is_none_or(|c| !c.preferred && preferred)
         {
-            let display: Option<String> = row.get(7)?;
-            let md5: Option<String> = row.get(9)?;
-            let thumb = thumb_for(
-                ctx,
-                display.as_deref(),
-                row.get::<_, Option<String>>(8)?.as_deref(),
-            );
             let id: i64 = row.get(0)?;
-            let thumb_url = if thumb.is_empty() {
-                String::new()
-            } else {
-                crate::thumb::thumb_url(id, display.as_deref(), md5.as_deref(), row.get(10)?)
-            };
             trip.cover = Some(Cover {
                 id,
-                thumb_url,
+                thumb_url: cover_thumb_url(
+                    ctx,
+                    id,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                ),
                 preferred,
             });
         }
@@ -634,17 +735,22 @@ fn visible_clause(with_hidden: bool) -> String {
 /// `GET /api/admin/library/calendar`。
 pub async fn calendar(state: &AppState, query: Option<&str>) -> Response {
     let hidden = include_hidden(&query_params(query));
+    let ctx = Arc::clone(&state.admin);
     respond(
         state
             .catalog
-            .read(move |conn| build_calendar(conn, hidden))
+            .read(move |conn| build_calendar(conn, &ctx, hidden))
             .await,
     )
 }
 
 /// 年・月ごとの件数。日時ありの形（[`TIMED`]）の行を `substr(taken_at,1,4)`・`substr(taken_at,1,7)` で数える
-/// （暦として読めない値も形が合えばそのまま出る）。年は新しい順、月は古い順。
-fn build_calendar(conn: &Connection, with_hidden: bool) -> rusqlite::Result<Value> {
+/// （暦として読めない値も形が合えばそのまま出る）。年は新しい順、月は古い順。年には代表の写真 `cover` が付く（月には付けない）。
+fn build_calendar(
+    conn: &Connection,
+    ctx: &AdminContext,
+    with_hidden: bool,
+) -> rusqlite::Result<Value> {
     // 年・月・日時なしの件数が同じ時点の DB から出るように、1 つの読み取りにまとめる
     let _snapshot = conn.unchecked_transaction()?;
     let visible = visible_clause(with_hidden);
@@ -658,6 +764,13 @@ fn build_calendar(conn: &Connection, with_hidden: bool) -> rusqlite::Result<Valu
     };
     let years = count_by(4)?;
     let months = count_by(7)?;
+    let mut year_covers = covers(
+        conn,
+        ctx,
+        "substr(taken_at,1,4)",
+        &format!("{TIMED}{visible}"),
+        &[],
+    )?;
     let mut by_year: BTreeMap<&str, Vec<Value>> = BTreeMap::new();
     for (key, count) in &months {
         // `key` は `YYYY-MM`（TIMED の形なので 7 文字の ASCII）
@@ -673,6 +786,7 @@ fn build_calendar(conn: &Connection, with_hidden: bool) -> rusqlite::Result<Valu
             json!({
                 "year": year,
                 "count": count,
+                "cover": year_covers.remove(year.as_str()),
                 "months": by_year.remove(year.as_str()).unwrap_or_default(),
             })
         })
@@ -685,69 +799,163 @@ fn build_calendar(conn: &Connection, with_hidden: bool) -> rusqlite::Result<Valu
     Ok(json!({"ok": true, "years": years, "untimed": untimed}))
 }
 
+/// `places` の絞り込み。`from`・`to`・`bbox` の形が違えば `None`（400）。`bbox` があるときは位置のある写真だけが残る
+/// （件数・表紙・範囲と `abroad` のすべてに掛かる）。
+fn places_filter(params: &Params) -> Option<Filter> {
+    let mut filter = Filter::default();
+    let (from, to) = parse_range(params)?;
+    filter.range(from, to);
+    if let Some(bbox) = params.get("bbox") {
+        filter.bbox(parse_bbox(bbox)?);
+    }
+    filter.hidden(include_hidden(params));
+    Some(filter)
+}
+
 /// `GET /api/admin/library/places`。
 pub async fn places(state: &AppState, query: Option<&str>) -> Response {
-    let hidden = include_hidden(&query_params(query));
+    let Some(filter) = places_filter(&query_params(query)) else {
+        return bad_params();
+    };
+    let ctx = Arc::clone(&state.admin);
     respond(
         state
             .catalog
-            .read(move |conn| build_places(conn, hidden))
+            .read(move |conn| build_places(conn, &ctx, &filter))
             .await,
     )
 }
 
-/// 都道府県・市区町村ごとの件数（`pref` が空でない行）と、海外・不明（`pref` が NULL か空。位置なしも入る）の件数。
-/// 並びは件数の多い順、同数なら名前の順。`city` が空の行は `city: ""` の 1 項目にする。
-fn build_places(conn: &Connection, with_hidden: bool) -> rusqlite::Result<Value> {
-    let _snapshot = conn.unchecked_transaction()?;
-    let visible = visible_clause(with_hidden);
-    let mut stmt = conn.prepare(&format!(
-        "SELECT CAST(pref AS TEXT), CAST(COALESCE(city,'') AS TEXT), COUNT(*) FROM photos
-          WHERE NOT {ABROAD}{visible} GROUP BY 1, 2"
-    ))?;
-    let rows = stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let abroad: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM photos WHERE {ABROAD}{visible}"),
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(json!({"ok": true, "prefs": group_places(rows), "abroad": abroad}))
+/// 写真の範囲 `[min_lon, min_lat, max_lon, max_lat]`。
+type Bounds = [f64; 4];
+
+/// `(pref, city)` ごとの集計。
+struct PlaceRow {
+    pref: String,
+    city: String,
+    count: i64,
+    /// 位置のある写真だけの範囲。位置のある写真が無ければ `None`。
+    bounds: Option<Bounds>,
 }
 
-/// 都道府県の件数と市区町村の `(名前, 件数)`。
-type PrefGroup = (String, i64, Vec<(String, i64)>);
+/// 範囲を 1 つにまとめる（`None` は無視する）。
+fn union_bounds(a: Option<Bounds>, b: Option<Bounds>) -> Option<Bounds> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some([
+            a[0].min(b[0]),
+            a[1].min(b[1]),
+            a[2].max(b[2]),
+            a[3].max(b[3]),
+        ]),
+        (a, b) => a.or(b),
+    }
+}
 
-/// `(pref, city, count)` を都道府県ごとにまとめ、件数の多い順（同数は名前の順）に並べる。
-fn group_places(rows: Vec<(String, String, i64)>) -> Vec<Value> {
-    let mut prefs: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
-    for (pref, city, count) in rows {
-        prefs.entry(pref).or_default().push((city, count));
+/// 都道府県・市区町村ごとの件数・範囲（`pref` が空でない行）と、海外・不明（`pref` が NULL か空。位置なしも入る）の件数。
+/// `filter`（期間・範囲・除外）は件数・都道府県の代表の写真・範囲と海外・不明のすべてに掛かる。範囲があれば、その中に
+/// 写真の無い都道府県・市区町村は出ず、海外・不明は位置のある写真だけを数える（範囲が位置のある写真だけを残すため）。
+/// 並びは件数の多い順、同数なら名前の順。`city` が空の行は `city: ""` の 1 項目にする。
+fn build_places(conn: &Connection, ctx: &AdminContext, filter: &Filter) -> rusqlite::Result<Value> {
+    // 件数・代表の写真・海外・不明が同じ時点の DB から出るように、1 つの読み取りにまとめる
+    let _snapshot = conn.unchecked_transaction()?;
+    let clause = filter.where_clause();
+    // 範囲は位置のある写真だけの MIN/MAX（集計関数は NULL を飛ばすので、位置の無い行は CASE で NULL にする）
+    let mut stmt = conn.prepare(&format!(
+        "SELECT CAST(pref AS TEXT), CAST(COALESCE(city,'') AS TEXT), COUNT(*),
+                MIN(CASE WHEN lat IS NOT NULL AND lon IS NOT NULL THEN lon END),
+                MIN(CASE WHEN lat IS NOT NULL AND lon IS NOT NULL THEN lat END),
+                MAX(CASE WHEN lat IS NOT NULL AND lon IS NOT NULL THEN lon END),
+                MAX(CASE WHEN lat IS NOT NULL AND lon IS NOT NULL THEN lat END)
+           FROM photos WHERE NOT {ABROAD} AND {clause} GROUP BY 1, 2"
+    ))?;
+    let rows = stmt
+        .query_map(params_from_iter(filter.params.iter()), |row| {
+            let corners = [
+                row.get::<_, Option<f64>>(3)?,
+                row.get::<_, Option<f64>>(4)?,
+                row.get::<_, Option<f64>>(5)?,
+                row.get::<_, Option<f64>>(6)?,
+            ];
+            let bounds = match corners {
+                [Some(w), Some(s), Some(e), Some(n)] => Some([w, s, e, n]),
+                _ => None,
+            };
+            Ok(PlaceRow {
+                pref: row.get(0)?,
+                city: row.get(1)?,
+                count: row.get(2)?,
+                bounds,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut pref_covers = covers(
+        conn,
+        ctx,
+        "CAST(pref AS TEXT)",
+        &format!("NOT {ABROAD} AND {clause}"),
+        &filter.params,
+    )?;
+    let abroad: i64 = conn.query_row(
+        &format!("SELECT COUNT(*) FROM photos WHERE {ABROAD} AND {clause}"),
+        params_from_iter(filter.params.iter()),
+        |row| row.get(0),
+    )?;
+    let mut prefs = group_places(rows);
+    for pref in &mut prefs {
+        let name = pref["pref"].as_str().unwrap_or_default();
+        pref["cover"] = pref_covers.remove(name).unwrap_or(Value::Null);
+    }
+    Ok(json!({"ok": true, "prefs": prefs, "abroad": abroad}))
+}
+
+/// 都道府県の件数・範囲と市区町村の `(名前, 件数, 範囲)`。
+type PrefGroup = (
+    String,
+    i64,
+    Option<Bounds>,
+    Vec<(String, i64, Option<Bounds>)>,
+);
+
+/// 範囲の JSON（無ければ `null`）。
+fn bounds_json(bounds: Option<Bounds>) -> Value {
+    bounds.map_or(Value::Null, |b| json!(b))
+}
+
+/// 行を都道府県ごとにまとめ、件数の多い順（同数は名前の順）に並べる。代表の写真 `cover` は呼び出し側が足す。
+fn group_places(rows: Vec<PlaceRow>) -> Vec<Value> {
+    let mut prefs: BTreeMap<String, Vec<(String, i64, Option<Bounds>)>> = BTreeMap::new();
+    for row in rows {
+        prefs
+            .entry(row.pref)
+            .or_default()
+            .push((row.city, row.count, row.bounds));
     }
     let mut prefs: Vec<PrefGroup> = prefs
         .into_iter()
         .map(|(pref, mut cities)| {
             cities.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
             let total = cities.iter().map(|c| c.1).sum();
-            (pref, total, cities)
+            let bounds = cities.iter().fold(None, |acc, c| union_bounds(acc, c.2));
+            (pref, total, bounds, cities)
         })
         .collect();
     prefs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
     prefs
         .into_iter()
-        .map(|(pref, count, cities)| {
+        .map(|(pref, count, bounds, cities)| {
             let cities: Vec<Value> = cities
                 .into_iter()
-                .map(|(city, count)| json!({"city": city, "count": count}))
+                .map(|(city, count, bounds)| {
+                    json!({"city": city, "count": count, "bbox": bounds_json(bounds)})
+                })
                 .collect();
-            json!({"pref": pref, "count": count, "cities": cities})
+            json!({
+                "pref": pref,
+                "count": count,
+                "cover": Value::Null,
+                "bbox": bounds_json(bounds),
+                "cities": cities,
+            })
         })
         .collect()
 }
@@ -855,14 +1063,23 @@ mod tests {
         assert!(parse_name(&"あ".repeat(NAME_MAX_CHARS + 1)).is_none());
     }
 
+    fn place(pref: &str, city: &str, count: i64, bounds: Option<Bounds>) -> PlaceRow {
+        PlaceRow {
+            pref: pref.to_owned(),
+            city: city.to_owned(),
+            count,
+            bounds,
+        }
+    }
+
     #[test]
     fn places_are_grouped_by_pref_and_sorted_by_count_then_name() {
         let rows = vec![
-            ("B県".to_owned(), "い市".to_owned(), 2),
-            ("A県".to_owned(), "".to_owned(), 1),
-            ("A県".to_owned(), "う市".to_owned(), 1),
-            ("A県".to_owned(), "あ市".to_owned(), 1),
-            ("C県".to_owned(), "え市".to_owned(), 4),
+            place("B県", "い市", 2, Some([1.0, 1.0, 2.0, 2.0])),
+            place("A県", "", 1, None),
+            place("A県", "う市", 1, Some([10.0, 20.0, 11.0, 21.0])),
+            place("A県", "あ市", 1, Some([9.0, 22.0, 10.5, 23.0])),
+            place("C県", "え市", 4, None),
         ];
         let out = group_places(rows);
         let prefs: Vec<&str> = out.iter().map(|p| p["pref"].as_str().unwrap()).collect();
@@ -875,6 +1092,43 @@ mod tests {
             .map(|c| c["city"].as_str().unwrap())
             .collect();
         assert_eq!(cities, ["", "あ市", "う市"]);
+        // 都道府県の範囲は市区町村の範囲の合併（位置の無い市区町村は無視）。位置のある写真が無ければ null
+        assert_eq!(out[1]["bbox"], json!([9.0, 20.0, 11.0, 23.0]));
+        assert_eq!(out[1]["cities"][0]["bbox"], Value::Null);
+        assert_eq!(out[0]["bbox"], Value::Null);
+        assert_eq!(out[2]["bbox"], json!([1.0, 1.0, 2.0, 2.0]));
+    }
+
+    #[test]
+    fn q_is_trimmed_split_on_any_space_and_capped() {
+        assert_eq!(parse_q("  松本　城 \u{3000}"), Some(vec!["松本", "城"]));
+        assert_eq!(parse_q(" \u{3000} "), Some(vec![]));
+        assert_eq!(parse_q("a b c d e"), Some(vec!["a", "b", "c", "d", "e"]));
+        assert!(parse_q("a b c d e f").is_none());
+        // 長さは前後の空白を除いたあとで数える
+        let long = "あ".repeat(NAME_MAX_CHARS);
+        assert!(parse_q(&format!(" {long} ")).is_some());
+        assert!(parse_q(&format!("{long}あ")).is_none());
+    }
+
+    #[test]
+    fn like_patterns_escape_the_backslash_first_then_percent_and_underscore() {
+        assert_eq!(like_pattern("abc"), "%abc%");
+        assert_eq!(like_pattern("50%_off"), "%50\\%\\_off%");
+        assert_eq!(like_pattern("a\\%"), "%a\\\\\\%%");
+        assert_eq!(like_pattern("\\"), "%\\\\%");
+    }
+
+    #[test]
+    fn q_narrows_and_binds_five_patterns_per_word() {
+        let f = photos_filter(&params("q=%E3%81%82+b")).unwrap();
+        assert_eq!(f.conditions.iter().filter(|c| *c == Q_WORD_SQL).count(), 2);
+        assert_eq!(f.params.len(), 2 * Q_WORD_PARAMS);
+        assert!(f.narrowed);
+        // 空白だけの q は無いのと同じ（絞り込みにならない）
+        assert!(photos_filter(&params("q=%20%E3%80%80")).is_none());
+        assert!(photos_filter(&params("q=%20&pref=x")).is_some());
+        assert!(photos_filter(&params("q=a+b+c+d+e+f")).is_none());
     }
 
     #[test]

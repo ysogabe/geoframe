@@ -4,7 +4,7 @@
 //   - textContent（子の文字列をつなぐ getter と、子を置き換える setter）
 //   - className / classList / dataset / setAttribute / getAttribute
 //   - addEventListener（登録した関数を保持し、click() と dispatchEvent({type}) で呼ぶ。バブリングはしない。disabled なボタン等の click() は何も起こさない）
-//   - disabled / value / checked / focus() と document.activeElement、getBoundingClientRect()（幅 100 の固定）、document.contains()
+//   - disabled / value / checked / focus() と document.activeElement、getBoundingClientRect()（幅は 100。試験が rectWidth を入れれば差し替わる）、document.contains()
 //   - querySelector / querySelectorAll: #id .class tag tag.class [data-x] [data-x=v] とその組み合わせ、
 //     空白区切りの子孫（"nav .tab" など）
 //   - document.createElement / createTextNode / getElementById / addEventListener / dispatchEvent
@@ -94,13 +94,14 @@ class FakeElement {
     this.dataset = new Proxy({}, {set(t, k, v){ t[k] = String(v); return true; }});
     this.attributes = {};
     this.listeners = {};
+    hidden(this, 'scrollCalls', []);
     this.classList = new ClassList(this);
     this.disabled = false;
     this.value = '';
     this.checked = false;
     this.title = '';
   }
-  getBoundingClientRect(){ return {left: 0, top: 0, width: 100, height: 100}; }
+  getBoundingClientRect(){ return {left: 0, top: 0, width: this.rectWidth === undefined ? 100 : this.rectWidth, height: 100}; }
   get childNodes(){ return this.children; }
   get textContent(){ return this.children.map(c => c.textContent).join(''); }
   set textContent(v){
@@ -141,6 +142,12 @@ class FakeElement {
     else if(name === 'class') this.className = v;
     else if(name.startsWith('data-')) this.dataset[kebabToCamel(name.slice(5))] = v;
   }
+  removeAttribute(name){
+    delete this.attributes[name];
+    if(name === 'id') this.id = '';
+    else if(name === 'class') this.className = '';
+    else if(name.startsWith('data-')) delete this.dataset[kebabToCamel(name.slice(5))];
+  }
   getAttribute(name){
     if(name === 'id') return this.id || null;
     if(name === 'class') return this.className || null;
@@ -157,6 +164,12 @@ class FakeElement {
     if(!ev.preventDefault) ev.preventDefault = () => { ev.defaultPrevented = true; };
     if(!ev.stopPropagation) ev.stopPropagation = () => { ev.propagationStopped = true; };
     (this.listeners[ev.type] || []).slice().forEach(fn => fn(ev));
+    // 本物のブラウザは、button の上の Enter（keydown）・Space（keyup）から click を起こす。ここでは keydown の Enter・Space から、
+    // preventDefault されていなければ click を 1 回起こす（button 側が keydown でも処理していると二重に動くのを見つけるため）
+    if(ev.type === 'keydown' && this.tag === 'button' && !this.disabled && !ev.defaultPrevented
+       && (ev.key === 'Enter' || ev.key === ' ')){
+      this.dispatchEvent({type: 'click', synthesized: true});
+    }
     // 親へ伝える（バブリング）のは、試験が `bubbles: true` を付けたイベントだけ（既存の試験は子で止まる前提）
     if(ev.bubbles && !ev.propagationStopped && this.parentNode && this.parentNode.nodeType === 1){
       this.parentNode.dispatchEvent(Object.assign(ev, {target: ev.target}));
@@ -170,6 +183,8 @@ class FakeElement {
     return this.dispatchEvent({type: 'click'});
   }
   focus(){ this.ownerDocument.activeElement = this; }
+  // 本物は画面内へスクロールする。ここでは呼ばれた引数を記録するだけ（試験が確かめる）
+  scrollIntoView(options){ this.scrollCalls.push(options === undefined ? null : options); }
   descendants(){
     const out = [];
     const walk = n => n.children.forEach(c => { if(c.nodeType === 1){ out.push(c); walk(c); } });
@@ -289,34 +304,49 @@ export function buildAdminDom(){
   mk('button', {id: 'lib-view-trips', cls: 'lib-seg on', text: '旅', data: {view: 'trips'}}, lbar);
   mk('button', {id: 'lib-view-calendar', cls: 'lib-seg', text: '日付', data: {view: 'calendar'}}, lbar);
   mk('button', {id: 'lib-view-places', cls: 'lib-seg', text: '場所', data: {view: 'places'}}, lbar);
-  mk('button', {id: 'lib-view-map', cls: 'lib-seg', text: '地図', data: {view: 'map'}}, lbar);
+  mk('input', {id: 'lib-search', cls: 'lib-in'}, lbar);
+  mk('input', {id: 'lib-when', cls: 'lib-in hidden'}, lbar);
+  mk('span', {id: 'lib-when-note', cls: 'lib-when-note hidden'}, lbar);
+  const lcombo = mk('span', {cls: 'lib-combo hidden'}, lbar);
+  const lcin = mk('input', {id: 'lib-place-combo', cls: 'lib-in hidden'}, lcombo);
+  [['role', 'combobox'], ['aria-expanded', 'false'], ['aria-controls', 'lib-place-list'], ['aria-autocomplete', 'list']]
+    .forEach(([k, v]) => lcin.setAttribute(k, v));
+  mk('div', {id: 'lib-place-list', cls: 'lib-opts hidden'}, lcombo).setAttribute('role', 'listbox');
   const lopt = mk('label', {cls: 'opt'}, lbar);
   mk('input', {id: 'lib-hidden'}, lopt);
   lopt.appendChild(document.createTextNode(' 除外も含める'));
   mk('span', {cls: 'spacer'}, lbar);
   mk('span', {id: 'lib-note', cls: 'count'}, lbar);
-  mk('div', {id: 'lib-trips'}, lib);
-  mk('div', {id: 'lib-calendar', cls: 'hidden'}, lib);
-  mk('div', {id: 'lib-places', cls: 'hidden'}, lib);
-  const lmapbox = mk('div', {id: 'lib-map-box', cls: 'hidden'}, lib);
-  const lmbar = mk('div', {cls: 'toolbar'}, lmapbox);
-  mk('button', {id: 'lib-bbox', cls: 'btn', text: 'この範囲の写真を見る'}, lmbar);
-  const lperiod = mk('span', {id: 'lib-period', cls: 'lib-period hidden'}, lmbar);
+  const ltrips = mk('div', {id: 'lib-trips'}, lib);
+  mk('div', {id: 'lib-trip-cards', cls: 'lib-cards'}, ltrips);
+  const lcal = mk('div', {id: 'lib-calendar', cls: 'hidden'}, lib);
+  mk('div', {id: 'lib-year-cards', cls: 'lib-cards'}, lcal);
+  const lmonths = mk('div', {id: 'lib-months', cls: 'hidden'}, lcal);
+  lmonths.setAttribute('role', 'group');
+  lmonths.setAttribute('aria-label', '月');
+  const lplaces = mk('div', {id: 'lib-places', cls: 'lib-place hidden'}, lib);
+  const lside = mk('div', {cls: 'lib-place-side'}, lplaces);
+  const lperiod = mk('div', {id: 'lib-period', cls: 'lib-period hidden'}, lside);
   mk('span', {id: 'lib-period-text'}, lperiod);
-  mk('button', {id: 'lib-period-clear', cls: 'btn', text: '期間を解除'}, lperiod);
+  const lclear = mk('button', {id: 'lib-period-clear', cls: 'btn', text: '✕'}, lperiod);
+  lclear.setAttribute('aria-label', '期間を解除');
+  mk('div', {id: 'lib-place-cards', cls: 'lib-cards lib-place-cards'}, lside);
+  const lmain = mk('div', {id: 'lib-place-main', cls: 'lib-place-main'}, lplaces);
+  const lmbar = mk('div', {cls: 'toolbar'}, lmain);
+  mk('button', {id: 'lib-bbox', cls: 'btn', text: 'この範囲の写真を見る'}, lmbar);
+  mk('button', {id: 'lib-reset', cls: 'btn', text: '全体に戻す'}, lmbar);
   mk('span', {cls: 'spacer'}, lmbar);
   mk('span', {id: 'lib-map-note', cls: 'count'}, lmbar);
-  mk('div', {id: 'lib-map'}, lmapbox);
-  const lgrid = mk('div', {id: 'lib-grid-box', cls: 'hidden'}, lib);
-  const lgbar = mk('div', {cls: 'toolbar'}, lgrid);
-  mk('button', {id: 'lib-back', cls: 'btn', text: '◀ 戻る'}, lgbar);
-  mk('span', {id: 'lib-sel', cls: 'lib-sel'}, lgbar);
-  mk('span', {cls: 'spacer'}, lgbar);
-  mk('button', {id: 'lib-prev', cls: 'btn', text: '◀ PREV'}, lgbar);
-  mk('span', {id: 'lib-pageinfo', cls: 'count', text: '--'}, lgbar);
-  mk('button', {id: 'lib-next', cls: 'btn', text: 'NEXT ▶'}, lgbar);
-  mk('div', {id: 'lib-grid'}, lgrid);
-  mk('div', {id: 'lib-empty', cls: 'empty hidden', text: '該当する写真がありません'}, lgrid);
+  mk('div', {id: 'lib-map'}, lmain);
+  const ldetail = mk('div', {id: 'lib-detail', cls: 'hidden'}, lib);
+  const ldbar = mk('div', {cls: 'toolbar'}, ldetail);
+  mk('h3', {id: 'lib-sel', cls: 'lib-sel'}, ldbar);
+  mk('span', {cls: 'spacer'}, ldbar);
+  mk('button', {id: 'lib-prev', cls: 'btn', text: '◀ PREV'}, ldbar);
+  mk('span', {id: 'lib-pageinfo', cls: 'count', text: '--'}, ldbar);
+  mk('button', {id: 'lib-next', cls: 'btn', text: 'NEXT ▶'}, ldbar);
+  mk('div', {id: 'lib-grid'}, ldetail);
+  mk('div', {id: 'lib-empty', cls: 'empty hidden', text: '該当する写真がありません'}, ldetail);
 
   // 選別タブ（admin.html の #v-curation と同じ id）
   const cur = mk('section', {id: 'v-curation', cls: 'hidden'}, main);

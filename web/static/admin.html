@@ -107,36 +107,55 @@
     <div class="empty hidden" id="empty">該当する写真がありません</div>
   </section>
 
-  <!-- ==== LIBRARY（旅・地図・サムネイルの格子。GET /api/admin/library/*。中身は library.js が描く） ==== -->
+  <!-- ==== LIBRARY（旅・日付・場所と地図・サムネイルの格子。GET /api/admin/library/*。中身は library.js が描く） ==== -->
   <section id="v-library" class="hidden">
     <div class="toolbar lib-bar">
       <button class="lib-seg on" id="lib-view-trips" type="button" data-view="trips">旅</button>
       <button class="lib-seg" id="lib-view-calendar" type="button" data-view="calendar">日付</button>
       <button class="lib-seg" id="lib-view-places" type="button" data-view="places">場所</button>
-      <button class="lib-seg" id="lib-view-map" type="button" data-view="map">地図</button>
+      <!-- 探す欄は view ごとに 1 つだけ出す（library.js が .hidden を付け外しする）。旅: 文字検索（カードを絞り、Enter で写真）/ 日付: 言葉（Enter で期間に直す）/ 場所: 候補が減るコンボボックス -->
+      <input type="text" class="lib-in" id="lib-search" placeholder="旅を探す（日時・地名）" aria-label="旅を探す" autocomplete="off">
+      <input type="text" class="lib-in hidden" id="lib-when" placeholder="日付の言葉（例: 去年の夏）" aria-label="日付の言葉" autocomplete="off">
+      <span class="lib-when-note hidden" id="lib-when-note" role="status"></span>
+      <span class="lib-combo hidden">
+        <input type="text" class="lib-in hidden" id="lib-place-combo" placeholder="場所を探す（例: 松本・ながの）" aria-label="場所を探す" autocomplete="off"
+               role="combobox" aria-expanded="false" aria-controls="lib-place-list" aria-autocomplete="list">
+        <div class="lib-opts hidden" id="lib-place-list" role="listbox" aria-label="場所の候補"></div>
+      </span>
       <label class="opt"><input type="checkbox" id="lib-hidden"> 除外も含める</label>
       <span class="spacer"></span>
       <span class="count" id="lib-note"></span>
     </div>
-    <div id="lib-trips"></div>
-    <div id="lib-calendar" class="hidden"></div>
-    <div id="lib-places" class="hidden"></div>
-    <div id="lib-map-box" class="hidden">
-      <div class="toolbar">
-        <button class="btn" id="lib-bbox" type="button">この範囲の写真を見る</button>
-        <span class="lib-period hidden" id="lib-period">
-          <span id="lib-period-text"></span>
-          <button class="btn" id="lib-period-clear" type="button">期間を解除</button>
-        </span>
-        <span class="spacer"></span>
-        <span class="count" id="lib-map-note"></span>
-      </div>
-      <div id="lib-map"></div>
+    <!-- 旅・日付: カードは非対話の容器 .lib-card（中に主ボタン button.lib-card-main と、兄弟のボタン）。選ぶと下の #lib-detail に写真 -->
+    <div id="lib-trips">
+      <div class="lib-cards" id="lib-trip-cards"></div>
     </div>
-    <div id="lib-grid-box" class="hidden">
+    <div id="lib-calendar" class="hidden">
+      <div class="lib-cards" id="lib-year-cards"></div>
+      <div id="lib-months" class="hidden" role="group" aria-label="月"></div>
+    </div>
+    <!-- 場所: 左に期間の表示と都道府県のカード、右に地図の操作・地図・（選ぶと）写真の詳細。詳細 #lib-detail は場所のときだけ #lib-place-main の中（地図の下）へ移す -->
+    <div id="lib-places" class="lib-place hidden">
+      <div class="lib-place-side">
+        <div class="lib-period hidden" id="lib-period">
+          <span id="lib-period-text"></span>
+          <button class="btn" id="lib-period-clear" type="button" aria-label="期間を解除" title="期間を解除">✕</button>
+        </div>
+        <div class="lib-cards lib-place-cards" id="lib-place-cards"></div>
+      </div>
+      <div class="lib-place-main" id="lib-place-main">
+        <div class="toolbar">
+          <button class="btn" id="lib-bbox" type="button">この範囲の写真を見る</button>
+          <button class="btn" id="lib-reset" type="button">全体に戻す</button>
+          <span class="spacer"></span>
+          <span class="count" id="lib-map-note"></span>
+        </div>
+        <div id="lib-map"></div>
+      </div>
+    </div>
+    <div id="lib-detail" class="hidden">
       <div class="toolbar">
-        <button class="btn" id="lib-back" type="button">◀ 戻る</button>
-        <span class="lib-sel" id="lib-sel"></span>
+        <h3 class="lib-sel" id="lib-sel"></h3>
         <span class="spacer"></span>
         <button class="btn" id="lib-prev" type="button">◀ PREV</button>
         <span class="count" id="lib-pageinfo">--</span>

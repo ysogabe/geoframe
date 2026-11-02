@@ -456,6 +456,12 @@ fn serve(overrides: &Overrides) -> ExitCode {
     let ai_worker = ingest
         .as_ref()
         .and_then(|ingest| start_ai(&config, ingest, &stop, &ai_clock, handlers()));
+    // ライブラリの日付の言葉の補助。AI 検索と同じ `LanClient`（対話の枠を共有する）。取り込みが無効でも作る
+    state = state.with_when(Arc::new(crate::ai::when::Runtime::new(
+        &config,
+        lan.clone(),
+        stop.clone(),
+    )));
     state = state.with_ai_search(Arc::new(crate::ai::query::Runtime::new(
         &config,
         lan,
