@@ -160,6 +160,38 @@ class ValidatePolygon(unittest.TestCase):
         pinch = [(0.0, 0.0), (4.0, 0.0), (2.0, 2.0), (4.0, 4.0), (0.0, 4.0), (2.0, 2.0), (0.0, 0.0)]
         lib.validate_polygon([pinch], "t")
 
+    def test_hole_crossing_the_outer_ring_through_its_vertices_is_rejected(self):
+        # 穴の辺が外周の頂点 (3,5) と (2,5) を通り、その間で外周の外 (2.5,5) に出る。辺の端点を含む交差だけでは見えない
+        outer = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (3.0, 10.0), (3.0, 5.0), (2.5, 4.0), (2.0, 5.0), (2.0, 10.0), (0.0, 10.0), (0.0, 0.0)]
+        hole = [(1.0, 5.0), (9.0, 5.0), (9.0, 1.0), (1.0, 1.0), (1.0, 5.0)]
+        self.assertEqual(self.code_of([outer, hole]), "ring_intersection")
+        # 向きを変えても（穴を逆回り・始点をずらしても）同じ
+        self.assertEqual(self.code_of([outer, hole[::-1]]), "ring_intersection")
+        rotated = hole[1:-1] + hole[:2]
+        self.assertEqual(self.code_of([outer, rotated]), "ring_intersection")
+
+    def test_hole_touching_outer_vertices_without_crossing_is_fine(self):
+        # 同じ外周で、穴が外周の頂点 (3,5) と (2,5) に触れても下側（内側）に留まる形は通る
+        outer = [(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (3.0, 10.0), (3.0, 5.0), (2.5, 4.0), (2.0, 5.0), (2.0, 10.0), (0.0, 10.0), (0.0, 0.0)]
+        below = [(1.0, 1.0), (9.0, 1.0), (9.0, 5.0), (3.0, 5.0), (2.5, 3.5), (2.0, 5.0), (1.0, 5.0), (1.0, 1.0)]
+        lib.validate_polygon([outer, below], "t")
+        # 外周の頂点に頂点だけで接する穴
+        apex = [(2.5, 4.0), (4.0, 2.0), (1.0, 2.0), (2.5, 4.0)]
+        lib.validate_polygon([outer, apex], "t")
+
+    def test_ring_crossing_itself_at_a_vertex_is_rejected(self):
+        # (5,5) を 2 度通り、1 度目は横、2 度目は縦。頂点での X 字（8 の字）
+        cross = [(0.0, 5.0), (5.0, 5.0), (10.0, 5.0), (10.0, 10.0), (5.0, 10.0), (5.0, 5.0), (5.0, -2.0), (0.0, -2.0), (0.0, 5.0)]
+        self.assertEqual(self.code_of([cross]), "self_intersection")
+        # 同じ点でも、通り道が交互でなければ（接するだけ）通る
+        touch = [(0.0, 0.0), (5.0, 5.0), (10.0, 0.0), (10.0, 10.0), (5.0, 5.0), (0.0, 10.0), (0.0, 0.0)]
+        lib.validate_polygon([touch], "t")
+
+    def test_hole_crossing_another_hole_at_a_vertex_is_rejected(self):
+        a = [(2.0, 2.0), (2.0, 6.0), (6.0, 6.0), (6.0, 2.0), (2.0, 2.0)]
+        b = [(4.0, 4.0), (8.0, 4.0), (8.0, 8.0), (4.0, 8.0), (4.0, 6.0), (4.0, 4.0)]  # (4,6) は a の辺の上。頂点で突き抜ける
+        self.assertEqual(self.code_of([SQUARE, a, b]), "ring_intersection")
+
     def test_ring_with_repeated_points_is_fine(self):
         lib.validate_polygon([[(0.0, 0.0), (10.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0), (0.0, 10.0), (0.0, 0.0)]], "t")
 
@@ -216,8 +248,9 @@ class Intersections(unittest.TestCase):
             pts = [(float(rng.randint(0, g)), float(rng.randint(0, g))) for _ in range(n)]
             pts.append(pts[0])
             hits = lib.find_intersections([pts], limit=10**9)
-            # 折り返し（backtrack）は隣り合う辺の組なので、総当たりの対象外。数えるのは交差と重なりだけ
-            pairs = sum(1 for kind, *_ in hits if kind != "backtrack")
+            # 折り返し（backtrack）は隣り合う辺の組、接点の横断（touch_cross）は接点ごとの判定なので、総当たりの対象外。
+            # 数えるのは交差と重なりだけ
+            pairs = sum(1 for kind, *_ in hits if kind not in ("backtrack", "touch_cross"))
             self.assertEqual(pairs, brute_force_hits([pts]), pts)
 
     def test_large_ring_finishes_in_practical_time(self):

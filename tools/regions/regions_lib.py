@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 import re
 import struct
@@ -224,11 +225,18 @@ def orient(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> 
     return (exact > 0) - (exact < 0)
 
 
-def segment_hit(a: Point, b: Point, c: Point, d: Point) -> int:
+def _within(p: Point, a: Point, b: Point) -> bool:
+    """一直線上にある点 p が、線分 ab の範囲（端点を含む）にあるか。"""
+    return min(a[0], b[0]) <= p[0] <= max(a[0], b[0]) and min(a[1], b[1]) <= p[1] <= max(a[1], b[1])
+
+
+def segment_hit(a: Point, b: Point, c: Point, d: Point, contacts: list[Point] | None = None) -> int:
     """線分 ab と cd の関係。0 = 交わらない・端点で接するだけ、1 = 互いの内側で交差（X 字）、
     2 = 一直線上で長さを持って重なる。
 
-    端点が相手の線分に乗る接触（輪の自己接触・穴が外周に接する）は 0 とする。偶奇判定の結果を変えないため。
+    端点が相手の線分に乗る接触（輪の自己接触・穴が外周に接する）は 0 とする。ただし接点で輪が互いに
+    突き抜けるか（横断）どうかは線分の組だけでは決まらないので、`contacts` が渡されたときは接点（4 つの端点の
+    どれか）を入れて返し、呼び出し側が接点ごとに横断を調べる（`find_intersections`）。
     """
     if max(a[0], b[0]) < min(c[0], d[0]) or max(c[0], d[0]) < min(a[0], b[0]):
         return 0
@@ -240,6 +248,10 @@ def segment_hit(a: Point, b: Point, c: Point, d: Point) -> int:
     o4 = orient(*c, *d, *b)
     if o1 * o2 < 0 and o3 * o4 < 0:
         return 1
+    if contacts is not None and (o1 == 0 or o2 == 0 or o3 == 0 or o4 == 0):
+        for o, p, q, r in ((o1, c, a, b), (o2, d, a, b), (o3, a, c, d), (o4, b, c, d)):
+            if o == 0 and _within(p, q, r) and p not in contacts:
+                contacts.append(p)
     if o1 == o2 == o3 == o4 == 0:
         # 一直線上。広がりの大きい軸に射影して、区間の重なりに長さがあるか
         axis = 0 if max(a[0], b[0], c[0], d[0]) - min(a[0], b[0], c[0], d[0]) >= max(
@@ -264,7 +276,7 @@ def find_intersections(polygon: Polygon, limit: int = 8) -> list[tuple[str, int,
     """多角形（外側の輪と穴）の辺どうしの不正な交差を、最大 `limit` 件返す。
 
     不正なのは (a) 互いの内側での交差（X 字）、(b) 一直線上で長さを持つ重なり（輪の折り返し・辺の重複を含む）。
-    端点での接触は許す。戻りは (種類, 輪 i, 辺 i, 輪 j, 辺 j, 目安の座標)。種類は "cross" / "overlap" / "backtrack"。
+    端点での接触は許すが、接点で輪が互いに突き抜ける横断（"touch_cross"。頂点を通る X 字）は不正とする。戻りは (種類, 輪 i, 辺 i, 輪 j, 辺 j, 目安の座標)。種類は "cross" / "overlap" / "backtrack" / "touch_cross"。
 
     辺を格子に入れ、同じ格子にある辺の組だけを調べる（頂点が百万単位でも実用的な時間で終わる）。
     """
@@ -314,6 +326,8 @@ def find_intersections(polygon: Polygon, limit: int = 8) -> list[tuple[str, int,
                 grid.setdefault((cx, cy), []).append(k)
     seen: set[tuple[int, int]] = set()
     sizes = [len(r) - 1 for r in rings]
+    touches: dict[Point, set[tuple[int, int]]] = {}
+    contacts: list[Point] = []
     for members in grid.values():
         m = len(members)
         if m < 2:
@@ -336,12 +350,69 @@ def find_intersections(polygon: Polygon, limit: int = 8) -> list[tuple[str, int,
                 seen.add(pair)
                 a, b = rings[r1][i1], rings[r1][i1 + 1]
                 c, d = rings[r2][i2], rings[r2][i2 + 1]
-                hit = segment_hit(a, b, c, d)
+                contacts.clear()
+                hit = segment_hit(a, b, c, d, contacts)
                 if hit:
                     found.append(("cross" if hit == 1 else "overlap", r1, i1, r2, i2, a))
                     if len(found) >= limit:
                         return found
+                for p in contacts:
+                    touches.setdefault(p, set()).update(((r1, i1), (r2, i2)))
+    for p, edge_ids in touches.items():
+        pair = _crossing_at_contact(rings, p, edge_ids)
+        if pair is not None:
+            (r1, i1), (r2, i2) = pair
+            found.append(("touch_cross", r1, i1, r2, i2, p))
+            if len(found) >= limit:
+                break
     return found
+
+
+def _angle_cmp(u: tuple[Fraction, Fraction], v: tuple[Fraction, Fraction]) -> int:
+    """原点から出る 2 つの向きの、反時計回りの順（+x 軸から [0, 2π)）。同じ向きは 0。"""
+    hu = 0 if (u[1] > 0 or (u[1] == 0 and u[0] > 0)) else 1
+    hv = 0 if (v[1] > 0 or (v[1] == 0 and v[0] > 0)) else 1
+    if hu != hv:
+        return hu - hv
+    cross = u[0] * v[1] - u[1] * v[0]
+    return -1 if cross > 0 else (1 if cross < 0 else 0)
+
+
+def _crossing_at_contact(
+    rings: Sequence[Sequence[Point]], p: Point, edge_ids: set[tuple[int, int]]
+) -> tuple[tuple[int, int], tuple[int, int]] | None:
+    """接点 p で、輪（の通り道）が互いに突き抜けているか。突き抜けていれば、その 2 本の通り道の辺を返す。
+
+    通り道は、p が辺の内側にあるときはその辺ぜんたい（まっすぐ通る）、p が輪の頂点のときはその頂点の前後の辺。
+    2 本の通り道の 4 つの向きが、p のまわりで交互に並ぶ（ABAB）なら横断。並びが AABB なら、接するだけ。
+    """
+    passes: dict[tuple, tuple[tuple[int, int], tuple[Fraction, Fraction], tuple[Fraction, Fraction]]] = {}
+    px, py = Fraction(p[0]), Fraction(p[1])
+
+    def vec(q: Point) -> tuple[Fraction, Fraction]:
+        return (Fraction(q[0]) - px, Fraction(q[1]) - py)
+
+    for ri, ei in sorted(edge_ids):
+        ring = rings[ri]
+        n = len(ring) - 1
+        if p == ring[ei] or p == ring[ei + 1]:
+            pos = ei if p == ring[ei] else (ei + 1) % n
+            prev = ring[pos - 1] if pos > 0 else ring[n - 1]
+            passes.setdefault(("v", ri, pos), ((ri, ei), vec(prev), vec(ring[pos + 1])))
+        else:
+            passes.setdefault(("e", ri, ei), ((ri, ei), vec(ring[ei]), vec(ring[ei + 1])))
+    items = list(passes.values())
+    for x in range(len(items) - 1):
+        for y in range(x + 1, len(items)):
+            (_, a1, a2), (_, b1, b2) = items[x], items[y]
+            order = sorted(
+                [("a", a1), ("a", a2), ("b", b1), ("b", b2)],
+                key=functools.cmp_to_key(lambda s, t: _angle_cmp(s[1], t[1])),
+            )
+            labels = [name for name, _ in order]
+            if labels[0] == labels[2]:
+                return items[x][0], items[y][0]
+    return None
 
 
 class RingIndex:
