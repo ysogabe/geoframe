@@ -2,7 +2,7 @@
 
 `update_regions.py` が使い、`tools/tests/test_regions.py` が試験する。ここでやること:
 
-- 形状の検査（閉じていない輪・有限でない座標・日付変更線をまたぐ辺・穴が外側に収まらない、など）
+- 形状の検査（閉じていない輪・有限でない座標・日付変更線をまたぐ辺・輪の自己交差・穴が外側に収まらない・穴同士の重なり、など）
 - 点の内外判定（国参照の食い違いを調べる診断用。分類器の本体は Rust の `regions` モジュール）
 - 成果物 `polygons.bin.gz` の符号化と復号（形式は docs/international-places/design.md の「境界データと分類器」と
   `crates/geoframe/src/regions/data.rs` の冒頭に書いたものと同じ）
@@ -17,6 +17,7 @@ from __future__ import annotations
 import math
 import re
 import struct
+from fractions import Fraction
 from typing import Iterable, Sequence
 
 MAGIC = b"GFREGN01"
@@ -32,6 +33,16 @@ Polygon = list[Ring]  # 先頭が外側、残りが穴
 
 class RegionDataError(ValueError):
     """元データまたは対応表が不正。変換を止める。"""
+
+
+class GeometryError(RegionDataError):
+    """形状の不正。`code` は不正の種類（`tables/geometry_exceptions.json` の `code`）、`detail` は座標つきの説明。"""
+
+    def __init__(self, code: str, label: str, detail: str) -> None:
+        super().__init__(f"{label}: {detail}")
+        self.code = code
+        self.label = label
+        self.detail = detail
 
 
 # ---------------------------------------------------------------- 可変長整数
@@ -176,22 +187,161 @@ def ring_area2(ring: Sequence[Point]) -> float:
 
 
 def validate_ring(ring: Sequence[Point], label: str) -> None:
+    """1 本の輪の検査（自己交差を除く。自己交差は `validate_polygon` が多角形ぜんたいで調べる）。"""
     if len(ring) < 4:
-        raise RegionDataError(f"{label}: 輪の点が 4 未満")
+        raise GeometryError("ring_too_short", label, "輪の点が 4 未満")
     if ring[0] != ring[-1]:
-        raise RegionDataError(f"{label}: 輪が閉じていない")
+        raise GeometryError("ring_not_closed", label, "輪が閉じていない")
     for x, y in ring:
         if not (math.isfinite(x) and math.isfinite(y)):
-            raise RegionDataError(f"{label}: 有限でない座標")
+            raise GeometryError("non_finite", label, "有限でない座標")
         if not (-180.0 <= x <= 180.0 and -90.0 <= y <= 90.0):
-            raise RegionDataError(f"{label}: 範囲外の座標 ({x}, {y})")
+            raise GeometryError("out_of_range", label, f"範囲外の座標 ({x}, {y})")
     for (x1, _), (x2, _) in zip(ring, ring[1:]):
         # 経度 ±180 をまたぐ辺（東西が反対側の点を直接つなぐ辺）は、平面の判定では世界を横切る。
         # 両端がちょうど ±180 の辺（南極の縁など、図の端に沿う辺）は図の端に沿うだけなので許す
         if abs(x2 - x1) > 180.0 and not (abs(x1) == 180.0 and abs(x2) == 180.0):
-            raise RegionDataError(f"{label}: 経度 ±180 をまたぐ辺がある")
+            raise GeometryError("antimeridian_edge", label, "経度 ±180 をまたぐ辺がある")
     if ring_area2(ring) == 0.0:
-        raise RegionDataError(f"{label}: 面積が 0 の輪")
+        raise GeometryError("zero_area", label, "面積が 0 の輪")
+
+
+# ---------------------------------------------------------------- 正確な幾何（交差・内外）
+
+# Shewchuk の ccw の誤差上界（倍精度）。これより大きい行列式の符号は浮動小数点でも確実
+_CCW_ERRBOUND = 3.3306690738754716e-16
+
+
+def orient(ax: float, ay: float, bx: float, by: float, cx: float, cy: float) -> int:
+    """a→b→c の向き。+1 が左回り、-1 が右回り、0 が一直線。厳密（誤差が怪しいときだけ有理数で計算し直す）。"""
+    left = (bx - ax) * (cy - ay)
+    right = (by - ay) * (cx - ax)
+    det = left - right
+    if abs(det) > _CCW_ERRBOUND * (abs(left) + abs(right)):
+        return 1 if det > 0 else -1
+    fa, fb, fc = (Fraction(ax), Fraction(ay)), (Fraction(bx), Fraction(by)), (Fraction(cx), Fraction(cy))
+    exact = (fb[0] - fa[0]) * (fc[1] - fa[1]) - (fb[1] - fa[1]) * (fc[0] - fa[0])
+    return (exact > 0) - (exact < 0)
+
+
+def segment_hit(a: Point, b: Point, c: Point, d: Point) -> int:
+    """線分 ab と cd の関係。0 = 交わらない・端点で接するだけ、1 = 互いの内側で交差（X 字）、
+    2 = 一直線上で長さを持って重なる。
+
+    端点が相手の線分に乗る接触（輪の自己接触・穴が外周に接する）は 0 とする。偶奇判定の結果を変えないため。
+    """
+    if max(a[0], b[0]) < min(c[0], d[0]) or max(c[0], d[0]) < min(a[0], b[0]):
+        return 0
+    if max(a[1], b[1]) < min(c[1], d[1]) or max(c[1], d[1]) < min(a[1], b[1]):
+        return 0
+    o1 = orient(*a, *b, *c)
+    o2 = orient(*a, *b, *d)
+    o3 = orient(*c, *d, *a)
+    o4 = orient(*c, *d, *b)
+    if o1 * o2 < 0 and o3 * o4 < 0:
+        return 1
+    if o1 == o2 == o3 == o4 == 0:
+        # 一直線上。広がりの大きい軸に射影して、区間の重なりに長さがあるか
+        axis = 0 if max(a[0], b[0], c[0], d[0]) - min(a[0], b[0], c[0], d[0]) >= max(
+            a[1], b[1], c[1], d[1]
+        ) - min(a[1], b[1], c[1], d[1]) else 1
+        lo1, hi1 = sorted((a[axis], b[axis]))
+        lo2, hi2 = sorted((c[axis], d[axis]))
+        return 2 if max(lo1, lo2) < min(hi1, hi2) else 0
+    return 0
+
+
+def _dedupe_ring(ring: Sequence[Point]) -> list[Point]:
+    """連続して同じ点を 1 つにした輪（閉じた形のまま）。長さ 0 の辺を取り除く。"""
+    out = [ring[0]]
+    for p in ring[1:]:
+        if p != out[-1]:
+            out.append(p)
+    return out
+
+
+def find_intersections(polygon: Polygon, limit: int = 8) -> list[tuple[str, int, int, int, int, Point]]:
+    """多角形（外側の輪と穴）の辺どうしの不正な交差を、最大 `limit` 件返す。
+
+    不正なのは (a) 互いの内側での交差（X 字）、(b) 一直線上で長さを持つ重なり（輪の折り返し・辺の重複を含む）。
+    端点での接触は許す。戻りは (種類, 輪 i, 辺 i, 輪 j, 辺 j, 目安の座標)。種類は "cross" / "overlap" / "backtrack"。
+
+    辺を格子に入れ、同じ格子にある辺の組だけを調べる（頂点が百万単位でも実用的な時間で終わる）。
+    """
+    found: list[tuple[str, int, int, int, int, Point]] = []
+    rings = [_dedupe_ring(r) for r in polygon]
+    # 隣り合う辺の折り返し（A→B→A のように同じ向きへ戻る）
+    for ri, r in enumerate(rings):
+        n = len(r) - 1  # 辺の数（r[n] == r[0]）
+        for i in range(n):
+            p, q, s = r[i], r[i + 1], r[(i + 1) % n + 1]
+            if orient(*p, *q, *s) == 0 and (q[0] - p[0]) * (s[0] - q[0]) + (q[1] - p[1]) * (s[1] - q[1]) < 0:
+                found.append(("backtrack", ri, i, ri, (i + 1) % n, q))
+                if len(found) >= limit:
+                    return found
+    edges: list[tuple[float, float, float, float, int, int]] = []
+    total_len = 0.0
+    minx = miny = math.inf
+    maxx = maxy = -math.inf
+    for ri, r in enumerate(rings):
+        for i in range(len(r) - 1):
+            (x1, y1), (x2, y2) = r[i], r[i + 1]
+            edges.append((min(x1, x2), min(y1, y2), max(x1, x2), max(y1, y2), ri, i))
+            total_len += max(abs(x2 - x1), abs(y2 - y1))
+            minx, maxx = min(minx, x1, x2), max(maxx, x1, x2)
+            miny, maxy = min(miny, y1, y2), max(maxy, y1, y2)
+    if len(edges) < 4:
+        return found
+    cell = max(4.0 * total_len / len(edges), max(maxx - minx, maxy - miny) / 4096.0, 1e-12)
+    grid: dict[tuple[int, int], list[int]] = {}
+    floor = math.floor
+    for k, (x0, y0, x1, y1, ri, i) in enumerate(edges):
+        r = rings[ri]
+        (ax, ay), (bx, by) = r[i], r[i + 1]
+        c0, c1 = floor(x0 / cell), floor(x1 / cell)
+        for cx in range(c0, c1 + 1):
+            # この列の中で辺が通る y の範囲（列の左右の端での y と、辺の端点を含む）
+            if ax == bx:
+                lo, hi = y0, y1
+            else:
+                xl = max(cx * cell, x0)
+                xr = min((cx + 1) * cell, x1)
+                ya = ay + (xl - ax) * (by - ay) / (bx - ax)
+                yb = ay + (xr - ax) * (by - ay) / (bx - ax)
+                pad = cell * 1e-9
+                lo, hi = max(min(ya, yb) - pad, y0), min(max(ya, yb) + pad, y1)
+            for cy in range(floor(lo / cell), floor(hi / cell) + 1):
+                grid.setdefault((cx, cy), []).append(k)
+    seen: set[tuple[int, int]] = set()
+    sizes = [len(r) - 1 for r in rings]
+    for members in grid.values():
+        m = len(members)
+        if m < 2:
+            continue
+        for u in range(m - 1):
+            k1 = members[u]
+            ex0, ey0, ex1, ey1, r1, i1 = edges[k1]
+            for v in range(u + 1, m):
+                k2 = members[v]
+                fx0, fy0, fx1, fy1, r2, i2 = edges[k2]
+                if ex1 < fx0 or fx1 < ex0 or ey1 < fy0 or fy1 < ey0:
+                    continue
+                if r1 == r2:
+                    gap = abs(i1 - i2)
+                    if gap == 1 or gap == sizes[r1] - 1:
+                        continue  # 隣り合う辺（折り返しは上で調べた）
+                pair = (k1, k2) if k1 < k2 else (k2, k1)
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                a, b = rings[r1][i1], rings[r1][i1 + 1]
+                c, d = rings[r2][i2], rings[r2][i2 + 1]
+                hit = segment_hit(a, b, c, d)
+                if hit:
+                    found.append(("cross" if hit == 1 else "overlap", r1, i1, r2, i2, a))
+                    if len(found) >= limit:
+                        return found
+    return found
 
 
 class RingIndex:
@@ -203,8 +353,6 @@ class RingIndex:
         ys = [p[1] for p in ring]
         self.bbox = (min(xs), min(ys), max(xs), max(ys))
         for (x1, y1), (x2, y2) in zip(ring, ring[1:]):
-            if y1 == y2:
-                continue
             lo, hi = (y1, y2) if y1 < y2 else (y2, y1)
             for band in range(math.floor(lo), math.floor(hi) + 1):
                 self.bands.setdefault(band, []).append((x1, y1, x2, y2))
@@ -256,25 +404,68 @@ class PolygonIndex:
         return best[1]
 
 
+def _classify(index: "RingIndex", px: float, py: float) -> int:
+    """点と輪の位置。1 = 内側、0 = 外側、-1 = 境界上。厳密（辺の向きの判定に `orient` を使う）。"""
+    x0, y0, x1, y1 = index.bbox
+    if not (x0 <= px <= x1 and y0 <= py <= y1):
+        return 0
+    inside = False
+    for ax, ay, bx, by in index.bands.get(math.floor(py), ()):
+        o = orient(ax, ay, bx, by, px, py)
+        if o == 0 and min(ax, bx) <= px <= max(ax, bx) and min(ay, by) <= py <= max(ay, by):
+            return -1
+        if (ay > py) != (by > py) and (o > 0) == (by > ay):
+            # 水平線との交点が点の右側にある（上向きの辺なら点が辺の左、下向きなら右）
+            inside = not inside
+    return 1 if inside else 0
+
+
+def _probe_points(hole: Sequence[Point]) -> list[Point]:
+    """穴の頂点と辺の中点（内外の判定に使う点）。"""
+    pts = list(hole[:-1])
+    pts += [((x1 + x2) / 2.0, (y1 + y2) / 2.0) for (x1, y1), (x2, y2) in zip(hole, hole[1:])]
+    return pts
+
+
 def validate_polygon(polygon: Polygon, label: str) -> None:
+    """多角形の検査。輪ごとの検査、辺の自己交差・輪どうしの交差、穴が外側に収まること、穴どうしが重ならないこと。
+
+    見つけた不正は `GeometryError`（`code` つき）で報告する。同じ多角形に複数の種類があるときは最初の 1 つ。
+    """
     if not polygon:
-        raise RegionDataError(f"{label}: 輪が無い多角形")
+        raise GeometryError("no_rings", label, "輪が無い多角形")
     for i, ring in enumerate(polygon):
         validate_ring(ring, f"{label} 輪{i}")
+    hits = find_intersections(polygon)
+    if hits:
+        kind, ri, ei, rj, ej, at = hits[0]
+        same = ri == rj
+        where = f"輪{ri}の辺{ei}" if same else f"輪{ri}の辺{ei}と輪{rj}の辺{ej}"
+        more = f"。他に {len(hits) - 1} 件以上" if len(hits) > 1 else ""
+        raise GeometryError(
+            "self_intersection" if same else "ring_intersection",
+            label,
+            f"{'自己交差' if same else '輪どうしの交差'}（{kind}）: {where} 付近 ({at[0]}, {at[1]}){more}",
+        )
     if len(polygon) == 1:
         return
-    outer = RingIndex(polygon[0])
-    ox0, oy0, ox1, oy1 = outer.bbox
+    indexes = [RingIndex(r) for r in polygon]
     for i, hole in enumerate(polygon[1:], start=1):
-        xs = [p[0] for p in hole]
-        ys = [p[1] for p in hole]
-        if min(xs) < ox0 or max(xs) > ox1 or min(ys) < oy0 or max(ys) > oy1:
-            raise RegionDataError(f"{label}: 穴{i}が外側の範囲からはみ出す")
-        # 穴の頂点の過半数が外側の内側か境界上にあること（境界に接する穴を許す）。
-        # 内外が不定な境界上の点を避けるため、各頂点をごく小さくずらして数える
-        inside = sum(1 for x, y in hole if outer.contains(x, y + 1e-9) or outer.contains(x, y - 1e-9))
-        if inside * 2 < len(hole):
-            raise RegionDataError(f"{label}: 穴{i}が外側に収まらない")
+        # 辺が交差しないので、穴は外側の内側にあるか外側の外にあるかのどちらか（接触を除く）。
+        # 頂点と辺の中点がどれも外側の外に出ていないこと、少なくとも 1 点は厳密に内側にあることを確かめる
+        states = [_classify(indexes[0], x, y) for x, y in _probe_points(hole)]
+        if 0 in states or 1 not in states:
+            raise GeometryError("hole_outside", label, f"穴{i}が外側に収まらない")
+    # 穴どうし: 一方が他方の内側に入っていない（辺が交差しないので、1 点の内外で決まる）
+    for i in range(1, len(polygon)):
+        for j in range(i + 1, len(polygon)):
+            bi, bj = indexes[i].bbox, indexes[j].bbox
+            if bi[2] < bj[0] or bj[2] < bi[0] or bi[3] < bj[1] or bj[3] < bi[1]:
+                continue
+            for a, b in ((i, j), (j, i)):
+                states = [_classify(indexes[b], x, y) for x, y in _probe_points(polygon[a])]
+                if 1 in states:
+                    raise GeometryError("holes_overlap", label, f"穴{a}と穴{b}が重なる")
 
 
 # ---------------------------------------------------------------- 名称表

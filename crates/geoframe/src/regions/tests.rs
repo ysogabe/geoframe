@@ -386,6 +386,24 @@ fn regions_refer_to_the_country_polygons_listed_in_the_names() {
 
 // ---------------------------------------------------------------- 形式の不正を拒否する
 
+fn limits() -> data::DecodeLimits {
+    data::DecodeLimits::from_manifest(data::manifest().unwrap())
+}
+
+/// 手で組んだ小さなデータ用の上限（件数に余裕を持たせる）。
+fn small() -> data::DecodeLimits {
+    let l = data::LayerLimits {
+        features: 8,
+        polygons: 8,
+        rings: 8,
+        vertices: 64,
+    };
+    data::DecodeLimits {
+        countries: l,
+        regions: l,
+    }
+}
+
 fn raw_polygons() -> Vec<u8> {
     let m = data::manifest().unwrap();
     let a = &m.artifacts.polygons;
@@ -399,19 +417,19 @@ fn err(r: Result<PolygonSet, DataError>) -> String {
 #[test]
 fn decoder_rejects_malformed_polygons() {
     let raw = raw_polygons();
-    assert!(data::decode_polygons(&raw).is_ok());
+    assert!(data::decode_polygons(&raw, &limits()).is_ok());
     // magic（形式の版を含む）
     let mut bad = raw.clone();
     bad[7] = b'9';
-    assert!(err(data::decode_polygons(&bad)).contains("magic"));
+    assert!(err(data::decode_polygons(&bad, &limits())).contains("magic"));
     // 途中で切れる
-    assert!(data::decode_polygons(&raw[..raw.len() / 2]).is_err());
-    assert!(data::decode_polygons(&raw[..4]).is_err());
-    assert!(data::decode_polygons(&[]).is_err());
+    assert!(data::decode_polygons(&raw[..raw.len() / 2], &limits()).is_err());
+    assert!(data::decode_polygons(&raw[..4], &limits()).is_err());
+    assert!(data::decode_polygons(&[], &limits()).is_err());
     // 末尾の余り
     let mut extra = raw.clone();
     extra.push(0);
-    assert!(err(data::decode_polygons(&extra)).contains("余り"));
+    assert!(err(data::decode_polygons(&extra, &limits())).contains("余り"));
 }
 
 #[test]
@@ -419,11 +437,108 @@ fn decoder_rejects_hostile_counts_without_allocating() {
     // 国の件数が 2^60 と宣言された短いデータ
     let mut hostile = data::MAGIC.to_vec();
     hostile.extend_from_slice(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x10, 0x00]);
-    assert!(err(data::decode_polygons(&hostile)).contains("個数"));
+    assert!(err(data::decode_polygons(&hostile, &limits())).contains("個数"));
     // 終わらない可変長整数
     let mut endless = data::MAGIC.to_vec();
     endless.extend_from_slice(&[0xff; 16]);
-    assert!(data::decode_polygons(&endless).is_err());
+    assert!(data::decode_polygons(&endless, &limits()).is_err());
+}
+
+/// 先頭から「国 1 件・地域 0 件・ID `ne:X`」までを組む。
+fn one_country_prefix(id: &[u8]) -> Vec<u8> {
+    let mut out = data::MAGIC.to_vec();
+    out.extend_from_slice(&[1, 0]);
+    out.push(u8::try_from(id.len()).unwrap());
+    out.extend_from_slice(id);
+    out
+}
+
+#[test]
+fn decoder_rejects_counts_that_fit_the_input_but_exceed_the_manifest() {
+    let m = data::manifest().unwrap();
+    let c = &m.counts.countries;
+    let put = |out: &mut Vec<u8>, mut n: u64| loop {
+        let b = (n & 0x7f) as u8;
+        n >>= 7;
+        if n == 0 {
+            out.push(b);
+            return;
+        }
+        out.push(b | 0x80);
+    };
+    // 入力長（ゼロ埋め）には収まるが manifest の件数を超える個数を、層ごと・階層ごとに宣言したデータ
+    let polygons = {
+        let mut d = one_country_prefix(b"ne:X");
+        put(&mut d, c.polygons as u64 + 1);
+        d.resize(d.len() + c.polygons + 8, 0);
+        d
+    };
+    let rings = {
+        let mut d = one_country_prefix(b"ne:X");
+        put(&mut d, 1); // 多角形 1
+        put(&mut d, c.rings as u64 + 1);
+        d.resize(d.len() + c.rings + 8, 0);
+        d
+    };
+    let vertices = {
+        let mut d = one_country_prefix(b"ne:X");
+        put(&mut d, 1);
+        put(&mut d, 1);
+        put(&mut d, c.vertices as u64 + 1);
+        d.resize(d.len() + 2 * c.vertices + 16, 0);
+        d
+    };
+    let features = {
+        let mut d = data::MAGIC.to_vec();
+        put(&mut d, c.features as u64 + 1);
+        put(&mut d, 0);
+        d.resize(d.len() + 3 * c.features + 16, 0);
+        d
+    };
+    for (label, d) in [
+        ("polygons", polygons),
+        ("rings", rings),
+        ("vertices", vertices),
+        ("features", features),
+    ] {
+        let e = err(data::decode_polygons(&d, &limits()));
+        assert!(e.contains("manifest の件数"), "{label}: {e}");
+    }
+    // 同じ個数でも、上限の中なら読み進められる（ここでは先の検査で別の理由で止まる）
+    let mut ok = one_country_prefix(b"ne:X");
+    put(&mut ok, 1);
+    ok.resize(ok.len() + 16, 0);
+    assert!(!err(data::decode_polygons(&ok, &limits())).contains("manifest の件数"));
+}
+
+#[test]
+fn decoder_rejects_bad_ids_and_empty_polygon_lists() {
+    // 長さ 0・65・使えない文字・UTF-8 でない・日本語
+    for (label, id) in [
+        ("空", Vec::new()),
+        ("長すぎる", vec![b'a'; 65]),
+        ("空白", b"ne:a b".to_vec()),
+        ("制御文字", b"ne:a\n".to_vec()),
+        ("UTF-8 でない", vec![b'n', b'e', b':', 0xff]),
+        ("日本語", "ne:日本".as_bytes().to_vec()),
+    ] {
+        let mut d = one_country_prefix(&id);
+        d.extend_from_slice(&[1, 1, 4]);
+        let e = err(data::decode_polygons(&d, &small()));
+        assert!(e.contains("ID"), "{label}: {e}");
+    }
+    // 長さ 64 ちょうどは ID としては通る（先の検査で別の理由で止まる）
+    let mut d = one_country_prefix(&[b'a'; 64]);
+    d.push(0);
+    assert!(err(data::decode_polygons(&d, &small())).contains("多角形が無い"));
+    // 多角形 0 件の地物
+    let mut d = one_country_prefix(b"ne:X");
+    d.push(0);
+    assert!(err(data::decode_polygons(&d, &small())).contains("多角形が無い"));
+    // 輪が 0 本の多角形
+    let mut d = one_country_prefix(b"ne:X");
+    d.extend_from_slice(&[1, 0]);
+    assert!(err(data::decode_polygons(&d, &small())).contains("輪が無い"));
 }
 
 #[test]
@@ -463,16 +578,40 @@ fn decoder_rejects_non_finite_unclosed_and_tiny_rings() {
     let b = (bits(3.0), bits(2.0));
     let c = (bits(3.0), bits(4.0));
     // 正しい輪（閉じた 4 点）は読める
-    assert!(data::decode_polygons(&feature_bytes(4, &[a, b, c, a])).is_ok());
+    assert!(data::decode_polygons(&feature_bytes(4, &[a, b, c, a]), &small()).is_ok());
     // 閉じていない
-    assert!(err(data::decode_polygons(&feature_bytes(4, &[a, b, c, b]))).contains("閉じていない"));
+    assert!(
+        err(data::decode_polygons(
+            &feature_bytes(4, &[a, b, c, b]),
+            &small()
+        ))
+        .contains("閉じていない")
+    );
     // 4 点未満
-    assert!(err(data::decode_polygons(&feature_bytes(3, &[a, b, a]))).contains("4 未満"));
+    assert!(
+        err(data::decode_polygons(
+            &feature_bytes(3, &[a, b, a]),
+            &small()
+        ))
+        .contains("4 未満")
+    );
     // 有限でない
     let nan = (bits(f64::NAN), bits(2.0));
-    assert!(err(data::decode_polygons(&feature_bytes(4, &[nan, b, c, nan]))).contains("有限"));
+    assert!(
+        err(data::decode_polygons(
+            &feature_bytes(4, &[nan, b, c, nan]),
+            &small()
+        ))
+        .contains("有限")
+    );
     let inf = (bits(f64::INFINITY), bits(2.0));
-    assert!(err(data::decode_polygons(&feature_bytes(4, &[inf, b, c, inf]))).contains("有限"));
+    assert!(
+        err(data::decode_polygons(
+            &feature_bytes(4, &[inf, b, c, inf]),
+            &small()
+        ))
+        .contains("有限")
+    );
 }
 
 #[test]

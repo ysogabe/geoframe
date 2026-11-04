@@ -16,10 +16,12 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
+import io
 import json
 import sys
 import urllib.parse
 import urllib.request
+import zlib
 from collections import Counter
 from pathlib import Path
 
@@ -244,7 +246,15 @@ def build(directory: Path, sources: dict, tables_dir: Path) -> dict:
             entry["pref"] = row["pref"]
             used_pref.add(code)
         regions.append(
-            {"id": rid, "country": country_index[parent], "polygons": polygons, "names": entry, "code": code, "declared": a3}
+            {
+                "id": rid,
+                "country": country_index[parent],
+                "polygons": polygons,
+                "names": entry,
+                "code": code,
+                "declared": a3,
+                "reassigned": a3 in parent_map,
+            }
         )
 
     for label, wanted, got in (
@@ -280,6 +290,9 @@ def check_japan(jp_table: list, pref_by_code: dict, used: set, regions: list) ->
 def cross_reference(built: dict) -> tuple[list[dict], list[str]]:
     """Admin1 の各多角形の代表点が、日本視点版 Admin0 のどの国に入るかを調べ、宣言された国と違うものを返す。
 
+    `id_resolution.json` の `admin1_parent` で明示的に国を付け替えた地域は、既知の食い違いの一覧とは別に検査する。
+    付け替え先の国にすべての片の代表点が入らなければ、変換を止める（付け替えの誤りであり、既知の食い違いではない）。
+
     Admin1 は既定版（日本視点ではない）なので、北方領土・竹島のように国が食い違うことがある。
     食い違いは分類器では『その国に Admin1 が当たらない点＝地域不明』になる（設計「境界データと分類器」）。
     """
@@ -289,6 +302,7 @@ def cross_reference(built: dict) -> tuple[list[dict], list[str]]:
         for polygon in c["polygons"]:
             index.append((c["id"], lib.PolygonIndex(polygon)))
     mismatches = []
+    reassign_failures = []
     nowhere = "(どの国にも入らない)"
     for region in built["regions"]:
         parent = region["names"]["country"]
@@ -298,6 +312,14 @@ def cross_reference(built: dict) -> tuple[list[dict], list[str]]:
             hit = [cid for cid, pidx in index if pidx.contains(px, py)]
             found[hit[0] if hit else nowhere] += 1
         wrong = {k: v for k, v in found.items() if k != parent}
+        if region["reassigned"]:
+            # 明示した付け替え先は、代表点の一致を必須にする。既知の食い違いの一覧には混ぜない
+            if wrong:
+                reassign_failures.append(
+                    f"{region['id']}（{region['declared']}→{parent}）: "
+                    + ", ".join(f"{k}:{v}" for k, v in sorted(wrong.items()))
+                )
+            continue
         if wrong:
             other = {k: v for k, v in wrong.items() if k != nowhere}
             mismatches.append(
@@ -313,6 +335,11 @@ def cross_reference(built: dict) -> tuple[list[dict], list[str]]:
             )
     other_country = [m for m in mismatches if m["parts_other_country"]]
     only_coast = [m for m in mismatches if not m["parts_other_country"]]
+    if reassign_failures:
+        raise lib.RegionDataError(
+            "admin1_parent で付け替えた地域の代表点が付け替え先の国に入らない（付け替え先を直す）: "
+            + "; ".join(reassign_failures)
+        )
     lines = [
         "# Admin1（既定版）の各片の代表点を、Admin0（日本視点版）の国と突き合わせた食い違いの一覧",
         "# 列: Admin1 の ID / 名称 / Admin1 の宣言(adm0_a3) / 採用した国 / 片の数 / 別の国に入る片(国:片数) / どの国にも入らない片",
@@ -448,10 +475,64 @@ def make_manifest(built: dict, sources: dict, blobs: dict) -> dict:
     }
 
 
+def expand(gz: bytes, max_raw: int) -> bytes | None:
+    """gzip を展開する。壊れている・`max_raw` を超えるときは None（展開爆弾を避けるため、上限 +1 バイトまでしか読まない）。"""
+    try:
+        with gzip.GzipFile(fileobj=io.BytesIO(gz)) as f:
+            raw = f.read(max_raw + 1)
+    except (OSError, EOFError, zlib.error):
+        return None
+    return raw if len(raw) <= max_raw else None
+
+
+def verify_committed(out: Path, committed: dict) -> dict[str, bytes]:
+    """コミット済みの成果物そのものが、committed manifest の記録（圧縮後のサイズ・SHA256、展開後のサイズ・SHA256・上限）と
+    一致するか。一致しなければ止まる。戻りは展開後の内容（名前→バイト列）。
+
+    変換し直した結果との比較（zlib の版による gzip の違いを許す）より前に行う。成果物が壊れているのに、
+    zlib の版違いとして『一致』と報告しないため。
+    """
+    raws: dict[str, bytes] = {}
+    for name in ("polygons", "names"):
+        art = committed["artifacts"][name]
+        path = out / art["file"]
+        if not path.is_file():
+            raise SystemExit(f"{art['file']}: コミット済みの成果物が無い")
+        gz = path.read_bytes()
+        if len(gz) != art["bytes"] or sha256_hex(gz) != art["sha256"]:
+            raise SystemExit(f"{art['file']}: 成果物のサイズまたは SHA256 が manifest と違う（壊れている）")
+        raw = expand(gz, art["max_raw_bytes"])
+        if raw is None:
+            raise SystemExit(f"{art['file']}: gzip を展開できない、または展開後が上限を超える（壊れている）")
+        if len(raw) != art["raw_bytes"] or sha256_hex(raw) != art["raw_sha256"]:
+            raise SystemExit(f"{art['file']}: 展開後のサイズまたは SHA256 が manifest と違う（壊れている）")
+        raws[name] = raw
+    return raws
+
+
+def keep_existing_gz(blobs: dict, out: Path) -> list[str]:
+    """既存の成果物の gzip が、新しい展開後の内容と同じ内容に展開できるなら、既存のバイト列を使う。
+
+    形状（展開後の内容）が同じなのに、zlib の版の違いだけで gzip のバイト列が変わり、履歴に blob が増えるのを避ける。
+    戻りは既存を残した成果物の名前。
+    """
+    kept = []
+    for name, file, limit in (("polygons", "polygons.bin.gz", LIMIT_POLYGONS_RAW), ("names", "names.json.gz", LIMIT_NAMES_RAW)):
+        path = out / file
+        if not path.is_file():
+            continue
+        old = path.read_bytes()
+        if old != blobs[f"{name}_gz"] and expand(old, limit) == blobs[f"{name}_raw"]:
+            blobs[f"{name}_gz"] = old
+            kept.append(file)
+    return kept
+
+
 def convert(sources: dict, directory: Path, out: Path, write: bool) -> dict:
     verify_dir(sources, directory)
     built = build(directory, sources, HERE / "tables")
     blobs = render(built, sources)
+    kept = keep_existing_gz(blobs, out) if write else []
     manifest = make_manifest(built, sources, blobs)
     total = manifest["artifacts"]["polygons"]["bytes"] + manifest["artifacts"]["names"]["bytes"]
     if total > manifest["max_total_bytes"]:
@@ -463,7 +544,14 @@ def convert(sources: dict, directory: Path, out: Path, write: bool) -> dict:
     manifest["counts"]["admin1_other_country"] = sum(1 for m in mismatches if m["parts_other_country"])
     manifest["counts"]["admin1_coastline_only"] = sum(1 for m in mismatches if not m["parts_other_country"])
     report = "\n".join(report_lines) + "\n"
-    result = {"built": built, "blobs": blobs, "manifest": manifest, "report": report, "mismatches": mismatches}
+    result = {
+        "built": built,
+        "blobs": blobs,
+        "manifest": manifest,
+        "report": report,
+        "mismatches": mismatches,
+        "kept_gz": kept,
+    }
     if write:
         out.mkdir(parents=True, exist_ok=True)
         (out / "polygons.bin.gz").write_bytes(blobs["polygons_gz"])
@@ -514,8 +602,9 @@ def main() -> None:
 
     try:
         if args.command == "check":
-            result = convert(sources, directory, args.out, write=False)
             committed = load_json(args.out / "manifest.json")
+            verify_committed(args.out, committed)  # 既存の成果物自体の検証が先（壊れていれば、ここで止まる）
+            result = convert(sources, directory, args.out, write=False)
             new = result["manifest"]
             for name in ("polygons", "names"):
                 a, b = committed["artifacts"][name], new["artifacts"][name]
@@ -528,10 +617,12 @@ def main() -> None:
                 for n in ("polygons", "names")
             )
             print_summary(result)
-            print("一致: 展開後の内容と manifest が同じ" + (" / gzip もバイト単位で同じ" if same_gz else "（gzip の出力は zlib の版で変わりうる）"))
+            print("一致: 展開後の内容と manifest が同じ" + (" / gzip もバイト単位で同じ" if same_gz else "（gzip のバイト列は違う。展開後の内容は一致するので zlib の版の違いと判断）"))
             return
         result = convert(sources, directory, args.out, write=True)
         print_summary(result)
+        for file in result["kept_gz"]:
+            print(f"{file}: 展開後の内容が同じなので、既存の gzip をそのまま残した")
         print(f"書き出した: {args.out}")
     except lib.RegionDataError as e:
         raise SystemExit(f"変換を拒否: {e}") from e

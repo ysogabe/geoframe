@@ -29,6 +29,10 @@
 //!
 //! 実行時は形式の版・件数・展開後のサイズ（manifest の上限と一致）を確認する。全データのハッシュは取らない
 //! （manifest との一致は [`verify_artifacts`] を `cargo test` と更新時に回す）。
+//!
+//! 復号は manifest の件数（国・地域の件数、多角形・輪・頂点の総数）を上限として受け取り（[`DecodeLimits`]）、
+//! `Vec` を確保する前に、宣言された個数が残りの上限と残りのバイト数の両方に収まることを確かめる。
+//! ID は長さ 1〜64・文字種（ASCII 英数字と `:_-`）を、多角形は 1 つ以上の輪を持つことを、読んだ時点で確かめる。
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -278,10 +282,13 @@ impl NameTable {
     }
 }
 
+/// ID の最大の長さ（バイト）。
+pub const MAX_ID_LEN: usize = 64;
+
 /// ID の文字種と長さ（管理 API の入力検査と同じ）。
 pub fn valid_id(id: &str) -> bool {
     !id.is_empty()
-        && id.len() <= 64
+        && id.len() <= MAX_ID_LEN
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'_' | b'-'))
@@ -433,6 +440,20 @@ impl<'a> Cursor<'a> {
         Ok(n)
     }
 
+    /// 個数。`count` の検査に加えて、残りの上限 `budget`（manifest の件数から使った分を引いたもの）を超えるものも拒否する。
+    fn count_within(
+        &mut self,
+        min_bytes_each: usize,
+        budget: &mut usize,
+    ) -> Result<usize, DataError> {
+        let n = self.count(min_bytes_each)?;
+        if n > *budget {
+            return Err(DataError::new("個数が manifest の件数を超える"));
+        }
+        *budget -= n;
+        Ok(n)
+    }
+
     fn take(&mut self, n: usize) -> Result<&'a [u8], DataError> {
         let end = self.pos.checked_add(n).filter(|&e| e <= self.data.len());
         let end = end.ok_or_else(|| DataError::new("ポリゴンが途中で終わっている"))?;
@@ -446,24 +467,74 @@ fn unzigzag(z: u64) -> i64 {
     ((z >> 1) as i64) ^ -((z & 1) as i64)
 }
 
-/// 展開済みの `polygons.bin` を復号する（座標が有限なこと、輪が 4 点以上で閉じていることまで確かめる）。
-pub fn decode_polygons(raw: &[u8]) -> Result<PolygonSet, DataError> {
+/// 復号で受け入れる件数の上限。壊れたデータが入力長には収まる巨大な個数を宣言しても、確保の前に拒否するための値で、
+/// 通常は manifest の件数（[`DecodeLimits::from_manifest`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeLimits {
+    pub countries: LayerLimits,
+    pub regions: LayerLimits,
+}
+
+/// 層（国または地域）ごとの上限。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerLimits {
+    pub features: usize,
+    pub polygons: usize,
+    pub rings: usize,
+    pub vertices: usize,
+}
+
+impl From<&LayerCounts> for LayerLimits {
+    fn from(c: &LayerCounts) -> Self {
+        Self {
+            features: c.features,
+            polygons: c.polygons,
+            rings: c.rings,
+            vertices: c.vertices,
+        }
+    }
+}
+
+impl DecodeLimits {
+    pub fn from_manifest(m: &Manifest) -> Self {
+        Self {
+            countries: (&m.counts.countries).into(),
+            regions: (&m.counts.regions).into(),
+        }
+    }
+}
+
+/// 展開済みの `polygons.bin` を復号する。件数は `limits`（通常は manifest の件数）を超えるものを、確保の前に拒否する。
+/// 座標が有限なこと、輪が 4 点以上で閉じていること、ID の長さと文字種、多角形が輪を持つことまで確かめる。
+pub fn decode_polygons(raw: &[u8], limits: &DecodeLimits) -> Result<PolygonSet, DataError> {
     let mut c = Cursor { data: raw, pos: 0 };
     if c.take(MAGIC.len())? != MAGIC {
         return Err(DataError::new("ポリゴンの magic が違う"));
     }
-    let n_countries = c.count(3)?;
-    let n_regions = c.count(3)?;
+    let mut features_budget = (limits.countries.features, limits.regions.features);
+    let n_countries = c.count_within(3, &mut features_budget.0)?;
+    let n_regions = c.count_within(3, &mut features_budget.1)?;
     let (mut px, mut py) = (0i64, 0i64);
     let mut layers: [Vec<Feature>; 2] = [
         Vec::with_capacity(n_countries),
         Vec::with_capacity(n_regions),
     ];
-    for (layer, is_region, n) in [(0usize, false, n_countries), (1, true, n_regions)] {
+    for (layer, is_region, n, lim) in [
+        (0usize, false, n_countries, &limits.countries),
+        (1, true, n_regions, &limits.regions),
+    ] {
+        let (mut polygons_left, mut rings_left, mut vertices_left) =
+            (lim.polygons, lim.rings, lim.vertices);
         for _ in 0..n {
             let id_len = c.count(1)?;
-            let id = String::from_utf8(c.take(id_len)?.to_vec())
-                .map_err(|_| DataError::new("ID が UTF-8 でない"))?;
+            if id_len == 0 || id_len > MAX_ID_LEN {
+                return Err(DataError::new("ID の長さが不正"));
+            }
+            let id = std::str::from_utf8(c.take(id_len)?)
+                .ok()
+                .filter(|s| valid_id(s))
+                .ok_or_else(|| DataError::new("ID に使えない文字がある"))?
+                .to_owned();
             let country = if is_region {
                 let i = usize::try_from(c.varint()?)
                     .map_err(|_| DataError::new("国の添字が大きすぎる"))?;
@@ -474,16 +545,19 @@ pub fn decode_polygons(raw: &[u8]) -> Result<PolygonSet, DataError> {
             } else {
                 None
             };
-            let n_polygons = c.count(1)?;
+            let n_polygons = c.count_within(1, &mut polygons_left)?;
+            if n_polygons == 0 {
+                return Err(DataError::new("多角形が無い地物"));
+            }
             let mut polygons = Vec::with_capacity(n_polygons);
             for _ in 0..n_polygons {
-                let n_rings = c.count(1)?;
+                let n_rings = c.count_within(1, &mut rings_left)?;
                 if n_rings == 0 {
                     return Err(DataError::new("輪が無い多角形"));
                 }
                 let mut rings = Vec::with_capacity(n_rings);
                 for _ in 0..n_rings {
-                    let n_points = c.count(2)?;
+                    let n_points = c.count_within(2, &mut vertices_left)?;
                     if n_points < 4 {
                         return Err(DataError::new("輪の点が 4 未満"));
                     }
@@ -525,7 +599,7 @@ pub fn load_polygons() -> Result<PolygonSet, DataError> {
     let m = manifest()?;
     let a = &m.artifacts.polygons;
     let raw = gunzip(POLYGONS_GZ, a.raw_bytes, a.max_raw_bytes)?;
-    let set = decode_polygons(&raw)?;
+    let set = decode_polygons(&raw, &DecodeLimits::from_manifest(m))?;
     drop(raw);
     check_polygon_set(&set, m, names()?)?;
     Ok(set)
