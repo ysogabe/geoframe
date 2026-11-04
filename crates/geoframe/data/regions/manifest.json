@@ -1,0 +1,124 @@
+{
+  "format": 1,
+  "source": {
+    "name": "Natural Earth",
+    "data_version": "5.1.1",
+    "license": "Public Domain",
+    "terms_url": "https://www.naturalearthdata.com/about/terms-of-use/",
+    "git_repo": "https://github.com/nvkelso/natural-earth-vector",
+    "git_tag": "v5.1.2",
+    "git_commit": "f1890d9f152c896d250a77557a5751a93d494776",
+    "layers": {
+      "admin0": {
+        "stem": "ne_10m_admin_0_countries_jpn",
+        "files": {
+          "shp": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_0_countries_jpn.shp",
+            "bytes": 8789840,
+            "sha256": "b32931a3158d8a6d24cd661d30d389da32b357cc8fe7e12b5b05139b47249e5b"
+          },
+          "shx": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_0_countries_jpn.shx",
+            "bytes": 2100,
+            "sha256": "e816774f88dc1c6fb560c47cb5890a6056f9193f3559e034b177d60e1e1a4d90"
+          },
+          "dbf": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_0_countries_jpn.dbf",
+            "bytes": 845660,
+            "sha256": "7af028205de4939a1f2deea0d4b66019f00074c81d962edbbf5fdc5886051bea"
+          },
+          "prj": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_0_countries_jpn.prj",
+            "bytes": 145,
+            "sha256": "a02a27b1d1982c8516d83398e85a3c8b1aef1713c13ef4d84d7bde17430c07c4"
+          }
+        }
+      },
+      "admin1": {
+        "stem": "ne_10m_admin_1_states_provinces",
+        "files": {
+          "shp": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_1_states_provinces.shp",
+            "bytes": 20998780,
+            "sha256": "c6f5c8b4b1320d9417033762419c6df1eb423989cd880fba78ea0b1e3522cbe4"
+          },
+          "shx": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_1_states_provinces.shx",
+            "bytes": 36868,
+            "sha256": "37a9e2bc79ed31d3bdea3cb62d928f77281a1c88d645cd33430231c75dbcf350"
+          },
+          "dbf": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_1_states_provinces.dbf",
+            "bytes": 15161514,
+            "sha256": "445a8a9bea889634faf0af18081830df0b05b8471fc6af8dc42aecdd7a71bba1"
+          },
+          "prj": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_1_states_provinces.prj",
+            "bytes": 145,
+            "sha256": "a02a27b1d1982c8516d83398e85a3c8b1aef1713c13ef4d84d7bde17430c07c4"
+          },
+          "cpg": {
+            "url": "https://raw.githubusercontent.com/nvkelso/natural-earth-vector/f1890d9f152c896d250a77557a5751a93d494776/10m_cultural/ne_10m_admin_1_states_provinces.cpg",
+            "bytes": 5,
+            "sha256": "3ad3031f5503a4404af825262ee8232cc04d4ea6683d42c5dd0a2f2a27ac9824"
+          }
+        }
+      }
+    }
+  },
+  "converter": {
+    "script": "tools/regions/update_regions.py",
+    "version": "1.0.0",
+    "pyshp": "3.1.6",
+    "coordinates": "IEEE 754 倍精度のまま。丸め・簡略化なし"
+  },
+  "counts": {
+    "countries": {
+      "features": 250,
+      "polygons": 4255,
+      "rings": 4273,
+      "holes": 18,
+      "vertices": 547478
+    },
+    "regions": {
+      "features": 4589,
+      "polygons": 8386,
+      "rings": 8497,
+      "holes": 111,
+      "vertices": 1292005
+    },
+    "excluded_admin1": [
+      "AIA+99?",
+      "ATA+99?",
+      "COL+99?",
+      "KIR+99?",
+      "MEX+99?",
+      "RUS+99?",
+      "VEN+99?"
+    ],
+    "admin1_other_country": 6,
+    "admin1_coastline_only": 14
+  },
+  "artifacts": {
+    "polygons": {
+      "file": "polygons.bin.gz",
+      "bytes": 13540763,
+      "sha256": "f9240c42e692464d660e70684c43befa9446eeafb97e54591d19044a7b650c67",
+      "raw_bytes": 23435987,
+      "raw_sha256": "a7c59ebb6bf90f4a5e0d759b89f11013ac78905686f6aff206cffb13a7eb4362",
+      "max_bytes": 14500000,
+      "max_raw_bytes": 40000000
+    },
+    "names": {
+      "file": "names.json.gz",
+      "bytes": 151205,
+      "sha256": "bc075fabca44eeb1c90ea3b67a6916cc26f64225ca807fbc46aa2aa664214308",
+      "raw_bytes": 699214,
+      "raw_sha256": "873c8597adb9480eb7470dfbef21f2251259108d639f6ab031b70d256245710a",
+      "max_bytes": 500000,
+      "max_raw_bytes": 3000000
+    }
+  },
+  "max_total_bytes": 15000000,
+  "dataset_sha256": "45cbc6f7d78cd7fe0c4971f717785beecce720b9bfaf75d636c9b3bfa3469a0d"
+}

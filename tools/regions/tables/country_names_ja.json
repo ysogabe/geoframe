@@ -1,0 +1,10 @@
+{
+  "_comment": "国の日本語名の言い換え。miharashi の tools/world_geojson_to_txt.py の NAME_OVERRIDES と同じ（PRD R13）。キーは ADM0_A3",
+  "overrides": {
+    "TWN": "台湾",
+    "USA": "アメリカ",
+    "GBR": "イギリス",
+    "KOR": "韓国",
+    "PRK": "北朝鮮"
+  }
+}

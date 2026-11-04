@@ -420,6 +420,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "fast_image_resize",
+ "flate2",
  "futures-util",
  "httpdate",
  "image",

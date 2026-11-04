@@ -1,0 +1,5 @@
+# 境界データを更新するときだけ使う（通常のビルド・実行・試験には要らない）。
+# pip install --require-hashes -r tools/regions/requirements.txt
+pyshp==3.1.6 \
+    --hash=sha256:be8cd9436dcbde477c63ea789f7dcdea3af19f17ea84f2744bfc12efe9145d1e \
+    --hash=sha256:4c4b5a4138815c93defd6ebe50bae885b7e58984f431cdb7bb5d00718ac71daf
