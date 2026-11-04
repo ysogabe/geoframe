@@ -126,6 +126,8 @@ struct Tally {
     stale_input: u64,
     removed: u64,
     failed: u64,
+    /// 候補の走査を時間の上限か停止で打ち切ったら 1（`pending` は数えた分までの下限）。
+    scan_incomplete: u64,
 }
 
 impl Tally {
@@ -147,6 +149,7 @@ impl Tally {
             ("removed", self.removed),
             ("failed", self.failed),
             ("deferred", deferred),
+            ("scan_incomplete", self.scan_incomplete),
         ]);
         Counts(v)
     }
@@ -448,6 +451,7 @@ impl Stage for Regions {
         let (candidates, pending, cut) =
             self.select(ctx.read, have_table, &literal, started, ctx.stop)?;
         tally.pending = pending;
+        tally.scan_incomplete = u64::from(cut);
         if cut {
             tracing::info!(
                 "[regions] 候補の走査を時間の上限か停止で打ち切りました（数えた分 {} 枚。残りは次回）",

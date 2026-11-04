@@ -330,6 +330,7 @@ fn candidates_are_unplaced_photos_with_valid_coordinates_only() {
     let (st, n) = stage("v1");
     let c = s.run(&st);
     assert_eq!(c["pending"], 3);
+    assert_eq!(c["scan_incomplete"], 0);
     assert_eq!(c["inside"] + c["unresolved"], 3);
     assert_eq!(
         s.rows().iter().map(|r| r.0).collect::<Vec<_>>(),
@@ -964,6 +965,8 @@ fn the_time_limit_also_cuts_the_candidate_scan_after_the_first_batch_is_found() 
     let c = s.run(&st);
     assert_eq!(c["inside"], 3, "{c:?}");
     assert!(c["pending"] < 20, "走査が打ち切られていない: {c:?}");
+    // 打ち切ったので、pending は下限であることを件数で示す
+    assert_eq!(c["scan_incomplete"], 1, "{c:?}");
     assert_eq!(s.row_count(), 43);
     // 時間に余裕があれば、残りは次の通常の同期で全部処理する
     let (st, _) = stage("v1");
@@ -972,7 +975,26 @@ fn the_time_limit_also_cuts_the_candidate_scan_after_the_first_batch_is_found() 
         .with_progress_ops(1);
     let c = s.run(&st);
     assert_eq!((c["pending"], c["inside"], c["deferred"]), (17, 17, 0));
+    assert_eq!(c["scan_incomplete"], 0, "{c:?}");
     assert_eq!(s.row_count(), 60);
+}
+
+#[test]
+fn a_dry_run_also_reports_an_incomplete_scan() {
+    let s = setup(true);
+    photos_with_leading_classified(&s, 40, 20);
+    let (st, _) = stage("v1");
+    let cut = st
+        .with_limits(100, Duration::from_secs(5), 3)
+        .with_clock(|_| Duration::from_secs(6))
+        .with_progress_ops(1);
+    let c = s.dry_run(&cut);
+    assert_eq!(c["scan_incomplete"], 1, "{c:?}");
+    assert!(c["pending"] < 20, "{c:?}");
+    assert_eq!(s.row_count(), 40, "dry-run は書かない");
+    let (st, _) = stage("v1");
+    let c = s.dry_run(&st);
+    assert_eq!((c["pending"], c["scan_incomplete"]), (20, 0), "{c:?}");
 }
 
 #[test]
@@ -1008,6 +1030,7 @@ fn a_stop_signal_interrupts_the_candidate_scan_and_the_read_connection_stays_usa
     };
     let c = map(&c);
     assert_eq!((c["inside"], c["unresolved"]), (0, 0), "{c:?}");
+    assert_eq!(c["scan_incomplete"], 1, "{c:?}");
     assert_eq!(loads(&n), 0);
     assert_eq!(s.row_count(), 40);
     // 進捗ハンドラは残らない: 同じ接続で次の問い合わせが最後まで進む
