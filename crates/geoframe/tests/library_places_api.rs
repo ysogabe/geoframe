@@ -817,6 +817,99 @@ async fn japan_pref_photos_wider_than_half_the_globe_skip_fit_but_keep_the_old_b
 }
 
 #[tokio::test]
+async fn invalid_coordinates_never_make_an_invalid_bbox_or_fit_bbox() {
+    // 東京都: 緯度が範囲外の写真だけ。大阪府: 有効な写真 + 経度が範囲外の写真。京都府: 文字列の座標だけ。
+    // 北海道: 有効な写真だけ。範囲外・文字列の座標は件数には数えるが、新しい bbox・fit_bbox には入れない
+    let rows = [
+        photo(1, Some("2025-04-01 10:00"), "95", "139", Some("東京都"), 0),
+        photo(
+            2,
+            Some("2025-04-02 10:00"),
+            "34.7",
+            "135.5",
+            Some("大阪府"),
+            0,
+        ),
+        photo(
+            3,
+            Some("2025-04-03 10:00"),
+            "34.0",
+            "200",
+            Some("大阪府"),
+            0,
+        ),
+        photo(4, Some("2025-04-04 10:00"), "'x'", "'y'", Some("京都府"), 0),
+        photo(
+            5,
+            Some("2025-04-05 10:00"),
+            "43.0",
+            "141.3",
+            Some("北海道"),
+            0,
+        ),
+        // `pref` の無い写真: 範囲外の座標は場所不明（`no_location`）で、範囲を持たない
+        photo(6, Some("2025-04-06 10:00"), "95", "10", None, 0),
+    ]
+    .concat();
+    let server = Server::start(&[], true, &rows).await;
+    let body = server.ok("").await;
+    let japan = country(&body, "ne:JPN");
+    let by_pref = |pref: &str| region(japan, &names().region_of_pref(pref).unwrap().id).clone();
+    let tokyo = by_pref("東京都");
+    assert_eq!(tokyo["count"], 1);
+    assert_eq!(tokyo["bbox"], Value::Null);
+    assert_eq!(tokyo["fit_bbox"], Value::Null);
+    let osaka = by_pref("大阪府");
+    assert_eq!(osaka["count"], 2);
+    assert_eq!(osaka["bbox"], json!([135.5, 34.7, 135.5, 34.7]));
+    assert_eq!(osaka["fit_bbox"], osaka["bbox"]);
+    let kyoto = by_pref("京都府");
+    assert_eq!(kyoto["count"], 1);
+    assert_eq!(kyoto["bbox"], Value::Null);
+    assert_eq!(kyoto["fit_bbox"], Value::Null);
+    let hokkaido = by_pref("北海道");
+    assert_eq!(hokkaido["bbox"], json!([141.3, 43.0, 141.3, 43.0]));
+    assert_eq!(hokkaido["fit_bbox"], hokkaido["bbox"]);
+    // 国全体は有効な写真だけの範囲
+    assert_eq!(japan["count"], 5);
+    assert_eq!(japan["bbox"], json!([135.5, 34.7, 141.3, 43.0]));
+    assert_eq!(japan["fit_bbox"], japan["bbox"]);
+    // 旧 `prefs` の bbox は変更前のまま（数値の座標の写真の MIN/MAX）
+    let old = |pref: &str| {
+        body["prefs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["pref"] == pref)
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(old("東京都")["bbox"], json!([139.0, 95.0, 139.0, 95.0]));
+    assert_eq!(old("大阪府")["bbox"], json!([135.5, 34.0, 200.0, 34.7]));
+    // 場所不明は範囲も fit_bbox も持たない
+    assert_eq!(body["unknown"]["no_location"]["count"], 1);
+    assert_eq!(body["unknown"]["no_location"]["bbox"], Value::Null);
+    assert_eq!(body["unknown"]["no_location"]["fit_bbox"], Value::Null);
+    // どの bbox・fit_bbox も、出ているなら有効（緯度 ±90・経度 ±180・最小 ≤ 最大）
+    let mut all = vec![japan.clone()];
+    all.extend(japan["regions"].as_array().unwrap().iter().cloned());
+    all.push(japan["region_unknown"].clone());
+    all.push(body["unknown"]["unclassified"].clone());
+    for item in &all {
+        for key in ["bbox", "fit_bbox"] {
+            if let Some(b) = item[key].as_array() {
+                let b: Vec<f64> = b.iter().map(|v| v.as_f64().unwrap()).collect();
+                assert!(
+                    b[0] >= -180.0 && b[2] <= 180.0 && b[1] >= -90.0 && b[3] <= 90.0,
+                    "{item}"
+                );
+                assert!(b[0] <= b[2] && b[1] <= b[3], "{item}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn without_the_table_pref_photos_stay_japan_and_the_rest_is_unclassified() {
     let f = fixture();
     // 分類の行は入れない（表を作らない）。pref の写真と同じ行だけ使う

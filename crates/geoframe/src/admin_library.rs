@@ -1225,6 +1225,9 @@ struct PlaceGroup {
     /// `no_location`（`pref` が空で座標が無効）。
     no_location: bool,
     tally: Tally,
+    /// `pref` のある写真だけ: 旧 `prefs` の bbox（数値の座標の写真の MIN/MAX。変更前と同じ値で、互換のため範囲外の値も
+    /// 含む。文字列の座標は、変更前は読み取りの失敗になっていたので除く）。新しい応答の範囲 `tally.bounds` は有効な座標の写真だけ。
+    legacy_bounds: Option<Bounds>,
 }
 
 /// 組の代表の写真を、集計の中で `MAX` だけで選ぶための鍵。[`COVER_ORDER`]（除外でない → 位置がある → 日時がある → 新しい →
@@ -1282,14 +1285,30 @@ fn spans_dateline(lons: &[f64]) -> bool {
     inner > wrap
 }
 
+/// 範囲が地図に出せる値か: 4 つとも有限で、緯度 ±90・経度 ±180 以内、最小 ≤ 最大。
+fn valid_bounds(b: &Bounds) -> bool {
+    let [w, s, e, n] = *b;
+    [w, s, e, n].iter().all(|v| v.is_finite())
+        && (-180.0..=180.0).contains(&w)
+        && (-180.0..=180.0).contains(&e)
+        && (-90.0..=90.0).contains(&s)
+        && (-90.0..=90.0).contains(&n)
+        && w <= e
+        && s <= n
+}
+
 /// 件数・範囲・代表の写真 `{count, cover, bbox, fit_bbox}`（国・地域・地域不明・場所不明で同じ形）。
 /// `fit_bbox` は地図の自動 fit 用で、写真の経度を円周上で覆う最小の区間が日付変更線をまたぐなら `null`。
 /// 通常の範囲の経度の幅が [`FIT_SPAN_FREE`] 以内ならその範囲そのまま。それより広いときは、経度が全部そろっていれば
 /// （[`fill_longitudes`]）最小の区間で確かめ、`pref` のある写真を含む（経度をそろえていない）ときは確かめずに `null`（自動 fit を省く側に倒す。
 /// 日本の `pref` の写真が経度で半周以上に広がるのは、座標の誤りがあるときだけ）。
+/// 範囲は有効な座標の写真だけから作る（`pref` のある写真も同じ。無効な座標は範囲に入れない）が、念のため `fit_bbox` は
+/// [`valid_bounds`] を満たさなければ `null`（不正な bbox を地図に渡さない）。
 fn tally_json(tally: &Tally, cover: Option<Value>) -> serde_json::Map<String, Value> {
     let fit = tally.bounds.filter(|b| {
-        b[2] - b[0] <= FIT_SPAN_FREE || tally.lons.as_deref().is_some_and(|l| !spans_dateline(l))
+        valid_bounds(b)
+            && (b[2] - b[0] <= FIT_SPAN_FREE
+                || tally.lons.as_deref().is_some_and(|l| !spans_dateline(l)))
     });
     let mut out = serde_json::Map::new();
     out.insert("count".to_owned(), json!(tally.count));
@@ -1383,21 +1402,25 @@ fn sort_places(items: &mut [(String, i64, serde_json::Map<String, Value>)]) {
     });
 }
 
-/// 集計の列（[`COVER_KEY`] を含む `COUNT(*)`・範囲 4 つ・代表の鍵）を `first` 列目から読む。
-fn tally_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Tally> {
+/// 範囲の 4 列（西・南・東・北の順）を `first` 列目から読む。1 つでも NULL なら `None`。
+fn bounds_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Option<Bounds>> {
     let corners = [
+        row.get::<_, Option<f64>>(first)?,
         row.get::<_, Option<f64>>(first + 1)?,
         row.get::<_, Option<f64>>(first + 2)?,
         row.get::<_, Option<f64>>(first + 3)?,
-        row.get::<_, Option<f64>>(first + 4)?,
     ];
-    let bounds = match corners {
+    Ok(match corners {
         [Some(w), Some(s), Some(e), Some(n)] => Some([w, s, e, n]),
         _ => None,
-    };
+    })
+}
+
+/// 集計の列（[`COVER_KEY`] を含む `COUNT(*)`・範囲 4 つ・代表の鍵）を `first` 列目から読む。
+fn tally_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Tally> {
     Ok(Tally {
         count: row.get(first)?,
-        bounds,
+        bounds: bounds_at(row, first + 1)?,
         boundary: 0,
         best: row.get(first + 5)?,
         lons: None,
@@ -1424,7 +1447,8 @@ fn build_places(conn: &Connection, ctx: &AdminContext, filter: &Filter) -> rusql
     // 組ごとの代表の写真の鍵も同じ走査で `MAX` を取る。集計は 2 つに分ける:
     // 規則 1（`pref` のある写真）は `pref`/`city` で数えるだけ（国は日本、地域は名称表の都道府県の対応で付ける。SQL の
     // `rules.region` が使う対応表と同じ名称表）、規則 2〜4 は分類の式で数える。1 回の走査で 5 つの鍵を並べ替えるより軽い
-    // 範囲に入れる写真（位置がある写真。`pref` の無い写真は座標が有効なものだけ。無効な座標の値は範囲に入れない）
+    // 範囲に入れる写真（座標が有効な写真だけ。無効な座標の値は範囲に入れない）。旧 `prefs` の bbox だけは変更前と同じ
+    // （数値の座標の写真の範囲。範囲外の値も含む）を、`pref` の組の追加の列で取る
     let aggregates = |located: &str| {
         format!(
             "COUNT(*),
@@ -1436,9 +1460,12 @@ fn build_places(conn: &Connection, ctx: &AdminContext, filter: &Filter) -> rusql
     let names = data::names().ok();
     let mut groups: Vec<PlaceGroup> = Vec::new();
     let mut stmt = conn.prepare(&format!(
-        "SELECT CAST(p.pref AS TEXT), CAST(COALESCE(p.city,'') AS TEXT), 0, {aggregates}
+        "SELECT CAST(p.pref AS TEXT), CAST(COALESCE(p.city,'') AS TEXT), 0, {aggregates},
+        MIN(CASE WHEN {legacy} THEN lon END), MIN(CASE WHEN {legacy} THEN lat END),
+        MAX(CASE WHEN {legacy} THEN lon END), MAX(CASE WHEN {legacy} THEN lat END)
            FROM photos p WHERE {has_pref} AND {clause} GROUP BY 1, 2",
-        aggregates = aggregates("lat IS NOT NULL AND lon IS NOT NULL"),
+        aggregates = aggregates(&regions::valid_coordinates("p")),
+        legacy = "typeof(lat) IN ('real','integer') AND typeof(lon) IN ('real','integer')",
         has_pref = rules.has_pref,
     ))?;
     let pref_groups = stmt
@@ -1453,6 +1480,7 @@ fn build_places(conn: &Connection, ctx: &AdminContext, filter: &Filter) -> rusql
                 pref: Some((pref, row.get(1)?)),
                 no_location: false,
                 tally: tally_at(row, 3)?,
+                legacy_bounds: bounds_at(row, 9)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1486,6 +1514,7 @@ fn build_places(conn: &Connection, ctx: &AdminContext, filter: &Filter) -> rusql
                 pref: None,
                 no_location: row.get(2)?,
                 tally,
+                legacy_bounds: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1504,7 +1533,7 @@ fn build_places(conn: &Connection, ctx: &AdminContext, filter: &Filter) -> rusql
                     pref: pref.clone(),
                     city: city.clone(),
                     count: g.tally.count,
-                    bounds: g.tally.bounds,
+                    bounds: g.legacy_bounds,
                 });
                 let best = pref_best.entry(pref).or_insert(&g.tally.best);
                 if **best < g.tally.best {
