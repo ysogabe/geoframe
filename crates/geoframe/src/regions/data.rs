@@ -1,4 +1,4 @@
-//! 同梱の境界データの形式の定義と、読み込み・検証。判定のロジックは持たない（分類器は別のタスク）。
+//! 同梱の境界データの形式の定義と、読み込み・検証。判定のロジックは持たない（[`super::index`]）。
 //!
 //! # 成果物（`crates/geoframe/data/regions/`）
 //!
@@ -32,6 +32,8 @@
 //!
 //! 復号は manifest の件数（国・地域の件数、多角形・輪・頂点の総数）を上限として受け取り（[`DecodeLimits`]）、
 //! `Vec` を確保する前に、宣言された個数が残りの上限と残りのバイト数の両方に収まることを確かめる。
+//! 復号は gzip を展開しながら小さな窓で読み（[`decode_polygons_from`]）、展開後の全体を 1 つのバッファに持たない。
+//! 結果は入れ子の `Vec` ではなく、座標 1 本とオフセット表の平らな配列（[`Layer`]）。
 //! ID は長さ 1〜64・文字種（ASCII 英数字と `:_-`）を、多角形は 1 つ以上の輪を持つことを、読んだ時点で確かめる。
 
 use std::collections::{HashMap, HashSet};
@@ -183,7 +185,7 @@ fn gunzip(gz: &[u8], expected_raw: u64, max_raw: u64) -> Result<Vec<u8>, DataErr
     Ok(out)
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(super) fn sha256_hex(data: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, data);
     let mut s = String::with_capacity(64);
     for b in digest.as_ref() {
@@ -374,40 +376,248 @@ pub fn names() -> Result<&'static NameTable, DataError> {
 
 // ---------------------------------------------------------------- ポリゴン
 
-/// 輪（閉じた点列。先頭と末尾が同じ点）。座標は `[経度, 緯度]`。
-pub type Ring = Vec<[f64; 2]>;
-
-/// 多角形。`rings[0]` が外側、残りが穴。
+/// 1 層（国または地域）の地物を、平らな配列にまとめたもの。
+///
+/// 入れ子の `Vec` にすると、輪・多角形ごとの確保の見出しだけで数十 MB になるので、座標は 1 本の配列に並べ、
+/// 地物・多角形・輪の区切りは **先頭に 0 を置いた終端のオフセット表**（長さ = 件数 + 1）で持つ。
+///
+/// ```text
+/// 地物 f の多角形  = feature_polys[f] .. feature_polys[f+1]   （多角形の通し番号）
+/// 多角形 p の輪    = poly_rings[p]    .. poly_rings[p+1]      （輪の通し番号。先頭が外側、残りが穴）
+/// 輪 r の点        = ring_pts[r]      .. ring_pts[r+1]        （pts の添字。閉じるための末尾の点を含む）
+/// ```
 #[derive(Debug, Clone, PartialEq)]
-pub struct Polygon {
-    pub rings: Vec<Ring>,
+pub struct Layer {
+    ids: Vec<String>,
+    /// 地域だけ。所属する国の添字（国の層での位置）。国の層では空。
+    parents: Vec<u32>,
+    feature_polys: Vec<u32>,
+    poly_rings: Vec<u32>,
+    ring_pts: Vec<u32>,
+    /// `[経度, 緯度]`。
+    pts: Vec<[f64; 2]>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Feature {
-    pub id: String,
-    /// 地域だけ。`PolygonSet::countries` の添字。
-    pub country: Option<usize>,
-    pub polygons: Vec<Polygon>,
+/// 層の確保の見積もり（再確保を避けるため）。
+#[derive(Debug, Clone, Copy, Default)]
+struct LayerCapacity {
+    features: usize,
+    polygons: usize,
+    rings: usize,
+    points: usize,
+}
+
+impl Layer {
+    fn with_capacity(c: LayerCapacity, regions: bool) -> Self {
+        let mut feature_polys = Vec::with_capacity(c.features + 1);
+        feature_polys.push(0);
+        let mut poly_rings = Vec::with_capacity(c.polygons + 1);
+        poly_rings.push(0);
+        let mut ring_pts = Vec::with_capacity(c.rings + 1);
+        ring_pts.push(0);
+        Self {
+            ids: Vec::with_capacity(c.features),
+            parents: if regions {
+                Vec::with_capacity(c.features)
+            } else {
+                Vec::new()
+            },
+            feature_polys,
+            poly_rings,
+            ring_pts,
+            pts: Vec::with_capacity(c.points),
+        }
+    }
+
+    /// 空の層。試験の合成データが `begin_feature` などで組み立てる。
+    #[cfg(test)]
+    pub(super) fn empty() -> Self {
+        Self::with_capacity(LayerCapacity::default(), false)
+    }
+
+    /// 地物の数。
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    pub fn ids(&self) -> &[String] {
+        &self.ids
+    }
+
+    pub fn id(&self, feature: usize) -> &str {
+        &self.ids[feature]
+    }
+
+    /// 地域の所属する国（国の層での添字）。国の層では `None`。
+    pub fn parent(&self, feature: usize) -> Option<usize> {
+        self.parents.get(feature).map(|&p| p as usize)
+    }
+
+    pub fn polygons_len(&self) -> usize {
+        self.poly_rings.len() - 1
+    }
+
+    pub fn rings_len(&self) -> usize {
+        self.ring_pts.len() - 1
+    }
+
+    pub fn points_len(&self) -> usize {
+        self.pts.len()
+    }
+
+    /// 地物 `feature` の多角形の通し番号の範囲。
+    pub fn polygon_range(&self, feature: usize) -> std::ops::Range<usize> {
+        self.feature_polys[feature] as usize..self.feature_polys[feature + 1] as usize
+    }
+
+    /// 多角形 `polygon` の輪の通し番号の範囲（先頭が外側、残りが穴）。
+    pub fn ring_range(&self, polygon: usize) -> std::ops::Range<usize> {
+        self.poly_rings[polygon] as usize..self.poly_rings[polygon + 1] as usize
+    }
+
+    /// 輪 `ring` の点列（閉じるための末尾の点を含む）。
+    pub fn ring(&self, ring: usize) -> &[[f64; 2]] {
+        &self.pts[self.ring_pts[ring] as usize..self.ring_pts[ring + 1] as usize]
+    }
+
+    /// 全部の輪（点列）。
+    pub fn rings(&self) -> impl Iterator<Item = &[[f64; 2]]> {
+        (0..self.rings_len()).map(|r| self.ring(r))
+    }
+
+    /// 地物 `feature` の全部の輪。
+    pub fn feature_rings(&self, feature: usize) -> impl Iterator<Item = &[[f64; 2]]> {
+        self.polygon_range(feature)
+            .flat_map(|p| self.ring_range(p))
+            .map(|r| self.ring(r))
+    }
+
+    // ---- 組み立て（復号と、試験用の合成データ）
+
+    fn offset(n: usize) -> Result<u32, DataError> {
+        u32::try_from(n).map_err(|_| DataError::new("頂点の数が大きすぎる"))
+    }
+
+    /// 地物を始める。`parent` は地域の層だけ（国の層の添字）。
+    pub(super) fn begin_feature(&mut self, id: String, parent: Option<usize>) {
+        self.ids.push(id);
+        if let Some(p) = parent {
+            self.parents.push(p as u32);
+        }
+    }
+
+    pub(super) fn push_point(&mut self, x: f64, y: f64) {
+        self.pts.push([x, y]);
+    }
+
+    /// 今の輪を閉じる。4 点以上で、先頭と末尾が同じこと。
+    pub(super) fn end_ring(&mut self) -> Result<(), DataError> {
+        let start = *self.ring_pts.last().expect("先頭の 0") as usize;
+        let ring = &self.pts[start..];
+        if ring.len() < 4 {
+            return Err(DataError::new("輪の点が 4 未満"));
+        }
+        if ring.first() != ring.last() {
+            return Err(DataError::new("輪が閉じていない"));
+        }
+        self.ring_pts.push(Self::offset(self.pts.len())?);
+        Ok(())
+    }
+
+    /// 今の多角形を閉じる。輪が 1 つ以上あること。
+    pub(super) fn end_polygon(&mut self) -> Result<(), DataError> {
+        let before = *self.poly_rings.last().expect("先頭の 0") as usize;
+        if self.rings_len() == before {
+            return Err(DataError::new("輪が無い多角形"));
+        }
+        self.poly_rings.push(Self::offset(self.rings_len())?);
+        Ok(())
+    }
+
+    /// 今の地物を閉じる。多角形が 1 つ以上あること。
+    pub(super) fn end_feature(&mut self) -> Result<(), DataError> {
+        let before = *self.feature_polys.last().expect("先頭の 0") as usize;
+        if self.polygons_len() == before {
+            return Err(DataError::new("多角形が無い地物"));
+        }
+        self.feature_polys.push(Self::offset(self.polygons_len())?);
+        Ok(())
+    }
+
+    /// 余分な確保を返す（復号の見積もりが上限いっぱいのとき）。
+    fn shrink(&mut self) {
+        self.pts.shrink_to_fit();
+        self.ring_pts.shrink_to_fit();
+        self.poly_rings.shrink_to_fit();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolygonSet {
-    pub countries: Vec<Feature>,
-    pub regions: Vec<Feature>,
+    pub countries: Layer,
+    pub regions: Layer,
 }
 
-struct Cursor<'a> {
-    data: &'a [u8],
+/// 展開済みのバイト列を、一定の大きさの窓で読む（全体を持たない）。`total` は読むはずの全体のバイト数で、
+/// 個数が残りのバイト数に収まるかの検査に使う。
+struct Cursor<R: Read> {
+    src: R,
+    buf: Vec<u8>,
     pos: usize,
+    filled: usize,
+    /// `buf` の先頭より前に読み終えたバイト数。
+    base: u64,
+    total: u64,
 }
 
-impl<'a> Cursor<'a> {
+const WINDOW: usize = 64 * 1024;
+
+impl<R: Read> Cursor<R> {
+    fn new(src: R, total: u64) -> Self {
+        Self {
+            src,
+            buf: vec![0; WINDOW],
+            pos: 0,
+            filled: 0,
+            base: 0,
+            total,
+        }
+    }
+
+    /// 窓を読み直す。もう読めなければ `false`。
+    fn fill(&mut self) -> Result<bool, DataError> {
+        self.base += self.filled as u64;
+        self.pos = 0;
+        self.filled = 0;
+        loop {
+            match self.src.read(&mut self.buf) {
+                Ok(n) => {
+                    self.filled = n;
+                    return Ok(n > 0);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return Err(DataError::new("gzip を展開できない")),
+            }
+        }
+    }
+
+    fn position(&self) -> u64 {
+        self.base + self.pos as u64
+    }
+
+    fn remaining(&self) -> u64 {
+        self.total.saturating_sub(self.position())
+    }
+
     fn byte(&mut self) -> Result<u8, DataError> {
-        let b = *self
-            .data
-            .get(self.pos)
-            .ok_or_else(|| DataError::new("ポリゴンが途中で終わっている"))?;
+        if self.pos == self.filled && !self.fill()? {
+            return Err(DataError::new("ポリゴンが途中で終わっている"));
+        }
+        let b = self.buf[self.pos];
         self.pos += 1;
         Ok(b)
     }
@@ -431,10 +641,8 @@ impl<'a> Cursor<'a> {
     /// 個数。残りのバイト数より多い個数は、確保する前に拒否する（壊れたデータでの巨大な確保を避ける）。
     fn count(&mut self, min_bytes_each: usize) -> Result<usize, DataError> {
         let n = usize::try_from(self.varint()?).map_err(|_| DataError::new("個数が大きすぎる"))?;
-        let remaining = self.data.len() - self.pos;
-        if n.checked_mul(min_bytes_each)
-            .is_none_or(|need| need > remaining)
-        {
+        let need = (n as u64).checked_mul(min_bytes_each as u64);
+        if need.is_none_or(|need| need > self.remaining()) {
             return Err(DataError::new("個数が残りのデータより多い"));
         }
         Ok(n)
@@ -454,12 +662,32 @@ impl<'a> Cursor<'a> {
         Ok(n)
     }
 
-    fn take(&mut self, n: usize) -> Result<&'a [u8], DataError> {
-        let end = self.pos.checked_add(n).filter(|&e| e <= self.data.len());
-        let end = end.ok_or_else(|| DataError::new("ポリゴンが途中で終わっている"))?;
-        let out = &self.data[self.pos..end];
-        self.pos = end;
+    /// `n` バイトを読む（呼び手が `n` を小さく抑えてから呼ぶ。ID と magic だけ）。
+    fn take(&mut self, n: usize) -> Result<Vec<u8>, DataError> {
+        if n as u64 > self.remaining() {
+            return Err(DataError::new("ポリゴンが途中で終わっている"));
+        }
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            if self.pos == self.filled && !self.fill()? {
+                return Err(DataError::new("ポリゴンが途中で終わっている"));
+            }
+            let k = (n - out.len()).min(self.filled - self.pos);
+            out.extend_from_slice(&self.buf[self.pos..self.pos + k]);
+            self.pos += k;
+        }
         Ok(out)
+    }
+
+    /// 全部読み終えたこと（`total` ちょうどで、その先が無いこと）を確かめる。gzip の末尾の CRC もここで検査される。
+    fn finish(&mut self) -> Result<(), DataError> {
+        if self.pos != self.filled || self.fill()? {
+            return Err(DataError::new("ポリゴンの末尾に余りがある"));
+        }
+        if self.position() != self.total {
+            return Err(DataError::new("展開後のサイズが manifest と違う"));
+        }
+        Ok(())
     }
 }
 
@@ -507,7 +735,17 @@ impl DecodeLimits {
 /// 展開済みの `polygons.bin` を復号する。件数は `limits`（通常は manifest の件数）を超えるものを、確保の前に拒否する。
 /// 座標が有限なこと、輪が 4 点以上で閉じていること、ID の長さと文字種、多角形が輪を持つことまで確かめる。
 pub fn decode_polygons(raw: &[u8], limits: &DecodeLimits) -> Result<PolygonSet, DataError> {
-    let mut c = Cursor { data: raw, pos: 0 };
+    decode_polygons_from(raw, raw.len() as u64, limits)
+}
+
+/// [`decode_polygons`] の流し込み版。`src` は展開済みの `polygons.bin` を `total` バイト返す読み手で、
+/// 展開後の全体を 1 つのバッファに持たずに、小さな窓で読みながら復号する。
+pub fn decode_polygons_from<R: Read>(
+    src: R,
+    total: u64,
+    limits: &DecodeLimits,
+) -> Result<PolygonSet, DataError> {
+    let mut c = Cursor::new(src, total);
     if c.take(MAGIC.len())? != MAGIC {
         return Err(DataError::new("ポリゴンの magic が違う"));
     }
@@ -515,14 +753,27 @@ pub fn decode_polygons(raw: &[u8], limits: &DecodeLimits) -> Result<PolygonSet, 
     let n_countries = c.count_within(3, &mut features_budget.0)?;
     let n_regions = c.count_within(3, &mut features_budget.1)?;
     let (mut px, mut py) = (0i64, 0i64);
-    let mut layers: [Vec<Feature>; 2] = [
-        Vec::with_capacity(n_countries),
-        Vec::with_capacity(n_regions),
-    ];
-    for (layer, is_region, n, lim) in [
-        (0usize, false, n_countries, &limits.countries),
-        (1, true, n_regions, &limits.regions),
+    let mut layers: Vec<Layer> = Vec::with_capacity(2);
+    for (is_region, n, lim) in [
+        (false, n_countries, &limits.countries),
+        (true, n_regions, &limits.regions),
     ] {
+        // 件数の上限（manifest）と、入力に収まる最大の件数（多角形・輪は 1 バイト、点は 2 バイト以上）の小さい方で見積もる
+        let cap = |limit: usize, min_bytes: u64| {
+            limit.min(usize::try_from(total / min_bytes).unwrap_or(usize::MAX))
+        };
+        if lim.vertices > u32::MAX as usize {
+            return Err(DataError::new("頂点の数が大きすぎる"));
+        }
+        let mut layer = Layer::with_capacity(
+            LayerCapacity {
+                features: n,
+                polygons: cap(lim.polygons, 1),
+                rings: cap(lim.rings, 1),
+                points: cap(lim.vertices, 2),
+            },
+            is_region,
+        );
         let (mut polygons_left, mut rings_left, mut vertices_left) =
             (lim.polygons, lim.rings, lim.vertices);
         for _ in 0..n {
@@ -530,11 +781,10 @@ pub fn decode_polygons(raw: &[u8], limits: &DecodeLimits) -> Result<PolygonSet, 
             if id_len == 0 || id_len > MAX_ID_LEN {
                 return Err(DataError::new("ID の長さが不正"));
             }
-            let id = std::str::from_utf8(c.take(id_len)?)
+            let id = String::from_utf8(c.take(id_len)?)
                 .ok()
                 .filter(|s| valid_id(s))
-                .ok_or_else(|| DataError::new("ID に使えない文字がある"))?
-                .to_owned();
+                .ok_or_else(|| DataError::new("ID に使えない文字がある"))?;
             let country = if is_region {
                 let i = usize::try_from(c.varint()?)
                     .map_err(|_| DataError::new("国の添字が大きすぎる"))?;
@@ -549,19 +799,17 @@ pub fn decode_polygons(raw: &[u8], limits: &DecodeLimits) -> Result<PolygonSet, 
             if n_polygons == 0 {
                 return Err(DataError::new("多角形が無い地物"));
             }
-            let mut polygons = Vec::with_capacity(n_polygons);
+            layer.begin_feature(id, country);
             for _ in 0..n_polygons {
                 let n_rings = c.count_within(1, &mut rings_left)?;
                 if n_rings == 0 {
                     return Err(DataError::new("輪が無い多角形"));
                 }
-                let mut rings = Vec::with_capacity(n_rings);
                 for _ in 0..n_rings {
                     let n_points = c.count_within(2, &mut vertices_left)?;
                     if n_points < 4 {
                         return Err(DataError::new("輪の点が 4 未満"));
                     }
-                    let mut ring = Vec::with_capacity(n_points);
                     for _ in 0..n_points {
                         px = px.wrapping_add(unzigzag(c.varint()?));
                         py = py.wrapping_add(unzigzag(c.varint()?));
@@ -569,61 +817,55 @@ pub fn decode_polygons(raw: &[u8], limits: &DecodeLimits) -> Result<PolygonSet, 
                         if !x.is_finite() || !y.is_finite() {
                             return Err(DataError::new("有限でない座標"));
                         }
-                        ring.push([x, y]);
+                        layer.push_point(x, y);
                     }
-                    if ring.first() != ring.last() {
-                        return Err(DataError::new("輪が閉じていない"));
-                    }
-                    rings.push(ring);
+                    layer.end_ring()?;
                 }
-                polygons.push(Polygon { rings });
+                layer.end_polygon()?;
             }
-            layers[layer].push(Feature {
-                id,
-                country,
-                polygons,
-            });
+            layer.end_feature()?;
         }
+        layer.shrink();
+        layers.push(layer);
     }
-    if c.pos != raw.len() {
-        return Err(DataError::new("ポリゴンの末尾に余りがある"));
-    }
-    let [countries, regions] = layers;
+    c.finish()?;
+    let regions = layers.pop().expect("2 層");
+    let countries = layers.pop().expect("2 層");
     Ok(PolygonSet { countries, regions })
 }
 
 /// 埋め込んだポリゴンを展開・復号し、manifest の件数と名称表の ID に一致することを確かめて返す。
 ///
-/// 数十 MB の一時メモリを使う。呼び手（分類段）がサイクルの間だけ持ち、終わったら手放す想定で、ここでは保持しない。
+/// gzip を展開しながら小さな窓で復号するので、展開後の全体（約 23MB）は持たない。常駐するのは座標の配列（約 30MB）と
+/// オフセット表だけ。呼び手（分類段）がサイクルの間だけ持ち、終わったら手放す想定で、ここでは保持しない。
 pub fn load_polygons() -> Result<PolygonSet, DataError> {
+    #[cfg(test)]
+    POLYGON_LOADS.with(|c| c.set(c.get() + 1));
     let m = manifest()?;
     let a = &m.artifacts.polygons;
-    let raw = gunzip(POLYGONS_GZ, a.raw_bytes, a.max_raw_bytes)?;
-    let set = decode_polygons(&raw, &DecodeLimits::from_manifest(m))?;
-    drop(raw);
+    if a.raw_bytes > a.max_raw_bytes {
+        return Err(DataError::new("展開後のサイズが上限を超える"));
+    }
+    // 上限 +1 バイトまで読み、超えたら拒否する（`finish` が余りとして検出する）
+    let src = GzDecoder::new(POLYGONS_GZ).take(a.max_raw_bytes + 1);
+    let set = decode_polygons_from(src, a.raw_bytes, &DecodeLimits::from_manifest(m))?;
     check_polygon_set(&set, m, names()?)?;
     Ok(set)
 }
 
-fn layer_counts(features: &[Feature]) -> LayerCounts {
-    let polygons = features.iter().map(|f| f.polygons.len()).sum();
-    let rings = features
-        .iter()
-        .flat_map(|f| &f.polygons)
-        .map(|p| p.rings.len())
-        .sum();
-    let vertices = features
-        .iter()
-        .flat_map(|f| &f.polygons)
-        .flat_map(|p| &p.rings)
-        .map(Vec::len)
-        .sum();
+#[cfg(test)]
+thread_local! {
+    /// 試験用: このスレッドでポリゴンを展開した回数（読み取り専用の経路が展開しないことの確認）。
+    pub(super) static POLYGON_LOADS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn layer_counts(layer: &Layer) -> LayerCounts {
     LayerCounts {
-        features: features.len(),
-        polygons,
-        rings,
-        holes: rings - polygons,
-        vertices,
+        features: layer.len(),
+        polygons: layer.polygons_len(),
+        rings: layer.rings_len(),
+        holes: layer.rings_len() - layer.polygons_len(),
+        vertices: layer.points_len(),
     }
 }
 
@@ -646,34 +888,32 @@ pub fn check_polygon_set(
     if set.countries.len() != names.countries.len() || set.regions.len() != names.regions.len() {
         return Err(DataError::new("ポリゴンと名称表の件数が違う"));
     }
-    for (f, p) in set.countries.iter().zip(&names.countries) {
-        if f.id != p.id {
+    for (id, p) in set.countries.ids().iter().zip(&names.countries) {
+        if *id != p.id {
             return Err(DataError::new("ポリゴンと名称表で国の並びが違う"));
         }
     }
-    for (f, p) in set.regions.iter().zip(&names.regions) {
-        let parent = f.country.map(|i| set.countries[i].id.as_str());
-        if f.id != p.id || parent != p.country.as_deref() {
+    for (i, p) in names.regions.iter().enumerate() {
+        let parent = set.regions.parent(i).map(|c| set.countries.id(c));
+        if set.regions.id(i) != p.id || parent != p.country.as_deref() {
             return Err(DataError::new(
                 "ポリゴンと名称表で地域の並びまたは国参照が違う",
             ));
         }
     }
-    for f in set.countries.iter().chain(&set.regions) {
-        for ring in f.polygons.iter().flat_map(|p| &p.rings) {
-            for w in ring.windows(2) {
-                let ((x1, _), (x2, _)) = ((w[0][0], w[0][1]), (w[1][0], w[1][1]));
-                // 図の端（経度 ±180）に沿う辺（南極の縁）は許し、東西が反対側の点を直接つなぐ辺は拒否する
-                if (x2 - x1).abs() > 180.0 && !(x1.abs() == 180.0 && x2.abs() == 180.0) {
-                    return Err(DataError::new("経度 ±180 をまたぐ辺がある"));
-                }
+    for ring in set.countries.rings().chain(set.regions.rings()) {
+        for w in ring.windows(2) {
+            let (x1, x2) = (w[0][0], w[1][0]);
+            // 図の端（経度 ±180）に沿う辺（南極の縁）は許し、東西が反対側の点を直接つなぐ辺は拒否する
+            if (x2 - x1).abs() > 180.0 && !(x1.abs() == 180.0 && x2.abs() == 180.0) {
+                return Err(DataError::new("経度 ±180 をまたぐ辺がある"));
             }
-            if ring
-                .iter()
-                .any(|p| !(-180.0..=180.0).contains(&p[0]) || !(-90.0..=90.0).contains(&p[1]))
-            {
-                return Err(DataError::new("範囲外の座標がある"));
-            }
+        }
+        if ring
+            .iter()
+            .any(|p| !(-180.0..=180.0).contains(&p[0]) || !(-90.0..=90.0).contains(&p[1]))
+        {
+            return Err(DataError::new("範囲外の座標がある"));
         }
     }
     Ok(())

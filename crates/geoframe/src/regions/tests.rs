@@ -312,11 +312,9 @@ fn polygons_match_the_manifest_and_names() {
     assert_eq!(set.regions.len(), m.counts.regions.features);
     let vertices: usize = set
         .countries
-        .iter()
-        .chain(&set.regions)
-        .flat_map(|f| &f.polygons)
-        .flat_map(|p| &p.rings)
-        .map(Vec::len)
+        .rings()
+        .chain(set.regions.rings())
+        .map(<[_]>::len)
         .sum();
     assert_eq!(
         vertices,
@@ -329,22 +327,28 @@ fn polygons_match_the_manifest_and_names() {
     assert_eq!(m.counts.regions.holes, 111);
     let japan = set
         .countries
+        .ids()
         .iter()
-        .find(|f| f.id == data::JAPAN_ID)
+        .position(|id| id == data::JAPAN_ID)
         .unwrap();
-    assert!(japan.polygons.len() > 100, "日本は多数の島を持つ");
+    assert!(
+        set.countries.polygon_range(japan).len() > 100,
+        "日本は多数の島を持つ"
+    );
 }
 
 #[test]
 fn polygon_coordinates_are_finite_closed_and_in_range() {
-    for f in polygons().countries.iter().chain(&polygons().regions) {
-        assert!(!f.polygons.is_empty(), "{}", f.id);
-        for ring in f.polygons.iter().flat_map(|p| &p.rings) {
-            assert!(ring.len() >= 4);
-            assert_eq!(ring.first(), ring.last());
-            for [x, y] in ring {
-                assert!(x.is_finite() && y.is_finite());
-                assert!((-180.0..=180.0).contains(x) && (-90.0..=90.0).contains(y));
+    for layer in [&polygons().countries, &polygons().regions] {
+        for f in 0..layer.len() {
+            assert!(!layer.polygon_range(f).is_empty(), "{}", layer.id(f));
+            for ring in layer.feature_rings(f) {
+                assert!(ring.len() >= 4);
+                assert_eq!(ring.first(), ring.last());
+                for [x, y] in ring {
+                    assert!(x.is_finite() && y.is_finite());
+                    assert!((-180.0..=180.0).contains(x) && (-90.0..=90.0).contains(y));
+                }
             }
         }
     }
@@ -353,14 +357,20 @@ fn polygon_coordinates_are_finite_closed_and_in_range() {
 #[test]
 fn the_dateline_is_never_crossed_by_an_edge() {
     let mut on_the_edge = 0;
-    for f in polygons().countries.iter().chain(&polygons().regions) {
-        for ring in f.polygons.iter().flat_map(|p| &p.rings) {
-            for w in ring.windows(2) {
-                let dx = (w[1][0] - w[0][0]).abs();
-                if dx > 180.0 {
-                    // 許すのは、両端がちょうど ±180 の辺（南極の縁）だけ
-                    assert!(w[0][0].abs() == 180.0 && w[1][0].abs() == 180.0, "{}", f.id);
-                    on_the_edge += 1;
+    for layer in [&polygons().countries, &polygons().regions] {
+        for f in 0..layer.len() {
+            for ring in layer.feature_rings(f) {
+                for w in ring.windows(2) {
+                    let dx = (w[1][0] - w[0][0]).abs();
+                    if dx > 180.0 {
+                        // 許すのは、両端がちょうど ±180 の辺（南極の縁）だけ
+                        assert!(
+                            w[0][0].abs() == 180.0 && w[1][0].abs() == 180.0,
+                            "{}",
+                            layer.id(f)
+                        );
+                        on_the_edge += 1;
+                    }
                 }
             }
         }
@@ -374,12 +384,14 @@ fn the_dateline_is_never_crossed_by_an_edge() {
 #[test]
 fn regions_refer_to_the_country_polygons_listed_in_the_names() {
     let set = polygons();
-    for r in &set.regions {
-        let idx = r.country.expect("地域は国を持つ");
-        assert!(set.countries[idx].id.starts_with("ne:"));
+    for r in 0..set.regions.len() {
+        let idx = set.regions.parent(r).expect("地域は国を持つ");
+        assert!(set.countries.id(idx).starts_with("ne:"));
     }
     // 国のみで地域を持たない国がある（Admin1 の無い国は『国のみ判定』）
-    let with_regions: BTreeSet<usize> = set.regions.iter().filter_map(|r| r.country).collect();
+    let with_regions: BTreeSet<usize> = (0..set.regions.len())
+        .filter_map(|r| set.regions.parent(r))
+        .collect();
     assert!(with_regions.len() < set.countries.len());
     assert!(with_regions.len() > 200);
 }
@@ -629,4 +641,56 @@ fn gunzip_refuses_oversized_and_mismatched_expansion() {
     assert!(testing::gunzip(gz, a.max_raw_bytes + 1, a.max_raw_bytes).is_err());
     // gzip でないバイト列
     assert!(testing::gunzip(b"not gzip", 8, 100).is_err());
+}
+
+// ---------------------------------------------------------------- 流し込みの復号
+
+/// 1 回に `chunk` バイトずつしか返さない読み手（窓の読み直しの境界を通す）。
+struct Dribble<'a> {
+    data: &'a [u8],
+    chunk: usize,
+}
+
+impl std::io::Read for Dribble<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.chunk.min(buf.len()).min(self.data.len());
+        buf[..n].copy_from_slice(&self.data[..n]);
+        self.data = &self.data[n..];
+        Ok(n)
+    }
+}
+
+#[test]
+fn streaming_decode_matches_the_slice_decode_at_any_chunk_size() {
+    let raw = raw_polygons();
+    let whole = data::decode_polygons(&raw, &limits()).unwrap();
+    assert_eq!(&whole, polygons());
+    // 窓（64KiB）をまたぐ・可変長整数の途中で切れる読み方
+    for chunk in [1usize << 16, 4093, 37] {
+        let src = Dribble { data: &raw, chunk };
+        let got = data::decode_polygons_from(src, raw.len() as u64, &limits()).unwrap();
+        assert!(got == whole, "chunk={chunk}");
+    }
+}
+
+#[test]
+fn streaming_decode_checks_the_declared_total() {
+    let raw = raw_polygons();
+    let n = raw.len() as u64;
+    // 宣言より長い（余り）・短い（途中で終わる、または件数が残りに収まらない）
+    let longer = data::decode_polygons_from(&raw[..], n - 1, &limits());
+    assert!(longer.is_err());
+    let shorter = data::decode_polygons_from(&raw[..], n + 1, &limits());
+    assert!(err(shorter).contains("サイズ"));
+}
+
+#[test]
+fn flat_layout_has_no_nested_allocations_per_ring() {
+    // 座標は 1 本の配列に並び、点の数は manifest と一致する（入れ子の Vec に戻していないことの確認）
+    let m = data::manifest().unwrap();
+    let set = polygons();
+    assert_eq!(set.countries.points_len(), m.counts.countries.vertices);
+    assert_eq!(set.regions.points_len(), m.counts.regions.vertices);
+    assert_eq!(set.countries.rings_len(), m.counts.countries.rings);
+    assert_eq!(set.regions.polygons_len(), m.counts.regions.polygons);
 }
