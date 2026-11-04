@@ -36,7 +36,7 @@ class RegionDataError(ValueError):
 
 
 class GeometryError(RegionDataError):
-    """形状の不正。`code` は不正の種類（`tables/geometry_exceptions.json` の `code`）、`detail` は座標つきの説明。"""
+    """形状の不正。`code` は不正の種類（将来、例外表を設けるときの項目に使える）、`detail` は座標つきの説明。"""
 
     def __init__(self, code: str, label: str, detail: str) -> None:
         super().__init__(f"{label}: {detail}")
