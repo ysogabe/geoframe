@@ -3,6 +3,7 @@
 //!
 //! - [`data`] — 同梱データの形式の定義と、読み込み・検証。座標は平らな配列（[`data::Layer`]）。
 //! - [`index`] — 境界の索引（[`RegionIndex`]。呼び出し側が明示的に作り、使い終えたら手放す）と、判定手順 1〜4。
+//! - [`rules`] — 「場所の区分の規則」の SQL 片（[`PlaceRules`]。管理 API の集計・絞り込み・検索が共通で使う）。
 //! - [`search`] — 分類版（[`classifier_version`]）と検索用文字列（[`search_text`]）。ポリゴンを展開せずに得られる。
 //!
 //! - [`table`] — 分類の保存先 `photo_regions` 表（`available`・`pending`・`ensure_tables`）と、読み取り側が使う有効な分類の SQL 片。
@@ -14,11 +15,13 @@
 
 pub mod data;
 pub mod index;
+pub mod rules;
 pub mod search;
 pub mod stage;
 pub mod table;
 
 pub use index::{Classification, InvalidCoordinate, Method, RegionIndex};
+pub use rules::{PlaceRules, SEARCH_LIKE_PARAMS, pref_region};
 pub use search::{classifier_version, search_text};
 pub use stage::Regions;
 pub use table::{

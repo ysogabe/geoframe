@@ -108,8 +108,13 @@ fn current_version_literal() -> String {
 /// 表があること（[`available`]）は呼び手が確かめる（無ければ JOIN しない）。分類版が得られない（同梱データの破損）ときは、
 /// 何にも一致しない JOIN になる（壊れた分類を提供しない）。
 pub fn join(p: &str, r: &str) -> String {
+    format!("LEFT JOIN photo_regions {r} ON {}", valid_on(p, r))
+}
+
+/// [`join`] の `ON` の中身（有効な分類の条件）。`EXISTS (SELECT 1 FROM photo_regions r WHERE …)` にも使える。
+pub(super) fn valid_on(p: &str, r: &str) -> String {
     format!(
-        "LEFT JOIN photo_regions {r} ON {r}.photo_id={p}.id AND {r}.input_lat={p}.lat AND {r}.input_lon={p}.lon
+        "{r}.photo_id={p}.id AND {r}.input_lat={p}.lat AND {r}.input_lon={p}.lon
   AND {r}.classifier_version={version} AND {r}.country_method<>'failed' AND {valid}",
         version = current_version_literal(),
         valid = valid_coordinates(p)

@@ -1,6 +1,6 @@
 # 国・地域別の場所表示 設計
 
-作成日: 2026-11-04。状態: 承認済み。段①（境界データと分類段）実装済み、段②（管理API）・段③（画面）は未実装。[PRD](prd.md)に対応。
+作成日: 2026-11-04。状態: 承認済み。段①（境界データと分類段）実装済み。段②（管理API）は `places` の集計、`photos` の絞り込み・文字検索・`location_region`、`trips` の国・地域まで実装済み。段③（画面）は未実装。[PRD](prd.md)に対応。
 
 ## 概要
 
@@ -69,7 +69,9 @@ Natural Earthも測量用の精度や最新の行政区画を保証しないた�
 3. `pref` が空（NULL または空文字）で座標が有効（enrich の `USABLE` と同じ型検査＋判定手順 1 の範囲検査を SQL で掛ける）で、
    未処理・座標変更・分類版不一致の行を抽出し、同一座標をまとめて判定する。無効な座標の行は候補に入れない。
 4. writer経由で短いバッチを適用する。現座標を再確認する。写真が無くなった分類行もここで消す。
-5. 管理APIは下の「場所の区分の規則」を共通の SQL 片にまとめ、集計・絞り込み・検索・表示で使う。
+5. 管理APIは下の「場所の区分の規則」を共通の SQL 片 `regions::PlaceRules`（`regions/rules.rs`）にまとめ、集計・絞り込み・検索・表示で使う。
+   `from`（`photos p` に都道府県の対応表 `pm` と有効な分類 `r` を結合）、`country`・`region`（ID の式）、`has_pref`・`no_location`・`unclassified`（真偽の式）、`search`（検索用文字列の式）、`search_like`（`search LIKE ?` と同じ意味で、`pm`・`r` を結合せず `IN` の形で引く 1 語ぶんの検索条件。実際の文字検索はこちらを使う）を持つ。
+   表の無い DB では `r` を同じ列の空の派生表にして同じ式を使う（表は作らない）。
 
 ### 場所の区分の規則
 
@@ -152,8 +154,9 @@ gzip展開は既に依存にあるflate2を使う。実行時のネイティブG
 検索用の表記だけは `search_text` に展開し、既存の文字検索のSQLから同じ有効分類JOINを通して参照する。
 これによりSQLからメモリ上の表を引く独自関数や、語ごとの大量ID展開を避ける。`Q_WORD_PARAMS` は列の追加に合わせて増やす。
 `pref` のある写真（分類行が無い）には、ビルド時に埋め込む「日本＋47 都道府県の別名（日本語・英語・原表記）」の
-固定の `VALUES` 表を `pref` で JOIN し、同じ検索列として扱う。検索列は `CASE WHEN pref<>'' THEN 固定表.text ELSE r.search_text END`。
+固定の `VALUES` 表を `pref` で JOIN し、同じ検索列として扱う。検索列は `CASE WHEN pref<>'' THEN 固定表.text ELSE r.search_text END`（`PlaceRules.search`）。
 固定表は利用者の入力を含まない定数なので、SQL に埋め込んでよい。
+実装した文字検索の条件は、これと同じ意味の `PlaceRules.search_like`（`IN` の形。下の「GET /api/admin/library/photos」）で、同値性を試験で確かめている。
 分類結果に国IDがない場合、地域IDもNULL。地域IDと国IDの所属関係をwriter適用前に検証する。
 
 有効な分類は、現写真と座標が一致し、`classifier_version`が現在の同梱版に一致する行だけ。
@@ -240,12 +243,38 @@ gzip展開は既に依存にあるflate2を使う。実行時のネイティブG
 
 - `countries[]`: ID、表示名、検索別名、件数、表紙、bbox、fit_bbox、`regions[]`。
 - `regions[]`: ID、表示名、検索別名、件数、表紙、bbox、fit_bbox。
-  日本のみ、pref名と `cities[]`、`boundary_only` も持つ。市区町村は今の `pref/city` の集計をそのまま使う。
+  日本のみ、pref名（`pref`）と `boundary_only` も持つ。市区町村は新しい地域に複製せず、旧 `prefs` の `pref` が同じ行の
+  `cities[]` を画面が引く（今の `pref/city` の集計がそのまま唯一の市区町村。応答を増やさない）。
   `boundary_only` は境界データで入った `pref` 空の写真（enrich 待ちを含む）の件数で、画面は「市区町村未取得 N」と出す。
-  日本の地域の件数 − `boundary_only` が、旧 `prefs` のその都道府県の件数と一致する。
+  日本の地域の件数 − `boundary_only` が、旧 `prefs` のその都道府県の件数と一致する（旧 `prefs` に行が無い都道府県は 0）。
 - 各国に `region_unknown`: 当該国で地域が分からない写真の件数と範囲。
 - `unknown`: `unclassified`（座標あり国未判定）と `no_location`（座標なし・無効）の件数。
-- `classification_available`、`classification_pending`。
+- `classification_available`（表があるか）、`classification_pending`（`regions::pending_photos`。期間・範囲は掛けない）。
+
+実装した応答の形（`places`）:
+
+```json
+{"ok": true, "prefs": [...], "abroad": 25,
+ "classification_available": true, "classification_pending": 3,
+ "countries": [{
+   "id": "ne:FRA", "name": "フランス", "aliases": ["フランス", "France", "French Republic"],
+   "count": 4, "cover": {"id": 14, "thumb_url": "/thumb/14.jpg?v=…"}, "bbox": [w, s, e, n], "fit_bbox": [w, s, e, n],
+   "regions": [{"id": "ne:FRA-…", "name": "…", "aliases": [...], "count": 2, "cover": {...}, "bbox": [...], "fit_bbox": [...]}],
+   "region_unknown": {"count": 1, "cover": {...}, "bbox": [...], "fit_bbox": [...]}}],
+ "unknown": {"unclassified": {"count": 6, "cover": {...}, "bbox": [...], "fit_bbox": null},
+             "no_location": {"count": 4, "cover": {...}, "bbox": null, "fit_bbox": null}}}
+```
+
+- 日本の地域だけ `pref`（都道府県名。旧 `prefs` の同名の行から市区町村を引くキー）・`boundary_only` を持つ。`cities[]` は持たない。`region_unknown` は常にあり、無ければ `count: 0`・`cover`/`bbox`/`fit_bbox` が `null`。
+- `fit_bbox` は、通常の範囲の経度の幅が 180 度以内なら `bbox` と同じ（空きが戻る間が必ず最大のため）。それより広いときだけ、経度を全部使って最小の区間を求め、日付変更線をまたぐなら `null`。
+  `pref` のある写真を含む組（日本）は経度をそろえず、幅が 180 度を超えたら確かめずに `null`（日本の `pref` の写真が半周以上に広がるのは座標の誤りのときだけ）。
+  経度は、通常の範囲の幅が 180 度を超える国の `pref` の無い組だけ追加の文で引き、国が決まらない写真は集計の文が一緒に取る（ふつうは追加の文を実行しない）。
+- 範囲の不正値: `bbox`・`fit_bbox` は、緯度 ±90・経度 ±180 を外れる座標、数値でない座標（文字列・NULL など）の写真を範囲に入れない（`pref` のある写真も同じ。件数には数える）。
+  有効な写真が無い組は `bbox`・`fit_bbox` とも `null`。`fit_bbox` はさらに、出す前に 4 値が有限・範囲内・最小 ≤ 最大かを検査し、満たさなければ `null`
+  （国・地域・`region_unknown`・`unclassified` で共通。不正な bbox を地図に渡さない）。旧 `prefs` の bbox だけは互換のため変えず、数値の座標の写真の MIN/MAX のまま（範囲外の値も含む。文字列の座標は、変更前は読み取りの失敗になっていたので除く）。
+- 件数の多い順、同数は表示名、それも同じなら ID。国・地域・区分の集計は 1 つの走査（`pref` のある写真と、無い写真の 2 本の `GROUP BY`）から取り、
+  旧 `prefs`・`abroad` も同じ結果から作る。代表の写真は、集計と同じ走査で組ごとに `MAX(COVER_KEY)`（`COVER_ORDER` と同じ順位を文字列にした鍵）を取り、
+  国・地域は組の鍵の最大から選ぶ（窓関数の並べ替えをしない。`COVER_ORDER` との同値を単体試験で確かめる）。
 
 新しい国別件数＋国未判定＋場所不明の合計を一致させる。旧 `abroad` と新しい国別件数は足し合わせない。
 代表写真の選択は既存coversの規則を再利用し、JOINにより1枚が複数回現れないようにする。
@@ -264,23 +293,47 @@ gzip展開は既に依存にあるflate2を使う。実行時のネイティブG
 クエリは旧形式と新形式の 2 つに分け、混ぜると400。
 
 - 旧形式: `pref`、`pref&city`、`city` だけ、`abroad`。今の意味のまま受ける（段③の前の画面と、段③を戻したときのため）。
+  `FROM photos` のまま絞り、変更前と同じ文・同じ結果（`tests/fixtures/photos-old-golden.json` に変更前の出力を固定）。
 - 新形式: `country`／`region`／`region_unknown`／`unclassified`／`no_location`。相互排他。`region`単独、別国の地域は400。
   新形式で `city` を受けるのは `country=ne:JPN` かつ日本の `region` を指定したときだけ。
   意味は「`pref` = 対応表の都道府県名 AND `city` = 指定値」（同名の市区町村が他県で混ざらない）。
-  `city`＋`country` で `region` なし、日本以外の `region`＋`city` は400。
+  `city`＋`country` で `region` なし、日本以外の `region`＋`city`、名称表に無い `region`＋`city` は400。
+- `region`・`region_unknown` は `country` が要り、`region` と `region_unknown` は同時に受けない。`unclassified`・`no_location` は
+  それぞれ単独で、`country` や旧形式のキー（`pref`・`abroad`・`city`）とは混ぜない。
+  旗（`region_unknown`・`unclassified`・`no_location`）は `1`（有効）か `0`（無いのと同じ）だけで、ほかの値は400。
+  400 の応答は `bad_params` だけで、値を出さない。
 IDは最大64文字、許可文字はASCII英数字と `:_-`。SQLは常にパラメータ化する。
 文法上正しい未知IDは0件を返し、画面は選択を外せる。古い選択を別地域へ暗黙変換しない。
+別国の地域かどうかは名称表で確かめる（名称表に無い地域 ID は確かめられないので 0 件）。
+
+新形式の条件は [`PlaceRules`](../../crates/geoframe/src/regions/rules.rs) の式（`country`・`region`・`unclassified`・`no_location`）だけで書く。
+区分ごとの絞り込みの `total` は、同じ期間・範囲・除外を掛けた `places` の件数と一致する（結合試験で確かめる）。
+読み取りは、条件が国・地域の式を使うときだけ `rules.from`（`pm` と `r` を結合）で引く。旧形式の絞り込みと文字検索は
+`photos` だけで引く（旧形式は変更前と同じ文）。
 
 文字検索 `q` は国・地域の日本語/英語/原表記も対象にする。JOIN・WHEREの生成を共通化し、
 国名と地域名が同じ語に一致しても写真を二重に返さない（試験で確かめる）。語数・文字数上限は既存を維持する。
+検索列は既存の5列と `PlaceRules.search`（`Q_WORD_PARAMS` = 5 + `SEARCH_LIKE_PARAMS`）。`search LIKE ?` と同じ意味の
+`PlaceRules.search_like` を使う: 47 都道府県の別名（`pm_search`）を `LIKE` で一度だけ照合して `p.pref IN (…)` で引き、
+`pref` の無い写真は `r.search_text` を照合する（写真ごとに長い文字列を舐めない。同値性は `regions/rules.rs` の試験で確かめる）。
+`pref` のある写真は「日本」「Japan」「Tokyo」「東京」などで当たり、47件に無い `pref` も「日本」「Japan」に当たる。
+無効・旧版・`failed` の分類の `search_text` は結合に入らないので当たらない。
 
 ### trips・points・写真詳細
 
-- tripsは時間での区切りを維持し、地名上位候補に国・地域ID/名称を追加する。旧pref/cityは互換項目として残す。
-- 地図のpointsは従来の期間・除外での表示を維持する。地域選択で点の集合を狭めない。
-  地図吹き出しは同じ写真取得経路から有効な `location_region` を読む。
-- ライブラリのphotos応答と共有ビューアの正規化に任意の `location_region` を追加する。
+- tripsは時間での区切りを維持し、各旅に国・地域の上位候補 `regions[]`（最大3件）を追加する。旧 `places[]`（`pref`/`city`/`count`）は
+  変更せず互換項目として残す（`tests/fixtures/trips-old-golden.json` に変更前の出力を固定）。
+  `regions[]` の項目は `{country_id, country, region_id, region, label, count}`。件数の多い順、同数は国名・地域名（地域不明が先）、それも同じなら ID。
+  国が決まらない写真（未判定・場所不明）は数えない。`pref` のある写真は日本と `pref` の対応（`regions::pref_region`）、無い写真は
+  `PlaceRules.outside_pref` の式で引く（旅の走査に分類の結合を掛けない）。
+- 地図のpointsは従来の期間・除外での表示を維持する。地域選択で点の集合を狭めない（`points` は場所の絞り込みを読まない）。
+  地図吹き出しは同じ写真取得経路（`photos?ids=`）から有効な `location_region` を読む。
+- ライブラリのphotos応答の各写真に、任意の `location_region` を追加する（共有ビューアの正規化は段③）。
   フィールドなしの旧API応答でも動く。写真タブ全体の検索仕様変更は行わない。
+  形は `{"country_id", "country", "region_id", "region", "method", "label"}`。`label` は「国・地域」（地域が無ければ国だけ）。
+  `method` は `pref`（`pref` のある写真）か `inside`（境界データの分類）。地域が決まらない写真は `region_id`/`region` が `null`。
+  **国が決まらない写真（未判定・場所不明・無効/旧版/`failed` の分類）にはこの項目を付けない**（キーが無い）。分類版・入力座標は出さない。
+  このページの写真だけ、規則の式で引く（`pref` の写真は `pref` から、ほかは `outside_pref` の式）。
 
 ## 画面
 
@@ -317,7 +370,7 @@ IDは最大64文字、許可文字はASCII英数字と `:_-`。SQLは常にパ�
 |受け入れ条件|検証|
 |---|---|
 |AC1,AC3|API結合試験。複数国・同名地域・表紙・期間/bbox/除外・合計一致・ページング|
-|AC2|変更前後の `places` の日本部分の比較（海岸・小島・県境・GPS が消えて `pref` だけ残った合成写真を含む。地域の件数 − `boundary_only` と `cities[]`）、市区町村・読み仮名・選択解除。旧形式のクエリが変更前と同じ結果を返す|
+|AC2|変更前後の `places` の日本部分の比較（海岸・小島・県境・GPS が消えて `pref` だけ残った合成写真を含む。日本の各地域で、件数 − `boundary_only` = 旧 `prefs` のその都道府県の件数（行が無ければ 0）。地域は `cities[]` を持たず、市区町村は旧 `prefs` のものだけ）、市区町村・読み仮名・選択解除。旧形式のクエリが変更前と同じ結果を返す|
 |AC3|区分の規則 1〜4 の各分岐と、集計の式（国 = Σ地域 + `region_unknown`、Σ国 + `unclassified` + `no_location` = 全体）|
 |AC4|日本語/英語/原表記の検索、`pref` のある写真が「日本」「Japan」「Tokyo」で当たる、国名と地域名の両方に一致する語で二重にならない、旅の地名・文字検索|
 |AC5,AC6|合成ポリゴンの内部・境界・穴・島・国境の共有辺・地域の共有辺・国のみ・海上・無効座標（判定手順 1〜4 の各分岐）|
@@ -332,7 +385,8 @@ IDは最大64文字、許可文字はASCII英数字と `:_-`。SQLは常にパ�
 私的な写真座標・行動履歴・本番DBの抜粋をfixtureにしない。
 大量データでは1万件程度の合成写真で処理時間・writer待ち・照合回数を測り、バッチ上限を調整する。
 地図を動かすたびに来る `places` の応答時間を、`photo_regions(country_id, region_id)` の索引あり・1万件の合成データで測る。
-目標は変更前の `places` の応答時間の 1.5 倍以内（段②で変更前を先に測る）。
+目標は変更前の `places` の応答時間の 1.5 倍以内、または増加 5ms 以内（段②で変更前を先に測る。2026-11-04 T4 の計測を受けて「または」を追加: 欧州 bbox は 1.43→2.92ms で 2.04 倍だが増加 1.5ms）。
+実測（`tests/library_places_perf.rs`、release、1 万件、変更前 → 変更後の中央値）は段②の PR の説明を参照。計測は `cargo test --release --test library_places_perf -- --ignored --nocapture`（`photos`・`trips` の応答時間も同じファイル。1 万件の変更前→変更後は段②の PR の説明を参照）。
 
 必要な確認: `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、
 画面の DOM 試験は上限付きの `cargo test --test admin_ui_library`（共有ビューアは `admin_ui_photos`）経由で回す

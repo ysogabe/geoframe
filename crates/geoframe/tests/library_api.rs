@@ -739,11 +739,13 @@ async fn library_photo_has_the_documented_keys_and_values() {
     .into_iter()
     .collect();
     for item in body["items"].as_array().unwrap() {
+        // 国が決まる写真には、任意の `location_region` が付く（段②。ここでは他のキーだけを確かめる）
         let have: BTreeSet<&str> = item
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
+            .filter(|k| *k != "location_region")
             .collect();
         assert_eq!(have, keys, "id {}", item["id"]);
     }
@@ -1183,7 +1185,13 @@ INSERT INTO photos(id, source, drive_id, path, display, name, md5, mtime, taken_
 async fn places_of_an_empty_catalog() {
     let server = Server::start_with(&[], "DELETE FROM photos;").await;
     let body = server.ok("/api/admin/library/places").await;
-    assert_eq!(body, json!({"ok": true, "prefs": [], "abroad": 0}));
+    // 旧形式のフィールドは変わらず、新しいフィールドは空（分類の表が無い DB なので `classification_available` は偽）
+    assert_eq!(body["prefs"], json!([]));
+    assert_eq!(body["abroad"], 0);
+    assert_eq!(body["countries"], json!([]));
+    assert_eq!(body["classification_available"], false);
+    assert_eq!(body["unknown"]["unclassified"]["count"], 0);
+    assert_eq!(body["unknown"]["no_location"]["count"], 0);
 }
 
 #[tokio::test]

@@ -1,0 +1,214 @@
+{
+ "": {
+  "ok": true,
+  "trips": [
+   {
+    "key": "2025-08-01 09:00",
+    "start": "2025-08-01 09:00",
+    "end": "2025-08-04 09:00",
+    "count": 9,
+    "noloc": 1,
+    "places": [
+     {
+      "pref": "",
+      "city": "",
+      "count": 9
+     }
+    ],
+    "cover": {
+     "id": 25,
+     "thumb_url": "/thumb/25.jpg?v=8e466642ff1f"
+    }
+   },
+   {
+    "key": "2025-07-01 09:00",
+    "start": "2025-07-01 09:00",
+    "end": "2025-07-01 09:00",
+    "count": 6,
+    "noloc": 0,
+    "places": [
+     {
+      "pref": "",
+      "city": "",
+      "count": 6
+     }
+    ],
+    "cover": {
+     "id": 19,
+     "thumb_url": "/thumb/19.jpg?v=c462ab436fe1"
+    }
+   },
+   {
+    "key": "2025-06-01 09:00",
+    "start": "2025-06-01 09:00",
+    "end": "2025-06-01 09:00",
+    "count": 3,
+    "noloc": 0,
+    "places": [
+     {
+      "pref": "",
+      "city": "",
+      "count": 3
+     }
+    ],
+    "cover": {
+     "id": 16,
+     "thumb_url": "/thumb/16.jpg?v=8ea620c03fee"
+    }
+   },
+   {
+    "key": "2025-05-01 09:00",
+    "start": "2025-05-01 09:00",
+    "end": "2025-05-04 09:00",
+    "count": 4,
+    "noloc": 0,
+    "places": [
+     {
+      "pref": "",
+      "city": "",
+      "count": 4
+     }
+    ],
+    "cover": {
+     "id": 11,
+     "thumb_url": "/thumb/11.jpg?v=b03a666b5f64"
+    }
+   },
+   {
+    "key": "2025-04-01 10:00",
+    "start": "2025-04-01 10:00",
+    "end": "2025-04-10 10:00",
+    "count": 9,
+    "noloc": 1,
+    "places": [
+     {
+      "pref": "東京都",
+      "city": "市1",
+      "count": 3
+     },
+     {
+      "pref": "",
+      "city": "",
+      "count": 2
+     },
+     {
+      "pref": "東京都",
+      "city": "市0",
+      "count": 2
+     }
+    ],
+    "cover": {
+     "id": 1,
+     "thumb_url": "/thumb/1.jpg?v=051820ba151c"
+    }
+   }
+  ],
+  "untimed": 1
+ },
+ "?hidden=1": {
+  "ok": true,
+  "trips": [
+   {
+    "key": "2025-08-01 09:00",
+    "start": "2025-08-01 09:00",
+    "end": "2025-08-04 09:00",
+    "count": 9,
+    "noloc": 1,
+    "places": [
+     {
+      "pref": "",
+      "city": "",
+      "count": 9
+     }
+    ],
+    "cover": {
+     "id": 25,
+     "thumb_url": "/thumb/25.jpg?v=8e466642ff1f"
+    }
+   },
+   {
+    "key": "2025-07-01 09:00",
+    "start": "2025-07-01 09:00",
+    "end": "2025-07-01 09:00",
+    "count": 6,
+    "noloc": 0,
+    "places": [
+     {
+      "pref": "",
+      "city": "",
+      "count": 6
+     }
+    ],
+    "cover": {
+     "id": 19,
+     "thumb_url": "/thumb/19.jpg?v=c462ab436fe1"
+    }
+   },
+   {
+    "key": "2025-06-01 09:00",
+    "start": "2025-06-01 09:00",
+    "end": "2025-06-01 09:00",
+    "count": 3,
+    "noloc": 0,
+    "places": [
+     {
+      "pref": "",
+      "city": "",
+      "count": 3
+     }
+    ],
+    "cover": {
+     "id": 16,
+     "thumb_url": "/thumb/16.jpg?v=8ea620c03fee"
+    }
+   },
+   {
+    "key": "2025-05-01 09:00",
+    "start": "2025-05-01 09:00",
+    "end": "2025-05-05 09:00",
+    "count": 5,
+    "noloc": 0,
+    "places": [
+     {
+      "pref": "",
+      "city": "",
+      "count": 5
+     }
+    ],
+    "cover": {
+     "id": 11,
+     "thumb_url": "/thumb/11.jpg?v=b03a666b5f64"
+    }
+   },
+   {
+    "key": "2025-04-01 10:00",
+    "start": "2025-04-01 10:00",
+    "end": "2025-04-10 10:00",
+    "count": 10,
+    "noloc": 1,
+    "places": [
+     {
+      "pref": "東京都",
+      "city": "市0",
+      "count": 3
+     },
+     {
+      "pref": "東京都",
+      "city": "市1",
+      "count": 3
+     },
+     {
+      "pref": "",
+      "city": "",
+      "count": 2
+     }
+    ],
+    "cover": {
+     "id": 1,
+     "thumb_url": "/thumb/1.jpg?v=051820ba151c"
+    }
+   }
+  ],
+  "untimed": 1
+ }
+}

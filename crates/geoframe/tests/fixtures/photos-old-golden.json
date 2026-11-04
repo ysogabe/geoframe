@@ -1,0 +1,356 @@
+{
+ "pref=東京都": {
+  "total": 5,
+  "pages": 1,
+  "ids": [
+   1,
+   2,
+   3,
+   5,
+   6
+  ]
+ },
+ "pref=東京都&city=市1": {
+  "total": 3,
+  "pages": 1,
+  "ids": [
+   1,
+   3,
+   5
+  ],
+  "items": [
+   {
+    "id": 1,
+    "name": "P1.jpg",
+    "thumb": "/d/1.jpg",
+    "thumb_url": "/thumb/1.jpg?v=051820ba151c",
+    "taken_at": "2025-04-01 10:00",
+    "lat": 35.7,
+    "lon": 139.7,
+    "loc_source": "",
+    "place": "",
+    "pref": "東京都",
+    "city": "市1",
+    "favorite": false,
+    "hidden": false,
+    "rotation": 0,
+    "source": "local"
+   },
+   {
+    "id": 3,
+    "name": "P3.jpg",
+    "thumb": "/d/3.jpg",
+    "thumb_url": "/thumb/3.jpg?v=e8a044685ec6",
+    "taken_at": "2025-04-03 10:00",
+    "lat": 35.6,
+    "lon": 139.6,
+    "loc_source": "",
+    "place": "",
+    "pref": "東京都",
+    "city": "市1",
+    "favorite": false,
+    "hidden": false,
+    "rotation": 0,
+    "source": "local"
+   },
+   {
+    "id": 5,
+    "name": "P5.jpg",
+    "thumb": "/d/5.jpg",
+    "thumb_url": "/thumb/5.jpg?v=068d0267206f",
+    "taken_at": "2025-04-05 10:00",
+    "lat": 30.5,
+    "lon": 139.9,
+    "loc_source": "",
+    "place": "",
+    "pref": "東京都",
+    "city": "市1",
+    "favorite": false,
+    "hidden": false,
+    "rotation": 0,
+    "source": "local"
+   }
+  ]
+ },
+ "city=市1": {
+  "total": 4,
+  "pages": 1,
+  "ids": [
+   1,
+   3,
+   5,
+   7
+  ]
+ },
+ "city=市0&hidden=1": {
+  "total": 5,
+  "pages": 1,
+  "ids": [
+   2,
+   4,
+   6,
+   8,
+   10
+  ]
+ },
+ "abroad=1": {
+  "total": 25,
+  "pages": 1,
+  "ids": [
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   16,
+   17,
+   18,
+   19,
+   20,
+   21,
+   22,
+   23,
+   24,
+   25,
+   26,
+   27,
+   28,
+   29,
+   30,
+   31,
+   33,
+   34,
+   32
+  ]
+ },
+ "abroad=1&hidden=1": {
+  "total": 26,
+  "pages": 1,
+  "ids": [
+   9,
+   10,
+   11,
+   12,
+   13,
+   14,
+   15,
+   16,
+   17,
+   18,
+   19,
+   20,
+   21,
+   22,
+   23,
+   24,
+   25,
+   26,
+   27,
+   28,
+   29,
+   30,
+   31,
+   33,
+   34,
+   32
+  ]
+ },
+ "pref=架空県": {
+  "total": 1,
+  "pages": 1,
+  "ids": [
+   7
+  ]
+ },
+ "pref=東京都&from=2025-04-02+00:00&to=2025-04-06+23:59": {
+  "total": 4,
+  "pages": 1,
+  "ids": [
+   2,
+   3,
+   5,
+   6
+  ]
+ },
+ "abroad=1&bbox=-10,40,10,50": {
+  "total": 6,
+  "pages": 1,
+  "ids": [
+   11,
+   12,
+   13,
+   14,
+   17,
+   18
+  ]
+ },
+ "pref=大阪府&bbox=-180,-90,180,90": {
+  "total": 1,
+  "pages": 1,
+  "ids": [
+   4
+  ]
+ },
+ "q=東京": {
+  "total": 5,
+  "pages": 1,
+  "ids": [
+   1,
+   2,
+   3,
+   5,
+   6
+  ]
+ },
+ "q=市1": {
+  "total": 4,
+  "pages": 1,
+  "ids": [
+   1,
+   3,
+   5,
+   7
+  ]
+ },
+ "q=P1": {
+  "total": 10,
+  "pages": 1,
+  "ids": [
+   1,
+   10,
+   11,
+   12,
+   13,
+   14,
+   16,
+   17,
+   18,
+   19
+  ]
+ },
+ "q=2025-05": {
+  "total": 4,
+  "pages": 1,
+  "ids": [
+   11,
+   12,
+   13,
+   14
+  ]
+ },
+ "q=東京+市1": {
+  "total": 3,
+  "pages": 1,
+  "ids": [
+   1,
+   3,
+   5
+  ]
+ },
+ "untimed=1": {
+  "total": 1,
+  "pages": 1,
+  "ids": [
+   32
+  ]
+ },
+ "ids=1,9,11,31&hidden=1": {
+  "total": 4,
+  "pages": 1,
+  "ids": [
+   1,
+   9,
+   11,
+   31
+  ],
+  "items": [
+   {
+    "id": 1,
+    "name": "P1.jpg",
+    "thumb": "/d/1.jpg",
+    "thumb_url": "/thumb/1.jpg?v=051820ba151c",
+    "taken_at": "2025-04-01 10:00",
+    "lat": 35.7,
+    "lon": 139.7,
+    "loc_source": "",
+    "place": "",
+    "pref": "東京都",
+    "city": "市1",
+    "favorite": false,
+    "hidden": false,
+    "rotation": 0,
+    "source": "local"
+   },
+   {
+    "id": 9,
+    "name": "P9.jpg",
+    "thumb": "/d/9.jpg",
+    "thumb_url": "/thumb/9.jpg?v=cf06b91ac102",
+    "taken_at": "2025-04-09 10:00",
+    "lat": 35.0,
+    "lon": 139.0,
+    "loc_source": "",
+    "place": "",
+    "pref": "",
+    "city": "",
+    "favorite": false,
+    "hidden": false,
+    "rotation": 0,
+    "source": "local"
+   },
+   {
+    "id": 11,
+    "name": "P11.jpg",
+    "thumb": "/d/11.jpg",
+    "thumb_url": "/thumb/11.jpg?v=b03a666b5f64",
+    "taken_at": "2025-05-01 09:00",
+    "lat": 48.0,
+    "lon": 2.0,
+    "loc_source": "",
+    "place": "",
+    "pref": "",
+    "city": "",
+    "favorite": false,
+    "hidden": false,
+    "rotation": 0,
+    "source": "local"
+   },
+   {
+    "id": 31,
+    "name": "P31.jpg",
+    "thumb": "/d/31.jpg",
+    "thumb_url": "/thumb/31.jpg?v=82ae9b0abed6",
+    "taken_at": "2025-08-02 09:00",
+    "lat": null,
+    "lon": null,
+    "loc_source": "",
+    "place": "",
+    "pref": "",
+    "city": "",
+    "favorite": false,
+    "hidden": false,
+    "rotation": 0,
+    "source": "local"
+   }
+  ]
+ },
+ "from=2025-05-01+00:00&to=2025-06-30+23:59": {
+  "total": 7,
+  "pages": 1,
+  "ids": [
+   11,
+   12,
+   13,
+   14,
+   16,
+   17,
+   18
+  ]
+ },
+ "q=東京&abroad=1": {
+  "total": 0,
+  "pages": 1,
+  "ids": []
+ }
+}
