@@ -587,6 +587,182 @@ fn cleanup_stops_at_the_cycle_limit_and_continues_next_time() {
     assert_eq!(s.row_count(), 0);
 }
 
+#[test]
+fn the_dry_run_cleanup_count_follows_the_cycle_limit_like_apply() {
+    let s = setup(true);
+    s.sql(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<350)
+         INSERT INTO photo_regions(photo_id,input_lat,input_lon,classifier_version,country_method,region_method,classified_at)
+         SELECT i, 1.0, 1.0, 'v1', 'outside', 'outside', '2026-01-01 00:00:00' FROM n;",
+    );
+    // 孤児 350 行、1 サイクル 250 行（1 回の削除 100 行の倍数ではない）: dry-run も実行も 250 行
+    let (st, _) = stage("v1");
+    let st = st.with_limits(250, Duration::from_secs(60), 100);
+    assert_eq!(s.dry_run(&st)["removed"], 250);
+    assert_eq!(s.row_count(), 350, "dry-run は消さない");
+    assert_eq!(s.run(&st)["removed"], 250);
+    assert_eq!(s.row_count(), 100);
+    // 上限より少なければ、あるだけ
+    assert_eq!(s.dry_run(&st)["removed"], 100);
+    assert_eq!(s.run(&st)["removed"], 100);
+    assert_eq!(s.row_count(), 0);
+}
+
+// ---------------------------------------------------------------- 判定できなかった座標（failed）
+
+/// 国 `ne:ZZZ`（名称表に無い）の領域 x[80,90] を足した世界。そこに入る座標は国は決まるが名称表と合わず、判定できない。
+fn broken_world() -> Result<super::RegionIndex, super::data::DataError> {
+    synth(
+        &[
+            ("ne:USA", vec![solid(rect(0.0, 0.0, 10.0, 10.0))]),
+            ("ne:ZZZ", vec![solid(rect(80.0, 0.0, 90.0, 10.0))]),
+        ],
+        &[],
+    )
+}
+
+fn broken_stage(version: &str) -> Regions {
+    Regions::with_index(version, broken_world)
+}
+
+const BAD: (&str, &str) = ("5.0", "85.0");
+
+fn valid_join_ids(s: &Setup) -> Vec<i64> {
+    let conn = s.read(Mode::Apply);
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT p.id FROM photos p {} WHERE r.photo_id IS NOT NULL ORDER BY p.id",
+            join("p", "r")
+        ))
+        .unwrap();
+    stmt.query_map([], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+#[test]
+fn an_unclassifiable_coordinate_is_recorded_as_failed_and_not_selected_again() {
+    let s = setup(true);
+    s.photo(1, BAD.0, BAD.1, None);
+    s.photo(2, BAD.0, BAD.1, None); // 同じ座標
+    s.photo(3, US1.0, US1.1, None);
+    // 読み取りの JOIN は同梱の分類版で照合するので、この試験は同梱の版で保存する
+    let version = super::classifier_version().unwrap();
+    let st = broken_stage(version);
+    let c = s.run(&st);
+    assert_eq!((c["pending"], c["inside"], c["failed"]), (3, 1, 2));
+    assert_eq!(c["deferred"], 0);
+    let rows = s.rows();
+    let failed: Vec<_> = rows.iter().filter(|r| r.3 == "failed").collect();
+    assert_eq!(failed.len(), 2);
+    for r in failed {
+        // 国・地域・検索用文字列は空、版は今の版、判定方法は国も地域も failed
+        assert_eq!((r.1.as_deref(), r.2.as_deref()), (None, None));
+        assert_eq!(
+            (r.4.as_str(), r.5.as_str(), r.6.as_str()),
+            ("failed", version, "")
+        );
+    }
+    // 読み取り側は failed の行を有効な分類として引かない（= 国が決まらない `unclassified`）
+    assert_eq!(valid_join_ids(&s), vec![3]);
+    // 候補ではなくなり、分類待ちにも数えない
+    let c = s.run(&st);
+    assert_eq!((c["pending"], c["failed"], c["inside"]), (0, 0, 0));
+    assert_eq!(super::pending_photos(&s.read(Mode::Apply)).unwrap(), 0);
+    // dry-run も同じ（失敗した行は候補に戻らない）
+    assert_eq!(s.dry_run(&st)["pending"], 0);
+}
+
+#[test]
+fn a_failed_coordinate_is_retried_when_the_version_or_the_coordinate_changes() {
+    let s = setup(true);
+    s.photo(1, BAD.0, BAD.1, None);
+    s.photo(2, BAD.0, BAD.1, None);
+    assert_eq!(s.run(&broken_stage("v1"))["failed"], 2);
+    assert_eq!(s.run(&broken_stage("v1"))["pending"], 0);
+    // 版が上がれば選び直す（直った索引なら分類できる）
+    let (st, _) = stage("v2");
+    s.sql("UPDATE photos SET lat=5.0, lon=2.0 WHERE id=2");
+    let c = s.run(&st);
+    assert_eq!((c["pending"], c["inside"], c["unresolved"]), (2, 1, 1));
+    let rows = s.rows();
+    assert!(rows.iter().all(|r| r.5 == "v2"), "{rows:?}");
+    // 座標が動いた写真は、版が同じでも選び直す
+    let s2 = setup(true);
+    s2.photo(1, BAD.0, BAD.1, None);
+    assert_eq!(s2.run(&broken_stage("v1"))["failed"], 1);
+    s2.sql("UPDATE photos SET lat=5.0, lon=2.0 WHERE id=1");
+    let c = s2.run(&broken_stage("v1"));
+    assert_eq!((c["pending"], c["inside"]), (1, 1));
+}
+
+#[test]
+fn permanent_failures_at_the_front_do_not_block_the_photos_behind_them() {
+    let s = setup(true);
+    // 先頭 5 枚が恒久的に判定できない。1 サイクル 5 枚でも、次のサイクルでは後ろへ進む
+    for id in 1..=5 {
+        s.photo(id, BAD.0, BAD.1, None);
+    }
+    for id in 6..=8 {
+        s.photo(id, US1.0, US1.1, None);
+    }
+    let st = broken_stage("v1").with_limits(5, Duration::from_secs(60), 2);
+    let c = s.run(&st);
+    assert_eq!(
+        (c["pending"], c["failed"], c["inside"], c["deferred"]),
+        (8, 5, 0, 3)
+    );
+    let c = s.run(&st);
+    assert_eq!(
+        (c["pending"], c["failed"], c["inside"], c["deferred"]),
+        (3, 0, 3, 0)
+    );
+    assert_eq!(s.run(&st)["pending"], 0);
+}
+
+#[test]
+fn failed_rows_are_dropped_when_a_photo_changes_before_the_apply() {
+    let s = setup(true);
+    s.photo(1, BAD.0, BAD.1, None);
+    s.photo(2, BAD.0, BAD.1, None);
+    // 判定と適用のあいだに写真 2 の座標が動く: failed の行も照合で捨て、stale_input に数える
+    let st = broken_stage("v1");
+    let c = apply_with_interruption(&s, &st, |w| {
+        w.call(|c| c.execute("UPDATE photos SET lat=6.0 WHERE id=2", []))
+            .unwrap();
+    });
+    assert_eq!((c["failed"], c["stale_input"]), (1, 1));
+    assert_eq!(s.rows().iter().map(|r| r.0).collect::<Vec<_>>(), vec![1]);
+}
+
+#[test]
+fn a_dry_run_counts_failures_without_writing() {
+    let s = setup(true);
+    s.photo(1, BAD.0, BAD.1, None);
+    s.photo(2, US1.0, US1.1, None);
+    let c = s.dry_run(&broken_stage("v1"));
+    assert_eq!((c["pending"], c["inside"], c["failed"]), (2, 1, 1));
+    assert_eq!(s.row_count(), 0);
+}
+
+#[test]
+fn the_failed_mark_is_a_valid_value_of_the_table_but_other_values_are_not() {
+    let s = setup(true);
+    let insert = |m: &str| {
+        let m = m.to_string();
+        s.writer.call(move |c| {
+            c.execute(
+                "INSERT INTO photo_regions(photo_id,input_lat,input_lon,classifier_version,country_method,region_method,classified_at)
+                 VALUES(1,1.0,1.0,'v',?1,?1,'2026-01-01 00:00:00')",
+                [m],
+            )
+        })
+    };
+    assert!(insert("nonsense").is_err());
+    assert!(insert("failed").is_ok());
+}
+
 // ---------------------------------------------------------------- 上限・停止・再開
 
 #[test]
@@ -760,6 +936,87 @@ fn dry_run_with_no_candidates_does_not_build_the_index() {
     let (st, n) = stage("v1");
     assert_eq!(s.dry_run(&st)["pending"], 0);
     assert_eq!(loads(&n), 0);
+}
+
+// ---------------------------------------------------------------- 候補の走査の上限
+
+/// 写真 1〜`done` は有効な分類が済み、`done+1`〜`done+todo` が候補。
+fn photos_with_leading_classified(s: &Setup, done: i64, todo: i64) {
+    s.sql(&format!(
+        "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{})
+         INSERT INTO photos(id, source, name, lat, lon, pref) SELECT i, 'drive', 'p'||i, 5.0, 2.0, NULL FROM n;
+         INSERT INTO photo_regions(photo_id,input_lat,input_lon,classifier_version,country_method,region_method,classified_at)
+         SELECT id, lat, lon, 'v1', 'outside', 'outside', '2026-01-01 00:00:00' FROM photos WHERE id<={done};",
+        done + todo
+    ));
+}
+
+#[test]
+fn the_time_limit_also_cuts_the_candidate_scan_after_the_first_batch_is_found() {
+    let s = setup(true);
+    photos_with_leading_classified(&s, 40, 20);
+    let (st, _) = stage("v1");
+    // 経過時間は最初から上限を過ぎている。走査は 1 バッチ目（3 枚）の候補が揃うまで続き、そこで中断する
+    let st = st
+        .with_limits(100, Duration::from_secs(5), 3)
+        .with_clock(|_| Duration::from_secs(6))
+        .with_progress_ops(1);
+    let c = s.run(&st);
+    assert_eq!(c["inside"], 3, "{c:?}");
+    assert!(c["pending"] < 20, "走査が打ち切られていない: {c:?}");
+    assert_eq!(s.row_count(), 43);
+    // 時間に余裕があれば、残りは次の通常の同期で全部処理する
+    let (st, _) = stage("v1");
+    let st = st
+        .with_limits(100, Duration::from_secs(60), 3)
+        .with_progress_ops(1);
+    let c = s.run(&st);
+    assert_eq!((c["pending"], c["inside"], c["deferred"]), (17, 17, 0));
+    assert_eq!(s.row_count(), 60);
+}
+
+#[test]
+fn the_scan_keeps_going_until_the_first_batch_exists_even_when_out_of_time() {
+    // 分類済みの写真が 200 枚続いても、候補が 1 枚でもあれば進む（毎回走査だけで時間切れにならない）
+    let s = setup(true);
+    photos_with_leading_classified(&s, 200, 2);
+    let (st, _) = stage("v1");
+    let st = st
+        .with_limits(100, Duration::from_secs(5), 100)
+        .with_clock(|_| Duration::from_secs(60))
+        .with_progress_ops(1);
+    let c = s.run(&st);
+    assert_eq!(c["inside"], 2, "{c:?}");
+}
+
+#[test]
+fn a_stop_signal_interrupts_the_candidate_scan_and_the_read_connection_stays_usable() {
+    let s = setup(true);
+    photos_with_leading_classified(&s, 40, 20);
+    let stop = StopFlag::new();
+    stop.stop();
+    let (st, n) = stage("v1");
+    let st = st
+        .with_limits(100, Duration::from_secs(60), 3)
+        .with_progress_ops(1);
+    let read = s.read(Mode::Apply);
+    let StageOutcome::Done(c) = s
+        .run_with(&st, Mode::Apply, &read, &s.writer, &stop)
+        .unwrap()
+    else {
+        panic!("完了のはず");
+    };
+    let c = map(&c);
+    assert_eq!((c["inside"], c["unresolved"]), (0, 0), "{c:?}");
+    assert_eq!(loads(&n), 0);
+    assert_eq!(s.row_count(), 40);
+    // 進捗ハンドラは残らない: 同じ接続で次の問い合わせが最後まで進む
+    let n: i64 = read
+        .query_row("SELECT COUNT(*) FROM photos p WHERE p.id>0", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(n, 60);
 }
 
 // ---------------------------------------------------------------- ログ（AC12）
@@ -999,4 +1256,54 @@ fn measure_one_cycle_of_ten_thousand_photos() {
     );
     assert_eq!(c["pending"], 10_000);
     assert_eq!(c["failed"], 0);
+}
+
+/// 計測（大規模 DB の候補選択）。写真 `n` 枚（`pref` 空・座標有効）のうち、先頭の `classified` 枚は有効な分類が済み、残りが候補。
+///
+/// ```text
+/// cargo test --release -p geoframe --lib regions::stage_tests::measure_candidate_scan -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore = "計測。単独で回す"]
+fn measure_candidate_scan() {
+    use std::time::Instant;
+    for (label, n, classified) in [
+        ("20 万枚: 全件が候補（初回移行）", 200_000i64, 0i64),
+        ("20 万枚: 15 万枚が分類済み、5 万枚が候補", 200_000, 150_000),
+        ("20 万枚: 全件が分類済み（定常状態）", 200_000, 200_000),
+        ("100 万枚: 全件が分類済み（定常状態）", 1_000_000, 1_000_000),
+    ] {
+        let s = setup(true);
+        s.writer
+            .call(move |conn| {
+                let tx = conn.transaction()?;
+                tx.execute_batch(&format!(
+                    "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<{n})
+                     INSERT INTO photos(id, source, name, lat, lon, pref, md5, mtime, taken_at)
+                     SELECT i, 'drive', 'p'||i, (i%1700)/10.0-85.0, (i%3500)/10.0-175.0, NULL, 'x'||i, 1.0, '2026-01-01 00:00'
+                       FROM n;
+                     INSERT INTO photo_regions(photo_id,input_lat,input_lon,classifier_version,country_method,region_method,classified_at)
+                     SELECT id, lat, lon, 'v1', 'outside', 'outside', '2026-01-01 00:00:00' FROM photos WHERE id<={classified};"
+                ))?;
+                tx.commit()
+            })
+            .unwrap();
+        let (st, _) = stage("v1");
+        let read = s.read(Mode::Apply);
+        let t = Instant::now();
+        let (c, total, _) = st
+            .select(&read, true, "'v1'", Instant::now(), &StopFlag::new())
+            .unwrap();
+        println!(
+            "{label}: 候補走査 {:.0} ms（候補 {} 枚、総数 {total}）",
+            t.elapsed().as_secs_f64() * 1e3,
+            c.len()
+        );
+        let t = Instant::now();
+        let c = s.run(&st);
+        println!(
+            "  1 サイクル（索引は合成）: {:.0} ms {c:?}",
+            t.elapsed().as_secs_f64() * 1e3
+        );
+    }
 }

@@ -6,6 +6,9 @@
 //!   読む側は JOIN しない。API からは作らない。
 //! - 行は「分類に使った座標（`input_lat`/`input_lon`）」と「分類版」を持つ。**現在の写真の座標と一致し、分類版が今の同梱版と
 //!   同じ行だけが有効**（[`join`]）。座標が変わった・版が上がった・写真が消えた行は読まれず、同期段が分類し直す・掃除する。
+//! - 判定そのものができなかった座標（`failed`。同梱データの不整合）も、同じ座標・同じ版では選び直さないよう行に残す。
+//!   `country_method`/`region_method` が `failed` の行は**有効な分類ではない**（[`join`] に一致しない = 読み取り側では
+//!   `unclassified`）。版が変われば選び直す。
 //! - 表には写真名・鍵・画像・応答本文を入れない。国・地域の表示名は同梱の ID→名称表から引く。
 
 use rusqlite::{Connection, TransactionBehavior};
@@ -19,6 +22,8 @@ pub const TABLES: &[&str] = &["photo_regions"];
 ///
 /// - `input_lat`/`input_lon` は分類に使った座標を元の数値のまま持つ（`photos.lat`/`lon` と SQLite で同値比較する）。
 /// - `country_id`/`region_id` は未判定なら NULL。`search_text` は未判定なら空文字。
+/// - `country_method`/`region_method` の `failed` は「判定できなかった」印（国・地域・検索用文字列は空）。`inside`/`outside`/
+///   `ambiguous` と違い分類の結果ではなく、[`join`] は `failed` の行を引かない。
 pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS photo_regions(
   photo_id INTEGER PRIMARY KEY,
   input_lat REAL NOT NULL,
@@ -27,8 +32,8 @@ pub const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS photo_regions(
   country_id TEXT,
   region_id TEXT,
   search_text TEXT NOT NULL DEFAULT '',
-  country_method TEXT NOT NULL CHECK(country_method IN ('inside','outside','ambiguous')),
-  region_method TEXT NOT NULL CHECK(region_method IN ('inside','outside','ambiguous')),
+  country_method TEXT NOT NULL CHECK(country_method IN ('inside','outside','ambiguous','failed')),
+  region_method TEXT NOT NULL CHECK(region_method IN ('inside','outside','ambiguous','failed')),
   classified_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS photo_regions_place ON photo_regions(country_id, region_id);";
@@ -94,14 +99,18 @@ fn current_version_literal() -> String {
 
 /// `photos` の別名 `p` の写真に、**有効な分類**だけを付ける `LEFT JOIN`。`r` は `photo_regions` の別名。
 /// 有効 = 行の `input_lat`/`input_lon` が現在の座標と一致し、`classifier_version` が今の同梱版で、現在の座標が有効
-/// （[`valid_coordinates`]）。`photo_id` が主キーなので `p` の行が増えることはない。
+/// （[`valid_coordinates`]）で、判定できた行（`country_method` が `failed` でない）。`photo_id` が主キーなので `p` の行が
+/// 増えることはない。
+///
+/// `failed` の行（判定できなかった座標を、選び直さないために残した印）は結合しないので、`r` の列は NULL になる。読み取り側から見ると
+/// 分類行が無い写真と区別がつかず、座標があるのに国が決まらない写真として `unclassified` に入る（`failed` を別の区分にしない）。
 ///
 /// 表があること（[`available`]）は呼び手が確かめる（無ければ JOIN しない）。分類版が得られない（同梱データの破損）ときは、
 /// 何にも一致しない JOIN になる（壊れた分類を提供しない）。
 pub fn join(p: &str, r: &str) -> String {
     format!(
         "LEFT JOIN photo_regions {r} ON {r}.photo_id={p}.id AND {r}.input_lat={p}.lat AND {r}.input_lon={p}.lon
-  AND {r}.classifier_version={version} AND {valid}",
+  AND {r}.classifier_version={version} AND {r}.country_method<>'failed' AND {valid}",
         version = current_version_literal(),
         valid = valid_coordinates(p)
     )
@@ -116,7 +125,8 @@ pub(super) fn classifiable(p: &str) -> String {
     )
 }
 
-/// 有効な分類がまだ無い（分類行が無い・座標が合わない・分類版が違う）ことの条件。`version` は [`version_literal`] の結果。
+/// 同期段が**まだ処理していない**（分類行が無い・座標が合わない・分類版が違う）ことの条件。`version` は [`version_literal`] の結果。
+/// `failed` の行も処理済みに数える（同じ座標・同じ版では選び直さない）。読み取りの有効性は [`join`]。
 pub(super) fn needs_classification(p: &str, version: &str) -> String {
     format!(
         "NOT EXISTS (SELECT 1 FROM photo_regions r0 WHERE r0.photo_id={p}.id
