@@ -1,4 +1,4 @@
-//! `GET /api/admin/library/places` の応答時間の計測（手動。`#[ignore]`）。
+//! `GET /api/admin/library/places`・`photos`・`trips` の応答時間の計測（手動。`#[ignore]`）。
 //!
 //! 1 万件の合成写真（pref ありが 7 割、pref 空が 3 割。pref 空のうち有効座標のものに現行版の `photo_regions` 行を持たせる）で
 //! `places` を繰り返し呼び、中央値を出す。設計の目標は、変更前の 1.5 倍以内（docs/international-places/design.md「テスト計画」）。
@@ -168,5 +168,97 @@ async fn places_response_time_with_ten_thousand_photos() {
             times[ROUNDS * 9 / 10],
             times[0]
         );
+    }
+}
+
+/// 値を `%XX` にする（ASCII 英数字と `-_.~:,` 以外）。
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.~:,".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// 中央値などを出す。200 でない（その版が受けない形）ときは状態だけを出す。
+async fn measure(addr: std::net::SocketAddr, target: &str) {
+    let first = get(addr, target).await;
+    if first.status != 200 {
+        println!("{target:<90} status {}", first.status);
+        return;
+    }
+    let bytes = first.body.len();
+    let total = first.json()["total"].as_i64();
+    let mut times = Vec::new();
+    for _ in 0..ROUNDS {
+        let t = Instant::now();
+        let r = get(addr, target).await;
+        assert_eq!(r.status, 200);
+        times.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    times.sort_by(f64::total_cmp);
+    println!(
+        "{target:<90} median {:6.2} ms  p90 {:6.2} ms  min {:6.2} ms  ({bytes} bytes, total {total:?})",
+        times[ROUNDS / 2],
+        times[ROUNDS * 9 / 10],
+        times[0]
+    );
+}
+
+/// `photos`（旧形式・新形式・文字検索・期間・範囲・ID）と `trips` の応答時間。新形式は、それを受けない版では状態だけを出す。
+#[tokio::test]
+#[ignore = "手動の計測"]
+async fn photos_and_trips_response_time_with_ten_thousand_photos() {
+    let dir = TempDir::new("photos-perf");
+    let (path, mut writer) = build_empty_catalog(dir.path(), "");
+    geoframe::regions::ensure_tables(&mut writer).unwrap();
+    writer.execute_batch(&synthetic_sql()).unwrap();
+    let catalog = Catalog::open(&path).unwrap();
+    let addr = spawn_with_env(dir.path(), &[], catalog).await;
+    let base = "/api/admin/library/photos";
+    let ids: Vec<String> = (1..=60).map(|i| (i * 150).to_string()).collect();
+    let mut targets = vec![
+        "/api/admin/library/trips".to_owned(),
+        "/api/admin/library/trips?hidden=1".to_owned(),
+        format!("{base}?pref={}", encode("東京都")),
+        format!("{base}?pref={}&city={}", encode("東京都"), encode("市1")),
+        format!("{base}?city={}", encode("市1")),
+        format!("{base}?abroad=1"),
+        format!("{base}?untimed=1"),
+        format!("{base}?from=2024-01-01+00:00&to=2024-12-31+23:59"),
+        format!("{base}?bbox=125,28,148,46"),
+        format!("{base}?ids={}", ids.join(",")),
+        format!("{base}?q={}", encode("東京")),
+        format!("{base}?q={}", encode("Tokyo")),
+        format!("{base}?q={}", encode("日本")),
+        format!("{base}?q={}", encode("市1 P99")),
+        format!(
+            "{base}?q={}&from=2024-01-01+00:00&to=2024-12-31+23:59",
+            encode("日本")
+        ),
+    ];
+    let tokyo = geoframe::regions::data::names()
+        .unwrap()
+        .region_of_pref("東京都")
+        .unwrap()
+        .id
+        .clone();
+    for query in [
+        "country=ne:JPN".to_owned(),
+        format!("country=ne:JPN&region={tokyo}"),
+        format!("country=ne:JPN&region={tokyo}&city={}", encode("市1")),
+        "country=ne:JPN&region_unknown=1".to_owned(),
+        "country=ne:FRA".to_owned(),
+        "unclassified=1".to_owned(),
+        "no_location=1".to_owned(),
+    ] {
+        targets.push(format!("{base}?{query}"));
+    }
+    for target in targets {
+        measure(addr, &target).await;
     }
 }

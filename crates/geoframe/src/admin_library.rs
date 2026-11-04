@@ -1,15 +1,18 @@
 //! 管理画面の「ライブラリ」タブの読み取り API（docs/admin-library/design.md）。
 //!
 //! - `GET /api/admin/library/trips`: 撮影日時のある写真を 48 時間超の空きで旅に区切った一覧（新しい順）。
-//! - `GET /api/admin/library/photos`: 期間・範囲・ID・地名・日時なし・文字（`q`）で絞った写真のページ。
+//! - `GET /api/admin/library/photos`: 期間・範囲・ID・場所（旧形式の `pref`/`city`/`abroad`、新形式の `country`/`region`/…）・日時なし・
+//!   文字（`q`）で絞った写真のページ。各写真に、任意の `location_region`（国・地域・判定方法・表示用のラベル）が付く。
 //! - `GET /api/admin/library/points`: 位置のある写真の GeoJSON（地図用）。
 //! - `GET /api/admin/library/calendar`: 年・月ごとの件数と、年ごとの代表の写真（日付の眺め方）。
 //! - `GET /api/admin/library/places`: 国・地域ごとの件数・範囲・代表の写真（`countries`）、国が決まらない写真（`unknown`）、
 //!   旧形式の都道府県・市区町村（`prefs`）と海外・不明（`abroad`）（場所の眺め方。期間 `from`・`to` と地図の範囲 `bbox` で絞れる）。
 //!   区分は [`crate::regions::PlaceRules`]（設計「場所の区分の規則」）で 1 つに決まる。
 //!
-//! 読むのは `photos` 表と、国・地域の分類 `photo_regions` 表（`places` だけ。表が無い旧 DB では結合しない）。`photo_curation`
-//! などの新しい表が無い DB、`GEOFRAME_INGEST=0` の読み取り専用の起動でも動く。経路は完全一致の `GET` のみで、`server.rs` の
+//! 読むのは `photos` 表と、国・地域の分類 `photo_regions` 表（`places`・`trips`・`photos`。表が無い旧 DB では空の派生表を結合し、
+//! 表は作らない）。`photos` の絞り込み（`country` など）・文字検索 `q`・応答の `location_region` と、`trips` の地名は、
+//! [`crate::regions::PlaceRules`] の式を使う（規則をここで書き直さない）。`photo_curation` などの新しい表が無い DB、
+//! `GEOFRAME_INGEST=0` の読み取り専用の起動でも動く。経路は完全一致の `GET` のみで、`server.rs` の
 //! `site` が呼ぶ。**更新はしない**（分類の表も API からは作らない・書かない）。
 //!
 //! クエリは `/api/admin/photos` と同じく `parse_qs` の最初の値で読む（空の値は無かったことになる）。形が違えば
@@ -42,13 +45,20 @@ const PER_DEFAULT: i64 = 60;
 const PLACES_MAX: usize = 3;
 /// `photos` の `q` の語数の上限（これ以上は 400）。
 const Q_WORDS_MAX: usize = 5;
-/// `q` の 1 語ぶんの条件。検索する 5 列（都道府県・市区町村・地名・ファイル名・撮影日時）のどれかに部分一致する。
+/// `q` の 1 語ぶんの条件。検索する 6 つ（都道府県・市区町村・地名・ファイル名・撮影日時、場所の区分の検索用文字列）の
+/// どれかに部分一致する。場所の検索用文字列は [`crate::regions::PlaceRules::search`]（`pref` のある写真は日本と都道府県の別名、
+/// それ以外は有効な分類の検索用文字列。国名と地域名は 1 つの文字列なので、両方に一致する語でも写真は 1 回だけ数える）で、
+/// ここには同じ意味の [`regions::PlaceRules::search_like`] を入れる。
 /// ユーザーの文字列は入れず、`?` に語ごとのパターンをバインドする（Rust のソースの `ESCAPE '\\'` は、SQL では `ESCAPE '\'`）。
-const Q_WORD_SQL: &str = "(COALESCE(pref,'') LIKE ? ESCAPE '\\' OR COALESCE(city,'') LIKE ? ESCAPE '\\' \
-     OR COALESCE(place,'') LIKE ? ESCAPE '\\' OR COALESCE(name,'') LIKE ? ESCAPE '\\' \
-     OR COALESCE(taken_at,'') LIKE ? ESCAPE '\\')";
-/// `Q_WORD_SQL` の `?` の数。
-const Q_WORD_PARAMS: usize = 5;
+fn q_word_sql(search_like: &str) -> String {
+    format!(
+        "(COALESCE(pref,'') LIKE ? ESCAPE '\\' OR COALESCE(city,'') LIKE ? ESCAPE '\\' \
+         OR COALESCE(place,'') LIKE ? ESCAPE '\\' OR COALESCE(name,'') LIKE ? ESCAPE '\\' \
+         OR COALESCE(taken_at,'') LIKE ? ESCAPE '\\' OR {search_like})"
+    )
+}
+/// [`q_word_sql`] の `?` の数（5 列と、[`regions::PlaceRules::search_like`] の分）。
+const Q_WORD_PARAMS: usize = 5 + regions::SEARCH_LIKE_PARAMS;
 
 /// 「日時あり」の判定（SQL）。分までの撮影日時の形（`YYYY-MM-DD HH:MM`、16 桁）だけを見る。暦としての正しさは見ない
 /// （`imaging::norm_time` が暦を検査しないので、`2025-02-30 10:00` も取り込まれる）。`trips`・`photos`・`points` と
@@ -197,12 +207,25 @@ struct Filter {
     params: Vec<Sql>,
     /// 絞り込みが 1 つでもあるか（`hidden` は数えない）。
     narrowed: bool,
+    /// 条件が [`regions::PlaceRules`] の式（都道府県の対応表 `pm`・有効な分類 `r`）を使うか。使うときだけ、読み取りは
+    /// `rules.from` で引く（旧形式の絞り込みと文字検索だけなら `photos` のままで、旧形式は変更前と同じ文・同じ結果）。
+    rules: bool,
+    /// `q` の語のパターン（`LIKE` 用）。分類の表の有無で条件の文が変わるので、読み取りで [`Filter::render`] が展開する。
+    words: Vec<String>,
 }
 
 impl Filter {
     fn push(&mut self, condition: &'static str, params: impl IntoIterator<Item = Sql>) {
         self.conditions.push(condition.to_owned());
         self.params.extend(params);
+    }
+
+    /// [`regions::PlaceRules`] の式を使う条件（`condition` は固定の文字列と規則の式だけで、値は `?` にバインドする）。
+    fn push_rule(&mut self, condition: String, params: impl IntoIterator<Item = Sql>) {
+        self.conditions.push(condition);
+        self.params.extend(params);
+        self.rules = true;
+        self.narrowed = true;
     }
 
     fn range(&mut self, from: Option<String>, to: Option<String>) {
@@ -228,14 +251,9 @@ impl Filter {
         self.narrowed = true;
     }
 
-    /// 語ごとに 5 列のどれかに部分一致、語同士は AND。条件は固定の型を語の数だけ並べ、語はパターンとしてバインドする。
+    /// 語ごとに 6 つのどれかに部分一致、語同士は AND。語はパターンとして持ち、条件は [`Filter::render`] が固定の型を語の数だけ並べる。
     fn words(&mut self, words: &[&str]) {
-        for word in words {
-            self.conditions.push(Q_WORD_SQL.to_owned());
-            let pattern = like_pattern(word);
-            self.params
-                .extend(std::iter::repeat_n(Sql::Text(pattern), Q_WORD_PARAMS));
-        }
+        self.words.extend(words.iter().map(|w| like_pattern(w)));
         if !words.is_empty() {
             self.narrowed = true;
         }
@@ -254,10 +272,151 @@ impl Filter {
             self.conditions.join(" AND ")
         }
     }
+
+    /// `WHERE` の条件とバインド値。`q` の語を、分類の表の有無に合わせた [`regions::PlaceRules::search_like`] で展開する。
+    fn render(&self, rules: &regions::PlaceRules) -> (String, Vec<Sql>) {
+        let mut conditions = self.conditions.clone();
+        let mut params = self.params.clone();
+        for pattern in &self.words {
+            conditions.push(q_word_sql(&rules.search_like));
+            params.extend(std::iter::repeat_n(
+                Sql::Text(pattern.clone()),
+                Q_WORD_PARAMS,
+            ));
+        }
+        let clause = if conditions.is_empty() {
+            "1=1".to_owned()
+        } else {
+            conditions.join(" AND ")
+        };
+        (clause, params)
+    }
+}
+
+/// 新形式の場所の絞り込みのキー（`country`・`region`・`region_unknown`・`unclassified`・`no_location`）の 1 つが、旧形式のキー
+/// （`pref`・`abroad`）と同時に来たら 400。`0`/`1` の旗は、`0` なら無いのと同じ。`1`/`0` 以外の値は 400（`None`）。
+fn flag(params: &Params, name: &str) -> Option<bool> {
+    match params.get(name).map(String::as_str) {
+        None | Some("0") => Some(false),
+        Some("1") => Some(true),
+        Some(_) => None,
+    }
+}
+
+/// 国・地域の ID。1〜64 文字の ASCII 英数字と `:_-`（`parse_qs` が空の値を捨てるので、空は無いのと同じ）。
+fn parse_place_id(s: &str) -> Option<&str> {
+    data::valid_id(s).then_some(s)
+}
+
+/// 場所の絞り込み（設計「GET /api/admin/library/photos」）。旧形式（`pref`・`city`・`abroad`）は今の意味のまま、
+/// 新形式（`country`／`country&region`／`country&region_unknown=1`／`unclassified=1`／`no_location=1`）は
+/// [`regions::PlaceRules`] の式で絞る。2 つの形は混ぜられない。形が違えば `None`（400）。
+fn place_filter(params: &Params, filter: &mut Filter, rules: &regions::PlaceRules) -> Option<()> {
+    let country: Option<Option<&str>> = params.get("country").map(|v| parse_place_id(v));
+    let (region_unknown, unclassified, no_location, abroad) = (
+        flag(params, "region_unknown")?,
+        flag(params, "unclassified")?,
+        flag(params, "no_location")?,
+        params.get("abroad").is_some_and(|v| v == "1"),
+    );
+    // 旧形式のキー。`city` は、`country` と一緒に来たときだけ新形式の一部
+    let legacy_pref = params.contains_key("pref") || abroad;
+    let new_flag = unclassified || no_location;
+    match country {
+        Some(country) => {
+            let country = country?;
+            if legacy_pref || new_flag {
+                return None;
+            }
+            let names = data::names().ok();
+            let region = match params.get("region") {
+                Some(region) => Some(parse_place_id(region)?),
+                None => None,
+            };
+            if region.is_some() && region_unknown {
+                return None;
+            }
+            // 別の国の地域は 400。名称表に無い ID（文法は正しい）はそのまま 0 件になる
+            if let (Some(region), Some(names)) = (region, names)
+                && let Some(place) = names.region(region)
+                && place.country.as_deref() != Some(country)
+            {
+                return None;
+            }
+            filter.push_rule(
+                format!("{} = ?", rules.country),
+                [Sql::Text(country.to_owned())],
+            );
+            if let Some(region) = region {
+                filter.push_rule(
+                    format!("{} = ?", rules.region),
+                    [Sql::Text(region.to_owned())],
+                );
+            }
+            if region_unknown {
+                filter.push_rule(format!("{} IS NULL", rules.region), []);
+            }
+            if let Some(city) = params.get("city") {
+                // 日本の地域のときだけ: 都道府県名（名称表）と市区町村の両方に一致する
+                let pref = (country == data::JAPAN_ID)
+                    .then_some(region)
+                    .flatten()
+                    .and_then(|r| names?.region(r)?.pref.as_deref())?;
+                filter.push_rule(
+                    "p.pref = ? AND p.city = ?".to_owned(),
+                    [
+                        Sql::Text(pref.to_owned()),
+                        Sql::Text(parse_name(city)?.to_owned()),
+                    ],
+                );
+            }
+        }
+        None if new_flag || params.contains_key("region") || region_unknown => {
+            // `region`・`region_unknown` は `country` が要る。`unclassified`・`no_location` は 1 つだけで、旧形式とも混ぜない
+            if params.contains_key("region")
+                || region_unknown
+                || (unclassified && no_location)
+                || legacy_pref
+                || params.contains_key("city")
+            {
+                return None;
+            }
+            if unclassified {
+                filter.push_rule(rules.unclassified.clone(), []);
+            } else {
+                filter.push_rule(rules.no_location.clone(), []);
+            }
+        }
+        None => {
+            // 旧形式（今の画面が送る）。意味は変更前のまま
+            if let Some(pref) = params.get("pref") {
+                filter.push("pref = ?", [Sql::Text(parse_name(pref)?.to_owned())]);
+                filter.narrowed = true;
+            }
+            if let Some(city) = params.get("city") {
+                filter.push("city = ?", [Sql::Text(parse_name(city)?.to_owned())]);
+                filter.narrowed = true;
+            }
+            // 海外・不明（`pref` が NULL か空。位置なしも入る）。`parse_qs` は空の値（`pref=`）を捨てるので、`pref` では絞れない。
+            // `pref`・`city` とは同時に受けない
+            if abroad {
+                if params.contains_key("pref") || params.contains_key("city") {
+                    return None;
+                }
+                filter.push(ABROAD, []);
+                filter.narrowed = true;
+            }
+        }
+    }
+    Some(())
 }
 
 /// `photos` の絞り込み。形が違うか、絞り込みが 1 つも無ければ `None`。
+///
+/// 場所の式は [`regions::PlaceRules`] のものを使う。式は分類の表の有無に依らず同じで、違うのは `from` だけなので、ここでは
+/// 表の有無を引かない（`from` は読み取りで選ぶ）。
 fn photos_filter(params: &Params) -> Option<Filter> {
+    let rules = regions::PlaceRules::new(true);
     let mut filter = Filter::default();
     let (from, to) = parse_range(params)?;
     filter.range(from, to);
@@ -275,23 +434,7 @@ fn photos_filter(params: &Params) -> Option<Filter> {
         filter.conditions.push(format!("id IN ({marks})"));
         filter.narrowed = true;
     }
-    if let Some(pref) = params.get("pref") {
-        filter.push("pref = ?", [Sql::Text(parse_name(pref)?.to_owned())]);
-        filter.narrowed = true;
-    }
-    if let Some(city) = params.get("city") {
-        filter.push("city = ?", [Sql::Text(parse_name(city)?.to_owned())]);
-        filter.narrowed = true;
-    }
-    // 海外・不明（`pref` が NULL か空。位置なしも入る）。`parse_qs` は空の値（`pref=`）を捨てるので、`pref` では絞れない。
-    // `pref`・`city` とは同時に受けない
-    if params.get("abroad").is_some_and(|v| v == "1") {
-        if params.contains_key("pref") || params.contains_key("city") {
-            return None;
-        }
-        filter.push(ABROAD, []);
-        filter.narrowed = true;
-    }
+    place_filter(params, &mut filter, &rules)?;
     if params.get("untimed").is_some_and(|v| v == "1") {
         filter.push(UNTIMED, []);
         filter.narrowed = true;
@@ -398,6 +541,8 @@ struct Trip {
     count: i64,
     noloc: i64,
     places: HashMap<(String, String), i64>,
+    /// 国・地域（ID）ごとの件数。国が決まらない写真は数えない。地域が決まらなければ地域の ID は `None`。
+    regions: HashMap<PlaceIds, i64>,
     cover: Option<Cover>,
 }
 
@@ -409,11 +554,12 @@ impl Trip {
             count: 0,
             noloc: 0,
             places: HashMap::new(),
+            regions: HashMap::new(),
             cover: None,
         }
     }
 
-    fn into_json(self) -> Value {
+    fn into_json(self, names: Option<&data::NameTable>) -> Value {
         let mut places: Vec<((String, String), i64)> = self.places.into_iter().collect();
         // 件数の多い順、同数なら名前の順（応答を安定させる）
         places.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -421,6 +567,32 @@ impl Trip {
         let places: Vec<Value> = places
             .into_iter()
             .map(|((pref, city), count)| json!({"pref": pref, "city": city, "count": count}))
+            .collect();
+        // 国・地域の上位。件数の多い順、同数なら国名・地域名（地域不明が先）、それも同じなら ID（応答を安定させる）。
+        // 名前は並べ替えには借りて比べ、表示用の項目は上位だけ作る（旅ごとに国・地域は数百になりうる）
+        fn name_of<'a>(names: Option<&'a data::NameTable>, id: &'a str, region: bool) -> &'a str {
+            names
+                .and_then(|n| if region { n.region(id) } else { n.country(id) })
+                .map_or(id, |p| p.name.as_str())
+        }
+        let mut regions: Vec<(PlaceIds, i64)> = self.regions.into_iter().collect();
+        regions.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| name_of(names, a.0.0, false).cmp(name_of(names, b.0.0, false)))
+                .then_with(|| {
+                    let region = |ids: PlaceIds| ids.1.map(|r| name_of(names, r, true));
+                    region(a.0).cmp(&region(b.0))
+                })
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        regions.truncate(PLACES_MAX);
+        let regions: Vec<Value> = regions
+            .into_iter()
+            .filter_map(|(ids, count)| {
+                let mut map = region_fields(names, Some(ids.0), ids.1)?;
+                map.insert("count".to_owned(), json!(count));
+                Some(Value::Object(map))
+            })
             .collect();
         let cover = self
             .cover
@@ -432,6 +604,7 @@ impl Trip {
             "count": self.count,
             "noloc": self.noloc,
             "places": places,
+            "regions": regions,
             "cover": cover,
         })
     }
@@ -467,6 +640,10 @@ fn build_trips(
            FROM photos WHERE {TIMED}{visible}
           ORDER BY taken_at, id"
     ))?;
+    // 国・地域は `places` と同じ規則。`pref` のある写真（規則 1）は日本と `pref` の対応（[`regions::pref_region`]）、
+    // 無い写真は有効な分類の式で引く（国が決まる写真だけ。旅の走査に分類の結合を掛けない）
+    let rules = regions::PlaceRules::new(regions::available(conn)?);
+    let classified = classified_places(conn, &rules, "1=1", &[])?;
     let mut rows = stmt.query([])?;
     let mut trips: Vec<Trip> = Vec::new();
     let mut last: Option<i64> = None;
@@ -497,12 +674,20 @@ fn build_trips(
             trip.noloc += 1;
         }
         let pref = text(row, 4)?;
+        let place = if pref.is_empty() {
+            classified.get(&row.get::<_, i64>(0)?).copied()
+        } else {
+            Some((data::JAPAN_ID, regions::pref_region(&pref)))
+        };
         let key = if pref.is_empty() {
             (String::new(), String::new())
         } else {
             (pref, text(row, 5)?)
         };
         *trip.places.entry(key).or_insert(0) += 1;
+        if let Some(place) = place {
+            *trip.regions.entry(place).or_insert(0) += 1;
+        }
         // 表紙は、位置があり除外でない最初の写真。無ければ先頭
         let preferred = located && !truthy(row.get_ref(6)?);
         if trip
@@ -527,6 +712,7 @@ fn build_trips(
     }
     drop(rows);
     drop(stmt);
+    let names = data::names().ok();
     trips.sort_by(|a, b| b.start.cmp(&a.start));
     let untimed: i64 = conn.query_row(
         &format!(
@@ -542,7 +728,7 @@ fn build_trips(
     )?;
     Ok(json!({
         "ok": true,
-        "trips": trips.into_iter().map(Trip::into_json).collect::<Vec<_>>(),
+        "trips": trips.into_iter().map(|t| t.into_json(names)).collect::<Vec<_>>(),
         "untimed": untimed,
     }))
 }
@@ -580,11 +766,18 @@ fn build_photos(
 ) -> rusqlite::Result<Value> {
     // 件数とページが同じ時点の DB から出るように、1 つの読み取りにまとめる
     let _snapshot = conn.unchecked_transaction()?;
-    let clause = filter.where_clause();
+    let rules = regions::PlaceRules::new(regions::available(conn)?);
+    let (clause, params) = filter.render(&rules);
     let per = per.clamp(1, PER_PAGE_MAX);
+    // 条件が国・地域の式を使うときだけ結合する（旧形式の絞り込みと文字検索は `photos` だけで引く）
+    let from = if filter.rules {
+        &rules.from
+    } else {
+        "photos p"
+    };
     let total: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM photos WHERE {clause}"),
-        params_from_iter(filter.params.iter()),
+        &format!("SELECT COUNT(*) FROM {from} WHERE {clause}"),
+        params_from_iter(params.iter()),
         |row| row.get(0),
     )?;
     let pages = ((total + per - 1) / per).max(1);
@@ -593,13 +786,14 @@ fn build_photos(
     let mut stmt = conn.prepare(&format!(
         "SELECT id, name, display, drive_id, taken_at, lat, lon, loc_source,
                 place, pref, city, favorite, hidden, rotation, source, md5, mtime
-           FROM photos WHERE {clause} ORDER BY {ORDER} LIMIT ? OFFSET ?"
+           FROM {from} WHERE {clause} ORDER BY {ORDER} LIMIT ? OFFSET ?"
     ))?;
-    let mut bound = filter.params.clone();
+    let mut bound = params;
     bound.push(Sql::Integer(per));
     bound.push(Sql::Integer((page - 1) * per));
     let mut rows = stmt.query(params_from_iter(bound.iter()))?;
     let mut items = Vec::new();
+    let mut prefs = Vec::new();
     while let Some(row) = rows.next()? {
         let id: i64 = row.get(0)?;
         let display: Option<String> = row.get(2)?;
@@ -623,6 +817,7 @@ fn build_photos(
             value if !truthy(value) => Value::from(0),
             value => cell(value)?,
         };
+        prefs.push((id, text(row, 9)?));
         items.push(json!({
             "id": id,
             "name": cell(row.get_ref(1)?)?,
@@ -641,6 +836,16 @@ fn build_photos(
             "source": cell(row.get_ref(14)?)?,
         }));
     }
+    drop(rows);
+    drop(stmt);
+    // 国・地域は、このページの写真だけ規則の式で引く（無効・旧版・`failed` の分類は結合に入らず、国が決まらない写真は NULL）
+    let located = locations(conn, &rules, &prefs)?;
+    for (item, (id, _)) in items.iter_mut().zip(&prefs) {
+        // 国が決まらない写真には付けない（任意の項目）
+        if let Some(location) = located.get(id) {
+            item["location_region"] = location.clone();
+        }
+    }
     Ok(json!({
         "ok": true,
         "page": page,
@@ -649,6 +854,107 @@ fn build_photos(
         "total": total,
         "items": items,
     }))
+}
+
+/// 国と地域の ID（名称表の ID。国が決まれば `Some`、地域が決まらなければ地域は `None`）。
+type PlaceIds = (&'static str, Option<&'static str>);
+
+/// `pref` が空で、有効な分類で国が決まる写真の `{写真の ID: (国, 地域)}`。`extra` は `photos`（別名 `p`）への追加の条件
+/// （`params` をバインドする）。分類の式は [`regions::PlaceRules::outside_pref`]。名称表に無い ID（版が合っていれば起きない）は
+/// 飛ばす。**`pref` のある写真は含めない**（規則 1。[`regions::pref_region`]）。
+fn classified_places(
+    conn: &Connection,
+    rules: &regions::PlaceRules,
+    extra: &str,
+    params: &[Sql],
+) -> rusqlite::Result<HashMap<i64, PlaceIds>> {
+    let mut out = HashMap::new();
+    let Ok(names) = data::names() else {
+        return Ok(out);
+    };
+    let outside = &rules.outside_pref;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT p.id, {country}, {region} FROM {from} WHERE NOT {has_pref} AND {extra} AND {country} IS NOT NULL",
+        country = outside.country,
+        region = outside.region,
+        from = outside.from,
+        has_pref = rules.has_pref,
+    ))?;
+    let mut rows = stmt.query(params_from_iter(params.iter()))?;
+    while let Some(row) = rows.next()? {
+        let country: String = row.get(1)?;
+        let region: Option<String> = row.get(2)?;
+        let Some(country) = names.country(&country) else {
+            continue;
+        };
+        let region = region
+            .as_deref()
+            .and_then(|r| names.region(r))
+            .map(|r| r.id.as_str());
+        out.insert(row.get(0)?, (country.id.as_str(), region));
+    }
+    Ok(out)
+}
+
+/// `ids`（このページの写真）の `location_region`（国が決まる写真だけ。決まらない写真は含めない）。`prefs` は
+/// `(写真の ID, pref)` で、`pref` のある写真は規則 1（日本と `pref` の対応）、それ以外は有効な分類。
+fn locations(
+    conn: &Connection,
+    rules: &regions::PlaceRules,
+    prefs: &[(i64, String)],
+) -> rusqlite::Result<HashMap<i64, Value>> {
+    let names = data::names().ok();
+    let mut out = HashMap::new();
+    let mut classified_ids = Vec::new();
+    for (id, pref) in prefs {
+        if pref.is_empty() {
+            classified_ids.push(Sql::Integer(*id));
+        } else if let Some(mut map) =
+            region_fields(names, Some(data::JAPAN_ID), regions::pref_region(pref))
+        {
+            // `pref` のある写真は地理院の地名が正
+            map.insert("method".to_owned(), json!("pref"));
+            out.insert(*id, Value::Object(map));
+        }
+    }
+    if classified_ids.is_empty() {
+        return Ok(out);
+    }
+    let extra = format!("p.id IN ({})", vec!["?"; classified_ids.len()].join(","));
+    for (id, (country, region)) in classified_places(conn, rules, &extra, &classified_ids)? {
+        if let Some(mut map) = region_fields(names, Some(country), region) {
+            // 境界データの分類
+            map.insert("method".to_owned(), json!("inside"));
+            out.insert(id, Value::Object(map));
+        }
+    }
+    Ok(out)
+}
+
+/// 国・地域の表示用の項目 `{country_id, country, region_id, region, label}`（`label` は「国・地域」。地域が無ければ国だけ）。
+/// 名称表に無い ID（同梱データが読めないときなど）は ID を名前にする。国が無ければ `None`。
+fn region_fields(
+    names: Option<&data::NameTable>,
+    country: Option<&str>,
+    region: Option<&str>,
+) -> Option<serde_json::Map<String, Value>> {
+    let country = country?;
+    let name = |place: Option<&data::Place>, id: &str| {
+        place.map_or_else(|| id.to_owned(), |p| p.name.clone())
+    };
+    let country_name = name(names.and_then(|n| n.country(country)), country);
+    let region_name = region.map(|id| name(names.and_then(|n| n.region(id)), id));
+    let label = match &region_name {
+        Some(region) => format!("{country_name}・{region}"),
+        None => country_name.clone(),
+    };
+    let mut map = serde_json::Map::new();
+    map.insert("country_id".to_owned(), json!(country));
+    map.insert("country".to_owned(), json!(country_name));
+    map.insert("region_id".to_owned(), json!(region));
+    map.insert("region".to_owned(), json!(region_name));
+    map.insert("label".to_owned(), json!(label));
+    Some(map)
 }
 
 // ---------------------------------------------------------------- points
@@ -1674,15 +1980,60 @@ mod tests {
     }
 
     #[test]
-    fn q_narrows_and_binds_five_patterns_per_word() {
-        let f = photos_filter(&params("q=%E3%81%82+b")).unwrap();
-        assert_eq!(f.conditions.iter().filter(|c| *c == Q_WORD_SQL).count(), 2);
-        assert_eq!(f.params.len(), 2 * Q_WORD_PARAMS);
-        assert!(f.narrowed);
+    fn q_narrows_and_binds_six_patterns_per_word() {
+        // 分類の表がある DB とない DB のどちらでも、語ごとに同じ数の `?` を持つ
+        for available in [true, false] {
+            let rules = regions::PlaceRules::new(available);
+            let word = q_word_sql(&rules.search_like);
+            let f = photos_filter(&params("q=%E3%81%82+b")).unwrap();
+            let (clause, bound) = f.render(&rules);
+            assert_eq!(clause.matches(&word).count(), 2);
+            assert_eq!(bound.len(), 2 * Q_WORD_PARAMS);
+            assert_eq!(
+                bound
+                    .iter()
+                    .filter(|v| **v == Sql::Text("%あ%".to_owned()))
+                    .count(),
+                Q_WORD_PARAMS
+            );
+            assert!(!clause.contains("%あ%"), "値は SQL に入れない");
+            // 文として正しく、`?` の数がバインドする値の数と同じ（`photos p` だけで引ける）
+            let conn = Connection::open_in_memory().unwrap();
+            conn.execute_batch(
+                "CREATE TABLE photos(id INTEGER PRIMARY KEY, lat REAL, lon REAL, pref TEXT, city TEXT,
+                   place TEXT, name TEXT, taken_at TEXT, hidden INTEGER);",
+            )
+            .unwrap();
+            if available {
+                conn.execute_batch(regions::SCHEMA).unwrap();
+            }
+            let stmt = conn
+                .prepare(&format!("SELECT COUNT(*) FROM photos p WHERE {clause}"))
+                .unwrap();
+            assert_eq!(stmt.parameter_count(), bound.len(), "table={available}");
+        }
+        assert!(photos_filter(&params("q=%E3%81%82+b")).unwrap().narrowed);
+        // 検索は `photos` だけで引く（国・地域の式を使わない）
+        assert!(!photos_filter(&params("q=a")).unwrap().rules);
         // 空白だけの q は無いのと同じ（絞り込みにならない）
         assert!(photos_filter(&params("q=%20%E3%80%80")).is_none());
         assert!(photos_filter(&params("q=%20&pref=x")).is_some());
         assert!(photos_filter(&params("q=a+b+c+d+e+f")).is_none());
+    }
+
+    #[test]
+    fn the_rule_expressions_do_not_depend_on_the_table() {
+        // `photos_filter` は式を表の有無に依らず作る（`from` だけが違う）。式が変わったらここで気づく
+        let (a, b) = (
+            regions::PlaceRules::new(true),
+            regions::PlaceRules::new(false),
+        );
+        assert_eq!(a.country, b.country);
+        assert_eq!(a.region, b.region);
+        assert_eq!(a.no_location, b.no_location);
+        assert_eq!(a.unclassified, b.unclassified);
+        assert_eq!(a.search, b.search);
+        assert_ne!(a.from, b.from);
     }
 
     #[test]
@@ -1700,5 +2051,105 @@ mod tests {
         assert!(photos_filter(&params("abroad=0&pref=x")).is_some());
         assert!(photos_filter(&params("pref=%E6%9E%B6%E7%A9%BA%E7%9C%8C")).is_some());
         assert!(photos_filter(&params("ids=1,2&from=bad")).is_none());
+    }
+
+    /// 場所の絞り込みの形。旧形式だけなら規則の結合は要らず、新形式は要る。
+    #[test]
+    fn place_queries_come_in_two_shapes_that_do_not_mix() {
+        let japan = data::JAPAN_ID;
+        let tokyo = data::names()
+            .unwrap()
+            .region_of_pref("東京都")
+            .unwrap()
+            .id
+            .clone();
+        let ok = |query: &str| photos_filter(&params(query));
+        // 旧形式: 今の画面が送る形。規則の結合は要らない（変更前と同じ文）
+        for query in [
+            "pref=a",
+            "pref=a&city=b",
+            "city=b",
+            "abroad=1",
+            "abroad=0&pref=a",
+            // 新形式の旗の 0 は、無いのと同じ
+            "pref=a&unclassified=0&no_location=0&region_unknown=0",
+        ] {
+            let f = ok(query).unwrap_or_else(|| panic!("{query}"));
+            assert!(!f.rules, "{query}");
+        }
+        // 新形式
+        for query in [
+            format!("country={japan}"),
+            format!("country={japan}&region={tokyo}"),
+            format!("country={japan}&region={tokyo}&city=x"),
+            format!("country={japan}&region_unknown=1"),
+            "country=ne:FRA".to_owned(),
+            "country=ne:FRA&region=ne:FRA-1".to_owned(),
+            "country=ne:FRA&region_unknown=1".to_owned(),
+            // 文法が正しい未知の ID は受ける（0 件になる）
+            "country=ne:ZZZ&region=ne:ZZZ-1".to_owned(),
+            "country=ne:FRA&region=unknown-id".to_owned(),
+            "unclassified=1".to_owned(),
+            "no_location=1".to_owned(),
+            "unclassified=1&no_location=0".to_owned(),
+            format!("country={}", "a".repeat(64)),
+        ] {
+            let f = ok(&query).unwrap_or_else(|| panic!("{query}"));
+            assert!(f.rules && f.narrowed, "{query}");
+        }
+        // 400
+        let fr_region = data::names()
+            .unwrap()
+            .regions
+            .iter()
+            .find(|r| r.country.as_deref() == Some("ne:FRA"))
+            .unwrap()
+            .id
+            .clone();
+        for query in [
+            // 地域だけ・地域不明だけ
+            format!("region={tokyo}"),
+            "region_unknown=1".to_owned(),
+            // 国と地域・地域不明の同時、国と区分の同時、区分どうし
+            format!("country={japan}&region={tokyo}&region_unknown=1"),
+            "unclassified=1&no_location=1".to_owned(),
+            format!("country={japan}&unclassified=1"),
+            format!("country={japan}&no_location=1"),
+            "unclassified=1&region_unknown=1".to_owned(),
+            // 別の国の地域
+            format!("country={japan}&region={fr_region}"),
+            format!("country=ne:FRA&region={tokyo}"),
+            format!("country=ne:ZZZ&region={tokyo}"),
+            // 旧形式との混用
+            format!("country={japan}&pref=a"),
+            format!("country={japan}&abroad=1"),
+            "unclassified=1&pref=a".to_owned(),
+            "no_location=1&abroad=1".to_owned(),
+            "unclassified=1&city=a".to_owned(),
+            // 新形式の `city` は日本の地域のときだけ
+            format!("country={japan}&city=x"),
+            format!("country={japan}&region_unknown=1&city=x"),
+            format!("country=ne:FRA&region={fr_region}&city=x"),
+            "country=ne:FRA&city=x".to_owned(),
+            format!("country={japan}&region=unknown-id&city=x"),
+            // ID の文法
+            "country=ne%3BFRA".to_owned(),
+            format!("country={}", "a".repeat(65)),
+            "country=%E6%97%A5%E6%9C%AC".to_owned(),
+            format!("country={japan}&region=a%20b"),
+            // 旗は 0/1 だけ
+            "unclassified=2".to_owned(),
+            "no_location=true".to_owned(),
+            format!("country={japan}&region_unknown=yes"),
+            // 64 文字を超える `city`
+            format!("country={japan}&region={tokyo}&city={}", "あ".repeat(65)),
+        ] {
+            assert!(ok(&query).is_none(), "{query}");
+        }
+        // 都道府県名は名称表のもの、市区町村はバインドされる
+        let f = ok(&format!("country={japan}&region={tokyo}&city=x")).unwrap();
+        assert!(f.params.contains(&Sql::Text("東京都".to_owned())));
+        assert!(f.params.contains(&Sql::Text("x".to_owned())));
+        assert!(f.conditions.iter().all(|c| !c.contains("'x'")));
     }
 }

@@ -21,7 +21,7 @@ pub mod stage;
 pub mod table;
 
 pub use index::{Classification, InvalidCoordinate, Method, RegionIndex};
-pub use rules::PlaceRules;
+pub use rules::{PlaceRules, SEARCH_LIKE_PARAMS, pref_region};
 pub use search::{classifier_version, search_text};
 pub use stage::Regions;
 pub use table::{

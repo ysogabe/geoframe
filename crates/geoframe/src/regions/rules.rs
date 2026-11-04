@@ -40,6 +40,13 @@ pub struct PlaceRules {
     pub unclassified: String,
     /// 検索用の文字列。`pref` のある写真は日本と都道府県の別名、それ以外は有効な分類の `search_text`（無ければ空）。
     pub search: String,
+    /// `{search} LIKE ? ESCAPE '\'` と同じ意味の、1 語ぶんの検索条件。`?` を [`SEARCH_LIKE_PARAMS`] 個持ち、**同じパターンを
+    /// 全部にバインドする**。`pm`・`r` を結合せず（`photos p` だけで使える）、写真ごとに長い文字列を舐めない:
+    /// 47 都道府県の別名（`pm_search`）を `LIKE` で一度だけ照合して `p.pref IN (…)` で引き、`pref` の無い写真は
+    /// 分類の `search_text` に一致する写真の ID の集合（一度だけ作る）に入るかを見て、入るときだけ有効な分類かを確かめる
+    /// （1 万件の `COUNT(*)` を `search` の `LIKE` と `r` の結合で数えると約 3.8ms、この条件だと約 2.3ms。変更前の 5 列だけでは約 1.4ms）。
+    /// 同値性は試験で確かめる。
+    pub search_like: String,
     /// `pref` が空の写真だけを扱う文では、これを使う（都道府県の対応表 `pm` を結合しない）。
     pub outside_pref: OutsidePref,
 }
@@ -57,6 +64,9 @@ pub struct OutsidePref {
     /// 規則 2: 座標が無効（`no_location`）。
     pub no_location: String,
 }
+
+/// [`PlaceRules::search_like`] の `?` の数。
+pub const SEARCH_LIKE_PARAMS: usize = 3;
 
 /// `pref` が空でない（既存の `ABROAD` の否定。`NULL`・空文字だけが空）。
 const HAS_PREF: &str = "(p.pref IS NOT NULL AND p.pref <> '')";
@@ -102,6 +112,26 @@ impl PlaceRules {
             "(CASE WHEN {HAS_PREF} THEN COALESCE(pm.pm_search, {japan_search}) \
              ELSE COALESCE(r.search_text, '') END)"
         );
+        // 1 語ぶんの検索条件。`pref` が 47 件にあれば都道府県の別名（`pm_search`）、無ければ日本の別名だけ、
+        // `pref` が空なら有効な分類の `search_text`（`search` の CASE と同じ分岐）。分類の表が無い DB では、
+        // 分類の分は偽（`?` の数をそろえるため、使わない `?` を置く）
+        let like = "LIKE ? ESCAPE '\\'";
+        let classified = if classification_available {
+            format!(
+                "p.id IN (SELECT sr.photo_id FROM photo_regions sr WHERE sr.search_text {like}) \
+                 AND EXISTS (SELECT 1 FROM photo_regions sr WHERE {})",
+                table::valid_on("p", "sr")
+            )
+        } else {
+            "0 AND ? IS NULL".to_owned()
+        };
+        let search_like = format!(
+            "(({HAS_PREF} AND (p.pref IN (SELECT pm_pref FROM {pm} WHERE pm_search {like}) \
+             OR (p.pref NOT IN ({names}) AND {japan_search} {like}))) \
+             OR (NOT {HAS_PREF} AND {classified}))",
+            pm = japan_prefectures_sql(),
+            names = japan_pref_names_sql(),
+        );
         Self {
             from,
             country,
@@ -110,9 +140,39 @@ impl PlaceRules {
             no_location,
             unclassified,
             search,
+            search_like,
             outside_pref,
         }
     }
+}
+
+/// 日本の `pref` の表記（名称表の 47 件）に対する日本の地域の ID。47 件に無い表記（表記揺れなど）は `None`
+/// （規則 1: 日本の地域不明）。SQL の式（`pm` の対応表）と同じ名称表から引く。
+pub fn pref_region(pref: &str) -> Option<&'static str> {
+    data::names()
+        .ok()?
+        .region_of_pref(pref)
+        .map(|r| r.id.as_str())
+}
+
+/// 47 都道府県の `pref` の表記を `'東京都','大阪府',…` と並べた文字列（`IN` の中身）。名称表を読めなければ `NULL`。
+fn japan_pref_names_sql() -> &'static str {
+    static CELL: OnceLock<String> = OnceLock::new();
+    CELL.get_or_init(|| {
+        let list: Vec<String> = data::names()
+            .map(|names| {
+                names
+                    .prefectures()
+                    .filter_map(|r| r.pref.as_deref().map(sql_text))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if list.is_empty() {
+            "NULL".to_owned()
+        } else {
+            list.join(",")
+        }
+    })
 }
 
 /// SQL の文字列リテラル（`'` は 2 つにする）。引数は同梱データ由来の定数だけで、利用者の入力は渡さない。
@@ -384,6 +444,109 @@ mod tests {
             got[1]
         );
         assert_eq!(got[2], "");
+    }
+
+    /// `search_like` は `search LIKE ?` と同じ写真に当たる（pref あり・47 件に無い pref・分類あり・分類なし・失敗・旧版・
+    /// 座標が違う行）。表の有無の両方で。
+    #[test]
+    fn search_like_matches_the_same_photos_as_the_search_expression() {
+        let version = super::super::classifier_version().unwrap();
+        let tokyo = data::names()
+            .unwrap()
+            .region_of_pref("東京都")
+            .unwrap()
+            .id
+            .clone();
+        let fr = search_text("ne:FRA", None).unwrap();
+        let fr_region = data::names()
+            .unwrap()
+            .regions
+            .iter()
+            .find(|r| r.country.as_deref() == Some("ne:FRA"))
+            .unwrap()
+            .id
+            .clone();
+        let fr_a = search_text("ne:FRA", Some(&fr_region)).unwrap();
+        let jp_tokyo = search_text(JAPAN_ID, Some(&tokyo)).unwrap();
+        let photos = "INSERT INTO photos VALUES
+            (1, 35.0, 139.0, '東京都', 'A'), (2, NULL, NULL, '大阪府', 'A'), (3, 35.0, 139.0, '架空県', 'A'),
+            (4, NULL, NULL, NULL, NULL), (5, 48.0, 2.0, NULL, NULL), (6, 48.0, 2.0, '', NULL),
+            (7, 36.0, 139.0, NULL, NULL), (8, 3.0, 3.0, NULL, NULL), (9, 4.0, 4.0, NULL, NULL),
+            (10, 5.0, 5.0, NULL, NULL), (11, 6.0, 6.0, NULL, NULL), (12, 48.0, 2.0, '東京都', NULL)";
+        let regions = format!(
+            "INSERT INTO photo_regions VALUES
+            (5, 48.0, 2.0, '{version}', 'ne:FRA', '{fr_region}', '{fr_a}', 'inside', 'inside', 't'),
+            (6, 48.0, 2.0, '{version}', 'ne:FRA', NULL, '{fr}', 'inside', 'outside', 't'),
+            (7, 36.0, 139.0, '{version}', 'ne:JPN', '{tokyo}', '{jp_tokyo}', 'inside', 'inside', 't'),
+            (8, 3.0, 3.0, '{version}', NULL, NULL, '', 'failed', 'failed', 't'),
+            (9, 4.0, 4.0, 'old', 'ne:FRA', NULL, '{fr}', 'inside', 'outside', 't'),
+            (10, 6.0, 6.0, '{version}', 'ne:FRA', NULL, '{fr}', 'inside', 'outside', 't'),
+            (11, 6.0, 6.0, '{version}', NULL, NULL, '', 'outside', 'outside', 't'),
+            (12, 48.0, 2.0, '{version}', 'ne:FRA', NULL, '{fr}', 'inside', 'outside', 't')"
+        );
+        for with_table in [true, false] {
+            let conn = memory(photos, &regions, with_table);
+            let rules = PlaceRules::new(with_table);
+            let ids = |condition: &str, from: &str, pattern: &str| -> Vec<i64> {
+                conn.prepare(&format!(
+                    "SELECT p.id FROM {from} WHERE {condition} ORDER BY p.id"
+                ))
+                .unwrap()
+                .query_map(
+                    rusqlite::params_from_iter(vec![pattern; SEARCH_LIKE_PARAMS]),
+                    |row| row.get(0),
+                )
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+            };
+            for word in [
+                "Tokyo",
+                "東京",
+                "日本",
+                "Japan",
+                "Osaka",
+                "大阪",
+                "France",
+                "フランス",
+                "Île",
+                "架空",
+                "e",
+                "x",
+                "zzz",
+                "tokyo",
+                "TOKYO",
+            ] {
+                let pattern = format!("%{word}%");
+                let by_expression = conn
+                    .prepare(&format!(
+                        "SELECT p.id FROM {} WHERE {} LIKE ?1 ESCAPE '\\' ORDER BY p.id",
+                        rules.from, rules.search
+                    ))
+                    .unwrap()
+                    .query_map([&pattern], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                // 何も結合しない `photos p` だけでよい
+                let by_condition = ids(&rules.search_like, "photos p", &pattern);
+                assert_eq!(by_condition, by_expression, "{word} table={with_table}");
+                // 結合していても同じ
+                assert_eq!(
+                    ids(&rules.search_like, &rules.outside_pref.from, &pattern),
+                    by_expression,
+                    "{word} table={with_table} (r)"
+                );
+                assert_eq!(
+                    ids(&rules.search_like, &rules.from, &pattern),
+                    by_expression,
+                    "{word} table={with_table} (pm)"
+                );
+            }
+            // 日本の語は pref のある写真（47 件に無い pref も）に当たる
+            let japan = ids(&rules.search_like, &rules.from, "%Japan%");
+            assert!(japan.contains(&1) && japan.contains(&3) && japan.contains(&12));
+        }
     }
 
     #[test]

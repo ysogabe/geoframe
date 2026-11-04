@@ -739,11 +739,13 @@ async fn library_photo_has_the_documented_keys_and_values() {
     .into_iter()
     .collect();
     for item in body["items"].as_array().unwrap() {
+        // 国が決まる写真には、任意の `location_region` が付く（段②。ここでは他のキーだけを確かめる）
         let have: BTreeSet<&str> = item
             .as_object()
             .unwrap()
             .keys()
             .map(String::as_str)
+            .filter(|k| *k != "location_region")
             .collect();
         assert_eq!(have, keys, "id {}", item["id"]);
     }

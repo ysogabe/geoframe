@@ -1,4 +1,5 @@
-//! `GET /api/admin/library/places` の国・地域別の集計（docs/international-places/design.md「管理API」）の結合テスト。
+//! `GET /api/admin/library/places` の国・地域別の集計と、`photos` の絞り込み・文字検索・`location_region`、`trips` の国・地域
+//! （docs/international-places/design.md「管理API」）の結合テスト。
 //!
 //! 合成データだけ（実際の撮影座標を使わない）。国・地域の ID は同梱の名称表のもの。`photo_regions` の行は現行の分類版で
 //! 直接入れる（分類段は通さない）。期待値は下のコメントの構成から数えた値で、実装の出力を写していない。
@@ -50,6 +51,33 @@ impl Server {
         let body = response.json();
         assert_eq!(body["ok"], true, "{target}");
         body
+    }
+
+    async fn get_ok(&self, path: &str, query: &str) -> Value {
+        let target = format!("{path}{query}");
+        let response = get(self.addr, &target).await;
+        assert_eq!(response.status, 200, "{target}");
+        let body = response.json();
+        assert_eq!(body["ok"], true, "{target}");
+        body
+    }
+
+    /// `photos`（`per=200` で 1 ページに全部入れる）。
+    async fn photos(&self, query: &str) -> Value {
+        self.get_ok(
+            "/api/admin/library/photos",
+            &format!("?per=200&{}", query.trim_start_matches(['?', '&'])),
+        )
+        .await
+    }
+
+    async fn trips(&self, query: &str) -> Value {
+        self.get_ok("/api/admin/library/trips", query).await
+    }
+
+    /// 状態だけ（400 などの確認）。
+    async fn status(&self, path: &str, query: &str) -> u16 {
+        get(self.addr, &format!("{path}{query}")).await.status
     }
 
     fn count(&self, sql: &str) -> i64 {
@@ -874,4 +902,920 @@ async fn old_prefs_and_abroad_are_what_they_were_before() {
         }
         assert_eq!(got, golden[query], "{query}");
     }
+}
+
+// ---------------------------------------------------------------- photos・trips（段②）
+
+/// クエリの値を `%XX` にする（ASCII 英数字と `-_.~:,+` 以外）。
+fn enc(query: &str) -> String {
+    query
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.~:,+=&".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+fn ids(body: &Value) -> Vec<i64> {
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["id"].as_i64().unwrap())
+        .collect()
+}
+
+fn sorted_ids(body: &Value) -> Vec<i64> {
+    let mut v = ids(body);
+    v.sort_unstable();
+    v
+}
+
+/// `location_region` を外した写真（変更前と同じ項目だけ）。
+fn without_location_region(item: &Value) -> Value {
+    let mut item = item.clone();
+    item.as_object_mut().unwrap().remove("location_region");
+    item
+}
+
+/// 変更前の `photos` が上の合成データに返した結果（旧形式のクエリ。`total`・`pages`・ID の並び、一部は項目全体）。AC2 を、
+/// 変更後も同じ値で確かめる。固定値は変更前の実装（段②の前のコミット）の出力で、新しい実装の出力を写していない。
+const LEGACY_PHOTO_QUERIES: [&str; 19] = [
+    "pref=東京都",
+    "pref=東京都&city=市1",
+    "city=市1",
+    "city=市0&hidden=1",
+    "abroad=1",
+    "abroad=1&hidden=1",
+    "pref=架空県",
+    "pref=東京都&from=2025-04-02+00:00&to=2025-04-06+23:59",
+    "abroad=1&bbox=-10,40,10,50",
+    "pref=大阪府&bbox=-180,-90,180,90",
+    "q=東京",
+    "q=市1",
+    "q=P1",
+    "q=2025-05",
+    "q=東京+市1",
+    "untimed=1",
+    "ids=1,9,11,31&hidden=1",
+    "from=2025-05-01+00:00&to=2025-06-30+23:59",
+    "q=東京&abroad=1",
+];
+/// 項目全体も固定する旧形式のクエリ。
+const LEGACY_FULL_ITEMS: [&str; 2] = ["pref=東京都&city=市1", "ids=1,9,11,31&hidden=1"];
+
+#[tokio::test]
+async fn legacy_photo_queries_return_what_they_returned_before() {
+    let f = fixture();
+    let golden: Value =
+        serde_json::from_str(include_str!("fixtures/photos-old-golden.json")).unwrap();
+    // 表がある DB と、旧 DB（表なし）の両方で、旧形式の結果は同じ
+    let photos_only: String = f
+        .sql
+        .lines()
+        .filter(|l| !l.contains("photo_regions"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for with_table in [true, false] {
+        let server = Server::start(
+            &[],
+            with_table,
+            if with_table { &f.sql } else { &photos_only },
+        )
+        .await;
+        for query in LEGACY_PHOTO_QUERIES {
+            let body = server.photos(&enc(query)).await;
+            let mut got =
+                json!({"total": body["total"], "pages": body["pages"], "ids": ids(&body)});
+            if LEGACY_FULL_ITEMS.contains(&query) {
+                got["items"] = Value::Array(
+                    body["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(without_location_region)
+                        .collect(),
+                );
+            }
+            if std::env::var("PLACES_DUMP_GOLDEN").is_ok() {
+                println!("GOLDEN\tphotos\t{query}\t{got}");
+                continue;
+            }
+            assert_eq!(got, golden[query], "{query} table={with_table}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn trips_keep_their_old_fields_and_places() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    let golden: Value =
+        serde_json::from_str(include_str!("fixtures/trips-old-golden.json")).unwrap();
+    for query in ["", "?hidden=1"] {
+        let mut body = server.trips(query).await;
+        for trip in body["trips"].as_array_mut().unwrap() {
+            trip.as_object_mut().unwrap().remove("regions");
+        }
+        if std::env::var("PLACES_DUMP_GOLDEN").is_ok() {
+            println!("GOLDEN\ttrips\t{query}\t{body}");
+            continue;
+        }
+        assert_eq!(body, golden[query], "{query}");
+    }
+}
+
+const PHOTOS: &str = "/api/admin/library/photos";
+
+#[tokio::test]
+async fn the_new_form_selects_countries_regions_and_the_unknowns() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    let sel = |query: String| {
+        let server = &server;
+        async move { sorted_ids(&server.photos(&query).await) }
+    };
+    let (tokyo, fr_a, fr_b) = (&f.tokyo, &f.fr_a, &f.fr_b);
+    // 日本: pref の写真（1〜7。8 は除外）と境界データの 9・10
+    assert_eq!(
+        sel("country=ne:JPN".into()).await,
+        [1, 2, 3, 4, 5, 6, 7, 9, 10]
+    );
+    assert_eq!(
+        sel("country=ne:JPN&hidden=1".into()).await,
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    );
+    // 東京都: pref の 1・2・3・5・6（座標なしの 6 も）と境界データの 9
+    assert_eq!(
+        sel(format!("country=ne:JPN&region={tokyo}")).await,
+        [1, 2, 3, 5, 6, 9]
+    );
+    // 日本の地域不明: 47 件に無い pref の 7 と、国だけ決まった 10
+    assert_eq!(sel("country=ne:JPN&region_unknown=1".into()).await, [7, 10]);
+    // 日本の市区町村: pref = 東京都 AND city = 市1（奇数の ID）
+    assert_eq!(
+        sel(enc(&format!("country=ne:JPN&region={tokyo}&city=市1"))).await,
+        [1, 3, 5]
+    );
+    assert_eq!(
+        sel(enc(&format!("country=ne:JPN&region={tokyo}&city=市0"))).await,
+        [2, 6]
+    );
+    // 市区町村は境界データの写真（city なし）には当たらない
+    assert!(
+        sel(enc(&format!("country=ne:JPN&region={tokyo}&city=")))
+            .await
+            .len()
+            >= 5
+    );
+    // フランス（15 は除外）
+    assert_eq!(sel("country=ne:FRA".into()).await, [11, 12, 13, 14]);
+    assert_eq!(
+        sel("country=ne:FRA&hidden=1".into()).await,
+        [11, 12, 13, 14, 15]
+    );
+    assert_eq!(sel(format!("country=ne:FRA&region={fr_a}")).await, [11, 12]);
+    assert_eq!(sel(format!("country=ne:FRA&region={fr_b}")).await, [13]);
+    assert_eq!(sel("country=ne:FRA&region_unknown=1".into()).await, [14]);
+    // 同名の地域は国で分かれる
+    assert_eq!(
+        sel(format!("country=ne:ARG&region={}", f.la_rioja_ar)).await,
+        [16]
+    );
+    assert_eq!(
+        sel(format!("country=ne:ESP&region={}", f.la_rioja_es)).await,
+        [17, 18]
+    );
+    assert_eq!(sel("country=ne:ESP".into()).await, [17, 18]);
+    // 日付変更線をまたぐフィジーと、地域不明だけのロシア
+    assert_eq!(sel("country=ne:FJI".into()).await, [19, 20]);
+    assert_eq!(
+        sel(format!("country=ne:FJI&region={}", f.fiji)).await,
+        [19, 20]
+    );
+    assert_eq!(sel("country=ne:RUS".into()).await, [21, 22, 23, 24]);
+    assert_eq!(
+        sel("country=ne:RUS&region_unknown=1".into()).await,
+        [21, 22, 23, 24]
+    );
+    // 未判定: 25 区域外・26 競合・27 処理待ち・28 失敗・29 古い版・30 座標が違う行
+    assert_eq!(sel("unclassified=1".into()).await, [25, 26, 27, 28, 29, 30]);
+    // 場所不明: 31 座標なし・32 緯度なし・33 緯度 95・34 緯度が文字列
+    assert_eq!(sel("no_location=1".into()).await, [31, 32, 33, 34]);
+    // 期間・範囲・除外と組み合わせる
+    assert_eq!(
+        sel("country=ne:FRA&bbox=-10,40,10,50&from=2025-05-02+00:00".into()).await,
+        [12, 13, 14]
+    );
+    // 範囲は両端を含む（27 は (2, 2)）
+    assert_eq!(
+        sel("unclassified=1&bbox=-1,-1,2,2".into()).await,
+        [25, 26, 27]
+    );
+    assert_eq!(
+        sel("no_location=1&bbox=-180,-90,180,90".into()).await,
+        [] as [i64; 0]
+    );
+    // 旗の 0 は無いのと同じ
+    assert_eq!(
+        sel("country=ne:FRA&unclassified=0&no_location=0&region_unknown=0".into()).await,
+        [11, 12, 13, 14]
+    );
+    // 文法が正しい未知の ID は 0 件（400 にしない）
+    for query in [
+        "country=ne:ZZZ".to_owned(),
+        "country=ne:FRA&region=ne:FRA-ZZZ".to_owned(),
+        "country=ne:ZZZ&region_unknown=1".to_owned(),
+        format!("country=ne:JPN&region={tokyo}&city=存在しない市"),
+        format!("country=a{}", "b".repeat(63)),
+    ] {
+        let body = server.photos(&enc(&query)).await;
+        assert_eq!(body["total"], 0, "{query}");
+        assert_eq!(body["items"], json!([]), "{query}");
+    }
+    // ページング: 日本の 9 枚を 4 枚ずつ（撮影日時の順）
+    let page = server.get_ok(PHOTOS, "?country=ne:JPN&per=4&page=2").await;
+    assert_eq!(
+        (
+            page["total"].as_i64(),
+            page["pages"].as_i64(),
+            page["page"].as_i64()
+        ),
+        (Some(9), Some(3), Some(2))
+    );
+    assert_eq!(ids(&page), [5, 6, 7, 9]);
+}
+
+#[tokio::test]
+async fn bad_place_queries_are_rejected_without_echoing_the_value() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    let (tokyo, fr_a) = (&f.tokyo, &f.fr_a);
+    let long = "a".repeat(65);
+    let bad = [
+        // 地域だけ・地域不明だけ
+        format!("region={tokyo}"),
+        "region_unknown=1".to_owned(),
+        // 国と地域・地域不明の同時
+        format!("country=ne:JPN&region={tokyo}&region_unknown=1"),
+        // 区分どうし・国と区分
+        "unclassified=1&no_location=1".to_owned(),
+        "country=ne:JPN&unclassified=1".to_owned(),
+        "country=ne:JPN&no_location=1".to_owned(),
+        "unclassified=1&region_unknown=1".to_owned(),
+        // 別の国の地域
+        format!("country=ne:JPN&region={fr_a}"),
+        format!("country=ne:FRA&region={tokyo}"),
+        format!("country=ne:ESP&region={}", f.la_rioja_ar),
+        // 旧形式との混用
+        "country=ne:JPN&pref=東京都".to_owned(),
+        "country=ne:JPN&abroad=1".to_owned(),
+        "unclassified=1&pref=東京都".to_owned(),
+        "no_location=1&abroad=1".to_owned(),
+        "unclassified=1&city=市1".to_owned(),
+        format!("region={tokyo}&pref=東京都"),
+        // 新形式の city は日本の地域のときだけ
+        "country=ne:JPN&city=市1".to_owned(),
+        "country=ne:JPN&region_unknown=1&city=市1".to_owned(),
+        format!("country=ne:FRA&region={fr_a}&city=市1"),
+        "country=ne:FRA&city=市1".to_owned(),
+        "country=ne:JPN&region=ne:JPN-ZZZ&city=市1".to_owned(),
+        // ID の文法
+        "country=ne;FRA".to_owned(),
+        "country=ne:FRA'--".to_owned(),
+        "country=日本".to_owned(),
+        format!("country={long}"),
+        format!("country=ne:JPN&region={long}"),
+        "country=ne:JPN&region=a b".to_owned(),
+        // 旗は 0/1 だけ
+        "unclassified=2".to_owned(),
+        "no_location=true".to_owned(),
+        "country=ne:JPN&region_unknown=yes".to_owned(),
+        // 市区町村の長さ
+        format!("country=ne:JPN&region={tokyo}&city={}", "あ".repeat(65)),
+        // 期間・範囲の形
+        "country=ne:JPN&from=bad".to_owned(),
+        "country=ne:JPN&bbox=1,2,3".to_owned(),
+    ];
+    for query in bad {
+        let response = get(server.addr, &format!("{PHOTOS}?{}", enc(&query))).await;
+        assert_eq!(response.status, 400, "{query}");
+        assert_eq!(response.json()["error"], "bad_params", "{query}");
+        // 値を応答に出さない
+        assert!(!response.text().contains("ne:"), "{query}");
+    }
+    // 旧形式の混用（変更前から 400）
+    for query in ["abroad=1&pref=東京都", "abroad=1&city=市1"] {
+        assert_eq!(
+            server.status(PHOTOS, &format!("?{}", enc(query))).await,
+            400,
+            "{query}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn each_selection_returns_as_many_photos_as_places_counts() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    // places と photos に同じ期間・範囲・除外を掛けて、区分ごとの件数が一致する（AC5）
+    for query in [
+        "",
+        "hidden=1",
+        "from=2025-05-01+00:00&to=2025-06-30+23:59",
+        "bbox=-10,40,10,50",
+        "bbox=-180,-90,180,90&hidden=1&from=2025-04-01+00:00",
+        "bbox=100,20,150,50",
+        "from=2025-07-01+00:00&to=2025-08-31+23:59&hidden=1",
+    ] {
+        let places = server.ok(&format!("?{query}")).await;
+        let mut checked = 0;
+        let total = |selection: String| {
+            let server = &server;
+            let query = query.to_owned();
+            async move {
+                let body = server.photos(&format!("{selection}&{query}")).await;
+                // total と実際に返る枚数が合う（per=200 で 1 ページに収まる）
+                assert_eq!(
+                    body["total"].as_u64(),
+                    Some(ids(&body).len() as u64),
+                    "{selection} {query}"
+                );
+                body["total"].as_i64().unwrap()
+            }
+        };
+        for c in places["countries"].as_array().unwrap() {
+            let id = c["id"].as_str().unwrap();
+            assert_eq!(
+                total(format!("country={id}")).await,
+                c["count"],
+                "{query} {id}"
+            );
+            for r in c["regions"].as_array().unwrap() {
+                let rid = r["id"].as_str().unwrap();
+                assert_eq!(
+                    total(format!("country={id}&region={rid}")).await,
+                    r["count"],
+                    "{query} {id} {rid}"
+                );
+                checked += 1;
+            }
+            assert_eq!(
+                total(format!("country={id}&region_unknown=1")).await,
+                c["region_unknown"]["count"],
+                "{query} {id} 地域不明"
+            );
+            checked += 1;
+        }
+        assert_eq!(
+            total("unclassified=1".into()).await,
+            places["unknown"]["unclassified"]["count"],
+            "{query} 未判定"
+        );
+        assert_eq!(
+            total("no_location=1".into()).await,
+            places["unknown"]["no_location"]["count"],
+            "{query} 場所不明"
+        );
+        // 旧形式の `abroad`（pref が空）は、新しい区分では「pref の無い国 + 未判定 + 場所不明」
+        assert!(
+            checked > 0 || places["countries"].as_array().unwrap().is_empty(),
+            "{query}"
+        );
+    }
+    // 日本の地域の件数 − boundary_only = 旧形式の `pref` の件数
+    let places = server.ok("").await;
+    let japan = country(&places, "ne:JPN");
+    for r in japan["regions"].as_array().unwrap() {
+        let Some(pref) = r["pref"].as_str() else {
+            continue;
+        };
+        let old = server.photos(&enc(&format!("pref={pref}"))).await;
+        assert_eq!(
+            r["count"].as_i64().unwrap() - r["boundary_only"].as_i64().unwrap(),
+            old["total"].as_i64().unwrap(),
+            "{pref}"
+        );
+    }
+}
+
+/// 分類行の検索用文字列を、同梱の名称表から入れる（本物の分類段が書く値）。無効な行（29・30）にも入れて、有効性で外れることを確かめる。
+fn fill_search_text(conn: &rusqlite::Connection) {
+    let rows: Vec<(i64, Option<String>, Option<String>)> = conn
+        .prepare("SELECT photo_id, country_id, region_id FROM photo_regions")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for (id, country, region) in rows {
+        if let Some(country) = country {
+            let text = geoframe::regions::search_text(&country, region.as_deref()).unwrap();
+            conn.execute(
+                "UPDATE photo_regions SET search_text=?1 WHERE photo_id=?2",
+                rusqlite::params![text, id],
+            )
+            .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn q_finds_countries_and_regions_by_japanese_english_and_original_names() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    fill_search_text(&server.writer);
+    let q = |query: &str| {
+        let server = &server;
+        let query = enc(&format!("q={query}"));
+        async move { sorted_ids(&server.photos(&query).await) }
+    };
+    let france = names().country("ne:FRA").unwrap();
+    let region_a = names().region(&f.fr_a).unwrap();
+    // 国: 日本語・英語・別名のどれでも。有効な分類の写真だけ（29 の旧版・30 の座標違いは外れる。15 は除外）
+    for alias in &france.search {
+        assert_eq!(q(alias).await, [11, 12, 13, 14], "{alias}");
+    }
+    assert_eq!(q("フランス").await, [11, 12, 13, 14]);
+    assert_eq!(
+        q("france").await,
+        [11, 12, 13, 14],
+        "大文字小文字を区別しない"
+    );
+    // 地域: 日本語・英語・原表記
+    for alias in &region_a.search {
+        let got = q(alias).await;
+        assert!(got.contains(&11) && got.contains(&12), "{alias}: {got:?}");
+        assert!(!got.contains(&29) && !got.contains(&30), "{alias}: {got:?}");
+    }
+    // 日本: pref の写真（1〜7。47 件に無い pref の 7 も）と、境界データの 9・10 が「日本」「Japan」で当たる
+    let all_japan = [1, 2, 3, 4, 5, 6, 7, 9, 10];
+    assert_eq!(q("日本").await, all_japan);
+    assert_eq!(q("Japan").await, all_japan);
+    // 都道府県は pref の写真も境界データの写真も、日本語・英語・原表記で当たる
+    let tokyo = names().region(&f.tokyo).unwrap();
+    for alias in &tokyo.search {
+        assert_eq!(q(alias).await, [1, 2, 3, 5, 6, 9], "{alias}");
+    }
+    assert_eq!(q("Tokyo").await, [1, 2, 3, 5, 6, 9]);
+    assert_eq!(q("大阪府").await, [4]);
+    // 語は AND（日本の写真のうち東京）
+    assert_eq!(q("日本 Tokyo").await, [1, 2, 3, 5, 6, 9]);
+    assert_eq!(q("日本　フランス").await, [] as [i64; 0]);
+    // 既存の列（市区町村・ファイル名・撮影日時）も引き続き当たる
+    assert_eq!(q("市1").await, [1, 3, 5, 7]);
+    assert_eq!(q("P11").await, [11]);
+    assert_eq!(q("2025-05").await, [11, 12, 13, 14]);
+    // 除外は hidden=1 のときだけ
+    assert_eq!(
+        sorted_ids(&server.photos(&enc("q=フランス&hidden=1")).await),
+        [11, 12, 13, 14, 15]
+    );
+    // 国・地域の絞り込みと組み合わせる
+    assert_eq!(
+        sorted_ids(
+            &server
+                .photos(&enc("q=Tokyo&country=ne:JPN&region_unknown=1"))
+                .await
+        ),
+        [] as [i64; 0]
+    );
+    assert_eq!(
+        sorted_ids(&server.photos(&enc("q=日本&unclassified=1")).await),
+        [] as [i64; 0]
+    );
+    // LIKE の記号は文字として扱う
+    assert_eq!(q("%").await, [] as [i64; 0]);
+    assert_eq!(q("_").await, [] as [i64; 0]);
+}
+
+/// 国名と地域名の両方に一致する語でも、写真は 1 回だけ返る（JOIN が行を増やさない）。
+#[tokio::test]
+async fn a_word_matching_both_the_country_and_the_region_returns_the_photo_once() {
+    let f = fixture();
+    // 西オーストラリア州の写真（国名も地域名も「オーストラリア」「Australia」を含む）
+    let version = geoframe::regions::classifier_version().unwrap();
+    let mut sql = f.sql.clone();
+    sql += "BEGIN;\n";
+    sql += &photo(101, Some("2025-09-01 10:00"), "-31.9", "115.8", None, 0);
+    sql += &photo(102, Some("2025-09-02 10:00"), "-33.9", "151.2", None, 0);
+    sql += &class_row(
+        101,
+        "-31.9",
+        "115.8",
+        version,
+        Some("ne:AUS"),
+        Some("ne:AUS-2651"),
+        ("inside", "inside"),
+    );
+    sql += &class_row(
+        102,
+        "-33.9",
+        "151.2",
+        version,
+        Some("ne:AUS"),
+        None,
+        ("inside", "outside"),
+    );
+    sql += "COMMIT;\n";
+    let server = Server::start(&[], true, &sql).await;
+    fill_search_text(&server.writer);
+    let country = names().country("ne:AUS").unwrap();
+    let region = names().region("ne:AUS-2651").unwrap();
+    for word in ["Australia", "オーストラリア", "australia", "tralia"] {
+        assert!(
+            country
+                .search
+                .iter()
+                .any(|s| s.to_lowercase().contains(&word.to_lowercase()))
+                || word == "tralia"
+        );
+        assert!(
+            region
+                .search
+                .iter()
+                .any(|s| s.to_lowercase().contains(&word.to_lowercase()))
+                || word == "tralia"
+        );
+        let body = server.photos(&enc(&format!("q={word}"))).await;
+        // 101（国名も地域名も当たる）と 102（国名だけ）が 1 回ずつ
+        assert_eq!(ids(&body), [101, 102], "{word}");
+        assert_eq!(body["total"], 2, "{word}");
+        let body = server
+            .photos(&enc(&format!("q={word}&country=ne:AUS")))
+            .await;
+        assert_eq!(ids(&body), [101, 102], "{word}");
+        assert_eq!(body["total"], 2, "{word}");
+    }
+    // 地域名だけに当たる語は、その地域の写真だけ
+    let body = server.photos(&enc("q=Western")).await;
+    assert_eq!(ids(&body), [101]);
+}
+
+#[tokio::test]
+async fn an_old_database_without_the_table_still_searches_and_filters() {
+    let f = fixture();
+    let photos_only: String = f
+        .sql
+        .lines()
+        .filter(|l| !l.contains("photo_regions"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    for env in [&[("GEOFRAME_INGEST", "0")][..], &[][..]] {
+        let server = Server::start(env, false, &photos_only).await;
+        let q = |query: &str| {
+            let server = &server;
+            let query = enc(&format!("q={query}"));
+            async move { sorted_ids(&server.photos(&query).await) }
+        };
+        // pref の写真は日本・都道府県で当たる。分類が無い写真は国名で当たらない
+        assert_eq!(q("日本").await, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(q("Tokyo").await, [1, 2, 3, 5, 6]);
+        assert_eq!(q("フランス").await, [] as [i64; 0]);
+        assert_eq!(q("P11").await, [11]);
+        let sel = |query: &str| {
+            let server = &server;
+            let query = query.to_owned();
+            async move { sorted_ids(&server.photos(&enc(&query)).await) }
+        };
+        assert_eq!(sel("country=ne:JPN").await, [1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(sel("country=ne:FRA").await, [] as [i64; 0]);
+        // pref が空で座標が有効な写真（除外の 15 を除く）は、すべて未判定
+        assert_eq!(
+            sel("unclassified=1").await,
+            (9..=30).filter(|id| *id != 15).collect::<Vec<i64>>()
+        );
+        assert_eq!(sel("no_location=1").await, [31, 32, 33, 34]);
+        // 表は作られない
+        assert_eq!(
+            server.count("SELECT COUNT(*) FROM sqlite_master WHERE name='photo_regions'"),
+            0
+        );
+        // location_region は pref の写真だけ
+        let body = server.photos("ids=1,11").await;
+        assert_eq!(body["items"][0]["location_region"]["country_id"], "ne:JPN");
+        assert!(body["items"][1].get("location_region").is_none());
+        // trips も動く
+        let trips = server.trips("").await;
+        assert!(!trips["trips"].as_array().unwrap().is_empty());
+    }
+}
+
+fn location_of(body: &Value, id: i64) -> Option<&Value> {
+    body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == id)
+        .unwrap_or_else(|| panic!("写真 {id} が無い"))
+        .get("location_region")
+}
+
+#[tokio::test]
+async fn location_region_describes_pref_and_boundary_classifications_and_hides_the_rest() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    // 吹き出しは `photos?ids=` で同じ項目を読む
+    let body = server
+        .photos("ids=1,6,7,9,10,11,14,16,25,26,27,28,29,30,31,32,33,34&hidden=1")
+        .await;
+    let tokyo_name = &names().region(&f.tokyo).unwrap().name;
+    // pref の写真: 国=日本、地域=その都道府県（地域 ID は対応表の ID）、判定方法 pref。座標が無い 6 も
+    for id in [1, 6] {
+        assert_eq!(
+            location_of(&body, id).unwrap(),
+            &json!({
+                "country_id": "ne:JPN", "country": "日本",
+                "region_id": f.tokyo, "region": tokyo_name,
+                "method": "pref", "label": format!("日本・{tokyo_name}"),
+            }),
+            "{id}"
+        );
+    }
+    // 47 件に無い pref: 日本、地域は不明
+    assert_eq!(
+        location_of(&body, 7).unwrap(),
+        &json!({
+            "country_id": "ne:JPN", "country": "日本", "region_id": null, "region": null,
+            "method": "pref", "label": "日本",
+        })
+    );
+    // 境界データの分類: 判定方法 inside。日本の地域は pref の写真と同じ ID
+    assert_eq!(
+        location_of(&body, 9).unwrap(),
+        &json!({
+            "country_id": "ne:JPN", "country": "日本",
+            "region_id": f.tokyo, "region": tokyo_name,
+            "method": "inside", "label": format!("日本・{tokyo_name}"),
+        })
+    );
+    assert_eq!(location_of(&body, 10).unwrap()["region_id"], Value::Null);
+    assert_eq!(location_of(&body, 10).unwrap()["method"], "inside");
+    let fr = names().country("ne:FRA").unwrap();
+    let a = names().region(&f.fr_a).unwrap();
+    assert_eq!(
+        location_of(&body, 11).unwrap(),
+        &json!({
+            "country_id": "ne:FRA", "country": fr.name,
+            "region_id": f.fr_a, "region": a.name,
+            "method": "inside", "label": format!("{}・{}", fr.name, a.name),
+        })
+    );
+    assert_eq!(
+        location_of(&body, 14).unwrap(),
+        &json!({
+            "country_id": "ne:FRA", "country": fr.name, "region_id": null, "region": null,
+            "method": "inside", "label": fr.name,
+        })
+    );
+    // 国が決まらない写真には付けない: 25 区域外・26 競合・27 処理待ち・28 失敗・29 古い版・30 座標違い、31〜34 場所不明
+    for id in [25, 26, 27, 28, 29, 30, 31, 32, 33, 34] {
+        assert!(location_of(&body, id).is_none(), "{id}");
+    }
+    // 分類版や入力座標は出さない
+    let text = serde_json::to_string(&body).unwrap();
+    for leaked in [
+        "classifier",
+        "input_lat",
+        "gf1-",
+        "country_method",
+        "search_text",
+    ] {
+        assert!(!text.contains(leaked), "{leaked}");
+    }
+    // 日本語以外の名前は ID でなく名称表の名前（同名の地域も国で区別できる）
+    let body = server.photos("ids=16,17").await;
+    assert_eq!(location_of(&body, 16).unwrap()["country_id"], "ne:ARG");
+    assert_eq!(location_of(&body, 17).unwrap()["country_id"], "ne:ESP");
+    assert_eq!(
+        location_of(&body, 16).unwrap()["region"],
+        location_of(&body, 17).unwrap()["region"]
+    );
+}
+
+#[tokio::test]
+async fn a_classification_stops_being_returned_when_the_coordinates_or_the_version_change() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    let located = |body: &Value, id| location_of(body, id).is_some();
+    let in_france = || async { sorted_ids(&server.photos("country=ne:FRA").await) };
+    assert!(located(&server.photos("ids=11,13").await, 11));
+    assert_eq!(in_france().await, [11, 12, 13, 14]);
+    // 座標が変わった写真（分類は古い座標のまま）→ 分類を返さず、未判定に入る
+    server
+        .writer
+        .execute("UPDATE photos SET lat=10.0, lon=10.0 WHERE id=11", [])
+        .unwrap();
+    let body = server.photos("ids=11,13").await;
+    assert!(!located(&body, 11));
+    assert!(located(&body, 13));
+    assert_eq!(in_france().await, [12, 13, 14]);
+    assert!(sorted_ids(&server.photos("unclassified=1").await).contains(&11));
+    // 座標が無効になった → 場所不明
+    server
+        .writer
+        .execute("UPDATE photos SET lat=95.0 WHERE id=12", [])
+        .unwrap();
+    assert!(!located(&server.photos("ids=12").await, 12));
+    assert!(sorted_ids(&server.photos("no_location=1").await).contains(&12));
+    // 分類版が今の同梱版でない行（再分類待ち）→ 返さない
+    server
+        .writer
+        .execute(
+            "UPDATE photo_regions SET classifier_version='gf0-old' WHERE photo_id=13",
+            [],
+        )
+        .unwrap();
+    assert!(!located(&server.photos("ids=13").await, 13));
+    assert_eq!(in_france().await, [14]);
+    // 判定できなかった印（failed）→ 返さない
+    server
+        .writer
+        .execute(
+            "UPDATE photo_regions SET country_method='failed', region_method='failed' WHERE photo_id=14",
+            [],
+        )
+        .unwrap();
+    assert!(!located(&server.photos("ids=14").await, 14));
+    assert_eq!(in_france().await, [] as [i64; 0]);
+    // pref の写真は座標が変わっても pref のまま（規則 1）
+    server
+        .writer
+        .execute("UPDATE photos SET lat=-10.0, lon=-10.0 WHERE id=1", [])
+        .unwrap();
+    assert_eq!(
+        location_of(&server.photos("ids=1").await, 1).unwrap()["method"],
+        "pref"
+    );
+    // places も同じ見え方（Σ国 + 未判定 + 場所不明 = 全体）
+    let places = server.ok("").await;
+    let sum: i64 = countries(&places).iter().map(|c| c.1).sum();
+    assert_eq!(
+        sum + places["unknown"]["unclassified"]["count"].as_i64().unwrap()
+            + places["unknown"]["no_location"]["count"].as_i64().unwrap(),
+        server.count("SELECT COUNT(*) FROM photos WHERE COALESCE(hidden,0)=0")
+    );
+}
+
+#[tokio::test]
+async fn trips_name_the_top_countries_and_regions_and_keep_the_old_places() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    let tokyo_name = names().region(&f.tokyo).unwrap().name.clone();
+    let osaka = names().region_of_pref("大阪府").unwrap();
+    let fr = names().country("ne:FRA").unwrap().name.clone();
+    let key = |t: &Value| {
+        t["regions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                (
+                    r["country_id"].as_str().unwrap().to_owned(),
+                    r["region_id"].as_str().map(str::to_owned),
+                    r["count"].as_i64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let body = server.trips("").await;
+    let by_start = |start: &str| {
+        body["trips"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["start"] == start)
+            .unwrap_or_else(|| panic!("{start} の旅が無い"))
+    };
+    // 4 月: 東京都 6（pref の 1・2・3・5・6 と境界データの 9）・日本の地域不明 2（7 と 10）・大阪府 1
+    let april = by_start("2025-04-01 10:00");
+    assert_eq!(
+        key(april),
+        [
+            ("ne:JPN".to_owned(), Some(f.tokyo.clone()), 6),
+            ("ne:JPN".to_owned(), None, 2),
+            ("ne:JPN".to_owned(), Some(osaka.id.clone()), 1),
+        ]
+    );
+    // 名前と表示用のラベル
+    assert_eq!(april["regions"][0]["country"], "日本");
+    assert_eq!(april["regions"][0]["region"], tokyo_name);
+    assert_eq!(april["regions"][0]["label"], format!("日本・{tokyo_name}"));
+    assert_eq!(april["regions"][1]["label"], "日本");
+    // 旧 pref/city の候補は変わらない（海外・不明は pref が空の 1 つにまとまる）
+    assert!(
+        april["places"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p.get("pref").is_some() && p.get("city").is_some())
+    );
+    // 5 月: フランス。地域 A が 2、地域 B と国だけが 1 ずつ（同数は地域不明が先）
+    let may = by_start("2025-05-01 09:00");
+    assert_eq!(
+        key(may),
+        [
+            ("ne:FRA".to_owned(), Some(f.fr_a.clone()), 2),
+            ("ne:FRA".to_owned(), None, 1),
+            ("ne:FRA".to_owned(), Some(f.fr_b.clone()), 1),
+        ]
+    );
+    assert_eq!(may["regions"][1]["label"], fr);
+    // 6 月: 同名の地域は国で分かれる（スペイン 2 が先）
+    let june = by_start("2025-06-01 09:00");
+    assert_eq!(
+        key(june),
+        [
+            ("ne:ESP".to_owned(), Some(f.la_rioja_es.clone()), 2),
+            ("ne:ARG".to_owned(), Some(f.la_rioja_ar.clone()), 1),
+        ]
+    );
+    // 7 月: ロシアの地域不明 4、フィジー 2
+    let july = by_start("2025-07-01 09:00");
+    assert_eq!(
+        key(july),
+        [
+            ("ne:RUS".to_owned(), None, 4),
+            ("ne:FJI".to_owned(), Some(f.fiji.clone()), 2),
+        ]
+    );
+    // 8 月: 未判定と場所不明だけ。国・地域の候補は無い（旧 pref/city の候補は従来どおり）
+    let august = by_start("2025-08-01 09:00");
+    assert_eq!(august["regions"], json!([]));
+    assert_eq!(
+        august["places"],
+        json!([{"pref": "", "city": "", "count": 9}])
+    );
+    // 除外を含めると、除外の写真（8: 東京都、15: フランス）も数える
+    let hidden = server.trips("?hidden=1").await;
+    let april = hidden["trips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["start"] == "2025-04-01 10:00")
+        .unwrap();
+    assert_eq!(
+        key(april)[0],
+        ("ne:JPN".to_owned(), Some(f.tokyo.clone()), 7)
+    );
+    // 表が無い DB: 日本（pref の写真）だけ
+    let photos_only: String = f
+        .sql
+        .lines()
+        .filter(|l| !l.contains("photo_regions"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let old = Server::start(&[], false, &photos_only).await;
+    let body = old.trips("").await;
+    let april = body["trips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["start"] == "2025-04-01 10:00")
+        .unwrap();
+    assert_eq!(
+        key(april),
+        [
+            ("ne:JPN".to_owned(), Some(f.tokyo.clone()), 5),
+            ("ne:JPN".to_owned(), None, 1),
+            ("ne:JPN".to_owned(), Some(osaka.id.clone()), 1),
+        ]
+    );
+    let may = body["trips"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["start"] == "2025-05-01 09:00")
+        .unwrap();
+    assert_eq!(may["regions"], json!([]));
+}
+
+#[tokio::test]
+async fn points_ignore_the_place_selection_and_stay_period_and_hidden_only() {
+    let f = fixture();
+    let server = Server::start(&[], true, &f.sql).await;
+    // 緯度が文字列の壊れた行（34）は、points が数値として読めず 503 になる（この変更の前から）。ここでは外す
+    server
+        .writer
+        .execute("UPDATE photos SET lat=NULL WHERE id=34", [])
+        .unwrap();
+    let all = server.get_ok("/api/admin/library/points", "").await;
+    for query in [
+        "?country=ne:FRA",
+        "?country=ne:JPN&region=ne:JPN-1",
+        "?unclassified=1",
+        "?pref=%E6%9D%B1%E4%BA%AC%E9%83%BD",
+    ] {
+        let narrowed = server.get_ok("/api/admin/library/points", query).await;
+        assert_eq!(narrowed, all, "{query}");
+    }
+    // 期間・除外では従来どおり絞れる
+    let hidden = server
+        .get_ok("/api/admin/library/points", "?hidden=1")
+        .await;
+    assert!(hidden["total"].as_i64() > all["total"].as_i64());
 }
