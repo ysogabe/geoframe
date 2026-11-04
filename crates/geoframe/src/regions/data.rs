@@ -408,31 +408,43 @@ struct LayerCapacity {
 }
 
 impl Layer {
-    fn with_capacity(c: LayerCapacity, regions: bool) -> Self {
-        let mut feature_polys = Vec::with_capacity(c.features + 1);
+    /// 見積もりの分を確保する。オフセット表は `u32` なので、各件数が `u32` に収まること、`+ 1`（先頭の 0）の加算が
+    /// あふれないこと、確保に失敗しないこと（`try_reserve_exact`）を確かめ、どれかが外れたら `Err`（パニック・中断をしない）。
+    fn try_with_capacity(c: LayerCapacity, regions: bool) -> Result<Self, DataError> {
+        fn reserved<T>(n: usize, extra: usize) -> Result<Vec<T>, DataError> {
+            let n = n
+                .checked_add(extra)
+                .filter(|&n| n <= u32::MAX as usize)
+                .ok_or_else(|| DataError::new("件数が大きすぎる"))?;
+            let mut v = Vec::new();
+            v.try_reserve_exact(n)
+                .map_err(|_| DataError::new("確保できない大きさの件数"))?;
+            Ok(v)
+        }
+        let mut feature_polys = reserved(c.features, 1)?;
         feature_polys.push(0);
-        let mut poly_rings = Vec::with_capacity(c.polygons + 1);
+        let mut poly_rings = reserved(c.polygons, 1)?;
         poly_rings.push(0);
-        let mut ring_pts = Vec::with_capacity(c.rings + 1);
+        let mut ring_pts = reserved(c.rings, 1)?;
         ring_pts.push(0);
-        Self {
-            ids: Vec::with_capacity(c.features),
+        Ok(Self {
+            ids: reserved(c.features, 0)?,
             parents: if regions {
-                Vec::with_capacity(c.features)
+                reserved(c.features, 0)?
             } else {
                 Vec::new()
             },
             feature_polys,
             poly_rings,
             ring_pts,
-            pts: Vec::with_capacity(c.points),
-        }
+            pts: reserved(c.points, 0)?,
+        })
     }
 
     /// 空の層。試験の合成データが `begin_feature` などで組み立てる。
     #[cfg(test)]
     pub(super) fn empty() -> Self {
-        Self::with_capacity(LayerCapacity::default(), false)
+        Self::try_with_capacity(LayerCapacity::default(), false).expect("空の確保")
     }
 
     /// 地物の数。
@@ -762,10 +774,14 @@ pub fn decode_polygons_from<R: Read>(
         let cap = |limit: usize, min_bytes: u64| {
             limit.min(usize::try_from(total / min_bytes).unwrap_or(usize::MAX))
         };
-        if lim.vertices > u32::MAX as usize {
-            return Err(DataError::new("頂点の数が大きすぎる"));
+        // オフセット表（`u32`）に表せない件数の上限は、確保の前に拒否する
+        if [lim.features, lim.polygons, lim.rings, lim.vertices]
+            .iter()
+            .any(|&n| n >= u32::MAX as usize)
+        {
+            return Err(DataError::new("件数の上限が大きすぎる"));
         }
-        let mut layer = Layer::with_capacity(
+        let mut layer = Layer::try_with_capacity(
             LayerCapacity {
                 features: n,
                 polygons: cap(lim.polygons, 1),
@@ -773,7 +789,7 @@ pub fn decode_polygons_from<R: Read>(
                 points: cap(lim.vertices, 2),
             },
             is_region,
-        );
+        )?;
         let (mut polygons_left, mut rings_left, mut vertices_left) =
             (lim.polygons, lim.rings, lim.vertices);
         for _ in 0..n {
@@ -936,5 +952,69 @@ pub(super) mod testing {
     }
     pub fn sha256_hex(data: &[u8]) -> String {
         super::sha256_hex(data)
+    }
+}
+
+#[cfg(test)]
+mod capacity_tests {
+    use super::*;
+
+    fn caps(n: usize) -> LayerCapacity {
+        LayerCapacity {
+            features: n,
+            polygons: n,
+            rings: n,
+            points: n,
+        }
+    }
+
+    #[test]
+    fn capacity_that_overflows_or_cannot_be_represented_is_an_error() {
+        // `+ 1` があふれる
+        assert!(Layer::try_with_capacity(caps(usize::MAX), true).is_err());
+        // オフセット表（u32）に表せない
+        assert!(Layer::try_with_capacity(caps(u32::MAX as usize), false).is_err());
+        assert!(Layer::try_with_capacity(caps(u32::MAX as usize + 1), false).is_err());
+        // 普通の大きさは通る
+        assert!(Layer::try_with_capacity(caps(1000), true).is_ok());
+    }
+
+    #[test]
+    fn the_public_decoder_rejects_limits_that_cannot_be_offsets_before_allocating() {
+        let huge = LayerLimits {
+            features: 1,
+            polygons: usize::MAX,
+            rings: usize::MAX,
+            vertices: usize::MAX,
+        };
+        let limits = DecodeLimits {
+            countries: huge,
+            regions: huge,
+        };
+        // 国 1 件・地域 0 件・ID `ne:X`・多角形 1・輪 1・点 4 の途中で終わるデータ
+        let mut raw = MAGIC.to_vec();
+        raw.extend_from_slice(&[1, 0, 4]);
+        raw.extend_from_slice(b"ne:X");
+        // 入力の長さを偽って大きく申告する（`total` から確保量を見積もる経路）
+        for total in [raw.len() as u64, u64::MAX / 4] {
+            let e = decode_polygons_from(&raw[..], total, &limits).expect_err("拒否されるはず");
+            assert!(e.0.contains("大きすぎる"), "{}", e.0);
+        }
+        // 上限が u32 に収まる大きさでも、入力の長さを超える確保はしない
+        let ok_limits = DecodeLimits {
+            countries: LayerLimits {
+                features: 1,
+                polygons: 1,
+                rings: 1,
+                vertices: 4,
+            },
+            regions: LayerLimits {
+                features: 0,
+                polygons: 0,
+                rings: 0,
+                vertices: 0,
+            },
+        };
+        assert!(decode_polygons_from(&raw[..], raw.len() as u64, &ok_limits).is_err());
     }
 }

@@ -12,8 +12,8 @@
 //! 4. 複数国なら国が `ambiguous`（地域は決めない）。国境の共有辺も同じ。配列の順や名前の順では決めない。
 //!
 //! 点の内外は偶奇判定で、境界上（辺・頂点。外側の輪も穴の縁も）は内部として扱う。境界上の判定は座標の厳密な一致
-//! （外積がちょうど 0）なので、斜めの辺の上の点は、倍精度で厳密に載るときだけ境界上になる。それ以外は丸め誤差の範囲で
-//! 内外のどちらかに決まる。
+//! （外積が実数としてちょうど 0）で、斜めの辺の上の点は、倍精度で厳密に載るときだけ境界上になる。左右の判定は
+//! 丸め誤差が効く範囲だけ厳密な計算（[`orientation`]）に切り替えるので、輪の向きを反転しても結果は変わらない。
 //!
 //! # 索引
 //!
@@ -199,6 +199,82 @@ enum RingState {
     Boundary,
 }
 
+/// 点 `p` が有向線分 `a→b` の左（正）・右（負）・線上（0）のどこにあるか。**符号は常に実数としての正しい値**で、
+/// 浮動小数点の丸めで決まらない（輪の向きを反転しても、同じ辺を逆向きに持つ隣の多角形でも、結果は変わらない）。
+///
+/// 外積を倍精度で計算し、丸め誤差の上限（Shewchuk の `orient2d` の第 1 段の上限）より大きければその符号を返す。
+/// 誤差の範囲に入るときだけ、展開（重ならない倍精度の和）による厳密な計算にフォールバックする。ほとんどの点は第 1 段で決まる。
+#[inline]
+fn orientation(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> i8 {
+    // (3 + 16ε)ε、ε = 2^-53
+    const ERR_BOUND: f64 = (3.0 + 16.0 * f64::EPSILON / 2.0) * (f64::EPSILON / 2.0);
+    let left = (bx - ax) * (py - ay);
+    let right = (by - ay) * (px - ax);
+    let det = left - right;
+    if det > ERR_BOUND * (left.abs() + right.abs()) {
+        return 1;
+    }
+    if -det > ERR_BOUND * (left.abs() + right.abs()) {
+        return -1;
+    }
+    orientation_exact(ax, ay, bx, by, px, py)
+}
+
+/// 倍精度の 2 数の和 `a + b` を、丸めた和と丸め誤差の組（和 + 誤差 = 厳密な和）にする。
+#[inline]
+fn two_sum(a: f64, b: f64) -> (f64, f64) {
+    let x = a + b;
+    let bv = x - a;
+    let av = x - bv;
+    (x, (a - av) + (b - bv))
+}
+
+/// 倍精度の 2 数の積を、丸めた積と丸め誤差の組にする（融合積和で厳密）。
+#[inline]
+fn two_product(a: f64, b: f64) -> (f64, f64) {
+    let p = a * b;
+    (p, a.mul_add(b, -p))
+}
+
+/// [`orientation`] の厳密な計算。差 `bx-ax` などを 2 要素の展開にし、積 16 項の和を重ならない展開（Shewchuk の
+/// grow-expansion）にして、最も大きい 0 でない項の符号を返す。座標は ±180 の範囲で、桁あふれ・桁落ち（アンダーフロー）は起きない。
+#[cold]
+fn orientation_exact(ax: f64, ay: f64, bx: f64, by: f64, px: f64, py: f64) -> i8 {
+    let dx1 = two_sum(bx, -ax);
+    let dy1 = two_sum(by, -ay);
+    let dx2 = two_sum(px, -ax);
+    let dy2 = two_sum(py, -ay);
+    // cross = dx1 * dy2 - dy1 * dx2
+    let mut terms = [0.0f64; 16];
+    let mut n = 0;
+    for (u, v, sign) in [(dx1, dy2, 1.0), (dy1, dx2, -1.0)] {
+        for a in [u.0, u.1] {
+            for b in [v.0, v.1] {
+                let (hi, lo) = two_product(a, b);
+                terms[n] = sign * hi;
+                terms[n + 1] = sign * lo;
+                n += 2;
+            }
+        }
+    }
+    // 重ならない展開（小さい順）に 1 項ずつ足す
+    let mut e = [0.0f64; 16];
+    for (len, &t) in terms.iter().enumerate() {
+        let mut q = t;
+        for h in e.iter_mut().take(len) {
+            let (sum, err) = two_sum(q, *h);
+            q = sum;
+            *h = err;
+        }
+        e[len] = q;
+    }
+    match e.iter().rev().find(|&&c| c != 0.0) {
+        Some(c) if *c > 0.0 => 1,
+        Some(_) => -1,
+        None => 0,
+    }
+}
+
 /// 輪に対する点の位置（偶奇判定。辺・頂点の上は `Boundary`）。
 fn ring_state(ring: &[[f64; 2]], px: f64, py: f64) -> RingState {
     let mut inside = false;
@@ -206,17 +282,18 @@ fn ring_state(ring: &[[f64; 2]], px: f64, py: f64) -> RingState {
         let [ax, ay] = w[0];
         let [bx, by] = w[1];
         // 辺の包絡矩形の中でだけ、辺の上かを厳密に見る
-        if px >= ax.min(bx) && px <= ax.max(bx) && py >= ay.min(by) && py <= ay.max(by) {
-            let cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
-            if cross == 0.0 {
-                return RingState::Boundary;
-            }
+        if px >= ax.min(bx)
+            && px <= ax.max(bx)
+            && py >= ay.min(by)
+            && py <= ay.max(by)
+            && orientation(ax, ay, bx, by, px, py) == 0
+        {
+            return RingState::Boundary;
         }
         // +x 方向の半直線が辺を横切るか（上端を含み下端を含まない半開区間で、頂点の二重数えを避ける）
         if (ay > py) != (by > py) {
-            let cross = (bx - ax) * (py - ay) - (by - ay) * (px - ax);
             // 交点の x は px より右か。cross = (by-ay) * (交点x - px)
-            if (cross > 0.0) == (by > ay) {
+            if (orientation(ax, ay, bx, by, px, py) > 0) == (by > ay) {
                 inside = !inside;
             }
         }
@@ -329,5 +406,78 @@ fn unplaced(method: Method) -> Classification<'static> {
         region_id: None,
         country_method: method,
         region_method: method,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 格子点（2^-20 刻みの整数）の座標では、外積は i128 で厳密に求まる。
+    fn exact_sign(a: (i64, i64), b: (i64, i64), p: (i64, i64)) -> i8 {
+        let c = i128::from(b.0 - a.0) * i128::from(p.1 - a.1)
+            - i128::from(b.1 - a.1) * i128::from(p.0 - a.0);
+        c.signum() as i8
+    }
+
+    fn lattice(v: i64) -> f64 {
+        v as f64 / f64::from(1 << 20)
+    }
+
+    #[test]
+    fn orientation_matches_exact_integer_arithmetic_on_near_collinear_points() {
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut checked = 0;
+        for _ in 0..20_000 {
+            let r = |n: &mut dyn FnMut() -> u64| (n() % (360 << 20)) as i64 - (180 << 20);
+            let a = (r(&mut next), r(&mut next) / 2);
+            let b = (r(&mut next), r(&mut next) / 2);
+            // a→b 上（有理数）の点を格子へ丸めたものと、その前後 1 目盛り
+            let t = (next() % 1000) as i128;
+            let on = |d: i64| {
+                let x = a.0 + ((i128::from(b.0 - a.0) * t / 1000) as i64) + d;
+                let y = a.1 + ((i128::from(b.1 - a.1) * t / 1000) as i64);
+                (x, y)
+            };
+            for d in [-1, 0, 1] {
+                let p = on(d);
+                let want = exact_sign(a, b, p);
+                let (fa, fb, fp) = (
+                    (lattice(a.0), lattice(a.1)),
+                    (lattice(b.0), lattice(b.1)),
+                    (lattice(p.0), lattice(p.1)),
+                );
+                assert_eq!(orientation(fa.0, fa.1, fb.0, fb.1, fp.0, fp.1), want);
+                // 向きを反転すると符号が反転し、巡回しても変わらない
+                assert_eq!(orientation(fb.0, fb.1, fa.0, fa.1, fp.0, fp.1), -want);
+                assert_eq!(orientation(fb.0, fb.1, fp.0, fp.1, fa.0, fa.1), want);
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 60_000);
+        // ちょうど線上（整数の点）は 0
+        assert_eq!(orientation(0.0, 0.0, 4.0, 2.0, 2.0, 1.0), 0);
+        assert_eq!(orientation(0.0, 0.0, 4.0, 2.0, 2.0, 1.0 + f64::EPSILON), 1);
+    }
+
+    #[test]
+    fn reversing_a_ring_does_not_change_the_state() {
+        // 辺 (0.1,0.2)→(1.3,1.7) は 0.7, 0.95 の近くを通る（十進では線上、倍精度では丸めで外積が 0 にも 0 でない値にもなる）
+        let tri = [[0.1, 0.2], [1.3, 1.7], [1.3, 0.2], [0.1, 0.2]];
+        let mut rev = tri;
+        rev.reverse();
+        for p in [[0.7, 0.95], [0.95, 0.7], [1.0, 0.5], [0.2, 0.9], [1.3, 1.0]] {
+            let forward = ring_state(&tri, p[0], p[1]);
+            let backward = ring_state(&rev, p[0], p[1]);
+            assert!(forward == backward, "向きで結果が変わった: {p:?}");
+        }
+        // 実数として線上にない点は Boundary にならない（倍精度の外積の丸めで線上と扱わない）
+        assert!(ring_state(&tri, 0.7, 0.95) != RingState::Boundary);
     }
 }
