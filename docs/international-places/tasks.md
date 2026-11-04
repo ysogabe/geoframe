@@ -17,7 +17,7 @@
 
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
-| T4 | 場所の区分の規則（共通 SQL 片）と `places` の拡張（`countries`・`regions`・`boundary_only`・`unknown`・旧DB分岐） | AC1, AC2, AC3, AC5, AC9 | T3 | full | 未着手 | | | |
+| T4 | 場所の区分の規則（共通 SQL 片）と `places` の拡張（`countries`・`regions`・`boundary_only`・`unknown`・旧DB分岐） | AC1, AC2, AC3, AC5, AC9 | T3 | full | 実装中 | b99a7d5 | | |
 | T5 | `photos` の旧形式/新形式の絞り込み・`q` 検索（日本の固定別名表）・trips・`location_region` | AC1, AC2, AC4, AC7 | T4 | full | 未着手 | | | |
 
 ## 段③（PR 3）: 画面
