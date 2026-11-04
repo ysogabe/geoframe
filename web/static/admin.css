@@ -225,6 +225,8 @@ body.ps-viewer-open{overflow:hidden}
 .ps-viewer-location{border:1px solid var(--panel-border);border-radius:6px;background:rgba(0,229,255,.04);
   padding:10px 11px;color:var(--ink);font-size:12px;line-height:1.55}
 .ps-viewer-location .coords{display:block;color:var(--ink-3);font-family:var(--mono);font-size:9px;margin-top:3px}
+.ps-viewer-region{margin-top:7px;color:var(--ink);font-size:12px;line-height:1.55}
+.ps-viewer-region .region-note,.lib-pop-region .region-note{color:var(--ink-3);font-family:var(--mono);font-size:10px;margin-left:6px}
 .ps-viewer-badges{margin:13px 0 7px}
 .ps-viewer-scores{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:13px 0}
 .ps-viewer-score-cell{border:1px solid var(--panel-border);border-radius:7px;background:rgba(0,229,255,.05);
@@ -424,6 +426,8 @@ button.chip:disabled{opacity:.35;cursor:default}
 .lib-pop-thumb img{width:100%;height:100%;object-fit:cover;display:block}
 .lib-pop-dt{font-family:var(--mono);font-size:11px}
 .lib-pop-place{font-size:12px}
+.lib-pop-region{font-size:12px}
+.lib-pop-region .region-note{color:#4a6072}
 .lib-pop .lib-pop-open{color:#10202e;background:rgba(0,150,180,.12);border-color:rgba(0,150,180,.5)}
 @media(max-width:640px){
   /* 狭い画面: カードの列は横スクロール（折り返さない）。列に min-width:0 を付けて、中身の幅で画面が広がらないようにする */

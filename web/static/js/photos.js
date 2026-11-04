@@ -31,6 +31,20 @@ const GROUP_KIND_LABEL = {scene: 'SAME SCENE', pet: 'PET PHOTO', similar: 'SIMIL
 function hasValue(v){ return v !== null && v !== undefined; }
 function hasLoc(photo){ return hasValue(photo.lat); }
 
+/* 国・地域の分類（ライブラリの photos の location_region。国が決まらない写真・旧応答・写真タブの一覧では無い）を
+   {country_id, country, region_id, region, method, label} にする。method は 'pref'（pref のある日本の写真）か 'inside'（境界データによる分類）。
+   label が無い・空なら国・地域の名前から「国・地域」を組み、それも無ければ null（分類なし） */
+function normalizeRegion(raw){
+  if(!raw || typeof raw !== 'object') return null;
+  const str = v => (typeof v === 'string' ? v : '');
+  const country = str(raw.country), region = str(raw.region);
+  const label = str(raw.label) || [country, region].filter(Boolean).join('・');
+  if(!label) return null;
+  return {country_id: str(raw.country_id), country, region_id: str(raw.region_id), region, method: str(raw.method), label};
+}
+/* 国・地域の表示の注記。境界データによる分類（method が inside）だけ「撮影位置からの分類」。pref の写真は地名そのものなので付けない */
+const REGION_INSIDE_NOTE = '撮影位置からの分類';
+
 /* 一覧（GET /api/admin/photos。origin='list'）と検索（GET /api/ai/search。origin='search'）の写真を
    共通の形にする。お気に入りは一覧が fav、検索が favorite。AI の評価と構図の分類は検索だけ（一覧では null） */
 function normalizePhoto(raw, origin){
@@ -43,6 +57,7 @@ function normalizePhoto(raw, origin){
     loc_source: raw.loc_source || 'none', infer_bucket: raw.infer_bucket || '',
     rotation: raw.rotation || 0, source: raw.source || '',
     hint: raw.hint || null, suggest: raw.suggest || null,
+    location_region: normalizeRegion(raw.location_region),
     ai: null, visual: null,
   };
   if(search){
@@ -114,6 +129,16 @@ function paintL1(node, photo){
   const r = l1Of(photo);
   node.className = r.cls;
   node.textContent = r.text;
+}
+/* 国・地域（location_region）の行。GPS の由来のタグ（loc_source。EXIF・推定・手動）とは別の情報なので別の行に出す。
+   境界データによる分類（method が inside）だけ注記を添える。名前は textContent だけで入れる。分類が無ければ行ごと隠す */
+function paintRegion(node, photo){
+  const r = photo.location_region;
+  node.textContent = '';
+  node.classList.toggle('hidden', !r);
+  if(!r) return;
+  node.appendChild(el('span', 'region-label', r.label));
+  if(r.method === 'inside') node.appendChild(el('span', 'region-note', REGION_INSIDE_NOTE));
 }
 function paintTags(box, photo, full){
   box.textContent = '';
@@ -553,6 +578,7 @@ function renderModal(){
   if(hasLoc(photo) && hasValue(photo.lon)){
     locNode.appendChild(el('span', 'coords', Number(photo.lat).toFixed(5) + ', ' + Number(photo.lon).toFixed(5)));
   }
+  paintRegion($('#viewer-region'), photo);
   paintTags($('#viewer-badges'), photo, true);
 
   $('#viewer-ai').classList.toggle('hidden', !ai || !viewerAiShown);
@@ -646,6 +672,9 @@ function stepModal(delta){
 /* ==== 6) フラグ・回転・更新の反映 ==== */
 /* 同じ id の写真を全部（entries・カード・開いているビューア）、patch の値で更新して描き直す */
 function applyPhoto(id, patch){
+  /* 位置が変わった写真の国・地域は、座標が変わった時点で古い（サーバーは次の分類まで「未判定」として返す）。
+     呼び側が忘れても残さないよう、位置を含む patch には location_region: null を足す（呼び側が値を渡していればそれを使う） */
+  if('lat' in patch || 'lon' in patch) patch = Object.assign({location_region: null}, patch);
   ps.entries.forEach((entry, i) => {
     if(String(entry.photo.id) !== String(id)) return;
     Object.assign(entry.photo, patch);

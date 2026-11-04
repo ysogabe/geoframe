@@ -343,6 +343,7 @@ export function buildAdminDom(){
   const ldetail = mk('div', {id: 'lib-detail', cls: 'hidden'}, lib);
   const ldbar = mk('div', {cls: 'toolbar'}, ldetail);
   mk('h3', {id: 'lib-sel', cls: 'lib-sel'}, ldbar);
+  mk('button', {id: 'lib-sel-clear', cls: 'btn', text: '選択を解除'}, ldbar);
   mk('span', {cls: 'spacer'}, ldbar);
   mk('button', {id: 'lib-prev', cls: 'btn', text: '◀ PREV'}, ldbar);
   mk('span', {id: 'lib-pageinfo', cls: 'count', text: '--'}, ldbar);
@@ -431,6 +432,7 @@ export function buildAdminDom(){
   mk('h2', {id: 'viewer-title'}, aside);
   mk('p', {id: 'viewer-meta', cls: 'ps-viewer-meta'}, aside);
   mk('div', {id: 'viewer-location', cls: 'ps-viewer-location'}, aside);
+  mk('div', {id: 'viewer-region', cls: 'ps-viewer-region hidden'}, aside);
   mk('div', {id: 'viewer-badges', cls: 'tags ps-viewer-badges'}, aside);
   const vai = mk('div', {id: 'viewer-ai'}, aside);
   mk('div', {id: 'viewer-scores', cls: 'ps-viewer-scores'}, vai);
