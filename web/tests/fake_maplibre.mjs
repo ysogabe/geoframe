@@ -139,12 +139,21 @@ export function createFakeMaplibre({bounds = {w: 100, s: 10, e: 120, n: 30}, exp
     constructor(options){
       this.options = options;
       this.lngLat = null; this.content = null; this.map = null; this.removed = false;
+      this.handlers = {};
       fake.popups.push(this);
     }
     setLngLat(p){ this.lngLat = p; return this; }
     setDOMContent(node){ this.content = node; return this; }
     addTo(map){ this.map = map; return this; }
-    remove(){ this.removed = true; return this; }
+    on(type, fn){ (this.handlers[type] ||= []).push(fn); return this; }
+    // 実物の Popup と同じく、remove() は（開いていれば）close を 1 回起こす。×ボタンは close() で押した状態を作る
+    remove(){
+      const wasOpen = !this.removed;
+      this.removed = true;
+      if(wasOpen) (this.handlers.close || []).forEach(fn => fn({target: this}));
+      return this;
+    }
+    close(){ return this.remove(); }
   }
 
   class FakeMarker {

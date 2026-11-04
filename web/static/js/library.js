@@ -1321,16 +1321,26 @@ function paintPopupInfo(){
   if(r.method === 'inside') info.region.appendChild(el('span', 'region-note', REGION_INSIDE_NOTE));
 }
 function closePopup(){
-  if(ls.popup){ ls.popup.remove(); ls.popup = null; }
+  ls.seq.popup++;              // 取得中の応答・読み直しは、閉じた吹き出しへ描かず状態も戻さない
+  const p = ls.popup;
+  ls.popup = null;
   ls.popupInfo = null;
+  if(p) p.remove();
 }
 /* 点を押した時点で 1 枚を引く（点の中身は id だけ）。別の点を押したら古い応答は捨てる */
 function openPointPopup(id, lngLat){
+  closePopup();                // 古い吹き出しを閉じて要求を無効にしてから、新しい要求番号を採る
   const seq = ++ls.seq.popup;
-  closePopup();
   const body = el('div', 'lib-pop', '読み込み中');
-  ls.popup = new maplibregl.Popup({closeButton: true, maxWidth: '260px'})
-    .setLngLat(lngLat).setDOMContent(body).addTo(ls.map);
+  const popup = new maplibregl.Popup({closeButton: true, maxWidth: '260px'});
+  ls.popup = popup;
+  popup.on('close', () => {    // ×ボタンなど、closePopup() を通らない閉じ方
+    if(ls.popup !== popup) return;
+    ls.popup = null;
+    ls.popupInfo = null;
+    ls.seq.popup++;
+  });
+  popup.setLngLat(lngLat).setDOMContent(body).addTo(ls.map);
   fetchPopupPhoto();
   function fetchPopupPhoto(){
     const rev = ls.locRev;

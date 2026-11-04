@@ -4240,6 +4240,34 @@ await test('(t7k3) AC7 吹き出しの取得中に位置が変わったら、保
   assert.equal(pending.length, 2);
 });
 
+await test('(t7k4) AC7 取得中に吹き出しを閉じたら（×・別 view へ移動）、位置が変わっても再取得せず、閉じた吹き出しを描かず popupInfo も戻さない', async () => {
+  for(const how of ['x', 'view']){
+    const env = makeEnv();
+    await env.boot();
+    await openLib(env);
+    env.$('#lib-view-places').click();
+    await settle();
+    const map = mapOf(env);
+    const pending = [];
+    env.handlers.photos = () => new Promise(resolve => pending.push(resolve));
+    const res = photo => ({ok: true, status: 200, json: () => Promise.resolve({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [photo]})});
+    map.fire('click', {features: [{properties: {id: 702}, geometry: {coordinates: [2, 47]}}]}, 'lib-point');
+    await settle();
+    assert.equal(pending.length, 1, how);
+    const pop = env.fake.popups.at(-1);
+    if(how === 'x') pop.close();                      // ×ボタン
+    else { env.$('#lib-view-trips').click(); await settle(); }   // 場所以外の view へ
+    assert.equal(env.ev('ls.popup'), null, how);
+    const before = pending.length;
+    vm.runInContext("applyPhoto(702, {lat: 35.5, lon: 139.5, loc_source: 'manual', infer_bucket: '', place: '', pref: '', city: ''})", env.context);
+    pending[0](res(R702));                            // 閉じた後に、保存前の応答が届く
+    await settle();
+    assert.equal(pending.length, before, how + ': 再取得しない');
+    assert.equal(env.ev('ls.popupInfo'), null, how + ': popupInfo を戻さない');
+    assert.equal(pop.content.querySelector('.lib-pop-region'), null, how + ': 閉じた吹き出しを描かない');
+  }
+});
+
 // ---- 旅のカードの地名（regions[] の上位。海外の旅で国・地域名が出る） ----
 const tagsOf = card => card.querySelectorAll('.tag').map(t => t.textContent);
 const TRIP_ABROAD = {key: '2030-08-01 08:00', start: '2030-08-01 08:00', end: '2030-08-09 20:00', count: 90, noloc: 2,
