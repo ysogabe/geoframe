@@ -40,6 +40,22 @@ pub struct PlaceRules {
     pub unclassified: String,
     /// 検索用の文字列。`pref` のある写真は日本と都道府県の別名、それ以外は有効な分類の `search_text`（無ければ空）。
     pub search: String,
+    /// `pref` が空の写真だけを扱う文では、これを使う（都道府県の対応表 `pm` を結合しない）。
+    pub outside_pref: OutsidePref,
+}
+
+/// [`PlaceRules`] のうち `WHERE NOT has_pref`（規則 1 に当たらない写真だけ）の文で使える式。規則 1 の枝（日本・`pm`）を
+/// 持たないので、都道府県の対応表を結合・実体化しない。`pref` のある写真には使わないこと（国・地域が NULL になる）。
+#[derive(Debug, Clone)]
+pub struct OutsidePref {
+    /// `photos p` と有効な分類 `r` の結合（`pm` なし）。
+    pub from: String,
+    /// 国の ID（規則 3）。決まらなければ NULL。
+    pub country: String,
+    /// 地域の ID（規則 3）。決まらなければ NULL。
+    pub region: String,
+    /// 規則 2: 座標が無効（`no_location`）。
+    pub no_location: String,
 }
 
 /// `pref` が空でない（既存の `ABROAD` の否定。`NULL`・空文字だけが空）。
@@ -63,6 +79,14 @@ impl PlaceRules {
             "photos p LEFT JOIN {} pm ON pm.pm_pref = p.pref {classification}",
             japan_prefectures_sql()
         );
+        let outside_pref = OutsidePref {
+            from: format!("photos p {classification}"),
+            country: "(CASE WHEN r.country_method = 'inside' THEN r.country_id END)".to_owned(),
+            region: "(CASE WHEN r.country_method = 'inside' AND r.region_method = 'inside' \
+                     THEN r.region_id END)"
+                .to_owned(),
+            no_location: format!("(NOT {valid})"),
+        };
         let country = format!(
             "(CASE WHEN {HAS_PREF} THEN {japan} WHEN r.country_method = 'inside' THEN r.country_id END)"
         );
@@ -86,6 +110,7 @@ impl PlaceRules {
             no_location,
             unclassified,
             search,
+            outside_pref,
         }
     }
 }
@@ -241,6 +266,67 @@ mod tests {
             (14, None, None, "unclassified"),
         ];
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn outside_pref_expressions_equal_the_full_ones_for_photos_without_pref() {
+        let version = super::super::classifier_version().unwrap();
+        let tokyo = data::names()
+            .unwrap()
+            .region_of_pref("東京都")
+            .unwrap()
+            .id
+            .clone();
+        let photos = "INSERT INTO photos VALUES
+            (1, 35.0, 139.0, '東京都', 'A'), (2, NULL, NULL, NULL, NULL), (3, 95.0, 10.0, '', NULL),
+            (4, 48.0, 2.0, NULL, NULL), (5, 48.0, 2.0, '', NULL), (6, 36.0, 139.0, NULL, NULL),
+            (7, 0.0, 0.0, NULL, NULL), (8, 3.0, 3.0, NULL, NULL), (9, 2.0, 2.0, NULL, NULL)";
+        let regions = format!(
+            "INSERT INTO photo_regions VALUES
+            (4, 48.0, 2.0, '{version}', 'ne:FRA', 'ne:FRA-1', '', 'inside', 'inside', 't'),
+            (5, 48.0, 2.0, '{version}', 'ne:FRA', NULL, '', 'inside', 'outside', 't'),
+            (6, 36.0, 139.0, '{version}', 'ne:JPN', '{tokyo}', '', 'inside', 'inside', 't'),
+            (7, 0.0, 0.0, '{version}', NULL, NULL, '', 'outside', 'outside', 't'),
+            (8, 3.0, 3.0, '{version}', NULL, NULL, '', 'failed', 'failed', 't')"
+        );
+        for with_table in [true, false] {
+            let conn = memory(photos, &regions, with_table);
+            let rules = PlaceRules::new(with_table);
+            let rows = |from: &str,
+                        c: &str,
+                        r: &str,
+                        n: &str|
+             -> Vec<(i64, Option<String>, Option<String>, bool)> {
+                conn.prepare(&format!(
+                    "SELECT p.id, {c}, {r}, {n} FROM {from} WHERE NOT {} ORDER BY p.id",
+                    rules.has_pref
+                ))
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+            };
+            let full = rows(
+                &rules.from,
+                &rules.country,
+                &rules.region,
+                &rules.no_location,
+            );
+            let outside = &rules.outside_pref;
+            let slim = rows(
+                &outside.from,
+                &outside.country,
+                &outside.region,
+                &outside.no_location,
+            );
+            assert_eq!(slim, full, "table: {with_table}");
+            assert_eq!(slim.len(), 8);
+            // 都道府県の対応表を結合しない
+            assert!(!outside.from.contains("pm_pref"));
+        }
     }
 
     #[test]

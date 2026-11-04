@@ -242,9 +242,10 @@ gzip展開は既に依存にあるflate2を使う。実行時のネイティブG
 
 - `countries[]`: ID、表示名、検索別名、件数、表紙、bbox、fit_bbox、`regions[]`。
 - `regions[]`: ID、表示名、検索別名、件数、表紙、bbox、fit_bbox。
-  日本のみ、pref名と `cities[]`、`boundary_only` も持つ。市区町村は今の `pref/city` の集計をそのまま使う。
+  日本のみ、pref名（`pref`）と `boundary_only` も持つ。市区町村は新しい地域に複製せず、旧 `prefs` の `pref` が同じ行の
+  `cities[]` を画面が引く（今の `pref/city` の集計がそのまま唯一の市区町村。応答を増やさない）。
   `boundary_only` は境界データで入った `pref` 空の写真（enrich 待ちを含む）の件数で、画面は「市区町村未取得 N」と出す。
-  日本の地域の件数 − `boundary_only` が、旧 `prefs` のその都道府県の件数と一致する。
+  日本の地域の件数 − `boundary_only` が、旧 `prefs` のその都道府県の件数と一致する（旧 `prefs` に行が無い都道府県は 0）。
 - 各国に `region_unknown`: 当該国で地域が分からない写真の件数と範囲。
 - `unknown`: `unclassified`（座標あり国未判定）と `no_location`（座標なし・無効）の件数。
 - `classification_available`（表があるか）、`classification_pending`（`regions::pending_photos`。期間・範囲は掛けない）。
@@ -263,9 +264,10 @@ gzip展開は既に依存にあるflate2を使う。実行時のネイティブG
              "no_location": {"count": 4, "cover": {...}, "bbox": null, "fit_bbox": null}}}
 ```
 
-- 日本の地域だけ `pref`・`cities[]`（`prefs` の `cities` と同じ）・`boundary_only` を持つ。`region_unknown` は常にあり、無ければ `count: 0`・`cover`/`bbox`/`fit_bbox` が `null`。
+- 日本の地域だけ `pref`（都道府県名。旧 `prefs` の同名の行から市区町村を引くキー）・`boundary_only` を持つ。`cities[]` は持たない。`region_unknown` は常にあり、無ければ `count: 0`・`cover`/`bbox`/`fit_bbox` が `null`。
 - `fit_bbox` は、通常の範囲の経度の幅が 180 度以内なら `bbox` と同じ（空きが戻る間が必ず最大のため）。それより広いときだけ、経度を全部使って最小の区間を求め、日付変更線をまたぐなら `null`。
   `pref` のある写真を含む組（日本）は経度をそろえず、幅が 180 度を超えたら確かめずに `null`（日本の `pref` の写真が半周以上に広がるのは座標の誤りのときだけ）。
+  経度は、通常の範囲の幅が 180 度を超える国の `pref` の無い組だけ追加の文で引き、国が決まらない写真は集計の文が一緒に取る（ふつうは追加の文を実行しない）。
 - 件数の多い順、同数は表示名、それも同じなら ID。国・地域・区分の集計は 1 つの走査（`pref` のある写真と、無い写真の 2 本の `GROUP BY`）から取り、
   旧 `prefs`・`abroad` も同じ結果から作る。代表の写真は、集計と同じ走査で組ごとに `MAX(COVER_KEY)`（`COVER_ORDER` と同じ順位を文字列にした鍵）を取り、
   国・地域は組の鍵の最大から選ぶ（窓関数の並べ替えをしない。`COVER_ORDER` との同値を単体試験で確かめる）。
@@ -340,7 +342,7 @@ IDは最大64文字、許可文字はASCII英数字と `:_-`。SQLは常にパ�
 |受け入れ条件|検証|
 |---|---|
 |AC1,AC3|API結合試験。複数国・同名地域・表紙・期間/bbox/除外・合計一致・ページング|
-|AC2|変更前後の `places` の日本部分の比較（海岸・小島・県境・GPS が消えて `pref` だけ残った合成写真を含む。地域の件数 − `boundary_only` と `cities[]`）、市区町村・読み仮名・選択解除。旧形式のクエリが変更前と同じ結果を返す|
+|AC2|変更前後の `places` の日本部分の比較（海岸・小島・県境・GPS が消えて `pref` だけ残った合成写真を含む。日本の各地域で、件数 − `boundary_only` = 旧 `prefs` のその都道府県の件数（行が無ければ 0）。地域は `cities[]` を持たず、市区町村は旧 `prefs` のものだけ）、市区町村・読み仮名・選択解除。旧形式のクエリが変更前と同じ結果を返す|
 |AC3|区分の規則 1〜4 の各分岐と、集計の式（国 = Σ地域 + `region_unknown`、Σ国 + `unclassified` + `no_location` = 全体）|
 |AC4|日本語/英語/原表記の検索、`pref` のある写真が「日本」「Japan」「Tokyo」で当たる、国名と地域名の両方に一致する語で二重にならない、旅の地名・文字検索|
 |AC5,AC6|合成ポリゴンの内部・境界・穴・島・国境の共有辺・地域の共有辺・国のみ・海上・無効座標（判定手順 1〜4 の各分岐）|

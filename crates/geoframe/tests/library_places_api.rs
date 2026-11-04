@@ -475,23 +475,38 @@ async fn japan_regions_join_pref_photos_and_boundary_photos_and_keep_old_prefs()
     );
     // 47 件に無い pref（7）と、国のみの境界データ（10）は日本の地域不明
     assert_eq!(japan["region_unknown"]["count"], 2);
-    // 旧 `prefs` は意味が変わらない: pref の写真だけを pref/city で数える。地域の件数 − boundary_only と市区町村が一致する
+    // 旧 `prefs` は意味が変わらない: pref の写真だけを pref/city で数える。日本の地域は市区町村を持たず、`pref`（都道府県名）で
+    // 旧 `prefs` の行を引く（市区町村は旧 `prefs` のものが唯一）。地域の件数 − boundary_only は旧 `prefs` のその都道府県の件数
     let prefs = body["prefs"].as_array().unwrap();
     let old = |name: &str| prefs.iter().find(|p| p["pref"] == name).unwrap();
     assert_eq!(old("東京都")["count"], 5);
-    assert_eq!(old("東京都")["cities"], tokyo["cities"]);
+    assert!(tokyo.get("cities").is_none());
     assert_eq!(
         tokyo["count"].as_i64().unwrap() - tokyo["boundary_only"].as_i64().unwrap(),
-        5
+        old("東京都")["count"].as_i64().unwrap()
     );
+    // 日本のすべての地域で同じ（旧 `prefs` に行が無い都道府県 = pref の写真が無い地域は 0）
+    for r in japan["regions"].as_array().unwrap() {
+        let name = r["pref"].as_str().unwrap();
+        let old_count = prefs
+            .iter()
+            .find(|p| p["pref"] == name)
+            .map_or(0, |p| p["count"].as_i64().unwrap());
+        assert_eq!(
+            r["count"].as_i64().unwrap() - r["boundary_only"].as_i64().unwrap(),
+            old_count,
+            "{name}"
+        );
+        assert!(r.get("cities").is_none(), "{name}");
+    }
     assert_eq!(old("架空県")["count"], 1);
     // 旧 `prefs` の合計は pref のある写真（除外を除く）7 枚、`abroad` は pref の無い写真
     let pref_sum: i64 = prefs.iter().map(|p| p["count"].as_i64().unwrap()).sum();
     assert_eq!(pref_sum, 7);
     // 除外（8・15）を除く 32 枚のうち pref の無い 25 枚
     assert_eq!(body["abroad"], 25);
-    // 市区町村は pref/city の集計そのまま
-    let cities: i64 = tokyo["cities"]
+    // 市区町村は旧 `prefs` の pref/city の集計そのまま
+    let cities: i64 = old("東京都")["cities"]
         .as_array()
         .unwrap()
         .iter()
@@ -666,6 +681,111 @@ async fn fit_bbox_is_the_minimal_arc_and_null_across_the_date_line() {
     let fj = country(&one, "ne:FJI");
     assert_eq!(fj["count"], 1);
     assert_eq!(fj["fit_bbox"], fj["bbox"]);
+}
+
+#[tokio::test]
+async fn unclassified_photos_are_checked_for_the_date_line_too() {
+    // 国が決まらない写真（分類行なし）の経度は、集計と同じ走査で取る。経度 178・-179 は日付変更線をまたぐ
+    let across = [
+        photo(1, Some("2025-08-01 10:00"), "-17.0", "178.0", None, 0),
+        photo(2, Some("2025-08-02 10:00"), "-17.0", "-179.0", None, 0),
+    ]
+    .concat();
+    let server = Server::start(&[], true, &across).await;
+    let body = server.ok("").await;
+    let unclassified = &body["unknown"]["unclassified"];
+    assert_eq!(unclassified["count"], 2);
+    assert_eq!(unclassified["bbox"], json!([-179.0, -17.0, 178.0, -17.0]));
+    assert_eq!(unclassified["fit_bbox"], Value::Null);
+    // 広いが、最小の区間は通常の範囲（空きが 80 度ずつ、戻る間が 120 度）なら、通常の範囲のまま
+    let wide = [-100.0, -20.0, 60.0, 140.0]
+        .iter()
+        .enumerate()
+        .map(|(i, lon)| {
+            photo(
+                10 + i as i64,
+                Some("2025-08-01 10:00"),
+                "55.0",
+                &lon.to_string(),
+                None,
+                0,
+            )
+        })
+        .collect::<String>();
+    let server = Server::start(&[], true, &wide).await;
+    let body = server.ok("").await;
+    let unclassified = &body["unknown"]["unclassified"];
+    assert_eq!(unclassified["bbox"], json!([-100.0, 55.0, 140.0, 55.0]));
+    assert_eq!(unclassified["fit_bbox"], unclassified["bbox"]);
+    // 座標が無効な写真（場所不明）の経度は含めない
+    let invalid = [
+        photo(20, Some("2025-08-01 10:00"), "10.0", "20.0", None, 0),
+        photo(21, Some("2025-08-01 10:00"), "95.0", "-170.0", None, 0),
+    ]
+    .concat();
+    let server = Server::start(&[], true, &invalid).await;
+    let body = server.ok("").await;
+    assert_eq!(body["unknown"]["unclassified"]["count"], 1);
+    assert_eq!(body["unknown"]["no_location"]["count"], 1);
+    assert_eq!(
+        body["unknown"]["unclassified"]["fit_bbox"],
+        json!([20.0, 10.0, 20.0, 10.0])
+    );
+}
+
+#[tokio::test]
+async fn japan_pref_photos_wider_than_half_the_globe_skip_fit_but_keep_the_old_bbox() {
+    // 日本の `pref` の写真が経度で 260 度（東京都の 140 と、誤った座標の -120）に広がる。通常の範囲は 180 度を超えるが、
+    // `pref` の写真は経度をそろえないので、最小の区間は確かめずに `fit_bbox` は null。旧 `prefs` の bbox は変更前と同じ
+    let rows = [
+        photo(
+            1,
+            Some("2025-04-01 10:00"),
+            "35.7",
+            "140.0",
+            Some("東京都"),
+            0,
+        ),
+        photo(
+            2,
+            Some("2025-04-02 10:00"),
+            "36.0",
+            "-120.0",
+            Some("東京都"),
+            0,
+        ),
+        photo(
+            3,
+            Some("2025-04-03 10:00"),
+            "34.7",
+            "135.5",
+            Some("大阪府"),
+            0,
+        ),
+    ]
+    .concat();
+    let server = Server::start(&[], true, &rows).await;
+    let body = server.ok("").await;
+    let japan = country(&body, "ne:JPN");
+    let tokyo_id = names().region_of_pref("東京都").unwrap().id.clone();
+    let tokyo = region(japan, &tokyo_id);
+    assert_eq!(tokyo["bbox"], json!([-120.0, 35.7, 140.0, 36.0]));
+    assert_eq!(tokyo["fit_bbox"], Value::Null);
+    // 国全体も、東京都を含むので広い。日付変更線をまたぐかを確かめない側（null）に倒す
+    assert_eq!(japan["bbox"], json!([-120.0, 34.7, 140.0, 36.0]));
+    assert_eq!(japan["fit_bbox"], Value::Null);
+    // 大阪府だけの地域は狭いので、通常の範囲そのまま
+    let osaka = region(japan, &names().region_of_pref("大阪府").unwrap().id);
+    assert_eq!(osaka["fit_bbox"], osaka["bbox"]);
+    // 旧 `prefs` の bbox は従来どおりの通常の範囲（min..max）
+    let old = body["prefs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["pref"] == "東京都")
+        .unwrap();
+    assert_eq!(old["bbox"], json!([-120.0, 35.7, 140.0, 36.0]));
+    assert_eq!(old["cities"].as_array().unwrap().len(), 2);
 }
 
 #[tokio::test]
