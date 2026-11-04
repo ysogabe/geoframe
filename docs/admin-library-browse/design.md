@@ -2,6 +2,10 @@
 
 作成日: 2026-11-02。状態: 設計レビュー 2 回（Sol）・安全面レビュー 1 回（Opus）を反映済み。ユーザー承認待ち。
 
+> **場所の画面は後から拡張した**: 左の一覧は都道府県のカードから、国→地域（日本はさらに市区町村）のカードに変わった（2026-11-04、[国・地域別の場所表示](../international-places/design.md)の段③）。
+> 選択の種類・カード・地図の合わせ方・写真の絞り込みのクエリは、そちらの「画面」「日付変更線と地図範囲」が正。以下の `pref`・`city`・`abroad` に関する記述は変更前の説明で、
+> 期間・bbox・除外・古い応答の破棄・地図の移動の理由・コンボボックスの考え方は今も有効（コンボボックスは段③の T7 で国→地域→市区町村の候補に広げる）。
+
 ## 概要
 
 [PRD](prd.md) の R1〜R14 を実装する。サーバーは既存の `GET /api/admin/library/*` を広げ、日付の言葉を読む
@@ -262,7 +266,7 @@ view: 'trips' | 'calendar' | 'places'
 sel:  {trips: null|S, calendar: null|S, places: null|S}   … view ごとの選択。今の選択は sel[view]
   S = {kind:'trip', key, from, to} | {kind:'year', year} | {kind:'month', year, month}
     | {kind:'span', from, to}（ピッカーの Shift の範囲。形の範囲）| {kind:'words', from, to, source}（言葉。暦の範囲）
-    | {kind:'untimed'} | {kind:'pref', pref} | {kind:'city', pref, city} | {kind:'abroad'} | {kind:'bbox', bbox}
+    | {kind:'untimed'} | {kind:'country'|'region'|'city'|'region_unknown'|'unclassified'|'no_location', …}（国 ID・地域 ID。旧: {kind:'pref', pref} | {kind:'city', pref, city} | {kind:'abroad'}） | {kind:'bbox', bbox}
     | {kind:'q', q} | {kind:'period'}（場所の画面で、期間の写真全体）
 anchor: null | {from, to}      … Shift の範囲の起点（押した年・月の形の範囲）。範囲は min(from)〜max(to)
 monthYear: null | 年           … 範囲の選択中に月のチップを出す年（前後の年ボタンで替える）。範囲以外の選択に替わると null

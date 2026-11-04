@@ -46,6 +46,27 @@ const placesBody = () => ({ok: true, abroad: 9, prefs: [
             {city: '', count: 2, bbox: null}]},
   {pref: '試験県', count: 3, cover: null, bbox: null, cities: [{city: 'サンプル市', count: 3, bbox: null}]}]});
 
+// 旧形式の合成応答（prefs・abroad だけ）に、新しい応答の国・地域・未判定を足す。prefs の各行を日本（ne:JPN）の地域（pref 付き）にし、
+// abroad は「地域未判定」にする。新しい項目を最初から持つ応答（countries のあるもの）はそのまま
+const jpId = pref => 'ne:JPN-' + [...pref].map(ch => ch.codePointAt(0).toString(16)).join('');
+const union = boxes => {
+  const b = boxes.filter(Boolean);
+  return b.length ? [Math.min(...b.map(x => x[0])), Math.min(...b.map(x => x[1])), Math.max(...b.map(x => x[2])), Math.max(...b.map(x => x[3]))] : null;
+};
+const noneItem = () => ({count: 0, cover: null, bbox: null, fit_bbox: null});
+function withCountries(body){
+  if(!body || body.ok !== true || body.countries) return body;
+  const prefs = body.prefs || [];
+  const regions = prefs.filter(p => p.pref).map(p => ({id: jpId(p.pref), name: p.pref, aliases: [p.pref], count: p.count, cover: p.cover,
+    bbox: p.bbox, fit_bbox: p.bbox, pref: p.pref, boundary_only: 0}));
+  const box = union(regions.map(r => r.bbox));
+  const countries = regions.length ? [{id: 'ne:JPN', name: '日本', aliases: ['日本', 'Japan'], count: regions.reduce((a, r) => a + r.count, 0),
+    cover: regions[0].cover, bbox: box, fit_bbox: box, regions, region_unknown: noneItem()}] : [];
+  const abroad = body.abroad || 0;
+  return {...body, countries, classification_available: true, classification_pending: 0,
+    unknown: {unclassified: abroad ? {count: abroad, cover: null, bbox: null, fit_bbox: null} : noneItem(), no_location: noneItem()}};
+}
+
 const lp = o => ({name: 'lib.jpg', thumb: '/derivatives/lib.jpg', thumb_url: '', taken_at: '2030-05-03 09:12',
   lat: 10.0, lon: 20.0, loc_source: 'exif', place: '', pref: '架空県', city: '試験市',
   favorite: false, hidden: false, rotation: 0, source: 'drive', ...o});
@@ -99,7 +120,8 @@ function makeEnv({gridItems = GRID, pathname = '/admin'} = {}){
       return (handlers.when && handlers.when(params, rec)) || reply({ok: false, error: 'unreadable'});
     }
     if(url.startsWith('/api/admin/library/places')){
-      return (handlers.places && handlers.places(params, rec)) || reply(placesBody());
+      const r = (handlers.places && handlers.places(params, rec)) || reply(placesBody());
+      return r.then(res => res.json().then(b => respond(res.status, withCountries(b))));
     }
     if(url === '/api/admin/setloc'){
       const b = JSON.parse(opts.body);
@@ -931,7 +953,11 @@ await test('(o) .hidden で出し入れする要素の display は、ID・クラ
 const A = '2030-05-03 09:12', Z = '2030-05-05 18:40', B = '2029-01-01 00:00';
 const qOf = c => new URLSearchParams(c.url.split('?')[1] || '');
 const placeQs = env => env.reqs('/api/admin/library/places').map(qOf);
-const pcards = env => env.$$('#lib-place-cards .lib-card');
+const pcards = env => env.$$('#lib-place-cards .lib-region');            // 展開している国の地域のカード（日本の都道府県）
+const ccards = env => env.$$('#lib-place-cards .lib-country');          // 国のカード
+const allCards = env => env.$$('#lib-place-cards .lib-card');
+const cardByKey = (env, key) => allCards(env).find(c => c.dataset.key === key);
+const JP = 'ne:JPN';
 const cardName = c => mainOf(c).querySelector('.lib-card-name').textContent;
 const cardCount = c => mainOf(c).querySelector('.lib-card-count').textContent;
 const cityChips = card => card.querySelectorAll('.lib-cities .lib-city');
@@ -1022,28 +1048,40 @@ await test('(h3) 期間の写真全体の詳細は、解除すると隠れて、
   assert.equal(hidden(env, '#lib-period'), true);
 });
 
-await test('(h4) 期間のあいだの県・市区町村・海外不明は from・to を付けて読み、県を選んでから解除すると、県の詳細を期間なしで読み直す（ページ 1）', async () => {
+await test('(h4) 期間のあいだの国・地域・市区町村・地域未判定は from・to を付けて読み、地域を選んでから解除すると、地域の詳細を期間なしで読み直す（ページ 1）', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
   mapBtnOf(env, 0).click();
   await settle();
-  mainOf(pcards(env)[0]).click();                  // 架空県
+  assert.equal(pcards(env).length, 0, '期間のあいだは日本を自動で展開しない');
+  mainOf(ccards(env)[0]).click();                  // 日本（国全体）
   await settle();
   let q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('pref'), '架空県');
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('region'), null);
+  assert.equal(q.get('from'), A);
+  assert.equal(pcards(env).length, 2, '国を選ぶと地域を展開する');
+  mainOf(pcards(env)[0]).click();                  // 架空県
+  await settle();
+  q = env.last('/api/admin/library/photos');
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('region'), jpId('架空県'));
+  assert.equal(q.get('pref'), null);
   assert.equal(q.get('from'), A);
   assert.equal(q.get('to'), Z);
-  assert.equal(env.$('#lib-sel').textContent, '架空県');
+  assert.equal(env.$('#lib-sel').textContent, '日本 架空県');
   cityChips(pcards(env)[0])[1].click();             // 見本町
   await settle();
   q = env.last('/api/admin/library/photos');
   assert.equal(q.get('city'), '見本町');
+  assert.equal(q.get('region'), jpId('架空県'));
   assert.equal(q.get('from'), A);
-  mainOf(pcards(env)[2]).click();                   // 海外・不明
+  mainOf(cardByKey(env, 'unclassified')).click();   // 地域未判定
   await settle();
   q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('abroad'), '1');
+  assert.equal(q.get('unclassified'), '1');
+  assert.equal(q.get('country'), null);
   assert.equal(q.get('from'), A);
   assert.equal(q.get('to'), Z);
   mainOf(pcards(env)[0]).click();                   // 架空県をまた選ぶ
@@ -1054,7 +1092,7 @@ await test('(h4) 期間のあいだの県・市区町村・海外不明は from�
   await settle();
   assert.equal(env.reqs('/api/admin/library/photos').length, photoReqs + 1);
   q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('pref'), '架空県');
+  assert.equal(q.get('region'), jpId('架空県'));
   assert.equal(q.get('from'), null);
   assert.equal(q.get('to'), null);
   assert.equal(q.get('page'), '1');
@@ -1406,7 +1444,7 @@ await test('(p3) AC15 除外の切り替え: 見えている一覧・詳細（�
   assert.equal(env.ev('ls.prefs.length'), 2, '飛んでいた空の応答で一覧を差し替えない');
   assert.equal(env.ev('ls.placeOpts.prefs.length'), 2);
 });
-await test('(q) AC1・AC4・AC6 場所: 都道府県のカード（表紙・名前・枚数・主ボタン）と海外・不明。県を押すと pref・fitBounds・市区町村のチップ（件数順）。チップで city と fitBounds。もう一度押すと外れる', async () => {
+await test('(q) AC1・AC2・AC11 場所: 国のカード（日本）と、初回に展開した日本の都道府県のカード（表紙・名前・枚数・主ボタン）と地域未判定。県を押すと country・region・fitBounds・市区町村のチップ（件数順）。チップで city と fitBounds。もう一度押すと外れる', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
@@ -1420,24 +1458,30 @@ await test('(q) AC1・AC4・AC6 場所: 都道府県のカード（表紙・名�
   assert.equal(hidden(env, '#lib-places'), false);
   assert.equal(hidden(env, '#lib-calendar'), true);
   assert.equal(hidden(env, '#lib-detail'), true);
-  assert.equal(env.$('#lib-note').textContent, '2 都道府県');
+  assert.equal(env.$('#lib-note').textContent, '1 か国');
   assert.ok(env.$('#lib-place-cards').classList.contains('lib-cards'));
   assert.ok(!env.$('#lib-place-cards').classList.contains('is-strip'), '場所のカードは 1 段にしない');
-  let c = pcards(env);
-  assert.deepEqual(c.map(cardName), ['架空県', '試験県', '海外・不明']);
-  assert.deepEqual(c.map(cardCount), ['50 枚', '3 枚', '9 枚']);
-  assert.ok(c.every(x => x.tagName.toLowerCase() === 'div' && x.listeners.click === undefined), 'カードの容器は対話しない');
+  assert.deepEqual(allCards(env).map(cardName), ['日本', '架空県', '試験県', '地域未判定'], '国 → 展開した国の地域 → 国一覧の地域未判定');
+  assert.deepEqual(allCards(env).map(cardCount), ['53 枚', '50 枚', '3 枚', '9 枚']);
+  assert.equal(env.ev('ls.sel.places'), null, '日本を展開するだけで選ばない');
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '写真は読まない');
+  assert.equal(env.fake.maps[0].calls.fitBounds.length, 0, '地図は動かさない');
+  assert.equal(mainOf(ccards(env)[0]).getAttribute('aria-expanded'), 'true');
+  const c = pcards(env).concat([cardByKey(env, 'unclassified')]);
+  assert.ok(allCards(env).every(x => x.tagName.toLowerCase() === 'div' && x.listeners.click === undefined), 'カードの容器は対話しない');
   assert.equal(mainOf(c[0]).querySelector('.lib-cover img').src, '/thumb/701.jpg?v=dddddddddddd', '県の表紙');
   assert.equal(mainOf(c[1]).querySelector('.lib-cover .img-broken').textContent, '画像なし');
   assert.equal(env.$$('#lib-place-cards .lib-cities').length, 0, '選ぶまでチップは出さない');
   assert.equal(env.fake.maps[0].calls.fitBounds.length, 0);
-  // 県 → pref と fitBounds
+  // 県 → country・region と fitBounds
   mainOf(c[0]).click();
   await settle();
   let q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('pref'), '架空県');
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('region'), jpId('架空県'));
+  assert.equal(q.get('pref'), null, '旧形式は混ぜない');
   assert.equal(q.get('city'), null);
-  assert.equal(env.$('#lib-sel').textContent, '架空県');
+  assert.equal(env.$('#lib-sel').textContent, '日本 架空県');
   assert.equal(hidden(env, '#lib-detail'), false);
   same(env.$('#lib-detail').parentNode, env.$('#lib-place-main'));
   const map = mapOf(env);
@@ -1456,9 +1500,11 @@ await test('(q) AC1・AC4・AC6 場所: 都道府県のカード（表紙・名�
   chips[1].click();
   await settle();
   q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('pref'), '架空県');
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('region'), jpId('架空県'));
   assert.equal(q.get('city'), '見本町');
-  assert.equal(env.$('#lib-sel').textContent, '架空県 見本町');
+  assert.equal(q.get('pref'), null);
+  assert.equal(env.$('#lib-sel').textContent, '日本 架空県 見本町');
   assert.deepEqual(plain(map.calls.fitBounds.at(-1)), {bounds: [130.5, 30.5, 130.6, 30.6], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}});
   assert.equal(map.calls.fitBounds.length, 2);
   assert.equal(chips[1].getAttribute('aria-pressed'), 'true');
@@ -1473,18 +1519,20 @@ await test('(q) AC1・AC4・AC6 場所: 都道府県のカード（表紙・名�
   // bbox が null の県: 選べるが地図は動かさない。前の県のチップは消える
   mainOf(c[1]).click();
   await settle();
-  assert.equal(env.last('/api/admin/library/photos').get('pref'), '試験県');
+  assert.equal(env.last('/api/admin/library/photos').get('region'), jpId('試験県'));
   assert.equal(map.calls.fitBounds.length, 2, 'bbox が null なら地図は動かさない');
+  assert.equal(env.$('#lib-map-hint').textContent, '', '位置のある写真が無いので案内も出さない');
   assert.equal(c[0].querySelector('.lib-cities'), null);
   assert.equal(cityChips(c[1]).length, 1);
   assert.ok(!c[0].classList.contains('is-selected'));
-  // 海外・不明
+  // 地域未判定
   mainOf(c[2]).click();
   await settle();
   q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('abroad'), '1');
+  assert.equal(q.get('unclassified'), '1');
+  assert.equal(q.get('country'), null);
   assert.equal(q.get('pref'), null);
-  assert.equal(env.$('#lib-sel').textContent, '海外・不明');
+  assert.equal(env.$('#lib-sel').textContent, '地域未判定');
   assert.equal(map.calls.fitBounds.length, 2);
   assert.ok(c[2].classList.contains('is-selected'));
   // 同じカードをもう一度押すと外れ、詳細は隠れ、地図は動かさない
@@ -1497,7 +1545,7 @@ await test('(q) AC1・AC4・AC6 場所: 都道府県のカード（表紙・名�
   mainOf(c[0]).click();
   await settle();
   assert.equal(map.calls.fitBounds.length, 2, '今の範囲と同じなら呼ばない');
-  assert.equal(env.last('/api/admin/library/photos').get('pref'), '架空県');
+  assert.equal(env.last('/api/admin/library/photos').get('region'), jpId('架空県'));
   // 除外を含める: カード用・候補用・点・詳細のすべてが hidden=1
   const since = env.calls.length;
   env.$('#lib-hidden').checked = true;
@@ -1742,7 +1790,7 @@ const userMove = (env, to) => {                  // 利用者のドラッグ相�
   map.fire('moveend', {originalEvent: {type: 'mouseup'}});
 };
 
-await test('(v) AC7 ドラッグ・ズーム・クラスタを押したあとの移動では /places?bbox=… を読み直し、カードが範囲の中の県・枚数になり、#lib-note に「地図の範囲: N 都道府県」。候補用は読み直さない', async () => {
+await test('(v) AC7 ドラッグ・ズーム・クラスタを押したあとの移動では /places?bbox=… を読み直し、カードが範囲の中の国・県・枚数になり、#lib-note に「地図の範囲: N か国」。候補用は読み直さない', async () => {
   const env = makeEnv();
   await env.boot();
   await openLib(env);
@@ -1751,7 +1799,7 @@ await test('(v) AC7 ドラッグ・ズーム・クラスタを押したあとの
   env.raf();                                              // 場所を出したときの resize（libMove 付き）では読まない
   const map = mapOf(env);
   assert.equal(bboxReqs(env).length, 0);
-  assert.deepEqual(pcards(env).map(cardName), ['架空県', '試験県', '海外・不明']);
+  assert.deepEqual(allCards(env).map(cardName), ['日本', '架空県', '試験県', '地域未判定']);
   // ドラッグ
   userMove(env, {bounds: {w: 130.25, s: 30.5, e: 131.75, n: 31.5}, center: {lng: 131, lat: 31}});
   await settle();
@@ -1760,9 +1808,9 @@ await test('(v) AC7 ドラッグ・ズーム・クラスタを押したあとの
   assert.equal(q.get('bbox'), '130.25,30.5,131.75,31.5');
   assert.equal(q.get('from'), null);
   assert.deepEqual(plain(env.ev('ls.mapBbox')), [130.25, 30.5, 131.75, 31.5]);
-  assert.deepEqual(pcards(env).map(cardName), ['架空県'], '範囲の中に写真のある県だけ');
-  assert.deepEqual(pcards(env).map(cardCount), ['7 枚'], '範囲の中の枚数');
-  assert.equal(env.$('#lib-note').textContent, '地図の範囲: 1 都道府県');
+  assert.deepEqual(allCards(env).map(cardName), ['日本', '架空県'], '範囲の中に写真のある県だけ（日本は展開したまま）');
+  assert.deepEqual(allCards(env).map(cardCount), ['7 枚', '7 枚'], '範囲の中の枚数');
+  assert.equal(env.$('#lib-note').textContent, '地図の範囲: 1 か国');
   assert.equal(placeQs(env).filter(x => !x.get('bbox')).length, 2, '候補用（bbox なし）は読み直さない');
   // ズーム
   userMove(env, {bounds: {w: 130.5, s: 30.75, e: 131.5, n: 31.25}, zoom: 8});
@@ -1802,6 +1850,7 @@ await test('(v) AC7 ドラッグ・ズーム・クラスタを押したあとの
   assert.equal(q.get('from'), null);
   assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'bbox', bbox: [131, 31, 131.5, 31.25]});
   assert.equal(env.$('#lib-sel').textContent, '地図の範囲');
+  assert.equal(placeQs(env).at(-1).get('country'), null, 'カードの読み直しに場所の選択は載らない');
   // 全体に戻す: 日本全体へ（libMove 付き）、絞り込みを外して読み直す。moveend では読まない
   const reqs = placeQs(env).length;
   env.$('#lib-reset').click();
@@ -1811,8 +1860,8 @@ await test('(v) AC7 ドラッグ・ズーム・クラスタを押したあとの
   assert.equal(placeQs(env).length, reqs + 1);
   q = placeQs(env).at(-1);
   assert.equal(q.get('bbox'), null, 'bbox が外れる');
-  assert.deepEqual(pcards(env).map(cardName), ['架空県', '試験県', '海外・不明']);
-  assert.equal(env.$('#lib-note').textContent, '2 都道府県');
+  assert.deepEqual(allCards(env).map(cardName), ['日本', '架空県', '試験県', '地域未判定']);
+  assert.equal(env.$('#lib-note').textContent, '1 か国');
   map.endMove();
   await settle();
   assert.equal(placeQs(env).length, reqs + 1, '全体に戻すの moveend では読まない');
@@ -2413,6 +2462,10 @@ const comboBody = () => ({ok: true, abroad: 0, prefs: [
     {city: '<b>町', count: 5, bbox: null}]},
   {pref: '北海道', count: 10, cover: null, bbox: null, cities: [{city: '', count: 10, bbox: null}]}]});
 const labelsOf = env => optsOf(env).map(o => o.textContent);
+// コンボボックスで決めた日本の地域・市区町村の選択（国 ID・地域 ID を持つ。名前は見出しの label と、市区町村を引く pref だけ）
+const rkey = pref => JP + '/' + jpId(pref);
+const selRegion = pref => ({kind: 'region', country: JP, region: jpId(pref), pref, label: '日本 ' + pref});
+const selCity = (pref, city) => ({kind: 'city', country: JP, region: jpId(pref), pref, city, label: '日本 ' + pref + ' ' + city});
 
 await test('(x1) AC14 コンボボックス: 「松」で「松」を含む候補だけ（件数の多い順）、「ながの」「nagano」「ナガノ」で長野県。読みは県・府・都の付いた形も。ARIA の属性と lib-opt-<添字>', async () => {
   const env = makeEnv();
@@ -2544,20 +2597,22 @@ await test('(x3) AC14 ↓↑ で aria-activedescendant を動かし、Enter で�
   input.dispatchEvent(enter);
   await settle();
   const q = env.last('/api/admin/library/photos');
-  assert.equal(q.get('pref'), '長野県');
+  assert.equal(q.get('region'), jpId('長野県'));
   assert.equal(q.get('city'), '松本市');
-  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'city', pref: '長野県', city: '松本市'});
-  assert.equal(env.$('#lib-sel').textContent, '長野県 松本市');
+  assert.deepEqual(plain(env.ev('ls.sel.places')), selCity('長野県', '松本市'));
+  assert.equal(env.$('#lib-sel').textContent, '日本 長野県 松本市');
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('pref'), null, '旧形式は混ぜない');
   assert.deepEqual(plain(map.calls.fitBounds.at(-1)), {bounds: [137.8, 36.1, 138.1, 36.4], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}});
   assert.equal(input.getAttribute('aria-expanded'), 'false');
   assert.equal(input.getAttribute('aria-activedescendant'), null);
   assert.equal(hidden(env, '#lib-place-list'), true);
   assert.equal(input.value, '松本市');
-  const pref = pcards(env).find(c => c.dataset.key === '長野県');
+  const pref = pcards(env).find(c => c.dataset.key === rkey('長野県'));
   assert.ok(pref, '県のカード');
   assert.ok(pref.classList.contains('is-selected'), 'その県のカードが選ばれ');
   assert.ok(pref.classList.contains('has-cities'));
-  assert.equal(cityChips(pref).find(c => c.dataset.key === '長野県/松本市').getAttribute('aria-pressed'), 'true');
+  assert.equal(cityChips(pref).find(c => c.dataset.key === rkey('長野県') + '/松本市').getAttribute('aria-pressed'), 'true');
   assert.equal(map.moves.length, 1, '地図は 1 回だけ動かす');
   // Enter で決めたあとの Enter（候補が閉じている）は何もしない
   const reqs = env.reqs('/api/admin/library/photos').length;
@@ -2570,9 +2625,9 @@ await test('(x3) AC14 ↓↑ で aria-activedescendant を動かし、Enter で�
   keyOn(input, 'Enter');
   await settle();
   const p = env.last('/api/admin/library/photos');
-  assert.equal(p.get('pref'), '長野県');
+  assert.equal(p.get('region'), jpId('長野県'));
   assert.equal(p.get('city'), null);
-  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'pref', pref: '長野県'});
+  assert.deepEqual(plain(env.ev('ls.sel.places')), selRegion('長野県'));
   assert.deepEqual(plain(map.calls.fitBounds.at(-1).bounds), [137.3, 35.2, 138.7, 37.0]);
   // 今選んでいるものをもう一度選んでも外れない（読み直さない）。地図は同じ範囲なら動かさない
   const n = env.reqs('/api/admin/library/photos').length;
@@ -2582,7 +2637,7 @@ await test('(x3) AC14 ↓↑ で aria-activedescendant を動かし、Enter で�
   keyOn(input, 'ArrowDown');
   keyOn(input, 'Enter');
   await settle();
-  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'pref', pref: '長野県'}, '外れない');
+  assert.deepEqual(plain(env.ev('ls.sel.places')), selRegion('長野県'), '外れない');
   assert.equal(env.reqs('/api/admin/library/photos').length, n);
   // クリックでも決める。強調は要らない。bbox が null の市区町村は地図を動かさない
   const moves = map.calls.fitBounds.length;
@@ -2664,13 +2719,13 @@ await test('(x5) AC14 地図の範囲で隠れている県も選べる: mapBbox 
   assert.equal(env.ev('ls.mapBbox'), null, '地図の範囲による絞り込みは外れる');
   assert.equal(env.last('/api/admin/library/places').get('bbox'), null, 'カードは bbox なしで読み直した');
   assert.deepEqual(pcards(env).map(cardName), ['長野県', '東京都', '千葉県', '愛媛県', '北海道']);
-  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'city', pref: '長野県', city: '松本市'});
-  assert.equal(env.last('/api/admin/library/photos').get('pref'), '長野県');
+  assert.deepEqual(plain(env.ev('ls.sel.places')), selCity('長野県', '松本市'));
+  assert.equal(env.last('/api/admin/library/photos').get('region'), jpId('長野県'));
   assert.equal(env.last('/api/admin/library/photos').get('city'), '松本市');
-  const pref = pcards(env).find(c => c.dataset.key === '長野県');
+  const pref = pcards(env).find(c => c.dataset.key === rkey('長野県'));
   assert.ok(pref.classList.contains('has-cities'), 'カードを読み直したあとにチップが出る');
-  assert.equal(cityChips(pref).find(c => c.dataset.key === '長野県/松本市').getAttribute('aria-pressed'), 'true');
-  assert.equal(env.$('#lib-note').textContent, '5 都道府県');
+  assert.equal(cityChips(pref).find(c => c.dataset.key === rkey('長野県') + '/松本市').getAttribute('aria-pressed'), 'true');
+  assert.equal(env.$('#lib-note').textContent, '1 か国');
   assert.deepEqual(plain(mapOf(env).calls.fitBounds.at(-1).bounds), [137.8, 36.1, 138.1, 36.4]);
   // 読み直しの間に別の操作（view を替える）があれば、読み直したあとに選ばない
   mapOf(env).endMove();
@@ -2713,7 +2768,7 @@ await test('(x5b) AC14 R14 候補を決めたあとの読み直しの間に、�
   await settle();
   const input = comboBox(env);
   const choose = text => { typeInto(input, text); keyOn(input, 'ArrowDown'); keyOn(input, 'Enter'); };
-  const prefSel = {kind: 'pref', pref: '愛媛県'};
+  const prefSel = selRegion('愛媛県');
   // 隠れている長野県 松本市を候補から決める（読み直しを保留）→ 保留中に愛媛県を候補から再選択
   held.hold = true;
   choose('松本');
@@ -3082,4 +3137,424 @@ await test('(w5) AC13 年をまたぐ月から月: 月を起点にして年を�
     assert.equal(env.ev('ls.monthYear'), null);
     assert.equal(chipYear(), '2025');
   }
+});
+
+// ---- 国・地域のカード（段③ T6）。合成の応答: 日本（都道府県・地域不明・境界データだけの県）・フランス・ドイツ（同名の地域）・フィジー（日付変更線をまたぐ） ----
+const cvr = n => ({id: n, thumb_url: '/thumb/' + n + '.jpg?v=' + String(n).padStart(12, 'e')});
+const item = (count, o = {}) => ({count, cover: cvr(900 + count), bbox: [10, 10, 20, 20], fit_bbox: [10, 10, 20, 20], ...o});
+const noItem = () => ({count: 0, cover: null, bbox: null, fit_bbox: null});
+const BAD_NAME = '<img src=x onerror=alert(1)>';
+const intlBody = (over = {}) => ({ok: true, abroad: 0, classification_available: true, classification_pending: 0,
+  prefs: [
+    {pref: '架空県', count: 46, cover: cvr(701), bbox: [130, 30, 132, 32],
+     cities: [{city: '見本町', count: 8, bbox: [130.5, 30.5, 130.6, 30.6]}, {city: '試験市', count: 38, bbox: [131, 31, 131.5, 31.5]}]},
+    {pref: '試験県', count: 3, cover: null, bbox: null, cities: []}],
+  countries: [
+    {id: JP, name: '日本', aliases: ['日本', 'Japan'], count: 60, cover: cvr(701), bbox: [130, 30, 132, 32], fit_bbox: [130, 30, 132, 32], regions: [
+      {id: jpId('架空県'), name: '架空県', aliases: [], count: 50, cover: cvr(701), bbox: [130, 30, 132, 32], fit_bbox: [130, 30, 132, 32], pref: '架空県', boundary_only: 4},
+      {id: jpId('境界県'), name: '境界県', aliases: [], count: 5, cover: cvr(702), bbox: [140, 40, 141, 41], fit_bbox: [140, 40, 141, 41], pref: '境界県', boundary_only: 5},
+      {id: jpId('試験県'), name: '試験県', aliases: [], count: 3, cover: null, bbox: null, fit_bbox: null, pref: '試験県', boundary_only: 0}],
+     region_unknown: item(2)},
+    {id: 'ne:FRA', name: 'フランス', aliases: ['France'], count: 30, cover: cvr(710), bbox: [-4, 43, 7, 50], fit_bbox: [-4, 43, 7, 50], regions: [
+      {id: 'ne:FRA-r1', name: '中央', aliases: [], count: 20, cover: cvr(711), bbox: [1, 46, 3, 48], fit_bbox: [1, 46, 3, 48]},
+      {id: 'ne:FRA-r2', name: BAD_NAME, aliases: [], count: 10, cover: cvr(712), bbox: [4, 44, 5, 45], fit_bbox: [4, 44, 5, 45]}],
+     region_unknown: noItem()},
+    {id: 'ne:DEU', name: 'ドイツ', aliases: ['Germany'], count: 10, cover: cvr(720), bbox: [6, 47, 14, 54], fit_bbox: [6, 47, 14, 54], regions: [
+      {id: 'ne:DEU-r1', name: '中央', aliases: [], count: 10, cover: cvr(721), bbox: [9, 50, 10, 51], fit_bbox: [9, 50, 10, 51]}],
+     region_unknown: noItem()},
+    {id: 'ne:FJI', name: 'フィジー', aliases: ['Fiji'], count: 4, cover: cvr(730), bbox: [-180, -20, 180, -15], fit_bbox: null, regions: [
+      {id: 'ne:FJI-r1', name: '西部', aliases: [], count: 2, cover: cvr(731), bbox: [177, -18, 180, -16], fit_bbox: [177, -18, 180, -16]},
+      {id: 'ne:FJI-r2', name: '日付変更線の地域', aliases: [], count: 1, cover: cvr(732), bbox: [-180, -18, 180, -16], fit_bbox: null},
+      {id: 'ne:FJI-r3', name: '範囲外の地域', aliases: [], count: 1, cover: cvr(733), bbox: [200, -17, 210, -16], fit_bbox: [200, -17, 210, -16]}],
+     region_unknown: item(1, {bbox: [-180, -19, 180, -15], fit_bbox: null})}],
+  unknown: {unclassified: item(6, {fit_bbox: null}), no_location: {count: 4, cover: cvr(740), bbox: null, fit_bbox: null}},
+  ...over});
+const useIntl = (env, over) => { env.handlers.places = () => reply(intlBody(over)); };
+const intlEnv = async over => {
+  const env = makeEnv();
+  useIntl(env, over);
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  return env;
+};
+const photoQ = env => env.last('/api/admin/library/photos');
+const hintOf = env => env.$('#lib-map-hint').textContent;
+const press = async (env, card) => { mainOf(card).click(); await settle(); };
+const HINT = 'この地域は地図を移動して確認できます';
+
+await test('(t6a) AC1 国のカード: API の並び（件数降順）・表紙・枚数。初回は日本の地域（地域不明も）だけ展開し、写真・地図・選択は動かさない。地域未判定・場所不明は国の後ろ。名前は textContent だけ', async () => {
+  const env = await intlEnv();
+  assert.deepEqual(ccards(env).map(cardName), ['日本', 'フランス', 'ドイツ', 'フィジー']);
+  assert.deepEqual(ccards(env).map(cardCount), ['60 枚', '30 枚', '10 枚', '4 枚']);
+  assert.deepEqual(allCards(env).map(cardName), ['日本', '架空県', '境界県', '試験県', '地域不明', 'フランス', 'ドイツ', 'フィジー', '地域未判定', '場所不明']);
+  assert.deepEqual(allCards(env).map(c => c.dataset.key), [JP, rkey('架空県'), rkey('境界県'), rkey('試験県'), JP + '/!unknown', 'ne:FRA', 'ne:DEU', 'ne:FJI', 'unclassified', 'no_location'],
+    'キーは国 ID・地域 ID（名前ではない）');
+  assert.equal(mainOf(ccards(env)[1]).querySelector('.lib-cover img').src, '/thumb/710.jpg?v=eeeeeeeee710');
+  assert.equal(mainOf(cardByKey(env, 'no_location')).querySelector('.lib-cover img').src, '/thumb/740.jpg?v=eeeeeeeee740');
+  assert.deepEqual(ccards(env).map(c => mainOf(c).getAttribute('aria-expanded')), ['true', 'false', 'false', 'false']);
+  assert.equal(env.ev('ls.openCountry'), JP);
+  assert.equal(env.ev('ls.sel.places'), null, '展開だけで選ばない');
+  assert.equal(env.reqs('/api/admin/library/photos').length, 0, '写真を読まない');
+  assert.equal(mapOf(env).calls.fitBounds.length, 0, '地図を動かさない');
+  assert.equal(hidden(env, '#lib-detail'), true);
+  assert.equal(env.$('#lib-note').textContent, '4 か国');
+  assert.ok(allCards(env).every(c => mainOf(c).tagName === 'BUTTON' && mainOf(c).getAttribute('aria-pressed') === 'false'), '主ボタンは button（Enter・Space は click になる）');
+  // 名前は textContent で入る（HTML として解釈しない）
+  await press(env, ccards(env)[1]);
+  const evil = cardByKey(env, 'ne:FRA/ne:FRA-r2');
+  assert.equal(cardName(evil), BAD_NAME);
+  assert.equal(evil.querySelectorAll('img').length, 1, '表紙の img だけ（名前から img は生えない）');
+  assert.equal(evil.querySelectorAll('img')[0].src.startsWith('/thumb/'), true);
+});
+
+await test('(t6b) AC1・AC11 他国を押す: その国の写真（country）と地域の一覧へ切り替え（日本の展開は閉じる）。フォーカスは押したボタンに残る。地域で country&region。同じ項目をもう一度押すと選択解除（展開は残る）。同名の地域は ID で区別する', async () => {
+  const env = await intlEnv();
+  const map = mapOf(env);
+  await press(env, ccards(env)[1]);                      // フランス
+  let q = photoQ(env);
+  assert.equal(q.get('country'), 'ne:FRA');
+  ['region', 'region_unknown', 'pref', 'city', 'abroad', 'unclassified', 'no_location', 'bbox'].forEach(k => assert.equal(q.get(k), null, k));
+  assert.equal(env.$('#lib-sel').textContent, 'フランス');
+  assert.equal(hidden(env, '#lib-detail'), false);
+  assert.equal(tiles(env).length, 3);
+  assert.deepEqual(allCards(env).map(cardName), ['日本', 'フランス', '中央', BAD_NAME, 'ドイツ', 'フィジー', '地域未判定', '場所不明'], '日本は閉じ、フランスの地域が続く（地域不明は 0 件なので出ない）');
+  assert.equal(env.ev('ls.openCountry'), 'ne:FRA');
+  const fra = cardByKey(env, 'ne:FRA');
+  assert.ok(fra.classList.contains('is-selected'));
+  assert.equal(mainOf(fra).getAttribute('aria-pressed'), 'true');
+  assert.equal(mainOf(fra).getAttribute('aria-expanded'), 'true');
+  same(env.document.activeElement, mainOf(fra), '一覧を作り直しても押したボタンにフォーカスが残る');
+  assert.deepEqual(plain(map.calls.fitBounds), [{bounds: [-4, 43, 7, 50], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}}], 'fit_bbox に合わせる');
+  // 地域
+  await press(env, cardByKey(env, 'ne:FRA/ne:FRA-r1'));
+  q = photoQ(env);
+  assert.equal(q.get('country'), 'ne:FRA');
+  assert.equal(q.get('region'), 'ne:FRA-r1');
+  assert.equal(env.$('#lib-sel').textContent, 'フランス 中央');
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'region', country: 'ne:FRA', region: 'ne:FRA-r1', pref: '', label: 'フランス 中央'});
+  assert.ok(cardByKey(env, 'ne:FRA/ne:FRA-r1').classList.contains('is-selected'));
+  assert.ok(!fra.classList.contains('is-selected'), '国のカードの選択は外れる');
+  assert.equal(cardByKey(env, 'ne:FRA/ne:FRA-r1').querySelector('.lib-cities'), null, '日本以外の地域に市区町村のチップは無い');
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1).bounds), [1, 46, 3, 48]);
+  // 国のカードをまた押すと（選択は地域なので）国全体を選ぶ。地域をもう一度押すと外れる
+  await press(env, cardByKey(env, 'ne:FRA'));
+  assert.equal(photoQ(env).get('region'), null);
+  assert.equal(env.ev('ls.sel.places.kind'), 'country');
+  await press(env, cardByKey(env, 'ne:FRA'));
+  assert.equal(env.ev('ls.sel.places'), null, '同じ国をもう一度押すと選択解除');
+  assert.equal(hidden(env, '#lib-detail'), true);
+  assert.equal(env.ev('ls.openCountry'), 'ne:FRA', '解除しても地域の展開は残る');
+  assert.equal(pcards(env).length, 2);
+  // ドイツ: 同名の「中央」でも国・地域 ID が別なので、別の選択になる（外れずに切り替わる）
+  await press(env, cardByKey(env, 'ne:DEU'));
+  assert.equal(photoQ(env).get('country'), 'ne:DEU');
+  await press(env, cardByKey(env, 'ne:DEU/ne:DEU-r1'));
+  assert.equal(photoQ(env).get('region'), 'ne:DEU-r1');
+  assert.equal(photoQ(env).get('country'), 'ne:DEU');
+  await press(env, cardByKey(env, 'ne:DEU/ne:DEU-r1'));
+  assert.equal(env.ev('ls.sel.places'), null);
+  await press(env, ccards(env)[0]);                      // 日本へ戻す: 日本の地域に切り替わる
+  assert.equal(photoQ(env).get('country'), JP);
+  assert.deepEqual(allCards(env).slice(0, 5).map(cardName), ['日本', '架空県', '境界県', '試験県', '地域不明']);
+});
+
+await test('(t6c) AC2 日本の地域: 市区町村のチップ（旧 prefs の同名の行・件数順）と「市区町村未取得 N」（絞り込みは無い）。市区町村は country&region&city。チップが無くても未取得だけ出す', async () => {
+  const env = await intlEnv();
+  const map = mapOf(env);
+  await press(env, pcards(env)[0]);                      // 架空県
+  let q = photoQ(env);
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('region'), jpId('架空県'));
+  assert.equal(q.get('city'), null);
+  assert.equal(q.get('pref'), null);
+  const card = cardByKey(env, rkey('架空県'));
+  assert.ok(card.classList.contains('has-cities'));
+  assert.deepEqual(cityChips(card).map(x => x.textContent), ['試験市38', '見本町8']);
+  const missing = card.querySelector('.lib-cities .lib-missing');
+  assert.equal(missing.textContent, '市区町村未取得 4');
+  assert.notEqual(missing.tagName, 'BUTTON', '絞り込みは無い（押せない）');
+  const before = env.reqs('/api/admin/library/photos').length;
+  missing.click();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, before);
+  const chips = cityChips(card);
+  chips[1].click();                                      // 見本町
+  await settle();
+  q = photoQ(env);
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('region'), jpId('架空県'));
+  assert.equal(q.get('city'), '見本町');
+  assert.equal(env.$('#lib-sel').textContent, '日本 架空県 見本町');
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1).bounds), [130.5, 30.5, 130.6, 30.6]);
+  same(cityChips(card)[1], chips[1], 'チップを作り直さない');
+  assert.equal(chips[1].getAttribute('aria-pressed'), 'true');
+  assert.ok(card.classList.contains('is-selected'));
+  chips[1].click();                                      // 同じチップ → 解除
+  await settle();
+  assert.equal(env.ev('ls.sel.places'), null);
+  assert.equal(card.querySelector('.lib-cities'), null, '選択が無くなると地域のチップは閉じる（従来どおり）');
+  // 旧 prefs に行が無い県（境界データだけ）は未取得の数だけ。取得済みで未取得 0 の県は何も付かない
+  await press(env, pcards(env)[1]);                      // 境界県
+  const edge = cardByKey(env, rkey('境界県'));
+  assert.deepEqual(cityChips(edge).map(x => x.textContent), []);
+  assert.equal(edge.querySelector('.lib-cities').textContent, '市区町村未取得 5');
+  assert.equal(card.querySelector('.lib-cities'), null, '前の県のチップは消える');
+  await press(env, pcards(env)[2]);                      // 試験県（市区町村 0・未取得 0）
+  assert.equal(cardByKey(env, rkey('試験県')).querySelector('.lib-cities'), null);
+  assert.ok(!cardByKey(env, rkey('試験県')).classList.contains('has-cities'));
+  // 日本の地域不明
+  await press(env, cardByKey(env, JP + '/!unknown'));
+  q = photoQ(env);
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('region_unknown'), '1');
+  assert.equal(q.get('region'), null);
+  assert.equal(env.$('#lib-sel').textContent, '日本 地域不明');
+});
+
+await test('(t6d) AC1 地域不明（各国）・地域未判定・場所不明: 選ぶと region_unknown／unclassified／no_location。0 件なら出さない。場所不明は地図を動かさず案内も出さない', async () => {
+  const env = await intlEnv();
+  const map = mapOf(env);
+  await press(env, ccards(env)[3]);                      // フィジー（日付変更線）
+  await press(env, cardByKey(env, 'ne:FJI/!unknown'));
+  let q = photoQ(env);
+  assert.equal(q.get('country'), 'ne:FJI');
+  assert.equal(q.get('region_unknown'), '1');
+  assert.equal(env.$('#lib-sel').textContent, 'フィジー 地域不明');
+  await press(env, cardByKey(env, 'unclassified'));
+  q = photoQ(env);
+  assert.equal(q.get('unclassified'), '1');
+  ['country', 'region', 'region_unknown', 'no_location', 'pref', 'abroad'].forEach(k => assert.equal(q.get(k), null, k));
+  assert.equal(env.$('#lib-sel').textContent, '地域未判定');
+  assert.equal(env.ev('ls.openCountry'), 'ne:FJI', '国の外の項目では展開を替えない');
+  const fits = map.calls.fitBounds.length;
+  await press(env, cardByKey(env, 'no_location'));
+  q = photoQ(env);
+  assert.equal(q.get('no_location'), '1');
+  assert.equal(q.get('unclassified'), null);
+  assert.equal(env.$('#lib-sel').textContent, '場所不明');
+  assert.equal(map.calls.fitBounds.length, fits, '位置が無いので地図は動かさない');
+  assert.equal(hintOf(env), '', '案内も出さない');
+  await press(env, cardByKey(env, 'no_location'));
+  assert.equal(env.ev('ls.sel.places'), null, '同じ項目をもう一度押すと解除');
+  // 0 件なら出さない（日本の地域不明・地域未判定・場所不明。展開中のフィジーの地域不明は 1 件なので残る）
+  const bodyNone = intlBody({unknown: {unclassified: noItem(), no_location: noItem()}});
+  bodyNone.countries[0].region_unknown = noItem();
+  const calm = makeEnv();
+  calm.handlers.places = () => reply(bodyNone);
+  await calm.boot();
+  await openLib(calm);
+  await openPlaces(calm);
+  assert.deepEqual(allCards(calm).map(cardName), ['日本', '架空県', '境界県', '試験県', 'フランス', 'ドイツ', 'フィジー']);
+  await press(calm, ccards(calm)[3]);
+  assert.deepEqual(allCards(calm).map(cardName).slice(3), ['フィジー', '西部', '日付変更線の地域', '範囲外の地域', '地域不明']);
+});
+
+await test('(t6e) 処理待ちと旧 DB: classification_pending があれば「処理待ち N 枚」、0 なら出さない。classification_available:false（旧 DB・日本だけ）でも国・地域・市区町村を選べ、分類がまだ始まっていないと短く示す', async () => {
+  const env = await intlEnv({classification_pending: 3});
+  assert.equal(env.$('#lib-place-status').textContent, '処理待ち 3 枚');
+  const calm = makeEnv();
+  useIntl(calm);
+  await calm.boot();
+  await openLib(calm);
+  await openPlaces(calm);
+  assert.equal(calm.$('#lib-place-status').textContent, '', '0 件なら出さない');
+  // 旧 DB: 日本だけ。地域未判定は旧の未分類
+  const body = intlBody({classification_available: false, classification_pending: 0});
+  body.countries = body.countries.slice(0, 1);
+  body.unknown = {unclassified: item(9, {fit_bbox: null}), no_location: noItem()};
+  const old = makeEnv();
+  old.handlers.places = () => reply(body);
+  await old.boot();
+  await openLib(old);
+  await openPlaces(old);
+  assert.equal(old.$('#lib-place-status').textContent, '国・地域の分類はまだ始まっていません');
+  assert.deepEqual(allCards(old).map(cardName), ['日本', '架空県', '境界県', '試験県', '地域不明', '地域未判定']);
+  await press(old, pcards(old)[0]);
+  assert.equal(photoQ(old).get('region'), jpId('架空県'));
+  cityChips(cardByKey(old, rkey('架空県')))[0].click();
+  await settle();
+  assert.equal(photoQ(old).get('city'), '試験市');
+  await press(old, cardByKey(old, 'unclassified'));
+  assert.equal(photoQ(old).get('unclassified'), '1');
+  assert.equal(hintOf(old), HINT, '範囲があっても fit_bbox が無ければ案内を出す');
+  // countries の無い古い応答でも壊れない（空の一覧）
+  const bare = makeEnv();
+  bare.handlers.places = () => reply({ok: true, countries: 'x', prefs: [], abroad: 0});
+  await bare.boot();
+  await openLib(bare);
+  await openPlaces(bare);
+  assert.equal(bare.$('#lib-place-cards').textContent, '写真がありません');
+});
+
+await test('(t6f) AC11 古い応答の破棄: 国を押した直後に別の国・地域・解除をしても、遅れて届いた前の写真は出さない（gen/seq）', async () => {
+  const env = await intlEnv();
+  const held = {};
+  env.handlers.photos = params => {
+    const key = params.get('country') + '/' + (params.get('region') || '');
+    if(key === 'ne:FRA/' || key === 'ne:FRA/ne:FRA-r1'){
+      return new Promise(res => { held[key] = () => res(jsonRes({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [P503]})); });
+    }
+    return null;
+  };
+  await press(env, cardByKey(env, 'ne:FRA'));            // フランス（保留）
+  assert.equal(tiles(env).length, 0);
+  await press(env, cardByKey(env, 'ne:DEU'));            // ドイツ（すぐ届く: GRID の 3 枚）
+  assert.equal(tiles(env).length, 3);
+  held['ne:FRA/']();
+  await settle();
+  assert.equal(tiles(env).length, 3, '遅れたフランスの 1 枚は捨てる');
+  assert.equal(env.$('#lib-sel').textContent, 'ドイツ');
+  // 保留中に解除
+  await press(env, cardByKey(env, 'ne:FRA'));            // フランス（保留）
+  assert.equal(held['ne:FRA/'] !== undefined, true);
+  await press(env, cardByKey(env, 'ne:FRA/ne:FRA-r1'));  // フランス 中央（保留）
+  await press(env, cardByKey(env, 'ne:FRA/ne:FRA-r1'));  // 外す
+  held['ne:FRA/ne:FRA-r1']();
+  held['ne:FRA/']();
+  await settle();
+  assert.equal(env.ev('ls.sel.places'), null);
+  assert.equal(tiles(env).length, 0, '解除したあとに届いた応答は出さない');
+  assert.equal(hidden(env, '#lib-detail'), true);
+  // 除外の切り替えでも、飛んでいる国の応答は捨てる
+  await press(env, cardByKey(env, 'ne:FRA'));
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  const reqs = env.reqs('/api/admin/library/photos').length;
+  held['ne:FRA/']();
+  await settle();
+  assert.equal(env.reqs('/api/admin/library/photos').length, reqs);
+  assert.equal(photoQ(env).get('hidden'), '1');
+  assert.equal(photoQ(env).get('country'), 'ne:FRA', '選択は残り、除外を含めて読み直す');
+});
+
+await test('(t6g) AC3・AC11 地図: fit_bbox に合わせる（libMove 付き・bbox の絞り込みを足さない）。fit_bbox が null（日付変更線をまたぐ）か不正なら動かさず、世界全体へも飛ばさず、案内を出す。次の選択・利用者の移動で案内は消える', async () => {
+  const env = await intlEnv();
+  const map = mapOf(env);
+  const camera = () => JSON.stringify([env.fake.center, env.fake.zoom, env.fake.bounds]);
+  await press(env, cardByKey(env, 'ne:FRA'));
+  assert.deepEqual(plain(map.calls.fitBounds.map(f => f.bounds)), [[-4, 43, 7, 50]]);
+  assert.equal(hintOf(env), '');
+  map.endMove();                                         // 着いた（libMove 付きの moveend）
+  await settle();
+  assert.equal(env.ev('ls.mapBbox'), null, 'カードによる移動で絞り込みを足さない');
+  placeQs(env).forEach(q => assert.equal(q.get('bbox'), null));
+  // フィジー: bbox は経度の全域だが fit_bbox は null → 動かさない
+  const cam = camera();
+  const fits = map.calls.fitBounds.length;
+  await press(env, cardByKey(env, 'ne:FJI'));
+  assert.equal(photoQ(env).get('country'), 'ne:FJI', '写真は国 ID で絞る');
+  assert.equal(map.calls.fitBounds.length, fits, '地図を動かさない');
+  assert.equal(map.calls.easeTo.length + map.calls.flyTo.length, 0);
+  assert.equal(camera(), cam, '現在位置のまま（世界全体へ飛ばない）');
+  assert.equal(hintOf(env), HINT);
+  assert.equal(env.$('#lib-map-hint').getAttribute('role'), 'status');
+  env.$('#lib-hidden').checked = true;                   // 除外の切り替えでは選択も位置も変わらないので、案内は残る
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  assert.equal(hintOf(env), HINT);
+  env.$('#lib-hidden').checked = false;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  // 日付変更線の手前の地域は合わせる。案内は選択が替わると消える
+  await press(env, cardByKey(env, 'ne:FJI/ne:FJI-r1'));
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1).bounds), [177, -18, 180, -16]);
+  assert.equal(hintOf(env), '');
+  // 日付変更線をまたぐ地域・範囲外の fit_bbox・地域不明（fit_bbox null）
+  for(const key of ['ne:FJI/ne:FJI-r2', 'ne:FJI/ne:FJI-r3', 'ne:FJI/!unknown']){
+    const n = map.calls.fitBounds.length;
+    await press(env, cardByKey(env, key));
+    assert.equal(map.calls.fitBounds.length, n, key + ': 動かさない');
+    assert.equal(hintOf(env), HINT, key + ': 案内');
+    assert.equal(photoQ(env).get('country'), 'ne:FJI', key);
+  }
+  assert.equal(photoQ(env).get('region_unknown'), '1');
+  assert.equal(camera(), cam);
+  assert.equal(env.ev('ls.mapBbox'), null);
+  // 地域未判定: bbox はあるが fit_bbox が null → 案内
+  await press(env, cardByKey(env, 'unclassified'));
+  assert.equal(hintOf(env), HINT);
+  // 解除すると案内も消える。利用者が地図を動かしても消える
+  await press(env, cardByKey(env, 'unclassified'));
+  assert.equal(hintOf(env), '');
+  await press(env, cardByKey(env, 'ne:FJI'));
+  assert.equal(hintOf(env), HINT);
+  userMove(env, {bounds: {w: 170, s: -20, e: 179, n: -15}, center: {lng: 175, lat: -17}});
+  await settle();
+  assert.equal(hintOf(env), '', '利用者が動かしたら案内は役目を終える');
+  assert.deepEqual(plain(env.ev('ls.mapBbox')), [170, -20, 179, -15], '絞り込みは利用者の移動のときだけ');
+  // 日本の fit_bbox が無い地域（試験県: 位置のある写真なし）は案内も出さない
+  env.handlers.places = () => reply(intlBody());
+  await press(env, cardByKey(env, 'ne:FRA'));
+  await press(env, ccards(env)[0]);
+  const n = map.calls.fitBounds.length;
+  await press(env, cardByKey(env, rkey('試験県')));
+  assert.equal(map.calls.fitBounds.length, n);
+  assert.equal(hintOf(env), '');
+});
+
+await test('(t6h) AC3 地図の点は場所の選択で消えず読み直さない（points に場所の条件を付けない）。国・地域の選択は places のカード読み込みも増やさない', async () => {
+  const env = await intlEnv();
+  const map = mapOf(env);
+  const pointReqs = () => env.reqs('/api/admin/library/points');
+  const n = pointReqs().length;
+  assert.equal(n, 1);
+  const sets = () => (map.sources.photos ? map.sources.photos.setDataCalls.length : 0);
+  const s0 = sets();
+  const places0 = env.reqs('/api/admin/library/places').length;
+  for(const key of ['ne:FRA', 'ne:FRA/ne:FRA-r1', 'unclassified', 'no_location', 'ne:FJI', 'ne:FJI/ne:FJI-r2']){
+    await press(env, cardByKey(env, key));
+  }
+  assert.equal(pointReqs().length, n, '点は読み直さない');
+  assert.equal(sets(), s0, '点は差し替えない（消えない）');
+  assert.equal(env.reqs('/api/admin/library/places').length, places0, '選択ではカードも読み直さない');
+  pointReqs().forEach(c => {
+    const q = qOf(c);
+    ['country', 'region', 'region_unknown', 'unclassified', 'no_location', 'pref', 'city', 'bbox'].forEach(k => assert.equal(q.get(k), null, k));
+  });
+  assert.equal(env.ev('ls.pointsStale'), false);
+  map.endMove();
+  await settle();
+  assert.equal(env.ev('ls.mapBbox'), null);
+  assert.equal(env.reqs('/api/admin/library/places').length, places0, 'カードの移動の moveend ではカードを絞らない');
+});
+
+await test('(t6i) 選択は国 ID・地域 ID が同一性: 同じ名前の地域・市区町村が別の国・県にあっても混ざらない。期間・除外のあいだも country/region を送る。カードの読み直しで展開を失わない', async () => {
+  const env = await intlEnv();
+  await press(env, cardByKey(env, 'ne:FRA'));
+  await press(env, cardByKey(env, 'ne:FRA/ne:FRA-r1'));
+  const sel = plain(env.ev('ls.sel.places'));
+  assert.equal(sel.region, 'ne:FRA-r1');
+  // 地図を動かすとカードが読み直される: 展開も選択も残り、押したカードの見た目が戻る
+  userMove(env, {bounds: {w: 0, s: 45, e: 4, n: 49}, center: {lng: 2, lat: 47}});
+  await settle();
+  assert.equal(env.ev('ls.openCountry'), 'ne:FRA');
+  assert.ok(cardByKey(env, 'ne:FRA/ne:FRA-r1').classList.contains('is-selected'));
+  assert.equal(mainOf(cardByKey(env, 'ne:FRA/ne:FRA-r1')).getAttribute('aria-pressed'), 'true');
+  assert.deepEqual(plain(env.ev('ls.sel.places')), sel);
+  // 除外を含める: 同じ選択で読み直す
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  const q = photoQ(env);
+  assert.equal(q.get('hidden'), '1');
+  assert.equal(q.get('country'), 'ne:FRA');
+  assert.equal(q.get('region'), 'ne:FRA-r1');
+  // 期間: 旅の「地図で見る」でも、国の選択に from/to が付く
+  env.$('#lib-view-trips').click();
+  await settle();
+  mapBtnOf(env, 0).click();
+  await settle();
+  await press(env, cardByKey(env, 'ne:DEU') || ccards(env)[2]);
+  const p = photoQ(env);
+  assert.equal(p.get('country'), 'ne:DEU');
+  assert.equal(p.get('from'), A);
+  assert.equal(p.get('to'), Z);
+  // 期間を解除すると、選択はそのまま期間なしで読み直す
+  env.$('#lib-period-clear').click();
+  await settle();
+  const r = photoQ(env);
+  assert.equal(r.get('country'), 'ne:DEU');
+  assert.equal(r.get('from'), null);
 });

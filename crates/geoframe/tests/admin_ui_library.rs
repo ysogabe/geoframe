@@ -126,10 +126,11 @@ fn a_narrow_screen_scrolls_the_library_card_rows_sideways() {
     assert!(found, "幅 640px 以下の @media に .lib-cards の規則が無い");
 }
 
-/// AC1（場所）: 場所の画面は左の列（期間の表示と都道府県のカード）と右の列（地図・詳細）。都道府県のカードは左の列に 2 列。
-/// 選んだ県のカードは 2 列を使い切って市区町村のチップを出す
+/// AC1（場所）: 場所の画面は左の列（期間の表示と国・地域のカード）と右の列（地図・詳細）。カードは左の列に 2 列。
+/// 展開した国と、選んだ日本の地域のカードは 2 列を使い切る（地域のカードが続く・市区町村のチップを出す）。
+/// 短い案内（処理待ち・分類の準備）と地図の案内は折り返す
 #[test]
-fn the_place_screen_has_a_card_column_on_the_left_with_two_columns_of_prefectures() {
+fn the_place_screen_has_a_card_column_on_the_left_with_two_columns_of_cards() {
     let css = compact_css();
     let place = rule_body(&css, ".lib-place").expect(".lib-place の規則が無い");
     assert!(place.contains("display:grid"), "{place}");
@@ -144,16 +145,44 @@ fn the_place_screen_has_a_card_column_on_the_left_with_two_columns_of_prefecture
     let cards = rule_body(&css, ".lib-place-cards").expect(".lib-place-cards の規則が無い");
     assert!(
         cards.contains("grid-template-columns:repeat(2,minmax(0,1fr))"),
-        "都道府県のカードは 2 列: {cards}"
+        "国・地域のカードは 2 列: {cards}"
     );
-    let open = rule_body(&css, ".lib-place-cards.lib-card.has-cities")
-        .expect("選んだ県のカードの規則が無い");
+    let open = rule_body(
+        &css,
+        ".lib-place-cards.lib-card.has-cities,.lib-place-cards.lib-card.has-regions",
+    )
+    .expect("展開した国・選んだ地域のカードの規則が無い");
     assert!(open.contains("grid-column:1/-1"), "{open}");
+    // 地域のカードは国のカードの続きと分かる印を持つ
+    assert!(rule_body(&css, ".lib-place-cards.lib-region").is_some());
+    // 案内は折り返す。中身が空なら出さない
+    let status = rule_body(&css, ".lib-place-status").expect("処理待ちの案内の規則が無い");
+    assert!(status.contains("overflow-wrap:anywhere"), "{status}");
+    assert!(rule_body(&css, ".lib-place-status:empty").is_some_and(|b| b.contains("display:none")));
+    let hint = rule_body(&css, ".lib-map-hint").expect("地図の案内の規則が無い");
+    assert!(hint.contains("overflow-wrap:anywhere"), "{hint}");
     // 地図は画面の高さの 55%（旧: min-height:320px のみ）
     let map = rule_body(&css, "#lib-map").expect("#lib-map の規則が無い");
     assert!(map.contains("height:55vh"), "{map}");
     // 選べない「ほか N」の行はボタンにしない（スタイルは別のクラス）
     assert!(rule_body(&css, ".lib-more").is_some());
+}
+
+/// 幅 640px 以下: 展開した国・選んだ地域のカードも、横スクロールの 1 段の中では列を使い切らず 1 枚分の幅のまま
+#[test]
+fn a_narrow_screen_keeps_expanded_place_cards_in_the_scrolling_row() {
+    let css = compact_css();
+    let mut from = 0;
+    let mut found = false;
+    while let Some((at, body)) = block_after(&css, "@media(max-width:640px){", from) {
+        from = at + 1;
+        if body.contains(
+            ".lib-place-cards.lib-card.has-cities,.lib-place-cards.lib-card.has-regions{grid-column:auto}",
+        ) {
+            found = true;
+        }
+    }
+    assert!(found, "幅 640px 以下の @media に展開したカードの規則が無い");
 }
 
 /// AC9・AC12・AC14（見た目）: 探す欄（`.lib-in`）・コンボボックスの包み（`.lib-combo`）は `.hidden` で出し入れするので、display を持つ規則には
