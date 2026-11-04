@@ -18,7 +18,7 @@
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
 | T4 | 場所の区分の規則（共通 SQL 片）と `places` の拡張（`countries`・`regions`・`boundary_only`・`unknown`・旧DB分岐） | AC1, AC2, AC3, AC5, AC9 | T3 | full | 完了 | b99a7d5 | ce73db4..3c75c0b | レビュー Sol 2 回、必須なし。推奨 4 件を修正（cities の重複をやめ日本の地域は pref で旧 prefs を引く、性能、表紙順位の試験、経度 180 度超の試験）。性能目標を「1.5 倍以内または増加 5ms 以内」に改めた（欧州 bbox 1.43→2.92ms） |
-| T5 | `photos` の旧形式/新形式の絞り込み・`q` 検索（日本の固定別名表）・trips・`location_region` | AC1, AC2, AC4, AC7 | T4 | full | 実装中 | 9a23754 | | |
+| T5 | `photos` の旧形式/新形式の絞り込み・`q` 検索（日本の固定別名表）・trips・`location_region` | AC1, AC2, AC4, AC7 | T4 | full | 完了 | 9a23754 | 7c793cb | レビュー Sol 1 回、指摘なし。trips 1.45 倍、q +2.6ms。photos.js の location_region 正規化と座標変更時の消去は T7 |
 
 ## 段③（PR 3）: 画面
 
