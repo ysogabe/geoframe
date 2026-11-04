@@ -4,11 +4,13 @@
 //! - `GET /api/admin/library/photos`: 期間・範囲・ID・地名・日時なし・文字（`q`）で絞った写真のページ。
 //! - `GET /api/admin/library/points`: 位置のある写真の GeoJSON（地図用）。
 //! - `GET /api/admin/library/calendar`: 年・月ごとの件数と、年ごとの代表の写真（日付の眺め方）。
-//! - `GET /api/admin/library/places`: 都道府県・市区町村ごとの件数・範囲（都道府県は代表の写真も）と海外・不明の件数
-//!   （場所の眺め方。期間 `from`・`to` と地図の範囲 `bbox` で絞れる）。
+//! - `GET /api/admin/library/places`: 国・地域ごとの件数・範囲・代表の写真（`countries`）、国が決まらない写真（`unknown`）、
+//!   旧形式の都道府県・市区町村（`prefs`）と海外・不明（`abroad`）（場所の眺め方。期間 `from`・`to` と地図の範囲 `bbox` で絞れる）。
+//!   区分は [`crate::regions::PlaceRules`]（設計「場所の区分の規則」）で 1 つに決まる。
 //!
-//! どれも `photos` 表だけを読む（`photo_curation` などの新しい表が無い DB、`GEOFRAME_INGEST=0` の読み取り専用の起動でも
-//! 動く）。経路は完全一致の `GET` のみで、`server.rs` の `site` が呼ぶ。更新はしない。
+//! 読むのは `photos` 表と、国・地域の分類 `photo_regions` 表（`places` だけ。表が無い旧 DB では結合しない）。`photo_curation`
+//! などの新しい表が無い DB、`GEOFRAME_INGEST=0` の読み取り専用の起動でも動く。経路は完全一致の `GET` のみで、`server.rs` の
+//! `site` が呼ぶ。**更新はしない**（分類の表も API からは作らない・書かない）。
 //!
 //! クエリは `/api/admin/photos` と同じく `parse_qs` の最初の値で読む（空の値は無かったことになる）。形が違えば
 //! 400 `bad_params`（値は応答にもログにも出さない）。SQL の条件は固定の文字列の候補だけから組み、値はすべてバインドする。
@@ -25,6 +27,7 @@ use serde_json::{Value, json};
 use crate::admin::{AdminContext, PER_PAGE_MAX, cell, text, thumb_for, truthy};
 use crate::photos::{TRIP_GAP_SECONDS, parse_epoch};
 use crate::pyquery;
+use crate::regions::{self, data};
 use crate::server::{AppState, error_response, json_response};
 
 /// `points` が 1 回で返す点の上限。超えたら撮影日時の新しい順に切る。
@@ -851,61 +854,421 @@ fn union_bounds(a: Option<Bounds>, b: Option<Bounds>) -> Option<Bounds> {
     }
 }
 
-/// 都道府県・市区町村ごとの件数・範囲（`pref` が空でない行）と、海外・不明（`pref` が NULL か空。位置なしも入る）の件数。
-/// `filter`（期間・範囲・除外）は件数・都道府県の代表の写真・範囲と海外・不明のすべてに掛かる。範囲があれば、その中に
-/// 写真の無い都道府県・市区町村は出ず、海外・不明は位置のある写真だけを数える（範囲が位置のある写真だけを残すため）。
-/// 並びは件数の多い順、同数なら名前の順。`city` が空の行は `city: ""` の 1 項目にする。
+/// 国・地域・区分ごとの件数と範囲と代表の写真。
+#[derive(Clone)]
+struct Tally {
+    count: i64,
+    bounds: Option<Bounds>,
+    /// 日本の地域だけ: 境界データで入った（`pref` 空の）写真の数。
+    boundary: i64,
+    /// 代表の写真の鍵（[`COVER_KEY`] の最大。大きいほど代表にふさわしい）。
+    best: Option<String>,
+    /// 位置のある写真の経度の全部。`pref` のある写真（件数が多く、経度を取り出すと重い）を含む組は `None`。
+    lons: Option<Vec<f64>>,
+}
+
+impl Default for Tally {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            bounds: None,
+            boundary: 0,
+            best: None,
+            lons: Some(Vec::new()),
+        }
+    }
+}
+
+impl Tally {
+    fn add(&mut self, other: &Tally, boundary: bool) {
+        self.count += other.count;
+        self.bounds = union_bounds(self.bounds, other.bounds);
+        if boundary {
+            self.boundary += other.count;
+        }
+        if self.best < other.best {
+            self.best.clone_from(&other.best);
+        }
+        self.lons = match (self.lons.take(), &other.lons) {
+            (Some(mut a), Some(b)) => {
+                a.extend_from_slice(b);
+                Some(a)
+            }
+            _ => None,
+        };
+    }
+
+    /// 代表の写真の ID（鍵の末尾の 20 桁）。
+    fn cover_id(&self) -> Option<i64> {
+        let key = self.best.as_deref()?;
+        key.get(key.len().checked_sub(COVER_KEY_ID_DIGITS)?..)?
+            .parse()
+            .ok()
+    }
+}
+
+/// 集計の 1 行（国・地域・`pref`/`city`・場所不明の別で分けた組）。
+struct PlaceGroup {
+    /// 国の ID。決まらない写真（`unclassified`・`no_location`）は `None`。
+    country: Option<String>,
+    /// 地域の ID。地域が決まらない写真は `None`。
+    region: Option<String>,
+    /// `pref` のある写真だけ: `(pref, city)`。
+    pref: Option<(String, String)>,
+    /// `no_location`（`pref` が空で座標が無効）。
+    no_location: bool,
+    tally: Tally,
+}
+
+/// 組の代表の写真を、集計の中で `MAX` だけで選ぶための鍵。[`COVER_ORDER`]（除外でない → 位置がある → 日時がある → 新しい →
+/// ID が大きい）と同じ順位が、文字列として大きいほど上位になるよう、先頭から 3 つの 0/1、日時、ID（20 桁の 0 埋め）を並べる。
+/// 日時のない写真は、日時の文字列が任意の長さなので 16 進にして `-` で区切る（短い方が小さくなる）。日時のある写真は
+/// 固定長の形（[`TIMED`]）。日時のある写真と日時のない写真は先頭の 0/1 で分かれるので、日時の部分を比べ合うことはない。
+/// 窓関数の並べ替えをせず、件数の集計と同じ 1 回の走査で代表が得られる。
+const COVER_KEY: &str = concat!(
+    "CASE WHEN ",
+    timed_sql!(),
+    " THEN printf('%d%d1%s-%020d', COALESCE(hidden,0)=0, lat IS NOT NULL AND lon IS NOT NULL, taken_at, p.id) ",
+    "ELSE printf('%d%d0%s-%020d', COALESCE(hidden,0)=0, lat IS NOT NULL AND lon IS NOT NULL, ",
+    "hex(COALESCE(taken_at,'')), p.id) END"
+);
+/// [`COVER_KEY`] の末尾の ID の桁数。
+const COVER_KEY_ID_DIGITS: usize = 20;
+
+/// 代表の写真の `{id, thumb_url}`。`ids` の写真の表示ファイルは 1 回の読み取りでまとめて引く。
+fn cover_values(
+    conn: &Connection,
+    ctx: &AdminContext,
+    ids: &[i64],
+) -> rusqlite::Result<HashMap<i64, Value>> {
+    let mut out = HashMap::new();
+    for chunk in ids.chunks(500) {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT id, display, drive_id, md5, mtime FROM photos WHERE id IN ({})",
+            vec!["?"; chunk.len()].join(",")
+        ))?;
+        let mut rows = stmt.query(params_from_iter(chunk.iter()))?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let thumb_url =
+                cover_thumb_url(ctx, id, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?);
+            out.insert(id, json!({"id": id, "thumb_url": thumb_url}));
+        }
+    }
+    Ok(out)
+}
+
+/// 通常の範囲の経度の幅がこれ以内なら、空きが戻る間（最大 → 最小）が必ず最大の空きなので、日付変更線をまたがない。
+const FIT_SPAN_FREE: f64 = 180.0;
+
+/// 経度の列から、写真の経度を円周上で覆う最小の区間が日付変更線（±180）をまたぐか。
+/// 隣り合う経度の間（円周上で最後の 1 つは最大から最小へ戻る間）の最大の空きが、最小の区間の外側になる。
+/// 空きが戻る間（最大 → 最小）にあるか、同じ大きさなら、区間は通常の `[最小, 最大]`。それ以外はまたぐ。
+fn spans_dateline(lons: &[f64]) -> bool {
+    let mut lons = lons.to_vec();
+    lons.sort_by(f64::total_cmp);
+    let (Some(first), Some(last)) = (lons.first().copied(), lons.last().copied()) else {
+        return false;
+    };
+    let wrap = 360.0 - (last - first);
+    let inner = lons.windows(2).map(|w| w[1] - w[0]).fold(0.0, f64::max);
+    inner > wrap
+}
+
+/// 件数・範囲・代表の写真 `{count, cover, bbox, fit_bbox}`（国・地域・地域不明・場所不明で同じ形）。
+/// `fit_bbox` は地図の自動 fit 用で、写真の経度を円周上で覆う最小の区間が日付変更線をまたぐなら `null`。
+/// 通常の範囲の経度の幅が [`FIT_SPAN_FREE`] 以内ならその範囲そのまま。それより広いときは、経度が全部そろっていれば
+/// 最小の区間で確かめ、`pref` のある写真を含む（経度をそろえていない）ときは確かめずに `null`（自動 fit を省く側に倒す。
+/// 日本の `pref` の写真が経度で半周以上に広がるのは、座標の誤りがあるときだけ）。
+fn tally_json(tally: &Tally, cover: Option<Value>) -> serde_json::Map<String, Value> {
+    let fit = tally.bounds.filter(|b| {
+        b[2] - b[0] <= FIT_SPAN_FREE || tally.lons.as_deref().is_some_and(|l| !spans_dateline(l))
+    });
+    let mut out = serde_json::Map::new();
+    out.insert("count".to_owned(), json!(tally.count));
+    out.insert("cover".to_owned(), cover.unwrap_or(Value::Null));
+    out.insert("bbox".to_owned(), bounds_json(tally.bounds));
+    out.insert("fit_bbox".to_owned(), bounds_json(fit));
+    out
+}
+
+/// 名称表の 1 件（表示名と検索別名）。表に無い ID は ID を表示名にする（版が合っていれば起きない）。
+fn names_json(map: &mut serde_json::Map<String, Value>, id: &str, place: Option<&data::Place>) {
+    map.insert("id".to_owned(), json!(id));
+    map.insert(
+        "name".to_owned(),
+        json!(place.map_or(id, |p| p.name.as_str())),
+    );
+    map.insert(
+        "aliases".to_owned(),
+        json!(place.map_or_else(Vec::new, |p| p.search.clone())),
+    );
+}
+
+/// 件数の多い順、同数なら表示名、それも同じなら ID の順。
+fn sort_places(items: &mut [(String, i64, serde_json::Map<String, Value>)]) {
+    items.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.2["name"].as_str().cmp(&b.2["name"].as_str()))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+}
+
+/// 集計の列（[`COVER_KEY`] を含む `COUNT(*)`・範囲 4 つ・代表の鍵）を `first` 列目から読む。
+fn tally_at(row: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Tally> {
+    let corners = [
+        row.get::<_, Option<f64>>(first + 1)?,
+        row.get::<_, Option<f64>>(first + 2)?,
+        row.get::<_, Option<f64>>(first + 3)?,
+        row.get::<_, Option<f64>>(first + 4)?,
+    ];
+    let bounds = match corners {
+        [Some(w), Some(s), Some(e), Some(n)] => Some([w, s, e, n]),
+        _ => None,
+    };
+    Ok(Tally {
+        count: row.get(first)?,
+        bounds,
+        boundary: 0,
+        best: row.get(first + 5)?,
+        lons: None,
+    })
+}
+
+/// 場所の眺め方。国ごと・地域ごとの件数・範囲・代表の写真（`countries`）、国が決まらない写真（`unknown`）、旧形式の都道府県・
+/// 市区町村（`prefs`）と海外・不明（`abroad`）。区分は [`regions::PlaceRules`]（設計「場所の区分の規則」）で 1 つに決まる。
+///
+/// `filter`（期間・範囲・除外）は、すべての項目の件数・代表の写真・範囲に先に掛かる。範囲があれば、その中に写真の無い
+/// 国・地域は出ず、座標のない写真（`no_location`）も入らない。並びは件数の多い順、同数なら表示名の順。
+/// 旧形式の `prefs`（`pref` のある写真を `pref`/`city` で数えたもの）と `abroad`（`pref` が空の写真の数）は、変更前と
+/// 同じ意味のまま、新しい集計と同じ走査から取る。
+///
+/// 分類の表が無い DB（`classification_available` が偽）では、`pref` のある写真だけが日本として出て、残りは国が決まらない
+/// 写真になる。表は作らず、書かない。
 fn build_places(conn: &Connection, ctx: &AdminContext, filter: &Filter) -> rusqlite::Result<Value> {
-    // 件数・代表の写真・海外・不明が同じ時点の DB から出るように、1 つの読み取りにまとめる
+    // 件数・代表の写真・分類待ちが同じ時点の DB から出るように、1 つの読み取りにまとめる
     let _snapshot = conn.unchecked_transaction()?;
+    let classification_available = regions::available(conn)?;
+    let rules = regions::PlaceRules::new(classification_available);
     let clause = filter.where_clause();
-    // 範囲は位置のある写真だけの MIN/MAX（集計関数は NULL を飛ばすので、位置の無い行は CASE で NULL にする）
+    // 範囲は位置のある写真だけの MIN/MAX（集計関数は NULL を飛ばすので、位置の無い行は CASE で NULL にする）。
+    // 組ごとの代表の写真の鍵も同じ走査で `MAX` を取る。集計は 2 つに分ける:
+    // 規則 1（`pref` のある写真）は `pref`/`city` で数えるだけ（国は日本、地域は名称表の都道府県の対応で付ける。SQL の
+    // `rules.region` が使う対応表と同じ名称表）、規則 2〜4 は分類の式で数える。1 回の走査で 5 つの鍵を並べ替えるより軽い
+    // 範囲に入れる写真（位置がある写真。`pref` の無い写真は座標が有効なものだけ。無効な座標の値は範囲に入れない）
+    let aggregates = |located: &str| {
+        format!(
+            "COUNT(*),
+        MIN(CASE WHEN {located} THEN lon END), MIN(CASE WHEN {located} THEN lat END),
+        MAX(CASE WHEN {located} THEN lon END), MAX(CASE WHEN {located} THEN lat END),
+        MAX({COVER_KEY})"
+        )
+    };
+    let names = data::names().ok();
+    let mut groups: Vec<PlaceGroup> = Vec::new();
     let mut stmt = conn.prepare(&format!(
-        "SELECT CAST(pref AS TEXT), CAST(COALESCE(city,'') AS TEXT), COUNT(*),
-                MIN(CASE WHEN lat IS NOT NULL AND lon IS NOT NULL THEN lon END),
-                MIN(CASE WHEN lat IS NOT NULL AND lon IS NOT NULL THEN lat END),
-                MAX(CASE WHEN lat IS NOT NULL AND lon IS NOT NULL THEN lon END),
-                MAX(CASE WHEN lat IS NOT NULL AND lon IS NOT NULL THEN lat END)
-           FROM photos WHERE NOT {ABROAD} AND {clause} GROUP BY 1, 2"
+        "SELECT CAST(p.pref AS TEXT), CAST(COALESCE(p.city,'') AS TEXT), 0, {aggregates}
+           FROM photos p WHERE {has_pref} AND {clause} GROUP BY 1, 2",
+        aggregates = aggregates("lat IS NOT NULL AND lon IS NOT NULL"),
+        has_pref = rules.has_pref,
     ))?;
-    let rows = stmt
+    let pref_groups = stmt
         .query_map(params_from_iter(filter.params.iter()), |row| {
-            let corners = [
-                row.get::<_, Option<f64>>(3)?,
-                row.get::<_, Option<f64>>(4)?,
-                row.get::<_, Option<f64>>(5)?,
-                row.get::<_, Option<f64>>(6)?,
-            ];
-            let bounds = match corners {
-                [Some(w), Some(s), Some(e), Some(n)] => Some([w, s, e, n]),
-                _ => None,
-            };
-            Ok(PlaceRow {
-                pref: row.get(0)?,
-                city: row.get(1)?,
-                count: row.get(2)?,
-                bounds,
+            let pref: String = row.get(0)?;
+            let region = names
+                .and_then(|n| n.region_of_pref(&pref))
+                .map(|r| r.id.clone());
+            Ok(PlaceGroup {
+                country: Some(data::JAPAN_ID.to_owned()),
+                region,
+                pref: Some((pref, row.get(1)?)),
+                no_location: false,
+                tally: tally_at(row, 3)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut pref_covers = covers(
-        conn,
-        ctx,
-        "CAST(pref AS TEXT)",
-        &format!("NOT {ABROAD} AND {clause}"),
-        &filter.params,
-    )?;
-    let abroad: i64 = conn.query_row(
-        &format!("SELECT COUNT(*) FROM photos WHERE {ABROAD} AND {clause}"),
-        params_from_iter(filter.params.iter()),
-        |row| row.get(0),
-    )?;
-    let mut prefs = group_places(rows);
-    for pref in &mut prefs {
-        let name = pref["pref"].as_str().unwrap_or_default();
-        pref["cover"] = pref_covers.remove(name).unwrap_or(Value::Null);
+    drop(stmt);
+    groups.extend(pref_groups);
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {country}, {region}, {no_location}, {aggregates},
+                group_concat(CASE WHEN typeof(lon) IN ('real','integer') AND lat IS NOT NULL THEN lon END, ',')
+           FROM {from} WHERE NOT {has_pref} AND {clause} GROUP BY 1, 2, 3",
+        aggregates = aggregates(&regions::valid_coordinates("p")),
+        country = rules.country,
+        region = rules.region,
+        no_location = rules.no_location,
+        has_pref = rules.has_pref,
+        from = rules.from,
+    ))?;
+    let other_groups = stmt
+        .query_map(params_from_iter(filter.params.iter()), |row| {
+            let mut tally = tally_at(row, 3)?;
+            // 経度は全部そろえる（日付変更線をまたぐかを、通常の範囲が広い組だけ確かめる）
+            tally.lons = Some(
+                row.get::<_, Option<String>>(9)?
+                    .iter()
+                    .flat_map(|s| s.split(',').filter_map(|v| v.parse::<f64>().ok()))
+                    .collect(),
+            );
+            Ok(PlaceGroup {
+                country: row.get(0)?,
+                region: row.get(1)?,
+                pref: None,
+                no_location: row.get(2)?,
+                tally,
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    groups.extend(other_groups);
+
+    // 旧形式: `pref` のある写真の `pref`/`city`、`pref` が空の写真の数。`pref` ごとの代表の写真の鍵
+    let mut abroad = 0;
+    let mut pref_rows: Vec<PlaceRow> = Vec::new();
+    let mut pref_best: HashMap<&str, &Option<String>> = HashMap::new();
+    for g in &groups {
+        match &g.pref {
+            Some((pref, city)) => {
+                pref_rows.push(PlaceRow {
+                    pref: pref.clone(),
+                    city: city.clone(),
+                    count: g.tally.count,
+                    bounds: g.tally.bounds,
+                });
+                let best = pref_best.entry(pref).or_insert(&g.tally.best);
+                if **best < g.tally.best {
+                    *best = &g.tally.best;
+                }
+            }
+            None => abroad += g.tally.count,
+        }
     }
-    Ok(json!({"ok": true, "prefs": prefs, "abroad": abroad}))
+
+    // 国・地域・場所不明ごとの件数と範囲と代表の写真の鍵
+    let mut by_region: BTreeMap<(String, Option<String>), Tally> = BTreeMap::new();
+    let mut unknown = [Tally::default(), Tally::default()];
+    for g in &groups {
+        match &g.country {
+            Some(country) => by_region
+                .entry((country.clone(), g.region.clone()))
+                .or_default()
+                .add(&g.tally, g.pref.is_none()),
+            None => unknown[usize::from(g.no_location)].add(&g.tally, false),
+        }
+    }
+    let mut countries: BTreeMap<&str, Vec<(&Option<String>, &Tally)>> = BTreeMap::new();
+    for ((country, region), tally) in &by_region {
+        countries.entry(country).or_default().push((region, tally));
+    }
+    let country_total = |parts: &[(&Option<String>, &Tally)]| {
+        parts.iter().fold(Tally::default(), |mut acc, (_, t)| {
+            acc.add(t, false);
+            acc
+        })
+    };
+
+    // 代表の写真の表示ファイルを、必要な写真だけまとめて引く
+    let mut wanted: Vec<i64> = pref_best
+        .values()
+        .filter_map(|b| {
+            Tally {
+                best: (*b).clone(),
+                ..Tally::default()
+            }
+            .cover_id()
+        })
+        .collect();
+    wanted.extend(by_region.values().filter_map(Tally::cover_id));
+    wanted.extend(
+        countries
+            .values()
+            .filter_map(|p| country_total(p).cover_id()),
+    );
+    wanted.extend(unknown.iter().filter_map(Tally::cover_id));
+    wanted.sort_unstable();
+    wanted.dedup();
+    let covers = cover_values(conn, ctx, &wanted)?;
+    let cover_of = |t: &Tally| t.cover_id().and_then(|id| covers.get(&id)).cloned();
+
+    let mut prefs = group_places(pref_rows);
+    let mut cities_of: HashMap<String, Value> = HashMap::new();
+    for pref in &mut prefs {
+        let name = pref["pref"].as_str().unwrap_or_default().to_owned();
+        let best = pref_best.get(name.as_str()).and_then(|b| (*b).clone());
+        pref["cover"] = cover_of(&Tally {
+            best,
+            ..Tally::default()
+        })
+        .unwrap_or(Value::Null);
+        cities_of.insert(name, pref["cities"].clone());
+    }
+
+    let mut country_items: Vec<(String, i64, serde_json::Map<String, Value>)> = Vec::new();
+    for (country, parts) in &countries {
+        let total = country_total(parts);
+        let mut map = serde_json::Map::new();
+        names_json(&mut map, country, names.and_then(|n| n.country(country)));
+        map.extend(tally_json(&total, cover_of(&total)));
+        let mut region_items: Vec<(String, i64, serde_json::Map<String, Value>)> = Vec::new();
+        let mut region_unknown = Tally::default();
+        for (region, tally) in parts {
+            match region {
+                None => region_unknown = (*tally).clone(),
+                Some(id) => {
+                    let place = names.and_then(|n| n.region(id));
+                    let mut rmap = serde_json::Map::new();
+                    names_json(&mut rmap, id, place);
+                    rmap.extend(tally_json(tally, cover_of(tally)));
+                    // 日本の地域だけ: `pref` の名前・市区町村・境界データで入った写真の数
+                    if let Some(pref) = place.and_then(|p| p.pref.as_deref()) {
+                        rmap.insert("pref".to_owned(), json!(pref));
+                        rmap.insert(
+                            "cities".to_owned(),
+                            cities_of.get(pref).cloned().unwrap_or_else(|| json!([])),
+                        );
+                        rmap.insert("boundary_only".to_owned(), json!(tally.boundary));
+                    }
+                    region_items.push((id.clone(), tally.count, rmap));
+                }
+            }
+        }
+        sort_places(&mut region_items);
+        map.insert(
+            "regions".to_owned(),
+            Value::Array(
+                region_items
+                    .into_iter()
+                    .map(|(_, _, m)| Value::Object(m))
+                    .collect(),
+            ),
+        );
+        map.insert(
+            "region_unknown".to_owned(),
+            Value::Object(tally_json(&region_unknown, cover_of(&region_unknown))),
+        );
+        country_items.push(((*country).to_owned(), total.count, map));
+    }
+    sort_places(&mut country_items);
+
+    let unclassified = tally_json(&unknown[0], cover_of(&unknown[0]));
+    // 座標が無い（無効な）写真に範囲は無い
+    let no_location = tally_json(
+        &Tally {
+            bounds: None,
+            ..unknown[1].clone()
+        },
+        cover_of(&unknown[1]),
+    );
+    let pending = regions::pending_photos(conn)?;
+    Ok(json!({
+        "ok": true,
+        "prefs": prefs,
+        "abroad": abroad,
+        "classification_available": classification_available,
+        "classification_pending": pending,
+        "countries": country_items.into_iter().map(|(_, _, m)| Value::Object(m)).collect::<Vec<_>>(),
+        "unknown": {"unclassified": unclassified, "no_location": no_location},
+    }))
 }
 
 /// 都道府県の件数・範囲と市区町村の `(名前, 件数, 範囲)`。
@@ -1097,6 +1460,84 @@ mod tests {
         assert_eq!(out[1]["cities"][0]["bbox"], Value::Null);
         assert_eq!(out[0]["bbox"], Value::Null);
         assert_eq!(out[2]["bbox"], json!([1.0, 1.0, 2.0, 2.0]));
+    }
+
+    #[test]
+    fn dateline_is_crossed_only_when_the_largest_gap_is_inside() {
+        // 178 と -179 は円周上で 3 度の差 = またぐ
+        assert!(spans_dateline(&[178.0, -179.0]));
+        assert!(spans_dateline(&[-179.0, -170.0, 170.0, 179.0]));
+        // 空きが 80 度ずつ、戻る間が 120 度 = またがない
+        assert!(!spans_dateline(&[-100.0, -20.0, 60.0, 140.0]));
+        // 戻る間と同じ大きさの空きは、通常の区間（またがない）
+        assert!(!spans_dateline(&[-90.0, 0.0, 90.0]));
+        assert!(!spans_dateline(&[]));
+        assert!(!spans_dateline(&[10.0]));
+        assert!(!spans_dateline(&[135.0, 140.0, 139.7]));
+    }
+
+    #[test]
+    fn the_cover_key_ranks_photos_the_way_cover_order_does() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE photos(id INTEGER PRIMARY KEY, taken_at TEXT, lat REAL, lon REAL, hidden INTEGER);",
+        )
+        .unwrap();
+        // 除外・位置・日時のある/なし/形の違う値・同じ日時・日時の文字列が他の接頭辞になる値、を組み合わせた行
+        let takens = [
+            "NULL",
+            "''",
+            "'x'",
+            "'2025-06'",
+            "'2025-06-1'",
+            "'2025-06-01 10:00'",
+            "'2025-06-01 10:01'",
+            "'2025-07-01 09:00'",
+        ];
+        let mut id = 0;
+        let mut rows = String::new();
+        for hidden in ["NULL", "0", "1"] {
+            for pos in ["NULL, NULL", "35.0, 135.0", "35.0, NULL"] {
+                for taken in takens {
+                    for _ in 0..2 {
+                        id += 1;
+                        rows += &format!("INSERT INTO photos VALUES({id},{taken},{pos},{hidden});");
+                    }
+                }
+            }
+        }
+        conn.execute_batch(&rows).unwrap();
+        // 全体から COVER_ORDER で 1 枚選ぶのと、COVER_KEY の MAX で選ぶのが同じ写真になる（組は ID の余りで分ける）
+        for modulus in [1, 3, 7] {
+            let by_window: Vec<(i64, i64)> = conn
+                .prepare(&format!(
+                    "SELECT k, id FROM (SELECT id % {modulus} AS k, id,
+                        ROW_NUMBER() OVER (PARTITION BY id % {modulus} ORDER BY {COVER_ORDER}) AS rn FROM photos)
+                      WHERE rn = 1 ORDER BY k"
+                ))
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let by_key: Vec<(i64, i64)> = conn
+                .prepare(&format!(
+                    "SELECT id % {modulus}, MAX({COVER_KEY}) FROM photos p GROUP BY 1 ORDER BY 1"
+                ))
+                .unwrap()
+                .query_map([], |row| {
+                    let key: String = row.get(1)?;
+                    let tally = Tally {
+                        best: Some(key),
+                        ..Tally::default()
+                    };
+                    Ok((row.get(0)?, tally.cover_id().unwrap()))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(by_key, by_window, "modulus {modulus}");
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 # 国・地域別の場所表示 設計
 
-作成日: 2026-11-04。状態: 承認済み。段①（境界データと分類段）実装済み、段②（管理API）・段③（画面）は未実装。[PRD](prd.md)に対応。
+作成日: 2026-11-04。状態: 承認済み。段①（境界データと分類段）実装済み。段②（管理API）は `places` の集計まで実装済み（`photos` の絞り込み・検索・旅・`location_region` は未）。段③（画面）は未実装。[PRD](prd.md)に対応。
 
 ## 概要
 
@@ -69,7 +69,9 @@ Natural Earthも測量用の精度や最新の行政区画を保証しないた�
 3. `pref` が空（NULL または空文字）で座標が有効（enrich の `USABLE` と同じ型検査＋判定手順 1 の範囲検査を SQL で掛ける）で、
    未処理・座標変更・分類版不一致の行を抽出し、同一座標をまとめて判定する。無効な座標の行は候補に入れない。
 4. writer経由で短いバッチを適用する。現座標を再確認する。写真が無くなった分類行もここで消す。
-5. 管理APIは下の「場所の区分の規則」を共通の SQL 片にまとめ、集計・絞り込み・検索・表示で使う。
+5. 管理APIは下の「場所の区分の規則」を共通の SQL 片 `regions::PlaceRules`（`regions/rules.rs`）にまとめ、集計・絞り込み・検索・表示で使う。
+   `from`（`photos p` に都道府県の対応表 `pm` と有効な分類 `r` を結合）、`country`・`region`（ID の式）、`has_pref`・`no_location`・`unclassified`（真偽の式）、`search`（検索用文字列の式）を持つ。
+   表の無い DB では `r` を同じ列の空の派生表にして同じ式を使う（表は作らない）。
 
 ### 場所の区分の規則
 
@@ -245,7 +247,28 @@ gzip展開は既に依存にあるflate2を使う。実行時のネイティブG
   日本の地域の件数 − `boundary_only` が、旧 `prefs` のその都道府県の件数と一致する。
 - 各国に `region_unknown`: 当該国で地域が分からない写真の件数と範囲。
 - `unknown`: `unclassified`（座標あり国未判定）と `no_location`（座標なし・無効）の件数。
-- `classification_available`、`classification_pending`。
+- `classification_available`（表があるか）、`classification_pending`（`regions::pending_photos`。期間・範囲は掛けない）。
+
+実装した応答の形（`places`）:
+
+```json
+{"ok": true, "prefs": [...], "abroad": 25,
+ "classification_available": true, "classification_pending": 3,
+ "countries": [{
+   "id": "ne:FRA", "name": "フランス", "aliases": ["フランス", "France", "French Republic"],
+   "count": 4, "cover": {"id": 14, "thumb_url": "/thumb/14.jpg?v=…"}, "bbox": [w, s, e, n], "fit_bbox": [w, s, e, n],
+   "regions": [{"id": "ne:FRA-…", "name": "…", "aliases": [...], "count": 2, "cover": {...}, "bbox": [...], "fit_bbox": [...]}],
+   "region_unknown": {"count": 1, "cover": {...}, "bbox": [...], "fit_bbox": [...]}}],
+ "unknown": {"unclassified": {"count": 6, "cover": {...}, "bbox": [...], "fit_bbox": null},
+             "no_location": {"count": 4, "cover": {...}, "bbox": null, "fit_bbox": null}}}
+```
+
+- 日本の地域だけ `pref`・`cities[]`（`prefs` の `cities` と同じ）・`boundary_only` を持つ。`region_unknown` は常にあり、無ければ `count: 0`・`cover`/`bbox`/`fit_bbox` が `null`。
+- `fit_bbox` は、通常の範囲の経度の幅が 180 度以内なら `bbox` と同じ（空きが戻る間が必ず最大のため）。それより広いときだけ、経度を全部使って最小の区間を求め、日付変更線をまたぐなら `null`。
+  `pref` のある写真を含む組（日本）は経度をそろえず、幅が 180 度を超えたら確かめずに `null`（日本の `pref` の写真が半周以上に広がるのは座標の誤りのときだけ）。
+- 件数の多い順、同数は表示名、それも同じなら ID。国・地域・区分の集計は 1 つの走査（`pref` のある写真と、無い写真の 2 本の `GROUP BY`）から取り、
+  旧 `prefs`・`abroad` も同じ結果から作る。代表の写真は、集計と同じ走査で組ごとに `MAX(COVER_KEY)`（`COVER_ORDER` と同じ順位を文字列にした鍵）を取り、
+  国・地域は組の鍵の最大から選ぶ（窓関数の並べ替えをしない。`COVER_ORDER` との同値を単体試験で確かめる）。
 
 新しい国別件数＋国未判定＋場所不明の合計を一致させる。旧 `abroad` と新しい国別件数は足し合わせない。
 代表写真の選択は既存coversの規則を再利用し、JOINにより1枚が複数回現れないようにする。
@@ -333,6 +356,7 @@ IDは最大64文字、許可文字はASCII英数字と `:_-`。SQLは常にパ�
 大量データでは1万件程度の合成写真で処理時間・writer待ち・照合回数を測り、バッチ上限を調整する。
 地図を動かすたびに来る `places` の応答時間を、`photo_regions(country_id, region_id)` の索引あり・1万件の合成データで測る。
 目標は変更前の `places` の応答時間の 1.5 倍以内（段②で変更前を先に測る）。
+実測（`tests/library_places_perf.rs`、release、1 万件、変更前 → 変更後の中央値）は段②の PR の説明を参照。計測は `cargo test --release --test library_places_perf -- --ignored --nocapture`。
 
 必要な確認: `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、
 画面の DOM 試験は上限付きの `cargo test --test admin_ui_library`（共有ビューアは `admin_ui_photos`）経由で回す
