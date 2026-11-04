@@ -60,7 +60,7 @@ static NAMES_GZ: &[u8] = include_bytes!("../../data/regions/names.json.gz");
 pub struct DataError(pub String);
 
 impl DataError {
-    fn new(reason: impl Into<String>) -> Self {
+    pub(super) fn new(reason: impl Into<String>) -> Self {
         Self(reason.into())
     }
 }

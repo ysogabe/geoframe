@@ -5,19 +5,19 @@ use super::data::{self, DataError, Layer, PolygonSet};
 use super::index::{Classification, InvalidCoordinate, Method, RegionIndex};
 use super::search;
 
-type Pt = (f64, f64); // (経度 x, 緯度 y)
+pub(super) type Pt = (f64, f64); // (経度 x, 緯度 y)
 
 #[derive(Clone)]
-struct Poly {
-    outer: Vec<Pt>,
-    holes: Vec<Vec<Pt>>,
+pub(super) struct Poly {
+    pub(super) outer: Vec<Pt>,
+    pub(super) holes: Vec<Vec<Pt>>,
 }
 
-fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<Pt> {
+pub(super) fn rect(x0: f64, y0: f64, x1: f64, y1: f64) -> Vec<Pt> {
     vec![(x0, y0), (x1, y0), (x1, y1), (x0, y1), (x0, y0)]
 }
 
-fn solid(ring: Vec<Pt>) -> Poly {
+pub(super) fn solid(ring: Vec<Pt>) -> Poly {
     Poly {
         outer: ring,
         holes: vec![],
@@ -39,7 +39,7 @@ fn add_feature(layer: &mut Layer, id: &str, parent: Option<usize>, polys: &[Poly
 }
 
 /// `countries`: (ID, 多角形)、`regions`: (ID, 所属する国の ID, 多角形)。並びは与えたまま。
-fn synth(
+pub(super) fn synth(
     countries: &[(&str, Vec<Poly>)],
     regions: &[(&str, &str, Vec<Poly>)],
 ) -> Result<RegionIndex, DataError> {

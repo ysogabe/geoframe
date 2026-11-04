@@ -1797,11 +1797,11 @@ fn portable_fixture_starts_without_scene_tables_migrates_and_runs_validated_weig
             .schema
             .missing_objects
             .len(),
-        11
+        12
     );
     let old = rows(&conn, "photos");
     let ingest = crate::ingest::start_with(&config, &crate::guard::Guard::skip()).unwrap();
-    assert_eq!(ingest.migration.created.len(), 11);
+    assert_eq!(ingest.migration.created.len(), 12);
     assert_eq!(
         runtime::Runtime::production(config.clone())
             .unwrap()

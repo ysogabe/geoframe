@@ -7,7 +7,7 @@
 //! [`Placeholder`]）。順序は現行の
 //! `cycle()` と同じ:
 //!
-//! `index_local` → `index_drive` → `infer` → `enrich` → `local_derivatives` → `fetch_derivatives` → `quality`
+//! `index_local` → `index_drive` → `infer` → `enrich` → `regions` → `local_derivatives` → `fetch_derivatives` → `quality`
 //!
 //! - **段ごとに失敗を隔離する**。段が `Err` を返しても、パニックしても、残りの段と次の周期へ進む
 //!   （現行は段ごとの `except` で握る）。ログには段の名前と失敗の種類だけを出す（例外文字列には
@@ -48,11 +48,12 @@ use crate::stop::StopFlag;
 use crate::writer::{WriteError, Writer};
 
 /// 段の名前（サイクルの順）。
-pub const STAGE_NAMES: [&str; 7] = [
+pub const STAGE_NAMES: [&str; 8] = [
     "index_local",
     "index_drive",
     "infer",
     "enrich",
+    "regions",
     "local_derivatives",
     "fetch_derivatives",
     "quality",
@@ -339,6 +340,7 @@ fn stages(
             "index_local" => Box::new(crate::local::IndexLocal) as Box<dyn Stage>,
             "infer" => Box::new(crate::geo::Infer),
             "enrich" => Box::new(crate::geo::Enrich::new()),
+            "regions" => Box::new(crate::regions::Regions::new()),
             "index_drive" => Box::new(crate::drive::IndexDrive::with_allow(
                 Arc::clone(&drive),
                 allow.clone(),
@@ -723,6 +725,8 @@ mod tests {
         let config = Arc::new(Config::load(|_| None, &overrides).unwrap());
         let writer = Writer::open(&config.db_path(), OpenMode::CreateIfMissing).unwrap();
         writer.call(crate::schema::migrate).unwrap();
+        // 起動時に作られる派生表（`regions` 段の保存先）
+        writer.call(crate::regions::ensure_tables).unwrap();
         let cache = Arc::new(Cache::load(dir.path()));
         Setup {
             _dir: dir,
@@ -778,7 +782,7 @@ mod tests {
     }
 
     #[test]
-    fn default_stages_follow_the_python_order() {
+    fn default_stages_follow_the_python_order_with_regions_after_enrich() {
         let names: Vec<_> = default_stages().iter().map(|s| s.name()).collect();
         assert_eq!(names, STAGE_NAMES);
         assert_eq!(
@@ -788,11 +792,13 @@ mod tests {
                 "index_drive",
                 "infer",
                 "enrich",
+                "regions",
                 "local_derivatives",
                 "fetch_derivatives",
                 "quality"
             ]
         );
+        assert_eq!(STAGE_NAMES.len(), 8);
     }
 
     #[test]
@@ -811,7 +817,7 @@ mod tests {
             .unwrap();
         let report = with_ctx(&s, Mode::Apply, |ctx| run_cycle(&default_stages(), ctx));
         assert_eq!(report.failed(), 0);
-        assert_eq!(report.stages.len(), 7);
+        assert_eq!(report.stages.len(), 8);
         assert_eq!(
             report.photos,
             Some(PhotoCounts {

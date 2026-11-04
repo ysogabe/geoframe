@@ -14,6 +14,7 @@
 - 撮影時刻は `taken_at`（`YYYY-MM-DD HH:MM`）。元EXIF文字列、UTC、タイムゾーンは現在のDBには分離保存されていない。
 - 位置は `lat` / `lon`。由来は `loc_source`（`exif`、`drive_meta`、`inferred`、`manual`）。推定元は `inferred_from`、時間差は `infer_dt_s`。
 - 地名は `place` / `pref` / `city`、標高は `elev`。
+- `pref` が空の写真の国・地域は、同期サイクルの`regions`段（`enrich`の後。`enrich`の失敗に依存しない）が、同梱の境界データ（Natural Earth 1:10m）と座標の照合で分類し、派生表`photo_regions`に保存する（`SCHEMA`には足さず、書き込み起動時に作る）。行は分類に使った座標と分類版を持ち、現在の座標と今の分類版に一致する行だけが有効。1サイクル最大10,000枚・5秒、writerへは100枚ずつ。`outside`/`ambiguous`も処理済みとして保存する。通信はせず、ログは件数だけ。設計は[international-places/design.md](../international-places/design.md)。
 - Driveの変更検知に `md5`、ローカル変更検知に `mtime` を使う。表示用derivativeのSHA-256、64-bit pHash、鮮明度・露出・クリッピングは`photo_quality_features`へ保存する（原本ハッシュではない）。
 - 事前検証した品質解析は本体へ実装済み。同期サイクルは新規・更新写真だけを`GEOFRAME_QUALITY_PER_CYCLE`件ずつ解析し、全表示写真の特徴量が最新になった時だけ`photo_quality`を原子的に再生成する。途中では前回の完成結果を維持する。
 - 初回や保守時は `geoframe quality-scan`（`GEOFRAME_INGEST=1`が要る）で未解析写真を一括バックフィルできる。通常運用ではサーバー起動中の同期ワーカーが自動処理する。

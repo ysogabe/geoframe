@@ -5,7 +5,8 @@
 //! - [`index`] — 境界の索引（[`RegionIndex`]。呼び出し側が明示的に作り、使い終えたら手放す）と、判定手順 1〜4。
 //! - [`search`] — 分類版（[`classifier_version`]）と検索用文字列（[`search_text`]）。ポリゴンを展開せずに得られる。
 //!
-//! 同期段・表（`photo_regions`）は後のタスクで足す。
+//! - [`table`] — 分類の保存先 `photo_regions` 表（`available`・`pending`・`ensure_tables`）と、読み取り側が使う有効な分類の SQL 片。
+//! - [`stage`] — 同期段 `regions`（候補選択・判定・適用・掃除）。
 //!
 //! 通常のビルドは境界データを取得・生成しない。`crates/geoframe/data/regions/` にコミットされた成果物を
 //! `include_bytes!` で埋め込み、manifest の SHA256 と一致するかは `cargo test` で検査する。
@@ -14,13 +15,21 @@
 pub mod data;
 pub mod index;
 pub mod search;
+pub mod stage;
+pub mod table;
 
 pub use index::{Classification, InvalidCoordinate, Method, RegionIndex};
 pub use search::{classifier_version, search_text};
+pub use stage::Regions;
+pub use table::{
+    SCHEMA, TABLES, available, ensure_tables, join, pending, pending_photos, valid_coordinates,
+};
 
 #[cfg(test)]
 mod classify_tests;
 #[cfg(test)]
 mod measure_tests;
+#[cfg(test)]
+mod stage_tests;
 #[cfg(test)]
 mod tests;
