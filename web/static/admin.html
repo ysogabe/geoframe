@@ -134,13 +134,14 @@
       <div class="lib-cards" id="lib-year-cards"></div>
       <div id="lib-months" class="hidden" role="group" aria-label="月"></div>
     </div>
-    <!-- 場所: 左に期間の表示と都道府県のカード、右に地図の操作・地図・（選ぶと）写真の詳細。詳細 #lib-detail は場所のときだけ #lib-place-main の中（地図の下）へ移す -->
+    <!-- 場所: 左に期間の表示と国・地域のカード、右に地図の操作・地図・（選ぶと）写真の詳細。詳細 #lib-detail は場所のときだけ #lib-place-main の中（地図の下）へ移す -->
     <div id="lib-places" class="lib-place hidden">
       <div class="lib-place-side">
         <div class="lib-period hidden" id="lib-period">
           <span id="lib-period-text"></span>
           <button class="btn" id="lib-period-clear" type="button" aria-label="期間を解除" title="期間を解除">✕</button>
         </div>
+        <div class="lib-place-status" id="lib-place-status" role="status"></div>
         <div class="lib-cards lib-place-cards" id="lib-place-cards"></div>
       </div>
       <div class="lib-place-main" id="lib-place-main">
@@ -148,6 +149,7 @@
           <button class="btn" id="lib-bbox" type="button">この範囲の写真を見る</button>
           <button class="btn" id="lib-reset" type="button">全体に戻す</button>
           <span class="spacer"></span>
+          <span class="lib-map-hint" id="lib-map-hint" role="status"></span>
           <span class="count" id="lib-map-note"></span>
         </div>
         <div id="lib-map"></div>
@@ -156,6 +158,7 @@
     <div id="lib-detail" class="hidden">
       <div class="toolbar">
         <h3 class="lib-sel" id="lib-sel"></h3>
+        <button class="btn" id="lib-sel-clear" type="button" title="この選択を外して一覧に戻す">選択を解除</button>
         <span class="spacer"></span>
         <button class="btn" id="lib-prev" type="button">◀ PREV</button>
         <span class="count" id="lib-pageinfo">--</span>
@@ -302,6 +305,7 @@
       <h2 id="viewer-title"></h2>
       <p id="viewer-meta" class="ps-viewer-meta"></p>
       <div id="viewer-location" class="ps-viewer-location"></div>
+      <div id="viewer-region" class="ps-viewer-region hidden"></div>
       <div id="viewer-badges" class="tags ps-viewer-badges"></div>
 
       <div id="viewer-ai">

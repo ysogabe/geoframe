@@ -1494,4 +1494,85 @@ await test('(z2) tileStyle() は呼ぶたびに新しい style を返し、タ�
   assert.ok(vm.runInContext('tileStyle() !== tileStyle() && tileStyle().sources !== tileStyle().sources', env.context));
 });
 
+await test('(z3) 国・地域（location_region）: 正規化は任意項目（旧応答・欠けた値でも動く）。ビューアは label を別の行に出し、inside だけ「撮影位置からの分類」。GPS の由来のタグとは別。位置が変わると消える', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  await openPhotos(env);
+  const raw = (id, region, extra = {}) => ({id, name: 'r' + id + '.jpg', thumb: '/derivatives/r' + id + '.jpg', thumb_url: '', taken_at: '2030-01-02 03:04',
+    lat: 10.0, lon: 20.0, loc_source: 'exif', place: '', pref: '', city: '', favorite: false, hidden: false, rotation: 0, source: 'drive',
+    ...(region === undefined ? {} : {location_region: region}), ...extra});
+  const JP = {country_id: 'ne:JPN', country: '日本', region_id: 'ne:JPN-x', region: '架空県', method: 'pref', label: '日本・架空県'};
+  const FR = {country_id: 'ne:FRA', country: 'フランス', region_id: 'ne:FRA-r1', region: '中央', method: 'inside', label: 'フランス・中央'};
+  const FR_ONLY = {country_id: 'ne:FRA', country: 'フランス', region_id: null, region: null, method: 'inside', label: 'フランス'};
+  const BAD = {...FR, label: '<img src=x onerror=alert(1)>・<b>地域</b>'};
+  const list = [raw(1, JP, {pref: '架空県'}), raw(2, FR), raw(3, FR_ONLY), raw(4), raw(5, null), raw(6, {country: 5, label: 7}), raw(7, BAD),
+                raw(8, {country: 'ドイツ', region: 'ベルリン', method: 'inside'})];
+  vm.runInContext('globalThis.__raw = ' + JSON.stringify(list) + '; globalThis.__norm = __raw.map(r => normalizePhoto(r, "list"))', env.context);
+  const norm = env.ev('__norm.map(p => p.location_region)');
+  assert.deepEqual(norm[0], {country_id: 'ne:JPN', country: '日本', region_id: 'ne:JPN-x', region: '架空県', method: 'pref', label: '日本・架空県'});
+  assert.deepEqual(norm[2], {country_id: 'ne:FRA', country: 'フランス', region_id: '', region: '', method: 'inside', label: 'フランス'}, '地域が無い写真は国だけ');
+  assert.equal(norm[3], null, 'フィールドの無い旧応答');
+  assert.equal(norm[4], null, 'null');
+  assert.equal(norm[5], null, '型が違う値と label が無いものは分類なし');
+  assert.equal(norm[7].label, 'ドイツ・ベルリン', 'label が無ければ国・地域から組む');
+  vm.runInContext('openModalFor(__norm, 0, {ai: false})', env.context);
+  const region = () => env.$('#viewer-region');
+  const kids = () => region().children.map(c => c.textContent);
+  assert.equal(hidden(env, '#viewer-region'), false);
+  assert.deepEqual(kids(), ['日本・架空県'], 'pref の写真に注記は付けない');
+  assert.ok(env.$('#viewer-location').textContent.startsWith('架空県'), 'GPS の地名の行はそのまま（国・地域の行とは別）');
+  assert.ok(!env.$('#viewer-location').textContent.includes('日本・'), '国・地域は地名の行に混ぜない');
+  assert.ok(env.document.querySelectorAll('#viewer-badges .tag').some(t => t.textContent === 'EXIF'), 'loc_source のタグは別の情報としてそのまま');
+  const step = i => { while(env.ev('viewerIndex') !== i) env.$('#viewer-next').click(); };
+  step(1);
+  assert.deepEqual(kids(), ['フランス・中央', '撮影位置からの分類']);
+  step(2);
+  assert.deepEqual(kids(), ['フランス', '撮影位置からの分類']);
+  step(3);
+  assert.equal(hidden(env, '#viewer-region'), true, '旧応答（キーなし）は行ごと隠す');
+  assert.equal(region().textContent, '');
+  step(5);
+  assert.equal(hidden(env, '#viewer-region'), true);
+  step(6);
+  assert.deepEqual(kids(), ['<img src=x onerror=alert(1)>・<b>地域</b>', '撮影位置からの分類'], '名前は文字として入る');
+  assert.ok(region().children.every(c => c.children.every(k => k.nodeType !== 1)), '名前から要素を作らない（文字のノードだけ）');
+  // 位置が変わると（setloc の反映）古い国・地域を消す。呼び側が値を渡せばそれを使う
+  step(1);
+  vm.runInContext('globalThis.__seen = []; onPhotoChange((id, patch) => __seen.push([id, Object.keys(patch).sort()]))', env.context);
+  vm.runInContext("applyPhoto(2, {lat: 1.5, lon: 2.5, loc_source: 'manual', infer_bucket: '', place: '', pref: '', city: ''})", env.context);
+  assert.equal(hidden(env, '#viewer-region'), true, '位置の修正の直後に消える');
+  assert.equal(env.ev('__norm[1].location_region'), null);
+  assert.ok(env.ev('__seen[0][1]').includes('location_region'), '通知の patch にも location_region が入る（他の画面が消せる）');
+  assert.equal(env.ev('__norm[0].location_region.label'), '日本・架空県', '別の写真は変わらない');
+  vm.runInContext('applyPhoto(1, {favorite: true})', env.context);
+  assert.equal(env.ev('__norm[0].location_region.label'), '日本・架空県', '位置を含まない patch では消さない');
+  vm.runInContext("applyPhoto(1, {lat: 3, lon: 4, location_region: {country_id: 'ne:JPN', country: '日本', region_id: '', region: '', method: 'inside', label: '日本'}})", env.context);
+  assert.equal(env.ev('__norm[0].location_region.label'), '日本', '値を渡せばそれを使う');
+  env.$('#viewer-close').click();
+});
+
+await test('(z4) 国・地域の正規化は型を厳しく見る: 指定された項目（country_id・country・region_id・region・method・label）の型が不正なら、正常な label があっても分類全体を null にする。欠落・地域の null は許す', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  const ok = {country_id: 'ne:FRA', country: 'フランス', region_id: 'ne:FRA-r1', region: '中央', method: 'inside', label: 'フランス・中央'};
+  const cases = [
+    ['正常な label と不正な ID・method', {country_id: 123, label: 'フランス', method: 42}, null],
+    ['country_id が数値', {...ok, country_id: 123}, null],
+    ['country が数値', {...ok, country: 5}, null],
+    ['region_id が数値', {...ok, region_id: 7}, null],
+    ['region が真偽値', {...ok, region: true}, null],
+    ['method が数値', {...ok, method: 42}, null],
+    ['label が数値', {...ok, label: 9}, null],
+    ['label が object', {...ok, label: {a: 1}}, null],
+    ['country が null（地域以外の null は不正）', {...ok, country: null}, null],
+    ['配列', [ok], null],
+    ['地域の null は許す', {...ok, region_id: null, region: null, label: 'フランス'}, {country_id: 'ne:FRA', country: 'フランス', region_id: '', region: '', method: 'inside', label: 'フランス'}],
+    ['任意項目の欠落は許す', {label: 'フランス'}, {country_id: '', country: '', region_id: '', region: '', method: '', label: 'フランス'}],
+    ['正常', ok, ok],
+  ];
+  vm.runInContext('globalThis.__cases = ' + JSON.stringify(cases.map(c => c[1])) + '; globalThis.__out = __cases.map(c => normalizeRegion(c))', env.context);
+  const out = env.ev('__out');
+  cases.forEach(([name, , want], i) => assert.deepEqual(out[i], want, name));
+});
+
 console.log(`ok (${n})`);

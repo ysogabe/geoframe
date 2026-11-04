@@ -225,6 +225,8 @@ body.ps-viewer-open{overflow:hidden}
 .ps-viewer-location{border:1px solid var(--panel-border);border-radius:6px;background:rgba(0,229,255,.04);
   padding:10px 11px;color:var(--ink);font-size:12px;line-height:1.55}
 .ps-viewer-location .coords{display:block;color:var(--ink-3);font-family:var(--mono);font-size:9px;margin-top:3px}
+.ps-viewer-region{margin-top:7px;color:var(--ink);font-size:12px;line-height:1.55}
+.ps-viewer-region .region-note,.lib-pop-region .region-note{color:var(--ink-3);font-family:var(--mono);font-size:10px;margin-left:6px}
 .ps-viewer-badges{margin:13px 0 7px}
 .ps-viewer-scores{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:13px 0}
 .ps-viewer-score-cell{border:1px solid var(--panel-border);border-radius:7px;background:rgba(0,229,255,.05);
@@ -382,7 +384,11 @@ button.chip:disabled{opacity:.35;cursor:default}
 .lib-place-side,.lib-place-main{min-width:0}
 .lib-place-side{max-height:calc(100vh - 140px);overflow-y:auto;padding-right:2px}
 .lib-place-cards{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
-.lib-place-cards .lib-card.has-cities{grid-column:1/-1}
+.lib-place-cards .lib-card.has-cities,.lib-place-cards .lib-card.has-regions{grid-column:1/-1}
+.lib-place-cards .lib-region{border-left:3px solid rgba(0,229,255,.35)}
+.lib-place-status{font-family:var(--mono);font-size:11px;color:var(--amber);margin-bottom:8px;overflow-wrap:anywhere}
+.lib-place-status:empty{display:none}
+.lib-map-hint{font-family:var(--mono);font-size:11px;color:var(--amber);overflow-wrap:anywhere}
 .lib-cities{display:flex;flex-wrap:wrap;gap:6px;padding:0 10px 10px}
 .lib-city{font-size:12px}
 .lib-more{font-family:var(--mono);font-size:11px;color:var(--ink-3);align-self:center}
@@ -420,6 +426,8 @@ button.chip:disabled{opacity:.35;cursor:default}
 .lib-pop-thumb img{width:100%;height:100%;object-fit:cover;display:block}
 .lib-pop-dt{font-family:var(--mono);font-size:11px}
 .lib-pop-place{font-size:12px}
+.lib-pop-region{font-size:12px}
+.lib-pop-region .region-note{color:#4a6072}
 .lib-pop .lib-pop-open{color:#10202e;background:rgba(0,150,180,.12);border-color:rgba(0,150,180,.5)}
 @media(max-width:640px){
   /* 狭い画面: カードの列は横スクロール（折り返さない）。列に min-width:0 を付けて、中身の幅で画面が広がらないようにする */
@@ -430,7 +438,7 @@ button.chip:disabled{opacity:.35;cursor:default}
   /* 場所は 1 列（カードの列 → 地図 → 詳細）。カードの列は他と同じ横スクロールの 1 段 */
   .lib-place{grid-template-columns:minmax(0,1fr)}
   .lib-place-side{max-height:none;overflow-y:visible}
-  .lib-place-cards .lib-card.has-cities{grid-column:auto}
+  .lib-place-cards .lib-card.has-cities,.lib-place-cards .lib-card.has-regions{grid-column:auto}
   .lib-cards,.lib-cards.is-strip{grid-template-columns:none;grid-auto-flow:column;grid-auto-columns:minmax(200px,72vw);
     overflow-x:auto;scroll-snap-type:x proximity;padding-bottom:8px}
   #lib-map{height:40vh;min-height:280px}

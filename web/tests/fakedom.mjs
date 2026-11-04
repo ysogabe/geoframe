@@ -330,17 +330,20 @@ export function buildAdminDom(){
   mk('span', {id: 'lib-period-text'}, lperiod);
   const lclear = mk('button', {id: 'lib-period-clear', cls: 'btn', text: '✕'}, lperiod);
   lclear.setAttribute('aria-label', '期間を解除');
+  mk('div', {id: 'lib-place-status', cls: 'lib-place-status'}, lside).setAttribute('role', 'status');
   mk('div', {id: 'lib-place-cards', cls: 'lib-cards lib-place-cards'}, lside);
   const lmain = mk('div', {id: 'lib-place-main', cls: 'lib-place-main'}, lplaces);
   const lmbar = mk('div', {cls: 'toolbar'}, lmain);
   mk('button', {id: 'lib-bbox', cls: 'btn', text: 'この範囲の写真を見る'}, lmbar);
   mk('button', {id: 'lib-reset', cls: 'btn', text: '全体に戻す'}, lmbar);
   mk('span', {cls: 'spacer'}, lmbar);
+  mk('span', {id: 'lib-map-hint', cls: 'lib-map-hint'}, lmbar).setAttribute('role', 'status');
   mk('span', {id: 'lib-map-note', cls: 'count'}, lmbar);
   mk('div', {id: 'lib-map'}, lmain);
   const ldetail = mk('div', {id: 'lib-detail', cls: 'hidden'}, lib);
   const ldbar = mk('div', {cls: 'toolbar'}, ldetail);
   mk('h3', {id: 'lib-sel', cls: 'lib-sel'}, ldbar);
+  mk('button', {id: 'lib-sel-clear', cls: 'btn', text: '選択を解除'}, ldbar);
   mk('span', {cls: 'spacer'}, ldbar);
   mk('button', {id: 'lib-prev', cls: 'btn', text: '◀ PREV'}, ldbar);
   mk('span', {id: 'lib-pageinfo', cls: 'count', text: '--'}, ldbar);
@@ -429,6 +432,7 @@ export function buildAdminDom(){
   mk('h2', {id: 'viewer-title'}, aside);
   mk('p', {id: 'viewer-meta', cls: 'ps-viewer-meta'}, aside);
   mk('div', {id: 'viewer-location', cls: 'ps-viewer-location'}, aside);
+  mk('div', {id: 'viewer-region', cls: 'ps-viewer-region hidden'}, aside);
   mk('div', {id: 'viewer-badges', cls: 'tags ps-viewer-badges'}, aside);
   const vai = mk('div', {id: 'viewer-ai'}, aside);
   mk('div', {id: 'viewer-scores', cls: 'ps-viewer-scores'}, vai);
