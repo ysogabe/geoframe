@@ -1551,4 +1551,28 @@ await test('(z3) 国・地域（location_region）: 正規化は任意項目（�
   env.$('#viewer-close').click();
 });
 
+await test('(z4) 国・地域の正規化は型を厳しく見る: 指定された項目（country_id・country・region_id・region・method・label）の型が不正なら、正常な label があっても分類全体を null にする。欠落・地域の null は許す', async () => {
+  const env = makeEnv({pathname: '/admin'});
+  await env.boot();
+  const ok = {country_id: 'ne:FRA', country: 'フランス', region_id: 'ne:FRA-r1', region: '中央', method: 'inside', label: 'フランス・中央'};
+  const cases = [
+    ['正常な label と不正な ID・method', {country_id: 123, label: 'フランス', method: 42}, null],
+    ['country_id が数値', {...ok, country_id: 123}, null],
+    ['country が数値', {...ok, country: 5}, null],
+    ['region_id が数値', {...ok, region_id: 7}, null],
+    ['region が真偽値', {...ok, region: true}, null],
+    ['method が数値', {...ok, method: 42}, null],
+    ['label が数値', {...ok, label: 9}, null],
+    ['label が object', {...ok, label: {a: 1}}, null],
+    ['country が null（地域以外の null は不正）', {...ok, country: null}, null],
+    ['配列', [ok], null],
+    ['地域の null は許す', {...ok, region_id: null, region: null, label: 'フランス'}, {country_id: 'ne:FRA', country: 'フランス', region_id: '', region: '', method: 'inside', label: 'フランス'}],
+    ['任意項目の欠落は許す', {label: 'フランス'}, {country_id: '', country: '', region_id: '', region: '', method: '', label: 'フランス'}],
+    ['正常', ok, ok],
+  ];
+  vm.runInContext('globalThis.__cases = ' + JSON.stringify(cases.map(c => c[1])) + '; globalThis.__out = __cases.map(c => normalizeRegion(c))', env.context);
+  const out = env.ev('__out');
+  cases.forEach(([name, , want], i) => assert.deepEqual(out[i], want, name));
+});
+
 console.log(`ok (${n})`);

@@ -39,6 +39,8 @@
    fitPoints: 「地図で見る」のあと、点を読めたら点の範囲へ地図を動かす印。
    onPlaces・detailShown・resizeQueued: 地図の大きさを合わせ直す時点を決める印（場所の view を出した・詳細の出し入れ・合わせ直しの予約中）。
    pointsStale: 地図が見えていないあいだに設定（除外も含める）が変わったので、地図に戻るとき点を取り直す印。
+   locRev: 位置が変わった回数（libPhotoChanged）。詳細・吹き出しの写真の取得は要求した時点の値を覚え、応答のとき違っていたら（取得中に位置が変わった＝古い location_region を含みうる）
+        その応答は捨てて読み直す。
    seq: 要求の種類ごとの番号。古い応答は捨てる（種類を分けるのは、吹き出しの要求が詳細の読み込みを捨てないため）。
         cluster はクラスタを押したあとの展開ズームの応答待ち。応答のとき seq.cluster と gen の両方が押した時点のままでなければ地図を動かさない
         （カード・候補・全体に戻す・利用者の地図の移動の開始（movestart）・点の読み直しは seq.cluster を進め、選択・view・期間・除外の変更は gen を進める） */
@@ -50,7 +52,7 @@ const ls = {
   loaded: {trips: false, calendar: false, placeCards: false, placeOptions: false},
   sel: {trips: null, calendar: null, places: null}, gen: 0, anchor: null, monthYear: null,
   tripFilter: '', whenMsg: null, combo: {open: false, items: [], more: 0, active: -1},
-  period: null, mapBbox: null, fitPoints: false, pointsStale: false,
+  period: null, mapBbox: null, fitPoints: false, pointsStale: false, locRev: 0,
   onPlaces: false, detailShown: false, resizeQueued: false,
   page: 1, pages: 1, per: 60, total: 0, items: [], tiles: [],
   map: null, pendingData: null, labels: new Map(), popup: null, popupInfo: null,
@@ -143,18 +145,28 @@ function placeLabel(p){
 /* 旅のカードの地名のタグ [{text, count}]（件数の多い順。同数は places → regions の順）。
    regions[]（国・地域の上位。海外の旅はここで国・地域名が出る）がある応答では、日本の pref のある写真は今までどおり places[] の「都道府県 市区町村」を使い
    （市区町村まで分かるため）、regions[] は日本以外の国・地域と、places[] に pref が無い日本の分類（境界データで入った写真）だけを足す。
-   places[] の pref が空の行（「海外・不明」）は出さない。regions[] が無い旧応答は places[] をそのまま使う */
+   同じ都道府県に places[] の行があっても regions[] の件数がその都道府県の places[] の合計より多ければ、差（pref の空な境界分類の写真や、places[] の上位に入らない市区町村）を
+   「都道府県（市区町村未取得ほか） N」の別タグで足す。places[] の pref が空の行（「海外・不明」）は出さない。regions[] が無い旧応答は places[] をそのまま使う */
 function tripPlaceTags(trip){
   const places = Array.isArray(trip.places) ? trip.places : [];
   if(!Array.isArray(trip.regions)) return places.map(p => ({text: placeLabel(p), count: p.count}));
-  const inPlaces = new Set(places.filter(p => p.pref).map(p => p.pref));
+  const inPlaces = new Map();                       // pref → places[] の合計
+  places.forEach(p => { if(p.pref) inPlaces.set(p.pref, (inPlaces.get(p.pref) || 0) + (Number(p.count) || 0)); });
   const tags = places.filter(p => p.pref).map(p => ({text: placeLabel(p), count: p.count}));
   trip.regions.forEach(r => {
     if(!r || typeof r.label !== 'string' || !r.label) return;
-    // 日本の pref のある写真は places[] の行で出している: 同じ都道府県（regions[].region は pref と同じ名前。名称表の 47 件で一致を確認済み）と、
-    // 地域が決まらない日本（対応表にない旧地名の pref はここに入る）は、places[] に pref の行があれば足さない
-    if(r.country_id === LIB_JAPAN_ID && inPlaces.size && (!r.region_id || inPlaces.has(r.region))) return;
-    tags.push({text: r.label + ' ' + r.count, count: Number(r.count) || 0});
+    const count = Number(r.count) || 0;
+    if(r.country_id === LIB_JAPAN_ID && inPlaces.size){
+      // 日本の pref のある写真は places[] の行で出している。地域が決まらない日本（対応表にない旧地名の pref はここに入る）は足さない。
+      // 同じ都道府県（regions[].region は pref と同じ名前。名称表の日本の 47 件は name === pref）は、places[] の合計を上回る分だけ別タグにする
+      if(!r.region_id) return;
+      if(inPlaces.has(r.region)){
+        const rest = count - inPlaces.get(r.region);
+        if(rest > 0) tags.push({text: r.region + '（市区町村未取得ほか） ' + rest, count: rest});
+        return;
+      }
+    }
+    tags.push({text: r.label + ' ' + r.count, count});
   });
   return tags.map((t, i) => ({t, i})).sort((a, b) => (b.t.count - a.t.count) || (a.i - b.i)).map(x => x.t);
 }
@@ -1049,9 +1061,10 @@ function clearDetail(){
 function loadDetail(){
   const S = ls.sel[ls.view];
   if(!S) return;
-  const seq = ++ls.seq.detail, gen = ls.gen;
+  const seq = ++ls.seq.detail, gen = ls.gen, rev = ls.locRev;
   libGet('photos', detailParams(S)).then(d => {
     if(seq !== ls.seq.detail || gen !== ls.gen) return;
+    if(rev !== ls.locRev) return loadDetail();       // 取得中に位置が変わった: 古い国・地域を含みうるので捨てて読み直す
     ls.page = d.page; ls.pages = d.pages; ls.total = d.total;
     ls.items = (d.items || []).map(libPhoto);
     renderGrid();
@@ -1079,7 +1092,7 @@ function libPhotoChanged(id, patch){
   }
   // 位置が変わると国・地域の件数（カード・候補・旅の地名）も変わる（その写真は次の分類まで「地域未判定」）。
   // ライブラリが見えていれば今の view の一覧を読み直し、見えていなければ読み込み済みの印を落とす（開くときに読む。飛んでいる応答は捨てる）
-  if(patch && ('lat' in patch || 'lon' in patch)) refreshRegionLists();
+  if(patch && ('lat' in patch || 'lon' in patch)){ ls.locRev++; refreshRegionLists(); }
 }
 /* 位置の変更のあと、国・地域に由来する一覧（旅の地名・場所のカードと候補）を新しくする */
 function refreshRegionLists(){
@@ -1318,25 +1331,30 @@ function openPointPopup(id, lngLat){
   const body = el('div', 'lib-pop', '読み込み中');
   ls.popup = new maplibregl.Popup({closeButton: true, maxWidth: '260px'})
     .setLngLat(lngLat).setDOMContent(body).addTo(ls.map);
-  libGet('photos', {ids: id, hidden: ls.includeHidden}).then(d => {
-    if(seq !== ls.seq.popup) return;
-    const raw = (d.items || [])[0];
-    if(!raw) throw new Error('not found');
-    const photo = libPhoto(raw);
-    body.textContent = '';
-    const thumb = el('div', 'lib-pop-thumb');
-    putImage(thumb, photo.thumb_url || photo.thumb, photo.name);
-    body.appendChild(thumb);
-    body.appendChild(el('div', 'lib-pop-dt', photo.taken_at || '撮影時刻なし'));
-    ls.popupInfo = {photo, place: el('div', 'lib-pop-place'), region: el('div', 'lib-pop-region hidden')};
-    body.appendChild(ls.popupInfo.place);
-    body.appendChild(ls.popupInfo.region);
-    paintPopupInfo();
-    const open = el('button', 'btn lib-pop-open', '開く');
-    open.type = 'button';
-    open.addEventListener('click', () => openModalFor([photo], 0, {ai: false}));
-    body.appendChild(open);
-  }).catch(() => { if(seq === ls.seq.popup) body.textContent = '読めませんでした'; });
+  fetchPopupPhoto();
+  function fetchPopupPhoto(){
+    const rev = ls.locRev;
+    libGet('photos', {ids: id, hidden: ls.includeHidden}).then(d => {
+      if(seq !== ls.seq.popup) return;
+      if(rev !== ls.locRev) return fetchPopupPhoto();     // 取得中に位置が変わった: 古い国・地域を含みうるので捨てて読み直す
+      const raw = (d.items || [])[0];
+      if(!raw) throw new Error('not found');
+      const photo = libPhoto(raw);
+      body.textContent = '';
+      const thumb = el('div', 'lib-pop-thumb');
+      putImage(thumb, photo.thumb_url || photo.thumb, photo.name);
+      body.appendChild(thumb);
+      body.appendChild(el('div', 'lib-pop-dt', photo.taken_at || '撮影時刻なし'));
+      ls.popupInfo = {photo, place: el('div', 'lib-pop-place'), region: el('div', 'lib-pop-region hidden')};
+      body.appendChild(ls.popupInfo.place);
+      body.appendChild(ls.popupInfo.region);
+      paintPopupInfo();
+      const open = el('button', 'btn lib-pop-open', '開く');
+      open.type = 'button';
+      open.addEventListener('click', () => openModalFor([photo], 0, {ai: false}));
+      body.appendChild(open);
+    }).catch(() => { if(seq === ls.seq.popup) body.textContent = '読めませんでした'; });
+  }
 }
 /* 今の表示範囲を [w, s, e, n] に（lon は ±180・lat は ±90 に丸める。サーバーは範囲外を 400 にする）。
    地図は周回しない設定だが、丸めた後に w >= e（190〜210 が 180〜180 に潰れる等。日付変更線をまたぐ範囲は扱わない）なら経度は全域にする */

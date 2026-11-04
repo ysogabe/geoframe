@@ -33,14 +33,25 @@ function hasLoc(photo){ return hasValue(photo.lat); }
 
 /* 国・地域の分類（ライブラリの photos の location_region。国が決まらない写真・旧応答・写真タブの一覧では無い）を
    {country_id, country, region_id, region, method, label} にする。method は 'pref'（pref のある日本の写真）か 'inside'（境界データによる分類）。
-   label が無い・空なら国・地域の名前から「国・地域」を組み、それも無ければ null（分類なし） */
+   各項目は文字列。欠けている項目は許す（''）。地域だけは null も許す（国だけの分類: region_id・region が null）。
+   指定された項目の型が不正（数値・真偽・配列・object、国や method の null など）なら、分類全体を null（分類なし）にする。
+   label が無い・空なら国・地域の名前から「国・地域」を組み、それも無ければ null */
 function normalizeRegion(raw){
-  if(!raw || typeof raw !== 'object') return null;
-  const str = v => (typeof v === 'string' ? v : '');
-  const country = str(raw.country), region = str(raw.region);
-  const label = str(raw.label) || [country, region].filter(Boolean).join('・');
+  if(!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  let bad = false;
+  const field = (key, nullable) => {
+    const v = raw[key];
+    if(v === undefined || (nullable && v === null)) return '';
+    if(typeof v !== 'string'){ bad = true; return ''; }
+    return v;
+  };
+  const country_id = field('country_id'), country = field('country');
+  const region_id = field('region_id', true), region = field('region', true);
+  const method = field('method'), given = field('label');
+  if(bad) return null;
+  const label = given || [country, region].filter(Boolean).join('・');
   if(!label) return null;
-  return {country_id: str(raw.country_id), country, region_id: str(raw.region_id), region, method: str(raw.method), label};
+  return {country_id, country, region_id, region, method, label};
 }
 /* 国・地域の表示の注記。境界データによる分類（method が inside）だけ「撮影位置からの分類」。pref の写真は地名そのものなので付けない */
 const REGION_INSIDE_NOTE = '撮影位置からの分類';

@@ -4195,6 +4195,51 @@ await test('(t7l) AC7 位置が変わると、国・地域に由来する一覧�
   assert.ok(count('/api/admin/library/trips') >= t1 + 1);
 });
 
+await test('(t7k2) AC7 詳細の取得中に位置が変わったら、保存前の応答は捨てて読み直す（古い location_region を戻さない）', async () => {
+  const env = await regEnv();
+  const pending = [];
+  env.handlers.photos = () => new Promise(resolve => pending.push(resolve));
+  const res = items => ({ok: true, status: 200, json: () => Promise.resolve({ok: true, page: 1, per: 60, pages: 1, total: items.length, items})});
+  vm.runInContext('loadDetail()', env.context);
+  await settle();
+  assert.equal(pending.length, 1);
+  vm.runInContext("applyPhoto(702, {lat: 35.5, lon: 139.5, loc_source: 'manual', infer_bucket: '', place: '', pref: '', city: ''})", env.context);
+  assert.equal(env.ev('ls.items[1].location_region'), null);
+  pending[0](res(REG_ITEMS));                       // 保存前の応答（702 はフランス・中央のまま）
+  await settle();
+  assert.equal(env.ev('ls.items[1].location_region'), null, '保存前の応答の古い国・地域を戻さない');
+  assert.equal(pending.length, 2, '読み直す');
+  pending[1](res(REG_ITEMS.map(p => p.id === 702 ? {...p, lat: 35.5, lon: 139.5, location_region: REG_JP} : p)));
+  await settle();
+  assert.equal(env.ev('ls.items[1].location_region.label'), '日本・架空県', '読み直した応答は使う');
+  assert.equal(pending.length, 2);
+});
+
+await test('(t7k3) AC7 吹き出しの取得中に位置が変わったら、保存前の応答は捨てて読み直す（古い国・地域を出さない）', async () => {
+  const env = makeEnv();
+  await env.boot();
+  await openLib(env);
+  env.$('#lib-view-places').click();
+  await settle();
+  const map = mapOf(env);
+  const pending = [];
+  env.handlers.photos = () => new Promise(resolve => pending.push(resolve));
+  const res = photo => ({ok: true, status: 200, json: () => Promise.resolve({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [photo]})});
+  map.fire('click', {features: [{properties: {id: 702}, geometry: {coordinates: [2, 47]}}]}, 'lib-point');
+  await settle();
+  assert.equal(pending.length, 1);
+  const pop = env.fake.popups.at(-1);
+  vm.runInContext("applyPhoto(702, {lat: 35.5, lon: 139.5, loc_source: 'manual', infer_bucket: '', place: '', pref: '', city: ''})", env.context);
+  pending[0](res(R702));                            // 保存前の応答（フランス・中央）
+  await settle();
+  assert.equal(pop.content.querySelector('.lib-pop-region'), null, '保存前の応答では描かない（読み込み中のまま）');
+  assert.equal(pending.length, 2, '読み直す');
+  pending[1](res({...R702, lat: 35.5, lon: 139.5, location_region: REG_JP}));
+  await settle();
+  assert.deepEqual(pop.content.querySelector('.lib-pop-region').children.map(c => c.textContent), ['日本・架空県']);
+  assert.equal(pending.length, 2);
+});
+
 // ---- 旅のカードの地名（regions[] の上位。海外の旅で国・地域名が出る） ----
 const tagsOf = card => card.querySelectorAll('.tag').map(t => t.textContent);
 const TRIP_ABROAD = {key: '2030-08-01 08:00', start: '2030-08-01 08:00', end: '2030-08-09 20:00', count: 90, noloc: 2,
@@ -4240,4 +4285,22 @@ await test('(t7m) AC4 旅のカードの地名: 海外の旅は regions[] の国
   const tag = cards(env)[0].querySelector('.tag');
   assert.equal(tag.textContent, '<img src=x onerror=alert(1)>・<b>x</b> 60');
   assert.ok(tag.children.every(k => k.nodeType !== 1));
+});
+
+await test('(t7n) AC4 旅のカード: 同じ県に市区町村のある写真（places[]）と境界分類の写真（pref 空）が混ざるときは、places[] の合計を上回る件数を「県（市区町村未取得ほか） N」の別タグで出す。合計と同じなら出さない', async () => {
+  const jp = (region, count) => ({country_id: JP, country: '日本', region_id: jpId(region), region, label: '日本・' + region, count});
+  const mixed = {...TRIP_HOME, key: 'm1', start: '2031-01-01 00:00', end: '2031-01-02 00:00',
+    places: [{pref: '東京都', city: '新宿区', count: 1}], regions: [jp('東京都', 10)]};
+  const topN = {...TRIP_HOME, key: 'm2', start: '2031-02-01 00:00', end: '2031-02-02 00:00',
+    places: [{pref: '東京都', city: '新宿区', count: 5}, {pref: '東京都', city: '渋谷区', count: 3}, {pref: '東京都', city: '港区', count: 1}], regions: [jp('東京都', 10)]};
+  const same = {...TRIP_HOME, key: 'm3', start: '2031-03-01 00:00', end: '2031-03-02 00:00',
+    places: [{pref: '東京都', city: '新宿区', count: 4}, {pref: '東京都', city: '渋谷区', count: 6}], regions: [jp('東京都', 10)]};
+  const env = makeEnv();
+  env.handlers.trips = () => reply({ok: true, trips: [mixed, topN, same], untimed: 0});
+  await env.boot();
+  await openLib(env);
+  const c = cards(env);
+  assert.deepEqual(tagsOf(c[0]), ['東京都（市区町村未取得ほか） 9', '東京都 新宿区 1'], '境界分類の 9 枚が抜けない');
+  assert.deepEqual(tagsOf(c[1]), ['東京都 新宿区 5', '東京都 渋谷区 3', '東京都 港区 1', '東京都（市区町村未取得ほか） 1'], '上位に入らない分も差として出る');
+  assert.deepEqual(tagsOf(c[2]), ['東京都 渋谷区 6', '東京都 新宿区 4'], '合計と同じなら足さない');
 });

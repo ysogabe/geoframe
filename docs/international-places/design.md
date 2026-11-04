@@ -376,16 +376,23 @@ IDは最大64文字、許可文字はASCII英数字と `:_-`。SQLは常にパ�
   キー操作（↑↓ は端で回る・Enter は強調した候補だけ・Esc は閉じる・日本語入力の変換中は無視）と、古い応答の破棄（`seq.placeOptions`・`seq.choose`）は T6 までと同じ。
 - 選択の解除: 詳細の見出しに「選択を解除」ボタン（`#lib-sel-clear`）を置く。どの view・どの種類の選択でも今の選択を外し、詳細を閉じる（飛んでいる詳細の応答は捨てる）。
   旧地名の選択はカードが無く、同じ候補を選び直しても外れないため、これで外す。場所では入力欄の文字も空にし、フォーカスは今の view の切り替えボタンへ移す。国・地域の展開（`ls.openCountry`）は残す。
-- 写真詳細: `normalizePhoto` が任意の `location_region`（`{country_id, country, region_id, region, method, label}`）を持つ。無い（旧応答・国が決まらない写真）・型が不正・`label` も国/地域名も無いものは `null`。
+- 写真詳細: `normalizePhoto` が任意の `location_region`（`{country_id, country, region_id, region, method, label}`）を持つ。無い（旧応答・国が決まらない写真）・`label` も国/地域名も無いものは `null`。
+  型の見方は厳しい: 指定された項目（`country_id`・`country`・`region_id`・`region`・`method`・`label`）が文字列でなければ（数値・真偽・配列・object。国や `method` の `null` も）、正常な `label` があっても分類全体を `null` にする。
+  欠けている項目と、地域（`region_id`・`region`）の `null`（国だけの分類）は許す。
   共有ビューア（`#viewer-region`）と地図の吹き出し（`.lib-pop-region`）に `label` を **GPS の地名の行・由来のタグ（`loc_source`）とは別の行** で出し、`method` が `inside`（境界データ）のときだけ「撮影位置からの分類」の注記を添える（`pref` の写真は地名そのものなので付けない）。
   分類が無ければ行ごと隠す。名前は `textContent` だけ。写真タブの一覧・検索の応答には `location_region` が無いので出ない。
 - 旅（trips）のカードの地名: `regions[]` があるとき、日本の `pref` のある写真は今までどおり `places[]` の「都道府県 市区町村」を使う（市区町村まで分かるため）。
   `regions[]` からは **日本以外の国・地域** と、`places[]` に同じ `pref` が無い日本の分類（境界データで入った写真）だけを足し、`places[]` の `pref` が空の行（「海外・不明」）は出さない。
-  同じ都道府県かどうかは `regions[].region` と `places[].pref` の名前の一致で決める（名称表の日本の 47 地域は名前が `pref` と一致する。この一致に頼る）。地域が決まらない日本（`region_id` が `null`。対応表にない旧地名の `pref` はここに入る）は、`places[]` に `pref` の行があれば足さない。
+  同じ都道府県かどうかは `regions[].region` と `places[].pref` の名前の一致で決める（名称表の日本の 47 地域は名前が `pref` と一致する。この一致に頼る。
+  47 件すべてで `name === pref` であることは Rust の試験 `all_47_prefectures_map_to_distinct_japanese_regions`（`crates/geoframe/src/regions/tests.rs`）が確かめる）。地域が決まらない日本（`region_id` が `null`。対応表にない旧地名の `pref` はここに入る）は、`places[]` に `pref` の行があれば足さない。
+  同じ県に国内の写真（`places[]` の `pref`・`city`）と境界データで入った写真（`pref` が空）が混ざるときは、API を変えずに `regions[]` のその県の件数が `places[]` の同じ `pref` の合計を上回る分を、
+  「県（市区町村未取得ほか） N」の別タグで足す（合計と同じ・下回るなら足さない）。`places[]` と `regions[]` はどちらも旅ごとの上位 3 件なので、この差には `places[]` の上位に入らない市区町村の写真も含まれる（文言に「ほか」を付けた理由）。
   タグは件数の多い順（同数は `places[]`→`regions[]`）。`regions[]` の無い旧応答は `places[]` のまま（「海外・不明」も出る）。旅の文字検索も同じタグの文字に当たる。
   置き換えにしなかったのは、国内の旅で市区町村のタグを失わないため。海外の旅は `regions[]` の `label`（「国・地域」）と件数が出る。
 - 位置変更通知への追随: 位置を含む `applyPhoto`（`lat`・`lon` を持つ patch。位置の指定の保存）は、`location_region: null` を足してビューア・格子の写真・開いている吹き出しの 1 枚から古い国・地域をすぐ消す
   （呼び側が `location_region` を渡せばそれを使う）。吹き出しは地名の行も座標に描き直す。サーバーは位置が変わった写真を次の分類まで「地域未判定」として返すので、次の読み取りで未判定（キーなし）か新しい結果になる。
+  取得中の応答にも追随する: 位置が変わるたびに `ls.locRev` を進め、詳細（`loadDetail`）と地図の吹き出し（`openPointPopup`）の写真の取得は、要求した時点の値と応答のときの値が違えば（取得中に位置が変わった）
+  その応答を捨てて読み直す（保存前の古い `location_region` が保存後に戻らない）。
   あわせて国・地域に由来する一覧を新しくする: ライブラリが見えていれば今の view の旅／場所のカードと候補を読み直し、見えていなければ読み込み済みの印を落として飛んでいる応答を捨て、ライブラリを開くときに読む。★・除外だけの変更では読まない。
 
 ## 日付変更線と地図範囲

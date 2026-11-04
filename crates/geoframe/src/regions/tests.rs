@@ -255,6 +255,8 @@ fn all_47_prefectures_map_to_distinct_japanese_regions() {
             .unwrap_or_else(|| panic!("{pref} に対応する地域が無い"));
         assert_eq!(r.country.as_deref(), Some(data::JAPAN_ID));
         assert_eq!(r.pref.as_deref(), Some(pref));
+        // 旅のカードは regions[].region と places[].pref の名前の一致に頼る（design.md「写真詳細・旅」）: 47 件すべてで地域名 = pref
+        assert_eq!(r.name, pref, "{pref}: 地域名が pref と違う");
         assert!(
             r.iso.as_deref().is_some_and(|iso| iso.starts_with("JP-")),
             "{pref}"
