@@ -19,6 +19,7 @@
 | [管理画面の整え直し（A）](admin-rework/prd.md) | 計画 | 3ページの管理画面を「状況 / 写真 / 設定」の3タブに統合する PRD と[設計](admin-rework/design.md)（2026-10-30） |
 | [運用コンソール（C）](admin-ops/prd.md) | 実装中（PR ① マージ済み） | 同期・品質解析・AI ジョブの再試行・停止の解除・大量削除の保留の解除を稼働中の `serve` の「運用」タブから行う PRD と[設計](admin-ops/design.md)（2026-11-01） |
 | [ライブラリの見直し](admin-library-browse/prd.md) | 計画 | ライブラリタブのカードの横並び・選んで見る・検索（日付の言葉・場所の候補）・場所と地図の統合の PRD と[設計](admin-library-browse/design.md)（2026-11-02） |
+| [国・地域別の場所表示](international-places/prd.md) | 実装案・レビュー待ち | 海外写真の国・州/県相当の分類、既存写真の再分類、国・地域のカードと検索の[設計](international-places/design.md)（2026-11-04） |
 | [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（手で保ち、コードとの照合を`cargo test`が検査） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、更新、バックアップ |
 
