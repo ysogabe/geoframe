@@ -170,12 +170,12 @@ fn dry_run_writes_nothing_and_reports_counts() {
         ],
     );
     assert!(local_plan.status.success());
-    assert!(text(&local_plan.stdout).contains("スキーマ: 作る表・索引 14 / 足す列 0"));
+    assert!(text(&local_plan.stdout).contains("スキーマ: 作る表・索引 15 / 足す列 0"));
     assert_eq!(snapshot(data), before);
 
     assert!(
         stdout.contains(
-            "スキーマ: 作る表・索引 11 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
+            "スキーマ: 作る表・索引 12 / 足す列 0 / place を NULL に戻す なし / embedding の写し 0"
         ),
         "{stdout}"
     );
@@ -213,6 +213,13 @@ fn dry_run_writes_nothing_and_reports_counts() {
     assert!(
         stdout.contains(
             "段 enrich: 完了 candidates=1 foreign=1 cache_hit=0 would_query=0 unresolved=0 skipped_backoff=0 skipped_blocked=0 unusable=0 pending=1"
+        ),
+        "{stdout}"
+    );
+    // `regions` の段: 表が無い DB でも、`pref` 空で座標が有効な写真を処理待ちとして数え、判定まで行う（表は作らない）
+    assert!(
+        stdout.contains(
+            "段 regions: 完了 pending=2 inside=0 unresolved=2 removed=0 failed=0 deferred=0"
         ),
         "{stdout}"
     );
@@ -337,8 +344,8 @@ fn sync_with_ingest_creates_the_schema_in_an_empty_database_file_and_runs_one_cy
             |r| r.get(0),
         )
         .unwrap();
-    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・`ai_embedding_spaces`・`ai_embedding_vectors`、選別の表 `photo_curation`
-    assert_eq!(tables, 23);
+    // Python と同じ 11 表と、P4 の AI 表 `ai_jobs`・`ai_request_usage`・`ai_provider_pauses`・`ai_provider_waits`・`ai_worker_runs`・`ai_embedding_spaces`・`ai_embedding_vectors`、選別の表 `photo_curation`、国・地域の分類の表 `photo_regions`
+    assert_eq!(tables, 24);
 }
 
 #[test]
@@ -350,9 +357,9 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
     envs.push(("GEOFRAME_INGEST", "1".into()));
     let out = run_owned(&["sync", "--data-dir", dir.0.to_str().unwrap()], &envs);
     assert!(out.status.success(), "{}", text(&out.stdout));
-    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表）と選別の表 `photo_curation` だけ。ほかの表・列は変えない
+    // 本番相当の DB に足されるのは P4 の AI 表（`ai_jobs`・索引・送信予算・Provider 停止・共有の一時待機・起動 ID・空間とベクトルの表）と選別の表 `photo_curation`・国・地域の分類の表 `photo_regions` だけ。ほかの表・列は変えない
     assert!(
-        text(&out.stdout).contains("スキーマを更新しました: 作成 14件 / 列の追加 0件"),
+        text(&out.stdout).contains("スキーマを更新しました: 作成 15件 / 列の追加 0件"),
         "{}",
         text(&out.stdout)
     );
@@ -362,6 +369,15 @@ fn sync_with_ingest_on_a_production_shaped_database_changes_no_rows() {
             r.get(0)
         })
         .unwrap();
+    // 国外の 2 枚（海上の合成座標）は `regions` が『未解決』として保存した（再選択されない）
+    let regions: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM photo_regions WHERE country_method='outside'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(regions, 2);
     // 国外の 1 件は `enrich` が空で確定した（NULL でなくなる）。位置の無い行だけが残る。
     // 移行が再 enrich の印（`place=NULL`）を増やしていないことは、スキーマの確認（上）で見ている
     assert_eq!(null_places, 1);

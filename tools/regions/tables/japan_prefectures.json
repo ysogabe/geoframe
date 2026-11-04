@@ -1,0 +1,287 @@
+{
+  "_comment": "日本の Admin1 から、写真の pref 列の表記（47 都道府県）への対応。並びは JIS X 0401 の順。web/static/js/library.js の LIB_PREF_READINGS のキーと同じ表記",
+  "prefectures": [
+    {
+      "iso_3166_2": "JP-01",
+      "adm1_code": "JPN-1847",
+      "pref": "北海道",
+      "ne_name": "Hokkaidō"
+    },
+    {
+      "iso_3166_2": "JP-02",
+      "adm1_code": "JPN-1863",
+      "pref": "青森県",
+      "ne_name": "Aomori"
+    },
+    {
+      "iso_3166_2": "JP-03",
+      "adm1_code": "JPN-1865",
+      "pref": "岩手県",
+      "ne_name": "Iwate"
+    },
+    {
+      "iso_3166_2": "JP-04",
+      "adm1_code": "JPN-1866",
+      "pref": "宮城県",
+      "ne_name": "Miyagi"
+    },
+    {
+      "iso_3166_2": "JP-05",
+      "adm1_code": "JPN-1862",
+      "pref": "秋田県",
+      "ne_name": "Akita"
+    },
+    {
+      "iso_3166_2": "JP-06",
+      "adm1_code": "JPN-1868",
+      "pref": "山形県",
+      "ne_name": "Yamagata"
+    },
+    {
+      "iso_3166_2": "JP-07",
+      "adm1_code": "JPN-1864",
+      "pref": "福島県",
+      "ne_name": "Fukushima"
+    },
+    {
+      "iso_3166_2": "JP-08",
+      "adm1_code": "JPN-1856",
+      "pref": "茨城県",
+      "ne_name": "Ibaraki"
+    },
+    {
+      "iso_3166_2": "JP-09",
+      "adm1_code": "JPN-1859",
+      "pref": "栃木県",
+      "ne_name": "Tochigi"
+    },
+    {
+      "iso_3166_2": "JP-10",
+      "adm1_code": "JPN-3503",
+      "pref": "群馬県",
+      "ne_name": "Gunma"
+    },
+    {
+      "iso_3166_2": "JP-11",
+      "adm1_code": "JPN-1858",
+      "pref": "埼玉県",
+      "ne_name": "Saitama"
+    },
+    {
+      "iso_3166_2": "JP-12",
+      "adm1_code": "JPN-1855",
+      "pref": "千葉県",
+      "ne_name": "Chiba"
+    },
+    {
+      "iso_3166_2": "JP-13",
+      "adm1_code": "JPN-1860",
+      "pref": "東京都",
+      "ne_name": "Tokyo"
+    },
+    {
+      "iso_3166_2": "JP-14",
+      "adm1_code": "JPN-1857",
+      "pref": "神奈川県",
+      "ne_name": "Kanagawa"
+    },
+    {
+      "iso_3166_2": "JP-15",
+      "adm1_code": "JPN-1867",
+      "pref": "新潟県",
+      "ne_name": "Niigata"
+    },
+    {
+      "iso_3166_2": "JP-16",
+      "adm1_code": "JPN-1846",
+      "pref": "富山県",
+      "ne_name": "Toyama"
+    },
+    {
+      "iso_3166_2": "JP-17",
+      "adm1_code": "JPN-1842",
+      "pref": "石川県",
+      "ne_name": "Ishikawa"
+    },
+    {
+      "iso_3166_2": "JP-18",
+      "adm1_code": "JPN-1848",
+      "pref": "福井県",
+      "ne_name": "Fukui"
+    },
+    {
+      "iso_3166_2": "JP-19",
+      "adm1_code": "JPN-1861",
+      "pref": "山梨県",
+      "ne_name": "Yamanashi"
+    },
+    {
+      "iso_3166_2": "JP-20",
+      "adm1_code": "JPN-1844",
+      "pref": "長野県",
+      "ne_name": "Nagano"
+    },
+    {
+      "iso_3166_2": "JP-21",
+      "adm1_code": "JPN-1841",
+      "pref": "岐阜県",
+      "ne_name": "Gifu"
+    },
+    {
+      "iso_3166_2": "JP-22",
+      "adm1_code": "JPN-1845",
+      "pref": "静岡県",
+      "ne_name": "Shizuoka"
+    },
+    {
+      "iso_3166_2": "JP-23",
+      "adm1_code": "JPN-1840",
+      "pref": "愛知県",
+      "ne_name": "Aichi"
+    },
+    {
+      "iso_3166_2": "JP-24",
+      "adm1_code": "JPN-1843",
+      "pref": "三重県",
+      "ne_name": "Mie"
+    },
+    {
+      "iso_3166_2": "JP-25",
+      "adm1_code": "JPN-1853",
+      "pref": "滋賀県",
+      "ne_name": "Shiga"
+    },
+    {
+      "iso_3166_2": "JP-26",
+      "adm1_code": "JPN-1850",
+      "pref": "京都府",
+      "ne_name": "Kyōto"
+    },
+    {
+      "iso_3166_2": "JP-27",
+      "adm1_code": "JPN-1852",
+      "pref": "大阪府",
+      "ne_name": "Ōsaka"
+    },
+    {
+      "iso_3166_2": "JP-28",
+      "adm1_code": "JPN-1849",
+      "pref": "兵庫県",
+      "ne_name": "Hyōgo"
+    },
+    {
+      "iso_3166_2": "JP-29",
+      "adm1_code": "JPN-1851",
+      "pref": "奈良県",
+      "ne_name": "Nara"
+    },
+    {
+      "iso_3166_2": "JP-30",
+      "adm1_code": "JPN-1854",
+      "pref": "和歌山県",
+      "ne_name": "Wakayama"
+    },
+    {
+      "iso_3166_2": "JP-31",
+      "adm1_code": "JPN-1825",
+      "pref": "鳥取県",
+      "ne_name": "Tottori"
+    },
+    {
+      "iso_3166_2": "JP-32",
+      "adm1_code": "JPN-1824",
+      "pref": "島根県",
+      "ne_name": "Shimane"
+    },
+    {
+      "iso_3166_2": "JP-33",
+      "adm1_code": "JPN-1822",
+      "pref": "岡山県",
+      "ne_name": "Okayama"
+    },
+    {
+      "iso_3166_2": "JP-34",
+      "adm1_code": "JPN-1821",
+      "pref": "広島県",
+      "ne_name": "Hiroshima"
+    },
+    {
+      "iso_3166_2": "JP-35",
+      "adm1_code": "JPN-1826",
+      "pref": "山口県",
+      "ne_name": "Yamaguchi"
+    },
+    {
+      "iso_3166_2": "JP-36",
+      "adm1_code": "JPN-1836",
+      "pref": "徳島県",
+      "ne_name": "Tokushima"
+    },
+    {
+      "iso_3166_2": "JP-37",
+      "adm1_code": "JPN-1833",
+      "pref": "香川県",
+      "ne_name": "Kagawa"
+    },
+    {
+      "iso_3166_2": "JP-38",
+      "adm1_code": "JPN-1832",
+      "pref": "愛媛県",
+      "ne_name": "Ehime"
+    },
+    {
+      "iso_3166_2": "JP-39",
+      "adm1_code": "JPN-1834",
+      "pref": "高知県",
+      "ne_name": "Kōchi"
+    },
+    {
+      "iso_3166_2": "JP-40",
+      "adm1_code": "JPN-1829",
+      "pref": "福岡県",
+      "ne_name": "Fukuoka"
+    },
+    {
+      "iso_3166_2": "JP-41",
+      "adm1_code": "JPN-1827",
+      "pref": "佐賀県",
+      "ne_name": "Saga"
+    },
+    {
+      "iso_3166_2": "JP-42",
+      "adm1_code": "JPN-3500",
+      "pref": "長崎県",
+      "ne_name": "Nagasaki"
+    },
+    {
+      "iso_3166_2": "JP-43",
+      "adm1_code": "JPN-1830",
+      "pref": "熊本県",
+      "ne_name": "Kumamoto"
+    },
+    {
+      "iso_3166_2": "JP-44",
+      "adm1_code": "JPN-1835",
+      "pref": "大分県",
+      "ne_name": "Ōita"
+    },
+    {
+      "iso_3166_2": "JP-45",
+      "adm1_code": "JPN-1831",
+      "pref": "宮崎県",
+      "ne_name": "Miyazaki"
+    },
+    {
+      "iso_3166_2": "JP-46",
+      "adm1_code": "JPN-3501",
+      "pref": "鹿児島県",
+      "ne_name": "Kagoshima"
+    },
+    {
+      "iso_3166_2": "JP-47",
+      "adm1_code": "JPN-3502",
+      "pref": "沖縄県",
+      "ne_name": "Okinawa"
+    }
+  ]
+}

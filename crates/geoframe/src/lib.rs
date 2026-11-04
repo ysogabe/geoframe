@@ -40,6 +40,7 @@ pub mod post;
 pub mod pyquery;
 pub mod pyval;
 pub mod quality;
+pub mod regions;
 pub mod rotate;
 pub mod schema;
 pub mod selection;

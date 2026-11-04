@@ -42,3 +42,6 @@ app/local-tools/
 
 # Rust（Cargo）
 /target/
+
+# 境界データの取得物（tools/regions/update_regions.py fetch。コミットしない）
+tools/regions/.cache/

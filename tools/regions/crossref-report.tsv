@@ -1,0 +1,28 @@
+# Admin1（既定版）の各片の代表点を、Admin0（日本視点版）の国と突き合わせた食い違いの一覧
+# 列: Admin1 の ID / 名称 / Admin1 の宣言(adm0_a3) / 採用した国 / 片の数 / 別の国に入る片(国:片数) / どの国にも入らない片
+# 『別の国』は国境の見方の違い（北方領土など）、『どの国にも入らない』は海岸線の細部の違い（沖合の小島など）
+# 分類器では、国が決まった後に、その国の Admin1 に当たらない点は『地域不明』になる
+
+## 別の国に入る片がある Admin1: 6 件
+ne:IRN-3228	ホルモズガーン州	IRN	ne:IRN	11	ne:ARE:1	0
+ne:MAR-3456	アイウン＝ブジュール＝サキア・エル・ハムラ地方	MAR	ne:MAR	1	ne:SAH:1	0
+ne:MAR-3469	オウィド・エッ＝ダハブ州	MAR	ne:MAR	1	ne:SAH:1	0
+ne:RUS-2616	サハリン州	RUS	ne:RUS	23	ne:JPN:4	3
+ne:RUS-283	クリミア自治共和国	RUS	ne:RUS	1	ne:UKR:1	0
+ne:RUS-5482	セヴァストポリ	RUS	ne:RUS	1	ne:UKR:1	0
+
+## 海岸線の違いだけ（どの国にも入らない片だけ）の Admin1: 14 件
+ne:ARE-349	アブダビ	ARE	ne:ARE	13	-	4
+ne:ATF-5919	フランス領インド洋無人島群	ATF	ne:ATF	7	-	2
+ne:CSI-X00	コーラル・シー諸島	CSI	ne:CSI	21	-	20
+ne:ECU-1270	ガラパゴス県	ECU	ne:ECU	13	-	1
+ne:FSM-4941	ポンペイ州	FSM	ne:FSM	9	-	1
+ne:IMN-X00	マン島	IMN	ne:IMN	2	-	1
+ne:JPN-3502	沖縄県	JPN	ne:JPN	29	-	6
+ne:PAN-1340	パナマ県	PAN	ne:PAN	6	-	1
+ne:PFA-X00	パラセル諸島	CHN	ne:CHN	6	-	6
+ne:PHL-2538	南カマリネス	PHL	ne:PHL	2	-	1
+ne:PHL-2564	バタンガス	PHL	ne:PHL	3	-	1
+ne:SGS-X00	サウスジョージア・サウスサンドウィッチ諸島	SGS	ne:SGS	17	-	5
+ne:TON-4947	ニウアス諸島	TON	ne:TON	2	-	1
+ne:WLF-4997	アロ首長国	WLF	ne:WLF	2	-	1

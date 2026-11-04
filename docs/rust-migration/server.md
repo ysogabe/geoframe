@@ -565,7 +565,7 @@ unit は [`deploy/geoframe-rs.service`](../../deploy/geoframe-rs.service)（T1.5
 
 ### 11.3 同期サイクルの骨組み
 
-現行の`catalog.py:cycle()`の順に、**段（`Stage`）を並べた**もの。段は`index_local`→`index_drive`→`infer`→`enrich`→`local_derivatives`→`fetch_derivatives`→`quality`。T2.1の段は何もしない（`Placeholder`）で、T2.3〜T2.6で全部の段に中身が入った（`quality`はT2.6。§16）。
+現行の`catalog.py:cycle()`の順に、**段（`Stage`）を並べた**もの。段は`index_local`→`index_drive`→`infer`→`enrich`→`regions`→`local_derivatives`→`fetch_derivatives`→`quality`（`regions`は国・地域の分類。[international-places/design.md](../international-places/design.md)）。T2.1の段は何もしない（`Placeholder`）で、T2.3〜T2.6で全部の段に中身が入った（`quality`はT2.6。§16）。
 
 - **起動直後に1回、以降`GEOFRAME_DRIVE_POLL_MIN`ごと**。専用のstdスレッド`sync-worker`で動き、HTTPサーバーの起動を待たせない。SIGTERMで`StopFlag`を立て、待ちの最中ならすぐ、サイクルの最中なら今の段が終わってから止まる（最大10秒待ち、超えたらそのまま終了する。途中で止まってもDBはトランザクション単位なので壊れず、`.dl_*`の残骸は次回の起動で消す）。SIGTERMの合図はHTTPのgraceful shutdownを待たずに立ち、待ちはSIGTERMから60秒の共通期限の残りを越えない（§22）。
 - **段ごとに失敗を隔離する**: 段が`Err`を返しても、パニックしても、残りの段と次の周期へ進む。ログに出すのは段の名前と失敗の種類だけ（`StageError`はDB・I/Oの種類と定型文しか持たない。パニックのメッセージは出さず、場所だけをpanic hookが出す）。Pythonの`index_drive`段の「Drive認証に失敗したらDBの段だけ飛ばす」は、段が`Skipped(理由)`を返す形で表す（T2.4）。

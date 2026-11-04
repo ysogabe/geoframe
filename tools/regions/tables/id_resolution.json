@@ -1,0 +1,59 @@
+{
+  "_comment": "明示的な対応表。変換器は、ここに書いた項目がすべて使われること（余りが無いこと）と、書いていない不整合が無いことを検査する。",
+  "admin1_id": {
+    "GAZ+00?": "GAZ-X00",
+    "WEB+00?": "WEB-X00",
+    "SOL+00?": "SOL-X00",
+    "SAH+00?": "SAH-X00",
+    "MCO+00?": "MCO-X00",
+    "USG+00?": "USG-X00",
+    "GIB+00?": "GIB-X00",
+    "VAT+00?": "VAT-X00",
+    "CYN+00?": "CYN-X00",
+    "KAS+00?": "KAS-X00",
+    "KAB+00?": "KAB-X00",
+    "ATA+00?": "ATA-X00",
+    "PCN+00?": "PCN-X00",
+    "KIR+00?": "KIR-X00",
+    "VGB+00?": "VGB-X00",
+    "CYM+00?": "CYM-X00",
+    "HMD+00?": "HMD-X00",
+    "JEY+00?": "JEY-X00",
+    "GGY+00?": "GGY-X00",
+    "IMN+00?": "IMN-X00",
+    "IOT+00?": "IOT-X00",
+    "AUS+00?": "AUS-X00",
+    "NFK+00?": "NFK-X00",
+    "TUV+00?": "TUV-X00",
+    "SGS+00?": "SGS-X00",
+    "BVT+00?": "BVT-X00",
+    "GUM+00?": "GUM-X00",
+    "PFA+00?": "PFA-X00",
+    "CSI+00?": "CSI-X00",
+    "PGA+00?": "PGA-X00",
+    "CLP+00?": "CLP-X00",
+    "MAC+00?": "MAC-X00",
+    "ATC+00?": "ATC-X00"
+  },
+  "admin1_parent": {
+    "_comment": "Admin1 の国参照（adm0_a3）が日本視点版の Admin0 に無いときの付け替え先。付け替え先が代表点を含むことを変換時に検査する",
+    "map": {
+      "SOL": "SOM",
+      "CYN": "CYP",
+      "KAS": "IND",
+      "KAB": "KAZ"
+    }
+  },
+  "admin1_exclude": {
+    "_comment": "名称が全く無く、地域として見せられない Admin1。写真が当たったときは、その国の『地域不明』になる",
+    "codes": [
+      "AIA+99?",
+      "ATA+99?",
+      "COL+99?",
+      "KIR+99?",
+      "MEX+99?",
+      "RUS+99?",
+      "VEN+99?"
+    ]
+  }
+}
