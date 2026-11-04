@@ -9,7 +9,7 @@
 | ID | 内容 | AC | 依存 | 種類 | 状態 | 開始 SHA | コミット | メモ |
 |---|---|---|---|---|---|---|---|---|
 | T1 | 境界データの変換ツール（`tools/regions/`）・同梱データ・manifest・出典・名称表（日本 47 都道府県の対応、国の日本語名を miharashi の `NAME_OVERRIDES` と揃える） | AC10 | - | full | 完了 | 7d0b42e | cbc3ffb..ffa7b57 | レビュー Sol 3 回（必須 4 件を修正）。RSS は読込だけで +83MB → T2 で削減。同梱 13.7MB、バイナリ +13.8MB |
-| T2 | `regions` 分類器: 埋め込みデータの検証・遅延索引・判定手順 1〜4・合成ポリゴン試験・公開地点スモーク・サイズ/RSS/索引時間の計測 | AC6, AC10 | T1 | full | 実装中 | 494f765 | | |
+| T2 | `regions` 分類器: 埋め込みデータの検証・遅延索引・判定手順 1〜4・合成ポリゴン試験・公開地点スモーク・サイズ/RSS/索引時間の計測 | AC6, AC10 | T1 | full | 完了 | 494f765 | 65870c7 | レビュー Sol 1 回、必須なし。推奨 2 件（外積の丸めで向き依存・流し込み復号の容量加算）は T3 の最初のコミットで直す。RSS +51MB・索引 130ms（musl+mimalloc） |
 | T3 | `photo_regions` 表（`available`/`pending`/`ensure_tables`）と `regions` 同期段: 候補選択・CAS 適用・残り行の掃除・件数・dry-run・`STAGE_NAMES`・ログ・索引の解放 | AC7, AC8, AC9, AC12 | T2 | full | 未着手 | | | |
 
 ## 段②（PR 2）: 管理API
