@@ -46,8 +46,13 @@ const placesBody = () => ({ok: true, abroad: 9, prefs: [
             {city: '', count: 2, bbox: null}]},
   {pref: '試験県', count: 3, cover: null, bbox: null, cities: [{city: 'サンプル市', count: 3, bbox: null}]}]});
 
-// 旧形式の合成応答（prefs・abroad だけ）に、新しい応答の国・地域・未判定を足す。prefs の各行を日本（ne:JPN）の地域（pref 付き）にし、
-// abroad は「地域未判定」にする。新しい項目を最初から持つ応答（countries のあるもの）はそのまま
+// 旧形式の合成応答（prefs・abroad だけ）に、新しい応答の国・地域・未判定を足す。実 API と同じ分類にする:
+// 日本の地域になるのは対応表（PREF_TABLE）にある pref だけで、表にない旧地名（表記揺れ）は日本の region_unknown に入り、countries[].regions[] には現れない
+// （prefs の行には残る。旧形式 pref=<名前> でだけ引ける）。abroad は「地域未判定」にする。新しい項目を最初から持つ応答（countries のあるもの）はそのまま
+const PREF_TABLE = new Set(('北海道 青森県 岩手県 宮城県 秋田県 山形県 福島県 茨城県 栃木県 群馬県 埼玉県 千葉県 東京都 神奈川県 新潟県 富山県 石川県 福井県 山梨県 長野県 '
+  + '岐阜県 静岡県 愛知県 三重県 滋賀県 京都府 大阪府 兵庫県 奈良県 和歌山県 鳥取県 島根県 岡山県 広島県 山口県 徳島県 香川県 愛媛県 高知県 福岡県 佐賀県 長崎県 熊本県 大分県 宮崎県 鹿児島県 沖縄県').split(' '));
+// 試験用に表へ足した架空の県（地名・座標はすべて架空。実際の表にはない。これらを日本の地域として扱う試験が多いので、表にあるものとして置く）
+['架空県', '試験県', '境界県', '多県', 'カード甲', 'カード乙', '候補だけ', '候補新', '新しい範囲', 'カード新'].forEach(n => PREF_TABLE.add(n));
 const jpId = pref => 'ne:JPN-' + [...pref].map(ch => ch.codePointAt(0).toString(16)).join('');
 const union = boxes => {
   const b = boxes.filter(Boolean);
@@ -56,12 +61,19 @@ const union = boxes => {
 const noneItem = () => ({count: 0, cover: null, bbox: null, fit_bbox: null});
 function withCountries(body){
   if(!body || body.ok !== true || body.countries) return body;
-  const prefs = body.prefs || [];
-  const regions = prefs.filter(p => p.pref).map(p => ({id: jpId(p.pref), name: p.pref, aliases: [p.pref], count: p.count, cover: p.cover,
+  const prefs = (body.prefs || []).filter(p => p.pref);
+  const known = prefs.filter(p => PREF_TABLE.has(p.pref));
+  const legacy = prefs.filter(p => !PREF_TABLE.has(p.pref));
+  const regions = known.map(p => ({id: jpId(p.pref), name: p.pref, aliases: [p.pref], count: p.count, cover: p.cover,
     bbox: p.bbox, fit_bbox: p.bbox, pref: p.pref, boundary_only: 0}));
-  const box = union(regions.map(r => r.bbox));
-  const countries = regions.length ? [{id: 'ne:JPN', name: '日本', aliases: ['日本', 'Japan'], count: regions.reduce((a, r) => a + r.count, 0),
-    cover: regions[0].cover, bbox: box, fit_bbox: box, regions, region_unknown: noneItem()}] : [];
+  const ruBox = union(legacy.map(p => p.bbox));
+  const regionUnknown = legacy.length
+    ? {count: legacy.reduce((a, p) => a + p.count, 0), cover: legacy.find(p => p.cover)?.cover || null, bbox: ruBox, fit_bbox: ruBox}
+    : noneItem();
+  const box = union(prefs.map(p => p.bbox));
+  const all = regions.concat(legacy.map(p => ({count: p.count, cover: p.cover})));
+  const countries = prefs.length ? [{id: 'ne:JPN', name: '日本', aliases: ['日本', 'Japan'], count: all.reduce((a, r) => a + r.count, 0),
+    cover: all.find(r => r.cover)?.cover || null, bbox: box, fit_bbox: box, regions, region_unknown: regionUnknown}] : [];
   const abroad = body.abroad || 0;
   return {...body, countries, classification_available: true, classification_pending: 0,
     unknown: {unclassified: abroad ? {count: abroad, cover: null, bbox: null, fit_bbox: null} : noneItem(), no_location: noneItem()}};
@@ -3390,10 +3402,15 @@ await test('(t6e) 処理待ちと旧 DB: classification_pending があれば「�
 await test('(t6f) AC11 古い応答の破棄: 国を押した直後に別の国・地域・解除をしても、遅れて届いた前の写真は出さない（gen/seq）', async () => {
   const env = await intlEnv();
   const held = {};
+  const sent = {};            // 保留した要求のすべて（キーごとに送った順）。resolver をリクエストごとに残す（新しい応答のあとで古い応答を解くため）
   env.handlers.photos = params => {
     const key = params.get('country') + '/' + (params.get('region') || '');
     if(key === 'ne:FRA/' || key === 'ne:FRA/ne:FRA-r1'){
-      return new Promise(res => { held[key] = () => res(jsonRes({ok: true, page: 1, per: 60, pages: 1, total: 1, items: [P503]})); });
+      return new Promise(res => {
+        const send = items => res(jsonRes({ok: true, page: 1, per: 60, pages: 1, total: items.length, items}));
+        held[key] = () => send([P503]);
+        (sent[key] = sent[key] || []).push({hidden: params.get('hidden'), send});
+      });
     }
     return null;
   };
@@ -3418,15 +3435,181 @@ await test('(t6f) AC11 古い応答の破棄: 国を押した直後に別の国�
   assert.equal(hidden(env, '#lib-detail'), true);
   // 除外の切り替えでも、飛んでいる国の応答は捨てる
   await press(env, cardByKey(env, 'ne:FRA'));
+  const before = sent['ne:FRA/'].length;
+  const stale = sent['ne:FRA/'][before - 1];             // 除外を含める前に送った要求（まだ保留）
+  assert.equal(stale.hidden, null);
   env.$('#lib-hidden').checked = true;
   env.$('#lib-hidden').dispatchEvent({type: 'change'});
   await settle();
   const reqs = env.reqs('/api/admin/library/photos').length;
-  held['ne:FRA/']();
+  assert.equal(sent['ne:FRA/'].length, before + 1, '除外を含めて読み直す');
+  const fresh = sent['ne:FRA/'][before];
+  assert.equal(fresh.hidden, '1');
+  fresh.send([P501, P502]);                              // 新しい応答が先に届いて表示される
   await settle();
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['501', '502']);
+  stale.send([P503]);                                    // そのあとに古い応答が届く
+  await settle();
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['501', '502'], '古い応答では内容が戻らない');
   assert.equal(env.reqs('/api/admin/library/photos').length, reqs);
   assert.equal(photoQ(env).get('hidden'), '1');
   assert.equal(photoQ(env).get('country'), 'ne:FRA', '選択は残り、除外を含めて読み直す');
+});
+
+// 実 API どおりの分類: 対応表にある架空県だけが日本の地域になり、表にない旧地名（表記揺れ）は日本の region_unknown に入る（prefs の行には残る）
+const legacyBody = () => ({ok: true, abroad: 0, prefs: [
+  {pref: '架空県', count: 50, cover: null, bbox: [130, 30, 132, 32], cities: [{city: '試験市', count: 40, bbox: [131, 31, 131.5, 31.5]}]},
+  {pref: '旧表記県', count: 4, cover: null, bbox: [135, 34, 136, 35], cities: [
+    {city: '旧市', count: 3, bbox: [135.2, 34.2, 135.4, 34.4]}, {city: '', count: 1, bbox: null}]},
+  {pref: '歪み県', count: 2, cover: null, bbox: [10, 20, 5, 30], cities: [{city: '歪み町', count: 2, bbox: null}]}]});
+const legacyEnv = async () => {
+  const env = makeEnv();
+  env.handlers.places = () => reply(legacyBody());
+  await env.boot();
+  await openLib(env);
+  await openPlaces(env);
+  return env;
+};
+const chooseOpt = async (env, text) => {
+  const input = comboBox(env);
+  typeInto(input, text);
+  keyOn(input, 'ArrowDown');
+  keyOn(input, 'Enter');
+  await settle();
+};
+const noNewForm = q => ['country', 'region', 'region_unknown', 'unclassified', 'no_location'].forEach(k => assert.equal(q.get(k), null, k + ' は混ぜない'));
+
+await test('(t6j) 対応表にない旧地名（日本の region_unknown に入る pref）: カードには出ないがコンボボックスの候補に残り、選ぶと旧形式 pref=（市区町村は pref&city）で写真を取り、見出し・地図の fit を出す。新形式とは混ぜない', async () => {
+  const env = await legacyEnv();
+  // API どおり: 地域は対応表の県だけ。旧地名は「地域不明」に入り、地域のカードには出ない
+  assert.deepEqual(allCards(env).map(cardName), ['日本', '架空県', '地域不明']);
+  assert.deepEqual(plain(env.ev('ls.countries[0].regions.map(r => r.pref)')), ['架空県']);
+  assert.equal(cardCount(cardByKey(env, JP + '/!unknown')), '6 枚');
+  assert.deepEqual(plain(env.ev('ls.prefs.map(p => p.pref)')), ['架空県', '旧表記県', '歪み県'], '旧形式の行は旧地名も持つ');
+  // 候補: 旧地名も出る。旧地名には legacy の印、表にある県には付かない
+  const input = comboBox(env);
+  typeInto(input, '旧');
+  assert.deepEqual(labelsOf(env), ['旧表記県（4）', '旧表記県 旧市（3）']);
+  assert.deepEqual(plain(env.ev('ls.combo.items.map(i => i.legacy)')), [true, true]);
+  typeInto(input, '架空');
+  assert.deepEqual(plain(env.ev('ls.combo.items.map(i => [i.label, i.legacy])')), [['架空県（50）', false]]);
+  typeInto(input, '試験市');
+  assert.deepEqual(plain(env.ev('ls.combo.items.map(i => [i.label, i.legacy])')), [['架空県 試験市（40）', false]]);
+  // 旧地名の県を選ぶ: pref= だけ。選択は legacy_pref。見出し・地図の fit
+  const photos0 = env.reqs('/api/admin/library/photos').length;
+  const map = mapOf(env);
+  await chooseOpt(env, '旧表記');
+  let q = photoQ(env);
+  assert.equal(env.reqs('/api/admin/library/photos').length, photos0 + 1);
+  assert.equal(q.get('pref'), '旧表記県');
+  assert.equal(q.get('city'), null);
+  noNewForm(q);
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'legacy_pref', pref: '旧表記県', city: '', label: '旧表記県'});
+  assert.equal(env.$('#lib-sel').textContent, '旧表記県');
+  assert.equal(tiles(env).length, 3, '写真が出る（無反応にならない）');
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1)), {bounds: [135, 34, 136, 35], options: {padding: 16, maxZoom: 12}, eventData: {libMove: true}});
+  assert.equal(comboBox(env).value, '旧表記県');
+  assert.equal(hintOf(env), '');
+  // カードに選択の印は付かず、新形式の地域のカードも選ばれない
+  assert.ok(allCards(env).every(c => !c.classList.contains('is-selected')));
+  // 市区町村: pref と city の両方
+  await chooseOpt(env, '旧市');
+  q = photoQ(env);
+  assert.equal(q.get('pref'), '旧表記県');
+  assert.equal(q.get('city'), '旧市');
+  noNewForm(q);
+  assert.deepEqual(plain(env.ev('ls.sel.places')), {kind: 'legacy_pref', pref: '旧表記県', city: '旧市', label: '旧表記県 旧市'});
+  assert.equal(env.$('#lib-sel').textContent, '旧表記県 旧市');
+  assert.deepEqual(plain(map.calls.fitBounds.at(-1).bounds), [135.2, 34.2, 135.4, 34.4]);
+  // 同じ候補を選び直しても外れず、読み直さない
+  const n = env.reqs('/api/admin/library/photos').length;
+  await chooseOpt(env, '旧市');
+  assert.equal(env.reqs('/api/admin/library/photos').length, n);
+  assert.equal(env.ev('ls.sel.places.city'), '旧市');
+  // 除外を含める・期間のあいだも旧形式のまま読み直す
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  q = photoQ(env);
+  assert.equal(q.get('hidden'), '1');
+  assert.equal(q.get('pref'), '旧表記県');
+  assert.equal(q.get('city'), '旧市');
+  noNewForm(q);
+  // 表にある県は従来どおり新形式（pref は送らない）
+  await chooseOpt(env, '架空');
+  q = photoQ(env);
+  assert.equal(q.get('country'), JP);
+  assert.equal(q.get('region'), jpId('架空県'));
+  assert.equal(q.get('pref'), null, '新形式に旧形式を混ぜない');
+  assert.equal(env.ev('ls.sel.places.kind'), 'region');
+  // カードを押すと旧地名の選択は替わる（新形式のみ）
+  await chooseOpt(env, '旧表記');
+  assert.equal(env.ev('ls.sel.places.kind'), 'legacy_pref');
+  await press(env, cardByKey(env, JP + '/!unknown'));
+  q = photoQ(env);
+  assert.equal(q.get('region_unknown'), '1');
+  assert.equal(q.get('pref'), null);
+  assert.equal(q.get('city'), null);
+  assert.equal(env.ev('ls.sel.places.kind'), 'region_unknown');
+});
+
+await test('(t6k) 旧地名の選択も gen/seq で守る: 遅れて届いた旧地名の写真は、別のカードを選んだあとに出さない。bbox が不正なら動かさず案内、次の選択で案内は消える。地図を動かして絞っていても選べる', async () => {
+  const env = await legacyEnv();
+  const map = mapOf(env);
+  const sentL = [];
+  env.handlers.photos = params => {
+    if(params.get('pref') !== '旧表記県') return null;
+    return new Promise(res => { sentL.push(items => res(jsonRes({ok: true, page: 1, per: 60, pages: 1, total: items.length, items}))); });
+  };
+  await chooseOpt(env, '旧表記');                          // 旧地名（保留）
+  assert.equal(tiles(env).length, 0);
+  await press(env, cardByKey(env, JP + '/' + jpId('架空県')));   // 別のカード（すぐ届く）
+  assert.equal(tiles(env).length, 3);
+  sentL[0]([P503]);
+  await settle();
+  assert.equal(tiles(env).length, 3, '遅れた旧地名の 1 枚は捨てる');
+  assert.equal(env.$('#lib-sel').textContent, '日本 架空県');
+  // 逆: 旧地名を選んだあとに除外を切り替えると、古い要求は捨てる
+  await chooseOpt(env, '旧表記');
+  env.$('#lib-hidden').checked = true;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  sentL.at(-1)([P501]);                                   // 新しい応答（hidden=1）
+  await settle();
+  sentL.at(-2)([P503, P502]);                             // 古い応答
+  await settle();
+  assert.deepEqual(tiles(env).map(x => x.dataset.id), ['501'], '古い応答では内容が戻らない');
+  env.$('#lib-hidden').checked = false;
+  env.$('#lib-hidden').dispatchEvent({type: 'change'});
+  await settle();
+  env.handlers.photos = null;
+  // bbox が不正（最小 > 最大）: 地図は動かさず案内。選択はできる
+  const fits = map.calls.fitBounds.length;
+  await chooseOpt(env, '歪み県');
+  assert.equal(photoQ(env).get('pref'), '歪み県');
+  assert.equal(map.calls.fitBounds.length, fits);
+  assert.equal(hintOf(env), HINT);
+  // bbox が無い旧地名の市区町村: 動かさず、案内も出さない
+  await chooseOpt(env, '歪み町');
+  assert.equal(photoQ(env).get('city'), '歪み町');
+  assert.equal(map.calls.fitBounds.length, fits);
+  assert.equal(hintOf(env), '', '前の選択の案内は残さない');
+  assert.equal(env.ev('ls.mapHint'), null);
+  // 案内を出した選択を外して選び直しても、前の案内は復活しない（旧地名 → 案内 → 別のカード → 解除）
+  await chooseOpt(env, '歪み県');
+  assert.equal(hintOf(env), HINT);
+  await press(env, cardByKey(env, JP + '/' + jpId('架空県')));
+  assert.equal(hintOf(env), '');
+  assert.equal(env.ev('ls.mapHint'), null, '選択が替わると案内は捨てる');
+  // 地図を動かしてカードを絞っていても、旧地名は選べる（カードの読み直しは要らない）
+  userMove(env, {bounds: {w: 130, s: 30, e: 132, n: 32}, center: {lng: 131, lat: 31}});
+  await settle();
+  assert.deepEqual(plain(env.ev('ls.mapBbox')), [130, 30, 132, 32]);
+  const places = env.reqs('/api/admin/library/places').length;
+  await chooseOpt(env, '旧表記');
+  assert.equal(photoQ(env).get('pref'), '旧表記県');
+  assert.equal(env.reqs('/api/admin/library/places').length, places, 'カードを読み直さない');
+  assert.deepEqual(plain(env.ev('ls.mapBbox')), [130, 30, 132, 32], '絞り込みはそのまま');
 });
 
 await test('(t6g) AC3・AC11 地図: fit_bbox に合わせる（libMove 付き・bbox の絞り込みを足さない）。fit_bbox が null（日付変更線をまたぐ）か不正なら動かさず、世界全体へも飛ばさず、案内を出す。次の選択・利用者の移動で案内は消える', async () => {
@@ -3478,6 +3661,7 @@ await test('(t6g) AC3・AC11 地図: fit_bbox に合わせる（libMove 付き�
   // 解除すると案内も消える。利用者が地図を動かしても消える
   await press(env, cardByKey(env, 'unclassified'));
   assert.equal(hintOf(env), '');
+  assert.equal(env.ev('ls.mapHint'), null, '解除で案内そのものを捨てる（同じ選択を選び直しても前の案内が復活しない）');
   await press(env, cardByKey(env, 'ne:FJI'));
   assert.equal(hintOf(env), HINT);
   userMove(env, {bounds: {w: 170, s: -20, e: 179, n: -15}, center: {lng: 175, lat: -17}});

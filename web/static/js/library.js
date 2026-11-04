@@ -15,6 +15,8 @@
         {kind:'trip', key, from, to} | {kind:'year', year, from, to} | {kind:'month', year, month, from, to} | {kind:'untimed'}
         | {kind:'country', country, label} | {kind:'region', country, region, pref, label} | {kind:'city', country, region, pref, city, label}（日本の地域の市区町村）
         | {kind:'region_unknown', country, label} | {kind:'unclassified', label} | {kind:'no_location', label}
+        | {kind:'legacy_pref', pref, city, label}（旧地名: 日本の 47 都道府県の対応表にない pref〔表記揺れ〕。API では日本の region_unknown に入りカードには出ないので、
+          コンボボックスの候補（legacy 印付き）から旧形式 pref=<名前>（city があれば &city=<名前>）で選ぶ。名前をキーにするのはこの種類だけ。新形式の country/region とは混ぜない）
           （country・region は /places の国 ID・地域 ID。名前は label（見出し）と日本の pref（旧 prefs の市区町村を引くキー）だけで、選択の同一性は ID で決める）
         | {kind:'bbox', bbox: [w, s, e, n]} | {kind:'period'}（場所の画面で、期間の写真全体）
         | {kind:'span', from, to}（Shift の範囲。形の範囲）| {kind:'words', from, to, source}（日付の言葉。暦の範囲）| {kind:'q', q}（旅の文字検索）
@@ -29,8 +31,8 @@
    countries / unknown / classif / prefs: 国・地域のカード用の /places の応答（period・hidden・mapBbox を掛ける。countries は国の配列（regions を持つ）、
    unknown は {unclassified, no_location}、classif は {available, pending}、prefs は日本の市区町村を引く旧形式の行）。
    openCountry: 地域を展開している国の ID（undefined は未決定。初回に期間・bbox・選択がなければ日本。選択すると選んだ国になる）。mapHint: 地図の案内 {sel, text}（sel は出した選択の selId。その選択のあいだだけ出す）。
-   placeOpts: コンボボックスの候補用の /places の応答
-   （period・hidden だけ。mapBbox は掛けない。候補の UI は後の段）。保存先・seq（placeCards・placeOptions）・loaded を別に持つ。
+   placeOpts: コンボボックスの候補用の /places の応答（prefs と、旧地名の見分けに使う countries）
+   （period・hidden だけ。mapBbox は掛けない）。保存先・seq（placeCards・placeOptions）・loaded を別に持つ。
    loaded: 読み込み済みの一覧
    period: 場所の画面に掛かる期間 {from, to}（旅の「地図で見る」で入り、解除ボタンで外す）。カード・候補・点・詳細のすべてに掛かる。
    mapBbox: 利用者が地図を動かしたときのカードの絞り込み [w, s, e, n]。null なら絞らない。
@@ -44,7 +46,7 @@ const ls = {
   view: 'trips', includeHidden: false,
   trips: [], untimed: 0,
   years: [], calUntimed: 0, prefs: [], countries: [], unknown: {}, classif: {available: true, pending: 0},
-  openCountry: undefined, mapHint: null, placeOpts: {prefs: []},
+  openCountry: undefined, mapHint: null, placeOpts: {prefs: [], countries: []},
   loaded: {trips: false, calendar: false, placeCards: false, placeOptions: false},
   sel: {trips: null, calendar: null, places: null}, gen: 0, anchor: null, monthYear: null,
   tripFilter: '', whenMsg: null, combo: {open: false, items: [], more: 0, active: -1},
@@ -168,7 +170,7 @@ function selLabel(S){
     case 'year': return S.year + '年';
     case 'month': return S.year + '年' + S.month + '月';
     case 'untimed': return '日時なし';
-    case 'country': case 'region': case 'city': case 'region_unknown': case 'unclassified': case 'no_location': return S.label;
+    case 'country': case 'region': case 'city': case 'region_unknown': case 'legacy_pref': case 'unclassified': case 'no_location': return S.label;
     case 'bbox': return '地図の範囲' + (ls.period ? '・' + rangeLabel(ls.period.from, ls.period.to) : '');
     case 'period': return ls.period ? '期間 ' + rangeLabel(ls.period.from, ls.period.to) : '';
     case 'span': return spanLabel(S.from, S.to);
@@ -190,6 +192,7 @@ function selId(S){
     case 'region': return 'region:' + S.country + '/' + S.region;
     case 'city': return 'city:' + S.country + '/' + S.region + '/' + S.city;
     case 'region_unknown': return 'region_unknown:' + S.country;
+    case 'legacy_pref': return 'legacy_pref:' + encodeURIComponent(S.pref) + '/' + encodeURIComponent(S.city || '');
     default: return S.kind;          // untimed・unclassified・no_location・period
   }
 }
@@ -253,6 +256,7 @@ function applySel(S){
   ls.gen++;
   ls.seq.detail++;
   ls.page = 1;
+  setMapHint(null);            // 地図の案内は選択が変わる（外れる）と捨てる。同じ選択のまま読み直すだけの操作（期間・除外）は applySel を通らず、案内を保つ
   clearDetail();
   showLib();
   scrollSelected();
@@ -367,6 +371,7 @@ function submitTripSearch(){
 function mapForTrip(trip){
   ls.period = {from: trip.start, to: trip.end};
   ls.sel.places = {kind: 'period'};
+  ls.mapHint = null;               // 選択が替わるので、前の選択の案内は捨てる（表示はこのあと setLibView が合わせる）
   ls.mapBbox = null;
   ls.fitPoints = true;
   ls.gen++;
@@ -546,6 +551,7 @@ function countrySel(c){ return {kind: 'country', country: c.id, label: c.name}; 
 function regionSel(c, r){ return {kind: 'region', country: c.id, region: r.id, pref: r.pref || '', label: c.name + ' ' + r.name}; }
 function citySel(c, r, city){ return {kind: 'city', country: c.id, region: r.id, pref: r.pref || '', city, label: c.name + ' ' + r.name + ' ' + city}; }
 function regionUnknownSel(c){ return {kind: 'region_unknown', country: c.id, label: c.name + ' 地域不明'}; }
+function legacyPrefSel(pref, city){ return {kind: 'legacy_pref', pref, city: city || '', label: city ? pref + ' ' + city : pref}; }
 function countryCard(c){
   const open = ls.openCountry === c.id;
   const card = placeItemCard('lib-country' + (open ? ' has-regions' : ''), c.id, c.name, c, () => {
@@ -668,6 +674,7 @@ function validFitBox(b){
     && b[0] >= -180 && b[2] <= 180 && b[1] >= -90 && b[3] <= 90 && b[0] <= b[2] && b[1] <= b[3] && b[2] - b[0] <= 180;
 }
 function fitSelected(S, item){
+  setMapHint(null);              // 前の選択の案内は残さない。合わせられない（下）ときだけ出し直す
   if(S.kind === 'no_location' || !item) return;
   if(validFitBox(item.fit_bbox)){ fitMapTo(item.fit_bbox); return; }
   if(item.bbox || item.fit_bbox) setMapHint(LIB_FIT_HINT, S);     // 位置のある写真はあるが、自動では合わせられない。地図は今の位置のまま
@@ -715,7 +722,7 @@ function loadPlaceOptions(){
   const seq = ++ls.seq.placeOptions;
   libGet('places', placeParams(false)).then(d => {
     if(seq !== ls.seq.placeOptions) return;
-    ls.placeOpts = {prefs: d.prefs || []};
+    ls.placeOpts = {prefs: d.prefs || [], countries: readCountries(d.countries)};
     ls.loaded.placeOptions = true;
     if(ls.combo.open) refreshCombo();
   }).catch(e => { if(seq === ls.seq.placeOptions) toast('場所の候補を読めませんでした: ' + e.message, true); });
@@ -764,15 +771,19 @@ function comboRows(text){
   const f = foldText(text.trim());
   const byCount = (a, b) => b.count - a.count || (a.pref + a.city < b.pref + b.city ? -1 : 1);
   const prefs = [], cities = [];
+  // 日本の地域になる pref（対応表にある都道府県）。これに無い pref は旧地名（legacy）で、地域のカードに出ず、旧形式の pref= で選ぶ
+  const known = new Set();
+  (ls.placeOpts.countries || []).forEach(c => (c.regions || []).forEach(r => { if(r.pref) known.add(r.pref); }));
   (ls.placeOpts.prefs || []).forEach(p => {
     if(!p.pref) return;
+    const legacy = !known.has(p.pref);
     if(!f || foldText(p.pref).includes(f) || prefReadingMatch(p.pref, f)){
-      prefs.push({kind: 'pref', pref: p.pref, city: '', count: p.count, bbox: p.bbox || null,
+      prefs.push({kind: 'pref', pref: p.pref, city: '', count: p.count, bbox: p.bbox || null, legacy,
                   label: p.pref + '（' + p.count + '）'});
     }
     (p.cities || []).forEach(c => {
       if(!c.city || (f && !foldText(c.city).includes(f))) return;
-      cities.push({kind: 'city', pref: p.pref, city: c.city, count: c.count, bbox: c.bbox || null,
+      cities.push({kind: 'city', pref: p.pref, city: c.city, count: c.count, bbox: c.bbox || null, legacy,
                    label: p.pref + ' ' + c.city + '（' + c.count + '）'});
     });
   });
@@ -834,39 +845,47 @@ function moveCombo(delta){
   paintCombo();
 }
 /* 候補を決める。地域・市区町村のカードを選んだのと同じ動き（selectPlace）。ただし同じものを選んでいるときは外さず、地図を動かすだけ。
-   候補は今は日本の都道府県と市区町村（旧 prefs）で、選択は日本の国 ID・地域 ID に直す（候補の国→地域→市区町村への広げ方は後の段） */
+   候補は今は日本の都道府県と市区町村（旧 prefs）で、対応表にある都道府県は日本の国 ID・地域 ID の選択に直す（候補の国→地域→市区町村への広げ方は後の段）。
+   対応表にない旧地名（legacy 印）は、変更前と同じ結果になるよう旧形式の選択（legacy_pref）にする */
 function chooseComboItem(it){
   closeCombo();
   $('#lib-place-combo').value = it.kind === 'city' ? it.city : it.pref;
-  choosePlace(it.kind === 'city' ? {kind: 'city', pref: it.pref, city: it.city} : {kind: 'pref', pref: it.pref});
+  choosePlace(it);
 }
 /* 候補（都道府県名・市区町村名）に当たる日本の地域のカードと選択。見つからなければ null */
-function japanChoice(legacy){
+function japanChoice(it){
   for(const c of ls.countries){
-    const r = (c.regions || []).find(x => x.pref === legacy.pref);
+    const r = (c.regions || []).find(x => x.pref === it.pref);
     if(!r) continue;
-    if(legacy.kind !== 'city') return {S: regionSel(c, r), item: r};
-    const row = ls.prefs.find(x => x.pref === legacy.pref);
-    const city = row && (row.cities || []).find(x => x.city === legacy.city);
-    return city ? {S: citySel(c, r, legacy.city), item: {bbox: city.bbox, fit_bbox: city.bbox}} : null;
+    if(it.kind !== 'city') return {S: regionSel(c, r), item: r};
+    const row = ls.prefs.find(x => x.pref === it.pref);
+    const city = row && (row.cities || []).find(x => x.city === it.city);
+    return city ? {S: citySel(c, r, it.city), item: {bbox: city.bbox, fit_bbox: city.bbox}} : null;
   }
   return null;
+}
+/* 旧地名の候補の選択と地図の合わせ先（候補が持つ旧 prefs の bbox。カードの応答には無いので、読み直しは要らない） */
+function legacyChoice(it){
+  return {S: legacyPrefSel(it.pref, it.kind === 'city' ? it.city : ''), item: {bbox: it.bbox, fit_bbox: it.bbox}};
 }
 /* カードに（city なら地域のカードの市区町村にも）出ていない候補は、地図の範囲による絞り込みを外してカードを読み直してから選ぶ
    （市区町村のチップはカード用の ls.prefs から作るので、読み直したあとに出る）。読み直しの間に別の操作があれば選ばない
    （カード・月などの選択は gen を進め、候補を決め直すと seq.choose が進む。どちらが変わっても保留中の選択は捨てる） */
-function choosePlace(legacy){
+function applyChoice(found){
+  const cur = ls.sel.places;
+  if(cur && selId(cur) === selId(found.S)){
+    if(validFitBox(found.item.fit_bbox)){ setMapHint(null); fitMapTo(found.item.fit_bbox); }     // 選び直しで合わせられるようになったら、前の案内は消す
+  }else selectPlace(found.S, found.item);
+}
+function choosePlace(it){
   const cseq = ++ls.seq.choose;
   ls.seq.cluster++;            // 同じ候補を選び直して選択が変わらないとき（地図を動かすだけ）も、待っているクラスタの展開は捨てる
+  if(it.legacy){ applyChoice(legacyChoice(it)); return; }       // 旧地名はカードに出ない。カードの読み直しも待たない
   const done = () => {
-    const found = japanChoice(legacy);
-    if(!found) return;
-    const cur = ls.sel.places;
-    if(cur && selId(cur) === selId(found.S)){
-      if(validFitBox(found.item.fit_bbox)) fitMapTo(found.item.fit_bbox);
-    }else selectPlace(found.S, found.item);
+    const found = japanChoice(it);
+    if(found) applyChoice(found);
   };
-  const shown = !!japanChoice(legacy);
+  const shown = !!japanChoice(it);
   if(!ls.mapBbox || shown){ done(); return; }
   const gen = ls.gen;
   ls.mapBbox = null;
@@ -899,7 +918,7 @@ function clearPeriod(){
   ls.seq.placeCards++;
   ls.seq.placeOptions++;
   ls.page = 1;
-  if(ls.sel.places && ls.sel.places.kind === 'period') ls.sel.places = null;
+  if(ls.sel.places && ls.sel.places.kind === 'period'){ ls.sel.places = null; ls.mapHint = null; }
   clearDetail();
   if(ls.view === 'places'){
     showLib();
@@ -932,6 +951,7 @@ function detailParams(S){
     case 'region': p.country = S.country; p.region = S.region; break;
     case 'city': p.country = S.country; p.region = S.region; p.city = S.city; break;      // 日本の地域の市区町村だけ（pref = 地域の都道府県 AND city）
     case 'region_unknown': p.country = S.country; p.region_unknown = true; break;
+    case 'legacy_pref': p.pref = S.pref; if(S.city) p.city = S.city; break;        // 旧形式（変更前と同じ）。country・region とは混ぜない
     case 'unclassified': p.unclassified = true; break;
     case 'no_location': p.no_location = true; break;
     case 'bbox': p.bbox = S.bbox.join(','); break;
