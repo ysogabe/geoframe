@@ -1,7 +1,7 @@
 # 国・地域別の場所表示 タスク
 
 - PRD: [prd.md](prd.md) / 設計: [design.md](design.md)
-- ブランチ: 段①は `t3/f73af70e`（geoframe の PR #80 でマージ済み、2026-11-04）。段②は `t3/international-places-api`。段③は段②のマージ後に新しいブランチで行う。
+- ブランチ: 段①は `t3/f73af70e`（geoframe の PR #80 でマージ済み、2026-11-04）。段②は `t3/international-places-api`（geoframe の PR #81 でマージ済み、2026-11-04）。段③は `t3/international-places-ui`。
 - PR は段ごとに 1 本（設計「実装の順番」）。
 
 ## 段①（PR 1）: 境界データと分類段
