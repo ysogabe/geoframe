@@ -69,7 +69,7 @@
 
 ### `note-photo-export/` — note 記事用の写真書き出し
 
-2026-11-20 開始。日付（または期間）を指定すると、その日の表示用 JPEG と manifest を Google Drive へ書き出す別プロセス（`geoframe-export`）を作る計画。だいだいが tailnet 経由で呼ぶ。写真サービス本体は変えない。
+2026-11-20 開始。日付（または期間）を指定すると、その日の表示用 JPEG と manifest を Google Drive へ書き出す別プロセス（`geoframe-export`）を作る計画。別 VM のエージェントが tailnet 経由で呼ぶ。写真サービス本体は変えない。
 
 - [PRD](note-photo-export/prd.md) / [設計](note-photo-export/design.md)
 
