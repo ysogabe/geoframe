@@ -23,7 +23,7 @@
 ### 2.2 写真フィード `GET /api/v1/photos`
 
 - ハンドラは `src/server.rs:269-289`。**クエリを読まない**。絞り込み・ページングは無く、全件（数千件）を返す。
-- 対象の条件（`src/photos.rs:52-111`）:
+- 対象の条件（`src/photos.rs:52-111`）は次のとおり。
   - `p.lat IS NOT NULL AND p.display IS NOT NULL AND COALESCE(p.hidden,0)=0`（`FEED_BASE_WHERE`）。さらに行の変換で `lon` が NULL の行も落とす（`src/photos.rs:166` 付近）。
   - 品質: 完全一致の重複グループで非推奨の写真を出さない（`QUALITY_VISIBLE`。人の代表の記録があればそれを優先）。
   - AI の類似グループ: 非推奨の写真を出さない。ただし、お気に入り・人の代表・表示できる推薦写真が無いグループなどの例外がある（`src/selection.rs:69` 付近）。
@@ -48,7 +48,7 @@
 ### 2.5 既存の書き出し機能（旅行ブログ）
 
 - `POST /api/blog/export`（`src/blog_write.rs`）は `DATA_DIR/blog_exports/<trip_id>/` に画像と manifest を書く。作業領域に作ってから、旧フォルダを `.previous` へ退避して置き換え、失敗したら元に戻す（`src/blog_write.rs:801` 付近）。書き出せない写真は飛ばし、`skipped` で理由を返す。書き出しはプロセスで 1 本だけで、実行中は 409。
-- 書く先はサービスの DATA_DIR の中だけで、Drive には送らない。今回の設計は、この 3 つの考え方を Drive の上で踏襲する（4.2）。
+- 書く先はサービスの DATA_DIR の中だけで、Drive には送らない。今回の設計はこの 3 つの考え方を Drive の上で踏襲する（4.2）。
   - 作業領域に一式を作ってから公開する。
   - 置き換えるときは旧フォルダを退避し、失敗したら戻す。
   - 書き出しは 1 本だけにする。
@@ -64,15 +64,15 @@
 
 ### 2.7 Drive と rclone
 
-- rclone の remote `gdrive:` は、オーナーのホームの設定ファイル（0600）にある。`scope` を指定していないので、Drive 全体を読み書きできる権限になっている。`geoframe` ユーザーからは読めない。
-- 既存の書き出し先の形（読み取りで確認）:
+- rclone の remote `gdrive:` はオーナーのホームの設定ファイル（0600）にある。`scope` を指定していないので、Drive 全体を読み書きできる権限になっている。`geoframe` ユーザーからは読めない。
+- 既存の書き出し先の形（読み取りで確認）は次のとおり。
   - `gdrive:yamareco/` … 1 日は `YYYY-MM-DD`。2 日分は `YYYY-MM-DD-DD` のフォルダに、日付ごとのサブフォルダと、まとめた `manifest.json` を置いている。
   - `gdrive:travel-journal/` … 1 日 1 フォルダ（`YYYY-MM-DD`）。
 - rclone は「共用の client_id は 2026 年中に使えなくなる」と警告を出している（9 章）。
 
 ### 2.8 旧 manifest の形（互換の基準）
 
-既存の manifest から読み取った形（値は架空のもの）:
+既存の manifest から読み取った形は次のとおり（値は架空のもの）。
 
 ```json
 {
@@ -97,6 +97,7 @@
 - 期間のときは `date` が `"2026-01-10/2026-01-11"`、`filename` が `"2026-01-10/091100_101.jpg"` になり、`days`（日ごとの `count`・`first`・`last`・`ids`）が付く。
 - ファイル名の秒は、フィードが分までしか持たないので常に `00`。
 - 古い旅行記の manifest には `gps_inferred` と `elev` が無いものがある。新しいものには必ず入れる。
+- `spot` と `nearest_spot_distance_m`: 山行の manifest では空欄（`""` と `null`）。旅行記の manifest には、名所の一覧から求めた名前と距離（300m 以内の最寄り）が入っていたものがある。その名所の一覧はこの環境では見つかっていない（U8）。
 - `mean_brightness` はグレースケール（縮小前）の 0〜255 の平均。`sharpness_laplacian_var` は、長辺 1024px 以下に縮小したグレースケールに 3×3 の 4 近傍ラプラシアン（オフセット 128、0〜255 に丸め）を掛けた応答の分散。どちらも PIL で計算していた。計算に使ったスクリプトと Pillow の版は見つかっていない（4.3）。
 
 ## 3. 方針
@@ -117,7 +118,7 @@
 ### 3.2 コードの置き場所
 
 - このリポジトリのワークスペースに 2 つ目の crate `crates/geoframe-export` を足す。バイナリは `geoframe-export`。
-- `geoframe` crate（ライブラリ）には依存しない。つながりは HTTP だけにして、写真サービスの内部の型の変更に引きずられないようにする。依存は、ワークスペースで既に使っている crate（`axum`/`tokio`、`ureq`、`serde`/`serde_json`、`zune-jpeg`、縮小用の crate）の同じ版に限る。
+- `geoframe` crate（ライブラリ）には依存しない。つながりは HTTP だけにして、写真サービスの内部の型の変更に引きずられないようにする。依存はワークスペースで既に使っている crate（`axum`/`tokio`、`ureq`、`serde`/`serde_json`、`zune-jpeg`、縮小用の crate）の同じ版に限る。
 - 既存の `geoframe` crate の 2 つ目のバイナリにする案もあるが、写真サービスの依存（SQLite など）を引き込み、ビルドと配布の単位が分けにくくなるので、crate を分ける。
 - 他の小サービスはリポジトリの外にあるものもある。これは GEOFRAME のデータの形（フィードの契約、派生画像）に依存するので、契約の試験と同じリポジトリに置く。
 
@@ -129,7 +130,7 @@
   - 明るさ・シャープネスの計算（182 枚で数十秒の見込み）。
 - 仮定が外れても、数分かかる処理を 1 本の HTTP 要求で待たせると、呼び出し側のタイムアウトと切断に弱い。**非同期にする**（受付で `202` とジョブ ID を返し、ID で状態を引く）。確認（`dry_run`）だけは数秒で終わるので同期で返す。
 - ジョブの記録は小さな JSON にして、`StateDirectory` の `jobs/` に残す（直近 50 件）。再起動しても、ジョブ ID で結果を引ける。実行中に止まったジョブは、次の起動で `interrupted` にする。
-- 呼び出し側は任意の `request_id` を付けられる。同じ `request_id` の再送には、新しいジョブを作らずに同じジョブを返す（受付の応答を受け取れなかったときの再試行のため）。
+- 呼び出し側は任意の `request_id` を付けられる。同じ `request_id` の再送には新しいジョブを作らずに同じジョブを返す（受付の応答を受け取れなかったときの再試行のため）。
 
 ### 3.4 認証と送信元の制限
 
@@ -142,15 +143,15 @@
 ### 3.5 書き出し先と再実行
 
 - 書き出し先は種類で指定する。`destination` は `yamareco` か `travel-journal` のどちらか。
-- Drive 上のパスは、次の 2 つだけで決める。呼び出し側の文字列は rclone の引数に入れない。
+- Drive 上のパスは次の 2 つだけで決める。呼び出し側の文字列は rclone の引数に入れない。
   - サーバーの設定にある、種類ごとの固定の接頭辞（既定は `gdrive:yamareco` と `gdrive:travel-journal`。U4 で変わりうる）。
   - 検査済みの日付から作ったフォルダ名。
-- フォルダ名:
+- フォルダ名は次のとおり。
   - 1 日: `YYYY-MM-DD`
   - 同じ月の期間: `YYYY-MM-DD-DD`（既存の形と同じ）
   - 月や年をまたぐ期間: `YYYY-MM-DD_YYYY-MM-DD`（既存に例が無い。5 章 U3）
   - 作った名前は `^\d{4}-\d{2}-\d{2}(-\d{2}|_\d{4}-\d{2}-\d{2})?$` に合うことを、使う直前に確かめる。
-- 再実行（同じ宛先に既にフォルダがある）:
+- 再実行（同じ宛先に既にフォルダがある）の扱いは次のとおり。
   - 既定（`on_exists: "error"`）: 書かずに、状態 `conflict` で終える。
   - `on_exists: "replace"`: 新しい一式を公開し、旧フォルダは退避してから Drive のゴミ箱へ移す（4.2）。ゴミ箱から戻せる。
   - 追記（既存を残して足す）は持たない。ファイル名は `HHMMSS_<id>.jpg` で決まる。そのため同じ日をもう一度書けば同じ名前になり、追記と置き換えの違いは「消えた写真が残るかどうか」だけになる。残すと manifest と実ファイルが合わなくなり、受け取り側の検証が落ちる。
@@ -159,8 +160,8 @@
 
 ```mermaid
 flowchart LR
-  D[呼び出し側のエージェント] -- "tailnet 上の HTTP\nBearer + 送信元の許可" --> E[geoframe-export]
-  E -- "GET /api/v1/photos\nGET /derivatives/*\n(127.0.0.1:8080)" --> G[geoframe serve]
+  D[呼び出し側のエージェント] -- "tailnet 上の HTTP、Bearer と送信元の許可" --> E[geoframe-export]
+  E -- "GET /api/v1/photos と /derivatives/* (127.0.0.1:8080)" --> G[geoframe serve]
   E -- "rclone copy / lsjson / moveto / purge" --> R[(Google Drive)]
   D -- "Drive から取得・検証" --> R
 ```
@@ -172,10 +173,10 @@ flowchart LR
 3. 各写真の `time` を検査する（4.4）。期間内の日付の写真を選ぶ。`time` が空の写真（`undated_in_feed`）と形が崩れた写真（`invalid_time_in_feed`）は、フィード全体での数だけ数える（その写真の日付は分からないので、対象の日のものかどうかも分からない）。
 4. 選んだ写真（候補）が 0 枚なら、状態 `succeeded`、`count: 0`、`uploaded: false` で終える。Drive には触れない（既存のフォルダがあっても変えない）。
 5. 作業領域（`StateDirectory/staging/<job_id>/`、0700）に、写真を 1 枚ずつ取る。
-   - 書き出しの対象から外すもの（仕様上の除外。件数と理由を返し、書き出しは続ける）:
+   - 次の写真は書き出しの対象から外す（仕様上の除外。件数と理由を返し、書き出しは続ける）。
      - `not_derivative` … `file` が 4.4 の形に合わない。EXIF 付きの原本を外へ出さないため。
      - `has_metadata` … JPEG に APP1（Exif/XMP）の区画がある。派生画像は EXIF を落としてあるはずなので、作り方が変わったときに気づくため。
-     - `time` が空・崩れた写真は、そもそも期間に割り当てられないので候補に入らない（`excluded` ではなく、フィード全体の件数として別に返す）。
+     - `time` が空・崩れた写真はそもそも期間に割り当てられないので候補に入らない（`excluded` ではなく、フィード全体の件数として別に返す）。
    - 書き出しの対象にした写真の取得・デコードに失敗したら、**ジョブを `failed` にして公開しない**（一部の写真が欠けた書き出しを作らない）。
      - 取得の失敗の例: 接続できない、上限（1 枚 30MB、画素数 6,000 万）を超える、期限（1 枚 60 秒）を過ぎる。
    - 取ったバイト列はそのまま書く（再エンコードしない）。`file_size` は配信されたバイト数と一致する。ファイルは新規作成（`O_EXCL`・`O_NOFOLLOW`）で書く。
@@ -202,23 +203,25 @@ flowchart LR
 | 2 つ以上、またはファイル・ショートカット | `ambiguous` | `failed`（`ambiguous_destination`）。Drive では同じ名前を複数作れる |
 | 照会の失敗 | — | `failed`（`drive_unavailable`）。「無い」と取り違えない |
 
-**公開の手順**: 作業用のフォルダは、接頭辞の下の `_geoframe-export/` に置く。各段階に進む前に、段階の名前と関係するフォルダの ID をジョブの記録（`jobs/<job_id>.json`）に書く。
+**公開の手順**: 作業用のフォルダは接頭辞の下の `_geoframe-export/` に置く。各段階に進む前に、段階の名前と関係するフォルダの ID をジョブの記録（`jobs/<job_id>.json`）に書く。
 
 1. `uploading`: 写真を `_geoframe-export/incoming/<job_id>/` へ `rclone copy` で送り、最後に manifest を送る。
 2. `verifying`: `rclone lsjson -R` で、`incoming` の相対パスとサイズを manifest と突き合わせる（受け取り側と同じ検証）。合わなければ `failed`（`verify_mismatch`）にし、`incoming` を消す。`incoming` のフォルダの ID を記録する。
 3. 宛先の状態をもう一度調べる（運用の前提により、ここで変わっていることはないはずだが、変わっていたら `failed` にして公開しない）。
 4. 宛先の状態に応じて公開する。
    - `absent` のとき（`publishing`）: `rclone moveto incoming/<job_id> <宛先>` で移す。宛先が無い状態での移動なので、Drive の中でのフォルダの移動（親と名前の変更）になる。
-   - `exists` で `replace` のとき:
+   - `exists` で `replace` のときは、次の順に行う。
      1. `retiring`: 旧フォルダ（ID を記録済み）を `_geoframe-export/replaced/<フォルダ名>-<job_id>` へ移す。
      2. `publishing`: `incoming/<job_id>` を宛先へ移す。
      3. `trashing`: `replaced/` の旧フォルダを `rclone purge --drive-use-trash=true` でゴミ箱へ移す。
-5. 移動のあとは、コマンドの終了コードを信じずに、毎回 `lsjson` で結果を確かめる（応答が失われても、移動は済んでいることがある）。
-   - 宛先が、記録した `incoming` の ID のフォルダ 1 つだけであること。
+5. 移動のあとはコマンドの終了コードを信じずに、毎回 `lsjson` で結果を確かめる（応答が失われても、移動は済んでいることがある）。
+   - 宛先が記録した `incoming` の ID のフォルダ 1 つだけであること。
    - `incoming/<job_id>` が残っていないこと。
    - 中身が manifest と一致すること。
    - rclone はフォルダの移動ができないとファイル単位の移動に切り替えるので、宛先の ID が違う・中身が混ざっているなどの形でそれを見つける。見つけたら `blocked` にする（下の「復旧」）。
 6. `succeeded`: ジョブの記録を完了にする。
+
+手順 4・5 のどこかで rclone が失敗・タイムアウトしたら、その場で（次のジョブや再起動を待たずに）下の「復旧」の表を実行し、宛先を旧か新のどちらかの一式に戻してからジョブを終える。
 
 `replace` では、手順 4 の 1 と 2 の間（通常は数秒）、宛先が一時的に無くなる。受け取り側は、宛先が無ければ少し待って取り直す（PRD R6）。
 
@@ -242,7 +245,7 @@ flowchart LR
 - 接頭辞（`--remote-*`）は起動時に `^[A-Za-z0-9_-]+:[A-Za-z0-9_/-]+$` に合うこと、`-` で始まらないこと、`..` を含まないことを確かめる。
 - 子プロセスにはタイムアウトを掛ける（既定 15 分。`try_wait` の繰り返しで見て、過ぎたら kill する）。
 - 主なオプションは `--transfers 4`、`--checkers 8`、`--retries 3`、`--low-level-retries 10`。`purge` には `--drive-use-trash=true` を明示する。
-- rclone の標準エラーは、`token`・`Bearer`・`access_token` を含む行を伏せ字にしてから、最後の数行だけをログに残す。API の応答には載せず、固定のエラーコードと短い説明だけを返す。
+- rclone の標準エラーは `token`・`Bearer`・`access_token` を含む行を伏せ字にしてから、最後の数行だけをログに残す。API の応答には載せず、固定のエラーコードと短い説明だけを返す。
 
 ### 4.3 明るさとシャープネス
 
@@ -283,6 +286,8 @@ flowchart LR
 | U6 | `replace` を API から許すか | **許す**（旧フォルダはゴミ箱に移るので戻せる） | 呼び出し側のエージェントが置き換えまでできる | `error` が既定であること |
 | U6′ | 〃（別案） | CLI だけに許す（API の `replace` は 403） | 置き換えはオーナーがホストで行う | 同上 |
 | U7 | 書き出し先のフォルダの共有範囲 | オーナーが確認する（manifest に正確な緯度経度が入るため） | — | — |
+| U8 | 旅行記の名所（`spot`） | **空欄のまま**（名所の一覧が見つかっていない） | 旅行記の manifest で、前は入っていた名所の名前と距離が欠ける。記事を書く側で名所を補う | 山行の manifest（前から空欄）、その他のキー |
+| U8′ | 〃（別案） | 名所の一覧（名前と座標）を用意し、300m 以内の最寄りを付ける | 一覧の置き場所と管理の方法を決める必要がある（後から足せる） | 同上 |
 
 ## 6. インターフェース
 
@@ -304,11 +309,11 @@ flowchart LR
   - 候補の数と、フィードだけで分かる除外（`not_derivative`）
   - フォルダ名
   - 宛先の状態
-- `request_id`（省略可）: `[A-Za-z0-9_-]{1,64}`。同じ値の再送には、実行枠を取らずに同じジョブを返す（実行中でも 409 にしない）。対象は直近 50 件の記録。同じ値で中身（期間・宛先・`on_exists`）が違えば 409（`request_id_mismatch`）。重複の確認とジョブの登録は 1 つの排他の中で行い、記録を `jobs/` に書いてから `202` を返す。
+- `request_id`（省略可）: `[A-Za-z0-9_-]{1,64}`。同じ値の再送には実行枠を取らずに同じジョブを返す（実行中でも 409 にしない）。対象は直近 50 件の記録。同じ値で中身（期間・宛先・`on_exists`）が違えば 409（`request_id_mismatch`）。重複の確認とジョブの登録は 1 つの排他の中で行い、記録を `jobs/` に書いてから `202` を返す。
 
-応答:
+応答は次のとおり。
 
-- `202 {"job_id": "...", "status": "running"}`。同じ `request_id` の再送には、そのジョブの `job_id` と今の `status` を返す。
+- `202 {"job_id": "...", "status": "running"}`。同じ `request_id` の再送にはそのジョブの `job_id` と今の `status` を返す。
 - `200`（`dry_run`）`{"folder": "2026-01-10-11", "destination": "yamareco", "candidate_count": 52, "days": {...}, "target": "absent", "existing_files": 0, "excluded": {"not_derivative": 0}, "undated_in_feed": 6, "invalid_time_in_feed": 0}`
 - `400`（検査の失敗。`{"error": "invalid_date"}` など）、`401`、`403`、`409`（実行中・`request_id_mismatch`）、`503`（`dry_run` でフィードか Drive が使えない、または `blocked`）
 
@@ -337,7 +342,7 @@ flowchart LR
 }
 ```
 
-- 数の意味:
+- 数の意味は次のとおり。
   - `catalog_count`: 候補の数。期間内の日付だとフィードから判定できた写真の数。
   - `excluded`: 候補のうち、仕様上の除外（`not_derivative`・`has_metadata`）で外した写真。
   - `count`: 公開した写真の数（= `catalog_count` − `excluded` の件数）。
@@ -364,7 +369,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
 
 - `recover` は、未完了のジョブの記録と Drive の状態を照らし合わせて表示する（4.2 の復旧）。`--resolve` は、オーナーが Drive を確かめたあとで `blocked` を解除する。
 
-- 設定の引数:
+- 設定の引数は次のとおり。
   - `--feed-base`（既定 `http://127.0.0.1:8080`）
   - `--rclone`、`--rclone-config`
   - `--remote-yamareco`、`--remote-travel-journal`（既定は 3.5。U4 で変わる）
@@ -376,24 +381,24 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
   - 4: 実行中（実行枠が取れない）
   - 1: 失敗
   - 2: 引数の誤り
-- 引数の解釈は、`geoframe` crate と同じく手書きにする（`crates/geoframe/src/cli.rs:1-2` の方針。依存を増やさない）。
+- 引数の解釈は `geoframe` crate と同じく手書きにする（`crates/geoframe/src/cli.rs:1-2` の方針。依存を増やさない）。
 
 ### 6.3 manifest.json
 
 2.8 の形に合わせる。キーは旧 manifest のものをすべて出し、次を足す。
 
-- 最上位に足すキー:
+- 最上位に足すキーは次のとおり。
   - `generator`（`"geoframe-export <版>"`）
   - `destination`、`folder`
   - `excluded`（理由付き）
   - `undated_in_feed`、`invalid_time_in_feed`
 - `source` は `"GEOFRAME /api/v1/photos"` のまま。
-- `notes` に書くこと:
+- `notes` には次を書く。
   - 時刻: 分までで、秒は 00。ローカル時刻のままで補正しない。
   - 明るさ・シャープネスの計算方法（4.3）と、旧 manifest とずれうること。
   - `gps_inferred` の意味。
   - `spot` が空である理由。
-- `spot` は `""`、`nearest_spot_distance_m` は `null`。
+- `spot` は `""`、`nearest_spot_distance_m` は `null`（U8 で名所の一覧を用意すると決めたら、そのときに足す）。
 - `lat`/`lon`/`elev` はフィードの値をそのまま出す（丸めない）。`elev` が無ければ `null`。
 - 期間のときは日付ごとのサブフォルダに写真を置き、`filename` に日付を含め、`days` を付ける（2.8）。
 
@@ -475,4 +480,4 @@ PR は 2 本に分ける。どちらも単独でマージ・差し戻しでき�
    2. ジョブの API（受付、状態、一覧、`request_id`）。
    3. unit の雛形（`deploy/geoframe-export.service`。IP とトークンのパスは書かない）、`deploy/README.md` の手順、musl の静的ビルドへの追加。
    4. 配置: U4 に従って、専用ユーザーと rclone の設定を用意する。そのあと本番で検証する（10 章の「配置後」）。rclone のトークン更新が unit の権限の下で動くことも確かめる。
-3. 呼び出し側の変更は、呼び出し側のリポジトリで別に行う。
+3. 呼び出し側の変更は呼び出し側のリポジトリで別に行う。
