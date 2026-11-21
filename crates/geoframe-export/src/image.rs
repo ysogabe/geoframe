@@ -138,12 +138,14 @@ impl ImageClient {
         }
         let limit = self.limits.max_image_bytes.min(job_remaining);
         let cap = limit.saturating_add(1);
-        // ureq 自身の上限は take より後ろに置く（take が先に止める。ureq の上限は最後の保険）
-        let reader = response
-            .body_mut()
-            .with_config()
-            .limit(cap.saturating_add(1))
-            .reader();
+        // ureq 自身の上限は（gzip なら）展開の前のバイト数に効くので、ジョブの残りとは切り離し、1 枚の上限から
+        // ゆとりを持たせた値にする（圧縮で少し大きくなった正常な応答を断らない）。展開の後のバイト数は take で数える
+        let wire_cap = self
+            .limits
+            .max_image_bytes
+            .saturating_mul(2)
+            .saturating_add(64 * 1024);
+        let reader = response.body_mut().with_config().limit(wire_cap).reader();
         let mut out = Vec::new();
         reader
             .take(cap)
@@ -399,6 +401,8 @@ fn prepare_inner(
         });
     }
 
+    // 早く終わる結果（全部除外）も含めて、結果を返す前に全体の期限を確かめる
+    check_deadline(deadline, now)?;
     // 仕様上の除外のあとで 0 枚になったら失敗（宛先の状態に関係なく同じ結果。Drive の照会はこの後）
     if photos.is_empty() {
         return Err(ExportError::from(ErrorCode::NothingToExport));

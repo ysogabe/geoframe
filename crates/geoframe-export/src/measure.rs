@@ -230,10 +230,11 @@ fn resample(
 
 /// Pillow の `division_UINT32(divider, 8)`（`libImaging/Reduce.c`）: 平均を出す掛け算の係数。`2^32 / (256 * divider)` を
 /// 単精度の浮動小数で割り、切り捨てる。
-fn reduce_multiplier(divider: u32) -> u32 {
-    let max_dividend = (1u32 << 8) * divider;
+/// 区画が大きい（`256 * divider` が `u32` に収まらない）ときも桁あふれしないよう、`u64` で掛ける（Pillow の範囲では同じ値）。
+fn reduce_multiplier(divider: u64) -> u64 {
+    let max_dividend = (1u64 << 8) * divider;
     let max_int = (1u32 << 30) as f32 * 4.0;
-    (max_int / max_dividend as f32) as u32
+    (max_int / max_dividend as f32) as u64
 }
 
 /// Pillow の `Image.reduce((factor_x, factor_y))`（8 ビット 1 チャンネル、`libImaging/Reduce.c`）: `factor_x × factor_y`
@@ -254,16 +255,15 @@ pub fn reduce(
         for ox in 0..out_w {
             let x0 = ox * factor_x;
             let x1 = (x0 + factor_x).min(width);
-            let count = ((x1 - x0) * (y1 - y0)) as u32;
+            let count = ((x1 - x0) * (y1 - y0)) as u64;
             let mut sum = count / 2;
             for y in y0..y1 {
                 sum += src[y * width + x0..y * width + x1]
                     .iter()
-                    .map(|&v| u32::from(v))
-                    .sum::<u32>();
+                    .map(|&v| u64::from(v))
+                    .sum::<u64>();
             }
-            out[oy * out_w + ox] =
-                ((u64::from(sum) * u64::from(reduce_multiplier(count))) >> 24) as u8;
+            out[oy * out_w + ox] = ((sum * reduce_multiplier(count)) >> 24).min(255) as u8;
         }
     }
     (out, out_w, out_h)

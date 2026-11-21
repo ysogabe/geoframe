@@ -206,3 +206,13 @@ fn jpeg_fixtures_match_pillow_within_the_tolerance() {
         );
     }
 }
+
+#[test]
+fn reduce_with_a_huge_factor_does_not_overflow() {
+    // 区画が 4096×4096 でも桁あふれしない（Pillow の u32 の範囲を超える係数。サムネイルの経路では起きない）
+    let (w, h) = (4096usize, 4096usize);
+    let src = vec![200u8; w * h];
+    let (out, ow, oh) = measure::reduce(&src, w, h, 4096, 4096);
+    assert_eq!((ow, oh), (1, 1));
+    assert!((i32::from(out[0]) - 200).abs() <= 1, "{}", out[0]);
+}

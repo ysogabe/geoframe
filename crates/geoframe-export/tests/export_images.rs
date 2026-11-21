@@ -1286,14 +1286,16 @@ fn ticking_clock(base: Instant) -> impl Fn() -> Instant {
 
 #[test]
 fn the_deadline_is_checked_after_decoding_and_after_writing_the_manifest() {
-    // 1 枚だけの書き出しで、期限の確かめは 3 回: 取得の前（1 回目）、デコードと計測の後（2 回目）、manifest の後（3 回目）。
+    // 1 枚だけの書き出しで、期限の確かめは 4 回: 取得の前（1 回目）、デコードと計測の後（2 回目）、結果を決める前
+    // （3 回目。全部除外のような早く終わる結果もここを通る）、manifest の後（4 回目）。
     // 期限を n 回目の時刻ちょうどにすると、n 回目で timeout になる
     let good = jpeg_bytes(64, 48, 1);
     let sel = selection(period1(), vec![row(1, "2030-03-10 09:00")]);
     for (hours, written) in [
         (1u64, vec![]),
         (2, vec![]),
-        (3, vec!["090000_1.jpg", "manifest.json"]),
+        (3, vec!["090000_1.jpg"]),
+        (4, vec!["090000_1.jpg", "manifest.json"]),
     ] {
         let tmp = TempDir::new(&format!("deadline-clock-{hours}"));
         let site = FakeSite::start(vec![jpeg_route(1, &good)]);
@@ -1309,7 +1311,7 @@ fn the_deadline_is_checked_after_decoding_and_after_writing_the_manifest() {
         );
         let err = r.expect_err(&format!("{hours} 時間目に期限"));
         assert_eq!(err.code(), ErrorCode::Timeout, "{hours}");
-        // 1 回目: 1 枚も取らない。2 回目: 取ったが書かない。3 回目: 書いた後で、成功を返さない
+        // 1 回目: 1 枚も取らない。2 回目: 取ったが書かない。3 回目: manifest を書かない。4 回目: 書いた後で、成功を返さない
         assert_eq!(
             site.request_lines().len(),
             usize::from(hours > 1),
@@ -1317,7 +1319,7 @@ fn the_deadline_is_checked_after_decoding_and_after_writing_the_manifest() {
         );
         assert_eq!(files_in(ws.path()), written, "{hours}");
     }
-    // 期限が 3 回の確かめより後ならそのまま成功する
+    // 期限が 4 回の確かめより後ならそのまま成功する
     let tmp = TempDir::new("deadline-clock-ok");
     let site = FakeSite::start(vec![jpeg_route(1, &good)]);
     let ws = Workspace::create(tmp.path(), "job1").unwrap();
@@ -1327,7 +1329,7 @@ fn the_deadline_is_checked_after_decoding_and_after_writing_the_manifest() {
         &sel,
         Destination::Yamareco,
         &ws,
-        Some(base + Duration::from_secs(3600 * 3 + 1)),
+        Some(base + Duration::from_secs(3600 * 4 + 1)),
         &ticking_clock(base),
     )
     .unwrap();
@@ -1490,4 +1492,54 @@ fn links_are_never_followed_when_writing() {
     // 作業領域を消しても、リンクの先は消えない
     drop(ws);
     assert!(victim.exists() && elsewhere.exists());
+}
+
+#[test]
+fn an_early_result_is_not_returned_after_the_deadline() {
+    // 全部が not_derivative（画像を 1 枚も取らない早く終わる結果）でも、期限を過ぎていれば nothing_to_export ではなく timeout
+    let tmp = TempDir::new("deadline-early");
+    let mut rows = vec![row(1, "2030-03-10 09:00")];
+    rows[0]["file"] = json!("local/x.jpg");
+    let site = FakeSite::start(vec![]);
+    let ws = Workspace::create(tmp.path(), "job1").unwrap();
+    let base = Instant::now();
+    let r = prepare_with_clock(
+        &client(&site),
+        &selection(period1(), rows),
+        Destination::Yamareco,
+        &ws,
+        Some(base + Duration::from_secs(3600)),
+        &ticking_clock(base),
+    );
+    assert_eq!(r.unwrap_err().code(), ErrorCode::Timeout);
+    assert!(site.request_lines().is_empty());
+}
+
+#[test]
+fn a_gzip_body_larger_on_the_wire_fits_the_remaining_job_bytes() {
+    // 圧縮すると少し大きくなる本文でも、展開後の大きさが残り以内なら読める（ureq の上限は展開前に効くので、残りに縛らない）
+    use std::io::Write;
+    let good = jpeg_bytes(64, 48, 7);
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::none());
+    gz.write_all(&good).unwrap();
+    let body = gz.finish().unwrap();
+    assert!(body.len() > good.len());
+    let site = FakeSite::start(vec![route(
+        1,
+        Reply::Raw {
+            head: format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            body: common::Body::Bytes(body),
+        },
+    )]);
+    let got = client(&site)
+        .fetch(
+            "derivatives/p1.jpg",
+            Duration::from_secs(10),
+            good.len() as u64,
+        )
+        .unwrap();
+    assert_eq!(got, good);
 }
