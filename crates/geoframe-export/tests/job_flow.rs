@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use common::drive::*;
 use common::site::*;
-use common::{FakeSite, closed_port_base};
+use common::{FakeSite, Reply, closed_port_base};
 use geoframe_export::cancel::Cancel;
 use geoframe_export::error::ErrorCode;
 use geoframe_export::flow::Tuning;
@@ -1490,6 +1490,88 @@ fn a_panic_after_the_first_stage_is_settled_by_the_table_and_leaves_nothing_behi
     assert_eq!(staging_entries(&env), 0);
     assert!(slot_is_free(&env.state));
     assert!(svc.blocking().is_none());
+}
+
+/// パニックの時点で、ジョブの記録が読めない: メモリ上の段階で Drive を操作せず、壊れた記録を上書きもしない（`running` のまま／
+/// 読めないまま残し、次の起動で `blocked` として扱われる）。
+#[test]
+fn a_panic_with_an_unreadable_record_touches_neither_drive_nor_the_record() {
+    let mut env = Env::new("flow-panic-unreadable");
+    let site = photo_site(DAY, DAY, three_photos());
+    env.settings.feed_base = site.base.clone();
+    let svc = Service::with_tuning(
+        env.settings.clone(),
+        Tuning {
+            panic_after_stage: Some(Stage::Uploading),
+            corrupt_record_on_panic: true,
+            ..fast_tuning()
+        },
+    )
+    .unwrap();
+    let rec = run_foreground_retry(&svc, &day()).unwrap();
+    let path = JobStore::open(&env.state).unwrap().record_path(&rec.job_id);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"{broken",
+        "壊れた記録を上書きしない"
+    );
+    // 段階を記録した直後（写真を送る前）のパニック。復旧の表を当てていれば、incoming のゴミ箱への移動（purge）などが走る
+    let seq = env.sequence();
+    assert!(
+        !seq.iter()
+            .any(|c| c == "purge" || c == "moveto" || c == "copy"),
+        "パニックの後に Drive を操作しない: {seq:?}"
+    );
+    assert!(slot_is_free(&env.state));
+    // 次の起動では、読めない記録として blocked 扱い
+    let next = Service::with_tuning(env.settings.clone(), fast_tuning()).unwrap();
+    assert!(next.blocking().is_some());
+}
+
+// ---- 一覧の取得の前後のキャンセル ----
+
+/// 印が立っているとき、一覧の取得の前に止まる。候補が 0 枚でも `succeeded` にしない（段階が未記録なので `interrupted`）。
+#[test]
+fn a_cancel_before_the_listing_is_interrupted_even_when_nothing_would_be_exported() {
+    let mut env = Env::new("flow-cancel-before-list");
+    let site = photo_site(DAY, DAY, vec![]);
+    let cancel = Cancel::new();
+    let svc = cancellable_service(&mut env, &site, &cancel);
+    cancel.cancel();
+    let rec = run_foreground_retry(&svc, &day()).unwrap();
+    assert_eq!(rec.status, Status::Interrupted, "{:?}", rec.result);
+    assert_eq!(read_record(&env, &rec.job_id).status, Status::Interrupted);
+    assert_eq!(site.connections(), 0, "一覧を取りに行かない");
+    assert!(env.calls().is_empty());
+    assert!(slot_is_free(&env.state));
+}
+
+/// 一覧の取得の最中に印が立ったら、返ってきた結果（候補 0 枚）を判定せずに `interrupted`。
+#[test]
+fn a_cancel_during_the_listing_is_interrupted_not_succeeded() {
+    let mut env = Env::new("flow-cancel-during-list");
+    let site = FakeSite::start(vec![(
+        "/api/admin/export/photos".to_owned(),
+        Reply::Delayed {
+            wait: Duration::from_millis(800),
+            then: Box::new(Reply::json(
+                serde_json::to_vec(&listing(DAY, DAY, vec![])).unwrap(),
+            )),
+        },
+    )]);
+    let cancel = Cancel::new();
+    let svc = cancellable_service(&mut env, &site, &cancel);
+    let worker = {
+        let svc = svc.clone();
+        std::thread::spawn(move || run_foreground_retry(&svc, &day()))
+    };
+    std::thread::sleep(Duration::from_millis(300));
+    cancel.cancel();
+    let rec = worker.join().unwrap().unwrap();
+    assert_eq!(rec.status, Status::Interrupted, "{:?}", rec.result);
+    assert_eq!(read_record(&env, &rec.job_id).status, Status::Interrupted);
+    assert!(env.calls().is_empty());
+    assert!(slot_is_free(&env.state));
 }
 
 // ---- request_id の再照会（別のプロセスに相当する別の Service） ----

@@ -199,3 +199,22 @@ fn a_killed_parent_takes_its_rclone_child_with_it_as_a_backstop() {
     );
     assert!(slot_is_free(&env.state));
 }
+
+/// バイナリは、標準エラーに完了ログ（1 行）を出す。標準出力は、コマンドの JSON だけ（ログが混ざらない）。
+#[test]
+fn the_binary_logs_the_completion_to_stderr_and_keeps_stdout_for_the_json() {
+    let env = Env::new("log-completion");
+    let site = photo_site(DAY, DAY, three());
+    let out = wait_exit(spawn_run(&env, &site), 60);
+    assert_eq!(out.code, Some(0), "{}\n{}", out.stdout, out.stderr);
+    let v: Value = serde_json::from_str(&out.stdout)
+        .unwrap_or_else(|e| panic!("標準出力が JSON でない: {e}: {}", out.stdout));
+    assert_eq!(v["status"], "succeeded", "{v}");
+    let line = out
+        .stderr
+        .lines()
+        .find(|l| l.contains("書き出しのジョブが終わりました"))
+        .unwrap_or_else(|| panic!("完了ログが無い: {:?}", out.stderr));
+    assert!(line.contains("status=\"succeeded\"") || line.contains("status=succeeded"));
+    assert!(line.contains("count=3"), "{line}");
+}

@@ -686,35 +686,65 @@ impl Rclone {
         let stderr = guard.child.stderr.take().map(read_tail);
 
         let started = Instant::now();
-        let mut timed_out = false;
-        let mut cancelled = false;
-        let status = loop {
-            match guard.child.try_wait() {
-                Ok(Some(status)) => {
-                    guard.reaped = true;
-                    break Some(status);
+        // 直接の子の終了と、出力のパイプの完了は別々に見る。子が先に終わっても、同じグループの子孫がパイプを握ったまま、
+        // あるいはパイプを閉じて動き続けていることがある。後始末（グループの停止・子の回収・パイプの読み切り）が済むまで、
+        // キャンセルと期限を見続ける。
+        let mut status: Option<std::process::ExitStatus> = None;
+        let mut cause = Interrupt::None;
+        loop {
+            if status.is_none() {
+                match child_exited(guard.child.id()) {
+                    Ok(true) => {
+                        // 直接の子は終わって、まだ回収していない（ゾンビ。PID・PGID は再利用されない）。回収する前に、
+                        // 子孫をグループごと止める。そのあとで `wait` する
+                        guard.kill_group();
+                        match guard.child.wait() {
+                            Ok(st) => {
+                                guard.reaped = true;
+                                status = Some(st);
+                            }
+                            Err(_) => {
+                                cause = Interrupt::Failed;
+                                break;
+                            }
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        cause = Interrupt::Failed;
+                        break;
+                    }
                 }
-                Ok(None) => {}
-                Err(_) => break None,
+            }
+            if status.is_some() && readers_done(&stdout, &stderr) {
+                break;
             }
             if self.cancel.is_cancelled() {
-                cancelled = true;
-                break None;
+                cause = Interrupt::Cancelled;
+                break;
             }
             if started.elapsed() >= limit {
-                timed_out = true;
-                break None;
+                cause = Interrupt::TimedOut;
+                break;
             }
             std::thread::sleep(POLL_INTERVAL);
-        };
-        if status.is_none() {
+        }
+        if cause != Interrupt::None {
             // 期限切れ・キャンセル（または待てない）。子と、その子孫をまとめて止めて、`wait` し終えてから先へ進む
             guard.kill_and_wait();
         }
-        let (stdout_bytes, truncated) = stdout
-            .and_then(|h| h.join().ok())
-            .unwrap_or_else(|| (Vec::new(), false));
-        let stderr_text = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+        // パイプを読み切るのを待つ。グループを止めたので、すぐ終わる。グループを抜けた子孫がパイプを握り続けていても、
+        // 無限には待たない（猶予のあとは読み手を手放す）
+        let grace = Instant::now() + READER_GRACE;
+        let (stdout_bytes, truncated) = collect_reader(stdout, grace).unwrap_or_default();
+        let stderr_text = collect_reader(stderr, grace).unwrap_or_default();
+        let status = if cause == Interrupt::None {
+            status
+        } else {
+            None
+        };
+        let cancelled = cause == Interrupt::Cancelled;
+        let timed_out = cause == Interrupt::TimedOut;
 
         let result = match status {
             None if cancelled => Err(RunError::Cancelled),
@@ -749,6 +779,61 @@ impl Rclone {
     }
 }
 
+/// 実行を途中で切り上げた理由。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Interrupt {
+    None,
+    Cancelled,
+    TimedOut,
+    /// 子の状態を調べられない・回収できない
+    Failed,
+}
+
+/// パイプを読み切るのを待つ猶予（グループを止めたあと）。
+const READER_GRACE: Duration = Duration::from_secs(2);
+
+/// 直接の子が終わったか（回収はしない。`waitid(WNOWAIT)`）。終わっていれば、子はゾンビのまま残り、PID も PGID も使われ続ける。
+fn child_exited(pid: u32) -> std::io::Result<bool> {
+    // SAFETY: 全ビット 0 の siginfo_t は有効な値。
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    loop {
+        // SAFETY: 自分が起動した子の PID への waitid(2)。`WNOWAIT` で回収しない。`info` は書き込み先として有効。
+        let r = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if r == 0 {
+            // SAFETY: waitid が成功したあとの siginfo_t（待つ子が無ければ si_pid は 0 のまま）。
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() != std::io::ErrorKind::Interrupted {
+            return Err(e);
+        }
+    }
+}
+
+/// 読み手のスレッドがすべて終わった（読み手が無い場合も含む）。
+fn readers_done<A, B>(a: &Option<JoinHandle<A>>, b: &Option<JoinHandle<B>>) -> bool {
+    a.as_ref().is_none_or(|h| h.is_finished()) && b.as_ref().is_none_or(|h| h.is_finished())
+}
+
+/// 読み手の結果を受け取る。`grace` までに終わらなければ手放す（スレッドは、パイプが閉じたときに自分で終わる）。
+fn collect_reader<T>(handle: Option<JoinHandle<T>>, grace: Instant) -> Option<T> {
+    let handle = handle?;
+    while !handle.is_finished() {
+        if Instant::now() >= grace {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    handle.join().ok()
+}
+
 /// 起動した子。手放すとき（正常な終わりでも、パニックの巻き戻りでも）まだ `wait` していなければ、プロセスグループごと
 /// kill して `wait` する（子が残ったまま、実行枠だけが外れないように）。
 struct ChildGuard {
@@ -769,7 +854,8 @@ impl ChildGuard {
         }
     }
 
-    fn kill_and_wait(&mut self) {
+    /// 子のプロセスグループ全体へ SIGKILL。直接の子を回収する前にだけ呼ぶ（回収すると PID が再利用されうるため）。
+    fn kill_group(&self) {
         if self.reaped {
             return;
         }
@@ -779,6 +865,13 @@ impl ChildGuard {
                 libc::kill(-pgid, libc::SIGKILL);
             }
         }
+    }
+
+    fn kill_and_wait(&mut self) {
+        if self.reaped {
+            return;
+        }
+        self.kill_group();
         let _ = self.child.kill();
         let _ = self.child.wait();
         self.reaped = true;

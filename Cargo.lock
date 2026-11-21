@@ -451,6 +451,7 @@ dependencies = [
  "libc",
  "serde_json",
  "tracing",
+ "tracing-subscriber",
  "ureq",
  "zune-jpeg",
 ]

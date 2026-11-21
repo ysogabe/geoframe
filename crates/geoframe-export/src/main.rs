@@ -11,14 +11,18 @@ fn main() -> ExitCode {
             }
         }
     }
+    // ログは標準エラーへ（標準出力はコマンドの JSON 専用）。完了ログと rclone の警告が出る
+    geoframe_export::logging::init();
     // `run`・`serve` では、SIGINT・SIGTERM で終わらず、キャンセルの印を立てる。実行中の rclone を止めて `wait` し終えてから、
     // 実行枠を手放して終わる（子が残ったまま、枠だけが外れないように）。handler は `run_command_cancellable` が入れる
     let cancel = geoframe_export::cancel::Cancel::new();
+    // 標準出力・標準エラーは、コマンドの実行中ずっとロックしない（`lock()` のガードを持ち続けると、ワーカーのパニックの表示や
+    // 標準エラーへ出すログが、別のスレッドでロック待ちになり、実行枠を外せなくなる）。書くたびにロックを取って放す
     let code = geoframe_export::app::run_command_cancellable(
         Some(geoframe_export::sys::euid()),
         &args,
-        &mut std::io::stdout().lock(),
-        &mut std::io::stderr().lock(),
+        &mut std::io::stdout(),
+        &mut std::io::stderr(),
         &cancel,
         true,
     );

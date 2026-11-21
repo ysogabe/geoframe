@@ -29,8 +29,10 @@
 //!
 //! - **パニック**（[`execute`] が `catch_unwind` で受ける）: 段階が記録にあれば、無条件に `failed` を確定しない（退避の直後なら、
 //!   宛先が空のまま復旧の対象から外れる）。**実行枠を持ったまま、その場で復旧の表を当てる**（[`recover_one`]。起動時・各ジョブの
-//!   前の復旧と同じ）。ジョブの記録が最後に記録できた段階だけを根拠にするので、パニックの時点のメモリの状態は信じない。
-//!   復旧の中でまたパニックしたら、記録を `running` のまま残して次の復旧に渡す。
+//!   前の復旧と同じ）。根拠は、**ディスクの記録を読み直したもの**（段階と ID）だけで、パニックの時点のメモリの状態は信じない。
+//!   記録が無い・読めないときは、Drive の操作も記録の書き込みもせず、そのまま残す（読めない記録は上書きしない。次の起動で
+//!   `blocked` として扱われる）。復旧の中でまたパニックしたら、記録を `running` のまま残して次の復旧に渡す。
+//! - 一覧の取得の前後でも、キャンセルの印を見る（段階が未記録なので `interrupted`。候補が 0 枚でも `succeeded` にしない）。
 //! - **キャンセル**（[`Cancel`] の印。[`crate::cancel`]）: rclone は動かせない（印が立つと、起動前なら起動せず、実行中なら kill して
 //!   `wait` し終えてから失敗を返す）ので、その場で復旧の表は当てられない。段階が記録にあれば、記録を**確定せず `running` のまま**
 //!   次の復旧（次のジョブの前・起動時・`recover`）に渡す。印のもとで返ってくる失敗・`blocked`・中断・知らせの付いた成功は、
@@ -94,6 +96,10 @@ pub struct Tuning {
     /// 退避した直後。実行枠を持ったまま復旧の表が当たり、公開まで進むことを確かめる）。
     #[doc(hidden)]
     pub panic_after_stage: Option<Stage>,
+    /// 試験用: [`Self::panic_after_stage`] のパニックの直前に、ジョブの記録を読めない中身にする（読めない記録で Drive を操作せず、
+    /// 上書きもしないことを確かめる）。
+    #[doc(hidden)]
+    pub corrupt_record_on_panic: bool,
 }
 
 impl Default for Tuning {
@@ -104,6 +110,7 @@ impl Default for Tuning {
             image_limits: Limits::default(),
             panic_in_job: false,
             panic_after_stage: None,
+            corrupt_record_on_panic: false,
         }
     }
 }
@@ -194,6 +201,7 @@ impl JobHandle {
 pub struct Recorder<'a> {
     handle: &'a mut JobHandle,
     panic_after: Option<Stage>,
+    corrupt_on_panic: bool,
 }
 
 impl<'a> Recorder<'a> {
@@ -201,7 +209,14 @@ impl<'a> Recorder<'a> {
         Self {
             handle,
             panic_after: None,
+            corrupt_on_panic: false,
         }
+    }
+
+    /// 試験用: パニックの直前に、記録のファイルを読めない中身にする（[`Tuning::corrupt_record_on_panic`]）。
+    fn corrupt_on_panic(mut self, on: bool) -> Self {
+        self.corrupt_on_panic = on;
+        self
     }
 
     /// 試験用: `stage` を書いた直後にパニックする（[`Tuning::panic_after_stage`]）。
@@ -219,6 +234,12 @@ impl ProgressSink for Recorder<'_> {
             self.handle.record.progress = before;
         })?;
         if self.panic_after == Some(progress.stage) {
+            if self.corrupt_on_panic {
+                let _ = std::fs::write(
+                    self.handle.store.record_path(&self.handle.record.job_id),
+                    b"{broken",
+                );
+            }
             panic!("試験: 段階 {} を記録した直後のパニック", progress.stage);
         }
         Ok(())
@@ -469,11 +490,35 @@ fn stage_on_disk(ctx: &Context<'_>, handle: &JobHandle) -> bool {
     }
 }
 
-/// パニックのあとの終わり方。段階が無ければ `failed`（`internal`）。あれば、実行枠を持ったまま復旧の表を当てる（`failed` を
-/// 無条件に確定すると、退避の直後なら、宛先が空のまま復旧の対象から外れる）。復旧の中でまたパニックしたら `None`（記録は
-/// `running` のまま、次の復旧に渡す）。
+/// パニックのあとの終わり方。根拠は**ディスクの記録を読み直したもの**だけ（メモリの状態は、パニックの時点で信じない）。
+///
+/// - 読み直せた `running` の記録で、段階が無ければ `failed`（`internal`）。
+/// - 段階があれば、その記録（段階と ID）を `handle` に取り込み、実行枠を持ったまま復旧の表を当てる（`failed` を無条件に確定すると、
+///   退避の直後なら、宛先が空のまま復旧の対象から外れる）。
+/// - 記録が無い・読めない・`running` でないときは、Drive の操作も記録の書き込みもしない（`None`。読めない記録は上書きせず、
+///   次の起動で `blocked` として扱われる）。
+///
+/// 復旧の中でまたパニックしたら `None`（記録は `running` のまま、次の復旧に渡す）。
 fn after_panic(ctx: &Context<'_>, handle: &mut JobHandle) -> Option<Done> {
-    if !stage_on_disk(ctx, handle) {
+    let disk = match ctx.store.read(&handle.record.job_id) {
+        ReadOutcome::Found(rec) if rec.status == Status::Running => *rec,
+        ReadOutcome::Found(_) => {
+            tracing::error!(
+                job = %handle.record.job_id,
+                "ジョブの中でパニックしました（記録は、すでに終わりの状態です。触れません）"
+            );
+            return None;
+        }
+        ReadOutcome::NotFound | ReadOutcome::Unreadable => {
+            tracing::error!(
+                job = %handle.record.job_id,
+                "ジョブの中でパニックしましたが、記録を読み直せません（Drive にも記録にも触れません。次の起動で扱います）"
+            );
+            return None;
+        }
+    };
+    handle.record = disk;
+    if handle.record.progress.is_none() {
         return Some(Done::failed(ErrorCode::Internal, None));
     }
     tracing::error!(
@@ -531,9 +576,17 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
 
     let deadline = Instant::now() + ctx.tuning.job_timeout;
 
-    // 手順 2
+    // 手順 2（一覧の取得の前後で、キャンセルの印を見る。段階は未記録なので、`execute` が `interrupted` にする。印が立った
+    // あとの取得の結果で、`succeeded`（0 枚）や `failed` を確定しない）
+    if ctx.cancel.is_cancelled() {
+        return Done::interrupted();
+    }
     let feed = FeedClient::new(&ctx.settings.feed_base);
-    let selection = match feed.select(&req.period) {
+    let selected = feed.select(&req.period);
+    if ctx.cancel.is_cancelled() {
+        return Done::interrupted();
+    }
+    let selection = match selected {
         Ok(s) => s,
         Err(e) => return Done::failed(e.code, None),
     };
@@ -599,7 +652,9 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         &rclone,
         &layout,
         &params,
-        &mut Recorder::new(handle).panic_after(ctx.tuning.panic_after_stage),
+        &mut Recorder::new(handle)
+            .panic_after(ctx.tuning.panic_after_stage)
+            .corrupt_on_panic(ctx.tuning.corrupt_record_on_panic),
     );
     let done = match outcome {
         Ok(PublishOutcome::Published(p)) => {

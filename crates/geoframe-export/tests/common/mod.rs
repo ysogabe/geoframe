@@ -35,6 +35,8 @@ pub enum Reply {
     Raw { head: String, body: Body },
     /// 要求を読んだあと、`Duration` のあいだ何も返さない。
     Stall(Duration),
+    /// 要求を読んだあと、`wait` だけ待ってから `then` を返す。
+    Delayed { wait: Duration, then: Box<Reply> },
     /// 先頭と本文の一部を送ったあと、接続を開いたまま `hold` のあいだ黙る（本文の途中で止まる）。
     Partial {
         head: String,
@@ -166,6 +168,10 @@ fn respond_counting(mut stream: TcpStream, reply: &Reply, sent: Option<&AtomicU6
     };
     match reply {
         Reply::Stall(d) => std::thread::sleep(*d),
+        Reply::Delayed { wait, then } => {
+            std::thread::sleep(*wait);
+            respond_counting(stream, then, sent);
+        }
         Reply::Partial { head, prefix, hold } => {
             if stream.write_all(head.as_bytes()).is_err() || stream.write_all(prefix).is_err() {
                 return;

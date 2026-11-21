@@ -225,6 +225,78 @@ fn a_cancel_stops_the_child_and_its_descendants_and_waits_for_them() {
     assert!(pid_gone(grand), "子孫が残っている");
 }
 
+fn wait_gone(pid: i32) -> bool {
+    let until = Instant::now() + Duration::from_secs(5);
+    while !pid_gone(pid) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    pid_gone(pid)
+}
+
+#[test]
+fn a_child_that_exits_first_does_not_leave_a_descendant_holding_the_pipes() {
+    // 直接の子は先に終わる。子孫はパイプ（標準出力・標準エラー）を握ったまま 30 秒動く。以前は、子を回収したあとの
+    // パイプの読み切りで 30 秒止まった。子孫もグループごと止めてから返る
+    let dir = TempDir::new("exit-first-holds");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let grand_file = state.join("grandpid");
+    let script = write_script(
+        dir.path(),
+        &format!(
+            "sleep 30 &\necho $! > '{}'\necho hi\nexit 0",
+            grand_file.display()
+        ),
+    );
+    let rclone = Rclone::new(&settings_for(&script, &state)).with_timeouts(SECS, SECS);
+    let started = Instant::now();
+    let out = retry(|| rclone.cat(&loc(), 10)).expect("直接の子は成功で終わった");
+    assert_eq!(out, b"hi\n");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    let grand = read_pid(&grand_file).expect("子孫の PID");
+    assert!(wait_gone(grand), "子孫が残っている");
+}
+
+#[test]
+fn a_child_that_exits_first_does_not_leave_a_descendant_that_closed_the_pipes() {
+    // 子孫はパイプを閉じて動き続ける。以前は、子を回収すると監視を抜けて、子孫が動いたまま実行枠が外れた
+    let dir = TempDir::new("exit-first-closed");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let grand_file = state.join("grandpid");
+    let script = write_script(
+        dir.path(),
+        &format!(
+            "sleep 30 >/dev/null 2>&1 </dev/null &\necho $! > '{}'\necho hi\nexit 0",
+            grand_file.display()
+        ),
+    );
+    let rclone = Rclone::new(&settings_for(&script, &state)).with_timeouts(SECS, SECS);
+    assert_eq!(retry(|| rclone.cat(&loc(), 10)).unwrap(), b"hi\n");
+    let grand = read_pid(&grand_file).expect("子孫の PID");
+    assert!(wait_gone(grand), "子孫が残っている");
+}
+
+#[test]
+fn a_failing_child_that_exits_first_also_stops_its_descendants() {
+    let dir = TempDir::new("exit-first-fail");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let grand_file = state.join("grandpid");
+    let script = write_script(
+        dir.path(),
+        &format!("sleep 30 &\necho $! > '{}'\nexit 3", grand_file.display()),
+    );
+    let rclone = Rclone::new(&settings_for(&script, &state)).with_timeouts(SECS, SECS);
+    assert_eq!(retry(|| rclone.cat(&loc(), 10)), Err(RunError::NotFound));
+    let grand = read_pid(&grand_file).expect("子孫の PID");
+    assert!(wait_gone(grand), "子孫が残っている");
+}
+
 #[test]
 fn a_cancel_that_is_already_set_never_starts_the_child() {
     let dir = TempDir::new("cancel-first");

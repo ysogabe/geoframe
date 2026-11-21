@@ -35,6 +35,7 @@ pub mod jobid;
 pub mod jpeg;
 pub mod jsonfile;
 pub mod listing;
+pub mod logging;
 pub mod manifest;
 pub mod measure;
 pub mod publish;
