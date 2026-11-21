@@ -109,6 +109,22 @@ RAW_CASES = [
     ("mixed", 30, 4000), ("mixed", 1024, 1000), ("mixed", 800, 600), ("mixed", 3000, 1),
     ("mixed", 1, 3000), ("mixed", 2, 2), ("mixed", 3, 3), ("noise", 5, 5), ("noise", 17, 9),
     ("noise", 1500, 1000),
+    # 縮小の比が 4 以上になる（Pillow の thumbnail が先に整数倍の reduce を挟む）境目。長辺 4095 は入らず、4096 から入る
+    ("mixed", 4095, 128), ("mixed", 4096, 128), ("mixed", 4097, 128), ("noise", 4096, 128),
+    ("stripes", 4096, 128), ("gradient", 4096, 3000), ("noise", 4095, 3000), ("mixed", 6143, 200),
+    ("mixed", 6144, 200), ("mixed", 8192, 128), ("mixed", 8192, 100), ("mixed", 8192, 8192 // 2),
+    ("noise", 5000, 3333), ("noise", 3333, 5000), ("checker", 4500, 4096), ("mixed", 30, 4100),
+    ("mixed", 100, 8192), ("mixed", 20000, 30), ("mixed", 4096, 1), ("mixed", 12289, 5),
+]
+
+# Image.reduce の単体（係数が違う軸、端数の区画、1 軸だけ縮める場合）。(パターン, 幅, 高さ, factor_x, factor_y)
+REDUCE_CASES = [
+    ("noise", 64, 64, 2, 2), ("noise", 65, 63, 2, 2), ("noise", 64, 64, 3, 3), ("noise", 100, 100, 3, 3),
+    ("noise", 101, 97, 4, 4), ("noise", 103, 101, 5, 5), ("noise", 103, 101, 7, 7), ("noise", 200, 199, 2, 3),
+    ("noise", 200, 199, 3, 2), ("noise", 199, 200, 1, 3), ("noise", 199, 200, 5, 1), ("noise", 199, 200, 1, 2),
+    ("noise", 199, 200, 2, 1), ("noise", 199, 200, 1, 7), ("noise", 199, 200, 9, 1), ("noise", 17, 9, 6, 4),
+    ("noise", 5, 5, 5, 5), ("noise", 5, 5, 6, 6), ("noise", 9, 7, 9, 7), ("noise", 301, 299, 11, 13),
+    ("mixed", 1000, 998, 4, 4), ("noise", 4096, 3, 4, 3), ("noise", 1000, 1000, 16, 16),
 ]
 
 # JPEG（Pillow が品質 85 で作ったもの。期待値は Pillow がそのファイルをデコードして計算した値。
@@ -121,17 +137,28 @@ JPEG_CASES = [
     ("mixed_gray_640x480", "L", "mixed", 640, 480, 0),
     ("noise_color_300x200", "RGB", "noise", 300, 200, 2),
     ("noise_gray_300x200", "L", "noise", 300, 200, 0),
+    # 縮小の比が 4 以上（reduce が入る）の幅広の画像。4095 は入らず、4096・8192 は入る
+    ("mixed_gray_4096x128", "L", "mixed", 4096, 128, 0),
+    ("mixed_gray_4095x128", "L", "mixed", 4095, 128, 0),
+    ("stripes_gray_8192x64", "L", "stripes", 8192, 64, 0),
+    ("gradient_color_5000x120", "RGB", "gradient", 5000, 120, 2),
 ]
 
 
 def main():
-    expected = {"pillow": PIL.__version__, "raw": [], "jpeg": []}
+    expected = {"pillow": PIL.__version__, "raw": [], "reduce": [], "jpeg": []}
     for kind, w, h in RAW_CASES:
         data = pattern(kind, w, h)
         entry = {"kind": kind, "width": w, "height": h}
         entry.update(pil_stats(Image.frombytes("L", (w, h), data)))
         expected["raw"].append(entry)
         print("raw", kind, w, h, file=sys.stderr)
+    for kind, w, h, fx, fy in REDUCE_CASES:
+        reduced = Image.frombytes("L", (w, h), pattern(kind, w, h)).reduce((fx, fy))
+        expected["reduce"].append({
+            "kind": kind, "width": w, "height": h, "factor": [fx, fy],
+            "size": list(reduced.size), "crc32": zlib.crc32(reduced.tobytes()),
+        })
     for name, mode, kind, w, h, sub in JPEG_CASES:
         if mode == "L":
             img = Image.frombytes("L", (w, h), pattern(kind, w, h))

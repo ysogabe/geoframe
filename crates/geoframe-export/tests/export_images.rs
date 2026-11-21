@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 use common::{FakeSite, Reply, TempDir, closed_port_base};
 use geoframe_export::date::Period;
 use geoframe_export::error::{ErrorCode, ExportError};
-use geoframe_export::image::{ImageClient, Limits, Prepared, prepare};
+use geoframe_export::image::{
+    ImageClient, Limits, PrepareError, Prepared, prepare, prepare_with_clock,
+};
 use geoframe_export::jpeg::{self, InspectError, Inspection};
 use geoframe_export::listing::{ExcludeReason, Selection, select};
 use geoframe_export::measure;
@@ -97,12 +99,15 @@ fn limits(f: impl FnOnce(&mut Limits)) -> Limits {
     l
 }
 
-fn code<T: std::fmt::Debug>(r: Result<T, ExportError>) -> ErrorCode {
-    r.expect_err("失敗するはず").code
+fn code<T: std::fmt::Debug, E: std::fmt::Debug + Into<ExportError>>(r: Result<T, E>) -> ErrorCode {
+    r.expect_err("失敗するはず").into().code
 }
 
-fn code_of<T: std::fmt::Debug>(name: &str, r: Result<T, ExportError>) -> ErrorCode {
-    r.expect_err(&format!("{name}: 失敗するはず")).code
+fn code_of<T: std::fmt::Debug, E: std::fmt::Debug + Into<ExportError>>(
+    name: &str,
+    r: Result<T, E>,
+) -> ErrorCode {
+    r.expect_err(&format!("{name}: 失敗するはず")).into().code
 }
 
 fn read_manifest(ws: &Workspace) -> Value {
@@ -113,7 +118,7 @@ fn run(
     site: &FakeSite,
     selection: &Selection,
     tmp: &TempDir,
-) -> (Workspace, Result<Prepared, ExportError>) {
+) -> (Workspace, Result<Prepared, PrepareError>) {
     let ws = Workspace::create(tmp.path(), "job1").unwrap();
     let result = prepare(&client(site), selection, Destination::Yamareco, &ws, None);
     (ws, result)
@@ -670,7 +675,7 @@ fn non_derivative_files_are_excluded_without_being_fetched() {
 
 #[test]
 fn nothing_to_export_when_everything_is_excluded() {
-    // 全部が not_derivative: 画像を 1 枚も取らない
+    // 全部が not_derivative: 画像を 1 枚も取らない。失敗の値に、候補の数と除外の理由が全部入っている
     let tmp = TempDir::new("nothing-a");
     let mut rows = vec![row(1, "2030-03-10 09:00"), row(2, "2030-03-10 10:00")];
     for r in &mut rows {
@@ -678,19 +683,82 @@ fn nothing_to_export_when_everything_is_excluded() {
     }
     let site = FakeSite::start(vec![]);
     let (ws, r) = run(&site, &selection(period1(), rows), &tmp);
-    assert_eq!(code(r), ErrorCode::NothingToExport);
+    let err = r.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::NothingToExport);
+    assert_eq!(err.catalog_count, 2);
+    assert_eq!(
+        reasons(&err),
+        [
+            (1, ExcludeReason::NotDerivative),
+            (2, ExcludeReason::NotDerivative)
+        ]
+    );
+    assert_eq!(
+        (err.undated_in_catalog, err.invalid_time_in_catalog),
+        (4, 5)
+    );
     assert!(site.request_lines().is_empty());
     assert_eq!(files_in(ws.path()), Vec::<String>::new());
 
-    // not_derivative と has_metadata だけ: manifest も作らない
+    // not_derivative と has_metadata だけ: manifest も作らない。除外の理由は候補の順で全部残る
     let tmp = TempDir::new("nothing-b");
     let with_exif = with_segment(&jpeg_bytes(64, 48, 1), 0xE1, b"Exif\0\0");
-    let mut rows = vec![row(1, "2030-03-10 09:00"), row(2, "2030-03-10 10:00")];
+    let mut rows = vec![
+        row(1, "2030-03-10 09:00"),
+        row(2, "2030-03-10 10:00"),
+        row(3, "2030-03-10 11:00"),
+    ];
     rows[1]["file"] = json!("local/x.jpg");
-    let site = FakeSite::start(vec![jpeg_route(1, &with_exif)]);
+    let site = FakeSite::start(vec![jpeg_route(1, &with_exif), jpeg_route(3, &with_exif)]);
     let (ws, r) = run(&site, &selection(period1(), rows), &tmp);
-    assert_eq!(code(r), ErrorCode::NothingToExport);
+    let err = r.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::NothingToExport);
+    assert_eq!(err.catalog_count, 3);
+    assert_eq!(
+        reasons(&err),
+        [
+            (1, ExcludeReason::HasMetadata),
+            (2, ExcludeReason::NotDerivative),
+            (3, ExcludeReason::HasMetadata)
+        ]
+    );
     assert_eq!(files_in(ws.path()), Vec::<String>::new());
+}
+
+fn reasons(e: &PrepareError) -> Vec<(i64, ExcludeReason)> {
+    e.excluded.iter().map(|x| (x.id, x.reason)).collect()
+}
+
+#[test]
+fn other_failures_carry_the_counts_known_so_far() {
+    // 1 枚目は原本のパス（not_derivative）、2 枚目は区画の検査で外れ、3 枚目が壊れている
+    let tmp = TempDir::new("partial-counts");
+    let with_exif = with_segment(&jpeg_bytes(64, 48, 1), 0xE1, b"Exif\0\0");
+    let mut rows = vec![
+        row(1, "2030-03-10 09:00"),
+        row(2, "2030-03-10 10:00"),
+        row(3, "2030-03-10 11:00"),
+        row(4, "2030-03-10 12:00"),
+    ];
+    rows[0]["file"] = json!("local/x.jpg");
+    let site = FakeSite::start(vec![
+        jpeg_route(2, &with_exif),
+        jpeg_route(3, b"not a jpeg"),
+        jpeg_route(4, &jpeg_bytes(64, 48, 2)),
+    ]);
+    let (_ws, r) = run(&site, &selection(period1(), rows), &tmp);
+    let err = r.unwrap_err();
+    assert_eq!(err.code(), ErrorCode::DecodeFailed);
+    assert_eq!(err.catalog_count, 4);
+    assert_eq!(
+        reasons(&err),
+        [
+            (1, ExcludeReason::NotDerivative),
+            (2, ExcludeReason::HasMetadata)
+        ]
+    );
+    // 4 枚目は取りに行かない
+    assert_eq!(site.request_lines().len(), 2);
 }
 
 #[test]
@@ -793,6 +861,85 @@ fn bad_jpegs_fail_the_whole_export_as_decode_failed() {
             !ws.path().join("100000_2.jpg").exists(),
             "{name}: 壊れた画像は書かない"
         );
+    }
+}
+
+/// SOI の後ろで、最初に現れる `FF <marker>` の区画の本体の位置（`nth` 番目）。
+fn payload_at(jpeg: &[u8], marker: u8, nth: usize) -> usize {
+    let (mut pos, mut seen) = (2, 0);
+    loop {
+        assert_eq!(jpeg[pos], 0xFF);
+        let len = usize::from(jpeg[pos + 2]) << 8 | usize::from(jpeg[pos + 3]);
+        if jpeg[pos + 1] == marker {
+            if seen == nth {
+                return pos + 4;
+            }
+            seen += 1;
+        }
+        assert_ne!(jpeg[pos + 1], 0xDA, "区画 {marker:#x} が見つかりません");
+        pos += 2 + len;
+    }
+}
+
+#[test]
+fn jpegs_that_pass_the_section_check_but_not_the_decoder_fail_as_decode_failed() {
+    // 区画の検査（並びと長さ）は通るが、デコーダが拒む画像。表の中身・成分・走査データを壊す
+    let good = jpeg_bytes(200, 150, 1);
+    let dht = payload_at(&good, 0xC4, 0);
+    let sof = payload_at(&good, 0xC0, 0);
+    let dqt = payload_at(&good, 0xDB, 0);
+    let sos = payload_at(&good, 0xDA, 0);
+    let scan = sos - 2 + (usize::from(good[sos - 2]) << 8 | usize::from(good[sos - 1]));
+    let patch = |f: &dyn Fn(&mut Vec<u8>)| {
+        let mut j = good.clone();
+        f(&mut j);
+        j
+    };
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        // ハフマン表: 符号の長さごとの個数が、全部 255（256 個を超える）／符号が足りなくなる並び
+        (
+            "huffman table counts too large",
+            patch(&|j| j[dht + 1..dht + 17].fill(0xFF)),
+        ),
+        (
+            "huffman table oversubscribed",
+            patch(&|j| j[dht + 1..dht + 4].fill(2)),
+        ),
+        // SOF: 精度 12 ビット、成分 0 個、標本化の比が 0
+        ("sof precision 12", patch(&|j| j[sof] = 12)),
+        ("sof no components", patch(&|j| j[sof + 5] = 0)),
+        ("sof sampling factor 0", patch(&|j| j[sof + 7] = 0)),
+        // DQT: 精度と番号の組が不正
+        ("dqt bad id", patch(&|j| j[dqt] = 0x1F)),
+        // SOS: 使うハフマン表が定義されていない
+        ("sos undefined tables", patch(&|j| j[sos + 2] = 0x77)),
+        // 走査データ: ハフマン符号として成り立たないビット列（FF 00 の詰め物が続く）
+        (
+            "invalid huffman codes in the scan",
+            patch(&|j| {
+                for (i, b) in j[scan + 10..scan + 50].iter_mut().enumerate() {
+                    *b = if i % 2 == 0 { 0xFF } else { 0x00 };
+                }
+            }),
+        ),
+    ];
+    for (name, bad) in cases {
+        // 区画の検査は通る（止めるのはデコーダ）
+        let Ok(Inspection::Clean(header)) = jpeg::inspect(&bad, 60_000_000) else {
+            panic!("{name}: 区画の検査で止まってしまう");
+        };
+        assert!(jpeg::decode_gray(&bad, header).is_err(), "{name}");
+
+        let tmp = TempDir::new(&format!("decoder-{}", name.replace(' ', "-")));
+        let site = FakeSite::start(vec![jpeg_route(1, &good), jpeg_route(2, &bad)]);
+        let rows = vec![row(1, "2030-03-10 09:00"), row(2, "2030-03-10 10:00")];
+        let (ws, r) = run(&site, &selection(period1(), rows), &tmp);
+        let err = r.expect_err(name);
+        assert_eq!(err.code(), ErrorCode::DecodeFailed, "{name}");
+        // 2 枚目まで取りに行き、2 枚目で止まる。manifest は作らない。壊れた画像は書かない
+        assert_eq!(site.request_lines().len(), 2, "{name}");
+        assert!(!ws.path().join("manifest.json").exists(), "{name}");
+        assert!(!ws.path().join("100000_2.jpg").exists(), "{name}");
     }
 }
 
@@ -954,6 +1101,90 @@ fn the_total_size_limit_of_a_job_counts_fetched_bytes() {
 }
 
 #[test]
+fn the_job_total_is_enforced_before_reading_not_after() {
+    let good = jpeg_bytes(64, 48, 1);
+    let len = good.len() as u64;
+    let site = FakeSite::start(vec![jpeg_route(1, &good)]);
+    let c = client(&site);
+    let t = Duration::from_secs(10);
+    // 残りがちょうど（1 枚の大きさ）なら読める。1 バイト足りなければ失敗、0 でも失敗
+    assert_eq!(c.fetch("derivatives/p1.jpg", t, len).unwrap(), good);
+    assert_eq!(c.fetch("derivatives/p1.jpg", t, len + 1).unwrap(), good);
+    for remaining in [len - 1, 1, 0] {
+        let e = c.fetch("derivatives/p1.jpg", t, remaining).unwrap_err();
+        assert_eq!(e.code, ErrorCode::FetchFailed, "{remaining}");
+        assert!(
+            e.detail.contains("1 ジョブの上限"),
+            "{remaining}: {}",
+            e.detail
+        );
+    }
+    // 1 枚の上限のほうが小さいときは、1 枚の上限の失敗として返す
+    let c = ImageClient::with_limits(&site.base, limits(|l| l.max_image_bytes = len - 1));
+    let e = c.fetch("derivatives/p1.jpg", t, u64::MAX).unwrap_err();
+    assert!(e.detail.contains("1 枚の上限"), "{}", e.detail);
+}
+
+#[test]
+fn the_fetch_stops_reading_just_past_the_remaining_job_bytes() {
+    // 本文は 48MB。残りが 1,000 バイトなら、超えると分かったところで読むのをやめる（上限を大きく超えて読まない）。
+    // 相手が読むのをやめると、偽のサーバーの書き込みはそこで止まる（ソケットのバッファの分だけ先に書ける）
+    const BODY: u64 = 48 * 1024 * 1024;
+    let site = FakeSite::start(vec![route(
+        1,
+        Reply::Raw {
+            head: "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nConnection: close\r\n\r\n".into(),
+            body: common::Body::Filler {
+                len: BODY,
+                byte: 0xAB,
+            },
+        },
+    )]);
+    let c = ImageClient::with_limits(&site.base, limits(|l| l.max_image_bytes = BODY));
+    let e = c
+        .fetch("derivatives/p1.jpg", Duration::from_secs(10), 1000)
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::FetchFailed);
+    assert!(e.detail.contains("1 ジョブの上限"), "{}", e.detail);
+    std::thread::sleep(Duration::from_millis(300));
+    let sent = site.body_bytes_sent();
+    assert!(
+        sent < BODY / 2,
+        "読むのをやめていない（サーバーが {sent} バイト書けた）"
+    );
+}
+
+#[test]
+fn files_excluded_for_metadata_still_count_toward_the_job_total() {
+    // 1 枚目は区画の検査で外れるが、読んだバイトは合計に数える（合計は「取った画像」に掛ける）
+    let excluded_one = with_segment(&jpeg_bytes(64, 48, 1), 0xE1, b"Exif\0\0");
+    let kept = jpeg_bytes(80, 60, 2);
+    let total = (excluded_one.len() + kept.len()) as u64;
+    for (max, ok) in [(total, true), (total - 1, false)] {
+        let tmp = TempDir::new(&format!("excluded-count-{max}"));
+        let site = FakeSite::start(vec![jpeg_route(1, &excluded_one), jpeg_route(2, &kept)]);
+        let ws = Workspace::create(tmp.path(), "job1").unwrap();
+        let c = ImageClient::with_limits(&site.base, limits(|l| l.max_job_bytes = max));
+        let rows = vec![row(1, "2030-03-10 09:00"), row(2, "2030-03-10 10:00")];
+        let r = prepare(
+            &c,
+            &selection(period1(), rows),
+            Destination::Yamareco,
+            &ws,
+            None,
+        );
+        if ok {
+            assert_eq!(r.unwrap().photo_bytes, kept.len() as u64);
+        } else {
+            let err = r.unwrap_err();
+            assert_eq!(err.code(), ErrorCode::FetchFailed, "{max}");
+            // 外した 1 枚目までは分かっている
+            assert_eq!(reasons(&err), [(1, ExcludeReason::HasMetadata)]);
+        }
+    }
+}
+
+#[test]
 fn production_limits_are_the_documented_ones() {
     let l = Limits::default();
     assert_eq!(l.max_image_bytes, 30 * 1024 * 1024);
@@ -1042,6 +1273,64 @@ fn the_job_deadline_stops_the_export_with_timeout() {
     );
     assert_eq!(code(r), ErrorCode::Timeout);
     assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+/// 呼ぶたびに 1 時間ずつ進む時計（期限の確かめを、時間に頼らずに数える）。`n` 回目の呼び出しは `base + n 時間`。
+fn ticking_clock(base: Instant) -> impl Fn() -> Instant {
+    let calls = std::cell::Cell::new(0u32);
+    move || {
+        calls.set(calls.get() + 1);
+        base + Duration::from_secs(3600 * u64::from(calls.get()))
+    }
+}
+
+#[test]
+fn the_deadline_is_checked_after_decoding_and_after_writing_the_manifest() {
+    // 1 枚だけの書き出しで、期限の確かめは 3 回: 取得の前（1 回目）、デコードと計測の後（2 回目）、manifest の後（3 回目）。
+    // 期限を n 回目の時刻ちょうどにすると、n 回目で timeout になる
+    let good = jpeg_bytes(64, 48, 1);
+    let sel = selection(period1(), vec![row(1, "2030-03-10 09:00")]);
+    for (hours, written) in [
+        (1u64, vec![]),
+        (2, vec![]),
+        (3, vec!["090000_1.jpg", "manifest.json"]),
+    ] {
+        let tmp = TempDir::new(&format!("deadline-clock-{hours}"));
+        let site = FakeSite::start(vec![jpeg_route(1, &good)]);
+        let ws = Workspace::create(tmp.path(), "job1").unwrap();
+        let base = Instant::now();
+        let r = prepare_with_clock(
+            &client(&site),
+            &sel,
+            Destination::Yamareco,
+            &ws,
+            Some(base + Duration::from_secs(3600 * hours)),
+            &ticking_clock(base),
+        );
+        let err = r.expect_err(&format!("{hours} 時間目に期限"));
+        assert_eq!(err.code(), ErrorCode::Timeout, "{hours}");
+        // 1 回目: 1 枚も取らない。2 回目: 取ったが書かない。3 回目: 書いた後で、成功を返さない
+        assert_eq!(
+            site.request_lines().len(),
+            usize::from(hours > 1),
+            "{hours}"
+        );
+        assert_eq!(files_in(ws.path()), written, "{hours}");
+    }
+    // 期限が 3 回の確かめより後ならそのまま成功する
+    let tmp = TempDir::new("deadline-clock-ok");
+    let site = FakeSite::start(vec![jpeg_route(1, &good)]);
+    let ws = Workspace::create(tmp.path(), "job1").unwrap();
+    let base = Instant::now();
+    prepare_with_clock(
+        &client(&site),
+        &sel,
+        Destination::Yamareco,
+        &ws,
+        Some(base + Duration::from_secs(3600 * 3 + 1)),
+        &ticking_clock(base),
+    )
+    .unwrap();
 }
 
 #[test]

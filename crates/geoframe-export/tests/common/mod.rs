@@ -5,7 +5,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -153,7 +153,17 @@ fn serve(mut stream: TcpStream, reply: &Reply, requests: &Mutex<Vec<String>>) {
     respond(stream, reply);
 }
 
-fn respond(mut stream: TcpStream, reply: &Reply) {
+fn respond(stream: TcpStream, reply: &Reply) {
+    respond_counting(stream, reply, None);
+}
+
+/// 本文のバイト数を、書けた分だけ `sent` に足しながら返す（相手が読むのをやめると、そこで止まる）。
+fn respond_counting(mut stream: TcpStream, reply: &Reply, sent: Option<&AtomicU64>) {
+    let add = |n: usize| {
+        if let Some(sent) = sent {
+            sent.fetch_add(n as u64, Ordering::SeqCst);
+        }
+    };
     match reply {
         Reply::Stall(d) => std::thread::sleep(*d),
         Reply::Partial { head, prefix, hold } => {
@@ -169,7 +179,9 @@ fn respond(mut stream: TcpStream, reply: &Reply) {
             }
             match body {
                 Body::Bytes(b) => {
-                    let _ = stream.write_all(b);
+                    if stream.write_all(b).is_ok() {
+                        add(b.len());
+                    }
                 }
                 Body::Filler { len, byte } => {
                     let chunk = vec![*byte; 64 * 1024];
@@ -179,6 +191,7 @@ fn respond(mut stream: TcpStream, reply: &Reply) {
                         if stream.write_all(&chunk[..n]).is_err() {
                             return;
                         }
+                        add(n);
                         left -= n as u64;
                     }
                 }
@@ -194,6 +207,7 @@ pub struct FakeSite {
     pub addr: String,
     connections: Arc<AtomicUsize>,
     requests: Arc<Mutex<Vec<String>>>,
+    sent: Arc<AtomicU64>,
 }
 
 impl FakeSite {
@@ -203,14 +217,17 @@ impl FakeSite {
         let addr = listener.local_addr().expect("addr").to_string();
         let connections = Arc::new(AtomicUsize::new(0));
         let requests = Arc::new(Mutex::new(Vec::new()));
+        let sent = Arc::new(AtomicU64::new(0));
         let routes: Arc<Vec<(String, Reply)>> = Arc::new(routes);
         {
             let (connections, requests) = (Arc::clone(&connections), Arc::clone(&requests));
+            let sent = Arc::clone(&sent);
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
                     connections.fetch_add(1, Ordering::SeqCst);
                     let (routes, requests) = (Arc::clone(&routes), Arc::clone(&requests));
+                    let sent = Arc::clone(&sent);
                     std::thread::spawn(move || {
                         let mut stream = stream;
                         let Some(line) = read_request_line(&mut stream) else {
@@ -220,7 +237,7 @@ impl FakeSite {
                         let path = line.split(' ').nth(1).unwrap_or("");
                         let path = path.split('?').next().unwrap_or("");
                         match routes.iter().find(|(p, _)| p == path) {
-                            Some((_, reply)) => respond(stream, reply),
+                            Some((_, reply)) => respond_counting(stream, reply, Some(&sent)),
                             None => respond(stream, &Reply::status(404)),
                         }
                     });
@@ -232,11 +249,17 @@ impl FakeSite {
             addr,
             connections,
             requests,
+            sent,
         }
     }
 
     pub fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// 応答の本文として、これまでに書けたバイト数の合計（頭出しのヘッダーは含まない）。
+    pub fn body_bytes_sent(&self) -> u64 {
+        self.sent.load(Ordering::SeqCst)
     }
 
     /// 受けた要求の 1 行目。

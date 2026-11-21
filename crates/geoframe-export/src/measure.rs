@@ -13,8 +13,9 @@
 //! 経路を、`libImaging/Resample.c` と同じ手順で移植したもの（係数の範囲の決め方、22 ビットの固定小数点、横→縦の 2 パス、
 //! パスごとの丸めと 0〜255 への丸め）。`fast_image_resize`（CatmullRom）も試したが、旧値との差が大きかったので使わない。
 //!
-//! 移植していないところ: Pillow は縮小の比が 4 以上（長辺が 4096px 以上）のとき、先に整数倍の `reduce` を挟む。
-//! 表示用 JPEG の長辺は 2560px なので起きない。起きた場合は `reduce` を挟まずに同じ畳み込みで縮小する（値はわずかにずれうる）。
+//! `thumbnail` の `reducing_gap=2.0` による整数倍の縮小も移植している（[`reduce`]）。縮小の比（`元の大きさ / 縮小後 / 2`）が
+//! 整数で 2 以上になる軸（長辺が 4096px 以上）では、先に `Image.reduce` と同じ箱形の平均で縮め、そのあとの畳み込みには
+//! 縮めた後の画像と、整数倍で割った小数のままの範囲（box）を渡す。表示用 JPEG の長辺は 2560px なので、通常は入らない。
 
 /// 縮小後の長辺の上限（`thumbnail((1024, 1024))`）。
 pub const THUMBNAIL_MAX: u32 = 1024;
@@ -127,11 +128,16 @@ fn bicubic(x: f64) -> f64 {
     }
 }
 
-/// 1 次元の係数（Pillow の `precompute_coeffs` と `normalize_coeffs_8bpc`）。
+/// 1 次元の係数（Pillow の `precompute_coeffs` と `normalize_coeffs_8bpc`）。`in0..in1` は入力の中で縮める範囲（小数）。
 /// 返すのは、1 出力画素あたりの係数の最大の個数 `ksize`、各画素の `(xmin, 個数)`、固定小数点の係数。
-fn coefficients(in_size: usize, out_size: usize) -> (usize, Vec<(usize, usize)>, Vec<i32>) {
+fn coefficients(
+    in_size: usize,
+    in0: f64,
+    in1: f64,
+    out_size: usize,
+) -> (usize, Vec<(usize, usize)>, Vec<i32>) {
     let support_base = 2.0;
-    let scale = in_size as f64 / out_size as f64;
+    let scale = (in1 - in0) / out_size as f64;
     let filterscale = scale.max(1.0);
     let support = support_base * filterscale;
     let ksize = support.ceil() as usize * 2 + 1;
@@ -139,7 +145,7 @@ fn coefficients(in_size: usize, out_size: usize) -> (usize, Vec<(usize, usize)>,
     let mut kk = vec![0i32; out_size * ksize];
     let mut weights = vec![0f64; ksize];
     for xx in 0..out_size {
-        let center = (xx as f64 + 0.5) * scale;
+        let center = in0 + (xx as f64 + 0.5) * scale;
         let ss = 1.0 / filterscale;
         // C の `(int)(v + 0.5)`（0 方向への切り捨て）。負なら 0 に丸められる
         let xmin = ((center - support + 0.5) as i64).max(0) as usize;
@@ -170,18 +176,24 @@ fn clip8(v: i64) -> u8 {
 }
 
 /// Pillow の `ImagingResample`（BICUBIC、8 ビット 1 チャンネル）: 大きさが変わる方向だけ、横→縦の順に畳み込む。
-pub fn resize_bicubic(
+/// `box_` は入力の中で縮める範囲 `(x0, y0, x1, y1)`（小数）。
+fn resample(
     src: &[u8],
     width: usize,
     height: usize,
     out_w: usize,
     out_h: usize,
+    box_: (f64, f64, f64, f64),
 ) -> Vec<u8> {
     debug_assert_eq!(src.len(), width * height);
+    let (bx0, by0, bx1, by1) = box_;
+    // Pillow: `xsize != imIn->xsize || box[0] || box[2] != xsize`（縦も同じ）
+    let need_horizontal = out_w != width || bx0 != 0.0 || bx1 != out_w as f64;
+    let need_vertical = out_h != height || by0 != 0.0 || by1 != out_h as f64;
     let mut cur: Vec<u8>;
     let mut cur_ref: &[u8] = src;
-    if out_w != width {
-        let (ksize, bounds, kk) = coefficients(width, out_w);
+    if need_horizontal {
+        let (ksize, bounds, kk) = coefficients(width, bx0, bx1, out_w);
         let mut out = vec![0u8; out_w * height];
         for y in 0..height {
             let row = &src[y * width..(y + 1) * width];
@@ -197,8 +209,8 @@ pub fn resize_bicubic(
         cur = out;
         cur_ref = &cur;
     }
-    if out_h != height {
-        let (ksize, bounds, kk) = coefficients(height, out_h);
+    if need_vertical {
+        let (ksize, bounds, kk) = coefficients(height, by0, by1, out_h);
         let mut out = vec![0u8; out_w * out_h];
         for (yy, &(ymin, n)) in bounds.iter().enumerate() {
             let k = &kk[yy * ksize..yy * ksize + n];
@@ -214,6 +226,84 @@ pub fn resize_bicubic(
         cur_ref = &cur;
     }
     cur_ref.to_vec()
+}
+
+/// Pillow の `division_UINT32(divider, 8)`（`libImaging/Reduce.c`）: 平均を出す掛け算の係数。`2^32 / (256 * divider)` を
+/// 単精度の浮動小数で割り、切り捨てる。
+fn reduce_multiplier(divider: u32) -> u32 {
+    let max_dividend = (1u32 << 8) * divider;
+    let max_int = (1u32 << 30) as f32 * 4.0;
+    (max_int / max_dividend as f32) as u32
+}
+
+/// Pillow の `Image.reduce((factor_x, factor_y))`（8 ビット 1 チャンネル、`libImaging/Reduce.c`）: `factor_x × factor_y`
+/// の区画ごとの平均（`(合計 + 個数/2) * multiplier >> 24`。右端・下端の区画は端数の個数で平均する）。大きさは切り上げ。
+pub fn reduce(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    factor_x: usize,
+    factor_y: usize,
+) -> (Vec<u8>, usize, usize) {
+    debug_assert_eq!(src.len(), width * height);
+    let (out_w, out_h) = (width.div_ceil(factor_x), height.div_ceil(factor_y));
+    let mut out = vec![0u8; out_w * out_h];
+    for oy in 0..out_h {
+        let y0 = oy * factor_y;
+        let y1 = (y0 + factor_y).min(height);
+        for ox in 0..out_w {
+            let x0 = ox * factor_x;
+            let x1 = (x0 + factor_x).min(width);
+            let count = ((x1 - x0) * (y1 - y0)) as u32;
+            let mut sum = count / 2;
+            for y in y0..y1 {
+                sum += src[y * width + x0..y * width + x1]
+                    .iter()
+                    .map(|&v| u32::from(v))
+                    .sum::<u32>();
+            }
+            out[oy * out_w + ox] =
+                ((u64::from(sum) * u64::from(reduce_multiplier(count))) >> 24) as u8;
+        }
+    }
+    (out, out_w, out_h)
+}
+
+/// Pillow の `Image.resize(size, BICUBIC, box=None, reducing_gap=2.0)`（`thumbnail` が内部で呼ぶ形）の 8 ビット 1 チャンネル版。
+/// 軸ごとの縮小の比 `int(元 / 先 / 2.0)` が 2 以上の軸があれば、先に [`reduce`] で縮め（比は 1 以下に丸められた軸では 1）、
+/// 残りの畳み込みには、縮めた後の画像と `元の範囲 / 整数倍` の小数の範囲を渡す。
+pub fn resize_bicubic(
+    src: &[u8],
+    width: usize,
+    height: usize,
+    out_w: usize,
+    out_h: usize,
+) -> Vec<u8> {
+    const REDUCING_GAP: f64 = 2.0;
+    let factor =
+        |from: usize, to: usize| ((from as f64 / to as f64 / REDUCING_GAP) as usize).max(1);
+    let (factor_x, factor_y) = (factor(width, out_w), factor(height, out_h));
+    if factor_x > 1 || factor_y > 1 {
+        // `_get_safe_box` は、全体の範囲を渡したとき全体に収まる（support を足しても画像の外は切られる）
+        let (reduced, rw, rh) = reduce(src, width, height, factor_x, factor_y);
+        // Pillow の C 側は box を単精度（`float box[4]`）で受け取る。割り算の結果を単精度に丸めてから使う
+        let to_f32 = |v: f64| f64::from(v as f32);
+        let box_ = (
+            0.0,
+            0.0,
+            to_f32(width as f64 / factor_x as f64),
+            to_f32(height as f64 / factor_y as f64),
+        );
+        return resample(&reduced, rw, rh, out_w, out_h, box_);
+    }
+    resample(
+        src,
+        width,
+        height,
+        out_w,
+        out_h,
+        (0.0, 0.0, width as f64, height as f64),
+    )
 }
 
 /// 3×3 の 4 近傍ラプラシアン（scale 1、offset 128、0〜255 に丸め）。縁の 1 画素は元の値（Pillow の

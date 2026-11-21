@@ -132,10 +132,44 @@ fn raw_buffers_match_pillow_pixel_for_pixel() {
 }
 
 #[test]
+fn reduce_matches_pillow_pixel_for_pixel() {
+    let expected = expected();
+    let cases = expected["reduce"].as_array().unwrap();
+    assert!(cases.len() >= 20);
+    for case in cases {
+        let (kind, w, h) = (s(&case["kind"]), n(&case["width"]), n(&case["height"]));
+        let (fx, fy) = (n(&case["factor"][0]), n(&case["factor"][1]));
+        let label = format!("{kind} {w}x{h} / {fx}x{fy}");
+        let (out, ow, oh) = measure::reduce(&pattern(kind, w, h), w, h, fx, fy);
+        assert_eq!(
+            (ow, oh),
+            (n(&case["size"][0]), n(&case["size"][1])),
+            "{label}: 大きさ"
+        );
+        assert_eq!(crc(&out), case["crc32"].as_u64().unwrap(), "{label}");
+    }
+}
+
+#[test]
+fn the_reduce_boundary_is_covered() {
+    // 長辺 4095 は縮小の比が 4 未満で reduce が入らず、4096 から入る（Pillow の `int(元 / 先 / 2.0) > 1`）。
+    // 境目の画像が、期待値の中にある
+    let expected = expected();
+    let has = |w: u64, h: u64| {
+        expected["raw"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["width"] == w && c["height"] == h)
+    };
+    assert!(has(4095, 128) && has(4096, 128) && has(8192, 128));
+}
+
+#[test]
 fn jpeg_fixtures_match_pillow_within_the_tolerance() {
     let expected = expected();
     let cases = expected["jpeg"].as_array().unwrap();
-    assert!(cases.len() >= 6);
+    assert!(cases.len() >= 10);
     for case in cases {
         let name = s(&case["name"]);
         let bytes = std::fs::read(format!("{DIR}/{name}.jpg")).expect("fixture");

@@ -15,7 +15,11 @@
 //!
 //! 上限（[`Limits`]）: 1 枚 30MB（**読んだバイト数**で数える）、画素数 6,000 万（SOF のヘッダで、デコードの前に確かめる）、
 //! 1 枚 60 秒（接続から本文を読み終えるまで）、1 ジョブの画像の合計 2GB、リダイレクトはたどらない、proxy は使わない。
-//! ジョブ全体の期限は呼び出し側が [`prepare`] の `deadline` で渡す（過ぎれば `timeout`。1 枚の期限もそこまでに縮める）。
+//! 合計の上限は**読む前**に効く: 1 枚ごとに「1 枚の上限」と「合計の残り」の小さい方に超過の検出用の 1 バイトを足したところで
+//! 読むのを止める（超えると分かった時点で止まり、上限を大きく超えて読まない）。区画の検査で外した写真の分も、読んだバイトとして
+//! 合計に数える。
+//! ジョブ全体の期限は呼び出し側が [`prepare`] の `deadline` で渡す（過ぎれば `timeout`。1 枚の期限もそこまでに縮める。
+//! 期限は、取得の前、デコードと計測の後、最後に manifest を書いた後に確かめる）。
 //! 1 ジョブの枚数の上限（2,000）は一覧 API の検査（[`crate::listing`]）が持つ。
 //!
 //! エラーには URL・本文・`ureq` のメッセージを入れない（固定の説明だけ）。
@@ -106,10 +110,17 @@ impl ImageClient {
     }
 
     /// 1 枚取る。`file` は検査済みの `derivatives/…jpg`。`timeout` はこの 1 枚の期限（既定の期限以下）。
+    /// `job_remaining` は、このジョブの画像の合計の上限（2GB）までの残りのバイト数。1 枚の上限と残りの小さい方に、超過の
+    /// 検出用の 1 バイトを足したところで読むのを止める（失敗までに余計に読むのは、その 1 バイトだけ）。
     /// 返すのは配信されたバイト列そのまま。圧縮は頼まない（`Accept-Encoding: identity`）。それでも `Content-Encoding: gzip` で
     /// 配られたときは、一覧 API の取得（[`crate::feed`]）と同じく展開したバイト列を受け取り、上限は**展開後**のバイト数に掛ける
     /// （手元のバイト列を書くので、`file_size` はそのバイト列の大きさと一致する）。
-    pub fn fetch(&self, file: &str, timeout: Duration) -> Result<Vec<u8>, ExportError> {
+    pub fn fetch(
+        &self,
+        file: &str,
+        timeout: Duration,
+        job_remaining: u64,
+    ) -> Result<Vec<u8>, ExportError> {
         let url = format!("{}/{}", self.base, file);
         let mut response = self
             .agent
@@ -125,7 +136,8 @@ impl ImageClient {
             // 3xx もここに来る（たどらない）。本文は読まない
             return Err(fetch_failed("写真サービスが 200 以外を返しました"));
         }
-        let cap = self.limits.max_image_bytes.saturating_add(1);
+        let limit = self.limits.max_image_bytes.min(job_remaining);
+        let cap = limit.saturating_add(1);
         // ureq 自身の上限は take より後ろに置く（take が先に止める。ureq の上限は最後の保険）
         let reader = response
             .body_mut()
@@ -137,8 +149,12 @@ impl ImageClient {
             .take(cap)
             .read_to_end(&mut out)
             .map_err(|_| fetch_failed("画像の本文を読み取れませんでした"))?;
-        if out.len() as u64 > self.limits.max_image_bytes {
-            return Err(fetch_failed("画像が 1 枚の上限（30MB）を超えています"));
+        if out.len() as u64 > limit {
+            return Err(if self.limits.max_image_bytes <= job_remaining {
+                fetch_failed("画像が 1 枚の上限（30MB）を超えています")
+            } else {
+                fetch_failed("画像の合計が 1 ジョブの上限（2GB）を超えました")
+            });
         }
         Ok(out)
     }
@@ -171,11 +187,48 @@ pub struct Prepared {
     pub invalid_time_in_catalog: u64,
 }
 
-fn check_deadline(deadline: Option<Instant>) -> Result<Duration, ExportError> {
+/// [`prepare`] の失敗。失敗の理由に加えて、**そこまでに分かっていた数**を持つ（ジョブの結果に載せる。`nothing_to_export`
+/// のときは、候補の数と除外の理由が全部入っている）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrepareError {
+    pub error: ExportError,
+    /// 候補の数（結果の `catalog_count`）。
+    pub catalog_count: usize,
+    /// 失敗までに外した仕様上の除外（`not_derivative`・`has_metadata`）。候補の順。`nothing_to_export` では全部。
+    /// ほかの失敗では、失敗した写真より前の分だけ。
+    pub excluded: Vec<Exclusion>,
+    pub undated_in_catalog: u64,
+    pub invalid_time_in_catalog: u64,
+}
+
+impl PrepareError {
+    pub fn code(&self) -> ErrorCode {
+        self.error.code
+    }
+}
+
+impl From<PrepareError> for ExportError {
+    fn from(e: PrepareError) -> Self {
+        e.error
+    }
+}
+
+impl std::fmt::Display for PrepareError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
+
+impl std::error::Error for PrepareError {}
+
+fn check_deadline(
+    deadline: Option<Instant>,
+    now: &dyn Fn() -> Instant,
+) -> Result<Duration, ExportError> {
     match deadline {
         None => Ok(Duration::MAX),
         Some(d) => {
-            let left = d.saturating_duration_since(Instant::now());
+            let left = d.saturating_duration_since(now());
             if left.is_zero() {
                 Err(ExportError::from(ErrorCode::Timeout))
             } else {
@@ -191,8 +244,8 @@ fn check_deadline(deadline: Option<Instant>) -> Result<Duration, ExportError> {
 /// - 作成待ち（`file: null`）の写真が 1 枚でもあれば、何も取らずに `derivative_pending`。
 /// - 1 枚の取得・デコードの失敗、上限（1 枚・画素数・合計）の超過で全体が失敗（`fetch_failed`・`decode_failed`）。
 ///   区画の検査に通らない写真（`has_metadata`）は外して続ける。
-/// - 書き出す写真が 0 枚になったら `nothing_to_export`。
-/// - `deadline` を過ぎたら `timeout`。
+/// - 書き出す写真が 0 枚になったら `nothing_to_export`（[`PrepareError`] に、候補の数と除外の理由を持たせる）。
+/// - `deadline` を過ぎたら `timeout`（取得の前、デコードと計測の後、manifest を書いた後に確かめる）。
 ///
 /// 失敗しても作業領域の中身は残る（呼び出し側が [`Workspace`] を手放して消す）。
 pub fn prepare(
@@ -201,6 +254,54 @@ pub fn prepare(
     destination: Destination,
     workspace: &Workspace,
     deadline: Option<Instant>,
+) -> Result<Prepared, PrepareError> {
+    prepare_with_clock(
+        client,
+        selection,
+        destination,
+        workspace,
+        deadline,
+        &Instant::now,
+    )
+}
+
+/// [`prepare`] の、現在時刻の取り方を差し替えられる形（期限の確かめを、時間に頼らずに試験するため。本番は [`prepare`]）。
+#[doc(hidden)]
+pub fn prepare_with_clock(
+    client: &ImageClient,
+    selection: &Selection,
+    destination: Destination,
+    workspace: &Workspace,
+    deadline: Option<Instant>,
+    now: &dyn Fn() -> Instant,
+) -> Result<Prepared, PrepareError> {
+    let mut excluded = Vec::new();
+    prepare_inner(
+        client,
+        selection,
+        destination,
+        workspace,
+        deadline,
+        now,
+        &mut excluded,
+    )
+    .map_err(|error| PrepareError {
+        error,
+        catalog_count: selection.candidate_count(),
+        excluded,
+        undated_in_catalog: selection.undated,
+        invalid_time_in_catalog: selection.invalid_time,
+    })
+}
+
+fn prepare_inner(
+    client: &ImageClient,
+    selection: &Selection,
+    destination: Destination,
+    workspace: &Workspace,
+    deadline: Option<Instant>,
+    now: &dyn Fn() -> Instant,
+    excluded: &mut Vec<Exclusion>,
 ) -> Result<Prepared, ExportError> {
     if selection.candidates.is_empty() {
         return Err(ExportError::new(
@@ -215,7 +316,6 @@ pub fn prepare(
     let folder = FolderName::for_period(period)?;
     let limits = client.limits();
 
-    let mut excluded = Vec::new();
     let mut photos: Vec<PhotoEntry> = Vec::new();
     let mut files: Vec<PublishFile> = Vec::new();
     let mut photo_bytes = 0u64;
@@ -235,15 +335,17 @@ pub fn prepare(
             // 上で止めている。ここに来たら食い違い
             FileState::Pending => return Err(ExportError::from(ErrorCode::DerivativePending)),
         };
-        let left = check_deadline(deadline)?;
-        let bytes = client.fetch(path, left).map_err(|e| {
+        let left = check_deadline(deadline, now)?;
+        let remaining = limits.max_job_bytes.saturating_sub(fetched_bytes);
+        let bytes = client.fetch(path, left, remaining).map_err(|e| {
             // 全体の期限で 1 枚の期限が縮んでいたときの失敗は、期限切れとして返す
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+            if deadline.is_some_and(|d| now() >= d) {
                 ExportError::from(ErrorCode::Timeout)
             } else {
                 e
             }
         })?;
+        // 読む前に残りで止めている（超えていれば fetch が失敗している）。ここは取りこぼしの保険
         fetched_bytes = fetched_bytes
             .checked_add(bytes.len() as u64)
             .filter(|total| *total <= limits.max_job_bytes)
@@ -270,6 +372,8 @@ pub fn prepare(
             .map_err(|_| decode_failed("画像をデコードできません"))?;
         let measures = measure::measure(&gray.data, gray.width, gray.height);
         drop(gray);
+        // デコードと計測は長くかかりうる。そのあいだに期限が過ぎていれば、この写真を書かずに止める
+        check_deadline(deadline, now)?;
 
         let filename = manifest::relative_path(period, candidate.time, candidate.id);
         workspace.write_new(&filename, &bytes)?;
@@ -305,7 +409,7 @@ pub fn prepare(
         folder: &folder,
         period,
         catalog_count: selection.candidate_count(),
-        excluded: &excluded,
+        excluded,
         undated_in_catalog: selection.undated,
         invalid_time_in_catalog: selection.invalid_time,
         photos: &photos,
@@ -316,13 +420,15 @@ pub fn prepare(
         path: "manifest.json".to_owned(),
         size: manifest_bytes.len() as u64,
     });
+    // 期限を過ぎてから「成功」を返さない（呼び出し側は、この後に宛先を照会して送る）
+    check_deadline(deadline, now)?;
 
     Ok(Prepared {
         folder,
         count: photos.len(),
         catalog_count: selection.candidate_count(),
         files,
-        excluded,
+        excluded: std::mem::take(excluded),
         photo_bytes,
         manifest_bytes: manifest_bytes.len() as u64,
         undated_in_catalog: selection.undated,
