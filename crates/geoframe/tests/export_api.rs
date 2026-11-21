@@ -115,6 +115,8 @@ fn rows() -> String {
     sql += &photo(13, "", "");
     sql += &photo(14, "2030-03", "");
     sql += &photo(15, "x", "");
+    // 文字列の比較では期間内に入るが、分までの形ではない（TIMED の条件が抜けると一覧に出てしまう）
+    sql += &photo(18, "2030-03-10 10:15:30", "");
     sql += &photo(16, "NULL", "UPDATE photos SET hidden=1 WHERE id=16;");
     sql += &photo(17, "y", "UPDATE photos SET hidden=1 WHERE id=17;");
     sql
@@ -181,7 +183,7 @@ async fn returns_the_period_with_every_visible_photo() {
     assert_eq!(body["from"], "2030-03-10");
     assert_eq!(body["to"], "2030-03-11");
     assert_eq!(body["undated"], 2);
-    assert_eq!(body["invalid_time"], 2);
+    assert_eq!(body["invalid_time"], 3);
     assert_eq!(body["truncated"], false);
     // 1 件のキーは 8 つだけで、無い値もキーを省かない
     for p in body["photos"].as_array().unwrap() {
@@ -284,7 +286,7 @@ async fn day_boundaries_are_inclusive_of_00_00_and_23_59() {
     let empty = server.export("from=2030-04-01&to=2030-04-01").await;
     assert_eq!(ids(&empty), Vec::<i64>::new());
     assert_eq!(empty["undated"], 2);
-    assert_eq!(empty["invalid_time"], 2);
+    assert_eq!(empty["invalid_time"], 3);
     assert_eq!(empty["truncated"], false);
 }
 
