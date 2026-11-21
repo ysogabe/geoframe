@@ -13,9 +13,18 @@
 //!   1 枚以上（`files` が写真 1 枚以上と末尾の `manifest.json`）であることを前提にし、そうでなければ何も呼ばずに `internal`。
 //! - 各段階に進む**前**に、[`ProgressSink::record`] が呼ばれる。ここでジョブの記録（`jobs/<job_id>.json`）へ段階名と ID を書いて
 //!   から `Ok` を返すこと。`Err` を返すと、その段階の Drive の操作はしない。`uploading` は 2 回（フォルダを作る前に段階だけ、
-//!   作って ID が分かってから ID つきで）呼ばれる。
+//!   作って ID が分かってから ID つきで）呼ばれる。**復旧（[`Recovery::run`]・[`Recovery::execute`]）にも同じ口を渡す**:
+//!   復旧が Drive を変える操作（`incoming` の移動＝`publishing`、旧フォルダのゴミ箱への移動＝`trashing`）の前にも、
+//!   段階を書く（復旧の途中でまた止まっても、記録と Drive が食い違わないため）。書けなければ、その操作はしない。
 //! - ジョブ全体の期限は、渡す [`Rclone`] に `with_deadline` で掛ける。過ぎたら実行中の rclone を kill して `timeout`。後始末と復旧は
 //!   期限なし（コマンドごとの期限だけ）で動く。
+//! - [`Published::recorded`] が偽（公開の記録 `published.json` に書けなかった）のときは、公開は済んでいる。**正常な完了として
+//!   吸収しない**: [`Published::record`] が書くはずだった行なので、`upsert` をやり直し、それでも書けなければ、結果に
+//!   「公開済み（フォルダの ID）・記録に書けていない」を残す（次の `replace` はこのフォルダを管理していないものとして断る）。
+//! - [`Published::old_left_in_replaced`] が `Some` のときは、新しい一式は公開済みで、旧フォルダが `replaced/` に残っている
+//!   （旧 ID が退避先にあると再確認できた場合に限る。別の ID や照会できないときは、成功にせず `blocked`）。
+//! - [`PublishFailure::leftover_incoming`]・[`Resolution::Interrupted`] の残りもの（`incoming/<job_id>`）は、ID を記録していない
+//!   フォルダを名前だけでは消さないので、残ることがある。結果と `recover` の表示に出す（[`leftover_incoming_text`]）。
 //!
 //! ## ID の照合をしている段（本物の rclone で配置のときに確かめる項目の根拠）
 //!
@@ -29,8 +38,22 @@
 //! | `retiring` の直後 | 宛先が無く、`replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**。違えば `blocked`（`retire_mismatch`。パスで解決する移動が、確かめてから移すまでの間にできた別のフォルダを移した場合） |
 //! | `publishing` の前 | 宛先が無い（新規は無ければ中止、置き換えは `blocked`） |
 //! | `publishing` の直後 | 宛先が**記録した `incoming` の ID 1 つだけ**・`incoming/<job_id>` が残っていない・中身が一式と一致。違えば `blocked`（`publish_mismatch`。ファイル単位の移動への切り替え、宛先に既にあった別のフォルダへの merge など） |
-//! | `trashing` の直前 | `replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**。違えば `blocked`（`trash_mismatch`） |
-//! | 取り除き（`incoming` のゴミ箱） | 見えた項目がちょうど 1 つのフォルダで、記録した ID と一致 |
+//! | `trashing` の直前 | `replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**、かつ**中身が旧 manifest の一式と完全に一致**。違えば `blocked`（`trash_mismatch`・`retired_content_changed`） |
+//! | 取り除き（`incoming` のゴミ箱） | 見えた項目が、**記録した ID** のフォルダちょうど 1 つ（ID が無ければ消さない） |
+//!
+//! ## ゴミ箱へ移すものと、`moveto` の fallback の影響（残る前提）
+//!
+//! - rclone で ID を固定した `purge` はできない（上流の `purgeCheck` は、`root_folder_id` で根を指しても何もしない）。`purge` を
+//!   呼ぶのは、誰とも共有しない作業用のフォルダの中の `incoming/<job_id>`・`replaced/<種類>-<フォルダ名>-<job_id>`
+//!   （`job_id` は 128 ビットの乱数）だけ。競合の余地は、オーナーがその名前のフォルダを数秒のうちに作ることだけ。
+//! - rclone の `moveto`（フォルダ）は、移し先にフォルダができていると、Drive の中での移動をやめて**ファイル単位の移動**に切り替わる
+//!   （上流の `MoveDir` が `ErrorDirExists` を受けた場合）。止める手段は無く、`ErrorCantDirMove`（remote 名が違うとき）は
+//!   remote 名をそろえた設定（起動時に検査済み）では起きないので、残る条件は「直前に移し先が無いと確かめてから移すまでの数秒に、
+//!   同じ名前のフォルダが作られる」競合だけ（設計 4.2 の「書き出しの実行中に、オーナーが同じ宛先のフォルダを画面から作ったり
+//!   動かしたりしない」前提の範囲）。起きたときの影響は、移し先のフォルダに**写真が足される**こと（既にあるものは消さず、
+//!   `--immutable` で書き換えない）。移したあとの ID の照合（移し先の ID が `incoming` の ID と違う）で見つけて `blocked` で止まる。
+//!   `recover` の表示（[`BlockedInfo::describe`]）の ID を見て、オーナーが Drive の画面で足された写真を手で片付ける。`retiring`
+//!   （旧フォルダの退避）の移動も同じ。
 //!
 //! rclone の drive の `backend moveid`（ID を指して移す）は、フォルダに使えるかをネットワークなしでは確かめられなかったので
 //! 使っていない（パスでの移動と、上の照合）。使えると分かれば、`retiring`・`publishing` の移動だけを差し替えられる
@@ -39,12 +62,14 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::drive::{Drive, Expected, Inspection, Layout, Managed, Removed, Target};
+use crate::drive::{Drive, Expected, Inspection, Layout, Managed, Place, Removed, Target};
 use crate::error::{ErrorCode, ExportError};
 use crate::image::PublishFile;
 use crate::published::{PublishedRecord, PublishedStore};
 use crate::rclone::Rclone;
-use crate::recovery::{Action, BlockedReason, Decision, Observed, Progress, Seen, Stage, decide};
+use crate::recovery::{
+    Action, BlockedReason, Decision, Kind, Observed, Progress, Seen, Stage, decide,
+};
 use crate::request::OnExists;
 
 /// 各段階の前に、ジョブの記録へ段階名と ID を書くための口（T5 が実装する）。
@@ -106,9 +131,31 @@ pub struct Published {
     /// 置き換えのとき、置き換える前にあったファイル数（新規は 0。復旧で完了したときも 0）。
     pub existing_files: u64,
     /// 旧フォルダのゴミ箱への移動ができなかったとき、`replaced/` に残っている旧フォルダの ID（新しい一式は公開済み）。
+    /// **旧 ID が退避先にあると、一覧で再確認できたときだけ**入る（別の ID や、照会できないときは `blocked`）。
     pub old_left_in_replaced: Option<String>,
     /// 公開の記録（`published.json`）に書けたか。偽なら、次の `replace` はこのフォルダを管理していないものとして断る。
+    /// 偽のまま正常な完了にしない（[`Published::record`] を `upsert` し直し、書けなければ結果に残す）。
     pub recorded: bool,
+    /// 公開の記録に書く（書いた）行。`recorded` が偽のとき、記録の再試行に使う。
+    pub record: PublishedRecord,
+}
+
+impl Published {
+    /// 公開の記録（`published.json`）への書き込みをやり直す（`recorded` が偽のとき）。
+    pub fn retry_record(&self, store: &PublishedStore) -> Result<(), ExportError> {
+        store.upsert(self.record.clone())
+    }
+
+    /// `old_left_in_replaced` があるときの、結果と `recover` に出す説明。
+    pub fn old_left_text(&self, layout: &Layout) -> Option<String> {
+        self.old_left_in_replaced.as_ref().map(|id| {
+            format!(
+                "新しい一式は公開済みですが、旧フォルダ（ID {id}）をゴミ箱へ移せず、{} に残っています。\
+                 Drive の画面で確かめてゴミ箱へ移してください。",
+                layout.retired_path()
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,16 +208,39 @@ impl BlockedInfo {
                 list(&o.replaced),
             ));
         }
-        if self.reason == BlockedReason::RetireMismatch {
-            text.push_str(&format!(
+        match self.reason {
+            BlockedReason::RetireMismatch => text.push_str(&format!(
                 " 戻す手順: replaced の項目（上の ID）が、記録した旧フォルダ（ID {}）と違うフォルダなら、移してしまったものです。\
                  Drive の画面で、そのフォルダを元の場所（{}）へ戻し、本物の旧フォルダが宛先に残っていることを確かめてください。",
                 self.progress.old_id.as_deref().unwrap_or("記録なし"),
                 layout.dest_path(),
-            ));
+            )),
+            BlockedReason::PublishMismatch => text.push_str(&format!(
+                " 宛先（{}）の ID が incoming の ID（{}）と違うときは、宛先に既にあったフォルダへファイル単位で移された（写真が足された）\
+                 可能性があります。消してはいません。Drive の画面で、足された写真を確かめて片付けてください。",
+                layout.dest_path(),
+                self.progress.incoming_id.as_deref().unwrap_or("記録なし"),
+            )),
+            BlockedReason::RetiredContentChanged => text.push_str(&format!(
+                " 退避した旧フォルダ（{}）に、旧 manifest の一式にないファイルがある・足りない・大きさが違います。ゴミ箱へは移していません。\
+                 Drive の画面で中身を確かめ、足されたものがあれば取り出してから、旧フォルダをゴミ箱へ移してください。",
+                layout.retired_path(),
+            )),
+            _ => {}
         }
         text
     }
+}
+
+/// 片付けられずに作業用のフォルダに残っている `incoming/<job_id>` の知らせ（結果と `recover` の表示に出す）。
+/// 宛先は変わっていない。ID が分かっていれば入れる。
+pub fn leftover_incoming_text(layout: &Layout, id: Option<&str>) -> String {
+    format!(
+        "作業用のフォルダに incoming（{}{}）が残っています。宛先は変わっていません。\
+         ID を記録していないフォルダは名前だけでは消さないので、オーナーが Drive の画面で確かめて消してください。",
+        layout.incoming_path(),
+        id.map(|i| format!("、ID {i}")).unwrap_or_default()
+    )
 }
 
 /// 公開できなかったときの結果。
@@ -181,7 +251,10 @@ pub struct PublishFailure {
     /// `blocked` のときの記録。
     pub blocked: Option<Box<BlockedInfo>>,
     /// `incoming` を片付けられず、作業用のフォルダに残っている（宛先は変わっていない。オーナーが消してよい）。
+    /// ID を記録していないフォルダは、名前だけでは消さずにここへ出す。
     pub leftover_incoming: bool,
+    /// 残っている `incoming/<job_id>` の ID（分かっているとき）。表示は [`leftover_incoming_text`]。
+    pub leftover_incoming_id: Option<String>,
 }
 
 impl PublishFailure {
@@ -190,6 +263,7 @@ impl PublishFailure {
             error,
             blocked: None,
             leftover_incoming: false,
+            leftover_incoming_id: None,
         }
     }
 
@@ -198,7 +272,51 @@ impl PublishFailure {
             error: ExportError::from(ErrorCode::Blocked),
             blocked: Some(info),
             leftover_incoming: false,
+            leftover_incoming_id: None,
         }
+    }
+}
+
+// ---- 残りものの片付け ----
+
+/// `incoming/<job_id>` を片付けた結果。
+struct Leftover {
+    present: bool,
+    id: Option<String>,
+}
+
+impl Leftover {
+    const NONE: Self = Self {
+        present: false,
+        id: None,
+    };
+}
+
+/// `incoming/<job_id>` を片付ける。**記録した（または自分で確かめた）ID と一致するフォルダ 1 つだけ**をゴミ箱へ移す。
+/// ID が無ければ名前だけでは消さず、あるかどうかだけを見て、あれば残りものとして返す。
+fn clean_incoming(drive: &Drive<'_>, id: Option<&str>) -> Leftover {
+    match id {
+        Some(id) => match drive.remove_incoming(id) {
+            Ok(Removed::Done | Removed::Nothing) => Leftover::NONE,
+            _ => Leftover {
+                present: true,
+                id: Some(id.to_owned()),
+            },
+        },
+        None => match drive.incoming_seen() {
+            Ok(seen) if seen.is_empty() => Leftover::NONE,
+            Ok(seen) => Leftover {
+                present: true,
+                id: match seen.as_slice() {
+                    [s] if s.kind == Kind::Dir => Some(s.id.clone()),
+                    _ => None,
+                },
+            },
+            Err(_) => Leftover {
+                present: true,
+                id: None,
+            },
+        },
     }
 }
 
@@ -207,11 +325,49 @@ impl PublishFailure {
 /// 復旧の結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolution {
-    /// 宛先は前のまま。`incoming` を片付けた（`leftover_incoming` は、片付けられなかった）。ジョブは `interrupted`
-    /// （公開の途中の失敗では、元の失敗）で終える。
-    Interrupted { leftover_incoming: bool },
+    /// 宛先は前のまま。`incoming` を片付けた（`leftover_incoming` は、片付けられなかった・名前だけでは消さなかった）。ジョブは
+    /// `interrupted`（公開の途中の失敗では、元の失敗）で終える。
+    Interrupted {
+        leftover_incoming: bool,
+        /// 残っている `incoming/<job_id>` の ID（分かっているとき。表示は [`leftover_incoming_text`]）。
+        leftover_incoming_id: Option<String>,
+    },
     /// 新しい一式が公開されている。
     Published(Published),
+}
+
+/// ゴミ箱へ移す前の照合で止めた理由（何も消していない）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrashStop {
+    /// `replaced/` の項目が、記録した旧フォルダの ID のフォルダ 1 つだけではない。
+    Mismatch(Vec<Seen>),
+    /// 旧フォルダだが、中身が旧 manifest の一式と違う。
+    Content(Vec<Seen>),
+    /// `replaced/` を一覧できない（確かめられない）。
+    Unconfirmed,
+}
+
+impl TrashStop {
+    fn into_blocked(self, progress: &Progress, base: Option<&Observed>) -> Box<BlockedInfo> {
+        let with_replaced = |seen: Vec<Seen>| {
+            let mut o = base.cloned().unwrap_or_default();
+            o.replaced = seen;
+            o
+        };
+        let (reason, observed) = match self {
+            Self::Mismatch(seen) => (BlockedReason::TrashMismatch, Some(with_replaced(seen))),
+            Self::Content(seen) => (
+                BlockedReason::RetiredContentChanged,
+                Some(with_replaced(seen)),
+            ),
+            Self::Unconfirmed => (BlockedReason::Unobservable, base.cloned()),
+        };
+        Box::new(BlockedInfo {
+            reason,
+            progress: progress.clone(),
+            observed,
+        })
+    }
 }
 
 /// 復旧の表を実行するための部品。
@@ -243,6 +399,26 @@ impl Recovery<'_> {
         })
     }
 
+    /// 段階を記録する（Drive を変える操作の前）。すでにその段階なら書かない。書けなければ `Err`（その操作はしない）。
+    /// 書けたら `cur`（最後に記録できた段階と ID）を進める。
+    fn record_stage(
+        cur: &mut Progress,
+        stage: Stage,
+        sink: &mut dyn ProgressSink,
+    ) -> Result<(), ExportError> {
+        if cur.stage == stage {
+            return Ok(());
+        }
+        let next = Progress {
+            stage,
+            old_id: cur.old_id.clone(),
+            incoming_id: cur.incoming_id.clone(),
+        };
+        sink.record(&next)?;
+        *cur = next;
+        Ok(())
+    }
+
     /// 待って、一覧を 2 回取り、同じなら返す。違えば（または取れなければ）待ってやり直し、`rounds` 回で決まらなければ `None`。
     /// `wait_first` が偽なら、最初の 1 回目は待たない（Drive の移動が起きていない段階の失敗）。
     pub fn settle_observe(&self, wait_first: bool) -> Option<Observed> {
@@ -261,16 +437,18 @@ impl Recovery<'_> {
     }
 
     /// 復旧の表を当てはめて実行する。`wait_first`: 最初に待つか（移動・ゴミ箱への移動の段階の失敗、起動時は真）。
+    /// `sink`: Drive を変える操作の前に、段階（`publishing`・`trashing`）を書く口（公開と同じもの）。
     pub fn run(
         &self,
         progress: &Progress,
         wait_first: bool,
+        sink: &mut dyn ProgressSink,
     ) -> Result<Resolution, Box<BlockedInfo>> {
         let Some(observed) = self.settle_observe(wait_first) else {
             return Err(self.blocked(progress, BlockedReason::Unobservable, None));
         };
         let decision = decide(progress, &observed);
-        self.execute(progress, &decision, &observed)
+        self.execute(progress, &decision, &observed, sink)
     }
 
     /// `recover` コマンドの表示用: Drive を変えずに、今の状態と、表の動きと、その説明を返す。
@@ -284,116 +462,175 @@ impl Recovery<'_> {
         Ok((decision, observed, text))
     }
 
-    /// 決めた動きを実行する。
+    /// 決めた動きを実行する。Drive を変える操作（`incoming` の移動、旧フォルダのゴミ箱への移動）の前には、段階を `sink` に書く。
+    /// 書けなければその操作はしない（移す前なら `blocked`〔`record_failed`〕、ゴミ箱へ移す前なら、公開済みとして旧フォルダが
+    /// `replaced/` に残っていることを知らせる）。`blocked` の `progress` は、最後に記録できた段階。
     pub fn execute(
         &self,
         progress: &Progress,
         decision: &Decision,
         observed: &Observed,
+        sink: &mut dyn ProgressSink,
     ) -> Result<Resolution, Box<BlockedInfo>> {
-        let blocked = |reason| Err(self.blocked(progress, reason, Some(observed)));
+        let mut cur = progress.clone();
+        let drive = self.drive();
         match &decision.action {
-            Action::Blocked(reason) => blocked(*reason),
+            Action::Blocked(reason) => Err(self.blocked(&cur, *reason, Some(observed))),
             Action::Abort { remove_incoming } => {
-                let leftover = !matches!(
-                    self.drive().remove_incoming(remove_incoming.as_deref()),
-                    Ok(Removed::Done | Removed::Nothing)
-                );
+                let left = match remove_incoming {
+                    Some(id) => clean_incoming(&drive, Some(id)),
+                    None => Leftover::NONE,
+                };
                 Ok(Resolution::Interrupted {
-                    leftover_incoming: leftover,
+                    leftover_incoming: left.present,
+                    leftover_incoming_id: left.id,
                 })
             }
+            // ID を記録していない incoming は、名前だけでは消さない
+            Action::KeepUnrecordedIncoming { incoming_id } => Ok(Resolution::Interrupted {
+                leftover_incoming: true,
+                leftover_incoming_id: Some(incoming_id.clone()),
+            }),
             Action::FinishPublished {
                 folder_id,
                 trash_old,
             } => {
-                match self.content_ok(false) {
+                match self.content_ok(Place::Dest) {
                     Ok(true) => {}
-                    Ok(false) => return blocked(BlockedReason::ContentMismatch),
-                    Err(_) => return blocked(BlockedReason::ExecutionFailed),
+                    Ok(false) => {
+                        return Err(self.blocked(
+                            &cur,
+                            BlockedReason::ContentMismatch,
+                            Some(observed),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(self.blocked(
+                            &cur,
+                            BlockedReason::ExecutionFailed,
+                            Some(observed),
+                        ));
+                    }
                 }
-                self.finish(progress, observed, folder_id, trash_old.as_deref())
+                self.finish(&mut cur, observed, folder_id, trash_old.as_deref(), sink)
             }
             Action::RollForward {
                 incoming_id,
                 old_id,
             } => {
-                match self.content_ok(true) {
+                match self.content_ok(Place::Incoming) {
                     Ok(true) => {}
-                    Ok(false) => return blocked(BlockedReason::ContentMismatch),
-                    Err(_) => return blocked(BlockedReason::ExecutionFailed),
+                    Ok(false) => {
+                        return Err(self.blocked(
+                            &cur,
+                            BlockedReason::ContentMismatch,
+                            Some(observed),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(self.blocked(
+                            &cur,
+                            BlockedReason::ExecutionFailed,
+                            Some(observed),
+                        ));
+                    }
                 }
-                let drive = self.drive();
+                // 移す前に `publishing` を記録する（移した直後にまた止まっても、記録が `retiring` のままにならない）
+                if Self::record_stage(&mut cur, Stage::Publishing, sink).is_err() {
+                    return Err(self.blocked(&cur, BlockedReason::RecordFailed, Some(observed)));
+                }
                 // 直前に宛先が無いことをもう一度確かめる（あれば、移さない）
                 match drive.target() {
                     Ok(Target::Absent) => {}
                     Ok(Target::Exists { .. }) | Err(_) => {
-                        return blocked(BlockedReason::DestinationUnexpected);
+                        return Err(self.blocked(
+                            &cur,
+                            BlockedReason::DestinationUnexpected,
+                            Some(observed),
+                        ));
                     }
                 }
                 if drive.publish_move().is_err() {
-                    // 移動の応答が失われても済んでいることがあるので、続けて照合する
-                    if !matches!(drive.observe(), Ok(o) if o.dest == [Seen::dir(incoming_id)]) {
-                        return blocked(BlockedReason::ExecutionFailed);
+                    // 移動の応答が失われても済んでいることがあり、止めたあとも Drive 側で遅れて反映されることがある。
+                    // 公開の途中の失敗と同じく、待って、一覧を 2 回取って、同じなら照合する
+                    match self.settle_observe(true) {
+                        Some(o) if o.dest == [Seen::dir(incoming_id)] && o.incoming.is_empty() => {}
+                        Some(o) => {
+                            return Err(self.blocked(
+                                &cur,
+                                BlockedReason::ExecutionFailed,
+                                Some(&o),
+                            ));
+                        }
+                        None => return Err(self.blocked(&cur, BlockedReason::Unobservable, None)),
                     }
                 }
-                let expected_ok = match self.expected {
-                    Some(e) => drive.check_published(incoming_id, e),
-                    None => drive.observe().map(|o| {
-                        if o.dest == [Seen::dir(incoming_id)] && o.incoming.is_empty() {
-                            Ok(())
-                        } else {
-                            Err(o)
-                        }
-                    }),
-                };
-                match expected_ok {
+                // 公開の直後の照合（宛先の ID・incoming が残っていない・中身）。起動時は宛先の manifest で照合する
+                match drive.check_published(incoming_id, self.expected) {
                     Ok(Ok(())) => {}
                     Ok(Err(o)) => {
+                        return Err(self.blocked(&cur, BlockedReason::PublishMismatch, Some(&o)));
+                    }
+                    Err(_) => {
                         return Err(self.blocked(
-                            progress,
-                            BlockedReason::PublishMismatch,
-                            Some(&o),
+                            &cur,
+                            BlockedReason::ExecutionFailed,
+                            Some(observed),
                         ));
                     }
-                    Err(_) => return blocked(BlockedReason::ExecutionFailed),
                 }
-                self.finish(progress, observed, incoming_id, Some(old_id))
+                self.finish(&mut cur, observed, incoming_id, Some(old_id), sink)
             }
         }
     }
 
-    /// 宛先（`incoming` が偽）または `incoming` の中身が、期待した一式と一致するか。
-    fn content_ok(&self, incoming: bool) -> Result<bool, ExportError> {
+    /// 宛先（[`Place::Dest`]）または `incoming` の中身が、期待した一式と一致するか。
+    fn content_ok(&self, place: Place) -> Result<bool, ExportError> {
         let drive = self.drive();
-        match (self.expected, incoming) {
-            (Some(e), true) => drive.incoming_matches(e),
-            (Some(e), false) => drive.dest_matches_expected(e),
-            (None, incoming) => drive.folder_matches_its_manifest(incoming),
+        match (self.expected, place) {
+            (Some(e), Place::Incoming) => drive.incoming_matches(e),
+            (Some(e), _) => drive.dest_matches_expected(e),
+            (None, place) => drive.folder_matches_its_manifest(place),
         }
     }
 
-    /// 公開済みの仕上げ（旧フォルダのゴミ箱への移動と、公開の記録）。
+    /// 公開済みの仕上げ（旧フォルダのゴミ箱への移動と、公開の記録）。ゴミ箱へ移す前に `trashing` を記録する。
     fn finish(
         &self,
-        progress: &Progress,
+        cur: &mut Progress,
         observed: &Observed,
         folder_id: &str,
         trash_old: Option<&str>,
+        sink: &mut dyn ProgressSink,
     ) -> Result<Resolution, Box<BlockedInfo>> {
-        finish_tail(
-            &self.drive(),
+        let drive = self.drive();
+        // 記録できなければ、ゴミ箱へは移さない（公開は済んでいる。旧フォルダは `replaced/` に残る）
+        let mut skipped_trash = None;
+        let mut trash = trash_old;
+        if let Some(old) = trash_old
+            && Self::record_stage(cur, Stage::Trashing, sink).is_err()
+        {
+            skipped_trash = Some(old);
+            trash = None;
+        }
+        let mut published = finish_tail(
+            &drive,
+            &drive,
             self.published,
             self.layout,
             Finish {
                 folder_id,
-                trash_old,
-                replaced: progress.old_id.is_some(),
+                trash_old: trash,
+                replaced: cur.old_id.is_some(),
                 existing_files: 0,
             },
         )
-        .map(Resolution::Published)
-        .map_err(|_| self.blocked(progress, BlockedReason::TrashMismatch, Some(observed)))
+        .map_err(|stop| stop.into_blocked(cur, Some(observed)))?;
+        if let Some(old) = skipped_trash {
+            published.old_left_in_replaced = confirm_old_left(&drive, old)
+                .map_err(|stop| stop.into_blocked(cur, Some(observed)))?;
+        }
+        Ok(Resolution::Published(published))
     }
 }
 
@@ -407,19 +644,36 @@ struct Finish<'a> {
     existing_files: u64,
 }
 
+/// 旧フォルダが `replaced/` にまだあるかを、一覧で確かめる（ゴミ箱への移動の失敗のあと・移さなかったあと）。
+/// 無ければ `None`（済んでいる）、記録した旧 ID のフォルダ 1 つだけなら `Some`（残っている）。それ以外・一覧できないときは
+/// 成功にせず、止める理由を返す。
+fn confirm_old_left(drive: &Drive<'_>, old: &str) -> Result<Option<String>, TrashStop> {
+    match drive.replaced_seen() {
+        Ok(seen) if seen.is_empty() => Ok(None),
+        Ok(seen) if matches!(seen.as_slice(), [s] if s.kind == Kind::Dir && s.id == old) => {
+            Ok(Some(old.to_owned()))
+        }
+        Ok(seen) => Err(TrashStop::Mismatch(seen)),
+        Err(_) => Err(TrashStop::Unconfirmed),
+    }
+}
+
 /// 仕上げ: 旧フォルダ（`trash_old`）をゴミ箱へ移し、公開の記録（`published.json`）に足す。
 ///
-/// - ゴミ箱へ移す前に、`replaced/<…>` が記録した旧フォルダの ID 1 つだけであることを確かめる。違えば何も消さずに `Err`
-///   （`blocked`。見えていた項目を返す）。
-/// - 移せなかったときは、一覧でもう無いかを確かめる（応答が失われても、移動は済んでいることがある）。まだあれば、
-///   新しい一式は公開済みなので、`replaced/` に残っていることを `old_left_in_replaced` で知らせて終える。
-/// - 公開の記録に書けなかったときは `recorded: false`（次の `replace` は、このフォルダを管理していないものとして断る）。
+/// - ゴミ箱へ移す前に、`replaced/<…>` が記録した旧フォルダの ID 1 つだけで、中身が旧 manifest の一式と完全に一致することを
+///   確かめる（[`Drive::trash_replaced`]）。違えば何も消さずに `Err`（`blocked`）。
+/// - 移せなかったときは、`free`（ジョブの期限を掛けない）で一覧し直して確かめる。もう無ければ（応答が失われても、移動は済んで
+///   いることがある）済み。旧 ID のフォルダが 1 つだけ残っていれば、新しい一式は公開済みなので `old_left_in_replaced` で知らせて
+///   終える。**別の ID だった・一覧できなかったときは成功にせず `Err`**（`blocked`）。
+/// - 公開の記録に書けなかったときは `recorded: false`（[`Published::record`] を残す。次の `replace` は、このフォルダを管理して
+///   いないものとして断る）。
 fn finish_tail(
     drive: &Drive<'_>,
+    free: &Drive<'_>,
     published: &PublishedStore,
     layout: &Layout,
     finish: Finish<'_>,
-) -> Result<Published, Vec<Seen>> {
+) -> Result<Published, TrashStop> {
     let Finish {
         folder_id,
         trash_old,
@@ -430,28 +684,25 @@ fn finish_tail(
     if let Some(old) = trash_old {
         match drive.trash_replaced(old) {
             Ok(Removed::Done | Removed::Nothing) => {}
-            Ok(Removed::Mismatch(seen)) => return Err(seen),
-            Err(_) => {
-                if !matches!(drive.trash_gone(), Ok(true)) {
-                    left = Some(old.to_owned());
-                }
-            }
+            Ok(Removed::Mismatch(seen)) => return Err(TrashStop::Mismatch(seen)),
+            Ok(Removed::ContentMismatch(seen)) => return Err(TrashStop::Content(seen)),
+            Err(_) => left = confirm_old_left(free, old)?,
         }
     }
-    let recorded = published
-        .upsert(PublishedRecord {
-            destination: layout.destination(),
-            folder: layout.folder().clone(),
-            folder_id: folder_id.to_owned(),
-            job_id: layout.job().clone(),
-        })
-        .is_ok();
+    let record = PublishedRecord {
+        destination: layout.destination(),
+        folder: layout.folder().clone(),
+        folder_id: folder_id.to_owned(),
+        job_id: layout.job().clone(),
+    };
+    let recorded = published.upsert(record.clone()).is_ok();
     Ok(Published {
         folder_id: folder_id.to_owned(),
         replaced,
         existing_files,
         old_left_in_replaced: left,
         recorded,
+        record,
     })
 }
 
@@ -481,13 +732,19 @@ struct Run<'a> {
     layout: &'a Layout,
     params: &'a PublishParams<'a>,
     sink: &'a mut dyn ProgressSink,
+    /// ジョブの期限を掛けた rclone の `Drive`。
     drive: Drive<'a>,
+    /// 期限を掛けない `Drive`（仕上げの確認と後始末）。
+    free_drive: Drive<'a>,
     expected: Expected,
     /// 最後に**記録できた**段階と ID。
     progress: Progress,
     old_id: Option<String>,
     existing_files: u64,
     incoming_created: bool,
+    /// `incoming/<job_id>` を作ったあとに、この処理が一覧から確かめた ID（ジョブの記録に書けなかったときも、この ID
+    /// なら片付けられる。作ったばかりのフォルダを指している）。
+    known_incoming_id: Option<String>,
     retire_issued: bool,
 }
 
@@ -534,6 +791,7 @@ impl Run<'_> {
         self.incoming_created = true;
         self.drive.mkdir_incoming().map_err(StepErr::Op)?;
         let incoming_id = self.drive.incoming_id().map_err(StepErr::Op)?;
+        self.known_incoming_id = Some(incoming_id.clone());
         self.record(Stage::Uploading, Some(&incoming_id))?;
         self.drive
             .upload(self.params.workspace)
@@ -571,6 +829,11 @@ impl Run<'_> {
     }
 
     /// 宛先が無いとき: 直前にもう一度「無い」ことを確かめて、`incoming` を宛先へ移す。
+    ///
+    /// 確かめてから移すまでの数秒に、オーナーが同じ名前のフォルダを作ると、rclone の `moveto` は Drive の中での移動をやめて
+    /// ファイル単位の移動に切り替わる（止める手段が無い。設計 4.2 の「残る前提」の範囲）。宛先のフォルダに `incoming` の写真が
+    /// 足される（消しはしない）。移したあとの照合（宛先の ID が `incoming` の ID と違う）で見つけて `blocked` で止まり、
+    /// `recover` の表示で、オーナーが足された写真を手で片付ける。
     fn publish_absent(&mut self, incoming_id: &str) -> Result<Published, StepErr> {
         self.record(Stage::Publishing, Some(incoming_id))?;
         match self.drive.target() {
@@ -584,7 +847,9 @@ impl Run<'_> {
         self.finish(incoming_id, None)
     }
 
-    /// 置き換え: 退避 → 公開 → ゴミ箱。
+    /// 置き換え: 退避 → 公開 → ゴミ箱。退避・公開の移動が、確かめてから移すまでの数秒に同じ名前のフォルダができた場合の影響は、
+    /// [`Self::publish_absent`] と同じ（`retiring` では、`replaced/<…>` にできていたフォルダへ旧フォルダの中身が足される。
+    /// 退避の直後の照合で見つけて `blocked` にし、ゴミ箱へは移さない）。
     fn publish_replace(&mut self, incoming_id: &str, old: &str) -> Result<Published, StepErr> {
         // retiring: 旧フォルダ（ID 記録済み）を replaced/<…> へ移し、結果を照合する
         self.record(Stage::Retiring, Some(incoming_id))?;
@@ -619,7 +884,7 @@ impl Run<'_> {
     fn check_published(&self, incoming_id: &str) -> Result<(), StepErr> {
         match self
             .drive
-            .check_published(incoming_id, &self.expected)
+            .check_published(incoming_id, Some(&self.expected))
             .map_err(StepErr::Op)?
         {
             Ok(()) => Ok(()),
@@ -634,6 +899,7 @@ impl Run<'_> {
     fn finish(&self, folder_id: &str, trash_old: Option<&str>) -> Result<Published, StepErr> {
         finish_tail(
             &self.drive,
+            &self.free_drive,
             self.params.published,
             self.layout,
             Finish {
@@ -643,16 +909,7 @@ impl Run<'_> {
                 existing_files: self.existing_files,
             },
         )
-        .map_err(|seen| {
-            StepErr::Blocked(Box::new(BlockedInfo {
-                reason: BlockedReason::TrashMismatch,
-                progress: self.progress.clone(),
-                observed: Some(Observed {
-                    replaced: seen,
-                    ..Observed::default()
-                }),
-            }))
-        })
+        .map_err(|stop| StepErr::Blocked(stop.into_blocked(&self.progress, None)))
     }
 }
 
@@ -725,6 +982,7 @@ pub fn publish(
         params,
         sink,
         drive,
+        free_drive: Drive::new(&free, layout),
         expected: expected.clone(),
         progress: Progress {
             stage: Stage::Uploading,
@@ -734,6 +992,7 @@ pub fn publish(
         old_id,
         existing_files: inspection.existing_files,
         incoming_created: false,
+        known_incoming_id: None,
         retire_issued: false,
     };
     let recovery = Recovery {
@@ -748,15 +1007,23 @@ pub fn publish(
         Ok(published) => Ok(PublishOutcome::Published(published)),
         Err(StepErr::Blocked(info)) => Err(PublishFailure::blocked(info)),
         Err(StepErr::Abort(error)) => {
-            let leftover = run.incoming_created
-                && !matches!(
-                    Drive::new(&free, layout).remove_incoming(run.progress.incoming_id.as_deref()),
-                    Ok(Removed::Done | Removed::Nothing)
-                );
+            // 記録した ID、なければ作った直後にこの処理が確かめた ID で片付ける。どちらも無ければ名前だけでは消さず、
+            // 残っていれば残りものとして返す
+            let id = run
+                .progress
+                .incoming_id
+                .clone()
+                .or_else(|| run.known_incoming_id.clone());
+            let left = if run.incoming_created {
+                clean_incoming(&run.free_drive, id.as_deref())
+            } else {
+                Leftover::NONE
+            };
             Err(PublishFailure {
                 error,
                 blocked: None,
-                leftover_incoming: leftover,
+                leftover_incoming: left.present,
+                leftover_incoming_id: left.id,
             })
         }
         Err(StepErr::Op(error)) => {
@@ -765,11 +1032,15 @@ pub fn publish(
                 run.progress.stage,
                 Stage::Retiring | Stage::Publishing | Stage::Trashing
             ) || run.retire_issued;
-            match recovery.run(&run.progress, wait) {
-                Ok(Resolution::Interrupted { leftover_incoming }) => Err(PublishFailure {
+            match recovery.run(&run.progress, wait, &mut *run.sink) {
+                Ok(Resolution::Interrupted {
+                    leftover_incoming,
+                    leftover_incoming_id,
+                }) => Err(PublishFailure {
                     error,
                     blocked: None,
                     leftover_incoming,
+                    leftover_incoming_id,
                 }),
                 Ok(Resolution::Published(mut published)) => {
                     published.existing_files = run.existing_files;

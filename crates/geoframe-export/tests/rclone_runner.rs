@@ -294,3 +294,36 @@ fn stderr_lines_with_tokens_are_masked_in_the_log_and_never_reach_the_error() {
         }
     }
 }
+
+#[test]
+fn a_very_long_stderr_line_that_starts_with_a_bearer_token_is_masked_as_a_whole() {
+    // 末尾の 64KiB だけを先に切り出して検査すると、先頭の `Bearer` が切れて、残り（資格情報の本体）が出る
+    let env = Env::new("redact-long");
+    let body = "LONGSECRETBODY".repeat(20_000); // 約 280KB の 1 行
+    let stderr = format!("Authorization: Bearer {body}\nlong-case tail marker line");
+    env.add_rule(
+        "lsjson",
+        0,
+        1,
+        json!({"kind": "fail", "code": 1, "stderr": stderr}),
+    );
+    capture_logs();
+    let layout = env.layout(Destination::Yamareco, FOLDER, JOB_A);
+    let _ = geoframe_export::drive::Drive::new(&env.rclone(), &layout)
+        .target()
+        .unwrap_err();
+    let all = LOGS.lock().unwrap().clone();
+    let ours: Vec<&String> = all
+        .iter()
+        .filter(|l| l.contains("long-case tail marker line"))
+        .collect();
+    assert_eq!(ours.len(), 1, "{}", all.len());
+    assert!(ours[0].contains("[伏せ字]"), "{}", ours[0]);
+    for line in &all {
+        assert!(
+            !line.contains("LONGSECRET"),
+            "{}",
+            &line[..line.len().min(200)]
+        );
+    }
+}

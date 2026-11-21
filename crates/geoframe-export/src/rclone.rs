@@ -17,6 +17,7 @@
 //! - 標準エラーは、`token`・`Bearer`・`access_token` などを含む行を伏せ字にしてから、最後の数行だけをログ（tracing）に残す
 //!   （[`redact_stderr`]）。API の結果・エラーの説明には rclone の出力を載せない（[`ExportError`] の説明は固定の文字列）。
 
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
@@ -39,14 +40,17 @@ pub const ENV_KEYS: [&str; 3] = ["PATH", "HOME", "XDG_CACHE_HOME"];
 pub const STDOUT_MAX_BYTES: usize = 32 * 1024 * 1024;
 /// 一覧の項目数の上限。
 pub const LSJSON_MAX_ENTRIES: usize = 20_000;
-/// 標準エラーのうち、読み残す末尾のバイト数。
-const STDERR_KEEP_BYTES: usize = 64 * 1024;
+/// 標準エラーの 1 行のうち、読み取って機微な語を調べるバイト数の上限。超えた行は、中身を見ずにまるごと伏せ字にする。
+const STDERR_LINE_CAP_BYTES: usize = 64 * 1024;
 /// ログに残す標準エラーの行数（末尾から）。
 pub const STDERR_LOG_LINES: usize = 5;
 const STDERR_LINE_MAX_CHARS: usize = 300;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// Drive のショートカットの MIME タイプ。
 pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
+/// リンク先が無くなったショートカットに、rclone が付ける MIME タイプ（rclone の drive の `shortcutMimeTypeDangling`。
+/// ふつうのファイルのように一覧に出る。ID はショートカット自身の ID）。
+pub const SHORTCUT_DANGLING_MIME: &str = "application/vnd.google-apps.shortcut.dangling";
 /// rclone の `lsjson` がフォルダに付ける MIME タイプ。
 pub const DIRECTORY_MIME: &str = "inode/directory";
 /// rclone の終了コード 3（ディレクトリが無い）。
@@ -96,13 +100,19 @@ pub struct LsEntry {
     pub size: i64,
     pub mime: String,
     pub is_dir: bool,
-    /// Drive の ID。
+    /// Drive の ID。解決されたショートカットでは、**リンク先**の ID（rclone の複合 ID の前半）。
     pub id: String,
+    /// 解決されたショートカットの、ショートカット自身の ID（rclone は解決した項目の ID を、リンク先の ID とショートカットの ID を
+    /// タブで結んだ複合 ID にする。後半）。通常の項目では `None`。
+    pub shortcut_id: Option<String>,
 }
 
 impl LsEntry {
+    /// ショートカットか: MIME タイプがショートカット（リンク切れを含む）、または複合 ID（解決されたショートカット）。
     pub fn is_shortcut(&self) -> bool {
-        self.mime == SHORTCUT_MIME
+        self.shortcut_id.is_some()
+            || self.mime == SHORTCUT_MIME
+            || self.mime == SHORTCUT_DANGLING_MIME
     }
 }
 
@@ -120,10 +130,23 @@ fn rel_path_ok(p: &str) -> bool {
             .all(|c| !c.is_empty() && c != "." && c != ".." && !c.chars().any(char::is_control))
 }
 
+/// rclone の複合 ID（リンク先の ID とショートカットの ID をタブで結んだもの。drive.go の `joinID`）を分ける。
+/// どちらの部分も [`is_valid_drive_id`] に合わなければ `None`。タブを含まなければ、そのまま通常の ID。
+fn split_composite_id(id: &str) -> Option<(String, Option<String>)> {
+    match id.split_once('\t') {
+        None => is_valid_drive_id(id).then(|| (id.to_owned(), None)),
+        Some((actual, shortcut)) => (is_valid_drive_id(actual) && is_valid_drive_id(shortcut))
+            .then(|| (actual.to_owned(), Some(shortcut.to_owned()))),
+    }
+}
+
 /// `lsjson` の出力を読む。形が違えば `None`（呼び出し側は `drive_unavailable` などの失敗にする）。
 ///
-/// 形: 配列。各項目は `Path`(文字列)・`Name`(文字列、`Path` の最後の部品)・`Size`(整数、フォルダは -1)・
-/// `MimeType`(文字列。フォルダは `inode/directory`)・`IsDir`(真偽)・`ID`(文字列、空でない)。`ModTime` は読まない。
+/// 形: 配列。各項目は `Path`(文字列)・`Name`(文字列、`Path` の最後の部品)・`Size`(整数、フォルダは -1。**ファイルも -1 になりうる**:
+/// `--drive-show-all-gdocs` で出るネイティブの Google 文書など、サイズが分からないもの)・
+/// `MimeType`(文字列。フォルダは `inode/directory`)・`IsDir`(真偽)・`ID`(文字列、空でない。解決されたショートカットは複合 ID)。
+/// `ModTime` は読まない。サイズ不明（負）のファイルは受け付け、中身の照合（[`crate::drive::Expected::matches`]）が
+/// 「一式に無いファイル」として扱う。
 pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
     let items = value.as_array()?;
@@ -136,14 +159,13 @@ pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
         let path = o.get("Path")?.as_str()?;
         let name = o.get("Name")?.as_str()?;
         let mime = o.get("MimeType")?.as_str()?;
-        let id = o.get("ID")?.as_str()?;
+        let raw_id = o.get("ID")?.as_str()?;
         let size = o.get("Size")?.as_i64()?;
         let is_dir = o.get("IsDir")?.as_bool()?;
+        let (id, shortcut_id) = split_composite_id(raw_id)?;
         if !rel_path_ok(path)
             || path.rsplit('/').next() != Some(name)
-            || !is_valid_drive_id(id)
             || is_dir != (mime == DIRECTORY_MIME)
-            || (!is_dir && size < 0)
         {
             return None;
         }
@@ -153,7 +175,8 @@ pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
             size,
             mime: mime.to_owned(),
             is_dir,
-            id: id.to_owned(),
+            id,
+            shortcut_id,
         });
     }
     Some(out)
@@ -171,27 +194,98 @@ const SENSITIVE_MARKERS: [&str; 6] = [
     "client_id",
 ];
 
+/// 標準エラーを**読みながら**行ごとに伏せ字にして、最後の数行だけを残す。
+///
+/// 先に末尾のバイト列だけを切り出してから検査すると、長い行の先頭にある `Bearer` などが切れて、残りの部分（資格情報の本体）が
+/// 伏せ字にならずに出てしまう。そこで、行の終わり（`\n`）が来るたびに、**その行の全体**を調べてから残す。1 行が
+/// [`STDERR_LINE_CAP_BYTES`] を超えたら、先頭だけを持って、その行はまるごと伏せ字にする（持っていない部分に何があるか分からないため）。
+/// どんなバイト列の区切りで [`StderrTail::push`] に渡しても、結果は同じ。
+struct StderrTail {
+    keep: usize,
+    lines: VecDeque<String>,
+    current: Vec<u8>,
+    overflowed: bool,
+}
+
+impl StderrTail {
+    fn new(keep: usize) -> Self {
+        Self {
+            keep,
+            lines: VecDeque::new(),
+            current: Vec::new(),
+            overflowed: false,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        for chunk in bytes.split_inclusive(|b| *b == b'\n') {
+            let (body, ended) = match chunk.split_last() {
+                Some((b'\n', rest)) => (rest, true),
+                _ => (chunk, false),
+            };
+            let room = STDERR_LINE_CAP_BYTES.saturating_sub(self.current.len());
+            if body.len() > room {
+                self.overflowed = true;
+            }
+            self.current
+                .extend_from_slice(&body[..body.len().min(room)]);
+            if ended {
+                self.end_line();
+            }
+        }
+    }
+
+    fn end_line(&mut self) {
+        let bytes = std::mem::take(&mut self.current);
+        let overflowed = std::mem::take(&mut self.overflowed);
+        let Some(line) = redact_line(&bytes, overflowed) else {
+            return;
+        };
+        self.lines.push_back(line);
+        while self.lines.len() > self.keep {
+            self.lines.pop_front();
+        }
+    }
+
+    /// 最後の行（改行で終わっていないもの）も含めて、` / ` でつなぐ。
+    fn finish(mut self) -> String {
+        if !self.current.is_empty() || self.overflowed {
+            self.end_line();
+        }
+        self.lines.into_iter().collect::<Vec<_>>().join(" / ")
+    }
+}
+
+/// 1 行を、ログに残せる形にする。空の行は `None`。
+fn redact_line(bytes: &[u8], overflowed: bool) -> Option<String> {
+    if overflowed {
+        return Some(REDACTED.to_owned());
+    }
+    let text = String::from_utf8_lossy(bytes);
+    let line = text.trim_end_matches('\r');
+    if line.trim().is_empty() {
+        return None;
+    }
+    let lower = line.to_lowercase();
+    Some(if SENSITIVE_MARKERS.iter().any(|m| lower.contains(m)) {
+        REDACTED.to_owned()
+    } else {
+        line.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(STDERR_LINE_MAX_CHARS)
+            .collect()
+    })
+}
+
+const REDACTED: &str = "[伏せ字]";
+
 /// 標準エラーを、ログに残せる形にする: 行ごとに、機微な語（`token`・`Bearer`・`access_token` ほか。大文字小文字を問わない）を
 /// 含む行を伏せ字にし、制御文字を空白にし、長い行を切り、最後の `max_lines` 行だけを ` / ` でつなぐ。
+/// 子プロセスの出力は、読みながら同じ処理をする（`StderrTail`）。
 pub fn redact_stderr(raw: &[u8], max_lines: usize) -> String {
-    let text = String::from_utf8_lossy(raw);
-    let lines: Vec<String> = text
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| {
-            let lower = l.to_lowercase();
-            if SENSITIVE_MARKERS.iter().any(|m| lower.contains(m)) {
-                "[伏せ字]".to_owned()
-            } else {
-                l.chars()
-                    .map(|c| if c.is_control() { ' ' } else { c })
-                    .take(STDERR_LINE_MAX_CHARS)
-                    .collect()
-            }
-        })
-        .collect();
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].join(" / ")
+    let mut tail = StderrTail::new(max_lines);
+    tail.push(raw);
+    tail.finish()
 }
 
 // ---- 子プロセスの結果 ----
@@ -366,7 +460,21 @@ impl Rclone {
         recursive: bool,
         skip_shortcuts: bool,
     ) -> Vec<OsString> {
-        let mut a = self.common_args("lsjson", skip_shortcuts);
+        // 設定ファイルに `skip_shortcuts`・`skip_gdocs` があっても結果が変わらないよう、毎回どちらも明示する。
+        // ショートカットを除かない一覧は `=false`（設定ファイルで省略が有効でも、解決されたショートカットが一覧に出る）。
+        // `--drive-show-all-gdocs` は、エクスポートできない Google のファイル（フォーム等）も一覧に出す
+        // （付けないと、宛先と同じ名前のフォームが「無い」ように見える）。そうしたファイルとネイティブ文書は `Size: -1`。
+        let mut a = self.common_args("lsjson", false);
+        a.push(
+            if skip_shortcuts {
+                "--drive-skip-shortcuts"
+            } else {
+                "--drive-skip-shortcuts=false"
+            }
+            .into(),
+        );
+        a.push("--drive-skip-gdocs=false".into());
+        a.push("--drive-show-all-gdocs".into());
         if recursive {
             a.push("-R".into());
         }
@@ -564,7 +672,7 @@ impl Rclone {
         let (stdout_bytes, truncated) = stdout
             .and_then(|h| h.join().ok())
             .unwrap_or_else(|| (Vec::new(), false));
-        let stderr_bytes = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+        let stderr_text = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
 
         let result = match status {
             Some(status) if status.success() => {
@@ -590,7 +698,7 @@ impl Rclone {
             tracing::warn!(
                 command = sub,
                 failure = ?e,
-                stderr = %redact_stderr(&stderr_bytes, STDERR_LOG_LINES),
+                stderr = %stderr_text,
                 "rclone が失敗しました"
             );
         }
@@ -621,24 +729,18 @@ fn read_head<R: Read + Send + 'static>(mut r: R, cap: usize) -> JoinHandle<(Vec<
     })
 }
 
-/// 末尾の [`STDERR_KEEP_BYTES`] バイトだけを残して読み続ける。
-fn read_tail<R: Read + Send + 'static>(mut r: R) -> JoinHandle<Vec<u8>> {
+/// 読み続けて（パイプを詰まらせない）、行ごとに伏せ字にした最後の [`STDERR_LOG_LINES`] 行を返す（[`StderrTail`]）。
+fn read_tail<R: Read + Send + 'static>(mut r: R) -> JoinHandle<String> {
     std::thread::spawn(move || {
-        let mut out: Vec<u8> = Vec::new();
+        let mut tail = StderrTail::new(STDERR_LOG_LINES);
         let mut buf = [0u8; 16 * 1024];
         while let Ok(n) = r.read(&mut buf) {
             if n == 0 {
                 break;
             }
-            out.extend_from_slice(&buf[..n]);
-            if out.len() > STDERR_KEEP_BYTES * 2 {
-                out.drain(..out.len() - STDERR_KEEP_BYTES);
-            }
+            tail.push(&buf[..n]);
         }
-        if out.len() > STDERR_KEEP_BYTES {
-            out.drain(..out.len() - STDERR_KEEP_BYTES);
-        }
-        out
+        tail.finish()
     })
 }
 
@@ -732,7 +834,8 @@ mod tests {
         let r = Rclone::new(&settings());
         let l = loc("gdrive:p/q");
         let has = |a: &[OsString], f: &str| strs(a).contains(&f);
-        // Drive の操作には --drive-skip-shortcuts（ショートカットも見たい照会だけは付けない）
+        // Drive の操作には --drive-skip-shortcuts。ショートカットも見たい照会だけは `=false` を明示する（設定ファイルで
+        // skip_shortcuts が有効でも、解決されたショートカットが一覧に出る）
         assert!(has(
             &r.lsjson_args(&l, false, true),
             "--drive-skip-shortcuts"
@@ -741,6 +844,23 @@ mod tests {
             &r.lsjson_args(&l, false, false),
             "--drive-skip-shortcuts"
         ));
+        assert!(has(
+            &r.lsjson_args(&l, false, false),
+            "--drive-skip-shortcuts=false"
+        ));
+        assert!(!has(
+            &r.lsjson_args(&l, false, true),
+            "--drive-skip-shortcuts=false"
+        ));
+        // 一覧は毎回、エクスポートできない Google のファイルも出し、gdocs を除く設定を打ち消す
+        for skip in [true, false] {
+            for recursive in [true, false] {
+                let a = r.lsjson_args(&l, recursive, skip);
+                assert!(has(&a, "--drive-show-all-gdocs"));
+                assert!(has(&a, "--drive-skip-gdocs=false"));
+            }
+        }
+        assert!(!has(&r.mkdir_args(&l), "--drive-show-all-gdocs"));
         for a in [
             r.cat_args(&l, 1),
             r.mkdir_args(&l),
@@ -847,6 +967,49 @@ mod tests {
         assert_eq!(redact_stderr(b"", 3), "");
     }
 
+    #[test]
+    fn a_long_line_is_redacted_as_a_whole_before_the_tail_is_kept() {
+        // 先頭に Bearer がある、とても長い行（末尾だけを先に切り出す作りだと、先頭が落ちて残りが出る）
+        let secret = "SECRETSECRETSECRET";
+        let mut raw = format!("Authorization: Bearer {secret}").into_bytes();
+        raw.extend(std::iter::repeat_n(b'x', 3 * STDERR_LINE_CAP_BYTES));
+        raw.extend_from_slice(secret.as_bytes());
+        raw.extend_from_slice(b"\nERROR : plain tail\n");
+        let out = redact_stderr(&raw, 5);
+        assert!(
+            !out.contains(secret) && !out.contains("xxxx"),
+            "{}",
+            &out[..out.len().min(200)]
+        );
+        assert_eq!(out, "[伏せ字] / ERROR : plain tail");
+        // 長いが機微な語を含まない行も、中身を見ずに伏せ字にする（持っていない部分に何があるか分からない）
+        let mut raw = vec![b'y'; 2 * STDERR_LINE_CAP_BYTES];
+        raw.extend_from_slice(b"\nok\n");
+        assert_eq!(redact_stderr(&raw, 5), "[伏せ字] / ok");
+        // 区切りの位置が変わっても同じ結果（1 バイトずつ・不揃いに渡す）
+        let text = b"one\r\nERROR : token=abc\n\nBearer zzz tail\nlast line without newline";
+        let whole = redact_stderr(text, 10);
+        for step in [1usize, 2, 3, 7] {
+            let mut t = StderrTail::new(10);
+            for c in text.chunks(step) {
+                t.push(c);
+            }
+            assert_eq!(t.finish(), whole, "step={step}");
+        }
+        assert_eq!(
+            whole,
+            "one / [伏せ字] / [伏せ字] / last line without newline"
+        );
+        assert!(!whole.contains("abc") && !whole.contains("zzz"));
+        // 最後の数行だけを残す
+        let many: String = (0..100).map(|i| format!("l{i}\n")).collect();
+        let mut t = StderrTail::new(3);
+        for c in many.as_bytes().chunks(5) {
+            t.push(c);
+        }
+        assert_eq!(t.finish(), "l97 / l98 / l99");
+    }
+
     fn entry(path: &str, id: &str, dir: bool) -> serde_json::Value {
         json!({
             "Path": path,
@@ -896,13 +1059,43 @@ mod tests {
             // IsDir と MimeType が食い違う、ファイルの Size が負
             json!([{"Path":"a","Name":"a","Size":-1,"MimeType":"inode/directory","IsDir":false,"ID":"i"}]),
             json!([{"Path":"a","Name":"a","Size":-1,"MimeType":"x/y","IsDir":true,"ID":"i"}]),
-            json!([{"Path":"a","Name":"a","Size":-1,"MimeType":"x/y","IsDir":false,"ID":"i"}]),
+            // 複合 ID の形（どちらかが空・3 つ・形が違う）
+            json!([entry("a", "i\t", false)]),
+            json!([entry("a", "\ti", false)]),
+            json!([entry("a", "i\tj\tk", false)]),
+            json!([entry("a", "i\tb d", false)]),
         ];
         for bad in bad_cases {
             assert!(parse_lsjson(bad.to_string().as_bytes()).is_none(), "{bad}");
         }
         assert!(parse_lsjson(b"not json").is_none());
         assert!(parse_lsjson(b"").is_none());
+    }
+
+    #[test]
+    fn unknown_sizes_and_composite_ids_are_read_without_rejecting_the_whole_listing() {
+        // ネイティブの Google 文書・エクスポートできないファイル（--drive-show-all-gdocs）: ファイルで Size が -1
+        let doc = json!({"Path":"memo","Name":"memo","Size":-1,"MimeType":"application/vnd.google-apps.document","IsDir":false,"ID":"idD"});
+        // 解決されたショートカット: リンク先の ID とショートカットの ID をタブで結んだ複合 ID
+        let resolved_dir = json!({"Path":"link","Name":"link","Size":-1,"MimeType":"inode/directory","IsDir":true,"ID":"idT\tidS"});
+        let resolved_file = json!({"Path":"pic","Name":"pic","Size":5,"MimeType":"image/jpeg","IsDir":false,"ID":"idT2\tidS2"});
+        // リンク切れ: MIME タイプが .dangling、ID はショートカット自身
+        let dangling = json!({"Path":"gone","Name":"gone","Size":0,"MimeType":"application/vnd.google-apps.shortcut.dangling","IsDir":false,"ID":"idG"});
+        let plain = entry("a.jpg", "idP", false);
+        let all = json!([doc, resolved_dir, resolved_file, dangling, plain]);
+        let got = parse_lsjson(all.to_string().as_bytes()).expect("全体を断らない");
+        assert_eq!(got.len(), 5);
+        assert_eq!((got[0].size, got[0].is_shortcut()), (-1, false));
+        assert_eq!(got[1].id, "idT");
+        assert_eq!(got[1].shortcut_id.as_deref(), Some("idS"));
+        assert!(got[1].is_shortcut() && got[1].is_dir);
+        assert!(got[2].is_shortcut());
+        assert_eq!(got[3].shortcut_id, None);
+        assert!(
+            got[3].is_shortcut(),
+            "リンク切れも、ショートカットとして数える"
+        );
+        assert!(!got[4].is_shortcut() && got[4].shortcut_id.is_none());
     }
 
     #[test]
@@ -924,8 +1117,26 @@ mod tests {
             mime: SHORTCUT_MIME.into(),
             is_dir: false,
             id: "i".into(),
+            shortcut_id: None,
         };
         assert!(e.is_shortcut());
+        let resolved = LsEntry {
+            mime: "image/jpeg".into(),
+            shortcut_id: Some("j".into()),
+            ..e.clone()
+        };
+        assert!(resolved.is_shortcut());
+        let dangling = LsEntry {
+            mime: SHORTCUT_DANGLING_MIME.into(),
+            ..resolved.clone()
+        };
+        assert!(dangling.is_shortcut());
+        let plain = LsEntry {
+            mime: "image/jpeg".into(),
+            shortcut_id: None,
+            ..e
+        };
+        assert!(!plain.is_shortcut());
     }
 
     #[test]

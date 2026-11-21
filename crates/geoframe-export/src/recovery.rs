@@ -20,18 +20,21 @@
 //! ### 設計の表に文字どおりには無く、この関数が決めている行（報告で確かめてもらう）
 //!
 //! - `trashing` で、宛先が新しい一式で、`replaced/` が空 → ゴミ箱への移動は済んでいる（応答が失われた）。公開済みとして終える。
-//! - 新規（旧フォルダ無し）の `publishing` で、宛先がまだ無く `incoming` が残っている → 前のまま（`incoming` を消して
-//!   `interrupted`）。移動が実行されなかった（rclone の失敗で止まった）通常の失敗が、`blocked` にならないようにするため。
-//! - `uploading` で、`incoming/<job_id>` はあるが ID を記録する前に止まった → ジョブ ID は乱数で自分しか使わない名前なので、
-//!   名前で見つけたものを `incoming` として扱い、消す（記録した ID が無いときだけ）。
-//! - 置き換えの `publishing` で、宛先が旧フォルダのまま・`replaced/` が空 → 前のまま（退避は実行されていない）。
+//! - 新規（旧フォルダ無し）の `publishing` で、宛先がまだ無く、記録した ID の `incoming` が残っている → 前のまま（`incoming` を
+//!   消して `interrupted`）。移動が実行されなかった（rclone の失敗で止まった）通常の失敗が、`blocked` にならないようにするため。
+//!   `incoming` も消えていて宛先も空なら、あるはずのものが無いので `blocked`。
+//! - 置き換えの `publishing` で、旧 ID のフォルダが宛先にある → `blocked`。`publishing` に進めるのは退避の照合に通ったあとなので、
+//!   旧フォルダが宛先に戻っているのは、誰かが動かした状態（旧フォルダは宛先にあるのに退避先も空、という形も含む）。
+//! - `uploading` で、`incoming/<job_id>` はあるが ID を記録する前に止まった → **名前だけでは消さない**。名前で見つけたフォルダは
+//!   [`Action::KeepUnrecordedIncoming`]（消さずに残りものとして知らせ、`interrupted` で終える。宛先は前のままなので `blocked` にはしない）。
+//!   `incoming/<job_id>` のゴミ箱への移動は、記録した ID と一致するフォルダ 1 つだけのときにする。
 //!
 //! 起動時（T5）にも、各ジョブの途中の失敗（[`crate::publish`]）にも、同じこの関数を使う（一方が `blocked` にする状態を、
 //! もう一方が進めることがないように）。
 
 use std::fmt;
 
-use crate::rclone::{LsEntry, SHORTCUT_MIME};
+use crate::rclone::LsEntry;
 
 /// 公開の手順の段階（ジョブの記録に書く名前）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,7 +104,7 @@ impl Seen {
     pub fn of(e: &LsEntry) -> Self {
         Self {
             id: e.id.clone(),
-            kind: if e.mime == SHORTCUT_MIME {
+            kind: if e.is_shortcut() {
                 Kind::Shortcut
             } else if e.is_dir {
                 Kind::Dir
@@ -168,8 +171,12 @@ pub enum BlockedReason {
     PublishMismatch,
     /// 前へ進める・公開済みと見る前の、宛先の中身の照合が合わない（manifest と一致しない）。
     ContentMismatch,
-    /// ゴミ箱へ移す前の照合が合わない（`replaced/` の項目が記録した旧フォルダの ID と違う）。
+    /// ゴミ箱へ移す前の照合が合わない（`replaced/` の項目が記録した旧フォルダの ID と違う、または確かめられない）。
     TrashMismatch,
+    /// ゴミ箱へ移す前の、退避した旧フォルダの中身の照合が合わない（旧 manifest の一式と違う。停止中に足された・変えられた）。
+    RetiredContentChanged,
+    /// 復旧の途中で、段階をジョブの記録に書けなかった（その段階の Drive の操作はしていない）。
+    RecordFailed,
 }
 
 impl BlockedReason {
@@ -185,6 +192,8 @@ impl BlockedReason {
             Self::PublishMismatch => "publish_mismatch",
             Self::ContentMismatch => "content_mismatch",
             Self::TrashMismatch => "trash_mismatch",
+            Self::RetiredContentChanged => "retired_content_changed",
+            Self::RecordFailed => "record_failed",
         }
     }
 
@@ -204,7 +213,13 @@ impl BlockedReason {
             Self::PublishMismatch => "公開（incoming の移動）のあとの照合が合いません",
             Self::ContentMismatch => "宛先の中身が manifest と一致しません",
             Self::TrashMismatch => {
-                "ゴミ箱へ移す前の照合が合いません（replaced/ の項目が記録した旧フォルダと違います）"
+                "ゴミ箱へ移す前の照合が合いません（replaced/ の項目が記録した旧フォルダと違う、または確かめられません）"
+            }
+            Self::RetiredContentChanged => {
+                "退避した旧フォルダの中身が、旧 manifest の一式と違います（ゴミ箱へは移していません）"
+            }
+            Self::RecordFailed => {
+                "復旧の途中で、段階をジョブの記録に書けませんでした（その段階の Drive の操作はしていません）"
             }
         }
     }
@@ -213,9 +228,12 @@ impl BlockedReason {
 /// 次の動き。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// `incoming`（あれば。ID は観察した値）を消して、ジョブを `interrupted`（実行中の失敗なら、その失敗）で終える。
-    /// 宛先は前のまま。
+    /// `incoming`（あれば。ID は、記録した ID と一致した観察の値）を消して、ジョブを `interrupted`（実行中の失敗なら、その失敗）
+    /// で終える。宛先は前のまま。
     Abort { remove_incoming: Option<String> },
+    /// 宛先は前のままだが、`incoming/<job_id>` に、ID を記録する前に止まったフォルダがある。**名前だけでは消さず**、残りものとして
+    /// 知らせて `interrupted` で終える（オーナーが確かめて消す）。
+    KeepUnrecordedIncoming { incoming_id: String },
     /// 置き換えを前へ進める: `incoming` を宛先へ移し、移動を照合し、旧フォルダをゴミ箱へ移す。
     RollForward { incoming_id: String, old_id: String },
     /// 公開済み。公開の記録に足し、`trash_old` があれば旧フォルダのゴミ箱への移動を続ける。
@@ -296,14 +314,31 @@ pub fn decide(p: &Progress, o: &Observed) -> Decision {
         if !o.replaced.is_empty() {
             return blocked(BlockedReason::ReplacedUnexpected);
         }
-        return match incoming_ok {
-            Some(id) => Decision {
-                row: Some(Row::BeforeChange),
-                action: Action::Abort {
-                    remove_incoming: id.map(str::to_owned),
-                },
+        // 置き換えの publishing に進めるのは、退避の照合に通ったあと。旧 ID が宛先に戻っているのは誰かが動かした状態
+        if old.is_some() && p.stage == Stage::Publishing {
+            return blocked(BlockedReason::StageInconsistent);
+        }
+        // 新規の publishing: incoming も宛先も無いのは、あるはずのものが無い状態
+        if old.is_none() && p.stage == Stage::Publishing && o.incoming.is_empty() {
+            return blocked(BlockedReason::StageInconsistent);
+        }
+        let action = match (incoming_ok, inc) {
+            (None, _) => return blocked(BlockedReason::IncomingUnexpected),
+            (Some(None), _) => Action::Abort {
+                remove_incoming: None,
             },
-            None => blocked(BlockedReason::IncomingUnexpected),
+            // 記録した ID と一致した（`incoming_ok` が確かめ済み）
+            (Some(Some(id)), Some(_)) => Action::Abort {
+                remove_incoming: Some(id.to_owned()),
+            },
+            // ID を記録する前に止まった。名前だけでは消さない
+            (Some(Some(id)), None) => Action::KeepUnrecordedIncoming {
+                incoming_id: id.to_owned(),
+            },
+        };
+        return Decision {
+            row: Some(Row::BeforeChange),
+            action,
         };
     }
 
@@ -373,6 +408,10 @@ impl Decision {
                     "宛先は前のままで、消すものはありません。interrupted で終えます。".to_owned()
                 }
             },
+            Action::KeepUnrecordedIncoming { incoming_id } => format!(
+                "宛先は前のままです。incoming（ID {incoming_id}）は、ジョブの記録に ID が無いので名前だけでは消しません（残りものとして知らせます）。\
+                 オーナーが Drive の画面で確かめて消してください。interrupted で終えます。"
+            ),
             Action::RollForward {
                 incoming_id,
                 old_id,
@@ -495,6 +534,13 @@ mod tests {
         // 前のまま: 新規は宛先が無い、置き換えは旧フォルダだけ。replaced は空。incoming は無い・記録どおり
         let unchanged = if replace { d == D::Old } else { d == D::Empty };
         if unchanged && stage != Trashing && r == R::Empty {
+            // 置き換えの publishing: 旧 ID が宛先に戻っている → blocked。新規の publishing で incoming も無い → blocked
+            if replace && stage == Publishing {
+                return None;
+            }
+            if !replace && stage == Publishing && i == I::Gone {
+                return None;
+            }
             return match i {
                 I::Gone => Some(Expect::Abort(false)),
                 I::Intact => Some(Expect::Abort(true)),
@@ -594,9 +640,10 @@ mod tests {
                 }
             }
         }
-        // 新規 4 段階×2（incoming 無し・あり）＋置き換え 4×2、進める 2、公開済み 2+3
-        // （16 + 2 + 5 = 23。上の `expected` と数が合うこと）
-        assert_eq!(non_blocked, 23);
+        // 前のまま: 新規 4 段階（uploading・verifying・retiring・publishing）×incoming 無し/あり ＋ 置き換え 3 段階
+        // （publishing を除く）×2 から、新規 publishing で incoming 無し（blocked）を除く 7 ＋ 6 = 13、
+        // 進める 2、公開済み 2+3（13 + 2 + 5 = 20。上の `expected` と数が合うこと）
+        assert_eq!(non_blocked, 20);
     }
 
     // ---- 設計の表の各行（名前を付けて確かめる） ----
@@ -738,7 +785,27 @@ mod tests {
                 remove_incoming: Some(INC.into())
             }
         );
-        // uploading: ID を記録する前に止まった（記録に incoming の ID が無い）。名前で見つけたものを消す
+        // 新規の publishing: incoming も消えていて宛先も空 → あるはずのものが無いので blocked
+        assert!(matches!(
+            decide(
+                &progress(Stage::Publishing, false),
+                &observed(D::Empty, I::Gone, R::Empty)
+            )
+            .action,
+            Action::Blocked(BlockedReason::StageInconsistent)
+        ));
+        // 置き換えの publishing: 旧 ID のフォルダが宛先に戻っている（退避先は空、incoming は残っている）→ blocked
+        for i in [I::Gone, I::Intact] {
+            assert!(matches!(
+                decide(
+                    &progress(Stage::Publishing, true),
+                    &observed(D::Old, i, R::Empty)
+                )
+                .action,
+                Action::Blocked(BlockedReason::StageInconsistent)
+            ));
+        }
+        // uploading: ID を記録する前に止まった（記録に incoming の ID が無い）。名前で見つけたものは、名前だけでは消さない
         let p = Progress {
             stage: Stage::Uploading,
             old_id: None,
@@ -748,11 +815,18 @@ mod tests {
             incoming: vec![dir("fidNEW")],
             ..Observed::default()
         };
+        let got = decide(&p, &o);
         assert_eq!(
-            decide(&p, &o).action,
-            Action::Abort {
-                remove_incoming: Some("fidNEW".into())
+            got.action,
+            Action::KeepUnrecordedIncoming {
+                incoming_id: "fidNEW".into()
             }
+        );
+        assert_eq!(got.row, Some(Row::BeforeChange));
+        let text = got.describe(&p, &o);
+        assert!(
+            text.contains("fidNEW") && text.contains("消しません"),
+            "{text}"
         );
         // 何も作っていない
         assert_eq!(

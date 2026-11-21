@@ -101,6 +101,14 @@ impl World {
     }
 }
 
+/// 片付けて終えた（残りものは無い）。
+fn interrupted() -> Resolution {
+    Resolution::Interrupted {
+        leftover_incoming: false,
+        leftover_incoming_id: None,
+    }
+}
+
 fn progress(stage: Stage, old: Option<&str>, incoming: Option<&str>) -> Progress {
     Progress {
         stage,
@@ -119,15 +127,13 @@ fn uploading_and_verifying_with_an_untouched_destination_remove_incoming_and_int
             let r = w.env.rclone();
             let res = w
                 .recovery(&r, None)
-                .run(&progress(stage, old.as_deref(), Some(&inc)), false)
+                .run(
+                    &progress(stage, old.as_deref(), Some(&inc)),
+                    false,
+                    &mut Hook::new(&w.env),
+                )
                 .unwrap();
-            assert_eq!(
-                res,
-                Resolution::Interrupted {
-                    leftover_incoming: false
-                },
-                "{stage} {replace}"
-            );
+            assert_eq!(res, interrupted(), "{stage} {replace}");
             assert!(!w.incoming_exists());
             assert_eq!(w.dest(), old, "宛先は前のまま");
             assert_eq!(w.env.drive().trashed, [inc], "incoming はゴミ箱へ");
@@ -137,35 +143,80 @@ fn uploading_and_verifying_with_an_untouched_destination_remove_incoming_and_int
 }
 
 #[test]
-fn an_interrupted_upload_that_never_recorded_the_incoming_id_is_cleaned_by_name() {
+fn an_interrupted_upload_that_never_recorded_the_incoming_id_is_not_deleted_by_name() {
+    // ID を記録する前に止まった: 名前だけでは消さず、残りものとして知らせる（宛先は変わっていないので blocked にはしない）
     let w = world("row1-noid");
     let inc = w.put_incoming();
     let r = w.env.rclone();
     let res = w
         .recovery(&r, None)
-        .run(&progress(Stage::Uploading, None, None), false)
+        .run(
+            &progress(Stage::Uploading, None, None),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap();
     assert_eq!(
         res,
         Resolution::Interrupted {
-            leftover_incoming: false
+            leftover_incoming: true,
+            leftover_incoming_id: Some(inc.clone()),
         }
     );
-    assert_eq!(w.env.drive().trashed, [inc]);
+    assert!(w.incoming_exists(), "消していない");
+    assert!(w.env.drive().trashed.is_empty() && w.env.drive().deleted.is_empty());
+    assert!(w.env.mutations().is_empty());
+    // 結果と recover の表示に出す
+    let text = geoframe_export::publish::leftover_incoming_text(&w.layout, Some(&inc));
+    assert!(
+        text.contains(&inc) && text.contains(w.layout.incoming_path()),
+        "{text}"
+    );
+    let (decision, _, shown) = w
+        .recovery(&r, None)
+        .explain(&progress(Stage::Uploading, None, None))
+        .unwrap();
+    assert!(matches!(
+        decision.action,
+        Action::KeepUnrecordedIncoming { .. }
+    ));
+    assert!(
+        shown.contains(&inc) && shown.contains("消しません"),
+        "{shown}"
+    );
+
     // 何も作っていなかった
     let w = world("row1-nothing");
     let r = w.env.rclone();
     let res = w
         .recovery(&r, None)
-        .run(&progress(Stage::Uploading, None, None), false)
+        .run(
+            &progress(Stage::Uploading, None, None),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap();
-    assert_eq!(
-        res,
-        Resolution::Interrupted {
-            leftover_incoming: false
-        }
-    );
+    assert_eq!(res, interrupted());
     assert!(w.env.mutations().is_empty());
+}
+
+#[test]
+fn the_incoming_is_deleted_only_when_it_matches_the_recorded_id() {
+    // 記録した ID と、見えているフォルダの ID が違う → 消さずに blocked
+    let w = world("row1-id-differs");
+    let _inc = w.put_incoming();
+    let r = w.env.rclone();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Verifying, None, Some("fidSOMEONEELSE")),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::IncomingUnexpected);
+    assert!(w.env.mutations().is_empty());
+    assert!(w.incoming_exists());
 }
 
 #[test]
@@ -176,14 +227,13 @@ fn retiring_before_the_move_is_interrupted_and_anything_in_replaced_blocks() {
     let r = w.env.rclone();
     let res = w
         .recovery(&r, None)
-        .run(&progress(Stage::Retiring, Some(&old), Some(&inc)), false)
+        .run(
+            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap();
-    assert_eq!(
-        res,
-        Resolution::Interrupted {
-            leftover_incoming: false
-        }
-    );
+    assert_eq!(res, interrupted());
     assert_eq!(w.dest().as_deref(), Some(old.as_str()));
 
     // replaced/ に何かある（旧フォルダはまだ宛先にあるのに）→ blocked。何も消さない・動かさない
@@ -197,7 +247,11 @@ fn retiring_before_the_move_is_interrupted_and_anything_in_replaced_blocks() {
     let r = w.env.rclone();
     let info = w
         .recovery(&r, None)
-        .run(&progress(Stage::Retiring, Some(&old), Some(&inc)), false)
+        .run(
+            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::ReplacedUnexpected);
     assert!(w.env.mutations().is_empty());
@@ -214,7 +268,11 @@ fn a_retired_old_folder_with_a_verified_incoming_is_rolled_forward() {
         let r = w.env.rclone();
         let res = w
             .recovery(&r, None)
-            .run(&progress(stage, Some(&old), Some(&inc)), false)
+            .run(
+                &progress(stage, Some(&old), Some(&inc)),
+                false,
+                &mut Hook::new(&w.env),
+            )
             .unwrap();
         let Resolution::Published(p) = res else {
             panic!("{res:?}")
@@ -246,7 +304,11 @@ fn rolling_forward_refuses_an_incoming_that_no_longer_matches_its_manifest() {
     let r = w.env.rclone();
     let info = w
         .recovery(&r, None)
-        .run(&progress(Stage::Publishing, Some(&old), Some(&inc)), false)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::ContentMismatch);
     assert!(w.env.rclone_calls("moveto").is_empty());
@@ -267,7 +329,11 @@ fn publishing_with_the_new_set_at_the_destination_is_recorded_as_published() {
     let r = w.env.rclone();
     let res = w
         .recovery(&r, None)
-        .run(&progress(Stage::Publishing, None, Some(&inc)), false)
+        .run(
+            &progress(Stage::Publishing, None, Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap();
     let Resolution::Published(p) = res else {
         panic!("{res:?}")
@@ -288,7 +354,11 @@ fn publishing_with_the_new_set_at_the_destination_is_recorded_as_published() {
     let r = w.env.rclone();
     let res = w
         .recovery(&r, None)
-        .run(&progress(Stage::Publishing, Some(&old), Some(&inc)), false)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap();
     let Resolution::Published(p) = res else {
         panic!("{res:?}")
@@ -308,7 +378,11 @@ fn trashing_retries_while_the_old_folder_is_in_replaced_and_finishes_when_it_is_
     let r = w.env.rclone();
     let res = w
         .recovery(&r, None)
-        .run(&progress(Stage::Trashing, Some(&old), Some(&inc)), false)
+        .run(
+            &progress(Stage::Trashing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap();
     assert!(matches!(res, Resolution::Published(_)));
     assert_eq!(w.env.drive().trashed, std::slice::from_ref(&old));
@@ -327,7 +401,11 @@ fn trashing_retries_while_the_old_folder_is_in_replaced_and_finishes_when_it_is_
     let r = w.env.rclone();
     let res = w
         .recovery(&r, None)
-        .run(&progress(Stage::Trashing, Some(&old), Some(&inc)), false)
+        .run(
+            &progress(Stage::Trashing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap();
     assert!(matches!(res, Resolution::Published(_)));
     assert!(w.env.rclone_calls("purge").is_empty());
@@ -401,7 +479,10 @@ fn states_the_table_does_not_cover_block_without_touching_anything() {
         let p = setup(&w);
         let nodes = w.env.drive().nodes.len();
         let r = w.env.rclone();
-        let info = w.recovery(&r, None).run(&p, false).unwrap_err();
+        let info = w
+            .recovery(&r, None)
+            .run(&p, false, &mut Hook::new(&w.env))
+            .unwrap_err();
         assert_eq!(info.reason, reason, "{name}");
         assert_eq!(info.progress, p, "{name}");
         assert!(info.observed.is_some(), "{name}");
@@ -423,7 +504,11 @@ fn an_unlistable_drive_is_unobservable_and_blocks() {
     let r = w.env.rclone();
     let info = w
         .recovery(&r, None)
-        .run(&progress(Stage::Verifying, None, Some(&inc)), false)
+        .run(
+            &progress(Stage::Verifying, None, Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::Unobservable);
     assert_eq!(info.observed, None);
@@ -470,7 +555,11 @@ fn a_failed_move_during_recovery_blocks_instead_of_guessing() {
     let r = w.env.rclone();
     let info = w
         .recovery(&r, None)
-        .run(&progress(Stage::Publishing, Some(&old), Some(&inc)), false)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::ExecutionFailed);
     assert!(w.env.rclone_calls("purge").is_empty());
@@ -487,9 +576,333 @@ fn the_pending_lookup_works_with_the_local_set_too() {
     let r = w.env.rclone();
     let res = w
         .recovery(&r, Some(&expected))
-        .run(&progress(Stage::Retiring, Some(&old), Some(&inc)), false)
+        .run(
+            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
         .unwrap();
     assert!(matches!(res, Resolution::Published(_)));
-    assert!(!w.env.commands_used().contains(&"cat".to_owned()));
+    // 手元の一式で照合するので、incoming・宛先の manifest は読まない。読むのは、ゴミ箱へ移す前の、退避した旧フォルダの
+    // manifest（旧 manifest の一式と中身の照合）だけ
+    let cats = w.env.rclone_calls("cat");
+    assert_eq!(cats.len(), 1, "{cats:?}");
+    assert!(
+        cats[0].last().unwrap().contains("/replaced/"),
+        "{:?}",
+        cats[0]
+    );
     let _ = (ErrorCode::Blocked, model::ROOT);
+}
+
+// ---- 復旧にも段階の記録を掛ける（復旧の途中でまた止まっても、記録と Drive が食い違わない） ----
+
+/// 次に起動したときの復旧: 最後に記録できた段階から、新しい口で動かす。
+fn resume(
+    w: &World,
+    last: &Progress,
+) -> Result<Resolution, Box<geoframe_export::publish::BlockedInfo>> {
+    let r = w.env.rclone();
+    w.recovery(&r, None)
+        .run(last, false, &mut Hook::new(&w.env))
+}
+
+#[test]
+fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_resumes() {
+    // retiring から復旧して、新フォルダを移した直後に止まる（trashing の記録が書けないことで、その場で止めたことにする）
+    let w = world("restop-forward");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    let r = w.env.rclone();
+    let mut hook = Hook::new(&w.env).fail_at(Stage::Trashing, 1);
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            false,
+            &mut hook,
+        )
+        .unwrap();
+    // 順番: 移す前に publishing を記録。trashing は書けなかったので、旧フォルダはゴミ箱へ移していない
+    assert_eq!(
+        w.env.mutations(),
+        ["record:publishing", "moveto", "record:trashing"]
+    );
+    let Resolution::Published(p) = res else {
+        panic!("{res:?}")
+    };
+    assert_eq!(p.folder_id, inc);
+    assert_eq!(
+        p.old_left_in_replaced.as_deref(),
+        Some(old.as_str()),
+        "旧フォルダが退避先にあると再確認できたので、残っていると知らせる"
+    );
+    assert!(w.replaced_exists() && w.env.drive().trashed.is_empty());
+    // 記録は publishing まで進んでいる（retiring のままではない）
+    let last = hook.records.last().cloned().unwrap();
+    assert_eq!(last.stage, Stage::Publishing);
+    assert_eq!(last.old_id.as_deref(), Some(old.as_str()));
+    assert_eq!(last.incoming_id.as_deref(), Some(inc.as_str()));
+
+    // 次の起動: 記録した publishing から、公開済みとして旧フォルダのゴミ箱への移動を続けて終わる
+    let res = resume(&w, &last).unwrap();
+    let Resolution::Published(p) = res else {
+        panic!("{res:?}")
+    };
+    assert!(p.old_left_in_replaced.is_none() && p.recorded);
+    assert_eq!(w.env.drive().trashed, [old]);
+    assert!(!w.replaced_exists());
+    assert_eq!(w.recorded_id().as_deref(), Some(inc.as_str()));
+    // 記録の前に Drive を変えていない（trashing を記録してから purge）
+    let seq = w.env.mutations();
+    let rec = seq.iter().rposition(|c| c == "record:trashing").unwrap();
+    let purge = seq.iter().position(|c| c == "purge").unwrap();
+    assert!(rec < purge, "{seq:?}");
+    assert_safe_calls(&w.env);
+}
+
+#[test]
+fn recovery_records_trashing_before_the_purge_so_a_stop_after_the_purge_resumes() {
+    // publishing のまま（記録は publishing）、公開済み・旧フォルダは退避先にある。復旧でゴミ箱へ移して止まる
+    let w = world("restop-trash");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.publish_incoming(&inc);
+    let r = w.env.rclone();
+    let mut hook = Hook::new(&w.env);
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut hook,
+        )
+        .unwrap();
+    assert!(matches!(res, Resolution::Published(_)));
+    assert_eq!(w.env.mutations(), ["record:trashing", "purge"]);
+    let last = hook.records.last().cloned().unwrap();
+    assert_eq!(last.stage, Stage::Trashing);
+    assert_eq!(w.env.drive().trashed, std::slice::from_ref(&old));
+
+    // purge の直後に止まった、として、記録した trashing から再開する: 旧フォルダはもう無い → 公開済み。purge は呼ばない
+    let res = resume(&w, &last).unwrap();
+    assert!(matches!(res, Resolution::Published(_)));
+    assert_eq!(w.env.rclone_calls("purge").len(), 1);
+    // 記録が publishing のままだったら、旧フォルダが無いのは想定外として止まっていた（trashing を先に記録する理由）
+    let stale = progress(Stage::Publishing, Some(&old), Some(&inc));
+    let info = resume(&w, &stale).unwrap_err();
+    assert_eq!(info.reason, BlockedReason::ReplacedUnexpected);
+}
+
+#[test]
+fn a_record_that_cannot_be_written_stops_the_recovery_before_the_drive_operation() {
+    // 移す前の publishing が書けない → 移さない。blocked（record_failed）、記録は retiring のまま
+    let w = world("record-fails-forward");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    let r = w.env.rclone();
+    let p = progress(Stage::Retiring, Some(&old), Some(&inc));
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &p,
+            false,
+            &mut Hook::new(&w.env).fail_at(Stage::Publishing, 1),
+        )
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::RecordFailed);
+    assert_eq!(info.progress, p, "最後に記録できた段階");
+    assert!(w.env.rclone_calls("moveto").is_empty());
+    assert!(w.dest().is_none() && w.replaced_exists());
+    // 書けるようになれば、同じ記録から進められる
+    assert!(matches!(resume(&w, &p), Ok(Resolution::Published(_))));
+
+    // ゴミ箱へ移す前の trashing が書けない → purge しない。公開済みとして、旧フォルダが残っていると知らせる
+    let w = world("record-fails-trash");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.publish_incoming(&inc);
+    let r = w.env.rclone();
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env).fail_at(Stage::Trashing, 1),
+        )
+        .unwrap();
+    let Resolution::Published(p) = res else {
+        panic!("{res:?}")
+    };
+    assert_eq!(p.old_left_in_replaced.as_deref(), Some(old.as_str()));
+    assert!(w.env.rclone_calls("purge").is_empty());
+}
+
+#[test]
+fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks() {
+    // 移動は失敗で終わるが、Drive 側では数回の一覧のあとに反映される。待って 2 回取り、同じになってから照合する
+    let w = world("recovery-late");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.env.add_rule("moveto", 0, 1, late_then_fail(3));
+    let r = w.env.rclone();
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap();
+    assert!(matches!(res, Resolution::Published(_)));
+    assert_eq!(w.env.rclone_calls("moveto").len(), 1, "もう一度移さない");
+    assert_eq!(w.dest().as_deref(), Some(inc.as_str()));
+    // 応答が失われただけ（済んでいる）の場合
+    let w = world("recovery-lost");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.env.add_rule("moveto", 0, 1, do_then_fail());
+    let r = w.env.rclone();
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap();
+    assert!(matches!(res, Resolution::Published(_)));
+    assert_eq!(w.env.rclone_calls("moveto").len(), 1);
+    // 一覧が決まらなければ blocked
+    let w = world("recovery-unstable");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.env.add_rule("moveto", 0, 1, fail(1));
+    let mut c = w.env.ctl();
+    c.rules.push(model::Rule {
+        cmd: "lsjson".into(),
+        contains: None,
+        // 移す前の確認（incoming・宛先）の一覧は通し、失敗のあとの一覧をすべて失敗させる
+        skip: 12,
+        times: u64::MAX,
+        seen: 0,
+        effect: fail(1),
+    });
+    c.save(&w.env.fake_dir);
+    let r = w.env.rclone();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            info.reason,
+            BlockedReason::Unobservable | BlockedReason::ExecutionFailed
+        ),
+        "{:?}",
+        info.reason
+    );
+}
+
+#[test]
+fn startup_recovery_checks_the_destination_after_the_move_before_it_goes_to_the_trash() {
+    // 起動時の復旧（手元に一式が無い）でも、移した直後に、宛先の ID・incoming が残っていない・中身を照合する
+    // ファイル単位の移動に切り替わった → 宛先の ID が incoming の ID と違う
+    let w = world("startup-filewise");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.env.add_rule("moveto", 0, 1, filewise());
+    let r = w.env.rclone();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::PublishMismatch);
+    assert_eq!(info.progress.stage, Stage::Publishing);
+    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.replaced_exists());
+
+    // 移したあとの中身が、宛先の manifest と合わない（移す直前に写真が 1 枚消えた）→ ゴミ箱へ進まない
+    let w = world("startup-content");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    let fake = w.env.fake_dir.clone();
+    let inc2 = inc.clone();
+    let mut hook = Hook::new(&w.env).mutate_after(Stage::Publishing, move || {
+        let mut d = model::Drive::load(&fake);
+        d.nodes
+            .retain(|n| n.name != "090000_1.jpg" || n.parent != inc2);
+        d.save(&fake);
+    });
+    let r = w.env.rclone();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            false,
+            &mut hook,
+        )
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::PublishMismatch);
+    assert!(w.env.rclone_calls("purge").is_empty());
+}
+
+#[test]
+fn the_old_folder_is_not_trashed_when_its_contents_changed_while_the_service_was_down() {
+    // 停止中に、オーナーが退避先の旧フォルダにメモを足した → ファイルごとゴミ箱へ移さない
+    for (name, expected) in [("startup", false), ("local", true)] {
+        let w = world(&format!("trash-content-{name}"));
+        let old = w.env.seed_managed(Y, FOLDER, &w.set);
+        let inc = w.put_incoming();
+        w.retire(&old);
+        w.publish_incoming(&inc);
+        let mut d = w.env.drive();
+        d.add_file(
+            &["geoframe-export-work", "replaced", w.layout.retired_name()],
+            "owner-memo.txt",
+            7,
+            None,
+        );
+        w.env.save(&d);
+        let set_expected = Expected::from_publish_files(&w.set.files);
+        let r = w.env.rclone();
+        let info = w
+            .recovery(&r, expected.then_some(&set_expected))
+            .run(
+                &progress(Stage::Publishing, Some(&old), Some(&inc)),
+                false,
+                &mut Hook::new(&w.env),
+            )
+            .unwrap_err();
+        assert_eq!(info.reason, BlockedReason::RetiredContentChanged, "{name}");
+        assert!(w.env.rclone_calls("purge").is_empty(), "{name}");
+        assert!(w.env.drive().trashed.is_empty(), "{name}");
+        assert!(w.replaced_exists(), "{name}");
+        let o = info.observed.clone().expect("見えていた状態");
+        assert_eq!(o.replaced, [geoframe_export::recovery::Seen::dir(&old)]);
+        let text = info.describe(&w.layout);
+        assert!(
+            text.contains("retired_content_changed") && text.contains("取り出して"),
+            "{text}"
+        );
+        // 公開は済んでいる（宛先は新しい一式のまま）
+        assert_eq!(w.dest().as_deref(), Some(inc.as_str()));
+    }
 }

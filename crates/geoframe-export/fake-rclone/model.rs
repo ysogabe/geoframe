@@ -11,12 +11,20 @@ use serde_json::{Map, Value, json};
 pub const ROOT: &str = "root";
 pub const DIR_MIME: &str = "inode/directory";
 pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
+/// リンク切れのショートカットに、rclone が付ける MIME タイプ。
+pub const SHORTCUT_DANGLING_MIME: &str = "application/vnd.google-apps.shortcut.dangling";
+pub const GDOC_MIME: &str = "application/vnd.google-apps.document";
+pub const FORM_MIME: &str = "application/vnd.google-apps.form";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
     Dir,
     File,
     Shortcut,
+    /// ネイティブの Google 文書（エクスポートできる。`Size: -1`）。
+    Gdoc,
+    /// エクスポートできない Google のファイル（フォームなど）。`--drive-show-all-gdocs` が無ければ一覧に出ない。出れば `Size: -1`。
+    Form,
 }
 
 impl Kind {
@@ -25,12 +33,16 @@ impl Kind {
             Self::Dir => "dir",
             Self::File => "file",
             Self::Shortcut => "shortcut",
+            Self::Gdoc => "gdoc",
+            Self::Form => "form",
         }
     }
     fn parse(s: &str) -> Self {
         match s {
             "dir" => Self::Dir,
             "shortcut" => Self::Shortcut,
+            "gdoc" => Self::Gdoc,
+            "form" => Self::Form,
             _ => Self::File,
         }
     }
@@ -68,6 +80,16 @@ pub struct Row {
     pub id: String,
 }
 
+/// `lsjson` の呼び出しごとの設定（偽の rclone が引数から作る）。
+#[derive(Clone, Debug)]
+pub struct LsOpts {
+    pub skip_shortcuts: bool,
+    /// `mime`（ショートカットとして見える）か `resolved`（指す先として見える）。
+    pub mode: String,
+    /// `--drive-show-all-gdocs`。
+    pub show_all_gdocs: bool,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Drive {
     pub nodes: Vec<Node>,
@@ -92,6 +114,8 @@ fn mime_of(name: &str, kind: Kind) -> &'static str {
     match kind {
         Kind::Dir => DIR_MIME,
         Kind::Shortcut => SHORTCUT_MIME,
+        Kind::Gdoc => GDOC_MIME,
+        Kind::Form => FORM_MIME,
         Kind::File if name.ends_with(".jpg") => "image/jpeg",
         Kind::File if name.ends_with(".json") => "application/json",
         Kind::File => "application/octet-stream",
@@ -191,6 +215,18 @@ impl Drive {
         self.new_node(&p, name, Kind::Shortcut, 0, None, Some(target.to_owned()))
     }
 
+    /// ネイティブの Google 文書（`Size: -1` で一覧に出る）を足す。
+    pub fn add_gdoc<S: AsRef<str>>(&mut self, parent: &[S], name: &str) -> String {
+        let p = self.mkdir_p(parent);
+        self.new_node(&p, name, Kind::Gdoc, 0, None, None)
+    }
+
+    /// エクスポートできない Google のファイル（フォーム）を足す。`--drive-show-all-gdocs` のときだけ一覧に出る。
+    pub fn add_form<S: AsRef<str>>(&mut self, parent: &[S], name: &str) -> String {
+        let p = self.mkdir_p(parent);
+        self.new_node(&p, name, Kind::Form, 0, None, None)
+    }
+
     /// ルートからのパス（`a/b/c`）。
     pub fn path_of(&self, id: &str) -> Option<String> {
         let mut parts = Vec::new();
@@ -205,6 +241,7 @@ impl Drive {
     }
 
     /// `lsjson`。`shortcut_mode` は `mime`（ショートカットとして見える）か `resolved`（指す先として見える）。
+    /// エクスポートできない Google のファイルも出す（`--drive-show-all-gdocs` 付きの一覧と同じ）。
     pub fn ls(
         &self,
         dir: &str,
@@ -212,27 +249,29 @@ impl Drive {
         skip_shortcuts: bool,
         shortcut_mode: &str,
     ) -> Vec<Row> {
-        let mut out = Vec::new();
-        self.ls_into(
+        self.ls_opts(
             dir,
-            "",
             recursive,
-            skip_shortcuts,
-            shortcut_mode,
-            &mut out,
-            0,
-        );
+            &LsOpts {
+                skip_shortcuts,
+                mode: shortcut_mode.to_owned(),
+                show_all_gdocs: true,
+            },
+        )
+    }
+
+    pub fn ls_opts(&self, dir: &str, recursive: bool, opts: &LsOpts) -> Vec<Row> {
+        let mut out = Vec::new();
+        self.ls_into(dir, "", recursive, opts, &mut out, 0);
         out
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn ls_into(
         &self,
         dir: &str,
         prefix: &str,
         recursive: bool,
-        skip_shortcuts: bool,
-        mode: &str,
+        opts: &LsOpts,
         out: &mut Vec<Row>,
         depth: usize,
     ) {
@@ -247,31 +286,38 @@ impl Drive {
             };
             match n.kind {
                 Kind::Shortcut => {
-                    if skip_shortcuts {
+                    if opts.skip_shortcuts {
                         continue;
                     }
-                    if mode == "resolved" {
+                    if opts.mode == "resolved" {
+                        // 解決された項目の ID は、リンク先の ID とショートカットの ID をタブで結んだ複合 ID（rclone の drive.go の
+                        // joinID）。リンク先が無い（リンク切れ）ときは、MIME タイプが `.dangling` で、ショートカット自身の ID
                         if let Some(t) = n.target.as_deref().and_then(|t| self.node(t)) {
                             let is_dir = t.kind == Kind::Dir;
                             out.push(Row {
                                 path: path.clone(),
                                 name: n.name.clone(),
-                                size: if is_dir { -1 } else { t.size as i64 },
+                                size: if is_dir || matches!(t.kind, Kind::Gdoc | Kind::Form) {
+                                    -1
+                                } else {
+                                    t.size as i64
+                                },
                                 mime: mime_of(&t.name, t.kind).to_owned(),
                                 is_dir,
-                                id: t.id.clone(),
+                                id: format!("{}\t{}", t.id, n.id),
                             });
                             if is_dir && recursive {
-                                self.ls_into(
-                                    &t.id,
-                                    &path,
-                                    recursive,
-                                    skip_shortcuts,
-                                    mode,
-                                    out,
-                                    depth + 1,
-                                );
+                                self.ls_into(&t.id, &path, recursive, opts, out, depth + 1);
                             }
+                        } else {
+                            out.push(Row {
+                                path,
+                                name: n.name.clone(),
+                                size: 0,
+                                mime: SHORTCUT_DANGLING_MIME.to_owned(),
+                                is_dir: false,
+                                id: n.id.clone(),
+                            });
                         }
                     } else {
                         out.push(Row {
@@ -294,15 +340,7 @@ impl Drive {
                         id: n.id.clone(),
                     });
                     if recursive {
-                        self.ls_into(
-                            &n.id,
-                            &path,
-                            recursive,
-                            skip_shortcuts,
-                            mode,
-                            out,
-                            depth + 1,
-                        );
+                        self.ls_into(&n.id, &path, recursive, opts, out, depth + 1);
                     }
                 }
                 Kind::File => out.push(Row {
@@ -313,6 +351,19 @@ impl Drive {
                     is_dir: false,
                     id: n.id.clone(),
                 }),
+                Kind::Gdoc | Kind::Form => {
+                    if n.kind == Kind::Form && !opts.show_all_gdocs {
+                        continue;
+                    }
+                    out.push(Row {
+                        path,
+                        name: n.name.clone(),
+                        size: -1,
+                        mime: mime_of(&n.name, n.kind).to_owned(),
+                        is_dir: false,
+                        id: n.id.clone(),
+                    });
+                }
             }
         }
     }

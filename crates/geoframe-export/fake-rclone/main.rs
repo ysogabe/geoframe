@@ -114,11 +114,22 @@ fn operate(p: &Parsed, drive: &mut Drive, ctl: &Ctl, filewise: bool) -> Result<V
                 stderr("directory not found");
                 return Err(3);
             };
-            let rows = drive.ls(
+            // `--drive-skip-shortcuts` は値なしで真、`=true`・`=false` も読む（rclone の真偽の flag と同じ）
+            let flag_on = |name: &str| {
+                if p.has(&format!("{name}=false")) {
+                    false
+                } else {
+                    p.has(name) || p.has(&format!("{name}=true"))
+                }
+            };
+            let rows = drive.ls_opts(
                 &dir,
                 p.has("-R"),
-                p.has("--drive-skip-shortcuts"),
-                &ctl.shortcut_mode,
+                &model::LsOpts {
+                    skip_shortcuts: flag_on("--drive-skip-shortcuts"),
+                    mode: ctl.shortcut_mode.clone(),
+                    show_all_gdocs: flag_on("--drive-show-all-gdocs"),
+                },
             );
             let v = Value::Array(rows.iter().map(row_json).collect());
             Ok(serde_json::to_vec_pretty(&v).unwrap())
