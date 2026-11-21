@@ -258,6 +258,17 @@ impl BlockedInfo {
             )),
             _ => {}
         }
+        // 退避の移動を試みたあと（retire_mismatch 以外の理由でも。例えば moveto が途中で失敗して復旧の表に進んだとき）は、
+        // 移動がファイル単位に切り替わって旧ファイルの一部が退避先へ移っていることがある
+        if self.progress.stage == Stage::Retiring && self.reason != BlockedReason::RetireMismatch {
+            text.push_str(&format!(
+                " 退避の移動を試みたあとに止まったときは、移動がファイル単位に切り替わり、旧フォルダの一部のファイルが退避先（{}）へ\
+                 移っていることがあります。その場合は、移った旧ファイル（旧 manifest の一式のうち宛先 {} に無いもの）を宛先へ戻してから\
+                 解除してください（ゴミ箱へは移していません）。",
+                layout.retired_path(),
+                layout.dest_path(),
+            ));
+        }
         text
     }
 }
@@ -668,6 +679,12 @@ impl Recovery<'_> {
                 confirm_old_left(&drive, old)
                     .map_err(|stop| stop.into_blocked(cur, Some(observed)))?,
             );
+            // `trashing` を記録できず、しかも退避先に旧フォルダが無い（説明できない消失）。公開の記録を書いて成功にすると、
+            // 記録の段階は `publishing` のままなので、再起動の復旧が「置き換えの publishing で退避先が空」を `blocked` にする。
+            // 公開の記録は書かずに、ここで `blocked` にする（旧 ID が退避先に残っているときだけ公開の記録を更新する）
+            if matches!(skipped, Some(None)) {
+                return Err(TrashStop::Mismatch(Vec::new()).into_blocked(cur, Some(observed)));
+            }
             trash = None;
         }
         let mut published = finish_tail(
@@ -847,18 +864,25 @@ impl Run<'_> {
     }
 
     fn steps(&mut self) -> Result<Published, StepErr> {
-        // 1. uploading: 段階を記録 → incoming/<job_id> を作る → ID を記録 → 写真 → 最後に manifest
-        self.record(Stage::Uploading, None)?;
-        self.incoming_created = true;
+        // 1. uploading: 同名の確かめ → 段階を記録 → incoming/<job_id> を作る → ID を記録 → 写真 → 最後に manifest
+        // 同名の確かめは、最初の記録より前に行う（記録の後で見つけて止まると、再起動の復旧が `incoming_unexpected` で
+        // `blocked` になり、Drive を変えていないジョブが後の書き出しを止めてしまう）
         // `rclone mkdir` は、既にあるフォルダでも成功する。実行前から同名の `incoming/<job_id>` があると、そのフォルダの ID を
         // このジョブのものとして記録し、アップロードや失敗時のゴミ箱への移動の対象にしてしまう。作る前に一覧し、同名があれば
         // 触らずに止める（ID はまだ記録していないので、中止の片付けは名前だけでは消さず、残りものとして知らせる）。宛先も
         // 旧フォルダも動かしていないので `blocked` にはしない（`job_id` は乱数で、同名があるのは異常だが、守るべきものは無い）
         match self.drive.incoming_seen() {
             Ok(seen) if seen.is_empty() => {}
-            Ok(_) => return Err(StepErr::Abort(incoming_already_exists())),
-            Err(e) => return Err(StepErr::Op(e)),
+            Ok(_) => {
+                // 何も作っていないが、見えた同名を残りものとして知らせる（ID は記録していないので、名前だけでは消さない）
+                self.incoming_created = true;
+                return Err(StepErr::Abort(incoming_already_exists()));
+            }
+            // まだ何も記録も操作もしていない。照会の失敗として、そのまま終える（復旧の表に進まない）
+            Err(e) => return Err(StepErr::Abort(e)),
         }
+        self.record(Stage::Uploading, None)?;
+        self.incoming_created = true;
         self.drive.mkdir_incoming().map_err(StepErr::Op)?;
         let incoming_id = self.drive.incoming_id().map_err(StepErr::Op)?;
         self.record(Stage::Uploading, Some(&incoming_id))?;

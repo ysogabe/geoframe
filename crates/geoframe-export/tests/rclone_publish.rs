@@ -1908,7 +1908,13 @@ fn a_same_named_item_already_in_replaced_stops_the_retire_before_anything_moves(
 
 #[test]
 fn a_same_named_incoming_that_already_exists_is_not_adopted_and_is_reported_as_a_leftover() {
-    for variant in ["dir", "file", "two-dirs"] {
+    for variant in [
+        "dir",
+        "file",
+        "two-dirs",
+        "shortcut-mime",
+        "shortcut-resolved",
+    ] {
         let env = Env::new(&format!("incoming-occupied-{variant}"));
         let set = env.make_set("s", Y, FOLDER, PHOTOS);
         let work = ["geoframe-export-work", "incoming"];
@@ -1919,6 +1925,17 @@ fn a_same_named_incoming_that_already_exists_is_not_adopted_and_is_reported_as_a
             }
             "file" => {
                 let id = env.drive_add_file(&work, JOB_A);
+                (None, vec![id])
+            }
+            "shortcut-mime" | "shortcut-resolved" => {
+                // 同名のショートカット（ショートカットを省く一覧では見えない）。どちらの見え方でも同名として数える
+                let mut d = env.drive();
+                let other = d.mkdir_p(&["elsewhere"]);
+                let id = d.add_shortcut(&work, JOB_A, &other);
+                env.save(&d);
+                if variant == "shortcut-resolved" {
+                    env.set_shortcut_mode("resolved");
+                }
                 (None, vec![id])
             }
             _ => {
@@ -1938,9 +1955,8 @@ fn a_same_named_incoming_that_already_exists_is_not_adopted_and_is_reported_as_a
         assert!(f.leftover_incoming, "{variant}");
         assert_eq!(f.leftover_incoming_id, expect_id, "{variant}");
         // 既存のフォルダの ID を、このジョブのものとして記録しない。作らず、送らず、消さない
-        assert_eq!(hook.records.len(), 1, "{variant}");
-        assert_eq!(hook.records[0].stage, Stage::Uploading);
-        assert!(hook.records[0].incoming_id.is_none(), "{variant}");
+        // 同名の確かめは最初の記録より前に行うので、何も記録しない（再起動の復旧が blocked にならない）
+        assert!(hook.records.is_empty(), "{variant}");
         for cmd in ["mkdir", "copy", "moveto", "purge"] {
             assert!(env.rclone_calls(cmd).is_empty(), "{variant}: {cmd}");
         }

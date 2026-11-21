@@ -372,12 +372,15 @@ impl<'a> Drive<'a> {
 
     /// 作業用のフォルダの直下の `incoming`・`replaced` の中。親（作業用のフォルダ）の一覧が成功したうえで、そのフォルダが
     /// 無ければ空、ちょうど 1 つのフォルダならその中の一覧。それ以外（同名が複数・ファイル）は失敗。
+    ///
+    /// どちらの一覧も、ショートカットを省かずに取る（同名のショートカットを「無い」と読んで、`mkdir`・`moveto` で同名の
+    /// フォルダを作らないため。ショートカットは名前が一致すれば「同名がある」として数える）。
     fn work_children(&self, which: &str, loc: &RemoteLoc) -> Result<Vec<LsEntry>, ExportError> {
-        let work = self.list(&self.layout.work_loc, false)?;
+        let work = self.list_with_shortcuts(&self.layout.work_loc, false)?;
         let found: Vec<&LsEntry> = work.iter().filter(|e| e.name == which).collect();
         match found.as_slice() {
             [] => Ok(Vec::new()),
-            [e] if e.is_dir && !e.is_shortcut() => self.list(loc, false),
+            [e] if e.is_dir && !e.is_shortcut() => self.list_with_shortcuts(loc, false),
             _ => Err(unavailable("作業用のフォルダの構成が想定外です")),
         }
     }

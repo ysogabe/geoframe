@@ -1099,6 +1099,15 @@ fn a_trashing_record_failure_rechecks_the_retired_folder_before_the_published_re
         d.mkdir_p(&["geoframe-export-work", "replaced", retired]);
         d.save(fake);
     });
+    // 退避先から旧フォルダが消えた（説明できない消失）→ 公開の記録を更新せず blocked（再起動の復旧と食い違わない）
+    trashing_record_fails_while_replaced_changes("trash-record-vanished", &|fake, retired| {
+        let mut d = model::Drive::load(fake);
+        let id = d
+            .resolve(&["geoframe-export-work", "replaced", retired])
+            .unwrap();
+        d.purge(&id, false);
+        d.save(fake);
+    });
     // 退避先を一覧できなくなった → unobservable
     trashing_record_fails_while_replaced_changes("trash-record-unlistable", &|fake, _| {
         let mut c = model::Ctl::load(fake);
