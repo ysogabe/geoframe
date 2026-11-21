@@ -237,3 +237,55 @@ fn a_broken_compressed_response_is_feed_invalid_in_every_build() {
         );
     }
 }
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    enc.write_all(bytes).unwrap();
+    enc.finish().unwrap()
+}
+
+fn gzip_reply(compressed: Vec<u8>) -> Reply {
+    Reply::Raw {
+        head: format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            compressed.len()
+        ),
+        body: Body::Bytes(compressed),
+    }
+}
+
+#[test]
+fn a_gzip_response_is_inflated_and_read() {
+    // どちらのビルド（この crate だけ・ワークスペース全体）でも、正常な gzip は展開して読む
+    let feed = FakeFeed::start(gzip_reply(gzip(
+        &serde_json::to_vec(&fixture_json()).unwrap(),
+    )));
+    let v = FeedClient::new(&feed.base).fetch(&period()).unwrap();
+    assert_eq!(v["photos"].as_array().unwrap().len(), 8);
+}
+
+#[test]
+fn the_limit_applies_to_the_inflated_size_of_a_gzip_response() {
+    // 圧縮後は数百バイトでも、展開後が上限を超えるものは feed_invalid。ちょうど上限は通る
+    let limit = 4096usize;
+    let client = |feed: &FakeFeed| {
+        FeedClient::with_limits(&feed.base, Duration::from_secs(10), limit as u64)
+    };
+    let over = gzip(&padded_json(limit + 1));
+    assert!(over.len() < limit / 2, "圧縮後は上限より十分小さい");
+    let feed = FakeFeed::start(gzip_reply(over));
+    assert_eq!(code(client(&feed).fetch(&period())), ErrorCode::FeedInvalid);
+
+    // 展開すると 16MB になる、小さな応答（圧縮爆弾）も、読み切らずに止まる
+    let bomb = gzip(&vec![b' '; 16 * 1024 * 1024]);
+    assert!(bomb.len() < 64 * 1024);
+    let feed = FakeFeed::start(gzip_reply(bomb));
+    let started = Instant::now();
+    assert_eq!(code(client(&feed).fetch(&period())), ErrorCode::FeedInvalid);
+    assert!(started.elapsed() < Duration::from_secs(5));
+
+    let exact = gzip(&padded_json(limit));
+    let feed = FakeFeed::start(gzip_reply(exact));
+    assert!(client(&feed).fetch(&period()).is_ok());
+}

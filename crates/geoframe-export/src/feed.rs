@@ -8,8 +8,8 @@
 //! - リダイレクトはたどらない（`max_redirects(0)`。3xx は 200 以外として `feed_unavailable`）。環境変数の proxy も使わない。
 //! - 接続できない・タイムアウト・200 以外・本文の読み取りの失敗は `feed_unavailable`。JSON として読めない・
 //!   値の検査に通らないものは `feed_invalid`（[`crate::listing`]）。
-//! - 圧縮は頼まない（`Accept-Encoding: identity`）。ワークスペース全体のビルドでは、geoframe 側の機能（gzip）が同じ ureq に
-//!   合流して、`Content-Encoding: gzip` の応答が自動で展開される（この crate だけのビルドでは展開されない）。どちらでも
+//! - 圧縮は頼まない（`Accept-Encoding: identity`）。ただし `Content-Encoding: gzip` の応答は展開して読む（ureq の `gzip` feature を
+//!   この crate の Cargo.toml で明示している。ワークスペース全体のビルドでも、この crate だけのビルドでも同じ動き）。
 //!   上限は**展開後**のバイト数に掛け、壊れた圧縮は `feed_invalid`、通信の失敗（期限・切断）は `feed_unavailable`。
 //! - エラーには URL・本文・`ureq` のメッセージを入れない（固定の説明だけ）。
 
@@ -109,8 +109,8 @@ impl FeedClient {
             .read_to_end(&mut out)
             .map_err(|e| match ureq::Error::from(e) {
                 ureq::Error::BodyExceedsLimit(_) => too_large(),
-                // 通信の失敗（期限・切断・途中で止まった）だけを「使えない」とする。それ以外（壊れた圧縮など、ビルドの
-                // 組み合わせで現れる種類を含む）は、応答の中身が使えないものとして feed_invalid にそろえる
+                // 通信の失敗（期限・切断・途中で止まった）だけを「使えない」とする。それ以外（壊れた圧縮など）は、
+                // 応答の中身が使えないものとして feed_invalid にそろえる
                 ureq::Error::Timeout(_)
                 | ureq::Error::Io(_)
                 | ureq::Error::Protocol(_)

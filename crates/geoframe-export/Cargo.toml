@@ -17,6 +17,11 @@ path = "src/main.rs"
 [dependencies]
 serde_json = "1.0.154"
 # 写真サービスへの GET（127.0.0.1 の http だけ。TLS は要らない）。同期 API
-ureq = { version = "3", default-features = false }
+# gzip を明示する: geoframe 側のビルドと合流するかどうかで応答の扱いが変わらないように（展開後のバイト数に上限を掛ける）
+ureq = { version = "3", default-features = false, features = ["gzip"] }
 # 実効ユーザー ID（geteuid）と O_NOFOLLOW だけ
 libc = "0.2"
+
+[dev-dependencies]
+# 試験の gzip 応答を作る（geoframe crate と同じ版・同じ feature。Cargo.lock に新しいパッケージは増えない）
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }

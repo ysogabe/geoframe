@@ -251,6 +251,8 @@ fn parse_row(value: &Value, period: &Period, seen: &mut HashSet<i64>) -> Result<
     }
 }
 
+const COUNT_OVERFLOW: &str = "undated・invalid_time の件数が表現できる範囲を超えます";
+
 fn count(obj: &Map<String, Value>, key: &str) -> Result<u64, ExportError> {
     field_top(obj, key)?.as_u64().ok_or(invalid(
         "undated・invalid_time が 0 以上の整数ではありません",
@@ -292,8 +294,13 @@ pub fn select(response: &Value, period: &Period) -> Result<Selection, ExportErro
             // 日付が分からない行は期間に割り当てられないので、候補に入れず件数に足す（黙って落とさない）。
             // 一覧 API は `taken_at` が分までの形の行だけを `photos` に出すので、ここに来るのは暦に実在しない日時
             // （`2030-02-30 10:00`）か、写真サービスの契約に反する行
-            Row::NoTime(TimeShape::Empty) => undated += 1,
-            Row::NoTime(_) => invalid_time += 1,
+            // 件数は表現できる範囲だけ通す（応答の件数が u64::MAX のとき、足して折り返さない・パニックしない）
+            Row::NoTime(TimeShape::Empty) => {
+                undated = undated.checked_add(1).ok_or(invalid(COUNT_OVERFLOW))?;
+            }
+            Row::NoTime(_) => {
+                invalid_time = invalid_time.checked_add(1).ok_or(invalid(COUNT_OVERFLOW))?;
+            }
         }
     }
     candidates.sort_by_key(|c| (c.time, c.id));
@@ -534,6 +541,45 @@ mod tests {
         let mut r = response(vec![row(2, "")]);
         r["photos"][0].as_object_mut().unwrap().remove("inferred");
         assert_eq!(code(select(&r, &period())), ErrorCode::FeedInvalid);
+    }
+
+    #[test]
+    fn counters_at_the_edge_of_u64_are_exact_or_feed_invalid() {
+        // (カウンターのキー, 足される行の time)
+        for (key, time) in [("undated", ""), ("invalid_time", "2030-02-30 10:00")] {
+            let get = |s: &Selection| {
+                if key == "undated" {
+                    s.undated
+                } else {
+                    s.invalid_time
+                }
+            };
+            let other = |s: &Selection| {
+                if key == "undated" {
+                    s.invalid_time
+                } else {
+                    s.undated
+                }
+            };
+            // 行が無ければ、u64::MAX のままで通る
+            let mut r = response(vec![row(1, "2030-03-10 09:00")]);
+            r[key] = json!(u64::MAX);
+            let s = select(&r, &period()).unwrap();
+            assert_eq!((get(&s), other(&s)), (u64::MAX, 0), "{key}");
+            // u64::MAX - 1 に 1 行足すと、ちょうど u64::MAX
+            let mut r = response(vec![row(1, time)]);
+            r[key] = json!(u64::MAX - 1);
+            let s = select(&r, &period()).unwrap();
+            assert_eq!(get(&s), u64::MAX, "{key}");
+            // u64::MAX に 1 行足すと表現できない
+            let mut r = response(vec![row(1, time)]);
+            r[key] = json!(u64::MAX);
+            assert_eq!(code(select(&r, &period())), ErrorCode::FeedInvalid, "{key}");
+            // 2 行目で超えるときも同じ
+            let mut r = response(vec![row(1, time), row(2, time)]);
+            r[key] = json!(u64::MAX - 1);
+            assert_eq!(code(select(&r, &period())), ErrorCode::FeedInvalid, "{key}");
+        }
     }
 
     #[test]

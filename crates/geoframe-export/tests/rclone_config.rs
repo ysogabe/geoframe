@@ -8,8 +8,8 @@ use common::{
     MARK_ID, MARK_SECRET, TempDir, assert_no_secrets, good_config, set_mode, write_config,
 };
 use geoframe_export::rclone_conf::{
-    CONFIG_MAX_BYTES, ConfigError, Target, check_rclone_config, check_rclone_config_for_uid,
-    effective_uid,
+    CONFIG_MAX_BYTES, ConfigError, SyntaxIssue, Target, check_rclone_config,
+    check_rclone_config_for_uid, effective_uid,
 };
 
 fn check(path: &std::path::Path) -> Result<(), ConfigError> {
@@ -201,6 +201,132 @@ fn malformed_lines_never_leak_into_the_error() {
     );
     let path = write_config(dir.path(), content.as_bytes());
     let e = check(&path).unwrap_err();
-    assert!(matches!(e, ConfigError::MissingKey(_)), "{e:?}");
+    // 1 行目（セクションの前の壊れた行）で止まる。行の番号だけを持ち、中身は持たない
+    assert_eq!(
+        e,
+        ConfigError::Syntax {
+            line: 1,
+            issue: SyntaxIssue::OutsideSection
+        }
+    );
     assert_clean(&e, &dir);
+
+    let content = format!("[gdrive]\nclient_id = {MARK_ID}\n{MARK_SECRET} {MARK_ID}\n");
+    let path = write_config(dir.path(), content.as_bytes());
+    let e = check(&path).unwrap_err();
+    assert_eq!(
+        e,
+        ConfigError::Syntax {
+            line: 3,
+            issue: SyntaxIssue::BadLine
+        }
+    );
+    assert_clean(&e, &dir);
+}
+
+#[test]
+fn configs_that_rclone_would_read_as_a_shared_client_id_are_refused() {
+    // rclone（goconfig）は `:` 区切り・引用符つきの値・同じキーの再指定（後勝ち）を解釈する。
+    // この検査を通った設定が、rclone では空の client_id（= 共用の client_id）にならないこと
+    let dir = TempDir::new("conf-shared-client");
+    let cases: [(String, SyntaxIssue); 6] = [
+        // 値あり → 空で再指定
+        (
+            format!(
+                "[gdrive]\nclient_id = {MARK_ID}\nclient_secret = {MARK_SECRET}\nclient_id =\n"
+            ),
+            SyntaxIssue::DuplicateKey,
+        ),
+        // 引用された空値
+        (
+            format!("[gdrive]\nclient_id = \"\"\nclient_secret = {MARK_SECRET}\n"),
+            SyntaxIssue::QuotedOrInterpolated("client_id"),
+        ),
+        (
+            format!("[gdrive]\nclient_id = {MARK_ID}\nclient_secret = ``\n"),
+            SyntaxIssue::QuotedOrInterpolated("client_secret"),
+        ),
+        // `:` 区切り
+        (
+            format!("[gdrive]\nclient_id: {MARK_ID}\nclient_secret = {MARK_SECRET}\n"),
+            SyntaxIssue::BadLine,
+        ),
+        // 引用符つきのキー
+        (
+            format!("[gdrive]\n\"client_id\" = {MARK_ID}\nclient_secret = {MARK_SECRET}\n"),
+            SyntaxIssue::BadLine,
+        ),
+        // 同じ remote のセクションを後ろで開き直して上書き
+        (
+            format!(
+                "[gdrive]\nclient_id = {MARK_ID}\nclient_secret = {MARK_SECRET}\n[gdrive]\nclient_id =\n"
+            ),
+            SyntaxIssue::DuplicateSection,
+        ),
+    ];
+    for (content, want) in cases {
+        let path = write_config(dir.path(), content.as_bytes());
+        let got = check(&path).unwrap_err();
+        assert!(
+            matches!(got, ConfigError::Syntax { issue, .. } if issue == want),
+            "{got:?} (want {want:?})"
+        );
+        assert_clean(&got, &dir);
+    }
+}
+
+#[test]
+fn a_fifo_is_refused_without_blocking() {
+    // FIFO は、書き手がいなければ open が待ち続ける。O_NONBLOCK で開いて、通常のファイルでないと断る
+    let dir = TempDir::new("conf-fifo");
+    let path = write_config(dir.path(), good_config("gdrive").as_bytes());
+    let fifo = path.with_file_name("fifo.conf");
+    let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+    // SAFETY: NUL で終わるパス（この試験の一時ディレクトリの中）に FIFO を作るだけ。
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(check(&fifo));
+    });
+    let got = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("FIFO の open で待ち続けた");
+    assert_eq!(got, Err(ConfigError::WrongKind(Target::File)));
+    assert_clean(&got.unwrap_err(), &dir);
+}
+
+#[test]
+fn a_parent_directory_that_is_a_symlink_is_refused() {
+    let dir = TempDir::new("conf-parent-link");
+    let path = write_config(dir.path(), good_config("gdrive").as_bytes());
+    // 本物の親（0700・自分の持ち物・正しい設定）を指すリンクを親にする
+    let link = dir.path().join("linked");
+    symlink(path.parent().unwrap(), &link).unwrap();
+    let via_link = link.join("rclone.conf");
+    let e = check(&via_link).unwrap_err();
+    assert_eq!(e, ConfigError::WrongKind(Target::Directory));
+    assert_clean(&e, &dir);
+    // 本物のパスは通る
+    assert_eq!(check(&path), Ok(()));
+
+    // リンク先が広い権限のディレクトリでも、リンクであること自体を断る（権限の話にならない）
+    let wide = dir.path().join("wide");
+    std::fs::create_dir(&wide).unwrap();
+    set_mode(&wide, 0o755);
+    let wide_link = dir.path().join("wide-link");
+    symlink(&wide, &wide_link).unwrap();
+    assert_eq!(
+        check(&wide_link.join("rclone.conf")),
+        Err(ConfigError::WrongKind(Target::Directory))
+    );
+    set_mode(&wide, 0o700);
+}
+
+#[test]
+fn a_regular_file_as_the_parent_is_refused() {
+    let dir = TempDir::new("conf-parent-file");
+    let path = write_config(dir.path(), good_config("gdrive").as_bytes());
+    let e = check(&path.join("rclone.conf")).unwrap_err();
+    assert_eq!(e, ConfigError::WrongKind(Target::Directory));
 }
