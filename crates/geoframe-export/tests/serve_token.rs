@@ -100,6 +100,22 @@ fn weak_or_odd_values_are_refused() {
             format!("{}\n\n\n\n\n\n", &GOOD[..20]).into_bytes(),
             TokenError::TooShort,
         ),
+        // 詰め物（末尾の =）は、長さにも種類にも数えない
+        (
+            "padded-short",
+            format!("{}==", &GOOD[..30]).into_bytes(),
+            TokenError::TooShort,
+        ),
+        (
+            "padded-seven-kinds",
+            format!("{}==", "abcdefg".repeat(6)).into_bytes(),
+            TokenError::LowVariety,
+        ),
+        (
+            "only-padding",
+            "=".repeat(40).into_bytes(),
+            TokenError::BadCharacters,
+        ),
         (
             "same-char",
             "a".repeat(64).into_bytes(),

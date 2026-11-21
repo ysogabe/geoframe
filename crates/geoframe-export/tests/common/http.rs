@@ -41,6 +41,45 @@ pub fn connect(addr: SocketAddr) -> TcpStream {
     s
 }
 
+/// 送信元のアドレスを `source`（127.0.0.0/8 の中の、別のアドレス。例: `127.0.0.2`）にして接続する。許可リストの中と外の送信元を、
+/// 1 つのホストで作るため（`std` は、接続の前に送信元を決められない）。IPv4 だけ。
+pub fn connect_from(addr: SocketAddr, source: &str) -> TcpStream {
+    use std::net::Ipv4Addr;
+    use std::os::fd::FromRawFd;
+    let SocketAddr::V4(dst) = addr else {
+        panic!("IPv4 だけ")
+    };
+    let src: Ipv4Addr = source.parse().expect("送信元");
+    let sockaddr = |ip: Ipv4Addr, port: u16| libc::sockaddr_in {
+        sin_family: libc::AF_INET as libc::sa_family_t,
+        sin_port: port.to_be(),
+        sin_addr: libc::in_addr {
+            s_addr: u32::from_ne_bytes(ip.octets()),
+        },
+        sin_zero: [0; 8],
+    };
+    let len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+    // SAFETY: 自分で作った TCP ソケットに、構造体のポインタと大きさを渡すだけ。成功したら、fd の持ち主は `TcpStream` に移る。
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+        assert!(fd >= 0, "socket");
+        let s = sockaddr(src, 0);
+        let d = sockaddr(*dst.ip(), dst.port());
+        let bound = libc::bind(fd, (&raw const s).cast(), len);
+        let connected = bound == 0 && libc::connect(fd, (&raw const d).cast(), len) == 0;
+        if !connected {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            panic!("{source} から接続できません: {e}");
+        }
+        let stream = TcpStream::from_raw_fd(fd);
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .unwrap();
+        stream
+    }
+}
+
 /// 応答を EOF まで読んで解釈する。
 pub fn read_response(stream: &mut TcpStream) -> Resp {
     let mut raw = Vec::new();

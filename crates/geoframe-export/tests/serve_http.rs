@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use common::FakeSite;
 use common::drive::*;
 use common::http::*;
 use common::site::*;
+use common::{FakeSite, Reply};
 use geoframe_export::cancel::Cancel;
 use geoframe_export::logging;
 use geoframe_export::serve::{self, Config, Limits, Token};
@@ -408,6 +408,73 @@ fn an_ipv4_mapped_entry_in_the_allow_list_matches_the_ipv4_peer() {
     );
 }
 
+/// トークンは小文字 16 進 32 文字にもできる（ジョブ ID と同じ形）。パス・クエリ・メソッド名のどこに入っても、ログには出ない。
+#[test]
+fn a_token_shaped_like_a_job_id_never_reaches_the_access_log() {
+    // 架空の値（ジョブ ID と同じ形。異なる文字が 8 種類以上）
+    const TOKEN: &str = "3f9a0c7e1b5d842a6e0f1c3b7a9d5e24";
+    const OTHER: &str = "c41e8d27b05a93f6e2d8a1b7405c9e3f";
+    let mut env = Env::new("http-log-token");
+    let site = photo_site(DAY, DAY, three());
+    let server = Server::start(&mut env, &site, TOKEN);
+    let addr = server.addr;
+    let auth = format!("Bearer {TOKEN}");
+    let wrong = format!("Bearer {OTHER}");
+
+    // パスの値（認証あり・なし・違う）、クエリ、メソッド名（拡張メソッド）に、トークンと別の値を入れる
+    for headers in [
+        vec![("Authorization", auth.as_str())],
+        vec![("Authorization", wrong.as_str())],
+        vec![],
+    ] {
+        for secret in [TOKEN, OTHER] {
+            for (method, path) in [
+                ("GET", format!("/v1/exports/{secret}")),
+                ("GET", format!("/v1/exports?token={secret}")),
+                ("GET", format!("/v1/exports/{secret}?access_token={secret}")),
+                ("GET", format!("/{secret}")),
+                (secret, "/v1/exports".to_owned()),
+                (secret, format!("/v1/exports/{secret}")),
+            ] {
+                let _ = http_request(addr, method, &path, &headers, None);
+            }
+        }
+    }
+    // 正しい経路の 1 件ずつ（見つかったジョブ ID は出る。見つからなかった値は出ない）
+    let r = post_retry(addr, TOKEN, &day_body(json!({})));
+    assert_eq!(r.status, 202, "{}", r.body);
+    let job_id = r.json()["job_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        get(addr, &format!("/v1/exports/{job_id}"), TOKEN).status,
+        200
+    );
+    assert_eq!(
+        get(addr, &format!("/v1/exports/{TOKEN}"), TOKEN).status,
+        404
+    );
+    drop(server);
+
+    let log = logs();
+    for secret in [TOKEN, OTHER, &TOKEN[..16], &OTHER[..16]] {
+        assert!(!log.contains(secret), "ログに要求の値が出ている: {log}");
+    }
+    // メソッドは既知のものだけ、経路はテンプレート
+    assert!(log.contains("method=other"), "{log}");
+    assert!(log.contains("method=GET"), "{log}");
+    assert!(log.contains("method=POST"), "{log}");
+    assert!(log.contains("path=/v1/exports/{job_id}"), "{log}");
+    assert!(log.contains("path=other"), "{log}");
+    // 受付で作った ID と、照会で見つかった記録の ID は出る
+    assert!(
+        log.lines()
+            .filter(|l| l.contains(&format!("job_id={job_id}")))
+            .count()
+            >= 2,
+        "{log}"
+    );
+    assert!(log.contains("job_id=-"), "{log}");
+}
+
 // ---- AC8・AC9: 実行中の 2 件目と、request_id ----
 
 #[test]
@@ -609,7 +676,8 @@ fn a_blocked_record_and_an_unreachable_photo_service_answer_503_with_a_fixed_cod
     store.write(&b).unwrap();
     let server = Server::start(&mut env, &site, TOKEN);
     for body in [day_body(json!({})), day_body(json!({"dry_run": true}))] {
-        let r = post_json(server.addr, TOKEN, &body);
+        // 実行枠の見かけの `busy`（ほかの試験の fork。冒頭の説明）は、少し待って打ち直す
+        let r = post_retry(server.addr, TOKEN, &body);
         assert_eq!((r.status, r.error().as_str()), (503, "blocked"), "{body}");
     }
     let v = get(server.addr, &format!("/v1/exports/{:032x}", 8), TOKEN).json();
@@ -740,6 +808,25 @@ fn the_body_is_checked_before_anything_starts() {
             r.body
         );
     }
+    // 重複したキーは 400（最後の値で上書きしない）。ジョブも rclone も作らない
+    let before = job_files(&env);
+    for raw in [
+        &br#"{"from":"2030-03-10","destination":"yamareco","dry_run":true,"dry_run":false}"#[..],
+        br#"{"from":"2030-03-10","destination":"yamareco","dry_run":false,"dry_run":true}"#,
+        br#"{"from":"2030-03-10","from":"2030-03-11","destination":"yamareco"}"#,
+        br#"{"from":"2030-03-10","destination":"yamareco","request_id":null,"request_id":"r-1"}"#,
+        br#"{"from":"2030-03-10","destination":"yamareco","dry_run":true,"dry\u005frun":false}"#,
+    ] {
+        let r = post_raw(addr, TOKEN, raw);
+        assert_eq!(
+            (r.status, r.error().as_str()),
+            (400, "duplicate_field"),
+            "{}",
+            String::from_utf8_lossy(raw)
+        );
+    }
+    assert_eq!(job_files(&env), before);
+    assert!(env.calls().is_empty());
     for raw in [
         &b""[..],
         b"[]",
@@ -934,4 +1021,282 @@ fn the_production_limits_are_the_documented_ones() {
     assert_eq!(l.header_timeout, Duration::from_secs(10));
     assert_eq!(l.body_timeout, Duration::from_secs(10));
     assert_eq!(l.max_body, 4096);
+    assert_eq!(l.max_denied_connections, 2);
+    assert_eq!(l.denied_header_timeout, Duration::from_secs(2));
+    assert_eq!(l.shutdown_wait, Duration::from_secs(75));
+}
+
+// ---- 許可外の接続は、許可した送信元の枠を使わない ----
+
+/// 許可リストにあるのは 127.0.0.1 だけ。127.0.0.2（同じホストの別のループバックのアドレス）から来る接続は許可外。
+#[test]
+fn outside_sources_use_their_own_small_pool_and_never_the_allowed_slots() {
+    const TOKEN: &str = "POOL-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
+    let mut env = Env::new("http-denied-pool");
+    let site = photo_site(DAY, DAY, three());
+    let limits = Limits {
+        max_connections: 2,
+        max_denied_connections: 2,
+        denied_header_timeout: Duration::from_secs(4),
+        ..Limits::default()
+    };
+    let server = Server::start_with(
+        &mut env,
+        &site,
+        TOKEN,
+        vec!["127.0.0.1".parse().unwrap()],
+        limits,
+    );
+    let addr = server.addr;
+    let t0 = Instant::now();
+
+    // 許可外の、何も送らない接続で、許可外の枠（2）を使い切る
+    let mut a = connect_from(addr, "127.0.0.2");
+    let mut b = connect_from(addr, "127.0.0.2");
+    // 枠が埋まったあとの許可外は、何も返さずに閉じられる（待たされない）
+    let mut c = connect_from(addr, "127.0.0.2");
+    c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 16];
+    match std::io::Read::read(&mut c, &mut buf) {
+        Ok(0) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+        other => panic!("枠を超えた許可外の接続が閉じられていない: {other:?}"),
+    }
+    // 許可した送信元は、その間も待たされない（許可外の 3 本が、許可した枠 2 を使っていれば、ここで待たされる）
+    for _ in 0..3 {
+        let r = http_request(addr, "GET", "/healthz", &[], None);
+        assert_eq!((r.status, r.body.as_str()), (200, "ok"));
+    }
+    assert!(
+        t0.elapsed() < Duration::from_secs(3),
+        "許可した送信元が待たされた: {:?}",
+        t0.elapsed()
+    );
+    // 許可した送信元の枠が埋まっていても、許可外は自分の枠で 403 を返される（枠が空いたあとで）
+    for s in [&mut a, &mut b] {
+        // 黙っていた許可外の接続は、許可外のヘッダの期限（4 秒）で切られる
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let mut sink = Vec::new();
+        let _ = std::io::Read::read_to_end(s, &mut sink);
+        assert!(!String::from_utf8_lossy(&sink).contains("200 OK"));
+    }
+    assert!(t0.elapsed() >= Duration::from_secs(3), "期限より前に切れた");
+    let mut d = connect_from(addr, "127.0.0.2");
+    send_request(&mut d, "GET", "/healthz", &[], None);
+    let r = read_response(&mut d);
+    assert_eq!((r.status, r.error().as_str()), (403, "forbidden"));
+    // 許可外の 403 は、トークンが正しくても同じ（認証より前）
+    let auth = format!("Bearer {TOKEN}");
+    let mut d = connect_from(addr, "127.0.0.2");
+    send_request(
+        &mut d,
+        "GET",
+        "/v1/exports",
+        &[("Authorization", &auth)],
+        None,
+    );
+    assert_eq!(read_response(&mut d).status, 403);
+    assert_eq!(job_files(&env), 0);
+}
+
+// ---- 終了: 接続の打ち切りの期限と、後始末の完了は別 ----
+
+/// 接続の期限（`shutdown_wait`）が 0 でも、親は、子の rclone を止めて回収し、実行枠を手放してから返る。
+#[test]
+fn stopping_returns_only_after_the_child_is_reaped_even_with_no_time_left_for_connections() {
+    const TOKEN: &str = "STOP-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
+    let mut env = Env::new("http-stop-reap");
+    let site = photo_site(DAY, DAY, three());
+    env.add_rule("copy", 0, 1, sleep_ms(30_000));
+    let limits = Limits {
+        shutdown_wait: Duration::ZERO,
+        ..Limits::default()
+    };
+    let server = Server::start_with(
+        &mut env,
+        &site,
+        TOKEN,
+        vec!["127.0.0.1".parse().unwrap()],
+        limits,
+    );
+    let r = post_retry(server.addr, TOKEN, &day_body(json!({})));
+    assert_eq!(r.status, 202, "{}", r.body);
+    let copy_pid = wait_for_call(&env, "copy", 30);
+    assert!(process_exists(copy_pid));
+
+    let started = Instant::now();
+    // 接続の期限が 0 なので、終了コードは 0 か 1（接続のタスクの片付けが間に合ったか）。確かめるのは、返った時点の状態
+    let code = server.stop();
+    assert!(code <= 1, "{code}");
+    assert!(
+        !process_exists(copy_pid),
+        "返ったのに、子の rclone が残っている（回収されていない）"
+    );
+    assert!(slot_is_free(&env.state), "返ったのに、実行枠が外れていない");
+    assert!(started.elapsed() < Duration::from_secs(20));
+    let store = geoframe_export::jobs::JobStore::open(&env.state).unwrap();
+    assert_eq!(
+        store.scan().records[0].status,
+        geoframe_export::jobs::Status::Running
+    );
+}
+
+/// 受付・`dry_run` のブロッキング処理が終わっていなければ、接続の期限（0）が過ぎても、返らない（期限なしで待つ）。ブロッキング処理は
+/// 写真サービスの応答待ち（1.5 秒）で止まっている。
+#[test]
+fn stopping_waits_for_an_inflight_blocking_task_even_after_the_connection_deadline() {
+    const TOKEN: &str = "WAIT-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
+    let mut env = Env::new("http-stop-inflight");
+    // 一覧 API の応答を 1.5 秒遅らせる（`dry_run` が、その間ブロッキングのスレッドで待つ）
+    let site = FakeSite::start(vec![(
+        "/api/admin/export/photos".to_owned(),
+        Reply::Delayed {
+            wait: Duration::from_millis(1500),
+            then: Box::new(Reply::json(
+                serde_json::to_vec(&listing(DAY, DAY, three())).unwrap(),
+            )),
+        },
+    )]);
+    let limits = Limits {
+        shutdown_wait: Duration::ZERO,
+        ..Limits::default()
+    };
+    let server = Server::start_with(
+        &mut env,
+        &site,
+        TOKEN,
+        vec!["127.0.0.1".parse().unwrap()],
+        limits,
+    );
+    // dry_run を送る（応答は待たない）
+    let auth = format!("Bearer {TOKEN}");
+    let mut s = connect(server.addr);
+    let body = serde_json::to_vec(&day_body(json!({"dry_run": true}))).unwrap();
+    send_request(
+        &mut s,
+        "POST",
+        "/v1/exports",
+        &[
+            ("Authorization", &auth),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&body),
+    );
+    // 写真サービスに届くまで待つ（ブロッキング処理が、応答待ちに入っている）
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while site.request_lines().is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "dry_run が写真サービスに届かない"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let seen = Instant::now();
+    let code = server.stop();
+    assert!(code <= 1, "{code}");
+    assert!(
+        seen.elapsed() >= Duration::from_millis(1200),
+        "ブロッキング処理が終わる前に返った: {:?}",
+        seen.elapsed()
+    );
+    assert!(seen.elapsed() < Duration::from_secs(20));
+    drop(s);
+}
+
+/// ジョブのスレッドが（写真サービスの応答待ちなどで）終わるのに時間がかかっても、接続の期限（0）が過ぎても、返らない。スレッドは
+/// tokio のランタイムの外の素のスレッドなので、ランタイムの破棄は待たない。返る条件は、ジョブのスレッドの終わり（子の回収と
+/// 実行枠の解放を済ませた状態）だけ。
+#[test]
+fn stopping_waits_for_a_slow_job_thread_even_after_the_connection_deadline() {
+    const TOKEN: &str = "JOBT-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
+    let mut env = Env::new("http-stop-jobthread");
+    // 一覧 API はすぐ、表示用 JPEG は 1.5 秒遅れて返す（ジョブのスレッドが、写真の取得で待つ）
+    let mut routes = vec![(
+        "/api/admin/export/photos".to_owned(),
+        Reply::json(serde_json::to_vec(&listing(DAY, DAY, three())).unwrap()),
+    )];
+    for (i, p) in three().iter().enumerate() {
+        routes.push((
+            format!("/derivatives/p{}.jpg", p["id"].as_i64().unwrap()),
+            Reply::Delayed {
+                wait: Duration::from_millis(1500),
+                then: Box::new(Reply::jpeg(jpeg(64, 48, i as u8))),
+            },
+        ));
+    }
+    let site = FakeSite::start(routes);
+    let limits = Limits {
+        shutdown_wait: Duration::ZERO,
+        ..Limits::default()
+    };
+    let server = Server::start_with(
+        &mut env,
+        &site,
+        TOKEN,
+        vec!["127.0.0.1".parse().unwrap()],
+        limits,
+    );
+    let r = post_retry(server.addr, TOKEN, &day_body(json!({})));
+    assert_eq!(r.status, 202, "{}", r.body);
+    // 写真の取得が始まるまで待つ
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !site
+        .request_lines()
+        .iter()
+        .any(|l| l.contains("/derivatives/"))
+    {
+        assert!(Instant::now() < deadline, "写真の取得が始まらない");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let seen = Instant::now();
+    let code = server.stop();
+    assert!(code <= 1, "{code}");
+    assert!(
+        seen.elapsed() >= Duration::from_millis(1200),
+        "ジョブのスレッドが終わる前に返った: {:?}",
+        seen.elapsed()
+    );
+    assert!(slot_is_free(&env.state), "返ったのに、実行枠が外れていない");
+    assert!(seen.elapsed() < Duration::from_secs(20));
+}
+
+/// 本文を読み切らない接続が残っていても、接続の期限（ここでは 0.3 秒）で落として、返る（本文の期限が 30 秒でも、待たない）。
+/// 打ち切ったことは、終了コード 1 で分かる。
+#[test]
+fn a_connection_stalled_in_its_body_is_dropped_at_the_connection_deadline() {
+    const TOKEN: &str = "STAL-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
+    let mut env = Env::new("http-stop-stalled");
+    let site = photo_site(DAY, DAY, three());
+    let limits = Limits {
+        body_timeout: Duration::from_secs(30),
+        shutdown_wait: Duration::from_millis(300),
+        ..Limits::default()
+    };
+    let server = Server::start_with(
+        &mut env,
+        &site,
+        TOKEN,
+        vec!["127.0.0.1".parse().unwrap()],
+        limits,
+    );
+    let auth = format!("Bearer {TOKEN}");
+    let mut s = connect(server.addr);
+    use std::io::Write;
+    s.write_all(
+        format!(
+            "POST /v1/exports HTTP/1.1\r\nHost: t\r\nConnection: close\r\nAuthorization: {auth}\r\nContent-Type: application/json\r\nContent-Length: 50\r\n\r\n{{\"fro"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    let started = Instant::now();
+    assert_eq!(server.stop(), 1, "接続を落としたのに、0 を返した");
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(job_files(&env), 0);
+    drop(s);
 }

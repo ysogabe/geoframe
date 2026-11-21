@@ -42,6 +42,44 @@ fn token_file(env: &Env, name: &str, content: &[u8], mode: u32) -> std::path::Pa
     path
 }
 
+/// `geoframe-export run`（別のプロセスの CLI）。偽の rclone・偽の写真サービス・同じ状態ディレクトリ。
+fn spawn_run(env: &Env, site: &FakeSite) -> Child {
+    write_config(&env.state, good_config("gdrive").as_bytes());
+    Command::new(env!("CARGO_BIN_EXE_geoframe-export"))
+        .args(["run", "--from", DAY, "--destination", "yamareco"])
+        .args(["--feed-base", &format!("http://{}", site.addr)])
+        .args(["--rclone", env!("CARGO_BIN_EXE_fake-rclone")])
+        .args([
+            "--rclone-config",
+            env.state.join("rclone/rclone.conf").to_str().unwrap(),
+        ])
+        .args(["--state-dir", env.state.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("起動")
+}
+
+/// 試験が失敗しても、起動した子（と、その偽の rclone）を残さない。
+struct Reaper(Vec<Child>);
+
+impl Drop for Reaper {
+    fn drop(&mut self) {
+        for c in &mut self.0 {
+            if matches!(c.try_wait(), Ok(None)) {
+                send(c.id(), libc::SIGTERM);
+                let deadline = Instant::now() + Duration::from_secs(15);
+                while matches!(c.try_wait(), Ok(None)) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+}
+
 fn spawn_serve(env: &Env, site: &FakeSite, listen: &str, token: &std::path::Path) -> Child {
     write_config(&env.state, good_config("gdrive").as_bytes());
     Command::new(env!("CARGO_BIN_EXE_geoframe-export"))
@@ -182,12 +220,21 @@ fn serve_refuses_to_start_with_a_weak_token_file_or_a_wildcard_listen() {
     let weak = token_file(&env, "weak", "z".repeat(64).as_bytes(), 0o600);
     expect_refused(&env, &site, &listen, &weak, "単調");
 
-    // 0.0.0.0・::・ポート 0 は、トークンが良くても起動しない
+    // 0.0.0.0・::・ポート 0、tailnet でもループバックでもないアドレス（LAN の私的アドレス・文書用の予約アドレス・
+    // 帯のすぐ外）は、トークンが良くても起動しない
     let port = free_addr().port();
     for bad in [
         format!("0.0.0.0:{port}"),
         format!("[::]:{port}"),
         "127.0.0.1:0".to_owned(),
+        format!("192.168.1.10:{port}"),
+        format!("10.0.0.5:{port}"),
+        format!("172.16.0.1:{port}"),
+        format!("192.0.2.1:{port}"),
+        format!("100.63.255.255:{port}"),
+        format!("100.128.0.1:{port}"),
+        format!("[2001:db8::1]:{port}"),
+        format!("[fd7a:115c:a1e1::1]:{port}"),
     ] {
         expect_refused(&env, &site, &bad, &real, &bad);
     }
@@ -323,4 +370,58 @@ fn a_sigterm_during_the_startup_recovery_ends_serve_without_listening() {
     );
     assert!(slot_is_free(&env.state), "実行枠が外れない");
     assert!(!out.stderr.contains(TOKEN));
+}
+
+/// 別のプロセスの CLI（`run`）が実行枠を持っている間、HTTP の `POST`（受付も `dry_run` も）は 409 `busy`。CLI が終わって枠が
+/// 空けば、HTTP は受け付けられる。プロセスをまたいだ排他（flock）の確かめ。
+#[test]
+fn while_a_separate_cli_run_holds_the_slot_http_posts_get_409_until_it_ends() {
+    let env = Env::new("cli-vs-http");
+    let site = photo_site(DAY, DAY, three());
+    // 写真を送る copy を 30 秒止める（CLI の run が実行中のまま）
+    env.add_rule("copy", 0, 1, sleep_ms(30_000));
+    let mut kids = Reaper(Vec::new());
+    kids.0.push(spawn_run(&env, &site));
+    let copy_pid = wait_for_call(&env, "copy", 30);
+    assert!(process_exists(copy_pid));
+
+    let token = token_file(&env, "token", TOKEN.as_bytes(), 0o600);
+    let addr = free_addr();
+    kids.0
+        .push(spawn_serve(&env, &site, &addr.to_string(), &token));
+    wait_ready(&mut kids.0[1], addr);
+    // serve の起動時の復旧は、枠が取れないので見送られる（CLI の記録には触れない）
+
+    for body in [
+        json!({"from": DAY, "destination": "yamareco"}),
+        json!({"from": DAY, "destination": "yamareco", "dry_run": true}),
+        json!({"from": "2030-03-12", "destination": "yamareco", "request_id": "rid-http"}),
+    ] {
+        let r = post_json(addr, TOKEN, &body);
+        assert_eq!((r.status, r.error().as_str()), (409, "busy"), "{body}");
+    }
+    // CLI のジョブは、HTTP からも見える（実行中）。HTTP は新しいジョブを作っていない
+    let list = get(addr, "/v1/exports", TOKEN).json();
+    assert_eq!(list["jobs"].as_array().map(Vec::len), Some(1), "{list}");
+    assert_eq!(list["jobs"][0]["status"], "running", "{list}");
+    assert!(process_exists(copy_pid), "CLI の rclone が止められた");
+
+    // CLI を止める（SIGTERM。rclone を止めて回収してから、枠を手放して 1 で終わる）
+    let run = kids.0.remove(0);
+    send(run.id(), libc::SIGTERM);
+    let out = wait_exit(run, 20);
+    assert_eq!(out.code, Some(1), "{} {}", out.stdout, out.stderr);
+    assert!(!process_exists(copy_pid));
+    assert!(slot_is_free(&env.state), "CLI が終わったのに枠が空かない");
+    // 枠が空けば、HTTP の dry_run は通る（書かない確認）
+    let r = post_json(
+        addr,
+        TOKEN,
+        &json!({"from": DAY, "destination": "yamareco", "dry_run": true}),
+    );
+    assert_eq!(r.status, 200, "{}", r.body);
+
+    let serve = kids.0.remove(0);
+    send(serve.id(), libc::SIGTERM);
+    assert_eq!(wait_exit(serve, 20).code, Some(0));
 }

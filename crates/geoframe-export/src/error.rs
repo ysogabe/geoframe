@@ -34,11 +34,13 @@ pub enum ErrorCode {
     Busy,
     /// 同じ `request_id` で、期間・宛先・`on_exists` が違う。
     RequestIdMismatch,
+    /// 終了の印が立っている（HTTP は 503。新しい書き出しを始めない）。
+    ShuttingDown,
 }
 
 impl ErrorCode {
     /// 全部（記録から読んだ文字列を [`ErrorCode::parse`] で戻すのに使う）。
-    pub const ALL: [ErrorCode; 22] = [
+    pub const ALL: [ErrorCode; 23] = [
         Self::InvalidDate,
         Self::InvalidRange,
         Self::InvalidDestination,
@@ -61,6 +63,7 @@ impl ErrorCode {
         Self::Internal,
         Self::Busy,
         Self::RequestIdMismatch,
+        Self::ShuttingDown,
     ];
 
     pub fn parse(s: &str) -> Option<Self> {
@@ -91,6 +94,7 @@ impl ErrorCode {
             Self::Internal => "internal",
             Self::Busy => "busy",
             Self::RequestIdMismatch => "request_id_mismatch",
+            Self::ShuttingDown => "shutting_down",
         }
     }
 
@@ -121,6 +125,7 @@ impl ErrorCode {
             Self::Internal => "内部エラー",
             Self::Busy => "実行中の書き出しがあります",
             Self::RequestIdMismatch => "同じ request_id で、期間・宛先・on_exists が違います",
+            Self::ShuttingDown => "終了の途中のため、新しい書き出しを始めません",
         }
     }
 }
@@ -165,7 +170,7 @@ impl std::error::Error for ExportError {}
 mod tests {
     use super::*;
 
-    const ALL: [ErrorCode; 22] = ErrorCode::ALL;
+    const ALL: [ErrorCode; 23] = ErrorCode::ALL;
 
     #[test]
     fn codes_are_fixed_unique_snake_case_strings() {
@@ -193,6 +198,7 @@ mod tests {
         assert_eq!(ErrorCode::NothingToExport.as_str(), "nothing_to_export");
         assert_eq!(ErrorCode::Busy.as_str(), "busy");
         assert_eq!(ErrorCode::RequestIdMismatch.as_str(), "request_id_mismatch");
+        assert_eq!(ErrorCode::ShuttingDown.as_str(), "shutting_down");
     }
 
     #[test]

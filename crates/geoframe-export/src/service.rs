@@ -4,7 +4,7 @@
 //!
 //! | HTTP | 呼ぶもの | 断り |
 //! |---|---|---|
-//! | `POST /v1/exports`（`dry_run` でない） | [`Service::submit`] → `202 {"job_id", "status"}` | [`SubmitError::Busy`]・[`SubmitError::RequestIdMismatch`] は 409、[`SubmitError::Blocked`] は 503（`blocked`）、[`SubmitError::Internal`] は 500 |
+//! | `POST /v1/exports`（`dry_run` でない） | [`Service::submit`] → `202 {"job_id", "status"}` | [`SubmitError::Busy`]・[`SubmitError::RequestIdMismatch`] は 409、[`SubmitError::Blocked`]・[`SubmitError::ShuttingDown`] は 503（`blocked`・`shutting_down`）、[`SubmitError::Internal`] は 500 |
 //! | `POST /v1/exports`（`dry_run`） | [`Service::dry_run`] → `200` の本文 | [`DryRunError::Busy`] は 409、[`DryRunError::Blocked`]・写真サービス・Drive の失敗は 503 |
 //! | `GET /v1/exports/{job_id}` | [`Service::lookup`] → [`Lookup::Found`] は 200、[`Lookup::NotFound`] は 404、[`Lookup::Unreadable`] は 500 | |
 //! | `GET /v1/exports` | [`Service::list`] | |
@@ -22,8 +22,12 @@
 //!    返す）、無ければ [`SubmitError::Busy`]。取れたら、記録を書く前にもう一度照会する（見つかれば、枠を手放してそのジョブを返す。
 //!    二重に登録しない）。
 //! 3. 記録の走査で、`blocked`・読めない記録があれば [`SubmitError::Blocked`]（解除するまで、新しい書き出しを断る）。
-//! 4. ジョブの記録（`running`）を書く。書けなければ [`SubmitError::Internal`]（何も始めない）。
-//! 5. 別のスレッドで流す（[`crate::flow::execute`]。実行枠のガードはそのスレッドへ移る。終わりの記録を書いてから手放す）。
+//! 4. **終了の印**（[`Service::cancel`]）が立っていれば、何も登録せずに [`SubmitError::ShuttingDown`]（HTTP の入口が本文を読んでいる
+//!    間に印が立つと、入口の確認と登録の間に隙間ができる。この確認は、排他と実行枠を取ったあと、記録を書く直前にする。これで、
+//!    印を見て断った受付は、記録も実行枠も残さない。確認のあとに印が立てば、記録は書かれ、ジョブのスレッドが印を見て止まる
+//!    〔記録は次の復旧が片付ける〕）。
+//! 5. ジョブの記録（`running`）を書く。書けなければ [`SubmitError::Internal`]（何も始めない）。
+//! 6. 別のスレッドで流す（[`crate::flow::execute`]。実行枠のガードはそのスレッドへ移る。終わりの記録を書いてから手放す）。
 //!    スレッドを作れなければ、記録を `failed`（`internal`）にして [`SubmitError::Internal`]。
 //!
 //! ## キャンセル（SIGINT・SIGTERM）と終わりの待ち（T6 から）
@@ -65,6 +69,8 @@ pub enum SubmitError {
     RequestIdMismatch,
     /// `blocked` の記録・読めない記録がある。HTTP は 503。
     Blocked(Blocking),
+    /// 終了の印が立っていた（記録を書く直前に確かめる）。何も登録していない。HTTP は 503（`shutting_down`）。
+    ShuttingDown,
     Internal(ExportError),
 }
 
@@ -75,6 +81,7 @@ impl SubmitError {
             Self::Busy => ErrorCode::Busy,
             Self::RequestIdMismatch => ErrorCode::RequestIdMismatch,
             Self::Blocked(_) => ErrorCode::Blocked,
+            Self::ShuttingDown => ErrorCode::ShuttingDown,
             Self::Internal(e) => e.code,
         }
     }
@@ -132,6 +139,15 @@ pub enum StartupReport {
         recovery: RecoverReport,
     },
     Failed(ExportError),
+}
+
+/// [`Service::begin`] の使い方（受付と、`run` コマンド）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// `submit`: `request_id` を照会し、記録を書く直前に終了の印を確かめる。
+    Submit,
+    /// `run_foreground`: `request_id` は見ない。終了の印は、ジョブの中（[`crate::flow`]）で見る。
+    Foreground,
 }
 
 /// [`Service::begin`] の結果。
@@ -296,7 +312,7 @@ impl Service {
             return Ok(found);
         }
         between();
-        let (guard, handle) = match self.begin(req, true)? {
+        let (guard, handle) = match self.begin(req, Mode::Submit)? {
             Began::Started(started) => *started,
             Began::Duplicate(found) => return Ok(found),
         };
@@ -316,6 +332,9 @@ impl Service {
                 let inner = Arc::clone(&inner);
                 move || {
                     let _running = RunningGuard(Arc::clone(&inner));
+                    // `_running` より後に宣言する: パニックでも、実行枠を手放してから数を減らす（`wait_idle` が戻ったとき、
+                    // 実行枠はもう空いている）
+                    let guard = guard;
                     let mut handle = handle;
                     let ctx = inner.context();
                     flow::execute(&ctx, &mut handle, &guard);
@@ -364,7 +383,8 @@ impl Service {
 
     /// 実行枠を取り、`blocked` でないことを確かめ、ジョブの記録（`running`）を書く。`request_id` は、取れなかったときと、
     /// 取れた直後（記録を書く前）に、もう一度照会する（別のプロセスが、最初の照会のあとに登録しているかもしれない）。
-    fn begin(&self, req: &ExportRequest, dedupe: bool) -> Result<Began, SubmitError> {
+    fn begin(&self, req: &ExportRequest, mode: Mode) -> Result<Began, SubmitError> {
+        let dedupe = mode == Mode::Submit;
         let guard = match self.acquire() {
             Ok(g) => g,
             Err(e) if e.code == ErrorCode::Busy => {
@@ -381,6 +401,10 @@ impl Service {
         if let Some(b) = self.inner.store.scan().blocking() {
             return Err(SubmitError::Blocked(b));
         }
+        // 記録を書く直前（上の「受付」の 4）
+        if mode == Mode::Submit && self.inner.cancel.is_cancelled() {
+            return Err(SubmitError::ShuttingDown);
+        }
         let record = JobRecord::new(JobId::generate().map_err(SubmitError::Internal)?, req);
         self.inner
             .store
@@ -394,7 +418,7 @@ impl Service {
 
     /// 同じ実行枠で、呼び出したスレッドの上で流す（`run` コマンド）。終わった記録を返す。`request_id` は見ない。
     pub fn run_foreground(&self, req: &ExportRequest) -> Result<JobRecord, SubmitError> {
-        let Began::Started(started) = self.begin(req, false)? else {
+        let Began::Started(started) = self.begin(req, Mode::Foreground)? else {
             unreachable!("request_id を見ないので、重複にはならない")
         };
         let (guard, mut handle) = *started;

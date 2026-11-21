@@ -24,6 +24,10 @@ test = false
 [dependencies]
 # manifest のキーの順を旧 manifest に揃えるため preserve_order を明示する（geoframe crate も同じ feature。新しいパッケージは増えない）
 serde_json = { version = "1.0.154", features = ["preserve_order"] }
+# 本文の JSON のキーの重複を見つける自前の Deserialize（serde_json が既に引いている版。derive は使わない）
+serde = "1.0.229"
+# Bearer トークンの SHA-256（固定長のダイジェストにして比べる）。geoframe crate と同じ版（Cargo.lock に新しいパッケージは増えない）
+ring = "0.17"
 # 表示用 JPEG のデコード（geoframe crate と同じ版・同じ feature）
 zune-jpeg = "0.5.15"
 # 写真サービスへの GET（127.0.0.1 の http だけ。TLS は要らない）。同期 API

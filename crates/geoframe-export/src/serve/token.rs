@@ -10,10 +10,17 @@
 //! - 通常のファイル（ディレクトリ・FIFO・デバイスは不可）
 //! - 実行ユーザーの所有
 //! - グループ・その他の権限が無い（`0600`・`0400` など。`mode & 0o077 == 0`）
-//! - 前後の改行（`\r`・`\n`）を除いて 32 バイト以上 [`MAX_LEN`] バイト以下。ファイルの大きさにも上限を掛ける（改行の余裕を足して 1,088 バイト）
+//! - 前後の改行（`\r`・`\n`）を除き、末尾の `=`（詰め物）も除いた部分が 32 バイト以上、詰め物を含めて [`MAX_LEN`] バイト以下。
+//!   ファイルの大きさにも上限を掛ける（改行の余裕を足して 1,088 バイト）
 //! - 文字は RFC 6750 の token68（`A-Za-z0-9` と `-._~+/`、末尾の `=` の詰め物）だけ。空白・制御文字・日本語は不可
 //!   （`Authorization: Bearer <token>` の値としてそのまま照合できる文字の範囲）
-//! - 異なるバイトが 8 種類以上（`aaaa…`・`abab…` のような弱い値を断る。16 進 32 文字の乱数でも、8 種類を下回る確率は無視できる）
+//! - 詰め物を除いた部分に、異なるバイトが 8 種類以上（`aaaa…`・`abab…` のような弱い値を断る。16 進 32 文字の乱数でも、8 種類を
+//!   下回る確率は無視できる。詰め物の `=` は、長さにも種類にも数えない）
+//!
+//! ## 照合
+//!
+//! 起動のときに、トークンの SHA-256 だけを持つ（値そのものは持たない）。照合は、示された値も SHA-256 にして、32 バイトの
+//! ダイジェストどうしを、途中で抜けずに XOR を畳み込んで比べる（示された値の長さで時間が変わらない）。
 //!
 //! 親ディレクトリには何も求めない（設計が縛るのはファイルだけ。unit の `StateDirectory` や `/etc` の下に置ける）。親の途中の
 //! シンボリックリンクは、`O_NOFOLLOW` では見ない（最後の要素だけ。配置時に所有者だけが書ける場所に置く）。
@@ -24,6 +31,8 @@ use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
+use ring::digest::{SHA256, SHA256_OUTPUT_LEN, digest};
+
 /// トークンの長さの下限と上限（バイト）。
 pub const MIN_LEN: usize = 32;
 pub const MAX_LEN: usize = 1024;
@@ -32,9 +41,15 @@ const MAX_FILE: usize = MAX_LEN + 64;
 /// 異なるバイトの種類の下限。
 const MIN_DISTINCT: usize = 8;
 
-/// トークンの値。`Debug` は伏せる。
+/// トークンの SHA-256 ダイジェスト（値そのものは持たない）。`Debug` は伏せる。
 #[derive(Clone, PartialEq, Eq)]
-pub struct Token(Vec<u8>);
+pub struct Token([u8; SHA256_OUTPUT_LEN]);
+
+fn sha256(bytes: &[u8]) -> [u8; SHA256_OUTPUT_LEN] {
+    let mut out = [0u8; SHA256_OUTPUT_LEN];
+    out.copy_from_slice(digest(&SHA256, bytes).as_ref());
+    out
+}
 
 impl fmt::Debug for Token {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -54,55 +69,57 @@ impl Token {
             .rposition(|b| !matches!(b, b'\r' | b'\n'))
             .map_or(start, |i| i + 1);
         let value = &bytes[start..end];
-        if value.len() < MIN_LEN {
-            return Err(TokenError::TooShort);
-        }
         if value.len() > MAX_LEN {
             return Err(TokenError::TooLong);
         }
+        // 詰め物（末尾の `=`）は、長さにも種類にも数えない
         let body = {
             let pad = value.iter().rev().take_while(|b| **b == b'=').count();
             &value[..value.len() - pad]
         };
+        if body.is_empty() && !value.is_empty() {
+            // `=` だけ
+            return Err(TokenError::BadCharacters);
+        }
+        if body.len() < MIN_LEN {
+            return Err(TokenError::TooShort);
+        }
         let plain = |b: &u8| {
             b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
         };
-        if body.is_empty() || !body.iter().all(plain) {
+        if !body.iter().all(plain) {
             return Err(TokenError::BadCharacters);
         }
         let mut seen = [false; 256];
-        for b in value {
+        for b in body {
             seen[usize::from(*b)] = true;
         }
         if seen.iter().filter(|s| **s).count() < MIN_DISTINCT {
             return Err(TokenError::LowVariety);
         }
-        Ok(Self(value.to_vec()))
+        Ok(Self(sha256(value)))
     }
 
     /// `Authorization` ヘッダの値（`Bearer <token>`）が、このトークンか。スキームは大文字小文字を区別しない（RFC 7235）。
-    /// トークンの照合は定数時間（[`ct_eq`]）。
+    /// 照合は、示された値の SHA-256 と、持っているダイジェストの、固定長の定数時間の比較（[`ct_eq`]）。
     pub fn matches_authorization(&self, value: &[u8]) -> bool {
         const SCHEME: &[u8] = b"Bearer ";
         let presented =
             if value.len() >= SCHEME.len() && value[..SCHEME.len()].eq_ignore_ascii_case(SCHEME) {
                 &value[SCHEME.len()..]
             } else {
-                // スキームが違っても、照合の時間は変えない（空の値と比べる）
+                // スキームが違っても、照合の手間は変えない（空の値のダイジェストと比べる。空はトークンに成り得ない）
                 &[][..]
             };
-        let ok = ct_eq(&self.0, presented);
-        ok && presented.len() == self.0.len()
+        ct_eq(&self.0, &sha256(presented))
     }
 }
 
-/// 長さが違っても、比べる回数は `secret` の長さで決まる（`presented` の長さで時間が変わらない）。違いは、全バイトを見てから
-/// まとめて判定する（途中で抜けない）。
-fn ct_eq(secret: &[u8], presented: &[u8]) -> bool {
-    let mut diff = secret.len() ^ presented.len();
-    for (i, s) in secret.iter().enumerate() {
-        let p = presented.get(i).copied().unwrap_or(0);
-        diff |= usize::from(s ^ p);
+/// 32 バイトのダイジェストの比較。全バイトの違いを XOR で畳み込んでから判定する（途中で抜けない）。
+fn ct_eq(a: &[u8; SHA256_OUTPUT_LEN], b: &[u8; SHA256_OUTPUT_LEN]) -> bool {
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
     }
     std::hint::black_box(diff) == 0
 }
@@ -284,14 +301,44 @@ mod tests {
     }
 
     #[test]
-    fn the_comparison_does_not_depend_on_where_the_values_differ() {
-        assert!(ct_eq(b"abc", b"abc"));
-        assert!(!ct_eq(b"abc", b"abd"));
-        assert!(!ct_eq(b"abc", b"ab"));
-        assert!(!ct_eq(b"abc", b"abcd"));
-        assert!(!ct_eq(b"abc", b""));
-        // 長さが違うだけで、先頭が同じでも一致しない（末尾が 0 バイトの詰め物でも）
-        assert!(!ct_eq(b"abc", b"abc\0"));
-        assert!(!ct_eq(b"ab\0", b"ab"));
+    fn the_comparison_folds_every_byte_of_a_fixed_length_digest() {
+        let a = sha256(b"abc");
+        assert!(ct_eq(&a, &sha256(b"abc")));
+        assert!(!ct_eq(&a, &sha256(b"abd")));
+        assert!(!ct_eq(&a, &sha256(b"")));
+        // どの位置が違っても一致しない（先頭・末尾の 1 ビットだけの違いも）
+        for i in 0..SHA256_OUTPUT_LEN {
+            let mut b = a;
+            b[i] ^= 1;
+            assert!(!ct_eq(&a, &b), "{i}");
+        }
+        // 長さの違う値は、ダイジェストが違う（末尾が 0 バイトの詰め物でも）
+        assert_ne!(sha256(b"abc"), sha256(b"abc\0"));
+    }
+
+    #[test]
+    fn padding_counts_toward_neither_the_length_nor_the_variety() {
+        // 詰め物を足して 32 バイトにはならない
+        assert_eq!(
+            Token::parse(format!("{}==", &GOOD[..30]).as_bytes()),
+            Err(TokenError::TooShort)
+        );
+        assert_eq!(
+            Token::parse(format!("{}=", &GOOD[..31]).as_bytes()),
+            Err(TokenError::TooShort)
+        );
+        assert!(Token::parse(format!("{GOOD}=").as_bytes()).is_ok());
+        // `=` を 8 種類目に数えない（7 種類 + 詰め物）
+        let seven = "abcdefg".repeat(6);
+        assert_eq!(
+            Token::parse(format!("{seven}==").as_bytes()),
+            Err(TokenError::LowVariety)
+        );
+        assert_eq!(Token::parse(seven.as_bytes()), Err(TokenError::LowVariety));
+        // 詰め物のあとの文字は不可（途中の `=` は詰め物でない）
+        assert_eq!(
+            Token::parse(format!("{}={}", &GOOD[..16], &GOOD[16..]).as_bytes()),
+            Err(TokenError::BadCharacters)
+        );
     }
 }

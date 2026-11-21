@@ -364,6 +364,33 @@ fn a_held_slot_refuses_jobs_and_dry_run_and_creates_no_record() {
     assert_eq!(v["status"], "succeeded");
 }
 
+/// 本文の検査のあと（HTTP の入口の確認のあと）に終了の印が立つ隙間: 排他と実行枠を取ったあと、記録を書く直前に印を確かめ、
+/// 立っていれば何も登録しない（記録も rclone の呼び出しも実行枠の保持も残らない）。
+#[test]
+fn a_shutdown_mark_raised_just_before_the_registration_registers_nothing() {
+    let mut env = Env::new("flow-shutdown-race");
+    let site = photo_site(DAY, DAY, three_photos());
+    env.settings.feed_base = site.base.clone();
+    let cancel = Cancel::new();
+    let svc = Service::with_cancel(env.settings.clone(), fast_tuning(), cancel.clone()).unwrap();
+    // 最初の request_id の照会のあと、実行枠を取る前に印が立つ（上の隙間を、決まった順に起こす）
+    let raiser = cancel.clone();
+    let e = svc
+        .submit_with_hook(&request(DAY, None, None, Some("rid-race")), &|| {
+            raiser.cancel()
+        })
+        .unwrap_err();
+    assert_eq!(e, SubmitError::ShuttingDown);
+    assert_eq!(e.code(), ErrorCode::ShuttingDown);
+    assert_eq!(job_files(&env), 0, "記録を作らない");
+    assert!(env.calls().is_empty(), "rclone を呼ばない");
+    assert!(slot_is_free(&env.state), "実行枠を残さない");
+    assert!(svc.wait_idle(Duration::ZERO), "ジョブのスレッドは作らない");
+    // 印が立っている間は、そのあとの受付もすべて断る
+    assert_eq!(svc.submit(&day()).unwrap_err(), SubmitError::ShuttingDown);
+    assert_eq!(job_files(&env), 0);
+}
+
 #[test]
 fn a_second_job_while_one_is_running_is_refused_and_the_first_still_finishes() {
     let mut env = Env::new("flow-running");

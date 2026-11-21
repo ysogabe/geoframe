@@ -12,6 +12,7 @@
 //! | | 本文を 10 秒で読み切れない | 408 | `{"error":"request_timeout"}` |
 //! | | JSON でない・オブジェクトでない・`dry_run` の型違い | 400 | `{"error":"invalid_body"}` |
 //! | | 未知のキー | 400 | `{"error":"unknown_field"}` |
+//! | | 同じキーが 2 回以上（値が違っても同じでも。`null` も） | 400 | `{"error":"duplicate_field"}`（最後の値で上書きしない） |
 //! | | 値の誤り | 400 | `{"error":"invalid_date"}` など（[`crate::error::ErrorCode`]。キーの型違いも、そのキーのコード） |
 //! | | 受け付けた（同じ `request_id` の再送も） | 202 | `{"job_id","status"}` |
 //! | | 実行中（実行枠が取れない）・`request_id` の中身違い | 409 | `{"error":"busy"}`・`{"error":"request_id_mismatch"}` |
@@ -33,28 +34,42 @@
 //!   IPv6（`::ffff:a.b.c.d`）は IPv4 にそろえてから比べる（`::` に待ち受けると、IPv4 の相手がその形で見えるため）。
 //! - **認証**は 403 の次（許可外は、トークンを見る前に断る）。`/healthz` だけは認証しない。門は経路の振り分けの外側にあるので、
 //!   未知の経路・違うメソッドも、許可外は 403、トークン無しは 401 になる（経路の有無を漏らさない）。
-//! - **接続**は同時に [`Limits::max_connections`]（既定 8）本まで。枠が空くまで accept しない（超えた分は、503 ではなく、OS の
-//!   待ち行列で待たされる）。許可外の相手も、ヘッダを読み終えるまで（最長 10 秒）枠を 1 つ使う（403 は、ヘッダを読んでから返す）。
-//!   1 接続 1 要求（keep-alive しない）。ヘッダの読み取りは [`Limits::header_timeout`]（10 秒。hyper の `header_read_timeout`）、本文の
-//!   読み取りは [`Limits::body_timeout`]（10 秒）。本文は [`Limits::max_body`]（4KiB）まで。
-//! - **ログ**は、起動・終了・起動時の復旧の結果と、アクセスログ（送信元・メソッド・経路の型〔ジョブ ID は形が合うときだけ〕・状態コード・
-//!   所要時間）だけ。ヘッダ・クエリ・本文・トークンは出さない。
+//! - **接続**は、許可した送信元から同時に [`Limits::max_connections`]（既定 8）本まで。accept の直後にソケットの相手で分け、
+//!   許可外の相手は、別の小さな枠（[`Limits::max_denied_connections`]、既定 2）で受け、短い期限（[`Limits::denied_header_timeout`]、
+//!   既定 2 秒）でヘッダを読んで 403 を返して閉じる（許可した送信元の枠を使わない。別の枠も埋まっていれば、何も返さずに閉じる）。
+//!   許可した送信元の枠が埋まっている間は、その接続を 1 本だけ accept して持ち、枠が空くまで次を accept しない（超えた分は、
+//!   503 ではなく、OS の待ち行列で待たされる）。1 接続 1 要求（keep-alive しない）。ヘッダの読み取りは [`Limits::header_timeout`]
+//!   （10 秒。hyper の `header_read_timeout`）、本文の読み取りは [`Limits::body_timeout`]（10 秒）。本文は [`Limits::max_body`]
+//!   （4KiB）まで。
+//! - **ログ**は、起動・終了・起動時の復旧の結果と、アクセスログ（送信元・メソッド〔`GET`・`POST`・それ以外は `other`〕・経路の
+//!   テンプレート〔`/healthz`・`/v1/exports`・`/v1/exports/{job_id}`・`other`〕・ジョブ ID〔照会で見つかった記録と、受付で作った
+//!   ものだけ。なければ `-`〕・状態コード・所要時間）だけ。ヘッダ・クエリ・本文・トークン・要求の文字列そのもの（パスの値・
+//!   メソッド名）は出さない。トークンは、小文字 16 進 32 文字（ジョブ ID と同じ形）にもでき、メソッド名・パス・クエリのどこにも
+//!   入れられるので、要求の文字列は記録しない。
 //!
 //! ## 起動と終了
 //!
-//! 1. `--listen`・トークンのファイルを検査する（満たさなければ終了コード 2。[`check_listen`]・[`token`]）。
+//! 1. `--listen`・トークンのファイルを検査する（満たさなければ終了コード 2。[`check_listen`]・[`token`]）。`--listen` は、tailnet の
+//!    アドレス帯（IPv4 は 100.64.0.0/10、IPv6 は fd7a:115c:a1e0::/48）かループバックだけ。
 //! 2. SIGINT・SIGTERM を tokio で受ける（`handle_signals` が真のとき。受けたら [`Cancel::cancel`]）。**起動時の復旧より前**に入れる
 //!    （復旧中に既定の動作で親だけが終わると、rclone が残る）。`run` と違い、libc の handler は入れない
 //!    （[`crate::app`]。印を立てる先は同じ [`Cancel`]）。
 //! 3. [`Service::startup_recovery`] を済ませてから待ち受ける。待ち受けながら終わるまで 503 にする案もあるが、復旧は実行枠を
 //!    取るので、その間の受付は 409（`busy`）になり、呼び出し側が「別のジョブが実行中」と取り違える。接続できない（拒否）なら
-//!    呼び出し側は再試行するだけで済み、systemd も起動の完了を待たない（`Type=simple`）。復旧中に印が立てば、待ち受けずに終わる。
+//!    呼び出し側は再試行するだけで済み、systemd も起動の完了を待たない（`Type=simple`）。復旧中に印が立てば、待ち受けずに終わる
+//!    （復旧が子〔rclone〕を回収して実行枠を手放すまでは、終わらない）。
 //!    **帰結**: 止まったジョブ（Drive の段階を記録した `running`）があると、本番の待ち（Drive の反映を 30 秒ずつ最大 4 回）のぶん、
 //!    再起動のあと最大で数分、待ち受けない（呼び出し側には接続拒否に見える。`/healthz` も答えない）。呼び出し側は、接続を拒否
 //!    されたら間隔を空けて再試行する。unit の起動の完了を `/healthz` で見張るなら、その間は未起動に見える（T7）。
-//! 4. 終了（印が立つ）では、新しい受付を閉じ、①接続のタスクが終わるのを待ち（要求の途中だったものは返事をする）、②受付・
-//!    `dry_run`・起動時の復旧のブロッキング処理が終わるのを待ち、③ [`Service::wait_idle`] でジョブのスレッドの終わり（rclone を止めて
-//!    `wait` し終えるまで）を待ってから終わる。止まったジョブの記録は確定せず、次の起動の復旧が片付ける。
+//! 4. 終了（印が立つ）では、新しい受付を閉じ、①接続のタスクが終わるのを待ち（要求の途中だったものは返事をする。**この待ちだけが
+//!    [`Limits::shutdown_wait`] の期限つき**。超えたら接続を落とし、終了コード 1）、②受付・`dry_run`・起動時の復旧の
+//!    ブロッキング処理が終わるのを待ち、③ [`Service::wait_idle`] でジョブのスレッドの終わり（rclone を止めて `wait` し終え、実行枠を
+//!    手放すまで）を待ってから終わる。②③は**期限なし**（「HTTP の打ち切りの期限」と「後始末の完了の条件」は別。印が立てば rclone は
+//!    止まるので、後始末は有限の時間で終わる前提）。どの経路（復旧の最中の印・待ち受けの失敗・通常の停止）でも、この後始末を
+//!    経てから返る。そのあと tokio のランタイムは、短い待ち（[`RUNTIME_DROP_WAIT`]）で破棄する（残ったブロッキング処理があっても、
+//!    無限に待たない）。止まったジョブの記録は確定せず、次の起動の復旧が片付ける。
+//!    本文の読み取りの最中に印が立っても、受付は、実行枠を取ったあと記録を書く直前にもう一度印を確かめ、立っていれば何も
+//!    登録せずに 503（`shutting_down`。[`crate::service::SubmitError::ShuttingDown`]）にする。
 
 mod token;
 
@@ -78,6 +93,7 @@ use axum::routing::get;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
+use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
@@ -103,21 +119,37 @@ pub const MAX_CONNECTIONS: usize = 8;
 pub const MAX_BODY: usize = 4096;
 /// ヘッダ・本文の読み取りの期限（design.md 6.1）。
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// 終了のとき、接続・ブロッキング処理（受付・`dry_run`・復旧）・ジョブのスレッドの終わりを待つ、**全体の**上限（1 つの期限を、
-/// 3 つの待ちで共有する）。systemd の既定の停止の待ち（`TimeoutStopSec` の既定は 90 秒）より前に出す。T7 の unit は、これより
-/// 長い `TimeoutStopSec`（例: 120 秒）を置く。ジョブのスレッドは、印が立てば rclone を止めて数秒で終わる。
+/// 許可していない送信元の接続の同時数（design.md 6.1）。許可した送信元の枠（[`MAX_CONNECTIONS`]）とは別に数える。
+pub const MAX_DENIED_CONNECTIONS: usize = 2;
+/// 許可していない送信元の、ヘッダの読み取りの期限（403 を返すだけなので、短い）。
+pub const DENIED_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
+/// 終了のとき、**接続**（HTTP）の終わりを待つ上限。超えたら、接続のタスクを落として、終了コード 1 にする。
+///
+/// これは「HTTP の打ち切りの期限」だけを決める。後始末（ブロッキング処理・ジョブのスレッドが、子の rclone を止めて回収し、
+/// 実行枠を手放すまで）の完了は、この期限と関係なく、**必ず待つ**（[`run`]。期限なし）。印が立てば rclone は止まるので、後始末は
+/// 有限の時間で終わる。systemd の既定の停止の待ち（`TimeoutStopSec` の既定は 90 秒）より前に出す。T7 の unit は、これより
+/// 長い `TimeoutStopSec`（例: 120 秒）を置く。
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(75);
+/// 後始末を待っている間、状況をログに出す間隔。
+const CLEANUP_LAP: Duration = Duration::from_secs(10);
+/// 後始末が済んだあとの、tokio のランタイムの破棄の待ち（数えていない残りがあっても、無限に待たない）。
+const RUNTIME_DROP_WAIT: Duration = Duration::from_secs(5);
 
 /// 本番の値は [`Limits::default`]。試験が短くする。
 #[derive(Debug, Clone)]
 pub struct Limits {
+    /// 許可した送信元の接続の同時数。
     pub max_connections: usize,
     /// ヘッダを読み終えるまでの期限（接続してから、または前の応答のあとから。1 接続 1 要求なので、接続してから）。
     pub header_timeout: Duration,
     /// 本文を読み終えるまでの期限（ヘッダを読んでから）。
     pub body_timeout: Duration,
     pub max_body: usize,
-    /// 終了のとき、接続・ブロッキング処理・ジョブの終わりを待つ全体の上限（印を見てから数える）。
+    /// 許可していない送信元の接続の同時数（超えた分は、何も返さずに閉じる）。
+    pub max_denied_connections: usize,
+    /// 許可していない送信元の、ヘッダを読み終えるまでの期限。
+    pub denied_header_timeout: Duration,
+    /// 終了のとき、接続の終わりを待つ上限（印を見てから数える。後始末の完了の待ちには掛からない。[`SHUTDOWN_WAIT`]）。
     pub shutdown_wait: Duration,
 }
 
@@ -128,6 +160,8 @@ impl Default for Limits {
             header_timeout: READ_TIMEOUT,
             body_timeout: READ_TIMEOUT,
             max_body: MAX_BODY,
+            max_denied_connections: MAX_DENIED_CONNECTIONS,
+            denied_header_timeout: DENIED_HEADER_TIMEOUT,
             shutdown_wait: SHUTDOWN_WAIT,
         }
     }
@@ -142,6 +176,8 @@ pub enum ListenError {
     ZeroPort,
     /// マルチキャスト・ブロードキャスト（具体的な 1 つのアドレスではない）。
     NotUnicast,
+    /// Tailscale の tailnet のアドレス帯でも、ループバックでもない（LAN の私的アドレス・グローバルアドレス・リンクローカルなど）。
+    NotTailnet,
 }
 
 impl std::fmt::Display for ListenError {
@@ -152,13 +188,30 @@ impl std::fmt::Display for ListenError {
             }
             Self::ZeroPort => "ポートを具体的に指定してください（0 は不可）",
             Self::NotUnicast => "マルチキャスト・ブロードキャストのアドレスは使えません",
+            Self::NotTailnet => {
+                "tailnet のアドレス帯（100.64.0.0/10・fd7a:115c:a1e0::/48）かループバック以外には待ち受けられません"
+            }
         })
     }
 }
 
-/// `--listen` の検査（design.md 3.4）。具体的な IP とポートだけを受け付ける。**ループバック（`127.0.0.1`・`::1`）は許す**:
-/// 同じホストの中からしか届かないので、すべてのインターフェースへの待ち受けの危険は無く、試験が空きポートで起こすのに要る。
-/// 本番は unit が tailnet の IP を渡す。
+/// Tailscale の tailnet のアドレス帯: IPv4 は CGNAT の 100.64.0.0/10、IPv6 は fd7a:115c:a1e0::/48（`ip` は IPv4-mapped を IPv4 に
+/// そろえたもの）。
+fn is_tailnet(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 100 && (o[1] & 0xc0) == 0x40
+        }
+        IpAddr::V6(v6) => v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+/// `--listen` の検査（design.md 3.4）。tailnet の具体的なアドレス（[`is_tailnet`]）とポートだけを受け付ける。LAN の私的アドレス
+/// （`192.168.x.x`・`10.x.x.x`・`172.16.0.0/12`）・グローバルアドレスなど、tailnet でないアドレスは、起動しない。
+///
+/// **ループバック（`127.0.0.0/8`・`::1`）は許す**: 同じホストの中からしか届かず、ネットワークには出ないので、本番でも害が
+/// 無い（unit が tailnet の IP を渡す運用は変わらない）。試験が空きポートで起こすのにも要る。
 pub fn check_listen(addr: SocketAddr) -> Result<(), ListenError> {
     let ip = addr.ip().to_canonical();
     if ip.is_unspecified() {
@@ -170,6 +223,9 @@ pub fn check_listen(addr: SocketAddr) -> Result<(), ListenError> {
     let broadcast = matches!(ip, IpAddr::V4(v4) if v4.is_broadcast());
     if ip.is_multicast() || broadcast {
         return Err(ListenError::NotUnicast);
+    }
+    if !ip.is_loopback() && !is_tailnet(ip) {
+        return Err(ListenError::NotTailnet);
     }
     Ok(())
 }
@@ -237,13 +293,51 @@ pub fn serve(
 
 /// 起動時の復旧を済ませ、待ち受けて、印が立つまで受け付ける。`on_ready` は、待ち受けを始めた直後に、実際のアドレスで呼ぶ
 /// （試験が空きポートを知る。`--listen` はポート 0 を断るが、ここは [`check_listen`] を通さない下位の入口なので、0 でもよい）。
-/// 印が立ったら、上の「起動と終了」の順に待ってから返る。0 なら、ジョブまで止まった。
+/// 印が立ったら、上の「起動と終了」の順に待ってから返る。0 なら、接続もジョブも、時間内に止まった。1 は、接続が
+/// [`Limits::shutdown_wait`] までに終わらず落とした（このときも、ジョブの子は回収してから返る）。
+///
+/// **どの経路でも**（起動時の復旧の最中に印が立った場合・待ち受けられなかった場合・通常の停止）、返る前に、ブロッキング処理
+/// （受付・`dry_run`・起動時の復旧）とジョブのスレッドの終わりを、期限なしで待つ。印が立てば rclone は止まり、ジョブも復旧も
+/// 子を回収して実行枠を手放すので、この待ちは有限の時間で終わる（その前提で、HTTP の打ち切りの期限とは分けてある）。
 pub fn run(service: Service, config: Config, on_ready: impl FnOnce(SocketAddr)) -> io::Result<u8> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()?;
-    runtime.block_on(run_async(service, config, on_ready))
+    let inflight = Arc::new(Inflight::default());
+    let outcome = runtime.block_on(run_async(
+        service.clone(),
+        config,
+        Arc::clone(&inflight),
+        on_ready,
+    ));
+
+    // 後始末（子の回収と実行枠の解放）。ここへ来た時点で終わる途中なので、印を立てる（待ち受けの失敗で返ってきた場合も、
+    // ジョブが残っていれば止める）
+    service.cancel().cancel();
+    // 先にブロッキング処理（受付がジョブのスレッドを作りうる）、そのあとジョブのスレッド
+    while !inflight.wait_idle(CLEANUP_LAP) {
+        tracing::warn!("受付・復旧のブロッキング処理の終わりを待っています");
+    }
+    while !service.wait_idle(CLEANUP_LAP) {
+        tracing::warn!("ジョブのスレッド（rclone の回収）の終わりを待っています");
+    }
+    // 数えていない残りがあっても、ランタイムの破棄で無限に待たない
+    runtime.shutdown_timeout(RUNTIME_DROP_WAIT);
+
+    match outcome {
+        Ok(0) => {
+            tracing::info!("終わりました");
+            Ok(0)
+        }
+        Ok(code) => {
+            tracing::error!(
+                "接続が時間内に終わらなかったので落としました（ジョブの子は回収しました）"
+            );
+            Ok(code)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// ブロッキング処理（受付・`dry_run`・起動時の復旧）の数。相手が切れてハンドラの future が落ちても、`spawn_blocking` の中身は
@@ -317,6 +411,7 @@ impl App {
 async fn run_async(
     service: Service,
     config: Config,
+    inflight: Arc<Inflight>,
     on_ready: impl FnOnce(SocketAddr),
 ) -> io::Result<u8> {
     let Config {
@@ -327,12 +422,12 @@ async fn run_async(
         handle_signals,
     } = config;
     let cancel = service.cancel().clone();
-    let inflight = Arc::new(Inflight::default());
     if handle_signals {
         spawn_signal_task(cancel.clone())?;
     }
 
-    // 起動時の復旧（実行枠を取る。済んでから待ち受ける。上の「起動と終了」の 3）
+    // 起動時の復旧（実行枠を取る。済んでから待ち受ける。上の「起動と終了」の 3）。ここの待ちに期限は掛けない（子を回収して
+    // 実行枠を手放すまで終わらない。印が立てば rclone は止まるので、有限）
     let recovery = {
         let service = service.clone();
         let guard = inflight.enter();
@@ -376,10 +471,14 @@ async fn run_async(
         inflight: Arc::clone(&inflight),
     });
     let slots = Arc::new(Semaphore::new(limits.max_connections));
+    let denied_slots = Arc::new(Semaphore::new(limits.max_denied_connections));
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut connections: JoinSet<()> = JoinSet::new();
     let mut tick = tokio::time::interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 許可した送信元の接続で、枠が空くのを待っているもの（accept した直後に相手で分けるので、枠が埋まっている間は、
+    // 1 本だけ accept して持つ。持っている間は accept しない）
+    let mut waiting: Option<(tokio::net::TcpStream, SocketAddr)> = None;
 
     loop {
         tokio::select! {
@@ -390,14 +489,25 @@ async fn run_async(
                 }
             }
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
-            accepted = accept(&listener, &slots) => match accepted {
-                Ok((stream, peer, permit)) => {
-                    let app = Arc::clone(&app);
-                    let stop = stop_rx.clone();
-                    connections.spawn(async move {
-                        let _permit = permit;
-                        serve_connection(app, stream, peer, stop).await;
-                    });
+            permit = Arc::clone(&slots).acquire_owned(), if waiting.is_some() => {
+                if let (Ok(permit), Some((stream, peer))) = (permit, waiting.take()) {
+                    spawn_connection(&mut connections, &app, &stop_rx, stream, peer, permit, limits.header_timeout);
+                }
+            }
+            accepted = listener.accept(), if waiting.is_none() => match accepted {
+                Ok((stream, peer)) => {
+                    if app.allow.contains(&peer.ip().to_canonical()) {
+                        match Arc::clone(&slots).try_acquire_owned() {
+                            Ok(permit) => spawn_connection(&mut connections, &app, &stop_rx, stream, peer, permit, limits.header_timeout),
+                            Err(_) => waiting = Some((stream, peer)),
+                        }
+                    } else {
+                        // 許可外は、許可した接続の枠を使わない。別の小さな枠が埋まっていれば、何も返さずに閉じる
+                        match Arc::clone(&denied_slots).try_acquire_owned() {
+                            Ok(permit) => spawn_connection(&mut connections, &app, &stop_rx, stream, peer, permit, limits.denied_header_timeout),
+                            Err(_) => drop(stream),
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(kind = %e.kind(), "接続を受け付けられません");
@@ -407,59 +517,39 @@ async fn run_async(
         }
     }
 
-    // 終わり: 新しい受付を閉じる → 接続のタスク → ブロッキング処理 → ジョブのスレッド
+    // 終わり: 新しい受付を閉じる → 接続のタスク（ここだけが期限つき）。ブロッキング処理とジョブのスレッドの完了は、
+    // 返ったあとの [`run`] が、期限なしで待つ
     tracing::info!("終了の印を受けました。受付を閉じて、実行中の処理の終わりを待ちます");
     drop(listener);
+    drop(waiting);
     let _ = stop_tx.send(true);
-    let deadline = tokio::time::Instant::now() + limits.shutdown_wait;
-    let joined = tokio::time::timeout_at(deadline, async {
+    let joined = tokio::time::timeout(limits.shutdown_wait, async {
         while connections.join_next().await.is_some() {}
     })
     .await
     .is_ok();
     if !joined {
-        // 接続のタスクは落とす（中のブロッキング処理は続くので、次の待ちで数える）
+        // 接続のタスクは落とす（中のブロッキング処理は続くので、[`Inflight`] が数えている）
         connections.abort_all();
     }
-    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
-    let blocking_idle = {
-        let inflight = Arc::clone(&inflight);
-        let wait = left();
-        tokio::task::spawn_blocking(move || inflight.wait_idle(wait))
-            .await
-            .unwrap_or(false)
-    };
-    let jobs_idle = {
-        let service = service.clone();
-        let wait = left();
-        tokio::task::spawn_blocking(move || service.wait_idle(wait))
-            .await
-            .unwrap_or(false)
-    };
-    if joined && blocking_idle && jobs_idle {
-        tracing::info!("終わりました");
-        Ok(0)
-    } else {
-        tracing::error!("時間内に実行中の処理が終わりませんでした");
-        Ok(1)
-    }
+    Ok(u8::from(!joined))
 }
 
-/// 枠が空いてから accept する（接続の総数の上限。空くまで OS の待ち行列で待たせる）。
-async fn accept(
-    listener: &TcpListener,
-    slots: &Arc<Semaphore>,
-) -> io::Result<(
-    tokio::net::TcpStream,
-    SocketAddr,
-    tokio::sync::OwnedSemaphorePermit,
-)> {
-    let permit = Arc::clone(slots)
-        .acquire_owned()
-        .await
-        .map_err(|_| io::Error::other("接続の枠が閉じました"))?;
-    let (stream, peer) = listener.accept().await?;
-    Ok((stream, peer, permit))
+fn spawn_connection(
+    connections: &mut JoinSet<()>,
+    app: &Arc<App>,
+    stop: &watch::Receiver<bool>,
+    stream: tokio::net::TcpStream,
+    peer: SocketAddr,
+    permit: tokio::sync::OwnedSemaphorePermit,
+    header_timeout: Duration,
+) {
+    let app = Arc::clone(app);
+    let stop = stop.clone();
+    connections.spawn(async move {
+        let _permit = permit;
+        serve_connection(app, stream, peer, stop, header_timeout).await;
+    });
 }
 
 /// SIGINT・SIGTERM を、[`Cancel::cancel`] を呼ぶ受け口にする。登録はこの関数の中で済む（呼んだ直後から有効）。
@@ -488,12 +578,12 @@ async fn serve_connection(
     stream: tokio::net::TcpStream,
     peer: SocketAddr,
     mut stop: watch::Receiver<bool>,
+    header_timeout: Duration,
 ) {
-    let limits = &app.limits;
     let service = TowerToHyperService::new(router(Arc::clone(&app), peer.ip().to_canonical()));
     let connection = http1::Builder::new()
         .timer(TokioTimer::new())
-        .header_read_timeout(limits.header_timeout)
+        .header_read_timeout(header_timeout)
         .keep_alive(false)
         .max_buf_size(16 * 1024)
         .serve_connection(TokioIo::new(stream), service);
@@ -530,10 +620,12 @@ fn router(app: Arc<App>, peer: IpAddr) -> Router {
         .layer(middleware::from_fn_with_state((app, peer), gate))
 }
 
-/// 送信元の許可 → 認証（`/healthz` 以外）→ 振り分け。アクセスログもここで出す（ヘッダ・クエリ・本文は出さない）。
+/// 送信元の許可 → 認証（`/healthz` 以外）→ 振り分け。アクセスログもここで出す。出すのは、送信元・メソッド（既知のものだけ）・
+/// 経路の型・ジョブ ID（記録が実際にあったとき）・状態コード・所要時間だけ。ヘッダ・クエリ・本文・要求の値そのものは出さない
+/// （トークンは、メソッド名にもパスにもクエリにも入れられるので、要求の文字列をそのまま記録しない）。
 async fn gate(State((app, peer)): State<Gate>, req: Request, next: Next) -> Response {
     let started = Instant::now();
-    let method = req.method().clone();
+    let method = method_label(req.method());
     let label = route_label(req.uri().path());
     let response = if !app.allow.contains(&peer) {
         error(StatusCode::FORBIDDEN, "forbidden")
@@ -545,10 +637,15 @@ async fn gate(State((app, peer)): State<Gate>, req: Request, next: Next) -> Resp
             .insert(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
         r
     };
+    let job_id = response
+        .extensions()
+        .get::<LoggedJob>()
+        .map_or("-", |j| j.0.as_str());
     tracing::info!(
         peer = %peer,
         method = %method,
         path = %label,
+        job_id = %job_id,
         status = response.status().as_u16(),
         elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "要求"
@@ -556,14 +653,37 @@ async fn gate(State((app, peer)): State<Gate>, req: Request, next: Next) -> Resp
     response
 }
 
-/// アクセスログの経路。型と、形が合うジョブ ID だけ（生のパスは出さない。制御文字や長い値をログに入れない）。
-fn route_label(path: &str) -> String {
+/// ハンドラが応答に付ける、アクセスログに出すジョブ ID。付けるのは、照会で**実際に見つかった**記録の ID と、受付で**作った**
+/// ID だけ（要求に書かれた文字列は付けない）。
+#[derive(Clone)]
+struct LoggedJob(String);
+
+fn with_job(mut response: Response, id: &JobId) -> Response {
+    response
+        .extensions_mut()
+        .insert(LoggedJob(id.as_str().to_owned()));
+    response
+}
+
+/// アクセスログのメソッド。既知の `GET`・`POST` だけ。ほかは `other`（メソッド名には、トークンと同じ文字を使えるので、
+/// 要求の値をそのまま記録しない）。
+fn method_label(method: &axum::http::Method) -> &'static str {
+    match *method {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        _ => "other",
+    }
+}
+
+/// アクセスログの経路。型だけ（ジョブ ID も含めない。トークンに許す文字〔小文字 16 進 32 文字を含む〕は、ジョブ ID の形と
+/// 区別できないので、パスの値は記録しない）。
+fn route_label(path: &str) -> &'static str {
     match path {
-        "/healthz" | "/v1/exports" => path.to_owned(),
+        "/healthz" => "/healthz",
+        "/v1/exports" => "/v1/exports",
         _ => match path.strip_prefix("/v1/exports/") {
-            Some(id) if JobId::parse(id).is_some() => path.to_owned(),
-            Some(_) => "/v1/exports/{invalid}".to_owned(),
-            None => "other".to_owned(),
+            Some(rest) if !rest.is_empty() && !rest.contains('/') => "/v1/exports/{job_id}",
+            _ => "other",
         },
     }
 }
@@ -639,8 +759,10 @@ async fn show_job(State(app): State<Arc<App>>, req: Request) -> Response {
         return error(StatusCode::NOT_FOUND, "not_found");
     };
     let service = app.service.clone();
+    let id_for_log = id.clone();
     match app.blocking(move || service.lookup(id.as_str())).await {
-        Some(Lookup::Found(v)) => json_response(StatusCode::OK, &v),
+        // 見つかった記録の ID だけをログに出す
+        Some(Lookup::Found(v)) => with_job(json_response(StatusCode::OK, &v), &id_for_log),
         Some(Lookup::NotFound) => error(StatusCode::NOT_FOUND, "not_found"),
         Some(Lookup::Unreadable) | None => internal(),
     }
@@ -648,7 +770,10 @@ async fn show_job(State(app): State<Arc<App>>, req: Request) -> Response {
 
 async fn create_job(State(app): State<Arc<App>>, req: Request) -> Response {
     if app.cancel.is_cancelled() {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "shutting_down");
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::ShuttingDown.as_str(),
+        );
     }
     let (parts, body) = req.into_parts();
     if !is_json(&parts.headers) {
@@ -679,7 +804,10 @@ async fn create_job(State(app): State<Arc<App>>, req: Request) -> Response {
 
     // 本文の読み取り中に印が立ったら、始めない（読み取りの前の確認だけだと、202 を返したのに動かないジョブができる）
     if app.cancel.is_cancelled() {
-        return error(StatusCode::SERVICE_UNAVAILABLE, "shutting_down");
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::ShuttingDown.as_str(),
+        );
     }
     let service = app.service.clone();
     if request.dry_run {
@@ -698,14 +826,19 @@ async fn create_job(State(app): State<Arc<App>>, req: Request) -> Response {
         };
     }
     match app.blocking(move || service.submit(&request)).await {
-        Some(Ok(s)) => json_response(
-            StatusCode::ACCEPTED,
-            &json!({"job_id": s.job_id.as_str(), "status": s.status.as_str()}),
+        Some(Ok(s)) => with_job(
+            json_response(
+                StatusCode::ACCEPTED,
+                &json!({"job_id": s.job_id.as_str(), "status": s.status.as_str()}),
+            ),
+            &s.job_id,
         ),
         Some(Err(e)) => {
             let status = match e {
                 SubmitError::Busy | SubmitError::RequestIdMismatch => StatusCode::CONFLICT,
-                SubmitError::Blocked(_) => StatusCode::SERVICE_UNAVAILABLE,
+                SubmitError::Blocked(_) | SubmitError::ShuttingDown => {
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
                 SubmitError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
             };
             error(status, e.code().as_str())
@@ -761,16 +894,51 @@ const KEYS: [&str; 6] = [
     "request_id",
 ];
 
-/// 本文（JSON）を [`RawRequest`] にする。未知のキー・オブジェクトでない本文・型の違いは、固定のコードで断る。`null` は、キーが
-/// 無いのと同じに扱う（必須の `from`・`destination` は、そのあとの検査で `invalid_date`・`invalid_destination`）。型の違いは、その
-/// キーの検査のコード（`from`・`to` は `invalid_date`、`dry_run` は `invalid_body`）。
+/// 本文のオブジェクト。未知のキー・重複したキーは、**最初に見つけた 1 つ**を理由として持つ（本文の最後まで読む。途中で
+/// 打ち切ると、JSON の文法の誤りと区別できない）。重複は、エスケープを戻したあとのキーで比べる（`"dry_run"` と `"dry\u005frun"`
+/// は同じキー）。値が `null` のキーも、1 つと数える。
+struct Strict(Result<Map<String, Value>, &'static str>);
+
+impl<'de> Deserialize<'de> for Strict {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+
+        impl<'de> Visitor<'de> for Visit {
+            type Value = Strict;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Strict, A::Error> {
+                let mut object = Map::new();
+                let mut problem: Option<&'static str> = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    let value = map.next_value::<Value>()?;
+                    if !KEYS.contains(&key.as_str()) {
+                        problem.get_or_insert("unknown_field");
+                    } else if object.contains_key(&key) {
+                        problem.get_or_insert("duplicate_field");
+                    } else {
+                        object.insert(key, value);
+                    }
+                }
+                Ok(Strict(problem.map_or(Ok(object), Err)))
+            }
+        }
+
+        deserializer.deserialize_map(Visit)
+    }
+}
+
+/// 本文（JSON）を [`RawRequest`] にする。未知のキー・重複したキー・オブジェクトでない本文・型の違いは、固定のコードで断る。
+/// `null` は、キーが無いのと同じに扱う（必須の `from`・`destination` は、そのあとの検査で `invalid_date`・`invalid_destination`）。
+/// 型の違いは、そのキーの検査のコード（`from`・`to` は `invalid_date`、`dry_run` は `invalid_body`）。
 fn parse_body(bytes: &[u8]) -> Result<RawRequest, &'static str> {
-    let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(bytes) else {
+    let Ok(Strict(checked)) = serde_json::from_slice::<Strict>(bytes) else {
         return Err("invalid_body");
     };
-    if object.keys().any(|k| !KEYS.contains(&k.as_str())) {
-        return Err("unknown_field");
-    }
+    let object = checked?;
     let text = |key: &str, code: ErrorCode| text_field(&object, key, code);
     let from = text("from", ErrorCode::InvalidDate)?;
     let to = text("to", ErrorCode::InvalidDate)?;
@@ -825,14 +993,55 @@ mod tests {
         for bad in ["224.0.0.1:9100", "255.255.255.255:9100", "[ff02::1]:9100"] {
             assert_eq!(check_listen(sa(bad)), Err(ListenError::NotUnicast), "{bad}");
         }
-        // 具体的な IP（文書用の予約アドレス）とループバック（試験用）
+        // tailnet の帯の中（端も）とループバック（試験用）
         for ok in [
+            "100.64.0.0:9100",
             "100.64.0.1:9100",
+            "100.96.1.2:9100",
+            "100.127.255.255:9100",
             "[fd7a:115c:a1e0::1]:9100",
+            "[fd7a:115c:a1e0:ffff:ffff:ffff:ffff:ffff]:9100",
             "127.0.0.1:9100",
+            "127.1.2.3:9100",
             "[::1]:9100",
+            "[::ffff:127.0.0.1]:9100",
+            "[::ffff:100.64.0.1]:9100",
         ] {
             assert_eq!(check_listen(sa(ok)), Ok(()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn listen_refuses_addresses_outside_the_tailnet_and_loopback() {
+        for bad in [
+            // LAN の私的アドレス
+            "192.168.1.10:9100",
+            "192.168.0.1:9100",
+            "10.0.0.5:9100",
+            "10.255.255.254:9100",
+            "172.16.0.1:9100",
+            "172.31.255.254:9100",
+            // 文書用の予約アドレス・リンクローカル・グローバル
+            "192.0.2.1:9100",
+            "198.51.100.7:9100",
+            "203.0.113.9:9100",
+            "169.254.1.1:9100",
+            "198.18.0.1:9100",
+            "[2001:db8::1]:9100",
+            "[fe80::1]:9100",
+            "[fd00::1]:9100",
+            "[2002::1]:9100",
+            // tailnet の帯のすぐ外
+            "100.63.255.255:9100",
+            "100.128.0.0:9100",
+            "100.0.0.1:9100",
+            "[fd7a:115c:a1e1::1]:9100",
+            "[fd7a:115b:a1e0::1]:9100",
+            "[fd7b:115c:a1e0::1]:9100",
+            // IPv4-mapped は IPv4 として判定する
+            "[::ffff:192.168.1.10]:9100",
+        ] {
+            assert_eq!(check_listen(sa(bad)), Err(ListenError::NotTailnet), "{bad}");
         }
     }
 
@@ -860,6 +1069,29 @@ mod tests {
             (br#"{"request_id":1}"#, "invalid_request_id"),
             (br#"{"dry_run":"true"}"#, "invalid_body"),
             (br#"{"dry_run":1}"#, "invalid_body"),
+            // 重複したキー（最後の値で上書きしない）
+            (br#"{"dry_run":true,"dry_run":false}"#, "duplicate_field"),
+            (br#"{"dry_run":false,"dry_run":true}"#, "duplicate_field"),
+            (
+                br#"{"from":"2030-03-10","from":"2030-03-11"}"#,
+                "duplicate_field",
+            ),
+            (br#"{"from":"2030-03-10","from":null}"#, "duplicate_field"),
+            (br#"{"to":null,"to":"2030-03-11"}"#, "duplicate_field"),
+            (
+                br#"{"dry_run":true,"dry\u005frun":false}"#,
+                "duplicate_field",
+            ),
+            (
+                br#"{"request_id":"a","destination":"b","request_id":"a"}"#,
+                "duplicate_field",
+            ),
+            // 未知のキーと重複の両方があるときは、先に見つけたほう
+            (br#"{"x":1,"from":"a","from":"b"}"#, "unknown_field"),
+            (br#"{"from":"a","from":"b","x":1}"#, "duplicate_field"),
+            (br#"{"x":1,"x":2}"#, "unknown_field"),
+            // 文法の誤りは、重複より先に invalid_body
+            (br#"{"from":"a","from":"b""#, "invalid_body"),
         ] {
             assert_eq!(
                 parse_body(body).map(|_| ()),
@@ -874,20 +1106,37 @@ mod tests {
     }
 
     #[test]
-    fn the_access_log_names_only_the_route_type_and_a_well_formed_job_id() {
+    fn the_access_log_names_only_known_methods_and_route_templates() {
+        use axum::http::Method;
         let id = "00112233445566778899aabbccddeeff";
         assert_eq!(route_label("/healthz"), "/healthz");
         assert_eq!(route_label("/v1/exports"), "/v1/exports");
+        // ジョブ ID の形でも、パスの値は出さない（トークンに許す文字は、ジョブ ID の形を含む）
         assert_eq!(
             route_label(&format!("/v1/exports/{id}")),
-            format!("/v1/exports/{id}")
+            "/v1/exports/{job_id}"
         );
-        assert_eq!(route_label("/v1/exports/../etc"), "/v1/exports/{invalid}");
         assert_eq!(
             route_label("/v1/exports/abc%0aTOKEN"),
-            "/v1/exports/{invalid}"
+            "/v1/exports/{job_id}"
         );
-        assert_eq!(route_label("/anything/else"), "other");
+        for other in [
+            "/v1/exports/",
+            "/v1/exports/a/b",
+            "/anything/else",
+            "/healthz/",
+            "*",
+            "",
+        ] {
+            assert_eq!(route_label(other), "other", "{other}");
+        }
+        assert_eq!(method_label(&Method::GET), "GET");
+        assert_eq!(method_label(&Method::POST), "POST");
+        for other in [Method::DELETE, Method::OPTIONS, Method::HEAD] {
+            assert_eq!(method_label(&other), "other");
+        }
+        let token_like = Method::from_bytes(id.as_bytes()).unwrap();
+        assert_eq!(method_label(&token_like), "other");
     }
 
     #[test]
