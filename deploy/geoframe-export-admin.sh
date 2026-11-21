@@ -55,6 +55,8 @@ PROPS=(
     RestrictNamespaces=true
     LockPersonality=true
     RestrictSUIDSGID=true
+    # SIGTERM（systemctl stop geoframe-export-cli）は本体だけに送る。rclone の止め方と順序は geoframe-export が決める（サービスと同じ）
+    KillMode=mixed
     # SIGTERM を受けた run は rclone を止めて wait し終えるまで終わらない。サービスの TimeoutStopSec と同じだけ待つ
     TimeoutStopSec=180s
 )

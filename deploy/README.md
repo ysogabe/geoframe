@@ -541,16 +541,12 @@ Google API Console の画面の項目名は変わることがあるので、公�
 
     対話の入力は次のとおりです。remote 名は **`gdrive`**（書き出し先の既定が`gdrive:yamareco`などで、設定ファイルのセクション名と合わせます）、種類は`drive`、
     `client_id`と`client_secret`に 8 で控えた値、`scope`は`1`（`drive`）、`service_account_file`は空、「Use web browser to automatically authenticate rclone with remote?」は **`n`** です。
-    すると rclone がブラウザのある機体で実行するコマンドを表示します。表示された指示を優先してください。表示はおおむね次の形です
-    （この 3 つの引数の形は、rclone v1.76.0 の`rclone authorize --help`の usage `rclone authorize <backendname> [base64_json_blob | client_id client_secret]`によります。実行例は公式の文書にありません）。
-
-    ```sh
-    rclone authorize "drive" "<client_id>" "<client_secret>"
-    ```
-
-    ブラウザのある別の機体（同じバージョンの rclone がよい）でこれを実行し、ブラウザで認可します（Drive の持ち主のアカウントで許可します）。
-    出てきたトークン（`{`で始まる JSON）を、このホストの`config_token>`に貼ります。「Configure this as a Shared Drive」は`n`、最後の確認は`y`です。
-    client_secret をコマンドの引数に書くので、その機体のシェルの履歴に残らないようにし、使い終わったら履歴から消します。
+    すると rclone がブラウザのある機体で実行するコマンドを表示します。**表示されたコマンドをそのまま、ブラウザのある別の機体（同じバージョンの rclone がよい）で実行してください。**
+    rclone v1.76.0 の`rclone authorize --help`の usage には、`rclone authorize <backendname> [base64_json_blob | client_id client_secret]`の 2 通りの形があります。
+    表示がどちらの形かは、実際に表示されたものに従います（`rclone authorize "drive" "<client_id>" "<client_secret>"`の形は usage から読み取ったもので、公式の文書に実行例はありません）。
+    ブラウザで認可し（Drive の持ち主のアカウントで許可します）、出てきたトークン（`{`で始まる JSON）を、このホストの`config_token>`に貼ります。
+    「Configure this as a Shared Drive」は`n`、最後の確認は`y`です。
+    client_secret をコマンドの引数に書く形になるときは、その機体のシェルの履歴に残らないようにし、使い終わったら履歴から消します。
 11. 設定ファイルが`0600`、ディレクトリが`0700`で、専用ユーザーの持ち物であることを確かめます。`geoframe-export`は、満たさないと起動しません。
 
     ```sh
@@ -595,12 +591,12 @@ systemd の展開では、`${GEOFRAME_EXPORT_LISTEN}`のような`${…}`は値�
 
 書き出し先の親フォルダ（`yamareco/`・`travel-journal/`）とは別の、最上位のフォルダ `geoframe-export-work`（既定。`--work-root`）を、Drive の画面で作ります。
 受け取り側が一覧する親フォルダの下に、作業用のものを見せないためです。このフォルダは誰とも共有しません。`yamareco/`・`travel-journal/`も先に存在している必要があります。
-別の名前にするときは、`--work-root`を unit と包みの両方に足します（remote 名は`gdrive`のまま、親フォルダの下にも入れ子にもしない）。
+別の名前にするときは、`--work-root`を unit と包みの両方に足します（remote 名は`gdrive`のまま、親フォルダの下にも入れ子にもしない）。足すのはリポジトリ側で変えてコミットしてからです（本番の`/opt/geoframe`のファイルは直接編集しません。§5）。
 
 ### 8.6 unit の有効化（ユーザーの立ち会いで）
 
 1. `systemd-analyze verify /usr/local/lib/systemd/system/geoframe-export.service`（バイナリや rclone を置いたあとなら警告は出ません）。
-2. CLI の包みで、まず**書かずに確認**します（§8.7 の`dry_run`。サービスの起動の前でも使えます）。
+2. CLI の包みで、まず**書かずに確認**します（§8.7 の`dry_run`。サービスの起動の前でも使えます）。包みの`systemd-run`の`-p`（`CapabilityBoundingSet=`の空の値など）を本物の`systemd-run`が受け付けるかは、試験がモックなので、この最初の実行で確かめます。
 3. 起動します。`sudo systemctl daemon-reload && sudo systemctl enable --now geoframe-export`、確認は`systemctl is-active geoframe-export`と`journalctl -u geoframe-export -f`です。
    待ち受けは`/healthz`（認証なし。送信元の許可は効く）で確かめます。
 
@@ -627,7 +623,7 @@ sudo systemctl stop geoframe-export-cli
 ```
 
 `serve`は包みでは動かさず、サービスで動かします。unit の固定の引数（`--rclone`・`--rclone-config`・`--state-dir`・`--feed-base`）を変えるときは、
-包みの同じ値も変えます（`bash deploy/geoframe-export-admin-test.sh`が、unit と包みの食い違いを検査します）。
+包みの同じ値も変えます。どちらもリポジトリ側で変えてコミットし、§5 の手順で本番へ入れます（本番の`/opt/geoframe`のファイルは直接編集しません）。`bash deploy/geoframe-export-admin-test.sh`が、unit と包みの食い違いを検査します。
 
 ### 8.8 配置の後の確認（PRD・設計 10 章）
 
