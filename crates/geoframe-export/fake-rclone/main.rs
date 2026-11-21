@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use model::{Ctl, Drive, Kind, ROOT, split_loc};
 use serde_json::{Value, json};
 
-const VALUE_FLAGS: [&str; 9] = [
+const VALUE_FLAGS: [&str; 10] = [
     "--config",
     "--retries",
     "--low-level-retries",
@@ -24,6 +24,7 @@ const VALUE_FLAGS: [&str; 9] = [
     "--count",
     "--exclude",
     "--include",
+    "--hash-type",
 ];
 
 struct Parsed {
@@ -71,11 +72,17 @@ impl Parsed {
     }
 }
 
-fn row_json(r: &model::Row) -> Value {
-    json!({
+/// `lsjson` の 1 項目。`--hash`（または `--hash-type`）があれば、ファイルには `Hashes: {"md5": "<小文字の 16 進>"}` を付ける
+/// （rclone v1.76.0 の `ListJSONItem.Hashes`。キーは `hash.MD5.String()` の小文字。MD5 を持たない項目は省略）。
+fn row_json(r: &model::Row, hashes: bool) -> Value {
+    let mut v = json!({
         "Path": r.path, "Name": r.name, "Size": r.size, "MimeType": r.mime,
         "ModTime": "2030-01-01T00:00:00.000000000Z", "IsDir": r.is_dir, "ID": r.id,
-    })
+    });
+    if let (true, Some(md5)) = (hashes, &r.md5) {
+        v["Hashes"] = json!({ "md5": md5 });
+    }
+    v
 }
 
 fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
@@ -131,7 +138,12 @@ fn operate(p: &Parsed, drive: &mut Drive, ctl: &Ctl, filewise: bool) -> Result<V
                     show_all_gdocs: flag_on("--drive-show-all-gdocs"),
                 },
             );
-            let v = Value::Array(rows.iter().map(row_json).collect());
+            // `--hash-type MD5` だけ（`--hash` なし）でも `--hash` を含意する。MD5 以外だけを頼まれたら、MD5 は出さない
+            let hash_types = p.values("--hash-type");
+            let hashes = (p.has("--hash") || !hash_types.is_empty())
+                && (hash_types.is_empty()
+                    || hash_types.iter().any(|t| t.eq_ignore_ascii_case("md5")));
+            let v = Value::Array(rows.iter().map(|r| row_json(r, hashes)).collect());
             Ok(serde_json::to_vec_pretty(&v).unwrap())
         }
         "cat" => {
@@ -212,7 +224,10 @@ fn operate(p: &Parsed, drive: &mut Drive, ctl: &Ctl, filewise: bool) -> Result<V
                 }
                 let content = (*file == "manifest.json")
                     .then(|| String::from_utf8_lossy(&bytes).into_owned());
-                drive.new_node(&parent, file, Kind::File, bytes.len() as u64, content, None);
+                let id =
+                    drive.new_node(&parent, file, Kind::File, bytes.len() as u64, content, None);
+                // 送った中身の MD5（`cat` で返す内容とは別。写真は中身を持たないので、実際に送ったバイトの MD5 を持つ）
+                drive.set_md5(&id, &model::md5_hex(&bytes));
             }
             Ok(Vec::new())
         }

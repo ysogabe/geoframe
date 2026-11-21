@@ -639,6 +639,16 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
         "旧フォルダが退避先にあると再確認できたので、残っていると知らせる"
     );
     assert!(w.replaced_exists() && w.env.drive().trashed.is_empty());
+    // 旧フォルダが退避先に残るので、新しい行に旧フォルダの ID と MD5 を `previous` として残す（次の復旧がゴミ箱へ移す前に
+    // 中身を照らすため。新しい行に置き換わっても旧 MD5 は失われない）
+    let folder = FolderName::parse(FOLDER).unwrap();
+    let row = w.env.published.find(Y, &folder).expect("row");
+    assert_eq!(row.folder_id, inc);
+    let previous = row.previous.expect("previous");
+    assert_eq!(previous.folder_id, old);
+    assert_eq!(previous.files, w.set.recorded());
+    // 起動時の復旧（手元の一式なし）が書く行の MD5 は、manifest と一致すると確かめた宛先の一覧の MD5
+    assert_eq!(row.files, Some(w.set.recorded()));
     // 記録は publishing まで進んでいる（retiring のままではない）
     let last = hook.records.last().cloned().unwrap();
     assert_eq!(last.stage, Stage::Publishing);
@@ -654,6 +664,8 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
     assert_eq!(w.env.drive().trashed, [old]);
     assert!(!w.replaced_exists());
     assert_eq!(w.recorded_id().as_deref(), Some(inc.as_str()));
+    // ゴミ箱へ移せたので、`previous` は残らない
+    assert!(w.env.published.find(Y, &folder).unwrap().previous.is_none());
     // 記録の前に Drive を変えていない（trashing を記録してから purge）
     let seq = w.env.mutations();
     let rec = seq.iter().rposition(|c| c == "record:trashing").unwrap();
@@ -917,6 +929,70 @@ fn the_old_folder_is_not_trashed_when_its_contents_changed_while_the_service_was
         );
         // 公開は済んでいる（宛先は新しい一式のまま）
         assert_eq!(w.dest().as_deref(), Some(inc.as_str()));
+    }
+}
+
+#[test]
+fn the_old_folder_is_not_trashed_when_a_file_was_rewritten_to_the_same_size_while_the_service_was_down()
+ {
+    // 停止中に、退避先の旧フォルダの写真が、同じ名前・同じ大きさのまま書き換えられた（旧フォルダの MD5 は公開の記録のまま）
+    // 旧フォルダの MD5 が確かめられないとき（記録に旧 ID の行も `previous` も無い・MD5 が無い）も、移さない
+    for (name, expected, case) in [
+        ("startup-rewritten", false, "rewritten"),
+        ("local-rewritten", true, "rewritten"),
+        ("no-md5", false, "no-md5"),
+        ("other-id", false, "other-id"),
+    ] {
+        let w = world(&format!("trash-md5-{name}"));
+        let old = w.env.seed_managed(Y, FOLDER, &w.set);
+        let inc = w.put_incoming();
+        w.retire(&old);
+        w.publish_incoming(&inc);
+        let folder = FolderName::parse(FOLDER).unwrap();
+        match case {
+            "rewritten" => {
+                let mut d = w.env.drive();
+                let dir = d
+                    .resolve(&["geoframe-export-work", "replaced", w.layout.retired_name()])
+                    .unwrap();
+                let id = d
+                    .children(&dir)
+                    .iter()
+                    .find(|n| n.name == "090000_1.jpg")
+                    .unwrap()
+                    .id
+                    .clone();
+                d.set_md5(&id, &"f".repeat(32));
+                w.env.save(&d);
+            }
+            // 記録の旧 ID の行に MD5 が無い（MD5 を記録する前の古い形）
+            "no-md5" => {
+                let mut row = w.env.published.find(Y, &folder).unwrap();
+                row.files = None;
+                w.env.published.upsert(row).unwrap();
+            }
+            // 記録の行が別のフォルダの ID で、`previous` も無い
+            _ => {
+                let mut row = w.env.published.find(Y, &folder).unwrap();
+                row.folder_id = "fidOTHER".into();
+                w.env.published.upsert(row).unwrap();
+            }
+        }
+        let set_expected = Expected::from_publish_files(&w.set.files);
+        let r = w.env.rclone();
+        let info = w
+            .recovery(&r, expected.then_some(&set_expected))
+            .run(
+                &progress(Stage::Publishing, Some(&old), Some(&inc)),
+                false,
+                &mut Hook::new(&w.env),
+            )
+            .unwrap_err();
+        assert_eq!(info.reason, BlockedReason::RetiredContentChanged, "{name}");
+        assert!(w.env.rclone_calls("purge").is_empty(), "{name}");
+        assert!(w.env.drive().trashed.is_empty(), "{name}");
+        assert!(w.replaced_exists(), "{name}");
+        assert_eq!(w.dest().as_deref(), Some(inc.as_str()), "{name}");
     }
 }
 

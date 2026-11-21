@@ -687,7 +687,12 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
    - 検証用の入口は、本番の`export.lock`を取らず、本番の`rclone/`にも触れません（`ReadWritePaths=`も足しません）。本番の書き出しと同時に動かしても、互いの記録・ロック・rclone の設定は書き換わりません。
      rclone がアクセストークンを更新すると、本番と写しのそれぞれの設定に、新しいアクセストークンが書かれるだけです。Google の更新トークン（`refresh_token`）は、本番と写しの両方から使っても、通常は変わりません。
      もし更新トークンが失効するなどして、片方で認証が通らなくなったら、検証用の写し（`/var/lib/geoframe-export-verify/rclone/rclone.conf`）を消して、上の手順で本番のものを写し直します。
-   - 旧 manifest と比べ、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことと、呼び出し側の実際の検証（サイズの突き合わせ）まで通ることを確かめます。
+   - 旧 manifest と比べる順序は、次のとおりです。
+     1. 旧 manifest のある日を、**本番の入口で`--dry-run`**します（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <日付> --destination yamareco --dry-run`）。
+        Drive を読むだけ（`lsjson`・`cat`）で、本番の記録・Drive は変わりません。宛先の状態（`target`・`existing_files`）と、書き出す枚数（`candidate_count`）を控えます。
+        旧 manifest のフォルダは旧実装が書いたもので、公開の記録に行がないので、`managed`が`false`なのは正しい挙動です（この入口では`replace`しません）。
+     2. そのあと、**同じ日を`--verify`で書き出し**（上の`--dry-run`を外す）、検証用の宛先にできた`manifest.json`と旧 manifest を比べます。本番の宛先には書きません。
+   - 比べるのは、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことです。呼び出し側の実際の検証（サイズの突き合わせ）まで通ることも確かめます。
    - 検証の前後で、本番の`published.json`の更新時刻が変わらないことを確かめます（検証用の書き出しの記録は、検証用の状態ディレクトリにだけ残ります）。
    - 最初の検証用の実行で、写しへ rclone が設定を書き戻せることを、5 の確認と合わせて見ます（試験はモックなので、ここで初めて確かめます）。
    - **検証が終わったら、写しを必ず消します**（通常の削除で足ります）。写しは、本番と同じ Drive 全体の権限の資格情報（更新トークンと`client_secret`）で、残しておく理由がありません。
@@ -708,6 +713,10 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
    - `moveto`が、フォルダの ID を保ったまま移すこと（ファイル単位の移動に切り替わらないこと。結果の ID の照合で`blocked`にならないこと）。
    - `lsjson`の`--drive-show-all-gdocs`・ショートカットの見え方（宛先と同じ名前のフォームやショートカットが`ambiguous_destination`として見えること）。
    - 無いディレクトリへの一覧で、終了コード 3 が返ること。
+   - `lsjson -R --hash --hash-type MD5`で、Drive のバイナリのファイル（写真と`manifest.json`）に、`Hashes`の`md5`（小文字の 16 進 32 文字）が出ること。
+     その値が、作業領域のファイルの MD5（`md5sum`）と一致すること。フォルダには`Hashes`が付かないこと。Google のネイティブ文書では`Hashes`が付かないこと
+     （一式に無いファイルとして断られます）。`replace`の前の確認（`modified`）と、ゴミ箱へ移す前の確認（`retired_content_changed`）は、この MD5 に頼ります。
+     書き出し直したフォルダに、Drive の画面で同じ名前・同じ大きさのファイルを上書きしたとき、`--dry-run`の`managed`が`false`になる（`replace`が`modified`で断られる）ことも見ます。
    - `cat --count`など、使う引数が rclone に受け付けられること。
 
 ### 8.9 トラブルシュート

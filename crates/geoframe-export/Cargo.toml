@@ -37,6 +37,8 @@ ureq = { version = "3", default-features = false, features = ["gzip"] }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # ログの出力（標準エラー。geoframe crate と同じ版・同じ feature。新しいパッケージは増えない）
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# 公開するファイルごとの MD5（Drive の `lsjson --hash` の MD5 と照らす。geoframe crate と同じ版。新しいパッケージは増えない）
+md-5 = "0.11.0"
 # 実効ユーザー ID（geteuid）と O_NOFOLLOW だけ
 libc = "0.2"
 # serve（HTTP の入口）: axum・tokio は geoframe crate と同じ版。hyper・hyper-util は axum が既に引いているもので、接続ごとの

@@ -27,8 +27,13 @@ fn the_fixture_passes_the_checks_and_gives_the_expected_candidates() {
     let ids: Vec<i64> = s.candidates.iter().map(|c| c.id).collect();
     assert_eq!(ids, [1, 6, 7, 8, 9, 10, 11, 4]);
     assert_eq!(s.candidate_count(), 8);
-    // カタログ全体の件数を引き継ぐ
-    assert_eq!((s.undated, s.invalid_time), (2, 3));
+    // カタログ全体の件数（一覧 API の `undated`: 2、`invalid_time`: 3）に、応答の `photos` の中の、時・分が範囲外の行
+    // （19: `2030-03-10 23:99`、20: `2030-03-11 24:00`。一覧 API は日付の部分が期間の日なので返し、`invalid_time` には
+    // 数えない）を足す。一覧 API が数えないので、二重にはならない（3 + 2 = 5）。候補には入らない
+    assert_eq!((s.undated, s.invalid_time), (2, 5));
+    assert!(!ids.contains(&19) && !ids.contains(&20));
+    // 一覧 API の応答の `invalid_time` そのものは 3 のまま（fixture は一覧 API の実際の応答と一致する）
+    assert_eq!(fixture_json()["invalid_time"], 3);
     // 作成待ちは id 4 の 1 枚。dry_run は件数で返し、本番の書き出しは derivative_pending で失敗する
     assert_eq!(s.pending_count(), 1);
     assert_eq!(s.candidates.last().unwrap().file, FileState::Pending);
@@ -95,7 +100,7 @@ fn the_fixture_round_trips_through_the_http_client() {
     let feed = FakeFeed::start(Reply::json(body));
     let s = FeedClient::new(&feed.base).select(&period()).unwrap();
     assert_eq!(s.candidate_count(), 8);
-    assert_eq!((s.undated, s.invalid_time, s.pending_count()), (2, 3, 1));
+    assert_eq!((s.undated, s.invalid_time, s.pending_count()), (2, 5, 1));
     assert_eq!(
         feed.request_lines(),
         ["GET /api/admin/export/photos?from=2030-03-10&to=2030-03-11 HTTP/1.1"]

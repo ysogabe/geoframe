@@ -27,7 +27,7 @@ fn production_limits_are_30_seconds_and_8_megabytes() {
 fn a_200_response_is_parsed_and_the_request_line_is_exact() {
     let feed = FakeFeed::start(Reply::json(serde_json::to_vec(&fixture_json()).unwrap()));
     let v = FeedClient::new(&feed.base).fetch(&period()).unwrap();
-    assert_eq!(v["photos"].as_array().unwrap().len(), 8);
+    assert_eq!(v["photos"].as_array().unwrap().len(), 10);
     assert_eq!(
         feed.request_lines(),
         ["GET /api/admin/export/photos?from=2030-03-10&to=2030-03-11 HTTP/1.1"]
@@ -173,7 +173,7 @@ fn a_body_of_exactly_8_megabytes_is_accepted_and_one_more_byte_is_refused() {
     let v = FeedClient::new(&ok.base)
         .fetch(&period())
         .expect("ちょうど 8MB は通る");
-    assert_eq!(v["photos"].as_array().unwrap().len(), 8);
+    assert_eq!(v["photos"].as_array().unwrap().len(), 10);
 
     let over = FakeFeed::start(Reply::json(padded_json(max + 1)));
     assert_eq!(
@@ -262,7 +262,7 @@ fn a_gzip_response_is_inflated_and_read() {
         &serde_json::to_vec(&fixture_json()).unwrap(),
     )));
     let v = FeedClient::new(&feed.base).fetch(&period()).unwrap();
-    assert_eq!(v["photos"].as_array().unwrap().len(), 8);
+    assert_eq!(v["photos"].as_array().unwrap().len(), 10);
 }
 
 #[test]

@@ -56,6 +56,9 @@ pub struct Node {
     pub kind: Kind,
     pub size: u64,
     pub content: Option<String>,
+    /// ファイルの MD5（`lsjson --hash` の `Hashes.md5`）。`None` なら、中身（`cat` が返すもの: `content`、無ければ `x` を
+    /// `size` 個）の MD5。`copy` で作ったファイルは、送った中身の MD5 を入れる。
+    pub md5: Option<String>,
     /// ショートカットの指す先の ID。
     pub target: Option<String>,
 }
@@ -78,6 +81,8 @@ pub struct Row {
     pub mime: String,
     pub is_dir: bool,
     pub id: String,
+    /// ファイルの MD5（フォルダ・ショートカット・Google の文書は `None`）。出すかどうかは `--hash` の有無で偽の rclone が決める。
+    pub md5: Option<String>,
 }
 
 /// `lsjson` の呼び出しごとの設定（偽の rclone が引数から作る）。
@@ -99,6 +104,28 @@ pub struct Drive {
     /// ゴミ箱を通さずに消した ID。
     pub deleted: Vec<String>,
     pub pending: Vec<Pending>,
+}
+
+/// バイト列の MD5（小文字の 16 進 32 文字）。
+pub fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    Md5::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+impl Node {
+    /// ファイルの MD5（`md5` があればそれ、無ければ `cat` が返す中身の MD5）。
+    pub fn effective_md5(&self) -> String {
+        self.md5.clone().unwrap_or_else(|| {
+            let body = self
+                .content
+                .clone()
+                .unwrap_or_else(|| "x".repeat(self.size as usize));
+            md5_hex(body.as_bytes())
+        })
+    }
 }
 
 /// `remote:a/b` を部品に分ける（remote 名は見ない）。
@@ -189,9 +216,17 @@ impl Drive {
             kind,
             size,
             content,
+            md5: None,
             target,
         });
         id
+    }
+
+    /// ファイルの MD5 を指定する（中身を書き換えたが同じ名前・同じ大きさのまま、を作る）。
+    pub fn set_md5(&mut self, id: &str, md5: &str) {
+        if let Some(n) = self.node_mut(id) {
+            n.md5 = Some(md5.to_owned());
+        }
     }
 
     pub fn add_file<S: AsRef<str>>(
@@ -203,6 +238,20 @@ impl Drive {
     ) -> String {
         let p = self.mkdir_p(parent);
         self.new_node(&p, name, Kind::File, size, content.map(str::to_owned), None)
+    }
+
+    /// MD5 を指定して足す（公開する一式と同じ MD5 のファイルを作るとき）。
+    pub fn add_file_md5<S: AsRef<str>>(
+        &mut self,
+        parent: &[S],
+        name: &str,
+        size: u64,
+        content: Option<&str>,
+        md5: &str,
+    ) -> String {
+        let id = self.add_file(parent, name, size, content);
+        self.set_md5(&id, md5);
+        id
     }
 
     pub fn add_shortcut<S: AsRef<str>>(
@@ -305,6 +354,7 @@ impl Drive {
                                 mime: mime_of(&t.name, t.kind).to_owned(),
                                 is_dir,
                                 id: format!("{}\t{}", t.id, n.id),
+                                md5: (t.kind == Kind::File).then(|| t.effective_md5()),
                             });
                             if is_dir && recursive {
                                 self.ls_into(&t.id, &path, recursive, opts, out, depth + 1);
@@ -317,6 +367,7 @@ impl Drive {
                                 mime: SHORTCUT_DANGLING_MIME.to_owned(),
                                 is_dir: false,
                                 id: n.id.clone(),
+                                md5: None,
                             });
                         }
                     } else {
@@ -327,6 +378,7 @@ impl Drive {
                             mime: SHORTCUT_MIME.to_owned(),
                             is_dir: false,
                             id: n.id.clone(),
+                            md5: None,
                         });
                     }
                 }
@@ -338,6 +390,7 @@ impl Drive {
                         mime: DIR_MIME.to_owned(),
                         is_dir: true,
                         id: n.id.clone(),
+                        md5: None,
                     });
                     if recursive {
                         self.ls_into(&n.id, &path, recursive, opts, out, depth + 1);
@@ -350,6 +403,7 @@ impl Drive {
                     mime: mime_of(&n.name, Kind::File).to_owned(),
                     is_dir: false,
                     id: n.id.clone(),
+                    md5: Some(n.effective_md5()),
                 }),
                 Kind::Gdoc | Kind::Form => {
                     if n.kind == Kind::Form && !opts.show_all_gdocs {
@@ -362,6 +416,7 @@ impl Drive {
                         mime: mime_of(&n.name, n.kind).to_owned(),
                         is_dir: false,
                         id: n.id.clone(),
+                        md5: None,
                     });
                 }
             }
@@ -459,7 +514,7 @@ impl Drive {
             .map(|n| {
                 json!({
                     "id": n.id, "parent": n.parent, "name": n.name, "kind": n.kind.as_str(),
-                    "size": n.size, "content": n.content, "target": n.target,
+                    "size": n.size, "content": n.content, "target": n.target, "md5": n.md5,
                 })
             })
             .collect();
@@ -495,6 +550,7 @@ impl Drive {
                         kind: Kind::parse(n["kind"].as_str().unwrap_or("file")),
                         size: n["size"].as_u64().unwrap_or(0),
                         content: n["content"].as_str().map(str::to_owned),
+                        md5: n["md5"].as_str().map(str::to_owned),
                         target: n["target"].as_str().map(str::to_owned),
                     })
                     .collect()

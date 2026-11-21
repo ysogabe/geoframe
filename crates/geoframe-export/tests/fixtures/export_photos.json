@@ -73,12 +73,32 @@
       "inferred": false
     },
     {
+      "id": 19,
+      "file": "derivatives/p19.jpg",
+      "title": "IMG_0019",
+      "lat": 12.19,
+      "lon": 34.19,
+      "time": "2030-03-10 23:99",
+      "elev": null,
+      "inferred": false
+    },
+    {
       "id": 4,
       "file": null,
       "title": "試験市 試験区",
       "lat": null,
       "lon": null,
       "time": "2030-03-11 23:59",
+      "elev": null,
+      "inferred": false
+    },
+    {
+      "id": 20,
+      "file": "derivatives/p20.jpg",
+      "title": "IMG_0020",
+      "lat": 12.2,
+      "lon": 34.2,
+      "time": "2030-03-11 24:00",
       "elev": null,
       "inferred": false
     }

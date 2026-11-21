@@ -169,6 +169,18 @@ pub struct PublishFile {
     /// `/` 区切りの相対パス。単日は `HHMM00_<id>.jpg`、期間は `YYYY-MM-DD/HHMM00_<id>.jpg`、最後に `manifest.json`。
     pub path: String,
     pub size: u64,
+    /// 作業領域に書いた中身の MD5（小文字の 16 進 32 文字）。Drive の `lsjson --hash` の MD5 と照らす
+    /// （送った中身の検証と、`replace` の前の「その後に中身が変わっていないか」の確認。`published.json` にも残す）。
+    pub md5: String,
+}
+
+/// バイト列の MD5（小文字の 16 進 32 文字）。
+pub fn md5_hex(bytes: &[u8]) -> String {
+    use md5::{Digest, Md5};
+    Md5::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// [`prepare`] の結果。作業領域には、`files` の各ファイルが書いてある。
@@ -445,6 +457,7 @@ fn prepare_inner(
         files.push(PublishFile {
             path: filename.clone(),
             size: bytes.len() as u64,
+            md5: md5_hex(&bytes),
         });
         photos.push(PhotoEntry {
             id: candidate.id,
@@ -485,6 +498,7 @@ fn prepare_inner(
     files.push(PublishFile {
         path: "manifest.json".to_owned(),
         size: manifest_bytes.len() as u64,
+        md5: md5_hex(&manifest_bytes),
     });
     // 期限を過ぎてから「成功」を返さない（呼び出し側は、この後に宛先を照会して送る）
     gate.check()?;

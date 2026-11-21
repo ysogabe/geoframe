@@ -202,10 +202,13 @@ impl Env {
         for (rel, size) in files {
             let path = dir.join(rel);
             std::fs::create_dir_all(path.parent().unwrap()).expect("ws dir");
-            std::fs::write(&path, vec![b'j'; *size as usize]).expect("ws file");
+            // 写真ごとに中身（と MD5）が違うように、パスの文字を繰り返して `size` バイトにする
+            let body: Vec<u8> = rel.bytes().cycle().take(*size as usize).collect();
+            std::fs::write(&path, &body).expect("ws file");
             publish.push(PublishFile {
                 path: (*rel).to_owned(),
                 size: *size,
+                md5: model::md5_hex(&body),
             });
         }
         let manifest = manifest_json(dest, folder, files);
@@ -214,6 +217,7 @@ impl Env {
         publish.push(PublishFile {
             path: "manifest.json".to_owned(),
             size: bytes.len() as u64,
+            md5: model::md5_hex(bytes.as_bytes()),
         });
         Set {
             dir,
@@ -231,6 +235,8 @@ impl Env {
                 folder: FolderName::parse(folder).unwrap(),
                 folder_id: id.clone(),
                 job_id: JobId::parse(JOB_B).unwrap(),
+                files: Some(set.recorded()),
+                previous: None,
             })
             .expect("published.json");
         id
@@ -251,7 +257,7 @@ impl Env {
                 None => (path.to_vec(), f.path.as_str()),
             };
             let content = (f.path == "manifest.json").then(|| set.manifest.clone());
-            d.add_file(&parent, name, f.size, content.as_deref());
+            d.add_file_md5(&parent, name, f.size, content.as_deref(), &f.md5);
         }
         self.save(&d);
         id
@@ -271,6 +277,19 @@ pub struct Set {
     pub dir: PathBuf,
     pub files: Vec<PublishFile>,
     pub manifest: String,
+}
+
+impl Set {
+    /// 公開の記録（`published.json`）に書くファイルごとの MD5。
+    pub fn recorded(&self) -> Vec<geoframe_export::published::RecordedFile> {
+        self.files
+            .iter()
+            .map(|f| geoframe_export::published::RecordedFile {
+                path: f.path.clone(),
+                md5: f.md5.clone(),
+            })
+            .collect()
+    }
 }
 
 /// 段階の記録の口（T5 の代わり）。記録を偽の rclone と同じ `calls.log` に追記するので、「記録が Drive の操作より先」を

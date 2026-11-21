@@ -11,6 +11,11 @@
 //!   から。`cat` の失敗は `drive_unavailable`。
 //! - 「一覧が manifest と一致する」の比べ方は 1 つ（[`Expected::matches`]）。送信後の検証・管理しているフォルダの変更の確認・
 //!   公開後の確認・復旧が、同じものを使う。
+//! - 一致の条件は、相対パス・サイズに加えて、**MD5**（`lsjson -R --hash --hash-type MD5` の `Hashes.md5`）。期待する MD5 が
+//!   分かっているとき（これから送る一式の検証、公開の記録 `published.json` の MD5 と照らす `replace` の前の確認・ゴミ箱へ移す前の
+//!   確認）は、一覧の MD5 が一致しなければ一致しない（同じ名前・同じ大きさのまま中身を書き換えられたものを見落とさない）。
+//!   MD5 を持たないファイル（Google のネイティブ文書など）は、期待した MD5 を持てないので「一式に無いファイル」として断る。
+//!   期待する MD5 が無いのは、手元にも記録にも一式の MD5 が無い、起動時の復旧の照合（宛先の manifest だけで照合する）だけ。
 //!
 //! ## ショートカット
 //!
@@ -47,7 +52,7 @@ use crate::error::{ErrorCode, ExportError};
 use crate::folder::FolderName;
 use crate::image::PublishFile;
 use crate::jobid::JobId;
-use crate::published::PublishedStore;
+use crate::published::{PublishedStore, RecordedFile};
 use crate::rclone::{CopyScope, LsEntry, Rclone, RemoteLoc, RunError};
 use crate::recovery::{Kind, Observed, Seen};
 use crate::request::Destination;
@@ -143,7 +148,8 @@ impl Layout {
 /// 公開するフォルダの中身（相対パスとサイズ）。**並べ替えたリスト**で持つ。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expected {
-    files: Vec<(String, u64)>,
+    /// （相対パス、サイズ、MD5）。MD5 が `None` のファイルは、MD5 を比べない。
+    files: Vec<(String, u64, Option<String>)>,
     dirs: Vec<String>,
 }
 
@@ -155,10 +161,10 @@ fn rel_ok(p: &str) -> bool {
 }
 
 impl Expected {
-    fn build(mut files: Vec<(String, u64)>) -> Self {
+    fn build(mut files: Vec<(String, u64, Option<String>)>) -> Self {
         files.sort();
         let mut dirs: Vec<String> = Vec::new();
-        for (path, _) in &files {
+        for (path, _, _) in &files {
             let mut parts: Vec<&str> = path.split('/').collect();
             parts.pop();
             for i in 1..=parts.len() {
@@ -172,11 +178,16 @@ impl Expected {
 
     /// これから送る一式（[`crate::image::Prepared::files`]。最後が `manifest.json`）から。
     pub fn from_publish_files(files: &[PublishFile]) -> Self {
-        Self::build(files.iter().map(|f| (f.path.clone(), f.size)).collect())
+        Self::build(
+            files
+                .iter()
+                .map(|f| (f.path.clone(), f.size, Some(f.md5.clone())))
+                .collect(),
+        )
     }
 
     /// Drive の manifest（旧 manifest と同じ形）から: `photos` の `filename`・`file_size` と、`manifest.json` そのもの
-    /// （大きさは一覧の値）。形が違えば `None`。
+    /// （大きさは一覧の値）。形が違えば `None`。MD5 は持たない（[`Self::with_md5`] で足す）。
     pub fn from_manifest(manifest: &Value, manifest_size: u64) -> Option<Self> {
         let mut files = Vec::new();
         for p in manifest.get("photos")?.as_array()? {
@@ -184,22 +195,56 @@ impl Expected {
             if !rel_ok(name) || name == MANIFEST_NAME {
                 return None;
             }
-            files.push((name.to_owned(), p.get("file_size")?.as_u64()?));
+            files.push((name.to_owned(), p.get("file_size")?.as_u64()?, None));
         }
-        files.push((MANIFEST_NAME.to_owned(), manifest_size));
+        files.push((MANIFEST_NAME.to_owned(), manifest_size, None));
         Some(Self::build(files))
     }
 
-    /// 一覧（`lsjson -R`）が、期待した中身と完全に一致するか。ファイルは（パス・サイズ）の並べ替えたリスト、フォルダは
-    /// 期待したファイルの親だけ。ショートカットが 1 つでもあれば一致しない。
+    /// 公開の記録の MD5 を、ファイルごとに足す。記録のパスの集合が、期待したファイルのパスの集合と**完全に同じ**でなければ
+    /// `None`（記録と manifest が食い違っている）。
+    pub fn with_md5(mut self, recorded: &[RecordedFile]) -> Option<Self> {
+        if recorded.len() != self.files.len() {
+            return None;
+        }
+        for (path, _, md5) in &mut self.files {
+            let mut hits = recorded.iter().filter(|r| &r.path == path);
+            let (Some(r), None) = (hits.next(), hits.next()) else {
+                return None;
+            };
+            *md5 = Some(r.md5.clone());
+        }
+        Some(self)
+    }
+
+    /// 期待した一式のファイルごとの MD5（公開の記録に書く）。MD5 が分からないファイルが 1 つでもあれば `None`。
+    pub fn recorded_files(&self) -> Option<Vec<RecordedFile>> {
+        self.files
+            .iter()
+            .map(|(path, _, md5)| {
+                md5.as_ref().map(|m| RecordedFile {
+                    path: path.clone(),
+                    md5: m.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// 一覧（`lsjson -R --hash`）が、期待した中身と完全に一致するか。ファイルは（パス・サイズ・MD5）の並べ替えたリスト
+    /// （期待した MD5 があるファイルは、一覧の MD5 も同じでなければならない。一覧に MD5 が無ければ一致しない）、
+    /// フォルダは期待したファイルの親だけ。ショートカットが 1 つでもあれば一致しない。
     pub fn matches(&self, entries: &[LsEntry]) -> bool {
         if entries.iter().any(LsEntry::is_shortcut) {
             return false;
         }
-        let mut files: Vec<(String, u64)> = entries
+        let mut files: Vec<(String, u64, Option<String>)> = entries
             .iter()
             .filter(|e| !e.is_dir)
-            .filter_map(|e| u64::try_from(e.size).ok().map(|s| (e.path.clone(), s)))
+            .filter_map(|e| {
+                u64::try_from(e.size)
+                    .ok()
+                    .map(|s| (e.path.clone(), s, e.md5.clone()))
+            })
             .collect();
         if files.len() != entries.iter().filter(|e| !e.is_dir).count() {
             return false;
@@ -211,7 +256,13 @@ impl Expected {
             .map(|e| e.path.clone())
             .collect();
         dirs.sort();
-        files == self.files && dirs == self.dirs
+        dirs == self.dirs
+            && files.len() == self.files.len()
+            && files.iter().zip(&self.files).all(|(got, want)| {
+                got.0 == want.0
+                    && got.1 == want.1
+                    && want.2.as_ref().is_none_or(|m| got.2.as_ref() == Some(m))
+            })
     }
 }
 
@@ -266,11 +317,14 @@ pub enum Target {
 /// このサービスが書いたフォルダか。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Managed {
-    /// 公開の記録の ID と manifest の `generator`・`destination`・`folder` が合い、中身が manifest と完全に一致する。
+    /// 公開の記録の ID と manifest の `generator`・`destination`・`folder` が合い、中身が manifest と完全に一致し、
+    /// ファイルごとの MD5 が公開の記録の MD5 と一致する。
     Managed,
-    /// 公開の記録に ID が無い・記録が読めない、または manifest が無い・`generator` や `destination`・`folder` が違う。
+    /// 公開の記録に ID が無い・記録が読めない・記録に MD5 が無い（MD5 を記録する前の古い形の行）、または manifest が無い・
+    /// `generator` や `destination`・`folder` が違う。
     NotManaged,
-    /// このサービスが書いたが、manifest に無いファイルやフォルダが足されている・サイズが違う・足りない。
+    /// このサービスが書いたが、manifest に無いファイルやフォルダが足されている・サイズが違う・足りない・MD5 が公開の記録と違う
+    /// （同じ名前・同じ大きさのまま中身を書き換えられた）。
     Modified,
 }
 
@@ -327,9 +381,11 @@ impl<'a> Drive<'a> {
     // ---- 一覧 ----
 
     /// `--drive-skip-shortcuts` ありの一覧。場所が無い（終了コード 3）ことも含め、失敗は `drive_unavailable`。
+    ///
+    /// 再帰の一覧（フォルダの中身の照合に使う）にだけ、ファイルの MD5（`--hash --hash-type MD5`）を付ける。
     fn list(&self, loc: &RemoteLoc, recursive: bool) -> Result<Vec<LsEntry>, ExportError> {
         self.rclone
-            .lsjson(loc, recursive, true)
+            .lsjson(loc, recursive, true, recursive)
             .map_err(RunError::into_query_error)
     }
 
@@ -339,7 +395,7 @@ impl<'a> Drive<'a> {
         recursive: bool,
     ) -> Result<Vec<LsEntry>, ExportError> {
         self.rclone
-            .lsjson(loc, recursive, false)
+            .lsjson(loc, recursive, false, false)
             .map_err(RunError::into_query_error)
     }
 
@@ -459,11 +515,15 @@ impl<'a> Drive<'a> {
         listing: &Listing,
         published: &PublishedStore,
     ) -> Result<Managed, ExportError> {
-        // 1. 公開の記録の同じ種類・同じフォルダ名の行の ID と一致する（記録が読めない・行が無ければ管理していない）
-        match published.find_id(self.layout.destination, &self.layout.folder) {
-            Some(recorded) if recorded == id => {}
+        // 1. 公開の記録の同じ種類・同じフォルダ名の行の ID と一致する（記録が読めない・行が無ければ管理していない）。
+        //    行に MD5 が無ければ（MD5 を記録する前の古い形）、中身が変わっていないと確かめられないので、管理していないものとして断る
+        let recorded_files = match published.find(self.layout.destination, &self.layout.folder) {
+            Some(rec) if rec.folder_id == id => match rec.files {
+                Some(files) => files,
+                None => return Ok(Managed::NotManaged),
+            },
             _ => return Ok(Managed::NotManaged),
-        }
+        };
         // 2. 直下の manifest.json: 一覧から、ちょうど 1 つのファイルで 4MB 以下
         let top: Vec<&LsEntry> = listing
             .entries
@@ -494,9 +554,14 @@ impl<'a> Drive<'a> {
         if !self.is_ours(&manifest) {
             return Ok(Managed::NotManaged);
         }
-        // 4. 中身が manifest（と manifest.json 自身）に完全に一致する。足されたもの・サイズの違うものがあれば modified
+        // 4. 中身が manifest（と manifest.json 自身）に完全に一致し、ファイルごとの MD5 が公開の記録と一致する。足されたもの・
+        //    サイズの違うもの・MD5 の違うもの（同じ名前・同じ大きさのまま中身を書き換えられたもの）があれば modified。
+        //    公開の記録のファイルの集合が manifest と食い違うときも、中身が変わっているものとして modified
         let Some(expected) = Expected::from_manifest(&manifest, size) else {
             return Ok(Managed::NotManaged);
+        };
+        let Some(expected) = expected.with_md5(&recorded_files) else {
+            return Ok(Managed::Modified);
         };
         if listing.has_shortcut || !expected.matches(&listing.entries) {
             return Ok(Managed::Modified);
@@ -561,8 +626,13 @@ impl<'a> Drive<'a> {
     }
 
     /// フォルダの中身が、そのフォルダの manifest が言う一式と一致するか（復旧用。手元に一式が無いとき）。manifest は、
-    /// このサービスが書いたもの（`generator`・`destination`・`folder`）でなければならない。
-    pub fn folder_matches_its_manifest(&self, place: Place) -> Result<bool, ExportError> {
+    /// このサービスが書いたもの（`generator`・`destination`・`folder`）でなければならない。`md5` があれば（公開の記録の
+    /// ファイルごとの MD5）、一覧の MD5 もそれと一致しなければならない（ファイルの集合が manifest と違えば不一致）。
+    pub fn folder_matches_its_manifest(
+        &self,
+        place: Place,
+        md5: Option<&[RecordedFile]>,
+    ) -> Result<bool, ExportError> {
         let (dir, manifest) = match place {
             Place::Incoming => (
                 &self.layout.incoming_loc,
@@ -605,14 +675,42 @@ impl<'a> Drive<'a> {
         let Some(manifest) = serde_json::from_slice::<Value>(&bytes).ok() else {
             return Ok(false);
         };
-        let Some(expected) = self
+        let Some(mut expected) = self
             .is_ours(&manifest)
             .then(|| Expected::from_manifest(&manifest, size))
             .flatten()
         else {
             return Ok(false);
         };
+        if let Some(recorded) = md5 {
+            let Some(with) = expected.with_md5(recorded) else {
+                return Ok(false);
+            };
+            expected = with;
+        }
         Ok(!listing.has_shortcut && expected.matches(&listing.entries))
+    }
+
+    /// 宛先の中身のファイルごとの MD5（公開の記録に書く。起動時の復旧で、手元に一式が無いとき）。直前に
+    /// [`Self::folder_matches_its_manifest`] で manifest と一致すると確かめたフォルダに使う。ショートカットがある・MD5 を
+    /// 持たないファイルがある・manifest.json が無いときは `None`（記録には MD5 を書かない。次の `replace` は断る）。
+    pub fn dest_digests(&self) -> Result<Option<Vec<RecordedFile>>, ExportError> {
+        let listing = self.list_checked(&self.layout.dest_loc, true)?;
+        if listing.has_shortcut {
+            return Ok(None);
+        }
+        let files: Option<Vec<RecordedFile>> = listing
+            .entries
+            .iter()
+            .filter(|e| !e.is_dir)
+            .map(|e| {
+                e.md5.as_ref().map(|m| RecordedFile {
+                    path: e.path.clone(),
+                    md5: m.clone(),
+                })
+            })
+            .collect();
+        Ok(files.filter(|f| f.iter().any(|x| x.path == MANIFEST_NAME)))
     }
 
     /// `incoming/<job_id>` をゴミ箱へ移す（`--drive-use-trash=true`）。先に一覧で、見えた項目が**記録した ID** のフォルダ
@@ -665,13 +763,20 @@ impl<'a> Drive<'a> {
     /// 退避した旧フォルダをゴミ箱へ移す。**移す前に**次をすべて確かめる（どれかが合わなければ、何も消さずに返す）。
     ///
     /// 1. `replaced/` の項目が、記録した旧フォルダの ID のフォルダ 1 つだけ。
-    /// 2. そのフォルダの中身（`lsjson -R` の相対パスとサイズ）が、中の旧 manifest の一式と完全に一致する
-    ///    （停止している間に足されたファイルごとゴミ箱へ移さない。旧 manifest は `cat` で読み直す）。
+    /// 2. そのフォルダの中身（`lsjson -R --hash` の相対パス・サイズ・MD5）が、中の旧 manifest の一式と完全に一致し、
+    ///    MD5 が**公開の記録の MD5**（旧フォルダを公開したときに記録したもの。新しい行を書いたあとの復旧では、新しい行の
+    ///    `previous`）と一致する（停止している間に足されたファイルや、同じ名前・同じ大きさのまま書き換えられた
+    ///    ファイルごとゴミ箱へ移さない。旧 manifest は `cat` で読み直す）。公開の記録に旧フォルダの行と MD5 が無いとき
+    ///    （行の ID が旧 ID と違う・MD5 が無い）は、確かめられないので移さない（[`Removed::ContentMismatch`]）。
     /// 3. 2 の間に差し替わっていないことを、1 をもう一度確かめて見る。
     ///
     /// `purge` はパスで指す（ID を固定した `purge` は rclone ではできない。モジュールの説明）。指す名前は、`job_id`（乱数）を
     /// 含む、作業用のフォルダの中の名前だけ。
-    pub fn trash_replaced(&self, old_id: &str) -> Result<Removed, ExportError> {
+    pub fn trash_replaced(
+        &self,
+        old_id: &str,
+        published: &PublishedStore,
+    ) -> Result<Removed, ExportError> {
         let is_old = |seen: &[Seen]| matches!(seen, [s] if s.kind == Kind::Dir && s.id == old_id);
         let seen = self.replaced_seen()?;
         if seen.is_empty() {
@@ -680,7 +785,12 @@ impl<'a> Drive<'a> {
         if !is_old(&seen) {
             return Ok(Removed::Mismatch(seen));
         }
-        if !self.folder_matches_its_manifest(Place::Retired)? {
+        let Some(recorded) =
+            published.recorded_files_of(self.layout.destination, &self.layout.folder, old_id)
+        else {
+            return Ok(Removed::ContentMismatch(seen));
+        };
+        if !self.folder_matches_its_manifest(Place::Retired, Some(&recorded.files))? {
             return Ok(Removed::ContentMismatch(seen));
         }
         let again = self.replaced_seen()?;
@@ -716,7 +826,7 @@ impl<'a> Drive<'a> {
         }
         let content_ok = match expected {
             Some(e) => self.dest_matches_expected(e)?,
-            None => self.folder_matches_its_manifest(Place::Dest)?,
+            None => self.folder_matches_its_manifest(Place::Dest, None)?,
         };
         if !content_ok {
             return Ok(Err(o));
@@ -730,6 +840,11 @@ mod tests {
     use super::*;
     use crate::rclone::{DIRECTORY_MIME, SHORTCUT_MIME};
 
+    /// 試験用の MD5（パスから決まる架空の値。同じパスなら同じ）。
+    fn fake_md5(path: &str) -> String {
+        crate::image::md5_hex(path.as_bytes())
+    }
+
     fn file(path: &str, size: i64) -> LsEntry {
         LsEntry {
             path: path.into(),
@@ -739,6 +854,7 @@ mod tests {
             is_dir: false,
             id: format!("f{}", path.replace(['/', '.'], "_")),
             shortcut_id: None,
+            md5: Some(fake_md5(path)),
         }
     }
     fn dir(path: &str) -> LsEntry {
@@ -750,6 +866,7 @@ mod tests {
             is_dir: true,
             id: format!("d{}", path.replace('/', "_")),
             shortcut_id: None,
+            md5: None,
         }
     }
 
@@ -757,6 +874,7 @@ mod tests {
         PublishFile {
             path: path.into(),
             size,
+            md5: fake_md5(path),
         }
     }
 
@@ -801,6 +919,86 @@ mod tests {
             ..file("link", 0)
         });
         assert!(!e.matches(&sc));
+    }
+
+    #[test]
+    fn md5_must_match_when_the_expected_set_knows_it() {
+        let e = Expected::from_publish_files(&[
+            pf("a.jpg", 5),
+            pf("2030-03-11/b.jpg", 7),
+            pf("manifest.json", 9),
+        ]);
+        let good = vec![
+            file("a.jpg", 5),
+            dir("2030-03-11"),
+            file("2030-03-11/b.jpg", 7),
+            file("manifest.json", 9),
+        ];
+        assert!(e.matches(&good));
+        // 同じ名前・同じ大きさで MD5 が違う（写真・下のフォルダの写真・manifest）
+        for i in [0, 2, 3] {
+            let mut changed = good.clone();
+            changed[i].md5 = Some("f".repeat(32));
+            assert!(!e.matches(&changed), "{i}");
+        }
+        // 一覧に MD5 が無い（--hash なし・MD5 を持たないファイル）
+        for i in [0, 2, 3] {
+            let mut none = good.clone();
+            none[i].md5 = None;
+            assert!(!e.matches(&none), "{i}");
+        }
+    }
+
+    #[test]
+    fn a_manifest_set_has_no_md5_until_the_record_adds_it() {
+        let m = serde_json::json!({
+            "photos": [{"filename": "a.jpg", "file_size": 5}]
+        });
+        let bare = Expected::from_manifest(&m, 9).unwrap();
+        assert_eq!(bare.recorded_files(), None);
+        // MD5 なし: 一覧の MD5 は比べない（起動時の復旧の照合）
+        let mut listing = vec![file("a.jpg", 5), file("manifest.json", 9)];
+        listing[0].md5 = Some("9".repeat(32));
+        assert!(bare.matches(&listing));
+        // 記録の MD5 を足すと、比べる
+        let rec = |a: &str, m: &str| {
+            vec![
+                RecordedFile {
+                    path: "a.jpg".into(),
+                    md5: a.into(),
+                },
+                RecordedFile {
+                    path: "manifest.json".into(),
+                    md5: m.into(),
+                },
+            ]
+        };
+        let with = bare
+            .clone()
+            .with_md5(&rec(&"9".repeat(32), &fake_md5("manifest.json")))
+            .unwrap();
+        assert!(with.matches(&listing));
+        assert_eq!(
+            with.recorded_files().unwrap(),
+            rec(&"9".repeat(32), &fake_md5("manifest.json"))
+        );
+        listing[0].md5 = Some(fake_md5("a.jpg"));
+        assert!(!with.matches(&listing));
+        // 記録のファイルの集合が manifest と違えば足せない（足りない・余分・名前違い・同じパスが 2 つ）
+        let all = rec("1", "2");
+        assert!(bare.clone().with_md5(&all[..1]).is_none());
+        let mut extra = all.clone();
+        extra.push(RecordedFile {
+            path: "b.jpg".into(),
+            md5: "3".into(),
+        });
+        assert!(bare.clone().with_md5(&extra).is_none());
+        let mut renamed = all.clone();
+        renamed[0].path = "c.jpg".into();
+        assert!(bare.clone().with_md5(&renamed).is_none());
+        let mut twice = all.clone();
+        twice[1].path = "a.jpg".into();
+        assert!(bare.with_md5(&twice).is_none());
     }
 
     #[test]
@@ -901,12 +1099,13 @@ mod tests {
             ]
         });
         let e = Expected::from_manifest(&m, 99).unwrap();
+        // MD5 は持たない（記録の MD5 は with_md5 で足す）
         assert_eq!(
             e,
-            Expected::from_publish_files(&[
-                pf("2030-03-10/090000_1.jpg", 10),
-                pf("2030-03-11/090000_2.jpg", 20),
-                pf("manifest.json", 99),
+            Expected::build(vec![
+                ("2030-03-10/090000_1.jpg".into(), 10, None),
+                ("2030-03-11/090000_2.jpg".into(), 20, None),
+                ("manifest.json".into(), 99, None),
             ])
         );
         for bad in [
@@ -936,6 +1135,7 @@ mod tests {
             is_dir,
             id: id.into(),
             shortcut_id: None,
+            md5: None,
         }
     }
 

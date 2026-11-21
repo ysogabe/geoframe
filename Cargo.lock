@@ -452,6 +452,7 @@ dependencies = [
  "hyper-util",
  "jpeg-encoder",
  "libc",
+ "md-5",
  "ring",
  "serde",
  "serde_json",

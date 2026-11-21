@@ -114,6 +114,9 @@ pub struct LsEntry {
     /// 解決されたショートカットの、ショートカット自身の ID（rclone は解決した項目の ID を、リンク先の ID とショートカットの ID を
     /// タブで結んだ複合 ID にする。後半）。通常の項目では `None`。
     pub shortcut_id: Option<String>,
+    /// `lsjson --hash --hash-type MD5` の `Hashes.md5`（小文字の 16 進 32 文字）。フォルダ・MD5 を持たないファイル
+    /// （Google のネイティブ文書など）・`--hash` なしの一覧・形が違う値では `None`。
+    pub md5: Option<String>,
 }
 
 impl LsEntry {
@@ -132,7 +135,13 @@ pub fn is_valid_drive_id(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-fn rel_path_ok(p: &str) -> bool {
+/// MD5 の文字列（16 進 32 文字。大文字でも受け、小文字にそろえる）。違えば `None`。
+pub fn normalize_md5(s: &str) -> Option<String> {
+    (s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
+}
+
+/// 一覧・記録の相対パス（`/` 区切り。空の部品・`.`・`..`・制御文字を含まない。1024 バイト以下）。
+pub fn rel_path_ok(p: &str) -> bool {
     !p.is_empty()
         && p.len() <= 1024
         && p.split('/')
@@ -154,7 +163,9 @@ fn split_composite_id(id: &str) -> Option<(String, Option<String>)> {
 /// 形: 配列。各項目は `Path`(文字列)・`Name`(文字列、`Path` の最後の部品)・`Size`(整数、フォルダは -1。**ファイルも -1 になりうる**:
 /// `--drive-show-all-gdocs` で出るネイティブの Google 文書など、サイズが分からないもの)・
 /// `MimeType`(文字列。フォルダは `inode/directory`)・`IsDir`(真偽)・`ID`(文字列、空でない。解決されたショートカットは複合 ID)。
-/// `ModTime` は読まない。サイズ不明（負）のファイルは受け付け、中身の照合（[`crate::drive::Expected::matches`]）が
+/// `--hash` を付けた一覧では、ファイルに `Hashes`(`{"md5": "<16 進 32 文字>"}`。rclone v1.76.0 の `ListJSONItem.Hashes`。
+/// キーは小文字の `md5`、MD5 を持たないファイルでは空・省略）が付く。形が違う `Hashes` は MD5 なし（`None`）として読む
+/// （一覧全体は断らない。MD5 を期待する照合が一式に無いファイルとして断る）。`ModTime` は読まない。サイズ不明（負）のファイルは受け付け、中身の照合（[`crate::drive::Expected::matches`]）が
 /// 「一式に無いファイル」として扱う。
 pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
@@ -172,6 +183,12 @@ pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
         let size = o.get("Size")?.as_i64()?;
         let is_dir = o.get("IsDir")?.as_bool()?;
         let (id, shortcut_id) = split_composite_id(raw_id)?;
+        let md5 = o
+            .get("Hashes")
+            .and_then(Value::as_object)
+            .and_then(|h| h.get("md5"))
+            .and_then(Value::as_str)
+            .and_then(normalize_md5);
         if !rel_path_ok(path)
             || path.rsplit('/').next() != Some(name)
             || is_dir != (mime == DIRECTORY_MIME)
@@ -186,6 +203,7 @@ pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
             is_dir,
             id,
             shortcut_id,
+            md5: if is_dir { None } else { md5 },
         });
     }
     Some(out)
@@ -485,6 +503,7 @@ impl Rclone {
         loc: &RemoteLoc,
         recursive: bool,
         skip_shortcuts: bool,
+        hash: bool,
     ) -> Vec<OsString> {
         // 設定ファイルに `skip_shortcuts`・`skip_gdocs` があっても結果が変わらないよう、毎回どちらも明示する。
         // ショートカットを除かない一覧は `=false`（設定ファイルで省略が有効でも、解決されたショートカットが一覧に出る）。
@@ -507,6 +526,12 @@ impl Rclone {
         a.push("--drive-show-all-gdocs".into());
         if recursive {
             a.push("-R".into());
+        }
+        // 中身の照合用: ファイルごとの MD5（Drive はバイナリのファイルに MD5 を持つ）を `Hashes.md5` に出す
+        if hash {
+            a.push("--hash".into());
+            a.push("--hash-type".into());
+            a.push("MD5".into());
         }
         Self::finish_args(a, vec![loc.as_str().into()])
     }
@@ -558,17 +583,19 @@ impl Rclone {
 
     // ---- コマンド ----
 
-    /// `lsjson`。`skip_shortcuts` が偽のときは、ショートカットも（rclone の既定の扱いで）一覧に出る。
+    /// `lsjson`。`skip_shortcuts` が偽のときは、ショートカットも（rclone の既定の扱いで）一覧に出る。`hash` が真なら、
+    /// ファイルの MD5 も出す（`--hash --hash-type MD5`。中身の照合に使う一覧だけ）。
     /// 場所が無ければ `NotFound`、出力が決められた形でなければ `BadOutput`。
     pub fn lsjson(
         &self,
         loc: &RemoteLoc,
         recursive: bool,
         skip_shortcuts: bool,
+        hash: bool,
     ) -> Result<Vec<LsEntry>, RunError> {
         let out = self.run(
             "lsjson",
-            self.lsjson_args(loc, recursive, skip_shortcuts),
+            self.lsjson_args(loc, recursive, skip_shortcuts, hash),
             self.timeout,
             STDOUT_MAX_BYTES,
         )?;
@@ -992,8 +1019,8 @@ mod tests {
         let r = Rclone::new(&settings());
         let l = loc("gdrive:p/q");
         let all: Vec<Vec<OsString>> = vec![
-            r.lsjson_args(&l, true, true),
-            r.lsjson_args(&l, false, false),
+            r.lsjson_args(&l, true, true, false),
+            r.lsjson_args(&l, false, false, false),
             r.cat_args(&l, 10),
             r.mkdir_args(&l),
             r.copy_args(Path::new("/w/ws"), &l, CopyScope::PhotosOnly),
@@ -1039,33 +1066,41 @@ mod tests {
         // Drive の操作には --drive-skip-shortcuts。ショートカットも見たい照会だけは `=false` を明示する（設定ファイルで
         // skip_shortcuts が有効でも、解決されたショートカットが一覧に出る）
         assert!(has(
-            &r.lsjson_args(&l, false, true),
+            &r.lsjson_args(&l, false, true, false),
             "--drive-skip-shortcuts"
         ));
         assert!(!has(
-            &r.lsjson_args(&l, false, false),
+            &r.lsjson_args(&l, false, false, false),
             "--drive-skip-shortcuts"
         ));
         assert!(has(
-            &r.lsjson_args(&l, false, false),
+            &r.lsjson_args(&l, false, false, false),
             "--drive-skip-shortcuts=false"
         ));
         assert!(!has(
-            &r.lsjson_args(&l, false, true),
+            &r.lsjson_args(&l, false, true, false),
             "--drive-skip-shortcuts=false"
         ));
         assert!(has(
-            &r.lsjson_args(&l, false, false),
+            &r.lsjson_args(&l, false, false, false),
             "--drive-skip-dangling-shortcuts=false"
         ));
         // 一覧は毎回、エクスポートできない Google のファイルも出し、gdocs を除く設定を打ち消す
         for skip in [true, false] {
             for recursive in [true, false] {
-                let a = r.lsjson_args(&l, recursive, skip);
+                let a = r.lsjson_args(&l, recursive, skip, false);
                 assert!(has(&a, "--drive-show-all-gdocs"));
                 assert!(has(&a, "--drive-skip-gdocs=false"));
             }
         }
+        // MD5 は、頼んだ一覧だけに付ける（`--hash --hash-type MD5`。付けないと `Hashes` が出ない）
+        let hashed_args = r.lsjson_args(&l, true, true, true);
+        let hashed = strs(&hashed_args);
+        let i = hashed.iter().position(|a| *a == "--hash").expect("--hash");
+        assert_eq!(hashed[i + 1], "--hash-type");
+        assert_eq!(hashed[i + 2], "MD5");
+        assert!(!has(&r.lsjson_args(&l, true, true, false), "--hash"));
+        assert!(!has(&r.lsjson_args(&l, true, true, false), "--hash-type"));
         assert!(!has(&r.mkdir_args(&l), "--drive-show-all-gdocs"));
         for a in [
             r.cat_args(&l, 1),
@@ -1083,10 +1118,10 @@ mod tests {
         ));
         assert!(has(&r.moveto_args(&l, &l), "--immutable"));
         assert!(has(&r.purge_args(&l), "--drive-use-trash=true"));
-        assert!(!has(&r.lsjson_args(&l, true, true), "--immutable"));
+        assert!(!has(&r.lsjson_args(&l, true, true, false), "--immutable"));
         // 再帰の指定
-        assert!(has(&r.lsjson_args(&l, true, true), "-R"));
-        assert!(!has(&r.lsjson_args(&l, false, true), "-R"));
+        assert!(has(&r.lsjson_args(&l, true, true, false), "-R"));
+        assert!(!has(&r.lsjson_args(&l, false, true, false), "-R"));
         // manifest の分け方
         let photos = r.copy_args(Path::new("/w"), &l, CopyScope::PhotosOnly);
         let manifest = r.copy_args(Path::new("/w"), &l, CopyScope::ManifestOnly);
@@ -1279,6 +1314,48 @@ mod tests {
     }
 
     #[test]
+    fn md5_is_read_from_hashes_and_a_malformed_value_means_no_md5() {
+        let md5 = "0123456789abcdef0123456789ABCDEF";
+        let with = |hashes: serde_json::Value| {
+            let mut e = entry("a.jpg", "i", false);
+            e["Hashes"] = hashes;
+            parse_lsjson(json!([e]).to_string().as_bytes()).expect("一覧は断らない")
+        };
+        // 小文字にそろえる
+        assert_eq!(
+            with(json!({"md5": md5}))[0].md5.as_deref(),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        // 付いていない・空（MD5 を持たないファイル）・形が違うものは MD5 なし
+        assert_eq!(
+            parse_lsjson(json!([entry("a.jpg", "i", false)]).to_string().as_bytes()).unwrap()[0]
+                .md5,
+            None
+        );
+        for bad in [
+            json!({}),
+            json!({"md5": ""}),
+            json!({"md5": "xyz"}),
+            json!({"md5": "0123456789abcdef0123456789abcde"}),
+            json!({"md5": "0123456789abcdef0123456789abcdef0"}),
+            json!({"md5": 5}),
+            // キーは小文字の `md5`（rclone の `hash.MD5.String()`）。別の名前は読まない
+            json!({"MD5": md5}),
+            json!({"sha1": md5}),
+            json!("md5"),
+        ] {
+            assert_eq!(with(bad.clone())[0].md5, None, "{bad}");
+        }
+        // フォルダには付けない
+        let mut d = entry("d", "i", true);
+        d["Hashes"] = json!({"md5": md5});
+        assert_eq!(
+            parse_lsjson(json!([d]).to_string().as_bytes()).unwrap()[0].md5,
+            None
+        );
+    }
+
+    #[test]
     fn unknown_sizes_and_composite_ids_are_read_without_rejecting_the_whole_listing() {
         // ネイティブの Google 文書・エクスポートできないファイル（--drive-show-all-gdocs）: ファイルで Size が -1
         let doc = json!({"Path":"memo","Name":"memo","Size":-1,"MimeType":"application/vnd.google-apps.document","IsDir":false,"ID":"idD"});
@@ -1324,6 +1401,7 @@ mod tests {
             is_dir: false,
             id: "i".into(),
             shortcut_id: None,
+            md5: None,
         };
         assert!(e.is_shortcut());
         let resolved = LsEntry {

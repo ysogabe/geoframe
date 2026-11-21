@@ -75,7 +75,7 @@ use std::time::Duration;
 use crate::drive::{Drive, Expected, Inspection, Layout, Managed, Place, Removed, Target};
 use crate::error::{ErrorCode, ExportError};
 use crate::image::PublishFile;
-use crate::published::{PublishedRecord, PublishedStore};
+use crate::published::{PreviousFolder, PublishedRecord, PublishedStore, RecordedFile};
 use crate::rclone::Rclone;
 use crate::recovery::{
     Action, BlockedReason, Decision, Kind, Observed, Progress, Seen, Stage, decide,
@@ -669,7 +669,7 @@ impl Recovery<'_> {
         match (self.expected, place) {
             (Some(e), Place::Incoming) => drive.incoming_matches(e),
             (Some(e), _) => drive.dest_matches_expected(e),
-            (None, place) => drive.folder_matches_its_manifest(place),
+            (None, place) => drive.folder_matches_its_manifest(place, None),
         }
     }
 
@@ -688,6 +688,7 @@ impl Recovery<'_> {
         // にするので、`blocked` なのに公開の記録だけ更新済み、という食い違いを作らない）
         // `Some(..)`: 記録できずにゴミ箱へ移さなかった。中の値が、再確認した結果（旧フォルダが残っていれば `Some(旧 ID)`）
         let mut skipped: Option<Option<String>> = None;
+        let mut skipped_old: Option<&str> = None;
         let mut trash = trash_old;
         if let Some(old) = trash_old
             && record_stage(cur, Stage::Trashing, sink).is_err()
@@ -703,13 +704,22 @@ impl Recovery<'_> {
                 return Err(TrashStop::Mismatch(Vec::new()).into_blocked(cur, Some(observed)));
             }
             trash = None;
+            skipped_old = trash_old;
         }
+        // 公開の記録に書く MD5: 手元の一式（公開の途中の失敗の復旧）があればそれ。起動時の復旧は、manifest と一致すると
+        // 確かめた宛先の一覧の MD5（取れなければ MD5 なしの行。次の `replace` は断る）
+        let files = match self.expected {
+            Some(e) => e.recorded_files(),
+            None => drive.dest_digests().ok().flatten(),
+        };
         let mut published = finish_tail(
             &drive,
             &drive,
             self.published,
             self.layout,
             Finish {
+                files,
+                leave_old: skipped_old,
                 folder_id,
                 trash_old: trash,
                 replaced: cur.old_id.is_some(),
@@ -727,6 +737,10 @@ impl Recovery<'_> {
 
 /// [`finish_tail`] の入力。
 struct Finish<'a> {
+    /// 公開の記録に書く、公開した一式のファイルごとの MD5（分からなければ `None`。次の `replace` は断る）。
+    files: Option<Vec<RecordedFile>>,
+    /// ゴミ箱へ移さずに公開の記録だけ書くときの、`replaced/` に残る旧フォルダの ID（旧 MD5 を `previous` に残す）。
+    leave_old: Option<&'a str>,
     folder_id: &'a str,
     /// ゴミ箱へ移す旧フォルダの ID（移動が済んでいるときは `None`）。
     trash_old: Option<&'a str>,
@@ -766,18 +780,32 @@ fn finish_tail(
     finish: Finish<'_>,
 ) -> Result<Published, TrashStop> {
     let Finish {
+        files,
+        leave_old,
         folder_id,
         trash_old,
         replaced,
         existing_files,
     } = finish;
     let mut left = None;
+    // 旧フォルダが `replaced/` に残るときは、旧 MD5 を新しい行の `previous` に残す（後の復旧がゴミ箱へ移す前に照らす）。
+    // 旧 MD5 は、新しい行を書く前に、今の行（または、前に書いた行の `previous`）から取る
+    let previous_of = |old: &str| -> Option<PreviousFolder> {
+        published.recorded_files_of(layout.destination(), layout.folder(), old)
+    };
+    let mut previous = leave_old.and_then(previous_of);
     if let Some(old) = trash_old {
-        match drive.trash_replaced(old) {
+        let before = previous_of(old);
+        match drive.trash_replaced(old, published) {
             Ok(Removed::Done | Removed::Nothing) => {}
             Ok(Removed::Mismatch(seen)) => return Err(TrashStop::Mismatch(seen)),
             Ok(Removed::ContentMismatch(seen)) => return Err(TrashStop::Content(seen)),
-            Err(_) => left = confirm_old_left(free, old)?,
+            Err(_) => {
+                left = confirm_old_left(free, old)?;
+                if left.is_some() {
+                    previous = before;
+                }
+            }
         }
     }
     let record = PublishedRecord {
@@ -785,6 +813,8 @@ fn finish_tail(
         folder: layout.folder().clone(),
         folder_id: folder_id.to_owned(),
         job_id: layout.job().clone(),
+        files,
+        previous: previous.map(Box::new),
     };
     let recorded = published.upsert(record.clone()).is_ok();
     Ok(Published {
@@ -1031,6 +1061,8 @@ impl Run<'_> {
             self.params.published,
             self.layout,
             Finish {
+                files: self.expected.recorded_files(),
+                leave_old: None,
                 folder_id,
                 trash_old,
                 replaced: self.old_id.is_some(),

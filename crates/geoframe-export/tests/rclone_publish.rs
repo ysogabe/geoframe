@@ -105,6 +105,21 @@ fn remove_child(env: &Env, parent: &[&str], name: &str) {
     env.save(&d);
 }
 
+/// `parent` の直下の `name` のファイルの MD5 を、別の値にする（同じ名前・同じ大きさのまま中身を書き換えた、を作る）。
+fn change_md5(env: &Env, parent: &[&str], name: &str) {
+    let mut d = env.drive();
+    let p = d.resolve(parent).expect("parent");
+    let ids: Vec<String> = d
+        .children(&p)
+        .iter()
+        .filter(|n| n.name == name)
+        .map(|n| n.id.clone())
+        .collect();
+    assert_eq!(ids.len(), 1, "{name}");
+    d.set_md5(&ids[0], &"f".repeat(32));
+    env.save(&d);
+}
+
 fn rewrite_manifest(env: &Env, folder: &[&str], content: &Value) {
     let mut d = env.drive();
     let p = d.resolve(folder).expect("folder");
@@ -792,7 +807,7 @@ fn a_replace_target_that_changed_during_the_run_is_not_replaced() {
 #[test]
 fn a_verification_mismatch_trashes_incoming_and_fails() {
     // 送ったあとで、incoming のファイルのサイズが変わった（または足りない・余分がある）
-    for (name, tamper) in [("size", 0), ("missing", 1), ("extra", 2)] {
+    for (name, tamper) in [("size", 0), ("missing", 1), ("extra", 2), ("md5", 3)] {
         let env = Env::new(&format!("verify-{name}"));
         let set = env.make_set("s", Y, FOLDER, PHOTOS);
         let fake = env.fake_dir.clone();
@@ -812,13 +827,24 @@ fn a_verification_mismatch_trashes_incoming_and_fails() {
                 1 => d
                     .nodes
                     .retain(|n| !(n.parent == inc && n.name == "090000_1.jpg")),
-                _ => {
+                2 => {
                     d.add_file(
                         &["geoframe-export-work", "incoming", JOB_A],
                         "extra.jpg",
                         1,
                         None,
                     );
+                }
+                // 同じ名前・同じ大きさのまま中身が違う（MD5 だけが違う）
+                _ => {
+                    let id = d
+                        .children(&inc)
+                        .iter()
+                        .find(|n| n.name == "090000_1.jpg")
+                        .unwrap()
+                        .id
+                        .clone();
+                    d.set_md5(&id, &"f".repeat(32));
                 }
             }
             d.save(&fake);
@@ -970,6 +996,8 @@ fn folders_not_written_by_this_service_are_never_replaced() {
                         folder: geoframe_export::folder::FolderName::parse(FOLDER).unwrap(),
                         folder_id: "fidOTHER".into(),
                         job_id: geoframe_export::jobid::JobId::parse(JOB_B).unwrap(),
+                        files: Some(set.recorded()),
+                        previous: None,
                     })
                     .unwrap();
             }),
@@ -2065,4 +2093,243 @@ fn an_abort_whose_aborting_record_cannot_be_written_does_not_trash_the_incoming(
             .resolve(&["geoframe-export-work", "incoming", JOB_A])
             .is_some()
     );
+}
+
+// ---- 中身の MD5（AC6: その後に中身が変わっていないフォルダだけを置き換える） ----
+
+#[test]
+fn a_rewrite_with_the_same_name_and_size_is_modified_and_nothing_is_touched() {
+    // 写真・manifest.json・下のフォルダの写真の、どれを書き換えても（サイズは同じ）、replace は conflict（modified）。
+    // moveto・purge どころか、copy・mkdir も呼ばない
+    for (name, folder, files, target) in [
+        ("photo", FOLDER, PHOTOS, ("", "090000_1.jpg")),
+        ("manifest", FOLDER, PHOTOS, ("", "manifest.json")),
+        (
+            "sub-photo",
+            "2030-03-10-11",
+            &[
+                ("2030-03-10/090000_1.jpg", 100),
+                ("2030-03-11/090100_2.jpg", 200),
+            ][..],
+            ("2030-03-11", "090100_2.jpg"),
+        ),
+    ] {
+        let env = Env::new(&format!("md5-modified-{name}"));
+        let set = env.make_set("s", Y, folder, files);
+        let id = env.seed_managed(Y, folder, &set);
+        // 書き換える前は、管理しているフォルダ
+        let layout = env.layout(Y, folder, JOB_A);
+        assert_eq!(
+            dry_run(&env.rclone(), &layout, &env.published)
+                .unwrap()
+                .managed,
+            Some(Managed::Managed),
+            "{name}"
+        );
+        let mut parent = vec!["yamareco", folder];
+        if !target.0.is_empty() {
+            parent.push(target.0);
+        }
+        change_md5(&env, &parent, target.1);
+        let before = env.drive().nodes.len();
+        assert_eq!(
+            dry_run(&env.rclone(), &layout, &env.published)
+                .unwrap()
+                .managed,
+            Some(Managed::Modified),
+            "{name}: dry_run も同じ判定"
+        );
+        let layout = env.layout(Y, folder, JOB_A);
+        let mut hook = Hook::new(&env);
+        let out = publish(
+            &env.rclone(),
+            &layout,
+            &params(&env, &set, OnExists::Replace),
+            &mut hook,
+        );
+        let (reason, _) = conflict(out);
+        assert_eq!(reason, ConflictReason::Modified, "{name}");
+        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+        for cmd in ["moveto", "purge", "copy", "mkdir"] {
+            assert!(env.rclone_calls(cmd).is_empty(), "{name}: {cmd}");
+        }
+        assert_eq!(
+            env.drive().resolve(&["yamareco", folder]).as_deref(),
+            Some(id.as_str()),
+            "{name}"
+        );
+        assert_eq!(env.drive().nodes.len(), before, "{name}");
+        assert!(env.drive().trashed.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn a_record_without_md5_refuses_replace_as_not_managed() {
+    // MD5 を記録する前の古い形の行（files が無い）: 中身が変わっていないと確かめられないので、管理していないものとして断る
+    let env = Env::new("md5-legacy");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let id = env.seed_folder(Y, FOLDER, &set);
+    std::fs::write(
+        env.published.path(),
+        format!(
+            r#"{{"version":1,"entries":[{{"destination":"yamareco","folder":"{FOLDER}","folder_id":"{id}","job_id":"{JOB_B}"}}]}}"#
+        ),
+    )
+    .unwrap();
+    let layout = env.layout(Y, FOLDER, JOB_A);
+    assert_eq!(
+        dry_run(&env.rclone(), &layout, &env.published)
+            .unwrap()
+            .managed,
+        Some(Managed::NotManaged)
+    );
+    let mut hook = Hook::new(&env);
+    let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
+    assert_eq!(reason, ConflictReason::NotManaged);
+    assert_eq!(env.mutations(), Vec::<String>::new());
+    assert_eq!(dest_id(&env).as_deref(), Some(id.as_str()));
+    // 古い行は、そのまま残っている（MD5 を作り出さない）
+    let text = std::fs::read_to_string(env.published.path()).unwrap();
+    assert!(!text.contains("md5"), "{text}");
+}
+
+#[test]
+fn a_record_whose_files_disagree_with_the_manifest_is_modified() {
+    // 記録のファイルの集合が、宛先の manifest の一式と違う（足りない・名前が違う）→ 中身が変わっているものとして modified
+    for (name, drop_one) in [("missing", true), ("renamed", false)] {
+        let env = Env::new(&format!("md5-record-{name}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let id = env.seed_managed(Y, FOLDER, &set);
+        let mut files = set.recorded();
+        if drop_one {
+            files.remove(0);
+        } else {
+            files[0].path = "other.jpg".into();
+        }
+        env.published
+            .upsert(geoframe_export::published::PublishedRecord {
+                destination: Y,
+                folder: geoframe_export::folder::FolderName::parse(FOLDER).unwrap(),
+                folder_id: id,
+                job_id: geoframe_export::jobid::JobId::parse(JOB_B).unwrap(),
+                files: Some(files),
+                previous: None,
+            })
+            .unwrap();
+        let mut hook = Hook::new(&env);
+        let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
+        assert_eq!(reason, ConflictReason::Modified, "{name}");
+        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+    }
+}
+
+#[test]
+fn the_old_folder_is_not_trashed_when_a_file_was_rewritten_to_the_same_size_after_the_check() {
+    // 退避のあと、旧フォルダの写真（または manifest.json）が、同じ名前・同じ大きさのまま書き換えられた → ゴミ箱へ移さず blocked
+    for target in ["090000_1.jpg", "manifest.json"] {
+        let env = Env::new(&format!("md5-trash-{}", target.replace('.', "_")));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = env.seed_managed(Y, FOLDER, &set);
+        let fake = env.fake_dir.clone();
+        let name = format!("yamareco-{FOLDER}-{JOB_A}");
+        let mut hook = Hook::new(&env).mutate_after(Stage::Trashing, move || {
+            let mut d = model::Drive::load(&fake);
+            let dir = d
+                .resolve(&["geoframe-export-work", "replaced", &name])
+                .unwrap();
+            let id = d
+                .children(&dir)
+                .iter()
+                .find(|n| n.name == target)
+                .unwrap()
+                .id
+                .clone();
+            d.set_md5(&id, &"f".repeat(32));
+            d.save(&fake);
+        });
+        let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+        assert_eq!(f.error.code, ErrorCode::Blocked, "{target}");
+        let info = f.blocked.expect("blocked");
+        assert_eq!(
+            info.reason,
+            BlockedReason::RetiredContentChanged,
+            "{target}"
+        );
+        assert_eq!(info.progress.stage, Stage::Trashing, "{target}");
+        assert!(env.rclone_calls("purge").is_empty(), "{target}");
+        assert!(env.drive().trashed.is_empty(), "{target}");
+        // 新しい一式は公開済み。旧フォルダは退避先にそのまま残っている
+        assert_ne!(dest_id(&env).as_deref(), Some(old_id.as_str()), "{target}");
+        assert_eq!(info.observed.clone().unwrap().replaced[0].id, old_id);
+    }
+}
+
+#[test]
+fn the_published_row_records_the_md5_of_every_file_and_a_replace_works_again_from_it() {
+    let env = Env::new("md5-record");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let mut hook = Hook::new(&env);
+    let p = published(run(&env, &set, OnExists::Error, &mut hook));
+    // 作業領域の中身の MD5（写真ごとに違い、manifest.json も入る）が、公開の記録に入る
+    let f = geoframe_export::folder::FolderName::parse(FOLDER).unwrap();
+    let row = env.published.find(Y, &f).expect("row");
+    assert_eq!(row.files, Some(set.recorded()));
+    assert_eq!(p.record.files, Some(set.recorded()));
+    assert!(row.previous.is_none());
+    let md5s: std::collections::BTreeSet<&str> = set.files.iter().map(|f| f.md5.as_str()).collect();
+    assert_eq!(
+        md5s.len(),
+        set.files.len(),
+        "試験の一式は、ファイルごとに MD5 が違う"
+    );
+    // 宛先の MD5 は、送った中身と同じ
+    let layout = env.layout(Y, FOLDER, JOB_B);
+    assert_eq!(
+        dry_run(&env.rclone(), &layout, &env.published)
+            .unwrap()
+            .managed,
+        Some(Managed::Managed)
+    );
+    // 中身を作り直して replace すると、新しい行の MD5 が入れ替わり、旧フォルダの MD5 は `previous` に残らない
+    let set2 = env.make_set(
+        "s2",
+        Y,
+        FOLDER,
+        &[("090000_1.jpg", 101), ("090100_2.jpg", 200)],
+    );
+    let layout = env.layout(Y, FOLDER, JOB_B);
+    let mut hook = Hook::new(&env);
+    let out = publish(
+        &env.rclone(),
+        &layout,
+        &params(&env, &set2, OnExists::Replace),
+        &mut hook,
+    );
+    let p2 = published(out);
+    assert!(p2.replaced && p2.old_left_in_replaced.is_none());
+    let row = env.published.find(Y, &f).unwrap();
+    assert_eq!(row.files, Some(set2.recorded()));
+    assert_eq!(row.folder_id, p2.folder_id);
+    assert!(row.previous.is_none());
+}
+
+#[test]
+fn only_the_listings_that_check_the_content_ask_for_md5() {
+    let env = Env::new("md5-flags");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let mut hook = Hook::new(&env);
+    published(run(&env, &set, OnExists::Replace, &mut hook));
+    let mut hashed = 0;
+    for args in env.rclone_calls("lsjson") {
+        let has = |f: &str| args.iter().any(|a| a == f);
+        // 中身の照合に使う一覧（再帰で、ショートカットを除いたほう）だけに MD5 を付ける
+        if has("-R") && !has("--drive-skip-shortcuts=false") {
+            hashed += 1;
+            let i = args.iter().position(|a| a == "--hash").expect("--hash");
+            assert_eq!(&args[i + 1..i + 3], ["--hash-type", "MD5"], "{args:?}");
+        } else {
+            assert!(!has("--hash") && !has("--hash-type"), "{args:?}");
+        }
+    }
+    assert!(hashed >= 1);
 }

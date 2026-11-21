@@ -10,15 +10,18 @@
 //! - クエリ: `from`・`to` はどちらも必須で、実在する日付（`YYYY-MM-DD`）。`from <= to`、期間は両端を含めて
 //!   [`SPAN_DAYS_MAX`] 日まで。ほかのキー、同じキーの繰り返し、空の値は 400 `bad_params`（値は応答にもログにも出さない）。
 //!   既存の管理 API の `parse_qs` の読み方（最初の値だけ使い、空の値は無かったことにする）は使わない。
-//! - 対象: 非表示でなく、撮影日時が分までの形（`admin_library` の `TIMED` と同じ）で、`from 00:00`〜`to 23:59`
-//!   （両端を含む）に入る写真。並びは `taken_at`、`id` の昇順。`idx_photos_time` の範囲検索で引く。
+//! - 対象: 非表示でなく、撮影日時が分までの形（`admin_library` の `TIMED` と同じ）で、**日付の部分が `from` 〜 `to`
+//!   （両端を含む）の日に入る**写真。範囲は `taken_at >= 'from 00:00' AND taken_at < '(to の翌日) 00:00'` で、`to 23:59` との
+//!   文字列の比較にはしない（形は分まででも、時・分が範囲外の値 `2030-03-10 23:99`・`2030-03-10 24:00` が一覧から落ちて、
+//!   `invalid_time` にも数えられなくなるため）。並びは `taken_at`、`id` の昇順。`idx_photos_time` の範囲検索で引く。
 //! - 1 件: `id`・`file`（`photos.display`。無ければ `null`）・`title`（フィードと同じ [`photo_title`]）・`lat`・`lon`
 //!   （無ければ `null`。キーは省かない）・`time`・`elev`（無ければ `null`）・`inferred`（`loc_source == "inferred"`）。
 //!   列の値はそのまま出す。受け取る側が検査し直す（design 4.4）。
 //! - 応答: `{from, to, photos, undated, invalid_time, truncated}`。`undated` は撮影日時が NULL か空の、`invalid_time` は
 //!   空でないが分までの形でない、非表示でない写真の数（カタログ全体。期間では絞らない）。
-//!   分までの形でも暦として存在しない日時（`2030-02-30 10:00`）は形の検査を通るので、期間に入れば `photos` に出て、
-//!   `invalid_time` には数えない（書き出し側が検査する）。上限は [`PHOTOS_MAX`] 件で、超えたら先頭の
+//!   分までの形でも暦・時刻として存在しない日時（`2030-02-30 10:00`・`2030-03-10 23:99`・`2030-03-10 24:00`）は形の検査を
+//!   通るので、日付の部分が期間に入れば `photos` に出て、`invalid_time` には数えない（書き出し側が暦と時刻の範囲を検査して、
+//!   自分の `invalid_time` に数える。二重には数えない）。上限は [`PHOTOS_MAX`] 件で、超えたら先頭の
 //!   [`PHOTOS_MAX`] 件と `truncated: true`。
 
 use axum::response::Response;
@@ -101,22 +104,32 @@ pub async fn photos(state: &AppState, query: Option<&str>) -> Response {
 
 /// 期間の写真を引く SQL。`LIMIT` は上限より 1 件多く取り、`truncated` の判定に使う。
 /// 文字列の比較なので、日時なしや形の違う値が範囲に紛れ込まないよう、分までの形の行（[`TIMED`]）だけにする。
+/// 範囲の上端は `to 23:59` との `<=` ではなく、`to` の翌日の `00:00` との `<`（時・分が範囲外の値も、その日の日付なら含める）。
 /// `ORDER BY` は列そのもの（式にしない）で、`idx_photos_time`（`taken_at`、同じ値は行 ID の順）の走査をそのまま使う。
 fn list_sql() -> String {
     format!(
         "SELECT id, display, title, city, place, name, lat, lon, taken_at, elev, loc_source FROM photos \
-         WHERE {VISIBLE} AND taken_at >= ?1 AND taken_at <= ?2 AND {TIMED} \
+         WHERE {VISIBLE} AND taken_at >= ?1 AND taken_at < ?2 AND {TIMED} \
          ORDER BY taken_at, id LIMIT ?3"
     )
+}
+
+/// 範囲の上端（含まない）: `to` の翌日の `00:00`。`9999-12-31` の翌日は SQLite の暦で表せないので、その日のどんな値
+/// （`9999-12-31 HH:MM`）よりも大きい文字列にする。
+fn upper_bound(conn: &Connection, to: &str) -> rusqlite::Result<String> {
+    let next: Option<String> =
+        conn.query_row("SELECT date(?1, '+1 day')", [to], |row| row.get(0))?;
+    Ok(match next {
+        Some(day) => format!("{day} 00:00"),
+        None => format!("{to} ~"),
+    })
 }
 
 fn build(conn: &Connection, range: &Range) -> rusqlite::Result<Value> {
     // 一覧と件数が同じ時点の DB から出るように、1 つの読み取りにまとめる
     let _snapshot = conn.unchecked_transaction()?;
-    let (from, to) = (
-        format!("{} 00:00", range.from),
-        format!("{} 23:59", range.to),
-    );
+    let from = format!("{} 00:00", range.from);
+    let to = upper_bound(conn, &range.to)?;
 
     let mut stmt = conn.prepare(&list_sql())?;
     let mut rows = stmt.query(params![from, to, (PHOTOS_MAX + 1) as i64])?;
@@ -239,6 +252,25 @@ mod tests {
             assert_eq!(r(q), None, "{q}");
         }
         assert_eq!(parse_range(None), None);
+    }
+
+    #[test]
+    fn the_upper_bound_is_midnight_of_the_next_day() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (to, want) in [
+            ("2030-03-10", "2030-03-11 00:00"),
+            ("2030-03-31", "2030-04-01 00:00"),
+            ("2030-12-31", "2031-01-01 00:00"),
+            ("2032-02-28", "2032-02-29 00:00"),
+            ("2032-02-29", "2032-03-01 00:00"),
+            ("2031-02-28", "2031-03-01 00:00"),
+            // 表せない翌日: その日の全ての値より大きい
+            ("9999-12-31", "9999-12-31 ~"),
+        ] {
+            let got = upper_bound(&conn, to).unwrap();
+            assert_eq!(got, want, "{to}");
+        }
+        assert!("9999-12-31 23:59" < "9999-12-31 ~" && "9999-12-31 24:00" < "9999-12-31 ~");
     }
 
     /// 期間の検索が撮影時刻の索引（範囲検索）で引け、並べ替えの一時領域を使わないこと。

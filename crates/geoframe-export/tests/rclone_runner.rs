@@ -309,7 +309,7 @@ fn a_cancel_that_is_already_set_never_starts_the_child() {
     let r = Rclone::new(&settings_for(&script, &state)).with_cancel(cancel);
     assert_eq!(r.cat(&loc(), 10), Err(RunError::Cancelled));
     assert_eq!(
-        r.lsjson(&loc(), false, true).unwrap_err(),
+        r.lsjson(&loc(), false, true, false).unwrap_err(),
         RunError::Cancelled
     );
     assert!(r.is_cancelled());
