@@ -228,9 +228,9 @@ flowchart LR
 - 宛先のフォルダの ID が、公開の記録の同じ種類・同じフォルダ名の行と一致する。
 - フォルダの直下に `manifest.json`（4MB 以下）があり、その `generator` が `geoframe-export ` で始まり、`destination`・`folder` が宛先と一致する（`rclone cat` で読む）。
 
-どちらかが合わなければ `not_managed` として `conflict` で終える。状態のディレクトリを失ったときは、前の書き出しも置き換えられなくなるが、そのときはオーナーが画面でゴミ箱へ移せばよい（安全な側に倒れる）。
+どちらかが合わなければ `not_managed` として `conflict` で終える。さらに、旧フォルダを `lsjson -R` で一覧し、ファイルの集合（相対パスとサイズ）が旧 manifest の `filename`・`file_size` と `manifest.json` そのものに完全に一致することを確かめる。オーナーや受け取り側が後からメモや写真を足していれば、足したものごとゴミ箱へ移さないよう、`conflict`（`modified`）で終える。この確認は手順 3 の確かめ直しでも行う。状態のディレクトリを失ったときは、前の書き出しも置き換えられなくなるが、そのときはオーナーが画面でゴミ箱へ移せばよい（安全な側に倒れる）。
 
-**共有範囲（U7）**: このサービスは Drive の共有設定を一切変えない（rclone の共有・リンク作成の操作を呼ばない）。公開したフォルダは、宛先の親フォルダの今の共有設定をそのまま受け継ぐ。manifest には正確な緯度経度が入るので、親フォルダの共有を新たに広げない。配置のときに、2 つの親フォルダと作業用のフォルダの今の共有範囲を確かめて記録する（10 章の「配置後」）。
+**共有範囲（U7）**: このサービスは Drive の共有設定を一切変えない（rclone の共有・リンク作成の操作を呼ばない）。公開したフォルダは、宛先の親フォルダの今の共有設定をそのまま受け継ぐ（作業用のフォルダから宛先へ移した時点で受け継ぐ。逆に、退避で作業用のフォルダへ移した旧フォルダは、受け継いでいた共有を失う）。manifest には正確な緯度経度が入るので、親フォルダの共有を新たに広げない。配置のときに、2 つの親フォルダと作業用のフォルダの今の共有範囲を確かめて記録する（10 章の「配置後」）。
 
 **宛先の状態**: 接頭辞の直下を `rclone lsjson --drive-skip-shortcuts` で一覧し（フォルダもファイルも）、名前が完全に一致するものを数える。各項目の Drive の ID（`lsjson` の `ID`）も控える。
 
@@ -243,13 +243,13 @@ flowchart LR
 
 **公開の手順**: 作業用のフォルダ（`<work-root>/`。以下では `incoming/`・`replaced/` と略す）を使う。各段階に進む前に、段階の名前と関係するフォルダの ID をジョブの記録（`jobs/<job_id>.json`）に書く。
 
-1. `uploading`: 写真を `<work-root>/incoming/<job_id>/` へ `rclone copy` で送り、最後に manifest を送る。
+1. `uploading`: 先に `<work-root>/incoming/<job_id>/` を作り、その ID をジョブの記録に書いてから、写真を `rclone copy` で送り、最後に manifest を送る（復旧で `incoming` をパスではなく ID で確かめて消せるようにする）。
 2. `verifying`: `rclone lsjson -R` で、`incoming` の相対パスとサイズを manifest と突き合わせる（受け取り側と同じ検証）。合わなければ `failed`（`verify_mismatch`）にし、`incoming` を消す。`incoming` のフォルダの ID を記録する。
 3. 宛先の状態をもう一度調べる（実行中にオーナーが宛先を触らない前提なので、ここで変わっていることはないはずだが、変わっていたら `failed` にして公開しない）。`replace` なら、管理しているフォルダかどうかもここで確かめ直す。
 4. 宛先の状態に応じて公開する。
    - `absent` のとき（`publishing`）: 直前に宛先が無いことをもう一度確かめてから、`rclone moveto incoming/<job_id> <宛先>` で移す。宛先が無い状態での移動なので、Drive の中でのフォルダの移動（親と名前の変更）になる。
    - `exists` で `replace`（管理しているフォルダ）のときは、次の順に行う。
-     1. `retiring`: 旧フォルダ（ID を記録済み）を `replaced/<種類>-<フォルダ名>-<job_id>` へ移す（以下では `replaced/<フォルダ名>-<job_id>` と略す）。移したあと、宛先が無いことと、`replaced/<フォルダ名>-<job_id>` が記録した旧フォルダの ID のもの 1 つだけであることを `lsjson` で確かめる。合わなければ（ファイル単位の移動に切り替わった、など）`blocked` にして先へ進まない。
+     1. `retiring`: 旧フォルダ（ID を記録済み）を `replaced/<種類>-<フォルダ名>-<job_id>` へ移す（以下では `replaced/<フォルダ名>-<job_id>` と略す）。移したあと、宛先が無いことと、`replaced/<フォルダ名>-<job_id>` が記録した旧フォルダの ID のもの 1 つだけであることを `lsjson` で確かめる。合わなければ（ファイル単位の移動に切り替わった、など）`blocked` にして先へ進まない。rclone の `moveto` はパスで解決するので、確かめてから移すまでの間に同じ名前の手作業のフォルダができると、そちらを移してしまうことがある。実装では、ID を指して移す方法（rclone の drive の `backend` の操作や `root_folder_id` を使う接続文字列。使える版かは実装時に確かめる）を優先する。パスでしか移せない場合はこの競合が残るので、移したあとの ID の照合で `blocked` にし（ゴミ箱へは移さない）、`recover` の表示に、移してしまったフォルダの ID と、元の場所へ戻す手順を出す。
      2. `publishing`: 直前に宛先が無いことをもう一度確かめてから、`incoming/<job_id>` を宛先へ移す。
      3. `trashing`: 直前に `replaced/` を一覧し、`<フォルダ名>-<job_id>` に完全に一致するものが、記録した旧フォルダの ID のフォルダ 1 つだけであることを確かめてから、`rclone purge --drive-use-trash=true` でゴミ箱へ移す。合わなければ `blocked`。
 5. 移動のあとはコマンドの終了コードを信じずに、毎回 `lsjson` で結果を確かめる（応答が失われても、移動は済んでいることがある）。
@@ -280,7 +280,7 @@ flowchart LR
 
 - 実行ファイルと設定ファイルのパスは起動引数で固定する（`--rclone`、`--rclone-config`）。子プロセスには `--config` を明示し、環境変数は `env_clear()` で消して、要るもの（`PATH` など）だけを渡す。
 - シェルを介さず、引数の配列で渡す。位置の引数の前に `--` を置く。Drive の操作には `--drive-skip-shortcuts` を付ける。`-vv` と `--dump*` は使わない。
-- 接頭辞（`--remote-*`）と作業用のフォルダ（`--work-root`）は起動時に、3 つが別物で互いに入れ子になっていないこと、remote の最上位でないこと、末尾が `/` でないこと、`^[A-Za-z0-9_-]+:[A-Za-z0-9_/-]+$` に合うこと、`-` で始まらないこと、`..` を含まないことを確かめる。
+- 接頭辞（`--remote-*`）と作業用のフォルダ（`--work-root`）は起動時に、3 つが別物で互いに入れ子になっていないこと、3 つの remote 名（`:` の前）が同じであること（別の remote や共有ドライブだと、移動がファイル単位のコピーと削除になるため）、remote の最上位でないこと、末尾が `/` でないこと、`^[A-Za-z0-9_-]+:[A-Za-z0-9_/-]+$` に合うこと、`-` で始まらないこと、`..` を含まないことを確かめる。
 - 子プロセスにはタイムアウトを掛ける（`try_wait` の繰り返しで見て、過ぎたら kill する）。写真を送る `copy` は既定 45 分（14 日の最多を細い帯域で送る場合。2.9）、それ以外（`lsjson`・`moveto`・`purge`・`cat`）は既定 5 分。
 - `copy`・`moveto` には `--immutable` を付け、既にあるファイルを書き換えないようにする。`<job_id>`・フォルダ名が空でないことを、パスを組み立てる前に確かめる（空だと `incoming/` や `replaced/` 全体が対象になる）。`incoming` を消すときも `--drive-use-trash=true` を付ける。
 - 主なオプションは `--transfers 4`、`--checkers 8`、`--retries 3`、`--low-level-retries 10`。`purge` には `--drive-use-trash=true` を明示する。
@@ -389,7 +389,7 @@ U1〜U7 は 2026-11-22 にユーザーが決めた。U8 は判断待ち。
   - `count`: 公開した写真の数（= `catalog_count` − `excluded` の件数）。
   - `undated_in_catalog`・`invalid_time_in_catalog`: カタログ全体（非表示を除く）で `time` が空・形が崩れた写真の数。日付が分からないので候補にも `excluded` にも入れない。
 - `status`: `running`、`succeeded`、`conflict`、`failed`、`interrupted`、`blocked`（4.2 の復旧で照合できなかった。オーナーが解除するまで次の書き出しを断る）のどれか。
-- `conflict` のときは `result.conflict` に理由を入れる。`exists`（既定の `error` で宛先が既にある）か `not_managed`（`replace` だが、このサービスが書いたと確かめられないフォルダ）。
+- `conflict` のときは `result.conflict` に理由を入れる。`exists`（既定の `error` で宛先が既にある）、`not_managed`（`replace` だが、このサービスが書いたと確かめられないフォルダ）、`modified`（このサービスが書いたフォルダだが、中身が前の manifest と合わない）のどれか。
 - `error`: 失敗したときに `{"code": ..., "message": "..."}` を返す。`message` は固定の短い説明で、rclone の出力は含めない。`code` は次のどれか。
   - `feed_unavailable`（一覧 API に接続できない・200 以外）、`feed_invalid`（一覧 API の値が 4.4 の検査に通らない）、`too_many_photos`、`derivative_pending`、`fetch_failed`、`decode_failed`、`nothing_to_export`
   - `drive_unavailable`、`ambiguous_destination`、`rclone_failed`、`rclone_timeout`、`verify_mismatch`
@@ -452,7 +452,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
 
 **`GET /api/admin/export/photos?from=YYYY-MM-DD&to=YYYY-MM-DD`** … 期間に撮った、非表示でない全写真を返す。読み取り専用。
 
-- 置き場所: `crates/geoframe` の新しいモジュール（例: `src/admin_export.rs`）。既存の管理 API（`/api/admin/*`）と同じ区域に置き、同じ守り（Host の検査。外からの経路は Cloudflare Access の内側）を受ける。GET だけで、DB を読むだけにする。書き込み・外部プロセス・外部への通信は無い。unit は変えない。
+- 置き場所: `crates/geoframe` の新しいモジュール（例: `src/admin_export.rs`）。既存の管理 API（`/api/admin/*`）と同じ区域に置き、同じ守りを受ける。Cloudflare Tunnel を通る経路は Access の内側にある。ただし LAN と tailnet からは、Access を通らずに無認証で直接届く（IP リテラルの Host は常に許可。2.1）。Access から外す設定（bypass）を `/api/admin/` に広げない（`docs/admin-ops/design.md` と同じ方針）。GET だけで、DB を読むだけにする。書き込み・外部プロセス・外部への通信は無い。unit は変えない。
 - 引数: `from`・`to` はどちらも必須で、実在する日付。`from <= to`、期間は 14 日以下。それ以外のクエリのキーは 400。
 - 対象: `COALESCE(hidden,0)=0` で、`taken_at` が分までの形（既存の `TIMED` と同じ判定）で、`from 00:00`〜`to 23:59` に入る写真。重複・類似の選別と位置の有無では絞らない。並びは `taken_at`・`id` の昇順。撮影時刻の索引（`idx_photos_time`）で引く。
 - 1 件の形: `{"id", "file", "title", "lat", "lon", "time", "elev", "inferred"}`。
@@ -461,7 +461,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
 - 応答: `{"from", "to", "photos": [...], "undated": <件数>, "invalid_time": <件数>, "truncated": <真偽>}`。
   - `undated`・`invalid_time` は、カタログ全体（非表示を除く）で `taken_at` が空・形が崩れた写真の数。
   - 上限は 2,000 件。超えたら先頭の 2,000 件と `truncated: true` を返し、書き出し側は `too_many_photos` にする。
-- 外に出るものが増える範囲: このサービスは前から無認証で、既存の `GET /api/admin/library/photos` が非表示を含む全写真の座標を返している。新たに出るのは、フィードに載らない写真の表示用 JPEG のパスと `elev` だけである（8 章）。
+- 外に出るものが増える範囲: このサービスは前から無認証で、既存の `GET /api/admin/library/photos` が非表示を含む全写真の座標と、表示用 JPEG のパス（`thumb`。`src/admin.rs:853` 付近）を返している。新たに出るのは、ほぼ `elev` だけである（8 章）。
 - 試験: `crates/geoframe` の試験で、非表示・日時なし・形の崩れた日時・位置なし・`display` が NULL・重複の非推奨を含む DB から、期待どおりの行と件数が返ることを確かめる。出した応答の例を、書き出し側の試験の fixture にも使う（3.2）。
 
 ## 7. データ
@@ -491,7 +491,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
 | 資格情報 | 専用ユーザー `geoframe-export` と、`StateDirectory/rclone/` の専用の rclone の設定（このサービス専用の client_id で認可し直す。共用の client_id は 2026 年中に止まる）。オーナーのホームの設定は使わない。権限は Drive 全体のまま（U4）なので、この設定が漏れると Drive 全体を読まれ・消されうる。設定は 0600・`StateDirectory` は 0700 で、専用ユーザーだけが読める。写真サービスの Drive の鍵（読み取り用）とは分ける |
 | 同時実行 | 書き出しと `dry_run` は、サービスと CLI で共通の実行枠（flock）を取る。1 ジョブの上限は 2,000 枚・2GB、全体の期限は 60 分（2.9）。パニックでも実行枠は外れる |
 | 子プロセス | rclone にタイムアウトを掛ける（写真の `copy` は既定 45 分、それ以外は 5 分）。環境変数は消してから渡す。標準エラーは伏せ字にしてログにだけ残す。共有・リンク作成の操作（`link` など）は呼ばない |
-| 写真サービスに足す一覧 API | GET だけで DB を読むだけ。既存の管理 API と同じ区域・同じ守り（6.4）。このサービスは無認証で `0.0.0.0:8080` に出ている（2.1）が、既存の管理 API が既に非表示を含む全写真の座標を返しているので、新たに出るのはフィード外の写真の表示用 JPEG のパスと `elev` だけ。引数は日付 2 つだけで、期間と件数に上限を掛ける |
+| 写真サービスに足す一覧 API | GET だけで DB を読むだけ。既存の管理 API と同じ区域・同じ守り（6.4）。このサービスは無認証で `0.0.0.0:8080` に出ている（2.1）。LAN・tailnet からは Access を通らずに届く。既存の管理 API が既に非表示を含む全写真の座標と表示用 JPEG のパスを返しているので、新たに出るのはほぼ `elev` だけ。Access の bypass を `/api/admin/` に広げない。引数は日付 2 つだけで、期間と件数に上限を掛ける |
 | unit のハードニング | `NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp`、`PrivateDevices`、`CapabilityBoundingSet=`、`RestrictAddressFamilies=AF_INET AF_INET6`（AF_UNIX が要るかは確かめる）、`SystemCallFilter=@system-service`、`UMask=0077` にする。書けるのは `StateDirectory` だけ。`MemoryMax`・`TasksMax` は rclone（Go）と JPEG のデコードを動かして実測してから決める。`MemoryDenyWriteExecute` は rclone と組み合わせて動くかを確かめてから付ける |
 | ログ | トークン、要求のヘッダ、rclone の設定の中身は出さない |
 | 写真サービスへの影響 | 読み取り専用の一覧 API を 1 つ足すだけで、既存の API の動作と unit は変えない。負荷は、1 回の書き出しで期間を索引で引く問い合わせ 1 回と、画像の順次取得だけ（今の全件フィードより軽い。2.9） |
@@ -524,7 +524,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
 | AC3 | 一覧 API の試験（6.4）で、非表示の写真が返らず、重複・類似で非推奨の写真と位置の無い写真が返ること。書き出し側で、`time` が空・形が崩れた写真が出ず、件数と理由が出ること。`file` が `null` の写真が 1 枚でもあれば `derivative_pending` で、rclone が呼ばれないこと。`truncated: true` なら `too_many_photos` |
 | AC4 | 旧 manifest の形（2.8。単日と期間）を fixture にして、キー・型・`days`・`filename`（`HHMM00_<id>.jpg`、期間は日付のサブフォルダ付き）を比べる。`file_size` が配信のバイト数と一致すること。`elev: null`、`gps_inferred: false`/`true` が一覧 API どおりに出ること。位置の無い写真で `lat`/`lon` が `null`、`gps_inferred` が `false` になること。`inferred` が欠けた応答、片方だけの位置、位置なしで `inferred: true` の応答では `feed_invalid` |
 | AC5 | 0 枚の日は `succeeded`・`count: 0` で、rclone が呼ばれない（フォルダも作られない）こと。宛先が既にある日でも同じ |
-| AC6 | 宛先が `exists`（空のフォルダを含む）なら、既定は `conflict` で、`copy`・`moveto` が呼ばれないこと。`replace` は incoming → 検証 → 退避 → 移動 → ゴミ箱の順で呼ぶこと。各段階の記録が Drive の操作の前に書かれること。移動の応答が失われた（偽の rclone が移動を済ませて失敗を返す）とき、`lsjson` で済んでいると判定すること。復旧の表（4.2）の各行の状態から起動して、表のとおりに進むこと。照合できない状態では `blocked` になり、次の書き出しが 503 になること。同じ名前のフォルダが 2 つ・同じ名前のファイル・ショートカットがあると `ambiguous_destination`、照会の失敗で `drive_unavailable` になること。`replace` で、公開の記録に ID が無いフォルダ、manifest が無い・`generator` が違う・`destination`/`folder` が違うフォルダは `conflict`（`not_managed`）で、`moveto`・`purge` が呼ばれないこと。公開の記録が壊れていても `not_managed` になること。作業用のフォルダが接頭辞と同じ・入れ子の設定では起動しないこと |
+| AC6 | 宛先が `exists`（空のフォルダを含む）なら、既定は `conflict` で、`copy`・`moveto` が呼ばれないこと。`replace` は incoming → 検証 → 退避 → 移動 → ゴミ箱の順で呼ぶこと。各段階の記録が Drive の操作の前に書かれること。移動の応答が失われた（偽の rclone が移動を済ませて失敗を返す）とき、`lsjson` で済んでいると判定すること。復旧の表（4.2）の各行の状態から起動して、表のとおりに進むこと。照合できない状態では `blocked` になり、次の書き出しが 503 になること。同じ名前のフォルダが 2 つ・同じ名前のファイル・ショートカットがあると `ambiguous_destination`、照会の失敗で `drive_unavailable` になること。`replace` で、公開の記録に ID が無いフォルダ、manifest が無い・`generator` が違う・`destination`/`folder` が違うフォルダは `conflict`（`not_managed`）で、`moveto`・`purge` が呼ばれないこと。公開の記録が壊れていても `not_managed` になること。管理しているフォルダでも、manifest に無いファイルが足されている・サイズが違えば `conflict`（`modified`）で、`moveto`・`purge` が呼ばれないこと。作業用のフォルダと接頭辞の remote 名が違う設定では起動しないこと。作業用のフォルダが接頭辞と同じ・入れ子の設定では起動しないこと |
 | AC7 | トークンが無い・違うと 401。許可外の送信元で 403。正しいトークンと許可された送信元では受け付けること。ログと応答にトークンが出ないこと。弱いトークンのファイルでは起動しないこと |
 | AC8 | 実行中（偽の rclone を待たせる）の 2 件目は 409。CLI の `run` も 4 で終わること。`dry_run` も 409 |
 | AC9 | `202` から、`running` を経て、`succeeded`・`failed`・`conflict` になる遷移。最初の GET で完了が返ってもよいこと。同じ `request_id` で、実行中でも同じジョブが返ること。中身が違えば `request_id_mismatch`。再起動後もジョブ ID で引けること。止まったジョブが 4.2 の復旧の表に従って片付くこと（Drive に触れる前なら `interrupted`） |
@@ -533,7 +533,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
 | 一部の失敗 | 1 枚の取得の失敗・デコードの失敗で `failed` になり、Drive に何も公開されないこと。全部が除外されたら、宛先の状態（無い・ある・照会できない）に関係なく `nothing_to_export` になり、Drive を照会しないこと。APP1 がある JPEG は `has_metadata` で除外されること |
 | 上限 | 画像の大きさ・画素数・枚数・期限の上限を超えたら `failed` になること。リダイレクトをたどらないこと |
 | 4.3 | 試験画像（縮小を要する大きさの実際の JPEG、平坦、高周波、グレー）で、固定の版の Pillow で計算した期待値と比べる。期待値は fixture として固定し、試験の実行時には Python を使わない。配置の前に、本番の数日分で旧 manifest と比べた差を記録する（記録は公開リポジトリの外に置く） |
-| 配置後 | 配置の前に、このホストの上り帯域を測り、2.9 の転送時間の仮定と期限（4.1・4.2）を見直す。2 つの親フォルダと作業用のフォルダの今の共有範囲を確かめて記録する（U7。共有を広げない）。受け取り側が `lat`/`lon` の `null` と、増えた枚数を扱えるかを確かめる。そのうえで本番で、旧 manifest がある日を `dry_run` してから、検証用の接頭辞に書き出す。旧 manifest と比べ、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことを確かめ、呼び出し側の実際の検証（サイズの突き合わせ）まで通す |
+| 配置後 | 配置の前に、このホストの上り帯域を測り、2.9 の転送時間の仮定と期限（4.1・4.2）を見直す。2 つの親フォルダと作業用のフォルダの今の共有範囲を確かめて記録する（U7。共有を広げない）。親フォルダが「リンクを知っている全員」や、オーナーと受け取り側以外に共有されていれば、配置を止めてオーナーに確かめる（manifest に正確な座標が入り、U1 で日常の写真も出るため）。受け取り側が `lat`/`lon` の `null` と、増えた枚数を扱えるかを確かめる。そのうえで本番で、旧 manifest がある日を `dry_run` してから、検証用の接頭辞に書き出す。旧 manifest と比べ、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことを確かめ、呼び出し側の実際の検証（サイズの突き合わせ）まで通す |
 
 ## 11. 実装の順番
 
