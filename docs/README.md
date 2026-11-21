@@ -20,6 +20,7 @@
 | [運用コンソール（C）](admin-ops/prd.md) | 実装中（PR ① マージ済み） | 同期・品質解析・AI ジョブの再試行・停止の解除・大量削除の保留の解除を稼働中の `serve` の「運用」タブから行う PRD と[設計](admin-ops/design.md)（2026-11-01） |
 | [ライブラリの見直し](admin-library-browse/prd.md) | 計画 | ライブラリタブのカードの横並び・選んで見る・検索（日付の言葉・場所の候補）・場所と地図の統合の PRD と[設計](admin-library-browse/design.md)（2026-11-02） |
 | [国・地域別の場所表示](international-places/prd.md) | 実装済み | 海外写真の国・州/県相当の分類、既存写真の再分類、国・地域のカードと検索の[設計](international-places/design.md)（2026-11-04） |
+| [note 記事用の写真書き出し](note-photo-export/prd.md) | 計画 | 日付を指定して表示用 JPEG と manifest を Google Drive へ書き出す別プロセス（`geoframe-export`）の PRD と[設計](note-photo-export/design.md)（2026-11-20。判断 U1〜U7 は 2026-11-22 に反映、U8 は判断待ち） |
 | [設定リファレンス](reference/configuration.md) | 現行 | 環境変数の一覧（手で保ち、コードとの照合を`cargo test`が検査） |
 | [デプロイ](../deploy/README.md) | 現行 | systemd、更新、バックアップ |
 
@@ -65,6 +66,12 @@
 - [ADR 0006: 実装順序（Wave構成）](decisions/0006-implementation-sequencing.md)（廃止）
 - [ADR 0007: 管理画面のキーマップ保存](decisions/0007-admin-keymap-write-path.md)（廃止）
 - [ADR 0008: GEOFRAMEを写真管理基盤にし、表示はmiharashiへ移す](decisions/0008-photo-platform-and-miharashi-display.md)
+
+### `note-photo-export/` — note 記事用の写真書き出し
+
+2026-11-20 開始。日付（または期間）を指定すると、その期間の全写真（非表示を除く）の表示用 JPEG と manifest を Google Drive へ書き出す別プロセス（`geoframe-export`）を作る計画。別 VM のエージェントが tailnet 経由で呼ぶ。写真サービスには読み取り専用の一覧 API を 1 つだけ足す。
+
+- [PRD](note-photo-export/prd.md) / [設計](note-photo-export/design.md)
 
 ### `reference/` — リファレンス
 
