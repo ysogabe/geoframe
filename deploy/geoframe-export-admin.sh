@@ -14,7 +14,8 @@
 #   sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from 2026-01-10 --destination yamareco --dry-run
 #   sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover
 #   （検証用の状態ディレクトリ・宛先・作業用フォルダは、このスクリプトの VERIFY_* の固定値。dry_run・書き出し・recover は同じ入口で行う。
-#     本番の export.lock も取るので、本番の書き出しの実行中は終了コード 4）
+#     本番の export.lock・本番の rclone/ には触れない。rclone の設定は、検証の準備で本番の rclone.conf を写した
+#     /var/lib/geoframe-export-verify/rclone/rclone.conf だけを使う。写しが無ければ動かない。手順は deploy/README.md §8.8 の 4）
 #
 # なぜ要るか: geoframe-export を root で直接動かすと、作られるファイル（jobs/・published.json・rclone の設定の更新）が
 # root の所有になり、サービス（User=geoframe-export）が読めなくなる。バイナリは root では動かない（終了コード 2）。
@@ -40,10 +41,12 @@ RCLONE_CONF="${STATE_DIR}/rclone/rclone.conf"
 FEED_BASE="http://127.0.0.1:8080"
 
 # 検証用の入口（--verify）の固定値。本番と別の状態ディレクトリ（StateDirectory=geoframe-export-verify。jobs/・published.json・
-# export.lock・作業領域が本番と別）、別の宛先の接頭辞、別の作業用フォルダ。remote 名（gdrive）は本番と同じ
-# （rclone の設定は本番の 1 つを参照する。写さない）。3 つの場所は互いに入れ子にならない（geoframe-export が検査する）。
+# export.lock・作業領域・rclone の設定が本番と別）、別の宛先の接頭辞、別の作業用フォルダ。remote 名（gdrive）は本番と同じ。
+# rclone の設定は、検証の準備で本番の rclone.conf を写した、検証用の状態ディレクトリの rclone/rclone.conf（本番の設定には触れない。
+# 本番のロックも取らない）。3 つの場所は互いに入れ子にならない（geoframe-export が検査する）。
 VERIFY_STATE_NAME="geoframe-export-verify"
 VERIFY_STATE_DIR="/var/lib/${VERIFY_STATE_NAME}"
+VERIFY_RCLONE_CONF="${VERIFY_STATE_DIR}/rclone/rclone.conf"
 VERIFY_ARGS=(
     --remote-yamareco gdrive:geoframe-export-verify/yamareco
     --remote-travel-journal gdrive:geoframe-export-verify/travel-journal
@@ -51,8 +54,7 @@ VERIFY_ARGS=(
 )
 
 # サービスの ExecStart と同じ設定の引数（geoframe-export.service と食い違わないこと。deploy/geoframe-export-admin-test.sh が検査する）。
-# --state-dir は本番のもの。検証用の入口では、下で検証用のものに替える。
-COMMON_ARGS=(--rclone "$RCLONE_BIN" --rclone-config "$RCLONE_CONF" --feed-base "$FEED_BASE")
+# --rclone-config・--state-dir は、入口ごとに下で決めた値（本番か検証用）。
 
 # サービスと同じハードニング（geoframe-export.service の同名の設定。同じ値であることを試験が検査する）。
 # StateDirectory=・StateDirectoryMode= は、下で入口ごとに足す。
@@ -99,6 +101,20 @@ case "${1:-}" in
     *) die "知らないサブコマンド（run・recover だけ）。使い方は --help" ;;
 esac
 
+# 入口ごとの値。検証用の入口は、状態ディレクトリ・rclone の設定・宛先・作業用フォルダのどれも本番と共有しない
+if [ "$verify" = 1 ]; then
+    state_dir="$VERIFY_STATE_DIR"
+    state_name="$VERIFY_STATE_NAME"
+    rclone_conf="$VERIFY_RCLONE_CONF"
+    extra_args=("${VERIFY_ARGS[@]}")
+else
+    state_dir="$STATE_DIR"
+    state_name="geoframe-export"
+    rclone_conf="$RCLONE_CONF"
+    extra_args=()
+fi
+COMMON_ARGS=(--rclone "$RCLONE_BIN" --rclone-config "$rclone_conf" --feed-base "$FEED_BASE")
+
 # 宛先の接頭辞・作業用フォルダは、この入口では変えさせない。本番の状態ディレクトリ（published.json・ジョブの記録）のまま
 # 宛先だけを変えると、本番の公開の記録を別の場所の ID で上書きし、以後の置き換えが not_managed になる。検証は --verify で行う
 for a in "$@"; do
@@ -113,7 +129,12 @@ done
 id -u "$RUN_USER" >/dev/null 2>&1 || die "ユーザー ${RUN_USER} が無い（deploy/README.md の手順で作る）"
 [ -x "$BIN" ] || die "geoframe-export のバイナリが無い（${BIN}）"
 [ -x "$RCLONE_BIN" ] || die "rclone が無い（${RCLONE_BIN}）"
-[ -f "$RCLONE_CONF" ] || die "rclone の設定のファイルが無い（${RCLONE_CONF}）。専用の client_id での設定が済んでいない機体では使えない"
+if [ "$verify" = 1 ]; then
+    # 本番の設定は見ない。写しの持ち主・権限・中身は、バイナリが起動時に検査する
+    [ -f "$rclone_conf" ] || die "検証用の rclone の設定の写しが無い（${rclone_conf}）。deploy/README.md §8.8 の 4 の準備で、専用ユーザーとして本番の rclone.conf を写す"
+else
+    [ -f "$rclone_conf" ] || die "rclone の設定のファイルが無い（${rclone_conf}）。専用の client_id での設定が済んでいない機体では使えない"
+fi
 command -v systemd-run >/dev/null 2>&1 || die "systemd-run が無い"
 
 # 一時サービスの名前は呼び出しごとに一意にする（日時と、このプロセスの番号と乱数）。同じ名前を使い回すと、前の一時サービスが
@@ -122,37 +143,11 @@ command -v systemd-run >/dev/null 2>&1 || die "systemd-run が無い"
 UNIT="geoframe-export-cli-$(date +%Y%m%d%H%M%S)-$$-${RANDOM}"
 
 sd_args=()
-if [ "$verify" = 1 ]; then
-    state_dir="$VERIFY_STATE_DIR"
-    state_name="$VERIFY_STATE_NAME"
-    # 本番の rclone の設定への書き戻し（アクセストークンの更新）だけは、本番の rclone/ に許す。本番の jobs/・published.json・
-    # export.lock は読み取り専用のまま（ProtectSystem=strict）
-    sd_args+=(-p "ReadWritePaths=${STATE_DIR}/rclone")
-    extra_args=("${VERIFY_ARGS[@]}")
-
-    # 検証用の実行枠は本番と別なので、本番の書き出しと同時に動かさないように、本番の実行枠（export.lock）を、このスクリプトの
-    # 終わりまで（exec した systemd-run が終わるまで）持つ。rclone の設定を 2 つの run が同時に書き戻すと、書き戻しの 2 回の
-    # rename の間に設定ファイルが一瞬無くなる。取れなければ本番の書き出しの実行中
-    prod_lock="${STATE_DIR}/export.lock"
-    if [ -f "$prod_lock" ] && [ ! -L "$prod_lock" ]; then
-        command -v flock >/dev/null 2>&1 || die "flock が無い（util-linux）"
-        # 読み取り専用で開いて flock するだけ。専用ユーザーが export.lock をすり替えても、root は何も書かない
-        exec {lock_fd}<"$prod_lock"
-        if ! flock -n "$lock_fd"; then
-            say "本番の書き出し（サービスか CLI）が実行中。終わるのを待つ（検証用の入口は、本番と同時に動かさない）"
-            exit 4
-        fi
-    fi
-else
-    state_dir="$STATE_DIR"
-    state_name="geoframe-export"
-    extra_args=()
-fi
 sd_args+=(-p "StateDirectory=${state_name}" -p "StateDirectoryMode=0700")
 for p in "${PROPS[@]}"; do sd_args+=(-p "$p"); done
 
 if [ "$verify" = 1 ]; then
-    say "検証用の入口: ユーザー ${RUN_USER}、状態ディレクトリ ${state_dir}（本番の記録とは別）、宛先と作業用フォルダは検証用（rclone の設定だけ本番の ${RCLONE_CONF}）"
+    say "検証用の入口: ユーザー ${RUN_USER}、状態ディレクトリ ${state_dir}（本番の記録・ロック・rclone の設定とは別）、宛先と作業用フォルダは検証用、rclone の設定は写し ${rclone_conf}"
 else
     say "ユーザー ${RUN_USER}、状態ディレクトリ ${state_dir}（サービスと同じ設定。実行枠もサービスと共通）"
 fi
