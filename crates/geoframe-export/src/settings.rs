@@ -191,7 +191,7 @@ impl fmt::Display for SettingsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::MissingOption(o) => write!(f, "{o} が必要です"),
-            Self::NotAbsolute(o) => write!(f, "{o} は絶対パスで指定してください"),
+            Self::NotAbsolute(o) => write!(f, "{o} は正規化済みの絶対パス（`.`・`..`・`//`・末尾の `/` を含まない）で指定してください"),
             Self::Remote(o, r) => write!(f, "{o}: {}", r.text()),
             Self::RemoteNameMismatch => f.write_str(
                 "--remote-yamareco・--remote-travel-journal・--work-root の remote 名（: の前）は同じにしてください",
@@ -241,6 +241,18 @@ fn absolute(option: &'static str, value: Option<&str>) -> Result<PathBuf, Settin
     let value = value.ok_or(SettingsError::MissingOption(option))?;
     let path = PathBuf::from(value);
     if value.is_empty() || value.contains('\0') || !path.is_absolute() {
+        return Err(SettingsError::NotAbsolute(option));
+    }
+    // 正規化済みの形だけを受け付ける（`.`・`..`・`//`・末尾の `/` を断る）。検査（リンクをたどって解決する）と
+    // 子プロセス（rclone は `..` を文字列の上で畳む）とで、別のファイルを指すことがないようにする
+    let normalized: PathBuf = path.components().collect();
+    if path.components().any(|c| {
+        matches!(
+            c,
+            std::path::Component::ParentDir | std::path::Component::CurDir
+        )
+    }) || normalized.as_os_str() != path.as_os_str()
+    {
         return Err(SettingsError::NotAbsolute(option));
     }
     Ok(path)
@@ -415,6 +427,20 @@ mod tests {
             missing(|r| r.rclone_config = Some(String::new())),
             SettingsError::NotAbsolute(OPT_RCLONE_CONFIG)
         );
+        // 正規化されていない絶対パス（検査と rclone とで別のファイルを指しうる）も断る
+        for bad in [
+            "/srv/a/../rclone.conf",
+            "/srv/./rclone.conf",
+            "/srv//rclone.conf",
+            "/srv/rclone/",
+            "/srv/rclone/.",
+        ] {
+            assert_eq!(
+                Settings::from_raw(&raw(|r| r.rclone_config = Some(bad.into()))).unwrap_err(),
+                SettingsError::NotAbsolute(OPT_RCLONE_CONFIG),
+                "{bad}"
+            );
+        }
     }
 
     #[test]

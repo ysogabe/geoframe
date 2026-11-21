@@ -86,6 +86,9 @@ pub enum SyntaxIssue {
     DuplicateKey,
     /// 専用の値が引用符で始まる、または `%(` を含む（空の引用・展開が読み手によって別の値になる）。
     QuotedOrInterpolated(&'static str),
+    /// どのセクションでも、値が引用符で始まる（rclone はこの形で書かない。閉じ忘れると、読み手がその行を丸ごと
+    /// エラーに載せることがあり、資格情報が標準エラーに出うる）。DEFAULT の見出しの無いキーも受け付けない。
+    QuotedValue,
 }
 
 impl SyntaxIssue {
@@ -95,6 +98,9 @@ impl SyntaxIssue {
             Self::BadLine => "`key = value` の形ではない行",
             Self::DuplicateSection => "remote のセクションが 2 度ある",
             Self::DuplicateKey => "remote のセクションで同じキーが 2 度ある",
+            Self::QuotedValue => {
+                "値が引用符で始まる行（専用の設定は rclone が書く `key = value` の形だけを受け付ける）"
+            }
             Self::QuotedOrInterpolated(_) => {
                 "client_id・client_secret の値が引用符で始まるか `%(` を含む"
             }
@@ -305,6 +311,9 @@ fn check_section(text: &str, remote: &str) -> Result<(), ConfigError> {
         if !is_plain_key(key) {
             return Err(syntax(no, SyntaxIssue::BadLine));
         }
+        if !in_section && value.trim().starts_with(['"', '`']) {
+            return Err(syntax(no, SyntaxIssue::QuotedValue));
+        }
         if !in_section {
             continue;
         }
@@ -349,6 +358,22 @@ mod tests {
         let text =
             "# x\n[other]\nclient_id =\n\n[ gdrive ]\n; c\n  client_secret=B  \nclient_id\t= A\n";
         assert_eq!(check_section(text, "gdrive"), Ok(()));
+        // ほかのセクションでも、引用符で始まる値（閉じ忘れを含む）は断る
+        for text in [
+            "[other]\ntoken = `{unclosed\n[gdrive]\nclient_id = A\nclient_secret = B\n",
+            "[gdrive]\nclient_id = A\nclient_secret = B\n[other]\ntoken = \"x\n",
+        ] {
+            assert!(
+                matches!(
+                    check_section(text, "gdrive"),
+                    Err(ConfigError::Syntax {
+                        issue: SyntaxIssue::QuotedValue,
+                        ..
+                    })
+                ),
+                "{text}"
+            );
+        }
     }
 
     #[test]
