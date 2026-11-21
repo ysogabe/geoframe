@@ -9,6 +9,7 @@ use std::time::Duration;
 use common::drive::*;
 use common::site::*;
 use common::{FakeSite, closed_port_base};
+use geoframe_export::cancel::Cancel;
 use geoframe_export::error::ErrorCode;
 use geoframe_export::flow::Tuning;
 use geoframe_export::jobid::JobId;
@@ -467,7 +468,11 @@ fn only_the_newest_finished_records_are_kept() {
     // 0 枚のジョブは速い。直前に、読めない記録・未完了でない古い blocked を足しておく
     let store = JobStore::open(&env.state).unwrap();
     let mut blocked = JobRecord::new(JobId::parse(&format!("{:032x}", 9_000)).unwrap(), &day());
-    blocked.status = Status::Blocked;
+    settle(&mut blocked, Status::Blocked);
+    blocked.blocked = Some(BlockedNote {
+        reason: "unobservable".into(),
+        description: String::new(),
+    });
     blocked.started_ns = 1;
     blocked.resolved_at = Some("2030-01-01T00:00:00+09:00".into());
     store.write(&blocked).unwrap();
@@ -928,7 +933,7 @@ fn blocked_records_are_not_pruned_and_resolved_ones_free_the_service() {
     let svc = service(&mut env, &site);
     let store = JobStore::open(&env.state).unwrap();
     let mut b = JobRecord::new(JobId::parse(&format!("{:032x}", 8)).unwrap(), &day());
-    b.status = Status::Blocked;
+    settle(&mut b, Status::Blocked);
     b.started_ns = 1;
     b.blocked = Some(BlockedNote {
         reason: "unobservable".into(),
@@ -1158,4 +1163,428 @@ fn the_same_fixture_gives_the_same_manifest() {
     assert_eq!(m["count"], 3);
     assert_eq!(m["destination"], "yamareco");
     assert_eq!(m["folder"], DAY);
+}
+
+// ---- キャンセル（SIGINT・SIGTERM）・パニックの後の復旧・request_id の再照会・記録の整合・完了ログ（T5 のレビュー対応） ----
+
+/// `cancel` を共有する `Service`（偽の写真サービスを向く）。
+fn cancellable_service(env: &mut Env, site: &FakeSite, cancel: &Cancel) -> Service {
+    env.settings.feed_base = site.base.clone();
+    Service::with_cancel(env.settings.clone(), fast_tuning(), cancel.clone()).expect("service")
+}
+
+fn all_records(env: &Env) -> Vec<JobRecord> {
+    JobStore::open(&env.state).unwrap().scan().records
+}
+
+/// 印が立つと、実行中の rclone を止めて `wait` し終えてから返る（実行枠は、そのあとで外れる）。記録は確定せず、`blocked` にも
+/// `failed` にもならない。次の復旧が、表のとおりに片付ける。
+#[test]
+fn a_cancel_stops_the_running_rclone_before_returning_and_hands_the_record_to_recovery() {
+    let mut env = Env::new("flow-cancel");
+    let site = photo_site(DAY, DAY, three_photos());
+    let cancel = Cancel::new();
+    let svc = cancellable_service(&mut env, &site, &cancel);
+    // 写真を送る copy を、20 秒止める（止めなければ、そのまま待つ）
+    env.add_rule("copy", 0, 1, sleep_ms(20_000));
+    let worker = {
+        let svc = svc.clone();
+        std::thread::spawn(move || run_foreground_retry(&svc, &day()))
+    };
+    let copy_pid = wait_for_call(&env, "copy", 20);
+    assert!(process_exists(copy_pid));
+    let t = std::time::Instant::now();
+    cancel.cancel();
+    let rec = worker.join().unwrap().unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(10),
+        "印を見て止まる: {:?}",
+        t.elapsed()
+    );
+    // 返った時点で、子はもう居ない（`wait` 済み。次のジョブの復旧と競合しない）
+    assert!(!process_exists(copy_pid), "子が残っています");
+    assert!(slot_is_free(&env.state));
+    assert_eq!(staging_entries(&env), 0);
+
+    // 記録は running のまま（Drive の段階が記録にある）。blocked にも failed にもしない
+    assert_eq!(rec.status, Status::Running);
+    let on_disk = read_record(&env, &rec.job_id);
+    assert_eq!(on_disk.status, Status::Running);
+    assert_eq!(on_disk.error, None);
+    let progress = on_disk.progress.expect("段階の記録");
+    assert_eq!(progress.stage, Stage::Uploading);
+    assert!(progress.incoming_id.is_some());
+    assert!(svc.blocking().is_none());
+    let incoming = progress.incoming_id.unwrap();
+    assert!(
+        drive_has(
+            &env,
+            &["geoframe-export-work", "incoming", rec.job_id.as_str()]
+        ),
+        "incoming は、復旧が片付けるまで残る"
+    );
+    assert!(!env.drive().trashed.contains(&incoming));
+
+    // 次の起動の復旧（別の印）が、表のとおり incoming を片付けて interrupted にし、そのあとの書き出しが動く
+    let next = Service::with_tuning(env.settings.clone(), fast_tuning()).unwrap();
+    match startup_recovery_retry(&next) {
+        StartupReport::Done { recovery, .. } => {
+            assert_eq!((recovery.recovered, recovery.blocked), (1, false));
+            assert!(!recovery.cancelled);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(read_record(&env, &rec.job_id).status, Status::Interrupted);
+    assert!(env.drive().trashed.contains(&incoming));
+    let v = submit_and_wait(&next, &day());
+    assert_eq!(v["status"], "succeeded", "{v}");
+    assert_safe_calls(&env);
+}
+
+/// 別のジョブの復旧の最中の印: 復旧の `rclone` を止め、その別のジョブを `blocked` にしない（`Unobservable` を確定しない）。
+/// 復旧の待ちも眠り通さない。
+#[test]
+fn a_cancel_during_another_jobs_recovery_does_not_block_it() {
+    let mut env = Env::new("rec-cancel");
+    let set = env.make_set("s", Y, DAY, &[("090000_1.jpg", 100)]);
+    let job = JobId::parse(&format!("{:032x}", 2)).unwrap();
+    let inc = env.seed_set_at(&["geoframe-export-work", "incoming", job.as_str()], &set);
+    let site = photo_site(DAY, DAY, three_photos());
+    let cancel = Cancel::new();
+    env.settings.feed_base = site.base.clone();
+    // 待ちを長くして、印が待ちを切り上げることも確かめる
+    let svc = Service::with_cancel(
+        env.settings.clone(),
+        Tuning {
+            timing: geoframe_export::publish::Timing {
+                settle: Duration::from_secs(30),
+                rounds: 4,
+            },
+            ..fast_tuning()
+        },
+        cancel.clone(),
+    )
+    .unwrap();
+    let rec = running_record(
+        &env,
+        2,
+        Some(Progress {
+            stage: Stage::Uploading,
+            old_id: None,
+            incoming_id: Some(inc.clone()),
+        }),
+    );
+    let worker = {
+        let svc = svc.clone();
+        std::thread::spawn(move || startup_recovery_retry(&svc))
+    };
+    // 復旧が一覧を取る前の待ち（30 秒）の最中に、印を立てる
+    std::thread::sleep(Duration::from_millis(300));
+    let t = std::time::Instant::now();
+    cancel.cancel();
+    let report = worker.join().unwrap();
+    assert!(
+        t.elapsed() < Duration::from_secs(10),
+        "待ちを眠り通さない: {:?}",
+        t.elapsed()
+    );
+    match report {
+        StartupReport::Done { recovery, .. } => {
+            assert!(recovery.cancelled);
+            assert!(!recovery.blocked);
+        }
+        other => panic!("{other:?}"),
+    }
+    let after = read_record(&env, &rec.job_id);
+    assert_eq!(after.status, Status::Running, "確定しない");
+    assert!(svc.blocking().is_none());
+    assert!(!env.drive().trashed.contains(&inc), "何も片付けていない");
+    assert!(slot_is_free(&env.state));
+
+    // 印のない次の起動で、片付く
+    let next = Service::with_tuning(env.settings.clone(), fast_tuning()).unwrap();
+    assert!(matches!(
+        startup_recovery_retry(&next),
+        StartupReport::Done { .. }
+    ));
+    assert_eq!(read_record(&env, &rec.job_id).status, Status::Interrupted);
+}
+
+/// 復旧が `incoming` をゴミ箱へ移している最中に印が立った: 止められた片付けは「手作業の片付けが要る残りもの」として
+/// `interrupted` に確定しない（次の復旧なら自動で消せる）。記録は `running` のまま、`incoming` も残り、次の復旧で片付く。
+#[test]
+fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
+    let mut env = Env::new("rec-cancel-purge");
+    let set = env.make_set("s", Y, DAY, &[("090000_1.jpg", 100)]);
+    let job = JobId::parse(&format!("{:032x}", 2)).unwrap();
+    let inc = env.seed_set_at(&["geoframe-export-work", "incoming", job.as_str()], &set);
+    let site = photo_site(DAY, DAY, three_photos());
+    let cancel = Cancel::new();
+    let svc = cancellable_service(&mut env, &site, &cancel);
+    let rec = running_record(
+        &env,
+        2,
+        Some(Progress {
+            stage: Stage::Uploading,
+            old_id: None,
+            incoming_id: Some(inc.clone()),
+        }),
+    );
+    // ゴミ箱への移動（purge）を止めておく
+    env.add_rule("purge", 0, 1, sleep_ms(30_000));
+    let worker = {
+        let svc = svc.clone();
+        std::thread::spawn(move || startup_recovery_retry(&svc))
+    };
+    let purge_pid = wait_for_call(&env, "purge", 20);
+    cancel.cancel();
+    let report = worker.join().unwrap();
+    assert!(!process_exists(purge_pid), "子が残っています");
+    match report {
+        StartupReport::Done { recovery, .. } => assert!(recovery.cancelled),
+        other => panic!("{other:?}"),
+    }
+    let after = read_record(&env, &rec.job_id);
+    assert_eq!(after.status, Status::Running, "interrupted に確定しない");
+    assert!(after.notes.is_empty());
+    assert!(!env.drive().trashed.contains(&inc));
+    assert!(svc.blocking().is_none());
+
+    let next = Service::with_tuning(env.settings.clone(), fast_tuning()).unwrap();
+    assert!(matches!(
+        startup_recovery_retry(&next),
+        StartupReport::Done { .. }
+    ));
+    let done = read_record(&env, &rec.job_id);
+    assert_eq!(done.status, Status::Interrupted);
+    assert!(done.notes.is_empty(), "次の復旧が自動で片付ける");
+    assert!(env.drive().trashed.contains(&inc));
+}
+
+/// 印が、Drive に触れる前に立っていれば、ジョブは `interrupted`（rclone は 1 回も呼ばない）。
+#[test]
+fn a_cancel_before_drive_is_touched_ends_the_job_as_interrupted() {
+    let mut env = Env::new("flow-cancel-early");
+    let site = photo_site(DAY, DAY, three_photos());
+    let cancel = Cancel::new();
+    let svc = cancellable_service(&mut env, &site, &cancel);
+    cancel.cancel();
+    let rec = run_foreground_retry(&svc, &day()).unwrap();
+    assert_eq!(rec.status, Status::Interrupted, "{:?}", rec.error);
+    assert_eq!(rec.error, None);
+    assert!(rec.progress.is_none());
+    assert!(env.calls().is_empty(), "Drive に触れない");
+    assert_eq!(staging_entries(&env), 0);
+    assert!(slot_is_free(&env.state));
+    assert!(svc.blocking().is_none());
+    // 次のジョブは、別の印で動く
+    let next = Service::with_tuning(env.settings.clone(), fast_tuning()).unwrap();
+    let v = submit_and_wait(&next, &day());
+    assert_eq!(v["status"], "succeeded", "{v}");
+}
+
+/// 動いているジョブのスレッドの終わりを待てる（`serve` が、印を立てたあとに使う）。
+#[test]
+fn wait_idle_returns_when_the_job_thread_has_released_the_slot() {
+    let mut env = Env::new("flow-idle");
+    let site = photo_site(DAY, DAY, three_photos());
+    let svc = service(&mut env, &site);
+    assert!(svc.wait_idle(Duration::from_millis(10)), "何も動いていない");
+    env.add_rule("copy", 0, 1, sleep_ms(600));
+    let s = submit_retry(&svc, &day()).unwrap();
+    assert!(!svc.wait_idle(Duration::from_millis(50)), "まだ動いている");
+    assert!(svc.wait_idle(Duration::from_secs(30)));
+    assert!(
+        matches!(svc.lookup(s.job_id.as_str()), Lookup::Found(v) if v["status"] == "succeeded")
+    );
+    assert!(slot_is_free(&env.state));
+}
+
+// ---- パニックの後 ----
+
+/// 旧フォルダを退避した直後（`publishing` を記録した直後）のパニックは、`failed` を確定せず、実行枠を持ったまま復旧の表を
+/// 当てる。宛先が空のまま、復旧の対象から外れることがない（前へ進めて公開し、旧フォルダをゴミ箱へ）。
+#[test]
+fn a_panic_right_after_retiring_is_recovered_in_place_not_failed() {
+    let mut env = Env::new("flow-panic-retired");
+    let old = env.make_set("old", Y, DAY, &[("090000_9.jpg", 50)]);
+    let old_id = env.seed_managed(Y, DAY, &old);
+    let site = photo_site(DAY, DAY, three_photos());
+    env.settings.feed_base = site.base.clone();
+    let svc = Service::with_tuning(
+        env.settings.clone(),
+        Tuning {
+            panic_after_stage: Some(Stage::Publishing),
+            ..fast_tuning()
+        },
+    )
+    .unwrap();
+    let rec = run_foreground_retry(&svc, &request(DAY, None, Some("replace"), None)).unwrap();
+    // 旧フォルダの退避は済んでいる（記録の段階は publishing）。パニックのあと、復旧の表で公開まで進んだ
+    assert_eq!(
+        rec.status,
+        Status::Succeeded,
+        "{:?} {:?}",
+        rec.error,
+        rec.notes
+    );
+    assert_eq!(rec.error, None);
+    let new_id = env
+        .drive()
+        .resolve(&["yamareco", DAY])
+        .expect("宛先が空でない");
+    assert_ne!(new_id, old_id);
+    for f in [
+        "090000_1.jpg",
+        "090100_2.jpg",
+        "103000_3.jpg",
+        "manifest.json",
+    ] {
+        assert!(drive_has(&env, &["yamareco", DAY, f]), "{f}");
+    }
+    assert!(
+        env.drive().trashed.contains(&old_id),
+        "旧フォルダはゴミ箱へ"
+    );
+    assert!(
+        env.published
+            .find_id(Y, &geoframe_export::folder::FolderName::parse(DAY).unwrap())
+            == Some(new_id)
+    );
+    // 記録は終わりの状態（読める）。作業領域は消え、実行枠は外れている
+    let on_disk = read_record(&env, &rec.job_id);
+    assert_eq!(on_disk.status, Status::Succeeded);
+    assert_eq!(
+        on_disk.result.as_ref().map(|r| r["count"].clone()),
+        Some(json!(3)),
+        "数は、公開の前に記録した summary から"
+    );
+    assert_eq!(staging_entries(&env), 0);
+    assert!(slot_is_free(&env.state));
+    assert!(svc.blocking().is_none());
+    assert_eq!(all_records(&env).len(), 1);
+}
+
+/// 段階を記録した直後（新規の公開の前）のパニックも、`failed` を確定せず復旧の表を当てる: `incoming` を片付けて `interrupted`。
+#[test]
+fn a_panic_after_the_first_stage_is_settled_by_the_table_and_leaves_nothing_behind() {
+    let mut env = Env::new("flow-panic-uploading");
+    let site = photo_site(DAY, DAY, three_photos());
+    env.settings.feed_base = site.base.clone();
+    let svc = Service::with_tuning(
+        env.settings.clone(),
+        Tuning {
+            panic_after_stage: Some(Stage::Verifying),
+            ..fast_tuning()
+        },
+    )
+    .unwrap();
+    let rec = run_foreground_retry(&svc, &day()).unwrap();
+    // 検証の段階まで進んだ（写真は送った）。宛先は前のまま（無い）なので、incoming を片付けて interrupted
+    assert_eq!(rec.status, Status::Interrupted, "{:?}", rec.error);
+    assert!(!drive_has(&env, &["yamareco", DAY]));
+    assert!(!drive_has(
+        &env,
+        &["geoframe-export-work", "incoming", rec.job_id.as_str()]
+    ));
+    assert_eq!(staging_entries(&env), 0);
+    assert!(slot_is_free(&env.state));
+    assert!(svc.blocking().is_none());
+}
+
+// ---- request_id の再照会（別のプロセスに相当する別の Service） ----
+
+fn second_service(env: &Env) -> Service {
+    Service::with_tuning(env.settings.clone(), fast_tuning()).expect("service")
+}
+
+/// 最初の照会のあと（実行枠を取る前）に、別のプロセスが同じ `request_id` を登録して終えた: 実行枠を取った直後の照会で見つけて、
+/// 二重に登録しない。
+#[test]
+fn a_request_id_registered_by_another_instance_after_the_first_lookup_is_not_registered_twice() {
+    let mut env = Env::new("flow-rid-after");
+    let site = photo_site(DAY, DAY, three_photos());
+    let a = service(&mut env, &site);
+    let b = second_service(&env);
+    let req = request(DAY, None, None, Some("req-x"));
+    let other: std::cell::RefCell<Option<geoframe_export::service::Submitted>> = Default::default();
+    let found = a
+        .submit_with_hook(&req, &|| {
+            let s = submit_retry(&b, &req).unwrap();
+            wait_done(&b, &s.job_id);
+            *other.borrow_mut() = Some(s);
+        })
+        .unwrap();
+    let first = other.borrow().clone().unwrap();
+    assert_eq!(
+        found.job_id, first.job_id,
+        "別のインスタンスが登録したジョブを返す"
+    );
+    assert!(found.reused);
+    assert_eq!(found.status, Status::Succeeded);
+    assert_eq!(job_files(&env), 1, "二重に登録しない");
+    assert!(slot_is_free(&env.state), "取った実行枠は手放している");
+}
+
+/// その間に別のプロセスが登録して、まだ実行中（実行枠が取れない）: `Busy` ではなく、そのジョブを返す。
+#[test]
+fn a_request_id_registered_meanwhile_is_returned_instead_of_busy() {
+    let mut env = Env::new("flow-rid-busy");
+    let site = photo_site(DAY, DAY, three_photos());
+    let a = service(&mut env, &site);
+    let b = second_service(&env);
+    env.add_rule("copy", 0, 1, sleep_ms(800));
+    let req = request(DAY, None, None, Some("req-y"));
+    let other: std::cell::RefCell<Option<geoframe_export::service::Submitted>> = Default::default();
+    let found = a
+        .submit_with_hook(&req, &|| {
+            *other.borrow_mut() = Some(submit_retry(&b, &req).unwrap());
+        })
+        .unwrap();
+    let first = other.borrow().clone().unwrap();
+    assert_eq!(found.job_id, first.job_id);
+    assert!(found.reused);
+    assert_eq!(found.status, Status::Running);
+    // 別の要求は、ふつうに Busy
+    assert_eq!(
+        a.submit(&request("2030-03-12", None, None, Some("req-z")))
+            .unwrap_err(),
+        SubmitError::Busy
+    );
+    assert_eq!(job_files(&env), 1);
+    wait_done(&b, &first.job_id);
+}
+
+/// その間に別のプロセスが、同じ `request_id` で中身の違う要求を登録した: `request_id_mismatch`（Busy でも、新しい登録でもない）。
+#[test]
+fn a_request_id_registered_meanwhile_with_other_content_is_a_mismatch() {
+    let mut env = Env::new("flow-rid-mismatch");
+    let site = photo_site(DAY, DAY, three_photos());
+    let a = service(&mut env, &site);
+    let b = second_service(&env);
+    let theirs = request(DAY, None, Some("replace"), Some("req-w"));
+    let mine = request(DAY, None, None, Some("req-w"));
+    // 実行枠が空いている場合
+    let e = a
+        .submit_with_hook(&mine, &|| {
+            let s = submit_retry(&b, &theirs).unwrap();
+            wait_done(&b, &s.job_id);
+        })
+        .unwrap_err();
+    assert_eq!(e, SubmitError::RequestIdMismatch);
+    assert_eq!(job_files(&env), 1);
+    assert!(slot_is_free(&env.state));
+    // 実行中で取れない場合
+    let mut env2 = Env::new("flow-rid-mismatch2");
+    let a2 = service(&mut env2, &site);
+    let b2 = second_service(&env2);
+    env2.add_rule("copy", 0, 1, sleep_ms(800));
+    let other: std::cell::RefCell<Option<JobId>> = Default::default();
+    let e = a2
+        .submit_with_hook(&mine, &|| {
+            *other.borrow_mut() = Some(submit_retry(&b2, &theirs).unwrap().job_id);
+        })
+        .unwrap_err();
+    assert_eq!(e, SubmitError::RequestIdMismatch);
+    wait_done(&b2, other.borrow().as_ref().unwrap());
 }

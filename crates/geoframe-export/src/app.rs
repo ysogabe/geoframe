@@ -9,6 +9,7 @@
 
 use std::io::Write;
 
+use crate::cancel::Cancel;
 use crate::cli::{self, CliError, Command};
 use crate::startup::startup_check;
 use crate::{recover, run, serve};
@@ -38,6 +39,22 @@ pub fn run_command(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
+    run_command_cancellable(euid, args, out, err, &Cancel::new(), false)
+}
+
+/// [`run_command`] に、キャンセルの印を渡せる形。`run` と `serve` が使う。`handle_signals` が真なら、`run`・`serve` の前に
+/// SIGINT・SIGTERM の handler を入れる（[`crate::cancel::install_signal_handlers`]。以後、この 2 つの signal はプロセスを
+/// 終わらせず、`cancel` の印を立てる。実行中の rclone を止めて `wait` し終えてから終わる）。バイナリの `main` だけが真にする
+/// （プロセス内の試験は並列で 1 つのプロセスを共有するので、handler を入れない）。`recover` と `--help`・`--version` は、
+/// handler を入れない（signal でふつうに終わる）。
+pub fn run_command_cancellable(
+    euid: Option<u32>,
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    cancel: &Cancel,
+    handle_signals: bool,
+) -> u8 {
     let command = match cli::parse(args) {
         Ok(command) => command,
         Err(e) => return usage_error(&e, err),
@@ -62,7 +79,17 @@ pub fn run_command(
             if let Err(code) = startup(&settings, err) {
                 return code;
             }
-            return run::run(&settings, &request, out, err);
+            if handle_signals && let Err(code) = install_handlers(cancel, err) {
+                return code;
+            }
+            return run::run_with(
+                &settings,
+                &request,
+                crate::flow::Tuning::default(),
+                cancel,
+                out,
+                err,
+            );
         }
         Command::Serve {
             listen,
@@ -73,7 +100,10 @@ pub fn run_command(
             if let Err(code) = startup(&settings, err) {
                 return code;
             }
-            serve::serve(&settings, listen, &token_file, &allow)
+            if handle_signals && let Err(code) = install_handlers(cancel, err) {
+                return code;
+            }
+            serve::serve(&settings, listen, &token_file, &allow, cancel)
         }
         Command::Recover { resolve, settings } => {
             if let Err(code) = startup(&settings, err) {
@@ -92,6 +122,13 @@ pub fn run_command(
             EXIT_NOT_IMPLEMENTED
         }
     }
+}
+
+fn install_handlers(cancel: &Cancel, err: &mut dyn Write) -> Result<(), u8> {
+    crate::cancel::install_signal_handlers(cancel).map_err(|_| {
+        let _ = writeln!(err, "geoframe-export: signal の handler を入れられません");
+        EXIT_USAGE
+    })
 }
 
 fn startup(settings: &crate::settings::Settings, err: &mut dyn Write) -> Result<(), u8> {

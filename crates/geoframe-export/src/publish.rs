@@ -480,13 +480,30 @@ impl Recovery<'_> {
         })
     }
 
+    /// `settle` だけ待つ。キャンセルの印が立てば、そこで切り上げる（30 秒を眠り通さない）。
+    fn pause(&self) {
+        let until = std::time::Instant::now() + self.timing.settle;
+        loop {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() || self.rclone.is_cancelled() {
+                return;
+            }
+            std::thread::sleep(left.min(Duration::from_millis(50)));
+        }
+    }
+
     /// 待って、一覧を 2 回取り、同じなら返す。違えば（または取れなければ）待ってやり直し、`rounds` 回で決まらなければ `None`。
     /// `wait_first` が偽なら、最初の 1 回目は待たない（Drive の移動が起きていない段階の失敗）。
     pub fn settle_observe(&self, wait_first: bool) -> Option<Observed> {
         let drive = self.drive();
         for round in 0..self.timing.rounds.max(1) {
             if wait_first || round > 0 {
-                std::thread::sleep(self.timing.settle);
+                self.pause();
+            }
+            // キャンセルされたら、決まらなかったものとして返す（rclone はもう動かない。呼び出し側は、キャンセルの印を見て、
+            // この結果〔`blocked`〕を記録に確定しない）
+            if self.rclone.is_cancelled() {
+                return None;
             }
             if let (Ok(a), Ok(b)) = (drive.observe(), drive.observe())
                 && a == b

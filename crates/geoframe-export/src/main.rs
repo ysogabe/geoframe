@@ -11,11 +11,16 @@ fn main() -> ExitCode {
             }
         }
     }
-    let code = geoframe_export::app::run_command(
+    // `run`・`serve` では、SIGINT・SIGTERM で終わらず、キャンセルの印を立てる。実行中の rclone を止めて `wait` し終えてから、
+    // 実行枠を手放して終わる（子が残ったまま、枠だけが外れないように）。handler は `run_command_cancellable` が入れる
+    let cancel = geoframe_export::cancel::Cancel::new();
+    let code = geoframe_export::app::run_command_cancellable(
         Some(geoframe_export::sys::euid()),
         &args,
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),
+        &cancel,
+        true,
     );
     ExitCode::from(code)
 }

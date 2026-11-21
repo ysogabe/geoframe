@@ -13,6 +13,14 @@
 //!   起動の直前に [`is_forbidden_flag`] でもう一度確かめる。`-vv`・`--dump*` も同じ検査で断る。
 //! - シェルを介さず、引数の配列で渡す。位置の引数の前に `--` を置く。Drive の場所は [`RemoteLoc`]（検査済みの部品だけで作る）。
 //! - 標準入力は閉じる。子プロセスは自分のプロセスグループに入れ、期限を過ぎたらグループごと kill する。
+//! - キャンセルの印（[`crate::cancel::Cancel`]。SIGINT・SIGTERM）が立ったら、起動の前なら起動せず、実行中なら期限切れと同じく
+//!   グループごと kill して `wait` し、出力のスレッドを `join` してから [`RunError::Cancelled`] を返す。呼び出し側は、この
+//!   関数が返ってから実行枠を手放す（子が残ったまま枠だけ外れて、次の復旧が進行中の `copy`・`moveto` と競合しないため）。
+//!   パニックで巻き戻るときも、`Drop` で同じ kill と `wait` をする（[`ChildGuard`]）。
+//! - 親が異常終了したとき（SIGKILL・OOM など、印を見られない終わり方）の補助として、子に `PR_SET_PDEATHSIG`（SIGKILL）を付ける。
+//!   これは**排他の保証にならない**: 効くのは、子を起動した**スレッド**が終わったときで（プロセスの終了とは限らない。ジョブの
+//!   スレッドは起動した子を `wait` し終えてから終わる）、kill されるのは子だけで子孫には及ばず、親が死んだあとで実行枠が
+//!   外れるのとのあいだに隙がある。排他は、印を見て kill → `wait` → 枠を手放す、の順で守る。
 //! - 標準出力・標準エラーは別のスレッドで読み続ける（パイプが詰まって止まらないように）。標準出力には上限を掛ける。
 //! - 標準エラーは、`token`・`Bearer`・`access_token` などを含む行を伏せ字にしてから、最後の数行だけをログ（tracing）に残す
 //!   （[`redact_stderr`]）。API の結果・エラーの説明には rclone の出力を載せない（[`ExportError`] の説明は固定の文字列）。
@@ -23,12 +31,13 @@ use std::io::Read;
 use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::cancel::Cancel;
 use crate::error::{ErrorCode, ExportError};
 use crate::settings::{RemotePath, Settings};
 
@@ -305,6 +314,9 @@ pub enum RunError {
     Exit(i32),
     /// 標準出力が上限を超えた、または `lsjson` の出力が決められた形でない。
     BadOutput,
+    /// キャンセルの印（SIGINT・SIGTERM）が立った（起動の前、または kill して `wait` し終えた）。結果は分からない
+    /// （`copy`・`moveto` は、Drive 側で済んでいるかもしれない）ので、呼び出し側は失敗として確定せず、復旧の表に渡す。
+    Cancelled,
 }
 
 impl RunError {
@@ -382,6 +394,7 @@ pub struct Rclone {
     copy_timeout: Duration,
     timeout: Duration,
     deadline: Option<Instant>,
+    cancel: Cancel,
 }
 
 impl Rclone {
@@ -396,6 +409,7 @@ impl Rclone {
             copy_timeout: settings.rclone_copy_timeout,
             timeout: settings.rclone_timeout,
             deadline: None,
+            cancel: Cancel::new(),
         }
     }
 
@@ -413,6 +427,18 @@ impl Rclone {
         self.copy_timeout = copy;
         self.timeout = other;
         self
+    }
+
+    /// キャンセルの印（SIGINT・SIGTERM）を共有する。立つと、起動の前なら起動せず、実行中なら子のグループを kill して `wait` し、
+    /// [`RunError::Cancelled`] を返す。
+    pub fn with_cancel(mut self, cancel: Cancel) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
+    /// キャンセルの印が立っているか（復旧の待ちが、眠らずに止まるために見る）。
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.is_cancelled()
     }
 
     /// ジョブ全体の期限を掛けた複製。過ぎたあとの起動は `JobDeadline`、実行中に過ぎれば kill して `JobDeadline`。
@@ -616,6 +642,9 @@ impl Rclone {
                 _ => return Err(RunError::Spawn),
             }
         }
+        if self.cancel.is_cancelled() {
+            return Err(RunError::Cancelled);
+        }
         // 期限: コマンドごとの期限と、ジョブ全体の期限の短いほう
         let mut limit = timeout;
         let mut by_job_deadline = false;
@@ -632,7 +661,8 @@ impl Rclone {
         Self::ensure_private_dir(&self.home)?;
         Self::ensure_private_dir(&self.cache)?;
 
-        let mut child = Command::new(&self.program)
+        let mut command = Command::new(&self.program);
+        command
             .args(&args)
             .env_clear()
             .env("PATH", PATH_VALUE)
@@ -641,20 +671,35 @@ impl Rclone {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .process_group(0)
-            .spawn()
-            .map_err(|_| RunError::Spawn)?;
-        let pid = child.id();
-        let stdout = child.stdout.take().map(|r| read_head(r, stdout_cap));
-        let stderr = child.stderr.take().map(read_tail);
+            .process_group(0);
+        #[cfg(target_os = "linux")]
+        {
+            let parent = std::process::id();
+            // SAFETY: fork のあと exec の前に走る。`prctl`・`getppid` は async-signal-safe で、メモリの確保も、ロックも取らない。
+            unsafe {
+                command.pre_exec(move || die_with_parent(parent));
+            }
+        }
+        let child = command.spawn().map_err(|_| RunError::Spawn)?;
+        let mut guard = ChildGuard::new(child);
+        let stdout = guard.child.stdout.take().map(|r| read_head(r, stdout_cap));
+        let stderr = guard.child.stderr.take().map(read_tail);
 
         let started = Instant::now();
         let mut timed_out = false;
+        let mut cancelled = false;
         let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break Some(status),
+            match guard.child.try_wait() {
+                Ok(Some(status)) => {
+                    guard.reaped = true;
+                    break Some(status);
+                }
                 Ok(None) => {}
                 Err(_) => break None,
+            }
+            if self.cancel.is_cancelled() {
+                cancelled = true;
+                break None;
             }
             if started.elapsed() >= limit {
                 timed_out = true;
@@ -663,15 +708,8 @@ impl Rclone {
             std::thread::sleep(POLL_INTERVAL);
         };
         if status.is_none() {
-            // 期限切れ（または待てない）。子と、その子孫をまとめて止める
-            if let Ok(pid) = i32::try_from(pid) {
-                // SAFETY: 自分が作ったプロセスグループ（`process_group(0)`）への kill(2) だけ
-                unsafe {
-                    libc::kill(-pid, libc::SIGKILL);
-                }
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            // 期限切れ・キャンセル（または待てない）。子と、その子孫をまとめて止めて、`wait` し終えてから先へ進む
+            guard.kill_and_wait();
         }
         let (stdout_bytes, truncated) = stdout
             .and_then(|h| h.join().ok())
@@ -679,6 +717,7 @@ impl Rclone {
         let stderr_text = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
 
         let result = match status {
+            None if cancelled => Err(RunError::Cancelled),
             Some(status) if status.success() => {
                 if truncated {
                     Err(RunError::BadOutput)
@@ -708,6 +747,71 @@ impl Rclone {
         }
         result
     }
+}
+
+/// 起動した子。手放すとき（正常な終わりでも、パニックの巻き戻りでも）まだ `wait` していなければ、プロセスグループごと
+/// kill して `wait` する（子が残ったまま、実行枠だけが外れないように）。
+struct ChildGuard {
+    child: Child,
+    /// 子のプロセスグループ（`process_group(0)` で、子の PID と同じ）。
+    pgid: Option<i32>,
+    /// `wait` 済み（子が終わって回収した）。
+    reaped: bool,
+}
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        let pgid = i32::try_from(child.id()).ok();
+        Self {
+            child,
+            pgid,
+            reaped: false,
+        }
+    }
+
+    fn kill_and_wait(&mut self) {
+        if self.reaped {
+            return;
+        }
+        if let Some(pgid) = self.pgid {
+            // SAFETY: 自分が作ったプロセスグループ（`process_group(0)`）への kill(2) だけ
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
+
+/// 子が、親（このプロセス）が死んだときに SIGKILL を受けるようにする（`pre_exec`。上の「守っていること」の補助。排他の保証ではない）。
+/// 起動の途中で親がすでにいなければ（`getppid` が変わっていれば）、起動を失敗させる。
+#[cfg(target_os = "linux")]
+fn die_with_parent(parent: u32) -> std::io::Result<()> {
+    // SAFETY: `prctl`・`getppid` は async-signal-safe。
+    unsafe {
+        if libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as libc::c_ulong,
+            0,
+            0,
+            0,
+        ) != 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if u32::try_from(libc::getppid()).ok() != Some(parent) {
+            return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+        }
+    }
+    Ok(())
 }
 
 /// `dry_run` の照会の期限（design.md 6.1）。

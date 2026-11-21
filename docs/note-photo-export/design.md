@@ -209,7 +209,7 @@ flowchart LR
 8. 宛先の状態を調べる（4.2 の「宛先の状態」）。`exists` で `on_exists` が `error` なら `conflict` で終える。`exists` で `replace` でも、このサービスが書いたフォルダと確かめられなければ `conflict`（`not_managed`）で終える。照会に失敗したら `failed`。
 9. Drive に公開する（4.2）。
 10. 作業領域を消す。成功・失敗にかかわらず消す（起動時にも `staging/` の下の残骸を消す）。
-11. ジョブ全体の期限は 60 分。過ぎたら `failed`（`timeout`）にする。14 日の最多（約 580MB）を上り 5Mbps で送ると約 16 分かかる（2.9）ので、それに Drive の往復と復旧の待ちを足しても収まる長さにした。パニックでも実行枠は外れる（ロックのガードとタスクの終わりで外す）。
+11. ジョブ全体の期限は 60 分。過ぎたら `failed`（`timeout`）にする。期限は作業の開始（前のジョブの復旧が済んだあと）から数える。期限を過ぎたあとの、安全のための復旧（4.2 の復旧の表）は、rclone の 1 回ごとの期限（`--rclone-timeout`）と待ちの回数の上限の中で行い、全体の期限では打ち切らない（打ち切ると、公開の途中の状態が決まらないまま残る）。14 日の最多（約 580MB）を上り 5Mbps で送ると約 16 分かかる（2.9）ので、それに Drive の往復を足しても収まる長さにした。パニックでも実行枠は外れる（ロックのガードとタスクの終わりで外す）。パニックのとき、Drive の操作を含む段階（`uploading` 以降）が記録にあれば、`failed` を確定せず、実行枠を持ったまま復旧の表を当てる（退避の直後なら、宛先が空のまま復旧の対象から外れるため）。SIGINT・SIGTERM は、その場で終わらずキャンセルとして扱い、実行中の rclone をプロセスグループごと止めて `wait` し終えてから実行枠を手放す（子が残ったまま枠だけが外れて、次の復旧が進行中の `copy`・`moveto` と競合しないため）。キャンセルされたジョブは、Drive の段階が記録にあれば `running` のまま次の復旧（次のジョブの前・起動時・`recover`）に渡し、無ければ `interrupted` にする。
 
 ### 4.2 Drive への公開
 
@@ -426,7 +426,7 @@ geoframe-export serve --listen <ip:port> --token-file <path> --allow <ip> [--all
 geoframe-export recover [--resolve <job_id>] [設定の引数]
 ```
 
-- `recover` は、未完了のジョブの記録と Drive の状態を照らし合わせて表示するだけで、Drive は変えない（4.2 の復旧）。`--resolve` は、オーナーが Drive を確かめたあとで `blocked` を解除する。実行枠を取ってから動き、対象が `blocked` でなければ断る。Drive には触れず、`replaced/`・`incoming/` に残ったもののパスと ID を表示するだけにする。解除した日時を記録に残す。いったん `blocked` になったジョブは、あとで表の行に当てはまっても自動では動かさない。root で直接動かされたら断る。
+- `recover` は、未完了のジョブの記録と Drive の状態を照らし合わせて表示するだけで、Drive は変えない（4.2 の復旧）。完了済みでも、手作業の片付けが要る知らせ（残った `incoming`・旧フォルダなど。記録の `notes`）がある記録は、知らせだけを表示する（解除の対象ではない）。`--resolve` は、オーナーが Drive を確かめたあとで `blocked` を解除する。実行枠を取ってから動き、対象が `blocked` でなければ断る。Drive には触れず、`replaced/`・`incoming/` に残ったもののパスと ID を表示するだけにする。解除した日時を記録に残す。いったん `blocked` になったジョブは、あとで表の行に当てはまっても自動では動かさない。root で直接動かされたら断る。
 
 - 設定の引数は次のとおり。
   - `--feed-base`（写真サービスの基底 URL。既定 `http://127.0.0.1:8080`）
@@ -439,7 +439,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
   - 0: 成功・0 枚
   - 3: conflict
   - 4: 実行中（実行枠が取れない）
-  - 1: 失敗
+  - 1: 失敗（SIGINT・SIGTERM での中断を含む。実行中の rclone を止めて `wait` し終えてから終わる。Drive の段階を記録していれば、記録は `running` のまま次の復旧に渡す。4.1 の手順 11）
   - 2: 引数の誤り
 - 引数の解釈は `geoframe` crate と同じく手書きにする（`crates/geoframe/src/cli.rs:1-2` の方針。依存を増やさない）。
 
@@ -506,7 +506,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
 | 写真サービスから読むもの | 基底 URL は設定で固定し、リダイレクトはたどらない。`time`・`id`・`file`・`inferred` を検査する（4.4）。応答・画像の大きさ・画素数・時間に上限を掛ける。作業領域には `O_EXCL`・`O_NOFOLLOW` で書く |
 | 外へ出すもの | 表示用 JPEG と manifest（正確な緯度経度を含む）。U1 で、重複・類似で非推奨の写真と位置の無い写真も出るようになった。EXIF 付きの原本は出さない（`file` の検査、APP1 の検査）。行き先はオーナーの Drive の書き出し先だけ。共有設定は変えず、親フォルダの今の共有をそのまま受け継ぐ。作業用のフォルダは共有しない（U7） |
 | 資格情報 | 専用ユーザー `geoframe-export` と、`StateDirectory/rclone/` の専用の rclone の設定（このサービス専用の client_id で認可し直す。共用の client_id は 2026 年中に止まる）。オーナーのホームの設定は使わない。権限は Drive 全体のまま（U4）なので、この設定が漏れると Drive 全体を読まれ・消されうる。設定は 0600・`StateDirectory` は 0700 で、専用ユーザーだけが読める。写真サービスの Drive の鍵（読み取り用）とは分ける |
-| 同時実行 | 書き出しと `dry_run` は、サービスと CLI で共通の実行枠（flock）を取る。1 ジョブの上限は 2,000 枚・2GB、全体の期限は 60 分（2.9）。パニックでも実行枠は外れる |
+| 同時実行 | 書き出しと `dry_run` は、サービスと CLI で共通の実行枠（flock）を取る。1 ジョブの上限は 2,000 枚・2GB、全体の期限は 60 分（2.9）。パニックでも実行枠は外れる。SIGINT・SIGTERM では、子の rclone を止めて `wait` し終えてから枠を外す（4.1 の手順 11） |
 | 子プロセス | rclone にタイムアウトを掛ける（写真の `copy` は既定 45 分、それ以外は 5 分）。環境変数は消してから渡す。標準エラーは伏せ字にしてログにだけ残す。共有・リンク作成の操作（`link` など）は呼ばない |
 | 写真サービスに足す一覧 API | GET だけで DB を読むだけ。既存の管理 API と同じ区域・同じ守り（6.4）。このサービスは無認証で `0.0.0.0:8080` に出ている（2.1）。LAN・tailnet からは Access を通らずに届く。既存の管理 API が既に非表示を含む全写真の座標と表示用 JPEG のパスを返しているので、新たに出るのはほぼ `elev` だけ。Access の bypass を `/api/admin/` に広げない。引数は日付 2 つだけで、期間と件数に上限を掛ける |
 | unit のハードニング | `NoNewPrivileges`、`ProtectSystem=strict`、`ProtectHome=yes`、`PrivateTmp`、`PrivateDevices`、`CapabilityBoundingSet=`、`RestrictAddressFamilies=AF_INET AF_INET6`（AF_UNIX が要るかは確かめる）、`SystemCallFilter=@system-service`、`UMask=0077` にする。書けるのは `StateDirectory` だけ。`MemoryMax`・`TasksMax` は rclone（Go）と JPEG のデコードを動かして実測してから決める。`MemoryDenyWriteExecute` は rclone と組み合わせて動くかを確かめてから付ける |
@@ -544,7 +544,7 @@ geoframe-export recover [--resolve <job_id>] [設定の引数]
 | AC6 | 宛先が `exists`（空のフォルダを含む）なら、既定は `conflict` で、`copy`・`moveto` が呼ばれないこと。`replace` は incoming → 検証 → 退避 → 移動 → ゴミ箱の順で呼ぶこと。各段階の記録が Drive の操作の前に書かれること。移動の応答が失われた（偽の rclone が移動を済ませて失敗を返す）とき、`lsjson` で済んでいると判定すること。復旧の表（4.2）の各行の状態（`aborting` を含む全セル）から起動して、表のとおりに進むこと。実行前から `incoming/<job_id>`・`replaced/<…>` に同名の項目があるとき、触らずに止まる（前者は残りものとして知らせる、後者は `blocked`）こと。中止の片付けの前に `aborting` が記録され、その直後に止まっても再起動で `interrupted` になること。照合できない状態では `blocked` になり、次の書き出しが 503 になること。同じ名前のフォルダが 2 つ・同じ名前のファイル・ショートカットがあると `ambiguous_destination`、照会の失敗で `drive_unavailable` になること。`replace` で、公開の記録に ID が無いフォルダ、manifest が無い・`generator` が違う・`destination`/`folder` が違うフォルダは `conflict`（`not_managed`）で、`moveto`・`purge` が呼ばれないこと。公開の記録が壊れていても `not_managed` になること。管理しているフォルダでも、manifest に無いファイルが足されている・サイズが違えば `conflict`（`modified`）で、`moveto`・`purge` が呼ばれないこと。作業用のフォルダと接頭辞の remote 名が違う設定では起動しないこと。作業用のフォルダが接頭辞と同じ・入れ子の設定では起動しないこと |
 | AC7 | トークンが無い・違うと 401。許可外の送信元で 403。正しいトークンと許可された送信元では受け付けること。ログと応答にトークンが出ないこと。弱いトークンのファイルでは起動しないこと |
 | AC8 | 実行中（偽の rclone を待たせる）の 2 件目は 409。CLI の `run` も 4 で終わること。`dry_run` も 409 |
-| AC9 | `202` から、`running` を経て、`succeeded`・`failed`・`conflict` になる遷移。最初の GET で完了が返ってもよいこと。同じ `request_id` で、実行中でも同じジョブが返ること。中身が違えば `request_id_mismatch`。再起動後もジョブ ID で引けること。止まったジョブが 4.2 の復旧の表に従って片付くこと（Drive に触れる前なら `interrupted`） |
+| AC9 | `202` から、`running` を経て、`succeeded`・`failed`・`conflict` になる遷移。最初の GET で完了が返ってもよいこと。同じ `request_id` で、実行中でも同じジョブが返ること。中身が違えば `request_id_mismatch`。再起動後もジョブ ID で引けること。止まったジョブが 4.2 の復旧の表に従って片付くこと（Drive に触れる前なら `interrupted`）。パニックの後（退避の直後を含む）は `failed` を確定せず復旧の表で片付くこと。SIGINT・SIGTERM で、子の rclone が止まってから実行枠が外れ、記録が `blocked` にならず次の復旧に渡ること。別のインスタンスが同じ `request_id` を先に登録しても二重に登録しないこと。状態と食い違う記録が読めない記録として扱われること |
 | AC10 | `dry_run` では `lsjson`（と管理の確認の `cat`）だけが呼ばれ、`copy`・`moveto`・`purge` は呼ばれないこと |
 | AC11 | `run` で、同じ fixture から同じ manifest が出ること。成功・conflict・失敗の JSON と終了コード |
 | 一部の失敗 | 1 枚の取得の失敗・デコードの失敗で `failed` になり、Drive に何も公開されないこと。全部が除外されたら、宛先の状態（無い・ある・照会できない）に関係なく `nothing_to_export` になり、Drive を照会しないこと。APP1 がある JPEG は `has_metadata` で除外されること |

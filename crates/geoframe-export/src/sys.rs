@@ -1,4 +1,4 @@
-//! OS に直接聞く小さな関数（実効ユーザー ID・flock・現地時刻）。`unsafe` を使うのは、ここと [`crate::rclone`]・
+//! OS に直接聞く小さな関数（実効ユーザー ID・flock・現地時刻）。`unsafe` を使うのは、ここと [`crate::cancel`]・[`crate::rclone`]・
 //! [`crate::rclone_conf`] だけ。
 //!
 //! 現地時刻は C ライブラリ（`localtime_r`）に任せる。`TZ`（unit が与える）と zoneinfo を読む。ジョブの記録の時刻は、

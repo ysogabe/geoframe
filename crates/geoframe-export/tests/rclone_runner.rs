@@ -166,6 +166,84 @@ fn the_job_deadline_stops_a_running_child_and_blocks_new_ones() {
     assert!(!marker.exists(), "期限を過ぎたあとは起動しない");
 }
 
+fn pid_gone(pid: i32) -> bool {
+    // SAFETY: シグナル 0 は、存在の確かめだけ（何も送らない）。
+    unsafe { libc::kill(pid, 0) != 0 }
+}
+
+fn read_pid(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+#[test]
+fn a_cancel_stops_the_child_and_its_descendants_and_waits_for_them() {
+    let dir = TempDir::new("cancel-run");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let (pid_file, grand_file) = (state.join("pid"), state.join("grandpid"));
+    let script = write_script(
+        dir.path(),
+        &format!(
+            "echo $$ > '{}'\nsleep 30 &\necho $! > '{}'\nwait",
+            pid_file.display(),
+            grand_file.display()
+        ),
+    );
+    let cancel = geoframe_export::cancel::Cancel::new();
+    let rclone = Rclone::new(&settings_for(&script, &state))
+        .with_timeouts(SECS, SECS)
+        .with_cancel(cancel.clone());
+    let worker = {
+        let rclone = rclone.clone();
+        std::thread::spawn(move || retry(|| rclone.cat(&loc(), 10)))
+    };
+    // 子とその子孫が動き出すまで待つ
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (child, grand) = loop {
+        if let (Some(c), Some(g)) = (read_pid(&pid_file), read_pid(&grand_file)) {
+            break (c, g);
+        }
+        assert!(Instant::now() < deadline, "子が動き出さない");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(!pid_gone(child) && !pid_gone(grand));
+    let started = Instant::now();
+    cancel.cancel();
+    assert_eq!(worker.join().unwrap(), Err(RunError::Cancelled));
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    // 返った時点で、子は `wait` 済み（居ない）。子孫も、グループごと kill されている（親が居なくなった子孫は、init が
+    // 回収するまでの短い間だけ残りうる）
+    assert!(pid_gone(child), "子が残っている");
+    let until = Instant::now() + Duration::from_secs(5);
+    while !pid_gone(grand) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(pid_gone(grand), "子孫が残っている");
+}
+
+#[test]
+fn a_cancel_that_is_already_set_never_starts_the_child() {
+    let dir = TempDir::new("cancel-first");
+    let state = dir.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let marker = state.join("ran");
+    let script = write_script(dir.path(), &format!("touch '{}'", marker.display()));
+    let cancel = geoframe_export::cancel::Cancel::new();
+    cancel.cancel();
+    let r = Rclone::new(&settings_for(&script, &state)).with_cancel(cancel);
+    assert_eq!(r.cat(&loc(), 10), Err(RunError::Cancelled));
+    assert_eq!(
+        r.lsjson(&loc(), false, true).unwrap_err(),
+        RunError::Cancelled
+    );
+    assert!(r.is_cancelled());
+    assert!(!marker.exists(), "印が立っていれば起動しない");
+}
+
 #[test]
 fn exit_codes_are_distinguished_and_stdin_is_closed() {
     let nf = sh("exit3", "exit 3", SECS, SECS);

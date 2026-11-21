@@ -211,6 +211,32 @@ fn opt_time(v: &Value, key: &str) -> Option<Option<String>> {
     }
 }
 
+/// 6.1 の `result` の形（必須のキーと型）。合えば `Some(conflict の理由)`（`conflict` のキーが無ければ `Some(None)`）。
+fn result_shape(v: &Value) -> Option<Option<&str>> {
+    let o = v.as_object()?;
+    o.get("folder")?.as_str()?;
+    for key in [
+        "catalog_count",
+        "count",
+        "bytes",
+        "undated_in_catalog",
+        "invalid_time_in_catalog",
+        "existing_files",
+    ] {
+        o.get(key)?.as_u64()?;
+    }
+    o.get("uploaded")?.as_bool()?;
+    o.get("replaced")?.as_bool()?;
+    for e in o.get("excluded")?.as_array()? {
+        e.get("id")?.as_i64()?;
+        e.get("reason")?.as_str()?;
+    }
+    match o.get("conflict") {
+        None => Some(None),
+        Some(c) => Some(Some(c.as_str()?)),
+    }
+}
+
 fn opt_object(v: &Value, key: &str) -> Option<Option<Value>> {
     match v.get(key)? {
         Value::Null => Some(None),
@@ -326,7 +352,7 @@ impl JobRecord {
         if !is_time_text(started_at) {
             return None;
         }
-        Some(Self {
+        let record = Self {
             job_id,
             status: Status::parse(v.get("status")?.as_str()?)?,
             request: RequestInfo::from_file_json(v.get("request")?)?,
@@ -340,7 +366,80 @@ impl JobRecord {
             blocked,
             resolved_at: opt_time(v, "resolved_at")?,
             notes,
-        })
+        };
+        record.is_consistent().then_some(record)
+    }
+
+    /// 記録の中身が、`status` と食い違っていないか。書く側（[`crate::flow`] の終わり方）が作る組み合わせだけを通す。
+    /// 食い違う記録（例: `succeeded` なのに `finished_at` が無い、`result` が `{}`）は、人が書き換えたか壊れたものとして、
+    /// 読めない記録と同じに扱う（次の書き出しを断り、間引かず、上書きしない）。外すと、正しい記録まで読めない記録になって
+    /// 全部の書き出しが止まるので、書く側を変えたらここも合わせる。
+    ///
+    /// | `status` | `finished_at` | `result` | `error` | `blocked` | `resolved_at` |
+    /// |---|---|---|---|---|---|
+    /// | `running` | なし | なし | なし | なし | なし |
+    /// | `succeeded` | あり | 6.1 の形（`conflict` なし） | なし | なし | なし |
+    /// | `conflict` | あり | 6.1 の形＋`conflict`（`exists`・`not_managed`・`modified`） | なし | なし | なし |
+    /// | `failed` | あり | なし、または 6.1 の形（`conflict` なし） | あり | なし | なし |
+    /// | `interrupted` | あり | なし | なし | なし | なし |
+    /// | `blocked` | あり | なし | `blocked` | あり | あってもよい（解除した日時） |
+    fn is_consistent(&self) -> bool {
+        let finished = self.finished_at.is_some();
+        let no_result = self.result.is_none();
+        match self.status {
+            Status::Running => {
+                !finished
+                    && no_result
+                    && self.error.is_none()
+                    && self.blocked.is_none()
+                    && self.resolved_at.is_none()
+            }
+            Status::Succeeded => {
+                finished
+                    && self
+                        .result
+                        .as_ref()
+                        .is_some_and(|r| result_shape(r) == Some(None))
+                    && self.error.is_none()
+                    && self.blocked.is_none()
+                    && self.resolved_at.is_none()
+            }
+            Status::Conflict => {
+                finished
+                    && self.result.as_ref().is_some_and(|r| {
+                        matches!(
+                            result_shape(r),
+                            Some(Some("exists" | "not_managed" | "modified"))
+                        )
+                    })
+                    && self.error.is_none()
+                    && self.blocked.is_none()
+                    && self.resolved_at.is_none()
+            }
+            Status::Failed => {
+                finished
+                    && self
+                        .result
+                        .as_ref()
+                        .is_none_or(|r| result_shape(r) == Some(None))
+                    && self.error.is_some()
+                    && self.blocked.is_none()
+                    && self.resolved_at.is_none()
+            }
+            Status::Interrupted => {
+                finished
+                    && no_result
+                    && self.error.is_none()
+                    && self.blocked.is_none()
+                    && self.resolved_at.is_none()
+            }
+            Status::Blocked => {
+                finished
+                    && no_result
+                    && self.error == Some(ErrorCode::Blocked)
+                    && self.blocked.is_some()
+            }
+        }
     }
 
     /// `GET /v1/exports/{job_id}` と、`run` の標準出力の形（6.1）。解除済みの `blocked` には `resolved_at`、知らせがあれば
@@ -645,10 +744,49 @@ mod tests {
         JobId::parse(&format!("{n:032x}")).unwrap()
     }
 
+    /// 6.1 の `result`（書く側が作る形）。
+    fn sample_result(conflict: Option<&str>) -> Value {
+        let mut v = json!({
+            "folder": "2030-03-10-11",
+            "catalog_count": 3,
+            "count": 2,
+            "uploaded": true,
+            "replaced": false,
+            "bytes": 1234,
+            "excluded": [{"id": 7, "reason": "has_metadata"}],
+            "undated_in_catalog": 0,
+            "invalid_time_in_catalog": 0,
+            "existing_files": 0,
+        });
+        if let Some(c) = conflict {
+            v["conflict"] = json!(c);
+        }
+        v
+    }
+
+    const FINISHED_AT: &str = "2030-01-01T00:00:00+09:00";
+
+    /// 書く側（`flow` の終わり方）が作る組み合わせの記録。
     fn record(n: u32, status: Status, unix: i64) -> JobRecord {
         let mut r = JobRecord::new(id(n), &request(None));
         r.status = status;
         r.started_ns = unix;
+        if status != Status::Running {
+            r.finished_at = Some(FINISHED_AT.into());
+        }
+        match status {
+            Status::Succeeded => r.result = Some(sample_result(None)),
+            Status::Conflict => r.result = Some(sample_result(Some("exists"))),
+            Status::Failed => r.error = Some(ErrorCode::Internal),
+            Status::Blocked => {
+                r.error = Some(ErrorCode::Blocked);
+                r.blocked = Some(BlockedNote {
+                    reason: "unobservable".into(),
+                    description: String::new(),
+                });
+            }
+            Status::Running | Status::Interrupted => {}
+        }
         r
     }
 
@@ -663,7 +801,6 @@ mod tests {
             incoming_id: Some("inc1".into()),
         });
         r.summary = Some(json!({"catalog_count": 3}));
-        r.result = Some(json!({"count": 2}));
         r.error = Some(ErrorCode::Blocked);
         r.blocked = Some(BlockedNote {
             reason: "stage_inconsistent".into(),
@@ -711,6 +848,121 @@ mod tests {
         let mut v = good.clone();
         v.as_object_mut().unwrap().remove("notes");
         assert!(JobRecord::from_file_json(&v, &id(1)).is_none());
+    }
+
+    /// 読み込みで、`status` と中身の整合を検査する（読めても、`succeeded` なのに完了時刻が無い、など）。
+    #[test]
+    fn a_record_that_contradicts_its_status_is_unreadable() {
+        let back = |r: &JobRecord| JobRecord::from_file_json(&r.to_file_json(), &id(1));
+        // 書く側が作る組み合わせは、全部読める
+        for status in [
+            Status::Running,
+            Status::Succeeded,
+            Status::Conflict,
+            Status::Failed,
+            Status::Interrupted,
+            Status::Blocked,
+        ] {
+            let r = record(1, status, 1);
+            assert_eq!(back(&r).as_ref(), Some(&r), "{status:?}");
+        }
+        let mut failed_with_result = record(1, Status::Failed, 1);
+        failed_with_result.result = Some(sample_result(None));
+        assert!(back(&failed_with_result).is_some());
+        let mut resolved = record(1, Status::Blocked, 1);
+        resolved.resolved_at = Some(FINISHED_AT.into());
+        assert!(back(&resolved).is_some());
+
+        // 食い違うものは読めない
+        let mut cases: Vec<(&str, JobRecord)> = Vec::new();
+        let mut c = record(1, Status::Succeeded, 1);
+        c.finished_at = None;
+        cases.push(("succeeded で完了時刻が無い", c));
+        let mut c = record(1, Status::Succeeded, 1);
+        c.result = Some(json!({}));
+        cases.push(("succeeded で result が {}", c));
+        let mut c = record(1, Status::Succeeded, 1);
+        c.result = None;
+        cases.push(("succeeded で result が無い", c));
+        let mut c = record(1, Status::Succeeded, 1);
+        c.result = Some(sample_result(Some("exists")));
+        cases.push(("succeeded で conflict の理由", c));
+        let mut c = record(1, Status::Succeeded, 1);
+        c.error = Some(ErrorCode::Internal);
+        cases.push(("succeeded で error", c));
+        let mut c = record(1, Status::Succeeded, 1);
+        let mut bad = sample_result(None);
+        bad["count"] = json!("2");
+        c.result = Some(bad);
+        cases.push(("result の型が違う", c));
+        let mut c = record(1, Status::Succeeded, 1);
+        let mut bad = sample_result(None);
+        bad.as_object_mut().unwrap().remove("bytes");
+        c.result = Some(bad);
+        cases.push(("result の必須キーが無い", c));
+        let mut c = record(1, Status::Succeeded, 1);
+        let mut bad = sample_result(None);
+        bad["excluded"] = json!([{"id": "x", "reason": "has_metadata"}]);
+        c.result = Some(bad);
+        cases.push(("excluded の項目の型が違う", c));
+        let mut c = record(1, Status::Conflict, 1);
+        c.result = Some(sample_result(None));
+        cases.push(("conflict で理由が無い", c));
+        let mut c = record(1, Status::Conflict, 1);
+        c.result = Some(sample_result(Some("other")));
+        cases.push(("conflict の理由が知らない値", c));
+        let mut c = record(1, Status::Failed, 1);
+        c.error = None;
+        cases.push(("failed で error が無い", c));
+        let mut c = record(1, Status::Failed, 1);
+        c.finished_at = None;
+        cases.push(("failed で完了時刻が無い", c));
+        let mut c = record(1, Status::Interrupted, 1);
+        c.result = Some(sample_result(None));
+        cases.push(("interrupted で result", c));
+        let mut c = record(1, Status::Running, 1);
+        c.finished_at = Some(FINISHED_AT.into());
+        cases.push(("running で完了時刻", c));
+        let mut c = record(1, Status::Running, 1);
+        c.error = Some(ErrorCode::Internal);
+        cases.push(("running で error", c));
+        let mut c = record(1, Status::Blocked, 1);
+        c.blocked = None;
+        cases.push(("blocked で説明が無い", c));
+        let mut c = record(1, Status::Blocked, 1);
+        c.error = Some(ErrorCode::Internal);
+        cases.push(("blocked で error が blocked でない", c));
+        let mut c = record(1, Status::Failed, 1);
+        c.resolved_at = Some(FINISHED_AT.into());
+        cases.push(("blocked でないのに解除の日時", c));
+        for (what, r) in cases {
+            assert!(back(&r).is_none(), "{what}");
+        }
+    }
+
+    /// 食い違う記録は、読めない記録と同じに扱う（次の書き出しを断り、間引かず、上書きしない）。
+    #[test]
+    fn a_contradicting_record_blocks_like_an_unreadable_one_and_is_never_pruned() {
+        let d = Dir::new("contradict");
+        let store = JobStore::open(&d.0).unwrap();
+        let mut bad = record(1, Status::Succeeded, 1);
+        bad.finished_at = None;
+        store.write(&bad).unwrap();
+        for n in 2..=60u32 {
+            store
+                .write(&record(n, Status::Succeeded, i64::from(n)))
+                .unwrap();
+        }
+        assert!(matches!(store.read(&id(1)), ReadOutcome::Unreadable));
+        assert!(matches!(
+            store.scan().blocking(),
+            Some(Blocking::UnreadableRecord(n)) if n == format!("{}.json", id(1))
+        ));
+        store.prune();
+        assert!(
+            d.0.join("jobs").join(format!("{}.json", id(1))).exists(),
+            "間引かない"
+        );
     }
 
     #[test]

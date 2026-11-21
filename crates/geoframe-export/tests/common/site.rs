@@ -136,6 +136,54 @@ pub fn wait_done(svc: &Service, id: &JobId) -> Value {
     }
 }
 
+/// 手で作る記録を、`status` と整合する形にする（完了時刻・`result`・`error`。書く側〔`flow`〕が作る組み合わせ。読み込みの検査
+/// [`geoframe_export::jobs::JobRecord::from_file_json`] に通る）。`blocked` の説明（`blocked`）は、呼び出し側が入れる。
+pub fn settle(rec: &mut geoframe_export::jobs::JobRecord, status: geoframe_export::jobs::Status) {
+    use geoframe_export::error::ErrorCode;
+    use geoframe_export::jobs::Status;
+    rec.status = status;
+    if status != Status::Running {
+        rec.finished_at = Some("2030-01-01T00:00:00+09:00".to_owned());
+    }
+    match status {
+        Status::Succeeded => {
+            rec.result = Some(json!({
+                "folder": "2030-03-10", "catalog_count": 0, "count": 0, "uploaded": false, "replaced": false,
+                "bytes": 0, "excluded": [], "undated_in_catalog": 0, "invalid_time_in_catalog": 0, "existing_files": 0
+            }));
+        }
+        Status::Failed => rec.error = Some(ErrorCode::Internal),
+        Status::Blocked => rec.error = Some(ErrorCode::Blocked),
+        _ => {}
+    }
+}
+
+/// 偽の rclone の `cmd`（`copy` など）が呼ばれる（`calls.log` に出る）まで待って、そのプロセスの PID を返す（最大 `secs` 秒）。
+pub fn wait_for_call(env: &Env, cmd: &str, secs: u64) -> i64 {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        // 偽の rclone が書いている途中の行（読めない行）は、読み飛ばして、次の周回で読む
+        let text = std::fs::read_to_string(env.fake_dir.join("calls.log")).unwrap_or_default();
+        if let Some(pid) = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|c| c["kind"] == "rclone" && c["cmd"] == cmd)
+            .filter_map(|c| c["pid"].as_i64())
+            .next_back()
+        {
+            return pid;
+        }
+        assert!(Instant::now() < deadline, "{cmd} が呼ばれません");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// そのプロセスが（ゾンビも含めて）まだ存在するか。
+pub fn process_exists(pid: i64) -> bool {
+    // SAFETY: シグナル 0 は、存在の確かめだけ（何も送らない）。
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
 /// 状態ディレクトリの `staging/` の直下の数。
 pub fn staging_entries(env: &Env) -> usize {
     std::fs::read_dir(env.state.join("staging"))

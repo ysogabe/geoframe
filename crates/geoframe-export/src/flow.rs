@@ -17,8 +17,32 @@
 //!    持ったまま、次のジョブより前に書き直し（[`crate::publish::Published::retry_record`]）、それでも書けなければ `notes` に残す。
 //! 8. 作業領域を消す（[`crate::staging::Workspace`] を手放す。成功・失敗・パニックのいずれも）。
 //!
-//! ジョブ全体の期限は [`JOB_TIMEOUT`]（60 分）。`prepare` と rclone に同じ期限を掛ける（過ぎれば `timeout`）。パニックは
-//! `catch_unwind` で受けて `failed`（`internal`）にする。実行枠は、呼び出し側がガードを手放すと外れる（パニックでも）。
+//! ジョブ全体の期限は [`JOB_TIMEOUT`]（60 分）。`prepare` と rclone に同じ期限を掛ける（過ぎれば `timeout`）。期限は作業の開始
+//! （手順 1 の復旧が済んだあと）から数える。期限を過ぎたあとの、安全のための復旧（4.2 の復旧の表）は、rclone の 1 回ごとの期限
+//! （`--rclone-timeout`）と待ちの回数の上限（[`Timing`]）の中で行い、全体の期限では打ち切らない（打ち切ると、公開の途中の
+//! 状態が決まらないまま残る）。
+//!
+//! ## パニックとキャンセル（SIGINT・SIGTERM）
+//!
+//! どちらも、Drive の操作を含む段階（[`JobRecord::progress`] が記録にある）まで進んでいたかで分ける。段階が無ければ Drive に
+//! 触れていないので、パニックは `failed`（`internal`）、キャンセルは `interrupted`。
+//!
+//! - **パニック**（[`execute`] が `catch_unwind` で受ける）: 段階が記録にあれば、無条件に `failed` を確定しない（退避の直後なら、
+//!   宛先が空のまま復旧の対象から外れる）。**実行枠を持ったまま、その場で復旧の表を当てる**（[`recover_one`]。起動時・各ジョブの
+//!   前の復旧と同じ）。ジョブの記録が最後に記録できた段階だけを根拠にするので、パニックの時点のメモリの状態は信じない。
+//!   復旧の中でまたパニックしたら、記録を `running` のまま残して次の復旧に渡す。
+//! - **キャンセル**（[`Cancel`] の印。[`crate::cancel`]）: rclone は動かせない（印が立つと、起動前なら起動せず、実行中なら kill して
+//!   `wait` し終えてから失敗を返す）ので、その場で復旧の表は当てられない。段階が記録にあれば、記録を**確定せず `running` のまま**
+//!   次の復旧（次のジョブの前・起動時・`recover`）に渡す。印のもとで返ってくる失敗・`blocked`・中断・知らせの付いた成功は、
+//!   rclone を止めたことの副産物（照合できなかった、`incoming` を片付けられず残りものになった、など）なので、記録に確定しない
+//!   （[`cancel_voids`]）。確定するのは、印の前に済んだ `succeeded`（知らせなし）・`conflict` だけ。
+//!
+//!   パニックを「その場で復旧」、キャンセルを「`running` のまま」と分けた理由: パニックは、プロセスが続く（`serve`）ので、
+//!   `running` のまま残すと、次の受付まで GET が `running` を返し続ける。キャンセルはプロセスが終わるところで、rclone を
+//!   動かせない。
+//!
+//!   代償: `running` の記録は、次の復旧まで `running` のまま（`serve` では次の受付か再起動まで。退避の直後なら、その間は
+//!   宛先が空）。実行枠は、子を止めて `wait` し終えるまで外れない。
 //!
 //! ## 結果の数
 //!
@@ -30,13 +54,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
+use crate::cancel::Cancel;
 use crate::drive::{Layout, Managed, Target};
 use crate::error::{ErrorCode, ExportError};
 use crate::feed::FeedClient;
 use crate::folder::FolderName;
-use crate::image::{ImageClient, Limits, PrepareError, Prepared, prepare};
+use crate::image::{ImageClient, Limits, PrepareError, Prepared, prepare_cancellable};
 use crate::jobid::JobId;
-use crate::jobs::{BlockedNote, JobRecord, JobStore, Status};
+use crate::jobs::{BlockedNote, JobRecord, JobStore, ReadOutcome, Status};
 use crate::listing::{Exclusion, Selection};
 use crate::lock::SlotGuard;
 use crate::publish::{
@@ -45,13 +70,14 @@ use crate::publish::{
 };
 use crate::published::PublishedStore;
 use crate::rclone::Rclone;
-use crate::recovery::Progress;
+use crate::recovery::{Progress, Stage};
 use crate::request::ExportRequest;
 use crate::settings::Settings;
 use crate::staging::Workspace;
 use crate::sys;
 
-/// ジョブ全体の期限（60 分。design.md 4.1 の手順 11）。
+/// ジョブ全体の期限（60 分。design.md 4.1 の手順 11）。作業の開始（前のジョブの復旧のあと）から数える。期限を過ぎたあとの
+/// 安全のための復旧は、rclone の 1 回ごとの期限と待ちの回数の上限の中で行い、この期限では打ち切らない。
 pub const JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// 流れの調整値。本番は [`Tuning::default`]。試験が、待ちや期限を短くするために替える。
@@ -64,6 +90,10 @@ pub struct Tuning {
     /// 試験用: ジョブの中でパニックを起こす（`failed`・`internal` になり、実行枠が外れることを確かめる）。
     #[doc(hidden)]
     pub panic_in_job: bool,
+    /// 試験用: 公開の途中で、この段階を記録に書いた**直後**にパニックを起こす（`Retiring` のあとの `Publishing` なら、旧フォルダを
+    /// 退避した直後。実行枠を持ったまま復旧の表が当たり、公開まで進むことを確かめる）。
+    #[doc(hidden)]
+    pub panic_after_stage: Option<Stage>,
 }
 
 impl Default for Tuning {
@@ -73,6 +103,7 @@ impl Default for Tuning {
             timing: Timing::default(),
             image_limits: Limits::default(),
             panic_in_job: false,
+            panic_after_stage: None,
         }
     }
 }
@@ -83,6 +114,8 @@ pub struct Context<'a> {
     pub store: &'a JobStore,
     pub published: &'a PublishedStore,
     pub tuning: &'a Tuning,
+    /// キャンセルの印（SIGINT・SIGTERM。[`crate::cancel`]）。
+    pub cancel: &'a Cancel,
 }
 
 /// 1 つのジョブの記録と、それを書き直す口。
@@ -123,20 +156,58 @@ impl JobHandle {
                 "ジョブの終わりの記録を書けませんでした（次の復旧が片付けます）"
             );
         }
+        self.log_completion();
         // いま終えたジョブの記録は、同じ時刻の記録が多くても消さない
         self.store
             .prune_keeping(crate::jobs::KEEP_FINISHED, Some(&self.record.job_id));
+    }
+
+    /// ジョブの完了ログ（design.md 7 章）: ジョブ ID、期間、宛先、枚数、経過時間、結果の status と error の code。
+    /// トークン・資格情報・rclone の出力は載せない（記録にもそれらは無い）。`execute` と復旧（`recover_unfinished`）の
+    /// どちらの終わりも、ここを通る（CLI の `run` でも `serve` でも出る）。経過時間は、記録した開始からの秒数（復旧が終えた
+    /// ジョブでは、止まっていた時間を含む）。
+    fn log_completion(&self) {
+        let r = &self.record;
+        let count = r
+            .result
+            .as_ref()
+            .and_then(|v| v.get("count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let elapsed_secs =
+            sys::unix_now_nanos().saturating_sub(r.started_ns).max(0) / 1_000_000_000;
+        tracing::info!(
+            job = %r.job_id,
+            from = %r.request.period.from(),
+            to = %r.request.period.to(),
+            destination = r.request.destination.as_str(),
+            count,
+            elapsed_secs,
+            status = r.status.as_str(),
+            error = r.error.map_or("none", ErrorCode::as_str),
+            "書き出しのジョブが終わりました"
+        );
     }
 }
 
 /// 公開の各段階の前に、ジョブの記録へ段階と ID を書く口（[`ProgressSink`]）。書けなければ、その段階の Drive の操作はしない。
 pub struct Recorder<'a> {
     handle: &'a mut JobHandle,
+    panic_after: Option<Stage>,
 }
 
 impl<'a> Recorder<'a> {
     pub fn new(handle: &'a mut JobHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            panic_after: None,
+        }
+    }
+
+    /// 試験用: `stage` を書いた直後にパニックする（[`Tuning::panic_after_stage`]）。
+    fn panic_after(mut self, stage: Option<Stage>) -> Self {
+        self.panic_after = stage;
+        self
     }
 }
 
@@ -146,7 +217,11 @@ impl ProgressSink for Recorder<'_> {
         self.handle.save().inspect_err(|_| {
             // 書けなかったので、記録にある段階は前のまま
             self.handle.record.progress = before;
-        })
+        })?;
+        if self.panic_after == Some(progress.stage) {
+            panic!("試験: 段階 {} を記録した直後のパニック", progress.stage);
+        }
+        Ok(())
     }
 }
 
@@ -355,13 +430,79 @@ impl Done {
 
 // ---- ジョブの流れ ----
 
-/// 受け付けたジョブを、実行枠を持ったまま最後まで流して、記録を終わりの状態にする。
+/// 受け付けたジョブを、実行枠を持ったまま最後まで流して、記録を終わりの状態にする。パニックとキャンセルの扱いは、
+/// モジュールの説明（「パニックとキャンセル」）のとおり。
 pub fn execute(ctx: &Context<'_>, handle: &mut JobHandle, _slot: &SlotGuard) {
     let done = match catch_unwind(AssertUnwindSafe(|| run_steps(ctx, handle))) {
         Ok(done) => done,
-        Err(_) => Done::failed(ErrorCode::Internal, None),
+        Err(_) => match after_panic(ctx, handle) {
+            Some(done) => done,
+            None => return,
+        },
     };
+    if cancel_voids(ctx.cancel, &done) {
+        hand_over_cancelled(ctx, handle);
+        return;
+    }
     handle.finish(done);
+}
+
+/// キャンセルの印が立っているときに、記録に**確定しない**結果か。rclone を止めたことの副産物は確定しない: 照合できなかった
+/// （`blocked`）、失敗、中断（`incoming` のゴミ箱への移動が止まって、「手作業の片付けが要る残りもの」になる。次の復旧なら自動で
+/// 消せる）、知らせの付いた成功（旧フォルダのゴミ箱への移動が止まって、旧フォルダが残る）。印の前に済んだ `succeeded`（知らせなし）・
+/// `conflict` は、そのまま記録する。確定しなくても害は無い（復旧の表は、記録した段階から同じ結果を出す）。
+fn cancel_voids(cancel: &Cancel, done: &Done) -> bool {
+    cancel.is_cancelled()
+        && match done.status {
+            Status::Succeeded => !done.notes.is_empty(),
+            Status::Conflict => false,
+            Status::Failed | Status::Blocked | Status::Interrupted | Status::Running => true,
+        }
+}
+
+/// 記録に、Drive の操作を含む段階があるか。**ディスクの記録**で判定する（メモリの状態は、パニックの時点で信じない）。読めない・
+/// 無いときは、あるものとして扱う（確定の書き込みで、読めない記録を上書きしない）。
+fn stage_on_disk(ctx: &Context<'_>, handle: &JobHandle) -> bool {
+    match ctx.store.read(&handle.record.job_id) {
+        ReadOutcome::Found(rec) => rec.progress.is_some(),
+        ReadOutcome::NotFound | ReadOutcome::Unreadable => true,
+    }
+}
+
+/// パニックのあとの終わり方。段階が無ければ `failed`（`internal`）。あれば、実行枠を持ったまま復旧の表を当てる（`failed` を
+/// 無条件に確定すると、退避の直後なら、宛先が空のまま復旧の対象から外れる）。復旧の中でまたパニックしたら `None`（記録は
+/// `running` のまま、次の復旧に渡す）。
+fn after_panic(ctx: &Context<'_>, handle: &mut JobHandle) -> Option<Done> {
+    if !stage_on_disk(ctx, handle) {
+        return Some(Done::failed(ErrorCode::Internal, None));
+    }
+    tracing::error!(
+        job = %handle.record.job_id,
+        "ジョブの中でパニックしました。記録した段階から、復旧の表を当てます"
+    );
+    match catch_unwind(AssertUnwindSafe(|| recover_one(ctx, handle))) {
+        Ok(done) => Some(done),
+        Err(_) => {
+            tracing::error!(
+                job = %handle.record.job_id,
+                "パニックの後の復旧でもパニックしました（記録は running のまま、次の復旧に渡します）"
+            );
+            None
+        }
+    }
+}
+
+/// キャンセルされたジョブの記録。段階が無ければ（Drive に触れていない）`interrupted`、あれば確定せず `running` のまま、
+/// 次の復旧に渡す。
+fn hand_over_cancelled(ctx: &Context<'_>, handle: &mut JobHandle) {
+    if stage_on_disk(ctx, handle) {
+        tracing::warn!(
+            job = %handle.record.job_id,
+            "キャンセルされました。記録は running のまま、次の復旧に渡します"
+        );
+    } else {
+        handle.finish(Done::interrupted());
+    }
 }
 
 fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
@@ -382,6 +523,10 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
     let report = recover_unfinished(ctx, Some(&own_id));
     if report.blocked {
         return Done::failed(ErrorCode::Blocked, None);
+    }
+    if report.cancelled {
+        // キャンセルされた（確定しない。`execute` が、印を見て記録を渡す）
+        return Done::failed(ErrorCode::Internal, None);
     }
 
     let deadline = Instant::now() + ctx.tuning.job_timeout;
@@ -411,12 +556,13 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         Err(e) => return Done::failed(e.code, Some(counts.result(false, false, 0, None))),
     };
     let images = ImageClient::with_limits(&ctx.settings.feed_base, ctx.tuning.image_limits);
-    let prepared = match prepare(
+    let prepared = match prepare_cancellable(
         &images,
         &selection,
         req.destination,
         &workspace,
         Some(deadline),
+        ctx.cancel,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -439,7 +585,9 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         Ok(l) => l,
         Err(e) => return Done::failed(e.code, Some(counts.result(false, false, 0, None))),
     };
-    let rclone = Rclone::new(ctx.settings).with_deadline(Some(deadline));
+    let rclone = Rclone::new(ctx.settings)
+        .with_cancel(ctx.cancel.clone())
+        .with_deadline(Some(deadline));
     let params = PublishParams {
         on_exists: req.on_exists,
         workspace: workspace.path(),
@@ -447,7 +595,12 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         published: ctx.published,
         timing: ctx.tuning.timing,
     };
-    let outcome = publish(&rclone, &layout, &params, &mut Recorder::new(handle));
+    let outcome = publish(
+        &rclone,
+        &layout,
+        &params,
+        &mut Recorder::new(handle).panic_after(ctx.tuning.panic_after_stage),
+    );
     let done = match outcome {
         Ok(PublishOutcome::Published(p)) => {
             let mut notes = Vec::new();
@@ -507,6 +660,8 @@ pub struct RecoverReport {
     pub recovered: usize,
     /// `blocked` になった（そこで止める。後ろの未完了は、解除のあとの復旧に任せる）。
     pub blocked: bool,
+    /// キャンセルの印が立った（そこで止める。そのジョブの記録は確定せず `running` のまま、後ろの未完了にも触れない）。
+    pub cancelled: bool,
 }
 
 /// 未完了（`running` のまま残った）ジョブの記録を、古いほうから、表（4.2）のとおりに片付ける。実行枠を持っているときだけ
@@ -519,8 +674,17 @@ pub fn recover_unfinished(ctx: &Context<'_>, skip: Option<&JobId>) -> RecoverRep
         if skip == Some(&rec.job_id) {
             continue;
         }
+        if ctx.cancel.is_cancelled() {
+            report.cancelled = true;
+            break;
+        }
         let mut handle = JobHandle::new(ctx.store.clone(), rec.clone());
         let done = recover_one(ctx, &mut handle);
+        if cancel_voids(ctx.cancel, &done) {
+            // rclone を止めたことの副産物（照合できなかった、など）は確定しない。記録は `running` のまま、次の復旧に任せる
+            report.cancelled = true;
+            break;
+        }
         let blocked = done.status == Status::Blocked;
         handle.finish(done);
         report.recovered += 1;
@@ -556,8 +720,8 @@ fn recover_one(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
     ) else {
         return stuck("internal");
     };
-    // 後始末と復旧は期限なし（コマンドごとの期限だけ）
-    let rclone = Rclone::new(ctx.settings);
+    // 後始末と復旧は期限なし（コマンドごとの期限と、待ちの回数の上限だけ。ジョブ全体の期限では打ち切らない）
+    let rclone = Rclone::new(ctx.settings).with_cancel(ctx.cancel.clone());
     let recovery = Recovery {
         rclone: &rclone,
         layout: &layout,
@@ -620,7 +784,7 @@ pub fn dry_run(
         folder.clone(),
         JobId::generate()?,
     )?;
-    let rclone = Rclone::for_dry_run(ctx.settings);
+    let rclone = Rclone::for_dry_run(ctx.settings).with_cancel(ctx.cancel.clone());
     let inspection = crate::publish::dry_run(&rclone, &layout, ctx.published)?;
     let (target, managed) = match &inspection.target {
         Target::Absent => ("absent", Value::Null),
@@ -712,5 +876,85 @@ mod tests {
                 "existing_files"
             ]
         );
+    }
+
+    /// 書く側（[`Done`] の全部の作り方）が作る記録は、[`JobRecord::from_file_json`] の整合の検査に通る（外すと、正しい記録が
+    /// 読めない記録になって、全部の書き出しが止まる）。
+    #[test]
+    fn every_way_of_finishing_a_job_leaves_a_readable_record() {
+        use crate::jobs::ReadOutcome;
+        use crate::request::RawRequest;
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/unit-tmp")
+            .join(format!("flow-finish-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = JobStore::open(&dir).unwrap();
+        let req = RawRequest {
+            from: Some("2030-03-10".into()),
+            destination: Some("yamareco".into()),
+            ..RawRequest::default()
+        }
+        .validate()
+        .unwrap();
+        let counts = Counts {
+            folder: "2030-03-10".into(),
+            catalog_count: 3,
+            count: 2,
+            bytes: 10,
+            excluded: vec![(7, "has_metadata".into())],
+            undated: 0,
+            invalid_time: 0,
+        };
+        let note = || BlockedNote {
+            reason: "unobservable".into(),
+            description: "説明".into(),
+        };
+        let dones: Vec<(&str, Done)> = vec![
+            (
+                "公開",
+                Done::succeeded(counts.result(true, false, 0, None))
+                    .with_notes(vec!["知らせ".into()]),
+            ),
+            (
+                "0 枚",
+                Done::succeeded(Counts::empty("2030-03-10").result(false, false, 0, None)),
+            ),
+            (
+                "復旧の成功（数は不明）",
+                Done::succeeded(Counts::empty("2030-03-10").result(true, true, 0, None)),
+            ),
+            (
+                "conflict",
+                Done::conflict(counts.result(false, false, 2, Some("not_managed"))),
+            ),
+            (
+                "失敗（数つき）",
+                Done::failed(
+                    ErrorCode::FetchFailed,
+                    Some(counts.result(false, false, 0, None)),
+                ),
+            ),
+            ("失敗（数なし）", Done::failed(ErrorCode::Internal, None)),
+            (
+                "blocked で止められた",
+                Done::failed(ErrorCode::Blocked, None),
+            ),
+            (
+                "中断",
+                Done::interrupted().with_notes(vec!["incoming が残っています".into()]),
+            ),
+            ("blocked", Done::blocked(note())),
+        ];
+        for (n, (what, done)) in dones.into_iter().enumerate() {
+            let id = JobId::parse(&format!("{:032x}", n + 1)).unwrap();
+            let mut handle = JobHandle::new(store.clone(), JobRecord::new(id.clone(), &req));
+            handle.save().unwrap();
+            handle.finish(done);
+            assert!(
+                matches!(store.read(&id), ReadOutcome::Found(_)),
+                "{what}: 終えた記録が読めない"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

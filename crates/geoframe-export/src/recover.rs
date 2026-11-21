@@ -1,8 +1,9 @@
 //! `recover` コマンド（design.md 4.2 の復旧、6.2）。実行枠を取ってから動く（取れなければ「実行中」で終了コード 4）。
 //!
 //! - `recover`: 未完了（`running` のまま残った）ジョブと、解除していない `blocked` のジョブの記録を、Drive の今の状態と
-//!   照らし合わせて表示するだけ（[`crate::publish::Recovery::explain`]。Drive も、記録も変えない）。読めない記録・`jobs/` を
-//!   一覧できないことも表示する（読めない記録は `--resolve` では解除できない。中身を確かめて、そのファイルを手で退かす）。
+//!   照らし合わせて表示するだけ（[`crate::publish::Recovery::explain`]。Drive も、記録も変えない）。完了済みでも、手作業の
+//!   片付けが要る知らせ（`notes`。残った `incoming` など）がある記録は、知らせだけを表示する（Drive は照会しない。解除の対象では
+//!   ない）。読めない記録・`jobs/` を一覧できないことも表示する（読めない記録は `--resolve` では解除できない。中身を確かめて、そのファイルを手で退かす）。
 //! - `recover --resolve <job_id>`: 対象が `blocked`（未解除）のときだけ、解除の日時を記録に書く。Drive には触れない。
 //!   `replaced/`・`incoming/` に残ったもののパスと ID（記録から）を表示するだけで、片付けはオーナーが Drive の画面で行う。
 //!   `blocked` でない（未完了・終わった・解除済み）、記録が読めない・無いときは断る。
@@ -96,6 +97,24 @@ fn show(settings: &Settings, store: &JobStore, out: &mut dyn Write) -> u8 {
     // 古いほうから
     for rec in scan.records.iter().rev() {
         if !(rec.is_unfinished() || rec.is_blocking()) {
+            // 完了済みでも、手作業の片付けが要る知らせ（`notes`。残った `incoming`・公開の記録に書けなかった・旧フォルダが
+            // 残った、など）が残っている記録は、知らせとして出す（解除の対象ではない。Drive にも触れない）
+            if !rec.notes.is_empty() {
+                any = true;
+                let _ = writeln!(
+                    out,
+                    "ジョブ {}（{}、{}〜{}、{}、開始 {}）: 終わっていますが、手作業の片付けが要る知らせが残っています（解除の対象ではありません）",
+                    rec.job_id,
+                    rec.status.as_str(),
+                    rec.request.period.from(),
+                    rec.request.period.to(),
+                    rec.request.destination,
+                    rec.started_at
+                );
+                for note in &rec.notes {
+                    let _ = writeln!(out, "  知らせ: {note}");
+                }
+            }
             continue;
         }
         any = true;
@@ -178,7 +197,10 @@ fn show(settings: &Settings, store: &JobStore, out: &mut dyn Write) -> u8 {
         }
     }
     if !any {
-        let _ = writeln!(out, "未完了のジョブも、blocked のジョブもありません。");
+        let _ = writeln!(
+            out,
+            "未完了のジョブも、blocked のジョブも、片付けの知らせが残っているジョブもありません。"
+        );
     }
     EXIT_OK
 }

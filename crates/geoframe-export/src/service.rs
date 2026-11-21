@@ -12,15 +12,27 @@
 //!
 //! ## 受付（[`Service::submit`]）
 //!
-//! 1 つの排他（プロセス内の `Mutex`。毒化しても使い続ける）の中で、次を順に行う。
+//! 1 つの排他（プロセス内の `Mutex`。毒化しても使い続ける）の中で、次を順に行う。プロセス内の排他は、別のプロセス（同じ
+//! 状態ディレクトリを使う別の `Service`・CLI の `run`）には効かないので、**実行枠を取った直後と、取れなかったときにも**、
+//! `request_id` をもう一度照会する（手順 2）。
 //!
 //! 1. `request_id` があれば、直近 50 件の記録から探す。同じ値で期間・宛先・`on_exists` が同じなら、**実行枠を取らずに**そのジョブを
 //!    返す（実行中でも。[`Submitted::reused`] が真）。違えば [`SubmitError::RequestIdMismatch`]。
-//! 2. 実行枠（flock）を取る。取れなければ [`SubmitError::Busy`]。
+//! 2. 実行枠（flock）を取る。取れなければ、もう一度 `request_id` を照会し（その間に別のプロセスが登録していれば、手順 1 と同じに
+//!    返す）、無ければ [`SubmitError::Busy`]。取れたら、記録を書く前にもう一度照会する（見つかれば、枠を手放してそのジョブを返す。
+//!    二重に登録しない）。
 //! 3. 記録の走査で、`blocked`・読めない記録があれば [`SubmitError::Blocked`]（解除するまで、新しい書き出しを断る）。
 //! 4. ジョブの記録（`running`）を書く。書けなければ [`SubmitError::Internal`]（何も始めない）。
 //! 5. 別のスレッドで流す（[`crate::flow::execute`]。実行枠のガードはそのスレッドへ移る。終わりの記録を書いてから手放す）。
 //!    スレッドを作れなければ、記録を `failed`（`internal`）にして [`SubmitError::Internal`]。
+//!
+//! ## キャンセル（SIGINT・SIGTERM）と終わりの待ち（T6 から）
+//!
+//! [`Service::cancel`] が返す [`Cancel`] の印を立てると（[`crate::cancel`]。signal の handler か、tokio のシグナルの受け口から）、
+//! 実行中のジョブは、起動している rclone を止めて `wait` し終えてから、記録を確定せずに（Drive の段階が記録にあれば
+//! `running` のまま）終わる。止まったジョブの記録は、次の復旧（起動時・次のジョブの前・`recover`）が片付ける。`serve` は、印を
+//! 立てたあと、新しい受付を止め、[`Service::wait_idle`] で実行中のジョブのスレッドの終わりを待ってから、プロセスを終える
+//! （実行枠はジョブのスレッドが手放す。待たずに終えると、子が残るか、記録が中途のまま終わる）。
 //!
 //! 止まったジョブの復旧（時間がかかることがある）は、排他の中ではなく、手順 5 のスレッドの最初で行う（[`crate::flow`]）。
 //!
@@ -29,10 +41,12 @@
 //! 受付と `dry_run` は、`blocked` の記録・読めない記録があれば断る（[`Service::blocking`]）。解除は `geoframe-export recover
 //! --resolve <job_id>`（[`crate::recover`]）。サービスが動いている間は、`recover` は実行枠が取れなければ「実行中」で終わる。
 
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::cancel::Cancel;
 use crate::error::{ErrorCode, ExportError};
 use crate::flow::{self, Context, JobHandle, RecoverReport, Tuning};
 use crate::jobid::JobId;
@@ -120,12 +134,38 @@ pub enum StartupReport {
     Failed(ExportError),
 }
 
+/// [`Service::begin`] の結果。
+enum Began {
+    Started(Box<(SlotGuard, JobHandle)>),
+    /// 別のプロセスが、先に同じ `request_id` を登録していた（実行枠は手放した）。
+    Duplicate(Submitted),
+}
+
+/// ジョブのスレッドの数を、手放すとき（パニックでも）に減らす。
+struct RunningGuard(Arc<Inner>);
+
+impl RunningGuard {
+    /// 減らす（スレッドを作れなかったとき）。
+    fn release(self) {}
+}
+
+impl Drop for RunningGuard {
+    fn drop(&mut self) {
+        let (count, cv) = &self.0.running;
+        *count.lock().unwrap_or_else(PoisonError::into_inner) -= 1;
+        cv.notify_all();
+    }
+}
+
 struct Inner {
     settings: Settings,
     store: JobStore,
     published: PublishedStore,
     tuning: Tuning,
+    cancel: Cancel,
     gate: Mutex<()>,
+    /// 動いているジョブのスレッドの数（[`Service::wait_idle`]）。
+    running: (Mutex<usize>, Condvar),
 }
 
 impl Inner {
@@ -135,6 +175,7 @@ impl Inner {
             store: &self.store,
             published: &self.published,
             tuning: &self.tuning,
+            cancel: &self.cancel,
         }
     }
 }
@@ -152,6 +193,15 @@ impl Service {
 
     /// 調整値を替える（試験用。本番は [`Service::new`]）。
     pub fn with_tuning(settings: Settings, tuning: Tuning) -> Result<Self, ExportError> {
+        Self::with_cancel(settings, tuning, Cancel::new())
+    }
+
+    /// キャンセルの印を渡す形（`run`・`serve` の入口。signal の handler と同じ印を共有する）。
+    pub fn with_cancel(
+        settings: Settings,
+        tuning: Tuning,
+        cancel: Cancel,
+    ) -> Result<Self, ExportError> {
         let store = JobStore::open(&settings.state_dir)?;
         let published = PublishedStore::in_state_dir(&settings.state_dir);
         Ok(Self {
@@ -160,13 +210,38 @@ impl Service {
                 store,
                 published,
                 tuning,
+                cancel,
                 gate: Mutex::new(()),
+                running: (Mutex::new(0), Condvar::new()),
             }),
         })
     }
 
     pub fn settings(&self) -> &Settings {
         &self.inner.settings
+    }
+
+    /// キャンセルの印（立てると、実行中のジョブは rclone を止めて、記録を確定せずに終わる。上の「キャンセル」）。
+    pub fn cancel(&self) -> &Cancel {
+        &self.inner.cancel
+    }
+
+    /// 動いているジョブのスレッドが無くなるまで待つ。`timeout` までに無くなれば `true`。
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let (count, cv) = &self.inner.running;
+        let deadline = Instant::now() + timeout;
+        let mut n = count.lock().unwrap_or_else(PoisonError::into_inner);
+        while *n > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            n = cv
+                .wait_timeout(n, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
     }
 
     /// 次の書き出しを断る理由（`blocked`・読めない記録）。なければ `None`。
@@ -201,6 +276,17 @@ impl Service {
 
     /// 書き出しを受け付ける（上の「受付」）。`req.dry_run` は見ない（T6 は `dry_run` を [`Service::dry_run`] へ回す）。
     pub fn submit(&self, req: &ExportRequest) -> Result<Submitted, SubmitError> {
+        self.submit_with_hook(req, &|| {})
+    }
+
+    /// [`Service::submit`] の、最初の `request_id` の照会と実行枠を取る間に `between` を呼ぶ形（別のプロセスが、その間に同じ
+    /// `request_id` を登録した場合を、試験で決まった順に起こすため。本番は [`Service::submit`]）。
+    #[doc(hidden)]
+    pub fn submit_with_hook(
+        &self,
+        req: &ExportRequest,
+        between: &dyn Fn(),
+    ) -> Result<Submitted, SubmitError> {
         let _gate = self
             .inner
             .gate
@@ -209,18 +295,33 @@ impl Service {
         if let Some(found) = self.find_by_request_id(req)? {
             return Ok(found);
         }
-        let (guard, handle) = self.begin(req)?;
+        between();
+        let (guard, handle) = match self.begin(req, true)? {
+            Began::Started(started) => *started,
+            Began::Duplicate(found) => return Ok(found),
+        };
         let job_id = handle.record.job_id.clone();
         let fallback = (handle.record.clone(), self.inner.store.clone());
         let inner = Arc::clone(&self.inner);
+        // 動いているジョブの数（`wait_idle`）。スレッドの終わりで（パニックでも）減らす
+        *self
+            .inner
+            .running
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 1;
         let spawned = std::thread::Builder::new()
             .name("export-job".to_owned())
-            .spawn(move || {
-                let mut handle = handle;
-                let ctx = inner.context();
-                flow::execute(&ctx, &mut handle, &guard);
-                // 終わりの記録を書いたあとで、実行枠を手放す
-                drop(guard);
+            .spawn({
+                let inner = Arc::clone(&inner);
+                move || {
+                    let _running = RunningGuard(Arc::clone(&inner));
+                    let mut handle = handle;
+                    let ctx = inner.context();
+                    flow::execute(&ctx, &mut handle, &guard);
+                    // 終わりの記録を書いてから、実行枠を手放す
+                    drop(guard);
+                }
             });
         match spawned {
             Ok(_) => Ok(Submitted {
@@ -229,6 +330,7 @@ impl Service {
                 reused: false,
             }),
             Err(_) => {
+                RunningGuard(inner).release();
                 let (record, store) = fallback;
                 JobHandle::new(store, record).fail_internal();
                 Err(SubmitError::Internal(ExportError::new(
@@ -260,12 +362,22 @@ impl Service {
         }
     }
 
-    /// 実行枠を取り、`blocked` でないことを確かめ、ジョブの記録（`running`）を書く。
-    fn begin(&self, req: &ExportRequest) -> Result<(SlotGuard, JobHandle), SubmitError> {
-        let guard = self.acquire().map_err(|e| match e.code {
-            ErrorCode::Busy => SubmitError::Busy,
-            _ => SubmitError::Internal(e),
-        })?;
+    /// 実行枠を取り、`blocked` でないことを確かめ、ジョブの記録（`running`）を書く。`request_id` は、取れなかったときと、
+    /// 取れた直後（記録を書く前）に、もう一度照会する（別のプロセスが、最初の照会のあとに登録しているかもしれない）。
+    fn begin(&self, req: &ExportRequest, dedupe: bool) -> Result<Began, SubmitError> {
+        let guard = match self.acquire() {
+            Ok(g) => g,
+            Err(e) if e.code == ErrorCode::Busy => {
+                if dedupe && let Some(found) = self.find_by_request_id(req)? {
+                    return Ok(Began::Duplicate(found));
+                }
+                return Err(SubmitError::Busy);
+            }
+            Err(e) => return Err(SubmitError::Internal(e)),
+        };
+        if dedupe && let Some(found) = self.find_by_request_id(req)? {
+            return Ok(Began::Duplicate(found));
+        }
         if let Some(b) = self.inner.store.scan().blocking() {
             return Err(SubmitError::Blocked(b));
         }
@@ -274,12 +386,18 @@ impl Service {
             .store
             .write(&record)
             .map_err(SubmitError::Internal)?;
-        Ok((guard, JobHandle::new(self.inner.store.clone(), record)))
+        Ok(Began::Started(Box::new((
+            guard,
+            JobHandle::new(self.inner.store.clone(), record),
+        ))))
     }
 
     /// 同じ実行枠で、呼び出したスレッドの上で流す（`run` コマンド）。終わった記録を返す。`request_id` は見ない。
     pub fn run_foreground(&self, req: &ExportRequest) -> Result<JobRecord, SubmitError> {
-        let (guard, mut handle) = self.begin(req)?;
+        let Began::Started(started) = self.begin(req, false)? else {
+            unreachable!("request_id を見ないので、重複にはならない")
+        };
+        let (guard, mut handle) = *started;
         let ctx = self.inner.context();
         flow::execute(&ctx, &mut handle, &guard);
         Ok(handle.record)

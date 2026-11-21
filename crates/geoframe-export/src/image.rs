@@ -27,6 +27,7 @@
 use std::io::Read;
 use std::time::{Duration, Instant};
 
+use crate::cancel::Cancel;
 use crate::error::{ErrorCode, ExportError};
 use crate::folder::FolderName;
 use crate::jpeg::{self, InspectError, Inspection};
@@ -223,20 +224,37 @@ impl std::fmt::Display for PrepareError {
 
 impl std::error::Error for PrepareError {}
 
-fn check_deadline(
+/// 全体の期限と、キャンセルの印（1 枚ごとに確かめる）。
+struct Gate<'a> {
     deadline: Option<Instant>,
-    now: &dyn Fn() -> Instant,
-) -> Result<Duration, ExportError> {
-    match deadline {
-        None => Ok(Duration::MAX),
-        Some(d) => {
-            let left = d.saturating_duration_since(now());
-            if left.is_zero() {
-                Err(ExportError::from(ErrorCode::Timeout))
-            } else {
-                Ok(left)
+    now: &'a dyn Fn() -> Instant,
+    cancel: Option<&'a Cancel>,
+}
+
+impl Gate<'_> {
+    /// キャンセルされていれば `internal`、期限を過ぎていれば `timeout`。残りの時間を返す。
+    fn check(&self) -> Result<Duration, ExportError> {
+        if self.cancel.is_some_and(Cancel::is_cancelled) {
+            return Err(ExportError::new(
+                ErrorCode::Internal,
+                "キャンセルされました",
+            ));
+        }
+        match self.deadline {
+            None => Ok(Duration::MAX),
+            Some(d) => {
+                let left = d.saturating_duration_since((self.now)());
+                if left.is_zero() {
+                    Err(ExportError::from(ErrorCode::Timeout))
+                } else {
+                    Ok(left)
+                }
             }
         }
+    }
+
+    fn past_deadline(&self) -> bool {
+        self.deadline.is_some_and(|d| (self.now)() >= d)
     }
 }
 
@@ -277,14 +295,59 @@ pub fn prepare_with_clock(
     deadline: Option<Instant>,
     now: &dyn Fn() -> Instant,
 ) -> Result<Prepared, PrepareError> {
-    let mut excluded = Vec::new();
-    prepare_inner(
+    prepare_full(
         client,
         selection,
         destination,
         workspace,
         deadline,
         now,
+        None,
+    )
+}
+
+/// [`prepare`] に、キャンセルの印（[`Cancel`]。SIGINT・SIGTERM）を掛けた形。印が立つと、次の確かめ（1 枚ごと）で `internal` で
+/// 止まる（呼び出し側は、印を見て、この失敗を記録に確定しない。Drive には触れていない）。
+pub fn prepare_cancellable(
+    client: &ImageClient,
+    selection: &Selection,
+    destination: Destination,
+    workspace: &Workspace,
+    deadline: Option<Instant>,
+    cancel: &Cancel,
+) -> Result<Prepared, PrepareError> {
+    prepare_full(
+        client,
+        selection,
+        destination,
+        workspace,
+        deadline,
+        &Instant::now,
+        Some(cancel),
+    )
+}
+
+fn prepare_full(
+    client: &ImageClient,
+    selection: &Selection,
+    destination: Destination,
+    workspace: &Workspace,
+    deadline: Option<Instant>,
+    now: &dyn Fn() -> Instant,
+    cancel: Option<&Cancel>,
+) -> Result<Prepared, PrepareError> {
+    let mut excluded = Vec::new();
+    let gate = Gate {
+        deadline,
+        now,
+        cancel,
+    };
+    prepare_inner(
+        client,
+        selection,
+        destination,
+        workspace,
+        &gate,
         &mut excluded,
     )
     .map_err(|error| PrepareError {
@@ -301,8 +364,7 @@ fn prepare_inner(
     selection: &Selection,
     destination: Destination,
     workspace: &Workspace,
-    deadline: Option<Instant>,
-    now: &dyn Fn() -> Instant,
+    gate: &Gate<'_>,
     excluded: &mut Vec<Exclusion>,
 ) -> Result<Prepared, ExportError> {
     if selection.candidates.is_empty() {
@@ -337,11 +399,11 @@ fn prepare_inner(
             // 上で止めている。ここに来たら食い違い
             FileState::Pending => return Err(ExportError::from(ErrorCode::DerivativePending)),
         };
-        let left = check_deadline(deadline, now)?;
+        let left = gate.check()?;
         let remaining = limits.max_job_bytes.saturating_sub(fetched_bytes);
         let bytes = client.fetch(path, left, remaining).map_err(|e| {
             // 全体の期限で 1 枚の期限が縮んでいたときの失敗は、期限切れとして返す
-            if deadline.is_some_and(|d| now() >= d) {
+            if gate.past_deadline() {
                 ExportError::from(ErrorCode::Timeout)
             } else {
                 e
@@ -375,7 +437,7 @@ fn prepare_inner(
         let measures = measure::measure(&gray.data, gray.width, gray.height);
         drop(gray);
         // デコードと計測は長くかかりうる。そのあいだに期限が過ぎていれば、この写真を書かずに止める
-        check_deadline(deadline, now)?;
+        gate.check()?;
 
         let filename = manifest::relative_path(period, candidate.time, candidate.id);
         workspace.write_new(&filename, &bytes)?;
@@ -402,7 +464,7 @@ fn prepare_inner(
     }
 
     // 早く終わる結果（全部除外）も含めて、結果を返す前に全体の期限を確かめる
-    check_deadline(deadline, now)?;
+    gate.check()?;
     // 仕様上の除外のあとで 0 枚になったら失敗（宛先の状態に関係なく同じ結果。Drive の照会はこの後）
     if photos.is_empty() {
         return Err(ExportError::from(ErrorCode::NothingToExport));
@@ -425,7 +487,7 @@ fn prepare_inner(
         size: manifest_bytes.len() as u64,
     });
     // 期限を過ぎてから「成功」を返さない（呼び出し側は、この後に宛先を照会して送る）
-    check_deadline(deadline, now)?;
+    gate.check()?;
 
     Ok(Prepared {
         folder,

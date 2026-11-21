@@ -6,7 +6,7 @@
 //! | 終了コード | 意味 |
 //! |---|---|
 //! | 0 | 成功（0 枚を含む）、`--dry-run` の結果を出せた |
-//! | 1 | 失敗・`blocked`・`interrupted`、`blocked` の記録があって断った、`dry_run` の失敗 |
+//! | 1 | 失敗・`blocked`・`interrupted`、`blocked` の記録があって断った、`dry_run` の失敗、SIGINT・SIGTERM での中断 |
 //! | 2 | 引数・設定の誤り（`geoframe-export` の入口で。状態ディレクトリを用意できないときも） |
 //! | 3 | `conflict`（宛先が既にある・管理していない・中身が変わっている） |
 //! | 4 | 実行中（実行枠が取れない） |
@@ -21,6 +21,7 @@ use std::io::Write;
 use serde_json::{Value, json};
 
 use crate::app::EXIT_USAGE;
+use crate::cancel::Cancel;
 use crate::error::{ErrorCode, ExportError};
 use crate::flow::Tuning;
 use crate::jobs::{Status, error_json};
@@ -39,18 +40,29 @@ pub fn run(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    run_with(settings, request, Tuning::default(), out, err)
+    run_with(
+        settings,
+        request,
+        Tuning::default(),
+        &Cancel::new(),
+        out,
+        err,
+    )
 }
 
-/// [`run`] の、調整値（待ちと期限）を替えられる形（試験用）。
+/// [`run`] の、調整値（待ちと期限）とキャンセルの印を渡せる形。バイナリの `main` は、signal の handler
+/// （[`crate::cancel::install_signal_handlers`]）と同じ印を渡す。印が立つと、実行中の rclone を止めて `wait` し終えてから、
+/// 記録を確定せずに（Drive の段階が記録にあれば `running` のまま）終わる。そのときは、記録（`status` は `running`）を標準出力に出し、
+/// 標準エラーに説明を出して、終了コード 1。
 pub fn run_with(
     settings: &Settings,
     request: &ExportRequest,
     tuning: Tuning,
+    cancel: &Cancel,
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> u8 {
-    let service = match Service::with_tuning(settings.clone(), tuning) {
+    let service = match Service::with_cancel(settings.clone(), tuning, cancel.clone()) {
         Ok(s) => s,
         Err(e) => {
             let _ = writeln!(
@@ -77,6 +89,13 @@ pub fn run_with(
     match service.run_foreground(request) {
         Ok(record) => {
             print_json(out, &record.to_api_json());
+            if record.status == Status::Running {
+                let _ = writeln!(
+                    err,
+                    "geoframe-export: 中断されました。Drive に触れた記録は running のまま残しました。\
+                     次の書き出しの前（またはサービスの起動時）に、記録から片付けます（geoframe-export recover で確かめられます）"
+                );
+            }
             match record.status {
                 Status::Succeeded => EXIT_OK,
                 Status::Conflict => EXIT_CONFLICT,

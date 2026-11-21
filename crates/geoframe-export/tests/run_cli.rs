@@ -255,7 +255,7 @@ fn a_blocked_record_makes_run_exit_1_and_explain_on_stderr() {
     let site = photo_site(DAY, DAY, three());
     let store = JobStore::open(&env.state).unwrap();
     let mut b = JobRecord::new(job(1), &common::site::day());
-    b.status = Status::Blocked;
+    settle(&mut b, Status::Blocked);
     b.blocked = Some(BlockedNote {
         reason: "stage_inconsistent".into(),
         description: "説明".into(),
@@ -353,7 +353,7 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
     store.write(&early).unwrap();
     let mut blocked = JobRecord::new(job(4), &common::site::day());
     blocked.started_ns -= 10 * SEC;
-    blocked.status = Status::Blocked;
+    settle(&mut blocked, Status::Blocked);
     blocked.progress = Some(Progress {
         stage: Stage::Publishing,
         old_id: None,
@@ -365,7 +365,7 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
     });
     store.write(&blocked).unwrap();
     let mut done = JobRecord::new(job(5), &common::site::day());
-    done.status = Status::Succeeded;
+    settle(&mut done, Status::Succeeded);
     store.write(&done).unwrap();
     std::fs::write(
         env.state.join("jobs").join(format!("{}.json", job(6))),
@@ -426,7 +426,7 @@ fn resolve_clears_only_a_blocked_job_without_touching_drive() {
     let site = photo_site(DAY, DAY, three());
     let store = JobStore::open(&env.state).unwrap();
     let mut blocked = JobRecord::new(job(7), &common::site::day());
-    blocked.status = Status::Blocked;
+    settle(&mut blocked, Status::Blocked);
     blocked.progress = Some(Progress {
         stage: Stage::Retiring,
         old_id: Some("fid-old".into()),
@@ -438,10 +438,10 @@ fn resolve_clears_only_a_blocked_job_without_touching_drive() {
     });
     store.write(&blocked).unwrap();
     let mut running = JobRecord::new(job(8), &common::site::day());
-    running.status = Status::Running;
+    settle(&mut running, Status::Running);
     store.write(&running).unwrap();
     let mut done = JobRecord::new(job(9), &common::site::day());
-    done.status = Status::Failed;
+    settle(&mut done, Status::Failed);
     store.write(&done).unwrap();
     let drive_before = env.drive().to_json();
 
@@ -512,4 +512,85 @@ fn an_unreadable_record_cannot_be_resolved() {
     assert_eq!(out.code, 1);
     assert!(out.stderr.contains("手で退かして"), "{}", out.stderr);
     assert_eq!(std::fs::read(&path).unwrap(), b"{");
+}
+
+// ---- 完了済みでも、手作業の片付けが要る知らせ（T5 のレビュー対応） ----
+
+#[test]
+fn recover_lists_finished_jobs_whose_notes_ask_for_manual_cleanup_without_touching_anything() {
+    let env = Env::new("cli-notes");
+    let site = photo_site(DAY, DAY, three());
+    let store = JobStore::open(&env.state).unwrap();
+    // 失敗・中断・成功のそれぞれで、知らせが残っている記録と、残っていない記録
+    let mut failed = JobRecord::new(job(21), &common::site::day());
+    failed.started_ns -= 40 * SEC;
+    settle(&mut failed, Status::Failed);
+    failed.notes =
+        vec!["作業用のフォルダに incoming/AAA が残っています（手で片付けてください）".into()];
+    store.write(&failed).unwrap();
+    let mut interrupted = JobRecord::new(job(22), &common::site::day());
+    interrupted.started_ns -= 30 * SEC;
+    settle(&mut interrupted, Status::Interrupted);
+    interrupted.notes = vec!["旧フォルダが replaced/ に残っています".into()];
+    store.write(&interrupted).unwrap();
+    let mut succeeded = JobRecord::new(job(23), &common::site::day());
+    succeeded.started_ns -= 20 * SEC;
+    settle(&mut succeeded, Status::Succeeded);
+    succeeded.notes = vec!["公開の記録 published.json に書けていません".into()];
+    store.write(&succeeded).unwrap();
+    let mut quiet = JobRecord::new(job(24), &common::site::day());
+    quiet.started_ns -= 10 * SEC;
+    settle(&mut quiet, Status::Succeeded);
+    store.write(&quiet).unwrap();
+
+    let records_before: Vec<_> = (21..=24)
+        .map(|n| std::fs::read(env.state.join("jobs").join(format!("{}.json", job(n)))).unwrap())
+        .collect();
+    let out = run_free(&["recover"], &env, &site);
+    assert_eq!(out.code, 0, "{}", out.stderr);
+    let text = &out.stdout;
+    for n in [21, 22, 23] {
+        assert!(text.contains(job(n).as_str()), "{n}: {text}");
+    }
+    assert!(
+        !text.contains(job(24).as_str()),
+        "知らせの無い完了済みは出さない: {text}"
+    );
+    for note in [
+        "incoming/AAA が残っています",
+        "replaced/ に残っています",
+        "published.json に書けていません",
+    ] {
+        assert!(
+            text.contains("知らせ: ") && text.contains(note),
+            "{note}: {text}"
+        );
+    }
+    assert!(text.contains("解除の対象ではありません"), "{text}");
+    // 古いほうから
+    assert!(text.find(job(21).as_str()) < text.find(job(23).as_str()));
+    // Drive にも記録にも触れない。解除の対象にもならない
+    assert!(env.calls().is_empty(), "Drive は照会しない");
+    let records_after: Vec<_> = (21..=24)
+        .map(|n| std::fs::read(env.state.join("jobs").join(format!("{}.json", job(n)))).unwrap())
+        .collect();
+    assert_eq!(records_after, records_before);
+    let resolve = run_free(&["recover", "--resolve", job(21).as_str()], &env, &site);
+    assert_eq!(resolve.code, 1, "{}", resolve.stdout);
+    assert!(
+        resolve.stderr.contains("blocked ではない"),
+        "{}",
+        resolve.stderr
+    );
+
+    // 知らせが 1 つも無ければ、「ありません」
+    let env2 = Env::new("cli-notes-none");
+    let site2 = photo_site(DAY, DAY, three());
+    let out = run_free(&["recover"], &env2, &site2);
+    assert_eq!(out.code, 0);
+    assert!(
+        out.stdout.contains("知らせが残っているジョブもありません"),
+        "{}",
+        out.stdout
+    );
 }

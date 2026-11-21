@@ -261,7 +261,7 @@ fn main() {
     // 呼び出しの記録（引数と、渡された環境）。効果より先に書く（止まる呼び出しも残る）
     let env: serde_json::Map<String, Value> =
         std::env::vars().map(|(k, v)| (k, json!(v))).collect();
-    let line = json!({"kind": "rclone", "cmd": p.sub, "args": args, "env": env});
+    let line = json!({"kind": "rclone", "cmd": p.sub, "args": args, "env": env, "pid": std::process::id()});
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
