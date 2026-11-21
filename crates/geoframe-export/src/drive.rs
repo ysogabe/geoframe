@@ -836,7 +836,8 @@ mod tests {
         assert!(got.iter().any(|s| s.kind == Kind::Dir && s.id == "idR"));
         assert!(
             got.iter()
-                .any(|s| s.kind == Kind::Shortcut && s.id == "idT")
+                .any(|s| s.kind == Kind::Shortcut && s.id == "idS"),
+            "ショートカット自身の ID（recover の表示で見つけられるほう）"
         );
         // 解決されたショートカットだけがある（本物のフォルダは無い）→ ショートカット 1 つ（フォルダとしては数えない）
         let got = classify(&[], std::slice::from_ref(&resolved), name);

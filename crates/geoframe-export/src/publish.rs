@@ -292,7 +292,7 @@ impl Leftover {
     };
 }
 
-/// `incoming/<job_id>` を片付ける。**記録した（または自分で確かめた）ID と一致するフォルダ 1 つだけ**をゴミ箱へ移す。
+/// `incoming/<job_id>` を片付ける。**記録した ID と一致するフォルダ 1 つだけ**をゴミ箱へ移す。
 /// ID が無ければ名前だけでは消さず、あるかどうかだけを見て、あれば残りものとして返す。
 fn clean_incoming(drive: &Drive<'_>, id: Option<&str>) -> Leftover {
     match id {
@@ -742,9 +742,6 @@ struct Run<'a> {
     old_id: Option<String>,
     existing_files: u64,
     incoming_created: bool,
-    /// `incoming/<job_id>` を作ったあとに、この処理が一覧から確かめた ID（ジョブの記録に書けなかったときも、この ID
-    /// なら片付けられる。作ったばかりのフォルダを指している）。
-    known_incoming_id: Option<String>,
     retire_issued: bool,
 }
 
@@ -791,7 +788,6 @@ impl Run<'_> {
         self.incoming_created = true;
         self.drive.mkdir_incoming().map_err(StepErr::Op)?;
         let incoming_id = self.drive.incoming_id().map_err(StepErr::Op)?;
-        self.known_incoming_id = Some(incoming_id.clone());
         self.record(Stage::Uploading, Some(&incoming_id))?;
         self.drive
             .upload(self.params.workspace)
@@ -992,7 +988,6 @@ pub fn publish(
         old_id,
         existing_files: inspection.existing_files,
         incoming_created: false,
-        known_incoming_id: None,
         retire_issued: false,
     };
     let recovery = Recovery {
@@ -1007,15 +1002,10 @@ pub fn publish(
         Ok(published) => Ok(PublishOutcome::Published(published)),
         Err(StepErr::Blocked(info)) => Err(PublishFailure::blocked(info)),
         Err(StepErr::Abort(error)) => {
-            // 記録した ID、なければ作った直後にこの処理が確かめた ID で片付ける。どちらも無ければ名前だけでは消さず、
+            // 記録した ID と一致するフォルダだけを片付ける。ID を記録できていなければ（記録に失敗した場合を含む）名前だけでは消さず、
             // 残っていれば残りものとして返す
-            let id = run
-                .progress
-                .incoming_id
-                .clone()
-                .or_else(|| run.known_incoming_id.clone());
             let left = if run.incoming_created {
-                clean_incoming(&run.free_drive, id.as_deref())
+                clean_incoming(&run.free_drive, run.progress.incoming_id.as_deref())
             } else {
                 Leftover::NONE
             };

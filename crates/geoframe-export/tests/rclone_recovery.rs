@@ -779,7 +779,27 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
         .unwrap();
     assert!(matches!(res, Resolution::Published(_)));
     assert_eq!(w.env.rclone_calls("moveto").len(), 1);
-    // 一覧が決まらなければ blocked
+    // 一覧が決まらなければ blocked（unobservable）。移す前までの lsjson の回数は、同じ状況をもう 1 回動かして数える
+    let probe = world("recovery-unstable-probe");
+    let old = probe.env.seed_managed(Y, FOLDER, &probe.set);
+    let inc = probe.put_incoming();
+    probe.retire(&old);
+    probe.env.add_rule("moveto", 0, 1, fail(1));
+    let r = probe.env.rclone();
+    let _ = probe.recovery(&r, None).run(
+        &progress(Stage::Publishing, Some(&old), Some(&inc)),
+        false,
+        &mut Hook::new(&probe.env),
+    );
+    let before_move = probe
+        .env
+        .calls()
+        .iter()
+        .take_while(|c| c["cmd"] != "moveto")
+        .filter(|c| c["cmd"] == "lsjson")
+        .count() as u64;
+    assert!(before_move > 0);
+
     let w = world("recovery-unstable");
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
@@ -789,8 +809,8 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
     c.rules.push(model::Rule {
         cmd: "lsjson".into(),
         contains: None,
-        // 移す前の確認（incoming・宛先）の一覧は通し、失敗のあとの一覧をすべて失敗させる
-        skip: 12,
+        // 移す前の一覧は通し、失敗のあとの一覧をすべて失敗させる
+        skip: before_move,
         times: u64::MAX,
         seen: 0,
         effect: fail(1),
@@ -805,14 +825,7 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
             &mut Hook::new(&w.env),
         )
         .unwrap_err();
-    assert!(
-        matches!(
-            info.reason,
-            BlockedReason::Unobservable | BlockedReason::ExecutionFailed
-        ),
-        "{:?}",
-        info.reason
-    );
+    assert_eq!(info.reason, BlockedReason::Unobservable);
 }
 
 #[test]

@@ -473,6 +473,10 @@ impl Rclone {
             }
             .into(),
         );
+        // リンク切れのショートカットを省く設定があっても、一覧に出す（ショートカットとして分類したいため）
+        if !skip_shortcuts {
+            a.push("--drive-skip-dangling-shortcuts=false".into());
+        }
         a.push("--drive-skip-gdocs=false".into());
         a.push("--drive-show-all-gdocs".into());
         if recursive {
@@ -851,6 +855,10 @@ mod tests {
         assert!(!has(
             &r.lsjson_args(&l, false, true),
             "--drive-skip-shortcuts=false"
+        ));
+        assert!(has(
+            &r.lsjson_args(&l, false, false),
+            "--drive-skip-dangling-shortcuts=false"
         ));
         // 一覧は毎回、エクスポートできない Google のファイルも出し、gdocs を除く設定を打ち消す
         for skip in [true, false] {

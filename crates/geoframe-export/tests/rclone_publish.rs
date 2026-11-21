@@ -410,7 +410,8 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
     assert_eq!(f.error.code, ErrorCode::Internal);
     assert_eq!(env.mutations(), ["record:uploading"]);
 
-    // uploading の 2 回目（ID の記録）: 作ったフォルダを片付ける。写真は送らない
+    // uploading の 2 回目（ID の記録）: 写真は送らない。ID を記録できていないので、作ったフォルダは名前だけでは消さず、
+    // 残りものとして知らせる
     let env = Env::new("rec-up2");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let mut hook = Hook::new(&env).fail_at(Stage::Uploading, 2);
@@ -418,9 +419,15 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
     assert_eq!(f.error.code, ErrorCode::Internal);
     assert_eq!(
         env.mutations(),
-        ["record:uploading", "mkdir", "record:uploading", "purge"]
+        ["record:uploading", "mkdir", "record:uploading"]
     );
-    assert!(!f.leftover_incoming);
+    assert!(f.leftover_incoming);
+    let left = env
+        .drive()
+        .resolve(&["geoframe-export-work", "incoming", JOB_A])
+        .expect("消していない");
+    assert_eq!(f.leftover_incoming_id.as_deref(), Some(left.as_str()));
+    assert!(env.drive().trashed.is_empty() && env.drive().deleted.is_empty());
 
     // verifying: 検証の一覧も、公開もしない
     let env = Env::new("rec-ver");
