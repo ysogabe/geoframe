@@ -1168,20 +1168,32 @@ fn stopping_waits_for_an_inflight_blocking_task_even_after_the_connection_deadli
         vec!["127.0.0.1".parse().unwrap()],
         limits,
     );
-    // dry_run を送る（応答は待たない）
+    // dry_run を送る（応答は待たない）。実行枠の見かけの `busy`（ほかの試験の fork。冒頭の説明）で断られたら、打ち直す
     let auth = format!("Bearer {TOKEN}");
-    let mut s = connect(server.addr);
     let body = serde_json::to_vec(&day_body(json!({"dry_run": true}))).unwrap();
-    send_request(
-        &mut s,
-        "POST",
-        "/v1/exports",
-        &[
-            ("Authorization", &auth),
-            ("Content-Type", "application/json"),
-        ],
-        Some(&body),
-    );
+    let mut s;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        s = connect(server.addr);
+        send_request(
+            &mut s,
+            "POST",
+            "/v1/exports",
+            &[
+                ("Authorization", &auth),
+                ("Content-Type", "application/json"),
+            ],
+            Some(&body),
+        );
+        // 写真サービスに届けば、受け付けられている（busy なら届かない）
+        let sent = Instant::now() + Duration::from_millis(500);
+        while site.request_lines().is_empty() && Instant::now() < sent {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if !site.request_lines().is_empty() || Instant::now() > deadline {
+            break;
+        }
+    }
     // 写真サービスに届くまで待つ（ブロッキング処理が、応答待ちに入っている）
     let deadline = Instant::now() + Duration::from_secs(10);
     while site.request_lines().is_empty() {

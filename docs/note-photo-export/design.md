@@ -350,7 +350,7 @@ U1〜U7 は 2026-11-22 にユーザーが決めた。U8 は判断待ち。
 
 ### 6.1 HTTP
 
-すべての要求に `Authorization: Bearer <token>` が要る（`/healthz` を除く）。本文は JSON（`Content-Type: application/json`）で、上限は 4KiB、未知のキーは 400 で断る。接続数は 8 本まで。ヘッダと本文の読み取りに期限（10 秒）を掛ける。
+すべての要求に `Authorization: Bearer <token>` が要る（`/healthz` を除く）。本文は JSON（`Content-Type: application/json`）で、上限は 4KiB、未知のキーと、同じキーの重複（`duplicate_field`。最後の値で上書きしない）は 400 で断る。接続数は、許可した送信元から 8 本まで（許可外は別の 2 本の枠で 403 を返す。3.4）。ヘッダと本文の読み取りに期限（10 秒）を掛ける。
 
 **`POST /v1/exports`** … 書き出しを受け付ける。
 
