@@ -33,7 +33,8 @@
 //!   IPv6（`::ffff:a.b.c.d`）は IPv4 にそろえてから比べる（`::` に待ち受けると、IPv4 の相手がその形で見えるため）。
 //! - **認証**は 403 の次（許可外は、トークンを見る前に断る）。`/healthz` だけは認証しない。門は経路の振り分けの外側にあるので、
 //!   未知の経路・違うメソッドも、許可外は 403、トークン無しは 401 になる（経路の有無を漏らさない）。
-//! - **接続**は同時に [`Limits::max_connections`]（既定 8）本まで。枠が空くまで accept しない（超えた分は OS の待ち行列で待つ）。
+//! - **接続**は同時に [`Limits::max_connections`]（既定 8）本まで。枠が空くまで accept しない（超えた分は、503 ではなく、OS の
+//!   待ち行列で待たされる）。許可外の相手も、ヘッダを読み終えるまで（最長 10 秒）枠を 1 つ使う（403 は、ヘッダを読んでから返す）。
 //!   1 接続 1 要求（keep-alive しない）。ヘッダの読み取りは [`Limits::header_timeout`]（10 秒。hyper の `header_read_timeout`）、本文の
 //!   読み取りは [`Limits::body_timeout`]（10 秒）。本文は [`Limits::max_body`]（4KiB）まで。
 //! - **ログ**は、起動・終了・起動時の復旧の結果と、アクセスログ（送信元・メソッド・経路の型〔ジョブ ID は形が合うときだけ〕・状態コード・
@@ -48,6 +49,9 @@
 //! 3. [`Service::startup_recovery`] を済ませてから待ち受ける。待ち受けながら終わるまで 503 にする案もあるが、復旧は実行枠を
 //!    取るので、その間の受付は 409（`busy`）になり、呼び出し側が「別のジョブが実行中」と取り違える。接続できない（拒否）なら
 //!    呼び出し側は再試行するだけで済み、systemd も起動の完了を待たない（`Type=simple`）。復旧中に印が立てば、待ち受けずに終わる。
+//!    **帰結**: 止まったジョブ（Drive の段階を記録した `running`）があると、本番の待ち（Drive の反映を 30 秒ずつ最大 4 回）のぶん、
+//!    再起動のあと最大で数分、待ち受けない（呼び出し側には接続拒否に見える。`/healthz` も答えない）。呼び出し側は、接続を拒否
+//!    されたら間隔を空けて再試行する。unit の起動の完了を `/healthz` で見張るなら、その間は未起動に見える（T7）。
 //! 4. 終了（印が立つ）では、新しい受付を閉じ、①接続のタスクが終わるのを待ち（要求の途中だったものは返事をする）、②受付・
 //!    `dry_run`・起動時の復旧のブロッキング処理が終わるのを待ち、③ [`Service::wait_idle`] でジョブのスレッドの終わり（rclone を止めて
 //!    `wait` し終えるまで）を待ってから終わる。止まったジョブの記録は確定せず、次の起動の復旧が片付ける。
@@ -99,8 +103,10 @@ pub const MAX_CONNECTIONS: usize = 8;
 pub const MAX_BODY: usize = 4096;
 /// ヘッダ・本文の読み取りの期限（design.md 6.1）。
 pub const READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// 終了のとき、受付などのブロッキング処理と、ジョブのスレッドの終わりを待つ上限（systemd の停止の待ち時間より前に出る）。
-pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(120);
+/// 終了のとき、接続・ブロッキング処理（受付・`dry_run`・復旧）・ジョブのスレッドの終わりを待つ、**全体の**上限（1 つの期限を、
+/// 3 つの待ちで共有する）。systemd の既定の停止の待ち（`TimeoutStopSec` の既定は 90 秒）より前に出す。T7 の unit は、これより
+/// 長い `TimeoutStopSec`（例: 120 秒）を置く。ジョブのスレッドは、印が立てば rclone を止めて数秒で終わる。
+pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(75);
 
 /// 本番の値は [`Limits::default`]。試験が短くする。
 #[derive(Debug, Clone)]
@@ -111,7 +117,7 @@ pub struct Limits {
     /// 本文を読み終えるまでの期限（ヘッダを読んでから）。
     pub body_timeout: Duration,
     pub max_body: usize,
-    /// 終了のとき、ブロッキング処理・ジョブの終わりを待つ上限。
+    /// 終了のとき、接続・ブロッキング処理・ジョブの終わりを待つ全体の上限（印を見てから数える）。
     pub shutdown_wait: Duration,
 }
 
@@ -405,21 +411,32 @@ async fn run_async(
     tracing::info!("終了の印を受けました。受付を閉じて、実行中の処理の終わりを待ちます");
     drop(listener);
     let _ = stop_tx.send(true);
-    while connections.join_next().await.is_some() {}
-    let wait = limits.shutdown_wait;
+    let deadline = tokio::time::Instant::now() + limits.shutdown_wait;
+    let joined = tokio::time::timeout_at(deadline, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_ok();
+    if !joined {
+        // 接続のタスクは落とす（中のブロッキング処理は続くので、次の待ちで数える）
+        connections.abort_all();
+    }
+    let left = || deadline.saturating_duration_since(tokio::time::Instant::now());
     let blocking_idle = {
         let inflight = Arc::clone(&inflight);
+        let wait = left();
         tokio::task::spawn_blocking(move || inflight.wait_idle(wait))
             .await
             .unwrap_or(false)
     };
     let jobs_idle = {
         let service = service.clone();
+        let wait = left();
         tokio::task::spawn_blocking(move || service.wait_idle(wait))
             .await
             .unwrap_or(false)
     };
-    if blocking_idle && jobs_idle {
+    if joined && blocking_idle && jobs_idle {
         tracing::info!("終わりました");
         Ok(0)
     } else {
@@ -660,6 +677,10 @@ async fn create_job(State(app): State<Arc<App>>, req: Request) -> Response {
             Err(code) => return error(StatusCode::BAD_REQUEST, code),
         };
 
+    // 本文の読み取り中に印が立ったら、始めない（読み取りの前の確認だけだと、202 を返したのに動かないジョブができる）
+    if app.cancel.is_cancelled() {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "shutting_down");
+    }
     let service = app.service.clone();
     if request.dry_run {
         return match app.blocking(move || service.dry_run(&request)).await {
@@ -804,7 +825,7 @@ mod tests {
         for bad in ["224.0.0.1:9100", "255.255.255.255:9100", "[ff02::1]:9100"] {
             assert_eq!(check_listen(sa(bad)), Err(ListenError::NotUnicast), "{bad}");
         }
-        // 具体的な IP（tailnet の IP の形）とループバック（試験用）
+        // 具体的な IP（文書用の予約アドレス）とループバック（試験用）
         for ok in [
             "100.64.0.1:9100",
             "[fd7a:115c:a1e0::1]:9100",

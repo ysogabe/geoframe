@@ -194,10 +194,23 @@ fn the_token_is_required_everywhere_except_healthz_and_never_shows_up() {
     let site = photo_site(DAY, DAY, three());
     let server = Server::start(&mut env, &site, TOKEN);
     let addr = server.addr;
+    // 応答（状態行以外のヘッダと本文）に、トークンも、送られてきた誤ったトークンも、その断片も出ない
+    let clean = |r: &Resp| {
+        for secret in [TOKEN, WRONG, &TOKEN[..20], &WRONG[..20]] {
+            assert!(!r.body.contains(secret), "本文にトークンが出ている: {r:?}");
+            for (name, value) in &r.headers {
+                assert!(
+                    !name.contains(secret) && !value.contains(secret),
+                    "ヘッダにトークンが出ている: {r:?}"
+                );
+            }
+        }
+    };
 
     // /healthz は認証なし
     let r = http_request(addr, "GET", "/healthz", &[], None);
     assert_eq!((r.status, r.body.as_str()), (200, "ok"));
+    clean(&r);
 
     // トークンなし・違う・形の違う・2 つ → 401（経路の有無によらず）
     let wrong = format!("Bearer {WRONG}");
@@ -248,6 +261,7 @@ fn the_token_is_required_everywhere_except_healthz_and_never_shows_up() {
         assert_eq!(r.status, 401, "{method} {path} {headers:?}: {}", r.body);
         assert_eq!(r.error(), "unauthorized");
         assert_eq!(r.header("www-authenticate"), Some("Bearer"));
+        clean(&r);
     }
     // 2 つの Authorization ヘッダは、片方が正しくても断る
     let good = format!("Bearer {TOKEN}");
@@ -265,7 +279,10 @@ fn the_token_is_required_everywhere_except_healthz_and_never_shows_up() {
     // 正しいトークン: 一覧は 200、未知の経路は 404、違うメソッドは 405（どれも JSON）
     let r = get(addr, "/v1/exports", TOKEN);
     assert_eq!((r.status, r.json()), (200, json!({"jobs": []})));
-    assert_eq!(get(addr, "/no/such/path", TOKEN).status, 404);
+    clean(&r);
+    let r = get(addr, "/no/such/path", TOKEN);
+    assert_eq!(r.status, 404);
+    clean(&r);
     let r = http_request(
         addr,
         "DELETE",
@@ -274,6 +291,7 @@ fn the_token_is_required_everywhere_except_healthz_and_never_shows_up() {
         None,
     );
     assert_eq!((r.status, r.error().as_str()), (405, "method_not_allowed"));
+    clean(&r);
     // スキームは大文字小文字を区別しない
     let lower = format!("bearer {TOKEN}");
     let r = http_request(
@@ -290,8 +308,13 @@ fn the_token_is_required_everywhere_except_healthz_and_never_shows_up() {
     assert_eq!(r.status, 202, "{}", r.body);
     assert_eq!(r.json()["status"], "running");
     assert_eq!(r.json()["job_id"].as_str().map(str::len), Some(32));
+    clean(&r);
+    // 受け付けた job の記録にも出ない
+    let id = r.json()["job_id"].as_str().unwrap().to_owned();
+    clean(&get(addr, &format!("/v1/exports/{id}"), TOKEN));
+    clean(&post_json(addr, WRONG, &day_body(json!({}))));
 
-    // 応答（本文・ヘッダ）にトークンもその断片も出ない。ログにも出ない（試験用の購読者。要求のヘッダも出ない）
+    // ログにも出ない（試験用の購読者。要求のヘッダも出ない）。応答は上の `clean` で確かめた
     drop(server);
     let log = logs();
     for secret in [TOKEN, WRONG, &TOKEN[..20], &WRONG[..20]] {
@@ -548,6 +571,51 @@ fn a_failed_job_reports_a_fixed_code_and_never_the_rclone_output() {
     assert!(v["error"]["code"].is_string(), "{v}");
     assert!(v["error"]["message"].is_string(), "{v}");
     assert!(!v.to_string().contains("fake failure"));
+}
+
+// ---- 503: blocked と、dry_run で写真サービスに届かない ----
+
+#[test]
+fn a_blocked_record_and_an_unreachable_photo_service_answer_503_with_a_fixed_code() {
+    use geoframe_export::jobid::JobId;
+    use geoframe_export::jobs::{BlockedNote, JobRecord, JobStore, Status};
+    const TOKEN: &str = "S503-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
+
+    // dry_run で、写真サービスが一覧 API を返さない（登録のない経路は 404）→ 503 feed_unavailable
+    let mut env = Env::new("http-503-feed");
+    let dead = FakeSite::start(Vec::new());
+    let server = Server::start(&mut env, &dead, TOKEN);
+    let r = post_json(server.addr, TOKEN, &day_body(json!({"dry_run": true})));
+    assert_eq!(
+        (r.status, r.error().as_str()),
+        (503, "feed_unavailable"),
+        "{}",
+        r.body
+    );
+    assert_eq!(r.json().as_object().map(|o| o.len()), Some(1));
+    drop(server);
+
+    // blocked の記録がある間は、受付も dry_run も 503 blocked（解除するまで）。記録そのものは GET で引ける
+    let mut env = Env::new("http-503-blocked");
+    let site = photo_site(DAY, DAY, three());
+    let store = JobStore::open(&env.state).unwrap();
+    let mut b = JobRecord::new(JobId::parse(&format!("{:032x}", 8)).unwrap(), &day());
+    settle(&mut b, Status::Blocked);
+    b.started_ns = 1;
+    b.blocked = Some(BlockedNote {
+        reason: "unobservable".into(),
+        description: "d".into(),
+    });
+    store.write(&b).unwrap();
+    let server = Server::start(&mut env, &site, TOKEN);
+    for body in [day_body(json!({})), day_body(json!({"dry_run": true}))] {
+        let r = post_json(server.addr, TOKEN, &body);
+        assert_eq!((r.status, r.error().as_str()), (503, "blocked"), "{body}");
+    }
+    let v = get(server.addr, &format!("/v1/exports/{:032x}", 8), TOKEN).json();
+    assert_eq!(v["status"], "blocked", "{v}");
+    assert_eq!(job_files(&env), 1, "断った要求は記録を作らない");
+    assert!(env.calls().is_empty(), "blocked の間は Drive に触れない");
 }
 
 // ---- AC10: dry_run ----
