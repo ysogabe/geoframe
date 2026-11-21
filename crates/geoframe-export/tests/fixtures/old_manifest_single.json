@@ -1,0 +1,33 @@
+{
+  "date": "2030-03-10",
+  "source": "GEOFRAME /api/v1/photos",
+  "count": 2,
+  "catalog_count": 2,
+  "notes": {
+    "taken_at": "API は分までしか持たないためファイル名の秒は 00",
+    "mean_brightness": "グレースケール(縮小前) 0-255 の平均",
+    "sharpness_laplacian_var": "最大1024px に縮小後の 3x3(4近傍) Laplacian 応答の分散。PIL で計算",
+    "spot": "カタログ API に名所データが無いため全件空欄(nearest_spot_distance_m も null)",
+    "gps_inferred": "カタログの inferred フラグ",
+    "elev": "カタログの値。null は標高なし"
+  },
+  "photos": [
+    {
+      "id": 101,
+      "filename": "091100_101.jpg",
+      "title": "山頂",
+      "taken_at": "2030-03-10 09:11",
+      "lat": 10.5,
+      "lon": 20.25,
+      "width": 2560,
+      "height": 1707,
+      "file_size": 1000001,
+      "mean_brightness": 70.5,
+      "sharpness_laplacian_var": 2000.5,
+      "spot": "",
+      "nearest_spot_distance_m": null,
+      "gps_inferred": true,
+      "elev": 3776.0
+    }
+  ]
+}

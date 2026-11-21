@@ -57,13 +57,17 @@ pub struct Exclusion {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExcludeReason {
+    /// `file` が表示用 JPEG の形に合わない（一覧 API の値だけで分かる）。
     NotDerivative,
+    /// 取った JPEG に、許す区画以外の区画か EOI の後ろのデータがある（画像を取ってから分かる。[`crate::image`]）。
+    HasMetadata,
 }
 
 impl ExcludeReason {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotDerivative => "not_derivative",
+            Self::HasMetadata => "has_metadata",
         }
     }
 }

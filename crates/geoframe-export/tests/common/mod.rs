@@ -61,6 +61,17 @@ impl Reply {
         }
     }
 
+    /// 画像（`Content-Type: image/jpeg`）。
+    pub fn jpeg(body: Vec<u8>) -> Self {
+        Self::Raw {
+            head: format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            ),
+            body: Body::Bytes(body),
+        }
+    }
+
     pub fn redirect(code: u16, location: &str) -> Self {
         Self::Raw {
             head: format!(
@@ -115,21 +126,34 @@ impl FakeFeed {
     }
 }
 
-fn serve(mut stream: TcpStream, reply: &Reply, requests: &Mutex<Vec<String>>) {
+/// 要求の先頭（最後の空行まで）を読み、1 行目を返す。読めなければ `None`。
+fn read_request_line(stream: &mut TcpStream) -> Option<String> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
         match stream.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => return None,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     }
-    let line = String::from_utf8_lossy(&buf)
-        .lines()
-        .next()
-        .unwrap_or_default()
-        .to_owned();
+    Some(
+        String::from_utf8_lossy(&buf)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_owned(),
+    )
+}
+
+fn serve(mut stream: TcpStream, reply: &Reply, requests: &Mutex<Vec<String>>) {
+    let Some(line) = read_request_line(&mut stream) else {
+        return;
+    };
     requests.lock().expect("lock").push(line);
+    respond(stream, reply);
+}
+
+fn respond(mut stream: TcpStream, reply: &Reply) {
     match reply {
         Reply::Stall(d) => std::thread::sleep(*d),
         Reply::Partial { head, prefix, hold } => {
@@ -160,6 +184,64 @@ fn serve(mut stream: TcpStream, reply: &Reply, requests: &Mutex<Vec<String>>) {
                 }
             }
         }
+    }
+}
+
+/// 127.0.0.1 の空きポートで待ち受け、**パスごとに**応答を返す偽の写真サービス（表示用 JPEG と一覧 API）。
+/// 登録のないパスは 404。接続数と、要求の 1 行目を数える。
+pub struct FakeSite {
+    pub base: FeedBase,
+    pub addr: String,
+    connections: Arc<AtomicUsize>,
+    requests: Arc<Mutex<Vec<String>>>,
+}
+
+impl FakeSite {
+    /// `routes`: （パス、応答）。パスはクエリを除いた `/derivatives/a.jpg` の形。
+    pub fn start(routes: Vec<(String, Reply)>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let routes: Arc<Vec<(String, Reply)>> = Arc::new(routes);
+        {
+            let (connections, requests) = (Arc::clone(&connections), Arc::clone(&requests));
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { continue };
+                    connections.fetch_add(1, Ordering::SeqCst);
+                    let (routes, requests) = (Arc::clone(&routes), Arc::clone(&requests));
+                    std::thread::spawn(move || {
+                        let mut stream = stream;
+                        let Some(line) = read_request_line(&mut stream) else {
+                            return;
+                        };
+                        requests.lock().expect("lock").push(line.clone());
+                        let path = line.split(' ').nth(1).unwrap_or("");
+                        let path = path.split('?').next().unwrap_or("");
+                        match routes.iter().find(|(p, _)| p == path) {
+                            Some((_, reply)) => respond(stream, reply),
+                            None => respond(stream, &Reply::status(404)),
+                        }
+                    });
+                }
+            });
+        }
+        Self {
+            base: FeedBase::parse(&format!("http://{addr}")).expect("base"),
+            addr,
+            connections,
+            requests,
+        }
+    }
+
+    pub fn connections(&self) -> usize {
+        self.connections.load(Ordering::SeqCst)
+    }
+
+    /// 受けた要求の 1 行目。
+    pub fn request_lines(&self) -> Vec<String> {
+        self.requests.lock().expect("lock").clone()
     }
 }
 

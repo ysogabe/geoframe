@@ -447,9 +447,11 @@ name = "geoframe-export"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "jpeg-encoder",
  "libc",
  "serde_json",
  "ureq",
+ "zune-jpeg",
 ]
 
 [[package]]
