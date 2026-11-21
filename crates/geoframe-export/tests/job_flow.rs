@@ -959,6 +959,123 @@ fn unreadable_records_block_new_jobs_and_are_never_overwritten_or_pruned() {
     assert_eq!(submit_and_wait(&svc, &day())["status"], "succeeded");
 }
 
+/// 公開の途中（`publishing`）で止まったジョブの記録を、検証済みの MD5 つきで書く。`digests_json` で、記録の中の `digests` を
+/// そのまま差し替える（`None` はキーを省く）。
+fn publishing_record_with_digests(
+    env: &Env,
+    n: u32,
+    folder_id: &str,
+    set: &Set,
+    digests_json: Option<Value>,
+) -> std::path::PathBuf {
+    let rec = running_record(
+        env,
+        n,
+        Some(Progress {
+            stage: Stage::Publishing,
+            old_id: None,
+            incoming_id: Some(folder_id.to_owned()),
+            digests: Some(set.recorded()),
+        }),
+    );
+    let path = JobStore::open(&env.state).unwrap().record_path(&rec.job_id);
+    let mut v: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let progress = v["progress"].as_object_mut().unwrap();
+    match digests_json {
+        Some(d) => progress.insert("digests".into(), d),
+        None => progress.remove("digests"),
+    };
+    std::fs::write(&path, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn a_null_or_malformed_digests_in_the_job_record_blocks_instead_of_skipping_the_md5_check() {
+    // 公開の記録がまだ無い（同じフォルダ ID の行が無い）復旧で、ジョブの記録の `digests` が `null`（書き手は MD5 が無いときキーごと
+    // 省く）や型の違う値になっている。これを旧形式として読むと、止まっている間に写真が同じ名前・同じ大きさのまま書き換えられて
+    // いても MD5 の照合を飛ばして公開済みにしてしまう。記録の破損として読めないものにし（`blocked`）、何にも触れない
+    for (name, bad) in [
+        ("null", Value::Null),
+        ("string", json!("x")),
+        ("empty", json!([])),
+        (
+            "no-manifest",
+            json!([{"path": "a.jpg", "md5": "1".repeat(32)}]),
+        ),
+    ] {
+        let mut env = Env::new(&format!("rec-digests-{name}"));
+        let set = env.make_set("s", Y, DAY, &[("090000_1.jpg", 100)]);
+        let id = env.seed_folder(Y, DAY, &set);
+        // 止まっている間の書き換え（同じ名前・同じ大きさのまま、MD5 だけ変わった）
+        {
+            let mut d = env.drive();
+            let p = d.resolve(&[Y.as_str(), DAY]).unwrap();
+            let photo = d
+                .children(&p)
+                .iter()
+                .find(|n| n.name == "090000_1.jpg")
+                .unwrap()
+                .id
+                .clone();
+            d.set_md5(&photo, &"f".repeat(32));
+            env.save(&d);
+        }
+        let site = photo_site(DAY, DAY, three_photos());
+        let svc = service(&mut env, &site);
+        let path = publishing_record_with_digests(&env, 31, &id, &set, Some(bad));
+        let record_before = std::fs::read(&path).unwrap();
+        let drive_before = env.drive().to_json();
+
+        let report = startup_recovery_retry(&svc);
+        // 読めない記録は、復旧の対象にならず、次の書き出しを止める
+        match report {
+            StartupReport::Done { recovery, .. } => {
+                assert_eq!(recovery.recovered, 0, "{name}");
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+        assert!(
+            matches!(svc.blocking(), Some(Blocking::UnreadableRecord(_))),
+            "{name}: {:?}",
+            svc.blocking()
+        );
+        assert!(
+            matches!(
+                submit_retry(&svc, &day()),
+                Err(SubmitError::Blocked(Blocking::UnreadableRecord(_)))
+            ),
+            "{name}"
+        );
+        // 記録・公開の記録・Drive は変わらない
+        assert_eq!(std::fs::read(&path).unwrap(), record_before, "{name}");
+        assert!(!env.state.join("published").exists(), "{name}");
+        assert_eq!(env.drive().to_json(), drive_before, "{name}");
+        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+        assert_eq!(svc.lookup(&format!("{:032x}", 31)), Lookup::Unreadable);
+    }
+
+    // 対照: キーが無い（MD5 を残す前の古い記録）は読め、復旧は進む（MD5 の無い公開の記録になり、次の replace は断られる）
+    let mut env = Env::new("rec-digests-absent");
+    let set = env.make_set("s", Y, DAY, &[("090000_1.jpg", 100)]);
+    let id = env.seed_folder(Y, DAY, &set);
+    let site = photo_site(DAY, DAY, three_photos());
+    let svc = service(&mut env, &site);
+    publishing_record_with_digests(&env, 32, &id, &set, None);
+    match startup_recovery_retry(&svc) {
+        StartupReport::Done { recovery, .. } => {
+            assert_eq!((recovery.recovered, recovery.blocked), (1, false));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(svc.blocking().is_none());
+    let row = env
+        .published
+        .find(Y, &geoframe_export::folder::FolderName::parse(DAY).unwrap())
+        .unwrap();
+    assert_eq!(row.folder_id, id);
+    assert_eq!(row.files, None);
+}
+
 #[test]
 fn blocked_records_are_not_pruned_and_resolved_ones_free_the_service() {
     let mut env = Env::new("rec-resolved");

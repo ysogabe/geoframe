@@ -1394,6 +1394,67 @@ fn a_rewrite_right_after_the_published_record_was_updated_is_blocked_by_the_reco
 }
 
 #[test]
+fn when_the_published_row_and_the_job_record_disagree_on_md5_the_row_wins() {
+    // 公開の記録の行（同じフォルダ ID）とジョブの記録に、違う MD5 が入っているとき、照らすのは行の MD5。
+    // 行が正しければ（宛先の中身と一致）、ジョブの記録の MD5 が違っていても進み、行が違っていれば（ジョブの記録が宛先と一致していても）
+    // blocked にする。行がジョブの記録より先に書かれた、より新しい記録なので
+    let different = {
+        let mut v = world("digest-precedence-probe").set.recorded();
+        v[0].md5 = "e".repeat(32);
+        v
+    };
+    for (name, row_is_right) in [("row-right", true), ("row-wrong", false)] {
+        let (w, old, inc) = replaced_world(&format!("digest-precedence-{name}"));
+        let truth = w.set.recorded();
+        let mut wrong = truth.clone();
+        wrong[0].md5 = different[0].md5.clone();
+        assert_ne!(truth, wrong);
+        let (row_files, job_files) = if row_is_right {
+            (truth.clone(), wrong.clone())
+        } else {
+            (wrong.clone(), truth.clone())
+        };
+        w.env
+            .published
+            .upsert(geoframe_export::published::PublishedRecord {
+                destination: Y,
+                folder: FolderName::parse(FOLDER).unwrap(),
+                folder_id: inc.clone(),
+                job_id: geoframe_export::jobid::JobId::parse(JOB_A).unwrap(),
+                files: Some(row_files),
+                previous: Some(Box::new(geoframe_export::published::PreviousFolder {
+                    folder_id: old.clone(),
+                    files: truth.clone(),
+                })),
+            })
+            .unwrap();
+        let before = std::fs::read(row_file(&w)).unwrap();
+        let r = w.env.rclone();
+        let p = Progress {
+            digests: Some(job_files),
+            ..progress(Stage::Trashing, Some(&old), Some(&inc))
+        };
+        let res = w.recovery(&r, None).run(&p, false, &mut Hook::new(&w.env));
+        if row_is_right {
+            assert!(
+                matches!(res, Ok(Resolution::Published(_))),
+                "{name}: {res:?}"
+            );
+            assert_eq!(w.env.drive().trashed, [old], "{name}");
+        } else {
+            assert_eq!(
+                res.unwrap_err().reason,
+                BlockedReason::ContentMismatch,
+                "{name}"
+            );
+            assert_eq!(std::fs::read(row_file(&w)).unwrap(), before, "{name}");
+            assert!(w.env.drive().trashed.is_empty(), "{name}");
+            assert!(w.env.rclone_calls("purge").is_empty(), "{name}");
+        }
+    }
+}
+
+#[test]
 fn a_new_destination_rewritten_while_stopped_is_blocked_too() {
     // 新規（置き換えでない）: ジョブの記録は publishing、宛先は incoming の ID のフォルダ。書き換えられていれば blocked
     let w = world("digest-new");

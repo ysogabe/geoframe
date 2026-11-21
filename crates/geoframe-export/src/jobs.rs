@@ -199,9 +199,11 @@ fn progress_from_json(v: &Value) -> Option<Progress> {
         stage: Stage::parse(v.get("stage")?.as_str()?)?,
         old_id: id("old_id")?,
         incoming_id: id("incoming_id")?,
-        // 無い（MD5 を残す前の古い記録・退避より前の段階）は `None`。あって形が崩れていれば、記録を読めないものにする
+        // キーが無いこと（MD5 を残す前の古い記録・退避より前の段階。書き手はこのとき、キーごと省く）だけを `None` として読む。
+        // あって形が崩れていれば（`null`・型の違う値を含む）、記録を読めないものにする。`null` を旧形式として受け入れると、
+        // 壊れた記録が MD5 の照合を飛ばす経路になる
         digests: match v.get("digests") {
-            None | Some(Value::Null) => None,
+            None => None,
             Some(d) => Some(crate::published::parse_files(d)?),
         },
     })
@@ -572,14 +574,53 @@ pub struct JobStore {
 
 /// 実在するディレクトリ（リンクでない）で、なければ 0700 で作る。
 pub(crate) fn ensure_dir(path: &Path, what: &'static str) -> Result<(), ExportError> {
+    match dir_state(path) {
+        DirState::Real => Ok(()),
+        DirState::Bad => Err(internal(what)),
+        DirState::Absent => {
+            DirBuilder::new()
+                .mode(0o700)
+                .create(path)
+                .map_err(|_| internal(what))?;
+            // 作ったことを親のディレクトリに永続させる（電源断のあとに、ディレクトリごと消えて見えなくならないように）
+            sync_parent(path).map_err(|_| internal(what))
+        }
+    }
+}
+
+/// `path` の親ディレクトリを `fsync` する（`path` を作った・置いた直後に）。
+fn sync_parent(path: &Path) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "親ディレクトリがありません",
+            )
+        })?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
+/// [`dir_state`] の結果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirState {
+    /// 無い。
+    Absent,
+    /// 実在するディレクトリ（リンクでない）で、このプロセスのユーザーのもの。
+    Real,
+    /// ほかのもの（リンク・通常のファイル・ほかのユーザーのディレクトリ・調べられない）。
+    Bad,
+}
+
+/// 状態ディレクトリの下のディレクトリ（`jobs/`・`staging/`・`published/`）の検査。書くとき（[`ensure_dir`]）と読むときで
+/// 同じ検査を使う（読むときの `O_NOFOLLOW` は末尾のファイルにしか効かず、ディレクトリがリンクなら、リンク先の JSON を読めてしまうため）。
+pub(crate) fn dir_state(path: &Path) -> DirState {
     match std::fs::symlink_metadata(path) {
-        Ok(m) if m.is_dir() && m.uid() == sys::euid() => Ok(()),
-        Ok(_) => Err(internal(what)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DirBuilder::new()
-            .mode(0o700)
-            .create(path)
-            .map_err(|_| internal(what)),
-        Err(_) => Err(internal(what)),
+        Ok(m) if m.is_dir() && m.uid() == sys::euid() => DirState::Real,
+        Ok(_) => DirState::Bad,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DirState::Absent,
+        Err(_) => DirState::Bad,
     }
 }
 
@@ -862,8 +903,12 @@ mod tests {
         old["progress"].as_object_mut().unwrap().remove("digests");
         let back = JobRecord::from_file_json(&old, &id(1)).unwrap();
         assert_eq!(back.progress.unwrap().digests, None);
-        // 形が崩れていれば、記録を読めないものにする（空・パスや MD5 の形・manifest.json が無い）
+        // 形が崩れていれば、記録を読めないものにする（`null`・空・パスや MD5 の形・manifest.json が無い）。
+        // `null` を旧形式として読むと、壊れた記録が MD5 の照合を飛ばす経路になる（旧形式はキーが無いことだけ）
         for bad in [
+            Value::Null,
+            json!("x"),
+            json!(1),
             json!([]),
             json!({}),
             json!([{"path": "manifest.json", "md5": "short"}]),

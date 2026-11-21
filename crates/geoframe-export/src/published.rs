@@ -189,6 +189,11 @@ impl PublishedStore {
 
     /// 宛先の記録を読む。
     pub fn load(&self, destination: Destination, folder: &FolderName) -> Loaded {
+        // `published/` 自体の検査は書くとき（`upsert`）と同じ。リンクなら、リンク先に有効な JSON があっても読まない
+        // （読むときの `O_NOFOLLOW` は末尾のファイルにしか効かない）。無ければ「記録が無い」（ファイルの読みで `NotFound`）
+        if crate::jobs::dir_state(&self.dir) == crate::jobs::DirState::Bad {
+            return Loaded::Unreadable;
+        }
         match jsonfile::read_json(&self.path_of(destination, folder), MAX_BYTES) {
             Ok(v) => match parse_file(&v) {
                 // 中身の種類・フォルダ名がファイル名と違うものは、別の宛先の記録を取り違えるので読めないものにする
@@ -564,6 +569,61 @@ mod tests {
             store.find_id(Destination::Yamareco, &f).as_deref(),
             Some("idA")
         );
+    }
+
+    #[test]
+    fn a_published_directory_that_is_a_link_is_unreadable_even_when_the_target_holds_a_valid_record()
+     {
+        let d = Dir::new("dirlink");
+        let f = folder("2030-03-10");
+        // 実在のディレクトリ（`elsewhere/`）に有効な記録を置き、`published` をそこへのリンクにする
+        let real = PublishedStore::in_state_dir(&d.0.join("elsewhere-parent"));
+        std::fs::create_dir_all(real.dir()).unwrap();
+        real.upsert(rec(Destination::Yamareco, "2030-03-10", "idA"))
+            .unwrap();
+        assert!(real.find(Destination::Yamareco, &f).is_some());
+        std::os::unix::fs::symlink(real.dir(), d.0.join("published")).unwrap();
+
+        let store = PublishedStore::in_state_dir(&d.0);
+        // リンク先のファイルは読めるが（`O_NOFOLLOW` は末尾にしか効かない）、ディレクトリの検査で読めないものにする
+        assert!(
+            store
+                .dir()
+                .join("yamareco-2030-03-10.json")
+                .metadata()
+                .is_ok()
+        );
+        assert_eq!(store.load(Destination::Yamareco, &f), Loaded::Unreadable);
+        assert_eq!(store.find(Destination::Yamareco, &f), None);
+        assert_eq!(store.find_id(Destination::Yamareco, &f), None);
+        // 書くのも断る（リンク先の記録はそのまま）
+        assert!(
+            store
+                .upsert(rec(Destination::Yamareco, "2030-03-10", "idZ"))
+                .is_err()
+        );
+        assert_eq!(
+            real.find_id(Destination::Yamareco, &f).as_deref(),
+            Some("idA")
+        );
+        // 通常のファイルが `published` の場所にあるときも同じ
+        let d2 = Dir::new("dirfile");
+        std::fs::write(d2.0.join("published"), b"x").unwrap();
+        let store = PublishedStore::in_state_dir(&d2.0);
+        assert_eq!(store.load(Destination::Yamareco, &f), Loaded::Unreadable);
+    }
+
+    #[test]
+    fn a_missing_published_directory_means_no_record_and_upsert_creates_it() {
+        let d = Dir::new("nodir");
+        let store = PublishedStore::in_state_dir(&d.0);
+        let f = folder("2030-03-10");
+        assert!(!store.dir().exists());
+        assert_eq!(store.load(Destination::Yamareco, &f), Loaded::Absent);
+        store
+            .upsert(rec(Destination::Yamareco, "2030-03-10", "idA"))
+            .unwrap();
+        assert!(store.dir().is_dir());
     }
 
     fn wrap(entry: &str) -> String {
