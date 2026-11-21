@@ -767,11 +767,12 @@ impl Rclone {
             None => Err(RunError::Exit(-1)),
         };
         if let Err(e) = &result {
-            // 失敗のときだけ、伏せ字にした標準エラーの末尾を残す（出力は API の結果には載せない）
+            // 失敗のときは、コマンド名と失敗の分類（終了コード・期限・キャンセル）と、標準エラーの行数だけを残す。標準エラーの
+            // 中身はログにも API の結果にも出さない（伏せ字の語に当たらない行にも、Drive の ID やパスが入るため）
             tracing::warn!(
                 command = sub,
                 failure = ?e,
-                stderr = %stderr_text,
+                stderr_lines = stderr_text.lines().count(),
                 "rclone が失敗しました"
             );
         }

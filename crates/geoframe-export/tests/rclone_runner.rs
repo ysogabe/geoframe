@@ -393,12 +393,15 @@ impl tracing::Subscriber for Capture {
 }
 
 #[test]
-fn stderr_lines_with_tokens_are_masked_in_the_log_and_never_reach_the_error() {
+fn stderr_lines_never_reach_the_log_or_the_error() {
+    // 標準エラーの中身は、伏せ字の語に当たらない行（Drive の ID やパス）も含めて、ログにもエラーにも出さない。
+    // ログに残るのは、コマンド名・失敗の分類・行数だけ
     let env = Env::new("redact");
     let secret_lines = [
         "ERROR : auth failed: access_token=ya29.SECRETVALUE",
         "Authorization: Bearer abcdefSECRET",
         "refresh TOKEN expired SECRETTOKEN2",
+        "ERROR : File not found: fidPLAINDRIVEID123",
     ];
     let stderr = format!(
         "first plain line\n{}\nlast plain line",
@@ -415,22 +418,16 @@ fn stderr_lines_with_tokens_are_masked_in_the_log_and_never_reach_the_error() {
     let err = geoframe_export::drive::Drive::new(&env.rclone(), &layout)
         .target()
         .unwrap_err();
-    // エラーは固定の説明（rclone の出力は載らない）
     let shown = format!("{err} {err:?}");
-    for bad in ["SECRET", "Bearer", "access_token", "plain line"] {
+    for bad in ["SECRET", "Bearer", "access_token", "plain line", "fidPLAIN"] {
         assert!(!shown.contains(bad), "{shown}");
     }
     let all = LOGS.lock().unwrap().clone();
-    let ours: Vec<&String> = all
-        .iter()
-        .filter(|l| l.contains("first plain line"))
-        .collect();
-    assert_eq!(ours.len(), 1, "{all:?}");
-    let logged = ours[0];
-    assert!(logged.contains("rclone が失敗しました"), "{logged}");
-    assert!(logged.contains("[伏せ字]"), "{logged}");
-    assert!(logged.contains("last plain line"), "{logged}");
-    // どのログにも、秘密に見える語は出ていない
+    assert!(
+        all.iter()
+            .any(|l| l.contains("rclone が失敗しました") && l.contains("stderr_lines")),
+        "{all:?}"
+    );
     for line in &all {
         for bad in [
             "SECRET",
@@ -438,7 +435,8 @@ fn stderr_lines_with_tokens_are_masked_in_the_log_and_never_reach_the_error() {
             "access_token",
             "ya29",
             "TOKEN expired",
-            "secret-looking",
+            "plain line",
+            "fidPLAINDRIVEID",
         ] {
             assert!(!line.contains(bad), "{bad}: {line}");
         }
@@ -446,8 +444,7 @@ fn stderr_lines_with_tokens_are_masked_in_the_log_and_never_reach_the_error() {
 }
 
 #[test]
-fn a_very_long_stderr_line_that_starts_with_a_bearer_token_is_masked_as_a_whole() {
-    // 末尾の 64KiB だけを先に切り出して検査すると、先頭の `Bearer` が切れて、残り（資格情報の本体）が出る
+fn a_very_long_stderr_line_never_reaches_the_log() {
     let env = Env::new("redact-long");
     let body = "LONGSECRETBODY".repeat(20_000); // 約 280KB の 1 行
     let stderr = format!("Authorization: Bearer {body}\nlong-case tail marker line");
@@ -463,15 +460,9 @@ fn a_very_long_stderr_line_that_starts_with_a_bearer_token_is_masked_as_a_whole(
         .target()
         .unwrap_err();
     let all = LOGS.lock().unwrap().clone();
-    let ours: Vec<&String> = all
-        .iter()
-        .filter(|l| l.contains("long-case tail marker line"))
-        .collect();
-    assert_eq!(ours.len(), 1, "{}", all.len());
-    assert!(ours[0].contains("[伏せ字]"), "{}", ours[0]);
     for line in &all {
         assert!(
-            !line.contains("LONGSECRET"),
+            !line.contains("LONGSECRET") && !line.contains("long-case tail marker"),
             "{}",
             &line[..line.len().min(200)]
         );
