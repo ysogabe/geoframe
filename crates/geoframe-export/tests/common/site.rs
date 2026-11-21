@@ -220,3 +220,17 @@ pub fn dry_run_retry(
         }
     }
 }
+
+/// 実行枠が空くまで待って起動時の復旧を行う（`Skipped` を確かめる試験では使わない）。
+pub fn startup_recovery_retry(svc: &Service) -> geoframe_export::service::StartupReport {
+    use geoframe_export::service::StartupReport;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match svc.startup_recovery() {
+            StartupReport::Skipped if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            other => return other,
+        }
+    }
+}

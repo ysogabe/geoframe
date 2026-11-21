@@ -155,6 +155,12 @@ fn show(settings: &Settings, store: &JobStore, out: &mut dyn Write) -> u8 {
                     match recovery.explain(progress) {
                         Ok((_, _, text)) => {
                             let _ = writeln!(out, "  Drive の今の状態と、表のとおりの動き: {text}");
+                            if rec.is_blocking() {
+                                let _ = writeln!(
+                                    out,
+                                    "  （blocked のジョブは自動では動かしません。上の動きは参考で、Drive を確かめて解除してください）"
+                                );
+                            }
                         }
                         Err(e) => {
                             let _ = writeln!(

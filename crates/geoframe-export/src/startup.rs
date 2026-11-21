@@ -6,7 +6,8 @@
 //! - rclone の設定ファイルが、専用の client_id・client_secret を持ち、持ち主・権限が正しいこと
 //!   （[`crate::rclone_conf`]。rclone の共用の client_id を使わせないため）
 //!
-//! 後のタスクで、状態ディレクトリ・トークンのファイル（T5・T6）の検査をここに足す。
+//! 状態ディレクトリの用意（`jobs/`・`staging/`。0700。リンクでない実ディレクトリで、自分の持ち物）は、ジョブを扱う側
+//! （[`crate::jobs::JobStore::open`]。`run`・`recover`・`serve` が通る）が行う。トークンのファイルの検査は T6 がここに足す。
 
 use crate::rclone_conf::{self, ConfigError};
 use crate::settings::Settings;

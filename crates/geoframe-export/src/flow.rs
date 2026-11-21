@@ -123,7 +123,9 @@ impl JobHandle {
                 "ジョブの終わりの記録を書けませんでした（次の復旧が片付けます）"
             );
         }
-        self.store.prune();
+        // いま終えたジョブの記録は、同じ時刻の記録が多くても消さない
+        self.store
+            .prune_keeping(crate::jobs::KEEP_FINISHED, Some(&self.record.job_id));
     }
 }
 

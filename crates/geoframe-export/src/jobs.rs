@@ -8,7 +8,7 @@
 //!
 //! `job_id`・`status`（`running`・`succeeded`・`conflict`・`failed`・`interrupted`・`blocked`）・要求（`from`・`to`・
 //! `destination`・`on_exists`・`request_id`）・`started_at`/`finished_at`（`2026-01-12T19:30:00+09:00` のような時差つきの
-//! RFC 3339）・`started_unix`（並べ替えと間引きの順を決める数値の時刻。文字列の比較では決めない）・段階（`progress`。
+//! RFC 3339）・`started_ns`（並べ替えと間引きの順を決める、ナノ秒の UNIX 時刻。文字列の比較では決めない。同じ値は `job_id` で決める）・段階（`progress`。
 //! [`crate::publish::ProgressSink`] の実装が書く）・`summary`（公開の前に分かった数。起動時の復旧が、止まったジョブを
 //! 成功にするときの結果に使う）・`result`（6.1 の形）・`error`（コードだけ。説明は固定の短い文を [`ErrorCode::message`] から
 //! 作る。rclone の出力は入れない）・`blocked`（`blocked` にしたときの理由と、`recover` が出す説明）・`resolved_at`
@@ -164,7 +164,8 @@ pub struct JobRecord {
     pub status: Status,
     pub request: RequestInfo,
     pub started_at: String,
-    pub started_unix: i64,
+    /// 並べ替えの鍵（UNIX 時刻のナノ秒）。
+    pub started_ns: i64,
     pub finished_at: Option<String>,
     /// 最後に記録できた段階と ID。
     pub progress: Option<Progress>,
@@ -221,13 +222,13 @@ fn opt_object(v: &Value, key: &str) -> Option<Option<Value>> {
 impl JobRecord {
     /// 受け付けたばかりの記録（`running`。段階なし）。
     pub fn new(job_id: JobId, request: &ExportRequest) -> Self {
-        let now = sys::unix_now();
+        let now = sys::unix_now_nanos();
         Self {
             job_id,
             status: Status::Running,
             request: RequestInfo::from_request(request),
-            started_at: sys::rfc3339_local(now),
-            started_unix: now,
+            started_at: sys::rfc3339_local(now.div_euclid(1_000_000_000)),
+            started_ns: now,
             finished_at: None,
             progress: None,
             summary: None,
@@ -256,7 +257,7 @@ impl JobRecord {
 
     /// 並べ替えの鍵（新しいほうが大きい。同値は `job_id`）。
     fn order_key(&self) -> (i64, &str) {
-        (self.started_unix, self.job_id.as_str())
+        (self.started_ns, self.job_id.as_str())
     }
 
     pub fn to_file_json(&self) -> Value {
@@ -266,7 +267,7 @@ impl JobRecord {
             "status": self.status.as_str(),
             "request": self.request.to_file_json(),
             "started_at": self.started_at,
-            "started_unix": self.started_unix,
+            "started_ns": self.started_ns,
             "finished_at": self.finished_at,
             "progress": self.progress.as_ref().map(progress_json),
             "summary": self.summary,
@@ -330,7 +331,7 @@ impl JobRecord {
             status: Status::parse(v.get("status")?.as_str()?)?,
             request: RequestInfo::from_file_json(v.get("request")?)?,
             started_at: started_at.to_owned(),
-            started_unix: v.get("started_unix")?.as_i64()?,
+            started_ns: v.get("started_ns")?.as_i64()?,
             finished_at: opt_time(v, "finished_at")?,
             progress,
             summary: opt_object(v, "summary")?,
@@ -552,15 +553,16 @@ impl JobStore {
     /// 終わった記録を、新しいほうから [`KEEP_FINISHED`] 件だけ残す。未完了・解除していない `blocked`・読めない記録は消さない。
     /// 消せなくても失敗にはしない（次の機会にまた試す）。
     pub fn prune(&self) {
-        self.prune_keeping(KEEP_FINISHED);
+        self.prune_keeping(KEEP_FINISHED, None);
     }
 
-    #[doc(hidden)]
-    pub fn prune_keeping(&self, keep: usize) {
+    /// [`JobStore::prune`] の、残す数と、**消さない記録**（`protect`。いま終えたばかりのジョブ。同じ時刻の記録が多くても、
+    /// 終えたばかりの記録を消さない）を指定できる形。
+    pub fn prune_keeping(&self, keep: usize, protect: Option<&JobId>) {
         let scan = self.scan();
         let finished = scan.records.iter().filter(|r| r.is_finished());
         for (i, rec) in finished.enumerate() {
-            if i >= keep {
+            if i >= keep && protect != Some(&rec.job_id) {
                 let _ = std::fs::remove_file(self.path_of(&rec.job_id));
             }
         }
@@ -646,7 +648,7 @@ mod tests {
     fn record(n: u32, status: Status, unix: i64) -> JobRecord {
         let mut r = JobRecord::new(id(n), &request(None));
         r.status = status;
-        r.started_unix = unix;
+        r.started_ns = unix;
         r
     }
 
@@ -684,7 +686,7 @@ mod tests {
         for (key, value) in [
             ("version", json!(2)),
             ("status", json!("done")),
-            ("started_unix", json!("x")),
+            ("started_ns", json!("x")),
             ("started_at", json!("rm -rf")),
             ("error", json!({"code": "interrupted"})),
             (
@@ -780,6 +782,23 @@ mod tests {
         assert!(!kept.contains(&id(102).to_string()), "解除済みは間引く");
         assert_eq!(scan.unreadable.len(), 1, "読めない記録は消さない");
         assert!(d.0.join("jobs/notes.txt").exists());
+    }
+
+    #[test]
+    fn pruning_never_removes_the_record_just_finished_even_with_many_in_the_same_instant() {
+        let d = Dir::new("protect");
+        let store = JobStore::open(&d.0).unwrap();
+        // 同じ時刻の記録が 51 件。job_id が最も小さい（並びでは最後の）ものが、いま終えたジョブ
+        for n in 1..=51u32 {
+            store.write(&record(n, Status::Succeeded, 7)).unwrap();
+        }
+        store.prune_keeping(KEEP_FINISHED, Some(&id(1)));
+        let scan = store.scan();
+        assert_eq!(scan.records.len(), 51, "保護した 1 件は、50 件の外でも残る");
+        assert!(scan.records.iter().any(|r| r.job_id == id(1)));
+        store.prune_keeping(KEEP_FINISHED, None);
+        assert_eq!(store.scan().records.len(), 50);
+        assert!(!store.scan().records.iter().any(|r| r.job_id == id(1)));
     }
 
     #[test]

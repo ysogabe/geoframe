@@ -468,7 +468,7 @@ fn only_the_newest_finished_records_are_kept() {
     let store = JobStore::open(&env.state).unwrap();
     let mut blocked = JobRecord::new(JobId::parse(&format!("{:032x}", 9_000)).unwrap(), &day());
     blocked.status = Status::Blocked;
-    blocked.started_unix = 1;
+    blocked.started_ns = 1;
     blocked.resolved_at = Some("2030-01-01T00:00:00+09:00".into());
     store.write(&blocked).unwrap();
     let mut last = None;
@@ -651,7 +651,7 @@ fn a_publish_that_cannot_be_recorded_leaves_a_note_but_still_succeeds() {
 fn running_record(env: &Env, n: u32, progress: Option<Progress>) -> JobRecord {
     let store = JobStore::open(&env.state).unwrap();
     let mut rec = JobRecord::new(JobId::parse(&format!("{n:032x}")).unwrap(), &day());
-    rec.started_unix -= i64::from(1000 - n);
+    rec.started_ns -= i64::from(1000 - n) * 1_000_000_000;
     rec.progress = progress;
     store.write(&rec).unwrap();
     rec
@@ -679,7 +679,7 @@ fn a_job_that_stopped_before_touching_drive_becomes_interrupted() {
     };
     assert_eq!(v["status"], "running");
 
-    match svc.startup_recovery() {
+    match startup_recovery_retry(&svc) {
         StartupReport::Done { cleaned, recovery } => {
             assert_eq!(cleaned, 1, "staging/ の残骸を消す");
             assert_eq!((recovery.recovered, recovery.blocked), (1, false));
@@ -715,7 +715,10 @@ fn startup_recovery_follows_the_table_for_uploading_and_for_a_roll_forward() {
             incoming_id: Some(inc.clone()),
         }),
     );
-    assert!(matches!(svc.startup_recovery(), StartupReport::Done { .. }));
+    assert!(matches!(
+        startup_recovery_retry(&svc),
+        StartupReport::Done { .. }
+    ));
     assert_eq!(read_record(&env, &rec.job_id).status, Status::Interrupted);
     assert!(env.drive().trashed.contains(&inc));
     assert!(!drive_has(
@@ -763,7 +766,10 @@ fn startup_recovery_follows_the_table_for_uploading_and_for_a_roll_forward() {
         "excluded": [{"id": 8, "reason": "has_metadata"}], "undated_in_catalog": 1, "invalid_time_in_catalog": 0}),
     );
     JobStore::open(&env.state).unwrap().write(&rec).unwrap();
-    assert!(matches!(svc.startup_recovery(), StartupReport::Done { .. }));
+    assert!(matches!(
+        startup_recovery_retry(&svc),
+        StartupReport::Done { .. }
+    ));
     let after = read_record(&env, &job);
     assert_eq!(after.status, Status::Succeeded);
     let result = after.result.unwrap();
@@ -801,7 +807,7 @@ fn an_unexplainable_state_blocks_everything_until_it_is_resolved() {
             incoming_id: Some("fid-gone".into()),
         }),
     );
-    match svc.startup_recovery() {
+    match startup_recovery_retry(&svc) {
         StartupReport::Done { recovery, .. } => assert!(recovery.blocked),
         other => panic!("{other:?}"),
     }
@@ -841,7 +847,10 @@ fn an_unexplainable_state_blocks_everything_until_it_is_resolved() {
     );
 
     // いったん blocked になったジョブは、自動では動かさない（もう一度復旧しても変わらない）
-    assert!(matches!(svc.startup_recovery(), StartupReport::Done { .. }));
+    assert!(matches!(
+        startup_recovery_retry(&svc),
+        StartupReport::Done { .. }
+    ));
     assert_eq!(read_record(&env, &job).status, Status::Blocked);
     assert!(env.calls().iter().all(|c| c["kind"] != "hook"));
 }
@@ -920,7 +929,7 @@ fn blocked_records_are_not_pruned_and_resolved_ones_free_the_service() {
     let store = JobStore::open(&env.state).unwrap();
     let mut b = JobRecord::new(JobId::parse(&format!("{:032x}", 8)).unwrap(), &day());
     b.status = Status::Blocked;
-    b.started_unix = 1;
+    b.started_ns = 1;
     b.blocked = Some(BlockedNote {
         reason: "unobservable".into(),
         description: "d".into(),
@@ -960,7 +969,10 @@ fn an_incoming_folder_whose_id_was_never_recorded_is_left_and_reported_not_delet
             incoming_id: None,
         }),
     );
-    assert!(matches!(svc.startup_recovery(), StartupReport::Done { .. }));
+    assert!(matches!(
+        startup_recovery_retry(&svc),
+        StartupReport::Done { .. }
+    ));
     let rec = read_record(&env, &job);
     assert_eq!(rec.status, Status::Interrupted);
     assert!(
@@ -981,4 +993,169 @@ fn an_incoming_folder_whose_id_was_never_recorded_is_left_and_reported_not_delet
     };
     assert_eq!(v["status"], "interrupted");
     assert!(v["notes"][0].as_str().unwrap().contains(&inc));
+}
+
+#[test]
+fn startup_recovery_finishes_a_published_job_and_a_pending_trash_and_ends_an_aborting_one() {
+    let site_rows = three_photos();
+
+    // publishing（新規）で、宛先がもう incoming の ID のフォルダになっている → 公開済み。公開の記録に足す
+    let mut env = Env::new("rec-published");
+    let set = env.make_set("s", Y, DAY, &[("090000_1.jpg", 100)]);
+    let inc = env.seed_folder(Y, DAY, &set);
+    let site = photo_site(DAY, DAY, site_rows.clone());
+    let svc = service(&mut env, &site);
+    let rec = running_record(
+        &env,
+        20,
+        Some(Progress {
+            stage: Stage::Publishing,
+            old_id: None,
+            incoming_id: Some(inc.clone()),
+        }),
+    );
+    assert!(matches!(
+        startup_recovery_retry(&svc),
+        StartupReport::Done { .. }
+    ));
+    let after = read_record(&env, &rec.job_id);
+    assert_eq!(after.status, Status::Succeeded);
+    assert_eq!(after.result.as_ref().unwrap()["uploaded"], true);
+    assert_eq!(after.result.as_ref().unwrap()["replaced"], false);
+    assert_eq!(
+        env.published
+            .find_id(Y, &geoframe_export::folder::FolderName::parse(DAY).unwrap()),
+        Some(inc)
+    );
+    assert!(env.drive().trashed.is_empty());
+
+    // trashing で、旧フォルダがまだ replaced/ にある → ゴミ箱への移動をやり直して成功
+    let mut env = Env::new("rec-trashing");
+    let old_set = env.make_set("old", Y, DAY, &[("090000_9.jpg", 50)]);
+    let new_set = env.make_set("new", Y, DAY, &[("090000_1.jpg", 100)]);
+    let job = JobId::parse(&format!("{:032x}", 21)).unwrap();
+    let old_id = env.seed_managed(Y, DAY, &old_set);
+    let layout = env.layout(Y, DAY, job.as_str());
+    let mut d = env.drive();
+    assert!(d.move_dir(
+        &old_id,
+        &[
+            "geoframe-export-work".to_owned(),
+            "replaced".to_owned(),
+            layout.retired_name().to_owned()
+        ]
+    ));
+    env.save(&d);
+    let new_id = env.seed_folder(Y, DAY, &new_set);
+    let site = photo_site(DAY, DAY, site_rows.clone());
+    let svc = service(&mut env, &site);
+    let mut rec = JobRecord::new(job.clone(), &request(DAY, None, Some("replace"), None));
+    rec.progress = Some(Progress {
+        stage: Stage::Trashing,
+        old_id: Some(old_id.clone()),
+        incoming_id: Some(new_id.clone()),
+    });
+    JobStore::open(&env.state).unwrap().write(&rec).unwrap();
+    assert!(matches!(
+        startup_recovery_retry(&svc),
+        StartupReport::Done { .. }
+    ));
+    let after = read_record(&env, &job);
+    assert_eq!(after.status, Status::Succeeded, "{after:?}");
+    assert_eq!(after.result.as_ref().unwrap()["replaced"], true);
+    assert!(env.drive().trashed.contains(&old_id));
+    assert_eq!(
+        env.drive().resolve(&["yamareco", DAY]),
+        Some(new_id.clone())
+    );
+    assert_eq!(
+        env.published
+            .find_id(Y, &geoframe_export::folder::FolderName::parse(DAY).unwrap()),
+        Some(new_id)
+    );
+
+    // aborting: incoming が残っていれば消し、もう無ければ片付け済みとして、どちらも interrupted
+    for incoming_left in [true, false] {
+        let mut env = Env::new(&format!("rec-aborting-{incoming_left}"));
+        let set = env.make_set("s", Y, DAY, &[("090000_1.jpg", 100)]);
+        let job = JobId::parse(&format!("{:032x}", 22)).unwrap();
+        let inc = if incoming_left {
+            env.seed_set_at(&["geoframe-export-work", "incoming", job.as_str()], &set)
+        } else {
+            "fid-already-gone".to_owned()
+        };
+        let site = photo_site(DAY, DAY, site_rows.clone());
+        let svc = service(&mut env, &site);
+        running_record(
+            &env,
+            22,
+            Some(Progress {
+                stage: Stage::Aborting,
+                old_id: None,
+                incoming_id: Some(inc.clone()),
+            }),
+        );
+        assert!(matches!(
+            startup_recovery_retry(&svc),
+            StartupReport::Done { .. }
+        ));
+        assert_eq!(
+            read_record(&env, &job).status,
+            Status::Interrupted,
+            "{incoming_left}"
+        );
+        assert_eq!(env.drive().trashed.contains(&inc), incoming_left);
+        assert!(!drive_has(&env, &["yamareco", DAY]));
+    }
+}
+
+#[test]
+fn a_skipped_startup_recovery_touches_neither_records_nor_staging() {
+    let mut env = Env::new("rec-skipped");
+    let site = photo_site(DAY, DAY, three_photos());
+    let svc = service(&mut env, &site);
+    let rec = running_record(&env, 30, None);
+    std::fs::create_dir_all(env.state.join("staging/in-use")).unwrap();
+    std::fs::write(env.state.join("staging/in-use/a.jpg"), b"x").unwrap();
+    let record_bytes =
+        std::fs::read(env.state.join("jobs").join(format!("{}.json", rec.job_id))).unwrap();
+    let Slot::Got(held) = lock::try_acquire(&env.state).unwrap() else {
+        panic!("取れるはず")
+    };
+    assert_eq!(svc.startup_recovery(), StartupReport::Skipped);
+    assert_eq!(read_record(&env, &rec.job_id).status, Status::Running);
+    assert_eq!(
+        std::fs::read(env.state.join("jobs").join(format!("{}.json", rec.job_id))).unwrap(),
+        record_bytes
+    );
+    assert!(env.state.join("staging/in-use/a.jpg").exists());
+    assert!(env.calls().is_empty());
+    drop(held);
+}
+
+#[test]
+fn the_same_fixture_gives_the_same_manifest() {
+    // 別々の状態ディレクトリ・偽の Drive で同じ要求を流すと、Drive に置かれる manifest.json の中身が同じ（AC11）
+    let mut manifests = Vec::new();
+    for name in ["same-a", "same-b"] {
+        let mut env = Env::new(name);
+        let site = photo_site(DAY, DAY, three_photos());
+        let svc = service(&mut env, &site);
+        let rec = run_foreground_retry(&svc, &day()).unwrap();
+        assert_eq!(rec.status, Status::Succeeded);
+        let d = env.drive();
+        let dest = d.resolve(&["yamareco", DAY]).unwrap();
+        let manifest = d
+            .children(&dest)
+            .into_iter()
+            .find(|n| n.name == "manifest.json")
+            .and_then(|n| n.content.clone())
+            .expect("manifest.json の中身");
+        manifests.push(manifest);
+    }
+    assert_eq!(manifests[0], manifests[1]);
+    let m: Value = serde_json::from_str(&manifests[0]).unwrap();
+    assert_eq!(m["count"], 3);
+    assert_eq!(m["destination"], "yamareco");
+    assert_eq!(m["folder"], DAY);
 }

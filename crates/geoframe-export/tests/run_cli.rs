@@ -69,6 +69,7 @@ fn run_cmd(head: &[&str], env: &Env, site: &FakeSite) -> Out {
     run_args(&command(head, env, site), None)
 }
 
+const SEC: i64 = 1_000_000_000;
 const RUN: &[&str] = &["run", "--from", DAY, "--destination", "yamareco"];
 
 fn three() -> Vec<Value> {
@@ -79,10 +80,17 @@ fn three() -> Vec<Value> {
     ]
 }
 
-/// 実行枠が空くまで待って（`common::site` の理由）、同じコマンドを実行する。「実行中」の試験では使わない。
+/// 実行枠が取れずに終了コード 4 になったら、少し待ってやり直す（`common::site` の理由。ほかの試験の fork が、手放した枠の
+/// fd を一瞬持つことがある）。「実行中」の試験では使わない。
 fn run_free(head: &[&str], env: &Env, site: &FakeSite) -> Out {
-    assert!(slot_is_free(&env.state));
-    run_cmd(head, env, site)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let out = run_cmd(head, env, site);
+        if out.code != 4 || std::time::Instant::now() >= deadline {
+            return out;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
 }
 
 // ---- run ----
@@ -333,7 +341,7 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
     let store = JobStore::open(&env.state).unwrap();
     // 未完了（uploading。incoming は記録済み）、Drive に触れる前、blocked、終わったもの
     let mut running = JobRecord::new(job(2), &common::site::day());
-    running.started_unix -= 30;
+    running.started_ns -= 30 * SEC;
     running.progress = Some(Progress {
         stage: Stage::Uploading,
         old_id: None,
@@ -341,10 +349,10 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
     });
     store.write(&running).unwrap();
     let mut early = JobRecord::new(job(3), &common::site::day());
-    early.started_unix -= 20;
+    early.started_ns -= 20 * SEC;
     store.write(&early).unwrap();
     let mut blocked = JobRecord::new(job(4), &common::site::day());
-    blocked.started_unix -= 10;
+    blocked.started_ns -= 10 * SEC;
     blocked.status = Status::Blocked;
     blocked.progress = Some(Progress {
         stage: Stage::Publishing,

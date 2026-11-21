@@ -44,6 +44,15 @@ pub fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
+/// 今の UNIX 時刻（ナノ秒。ジョブの記録の並べ替えの鍵。2262 年まで `i64` に収まる）。
+pub fn unix_now_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_nanos()).ok())
+        .unwrap_or(0)
+}
+
 /// `secs`（UNIX 時刻）の現地時刻を `YYYY-MM-DDTHH:MM:SS+09:00` の形にする。現地時刻を求められなければ UTC（`+00:00`）。
 // `tm_gmtoff` の型は OS で違う（64 ビットでは i64、32 ビットでは i32）ので、`i64::from` で受ける
 #[allow(clippy::useless_conversion)]
