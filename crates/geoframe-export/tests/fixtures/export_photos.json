@@ -1,0 +1,89 @@
+{
+  "from": "2030-03-10",
+  "to": "2030-03-11",
+  "photos": [
+    {
+      "id": 1,
+      "file": "derivatives/p1.jpg",
+      "title": "架空の朝",
+      "lat": 12.5,
+      "lon": 34.5,
+      "time": "2030-03-10 00:00",
+      "elev": 100.5,
+      "inferred": false
+    },
+    {
+      "id": 6,
+      "file": "derivatives/p6.jpg",
+      "title": "IMG_0006",
+      "lat": 12.6,
+      "lon": 34.6,
+      "time": "2030-03-10 09:00",
+      "elev": null,
+      "inferred": false
+    },
+    {
+      "id": 7,
+      "file": "derivatives/p7.jpg",
+      "title": "IMG_0007",
+      "lat": 12.6,
+      "lon": 34.6,
+      "time": "2030-03-10 09:00",
+      "elev": null,
+      "inferred": false
+    },
+    {
+      "id": 8,
+      "file": "derivatives/p8.jpg",
+      "title": "IMG_0008",
+      "lat": 12.7,
+      "lon": 34.7,
+      "time": "2030-03-10 10:15",
+      "elev": null,
+      "inferred": true
+    },
+    {
+      "id": 9,
+      "file": "derivatives/p9.jpg",
+      "title": "IMG_0009",
+      "lat": null,
+      "lon": null,
+      "time": "2030-03-10 12:00",
+      "elev": null,
+      "inferred": false
+    },
+    {
+      "id": 10,
+      "file": "derivatives/p10.jpg",
+      "title": "IMG_0010",
+      "lat": 12.8,
+      "lon": 34.8,
+      "time": "2030-03-10 13:00",
+      "elev": null,
+      "inferred": false
+    },
+    {
+      "id": 11,
+      "file": "derivatives/p11.jpg",
+      "title": "IMG_0011",
+      "lat": 12.8,
+      "lon": 34.8,
+      "time": "2030-03-10 13:01",
+      "elev": null,
+      "inferred": false
+    },
+    {
+      "id": 4,
+      "file": null,
+      "title": "試験市 試験区",
+      "lat": null,
+      "lon": null,
+      "time": "2030-03-11 23:59",
+      "elev": null,
+      "inferred": false
+    }
+  ],
+  "undated": 2,
+  "invalid_time": 2,
+  "truncated": false
+}

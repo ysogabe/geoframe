@@ -75,13 +75,13 @@ macro_rules! untimed_sql {
     };
 }
 /// 分までの撮影日時の形をしている。
-const TIMED: &str = timed_sql!();
+pub(crate) const TIMED: &str = timed_sql!();
 /// 日時なし（[`TIMED`] でない）。
 const UNTIMED: &str = untimed_sql!();
 /// 海外・不明（`pref` が NULL か空）。`trips` の `places` の「海外・不明」と同じ定義。
 const ABROAD: &str = "(pref IS NULL OR pref = '')";
 /// 除外していない（`hidden` が NULL・0）。
-const VISIBLE: &str = "COALESCE(hidden,0)=0";
+pub(crate) const VISIBLE: &str = "COALESCE(hidden,0)=0";
 /// 日時の順（日時なしは最後）、同じなら ID。
 const ORDER: &str = concat!(
     "CASE WHEN ",

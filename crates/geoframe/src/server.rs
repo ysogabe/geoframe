@@ -844,6 +844,14 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 "/api/admin/library/points",
             );
         }
+        // note 記事用の書き出しの一覧（`crate::admin_export`）。これも完全一致（`/api/admin/export/photosX` や末尾 `/` は
+        // 静的配信の判定に回って 403）
+        if path == "/api/admin/export/photos" {
+            return labeled(
+                crate::admin_export::photos(&state, parts.uri.query()).await,
+                "/api/admin/export/photos",
+            );
+        }
         // 選別の確認（`crate::admin_curation`）。これも完全一致（`/api/admin/curation/groupsX` や末尾 `/` は静的配信の判定に回って 403）
         if path == "/api/admin/curation/groups" {
             return labeled(

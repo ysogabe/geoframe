@@ -6,6 +6,7 @@
 pub mod admin;
 pub mod admin_config;
 pub mod admin_curation;
+pub mod admin_export;
 pub mod admin_library;
 pub mod admin_ops;
 pub mod ai;
