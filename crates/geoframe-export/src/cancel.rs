@@ -7,9 +7,8 @@
 //! - [`Cancel`] は同期の印（`Arc<AtomicBool>`。`Clone` で共有）。[`Cancel::cancel`] で立てる。立った印は下ろさない。
 //! - [`install_signal_handlers`] は、SIGINT・SIGTERM の handler を入れる（印を立てるだけ。async-signal-safe）。
 //!   バイナリの `main` だけが、[`crate::app::run_command_cancellable`] の `handle_signals` を真にして呼ばせる（試験のプロセスは
-//!   並列で 1 つの印を共有できないので、プロセス内の試験は呼ばない）。今は `run` と `serve` の前に入る。`serve`（T6）が tokio の
-//!   シグナルを使うなら、`serve` の前では入れないようにして（`app` の `Command::Serve` の枝）、受けたときに [`Cancel::cancel`]
-//!   を呼ぶ（どちらでも、立った印の見方は同じ）。
+//!   並列で 1 つの印を共有できないので、プロセス内の試験は呼ばない）。`run` の前に入る。`serve` は入れず、tokio のシグナルで受けて
+//!   [`Cancel::cancel`] を呼ぶ（[`crate::serve`]。どちらでも、立った印の見方は同じ）。
 //!
 //! 印は下ろせない。2 回目以降の signal も、印を立てるだけ（子を止めて `wait` し終えるまで、枠を持ったまま待つ。印を見ない待ちは、
 //! 一覧 API の取得〔30 秒〕と写真 1 枚の取得〔60 秒〕だけで、どちらにも上限がある）。

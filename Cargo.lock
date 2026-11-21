@@ -446,10 +446,14 @@ dependencies = [
 name = "geoframe-export"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "flate2",
+ "hyper",
+ "hyper-util",
  "jpeg-encoder",
  "libc",
  "serde_json",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "ureq",

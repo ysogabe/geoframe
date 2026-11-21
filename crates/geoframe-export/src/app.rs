@@ -16,15 +16,6 @@ use crate::{recover, run, serve};
 
 /// 引数・設定の誤り（`run` の終了コードの 2）。
 pub const EXIT_USAGE: u8 = 2;
-/// 後のタスクで作るサブコマンド（T2 の骨組みだけの間）。
-pub const EXIT_NOT_IMPLEMENTED: u8 = 70;
-
-/// まだ作っていないサブコマンド。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NotImplemented {
-    /// 作るタスク（表示用）。
-    pub task: &'static str,
-}
 
 /// `args` はプログラム名を除いた引数。終了コードを返す。実効ユーザー ID は確かめない（試験用。バイナリは [`run_command`]）。
 pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
@@ -42,11 +33,14 @@ pub fn run_command(
     run_command_cancellable(euid, args, out, err, &Cancel::new(), false)
 }
 
-/// [`run_command`] に、キャンセルの印を渡せる形。`run` と `serve` が使う。`handle_signals` が真なら、`run`・`serve` の前に
-/// SIGINT・SIGTERM の handler を入れる（[`crate::cancel::install_signal_handlers`]。以後、この 2 つの signal はプロセスを
-/// 終わらせず、`cancel` の印を立てる。実行中の rclone を止めて `wait` し終えてから終わる）。バイナリの `main` だけが真にする
-/// （プロセス内の試験は並列で 1 つのプロセスを共有するので、handler を入れない）。`recover` と `--help`・`--version` は、
-/// handler を入れない（signal でふつうに終わる）。
+/// [`run_command`] に、キャンセルの印を渡せる形。`run` と `serve` が使う。`handle_signals` が真なら、SIGINT・SIGTERM を
+/// プロセスを終わらせずに `cancel` の印を立てる受け口にする（実行中の rclone を止めて `wait` し終えてから終わる）。バイナリの
+/// `main` だけが真にする（プロセス内の試験は並列で 1 つのプロセスを共有するので、受け口を入れない）。
+///
+/// - `run`: `run` の前に libc の handler を入れる（[`crate::cancel::install_signal_handlers`]）。
+/// - `serve`: libc の handler は入れない。`serve` が tokio のシグナルで受けて [`Cancel::cancel`] を呼ぶ（[`crate::serve`]。
+///   起動時の復旧より前に登録する）。
+/// - `recover`・`--help`・`--version`: 入れない（signal でふつうに終わる）。
 pub fn run_command_cancellable(
     euid: Option<u32>,
     args: &[String],
@@ -66,14 +60,14 @@ pub fn run_command_cancellable(
         );
         return EXIT_USAGE;
     }
-    let outcome: Result<u8, NotImplemented> = match command {
+    match command {
         Command::Version => {
             let _ = writeln!(out, "geoframe-export {}", env!("CARGO_PKG_VERSION"));
-            return 0;
+            0
         }
         Command::Help => {
             let _ = writeln!(out, "{}", cli::USAGE);
-            return 0;
+            0
         }
         Command::Run { request, settings } => {
             if let Err(code) = startup(&settings, err) {
@@ -82,14 +76,14 @@ pub fn run_command_cancellable(
             if handle_signals && let Err(code) = install_handlers(cancel, err) {
                 return code;
             }
-            return run::run_with(
+            run::run_with(
                 &settings,
                 &request,
                 crate::flow::Tuning::default(),
                 cancel,
                 out,
                 err,
-            );
+            )
         }
         Command::Serve {
             listen,
@@ -100,26 +94,23 @@ pub fn run_command_cancellable(
             if let Err(code) = startup(&settings, err) {
                 return code;
             }
-            if handle_signals && let Err(code) = install_handlers(cancel, err) {
-                return code;
-            }
-            serve::serve(&settings, listen, &token_file, &allow, cancel)
+            // `serve` は、SIGINT・SIGTERM を tokio で受ける（libc の handler は入れない。`handle_signals` が真のとき）。
+            // 復旧より前に入れるのが要点なので、受け口の登録は `serve::serve` の中の最初の段階で行う
+            serve::serve(
+                &settings,
+                listen,
+                &token_file,
+                &allow,
+                cancel,
+                handle_signals,
+                err,
+            )
         }
         Command::Recover { resolve, settings } => {
             if let Err(code) = startup(&settings, err) {
                 return code;
             }
-            return recover::recover(&settings, resolve.as_deref(), out, err);
-        }
-    };
-    match outcome {
-        Ok(code) => code,
-        Err(NotImplemented { task }) => {
-            let _ = writeln!(
-                err,
-                "geoframe-export: このコマンドは未実装です（{task}で作ります）"
-            );
-            EXIT_NOT_IMPLEMENTED
+            recover::recover(&settings, resolve.as_deref(), out, err)
         }
     }
 }

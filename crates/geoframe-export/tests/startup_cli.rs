@@ -6,7 +6,7 @@ mod common;
 use common::{
     MARK_ID, MARK_SECRET, TempDir, assert_no_secrets, good_config, set_mode, write_config,
 };
-use geoframe_export::app::{EXIT_NOT_IMPLEMENTED, EXIT_USAGE, main_with};
+use geoframe_export::app::{EXIT_USAGE, main_with};
 
 struct Out {
     code: u8,
@@ -79,14 +79,14 @@ fn run_all(cmds: &[Vec<String>]) -> Vec<Out> {
 #[test]
 fn every_subcommand_starts_with_a_dedicated_config_and_reaches_its_own_command() {
     // `--feed-base` は使われていないポート、`--rclone` は存在しないパス。`run` は一覧 API に届かず失敗（1。rclone まで行かない）、
-    // `recover` は記録が 0 件なので rclone を起動せずに 0、`serve` は T6 まで未実装
+    // `recover` は記録が 0 件なので rclone を起動せずに 0、`serve` はトークンのファイルが無いので、待ち受けずに 2（起動時の検査には通ったあと）
     let dir = TempDir::new("cli-ok");
     let conf = write_config(dir.path(), good_config("gdrive").as_bytes());
     let outs = run_all(&all_commands(&common(&conf, &dir)));
     let codes: Vec<u8> = outs.iter().map(|o| o.code).collect();
     assert_eq!(
         codes,
-        [1, 1, EXIT_NOT_IMPLEMENTED, 0],
+        [1, 1, EXIT_USAGE, 0],
         "{:?}",
         outs.iter().map(|o| &o.stderr).collect::<Vec<_>>()
     );
@@ -100,7 +100,11 @@ fn every_subcommand_starts_with_a_dedicated_config_and_reaches_its_own_command()
         "{}",
         outs[1].stdout
     );
-    assert!(outs[2].stderr.contains("未実装"), "{}", outs[2].stderr);
+    assert!(
+        outs[2].stderr.contains("--token-file") && !outs[2].stderr.contains("/nonexistent"),
+        "{}",
+        outs[2].stderr
+    );
     for out in &outs {
         assert_no_secrets(&out.stdout);
         assert_no_secrets(&out.stderr);
