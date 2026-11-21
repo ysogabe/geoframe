@@ -529,8 +529,10 @@ async fn run_async(
     .await
     .is_ok();
     if !joined {
-        // 接続のタスクは落とす（中のブロッキング処理は続くので、[`Inflight`] が数えている）
-        connections.abort_all();
+        // 接続のタスクは落とし、落ち切るまで待つ（`abort_all` は要求だけで、まだ `App::blocking` に入っていないタスクが、この後で
+        // ブロッキング処理を始めると、[`run`] の [`Inflight`] の確かめから漏れる）。落ちたタスクの中で始まっていたブロッキング処理は
+        // 続くので、[`Inflight`] が数えている
+        connections.shutdown().await;
     }
     Ok(u8::from(!joined))
 }

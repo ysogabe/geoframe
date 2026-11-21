@@ -373,7 +373,7 @@ U1〜U7 は 2026-11-22 にユーザーが決めた。U8 は判断待ち。
 - `202 {"job_id": "...", "status": "running"}`。同じ `request_id` の再送にはそのジョブの `job_id` と今の `status` を返す。
 - `200`（`dry_run`）`{"folder": "2026-01-10-11", "destination": "yamareco", "candidate_count": 52, "days": {...}, "target": "absent", "managed": null, "existing_files": 0, "excluded": {"not_derivative": 0}, "derivative_pending": 0, "undated_in_catalog": 6, "invalid_time_in_catalog": 0}`
   - `managed`: `target` が `exists` のとき、このサービスが書いたフォルダか（`true`/`false`）。`false` なら `replace` でも `conflict`（`not_managed`）になる。それ以外は `null`。
-- `400`（検査の失敗。`{"error": "invalid_date"}` など）、`401`、`403`、`409`（実行中・`request_id_mismatch`）、`503`（`dry_run` で写真サービスか Drive が使えない、または `blocked`）
+- `400`（検査の失敗。`{"error": "invalid_date"}` など）、`401`、`403`、`409`（実行中・`request_id_mismatch`）、`503`（`dry_run` で写真サービスか Drive が使えない、または `blocked`。終了の印を受けたあとの受付は `{"error": "shutting_down"}`）
 
 **`GET /v1/exports/{job_id}`** … 状態と結果。完了の速いジョブは、最初の GET で完了の状態が返ってよい。
 
