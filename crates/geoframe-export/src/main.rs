@@ -11,7 +11,8 @@ fn main() -> ExitCode {
             }
         }
     }
-    let code = geoframe_export::app::main_with(
+    let code = geoframe_export::app::run_command(
+        Some(geoframe_export::sys::euid()),
         &args,
         &mut std::io::stdout().lock(),
         &mut std::io::stderr().lock(),

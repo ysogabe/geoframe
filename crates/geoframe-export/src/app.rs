@@ -2,6 +2,10 @@
 //!
 //! 起動時の検査（[`crate::startup::startup_check`]）は、`run`（`--dry-run` を含む）・`serve`・`recover` のどれでも、
 //! 中身を始める前に通る。通らなければ何もせず終了コード 2。表示には設定ファイルの値を出さない。
+//!
+//! root（実効ユーザー ID が 0）で直接動かされたら、`run`・`serve`・`recover` は断る（終了コード 2）。専用のユーザーで動かす
+//! （design.md 6.2）。実効ユーザー ID は [`run_command`] の引数で受け取る（バイナリの `main` が本物の値を渡す。
+//! [`main_with`] は確かめない。root の CI で試験が落ちないように、判定を試験から切り離している）。
 
 use std::io::Write;
 
@@ -21,13 +25,31 @@ pub struct NotImplemented {
     pub task: &'static str,
 }
 
-/// `args` はプログラム名を除いた引数。終了コードを返す。
+/// `args` はプログラム名を除いた引数。終了コードを返す。実効ユーザー ID は確かめない（試験用。バイナリは [`run_command`]）。
 pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u8 {
+    run_command(None, args, out, err)
+}
+
+/// [`main_with`] に、実効ユーザー ID（`Some(0)` なら root）を渡せる形。`run`・`serve`・`recover` は、root なら何もせず
+/// 終了コード 2。`--version`・`--help` は root でも動く。
+pub fn run_command(
+    euid: Option<u32>,
+    args: &[String],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> u8 {
     let command = match cli::parse(args) {
         Ok(command) => command,
         Err(e) => return usage_error(&e, err),
     };
-    let outcome = match command {
+    if euid == Some(0) && !matches!(command, Command::Version | Command::Help) {
+        let _ = writeln!(
+            err,
+            "geoframe-export: root では動かしません。専用のユーザーで実行してください"
+        );
+        return EXIT_USAGE;
+    }
+    let outcome: Result<u8, NotImplemented> = match command {
         Command::Version => {
             let _ = writeln!(out, "geoframe-export {}", env!("CARGO_PKG_VERSION"));
             return 0;
@@ -40,7 +62,7 @@ pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u
             if let Err(code) = startup(&settings, err) {
                 return code;
             }
-            run::run(&settings, &request)
+            return run::run(&settings, &request, out, err);
         }
         Command::Serve {
             listen,
@@ -57,7 +79,7 @@ pub fn main_with(args: &[String], out: &mut dyn Write, err: &mut dyn Write) -> u
             if let Err(code) = startup(&settings, err) {
                 return code;
             }
-            recover::recover(&settings, resolve.as_deref())
+            return recover::recover(&settings, resolve.as_deref(), out, err);
         }
     };
     match outcome {

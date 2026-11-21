@@ -77,12 +77,31 @@ fn run_all(cmds: &[Vec<String>]) -> Vec<Out> {
 }
 
 #[test]
-fn every_subcommand_starts_with_a_dedicated_config_and_is_not_implemented_yet() {
+fn every_subcommand_starts_with_a_dedicated_config_and_reaches_its_own_command() {
+    // `--feed-base` は使われていないポート、`--rclone` は存在しないパス。`run` は一覧 API に届かず失敗（1。rclone まで行かない）、
+    // `recover` は記録が 0 件なので rclone を起動せずに 0、`serve` は T6 まで未実装
     let dir = TempDir::new("cli-ok");
     let conf = write_config(dir.path(), good_config("gdrive").as_bytes());
-    for out in run_all(&all_commands(&common(&conf, &dir))) {
-        assert_eq!(out.code, EXIT_NOT_IMPLEMENTED, "{}", out.stderr);
-        assert!(out.stderr.contains("未実装"), "{}", out.stderr);
+    let outs = run_all(&all_commands(&common(&conf, &dir)));
+    let codes: Vec<u8> = outs.iter().map(|o| o.code).collect();
+    assert_eq!(
+        codes,
+        [1, 1, EXIT_NOT_IMPLEMENTED, 0],
+        "{:?}",
+        outs.iter().map(|o| &o.stderr).collect::<Vec<_>>()
+    );
+    assert!(
+        outs[0].stdout.contains("feed_unavailable"),
+        "{}",
+        outs[0].stdout
+    );
+    assert!(
+        outs[1].stdout.contains("feed_unavailable"),
+        "{}",
+        outs[1].stdout
+    );
+    assert!(outs[2].stderr.contains("未実装"), "{}", outs[2].stderr);
+    for out in &outs {
         assert_no_secrets(&out.stdout);
         assert_no_secrets(&out.stderr);
     }
@@ -148,7 +167,9 @@ fn a_remote_name_that_differs_from_the_section_refuses_to_start() {
     let mut args2 = args[..11].to_vec();
     args2.extend(common(&conf, &dir));
     let out = run(&args2.iter().map(String::as_str).collect::<Vec<_>>());
-    assert_eq!(out.code, EXIT_NOT_IMPLEMENTED, "{}", out.stderr);
+    // 検査には通り、`run` の中身（一覧 API に届かない）まで進む
+    assert_eq!(out.code, 1, "{}", out.stderr);
+    assert!(out.stdout.contains("feed_unavailable"), "{}", out.stdout);
 }
 
 #[test]
@@ -228,6 +249,10 @@ fn bad_prefixes_refuse_to_start_before_anything_else() {
             let out = run(&owned.iter().map(String::as_str).collect::<Vec<_>>());
             assert_eq!(out.code, EXIT_USAGE, "{extra:?} {head:?}: {}", out.stderr);
             assert!(!out.stderr.contains("未実装"), "{extra:?}: {}", out.stderr);
+            assert!(
+                !dir.path().join("jobs").exists(),
+                "検査に通らなければ何も作らない"
+            );
             assert!(out.stdout.is_empty());
         }
     }

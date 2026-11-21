@@ -29,9 +29,44 @@ pub enum ErrorCode {
     Timeout,
     Blocked,
     Internal,
+    // 受付の断り（HTTP は 409。ジョブの `error.code` には載らない。CLI の `run` の標準出力にも同じ文字列を使う）
+    /// 実行枠（flock）が取れない（別のジョブか CLI の `run` が実行中）。
+    Busy,
+    /// 同じ `request_id` で、期間・宛先・`on_exists` が違う。
+    RequestIdMismatch,
 }
 
 impl ErrorCode {
+    /// 全部（記録から読んだ文字列を [`ErrorCode::parse`] で戻すのに使う）。
+    pub const ALL: [ErrorCode; 22] = [
+        Self::InvalidDate,
+        Self::InvalidRange,
+        Self::InvalidDestination,
+        Self::InvalidOnExists,
+        Self::InvalidRequestId,
+        Self::FeedUnavailable,
+        Self::FeedInvalid,
+        Self::TooManyPhotos,
+        Self::DerivativePending,
+        Self::FetchFailed,
+        Self::DecodeFailed,
+        Self::NothingToExport,
+        Self::DriveUnavailable,
+        Self::AmbiguousDestination,
+        Self::RcloneFailed,
+        Self::RcloneTimeout,
+        Self::VerifyMismatch,
+        Self::Timeout,
+        Self::Blocked,
+        Self::Internal,
+        Self::Busy,
+        Self::RequestIdMismatch,
+    ];
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|c| c.as_str() == s)
+    }
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::InvalidDate => "invalid_date",
@@ -54,6 +89,8 @@ impl ErrorCode {
             Self::Timeout => "timeout",
             Self::Blocked => "blocked",
             Self::Internal => "internal",
+            Self::Busy => "busy",
+            Self::RequestIdMismatch => "request_id_mismatch",
         }
     }
 
@@ -82,6 +119,8 @@ impl ErrorCode {
             Self::Timeout => "ジョブ全体の期限を過ぎました",
             Self::Blocked => "前の書き出しの状態を照合できていません",
             Self::Internal => "内部エラー",
+            Self::Busy => "実行中の書き出しがあります",
+            Self::RequestIdMismatch => "同じ request_id で、期間・宛先・on_exists が違います",
         }
     }
 }
@@ -126,28 +165,7 @@ impl std::error::Error for ExportError {}
 mod tests {
     use super::*;
 
-    const ALL: [ErrorCode; 20] = [
-        ErrorCode::InvalidDate,
-        ErrorCode::InvalidRange,
-        ErrorCode::InvalidDestination,
-        ErrorCode::InvalidOnExists,
-        ErrorCode::InvalidRequestId,
-        ErrorCode::FeedUnavailable,
-        ErrorCode::FeedInvalid,
-        ErrorCode::TooManyPhotos,
-        ErrorCode::DerivativePending,
-        ErrorCode::FetchFailed,
-        ErrorCode::DecodeFailed,
-        ErrorCode::NothingToExport,
-        ErrorCode::DriveUnavailable,
-        ErrorCode::AmbiguousDestination,
-        ErrorCode::RcloneFailed,
-        ErrorCode::RcloneTimeout,
-        ErrorCode::VerifyMismatch,
-        ErrorCode::Timeout,
-        ErrorCode::Blocked,
-        ErrorCode::Internal,
-    ];
+    const ALL: [ErrorCode; 22] = ErrorCode::ALL;
 
     #[test]
     fn codes_are_fixed_unique_snake_case_strings() {
@@ -173,5 +191,17 @@ mod tests {
         assert_eq!(ErrorCode::TooManyPhotos.as_str(), "too_many_photos");
         assert_eq!(ErrorCode::DerivativePending.as_str(), "derivative_pending");
         assert_eq!(ErrorCode::NothingToExport.as_str(), "nothing_to_export");
+        assert_eq!(ErrorCode::Busy.as_str(), "busy");
+        assert_eq!(ErrorCode::RequestIdMismatch.as_str(), "request_id_mismatch");
+    }
+
+    #[test]
+    fn every_code_parses_back_from_its_string() {
+        for code in ALL {
+            assert_eq!(ErrorCode::parse(code.as_str()), Some(code));
+        }
+        assert_eq!(ErrorCode::parse(""), None);
+        assert_eq!(ErrorCode::parse("Internal"), None);
+        assert_eq!(ErrorCode::parse("interrupted"), None);
     }
 }
