@@ -15,11 +15,11 @@
 //!   から `Ok` を返すこと。`Err` を返すと、その段階の Drive の操作はしない。`uploading` は 2 回（フォルダを作る前に段階だけ、
 //!   作って ID が分かってから ID つきで）呼ばれる。**復旧（[`Recovery::run`]・[`Recovery::execute`]）にも同じ口を渡す**:
 //!   復旧が Drive を変える操作（`incoming` の移動＝`publishing`、旧フォルダのゴミ箱への移動＝`trashing`）の前にも、
-//!   段階を書く（復旧の途中でまた止まっても、記録と Drive が食い違わないため）。書けなければ、その操作はしない。ゴミ箱への移動の前の `trashing` が書けなかったときは、公開の記録（`published.json`）を更新する**前**に、旧フォルダが退避先に
+//!   段階を書く（復旧の途中でまた止まっても、記録と Drive が食い違わないため）。書けなければ、その操作はしない。ゴミ箱への移動の前の `trashing` が書けなかったときは、公開の記録（`published/`）を更新する**前**に、旧フォルダが退避先に
 //!   あると再確認する（別の ID・照会できないときは、公開の記録を更新せずに `blocked`）。
 //! - ジョブ全体の期限は、渡す [`Rclone`] に `with_deadline` で掛ける。過ぎたら実行中の rclone を kill して `timeout`。後始末と復旧は
 //!   期限なし（コマンドごとの期限だけ）で動く。
-//! - [`Published::recorded`] が偽（公開の記録 `published.json` に書けなかった）のときは、公開は済んでいる。**正常な完了として
+//! - [`Published::recorded`] が偽（公開の記録 `published/` に書けなかった）のときは、公開は済んでいる。**正常な完了として
 //!   吸収しない**: [`Published::record`] が書くはずだった行なので、`upsert` をやり直し、それでも書けなければ、結果に
 //!   「公開済み（フォルダの ID）・記録に書けていない」を残す（次の `replace` はこのフォルダを管理していないものとして断る）。
 //! - [`Published::old_left_in_replaced`] が `Some` のときは、新しい一式は公開済みで、旧フォルダが `replaced/` に残っている
@@ -143,7 +143,7 @@ pub struct Published {
     /// 旧フォルダのゴミ箱への移動ができなかったとき、`replaced/` に残っている旧フォルダの ID（新しい一式は公開済み）。
     /// **旧 ID が退避先にあると、一覧で再確認できたときだけ**入る（別の ID や、照会できないときは `blocked`）。
     pub old_left_in_replaced: Option<String>,
-    /// 公開の記録（`published.json`）に書けたか。偽なら、次の `replace` はこのフォルダを管理していないものとして断る。
+    /// 公開の記録（`published/`）に書けたか。偽なら、次の `replace` はこのフォルダを管理していないものとして断る。
     /// 偽のまま正常な完了にしない（[`Published::record`] を `upsert` し直し、書けなければ結果に残す）。
     pub recorded: bool,
     /// 公開の記録に書く（書いた）行。`recorded` が偽のとき、記録の再試行に使う。
@@ -151,7 +151,7 @@ pub struct Published {
 }
 
 impl Published {
-    /// 公開の記録（`published.json`）への書き込みをやり直す（`recorded` が偽のとき）。
+    /// 公開の記録（`published/`）への書き込みをやり直す（`recorded` が偽のとき）。
     ///
     /// **T5 への注意**: [`PublishedStore::upsert`] は、同じ宛先（種類・フォルダ名）の行を**置き換える**。実行枠（flock）を
     /// 持ったまま、同じ宛先への次のジョブより前に再試行すること。後から再試行するなら、先に宛先の今の ID を確かめる
@@ -375,6 +375,7 @@ fn record_stage(
         stage,
         old_id: cur.old_id.clone(),
         incoming_id: cur.incoming_id.clone(),
+        digests: cur.digests.clone(),
     };
     sink.record(&next)?;
     *cur = next;
@@ -574,7 +575,8 @@ impl Recovery<'_> {
                 folder_id,
                 trash_old,
             } => {
-                match self.content_ok(Place::Dest) {
+                let recorded = self.recorded_digests(folder_id, &cur);
+                match self.content_ok(Place::Dest, recorded.as_deref()) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(self.blocked(
@@ -591,13 +593,21 @@ impl Recovery<'_> {
                         ));
                     }
                 }
-                self.finish(&mut cur, observed, folder_id, trash_old.as_deref(), sink)
+                self.finish(
+                    &mut cur,
+                    observed,
+                    folder_id,
+                    trash_old.as_deref(),
+                    recorded,
+                    sink,
+                )
             }
             Action::RollForward {
                 incoming_id,
                 old_id,
             } => {
-                match self.content_ok(Place::Incoming) {
+                let recorded = self.recorded_digests(incoming_id, &cur);
+                match self.content_ok(Place::Incoming, recorded.as_deref()) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(self.blocked(
@@ -645,7 +655,7 @@ impl Recovery<'_> {
                     }
                 }
                 // 公開の直後の照合（宛先の ID・incoming が残っていない・中身）。起動時は宛先の manifest で照合する
-                match drive.check_published(incoming_id, self.expected) {
+                match drive.check_published(incoming_id, self.expected, recorded.as_deref()) {
                     Ok(Ok(())) => {}
                     Ok(Err(o)) => {
                         return Err(self.blocked(&cur, BlockedReason::PublishMismatch, Some(&o)));
@@ -658,18 +668,44 @@ impl Recovery<'_> {
                         ));
                     }
                 }
-                self.finish(&mut cur, observed, incoming_id, Some(old_id), sink)
+                self.finish(
+                    &mut cur,
+                    observed,
+                    incoming_id,
+                    Some(old_id),
+                    recorded,
+                    sink,
+                )
             }
         }
     }
 
-    /// 宛先（[`Place::Dest`]）または `incoming` の中身が、期待した一式と一致するか。
-    fn content_ok(&self, place: Place) -> Result<bool, ExportError> {
+    /// 起動時の復旧（手元に一式が無い）で、公開した中身を照らす**検証済みの MD5**。同じフォルダ ID の公開の記録（公開の記録を
+    /// 更新した直後に止まったとき）があればその MD5、無ければジョブの記録に残した MD5（退避・公開の前に書いたもの）。どちらにも
+    /// 無ければ `None`（古い記録。MD5 の無い記録にして、次の `replace` を断る）。宛先の今の MD5 を「正規の一式」として
+    /// 作り直すことはしない（止まっている間に、同じ名前・同じ大きさのまま書き換えられていても、気づけなくなるため）。
+    /// 手元に一式がある（公開の途中の失敗のその場の復旧）ときは、その一式の MD5 を使うので `None`。
+    fn recorded_digests(&self, folder_id: &str, progress: &Progress) -> Option<Vec<RecordedFile>> {
+        if self.expected.is_some() {
+            return None;
+        }
+        self.published
+            .current_files_of(self.layout.destination(), self.layout.folder(), folder_id)
+            .or_else(|| progress.digests.clone())
+    }
+
+    /// 宛先（[`Place::Dest`]）または `incoming` の中身が、期待した一式と一致するか。手元に一式が無いときは、フォルダの manifest
+    /// と一致し、`recorded`（検証済みの MD5）があればそれにも一致するか。
+    fn content_ok(
+        &self,
+        place: Place,
+        recorded: Option<&[RecordedFile]>,
+    ) -> Result<bool, ExportError> {
         let drive = self.drive();
         match (self.expected, place) {
             (Some(e), Place::Incoming) => drive.incoming_matches(e),
             (Some(e), _) => drive.dest_matches_expected(e),
-            (None, place) => drive.folder_matches_its_manifest(place, None),
+            (None, place) => drive.folder_matches_its_manifest(place, recorded),
         }
     }
 
@@ -680,11 +716,12 @@ impl Recovery<'_> {
         observed: &Observed,
         folder_id: &str,
         trash_old: Option<&str>,
+        recorded: Option<Vec<RecordedFile>>,
         sink: &mut dyn ProgressSink,
     ) -> Result<Resolution, Box<BlockedInfo>> {
         let drive = self.drive();
         // 記録できなければ、ゴミ箱へは移さない（公開は済んでいる。旧フォルダは `replaced/` に残る）。そのときは、公開の記録
-        // （`published.json`）を書く**前**に、旧フォルダが退避先にあるかを再確認する（別の ID・照会できないときは `blocked`
+        // （`published/`）を書く**前**に、旧フォルダが退避先にあるかを再確認する（別の ID・照会できないときは `blocked`
         // にするので、`blocked` なのに公開の記録だけ更新済み、という食い違いを作らない）
         // `Some(..)`: 記録できずにゴミ箱へ移さなかった。中の値が、再確認した結果（旧フォルダが残っていれば `Some(旧 ID)`）
         let mut skipped: Option<Option<String>> = None;
@@ -706,11 +743,11 @@ impl Recovery<'_> {
             trash = None;
             skipped_old = trash_old;
         }
-        // 公開の記録に書く MD5: 手元の一式（公開の途中の失敗の復旧）があればそれ。起動時の復旧は、manifest と一致すると
-        // 確かめた宛先の一覧の MD5（取れなければ MD5 なしの行。次の `replace` は断る）
+        // 公開の記録に書く MD5: 手元の一式（公開の途中の失敗の復旧）があればそれ。起動時の復旧は、宛先の中身が一致すると
+        // 確かめた検証済みの MD5（`recorded`。宛先の今の MD5 から作り直さない）。無ければ MD5 なしの記録（次の `replace` は断る）
         let files = match self.expected {
             Some(e) => e.recorded_files(),
-            None => drive.dest_digests().ok().flatten(),
+            None => recorded,
         };
         let mut published = finish_tail(
             &drive,
@@ -763,7 +800,7 @@ fn confirm_old_left(drive: &Drive<'_>, old: &str) -> Result<Option<String>, Tras
     }
 }
 
-/// 仕上げ: 旧フォルダ（`trash_old`）をゴミ箱へ移し、公開の記録（`published.json`）に足す。
+/// 仕上げ: 旧フォルダ（`trash_old`）をゴミ箱へ移し、公開の記録（`published/`）に足す。
 ///
 /// - ゴミ箱へ移す前に、`replaced/<…>` が記録した旧フォルダの ID 1 つだけで、中身が旧 manifest の一式と完全に一致することを
 ///   確かめる（[`Drive::trash_replaced`]）。違えば何も消さずに `Err`（`blocked`）。
@@ -892,12 +929,22 @@ fn changed_during_run() -> ExportError {
 impl Run<'_> {
     /// 段階を記録する（Drive の操作の前）。記録できなければ、その段階の操作はしない。
     fn record(&mut self, stage: Stage, incoming_id: Option<&str>) -> Result<(), StepErr> {
+        // 検証済みの MD5（作業領域の各ファイルの MD5。`verifying` で送った中身との一致を確かめたあと）を、旧フォルダの退避・
+        // 公開の**前**にジョブの記録へ残す。起動時の復旧が、公開の記録を書く前に宛先の中身をこれと照らす
+        let digests = match stage {
+            Stage::Retiring | Stage::Publishing | Stage::Trashing => self
+                .expected
+                .recorded_files()
+                .or_else(|| self.progress.digests.clone()),
+            _ => self.progress.digests.clone(),
+        };
         let next = Progress {
             stage,
             old_id: self.old_id.clone(),
             incoming_id: incoming_id
                 .map(str::to_owned)
                 .or_else(|| self.progress.incoming_id.clone()),
+            digests,
         };
         match self.sink.record(&next) {
             Ok(()) => {
@@ -1042,7 +1089,7 @@ impl Run<'_> {
     fn check_published(&self, incoming_id: &str) -> Result<(), StepErr> {
         match self
             .drive
-            .check_published(incoming_id, Some(&self.expected))
+            .check_published(incoming_id, Some(&self.expected), None)
             .map_err(StepErr::Op)?
         {
             Ok(()) => Ok(()),
@@ -1148,6 +1195,7 @@ pub fn publish(
             stage: Stage::Uploading,
             old_id: old_id.clone(),
             incoming_id: None,
+            digests: None,
         },
         old_id,
         existing_files: inspection.existing_files,

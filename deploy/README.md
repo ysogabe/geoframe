@@ -656,12 +656,12 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
    このサービスは共有設定を変えません。公開したフォルダは親フォルダの共有を受け継ぎます。
 3. 受け取り側が`lat`/`lon`の`null`と増えた枚数を扱えるか確かめます。位置の無い写真も出るので、受け取り側の検証と記事の作成が`null`で落ちないことを確かめます。
 4. 旧 manifest のある日で比べます。検証は、本番の記録・ロック・rclone の設定のどれにも触れない**検証用の入口**（`geoframe-export-admin.sh --verify`）で行います。
-   本番の入口に宛先の接頭辞だけを渡す形は使えません（包みが断ります）。それだと本番の状態ディレクトリを共有して、同じ日の本番の公開の記録（`published.json`）を検証用フォルダの ID で上書きしてしまい、
+   本番の入口に宛先の接頭辞だけを渡す形は使えません（包みが断ります）。それだと本番の状態ディレクトリを共有して、同じ日の本番の公開の記録（`published/`の下のその宛先のファイル）を検証用フォルダの ID で上書きしてしまい、
    以後の`replace`が`not_managed`になるためです。途中で止まれば、復旧が本番の接頭辞で Drive を照合することにもなります。
 
    | | 本番の入口 | 検証用の入口（`--verify`） |
    | --- | --- | --- |
-   | 状態ディレクトリ（`jobs/`・`published.json`・`export.lock`・作業領域・rclone の HOME） | `/var/lib/geoframe-export` | `/var/lib/geoframe-export-verify` |
+   | 状態ディレクトリ（`jobs/`・`published/`・`export.lock`・作業領域・rclone の HOME） | `/var/lib/geoframe-export` | `/var/lib/geoframe-export-verify` |
    | `yamareco`の宛先（`--remote-yamareco`） | `gdrive:yamareco` | `gdrive:geoframe-export-verify/yamareco` |
    | `travel-journal`の宛先（`--remote-travel-journal`） | `gdrive:travel-journal` | `gdrive:geoframe-export-verify/travel-journal` |
    | 作業用フォルダ（`--work-root`） | `gdrive:geoframe-export-work` | `gdrive:geoframe-export-verify-work` |
@@ -681,19 +681,19 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
      ```
 
      検証用の状態ディレクトリは、一時サービスの`StateDirectory=geoframe-export-verify`も同じ持ち主・0700 で扱います。
-   - 検証用の入口で、`dry_run`、書き出し、止まったときの`recover`を、同じ入口で行います。
-     `sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from <日付> --destination yamareco --dry-run`のあと、`--dry-run`を外して書き出します。
-     途中で止まったら、`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover`で確かめます（本番の`recover`は使いません）。
    - 検証用の入口は、本番の`export.lock`を取らず、本番の`rclone/`にも触れません（`ReadWritePaths=`も足しません）。本番の書き出しと同時に動かしても、互いの記録・ロック・rclone の設定は書き換わりません。
      rclone がアクセストークンを更新すると、本番と写しのそれぞれの設定に、新しいアクセストークンが書かれるだけです。Google の更新トークン（`refresh_token`）は、本番と写しの両方から使っても、通常は変わりません。
      もし更新トークンが失効するなどして、片方で認証が通らなくなったら、検証用の写し（`/var/lib/geoframe-export-verify/rclone/rclone.conf`）を消して、上の手順で本番のものを写し直します。
-   - 旧 manifest と比べる順序は、次のとおりです。
-     1. 旧 manifest のある日を、**本番の入口で`--dry-run`**します（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <日付> --destination yamareco --dry-run`）。
-        Drive を読むだけ（`lsjson`・`cat`）で、本番の記録・Drive は変わりません。宛先の状態（`target`・`existing_files`）と、書き出す枚数（`candidate_count`）を控えます。
-        旧 manifest のフォルダは旧実装が書いたもので、公開の記録に行がないので、`managed`が`false`なのは正しい挙動です（この入口では`replace`しません）。
-     2. そのあと、**同じ日を`--verify`で書き出し**（上の`--dry-run`を外す）、検証用の宛先にできた`manifest.json`と旧 manifest を比べます。本番の宛先には書きません。
-   - 比べるのは、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことです。呼び出し側の実際の検証（サイズの突き合わせ）まで通ることも確かめます。
-   - 検証の前後で、本番の`published.json`の更新時刻が変わらないことを確かめます（検証用の書き出しの記録は、検証用の状態ディレクトリにだけ残ります）。
+   - 旧 manifest と比べる手順は、次の 3 つを、この順に行います（ここに 1 か所だけ書きます）。
+     1. 本番の入口で`--dry-run`します（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <日付> --destination yamareco --dry-run`）。
+        旧 manifest のある日を使います。Drive を読むだけ（`lsjson`・`cat`）で、本番の記録・Drive は変わりません。
+        宛先の状態（`target`・`existing_files`）と、書き出す枚数（`candidate_count`）を控えます。
+        旧 manifest のフォルダは旧実装が書いたもので、公開の記録（`published/`の下のその宛先のファイル）が無いので、`managed`が`false`なのは正しい挙動です（この入口では`replace`しません）。
+     2. 同じ日を`--verify`で書き出します（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from <日付> --destination yamareco`）。
+        書き出しは検証用の宛先（上の表）にだけ行い、本番の宛先には書きません。途中で止まったら、`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover`で確かめます（本番の`recover`は使いません）。
+     3. 比べます。検証用の宛先にできた`manifest.json`と旧 manifest を比べ、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことを見ます。
+        呼び出し側の実際の検証（サイズの突き合わせ）まで通ることも確かめます。あわせて、検証の前後で、本番の`published/`の下のファイルの更新時刻が変わらないことを確かめます
+        （検証用の書き出しの記録は、検証用の状態ディレクトリにだけ残ります）。
    - 最初の検証用の実行で、写しへ rclone が設定を書き戻せることを、5 の確認と合わせて見ます（試験はモックなので、ここで初めて確かめます）。
    - **検証が終わったら、写しを必ず消します**（通常の削除で足ります）。写しは、本番と同じ Drive 全体の権限の資格情報（更新トークンと`client_secret`）で、残しておく理由がありません。
      あわせて、検証用の Drive のフォルダと検証用の記録も消してかまいません（本番の記録ではありません）。

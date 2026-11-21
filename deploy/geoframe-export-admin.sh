@@ -17,7 +17,7 @@
 #     本番の export.lock・本番の rclone/ には触れない。rclone の設定は、検証の準備で本番の rclone.conf を写した
 #     /var/lib/geoframe-export-verify/rclone/rclone.conf だけを使う。写しが無ければ動かない。手順は deploy/README.md §8.8 の 4）
 #
-# なぜ要るか: geoframe-export を root で直接動かすと、作られるファイル（jobs/・published.json・rclone の設定の更新）が
+# なぜ要るか: geoframe-export を root で直接動かすと、作られるファイル（jobs/・published/・rclone の設定の更新）が
 # root の所有になり、サービス（User=geoframe-export）が読めなくなる。バイナリは root では動かない（終了コード 2）。
 # このラッパーは systemd-run で一時的なサービス（geoframe-export-cli-<日時>-<番号>）を作り、User=geoframe-export・サービスと同じ設定の引数
 # （deploy/geoframe-export.service の ExecStart と同じ --rclone・--rclone-config・--state-dir・--feed-base）・同じ状態ディレクトリ
@@ -40,7 +40,7 @@ RCLONE_BIN="/usr/local/bin/rclone"
 RCLONE_CONF="${STATE_DIR}/rclone/rclone.conf"
 FEED_BASE="http://127.0.0.1:8080"
 
-# 検証用の入口（--verify）の固定値。本番と別の状態ディレクトリ（StateDirectory=geoframe-export-verify。jobs/・published.json・
+# 検証用の入口（--verify）の固定値。本番と別の状態ディレクトリ（StateDirectory=geoframe-export-verify。jobs/・published/・
 # export.lock・作業領域・rclone の設定が本番と別）、別の宛先の接頭辞、別の作業用フォルダ。remote 名（gdrive）は本番と同じ。
 # rclone の設定は、検証の準備で本番の rclone.conf を写した、検証用の状態ディレクトリの rclone/rclone.conf（本番の設定には触れない。
 # 本番のロックも取らない）。3 つの場所は互いに入れ子にならない（geoframe-export が検査する）。
@@ -115,7 +115,7 @@ else
 fi
 COMMON_ARGS=(--rclone "$RCLONE_BIN" --rclone-config "$rclone_conf" --feed-base "$FEED_BASE")
 
-# 宛先の接頭辞・作業用フォルダは、この入口では変えさせない。本番の状態ディレクトリ（published.json・ジョブの記録）のまま
+# 宛先の接頭辞・作業用フォルダは、この入口では変えさせない。本番の状態ディレクトリ（published/・ジョブの記録）のまま
 # 宛先だけを変えると、本番の公開の記録を別の場所の ID で上書きし、以後の置き換えが not_managed になる。検証は --verify で行う
 for a in "$@"; do
     case "$a" in

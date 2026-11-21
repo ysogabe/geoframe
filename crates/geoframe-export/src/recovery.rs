@@ -37,6 +37,7 @@
 
 use std::fmt;
 
+use crate::published::RecordedFile;
 use crate::rclone::LsEntry;
 
 /// 公開の手順の段階（ジョブの記録に書く名前）。
@@ -95,6 +96,10 @@ pub struct Progress {
     pub old_id: Option<String>,
     /// `incoming/<job_id>` の Drive の ID。`uploading` の最初（フォルダを作る前）だけ `None`。
     pub incoming_id: Option<String>,
+    /// 公開する一式の、**検証済みの**ファイルごとの MD5（作業領域の各ファイルの MD5。送った中身との一致を確かめたあと、
+    /// 退避・公開の段階から記録する）。起動時の復旧が、公開の記録を書く前に、宛先の中身をこれと照らす（同じ名前・同じ大きさの
+    /// まま書き換えられたものを、正規の一式として登録しない）。それより前の段階・古い記録では `None`。
+    pub digests: Option<Vec<RecordedFile>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -531,6 +536,7 @@ mod tests {
             stage,
             old_id: replace.then(|| OLD.to_owned()),
             incoming_id: Some(INC.to_owned()),
+            digests: None,
         }
     }
 
@@ -899,6 +905,7 @@ mod tests {
             stage: Stage::Uploading,
             old_id: None,
             incoming_id: None,
+            digests: None,
         };
         let o = Observed {
             incoming: vec![dir("fidNEW")],

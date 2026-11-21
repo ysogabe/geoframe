@@ -170,7 +170,7 @@ pub struct PublishFile {
     pub path: String,
     pub size: u64,
     /// 作業領域に書いた中身の MD5（小文字の 16 進 32 文字）。Drive の `lsjson --hash` の MD5 と照らす
-    /// （送った中身の検証と、`replace` の前の「その後に中身が変わっていないか」の確認。`published.json` にも残す）。
+    /// （送った中身の検証と、`replace` の前の「その後に中身が変わっていないか」の確認。`published/` にも残す）。
     pub md5: String,
 }
 

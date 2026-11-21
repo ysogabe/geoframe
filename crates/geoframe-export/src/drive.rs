@@ -12,7 +12,7 @@
 //! - 「一覧が manifest と一致する」の比べ方は 1 つ（[`Expected::matches`]）。送信後の検証・管理しているフォルダの変更の確認・
 //!   公開後の確認・復旧が、同じものを使う。
 //! - 一致の条件は、相対パス・サイズに加えて、**MD5**（`lsjson -R --hash --hash-type MD5` の `Hashes.md5`）。期待する MD5 が
-//!   分かっているとき（これから送る一式の検証、公開の記録 `published.json` の MD5 と照らす `replace` の前の確認・ゴミ箱へ移す前の
+//!   分かっているとき（これから送る一式の検証、公開の記録 `published/` の MD5 と照らす `replace` の前の確認・ゴミ箱へ移す前の
 //!   確認）は、一覧の MD5 が一致しなければ一致しない（同じ名前・同じ大きさのまま中身を書き換えられたものを見落とさない）。
 //!   MD5 を持たないファイル（Google のネイティブ文書など）は、期待した MD5 を持てないので「一式に無いファイル」として断る。
 //!   期待する MD5 が無いのは、手元にも記録にも一式の MD5 が無い、起動時の復旧の照合（宛先の manifest だけで照合する）だけ。
@@ -691,28 +691,6 @@ impl<'a> Drive<'a> {
         Ok(!listing.has_shortcut && expected.matches(&listing.entries))
     }
 
-    /// 宛先の中身のファイルごとの MD5（公開の記録に書く。起動時の復旧で、手元に一式が無いとき）。直前に
-    /// [`Self::folder_matches_its_manifest`] で manifest と一致すると確かめたフォルダに使う。ショートカットがある・MD5 を
-    /// 持たないファイルがある・manifest.json が無いときは `None`（記録には MD5 を書かない。次の `replace` は断る）。
-    pub fn dest_digests(&self) -> Result<Option<Vec<RecordedFile>>, ExportError> {
-        let listing = self.list_checked(&self.layout.dest_loc, true)?;
-        if listing.has_shortcut {
-            return Ok(None);
-        }
-        let files: Option<Vec<RecordedFile>> = listing
-            .entries
-            .iter()
-            .filter(|e| !e.is_dir)
-            .map(|e| {
-                e.md5.as_ref().map(|m| RecordedFile {
-                    path: e.path.clone(),
-                    md5: m.clone(),
-                })
-            })
-            .collect();
-        Ok(files.filter(|f| f.iter().any(|x| x.path == MANIFEST_NAME)))
-    }
-
     /// `incoming/<job_id>` をゴミ箱へ移す（`--drive-use-trash=true`）。先に一覧で、見えた項目が**記録した ID** のフォルダ
     /// ちょうど 1 つであることを確かめる（違えば何も消さずに [`Removed::Mismatch`]。無ければ [`Removed::Nothing`]）。
     /// ID は必ず渡す（名前だけでは消せない。ID を記録できていなければ、呼び出し側は消さずに残りものとして知らせる）。
@@ -813,11 +791,13 @@ impl<'a> Drive<'a> {
     }
 
     /// 公開のあと: 宛先が記録した `incoming` の ID のフォルダ 1 つだけ、`incoming/<job_id>` が残っていない、
-    /// 中身が一式と一致する。`expected` が無ければ（起動時の復旧）、宛先の manifest が言う一式と照合する。
+    /// 中身が一式と一致する。`expected` が無ければ（起動時の復旧）、宛先の manifest が言う一式と照合し、`recorded`（検証済みの
+    /// ファイルごとの MD5。ジョブの記録・公開の記録から）があれば、一覧の MD5 もそれと一致しなければならない。
     pub fn check_published(
         &self,
         incoming_id: &str,
         expected: Option<&Expected>,
+        recorded: Option<&[RecordedFile]>,
     ) -> Result<Check, ExportError> {
         let o = self.observe()?;
         let placed = o.dest == [Seen::dir(incoming_id)] && o.incoming.is_empty();
@@ -826,7 +806,7 @@ impl<'a> Drive<'a> {
         }
         let content_ok = match expected {
             Some(e) => self.dest_matches_expected(e)?,
-            None => self.folder_matches_its_manifest(Place::Dest, None)?,
+            None => self.folder_matches_its_manifest(Place::Dest, recorded)?,
         };
         if !content_ok {
             return Ok(Err(o));

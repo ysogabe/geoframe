@@ -658,7 +658,12 @@ fn the_job_deadline_kills_rclone_and_fails_with_timeout() {
 fn a_publish_that_cannot_be_recorded_leaves_a_note_but_still_succeeds() {
     let mut env = Env::new("flow-unrecorded");
     // 公開の記録が読めない（上書きしない）
-    std::fs::write(env.state.join("published.json"), b"{broken").unwrap();
+    let record = env.published.path_of(
+        geoframe_export::request::Destination::Yamareco,
+        &geoframe_export::folder::FolderName::parse(DAY).unwrap(),
+    );
+    std::fs::create_dir_all(env.published.dir()).unwrap();
+    std::fs::write(&record, b"{broken").unwrap();
     let site = photo_site(DAY, DAY, three_photos());
     let svc = service(&mut env, &site);
     let v = submit_and_wait(&svc, &day());
@@ -668,14 +673,11 @@ fn a_publish_that_cannot_be_recorded_leaves_a_note_but_still_succeeds() {
     assert!(
         notes
             .iter()
-            .any(|n| n.as_str().unwrap().contains("published.json")),
+            .any(|n| n.as_str().unwrap().contains("published/")),
         "{notes:?}"
     );
     assert!(drive_has(&env, &["yamareco", DAY, "manifest.json"]));
-    assert_eq!(
-        std::fs::read(env.state.join("published.json")).unwrap(),
-        b"{broken"
-    );
+    assert_eq!(std::fs::read(&record).unwrap(), b"{broken");
 }
 
 // ---- 止まったジョブの復旧（AC9） ----
@@ -745,6 +747,7 @@ fn startup_recovery_follows_the_table_for_uploading_and_for_a_roll_forward() {
             stage: Stage::Uploading,
             old_id: None,
             incoming_id: Some(inc.clone()),
+            digests: None,
         }),
     );
     assert!(matches!(
@@ -792,6 +795,7 @@ fn startup_recovery_follows_the_table_for_uploading_and_for_a_roll_forward() {
         stage: Stage::Retiring,
         old_id: Some(old_id.clone()),
         incoming_id: Some(inc.clone()),
+        digests: None,
     });
     rec.summary = Some(
         json!({"folder": DAY, "catalog_count": 4, "count": 2, "bytes": 300,
@@ -837,6 +841,7 @@ fn an_unexplainable_state_blocks_everything_until_it_is_resolved() {
             stage: Stage::Publishing,
             old_id: None,
             incoming_id: Some("fid-gone".into()),
+            digests: None,
         }),
     );
     match startup_recovery_retry(&svc) {
@@ -909,6 +914,7 @@ fn a_stuck_job_is_recovered_before_the_next_job_and_a_new_block_fails_that_job()
             stage: Stage::Publishing,
             old_id: None,
             incoming_id: Some("fid-gone".into()),
+            digests: None,
         }),
     );
     let b = running_record(&env, 7, None);
@@ -999,6 +1005,7 @@ fn an_incoming_folder_whose_id_was_never_recorded_is_left_and_reported_not_delet
             stage: Stage::Uploading,
             old_id: None,
             incoming_id: None,
+            digests: None,
         }),
     );
     assert!(matches!(
@@ -1044,6 +1051,7 @@ fn startup_recovery_finishes_a_published_job_and_a_pending_trash_and_ends_an_abo
             stage: Stage::Publishing,
             old_id: None,
             incoming_id: Some(inc.clone()),
+            digests: None,
         }),
     );
     assert!(matches!(
@@ -1086,6 +1094,7 @@ fn startup_recovery_finishes_a_published_job_and_a_pending_trash_and_ends_an_abo
         stage: Stage::Trashing,
         old_id: Some(old_id.clone()),
         incoming_id: Some(new_id.clone()),
+        digests: None,
     });
     JobStore::open(&env.state).unwrap().write(&rec).unwrap();
     assert!(matches!(
@@ -1125,6 +1134,7 @@ fn startup_recovery_finishes_a_published_job_and_a_pending_trash_and_ends_an_abo
                 stage: Stage::Aborting,
                 old_id: None,
                 incoming_id: Some(inc.clone()),
+                digests: None,
             }),
         );
         assert!(matches!(
@@ -1138,6 +1148,111 @@ fn startup_recovery_finishes_a_published_job_and_a_pending_trash_and_ends_an_abo
         );
         assert_eq!(env.drive().trashed.contains(&inc), incoming_left);
         assert!(!drive_has(&env, &["yamareco", DAY]));
+    }
+}
+
+/// `parent` の直下の `name` のファイルの MD5 を別の値にする（同じ名前・同じ大きさのまま中身を書き換えた、を作る）。
+fn change_md5(env: &Env, parent: &[&str], name: &str) {
+    let mut d = env.drive();
+    let p = d.resolve(parent).expect("parent");
+    let ids: Vec<String> = d
+        .children(&p)
+        .iter()
+        .filter(|n| n.name == name)
+        .map(|n| n.id.clone())
+        .collect();
+    assert_eq!(ids.len(), 1, "{name}");
+    d.set_md5(&ids[0], &"f".repeat(32));
+    env.save(&d);
+}
+
+#[test]
+fn startup_recovery_checks_the_kept_md5_and_never_overwrites_the_published_record_with_the_drives_md5()
+ {
+    let folder = geoframe_export::folder::FolderName::parse(DAY).unwrap();
+    let site_rows = three_photos();
+    // (名前, 記録した段階, 公開の記録を新しい行に更新済みか, 書き換えるか)
+    for (name, stage, row_updated, tamper) in [
+        // 公開の記録を書く前に止まった（ジョブの記録は publishing）
+        ("before-row", Stage::Publishing, false, true),
+        // 公開の記録を更新した直後・ジョブの完了の前に止まった（ジョブの記録は trashing）
+        ("after-row", Stage::Trashing, true, true),
+        // 書き換えられていなければ、ジョブの記録の MD5 で公開の記録を書いて完了する
+        ("clean", Stage::Publishing, false, false),
+    ] {
+        let mut env = Env::new(&format!("rec-md5-{name}"));
+        let old_set = env.make_set("old", Y, DAY, &[("090000_9.jpg", 50)]);
+        let new_set = env.make_set(
+            "new",
+            Y,
+            DAY,
+            &[("090000_1.jpg", 100), ("090100_2.jpg", 200)],
+        );
+        let job = JobId::parse(&format!("{:032x}", 40)).unwrap();
+        let old_id = env.seed_managed(Y, DAY, &old_set);
+        let layout = env.layout(Y, DAY, job.as_str());
+        let mut d = env.drive();
+        assert!(d.move_dir(
+            &old_id,
+            &[
+                "geoframe-export-work".to_owned(),
+                "replaced".to_owned(),
+                layout.retired_name().to_owned()
+            ]
+        ));
+        env.save(&d);
+        let new_id = env.seed_folder(Y, DAY, &new_set);
+        if row_updated {
+            env.published
+                .upsert(geoframe_export::published::PublishedRecord {
+                    destination: Y,
+                    folder: folder.clone(),
+                    folder_id: new_id.clone(),
+                    job_id: job.clone(),
+                    files: Some(new_set.recorded()),
+                    previous: Some(Box::new(geoframe_export::published::PreviousFolder {
+                        folder_id: old_id.clone(),
+                        files: old_set.recorded(),
+                    })),
+                })
+                .unwrap();
+        }
+        if tamper {
+            change_md5(&env, &["yamareco", DAY], "090000_1.jpg");
+        }
+        let row_before = std::fs::read(env.published.path_of(Y, &folder)).unwrap();
+        let site = photo_site(DAY, DAY, site_rows.clone());
+        let svc = service(&mut env, &site);
+        let mut rec = JobRecord::new(job.clone(), &request(DAY, None, Some("replace"), None));
+        rec.progress = Some(Progress {
+            stage,
+            old_id: Some(old_id.clone()),
+            incoming_id: Some(new_id.clone()),
+            // ジョブの記録には、退避の前に検証済みの MD5 が書いてある
+            digests: Some(new_set.recorded()),
+        });
+        JobStore::open(&env.state).unwrap().write(&rec).unwrap();
+        assert!(matches!(
+            startup_recovery_retry(&svc),
+            StartupReport::Done { .. }
+        ));
+        let after = read_record(&env, &job);
+        if tamper {
+            // blocked で止め、公開の記録（旧フォルダの行、または新しい行）を書き換えず、旧フォルダもゴミ箱へ移さない
+            assert_eq!(after.status, Status::Blocked, "{name}: {after:?}");
+            assert_eq!(
+                std::fs::read(env.published.path_of(Y, &folder)).unwrap(),
+                row_before,
+                "{name}"
+            );
+            assert!(env.drive().trashed.is_empty(), "{name}");
+        } else {
+            assert_eq!(after.status, Status::Succeeded, "{name}: {after:?}");
+            let row = env.published.find(Y, &folder).unwrap();
+            assert_eq!(row.folder_id, new_id, "{name}");
+            assert_eq!(row.files, Some(new_set.recorded()), "{name}");
+            assert!(env.drive().trashed.contains(&old_id), "{name}");
+        }
     }
 }
 
@@ -1299,6 +1414,7 @@ fn a_cancel_during_another_jobs_recovery_does_not_block_it() {
             stage: Stage::Uploading,
             old_id: None,
             incoming_id: Some(inc.clone()),
+            digests: None,
         }),
     );
     let worker = {
@@ -1355,6 +1471,7 @@ fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
             stage: Stage::Uploading,
             old_id: None,
             incoming_id: Some(inc.clone()),
+            digests: None,
         }),
     );
     // ゴミ箱への移動（purge）を止めておく
@@ -1486,6 +1603,29 @@ fn a_panic_right_after_retiring_is_recovered_in_place_not_failed() {
         Some(json!(3)),
         "数は、公開の前に記録した summary から"
     );
+    // 実際の流れ（Recorder → jobs/<job_id>.json）が、検証済みの MD5（写真 3 枚と manifest.json）を段階の記録に残している。
+    // それは公開の記録の MD5 と同じ（ファイルから読み直して確かめる）
+    let kept = on_disk
+        .progress
+        .as_ref()
+        .and_then(|p| p.digests.clone())
+        .expect("ジョブの記録に検証済みの MD5");
+    let mut paths: Vec<&str> = kept.iter().map(|f| f.path.as_str()).collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "090000_1.jpg",
+            "090100_2.jpg",
+            "103000_3.jpg",
+            "manifest.json"
+        ]
+    );
+    let row = env
+        .published
+        .find(Y, &geoframe_export::folder::FolderName::parse(DAY).unwrap())
+        .unwrap();
+    assert_eq!(row.files, Some(kept));
     assert_eq!(staging_entries(&env), 0);
     assert!(slot_is_free(&env.state));
     assert!(svc.blocking().is_none());

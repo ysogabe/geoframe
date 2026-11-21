@@ -22,6 +22,14 @@ use serde_json::{Value, json};
 const PHOTOS: &[(&str, u64)] = &[("090000_1.jpg", 100), ("090100_2.jpg", 200)];
 const Y: Destination = Destination::Yamareco;
 
+/// 宛先（Y・FOLDER）の公開の記録のファイル。
+fn record_path(env: &Env) -> std::path::PathBuf {
+    env.published.path_of(
+        Y,
+        &geoframe_export::folder::FolderName::parse(FOLDER).unwrap(),
+    )
+}
+
 fn params<'a>(env: &'a Env, set: &'a Set, on_exists: OnExists) -> PublishParams<'a> {
     PublishParams {
         on_exists,
@@ -1007,7 +1015,7 @@ fn folders_not_written_by_this_service_are_never_replaced() {
             "corrupt-record",
             Box::new(|env, set| {
                 env.seed_managed(Y, FOLDER, set);
-                std::fs::write(env.published.path(), "{not json").unwrap();
+                std::fs::write(record_path(env), "{not json").unwrap();
             }),
         ),
         // manifest が無い
@@ -1806,7 +1814,8 @@ fn a_published_result_whose_record_failed_carries_what_is_needed_to_retry_it() {
     let env = Env::new("unrecorded");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     // 公開の記録が読めない（壊れている）→ 書かない
-    std::fs::write(env.published.path(), b"not json").unwrap();
+    std::fs::create_dir_all(env.published.dir()).unwrap();
+    std::fs::write(record_path(&env), b"not json").unwrap();
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Error, &mut hook));
     assert!(!p.recorded);
@@ -1816,7 +1825,7 @@ fn a_published_result_whose_record_failed_carries_what_is_needed_to_retry_it() {
     assert_eq!(p.record.job_id.as_str(), JOB_A);
     assert!(p.retry_record(&env.published).is_err());
     // 記録が直れば、結果に残した行で書き直せる
-    std::fs::remove_file(env.published.path()).unwrap();
+    std::fs::remove_file(record_path(&env)).unwrap();
     p.retry_record(&env.published).unwrap();
     let f = geoframe_export::folder::FolderName::parse(FOLDER).unwrap();
     assert_eq!(
@@ -2169,10 +2178,11 @@ fn a_record_without_md5_refuses_replace_as_not_managed() {
     let env = Env::new("md5-legacy");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let id = env.seed_folder(Y, FOLDER, &set);
+    std::fs::create_dir_all(env.published.dir()).unwrap();
     std::fs::write(
-        env.published.path(),
+        record_path(&env),
         format!(
-            r#"{{"version":1,"entries":[{{"destination":"yamareco","folder":"{FOLDER}","folder_id":"{id}","job_id":"{JOB_B}"}}]}}"#
+            r#"{{"version":1,"entry":{{"destination":"yamareco","folder":"{FOLDER}","folder_id":"{id}","job_id":"{JOB_B}"}}}}"#
         ),
     )
     .unwrap();
@@ -2189,7 +2199,7 @@ fn a_record_without_md5_refuses_replace_as_not_managed() {
     assert_eq!(env.mutations(), Vec::<String>::new());
     assert_eq!(dest_id(&env).as_deref(), Some(id.as_str()));
     // 古い行は、そのまま残っている（MD5 を作り出さない）
-    let text = std::fs::read_to_string(env.published.path()).unwrap();
+    let text = std::fs::read_to_string(record_path(&env)).unwrap();
     assert!(!text.contains("md5"), "{text}");
 }
 
@@ -2332,4 +2342,68 @@ fn only_the_listings_that_check_the_content_ask_for_md5() {
         }
     }
     assert!(hashed >= 1);
+}
+
+// ---- 検証済みの MD5 は、退避・公開の前にジョブの記録へ残す ----
+
+#[test]
+fn the_verified_md5_is_recorded_in_the_job_record_before_the_retire_or_the_publish() {
+    // 新規: uploading・verifying の記録には無く、publishing の記録（公開の移動の前）から、作業領域の各ファイルの MD5 が入る
+    let env = Env::new("digests-new");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let mut hook = Hook::new(&env);
+    published(run(&env, &set, OnExists::Error, &mut hook));
+    let stages: Vec<(Stage, bool)> = hook
+        .records
+        .iter()
+        .map(|r| (r.stage, r.digests.is_some()))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            (Stage::Uploading, false),
+            (Stage::Uploading, false),
+            (Stage::Verifying, false),
+            (Stage::Publishing, true),
+        ]
+    );
+    let last = hook.records.last().unwrap();
+    assert_eq!(last.digests, Some(set.recorded()));
+    // 記録は、公開の移動（moveto）より前に書いている
+    let seq = env.mutations();
+    let rec = seq.iter().position(|c| c == "record:publishing").unwrap();
+    let mv = seq.iter().position(|c| c == "moveto").unwrap();
+    assert!(rec < mv, "{seq:?}");
+
+    // 置き換え: retiring の記録（旧フォルダの退避の移動の前）から入り、publishing・trashing に引き継がれる
+    let env = Env::new("digests-replace");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    env.seed_managed(Y, FOLDER, &set);
+    let mut hook = Hook::new(&env);
+    published(run(&env, &set, OnExists::Replace, &mut hook));
+    let stages: Vec<(Stage, bool)> = hook
+        .records
+        .iter()
+        .map(|r| (r.stage, r.digests.is_some()))
+        .collect();
+    assert_eq!(
+        stages,
+        [
+            (Stage::Uploading, false),
+            (Stage::Uploading, false),
+            (Stage::Verifying, false),
+            (Stage::Retiring, true),
+            (Stage::Publishing, true),
+            (Stage::Trashing, true),
+        ]
+    );
+    assert!(
+        hook.records[3..]
+            .iter()
+            .all(|r| r.digests == Some(set.recorded()))
+    );
+    let seq = env.mutations();
+    let rec = seq.iter().position(|c| c == "record:retiring").unwrap();
+    let mv = seq.iter().position(|c| c == "moveto").unwrap();
+    assert!(rec < mv, "{seq:?}");
 }

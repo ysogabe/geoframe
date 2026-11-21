@@ -238,7 +238,7 @@ impl Env {
                 files: Some(set.recorded()),
                 previous: None,
             })
-            .expect("published.json");
+            .expect("published/");
         id
     }
 
@@ -280,7 +280,7 @@ pub struct Set {
 }
 
 impl Set {
-    /// 公開の記録（`published.json`）に書くファイルごとの MD5。
+    /// 公開の記録（`published/`）に書くファイルごとの MD5。
     pub fn recorded(&self) -> Vec<geoframe_export::published::RecordedFile> {
         self.files
             .iter()

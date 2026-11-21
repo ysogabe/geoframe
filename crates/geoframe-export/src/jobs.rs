@@ -180,7 +180,13 @@ pub struct JobRecord {
 }
 
 fn progress_json(p: &Progress) -> Value {
-    json!({"stage": p.stage.as_str(), "old_id": p.old_id, "incoming_id": p.incoming_id})
+    let mut v =
+        json!({"stage": p.stage.as_str(), "old_id": p.old_id, "incoming_id": p.incoming_id});
+    // 検証済みの MD5 は、退避・公開の段階から（それより前は書かない）
+    if let Some(d) = &p.digests {
+        v["digests"] = crate::published::files_json(d);
+    }
+    v
 }
 
 fn progress_from_json(v: &Value) -> Option<Progress> {
@@ -193,6 +199,11 @@ fn progress_from_json(v: &Value) -> Option<Progress> {
         stage: Stage::parse(v.get("stage")?.as_str()?)?,
         old_id: id("old_id")?,
         incoming_id: id("incoming_id")?,
+        // 無い（MD5 を残す前の古い記録・退避より前の段階）は `None`。あって形が崩れていれば、記録を読めないものにする
+        digests: match v.get("digests") {
+            None | Some(Value::Null) => None,
+            Some(d) => Some(crate::published::parse_files(d)?),
+        },
     })
 }
 
@@ -560,7 +571,7 @@ pub struct JobStore {
 }
 
 /// 実在するディレクトリ（リンクでない）で、なければ 0700 で作る。
-fn ensure_dir(path: &Path, what: &'static str) -> Result<(), ExportError> {
+pub(crate) fn ensure_dir(path: &Path, what: &'static str) -> Result<(), ExportError> {
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() && m.uid() == sys::euid() => Ok(()),
         Ok(_) => Err(internal(what)),
@@ -602,8 +613,13 @@ impl JobStore {
 
     /// 記録をアトミックに書く。
     pub fn write(&self, rec: &JobRecord) -> Result<(), ExportError> {
-        jsonfile::write_json_atomic(&self.path_of(&rec.job_id), &rec.to_file_json())
-            .map_err(|_| internal("ジョブの記録を書けません"))
+        // 読む上限（`RECORD_MAX_BYTES`）を超える記録は、書く前に断る（書いたあとで読めなくなって、後の書き出しを止めないように）
+        jsonfile::write_json_atomic_max(
+            &self.path_of(&rec.job_id),
+            &rec.to_file_json(),
+            RECORD_MAX_BYTES,
+        )
+        .map_err(|_| internal("ジョブの記録を書けません"))
     }
 
     pub fn read(&self, id: &JobId) -> ReadOutcome {
@@ -799,6 +815,7 @@ mod tests {
             stage: Stage::Retiring,
             old_id: Some("oldid1".into()),
             incoming_id: Some("inc1".into()),
+            digests: None,
         });
         r.summary = Some(json!({"catalog_count": 3}));
         r.error = Some(ErrorCode::Blocked);
@@ -814,6 +831,110 @@ mod tests {
         assert!(back.is_finished());
         // ほかの job_id のファイル名で読むと、形が崩れた記録として断る
         assert!(JobRecord::from_file_json(&r.to_file_json(), &id(2)).is_none());
+    }
+
+    #[test]
+    fn the_verified_digests_round_trip_and_a_record_without_them_is_still_readable() {
+        use crate::published::RecordedFile;
+        let digests = vec![
+            RecordedFile {
+                path: "090000_1.jpg".into(),
+                md5: "11111111111111111111111111111111".into(),
+            },
+            RecordedFile {
+                path: "manifest.json".into(),
+                md5: "22222222222222222222222222222222".into(),
+            },
+        ];
+        let mut r = JobRecord::new(id(1), &request(None));
+        r.progress = Some(Progress {
+            stage: Stage::Publishing,
+            old_id: None,
+            incoming_id: Some("inc1".into()),
+            digests: Some(digests.clone()),
+        });
+        let v = r.to_file_json();
+        assert_eq!(v["progress"]["digests"][0]["path"], "090000_1.jpg");
+        let back = JobRecord::from_file_json(&v, &id(1)).unwrap();
+        assert_eq!(back.progress.unwrap().digests, Some(digests));
+        // MD5 を残す前の古い記録（digests のキーが無い）・退避より前の段階（書かない）は、`None` として読める
+        let mut old = v.clone();
+        old["progress"].as_object_mut().unwrap().remove("digests");
+        let back = JobRecord::from_file_json(&old, &id(1)).unwrap();
+        assert_eq!(back.progress.unwrap().digests, None);
+        // 形が崩れていれば、記録を読めないものにする（空・パスや MD5 の形・manifest.json が無い）
+        for bad in [
+            json!([]),
+            json!({}),
+            json!([{"path": "manifest.json", "md5": "short"}]),
+            json!([{"path": "../a", "md5": "11111111111111111111111111111111"}]),
+            json!([{"path": "a.jpg", "md5": "11111111111111111111111111111111"}]),
+        ] {
+            let mut v = v.clone();
+            v["progress"]["digests"] = bad.clone();
+            assert!(JobRecord::from_file_json(&v, &id(1)).is_none(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_record_with_the_digests_of_the_largest_export_stays_within_the_read_limit() {
+        use crate::published::RecordedFile;
+        // 写真 2,000 枚と manifest の MD5 を持つ段階の記録は、読む上限（RECORD_MAX_BYTES）に十分収まる
+        let mut digests: Vec<RecordedFile> = (0..crate::listing::PHOTOS_MAX)
+            .map(|i| RecordedFile {
+                path: format!("{i:0>40}.jpg"),
+                md5: format!("{i:032x}"),
+            })
+            .collect();
+        digests.push(RecordedFile {
+            path: "manifest.json".into(),
+            md5: "22222222222222222222222222222222".into(),
+        });
+        let mut r = JobRecord::new(id(1), &request(None));
+        r.progress = Some(Progress {
+            stage: Stage::Trashing,
+            old_id: Some("oldid1".into()),
+            incoming_id: Some("inc1".into()),
+            digests: Some(digests),
+        });
+        let mut bytes = serde_json::to_vec_pretty(&r.to_file_json()).unwrap();
+        bytes.push(b'\n');
+        assert!(
+            (bytes.len() as u64) < RECORD_MAX_BYTES / 4,
+            "{}",
+            bytes.len()
+        );
+        assert!(JobRecord::from_file_json(&r.to_file_json(), &id(1)).is_some());
+    }
+
+    #[test]
+    fn a_record_over_the_read_limit_is_not_written_and_the_previous_one_stays() {
+        use crate::published::RecordedFile;
+        let d = Dir::new("toolarge");
+        let store = JobStore::open(&d.0).unwrap();
+        let mut r = JobRecord::new(id(1), &request(None));
+        store.write(&r).unwrap();
+        let before = std::fs::read(store.record_path(&id(1))).unwrap();
+        // パスが 1,000 文字を超える MD5 の並びで、読む上限を超える
+        let mut digests: Vec<RecordedFile> = (0..2_100)
+            .map(|i| RecordedFile {
+                path: format!("{i:0>1000}.jpg"),
+                md5: format!("{i:032x}"),
+            })
+            .collect();
+        digests.push(RecordedFile {
+            path: "manifest.json".into(),
+            md5: "22222222222222222222222222222222".into(),
+        });
+        r.progress = Some(Progress {
+            stage: Stage::Publishing,
+            old_id: None,
+            incoming_id: Some("inc1".into()),
+            digests: Some(digests),
+        });
+        assert!(store.write(&r).is_err());
+        assert_eq!(std::fs::read(store.record_path(&id(1))).unwrap(), before);
+        assert!(matches!(store.read(&id(1)), ReadOutcome::Found(_)));
     }
 
     #[test]

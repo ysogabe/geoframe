@@ -1,6 +1,6 @@
 //! JSON のファイルをアトミックに書く・上限付きで読む（design.md 7 章）。
 //!
-//! ジョブの記録（`jobs/<job_id>.json`。T5）と公開の記録（`published.json`。[`crate::published`]）は、同じこの書き方にする:
+//! ジョブの記録（`jobs/<job_id>.json`。T5）と公開の記録（`published/`。[`crate::published`]）は、同じこの書き方にする:
 //! 同じディレクトリの一時ファイル（0600、新規作成）に書いて `fsync` し、`rename` で置き換え、ディレクトリも `fsync` する。
 //! 途中で止まっても、読めるのは「前の完全な記録」か「新しい完全な記録」のどちらかだけになる。
 //!
@@ -18,6 +18,12 @@ static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// `value` を整形して（末尾に改行）`path` へアトミックに書く。`path` の親ディレクトリは存在すること。
 pub fn write_json_atomic(path: &Path, value: &Value) -> io::Result<()> {
+    write_json_atomic_max(path, value, u64::MAX)
+}
+
+/// [`write_json_atomic`] に、書く大きさの上限を付けたもの。上限を超える（末尾の改行を含む）ときは、何も書かずに
+/// [`io::ErrorKind::InvalidData`] を返す（読む側の上限を超える記録を書いて、あとで読めなくならないように、書く前に断る）。
+pub fn write_json_atomic_max(path: &Path, value: &Value, max_bytes: u64) -> io::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -28,6 +34,12 @@ pub fn write_json_atomic(path: &Path, value: &Value) -> io::Result<()> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "ファイル名が不正です"))?;
     let mut bytes = serde_json::to_vec_pretty(value).map_err(io::Error::other)?;
     bytes.push(b'\n');
+    if bytes.len() as u64 > max_bytes {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "記録が上限の大きさを超えます",
+        ));
+    }
 
     let tmp = parent.join(format!(
         ".{file_name}.tmp-{}-{}",

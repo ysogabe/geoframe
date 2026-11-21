@@ -34,7 +34,7 @@ User=geoframe-export
 # --- 状態ディレクトリ ---
 # /var/lib/geoframe-export を User= の持ち物・0700 で用意する。書けるのはここだけ（下の ProtectSystem=strict）。
 #   staging/ … 作業領域（公開の前に一式を作る。成功・失敗にかかわらず消す）
-#   jobs/ … ジョブの記録    published.json … 公開の記録    export.lock … 実行枠（flock。CLI と共通）
+#   jobs/ … ジョブの記録    published/ … 公開の記録    export.lock … 実行枠（flock。CLI と共通）
 #   rclone/ … rclone の設定（rclone.conf。専用の client_id で認可したもの）と、rclone の HOME・キャッシュ
 # 注意: rclone/rclone.conf が無い（または client_id・client_secret が空）と起動しない（終了コード 2）。そのため、初回の起動の前に
 # README の手順で rclone/ と設定を用意する。

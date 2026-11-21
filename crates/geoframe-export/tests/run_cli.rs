@@ -346,6 +346,7 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
         stage: Stage::Uploading,
         old_id: None,
         incoming_id: Some(inc.clone()),
+        digests: None,
     });
     store.write(&running).unwrap();
     let mut early = JobRecord::new(job(3), &common::site::day());
@@ -358,6 +359,7 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
         stage: Stage::Publishing,
         old_id: None,
         incoming_id: Some("fid-x".into()),
+        digests: None,
     });
     blocked.blocked = Some(BlockedNote {
         reason: "stage_inconsistent".into(),
@@ -431,6 +433,7 @@ fn resolve_clears_only_a_blocked_job_without_touching_drive() {
         stage: Stage::Retiring,
         old_id: Some("fid-old".into()),
         incoming_id: Some("fid-inc".into()),
+        digests: None,
     });
     blocked.blocked = Some(BlockedNote {
         reason: "retire_mismatch".into(),
@@ -536,7 +539,7 @@ fn recover_lists_finished_jobs_whose_notes_ask_for_manual_cleanup_without_touchi
     let mut succeeded = JobRecord::new(job(23), &common::site::day());
     succeeded.started_ns -= 20 * SEC;
     settle(&mut succeeded, Status::Succeeded);
-    succeeded.notes = vec!["公開の記録 published.json に書けていません".into()];
+    succeeded.notes = vec!["公開の記録 published/ に書けていません".into()];
     store.write(&succeeded).unwrap();
     let mut quiet = JobRecord::new(job(24), &common::site::day());
     quiet.started_ns -= 10 * SEC;
@@ -559,7 +562,7 @@ fn recover_lists_finished_jobs_whose_notes_ask_for_manual_cleanup_without_touchi
     for note in [
         "incoming/AAA が残っています",
         "replaced/ に残っています",
-        "published.json に書けていません",
+        "published/ に書けていません",
     ] {
         assert!(
             text.contains("知らせ: ") && text.contains(note),

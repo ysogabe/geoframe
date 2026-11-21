@@ -114,6 +114,7 @@ fn progress(stage: Stage, old: Option<&str>, incoming: Option<&str>) -> Progress
         stage,
         old_id: old.map(str::to_owned),
         incoming_id: incoming.map(str::to_owned),
+        digests: None,
     }
 }
 
@@ -619,7 +620,11 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
     let res = w
         .recovery(&r, None)
         .run(
-            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            // ジョブの記録には、退避の前に検証済みの MD5 が書いてある
+            &Progress {
+                digests: Some(w.set.recorded()),
+                ..progress(Stage::Retiring, Some(&old), Some(&inc))
+            },
             false,
             &mut hook,
         )
@@ -647,11 +652,13 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
     let previous = row.previous.expect("previous");
     assert_eq!(previous.folder_id, old);
     assert_eq!(previous.files, w.set.recorded());
-    // 起動時の復旧（手元の一式なし）が書く行の MD5 は、manifest と一致すると確かめた宛先の一覧の MD5
+    // 起動時の復旧（手元の一式なし）が書く行の MD5 は、ジョブの記録に残した検証済みの MD5（宛先の今の MD5 から作り直さない）
     assert_eq!(row.files, Some(w.set.recorded()));
     // 記録は publishing まで進んでいる（retiring のままではない）
     let last = hook.records.last().cloned().unwrap();
     assert_eq!(last.stage, Stage::Publishing);
+    // 記録する段階には、検証済みの MD5 が引き継がれる
+    assert_eq!(last.digests, Some(w.set.recorded()));
     assert_eq!(last.old_id.as_deref(), Some(old.as_str()));
     assert_eq!(last.incoming_id.as_deref(), Some(inc.as_str()));
 
@@ -1224,4 +1231,246 @@ fn a_purge_that_fails_during_recovery_keeps_the_old_folder_in_the_result() {
     assert!(p.recorded);
     assert_eq!(w.recorded_id().as_deref(), Some(inc.as_str()));
     assert!(w.replaced_exists());
+}
+
+// ---- 起動時の復旧は、ジョブの記録に残した検証済みの MD5 で宛先の中身を照らす ----
+
+/// `parent` の直下の `name` のファイルの MD5 を、別の値にする（同じ名前・同じ大きさのまま中身を書き換えた、を作る）。
+fn change_md5(env: &Env, parent: &[&str], name: &str) {
+    let mut d = env.drive();
+    let p = d.resolve(parent).expect("parent");
+    let ids: Vec<String> = d
+        .children(&p)
+        .iter()
+        .filter(|n| n.name == name)
+        .map(|n| n.id.clone())
+        .collect();
+    assert_eq!(ids.len(), 1, "{name}");
+    d.set_md5(&ids[0], &"f".repeat(32));
+    env.save(&d);
+}
+
+fn row_file(w: &World) -> std::path::PathBuf {
+    w.env
+        .published
+        .path_of(Y, &FolderName::parse(FOLDER).unwrap())
+}
+
+/// 置き換えで、旧フォルダを退避し、新しい一式を宛先へ移した状態（記録は publishing 以降）。
+fn replaced_world(name: &str) -> (World, String, String) {
+    let w = world(name);
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.publish_incoming(&inc);
+    (w, old, inc)
+}
+
+#[test]
+fn a_rewrite_after_the_job_record_stopped_is_blocked_and_the_published_record_is_not_overwritten() {
+    // 公開の記録を書く前（ジョブの記録は publishing）に止まり、止まっている間に宛先の写真が、同じ名前・同じ大きさのまま
+    // 書き換えられた。宛先の今の MD5 を正規の一式として登録せず、blocked にして、公開の記録（旧フォルダの行）を変えない
+    let (w, old, inc) = replaced_world("digest-publishing");
+    let before = std::fs::read(row_file(&w)).unwrap();
+    change_md5(&w.env, &["yamareco", FOLDER], "090000_1.jpg");
+    let r = w.env.rclone();
+    let kept = Progress {
+        digests: Some(w.set.recorded()),
+        ..progress(Stage::Publishing, Some(&old), Some(&inc))
+    };
+    let info = w
+        .recovery(&r, None)
+        .run(&kept, false, &mut Hook::new(&w.env))
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::ContentMismatch);
+    assert_eq!(
+        std::fs::read(row_file(&w)).unwrap(),
+        before,
+        "記録を上書きしない"
+    );
+    assert_eq!(w.recorded_id().as_deref(), Some(old.as_str()));
+    // 何も動かしていない（trashing の記録も purge もない）
+    assert_eq!(w.env.mutations(), Vec::<String>::new());
+    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.replaced_exists() && w.env.drive().trashed.is_empty());
+
+    // 書き換えられていなければ、同じ記録で公開済みとして終わり、行にはジョブの記録の MD5 が書かれる
+    let (w, old, inc) = replaced_world("digest-publishing-clean");
+    let r = w.env.rclone();
+    let kept = Progress {
+        digests: Some(w.set.recorded()),
+        ..progress(Stage::Publishing, Some(&old), Some(&inc))
+    };
+    let res = w
+        .recovery(&r, None)
+        .run(&kept, false, &mut Hook::new(&w.env))
+        .unwrap();
+    assert!(matches!(res, Resolution::Published(_)));
+    let row = w
+        .env
+        .published
+        .find(Y, &FolderName::parse(FOLDER).unwrap())
+        .unwrap();
+    assert_eq!(row.folder_id, inc);
+    assert_eq!(row.files, Some(w.set.recorded()));
+    assert_eq!(w.env.drive().trashed, [old]);
+}
+
+#[test]
+fn a_rewrite_right_after_the_published_record_was_updated_is_blocked_by_the_recorded_md5() {
+    // 公開の記録を更新した直後・ジョブの完了の前に止まった（ジョブの記録は trashing）。行は新しいフォルダの ID と MD5 を
+    // 持っている。止まっている間の書き換えは、その行の MD5 で見つけて blocked にする（行を宛先の今の MD5 で上書きしない。
+    // 次の `replace` が、手作業で変えたフォルダをゴミ箱へ移すことになる）
+    for (name, kept_digests) in [("with-job-digests", true), ("without-job-digests", false)] {
+        let (w, old, inc) = replaced_world(&format!("digest-row-{name}"));
+        // 公開の記録は、新しいフォルダの行になっている（旧フォルダは previous に残る）
+        w.env
+            .published
+            .upsert(geoframe_export::published::PublishedRecord {
+                destination: Y,
+                folder: FolderName::parse(FOLDER).unwrap(),
+                folder_id: inc.clone(),
+                job_id: geoframe_export::jobid::JobId::parse(JOB_A).unwrap(),
+                files: Some(w.set.recorded()),
+                previous: Some(Box::new(geoframe_export::published::PreviousFolder {
+                    folder_id: old.clone(),
+                    files: w.set.recorded(),
+                })),
+            })
+            .unwrap();
+        let before = std::fs::read(row_file(&w)).unwrap();
+        change_md5(&w.env, &["yamareco", FOLDER], "090100_2.jpg");
+        let r = w.env.rclone();
+        let p = Progress {
+            // 行があれば、ジョブの記録に MD5 が無くても（古い記録）行の MD5 で照らす
+            digests: kept_digests.then(|| w.set.recorded()),
+            ..progress(Stage::Trashing, Some(&old), Some(&inc))
+        };
+        let info = w
+            .recovery(&r, None)
+            .run(&p, false, &mut Hook::new(&w.env))
+            .unwrap_err();
+        assert_eq!(info.reason, BlockedReason::ContentMismatch, "{name}");
+        assert_eq!(std::fs::read(row_file(&w)).unwrap(), before, "{name}");
+        assert!(w.env.rclone_calls("purge").is_empty(), "{name}");
+        assert!(w.env.drive().trashed.is_empty(), "{name}");
+    }
+
+    // 書き換えられていなければ、行の MD5 のまま完了する（旧フォルダをゴミ箱へ移し、previous は残さない）
+    let (w, old, inc) = replaced_world("digest-row-clean");
+    w.env
+        .published
+        .upsert(geoframe_export::published::PublishedRecord {
+            destination: Y,
+            folder: FolderName::parse(FOLDER).unwrap(),
+            folder_id: inc.clone(),
+            job_id: geoframe_export::jobid::JobId::parse(JOB_A).unwrap(),
+            files: Some(w.set.recorded()),
+            // 旧フォルダがまだ退避先にあるので、その ID と MD5 が previous に残っている
+            previous: Some(Box::new(geoframe_export::published::PreviousFolder {
+                folder_id: old.clone(),
+                files: w.set.recorded(),
+            })),
+        })
+        .unwrap();
+    let r = w.env.rclone();
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Trashing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap();
+    assert!(matches!(res, Resolution::Published(_)));
+    let row = w
+        .env
+        .published
+        .find(Y, &FolderName::parse(FOLDER).unwrap())
+        .unwrap();
+    assert_eq!(row.files, Some(w.set.recorded()));
+    assert!(row.previous.is_none());
+    assert_eq!(w.env.drive().trashed, [old]);
+}
+
+#[test]
+fn a_new_destination_rewritten_while_stopped_is_blocked_too() {
+    // 新規（置き換えでない）: ジョブの記録は publishing、宛先は incoming の ID のフォルダ。書き換えられていれば blocked
+    let w = world("digest-new");
+    let inc = w.put_incoming();
+    w.publish_incoming(&inc);
+    change_md5(&w.env, &["yamareco", FOLDER], "090000_1.jpg");
+    let r = w.env.rclone();
+    let kept = Progress {
+        digests: Some(w.set.recorded()),
+        ..progress(Stage::Publishing, None, Some(&inc))
+    };
+    let info = w
+        .recovery(&r, None)
+        .run(&kept, false, &mut Hook::new(&w.env))
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::ContentMismatch);
+    assert_eq!(w.recorded_id(), None, "公開の記録を書かない");
+    assert!(!row_file(&w).exists());
+
+    // 移す前（retiring のあと・incoming のまま）に書き換えられていても、移さずに blocked
+    let w = world("digest-roll-forward");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    change_md5(
+        &w.env,
+        &["geoframe-export-work", "incoming", JOB_A],
+        "090000_1.jpg",
+    );
+    let r = w.env.rclone();
+    let kept = Progress {
+        digests: Some(w.set.recorded()),
+        ..progress(Stage::Retiring, Some(&old), Some(&inc))
+    };
+    let info = w
+        .recovery(&r, None)
+        .run(&kept, false, &mut Hook::new(&w.env))
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::ContentMismatch);
+    assert!(w.env.rclone_calls("moveto").is_empty());
+    assert!(w.dest().is_none());
+    assert_eq!(w.recorded_id().as_deref(), Some(old.as_str()));
+}
+
+#[test]
+fn an_old_job_record_without_md5_writes_a_row_without_md5_so_the_next_replace_is_refused() {
+    // ジョブの記録にも、同じフォルダ ID の公開の記録にも MD5 が無い（古い記録）。宛先の今の MD5 から作らず、MD5 の無い行にする
+    let w = world("digest-legacy");
+    let inc = w.put_incoming();
+    w.publish_incoming(&inc);
+    let r = w.env.rclone();
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, None, Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap();
+    let Resolution::Published(p) = res else {
+        panic!("{res:?}")
+    };
+    assert!(p.recorded);
+    let row = w
+        .env
+        .published
+        .find(Y, &FolderName::parse(FOLDER).unwrap())
+        .unwrap();
+    assert_eq!(row.folder_id, inc);
+    assert_eq!(row.files, None);
+    // 次の replace は、中身を確かめられないので管理していないものとして断る
+    let layout = w.env.layout(Y, FOLDER, JOB_B);
+    let rclone = w.env.rclone();
+    assert_eq!(
+        geoframe_export::publish::dry_run(&rclone, &layout, &w.env.published)
+            .unwrap()
+            .managed,
+        Some(geoframe_export::drive::Managed::NotManaged)
+    );
 }

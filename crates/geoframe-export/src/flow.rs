@@ -13,7 +13,7 @@
 //! 5. 作業領域を作り、[`crate::image::prepare`]（失敗は、そこまでの数も結果に載せる。全部除外なら `nothing_to_export` で、
 //!    Drive は照会しない）。
 //! 6. [`crate::publish::publish`]（宛先の状態と `conflict` の判定、公開）。段階はジョブの記録へ書く（[`Recorder`]）。
-//! 7. `succeeded`・`conflict`・`failed`・`blocked` を記録する。公開の記録（`published.json`）に書けなかったときは、実行枠を
+//! 7. `succeeded`・`conflict`・`failed`・`blocked` を記録する。公開の記録（`published/`）に書けなかったときは、実行枠を
 //!    持ったまま、次のジョブより前に書き直し（[`crate::publish::Published::retry_record`]）、それでも書けなければ `notes` に残す。
 //! 8. 作業領域を消す（[`crate::staging::Workspace`] を手放す。成功・失敗・パニックのいずれも）。
 //!
@@ -696,7 +696,7 @@ fn failure_done(layout: &Layout, f: PublishFailure, counts: &Counts) -> Done {
 fn settle_published(ctx: &Context<'_>, p: &Published, layout: &Layout, notes: &mut Vec<String>) {
     if !p.recorded && p.retry_record(ctx.published).is_err() {
         notes.push(format!(
-            "公開は済んでいます（フォルダの ID {}）が、公開の記録（published.json）に書けていません。\
+            "公開は済んでいます（フォルダの ID {}）が、公開の記録（published/ の下の、この宛先のファイル）に書けていません。\
              次の replace は、このフォルダを管理しているものとして扱えず、conflict（not_managed）になります。",
             p.folder_id
         ));
