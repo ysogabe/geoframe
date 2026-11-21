@@ -15,7 +15,8 @@
 //!   から `Ok` を返すこと。`Err` を返すと、その段階の Drive の操作はしない。`uploading` は 2 回（フォルダを作る前に段階だけ、
 //!   作って ID が分かってから ID つきで）呼ばれる。**復旧（[`Recovery::run`]・[`Recovery::execute`]）にも同じ口を渡す**:
 //!   復旧が Drive を変える操作（`incoming` の移動＝`publishing`、旧フォルダのゴミ箱への移動＝`trashing`）の前にも、
-//!   段階を書く（復旧の途中でまた止まっても、記録と Drive が食い違わないため）。書けなければ、その操作はしない。
+//!   段階を書く（復旧の途中でまた止まっても、記録と Drive が食い違わないため）。書けなければ、その操作はしない。ゴミ箱への移動の前の `trashing` が書けなかったときは、公開の記録（`published.json`）を更新する**前**に、旧フォルダが退避先に
+//!   あると再確認する（別の ID・照会できないときは、公開の記録を更新せずに `blocked`）。
 //! - ジョブ全体の期限は、渡す [`Rclone`] に `with_deadline` で掛ける。過ぎたら実行中の rclone を kill して `timeout`。後始末と復旧は
 //!   期限なし（コマンドごとの期限だけ）で動く。
 //! - [`Published::recorded`] が偽（公開の記録 `published.json` に書けなかった）のときは、公開は済んでいる。**正常な完了として
@@ -23,6 +24,10 @@
 //!   「公開済み（フォルダの ID）・記録に書けていない」を残す（次の `replace` はこのフォルダを管理していないものとして断る）。
 //! - [`Published::old_left_in_replaced`] が `Some` のときは、新しい一式は公開済みで、旧フォルダが `replaced/` に残っている
 //!   （旧 ID が退避先にあると再確認できた場合に限る。別の ID や照会できないときは、成功にせず `blocked`）。
+//! - 中止の片付け（`incoming/<job_id>` のゴミ箱への移動）の前に、最後に記録した段階が `publishing` なら、段階 `aborting` と
+//!   `incoming` の ID を [`ProgressSink::record`] で記録する（[`Stage::Aborting`]）。T5 は、段階名 `aborting` を、ほかの段階と
+//!   同じようにジョブの記録へ書き、起動時の復旧では [`Progress`] に戻して渡す（[`Stage::parse`] が受け付ける）。書けなければ
+//!   `incoming` は消さず、残りものとして返す。
 //! - [`PublishFailure::leftover_incoming`]・[`Resolution::Interrupted`] の残りもの（`incoming/<job_id>`）は、ID を記録していない
 //!   フォルダを名前だけでは消さないので、残ることがある。結果と `recover` の表示に出す（[`leftover_incoming_text`]）。
 //!
@@ -32,12 +37,14 @@
 //!
 //! | 段 | 照合 |
 //! |---|---|
-//! | `uploading` の最初 | `incoming/<job_id>` を作ったあと、親の一覧で ID を取り（ちょうど 1 つのフォルダ）、記録する |
+//! | `uploading` の最初 | `incoming/<job_id>` を作る**前**に親を一覧し、同名の項目が既にあれば触らずに止める（`mkdir` は既存のフォルダでも成功するので。ID は未記録なので、残りものとして知らせる）。作ったあと、親の一覧で ID を取り（ちょうど 1 つのフォルダ）、記録する |
 //! | `verifying` | 送った中身が一式と完全に一致 |
 //! | 公開の前 | 宛先の状態をもう一度調べる（新規なら「無い」、置き換えなら「記録した旧 ID・管理している・中身が変わっていない」） |
+//! | `retiring` の直前 | `replaced/<…>` に同名の項目が無い。あれば何も動かさずに `blocked`（`replaced_unexpected`。あると `moveto` がファイル単位の移動に切り替わり、旧一式のファイルがそこへ移る） |
 //! | `retiring` の直後 | 宛先が無く、`replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**。違えば `blocked`（`retire_mismatch`。パスで解決する移動が、確かめてから移すまでの間にできた別のフォルダを移した場合） |
 //! | `publishing` の前 | 宛先が無い（新規は無ければ中止、置き換えは `blocked`） |
 //! | `publishing` の直後 | 宛先が**記録した `incoming` の ID 1 つだけ**・`incoming/<job_id>` が残っていない・中身が一式と一致。違えば `blocked`（`publish_mismatch`。ファイル単位の移動への切り替え、宛先に既にあった別のフォルダへの merge など） |
+//! | 中止の片付けの前 | 最後に記録した段階が `publishing` なら、`aborting` を記録してから `incoming` をゴミ箱へ（復旧は、`incoming` が残っていれば消し、無ければ片付け済みとして `interrupted`） |
 //! | `trashing` の直前 | `replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**、かつ**中身が旧 manifest の一式と完全に一致**。違えば `blocked`（`trash_mismatch`・`retired_content_changed`） |
 //! | 取り除き（`incoming` のゴミ箱） | 見えた項目が、**記録した ID** のフォルダちょうど 1 つ（ID が無ければ消さない） |
 //!
@@ -52,8 +59,11 @@
 //!   同じ名前のフォルダが作られる」競合だけ（設計 4.2 の「書き出しの実行中に、オーナーが同じ宛先のフォルダを画面から作ったり
 //!   動かしたりしない」前提の範囲）。起きたときの影響は、移し先のフォルダに**写真が足される**こと（既にあるものは消さず、
 //!   `--immutable` で書き換えない）。移したあとの ID の照合（移し先の ID が `incoming` の ID と違う）で見つけて `blocked` で止まる。
-//!   `recover` の表示（[`BlockedInfo::describe`]）の ID を見て、オーナーが Drive の画面で足された写真を手で片付ける。`retiring`
-//!   （旧フォルダの退避）の移動も同じ。
+//!   `recover` の表示（[`BlockedInfo::describe`]）の ID を見て、オーナーが Drive の画面で足された写真を手で片付ける。
+//!   `retiring`（旧フォルダの退避）の移動は、**案内が別**: 退避先 `replaced/<…>` にできていたフォルダへ旧フォルダの中身のファイルが
+//!   移るので、写真を片付けるのではなく、移った旧ファイルを元の場所（宛先）へ戻す必要がある（`retire_mismatch` の表示）。
+//!   退避は、競合を待たなくても、実行前から `replaced/<…>` に同名の項目があれば起きるので、移す前に退避先を一覧して、あれば
+//!   何も動かさずに `blocked`（`replaced_unexpected`）にしている。
 //!
 //! rclone の drive の `backend moveid`（ID を指して移す）は、フォルダに使えるかをネットワークなしでは確かめられなかったので
 //! 使っていない（パスでの移動と、上の照合）。使えると分かれば、`retiring`・`publishing` の移動だけを差し替えられる
@@ -142,6 +152,11 @@ pub struct Published {
 
 impl Published {
     /// 公開の記録（`published.json`）への書き込みをやり直す（`recorded` が偽のとき）。
+    ///
+    /// **T5 への注意**: [`PublishedStore::upsert`] は、同じ宛先（種類・フォルダ名）の行を**置き換える**。実行枠（flock）を
+    /// 持ったまま、同じ宛先への次のジョブより前に再試行すること。後から再試行するなら、先に宛先の今の ID を確かめる
+    /// （`record.folder_id` と一致するときだけ書く）。そうしないと、その間に別のジョブが公開した新しい行を、古い ID の行で
+    /// 上書きし、次の `replace` が管理しているフォルダを見失う（または別のフォルダを管理しているものと見る）。
     pub fn retry_record(&self, store: &PublishedStore) -> Result<(), ExportError> {
         store.upsert(self.record.clone())
     }
@@ -209,11 +224,26 @@ impl BlockedInfo {
             ));
         }
         match self.reason {
-            BlockedReason::RetireMismatch => text.push_str(&format!(
-                " 戻す手順: replaced の項目（上の ID）が、記録した旧フォルダ（ID {}）と違うフォルダなら、移してしまったものです。\
-                 Drive の画面で、そのフォルダを元の場所（{}）へ戻し、本物の旧フォルダが宛先に残っていることを確かめてください。",
-                self.progress.old_id.as_deref().unwrap_or("記録なし"),
-                layout.dest_path(),
+            BlockedReason::RetireMismatch => {
+                let old = self.progress.old_id.as_deref().unwrap_or("記録なし");
+                text.push_str(&format!(
+                    " 戻す手順は 2 つあります。\
+                     (1) replaced の項目（上の ID）が、記録した旧フォルダ（ID {old}）と違うフォルダで、中身も旧フォルダのものでないなら、\
+                     パスで解決する移動が、確かめてから移すまでの間にできた別のフォルダを移してしまったものです。\
+                     Drive の画面で、そのフォルダを元の場所（{dest}）へ戻し、本物の旧フォルダが宛先に残っていることを確かめてください。\
+                     (2) 退避の移動がファイル単位に切り替わった（replaced の項目が、移動の前からあった別のフォルダだった）ときは、\
+                     旧フォルダの中身のファイルが、そのフォルダ（上の ID）へ移っています。この場合は、移った旧ファイル（旧 manifest の一式）を\
+                     元の場所（宛先 {dest}）へ戻す必要があります（ゴミ箱へは移していません）。旧フォルダ（ID {old}）は、中身が空になって\
+                     宛先に残っているか、無くなっていることがあるので、Drive の画面で確かめてください。\
+                     これは公開の移動で写真が足された場合（下の publish_mismatch の手順）とは別の手順です。",
+                    dest = layout.dest_path(),
+                ));
+            }
+            BlockedReason::ReplacedUnexpected => text.push_str(&format!(
+                " 退避先（{}）に、このジョブの名前の項目があります。退避の移動の前に見つけたときは、何も動かしていません\
+                 （旧フォルダは宛先のままで、`incoming` も残っています）。Drive の画面でその項目が何かを確かめて片付けてから、\
+                 解除してください。退避の移動のあとに見つけたときは、旧フォルダの中身が移っていないかも確かめてください。",
+                layout.retired_path(),
             )),
             BlockedReason::PublishMismatch => text.push_str(&format!(
                 " 宛先（{}）の ID が incoming の ID（{}）と違うときは、宛先に既にあったフォルダへファイル単位で移された（写真が足された）\
@@ -320,6 +350,46 @@ fn clean_incoming(drive: &Drive<'_>, id: Option<&str>) -> Leftover {
     }
 }
 
+/// 段階を記録する（Drive を変える操作の前）。すでにその段階なら書かない。書けなければ `Err`（その操作はしない）。
+/// 書けたら `cur`（最後に記録できた段階と ID）を進める。
+fn record_stage(
+    cur: &mut Progress,
+    stage: Stage,
+    sink: &mut dyn ProgressSink,
+) -> Result<(), ExportError> {
+    if cur.stage == stage {
+        return Ok(());
+    }
+    let next = Progress {
+        stage,
+        old_id: cur.old_id.clone(),
+        incoming_id: cur.incoming_id.clone(),
+    };
+    sink.record(&next)?;
+    *cur = next;
+    Ok(())
+}
+
+/// 中止の片付け: 記録した ID の `incoming/<job_id>` をゴミ箱へ移す。**ゴミ箱へ移す前**に、最後に記録した段階が `publishing`
+/// なら `aborting` を記録する（[`Stage::Aborting`]。移したあと、呼び出し側が `interrupted` を保存するまでに止まっても、再起動で
+/// 「`publishing` のまま宛先も `incoming` も空」の `stage_inconsistent` にならないように）。`uploading`・`verifying`（置き換えの
+/// `retiring` の記録前を含む）で止まった場合は、`incoming` が無くなっていても復旧の表が「前のまま」として `interrupted` で終える
+/// ので、記録は要らない。書けなければ、ゴミ箱へは移さず、残りものとして返す。
+fn abort_incoming(
+    drive: &Drive<'_>,
+    cur: &mut Progress,
+    id: &str,
+    sink: &mut dyn ProgressSink,
+) -> Leftover {
+    if cur.stage == Stage::Publishing && record_stage(cur, Stage::Aborting, sink).is_err() {
+        return Leftover {
+            present: true,
+            id: Some(id.to_owned()),
+        };
+    }
+    clean_incoming(drive, Some(id))
+}
+
 // ---- 復旧の実行 ----
 
 /// 復旧の結果。
@@ -399,26 +469,6 @@ impl Recovery<'_> {
         })
     }
 
-    /// 段階を記録する（Drive を変える操作の前）。すでにその段階なら書かない。書けなければ `Err`（その操作はしない）。
-    /// 書けたら `cur`（最後に記録できた段階と ID）を進める。
-    fn record_stage(
-        cur: &mut Progress,
-        stage: Stage,
-        sink: &mut dyn ProgressSink,
-    ) -> Result<(), ExportError> {
-        if cur.stage == stage {
-            return Ok(());
-        }
-        let next = Progress {
-            stage,
-            old_id: cur.old_id.clone(),
-            incoming_id: cur.incoming_id.clone(),
-        };
-        sink.record(&next)?;
-        *cur = next;
-        Ok(())
-    }
-
     /// 待って、一覧を 2 回取り、同じなら返す。違えば（または取れなければ）待ってやり直し、`rounds` 回で決まらなければ `None`。
     /// `wait_first` が偽なら、最初の 1 回目は待たない（Drive の移動が起きていない段階の失敗）。
     pub fn settle_observe(&self, wait_first: bool) -> Option<Observed> {
@@ -477,8 +527,9 @@ impl Recovery<'_> {
         match &decision.action {
             Action::Blocked(reason) => Err(self.blocked(&cur, *reason, Some(observed))),
             Action::Abort { remove_incoming } => {
+                // `publishing`（新規）から片付けるときは、`incoming` をゴミ箱へ移す前に `aborting` を記録する
                 let left = match remove_incoming {
-                    Some(id) => clean_incoming(&drive, Some(id)),
+                    Some(id) => abort_incoming(&drive, &mut cur, id, sink),
                     None => Leftover::NONE,
                 };
                 Ok(Resolution::Interrupted {
@@ -536,7 +587,7 @@ impl Recovery<'_> {
                     }
                 }
                 // 移す前に `publishing` を記録する（移した直後にまた止まっても、記録が `retiring` のままにならない）
-                if Self::record_stage(&mut cur, Stage::Publishing, sink).is_err() {
+                if record_stage(&mut cur, Stage::Publishing, sink).is_err() {
                     return Err(self.blocked(&cur, BlockedReason::RecordFailed, Some(observed)));
                 }
                 // 直前に宛先が無いことをもう一度確かめる（あれば、移さない）
@@ -604,13 +655,19 @@ impl Recovery<'_> {
         sink: &mut dyn ProgressSink,
     ) -> Result<Resolution, Box<BlockedInfo>> {
         let drive = self.drive();
-        // 記録できなければ、ゴミ箱へは移さない（公開は済んでいる。旧フォルダは `replaced/` に残る）
-        let mut skipped_trash = None;
+        // 記録できなければ、ゴミ箱へは移さない（公開は済んでいる。旧フォルダは `replaced/` に残る）。そのときは、公開の記録
+        // （`published.json`）を書く**前**に、旧フォルダが退避先にあるかを再確認する（別の ID・照会できないときは `blocked`
+        // にするので、`blocked` なのに公開の記録だけ更新済み、という食い違いを作らない）
+        // `Some(..)`: 記録できずにゴミ箱へ移さなかった。中の値が、再確認した結果（旧フォルダが残っていれば `Some(旧 ID)`）
+        let mut skipped: Option<Option<String>> = None;
         let mut trash = trash_old;
         if let Some(old) = trash_old
-            && Self::record_stage(cur, Stage::Trashing, sink).is_err()
+            && record_stage(cur, Stage::Trashing, sink).is_err()
         {
-            skipped_trash = Some(old);
+            skipped = Some(
+                confirm_old_left(&drive, old)
+                    .map_err(|stop| stop.into_blocked(cur, Some(observed)))?,
+            );
             trash = None;
         }
         let mut published = finish_tail(
@@ -626,9 +683,9 @@ impl Recovery<'_> {
             },
         )
         .map_err(|stop| stop.into_blocked(cur, Some(observed)))?;
-        if let Some(old) = skipped_trash {
-            published.old_left_in_replaced = confirm_old_left(&drive, old)
-                .map_err(|stop| stop.into_blocked(cur, Some(observed)))?;
+        // ゴミ箱へ移そうとして失敗したときの `old_left_in_replaced`（`finish_tail` が確かめたもの）は、そのまま残す
+        if let Some(left) = skipped {
+            published.old_left_in_replaced = left;
         }
         Ok(Resolution::Published(published))
     }
@@ -754,6 +811,13 @@ fn query_failure(e: ExportError) -> StepErr {
     }
 }
 
+fn incoming_already_exists() -> ExportError {
+    ExportError::new(
+        ErrorCode::Internal,
+        "作業用のフォルダに、このジョブの名前の incoming が既にあります",
+    )
+}
+
 fn changed_during_run() -> ExportError {
     ExportError::new(
         ErrorCode::AmbiguousDestination,
@@ -786,6 +850,15 @@ impl Run<'_> {
         // 1. uploading: 段階を記録 → incoming/<job_id> を作る → ID を記録 → 写真 → 最後に manifest
         self.record(Stage::Uploading, None)?;
         self.incoming_created = true;
+        // `rclone mkdir` は、既にあるフォルダでも成功する。実行前から同名の `incoming/<job_id>` があると、そのフォルダの ID を
+        // このジョブのものとして記録し、アップロードや失敗時のゴミ箱への移動の対象にしてしまう。作る前に一覧し、同名があれば
+        // 触らずに止める（ID はまだ記録していないので、中止の片付けは名前だけでは消さず、残りものとして知らせる）。宛先も
+        // 旧フォルダも動かしていないので `blocked` にはしない（`job_id` は乱数で、同名があるのは異常だが、守るべきものは無い）
+        match self.drive.incoming_seen() {
+            Ok(seen) if seen.is_empty() => {}
+            Ok(_) => return Err(StepErr::Abort(incoming_already_exists())),
+            Err(e) => return Err(StepErr::Op(e)),
+        }
         self.drive.mkdir_incoming().map_err(StepErr::Op)?;
         let incoming_id = self.drive.incoming_id().map_err(StepErr::Op)?;
         self.record(Stage::Uploading, Some(&incoming_id))?;
@@ -843,12 +916,30 @@ impl Run<'_> {
         self.finish(incoming_id, None)
     }
 
-    /// 置き換え: 退避 → 公開 → ゴミ箱。退避・公開の移動が、確かめてから移すまでの数秒に同じ名前のフォルダができた場合の影響は、
-    /// [`Self::publish_absent`] と同じ（`retiring` では、`replaced/<…>` にできていたフォルダへ旧フォルダの中身が足される。
-    /// 退避の直後の照合で見つけて `blocked` にし、ゴミ箱へは移さない）。
+    /// 置き換え: 退避 → 公開 → ゴミ箱。公開の移動が、確かめてから移すまでの数秒に同じ名前のフォルダができた場合の影響は、
+    /// [`Self::publish_absent`] と同じ。退避の移動は、実行前から退避先に同名の項目があれば、移す前の一覧で見つけて `blocked`
+    /// にする。確かめてから移すまでの数秒にできた場合は、`replaced/<…>` にできていたフォルダへ旧フォルダの中身が**移る**
+    /// （写真が足されるのではなく、旧ファイルを宛先へ戻す必要がある。案内は [`BlockedInfo::describe`] の `retire_mismatch`）。
+    /// 退避の直後の照合で見つけて `blocked` にし、ゴミ箱へは移さない。
     fn publish_replace(&mut self, incoming_id: &str, old: &str) -> Result<Published, StepErr> {
         // retiring: 旧フォルダ（ID 記録済み）を replaced/<…> へ移し、結果を照合する
         self.record(Stage::Retiring, Some(incoming_id))?;
+        // 退避先 `replaced/<…>` に同名の項目が実行前からあると、`moveto` は Drive の中での移動をやめてファイル単位の移動に
+        // 切り替わり、旧一式のファイルがそこへ移ってしまう。移す前に退避先の親を一覧し、同名があれば何も動かさずに `blocked`
+        // にする（旧フォルダは宛先のまま。再起動の復旧も、`replaced/` に項目があるので同じ `blocked`）
+        match self.drive.replaced_seen() {
+            Ok(seen) if seen.is_empty() => {}
+            Ok(seen) => {
+                let mut observed = self.drive.observe().unwrap_or_default();
+                observed.replaced = seen;
+                return Err(StepErr::Blocked(Box::new(BlockedInfo {
+                    reason: BlockedReason::ReplacedUnexpected,
+                    progress: self.progress.clone(),
+                    observed: Some(observed),
+                })));
+            }
+            Err(e) => return Err(StepErr::Op(e)),
+        }
         self.retire_issued = true;
         self.drive.retire_old().map_err(StepErr::Op)?;
         match self.drive.check_retired(old).map_err(StepErr::Op)? {
@@ -1005,7 +1096,13 @@ pub fn publish(
             // 記録した ID と一致するフォルダだけを片付ける。ID を記録できていなければ（記録に失敗した場合を含む）名前だけでは消さず、
             // 残っていれば残りものとして返す
             let left = if run.incoming_created {
-                clean_incoming(&run.free_drive, run.progress.incoming_id.as_deref())
+                match run.progress.incoming_id.clone() {
+                    // `publishing`（新規）なら、ゴミ箱へ移す前に `aborting` を記録する
+                    Some(id) => {
+                        abort_incoming(&run.free_drive, &mut run.progress, &id, &mut *run.sink)
+                    }
+                    None => clean_incoming(&run.free_drive, None),
+                }
             } else {
                 Leftover::NONE
             };

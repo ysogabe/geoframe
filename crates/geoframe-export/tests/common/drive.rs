@@ -178,6 +178,14 @@ impl Env {
             .collect()
     }
 
+    /// Drive の `parent`（なければ作る）の直下に、`name` のファイル（中身は 5 バイト）を足す。ファイルの ID を返す。
+    pub fn drive_add_file(&self, parent: &[&str], name: &str) -> String {
+        let mut d = self.drive();
+        let id = d.add_file(parent, name, 5, None);
+        self.save(&d);
+        id
+    }
+
     // ---- 公開する一式の用意 ----
 
     /// 作業領域（絶対パスのディレクトリ）に、`files`（相対パスとサイズ）の写真と `manifest.json` を作る。

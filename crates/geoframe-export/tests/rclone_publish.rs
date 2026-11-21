@@ -11,10 +11,11 @@ use common::drive::*;
 use geoframe_export::drive::{Managed, Target};
 use geoframe_export::error::ErrorCode;
 use geoframe_export::publish::{
-    ConflictReason, PublishFailure, PublishOutcome, PublishParams, Published, dry_run, publish,
+    ConflictReason, PublishFailure, PublishOutcome, PublishParams, Published, Recovery, Resolution,
+    dry_run, publish,
 };
 use geoframe_export::rclone::Rclone;
-use geoframe_export::recovery::{BlockedReason, Stage};
+use geoframe_export::recovery::{BlockedReason, Progress, Stage};
 use geoframe_export::request::{Destination, OnExists};
 use serde_json::{Value, json};
 
@@ -638,6 +639,13 @@ fn a_file_by_file_retire_move_blocks_before_anything_reaches_the_trash() {
     let text = info.describe(&env.layout(Y, FOLDER, JOB_A));
     assert!(text.contains(&o.replaced[0].id), "{text}");
     assert!(text.contains("戻す手順"), "{text}");
+    // 退避のファイル単位の移動は、移った旧ファイルを元の場所へ戻す案内（公開の移動で足された写真を片付ける案内とは別）
+    assert!(text.contains("移った旧ファイル"), "{text}");
+    assert!(
+        text.contains(env.layout(Y, FOLDER, JOB_A).dest_path()),
+        "{text}"
+    );
+    assert!(!text.contains("足された写真"), "{text}");
 }
 
 #[test]
@@ -711,9 +719,9 @@ fn an_unstable_listing_that_never_settles_blocks() {
     c.rules.push(model::Rule {
         cmd: "lsjson".into(),
         contains: None,
-        // 失敗した移動より前の lsjson（宛先の状態 2、incoming の ID 2、検証 2、確かめ直し 2、公開の直前 2）は通し、
-        // 失敗のあとの一覧（復旧の観察）をすべて失敗させる
-        skip: 10,
+        // 失敗した移動より前の lsjson（宛先の状態 2、incoming の事前確認 1〔作業用のフォルダに incoming がまだ無い〕、
+        // incoming の ID 2、検証 2、確かめ直し 2、公開の直前 2）は通し、失敗のあとの一覧（復旧の観察）をすべて失敗させる
+        skip: 11,
         times: u64::MAX,
         seen: 0,
         effect: fail(1),
@@ -746,6 +754,18 @@ fn a_destination_created_during_the_run_stops_the_publish_and_cleans_incoming() 
         assert!(f.blocked.is_none() && !f.leftover_incoming, "{name}");
         assert!(env.rclone_calls("moveto").is_empty(), "{name}: 移動しない");
         assert_eq!(env.drive().trashed.len(), 1, "{name}: incoming を片付けた");
+        // 中止の片付けに入ったことを、ゴミ箱へ移す前に記録する（`publishing` から中止したときだけ。それ以外は前のままと見える）
+        let seq = env.mutations();
+        let aborting = seq.iter().position(|c| c == "record:aborting");
+        if stage == Stage::Publishing {
+            let rec = hook.records.last().unwrap();
+            assert_eq!(rec.stage, Stage::Aborting, "{name}");
+            assert_eq!(rec.incoming_id, hook.records[1].incoming_id, "{name}");
+            let purge = seq.iter().position(|c| c == "purge").unwrap();
+            assert!(aborting.is_some_and(|a| a < purge), "{name}: {seq:?}");
+        } else {
+            assert!(aborting.is_none(), "{name}: {seq:?}");
+        }
         // オーナーが作ったフォルダには触れない
         assert!(dest_id(&env).is_some());
     }
@@ -1800,6 +1820,229 @@ fn the_incoming_that_no_longer_matches_the_recorded_id_is_left_and_reported() {
     let recorded = hook.records.last().unwrap().incoming_id.clone().unwrap();
     assert_eq!(f.leftover_incoming_id.as_deref(), Some(recorded.as_str()));
     assert!(env.rclone_calls("purge").is_empty());
+    assert!(env.drive().trashed.is_empty());
+    assert!(
+        env.drive()
+            .resolve(&["geoframe-export-work", "incoming", JOB_A])
+            .is_some()
+    );
+}
+
+// ---- 退避の前に、退避先に同名の項目が無いことを確かめる ----
+
+#[test]
+fn a_same_named_item_already_in_replaced_stops_the_retire_before_anything_moves() {
+    for as_file in [false, true] {
+        let env = Env::new(&format!("retire-occupied-{as_file}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = env.seed_managed(Y, FOLDER, &set);
+        let retired = format!("yamareco-{FOLDER}-{JOB_A}");
+        // 実行前から、退避先と同じ名前の項目がある（旧フォルダの中身と同じ名前のファイルを含むフォルダ、またはファイル）
+        let pre = if as_file {
+            env.drive_add_file(&["geoframe-export-work", "replaced"], &retired)
+        } else {
+            env.seed_set_at(&["geoframe-export-work", "replaced", &retired], &set)
+        };
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+        assert_eq!(f.error.code, ErrorCode::Blocked, "file={as_file}");
+        let info = f.blocked.expect("blocked");
+        assert_eq!(info.reason, BlockedReason::ReplacedUnexpected);
+        assert_eq!(info.progress.stage, Stage::Retiring);
+        assert_eq!(info.progress.old_id.as_deref(), Some(old_id.as_str()));
+        let seen = &info.observed.as_ref().unwrap().replaced;
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].id, pre, "見えていた項目の ID");
+        // 何も動かしていない: 移動も purge も無く、旧フォルダは宛先のまま、incoming も残っている
+        assert!(env.rclone_calls("moveto").is_empty(), "file={as_file}");
+        assert!(env.rclone_calls("purge").is_empty());
+        assert_eq!(
+            env.mutations().last().map(String::as_str),
+            Some("record:retiring")
+        );
+        assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
+        assert_eq!(
+            files_under(&env, &["yamareco", FOLDER]),
+            expected_files(&set),
+            "旧一式のファイルは宛先のまま"
+        );
+        if !as_file {
+            assert_eq!(
+                files_under(&env, &["geoframe-export-work", "replaced", &retired]),
+                expected_files(&set),
+                "もともとあった項目に、何も足されていない"
+            );
+        }
+        assert!(
+            env.drive()
+                .resolve(&["geoframe-export-work", "incoming", JOB_A])
+                .is_some()
+        );
+        assert!(env.drive().trashed.is_empty() && env.drive().deleted.is_empty());
+        let layout = env.layout(Y, FOLDER, JOB_A);
+        let text = info.describe(&layout);
+        assert!(
+            text.contains("replaced_unexpected") && text.contains(&pre),
+            "{text}"
+        );
+        assert!(text.contains("何も動かしていません"), "{text}");
+
+        // 再起動の復旧も、記録した retiring と同じ状態を blocked にする（動かさない）
+        let r = env.rclone();
+        let rec = Recovery {
+            rclone: &r,
+            layout: &layout,
+            published: &env.published,
+            expected: None,
+            timing: fast_timing(),
+        };
+        let again = rec
+            .run(&info.progress, false, &mut Hook::new(&env))
+            .unwrap_err();
+        assert_eq!(again.reason, BlockedReason::ReplacedUnexpected);
+        assert!(env.rclone_calls("moveto").is_empty());
+    }
+}
+
+// ---- incoming を作る前に、同名の項目が無いことを確かめる ----
+
+#[test]
+fn a_same_named_incoming_that_already_exists_is_not_adopted_and_is_reported_as_a_leftover() {
+    for variant in ["dir", "file", "two-dirs"] {
+        let env = Env::new(&format!("incoming-occupied-{variant}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let work = ["geoframe-export-work", "incoming"];
+        let (expect_id, kept) = match variant {
+            "dir" => {
+                let id = env.seed_set_at(&["geoframe-export-work", "incoming", JOB_A], &set);
+                (Some(id.clone()), vec![id])
+            }
+            "file" => {
+                let id = env.drive_add_file(&work, JOB_A);
+                (None, vec![id])
+            }
+            _ => {
+                let mut d = env.drive();
+                d.mkdir_p(&work);
+                let a = d.mkdir_dup(&work, JOB_A);
+                let b = d.mkdir_dup(&work, JOB_A);
+                env.save(&d);
+                (None, vec![a, b])
+            }
+        };
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+        // 宛先は動かしておらず、守るものは無いので blocked にはしない。残りものとして知らせる
+        assert_eq!(f.error.code, ErrorCode::Internal, "{variant}");
+        assert!(f.blocked.is_none(), "{variant}");
+        assert!(f.leftover_incoming, "{variant}");
+        assert_eq!(f.leftover_incoming_id, expect_id, "{variant}");
+        // 既存のフォルダの ID を、このジョブのものとして記録しない。作らず、送らず、消さない
+        assert_eq!(hook.records.len(), 1, "{variant}");
+        assert_eq!(hook.records[0].stage, Stage::Uploading);
+        assert!(hook.records[0].incoming_id.is_none(), "{variant}");
+        for cmd in ["mkdir", "copy", "moveto", "purge"] {
+            assert!(env.rclone_calls(cmd).is_empty(), "{variant}: {cmd}");
+        }
+        assert!(dest_id(&env).is_none(), "{variant}");
+        assert!(env.drive().trashed.is_empty() && env.drive().deleted.is_empty());
+        let d = env.drive();
+        for id in kept {
+            assert!(d.node(&id).is_some(), "{variant}: 触っていない");
+        }
+        if variant == "dir" {
+            assert_eq!(
+                files_under(&env, &["geoframe-export-work", "incoming", JOB_A]),
+                expected_files(&set),
+                "既存のフォルダの中身は触っていない"
+            );
+        }
+    }
+}
+
+// ---- 中止の片付けの前に、`aborting` を記録する ----
+
+#[test]
+fn an_abort_from_publishing_records_aborting_before_the_trash_and_a_second_stop_resumes() {
+    let env = Env::new("abort-record");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    // publishing を記録したあと、直前の確認の前に、オーナーが宛先を作った
+    let mut hook = Hook::new(&env).mutate_after(Stage::Publishing, move || {
+        let mut d = model::Drive::load(&fake);
+        d.mkdir_p(&["yamareco", FOLDER]);
+        d.save(&fake);
+    });
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::AmbiguousDestination);
+    let seq = env.mutations();
+    let n = seq.len();
+    assert_eq!(
+        &seq[n - 3..],
+        ["record:publishing", "record:aborting", "purge"]
+    );
+    let last = hook.records.last().cloned().unwrap();
+    assert_eq!(last.stage, Stage::Aborting);
+    assert_eq!(last.old_id, None);
+    assert_eq!(last.incoming_id, hook.records[1].incoming_id);
+
+    // purge の直後に止まった、として再起動する。この中止は、宛先にオーナーのフォルダができたことが原因なので、宛先は
+    // 前のままではない。表のとおり（宛先が変わっていれば blocked）、再起動の復旧は destination_unexpected で止まる
+    let layout = env.layout(Y, FOLDER, JOB_A);
+    let r = env.rclone();
+    let rec = Recovery {
+        rclone: &r,
+        layout: &layout,
+        published: &env.published,
+        expected: None,
+        timing: fast_timing(),
+    };
+    let info = rec.run(&last, false, &mut Hook::new(&env)).unwrap_err();
+    assert_eq!(info.reason, BlockedReason::DestinationUnexpected);
+    // オーナーのフォルダを片付けた（宛先が前のまま）あとの再起動: aborting なら、片付け済みとして interrupted で終える。
+    // 記録が publishing のままなら、あるはずのものが無い状態（stage_inconsistent）で blocked になっていた
+    let owner = env.drive().resolve(&["yamareco", FOLDER]).unwrap();
+    let mut d = env.drive();
+    d.purge(&owner, false);
+    env.save(&d);
+    let res = rec.run(&last, false, &mut Hook::new(&env)).unwrap();
+    assert_eq!(
+        res,
+        Resolution::Interrupted {
+            leftover_incoming: false,
+            leftover_incoming_id: None
+        }
+    );
+    let stale = Progress {
+        stage: Stage::Publishing,
+        ..last.clone()
+    };
+    let info = rec.run(&stale, false, &mut Hook::new(&env)).unwrap_err();
+    assert_eq!(
+        info.reason,
+        BlockedReason::StageInconsistent,
+        "aborting を記録していなければ、これで blocked になっていた"
+    );
+}
+
+#[test]
+fn an_abort_whose_aborting_record_cannot_be_written_does_not_trash_the_incoming() {
+    let env = Env::new("abort-record-fails");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    let mut hook = Hook::new(&env)
+        .mutate_after(Stage::Publishing, move || {
+            let mut d = model::Drive::load(&fake);
+            d.mkdir_p(&["yamareco", FOLDER]);
+            d.save(&fake);
+        })
+        .fail_at(Stage::Aborting, 1);
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::AmbiguousDestination);
+    // 書けなければ、ゴミ箱へは移さない。残りものとして ID つきで知らせる
+    assert!(env.rclone_calls("purge").is_empty());
+    assert!(f.leftover_incoming);
+    assert_eq!(f.leftover_incoming_id, hook.records[1].incoming_id);
     assert!(env.drive().trashed.is_empty());
     assert!(
         env.drive()

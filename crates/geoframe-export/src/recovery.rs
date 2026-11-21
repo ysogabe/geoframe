@@ -11,7 +11,7 @@
 //!
 //! 1. **前のまま**（[`Row::BeforeChange`]）: 宛先が前のまま（新規なら無い、置き換えなら記録した旧フォルダの ID だけ）で、
 //!    `replaced/` にこのジョブの項目が無い。→ `incoming` を消して `interrupted`。設計の行「`uploading`・`verifying`」と
-//!    「`retiring` で、旧フォルダが宛先にあり `replaced/…` が無い」を含む。`replaced/` に何かあれば `blocked`。
+//!    「`retiring` で、旧フォルダが宛先にあり `replaced/…` が無い」と「`aborting`」を含む。`replaced/` に何かあれば `blocked`。
 //! 2. **前へ進める**（[`Row::RollForward`]）: 置き換えで、旧フォルダが `replaced/` にあり、宛先が無く、`incoming` がある。
 //!    → `incoming` を宛先へ移し、旧フォルダをゴミ箱へ（設計の行「`retiring`・`publishing`」）。
 //! 3. **公開済み**（[`Row::Published`]）: 宛先が `incoming` の ID のフォルダになっていて、`incoming` は無い。→ 公開の記録に足し、
@@ -25,6 +25,9 @@
 //!   `incoming` も消えていて宛先も空なら、あるはずのものが無いので `blocked`。
 //! - 置き換えの `publishing` で、旧 ID のフォルダが宛先にある → `blocked`。`publishing` に進めるのは退避の照合に通ったあとなので、
 //!   旧フォルダが宛先に戻っているのは、誰かが動かした状態（旧フォルダは宛先にあるのに退避先も空、という形も含む）。
+//! - `aborting`（中止の片付けに入った。[`Stage::Aborting`]）: 宛先が前のままなら、`incoming` が記録の ID で残っていれば消して
+//!   `interrupted`、もう無ければ片付け済みとして `interrupted`（上の「前のまま」と同じ）。宛先が前のままでない（別のものがある・
+//!   `incoming` の ID が違う・`replaced/` に項目がある・宛先が新しい一式になっている）ときは `blocked`。
 //! - `uploading` で、`incoming/<job_id>` はあるが ID を記録する前に止まった → **名前だけでは消さない**。名前で見つけたフォルダは
 //!   [`Action::KeepUnrecordedIncoming`]（消さずに残りものとして知らせ、`interrupted` で終える。宛先は前のままなので `blocked` にはしない）。
 //!   `incoming/<job_id>` のゴミ箱への移動は、記録した ID と一致するフォルダ 1 つだけのときにする。
@@ -44,15 +47,22 @@ pub enum Stage {
     Retiring,
     Publishing,
     Trashing,
+    /// 中止の片付けに入った（公開の途中の中止で、`incoming/<job_id>` をゴミ箱へ移す**前**に記録する）。`publishing`
+    /// 段階（新規）から中止すると、ゴミ箱へ移したあと、呼び出し側がジョブの終了を保存するまでに止まったとき、再起動では
+    /// `publishing` のまま宛先も `incoming` も空になり、あるはずのものが無い状態（`stage_inconsistent`）と区別できない。
+    /// この段階が記録されていれば、`incoming` が残っていれば消し、もう無ければ片付け済みとして `interrupted` で終える。
+    /// 宛先が前のままでなければ `blocked`。
+    Aborting,
 }
 
 impl Stage {
-    pub const ALL: [Stage; 5] = [
+    pub const ALL: [Stage; 6] = [
         Self::Uploading,
         Self::Verifying,
         Self::Retiring,
         Self::Publishing,
         Self::Trashing,
+        Self::Aborting,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -62,6 +72,7 @@ impl Stage {
             Self::Retiring => "retiring",
             Self::Publishing => "publishing",
             Self::Trashing => "trashing",
+            Self::Aborting => "aborting",
         }
     }
 
@@ -642,13 +653,89 @@ mod tests {
                 }
             }
         }
-        // 前のまま: 新規 4 段階（uploading・verifying・retiring・publishing）×incoming 無し/あり ＋ 置き換え 3 段階
-        // （publishing を除く）×2 から、新規 publishing で incoming 無し（blocked）を除く 7 ＋ 6 = 13、
-        // 進める 2、公開済み 2+3（13 + 2 + 5 = 20。上の `expected` と数が合うこと）
-        assert_eq!(non_blocked, 20);
+        // 前のまま: 新規 5 段階（uploading・verifying・retiring・publishing・aborting）×incoming 無し/あり ＋ 置き換え 4 段階
+        // （publishing を除く）×2 から、新規 publishing で incoming 無し（blocked）を除く 9 ＋ 8 = 17、
+        // 進める 2、公開済み 2+3（17 + 2 + 5 = 24。上の `expected` と数が合うこと）。全セルは 6 段階 × 2 × 112 = 1344
+        assert_eq!(non_blocked, 24);
     }
 
     // ---- 設計の表の各行（名前を付けて確かめる） ----
+
+    #[test]
+    fn row_aborting_finishes_the_cleanup_or_blocks_when_the_destination_is_not_as_before() {
+        for replace in [false, true] {
+            let p = progress(Stage::Aborting, replace);
+            let before = if replace { D::Old } else { D::Empty };
+            // incoming が記録の ID で残っている → 消して interrupted
+            let got = decide(&p, &observed(before, I::Intact, R::Empty));
+            assert_eq!(
+                got.action,
+                Action::Abort {
+                    remove_incoming: Some(INC.into())
+                },
+                "replace={replace}"
+            );
+            assert_eq!(got.row, Some(Row::BeforeChange));
+            // もう無い（ゴミ箱へ移したあとで止まった）→ 片付け済みとして interrupted（publishing のままなら blocked になる形）
+            let got = decide(&p, &observed(before, I::Gone, R::Empty));
+            assert_eq!(
+                got.action,
+                Action::Abort {
+                    remove_incoming: None
+                },
+                "replace={replace}"
+            );
+            // incoming の ID が記録と違う・複数 → 消さずに blocked
+            for i in [I::Other, I::Dup] {
+                assert_eq!(
+                    decide(&p, &observed(before, i, R::Empty)).action,
+                    Action::Blocked(BlockedReason::IncomingUnexpected),
+                    "replace={replace} {i:?}"
+                );
+            }
+            // replaced/ に項目がある → blocked
+            for r in [R::Old, R::Other, R::Dup] {
+                assert_eq!(
+                    decide(&p, &observed(before, I::Gone, r)).action,
+                    Action::Blocked(BlockedReason::ReplacedUnexpected),
+                    "replace={replace} {r:?}"
+                );
+            }
+            // 宛先が変わっている（別のもの・複数・ファイル・ショートカット・新しい一式）→ blocked
+            for d in [D::Other, D::Dup, D::File, D::Shortcut, D::Inc] {
+                if d == before {
+                    continue;
+                }
+                for i in [I::Gone, I::Intact] {
+                    assert!(
+                        matches!(
+                            decide(&p, &observed(d, i, R::Empty)).action,
+                            Action::Blocked(_)
+                        ),
+                        "replace={replace} {d:?} {i:?}"
+                    );
+                }
+            }
+        }
+        // 宛先が新しい一式（incoming が無い）でも、中止の片付けの記録があるなら公開済みとは見ない
+        assert_eq!(
+            decide(
+                &progress(Stage::Aborting, false),
+                &observed(D::Inc, I::Gone, R::Empty)
+            )
+            .action,
+            Action::Blocked(BlockedReason::StageInconsistent)
+        );
+        // 同じ「宛先も incoming も空」でも、publishing（新規）は blocked、aborting は片付け済み
+        assert_eq!(
+            decide(
+                &progress(Stage::Publishing, false),
+                &observed(D::Empty, I::Gone, R::Empty)
+            )
+            .action,
+            Action::Blocked(BlockedReason::StageInconsistent)
+        );
+    }
 
     #[test]
     fn row_uploading_and_verifying_with_an_untouched_destination_abort() {

@@ -919,3 +919,224 @@ fn the_old_folder_is_not_trashed_when_its_contents_changed_while_the_service_was
         assert_eq!(w.dest().as_deref(), Some(inc.as_str()));
     }
 }
+
+// ---- 中止の片付け（aborting）と、記録の失敗時の再確認の順序 ----
+
+#[test]
+fn recovery_records_aborting_before_it_trashes_the_incoming_of_a_new_publish() {
+    // 新規の publishing で、宛先はまだ無く、incoming が残っている → 前のまま。ゴミ箱へ移す前に aborting を記録する
+    let w = world("abort-from-publishing");
+    let inc = w.put_incoming();
+    let r = w.env.rclone();
+    let mut hook = Hook::new(&w.env);
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, None, Some(&inc)),
+            false,
+            &mut hook,
+        )
+        .unwrap();
+    assert_eq!(res, interrupted());
+    assert_eq!(w.env.mutations(), ["record:aborting", "purge"]);
+    let last = hook.records.last().cloned().unwrap();
+    assert_eq!(last, progress(Stage::Aborting, None, Some(&inc)));
+    assert!(!w.incoming_exists());
+
+    // purge の直後にまた止まった、として、記録した aborting から再開する: incoming は無い → 片付け済みで interrupted
+    let res = resume(&w, &last).unwrap();
+    assert_eq!(res, interrupted());
+    assert_eq!(w.env.rclone_calls("purge").len(), 1, "もう消さない");
+    // 記録が publishing のままなら、あるはずのものが無い状態として blocked だった（aborting を先に記録する理由）
+    let stale = progress(Stage::Publishing, None, Some(&inc));
+    let info = resume(&w, &stale).unwrap_err();
+    assert_eq!(info.reason, BlockedReason::StageInconsistent);
+}
+
+#[test]
+fn recovery_does_not_trash_the_incoming_when_aborting_cannot_be_recorded() {
+    let w = world("abort-record-fails");
+    let inc = w.put_incoming();
+    let r = w.env.rclone();
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, None, Some(&inc)),
+            false,
+            &mut Hook::new(&w.env).fail_at(Stage::Aborting, 1),
+        )
+        .unwrap();
+    assert_eq!(
+        res,
+        Resolution::Interrupted {
+            leftover_incoming: true,
+            leftover_incoming_id: Some(inc.clone()),
+        }
+    );
+    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.incoming_exists());
+}
+
+#[test]
+fn the_aborting_row_finishes_the_cleanup_or_blocks() {
+    // incoming が記録の ID で残っている（記録済みの aborting から。再度は記録しない）→ 消して interrupted
+    let w = world("aborting-intact");
+    let inc = w.put_incoming();
+    let r = w.env.rclone();
+    let mut hook = Hook::new(&w.env);
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Aborting, None, Some(&inc)),
+            false,
+            &mut hook,
+        )
+        .unwrap();
+    assert_eq!(res, interrupted());
+    assert!(
+        hook.records.is_empty(),
+        "すでに aborting なので、書き直さない"
+    );
+    assert_eq!(w.env.drive().trashed, std::slice::from_ref(&inc));
+
+    // もう無い → 片付け済みとして interrupted（置き換えでも同じ。旧フォルダは宛先のまま）
+    let w = world("aborting-gone");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let res = resume(&w, &progress(Stage::Aborting, Some(&old), Some("fidGONE"))).unwrap();
+    assert_eq!(res, interrupted());
+    assert!(w.env.mutations().is_empty());
+    assert_eq!(w.dest().as_deref(), Some(old.as_str()));
+
+    // 宛先が前のままでない（別のフォルダがある・新しい一式になっている）→ blocked。何も動かさない
+    let w = world("aborting-dest-changed");
+    let inc = w.put_incoming();
+    w.env.seed_set_at(&["yamareco", FOLDER], &w.set);
+    let info = resume(&w, &progress(Stage::Aborting, None, Some(&inc))).unwrap_err();
+    assert_eq!(info.reason, BlockedReason::DestinationUnexpected);
+    assert!(w.env.mutations().is_empty());
+    assert!(w.incoming_exists());
+
+    let w = world("aborting-published");
+    let inc = w.put_incoming();
+    w.publish_incoming(&inc);
+    let info = resume(&w, &progress(Stage::Aborting, None, Some(&inc))).unwrap_err();
+    assert_eq!(info.reason, BlockedReason::StageInconsistent);
+    assert!(w.env.mutations().is_empty());
+
+    // incoming が記録の ID と違う → 消さずに blocked
+    let w = world("aborting-other-incoming");
+    let _inc = w.put_incoming();
+    let info = resume(&w, &progress(Stage::Aborting, None, Some("fidSOMEONEELSE"))).unwrap_err();
+    assert_eq!(info.reason, BlockedReason::IncomingUnexpected);
+    assert!(w.env.mutations().is_empty());
+    // 表示にも出る（recover）
+    let (_, _, text) = w
+        .recovery(&w.env.rclone(), None)
+        .explain(&progress(Stage::Aborting, None, Some("fidSOMEONEELSE")))
+        .unwrap();
+    assert!(text.contains("aborting"), "{text}");
+}
+
+/// ゴミ箱へ移す前の `trashing` が書けず、その書き込みの間に退避先の状態が変わった（記録の口の中で Drive を書き換える）。
+/// 先に公開の記録を更新していると、`blocked` なのに公開の記録だけ更新済みになる。
+fn trashing_record_fails_while_replaced_changes(
+    name: &str,
+    change: &dyn Fn(&std::path::Path, &str),
+) {
+    let w = world(name);
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.publish_incoming(&inc);
+    assert_eq!(w.recorded_id().as_deref(), Some(old.as_str()));
+    let fake = w.env.fake_dir.clone();
+    let retired = w.layout.retired_name().to_owned();
+    let mut sink = |p: &Progress| -> Result<(), geoframe_export::error::ExportError> {
+        if p.stage == Stage::Trashing {
+            change(&fake, &retired);
+            return Err(geoframe_export::error::ExportError::new(
+                ErrorCode::Internal,
+                "ジョブの記録を書けません（試験）",
+            ));
+        }
+        Ok(())
+    };
+    let r = w.env.rclone();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut sink,
+        )
+        .unwrap_err();
+    // 旧フォルダが退避先にあると確かめられないので blocked にし、公開の記録は更新しない（旧い行のまま）
+    assert!(
+        matches!(
+            info.reason,
+            BlockedReason::TrashMismatch | BlockedReason::Unobservable
+        ),
+        "{:?}",
+        info.reason
+    );
+    assert_eq!(
+        w.recorded_id().as_deref(),
+        Some(old.as_str()),
+        "blocked なのに公開の記録だけ更新済みになっていない"
+    );
+    assert!(w.env.rclone_calls("purge").is_empty());
+}
+
+#[test]
+fn a_trashing_record_failure_rechecks_the_retired_folder_before_the_published_record_is_updated() {
+    // 退避先の項目が、別の ID のフォルダに入れ替わった → trash_mismatch
+    trashing_record_fails_while_replaced_changes("trash-record-swap", &|fake, retired| {
+        let mut d = model::Drive::load(fake);
+        let id = d
+            .resolve(&["geoframe-export-work", "replaced", retired])
+            .unwrap();
+        d.purge(&id, false);
+        d.mkdir_p(&["geoframe-export-work", "replaced", retired]);
+        d.save(fake);
+    });
+    // 退避先を一覧できなくなった → unobservable
+    trashing_record_fails_while_replaced_changes("trash-record-unlistable", &|fake, _| {
+        let mut c = model::Ctl::load(fake);
+        c.rules.push(model::Rule {
+            cmd: "lsjson".into(),
+            contains: Some("/replaced".into()),
+            skip: 0,
+            times: u64::MAX,
+            seen: 0,
+            effect: fail(1),
+        });
+        c.save(fake);
+    });
+}
+
+#[test]
+fn a_purge_that_fails_during_recovery_keeps_the_old_folder_in_the_result() {
+    // trashing は書けたが、purge が失敗する → 公開済みで、旧フォルダが退避先に残っている（結果が None に上書きされない）
+    let w = world("recovery-purge-fails");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.publish_incoming(&inc);
+    w.env.add_rule("purge", 0, u64::MAX, fail(1));
+    let r = w.env.rclone();
+    let res = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Publishing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap();
+    let Resolution::Published(p) = res else {
+        panic!("{res:?}")
+    };
+    assert_eq!(p.old_left_in_replaced.as_deref(), Some(old.as_str()));
+    assert!(p.recorded);
+    assert_eq!(w.recorded_id().as_deref(), Some(inc.as_str()));
+    assert!(w.replaced_exists());
+}
