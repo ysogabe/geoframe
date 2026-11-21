@@ -8,6 +8,9 @@
 //! - リダイレクトはたどらない（`max_redirects(0)`。3xx は 200 以外として `feed_unavailable`）。環境変数の proxy も使わない。
 //! - 接続できない・タイムアウト・200 以外・本文の読み取りの失敗は `feed_unavailable`。JSON として読めない・
 //!   値の検査に通らないものは `feed_invalid`（[`crate::listing`]）。
+//! - 圧縮は頼まない（`Accept-Encoding: identity`）。ワークスペース全体のビルドでは、geoframe 側の機能（gzip）が同じ ureq に
+//!   合流して、`Content-Encoding: gzip` の応答が自動で展開される（この crate だけのビルドでは展開されない）。どちらでも
+//!   上限は**展開後**のバイト数に掛け、壊れた圧縮は `feed_invalid`、通信の失敗（期限・切断）は `feed_unavailable`。
 //! - エラーには URL・本文・`ureq` のメッセージを入れない（固定の説明だけ）。
 
 use std::io::Read;
@@ -73,6 +76,7 @@ impl FeedClient {
             .agent
             .get(&url)
             .header("Accept", "application/json")
+            .header("Accept-Encoding", "identity")
             .call()
             .map_err(|_| unavailable("一覧 API に接続できません"))?;
         if response.status().as_u16() != 200 {
@@ -105,7 +109,16 @@ impl FeedClient {
             .read_to_end(&mut out)
             .map_err(|e| match ureq::Error::from(e) {
                 ureq::Error::BodyExceedsLimit(_) => too_large(),
-                _ => unavailable("一覧 API の本文を読み取れませんでした"),
+                // 通信の失敗（期限・切断・途中で止まった）だけを「使えない」とする。それ以外（壊れた圧縮など、ビルドの
+                // 組み合わせで現れる種類を含む）は、応答の中身が使えないものとして feed_invalid にそろえる
+                ureq::Error::Timeout(_)
+                | ureq::Error::Io(_)
+                | ureq::Error::Protocol(_)
+                | ureq::Error::BodyStalled
+                | ureq::Error::ConnectionFailed => {
+                    unavailable("一覧 API の本文を読み取れませんでした")
+                }
+                _ => ExportError::new(ErrorCode::FeedInvalid, "一覧 API の本文を展開できません"),
             })?;
         if out.len() as u64 > self.max_body {
             return Err(too_large());

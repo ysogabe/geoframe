@@ -64,7 +64,7 @@ fn all_commands(common: &[String]) -> Vec<Vec<String>> {
             "--token-file",
             "/nonexistent/token",
             "--allow",
-            "10.0.0.1",
+            "192.0.2.1",
         ]),
         with(&["recover"]),
     ]
@@ -215,7 +215,7 @@ fn bad_prefixes_refuse_to_start_before_anything_else() {
                 "--token-file",
                 "/nonexistent/token",
                 "--allow",
-                "10.0.0.1",
+                "192.0.2.1",
             ],
         ] {
             let mut owned: Vec<String> =

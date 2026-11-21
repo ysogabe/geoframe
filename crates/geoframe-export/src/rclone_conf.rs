@@ -271,6 +271,29 @@ mod tests {
     }
 
     #[test]
+    fn owner_and_mode_are_checked_for_both_targets() {
+        for target in [Target::File, Target::Directory] {
+            assert_eq!(check_owner_and_mode(target, 1000, 0o600, 1000), Ok(()));
+            assert_eq!(
+                check_owner_and_mode(target, 1001, 0o600, 1000),
+                Err(ConfigError::WrongOwner(target))
+            );
+            for mode in [0o640, 0o604, 0o660, 0o666, 0o701, 0o710] {
+                assert_eq!(
+                    check_owner_and_mode(target, 1000, mode, 1000),
+                    Err(ConfigError::TooPermissive(target)),
+                    "{mode:o}"
+                );
+            }
+            // 持ち主が違うときは、権限より先に持ち主を断る
+            assert_eq!(
+                check_owner_and_mode(target, 0, 0o666, 1000),
+                Err(ConfigError::WrongOwner(target))
+            );
+        }
+    }
+
+    #[test]
     fn messages_name_keys_and_kinds_only() {
         for e in [
             ConfigError::MissingSection,

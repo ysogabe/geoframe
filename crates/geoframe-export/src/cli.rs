@@ -451,7 +451,7 @@ mod tests {
     #[test]
     fn serve_and_recover_accept_their_arguments() {
         let Command::Serve { listen, token_file, allow, settings } = parse_line(&format!(
-            "serve --listen 127.0.0.1:9100 --token-file /x/token --allow 10.0.0.1 --allow ::1 {COMMON}"
+            "serve --listen 127.0.0.1:9100 --token-file /x/token --allow 192.0.2.1 --allow ::1 {COMMON}"
         ))
         .unwrap() else {
             panic!("serve のはず");
@@ -477,11 +477,11 @@ mod tests {
     fn serve_needs_its_own_arguments() {
         let serve = |extra: &str| parse_line(&format!("serve {extra} {COMMON}"));
         assert_eq!(
-            serve("--token-file /x/t --allow 10.0.0.1"),
+            serve("--token-file /x/t --allow 192.0.2.1"),
             Err(CliError::MissingRequired("--listen"))
         );
         assert_eq!(
-            serve("--listen 127.0.0.1:1 --allow 10.0.0.1"),
+            serve("--listen 127.0.0.1:1 --allow 192.0.2.1"),
             Err(CliError::MissingRequired("--token-file"))
         );
         assert_eq!(
@@ -489,15 +489,15 @@ mod tests {
             Err(CliError::MissingRequired("--allow"))
         );
         assert_eq!(
-            serve("--listen 127.0.0.1 --token-file /x/t --allow 10.0.0.1"),
+            serve("--listen 127.0.0.1 --token-file /x/t --allow 192.0.2.1"),
             Err(CliError::InvalidValue("--listen"))
         );
         assert_eq!(
-            serve("--listen 127.0.0.1:1 --token-file /x/t --allow 10.0.0.0/8"),
+            serve("--listen 127.0.0.1:1 --token-file /x/t --allow 192.0.2.0/24"),
             Err(CliError::InvalidValue("--allow"))
         );
         assert_eq!(
-            serve("--listen 127.0.0.1:1 --token-file= --allow 10.0.0.1"),
+            serve("--listen 127.0.0.1:1 --token-file= --allow 192.0.2.1"),
             Err(CliError::InvalidValue("--token-file"))
         );
     }
@@ -527,7 +527,7 @@ mod tests {
             Err(CliError::UnknownOption(n)) if n == "--listen"
         ));
         assert!(matches!(
-            parse_line(&format!("serve --listen 127.0.0.1:1 --token-file /x/t --allow 10.0.0.1 --dry-run {COMMON}")),
+            parse_line(&format!("serve --listen 127.0.0.1:1 --token-file /x/t --allow 192.0.2.1 --dry-run {COMMON}")),
             Err(CliError::UnknownOption(n)) if n == "--dry-run"
         ));
         assert!(matches!(
@@ -580,7 +580,7 @@ mod tests {
         // serve の --allow は何度でも書けるが、他は重複できない
         assert_eq!(
             parse_line(&format!(
-                "serve --listen 127.0.0.1:1 --listen 127.0.0.1:2 --token-file /x/t --allow 10.0.0.1 {COMMON}"
+                "serve --listen 127.0.0.1:1 --listen 127.0.0.1:2 --token-file /x/t --allow 192.0.2.1 {COMMON}"
             )),
             Err(CliError::Duplicate("--listen"))
         );

@@ -82,32 +82,47 @@ fn redirects_are_not_followed() {
 #[test]
 fn a_silent_server_hits_the_timeout() {
     let feed = FakeFeed::start(Reply::Stall(Duration::from_secs(3)));
-    let client = FeedClient::with_limits(&feed.base, Duration::from_millis(300), MAX_BODY_BYTES);
+    let timeout = Duration::from_millis(400);
+    let client = FeedClient::with_limits(&feed.base, timeout, MAX_BODY_BYTES);
     let started = Instant::now();
     assert_eq!(code(client.fetch(&period())), ErrorCode::FeedUnavailable);
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "{:?}",
-        started.elapsed()
-    );
+    let elapsed = started.elapsed();
+    // 期限まで待ち（下限）、サーバーの 3 秒までは待たない（上限）
+    assert!(elapsed >= timeout, "期限より早く失敗した: {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
 }
 
 #[test]
 fn a_body_that_stalls_midway_hits_the_timeout() {
-    // 先頭だけ送って止まる（本文の読み取りにも期限が掛かる）
+    // 先頭と本文の一部を送ったあと、接続を開いたまま黙る。本文の読み取りにも期限が掛かる
+    let feed = FakeFeed::start(Reply::Partial {
+        head: "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n".to_owned(),
+        prefix: b"{\"from\":".to_vec(),
+        hold: Duration::from_secs(3),
+    });
+    let timeout = Duration::from_millis(500);
+    let client = FeedClient::with_limits(&feed.base, timeout, MAX_BODY_BYTES);
+    let started = Instant::now();
+    assert_eq!(code(client.fetch(&period())), ErrorCode::FeedUnavailable);
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= timeout,
+        "期限より早く失敗した（途中で切れただけ？）: {elapsed:?}"
+    );
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[test]
+fn a_body_cut_off_midway_is_feed_unavailable() {
+    // 宣言した長さに届く前に接続が閉じる（期限を待たずに失敗する）
     let feed = FakeFeed::start(Reply::Raw {
         head: "HTTP/1.1 200 OK\r\nContent-Length: 100000\r\nConnection: close\r\n\r\n{\""
             .to_owned(),
         body: Body::Bytes(Vec::new()),
     });
-    let client = FeedClient::with_limits(&feed.base, Duration::from_millis(500), MAX_BODY_BYTES);
-    let started = Instant::now();
-    let e = code(client.fetch(&period()));
-    assert_eq!(e, ErrorCode::FeedUnavailable);
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        started.elapsed()
+    assert_eq!(
+        code(FeedClient::new(&feed.base).fetch(&period())),
+        ErrorCode::FeedUnavailable
     );
 }
 
@@ -204,14 +219,21 @@ fn the_limit_counts_bytes_read_not_the_content_length() {
 }
 
 #[test]
-fn a_gzip_labelled_body_is_not_trusted_either() {
-    // gzip の機能は入れていない。Content-Encoding を付けて返されても、読んだバイト列を JSON として読めなければ invalid
-    let feed = FakeFeed::start(Reply::Raw {
-        head: "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 4\r\nConnection: close\r\n\r\n".to_owned(),
-        body: Body::Bytes(vec![0x1f, 0x8b, 0x08, 0x00]),
-    });
-    assert_eq!(
-        code(FeedClient::new(&feed.base).fetch(&period())),
-        ErrorCode::FeedInvalid
-    );
+fn a_broken_compressed_response_is_feed_invalid_in_every_build() {
+    // ワークスペース全体のビルド（geoframe 側の gzip が合流して自動で展開する）でも、この crate だけのビルド
+    // （展開しない）でも、壊れた圧縮は同じ feed_invalid になる。通信の失敗（feed_unavailable）とは取り違えない。
+    // `cargo test -p geoframe-export` と `cargo test --workspace` の両方で確かめること
+    for encoding in ["gzip", "GZIP", "x-unknown"] {
+        let feed = FakeFeed::start(Reply::Raw {
+            head: format!(
+                "HTTP/1.1 200 OK\r\nContent-Encoding: {encoding}\r\nContent-Length: 4\r\nConnection: close\r\n\r\n"
+            ),
+            body: Body::Bytes(vec![0x1f, 0x8b, 0x08, 0x00]),
+        });
+        assert_eq!(
+            code(FeedClient::new(&feed.base).fetch(&period())),
+            ErrorCode::FeedInvalid,
+            "{encoding}"
+        );
+    }
 }

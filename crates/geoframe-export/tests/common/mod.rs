@@ -35,6 +35,12 @@ pub enum Reply {
     Raw { head: String, body: Body },
     /// 要求を読んだあと、`Duration` のあいだ何も返さない。
     Stall(Duration),
+    /// 先頭と本文の一部を送ったあと、接続を開いたまま `hold` のあいだ黙る（本文の途中で止まる）。
+    Partial {
+        head: String,
+        prefix: Vec<u8>,
+        hold: Duration,
+    },
 }
 
 impl Reply {
@@ -126,6 +132,13 @@ fn serve(mut stream: TcpStream, reply: &Reply, requests: &Mutex<Vec<String>>) {
     requests.lock().expect("lock").push(line);
     match reply {
         Reply::Stall(d) => std::thread::sleep(*d),
+        Reply::Partial { head, prefix, hold } => {
+            if stream.write_all(head.as_bytes()).is_err() || stream.write_all(prefix).is_err() {
+                return;
+            }
+            let _ = stream.flush();
+            std::thread::sleep(*hold);
+        }
         Reply::Raw { head, body } => {
             if stream.write_all(head.as_bytes()).is_err() {
                 return;
