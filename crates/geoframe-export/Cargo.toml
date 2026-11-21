@@ -2,6 +2,7 @@
 name = "geoframe-export"
 version = "0.1.0"
 edition = "2024"
+default-run = "geoframe-export"
 description = "note 記事用の写真書き出し（docs/note-photo-export/design.md）。写真サービスとは HTTP だけでつながる別プロセス"
 
 [lib]
@@ -11,6 +12,13 @@ path = "src/lib.rs"
 [[bin]]
 name = "geoframe-export"
 path = "src/main.rs"
+
+# 試験用の偽の rclone（本物の rclone・Drive には触れない。`cargo build --workspace` でもビルドされるが、配るのは
+# `geoframe-export` だけ）。偽の Drive の模型は fake-rclone/model.rs で、試験（tests/common/drive.rs）と共有する。
+[[bin]]
+name = "fake-rclone"
+path = "fake-rclone/main.rs"
+test = false
 
 # 依存は、ワークスペースで既に使っている crate の同じ版だけ（design.md 3.2）。`geoframe` crate には依存しない。
 # 後のタスクで axum・tokio（serve）を足す。
@@ -22,6 +30,8 @@ zune-jpeg = "0.5.15"
 # 写真サービスへの GET（127.0.0.1 の http だけ。TLS は要らない）。同期 API
 # gzip を明示する: geoframe 側のビルドと合流するかどうかで応答の扱いが変わらないように（展開後のバイト数に上限を掛ける）
 ureq = { version = "3", default-features = false, features = ["gzip"] }
+# ログ（rclone の失敗の標準エラーの末尾。伏せ字にしてから）。geoframe crate と同じ版・同じ feature（新しいパッケージは増えない）
+tracing = { version = "0.1", default-features = false, features = ["std"] }
 # 実効ユーザー ID（geteuid）と O_NOFOLLOW だけ
 libc = "0.2"
 

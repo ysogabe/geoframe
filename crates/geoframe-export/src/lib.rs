@@ -18,21 +18,26 @@
 //! | [`listing`] | 一覧 API の値の検査（4.4）と候補の選び方 | T2 |
 //! | [`cli`]・[`app`] | 引数の解釈と、コマンドの振り分け | T2 |
 //! | [`image`]・[`jpeg`]・[`measure`]・[`staging`]・[`manifest`] | 画像の取得と書き出しの入口、JPEG の区画の検査とデコード、明るさ・シャープネス、作業領域、manifest | T3 |
-//! | [`rclone`] | rclone の呼び出し、宛先の状態、公開・退避・復旧 | T4 |
+//! | [`rclone`]・[`drive`]・[`publish`]・[`recovery`]・[`published`]・[`jsonfile`]・[`jobid`] | rclone の起動、Drive への照会と操作・管理しているフォルダの判定、incoming → 検証 → 公開・退避・復旧の実行、復旧の表（純粋な関数）、公開の記録、アトミックな JSON の書き方、ジョブ ID | T4 |
 //! | [`lock`]・[`jobs`]・[`run`]・[`recover`] | 実行枠、ジョブと公開の記録、`run`・`recover` | T5 |
 //! | [`serve`] | HTTP の入口（トークン・送信元・本文の検査・ジョブ API） | T6 |
 
 pub mod app;
 pub mod cli;
 pub mod date;
+pub mod drive;
 pub mod error;
 pub mod feed;
 pub mod folder;
 pub mod image;
+pub mod jobid;
 pub mod jpeg;
+pub mod jsonfile;
 pub mod listing;
 pub mod manifest;
 pub mod measure;
+pub mod publish;
+pub mod published;
 pub mod rclone_conf;
 pub mod request;
 pub mod settings;
@@ -44,5 +49,6 @@ pub mod jobs;
 pub mod lock;
 pub mod rclone;
 pub mod recover;
+pub mod recovery;
 pub mod run;
 pub mod serve;

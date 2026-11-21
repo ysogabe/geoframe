@@ -334,3 +334,5 @@ pub fn assert_no_secrets(text: &str) {
     }
     assert!(!text.contains("access_token"), "{text}");
 }
+
+pub mod drive;

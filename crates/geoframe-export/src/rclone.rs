@@ -1,1 +1,959 @@
-//! T4: rclone の呼び出し、宛先の状態、管理フォルダの判定、incoming → 検証 → 公開、退避と復旧の表（design.md 4.2）
+//! rclone の起動（design.md 4.2「rclone の呼び方」、8 章「子プロセス」）。
+//!
+//! このモジュールは、rclone を**1 回起動して結果を受け取る**ところだけを持つ。何を・どの順で呼ぶか（宛先の状態、公開、
+//! 復旧）は [`crate::drive`]・[`crate::publish`]。
+//!
+//! ## 守っていること
+//!
+//! - 実行ファイルは `--rclone`、設定ファイルは `--config <--rclone-config>` を**毎回**明示する。
+//! - 環境変数は `env_clear()` のあと、[`ENV_KEYS`] の 3 つ（`PATH`＝固定の値、`HOME`・`XDG_CACHE_HOME`＝状態ディレクトリの
+//!   `rclone/` の中の専用の場所）だけ。`RCLONE_*` は渡さない（設定ファイルの値を上書きされないため）。
+//! - `--drive-client-id`・`--drive-client-secret`・`--drive-token` など、**資格情報を上書きする引数は渡さない**
+//!   （専用の client_id の検査［`crate::rclone_conf`］をすり抜けないため）。引数はこのモジュールの関数が固定の部品から組み立て、
+//!   起動の直前に [`is_forbidden_flag`] でもう一度確かめる。`-vv`・`--dump*` も同じ検査で断る。
+//! - シェルを介さず、引数の配列で渡す。位置の引数の前に `--` を置く。Drive の場所は [`RemoteLoc`]（検査済みの部品だけで作る）。
+//! - 標準入力は閉じる。子プロセスは自分のプロセスグループに入れ、期限を過ぎたらグループごと kill する。
+//! - 標準出力・標準エラーは別のスレッドで読み続ける（パイプが詰まって止まらないように）。標準出力には上限を掛ける。
+//! - 標準エラーは、`token`・`Bearer`・`access_token` などを含む行を伏せ字にしてから、最後の数行だけをログ（tracing）に残す
+//!   （[`redact_stderr`]）。API の結果・エラーの説明には rclone の出力を載せない（[`ExportError`] の説明は固定の文字列）。
+
+use std::ffi::OsString;
+use std::io::Read;
+use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
+
+use crate::error::{ErrorCode, ExportError};
+use crate::settings::{RemotePath, Settings};
+
+/// 子プロセスの `PATH`（固定。rclone は他のコマンドを呼ばない）。
+pub const PATH_VALUE: &str = "/usr/local/bin:/usr/bin:/bin";
+/// 子プロセスに渡す環境変数の名前（これだけ。試験が、渡した環境がこの 3 つと一致することを確かめる）。
+pub const ENV_KEYS: [&str; 3] = ["PATH", "HOME", "XDG_CACHE_HOME"];
+/// 標準出力の上限（`lsjson`。2,000 枚の再帰の一覧でも数 MB）。
+pub const STDOUT_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// 一覧の項目数の上限。
+pub const LSJSON_MAX_ENTRIES: usize = 20_000;
+/// 標準エラーのうち、読み残す末尾のバイト数。
+const STDERR_KEEP_BYTES: usize = 64 * 1024;
+/// ログに残す標準エラーの行数（末尾から）。
+pub const STDERR_LOG_LINES: usize = 5;
+const STDERR_LINE_MAX_CHARS: usize = 300;
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
+/// Drive のショートカットの MIME タイプ。
+pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
+/// rclone の `lsjson` がフォルダに付ける MIME タイプ。
+pub const DIRECTORY_MIME: &str = "inode/directory";
+/// rclone の終了コード 3（ディレクトリが無い）。
+const EXIT_DIR_NOT_FOUND: i32 = 3;
+
+// ---- Drive 上の場所 ----
+
+/// `remote:パス` の形の、検査済みの場所。固定の接頭辞（[`RemotePath`]）に、検査済みの部品を足してだけ作る。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteLoc(String);
+
+/// パスの部品として許す文字（`[A-Za-z0-9_.-]`、先頭は英数字、128 文字まで）。
+fn component_ok(c: &str) -> bool {
+    !c.is_empty()
+        && c.len() <= 128
+        && c.as_bytes()[0].is_ascii_alphanumeric()
+        && c.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && !c.contains("..")
+}
+
+impl RemoteLoc {
+    /// 検査済みの接頭辞・作業用のフォルダそのもの。
+    pub fn of(base: &RemotePath) -> Self {
+        Self(base.to_string())
+    }
+
+    /// 部品を 1 つ足す。空・`/` や `..` を含む・先頭が英数字でないものは作れない。
+    pub fn child(&self, component: &str) -> Option<Self> {
+        component_ok(component).then(|| Self(format!("{}/{component}", self.0)))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+// ---- lsjson の出力 ----
+
+/// `rclone lsjson` の 1 項目（rclone v1.76.0 の出力の形。配置のときに本物で確かめる）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LsEntry {
+    /// 一覧の起点からの相対パス（`/` 区切り）。
+    pub path: String,
+    pub name: String,
+    /// バイト数（フォルダは -1）。
+    pub size: i64,
+    pub mime: String,
+    pub is_dir: bool,
+    /// Drive の ID。
+    pub id: String,
+}
+
+impl LsEntry {
+    pub fn is_shortcut(&self) -> bool {
+        self.mime == SHORTCUT_MIME
+    }
+}
+
+/// Drive の ID の形（`[A-Za-z0-9_-]`、1〜128 文字）。空の ID は決して受け付けない（空どうしが「一致」しないように）。
+pub fn is_valid_drive_id(s: &str) -> bool {
+    (1..=128).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+fn rel_path_ok(p: &str) -> bool {
+    !p.is_empty()
+        && p.len() <= 1024
+        && p.split('/')
+            .all(|c| !c.is_empty() && c != "." && c != ".." && !c.chars().any(char::is_control))
+}
+
+/// `lsjson` の出力を読む。形が違えば `None`（呼び出し側は `drive_unavailable` などの失敗にする）。
+///
+/// 形: 配列。各項目は `Path`(文字列)・`Name`(文字列、`Path` の最後の部品)・`Size`(整数、フォルダは -1)・
+/// `MimeType`(文字列。フォルダは `inode/directory`)・`IsDir`(真偽)・`ID`(文字列、空でない)。`ModTime` は読まない。
+pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
+    let value: Value = serde_json::from_slice(bytes).ok()?;
+    let items = value.as_array()?;
+    if items.len() > LSJSON_MAX_ENTRIES {
+        return None;
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let o = item.as_object()?;
+        let path = o.get("Path")?.as_str()?;
+        let name = o.get("Name")?.as_str()?;
+        let mime = o.get("MimeType")?.as_str()?;
+        let id = o.get("ID")?.as_str()?;
+        let size = o.get("Size")?.as_i64()?;
+        let is_dir = o.get("IsDir")?.as_bool()?;
+        if !rel_path_ok(path)
+            || path.rsplit('/').next() != Some(name)
+            || !is_valid_drive_id(id)
+            || is_dir != (mime == DIRECTORY_MIME)
+            || (!is_dir && size < 0)
+        {
+            return None;
+        }
+        out.push(LsEntry {
+            path: path.to_owned(),
+            name: name.to_owned(),
+            size,
+            mime: mime.to_owned(),
+            is_dir,
+            id: id.to_owned(),
+        });
+    }
+    Some(out)
+}
+
+// ---- 標準エラーの伏せ字 ----
+
+/// この文字列（小文字）を含む行は、まるごと伏せ字にする。
+const SENSITIVE_MARKERS: [&str; 6] = [
+    "token",
+    "bearer",
+    "access_token",
+    "secret",
+    "authorization",
+    "client_id",
+];
+
+/// 標準エラーを、ログに残せる形にする: 行ごとに、機微な語（`token`・`Bearer`・`access_token` ほか。大文字小文字を問わない）を
+/// 含む行を伏せ字にし、制御文字を空白にし、長い行を切り、最後の `max_lines` 行だけを ` / ` でつなぐ。
+pub fn redact_stderr(raw: &[u8], max_lines: usize) -> String {
+    let text = String::from_utf8_lossy(raw);
+    let lines: Vec<String> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            let lower = l.to_lowercase();
+            if SENSITIVE_MARKERS.iter().any(|m| lower.contains(m)) {
+                "[伏せ字]".to_owned()
+            } else {
+                l.chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .take(STDERR_LINE_MAX_CHARS)
+                    .collect()
+            }
+        })
+        .collect();
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join(" / ")
+}
+
+// ---- 子プロセスの結果 ----
+
+/// 1 回の起動の失敗。rclone の出力は含めない。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunError {
+    /// 起動できない・作業用のディレクトリを作れない・引数の検査に通らない。
+    Spawn,
+    /// このコマンドの期限を過ぎて kill した。
+    Timeout,
+    /// ジョブ全体の期限を過ぎた（起動前、または kill した）。
+    JobDeadline,
+    /// 終了コードが 3（ディレクトリ・ファイルが無い）。
+    NotFound,
+    /// 終了コードが 0 以外（シグナルで終わったときは -1）。
+    Exit(i32),
+    /// 標準出力が上限を超えた、または `lsjson` の出力が決められた形でない。
+    BadOutput,
+}
+
+impl RunError {
+    /// 照会（`lsjson`・`cat`）の失敗を、ジョブのエラーにする。「無い」と取り違えないよう、`drive_unavailable`。
+    pub fn into_query_error(self) -> ExportError {
+        match self {
+            Self::JobDeadline => ExportError::from(ErrorCode::Timeout),
+            _ => ExportError::new(
+                ErrorCode::DriveUnavailable,
+                "Drive に照会できません（rclone の失敗）",
+            ),
+        }
+    }
+
+    /// 書き込み（`mkdir`・`copy`・`moveto`・`purge`）の失敗を、ジョブのエラーにする。
+    pub fn into_op_error(self) -> ExportError {
+        match self {
+            Self::Timeout => ExportError::from(ErrorCode::RcloneTimeout),
+            Self::JobDeadline => ExportError::from(ErrorCode::Timeout),
+            _ => ExportError::from(ErrorCode::RcloneFailed),
+        }
+    }
+}
+
+/// 起動した rclone の標準出力。
+#[derive(Debug)]
+pub struct Output {
+    pub stdout: Vec<u8>,
+}
+
+/// 引数に入れてはいけない flag（資格情報の上書き、ログに秘密が出うるもの、設定の二重指定）。
+pub fn is_forbidden_flag(arg: &str) -> bool {
+    const PREFIXES: [&str; 14] = [
+        "--drive-client",
+        "--drive-token",
+        "--drive-service-account",
+        "--drive-impersonate",
+        "--drive-scope",
+        "--drive-env-auth",
+        "--drive-auth",
+        "--drive-root-folder-id",
+        "--dump",
+        "--verbose",
+        "--config-",
+        "--rc",
+        "--password",
+        "--use-json-log",
+    ];
+    if PREFIXES.iter().any(|p| arg.starts_with(p)) {
+        return true;
+    }
+    // `-v`・`-vv`・`-vvv` と、`-q` の連なりなど（短い flag の束）。位置の引数は `--` の後ろにあるので、ここには来ない
+    arg.starts_with('-')
+        && !arg.starts_with("--")
+        && arg.len() > 1
+        && arg[1..].bytes().all(|b| b == b'v')
+}
+
+/// `copy` で送る範囲。manifest は最後に送るので、写真だけの送信と manifest だけの送信に分ける。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopyScope {
+    /// `manifest.json` 以外。
+    PhotosOnly,
+    /// `manifest.json` だけ。
+    ManifestOnly,
+}
+
+/// rclone の呼び出し口。`Clone` できる（期限だけを替えた複製を作れる）。
+#[derive(Debug, Clone)]
+pub struct Rclone {
+    program: PathBuf,
+    config: PathBuf,
+    home: PathBuf,
+    cache: PathBuf,
+    copy_timeout: Duration,
+    timeout: Duration,
+    deadline: Option<Instant>,
+}
+
+impl Rclone {
+    /// 設定（`--rclone`・`--rclone-config`・`--state-dir`・2 つの期限）から作る。
+    pub fn new(settings: &Settings) -> Self {
+        let base = settings.state_dir.join("rclone");
+        Self {
+            program: settings.rclone.clone(),
+            config: settings.rclone_config.clone(),
+            home: base.join("home"),
+            cache: base.join("cache"),
+            copy_timeout: settings.rclone_copy_timeout,
+            timeout: settings.rclone_timeout,
+            deadline: None,
+        }
+    }
+
+    /// `dry_run` 用: 照会の期限を 30 秒にする（design.md 6.1）。`copy` は使わない。
+    pub fn for_dry_run(settings: &Settings) -> Self {
+        let mut r = Self::new(settings);
+        r.timeout = r.timeout.min(DRY_RUN_TIMEOUT);
+        r.copy_timeout = r.timeout;
+        r
+    }
+
+    /// 期限（コマンドごとの期限）を指定して作る（試験用）。
+    #[doc(hidden)]
+    pub fn with_timeouts(mut self, copy: Duration, other: Duration) -> Self {
+        self.copy_timeout = copy;
+        self.timeout = other;
+        self
+    }
+
+    /// ジョブ全体の期限を掛けた複製。過ぎたあとの起動は `JobDeadline`、実行中に過ぎれば kill して `JobDeadline`。
+    pub fn with_deadline(&self, deadline: Option<Instant>) -> Self {
+        let mut r = self.clone();
+        r.deadline = deadline;
+        r
+    }
+
+    // ---- 引数の組み立て（固定の部品だけ。試験が flag の中身を確かめる） ----
+
+    fn common_args(&self, sub: &str, skip_shortcuts: bool) -> Vec<OsString> {
+        let mut a: Vec<OsString> = vec![sub.into(), "--config".into(), self.config.clone().into()];
+        for s in [
+            "--ask-password=false",
+            "--retries",
+            "3",
+            "--low-level-retries",
+            "10",
+            "--transfers",
+            "4",
+            "--checkers",
+            "8",
+            "--cache-dir",
+        ] {
+            a.push(s.into());
+        }
+        a.push(self.cache.clone().into());
+        if skip_shortcuts {
+            a.push("--drive-skip-shortcuts".into());
+        }
+        a
+    }
+
+    fn finish_args(mut a: Vec<OsString>, positional: Vec<OsString>) -> Vec<OsString> {
+        a.push("--".into());
+        a.extend(positional);
+        a
+    }
+
+    #[doc(hidden)]
+    pub fn lsjson_args(
+        &self,
+        loc: &RemoteLoc,
+        recursive: bool,
+        skip_shortcuts: bool,
+    ) -> Vec<OsString> {
+        let mut a = self.common_args("lsjson", skip_shortcuts);
+        if recursive {
+            a.push("-R".into());
+        }
+        Self::finish_args(a, vec![loc.as_str().into()])
+    }
+
+    #[doc(hidden)]
+    pub fn cat_args(&self, loc: &RemoteLoc, count: u64) -> Vec<OsString> {
+        let mut a = self.common_args("cat", true);
+        a.push("--count".into());
+        a.push(count.to_string().into());
+        Self::finish_args(a, vec![loc.as_str().into()])
+    }
+
+    #[doc(hidden)]
+    pub fn mkdir_args(&self, loc: &RemoteLoc) -> Vec<OsString> {
+        let a = self.common_args("mkdir", true);
+        Self::finish_args(a, vec![loc.as_str().into()])
+    }
+
+    #[doc(hidden)]
+    pub fn copy_args(&self, src: &Path, dst: &RemoteLoc, scope: CopyScope) -> Vec<OsString> {
+        let mut a = self.common_args("copy", true);
+        a.push("--immutable".into());
+        match scope {
+            CopyScope::PhotosOnly => {
+                a.push("--exclude".into());
+                a.push("/manifest.json".into());
+            }
+            CopyScope::ManifestOnly => {
+                a.push("--include".into());
+                a.push("/manifest.json".into());
+            }
+        }
+        Self::finish_args(a, vec![src.as_os_str().to_owned(), dst.as_str().into()])
+    }
+
+    #[doc(hidden)]
+    pub fn moveto_args(&self, src: &RemoteLoc, dst: &RemoteLoc) -> Vec<OsString> {
+        let mut a = self.common_args("moveto", true);
+        a.push("--immutable".into());
+        Self::finish_args(a, vec![src.as_str().into(), dst.as_str().into()])
+    }
+
+    #[doc(hidden)]
+    pub fn purge_args(&self, loc: &RemoteLoc) -> Vec<OsString> {
+        let mut a = self.common_args("purge", true);
+        a.push("--drive-use-trash=true".into());
+        Self::finish_args(a, vec![loc.as_str().into()])
+    }
+
+    // ---- コマンド ----
+
+    /// `lsjson`。`skip_shortcuts` が偽のときは、ショートカットも（rclone の既定の扱いで）一覧に出る。
+    /// 場所が無ければ `NotFound`、出力が決められた形でなければ `BadOutput`。
+    pub fn lsjson(
+        &self,
+        loc: &RemoteLoc,
+        recursive: bool,
+        skip_shortcuts: bool,
+    ) -> Result<Vec<LsEntry>, RunError> {
+        let out = self.run(
+            "lsjson",
+            self.lsjson_args(loc, recursive, skip_shortcuts),
+            self.timeout,
+            STDOUT_MAX_BYTES,
+        )?;
+        parse_lsjson(&out.stdout).ok_or(RunError::BadOutput)
+    }
+
+    /// `cat`。先頭の `max_bytes + 1` バイトまでを読む（`max_bytes` を超えるかどうかは、返った長さで分かる）。
+    pub fn cat(&self, loc: &RemoteLoc, max_bytes: u64) -> Result<Vec<u8>, RunError> {
+        let count = max_bytes.saturating_add(1);
+        let cap = usize::try_from(count).unwrap_or(usize::MAX);
+        self.run("cat", self.cat_args(loc, count), self.timeout, cap)
+            .map(|o| o.stdout)
+    }
+
+    pub fn mkdir(&self, loc: &RemoteLoc) -> Result<(), RunError> {
+        self.run("mkdir", self.mkdir_args(loc), self.timeout, 64 * 1024)
+            .map(|_| ())
+    }
+
+    /// 作業領域（ローカルのディレクトリ。絶対パス）を `dst` へ送る。期限は `--rclone-copy-timeout`。
+    pub fn copy(&self, src: &Path, dst: &RemoteLoc, scope: CopyScope) -> Result<(), RunError> {
+        if !src.is_absolute() {
+            return Err(RunError::Spawn);
+        }
+        self.run(
+            "copy",
+            self.copy_args(src, dst, scope),
+            self.copy_timeout,
+            64 * 1024,
+        )
+        .map(|_| ())
+    }
+
+    pub fn moveto(&self, src: &RemoteLoc, dst: &RemoteLoc) -> Result<(), RunError> {
+        self.run(
+            "moveto",
+            self.moveto_args(src, dst),
+            self.timeout,
+            64 * 1024,
+        )
+        .map(|_| ())
+    }
+
+    /// `purge --drive-use-trash=true`（Drive のゴミ箱へ移す）。
+    pub fn purge(&self, loc: &RemoteLoc) -> Result<(), RunError> {
+        self.run("purge", self.purge_args(loc), self.timeout, 64 * 1024)
+            .map(|_| ())
+    }
+
+    // ---- 起動 ----
+
+    fn ensure_private_dir(path: &Path) -> Result<(), RunError> {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .map_err(|_| RunError::Spawn)
+    }
+
+    fn run(
+        &self,
+        sub: &'static str,
+        args: Vec<OsString>,
+        timeout: Duration,
+        stdout_cap: usize,
+    ) -> Result<Output, RunError> {
+        // 引数の最後の検査（資格情報の上書き・詳細なログの flag は、どの経路でも渡さない）
+        for arg in args.iter().take_while(|a| a.as_encoded_bytes() != b"--") {
+            match arg.to_str() {
+                Some(s) if !is_forbidden_flag(s) => {}
+                _ => return Err(RunError::Spawn),
+            }
+        }
+        // 期限: コマンドごとの期限と、ジョブ全体の期限の短いほう
+        let mut limit = timeout;
+        let mut by_job_deadline = false;
+        if let Some(d) = self.deadline {
+            let left = d.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(RunError::JobDeadline);
+            }
+            if left < limit {
+                limit = left;
+                by_job_deadline = true;
+            }
+        }
+        Self::ensure_private_dir(&self.home)?;
+        Self::ensure_private_dir(&self.cache)?;
+
+        let mut child = Command::new(&self.program)
+            .args(&args)
+            .env_clear()
+            .env("PATH", PATH_VALUE)
+            .env("HOME", &self.home)
+            .env("XDG_CACHE_HOME", &self.cache)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .map_err(|_| RunError::Spawn)?;
+        let pid = child.id();
+        let stdout = child.stdout.take().map(|r| read_head(r, stdout_cap));
+        let stderr = child.stderr.take().map(read_tail);
+
+        let started = Instant::now();
+        let mut timed_out = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) => {}
+                Err(_) => break None,
+            }
+            if started.elapsed() >= limit {
+                timed_out = true;
+                break None;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        };
+        if status.is_none() {
+            // 期限切れ（または待てない）。子と、その子孫をまとめて止める
+            if let Ok(pid) = i32::try_from(pid) {
+                // SAFETY: 自分が作ったプロセスグループ（`process_group(0)`）への kill(2) だけ
+                unsafe {
+                    libc::kill(-pid, libc::SIGKILL);
+                }
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let (stdout_bytes, truncated) = stdout
+            .and_then(|h| h.join().ok())
+            .unwrap_or_else(|| (Vec::new(), false));
+        let stderr_bytes = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+
+        let result = match status {
+            Some(status) if status.success() => {
+                if truncated {
+                    Err(RunError::BadOutput)
+                } else {
+                    Ok(Output {
+                        stdout: stdout_bytes,
+                    })
+                }
+            }
+            Some(status) => match status.code() {
+                Some(EXIT_DIR_NOT_FOUND) => Err(RunError::NotFound),
+                Some(code) => Err(RunError::Exit(code)),
+                None => Err(RunError::Exit(-1)),
+            },
+            None if timed_out && by_job_deadline => Err(RunError::JobDeadline),
+            None if timed_out => Err(RunError::Timeout),
+            None => Err(RunError::Exit(-1)),
+        };
+        if let Err(e) = &result {
+            // 失敗のときだけ、伏せ字にした標準エラーの末尾を残す（出力は API の結果には載せない）
+            tracing::warn!(
+                command = sub,
+                failure = ?e,
+                stderr = %redact_stderr(&stderr_bytes, STDERR_LOG_LINES),
+                "rclone が失敗しました"
+            );
+        }
+        result
+    }
+}
+
+/// `dry_run` の照会の期限（design.md 6.1）。
+pub const DRY_RUN_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// 先頭の `cap` バイトまでを読み、残りは読み捨てる（パイプを詰まらせない）。超えたら真を返す。
+fn read_head<R: Read + Send + 'static>(mut r: R, cap: usize) -> JoinHandle<(Vec<u8>, bool)> {
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut truncated = false;
+        let mut buf = [0u8; 64 * 1024];
+        while let Ok(n) = r.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            let room = cap.saturating_sub(out.len());
+            if n > room {
+                truncated = true;
+            }
+            out.extend_from_slice(&buf[..n.min(room)]);
+        }
+        (out, truncated)
+    })
+}
+
+/// 末尾の [`STDERR_KEEP_BYTES`] バイトだけを残して読み続ける。
+fn read_tail<R: Read + Send + 'static>(mut r: R) -> JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut out: Vec<u8> = Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        while let Ok(n) = r.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            if out.len() > STDERR_KEEP_BYTES * 2 {
+                out.drain(..out.len() - STDERR_KEEP_BYTES);
+            }
+        }
+        if out.len() > STDERR_KEEP_BYTES {
+            out.drain(..out.len() - STDERR_KEEP_BYTES);
+        }
+        out
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn settings() -> Settings {
+        Settings::from_raw(&crate::settings::RawSettings {
+            rclone: Some("/x/rclone".into()),
+            rclone_config: Some("/x/state/rclone/rclone.conf".into()),
+            state_dir: Some("/x/state".into()),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn strs(a: &[OsString]) -> Vec<&str> {
+        a.iter().map(|s| s.to_str().unwrap()).collect()
+    }
+
+    fn loc(s: &str) -> RemoteLoc {
+        let mut parts = s.split('/');
+        let base = RemotePath::parse(parts.next().unwrap()).unwrap();
+        parts.fold(RemoteLoc::of(&base), |l, c| l.child(c).unwrap())
+    }
+
+    #[test]
+    fn remote_loc_only_takes_checked_components() {
+        let base = loc("gdrive:work");
+        assert_eq!(
+            base.child("incoming").unwrap().as_str(),
+            "gdrive:work/incoming"
+        );
+        for bad in [
+            "", "..", "a/b", "-x", ".hidden", "a b", "a\n", "ａ", "a..b", "/x",
+        ] {
+            assert!(base.child(bad).is_none(), "{bad:?}");
+        }
+        assert!(base.child("manifest.json").is_some());
+        assert!(base.child(&"a".repeat(129)).is_none());
+    }
+
+    #[test]
+    fn every_command_names_config_and_ends_flags_with_dashes() {
+        let r = Rclone::new(&settings());
+        let l = loc("gdrive:p/q");
+        let all: Vec<Vec<OsString>> = vec![
+            r.lsjson_args(&l, true, true),
+            r.lsjson_args(&l, false, false),
+            r.cat_args(&l, 10),
+            r.mkdir_args(&l),
+            r.copy_args(Path::new("/w/ws"), &l, CopyScope::PhotosOnly),
+            r.copy_args(Path::new("/w/ws"), &l, CopyScope::ManifestOnly),
+            r.moveto_args(&l, &loc("gdrive:p/r")),
+            r.purge_args(&l),
+        ];
+        for args in &all {
+            let s = strs(args);
+            let dashes = s.iter().position(|a| *a == "--").expect("-- がある");
+            let (flags, positional) = s.split_at(dashes);
+            // 設定ファイルは毎回明示する
+            let ci = flags.iter().position(|a| *a == "--config").unwrap();
+            assert_eq!(flags[ci + 1], "/x/state/rclone/rclone.conf");
+            assert!(flags.contains(&"--ask-password=false"));
+            for pair in [
+                ["--retries", "3"],
+                ["--low-level-retries", "10"],
+                ["--transfers", "4"],
+                ["--checkers", "8"],
+            ] {
+                let i = flags.iter().position(|a| *a == pair[0]).expect(pair[0]);
+                assert_eq!(flags[i + 1], pair[1]);
+            }
+            // 位置の引数は `--` の後ろだけ。flag の部分に、場所のような文字列は無い
+            assert!(
+                !flags.iter().skip(1).any(|a| a.contains("gdrive:")),
+                "{flags:?}"
+            );
+            assert!(positional.len() >= 2);
+            // 禁止の flag は、組み立てた引数にも無い
+            for f in flags {
+                assert!(!is_forbidden_flag(f), "{f}");
+            }
+        }
+    }
+
+    #[test]
+    fn flags_for_each_command_match_the_design() {
+        let r = Rclone::new(&settings());
+        let l = loc("gdrive:p/q");
+        let has = |a: &[OsString], f: &str| strs(a).contains(&f);
+        // Drive の操作には --drive-skip-shortcuts（ショートカットも見たい照会だけは付けない）
+        assert!(has(
+            &r.lsjson_args(&l, false, true),
+            "--drive-skip-shortcuts"
+        ));
+        assert!(!has(
+            &r.lsjson_args(&l, false, false),
+            "--drive-skip-shortcuts"
+        ));
+        for a in [
+            r.cat_args(&l, 1),
+            r.mkdir_args(&l),
+            r.copy_args(Path::new("/w"), &l, CopyScope::PhotosOnly),
+            r.moveto_args(&l, &l),
+            r.purge_args(&l),
+        ] {
+            assert!(has(&a, "--drive-skip-shortcuts"));
+        }
+        // copy・moveto は --immutable、purge は --drive-use-trash=true
+        assert!(has(
+            &r.copy_args(Path::new("/w"), &l, CopyScope::PhotosOnly),
+            "--immutable"
+        ));
+        assert!(has(&r.moveto_args(&l, &l), "--immutable"));
+        assert!(has(&r.purge_args(&l), "--drive-use-trash=true"));
+        assert!(!has(&r.lsjson_args(&l, true, true), "--immutable"));
+        // 再帰の指定
+        assert!(has(&r.lsjson_args(&l, true, true), "-R"));
+        assert!(!has(&r.lsjson_args(&l, false, true), "-R"));
+        // manifest の分け方
+        let photos = r.copy_args(Path::new("/w"), &l, CopyScope::PhotosOnly);
+        let manifest = r.copy_args(Path::new("/w"), &l, CopyScope::ManifestOnly);
+        assert!(
+            strs(&photos)
+                .windows(2)
+                .any(|w| w == ["--exclude", "/manifest.json"])
+        );
+        assert!(
+            strs(&manifest)
+                .windows(2)
+                .any(|w| w == ["--include", "/manifest.json"])
+        );
+        // cat は読む量を決める
+        assert!(
+            strs(&r.cat_args(&l, 7))
+                .windows(2)
+                .any(|w| w == ["--count", "7"])
+        );
+    }
+
+    #[test]
+    fn forbidden_flags_are_refused() {
+        for bad in [
+            "--drive-client-id",
+            "--drive-client-id=x",
+            "--drive-client-secret",
+            "--drive-token",
+            "--drive-token=x",
+            "--drive-service-account-file",
+            "--drive-impersonate",
+            "--drive-env-auth",
+            "--dump",
+            "--dump=headers",
+            "--dump-bodies",
+            "-v",
+            "-vv",
+            "-vvv",
+            "--verbose",
+            "--config-x",
+            "--rc",
+            "--rc-addr",
+            "--password-command",
+            "--use-json-log",
+        ] {
+            assert!(is_forbidden_flag(bad), "{bad}");
+        }
+        for ok in [
+            "--config",
+            "--drive-skip-shortcuts",
+            "--drive-use-trash=true",
+            "-R",
+            "--",
+            "--immutable",
+            "--cache-dir",
+        ] {
+            assert!(!is_forbidden_flag(ok), "{ok}");
+        }
+    }
+
+    #[test]
+    fn stderr_is_redacted_per_line_and_trimmed_to_the_tail() {
+        let raw = b"line one\nERROR : token expired\nAuthorization: Bearer abc\nBEARER xyz\n\"access_token\":\"s\"\nclient_secret=z\n\nplain tail\n";
+        let out = redact_stderr(raw, 10);
+        for secret in ["token expired", "abc", "xyz", "\"s\"", "z\n"] {
+            assert!(!out.contains(secret), "{out}");
+        }
+        assert!(out.contains("line one"));
+        assert!(out.ends_with("plain tail"));
+        assert_eq!(out.matches("[伏せ字]").count(), 5);
+        // 末尾の行だけ
+        let many: String = (0..20).map(|i| format!("l{i}\n")).collect();
+        assert_eq!(redact_stderr(many.as_bytes(), 3), "l17 / l18 / l19");
+        // 大文字小文字を問わない・制御文字は空白・長い行は切る
+        assert_eq!(redact_stderr(b"ToKeN\n", 3), "[伏せ字]");
+        assert_eq!(redact_stderr(b"a\x1b[31mb\n", 3), "a [31mb");
+        let long = "x".repeat(1000);
+        assert_eq!(
+            redact_stderr(long.as_bytes(), 1).chars().count(),
+            STDERR_LINE_MAX_CHARS
+        );
+        // UTF-8 でないバイトがあっても落ちない
+        assert!(!redact_stderr(&[0xff, 0xfe, b'\n'], 1).is_empty());
+        assert_eq!(redact_stderr(b"", 3), "");
+    }
+
+    fn entry(path: &str, id: &str, dir: bool) -> serde_json::Value {
+        json!({
+            "Path": path,
+            "Name": path.rsplit('/').next().unwrap(),
+            "Size": if dir { -1 } else { 10 },
+            "MimeType": if dir { "inode/directory" } else { "image/jpeg" },
+            "ModTime": "2030-01-01T00:00:00.000Z",
+            "IsDir": dir,
+            "ID": id,
+        })
+    }
+
+    #[test]
+    fn lsjson_output_shape_is_checked() {
+        let good = json!([entry("a", "id1", true), entry("a/b.jpg", "id2", false)]);
+        let parsed = parse_lsjson(good.to_string().as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].id, "id1");
+        assert!(parsed[0].is_dir);
+        assert_eq!(parsed[1].path, "a/b.jpg");
+        assert_eq!(parsed[1].name, "b.jpg");
+        assert_eq!(parsed[1].size, 10);
+        assert_eq!(parse_lsjson(b"[]").unwrap(), vec![]);
+        assert_eq!(parse_lsjson(b"[\n]\n").unwrap(), vec![]);
+
+        let bad_cases: Vec<serde_json::Value> = vec![
+            json!({"a": 1}),
+            json!([1]),
+            json!([{"Path": "a"}]),
+            // ID が無い・空・形が違う
+            json!([{"Path":"a","Name":"a","Size":1,"MimeType":"x/y","IsDir":false}]),
+            json!([entry("a", "", false)]),
+            json!([entry("a", "bad id", false)]),
+            json!([entry("a", "bad/id", false)]),
+            // Name が Path の最後と違う
+            json!([{"Path":"a/b","Name":"c","Size":1,"MimeType":"x/y","IsDir":false,"ID":"i"}]),
+            // パスの形
+            json!([entry("/a", "i", false)]),
+            json!([entry("a/", "i", false)]),
+            json!([entry("../a", "i", false)]),
+            json!([entry("a//b", "i", false)]),
+            json!([entry("", "i", false)]),
+            // 型が違う
+            json!([{"Path":"a","Name":"a","Size":"1","MimeType":"x/y","IsDir":false,"ID":"i"}]),
+            json!([{"Path":"a","Name":"a","Size":1,"MimeType":"x/y","IsDir":"no","ID":"i"}]),
+            json!([{"Path":"a","Name":"a","Size":1,"MimeType":5,"IsDir":false,"ID":"i"}]),
+            // IsDir と MimeType が食い違う、ファイルの Size が負
+            json!([{"Path":"a","Name":"a","Size":-1,"MimeType":"inode/directory","IsDir":false,"ID":"i"}]),
+            json!([{"Path":"a","Name":"a","Size":-1,"MimeType":"x/y","IsDir":true,"ID":"i"}]),
+            json!([{"Path":"a","Name":"a","Size":-1,"MimeType":"x/y","IsDir":false,"ID":"i"}]),
+        ];
+        for bad in bad_cases {
+            assert!(parse_lsjson(bad.to_string().as_bytes()).is_none(), "{bad}");
+        }
+        assert!(parse_lsjson(b"not json").is_none());
+        assert!(parse_lsjson(b"").is_none());
+    }
+
+    #[test]
+    fn drive_ids_are_never_empty() {
+        for ok in ["a", "0BxYz-_9", &"a".repeat(128)] {
+            assert!(is_valid_drive_id(ok));
+        }
+        for bad in ["", "a b", "a.b", &"a".repeat(129), "日本"] {
+            assert!(!is_valid_drive_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn shortcut_entries_are_recognised_by_mime() {
+        let e = LsEntry {
+            path: "a".into(),
+            name: "a".into(),
+            size: 1,
+            mime: SHORTCUT_MIME.into(),
+            is_dir: false,
+            id: "i".into(),
+        };
+        assert!(e.is_shortcut());
+    }
+
+    #[test]
+    fn run_errors_map_to_the_documented_codes() {
+        assert_eq!(
+            RunError::Timeout.into_op_error().code,
+            ErrorCode::RcloneTimeout
+        );
+        assert_eq!(
+            RunError::Exit(1).into_op_error().code,
+            ErrorCode::RcloneFailed
+        );
+        assert_eq!(
+            RunError::JobDeadline.into_op_error().code,
+            ErrorCode::Timeout
+        );
+        for e in [
+            RunError::Timeout,
+            RunError::NotFound,
+            RunError::Exit(1),
+            RunError::BadOutput,
+            RunError::Spawn,
+        ] {
+            assert_eq!(e.into_query_error().code, ErrorCode::DriveUnavailable);
+        }
+        assert_eq!(
+            RunError::JobDeadline.into_query_error().code,
+            ErrorCode::Timeout
+        );
+    }
+}
