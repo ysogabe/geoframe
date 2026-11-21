@@ -572,20 +572,20 @@ pub struct JobStore {
     staging: PathBuf,
 }
 
-/// 実在するディレクトリ（リンクでない）で、なければ 0700 で作る。
+/// 実在するディレクトリ（リンクでない）で、なければ 0700 で作る。どちらの場合も親のディレクトリを `fsync` する
+/// （作ったことを永続させる。前の呼び出しで mkdir の後の `fsync` が失敗してディレクトリだけ残った場合も、ここで同期を済ませてから使う）。
 pub(crate) fn ensure_dir(path: &Path, what: &'static str) -> Result<(), ExportError> {
     match dir_state(path) {
-        DirState::Real => Ok(()),
-        DirState::Bad => Err(internal(what)),
+        DirState::Real => {}
+        DirState::Bad => return Err(internal(what)),
         DirState::Absent => {
             DirBuilder::new()
                 .mode(0o700)
                 .create(path)
                 .map_err(|_| internal(what))?;
-            // 作ったことを親のディレクトリに永続させる（電源断のあとに、ディレクトリごと消えて見えなくならないように）
-            sync_parent(path).map_err(|_| internal(what))
         }
     }
+    sync_parent(path).map_err(|_| internal(what))
 }
 
 /// `path` の親ディレクトリを `fsync` する（`path` を作った・置いた直後に）。

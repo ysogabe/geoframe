@@ -1397,7 +1397,7 @@ fn a_rewrite_right_after_the_published_record_was_updated_is_blocked_by_the_reco
 fn when_the_published_row_and_the_job_record_disagree_on_md5_the_row_wins() {
     // 公開の記録の行（同じフォルダ ID）とジョブの記録に、違う MD5 が入っているとき、照らすのは行の MD5。
     // 行が正しければ（宛先の中身と一致）、ジョブの記録の MD5 が違っていても進み、行が違っていれば（ジョブの記録が宛先と一致していても）
-    // blocked にする。行がジョブの記録より先に書かれた、より新しい記録なので
+    // blocked にする。行はジョブの記録（退避・公開の前に書く）より後に書かれた、より新しい記録なので
     let different = {
         let mut v = world("digest-precedence-probe").set.recorded();
         v[0].md5 = "e".repeat(32);
