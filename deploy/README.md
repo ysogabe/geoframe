@@ -329,6 +329,8 @@ Python版へ戻す手順は、[`cutover.md` §8・§13.2](../docs/rust-migration
 | [`geoframe-admin.sh`](geoframe-admin.sh) | `geoframe`の CLI（`ai-jobs`など）を、サービスと同じユーザー・同じ設定のファイル・同じ制限で動かす（`systemd-run`。root で直接動かさない）。動かす前に DATA_DIR（パスだけ）を出す |
 | [`geoframe-admin-test.sh`](geoframe-admin-test.sh) | `geoframe-admin.sh`の拒否を、モックの`systemd-run`/`systemctl`で試験する |
 | [`loc_decision_morning.py`](loc_decision_morning.py)・[`tests/`](tests/) | 毎朝のDecision起動（§2.3）。標準ライブラリだけのPython。システムの`python3`で動き、試験は`python3 -m unittest discover -s deploy/tests`（pip不要） |
+| [`geoframe-export.service`](geoframe-export.service) | note 記事用の写真書き出し（`geoframe-export serve`）の systemd unit の雛形。配置は§8 |
+| [`geoframe-export-admin.sh`](geoframe-export-admin.sh)・[`geoframe-export-admin-test.sh`](geoframe-export-admin-test.sh) | `geoframe-export`の CLI（`run`・`recover`）を、サービスと同じ専用ユーザー・同じ設定・同じ制限で動かす（`systemd-run`）。試験は、モックの`systemd-run`/`systemctl`/`id`と、unit との食い違いの検査 |
 | [`../tools/miharashi-feed-check/`](../tools/miharashi-feed-check/README.md) | miharashi の取得・読み込みのコードを、画面なしで Rust 版に向けて動かす確認用ハーネス |
 
 ### 7.1 unit の要点
@@ -462,6 +464,202 @@ sudo install -d /etc/geoframe && sudo touch /etc/geoframe/staging  # 検証環�
 sudo chown -R geoframe:geoframe /var/lib/geoframe   # WAL の -shm を作れる持ち主にそろえる
 sudo install -m 0644 /dev/null /etc/default/geoframe # 出力に影響する設定だけ書く。本番に合わせて GEOFRAME_EMBED_BACKEND=local など
 ```
+
+## 8. note 記事用の写真書き出し（geoframe-export）の配置
+
+日付（または期間）の写真を、表示用 JPEG と`manifest.json`にして Google Drive の`yamareco/`・`travel-journal/`へ書き出す、別プロセスのサービスです
+（`geoframe-export`。写真サービスとは HTTP だけでつながります）。仕様は[PRD](../docs/note-photo-export/prd.md)、設計は[design.md](../docs/note-photo-export/design.md)にあります。
+この節は**配置の手順**で、配置は PRD・設計の「配置後」の確認（§8.8）まで、ユーザーの立ち会いのもとで行います。
+**値（トークン・client_id・client_secret・実際の IP）は、文書・PR・ログに書きません**（ここの IP は文書用の予約アドレス`192.0.2.x`です。実際は tailnet の IP を使います）。
+
+### 8.1 前提と順番
+
+1. 写真サービスを先に更新します。書き出しは写真サービスの一覧 API（`GET /api/admin/export/photos`）を読むので、その API を足したバージョンを先に本番へ入れます
+   （いつもの手順。§5・§7.3、本番は[`cutover.md`](../docs/rust-migration/cutover.md)）。入れたあと、一覧 API が答えることを確かめます。
+   `curl --fail -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8080/api/admin/export/photos?from=<YYYY-MM-DD>&to=<YYYY-MM-DD>'`が`200`なら先へ進みます。
+2. 次に`geoframe-export`を入れます（このあとの節）。写真サービスの unit と DB には触れません。
+3. Drive に、書き出し先の親フォルダ（`yamareco/`・`travel-journal/`）と作業用のフォルダ（§8.5）が先に存在している必要があります。
+
+### 8.2 ビルドと専用ユーザー・置き場所
+
+バイナリは写真サービスと同じ musl の完全静的ビルドです（[build.md](../docs/rust-migration/build.md)。配るのは`geoframe-export`だけで、試験用の偽の rclone は配りません）。
+
+```sh
+cargo build --release --target x86_64-unknown-linux-musl -p geoframe-export --bin geoframe-export
+sha256sum target/x86_64-unknown-linux-musl/release/geoframe-export   # 控える。本番機で入れる前に同じ値か確かめる
+```
+
+専用ユーザーはログインシェルとホームを持たない`geoframe-export`です（写真サービスの`geoframe`とも、オーナーのユーザーとも別にします）。
+状態ディレクトリ（`/var/lib/geoframe-export`）は、unit の`StateDirectory=`が起動時に作りますが、**rclone の設定が無いと起動しない**ので、設定を置くために先に作ります。
+
+```sh
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin geoframe-export
+sudo install -d -o geoframe-export -g geoframe-export -m 0700 \
+  /var/lib/geoframe-export /var/lib/geoframe-export/rclone /var/lib/geoframe-export/rclone/home /var/lib/geoframe-export/rclone/cache
+sudo install -o root -g root -m 0755 geoframe-export /usr/local/bin/geoframe-export
+sudo install -D -o root -g root -m 0644 /opt/geoframe/deploy/geoframe-export.service /usr/local/lib/systemd/system/geoframe-export.service
+```
+
+unit は`geoframe-rs.service`と同じく`/usr/local/lib/systemd/system/`に置きます（`/etc/systemd/system/`には drop-in と mask のリンクだけを置きます。§7.1）。
+`rust-deploy.sh`は`geoframe-export`を扱わないので、入れ替えは手で行います。更新のときは、戻せるよう、上書きの前に今のバイナリを`sudo cp -p /usr/local/bin/geoframe-export /usr/local/bin/geoframe-export.prev`で残します。
+
+rclone は`ProtectHome=yes`の unit から使えるよう、ホームの外（`/usr/local/bin/rclone`）に置きます。バージョンは§8.3 でブラウザのある機体に入れるものと同じにします
+（この設計は v1.76.0 の引数で確かめています）。公式の配布物（<https://rclone.org/downloads/>）を取り、署名か`SHA256SUMS`を確かめてから入れます。
+
+```sh
+sudo install -o root -g root -m 0755 rclone /usr/local/bin/rclone
+/usr/local/bin/rclone version
+```
+
+### 8.3 専用の client_id での rclone の設定（ユーザーの操作）
+
+rclone の共用の client_id は 2026 年中に使えなくなります（rclone 自身が警告を出します）。書き出しは**このサービス専用の client_id** で認可した、専用の設定ファイル
+（`/var/lib/geoframe-export/rclone/rclone.conf`）だけを使います。権限は Drive 全体のままです（設計 U4。書き出し先が今の`yamareco/`・`travel-journal/`で、受け取り側の経路を変えないため）。
+`client_id`と`client_secret`が空だと`geoframe-export`は起動しません（共用の client_id に戻れないようにしています）。
+
+次の手順は rclone の公式の文書（[Making your own client_id](https://rclone.org/drive/#making-your-own-client-id)・[Remote setup](https://rclone.org/remote_setup/)）に基づきます。
+Google API Console の画面の項目名は変わることがあるので、公式の文書も合わせて見てください。
+
+1. Google API Console（<https://console.developers.google.com/>）にログインします（Drive の持ち主と同じアカウントでなくてもかまいません）。
+2. プロジェクトを作ります（既にあれば選びます）。
+3. 「ENABLE APIS AND SERVICES」で「Google Drive API」を有効にします。
+4. 左の「Credentials」を開きます（「Create credentials」ではありません）。
+5. 同意画面が未設定なら、「CONFIGURE CONSENT SCREEN」→「Get started」を押します。アプリ名（例: `geoframe-export`）、サポートのメール、Audience は「External」、連絡先を入れて「Create」します。
+   「Data Access」で scope `https://www.googleapis.com/auth/drive`を足して保存します（書き出しは Drive 全体の権限のままです。設計 U4）。
+6. 「Audience」→「+ Add users」で、自分をテストユーザーに足します。
+7. 「Overview」→「Create OAuth client」を押し、種類は「Desktop app」にして「Create」します。
+8. client ID と client secret を控えます。**チャット・リポジトリ・コミット・ログには書きません。**
+9. 「Audience」→「PUBLISH APP」で公開します。**「Testing」のままだと、許可（リフレッシュトークン）が 1 週間で切れます。**
+   「PUBLISH APP」が押せないときは、「Branding」でホームページとプライバシーポリシーの URL、Authorized domains を入れます。
+   個人で使う（100 人未満）なら審査は要りません。ただし、認可のときに「確認されていないアプリ」の警告が出るので、そのまま先へ進みます。
+10. ブラウザの無いこのホストで、専用ユーザーとして設定します。`HOME`は、サービスの rclone と同じ場所（状態ディレクトリの下）にします。
+
+    ```sh
+    sudo -u geoframe-export env HOME=/var/lib/geoframe-export/rclone/home XDG_CACHE_HOME=/var/lib/geoframe-export/rclone/cache \
+      /usr/local/bin/rclone config --config /var/lib/geoframe-export/rclone/rclone.conf
+    ```
+
+    対話の入力は次のとおりです。remote 名は **`gdrive`**（書き出し先の既定が`gdrive:yamareco`などで、設定ファイルのセクション名と合わせます）、種類は`drive`、
+    `client_id`と`client_secret`に 8 で控えた値、`scope`は`1`（`drive`）、`service_account_file`は空、「Use web browser to automatically authenticate rclone with remote?」は **`n`** です。
+    すると rclone がブラウザのある機体で実行するコマンドを表示します。表示された指示を優先してください。表示はおおむね次の形です
+    （この 3 つの引数の形は、rclone v1.76.0 の`rclone authorize --help`の usage `rclone authorize <backendname> [base64_json_blob | client_id client_secret]`によります。実行例は公式の文書にありません）。
+
+    ```sh
+    rclone authorize "drive" "<client_id>" "<client_secret>"
+    ```
+
+    ブラウザのある別の機体（同じバージョンの rclone がよい）でこれを実行し、ブラウザで認可します（Drive の持ち主のアカウントで許可します）。
+    出てきたトークン（`{`で始まる JSON）を、このホストの`config_token>`に貼ります。「Configure this as a Shared Drive」は`n`、最後の確認は`y`です。
+    client_secret をコマンドの引数に書くので、その機体のシェルの履歴に残らないようにし、使い終わったら履歴から消します。
+11. 設定ファイルが`0600`、ディレクトリが`0700`で、専用ユーザーの持ち物であることを確かめます。`geoframe-export`は、満たさないと起動しません。
+
+    ```sh
+    sudo ls -ld /var/lib/geoframe-export /var/lib/geoframe-export/rclone
+    sudo ls -l /var/lib/geoframe-export/rclone/rclone.conf
+    ```
+
+    動作は読み取りだけの確認（一覧）で確かめます: `sudo -u geoframe-export env HOME=/var/lib/geoframe-export/rclone/home XDG_CACHE_HOME=/var/lib/geoframe-export/rclone/cache /usr/local/bin/rclone lsd gdrive: --config /var/lib/geoframe-export/rclone/rclone.conf`
+
+> [!NOTE]
+> **オーナーのホームにある今の rclone の設定（手作業の経路）も、共用の client_id のままなら同じく止まります。** 書き出しの専用の設定とは別に、そちらも同じ手順で直す必要があります。
+
+### 8.4 トークンと環境ファイル
+
+呼び出し側（別 VM のエージェント）が使う Bearer トークンを作ります。専用ユーザーの持ち物で、モード`0600`、32 バイト以上です
+（`geoframe-export`は、持ち主・モード・長さ・弱い値を起動時に検査して、満たさなければ起動しません。値は文書・ログに出しません）。
+
+```sh
+openssl rand -hex 32 | sudo -u geoframe-export tee /var/lib/geoframe-export/token >/dev/null   # 値は画面に出さない
+sudo chmod 0600 /var/lib/geoframe-export/token
+```
+
+置き場所は、専用ユーザーが読めればどこでもかまいません（上は例です）。呼び出し側には安全な経路で別に渡します。
+
+tailnet の IP・許可する送信元・トークンのファイルのパスは、unit に書かず`/etc/default/geoframe-export`（`0600 root:root`。無ければ起動しない）に置きます。
+drop-in で`ExecStart=`を上書きする形にはしません: CLI の包み（`geoframe-export-admin.sh`）が、unit と同じ設定の引数を使うためです。
+
+| 変数 | 意味 | 例（文書用の予約アドレス） |
+| --- | --- | --- |
+| `GEOFRAME_EXPORT_LISTEN` | 待ち受ける tailnet の IP とポート。tailnet の帯（IPv4 は`100.64.0.0/10`、IPv6 は`fd7a:115c:a1e0::/48`）とループバック以外の IP、`0.0.0.0`・`::`は起動時に拒否される | `192.0.2.1:8090` |
+| `GEOFRAME_EXPORT_TOKEN_FILE` | トークンのファイルのパス | `/var/lib/geoframe-export/token` |
+| `GEOFRAME_EXPORT_ALLOW_ARGS` | 許可する送信元 IP を`--allow <IP>`の並びで書く（呼び出し側と、このホスト自身）。値に空白があるので二重引用符で囲む | `"--allow 192.0.2.10 --allow 192.0.2.11"` |
+
+```sh
+sudo install -o root -g root -m 0600 /dev/null /etc/default/geoframe-export   # 中身は各自で書く（上の 3 つの変数）
+```
+
+systemd の展開では、`${GEOFRAME_EXPORT_LISTEN}`のような`${…}`は値が 1 つの引数になり、`$GEOFRAME_EXPORT_ALLOW_ARGS`は空白で分かれた 0 個以上の引数になります
+（unit の`ExecStart`と`systemd.service(5)`）。どれかが空・未設定だと、`geoframe-export`が引数を断って終了コード 2 になり、`RestartPreventExitStatus=2`で再起動ループにはなりません。
+
+### 8.5 Drive の作業用フォルダ
+
+書き出し先の親フォルダ（`yamareco/`・`travel-journal/`）とは別の、最上位のフォルダ `geoframe-export-work`（既定。`--work-root`）を、Drive の画面で作ります。
+受け取り側が一覧する親フォルダの下に、作業用のものを見せないためです。このフォルダは誰とも共有しません。`yamareco/`・`travel-journal/`も先に存在している必要があります。
+別の名前にするときは、`--work-root`を unit と包みの両方に足します（remote 名は`gdrive`のまま、親フォルダの下にも入れ子にもしない）。
+
+### 8.6 unit の有効化（ユーザーの立ち会いで）
+
+1. `systemd-analyze verify /usr/local/lib/systemd/system/geoframe-export.service`（バイナリや rclone を置いたあとなら警告は出ません）。
+2. CLI の包みで、まず**書かずに確認**します（§8.7 の`dry_run`。サービスの起動の前でも使えます）。
+3. 起動します。`sudo systemctl daemon-reload && sudo systemctl enable --now geoframe-export`、確認は`systemctl is-active geoframe-export`と`journalctl -u geoframe-export -f`です。
+   待ち受けは`/healthz`（認証なし。送信元の許可は効く）で確かめます。
+
+起動の最初に、止まっていたジョブの復旧（Drive の照合）を済ませてから待ち受けます。止まったジョブがあると、再起動のあと数分は`/healthz`も答えず、接続が拒否されます
+（unit は`Type=simple`なので、systemd は待ちません）。呼び出し側は拒否されたら間隔を空けて再試行します。
+停止（SIGTERM）では接続を最大 75 秒待って打ち切り、実行中の rclone を止めて後始末を終えてから終わります（`TimeoutStopSec=180s`、`KillMode=mixed`）。
+tailnet の IP が起動直後にまだ無いときの bind の失敗（終了コード 1）は 15 秒おきに再試行します（300 秒に 10 回まで）。
+
+### 8.7 CLI（`geoframe-export-admin.sh`）
+
+`geoframe-export`を root で直接動かさず（バイナリが断ります）、サービスと同じ専用ユーザー・設定・状態ディレクトリ・ハードニングで動かすには、`deploy/geoframe-export-admin.sh`を使います
+（`geoframe-admin.sh`と同じ考え方で、`systemd-run`の一時サービス`geoframe-export-cli`として動かします。サービスと同じ実行枠`export.lock`を取るので、書き出しの実行中は終了コード 4 です）。
+
+```sh
+# 書かずに確認（dry_run）: 候補の数・フォルダ名・宛先の状態・既存のフォルダを管理しているか
+sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <YYYY-MM-DD> --destination yamareco --dry-run
+# 書き出し（期間は --to。置き換えは --on-exists replace。終了コード 0 成功・0 枚 / 1 失敗 / 2 引数・設定 / 3 conflict / 4 実行中）
+sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <YYYY-MM-DD> --destination yamareco
+# 止まったジョブの確認（Drive は変えない）と、blocked の解除（Drive の状態を確かめたあと）
+sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover
+sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover --resolve <job_id>
+# 途中で止める（rclone を止めて後始末をしてから終わる。ジョブの記録は次の復旧が片付ける）
+sudo systemctl stop geoframe-export-cli
+```
+
+`serve`は包みでは動かさず、サービスで動かします。unit の固定の引数（`--rclone`・`--rclone-config`・`--state-dir`・`--feed-base`）を変えるときは、
+包みの同じ値も変えます（`bash deploy/geoframe-export-admin-test.sh`が、unit と包みの食い違いを検査します）。
+
+### 8.8 配置の後の確認（PRD・設計 10 章）
+
+起動の前後に、次を確かめて記録します（記録は公開リポジトリの外に置きます）。
+
+1. 上りの帯域を測ります。転送時間の仮定（1 日の最多 322 枚・約 260MB を、上り 20Mbps で約 2 分、5Mbps で約 7 分。14 日の最多は約 580MB）と、
+   rclone の期限（写真の`copy`は既定 45 分、それ以外は 5 分。ジョブ全体は 60 分）を見直します。
+2. 共有範囲を確かめて記録します（設計 U7）。`yamareco/`・`travel-journal/`・作業用のフォルダの共有設定を Drive の画面で確認します。
+   「リンクを知っている全員」や、オーナーと受け取り側以外への共有があれば、配置を止めてオーナーに確かめます（manifest に正確な座標が入り、全写真が出るため）。
+   このサービスは共有設定を変えません。公開したフォルダは親フォルダの共有を受け継ぎます。
+3. 受け取り側が`lat`/`lon`の`null`と増えた枚数を扱えるか確かめます。位置の無い写真も出るので、受け取り側の検証と記事の作成が`null`で落ちないことを確かめます。
+4. 旧 manifest のある日で比べます。その日を`dry_run`し、検証用の接頭辞（例: `gdrive:geoframe-export-verify`。`gdrive`の最上位に、作業用のフォルダと入れ子にならない別のフォルダとして、共有せずに作る）へ書き出します。
+   `sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <日付> --destination yamareco --remote-yamareco gdrive:geoframe-export-verify`
+   旧 manifest と比べ、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことと、呼び出し側の実際の検証（サイズの突き合わせ）まで通ることを確かめます。
+   検証用の書き出しも公開の記録（`published.json`）に残ります（同じ種類・フォルダ名の行は置き換わります）。
+5. rclone のトークン更新が unit の権限の下で動くこと（設定ファイルを書き戻せること）を確かめます。アクセストークンは約 1 時間で切れ、更新は`rclone.conf`への書き戻しを伴います。
+   書き出しの実行中か、1 時間を空けた 2 回目の実行のあとで、`rclone.conf`の更新時刻が変わり、持ち主と`0600`が保たれていること、journal に権限のエラーが無いことを見ます。
+6. unit のハードニングの未確定分を、実測してから決めます（unit のコメントに残してあります）。
+   - `RestrictAddressFamilies=AF_INET AF_INET6`で足りるか（rclone（Go）が`AF_UNIX`・`AF_NETLINK`を要しないか。要るなら、必要な 1 つだけを足し、包みの同じ設定も合わせる）。
+   - `MemoryDenyWriteExecute=true`を rclone と組み合わせて付けられるか。
+   - `MemoryMax=`・`TasksMax=`の値（14 日の最多の書き出し中の、rclone と本体の合計の最大値に余裕を足す）。
+7. 本物の rclone で確かめる点（試験は偽の rclone で行ったため、本物の挙動はここで初めて確かめます。検証用の接頭辞で行う）。
+   - `moveto`が、フォルダの ID を保ったまま移すこと（ファイル単位の移動に切り替わらないこと。結果の ID の照合で`blocked`にならないこと）。
+   - `lsjson`の`--drive-show-all-gdocs`・ショートカットの見え方（宛先と同じ名前のフォームやショートカットが`ambiguous_destination`として見えること）。
+   - 無いディレクトリへの一覧で、終了コード 3 が返ること。
+   - `cat --count`など、使う引数が rclone に受け付けられること。
+
+### 8.9 トラブルシュート
+
+- 起動しない（終了コード 2、`failed`のまま止まる）: `journalctl -u geoframe-export`に、検査に通らなかった項目の名前（`--listen`・`--token-file`・rclone の設定の持ち主やモード・`client_id`の空など）が出ます（値は出ません）。直したあと`systemctl reset-failed geoframe-export`で起動します。
+- 接続が拒否される・`/healthz`が答えない: 起動時の復旧の最中です（§8.6）。journal を見て、数分待ちます。
+- `blocked`（次の書き出しがすべて 503）: Drive の状態を`recover`で確かめ、Drive の画面で片付けてから`recover --resolve <job_id>`で解除します（設計 4.2 の復旧）。
 
 ## トラブルシュート
 
