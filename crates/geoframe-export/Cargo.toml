@@ -1,0 +1,22 @@
+[package]
+name = "geoframe-export"
+version = "0.1.0"
+edition = "2024"
+description = "note 記事用の写真書き出し（docs/note-photo-export/design.md）。写真サービスとは HTTP だけでつながる別プロセス"
+
+[lib]
+name = "geoframe_export"
+path = "src/lib.rs"
+
+[[bin]]
+name = "geoframe-export"
+path = "src/main.rs"
+
+# 依存は、ワークスペースで既に使っている crate の同じ版だけ（design.md 3.2）。`geoframe` crate には依存しない。
+# 後のタスクで axum・tokio（serve）、zune-jpeg・fast_image_resize（画像）を足す。
+[dependencies]
+serde_json = "1.0.154"
+# 写真サービスへの GET（127.0.0.1 の http だけ。TLS は要らない）。同期 API
+ureq = { version = "3", default-features = false }
+# 実効ユーザー ID（geteuid）と O_NOFOLLOW だけ
+libc = "0.2"
