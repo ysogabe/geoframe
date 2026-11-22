@@ -76,6 +76,9 @@ PROPS=(
     RestrictNamespaces=true
     LockPersonality=true
     RestrictSUIDSGID=true
+    MemoryDenyWriteExecute=true
+    MemoryMax=512M
+    TasksMax=64
     # SIGTERM（systemctl stop <unit 名>）は本体だけに送る。rclone の止め方と順序は geoframe-export が決める（サービスと同じ）
     KillMode=mixed
     # SIGTERM を受けた run は rclone を止めて wait し終えるまで終わらない。サービスの TimeoutStopSec と同じだけ待つ

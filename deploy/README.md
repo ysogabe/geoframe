@@ -705,10 +705,13 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
 
 5. rclone のトークン更新が unit の権限の下で動くこと（設定ファイルを書き戻せること）を確かめます。アクセストークンは約 1 時間で切れ、更新は`rclone.conf`への書き戻しを伴います。
    書き出しの実行中か、1 時間を空けた 2 回目の実行のあとで、`rclone.conf`の更新時刻が変わり、持ち主と`0600`が保たれていること、journal に権限のエラーが無いことを見ます。
-6. unit のハードニングの未確定分を、実測してから決めます（unit のコメントに残してあります）。
-   - `RestrictAddressFamilies=AF_INET AF_INET6`で足りるか（rclone（Go）が`AF_UNIX`・`AF_NETLINK`を要しないか。要るなら、必要な 1 つだけを足し、包みの同じ設定も合わせる）。
-   - `MemoryDenyWriteExecute=true`を rclone と組み合わせて付けられるか。
-   - `MemoryMax=`・`TasksMax=`の値（14 日の最多の書き出し中の、rclone と本体の合計の最大値に余裕を足す）。
+6. unit のハードニングの未確定分は、2026-11-22 に本番で実測して決めました（`geoframe-export.service`のコメントにも同じ値を残してあります）。
+   - `RestrictAddressFamilies=AF_INET AF_INET6`は、そのままで足りました（`AF_UNIX`・`AF_NETLINK`は要りませんでした）。
+   - `MemoryDenyWriteExecute=true`を付けて通りました。
+   - `MemoryMax=512M`・`TasksMax=64`を入れました。14 日の最多（880 枚・690MB）の書き出し中、anon メモリは最大 38.5MB、ページキャッシュは最大 660MB、タスクは最大 24 でした。
+     `MemoryMax=256M`・`TasksMax=64`・`MemoryDenyWriteExecute=true`でも成功しました。`MemoryMax`は、ページキャッシュの回収で詰まらないよう、余裕を見て 512M にしています。
+     この値は、書き出す画像が表示用の大きさ（長辺 2560px）であることが前提です。派生の大きさを変えるときは、`MemoryMax`を測り直します。
+     同じ 3 つの値を`geoframe-export-admin.sh`にも入れてあります（食い違いは`geoframe-export-admin-test.sh`が検査します）。
 7. 本物の rclone で確かめる点（試験は偽の rclone で行ったため、本物の挙動はここで初めて確かめます。検証用の入口（`--verify`）で行う）。
    - `moveto`が、フォルダの ID を保ったまま移すこと（ファイル単位の移動に切り替わらないこと。結果の ID の照合で`blocked`にならないこと）。
    - `lsjson`の`--drive-show-all-gdocs`・ショートカットの見え方（宛先と同じ名前のフォームやショートカットが`ambiguous_destination`として見えること）。
@@ -716,7 +719,9 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
    - `lsjson -R --hash --hash-type MD5`で、Drive のバイナリのファイル（写真と`manifest.json`）に、`Hashes`の`md5`（小文字の 16 進 32 文字）が出ること。
      その値が、作業領域のファイルの MD5（`md5sum`）と一致すること。フォルダには`Hashes`が付かないこと。Google のネイティブ文書では`Hashes`が付かないこと
      （一式に無いファイルとして断られます）。`replace`の前の確認（`modified`）と、ゴミ箱へ移す前の確認（`retired_content_changed`）は、この MD5 に頼ります。
-     書き出し直したフォルダに、Drive の画面で同じ名前・同じ大きさのファイルを上書きしたとき、`--dry-run`の`managed`が`false`になる（`replace`が`modified`で断られる）ことも見ます。
+     書き出し直したフォルダに、Drive の画面で同じ名前・同じ大きさで中身だけ違うファイルを上書きしたときも、`--dry-run`の`managed`は`true`のままです
+     （公開の記録にそのフォルダの ID と MD5 があり、manifest の`generator`・`destination`・`folder`が合っていれば、管理フォルダとして扱います）。`replace`は中身の MD5 の照合で`conflict`（`modified`）になり、終了コード 3 で断られます。
+     フォルダの中に Google ドキュメントがある場合も、同じく`modified`で断られます。これらも見ます。
    - `cat --count`など、使う引数が rclone に受け付けられること。
 
 ### 8.9 トラブルシュート
