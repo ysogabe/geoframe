@@ -710,6 +710,7 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
    - `MemoryDenyWriteExecute=true`を付けて通りました。
    - `MemoryMax=512M`・`TasksMax=64`を入れました。14 日の最多（880 枚・690MB）の書き出し中、anon メモリは最大 38.5MB、ページキャッシュは最大 660MB、タスクは最大 24 でした。
      `MemoryMax=256M`・`TasksMax=64`・`MemoryDenyWriteExecute=true`でも成功しました。`MemoryMax`は、ページキャッシュの回収で詰まらないよう、余裕を見て 512M にしています。
+     この値は、書き出す画像が表示用の大きさ（長辺 2560px）であることが前提です。派生の大きさを変えるときは、`MemoryMax`を測り直します。
      同じ 3 つの値を`geoframe-export-admin.sh`にも入れてあります（食い違いは`geoframe-export-admin-test.sh`が検査します）。
 7. 本物の rclone で確かめる点（試験は偽の rclone で行ったため、本物の挙動はここで初めて確かめます。検証用の入口（`--verify`）で行う）。
    - `moveto`が、フォルダの ID を保ったまま移すこと（ファイル単位の移動に切り替わらないこと。結果の ID の照合で`blocked`にならないこと）。
@@ -719,7 +720,7 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
      その値が、作業領域のファイルの MD5（`md5sum`）と一致すること。フォルダには`Hashes`が付かないこと。Google のネイティブ文書では`Hashes`が付かないこと
      （一式に無いファイルとして断られます）。`replace`の前の確認（`modified`）と、ゴミ箱へ移す前の確認（`retired_content_changed`）は、この MD5 に頼ります。
      書き出し直したフォルダに、Drive の画面で同じ名前・同じ大きさで中身だけ違うファイルを上書きしたときも、`--dry-run`の`managed`は`true`のままです
-     （公開の記録と ID・generator が合っていれば、管理フォルダとして扱います）。`replace`は中身の MD5 の照合で`conflict`（`modified`）になり、終了コード 3 で断られます。
+     （公開の記録にそのフォルダの ID と MD5 があり、manifest の`generator`・`destination`・`folder`が合っていれば、管理フォルダとして扱います）。`replace`は中身の MD5 の照合で`conflict`（`modified`）になり、終了コード 3 で断られます。
      フォルダの中に Google ドキュメントがある場合も、同じく`modified`で断られます。これらも見ます。
    - `cat --count`など、使う引数が rclone に受け付けられること。
 

@@ -114,6 +114,7 @@ UMask=0077
 # 次の 3 つは、2026-11-22 の本番での実測（deploy/README.md §8.8）で決めた。14 日の最多（880 枚・690MB）の書き出し中、
 # anon メモリは最大 38.5MB、ページキャッシュは最大 660MB、タスクは最大 24 だった。MemoryMax=256M・TasksMax=64・
 # MemoryDenyWriteExecute=true でも成功した。MemoryMax はページキャッシュの回収で詰まらないよう、余裕を見て 512M にした。
+# 書き出す画像が表示用の大きさ（長辺 2560px）であることが前提。派生の大きさを変えるときは MemoryMax を測り直す。
 MemoryDenyWriteExecute=true
 MemoryMax=512M
 TasksMax=64
