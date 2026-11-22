@@ -193,18 +193,18 @@ expect "unit の User= と包みの RUN_USER が同じ" bash -c 'u=$(sed -n "s/^
 expect "unit の StateDirectory= と包みの状態ディレクトリが同じ（/var/lib/ の下）" bash -c 'd=$(sed -n "s/^StateDirectory=//p" "$1"); grep -qx "STATE_DIR=\"/var/lib/$d\"" "$2"' _ "$UNIT" "$SCRIPT"
 # ハードニングの値: unit の設定（コメントでない行）を、包みが systemd-run の -p で同じ値のまま渡している
 run recover
-for key in StateDirectory StateDirectoryMode UMask NoNewPrivileges ProtectSystem ProtectHome PrivateTmp PrivateDevices CapabilityBoundingSet RestrictAddressFamilies SystemCallFilter SystemCallArchitectures ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictNamespaces LockPersonality RestrictSUIDSGID KillMode TimeoutStopSec; do
+for key in StateDirectory StateDirectoryMode UMask NoNewPrivileges ProtectSystem ProtectHome PrivateTmp PrivateDevices CapabilityBoundingSet RestrictAddressFamilies SystemCallFilter SystemCallArchitectures ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictNamespaces LockPersonality RestrictSUIDSGID MemoryDenyWriteExecute MemoryMax TasksMax KillMode TimeoutStopSec; do
     val="$(sed -n "s/^${key}=//p" "$UNIT")"
     expect "unit の ${key}=${val} を包みも同じ値で渡す" bash -c 'grep -qxF -e "$1=$2" "$3"' _ "$key" "$val" "$MOCK_ARGS"
 done
 # 検証用の入口も、StateDirectory= 以外のハードニングは本番と同じ値（StateDirectory は検証用の名前）
 run --verify recover
-for key in StateDirectoryMode UMask NoNewPrivileges ProtectSystem ProtectHome PrivateTmp PrivateDevices CapabilityBoundingSet RestrictAddressFamilies SystemCallFilter SystemCallArchitectures ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictNamespaces LockPersonality RestrictSUIDSGID KillMode TimeoutStopSec; do
+for key in StateDirectoryMode UMask NoNewPrivileges ProtectSystem ProtectHome PrivateTmp PrivateDevices CapabilityBoundingSet RestrictAddressFamilies SystemCallFilter SystemCallArchitectures ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictNamespaces LockPersonality RestrictSUIDSGID MemoryDenyWriteExecute MemoryMax TasksMax KillMode TimeoutStopSec; do
     val="$(sed -n "s/^${key}=//p" "$UNIT")"
     expect "検証用の入口も unit の ${key}=${val} を同じ値で渡す" bash -c 'grep -qxF -e "$1=$2" "$3"' _ "$key" "$val" "$MOCK_ARGS"
 done
 expect "unit にあるハードニングの設定を包みが渡し忘れていない（コメントでない行の名前が全部、上の一覧にある）" bash -c '
-    listed=" StateDirectory StateDirectoryMode UMask NoNewPrivileges ProtectSystem ProtectHome PrivateTmp PrivateDevices CapabilityBoundingSet RestrictAddressFamilies SystemCallFilter SystemCallArchitectures ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictNamespaces LockPersonality RestrictSUIDSGID KillMode TimeoutStopSec "
+    listed=" StateDirectory StateDirectoryMode UMask NoNewPrivileges ProtectSystem ProtectHome PrivateTmp PrivateDevices CapabilityBoundingSet RestrictAddressFamilies SystemCallFilter SystemCallArchitectures ProtectKernelTunables ProtectKernelModules ProtectKernelLogs ProtectControlGroups RestrictNamespaces LockPersonality RestrictSUIDSGID MemoryDenyWriteExecute MemoryMax TasksMax KillMode TimeoutStopSec "
     skip=" Description Documentation After Wants StartLimitIntervalSec StartLimitBurst Type User EnvironmentFile ExecStart Restart RestartSec RestartPreventExitStatus StandardOutput StandardError SyslogIdentifier WantedBy "
     for k in $(grep -E "^[A-Za-z]+=" "$1" | sed "s/=.*//" | sort -u); do
         case "$listed$skip" in *" $k "*) ;; *) echo "未分類: $k" >&2; exit 1 ;; esac

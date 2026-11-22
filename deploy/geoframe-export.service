@@ -97,8 +97,8 @@ PrivateDevices=true
 # 特権（capability）は要らない（1024 以上のポートで待ち受け、自分の状態ディレクトリにだけ書く）。
 CapabilityBoundingSet=
 # AF_INET・AF_INET6 は、tailnet での待ち受け、写真サービスへの接続（127.0.0.1）、rclone の Google への HTTPS。
-# 配置時に確かめること: rclone（Go）が AF_UNIX（systemd-resolved・nscd の名前解決など）や AF_NETLINK（ネットワークの
-# 構成の読み取り）を要するか。要るなら、journal のエラーと失敗した操作を確かめてから、必要な 1 つだけを足す。
+# rclone（Go）が AF_UNIX（systemd-resolved・nscd の名前解決など）や AF_NETLINK（ネットワークの構成の読み取り）を要するかは、
+# 2026-11-22 の本番での実測（deploy/README.md §8.8）で確かめ済み。AF_INET・AF_INET6 だけで足りた。
 RestrictAddressFamilies=AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
@@ -111,10 +111,12 @@ LockPersonality=true
 RestrictSUIDSGID=true
 # 作るファイル（記録・作業領域の写真・rclone の設定）は、所有者だけが読める。geoframe-export-admin.sh も同じ UMask で動かす。
 UMask=0077
-# 次の 3 つは、配置時に rclone（Go）と JPEG のデコードを組み合わせて動かし、実測してから決める（設計 8 章）。値は入れない。
-#   MemoryDenyWriteExecute=true … Go のランタイムと rclone が W+X のメモリを要しないか。通れば付ける
-#   MemoryMax=…                 … 14 日の最多（約 714 枚・580MB）の書き出し中の最大の使用量（rclone と本体の合計）に余裕を足す
-#   TasksMax=…                  … rclone（Go）のスレッド数を実測して、余裕を足す
+# 次の 3 つは、2026-11-22 の本番での実測（deploy/README.md §8.8）で決めた。14 日の最多（880 枚・690MB）の書き出し中、
+# anon メモリは最大 38.5MB、ページキャッシュは最大 660MB、タスクは最大 24 だった。MemoryMax=256M・TasksMax=64・
+# MemoryDenyWriteExecute=true でも成功した。MemoryMax はページキャッシュの回収で詰まらないよう、余裕を見て 512M にした。
+MemoryDenyWriteExecute=true
+MemoryMax=512M
+TasksMax=64
 # 書き込める場所は StateDirectory だけで、ReadWritePaths= は足さない。
 
 # ログは journal へ集約（確認: journalctl -u geoframe-export -f）。トークンと要求のヘッダは出さない（設計 3.4）。
