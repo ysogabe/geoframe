@@ -406,6 +406,8 @@ fn after() { let _ = "GEOFRAME_AFTER_TESTS"; }
     assert!(is_test_file(Path::new(
         "crates/geoframe/src/ai/tests_http.rs"
     )));
-    assert!(is_test_file(Path::new("crates/geoframe/tests/blog_api.rs")));
+    assert!(is_test_file(Path::new(
+        "crates/geoframe/tests/static_files.rs"
+    )));
     assert!(!is_test_file(Path::new("crates/geoframe/src/config.rs")));
 }

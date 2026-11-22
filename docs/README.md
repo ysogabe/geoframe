@@ -40,7 +40,7 @@
 
 ### `admin-rework/` — 管理画面の整え直し（A）
 
-2026-10-30 開始。3 ページの管理画面を 1 枚の 3 タブに統合し、旅行ブログを設定で無効にし、設定タブを足す計画。
+2026-10-30 開始。3 ページの管理画面を 1 枚の 3 タブに統合し、旅行ブログを設定で無効にし、設定タブを足す計画。旅行ブログは「作り直す予定」で残していたが、2026-11 に機能ごと削除した（書き出しは `geoframe-export` が引き継いだ）。
 
 - [PRD](admin-rework/prd.md) / [設計](admin-rework/design.md)
 
@@ -58,7 +58,7 @@
 アーキテクチャ上の意思決定記録（ADR）です。判断が変わった場合は過去の記録を黙って
 書き換えず、置き換える新しいADRを追加します。
 
-- [ADR 0001: 旅行ブログ生成](decisions/0001-travel-blog-generation.md)
+- [ADR 0001: 旅行ブログ生成](decisions/0001-travel-blog-generation.md)（2026-11 に機能を削除）
 - [ADR 0002: 画面電源の手動オーバーライド](decisions/0002-screen-power-override-via-ha.md)（廃止）
 - [ADR 0003: 画面制御の状態機械](decisions/0003-screen-control-state-machine.md)（廃止）
 - [ADR 0004: 表示モードのアービトレーション](decisions/0004-frontend-display-mode-arbitration.md)（廃止）

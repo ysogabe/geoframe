@@ -19,13 +19,11 @@
 //! | 地図タイル・地名検索の上流へ送る User-Agent（連絡先入りにする。ログには出さない） | なし | `GEOFRAME_TILE_UA` | `GeoFrame/0.1 (personal photo frame)` |
 //! | 地図タイルの上流取得の毎分の上限（全体。0 は上流へ行かない） | なし | `GEOFRAME_TILE_FETCH_PER_MIN` | `240` |
 //! | 取り込み（DB への書き込み・同期サイクル）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_INGEST`（`0`/`1`） | `0`（無効） |
-//! | 旅行ブログ（`/blog-admin`・`/api/blog/*`）を有効にするか（**Rust だけの項目**） | なし | `GEOFRAME_BLOG`（`0`/`1`） | `0`（無効） |
 //! | 同期サイクルの間隔（分） | なし | `GEOFRAME_DRIVE_POLL_MIN` | `10` |
 //! | ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可） | なし | `GEOFRAME_PHOTOS_DIR` | `photos` |
 //! | 同期 1 サイクルで derivative を作る枚数 | なし | `GEOFRAME_FETCH_PER_CYCLE` | `25` |
 //! | 同期 1 サイクルで品質を解析する枚数（0 は 1 として扱う） | なし | `GEOFRAME_QUALITY_PER_CYCLE` | `GEOFRAME_FETCH_PER_CYCLE` と同じ |
 //! | Drive のサービスアカウント鍵 JSON のパス（相対はカレントディレクトリ基準。現行は `app/` 基準） | なし | `GEOFRAME_DRIVE_KEY` | `drive_key.json` |
-//! | 旅行ブログの旅程 JSON の置き場（**Rust だけの項目**。あれば埋め込みの代わりにこのディレクトリの `*.json` を読む。相対はカレントディレクトリ基準） | なし | `GEOFRAME_BLOG_PLANS_DIR` | （未設定＝バイナリに埋め込んだもの） |
 //! | 取り込む Drive のフォルダ（名前、または 20 字以上の英数字なら ID） | なし | `GEOFRAME_DRIVE_FOLDER` | `GeoFrame` |
 //!
 //! `TZ` は Rust 側では読まない。P1 は時刻の変換をせず、`taken_at` などの naive な日時は文字列の
@@ -199,7 +197,6 @@ pub enum EnvItem {
     Port,
     AllowedHosts,
     Log,
-    Blog,
     Ingest,
     DrivePollMin,
     PhotosDir,
@@ -207,7 +204,6 @@ pub enum EnvItem {
     QualityPerCycle,
     DriveKey,
     DriveFolder,
-    BlogPlansDir,
     InferMin,
     InferOffsetMin,
     TileUa,
@@ -239,7 +235,6 @@ impl EnvItem {
         EnvItem::Port,
         EnvItem::AllowedHosts,
         EnvItem::Log,
-        EnvItem::Blog,
         EnvItem::Ingest,
         EnvItem::DrivePollMin,
         EnvItem::PhotosDir,
@@ -247,7 +242,6 @@ impl EnvItem {
         EnvItem::QualityPerCycle,
         EnvItem::DriveKey,
         EnvItem::DriveFolder,
-        EnvItem::BlogPlansDir,
         EnvItem::InferMin,
         EnvItem::InferOffsetMin,
         EnvItem::TileUa,
@@ -278,7 +272,6 @@ impl EnvItem {
             EnvItem::Port => "GEOFRAME_PORT",
             EnvItem::AllowedHosts => "GEOFRAME_ALLOWED_HOSTS",
             EnvItem::Log => "GEOFRAME_LOG",
-            EnvItem::Blog => "GEOFRAME_BLOG",
             EnvItem::Ingest => "GEOFRAME_INGEST",
             EnvItem::DrivePollMin => "GEOFRAME_DRIVE_POLL_MIN",
             EnvItem::PhotosDir => "GEOFRAME_PHOTOS_DIR",
@@ -286,7 +279,6 @@ impl EnvItem {
             EnvItem::QualityPerCycle => "GEOFRAME_QUALITY_PER_CYCLE",
             EnvItem::DriveKey => "GEOFRAME_DRIVE_KEY",
             EnvItem::DriveFolder => "GEOFRAME_DRIVE_FOLDER",
-            EnvItem::BlogPlansDir => "GEOFRAME_BLOG_PLANS_DIR",
             EnvItem::InferMin => "GEOFRAME_INFER_MIN",
             EnvItem::InferOffsetMin => "GEOFRAME_INFER_OFFSET_MIN",
             EnvItem::TileUa => "GEOFRAME_TILE_UA",
@@ -319,14 +311,12 @@ impl EnvItem {
             | EnvItem::Port
             | EnvItem::AllowedHosts
             | EnvItem::Log
-            | EnvItem::Blog
             | EnvItem::Ingest
             | EnvItem::DrivePollMin
             | EnvItem::PhotosDir
             | EnvItem::FetchPerCycle
             | EnvItem::QualityPerCycle
             | EnvItem::DriveFolder
-            | EnvItem::BlogPlansDir
             | EnvItem::InferMin
             | EnvItem::InferOffsetMin
             | EnvItem::TileUa
@@ -398,8 +388,6 @@ pub struct Config {
     /// 取り込み（DB への書き込みと同期サイクル）を有効にするか。`GEOFRAME_INGEST`。既定は無効。
     /// Python 版と共通の設定をそのまま使っても二重に書かないよう、明示しない限り Rust は書かない。
     pub ingest: bool,
-    /// 旅行ブログ（`/blog-admin`・`/api/blog/*`）を有効にするか。`GEOFRAME_BLOG`。既定は無効。
-    pub blog: bool,
     /// 同期サイクルの間隔（分）。`GEOFRAME_DRIVE_POLL_MIN`（現行と同じく分で、小数も可）。
     pub drive_poll_min: f64,
     /// `GEOFRAME_PHOTOS_DIR` の値そのまま（`DATA_DIR` からの相対、または絶対）。現行と同じく
@@ -417,11 +405,6 @@ pub struct Config {
     /// 取り込む Drive のフォルダ。`GEOFRAME_DRIVE_FOLDER`（名前、または 20 字以上の英数字・`_`・`-` なら ID）。
     /// 起動ログには載せない（フォルダ名は利用者の情報。`GET /api/admin/config` だけが設定どおりに出す）。
     pub drive_folder: String,
-    /// 旅行ブログの旅程 JSON を読むディレクトリ（絶対パス）。`GEOFRAME_BLOG_PLANS_DIR`（Rust だけの項目）。
-    /// `None` のときはバイナリに埋め込んだ `web/travel_blog/plans/*.json`（現行の `PLAN_DIR` と同じ内容）。
-    /// 旅程の中身は利用者の情報なので、パスもログの要約には載せない（埋め込みかディレクトリかだけ。
-    /// `GET /api/admin/config` だけが設定どおりのパスを出す）。
-    pub blog_plans_dir: Option<PathBuf>,
     /// AI の設定（T4.1b）。旧 `GEOFRAME_AI_*` の周期・上限・フラグと、任意の `GEOFRAME_AI_CONFIG`（JSON）。
     /// **不正でも `Config` は作れる**（AI だけが無効で、種類のコードを持つ）。パス・JSON の中身はログ・`Debug` に載せない
     /// （`GET /api/admin/config`（管理画面の設定タブ）だけは、ユーザーの決定（2026-10-30）で設定どおりの値を出す）。
@@ -574,18 +557,6 @@ impl Config {
             },
             None => false,
         };
-        let blog = match get("GEOFRAME_BLOG") {
-            Some(raw) => match raw.trim() {
-                "1" => true,
-                "0" => false,
-                _ => {
-                    return Err(ConfigError(
-                        "GEOFRAME_BLOG は 0（無効）か 1（有効）で指定してください".into(),
-                    ));
-                }
-            },
-            None => false,
-        };
         // 現行は `float(...)`。0 以下や非数だと Python は空回りか例外になるので、Rust は断る
         let drive_poll_min = match get("GEOFRAME_DRIVE_POLL_MIN") {
             Some(raw) => raw
@@ -633,16 +604,6 @@ impl Config {
             .trim()
             .to_string();
 
-        // 空文字は未設定と同じ（`get` が除く）。相対パスはカレントディレクトリ基準（`GEOFRAME_DRIVE_KEY` と同じ）
-        let blog_plans_dir = get("GEOFRAME_BLOG_PLANS_DIR")
-            .map(|v| std::path::absolute(PathBuf::from(v.trim())))
-            .transpose()
-            .map_err(|e| {
-                ConfigError(format!(
-                    "GEOFRAME_BLOG_PLANS_DIR を絶対パスにできません: {e}"
-                ))
-            })?;
-
         let ai = AiConfig::load(&get);
         let ai_visual_similarity =
             ai.visual_similarity()
@@ -679,14 +640,12 @@ impl Config {
             tile_ua,
             tile_fetch_per_min,
             ingest,
-            blog,
             drive_poll_min,
             photos_dir_setting,
             fetch_per_cycle,
             quality_per_cycle,
             drive_key,
             drive_folder,
-            blog_plans_dir,
             ai,
             ai_config_path,
             ai_config_modified,
@@ -752,7 +711,7 @@ impl Config {
     /// 起動ログ用の要約。**ここに載せた項目だけ**がログに出る（秘密になりうる項目は載せない）。
     pub fn log_summary(&self) -> String {
         format!(
-            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} blog={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} blog_plans={} ai={}",
+            "listen={} data_dir={} allowed_hosts={} log={:?} tz={} infer_min={} infer_offset_min={} embed={} tile_cache_max_mb={} ingest={} drive_poll_min={} fetch_per_cycle={} quality_per_cycle={} ai={}",
             self.listen,
             self.data_dir.display(),
             self.allowed_hosts.len(),
@@ -762,16 +721,10 @@ impl Config {
             self.infer_offset_min,
             self.embed_backend.model(),
             self.tile_cache_max_mb,
-            if self.blog { "on" } else { "off" },
             if self.ingest { 1 } else { 0 },
             self.drive_poll_min,
             self.fetch_per_cycle,
             self.quality_per_cycle,
-            if self.blog_plans_dir.is_some() {
-                "dir"
-            } else {
-                "embedded"
-            },
             self.ai.summary(),
         )
     }
@@ -1152,35 +1105,31 @@ mod tests {
         }
     }
 
+    /// 廃止した旅行ブログの環境変数（`GEOFRAME_BLOG`・`GEOFRAME_BLOG_PLANS_DIR`）は、本番の環境ファイルに
+    /// 残っていても起動を妨げない。知らない名前として読み飛ばし、値が不正でもエラーにしない
+    /// （削除前は `GEOFRAME_BLOG` が 0・1 以外ならエラーだった）。設定の一覧・起動ログにも出ない。
     #[test]
-    fn blog_is_off_by_default_and_read_from_the_environment() {
-        let c = load(&[], &Overrides::default()).unwrap();
-        assert!(!c.blog);
-        assert!(c.log_summary().contains("blog=off ingest=0 "));
-        // 空文字は未設定と同じ
-        assert!(
-            !load(&[("GEOFRAME_BLOG", " ")], &Overrides::default())
-                .unwrap()
-                .blog
-        );
-        assert!(
-            !load(&[("GEOFRAME_BLOG", "0")], &Overrides::default())
-                .unwrap()
-                .blog
-        );
-        let c = load(&[("GEOFRAME_BLOG", "1")], &Overrides::default()).unwrap();
-        assert!(c.blog);
-        assert!(c.log_summary().contains("blog=on ingest=0 "));
-    }
-
-    #[test]
-    fn invalid_blog_is_an_error_without_echoing_the_value() {
-        for value in ["2", "true", "yes", "on"] {
-            let err = load(&[("GEOFRAME_BLOG", value)], &Overrides::default()).unwrap_err();
-            assert!(err.0.contains("GEOFRAME_BLOG"), "{err}");
-            if value.len() > 2 {
-                assert!(!err.0.contains(value), "{err}");
-            }
+    fn retired_blog_variables_are_ignored() {
+        let plain = load(&[], &Overrides::default()).unwrap();
+        for env in [
+            vec![("GEOFRAME_BLOG", "0")],
+            vec![("GEOFRAME_BLOG", "1")],
+            vec![("GEOFRAME_BLOG", " ")],
+            vec![("GEOFRAME_BLOG", "yes")],
+            vec![("GEOFRAME_BLOG_PLANS_DIR", "/srv/plans")],
+            vec![
+                ("GEOFRAME_BLOG", "0"),
+                ("GEOFRAME_BLOG_PLANS_DIR", "relative/plans"),
+            ],
+        ] {
+            let c = load(&env, &Overrides::default()).unwrap();
+            assert_eq!(c.log_summary(), plain.log_summary(), "{env:?}");
+            assert!(!c.log_summary().contains("blog"), "{env:?}");
+            assert!(
+                c.sources.keys().all(|name| !name.contains("BLOG")),
+                "{env:?}"
+            );
+            assert_eq!(c.sources.len(), plain.sources.len(), "{env:?}");
         }
     }
 
@@ -1349,7 +1298,7 @@ mod tests {
         let names: Vec<&str> = EnvItem::ALL.iter().map(|i| i.name()).collect();
         let unique: BTreeSet<&str> = names.iter().copied().collect();
         assert_eq!(names.len(), unique.len(), "名前の重複: {names:?}");
-        assert_eq!(names.len(), 35);
+        assert_eq!(names.len(), 33);
         assert!(names.iter().all(|n| n.starts_with("GEOFRAME_")));
         let c = load(&[], &Overrides::default()).unwrap();
         let keys: BTreeSet<&str> = c.sources.keys().copied().collect();
@@ -1403,7 +1352,7 @@ mod tests {
             &[
                 ("GEOFRAME_ALLOWED_HOSTS", "a.example.test"),
                 ("GEOFRAME_AI_POLL_S", "45"),
-                ("GEOFRAME_BLOG", "1"),
+                ("GEOFRAME_INGEST", "1"),
                 ("GEOFRAME_RANK_MODEL", "/srv/g/rank.json"),
             ],
             &Overrides::default(),
@@ -1412,7 +1361,7 @@ mod tests {
         for name in [
             "GEOFRAME_ALLOWED_HOSTS",
             "GEOFRAME_AI_POLL_S",
-            "GEOFRAME_BLOG",
+            "GEOFRAME_INGEST",
             "GEOFRAME_RANK_MODEL",
         ] {
             assert_eq!(c.sources[name], Source::Env, "{name}");

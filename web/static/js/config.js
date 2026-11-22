@@ -21,14 +21,12 @@ const CONFIG_ITEMS = [
   {key: 'GEOFRAME_PORT', group: 'ingest', label: 'HTTP の待ち受けポート', unit: ''},
   {key: 'GEOFRAME_ALLOWED_HOSTS', group: 'ingest', label: '許可する Host 名（localhost を含む）。IP リテラル宛は無条件に許可', unit: ''},
   {key: 'GEOFRAME_LOG', group: 'ingest', label: 'ログの詳しさ', unit: ''},
-  {key: 'GEOFRAME_BLOG', group: 'ingest', label: '旅行ブログ。1 で有効、0 で無効', unit: ''},
   {key: 'GEOFRAME_INGEST', group: 'ingest', label: '取り込み（DB への書き込みと同期サイクル）。1 で有効、0 は書かないモード', unit: ''},
   {key: 'GEOFRAME_DRIVE_POLL_MIN', group: 'ingest', label: '同期サイクルの間隔', unit: '分'},
   {key: 'GEOFRAME_PHOTOS_DIR', group: 'ingest', label: 'ローカル写真の置き場（データ置き場からの相対）', unit: ''},
   {key: 'GEOFRAME_FETCH_PER_CYCLE', group: 'ingest', label: '同期 1 サイクルで derivative を作る枚数', unit: '枚'},
   {key: 'GEOFRAME_QUALITY_PER_CYCLE', group: 'ingest', label: '同期 1 サイクルで品質を解析する枚数', unit: '枚'},
   {key: 'GEOFRAME_DRIVE_FOLDER', group: 'ingest', label: '取り込む Drive のフォルダ（名前または ID）', unit: ''},
-  {key: 'GEOFRAME_BLOG_PLANS_DIR', group: 'ingest', label: '旅程 JSON のディレクトリ。未設定ならバイナリに埋め込んだ旅程を使う', unit: ''},
 
   {key: 'GEOFRAME_INFER_MIN', group: 'geo', label: '位置推定の窓。この範囲内の位置つき写真から推定する', unit: '分'},
   {key: 'GEOFRAME_INFER_OFFSET_MIN', group: 'geo', label: 'カメラ時計のずれの補正（負でもよい）', unit: '分'},
@@ -185,7 +183,7 @@ function renderFilesTable(table, entries){
   entries.forEach(e => table.appendChild(cfgItemRow(e, true)));
 }
 
-/* RUNTIME のセル: 取り込み・待ち受け・データ置き場・起動からの経過・旅行ブログ・ログ・版 */
+/* RUNTIME のセル: 取り込み・待ち受け・データ置き場・起動からの経過・ログ・版 */
 function runtimeCells(d, byKey){
   const val = k => { const it = byKey.get(k); return it && it.value !== undefined ? it.value : null; };
   const flag = (label, k) => {
@@ -208,7 +206,6 @@ function runtimeCells(d, byKey){
     text('待ち受け', host !== null && port !== null ? host + ':' + port : null, 'GEOFRAME_HOST : GEOFRAME_PORT'),
     text('データ置き場', val('GEOFRAME_DATA_DIR'), 'GEOFRAME_DATA_DIR'),
     up,
-    flag('旅行ブログ', 'GEOFRAME_BLOG'),
     text('ログ', val('GEOFRAME_LOG'), 'GEOFRAME_LOG'),
     text('版', d.version, 'geoframe --version')
   ];

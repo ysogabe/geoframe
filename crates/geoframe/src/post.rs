@@ -5,7 +5,9 @@
 //!
 //! 1. （[`crate::server`] の入口）未実装のメソッド（`OPTIONS` を含む）は 501、Host 検査（403）。
 //! 2. ルートが無ければ 403（[`route_of`]。`/api/blog/` 配下も含め、未知の POST は一律 403＝現行の
-//!    `send_error(403)`。`GET` の未知の `/api/blog/…` だけが 404 で、POST は違う）。
+//!    `send_error(403)`。`GET` の未知の `/api/blog/…` だけが 404 で、POST は違う）。廃止した旅行ブログの
+//!    `/api/blog/save`・`/api/blog/export` だけは [`Route::Retired`] として入口を通り、[`crate::server`] が
+//!    CSRF の検査・`INGEST=0` の 503 より先に 404 を返す（機能の削除前に `GEOFRAME_BLOG=0` で返していた応答と同じ）。
 //! 3. `Content-Type: application/json` 必須（違えば 403）。
 //! 4. `Origin` があれば `Host` と同じ（違えば 403。無い・空なら通す）。3・4 の値は現行と同じく**生バイトを
 //!    Latin-1 として**読む（[`crate::csrf`]）。現行が例外にする `Origin`（角括弧の中が IPv6 でない等）は、現行は
@@ -31,7 +33,7 @@
 //!
 //! # エラー応答
 //!
-//! [`ApiError`] → `BadRequest` 400、`NotFound` 404、`Busy` 409（他の処理と重なった回転（T3.2）、旅行ブログの書き出し中（T3.6））、
+//! [`ApiError`] → `BadRequest` 400、`NotFound` 404、`Busy` 409（他の処理と重なった回転（T3.2））、
 //! `Unavailable` 503（書き込みが無効。Python に無い）、`Internal` 500（定型文だけ。詳細は**ログにだけ**
 //! 出し、応答には出さない）。本文は `{"ok": false, "error": "…"}`。
 //!
@@ -47,7 +49,7 @@ use serde_json::{Map, Value};
 
 use crate::limits::ConnBusy;
 use crate::server::{AppState, error_response, json_response};
-use crate::{admin_curation, admin_ops, blog_write, csrf, rotate, update, webpath};
+use crate::{admin_curation, admin_ops, csrf, rotate, update, webpath};
 
 /// 本文の上限（現行の `MAX_POST_BYTES`）。
 pub const MAX_POST_BYTES: u64 = 64 * 1024;
@@ -58,8 +60,9 @@ pub enum Route {
     SetLoc,
     SetFlag,
     Rotate,
-    BlogSave,
-    BlogExport,
+    /// 廃止したルート（旅行ブログの `/api/blog/save`・`/api/blog/export`）。中身はアクセスログのラベル（ルートのパス）。
+    /// 入口は通すが、処理はせず 404 を返す（[`crate::server`]）。
+    Retired(&'static str),
     CurationConfirm,
     CurationReset,
     OpsSync,
@@ -76,8 +79,7 @@ impl Route {
             Self::SetLoc => "/api/admin/setloc",
             Self::SetFlag => "/api/admin/setflag",
             Self::Rotate => "/api/admin/rotate",
-            Self::BlogSave => "/api/blog/save",
-            Self::BlogExport => "/api/blog/export",
+            Self::Retired(label) => label,
             Self::CurationConfirm => "/api/admin/curation/confirm",
             Self::CurationReset => "/api/admin/curation/reset",
             Self::OpsSync => "/api/admin/ops/sync",
@@ -98,8 +100,8 @@ pub fn route_of(raw_path: &str) -> Option<Route> {
         "/api/admin/setloc" => Some(Route::SetLoc),
         "/api/admin/setflag" => Some(Route::SetFlag),
         "/api/admin/rotate" => Some(Route::Rotate),
-        "/api/blog/save" => Some(Route::BlogSave),
-        "/api/blog/export" => Some(Route::BlogExport),
+        "/api/blog/save" => Some(Route::Retired("/api/blog/save")),
+        "/api/blog/export" => Some(Route::Retired("/api/blog/export")),
         "/api/admin/curation/confirm" => Some(Route::CurationConfirm),
         "/api/admin/curation/reset" => Some(Route::CurationReset),
         "/api/admin/ops/sync" => Some(Route::OpsSync),
@@ -118,7 +120,7 @@ pub enum ApiError {
     BadRequest(String),
     /// 対象が無い（404）。
     NotFound(String),
-    /// 他の処理と重なった・実行中（409）。回転（T3.2）と、旅行ブログの書き出し（T3.6）が使う。
+    /// 他の処理と重なった・実行中（409）。回転（T3.2）が使う。
     Busy(String),
     /// 書き込みが無効（`GEOFRAME_INGEST=0`、またはガードで取り込みを断った）ので何も書かなかった（503）。
     Unavailable,
@@ -296,7 +298,6 @@ pub async fn handle(
     };
     let writer = state.writer();
     let data_dir = state.data_root.as_ref().clone();
-    let blog = std::sync::Arc::clone(&state.blog);
     let admin = std::sync::Arc::clone(&state.admin);
     let ops = state.ops.clone();
     let mass_delete = state.mass_delete.clone();
@@ -307,8 +308,8 @@ pub async fn handle(
         Route::SetLoc => update::set_loc(&payload, writer.as_ref()),
         Route::SetFlag => update::set_flag(&payload, writer.as_ref()),
         Route::Rotate => rotate::rotate(&payload, writer.as_ref(), &data_dir),
-        Route::BlogSave => blog_write::save(&payload, &blog, &data_dir, writer.as_ref()),
-        Route::BlogExport => blog_write::export(&payload, &blog, &data_dir, writer.as_ref()),
+        // 廃止したルートは [`crate::server`] が先に 404 を返すので、ここへは来ない（来ても同じ応答）
+        Route::Retired(_) => Err(ApiError::NotFound("Not Found".into())),
         Route::CurationConfirm => admin_curation::confirm(&payload, writer.as_ref(), admin),
         Route::CurationReset => admin_curation::reset(&payload, writer.as_ref(), admin),
         Route::OpsSync => admin_ops::sync(ops.as_ref()),

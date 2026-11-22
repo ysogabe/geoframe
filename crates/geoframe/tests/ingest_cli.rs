@@ -261,32 +261,6 @@ fn dry_run_does_not_create_a_missing_database() {
 }
 
 #[test]
-fn an_invalid_blog_flag_is_refused_as_a_config_error_before_anything_is_written() {
-    let dir = Dir::new("badblog");
-    production_shaped_db(&dir.0);
-    let before = snapshot(&dir.0);
-    for value in ["2", "true"] {
-        let out = run(
-            &[
-                "serve",
-                "--listen",
-                "127.0.0.1:0",
-                "--data-dir",
-                dir.0.to_str().unwrap(),
-            ],
-            &[("GEOFRAME_BLOG", value)],
-        );
-        assert_eq!(out.status.code(), Some(2), "{}", text(&out.stderr));
-        let stderr = text(&out.stderr);
-        assert!(stderr.contains("GEOFRAME_BLOG"), "{stderr}");
-        if value.len() > 1 {
-            assert!(!stderr.contains(value), "{stderr}");
-        }
-    }
-    assert_eq!(snapshot(&dir.0), before);
-}
-
-#[test]
 fn sync_without_ingest_refuses_and_writes_nothing() {
     let dir = Dir::new("noingest");
     production_shaped_db(&dir.0);
@@ -497,6 +471,67 @@ fn serve_without_ingest_stays_read_only() {
     assert!(stdout.contains("ingest=0"), "{stdout}");
     // 既定では書かない: tmp/・ロックのファイルも作らず、DB もそのまま
     assert_eq!(snapshot(&dir.0), before);
+}
+
+/// 廃止した旅行ブログの環境変数（`GEOFRAME_BLOG`・`GEOFRAME_BLOG_PLANS_DIR`）が本番の環境ファイルに残っていても、
+/// `serve` は起動する（読まずに無視する。削除の前は `GEOFRAME_BLOG` が 0・1 以外だと設定の誤りで終了コード 2 だった）。
+/// 取り込みが無効でも有効でも、起動の要約にブログの項目は出ず、廃止したパスは 200（管理画面）・404 のまま。
+#[test]
+fn leftover_blog_variables_do_not_stop_serve_from_starting() {
+    let leftovers: [&[(&str, &str)]; 4] = [
+        &[("GEOFRAME_BLOG", "0")],
+        &[("GEOFRAME_BLOG", "1")],
+        &[("GEOFRAME_BLOG", "2")],
+        &[
+            ("GEOFRAME_BLOG", "0"),
+            ("GEOFRAME_BLOG_PLANS_DIR", "/nonexistent/travel_blog/plans"),
+        ],
+    ];
+    for (round, extra) in leftovers.iter().enumerate() {
+        let dir = Dir::new(&format!("leftover-blog-{round}"));
+        production_shaped_db(&dir.0);
+        let before = snapshot(&dir.0);
+        let port = free_port();
+        let mut child = serve_with_env(&dir.0, port, None, extra);
+        wait_healthy(&mut child, port);
+        let page = get(port, "/blog-admin").unwrap();
+        assert!(page.starts_with("HTTP/1.1 200"), "{extra:?} {page}");
+        let api = get(port, "/api/blog/trips").unwrap();
+        assert!(api.starts_with("HTTP/1.1 404"), "{extra:?} {api}");
+        let (status, stdout) = terminate(child);
+        assert!(status.success(), "{extra:?} {stdout}");
+        assert!(stdout.contains("ingest=0"), "{stdout}");
+        // 起動の要約と案内に、旅行ブログの項目は出ない（アクセスログの廃止パスのラベルは出る）
+        assert!(
+            !stdout.contains("blog=") && !stdout.contains("GEOFRAME_BLOG"),
+            "{stdout}"
+        );
+        // 環境に残っていても、何も書かない
+        assert_eq!(snapshot(&dir.0), before, "{extra:?}");
+    }
+    // 取り込みが有効（起動時の掃除・同期のサイクルが動く）でも同じ
+    let dir = Dir::new("leftover-blog-ingest");
+    let data = dir.0.join("new-data");
+    let staging = IngestEnv::new("leftover-blog-ingest");
+    let port = free_port();
+    let mut child = serve_with_env(
+        &data,
+        port,
+        Some(("1", &staging)),
+        &[
+            ("GEOFRAME_BLOG", "1"),
+            ("GEOFRAME_BLOG_PLANS_DIR", "/nonexistent"),
+        ],
+    );
+    wait_healthy(&mut child, port);
+    std::thread::sleep(Duration::from_millis(300));
+    let (status, stdout) = terminate(child);
+    assert!(status.success(), "{stdout}");
+    assert!(stdout.contains("ingest=1"), "{stdout}");
+    assert!(
+        !stdout.contains("blog=") && !stdout.contains("GEOFRAME_BLOG"),
+        "{stdout}"
+    );
 }
 
 /// `INGEST=0` では AI の回収・表の作成・Provider 停止の整理を一切しない（旧 DB 全行不変）。AI の設定が有効で、

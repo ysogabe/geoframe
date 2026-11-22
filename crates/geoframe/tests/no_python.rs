@@ -62,7 +62,6 @@ const ALLOWED: &[(&str, Exe, usize)] = &[
     ("geoframe/src/ai/cloud/auth/tests.rs", Exe::Lit("mkfifo"), 1),
     ("geoframe/src/ai/groups/tests.rs", Exe::Lit("mkfifo"), 1),
     ("geoframe/src/tiles/tests.rs", Exe::Lit("mkfifo"), 1),
-    ("geoframe/tests/blog_api.rs", Exe::Lit("mkfifo"), 1),
     ("geoframe/tests/static_files.rs", Exe::Lit("mkfifo"), 1),
     // 試験の実行ファイル自身を子プロセスとして 1 つの試験だけ動かす（環境変数のプロキシを使わない確認）。
     (
@@ -1031,14 +1030,6 @@ const LITERAL_ALLOWED: &[(&str, Allow)] = &[
     (
         "geoframe/src/quality/tests.rs",
         Allow::Exact("{name}: Python が作った photo_quality"),
-    ),
-    (
-        "geoframe/tests/blog_api.rs",
-        Allow::Exact("{target}: 応答が Python と違う"),
-    ),
-    (
-        "geoframe/tests/blog_write_api.rs",
-        Allow::Exact("{name} は Python と同じになった。decided から外す"),
     ),
     (
         "geoframe/tests/csrf_python.rs",

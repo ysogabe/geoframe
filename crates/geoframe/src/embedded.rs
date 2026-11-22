@@ -10,19 +10,7 @@ pub struct File {
     pub etag: &'static str,
 }
 
-/// 埋め込んだ旅行ブログの旅程 JSON 1つ（`web/travel_blog/plans/<name>`）。
-pub struct PlanFile {
-    /// `<trip_id>.json` のようなファイル名（ディレクトリは含まない）。
-    pub name: &'static str,
-    pub data: &'static [u8],
-}
-
 include!(concat!(env!("OUT_DIR"), "/embedded_files.rs"));
-
-/// 埋め込んだ旅程 JSON（ファイル名順）。
-pub fn plan_files() -> &'static [PlanFile] {
-    PLAN_FILES
-}
 
 /// `static/admin.html` のようなパスのファイル。
 pub fn get(path: &str) -> Option<&'static File> {
@@ -37,12 +25,6 @@ pub fn is_dir(path: &str) -> bool {
     let prefix = format!("{path}/");
     FILES.iter().any(|f| f.path.starts_with(&prefix))
 }
-
-/// `build.rs` が旅程の埋め込みの前に使う検査（リンク・名前・読めること）の単体試験。同じファイルを読む。
-#[cfg(test)]
-#[path = "../build_plans.rs"]
-#[allow(dead_code)]
-mod build_plans;
 
 #[cfg(test)]
 mod tests {
@@ -63,7 +45,6 @@ mod tests {
     fn admin_pages_and_vendor_are_embedded() {
         for path in [
             "static/admin.html",
-            "static/blog-admin.html",
             "static/js/config.js",
             "static/js/curation.js",
             "static/js/library.js",
@@ -78,21 +59,6 @@ mod tests {
         }
         assert!(get("static/nope.js").is_none());
         assert!(get("derivatives/a.jpg").is_none());
-    }
-
-    /// 旅程 JSON の表がソート済みで、`.json` だけ・ドット始まりなしであること（中身は見ない）。
-    #[test]
-    fn plan_table_is_sorted_json_only() {
-        let plans = plan_files();
-        assert!(plans.windows(2).all(|w| w[0].name < w[1].name));
-        assert!(
-            plans
-                .iter()
-                .all(|p| p.name.ends_with(".json") && !p.name.starts_with('.'))
-        );
-        assert!(plans.iter().all(|p| !p.data.is_empty()));
-        // 配信の表には入らない
-        assert!(get("travel_blog/plans").is_none() && !is_dir("travel_blog"));
     }
 
     #[test]
