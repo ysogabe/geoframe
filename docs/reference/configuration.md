@@ -74,14 +74,14 @@ unit の雛形（[`deploy/geoframe-export.service`](../../deploy/geoframe-export
 
 ## 旧版のみ（削除済み。Rust は読まない）
 
-次は旧 Python 版（P5a のマージのコミット `a804623` まで存在）と、削除した旅行ブログ機能が読んでいた名前です。Rust は読まず、設定しても無視します（警告も出しません）。猶予期間中に Python 版へ戻すときだけ意味があります。Rust のコードがこれらの名前を読むようになったら、「Rust が読む環境変数」の節へ移します（試験が検査します）。
+次は旧 Python 版（P5a のマージのコミット `a804623` まで存在）と、削除した旅行ブログ機能が読んでいた名前です。Rust は読まず、設定しても無視します（警告も出しません）。旧 Python 版の項目は、猶予期間中に Python 版へ戻すときだけ意味があります（旅行ブログの 2 項目は、削除より前の Rust 版に戻したときだけ意味があります）。Rust のコードがこれらの名前を読むようになったら、「Rust が読む環境変数」の節へ移します（試験が検査します）。
 
 - `GEOFRAME_AI_JUDGE_SHUFFLE_RATE` — 既定値 `0.2`。写真の比較で、順位どおりでなく並べ替えて見せるグループの割合。
 - `GEOFRAME_LOCAL_EMBED_MODEL_DIR` — 既定値 `DATA_DIR/models/embeddinggemma-2`。CPU の local embedding のモデルディレクトリ。
 - `GEOFRAME_LOCAL_EMBED_THREADS` — 既定値 `4`。local embedding に使う CPU スレッド数。
 - `GEOFRAME_DECISION_URL` — 既定値 `http://127.0.0.1:8100/llm-decision`。撮影地の手がかりを判定する Decision サーバー。Rust は `GEOFRAME_AI_CONFIG` の `local_base_url` に固定のパスを付けて呼ぶ。
 - `GEOFRAME_LOC_SUGGEST_MODEL` — 既定値 `gemini-3.8-flash`。撮影地を推定する Gemini のモデル。Rust は `GEOFRAME_AI_CONFIG` の JSON で決める。
-- `GEOFRAME_BLOG` — 旅行ブログ（`/blog-admin`・`/api/blog/*`）を有効にするか（`0`/`1`。既定値 `0`）。Rust 版も旅行ブログを削除する（2026-11）まで読んでいた。今は読まない。環境ファイルに `0`・`1`・ほかの値が残っていても起動し、何も変わらない（以前は `0`/`1` 以外で起動しなかった）。`/blog-admin` は管理画面を、`/api/blog/*` は 404 を返し、`POST /api/blog/save`・`/api/blog/export` は 404 を返す（CSRF の検査・`GEOFRAME_INGEST` の 503 より先）。
+- `GEOFRAME_BLOG` — 旅行ブログ（`/blog-admin`・`/api/blog/*`）を有効にするか（`0`/`1`。既定値 `0`）。Rust 版も旅行ブログを削除する（2026-11）まで読んでいた。今は読まない。環境ファイルに `0`・`1`・ほかの値が残っていても起動し、何も変わらない（以前は `0`/`1` 以外で起動しなかった）。`/blog-admin` は管理画面を返す。`GET /api/blog/*` は 404、`POST /api/blog/save`・`/api/blog/export` は 404（CSRF の検査・`GEOFRAME_INGEST` の 503 より先）、`HEAD /api/blog/*` とその他の `POST /api/blog/*` は 403。
 - `GEOFRAME_BLOG_PLANS_DIR` — 旅行ブログの旅程 JSON を読むディレクトリ。`GEOFRAME_BLOG` と同じく削除した。残っていても無視する。
 
 あわせて、旧 Python 版は `app/.env`（`GEOFRAME_*` を書いたファイル）と、Google の認証の環境変数（`GOOGLE_APPLICATION_CREDENTIALS`・`GOOGLE_CLOUD_PROJECT` など）を読んでいました。Rust はどちらも読みません（Google の認証は `GEOFRAME_AI_CONFIG` の JSON の `credential_path` が指す鍵のファイルで渡します）。

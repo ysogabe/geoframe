@@ -127,7 +127,7 @@ sudo install -o geoframe -g geoframe -m 0600 \
 | `/etc/default/geoframe-rs` | Rustだけの設定。`GEOFRAME_DATA_DIR`・`GEOFRAME_DRIVE_KEY`・`TZ`を必ず置く（無ければ起動しない）。取り込みを使うときは`GEOFRAME_INGEST=1`も | `0600 root:root` |
 | AI設定のJSON（`GEOFRAME_AI_CONFIG`が指す） | AIの用途ごとの接続先・モデル・上限・予算。鍵のパスは持つが中身は持たない | `0640 root:geoframe` |
 
-旅行ブログの機能は削除しました（2026-11。書き出しは`geoframe-export`が引き継ぎました）。環境ファイルに`GEOFRAME_BLOG`・`GEOFRAME_BLOG_PLANS_DIR`が残っていても読まずに無視するので、起動に影響せず、消さなくても構いません。`/blog-admin`は管理画面を返し、`/api/blog/*`は404を返します。書き出し済みの`blog_exports/`は、今までどおり`/blog_exports/`で配信します。
+旅行ブログの機能は削除しました（2026-11。書き出しは`geoframe-export`が引き継ぎました）。環境ファイルに`GEOFRAME_BLOG`・`GEOFRAME_BLOG_PLANS_DIR`が残っていても読まずに無視するので、起動に影響せず、消さなくても構いません。`/blog-admin`は管理画面を返します。`GET /api/blog/*`と`POST /api/blog/save`・`/api/blog/export`は404、`HEAD /api/blog/*`とその他の`POST /api/blog/*`は403です（削除前の、無効にしていたときと同じ応答です）。書き出し済みの`blog_exports/`は、今までどおり`/blog_exports/`で配信します。
 
 ```sh
 sudo install -d /etc/geoframe

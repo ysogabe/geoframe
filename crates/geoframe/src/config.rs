@@ -1124,7 +1124,12 @@ mod tests {
         ] {
             let c = load(&env, &Overrides::default()).unwrap();
             assert_eq!(c.log_summary(), plain.log_summary(), "{env:?}");
-            assert!(!c.log_summary().contains("blog"), "{env:?}");
+            // データ置き場のパスに blog が入っても誤って落ちないよう、項目の名前だけを見る
+            let summary = c.log_summary();
+            assert!(
+                !summary.contains(" blog=") && !summary.contains(" blog_plans="),
+                "{env:?}"
+            );
             assert!(
                 c.sources.keys().all(|name| !name.contains("BLOG")),
                 "{env:?}"
