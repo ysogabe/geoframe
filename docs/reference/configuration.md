@@ -65,6 +65,15 @@ AI は用途（画像の embedding・検索語の embedding・写真の比較・
 - `GEOFRAME_AI_VISUAL_SIMILARITY` — 既定値 `0.90`（`local` のときは `0.91`）。検索結果で「同じ構図」に畳む cosine 類似度のしきい値。0〜1 の有限の数だけ受け付ける。
 - `GEOFRAME_RANK_MODEL` — 既定値 `DATA_DIR/models/rank_model.json`。同一場面グループの中の順位に使う学習済みモデル（JSON）。無ければ鮮明度・露出などの固定の式で順位を付ける。家庭の写真の評価から作るため、リポジトリには入れない。
 
+## geoframe-export（別プロセス。環境変数ではなく起動引数）
+
+note 記事用の写真書き出し（`geoframe-export`。[設計](../note-photo-export/design.md)）は、写真サービスとは別のバイナリで、`GEOFRAME_*` の環境変数を読みません。設定は起動引数だけです（設計 6.2）。
+unit の雛形（[`deploy/geoframe-export.service`](../../deploy/geoframe-export.service)）は、tailnet の IP などを `/etc/default/geoframe-export` の変数から `ExecStart` へ渡します。変数の名前と配置の手順は [`deploy/README.md` §8](../../deploy/README.md) にあります。
+
+- 設定の引数（`run`・`serve`・`recover` 共通）: `--feed-base`（写真サービスの基底 URL。既定 `http://127.0.0.1:8080`）、`--rclone`・`--rclone-config`（絶対パス。必須。設定は専用の client_id で認可したもの）、`--state-dir`（絶対パス。必須）、`--remote-yamareco`・`--remote-travel-journal`（既定 `gdrive:yamareco`・`gdrive:travel-journal`）、`--work-root`（作業用のフォルダ。既定 `gdrive:geoframe-export-work`）、`--rclone-copy-timeout`（秒。既定 2700）、`--rclone-timeout`（秒。既定 300）。
+- `serve` の引数: `--listen <ip:port>`（tailnet の帯かループバックの具体的な IP）、`--token-file <path>`（持ち主が実行ユーザー・`0600`・32 バイト以上）、`--allow <ip>`（1 つ以上。何度でも書ける）。
+- 写真サービス側に足したのは、読み取り専用の一覧 API（`GET /api/admin/export/photos`）だけで、設定は増えていません。
+
 ## 旧版のみ（削除済み。Rust は読まない）
 
 次は旧 Python 版（P5a のマージのコミット `a804623` まで存在）が読んでいた名前です。Rust は読まず、設定しても無視します（警告も出しません）。猶予期間中に Python 版へ戻すときだけ意味があります。Rust のコードがこれらの名前を読むようになったら、「Rust が読む環境変数」の節へ移します（試験が検査します）。

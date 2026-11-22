@@ -91,6 +91,10 @@ jobs:
       - name: geoframe-admin.sh（サービスと同じユーザー・設定で動かす）
         run: bash deploy/geoframe-admin-test.sh
 
+      - name: geoframe-export-admin.sh（書き出しの CLI を専用ユーザー・サービスと同じ設定で動かす）
+        # モックの systemd-run・systemctl・id を PATH に置く。geoframe-export.service との引数・ハードニングの食い違いも検査する
+        run: bash deploy/geoframe-export-admin-test.sh
+
   rust:
     name: Rust（fmt・clippy・test・musl静的ビルド）
     needs: changes
@@ -118,18 +122,36 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        # ワークスペースの全部（geoframe と geoframe-export。試験用の fake-rclone を含む）
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Rustテスト
         # 画面描画の試験（web/tests/admin_ai_ops_render.mjs を Node で動かす。tests/admin_ui_ai_waits.rs）と、
         # コードが読む環境変数が docs/reference/configuration.md に載っているかの検査（tests/env_reference.rs）、
         # crates に python の起動が無いことの検査（tests/no_python.rs）もここで回る。CI では Node が無ければ失敗にする
-        run: cargo test
+        run: cargo test --workspace
 
       - name: muslで静的ビルド
         # 画像処理（P2 / T2.2）も同じバイナリに入る: HEICは純Rustのzune-heic（libheifなし）、
         # アロケータはmuslのときだけmimalloc（Cをccでビルドする。上のmusl-toolsが要る）
         run: cargo build --release --target x86_64-unknown-linux-musl -p geoframe
+
+      - name: muslで書き出し（geoframe-export）を静的ビルド
+        # note 記事用の写真書き出し（docs/note-photo-export/design.md）。配るのは geoframe-export だけ。試験用の偽の rclone
+        # （fake-rclone）は --bin で外して配らない。musl-tools は上で入れてある
+        run: cargo build --release --target x86_64-unknown-linux-musl -p geoframe-export --bin geoframe-export
+
+      - name: 書き出しの静的リンクの検査
+        run: |
+          bin=target/x86_64-unknown-linux-musl/release/geoframe-export
+          ls -l "$bin"
+          file "$bin"
+          file "$bin" | grep -E 'statically linked|static-pie linked'
+          if ldd "$bin" 2>&1 | grep -q '=>'; then
+            echo "動的ライブラリにリンクされています" >&2
+            exit 1
+          fi
+          "$bin" --version
 
       - name: 静的リンクの検査
         run: |

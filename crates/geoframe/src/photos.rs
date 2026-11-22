@@ -112,6 +112,24 @@ pub fn feed_sql(curation: bool) -> String {
     )
 }
 
+/// 表示名: 手で付けた `title`、なければ `city place`（`city` が空なら使わない）、なければファイル名の stem。
+/// フィードと、書き出し用の一覧 API（[`crate::admin_export`]）が同じ規則で作る。
+pub(crate) fn photo_title(manual: &str, city: &str, place: &str, name: &str) -> String {
+    if !manual.is_empty() {
+        return manual.to_string();
+    }
+    let from_place = if city.is_empty() {
+        String::new()
+    } else {
+        py_strip(&format!("{city} {place}")).to_string()
+    };
+    if from_place.is_empty() {
+        file_stem(name).to_string()
+    } else {
+        from_place
+    }
+}
+
 /// 行を [`Photo`] にする。`trip` は後で [`assign_trips`] が付けるので 0。`lon` が NULL の行は
 /// `None`（外す。モジュール説明）。
 fn photo_from_row(row: &Row<'_>) -> rusqlite::Result<Option<Photo>> {
@@ -125,23 +143,12 @@ fn photo_from_row(row: &Row<'_>) -> rusqlite::Result<Option<Photo>> {
     };
     let city = text("city")?;
     let place = text("place")?;
-    let title = {
-        let manual = text("title")?;
-        if !manual.is_empty() {
-            manual
-        } else {
-            let from_place = if city.is_empty() {
-                String::new()
-            } else {
-                py_strip(&format!("{city} {place}")).to_string()
-            };
-            if from_place.is_empty() {
-                file_stem(&row.get::<_, String>("name")?).to_string()
-            } else {
-                from_place
-            }
-        }
-    };
+    let title = photo_title(
+        &text("title")?,
+        &city,
+        &place,
+        &row.get::<_, String>("name")?,
+    );
 
     let kind = match text("quality_kind")?.as_str() {
         "" => QualityKind::None,

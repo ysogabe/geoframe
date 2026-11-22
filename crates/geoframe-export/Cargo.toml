@@ -1,0 +1,56 @@
+[package]
+name = "geoframe-export"
+version = "0.1.0"
+edition = "2024"
+default-run = "geoframe-export"
+description = "note 記事用の写真書き出し（docs/note-photo-export/design.md）。写真サービスとは HTTP だけでつながる別プロセス"
+
+[lib]
+name = "geoframe_export"
+path = "src/lib.rs"
+
+[[bin]]
+name = "geoframe-export"
+path = "src/main.rs"
+
+# 試験用の偽の rclone（本物の rclone・Drive には触れない。`cargo build --workspace` でもビルドされるが、配るのは
+# `geoframe-export` だけ）。偽の Drive の模型は fake-rclone/model.rs で、試験（tests/common/drive.rs）と共有する。
+[[bin]]
+name = "fake-rclone"
+path = "fake-rclone/main.rs"
+test = false
+
+# 依存は、ワークスペースで既に使っている crate の同じ版だけ（design.md 3.2）。`geoframe` crate には依存しない。
+[dependencies]
+# manifest のキーの順を旧 manifest に揃えるため preserve_order を明示する（geoframe crate も同じ feature。新しいパッケージは増えない）
+serde_json = { version = "1.0.154", features = ["preserve_order"] }
+# 本文の JSON のキーの重複を見つける自前の Deserialize（serde_json が既に引いている版。derive は使わない）
+serde = "1.0.229"
+# Bearer トークンの SHA-256（固定長のダイジェストにして比べる）。geoframe crate と同じ版（Cargo.lock に新しいパッケージは増えない）
+ring = "0.17"
+# 表示用 JPEG のデコード（geoframe crate と同じ版・同じ feature）
+zune-jpeg = "0.5.15"
+# 写真サービスへの GET（127.0.0.1 の http だけ。TLS は要らない）。同期 API
+# gzip を明示する: geoframe 側のビルドと合流するかどうかで応答の扱いが変わらないように（展開後のバイト数に上限を掛ける）
+ureq = { version = "3", default-features = false, features = ["gzip"] }
+# ログ（rclone の失敗の標準エラーの末尾。伏せ字にしてから）。geoframe crate と同じ版・同じ feature（新しいパッケージは増えない）
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# ログの出力（標準エラー。geoframe crate と同じ版・同じ feature。新しいパッケージは増えない）
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+# 公開するファイルごとの MD5（Drive の `lsjson --hash` の MD5 と照らす。geoframe crate と同じ版。新しいパッケージは増えない）
+md-5 = "0.11.0"
+# 実効ユーザー ID（geteuid）と O_NOFOLLOW だけ
+libc = "0.2"
+# serve（HTTP の入口）: axum・tokio は geoframe crate と同じ版。hyper・hyper-util は axum が既に引いているもので、接続ごとの
+# ヘッダの読み取りの期限（header_read_timeout）と接続数の上限を自前の accept ループで掛けるために直接使う
+# （feature は axum が有効にしているものだけ。Cargo.lock に新しいパッケージは増えない）
+axum = "0.8.9"
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+hyper = { version = "1.12.0", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
+
+[dev-dependencies]
+# 試験の gzip 応答を作る（geoframe crate と同じ版・同じ feature。Cargo.lock に新しいパッケージは増えない）
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
+# 試験の合成 JPEG を作る（geoframe crate と同じ版）
+jpeg-encoder = "0.7.1"
