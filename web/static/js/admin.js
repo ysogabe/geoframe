@@ -54,7 +54,7 @@ function postJSON(path, body){
 }
 
 /* ==== 2) タブ ==== */
-/* 開いたときのタブ。/ と /admin（旅行ブログが無効のときの /blog-admin も同じ HTML）は状況。
+/* 開いたときのタブ。/ と /admin（廃止した旅行ブログの /blog-admin も同じ HTML）は状況。
    /ai-search を同じ HTML で返す版（写真タブへ統合したあと）では写真タブ。
    パスは先頭の連続する / を 1 つにし、末尾の / を除いて === で比べる */
 function initialTab(){

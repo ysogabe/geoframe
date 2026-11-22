@@ -92,16 +92,6 @@ impl Site {
 
     /// `data_dir` を置き場にしてサーバーを起動する。`allowed` は `GEOFRAME_ALLOWED_HOSTS`。
     async fn serve(&self, data_dir: &Path, allowed: &str) -> std::net::SocketAddr {
-        self.serve_blog(data_dir, allowed, Some("1")).await
-    }
-
-    /// [`Site::serve`] に `GEOFRAME_BLOG` を与える（`None` は未設定）。
-    async fn serve_blog(
-        &self,
-        data_dir: &Path,
-        allowed: &str,
-        blog: Option<&str>,
-    ) -> std::net::SocketAddr {
         let catalog = Catalog::open(&data_dir.join("catalog.db")).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -109,7 +99,6 @@ impl Site {
         let config = Config::load(
             |key| match key {
                 "GEOFRAME_ALLOWED_HOSTS" => Some(allowed.clone()),
-                "GEOFRAME_BLOG" => blog.map(str::to_string),
                 _ => None,
             },
             &Overrides {
@@ -411,6 +400,7 @@ async fn admin_pages_are_rewritten_to_the_embedded_html() {
         assert_eq!(r.header("content-type"), Some("text/html"), "{target}");
     }
     // 管理画面は「状況」「写真」「ライブラリ」「選別」「設定」のタブを持ち、旅行ブログへのリンクは持たない
+    let admin_again = admin.clone();
     let html = String::from_utf8(admin).unwrap();
     assert!(html.contains(r#"data-tab="status""#));
     assert!(html.contains(r#"data-tab="photos""#));
@@ -420,10 +410,8 @@ async fn admin_pages_are_rewritten_to_the_embedded_html() {
         !html.contains(r#"href="/blog-admin""#),
         "旅行ブログのリンク"
     );
-    assert_eq!(
-        get(addr, "/blog-admin").await.body,
-        repo_file("static/blog-admin.html")
-    );
+    // 廃止した旅行ブログの画面のパスも管理画面（詳しくは下の `blog_admin_serves_the_admin_page`）
+    assert_eq!(get(addr, "/blog-admin").await.body, admin_again);
     // AI 検索の旧ページは無く、/ai-search は管理画面と同じ本文（写真タブで開く）
     assert_eq!(
         get(addr, "/ai-search").await.body,
@@ -520,63 +508,42 @@ fn the_scripts_never_build_html_from_strings() {
     }
 }
 
+/// `/blog-admin` は廃止した旅行ブログの画面のパス。削除の前に本番（`GEOFRAME_BLOG=0`）が返していた、管理画面の HTML
+/// （200・ヘッダも HTML のまま）を今も返す。ログのラベルは `access_log.rs`。
 #[tokio::test]
-async fn blog_admin_serves_the_admin_page_unless_the_blog_is_enabled() {
+async fn blog_admin_serves_the_admin_page() {
     let site = Site::new();
     let admin = repo_file("static/admin.html");
-    let blog_admin = repo_file("static/blog-admin.html");
-    assert_ne!(admin, blog_admin);
-    // 未設定・`0`: `/blog-admin` は管理画面の HTML（200）。ヘッダは HTML のまま
-    for blog in [None, Some("0")] {
-        let addr = site.serve_blog(&site.data, "frame.lan", blog).await;
-        for target in [
-            "/blog-admin",
-            "/blog-admin/",
-            "/blog-admin?x=1",
-            "/%62log-admin",
-        ] {
-            let r = get(addr, target).await;
-            assert_eq!(r.status, 200, "{blog:?} {target}");
-            assert_eq!(r.body, admin, "{blog:?} {target}");
-            assert_eq!(
-                r.header("content-type"),
-                Some("text/html"),
-                "{blog:?} {target}"
-            );
-            assert_eq!(
-                r.header("x-frame-options"),
-                Some("deny"),
-                "{blog:?} {target}"
-            );
-            assert_eq!(
-                r.header("content-security-policy"),
-                Some("frame-ancestors 'none'"),
-                "{blog:?} {target}"
-            );
-            assert_eq!(
-                r.header("cache-control"),
-                Some("no-cache"),
-                "{blog:?} {target}"
-            );
-        }
-        let h = head(addr, "/blog-admin").await;
-        assert_eq!(h.status, 200);
-        assert!(h.body.is_empty());
-        // `/static/` 配下の旅行ブログの部品と書き出し済みの `/blog_exports/` は、今までどおり配る
-        let r = get(addr, "/static/blog-admin.html").await;
-        assert_eq!(r.status, 200, "{blog:?}");
-        assert_eq!(r.body, blog_admin, "{blog:?}");
-        assert_eq!(get(addr, "/blog_exports/t/index.html").await.status, 200);
-        // ほかのページは変わらない
-        assert_eq!(get(addr, "/admin").await.body, admin);
-        assert_eq!(get(addr, "/ai-search").await.body, admin);
+    let addr = site.start().await;
+    for target in [
+        "/blog-admin",
+        "/blog-admin/",
+        "/blog-admin?x=1",
+        "/%62log-admin",
+    ] {
+        let r = get(addr, target).await;
+        assert_eq!(r.status, 200, "{target}");
+        assert_eq!(r.body, admin, "{target}");
+        assert_eq!(r.header("content-type"), Some("text/html"), "{target}");
+        assert_eq!(r.header("x-frame-options"), Some("deny"), "{target}");
+        assert_eq!(
+            r.header("content-security-policy"),
+            Some("frame-ancestors 'none'"),
+            "{target}"
+        );
+        assert_eq!(r.header("cache-control"), Some("no-cache"), "{target}");
     }
-    // `1`: 旅行ブログの HTML
-    let addr = site.serve_blog(&site.data, "frame.lan", Some("1")).await;
-    let r = get(addr, "/blog-admin").await;
-    assert_eq!(r.status, 200);
-    assert_eq!(r.body, blog_admin);
-    assert_eq!(r.header("x-frame-options"), Some("deny"));
+    let h = head(addr, "/blog-admin").await;
+    assert_eq!(h.status, 200);
+    assert!(h.body.is_empty());
+    // 書き出し済みの `/blog_exports/` は、今までどおりデータ置き場から配る
+    assert_eq!(get(addr, "/blog_exports/t/index.html").await.status, 200);
+    // 旅行ブログの画面の部品は埋め込みから消した（削除の前は `/static/` 配下で配っていた）
+    assert_eq!(get(addr, "/static/blog-admin.html").await.status, 404);
+    assert_eq!(get(addr, "/static/js/blog-admin.js").await.status, 404);
+    // ほかのページは変わらない
+    assert_eq!(get(addr, "/admin").await.body, admin);
+    assert_eq!(get(addr, "/ai-search").await.body, admin);
 }
 
 // ---- ホワイトリスト・ドット・ディレクトリ ---------------------------------------------------
@@ -1170,11 +1137,15 @@ async fn post_without_a_route_is_403_and_other_methods_are_501_without_cors() {
         "/api/admin/setflag",
         "/api/admin/setloc",
         "/api/admin/rotate",
-        "/api/blog/save",
-        "/api/blog/export",
     ] {
         let r = post(target).await;
         assert_eq!(r.status, 400, "POST {target}");
+        assert!(!r.headers.contains("access-control-"), "{target}");
+    }
+    // 廃止した旅行ブログのルート（`/api/blog/save`・`/api/blog/export`）は、本文を見る前に 404（`retired_blog.rs`）
+    for target in ["/api/blog/save", "/api/blog/export"] {
+        let r = post(target).await;
+        assert_eq!(r.status, 404, "POST {target}");
         assert!(!r.headers.contains("access-control-"), "{target}");
     }
     // OPTIONS（CORS プリフライト）は 501 で、CORS ヘッダを一切返さない。クロスオリジンの POST は成立しない
@@ -1220,7 +1191,7 @@ async fn post_without_a_route_is_403_and_other_methods_are_501_without_cors() {
 async fn features_not_yet_in_rust_answer_503_with_a_fixed_json() {
     let site = Site::new();
     let addr = site.start().await;
-    // 旅行ブログの読み取り（`/api/blog/`）は T3.5 で実装した（tests/blog_api.rs）。残るのは AI（P4）
+    // 廃止した旅行ブログの読み取り（`/api/blog/`）は 404（tests/retired_blog.rs）。ここは AI（P4）
     for target in ["/api/ai/unknown", "/api/ai/search?q=x"] {
         let r = get(addr, target).await;
         assert_eq!(r.status, 503, "{target}");

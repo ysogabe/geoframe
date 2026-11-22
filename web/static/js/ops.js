@@ -334,7 +334,7 @@ function renderOpsHold(){
       '承認していない行が 1 件でも消えようとすれば、削除せず再び保留します。'));
     box.appendChild(opsLine('op-confirm-loss',
       '消えるのは Drive の写真のカタログの行と表示用画像です。その写真に付けた位置（手で直したものを含む）・★・除外・回転・' +
-      'タイトルも一緒に消え、これらの写真を使った旅行ブログの下書きは画像が抜けます。原本（Drive 側）には触れません。'));
+      'タイトルも一緒に消えます。原本（Drive 側）には触れません。'));
     box.appendChild(opsLine('op-confirm-copy',
       '消す前に、解除前の DB の写しを DATA_DIR の下に 1 つ残します（次の解除で上書き）。'));
     const acts = el('div', 'op-row');

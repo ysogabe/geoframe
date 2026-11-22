@@ -93,10 +93,11 @@ pub fn normalize(raw: &str) -> Option<Normalized> {
 
 /// 管理画面のページ。正規化後の**完全一致**だけを内部で HTML へ読み替える（接頭辞一致にしない。
 /// `/admin/../.env` のようなパスを通さないため）。戻り値は埋め込みファイルのパス。
+/// `/blog-admin` は廃止した旅行ブログの画面だったパスで、今は管理画面を返す（削除前の `GEOFRAME_BLOG=0` と同じ）。
 pub fn page_target(normalized: &str) -> Option<&'static str> {
     match normalized {
         "/" | "/admin" => Some("static/admin.html"),
-        "/blog-admin" => Some("static/blog-admin.html"),
+        "/blog-admin" => Some("static/admin.html"),
         "/ai-search" => Some("static/admin.html"),
         _ => None,
     }
@@ -300,10 +301,8 @@ mod tests {
         ] {
             assert_eq!(page_target(&norm(raw)), Some("static/admin.html"), "{raw}");
         }
-        assert_eq!(
-            page_target(&norm("/blog-admin")),
-            Some("static/blog-admin.html")
-        );
+        // 廃止した旅行ブログの画面のパス。管理画面を返す
+        assert_eq!(page_target(&norm("/blog-admin")), Some("static/admin.html"));
         assert_eq!(page_target(&norm("/ai-search")), Some("static/admin.html"));
         // 現行に /blog は無い（403）。接頭辞一致でもない
         for raw in [

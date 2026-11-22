@@ -26,15 +26,13 @@
 - `GEOFRAME_PORT` — 既定値 `8080`。HTTP の待ち受けポート。
 - `GEOFRAME_ALLOWED_HOSTS` — 既定値 空（`localhost` だけ許可）。許可する Host 名をカンマ区切りで足す。IP リテラル宛は無条件に許可するので、ここには名前だけを入れる（Tailscale や固定 DNS 名で開くとき。例: `geoframe.example.test:8080`）。
 - `GEOFRAME_LOG` — Rust だけ。既定値 `info`。ログの詳しさ。
-- `GEOFRAME_BLOG` — Rust だけ。既定値 `0`（無効）。`1` で旅行ブログ（`/blog-admin` のページと `/api/blog/*`）を有効にする。`0` の間は、`/api/blog/*` の読み取りと保存・書き出しは 404 を返し、`/blog-admin` は管理画面を返す。`0`/`1` 以外は設定の誤りで起動しない。
-- `GEOFRAME_INGEST` — Rust だけ。既定値 `0`（無効）。`1` で取り込み（DB への書き込みと同期サイクル）を有効にする。`0` の間は、書き込みの API（位置・お気に入りの更新、`GEOFRAME_BLOG=1` のときの旅行ブログの保存・書き出しなど）は書かずに 503 を返す（旅行ブログが無効なら 404 が優先する）。
+- `GEOFRAME_INGEST` — Rust だけ。既定値 `0`（無効）。`1` で取り込み（DB への書き込みと同期サイクル）を有効にする。`0` の間は、書き込みの API（位置・お気に入りの更新など）は書かずに 503 を返す。
 - `GEOFRAME_DRIVE_POLL_MIN` — 既定値 `10`。同期サイクルの間隔（分）。
 - `GEOFRAME_PHOTOS_DIR` — 既定値 `photos`。ローカル写真の置き場（`DATA_DIR` からの相対。絶対でも、解決した先が `DATA_DIR` の中なら可）。
 - `GEOFRAME_FETCH_PER_CYCLE` — 既定値 `25`。同期 1 サイクルで derivative を作る写真の枚数。初回の Drive 全件取り込みもこの数ずつ進む。
 - `GEOFRAME_QUALITY_PER_CYCLE` — 既定値 `GEOFRAME_FETCH_PER_CYCLE` と同じ。同期 1 サイクルで品質を解析する枚数（0 は 1 として扱う）。
 - `GEOFRAME_DRIVE_KEY` — 既定値 `drive_key.json`（相対はカレントディレクトリ基準。本番は絶対パス）。Google Drive のサービスアカウント鍵 JSON のパス。設定が持つのはパスだけで、中身は読み込み時にしか触れない。
 - `GEOFRAME_DRIVE_FOLDER` — 既定値 `GeoFrame`。取り込む Drive のフォルダ（名前、または 20 字以上の英数字なら ID）。
-- `GEOFRAME_BLOG_PLANS_DIR` — Rust だけ。既定値 未設定（バイナリに埋め込んだ旅程を使う）。あれば埋め込みの代わりに、このディレクトリの `*.json` を旅程として読む（再ビルドなしで差し替えるとき。相対はカレントディレクトリ基準）。
 
 ### 位置推定・地図
 
@@ -76,12 +74,14 @@ unit の雛形（[`deploy/geoframe-export.service`](../../deploy/geoframe-export
 
 ## 旧版のみ（削除済み。Rust は読まない）
 
-次は旧 Python 版（P5a のマージのコミット `a804623` まで存在）が読んでいた名前です。Rust は読まず、設定しても無視します（警告も出しません）。猶予期間中に Python 版へ戻すときだけ意味があります。Rust のコードがこれらの名前を読むようになったら、「Rust が読む環境変数」の節へ移します（試験が検査します）。
+次は旧 Python 版（P5a のマージのコミット `a804623` まで存在）と、削除した旅行ブログ機能が読んでいた名前です。Rust は読まず、設定しても無視します（警告も出しません）。旧 Python 版の項目は、猶予期間中に Python 版へ戻すときだけ意味があります（旅行ブログの 2 項目は、削除より前の Rust 版に戻したときだけ意味があります）。Rust のコードがこれらの名前を読むようになったら、「Rust が読む環境変数」の節へ移します（試験が検査します）。
 
 - `GEOFRAME_AI_JUDGE_SHUFFLE_RATE` — 既定値 `0.2`。写真の比較で、順位どおりでなく並べ替えて見せるグループの割合。
 - `GEOFRAME_LOCAL_EMBED_MODEL_DIR` — 既定値 `DATA_DIR/models/embeddinggemma-2`。CPU の local embedding のモデルディレクトリ。
 - `GEOFRAME_LOCAL_EMBED_THREADS` — 既定値 `4`。local embedding に使う CPU スレッド数。
 - `GEOFRAME_DECISION_URL` — 既定値 `http://127.0.0.1:8100/llm-decision`。撮影地の手がかりを判定する Decision サーバー。Rust は `GEOFRAME_AI_CONFIG` の `local_base_url` に固定のパスを付けて呼ぶ。
 - `GEOFRAME_LOC_SUGGEST_MODEL` — 既定値 `gemini-3.8-flash`。撮影地を推定する Gemini のモデル。Rust は `GEOFRAME_AI_CONFIG` の JSON で決める。
+- `GEOFRAME_BLOG` — 旅行ブログ（`/blog-admin`・`/api/blog/*`）を有効にするか（`0`/`1`。既定値 `0`）。Rust 版も旅行ブログを削除する（2026-11）まで読んでいた。今は読まない。環境ファイルに `0`・`1`・ほかの値が残っていても起動し、何も変わらない（以前は `0`/`1` 以外で起動しなかった）。`/blog-admin` は管理画面を返す。`GET /api/blog/*` は 404、`POST /api/blog/save`・`/api/blog/export` は 404（CSRF の検査・`GEOFRAME_INGEST` の 503 より先）、`HEAD /api/blog/*` とその他の `POST /api/blog/*` は 403。
+- `GEOFRAME_BLOG_PLANS_DIR` — 旅行ブログの旅程 JSON を読むディレクトリ。`GEOFRAME_BLOG` と同じく削除した。残っていても無視する。
 
 あわせて、旧 Python 版は `app/.env`（`GEOFRAME_*` を書いたファイル）と、Google の認証の環境変数（`GOOGLE_APPLICATION_CREDENTIALS`・`GOOGLE_CLOUD_PROJECT` など）を読んでいました。Rust はどちらも読みません（Google の認証は `GEOFRAME_AI_CONFIG` の JSON の `credential_path` が指す鍵のファイルで渡します）。

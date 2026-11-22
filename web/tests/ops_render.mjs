@@ -299,8 +299,8 @@ await test('AC4: 「解除する…」で確認の段が開き、件数と消え
   const t = box.textContent;
   assert.ok(t.includes('承認した 120 件のうち引き続き一覧に無い行だけを削除します'), t);
   assert.ok(t.includes('承認していない行が 1 件でも消えようとすれば、削除せず再び保留します'), t);
-  assert.ok(t.includes('位置（手で直したものを含む）・★・除外・回転・タイトルも一緒に消え'), t);
-  assert.ok(t.includes('旅行ブログの下書きは画像が抜けます'), t);
+  assert.ok(t.includes('位置（手で直したものを含む）・★・除外・回転・タイトルも一緒に消えます。原本（Drive 側）には触れません'), t);
+  assert.ok(!t.includes('旅行ブログ'), t);
   assert.ok(t.includes('原本（Drive 側）には触れません'), t);
   assert.ok(t.includes('解除前の DB の写しを DATA_DIR の下に 1 つ残します（次の解除で上書き）'), t);
   assert.equal(env.$('#o-hold-allow').textContent, '120 件の削除を許可');

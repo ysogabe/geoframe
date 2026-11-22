@@ -142,14 +142,12 @@ fn file_state(config: &Config, item: EnvItem) -> &'static str {
         | EnvItem::Port
         | EnvItem::AllowedHosts
         | EnvItem::Log
-        | EnvItem::Blog
         | EnvItem::Ingest
         | EnvItem::DrivePollMin
         | EnvItem::PhotosDir
         | EnvItem::FetchPerCycle
         | EnvItem::QualityPerCycle
         | EnvItem::DriveFolder
-        | EnvItem::BlogPlansDir
         | EnvItem::InferMin
         | EnvItem::InferOffsetMin
         | EnvItem::TileUa
@@ -204,7 +202,6 @@ fn value_of(config: &Config, item: EnvItem) -> Option<String> {
                 .join(", "),
         ),
         EnvItem::Log => Some(config.log_level.as_str().into()),
-        EnvItem::Blog => Some(flag(config.blog)),
         EnvItem::Ingest => Some(flag(config.ingest)),
         EnvItem::DrivePollMin => Some(config.drive_poll_min.to_string()),
         EnvItem::PhotosDir => path(config.photos_dir_setting()),
@@ -212,7 +209,6 @@ fn value_of(config: &Config, item: EnvItem) -> Option<String> {
         EnvItem::QualityPerCycle => Some(config.quality_per_cycle.to_string()),
         EnvItem::DriveKey => path(&config.drive_key),
         EnvItem::DriveFolder => Some(config.drive_folder.clone()),
-        EnvItem::BlogPlansDir => config.blog_plans_dir.as_deref().and_then(path),
         EnvItem::InferMin => Some(config.infer_min.to_string()),
         EnvItem::InferOffsetMin => Some(config.infer_offset_min.to_string()),
         EnvItem::TileUa => Some(config.tile_ua.clone()),
@@ -383,10 +379,6 @@ mod tests {
                 "GEOFRAME_RANK_MODEL",
                 path(&root.join("mark-dir/rank.json")),
             ),
-            (
-                "GEOFRAME_BLOG_PLANS_DIR",
-                path(&root.join("mark-dir/plans")),
-            ),
             ("GEOFRAME_AI_CONFIG", path(&ai_path)),
             ("GEOFRAME_INGEST", "1".into()),
         ]
@@ -424,7 +416,6 @@ mod tests {
             "mark-model-suggest".into(),
             "mark-folder".into(),
             path(&root.join("mark-dir/rank.json")),
-            path(&root.join("mark-dir/plans")),
             path(&ai_path),
             "mark-host.example.test".into(),
         ]
@@ -501,10 +492,6 @@ mod tests {
             item(&body, "GEOFRAME_DRIVE_KEY")["value"],
             root.join("mark-key-2.json").display().to_string()
         );
-        assert_eq!(
-            item(&body, "GEOFRAME_BLOG_PLANS_DIR")["value"],
-            root.join("mark-dir/plans").display().to_string()
-        );
         let ai = &body["ai"];
         assert_eq!(ai["local_base_url"], "http://mark-host.invalid:8100");
         assert_eq!(ai["embedding_space"]["space_id"], "mark-space-id");
@@ -580,18 +567,12 @@ mod tests {
             "GEOFRAME_DRIVE_KEY",
             "GEOFRAME_DRIVE_FOLDER",
             "GEOFRAME_RANK_MODEL",
-            "GEOFRAME_BLOG_PLANS_DIR",
             "GEOFRAME_AI_CONFIG",
             "GEOFRAME_INGEST",
         ] {
             assert_eq!(item(&body, key)["source"], "env", "{key}");
         }
-        for key in [
-            "GEOFRAME_HOST",
-            "GEOFRAME_PORT",
-            "GEOFRAME_LOG",
-            "GEOFRAME_BLOG",
-        ] {
+        for key in ["GEOFRAME_HOST", "GEOFRAME_PORT", "GEOFRAME_LOG"] {
             assert_eq!(item(&body, key)["source"], "default", "{key}");
         }
         // 起動引数は arg（環境変数があっても）
@@ -612,7 +593,6 @@ mod tests {
     fn defaults_are_shown_as_values_and_unset_optional_items_as_null() {
         let config = Config::load(|_| None, &Overrides::default()).unwrap();
         let body = body(&config);
-        assert_eq!(item(&body, "GEOFRAME_BLOG_PLANS_DIR")["value"], Value::Null);
         assert_eq!(item(&body, "GEOFRAME_AI_CONFIG")["value"], Value::Null);
         assert_eq!(item(&body, "GEOFRAME_AI_CONFIG")["state"], "absent");
         assert!(
@@ -626,7 +606,6 @@ mod tests {
             ("GEOFRAME_ALLOWED_HOSTS", "localhost"),
             ("GEOFRAME_LOG", "info"),
             ("GEOFRAME_INGEST", "0"),
-            ("GEOFRAME_BLOG", "0"),
             ("GEOFRAME_DRIVE_POLL_MIN", "10"),
             ("GEOFRAME_PHOTOS_DIR", "photos"),
             ("GEOFRAME_FETCH_PER_CYCLE", "25"),

@@ -22,11 +22,10 @@ GEOFRAME_INGEST=1 ./target/release/geoframe serve --listen 127.0.0.1:8080 --data
 ブラウザで <http://127.0.0.1:8080/> を開くと管理画面が表示されます。画面は「状況 / 写真 / 設定」の 3 タブです。
 設定タブは読み取り専用で、起動時に読んだ設定の全項目を出どころ（起動引数・環境変数・既定・AI 設定 JSON）つきで出します。
 鍵のパス・接続先・連絡先も含むので、画面は共有しないでください。画面のファイル
-（`web/static`・`web/vendor`）と旅行ブログの旅程（`web/travel_blog/plans`）はバイナリに埋め込まれます。
+（`web/static`・`web/vendor`）はバイナリに埋め込まれます。
 
 - `GEOFRAME_INGEST=1`のときだけ、写真の取り込み、表示用画像の生成、品質解析が順に進みます。
-  無い（`0`の）あいだは**カタログ（`catalog.db`）に書かない**モードで、取り込みは止まり、位置の修正・お気に入り・
-  旅行ブログの保存と書き出しなどの書き込みAPIは503を返します（読む機能は動きます。地図タイルのキャッシュだけはデータディレクトリへ書きます）。
+  無い（`0`の）あいだは**カタログ（`catalog.db`）に書かない**モードで、取り込みは止まり、位置の修正・お気に入りなどの書き込みAPIは503を返します（読む機能は動きます。地図タイルのキャッシュだけはデータディレクトリへ書きます）。
 - データディレクトリは`./var`（`--data-dir`か`GEOFRAME_DATA_DIR`で変更）で、Gitの追跡対象外です。
   最初は`./var/photos/`に写真を置くと取り込まれます。
 - `serve`はrootでは起動しません。Google DriveとAIの連携は任意です。
@@ -41,7 +40,6 @@ GEOFRAME_INGEST=1 ./target/release/geoframe serve --listen 127.0.0.1:8080 --data
   - 地図と地名検索: 管理画面の位置修正で、OpenStreetMapと地理院のタイル、地理院とNominatimの地名検索へ通信します（座標・検索語が上流へ渡ります）。
   - AI: `GEOFRAME_AI_CONFIG`を設定しない限り推論は始まりません。クラウドを許した用途では、縮小してEXIFを除いた写真が外部のAPI（Google CloudのGemini）へ送られ、**課金が発生します**。用途ごとの1周期あたりの上限は設定できます（[設定リファレンス](reference/configuration.md)）。
 - カタログ（`catalog.db`）には、手動で直したGPSやお気に入りが入ります。**公開するときは写真・`catalog.db`・生成した書き出しを含めないでください。**
-- 旅行ブログの旅程の例（`web/travel_blog/plans/`）は、作者が2025年に実際に行った旅の日程と訪問地です。宿や便名、同行者は含みません。
 - 動作の確認は、x86_64のLinux（`x86_64-unknown-linux-musl`の静的ビルド）で行っています。他の環境は確かめていません。
 
 ## 構成
@@ -52,7 +50,7 @@ GEOFRAME_INGEST=1 ./target/release/geoframe serve --listen 127.0.0.1:8080 --data
         ▼
 GEOFRAME（Rust単一バイナリ）── SQLite（catalog.db）
   ├─ 表示用画像・品質解析・位置の推定と修正
-  ├─ 管理画面 / 旅行ブログ / AI（任意）
+  ├─ 管理画面 / AI（任意）
   └─ 写真フィード  GET /api/v1/photos ＋ /derivatives/
         │ HTTP
         ▼
@@ -62,7 +60,7 @@ miharashi（表示）
 | パス | 内容 |
 |---|---|
 | [`crates/`](../crates/) | Rustのサーバー（`geoframe`。単体・結合試験を含む） |
-| [`web/`](../web/) | 管理画面・旅行ブログの画面・旅程（バイナリに埋め込む）と、画面の試験 |
+| [`web/`](../web/) | 管理画面（バイナリに埋め込む）と、画面の試験 |
 | [`site/`](../site/) | 紹介ページ（LP）。素のHTMLとCSSの静的サイト |
 | [`docs/`](./) | アーキテクチャ、意思決定、リファレンス、履歴資料 |
 | [`deploy/`](../deploy/) | systemd、配布、バックアップの構成例と、その試験 |

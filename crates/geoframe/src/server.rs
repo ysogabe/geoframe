@@ -33,7 +33,6 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::admin::{self, AdminContext};
-use crate::blog::{self, BlogEnv, BlogError};
 use crate::cache::Cache;
 use crate::config::Config;
 use crate::db::Catalog;
@@ -85,8 +84,6 @@ pub struct AppState {
     pub geocoder: Arc<Geocoder>,
     /// 地図タイルのプロキシ（`GET`/`HEAD /tiles/…`）と、そのキャッシュの掃除。流量の窓と同時数をプロセス全体で持つ。
     pub tiles: Arc<TileProxy>,
-    /// 旅行ブログの読み取り（旅程 JSON の置き場・下書き・書き出し。E7〜E10）。
-    pub blog: Arc<BlogEnv>,
     /// Drive の大量削除の保留の記憶（同期サイクルの `index_drive` が書く）。取り込みが有効（`GEOFRAME_INGEST=1`）の
     /// `serve` だけが持ち、`/api/admin/status` の `sync.mass_delete_hold` に出す。無いとき（取り込み無効・試験）は
     /// キーを出さない。
@@ -127,7 +124,6 @@ impl AppState {
         });
         let admin = Arc::new(AdminContext::new(&config, &data_root));
         let tiles = Arc::new(TileProxy::production(&config, &data_root));
-        let blog = Arc::new(BlogEnv::new(config.blog_plans_dir.as_deref(), &data_root));
         let geocoder = Arc::new(Geocoder::production(&config.tile_ua));
         let ai_search = Arc::new(crate::ai::query::Runtime::new(
             &config,
@@ -153,7 +149,6 @@ impl AppState {
             cache: Arc::new(Cache::memory_only()),
             geocoder,
             tiles,
-            blog,
             mass_delete: None,
             ops: None,
             ai_retry_handlers: Arc::new(Vec::new()),
@@ -457,68 +452,6 @@ fn geocode_response(items: Vec<Value>) -> Response {
     }
 }
 
-/// 旅行ブログの読み取り API（E7〜E10）のルート。現行 `do_GET` は `/api/blog/` で始まるパスを、完全一致の4つだけ
-/// 受け、それ以外は `send_error(404)`（末尾の `/`・大文字・エンコードした名前も 404）。
-fn blog_route(path: &str) -> Option<(&'static str, BlogCall)> {
-    Some(match path {
-        "/api/blog/trips" => ("/api/blog/trips", BlogCall::Trips),
-        "/api/blog/trip" => ("/api/blog/trip", BlogCall::Trip),
-        "/api/blog/candidates" => ("/api/blog/candidates", BlogCall::Candidates),
-        "/api/blog/draft" => ("/api/blog/draft", BlogCall::Draft),
-        _ => return None,
-    })
-}
-
-#[derive(Clone, Copy)]
-enum BlogCall {
-    Trips,
-    Trip,
-    Candidates,
-    Draft,
-}
-
-/// `GET /api/blog/…`（現行の `api_blog_*` と、`handlers.py` のクエリの解釈）。`trip_id` は `parse_qs` の最初の値
-/// （空の値は無かったことになる。無ければ `""` で 400）。応答の本文は定型文だけ（旅程の中身・例外の文字列を載せない）。
-async fn blog_response(state: &AppState, call: BlogCall, query: Option<&str>) -> Response {
-    let params = pyquery::parse_qs_first(query.unwrap_or(""));
-    let trip_id = params.get("trip_id").cloned().unwrap_or_default();
-    let env = Arc::clone(&state.blog);
-    let result = match call {
-        BlogCall::Trips => blog::trips(env).await,
-        BlogCall::Trip => blog::trip(env, trip_id).await,
-        BlogCall::Candidates => blog::candidates(env, &state.catalog, trip_id).await,
-        BlogCall::Draft => blog::draft(env, &state.catalog, trip_id).await,
-    };
-    match result {
-        Ok(value) => match serde_json::to_vec(&value) {
-            Ok(body) => json_response(StatusCode::OK, body),
-            Err(e) => {
-                tracing::error!("旅行ブログの応答を JSON にできません: {e}");
-                error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "内部エラーが発生しました",
-                )
-            }
-        },
-        Err(BlogError::BadRequest(message)) => error_response(StatusCode::BAD_REQUEST, &message),
-        Err(BlogError::NotFound(message)) => error_response(StatusCode::NOT_FOUND, &message),
-        Err(BlogError::Unavailable(reason)) => {
-            tracing::warn!("旅行ブログの写真を読めません: {reason}");
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "写真を読み取れません。しばらくしてから再試行してください",
-            )
-        }
-        Err(BlogError::Internal) => {
-            tracing::error!("旅行ブログの処理が異常終了しました");
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "内部エラーが発生しました",
-            )
-        }
-    }
-}
-
 /// アクセスログに出すタイルのルートのテンプレート（座標・層は出さない）。
 const TILE_ROUTE: &str = "/tiles/{*path}";
 
@@ -729,10 +662,10 @@ fn not_yet_implemented(label: &'static str) -> Response {
 /// 1. `GET` の `/api/admin/status`・`/api/admin/photos`（T1.4）は管理画面の読み取り API。
 ///    現行と同じく**生のパスの前方一致**（`/api/admin/photosX` も、クエリ付きも当たる）。
 ///    `GET` の `/api/admin/geocode`（地名検索。T3.3）も同じ前方一致。`/tiles/`（地図タイル。T3.4。`GET`・`HEAD` とも、
-///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/blog/`（旅行ブログの読み取り。T3.5。完全一致の4つ以外は 404。`GEOFRAME_BLOG` が無効なら全部 404）は [`blog_response`]、`/api/ai/status`・`/api/ai/search` は E5/E6、残る `/api/ai/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
+///    他のどの判定よりも先に、生のパスで）は [`tile_response`]。`GET` の `/api/blog/`（廃止した旅行ブログの読み取り。何を指しても 404）、`/api/ai/status`・`/api/ai/search` は E5/E6、残る `/api/ai/` は 503。`/api/admin/` の残り（`setloc` などの更新ルートへの `GET` を含む）は現行でも
 ///    ホワイトリストに当たらず 403 なので、下の静的配信の判定へ回す。
-/// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML（旅行ブログが無効なら
-///    `/blog-admin` も管理画面）。
+/// 2. 管理画面のページ（`/`・`/admin`・`/blog-admin`・`/ai-search`）は埋め込みの HTML（廃止した旅行ブログの
+///    `/blog-admin` も管理画面を返す。ログのラベルは `/blog-admin` のまま）。
 /// 3. 静的ファイル。許可は `/favicon.ico` と5つの接頭辞だけで、それ以外・ドット始まりは 403。
 ///    `/static/`・`/vendor/` は埋め込み、`/derivatives/`・`/photos/`・`/blog_exports/` はデータ置き場から。
 ///
@@ -748,16 +681,12 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
             return response;
         }
         return match post::route_of(raw) {
-            // 旅行ブログが無効のときは、CSRF の検査（403）・`INGEST=0` の 503 より先に 404。
+            // 廃止したルート（旅行ブログの保存・書き出し）は、CSRF の検査（403）・`INGEST=0` の 503 より先に 404。
             // 理由は書かない（ルートが無いのと同じに見せる）
-            Some(route @ (post::Route::BlogSave | post::Route::BlogExport))
-                if !state.config.blog =>
-            {
-                labeled(
-                    error_response(StatusCode::NOT_FOUND, "Not Found"),
-                    route.label(),
-                )
-            }
+            Some(route @ post::Route::Retired(_)) => labeled(
+                error_response(StatusCode::NOT_FOUND, "Not Found"),
+                route.label(),
+            ),
             Some(route) => {
                 // 書き出し（E16）などの長い処理の間は、無通信の期限で接続を切らない（`serve` が付けた接続の情報。
                 // 付いていない起動のしかた（試験）では何もしない）。止めるのは**本文を読み終えて検査したあと**の
@@ -874,30 +803,16 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
                 "/api/admin/geocode",
             );
         }
+        // 廃止した旅行ブログの読み取り API。何を指しても 404（本文は他の未知のパスと同じ）
         if path.starts_with("/api/blog/") {
-            if !state.config.blog {
-                return labeled(
-                    statics::error_page(
-                        StatusCode::NOT_FOUND,
-                        "Not Found",
-                        "Nothing matches the given URI",
-                    ),
-                    "/api/blog/{*path}",
-                );
-            }
-            return match blog_route(path) {
-                Some((label, call)) => {
-                    labeled(blog_response(&state, call, parts.uri.query()).await, label)
-                }
-                None => labeled(
-                    statics::error_page(
-                        StatusCode::NOT_FOUND,
-                        "Not Found",
-                        "Nothing matches the given URI",
-                    ),
-                    "/api/blog/{*path}",
+            return labeled(
+                statics::error_page(
+                    StatusCode::NOT_FOUND,
+                    "Not Found",
+                    "Nothing matches the given URI",
                 ),
-            };
+                "/api/blog/{*path}",
+            );
         }
         if path == "/api/ai/status" {
             let response = match ai_status(&state).await {
@@ -948,11 +863,7 @@ async fn site(State(state): State<AppState>, request: Request) -> Response {
             "/thumb/{id}",
         );
     }
-    if let Some(mut key) = webpath::page_target(&normalized.path) {
-        // 旅行ブログが無効のときは、`/blog-admin` にも管理画面を返す（ラベルは `/blog-admin` のまま）
-        if key == "static/blog-admin.html" && !state.config.blog {
-            key = "static/admin.html";
-        }
+    if let Some(key) = webpath::page_target(&normalized.path) {
         let label = match normalized.path.as_str() {
             "/blog-admin" => "/blog-admin",
             "/ai-search" => "/ai-search",
@@ -1094,8 +1005,6 @@ pub async fn serve_until(
             signal.await;
             // 合図の直後に共有の停止を立てる（HTTP の終了待ちを待たない）
             stop.stop();
-            // 実行中の旅行ブログの書き出しは、次の画像の前で作業領域を片付けて止まる（前の書き出しは残る）
-            crate::blog_write::request_stop();
             signalled.notify_one();
         }
     };

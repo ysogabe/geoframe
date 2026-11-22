@@ -72,9 +72,8 @@ async fn access_log_has_only_method_route_status_and_time() {
             .unwrap();
     }
 
-    // 旅行ブログの読み取り API を通すので有効にする（無効時の 404 は tests/blog_disabled.rs）
     let config = Config::load(
-        |key| (key == "GEOFRAME_BLOG").then(|| "1".to_string()),
+        |_| None,
         &Overrides {
             data_dir: Some(dir.clone()),
             ..Overrides::default()
@@ -106,12 +105,11 @@ async fn access_log_has_only_method_route_status_and_time() {
     get(addr, "/api/admin/photos?filter=secret-filter&page=2").await;
     get(addr, "/api/admin/photos?page=secret-page").await; // 400
     get(addr, "/api/admin/status?x=secret-status").await;
-    // 旅行ブログの読み取り API。trip_id・未知のパスの名前はログに出ない（旅程の中身も読まない）
+    // 廃止した旅行ブログのパス。trip_id・パスの名前はログに出ない（ラベルは `/api/blog/{*path}` と `/blog-admin` のまま）
     get(addr, "/api/blog/trips?secret-blog-query=1").await;
-    get(addr, "/api/blog/trip?trip_id=secret-trip-id").await; // 404
-    get(addr, "/api/blog/trip?trip_id=Secret_Bad").await; // 400
-    get(addr, "/api/blog/draft?trip_id=secret-draft-id").await; // 404
-    get(addr, "/api/blog/secret-blog-route").await; // 404
+    get(addr, "/api/blog/trip?trip_id=secret-trip-id").await;
+    get(addr, "/api/blog/secret-blog-route").await;
+    get(addr, "/blog-admin?secret-blog-page=1").await;
     // Host が許可されない要求。拒否の理由は出るが、Host の値は出ない
     get_with_host(addr, "/derivatives/a.jpg", "attacker.invalid:8080").await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -134,11 +132,8 @@ async fn access_log_has_only_method_route_status_and_time() {
         "GET /api/admin/photos 200",
         "GET /api/admin/photos 400",
         "GET /api/admin/status 200",
-        "GET /api/blog/trips 200",
-        "GET /api/blog/trip 404",
-        "GET /api/blog/trip 400",
-        "GET /api/blog/draft 404",
         "GET /api/blog/{*path} 404",
+        "GET /blog-admin 200",
     ] {
         assert!(log.contains(expected), "{expected} が無い:\n{log}");
     }
@@ -166,8 +161,6 @@ async fn access_log_has_only_method_route_status_and_time() {
         "secret-status",
         "secret-blog",
         "secret-trip-id",
-        "Secret_Bad",
-        "secret-draft-id",
         "attacker",
         "a.jpg",
         "x.jpg",
@@ -328,6 +321,17 @@ async fn post_logs_only_method_route_status_and_the_kind_of_internal_error() {
     assert!(origin.starts_with("HTTP/1.1 403"), "{origin}");
     let none = post(addr, "/api/admin/secret-route", "", setloc).await;
     assert!(none.starts_with("HTTP/1.1 403"), "{none}");
+    // 廃止した旅行ブログのルート（404。CSRF の 403 より先なので、Origin が違っても 404。ラベルはルートのパス）
+    let retired = post(addr, "/api/blog/save?secret-blog-query=1", "", setloc).await;
+    assert!(retired.starts_with("HTTP/1.1 404"), "{retired}");
+    let retired_cross = post(
+        addr,
+        "/api/blog/export",
+        "Origin: http://attacker.invalid\r\n",
+        setloc,
+    )
+    .await;
+    assert!(retired_cross.starts_with("HTTP/1.1 404"), "{retired_cross}");
     // 入力の違反（400）
     let bad = post(
         addr,
@@ -360,6 +364,8 @@ async fn post_logs_only_method_route_status_and_the_kind_of_internal_error() {
         "POST /api/admin/setloc 403",
         "POST (unmatched) 403",
         "POST /api/admin/setloc 400",
+        "POST /api/blog/save 404",
+        "POST /api/blog/export 404",
         "POST /api/admin/setflag 500",
         "[api] /api/admin/setflag 内部エラー",
     ] {
@@ -371,6 +377,7 @@ async fn post_logs_only_method_route_status_and_the_kind_of_internal_error() {
         "secret-name",
         "secret-query",
         "secret-route",
+        "secret-blog",
         "attacker",
         "99.5",
         "127.0.0.1",

@@ -2,7 +2,7 @@
 // 設定ファイルの表・3 つのパネル・AI の用途の表・凡例・失敗・古い応答の破棄 — を、fakedom.mjs の DOM の代用品と
 // fetch の代用品で動かして確かめる。
 // 使い方: node web/tests/config_render.mjs <admin.js のパス> <photos.js のパス> <config.js のパス>
-// 合成の応答（crates/geoframe/tests/admin_config_api.rs と同じ形・35 項目）だけで、ネットワークには出ない。
+// 合成の応答（crates/geoframe/tests/admin_config_api.rs と同じ形・33 項目）だけで、ネットワークには出ない。
 // 値は合成のみ（example.test・/srv/example/...・mark-…）。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -21,11 +21,11 @@ const settle = async () => { for(let i = 0; i < 10; i++) await new Promise(r => 
 const respond = (status, body) =>
   Promise.resolve({ok: status >= 200 && status < 300, status, json: () => Promise.resolve(body)});
 
-// ---- 合成の応答（EnvItem::ALL の 35 項目。順序も同じ） ----
+// ---- 合成の応答（EnvItem::ALL の 33 項目。順序も同じ） ----
 const ALL_KEYS = [
-  'GEOFRAME_DATA_DIR', 'GEOFRAME_HOST', 'GEOFRAME_PORT', 'GEOFRAME_ALLOWED_HOSTS', 'GEOFRAME_LOG', 'GEOFRAME_BLOG',
+  'GEOFRAME_DATA_DIR', 'GEOFRAME_HOST', 'GEOFRAME_PORT', 'GEOFRAME_ALLOWED_HOSTS', 'GEOFRAME_LOG',
   'GEOFRAME_INGEST', 'GEOFRAME_DRIVE_POLL_MIN', 'GEOFRAME_PHOTOS_DIR', 'GEOFRAME_FETCH_PER_CYCLE',
-  'GEOFRAME_QUALITY_PER_CYCLE', 'GEOFRAME_DRIVE_KEY', 'GEOFRAME_DRIVE_FOLDER', 'GEOFRAME_BLOG_PLANS_DIR',
+  'GEOFRAME_QUALITY_PER_CYCLE', 'GEOFRAME_DRIVE_KEY', 'GEOFRAME_DRIVE_FOLDER',
   'GEOFRAME_INFER_MIN', 'GEOFRAME_INFER_OFFSET_MIN', 'GEOFRAME_TILE_UA', 'GEOFRAME_TILE_CACHE_MAX_MB',
   'GEOFRAME_TILE_FETCH_PER_MIN', 'GEOFRAME_AI_CONFIG', 'GEOFRAME_AI_ENABLED', 'GEOFRAME_AI_POLL_S',
   'GEOFRAME_AI_BACKLOG_POLL_S', 'GEOFRAME_AI_EMBED_PER_CYCLE', 'GEOFRAME_AI_JUDGE_PER_CYCLE',
@@ -33,14 +33,14 @@ const ALL_KEYS = [
   'GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE', 'GEOFRAME_EMBED_BACKEND', 'GEOFRAME_AI_TIME_WINDOW_MIN',
   'GEOFRAME_AI_SIMILARITY', 'GEOFRAME_AI_SHORTLIST_MAX', 'GEOFRAME_AI_VISUAL_SIMILARITY', 'GEOFRAME_RANK_MODEL',
 ];
-assert.equal(ALL_KEYS.length, 35);
+assert.equal(ALL_KEYS.length, 33);
 const VALUES = {
   GEOFRAME_DATA_DIR: '/srv/example/geoframe', GEOFRAME_HOST: '0.0.0.0', GEOFRAME_PORT: '8080',
-  GEOFRAME_ALLOWED_HOSTS: 'localhost, mark-host.example.test', GEOFRAME_LOG: 'info', GEOFRAME_BLOG: '0',
+  GEOFRAME_ALLOWED_HOSTS: 'localhost, mark-host.example.test', GEOFRAME_LOG: 'info',
   GEOFRAME_INGEST: '1', GEOFRAME_DRIVE_POLL_MIN: '10', GEOFRAME_PHOTOS_DIR: 'photos',
   GEOFRAME_FETCH_PER_CYCLE: '25', GEOFRAME_QUALITY_PER_CYCLE: '25',
   GEOFRAME_DRIVE_KEY: '/srv/example/mark-drive-key.json', GEOFRAME_DRIVE_FOLDER: 'mark-folder',
-  GEOFRAME_BLOG_PLANS_DIR: null, GEOFRAME_INFER_MIN: '15', GEOFRAME_INFER_OFFSET_MIN: '-3',
+  GEOFRAME_INFER_MIN: '15', GEOFRAME_INFER_OFFSET_MIN: '-3',
   GEOFRAME_TILE_UA: 'mark@example.test', GEOFRAME_TILE_CACHE_MAX_MB: '16384', GEOFRAME_TILE_FETCH_PER_MIN: '240',
   GEOFRAME_AI_CONFIG: '/srv/example/mark-ai-config.json', GEOFRAME_AI_ENABLED: '1', GEOFRAME_AI_POLL_S: '60',
   GEOFRAME_AI_BACKLOG_POLL_S: '5', GEOFRAME_AI_EMBED_PER_CYCLE: '12', GEOFRAME_AI_JUDGE_PER_CYCLE: '2',
@@ -132,14 +132,14 @@ const rowOf = (env, key) => {
 let n = 0;
 async function test(name, fn){ await fn(); n++; console.log('ok - ' + name); }
 
-await test('合成の応答は EnvItem::ALL の 35 項目で、config.js の CONFIG_ITEMS と過不足なく一致する', () => {
+await test('合成の応答は EnvItem::ALL の 33 項目で、config.js の CONFIG_ITEMS と過不足なく一致する', () => {
   const ctx = vm.createContext({document: buildAdminDom(), console});
   loadScripts(ctx);
   const keys = vm.runInContext('CONFIG_ITEMS.map(m => m.key)', ctx);
   assert.equal(new Set(keys).size, keys.length, 'CONFIG_ITEMS の key は重複しない');
   assert.deepEqual([...keys].sort(), [...ALL_KEYS].sort());
-  assert.equal(configBody().items.length, 35);
-  assert.equal(new Set(ALL_KEYS).size, 35);
+  assert.equal(configBody().items.length, 33);
+  assert.equal(new Set(ALL_KEYS).size, 33);
 });
 
 await test('admin.html と fakedom の骨格（id・タブ・読み込み順）が一致している', () => {
@@ -217,7 +217,7 @@ await test('(b) 案内文は読み取り専用と、画面を共有しないこ�
   assert.deepEqual(legend.map(b => b.className), ['src arg', 'src env', 'src default', 'src ai_config']);
 });
 
-await test('(c) items の 35 項目すべての key と value が画面に出る。null は（未設定）', async () => {
+await test('(c) items の 33 項目すべての key と value が画面に出る。null は（未設定）', async () => {
   const env = makeEnv();
   await env.boot(); await env.openConfig();
   const body = text(env);
@@ -229,11 +229,10 @@ await test('(c) items の 35 項目すべての key と value が画面に出る
     const unit = vm.runInContext('CONFIG_META.get(' + JSON.stringify(key) + ').unit', env.context);
     assert.equal(cell.textContent, v === null ? '（未設定）' : v + unit, key + ' の値セル');
   }
-  const plans = rowOf(env, 'GEOFRAME_BLOG_PLANS_DIR');
-  assert.ok(plans.textContent.includes('（未設定）'));
+  assert.ok(!body.includes('GEOFRAME_BLOG'), '廃止した旅行ブログの項目は出さない');
   assert.ok(!rowOf(env, 'GEOFRAME_DATA_DIR').textContent.includes('（未設定）'));
-  // 分類: ingest 13・geo 5・ai 14（ファイルの 3 項目は専用の表）。表は 1 項目 1 行
-  assert.equal(rows(env, '#c-ingest').length, 13);
+  // 分類: ingest 11・geo 5・ai 14（ファイルの 3 項目は専用の表）。表は 1 項目 1 行
+  assert.equal(rows(env, '#c-ingest').length, 11);
   assert.equal(rows(env, '#c-geo').length, 5);
   assert.equal(rows(env, '#c-ai').length, 14);
   assert.equal(rows(env, '#c-files').length, 3);
@@ -264,7 +263,7 @@ await test('(c2) 表に無い key は「その他」に出し、API に無い ke
   assert.ok(!tableKeys.includes('GEOFRAME_LOG') && !tableKeys.includes('GEOFRAME_AI_VISUAL_SIMILARITY'),
     'API に無い key は表に行を作らない');
   assert.ok(env.$('#c-runtime').textContent.includes('--'), 'RUNTIME のログは値が無ければ --');
-  assert.equal(rows(env, '#c-ingest').length, 12);
+  assert.equal(rows(env, '#c-ingest').length, 10);
   assert.equal(rows(env, '#c-ai').length, 13);
 });
 
@@ -320,11 +319,11 @@ await test('(e) ファイルの state（あり/なし/読めない/読み込み�
   assert.ok(row.includes('なし') && row.includes('（未設定）'));
 });
 
-await test('RUNTIME: 取り込み・待ち受け・データ置き場・経過・旅行ブログ・ログ・版', async () => {
+await test('RUNTIME: 取り込み・待ち受け・データ置き場・経過・ログ・版', async () => {
   const env = makeEnv();
   await env.boot(); await env.openConfig();
   const cells = env.document.querySelectorAll('#c-runtime .cell');
-  assert.equal(cells.length, 7);
+  assert.equal(cells.length, 6);
   const t = cells.map(c => c.textContent).join('\n');
   assert.ok(cells[0].textContent.includes('取り込み INGEST') && cells[0].textContent.includes('有効'));
   assert.ok(cells[0].classList.contains('good'));
@@ -332,18 +331,16 @@ await test('RUNTIME: 取り込み・待ち受け・データ置き場・経過�
   assert.ok(t.includes('/srv/example/geoframe'));
   assert.ok(t.includes('13.2時間'), '47520 秒は fmtDur で 13.2時間');
   assert.ok(t.includes('起動 2026-10-30 08:25:00'));
-  assert.ok(cells[4].textContent.includes('旅行ブログ') && cells[4].textContent.includes('無効'));
-  assert.ok(cells[5].textContent.includes('info'));
-  assert.ok(cells[6].textContent.includes('0.1.0'));
+  assert.ok(!t.includes('旅行ブログ'), '旅行ブログのセルは無い');
+  assert.ok(cells[4].textContent.includes('info'));
+  assert.ok(cells[5].textContent.includes('0.1.0'));
   // INGEST=0 は無効（warn）
   const off = configBody();
   off.items.find(i => i.key === 'GEOFRAME_INGEST').value = '0';
-  off.items.find(i => i.key === 'GEOFRAME_BLOG').value = '1';
   const env2 = makeEnv({configHandler: () => respond(200, off)});
   await env2.boot(); await env2.openConfig();
   const c2 = env2.document.querySelectorAll('#c-runtime .cell');
   assert.ok(c2[0].textContent.includes('無効') && c2[0].classList.contains('warn'));
-  assert.ok(c2[4].textContent.includes('有効') && c2[4].classList.contains('good'));
 });
 
 await test('(f) AI の用途の表: 今日（UTC）/ 上限・バー・—・認証ファイル・project・region・disabled、接続先と空間', async () => {

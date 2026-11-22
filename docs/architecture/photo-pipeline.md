@@ -2,7 +2,7 @@
 
 更新日: 2026-11-01（B: 一覧用サムネイル `/thumb/` の節を追加。2026-10-30 の P5b で Python版の削除に合わせて、実装の記述をRust版へ直した。AIの詳細は[rust-migration/ai-config.md](../rust-migration/ai-config.md)ほか）
 
-旅行ブログ連携の調査から出発し、写真の取り込み・品質解析・AI選定・表示APIまでの現行仕様を
+旅行ブログ連携の調査から出発し（旅行ブログの機能は2026-11に削除した）、写真の取り込み・品質解析・AI選定・表示APIまでの現行仕様を
 まとめた文書です。
 
 ## 写真カタログ
@@ -25,7 +25,7 @@
 - ユーザー評価は `favorite` と `hidden`。rating・表示回数はない。
 - `GEOFRAME_INFER_OFFSET_MIN` は位置推定時のカメラ時計補正に使う。写真ごとの補正値・根拠は未保存。
 - 位置なし写真の撮影地候補は`ai_worker`が写真選定の後に別処理として増分実行する（Rustでは`ai/location_clue.rs`・`ai/location_suggest.rs`）。まず同じ機体のDecisionサーバー（gpu-evalの常駐のd3-lite。同じ機体のLAN入口経由で呼び、接続先は`GEOFRAME_AI_CONFIG`のJSONの`local_base_url`）が写真ごとに「撮影地の手がかりがあるか」と被写体の種類を判定し、`photo_loc_clues`へ保存する。同じ日の写真（12時間以上の空きか日付の変わり目で区切る）をまとめ、手がかりあり（`clue`≥0.2または`kind=landmark`）の上位6枚だけをクラウドのGemini（モデルは`GEOFRAME_AI_CONFIG`のJSONで決める）へ送って撮影地を推定させる。判定の済んでいない写真がある日、手がかりのある写真が無い日は送らない。Decisionが応答しない間は判定が進まないので、家の中のペット写真などが判定なしでGoogleへ送られることはない。Decisionはgpu-evalの常駐なので起動を気にしなくてよい（常駐をやめて必要な間だけ起動する運用に戻す場合の毎朝5:00のタイマーは[デプロイ §2.3](../../deploy/README.md#23-撮影地の手がかり判定を毎朝動かす任意)）。推定した地名はNominatimで座標にし、`photo_loc_runs`（問い合わせ1回分）と`photo_loc_suggestions`（写真ごとの候補）へ保存する。候補は`photos.lat/lon`に書かず、管理画面の位置指定で候補の場所へ地図を動かすだけにする。確定は人が地図をクリックしてSAVEしたとき（`manual`）に限る。処理量は`GEOFRAME_LOC_SUGGEST_CLUE_PER_CYCLE`（既定10枚）と`GEOFRAME_LOC_SUGGEST_GEMINI_PER_CYCLE`（既定2日）、`GEOFRAME_LOC_SUGGEST=0`で停止できる。
-- 外部AIは写真選定と撮影地候補にだけ使用する。用途ごとの送り先は`GEOFRAME_AI_CONFIG`のJSONで決める（`GEOFRAME_EMBED_BACKEND`は旧データの識別で、送り先を切り替えない）。画像と検索語のembeddingを`provider: local`にすると、EXIF除去・縮小したderivativeと検索文はLAN内のembeddingサービスへだけ送り、クラウド（Agent Platform）へ送るのは、クラウドを許した用途（同一場面の比較評価に回す候補（最大6枚）と、撮影地の推定）だけになる。`ai_caption`列は未使用で、旅行ブログ本文は引き続き決定的な事実アウトラインを生成する。
+- 外部AIは写真選定と撮影地候補にだけ使用する。用途ごとの送り先は`GEOFRAME_AI_CONFIG`のJSONで決める（`GEOFRAME_EMBED_BACKEND`は旧データの識別で、送り先を切り替えない）。画像と検索語のembeddingを`provider: local`にすると、EXIF除去・縮小したderivativeと検索文はLAN内のembeddingサービスへだけ送り、クラウド（Agent Platform）へ送るのは、クラウドを許した用途（同一場面の比較評価に回す候補（最大6枚）と、撮影地の推定）だけになる。`ai_caption`列は未使用。
 
 ## API・UI
 
@@ -39,9 +39,7 @@
 - 管理画面の運用タブは、同期ワーカー（`serve` の定期サイクルと同じ1本のスレッド）に運用の要求を入れ、進み具合を見せる。`GET /api/admin/ops`（GETの完全一致。`Cache-Control: no-store`。HEAD・POSTは403）は実行中・待ちの要求、直近の定期サイクル、次の予定、履歴（新しい順に10件）、大量削除の保留（`hold`。件数・理由・`token`・`releasable`。行のIDは出さない）を返す。メモリ上の掲示板と保留の記憶の写しだけで、DBは読まない（再起動で消える）。段の失敗は結果の語（`failed`）だけで、文面（パス・SQLiteのメッセージ）は出さずログにだけ残る。`INGEST=0`でも200で、`ingest:false` と空の項目だけを返す。操作は `POST /api/admin/ops/sync`（定期サイクルと同じ段を1回）・`/quality-scan`（`geoframe quality-scan` と同じ一括解析）・`/drive-release`（本文 `{"token":"<16桁の小文字hex>"}`。画面が見た保留の行の集合に限って大量削除の保留を解除する）で、受け付けたら200 `{ok, request:{id, kind, state:"queued"}}`（`drive-release` は承認した件数 `approved` つき）を返し、実行はワーカーが順に行う（結果は `GET` の履歴で読む）。要求は1つだけ待てる。失敗は `{ok:false, error:<符号>}`: 409 `busy`（待ちがある・同じ種類が実行中）、409 `too_soon`（Driveを読む `sync`・`drive-release` は前回の終了から60秒以内）、`drive-release` はさらに409 `no_hold`（保留が無い）・409 `not_releasable`（一覧が空のための保留 `empty_listing`。画面から解除せず、CLIの `--allow-mass-delete` だけ）・409 `hold_changed`（`token` が今の保留と違う。実行の直前にもワーカーが照らし直し、違えば実行せず履歴に `hold_changed`）、`token` の形が違えば400 `bad_params`。`INGEST=0` と停止の合図のあとは503。入口の検査（Content-Typeと同一OriginのCSRF検査・本文64 KiB）は他のPOSTと同じ。**`token` は認可ではなく、古い画面で解除してしまうのを防ぐ印**（認証の無いLANでは `GET` を読める相手は誰でも得られる）。相手の正当性は[ADR 0008](../decisions/0008-photo-platform-and-miharashi-display.md)の前提（家庭LAN・外部公開時はCloudflare Access）に任せる。AI系の2本は同期ワーカーの待ち行列に入れず、POSTの中で `geoframe ai-jobs retry`・`release-pause` と同じ関数を `serve` のwriter経由で呼び、結果をレスポンスと履歴（`kind:"ai_retry"`・`"ai_release_pause"`、`report`）に1件残す（外部へは送らない）: `POST /api/admin/ops/ai-retry`（本文 `{"target":"all"}` か `{"target":{"kind":"<JobKindの名前>"}}`。`failed` のAIジョブを現在の入力で再検査し、200 `{ok, report:{requeued, obsolete, satisfied, unsupported, policy_disabled}}`。handler未登録・設定で今は使えない種類は戻さず `failed` のまま件数だけ。再試行用のhandlerは背景ワーカーとは別インスタンスで、`GET` の `ai.retry_kinds` が再検査できる種類）・`/ai-release-pause`（本文 `{"target":"all"}` か `{"target":{"task":"<TaskKindの名前>"}}`。Provider・用途の停止を解除し、200 `{ok, released:n}`。用途指定は今の設定に当たる停止だけで、設定が未指定・不正・その用途が未設定なら何も消さず409 `config_unavailable`）。どちらも同時に1つだけ（別のAI操作の実行中は409 `busy`。接続が切れても書き込みが終わるまで `busy`）、`target` の形が違う・未知の名前は400 `bad_params`、途中の失敗は500（定型文。再試行は済んだ種類の件数が履歴の `report` に残る）、`INGEST=0`・writerなし・停止の合図のあとは503。設計は[admin-ops/design.md](../admin-ops/design.md)。
 - 管理画面の設定タブは `GET /api/admin/config`（GETの完全一致。読み取り専用）で、起動時に読んだ設定を項目ごとの出どころ（引数・環境変数・既定）つきで返す。AI用途の送り先・モデル・今日（UTC）の送信数・無効の理由も含み、ユーザーの決定で鍵のパスや接続先も設定どおりに出す（鍵の中身は出さない）。
 - 管理画面の地名検索（`GET /api/admin/geocode`）は地理院のアドレス検索が0件のときだけNominatim（OpenStreetMap）で引き直し、海外の地名も探せる。Nominatimへの問い合わせは全体で1秒1件に絞り、結果はキャッシュする。
-- 旅行ブログ機能は、`GEOFRAME_BLOG=1`のときだけ有効（既定は無効）。`GET /api/blog/*` から写真カタログを読み取り、正確なGPSをレスポンスへ含めない。
-- レビュー状態は再構築可能な写真索引と混ぜず、`GEOFRAME_DATA_DIR/travel_blog/drafts/` のJSONへ保存する。
-- エクスポートは `GEOFRAME_DATA_DIR/blog_exports/<trip_id>/`。画像は再エンコードしてEXIFを除去する。
+- 旅行ブログ機能（`/blog-admin`・`/api/blog/*`・`GEOFRAME_BLOG`）は2026-11に削除した。`/blog-admin` は管理画面を、`GET /api/blog/*` と `POST /api/blog/save`・`/api/blog/export` は404を返す。書き出し済みの `GEOFRAME_DATA_DIR/blog_exports/` は、今までどおり `/blog_exports/` で配信する。note記事用の写真の書き出しは `geoframe-export` が行う。
 
 ## 一覧用サムネイル（`GET /thumb/<id>.jpg?v=<gen>`）
 
@@ -66,5 +64,4 @@
 - SHA-256とembeddingはいずれも表示用derivative由来で、Drive原本そのもののハッシュではない。
 - AIバックフィル中は未解析写真を表示可能なままにするため、全件完了まで選定率は段階的に上がる。
 - 撮影地候補の関門の基準（`clue`≥0.2または`kind=landmark`）は、位置なし写真64枚に1人が付けたラベルで決めた暫定値。ラベルと基準の判定は[tools/loc_clue_eval](../../tools/loc_clue_eval/README.md)（測り直すスクリプトはP5bで削除した）。Geminiの確信度は当てにならないため、候補は必ず人が確認する。
-- 海外写真の粗い地名が未解決の場合がある。ブログ候補では旅程の場所ラベルへフォールバックする。
-- 公開は自動化しない。静的HTMLを書き出した後、利用者が内容を確認して別途公開する。
+- 海外写真の粗い地名が未解決の場合がある。

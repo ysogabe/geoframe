@@ -6,7 +6,7 @@
 ## 概要
 
 3 ページ（`/admin`・`/ai-search`・`/blog-admin`）の管理画面を、`admin.html` 1 枚の「状況 / 写真 / 設定」の
-3 タブに統合する。旅行ブログは環境変数 `GEOFRAME_BLOG`（既定 `0`）で無効にする。写真タブは一覧と AI 検索を
+3 タブに統合する。旅行ブログは環境変数 `GEOFRAME_BLOG`（既定 `0`）で無効にする（2026-11 に機能ごと削除した。`/blog-admin` の管理画面と `/api/blog/*` の 404 は残した。以下は当時の記録）。写真タブは一覧と AI 検索を
 同居させ、カードを 1 種類にする。設定タブは新しい読み取り専用 API `GET /api/admin/config` で、起動時の設定を
 出どころつきで表示する。サーバーは Rust（axum）、画面は素の JavaScript（classic script）を `build.rs` で埋め込む
 方式を続ける。PR は 3 本（「実装の順番」）。

@@ -110,7 +110,7 @@ async fn the_config_is_served_as_no_store_json_with_items_and_ai() {
     );
     assert_eq!(item("GEOFRAME_INGEST")["value"], "1");
     assert_eq!(item("GEOFRAME_INGEST")["source"], "env");
-    assert_eq!(item("GEOFRAME_BLOG")["source"], "default");
+    assert_eq!(item("GEOFRAME_LOG")["source"], "default");
     assert_eq!(item("GEOFRAME_DRIVE_KEY")["state"], "present");
     assert_eq!(item("GEOFRAME_AI_CONFIG")["state"], "loaded");
     assert_eq!(body["ai"]["configured"], true);
