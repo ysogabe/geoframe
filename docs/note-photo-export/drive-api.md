@@ -109,3 +109,54 @@ drive.rs（`Drive`）の書き換え:
 
 ## 8. 本番の関門（PR③ のあと。参考）
 §8.8 の --verify の入口で: 移動で ID が保たれる、同名のフォーム・ショートカットが ambiguous_destination、md5Checksum が作業領域の MD5 と一致、Google 文書入り・同じ大きさで中身を変えたフォルダが modified で断られる、rclone 版が公開したフォルダを API 版で replace できる、ゴミ箱行きがフォルダと中身ごと戻せる、トークン更新後も資格情報のファイルの更新時刻が変わらない、所要時間、unit の上限の測り直し、.prev へ戻す練習。
+
+## 9. 実装で決めたこと（前半: 型と偽の Drive の HTTP サーバー）
+
+設計メモの書きぶりを具体にしたもの、設計と違えたもの、設計に無かった判断。コードは `crates/geoframe-export/src/drive/`（`mod.rs`＝今までの `drive.rs`、`http.rs`・`auth.rs`・`api.rs`）、偽のサーバーは `tests/common/fake_drive.rs`。
+
+### 9.1 型の置き場所と公開している入口（後半が使う）
+- `drive::http`: `Endpoints`（`production()`・`loopback(&str)`。`--drive-endpoint` の検査はこの `loopback`。`http://127.0.0.1:<port>` と `http://[::1]:<port>` の完全一致だけ）、`Deadline`、`ApiError`、`Retry`。
+- `drive::auth`: `Credentials::load(path)`（検査して読む。書かない）、`CredentialsError`。トークンは `DriveApi` の中でメモリだけに持つ。
+- `drive::api`: `DriveApi`（`Clone`・`Send + Sync`）。操作は `list_children`・`list_tree`・`get`・`generate_ids`・`create_folder`・`upload`・`move_to`・`trash`・`read`・`check_credentials`。
+  `Limit::{Query, Upload}`・`FileMeta`・`FOLDER_MIME`・上限の定数（`MAX_ENTRIES` など）も公開。
+- `ApiError` → `RemoteError` は `From`。`RemoteError` に `AuthInvalid`（照会でも書き込みでも `drive_auth_invalid`）と `Failed`（API の失敗。照会は `drive_unavailable`、書き込みは `rclone_failed`）を足した。ほかの対応は 5 章のまま。
+
+### 9.2 期限とキャンセル
+- どの操作も、最後の引数に `Deadline` を取る。`DriveApi::deadline(Limit)` が「今から数えた操作の期限」と「ジョブ全体の期限」（`with_job_deadline`）の早いほうで作る。操作の期限が切れると `ApiError::Timeout`（→ `rclone_timeout`）、ジョブの期限なら `ApiError::JobDeadline`（→ `timeout`）。呼び出し側が自分で `Deadline::operation(Instant)`・`Deadline::job(Instant)` を作って渡してもよい。
+- 1 つの操作（フォルダの作成・移動などで複数の要求になるもの）は、1 つの `Deadline` を共有する。写真の送信全体の期限（`--drive-upload-timeout`）は、呼び出し側が写真ごとに同じ `Deadline`（`Limit::Upload`）を渡して表す。
+- 要求 1 回の時間切れは、締め切りの残りと上限（JSON は 60 秒、チャンク・multipart は 10 分）の短いほう。**キャンセルは、要求の前・再試行の待ち・チャンクの間で見る**（要求の最中には見ない。最長でその上限まで待つ）。キャンセルされたら `ApiError::Cancelled`（→ `RemoteError::Cancelled`）。並列のアップロードでは、各スレッドが自分の `DriveApi` の複製（同じ `Cancel` を共有）で止まるので、呼び出し側が全スレッドを join してから戻る。
+
+### 9.3 トークン
+- 取得: `POST` の本文は設計どおり。`400`・`401` で `error` が `invalid_grant`・`invalid_client`・`unauthorized_client` なら `AuthInvalid`（再試行しない）。**ほかの 4xx は認可の失効とは言えないので `ApiError::Status`（`drive_unavailable`）**にして、再試行もしない。429・5xx・通信の失敗は再試行する。
+- 取り直しは 1 つずつ（ロックを持ったまま）。401 を受けたら、**その要求に使ったトークンだけ**を捨てて取り直し、1 回だけやり直す（別のスレッドが先に取り直していれば、その新しいトークンは捨てない）。取り直したトークンでも 401 なら `Status(401)`。
+- `expires_in` が無い・読めないときは 3000 秒とみなす（写真サービス側と同じ）。
+
+### 9.4 再試行
+- 最初の 1 回のあとに 5 回まで（待ちは 1・2・4・8・16 秒に 0〜25% の揺らぎ。上限 30 秒）。`Retry-After` は**秒の形だけ**読む（日時の形は無視して、指数の待ちにする）。上限（30 秒）を超える値は上限で切る。待ちが締め切りの残りを超えるときは、眠らずに期限のエラーを返す。
+- 再試行するもの: 通信の失敗（接続・TLS・時間切れ・読み取りの途中の切断。本文を読む失敗も含む）、429、5xx、403 で `error.errors[0].reason` が `rateLimitExceeded`・`userRateLimitExceeded`。使い切ったあと、流量制限は `RateLimited`、5xx は `Status`、通信は `Net`。
+- 再試行しない: ほかの 4xx・3xx（`Status`。404 は `NotFound`）、応答の形の誤り。3xx は `max_redirects(0)` で応答として受け取り、たどらない。**ureq は 308 も応答として返す**（resumable の続きの合図に使う）。環境変数の proxy も使わない。
+- 再送の約束: `create_folder`・`upload` は、最初に `generateIds` で取った ID を本文に入れ、再送も同じ ID（ID を取り直さない）。応答を失った再送は 409 になり、`get` で親・名前・種類（アップロードは大きさと `md5Checksum` も）が期待どおりなら成功、違えば `Mismatch`。`move_to`・`trash` は、再送の前と 4xx で断られたときに `get` で今の状態を見る（`move_to` は「親が移動先だけ・名前が新しい名前・ゴミ箱でない」、`trash` は「ゴミ箱の中」）。済んでいれば再送しない。`move_to` は、移動元と移動先が同じなら送らずに断る。
+
+### 9.5 resumable のアップロード
+- チャンクは 8MiB（256KiB の倍数）。8MiB 以下は multipart、超えたら resumable（試験は `with_sizes` で小さくする）。
+- セッションの `Location` は、スキーム・ホスト・ポートが設定のアップロードの URL と同じものだけ（ホスト名は小文字にして比べる。ユーザー情報つき・相対 URL は断る）。違えば送らずに `Rejected`。
+- **チャンクの `PUT` には `Authorization` を付けない**（`upload_id` を含むセッションの URL が認可する。アクセストークンを別のホストへ出さない二重の備えにもなる）。セッションを始める `POST` は付ける。
+- チャンクは 1 回だけ送り、通信の失敗・429・5xx のときは、少し待ってから `Content-Range: bytes */<size>` で位置を問い合わせる（308 と `Range`。見出しが無ければ 0。200・201 ならその応答が完成したファイル）。位置が進まないまま失敗が `max_retries` を超えたら失敗。404・410 はセッションの喪失で、**同じ ID** で始め直す（3 回まで。始めた時点で 409 なら、できているものを照合する）。
+- 手元のファイルは、multipart では送る前に大きさと MD5 を確かめて（違えば送らずに `Rejected`）、resumable では大きさだけ確かめる（MD5 は、完成の応答の `md5Checksum` と照らす。違えば `Mismatch`）。
+
+### 9.6 一覧・木
+- 件数の上限 20000（`MAX_ENTRIES`）、ページ数の上限 1000、木の深さの上限 32。同じ `nextPageToken` が前に使ったものと重なったら（直前でなくても）`TooManyPages`。名前に `/` を含む項目が木にあれば `BadResponse`（相対パスが曖昧になる。`list_children` は名前をそのまま返す）。木で同じフォルダに 2 度入ったら `TooManyPages`。
+- `Entry.mime` は Drive の `mimeType` のまま（フォルダは `application/vnd.google-apps.folder`。rclone の `inode/directory` ではない）。`is_dir`・`is_shortcut()` で判定するので、後半の呼び出し側は `mime` の値に頼らない。ショートカットは `size` が無いので -1。
+- `read` が上限を超えたら `TooLarge`（`BadOutput`）。エラー応答の本文の上限は 64KiB（成功の本文の上限とは別）。
+
+### 9.7 偽の Drive の HTTP サーバー（7 章の実装）
+- 置き場所は `tests/common/fake_drive.rs`。模型（`fake-rclone/model.rs`）は動かさず、`Node` に `trashed` を足しただけ（偽の rclone の `purge` は今までどおり木から消して `Drive::trashed` に ID を残す）。保存は一時ファイル＋rename にした（HTTP サーバーが読んでいる最中に半端な内容を見せない）。
+- 状態は偽の rclone と同じファイル（`drive.json`・`ctl.json`・`calls.log`）。要求ごとに読み書きするので、`Env::drive()`・`Env::save()`・`Env::add_rule()`・`Hook` がそのまま使える。CLI を子プロセスで動かす試験は `FakeDrive::url()` を `--drive-endpoint` に渡す。
+- calls.log の行は `kind: "http"`、`op`（中立の操作名＋ `get`・`generate_ids`・`token`）、`method`・`route`・`subject`・`authorization`（`ok`・`invalid`・`missing`。値は書かない）・`injected` ほか。resumable は 1 回の送信が複数行（`phase` が `init`・`chunk`・`status`）。規則の「何回目」は、条件（`op`・`contains`）に合う要求の数。`contains` は `subject`（対象のノードのパス）と `phase:<名前>` の部分一致。
+- **`Env::mutating_ops` は `get`・`generate_ids`・`token` も読むだけとして除く。`Env::ops_used`・`op_count` は `op` を持つ行を全部数える**（PR #87 のレビューの推奨）。
+- 偽のサーバーは、実際の Drive に近い厳しさにしてある: 一覧の `q` が `'<ID>' in parents and trashed=false` 以外なら 400（名前で絞る退行を捕まえる）、`generateIds` で払い出していない ID での作成は 400、重複した ID は 409、`removeParents` が今の親でなければ 404、`PATCH` の本文は `name`・`trashed:true` だけ、`DELETE`・`PATCH /upload/…`・`emptyTrash` は 405（`op: unsupported`）。`size` は文字列。エラーは `error.errors[].reason`、トークンのエラーは `{"error":"invalid_grant"}`。308 は `Range: bytes=0-N`（何も受けていなければ見出しなし）。
+- 故障注入の効果は `tests/common/fake_drive.rs` の関数（`status`・`rate_limit_403`・`too_many_requests`・`unauthorized`・`invalid_grant`・`drop_connection`・`do_then_drop`・`cut_response`・`redirect`・`repeat_page_token`・`bad_location`・`cut_after`・`lose_session`）と、`tests/common/drive.rs` の `fail`・`do_then_fail`・`sleep_ms`・`garbage`。rclone 版だけの効果（`late_then_fail`・`filewise`）は HTTP 版には無い（API の移動はファイル単位に化けないので要らない。移動の反映の遅れを試すなら、後半で `sleep` か状態の書き換えで作る）。
+
+### 9.8 共通にしたもの
+- 重複キーを断る JSON の読み方は、`serve.rs` の本文の検査から `jsonfile::parse_strict_object(bytes, 許すキー)` に移して、資格情報の読み込みと共有した（serve の振る舞いは変えない）。
+- ureq は `rustls`・`gzip`（geoframe crate と同じ形）。Cargo.lock に新しいパッケージは増えない。

@@ -14,7 +14,7 @@ name = "geoframe-export"
 path = "src/main.rs"
 
 # 試験用の偽の rclone（本物の rclone・Drive には触れない。`cargo build --workspace` でもビルドされるが、配るのは
-# `geoframe-export` だけ）。偽の Drive の模型は fake-rclone/model.rs で、試験（tests/common/drive.rs）と共有する。
+# `geoframe-export` だけ）。偽の Drive の模型は fake-rclone/model.rs で、試験（tests/common/drive.rs・偽の Drive の HTTP サーバー tests/common/fake_drive.rs）と共有する。
 [[bin]]
 name = "fake-rclone"
 path = "fake-rclone/main.rs"

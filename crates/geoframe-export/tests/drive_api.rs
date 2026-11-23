@@ -209,7 +209,7 @@ fn trashed_files_and_folders_are_not_listed() {
         .into_iter()
         .map(|e| e.id)
         .collect();
-    assert_eq!(names, [keep.clone()]);
+    assert_eq!(names, std::slice::from_ref(&keep));
     // ゴミ箱の中のフォルダの中身は、ゴミ箱の中のものとして見える（`get` の trashed は真）
     assert!(fx.api.get(&inner, fx.dl()).unwrap().trashed);
     assert!(fx.api.get(&folder, fx.dl()).unwrap().trashed);
@@ -311,7 +311,7 @@ fn get_and_read_by_id() {
     let m = fx.api.get(&id, fx.dl()).unwrap();
     assert_eq!(m.entry.name, "manifest.json");
     assert_eq!(m.entry.size, 7);
-    assert_eq!(m.parents, [fx.yamareco.clone()]);
+    assert_eq!(m.parents, std::slice::from_ref(&fx.yamareco));
     assert!(!m.trashed);
     assert_eq!(fx.api.read(&id, 100, fx.dl()).unwrap(), b"{\"a\":1}");
     // 上限ちょうどは通り、1 バイト超えたら失敗
@@ -841,7 +841,8 @@ fn rate_limits_and_server_errors_are_retried_then_succeed() {
 
 #[test]
 fn retries_stop_at_the_limit() {
-    let cases: [(Value, fn(&ApiError) -> bool); 4] = [
+    type Check = fn(&ApiError) -> bool;
+    let cases: [(Value, Check); 4] = [
         (fk::rate_limit_403(), |e| *e == ApiError::RateLimited),
         (fk::too_many_requests(0), |e| *e == ApiError::RateLimited),
         (fk::status(503), |e| *e == ApiError::Status(503)),

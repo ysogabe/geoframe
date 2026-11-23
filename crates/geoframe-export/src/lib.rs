@@ -19,7 +19,7 @@
 //! | [`listing`] | 一覧 API の値の検査（4.4）と候補の選び方 | T2 |
 //! | [`cli`]・[`app`] | 引数の解釈と、コマンドの振り分け | T2 |
 //! | [`image`]・[`jpeg`]・[`measure`]・[`staging`]・[`manifest`] | 画像の取得と書き出しの入口、JPEG の区画の検査とデコード、明るさ・シャープネス、作業領域、manifest | T3 |
-//! | [`remote`]・[`rclone`]・[`drive`]・[`publish`]・[`recovery`]・[`published`]・[`jsonfile`]・[`jobid`] | Drive の操作の入口と中立の型（`Remote`・`Entry`・`RemoteLoc`・`RemoteError`・Drive の ID／MD5／相対パスの検査）、その今の実装としての rclone の起動（引数の組み立て・子プロセス・標準エラーの伏せ字・`lsjson` の読み取り）、Drive への照会と操作・管理しているフォルダの判定、incoming → 検証 → 公開・退避・復旧の実行、復旧の表（純粋な関数）、公開の記録、アトミックな JSON の書き方、ジョブ ID | T4 |
+//! | [`remote`]・[`rclone`]・[`drive`]（[`drive::api`]・[`drive::auth`]・[`drive::http`] は Drive API を ID で指す操作の型。docs/note-photo-export/drive-api.md。フローにはまだつないでいない）・[`publish`]・[`recovery`]・[`published`]・[`jsonfile`]・[`jobid`] | Drive の操作の入口と中立の型（`Remote`・`Entry`・`RemoteLoc`・`RemoteError`・Drive の ID／MD5／相対パスの検査）、その今の実装としての rclone の起動（引数の組み立て・子プロセス・標準エラーの伏せ字・`lsjson` の読み取り）、Drive への照会と操作・管理しているフォルダの判定、incoming → 検証 → 公開・退避・復旧の実行、復旧の表（純粋な関数）、公開の記録、アトミックな JSON の書き方、ジョブ ID | T4 |
 //! | [`sys`]・[`cancel`]・[`lock`]・[`jobs`]・[`flow`]・[`service`]・[`run`]・[`recover`] | OS への問い合わせ（flock・現地時刻・実効ユーザー ID）、キャンセルの印（SIGINT・SIGTERM）、実行枠、ジョブの記録と状態ディレクトリの配置、ジョブの流れ・復旧・`dry_run`、受付と照会の層（T6 が使う）、`run`・`recover` | T5 |
 //! | [`serve`] | HTTP の入口（トークン・送信元の制限・本文の検査・接続の上限・ジョブ API・シグナルでの終了） | T6 |
 

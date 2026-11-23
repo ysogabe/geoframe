@@ -1,12 +1,12 @@
 //! Drive API 直接方式の HTTP の層（docs/note-photo-export/drive-api.md 4 章・5 章）: 通信先（[`Endpoints`]）、期限（[`Deadline`]）、
-//! 失敗（[`ApiError`]）、再試行つきの送信（[`Transport`]）。
+//! 失敗（[`ApiError`]）、再試行つきの送信（`Transport`）。
 //!
 //! 写真サービスの `crates/geoframe/src/drive.rs`（`send_with_retry`・`authorized`）と `net.rs`（`Failure`・本文の上限つきの読み出し）を
 //! 写して、書き込み向けに直したもの（共通の crate は作らない）。写真サービスは読むだけなので、ここで足したのは次の 4 つ。
 //!
-//! - 「済んでいるか」の確認（[`SendOpts::settled`]）: 書き込みを再送する前と、4xx で断られたときに、今の状態を見て、目的の状態なら
+//! - 「済んでいるか」の確認（`SendOpts::settled`）: 書き込みを再送する前と、4xx で断られたときに、今の状態を見て、目的の状態なら
 //!   成功とする（移動・ゴミ箱へ移すは、再送すると別の結果になりうるため）。
-//! - 308 などの状態コードを呼び出し側へそのまま返す（[`SendOpts::passthrough`]。resumable のアップロードの続き）。
+//! - 308 などの状態コードを呼び出し側へそのまま返す（`SendOpts::passthrough`。resumable のアップロードの続き）。
 //! - 期限が 2 種類（操作の期限とジョブ全体の期限）あり、どちらで切れたかを区別して返す（[`Deadline`]）。
 //! - キャンセル（[`Cancel`]）を、要求の前と再試行の待ちの最中に見る。
 //!
