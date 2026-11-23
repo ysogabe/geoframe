@@ -48,8 +48,11 @@ fn drive_has(env: &Env, path: &[&str]) -> bool {
     let Some((name, parent)) = path.split_last() else {
         return false;
     };
-    d.resolve(parent)
-        .is_some_and(|p| d.children(&p).iter().any(|n| n.name == *name))
+    d.resolve(parent).is_some_and(|p| {
+        d.children(&p)
+            .iter()
+            .any(|n| n.name == *name && !n.trashed)
+    })
 }
 
 // ---- 成功とその記録 ----
@@ -127,8 +130,8 @@ fn a_single_day_job_publishes_records_and_cleans_up() {
         "記録した incoming の ID が、公開されたフォルダの ID"
     );
     assert!(rec.summary.is_some());
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    assert_rclone_safe_calls(&env);
+    // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+    env.assert_api_calls_safe();
 }
 
 #[test]
@@ -311,7 +314,13 @@ fn an_existing_destination_ends_in_conflict_unless_replace_targets_a_managed_fol
     assert_eq!(v["result"]["catalog_count"], 3);
     assert_eq!(v["result"]["existing_files"], 2, "写真 1 枚と manifest");
     assert_eq!(v["error"], Value::Null);
-    assert_eq!(env.ops_used(), ["list"], "{:?}", env.ops_used());
+    // 呼んだのは、トークン・起動後の宛先の親と作業用のフォルダの確認（get）・一覧だけ（読むだけ）
+    assert_eq!(
+        env.ops_used(),
+        ["get", "list", "token"],
+        "{:?}",
+        env.ops_used()
+    );
     assert_eq!(
         env.drive().resolve(&["yamareco", DAY]),
         Some(old_id.clone())
@@ -571,10 +580,10 @@ fn dry_run_reports_the_destination_and_only_queries_drive() {
         (Some("exists"), Some(false))
     );
 
-    // 呼んだ rclone は lsjson と cat だけ。実行枠は外れている。ジョブの記録は作らない
+    // 呼んだのは、一覧・読み出しとトークンだけ（読むだけ）。実行枠は外れている。ジョブの記録は作らない
     for e in [&env, &env2] {
         for c in e.ops_used() {
-            assert!(c == "list" || c == "read", "{c}");
+            assert!(c == "list" || c == "read" || c == "token", "{c}");
         }
     }
     assert_eq!(job_files(&env), 0);
@@ -1439,22 +1448,21 @@ fn all_records(env: &Env) -> Vec<JobRecord> {
     JobStore::open(&env.state).unwrap().scan().records
 }
 
-/// 印が立つと、実行中の rclone を止めて `wait` し終えてから返る（実行枠は、そのあとで外れる）。記録は確定せず、`blocked` にも
-/// `failed` にもならない。次の復旧が、表のとおりに片付ける。
+/// 印が立つと、飛んでいる要求が終わるのを待って（要求の最中には見ない）、全スレッドを止めてから返る（実行枠は、そのあとで外れる）。
+/// 記録は確定せず、`blocked` にも `failed` にもならない。次の復旧が、表のとおりに片付ける。
 #[test]
-fn a_cancel_stops_the_running_rclone_before_returning_and_hands_the_record_to_recovery() {
+fn a_cancel_stops_every_upload_thread_before_returning_and_hands_the_record_to_recovery() {
     let mut env = Env::new("flow-cancel");
     let site = photo_site(DAY, DAY, three_photos());
     let cancel = Cancel::new();
     let svc = cancellable_service(&mut env, &site, &cancel);
-    // 写真を送る copy を、20 秒止める（止めなければ、そのまま待つ）
-    env.add_rule("upload", 0, 1, sleep_ms(20_000));
+    // 写真を送る要求を、1.5 秒止める（要求の最中には印を見ないので、その要求が終わってから止まる）
+    env.add_rule("upload", 0, 1, sleep_ms(1500));
     let worker = {
         let svc = svc.clone();
         std::thread::spawn(move || run_foreground_retry(&svc, &day()))
     };
-    let copy_pid = wait_for_call(&env, "upload", 20);
-    assert!(process_exists(copy_pid));
+    wait_for_call(&env, "upload", 20);
     let t = std::time::Instant::now();
     cancel.cancel();
     let rec = worker.join().unwrap().unwrap();
@@ -1463,8 +1471,8 @@ fn a_cancel_stops_the_running_rclone_before_returning_and_hands_the_record_to_re
         "印を見て止まる: {:?}",
         t.elapsed()
     );
-    // 返った時点で、子はもう居ない（`wait` 済み。次のジョブの復旧と競合しない）
-    assert!(!process_exists(copy_pid), "子が残っています");
+    // 返った時点で、全スレッドが止まっている（飛んでいる要求も、新しい要求も無い。次のジョブの復旧と競合しない）
+    assert_quiet(&env, 300);
     assert!(slot_is_free(&env.state));
     assert_eq!(staging_entries(&env), 0);
 
@@ -1500,8 +1508,8 @@ fn a_cancel_stops_the_running_rclone_before_returning_and_hands_the_record_to_re
     assert!(env.drive().trashed.contains(&incoming));
     let v = submit_and_wait(&next, &day());
     assert_eq!(v["status"], "succeeded", "{v}");
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    assert_rclone_safe_calls(&env);
+    // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+    env.assert_api_calls_safe();
 }
 
 /// 別のジョブの復旧の最中の印: 復旧の `rclone` を止め、その別のジョブを `blocked` にしない（`Unobservable` を確定しない）。
@@ -1595,16 +1603,16 @@ fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
             digests: None,
         }),
     );
-    // ゴミ箱への移動（purge）を止めておく
-    env.add_rule("trash", 0, 1, sleep_ms(30_000));
+    // ゴミ箱への移動の要求を、1.5 秒止めておく（要求の最中には印を見ない。その要求は、印のあとで Drive に届いてしまう）
+    env.add_rule("trash", 0, 1, sleep_ms(1500));
     let worker = {
         let svc = svc.clone();
         std::thread::spawn(move || startup_recovery_retry(&svc))
     };
-    let purge_pid = wait_for_call(&env, "trash", 20);
+    wait_for_call(&env, "trash", 20);
     cancel.cancel();
     let report = worker.join().unwrap();
-    assert!(!process_exists(purge_pid), "子が残っています");
+    assert_quiet(&env, 300);
     match report {
         StartupReport::Done { recovery, .. } => assert!(recovery.cancelled),
         other => panic!("{other:?}"),
@@ -1612,7 +1620,7 @@ fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
     let after = read_record(&env, &rec.job_id);
     assert_eq!(after.status, Status::Running, "interrupted に確定しない");
     assert!(after.notes.is_empty());
-    assert!(!env.drive().trashed.contains(&inc));
+    // 飛んでいた要求は、印のあとで Drive に届く（結果不明。記録は確定しない）。次の復旧が、今の Drive の状態から続ける
     assert!(svc.blocking().is_none());
 
     let next = Service::with_tuning(env.settings.clone(), fast_tuning()).unwrap();
