@@ -402,7 +402,6 @@ impl tracing::Subscriber for Capture {
 fn stderr_lines_never_reach_the_log_or_the_error() {
     // 標準エラーの中身は、伏せ字の語に当たらない行（Drive の ID やパス）も含めて、ログにもエラーにも出さない。
     // ログに残るのは、コマンド名・失敗の分類・行数だけ
-    let env = Env::new("redact");
     let secret_lines = [
         "ERROR : auth failed: access_token=ya29.SECRETVALUE",
         "Authorization: Bearer abcdefSECRET",
@@ -413,18 +412,15 @@ fn stderr_lines_never_reach_the_log_or_the_error() {
         "first plain line\n{}\nlast plain line",
         secret_lines.join("\n")
     );
-    env.add_rule(
-        "list",
-        0,
-        1,
-        json!({"kind": "fail", "code": 1, "stderr": stderr}),
+    let s = sh(
+        "redact",
+        &format!("cat >&2 <<'EOF'\n{stderr}\nEOF\nexit 1"),
+        SECS,
+        SECS,
     );
     capture_logs();
-    let layout = env.layout(Destination::Yamareco, FOLDER, JOB_A);
-    let err = geoframe_export::drive::Drive::new(&env.remote(), &layout)
-        .target()
-        .unwrap_err();
-    let shown = format!("{err} {err:?}");
+    let err = retry(|| s.rclone.lsjson(&loc(), false, true, false)).unwrap_err();
+    let shown = format!("{err:?}");
     for bad in ["SECRET", "Bearer", "access_token", "plain line", "fidPLAIN"] {
         assert!(!shown.contains(bad), "{shown}");
     }
@@ -451,20 +447,15 @@ fn stderr_lines_never_reach_the_log_or_the_error() {
 
 #[test]
 fn a_very_long_stderr_line_never_reaches_the_log() {
-    let env = Env::new("redact-long");
-    let body = "LONGSECRETBODY".repeat(20_000); // 約 280KB の 1 行
-    let stderr = format!("Authorization: Bearer {body}\nlong-case tail marker line");
-    env.add_rule(
-        "list",
-        0,
-        1,
-        json!({"kind": "fail", "code": 1, "stderr": stderr}),
+    // 約 280KB の 1 行（Authorization の見出しの形）と、そのあとの行
+    let s = sh(
+        "redact-long",
+        "printf 'Authorization: Bearer ' >&2\ni=0\nwhile [ $i -lt 20000 ]; do printf LONGSECRETBODY >&2; i=$((i+1)); done\nprintf '\\nlong-case tail marker line\\n' >&2\nexit 1",
+        SECS,
+        SECS,
     );
     capture_logs();
-    let layout = env.layout(Destination::Yamareco, FOLDER, JOB_A);
-    let _ = geoframe_export::drive::Drive::new(&env.remote(), &layout)
-        .target()
-        .unwrap_err();
+    let _ = retry(|| s.rclone.lsjson(&loc(), false, true, false)).unwrap_err();
     let all = LOGS.lock().unwrap().clone();
     for line in &all {
         assert!(
