@@ -22,6 +22,10 @@ pub enum ErrorCode {
     DecodeFailed,
     NothingToExport,
     DriveUnavailable,
+    /// Drive の認可が失効している（OAuth の更新トークンが `invalid_grant`）。再認可が要る。**まだどこからも返さない**:
+    /// ジョブの記録はエラーコードを厳しく読む（[`ErrorCode::parse`] に無いと読めず `blocked` になる）ので、このコードを書く版より
+    /// 先に、前の版にこの綴りを読ませておくために足した（書く版のあとで前の版へ戻しても、記録が読める）。
+    DriveAuthInvalid,
     AmbiguousDestination,
     RcloneFailed,
     RcloneTimeout,
@@ -40,7 +44,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// 全部（記録から読んだ文字列を [`ErrorCode::parse`] で戻すのに使う）。
-    pub const ALL: [ErrorCode; 23] = [
+    pub const ALL: [ErrorCode; 24] = [
         Self::InvalidDate,
         Self::InvalidRange,
         Self::InvalidDestination,
@@ -54,6 +58,7 @@ impl ErrorCode {
         Self::DecodeFailed,
         Self::NothingToExport,
         Self::DriveUnavailable,
+        Self::DriveAuthInvalid,
         Self::AmbiguousDestination,
         Self::RcloneFailed,
         Self::RcloneTimeout,
@@ -85,6 +90,7 @@ impl ErrorCode {
             Self::DecodeFailed => "decode_failed",
             Self::NothingToExport => "nothing_to_export",
             Self::DriveUnavailable => "drive_unavailable",
+            Self::DriveAuthInvalid => "drive_auth_invalid",
             Self::AmbiguousDestination => "ambiguous_destination",
             Self::RcloneFailed => "rclone_failed",
             Self::RcloneTimeout => "rclone_timeout",
@@ -116,6 +122,7 @@ impl ErrorCode {
             Self::DecodeFailed => "写真のデコードに失敗しました",
             Self::NothingToExport => "書き出せる写真がありません",
             Self::DriveUnavailable => "Drive に照会できません",
+            Self::DriveAuthInvalid => "Drive の認可が失効しました（再認可が要ります）",
             Self::AmbiguousDestination => "書き出し先に同じ名前のものが複数あります",
             Self::RcloneFailed => "rclone が失敗しました",
             Self::RcloneTimeout => "rclone が時間内に終わりませんでした",
@@ -170,7 +177,7 @@ impl std::error::Error for ExportError {}
 mod tests {
     use super::*;
 
-    const ALL: [ErrorCode; 23] = ErrorCode::ALL;
+    const ALL: [ErrorCode; 24] = ErrorCode::ALL;
 
     #[test]
     fn codes_are_fixed_unique_snake_case_strings() {
@@ -199,6 +206,10 @@ mod tests {
         assert_eq!(ErrorCode::Busy.as_str(), "busy");
         assert_eq!(ErrorCode::RequestIdMismatch.as_str(), "request_id_mismatch");
         assert_eq!(ErrorCode::ShuttingDown.as_str(), "shutting_down");
+        assert_eq!(ErrorCode::DriveAuthInvalid.as_str(), "drive_auth_invalid");
+        // 呼び出し側との契約（rclone 版が返すコードの綴りは変えない）
+        assert_eq!(ErrorCode::RcloneFailed.as_str(), "rclone_failed");
+        assert_eq!(ErrorCode::RcloneTimeout.as_str(), "rclone_timeout");
     }
 
     #[test]

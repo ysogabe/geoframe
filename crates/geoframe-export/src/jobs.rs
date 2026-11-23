@@ -875,6 +875,33 @@ mod tests {
     }
 
     #[test]
+    fn a_record_carrying_any_error_code_reads_back_including_drive_auth_invalid() {
+        // 記録はエラーコードを厳しく読む（知らない綴りの記録は読めず blocked になる）。まだ書く版が無いコードも、
+        // 前の版が読めるよう、全部のコードで往復を確かめる
+        assert!(ErrorCode::ALL.contains(&ErrorCode::DriveAuthInvalid));
+        for code in ErrorCode::ALL {
+            let mut r = JobRecord::new(id(1), &request(None));
+            r.status = Status::Failed;
+            r.finished_at = Some(FINISHED_AT.into());
+            r.error = Some(code);
+            let back = JobRecord::from_file_json(&r.to_file_json(), &id(1))
+                .unwrap_or_else(|| panic!("{code} の記録を読めません"));
+            assert_eq!(back.error, Some(code));
+        }
+        // 前の版が読む形: 文字列そのままで書いた記録
+        let mut r = JobRecord::new(id(1), &request(None));
+        r.status = Status::Failed;
+        r.finished_at = Some(FINISHED_AT.into());
+        r.error = Some(ErrorCode::Internal);
+        let mut v = r.to_file_json();
+        v["error"] = json!({"code": "drive_auth_invalid"});
+        assert_eq!(
+            JobRecord::from_file_json(&v, &id(1)).unwrap().error,
+            Some(ErrorCode::DriveAuthInvalid)
+        );
+    }
+
+    #[test]
     fn the_verified_digests_round_trip_and_a_record_without_them_is_still_readable() {
         use crate::published::RecordedFile;
         let digests = vec![
