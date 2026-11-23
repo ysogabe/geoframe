@@ -2,14 +2,16 @@
 //! 起動時の復旧（T5）と同じく、手元に一式が無い（Drive の manifest で照合する）形で動かす。表そのもの（純粋な関数）の試験は
 //! `src/recovery.rs`。
 //!
-//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る
-//! （`Env::ops`・`mutating_ops`・`ops_used`・`op_count`）。`// rclone 固有` と書いた確認（`rclone_calls`・
-//! `assert_rclone_safe_calls`）と、そう書いた試験だけが、rclone の引数・環境変数を見る。それらは rclone 版を消すときに消す。
+//! Drive は、試験のプロセスの中の偽の Drive の HTTP サーバー（`tests/common/fake_drive.rs`）。操作の記録は、中立の操作名（`list`・
+//! `read`・`create_folder`・`upload`・`move`・`trash`。読むだけの `get`・`generate_ids`・`token` も混ざる）で見る（`Env::ops`・
+//! `mutating_ops`・`ops_used`・`op_count`）。API の呼び出しの形は `Env::assert_api_calls_safe`。復旧の表を通す試験は、API の再試行に
+//! 助けられないよう、再試行しない `Env::remote()` で動かす。
 
 mod common;
 
 use common::drive::model;
 use common::drive::*;
+use common::fake_drive::{do_then_add_folder, do_then_move_away, late_then_fail};
 use geoframe_export::drive::{Expected, Layout};
 use geoframe_export::error::ErrorCode;
 use geoframe_export::folder::FolderName;
@@ -174,7 +176,7 @@ fn an_interrupted_upload_that_never_recorded_the_incoming_id_is_not_deleted_by_n
     // 結果と recover の表示に出す
     let text = geoframe_export::publish::leftover_incoming_text(&w.layout, Some(&inc));
     assert!(
-        text.contains(&inc) && text.contains(w.layout.incoming_path()),
+        text.contains(&inc) && text.contains(&w.layout.incoming_path()),
         "{text}"
     );
     let (decision, _, shown) = w
@@ -291,8 +293,8 @@ fn a_retired_old_folder_with_a_verified_incoming_is_rolled_forward() {
         // 前へ進める前に incoming の中身を manifest と照合し（cat）、移動は 1 回だけ
         assert!(w.env.ops_used().contains(&"read".to_owned()));
         assert_eq!(w.env.op_count("move"), 1);
-        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-        assert_rclone_safe_calls(&w.env);
+        // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+        w.env.assert_api_calls_safe();
     }
 }
 
@@ -533,8 +535,8 @@ fn explain_shows_the_state_and_the_next_move_without_changing_drive() {
     assert!(matches!(decision.action, Action::RollForward { .. }));
     assert!(observed.dest.is_empty());
     assert!(text.contains(&old) && text.contains(&inc), "{text}");
-    // 呼んだのは lsjson だけ
-    assert_eq!(w.env.ops_used(), ["list"]);
+    // 呼んだのは一覧だけ（トークンを取るほかは、読むだけ）
+    assert_eq!(w.env.ops_used(), ["list", "token"]);
     w.env.assert_no_mutations();
     assert_eq!(w.dest(), None);
     // ブロックされる状態の説明
@@ -591,14 +593,15 @@ fn the_pending_lookup_works_with_the_local_set_too() {
     assert!(matches!(res, Resolution::Published(_)));
     // 手元の一式で照合するので、incoming・宛先の manifest は読まない。読むのは、ゴミ箱へ移す前の、退避した旧フォルダの
     // manifest（旧 manifest の一式と中身の照合）だけ
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    let cats = w.env.rclone_calls("cat");
-    assert_eq!(cats.len(), 1, "{cats:?}");
-    assert!(
-        cats[0].last().unwrap().contains("/replaced/"),
-        "{:?}",
-        cats[0]
-    );
+    let reads: Vec<String> = w
+        .env
+        .http_calls()
+        .iter()
+        .filter(|c| c["op"] == "read")
+        .map(|c| c["subject"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(reads[0].contains("/replaced/"), "{reads:?}");
     let _ = (ErrorCode::Blocked, model::ROOT);
 }
 
@@ -684,8 +687,8 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
     let rec = seq.iter().rposition(|c| c == "record:trashing").unwrap();
     let purge = seq.iter().position(|c| c == "trash").unwrap();
     assert!(rec < purge, "{seq:?}");
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    assert_rclone_safe_calls(&w.env);
+    // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+    w.env.assert_api_calls_safe();
 }
 
 #[test]
@@ -775,7 +778,7 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("move", 0, 1, late_then_fail(3));
+    w.env.add_rule("move", 0, u64::MAX, late_then_fail(3));
     let r = w.env.remote();
     let res = w
         .recovery(&r, None)
@@ -857,12 +860,13 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
 #[test]
 fn startup_recovery_checks_the_destination_after_the_move_before_it_goes_to_the_trash() {
     // 起動時の復旧（手元に一式が無い）でも、移した直後に、宛先の ID・incoming が残っていない・中身を照合する
-    // ファイル単位の移動に切り替わった → 宛先の ID が incoming の ID と違う
-    let w = world("startup-filewise");
+    // 移した直後に、オーナーが宛先に同じ名前のフォルダを作った → 宛先が incoming の ID のフォルダ 1 つだけではない
+    let w = world("startup-dup-folder");
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("move", 0, 1, filewise());
+    w.env
+        .add_rule("move", 0, 1, do_then_add_folder(&["yamareco"], FOLDER));
     let r = w.env.remote();
     let info = w
         .recovery(&r, None)
@@ -1541,4 +1545,146 @@ fn an_old_job_record_without_md5_writes_a_row_without_md5_so_the_next_replace_is
             .managed,
         Some(geoframe_export::drive::Managed::NotManaged)
     );
+}
+
+/// 宛先の中身を ID で一覧している間に、そのフォルダが宛先から動かされた（ID は同じなので、中身は読めて一致する）。公開の確定（記録）と
+/// 旧フォルダの片付けに入る前に、宛先を観察し直して `blocked`（`publish_mismatch`）にする。
+#[test]
+fn a_folder_moved_away_while_recovery_checks_its_contents_is_not_taken_as_published() {
+    // 公開済み（宛先が新しい一式）の仕上げ
+    for replace in [false, true] {
+        let w = world(&format!("moved-away-finish-{replace}"));
+        let old = replace.then(|| w.env.seed_managed(Y, FOLDER, &w.set));
+        let inc = w.put_incoming();
+        if let Some(old) = &old {
+            w.retire(old);
+        }
+        w.publish_incoming(&inc);
+        w.env.fake.add_rule_contains(
+            "list",
+            &format!("yamareco/{FOLDER}"),
+            0,
+            1,
+            do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+        );
+        let r = w.env.remote();
+        let info = w
+            .recovery(&r, None)
+            .run(
+                &progress(Stage::Publishing, old.as_deref(), Some(&inc)),
+                false,
+                &mut Hook::new(&w.env),
+            )
+            .unwrap_err();
+        assert_eq!(
+            info.reason,
+            BlockedReason::PublishMismatch,
+            "replace={replace}"
+        );
+        assert!(info.observed.expect("observed").dest.is_empty());
+        // 公開の記録は書き換えない（置き換えなら、旧フォルダの行のまま）
+        assert_eq!(w.recorded_id(), old, "replace={replace}");
+        assert_eq!(w.env.op_count("trash"), 0, "replace={replace}");
+        assert!(w.env.drive().trashed.is_empty());
+    }
+
+    // 前へ進める（incoming を宛先へ移したあとの照合）
+    let w = world("moved-away-roll-forward");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.env.fake.add_rule_contains(
+        "list",
+        &format!("yamareco/{FOLDER}"),
+        0,
+        1,
+        do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+    );
+    let r = w.env.remote();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::PublishMismatch);
+    assert_eq!(w.recorded_id(), Some(old.clone()), "旧フォルダの行のまま");
+    assert_eq!(w.env.op_count("trash"), 0);
+    assert!(w.env.drive().trashed.is_empty());
+}
+
+/// 退避した旧フォルダのゴミ箱への移動が 429・401（処理されていない）のとき、再送しない（復旧でも同じ）。結果不明と同じ結末:
+/// 公開の記録は書き、旧フォルダは退避先に残ったものとして知らせる。待つ間に足されたファイルごとゴミ箱へ移すことはない。
+#[test]
+fn a_trash_that_was_not_processed_during_recovery_is_sent_once() {
+    use common::fake_drive::{status_then_add_file, too_many_requests, unauthorized};
+    for (label, effect) in [("429", too_many_requests(0)), ("401", unauthorized())] {
+        for added in [false, true] {
+            let w = world(&format!("trash-not-processed-recovery-{label}-{added}"));
+            let old = w.env.seed_managed(Y, FOLDER, &w.set);
+            let inc = w.put_incoming();
+            w.retire(&old);
+            w.publish_incoming(&inc);
+            let effect = if added {
+                let retired = w.layout.retired_name().to_owned();
+                status_then_add_file(
+                    effect.clone(),
+                    &["geoframe-export-work", "replaced", retired.as_str()],
+                    "owner-memo.txt",
+                )
+            } else {
+                effect.clone()
+            };
+            w.env.add_rule("trash", 0, u64::MAX, effect);
+            let r = w.env.remote_retrying();
+            let res = w
+                .recovery(&r, None)
+                .run(
+                    &progress(Stage::Trashing, Some(&old), Some(&inc)),
+                    false,
+                    &mut Hook::new(&w.env),
+                )
+                .unwrap();
+            let Resolution::Published(p) = res else {
+                panic!("{label}/{added}: {res:?}")
+            };
+            assert_eq!(p.old_left_in_replaced.as_deref(), Some(old.as_str()));
+            assert_eq!(w.env.op_count("trash"), 1, "{label}/{added}: 再送しない");
+            assert!(w.env.drive().trashed.is_empty(), "{label}/{added}");
+        }
+    }
+}
+
+/// 旧フォルダの中身の照合のあと、ゴミ箱へ移す直前に、新しい公開先が宛先から動かされた（復旧の「公開済み」の行でも、
+/// 照合は ID で行うので、動かされても中身は一致する）。ゴミ箱へ移さず、`publish_mismatch` で止める。
+#[test]
+fn the_new_folder_moved_away_just_before_the_trash_blocks_in_recovery_too() {
+    let w = world("moved-away-before-trash-recovery");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.publish_incoming(&inc);
+    w.env.fake.add_rule_contains(
+        "list",
+        &format!("replaced/{}", w.layout.retired_name()),
+        0,
+        1,
+        do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+    );
+    let r = w.env.remote();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Trashing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::PublishMismatch);
+    assert!(info.observed.expect("observed").dest.is_empty());
+    assert_eq!(w.recorded_id(), Some(old.clone()), "旧フォルダの行のまま");
+    assert_eq!(w.env.op_count("trash"), 0);
+    assert!(w.env.drive().trashed.is_empty());
 }

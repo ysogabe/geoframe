@@ -26,7 +26,7 @@
 //! | `GET /v1/exports` | | 200 | `{"jobs":[{"job_id","status","request",…}]}`（新しい順。直近 50 件） |
 //! | 上のどれでもない経路・メソッド | | 404（`not_found`）・405（`method_not_allowed`） | |
 //!
-//! 応答の `error` は固定のコードだけ。rclone の出力・資格情報・トークン・受け取った値は載せない。
+//! 応答の `error` は固定のコードだけ。Drive の応答の本文・資格情報・トークン・受け取った値は載せない。
 //!
 //! ## 守り
 //!
@@ -52,20 +52,21 @@
 //! 1. `--listen`・トークンのファイルを検査する（満たさなければ終了コード 2。[`check_listen`]・[`token`]）。`--listen` は、tailnet の
 //!    アドレス帯（IPv4 は 100.64.0.0/10、IPv6 は fd7a:115c:a1e0::/48）かループバックだけ。
 //! 2. SIGINT・SIGTERM を tokio で受ける（`handle_signals` が真のとき。受けたら [`Cancel::cancel`]）。**起動時の復旧より前**に入れる
-//!    （復旧中に既定の動作で親だけが終わると、rclone が残る）。`run` と違い、libc の handler は入れない
+//!    （復旧中に既定の動作で親だけが終わると、飛んでいる書き込みの結果が分からないまま実行枠だけが外れる）。`run` と違い、libc の handler は入れない
 //!    （[`crate::app`]。印を立てる先は同じ [`Cancel`]）。
 //! 3. [`Service::startup_recovery`] を済ませてから待ち受ける。待ち受けながら終わるまで 503 にする案もあるが、復旧は実行枠を
 //!    取るので、その間の受付は 409（`busy`）になり、呼び出し側が「別のジョブが実行中」と取り違える。接続できない（拒否）なら
 //!    呼び出し側は再試行するだけで済み、systemd も起動の完了を待たない（`Type=simple`）。復旧中に印が立てば、待ち受けずに終わる
-//!    （復旧が子〔rclone〕を回収して実行枠を手放すまでは、終わらない）。
+//!    （復旧が、飛んでいる要求の終わりを待って実行枠を手放すまでは、終わらない）。
 //!    **帰結**: 止まったジョブ（Drive の段階を記録した `running`）があると、本番の待ち（Drive の反映を 30 秒ずつ最大 4 回）のぶん、
 //!    再起動のあと最大で数分、待ち受けない（呼び出し側には接続拒否に見える。`/healthz` も答えない）。呼び出し側は、接続を拒否
 //!    されたら間隔を空けて再試行する。unit の起動の完了を `/healthz` で見張るなら、その間は未起動に見える（T7）。
 //! 4. 終了（印が立つ）では、新しい受付を閉じ、①接続のタスクが終わるのを待ち（要求の途中だったものは返事をする。**この待ちだけが
 //!    [`Limits::shutdown_wait`] の期限つき**。超えたら接続を落とし、終了コード 1）、②受付・`dry_run`・起動時の復旧の
-//!    ブロッキング処理が終わるのを待ち、③ [`Service::wait_idle`] でジョブのスレッドの終わり（rclone を止めて `wait` し終え、実行枠を
-//!    手放すまで）を待ってから終わる。②③は**期限なし**（「HTTP の打ち切りの期限」と「後始末の完了の条件」は別。印が立てば rclone は
-//!    止まるので、後始末は有限の時間で終わる前提）。どの経路（復旧の最中の印・待ち受けの失敗・通常の停止）でも、この後始末を
+//!    ブロッキング処理が終わるのを待ち、③ [`Service::wait_idle`] でジョブのスレッドの終わり（アップロードのスレッドを全部止めて join し終え、
+//!    実行枠を手放すまで）を待ってから終わる。②③は**期限なし**（「HTTP の打ち切りの期限」と「後始末の完了の条件」は別。印が立てば、
+//!    飛んでいる 1 つの要求〔最長 100 秒〕が終わったところで止まるので、後始末は有限の時間で終わる前提。unit の `TimeoutStopSec=180s` に
+//!    収まる）。どの経路（復旧の最中の印・待ち受けの失敗・通常の停止）でも、この後始末を
 //!    経てから返る。そのあと tokio のランタイムは、短い待ち（[`RUNTIME_DROP_WAIT`]）で破棄する（残ったブロッキング処理があっても、
 //!    無限に待たない）。止まったジョブの記録は確定せず、次の起動の復旧が片付ける。
 //!    本文の読み取りの最中に印が立っても、受付は、実行枠を取ったあと記録を書く直前にもう一度印を確かめ、立っていれば何も
@@ -93,7 +94,6 @@ use axum::routing::get;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
@@ -125,9 +125,9 @@ pub const MAX_DENIED_CONNECTIONS: usize = 2;
 pub const DENIED_HEADER_TIMEOUT: Duration = Duration::from_secs(2);
 /// 終了のとき、**接続**（HTTP）の終わりを待つ上限。超えたら、接続のタスクを落として、終了コード 1 にする。
 ///
-/// これは「HTTP の打ち切りの期限」だけを決める。後始末（ブロッキング処理・ジョブのスレッドが、子の rclone を止めて回収し、
-/// 実行枠を手放すまで）の完了は、この期限と関係なく、**必ず待つ**（[`run`]。期限なし）。印が立てば rclone は止まるので、後始末は
-/// 有限の時間で終わる。systemd の既定の停止の待ち（`TimeoutStopSec` の既定は 90 秒）より前に出す。T7 の unit は、これより
+/// これは「HTTP の打ち切りの期限」だけを決める。後始末（ブロッキング処理・ジョブのスレッドが、飛んでいる要求の終わりを待って
+/// 全スレッドを止め、実行枠を手放すまで）の完了は、この期限と関係なく、**必ず待つ**（[`run`]。期限なし）。印が立てば、飛んでいる
+/// 要求〔最長 100 秒〕が終わったところで止まるので、後始末は有限の時間で終わる。systemd の既定の停止の待ち（`TimeoutStopSec` の既定は 90 秒）より前に出す。T7 の unit は、これより
 /// 長い `TimeoutStopSec`（例: 120 秒）を置く。
 pub const SHUTDOWN_WAIT: Duration = Duration::from_secs(75);
 /// 後始末を待っている間、状況をログに出す間隔。
@@ -297,8 +297,8 @@ pub fn serve(
 /// [`Limits::shutdown_wait`] までに終わらず落とした（このときも、ジョブの子は回収してから返る）。
 ///
 /// **どの経路でも**（起動時の復旧の最中に印が立った場合・待ち受けられなかった場合・通常の停止）、返る前に、ブロッキング処理
-/// （受付・`dry_run`・起動時の復旧）とジョブのスレッドの終わりを、期限なしで待つ。印が立てば rclone は止まり、ジョブも復旧も
-/// 子を回収して実行枠を手放すので、この待ちは有限の時間で終わる（その前提で、HTTP の打ち切りの期限とは分けてある）。
+/// （受付・`dry_run`・起動時の復旧）とジョブのスレッドの終わりを、期限なしで待つ。印が立てば、ジョブも復旧も、飛んでいる要求が終わったところで
+/// 止まり、全スレッドを止めて実行枠を手放すので、この待ちは有限の時間で終わる（その前提で、HTTP の打ち切りの期限とは分けてある）。
 pub fn run(service: Service, config: Config, on_ready: impl FnOnce(SocketAddr)) -> io::Result<u8> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -312,7 +312,7 @@ pub fn run(service: Service, config: Config, on_ready: impl FnOnce(SocketAddr)) 
         on_ready,
     ));
 
-    // 後始末（子の回収と実行枠の解放）。ここへ来た時点で終わる途中なので、印を立てる（待ち受けの失敗で返ってきた場合も、
+    // 後始末（スレッドの停止と実行枠の解放）。ここへ来た時点で終わる途中なので、印を立てる（待ち受けの失敗で返ってきた場合も、
     // ジョブが残っていれば止める）
     service.cancel().cancel();
     // 先にブロッキング処理（受付がジョブのスレッドを作りうる）、そのあとジョブのスレッド
@@ -320,7 +320,7 @@ pub fn run(service: Service, config: Config, on_ready: impl FnOnce(SocketAddr)) 
         tracing::warn!("受付・復旧のブロッキング処理の終わりを待っています");
     }
     while !service.wait_idle(CLEANUP_LAP) {
-        tracing::warn!("ジョブのスレッド（rclone の回収）の終わりを待っています");
+        tracing::warn!("ジョブのスレッド（アップロードの停止）の終わりを待っています");
     }
     // 数えていない残りがあっても、ランタイムの破棄で無限に待たない
     runtime.shutdown_timeout(RUNTIME_DROP_WAIT);
@@ -426,8 +426,8 @@ async fn run_async(
         spawn_signal_task(cancel.clone())?;
     }
 
-    // 起動時の復旧（実行枠を取る。済んでから待ち受ける。上の「起動と終了」の 3）。ここの待ちに期限は掛けない（子を回収して
-    // 実行枠を手放すまで終わらない。印が立てば rclone は止まるので、有限）
+    // 起動時の復旧（実行枠を取る。済んでから待ち受ける。上の「起動と終了」の 3）。ここの待ちに期限は掛けない（全スレッドを止めて
+    // 実行枠を手放すまで終わらない。印が立てば、飛んでいる要求が終わったところで止まるので、有限）
     let recovery = {
         let service = service.clone();
         let guard = inflight.enter();
@@ -896,48 +896,12 @@ const KEYS: [&str; 6] = [
     "request_id",
 ];
 
-/// 本文のオブジェクト。未知のキー・重複したキーは、**最初に見つけた 1 つ**を理由として持つ（本文の最後まで読む。途中で
-/// 打ち切ると、JSON の文法の誤りと区別できない）。重複は、エスケープを戻したあとのキーで比べる（`"dry_run"` と `"dry\u005frun"`
-/// は同じキー）。値が `null` のキーも、1 つと数える。
-struct Strict(Result<Map<String, Value>, &'static str>);
-
-impl<'de> Deserialize<'de> for Strict {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visit;
-
-        impl<'de> Visitor<'de> for Visit {
-            type Value = Strict;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON object")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Strict, A::Error> {
-                let mut object = Map::new();
-                let mut problem: Option<&'static str> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    let value = map.next_value::<Value>()?;
-                    if !KEYS.contains(&key.as_str()) {
-                        problem.get_or_insert("unknown_field");
-                    } else if object.contains_key(&key) {
-                        problem.get_or_insert("duplicate_field");
-                    } else {
-                        object.insert(key, value);
-                    }
-                }
-                Ok(Strict(problem.map_or(Ok(object), Err)))
-            }
-        }
-
-        deserializer.deserialize_map(Visit)
-    }
-}
-
 /// 本文（JSON）を [`RawRequest`] にする。未知のキー・重複したキー・オブジェクトでない本文・型の違いは、固定のコードで断る。
 /// `null` は、キーが無いのと同じに扱う（必須の `from`・`destination` は、そのあとの検査で `invalid_date`・`invalid_destination`）。
 /// 型の違いは、そのキーの検査のコード（`from`・`to` は `invalid_date`、`dry_run` は `invalid_body`）。
 fn parse_body(bytes: &[u8]) -> Result<RawRequest, &'static str> {
-    let Ok(Strict(checked)) = serde_json::from_slice::<Strict>(bytes) else {
+    // 未知のキー・重複したキーは、最初に見つけた 1 つが理由（本文の最後まで読む。[`crate::jsonfile::parse_strict_object`]）
+    let Some(checked) = crate::jsonfile::parse_strict_object(bytes, &KEYS) else {
         return Err("invalid_body");
     };
     let object = checked?;

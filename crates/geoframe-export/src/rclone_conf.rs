@@ -15,6 +15,11 @@
 //!
 //! 開き方: 親ディレクトリを `O_DIRECTORY | O_NOFOLLOW` で開き、そのハンドルで持ち主・権限を見て、そこから `openat` で
 //! 設定ファイルを `O_NOFOLLOW | O_NONBLOCK` で開く（パスを引き直さない。FIFO で止まらない）。
+//!
+//! root が別のユーザーの設定を取り込むとき（`import-credentials`）は、パスの途中のディレクトリも確かめる。そのときは、**根（`/`）から
+//! 1 段ずつ** `openat(O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)` で開き（[`DirChain`]）、開いたハンドルの `fstat` で各ディレクトリを
+//! 見て、同じ親のハンドルから設定ファイルを開く（検査した経路と開いた経路が同じ。途中のシンボリックリンクは断る。`..`・`.`・
+//! 空の要素・相対パスも断る）。
 
 use std::ffi::CString;
 use std::fmt;
@@ -118,7 +123,9 @@ impl fmt::Display for ConfigError {
                 f.write_str("設定ファイルの権限が広すぎます（0600 にしてください）")
             }
             Self::TooPermissive(Target::Directory) => {
-                f.write_str("設定ファイルの親ディレクトリの権限が広すぎます（0700 にしてください）")
+                f.write_str(
+                    "設定ファイルの親ディレクトリ（root が取り込むときは、その上の各ディレクトリも）の権限が広すぎます（親は 0700、上はグループ・その他が書けない形にしてください）",
+                )
             }
             Self::TooLarge => write!(f, "設定ファイルが {CONFIG_MAX_BYTES} バイトを超えています"),
             Self::NotUtf8 => f.write_str("設定ファイルが UTF-8 ではありません"),
@@ -160,6 +167,27 @@ pub fn check_rclone_config(path: &Path, remote: &str) -> Result<(), ConfigError>
 /// 順序: 親ディレクトリ → ファイルの持ち主・権限（開いたハンドルで見る。確かめた後に差し替えられない）→ 中身。
 /// 親やファイルが安全でなければ、中身は読まない。
 pub fn check_rclone_config_for_uid(path: &Path, remote: &str, uid: u32) -> Result<(), ConfigError> {
+    let text = read_config_text(path, uid, false)?;
+    check_section(&text, remote)
+}
+
+/// 設定ファイルを安全に開いて、中身の文字列を返す。`any_owner` が真なら、持ち主は問わない（権限は問う）。
+fn read_config_text(path: &Path, uid: u32, any_owner: bool) -> Result<String, ConfigError> {
+    // 実行ユーザーが本当に root のときだけ（試験の「root のつもり」では、鎖の検査をしない）
+    read_config_text_with(path, uid, any_owner, any_owner && effective_uid() == 0)
+}
+
+/// [`read_config_text`] の、パスの途中の検査（`chain`）を呼び出し側が決める形。
+///
+/// `chain` が真なら、**根（`/`）から 1 段ずつ**開いたハンドルで読む（[`DirChain`]）: パスを引き直して検査しないので、検査した
+/// ディレクトリと実際に開いたファイルの経路がずれない。途中にシンボリックリンクがあれば断り、`..`・`.`・空の要素を含むパスと、
+/// 絶対でないパスも断る。
+fn read_config_text_with(
+    path: &Path,
+    uid: u32,
+    any_owner: bool,
+    chain: bool,
+) -> Result<String, ConfigError> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -169,22 +197,39 @@ pub fn check_rclone_config_for_uid(path: &Path, remote: &str, uid: u32) -> Resul
         .ok_or(ConfigError::WrongKind(Target::File))?;
 
     // 親ディレクトリ自身がシンボリックリンクなら断る（O_NOFOLLOW）。持ち主・権限は開いたハンドルで見る
-    let dir = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(parent)
-        .map_err(|e| match e.raw_os_error() {
-            // O_NOFOLLOW でリンクを開こうとすると、ELOOP か ENOTDIR（O_DIRECTORY と合わせたとき）になる
-            Some(libc::ELOOP | libc::ENOTDIR) => ConfigError::WrongKind(Target::Directory),
-            _ => ConfigError::Unreadable(Target::Directory, e.kind()),
-        })?;
+    let (dir, chain) = if chain {
+        let c = DirChain::open_file_parent(path)?;
+        (
+            c.parent
+                .try_clone()
+                .map_err(|e| ConfigError::Unreadable(Target::Directory, e.kind()))?,
+            Some(c),
+        )
+    } else {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent)
+            .map_err(|e| match e.raw_os_error() {
+                // O_NOFOLLOW でリンクを開こうとすると、ELOOP か ENOTDIR（O_DIRECTORY と合わせたとき）になる
+                Some(libc::ELOOP | libc::ENOTDIR) => ConfigError::WrongKind(Target::Directory),
+                _ => ConfigError::Unreadable(Target::Directory, e.kind()),
+            })?;
+        (dir, None)
+    };
     let dir_meta = dir
         .metadata()
         .map_err(|e| ConfigError::Unreadable(Target::Directory, e.kind()))?;
     if !dir_meta.is_dir() {
         return Err(ConfigError::WrongKind(Target::Directory));
     }
-    check_owner_and_mode(Target::Directory, dir_meta.uid(), dir_meta.mode(), uid)?;
+    check_owner_and_mode(
+        Target::Directory,
+        dir_meta.uid(),
+        dir_meta.mode(),
+        uid,
+        any_owner,
+    )?;
 
     // 同じハンドルの下から開く（パスを引き直さない）。シンボリックリンクはたどらない。FIFO などで待たないよう O_NONBLOCK で
     // 開き、通常のファイルだと確かめてから読む（通常のファイルの読み取りに O_NONBLOCK は影響しない）
@@ -195,12 +240,207 @@ pub fn check_rclone_config_for_uid(path: &Path, remote: &str, uid: u32) -> Resul
     if !meta.is_file() {
         return Err(ConfigError::WrongKind(Target::File));
     }
-    check_owner_and_mode(Target::File, meta.uid(), meta.mode(), uid)?;
+    check_owner_and_mode(Target::File, meta.uid(), meta.mode(), uid, any_owner)?;
+    // root が、別のユーザーの持ち物の設定を取り込むとき（`import-credentials`）は、パスの途中のディレクトリも確かめる。
+    // 途中のディレクトリを書き換えられるユーザーが、パスの先を別のファイルに差し替えて、root に読ませられないように。
+    // 検査するのは、**ファイルを開いた経路そのもの**（根から 1 段ずつ開いたハンドル）。パスを引き直して検査すると、途中のリンクを
+    // 解決した先を検査して、リンクを置いたディレクトリが検査から外れる
+    if let Some(chain) = &chain {
+        chain.check(meta.uid())?;
+    }
     if meta.len() > CONFIG_MAX_BYTES {
         return Err(ConfigError::TooLarge);
     }
-    let text = read_limited(&mut file)?;
-    check_section(&text, remote)
+    read_limited(&mut file)
+}
+
+/// 根（`/`）から 1 段ずつ開いたディレクトリの連なり。**パスを引き直さない**: 各段を、前の段のハンドルから
+/// `openat(O_NOFOLLOW | O_DIRECTORY | O_CLOEXEC)` で開き、開いたハンドルの `fstat` で持ち主・権限を控える。途中にシンボリックリンクが
+/// あれば断る。最後の段（設定ファイルの親）のハンドルから、同じ連なりのまま設定ファイルを開く。
+pub struct DirChain {
+    /// 最後の段（設定ファイルの親ディレクトリ）のハンドル。
+    parent: File,
+    /// 親より上の各段（根から順）の（持ち主, モード）。
+    ancestors: Vec<(u32, u32)>,
+}
+
+/// 絶対パスを、根からの各要素に分ける。`..`・`.`・空の要素（`//`・末尾の `/`）・相対パスは断る。`/` だけなら要素なし。
+fn absolute_elements(path: &Path) -> Result<Vec<&[u8]>, ConfigError> {
+    let bytes = path.as_os_str().as_bytes();
+    let rest = bytes
+        .strip_prefix(b"/")
+        .ok_or(ConfigError::WrongKind(Target::Directory))?;
+    if rest.is_empty() {
+        return Ok(Vec::new());
+    }
+    rest.split(|b| *b == b'/')
+        .map(|c| {
+            if c.is_empty() || c == b"." || c == b".." {
+                Err(ConfigError::WrongKind(Target::Directory))
+            } else {
+                Ok(c)
+            }
+        })
+        .collect()
+}
+
+impl DirChain {
+    /// `dir`（絶対パス）を、根から 1 段ずつ開く。
+    pub fn open(dir: &Path) -> Result<Self, ConfigError> {
+        Self::open_elements(&absolute_elements(dir)?)
+    }
+
+    /// 設定ファイル `path`（絶対パス）の親までを、根から 1 段ずつ開く（ファイル名の要素は開かない）。
+    fn open_file_parent(path: &Path) -> Result<Self, ConfigError> {
+        let mut elements = absolute_elements(path)?;
+        // ファイルの名前（最後の要素）は、親のハンドルから別に開く
+        elements.pop().ok_or(ConfigError::WrongKind(Target::File))?;
+        Self::open_elements(&elements)
+    }
+
+    fn open_elements(elements: &[&[u8]]) -> Result<Self, ConfigError> {
+        let unreadable = |e: io::Error| ConfigError::Unreadable(Target::Directory, e.kind());
+        let mut current = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+            .open("/")
+            .map_err(unreadable)?;
+        let mut metas = vec![current.metadata().map_err(unreadable)?];
+        for element in elements {
+            let c_name =
+                CString::new(*element).map_err(|_| ConfigError::WrongKind(Target::Directory))?;
+            // SAFETY: `current` は開いたままのディレクトリの FD、`c_name` は NUL で終わる文字列。戻り値の FD はこの関数の中で
+            // 1 度だけ `File` に包み、閉じる責任を `File` に移す。
+            let fd = unsafe {
+                libc::openat(
+                    current.as_raw_fd(),
+                    c_name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                let e = io::Error::last_os_error();
+                return Err(match e.raw_os_error() {
+                    // O_NOFOLLOW でリンクを開こうとすると、ELOOP か ENOTDIR（O_DIRECTORY と合わせたとき）になる
+                    Some(libc::ELOOP | libc::ENOTDIR) => ConfigError::WrongKind(Target::Directory),
+                    _ => unreadable(e),
+                });
+            }
+            // SAFETY: `fd` は上で開いたばかりの、他に持ち主のいない FD。
+            current = unsafe { File::from_raw_fd(fd) };
+            metas.push(current.metadata().map_err(unreadable)?);
+        }
+        // 最後の段（親）は、別の検査（持ち主・権限）を受けるので、ここでは親より上だけを控える
+        metas.pop();
+        let ancestors = metas
+            .into_iter()
+            .map(|m| {
+                if m.is_dir() {
+                    Ok((m.uid(), m.mode()))
+                } else {
+                    Err(ConfigError::WrongKind(Target::Directory))
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            parent: current,
+            ancestors,
+        })
+    }
+
+    /// 親より上の各ディレクトリを確かめる（近い順）。各ディレクトリは、持ち主が root か `file_owner`（設定ファイルの持ち主）で、
+    /// グループ・その他が書き込めないこと（root の持ち物のスティッキービット付き〔`/tmp` など〕は、書き込めてもよい。他人の持ち物を
+    /// 消せない）。親ディレクトリそのものは、[`check_rclone_config_for_uid`] と同じ検査（別に済ませる）。
+    pub fn check(&self, file_owner: u32) -> Result<(), ConfigError> {
+        for (uid, mode) in self.ancestors.iter().rev() {
+            if *uid != 0 && *uid != file_owner {
+                return Err(ConfigError::WrongOwner(Target::Directory));
+            }
+            let sticky_root = mode & 0o1000 != 0 && *uid == 0;
+            if mode & 0o022 != 0 && !sticky_root {
+                return Err(ConfigError::TooPermissive(Target::Directory));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `dir`（設定ファイルの親ディレクトリ）より上の、パスの途中の各ディレクトリを確かめる（root が取り込むとき）。根から 1 段ずつ
+/// 開いたハンドルで見る（[`DirChain`]。パスを引き直したり、リンクを解決したりしない）: 途中にシンボリックリンクがあれば断り、
+/// `..`・空の要素・相対パスも断る。各ディレクトリの条件は [`DirChain::check`]。
+pub fn check_ancestors(dir: &Path, file_owner: u32) -> Result<(), ConfigError> {
+    DirChain::open(dir)?.check(file_owner)
+}
+
+/// 取り込み（[`read_credentials`]）が取り出す 3 つの値。`Debug` は値を伏せる。
+pub struct ImportedCredentials {
+    pub client_id: String,
+    pub client_secret: String,
+    pub refresh_token: String,
+}
+
+impl std::fmt::Debug for ImportedCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ImportedCredentials { .. }")
+    }
+}
+
+/// rclone の設定ファイルの `[remote]` から、`client_id`・`client_secret`・`token` の `refresh_token` を取り出す
+/// （`import-credentials`。docs/note-photo-export/drive-api.md 2 章）。形の検査は起動時の検査と同じ（[`check_section`]）。
+///
+/// 持ち主: 設定ファイルはサービスのユーザーの持ち物で、取り込みは root が sudo で 1 回だけ動かす（持ち主が実行ユーザーと違う）。
+/// そこで **実行ユーザーが root のときは、持ち主を問わない**（権限は 0600／0700 相当を問う）。root でなければ、持ち主は実行ユーザー。
+/// 値は、エラーにも表示にも残さない。
+pub fn read_credentials(path: &Path, remote: &str) -> Result<ImportedCredentials, ConfigError> {
+    read_credentials_for_uid(path, remote, effective_uid())
+}
+
+/// [`read_credentials`] の、実行ユーザーを `uid` にする形（試験用）。
+pub fn read_credentials_for_uid(
+    path: &Path,
+    remote: &str,
+    uid: u32,
+) -> Result<ImportedCredentials, ConfigError> {
+    let text = read_config_text(path, uid, uid == 0)?;
+    credentials_from(&text, remote)
+}
+
+fn credentials_from(text: &str, remote: &str) -> Result<ImportedCredentials, ConfigError> {
+    check_section(text, remote)?;
+    // 形は検査済み（セクションは 1 つで、キーは重複せず、`key = value`）。値を拾う
+    let mut in_section = false;
+    let (mut id, mut secret, mut token) = (None, None, None);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_section = inner.trim() == remote;
+            continue;
+        }
+        if !in_section || line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().to_owned();
+        match key.trim() {
+            "client_id" => id = Some(value),
+            "client_secret" => secret = Some(value),
+            "token" => token = Some(value),
+            _ => {}
+        }
+    }
+    let token = token.ok_or(ConfigError::MissingKey("token"))?;
+    let refresh_token = serde_json::from_str::<serde_json::Value>(&token)
+        .ok()
+        .and_then(|v| v.get("refresh_token")?.as_str().map(str::to_owned))
+        .filter(|t| !t.is_empty())
+        .ok_or(ConfigError::EmptyValue("refresh_token"))?;
+    Ok(ImportedCredentials {
+        client_id: id.ok_or(ConfigError::MissingKey("client_id"))?,
+        client_secret: secret.ok_or(ConfigError::MissingKey("client_secret"))?,
+        refresh_token,
+    })
 }
 
 /// `dir` の下の `name`（1 つの名前）を、シンボリックリンクをたどらず、待たずに開く。
@@ -231,8 +471,9 @@ fn check_owner_and_mode(
     owner: u32,
     mode: u32,
     uid: u32,
+    any_owner: bool,
 ) -> Result<(), ConfigError> {
-    if owner != uid {
+    if owner != uid && !any_owner {
         return Err(ConfigError::WrongOwner(target));
     }
     if mode & 0o077 != 0 {
@@ -350,6 +591,42 @@ mod tests {
     use super::*;
 
     const GOOD: &str = "[gdrive]\ntype = drive\nclient_id = A\nclient_secret = B\ntoken = {}\n";
+
+    /// 試験用: root が取り込むときと同じ読み方（根から 1 段ずつ開いて、パスの途中も確かめる。持ち主は問わない）で、`[remote]` の
+    /// 3 つの値を取り出す。実行ユーザーが root でなくても、この読み方を通せる。本番のビルドには入れない（持ち主の検査を省く経路を
+    /// 残さない）。
+    fn read_credentials_via_chain(
+        path: &Path,
+        remote: &str,
+    ) -> Result<ImportedCredentials, ConfigError> {
+        let text = read_config_text_with(path, effective_uid(), true, true)?;
+        credentials_from(&text, remote)
+    }
+
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// `dir/rclone/rclone.conf`（親は 0700、ファイルは 0600）。
+    fn write_config(dir: &Path, content: &[u8]) -> std::path::PathBuf {
+        let parent = dir.join("rclone");
+        std::fs::create_dir_all(&parent).unwrap();
+        set_mode(&parent, 0o700);
+        let path = parent.join("rclone.conf");
+        std::fs::write(&path, content).unwrap();
+        set_mode(&path, 0o600);
+        path
+    }
+
+    const REFRESH: &str = "1//REFRESH-TOKEN-MARKER-33aa";
+
+    fn conf_text(remote: &str) -> String {
+        format!(
+            "[{remote}]\ntype = drive\nclient_id = CID-MARK\nclient_secret = SECRET-MARK\nscope = drive\n\
+             token = {{\"access_token\":\"ya29.X\",\"token_type\":\"Bearer\",\"refresh_token\":\"{REFRESH}\",\"expiry\":\"2030-01-01T00:00:00+09:00\"}}\n"
+        )
+    }
 
     #[test]
     fn a_section_with_both_values_passes() {
@@ -556,21 +833,24 @@ mod tests {
     #[test]
     fn owner_and_mode_are_checked_for_both_targets() {
         for target in [Target::File, Target::Directory] {
-            assert_eq!(check_owner_and_mode(target, 1000, 0o600, 1000), Ok(()));
             assert_eq!(
-                check_owner_and_mode(target, 1001, 0o600, 1000),
+                check_owner_and_mode(target, 1000, 0o600, 1000, false),
+                Ok(())
+            );
+            assert_eq!(
+                check_owner_and_mode(target, 1001, 0o600, 1000, false),
                 Err(ConfigError::WrongOwner(target))
             );
             for mode in [0o640, 0o604, 0o660, 0o666, 0o701, 0o710] {
                 assert_eq!(
-                    check_owner_and_mode(target, 1000, mode, 1000),
+                    check_owner_and_mode(target, 1000, mode, 1000, false),
                     Err(ConfigError::TooPermissive(target)),
                     "{mode:o}"
                 );
             }
             // 持ち主が違うときは、権限より先に持ち主を断る
             assert_eq!(
-                check_owner_and_mode(target, 0, 0o666, 1000),
+                check_owner_and_mode(target, 0, 0o666, 1000, false),
                 Err(ConfigError::WrongOwner(target))
             );
         }
@@ -596,6 +876,106 @@ mod tests {
             ConfigError::Unreadable(Target::File, io::ErrorKind::NotFound),
         ] {
             assert!(!e.to_string().is_empty());
+        }
+    }
+
+    /// root が取り込むときの読み方（根から 1 段ずつ開いたハンドルで、パスの途中も確かめる）を、root でない試験からも通す。
+    /// 検査したパスと、開いたファイルの経路が同じ（途中のリンクを解決した先を検査して、リンクを置いたディレクトリが検査から
+    /// 外れることがない）。
+    #[test]
+    fn the_file_is_opened_through_the_checked_chain_and_a_link_in_the_middle_is_refused() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let me = effective_uid();
+        // 検査は、根から下の全部のディレクトリを見る。この試験を置く場所の上に、グループが書き込めるディレクトリがあると、どんな読み方でも
+        // 通らない（環境による）。そこで、上の道が検査を通る置き場所を選ぶ（なければ、成功することの確認だけを省く）
+        let candidates = [std::env::temp_dir(), std::path::PathBuf::from("/tmp")];
+        let root = candidates.iter().find_map(|c| {
+            let real = std::fs::canonicalize(c).ok()?;
+            check_ancestors(&real, me).ok()?;
+            (std::fs::metadata(&real).ok()?.mode() & 0o022 == 0
+                || std::fs::metadata(&real).ok()?.mode() & 0o1000 != 0)
+                .then_some(real)
+        });
+        let (dir, usable) = match root {
+            Some(root) => {
+                let p = root.join(format!("export-import-chain-{}", std::process::id()));
+                let _ = std::fs::remove_dir_all(&p);
+                std::fs::create_dir_all(&p).unwrap();
+                set_mode(&p, 0o700);
+                (p, true)
+            }
+            None => {
+                eprintln!("上の道が検査を通る置き場所が無いので、成功することの確認は省く");
+                (
+                    {
+                        let p = std::env::temp_dir()
+                            .join(format!("export-import-chain-x-{}", std::process::id()));
+                        let _ = std::fs::remove_dir_all(&p);
+                        std::fs::create_dir_all(&p).unwrap();
+                        set_mode(&p, 0o700);
+                        std::fs::canonicalize(p).unwrap()
+                    },
+                    false,
+                )
+            }
+        };
+        // 実際のパス（途中のリンクを含まない形）で渡す
+        let base = dir.clone();
+        let conf = write_config(&base, conf_text("gdrive").as_bytes());
+        // 何も問題がなければ読める
+        if usable {
+            let got = read_credentials_via_chain(&conf, "gdrive").unwrap();
+            assert_eq!(got.refresh_token, REFRESH);
+        }
+
+        // 途中のディレクトリ（`base` の下の `up`）がシンボリックリンクなら、行き先が同じ中身でも断る
+        let up = base.join("up");
+        symlink(&base, &up).unwrap();
+        let via_link = up.join("rclone").join("rclone.conf");
+        assert!(via_link.exists());
+        assert_eq!(
+            read_credentials_via_chain(&via_link, "gdrive").unwrap_err(),
+            ConfigError::WrongKind(Target::Directory)
+        );
+        // 親ディレクトリそのものがリンクでも断る
+        let alias = base.join("alias");
+        symlink(base.join("rclone"), &alias).unwrap();
+        assert_eq!(
+            read_credentials_via_chain(&alias.join("rclone.conf"), "gdrive").unwrap_err(),
+            ConfigError::WrongKind(Target::Directory)
+        );
+        // 途中のディレクトリを、グループが書き込める → 断る（その下の親ディレクトリは 0700 のまま）
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o770)).unwrap();
+        assert_eq!(
+            read_credentials_via_chain(&conf, "gdrive").unwrap_err(),
+            ConfigError::TooPermissive(Target::Directory)
+        );
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if usable {
+            assert!(read_credentials_via_chain(&conf, "gdrive").is_ok());
+        }
+        // `..` や空の要素を含むパスは断る
+        for bad in [
+            format!("{}/rclone/../rclone/rclone.conf", base.display()),
+            format!("{}//rclone/rclone.conf", base.display()),
+            format!("{}/./rclone/rclone.conf", base.display()),
+        ] {
+            assert_eq!(
+                read_credentials_via_chain(std::path::Path::new(&bad), "gdrive").unwrap_err(),
+                ConfigError::WrongKind(Target::Directory),
+                "{bad}"
+            );
+        }
+        // ファイルがシンボリックリンクなら断る（ファイル名の要素も、リンクをたどらない）
+        let real = base.join("rclone").join("rclone.conf");
+        let swapped = base.join("rclone").join("other.conf");
+        symlink(&real, &swapped).unwrap();
+        assert_eq!(
+            read_credentials_via_chain(&swapped, "gdrive").unwrap_err(),
+            ConfigError::WrongKind(Target::File)
+        );
+        if usable {
+            let _ = std::fs::remove_dir_all(&base);
         }
     }
 }

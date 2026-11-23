@@ -93,7 +93,16 @@ fn show(settings: &Settings, store: &JobStore, out: &mut dyn Write) -> u8 {
              退かすまで、新しい書き出しは断られます。"
         );
     }
-    let remote = Remote::new(settings);
+    let remote = match Remote::new(settings) {
+        Ok(r) => r,
+        Err(_) => {
+            let _ = writeln!(
+                out,
+                "Drive の資格情報を読めません。--drive-credentials のファイルを確かめてください。"
+            );
+            return EXIT_REFUSED;
+        }
+    };
     // 古いほうから
     for rec in scan.records.iter().rev() {
         if !(rec.is_unfinished() || rec.is_blocking()) {

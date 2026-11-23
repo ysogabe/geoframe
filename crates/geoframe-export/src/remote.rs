@@ -1,30 +1,35 @@
-//! Drive の操作の入口と、その周りの中立の型（design.md 4.2「Drive の操作」）。
+//! Drive の操作の入口と、その周りの中立の型（design.md 4.2「Drive の操作」、docs/note-photo-export/drive-api.md）。
 //!
-//! 呼び出し側（[`crate::drive`]・[`crate::publish`]・[`crate::flow`]・[`crate::recover`]）は、どの実装で Drive を操作しているかを
-//! 知らずに、このモジュールの [`Remote`] だけを持ち回る。今の中身は [`crate::rclone::Rclone`]（rclone の子プロセス）を包むだけ。
-//! 実装を差し替える仕組み（trait・実行時の切り替え）は持たない。
+//! 呼び出し側（[`crate::drive`]・[`crate::publish`]・[`crate::flow`]・[`crate::recover`]）は、このモジュールの [`Remote`] だけを
+//! 持ち回る。中身は [`crate::drive::api::DriveApi`]（Drive API v3 を HTTPS で直接呼ぶ。フォルダ・ファイルは **Drive の ID** で指す）。
+//! 実装を差し替える仕組み（trait・実行時の切り替え）は持たない。rclone の子プロセスを呼ぶ [`crate::rclone`] は、バイナリからは
+//! 使わない（3 段目で消す）。
 //!
-//! ## 中立の操作
+//! ## 操作（どれも ID で指す。パスは使わない）
 //!
-//! | 操作 | 意味 | rclone のコマンド |
+//! | 操作 | 意味 | Drive API |
 //! |---|---|---|
-//! | `list` | 一覧（再帰・ショートカットの扱い・MD5 を選べる） | `lsjson` |
-//! | `read` | ファイルの先頭を読む | `cat` |
-//! | `create_folder` | フォルダを作る（親も） | `mkdir` |
-//! | `upload` | 作業領域のファイルを送る | `copy` |
-//! | `move_to` | フォルダを移す | `moveto` |
-//! | `trash` | フォルダをゴミ箱へ移す | `purge --drive-use-trash=true` |
+//! | `list_children` | 親の直下の一覧（ゴミ箱の中は出ない） | `files.list` |
+//! | `list_tree` | 親の下を再帰で | `files.list` を幅優先で |
+//! | `get` | ID で 1 件 | `files.get` |
+//! | `read` | ファイルの中身 | `files.get?alt=media` |
+//! | `create_folder` | 親の下にフォルダを作る | `files.generateIds` ＋ `files.create` |
+//! | `upload` | 手元のファイルを送る | `files.create`（multipart／resumable） |
+//! | `move_to` | 親と名前を変える（ID は保たれる） | `files.update`（`addParents`・`removeParents`） |
+//! | `trash` | Drive のゴミ箱へ移す | `files.update`（`trashed: true`） |
 //!
-//! ここに置くのは、実装に依らない型と検査だけ: 一覧の 1 項目（[`Entry`]）、検査済みの場所（[`RemoteLoc`]）、Drive の ID・MD5・
-//! 相対パスの形の検査、MIME タイプの定数、操作の失敗（[`RemoteError`]）と、それをジョブのエラーにする対応。
-//! rclone の引数の組み立て・子プロセス・標準エラーの伏せ字は [`crate::rclone`]。
+//! ここに置くのは、実装に依らない型と検査だけ: 一覧の 1 項目（[`Entry`]）、Drive の ID・MD5・相対パスの形の検査、MIME タイプの定数、
+//! 操作の失敗（[`RemoteError`]）と、それをジョブのエラーにする対応。`RemoteLoc`（`remote:パス` の形の場所）と [`DIRECTORY_MIME`] は、
+//! rclone 版（[`crate::rclone`]）だけが使う。
 
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::cancel::Cancel;
+use crate::drive::api::{DriveApi, FileMeta, Limit};
+use crate::drive::auth::Credentials;
+use crate::drive::http::{ApiError, Deadline, Retry};
 use crate::error::{ErrorCode, ExportError};
-use crate::rclone::Rclone;
 use crate::settings::{RemotePath, Settings};
 
 /// Drive のショートカットの MIME タイプ。
@@ -140,118 +145,212 @@ pub enum RemoteError {
     NotFound,
     /// 終了コードが 0 以外（シグナルで終わったときは -1）。
     Exit(i32),
-    /// 標準出力が上限を超えた、または `lsjson` の出力が決められた形でない。
+    /// 標準出力が上限を超えた、または `lsjson` の出力・API の応答が決められた形でない。
     BadOutput,
+    /// 読み出したファイルが、決めた上限を超えた（[`Remote::read`]。呼び出し側は「一覧の大きさと違う」と同じに扱う）。
+    TooLarge,
     /// キャンセルの印（SIGINT・SIGTERM）が立った（起動の前、または kill して `wait` し終えた）。結果は分からない
     /// （`copy`・`moveto` は、Drive 側で済んでいるかもしれない）ので、呼び出し側は失敗として確定せず、復旧の表に渡す。
     Cancelled,
+    /// Drive の認可が失効している（OAuth の更新トークンが `invalid_grant` など）。再認可が要る。照会でも書き込みでも
+    /// `drive_auth_invalid`（[`crate::drive::api::DriveApi`] だけが返す。rclone 版は返さない）。
+    AuthInvalid,
+    /// Drive API の要求が失敗した（通信の失敗・状態コード・書き込みのあとの照合の不一致）。再試行は使い切ったあと。
+    /// （[`crate::drive::api::DriveApi`] だけが返す。）
+    Failed,
+    /// 移動・ゴミ箱へ移すが、処理されていないと分かる応答（429・流量制限の 403・401）を受けた。API の層は再送していない。
+    /// 呼び出し側（[`crate::drive`]）も再送せず、5xx・通信断の結果不明と同じに扱う（[`RemoteError::into_op_error`] は
+    /// `rclone_failed`。復旧の表に任せる）。
+    NotProcessed {
+        throttled: bool,
+        retry_after: Option<Duration>,
+    },
 }
 
 impl RemoteError {
-    /// 照会（`lsjson`・`cat`）の失敗を、ジョブのエラーにする。「無い」と取り違えないよう、`drive_unavailable`。
+    /// 照会（一覧・読み出し）の失敗を、ジョブのエラーにする。「無い」と取り違えないよう、`drive_unavailable`。
+    /// 認可の失効は `drive_auth_invalid`、ジョブ全体の期限は `timeout`。
     pub fn into_query_error(self) -> ExportError {
         match self {
             Self::JobDeadline => ExportError::from(ErrorCode::Timeout),
+            Self::AuthInvalid => ExportError::from(ErrorCode::DriveAuthInvalid),
             _ => ExportError::new(
                 ErrorCode::DriveUnavailable,
-                "Drive に照会できません（rclone の失敗）",
+                "Drive に照会できません（API の失敗）",
             ),
         }
     }
 
-    /// 書き込み（`mkdir`・`copy`・`moveto`・`purge`）の失敗を、ジョブのエラーにする。
+    /// 書き込み（フォルダの作成・送信・移動・ゴミ箱へ移す）の失敗を、ジョブのエラーにする。操作の期限は `rclone_timeout`
+    /// （綴りは呼び出し側との契約で変えない。意味は「Drive の操作が期限内に終わらない」）、ジョブ全体の期限は `timeout`、
+    /// 認可の失効は `drive_auth_invalid`、それ以外は `rclone_failed`（同じく、意味は「Drive の変更系の操作の失敗」）。
     pub fn into_op_error(self) -> ExportError {
         match self {
             Self::Timeout => ExportError::from(ErrorCode::RcloneTimeout),
             Self::JobDeadline => ExportError::from(ErrorCode::Timeout),
+            Self::AuthInvalid => ExportError::from(ErrorCode::DriveAuthInvalid),
             _ => ExportError::from(ErrorCode::RcloneFailed),
         }
     }
 }
 
-/// Drive の操作の入口。`Clone` できる（期限だけを替えた複製を作れる）。今の中身は rclone。
+/// Drive の操作の入口。`Clone` は安い（接続・トークンは共有。キャンセルの印・期限は複製ごと）。中身は Drive API（ID で指す）。
 #[derive(Debug, Clone)]
 pub struct Remote {
-    inner: Rclone,
+    api: DriveApi,
 }
 
 impl Remote {
-    /// 設定から作る。
-    pub fn new(settings: &Settings) -> Self {
-        Self {
-            inner: Rclone::new(settings),
-        }
+    /// 設定から作る。資格情報のファイルを読む（検査に通らなければ [`RemoteError::Spawn`]。ファイルは書かない）。
+    /// 期限は `--drive-upload-timeout`・`--drive-timeout`。
+    pub fn new(settings: &Settings) -> Result<Self, RemoteError> {
+        let credentials = Credentials::load(&settings.drive_credentials).map_err(ApiError::from)?;
+        let api = DriveApi::new(credentials, settings.endpoints())
+            .with_timeouts(settings.drive_upload_timeout, settings.drive_timeout);
+        Ok(Self { api })
+    }
+
+    /// 中身の [`DriveApi`]（起動時の検査が、失敗の種類を細かく見る）。
+    pub fn api(&self) -> &DriveApi {
+        &self.api
+    }
+
+    /// 作った [`DriveApi`] を包む（試験用）。
+    #[doc(hidden)]
+    pub fn from_api(api: DriveApi) -> Self {
+        Self { api }
     }
 
     /// `dry_run` 用: 照会の期限を 30 秒にする（design.md 6.1）。送信（`upload`）は使わない。
-    pub fn for_dry_run(settings: &Settings) -> Self {
+    pub fn for_dry_run(&self) -> Self {
+        let upload = self.api.upload_timeout().min(DRY_RUN_TIMEOUT);
+        let query = self.api.query_timeout().min(DRY_RUN_TIMEOUT);
         Self {
-            inner: Rclone::for_dry_run(settings),
+            api: self.api.clone().with_timeouts(upload, query),
         }
     }
 
-    /// 期限（操作ごとの期限）を指定して作る（試験用）。
+    /// 期限（操作ごとの期限）を指定して作る。
     #[doc(hidden)]
-    pub fn with_timeouts(self, upload: Duration, other: Duration) -> Self {
+    pub fn with_timeouts(self, upload: Duration, query: Duration) -> Self {
         Self {
-            inner: self.inner.with_timeouts(upload, other),
+            api: self.api.with_timeouts(upload, query),
         }
     }
 
-    /// キャンセルの印（SIGINT・SIGTERM）を共有する。立つと、起動の前なら始めず、実行中なら止めて、[`RemoteError::Cancelled`] を返す。
+    /// 再試行の方針を替える（試験が待たずに済むように）。
+    #[doc(hidden)]
+    pub fn with_retry(self, retry: Retry) -> Self {
+        Self {
+            api: self.api.with_retry(retry),
+        }
+    }
+
+    /// 一覧のページの大きさ・multipart の上限・チャンクの大きさを替える（試験用）。
+    #[doc(hidden)]
+    pub fn with_sizes(self, page_size: u32, multipart_max: u64, chunk_size: u64) -> Self {
+        Self {
+            api: self.api.with_sizes(page_size, multipart_max, chunk_size),
+        }
+    }
+
+    /// キャンセルの印（SIGINT・SIGTERM）を共有する。立つと、要求の前・再試行の待ち・チャンクの間で止まって
+    /// [`RemoteError::Cancelled`] を返す（要求の最中には見ない。1 回の要求の上限は [`crate::drive::api::CHUNK_REQUEST_CAP`] など）。
     pub fn with_cancel(self, cancel: Cancel) -> Self {
         Self {
-            inner: self.inner.with_cancel(cancel),
+            api: self.api.with_cancel(cancel),
         }
     }
 
     /// キャンセルの印が立っているか（復旧の待ちが、眠らずに止まるために見る）。
     pub fn is_cancelled(&self) -> bool {
-        self.inner.is_cancelled()
+        self.api.is_cancelled()
     }
 
-    /// ジョブ全体の期限を掛けた複製。過ぎたあとの操作は `JobDeadline`、実行中に過ぎれば止めて `JobDeadline`。
+    /// ジョブ全体の期限を掛けた複製。過ぎたあとの操作は `JobDeadline`。
     pub fn with_deadline(&self, deadline: Option<Instant>) -> Self {
         Self {
-            inner: self.inner.with_deadline(deadline),
+            api: self.api.with_job_deadline(deadline),
         }
     }
 
-    /// 一覧。`skip_shortcuts` が偽のときは、ショートカットも一覧に出る。`hash` が真なら、ファイルの MD5 も出す（中身の照合に使う
-    /// 一覧だけ）。場所が無ければ `NotFound`、応答が決められた形でなければ `BadOutput`。
-    pub fn list(
+    /// アクセストークンを 1 回取る（起動時の確認）。認可の失効は [`RemoteError::AuthInvalid`]。
+    pub fn check_credentials(&self) -> Result<(), RemoteError> {
+        Ok(self
+            .api
+            .check_credentials(self.api.deadline(Limit::Query))?)
+    }
+
+    /// `parent` の直下の一覧（ゴミ箱の中は出ない。ショートカットも 1 件として出る）。
+    pub fn list_children(&self, parent: &str) -> Result<Vec<Entry>, RemoteError> {
+        Ok(self
+            .api
+            .list_children(parent, self.api.deadline(Limit::Query))?)
+    }
+
+    /// `root` の下の全部（再帰。`Entry.path` は `root` からの相対パス）。
+    pub fn list_tree(&self, root: &str) -> Result<Vec<Entry>, RemoteError> {
+        Ok(self.api.list_tree(root, self.api.deadline(Limit::Query))?)
+    }
+
+    /// ID で 1 件（ゴミ箱の中でも返る。`trashed`・`parents` つき）。
+    pub fn get(&self, id: &str) -> Result<FileMeta, RemoteError> {
+        Ok(self.api.get(id, self.api.deadline(Limit::Query))?)
+    }
+
+    /// ファイルの中身。`max_bytes` を超えれば [`RemoteError::TooLarge`]。
+    pub fn read(&self, id: &str, max_bytes: u64) -> Result<Vec<u8>, RemoteError> {
+        Ok(self
+            .api
+            .read(id, max_bytes, self.api.deadline(Limit::Query))?)
+    }
+
+    /// `parent` の下にフォルダを作り、その ID を返す（応答を失った再送でも重複しない）。
+    pub fn create_folder(&self, parent: &str, name: &str) -> Result<String, RemoteError> {
+        Ok(self
+            .api
+            .create_folder(parent, name, self.api.deadline(Limit::Query))?)
+    }
+
+    /// 写真の送信全体の締め切り（`--drive-upload-timeout` とジョブの期限の早いほう）。**送信全体で 1 つ作って**、写真ごとの
+    /// [`Remote::upload`] に同じものを渡す（ファイルごとに作ると期限が延びる）。
+    pub fn upload_deadline(&self) -> Deadline {
+        self.api.deadline(Limit::Upload)
+    }
+
+    /// `parent` の下に `local` を `name` で送り、その ID を返す。`md5`・`size` は送る中身の MD5 と大きさ。
+    pub fn upload(
         &self,
-        loc: &RemoteLoc,
-        recursive: bool,
-        skip_shortcuts: bool,
-        hash: bool,
-    ) -> Result<Vec<Entry>, RemoteError> {
-        self.inner.lsjson(loc, recursive, skip_shortcuts, hash)
+        parent: &str,
+        name: &str,
+        local: &Path,
+        md5: &str,
+        size: u64,
+        deadline: Deadline,
+    ) -> Result<String, RemoteError> {
+        Ok(self.api.upload(parent, name, local, md5, size, deadline)?)
     }
 
-    /// ファイルの先頭の `max_bytes + 1` バイトまでを読む（`max_bytes` を超えるかどうかは、返った長さで分かる）。
-    pub fn read(&self, loc: &RemoteLoc, max_bytes: u64) -> Result<Vec<u8>, RemoteError> {
-        self.inner.cat(loc, max_bytes)
+    /// `id` を `from_parent` から `to_parent` へ、`new_name` にして移す（ID は保たれる）。
+    pub fn move_to(
+        &self,
+        id: &str,
+        from_parent: &str,
+        to_parent: &str,
+        new_name: &str,
+    ) -> Result<(), RemoteError> {
+        Ok(self.api.move_to(
+            id,
+            from_parent,
+            to_parent,
+            new_name,
+            self.api.deadline(Limit::Query),
+        )?)
     }
 
-    /// フォルダを作る（親が無ければ親も）。
-    pub fn create_folder(&self, loc: &RemoteLoc) -> Result<(), RemoteError> {
-        self.inner.mkdir(loc)
-    }
-
-    /// 作業領域（ローカルのディレクトリ。絶対パス）を `dst` へ送る。
-    pub fn upload(&self, src: &Path, dst: &RemoteLoc, scope: CopyScope) -> Result<(), RemoteError> {
-        self.inner.copy(src, dst, scope)
-    }
-
-    /// フォルダを移す。
-    pub fn move_to(&self, src: &RemoteLoc, dst: &RemoteLoc) -> Result<(), RemoteError> {
-        self.inner.moveto(src, dst)
-    }
-
-    /// フォルダを Drive のゴミ箱へ移す。
-    pub fn trash(&self, loc: &RemoteLoc) -> Result<(), RemoteError> {
-        self.inner.purge(loc)
+    /// `id` を Drive のゴミ箱へ移す（完全な削除ではない）。
+    pub fn trash(&self, id: &str) -> Result<(), RemoteError> {
+        Ok(self.api.trash(id, self.api.deadline(Limit::Query))?)
     }
 }
 
@@ -378,6 +477,27 @@ mod tests {
         assert_eq!(
             RemoteError::JobDeadline.into_query_error().code,
             ErrorCode::Timeout
+        );
+    }
+
+    #[test]
+    fn auth_failures_map_to_drive_auth_invalid_for_queries_and_writes() {
+        assert_eq!(
+            RemoteError::AuthInvalid.into_query_error().code,
+            ErrorCode::DriveAuthInvalid
+        );
+        assert_eq!(
+            RemoteError::AuthInvalid.into_op_error().code,
+            ErrorCode::DriveAuthInvalid
+        );
+        // API の要求の失敗は、照会なら drive_unavailable、書き込みなら rclone_failed
+        assert_eq!(
+            RemoteError::Failed.into_query_error().code,
+            ErrorCode::DriveUnavailable
+        );
+        assert_eq!(
+            RemoteError::Failed.into_op_error().code,
+            ErrorCode::RcloneFailed
         );
     }
 }

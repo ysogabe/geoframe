@@ -11,7 +11,7 @@
 //! RFC 3339）・`started_ns`（並べ替えと間引きの順を決める、ナノ秒の UNIX 時刻。文字列の比較では決めない。同じ値は `job_id` で決める）・段階（`progress`。
 //! [`crate::publish::ProgressSink`] の実装が書く）・`summary`（公開の前に分かった数。起動時の復旧が、止まったジョブを
 //! 成功にするときの結果に使う）・`result`（6.1 の形）・`error`（コードだけ。説明は固定の短い文を [`ErrorCode::message`] から
-//! 作る。rclone の出力は入れない）・`blocked`（`blocked` にしたときの理由と、`recover` が出す説明）・`resolved_at`
+//! 作る。Drive の応答の本文は入れない）・`blocked`（`blocked` にしたときの理由と、`recover` が出す説明）・`resolved_at`
 //! （`recover --resolve` で解除した日時）・`notes`（結果に添える知らせ。残った `incoming`、公開の記録に書けなかった、など）。
 //!
 //! ## 間引き・blocked

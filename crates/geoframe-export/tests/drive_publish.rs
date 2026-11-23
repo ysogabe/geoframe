@@ -1,10 +1,10 @@
 //! T4: 宛先の状態、管理しているフォルダの見分け方、incoming → 検証 → 公開、置き換えの退避とゴミ箱、失敗のあとの復旧、dry_run
-//! （design.md 4.2、10 章の AC5・AC6・AC10）。偽の rclone（`fake-rclone/`）と偽の Drive だけを使う。
-//! 本物の rclone・Drive・ネットワークには触れない。
+//! （design.md 4.2、10 章の AC5・AC6・AC10）。試験のプロセスの中の偽の Drive の HTTP サーバー（`tests/common/fake_drive.rs`）だけを使う。
+//! 本物の Google・ネットワークには触れない。
 //!
-//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る
-//! （`Env::ops`・`mutating_ops`・`ops_used`・`op_count`）。`// rclone 固有` と書いた確認（`rclone_calls`・
-//! `assert_rclone_safe_calls`）と、そう書いた試験だけが、rclone の引数・環境変数を見る。それらは rclone 版を消すときに消す。
+//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`。読むだけの `get`・`generate_ids`・
+//! `token` も混ざる）で見る（`Env::ops`・`mutating_ops`・`ops_used`・`op_count`）。API の呼び出しの形（Authorization・名前で絞らない・
+//! 完全な削除と中身の更新が無い）は `Env::assert_api_calls_safe`。送信は 1 ファイルが 1 回の `upload`（ファイルごと）で、manifest は最後。
 
 mod common;
 
@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 
 use common::drive::model::{self, Kind};
 use common::drive::*;
+use common::fake_drive::{self as fk, do_then_add_folder, do_then_swap_folder, late_then_fail};
 use geoframe_export::drive::{Managed, Target};
 use geoframe_export::error::ErrorCode;
 use geoframe_export::publish::{
@@ -19,7 +20,6 @@ use geoframe_export::publish::{
     dry_run, publish,
 };
 use geoframe_export::recovery::{BlockedReason, Progress, Stage};
-use geoframe_export::remote::Remote;
 use geoframe_export::request::{Destination, OnExists};
 use serde_json::{Value, json};
 
@@ -186,13 +186,16 @@ fn absent_destination_is_published_in_the_documented_order() {
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Error, &mut hook));
 
-    // 各段階の記録が、その段階の Drive の操作より先（1 本の順番で確かめる）。uploading は 2 回
+    // 各段階の記録が、その段階の Drive の操作より先（1 本の順番で確かめる）。uploading は 2 回。フォルダは `incoming/` と
+    // `incoming/<job_id>` の 2 つを作り、写真 2 枚と manifest は 1 ファイルずつ送る
     assert_eq!(
         env.mutating_ops(),
         [
             "record:uploading",
             "create_folder",
+            "create_folder",
             "record:uploading",
+            "upload",
             "upload",
             "upload",
             "record:verifying",
@@ -232,39 +235,42 @@ fn absent_destination_is_published_in_the_documented_order() {
         Some(incoming_id.as_str())
     );
 
-    // 呼び方: copy・moveto に --immutable、manifest は最後に別の呼び出し、位置の引数は固定の接頭辞＋検査済みの名前だけ
-    let ws = set.dir.to_string_lossy().into_owned();
-    let incoming = format!("gdrive:geoframe-export-work/incoming/{JOB_A}");
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    let copies = env.rclone_calls("copy");
-    assert_eq!(copies.len(), 2);
-    for c in &copies {
-        assert!(c.contains(&"--immutable".to_owned()));
-        let d = c.iter().position(|a| a == "--").unwrap();
-        assert_eq!(&c[d + 1..], [ws.clone(), incoming.clone()]);
-    }
-    assert!(
-        copies[0]
-            .windows(2)
-            .any(|w| w == ["--exclude", "/manifest.json"])
-    );
-    assert!(
-        copies[1]
-            .windows(2)
-            .any(|w| w == ["--include", "/manifest.json"])
-    );
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    let mv = &env.rclone_calls("moveto")[0];
-    assert!(mv.contains(&"--immutable".to_owned()));
-    let d = mv.iter().position(|a| a == "--").unwrap();
+    // 呼び方（API）: 写真はファイルごとに送り（並びは問わない）、manifest は最後。送り先は incoming/<job_id> の下の葉の名前。
+    // 移動は ID を保った 1 回の更新（親と名前を変える）で、宛先のフォルダの ID は incoming の ID のまま（上で確かめた）
+    let incoming = format!("geoframe-export-work/incoming/{JOB_A}");
+    let sent = env.uploaded_subjects();
+    assert_eq!(sent.len(), 3);
+    assert_eq!(sent[2], format!("{incoming}/manifest.json"));
+    let mut photos = sent[..2].to_vec();
+    photos.sort();
     assert_eq!(
-        &mv[d + 1..],
-        [incoming, format!("gdrive:yamareco/{FOLDER}")]
+        photos,
+        [
+            format!("{incoming}/090000_1.jpg"),
+            format!("{incoming}/090100_2.jpg")
+        ]
     );
-    // 共有・リンクの操作は呼ばない。使ったのは決まったコマンドだけ
-    assert_eq!(env.ops_used(), ["create_folder", "list", "move", "upload"]);
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    assert_rclone_safe_calls(&env);
+    let moves: Vec<Value> = env
+        .http_calls()
+        .into_iter()
+        .filter(|c| c["op"] == "move")
+        .collect();
+    assert_eq!(moves.len(), 1);
+    assert_eq!(moves[0]["subject"], incoming);
+    // 共有・リンクの操作は呼ばない。使ったのは決まった操作だけ
+    assert_eq!(
+        env.ops_used(),
+        [
+            "create_folder",
+            "generate_ids",
+            "list",
+            "move",
+            "token",
+            "upload"
+        ]
+    );
+    // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+    env.assert_api_calls_safe();
 }
 
 #[test]
@@ -299,7 +305,7 @@ fn a_period_with_date_subfolders_is_published_and_verified() {
 
 #[test]
 fn an_existing_destination_is_a_conflict_by_default_and_nothing_is_written() {
-    // 中身のあるフォルダ・空のフォルダ。どちらも、copy・moveto・purge・mkdir は呼ばれず、記録も書かれない
+    // 中身のあるフォルダ・空のフォルダ。どちらも、フォルダの作成・送信・移動・ゴミ箱へ移すは呼ばれず、記録も書かれない
     for (name, with_files) in [("files", true), ("empty", false)] {
         let env = Env::new(&format!("exists-{name}"));
         let set = env.make_set("e", Y, FOLDER, PHOTOS);
@@ -316,10 +322,10 @@ fn an_existing_destination_is_a_conflict_by_default_and_nothing_is_written() {
         assert_eq!(reason, ConflictReason::Exists, "{name}");
         assert_eq!(files, if with_files { 3 } else { 0 }, "{name}");
         assert_eq!(env.mutating_ops(), Vec::<String>::new(), "{name}");
-        assert_eq!(env.ops_used(), ["list"], "{name}");
+        assert_eq!(env.ops_used(), ["list", "token"], "{name}");
         assert_eq!(dest_id(&env).as_deref(), Some(id.as_str()));
-        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-        assert_rclone_safe_calls(&env);
+        // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+        env.assert_api_calls_safe();
     }
 }
 
@@ -358,11 +364,15 @@ fn replace_calls_in_the_documented_order_and_trashes_the_old_folder() {
         [
             "record:uploading",
             "create_folder",
+            "create_folder",
             "record:uploading",
+            "upload",
             "upload",
             "upload",
             "record:verifying",
             "record:retiring",
+            // `replaced/` が無いので、退避の前に作る
+            "create_folder",
             "move",
             "record:publishing",
             "move",
@@ -389,8 +399,9 @@ fn replace_calls_in_the_documented_order_and_trashes_the_old_folder() {
     let d = env.drive();
     assert_eq!(d.trashed, std::slice::from_ref(&old_id));
     assert!(d.deleted.is_empty());
+    // ゴミ箱の中のものは、Drive の一覧には出ない（模型には、ゴミ箱の印つきで残る）
     let replaced = d.resolve(&["geoframe-export-work", "replaced"]).unwrap();
-    assert!(d.children(&replaced).is_empty());
+    assert!(d.children(&replaced).iter().all(|n| d.is_trashed(&n.id)));
     assert!(
         d.resolve(&["geoframe-export-work", "incoming", JOB_A])
             .is_none()
@@ -402,35 +413,33 @@ fn replace_calls_in_the_documented_order_and_trashes_the_old_folder() {
         Some(incoming_id.as_str())
     );
 
-    // 呼び方: 退避は宛先 → replaced/<種類>-<フォルダ名>-<job_id>、purge は --drive-use-trash=true
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    let moves = env.rclone_calls("moveto");
-    let tail = |c: &Vec<String>| c[c.iter().position(|a| a == "--").unwrap() + 1..].to_vec();
+    // 呼び方（API）: 退避は旧フォルダの ID を、宛先の親から replaced/ へ、名前を <種類>-<フォルダ名>-<job_id> にして移す。
+    // ゴミ箱へは、同じ旧フォルダの ID を `trashed: true` の更新で移す（完全な削除ではない）
+    let moves: Vec<Value> = env
+        .http_calls()
+        .into_iter()
+        .filter(|c| c["op"] == "move")
+        .collect();
+    assert_eq!(moves.len(), 2);
+    assert_eq!(moves[0]["subject"], format!("yamareco/{FOLDER}"));
     assert_eq!(
-        tail(&moves[0]),
-        [
-            format!("gdrive:yamareco/{FOLDER}"),
-            format!("gdrive:geoframe-export-work/replaced/yamareco-{FOLDER}-{JOB_A}")
-        ]
+        moves[1]["subject"],
+        format!("geoframe-export-work/incoming/{JOB_A}")
     );
+    let retired = format!("geoframe-export-work/replaced/yamareco-{FOLDER}-{JOB_A}");
+    let trashes: Vec<Value> = env
+        .http_calls()
+        .into_iter()
+        .filter(|c| c["op"] == "trash")
+        .collect();
+    assert_eq!(trashes.len(), 1);
+    assert_eq!(trashes[0]["subject"], retired);
     assert_eq!(
-        tail(&moves[1]),
-        [
-            format!("gdrive:geoframe-export-work/incoming/{JOB_A}"),
-            format!("gdrive:yamareco/{FOLDER}")
-        ]
+        env.drive().path_of(&old_id).as_deref(),
+        Some(retired.as_str()),
+        "ID が保たれたまま、退避先にある（ゴミ箱の中）"
     );
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    let purge = &env.rclone_calls("purge")[0];
-    assert!(purge.contains(&"--drive-use-trash=true".to_owned()));
-    assert_eq!(
-        tail(purge),
-        [format!(
-            "gdrive:geoframe-export-work/replaced/yamareco-{FOLDER}-{JOB_A}"
-        )]
-    );
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    assert_rclone_safe_calls(&env);
+    env.assert_api_calls_safe();
 }
 
 // ---- 各段階の記録が書けなければ、その段階の操作はしない ----
@@ -454,7 +463,12 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
     assert_eq!(f.error.code, ErrorCode::Internal);
     assert_eq!(
         env.mutating_ops(),
-        ["record:uploading", "create_folder", "record:uploading"]
+        [
+            "record:uploading",
+            "create_folder",
+            "create_folder",
+            "record:uploading"
+        ]
     );
     assert!(f.leftover_incoming);
     let left = env
@@ -589,17 +603,19 @@ fn a_late_move_makes_two_listings_differ_so_the_service_waits_and_looks_again() 
     let env = Env::new("late");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     // 移動は失敗で終わり、Drive 側では数回の一覧のあとに反映される。1 回目の観察の途中で反映される
-    env.add_rule("move", 0, 1, late_then_fail(3));
+    env.add_rule("move", 0, u64::MAX, late_then_fail(3));
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Error, &mut hook));
     let incoming_id = hook.records[1].incoming_id.clone().unwrap();
     assert_eq!(p.folder_id, incoming_id);
     assert_eq!(dest_id(&env).as_deref(), Some(incoming_id.as_str()));
-    // 2 つの観察が食い違ったので、やり直した（失敗のあとの lsjson が、1 回分の観察の数より多い）
+    // 2 つの観察が食い違ったので、やり直した（失敗のあとの一覧が、1 回分の観察の数より多い）。移動は 1 回だけ送る（結果が
+    // 分からない失敗のあとに、API の層が再送しない）。1 回の観察は 4 回の一覧、2 回で 1 組（8 回）なので、2 組以上
+    assert_eq!(env.op_count("move"), 1, "移動を再送しない");
     let seq = env.ops();
     let after_move = seq.iter().rposition(|c| c == "move").unwrap();
     let lists_after = seq[after_move..].iter().filter(|c| *c == "list").count();
-    assert!(lists_after >= 18, "{lists_after}");
+    assert!(lists_after >= 16, "{lists_after}");
     assert!(
         !seq[after_move..].contains(&"trash".to_owned()),
         "公開済みの incoming を消さない"
@@ -611,7 +627,7 @@ fn a_move_that_never_shows_up_is_treated_as_not_done_and_incoming_is_cleaned() {
     // 2 回の観察が同じなら、その状態に表を当てはめる（移動は実行されなかったと見る）。失敗は元のまま返る
     let env = Env::new("stale");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("move", 0, 1, late_then_fail(100_000));
+    env.add_rule("move", 0, u64::MAX, late_then_fail(100_000));
     let mut hook = Hook::new(&env);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::RcloneFailed);
@@ -623,10 +639,12 @@ fn a_move_that_never_shows_up_is_treated_as_not_done_and_incoming_is_cleaned() {
 // ---- 照合できない → blocked ----
 
 #[test]
-fn a_file_by_file_publish_move_is_found_by_the_id_check_and_blocks() {
-    let env = Env::new("filewise-publish");
+fn a_same_named_folder_created_right_after_the_publish_move_is_found_by_the_id_check_and_blocks() {
+    // 公開の移動は済んだが、その直後（確かめる前）に、オーナーが宛先に同じ名前のフォルダを作った。移動は ID で行うので、写真が足される
+    // ことはなく、宛先に同名のフォルダが 2 つ並ぶ。移したあとの照合（宛先が incoming の ID のフォルダ 1 つだけ）が見つけて、blocked にする
+    let env = Env::new("dup-after-publish");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("move", 0, 1, filewise());
+    env.add_rule("move", 0, 1, do_then_add_folder(&["yamareco"], FOLDER));
     let mut hook = Hook::new(&env);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Blocked);
@@ -635,23 +653,33 @@ fn a_file_by_file_publish_move_is_found_by_the_id_check_and_blocks() {
     assert_eq!(info.progress.stage, Stage::Publishing);
     let incoming_id = hook.records[1].incoming_id.clone().unwrap();
     let o = info.observed.clone().expect("見えていた状態");
-    assert_eq!(o.dest.len(), 1);
-    assert_ne!(o.dest[0].id, incoming_id, "宛先の ID が incoming と違う");
-    // それ以上は何もしない（purge なし、移動も 1 回だけ）
+    assert_eq!(o.dest.len(), 2, "同名のフォルダが並ぶ");
+    assert!(o.dest.iter().any(|s| s.id == incoming_id));
+    assert!(o.dest.iter().any(|s| s.id != incoming_id));
+    // それ以上は何もしない（ゴミ箱なし、移動も 1 回だけ）
     assert_eq!(env.op_count("move"), 1);
     assert!(env.op_count("trash") == 0);
-    assert!(
-        info.describe(&env.layout(Y, FOLDER, JOB_A))
-            .contains("publish_mismatch")
-    );
+    let text = info.describe(&env.layout(Y, FOLDER, JOB_A));
+    assert!(text.contains("publish_mismatch"), "{text}");
+    assert!(!text.contains("足された写真"), "{text}");
 }
 
 #[test]
-fn a_file_by_file_retire_move_blocks_before_anything_reaches_the_trash() {
-    let env = Env::new("filewise-retire");
+fn a_same_named_folder_created_right_after_the_retire_move_blocks_before_anything_reaches_the_trash()
+ {
+    let env = Env::new("dup-after-retire");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old_id = env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("move", 0, 1, filewise());
+    // 退避の移動（最初の move）の直後に、退避先に同じ名前のフォルダができた
+    env.add_rule(
+        "move",
+        0,
+        1,
+        do_then_add_folder(
+            &["geoframe-export-work", "replaced"],
+            &format!("yamareco-{FOLDER}-{JOB_A}"),
+        ),
+    );
     let mut hook = Hook::new(&env);
     let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Blocked);
@@ -661,25 +689,23 @@ fn a_file_by_file_retire_move_blocks_before_anything_reaches_the_trash() {
     assert_eq!(info.progress.old_id.as_deref(), Some(old_id.as_str()));
     let o = info.observed.clone().unwrap();
     assert!(o.dest.is_empty());
-    assert_eq!(o.replaced.len(), 1);
-    assert_ne!(
-        o.replaced[0].id, old_id,
-        "replaced の ID が記録した旧 ID と違う"
+    assert_eq!(o.replaced.len(), 2, "同名のフォルダが並ぶ");
+    assert!(
+        o.replaced.iter().any(|s| s.id == old_id),
+        "旧フォルダは ID のまま退避先にある"
     );
     assert_eq!(env.op_count("move"), 1);
     assert!(env.op_count("trash") == 0);
     assert!(env.drive().trashed.is_empty());
-    // recover の表示: 移してしまったフォルダの ID と、戻す手順
+    // recover の表示: 見えていた ID と、戻す手順
     let text = info.describe(&env.layout(Y, FOLDER, JOB_A));
-    assert!(text.contains(&o.replaced[0].id), "{text}");
+    assert!(text.contains(&old_id), "{text}");
     assert!(text.contains("戻す手順"), "{text}");
-    // 退避のファイル単位の移動は、移った旧ファイルを元の場所へ戻す案内（公開の移動で足された写真を片付ける案内とは別）
-    assert!(text.contains("移った旧ファイル"), "{text}");
     assert!(
-        text.contains(env.layout(Y, FOLDER, JOB_A).dest_path()),
+        text.contains(&env.layout(Y, FOLDER, JOB_A).dest_path()),
         "{text}"
     );
-    assert!(!text.contains("足された写真"), "{text}");
+    assert!(!text.contains("ファイル単位"), "{text}");
 }
 
 #[test]
@@ -697,20 +723,23 @@ fn a_manual_folder_created_between_the_check_and_the_retire_is_caught_by_the_id_
         d.save(&fake);
     });
     let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+    // 移す直前の一覧に、記録した旧フォルダの ID が見えない（同名の別のフォルダに替わっている）ので、何も動かさずに止める
+    // （以前は、一覧で見えた別のフォルダを退避先へ移してしまい、あとの照合で見つけていた）
     let info = f.blocked.expect("blocked");
-    assert_eq!(info.reason, BlockedReason::RetireMismatch);
-    let moved = &info.observed.as_ref().unwrap().replaced[0].id;
-    assert_ne!(moved, &old_id);
+    assert_eq!(info.reason, BlockedReason::DestinationUnexpected);
+    assert_eq!(env.op_count("move"), 0, "何も移さない");
     assert!(env.op_count("trash") == 0, "ゴミ箱へは移さない");
-    // 移してしまったフォルダは replaced/ にある（オーナーが戻せる）
+    // 替わったフォルダは宛先のまま。退避先には何も無い
+    let d = env.drive();
+    let swapped = d.resolve(&["yamareco", FOLDER]).expect("swapped folder");
+    assert_ne!(swapped, old_id);
     assert!(
-        env.drive()
-            .resolve(&[
-                "geoframe-export-work",
-                "replaced",
-                &format!("yamareco-{FOLDER}-{JOB_A}")
-            ])
-            .is_some()
+        d.resolve(&[
+            "geoframe-export-work",
+            "replaced",
+            &format!("yamareco-{FOLDER}-{JOB_A}")
+        ])
+        .is_none()
     );
 }
 
@@ -918,9 +947,6 @@ fn duplicates_files_and_shortcuts_at_the_destination_are_ambiguous() {
             }
         }
         env.save(&d);
-        if matches!(case, Case::ShortcutResolved) {
-            env.set_shortcut_mode("resolved");
-        }
         for on_exists in [OnExists::Error, OnExists::Replace] {
             let mut hook = Hook::new(&env);
             let f = failure(run(&env, &set, on_exists, &mut hook));
@@ -936,19 +962,20 @@ fn duplicates_files_and_shortcuts_at_the_destination_are_ambiguous() {
 
 #[test]
 fn a_failed_query_is_drive_unavailable_and_never_read_as_absent() {
-    // rclone の失敗（終了コード 1・3）、決められた形でない出力、ID の無い出力、期限切れ
+    // API の失敗（500 を再試行しきる・404・403）、決められた形でない応答、ID の無い項目
     let cases: Vec<(&str, Value)> = vec![
-        ("exit1", fail(1)),
-        ("exit3", fail(3)),
+        ("http500", fail(500)),
+        ("http404", fk::status(404)),
+        ("http403", fk::status(403)),
         ("garbage", garbage("not json")),
-        ("object", garbage("{}")),
+        ("wrong-type", garbage(r#"{"files": 1}"#)),
         (
             "no-id",
-            garbage(r#"[{"Path":"a","Name":"a","Size":1,"MimeType":"x/y","IsDir":false}]"#),
+            garbage(r#"{"files":[{"name":"a","mimeType":"x/y","size":"1"}]}"#),
         ),
         (
             "empty-id",
-            garbage(r#"[{"Path":"a","Name":"a","Size":1,"MimeType":"x/y","IsDir":false,"ID":""}]"#),
+            garbage(r#"{"files":[{"id":"","name":"a","mimeType":"x/y","size":"1"}]}"#),
         ),
     ];
     for (name, effect) in cases {
@@ -960,7 +987,7 @@ fn a_failed_query_is_drive_unavailable_and_never_read_as_absent() {
         assert_eq!(f.error.code, ErrorCode::DriveUnavailable, "{name}");
         assert!(env.mutating_ops().is_empty(), "{name}: 何も書かない");
     }
-    // 接頭辞のフォルダそのものが無い（lsjson が終了コード 3）。「宛先が無い」とは読まない
+    // 宛先の親フォルダそのものが無い（一覧が 404）。「宛先が無い」とは読まない
     let env = Env::new("unavail-no-prefix");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let mut d = env.drive();
@@ -1134,13 +1161,15 @@ fn folders_not_written_by_this_service_are_never_replaced() {
         // moveto・purge・copy・mkdir は呼ばれず、記録も書かれない。Drive は変わらない
         assert_eq!(env.mutating_ops(), Vec::<String>::new(), "{name}");
         assert!(
-            env.ops_used().iter().all(|c| c == "list" || c == "read"),
+            env.ops_used()
+                .iter()
+                .all(|c| c == "list" || c == "read" || c == "token"),
             "{name}"
         );
         assert_eq!(env.drive().nodes.len(), before, "{name}");
         let _ = &f_;
-        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-        assert_rclone_safe_calls(&env);
+        // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+        env.assert_api_calls_safe();
     }
 }
 
@@ -1264,7 +1293,7 @@ fn a_managed_unchanged_folder_is_recognised_in_a_period_with_subfolders_too() {
 // ---- AC10: dry_run ----
 
 #[test]
-fn dry_run_calls_only_lsjson_and_cat() {
+fn dry_run_only_lists_and_reads() {
     let layout = |env: &Env| env.layout(Y, FOLDER, JOB_A);
     // 無い
     let env = Env::new("dry-absent");
@@ -1273,9 +1302,9 @@ fn dry_run_calls_only_lsjson_and_cat() {
         (i.target.clone(), i.existing_files, i.managed),
         (Target::Absent, 0, None)
     );
-    assert_eq!(env.ops_used(), ["list"]);
+    assert_eq!(env.ops_used(), ["list", "token"]);
 
-    // ある・管理している（cat で manifest を読む）
+    // ある・管理している（manifest を読む）
     let env = Env::new("dry-managed");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let id = env.seed_managed(Y, FOLDER, &set);
@@ -1283,7 +1312,7 @@ fn dry_run_calls_only_lsjson_and_cat() {
     assert_eq!(i.target, Target::Exists { id });
     assert_eq!(i.existing_files, 3);
     assert_eq!(i.managed, Some(Managed::Managed));
-    assert_eq!(env.ops_used(), ["list", "read"]);
+    assert_eq!(env.ops_used(), ["list", "read", "token"]);
     env.assert_no_mutations();
 
     // ある・管理していない（手作業）／変更あり
@@ -1300,10 +1329,14 @@ fn dry_run_calls_only_lsjson_and_cat() {
     env.save(&d);
     let i = dry_run(&env.remote(), &layout(&env), &env.published).unwrap();
     assert_eq!(i.managed, Some(Managed::Modified));
-    assert!(env.ops_used().iter().all(|c| c == "list" || c == "read"));
+    assert!(
+        env.ops_used()
+            .iter()
+            .all(|c| c == "list" || c == "read" || c == "token")
+    );
     env.assert_no_mutations();
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    assert_rclone_safe_calls(&env);
+    // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+    env.assert_api_calls_safe();
 
     // 照会の失敗は drive_unavailable、同名が複数なら ambiguous
     let env = Env::new("dry-fail");
@@ -1329,11 +1362,11 @@ fn dry_run_calls_only_lsjson_and_cat() {
 
 #[test]
 fn dry_run_as_a_whole_has_a_deadline_and_a_slow_drive_is_drive_unavailable() {
-    // 宛先があると rclone を 5 回ほど呼ぶ。1 回ごとの期限とは別に、全体に期限を掛ける
+    // 宛先があると一覧を 2 回と読み出しを呼ぶ。1 回ごとの期限とは別に、全体に期限を掛ける
     let env = Env::new("dry-whole");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("list", 0, u64::MAX, sleep_ms(400));
+    env.add_rule("list", 0, u64::MAX, sleep_ms(600));
     let layout = env.layout(Y, FOLDER, JOB_A);
     let started = Instant::now();
     let err = geoframe_export::publish::dry_run_within(
@@ -1357,23 +1390,21 @@ fn dry_run_as_a_whole_has_a_deadline_and_a_slow_drive_is_drive_unavailable() {
 }
 
 #[test]
-fn the_dry_run_rclone_has_a_thirty_second_limit_per_call() {
+fn the_dry_run_has_a_thirty_second_limit_per_call() {
     let env = Env::new("dry-limit");
-    let settings = &env.settings;
     // 既定の期限は 5 分。dry_run は 30 秒に縮める（実際に待たずに、短い期限での失敗で確かめるのは別の試験）
-    let r = Remote::for_dry_run(settings);
-    let text = format!("{r:?}");
-    assert!(text.contains("copy_timeout: 30s, timeout: 30s"), "{text}");
+    let base = env
+        .remote()
+        .with_timeouts(Duration::from_secs(45 * 60), Duration::from_secs(5 * 60));
+    let text = format!("{:?}", base.for_dry_run());
+    assert!(
+        text.contains("upload_timeout: 30s") && text.contains("query_timeout: 30s"),
+        "{text}"
+    );
     // 設定が 30 秒より短ければ、それを使う
-    let mut raw = geoframe_export::settings::RawSettings {
-        rclone: Some("/x/rclone".into()),
-        rclone_config: Some("/x/state/rclone/rclone.conf".into()),
-        state_dir: Some("/x/state".into()),
-        ..Default::default()
-    };
-    raw.rclone_timeout = Some("10".into());
-    let short = geoframe_export::settings::Settings::from_raw(&raw).unwrap();
-    assert!(format!("{:?}", Remote::for_dry_run(&short)).contains("timeout: 10s"));
+    let short = base.with_timeouts(Duration::from_secs(10), Duration::from_secs(10));
+    let text = format!("{:?}", short.for_dry_run());
+    assert!(text.contains("query_timeout: 10s"), "{text}");
 }
 
 // ---- 期限 ----
@@ -1426,72 +1457,58 @@ fn the_job_deadline_overrides_the_command_limit_and_cleanup_still_runs() {
     assert!(!f.leftover_incoming);
 }
 
-// ---- 設定: 作業用のフォルダと接頭辞 ----
+// ---- 設定: 3 つのフォルダ ----
 
 #[test]
-fn settings_with_a_different_remote_or_an_overlapping_work_root_do_not_start() {
+fn settings_with_the_same_folder_twice_do_not_start() {
     use geoframe_export::settings::{RawSettings, Settings};
+    let env = Env::new("same-folders");
     let base = || RawSettings {
-        rclone: Some("/x/rclone".into()),
-        rclone_config: Some("/x/state/rclone/rclone.conf".into()),
-        state_dir: Some("/x/state".into()),
+        state_dir: Some(env.state.to_string_lossy().into_owned()),
+        drive_credentials: Some(env.credentials.to_string_lossy().into_owned()),
+        folder_yamareco: Some(env.yamareco_id.clone()),
+        folder_travel_journal: Some(env.travel_journal_id.clone()),
+        work_folder: Some(env.work_id.clone()),
         ..RawSettings::default()
     };
     assert!(Settings::from_raw(&base()).is_ok());
-    // remote 名が違う（別の remote や共有ドライブだと、移動がファイル単位のコピーと削除になる）
-    for w in ["other:geoframe-export-work", "gdrive2:geoframe-export-work"] {
-        let mut r = base();
-        r.work_root = Some(w.into());
-        assert!(Settings::from_raw(&r).is_err(), "{w}");
-    }
+    // 宛先どうし・宛先と作業用のフォルダが同じ ID（祖先・子孫の関係は、起動時に Drive へ問い合わせて断る。startup_cli.rs）
     let mut r = base();
-    r.remote_yamareco = Some("other:yamareco".into());
+    r.folder_travel_journal = Some(env.yamareco_id.clone());
     assert!(Settings::from_raw(&r).is_err());
-    // 同じ・入れ子（作業用のフォルダが接頭辞の中、接頭辞が作業用のフォルダの中）
-    for w in [
-        "gdrive:yamareco",
-        "gdrive:travel-journal",
-        "gdrive:yamareco/work",
-        "gdrive:a",
-    ] {
-        let mut r = base();
-        r.work_root = Some(w.into());
-        if w == "gdrive:a" {
-            r.remote_yamareco = Some("gdrive:a/yamareco".into());
-        }
-        assert!(Settings::from_raw(&r).is_err(), "{w}");
-    }
+    let mut r = base();
+    r.work_folder = Some(env.yamareco_id.clone());
+    assert!(Settings::from_raw(&r).is_err());
+    let mut r = base();
+    r.work_folder = Some(env.travel_journal_id.clone());
+    assert!(Settings::from_raw(&r).is_err());
 }
 
 // ---- 呼び出しの安全（環境変数・引数） ----
 
-// rclone 固有: rclone の引数・環境変数そのものを確かめる（rclone 版を消すときに、この試験も消す）。
 #[test]
-fn rclone_gets_a_minimal_environment_and_no_credential_flags_in_every_call() {
+fn the_api_calls_carry_the_token_only_in_the_header_and_the_log_never_holds_a_credential() {
     let env = Env::new("safe");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old = env.seed_managed(Y, FOLDER, &set);
     let mut hook = Hook::new(&env);
     let _ = published(run(&env, &set, OnExists::Replace, &mut hook));
-    assert!(env.calls().iter().filter(|c| c["kind"] == "rclone").count() > 10);
-    assert_rclone_safe_calls(&env);
-    // 子プロセスの環境にも引数にも、client_id・client_secret・token の文字は無い
-    for c in env.calls().iter().filter(|c| c["kind"] == "rclone") {
-        let text = c.to_string().to_lowercase();
-        for bad in ["client_id", "client_secret", "access_token", "rclone_"] {
-            assert!(!text.contains(bad), "{bad}: {text}");
-        }
+    assert!(env.http_calls().len() > 10);
+    env.assert_api_calls_safe();
+    // 記録（偽の Drive が書いた要求の記録）にも、資格情報の値・トークンの値は無い
+    let log = std::fs::read_to_string(env.fake_dir.join("calls.log")).unwrap();
+    for secret in [
+        fk::FAKE_CLIENT_SECRET,
+        fk::FAKE_REFRESH_TOKEN,
+        fk::FAKE_CLIENT_ID,
+        "access_token",
+    ] {
+        assert!(!log.contains(secret), "{secret}");
     }
     let _ = (old, Kind::Dir);
 }
 
 // ---- Google のファイル（サイズ不明）とショートカット（実 rclone の一覧の形） ----
-
-// rclone 固有: rclone の引数・環境変数そのものを確かめる（rclone 版を消すときに、この試験も消す）。
-fn lsjson_calls_have(env: &Env, flag: &str) -> bool {
-    let calls = env.rclone_calls("lsjson");
-    !calls.is_empty() && calls.iter().all(|c| c.iter().any(|a| a == flag))
-}
 
 #[test]
 fn native_google_files_in_a_managed_folder_make_it_modified_and_nothing_is_touched() {
@@ -1514,14 +1531,9 @@ fn native_google_files_in_a_managed_folder_make_it_modified_and_nothing_is_touch
         assert_eq!(files, 4, "{name}: 写真 2・manifest・足されたファイル");
         assert!(env.mutating_ops().is_empty(), "{name}");
         assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
-        assert!(lsjson_calls_have(&env, "--drive-show-all-gdocs"), "{name}");
-        assert!(
-            lsjson_calls_have(&env, "--drive-skip-gdocs=false"),
-            "{name}"
-        );
         // dry_run も同じ判定
         let layout = env.layout(Y, FOLDER, JOB_A);
-        let i = dry_run(&Remote::for_dry_run(&env.settings), &layout, &env.published).unwrap();
+        let i = dry_run(&env.remote().for_dry_run(), &layout, &env.published).unwrap();
         assert_eq!(i.managed, Some(Managed::Modified), "{name}");
     }
 }
@@ -1601,26 +1613,18 @@ fn resolved_and_dangling_shortcuts_are_classified_not_rejected() {
         };
         d.add_shortcut(&["yamareco"], FOLDER, &target);
         env.save(&d);
-        env.set_shortcut_mode("resolved");
         let mut hook = Hook::new(&env);
         let f = failure(run(&env, &set, OnExists::Error, &mut hook));
         assert_eq!(f.error.code, ErrorCode::AmbiguousDestination, "{name}");
         assert!(env.mutating_ops().is_empty(), "{name}");
-        // ショートカットを除かない一覧は、設定ファイルに左右されないよう `=false` を明示している
-        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-        let calls = env.rclone_calls("lsjson");
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.iter().any(|a| a == "--drive-skip-shortcuts=false")),
-            "{name}"
-        );
-        assert!(
-            calls
-                .iter()
-                .any(|c| c.iter().any(|a| a == "--drive-skip-shortcuts")),
-            "{name}"
-        );
+        // API の一覧では、ショートカットは解決されずに 1 件として出る。同じ場所を 2 回一覧して差を見ることはしない
+        let parent_lists = env
+            .http_calls()
+            .iter()
+            .filter(|c| c["op"] == "list" && c["subject"] == "yamareco")
+            .count();
+        assert_eq!(parent_lists, 1, "{name}");
+        env.assert_api_calls_safe();
     }
     // 名前が違うショートカットが親にあっても、一覧全体は断らない（名前が一致するものだけを使う）
     let env = Env::new("sc-unrelated");
@@ -1631,7 +1635,6 @@ fn resolved_and_dangling_shortcuts_are_classified_not_rejected() {
     d.add_shortcut(&["yamareco"], "broken", "fidMISSING");
     d.add_shortcut(&["geoframe-export-work", "incoming"], "linked2", &other);
     env.save(&d);
-    env.set_shortcut_mode("resolved");
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(dest_id(&env).as_deref(), Some(p.folder_id.as_str()));
@@ -1651,7 +1654,6 @@ fn a_shortcut_inside_a_managed_folder_makes_it_modified() {
         };
         d.add_shortcut(&["yamareco", FOLDER], "link", &target);
         env.save(&d);
-        env.set_shortcut_mode("resolved");
         let set = env.make_set("new", Y, FOLDER, PHOTOS);
         let mut hook = Hook::new(&env);
         let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
@@ -1701,13 +1703,18 @@ fn the_old_folder_is_not_trashed_when_something_was_added_to_it_after_the_check(
         text.contains("retired_content_changed") && text.contains(&old_id),
         "{text}"
     );
-    // 旧 manifest は退避先の中の manifest.json を cat で読み直している
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    let cats = env.rclone_calls("cat");
+    // 旧 manifest は退避先の中の manifest.json を読み直している（ID で読む。対象のパスが退避先の下）
+    let reads: Vec<String> = env
+        .http_calls()
+        .iter()
+        .filter(|c| c["op"] == "read")
+        .map(|c| c["subject"].as_str().unwrap_or("").to_owned())
+        .collect();
     assert!(
-        cats.iter()
-            .any(|c| c.last().is_some_and(|l| l.contains("/replaced/"))),
-        "{cats:?}"
+        reads
+            .iter()
+            .any(|p| p.contains("/replaced/") && p.ends_with("/manifest.json")),
+        "{reads:?}"
     );
 }
 
@@ -1788,11 +1795,9 @@ fn a_failed_purge_succeeds_with_the_old_folder_left_only_if_it_is_confirmed_in_r
             break;
         }
         if c["op"] == "list"
-            && c["args"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|a| a.as_str().is_some_and(|a| a.ends_with("/replaced")))
+            && c["subject"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("/replaced"))
         {
             before_purge += 1;
         }
@@ -1980,14 +1985,11 @@ fn a_same_named_incoming_that_already_exists_is_not_adopted_and_is_reported_as_a
                 (None, vec![id])
             }
             "shortcut-mime" | "shortcut-resolved" => {
-                // 同名のショートカット（ショートカットを省く一覧では見えない）。どちらの見え方でも同名として数える
+                // 同名のショートカット（API の一覧では、解決されずに 1 件として出る）。同名として数える
                 let mut d = env.drive();
                 let other = d.mkdir_p(&["elsewhere"]);
                 let id = d.add_shortcut(&work, JOB_A, &other);
                 env.save(&d);
-                if variant == "shortcut-resolved" {
-                    env.set_shortcut_mode("resolved");
-                }
                 (None, vec![id])
             }
             _ => {
@@ -2338,26 +2340,26 @@ fn the_published_row_records_the_md5_of_every_file_and_a_replace_works_again_fro
     assert!(row.previous.is_none());
 }
 
-// rclone 固有: rclone の引数・環境変数そのものを確かめる（rclone 版を消すときに、この試験も消す）。
 #[test]
-fn only_the_listings_that_check_the_content_ask_for_md5() {
-    let env = Env::new("md5-flags");
+fn every_listing_asks_for_the_md5_field_and_nothing_else_is_asked_for_in_the_tree() {
+    // API の一覧は、いつも `md5Checksum` を含む項目だけを取る（親の一覧も、木の一覧も同じ。中身の照合に使うのは木の一覧）
+    let env = Env::new("md5-fields");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let mut hook = Hook::new(&env);
     published(run(&env, &set, OnExists::Replace, &mut hook));
-    let mut hashed = 0;
-    for args in env.rclone_calls("lsjson") {
-        let has = |f: &str| args.iter().any(|a| a == f);
-        // 中身の照合に使う一覧（再帰で、ショートカットを除いたほう）だけに MD5 を付ける
-        if has("-R") && !has("--drive-skip-shortcuts=false") {
-            hashed += 1;
-            let i = args.iter().position(|a| a == "--hash").expect("--hash");
-            assert_eq!(&args[i + 1..i + 3], ["--hash-type", "MD5"], "{args:?}");
-        } else {
-            assert!(!has("--hash") && !has("--hash-type"), "{args:?}");
-        }
+    let lists: Vec<Value> = env
+        .http_calls()
+        .into_iter()
+        .filter(|c| c["op"] == "list")
+        .collect();
+    assert!(!lists.is_empty());
+    for c in &lists {
+        assert_eq!(
+            c["fields"],
+            "kind,incompleteSearch,nextPageToken,files(id,name,mimeType,size,md5Checksum)",
+            "{c}"
+        );
     }
-    assert!(hashed >= 1);
 }
 
 // ---- 検証済みの MD5 は、退避・公開の前にジョブの記録へ残す ----
@@ -2422,4 +2424,771 @@ fn the_verified_md5_is_recorded_in_the_job_record_before_the_retire_or_the_publi
     let rec = seq.iter().position(|c| c == "record:retiring").unwrap();
     let mv = seq.iter().position(|c| c == "move").unwrap();
     assert!(rec < mv, "{seq:?}");
+}
+
+// ---- 作った・照合したフォルダの ID は、書き込みまで引き継ぐ ----
+
+#[test]
+fn a_swapped_incoming_right_after_creation_stops_before_any_id_is_recorded() {
+    for swap in [true, false] {
+        let env = Env::new(if swap { "mkdir-swap" } else { "mkdir-dup" });
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        // incoming/ を先に作っておく（無ければ、最初の create_folder が incoming/ そのものになる）
+        let d = {
+            let mut d = env.drive();
+            d.mkdir_p(&["geoframe-export-work", "incoming"]);
+            d
+        };
+        env.save(&d);
+        let effect = if swap {
+            do_then_swap_folder(&["geoframe-export-work", "incoming"], JOB_A)
+        } else {
+            do_then_add_folder(&["geoframe-export-work", "incoming"], JOB_A)
+        };
+        env.add_rule("create_folder", 0, 1, effect);
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+        assert!(
+            hook.records.iter().all(|r| r.incoming_id.is_none()),
+            "ID を記録しない: swap={swap}"
+        );
+        assert_eq!(env.op_count("upload"), 0, "何も送らない: swap={swap}");
+        assert!(dest_id(&env).is_none(), "swap={swap}");
+        assert!(env.drive().trashed.is_empty(), "swap={swap}");
+        // 同名のフォルダ（別の ID）が、触られずに残る。名前だけでは消さない
+        let d = env.drive();
+        let inc = d
+            .resolve(&["geoframe-export-work", "incoming"])
+            .expect("incoming");
+        assert!(
+            d.children(&inc).iter().any(|n| n.name == JOB_A),
+            "swap={swap}"
+        );
+        assert!(f.blocked.is_none() || f.error.code == ErrorCode::Blocked);
+    }
+}
+
+#[test]
+fn photos_go_to_the_recorded_incoming_id_even_if_it_is_swapped_after_the_record() {
+    let env = Env::new("upload-parent-id");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    // 2 回目の `uploading` の記録（ID つき）の直後に、記録した incoming が消されて、同名の別のフォルダに替わった
+    let mut hook = Hook::new(&env).mutate_after(Stage::Uploading, move || {
+        let mut d = model::Drive::load(&fake);
+        if let Some(inc) = d.resolve(&["geoframe-export-work", "incoming", JOB_A]) {
+            d.purge(&inc, false);
+            d.mkdir_p(&["geoframe-export-work", "incoming", JOB_A]);
+            d.save(&fake);
+        }
+    });
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    let _ = f;
+    // 別の ID の同名フォルダには、何も送っていない（名前で引き直して、そちらへ送らない）
+    let d = env.drive();
+    let swapped = d
+        .resolve(&["geoframe-export-work", "incoming", JOB_A])
+        .expect("swapped incoming");
+    assert!(
+        d.children(&swapped).is_empty(),
+        "別のフォルダへ書いていない"
+    );
+    assert!(dest_id(&env).is_none());
+    assert!(env.drive().trashed.is_empty());
+}
+
+#[test]
+fn an_incoming_swapped_before_the_move_is_not_published_and_not_trashed() {
+    let env = Env::new("move-swapped");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    // 公開の移動の前（`publishing` の記録の直後）に、記録した incoming が、同名の別のフォルダ（空）に替わった。名前で引き直すと、
+    // その別のフォルダが宛先へ移ってしまう
+    let mut hook = Hook::new(&env).mutate_after(Stage::Publishing, move || {
+        let mut d = model::Drive::load(&fake);
+        let inc = d
+            .resolve(&["geoframe-export-work", "incoming", JOB_A])
+            .unwrap();
+        d.purge(&inc, false);
+        d.mkdir_p(&["geoframe-export-work", "incoming", JOB_A]);
+        d.save(&fake);
+    });
+    let _ = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(env.op_count("move"), 0, "何も移さない");
+    assert!(dest_id(&env).is_none(), "宛先へ公開されていない");
+    assert!(env.drive().trashed.is_empty(), "別のフォルダを消さない");
+}
+
+#[test]
+fn a_malformed_listing_never_leads_to_creating_a_folder() {
+    // 一覧が形の壊れた 200（null など）でも、「空」として、同名のフォルダの作成へ進まない
+    for body in ["null", "[]", "{}", r#"{"kind":"drive#fileList"}"#] {
+        let env = Env::new("malformed-list");
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        // 1 回目（宛先の親の一覧）は通し、2 回目以降（作業用のフォルダの一覧）を壊す
+        env.add_rule("list", 1, u64::MAX, garbage(body));
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+        assert_eq!(f.error.code, ErrorCode::DriveUnavailable, "{body}");
+        assert!(
+            env.mutating_ops().is_empty(),
+            "{body}: {:?}",
+            env.mutating_ops()
+        );
+    }
+}
+
+#[test]
+fn a_malformed_destination_listing_is_not_read_as_no_destination() {
+    for body in ["null", "[]", "{}"] {
+        let env = Env::new("malformed-dest");
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        env.seed_managed(Y, FOLDER, &set);
+        env.add_rule("list", 0, u64::MAX, garbage(body));
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+        assert_eq!(f.error.code, ErrorCode::DriveUnavailable, "{body}");
+        env.assert_no_mutations();
+    }
+}
+
+// ---- 移動・ゴミ箱は、1 つの段で PATCH を 1 回だけ送る。処理されなかった（429・403・401）あとも再送しない ----
+//
+// 結果は、結果不明（5xx・通信断）と同じ結末になる: 公開の移動は復旧の表へ、旧フォルダのゴミ箱は `old_left_in_replaced`、
+// `incoming` のゴミ箱は残りもの。待つ間に変わったものを見落として再送する経路が無いことを、再送の回数（1 回）で確かめる。
+
+/// `remote` で動かす（`run` は再試行しない `Env::remote()`）。
+fn run_with(
+    remote: &geoframe_export::remote::Remote,
+    env: &Env,
+    set: &Set,
+    on_exists: OnExists,
+    hook: &mut Hook,
+) -> Result<PublishOutcome, PublishFailure> {
+    let layout = env.layout(Y, FOLDER, JOB_A);
+    publish(remote, &layout, &params(env, set, on_exists), hook)
+}
+
+/// 処理されていないと分かる応答（429・流量制限の 403・401）。
+fn not_processed_effects() -> [(&'static str, Value); 3] {
+    [
+        ("429", fk::too_many_requests(0)),
+        ("403", fk::rate_limit_403()),
+        ("401", fk::unauthorized()),
+    ]
+}
+
+fn retired_dir() -> [String; 3] {
+    [
+        "geoframe-export-work".to_owned(),
+        "replaced".to_owned(),
+        format!("yamareco-{FOLDER}-{JOB_A}"),
+    ]
+}
+
+#[test]
+fn a_trash_that_was_not_processed_is_sent_once_and_the_old_folder_is_left_in_replaced() {
+    for (label, effect) in not_processed_effects() {
+        // 終わらない流量制限でも、1 回しか送らない（再送の上限まで繰り返さない）
+        let env = Env::new(&format!("trash-not-processed-{label}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = env.seed_managed(Y, FOLDER, &set);
+        env.add_rule("trash", 0, u64::MAX, effect);
+        let mut hook = Hook::new(&env);
+        let p = published(run_with(
+            &env.remote_retrying(),
+            &env,
+            &set,
+            OnExists::Replace,
+            &mut hook,
+        ));
+        // 新しい一式は公開済み。旧フォルダは退避先に残る（ゴミ箱へは移せなかった）
+        assert_eq!(
+            p.old_left_in_replaced.as_deref(),
+            Some(old_id.as_str()),
+            "{label}"
+        );
+        assert!(p.recorded, "{label}");
+        assert!(env.drive().trashed.is_empty(), "{label}");
+        assert_eq!(env.op_count("trash"), 1, "{label}: 再送しない");
+    }
+}
+
+#[test]
+fn a_file_added_to_the_old_folder_while_the_trash_was_refused_is_never_trashed() {
+    // ゴミ箱へ移すが処理されなかった（429・403・401）あと、オーナーが旧フォルダへファイルを足した。再送しないので、足された分ごと
+    // ゴミ箱へ移すことはない
+    for (label, effect) in not_processed_effects() {
+        let env = Env::new(&format!("trash-not-processed-added-{label}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = env.seed_managed(Y, FOLDER, &set);
+        let dir = retired_dir();
+        let dir: Vec<&str> = dir.iter().map(String::as_str).collect();
+        env.add_rule(
+            "trash",
+            0,
+            u64::MAX,
+            fk::status_then_add_file(effect, &dir, "owner-memo.txt"),
+        );
+        let mut hook = Hook::new(&env);
+        let p = published(run_with(
+            &env.remote_retrying(),
+            &env,
+            &set,
+            OnExists::Replace,
+            &mut hook,
+        ));
+        assert_eq!(
+            p.old_left_in_replaced.as_deref(),
+            Some(old_id.as_str()),
+            "{label}"
+        );
+        assert_eq!(env.op_count("trash"), 1, "{label}: 再送しない");
+        assert!(env.drive().trashed.is_empty(), "{label}");
+        // 旧フォルダは、足されたファイルごと退避先に残っている
+        let d = env.drive();
+        assert_eq!(d.resolve(&dir).as_deref(), Some(old_id.as_str()), "{label}");
+    }
+}
+
+#[test]
+fn a_publish_move_that_was_not_processed_is_sent_once_and_left_to_the_recovery_table() {
+    for (label, effect) in not_processed_effects() {
+        let env = Env::new(&format!("move-not-processed-{label}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        env.add_rule("move", 0, u64::MAX, effect);
+        let mut hook = Hook::new(&env);
+        let f = failure(run_with(
+            &env.remote_retrying(),
+            &env,
+            &set,
+            OnExists::Error,
+            &mut hook,
+        ));
+        // 復旧の表が、宛先が空のまま `incoming` が残っているのを見て、公開しなかったものとして `incoming` を片付ける
+        assert_eq!(f.error.code, ErrorCode::RcloneFailed, "{label}");
+        assert!(f.blocked.is_none(), "{label}");
+        assert!(!f.leftover_incoming, "{label}");
+        assert_eq!(env.op_count("trash"), 1, "{label}: incoming を片付ける");
+        assert_eq!(env.op_count("move"), 1, "{label}: 再送しない");
+        assert!(dest_id(&env).is_none(), "{label}: 公開されていない");
+    }
+}
+
+#[test]
+fn a_retire_that_was_not_processed_is_sent_once_and_the_old_folder_stays_in_place() {
+    // 退避の移動が処理されなかった（429）。待つ間にオーナーが旧フォルダ（宛先）へファイルを足しても、再送しないので、
+    // 足された分ごと動かすことも、ゴミ箱へ移すこともない
+    let env = Env::new("retire-not-processed");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let old_id = env.seed_managed(Y, FOLDER, &set);
+    env.add_rule(
+        "move",
+        0,
+        u64::MAX,
+        fk::status_then_add_file(
+            fk::too_many_requests(0),
+            &["yamareco", FOLDER],
+            "owner-memo.txt",
+        ),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run_with(
+        &env.remote_retrying(),
+        &env,
+        &set,
+        OnExists::Replace,
+        &mut hook,
+    ));
+    assert_eq!(f.error.code, ErrorCode::RcloneFailed);
+    assert!(f.blocked.is_none());
+    assert_eq!(env.op_count("move"), 1, "再送しない");
+    // ゴミ箱へ移したのは、復旧の表が片付けた `incoming` だけ（旧フォルダは動かさない）
+    assert_eq!(env.op_count("trash"), 1);
+    assert!(!env.drive().trashed.contains(&old_id));
+    assert!(!f.leftover_incoming);
+    // 旧フォルダ（メモごと）は宛先のまま
+    assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
+}
+
+#[test]
+fn an_incoming_cleanup_that_was_not_processed_is_sent_once_and_reported_as_a_leftover() {
+    let env = Env::new("cleanup-not-processed");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    let mut hook = Hook::new(&env).mutate_after(Stage::Verifying, move || {
+        let mut d = model::Drive::load(&fake);
+        d.add_file(
+            &["geoframe-export-work", "incoming", JOB_A],
+            "extra.jpg",
+            1,
+            None,
+        );
+        d.save(&fake);
+    });
+    env.add_rule("trash", 0, u64::MAX, fk::too_many_requests(0));
+    let f = failure(run_with(
+        &env.remote_retrying(),
+        &env,
+        &set,
+        OnExists::Error,
+        &mut hook,
+    ));
+    assert_eq!(f.error.code, ErrorCode::VerifyMismatch);
+    assert!(
+        f.leftover_incoming,
+        "ゴミ箱へ移せなかったので、残りものとして知らせる"
+    );
+    assert!(f.leftover_incoming_id.is_some());
+    assert!(env.drive().trashed.is_empty());
+    assert_eq!(env.op_count("trash"), 1, "再送しない");
+}
+
+// ---- 公開のあとの照合の間に、フォルダが宛先から動かされた ----
+
+#[test]
+fn a_folder_moved_away_while_its_contents_are_checked_is_not_taken_as_published() {
+    // 宛先のフォルダの中身を ID で一覧している間に、そのフォルダが宛先から動かされた（ID は同じなので、中身は読めて一致する）。
+    // 公開の確定（記録）と旧フォルダの片付けに入る前に、宛先を観察し直して、`blocked` にする
+    for replace in [false, true] {
+        let env = Env::new(&format!("moved-away-{replace}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = replace.then(|| env.seed_managed(Y, FOLDER, &set));
+        let before = std::fs::read(record_path(&env)).ok();
+        // 宛先のフォルダの一覧: 置き換えでは、最初の 2 回（管理の確認）は新しい一式より前の旧フォルダの一覧。3 回目が公開の直後の照合
+        let skip = if replace { 2 } else { 0 };
+        env.fake.add_rule_contains(
+            "list",
+            &format!("yamareco/{FOLDER}"),
+            skip,
+            1,
+            fk::do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+        );
+        let on_exists = if replace {
+            OnExists::Replace
+        } else {
+            OnExists::Error
+        };
+        let mut hook = Hook::new(&env);
+        let f = failure(run_with(&env.remote(), &env, &set, on_exists, &mut hook));
+        assert_eq!(f.error.code, ErrorCode::Blocked, "replace={replace}");
+        let info = f.blocked.expect("blocked");
+        assert_eq!(
+            info.reason,
+            BlockedReason::PublishMismatch,
+            "replace={replace}"
+        );
+        assert!(info.observed.expect("observed").dest.is_empty());
+        // 公開の記録は書き換えない・旧フォルダはゴミ箱へ移さない
+        assert_eq!(
+            std::fs::read(record_path(&env)).ok(),
+            before,
+            "replace={replace}"
+        );
+        assert_eq!(env.op_count("trash"), 0, "replace={replace}");
+        assert!(env.drive().trashed.is_empty(), "replace={replace}");
+        assert!(dest_id(&env).is_none(), "replace={replace}");
+        if let Some(old) = old_id {
+            // 旧フォルダは退避先にそのまま残る
+            let dir = retired_dir();
+            let d = env.drive();
+            assert_eq!(
+                d.resolve(&dir.iter().map(String::as_str).collect::<Vec<_>>())
+                    .as_deref(),
+                Some(old.as_str())
+            );
+        }
+    }
+}
+
+// ---- 木をたどる途中の 404 は、「無い」とは読まない ----
+
+#[test]
+fn a_404_in_the_middle_of_a_tree_walk_is_a_failed_query_not_a_verify_mismatch() {
+    // 日付のサブフォルダがある一式。検証で incoming/<job_id> の木をたどる途中、サブフォルダの一覧が 404 になる。親の一覧では
+    // incoming の ID が見えているので、「無い」とは言えない: `drive_unavailable`（`verify_mismatch` ではない）
+    let env = Env::new("tree-404-middle");
+    let folder = "2030-03-10-11";
+    let files = [
+        ("2030-03-10/090000_1.jpg", 100),
+        ("2030-03-11/090100_2.jpg", 200),
+    ];
+    let set = env.make_set("p", Y, folder, &files);
+    env.fake.add_rule_contains(
+        "list",
+        &format!("incoming/{JOB_A}/2030-03-11"),
+        0,
+        u64::MAX,
+        fk::status(404),
+    );
+    let layout = env.layout(Y, folder, JOB_A);
+    let mut hook = Hook::new(&env);
+    let f = failure(publish(
+        &env.remote(),
+        &layout,
+        &params(&env, &set, OnExists::Error),
+        &mut hook,
+    ));
+    assert_eq!(f.error.code, ErrorCode::DriveUnavailable);
+    assert_ne!(f.error.code, ErrorCode::VerifyMismatch);
+    assert!(dest_id(&env).is_none());
+    assert_eq!(env.op_count("move"), 0);
+}
+
+#[test]
+fn a_404_on_the_recorded_folder_is_a_mismatch_only_when_the_parent_listing_shows_it_is_gone() {
+    // 記録した incoming のフォルダの一覧が 404 になる。親（incoming/）の一覧に、その ID がまだ見えている → 無いとは言えない
+    let env = Env::new("tree-404-root-present");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    env.fake.add_rule_contains(
+        "list",
+        &format!("incoming/{JOB_A}"),
+        0,
+        u64::MAX,
+        fk::status(404),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::DriveUnavailable);
+
+    // 親の一覧が成功し、その ID が見えない（入れ替わった）→ 一式と一致しない（verify_mismatch。入れ替わった incoming は消さずに知らせる）
+    let env = Env::new("tree-404-root-gone");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    let mut hook = Hook::new(&env).mutate_after(Stage::Verifying, move || {
+        let mut d = model::Drive::load(&fake);
+        if let Some(inc) = d.resolve(&["geoframe-export-work", "incoming", JOB_A]) {
+            d.purge(&inc, false);
+            d.mkdir_p(&["geoframe-export-work", "incoming", JOB_A]);
+            d.save(&fake);
+        }
+    });
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::VerifyMismatch);
+    assert!(
+        env.drive().trashed.is_empty(),
+        "入れ替わった incoming は消さない"
+    );
+    assert!(f.leftover_incoming);
+
+    // 親の一覧そのものが失敗する → 照会の失敗（「無い」と読まない）
+    let env = Env::new("tree-404-parent-fails");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    env.fake.add_rule_contains(
+        "list",
+        &format!("incoming/{JOB_A}"),
+        0,
+        u64::MAX,
+        fk::status(404),
+    );
+    // 親（`incoming/`）の一覧は、検証の 404 のあとの 1 回を 500 にする（`geoframe-export-work/incoming` を含む一覧は、順に
+    // `incoming/` の作成のあと・検証の 404（`incoming/<job_id>`）・その直後の親の一覧。3 番目）
+    env.fake.add_rule_contains(
+        "list",
+        "geoframe-export-work/incoming",
+        2,
+        1,
+        fk::status(500),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    let injected: Vec<String> = env
+        .http_calls()
+        .iter()
+        .filter(|c| c["op"] == "list" && c["injected"] == "status")
+        .map(|c| c["subject"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        injected.len(),
+        2,
+        "404 と 500 の両方が当たった: {injected:?}"
+    );
+    assert!(injected[1].ends_with("/incoming"), "{injected:?}");
+    assert_eq!(f.error.code, ErrorCode::DriveUnavailable);
+}
+
+// ---- PATCH の直前に、その段が前提にしていることを確かめ直す ----
+
+/// 最後の段階の記録（`record:…`）より後ろの、Drive への要求（操作名と、対象の Drive 上のパス）。
+fn requests_after_last_record(env: &Env) -> Vec<(String, String)> {
+    let calls = env.calls();
+    let i = calls
+        .iter()
+        .rposition(|c| c["kind"] == "hook")
+        .expect("段階の記録");
+    calls[i + 1..]
+        .iter()
+        .filter(|c| c["kind"] == "http")
+        .map(|c| {
+            (
+                c["op"].as_str().unwrap_or("?").to_owned(),
+                c["subject"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect()
+}
+
+fn req(op: &str, subject: &str) -> (String, String) {
+    (op.to_owned(), subject.to_owned())
+}
+
+#[test]
+fn a_same_named_folder_made_just_before_the_publish_move_stops_the_move() {
+    // 呼び出し側が「宛先が無い」と確かめたあと、`publish_move` の中の直前の一覧（宛先の親）で、同名の項目が見える。移さない
+    // （移すと、宛先に同名のフォルダが 2 つ並ぶ）。「呼び出し側の確認の直後に、オーナーが同じ名前のフォルダを作った」を、
+    // 呼び出し側の確認の一覧（`yamareco` の一覧の 3 回目。置き換えでは 8 回目）の直後に足すことで作る
+    for replace in [false, true] {
+        let env = Env::new(&format!("dup-before-publish-move-{replace}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = replace.then(|| env.seed_managed(Y, FOLDER, &set));
+        let skip = if replace { 7 } else { 2 };
+        env.fake.add_rule_contains(
+            "list",
+            "yamareco",
+            skip,
+            1,
+            do_then_add_folder(&["yamareco"], FOLDER),
+        );
+        let on_exists = if replace {
+            OnExists::Replace
+        } else {
+            OnExists::Error
+        };
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, on_exists, &mut hook));
+        // 公開の移動は送っていない（置き換えの退避の移動だけが 1 回ある）
+        assert_eq!(
+            env.op_count("move"),
+            usize::from(replace),
+            "replace={replace}"
+        );
+        // 最後の記録（`publishing`）のあとの要求は、呼び出し側の宛先の確認 → `publish_move` の `incoming/` の照合 → 宛先の親の一覧
+        // で、そこで止まる（PATCH の直前の要求が、この 2 つの照合）
+        let after = requests_after_last_record(&env);
+        assert_eq!(
+            after[..4],
+            [
+                req("list", "yamareco"),
+                req("list", "geoframe-export-work"),
+                req("list", "geoframe-export-work/incoming"),
+                req("list", "yamareco"),
+            ],
+            "replace={replace}"
+        );
+        assert!(
+            !after.iter().any(|(op, _)| op == "move"),
+            "replace={replace}: {after:?}"
+        );
+        // 復旧の表は、宛先に別のフォルダがあるので、何も動かさずに `blocked`
+        assert_eq!(f.error.code, ErrorCode::Blocked, "replace={replace}");
+        assert_eq!(
+            f.blocked.expect("blocked").reason,
+            BlockedReason::DestinationUnexpected,
+            "replace={replace}"
+        );
+        // 宛先にあるのは、オーナーが作った 1 つだけ。`incoming` のフォルダは宛先へ移っていない
+        let d = env.drive();
+        let under = d.resolve(&["yamareco"]).unwrap();
+        let same: Vec<_> = d
+            .children(&under)
+            .into_iter()
+            .filter(|n| n.name == FOLDER && !n.trashed)
+            .collect();
+        assert_eq!(same.len(), 1, "replace={replace}");
+        if let Some(old) = old_id {
+            assert_ne!(same[0].id, old);
+        }
+        assert!(
+            d.resolve(&["geoframe-export-work", "incoming", JOB_A])
+                .is_some(),
+            "replace={replace}"
+        );
+        assert!(d.trashed.is_empty(), "replace={replace}");
+    }
+}
+
+#[test]
+fn a_same_named_item_made_in_replaced_just_before_the_retire_stops_the_retire() {
+    // 呼び出し側が `replaced/` に同名が無いと確かめたあと、`retire_old` の中の直前の一覧（`replaced/`）で、退避名と同じ項目が見える。
+    // 旧フォルダは動かさない。「確かめた直後にできた」を、`replaced/` を作る要求の直後に、同名のフォルダを足すことで作る
+    let env = Env::new("dup-before-retire");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let old_id = env.seed_managed(Y, FOLDER, &set);
+    env.fake.add_rule_contains(
+        "create_folder",
+        "geoframe-export-work/replaced",
+        0,
+        1,
+        do_then_add_folder(
+            &["geoframe-export-work", "replaced"],
+            &format!("yamareco-{FOLDER}-{JOB_A}"),
+        ),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+    assert_eq!(env.op_count("move"), 0, "旧フォルダを動かさない");
+    // PATCH の直前の要求は、`replaced/` の一覧と、宛先の親の一覧（旧 ID の照合）
+    let after = requests_after_last_record(&env);
+    let create = after
+        .iter()
+        .position(|(op, _)| op == "create_folder")
+        .expect("replaced/ を作る");
+    assert_eq!(
+        after[create + 1..create + 3],
+        [
+            req("list", "geoframe-export-work/replaced"),
+            req("list", "yamareco"),
+        ]
+    );
+    // 旧フォルダは宛先のまま。復旧の表の結果: 宛先は前のままで、退避先に見えない（同名のフォルダがある）ので `blocked`
+    assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
+    assert!(env.drive().trashed.is_empty());
+    assert_eq!(f.error.code, ErrorCode::Blocked);
+    assert!(f.blocked.is_some());
+}
+
+#[test]
+fn the_new_folder_moved_away_just_before_the_trash_stops_the_trash_and_blocks_as_publish_mismatch()
+{
+    // 旧フォルダの中身の照合のあと、PATCH の直前に、新しい公開先が宛先から動かされた（中身の照合は ID で行うので、動かされても一致する）。
+    // 旧フォルダをゴミ箱へ移さず、片付けの失敗（成功扱い）に流さず、`publish_mismatch` で止める
+    let env = Env::new("moved-away-before-trash");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let old_id = env.seed_managed(Y, FOLDER, &set);
+    let before = std::fs::read(record_path(&env)).ok();
+    // 旧フォルダ（退避先）の中身の一覧のとき（この一覧のあとが、PATCH の直前の観察）
+    env.fake.add_rule_contains(
+        "list",
+        &format!("replaced/yamareco-{FOLDER}-{JOB_A}"),
+        0,
+        1,
+        fk::do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::Blocked);
+    let info = f.blocked.expect("blocked");
+    assert_eq!(info.reason, BlockedReason::PublishMismatch);
+    assert!(info.observed.expect("observed").dest.is_empty());
+    assert_eq!(env.op_count("trash"), 0, "ゴミ箱へ移さない");
+    assert!(env.drive().trashed.is_empty());
+    // 公開の記録は書き換えない。旧フォルダは退避先に残っている
+    assert_eq!(std::fs::read(record_path(&env)).ok(), before);
+    assert_eq!(
+        env.drive()
+            .resolve(&retired_dir().each_ref().map(String::as_str))
+            .map(|s| s.to_owned()),
+        Some(old_id.clone())
+    );
+    // PATCH の直前に、宛先と `incoming`・`replaced/` を観察している
+    let after = requests_after_last_record(&env);
+    assert!(
+        after.iter().any(|r| *r == req("list", "yamareco")),
+        "{after:?}"
+    );
+}
+
+#[test]
+fn a_retire_that_succeeds_and_a_publish_move_that_is_not_processed_leave_the_destination_empty_until_recover()
+ {
+    // 置き換えで、退避は成功し、公開の移動が 429。移動は 1 回だけ送る。復旧の表は前へ進める（`incoming` を宛先へ移す）が、
+    // その移動も 429 のままなら、`blocked`（execution_failed）で止まる。宛先は、`recover`（移動が通る状態で呼ぶ）まで空のまま。
+    // 旧フォルダは `replaced/` に、新しい一式は `incoming/` に残り、どちらもゴミ箱へは移さない
+    let env = Env::new("retire-ok-move-429");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let old_id = env.seed_managed(Y, FOLDER, &set);
+    // 1 つ目の移動（退避）は通る。2 つ目（公開）と、復旧の表の前へ進める移動（3 つ目）が 429
+    env.add_rule("move", 1, 2, fk::too_many_requests(0));
+    let mut hook = Hook::new(&env);
+    let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::Blocked);
+    let info = f.blocked.expect("blocked");
+    assert_eq!(info.reason, BlockedReason::ExecutionFailed);
+    assert_eq!(info.progress.stage, Stage::Publishing);
+    assert_eq!(
+        env.op_count("move"),
+        3,
+        "公開の移動 1 回 + 復旧の前へ進める 1 回"
+    );
+    assert_eq!(env.op_count("trash"), 0);
+    assert!(dest_id(&env).is_none(), "宛先は空のまま");
+    let d = env.drive();
+    assert_eq!(
+        d.resolve(&retired_dir().each_ref().map(String::as_str))
+            .map(|s| s.to_owned()),
+        Some(old_id.clone())
+    );
+    assert!(
+        d.resolve(&["geoframe-export-work", "incoming", JOB_A])
+            .is_some()
+    );
+    assert!(d.trashed.is_empty());
+
+    // 流量制限が解けたあとの `recover`: 前へ進めて公開し、旧フォルダをゴミ箱へ移す
+    let layout = env.layout(Y, FOLDER, JOB_A);
+    let r = env.remote();
+    let rec = Recovery {
+        remote: &r,
+        layout: &layout,
+        published: &env.published,
+        expected: None,
+        timing: fast_timing(),
+    };
+    let res = rec
+        .run(&info.progress, false, &mut Hook::new(&env))
+        .expect("復旧で公開できる");
+    let Resolution::Published(p) = res else {
+        panic!("{res:?}")
+    };
+    assert_eq!(dest_id(&env).as_deref(), Some(p.folder_id.as_str()));
+    assert_eq!(env.drive().trashed, [old_id]);
+}
+
+#[test]
+fn a_trash_that_succeeded_is_not_taken_as_done_while_a_same_named_item_remains() {
+    // ゴミ箱へ移すが成功した（応答が返った）が、同じ場所に同名の項目が見える。成功にせず `Mismatch`（`blocked`）
+    // 旧フォルダ（`replaced/`）
+    let env = Env::new("trash-then-dup-replaced");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let old_id = env.seed_managed(Y, FOLDER, &set);
+    env.add_rule(
+        "trash",
+        0,
+        1,
+        do_then_add_folder(
+            &["geoframe-export-work", "replaced"],
+            &format!("yamareco-{FOLDER}-{JOB_A}"),
+        ),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::Blocked);
+    let info = f.blocked.expect("blocked");
+    assert_eq!(info.reason, BlockedReason::TrashMismatch);
+    assert_eq!(env.drive().trashed, [old_id]);
+    assert_eq!(info.observed.expect("observed").replaced.len(), 1);
+
+    // `incoming/<job_id>`（中止の片付け）: 残りものとして知らせる
+    let env = Env::new("trash-then-dup-incoming");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    let mut hook = Hook::new(&env).mutate_after(Stage::Verifying, move || {
+        let mut d = model::Drive::load(&fake);
+        d.add_file(
+            &["geoframe-export-work", "incoming", JOB_A],
+            "extra.jpg",
+            1,
+            None,
+        );
+        d.save(&fake);
+    });
+    env.add_rule(
+        "trash",
+        0,
+        1,
+        do_then_add_folder(&["geoframe-export-work", "incoming"], JOB_A),
+    );
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::VerifyMismatch);
+    assert!(f.leftover_incoming);
 }

@@ -89,6 +89,8 @@ pub fn fast_tuning() -> Tuning {
             settle: Duration::from_millis(10),
             rounds: 3,
         },
+        // 流れの試験は、API の再試行に助けられずに、失敗がそのまま復旧の表へ渡ることを確かめる（再試行そのものは別の試験）
+        drive_retry: Some(super::drive::no_retry()),
         ..Tuning::default()
     }
 }
@@ -158,30 +160,37 @@ pub fn settle(rec: &mut geoframe_export::jobs::JobRecord, status: geoframe_expor
     }
 }
 
-/// 偽の rclone の `cmd`（`copy` など）が呼ばれる（`calls.log` に出る）まで待って、そのプロセスの PID を返す（最大 `secs` 秒）。
-pub fn wait_for_call(env: &Env, op: &str, secs: u64) -> i64 {
+/// 偽の Drive に、操作名 `op`（`upload` など）の要求が来る（`calls.log` に出る。効果の `sleep` は、記録のあとで眠る）まで待って、
+/// そのときまでに来た `op` の要求の数を返す（最大 `secs` 秒）。そのとき、その要求は飛んでいる（応答を待っている）。
+pub fn wait_for_call(env: &Env, op: &str, secs: u64) -> usize {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
-        // 偽の rclone が書いている途中の行（読めない行）は、読み飛ばして、次の周回で読む
+        // 偽のサーバーが書いている途中の行（読めない行）は、読み飛ばして、次の周回で読む
         let text = std::fs::read_to_string(env.fake_dir.join("calls.log")).unwrap_or_default();
-        if let Some(pid) = text
+        let n = text
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .filter(|c| c["kind"] == "rclone" && c["op"] == op)
-            .filter_map(|c| c["pid"].as_i64())
-            .next_back()
-        {
-            return pid;
+            .filter(|c| c["kind"] == "http" && c["op"] == op)
+            .count();
+        if n > 0 {
+            return n;
         }
         assert!(Instant::now() < deadline, "{op} が呼ばれません");
         std::thread::sleep(Duration::from_millis(5));
     }
 }
 
-/// そのプロセスが（ゾンビも含めて）まだ存在するか。
-pub fn process_exists(pid: i64) -> bool {
-    // SAFETY: シグナル 0 は、存在の確かめだけ（何も送らない）。
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+/// 呼び出しの記録の行数。止まったあと（`quiet_since`）に、新しい要求が来ないことの確認に使う。
+pub fn call_count(env: &Env) -> usize {
+    env.calls().len()
+}
+
+/// 呼び出しの記録の行数が、`ms` ミリ秒のあいだ増えない（止まったあとに、飛んでいる要求も新しい要求も無い）。
+#[track_caller]
+pub fn assert_quiet(env: &Env, ms: u64) {
+    let before = call_count(env);
+    std::thread::sleep(Duration::from_millis(ms));
+    assert_eq!(call_count(env), before, "止まったあとに、要求が来ています");
 }
 
 /// 状態ディレクトリの `staging/` の直下の数。

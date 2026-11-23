@@ -1,8 +1,9 @@
 //! note 記事用の写真書き出し（`geoframe-export`。docs/note-photo-export/design.md）。
 //!
 //! 写真サービス（`geoframe serve`）とは別のプロセスで、`geoframe` crate には依存しない。つながりは HTTP
-//! （一覧 API `GET /api/admin/export/photos` と `/derivatives/*`）だけ。Drive へは、今は rclone（[`rclone`]）を子プロセスで呼んで送る。
-//! Drive を操作する側（[`drive`]・[`publish`]・[`flow`]・[`recover`]）は、中立の入口（[`remote`]）だけを使い、rclone を知らない。
+//! （一覧 API `GET /api/admin/export/photos` と `/derivatives/*`）だけ。Drive へは、Drive API（HTTPS。[`drive::api`]。フォルダ・ファイルは Drive の ID で指す）を直接呼んで送る。
+//! Drive を操作する側（[`drive`]・[`publish`]・[`flow`]・[`recover`]）は、中立の入口（[`remote`]）だけを使う。rclone を子プロセスで呼ぶ [`rclone`] は、
+//! バイナリからは使わない（3 段目で消す）。
 //!
 //! モジュールと、後のタスクが乗る場所:
 //!
@@ -12,14 +13,15 @@
 //! | [`date`] | 日付・時刻・期間（14 日以下の検査） | T2 |
 //! | [`request`] | 要求の検査（HTTP と CLI で共通） | T2 |
 //! | [`folder`] | 書き出し先のフォルダ名 4 通り | T2 |
-//! | [`settings`] | 起動引数の検査（接頭辞・work-root・feed-base） | T2 |
-//! | [`rclone_conf`] | rclone 設定の専用 client_id・持ち主・権限の検査 | T2 |
+//! | [`settings`] | 起動引数の検査（Drive の ID・資格情報のパス・feed-base） | T2 |
+//! | [`rclone_conf`] | rclone 設定の読み取り（`import-credentials` の取り込み元。3 段目で消す） | T2 |
+//! | [`import`] | `import-credentials`（rclone の設定から Drive の資格情報のファイルを 1 回だけ作る） | PR② |
 //! | [`startup`] | 起動時の検査の入口（serve・run・recover が必ず通る） | T2 |
 //! | [`feed`] | 一覧 API の取得（30 秒・8MB・リダイレクトなし） | T2 |
 //! | [`listing`] | 一覧 API の値の検査（4.4）と候補の選び方 | T2 |
 //! | [`cli`]・[`app`] | 引数の解釈と、コマンドの振り分け | T2 |
 //! | [`image`]・[`jpeg`]・[`measure`]・[`staging`]・[`manifest`] | 画像の取得と書き出しの入口、JPEG の区画の検査とデコード、明るさ・シャープネス、作業領域、manifest | T3 |
-//! | [`remote`]・[`rclone`]・[`drive`]・[`publish`]・[`recovery`]・[`published`]・[`jsonfile`]・[`jobid`] | Drive の操作の入口と中立の型（`Remote`・`Entry`・`RemoteLoc`・`RemoteError`・Drive の ID／MD5／相対パスの検査）、その今の実装としての rclone の起動（引数の組み立て・子プロセス・標準エラーの伏せ字・`lsjson` の読み取り）、Drive への照会と操作・管理しているフォルダの判定、incoming → 検証 → 公開・退避・復旧の実行、復旧の表（純粋な関数）、公開の記録、アトミックな JSON の書き方、ジョブ ID | T4 |
+//! | [`remote`]・[`rclone`]・[`drive`]（[`drive::api`]・[`drive::auth`]・[`drive::http`] は Drive API を ID で指す操作の型。docs/note-photo-export/drive-api.md）・[`publish`]・[`recovery`]・[`published`]・[`jsonfile`]・[`jobid`] | Drive の操作の入口と中立の型（`Remote`・`Entry`・`RemoteLoc`・`RemoteError`・Drive の ID／MD5／相対パスの検査）、その今の実装としての rclone の起動（引数の組み立て・子プロセス・標準エラーの伏せ字・`lsjson` の読み取り）、Drive への照会と操作・管理しているフォルダの判定、incoming → 検証 → 公開・退避・復旧の実行、復旧の表（純粋な関数）、公開の記録、アトミックな JSON の書き方、ジョブ ID | T4 |
 //! | [`sys`]・[`cancel`]・[`lock`]・[`jobs`]・[`flow`]・[`service`]・[`run`]・[`recover`] | OS への問い合わせ（flock・現地時刻・実効ユーザー ID）、キャンセルの印（SIGINT・SIGTERM）、実行枠、ジョブの記録と状態ディレクトリの配置、ジョブの流れ・復旧・`dry_run`、受付と照会の層（T6 が使う）、`run`・`recover` | T5 |
 //! | [`serve`] | HTTP の入口（トークン・送信元の制限・本文の検査・接続の上限・ジョブ API・シグナルでの終了） | T6 |
 
@@ -32,6 +34,7 @@ pub mod error;
 pub mod feed;
 pub mod folder;
 pub mod image;
+pub mod import;
 pub mod jobid;
 pub mod jpeg;
 pub mod jsonfile;

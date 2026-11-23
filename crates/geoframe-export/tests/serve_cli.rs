@@ -1,7 +1,7 @@
 //! T6: `geoframe-export serve`（本物のバイナリ）。起動の検査（弱いトークン・`--listen`）と、SIGTERM・SIGINT での終わり方
-//! （実行中のジョブの rclone を止めてから終わる。AC9 の SIGINT・SIGTERM の行の HTTP 側）。偽の写真サービス（127.0.0.1 の空きポート）・
-//! 偽の rclone・偽の Drive だけを使う（`--feed-base` は必ず偽のサイトへ。本物の写真サービス 127.0.0.1:8080 には接続しない。
-//! `serve` の待ち受けも空きポート）。
+//! （実行中のジョブのアップロードのスレッドを全部止めて join してから終わる。AC9 の SIGINT・SIGTERM の行の HTTP 側）。偽の写真サービス
+//! （127.0.0.1 の空きポート）・偽の Drive の HTTP サーバー（`--drive-endpoint`）だけを使う（`--feed-base` は必ず偽のサイトへ。本物の
+//! 写真サービス 127.0.0.1:8080 にも、本物の Google にも接続しない。`serve` の待ち受けも空きポート）。
 
 mod common;
 
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use common::drive::*;
 use common::http::*;
 use common::site::*;
-use common::{FakeSite, good_config, set_mode, write_config};
+use common::{FakeSite, set_mode};
 use geoframe_export::jobs::{JobStore, Status};
 use serde_json::{Value, json};
 
@@ -42,18 +42,12 @@ fn token_file(env: &Env, name: &str, content: &[u8], mode: u32) -> std::path::Pa
     path
 }
 
-/// `geoframe-export run`（別のプロセスの CLI）。偽の rclone・偽の写真サービス・同じ状態ディレクトリ。
+/// `geoframe-export run`（別のプロセスの CLI）。偽の Drive・偽の写真サービス・同じ状態ディレクトリ。
 fn spawn_run(env: &Env, site: &FakeSite) -> Child {
-    write_config(&env.state, good_config("gdrive").as_bytes());
     Command::new(env!("CARGO_BIN_EXE_geoframe-export"))
         .args(["run", "--from", DAY, "--destination", "yamareco"])
         .args(["--feed-base", &format!("http://{}", site.addr)])
-        .args(["--rclone", env!("CARGO_BIN_EXE_fake-rclone")])
-        .args([
-            "--rclone-config",
-            env.state.join("rclone/rclone.conf").to_str().unwrap(),
-        ])
-        .args(["--state-dir", env.state.to_str().unwrap()])
+        .args(env.cli_settings_args())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -61,7 +55,7 @@ fn spawn_run(env: &Env, site: &FakeSite) -> Child {
         .expect("起動")
 }
 
-/// 試験が失敗しても、起動した子（と、その偽の rclone）を残さない。
+/// 試験が失敗しても、起動した子を残さない。
 struct Reaper(Vec<Child>);
 
 impl Drop for Reaper {
@@ -81,18 +75,12 @@ impl Drop for Reaper {
 }
 
 fn spawn_serve(env: &Env, site: &FakeSite, listen: &str, token: &std::path::Path) -> Child {
-    write_config(&env.state, good_config("gdrive").as_bytes());
     Command::new(env!("CARGO_BIN_EXE_geoframe-export"))
         .args(["serve", "--listen", listen])
         .args(["--token-file", token.to_str().unwrap()])
         .args(["--allow", "127.0.0.1"])
         .args(["--feed-base", &format!("http://{}", site.addr)])
-        .args(["--rclone", env!("CARGO_BIN_EXE_fake-rclone")])
-        .args([
-            "--rclone-config",
-            env.state.join("rclone/rclone.conf").to_str().unwrap(),
-        ])
-        .args(["--state-dir", env.state.to_str().unwrap()])
+        .args(env.cli_settings_args())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -187,7 +175,8 @@ fn expect_refused(env: &Env, site: &FakeSite, listen: &str, token: &std::path::P
         );
     }
     assert!(out.stdout.is_empty(), "{label}");
-    assert!(env.calls().is_empty(), "{label}: rclone に触れた");
+    // 起動時の検査（トークンと get）のほかには、Drive に触れない
+    env.assert_startup_only();
     assert!(
         !env.state.join("jobs").exists(),
         "{label}: 検査に通らないのに状態を作った"
@@ -238,12 +227,12 @@ fn serve_refuses_to_start_with_a_weak_token_file_or_a_wildcard_listen() {
 }
 
 #[test]
-fn sigterm_and_sigint_stop_the_running_jobs_rclone_before_serve_exits() {
+fn sigterm_and_sigint_stop_the_running_jobs_threads_before_serve_exits() {
     for (name, sig) in [("SIGTERM", libc::SIGTERM), ("SIGINT", libc::SIGINT)] {
         let env = Env::new(&format!("cli-sig-{}", name.to_lowercase()));
         let site = photo_site(DAY, DAY, three());
-        // 写真を送る copy を 30 秒止める（signal で止まらなければ、30 秒かかる）
-        env.add_rule("upload", 0, 1, sleep_ms(30_000));
+        // 写真を送る要求を 2 秒止める（要求の最中には印を見ないので、その要求が終わってから止まる）
+        env.add_rule("upload", 0, 1, sleep_ms(2000));
         let token = token_file(&env, "token", format!("{TOKEN}\n").as_bytes(), 0o600);
         let addr = free_addr();
         let mut child = spawn_serve(&env, &site, &addr.to_string(), &token);
@@ -265,8 +254,7 @@ fn sigterm_and_sigint_stop_the_running_jobs_rclone_before_serve_exits() {
         };
         assert_eq!(accepted.status, 202, "{name}: {}", accepted.body);
         let job_id = accepted.json()["job_id"].as_str().unwrap().to_owned();
-        let copy_pid = wait_for_call(&env, "upload", 30);
-        assert!(process_exists(copy_pid), "{name}: copy が動いている");
+        wait_for_call(&env, "upload", 30);
 
         let sent = Instant::now();
         send(pid, sig);
@@ -275,11 +263,8 @@ fn sigterm_and_sigint_stop_the_running_jobs_rclone_before_serve_exits() {
             sent.elapsed() < Duration::from_secs(20),
             "{name}: 止まるのが遅い"
         );
-        // 親が終わった時点で、rclone はもう居ない。実行枠も外れている
-        assert!(
-            !process_exists(copy_pid),
-            "{name}: 親が終わったのに rclone が残っている"
-        );
+        // 親が終わった時点で、飛んでいる要求も新しい要求も無い（全スレッドが止まって join された）。実行枠も外れている
+        assert_quiet(&env, 300);
         assert!(slot_is_free(&env.state), "{name}: 実行枠が外れない");
         assert_eq!(out.code, Some(0), "{name}: {} {}", out.stdout, out.stderr);
         assert!(out.stdout.is_empty(), "{name}: {}", out.stdout);
@@ -329,7 +314,7 @@ fn a_sigterm_during_the_startup_recovery_ends_serve_without_listening() {
     let env = Env::new("cli-recovery-sig");
     let site = photo_site(DAY, DAY, three());
     let token = token_file(&env, "token", TOKEN.as_bytes(), 0o600);
-    env.add_rule("upload", 0, 1, sleep_ms(30_000));
+    env.add_rule("upload", 0, 1, sleep_ms(2000));
     let addr = free_addr();
     let mut child = spawn_serve(&env, &site, &addr.to_string(), &token);
     wait_ready(&mut child, addr);
@@ -375,12 +360,11 @@ fn a_sigterm_during_the_startup_recovery_ends_serve_without_listening() {
 fn while_a_separate_cli_run_holds_the_slot_http_posts_get_409_until_it_ends() {
     let env = Env::new("cli-vs-http");
     let site = photo_site(DAY, DAY, three());
-    // 写真を送る copy を 30 秒止める（CLI の run が実行中のまま）
-    env.add_rule("upload", 0, 1, sleep_ms(30_000));
+    // 写真を送る要求を 4 秒止める（CLI の run が実行中のまま）
+    env.add_rule("upload", 0, 1, sleep_ms(4000));
     let mut kids = Reaper(Vec::new());
     kids.0.push(spawn_run(&env, &site));
-    let copy_pid = wait_for_call(&env, "upload", 30);
-    assert!(process_exists(copy_pid));
+    wait_for_call(&env, "upload", 30);
 
     let token = token_file(&env, "token", TOKEN.as_bytes(), 0o600);
     let addr = free_addr();
@@ -401,14 +385,12 @@ fn while_a_separate_cli_run_holds_the_slot_http_posts_get_409_until_it_ends() {
     let list = get(addr, "/v1/exports", TOKEN).json();
     assert_eq!(list["jobs"].as_array().map(Vec::len), Some(1), "{list}");
     assert_eq!(list["jobs"][0]["status"], "running", "{list}");
-    assert!(process_exists(copy_pid), "CLI の rclone が止められた");
 
-    // CLI を止める（SIGTERM。rclone を止めて回収してから、枠を手放して 1 で終わる）
+    // CLI を止める（SIGTERM。飛んでいる要求が終わってから、全スレッドを止めて、枠を手放して 1 で終わる）
     let run = kids.0.remove(0);
     send(run.id(), libc::SIGTERM);
     let out = wait_exit(run, 20);
     assert_eq!(out.code, Some(1), "{} {}", out.stdout, out.stderr);
-    assert!(!process_exists(copy_pid));
     assert!(slot_is_free(&env.state), "CLI が終わったのに枠が空かない");
     // 枠が空けば、HTTP の dry_run は通る（書かない確認。上で枠のファイルを開いた直後の見かけの busy は、打ち直す）
     let deadline = Instant::now() + Duration::from_secs(10);

@@ -1,9 +1,10 @@
 //! T5: SIGINT・SIGTERM（design.md 4.1 の手順 11、8 章「同時実行」）。本物のバイナリ（`geoframe-export run`）を起動して signal を送り、
-//! 親が終わったとき、偽の rclone（子）がもう居ないこと、そのあとに次のプロセスが実行枠を取れること、記録が `blocked`・`failed` に
-//! ならず次の復旧に渡されることを確かめる。偽の写真サービス（127.0.0.1 の空きポート）と偽の rclone・偽の Drive だけを使う
-//! （`--feed-base` は必ず偽のサイトへ。本物の写真サービス 127.0.0.1:8080 には接続しない）。
-//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る。`// rclone 固有` と
-//! 書いた確認（`assert_rclone_safe_calls`）だけが rclone の引数・環境変数を見る（rclone 版を消すときに消す）。
+//! 親が終わったとき、飛んでいる Drive の要求も、新しい要求も無いこと（アップロードのスレッドが全部止まって join された）、そのあとに
+//! 次のプロセスが実行枠を取れること、記録が `blocked`・`failed` にならず次の復旧に渡されることを確かめる。偽の写真サービス
+//! （127.0.0.1 の空きポート）と、偽の Drive の HTTP サーバー（`--drive-endpoint`）だけを使う
+//! （`--feed-base` は必ず偽のサイトへ。本物の写真サービス 127.0.0.1:8080 にも、本物の Google にも接続しない）。
+//! キャンセルは、要求の前・再試行の待ち・チャンクの間で見る（要求の最中には見ない）ので、飛んでいる要求が終わってから止まる。
+//! その要求は、印のあとで Drive に届きうる（結果不明として、次の復旧が今の Drive の状態から続ける）。
 
 mod common;
 
@@ -11,9 +12,9 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::FakeSite;
 use common::drive::*;
 use common::site::*;
-use common::{FakeSite, good_config, write_config};
 use geoframe_export::jobs::{JobStore, Status};
 use geoframe_export::recovery::Stage;
 use serde_json::Value;
@@ -30,16 +31,10 @@ fn three() -> Vec<Value> {
 
 /// `geoframe-export run`（本物のバイナリ）を起動する。
 fn spawn_run(env: &Env, site: &FakeSite) -> Child {
-    write_config(&env.state, good_config("gdrive").as_bytes());
     Command::new(env!("CARGO_BIN_EXE_geoframe-export"))
         .args(["run", "--from", DAY, "--destination", "yamareco"])
         .args(["--feed-base", &format!("http://{}", site.addr)])
-        .args(["--rclone", env!("CARGO_BIN_EXE_fake-rclone")])
-        .args([
-            "--rclone-config",
-            env.state.join("rclone/rclone.conf").to_str().unwrap(),
-        ])
-        .args(["--state-dir", env.state.to_str().unwrap()])
+        .args(env.cli_settings_args())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -94,19 +89,18 @@ fn send(pid: u32, sig: libc::c_int) {
     assert_eq!(rc, 0, "signal を送れません");
 }
 
-/// 実行中の `run` に signal を送ると、実行中の rclone を止めて `wait` し終えてから終わる（子が残らない）。実行枠はそのあとで外れ、
+/// 実行中の `run` に signal を送ると、飛んでいる要求が終わるのを待ち、アップロードのスレッドを全部止めて join してから終わる。実行枠はそのあとで外れ、
 /// 記録は確定せず `running` のまま（Drive の段階が記録にある）。次の起動の復旧が、その記録を表のとおり片付けて、書き出しを進める。
 #[test]
-fn sigint_and_sigterm_stop_the_child_before_the_parent_exits_and_leave_the_record_to_recovery() {
+fn sigint_and_sigterm_stop_every_thread_before_the_parent_exits_and_leave_the_record_to_recovery() {
     for (name, sig) in [("SIGINT", libc::SIGINT), ("SIGTERM", libc::SIGTERM)] {
         let mut env = Env::new(&format!("sig-{}", name.to_lowercase()));
         let site = photo_site(DAY, DAY, three());
-        // 写真を送る copy を、30 秒止める（signal で止まらなければ、30 秒かかる）
-        env.add_rule("upload", 0, 1, sleep_ms(30_000));
+        // 写真を送る要求を、2 秒止める（要求の最中には印を見ないので、その要求が終わってから止まる）
+        env.add_rule("upload", 0, 1, sleep_ms(2000));
         let child = spawn_run(&env, &site);
         let pid = child.id();
-        let copy_pid = wait_for_call(&env, "upload", 30);
-        assert!(process_exists(copy_pid), "{name}: copy が動いている");
+        wait_for_call(&env, "upload", 30);
 
         let sent = Instant::now();
         send(pid, sig);
@@ -117,11 +111,9 @@ fn sigint_and_sigterm_stop_the_child_before_the_parent_exits_and_leave_the_recor
             sent.elapsed()
         );
 
-        // 親が終わった時点で、子（偽の rclone）はもう居ない。そのあとで、次のプロセスが実行枠を取れる
-        assert!(
-            !process_exists(copy_pid),
-            "{name}: 親が終わったのに、rclone が残っている"
-        );
+        // 親が終わった時点で、飛んでいる要求も新しい要求も無い（全スレッドが止まって join された）。そのあとで、次のプロセスが
+        // 実行枠を取れる
+        assert_quiet(&env, 300);
         assert!(slot_is_free(&env.state), "{name}: 実行枠が外れない");
 
         // 終了コード 1。記録（running）を標準出力に、説明を標準エラーに出す
@@ -161,8 +153,8 @@ fn sigint_and_sigterm_stop_the_child_before_the_parent_exits_and_leave_the_recor
         let s = submit_retry(&next, &req).unwrap();
         let v = wait_done(&next, &s.job_id);
         assert_eq!(v["status"], "succeeded", "{name}: {v}");
-        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-        assert_rclone_safe_calls(&env);
+        // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+        env.assert_api_calls_safe();
     }
 }
 
@@ -178,29 +170,32 @@ fn a_run_without_a_signal_still_finishes_normally_with_the_handlers_installed() 
     assert!(slot_is_free(&env.state));
 }
 
-/// 異常終了（SIGKILL。印を見られない終わり方）の補助: 子に `PR_SET_PDEATHSIG`（SIGKILL）が付いているので、親が死ぬと子も止まる。
-/// これは排他の保証ではない（親が死んでから子が止まるまでに隙がある）。排他は、signal を印にして、子を止めてから枠を外す側で守る。
+/// 異常終了（SIGKILL。印を見られない終わり方）: 子プロセスは無く、実行枠（flock）はカーネルが外す。記録は running のまま次の復旧に渡る
+/// （飛んでいた要求が Drive に届いたかどうかは分からない。次の復旧が、今の Drive の状態から表のとおり片付ける）。
 #[test]
-fn a_killed_parent_takes_its_rclone_child_with_it_as_a_backstop() {
-    let env = Env::new("sig-kill");
+fn a_killed_parent_releases_the_slot_and_leaves_the_record_to_recovery() {
+    let mut env = Env::new("sig-kill");
     let site = photo_site(DAY, DAY, three());
-    env.add_rule("upload", 0, 1, sleep_ms(30_000));
+    env.add_rule("upload", 0, 1, sleep_ms(1500));
     let child = spawn_run(&env, &site);
     let pid = child.id();
-    let copy_pid = wait_for_call(&env, "upload", 30);
-    assert!(process_exists(copy_pid));
+    wait_for_call(&env, "upload", 30);
     send(pid, libc::SIGKILL);
-    let _ = wait_exit(child, 15);
-    // 親は印も見られずに死んだ。子は、カーネルが SIGKILL で止める（数 ms。init が回収するまで、短い間ゾンビで残りうる）
-    let until = Instant::now() + Duration::from_secs(5);
-    while process_exists(copy_pid) && Instant::now() < until {
-        std::thread::sleep(Duration::from_millis(10));
-    }
-    assert!(
-        !process_exists(copy_pid),
-        "親が死んでも、rclone が残っている"
-    );
+    let out = wait_exit(child, 15);
+    assert_eq!(out.code, None, "signal で死んだ");
     assert!(slot_is_free(&env.state));
+    let scan = JobStore::open(&env.state).unwrap().scan();
+    assert!(scan.blocking().is_none());
+    assert_eq!(scan.records[0].status, Status::Running);
+    // 飛んでいた要求が終わるのを待って、次の起動の復旧が片付け、書き出しが進む
+    std::thread::sleep(Duration::from_millis(1800));
+    let next = service(&mut env, &site);
+    assert!(matches!(
+        startup_recovery_retry(&next),
+        geoframe_export::service::StartupReport::Done { .. }
+    ));
+    let scan = JobStore::open(&env.state).unwrap().scan();
+    assert_eq!(scan.records[0].status, Status::Interrupted);
 }
 
 /// バイナリは、標準エラーに完了ログ（1 行）を出す。標準出力は、コマンドの JSON だけ（ログが混ざらない）。

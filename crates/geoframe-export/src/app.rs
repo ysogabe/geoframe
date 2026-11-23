@@ -1,7 +1,9 @@
 //! コマンドの振り分け。引数の解釈 → 起動時の検査 → サブコマンド。
 //!
 //! 起動時の検査（[`crate::startup::startup_check`]）は、`run`（`--dry-run` を含む）・`serve`・`recover` のどれでも、
-//! 中身を始める前に通る。通らなければ何もせず終了コード 2。表示には設定ファイルの値を出さない。
+//! 中身を始める前に通る（Drive へトークンを 1 回取りに行き、3 つのフォルダを確かめる）。通らなければ何もせず、設定の誤り・
+//! 再認可が要るなら終了コード 2、通信の失敗・5xx なら 1。表示には資格情報・ID の値を出さない。
+//! `import-credentials` は、起動時の検査を通らない（Drive に触れない。root が sudo で 1 回だけ動かす）ので、root でも動く。
 //!
 //! root（実効ユーザー ID が 0）で直接動かされたら、`run`・`serve`・`recover` は断る（終了コード 2）。専用のユーザーで動かす
 //! （design.md 6.2）。実効ユーザー ID は [`run_command`] の引数で受け取る（バイナリの `main` が本物の値を渡す。
@@ -34,7 +36,7 @@ pub fn run_command(
 }
 
 /// [`run_command`] に、キャンセルの印を渡せる形。`run` と `serve` が使う。`handle_signals` が真なら、SIGINT・SIGTERM を
-/// プロセスを終わらせずに `cancel` の印を立てる受け口にする（実行中の rclone を止めて `wait` し終えてから終わる）。バイナリの
+/// プロセスを終わらせずに `cancel` の印を立てる受け口にする（飛んでいる要求が終わってから、アップロードのスレッドを全部止めて終わる）。バイナリの
 /// `main` だけが真にする（プロセス内の試験は並列で 1 つのプロセスを共有するので、受け口を入れない）。
 ///
 /// - `run`: `run` の前に libc の handler を入れる（[`crate::cancel::install_signal_handlers`]）。
@@ -53,7 +55,12 @@ pub fn run_command_cancellable(
         Ok(command) => command,
         Err(e) => return usage_error(&e, err),
     };
-    if euid == Some(0) && !matches!(command, Command::Version | Command::Help) {
+    if euid == Some(0)
+        && !matches!(
+            command,
+            Command::Version | Command::Help | Command::ImportCredentials { .. }
+        )
+    {
         let _ = writeln!(
             err,
             "geoframe-export: root では動かしません。専用のユーザーで実行してください"
@@ -112,6 +119,11 @@ pub fn run_command_cancellable(
             }
             recover::recover(&settings, resolve.as_deref(), out, err)
         }
+        Command::ImportCredentials {
+            rclone_config,
+            remote,
+            out: out_path,
+        } => crate::import::run(&rclone_config, &remote, &out_path, out, err),
     }
 }
 
@@ -125,7 +137,7 @@ fn install_handlers(cancel: &Cancel, err: &mut dyn Write) -> Result<(), u8> {
 fn startup(settings: &crate::settings::Settings, err: &mut dyn Write) -> Result<(), u8> {
     startup_check(settings).map_err(|e| {
         let _ = writeln!(err, "geoframe-export: 起動しません: {e}");
-        EXIT_USAGE
+        e.exit_code()
     })
 }
 

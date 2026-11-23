@@ -33,7 +33,7 @@
 //! ## キャンセル（SIGINT・SIGTERM）と終わりの待ち（T6 から）
 //!
 //! [`Service::cancel`] が返す [`Cancel`] の印を立てると（[`crate::cancel`]。signal の handler か、tokio のシグナルの受け口から）、
-//! 実行中のジョブは、起動している rclone を止めて `wait` し終えてから、記録を確定せずに（Drive の段階が記録にあれば
+//! 実行中のジョブは、飛んでいる要求が終わるのを待ち、アップロードのスレッドを全部止めて join し終えてから、記録を確定せずに（Drive の段階が記録にあれば
 //! `running` のまま）終わる。止まったジョブの記録は、次の復旧（起動時・次のジョブの前・`recover`）が片付ける。`serve` は、印を
 //! 立てたあと、新しい受付を止め、[`Service::wait_idle`] で実行中のジョブのスレッドの終わりを待ってから、プロセスを終える
 //! （実行枠はジョブのスレッドが手放す。待たずに終えると、子が残るか、記録が中途のまま終わる）。
@@ -57,6 +57,7 @@ use crate::jobid::JobId;
 use crate::jobs::{Blocking, JobRecord, JobStore, REQUEST_ID_WINDOW, ReadOutcome, Status};
 use crate::lock::{self, Slot, SlotGuard};
 use crate::published::PublishedStore;
+use crate::remote::Remote;
 use crate::request::ExportRequest;
 use crate::settings::Settings;
 
@@ -175,6 +176,8 @@ impl Drop for RunningGuard {
 
 struct Inner {
     settings: Settings,
+    /// Drive の操作の入口（トークンは持ち回る。キャンセルの印は共有済み）。
+    remote: Remote,
     store: JobStore,
     published: PublishedStore,
     tuning: Tuning,
@@ -188,6 +191,7 @@ impl Inner {
     fn context(&self) -> Context<'_> {
         Context {
             settings: &self.settings,
+            remote: &self.remote,
             store: &self.store,
             published: &self.published,
             tuning: &self.tuning,
@@ -220,9 +224,24 @@ impl Service {
     ) -> Result<Self, ExportError> {
         let store = JobStore::open(&settings.state_dir)?;
         let published = PublishedStore::in_state_dir(&settings.state_dir);
+        let mut remote = Remote::new(&settings)
+            .map_err(|_| {
+                ExportError::new(
+                    ErrorCode::Internal,
+                    "Drive の資格情報を読めません（--drive-credentials）",
+                )
+            })?
+            .with_cancel(cancel.clone());
+        if let Some(retry) = tuning.drive_retry {
+            remote = remote.with_retry(retry);
+        }
+        if let Some((page, multipart, chunk)) = tuning.drive_sizes {
+            remote = remote.with_sizes(page, multipart, chunk);
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 settings,
+                remote,
                 store,
                 published,
                 tuning,
@@ -237,7 +256,7 @@ impl Service {
         &self.inner.settings
     }
 
-    /// キャンセルの印（立てると、実行中のジョブは rclone を止めて、記録を確定せずに終わる。上の「キャンセル」）。
+    /// キャンセルの印（立てると、実行中のジョブはスレッドを止めて、記録を確定せずに終わる。上の「キャンセル」）。
     pub fn cancel(&self) -> &Cancel {
         &self.inner.cancel
     }

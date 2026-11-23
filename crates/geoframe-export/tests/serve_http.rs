@@ -483,16 +483,15 @@ fn while_a_job_runs_a_second_request_and_a_dry_run_get_409_and_the_same_request_
     const TOKEN: &str = "AC8-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
     let mut env = Env::new("http-busy");
     let site = photo_site(DAY, DAY, three());
-    // 写真を送る copy を 30 秒止める（ジョブが実行中のまま）
-    env.add_rule("upload", 0, 1, sleep_ms(30_000));
+    // 写真を送る要求を 3 秒止める（ジョブが実行中のまま）
+    env.add_rule("upload", 0, 1, sleep_ms(3000));
     let server = Server::start(&mut env, &site, TOKEN);
     let addr = server.addr;
 
     let first = post_retry(addr, TOKEN, &day_body(json!({"request_id": "rid-busy"})));
     assert_eq!(first.status, 202, "{}", first.body);
     let job_id = first.json()["job_id"].as_str().unwrap().to_owned();
-    let copy_pid = wait_for_call(&env, "upload", 30);
-    assert!(process_exists(copy_pid));
+    wait_for_call(&env, "upload", 30);
 
     // GET: 実行中
     let v = get(addr, &format!("/v1/exports/{job_id}"), TOKEN).json();
@@ -524,17 +523,14 @@ fn while_a_job_runs_a_second_request_and_a_dry_run_get_409_and_the_same_request_
     let list = get(addr, "/v1/exports", TOKEN).json();
     assert_eq!(list["jobs"].as_array().map(Vec::len), Some(1), "{list}");
 
-    // 終わらせる: 印を立てると、新しい受付を閉じ、rclone を止めて待ってから終わる（記録は running のまま次の復旧へ）
+    // 終わらせる: 印を立てると、新しい受付を閉じ、飛んでいる要求が終わるのを待って全スレッドを止めてから終わる（記録は running のまま次の復旧へ）
     let started = Instant::now();
     assert_eq!(server.stop(), 0);
     assert!(
         started.elapsed() < Duration::from_secs(20),
         "止まるのが遅い"
     );
-    assert!(
-        !process_exists(copy_pid),
-        "終わったのに rclone が残っている"
-    );
+    assert_quiet(&env, 300);
     assert!(slot_is_free(&env.state));
     let store = geoframe_export::jobs::JobStore::open(&env.state).unwrap();
     assert_eq!(
@@ -709,13 +705,10 @@ fn a_dry_run_returns_200_and_only_reads_the_drive() {
     assert_eq!(v["candidate_count"], 3);
     assert_eq!(v["target"], "absent");
     assert_eq!(v["derivative_pending"], 0);
-    // Drive には何も書かない: 呼ばれたのは lsjson（と管理の確認の cat）だけ。記録も作らない
+    // Drive には何も書かない: 呼ばれたのは一覧・読み出し・起動後の確認（get）とトークンだけ。記録も作らない
     let used = env.ops_used();
-    assert!(!used.is_empty(), "Drive に照会していない");
-    assert!(
-        used.iter().all(|c| c == "list" || c == "read"),
-        "書く操作が呼ばれた: {used:?}"
-    );
+    assert!(used.contains(&"list".to_owned()), "Drive に照会していない");
+    env.assert_read_only();
     assert_eq!(job_files(&env), 0);
     // dry_run: false は、ふつうの受付
     let r = post_retry(server.addr, TOKEN, &day_body(json!({"dry_run": false})));
@@ -1101,13 +1094,13 @@ fn outside_sources_use_their_own_small_pool_and_never_the_allowed_slots() {
 
 // ---- 終了: 接続の打ち切りの期限と、後始末の完了は別 ----
 
-/// 接続の期限（`shutdown_wait`）が 0 でも、親は、子の rclone を止めて回収し、実行枠を手放してから返る。
+/// 接続の期限（`shutdown_wait`）が 0 でも、親は、アップロードのスレッドを全部止めて join し、実行枠を手放してから返る。
 #[test]
-fn stopping_returns_only_after_the_child_is_reaped_even_with_no_time_left_for_connections() {
+fn stopping_returns_only_after_every_thread_has_joined_even_with_no_time_left_for_connections() {
     const TOKEN: &str = "STOP-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
     let mut env = Env::new("http-stop-reap");
     let site = photo_site(DAY, DAY, three());
-    env.add_rule("upload", 0, 1, sleep_ms(30_000));
+    env.add_rule("upload", 0, 1, sleep_ms(2000));
     let limits = Limits {
         shutdown_wait: Duration::ZERO,
         ..Limits::default()
@@ -1121,17 +1114,13 @@ fn stopping_returns_only_after_the_child_is_reaped_even_with_no_time_left_for_co
     );
     let r = post_retry(server.addr, TOKEN, &day_body(json!({})));
     assert_eq!(r.status, 202, "{}", r.body);
-    let copy_pid = wait_for_call(&env, "upload", 30);
-    assert!(process_exists(copy_pid));
+    wait_for_call(&env, "upload", 30);
 
     let started = Instant::now();
     // 接続の期限が 0 なので、終了コードは 0 か 1（接続のタスクの片付けが間に合ったか）。確かめるのは、返った時点の状態
     let code = server.stop();
     assert!(code <= 1, "{code}");
-    assert!(
-        !process_exists(copy_pid),
-        "返ったのに、子の rclone が残っている（回収されていない）"
-    );
+    assert_quiet(&env, 300);
     assert!(slot_is_free(&env.state), "返ったのに、実行枠が外れていない");
     assert!(started.elapsed() < Duration::from_secs(20));
     let store = geoframe_export::jobs::JobStore::open(&env.state).unwrap();

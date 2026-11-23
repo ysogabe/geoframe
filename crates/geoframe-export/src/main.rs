@@ -11,9 +11,9 @@ fn main() -> ExitCode {
             }
         }
     }
-    // ログは標準エラーへ（標準出力はコマンドの JSON 専用）。完了ログと rclone の警告が出る
+    // ログは標準エラーへ（標準出力はコマンドの JSON 専用）。完了ログと Drive の警告が出る
     geoframe_export::logging::init();
-    // `run`・`serve` では、SIGINT・SIGTERM で終わらず、キャンセルの印を立てる。実行中の rclone を止めて `wait` し終えてから、
+    // `run`・`serve` では、SIGINT・SIGTERM で終わらず、キャンセルの印を立てる。飛んでいる要求が終わるのを待ち、アップロードのスレッドを全部止めて join し終えてから、
     // 実行枠を手放して終わる（子が残ったまま、枠だけが外れないように）。`run` の受け口は libc の handler、`serve` の受け口は
     // tokio のシグナル（どちらも `run_command_cancellable` の `handle_signals` が真のとき、その中で入れる）
     let cancel = geoframe_export::cancel::Cancel::new();

@@ -17,9 +17,9 @@
 //!    持ったまま、次のジョブより前に書き直し（[`crate::publish::Published::retry_record`]）、それでも書けなければ `notes` に残す。
 //! 8. 作業領域を消す（[`crate::staging::Workspace`] を手放す。成功・失敗・パニックのいずれも）。
 //!
-//! ジョブ全体の期限は [`JOB_TIMEOUT`]（60 分）。`prepare` と rclone に同じ期限を掛ける（過ぎれば `timeout`）。期限は作業の開始
-//! （手順 1 の復旧が済んだあと）から数える。期限を過ぎたあとの、安全のための復旧（4.2 の復旧の表）は、rclone の 1 回ごとの期限
-//! （`--rclone-timeout`）と待ちの回数の上限（[`Timing`]）の中で行い、全体の期限では打ち切らない（打ち切ると、公開の途中の
+//! ジョブ全体の期限は [`JOB_TIMEOUT`]（60 分）。`prepare` と Drive の操作に同じ期限を掛ける（過ぎれば `timeout`）。期限は作業の開始
+//! （手順 1 の復旧が済んだあと）から数える。期限を過ぎたあとの、安全のための復旧（4.2 の復旧の表）は、Drive の 1 回ごとの操作の期限
+//! （`--drive-timeout`）と待ちの回数の上限（[`Timing`]）の中で行い、全体の期限では打ち切らない（打ち切ると、公開の途中の
 //! 状態が決まらないまま残る）。
 //!
 //! ## パニックとキャンセル（SIGINT・SIGTERM）
@@ -33,18 +33,18 @@
 //!   記録が無い・読めないときは、Drive の操作も記録の書き込みもせず、そのまま残す（読めない記録は上書きしない。次の起動で
 //!   `blocked` として扱われる）。復旧の中でまたパニックしたら、記録を `running` のまま残して次の復旧に渡す。
 //! - 一覧の取得の前後でも、キャンセルの印を見る（段階が未記録なので `interrupted`。候補が 0 枚でも `succeeded` にしない）。
-//! - **キャンセル**（[`Cancel`] の印。[`crate::cancel`]）: rclone は動かせない（印が立つと、起動前なら起動せず、実行中なら kill して
-//!   `wait` し終えてから失敗を返す）ので、その場で復旧の表は当てられない。段階が記録にあれば、記録を**確定せず `running` のまま**
+//! - **キャンセル**（[`Cancel`] の印。[`crate::cancel`]）: Drive の操作は続けられない（印が立つと、要求の前・再試行の待ち・チャンクの間で止まる。
+//!   飛んでいる要求は終わるまで待ち、アップロードのスレッドを全部 join してから失敗を返す）ので、その場で復旧の表は当てられない。段階が記録にあれば、記録を**確定せず `running` のまま**
 //!   次の復旧（次のジョブの前・起動時・`recover`）に渡す。印のもとで返ってくる失敗・`blocked`・中断・知らせの付いた成功は、
-//!   rclone を止めたことの副産物（照合できなかった、`incoming` を片付けられず残りものになった、など）なので、記録に確定しない
+//!   止めたことの副産物（照合できなかった、`incoming` を片付けられず残りものになった、など）なので、記録に確定しない
 //!   （[`cancel_voids`]）。確定するのは、印の前に済んだ `succeeded`（知らせなし）・`conflict` だけ。
 //!
 //!   パニックを「その場で復旧」、キャンセルを「`running` のまま」と分けた理由: パニックは、プロセスが続く（`serve`）ので、
-//!   `running` のまま残すと、次の受付まで GET が `running` を返し続ける。キャンセルはプロセスが終わるところで、rclone を
-//!   動かせない。
+//!   `running` のまま残すと、次の受付まで GET が `running` を返し続ける。キャンセルはプロセスが終わるところで、Drive の操作を
+//!   続けられない。
 //!
 //!   代償: `running` の記録は、次の復旧まで `running` のまま（`serve` では次の受付か再起動まで。退避の直後なら、その間は
-//!   宛先が空）。実行枠は、子を止めて `wait` し終えるまで外れない。
+//!   宛先が空）。実行枠は、アップロードのスレッドを全部止めて join し終えるまで外れない。
 //!
 //! ## 結果の数
 //!
@@ -57,7 +57,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::cancel::Cancel;
-use crate::drive::{Layout, Managed, Target};
+use crate::drive::http::Retry;
+use crate::drive::{Drive, Layout, Managed, Target};
 use crate::error::{ErrorCode, ExportError};
 use crate::feed::FeedClient;
 use crate::folder::FolderName;
@@ -79,7 +80,7 @@ use crate::staging::Workspace;
 use crate::sys;
 
 /// ジョブ全体の期限（60 分。design.md 4.1 の手順 11）。作業の開始（前のジョブの復旧のあと）から数える。期限を過ぎたあとの
-/// 安全のための復旧は、rclone の 1 回ごとの期限と待ちの回数の上限の中で行い、この期限では打ち切らない。
+/// 安全のための復旧は、Drive の 1 回ごとの操作の期限と待ちの回数の上限の中で行い、この期限では打ち切らない。
 pub const JOB_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 
 /// 流れの調整値。本番は [`Tuning::default`]。試験が、待ちや期限を短くするために替える。
@@ -100,6 +101,12 @@ pub struct Tuning {
     /// 上書きもしないことを確かめる）。
     #[doc(hidden)]
     pub corrupt_record_on_panic: bool,
+    /// 試験用: Drive の要求の再試行の待ちを替える（待たずに済むように。本番は `None`）。
+    #[doc(hidden)]
+    pub drive_retry: Option<Retry>,
+    /// 試験用: 一覧のページの大きさ・multipart の上限・チャンクの大きさを替える（`None` は本番の値）。
+    #[doc(hidden)]
+    pub drive_sizes: Option<(u32, u64, u64)>,
 }
 
 impl Default for Tuning {
@@ -111,6 +118,8 @@ impl Default for Tuning {
             panic_in_job: false,
             panic_after_stage: None,
             corrupt_record_on_panic: false,
+            drive_retry: None,
+            drive_sizes: None,
         }
     }
 }
@@ -118,6 +127,8 @@ impl Default for Tuning {
 /// 流れが使う部品（借用）。
 pub struct Context<'a> {
     pub settings: &'a Settings,
+    /// Drive の操作の入口（キャンセルの印を共有済み。ジョブの期限は使うところで掛ける）。
+    pub remote: &'a Remote,
     pub store: &'a JobStore,
     pub published: &'a PublishedStore,
     pub tuning: &'a Tuning,
@@ -170,7 +181,7 @@ impl JobHandle {
     }
 
     /// ジョブの完了ログ（design.md 7 章）: ジョブ ID、期間、宛先、枚数、経過時間、結果の status と error の code。
-    /// トークン・資格情報・rclone の出力は載せない（記録にもそれらは無い）。`execute` と復旧（`recover_unfinished`）の
+    /// トークン・資格情報・Drive の応答の本文は載せない（記録にもそれらは無い）。`execute` と復旧（`recover_unfinished`）の
     /// どちらの終わりも、ここを通る（CLI の `run` でも `serve` でも出る）。経過時間は、記録した開始からの秒数（復旧が終えた
     /// ジョブでは、止まっていた時間を含む）。
     fn log_completion(&self) {
@@ -468,7 +479,7 @@ pub fn execute(ctx: &Context<'_>, handle: &mut JobHandle, _slot: &SlotGuard) {
     handle.finish(done);
 }
 
-/// キャンセルの印が立っているときに、記録に**確定しない**結果か。rclone を止めたことの副産物は確定しない: 照合できなかった
+/// キャンセルの印が立っているときに、記録に**確定しない**結果か。止めたことの副産物は確定しない: 照合できなかった
 /// （`blocked`）、失敗、中断（`incoming` のゴミ箱への移動が止まって、「手作業の片付けが要る残りもの」になる。次の復旧なら自動で
 /// 消せる）、知らせの付いた成功（旧フォルダのゴミ箱への移動が止まって、旧フォルダが残る）。印の前に済んだ `succeeded`（知らせなし）・
 /// `conflict` は、そのまま記録する。確定しなくても害は無い（復旧の表は、記録した段階から同じ結果を出す）。
@@ -638,9 +649,12 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         Ok(l) => l,
         Err(e) => return Done::failed(e.code, Some(counts.result(false, false, 0, None))),
     };
-    let remote = Remote::new(ctx.settings)
-        .with_cancel(ctx.cancel.clone())
-        .with_deadline(Some(deadline));
+    let remote = ctx.remote.with_deadline(Some(deadline));
+    // ジョブの始めに、宛先の親と作業用のフォルダが（起動後に動かされていないか）フォルダ・ゴミ箱の中でないことを確かめる。
+    // 候補が 0 枚のとき（上で終えている）は Drive に触れない
+    if let Err(e) = Drive::new(&remote, &layout).check_roots() {
+        return Done::failed(e.code, Some(counts.result(false, false, 0, None)));
+    }
     let params = PublishParams {
         on_exists: req.on_exists,
         workspace: workspace.path(),
@@ -736,7 +750,7 @@ pub fn recover_unfinished(ctx: &Context<'_>, skip: Option<&JobId>) -> RecoverRep
         let mut handle = JobHandle::new(ctx.store.clone(), rec.clone());
         let done = recover_one(ctx, &mut handle);
         if cancel_voids(ctx.cancel, &done) {
-            // rclone を止めたことの副産物（照合できなかった、など）は確定しない。記録は `running` のまま、次の復旧に任せる
+            // 止めたことの副産物（照合できなかった、など）は確定しない。記録は `running` のまま、次の復旧に任せる
             report.cancelled = true;
             break;
         }
@@ -776,7 +790,7 @@ fn recover_one(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         return stuck("internal");
     };
     // 後始末と復旧は期限なし（コマンドごとの期限と、待ちの回数の上限だけ。ジョブ全体の期限では打ち切らない）
-    let remote = Remote::new(ctx.settings).with_cancel(ctx.cancel.clone());
+    let remote = ctx.remote.with_deadline(None);
     let recovery = Recovery {
         remote: &remote,
         layout: &layout,
@@ -839,7 +853,7 @@ pub fn dry_run(
         folder.clone(),
         JobId::generate()?,
     )?;
-    let remote = Remote::for_dry_run(ctx.settings).with_cancel(ctx.cancel.clone());
+    let remote = ctx.remote.for_dry_run();
     let inspection = crate::publish::dry_run(&remote, &layout, ctx.published)?;
     let (target, managed) = match &inspection.target {
         Target::Absent => ("absent", Value::Null),

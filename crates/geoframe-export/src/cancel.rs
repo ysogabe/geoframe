@@ -1,8 +1,9 @@
 //! キャンセルの印（SIGINT・SIGTERM。design.md 8 章「同時実行」、4.1 の手順 11）。
 //!
-//! 親（`run`・`serve`）が signal で終わると、別のプロセスグループに入れた rclone だけが残り、実行枠（flock）だけが外れて、次の
-//! ジョブの復旧が、進行中の `copy`・`moveto` と競合しうる。それを避けるため、signal は**その場で終わらず、印を立てるだけ**にし、
-//! 実行中の子（rclone）のプロセスグループを止めて `wait` し終えるまで実行枠を持ってから終える（[`crate::remote::Remote`]（今の中身は [`crate::rclone::Rclone`]））。
+//! 親（`run`・`serve`）が signal でその場で終わると、飛んでいる Drive の要求とアップロードのスレッドが途中で切れ、実行枠（flock）
+//! だけが外れて、次のジョブの復旧が、結果の分からない書き込みと競合しうる。それを避けるため、signal は**その場で終わらず、印を
+//! 立てるだけ**にし、アップロードのスレッドを全部止めて join し終えるまで実行枠を持ってから終える（[`crate::remote::Remote`]
+//! （中身は [`crate::drive::api::DriveApi`]））。
 //!
 //! - [`Cancel`] は同期の印（`Arc<AtomicBool>`。`Clone` で共有）。[`Cancel::cancel`] で立てる。立った印は下ろさない。
 //! - [`install_signal_handlers`] は、SIGINT・SIGTERM の handler を入れる（印を立てるだけ。async-signal-safe）。
@@ -10,14 +11,17 @@
 //!   並列で 1 つの印を共有できないので、プロセス内の試験は呼ばない）。`run` の前に入る。`serve` は入れず、tokio のシグナルで受けて
 //!   [`Cancel::cancel`] を呼ぶ（[`crate::serve`]。どちらでも、立った印の見方は同じ）。
 //!
-//! 印は下ろせない。2 回目以降の signal も、印を立てるだけ（子を止めて `wait` し終えるまで、枠を持ったまま待つ。印を見ない待ちは、
-//! 一覧 API の取得〔30 秒〕と写真 1 枚の取得〔60 秒〕だけで、どちらにも上限がある）。
+//! 印は下ろせない。2 回目以降の signal も、印を立てるだけ（アップロードのスレッドを止めて join し終えるまで、枠を持ったまま待つ。
+//! 印を見ない待ちは、飛んでいる 1 つの要求〔JSON は 60 秒、チャンク・multipart は 100 秒が上限。unit の `TimeoutStopSec=180s` の中に
+//! 収まる〕と、一覧 API の取得〔30 秒〕・写真 1 枚の取得〔60 秒〕だけで、どれにも上限がある）。
 //!
 //! 立った印は、次のところで見る。見つけたら、取りかかっているジョブは、記録を**確定せずに**（Drive の段階を記録していれば
-//! `running` のまま）次の復旧に渡す（[`crate::flow`]）。
+//! `running` のまま）次の復旧に渡す（[`crate::flow`]）。**要求の最中には見ない**（飛んでいる要求は、終わるまで待つ。その結果は
+//! 分からない「結果不明」として、復旧の表が今の Drive の状態から続ける）。
 //!
-//! - [`crate::rclone::Rclone`]: 起動の前と、待ちのループの中（20ms ごと）。起動していれば、グループごと kill して `wait` し、
-//!   出力を読むスレッドを `join` してから [`crate::remote::RemoteError::Cancelled`] を返す。
+//! - [`crate::drive::api::DriveApi`]: 要求の前・再試行の待ち（20ms ごと）・resumable のチャンクの間。見つけたら
+//!   [`crate::remote::RemoteError::Cancelled`] を返す。並列のアップロードは、各スレッドが同じ印を見て新しい送信を始めず、
+//!   [`crate::drive::Drive::upload`] が全スレッドを join してから返る。
 //! - [`crate::publish::Recovery::settle_observe`]: 待ちの代わりに印を見る（30 秒 × 回数を眠らない）。
 //! - [`crate::image::prepare_cancellable`]: 1 枚ごと。
 

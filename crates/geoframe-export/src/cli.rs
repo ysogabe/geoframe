@@ -4,11 +4,13 @@
 //! geoframe-export run --from 2026-01-10 [--to ...] --destination yamareco [--on-exists replace] [--dry-run] [設定の引数]
 //! geoframe-export serve --listen <ip:port> --token-file <path> --allow <ip> [--allow <ip> ...] [設定の引数]
 //! geoframe-export recover [--resolve <job_id>] [設定の引数]
+//! geoframe-export import-credentials --rclone-config <path> --remote <name> --out <path>
 //! ```
 //!
-//! 設定の引数: `--feed-base --rclone --rclone-config --remote-yamareco --remote-travel-journal --work-root --state-dir
-//! --rclone-copy-timeout --rclone-timeout`。`--名前 値` と `--名前=値` のどちらでも書ける。引数の誤り（知らない・重複・
-//! 別のサブコマンドの引数・値の欠け・検査に通らない値）はすべて [`CliError`] で、終了コード 2。
+//! 設定の引数: `--feed-base --state-dir --drive-credentials --folder-yamareco --folder-travel-journal --work-folder
+//! --drive-upload-timeout --drive-timeout`（と、help に出さない試験専用の `--drive-endpoint`）。`--名前 値` と `--名前=値` の
+//! どちらでも書ける。引数の誤り（知らない・重複・別のサブコマンドの引数・値の欠け・検査に通らない値）はすべて [`CliError`] で、
+//! 終了コード 2。
 //! エラーの表示に引数の値は写さない（トークンのファイルのパスなどが端末に残らないように、名前だけを出す）。
 
 use std::fmt;
@@ -18,9 +20,9 @@ use std::path::PathBuf;
 use crate::error::ErrorCode;
 use crate::request::{ExportRequest, RawRequest};
 use crate::settings::{
-    OPT_FEED_BASE, OPT_RCLONE, OPT_RCLONE_CONFIG, OPT_RCLONE_COPY_TIMEOUT, OPT_RCLONE_TIMEOUT,
-    OPT_REMOTE_TRAVEL_JOURNAL, OPT_REMOTE_YAMARECO, OPT_STATE_DIR, OPT_WORK_ROOT, RawSettings,
-    Settings, SettingsError,
+    OPT_DRIVE_CREDENTIALS, OPT_DRIVE_ENDPOINT, OPT_DRIVE_TIMEOUT, OPT_DRIVE_UPLOAD_TIMEOUT,
+    OPT_FEED_BASE, OPT_FOLDER_TRAVEL_JOURNAL, OPT_FOLDER_YAMARECO, OPT_STATE_DIR, OPT_WORK_FOLDER,
+    RawSettings, Settings, SettingsError,
 };
 
 pub const USAGE: &str = "\
@@ -35,16 +37,17 @@ pub const USAGE: &str = "\
                                   書き出しの HTTP の入口を起動する
   geoframe-export recover [--resolve <job_id>] [設定の引数]
                                   未完了のジョブの記録と Drive の状態を照らし合わせて表示する。--resolve は blocked の解除
+  geoframe-export import-credentials --rclone-config <path> --remote <name> --out <path>
+                                  今の rclone の設定から、Drive の資格情報のファイル（0600）を 1 回だけ作る。値は表示しない
 設定の引数:
   --feed-base <url>               写真サービスの基底 URL（http://ホスト[:ポート]。既定 http://127.0.0.1:8080）
-  --rclone <path>                 rclone の実行ファイル（絶対パス。必須）
-  --rclone-config <path>          rclone の設定ファイル（絶対パス。必須。専用の client_id で認可したもの）
   --state-dir <dir>               状態ディレクトリ（絶対パス。必須）
-  --remote-yamareco <remote:path>         既定 gdrive:yamareco
-  --remote-travel-journal <remote:path>   既定 gdrive:travel-journal
-  --work-root <remote:path>               作業用のフォルダ。既定 gdrive:geoframe-export-work
-  --rclone-copy-timeout <秒>      写真を送る rclone copy の期限（既定 2700）
-  --rclone-timeout <秒>           それ以外の rclone の期限（既定 300）
+  --drive-credentials <path>      Drive の資格情報の JSON（絶対パス。必須。client_id・client_secret・refresh_token の 3 つ）
+  --folder-yamareco <ID>          宛先 yamareco の親フォルダの Drive ID（必須）
+  --folder-travel-journal <ID>    宛先 travel-journal の親フォルダの Drive ID（必須）
+  --work-folder <ID>              作業用のフォルダ（中に incoming/・replaced/ を作る）の Drive ID（必須）
+  --drive-upload-timeout <秒>     写真を送る操作全体の期限（既定 2700）
+  --drive-timeout <秒>            それ以外の Drive の操作の期限（既定 300）
 終了コード: 引数・設定の誤りは 2";
 
 /// 解釈した結果。
@@ -65,6 +68,12 @@ pub enum Command {
     Recover {
         resolve: Option<String>,
         settings: Settings,
+    },
+    /// rclone の設定から、Drive の資格情報のファイルを 1 回だけ作る（root が sudo で動かす。起動時の検査は通らない）。
+    ImportCredentials {
+        rclone_config: PathBuf,
+        remote: String,
+        out: PathBuf,
     },
 }
 
@@ -89,8 +98,12 @@ pub enum CliError {
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoCommand => f.write_str("サブコマンド（run・serve・recover）を指定してください"),
-            Self::UnknownCommand => f.write_str("知らないサブコマンドです（run・serve・recover）"),
+            Self::NoCommand => f.write_str(
+                "サブコマンド（run・serve・recover・import-credentials）を指定してください",
+            ),
+            Self::UnknownCommand => {
+                f.write_str("知らないサブコマンドです（run・serve・recover・import-credentials）")
+            }
             Self::UnknownOption(name) => write!(f, "このコマンドでは使えない引数です: {name}"),
             Self::UnexpectedArgument => {
                 f.write_str("引数の形が違います（--名前 値 の形で指定してください）")
@@ -131,14 +144,14 @@ const RUN_SPEC: Spec = Spec {
         "--destination",
         "--on-exists",
         OPT_FEED_BASE,
-        OPT_RCLONE,
-        OPT_RCLONE_CONFIG,
-        OPT_REMOTE_YAMARECO,
-        OPT_REMOTE_TRAVEL_JOURNAL,
-        OPT_WORK_ROOT,
         OPT_STATE_DIR,
-        OPT_RCLONE_COPY_TIMEOUT,
-        OPT_RCLONE_TIMEOUT,
+        OPT_DRIVE_CREDENTIALS,
+        OPT_FOLDER_YAMARECO,
+        OPT_FOLDER_TRAVEL_JOURNAL,
+        OPT_WORK_FOLDER,
+        OPT_DRIVE_ENDPOINT,
+        OPT_DRIVE_UPLOAD_TIMEOUT,
+        OPT_DRIVE_TIMEOUT,
     ],
     repeatable: &[],
     flags: &["--dry-run", "--help"],
@@ -149,14 +162,14 @@ const SERVE_SPEC: Spec = Spec {
         "--listen",
         "--token-file",
         OPT_FEED_BASE,
-        OPT_RCLONE,
-        OPT_RCLONE_CONFIG,
-        OPT_REMOTE_YAMARECO,
-        OPT_REMOTE_TRAVEL_JOURNAL,
-        OPT_WORK_ROOT,
         OPT_STATE_DIR,
-        OPT_RCLONE_COPY_TIMEOUT,
-        OPT_RCLONE_TIMEOUT,
+        OPT_DRIVE_CREDENTIALS,
+        OPT_FOLDER_YAMARECO,
+        OPT_FOLDER_TRAVEL_JOURNAL,
+        OPT_WORK_FOLDER,
+        OPT_DRIVE_ENDPOINT,
+        OPT_DRIVE_UPLOAD_TIMEOUT,
+        OPT_DRIVE_TIMEOUT,
     ],
     repeatable: &["--allow"],
     flags: &["--help"],
@@ -166,15 +179,21 @@ const RECOVER_SPEC: Spec = Spec {
     values: &[
         "--resolve",
         OPT_FEED_BASE,
-        OPT_RCLONE,
-        OPT_RCLONE_CONFIG,
-        OPT_REMOTE_YAMARECO,
-        OPT_REMOTE_TRAVEL_JOURNAL,
-        OPT_WORK_ROOT,
         OPT_STATE_DIR,
-        OPT_RCLONE_COPY_TIMEOUT,
-        OPT_RCLONE_TIMEOUT,
+        OPT_DRIVE_CREDENTIALS,
+        OPT_FOLDER_YAMARECO,
+        OPT_FOLDER_TRAVEL_JOURNAL,
+        OPT_WORK_FOLDER,
+        OPT_DRIVE_ENDPOINT,
+        OPT_DRIVE_UPLOAD_TIMEOUT,
+        OPT_DRIVE_TIMEOUT,
     ],
+    repeatable: &[],
+    flags: &["--help"],
+};
+
+const IMPORT_SPEC: Spec = Spec {
+    values: &["--rclone-config", "--remote", "--out"],
     repeatable: &[],
     flags: &["--help"],
 };
@@ -214,14 +233,14 @@ impl Parsed {
     fn settings(&self) -> Result<Settings, CliError> {
         Ok(Settings::from_raw(&RawSettings {
             feed_base: self.one(OPT_FEED_BASE),
-            rclone: self.one(OPT_RCLONE),
-            rclone_config: self.one(OPT_RCLONE_CONFIG),
-            remote_yamareco: self.one(OPT_REMOTE_YAMARECO),
-            remote_travel_journal: self.one(OPT_REMOTE_TRAVEL_JOURNAL),
-            work_root: self.one(OPT_WORK_ROOT),
             state_dir: self.one(OPT_STATE_DIR),
-            rclone_copy_timeout: self.one(OPT_RCLONE_COPY_TIMEOUT),
-            rclone_timeout: self.one(OPT_RCLONE_TIMEOUT),
+            drive_credentials: self.one(OPT_DRIVE_CREDENTIALS),
+            folder_yamareco: self.one(OPT_FOLDER_YAMARECO),
+            folder_travel_journal: self.one(OPT_FOLDER_TRAVEL_JOURNAL),
+            work_folder: self.one(OPT_WORK_FOLDER),
+            drive_endpoint: self.one(OPT_DRIVE_ENDPOINT),
+            drive_upload_timeout: self.one(OPT_DRIVE_UPLOAD_TIMEOUT),
+            drive_timeout: self.one(OPT_DRIVE_TIMEOUT),
         })?)
     }
 }
@@ -354,6 +373,29 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
                 settings: p.settings()?,
             })
         }
+        "import-credentials" => {
+            let p = scan(rest, &IMPORT_SPEC)?;
+            if p.flag("--help") {
+                return Ok(Command::Help);
+            }
+            let rclone_config = p.required("--rclone-config")?;
+            let remote = p.required("--remote")?;
+            let out = p.required("--out")?;
+            for (name, v) in [
+                ("--rclone-config", &rclone_config),
+                ("--remote", &remote),
+                ("--out", &out),
+            ] {
+                if v.is_empty() || v.contains('\0') {
+                    return Err(CliError::InvalidValue(name));
+                }
+            }
+            Ok(Command::ImportCredentials {
+                rclone_config: PathBuf::from(rclone_config),
+                remote,
+                out: PathBuf::from(out),
+            })
+        }
         _ => Err(CliError::UnknownCommand),
     }
 }
@@ -368,8 +410,8 @@ mod tests {
         s.split_whitespace().map(str::to_owned).collect()
     }
 
-    const COMMON: &str =
-        "--rclone /x/rclone --rclone-config /x/state/rclone/rclone.conf --state-dir /x/state";
+    const COMMON: &str = "--drive-credentials /x/cred/drive-credentials --folder-yamareco FolderY1 \
+        --folder-travel-journal FolderT2 --work-folder FolderW3 --state-dir /x/state";
 
     fn parse_line(line: &str) -> Result<Command, CliError> {
         parse(&args(line))
@@ -379,8 +421,8 @@ mod tests {
     fn run_accepts_the_full_set_of_arguments() {
         let line = format!(
             "run --from 2030-03-10 --to=2030-03-12 --destination travel-journal --on-exists replace --dry-run \
-             --feed-base http://127.0.0.1:9 --remote-yamareco gdrive:a --remote-travel-journal gdrive:b \
-             --work-root gdrive:w --rclone-copy-timeout 60 --rclone-timeout 30 {COMMON}"
+             --feed-base http://127.0.0.1:9 --drive-upload-timeout 60 --drive-timeout 30 \
+             --drive-endpoint http://127.0.0.1:8123 {COMMON}"
         );
         let Command::Run { request, settings } = parse_line(&line).unwrap() else {
             panic!("run のはず");
@@ -392,9 +434,19 @@ mod tests {
         assert!(request.dry_run);
         assert_eq!(request.request_id, None);
         assert_eq!(settings.feed_base.as_str(), "http://127.0.0.1:9");
-        assert_eq!(settings.remote_yamareco.to_string(), "gdrive:a");
-        assert_eq!(settings.work_root.to_string(), "gdrive:w");
-        assert_eq!(settings.rclone_copy_timeout.as_secs(), 60);
+        assert_eq!(settings.folder_yamareco, "FolderY1");
+        assert_eq!(settings.folder_travel_journal, "FolderT2");
+        assert_eq!(settings.work_folder, "FolderW3");
+        assert_eq!(
+            settings.drive_credentials,
+            PathBuf::from("/x/cred/drive-credentials")
+        );
+        assert_eq!(settings.drive_upload_timeout.as_secs(), 60);
+        assert_eq!(settings.drive_timeout.as_secs(), 30);
+        assert_eq!(
+            settings.endpoints(),
+            crate::drive::http::Endpoints::loopback("http://127.0.0.1:8123").unwrap()
+        );
     }
 
     #[test]
@@ -408,9 +460,11 @@ mod tests {
         assert!(request.period.is_single_day());
         assert_eq!(request.on_exists, OnExists::Error);
         assert!(!request.dry_run);
+        assert_eq!(settings.drive_upload_timeout.as_secs(), 45 * 60);
+        assert_eq!(settings.drive_timeout.as_secs(), 5 * 60);
         assert_eq!(
-            settings.work_root.to_string(),
-            "gdrive:geoframe-export-work"
+            settings.endpoints(),
+            crate::drive::http::Endpoints::production()
         );
     }
 
@@ -459,7 +513,7 @@ mod tests {
         assert_eq!(listen.to_string(), "127.0.0.1:9100");
         assert_eq!(token_file, PathBuf::from("/x/token"));
         assert_eq!(allow.len(), 2);
-        assert_eq!(settings.rclone, PathBuf::from("/x/rclone"));
+        assert_eq!(settings.work_folder, "FolderW3");
 
         assert!(matches!(
             parse_line(&format!("recover {COMMON}")),
@@ -509,8 +563,10 @@ mod tests {
                 parse(&[
                     "recover".to_owned(),
                     format!("--resolve={bad}"),
-                    "--rclone=/x/r".to_owned(),
-                    "--rclone-config=/x/c/r.conf".to_owned(),
+                    "--drive-credentials=/x/c".to_owned(),
+                    "--folder-yamareco=A".to_owned(),
+                    "--folder-travel-journal=B".to_owned(),
+                    "--work-folder=C".to_owned(),
                     "--state-dir=/x/s".to_owned(),
                 ]),
                 Err(CliError::InvalidValue("--resolve")),
@@ -591,20 +647,126 @@ mod tests {
         let base = "run --from 2030-03-10 --destination yamareco";
         assert_eq!(
             parse_line(&format!(
-                "{base} --rclone-config /x/c/r.conf --state-dir /x/s"
+                "{base} --folder-yamareco A --folder-travel-journal B --work-folder C --state-dir /x/s"
             )),
-            Err(CliError::Settings(SettingsError::MissingOption(OPT_RCLONE)))
+            Err(CliError::Settings(SettingsError::MissingOption(
+                OPT_DRIVE_CREDENTIALS
+            )))
         );
+        // 空の ID（unit の `${VAR}` が空のとき）は終了コード 2 の設定の誤り
         assert_eq!(
-            parse_line(&format!("{base} {COMMON} --remote-yamareco gdrive:a/")),
-            Err(CliError::Settings(SettingsError::Remote(
-                OPT_REMOTE_YAMARECO,
-                crate::settings::RemoteReason::TrailingSlash
+            parse_line(&format!(
+                "{base} --drive-credentials /x/c --folder-yamareco= --folder-travel-journal B --work-folder C --state-dir /x/s"
+            )),
+            Err(CliError::Settings(SettingsError::InvalidDriveId(
+                OPT_FOLDER_YAMARECO
+            )))
+        );
+        // 3 つが同じなら断る
+        assert_eq!(
+            parse_line(&format!(
+                "{base} --drive-credentials /x/c --folder-yamareco A --folder-travel-journal A --work-folder C --state-dir /x/s"
+            )),
+            Err(CliError::Settings(SettingsError::SameFolder(
+                OPT_FOLDER_YAMARECO,
+                OPT_FOLDER_TRAVEL_JOURNAL
             )))
         );
         assert_eq!(
             parse_line(&format!("{base} {COMMON} --feed-base https://x")),
             Err(CliError::Settings(SettingsError::InvalidFeedBase))
+        );
+        // 試験専用の通信先は loopback の http だけ
+        assert_eq!(
+            parse_line(&format!(
+                "{base} {COMMON} --drive-endpoint https://www.googleapis.com"
+            )),
+            Err(CliError::Settings(SettingsError::InvalidEndpoint))
+        );
+    }
+
+    #[test]
+    fn removed_rclone_arguments_are_unknown_options() {
+        for old in [
+            "--rclone /x/rclone",
+            "--rclone-config /x/c.conf",
+            "--remote-yamareco gdrive:a",
+            "--remote-travel-journal gdrive:b",
+            "--work-root gdrive:w",
+            "--rclone-copy-timeout 60",
+            "--rclone-timeout 30",
+        ] {
+            for cmd in [
+                "run --from 2030-03-10 --destination yamareco",
+                "serve --listen 127.0.0.1:1 --token-file /x/t --allow 192.0.2.1",
+                "recover",
+            ] {
+                let name = old.split(' ').next().unwrap();
+                assert_eq!(
+                    parse_line(&format!("{cmd} {COMMON} {old}")),
+                    Err(CliError::UnknownOption(name.into())),
+                    "{cmd} {old}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn help_does_not_mention_the_test_only_endpoint_or_rclone_arguments() {
+        assert!(!USAGE.contains("--drive-endpoint"));
+        // （`import-credentials` だけは、取り込み元として `--rclone-config` を取る）
+        for gone in ["--rclone-copy-timeout", "--rclone-timeout", "--rclone <"] {
+            assert!(!USAGE.contains(gone), "{gone}");
+        }
+        assert!(!USAGE.contains("--remote-"));
+        assert!(!USAGE.contains("--work-root"));
+        for name in [
+            "--drive-credentials",
+            "--folder-yamareco",
+            "--folder-travel-journal",
+            "--work-folder",
+            "--drive-upload-timeout",
+            "--drive-timeout",
+        ] {
+            assert!(USAGE.contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn import_credentials_takes_its_three_arguments() {
+        let ok = parse_line(
+            "import-credentials --rclone-config /x/rclone.conf --remote gdrive --out /x/out.json",
+        );
+        assert_eq!(
+            ok,
+            Ok(Command::ImportCredentials {
+                rclone_config: PathBuf::from("/x/rclone.conf"),
+                remote: "gdrive".into(),
+                out: PathBuf::from("/x/out.json"),
+            })
+        );
+        assert_eq!(
+            parse_line("import-credentials --remote gdrive --out /x/o"),
+            Err(CliError::MissingRequired("--rclone-config"))
+        );
+        assert_eq!(
+            parse_line("import-credentials --rclone-config /x/c --out /x/o"),
+            Err(CliError::MissingRequired("--remote"))
+        );
+        assert_eq!(
+            parse_line("import-credentials --rclone-config /x/c --remote gdrive"),
+            Err(CliError::MissingRequired("--out"))
+        );
+        // 設定の引数は取らない
+        assert!(matches!(
+            parse_line(&format!(
+                "import-credentials --rclone-config /x/c --remote gdrive --out /x/o {COMMON}"
+            )),
+            Err(CliError::UnknownOption(_))
+        ));
+        assert_eq!(
+            parse_line("import-credentials --rclone-config= --remote gdrive --out /x/o"),
+            Err(CliError::InvalidValue("--rclone-config"))
         );
     }
 
