@@ -159,7 +159,7 @@ pub fn settle(rec: &mut geoframe_export::jobs::JobRecord, status: geoframe_expor
 }
 
 /// 偽の rclone の `cmd`（`copy` など）が呼ばれる（`calls.log` に出る）まで待って、そのプロセスの PID を返す（最大 `secs` 秒）。
-pub fn wait_for_call(env: &Env, cmd: &str, secs: u64) -> i64 {
+pub fn wait_for_call(env: &Env, op: &str, secs: u64) -> i64 {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         // 偽の rclone が書いている途中の行（読めない行）は、読み飛ばして、次の周回で読む
@@ -167,13 +167,13 @@ pub fn wait_for_call(env: &Env, cmd: &str, secs: u64) -> i64 {
         if let Some(pid) = text
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-            .filter(|c| c["kind"] == "rclone" && c["cmd"] == cmd)
+            .filter(|c| c["kind"] == "rclone" && c["op"] == op)
             .filter_map(|c| c["pid"].as_i64())
             .next_back()
         {
             return pid;
         }
-        assert!(Instant::now() < deadline, "{cmd} が呼ばれません");
+        assert!(Instant::now() < deadline, "{op} が呼ばれません");
         std::thread::sleep(Duration::from_millis(5));
     }
 }

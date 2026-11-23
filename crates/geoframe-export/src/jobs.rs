@@ -33,8 +33,8 @@ use crate::date::Period;
 use crate::error::{ErrorCode, ExportError};
 use crate::jobid::JobId;
 use crate::jsonfile::{self, ReadError};
-use crate::rclone::is_valid_drive_id;
 use crate::recovery::{Progress, Stage};
+use crate::remote::is_valid_drive_id;
 use crate::request::{Destination, ExportRequest, OnExists, RequestId};
 use crate::sys;
 

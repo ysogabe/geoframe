@@ -53,8 +53,8 @@ use crate::folder::FolderName;
 use crate::image::PublishFile;
 use crate::jobid::JobId;
 use crate::published::{PublishedStore, RecordedFile};
-use crate::rclone::{CopyScope, LsEntry, Rclone, RemoteLoc, RunError};
 use crate::recovery::{Kind, Observed, Seen};
+use crate::remote::{CopyScope, Entry, Remote, RemoteError, RemoteLoc};
 use crate::request::Destination;
 use crate::settings::Settings;
 
@@ -233,8 +233,8 @@ impl Expected {
     /// 一覧（`lsjson -R --hash`）が、期待した中身と完全に一致するか。ファイルは（パス・サイズ・MD5）の並べ替えたリスト
     /// （期待した MD5 があるファイルは、一覧の MD5 も同じでなければならない。一覧に MD5 が無ければ一致しない）、
     /// フォルダは期待したファイルの親だけ。ショートカットが 1 つでもあれば一致しない。
-    pub fn matches(&self, entries: &[LsEntry]) -> bool {
-        if entries.iter().any(LsEntry::is_shortcut) {
+    pub fn matches(&self, entries: &[Entry]) -> bool {
+        if entries.iter().any(Entry::is_shortcut) {
             return false;
         }
         let mut files: Vec<(String, u64, Option<String>)> = entries
@@ -270,7 +270,7 @@ impl Expected {
 #[derive(Debug, Clone)]
 pub struct Listing {
     /// `--drive-skip-shortcuts` ありの一覧。
-    pub entries: Vec<LsEntry>,
+    pub entries: Vec<Entry>,
     /// ショートカットがある、または 2 つの一覧が食い違う。
     pub has_shortcut: bool,
 }
@@ -278,8 +278,8 @@ pub struct Listing {
 /// 接頭辞の一覧 2 つ（ショートカットを除いた `a` と、除かない `b`）から、`name` に一致する項目を ID・種類で返す。
 /// `b` にだけある項目（解決されたショートカット）と、ショートカットの項目（MIME タイプがショートカット・リンク切れ・
 /// 複合 ID）は、種類を [`Kind::Shortcut`] にする。
-pub fn classify(a: &[LsEntry], b: &[LsEntry], name: &str) -> Vec<Seen> {
-    let mut pool: Vec<&LsEntry> = a.iter().filter(|e| e.name == name).collect();
+pub fn classify(a: &[Entry], b: &[Entry], name: &str) -> Vec<Seen> {
+    let mut pool: Vec<&Entry> = a.iter().filter(|e| e.name == name).collect();
     let mut out = Vec::new();
     for e in b.iter().filter(|e| e.name == name) {
         if e.is_shortcut() {
@@ -365,13 +365,13 @@ pub enum Place {
 pub type Check = Result<(), Observed>;
 
 pub struct Drive<'a> {
-    rclone: &'a Rclone,
+    remote: &'a Remote,
     layout: &'a Layout,
 }
 
 impl<'a> Drive<'a> {
-    pub fn new(rclone: &'a Rclone, layout: &'a Layout) -> Self {
-        Self { rclone, layout }
+    pub fn new(remote: &'a Remote, layout: &'a Layout) -> Self {
+        Self { remote, layout }
     }
 
     pub fn layout(&self) -> &Layout {
@@ -383,27 +383,27 @@ impl<'a> Drive<'a> {
     /// `--drive-skip-shortcuts` ありの一覧。場所が無い（終了コード 3）ことも含め、失敗は `drive_unavailable`。
     ///
     /// 再帰の一覧（フォルダの中身の照合に使う）にだけ、ファイルの MD5（`--hash --hash-type MD5`）を付ける。
-    fn list(&self, loc: &RemoteLoc, recursive: bool) -> Result<Vec<LsEntry>, ExportError> {
-        self.rclone
-            .lsjson(loc, recursive, true, recursive)
-            .map_err(RunError::into_query_error)
+    fn list(&self, loc: &RemoteLoc, recursive: bool) -> Result<Vec<Entry>, ExportError> {
+        self.remote
+            .list(loc, recursive, true, recursive)
+            .map_err(RemoteError::into_query_error)
     }
 
     fn list_with_shortcuts(
         &self,
         loc: &RemoteLoc,
         recursive: bool,
-    ) -> Result<Vec<LsEntry>, ExportError> {
-        self.rclone
-            .lsjson(loc, recursive, false, false)
-            .map_err(RunError::into_query_error)
+    ) -> Result<Vec<Entry>, ExportError> {
+        self.remote
+            .list(loc, recursive, false, false)
+            .map_err(RemoteError::into_query_error)
     }
 
     fn list_checked(&self, loc: &RemoteLoc, recursive: bool) -> Result<Listing, ExportError> {
         let a = self.list(loc, recursive)?;
         let b = self.list_with_shortcuts(loc, recursive)?;
-        let mut pool: Vec<&LsEntry> = a.iter().collect();
-        let mut has_shortcut = a.iter().any(LsEntry::is_shortcut);
+        let mut pool: Vec<&Entry> = a.iter().collect();
+        let mut has_shortcut = a.iter().any(Entry::is_shortcut);
         for e in &b {
             if e.is_shortcut() {
                 has_shortcut = true;
@@ -431,9 +431,9 @@ impl<'a> Drive<'a> {
     ///
     /// どちらの一覧も、ショートカットを省かずに取る（同名のショートカットを「無い」と読んで、`mkdir`・`moveto` で同名の
     /// フォルダを作らないため。ショートカットは名前が一致すれば「同名がある」として数える）。
-    fn work_children(&self, which: &str, loc: &RemoteLoc) -> Result<Vec<LsEntry>, ExportError> {
+    fn work_children(&self, which: &str, loc: &RemoteLoc) -> Result<Vec<Entry>, ExportError> {
         let work = self.list_with_shortcuts(&self.layout.work_loc, false)?;
-        let found: Vec<&LsEntry> = work.iter().filter(|e| e.name == which).collect();
+        let found: Vec<&Entry> = work.iter().filter(|e| e.name == which).collect();
         match found.as_slice() {
             [] => Ok(Vec::new()),
             [e] if e.is_dir && !e.is_shortcut() => self.list_with_shortcuts(loc, false),
@@ -441,13 +441,13 @@ impl<'a> Drive<'a> {
         }
     }
 
-    fn incoming_entries(&self) -> Result<Vec<LsEntry>, ExportError> {
+    fn incoming_entries(&self) -> Result<Vec<Entry>, ExportError> {
         let mut v = self.work_children("incoming", &self.layout.incoming_root)?;
         v.retain(|e| e.name == self.layout.job.as_str());
         Ok(v)
     }
 
-    fn replaced_entries(&self) -> Result<Vec<LsEntry>, ExportError> {
+    fn replaced_entries(&self) -> Result<Vec<Entry>, ExportError> {
         let mut v = self.work_children("replaced", &self.layout.replaced_root)?;
         v.retain(|e| e.name == self.layout.retired_name);
         Ok(v)
@@ -525,7 +525,7 @@ impl<'a> Drive<'a> {
             _ => return Ok(Managed::NotManaged),
         };
         // 2. 直下の manifest.json: 一覧から、ちょうど 1 つのファイルで 4MB 以下
-        let top: Vec<&LsEntry> = listing
+        let top: Vec<&Entry> = listing
             .entries
             .iter()
             .filter(|e| e.path == MANIFEST_NAME)
@@ -541,9 +541,9 @@ impl<'a> Drive<'a> {
         };
         // 3. 読んで、generator・destination・folder を見る（上限を掛けて読む。`cat` の失敗は drive_unavailable）
         let bytes = self
-            .rclone
-            .cat(&self.layout.manifest_loc, MANIFEST_MAX_BYTES)
-            .map_err(RunError::into_query_error)?;
+            .remote
+            .read(&self.layout.manifest_loc, MANIFEST_MAX_BYTES)
+            .map_err(RemoteError::into_query_error)?;
         // 一覧の大きさと違えば、読んだものを信用しない
         if bytes.len() as u64 != size {
             return Ok(Managed::Modified);
@@ -586,9 +586,9 @@ impl<'a> Drive<'a> {
 
     /// `incoming/<job_id>` を作る。
     pub fn mkdir_incoming(&self) -> Result<(), ExportError> {
-        self.rclone
-            .mkdir(&self.layout.incoming_loc)
-            .map_err(RunError::into_op_error)
+        self.remote
+            .create_folder(&self.layout.incoming_loc)
+            .map_err(RemoteError::into_op_error)
     }
 
     /// `incoming/<job_id>` の Drive の ID（作ったあと、親の一覧から。ちょうど 1 つのフォルダでなければ失敗）。
@@ -601,16 +601,16 @@ impl<'a> Drive<'a> {
 
     /// 写真を送り、最後に manifest を送る。
     pub fn upload(&self, workspace: &Path) -> Result<(), ExportError> {
-        self.rclone
-            .copy(workspace, &self.layout.incoming_loc, CopyScope::PhotosOnly)
-            .map_err(RunError::into_op_error)?;
-        self.rclone
-            .copy(
+        self.remote
+            .upload(workspace, &self.layout.incoming_loc, CopyScope::PhotosOnly)
+            .map_err(RemoteError::into_op_error)?;
+        self.remote
+            .upload(
                 workspace,
                 &self.layout.incoming_loc,
                 CopyScope::ManifestOnly,
             )
-            .map_err(RunError::into_op_error)
+            .map_err(RemoteError::into_op_error)
     }
 
     /// `incoming/<job_id>` の中身が、期待した一式と完全に一致するか（`lsjson -R`）。
@@ -651,7 +651,7 @@ impl<'a> Drive<'a> {
             return Ok(false);
         };
         let listing = self.list_checked(dir, true)?;
-        let top: Vec<&LsEntry> = listing
+        let top: Vec<&Entry> = listing
             .entries
             .iter()
             .filter(|e| e.path == MANIFEST_NAME)
@@ -666,9 +666,9 @@ impl<'a> Drive<'a> {
             _ => return Ok(false),
         };
         let bytes = self
-            .rclone
-            .cat(&manifest_loc, MANIFEST_MAX_BYTES)
-            .map_err(RunError::into_query_error)?;
+            .remote
+            .read(&manifest_loc, MANIFEST_MAX_BYTES)
+            .map_err(RemoteError::into_query_error)?;
         if bytes.len() as u64 != size {
             return Ok(false);
         }
@@ -700,9 +700,9 @@ impl<'a> Drive<'a> {
         match seen.as_slice() {
             [] => Ok(Removed::Nothing),
             [s] if s.kind == Kind::Dir && s.id == expect_id => {
-                self.rclone
-                    .purge(&self.layout.incoming_loc)
-                    .map_err(RunError::into_op_error)?;
+                self.remote
+                    .trash(&self.layout.incoming_loc)
+                    .map_err(RemoteError::into_op_error)?;
                 Ok(Removed::Done)
             }
             _ => Ok(Removed::Mismatch(seen)),
@@ -711,9 +711,9 @@ impl<'a> Drive<'a> {
 
     /// 旧フォルダを `replaced/<種類>-<フォルダ名>-<job_id>` へ移す（パスでの移動。移したあとの照合は呼び出し側）。
     pub fn retire_old(&self) -> Result<(), ExportError> {
-        self.rclone
-            .moveto(&self.layout.dest_loc, &self.layout.retired_loc)
-            .map_err(RunError::into_op_error)
+        self.remote
+            .move_to(&self.layout.dest_loc, &self.layout.retired_loc)
+            .map_err(RemoteError::into_op_error)
     }
 
     /// `incoming/<job_id>` を宛先へ移す（パスでの移動。移したあとの照合は呼び出し側）。
@@ -723,9 +723,9 @@ impl<'a> Drive<'a> {
     /// 確かめてから移すまでの数秒に、オーナーが同じ名前のフォルダを作る」競合だけ。起きると、宛先のフォルダに写真が足され
     /// （消しはしない）、宛先の ID が `incoming` の ID と違うので、移したあとの照合で見つけて `blocked` にする。
     pub fn publish_move(&self) -> Result<(), ExportError> {
-        self.rclone
-            .moveto(&self.layout.incoming_loc, &self.layout.dest_loc)
-            .map_err(RunError::into_op_error)
+        self.remote
+            .move_to(&self.layout.incoming_loc, &self.layout.dest_loc)
+            .map_err(RemoteError::into_op_error)
     }
 
     /// `incoming/<job_id>` の今の項目（ID・種類。無ければ空）。
@@ -775,9 +775,9 @@ impl<'a> Drive<'a> {
         if !is_old(&again) {
             return Ok(Removed::Mismatch(again));
         }
-        self.rclone
-            .purge(&self.layout.retired_loc)
-            .map_err(RunError::into_op_error)?;
+        self.remote
+            .trash(&self.layout.retired_loc)
+            .map_err(RemoteError::into_op_error)?;
         Ok(Removed::Done)
     }
 
@@ -818,15 +818,15 @@ impl<'a> Drive<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rclone::{DIRECTORY_MIME, SHORTCUT_MIME};
+    use crate::remote::{DIRECTORY_MIME, SHORTCUT_MIME};
 
     /// 試験用の MD5（パスから決まる架空の値。同じパスなら同じ）。
     fn fake_md5(path: &str) -> String {
         crate::image::md5_hex(path.as_bytes())
     }
 
-    fn file(path: &str, size: i64) -> LsEntry {
-        LsEntry {
+    fn file(path: &str, size: i64) -> Entry {
+        Entry {
             path: path.into(),
             name: path.rsplit('/').next().unwrap().into(),
             size,
@@ -837,8 +837,8 @@ mod tests {
             md5: Some(fake_md5(path)),
         }
     }
-    fn dir(path: &str) -> LsEntry {
-        LsEntry {
+    fn dir(path: &str) -> Entry {
+        Entry {
             path: path.into(),
             name: path.rsplit('/').next().unwrap().into(),
             size: -1,
@@ -894,7 +894,7 @@ mod tests {
         assert!(!e.matches(&empty_dir));
         // ショートカット
         let mut sc = good.clone();
-        sc.push(LsEntry {
+        sc.push(Entry {
             mime: SHORTCUT_MIME.into(),
             ..file("link", 0)
         });
@@ -988,7 +988,7 @@ mod tests {
         let good = vec![file("a.jpg", 5), file("manifest.json", 9)];
         assert!(e.matches(&good));
         let mut with_doc = good.clone();
-        with_doc.push(LsEntry {
+        with_doc.push(Entry {
             mime: "application/vnd.google-apps.document".into(),
             ..file("memo", -1)
         });
@@ -1003,7 +1003,7 @@ mod tests {
         let name = "2030-03-10";
         let real = entry(name, "idR", true, "");
         // 解決されたフォルダのショートカット: MIME タイプはフォルダのまま、ID は複合 ID（前半がリンク先）
-        let resolved = LsEntry {
+        let resolved = Entry {
             shortcut_id: Some("idS".into()),
             ..entry(name, "idT", true, "")
         };
@@ -1028,14 +1028,14 @@ mod tests {
         let e = Expected::from_publish_files(&[pf("a.jpg", 5), pf("manifest.json", 9)]);
         let mut set = vec![file("a.jpg", 5), file("manifest.json", 9)];
         assert!(e.matches(&set));
-        set.push(LsEntry {
+        set.push(Entry {
             shortcut_id: Some("idS".into()),
             ..file("pic.jpg", 5)
         });
         assert!(!e.matches(&set));
         // リンク切れ
-        let dangling = LsEntry {
-            mime: crate::rclone::SHORTCUT_DANGLING_MIME.into(),
+        let dangling = Entry {
+            mime: crate::remote::SHORTCUT_DANGLING_MIME.into(),
             ..file("gone", 0)
         };
         let mut set = vec![file("a.jpg", 5), file("manifest.json", 9)];
@@ -1102,8 +1102,8 @@ mod tests {
         }
     }
 
-    fn entry(name: &str, id: &str, is_dir: bool, mime: &str) -> LsEntry {
-        LsEntry {
+    fn entry(name: &str, id: &str, is_dir: bool, mime: &str) -> Entry {
+        Entry {
             path: name.into(),
             name: name.into(),
             size: if is_dir { -1 } else { 1 },

@@ -71,8 +71,8 @@ use crate::publish::{
     Timing, leftover_incoming_text, publish,
 };
 use crate::published::PublishedStore;
-use crate::rclone::Rclone;
 use crate::recovery::{Progress, Stage};
+use crate::remote::Remote;
 use crate::request::ExportRequest;
 use crate::settings::Settings;
 use crate::staging::Workspace;
@@ -638,7 +638,7 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         Ok(l) => l,
         Err(e) => return Done::failed(e.code, Some(counts.result(false, false, 0, None))),
     };
-    let rclone = Rclone::new(ctx.settings)
+    let remote = Remote::new(ctx.settings)
         .with_cancel(ctx.cancel.clone())
         .with_deadline(Some(deadline));
     let params = PublishParams {
@@ -649,7 +649,7 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         timing: ctx.tuning.timing,
     };
     let outcome = publish(
-        &rclone,
+        &remote,
         &layout,
         &params,
         &mut Recorder::new(handle)
@@ -776,9 +776,9 @@ fn recover_one(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         return stuck("internal");
     };
     // 後始末と復旧は期限なし（コマンドごとの期限と、待ちの回数の上限だけ。ジョブ全体の期限では打ち切らない）
-    let rclone = Rclone::new(ctx.settings).with_cancel(ctx.cancel.clone());
+    let remote = Remote::new(ctx.settings).with_cancel(ctx.cancel.clone());
     let recovery = Recovery {
-        rclone: &rclone,
+        remote: &remote,
         layout: &layout,
         published: ctx.published,
         expected: None,
@@ -839,8 +839,8 @@ pub fn dry_run(
         folder.clone(),
         JobId::generate()?,
     )?;
-    let rclone = Rclone::for_dry_run(ctx.settings).with_cancel(ctx.cancel.clone());
-    let inspection = crate::publish::dry_run(&rclone, &layout, ctx.published)?;
+    let remote = Remote::for_dry_run(ctx.settings).with_cancel(ctx.cancel.clone());
+    let inspection = crate::publish::dry_run(&remote, &layout, ctx.published)?;
     let (target, managed) = match &inspection.target {
         Target::Absent => ("absent", Value::Null),
         Target::Exists { .. } => (

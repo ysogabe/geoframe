@@ -2,6 +2,8 @@
 //! 親が終わったとき、偽の rclone（子）がもう居ないこと、そのあとに次のプロセスが実行枠を取れること、記録が `blocked`・`failed` に
 //! ならず次の復旧に渡されることを確かめる。偽の写真サービス（127.0.0.1 の空きポート）と偽の rclone・偽の Drive だけを使う
 //! （`--feed-base` は必ず偽のサイトへ。本物の写真サービス 127.0.0.1:8080 には接続しない）。
+//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る。`// rclone 固有` と
+//! 書いた確認（`assert_rclone_safe_calls`）だけが rclone の引数・環境変数を見る（rclone 版を消すときに消す）。
 
 mod common;
 
@@ -100,10 +102,10 @@ fn sigint_and_sigterm_stop_the_child_before_the_parent_exits_and_leave_the_recor
         let mut env = Env::new(&format!("sig-{}", name.to_lowercase()));
         let site = photo_site(DAY, DAY, three());
         // 写真を送る copy を、30 秒止める（signal で止まらなければ、30 秒かかる）
-        env.add_rule("copy", 0, 1, sleep_ms(30_000));
+        env.add_rule("upload", 0, 1, sleep_ms(30_000));
         let child = spawn_run(&env, &site);
         let pid = child.id();
-        let copy_pid = wait_for_call(&env, "copy", 30);
+        let copy_pid = wait_for_call(&env, "upload", 30);
         assert!(process_exists(copy_pid), "{name}: copy が動いている");
 
         let sent = Instant::now();
@@ -159,7 +161,8 @@ fn sigint_and_sigterm_stop_the_child_before_the_parent_exits_and_leave_the_recor
         let s = submit_retry(&next, &req).unwrap();
         let v = wait_done(&next, &s.job_id);
         assert_eq!(v["status"], "succeeded", "{name}: {v}");
-        assert_safe_calls(&env);
+        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+        assert_rclone_safe_calls(&env);
     }
 }
 
@@ -181,10 +184,10 @@ fn a_run_without_a_signal_still_finishes_normally_with_the_handlers_installed() 
 fn a_killed_parent_takes_its_rclone_child_with_it_as_a_backstop() {
     let env = Env::new("sig-kill");
     let site = photo_site(DAY, DAY, three());
-    env.add_rule("copy", 0, 1, sleep_ms(30_000));
+    env.add_rule("upload", 0, 1, sleep_ms(30_000));
     let child = spawn_run(&env, &site);
     let pid = child.id();
-    let copy_pid = wait_for_call(&env, "copy", 30);
+    let copy_pid = wait_for_call(&env, "upload", 30);
     assert!(process_exists(copy_pid));
     send(pid, libc::SIGKILL);
     let _ = wait_exit(child, 15);

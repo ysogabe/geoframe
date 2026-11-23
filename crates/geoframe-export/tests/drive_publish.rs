@@ -1,6 +1,10 @@
 //! T4: 宛先の状態、管理しているフォルダの見分け方、incoming → 検証 → 公開、置き換えの退避とゴミ箱、失敗のあとの復旧、dry_run
 //! （design.md 4.2、10 章の AC5・AC6・AC10）。偽の rclone（`fake-rclone/`）と偽の Drive だけを使う。
 //! 本物の rclone・Drive・ネットワークには触れない。
+//!
+//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る
+//! （`Env::ops`・`mutating_ops`・`ops_used`・`op_count`）。`// rclone 固有` と書いた確認（`rclone_calls`・
+//! `assert_rclone_safe_calls`）と、そう書いた試験だけが、rclone の引数・環境変数を見る。それらは rclone 版を消すときに消す。
 
 mod common;
 
@@ -14,8 +18,8 @@ use geoframe_export::publish::{
     ConflictReason, PublishFailure, PublishOutcome, PublishParams, Published, Recovery, Resolution,
     dry_run, publish,
 };
-use geoframe_export::rclone::Rclone;
 use geoframe_export::recovery::{BlockedReason, Progress, Stage};
+use geoframe_export::remote::Remote;
 use geoframe_export::request::{Destination, OnExists};
 use serde_json::{Value, json};
 
@@ -47,7 +51,7 @@ fn run(
     hook: &mut Hook,
 ) -> Result<PublishOutcome, PublishFailure> {
     let layout = env.layout(Y, FOLDER, JOB_A);
-    publish(&env.rclone(), &layout, &params(env, set, on_exists), hook)
+    publish(&env.remote(), &layout, &params(env, set, on_exists), hook)
 }
 
 fn published(out: Result<PublishOutcome, PublishFailure>) -> Published {
@@ -155,7 +159,7 @@ fn a_set_without_photos_is_refused_before_any_rclone_call() {
             files,
             ..params(&env, &set, OnExists::Replace)
         };
-        let f = failure(publish(&env.rclone(), &layout, &p, &mut hook));
+        let f = failure(publish(&env.remote(), &layout, &p, &mut hook));
         assert_eq!(f.error.code, ErrorCode::Internal);
     }
     // 宛先に既にフォルダがあっても同じ。rclone は 1 度も呼ばれず、記録も書かれない
@@ -165,7 +169,7 @@ fn a_set_without_photos_is_refused_before_any_rclone_call() {
         ..params(&env, &set, OnExists::Replace)
     };
     assert_eq!(
-        failure(publish(&env.rclone(), &layout, &p, &mut hook))
+        failure(publish(&env.remote(), &layout, &p, &mut hook))
             .error
             .code,
         ErrorCode::Internal
@@ -184,16 +188,16 @@ fn absent_destination_is_published_in_the_documented_order() {
 
     // 各段階の記録が、その段階の Drive の操作より先（1 本の順番で確かめる）。uploading は 2 回
     assert_eq!(
-        env.mutations(),
+        env.mutating_ops(),
         [
             "record:uploading",
-            "mkdir",
+            "create_folder",
             "record:uploading",
-            "copy",
-            "copy",
+            "upload",
+            "upload",
             "record:verifying",
             "record:publishing",
-            "moveto"
+            "move"
         ]
     );
     // 記録した ID: 最初は incoming の ID が無く、2 回目から ID つき。新規なので旧 ID は無い
@@ -231,6 +235,7 @@ fn absent_destination_is_published_in_the_documented_order() {
     // 呼び方: copy・moveto に --immutable、manifest は最後に別の呼び出し、位置の引数は固定の接頭辞＋検査済みの名前だけ
     let ws = set.dir.to_string_lossy().into_owned();
     let incoming = format!("gdrive:geoframe-export-work/incoming/{JOB_A}");
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
     let copies = env.rclone_calls("copy");
     assert_eq!(copies.len(), 2);
     for c in &copies {
@@ -248,6 +253,7 @@ fn absent_destination_is_published_in_the_documented_order() {
             .windows(2)
             .any(|w| w == ["--include", "/manifest.json"])
     );
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
     let mv = &env.rclone_calls("moveto")[0];
     assert!(mv.contains(&"--immutable".to_owned()));
     let d = mv.iter().position(|a| a == "--").unwrap();
@@ -256,8 +262,9 @@ fn absent_destination_is_published_in_the_documented_order() {
         [incoming, format!("gdrive:yamareco/{FOLDER}")]
     );
     // 共有・リンクの操作は呼ばない。使ったのは決まったコマンドだけ
-    assert_eq!(env.commands_used(), ["copy", "lsjson", "mkdir", "moveto"]);
-    assert_safe_calls(&env);
+    assert_eq!(env.ops_used(), ["create_folder", "list", "move", "upload"]);
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+    assert_rclone_safe_calls(&env);
 }
 
 #[test]
@@ -272,7 +279,7 @@ fn a_period_with_date_subfolders_is_published_and_verified() {
     let mut hook = Hook::new(&env);
     let layout = env.layout(Y, folder, JOB_A);
     let out = publish(
-        &env.rclone(),
+        &env.remote(),
         &layout,
         &params(&env, &set, OnExists::Error),
         &mut hook,
@@ -308,10 +315,11 @@ fn an_existing_destination_is_a_conflict_by_default_and_nothing_is_written() {
         let (reason, files) = conflict(run(&env, &set, OnExists::Error, &mut hook));
         assert_eq!(reason, ConflictReason::Exists, "{name}");
         assert_eq!(files, if with_files { 3 } else { 0 }, "{name}");
-        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
-        assert_eq!(env.commands_used(), ["lsjson"], "{name}");
+        assert_eq!(env.mutating_ops(), Vec::<String>::new(), "{name}");
+        assert_eq!(env.ops_used(), ["list"], "{name}");
         assert_eq!(dest_id(&env).as_deref(), Some(id.as_str()));
-        assert_safe_calls(&env);
+        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+        assert_rclone_safe_calls(&env);
     }
 }
 
@@ -325,7 +333,7 @@ fn an_empty_folder_is_not_managed_and_replace_is_refused() {
     let mut hook = Hook::new(&env);
     let (reason, files) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!((reason, files), (ConflictReason::NotManaged, 0));
-    assert!(env.mutations().is_empty());
+    env.assert_no_mutations();
 }
 
 // ---- 置き換え ----
@@ -346,20 +354,20 @@ fn replace_calls_in_the_documented_order_and_trashes_the_old_folder() {
 
     // incoming → 検証 → 退避 → 移動 → ゴミ箱。各段階の記録は、その操作より先
     assert_eq!(
-        env.mutations(),
+        env.mutating_ops(),
         [
             "record:uploading",
-            "mkdir",
+            "create_folder",
             "record:uploading",
-            "copy",
-            "copy",
+            "upload",
+            "upload",
             "record:verifying",
             "record:retiring",
-            "moveto",
+            "move",
             "record:publishing",
-            "moveto",
+            "move",
             "record:trashing",
-            "purge"
+            "trash"
         ]
     );
     // 記録した ID: 旧フォルダの ID は最初の記録から、incoming の ID は 2 回目の uploading から
@@ -395,6 +403,7 @@ fn replace_calls_in_the_documented_order_and_trashes_the_old_folder() {
     );
 
     // 呼び方: 退避は宛先 → replaced/<種類>-<フォルダ名>-<job_id>、purge は --drive-use-trash=true
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
     let moves = env.rclone_calls("moveto");
     let tail = |c: &Vec<String>| c[c.iter().position(|a| a == "--").unwrap() + 1..].to_vec();
     assert_eq!(
@@ -411,6 +420,7 @@ fn replace_calls_in_the_documented_order_and_trashes_the_old_folder() {
             format!("gdrive:yamareco/{FOLDER}")
         ]
     );
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
     let purge = &env.rclone_calls("purge")[0];
     assert!(purge.contains(&"--drive-use-trash=true".to_owned()));
     assert_eq!(
@@ -419,7 +429,8 @@ fn replace_calls_in_the_documented_order_and_trashes_the_old_folder() {
             "gdrive:geoframe-export-work/replaced/yamareco-{FOLDER}-{JOB_A}"
         )]
     );
-    assert_safe_calls(&env);
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+    assert_rclone_safe_calls(&env);
 }
 
 // ---- 各段階の記録が書けなければ、その段階の操作はしない ----
@@ -432,7 +443,7 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
     let mut hook = Hook::new(&env).fail_at(Stage::Uploading, 1);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Internal);
-    assert_eq!(env.mutations(), ["record:uploading"]);
+    assert_eq!(env.mutating_ops(), ["record:uploading"]);
 
     // uploading の 2 回目（ID の記録）: 写真は送らない。ID を記録できていないので、作ったフォルダは名前だけでは消さず、
     // 残りものとして知らせる
@@ -442,8 +453,8 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Internal);
     assert_eq!(
-        env.mutations(),
-        ["record:uploading", "mkdir", "record:uploading"]
+        env.mutating_ops(),
+        ["record:uploading", "create_folder", "record:uploading"]
     );
     assert!(f.leftover_incoming);
     let left = env
@@ -459,7 +470,7 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
     let mut hook = Hook::new(&env).fail_at(Stage::Verifying, 1);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Internal);
-    assert!(!env.mutations().contains(&"moveto".to_owned()));
+    assert!(!env.mutating_ops().contains(&"move".to_owned()));
     assert!(dest_id(&env).is_none());
 
     // 新規の publishing: 移動しない。incoming を片付ける
@@ -468,7 +479,7 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
     let mut hook = Hook::new(&env).fail_at(Stage::Publishing, 1);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Internal);
-    assert!(!env.mutations().contains(&"moveto".to_owned()));
+    assert!(!env.mutating_ops().contains(&"move".to_owned()));
     assert!(dest_id(&env).is_none());
     assert_eq!(env.drive().trashed.len(), 1);
 
@@ -479,7 +490,7 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
     let mut hook = Hook::new(&env).fail_at(Stage::Retiring, 1);
     let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Internal);
-    assert!(!env.mutations().contains(&"moveto".to_owned()));
+    assert!(!env.mutating_ops().contains(&"move".to_owned()));
     assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
     assert_eq!(env.drive().trashed.len(), 1); // incoming だけ
 
@@ -509,13 +520,13 @@ fn a_move_whose_response_was_lost_is_found_done_by_listing() {
     // 新規: 移動は済んでいるのに rclone は失敗を返す → lsjson で済んでいると判定し、成功
     let env = Env::new("lost-absent");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("moveto", 0, 1, do_then_fail());
+    env.add_rule("move", 0, 1, do_then_fail());
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Error, &mut hook));
     let incoming_id = hook.records[1].incoming_id.clone().unwrap();
     assert_eq!(p.folder_id, incoming_id);
     assert_eq!(dest_id(&env).as_deref(), Some(incoming_id.as_str()));
-    assert_eq!(env.rclone_calls("moveto").len(), 1, "もう一度移動しない");
+    assert_eq!(env.op_count("move"), 1, "もう一度移動しない");
     assert!(p.recorded);
     assert_eq!(
         files_under(&env, &["yamareco", FOLDER]),
@@ -526,7 +537,7 @@ fn a_move_whose_response_was_lost_is_found_done_by_listing() {
     let env = Env::new("lost-retire");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old_id = env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("moveto", 0, 1, do_then_fail());
+    env.add_rule("move", 0, 1, do_then_fail());
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Replace, &mut hook));
     assert!(p.replaced && p.recorded);
@@ -541,18 +552,18 @@ fn a_move_whose_response_was_lost_is_found_done_by_listing() {
     let env = Env::new("lost-publish");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old_id = env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("moveto", 1, 1, do_then_fail());
+    env.add_rule("move", 1, 1, do_then_fail());
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(env.drive().trashed, [old_id]);
-    assert_eq!(env.rclone_calls("moveto").len(), 2);
+    assert_eq!(env.op_count("move"), 2);
     assert_eq!(dest_id(&env).as_deref(), Some(p.folder_id.as_str()));
 
     // 置き換え: ゴミ箱への移動の応答が失われた → 一覧でもう無いと分かり、成功（旧フォルダは残っていない）
     let env = Env::new("lost-purge");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old_id = env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("purge", 0, 1, do_then_fail());
+    env.add_rule("trash", 0, 1, do_then_fail());
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(p.old_left_in_replaced, None);
@@ -564,7 +575,7 @@ fn a_purge_that_really_failed_leaves_the_new_set_published_and_says_the_old_fold
     let env = Env::new("purge-fail");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old_id = env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("purge", 0, u64::MAX, fail(1));
+    env.add_rule("trash", 0, u64::MAX, fail(1));
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(p.old_left_in_replaced.as_deref(), Some(old_id.as_str()));
@@ -578,19 +589,19 @@ fn a_late_move_makes_two_listings_differ_so_the_service_waits_and_looks_again() 
     let env = Env::new("late");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     // 移動は失敗で終わり、Drive 側では数回の一覧のあとに反映される。1 回目の観察の途中で反映される
-    env.add_rule("moveto", 0, 1, late_then_fail(3));
+    env.add_rule("move", 0, 1, late_then_fail(3));
     let mut hook = Hook::new(&env);
     let p = published(run(&env, &set, OnExists::Error, &mut hook));
     let incoming_id = hook.records[1].incoming_id.clone().unwrap();
     assert_eq!(p.folder_id, incoming_id);
     assert_eq!(dest_id(&env).as_deref(), Some(incoming_id.as_str()));
     // 2 つの観察が食い違ったので、やり直した（失敗のあとの lsjson が、1 回分の観察の数より多い）
-    let seq = env.sequence();
-    let after_move = seq.iter().rposition(|c| c == "moveto").unwrap();
-    let lists_after = seq[after_move..].iter().filter(|c| *c == "lsjson").count();
+    let seq = env.ops();
+    let after_move = seq.iter().rposition(|c| c == "move").unwrap();
+    let lists_after = seq[after_move..].iter().filter(|c| *c == "list").count();
     assert!(lists_after >= 18, "{lists_after}");
     assert!(
-        !seq[after_move..].contains(&"purge".to_owned()),
+        !seq[after_move..].contains(&"trash".to_owned()),
         "公開済みの incoming を消さない"
     );
 }
@@ -600,7 +611,7 @@ fn a_move_that_never_shows_up_is_treated_as_not_done_and_incoming_is_cleaned() {
     // 2 回の観察が同じなら、その状態に表を当てはめる（移動は実行されなかったと見る）。失敗は元のまま返る
     let env = Env::new("stale");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("moveto", 0, 1, late_then_fail(100_000));
+    env.add_rule("move", 0, 1, late_then_fail(100_000));
     let mut hook = Hook::new(&env);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::RcloneFailed);
@@ -615,7 +626,7 @@ fn a_move_that_never_shows_up_is_treated_as_not_done_and_incoming_is_cleaned() {
 fn a_file_by_file_publish_move_is_found_by_the_id_check_and_blocks() {
     let env = Env::new("filewise-publish");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("moveto", 0, 1, filewise());
+    env.add_rule("move", 0, 1, filewise());
     let mut hook = Hook::new(&env);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Blocked);
@@ -627,8 +638,8 @@ fn a_file_by_file_publish_move_is_found_by_the_id_check_and_blocks() {
     assert_eq!(o.dest.len(), 1);
     assert_ne!(o.dest[0].id, incoming_id, "宛先の ID が incoming と違う");
     // それ以上は何もしない（purge なし、移動も 1 回だけ）
-    assert_eq!(env.rclone_calls("moveto").len(), 1);
-    assert!(env.rclone_calls("purge").is_empty());
+    assert_eq!(env.op_count("move"), 1);
+    assert!(env.op_count("trash") == 0);
     assert!(
         info.describe(&env.layout(Y, FOLDER, JOB_A))
             .contains("publish_mismatch")
@@ -640,7 +651,7 @@ fn a_file_by_file_retire_move_blocks_before_anything_reaches_the_trash() {
     let env = Env::new("filewise-retire");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old_id = env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("moveto", 0, 1, filewise());
+    env.add_rule("move", 0, 1, filewise());
     let mut hook = Hook::new(&env);
     let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(f.error.code, ErrorCode::Blocked);
@@ -655,8 +666,8 @@ fn a_file_by_file_retire_move_blocks_before_anything_reaches_the_trash() {
         o.replaced[0].id, old_id,
         "replaced の ID が記録した旧 ID と違う"
     );
-    assert_eq!(env.rclone_calls("moveto").len(), 1);
-    assert!(env.rclone_calls("purge").is_empty());
+    assert_eq!(env.op_count("move"), 1);
+    assert!(env.op_count("trash") == 0);
     assert!(env.drive().trashed.is_empty());
     // recover の表示: 移してしまったフォルダの ID と、戻す手順
     let text = info.describe(&env.layout(Y, FOLDER, JOB_A));
@@ -690,7 +701,7 @@ fn a_manual_folder_created_between_the_check_and_the_retire_is_caught_by_the_id_
     assert_eq!(info.reason, BlockedReason::RetireMismatch);
     let moved = &info.observed.as_ref().unwrap().replaced[0].id;
     assert_ne!(moved, &old_id);
-    assert!(env.rclone_calls("purge").is_empty(), "ゴミ箱へは移さない");
+    assert!(env.op_count("trash") == 0, "ゴミ箱へは移さない");
     // 移してしまったフォルダは replaced/ にある（オーナーが戻せる）
     assert!(
         env.drive()
@@ -717,8 +728,8 @@ fn a_manual_folder_appearing_after_the_retire_blocks_instead_of_publishing_over_
     let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
     let info = f.blocked.expect("blocked");
     assert_eq!(info.reason, BlockedReason::DestinationUnexpected);
-    assert_eq!(env.rclone_calls("moveto").len(), 1, "公開の移動はしない");
-    assert!(env.rclone_calls("purge").is_empty());
+    assert_eq!(env.op_count("move"), 1, "公開の移動はしない");
+    assert!(env.op_count("trash") == 0);
     // 旧フォルダは replaced/ に残っている（ID も記録のまま）
     let d = env.drive();
     let replaced = d
@@ -736,11 +747,11 @@ fn an_unstable_listing_that_never_settles_blocks() {
     // 一覧が毎回違う形で返り続ける → 2 回の観察が一致せず、rounds 回で決まらない
     let env = Env::new("unstable");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("moveto", 0, 1, fail(1));
+    env.add_rule("move", 0, 1, fail(1));
     // 失敗のあとの一覧がすべて失敗する
     let mut c = env.ctl();
     c.rules.push(model::Rule {
-        cmd: "lsjson".into(),
+        op: "list".into(),
         contains: None,
         // 失敗した移動より前の lsjson（宛先の状態 2、incoming の事前確認 1〔作業用のフォルダに incoming がまだ無い〕、
         // incoming の ID 2、検証 2、確かめ直し 2、公開の直前 2）は通し、失敗のあとの一覧（復旧の観察）をすべて失敗させる
@@ -775,16 +786,16 @@ fn a_destination_created_during_the_run_stops_the_publish_and_cleans_incoming() 
         let f = failure(run(&env, &set, OnExists::Error, &mut hook));
         assert_eq!(f.error.code, ErrorCode::AmbiguousDestination, "{name}");
         assert!(f.blocked.is_none() && !f.leftover_incoming, "{name}");
-        assert!(env.rclone_calls("moveto").is_empty(), "{name}: 移動しない");
+        assert!(env.op_count("move") == 0, "{name}: 移動しない");
         assert_eq!(env.drive().trashed.len(), 1, "{name}: incoming を片付けた");
         // 中止の片付けに入ったことを、ゴミ箱へ移す前に記録する（`publishing` から中止したときだけ。それ以外は前のままと見える）
-        let seq = env.mutations();
+        let seq = env.mutating_ops();
         let aborting = seq.iter().position(|c| c == "record:aborting");
         if stage == Stage::Publishing {
             let rec = hook.records.last().unwrap();
             assert_eq!(rec.stage, Stage::Aborting, "{name}");
             assert_eq!(rec.incoming_id, hook.records[1].incoming_id, "{name}");
-            let purge = seq.iter().position(|c| c == "purge").unwrap();
+            let purge = seq.iter().position(|c| c == "trash").unwrap();
             assert!(aborting.is_some_and(|a| a < purge), "{name}: {seq:?}");
         } else {
             assert!(aborting.is_none(), "{name}: {seq:?}");
@@ -808,7 +819,7 @@ fn a_replace_target_that_changed_during_the_run_is_not_replaced() {
     });
     let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(f.error.code, ErrorCode::AmbiguousDestination);
-    assert!(env.rclone_calls("moveto").is_empty());
+    assert!(env.op_count("move") == 0);
     assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
 }
 
@@ -859,7 +870,7 @@ fn a_verification_mismatch_trashes_incoming_and_fails() {
         });
         let f = failure(run(&env, &set, OnExists::Error, &mut hook));
         assert_eq!(f.error.code, ErrorCode::VerifyMismatch, "{name}");
-        assert!(env.rclone_calls("moveto").is_empty(), "{name}");
+        assert!(env.op_count("move") == 0, "{name}");
         assert_eq!(env.drive().trashed.len(), 1, "{name}: incoming はゴミ箱へ");
         assert!(dest_id(&env).is_none(), "{name}");
     }
@@ -915,7 +926,11 @@ fn duplicates_files_and_shortcuts_at_the_destination_are_ambiguous() {
             let f = failure(run(&env, &set, on_exists, &mut hook));
             assert_eq!(f.error.code, ErrorCode::AmbiguousDestination, "{name}");
         }
-        assert!(env.mutations().is_empty(), "{name}: {:?}", env.mutations());
+        assert!(
+            env.mutating_ops().is_empty(),
+            "{name}: {:?}",
+            env.mutating_ops()
+        );
     }
 }
 
@@ -939,11 +954,11 @@ fn a_failed_query_is_drive_unavailable_and_never_read_as_absent() {
     for (name, effect) in cases {
         let env = Env::new(&format!("unavail-{name}"));
         let set = env.make_set("s", Y, FOLDER, PHOTOS);
-        env.add_rule("lsjson", 0, u64::MAX, effect);
+        env.add_rule("list", 0, u64::MAX, effect);
         let mut hook = Hook::new(&env);
         let f = failure(run(&env, &set, OnExists::Error, &mut hook));
         assert_eq!(f.error.code, ErrorCode::DriveUnavailable, "{name}");
-        assert!(env.mutations().is_empty(), "{name}: 何も書かない");
+        assert!(env.mutating_ops().is_empty(), "{name}: 何も書かない");
     }
     // 接頭辞のフォルダそのものが無い（lsjson が終了コード 3）。「宛先が無い」とは読まない
     let env = Env::new("unavail-no-prefix");
@@ -955,16 +970,16 @@ fn a_failed_query_is_drive_unavailable_and_never_read_as_absent() {
     let mut hook = Hook::new(&env);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::DriveUnavailable);
-    assert!(env.mutations().is_empty());
+    env.assert_no_mutations();
 }
 
 #[test]
 fn a_query_that_times_out_is_drive_unavailable() {
     let env = Env::new("unavail-timeout");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("lsjson", 0, u64::MAX, sleep_ms(20_000));
+    env.add_rule("list", 0, u64::MAX, sleep_ms(20_000));
     let rclone = env
-        .rclone()
+        .remote()
         .with_timeouts(Duration::from_secs(30), Duration::from_millis(300));
     let layout = env.layout(Y, FOLDER, JOB_A);
     let mut hook = Hook::new(&env);
@@ -1117,16 +1132,15 @@ fn folders_not_written_by_this_service_are_never_replaced() {
         let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
         assert_eq!(reason, ConflictReason::NotManaged, "{name}");
         // moveto・purge・copy・mkdir は呼ばれず、記録も書かれない。Drive は変わらない
-        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+        assert_eq!(env.mutating_ops(), Vec::<String>::new(), "{name}");
         assert!(
-            env.commands_used()
-                .iter()
-                .all(|c| c == "lsjson" || c == "cat"),
+            env.ops_used().iter().all(|c| c == "list" || c == "read"),
             "{name}"
         );
         assert_eq!(env.drive().nodes.len(), before, "{name}");
         let _ = &f_;
-        assert_safe_calls(&env);
+        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+        assert_rclone_safe_calls(&env);
     }
 }
 
@@ -1147,7 +1161,7 @@ fn an_oversized_manifest_is_not_read() {
     let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(reason, ConflictReason::NotManaged);
     assert!(
-        !env.commands_used().contains(&"cat".to_owned()),
+        !env.ops_used().contains(&"read".to_owned()),
         "上限を超えるものは読まない"
     );
 }
@@ -1224,7 +1238,7 @@ fn a_managed_folder_with_added_or_changed_files_is_modified_and_untouched() {
         let mut hook = Hook::new(&env);
         let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
         assert_eq!(reason, ConflictReason::Modified, "{name}");
-        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+        assert_eq!(env.mutating_ops(), Vec::<String>::new(), "{name}");
         assert_eq!(dest_id(&env).as_deref(), Some(id.as_str()), "{name}");
         assert_eq!(env.drive().nodes.len(), before, "{name}");
         assert!(env.drive().trashed.is_empty(), "{name}");
@@ -1242,7 +1256,7 @@ fn a_managed_unchanged_folder_is_recognised_in_a_period_with_subfolders_too() {
     let set = env.make_set("p", Y, folder, &files);
     env.seed_managed(Y, folder, &set);
     let layout = env.layout(Y, folder, JOB_A);
-    let i = dry_run(&env.rclone(), &layout, &env.published).unwrap();
+    let i = dry_run(&env.remote(), &layout, &env.published).unwrap();
     assert_eq!(i.managed, Some(Managed::Managed));
     assert_eq!(i.existing_files, 3);
 }
@@ -1254,29 +1268,29 @@ fn dry_run_calls_only_lsjson_and_cat() {
     let layout = |env: &Env| env.layout(Y, FOLDER, JOB_A);
     // 無い
     let env = Env::new("dry-absent");
-    let i = dry_run(&env.rclone(), &layout(&env), &env.published).unwrap();
+    let i = dry_run(&env.remote(), &layout(&env), &env.published).unwrap();
     assert_eq!(
         (i.target.clone(), i.existing_files, i.managed),
         (Target::Absent, 0, None)
     );
-    assert_eq!(env.commands_used(), ["lsjson"]);
+    assert_eq!(env.ops_used(), ["list"]);
 
     // ある・管理している（cat で manifest を読む）
     let env = Env::new("dry-managed");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let id = env.seed_managed(Y, FOLDER, &set);
-    let i = dry_run(&env.rclone(), &layout(&env), &env.published).unwrap();
+    let i = dry_run(&env.remote(), &layout(&env), &env.published).unwrap();
     assert_eq!(i.target, Target::Exists { id });
     assert_eq!(i.existing_files, 3);
     assert_eq!(i.managed, Some(Managed::Managed));
-    assert_eq!(env.commands_used(), ["cat", "lsjson"]);
-    assert!(env.mutations().is_empty());
+    assert_eq!(env.ops_used(), ["list", "read"]);
+    env.assert_no_mutations();
 
     // ある・管理していない（手作業）／変更あり
     let env = Env::new("dry-manual");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     env.seed_folder(Y, FOLDER, &set);
-    let i = dry_run(&env.rclone(), &layout(&env), &env.published).unwrap();
+    let i = dry_run(&env.remote(), &layout(&env), &env.published).unwrap();
     assert_eq!(i.managed, Some(Managed::NotManaged));
     let env = Env::new("dry-modified");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
@@ -1284,21 +1298,18 @@ fn dry_run_calls_only_lsjson_and_cat() {
     let mut d = env.drive();
     d.add_file(&["yamareco", FOLDER], "memo.txt", 1, None);
     env.save(&d);
-    let i = dry_run(&env.rclone(), &layout(&env), &env.published).unwrap();
+    let i = dry_run(&env.remote(), &layout(&env), &env.published).unwrap();
     assert_eq!(i.managed, Some(Managed::Modified));
-    assert!(
-        env.commands_used()
-            .iter()
-            .all(|c| c == "lsjson" || c == "cat")
-    );
-    assert!(env.mutations().is_empty());
-    assert_safe_calls(&env);
+    assert!(env.ops_used().iter().all(|c| c == "list" || c == "read"));
+    env.assert_no_mutations();
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+    assert_rclone_safe_calls(&env);
 
     // 照会の失敗は drive_unavailable、同名が複数なら ambiguous
     let env = Env::new("dry-fail");
-    env.add_rule("lsjson", 0, u64::MAX, fail(1));
+    env.add_rule("list", 0, u64::MAX, fail(1));
     assert_eq!(
-        dry_run(&env.rclone(), &layout(&env), &env.published)
+        dry_run(&env.remote(), &layout(&env), &env.published)
             .unwrap_err()
             .code,
         ErrorCode::DriveUnavailable
@@ -1309,7 +1320,7 @@ fn dry_run_calls_only_lsjson_and_cat() {
     d.mkdir_dup(&["yamareco"], FOLDER);
     env.save(&d);
     assert_eq!(
-        dry_run(&env.rclone(), &layout(&env), &env.published)
+        dry_run(&env.remote(), &layout(&env), &env.published)
             .unwrap_err()
             .code,
         ErrorCode::AmbiguousDestination
@@ -1322,11 +1333,11 @@ fn dry_run_as_a_whole_has_a_deadline_and_a_slow_drive_is_drive_unavailable() {
     let env = Env::new("dry-whole");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("lsjson", 0, u64::MAX, sleep_ms(400));
+    env.add_rule("list", 0, u64::MAX, sleep_ms(400));
     let layout = env.layout(Y, FOLDER, JOB_A);
     let started = Instant::now();
     let err = geoframe_export::publish::dry_run_within(
-        &env.rclone(),
+        &env.remote(),
         &layout,
         &env.published,
         Duration::from_millis(900),
@@ -1336,7 +1347,7 @@ fn dry_run_as_a_whole_has_a_deadline_and_a_slow_drive_is_drive_unavailable() {
     assert!(started.elapsed() < Duration::from_secs(10));
     // 期限が足りていれば通る
     let ok = geoframe_export::publish::dry_run_within(
-        &env.rclone(),
+        &env.remote(),
         &layout,
         &env.published,
         Duration::from_secs(60),
@@ -1350,7 +1361,7 @@ fn the_dry_run_rclone_has_a_thirty_second_limit_per_call() {
     let env = Env::new("dry-limit");
     let settings = &env.settings;
     // 既定の期限は 5 分。dry_run は 30 秒に縮める（実際に待たずに、短い期限での失敗で確かめるのは別の試験）
-    let r = Rclone::for_dry_run(settings);
+    let r = Remote::for_dry_run(settings);
     let text = format!("{r:?}");
     assert!(text.contains("copy_timeout: 30s, timeout: 30s"), "{text}");
     // 設定が 30 秒より短ければ、それを使う
@@ -1362,7 +1373,7 @@ fn the_dry_run_rclone_has_a_thirty_second_limit_per_call() {
     };
     raw.rclone_timeout = Some("10".into());
     let short = geoframe_export::settings::Settings::from_raw(&raw).unwrap();
-    assert!(format!("{:?}", Rclone::for_dry_run(&short)).contains("timeout: 10s"));
+    assert!(format!("{:?}", Remote::for_dry_run(&short)).contains("timeout: 10s"));
 }
 
 // ---- 期限 ----
@@ -1371,9 +1382,9 @@ fn the_dry_run_rclone_has_a_thirty_second_limit_per_call() {
 fn the_copy_timeout_kills_rclone_and_cleans_incoming() {
     let env = Env::new("copy-timeout");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("copy", 0, 1, sleep_ms(20_000));
+    env.add_rule("upload", 0, 1, sleep_ms(20_000));
     let rclone = env
-        .rclone()
+        .remote()
         .with_timeouts(Duration::from_millis(400), Duration::from_secs(30));
     let layout = env.layout(Y, FOLDER, JOB_A);
     let mut hook = Hook::new(&env);
@@ -1394,9 +1405,9 @@ fn the_copy_timeout_kills_rclone_and_cleans_incoming() {
 fn the_job_deadline_overrides_the_command_limit_and_cleanup_still_runs() {
     let env = Env::new("job-deadline");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
-    env.add_rule("copy", 0, 1, sleep_ms(20_000));
+    env.add_rule("upload", 0, 1, sleep_ms(20_000));
     let rclone = env
-        .rclone()
+        .remote()
         .with_deadline(Some(Instant::now() + Duration::from_millis(2500)));
     let layout = env.layout(Y, FOLDER, JOB_A);
     let mut hook = Hook::new(&env);
@@ -1454,6 +1465,7 @@ fn settings_with_a_different_remote_or_an_overlapping_work_root_do_not_start() {
 
 // ---- 呼び出しの安全（環境変数・引数） ----
 
+// rclone 固有: rclone の引数・環境変数そのものを確かめる（rclone 版を消すときに、この試験も消す）。
 #[test]
 fn rclone_gets_a_minimal_environment_and_no_credential_flags_in_every_call() {
     let env = Env::new("safe");
@@ -1462,7 +1474,7 @@ fn rclone_gets_a_minimal_environment_and_no_credential_flags_in_every_call() {
     let mut hook = Hook::new(&env);
     let _ = published(run(&env, &set, OnExists::Replace, &mut hook));
     assert!(env.calls().iter().filter(|c| c["kind"] == "rclone").count() > 10);
-    assert_safe_calls(&env);
+    assert_rclone_safe_calls(&env);
     // 子プロセスの環境にも引数にも、client_id・client_secret・token の文字は無い
     for c in env.calls().iter().filter(|c| c["kind"] == "rclone") {
         let text = c.to_string().to_lowercase();
@@ -1475,6 +1487,7 @@ fn rclone_gets_a_minimal_environment_and_no_credential_flags_in_every_call() {
 
 // ---- Google のファイル（サイズ不明）とショートカット（実 rclone の一覧の形） ----
 
+// rclone 固有: rclone の引数・環境変数そのものを確かめる（rclone 版を消すときに、この試験も消す）。
 fn lsjson_calls_have(env: &Env, flag: &str) -> bool {
     let calls = env.rclone_calls("lsjson");
     !calls.is_empty() && calls.iter().all(|c| c.iter().any(|a| a == flag))
@@ -1499,7 +1512,7 @@ fn native_google_files_in_a_managed_folder_make_it_modified_and_nothing_is_touch
         let (reason, files) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
         assert_eq!(reason, ConflictReason::Modified, "{name}");
         assert_eq!(files, 4, "{name}: 写真 2・manifest・足されたファイル");
-        assert!(env.mutations().is_empty(), "{name}");
+        assert!(env.mutating_ops().is_empty(), "{name}");
         assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
         assert!(lsjson_calls_have(&env, "--drive-show-all-gdocs"), "{name}");
         assert!(
@@ -1508,7 +1521,7 @@ fn native_google_files_in_a_managed_folder_make_it_modified_and_nothing_is_touch
         );
         // dry_run も同じ判定
         let layout = env.layout(Y, FOLDER, JOB_A);
-        let i = dry_run(&Rclone::for_dry_run(&env.settings), &layout, &env.published).unwrap();
+        let i = dry_run(&Remote::for_dry_run(&env.settings), &layout, &env.published).unwrap();
         assert_eq!(i.managed, Some(Managed::Modified), "{name}");
     }
 }
@@ -1535,7 +1548,7 @@ fn unrelated_unknown_size_entries_in_a_parent_do_not_fail_the_whole_listing() {
     let mut hook = Hook::new(&env);
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::AmbiguousDestination);
-    assert!(env.mutations().is_empty());
+    env.assert_no_mutations();
 }
 
 #[test]
@@ -1550,7 +1563,7 @@ fn a_google_file_that_appears_in_the_incoming_fails_the_verification() {
     });
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::VerifyMismatch);
-    assert!(env.rclone_calls("moveto").is_empty());
+    assert!(env.op_count("move") == 0);
     assert!(dest_id(&env).is_none());
 }
 
@@ -1571,7 +1584,7 @@ fn a_google_file_found_in_the_destination_after_the_move_blocks() {
         f.blocked.expect("blocked").reason,
         BlockedReason::PublishMismatch
     );
-    assert!(env.rclone_calls("purge").is_empty());
+    assert!(env.op_count("trash") == 0);
 }
 
 #[test]
@@ -1592,8 +1605,9 @@ fn resolved_and_dangling_shortcuts_are_classified_not_rejected() {
         let mut hook = Hook::new(&env);
         let f = failure(run(&env, &set, OnExists::Error, &mut hook));
         assert_eq!(f.error.code, ErrorCode::AmbiguousDestination, "{name}");
-        assert!(env.mutations().is_empty(), "{name}");
+        assert!(env.mutating_ops().is_empty(), "{name}");
         // ショートカットを除かない一覧は、設定ファイルに左右されないよう `=false` を明示している
+        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
         let calls = env.rclone_calls("lsjson");
         assert!(
             calls
@@ -1642,7 +1656,7 @@ fn a_shortcut_inside_a_managed_folder_makes_it_modified() {
         let mut hook = Hook::new(&env);
         let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
         assert_eq!(reason, ConflictReason::Modified, "{name}");
-        assert!(env.mutations().is_empty(), "{name}");
+        assert!(env.mutating_ops().is_empty(), "{name}");
         assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
     }
 }
@@ -1675,7 +1689,7 @@ fn the_old_folder_is_not_trashed_when_something_was_added_to_it_after_the_check(
     let info = f.blocked.expect("blocked");
     assert_eq!(info.reason, BlockedReason::RetiredContentChanged);
     assert_eq!(info.progress.stage, Stage::Trashing);
-    assert!(env.rclone_calls("purge").is_empty());
+    assert!(env.op_count("trash") == 0);
     assert!(env.drive().trashed.is_empty());
     // 新しい一式は公開済み。旧フォルダ（メモごと）は退避先に残っている
     assert_ne!(dest_id(&env).as_deref(), Some(old_id.as_str()));
@@ -1688,6 +1702,7 @@ fn the_old_folder_is_not_trashed_when_something_was_added_to_it_after_the_check(
         "{text}"
     );
     // 旧 manifest は退避先の中の manifest.json を cat で読み直している
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
     let cats = env.rclone_calls("cat");
     assert!(
         cats.iter()
@@ -1729,7 +1744,7 @@ fn the_old_folder_is_not_trashed_when_replaced_shows_another_id_or_a_changed_fil
     let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
     let info = f.blocked.expect("blocked");
     assert_eq!(info.reason, BlockedReason::TrashMismatch);
-    assert!(env.rclone_calls("purge").is_empty());
+    assert!(env.op_count("trash") == 0);
 
     // 写真のサイズが違う
     let env = Env::new("trash-resized");
@@ -1754,7 +1769,7 @@ fn the_old_folder_is_not_trashed_when_replaced_shows_another_id_or_a_changed_fil
         f.blocked.expect("blocked").reason,
         BlockedReason::RetiredContentChanged
     );
-    assert!(env.rclone_calls("purge").is_empty());
+    assert!(env.op_count("trash") == 0);
 }
 
 #[test]
@@ -1763,16 +1778,16 @@ fn a_failed_purge_succeeds_with_the_old_folder_left_only_if_it_is_confirmed_in_r
     let probe = Env::new("purge-unlistable-probe");
     let set = probe.make_set("s", Y, FOLDER, PHOTOS);
     probe.seed_managed(Y, FOLDER, &set);
-    probe.add_rule("purge", 0, u64::MAX, fail(1));
+    probe.add_rule("trash", 0, u64::MAX, fail(1));
     let mut hook = Hook::new(&probe);
     let _ = published(run(&probe, &set, OnExists::Replace, &mut hook));
     // purge までに、`replaced` を含む場所への lsjson が何回あったか
     let mut before_purge = 0;
     for c in probe.calls() {
-        if c["cmd"] == "purge" {
+        if c["op"] == "trash" {
             break;
         }
-        if c["cmd"] == "lsjson"
+        if c["op"] == "list"
             && c["args"]
                 .as_array()
                 .unwrap()
@@ -1787,10 +1802,10 @@ fn a_failed_purge_succeeds_with_the_old_folder_left_only_if_it_is_confirmed_in_r
     let env = Env::new("purge-unlistable");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     env.seed_managed(Y, FOLDER, &set);
-    env.add_rule("purge", 0, u64::MAX, fail(1));
+    env.add_rule("trash", 0, u64::MAX, fail(1));
     let mut c = env.ctl();
     c.rules.push(model::Rule {
-        cmd: "lsjson".into(),
+        op: "list".into(),
         contains: Some("/replaced".into()),
         skip: before_purge,
         times: u64::MAX,
@@ -1856,7 +1871,7 @@ fn the_incoming_that_no_longer_matches_the_recorded_id_is_left_and_reported() {
     assert!(f.leftover_incoming, "消さずに、残りものとして知らせる");
     let recorded = hook.records.last().unwrap().incoming_id.clone().unwrap();
     assert_eq!(f.leftover_incoming_id.as_deref(), Some(recorded.as_str()));
-    assert!(env.rclone_calls("purge").is_empty());
+    assert!(env.op_count("trash") == 0);
     assert!(env.drive().trashed.is_empty());
     assert!(
         env.drive()
@@ -1891,10 +1906,10 @@ fn a_same_named_item_already_in_replaced_stops_the_retire_before_anything_moves(
         assert_eq!(seen.len(), 1);
         assert_eq!(seen[0].id, pre, "見えていた項目の ID");
         // 何も動かしていない: 移動も purge も無く、旧フォルダは宛先のまま、incoming も残っている
-        assert!(env.rclone_calls("moveto").is_empty(), "file={as_file}");
-        assert!(env.rclone_calls("purge").is_empty());
+        assert!(env.op_count("move") == 0, "file={as_file}");
+        assert!(env.op_count("trash") == 0);
         assert_eq!(
-            env.mutations().last().map(String::as_str),
+            env.mutating_ops().last().map(String::as_str),
             Some("record:retiring")
         );
         assert_eq!(dest_id(&env).as_deref(), Some(old_id.as_str()));
@@ -1925,9 +1940,9 @@ fn a_same_named_item_already_in_replaced_stops_the_retire_before_anything_moves(
         assert!(text.contains("何も動かしていません"), "{text}");
 
         // 再起動の復旧も、記録した retiring と同じ状態を blocked にする（動かさない）
-        let r = env.rclone();
+        let r = env.remote();
         let rec = Recovery {
-            rclone: &r,
+            remote: &r,
             layout: &layout,
             published: &env.published,
             expected: None,
@@ -1937,7 +1952,7 @@ fn a_same_named_item_already_in_replaced_stops_the_retire_before_anything_moves(
             .run(&info.progress, false, &mut Hook::new(&env))
             .unwrap_err();
         assert_eq!(again.reason, BlockedReason::ReplacedUnexpected);
-        assert!(env.rclone_calls("moveto").is_empty());
+        assert!(env.op_count("move") == 0);
     }
 }
 
@@ -1994,8 +2009,8 @@ fn a_same_named_incoming_that_already_exists_is_not_adopted_and_is_reported_as_a
         // 既存のフォルダの ID を、このジョブのものとして記録しない。作らず、送らず、消さない
         // 同名の確かめは最初の記録より前に行うので、何も記録しない（再起動の復旧が blocked にならない）
         assert!(hook.records.is_empty(), "{variant}");
-        for cmd in ["mkdir", "copy", "moveto", "purge"] {
-            assert!(env.rclone_calls(cmd).is_empty(), "{variant}: {cmd}");
+        for op in ["create_folder", "upload", "move", "trash"] {
+            assert!(env.op_count(op) == 0, "{variant}: {op}");
         }
         assert!(dest_id(&env).is_none(), "{variant}");
         assert!(env.drive().trashed.is_empty() && env.drive().deleted.is_empty());
@@ -2028,11 +2043,11 @@ fn an_abort_from_publishing_records_aborting_before_the_trash_and_a_second_stop_
     });
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::AmbiguousDestination);
-    let seq = env.mutations();
+    let seq = env.mutating_ops();
     let n = seq.len();
     assert_eq!(
         &seq[n - 3..],
-        ["record:publishing", "record:aborting", "purge"]
+        ["record:publishing", "record:aborting", "trash"]
     );
     let last = hook.records.last().cloned().unwrap();
     assert_eq!(last.stage, Stage::Aborting);
@@ -2042,9 +2057,9 @@ fn an_abort_from_publishing_records_aborting_before_the_trash_and_a_second_stop_
     // purge の直後に止まった、として再起動する。この中止は、宛先にオーナーのフォルダができたことが原因なので、宛先は
     // 前のままではない。表のとおり（宛先が変わっていれば blocked）、再起動の復旧は destination_unexpected で止まる
     let layout = env.layout(Y, FOLDER, JOB_A);
-    let r = env.rclone();
+    let r = env.remote();
     let rec = Recovery {
-        rclone: &r,
+        remote: &r,
         layout: &layout,
         published: &env.published,
         expected: None,
@@ -2093,7 +2108,7 @@ fn an_abort_whose_aborting_record_cannot_be_written_does_not_trash_the_incoming(
     let f = failure(run(&env, &set, OnExists::Error, &mut hook));
     assert_eq!(f.error.code, ErrorCode::AmbiguousDestination);
     // 書けなければ、ゴミ箱へは移さない。残りものとして ID つきで知らせる
-    assert!(env.rclone_calls("purge").is_empty());
+    assert!(env.op_count("trash") == 0);
     assert!(f.leftover_incoming);
     assert_eq!(f.leftover_incoming_id, hook.records[1].incoming_id);
     assert!(env.drive().trashed.is_empty());
@@ -2129,7 +2144,7 @@ fn a_rewrite_with_the_same_name_and_size_is_modified_and_nothing_is_touched() {
         // 書き換える前は、管理しているフォルダ
         let layout = env.layout(Y, folder, JOB_A);
         assert_eq!(
-            dry_run(&env.rclone(), &layout, &env.published)
+            dry_run(&env.remote(), &layout, &env.published)
                 .unwrap()
                 .managed,
             Some(Managed::Managed),
@@ -2142,7 +2157,7 @@ fn a_rewrite_with_the_same_name_and_size_is_modified_and_nothing_is_touched() {
         change_md5(&env, &parent, target.1);
         let before = env.drive().nodes.len();
         assert_eq!(
-            dry_run(&env.rclone(), &layout, &env.published)
+            dry_run(&env.remote(), &layout, &env.published)
                 .unwrap()
                 .managed,
             Some(Managed::Modified),
@@ -2151,16 +2166,16 @@ fn a_rewrite_with_the_same_name_and_size_is_modified_and_nothing_is_touched() {
         let layout = env.layout(Y, folder, JOB_A);
         let mut hook = Hook::new(&env);
         let out = publish(
-            &env.rclone(),
+            &env.remote(),
             &layout,
             &params(&env, &set, OnExists::Replace),
             &mut hook,
         );
         let (reason, _) = conflict(out);
         assert_eq!(reason, ConflictReason::Modified, "{name}");
-        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
-        for cmd in ["moveto", "purge", "copy", "mkdir"] {
-            assert!(env.rclone_calls(cmd).is_empty(), "{name}: {cmd}");
+        assert_eq!(env.mutating_ops(), Vec::<String>::new(), "{name}");
+        for op in ["move", "trash", "upload", "create_folder"] {
+            assert!(env.op_count(op) == 0, "{name}: {op}");
         }
         assert_eq!(
             env.drive().resolve(&["yamareco", folder]).as_deref(),
@@ -2188,7 +2203,7 @@ fn a_record_without_md5_refuses_replace_as_not_managed() {
     .unwrap();
     let layout = env.layout(Y, FOLDER, JOB_A);
     assert_eq!(
-        dry_run(&env.rclone(), &layout, &env.published)
+        dry_run(&env.remote(), &layout, &env.published)
             .unwrap()
             .managed,
         Some(Managed::NotManaged)
@@ -2196,7 +2211,7 @@ fn a_record_without_md5_refuses_replace_as_not_managed() {
     let mut hook = Hook::new(&env);
     let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
     assert_eq!(reason, ConflictReason::NotManaged);
-    assert_eq!(env.mutations(), Vec::<String>::new());
+    env.assert_no_mutations();
     assert_eq!(dest_id(&env).as_deref(), Some(id.as_str()));
     // 古い行は、そのまま残っている（MD5 を作り出さない）
     let text = std::fs::read_to_string(record_path(&env)).unwrap();
@@ -2229,7 +2244,7 @@ fn a_record_whose_files_disagree_with_the_manifest_is_modified() {
         let mut hook = Hook::new(&env);
         let (reason, _) = conflict(run(&env, &set, OnExists::Replace, &mut hook));
         assert_eq!(reason, ConflictReason::Modified, "{name}");
-        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+        assert_eq!(env.mutating_ops(), Vec::<String>::new(), "{name}");
     }
 }
 
@@ -2266,7 +2281,7 @@ fn the_old_folder_is_not_trashed_when_a_file_was_rewritten_to_the_same_size_afte
             "{target}"
         );
         assert_eq!(info.progress.stage, Stage::Trashing, "{target}");
-        assert!(env.rclone_calls("purge").is_empty(), "{target}");
+        assert!(env.op_count("trash") == 0, "{target}");
         assert!(env.drive().trashed.is_empty(), "{target}");
         // 新しい一式は公開済み。旧フォルダは退避先にそのまま残っている
         assert_ne!(dest_id(&env).as_deref(), Some(old_id.as_str()), "{target}");
@@ -2295,7 +2310,7 @@ fn the_published_row_records_the_md5_of_every_file_and_a_replace_works_again_fro
     // 宛先の MD5 は、送った中身と同じ
     let layout = env.layout(Y, FOLDER, JOB_B);
     assert_eq!(
-        dry_run(&env.rclone(), &layout, &env.published)
+        dry_run(&env.remote(), &layout, &env.published)
             .unwrap()
             .managed,
         Some(Managed::Managed)
@@ -2310,7 +2325,7 @@ fn the_published_row_records_the_md5_of_every_file_and_a_replace_works_again_fro
     let layout = env.layout(Y, FOLDER, JOB_B);
     let mut hook = Hook::new(&env);
     let out = publish(
-        &env.rclone(),
+        &env.remote(),
         &layout,
         &params(&env, &set2, OnExists::Replace),
         &mut hook,
@@ -2323,6 +2338,7 @@ fn the_published_row_records_the_md5_of_every_file_and_a_replace_works_again_fro
     assert!(row.previous.is_none());
 }
 
+// rclone 固有: rclone の引数・環境変数そのものを確かめる（rclone 版を消すときに、この試験も消す）。
 #[test]
 fn only_the_listings_that_check_the_content_ask_for_md5() {
     let env = Env::new("md5-flags");
@@ -2370,9 +2386,9 @@ fn the_verified_md5_is_recorded_in_the_job_record_before_the_retire_or_the_publi
     let last = hook.records.last().unwrap();
     assert_eq!(last.digests, Some(set.recorded()));
     // 記録は、公開の移動（moveto）より前に書いている
-    let seq = env.mutations();
+    let seq = env.mutating_ops();
     let rec = seq.iter().position(|c| c == "record:publishing").unwrap();
-    let mv = seq.iter().position(|c| c == "moveto").unwrap();
+    let mv = seq.iter().position(|c| c == "move").unwrap();
     assert!(rec < mv, "{seq:?}");
 
     // 置き換え: retiring の記録（旧フォルダの退避の移動の前）から入り、publishing・trashing に引き継がれる
@@ -2402,8 +2418,8 @@ fn the_verified_md5_is_recorded_in_the_job_record_before_the_retire_or_the_publi
             .iter()
             .all(|r| r.digests == Some(set.recorded()))
     );
-    let seq = env.mutations();
+    let seq = env.mutating_ops();
     let rec = seq.iter().position(|c| c == "record:retiring").unwrap();
-    let mv = seq.iter().position(|c| c == "moveto").unwrap();
+    let mv = seq.iter().position(|c| c == "move").unwrap();
     assert!(rec < mv, "{seq:?}");
 }

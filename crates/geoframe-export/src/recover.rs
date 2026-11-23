@@ -20,7 +20,7 @@ use crate::jobid::JobId;
 use crate::jobs::{JobRecord, JobStore, ReadOutcome, Status};
 use crate::lock::{self, Slot};
 use crate::publish::Recovery;
-use crate::rclone::Rclone;
+use crate::remote::Remote;
 use crate::settings::Settings;
 use crate::sys;
 
@@ -93,7 +93,7 @@ fn show(settings: &Settings, store: &JobStore, out: &mut dyn Write) -> u8 {
              退かすまで、新しい書き出しは断られます。"
         );
     }
-    let rclone = Rclone::new(settings);
+    let remote = Remote::new(settings);
     // 古いほうから
     for rec in scan.records.iter().rev() {
         if !(rec.is_unfinished() || rec.is_blocking()) {
@@ -163,7 +163,7 @@ fn show(settings: &Settings, store: &JobStore, out: &mut dyn Write) -> u8 {
                 }
                 Some(layout) => {
                     let recovery = Recovery {
-                        rclone: &rclone,
+                        remote: &remote,
                         layout: &layout,
                         published: &crate::published::PublishedStore::in_state_dir(
                             &settings.state_dir,

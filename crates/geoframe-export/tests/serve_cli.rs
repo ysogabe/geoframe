@@ -243,7 +243,7 @@ fn sigterm_and_sigint_stop_the_running_jobs_rclone_before_serve_exits() {
         let env = Env::new(&format!("cli-sig-{}", name.to_lowercase()));
         let site = photo_site(DAY, DAY, three());
         // 写真を送る copy を 30 秒止める（signal で止まらなければ、30 秒かかる）
-        env.add_rule("copy", 0, 1, sleep_ms(30_000));
+        env.add_rule("upload", 0, 1, sleep_ms(30_000));
         let token = token_file(&env, "token", format!("{TOKEN}\n").as_bytes(), 0o600);
         let addr = free_addr();
         let mut child = spawn_serve(&env, &site, &addr.to_string(), &token);
@@ -265,7 +265,7 @@ fn sigterm_and_sigint_stop_the_running_jobs_rclone_before_serve_exits() {
         };
         assert_eq!(accepted.status, 202, "{name}: {}", accepted.body);
         let job_id = accepted.json()["job_id"].as_str().unwrap().to_owned();
-        let copy_pid = wait_for_call(&env, "copy", 30);
+        let copy_pid = wait_for_call(&env, "upload", 30);
         assert!(process_exists(copy_pid), "{name}: copy が動いている");
 
         let sent = Instant::now();
@@ -329,7 +329,7 @@ fn a_sigterm_during_the_startup_recovery_ends_serve_without_listening() {
     let env = Env::new("cli-recovery-sig");
     let site = photo_site(DAY, DAY, three());
     let token = token_file(&env, "token", TOKEN.as_bytes(), 0o600);
-    env.add_rule("copy", 0, 1, sleep_ms(30_000));
+    env.add_rule("upload", 0, 1, sleep_ms(30_000));
     let addr = free_addr();
     let mut child = spawn_serve(&env, &site, &addr.to_string(), &token);
     wait_ready(&mut child, addr);
@@ -339,7 +339,7 @@ fn a_sigterm_during_the_startup_recovery_ends_serve_without_listening() {
         &json!({"from": DAY, "destination": "yamareco"}),
     );
     assert_eq!(r.status, 202, "{}", r.body);
-    wait_for_call(&env, "copy", 30);
+    wait_for_call(&env, "upload", 30);
     send(child.id(), libc::SIGTERM);
     assert_eq!(wait_exit(child, 20).code, Some(0));
 
@@ -376,10 +376,10 @@ fn while_a_separate_cli_run_holds_the_slot_http_posts_get_409_until_it_ends() {
     let env = Env::new("cli-vs-http");
     let site = photo_site(DAY, DAY, three());
     // 写真を送る copy を 30 秒止める（CLI の run が実行中のまま）
-    env.add_rule("copy", 0, 1, sleep_ms(30_000));
+    env.add_rule("upload", 0, 1, sleep_ms(30_000));
     let mut kids = Reaper(Vec::new());
     kids.0.push(spawn_run(&env, &site));
-    let copy_pid = wait_for_call(&env, "copy", 30);
+    let copy_pid = wait_for_call(&env, "upload", 30);
     assert!(process_exists(copy_pid));
 
     let token = token_file(&env, "token", TOKEN.as_bytes(), 0o600);

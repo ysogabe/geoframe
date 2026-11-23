@@ -17,7 +17,7 @@
 //!   復旧が Drive を変える操作（`incoming` の移動＝`publishing`、旧フォルダのゴミ箱への移動＝`trashing`）の前にも、
 //!   段階を書く（復旧の途中でまた止まっても、記録と Drive が食い違わないため）。書けなければ、その操作はしない。ゴミ箱への移動の前の `trashing` が書けなかったときは、公開の記録（`published/`）を更新する**前**に、旧フォルダが退避先に
 //!   あると再確認する（別の ID・照会できないときは、公開の記録を更新せずに `blocked`）。
-//! - ジョブ全体の期限は、渡す [`Rclone`] に `with_deadline` で掛ける。過ぎたら実行中の rclone を kill して `timeout`。後始末と復旧は
+//! - ジョブ全体の期限は、渡す [`Remote`] に `with_deadline` で掛ける。過ぎたら実行中の rclone を kill して `timeout`。後始末と復旧は
 //!   期限なし（コマンドごとの期限だけ）で動く。
 //! - [`Published::recorded`] が偽（公開の記録 `published/` に書けなかった）のときは、公開は済んでいる。**正常な完了として
 //!   吸収しない**: [`Published::record`] が書くはずだった行なので、`upsert` をやり直し、それでも書けなければ、結果に
@@ -76,10 +76,10 @@ use crate::drive::{Drive, Expected, Inspection, Layout, Managed, Place, Removed,
 use crate::error::{ErrorCode, ExportError};
 use crate::image::PublishFile;
 use crate::published::{PreviousFolder, PublishedRecord, PublishedStore, RecordedFile};
-use crate::rclone::Rclone;
 use crate::recovery::{
     Action, BlockedReason, Decision, Kind, Observed, Progress, Seen, Stage, decide,
 };
+use crate::remote::Remote;
 use crate::request::OnExists;
 
 /// 各段階の前に、ジョブの記録へ段階名と ID を書くための口（T5 が実装する）。
@@ -455,7 +455,7 @@ impl TrashStop {
 /// 復旧の表を実行するための部品。
 pub struct Recovery<'a> {
     /// 期限なし（コマンドごとの期限だけ）の rclone。
-    pub rclone: &'a Rclone,
+    pub remote: &'a Remote,
     pub layout: &'a Layout,
     pub published: &'a PublishedStore,
     /// 手元にある期待した一式（公開の途中の失敗のとき）。起動時の復旧では `None`（Drive の manifest で照合する）。
@@ -465,7 +465,7 @@ pub struct Recovery<'a> {
 
 impl Recovery<'_> {
     fn drive(&self) -> Drive<'_> {
-        Drive::new(self.rclone, self.layout)
+        Drive::new(self.remote, self.layout)
     }
 
     fn blocked(
@@ -486,7 +486,7 @@ impl Recovery<'_> {
         let until = std::time::Instant::now() + self.timing.settle;
         loop {
             let left = until.saturating_duration_since(std::time::Instant::now());
-            if left.is_zero() || self.rclone.is_cancelled() {
+            if left.is_zero() || self.remote.is_cancelled() {
                 return;
             }
             std::thread::sleep(left.min(Duration::from_millis(50)));
@@ -503,7 +503,7 @@ impl Recovery<'_> {
             }
             // キャンセルされたら、決まらなかったものとして返す（rclone はもう動かない。呼び出し側は、キャンセルの印を見て、
             // この結果〔`blocked`〕を記録に確定しない）
-            if self.rclone.is_cancelled() {
+            if self.remote.is_cancelled() {
                 return None;
             }
             if let (Ok(a), Ok(b)) = (drive.observe(), drive.observe())
@@ -1129,7 +1129,7 @@ impl Run<'_> {
 ///   その場で実行する。前のままなら `incoming` を片付けて、元の失敗を返す。公開まで済んでいれば、成功として返す。
 ///   決まらなければ `blocked`。
 pub fn publish(
-    rclone: &Rclone,
+    remote: &Remote,
     layout: &Layout,
     params: &PublishParams<'_>,
     sink: &mut dyn ProgressSink,
@@ -1150,8 +1150,8 @@ pub fn publish(
             "公開する一式が決められた形ではありません",
         )));
     }
-    let free = rclone.with_deadline(None);
-    let drive = Drive::new(rclone, layout);
+    let free = remote.with_deadline(None);
+    let drive = Drive::new(remote, layout);
     let expected = Expected::from_publish_files(params.files);
 
     // 4.1 の手順 8: 宛先の状態
@@ -1203,7 +1203,7 @@ pub fn publish(
         retire_issued: false,
     };
     let recovery = Recovery {
-        rclone: &free,
+        remote: &free,
         layout,
         published: params.published,
         expected: Some(&expected),
@@ -1261,25 +1261,25 @@ pub fn publish(
 }
 
 /// `dry_run`（design.md 6.1）: 宛先の状態と、`exists` のときの `existing_files`・管理しているフォルダか。
-/// 呼ぶ rclone のコマンドは `lsjson` と（管理の確認の）`cat` だけ。`rclone` は [`Rclone::for_dry_run`]（期限 30 秒）で作る。
+/// 呼ぶ rclone のコマンドは `lsjson` と（管理の確認の）`cat` だけ。`rclone` は [`Remote::for_dry_run`]（期限 30 秒）で作る。
 pub fn dry_run(
-    rclone: &Rclone,
+    remote: &Remote,
     layout: &Layout,
     published: &PublishedStore,
 ) -> Result<Inspection, ExportError> {
-    dry_run_within(rclone, layout, published, crate::rclone::DRY_RUN_TIMEOUT)
+    dry_run_within(remote, layout, published, crate::remote::DRY_RUN_TIMEOUT)
 }
 
 /// [`dry_run`] の、全体の期限を替えられる形（試験用。本番は 30 秒）。宛先がある場合は 5 回ほど rclone を呼ぶので、
-/// コマンドごとの期限（[`Rclone::for_dry_run`] の 30 秒）とは別に、`dry_run` 全体に期限を掛ける。過ぎたら `drive_unavailable`。
+/// コマンドごとの期限（[`Remote::for_dry_run`] の 30 秒）とは別に、`dry_run` 全体に期限を掛ける。過ぎたら `drive_unavailable`。
 #[doc(hidden)]
 pub fn dry_run_within(
-    rclone: &Rclone,
+    remote: &Remote,
     layout: &Layout,
     published: &PublishedStore,
     limit: std::time::Duration,
 ) -> Result<Inspection, ExportError> {
-    let bounded = rclone.with_deadline(Some(std::time::Instant::now() + limit));
+    let bounded = remote.with_deadline(Some(std::time::Instant::now() + limit));
     Drive::new(&bounded, layout)
         .inspect(published, true)
         .map_err(|e| {

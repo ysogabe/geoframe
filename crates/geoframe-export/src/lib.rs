@@ -52,6 +52,7 @@ pub mod lock;
 pub mod rclone;
 pub mod recover;
 pub mod recovery;
+pub mod remote;
 pub mod run;
 pub mod serve;
 pub mod service;

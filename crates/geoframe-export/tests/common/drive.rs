@@ -1,4 +1,6 @@
-//! T4 の試験の共通部品: 偽の rclone（`fake-rclone/`）と、偽の Drive の状態を作る・読む・差し替える部品。
+//! T4 の試験の共通部品: 偽の Drive（今は偽の rclone。`fake-rclone/`）の状態を作る・読む・差し替える部品と、呼び出しの記録を
+//! 中立の操作名で読む部品（`ops`・`mutating_ops`・`ops_used`・`op_count`）。rclone の引数・環境変数を見る部品
+//! （`rclone_calls`・`assert_rclone_safe_calls`）は rclone 固有で、rclone 版を消すときに一緒に消す。
 //! 本物の rclone・Drive・ネットワークには触れない。Drive の ID は架空の値（`fid0001` …）。
 
 use std::io::Write;
@@ -13,8 +15,8 @@ use geoframe_export::jobid::JobId;
 use geoframe_export::manifest::GENERATOR;
 use geoframe_export::publish::{ProgressSink, Timing};
 use geoframe_export::published::{PublishedRecord, PublishedStore};
-use geoframe_export::rclone::Rclone;
 use geoframe_export::recovery::Progress;
+use geoframe_export::remote::Remote;
 use geoframe_export::request::Destination;
 use geoframe_export::settings::{RawSettings, Settings};
 use serde_json::{Value, json};
@@ -77,8 +79,8 @@ impl Env {
         }
     }
 
-    pub fn rclone(&self) -> Rclone {
-        Rclone::new(&self.settings).with_timeouts(Duration::from_secs(30), Duration::from_secs(30))
+    pub fn remote(&self) -> Remote {
+        Remote::new(&self.settings).with_timeouts(Duration::from_secs(30), Duration::from_secs(30))
     }
 
     pub fn layout(&self, dest: Destination, folder: &str, job: &str) -> Layout {
@@ -109,10 +111,11 @@ impl Env {
         c.save(&self.fake_dir);
     }
 
-    pub fn add_rule(&self, cmd: &str, skip: u64, times: u64, effect: Value) {
+    /// `op` は中立の操作名。
+    pub fn add_rule(&self, op: &str, skip: u64, times: u64, effect: Value) {
         let mut c = self.ctl();
         c.rules.push(model::Rule {
-            cmd: cmd.to_owned(),
+            op: op.to_owned(),
             contains: None,
             skip,
             times,
@@ -122,7 +125,7 @@ impl Env {
         c.save(&self.fake_dir);
     }
 
-    /// 全部の呼び出し（rclone と、段階の記録）を、順番どおりに。
+    /// 全部の呼び出し（Drive の操作と、段階の記録）を、順番どおりに。
     pub fn calls(&self) -> Vec<Value> {
         std::fs::read_to_string(self.fake_dir.join("calls.log"))
             .unwrap_or_default()
@@ -131,38 +134,60 @@ impl Env {
             .collect()
     }
 
-    /// rclone のコマンド名と、段階の記録（`record:<stage>`）を、順番どおりに。
-    pub fn sequence(&self) -> Vec<String> {
+    // ---- 中立の記録（実装に依らない）----
+    //
+    // 操作名は `list`・`read`・`create_folder`・`upload`・`move`・`trash`。後の PR で偽の Drive の HTTP サーバーが同じ名前で
+    // calls.log に書けば、これらを使う試験はそのまま通る。
+
+    /// 操作名と、段階の記録（`record:<stage>`）を、順番どおりに。
+    pub fn ops(&self) -> Vec<String> {
         self.calls()
             .iter()
             .map(|c| match c["kind"].as_str() {
                 Some("hook") => format!("record:{}", c["stage"].as_str().unwrap_or("?")),
-                _ => c["cmd"].as_str().unwrap_or("?").to_owned(),
+                _ => c["op"].as_str().unwrap_or("?").to_owned(),
             })
             .collect()
     }
 
-    /// Drive を変えうる呼び出しと、段階の記録だけ（`lsjson`・`cat` を除く）。
-    pub fn mutations(&self) -> Vec<String> {
-        self.sequence()
+    /// Drive を変えうる操作と、段階の記録だけ（`list`・`read` を除く）。
+    pub fn mutating_ops(&self) -> Vec<String> {
+        self.ops()
             .into_iter()
-            .filter(|c| c != "lsjson" && c != "cat")
+            .filter(|c| c != "list" && c != "read")
             .collect()
     }
 
-    /// 呼ばれた rclone のコマンド名の集合（重複なし）。
-    pub fn commands_used(&self) -> Vec<String> {
+    /// 呼ばれた操作名の集合（重複なし。段階の記録は含まない）。
+    pub fn ops_used(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .calls()
             .iter()
             .filter(|c| c["kind"] == "rclone")
-            .map(|c| c["cmd"].as_str().unwrap_or("?").to_owned())
+            .map(|c| c["op"].as_str().unwrap_or("?").to_owned())
             .collect();
         v.sort();
         v.dedup();
         v
     }
 
+    /// その操作が呼ばれた回数。
+    pub fn op_count(&self, op: &str) -> usize {
+        self.calls()
+            .iter()
+            .filter(|c| c["kind"] == "rclone" && c["op"] == op)
+            .count()
+    }
+
+    /// Drive を変える操作（`create_folder`・`upload`・`move`・`trash`）も、段階の記録も、ひとつも無い。
+    #[track_caller]
+    pub fn assert_no_mutations(&self) {
+        assert_eq!(self.mutating_ops(), Vec::<String>::new());
+    }
+
+    // ---- rclone 固有の記録（rclone 版を消すときに、使う試験と一緒に消す）----
+
+    /// 呼ばれた rclone のコマンド `cmd`（`lsjson` など）の引数。
     pub fn rclone_calls(&self, cmd: &str) -> Vec<Vec<String>> {
         self.calls()
             .iter()
@@ -393,7 +418,7 @@ pub fn garbage(text: &str) -> Value {
 }
 
 /// 渡された環境変数・引数が、約束どおりであること（呼ばれた rclone の全部に対して）。
-pub fn assert_safe_calls(env: &Env) {
+pub fn assert_rclone_safe_calls(env: &Env) {
     let config = env
         .state
         .join("rclone/rclone.conf")
