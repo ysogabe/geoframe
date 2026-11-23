@@ -813,15 +813,107 @@ fn a_move_whose_response_was_lost_is_checked_with_get_and_not_resent() {
 }
 
 #[test]
-fn a_move_that_failed_before_doing_anything_is_resent() {
-    let fx = Fx::new("api-move-500");
+fn a_move_that_failed_with_an_unknown_result_is_checked_with_get_and_never_resent() {
+    // 5xx・通信断は、Drive 側で済んだか分からない。待っている間に場所や中身が変わっているかもしれないので、API の層は自分で再送せず、
+    // get で見て、目的の状態でなければ失敗として返す（再送するかは、場所と中身を照合し直せる上位が決める）
+    for (label, effect) in [
+        ("500", fail(1)),
+        ("503", fk::status(503)),
+        ("drop", fk::drop_connection()),
+    ] {
+        let fx = Fx::new("api-move-500");
+        let id = dir_in(&fx, &fx.work, "incoming-x");
+        fx.env.add_rule("move", 0, u64::MAX, effect);
+        let r = fx
+            .api
+            .move_to(&id, &fx.work, &fx.yamareco, "2030-03-10", fx.dl());
+        assert!(
+            matches!(r, Err(ApiError::Status(500 | 503) | ApiError::Net(_))),
+            "{label}: {r:?}"
+        );
+        assert_eq!(fx.ops(), ["move", "get"], "{label}: 再送しない");
+        assert_eq!(fx.env.drive().node(&id).unwrap().parent, fx.work, "{label}");
+    }
+}
+
+#[test]
+fn a_trash_that_failed_with_an_unknown_result_is_checked_with_get_and_never_resent() {
+    for (label, effect) in [
+        ("500", fail(1)),
+        ("503", fk::status(503)),
+        ("drop", fk::drop_connection()),
+    ] {
+        let fx = Fx::new("api-trash-500");
+        let id = dir_in(&fx, &fx.work, "old");
+        fx.env.add_rule("trash", 0, u64::MAX, effect);
+        let r = fx.api.trash(&id, fx.dl());
+        assert!(
+            matches!(r, Err(ApiError::Status(500 | 503) | ApiError::Net(_))),
+            "{label}: {r:?}"
+        );
+        assert_eq!(fx.ops(), ["trash", "get"], "{label}: 再送しない");
+        assert!(!fx.env.drive().node(&id).unwrap().trashed, "{label}");
+    }
+}
+
+#[test]
+fn a_throttled_move_or_trash_is_waited_for_and_resent_after_checking_the_state() {
+    // 429・流量制限の 403 は、処理されていないと分かる。待って再送してよい（その前に状態を見る）
+    for effect in [fk::rate_limit_403(), fk::too_many_requests(0)] {
+        let fx = Fx::new("api-move-throttled");
+        let id = dir_in(&fx, &fx.work, "incoming-x");
+        fx.env.add_rule("move", 0, 1, effect.clone());
+        fx.api
+            .move_to(&id, &fx.work, &fx.yamareco, "2030-03-10", fx.dl())
+            .unwrap();
+        assert_eq!(fx.ops(), ["move", "get", "move"], "{effect}");
+        assert_eq!(fx.env.drive().node(&id).unwrap().name, "2030-03-10");
+
+        let fx = Fx::new("api-trash-throttled");
+        let old = dir_in(&fx, &fx.work, "old");
+        fx.env.add_rule("trash", 0, 1, effect.clone());
+        fx.api.trash(&old, fx.dl()).unwrap();
+        assert_eq!(fx.ops(), ["trash", "get", "trash"], "{effect}");
+        assert!(fx.env.drive().node(&old).unwrap().trashed);
+    }
+}
+
+#[test]
+fn a_401_before_a_move_or_trash_checks_the_state_before_the_resend() {
+    let fx = Fx::new("api-move-401");
     let id = dir_in(&fx, &fx.work, "incoming-x");
-    fx.env.add_rule("move", 0, 1, fail(1));
+    fx.env.add_rule("move", 0, 1, fk::unauthorized());
     fx.api
         .move_to(&id, &fx.work, &fx.yamareco, "2030-03-10", fx.dl())
         .unwrap();
     assert_eq!(fx.ops(), ["move", "get", "move"]);
-    assert_eq!(fx.env.drive().node(&id).unwrap().name, "2030-03-10");
+    assert_eq!(fx.fake.tokens_issued(), 2);
+
+    let fx = Fx::new("api-trash-401");
+    let old = dir_in(&fx, &fx.work, "old");
+    fx.env.add_rule("trash", 0, 1, fk::unauthorized());
+    fx.api.trash(&old, fx.dl()).unwrap();
+    assert_eq!(fx.ops(), ["trash", "get", "trash"]);
+    assert_eq!(fx.fake.tokens_issued(), 2);
+}
+
+#[test]
+fn a_401_does_not_reset_the_no_resend_rule_for_a_later_unknown_failure() {
+    // 401 → トークンの取り直し → 再送 → 500。取り直しで確認が初期化されて、さらに再送することはない
+    for op in ["move", "trash"] {
+        let fx = Fx::new("api-401-then-500");
+        let id = dir_in(&fx, &fx.work, "x");
+        fx.env.add_rule(op, 0, 1, fk::unauthorized());
+        fx.env.add_rule(op, 1, 1, fail(1));
+        let r = if op == "move" {
+            fx.api.move_to(&id, &fx.work, &fx.yamareco, "n", fx.dl())
+        } else {
+            fx.api.trash(&id, fx.dl())
+        };
+        assert!(matches!(r, Err(ApiError::Status(500))), "{op}: {r:?}");
+        assert_eq!(fx.ops(), [op, "get", op, "get"], "{op}");
+        assert_eq!(fx.env.op_count(op), 2, "{op}");
+    }
 }
 
 #[test]
@@ -1330,4 +1422,218 @@ fn read_only_operations_leave_no_mutation_in_the_record() {
     fx.env.assert_no_mutations();
     assert_eq!(fx.env.op_count("create_folder"), 0);
     let _ = (ROOT, json!(null));
+}
+
+// ---- 形の壊れた応答を「空」として読まない ----
+
+const EMPTY_PAGE: &str = r#"{"kind":"drive#fileList","incompleteSearch":false,"files":[]}"#;
+
+#[test]
+fn a_well_formed_empty_page_is_the_only_empty_listing() {
+    let fx = Fx::new("api-list-empty-ok");
+    fx.env.add_rule("list", 0, 1, garbage(EMPTY_PAGE));
+    assert_eq!(fx.api.list_children(&fx.work, fx.dl()).unwrap(), []);
+    // `incompleteSearch` が無い応答（偽の応答の古い形）も、`kind`・`files` が正しければ受ける
+    let fx = Fx::new("api-list-empty-bare");
+    fx.env.add_rule(
+        "list",
+        0,
+        1,
+        garbage(r#"{"kind":"drive#fileList","files":[]}"#),
+    );
+    assert_eq!(fx.api.list_children(&fx.work, fx.dl()).unwrap(), []);
+}
+
+#[test]
+fn a_malformed_listing_is_a_failure_and_never_an_empty_one() {
+    for body in [
+        "",
+        "null",
+        "[]",
+        "{}",
+        r#""text""#,
+        r#"{"files":[]}"#,
+        r#"{"kind":"drive#fileList"}"#,
+        r#"{"kind":"drive#fileList","files":null}"#,
+        r#"{"kind":"drive#fileList","files":{}}"#,
+        r#"{"kind":"drive#fileList","files":"x"}"#,
+        r#"{"kind":"drive#file","files":[]}"#,
+        r#"{"kind":null,"files":[]}"#,
+        r#"{"kind":"drive#fileList","incompleteSearch":"no","files":[]}"#,
+        r#"{"kind":"drive#fileList","files":[1]}"#,
+        r#"{"kind":"drive#fileList","files":[{"id":"a"}]}"#,
+    ] {
+        let fx = Fx::new("api-list-malformed");
+        fx.env.add_rule("list", 0, u64::MAX, garbage(body));
+        assert_eq!(
+            fx.api.list_children(&fx.work, fx.dl()),
+            Err(ApiError::BadResponse),
+            "{body}"
+        );
+        assert_eq!(fx.env.op_count("list"), 1, "{body}: 再試行しない");
+        assert_eq!(
+            fx.api.list_tree(&fx.work, fx.dl()),
+            Err(ApiError::BadResponse),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn an_incomplete_search_is_a_failed_query() {
+    let fx = Fx::new("api-list-incomplete");
+    fx.env.add_rule(
+        "list",
+        0,
+        1,
+        garbage(r#"{"kind":"drive#fileList","incompleteSearch":true,"files":[]}"#),
+    );
+    assert_eq!(
+        fx.api.list_children(&fx.work, fx.dl()),
+        Err(ApiError::Incomplete)
+    );
+    // 呼び出し側（ジョブのエラー）では、照会の失敗（drive_unavailable）
+    use geoframe_export::error::ErrorCode;
+    use geoframe_export::remote::RemoteError;
+    assert_eq!(
+        RemoteError::from(ApiError::Incomplete)
+            .into_query_error()
+            .code,
+        ErrorCode::DriveUnavailable
+    );
+}
+
+#[test]
+fn a_malformed_later_page_fails_the_whole_listing() {
+    let fx = Fx::new("api-list-malformed-page2");
+    for i in 0..3 {
+        file_in(&fx, &fx.work, &format!("f{i}.jpg"), "x");
+    }
+    let api = fx.api.clone().with_sizes(1, 100 * 1024, 256 * 1024);
+    // 2 ページ目が、形の壊れた応答（空のページに見えるもの）
+    fx.env.add_rule("list", 1, 1, garbage("null"));
+    assert_eq!(
+        api.list_children(&fx.work, fx.dl()),
+        Err(ApiError::BadResponse)
+    );
+}
+
+#[test]
+fn a_get_response_must_be_an_object_for_the_requested_id() {
+    let fx = Fx::new("api-get-shape");
+    let id = dir_in(&fx, &fx.work, "x");
+    for body in [
+        "null".to_owned(),
+        "[]".to_owned(),
+        "{}".to_owned(),
+        r#"{"id":"fidOTHER","name":"x","mimeType":"application/vnd.google-apps.folder","trashed":false}"#
+            .to_owned(),
+    ] {
+        fx.env.add_rule("get", 0, 1, garbage(&body));
+        assert_eq!(
+            fx.api.get(&id, fx.dl()),
+            Err(ApiError::BadResponse),
+            "{body}"
+        );
+    }
+    assert!(fx.api.get(&id, fx.dl()).is_ok());
+}
+
+#[test]
+fn every_list_request_asks_for_the_kind_and_the_incomplete_flag() {
+    let fx = Fx::new("api-list-fields");
+    fx.api.list_children(&fx.work, fx.dl()).unwrap();
+    let fields = fx
+        .fake
+        .requests()
+        .iter()
+        .find(|r| r["op"] == "list")
+        .map(|r| r["fields"].as_str().unwrap().to_owned())
+        .unwrap();
+    assert!(fields.starts_with("kind,incompleteSearch,"), "{fields}");
+}
+
+// ---- resumable のチャンクの再試行の方針（共通の方針と同じ） ----
+
+#[test]
+fn a_rate_limited_chunk_waits_then_resumes_from_the_received_position() {
+    // 流量制限の 403 は、以前はチャンクで即失敗していた。共通の再試行の方針に従い、待って、位置を問い合わせて続ける
+    for effect in [
+        fk::rate_limit_403(),
+        fk::too_many_requests(0),
+        fk::status(503),
+    ] {
+        let fx = Fx::new("api-chunk-throttled");
+        let api = small_chunks(&fx);
+        let body = big(600_000);
+        let (path, md5) = fx.local("big.jpg", &body);
+        fx.fake
+            .add_rule_contains("upload", "phase:chunk", 1, 1, effect.clone());
+        let id = api
+            .upload(&fx.work, "big.jpg", &path, &md5, body.len() as u64, fx.up())
+            .unwrap_or_else(|e| panic!("{effect}: {e:?}"));
+        assert_eq!(fx.fake.blob(&id).unwrap(), body, "{effect}");
+        assert_eq!(fx.count_named(&fx.work, "big.jpg"), 1, "{effect}");
+        assert_eq!(fx.uploads("init"), 1, "{effect}");
+        assert_eq!(
+            fx.uploads("status"),
+            1,
+            "待ったあとに位置を問い合わせる: {effect}"
+        );
+        assert_eq!(fx.uploads("chunk"), 4, "{effect}");
+    }
+}
+
+#[test]
+fn a_chunk_honours_retry_after_and_caps_it() {
+    let fx = Fx::new("api-chunk-retry-after");
+    let api = small_chunks(&fx).with_retry(Retry {
+        max_retries: 3,
+        base: Duration::from_millis(1),
+        cap: Duration::from_millis(700),
+    });
+    let body = big(600_000);
+    let (path, md5) = fx.local("big.jpg", &body);
+    // Retry-After 1 秒は、上限（700ms）で切る。指数の待ち（1ms）より、はっきり長く待つ
+    fx.fake
+        .add_rule_contains("upload", "phase:chunk", 1, 1, fk::too_many_requests(1));
+    let start = Instant::now();
+    api.upload(&fx.work, "big.jpg", &path, &md5, body.len() as u64, fx.up())
+        .unwrap();
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(650), "{took:?}");
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    assert_eq!(fx.uploads("status"), 1);
+}
+
+#[test]
+fn a_rate_limited_chunk_stops_at_the_retry_limit_as_rate_limited() {
+    let fx = Fx::new("api-chunk-throttle-giveup");
+    let api = small_chunks(&fx);
+    let body = big(600_000);
+    let (path, md5) = fx.local("big.jpg", &body);
+    fx.fake
+        .add_rule_contains("upload", "phase:chunk", 0, 1000, fk::rate_limit_403());
+    let r = api.upload(&fx.work, "big.jpg", &path, &md5, body.len() as u64, fx.up());
+    assert_eq!(r, Err(ApiError::RateLimited));
+    assert_eq!(fx.uploads("chunk"), 4);
+    assert_eq!(fx.count_named(&fx.work, "big.jpg"), 0);
+}
+
+#[test]
+fn a_chunk_refused_for_a_permission_reason_is_not_retried() {
+    let fx = Fx::new("api-chunk-403-perm");
+    let api = small_chunks(&fx);
+    let body = big(600_000);
+    let (path, md5) = fx.local("big.jpg", &body);
+    fx.fake.add_rule_contains(
+        "upload",
+        "phase:chunk",
+        0,
+        1000,
+        fk::forbidden_with_reasons(&["insufficientFilePermissions"]),
+    );
+    let r = api.upload(&fx.work, "big.jpg", &path, &md5, body.len() as u64, fx.up());
+    assert_eq!(r, Err(ApiError::Status(403)));
+    assert_eq!(fx.uploads("chunk"), 1);
 }

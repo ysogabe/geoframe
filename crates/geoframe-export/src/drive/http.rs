@@ -4,8 +4,11 @@
 //! 写真サービスの `crates/geoframe/src/drive.rs`（`send_with_retry`・`authorized`）と `net.rs`（`Failure`・本文の上限つきの読み出し）を
 //! 写して、書き込み向けに直したもの（共通の crate は作らない）。写真サービスは読むだけなので、ここで足したのは次の 4 つ。
 //!
-//! - 「済んでいるか」の確認（`SendOpts::settled`）: 書き込みを再送する前と、4xx で断られたときに、今の状態を見て、目的の状態なら
-//!   成功とする（移動・ゴミ箱へ移すは、再送すると別の結果になりうるため）。
+//! - 「済んでいるか」の確認（`SendOpts::settled`）: 移動・ゴミ箱へ移すは、再送すると別の結果になりうる（待っている間に、場所や
+//!   中身が変わっているかもしれない）ので、**結果が分からない失敗（通信断・5xx・時間切れ）のあとは自分で再送しない**
+//!   （`SendOpts::resend_unknown`）。今の状態を見て、目的の状態なら成功、そうでなければ失敗として上へ返す。再送が要るなら、上位が
+//!   場所と中身の照合をやり直してから呼び直す。429・流量制限の 403（処理されていないと分かる応答）と、401 のあとのトークンの
+//!   取り直しの再送の前にも、同じ確認を通る。
 //! - 308 などの状態コードを呼び出し側へそのまま返す（`SendOpts::passthrough`。resumable のアップロードの続き）。
 //! - 期限が 2 種類（操作の期限とジョブ全体の期限）あり、どちらで切れたかを区別して返す（[`Deadline`]）。
 //! - キャンセル（[`Cancel`]）を、要求の前と再試行の待ちの最中に見る。
@@ -349,6 +352,8 @@ pub enum ApiError {
     TooLarge,
     /// ページ送りが止まらない（上限のページ数、または同じ `nextPageToken` の繰り返し）、または件数・深さの上限を超えた。
     TooManyPages,
+    /// 一覧が不完全だと Drive が言っている（`incompleteSearch: true`）。
+    Incomplete,
     /// 書き込みのあとの照合（409 のあとの `get`、送ったあとの大きさ・MD5）が、期待と違う。
     Mismatch,
     /// 送る前に断った（形の違う ID・名前、https でない URL、別のホストの `Location`、手元のファイルの大きさ・MD5 の違い）。
@@ -375,6 +380,7 @@ impl fmt::Display for ApiError {
             Self::TooManyPages => {
                 f.write_str("Drive の一覧の上限（ページ数・件数・深さ）を超えました")
             }
+            Self::Incomplete => f.write_str("Drive の一覧が不完全だと返されました"),
             Self::Mismatch => f.write_str("Drive の状態が、期待した書き込みの結果と違います"),
             Self::Rejected(why) => write!(f, "送る前に断りました（{why}）"),
             Self::Io(kind) => write!(f, "手元のファイルを読めません（{kind}）"),
@@ -396,7 +402,9 @@ impl From<ApiError> for RemoteError {
             ApiError::AuthInvalid => Self::AuthInvalid,
             ApiError::NotFound => Self::NotFound,
             ApiError::TooLarge => Self::TooLarge,
-            ApiError::BadResponse | ApiError::TooManyPages => Self::BadOutput,
+            ApiError::BadResponse | ApiError::TooManyPages | ApiError::Incomplete => {
+                Self::BadOutput
+            }
             ApiError::Rejected(_) | ApiError::Io(_) | ApiError::Credentials(_) => Self::Spawn,
             ApiError::Status(_) | ApiError::RateLimited | ApiError::Net(_) | ApiError::Mismatch => {
                 Self::Failed
@@ -516,6 +524,22 @@ impl Reply {
         String::from_utf8_lossy(&self.body)
     }
 
+    /// 流量制限の応答か（429、または 403 で流量制限の理由）。**処理されていない**と分かる。
+    pub fn is_throttled(&self) -> bool {
+        self.status == 429 || (self.status == 403 && self.is_rate_limit())
+    }
+
+    /// 再試行できる応答（流量制限・5xx）の失敗。ほかは `None`（再試行しない）。
+    pub fn retryable_failure(&self) -> Option<ApiError> {
+        if self.is_throttled() {
+            Some(ApiError::RateLimited)
+        } else if self.status >= 500 {
+            Some(ApiError::Status(self.status))
+        } else {
+            None
+        }
+    }
+
     /// 流量制限の 403 か。本文のどこかに `rateLimitExceeded`・`userRateLimitExceeded` があれば真（`errors[]` の何番目でも、
     /// 形が少し違っても拾う。写真サービスの `is_rate_limit_body` と同じ判定。権限の不足の 403 は、これらを含まない）。
     fn is_rate_limit(&self) -> bool {
@@ -548,7 +572,7 @@ impl Retry {
     }
 
     /// `attempt`（0 から）回目の失敗のあとの待ち。`Retry-After` があればそれ（上限で切る）、無ければ指数の待ちに 0〜25% の揺らぎ。
-    fn wait_for(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    pub(super) fn wait_for(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
         if let Some(ra) = retry_after {
             return ra.min(self.cap);
         }
@@ -575,8 +599,12 @@ pub(super) struct SendOpts<'a> {
     pub cap: Duration,
     /// 呼び出し側が自分で扱う成功以外の状態コード（そのまま [`Reply`] で返す。409・404・308 など）。401 は常にそのまま返す。
     pub passthrough: &'a [u16],
-    /// 「もう目的の状態か」の確認。再送の前と、再試行しない 4xx のときに呼び、真なら [`Outcome::AlreadyDone`]。
+    /// 「もう目的の状態か」の確認。再送の前と、再試行しない 4xx・結果が分からない失敗のときに呼び、真なら [`Outcome::AlreadyDone`]。
     pub settled: Option<&'a dyn Fn() -> Result<bool, ApiError>>,
+    /// 結果が分からない失敗（通信断・5xx・要求 1 回の時間切れ）のあとに、自分で再送するか。偽なら、`settled` で確かめ、目的の状態で
+    /// なければその失敗を返す（再送するかどうかは上位が、場所と中身の照合をやり直して決める）。流量制限（処理されていないと分かる
+    /// 応答）は、偽でも待って再送する。
+    pub resend_unknown: bool,
 }
 
 impl<'a> SendOpts<'a> {
@@ -587,6 +615,7 @@ impl<'a> SendOpts<'a> {
             cap: Duration::from_secs(60),
             passthrough: &[],
             settled: None,
+            resend_unknown: true,
         }
     }
 }
@@ -739,6 +768,8 @@ impl Transport {
     /// - 通信の失敗・429・5xx・403 の流量制限は、`Retry-After`（秒。無ければ指数の待ち）で待って再試行する。回数の上限は
     ///   [`Retry::max_retries`]。待ちの最中にキャンセルと期限を見る。使い切ったら、通信の失敗は [`ApiError::Net`]、流量制限は
     ///   [`ApiError::RateLimited`]、5xx は [`ApiError::Status`]。
+    ///   **`opts.resend_unknown` が偽のとき**、通信の失敗・5xx（結果が分からない）は再送せず、`opts.settled` で確かめて、済んで
+    ///   いれば [`Outcome::AlreadyDone`]、そうでなければその失敗を返す。
     /// - それ以外の 4xx・3xx は、再試行せず [`ApiError::Status`]（404 は [`ApiError::NotFound`]）。`opts.settled` があれば、その前に
     ///   確認して、済んでいれば [`Outcome::AlreadyDone`]。
     pub fn send_with_retry(
@@ -749,6 +780,15 @@ impl Transport {
         opts: &SendOpts<'_>,
     ) -> Result<Outcome, ApiError> {
         let mut attempt: u32 = 0;
+        // 結果が分からない失敗を、再送せずに確かめて返す
+        let give_up = |failed: ApiError| -> Result<Outcome, ApiError> {
+            if let Some(settled) = opts.settled
+                && settled()?
+            {
+                return Ok(Outcome::AlreadyDone);
+            }
+            Err(failed)
+        };
         loop {
             ctx.check()?;
             if attempt > 0
@@ -757,54 +797,64 @@ impl Transport {
             {
                 return Ok(Outcome::AlreadyDone);
             }
-            let (retry_after, failed): (Option<Duration>, ApiError) = match self
-                .attempt(ctx, req, token, opts)
-            {
-                Ok(reply) => {
-                    let status = reply.status;
-                    if reply.ok() || status == 401 || opts.passthrough.contains(&status) {
-                        return Ok(Outcome::Reply(reply));
-                    }
-                    let rate_limited = status == 429 || (status == 403 && reply.is_rate_limit());
-                    if !(rate_limited || status >= 500) {
-                        if let Some(settled) = opts.settled
-                            && settled()?
-                        {
-                            return Ok(Outcome::AlreadyDone);
+            let (retry_after, failed): (Option<Duration>, ApiError) =
+                match self.attempt(ctx, req, token, opts) {
+                    Ok(reply) => {
+                        let status = reply.status;
+                        if reply.ok() || status == 401 || opts.passthrough.contains(&status) {
+                            return Ok(Outcome::Reply(reply));
                         }
-                        tracing::warn!(
+                        let Some(err) = reply.retryable_failure() else {
+                            if let Some(settled) = opts.settled
+                                && settled()?
+                            {
+                                return Ok(Outcome::AlreadyDone);
+                            }
+                            tracing::warn!(
+                                op = opts.op,
+                                status,
+                                reason = reply.reason(),
+                                "Drive API が断りました"
+                            );
+                            return Err(ApiError::status(status));
+                        };
+                        if !opts.resend_unknown && !reply.is_throttled() {
+                            tracing::debug!(
+                                op = opts.op,
+                                status,
+                                reason = reply.reason(),
+                                "結果が分からない応答なので、再送せずに状態を確かめます"
+                            );
+                            return give_up(err);
+                        }
+                        tracing::debug!(
                             op = opts.op,
                             status,
                             reason = reply.reason(),
-                            "Drive API が断りました"
+                            retry = attempt + 1,
+                            "Drive API が再試行できる状態コードを返しました"
                         );
-                        return Err(ApiError::status(status));
+                        (reply.retry_after, err)
                     }
-                    let err = if rate_limited {
-                        ApiError::RateLimited
-                    } else {
-                        ApiError::Status(status)
-                    };
-                    tracing::debug!(
-                        op = opts.op,
-                        status,
-                        reason = reply.reason(),
-                        retry = attempt + 1,
-                        "Drive API が再試行できる状態コードを返しました"
-                    );
-                    (reply.retry_after, err)
-                }
-                Err(ApiError::Net(failure)) if failure.retryable() => {
-                    tracing::debug!(
-                        op = opts.op,
-                        failure = failure.as_str(),
-                        retry = attempt + 1,
-                        "Drive との通信に失敗しました"
-                    );
-                    (None, ApiError::Net(failure))
-                }
-                Err(e) => return Err(e),
-            };
+                    Err(ApiError::Net(failure)) if failure.retryable() => {
+                        if !opts.resend_unknown {
+                            tracing::debug!(
+                                op = opts.op,
+                                failure = failure.as_str(),
+                                "結果が分からない失敗なので、再送せずに状態を確かめます"
+                            );
+                            return give_up(ApiError::Net(failure));
+                        }
+                        tracing::debug!(
+                            op = opts.op,
+                            failure = failure.as_str(),
+                            retry = attempt + 1,
+                            "Drive との通信に失敗しました"
+                        );
+                        (None, ApiError::Net(failure))
+                    }
+                    Err(e) => return Err(e),
+                };
             if attempt >= self.retry.max_retries {
                 tracing::warn!(op = opts.op, retries = attempt, "再試行を使い切りました");
                 return Err(failed);

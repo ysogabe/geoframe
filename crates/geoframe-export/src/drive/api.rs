@@ -10,8 +10,8 @@
 //! | [`DriveApi::generate_ids`] | `GET files/generateIds` | 作成の前に ID を取る |
 //! | [`DriveApi::create_folder`] | `POST files`（取った ID を本文に） | 409 は「済み」→ 照合 |
 //! | [`DriveApi::upload`] | `POST upload/files`（multipart か resumable） | 409 は「済み」→ 照合 |
-//! | [`DriveApi::move_to`] | `PATCH files/<ID>?addParents&removeParents` | 再送の前に状態を見る |
-//! | [`DriveApi::trash`] | `PATCH files/<ID>`（`trashed: true`） | 再送の前に状態を見る |
+//! | [`DriveApi::move_to`] | `PATCH files/<ID>?addParents&removeParents` | 結果が分からない失敗のあとは再送せず、状態を見る |
+//! | [`DriveApi::trash`] | `PATCH files/<ID>`（`trashed: true`） | 結果が分からない失敗のあとは再送せず、状態を見る |
 //! | [`DriveApi::read`] | `GET files/<ID>?alt=media` | 上限つき |
 //!
 //! **作らないもの**: 完全な削除（`DELETE files`・`emptyTrash`）と、既存のファイルの中身の更新（`PATCH` の media・`PUT upload`）。
@@ -74,7 +74,8 @@ pub const JSON_REQUEST_CAP: Duration = Duration::from_secs(60);
 /// （8MiB のチャンクを 0.7Mbps でも送れる長さ。トークンの取得〔JSON の上限 60 秒〕と合わせても 180 秒を超えない）。
 pub const CHUNK_REQUEST_CAP: Duration = Duration::from_secs(100);
 const FILE_FIELDS: &str = "id,name,mimeType,size,md5Checksum,trashed,parents";
-const LIST_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,md5Checksum)";
+const LIST_FIELDS: &str =
+    "kind,incompleteSearch,nextPageToken,files(id,name,mimeType,size,md5Checksum)";
 
 /// どの期限か（[`DriveApi::deadline`]）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +228,12 @@ impl DriveApi {
                     }
                     tracing::debug!(op = opts.op, status = 401, "トークンを取り直します");
                     self.tokens.invalidate(&token);
+                    // 取り直したあとの再送の前にも、再送の前の確認を通る（トークンの取り直しで、確認が飛ばない）
+                    if let Some(settled) = opts.settled
+                        && settled()?
+                    {
+                        return Ok(Outcome::AlreadyDone);
+                    }
                 }
                 other => return Ok(other),
             }
@@ -290,20 +297,29 @@ impl DriveApi {
             }
             let json = self.get_json(&ctx, "list", self.files_url("/files", &query))?;
             pages += 1;
-            match json.get("files") {
-                None | Some(Value::Null) => {}
-                Some(Value::Array(items)) => {
-                    for item in items {
-                        let name = item["name"].as_str().ok_or(ApiError::BadResponse)?;
-                        out.push(entry_from(item, name.to_owned())?);
-                        if out.len() > self.max_entries {
-                            return Err(ApiError::TooManyPages);
-                        }
-                    }
-                }
+            // 形の壊れた応答（null・配列・`files` が無い・`kind` が違う）を、空の一覧として読まない
+            let Value::Object(page) = &json else {
+                return Err(ApiError::BadResponse);
+            };
+            if page.get("kind").and_then(Value::as_str) != Some("drive#fileList") {
+                return Err(ApiError::BadResponse);
+            }
+            match page.get("incompleteSearch") {
+                None | Some(Value::Bool(false)) => {}
+                Some(Value::Bool(true)) => return Err(ApiError::Incomplete),
                 Some(_) => return Err(ApiError::BadResponse),
             }
-            match json.get("nextPageToken") {
+            let Some(Value::Array(items)) = page.get("files") else {
+                return Err(ApiError::BadResponse);
+            };
+            for item in items {
+                let name = item["name"].as_str().ok_or(ApiError::BadResponse)?;
+                out.push(entry_from(item, name.to_owned())?);
+                if out.len() > self.max_entries {
+                    return Err(ApiError::TooManyPages);
+                }
+            }
+            match page.get("nextPageToken") {
                 None | Some(Value::Null) => break,
                 Some(Value::String(s)) if s.is_empty() => break,
                 Some(Value::String(s)) => {
@@ -367,6 +383,9 @@ impl DriveApi {
     fn get_meta(&self, ctx: &Ctx<'_>, id: &str) -> Result<FileMeta, ApiError> {
         let url = self.files_url(&format!("/files/{id}"), &[("fields", FILE_FIELDS)]);
         let json = self.get_json(ctx, "get", url)?;
+        if !json.is_object() {
+            return Err(ApiError::BadResponse);
+        }
         let meta = meta_from(&json)?;
         if meta.entry.id != id {
             return Err(ApiError::BadResponse);
@@ -654,7 +673,8 @@ impl DriveApi {
                 opts.cap = CHUNK_REQUEST_CAP;
                 // セッションの URL（`upload_id`）が認可するので、トークンは付けない
                 let sent = self.transport.attempt(ctx, &req, None, &opts);
-                let failed = match sent {
+                // 失敗の種類と、サーバーが指定した待ち（`Retry-After`）
+                let (failed, retry_after): (ApiError, Option<Duration>) = match sent {
                     Ok(reply) if reply.ok() => {
                         return self.verify_uploaded(&meta_from(&reply.json()?)?, id, want);
                     }
@@ -678,7 +698,7 @@ impl DriveApi {
                                 );
                                 return Err(ApiError::BadResponse);
                             }
-                            ctx.sleep(retry_wait(&retry, failures - 1))?;
+                            ctx.sleep(retry.wait_for(failures - 1, None))?;
                             continue;
                         }
                         404 | 410 => {
@@ -697,13 +717,35 @@ impl DriveApi {
                         409 => {
                             return self.verify_uploaded(&self.get_meta(ctx, id)?, id, want);
                         }
-                        429 | 500..=599 => ApiError::Status(reply.status),
-                        s => return Err(ApiError::status(s)),
+                        // 429・流量制限の 403・5xx: 共通の再試行の方針（`Retry-After` を含む）
+                        s => match reply.retryable_failure() {
+                            Some(err) => {
+                                tracing::debug!(
+                                    op = "upload",
+                                    status = s,
+                                    reason = reply.reason(),
+                                    retry = failures + 1,
+                                    "Drive API が再試行できる状態コードを返しました"
+                                );
+                                (err, reply.retry_after)
+                            }
+                            None => {
+                                tracing::warn!(
+                                    op = "upload",
+                                    status = s,
+                                    reason = reply.reason(),
+                                    "Drive API が断りました"
+                                );
+                                return Err(ApiError::status(s));
+                            }
+                        },
                     },
-                    Err(ApiError::Net(f)) if f != super::http::Failure::Other => ApiError::Net(f),
+                    Err(ApiError::Net(f)) if f != super::http::Failure::Other => {
+                        (ApiError::Net(f), None)
+                    }
                     Err(e) => return Err(e),
                 };
-                // 途中で切れた・一時的な失敗: 少し待って、受け取り済みの位置を問い合わせて続きから送る
+                // 途中で切れた・一時的な失敗: 待って（`Retry-After` があればそれ）、受け取り済みの位置を問い合わせて続きから送る
                 failures += 1;
                 if failures > retry.max_retries {
                     return Err(failed);
@@ -713,7 +755,7 @@ impl DriveApi {
                     retry = failures,
                     "チャンクの送信に失敗しました。位置を問い合わせます"
                 );
-                ctx.sleep(retry_wait(&retry, failures - 1))?;
+                ctx.sleep(retry.wait_for(failures - 1, retry_after))?;
                 match self.query_session(ctx, &url, want.size)? {
                     SessionState::Complete(body) => {
                         return self.verify_uploaded(&meta_from(&body)?, id, want);
@@ -749,8 +791,10 @@ impl DriveApi {
     }
 
     /// `id` を、`from_parent` から `to_parent` へ、`new_name` にして移す（1 回の `PATCH` で親と名前を変える。ID は保たれる）。
-    /// 再送の前（と、4xx で断られたとき）に `get` で今の状態を見て、既に目的の状態（親が `to_parent` だけ・名前が `new_name`・
-    /// ゴミ箱に入っていない）なら成功とする。
+    /// **結果が分からない失敗（通信断・5xx・時間切れ）のあとは、自分で再送しない**: `get` で今の状態を見て、既に目的の状態
+    /// （親が `to_parent` だけ・名前が `new_name`・ゴミ箱に入っていない）なら成功、そうでなければその失敗を返す（再送するかは、
+    /// 場所と中身の照合をやり直せる上位が決める）。429・流量制限の 403（処理されていないと分かる）は、待って再送する（その前にも
+    /// 状態を見る）。4xx で断られたときと、401 のあとのトークンの取り直しの再送の前にも、同じ確認を通る。
     pub fn move_to(
         &self,
         id: &str,
@@ -787,6 +831,7 @@ impl DriveApi {
         );
         let mut opts = self.opts("move");
         opts.settled = Some(&settled);
+        opts.resend_unknown = false;
         match self.authorized(&ctx, &req, &opts)? {
             Outcome::AlreadyDone => Ok(()),
             Outcome::Reply(r) if r.ok() => {
@@ -800,8 +845,10 @@ impl DriveApi {
         }
     }
 
-    /// `id` を Drive のゴミ箱へ移す（完全な削除ではない。ゴミ箱から戻せる）。再送の前（と、4xx で断られたとき）に `get` で見て、
-    /// 既にゴミ箱の中なら成功とする。
+    /// `id` を Drive のゴミ箱へ移す（完全な削除ではない。ゴミ箱から戻せる）。**結果が分からない失敗（通信断・5xx・時間切れ）の
+    /// あとは、自分で再送しない**: `get` で見て、既にゴミ箱の中なら成功、そうでなければその失敗を返す（待っている間に、フォルダが
+    /// 戻された・中身が足されたかもしれないので、再送するかは、場所と中身の照合をやり直せる上位が決める）。429・流量制限の 403 と、
+    /// 4xx・401 のあとの再送の前にも、同じ確認を通る。
     pub fn trash(&self, id: &str, deadline: Deadline) -> Result<(), ApiError> {
         check_id(id)?;
         let ctx = self.ctx(deadline);
@@ -816,6 +863,7 @@ impl DriveApi {
         );
         let mut opts = self.opts("trash");
         opts.settled = Some(&settled);
+        opts.resend_unknown = false;
         match self.authorized(&ctx, &req, &opts)? {
             Outcome::AlreadyDone => Ok(()),
             Outcome::Reply(r) if r.ok() => {
@@ -868,14 +916,6 @@ fn next_offset(reply: &Reply, size: u64) -> Result<u64, ApiError> {
         return Err(ApiError::BadResponse);
     }
     Ok(received)
-}
-
-fn retry_wait(retry: &Retry, attempt: u32) -> Duration {
-    retry
-        .base
-        .checked_mul(1u32 << attempt.min(16))
-        .unwrap_or(retry.cap)
-        .min(retry.cap)
 }
 
 // ---- 検査・写し ----

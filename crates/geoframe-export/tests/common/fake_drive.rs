@@ -166,6 +166,12 @@ pub fn do_then_add_folder(parent: &[&str], name: &str) -> Value {
     json!({"kind": "do_then_add_folder", "parent": parent, "name": name})
 }
 
+/// 操作を済ませたあと、`parent`（Drive 上のパス）の下の `name` のフォルダを、**同じ名前の別のフォルダ（別の ID・空）に入れ替えて**
+/// から答える（作ったフォルダが動かされて、同名の別のフォルダだけが残る、を作る）。
+pub fn do_then_swap_folder(parent: &[&str], name: &str) -> Value {
+    json!({"kind": "do_then_swap_folder", "parent": parent, "name": name})
+}
+
 /// 移動（`move`）を、すぐには反映せずに 500 で答える。Drive 側では、`after_lists` 回の一覧のあとに反映される（応答を失った移動が、
 /// 遅れて効く、を作る。再試行が全部この効果に当たるよう、規則の `times` は `u64::MAX` にする）。
 pub fn late_then_fail(after_lists: u64) -> Value {
@@ -989,6 +995,23 @@ fn execute(shared: &Shared, req: &Request, decision: Decision) -> Outcome {
         d.mkdir_dup(&parent, effect["name"].as_str().unwrap_or("x"));
         d.save(&shared.dir);
     }
+    if kind == "do_then_swap_folder" {
+        let mut path: Vec<String> = effect["parent"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        path.push(effect["name"].as_str().unwrap_or("x").to_owned());
+        let mut d = Drive::load(&shared.dir);
+        if let Some(id) = d.resolve(&path) {
+            d.purge(&id, false);
+        }
+        d.mkdir_p(&path);
+        d.save(&shared.dir);
+    }
     match kind.as_str() {
         "do_then_drop" | "cut_after" => Outcome::Drop,
         "do_then_fail" => Outcome::Respond(Response::error(500, "backendError")),
@@ -1100,7 +1123,7 @@ fn handle_list(drive: &Drive, req: &Request, kind: &str) -> Response {
         .take(page_size)
         .map(|n| item_json(n, drive, &fields))
         .collect();
-    let mut body = json!({"kind": "drive#fileList", "files": page});
+    let mut body = json!({"kind": "drive#fileList", "incompleteSearch": false, "files": page});
     if offset + page_size < all.len() {
         body["nextPageToken"] = json!(format!("pt{}", offset + page_size));
     }
