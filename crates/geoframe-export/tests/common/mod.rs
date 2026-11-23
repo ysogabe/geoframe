@@ -343,6 +343,8 @@ pub fn assert_no_secrets(text: &str) {
 
 pub mod drive;
 
+pub mod fake_drive;
+
 pub mod site;
 
 pub mod http;

@@ -38,6 +38,8 @@ pub const TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// 応答の本文（JSON）の上限。1 ページ 1000 件で数百 KB。
 pub const MAX_JSON_BYTES: u64 = 16 << 20;
+/// エラー応答の本文の上限（Drive のエラーは数百バイトの JSON）。
+const MAX_ERROR_BODY_BYTES: u64 = 64 << 10;
 /// 待ちを刻む間隔（キャンセルと期限を見る）。
 const SLEEP_SLICE: Duration = Duration::from_millis(20);
 
@@ -662,7 +664,13 @@ impl Transport {
         let location = header("location");
         let range = header("range");
         let (_, mut body) = response.into_parts();
-        let bytes = match read_body_limited(&mut body, opts.max_body) {
+        // 成功の本文は呼び出し側の上限（`read` は上限つきで読む）、エラーの本文は小さな JSON なので固定の上限
+        let limit = if (200..300).contains(&status) {
+            opts.max_body
+        } else {
+            MAX_ERROR_BODY_BYTES
+        };
+        let bytes = match read_body_limited(&mut body, limit) {
             Ok(b) => b,
             Err(ureq::Error::BodyExceedsLimit(_)) => return Err(ApiError::TooLarge),
             Err(e) => {

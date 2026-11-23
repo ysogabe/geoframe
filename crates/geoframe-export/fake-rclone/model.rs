@@ -61,6 +61,9 @@ pub struct Node {
     pub md5: Option<String>,
     /// ショートカットの指す先の ID。
     pub target: Option<String>,
+    /// ゴミ箱に入っている（偽の Drive の HTTP サーバーの `trash` が立てる。偽の rclone の `purge` は、木から消して `Drive::trashed` に
+    /// ID を残すので、この印は使わない）。
+    pub trashed: bool,
 }
 
 /// 実行が遅れて反映される移動（`late_then_fail` の効果）。
@@ -218,8 +221,34 @@ impl Drive {
             content,
             md5: None,
             target,
+            trashed: false,
         });
         id
+    }
+
+    /// ID を指定してノードを足す（偽の Drive の HTTP サーバーが、`generateIds` で渡した ID のフォルダ・ファイルを作る）。
+    pub fn push_node(&mut self, node: Node) {
+        self.nodes.push(node);
+    }
+
+    /// そのノードか、祖先のどれかがゴミ箱に入っているか（Drive の `trashed` は、親がゴミ箱の中でも真）。
+    pub fn is_trashed(&self, id: &str) -> bool {
+        let mut cur = id.to_owned();
+        for _ in 0..64 {
+            let Some(n) = self.node(&cur) else {
+                return false;
+            };
+            if n.trashed {
+                return true;
+            }
+            cur = n.parent.clone();
+        }
+        false
+    }
+
+    /// 同じ名前のフォルダがあっても、`node_mut` で書き換えるために。
+    pub fn node_mut_pub(&mut self, id: &str) -> Option<&mut Node> {
+        self.node_mut(id)
     }
 
     /// ファイルの MD5 を指定する（中身を書き換えたが同じ名前・同じ大きさのまま、を作る）。
@@ -515,6 +544,7 @@ impl Drive {
                 json!({
                     "id": n.id, "parent": n.parent, "name": n.name, "kind": n.kind.as_str(),
                     "size": n.size, "content": n.content, "target": n.target, "md5": n.md5,
+                    "trashed": n.trashed,
                 })
             })
             .collect();
@@ -552,6 +582,7 @@ impl Drive {
                         content: n["content"].as_str().map(str::to_owned),
                         md5: n["md5"].as_str().map(str::to_owned),
                         target: n["target"].as_str().map(str::to_owned),
+                        trashed: n["trashed"].as_bool().unwrap_or(false),
                     })
                     .collect()
             })
@@ -585,13 +616,13 @@ impl Drive {
             .unwrap_or_default()
     }
 
+    /// 保存する（一時ファイルに書いて rename する。偽の Drive の HTTP サーバーが読んでいる最中に、半端な内容を見せない）。
     pub fn save(&self, dir: &std::path::Path) {
         std::fs::create_dir_all(dir).expect("fake drive dir");
-        std::fs::write(
-            dir.join("drive.json"),
-            serde_json::to_vec(&self.to_json()).unwrap(),
-        )
-        .expect("fake drive save");
+        write_atomic(
+            &dir.join("drive.json"),
+            &serde_json::to_vec(&self.to_json()).unwrap(),
+        );
     }
 }
 
@@ -669,10 +700,22 @@ impl Ctl {
 
     pub fn save(&self, dir: &std::path::Path) {
         std::fs::create_dir_all(dir).expect("fake ctl dir");
-        std::fs::write(
-            dir.join("ctl.json"),
-            serde_json::to_vec(&self.to_json()).unwrap(),
-        )
-        .expect("fake ctl save");
+        write_atomic(
+            &dir.join("ctl.json"),
+            &serde_json::to_vec(&self.to_json()).unwrap(),
+        );
     }
+}
+
+/// 一時ファイルに書いて rename する（読む側が、書きかけを見ない）。
+fn write_atomic(path: &std::path::Path, bytes: &[u8]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&tmp, bytes).expect("fake state write");
+    std::fs::rename(&tmp, path).expect("fake state rename");
 }

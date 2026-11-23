@@ -103,6 +103,7 @@ pub struct DriveApi {
     page_size: u32,
     multipart_max: u64,
     chunk_size: u64,
+    max_entries: usize,
 }
 
 impl DriveApi {
@@ -118,6 +119,7 @@ impl DriveApi {
             page_size: PAGE_SIZE,
             multipart_max: MULTIPART_MAX,
             chunk_size: CHUNK_SIZE,
+            max_entries: MAX_ENTRIES,
         }
     }
 
@@ -156,6 +158,13 @@ impl DriveApi {
         self.page_size = page_size;
         self.multipart_max = multipart_max;
         self.chunk_size = chunk_size;
+        self
+    }
+
+    /// 一覧の件数の上限を替える（試験用。本番は [`MAX_ENTRIES`]）。
+    #[doc(hidden)]
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries;
         self
     }
 
@@ -275,7 +284,7 @@ impl DriveApi {
                     for item in items {
                         let name = item["name"].as_str().ok_or(ApiError::BadResponse)?;
                         out.push(entry_from(item, name.to_owned())?);
-                        if out.len() > MAX_ENTRIES {
+                        if out.len() > self.max_entries {
                             return Err(ApiError::TooManyPages);
                         }
                     }
@@ -328,7 +337,7 @@ impl DriveApi {
                     queue.push_back((e.id.clone(), e.path.clone(), depth + 1));
                 }
                 out.push(e);
-                if out.len() > MAX_ENTRIES {
+                if out.len() > self.max_entries {
                     return Err(ApiError::TooManyPages);
                 }
             }
@@ -472,11 +481,20 @@ impl DriveApi {
             size,
             md5: &md5,
         };
-        let id = self.generate(&ctx, 1)?.remove(0);
-        if size <= self.multipart_max {
-            self.upload_multipart(&ctx, &id, &want, local)?;
+        // 手元の中身の確認は、ネットワークに出る前に済ませる（multipart は、送る本文として読んだものをそのまま使う）
+        let content = if size <= self.multipart_max {
+            let content = read_exact_file(local, size)?;
+            if hex_md5(&content) != md5 {
+                return Err(ApiError::Rejected("手元のファイルの MD5 が違います"));
+            }
+            Some(content)
         } else {
-            self.upload_resumable(&ctx, &id, &want, local)?;
+            None
+        };
+        let id = self.generate(&ctx, 1)?.remove(0);
+        match content {
+            Some(content) => self.upload_multipart(&ctx, &id, &want, &content)?,
+            None => self.upload_resumable(&ctx, &id, &want, local)?,
         }
         Ok(id)
     }
@@ -486,14 +504,10 @@ impl DriveApi {
         ctx: &Ctx<'_>,
         id: &str,
         want: &Uploaded<'_>,
-        local: &Path,
+        content: &[u8],
     ) -> Result<(), ApiError> {
-        let content = read_exact_file(local, want.size)?;
-        if hex_md5(&content) != want.md5 {
-            return Err(ApiError::Rejected("手元のファイルの MD5 が違います"));
-        }
         let metadata = json!({"id": id, "name": want.name, "parents": [want.parent]}).to_string();
-        let boundary = boundary_for(&content);
+        let boundary = boundary_for(content);
         let mut body = Vec::with_capacity(content.len() + 512);
         body.extend_from_slice(
             format!(
@@ -501,7 +515,7 @@ impl DriveApi {
             )
             .as_bytes(),
         );
-        body.extend_from_slice(&content);
+        body.extend_from_slice(content);
         body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
         let url = format!(
             "{}/files?uploadType=multipart&fields={}",
