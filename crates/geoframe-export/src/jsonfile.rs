@@ -107,6 +107,63 @@ pub fn read_json(path: &Path, max_bytes: u64) -> Result<Value, ReadError> {
     serde_json::from_slice(&bytes).map_err(|_| ReadError::Syntax)
 }
 
+/// 本文のオブジェクト。許すキーの名前（`allowed`）以外のキー・重複したキーは、**最初に見つけた 1 つ**を理由として持つ（本文の最後まで読む。
+/// 途中で打ち切ると、JSON の文法の誤りと区別できない）。重複は、エスケープを戻したあとのキーで比べる（`"dry_run"` と `"dry\u005frun"` は
+/// 同じキー）。値が `null` のキーも、1 つと数える。
+///
+/// 戻り値: JSON として読めない・オブジェクトでない・末尾に余りがある → `None`。読めたが理由がある → `Some(Err("unknown_field" |
+/// "duplicate_field"))`。問題が無ければ `Some(Ok(キーと値))`。HTTP の本文（[`crate::serve`]）と資格情報のファイル
+/// （[`crate::drive::auth`]）が使う。
+pub fn parse_strict_object(
+    bytes: &[u8],
+    allowed: &[&str],
+) -> Option<Result<serde_json::Map<String, Value>, &'static str>> {
+    use serde::de::{DeserializeSeed, Deserializer, MapAccess, Visitor};
+
+    struct Seed<'a>(&'a [&'a str]);
+    struct Visit<'a>(&'a [&'a str]);
+
+    impl<'de> Visitor<'de> for Visit<'_> {
+        type Value = Result<serde_json::Map<String, Value>, &'static str>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut object = serde_json::Map::new();
+            let mut problem: Option<&'static str> = None;
+            while let Some(key) = map.next_key::<String>()? {
+                let value = map.next_value::<Value>()?;
+                if !self.0.contains(&key.as_str()) {
+                    problem.get_or_insert("unknown_field");
+                } else if object.contains_key(&key) {
+                    problem.get_or_insert("duplicate_field");
+                } else {
+                    object.insert(key, value);
+                }
+            }
+            Ok(problem.map_or(Ok(object), Err))
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for Seed<'_> {
+        type Value = Result<serde_json::Map<String, Value>, &'static str>;
+
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_map(Visit(self.0))
+        }
+    }
+
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    let checked = Seed(allowed).deserialize(&mut de).ok()?;
+    de.end().ok()?;
+    Some(checked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -145,13 +145,21 @@ pub enum RemoteError {
     /// キャンセルの印（SIGINT・SIGTERM）が立った（起動の前、または kill して `wait` し終えた）。結果は分からない
     /// （`copy`・`moveto` は、Drive 側で済んでいるかもしれない）ので、呼び出し側は失敗として確定せず、復旧の表に渡す。
     Cancelled,
+    /// Drive の認可が失効している（OAuth の更新トークンが `invalid_grant` など）。再認可が要る。照会でも書き込みでも
+    /// `drive_auth_invalid`（[`crate::drive::api::DriveApi`] だけが返す。rclone 版は返さない）。
+    AuthInvalid,
+    /// Drive API の要求が失敗した（通信の失敗・状態コード・書き込みのあとの照合の不一致）。再試行は使い切ったあと。
+    /// （[`crate::drive::api::DriveApi`] だけが返す。）
+    Failed,
 }
 
 impl RemoteError {
-    /// 照会（`lsjson`・`cat`）の失敗を、ジョブのエラーにする。「無い」と取り違えないよう、`drive_unavailable`。
+    /// 照会（一覧・読み出し）の失敗を、ジョブのエラーにする。「無い」と取り違えないよう、`drive_unavailable`。
+    /// 認可の失効は `drive_auth_invalid`、ジョブ全体の期限は `timeout`。
     pub fn into_query_error(self) -> ExportError {
         match self {
             Self::JobDeadline => ExportError::from(ErrorCode::Timeout),
+            Self::AuthInvalid => ExportError::from(ErrorCode::DriveAuthInvalid),
             _ => ExportError::new(
                 ErrorCode::DriveUnavailable,
                 "Drive に照会できません（rclone の失敗）",
@@ -159,11 +167,14 @@ impl RemoteError {
         }
     }
 
-    /// 書き込み（`mkdir`・`copy`・`moveto`・`purge`）の失敗を、ジョブのエラーにする。
+    /// 書き込み（フォルダの作成・送信・移動・ゴミ箱へ移す）の失敗を、ジョブのエラーにする。操作の期限は `rclone_timeout`
+    /// （綴りは呼び出し側との契約で変えない。意味は「Drive の操作が期限内に終わらない」）、ジョブ全体の期限は `timeout`、
+    /// 認可の失効は `drive_auth_invalid`、それ以外は `rclone_failed`（同じく、意味は「Drive の変更系の操作の失敗」）。
     pub fn into_op_error(self) -> ExportError {
         match self {
             Self::Timeout => ExportError::from(ErrorCode::RcloneTimeout),
             Self::JobDeadline => ExportError::from(ErrorCode::Timeout),
+            Self::AuthInvalid => ExportError::from(ErrorCode::DriveAuthInvalid),
             _ => ExportError::from(ErrorCode::RcloneFailed),
         }
     }
@@ -378,6 +389,27 @@ mod tests {
         assert_eq!(
             RemoteError::JobDeadline.into_query_error().code,
             ErrorCode::Timeout
+        );
+    }
+
+    #[test]
+    fn auth_failures_map_to_drive_auth_invalid_for_queries_and_writes() {
+        assert_eq!(
+            RemoteError::AuthInvalid.into_query_error().code,
+            ErrorCode::DriveAuthInvalid
+        );
+        assert_eq!(
+            RemoteError::AuthInvalid.into_op_error().code,
+            ErrorCode::DriveAuthInvalid
+        );
+        // API の要求の失敗は、照会なら drive_unavailable、書き込みなら rclone_failed
+        assert_eq!(
+            RemoteError::Failed.into_query_error().code,
+            ErrorCode::DriveUnavailable
+        );
+        assert_eq!(
+            RemoteError::Failed.into_op_error().code,
+            ErrorCode::RcloneFailed
         );
     }
 }

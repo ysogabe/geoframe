@@ -93,7 +93,6 @@ use axum::routing::get;
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
-use serde::de::{Deserialize, Deserializer, MapAccess, Visitor};
 use serde_json::{Map, Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, watch};
@@ -896,48 +895,12 @@ const KEYS: [&str; 6] = [
     "request_id",
 ];
 
-/// 本文のオブジェクト。未知のキー・重複したキーは、**最初に見つけた 1 つ**を理由として持つ（本文の最後まで読む。途中で
-/// 打ち切ると、JSON の文法の誤りと区別できない）。重複は、エスケープを戻したあとのキーで比べる（`"dry_run"` と `"dry\u005frun"`
-/// は同じキー）。値が `null` のキーも、1 つと数える。
-struct Strict(Result<Map<String, Value>, &'static str>);
-
-impl<'de> Deserialize<'de> for Strict {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Visit;
-
-        impl<'de> Visitor<'de> for Visit {
-            type Value = Strict;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                f.write_str("a JSON object")
-            }
-
-            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Strict, A::Error> {
-                let mut object = Map::new();
-                let mut problem: Option<&'static str> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    let value = map.next_value::<Value>()?;
-                    if !KEYS.contains(&key.as_str()) {
-                        problem.get_or_insert("unknown_field");
-                    } else if object.contains_key(&key) {
-                        problem.get_or_insert("duplicate_field");
-                    } else {
-                        object.insert(key, value);
-                    }
-                }
-                Ok(Strict(problem.map_or(Ok(object), Err)))
-            }
-        }
-
-        deserializer.deserialize_map(Visit)
-    }
-}
-
 /// 本文（JSON）を [`RawRequest`] にする。未知のキー・重複したキー・オブジェクトでない本文・型の違いは、固定のコードで断る。
 /// `null` は、キーが無いのと同じに扱う（必須の `from`・`destination` は、そのあとの検査で `invalid_date`・`invalid_destination`）。
 /// 型の違いは、そのキーの検査のコード（`from`・`to` は `invalid_date`、`dry_run` は `invalid_body`）。
 fn parse_body(bytes: &[u8]) -> Result<RawRequest, &'static str> {
-    let Ok(Strict(checked)) = serde_json::from_slice::<Strict>(bytes) else {
+    // 未知のキー・重複したキーは、最初に見つけた 1 つが理由（本文の最後まで読む。[`crate::jsonfile::parse_strict_object`]）
+    let Some(checked) = crate::jsonfile::parse_strict_object(bytes, &KEYS) else {
         return Err("invalid_body");
     };
     let object = checked?;

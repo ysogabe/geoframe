@@ -178,10 +178,7 @@ impl Env {
 
     /// その操作が呼ばれた回数。
     pub fn op_count(&self, op: &str) -> usize {
-        self.calls()
-            .iter()
-            .filter(|c| c["op"] == op)
-            .count()
+        self.calls().iter().filter(|c| c["op"] == op).count()
     }
 
     /// Drive を変える操作（`create_folder`・`upload`・`move`・`trash`）も、段階の記録も、ひとつも無い。

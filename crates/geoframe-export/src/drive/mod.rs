@@ -44,6 +44,10 @@
 //! ゴミ箱へ移さない）。`incoming/<job_id>` は、記録した ID と一致するフォルダ 1 つだけのときに消す
 //! （ID が記録されていなければ、名前だけでは消さない）。
 
+pub mod api;
+pub mod auth;
+pub mod http;
+
 use std::path::Path;
 
 use serde_json::Value;
