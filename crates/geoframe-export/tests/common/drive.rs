@@ -235,6 +235,62 @@ impl Env {
         assert_eq!(self.mutating_ops(), Vec::<String>::new());
     }
 
+    // ---- 偽の Drive の HTTP の要求（API の呼び出しの形）----
+
+    /// HTTP の要求（`kind: "http"`）だけ、順番どおりに。
+    pub fn http_calls(&self) -> Vec<Value> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c["kind"] == "http")
+            .collect()
+    }
+
+    /// ファイルの送信の対象（Drive 上のパス）を、順番どおりに。1 つのファイルにつき 1 つ（multipart の 1 回、または resumable の
+    /// 始め。チャンク・位置の問い合わせは数えない）。
+    pub fn uploaded_subjects(&self) -> Vec<String> {
+        self.http_calls()
+            .iter()
+            .filter(|c| {
+                c["op"] == "upload" && matches!(c["phase"].as_str(), Some("multipart" | "init"))
+            })
+            .map(|c| c["subject"].as_str().unwrap_or("").to_owned())
+            .collect()
+    }
+
+    /// 呼び出しの形が、約束どおりであること（rclone の引数の検査〔`assert_rclone_safe_calls`〕の置き換え）:
+    /// - Drive へのどの要求にも `Authorization` が付く（トークンの入口と、resumable のチャンク・位置の問い合わせ〔セッションの URL が
+    ///   認可する〕を除く）。付いていても無効な値ではない。
+    /// - 一覧の `q` は `'<ID>' in parents and trashed=false` だけ（名前で絞らない）。
+    /// - 完全な削除（`DELETE`・`emptyTrash`）も、中身の更新（`PATCH /upload/…`）も呼ばない（偽の Drive は 405・`unsupported`）。
+    /// - ゴミ箱へは、`trashed: true` の更新（`trash`）で移す。
+    pub fn assert_api_calls_safe(&self) {
+        let calls = self.http_calls();
+        assert!(!calls.is_empty(), "HTTP の要求が 1 つも無い");
+        for c in &calls {
+            let op = c["op"].as_str().unwrap_or("?");
+            assert_ne!(op, "unsupported", "完全な削除か中身の更新を呼んだ: {c}");
+            let auth = c["authorization"].as_str().unwrap_or("?");
+            let session_put = op == "upload" && matches!(c["phase"].as_str(), Some("chunk" | "status"));
+            match (op, auth) {
+                ("token", "missing") => {}
+                (_, "ok") if op != "token" => {}
+                (_, "missing") if session_put => {}
+                _ => panic!("Authorization が約束と違う（{auth}）: {c}"),
+            }
+            if op == "list" {
+                let q = c["q"].as_str().unwrap_or("");
+                let ok = q
+                    .strip_prefix('\'')
+                    .and_then(|r| r.strip_suffix("' in parents and trashed=false"))
+                    .is_some_and(|id| {
+                        !id.is_empty()
+                            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    });
+                assert!(ok, "一覧の q が ID だけの形ではない（名前で絞っている）: {q}");
+            }
+        }
+    }
+
     // ---- rclone 固有の記録（rclone 版を消すときに、使う試験と一緒に消す）----
 
     /// 呼ばれた rclone のコマンド `cmd`（`lsjson` など）の引数。
@@ -452,15 +508,6 @@ pub fn do_then_fail() -> Value {
 
 pub fn sleep_ms(ms: u64) -> Value {
     json!({"kind": "sleep", "ms": ms})
-}
-
-/// 移動を、`after_lists` 回の一覧のあとに反映させ、呼び出しは失敗で終わらせる。
-pub fn late_then_fail(after_lists: u64) -> Value {
-    json!({"kind": "late_then_fail", "code": 1, "after_lists": after_lists})
-}
-
-pub fn filewise() -> Value {
-    json!({"kind": "filewise"})
 }
 
 pub fn garbage(text: &str) -> Value {

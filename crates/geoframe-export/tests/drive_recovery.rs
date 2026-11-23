@@ -174,7 +174,7 @@ fn an_interrupted_upload_that_never_recorded_the_incoming_id_is_not_deleted_by_n
     // 結果と recover の表示に出す
     let text = geoframe_export::publish::leftover_incoming_text(&w.layout, Some(&inc));
     assert!(
-        text.contains(&inc) && text.contains(w.layout.incoming_path()),
+        text.contains(&inc) && text.contains(&w.layout.incoming_path()),
         "{text}"
     );
     let (decision, _, shown) = w

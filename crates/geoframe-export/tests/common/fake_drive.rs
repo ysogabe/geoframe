@@ -160,6 +160,18 @@ pub fn cut_after(bytes: usize) -> Value {
     json!({"kind": "cut_after", "bytes": bytes})
 }
 
+/// 操作を済ませたあと、`parent`（Drive 上のパス）の下に同じ名前のフォルダを足してから答える（確かめてから移すまでの間に、
+/// オーナーが同じ名前のフォルダを作った、を作る。旧 rclone 版の「ファイル単位の移動」の筋書きの置き換え）。
+pub fn do_then_add_folder(parent: &[&str], name: &str) -> Value {
+    json!({"kind": "do_then_add_folder", "parent": parent, "name": name})
+}
+
+/// 移動（`move`）を、すぐには反映せずに 500 で答える。Drive 側では、`after_lists` 回の一覧のあとに反映される（応答を失った移動が、
+/// 遅れて効く、を作る。再試行が全部この効果に当たるよう、規則の `times` は `u64::MAX` にする）。
+pub fn late_then_fail(after_lists: u64) -> Value {
+    json!({"kind": "late_then_fail", "after_lists": after_lists})
+}
+
 /// セッションを捨てて 404 を返す（セッションの喪失）。
 pub fn lose_session() -> Value {
     json!({"kind": "lose_session"})
@@ -927,6 +939,14 @@ fn execute(shared: &Shared, req: &Request, decision: Decision) -> Outcome {
         return Outcome::Respond(Response::error(401, "authError"));
     }
     let mut drive = Drive::load(&shared.dir);
+    if kind == "late_then_fail" && decision.route == "files.update" {
+        return Outcome::Respond(late_move(shared, &mut drive, req, &effect));
+    }
+    if decision.route == "files.list" && !drive.pending.is_empty() {
+        // 遅れて効く移動が、この一覧で 1 つ進む
+        drive.apply_pending();
+        drive.save(&shared.dir);
+    }
     let mut response = match decision.route {
         "token" => handle_token(shared, &mut inner, req),
         "files.list" => handle_list(&drive, req, &kind),
@@ -954,6 +974,19 @@ fn execute(shared: &Shared, req: &Request, decision: Decision) -> Outcome {
     };
     // 模型への書き戻しは、各ハンドラが `save` する
     let _ = &mut drive;
+    if kind == "do_then_add_folder" {
+        let parent: Vec<String> = effect["parent"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut d = Drive::load(&shared.dir);
+        d.mkdir_dup(&parent, effect["name"].as_str().unwrap_or("x"));
+        d.save(&shared.dir);
+    }
     match kind.as_str() {
         "do_then_drop" | "cut_after" => Outcome::Drop,
         "do_then_fail" => Outcome::Respond(Response::error(500, "backendError")),
@@ -1160,6 +1193,35 @@ fn handle_create_folder(shared: &Shared, drive: &mut Drive, req: &Request) -> Re
     drive.save(&shared.dir);
     let n = drive.node(id).unwrap();
     Response::json(200, &item_json(n, drive, &fields_of(req, false)))
+}
+
+/// 移動を、`after_lists` 回の一覧のあとに反映されるものとして預け、500 で答える（[`late_then_fail`]）。
+fn late_move(shared: &Shared, drive: &mut Drive, req: &Request, effect: &Value) -> Response {
+    let id = req.path.rsplit('/').next().unwrap_or_default().to_owned();
+    let (Some(node), Some(Value::Object(b))) = (drive.node(&id), req.json()) else {
+        return Response::error(404, "notFound");
+    };
+    let parent = req.q("addParents").unwrap_or(&node.parent).to_owned();
+    let name = b
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(&node.name)
+        .to_owned();
+    let mut dst: Vec<String> = drive
+        .path_of(&parent)
+        .unwrap_or_default()
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .map(str::to_owned)
+        .collect();
+    dst.push(name);
+    drive.pending.push(model::Pending {
+        src: id,
+        dst,
+        remaining: effect["after_lists"].as_u64().unwrap_or(1),
+    });
+    drive.save(&shared.dir);
+    Response::error(500, "backendError")
 }
 
 fn handle_update(shared: &Shared, drive: &mut Drive, req: &Request) -> Response {
