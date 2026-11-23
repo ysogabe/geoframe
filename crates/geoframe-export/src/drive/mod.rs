@@ -56,13 +56,25 @@
 //! **中身が旧 manifest の一式と完全に一致する**ことを確かめ、もう一度見てから移す（停止中に足されたファイルごとゴミ箱へ移さない）。
 //! パスで指していた rclone 版と違い、移す先が「その瞬間に同じ名前の別のフォルダ」に化ける競合は無い（ID を指すので）。
 //!
-//! ## 移動・ゴミ箱は、処理されなかったあと、照合をやり直してから再送する
+//! ## 移動・ゴミ箱は、1 つの段で PATCH を 1 回だけ送る（再送しない）
 //!
-//! API の層は、移動・ゴミ箱へ移すを、どの失敗のあとも再送しない（429・流量制限の 403・401 のあとも。`ApiError::NotProcessed`）。待つ間に
-//! 旧フォルダへファイルが足されたりフォルダが動かされたりしていても、同じ ID をもう一度更新すると、それを知らずに動かすため。この階層の
-//! `Drive::with_resends` が、待ってから（`Retry-After` を含む。上限で切る）、操作ごとの照合（`incoming/` の一覧と記録した ID・
-//! `replaced/` の場所・ID・旧 manifest の一式と記録した MD5・先に `get` で目的の状態でないか・移す直前の確認）をやり直して再送する。
-//! 回数の上限と期限（照会の期限・ジョブ全体の期限）を掛ける。
+//! API の層は、移動・ゴミ箱へ移すを、どの失敗のあとも再送しない（429・流量制限の 403・401 のあとも。`ApiError::NotProcessed`）。
+//! この階層も再送しない。再送するには、待つ間に変わったかもしれない場所と中身を、**最初の送信の前と同じ確認で全部やり直す**必要が
+//! あり、それを別の経路に書くと、確認の足りない再送が残る（確認が食い違うたびに指摘が出た）。処理されなかった結果は、5xx・通信断の
+//! 結果不明と同じ結末にして（`rclone_failed`）、呼び出し側の復旧の表（[`crate::publish`]・[`crate::recovery`]）に任せる。
+//! 移動・ゴミ箱は 1 ジョブに数回しか呼ばないので、復旧の表に回って待つ費用は小さい。
+//!
+//! そのかわり、各段は **PATCH の直前に**、その段が前提にしていることを自分の中で確かめる（呼び出し側の確認は残す）:
+//!
+//! | 段 | PATCH の直前に確かめること |
+//! |---|---|
+//! | [`Drive::publish_move`] | `incoming/` の直下の `<job_id>` が記録した ID 1 つだけ。宛先の親の直下に、宛先の名前の項目が無い |
+//! | [`Drive::retire_old`] | `replaced/` の直下に退避名の項目が無い。宛先の親の直下の宛先の名前が、記録した旧 ID 1 つだけ |
+//! | [`Drive::trash_replaced`] | 旧フォルダの中身（ID・旧 manifest の一式・MD5）の照合のあと、宛先が新しい ID 1 つだけ・`incoming/<job_id>` が空・`replaced/` が旧 ID 1 つだけ |
+//! | [`Drive::remove_incoming`] | `incoming/<job_id>` が記録した ID のフォルダ 1 つだけ |
+//!
+//! ゴミ箱へ移すが成功したあとは（応答を失って `get` でゴミ箱の中と分かった場合を含む）、元の場所を一覧し、同名の項目が残って
+//! いれば成功にせず `Mismatch` にする。
 //!
 //! 公開のあとの照合（[`Drive::check_published`]）は、中身を ID で照合したあと、もう一度宛先を観察する（[`Drive::still_placed`]）。照合の間に
 //! 同じ ID のフォルダが宛先から動かされても、ID では中身が読めるため。
@@ -75,7 +87,6 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::time::Duration;
 
 use serde_json::Value;
 
@@ -334,6 +345,9 @@ pub enum Removed {
     /// 項目は記録した旧フォルダの ID のフォルダ 1 つだが、中身が旧 manifest の一式と一致しない（停止中に足された・変えられた。
     /// 何も消していない）。見えていた項目を返す。
     ContentMismatch(Vec<Seen>),
+    /// 旧フォルダをゴミ箱へ移す直前に、新しい公開先が確かめられなかった（宛先が新しい ID 1 つだけでない・`incoming/<job_id>` が
+    /// 残っている）。何も消していない。見えた状態を返す。
+    NotPlaced(Observed),
 }
 
 /// 照合の結果（移動のあと、など）。
@@ -342,31 +356,6 @@ pub type Check = Result<(), Observed>;
 /// 宛先が `folder_id` のフォルダ 1 つだけで、`incoming/<job_id>` が残っていない。
 fn placed_only(o: &Observed, folder_id: &str) -> bool {
     o.dest == [Seen::dir(folder_id)] && o.incoming.is_empty()
-}
-
-/// 移動・ゴミ箱へ移すの 1 回分の結果（[`Drive::with_resends`]）。
-enum Resend<T> {
-    Done(T),
-    /// 処理されていなかった。待ってから、照合をやり直して再送する。
-    Again {
-        throttled: bool,
-        retry_after: Option<Duration>,
-    },
-}
-
-/// 変更系の呼び出しの結果を、成功なら `done`、処理されていない応答なら再送、それ以外の失敗なら `ExportError` にする。
-fn resend_or<T>(r: Result<(), RemoteError>, done: T) -> Result<Resend<T>, ExportError> {
-    match r {
-        Ok(()) => Ok(Resend::Done(done)),
-        Err(RemoteError::NotProcessed {
-            throttled,
-            retry_after,
-        }) => Ok(Resend::Again {
-            throttled,
-            retry_after,
-        }),
-        Err(e) => Err(e.into_op_error()),
-    }
 }
 
 pub struct Drive<'a> {
@@ -836,152 +825,91 @@ impl<'a> Drive<'a> {
     /// （違えば何も消さずに [`Removed::Mismatch`]。無ければ [`Removed::Nothing`]）。ID は必ず渡す（名前だけでは消せない。ID を
     /// 記録できていなければ、呼び出し側は消さずに残りものとして知らせる）。移すのは、照合した ID。
     ///
-    /// 流量制限・401 で処理されなかったときは、待ってから**照合をやり直して**再送する（[`Self::with_resends`]。ゴミ箱の中に
-    /// なっていれば、一覧に出ないので `Nothing`）。
+    /// PATCH は 1 回だけ（処理されなかったときも再送しない。失敗は `Err`。呼び出し側が残りものとして知らせる）。成功のあと、
+    /// `incoming/` を一覧し直して、同名の項目が残っていれば [`Removed::Mismatch`]。
     pub fn remove_incoming(&self, expect_id: &str) -> Result<Removed, ExportError> {
-        self.with_resends(|resent| {
-            // 再送の前に、先に `get` で、もうゴミ箱の中でないか（処理されていなかったか）を見る
-            if resent && self.is_trashed(expect_id)? {
-                return Ok(Resend::Done(Removed::Done));
-            }
-            let entries = self.incoming_entries()?;
-            let seen: Vec<Seen> = entries.iter().map(Seen::of).collect();
-            match seen.as_slice() {
-                [] => Ok(Resend::Done(Removed::Nothing)),
-                [s] if s.kind == Kind::Dir && s.id == expect_id => {
-                    resend_or(self.remote.trash(&s.id), Removed::Done)
+        let seen: Vec<Seen> = self.incoming_entries()?.iter().map(Seen::of).collect();
+        match seen.as_slice() {
+            [] => Ok(Removed::Nothing),
+            [s] if s.kind == Kind::Dir && s.id == expect_id => {
+                self.remote
+                    .trash(&s.id)
+                    .map_err(RemoteError::into_op_error)?;
+                let left = self.incoming_seen()?;
+                if left.is_empty() {
+                    Ok(Removed::Done)
+                } else {
+                    Ok(Removed::Mismatch(left))
                 }
-                _ => Ok(Resend::Done(Removed::Mismatch(seen))),
             }
-        })
+            _ => Ok(Removed::Mismatch(seen)),
+        }
     }
 
     /// 旧フォルダ（宛先のフォルダ。ID は `old_id`。公開の記録・ジョブの記録と一致したもの）を `replaced/<種類>-<フォルダ名>-<job_id>` へ
-    /// 移す（ID で移す。`replaced/` が無ければ作る。移したあとの照合は呼び出し側）。移す直前に宛先を一覧して、見えたフォルダが
-    /// `old_id` でなければ（動かされた・同名の別のフォルダに替わった）、何も変えずに失敗する。
+    /// 移す（ID で移す。`replaced/` が無ければ作る。移したあとの照合は呼び出し側）。
     ///
-    /// 流量制限・401 で処理されなかったときは、待ってから、まず `get` で目的の状態（`replaced/<…>` に移っている）かを見て、
-    /// そうでなければ**上の確認を最初からやり直して**再送する（[`Self::with_resends`]）。
+    /// PATCH は 1 回だけ（処理されなかったときも再送しない）。PATCH の直前の要求は、順に、
+    /// 1. 宛先の親の直下の照合（宛先の名前が記録した旧 ID 1 つだけ。違えば何も変えずに失敗）、`replaced/` を用意する（無ければ作る）、
+    /// 2. `replaced/` の直下に退避名の項目が無いこと（あれば何も変えずに失敗。退避の結果が曖昧になる）、
+    /// 3. 宛先の親の直下の照合をもう一度（動かされた・同名の別のフォルダに替わった、を直前に見る）。
     pub fn retire_old(&self, old_id: &str) -> Result<(), ExportError> {
-        let check = || match self.target()? {
+        let check_old = || match self.target()? {
             Target::Exists { id } if id == old_id => Ok(()),
             _ => Err(unavailable("宛先のフォルダが記録した旧フォルダと違います")),
         };
-        self.with_resends(|resent| {
-            if resent
-                && let Some(dir) = self.work_dir(REPLACED)?
-                && self.moved_to(old_id, &dir.id, &self.layout.retired_name)?
-            {
-                return Ok(Resend::Done(()));
-            }
-            // 何も作らずに確かめ、`replaced/` を用意したあと、移す直前にもう一度確かめる
-            check()?;
-            let replaced = self.ensure_work_dir(REPLACED)?;
-            check()?;
-            resend_or(
-                self.remote.move_to(
-                    old_id,
-                    &self.layout.prefix_id,
-                    &replaced,
-                    &self.layout.retired_name,
-                ),
-                (),
+        // 何も作らずに確かめ、`replaced/` を用意したあと、移す直前にもう一度確かめる
+        check_old()?;
+        let replaced = self.ensure_work_dir(REPLACED)?;
+        let mut same_name = self.children(&replaced)?;
+        same_name.retain(|e| e.name == self.layout.retired_name);
+        if !same_name.is_empty() {
+            return Err(unavailable("replaced に退避名と同じ項目があります"));
+        }
+        check_old()?;
+        self.remote
+            .move_to(
+                old_id,
+                &self.layout.prefix_id,
+                &replaced,
+                &self.layout.retired_name,
             )
-        })
+            .map_err(RemoteError::into_op_error)
     }
 
     /// `incoming/<job_id>`（ID は `incoming_id`。記録したもの）を宛先へ移す（ID で移す。親を宛先の親へ、名前をフォルダ名にして、
-    /// 1 回の更新で変える。移したあとの照合は呼び出し側）。移す直前に `incoming/` の直下を一覧して、`<job_id>` の項目が
-    /// `incoming_id` のフォルダ 1 つだけでなければ、何も変えずに失敗する。移す直前に宛先に同名が無いことを確かめるのは、呼び出し側
-    /// （[`crate::publish`]）。API の移動はフォルダの移動のまま（rclone のように、同名のフォルダがあるとファイル単位の移動に化ける
-    /// ことはない）。
+    /// 1 回の更新で変える。移したあとの照合は呼び出し側）。API の移動はフォルダの移動のまま（rclone のように、同名のフォルダが
+    /// あるとファイル単位の移動に化けることはない）。
     ///
-    /// 流量制限・401 で処理されなかったときは、待ってから、まず `get` で目的の状態（宛先に移っている）かを見て、そうでなければ
-    /// 上の確認を最初からやり直して再送する（[`Self::with_resends`]）。
+    /// PATCH は 1 回だけ（処理されなかったときも再送しない）。PATCH の直前の要求は、順に、
+    /// 1. `incoming/` の直下の一覧（`<job_id>` の項目が `incoming_id` のフォルダ 1 つだけ。違えば何も変えずに失敗）、
+    /// 2. 宛先の親の直下の一覧（宛先の名前の項目が無いこと。あれば何も変えずに `ambiguous_destination`）。
     pub fn publish_move(&self, incoming_id: &str) -> Result<(), ExportError> {
-        self.with_resends(|resent| {
-            if resent
-                && self.moved_to(
-                    incoming_id,
-                    &self.layout.prefix_id,
-                    self.layout.folder.as_str(),
-                )?
-            {
-                return Ok(Resend::Done(()));
-            }
-            let Some(root) = self.work_dir(INCOMING)? else {
-                return Err(unavailable("incoming のフォルダを確認できません"));
-            };
-            let mut listed = self.children(&root.id)?;
-            listed.retain(|e| e.name == self.layout.job.as_str());
-            match listed.as_slice() {
-                [e] if e.is_dir && !e.is_shortcut() && e.id == incoming_id => {}
-                _ => {
-                    return Err(unavailable("incoming のフォルダが記録した ID と違います"));
-                }
-            }
-            resend_or(
-                self.remote.move_to(
-                    incoming_id,
-                    &root.id,
-                    &self.layout.prefix_id,
-                    self.layout.folder.as_str(),
-                ),
-                (),
-            )
-        })
-    }
-
-    /// `id` が Drive のゴミ箱の中か（`get` で見る。ゴミ箱へ移すが処理されていたかの確認）。
-    fn is_trashed(&self, id: &str) -> Result<bool, ExportError> {
-        Ok(self
-            .remote
-            .get(id)
-            .map_err(RemoteError::into_query_error)?
-            .trashed)
-    }
-
-    /// `id` が、親 `parent` の下で名前 `name` になっていて、ゴミ箱の中でないか（`get` で見る。移動が処理されていたかの確認）。
-    fn moved_to(&self, id: &str, parent: &str, name: &str) -> Result<bool, ExportError> {
-        let meta = self.remote.get(id).map_err(RemoteError::into_query_error)?;
-        Ok(meta.parents == [parent] && meta.entry.name == name && !meta.trashed)
-    }
-
-    /// 移動・ゴミ箱へ移すの再送。これらは API の層では、処理されていないと分かる応答（429・流量制限の 403・401）のあとも再送しない
-    /// （[`RemoteError::NotProcessed`]。待つ間に旧フォルダへファイルが足されたり、フォルダが動かされたりしていても、同じ ID を
-    /// もう一度更新すると、足された分ごと動かしてしまう）。そこで、ここで**待ってから、`step` の中で操作ごとの照合をやり直して**
-    /// 再送する。`step` の引数は、再送かどうか（真なら、先に「もう目的の状態か」を `get` などで見る）。
-    ///
-    /// 再送には回数の上限（[`Remote::resend_limit`]）と、全体の期限（[`Remote::resend_deadline`]。ジョブ全体の期限を含む）を掛ける。
-    /// 上限を使い切ったら `rclone_failed`、期限・キャンセルはその待ちのエラー。
-    fn with_resends<T>(
-        &self,
-        mut step: impl FnMut(bool) -> Result<Resend<T>, ExportError>,
-    ) -> Result<T, ExportError> {
-        let deadline = self.remote.resend_deadline();
-        let mut resends: u32 = 0;
-        loop {
-            match step(resends > 0)? {
-                Resend::Done(v) => return Ok(v),
-                Resend::Again {
-                    throttled,
-                    retry_after,
-                } => {
-                    if resends >= self.remote.resend_limit() {
-                        return Err(RemoteError::Failed.into_op_error());
-                    }
-                    let wait = if throttled {
-                        self.remote.resend_wait(resends, retry_after)
-                    } else {
-                        Duration::ZERO
-                    };
-                    self.remote
-                        .pause(wait, deadline)
-                        .map_err(RemoteError::into_op_error)?;
-                    resends += 1;
-                }
+        let Some(root) = self.work_dir(INCOMING)? else {
+            return Err(unavailable("incoming のフォルダを確認できません"));
+        };
+        let mut listed = self.children(&root.id)?;
+        listed.retain(|e| e.name == self.layout.job.as_str());
+        match listed.as_slice() {
+            [e] if e.is_dir && !e.is_shortcut() && e.id == incoming_id => {}
+            _ => {
+                return Err(unavailable("incoming のフォルダが記録した ID と違います"));
             }
         }
+        if !self.dest_matches()?.is_empty() {
+            return Err(ExportError::new(
+                ErrorCode::AmbiguousDestination,
+                "移す直前に、宛先に同じ名前の項目がありました",
+            ));
+        }
+        self.remote
+            .move_to(
+                incoming_id,
+                &root.id,
+                &self.layout.prefix_id,
+                self.layout.folder.as_str(),
+            )
+            .map_err(RemoteError::into_op_error)
     }
 
     /// `incoming/<job_id>` の今の項目（ID・種類。無ければ空）。
@@ -1002,43 +930,53 @@ impl<'a> Drive<'a> {
     ///    （停止している間に足されたファイルや、同じ名前・同じ大きさのまま書き換えられたファイルごとゴミ箱へ移さない。旧 manifest は
     ///    読み直す）。公開の記録に旧フォルダの行と MD5 が無いとき（行の ID が旧 ID と違う・MD5 が無い）は、確かめられないので
     ///    移さない（[`Removed::ContentMismatch`]）。
-    /// 3. 2 の間に差し替わっていないことを、1 をもう一度確かめて見る。
+    /// 3. **PATCH の直前に**、宛先が `placed_id`（新しい公開先の ID）のフォルダ 1 つだけで `incoming/<job_id>` が空、かつ
+    ///    `replaced/` がまだ旧 ID 1 つだけであること（[`Self::observe`]）。2 の間に新しいフォルダが宛先から動かされていれば、
+    ///    移さずに [`Removed::NotPlaced`]（旧フォルダは、新しい公開先が確かでないうちは、戻せる唯一の元）。`replaced/` が旧 ID
+    ///    でなくなっていれば [`Removed::Mismatch`]。
     ///
-    /// 移すのは、照合した **ID**（`old_id`）。
+    /// 移すのは、照合した **ID**（`old_id`）。PATCH は 1 回だけ（処理されなかったときも再送しない。失敗は `Err`。呼び出し側が
+    /// `replaced/` を一覧し直して、結果不明と同じに扱う）。成功のあと、`replaced/` を一覧し直して、同名の項目が残っていれば
+    /// [`Removed::Mismatch`]。
     pub fn trash_replaced(
         &self,
         old_id: &str,
+        placed_id: &str,
         published: &PublishedStore,
     ) -> Result<Removed, ExportError> {
         let is_old = |seen: &[Seen]| matches!(seen, [s] if s.kind == Kind::Dir && s.id == old_id);
-        // 流量制限・401 で処理されなかったときは、待ってから、**1 から 3 までを最初からやり直して**再送する
-        // （ゴミ箱の中になっていれば、`replaced/` の一覧に出ないので `Nothing`）
-        self.with_resends(|resent| {
-            // 再送の前に、先に `get` で、もうゴミ箱の中でないか（処理されていなかったか）を見る
-            if resent && self.is_trashed(old_id)? {
-                return Ok(Resend::Done(Removed::Done));
-            }
-            let seen = self.replaced_seen()?;
-            if seen.is_empty() {
-                return Ok(Resend::Done(Removed::Nothing));
-            }
-            if !is_old(&seen) {
-                return Ok(Resend::Done(Removed::Mismatch(seen)));
-            }
-            let Some(recorded) =
-                published.recorded_files_of(self.layout.destination, &self.layout.folder, old_id)
-            else {
-                return Ok(Resend::Done(Removed::ContentMismatch(seen)));
-            };
-            if !self.folder_matches_its_manifest(old_id, Under::Replaced, Some(&recorded.files))? {
-                return Ok(Resend::Done(Removed::ContentMismatch(seen)));
-            }
-            let again = self.replaced_seen()?;
-            if !is_old(&again) {
-                return Ok(Resend::Done(Removed::Mismatch(again)));
-            }
-            resend_or(self.remote.trash(old_id), Removed::Done)
-        })
+        let seen = self.replaced_seen()?;
+        if seen.is_empty() {
+            return Ok(Removed::Nothing);
+        }
+        if !is_old(&seen) {
+            return Ok(Removed::Mismatch(seen));
+        }
+        let Some(recorded) =
+            published.recorded_files_of(self.layout.destination, &self.layout.folder, old_id)
+        else {
+            return Ok(Removed::ContentMismatch(seen));
+        };
+        if !self.folder_matches_its_manifest(old_id, Under::Replaced, Some(&recorded.files))? {
+            return Ok(Removed::ContentMismatch(seen));
+        }
+        // PATCH の直前の観察
+        let now = self.observe()?;
+        if !is_old(&now.replaced) {
+            return Ok(Removed::Mismatch(now.replaced));
+        }
+        if !placed_only(&now, placed_id) {
+            return Ok(Removed::NotPlaced(now));
+        }
+        self.remote
+            .trash(old_id)
+            .map_err(RemoteError::into_op_error)?;
+        let left = self.replaced_seen()?;
+        if left.is_empty() {
+            Ok(Removed::Done)
+        } else {
+            Ok(Removed::Mismatch(left))
+        }
     }
 
     // ---- 移動のあとの照合（応答を信じず、一覧で確かめる） ----

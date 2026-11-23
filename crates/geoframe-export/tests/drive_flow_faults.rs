@@ -140,11 +140,31 @@ fn rate_limits_are_waited_out_and_a_limit_that_never_ends_fails_the_job() {
     let svc = service_with(&mut env, &site, retrying());
     env.add_rule("list", 0, 2, fk::rate_limit_403());
     env.add_rule("upload", 1, 3, fk::too_many_requests(1));
-    env.add_rule("move", 0, 1, fk::rate_limit_403());
     let rec = run_job(&svc);
     assert_eq!(rec.status, Status::Succeeded, "{:?}", rec.error);
     assert_published_once(&env);
     assert!(requests_of(&env, "list") > 2);
+
+    // 移動が流量制限を返した: 移動の PATCH は 1 回だけ送り、再送しない（結果不明と同じ結末。復旧の表が、宛先が空のままで
+    // `incoming` が残っていることを見て、公開しなかったものとして片付ける）
+    let mut env = Env::new("faults-rate-move");
+    let site = photo_site(DAY, DAY, three());
+    let svc = service_with(&mut env, &site, retrying());
+    env.add_rule("move", 0, 1, fk::rate_limit_403());
+    let rec = run_job(&svc);
+    assert_eq!(env.op_count("move"), 1, "再送しない");
+    assert!(dest_names(&env).is_empty(), "公開されていない");
+    assert_eq!(rec.status, Status::Failed);
+    assert_eq!(rec.error, Some(ErrorCode::RcloneFailed));
+    // `incoming/<job_id>` は片付いている（ゴミ箱の中）
+    let d = env.drive();
+    let work = d.resolve(&["geoframe-export-work"]).unwrap();
+    let incoming = d
+        .children(&work)
+        .into_iter()
+        .find(|n| n.name == "incoming" && !n.trashed)
+        .expect("incoming/");
+    assert!(d.children(&incoming.id).iter().all(|n| n.trashed));
 
     // 送信が流量制限を返し続ける: 回数の上限で失敗し（rclone_failed）、宛先は公開されず、incoming は片付く
     let mut env = Env::new("faults-rate-upload");

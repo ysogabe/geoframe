@@ -158,8 +158,9 @@ pub enum RemoteError {
     /// Drive API の要求が失敗した（通信の失敗・状態コード・書き込みのあとの照合の不一致）。再試行は使い切ったあと。
     /// （[`crate::drive::api::DriveApi`] だけが返す。）
     Failed,
-    /// 移動・ゴミ箱へ移すが、処理されていないと分かる応答（429・流量制限の 403・401）を受けた。API の層は再送していない。待って
-    /// 再送するかは、操作ごとの照合をやり直せる呼び出し側が決める（[`crate::drive`]）。
+    /// 移動・ゴミ箱へ移すが、処理されていないと分かる応答（429・流量制限の 403・401）を受けた。API の層は再送していない。
+    /// 呼び出し側（[`crate::drive`]）も再送せず、5xx・通信断の結果不明と同じに扱う（[`RemoteError::into_op_error`] は
+    /// `rclone_failed`。復旧の表に任せる）。
     NotProcessed {
         throttled: bool,
         retry_after: Option<Duration>,
@@ -350,29 +351,6 @@ impl Remote {
     /// `id` を Drive のゴミ箱へ移す（完全な削除ではない）。
     pub fn trash(&self, id: &str) -> Result<(), RemoteError> {
         Ok(self.api.trash(id, self.api.deadline(Limit::Query))?)
-    }
-
-    // ---- 上位の再送（移動・ゴミ箱は、API の層では再送しない） ----
-
-    /// 上位の再送の期限（照会の期限とジョブ全体の期限の早いほう）。再送の繰り返し全体で 1 つ作る。
-    pub fn resend_deadline(&self) -> Deadline {
-        self.api.deadline(Limit::Query)
-    }
-
-    /// 上位が再送してよい回数の上限（再試行の方針の `max_retries` と同じ）。
-    pub fn resend_limit(&self) -> u32 {
-        self.api.retry_policy().max_retries
-    }
-
-    /// `attempt`（0 から）回目の再送の前の待ち。`Retry-After` があればそれ（上限で切る）、無ければ指数の待ち。
-    pub fn resend_wait(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
-        self.api.retry_policy().wait_for(attempt, retry_after)
-    }
-
-    /// 再送の前に待つ。キャンセルと期限（`deadline`）を見て、切れれば [`RemoteError::Cancelled`]・[`RemoteError::Timeout`]・
-    /// [`RemoteError::JobDeadline`]。
-    pub fn pause(&self, wait: Duration, deadline: Deadline) -> Result<(), RemoteError> {
-        Ok(self.api.pause(wait, deadline)?)
     }
 }
 

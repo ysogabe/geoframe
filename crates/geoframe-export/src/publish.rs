@@ -45,7 +45,7 @@
 //! | `publishing` の前 | 宛先が無い（新規は無ければ中止、置き換えは `blocked`） |
 //! | `publishing` の直後 | 宛先が**記録した `incoming` の ID 1 つだけ**・`incoming/<job_id>` が残っていない・中身が一式と一致。違えば `blocked`（`publish_mismatch`。確かめてから移すまでの間に、宛先に同じ名前の別のフォルダができた場合など） |
 //! | 中止の片付けの前 | 最後に記録した段階が `publishing` なら、`aborting` を記録してから `incoming` をゴミ箱へ（復旧は、`incoming` が残っていれば消し、無ければ片付け済みとして `interrupted`） |
-//! | `trashing` の直前 | `replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**、かつ**中身が旧 manifest の一式と完全に一致**。違えば `blocked`（`trash_mismatch`・`retired_content_changed`） |
+//! | `trashing` の直前 | `replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**、かつ**中身が旧 manifest の一式と完全に一致**。違えば `blocked`（`trash_mismatch`・`retired_content_changed`）。そのあと PATCH の直前に、宛先が**新しい ID 1 つだけ**・`incoming/<job_id>` が空であることを観察し直す。違えば `blocked`（`publish_mismatch`。公開先が確かでないうちは、旧フォルダをゴミ箱へ移さない） |
 //! | 取り除き（`incoming` のゴミ箱） | 見えた項目が、**記録した ID** のフォルダちょうど 1 つ（ID が無ければ消さない） |
 //!
 //! ## ゴミ箱へ移すものと、同名のフォルダの競合の影響（残る前提）
@@ -413,6 +413,9 @@ enum TrashStop {
     Mismatch(Vec<Seen>),
     /// 旧フォルダだが、中身が旧 manifest の一式と違う。
     Content(Vec<Seen>),
+    /// ゴミ箱へ移す直前に、新しい公開先が確かめられなかった（宛先が新しい ID 1 つだけでない・`incoming` が残っている）。
+    /// 片付けの失敗として成功に流さず、`publish_mismatch` で止める。
+    NotPlaced(Observed),
     /// `replaced/` を一覧できない（確かめられない）。
     Unconfirmed,
 }
@@ -430,6 +433,7 @@ impl TrashStop {
                 BlockedReason::RetiredContentChanged,
                 Some(with_replaced(seen)),
             ),
+            Self::NotPlaced(o) => (BlockedReason::PublishMismatch, Some(o)),
             Self::Unconfirmed => (BlockedReason::Unobservable, base.cloned()),
         };
         Box::new(BlockedInfo {
@@ -806,7 +810,8 @@ fn confirm_old_left(drive: &Drive<'_>, old: &str) -> Result<Option<String>, Tras
 /// 仕上げ: 旧フォルダ（`trash_old`）をゴミ箱へ移し、公開の記録（`published/`）に足す。
 ///
 /// - ゴミ箱へ移す前に、`replaced/<…>` が記録した旧フォルダの ID 1 つだけで、中身が旧 manifest の一式と完全に一致することを
-///   確かめる（[`Drive::trash_replaced`]）。違えば何も消さずに `Err`（`blocked`）。
+///   確かめ、PATCH の直前に新しい公開先（宛先が `folder_id` 1 つだけ・`incoming` が空）も確かめる（[`Drive::trash_replaced`]）。
+///   違えば何も消さずに `Err`（`blocked`。公開先が確かでないときは `publish_mismatch`）。
 /// - 移せなかったときは、`free`（ジョブの期限を掛けない）で一覧し直して確かめる。もう無ければ（応答が失われても、移動は済んで
 ///   いることがある）済み。旧 ID のフォルダが 1 つだけ残っていれば、新しい一式は公開済みなので `old_left_in_replaced` で知らせて
 ///   終える。**別の ID だった・一覧できなかったときは成功にせず `Err`**（`blocked`）。
@@ -836,10 +841,11 @@ fn finish_tail(
     let mut previous = leave_old.and_then(previous_of);
     if let Some(old) = trash_old {
         let before = previous_of(old);
-        match drive.trash_replaced(old, published) {
+        match drive.trash_replaced(old, folder_id, published) {
             Ok(Removed::Done | Removed::Nothing) => {}
             Ok(Removed::Mismatch(seen)) => return Err(TrashStop::Mismatch(seen)),
             Ok(Removed::ContentMismatch(seen)) => return Err(TrashStop::Content(seen)),
+            Ok(Removed::NotPlaced(o)) => return Err(TrashStop::NotPlaced(o)),
             Err(_) => {
                 left = confirm_old_left(free, old)?;
                 if left.is_some() {

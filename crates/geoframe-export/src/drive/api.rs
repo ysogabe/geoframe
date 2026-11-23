@@ -10,8 +10,8 @@
 //! | [`DriveApi::generate_ids`] | `GET files/generateIds` | 作成の前に ID を取る |
 //! | [`DriveApi::create_folder`] | `POST files`（取った ID を本文に） | 409 は「済み」→ 照合 |
 //! | [`DriveApi::upload`] | `POST upload/files`（multipart か resumable） | 409 は「済み」→ 照合 |
-//! | [`DriveApi::move_to`] | `PATCH files/<ID>?addParents&removeParents` | どの失敗のあとも再送しない（結果不明は状態を見る。429・401 は上位へ） |
-//! | [`DriveApi::trash`] | `PATCH files/<ID>`（`trashed: true`） | どの失敗のあとも再送しない（結果不明は状態を見る。429・401 は上位へ） |
+//! | [`DriveApi::move_to`] | `PATCH files/<ID>?addParents&removeParents` | どの失敗のあとも再送しない（結果不明は状態を見る。429・401 は `NotProcessed`） |
+//! | [`DriveApi::trash`] | `PATCH files/<ID>`（`trashed: true`） | どの失敗のあとも再送しない（結果不明は状態を見る。429・401 は `NotProcessed`） |
 //! | [`DriveApi::read`] | `GET files/<ID>?alt=media` | 上限つき |
 //!
 //! **作らないもの**: 完全な削除（`DELETE files`・`emptyTrash`）と、既存のファイルの中身の更新（`PATCH` の media・`PUT upload`）。
@@ -175,16 +175,6 @@ impl DriveApi {
         self.cancel.is_cancelled()
     }
 
-    /// 再試行の方針（上位が、[`ApiError::NotProcessed`] のあとに再送する回数の上限と待ちを決めるために使う）。
-    pub fn retry_policy(&self) -> Retry {
-        self.transport.retry()
-    }
-
-    /// `wait` だけ待つ。細かく刻んで、キャンセルと期限を見る（上位の再送の待ち）。
-    pub fn pause(&self, wait: Duration, deadline: Deadline) -> Result<(), ApiError> {
-        self.ctx(deadline).sleep(wait)
-    }
-
     /// 写真の送信全体の期限（`--drive-upload-timeout`）。
     pub fn upload_timeout(&self) -> Duration {
         self.upload_timeout
@@ -220,7 +210,7 @@ impl DriveApi {
     // ---- 送信の下請け ----
 
     /// トークンつきで送る。401 ならトークンを取り直して 1 回だけやり直す（`opts.resend_unknown` が偽の操作は、やり直さずに
-    /// [`ApiError::NotProcessed`] を返す。トークンは捨てるので、上位が照合し直して呼び直せば、次の要求が取り直す）。
+    /// [`ApiError::NotProcessed`] を返す。トークンは捨てるので、次の要求が取り直す）。
     fn authorized(
         &self,
         ctx: &Ctx<'_>,
@@ -816,9 +806,8 @@ impl DriveApi {
 
     /// `id` を、`from_parent` から `to_parent` へ、`new_name` にして移す（1 回の `PATCH` で親と名前を変える。ID は保たれる）。
     /// **結果が分からない失敗（通信断・5xx・時間切れ）のあとは、自分で再送しない**: `get` で今の状態を見て、既に目的の状態
-    /// （親が `to_parent` だけ・名前が `new_name`・ゴミ箱に入っていない）なら成功、そうでなければその失敗を返す（再送するかは、
-    /// 場所と中身の照合をやり直せる上位が決める）。429・流量制限の 403・401（処理されていないと分かる）のあとも**再送しない**:
-    /// [`ApiError::NotProcessed`]（流量制限なら `Retry-After` つき。401 ならトークンを捨てる）を返し、待つことと再送は上位が決める
+    /// （親が `to_parent` だけ・名前が `new_name`・ゴミ箱に入っていない）なら成功、そうでなければその失敗を返す（呼び出し側も再送しない）。429・流量制限の 403・401（処理されていないと分かる）のあとも**再送しない**:
+    /// [`ApiError::NotProcessed`]（流量制限なら `Retry-After` つき。401 ならトークンを捨てる）を返す
     /// （待つ間に旧フォルダへファイルが足されると、同じ ID をもう一度更新して、足された分ごと動かしてしまう）。4xx で断られた
     /// ときは、`get` で今の状態を見て、目的の状態なら成功。
     pub fn move_to(
@@ -873,7 +862,7 @@ impl DriveApi {
 
     /// `id` を Drive のゴミ箱へ移す（完全な削除ではない。ゴミ箱から戻せる）。**結果が分からない失敗（通信断・5xx・時間切れ）の
     /// あとは、自分で再送しない**: `get` で見て、既にゴミ箱の中なら成功、そうでなければその失敗を返す（待っている間に、フォルダが
-    /// 戻された・中身が足されたかもしれないので、再送するかは、場所と中身の照合をやり直せる上位が決める）。429・流量制限の 403・
+    /// 戻された・中身が足されたかもしれないので、再送しない）。429・流量制限の 403・
     /// 401 のあとも再送せず、[`ApiError::NotProcessed`] を返す。4xx で断られたときは、`get` で見て、ゴミ箱の中なら成功。
     pub fn trash(&self, id: &str, deadline: Deadline) -> Result<(), ApiError> {
         check_id(id)?;

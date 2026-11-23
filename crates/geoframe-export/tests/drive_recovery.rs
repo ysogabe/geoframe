@@ -1615,63 +1615,76 @@ fn a_folder_moved_away_while_recovery_checks_its_contents_is_not_taken_as_publis
     assert!(w.env.drive().trashed.is_empty());
 }
 
-/// 退避した旧フォルダのゴミ箱への移動が 429・401 のとき、待ったあとに、旧フォルダの中身を照合し直してから再送する。待つ間に
-/// ファイルが足されていれば、ゴミ箱へは移さない（復旧でも同じ）。
+/// 退避した旧フォルダのゴミ箱への移動が 429・401（処理されていない）のとき、再送しない（復旧でも同じ）。結果不明と同じ結末:
+/// 公開の記録は書き、旧フォルダは退避先に残ったものとして知らせる。待つ間に足されたファイルごとゴミ箱へ移すことはない。
 #[test]
-fn a_throttled_trash_during_recovery_is_checked_again_before_it_is_resent() {
+fn a_trash_that_was_not_processed_during_recovery_is_sent_once() {
     use common::fake_drive::{status_then_add_file, too_many_requests, unauthorized};
     for (label, effect) in [("429", too_many_requests(0)), ("401", unauthorized())] {
-        // 待つ間に何も起きなければ、再送して済む
-        let w = world(&format!("trash-throttled-recovery-{label}"));
-        let old = w.env.seed_managed(Y, FOLDER, &w.set);
-        let inc = w.put_incoming();
-        w.retire(&old);
-        w.publish_incoming(&inc);
-        w.env.add_rule("trash", 0, 1, effect.clone());
-        let r = w.env.remote_retrying();
-        let res = w
-            .recovery(&r, None)
-            .run(
-                &progress(Stage::Trashing, Some(&old), Some(&inc)),
-                false,
-                &mut Hook::new(&w.env),
-            )
-            .unwrap();
-        let Resolution::Published(p) = res else {
-            panic!("{label}: {res:?}")
-        };
-        assert_eq!(p.old_left_in_replaced, None, "{label}");
-        assert_eq!(w.env.drive().trashed, std::slice::from_ref(&old), "{label}");
-        assert_eq!(w.env.op_count("trash"), 2, "{label}");
-
-        // 待つ間にファイルが足された: ゴミ箱へ移さない
-        let w = world(&format!("trash-throttled-added-recovery-{label}"));
-        let old = w.env.seed_managed(Y, FOLDER, &w.set);
-        let inc = w.put_incoming();
-        w.retire(&old);
-        w.publish_incoming(&inc);
-        let r = w.env.remote_retrying();
-        let retired = w.layout.retired_name().to_owned();
-        w.env.add_rule(
-            "trash",
-            0,
-            1,
-            status_then_add_file(
-                effect,
-                &["geoframe-export-work", "replaced", retired.as_str()],
-                "owner-memo.txt",
-            ),
-        );
-        let info = w
-            .recovery(&r, None)
-            .run(
-                &progress(Stage::Trashing, Some(&old), Some(&inc)),
-                false,
-                &mut Hook::new(&w.env),
-            )
-            .unwrap_err();
-        assert_eq!(info.reason, BlockedReason::RetiredContentChanged, "{label}");
-        assert_eq!(w.env.op_count("trash"), 1, "{label}: 再送していない");
-        assert!(w.env.drive().trashed.is_empty(), "{label}");
+        for added in [false, true] {
+            let w = world(&format!("trash-not-processed-recovery-{label}-{added}"));
+            let old = w.env.seed_managed(Y, FOLDER, &w.set);
+            let inc = w.put_incoming();
+            w.retire(&old);
+            w.publish_incoming(&inc);
+            let effect = if added {
+                let retired = w.layout.retired_name().to_owned();
+                status_then_add_file(
+                    effect.clone(),
+                    &["geoframe-export-work", "replaced", retired.as_str()],
+                    "owner-memo.txt",
+                )
+            } else {
+                effect.clone()
+            };
+            w.env.add_rule("trash", 0, u64::MAX, effect);
+            let r = w.env.remote_retrying();
+            let res = w
+                .recovery(&r, None)
+                .run(
+                    &progress(Stage::Trashing, Some(&old), Some(&inc)),
+                    false,
+                    &mut Hook::new(&w.env),
+                )
+                .unwrap();
+            let Resolution::Published(p) = res else {
+                panic!("{label}/{added}: {res:?}")
+            };
+            assert_eq!(p.old_left_in_replaced.as_deref(), Some(old.as_str()));
+            assert_eq!(w.env.op_count("trash"), 1, "{label}/{added}: 再送しない");
+            assert!(w.env.drive().trashed.is_empty(), "{label}/{added}");
+        }
     }
+}
+
+/// 旧フォルダの中身の照合のあと、ゴミ箱へ移す直前に、新しい公開先が宛先から動かされた（復旧の「公開済み」の行でも、
+/// 照合は ID で行うので、動かされても中身は一致する）。ゴミ箱へ移さず、`publish_mismatch` で止める。
+#[test]
+fn the_new_folder_moved_away_just_before_the_trash_blocks_in_recovery_too() {
+    let w = world("moved-away-before-trash-recovery");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.publish_incoming(&inc);
+    w.env.fake.add_rule_contains(
+        "list",
+        &format!("replaced/{}", w.layout.retired_name()),
+        0,
+        1,
+        do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+    );
+    let r = w.env.remote();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Trashing, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::PublishMismatch);
+    assert!(info.observed.expect("observed").dest.is_empty());
+    assert_eq!(w.recorded_id(), Some(old.clone()), "旧フォルダの行のまま");
+    assert_eq!(w.env.op_count("trash"), 0);
+    assert!(w.env.drive().trashed.is_empty());
 }
