@@ -589,7 +589,7 @@ rclone 版を動かしていない新しい機体で、`rclone.conf`が無いと
    scope = drive
    token = <1 のトークン>
    ```
-3. 既存の資格情報のファイルを**退避してから**、取り込みます（出力先は上書きされません）。
+3. 既存の資格情報のファイルを**退避してから**、取り込みます（出力先は上書きされません）。取り込みが失敗したら、退避したファイルを元の名前へ戻します（`sudo mv /etc/geoframe-export/drive-credentials.json.old /etc/geoframe-export/drive-credentials.json`）。
    ```sh
    sudo mv /etc/geoframe-export/drive-credentials.json /etc/geoframe-export/drive-credentials.json.old
    sudo /usr/local/bin/geoframe-export import-credentials \
@@ -597,16 +597,16 @@ rclone 版を動かしていない新しい機体で、`rclone.conf`が無いと
      --out /etc/geoframe-export/drive-credentials.json
    sudo ls -l /etc/geoframe-export/drive-credentials.json   # -rw------- root root
    ```
-4. **一時ファイルと、退避した古い資格情報を消します**（どちらも Drive 全体の権限の値です）。
-   ```sh
-   sudo rm -rf /root/geoframe-reauth
-   sudo rm -f /etc/geoframe-export/drive-credentials.json.old
-   ```
-5. サービスを再起動します（資格情報は起動のたびに読まれるので、動いているサービスは再起動するまで古い値のままです）。
+4. サービスを再起動します（資格情報は起動のたびに読まれるので、動いているサービスは再起動するまで古い値のままです）。
    ```sh
    sudo systemctl reset-failed geoframe-export
    sudo systemctl restart geoframe-export
    journalctl -u geoframe-export -n 20   # 起動時の検査（トークンと 3 つのフォルダ）を通ったことを見る
+   ```
+5. **起動時の検査を通ったのを確かめてから**、一時ファイルと、退避した古い資格情報を消します（どちらも Drive 全体の権限の値です）。通らなかったときは、`.old`を消さずに原因を調べます。
+   ```sh
+   sudo rm -rf /root/geoframe-reauth
+   sudo rm -f /etc/geoframe-export/drive-credentials.json.old
    ```
 6. 認可の失効でジョブが途中で止まっていたら（`blocked`、または`running`のまま）、**Drive の状態を`recover`で確かめてから**解除します。
    ```sh
@@ -670,13 +670,14 @@ systemd の展開では、`${GEOFRAME_EXPORT_LISTEN}`のような`${…}`は値�
 3. 起動します。`sudo systemctl daemon-reload && sudo systemctl enable --now geoframe-export`、確認は`systemctl is-active geoframe-export`と`journalctl -u geoframe-export -f`です。
    待ち受けは`/healthz`（認証なし。送信元の許可は効く）で確かめます。
 
-**rclone 版から切り替えるとき**は、バイナリと unit を入れ替える前に、次を済ませます。
+**rclone 版から切り替えるとき**は、次の順に行います。**古い unit（`--rclone*`の引数）のまま新しいバイナリを動かさない**ため、サービスを止めてからバイナリを入れ替えます（`import-credentials`は、新しいバイナリがディスクにあれば、サービスが止まっていても動かせます）。
 
 1. 今のバイナリと unit を`.prev`に残す（§8.2）。
-2. `/opt/geoframe`を更新し（§5 の手順 2。更新の前の SHA を控える。unit・包み・この文書が新しくなる）、新しいバイナリを§8.2 のとおり置く。
-3. 資格情報を取り込む（§8.3）。`/etc/default/geoframe-export`に、Drive のフォルダの 3 つの ID（と検証用の 3 つ）を足す（§8.4、§8.5）。
-4. `sudo systemctl stop geoframe-export`のあと、新しい unit を置いて（§8.2 の`install -D`）、`sudo systemctl daemon-reload && sudo systemctl start geoframe-export`で起動し、journal の起動時の検査（トークン・3 つのフォルダ）が通ったことと`/healthz`を確かめます。
-5. §8.8 の確認へ進みます。**rclone 本体と`rclone.conf`（`/var/lib/geoframe-export/rclone/`）は、§8.8 の確認と切り戻しの練習が済み、しばらく様子を見るまで残します**（戻すときに前のバイナリが使います。撤去は別途）。
+2. `/opt/geoframe`を更新する（§5 の手順 2。更新の前の SHA を控える。unit・包み・この文書が新しくなる）。
+3. `sudo systemctl stop geoframe-export`で止める。
+4. 新しいバイナリと unit を置く（§8.2 の`install`）。資格情報を取り込む（§8.3）。`/etc/default/geoframe-export`に、Drive のフォルダの 3 つの ID（と検証用の 3 つ）を足す（§8.4、§8.5）。
+5. `sudo systemctl daemon-reload && sudo systemctl start geoframe-export`で起動し、journal の起動時の検査（トークン・3 つのフォルダ）が通ったことと`/healthz`を確かめます。
+6. §8.8 の確認へ進みます。**rclone 本体と`rclone.conf`（`/var/lib/geoframe-export/rclone/`）は、§8.8 の確認と切り戻しの練習が済み、しばらく様子を見るまで残します**（戻すときに前のバイナリが使います。撤去は別途）。
 
 起動の最初に、止まっていたジョブの復旧（Drive の照合）を済ませてから待ち受けます。止まったジョブがあると、再起動のあと数分は`/healthz`も答えず、接続が拒否されます
 （unit は`Type=simple`なので、systemd は待ちません）。呼び出し側は拒否されたら間隔を空けて再試行します。
@@ -757,7 +758,7 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
 5. **トークンを取り直しても、資格情報のファイルが変わらないこと**を確かめます。アクセストークンは約 1 時間で切れ、取り直しはメモリの中だけで行います（ファイルは書き換えません）。
    `sudo stat -c '%y %U %a' /etc/geoframe-export/drive-credentials.json`の更新時刻・持ち主・モードを控え、書き出しの実行中か、1 時間を空けた 2 回目の実行のあとにもう一度見て、同じであること、
    journal に認可のエラー（`drive_auth_invalid`・401）が無いことを見ます。
-6. unit の`LoadCredential=`と`ExecStart`の`--drive-credentials %d/drive-credentials`が、実際に展開されること（サービスが起動し、journal に資格情報を読めないという理由の終了が無いこと）を確かめます。
+6. unit の`LoadCredential=`と`ExecStart`の`--drive-credentials %d/drive-credentials`が、実際に展開されること（サービスが起動し、journal に資格情報を読めないという理由の終了が無いこと）を確かめます。`LoadCredential=`の写しは、所有者 root・グループ root・0440 で、サービスのユーザーには ACL で読み取りが付きます。バイナリはこの形（グループの読み取りは、グループが root のときだけ許す）を受け付けます。断られて終了コード 2 になるときは、journal の「資格情報のファイルを読めません」を見ます。
 7. unit のハードニングの値を、API 版で測り直します。値は、rclone 版を動かしていた 2026-11-22 に本番で実測して決めたもので、API 版は送信を並列 4 で行い（multipart は 1 本につき、中身と本文で最大 16MiB 弱をメモリに持ちます。4 本で 64MiB 前後）、スレッドも増えます
    （`geoframe-export.service`のコメントにも同じ値と理由を残してあります）。14 日の最多（880 枚・690MB）の書き出しで、次を測ります。
    - `RestrictAddressFamilies=AF_INET AF_INET6`で足りること（名前解決が`AF_UNIX`・`AF_NETLINK`を要しないこと。rustls・ring を使うので、`MemoryDenyWriteExecute=true`も合わせて見ます）。
