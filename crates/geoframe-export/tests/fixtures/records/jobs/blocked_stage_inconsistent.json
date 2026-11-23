@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "job_id": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+  "status": "blocked",
+  "request": {
+    "from": "2030-03-10",
+    "to": "2030-03-10",
+    "destination": "yamareco",
+    "on_exists": "error",
+    "request_id": null
+  },
+  "started_at": "2030-03-10T12:00:00+09:00",
+  "started_ns": 1899342000000000000,
+  "finished_at": "2030-03-10T12:00:30+09:00",
+  "progress": {
+    "stage": "publishing",
+    "old_id": null,
+    "incoming_id": "fid-gone"
+  },
+  "summary": null,
+  "result": null,
+  "error": {
+    "code": "blocked"
+  },
+  "blocked": {
+    "reason": "stage_inconsistent",
+    "description": "止めた理由: stage_inconsistent（記録した段階と Drive の状態が食い違っています）。最後に記録した段階: publishing。 見えていた状態: 宛先（gdrive:yamareco/2030-03-10）の ID=なし、incoming（gdrive:geoframe-export-work/incoming/a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5）の ID=なし、replaced（gdrive:geoframe-export-work/replaced/yamareco-2030-03-10-a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5）の ID=なし。"
+  },
+  "resolved_at": null,
+  "notes": []
+}

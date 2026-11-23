@@ -2,7 +2,7 @@
 //!
 //! 親（`run`・`serve`）が signal で終わると、別のプロセスグループに入れた rclone だけが残り、実行枠（flock）だけが外れて、次の
 //! ジョブの復旧が、進行中の `copy`・`moveto` と競合しうる。それを避けるため、signal は**その場で終わらず、印を立てるだけ**にし、
-//! 実行中の子（rclone）のプロセスグループを止めて `wait` し終えるまで実行枠を持ってから終える（[`crate::rclone::Rclone`]）。
+//! 実行中の子（rclone）のプロセスグループを止めて `wait` し終えるまで実行枠を持ってから終える（[`crate::remote::Remote`]（今の中身は [`crate::rclone::Rclone`]））。
 //!
 //! - [`Cancel`] は同期の印（`Arc<AtomicBool>`。`Clone` で共有）。[`Cancel::cancel`] で立てる。立った印は下ろさない。
 //! - [`install_signal_handlers`] は、SIGINT・SIGTERM の handler を入れる（印を立てるだけ。async-signal-safe）。
@@ -17,7 +17,7 @@
 //! `running` のまま）次の復旧に渡す（[`crate::flow`]）。
 //!
 //! - [`crate::rclone::Rclone`]: 起動の前と、待ちのループの中（20ms ごと）。起動していれば、グループごと kill して `wait` し、
-//!   出力を読むスレッドを `join` してから [`crate::rclone::RunError::Cancelled`] を返す。
+//!   出力を読むスレッドを `join` してから [`crate::remote::RemoteError::Cancelled`] を返す。
 //! - [`crate::publish::Recovery::settle_observe`]: 待ちの代わりに印を見る（30 秒 × 回数を眠らない）。
 //! - [`crate::image::prepare_cancellable`]: 1 枚ごと。
 

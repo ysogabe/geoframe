@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "entry": {
+    "destination": "yamareco",
+    "folder": "2030-03-10",
+    "folder_id": "fid0020",
+    "job_id": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "files": [
+      {
+        "path": "090000_1.jpg",
+        "md5": "0123456789abcdef0123456789abcdef"
+      },
+      {
+        "path": "manifest.json",
+        "md5": "fedcba9876543210fedcba9876543210"
+      }
+    ],
+    "previous": {
+      "folder_id": "fid0007",
+      "files": [
+        {
+          "path": "090000_9.jpg",
+          "md5": "00112233445566778899aabbccddeeff"
+        },
+        {
+          "path": "manifest.json",
+          "md5": "ffeeddccbbaa99887766554433221100"
+        }
+      ]
+    }
+  }
+}

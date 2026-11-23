@@ -598,7 +598,8 @@ impl Drive {
 /// 呼び出しごとの挙動の差し替え。試験が作り、偽の rclone が読む（`ctl.json`）。
 #[derive(Clone, Debug)]
 pub struct Rule {
-    pub cmd: String,
+    /// 中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）。
+    pub op: String,
     /// 引数のどこかにこの文字列があるときだけ（`None` は常に）。
     pub contains: Option<String>,
     /// 一致した呼び出しのうち、最初の `skip` 回は通常どおりにする。
@@ -623,7 +624,7 @@ impl Ctl {
             .rules
             .iter()
             .map(|r| {
-                json!({"cmd": r.cmd, "contains": r.contains, "skip": r.skip, "times": r.times,
+                json!({"op": r.op, "contains": r.contains, "skip": r.skip, "times": r.times,
                        "seen": r.seen, "effect": r.effect})
             })
             .collect();
@@ -639,7 +640,7 @@ impl Ctl {
             .map(|a| {
                 a.iter()
                     .map(|r| Rule {
-                        cmd: r["cmd"].as_str().unwrap_or_default().to_owned(),
+                        op: r["op"].as_str().unwrap_or_default().to_owned(),
                         contains: r["contains"].as_str().map(str::to_owned),
                         skip: r["skip"].as_u64().unwrap_or(0),
                         times: r["times"].as_u64().unwrap_or(1),

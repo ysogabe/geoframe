@@ -484,14 +484,14 @@ fn while_a_job_runs_a_second_request_and_a_dry_run_get_409_and_the_same_request_
     let mut env = Env::new("http-busy");
     let site = photo_site(DAY, DAY, three());
     // 写真を送る copy を 30 秒止める（ジョブが実行中のまま）
-    env.add_rule("copy", 0, 1, sleep_ms(30_000));
+    env.add_rule("upload", 0, 1, sleep_ms(30_000));
     let server = Server::start(&mut env, &site, TOKEN);
     let addr = server.addr;
 
     let first = post_retry(addr, TOKEN, &day_body(json!({"request_id": "rid-busy"})));
     assert_eq!(first.status, 202, "{}", first.body);
     let job_id = first.json()["job_id"].as_str().unwrap().to_owned();
-    let copy_pid = wait_for_call(&env, "copy", 30);
+    let copy_pid = wait_for_call(&env, "upload", 30);
     assert!(process_exists(copy_pid));
 
     // GET: 実行中
@@ -710,10 +710,10 @@ fn a_dry_run_returns_200_and_only_reads_the_drive() {
     assert_eq!(v["target"], "absent");
     assert_eq!(v["derivative_pending"], 0);
     // Drive には何も書かない: 呼ばれたのは lsjson（と管理の確認の cat）だけ。記録も作らない
-    let used = env.commands_used();
+    let used = env.ops_used();
     assert!(!used.is_empty(), "Drive に照会していない");
     assert!(
-        used.iter().all(|c| c == "lsjson" || c == "cat"),
+        used.iter().all(|c| c == "list" || c == "read"),
         "書く操作が呼ばれた: {used:?}"
     );
     assert_eq!(job_files(&env), 0);
@@ -1107,7 +1107,7 @@ fn stopping_returns_only_after_the_child_is_reaped_even_with_no_time_left_for_co
     const TOKEN: &str = "STOP-Tk-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
     let mut env = Env::new("http-stop-reap");
     let site = photo_site(DAY, DAY, three());
-    env.add_rule("copy", 0, 1, sleep_ms(30_000));
+    env.add_rule("upload", 0, 1, sleep_ms(30_000));
     let limits = Limits {
         shutdown_wait: Duration::ZERO,
         ..Limits::default()
@@ -1121,7 +1121,7 @@ fn stopping_returns_only_after_the_child_is_reaped_even_with_no_time_left_for_co
     );
     let r = post_retry(server.addr, TOKEN, &day_body(json!({})));
     assert_eq!(r.status, 202, "{}", r.body);
-    let copy_pid = wait_for_call(&env, "copy", 30);
+    let copy_pid = wait_for_call(&env, "upload", 30);
     assert!(process_exists(copy_pid));
 
     let started = Instant::now();

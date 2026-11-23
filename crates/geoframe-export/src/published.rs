@@ -39,7 +39,7 @@ use crate::error::{ErrorCode, ExportError};
 use crate::folder::FolderName;
 use crate::jobid::JobId;
 use crate::jsonfile::{self, ReadError};
-use crate::rclone::{is_valid_drive_id, normalize_md5, rel_path_ok};
+use crate::remote::{is_valid_drive_id, normalize_md5, rel_path_ok};
 use crate::request::Destination;
 
 /// 1 ファイルの上限（読む上限であり、書く上限でもある）。写真 2,000 枚と manifest の MD5・パス（1 件が整形して 150 バイト前後）に、

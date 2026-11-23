@@ -1,3 +1,4 @@
+//! 【rclone 固有。rclone 版を消すときに、このファイルごと消す】
 //! T4: rclone の起動（design.md 4.2「rclone の呼び方」、8 章「子プロセス」）。子プロセスのパイプ・期限・kill・終了コード・
 //! 標準エラーの伏せ字。短いシェルスクリプトを「rclone」として使う（本物の rclone・Drive には触れない）。
 
@@ -11,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use common::TempDir;
 use common::drive::*;
-use geoframe_export::rclone::{Rclone, RemoteLoc, RunError};
+use geoframe_export::rclone::Rclone;
+use geoframe_export::remote::{RemoteError, RemoteLoc};
 use geoframe_export::request::Destination;
 use geoframe_export::settings::{RawSettings, RemotePath, Settings};
 use serde_json::json;
@@ -65,11 +67,11 @@ fn sh(name: &str, body: &str, copy: Duration, other: Duration) -> Sh {
 }
 
 /// 書いたばかりの実行ファイルを、別のスレッドの fork と重なって実行すると ETXTBSY になることがある。起動できなかったら数回やり直す。
-fn retry<T>(mut f: impl FnMut() -> Result<T, RunError>) -> Result<T, RunError> {
-    let mut last = Err(RunError::Spawn);
+fn retry<T>(mut f: impl FnMut() -> Result<T, RemoteError>) -> Result<T, RemoteError> {
+    let mut last = Err(RemoteError::Spawn);
     for _ in 0..5 {
         last = f();
-        if !matches!(last, Err(RunError::Spawn)) {
+        if !matches!(last, Err(RemoteError::Spawn)) {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -105,7 +107,7 @@ fn stdout_over_the_cap_is_a_failure_and_the_rest_is_discarded() {
     // 読む量の上限は max+1。超えて出力する子は、読み捨てて失敗にする
     assert_eq!(
         retry(|| s.rclone.cat(&loc(), 100)),
-        Err(RunError::BadOutput)
+        Err(RemoteError::BadOutput)
     );
 }
 
@@ -119,7 +121,10 @@ fn the_command_timeout_kills_the_child_and_its_descendants() {
         Duration::from_millis(400),
     );
     let started = Instant::now();
-    assert_eq!(retry(|| s.rclone.cat(&loc(), 10)), Err(RunError::Timeout));
+    assert_eq!(
+        retry(|| s.rclone.cat(&loc(), 10)),
+        Err(RemoteError::Timeout)
+    );
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "{:?}",
@@ -135,9 +140,9 @@ fn copy_uses_the_copy_timeout_and_everything_else_the_other_one() {
         retry(|| s.rclone.copy(
             Path::new("/tmp"),
             &loc(),
-            geoframe_export::rclone::CopyScope::PhotosOnly
+            geoframe_export::remote::CopyScope::PhotosOnly
         )),
-        Err(RunError::Timeout)
+        Err(RemoteError::Timeout)
     );
     assert!(started.elapsed() < Duration::from_secs(8));
     // copy 以外（cat）は 20 秒の期限なので、すぐ終わる子は成功する
@@ -152,7 +157,7 @@ fn the_job_deadline_stops_a_running_child_and_blocks_new_ones() {
         .rclone
         .with_deadline(Some(Instant::now() + Duration::from_millis(400)));
     let started = Instant::now();
-    assert_eq!(retry(|| r.cat(&loc(), 10)), Err(RunError::JobDeadline));
+    assert_eq!(retry(|| r.cat(&loc(), 10)), Err(RemoteError::JobDeadline));
     assert!(started.elapsed() < Duration::from_secs(8));
     // 過ぎたあとは、起動しない
     let dir = TempDir::new("deadline2");
@@ -162,7 +167,7 @@ fn the_job_deadline_stops_a_running_child_and_blocks_new_ones() {
     let script = write_script(dir.path(), &format!("touch '{}'", marker.display()));
     let r = Rclone::new(&settings_for(&script, &state))
         .with_deadline(Some(Instant::now() - Duration::from_millis(1)));
-    assert_eq!(r.cat(&loc(), 10), Err(RunError::JobDeadline));
+    assert_eq!(r.cat(&loc(), 10), Err(RemoteError::JobDeadline));
     assert!(!marker.exists(), "期限を過ぎたあとは起動しない");
 }
 
@@ -209,7 +214,7 @@ fn a_cancel_stops_the_child_and_its_descendants_and_waits_for_them() {
     assert!(!pid_gone(child) && !pid_gone(grand));
     let started = Instant::now();
     cancel.cancel();
-    assert_eq!(worker.join().unwrap(), Err(RunError::Cancelled));
+    assert_eq!(worker.join().unwrap(), Err(RemoteError::Cancelled));
     assert!(
         started.elapsed() < Duration::from_secs(8),
         "{:?}",
@@ -292,7 +297,7 @@ fn a_failing_child_that_exits_first_also_stops_its_descendants() {
         &format!("sleep 30 &\necho $! > '{}'\nexit 3", grand_file.display()),
     );
     let rclone = Rclone::new(&settings_for(&script, &state)).with_timeouts(SECS, SECS);
-    assert_eq!(retry(|| rclone.cat(&loc(), 10)), Err(RunError::NotFound));
+    assert_eq!(retry(|| rclone.cat(&loc(), 10)), Err(RemoteError::NotFound));
     let grand = read_pid(&grand_file).expect("子孫の PID");
     assert!(wait_gone(grand), "子孫が残っている");
 }
@@ -307,10 +312,10 @@ fn a_cancel_that_is_already_set_never_starts_the_child() {
     let cancel = geoframe_export::cancel::Cancel::new();
     cancel.cancel();
     let r = Rclone::new(&settings_for(&script, &state)).with_cancel(cancel);
-    assert_eq!(r.cat(&loc(), 10), Err(RunError::Cancelled));
+    assert_eq!(r.cat(&loc(), 10), Err(RemoteError::Cancelled));
     assert_eq!(
         r.lsjson(&loc(), false, true, false).unwrap_err(),
-        RunError::Cancelled
+        RemoteError::Cancelled
     );
     assert!(r.is_cancelled());
     assert!(!marker.exists(), "印が立っていれば起動しない");
@@ -319,13 +324,19 @@ fn a_cancel_that_is_already_set_never_starts_the_child() {
 #[test]
 fn exit_codes_are_distinguished_and_stdin_is_closed() {
     let nf = sh("exit3", "exit 3", SECS, SECS);
-    assert_eq!(retry(|| nf.rclone.cat(&loc(), 10)), Err(RunError::NotFound));
+    assert_eq!(
+        retry(|| nf.rclone.cat(&loc(), 10)),
+        Err(RemoteError::NotFound)
+    );
     let e7 = sh("exit7", "echo secret-looking-token >&2\nexit 7", SECS, SECS);
-    assert_eq!(retry(|| e7.rclone.cat(&loc(), 10)), Err(RunError::Exit(7)));
+    assert_eq!(
+        retry(|| e7.rclone.cat(&loc(), 10)),
+        Err(RemoteError::Exit(7))
+    );
     let sig = sh("signal", "kill -9 $$", SECS, SECS);
     assert_eq!(
         retry(|| sig.rclone.cat(&loc(), 10)),
-        Err(RunError::Exit(-1))
+        Err(RemoteError::Exit(-1))
     );
     // 標準入力は閉じてある（読もうとしてもすぐ終わる）
     let stdin = sh("stdin", "cat\necho done", SECS, SECS);
@@ -335,7 +346,7 @@ fn exit_codes_are_distinguished_and_stdin_is_closed() {
     let state = dir.path().join("state");
     std::fs::create_dir_all(&state).unwrap();
     let r = Rclone::new(&settings_for(&dir.path().join("missing"), &state));
-    assert_eq!(r.cat(&loc(), 10), Err(RunError::Spawn));
+    assert_eq!(r.cat(&loc(), 10), Err(RemoteError::Spawn));
 }
 
 #[test]
@@ -408,14 +419,14 @@ fn stderr_lines_never_reach_the_log_or_the_error() {
         secret_lines.join("\n")
     );
     env.add_rule(
-        "lsjson",
+        "list",
         0,
         1,
         json!({"kind": "fail", "code": 1, "stderr": stderr}),
     );
     capture_logs();
     let layout = env.layout(Destination::Yamareco, FOLDER, JOB_A);
-    let err = geoframe_export::drive::Drive::new(&env.rclone(), &layout)
+    let err = geoframe_export::drive::Drive::new(&env.remote(), &layout)
         .target()
         .unwrap_err();
     let shown = format!("{err} {err:?}");
@@ -449,14 +460,14 @@ fn a_very_long_stderr_line_never_reaches_the_log() {
     let body = "LONGSECRETBODY".repeat(20_000); // 約 280KB の 1 行
     let stderr = format!("Authorization: Bearer {body}\nlong-case tail marker line");
     env.add_rule(
-        "lsjson",
+        "list",
         0,
         1,
         json!({"kind": "fail", "code": 1, "stderr": stderr}),
     );
     capture_logs();
     let layout = env.layout(Destination::Yamareco, FOLDER, JOB_A);
-    let _ = geoframe_export::drive::Drive::new(&env.rclone(), &layout)
+    let _ = geoframe_export::drive::Drive::new(&env.remote(), &layout)
         .target()
         .unwrap_err();
     let all = LOGS.lock().unwrap().clone();

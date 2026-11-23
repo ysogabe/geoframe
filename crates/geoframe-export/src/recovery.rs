@@ -38,7 +38,7 @@
 use std::fmt;
 
 use crate::published::RecordedFile;
-use crate::rclone::LsEntry;
+use crate::remote::Entry;
 
 /// 公開の手順の段階（ジョブの記録に書く名前）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -119,7 +119,7 @@ pub struct Seen {
 impl Seen {
     /// 解決されたショートカットは、リンク先ではなく**ショートカット自身**の ID（`recover` の表示で、オーナーが画面で
     /// 見つけられるのはこちら）。
-    pub fn of(e: &LsEntry) -> Self {
+    pub fn of(e: &Entry) -> Self {
         Self {
             id: e.shortcut_id.clone().unwrap_or_else(|| e.id.clone()),
             kind: if e.is_shortcut() {

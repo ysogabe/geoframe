@@ -1,6 +1,8 @@
 //! T5: ジョブの流れ（design.md 4.1）、実行枠、ジョブの記録、`request_id`、`dry_run`、止まったジョブの復旧、`blocked`。
 //! 偽の写真サービス（127.0.0.1）と偽の rclone・偽の Drive だけを使う（本物の写真サービス・rclone・Drive には触れない）。
 //! 受け持つ受け入れ条件: AC5・AC5b・AC8・AC9（記録の側）・AC10（dry_run）・「一部の失敗」。
+//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る。`// rclone 固有` と
+//! 書いた確認（`assert_rclone_safe_calls`）だけが rclone の引数・環境変数を見る（rclone 版を消すときに消す）。
 
 mod common;
 
@@ -125,7 +127,8 @@ fn a_single_day_job_publishes_records_and_cleans_up() {
         "記録した incoming の ID が、公開されたフォルダの ID"
     );
     assert!(rec.summary.is_some());
-    assert_safe_calls(&env);
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+    assert_rclone_safe_calls(&env);
 }
 
 #[test]
@@ -254,7 +257,7 @@ fn when_everything_is_excluded_nothing_to_export_never_queries_drive() {
                 let set = env.make_set("old", Y, DAY, &[("090000_9.jpg", 50)]);
                 env.seed_folder(Y, DAY, &set);
             }
-            "lsjson fails" => env.add_rule("lsjson", 0, 99, fail(1)),
+            "lsjson fails" => env.add_rule("list", 0, 99, fail(1)),
             _ => {}
         }
         let photos = vec![
@@ -308,7 +311,7 @@ fn an_existing_destination_ends_in_conflict_unless_replace_targets_a_managed_fol
     assert_eq!(v["result"]["catalog_count"], 3);
     assert_eq!(v["result"]["existing_files"], 2, "写真 1 枚と manifest");
     assert_eq!(v["error"], Value::Null);
-    assert_eq!(env.commands_used(), ["lsjson"], "{:?}", env.commands_used());
+    assert_eq!(env.ops_used(), ["list"], "{:?}", env.ops_used());
     assert_eq!(
         env.drive().resolve(&["yamareco", DAY]),
         Some(old_id.clone())
@@ -322,8 +325,8 @@ fn an_existing_destination_ends_in_conflict_unless_replace_targets_a_managed_fol
     let v = submit_and_wait(&svc2, &request(DAY, None, Some("replace"), None));
     assert_eq!(v["status"], "conflict", "{v}");
     assert_eq!(v["result"]["conflict"], "not_managed");
-    assert!(!env2.commands_used().contains(&"moveto".to_owned()));
-    assert!(!env2.commands_used().contains(&"purge".to_owned()));
+    assert!(!env2.ops_used().contains(&"move".to_owned()));
+    assert!(!env2.ops_used().contains(&"trash".to_owned()));
 
     // 管理しているフォルダの replace は成功し、旧フォルダはゴミ箱へ。公開の記録は新しい ID になる
     let v = submit_and_wait(&svc, &request(DAY, None, Some("replace"), None));
@@ -397,7 +400,7 @@ fn a_second_job_while_one_is_running_is_refused_and_the_first_still_finishes() {
     let site = photo_site(DAY, DAY, three_photos());
     let svc = service(&mut env, &site);
     // 写真を送る copy を 1 秒止める（実行中を作る）
-    env.add_rule("copy", 0, 1, sleep_ms(1000));
+    env.add_rule("upload", 0, 1, sleep_ms(1000));
     let first = svc.submit(&day()).unwrap();
     // 2 件目（別の要求）は断る。dry_run も
     assert_eq!(
@@ -417,7 +420,7 @@ fn a_repeated_request_id_returns_the_same_job_even_while_it_runs() {
     let mut env = Env::new("flow-rid");
     let site = photo_site(DAY, DAY, three_photos());
     let svc = service(&mut env, &site);
-    env.add_rule("copy", 0, 1, sleep_ms(800));
+    env.add_rule("upload", 0, 1, sleep_ms(800));
     let req = request(DAY, None, None, Some("req-1"));
     let first = svc.submit(&req).unwrap();
     // 実行中（実行枠は取れない）でも、同じ request_id は同じジョブを返す（Busy にならない）
@@ -570,8 +573,8 @@ fn dry_run_reports_the_destination_and_only_queries_drive() {
 
     // 呼んだ rclone は lsjson と cat だけ。実行枠は外れている。ジョブの記録は作らない
     for e in [&env, &env2] {
-        for c in e.commands_used() {
-            assert!(c == "lsjson" || c == "cat", "{c}");
+        for c in e.ops_used() {
+            assert!(c == "list" || c == "read", "{c}");
         }
     }
     assert_eq!(job_files(&env), 0);
@@ -643,7 +646,7 @@ fn the_job_deadline_kills_rclone_and_fails_with_timeout() {
     )
     .unwrap();
     // 写真を送る copy が、期限より長くかかる
-    env.add_rule("copy", 0, 1, sleep_ms(20_000));
+    env.add_rule("upload", 0, 1, sleep_ms(20_000));
     let started = std::time::Instant::now();
     let v = submit_and_wait(&svc, &day());
     assert!(started.elapsed() < Duration::from_secs(15), "期限で止まる");
@@ -927,7 +930,7 @@ fn a_stuck_job_is_recovered_before_the_next_job_and_a_new_block_fails_that_job()
         Status::Running,
         "blocked のあとは進まない"
     );
-    assert!(env.calls().iter().all(|c| c["cmd"] != "copy"));
+    assert!(env.calls().iter().all(|c| c["op"] != "upload"));
 }
 
 #[test]
@@ -1050,7 +1053,7 @@ fn a_null_or_malformed_digests_in_the_job_record_blocks_instead_of_skipping_the_
         assert_eq!(std::fs::read(&path).unwrap(), record_before, "{name}");
         assert!(!env.state.join("published").exists(), "{name}");
         assert_eq!(env.drive().to_json(), drive_before, "{name}");
-        assert_eq!(env.mutations(), Vec::<String>::new(), "{name}");
+        assert_eq!(env.mutating_ops(), Vec::<String>::new(), "{name}");
         assert_eq!(svc.lookup(&format!("{:032x}", 31)), Lookup::Unreadable);
     }
 
@@ -1445,12 +1448,12 @@ fn a_cancel_stops_the_running_rclone_before_returning_and_hands_the_record_to_re
     let cancel = Cancel::new();
     let svc = cancellable_service(&mut env, &site, &cancel);
     // 写真を送る copy を、20 秒止める（止めなければ、そのまま待つ）
-    env.add_rule("copy", 0, 1, sleep_ms(20_000));
+    env.add_rule("upload", 0, 1, sleep_ms(20_000));
     let worker = {
         let svc = svc.clone();
         std::thread::spawn(move || run_foreground_retry(&svc, &day()))
     };
-    let copy_pid = wait_for_call(&env, "copy", 20);
+    let copy_pid = wait_for_call(&env, "upload", 20);
     assert!(process_exists(copy_pid));
     let t = std::time::Instant::now();
     cancel.cancel();
@@ -1497,7 +1500,8 @@ fn a_cancel_stops_the_running_rclone_before_returning_and_hands_the_record_to_re
     assert!(env.drive().trashed.contains(&incoming));
     let v = submit_and_wait(&next, &day());
     assert_eq!(v["status"], "succeeded", "{v}");
-    assert_safe_calls(&env);
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+    assert_rclone_safe_calls(&env);
 }
 
 /// 別のジョブの復旧の最中の印: 復旧の `rclone` を止め、その別のジョブを `blocked` にしない（`Unobservable` を確定しない）。
@@ -1592,12 +1596,12 @@ fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
         }),
     );
     // ゴミ箱への移動（purge）を止めておく
-    env.add_rule("purge", 0, 1, sleep_ms(30_000));
+    env.add_rule("trash", 0, 1, sleep_ms(30_000));
     let worker = {
         let svc = svc.clone();
         std::thread::spawn(move || startup_recovery_retry(&svc))
     };
-    let purge_pid = wait_for_call(&env, "purge", 20);
+    let purge_pid = wait_for_call(&env, "trash", 20);
     cancel.cancel();
     let report = worker.join().unwrap();
     assert!(!process_exists(purge_pid), "子が残っています");
@@ -1651,7 +1655,7 @@ fn wait_idle_returns_when_the_job_thread_has_released_the_slot() {
     let site = photo_site(DAY, DAY, three_photos());
     let svc = service(&mut env, &site);
     assert!(svc.wait_idle(Duration::from_millis(10)), "何も動いていない");
-    env.add_rule("copy", 0, 1, sleep_ms(600));
+    env.add_rule("upload", 0, 1, sleep_ms(600));
     let s = submit_retry(&svc, &day()).unwrap();
     assert!(!svc.wait_idle(Duration::from_millis(50)), "まだ動いている");
     assert!(svc.wait_idle(Duration::from_secs(30)));
@@ -1800,10 +1804,10 @@ fn a_panic_with_an_unreadable_record_touches_neither_drive_nor_the_record() {
         "壊れた記録を上書きしない"
     );
     // 段階を記録した直後（写真を送る前）のパニック。復旧の表を当てていれば、incoming のゴミ箱への移動（purge）などが走る
-    let seq = env.sequence();
+    let seq = env.ops();
     assert!(
         !seq.iter()
-            .any(|c| c == "purge" || c == "moveto" || c == "copy"),
+            .any(|c| c == "trash" || c == "move" || c == "upload"),
         "パニックの後に Drive を操作しない: {seq:?}"
     );
     assert!(slot_is_free(&env.state));
@@ -1899,7 +1903,7 @@ fn a_request_id_registered_meanwhile_is_returned_instead_of_busy() {
     let site = photo_site(DAY, DAY, three_photos());
     let a = service(&mut env, &site);
     let b = second_service(&env);
-    env.add_rule("copy", 0, 1, sleep_ms(800));
+    env.add_rule("upload", 0, 1, sleep_ms(800));
     let req = request(DAY, None, None, Some("req-y"));
     let other: std::cell::RefCell<Option<geoframe_export::service::Submitted>> = Default::default();
     let found = a
@@ -1944,7 +1948,7 @@ fn a_request_id_registered_meanwhile_with_other_content_is_a_mismatch() {
     let mut env2 = Env::new("flow-rid-mismatch2");
     let a2 = service(&mut env2, &site);
     let b2 = second_service(&env2);
-    env2.add_rule("copy", 0, 1, sleep_ms(800));
+    env2.add_rule("upload", 0, 1, sleep_ms(800));
     let other: std::cell::RefCell<Option<JobId>> = Default::default();
     let e = a2
         .submit_with_hook(&mine, &|| {

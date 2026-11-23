@@ -1,4 +1,7 @@
-//! rclone の起動（design.md 4.2「rclone の呼び方」、8 章「子プロセス」）。
+//! rclone の起動（design.md 4.2「rclone の呼び方」、8 章「子プロセス」）。**rclone 固有のものだけ**を持つ（引数の組み立て・
+//! 子プロセス・標準エラーの伏せ字・`lsjson` の出力の読み取り）。呼び出し側は、このモジュールの [`Rclone`] を直接使わず、
+//! 中立の入口 [`crate::remote::Remote`]（今の中身は [`Rclone`]）を使う。一覧の 1 項目・検査済みの場所・操作の失敗の型は
+//! [`crate::remote`]（実装に依らない）。
 //!
 //! このモジュールは、rclone を**1 回起動して結果を受け取る**ところだけを持つ。何を・どの順で呼ぶか（宛先の状態、公開、
 //! 復旧）は [`crate::drive`]・[`crate::publish`]。
@@ -11,10 +14,10 @@
 //! - `--drive-client-id`・`--drive-client-secret`・`--drive-token` など、**資格情報を上書きする引数は渡さない**
 //!   （専用の client_id の検査［`crate::rclone_conf`］をすり抜けないため）。引数はこのモジュールの関数が固定の部品から組み立て、
 //!   起動の直前に [`is_forbidden_flag`] でもう一度確かめる。`-vv`・`--dump*` も同じ検査で断る。
-//! - シェルを介さず、引数の配列で渡す。位置の引数の前に `--` を置く。Drive の場所は [`RemoteLoc`]（検査済みの部品だけで作る）。
+//! - シェルを介さず、引数の配列で渡す。位置の引数の前に `--` を置く。Drive の場所は [`RemoteLoc`]（[`crate::remote`]。検査済みの部品だけで作る）。
 //! - 標準入力は閉じる。子プロセスは自分のプロセスグループに入れ、期限を過ぎたらグループごと kill する。
 //! - キャンセルの印（[`crate::cancel::Cancel`]。SIGINT・SIGTERM）が立ったら、起動の前なら起動せず、実行中なら期限切れと同じく
-//!   グループごと kill して `wait` し、出力のスレッドを `join` してから [`RunError::Cancelled`] を返す。呼び出し側は、この
+//!   グループごと kill して `wait` し、出力のスレッドを `join` してから [`RemoteError::Cancelled`]（[`crate::remote`]）を返す。呼び出し側は、この
 //!   関数が返ってから実行枠を手放す（子が残ったまま枠だけ外れて、次の復旧が進行中の `copy`・`moveto` と競合しないため）。
 //!   パニックで巻き戻るときも、`Drop` で同じ kill と `wait` をする（[`ChildGuard`]）。
 //! - 親が異常終了したとき（SIGKILL・OOM など、印を見られない終わり方）の補助として、子に `PR_SET_PDEATHSIG`（SIGKILL）を付ける。
@@ -23,7 +26,7 @@
 //!   外れるのとのあいだに隙がある。排他は、印を見て kill → `wait` → 枠を手放す、の順で守る。
 //! - 標準出力・標準エラーは別のスレッドで読み続ける（パイプが詰まって止まらないように）。標準出力には上限を掛ける。
 //! - 標準エラーは、`token`・`Bearer`・`access_token` などを含む行を伏せ字にしてから、最後の数行だけをログ（tracing）に残す
-//!   （[`redact_stderr`]）。API の結果・エラーの説明には rclone の出力を載せない（[`ExportError`] の説明は固定の文字列）。
+//!   （[`redact_stderr`]）。API の結果・エラーの説明には rclone の出力を載せない（[`crate::error::ExportError`] の説明は固定の文字列）。
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -38,8 +41,11 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::cancel::Cancel;
-use crate::error::{ErrorCode, ExportError};
-use crate::settings::{RemotePath, Settings};
+use crate::remote::{
+    CopyScope, DIRECTORY_MIME, DRY_RUN_TIMEOUT, Entry, RemoteError, RemoteLoc, is_valid_drive_id,
+    normalize_md5, rel_path_ok,
+};
+use crate::settings::Settings;
 
 /// 子プロセスの `PATH`（固定。rclone は他のコマンドを呼ばない）。
 pub const PATH_VALUE: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -55,98 +61,10 @@ const STDERR_LINE_CAP_BYTES: usize = 64 * 1024;
 pub const STDERR_LOG_LINES: usize = 5;
 const STDERR_LINE_MAX_CHARS: usize = 300;
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-/// Drive のショートカットの MIME タイプ。
-pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
-/// リンク先が無くなったショートカットに、rclone が付ける MIME タイプ（rclone の drive の `shortcutMimeTypeDangling`。
-/// ふつうのファイルのように一覧に出る。ID はショートカット自身の ID）。
-pub const SHORTCUT_DANGLING_MIME: &str = "application/vnd.google-apps.shortcut.dangling";
-/// rclone の `lsjson` がフォルダに付ける MIME タイプ。
-pub const DIRECTORY_MIME: &str = "inode/directory";
 /// rclone の終了コード 3（ディレクトリが無い）。
 const EXIT_DIR_NOT_FOUND: i32 = 3;
 
-// ---- Drive 上の場所 ----
-
-/// `remote:パス` の形の、検査済みの場所。固定の接頭辞（[`RemotePath`]）に、検査済みの部品を足してだけ作る。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemoteLoc(String);
-
-/// パスの部品として許す文字（`[A-Za-z0-9_.-]`、先頭は英数字、128 文字まで）。
-fn component_ok(c: &str) -> bool {
-    !c.is_empty()
-        && c.len() <= 128
-        && c.as_bytes()[0].is_ascii_alphanumeric()
-        && c.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
-        && !c.contains("..")
-}
-
-impl RemoteLoc {
-    /// 検査済みの接頭辞・作業用のフォルダそのもの。
-    pub fn of(base: &RemotePath) -> Self {
-        Self(base.to_string())
-    }
-
-    /// 部品を 1 つ足す。空・`/` や `..` を含む・先頭が英数字でないものは作れない。
-    pub fn child(&self, component: &str) -> Option<Self> {
-        component_ok(component).then(|| Self(format!("{}/{component}", self.0)))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 // ---- lsjson の出力 ----
-
-/// `rclone lsjson` の 1 項目（rclone v1.76.0 の出力の形。配置のときに本物で確かめる）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LsEntry {
-    /// 一覧の起点からの相対パス（`/` 区切り）。
-    pub path: String,
-    pub name: String,
-    /// バイト数（フォルダは -1）。
-    pub size: i64,
-    pub mime: String,
-    pub is_dir: bool,
-    /// Drive の ID。解決されたショートカットでは、**リンク先**の ID（rclone の複合 ID の前半）。
-    pub id: String,
-    /// 解決されたショートカットの、ショートカット自身の ID（rclone は解決した項目の ID を、リンク先の ID とショートカットの ID を
-    /// タブで結んだ複合 ID にする。後半）。通常の項目では `None`。
-    pub shortcut_id: Option<String>,
-    /// `lsjson --hash --hash-type MD5` の `Hashes.md5`（小文字の 16 進 32 文字）。フォルダ・MD5 を持たないファイル
-    /// （Google のネイティブ文書など）・`--hash` なしの一覧・形が違う値では `None`。
-    pub md5: Option<String>,
-}
-
-impl LsEntry {
-    /// ショートカットか: MIME タイプがショートカット（リンク切れを含む）、または複合 ID（解決されたショートカット）。
-    pub fn is_shortcut(&self) -> bool {
-        self.shortcut_id.is_some()
-            || self.mime == SHORTCUT_MIME
-            || self.mime == SHORTCUT_DANGLING_MIME
-    }
-}
-
-/// Drive の ID の形（`[A-Za-z0-9_-]`、1〜128 文字）。空の ID は決して受け付けない（空どうしが「一致」しないように）。
-pub fn is_valid_drive_id(s: &str) -> bool {
-    (1..=128).contains(&s.len())
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-}
-
-/// MD5 の文字列（16 進 32 文字。大文字でも受け、小文字にそろえる）。違えば `None`。
-pub fn normalize_md5(s: &str) -> Option<String> {
-    (s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())).then(|| s.to_ascii_lowercase())
-}
-
-/// 一覧・記録の相対パス（`/` 区切り。空の部品・`.`・`..`・制御文字を含まない。1024 バイト以下）。
-pub fn rel_path_ok(p: &str) -> bool {
-    !p.is_empty()
-        && p.len() <= 1024
-        && p.split('/')
-            .all(|c| !c.is_empty() && c != "." && c != ".." && !c.chars().any(char::is_control))
-}
 
 /// rclone の複合 ID（リンク先の ID とショートカットの ID をタブで結んだもの。drive.go の `joinID`）を分ける。
 /// どちらの部分も [`is_valid_drive_id`] に合わなければ `None`。タブを含まなければ、そのまま通常の ID。
@@ -167,7 +85,7 @@ fn split_composite_id(id: &str) -> Option<(String, Option<String>)> {
 /// キーは小文字の `md5`、MD5 を持たないファイルでは空・省略）が付く。形が違う `Hashes` は MD5 なし（`None`）として読む
 /// （一覧全体は断らない。MD5 を期待する照合が一式に無いファイルとして断る）。`ModTime` は読まない。サイズ不明（負）のファイルは受け付け、中身の照合（[`crate::drive::Expected::matches`]）が
 /// 「一式に無いファイル」として扱う。
-pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
+pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<Entry>> {
     let value: Value = serde_json::from_slice(bytes).ok()?;
     let items = value.as_array()?;
     if items.len() > LSJSON_MAX_ENTRIES {
@@ -195,7 +113,7 @@ pub fn parse_lsjson(bytes: &[u8]) -> Option<Vec<LsEntry>> {
         {
             return None;
         }
-        out.push(LsEntry {
+        out.push(Entry {
             path: path.to_owned(),
             name: name.to_owned(),
             size,
@@ -317,48 +235,6 @@ pub fn redact_stderr(raw: &[u8], max_lines: usize) -> String {
 
 // ---- 子プロセスの結果 ----
 
-/// 1 回の起動の失敗。rclone の出力は含めない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RunError {
-    /// 起動できない・作業用のディレクトリを作れない・引数の検査に通らない。
-    Spawn,
-    /// このコマンドの期限を過ぎて kill した。
-    Timeout,
-    /// ジョブ全体の期限を過ぎた（起動前、または kill した）。
-    JobDeadline,
-    /// 終了コードが 3（ディレクトリ・ファイルが無い）。
-    NotFound,
-    /// 終了コードが 0 以外（シグナルで終わったときは -1）。
-    Exit(i32),
-    /// 標準出力が上限を超えた、または `lsjson` の出力が決められた形でない。
-    BadOutput,
-    /// キャンセルの印（SIGINT・SIGTERM）が立った（起動の前、または kill して `wait` し終えた）。結果は分からない
-    /// （`copy`・`moveto` は、Drive 側で済んでいるかもしれない）ので、呼び出し側は失敗として確定せず、復旧の表に渡す。
-    Cancelled,
-}
-
-impl RunError {
-    /// 照会（`lsjson`・`cat`）の失敗を、ジョブのエラーにする。「無い」と取り違えないよう、`drive_unavailable`。
-    pub fn into_query_error(self) -> ExportError {
-        match self {
-            Self::JobDeadline => ExportError::from(ErrorCode::Timeout),
-            _ => ExportError::new(
-                ErrorCode::DriveUnavailable,
-                "Drive に照会できません（rclone の失敗）",
-            ),
-        }
-    }
-
-    /// 書き込み（`mkdir`・`copy`・`moveto`・`purge`）の失敗を、ジョブのエラーにする。
-    pub fn into_op_error(self) -> ExportError {
-        match self {
-            Self::Timeout => ExportError::from(ErrorCode::RcloneTimeout),
-            Self::JobDeadline => ExportError::from(ErrorCode::Timeout),
-            _ => ExportError::from(ErrorCode::RcloneFailed),
-        }
-    }
-}
-
 /// 起動した rclone の標準出力。
 #[derive(Debug)]
 pub struct Output {
@@ -391,15 +267,6 @@ pub fn is_forbidden_flag(arg: &str) -> bool {
         && !arg.starts_with("--")
         && arg.len() > 1
         && arg[1..].bytes().all(|b| b == b'v')
-}
-
-/// `copy` で送る範囲。manifest は最後に送るので、写真だけの送信と manifest だけの送信に分ける。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CopyScope {
-    /// `manifest.json` 以外。
-    PhotosOnly,
-    /// `manifest.json` だけ。
-    ManifestOnly,
 }
 
 /// rclone の呼び出し口。`Clone` できる（期限だけを替えた複製を作れる）。
@@ -448,7 +315,7 @@ impl Rclone {
     }
 
     /// キャンセルの印（SIGINT・SIGTERM）を共有する。立つと、起動の前なら起動せず、実行中なら子のグループを kill して `wait` し、
-    /// [`RunError::Cancelled`] を返す。
+    /// [`RemoteError::Cancelled`] を返す。
     pub fn with_cancel(mut self, cancel: Cancel) -> Self {
         self.cancel = cancel;
         self
@@ -592,33 +459,33 @@ impl Rclone {
         recursive: bool,
         skip_shortcuts: bool,
         hash: bool,
-    ) -> Result<Vec<LsEntry>, RunError> {
+    ) -> Result<Vec<Entry>, RemoteError> {
         let out = self.run(
             "lsjson",
             self.lsjson_args(loc, recursive, skip_shortcuts, hash),
             self.timeout,
             STDOUT_MAX_BYTES,
         )?;
-        parse_lsjson(&out.stdout).ok_or(RunError::BadOutput)
+        parse_lsjson(&out.stdout).ok_or(RemoteError::BadOutput)
     }
 
     /// `cat`。先頭の `max_bytes + 1` バイトまでを読む（`max_bytes` を超えるかどうかは、返った長さで分かる）。
-    pub fn cat(&self, loc: &RemoteLoc, max_bytes: u64) -> Result<Vec<u8>, RunError> {
+    pub fn cat(&self, loc: &RemoteLoc, max_bytes: u64) -> Result<Vec<u8>, RemoteError> {
         let count = max_bytes.saturating_add(1);
         let cap = usize::try_from(count).unwrap_or(usize::MAX);
         self.run("cat", self.cat_args(loc, count), self.timeout, cap)
             .map(|o| o.stdout)
     }
 
-    pub fn mkdir(&self, loc: &RemoteLoc) -> Result<(), RunError> {
+    pub fn mkdir(&self, loc: &RemoteLoc) -> Result<(), RemoteError> {
         self.run("mkdir", self.mkdir_args(loc), self.timeout, 64 * 1024)
             .map(|_| ())
     }
 
     /// 作業領域（ローカルのディレクトリ。絶対パス）を `dst` へ送る。期限は `--rclone-copy-timeout`。
-    pub fn copy(&self, src: &Path, dst: &RemoteLoc, scope: CopyScope) -> Result<(), RunError> {
+    pub fn copy(&self, src: &Path, dst: &RemoteLoc, scope: CopyScope) -> Result<(), RemoteError> {
         if !src.is_absolute() {
-            return Err(RunError::Spawn);
+            return Err(RemoteError::Spawn);
         }
         self.run(
             "copy",
@@ -629,7 +496,7 @@ impl Rclone {
         .map(|_| ())
     }
 
-    pub fn moveto(&self, src: &RemoteLoc, dst: &RemoteLoc) -> Result<(), RunError> {
+    pub fn moveto(&self, src: &RemoteLoc, dst: &RemoteLoc) -> Result<(), RemoteError> {
         self.run(
             "moveto",
             self.moveto_args(src, dst),
@@ -640,19 +507,19 @@ impl Rclone {
     }
 
     /// `purge --drive-use-trash=true`（Drive のゴミ箱へ移す）。
-    pub fn purge(&self, loc: &RemoteLoc) -> Result<(), RunError> {
+    pub fn purge(&self, loc: &RemoteLoc) -> Result<(), RemoteError> {
         self.run("purge", self.purge_args(loc), self.timeout, 64 * 1024)
             .map(|_| ())
     }
 
     // ---- 起動 ----
 
-    fn ensure_private_dir(path: &Path) -> Result<(), RunError> {
+    fn ensure_private_dir(path: &Path) -> Result<(), RemoteError> {
         std::fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
             .create(path)
-            .map_err(|_| RunError::Spawn)
+            .map_err(|_| RemoteError::Spawn)
     }
 
     fn run(
@@ -661,16 +528,16 @@ impl Rclone {
         args: Vec<OsString>,
         timeout: Duration,
         stdout_cap: usize,
-    ) -> Result<Output, RunError> {
+    ) -> Result<Output, RemoteError> {
         // 引数の最後の検査（資格情報の上書き・詳細なログの flag は、どの経路でも渡さない）
         for arg in args.iter().take_while(|a| a.as_encoded_bytes() != b"--") {
             match arg.to_str() {
                 Some(s) if !is_forbidden_flag(s) => {}
-                _ => return Err(RunError::Spawn),
+                _ => return Err(RemoteError::Spawn),
             }
         }
         if self.cancel.is_cancelled() {
-            return Err(RunError::Cancelled);
+            return Err(RemoteError::Cancelled);
         }
         // 期限: コマンドごとの期限と、ジョブ全体の期限の短いほう
         let mut limit = timeout;
@@ -678,7 +545,7 @@ impl Rclone {
         if let Some(d) = self.deadline {
             let left = d.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(RunError::JobDeadline);
+                return Err(RemoteError::JobDeadline);
             }
             if left < limit {
                 limit = left;
@@ -707,7 +574,7 @@ impl Rclone {
                 command.pre_exec(move || die_with_parent(parent));
             }
         }
-        let child = command.spawn().map_err(|_| RunError::Spawn)?;
+        let child = command.spawn().map_err(|_| RemoteError::Spawn)?;
         let mut guard = ChildGuard::new(child);
         let stdout = guard.child.stdout.take().map(|r| read_head(r, stdout_cap));
         let stderr = guard.child.stderr.take().map(read_tail);
@@ -774,10 +641,10 @@ impl Rclone {
         let timed_out = cause == Interrupt::TimedOut;
 
         let result = match status {
-            None if cancelled => Err(RunError::Cancelled),
+            None if cancelled => Err(RemoteError::Cancelled),
             Some(status) if status.success() => {
                 if truncated {
-                    Err(RunError::BadOutput)
+                    Err(RemoteError::BadOutput)
                 } else {
                     Ok(Output {
                         stdout: stdout_bytes,
@@ -785,13 +652,13 @@ impl Rclone {
                 }
             }
             Some(status) => match status.code() {
-                Some(EXIT_DIR_NOT_FOUND) => Err(RunError::NotFound),
-                Some(code) => Err(RunError::Exit(code)),
-                None => Err(RunError::Exit(-1)),
+                Some(EXIT_DIR_NOT_FOUND) => Err(RemoteError::NotFound),
+                Some(code) => Err(RemoteError::Exit(code)),
+                None => Err(RemoteError::Exit(-1)),
             },
-            None if timed_out && by_job_deadline => Err(RunError::JobDeadline),
-            None if timed_out => Err(RunError::Timeout),
-            None => Err(RunError::Exit(-1)),
+            None if timed_out && by_job_deadline => Err(RemoteError::JobDeadline),
+            None if timed_out => Err(RemoteError::Timeout),
+            None => Err(RemoteError::Exit(-1)),
         };
         if let Err(e) = &result {
             // 失敗のときは、コマンド名と失敗の分類（終了コード・期限・キャンセル）と、標準エラーの行数だけを残す。標準エラーの
@@ -935,9 +802,6 @@ fn die_with_parent(parent: u32) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `dry_run` の照会の期限（design.md 6.1）。
-pub const DRY_RUN_TIMEOUT: Duration = Duration::from_secs(30);
-
 /// 先頭の `cap` バイトまでを読み、残りは読み捨てる（パイプを詰まらせない）。超えたら真を返す。
 fn read_head<R: Read + Send + 'static>(mut r: R, cap: usize) -> JoinHandle<(Vec<u8>, bool)> {
     std::thread::spawn(move || {
@@ -976,6 +840,7 @@ fn read_tail<R: Read + Send + 'static>(mut r: R) -> JoinHandle<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::RemotePath;
     use serde_json::json;
 
     fn settings() -> Settings {
@@ -996,22 +861,6 @@ mod tests {
         let mut parts = s.split('/');
         let base = RemotePath::parse(parts.next().unwrap()).unwrap();
         parts.fold(RemoteLoc::of(&base), |l, c| l.child(c).unwrap())
-    }
-
-    #[test]
-    fn remote_loc_only_takes_checked_components() {
-        let base = loc("gdrive:work");
-        assert_eq!(
-            base.child("incoming").unwrap().as_str(),
-            "gdrive:work/incoming"
-        );
-        for bad in [
-            "", "..", "a/b", "-x", ".hidden", "a b", "a\n", "ａ", "a..b", "/x",
-        ] {
-            assert!(base.child(bad).is_none(), "{bad:?}");
-        }
-        assert!(base.child("manifest.json").is_some());
-        assert!(base.child(&"a".repeat(129)).is_none());
     }
 
     #[test]
@@ -1379,76 +1228,5 @@ mod tests {
             "リンク切れも、ショートカットとして数える"
         );
         assert!(!got[4].is_shortcut() && got[4].shortcut_id.is_none());
-    }
-
-    #[test]
-    fn drive_ids_are_never_empty() {
-        for ok in ["a", "0BxYz-_9", &"a".repeat(128)] {
-            assert!(is_valid_drive_id(ok));
-        }
-        for bad in ["", "a b", "a.b", &"a".repeat(129), "日本"] {
-            assert!(!is_valid_drive_id(bad), "{bad:?}");
-        }
-    }
-
-    #[test]
-    fn shortcut_entries_are_recognised_by_mime() {
-        let e = LsEntry {
-            path: "a".into(),
-            name: "a".into(),
-            size: 1,
-            mime: SHORTCUT_MIME.into(),
-            is_dir: false,
-            id: "i".into(),
-            shortcut_id: None,
-            md5: None,
-        };
-        assert!(e.is_shortcut());
-        let resolved = LsEntry {
-            mime: "image/jpeg".into(),
-            shortcut_id: Some("j".into()),
-            ..e.clone()
-        };
-        assert!(resolved.is_shortcut());
-        let dangling = LsEntry {
-            mime: SHORTCUT_DANGLING_MIME.into(),
-            ..resolved.clone()
-        };
-        assert!(dangling.is_shortcut());
-        let plain = LsEntry {
-            mime: "image/jpeg".into(),
-            shortcut_id: None,
-            ..e
-        };
-        assert!(!plain.is_shortcut());
-    }
-
-    #[test]
-    fn run_errors_map_to_the_documented_codes() {
-        assert_eq!(
-            RunError::Timeout.into_op_error().code,
-            ErrorCode::RcloneTimeout
-        );
-        assert_eq!(
-            RunError::Exit(1).into_op_error().code,
-            ErrorCode::RcloneFailed
-        );
-        assert_eq!(
-            RunError::JobDeadline.into_op_error().code,
-            ErrorCode::Timeout
-        );
-        for e in [
-            RunError::Timeout,
-            RunError::NotFound,
-            RunError::Exit(1),
-            RunError::BadOutput,
-            RunError::Spawn,
-        ] {
-            assert_eq!(e.into_query_error().code, ErrorCode::DriveUnavailable);
-        }
-        assert_eq!(
-            RunError::JobDeadline.into_query_error().code,
-            ErrorCode::Timeout
-        );
     }
 }

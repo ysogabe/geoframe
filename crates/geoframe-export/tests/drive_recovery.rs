@@ -1,6 +1,10 @@
 //! T4: 復旧の表（design.md 4.2「復旧」）の実行。記録した段階と ID と、偽の Drive の状態から起動して、表のとおりに進むこと。
 //! 起動時の復旧（T5）と同じく、手元に一式が無い（Drive の manifest で照合する）形で動かす。表そのもの（純粋な関数）の試験は
 //! `src/recovery.rs`。
+//!
+//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る
+//! （`Env::ops`・`mutating_ops`・`ops_used`・`op_count`）。`// rclone 固有` と書いた確認（`rclone_calls`・
+//! `assert_rclone_safe_calls`）と、そう書いた試験だけが、rclone の引数・環境変数を見る。それらは rclone 版を消すときに消す。
 
 mod common;
 
@@ -32,11 +36,11 @@ fn world(name: &str) -> World {
 impl World {
     fn recovery<'a>(
         &'a self,
-        r: &'a geoframe_export::rclone::Rclone,
+        r: &'a geoframe_export::remote::Remote,
         expected: Option<&'a Expected>,
     ) -> Recovery<'a> {
         Recovery {
-            rclone: r,
+            remote: r,
             layout: &self.layout,
             published: &self.env.published,
             expected,
@@ -125,7 +129,7 @@ fn uploading_and_verifying_with_an_untouched_destination_remove_incoming_and_int
             let w = world(&format!("row1-{stage}-{replace}"));
             let old = replace.then(|| w.env.seed_managed(Y, FOLDER, &w.set));
             let inc = w.put_incoming();
-            let r = w.env.rclone();
+            let r = w.env.remote();
             let res = w
                 .recovery(&r, None)
                 .run(
@@ -138,7 +142,7 @@ fn uploading_and_verifying_with_an_untouched_destination_remove_incoming_and_int
             assert!(!w.incoming_exists());
             assert_eq!(w.dest(), old, "宛先は前のまま");
             assert_eq!(w.env.drive().trashed, [inc], "incoming はゴミ箱へ");
-            assert!(w.env.rclone_calls("moveto").is_empty());
+            assert!(w.env.op_count("move") == 0);
         }
     }
 }
@@ -148,7 +152,7 @@ fn an_interrupted_upload_that_never_recorded_the_incoming_id_is_not_deleted_by_n
     // ID を記録する前に止まった: 名前だけでは消さず、残りものとして知らせる（宛先は変わっていないので blocked にはしない）
     let w = world("row1-noid");
     let inc = w.put_incoming();
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -166,7 +170,7 @@ fn an_interrupted_upload_that_never_recorded_the_incoming_id_is_not_deleted_by_n
     );
     assert!(w.incoming_exists(), "消していない");
     assert!(w.env.drive().trashed.is_empty() && w.env.drive().deleted.is_empty());
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
     // 結果と recover の表示に出す
     let text = geoframe_export::publish::leftover_incoming_text(&w.layout, Some(&inc));
     assert!(
@@ -188,7 +192,7 @@ fn an_interrupted_upload_that_never_recorded_the_incoming_id_is_not_deleted_by_n
 
     // 何も作っていなかった
     let w = world("row1-nothing");
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -198,7 +202,7 @@ fn an_interrupted_upload_that_never_recorded_the_incoming_id_is_not_deleted_by_n
         )
         .unwrap();
     assert_eq!(res, interrupted());
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
 }
 
 #[test]
@@ -206,7 +210,7 @@ fn the_incoming_is_deleted_only_when_it_matches_the_recorded_id() {
     // 記録した ID と、見えているフォルダの ID が違う → 消さずに blocked
     let w = world("row1-id-differs");
     let _inc = w.put_incoming();
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -216,7 +220,7 @@ fn the_incoming_is_deleted_only_when_it_matches_the_recorded_id() {
         )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::IncomingUnexpected);
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
     assert!(w.incoming_exists());
 }
 
@@ -225,7 +229,7 @@ fn retiring_before_the_move_is_interrupted_and_anything_in_replaced_blocks() {
     let w = world("row2-a");
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -245,7 +249,7 @@ fn retiring_before_the_move_is_interrupted_and_anything_in_replaced_blocks() {
         &["geoframe-export-work", "replaced", w.layout.retired_name()],
         &w.set,
     );
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -255,7 +259,7 @@ fn retiring_before_the_move_is_interrupted_and_anything_in_replaced_blocks() {
         )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::ReplacedUnexpected);
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
     assert!(w.env.drive().trashed.is_empty());
 }
 
@@ -266,7 +270,7 @@ fn a_retired_old_folder_with_a_verified_incoming_is_rolled_forward() {
         let old = w.env.seed_managed(Y, FOLDER, &w.set);
         let inc = w.put_incoming();
         w.retire(&old);
-        let r = w.env.rclone();
+        let r = w.env.remote();
         let res = w
             .recovery(&r, None)
             .run(
@@ -285,9 +289,10 @@ fn a_retired_old_folder_with_a_verified_incoming_is_rolled_forward() {
         assert_eq!(w.env.drive().trashed, [old]);
         assert_eq!(w.recorded_id().as_deref(), Some(inc.as_str()));
         // 前へ進める前に incoming の中身を manifest と照合し（cat）、移動は 1 回だけ
-        assert!(w.env.commands_used().contains(&"cat".to_owned()));
-        assert_eq!(w.env.rclone_calls("moveto").len(), 1);
-        assert_safe_calls(&w.env);
+        assert!(w.env.ops_used().contains(&"read".to_owned()));
+        assert_eq!(w.env.op_count("move"), 1);
+        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+        assert_rclone_safe_calls(&w.env);
     }
 }
 
@@ -302,7 +307,7 @@ fn rolling_forward_refuses_an_incoming_that_no_longer_matches_its_manifest() {
     d.nodes
         .retain(|n| n.name != "090000_1.jpg" || n.parent != inc);
     w.env.save(&d);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -312,8 +317,8 @@ fn rolling_forward_refuses_an_incoming_that_no_longer_matches_its_manifest() {
         )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::ContentMismatch);
-    assert!(w.env.rclone_calls("moveto").is_empty());
-    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.env.op_count("move") == 0);
+    assert!(w.env.op_count("trash") == 0);
     assert!(
         w.dest().is_none(),
         "宛先は空のまま。旧フォルダは replaced/ にある"
@@ -327,7 +332,7 @@ fn publishing_with_the_new_set_at_the_destination_is_recorded_as_published() {
     let w = world("row4-absent");
     let inc = w.put_incoming();
     w.publish_incoming(&inc);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -342,7 +347,7 @@ fn publishing_with_the_new_set_at_the_destination_is_recorded_as_published() {
     assert!(!p.replaced && p.recorded);
     assert_eq!(w.recorded_id().as_deref(), Some(inc.as_str()));
     assert!(
-        w.env.mutations().is_empty(),
+        w.env.mutating_ops().is_empty(),
         "公開済みなので Drive は変えない"
     );
 
@@ -352,7 +357,7 @@ fn publishing_with_the_new_set_at_the_destination_is_recorded_as_published() {
     let inc = w.put_incoming();
     w.retire(&old);
     w.publish_incoming(&inc);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -376,7 +381,7 @@ fn trashing_retries_while_the_old_folder_is_in_replaced_and_finishes_when_it_is_
     let inc = w.put_incoming();
     w.retire(&old);
     w.publish_incoming(&inc);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -399,7 +404,7 @@ fn trashing_retries_while_the_old_folder_is_in_replaced_and_finishes_when_it_is_
     d.purge(&old, true);
     w.env.save(&d);
     w.publish_incoming(&inc);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -409,7 +414,7 @@ fn trashing_retries_while_the_old_folder_is_in_replaced_and_finishes_when_it_is_
         )
         .unwrap();
     assert!(matches!(res, Resolution::Published(_)));
-    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.env.op_count("trash") == 0);
     assert_eq!(w.recorded_id().as_deref(), Some(inc.as_str()));
 }
 
@@ -479,7 +484,7 @@ fn states_the_table_does_not_cover_block_without_touching_anything() {
         let w = world(&format!("blocked-{name}"));
         let p = setup(&w);
         let nodes = w.env.drive().nodes.len();
-        let r = w.env.rclone();
+        let r = w.env.remote();
         let info = w
             .recovery(&r, None)
             .run(&p, false, &mut Hook::new(&w.env))
@@ -488,9 +493,9 @@ fn states_the_table_does_not_cover_block_without_touching_anything() {
         assert_eq!(info.progress, p, "{name}");
         assert!(info.observed.is_some(), "{name}");
         assert!(
-            w.env.mutations().is_empty(),
+            w.env.mutating_ops().is_empty(),
             "{name}: {:?}",
-            w.env.mutations()
+            w.env.mutating_ops()
         );
         assert_eq!(w.env.drive().nodes.len(), nodes, "{name}");
         assert!(w.env.drive().trashed.is_empty(), "{name}");
@@ -501,8 +506,8 @@ fn states_the_table_does_not_cover_block_without_touching_anything() {
 fn an_unlistable_drive_is_unobservable_and_blocks() {
     let w = world("unobservable");
     let inc = w.put_incoming();
-    w.env.add_rule("lsjson", 0, u64::MAX, fail(1));
-    let r = w.env.rclone();
+    w.env.add_rule("list", 0, u64::MAX, fail(1));
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -513,7 +518,7 @@ fn an_unlistable_drive_is_unobservable_and_blocks() {
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::Unobservable);
     assert_eq!(info.observed, None);
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
 }
 
 #[test]
@@ -522,19 +527,19 @@ fn explain_shows_the_state_and_the_next_move_without_changing_drive() {
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let p = progress(Stage::Publishing, Some(&old), Some(&inc));
     let (decision, observed, text) = w.recovery(&r, None).explain(&p).unwrap();
     assert!(matches!(decision.action, Action::RollForward { .. }));
     assert!(observed.dest.is_empty());
     assert!(text.contains(&old) && text.contains(&inc), "{text}");
     // 呼んだのは lsjson だけ
-    assert_eq!(w.env.commands_used(), ["lsjson"]);
-    assert!(w.env.mutations().is_empty());
+    assert_eq!(w.env.ops_used(), ["list"]);
+    w.env.assert_no_mutations();
     assert_eq!(w.dest(), None);
     // ブロックされる状態の説明
     let w2 = world("explain-blocked");
-    let r2 = w2.env.rclone();
+    let r2 = w2.env.remote();
     let mut d = w2.env.drive();
     d.mkdir_p(&["yamareco", FOLDER]);
     w2.env.save(&d);
@@ -552,8 +557,8 @@ fn a_failed_move_during_recovery_blocks_instead_of_guessing() {
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("moveto", 0, u64::MAX, fail(1));
-    let r = w.env.rclone();
+    w.env.add_rule("move", 0, u64::MAX, fail(1));
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -563,7 +568,7 @@ fn a_failed_move_during_recovery_blocks_instead_of_guessing() {
         )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::ExecutionFailed);
-    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.env.op_count("trash") == 0);
 }
 
 #[test]
@@ -574,7 +579,7 @@ fn the_pending_lookup_works_with_the_local_set_too() {
     let inc = w.put_incoming();
     w.retire(&old);
     let expected = Expected::from_publish_files(&w.set.files);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, Some(&expected))
         .run(
@@ -586,6 +591,7 @@ fn the_pending_lookup_works_with_the_local_set_too() {
     assert!(matches!(res, Resolution::Published(_)));
     // 手元の一式で照合するので、incoming・宛先の manifest は読まない。読むのは、ゴミ箱へ移す前の、退避した旧フォルダの
     // manifest（旧 manifest の一式と中身の照合）だけ
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
     let cats = w.env.rclone_calls("cat");
     assert_eq!(cats.len(), 1, "{cats:?}");
     assert!(
@@ -603,7 +609,7 @@ fn resume(
     w: &World,
     last: &Progress,
 ) -> Result<Resolution, Box<geoframe_export::publish::BlockedInfo>> {
-    let r = w.env.rclone();
+    let r = w.env.remote();
     w.recovery(&r, None)
         .run(last, false, &mut Hook::new(&w.env))
 }
@@ -615,7 +621,7 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let mut hook = Hook::new(&w.env).fail_at(Stage::Trashing, 1);
     let res = w
         .recovery(&r, None)
@@ -631,8 +637,8 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
         .unwrap();
     // 順番: 移す前に publishing を記録。trashing は書けなかったので、旧フォルダはゴミ箱へ移していない
     assert_eq!(
-        w.env.mutations(),
-        ["record:publishing", "moveto", "record:trashing"]
+        w.env.mutating_ops(),
+        ["record:publishing", "move", "record:trashing"]
     );
     let Resolution::Published(p) = res else {
         panic!("{res:?}")
@@ -674,11 +680,12 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
     // ゴミ箱へ移せたので、`previous` は残らない
     assert!(w.env.published.find(Y, &folder).unwrap().previous.is_none());
     // 記録の前に Drive を変えていない（trashing を記録してから purge）
-    let seq = w.env.mutations();
+    let seq = w.env.mutating_ops();
     let rec = seq.iter().rposition(|c| c == "record:trashing").unwrap();
-    let purge = seq.iter().position(|c| c == "purge").unwrap();
+    let purge = seq.iter().position(|c| c == "trash").unwrap();
     assert!(rec < purge, "{seq:?}");
-    assert_safe_calls(&w.env);
+    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
+    assert_rclone_safe_calls(&w.env);
 }
 
 #[test]
@@ -689,7 +696,7 @@ fn recovery_records_trashing_before_the_purge_so_a_stop_after_the_purge_resumes(
     let inc = w.put_incoming();
     w.retire(&old);
     w.publish_incoming(&inc);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let mut hook = Hook::new(&w.env);
     let res = w
         .recovery(&r, None)
@@ -700,7 +707,7 @@ fn recovery_records_trashing_before_the_purge_so_a_stop_after_the_purge_resumes(
         )
         .unwrap();
     assert!(matches!(res, Resolution::Published(_)));
-    assert_eq!(w.env.mutations(), ["record:trashing", "purge"]);
+    assert_eq!(w.env.mutating_ops(), ["record:trashing", "trash"]);
     let last = hook.records.last().cloned().unwrap();
     assert_eq!(last.stage, Stage::Trashing);
     assert_eq!(w.env.drive().trashed, std::slice::from_ref(&old));
@@ -708,7 +715,7 @@ fn recovery_records_trashing_before_the_purge_so_a_stop_after_the_purge_resumes(
     // purge の直後に止まった、として、記録した trashing から再開する: 旧フォルダはもう無い → 公開済み。purge は呼ばない
     let res = resume(&w, &last).unwrap();
     assert!(matches!(res, Resolution::Published(_)));
-    assert_eq!(w.env.rclone_calls("purge").len(), 1);
+    assert_eq!(w.env.op_count("trash"), 1);
     // 記録が publishing のままだったら、旧フォルダが無いのは想定外として止まっていた（trashing を先に記録する理由）
     let stale = progress(Stage::Publishing, Some(&old), Some(&inc));
     let info = resume(&w, &stale).unwrap_err();
@@ -722,7 +729,7 @@ fn a_record_that_cannot_be_written_stops_the_recovery_before_the_drive_operation
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let p = progress(Stage::Retiring, Some(&old), Some(&inc));
     let info = w
         .recovery(&r, None)
@@ -734,7 +741,7 @@ fn a_record_that_cannot_be_written_stops_the_recovery_before_the_drive_operation
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::RecordFailed);
     assert_eq!(info.progress, p, "最後に記録できた段階");
-    assert!(w.env.rclone_calls("moveto").is_empty());
+    assert!(w.env.op_count("move") == 0);
     assert!(w.dest().is_none() && w.replaced_exists());
     // 書けるようになれば、同じ記録から進められる
     assert!(matches!(resume(&w, &p), Ok(Resolution::Published(_))));
@@ -745,7 +752,7 @@ fn a_record_that_cannot_be_written_stops_the_recovery_before_the_drive_operation
     let inc = w.put_incoming();
     w.retire(&old);
     w.publish_incoming(&inc);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -758,7 +765,7 @@ fn a_record_that_cannot_be_written_stops_the_recovery_before_the_drive_operation
         panic!("{res:?}")
     };
     assert_eq!(p.old_left_in_replaced.as_deref(), Some(old.as_str()));
-    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.env.op_count("trash") == 0);
 }
 
 #[test]
@@ -768,8 +775,8 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("moveto", 0, 1, late_then_fail(3));
-    let r = w.env.rclone();
+    w.env.add_rule("move", 0, 1, late_then_fail(3));
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -779,15 +786,15 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
         )
         .unwrap();
     assert!(matches!(res, Resolution::Published(_)));
-    assert_eq!(w.env.rclone_calls("moveto").len(), 1, "もう一度移さない");
+    assert_eq!(w.env.op_count("move"), 1, "もう一度移さない");
     assert_eq!(w.dest().as_deref(), Some(inc.as_str()));
     // 応答が失われただけ（済んでいる）の場合
     let w = world("recovery-lost");
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("moveto", 0, 1, do_then_fail());
-    let r = w.env.rclone();
+    w.env.add_rule("move", 0, 1, do_then_fail());
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -797,14 +804,14 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
         )
         .unwrap();
     assert!(matches!(res, Resolution::Published(_)));
-    assert_eq!(w.env.rclone_calls("moveto").len(), 1);
+    assert_eq!(w.env.op_count("move"), 1);
     // 一覧が決まらなければ blocked（unobservable）。移す前までの lsjson の回数は、同じ状況をもう 1 回動かして数える
     let probe = world("recovery-unstable-probe");
     let old = probe.env.seed_managed(Y, FOLDER, &probe.set);
     let inc = probe.put_incoming();
     probe.retire(&old);
-    probe.env.add_rule("moveto", 0, 1, fail(1));
-    let r = probe.env.rclone();
+    probe.env.add_rule("move", 0, 1, fail(1));
+    let r = probe.env.remote();
     let _ = probe.recovery(&r, None).run(
         &progress(Stage::Publishing, Some(&old), Some(&inc)),
         false,
@@ -814,8 +821,8 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
         .env
         .calls()
         .iter()
-        .take_while(|c| c["cmd"] != "moveto")
-        .filter(|c| c["cmd"] == "lsjson")
+        .take_while(|c| c["op"] != "move")
+        .filter(|c| c["op"] == "list")
         .count() as u64;
     assert!(before_move > 0);
 
@@ -823,10 +830,10 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("moveto", 0, 1, fail(1));
+    w.env.add_rule("move", 0, 1, fail(1));
     let mut c = w.env.ctl();
     c.rules.push(model::Rule {
-        cmd: "lsjson".into(),
+        op: "list".into(),
         contains: None,
         // 移す前の一覧は通し、失敗のあとの一覧をすべて失敗させる
         skip: before_move,
@@ -835,7 +842,7 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
         effect: fail(1),
     });
     c.save(&w.env.fake_dir);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -855,8 +862,8 @@ fn startup_recovery_checks_the_destination_after_the_move_before_it_goes_to_the_
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("moveto", 0, 1, filewise());
-    let r = w.env.rclone();
+    w.env.add_rule("move", 0, 1, filewise());
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -867,7 +874,7 @@ fn startup_recovery_checks_the_destination_after_the_move_before_it_goes_to_the_
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::PublishMismatch);
     assert_eq!(info.progress.stage, Stage::Publishing);
-    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.env.op_count("trash") == 0);
     assert!(w.replaced_exists());
 
     // 移したあとの中身が、宛先の manifest と合わない（移す直前に写真が 1 枚消えた）→ ゴミ箱へ進まない
@@ -883,7 +890,7 @@ fn startup_recovery_checks_the_destination_after_the_move_before_it_goes_to_the_
             .retain(|n| n.name != "090000_1.jpg" || n.parent != inc2);
         d.save(&fake);
     });
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -893,7 +900,7 @@ fn startup_recovery_checks_the_destination_after_the_move_before_it_goes_to_the_
         )
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::PublishMismatch);
-    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.env.op_count("trash") == 0);
 }
 
 #[test]
@@ -914,7 +921,7 @@ fn the_old_folder_is_not_trashed_when_its_contents_changed_while_the_service_was
         );
         w.env.save(&d);
         let set_expected = Expected::from_publish_files(&w.set.files);
-        let r = w.env.rclone();
+        let r = w.env.remote();
         let info = w
             .recovery(&r, expected.then_some(&set_expected))
             .run(
@@ -924,7 +931,7 @@ fn the_old_folder_is_not_trashed_when_its_contents_changed_while_the_service_was
             )
             .unwrap_err();
         assert_eq!(info.reason, BlockedReason::RetiredContentChanged, "{name}");
-        assert!(w.env.rclone_calls("purge").is_empty(), "{name}");
+        assert!(w.env.op_count("trash") == 0, "{name}");
         assert!(w.env.drive().trashed.is_empty(), "{name}");
         assert!(w.replaced_exists(), "{name}");
         let o = info.observed.clone().expect("見えていた状態");
@@ -986,7 +993,7 @@ fn the_old_folder_is_not_trashed_when_a_file_was_rewritten_to_the_same_size_whil
             }
         }
         let set_expected = Expected::from_publish_files(&w.set.files);
-        let r = w.env.rclone();
+        let r = w.env.remote();
         let info = w
             .recovery(&r, expected.then_some(&set_expected))
             .run(
@@ -996,7 +1003,7 @@ fn the_old_folder_is_not_trashed_when_a_file_was_rewritten_to_the_same_size_whil
             )
             .unwrap_err();
         assert_eq!(info.reason, BlockedReason::RetiredContentChanged, "{name}");
-        assert!(w.env.rclone_calls("purge").is_empty(), "{name}");
+        assert!(w.env.op_count("trash") == 0, "{name}");
         assert!(w.env.drive().trashed.is_empty(), "{name}");
         assert!(w.replaced_exists(), "{name}");
         assert_eq!(w.dest().as_deref(), Some(inc.as_str()), "{name}");
@@ -1010,7 +1017,7 @@ fn recovery_records_aborting_before_it_trashes_the_incoming_of_a_new_publish() {
     // 新規の publishing で、宛先はまだ無く、incoming が残っている → 前のまま。ゴミ箱へ移す前に aborting を記録する
     let w = world("abort-from-publishing");
     let inc = w.put_incoming();
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let mut hook = Hook::new(&w.env);
     let res = w
         .recovery(&r, None)
@@ -1021,7 +1028,7 @@ fn recovery_records_aborting_before_it_trashes_the_incoming_of_a_new_publish() {
         )
         .unwrap();
     assert_eq!(res, interrupted());
-    assert_eq!(w.env.mutations(), ["record:aborting", "purge"]);
+    assert_eq!(w.env.mutating_ops(), ["record:aborting", "trash"]);
     let last = hook.records.last().cloned().unwrap();
     assert_eq!(last, progress(Stage::Aborting, None, Some(&inc)));
     assert!(!w.incoming_exists());
@@ -1029,7 +1036,7 @@ fn recovery_records_aborting_before_it_trashes_the_incoming_of_a_new_publish() {
     // purge の直後にまた止まった、として、記録した aborting から再開する: incoming は無い → 片付け済みで interrupted
     let res = resume(&w, &last).unwrap();
     assert_eq!(res, interrupted());
-    assert_eq!(w.env.rclone_calls("purge").len(), 1, "もう消さない");
+    assert_eq!(w.env.op_count("trash"), 1, "もう消さない");
     // 記録が publishing のままなら、あるはずのものが無い状態として blocked だった（aborting を先に記録する理由）
     let stale = progress(Stage::Publishing, None, Some(&inc));
     let info = resume(&w, &stale).unwrap_err();
@@ -1040,7 +1047,7 @@ fn recovery_records_aborting_before_it_trashes_the_incoming_of_a_new_publish() {
 fn recovery_does_not_trash_the_incoming_when_aborting_cannot_be_recorded() {
     let w = world("abort-record-fails");
     let inc = w.put_incoming();
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -1056,7 +1063,7 @@ fn recovery_does_not_trash_the_incoming_when_aborting_cannot_be_recorded() {
             leftover_incoming_id: Some(inc.clone()),
         }
     );
-    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.env.op_count("trash") == 0);
     assert!(w.incoming_exists());
 }
 
@@ -1065,7 +1072,7 @@ fn the_aborting_row_finishes_the_cleanup_or_blocks() {
     // incoming が記録の ID で残っている（記録済みの aborting から。再度は記録しない）→ 消して interrupted
     let w = world("aborting-intact");
     let inc = w.put_incoming();
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let mut hook = Hook::new(&w.env);
     let res = w
         .recovery(&r, None)
@@ -1087,7 +1094,7 @@ fn the_aborting_row_finishes_the_cleanup_or_blocks() {
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let res = resume(&w, &progress(Stage::Aborting, Some(&old), Some("fidGONE"))).unwrap();
     assert_eq!(res, interrupted());
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
     assert_eq!(w.dest().as_deref(), Some(old.as_str()));
 
     // 宛先が前のままでない（別のフォルダがある・新しい一式になっている）→ blocked。何も動かさない
@@ -1096,7 +1103,7 @@ fn the_aborting_row_finishes_the_cleanup_or_blocks() {
     w.env.seed_set_at(&["yamareco", FOLDER], &w.set);
     let info = resume(&w, &progress(Stage::Aborting, None, Some(&inc))).unwrap_err();
     assert_eq!(info.reason, BlockedReason::DestinationUnexpected);
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
     assert!(w.incoming_exists());
 
     let w = world("aborting-published");
@@ -1104,17 +1111,17 @@ fn the_aborting_row_finishes_the_cleanup_or_blocks() {
     w.publish_incoming(&inc);
     let info = resume(&w, &progress(Stage::Aborting, None, Some(&inc))).unwrap_err();
     assert_eq!(info.reason, BlockedReason::StageInconsistent);
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
 
     // incoming が記録の ID と違う → 消さずに blocked
     let w = world("aborting-other-incoming");
     let _inc = w.put_incoming();
     let info = resume(&w, &progress(Stage::Aborting, None, Some("fidSOMEONEELSE"))).unwrap_err();
     assert_eq!(info.reason, BlockedReason::IncomingUnexpected);
-    assert!(w.env.mutations().is_empty());
+    w.env.assert_no_mutations();
     // 表示にも出る（recover）
     let (_, _, text) = w
-        .recovery(&w.env.rclone(), None)
+        .recovery(&w.env.remote(), None)
         .explain(&progress(Stage::Aborting, None, Some("fidSOMEONEELSE")))
         .unwrap();
     assert!(text.contains("aborting"), "{text}");
@@ -1144,7 +1151,7 @@ fn trashing_record_fails_while_replaced_changes(
         }
         Ok(())
     };
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let info = w
         .recovery(&r, None)
         .run(
@@ -1167,7 +1174,7 @@ fn trashing_record_fails_while_replaced_changes(
         Some(old.as_str()),
         "blocked なのに公開の記録だけ更新済みになっていない"
     );
-    assert!(w.env.rclone_calls("purge").is_empty());
+    assert!(w.env.op_count("trash") == 0);
 }
 
 #[test]
@@ -1195,7 +1202,7 @@ fn a_trashing_record_failure_rechecks_the_retired_folder_before_the_published_re
     trashing_record_fails_while_replaced_changes("trash-record-unlistable", &|fake, _| {
         let mut c = model::Ctl::load(fake);
         c.rules.push(model::Rule {
-            cmd: "lsjson".into(),
+            op: "list".into(),
             contains: Some("/replaced".into()),
             skip: 0,
             times: u64::MAX,
@@ -1214,8 +1221,8 @@ fn a_purge_that_fails_during_recovery_keeps_the_old_folder_in_the_result() {
     let inc = w.put_incoming();
     w.retire(&old);
     w.publish_incoming(&inc);
-    w.env.add_rule("purge", 0, u64::MAX, fail(1));
-    let r = w.env.rclone();
+    w.env.add_rule("trash", 0, u64::MAX, fail(1));
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -1273,7 +1280,7 @@ fn a_rewrite_after_the_job_record_stopped_is_blocked_and_the_published_record_is
     let (w, old, inc) = replaced_world("digest-publishing");
     let before = std::fs::read(row_file(&w)).unwrap();
     change_md5(&w.env, &["yamareco", FOLDER], "090000_1.jpg");
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let kept = Progress {
         digests: Some(w.set.recorded()),
         ..progress(Stage::Publishing, Some(&old), Some(&inc))
@@ -1290,13 +1297,13 @@ fn a_rewrite_after_the_job_record_stopped_is_blocked_and_the_published_record_is
     );
     assert_eq!(w.recorded_id().as_deref(), Some(old.as_str()));
     // 何も動かしていない（trashing の記録も purge もない）
-    assert_eq!(w.env.mutations(), Vec::<String>::new());
-    assert!(w.env.rclone_calls("purge").is_empty());
+    w.env.assert_no_mutations();
+    assert!(w.env.op_count("trash") == 0);
     assert!(w.replaced_exists() && w.env.drive().trashed.is_empty());
 
     // 書き換えられていなければ、同じ記録で公開済みとして終わり、行にはジョブの記録の MD5 が書かれる
     let (w, old, inc) = replaced_world("digest-publishing-clean");
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let kept = Progress {
         digests: Some(w.set.recorded()),
         ..progress(Stage::Publishing, Some(&old), Some(&inc))
@@ -1340,7 +1347,7 @@ fn a_rewrite_right_after_the_published_record_was_updated_is_blocked_by_the_reco
             .unwrap();
         let before = std::fs::read(row_file(&w)).unwrap();
         change_md5(&w.env, &["yamareco", FOLDER], "090100_2.jpg");
-        let r = w.env.rclone();
+        let r = w.env.remote();
         let p = Progress {
             // 行があれば、ジョブの記録に MD5 が無くても（古い記録）行の MD5 で照らす
             digests: kept_digests.then(|| w.set.recorded()),
@@ -1352,7 +1359,7 @@ fn a_rewrite_right_after_the_published_record_was_updated_is_blocked_by_the_reco
             .unwrap_err();
         assert_eq!(info.reason, BlockedReason::ContentMismatch, "{name}");
         assert_eq!(std::fs::read(row_file(&w)).unwrap(), before, "{name}");
-        assert!(w.env.rclone_calls("purge").is_empty(), "{name}");
+        assert!(w.env.op_count("trash") == 0, "{name}");
         assert!(w.env.drive().trashed.is_empty(), "{name}");
     }
 
@@ -1373,7 +1380,7 @@ fn a_rewrite_right_after_the_published_record_was_updated_is_blocked_by_the_reco
             })),
         })
         .unwrap();
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -1429,7 +1436,7 @@ fn when_the_published_row_and_the_job_record_disagree_on_md5_the_row_wins() {
             })
             .unwrap();
         let before = std::fs::read(row_file(&w)).unwrap();
-        let r = w.env.rclone();
+        let r = w.env.remote();
         let p = Progress {
             digests: Some(job_files),
             ..progress(Stage::Trashing, Some(&old), Some(&inc))
@@ -1449,7 +1456,7 @@ fn when_the_published_row_and_the_job_record_disagree_on_md5_the_row_wins() {
             );
             assert_eq!(std::fs::read(row_file(&w)).unwrap(), before, "{name}");
             assert!(w.env.drive().trashed.is_empty(), "{name}");
-            assert!(w.env.rclone_calls("purge").is_empty(), "{name}");
+            assert!(w.env.op_count("trash") == 0, "{name}");
         }
     }
 }
@@ -1461,7 +1468,7 @@ fn a_new_destination_rewritten_while_stopped_is_blocked_too() {
     let inc = w.put_incoming();
     w.publish_incoming(&inc);
     change_md5(&w.env, &["yamareco", FOLDER], "090000_1.jpg");
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let kept = Progress {
         digests: Some(w.set.recorded()),
         ..progress(Stage::Publishing, None, Some(&inc))
@@ -1484,7 +1491,7 @@ fn a_new_destination_rewritten_while_stopped_is_blocked_too() {
         &["geoframe-export-work", "incoming", JOB_A],
         "090000_1.jpg",
     );
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let kept = Progress {
         digests: Some(w.set.recorded()),
         ..progress(Stage::Retiring, Some(&old), Some(&inc))
@@ -1494,7 +1501,7 @@ fn a_new_destination_rewritten_while_stopped_is_blocked_too() {
         .run(&kept, false, &mut Hook::new(&w.env))
         .unwrap_err();
     assert_eq!(info.reason, BlockedReason::ContentMismatch);
-    assert!(w.env.rclone_calls("moveto").is_empty());
+    assert!(w.env.op_count("move") == 0);
     assert!(w.dest().is_none());
     assert_eq!(w.recorded_id().as_deref(), Some(old.as_str()));
 }
@@ -1505,7 +1512,7 @@ fn an_old_job_record_without_md5_writes_a_row_without_md5_so_the_next_replace_is
     let w = world("digest-legacy");
     let inc = w.put_incoming();
     w.publish_incoming(&inc);
-    let r = w.env.rclone();
+    let r = w.env.remote();
     let res = w
         .recovery(&r, None)
         .run(
@@ -1527,7 +1534,7 @@ fn an_old_job_record_without_md5_writes_a_row_without_md5_so_the_next_replace_is
     assert_eq!(row.files, None);
     // 次の replace は、中身を確かめられないので管理していないものとして断る
     let layout = w.env.layout(Y, FOLDER, JOB_B);
-    let rclone = w.env.rclone();
+    let rclone = w.env.remote();
     assert_eq!(
         geoframe_export::publish::dry_run(&rclone, &layout, &w.env.published)
             .unwrap()

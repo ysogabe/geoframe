@@ -233,8 +233,8 @@ fn dry_run_prints_the_200_shape_and_exits_0() {
     assert_eq!(v["derivative_pending"], 0);
     assert_eq!(v["excluded"]["not_derivative"], 0);
     assert!(v.get("status").is_none());
-    for c in env.commands_used() {
-        assert!(c == "lsjson" || c == "cat", "{c}");
+    for c in env.ops_used() {
+        assert!(c == "list" || c == "read", "{c}");
     }
     // dry_run の失敗は、失敗の JSON と終了コード 1
     let env = Env::new("cli-dry2");
@@ -416,8 +416,8 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
         .map(|n| std::fs::read(env.state.join("jobs").join(format!("{}.json", job(n)))).unwrap())
         .collect();
     assert_eq!(records_after, records_before);
-    for c in env.commands_used() {
-        assert!(c == "lsjson" || c == "cat", "{c}");
+    for c in env.ops_used() {
+        assert!(c == "list" || c == "read", "{c}");
     }
     assert!(env.drive().trashed.is_empty());
 }

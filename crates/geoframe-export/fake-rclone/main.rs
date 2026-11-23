@@ -1,7 +1,7 @@
 //! 試験用の偽の rclone（本物の rclone でも Drive でもない。`geoframe-export` の試験だけが使う）。
 //!
 //! - 状態は `--config` のあるディレクトリの隣の `fake-drive/` に持つ（`drive.json`＝偽の Drive、`ctl.json`＝挙動の差し替え、
-//!   `calls.log`＝呼ばれた引数と、渡された環境変数を 1 行 1 件の JSON で追記）。
+//!   `calls.log`＝呼ばれた操作名（`op`。中立の名前）と引数と、渡された環境変数を 1 行 1 件の JSON で追記）。
 //! - 対応するのは `lsjson`・`cat`・`mkdir`・`copy`・`moveto`・`purge` だけ。ほかは終了コード 2。
 //! - 挙動の差し替え（`ctl.json` の `rules`）: 失敗、遅延、「移動は済ませて失敗を返す」、「移動が遅れて反映される」、
 //!   ファイル単位の移動への切り替え、壊れた出力、標準エラーの内容。
@@ -103,6 +103,19 @@ fn walk(dir: &Path, rel: &str, out: &mut Vec<(String, PathBuf)>) {
         } else {
             out.push((rel_path, path));
         }
+    }
+}
+
+/// rclone のコマンド名 → 中立の操作名（`remote::Remote` の操作と同じ）。
+fn op_name(cmd: &str) -> &'static str {
+    match cmd {
+        "lsjson" => "list",
+        "cat" => "read",
+        "mkdir" => "create_folder",
+        "copy" => "upload",
+        "moveto" => "move",
+        "purge" => "trash",
+        _ => "unknown",
     }
 }
 
@@ -276,7 +289,9 @@ fn main() {
     // 呼び出しの記録（引数と、渡された環境）。効果より先に書く（止まる呼び出しも残る）
     let env: serde_json::Map<String, Value> =
         std::env::vars().map(|(k, v)| (k, json!(v))).collect();
-    let line = json!({"kind": "rclone", "cmd": p.sub, "args": args, "env": env, "pid": std::process::id()});
+    // `op` は中立の操作名（試験が、実装に依らない形で呼び出しを数える・並べるための名前。後の Drive API 版の偽のサーバーも
+    // 同じ名前で記録する）。`cmd` と `args` と `env` は rclone 固有（rclone 版の引数・環境変数の試験だけが見る）
+    let line = json!({"kind": "rclone", "op": op_name(&p.sub), "cmd": p.sub, "args": args, "env": env, "pid": std::process::id()});
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -291,7 +306,7 @@ fn main() {
     // 挙動の差し替え（最初に当たった規則）
     let mut effect: Option<Value> = None;
     for rule in &mut ctl.rules {
-        let hit = rule.cmd == p.sub
+        let hit = rule.op == op_name(&p.sub)
             && rule
                 .contains
                 .as_ref()
