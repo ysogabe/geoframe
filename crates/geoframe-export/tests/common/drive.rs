@@ -194,9 +194,14 @@ impl Env {
 
     /// 全部の呼び出し（Drive の操作と、段階の記録）を、順番どおりに。
     pub fn calls(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.fake_dir.join("calls.log"))
-            .unwrap_or_default()
-            .lines()
+        let text = std::fs::read_to_string(self.fake_dir.join("calls.log")).unwrap_or_default();
+        let mut lines: Vec<&str> = text.lines().collect();
+        // 偽のサーバーが書いている途中の最後の行（改行がまだ無い）は、読み飛ばす（次に読めば、読める）
+        if !text.is_empty() && !text.ends_with('\n') {
+            lines.pop();
+        }
+        lines
+            .into_iter()
             .map(|l| serde_json::from_str(l).expect("calls.log の行"))
             .collect()
     }
