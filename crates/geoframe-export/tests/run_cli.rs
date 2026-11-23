@@ -1,12 +1,12 @@
 //! T5: `run`・`recover` コマンドの JSON と終了コード（design.md 6.2。AC8 の CLI 側・AC11）。`geoframe_export::app::run_command` を
-//! 直接呼ぶ（バイナリを起動しない）。偽の写真サービス（127.0.0.1）と偽の rclone・偽の Drive だけを使う。
-//! 本物の写真サービス（127.0.0.1:8080）・rclone・Drive には触れない。
+//! 直接呼ぶ（バイナリを起動しない）。偽の写真サービス（127.0.0.1）と偽の Drive の HTTP サーバー（`--drive-endpoint`）だけを使う。
+//! 本物の写真サービス（127.0.0.1:8080）・Google には触れない。
 
 mod common;
 
 use common::drive::*;
 use common::site::*;
-use common::{FakeSite, good_config, write_config};
+use common::FakeSite;
 use geoframe_export::app::{EXIT_USAGE, main_with, run_command};
 use geoframe_export::jobid::JobId;
 use geoframe_export::jobs::{BlockedNote, JobRecord, JobStore, ReadOutcome, Status};
@@ -41,22 +41,11 @@ fn run_args(args: &[String], euid: Option<u32>) -> Out {
     }
 }
 
-/// 設定の引数（偽の rclone・専用の設定・状態ディレクトリ・偽の写真サービス）。
+/// 設定の引数（偽の Drive の HTTP サーバー・資格情報・3 つのフォルダの ID・状態ディレクトリ・偽の写真サービス）。
 fn common_args(env: &Env, feed_base: &str) -> Vec<String> {
-    write_config(&env.state, good_config("gdrive").as_bytes());
-    [
-        "--feed-base",
-        feed_base,
-        "--rclone",
-        env!("CARGO_BIN_EXE_fake-rclone"),
-        "--rclone-config",
-        env.state.join("rclone/rclone.conf").to_str().unwrap(),
-        "--state-dir",
-        env.state.to_str().unwrap(),
-    ]
-    .iter()
-    .map(|s| (*s).to_owned())
-    .collect()
+    let mut v = vec!["--feed-base".to_owned(), feed_base.to_owned()];
+    v.extend(env.cli_settings_args());
+    v
 }
 
 fn command(head: &[&str], env: &Env, site: &FakeSite) -> Vec<String> {
@@ -141,7 +130,7 @@ fn a_successful_run_prints_the_get_shape_and_exits_0_then_conflicts_the_second_t
 }
 
 #[test]
-fn zero_photos_exit_0_without_calling_rclone() {
+fn zero_photos_exit_0_without_touching_drive() {
     let env = Env::new("cli-zero");
     let site = photo_site(DAY, DAY, vec![]);
     let out = run_free(RUN, &env, &site);
@@ -155,7 +144,7 @@ fn zero_photos_exit_0_without_calling_rclone() {
         ),
         (Some(0), Some(false))
     );
-    assert!(env.calls().is_empty());
+    env.assert_startup_only();
 }
 
 #[test]
@@ -185,7 +174,7 @@ fn failures_exit_1_with_the_error_in_the_json() {
     let out = run_free(RUN, &env, &site);
     assert_eq!(out.code, 1);
     assert_eq!(out.json()["error"]["code"], "fetch_failed");
-    assert!(env.calls().is_empty());
+    env.assert_startup_only();
 }
 
 #[test]
@@ -209,7 +198,7 @@ fn a_held_slot_exits_4_for_run_dry_run_and_recover() {
     assert_eq!(v["job_id"], Value::Null);
     assert_eq!(v["status"], "failed");
     assert_eq!(v["error"]["code"], "busy");
-    assert!(env.calls().is_empty());
+    env.assert_startup_only();
     assert_eq!(
         std::fs::read_dir(env.state.join("jobs"))
             .map(|d| d.count())
@@ -233,9 +222,7 @@ fn dry_run_prints_the_200_shape_and_exits_0() {
     assert_eq!(v["derivative_pending"], 0);
     assert_eq!(v["excluded"]["not_derivative"], 0);
     assert!(v.get("status").is_none());
-    for c in env.ops_used() {
-        assert!(c == "list" || c == "read", "{c}");
-    }
+    env.assert_read_only();
     // dry_run の失敗は、失敗の JSON と終了コード 1
     let env = Env::new("cli-dry2");
     let args = {
@@ -268,7 +255,7 @@ fn a_blocked_record_makes_run_exit_1_and_explain_on_stderr() {
     assert_eq!(v["error"]["code"], "blocked");
     assert!(out.stderr.contains("recover --resolve"), "{}", out.stderr);
     assert!(out.stderr.contains(job(1).as_str()));
-    assert!(env.calls().is_empty());
+    env.assert_startup_only();
 }
 
 fn job(n: u32) -> JobId {
@@ -306,7 +293,7 @@ fn usage_errors_exit_2_and_root_is_refused() {
         assert!(out.stderr.contains("root"), "{}", out.stderr);
         assert!(out.stdout.is_empty());
     }
-    assert!(env.calls().is_empty());
+    env.assert_startup_only();
     assert!(
         !env.state.join("jobs").exists(),
         "root の拒否は何も作らない"
@@ -329,7 +316,7 @@ fn recover_without_records_says_so_and_changes_nothing() {
     let out = run_free(&["recover"], &env, &site);
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(out.stdout.contains("ありません"), "{}", out.stdout);
-    assert!(env.calls().is_empty());
+    env.assert_startup_only();
 }
 
 #[test]
@@ -416,9 +403,7 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
         .map(|n| std::fs::read(env.state.join("jobs").join(format!("{}.json", job(n)))).unwrap())
         .collect();
     assert_eq!(records_after, records_before);
-    for c in env.ops_used() {
-        assert!(c == "list" || c == "read", "{c}");
-    }
+    env.assert_read_only();
     assert!(env.drive().trashed.is_empty());
 }
 
@@ -484,7 +469,7 @@ fn resolve_clears_only_a_blocked_job_without_touching_drive() {
         out.stdout
     );
     assert!(out.stdout.contains("本文"), "{}", out.stdout);
-    assert!(env.calls().is_empty(), "Drive には触れない");
+    env.assert_startup_only();
     assert_eq!(env.drive().to_json(), drive_before);
 
     // 2 回目は断る。解除したあとは、書き出しが動く（未完了の記録は、次の書き出しの前の復旧が片付ける）
@@ -573,7 +558,7 @@ fn recover_lists_finished_jobs_whose_notes_ask_for_manual_cleanup_without_touchi
     // 古いほうから
     assert!(text.find(job(21).as_str()) < text.find(job(23).as_str()));
     // Drive にも記録にも触れない。解除の対象にもならない
-    assert!(env.calls().is_empty(), "Drive は照会しない");
+    env.assert_startup_only();
     let records_after: Vec<_> = (21..=24)
         .map(|n| std::fs::read(env.state.join("jobs").join(format!("{}.json", job(n)))).unwrap())
         .collect();

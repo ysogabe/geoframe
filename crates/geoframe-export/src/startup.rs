@@ -19,7 +19,7 @@
 use std::fmt;
 
 use crate::drive::auth::Credentials;
-use crate::drive::http::ApiError;
+use crate::drive::http::{ApiError, Retry};
 use crate::remote::Remote;
 use crate::settings::{
     OPT_FOLDER_TRAVEL_JOURNAL, OPT_FOLDER_YAMARECO, OPT_WORK_FOLDER, Settings,
@@ -27,6 +27,14 @@ use crate::settings::{
 
 /// 祖先をたどる深さの上限。
 pub const MAX_ANCESTOR_DEPTH: usize = 64;
+
+/// 起動時の検査の再試行の方針（最初の 1 回のあとに 2 回。0.5・1 秒の待ち）。ジョブの操作（1・2・4・8・16 秒の 5 回）より短くする:
+/// 直らなければ終了コード 1 で終わり、serve は systemd が 15 秒おきに再起動する（`recover`・`run` は、すぐ結果が分かる）。
+pub const STARTUP_RETRY: Retry = Retry {
+    max_retries: 2,
+    base: std::time::Duration::from_millis(500),
+    cap: std::time::Duration::from_secs(2),
+};
 
 /// 起動できない理由。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,7 +110,9 @@ fn classify(option: &'static str, e: ApiError) -> StartupError {
 
 pub fn startup_check(settings: &Settings) -> Result<(), StartupError> {
     Credentials::load(&settings.drive_credentials).map_err(|_| StartupError::Credentials)?;
-    let remote = Remote::new(settings).map_err(|_| StartupError::Credentials)?;
+    let remote = Remote::new(settings)
+        .map_err(|_| StartupError::Credentials)?
+        .with_retry(STARTUP_RETRY);
     check_drive(&remote, settings)
 }
 

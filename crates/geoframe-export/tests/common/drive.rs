@@ -245,6 +245,25 @@ impl Env {
         self.calls().iter().filter(|c| c["op"] == op).count()
     }
 
+    /// 起動時の検査（トークンと、3 つのフォルダとその祖先の `get`）のほかに、Drive への要求が無い（一覧も読み出しも変更も無い）。
+    #[track_caller]
+    pub fn assert_startup_only(&self) {
+        for op in self.ops_used() {
+            assert!(op == "token" || op == "get", "起動時の検査のほかの要求: {op}");
+        }
+    }
+
+    /// 起動時の検査と、読むだけの操作（`list`・`read`）のほかに、Drive への要求が無い（変更が無い）。
+    #[track_caller]
+    pub fn assert_read_only(&self) {
+        for op in self.ops_used() {
+            assert!(
+                matches!(op.as_str(), "token" | "get" | "list" | "read"),
+                "読むだけではない要求: {op}"
+            );
+        }
+    }
+
     /// Drive を変える操作（`create_folder`・`upload`・`move`・`trash`）も、段階の記録も、ひとつも無い。
     #[track_caller]
     pub fn assert_no_mutations(&self) {
