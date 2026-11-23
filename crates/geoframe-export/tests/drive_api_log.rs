@@ -66,7 +66,8 @@ fn the_logs_carry_no_secrets_names_urls_or_bodies() {
     let cred = fk::write_credentials(&env.root.path().join("cred"));
     let api = DriveApi::new(Credentials::load(&cred).unwrap(), fake.endpoints())
         .with_retry(Retry {
-            max_retries: 3,
+            // 401 のあとのトークンの取り直しも、送った回数に数える（連なった失敗を全部越えるには、余裕が要る）
+            max_retries: 5,
             base: Duration::from_millis(5),
             cap: Duration::from_millis(50),
         })

@@ -216,11 +216,13 @@ impl DriveApi {
         req: &Req<'_>,
         opts: &SendOpts<'_>,
     ) -> Result<Outcome, ApiError> {
+        // 送った回数は、トークンの取り直しをまたいで持ち回る（再試行の回数と、再送の前の確認が初期化されない）
+        let mut attempt: u32 = 0;
         for refreshed in [false, true] {
             let token = self.tokens.get(&self.transport, ctx)?;
             match self
                 .transport
-                .send_with_retry(ctx, req, Some(&token), opts)?
+                .send_counting(ctx, req, Some(&token), opts, &mut attempt)?
             {
                 Outcome::Reply(r) if r.status == 401 => {
                     if refreshed {
@@ -228,12 +230,8 @@ impl DriveApi {
                     }
                     tracing::debug!(op = opts.op, status = 401, "トークンを取り直します");
                     self.tokens.invalidate(&token);
-                    // 取り直したあとの再送の前にも、再送の前の確認を通る（トークンの取り直しで、確認が飛ばない）
-                    if let Some(settled) = opts.settled
-                        && settled()?
-                    {
-                        return Ok(Outcome::AlreadyDone);
-                    }
+                    // 取り直したあとの再送は 2 回目以降の送信として数える（送る前に、状態の確認を通る）
+                    attempt += 1;
                 }
                 other => return Ok(other),
             }

@@ -770,11 +770,14 @@ impl<'a> Drive<'a> {
     /// 移す（ID で移す。`replaced/` が無ければ作る。移したあとの照合は呼び出し側）。移す直前に宛先を一覧して、見えたフォルダが
     /// `old_id` でなければ（動かされた・同名の別のフォルダに替わった）、何も変えずに失敗する。
     pub fn retire_old(&self, old_id: &str) -> Result<(), ExportError> {
+        let check = || match self.target()? {
+            Target::Exists { id } if id == old_id => Ok(()),
+            _ => Err(unavailable("宛先のフォルダが記録した旧フォルダと違います")),
+        };
+        // 何も作らずに確かめ、`replaced/` を用意したあと、移す直前にもう一度確かめる
+        check()?;
         let replaced = self.ensure_work_dir(REPLACED)?;
-        match self.target()? {
-            Target::Exists { id } if id == old_id => {}
-            _ => return Err(unavailable("宛先のフォルダが記録した旧フォルダと違います")),
-        }
+        check()?;
         self.remote
             .move_to(
                 old_id,

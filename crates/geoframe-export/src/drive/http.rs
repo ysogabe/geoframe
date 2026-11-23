@@ -779,7 +779,19 @@ impl Transport {
         token: Option<&str>,
         opts: &SendOpts<'_>,
     ) -> Result<Outcome, ApiError> {
-        let mut attempt: u32 = 0;
+        self.send_counting(ctx, req, token, opts, &mut 0)
+    }
+
+    /// [`Self::send_with_retry`] の、送った回数（`attempt`。最初は 0）を呼び出し側が持つ形。401 のあとのトークンの取り直しで、
+    /// 再試行の回数と「再送の前の確認」が初期化されないように、`authorized` が同じ値を持ち回る（`attempt > 0` なら、送る前に必ず確認する）。
+    pub fn send_counting(
+        &self,
+        ctx: &Ctx<'_>,
+        req: &Req<'_>,
+        token: Option<&str>,
+        opts: &SendOpts<'_>,
+        attempt: &mut u32,
+    ) -> Result<Outcome, ApiError> {
         // 結果が分からない失敗を、再送せずに確かめて返す
         let give_up = |failed: ApiError| -> Result<Outcome, ApiError> {
             if let Some(settled) = opts.settled
@@ -791,7 +803,7 @@ impl Transport {
         };
         loop {
             ctx.check()?;
-            if attempt > 0
+            if *attempt > 0
                 && let Some(settled) = opts.settled
                 && settled()?
             {
@@ -831,7 +843,7 @@ impl Transport {
                             op = opts.op,
                             status,
                             reason = reply.reason(),
-                            retry = attempt + 1,
+                            retry = *attempt + 1,
                             "Drive API が再試行できる状態コードを返しました"
                         );
                         (reply.retry_after, err)
@@ -848,19 +860,19 @@ impl Transport {
                         tracing::debug!(
                             op = opts.op,
                             failure = failure.as_str(),
-                            retry = attempt + 1,
+                            retry = *attempt + 1,
                             "Drive との通信に失敗しました"
                         );
                         (None, ApiError::Net(failure))
                     }
                     Err(e) => return Err(e),
                 };
-            if attempt >= self.retry.max_retries {
-                tracing::warn!(op = opts.op, retries = attempt, "再試行を使い切りました");
+            if *attempt >= self.retry.max_retries {
+                tracing::warn!(op = opts.op, retries = *attempt, "再試行を使い切りました");
                 return Err(failed);
             }
-            ctx.sleep(self.retry.wait_for(attempt, retry_after))?;
-            attempt += 1;
+            ctx.sleep(self.retry.wait_for(*attempt, retry_after))?;
+            *attempt += 1;
         }
     }
 }
