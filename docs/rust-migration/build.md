@@ -30,8 +30,8 @@ cargo test --workspace
 cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 # 成果物: target/x86_64-unknown-linux-musl/release/geoframe
 
-# note 記事用の写真書き出し（別プロセス。docs/note-photo-export/design.md）。配るのは geoframe-export だけで、
-# 試験用の偽の rclone（fake-rclone）は --bin で外す。配置は deploy/README.md §8
+# note 記事用の写真書き出し（別プロセス。docs/note-photo-export/design.md）。配るのは geoframe-export だけ
+# （--bin で指定する）。配置は deploy/README.md §8
 cargo build --release --target x86_64-unknown-linux-musl -p geoframe-export --bin geoframe-export
 # 成果物: target/x86_64-unknown-linux-musl/release/geoframe-export（static-pie。ldd は共有ライブラリを列挙しない）
 ```
@@ -44,10 +44,10 @@ cargo build --release --target x86_64-unknown-linux-musl -p geoframe-export --bi
 
 1. `dtolnay/rust-toolchain@stable`（rustfmt・clippy・muslターゲット付き）と`musl-tools`を入れる。
 2. `Swatinem/rust-cache`でビルドをキャッシュする。
-3. `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`（ワークスペースの全部。`geoframe-export`と、その試験用の`fake-rclone`を含む）。
+3. `cargo fmt --all --check`、`cargo clippy --workspace --all-targets -- -D warnings`、`cargo test --workspace`（ワークスペースの全部。`geoframe-export`を含む）。
 4. `cargo build --release --target x86_64-unknown-linux-musl -p geoframe`。
 5. 成果物（`geoframe`。T2.2から画像処理＝純RustのHEICと、muslのときだけ`mimalloc`も入る）が静的リンクであることを`file`（`statically linked`または`static-pie linked`）と`ldd`（共有ライブラリを列挙しない）で検査し、`--version`を実行する。動的リンクが混ざるとCIが落ちる。さらに、静的バイナリの`geoframe img-probe`で合成のHEIC（ICC付きを含む）を処理して、HEICのデコードが静的のまま動くことを確かめる。T2.2で、PoC用の2つ目のmusl静的ビルドと、libheifへ動的リンクする`imgpoc-heic`ジョブは削除した。
-6. 書き出し（`geoframe-export`）も同じ musl の静的ビルド（`-p geoframe-export --bin geoframe-export`）で作り、静的リンク（`file`と`ldd`）と`--version`を検査する。`fake-rclone`は配らない。
+6. 書き出し（`geoframe-export`）も同じ musl の静的ビルド（`-p geoframe-export --bin geoframe-export`）で作り、静的リンク（`file`と`ldd`）と`--version`を検査する。
 
 ## 3. musl静的ビルドの結果
 

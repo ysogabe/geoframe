@@ -68,7 +68,7 @@ AI は用途（画像の embedding・検索語の embedding・写真の比較・
 note 記事用の写真書き出し（`geoframe-export`。[設計](../note-photo-export/design.md)）は、写真サービスとは別のバイナリで、`GEOFRAME_*` の環境変数を読みません。設定は起動引数だけです（設計 6.2）。
 unit の雛形（[`deploy/geoframe-export.service`](../../deploy/geoframe-export.service)）は、tailnet の IP などを `/etc/default/geoframe-export` の変数から `ExecStart` へ渡します。変数の名前と配置の手順は [`deploy/README.md` §8](../../deploy/README.md) にあります。
 
-- 設定の引数（`run`・`serve`・`recover` 共通）: `--feed-base`（写真サービスの基底 URL。既定 `http://127.0.0.1:8080`）、`--rclone`・`--rclone-config`（絶対パス。必須。設定は専用の client_id で認可したもの）、`--state-dir`（絶対パス。必須）、`--remote-yamareco`・`--remote-travel-journal`（既定 `gdrive:yamareco`・`gdrive:travel-journal`）、`--work-root`（作業用のフォルダ。既定 `gdrive:geoframe-export-work`）、`--rclone-copy-timeout`（秒。既定 2700）、`--rclone-timeout`（秒。既定 300）。
+- 設定の引数（`run`・`serve`・`recover` 共通）: `--feed-base`（写真サービスの基底 URL。既定 `http://127.0.0.1:8080`）、`--drive-credentials`（Drive の資格情報の JSON。絶対パス。必須。専用の client_id で認可したもの。`import-credentials` で作る）、`--state-dir`（絶対パス。必須）、`--folder-yamareco`・`--folder-travel-journal`（宛先の親フォルダの Drive ID。必須）、`--work-folder`（作業用のフォルダの Drive ID。必須）、`--drive-upload-timeout`（秒。既定 2700）、`--drive-timeout`（秒。既定 300）。Drive は Drive API を直接呼ぶ（rclone は使わない。[drive-api.md](../note-photo-export/drive-api.md)）。
 - `serve` の引数: `--listen <ip:port>`（tailnet の帯かループバックの具体的な IP）、`--token-file <path>`（持ち主が実行ユーザー・`0600`・32 バイト以上）、`--allow <ip>`（1 つ以上。何度でも書ける）。
 - 写真サービス側に足したのは、読み取り専用の一覧 API（`GET /api/admin/export/photos`）だけで、設定は増えていません。
 
