@@ -240,3 +240,52 @@ fn the_subcommand_is_not_refused_for_root_and_skips_the_startup_check() {
     let (mut o, mut e) = (Vec::new(), Vec::new());
     assert_eq!(main_with(&args, &mut o, &mut e), EXIT_USAGE);
 }
+
+/// root が取り込むときは、パスの途中のディレクトリ（親より上）も確かめる。試験は root でないので、検査の関数を直接呼ぶ
+/// （一番近い上のディレクトリで決まるものだけを見る。それより上の環境の状態には依らない）。
+#[test]
+fn ancestors_above_the_parent_must_be_owned_by_root_or_the_file_owner_and_not_writable_by_others() {
+    use std::os::unix::fs::PermissionsExt;
+    let me = rclone_conf::effective_uid();
+    // 何も問題のない上のディレクトリだけの道（`/` は root の持ち物で、書き込めない）
+    assert_eq!(
+        rclone_conf::check_ancestors(std::path::Path::new("/usr"), me),
+        Ok(())
+    );
+    assert_eq!(
+        rclone_conf::check_ancestors(std::path::Path::new("/"), me),
+        Ok(())
+    );
+
+    let dir = TempDir::new("import-ancestors");
+    let a = dir.path().join("a");
+    let parent = a.join("b");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // 一番近い上のディレクトリ（a）を、グループ・その他が書き込める → 断る
+    for mode in [0o775, 0o757, 0o777, 0o722] {
+        std::fs::set_permissions(&a, std::fs::Permissions::from_mode(mode)).unwrap();
+        assert_eq!(
+            rclone_conf::check_ancestors(&parent, me),
+            Err(ConfigError::TooPermissive(Target::Directory)),
+            "{mode:o}"
+        );
+    }
+    // 持ち主が、root でも、設定ファイルの持ち主でもない → 断る（この試験のユーザーが root でなければ）
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if me != 0 {
+        assert_eq!(
+            rclone_conf::check_ancestors(&parent, me + 1),
+            Err(ConfigError::WrongOwner(Target::Directory))
+        );
+    }
+    // シンボリックリンクを通って来ても、実際のディレクトリを見る
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let link = dir.path().join("link");
+    symlink(&a, &link).unwrap();
+    assert_eq!(
+        rclone_conf::check_ancestors(&link.join("b"), me),
+        Err(ConfigError::TooPermissive(Target::Directory))
+    );
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o755)).unwrap();
+}

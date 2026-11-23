@@ -32,7 +32,7 @@ unit（`deploy/geoframe-export.service`）:
 - 整合試験は、unit と包みで同じ引数・同じ `LoadCredential` を検査する形にそろえる。
 
 ## 2. 資格情報
-- ファイルは `{"client_id": "...", "client_secret": "...", "refresh_token": "..."}` の 3 つのキーだけの JSON。ほかのキー・重複キー（既存の重複キー検査の仕組みを使う）・空の値は断る。大きさの上限 16KiB。読み方は O_NOFOLLOW、通常のファイル、グループ・他人の権限ビットが無いこと（LoadCredential の写しは 0400 で所有者はサービスのユーザー。root 所有の元ファイルを直接渡す使い方も許すため、所有者は euid か root）。
+- ファイルは `{"client_id": "...", "client_secret": "...", "refresh_token": "..."}` の 3 つのキーだけの JSON。ほかのキー・重複キー（既存の重複キー検査の仕組みを使う）・空の値は断る。大きさの上限 16KiB。読み方は O_NOFOLLOW、通常のファイル、権限ビットは「他人（other）は全部 0・グループの書き込みと実行は 0・グループの読み取り（0040）はファイルのグループが root〔gid 0〕のときだけ許す」（理由は 9.11）。所有者は euid か root（root 所有の元ファイルを直接渡す使い方も許す）。
 - 値はログ・エラー・Debug 表示に出さない（`Debug` を手で実装して伏せる）。
 - アクセストークンはメモリだけに持つ。**資格情報のファイルは決して書かない**（関門: トークン更新後もファイルの更新時刻が変わらない）。
 - トークンの取得: `POST <token_url>` に `grant_type=refresh_token&client_id=…&client_secret=…&refresh_token=…`（application/x-www-form-urlencoded、値は URL エンコード）。応答の `access_token`・`expires_in`（上限 3600、期限の 60 秒前に取り直す）。
@@ -81,8 +81,8 @@ drive.rs（`Drive`）の書き換え:
 - 写真サービスの `crates/geoframe/src/drive.rs` の `send_with_retry`・`authorized` を写して、書き込み向けに直す（共通 crate は作らない）。
   - 再試行するもの: 通信の失敗（接続・TLS・読み取りの途中の切断）・429・5xx・403 で理由が `rateLimitExceeded`/`userRateLimitExceeded`。`Retry-After`（秒）を守る。指数の待ち＋揺らぎ。回数の上限。待ちは期限とキャンセルで打ち切る。
   - 401 はトークンを取り直して 1 回だけやり直す。
-  - **書き込みの再試行は generateIds の前提を守る**: create_folder・upload の再送は、必ず最初に取った同じ ID で送る（応答を失った再送は 409 になり、重複しない）。ID を取り直して送り直さない。move_to・trash の再送の前（または 4xx で断られたとき）は `get(id)` で今の状態を見て、既に目的の状態（親・名前・trashed）なら成功とする。
-  - resumable のアップロードは、セッションの `Location` を保存し、**`Location` のスキーム・ホスト・ポートが設定のアップロードの URL と同じであること**を確かめる（違えば送らずに失敗）。途中で切れたら、`Content-Range: bytes */<size>` で受け取り済みの位置を問い合わせて続きから送る（308 と `Range` 見出し）。セッションが 404/410 で失われたら、**同じ ID** で新しいセッションを始める（作られていれば 409 → 済みの照合）。チャンクは 8MiB の倍数で、チャンクの間にキャンセルと期限を見る。
+  - **書き込みの再試行は generateIds の前提を守る**: create_folder・upload の再送は、必ず最初に取った同じ ID で送る（応答を失った再送は 409 になり、重複しない）。ID を取り直して送り直さない。move_to・trash は、**結果が分からない失敗（通信断・5xx・要求 1 回の時間切れ）のあとに、API の層が自分で再送しない**（待っている間に、フォルダが元の場所へ戻された・中身が足されたかもしれない。再送すると、それを知らずにゴミ箱へ移す）。`get(id)` で今の状態を見て、既に目的の状態（親・名前・trashed）なら成功、そうでなければその失敗を上へ返す（上位は、場所と中身の照合をやり直せる。今は、復旧の表・`confirm_old_left` に渡す）。429・流量制限の 403（処理されていないと分かる応答）は、状態を見てから、待って再送してよい。4xx で断られたときと、401 のあとのトークンの取り直しの再送の前にも、同じ確認を通す（取り直しで確認が飛ばない）。
+  - resumable のアップロードは、セッションの `Location` を保存し、**`Location` のスキーム・ホスト・ポートが設定のアップロードの URL と同じであること**を確かめる（違えば送らずに失敗）。チャンクの失敗（通信断・429・流量制限の 403・5xx）にも、ほかの要求と**同じ再試行の分類と待ち**（`Retry-After` を含む）を使い、待ったあとは `Content-Range: bytes */<size>` で受け取り済みの位置を問い合わせて続きから送る（308 と `Range` 見出し）。セッションが 404/410 で失われたら、**同じ ID** で新しいセッションを始める（作られていれば 409 → 済みの照合）。チャンクは 8MiB の倍数で、チャンクの間にキャンセルと期限を見る。
 - 期限: 一覧などの照会と各書き込みには `--drive-timeout`、写真の送信全体には `--drive-upload-timeout`、そしてジョブ全体の残り時間。要求ごとの ureq の timeout に、その短いほうを掛ける。期限切れは `rclone_timeout`（照会なら今の対応どおり）。
 - キャンセル（`Cancel`）: 要求の前・再試行の待ち・チャンクの間で見る。キャンセルされたら、アップロードのスレッドを全部 join してから `Cancelled` を返し、それから実行枠を手放す（今の「子を止めて wait してから」の約束の置き換え）。変更系の操作の途中で切れた場合は、今と同じく「結果不明」として復旧の表（recovery.rs）に渡す。
 - エラーの対応: 照会の失敗 → `drive_unavailable`、変更系の失敗 → `rclone_failed`、期限 → `rclone_timeout`、invalid_grant → `drive_auth_invalid`（`RemoteError` に変種を足し、`into_query_error`・`into_op_error` で対応づける）。
@@ -136,17 +136,18 @@ drive.rs（`Drive`）の書き換え:
 - 最初の 1 回のあとに 5 回まで（待ちは 1・2・4・8・16 秒に 0〜25% の揺らぎ。上限 30 秒）。`Retry-After` は**秒の形だけ**読む（日時の形は無視して、指数の待ちにする）。上限（30 秒）を超える値は上限で切る。待ちが締め切りの残りを超えるときは、眠らずに期限のエラーを返す。
 - 再試行するもの: 通信の失敗（接続・TLS・時間切れ・読み取りの途中の切断。本文を読む失敗も含む）、429、5xx、403 で、本文のどこかに `rateLimitExceeded`・`userRateLimitExceeded` がある（`errors[]` の何番目でも、形が少し違っても拾う。写真サービスの判定と同じ。権限の不足の 403 は含まない）。使い切ったあと、流量制限は `RateLimited`、5xx は `Status`、通信は `Net`。
 - 再試行しない: ほかの 4xx・3xx（`Status`。404 は `NotFound`）、応答の形の誤り。3xx は `max_redirects(0)` で応答として受け取り、たどらない。**ureq は 308 も応答として返す**（resumable の続きの合図に使う）。環境変数の proxy も使わない。
-- 再送の約束: `create_folder`・`upload` は、最初に `generateIds` で取った ID を本文に入れ、再送も同じ ID（ID を取り直さない）。応答を失った再送は 409 になり、`get` で親・名前・種類（アップロードは大きさと `md5Checksum` も）が期待どおりなら成功、違えば `Mismatch`。`move_to`・`trash` は、再送の前と 4xx で断られたときに `get` で今の状態を見る（`move_to` は「親が移動先だけ・名前が新しい名前・ゴミ箱でない」、`trash` は「ゴミ箱の中」）。済んでいれば再送しない。`move_to` は、移動元と移動先が同じなら送らずに断る。
+- 再送の約束: `create_folder`・`upload` は、最初に `generateIds` で取った ID を本文に入れ、再送も同じ ID（ID を取り直さない）。応答を失った再送は 409 になり、`get` で親・名前・種類（アップロードは大きさと `md5Checksum` も）が期待どおりなら成功、違えば `Mismatch`。`move_to`・`trash` は、**結果が分からない失敗（通信断・5xx・時間切れ）のあと再送しない**: `get` で今の状態を見て（`move_to` は「親が移動先だけ・名前が新しい名前・ゴミ箱でない」、`trash` は「ゴミ箱の中」）、済んでいれば成功、そうでなければその失敗（`Net`・`Status`）を返す。429・流量制限の 403 は、状態を見てから待って再送する。4xx で断られたとき・401 のあとのトークンの取り直しの再送の前も、状態を見る。実装は `SendOpts::resend_unknown`（偽）。`move_to` は、移動元と移動先が同じなら送らずに断る。
 
 ### 9.5 resumable のアップロード
 - チャンクは 8MiB（256KiB の倍数）。8MiB 以下は multipart、超えたら resumable（試験は `with_sizes` で小さくする）。
 - セッションの `Location` は、スキーム・ホスト・ポートが設定のアップロードの URL と同じものだけ（ホスト名は小文字にして比べる。ユーザー情報つき・相対 URL は断る）。違えば送らずに `Rejected`。
 - **チャンクの `PUT` には `Authorization` を付けない**（`upload_id` を含むセッションの URL が認可する。アクセストークンを別のホストへ出さない二重の備えにもなる）。セッションを始める `POST` は付ける。
-- チャンクは 1 回だけ送り、通信の失敗・429・5xx のときは、少し待ってから `Content-Range: bytes */<size>` で位置を問い合わせる（308 と `Range`。見出しが無ければ 0。200・201 ならその応答が完成したファイル）。位置が進まないまま失敗が `max_retries` を超えたら失敗（チャンクを送ったのに 308 の位置が進まないときも失敗として数える。壊れた応答で、期限まで同じチャンクを送り続けない）。404・410 はセッションの喪失で、**同じ ID** で始め直す（3 回まで。始めた時点で 409 なら、できているものを照合する）。
+- チャンクは 1 回だけ送り、通信の失敗・429・流量制限の 403・5xx のときは、共通の分類（`Reply::retryable_failure`）と待ち（`Retry::wait_for`。`Retry-After` があればそれを上限で切る）で待ってから `Content-Range: bytes */<size>` で位置を問い合わせる（308 と `Range`。見出しが無ければ 0。200・201 ならその応答が完成したファイル）。位置が進まないまま失敗が `max_retries` を超えたら失敗（チャンクを送ったのに 308 の位置が進まないときも失敗として数える。壊れた応答で、期限まで同じチャンクを送り続けない）。404・410 はセッションの喪失で、**同じ ID** で始め直す（3 回まで。始めた時点で 409 なら、できているものを照合する）。
 - 手元のファイルは、multipart では送る前に大きさと MD5 を確かめて（違えば送らずに `Rejected`）、resumable では大きさだけ確かめる（MD5 は、完成の応答の `md5Checksum` と照らす。違えば `Mismatch`）。
 
 ### 9.6 一覧・木
 - 件数の上限 20000（`MAX_ENTRIES`）、ページ数の上限 1000、木の深さの上限 32。同じ `nextPageToken` が前に使ったものと重なったら（直前でなくても）`TooManyPages`。名前に `/` を含む項目が木にあれば `BadResponse`（相対パスが曖昧になる。`list_children` は名前をそのまま返す）。木で同じフォルダに 2 度入ったら `TooManyPages`。
+- **形の壊れた応答を「空」として読まない**: 一覧の 200 の本文は、JSON のオブジェクトで `kind` が `drive#fileList`、`files` が配列（必須。空の配列だけが正当な空ページ）、`incompleteSearch` が `true` でないこと（`fields` に `kind`・`incompleteSearch` を足して取る。`true` は `ApiError::Incomplete`。照会の失敗）。`null`・`[]`・`files` の無いオブジェクト・`kind` 違いは `BadResponse`（再試行しない）。`get` の応答も、オブジェクトで `id` が要求した ID と一致すること。偽の Drive は `kind`・`incompleteSearch: false` つきで答える。
 - `Entry.mime` は Drive の `mimeType` のまま（フォルダは `application/vnd.google-apps.folder`。rclone の `inode/directory` ではない）。`is_dir`・`is_shortcut()` で判定するので、後半の呼び出し側は `mime` の値に頼らない。ショートカットは `size` が無いので -1。
 - `read` が上限を超えたら `TooLarge`（`BadOutput`）。エラー応答の本文の上限は 64KiB（成功の本文の上限とは別）。
 
@@ -225,6 +226,16 @@ drive.rs（`Drive`）の書き換え:
 - `Env::new` が偽の Drive の HTTP サーバー（`FakeDrive`）を立て、`Env::settings`（資格情報・3 つの ID・`--drive-endpoint`）をそれに向ける。CLI の試験は `Env::cli_settings_args()`。状態は `fake-drive/`（状態ディレクトリの外）。
 - 偽の Drive に、`do_then_add_folder`（済ませてから同名のフォルダを足す）・`late_then_fail`（移動を預けて 500 で答え、数回の一覧のあとに反映）の効果を足した。偽の模型は、ゴミ箱へ移したフォルダを `resolve` の対象から外す。
 - `// rclone 固有` の検査は、`Env::assert_api_calls_safe`（Authorization が付く〔トークンの入口・チャンクの PUT を除く〕・一覧の `q` は ID だけ・`unsupported`〔完全な削除・中身の更新〕が無い）と、対象のパスで見る呼び出しの形（移動・ゴミ箱は ID で・manifest は最後・md5Checksum を取る）に置き換えた。操作の数は、要求の数ではなく意味の数（ファイル数・移動の回数）で見る。
+
+### 9.11 レビューの指摘を直したこと（PR ②のあと）
+- **資格情報のファイルの権限ビット**（`drive::auth::check_mode`）: `User=geoframe-export` の unit に `LoadCredential=` で渡すと、`$CREDENTIALS_DIRECTORY/<名前>` の写しは mode 0440・所有者 root・グループ root で、サービスのユーザーには ACL（`user:geoframe-export:r--`・`mask::r--`・`group::---`）で読み取りが付く。ACL があると stat の mode のグループのビットは ACL の mask（r）になるので、「グループ・他人のビットが 0」の検査だと、この写しを断ってサービスが終了コード 2 で起動しない（本番機で確かめた事実）。そこで、他人（other）のビットは全部 0、グループの書き込み・実行は 0 を求め、**グループの読み取り（0040）は、ファイルのグループが root（gid 0）のときだけ許す**（root グループは root しか入らず、root は元から読める）。所有者は euid か root のまま。root 以外のグループの 0440・0640、0444、0460 などは断る。試験は uid・gid を変えずに `check_mode` を直接呼ぶ（`drive_auth.rs`）。
+- **作った・照合したフォルダの ID は、書き込みまで引き継ぐ**: `Drive::mkdir_incoming` は `create_folder` が返した ID を、直後の一覧（`incoming/` の直下の `<job_id>`）がちょうど 1 つのフォルダで同じ ID のときだけ返す（食い違えば何も記録せずに失敗）。送信（`upload` の親）・検証（`folder_matches_expected`）・公開の移動（`publish_move`）・復旧（`content_ok`）は、記録した ID を受け取り、名前で引き直さない（`Place`・`place_id`・`incoming_id()` は無くした）。`retire_old` は、公開の記録・ジョブの記録と一致した旧フォルダの ID を受け取る。移す直前の一覧（宛先・`incoming/`）にその ID のフォルダが見えなければ、何も変えずに照合の失敗（`drive_unavailable`）で止まり、復旧の表に渡る。記録の形式は変えない（新しいフィールドは無い）。記録した ID のフォルダを Drive が「無い」と答えたときの検証は、一式と一致しない（`verify_mismatch`。`incoming` は記録の ID と違うので消さず、残りものとして知らせる）。
+- **ゴミ箱・移動の再送**: 5 章・9.4 のとおり、結果が分からない失敗のあとに API の層が再送しない。上位は、移動の失敗なら復旧の表（待って観察を 2 回取り、ID で照合）、ゴミ箱の失敗なら `confirm_old_left`（`replaced/` を一覧し直す）へ進む。再送が要るかは、その照合のあとで決める。
+- **一覧の形**: 9.6 のとおり。
+- **チャンクの再試行**: 9.5 のとおり。共通の分類と待ち（`Retry-After` を含む）を使う。
+- **`import-credentials`（root で動くとき）**: 設定ファイルの親ディレクトリより上の、パスの途中の各ディレクトリを確かめる（`rclone_conf::check_ancestors`）。シンボリックリンクは解決してから見る。各ディレクトリの持ち主は root か設定ファイルの持ち主で、グループ・その他が書き込めないこと（root の持ち物のスティッキービット付き〔`/tmp` など〕は例外）。実行ユーザーが本当に root のときだけ働く（試験の「root のつもり」では見ない）。
+- **ジョブの途中の `invalid_grant`**（判断済み）: 変更前の照会なら `failed`（`drive_auth_invalid`）、変更のあとで結果を観察できなければ `blocked`（`unobservable`）のまま。再認可のあとの手順: ① 別の機体で `rclone authorize` して得た設定を `geoframe-export import-credentials` で取り込み、資格情報のファイルを置き換えて、サービスを再起動する。② `geoframe-export recover` で、`blocked` のジョブの記録と Drive の今の状態（宛先・`incoming/`・`replaced/`）を照らして表示させ、何が起きていたかを確かめる。③ 確かめたあとで `geoframe-export recover --resolve <job_id>` で解除する（解除するまで、次の書き出しは断られる）。
+- **残件**: serve の `--token-file`（`serve/token.rs`）の権限検査は、グループ・その他のビットが 0 のままで、`LoadCredential=` を使う場合は同じ問題が起きうる（今の unit は `/etc/default` の値でファイルを渡しており、`LoadCredential=` ではないので、今は起きない）。
 
 #### 本番の関門で確かめること（偽の Drive では確かめられない）
 - unit の `LoadCredential=` と `ExecStart` の `--drive-credentials %d/drive-credentials`（unit のファイルの中の `%d`）が、実際に展開されること。

@@ -63,8 +63,19 @@ fn a_valid_file_with_owner_only_permissions_is_read() {
 
 #[test]
 fn permissions_for_the_group_or_others_are_refused() {
+    use std::os::unix::fs::MetadataExt;
     let env = Env::new("auth-mode");
-    for mode in [0o640, 0o604, 0o644, 0o660, 0o606, 0o777, 0o610] {
+    // グループの書き込み・実行と、その他のビットは、グループによらず断る
+    let mut modes = vec![
+        0o604, 0o660, 0o606, 0o777, 0o610, 0o620, 0o470, 0o404, 0o402, 0o401,
+    ];
+    let p = write(&env, "m.json", valid_body().as_bytes(), 0o600);
+    // グループの読み取り（0640・0440・0444 …）は、ファイルのグループが root（gid 0）でなければ断る
+    // （root で動かして gid 0 のファイルができる環境では、この組は検査しない。root グループの扱いは下の直接の試験）
+    if std::fs::metadata(&p).unwrap().gid() != 0 {
+        modes.extend([0o640, 0o440, 0o644, 0o444, 0o460, 0o750]);
+    }
+    for mode in modes {
         let p = write(&env, "m.json", valid_body().as_bytes(), mode);
         assert_eq!(
             Credentials::load(&p).unwrap_err(),
@@ -72,6 +83,35 @@ fn permissions_for_the_group_or_others_are_refused() {
             "{mode:o}"
         );
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+}
+
+/// systemd の `LoadCredential=` の写し（mode 0440・所有者 root・グループ root。サービスのユーザーには ACL で読み取りが付き、stat の
+/// グループのビットは ACL の mask になる）を断らない。uid・gid を変えずに、検査の関数を直接呼んで確かめる。
+#[test]
+fn the_root_group_copy_made_by_load_credential_is_accepted_and_other_groups_are_not() {
+    use geoframe_export::drive::auth::check_mode;
+    const REG: u32 = 0o100000;
+    let refused = Err(CredentialsError::TooPermissive);
+    // 受け付ける: 0600・0400（グループによらず）、0440・0640（ファイルのグループが root）
+    for gid in [0, 1000] {
+        assert_eq!(check_mode(REG | 0o600, gid), Ok(()), "gid {gid}");
+        assert_eq!(check_mode(REG | 0o400, gid), Ok(()), "gid {gid}");
+    }
+    assert_eq!(check_mode(REG | 0o440, 0), Ok(()));
+    assert_eq!(check_mode(REG | 0o640, 0), Ok(()));
+    // 0440 でも、ファイルのグループが root 以外なら断る（そのグループの誰かが読める）
+    for gid in [1, 33, 1000, 65534] {
+        assert_eq!(check_mode(REG | 0o440, gid), refused, "gid {gid}");
+        assert_eq!(check_mode(REG | 0o640, gid), refused, "gid {gid}");
+    }
+    // その他のビットは、グループが root でも断る（0444・0404・0402・0401）
+    for mode in [0o444, 0o404, 0o402, 0o401, 0o441, 0o442, 0o447] {
+        assert_eq!(check_mode(REG | mode, 0), refused, "{mode:o}");
+    }
+    // グループの書き込み・実行は、グループが root でも断る（0460・0420・0410・0470・0660・0450）
+    for mode in [0o460, 0o420, 0o410, 0o470, 0o660, 0o450, 0o430] {
+        assert_eq!(check_mode(REG | mode, 0), refused, "{mode:o}");
     }
 }
 

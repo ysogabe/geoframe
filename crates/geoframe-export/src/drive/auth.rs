@@ -3,7 +3,12 @@
 //! - 資格情報のファイルは `{"client_id": "...", "client_secret": "...", "refresh_token": "..."}` の 3 つのキーだけの JSON。ほかのキー・
 //!   重複したキー・空の値は断る。大きさは 16KiB まで。読み方は `O_NOFOLLOW`・通常のファイル・グループと他人の権限ビットが無いこと・
 //!   持ち主が実効ユーザーか root（systemd の `LoadCredential` の写しは 0400 でサービスのユーザーの持ち物。root の持ち物の元のファイルを
-//!   直接渡す使い方も許す）。
+//!   直接渡す使い方も許す）。**権限ビットの検査**は [`check_mode`]: その他（other）のビットはすべて 0、グループの書き込み・実行は 0。
+//!   グループの読み取り（0040）は、**ファイルのグループが root（gid 0）のときだけ**許す。systemd の `LoadCredential=` の写しは、
+//!   mode 0440・所有者 root・グループ root で、サービスのユーザーには ACL（`user:<名前>:r--`・`mask::r--`・`group::---`）で読み取りが
+//!   付く。ACL があると stat の mode のグループのビットは ACL の mask（r）になるので、グループのビットを一律に断ると、この写しを
+//!   断ってしまい、サービスが起動しない（終了コード 2）。root グループは root しか入らないので、読み取りを許してよい（root は
+//!   元から読める）。それ以外のグループの読み取り（0640 など）は、実際にグループの誰かが読めるので断る。
 //! - 値は、ログ・エラー・`Debug` に出さない（`Debug` は手で書いて伏せる）。
 //! - **資格情報のファイルは決して書かない**（アクセストークンはメモリだけに持つ）。
 //! - トークンの取得: `POST <token_url>` に `grant_type=refresh_token&client_id=…&client_secret=…&refresh_token=…`。応答の
@@ -57,7 +62,8 @@ pub enum CredentialsError {
     NotRegularFile,
     /// 持ち主が実効ユーザーでも root でもない。
     WrongOwner,
-    /// グループ・その他に権限がある（0600 か 0400 にする）。
+    /// その他に権限がある・グループに書き込み・実行の権限がある・root 以外のグループに読み取りの権限がある（0600 か 0400 にする。
+    /// root グループの読み取りだけは許す）。
     TooPermissive,
     TooLarge,
     /// JSON のオブジェクトとして読めない（UTF-8 でない・文法の誤り・オブジェクトでない・末尾に余り）。
@@ -76,7 +82,9 @@ impl fmt::Display for CredentialsError {
             Self::NotRegularFile => f.write_str("通常のファイルではありません"),
             Self::WrongOwner => f.write_str("持ち主が実行ユーザーでも root でもありません"),
             Self::TooPermissive => {
-                f.write_str("グループ・その他に権限があります（0600 か 0400 にしてください）")
+                f.write_str(
+                "その他・グループに権限があります（0600 か 0400 にしてください。root グループの読み取りだけは許します）",
+            )
             }
             Self::TooLarge => write!(f, "{MAX_CREDENTIALS_BYTES} バイトを超えています"),
             Self::NotJson => f.write_str("JSON のオブジェクトとして読めません"),
@@ -140,9 +148,7 @@ impl Credentials {
         if meta.uid() != crate::sys::euid() && meta.uid() != 0 {
             return Err(CredentialsError::WrongOwner);
         }
-        if meta.mode() & 0o077 != 0 {
-            return Err(CredentialsError::TooPermissive);
-        }
+        check_mode(meta.mode(), meta.gid())?;
         if meta.len() > MAX_CREDENTIALS_BYTES {
             return Err(CredentialsError::TooLarge);
         }
@@ -174,6 +180,17 @@ impl Credentials {
             get("refresh_token")?,
         )
     }
+}
+
+/// 資格情報のファイルの権限ビット（`mode`。ファイルの種類のビットを含んでよい）と、ファイルのグループ（`gid`）の検査。
+/// その他（other）のビットはすべて 0、グループの書き込み・実行は 0 を求める。グループの読み取り（0040）は、`gid` が root（0）の
+/// ときだけ許す（systemd の `LoadCredential=` の写し。理由はモジュールの説明）。持ち主の検査は呼び出し側。
+#[doc(hidden)]
+pub fn check_mode(mode: u32, gid: u32) -> Result<(), CredentialsError> {
+    if mode & 0o007 != 0 || mode & 0o030 != 0 || (mode & 0o040 != 0 && gid != 0) {
+        return Err(CredentialsError::TooPermissive);
+    }
+    Ok(())
 }
 
 // ---- アクセストークン ----

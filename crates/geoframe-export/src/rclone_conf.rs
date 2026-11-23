@@ -118,7 +118,9 @@ impl fmt::Display for ConfigError {
                 f.write_str("設定ファイルの権限が広すぎます（0600 にしてください）")
             }
             Self::TooPermissive(Target::Directory) => {
-                f.write_str("設定ファイルの親ディレクトリの権限が広すぎます（0700 にしてください）")
+                f.write_str(
+                    "設定ファイルの親ディレクトリ（root が取り込むときは、その上の各ディレクトリも）の権限が広すぎます（親は 0700、上はグループ・その他が書けない形にしてください）",
+                )
             }
             Self::TooLarge => write!(f, "設定ファイルが {CONFIG_MAX_BYTES} バイトを超えています"),
             Self::NotUtf8 => f.write_str("設定ファイルが UTF-8 ではありません"),
@@ -208,10 +210,40 @@ fn read_config_text(path: &Path, uid: u32, any_owner: bool) -> Result<String, Co
         return Err(ConfigError::WrongKind(Target::File));
     }
     check_owner_and_mode(Target::File, meta.uid(), meta.mode(), uid, any_owner)?;
+    // root が、別のユーザーの持ち物の設定を取り込むとき（`import-credentials`）は、パスの途中のディレクトリも確かめる。
+    // 途中のディレクトリを書き換えられるユーザーが、パスの先を別のファイルに差し替えて、root に読ませられないように
+    // （実行ユーザーが本当に root のときだけ。試験の「root のつもり」では見ない）
+    if any_owner && effective_uid() == 0 {
+        check_ancestors(parent, meta.uid())?;
+    }
     if meta.len() > CONFIG_MAX_BYTES {
         return Err(ConfigError::TooLarge);
     }
     read_limited(&mut file)
+}
+
+/// `dir`（設定ファイルの親ディレクトリ）より上の、パスの途中の各ディレクトリを確かめる（root が取り込むとき）。シンボリックリンクは
+/// 先に解決して、実際のディレクトリを見る。各ディレクトリは、持ち主が root か `file_owner`（設定ファイルの持ち主）で、グループ・
+/// その他が書き込めないこと（root の持ち物のスティッキービット付き〔`/tmp` など〕は、書き込めてもよい。他人の持ち物を消せない）。
+/// 親ディレクトリそのものは、[`check_rclone_config_for_uid`] と同じ検査（別に済ませる）。
+pub fn check_ancestors(dir: &Path, file_owner: u32) -> Result<(), ConfigError> {
+    let real = std::fs::canonicalize(dir)
+        .map_err(|e| ConfigError::Unreadable(Target::Directory, e.kind()))?;
+    for ancestor in real.ancestors().skip(1) {
+        let meta = std::fs::symlink_metadata(ancestor)
+            .map_err(|e| ConfigError::Unreadable(Target::Directory, e.kind()))?;
+        if !meta.is_dir() {
+            return Err(ConfigError::WrongKind(Target::Directory));
+        }
+        if meta.uid() != 0 && meta.uid() != file_owner {
+            return Err(ConfigError::WrongOwner(Target::Directory));
+        }
+        let sticky_root = meta.mode() & 0o1000 != 0 && meta.uid() == 0;
+        if meta.mode() & 0o022 != 0 && !sticky_root {
+            return Err(ConfigError::TooPermissive(Target::Directory));
+        }
+    }
+    Ok(())
 }
 
 /// 取り込み（[`read_credentials`]）が取り出す 3 つの値。`Debug` は値を伏せる。
