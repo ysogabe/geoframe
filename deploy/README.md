@@ -552,13 +552,20 @@ sudo /usr/local/bin/geoframe-export import-credentials \
 sudo ls -l /etc/geoframe-export/drive-credentials.json   # -rw------- root root（中身は表示しない）
 ```
 
-- root で動かすので、`--rclone-config`には**絶対パス**を渡し、パスの途中にシンボリックリンク・`..`・空の要素を含めないでください（根から 1 段ずつ開いて確かめるため、含むと断ります）。
+- root で動かすので、`--rclone-config`には**絶対パス**を渡します。パスは、根（`/`）から 1 段ずつ、シンボリックリンクをたどらずに開いて確かめます。次のどれかに当たると断ります。
+  - 相対パス、`..`・`.`・空の要素（`//`や末尾の`/`）を含む。
+  - パスの途中に、シンボリックリンクがある。
+  - パスの途中の各ディレクトリ（設定ファイルの親ディレクトリより上）の持ち主が、root でも設定ファイルの持ち主でもない。
+  - パスの途中の各ディレクトリに、グループまたは他人の書き込み権限がある。ただし、root 所有でスティッキービットが付いたディレクトリ（`/tmp`など）は、書き込めても受け付けます。
+
   `rclone.conf`は、セクション（`--remote`の名前）に専用の`client_id`・`client_secret`と、`token`の`refresh_token`が入っていて、ファイルが 0600・親ディレクトリが 0700 である必要があります。持ち主は問いません（root が、サービスのユーザーの持ち物を読みます）。
-- 出力先は、`O_EXCL`で作ります。**既にあるファイルは上書きしません**（終了コード 1）。作り直すときは、先に退避してから動かします（`sudo mv /etc/geoframe-export/drive-credentials.json /etc/geoframe-export/drive-credentials.json.old`。退避した写しも root の 0600 のまま、不要になったら消します）。
+- 出力先は、`O_EXCL`で作ります。**既にあるファイルは上書きしません**（終了コード 1）。出力先の親（`/etc/geoframe-export`）も作りません（無ければ終了コード 1）ので、先に上の`install -d`で作ります。
+  作り直すときは、ファイルがあれば先に退避してから動かします（`sudo mv /etc/geoframe-export/drive-credentials.json /etc/geoframe-export/drive-credentials.json.old`。退避した写しも root の 0600 のまま、不要になったら消します）。ファイルが無い新規の配置では、退避は要りません。
 - 読めない・形が違う・`refresh_token`が無いときは、何も作らずに終了コード 2 です。
 - 資格情報のファイルは**一度作れば、サービスの起動のたびに読まれる**だけです。rclone の設定（`rclone.conf`）の更新とは連動しません。
 
-rclone 版を動かしていない新しい機体で、`rclone.conf`が無いときは、次の「再認可」の手順で`rclone authorize`のトークンから一時的な`rclone.conf`を作って取り込みます。
+rclone 版を動かしていない新しい機体で、`rclone.conf`が無いときは、次の「再認可」の手順で`rclone authorize`のトークンから一時的な`rclone.conf`を作って取り込みます
+（この機体には`/etc/geoframe-export`も資格情報のファイルもまだ無いので、手順 3 で、取り込みの前に`/etc/geoframe-export`を作ります）。
 
 #### 再認可（`drive_auth_invalid`・起動時の終了コード 2）
 
@@ -589,9 +596,13 @@ rclone 版を動かしていない新しい機体で、`rclone.conf`が無いと
    scope = drive
    token = <1 のトークン>
    ```
-3. 既存の資格情報のファイルを**退避してから**、取り込みます（出力先は上書きされません）。取り込みが失敗したら、退避したファイルを元の名前へ戻します（`sudo mv /etc/geoframe-export/drive-credentials.json.old /etc/geoframe-export/drive-credentials.json`）。
+3. 取り込みの前に、出力先の親を作り、既存の資格情報のファイルがあれば**退避します**（出力先は上書きされません）。新しい機体では`/etc/geoframe-export`が無いので、先に作ります（root 所有・0700。既にあれば、そのまま）。
+   取り込みが失敗したら、退避したファイルを元の名前へ戻します（`sudo mv -f /etc/geoframe-export/drive-credentials.json.old /etc/geoframe-export/drive-credentials.json`。退避していなければ要りません）。
    ```sh
-   sudo mv /etc/geoframe-export/drive-credentials.json /etc/geoframe-export/drive-credentials.json.old
+   sudo install -d -m 0700 -o root -g root /etc/geoframe-export
+   if sudo test -e /etc/geoframe-export/drive-credentials.json; then
+     sudo mv /etc/geoframe-export/drive-credentials.json /etc/geoframe-export/drive-credentials.json.old
+   fi
    sudo /usr/local/bin/geoframe-export import-credentials \
      --rclone-config /root/geoframe-reauth/rclone.conf --remote gdrive \
      --out /etc/geoframe-export/drive-credentials.json
@@ -603,15 +614,24 @@ rclone 版を動かしていない新しい機体で、`rclone.conf`が無いと
    sudo systemctl restart geoframe-export
    journalctl -u geoframe-export -n 20   # 起動時の検査（トークンと 3 つのフォルダ）を通ったことを見る
    ```
+   取り込みはできたのに、起動時の検査で失敗したとき（終了コード 2 のまま）は、journal で原因を見ます。**新しい資格情報が原因でない（フォルダの ID の誤りなど）なら**、原因を直してから起動し直します。
+   新しい資格情報が原因で、退避した`.old`があるときは、元へ戻して起動し直します（`.old`が無い新規の機体では、新しいファイルを消して、手順 1 からやり直します）。
+   ```sh
+   sudo mv -f /etc/geoframe-export/drive-credentials.json.old /etc/geoframe-export/drive-credentials.json   # 退避していたときだけ
+   sudo systemctl reset-failed geoframe-export
+   sudo systemctl restart geoframe-export
+   ```
 5. **起動時の検査を通ったのを確かめてから**、一時ファイルと、退避した古い資格情報を消します（どちらも Drive 全体の権限の値です）。通らなかったときは、`.old`を消さずに原因を調べます。
    ```sh
    sudo rm -rf /root/geoframe-reauth
    sudo rm -f /etc/geoframe-export/drive-credentials.json.old
    ```
-6. 認可の失効でジョブが途中で止まっていたら（`blocked`、または`running`のまま）、**Drive の状態を`recover`で確かめてから**解除します。
+6. 認可の失効でジョブが途中で止まっていたら（`blocked`、または`running`のまま）、`recover`で結果を確かめます。
+   - `running`のまま残ったジョブは、サービスの起動時（または次の書き出しの前）の復旧が、Drive と照らして片付けます。手順 4 の再起動のあとに、引数なしの`recover`で、`running`が残っていないことを確かめます。
+   - `blocked`は、自動では片付きません。引数なしの`recover`が表示する、Drive の今の状態と動きを読み、Drive の画面で必要な片付けを済ませてから、`--resolve`で解除します。`--resolve`は、未解除の`blocked`だけを受け付けます（`running`など、ほかの状態のジョブは断られます）。`--resolve`は Drive に触れず、解除の日時を記録に書くだけです（設計 4.2 の復旧）。
    ```sh
    sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover
-   sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover --resolve <job_id>   # Drive の画面で片付けたあと（設計 4.2 の復旧）
+   sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover --resolve <job_id>   # blocked だけ。Drive の画面で片付けたあと
    ```
 
 `rclone authorize`で作る`rclone.conf`の`token`の中のアクセストークンは約 1 時間で切れますが、取り込むのは`refresh_token`だけです。取り込んだあとは、この`rclone.conf`は要りません。
@@ -644,9 +664,23 @@ drop-in で`ExecStart=`を上書きする形にはしません: CLI の包み（
 | `GEOFRAME_EXPORT_WORK_FOLDER` | 作業用フォルダ（中に`incoming/`・`replaced/`を作る）の Drive ID | （値は書かない） |
 | `GEOFRAME_EXPORT_VERIFY_FOLDER_YAMARECO`・`…_VERIFY_FOLDER_TRAVEL_JOURNAL`・`…_VERIFY_WORK_FOLDER` | 検証用の入口（`geoframe-export-admin.sh --verify`。§8.8 の 4）が使う、検証用の同じ 3 つのフォルダの ID。サービスは読まない | （値は書かない） |
 
+**新規の配置**で、ファイルがまだ無いときだけ、空のファイルを作ります（`install`は既にあるファイルを空にするので、無条件には実行しません）。中身は各自で書きます（上の変数）。
+
 ```sh
-sudo install -o root -g root -m 0600 /dev/null /etc/default/geoframe-export   # 中身は各自で書く（上の変数。既にあれば、足りない行だけを足す）
+sudo test -e /etc/default/geoframe-export || sudo install -o root -g root -m 0600 /dev/null /etc/default/geoframe-export
+sudoedit /etc/default/geoframe-export   # 値をコマンドの引数に書かず、シェルの履歴にも残さない
 ```
+
+**rclone 版からの切り替え**では、ファイルが既にあります。**空にせず**、先に退避してから、Drive の ID の行（上の表の、フォルダの 3 つと検証用の 3 つの計 6 つの変数）を**足します**。既にある行は消しません。
+
+```sh
+sudo cp -p /etc/default/geoframe-export /etc/default/geoframe-export.bak   # 退避（持ち主・モードも保つ）
+sudoedit /etc/default/geoframe-export                                      # 6 つの変数の行を足す
+sudo ls -l /etc/default/geoframe-export                                    # -rw------- root root のままであること
+```
+
+足した行の形は、次の項のとおりです。古い版は新しい変数を読まないので、戻すときに行を消す必要はありません（`.bak`は、切り替えが落ち着いてから消します）。
+
 
 - Drive のフォルダの ID は、Drive の画面でそのフォルダを開いたときの URL の`folders/`の後ろの文字列です（`https://drive.google.com/drive/folders/<ID>`）。
   `KEY=値`の形で**1 変数 1 行**、値は英数字・`_`・`-`だけ（引用符・空白・コメントは付けません。包みはこの形だけを読み、形が違うと断ります）。
@@ -670,14 +704,45 @@ systemd の展開では、`${GEOFRAME_EXPORT_LISTEN}`のような`${…}`は値�
 3. 起動します。`sudo systemctl daemon-reload && sudo systemctl enable --now geoframe-export`、確認は`systemctl is-active geoframe-export`と`journalctl -u geoframe-export -f`です。
    待ち受けは`/healthz`（認証なし。送信元の許可は効く）で確かめます。
 
+#### 止める前の確認（切り替え・切り戻しの両方）
+
+`sudo systemctl stop geoframe-export`は、サービスだけを止めます。CLI（`geoframe-export-admin.sh`が`systemd-run`で作る一時 unit `geoframe-export-cli-*`）は止まりません。
+実行中のジョブ（`running`）や、解除していない`blocked`を残したまま、バイナリと unit を入れ替えないために、**入れ替えの前に**次の（a）〜（c）をこの順に済ませます。
+確認には、**今動いている版**のバイナリと、それに合う`geoframe-export-admin.sh`を使います（切り替えなら、`/opt/geoframe`を更新する前。切り戻しなら、戻す前の今の版）。
+
+- （a）新しい受付と CLI の起動を止めます。呼び出し側（別 VM のエージェント）に、書き出しの依頼を止めてもらいます。このホストで`geoframe-export-admin.sh`を使う人（自分を含む）にも、使わないよう伝えます。
+  確かめたあとに新しい書き出しが始まると、確認が無効になります。入れ替えを終えて、起動時の検査と`/healthz`を確かめるまで、止めたままにします。
+- （b）実行中のジョブを終わらせます。一時 unit が残っていないことを確かめます。
+
+  ```sh
+  systemctl list-units 'geoframe-export-*'   # geoframe-export-cli-*（検証用の入口の分も同じ名前）が出ないこと
+  journalctl -u geoframe-export -n 20        # サービスが書き出しの最中でないこと
+  ```
+
+  一時 unit があれば、終わるのを待ちます。待てないときは`sudo systemctl stop <unit 名>`で止めます（飛んでいる Drive の要求の終わりを待ってから、後始末をして終わります）。止めたジョブは`running`のまま残るので、（c）で片付けます。
+- （c）今動いている版の`recover`（引数なし。Drive も記録も変えません）で、`running`（未完了）と未解除の`blocked`が無いことを確かめます。
+
+  ```sh
+  sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover; echo "exit=$?"
+  ```
+
+  「未完了のジョブも、blocked のジョブも、片付けの知らせが残っているジョブもありません。」と出て、終了コードが 0 なら、先へ進みます。
+  - 終了コード 4（実行枠が取れない）は、書き出しが実行中です。（b）に戻ります。
+  - `running`が表示されたら、今の版のサービスを再起動して（`sudo systemctl restart geoframe-export`）、起動時の復旧に Drive と照合させます（数分は`/healthz`が答えません）。そのあと、もう一度`recover`で確かめます。
+  - 未解除の`blocked`が表示されたら、表示された Drive の今の状態を読み、Drive の画面で必要な片付けを済ませてから、`recover --resolve <job_id>`で解除します。解除してから、もう一度`recover`で確かめます。
+  - 「知らせ」だけが表示された記録は、手作業の片付けの知らせです。入れ替えを止める条件ではありませんが、読んで、必要なら片付けます。
+
+（a）〜（c）が済んだら、（d）サービスを止めて、バイナリと unit を入れ替えます。
+
 **rclone 版から切り替えるとき**は、次の順に行います。**古い unit（`--rclone*`の引数）のまま新しいバイナリを動かさない**ため、サービスを止めてからバイナリを入れ替えます（`import-credentials`は、新しいバイナリがディスクにあれば、サービスが止まっていても動かせます）。
 
-1. 今のバイナリと unit を`.prev`に残す（§8.2）。
-2. `/opt/geoframe`を更新する（§5 の手順 2。更新の前の SHA を控える。unit・包み・この文書が新しくなる）。
-3. `sudo systemctl stop geoframe-export`で止める。
-4. 新しいバイナリと unit を置く（§8.2 の`install`）。資格情報を取り込む（§8.3）。`/etc/default/geoframe-export`に、Drive のフォルダの 3 つの ID（と検証用の 3 つ）を足す（§8.4、§8.5）。
-5. `sudo systemctl daemon-reload && sudo systemctl start geoframe-export`で起動し、journal の起動時の検査（トークン・3 つのフォルダ）が通ったことと`/healthz`を確かめます。
-6. §8.8 の確認へ進みます。**rclone 本体と`rclone.conf`（`/var/lib/geoframe-export/rclone/`）は、§8.8 の確認と切り戻しの練習が済み、しばらく様子を見るまで残します**（戻すときに前のバイナリが使います。撤去は別途）。
+1. 上の（a）〜（c）を、**`/opt/geoframe`を更新する前に**済ませます（古い版のバイナリと、古い包みで確かめます）。
+2. 今のバイナリと unit を`.prev`に残す（§8.2）。
+3. `/opt/geoframe`を更新する（§5 の手順 2。更新の前の SHA を控える。unit・包み・この文書が新しくなる）。
+4. `sudo systemctl stop geoframe-export`で止める（上の（d））。
+5. 新しいバイナリと unit を置く（§8.2 の`install`）。資格情報を取り込む（§8.3。`/etc/geoframe-export`を先に作る）。`/etc/default/geoframe-export`は、退避してから、Drive のフォルダの 3 つの ID（と検証用の 3 つ）を**足す**（§8.4 の切り替えの手順、§8.5）。
+6. `sudo systemctl daemon-reload && sudo systemctl start geoframe-export`で起動し、journal の起動時の検査（トークン・3 つのフォルダ）が通ったことと`/healthz`を確かめます。通ったら、呼び出し側に再開を伝えます。
+7. §8.8 の確認へ進みます。**rclone 本体と`rclone.conf`（`/var/lib/geoframe-export/rclone/`）は、§8.8 の確認と切り戻しの練習が済み、しばらく様子を見るまで残します**（戻すときに前のバイナリが使います。撤去は別途）。
 
 起動の最初に、止まっていたジョブの復旧（Drive の照合）を済ませてから待ち受けます。止まったジョブがあると、再起動のあと数分は`/healthz`も答えず、接続が拒否されます
 （unit は`Type=simple`なので、systemd は待ちません）。呼び出し側は拒否されたら間隔を空けて再試行します。
@@ -736,7 +801,15 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
 
    - 準備（Drive）: Drive の画面で、共有せずに、最上位に検証用の親フォルダ（その中に`yamareco`と`travel-journal`）と検証用の作業用フォルダを作ります（§8.5）。
      本番の親フォルダ・作業用フォルダとは入れ子にしません。それぞれの ID を、`/etc/default/geoframe-export`の`…_VERIFY_…`の 3 変数に書きます（§8.4）。
-     3 つのフォルダが別物で入れ子でないことは、起動時に Drive へ問い合わせて確かめます。
+     `--verify`の起動時の検査が照合するのは、**検証用の 3 つの ID の間だけ**です。検証用の変数に本番の ID を入れ間違えても、そのまま起動します（本番の宛先に書いてしまいます）。
+     そこで、**最初の書き込みの前に**、本番用の 3 つと検証用の 3 つの計 6 つを、次のように見比べます。
+     1. 6 つの変数が全部あり、値が全部違うこと（`6`と出ること。値は画面に出ません）。
+        ```sh
+        sudo grep -E '^GEOFRAME_EXPORT_(VERIFY_)?(FOLDER_(YAMARECO|TRAVEL_JOURNAL)|WORK_FOLDER)=' /etc/default/geoframe-export | cut -d= -f2 | sort -u | wc -l
+        ```
+     2. Drive の画面で、本番側の 3 つのフォルダと検証用の 3 つのフォルダを開き、URL の`folders/`の後ろが、`/etc/default/geoframe-export`の対応する変数の値であることを、1 つずつ確かめます
+        （変数名とフォルダの名前を対応づけて見ます。値をチャットや記録に貼りません）。
+     3. 本番側のフォルダが検証用のフォルダの中に、検証用のフォルダが本番側のフォルダの中にないこと（同じフォルダや入れ子がないこと）を、Drive の画面で親をたどって確かめます。
    - 検証用の状態ディレクトリは、一時サービスの`StateDirectory=geoframe-export-verify`が、専用ユーザーの持ち物・0700 で作ります（先に作る必要はありません）。
      検証用の入口は、本番の`export.lock`を取らず、本番の状態ディレクトリにも触れません。本番の書き出しと同時に動かしても、互いの記録・ロックは書き換わりません。
    - 旧 manifest と比べる手順は、次の 3 つを、この順に行います（ここに 1 か所だけ書きます）。
@@ -769,8 +842,18 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
    - 起動時の検査（トークン・3 つのフォルダとその祖先）と、ジョブの始めの確認の所要時間。`--drive-timeout`の既定（5 分）で足りること。
    - 移動（公開・退避）で、フォルダの ID が保たれること（移したあとの ID の照合で`blocked`にならないこと）。
    - 宛先と同じ名前のフォームやショートカットが、`ambiguous_destination`として見えること。
-   - `md5Checksum`が、Drive のバイナリのファイル（写真と`manifest.json`）に付くこと。その値が、作業領域のファイルの MD5（`md5sum`）と一致すること。フォルダ・Google のネイティブ文書には付かないこと
-     （一式に無いファイルとして断られます）。`replace`の前の確認（`modified`）と、ゴミ箱へ移す前の確認（`retired_content_changed`）は、この MD5 に頼ります。
+   - `md5Checksum`が、Drive のバイナリのファイル（写真と`manifest.json`）に付くこと。その値が、書き出したファイルの MD5 と一致すること。フォルダ・Google のネイティブ文書には付かないこと
+     （一式に無いファイルとして断られます）。
+     作業領域のファイルはジョブの終わりに消えるので、書き出しのあとに`md5sum`では比べられません。成功のあとは、**検証用の状態ディレクトリの`published/`に保存されたファイルごとの MD5**を使います。
+     `/var/lib/geoframe-export-verify/published/<種類>-<フォルダ名>.json`（例: `yamareco-<日付>.json`。専用ユーザーの 0700 なので`sudo`で読みます）の`entry.files[]`に、一式の全部（写真と`manifest.json`）の`path`と`md5`（小文字の 16 進 32 文字）があります。
+     Drive の`md5Checksum`は、Drive の画面には出ません。Drive API の`files.get`（`fields=md5Checksum`。API Explorer でも読めます）で、検証用のフォルダの中のファイルごとに読み、`entry.files[]`の`md5`と照らします。
+     画面からファイルをダウンロードして、その`md5sum`を`entry.files[]`の`md5`と照らす方法でも確かめられます。`md5sum -c`に使う一覧は、次のように作れます（ダウンロードしたファイルのあるディレクトリで）。
+     ```sh
+     sudo python3 -I -c 'import json,sys; [print(f["md5"] + "  " + f["path"]) for f in json.load(open(sys.argv[1]))["entry"]["files"]]' \
+       /var/lib/geoframe-export-verify/published/<種類>-<フォルダ名>.json > md5.list
+     md5sum -c md5.list
+     ```
+     `replace`の前の確認（`modified`）と、ゴミ箱へ移す前の確認（`retired_content_changed`）は、この MD5 に頼ります。
      書き出し直したフォルダに、Drive の画面で同じ名前・同じ大きさで中身だけ違うファイルを上書きしたときも、`--dry-run`の`managed`は`true`のままです
      （公開の記録にそのフォルダの ID と MD5 があり、manifest の`generator`・`destination`・`folder`が合っていれば、管理フォルダとして扱います）。`replace`は中身の MD5 の照合で`conflict`（`modified`）になり、終了コード 3 で断られます。
      フォルダの中に Google ドキュメントがある場合も、同じく`modified`で断られます。これらも見ます。
@@ -779,13 +862,18 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
    - 429・403（流量制限）の実際の応答と、再試行の回数（journal の操作名・状態コード・再試行の回数だけが出ます。URL のクエリ・トークン・ファイル名は出ません）。
    - **8MiB を超えるファイル（resumable）を 1 つ**、本物の Drive へ送ること。本番の写真は 1 枚 1MB 前後で、通常の関門ではこの経路が通りません。チャンクの`PUT`に`Authorization`を付けない判断（セッションの URL が認可する）、
      `Content-Range`・308・`Range`の形、同じ ID での始め直しも、ここで本物で確かめます。
-   - SIGTERM（`systemctl stop`）から 180 秒以内に止まること（書き出しの途中で止めたあと、`recover`で記録が片付くこと）。
+   - SIGTERM（`systemctl stop`）から 180 秒以内に止まること。書き出しの途中で止めたあと、`running`のまま残った記録は、次の起動時（または次の書き出しの前）の復旧が Drive と照らして片付けます。
+     サービスを起動し直し、引数なしの`recover`で`running`が残っていないことを確かめます。`blocked`になった記録だけは自動では片付かないので、`recover`が表示する Drive の状態を読み、Drive の画面で片付けてから`recover --resolve <job_id>`で解除します（`--resolve`は未解除の`blocked`だけを受け付けます）。
 9. 切り戻しの練習をします（§8.9）。前のバイナリと前の unit で起動できること、`/healthz`が答えることを、書き出しのない時間に確かめます。
 
 ### 8.9 切り戻し
 
 API 版で問題が出たら、前のバイナリ（rclone 版）と前の unit に戻します。ジョブの記録と公開の記録の形式は変わらないので、前のバイナリが読めます。
 **戻すには、§8.2 で`.prev`に残した 2 つと、rclone 本体（`/usr/local/bin/rclone`）・`rclone.conf`（`/var/lib/geoframe-export/rclone/`）が要ります**（切り替えのあとも、しばらく残します）。
+
+**戻す前に、§8.6 の「止める前の確認」の（a）〜（c）を、API 版（今動いている版）で済ませます**。`systemctl stop`は CLI の一時 unit を止めず、実行中のジョブや未解除の`blocked`を残したまま入れ替えると、前のバイナリが片付けを引き受けることになるためです。
+（a）呼び出し側の依頼と CLI の起動を止める、（b）実行中のジョブを終わらせ、`systemctl list-units 'geoframe-export-*'`で一時 unit が無いことを確かめる、（c）API 版の`recover`で`running`と未解除の`blocked`が無いことを確かめる、の順です。
+そのあと、（d）サービスを止めて入れ替えます。
 
 ```sh
 sudo systemctl stop geoframe-export
@@ -795,6 +883,8 @@ sudo systemctl daemon-reload
 sudo systemctl start geoframe-export
 systemctl is-active geoframe-export && curl --fail -s -o /dev/null -w '%{http_code}\n' http://<待ち受けの IP>:<ポート>/healthz
 ```
+
+起動時の検査と`/healthz`が通ったら、呼び出し側に再開を伝えます。`/etc/default/geoframe-export`は、足した行を残したままで足ります（前の版は読みません）。
 
 - 戻したあと、止まっていたジョブは起動時の復旧が片付けます（`recover`で確かめられます）。`blocked`があれば、§8.10 のとおり Drive の状態を確かめて解除します。
 - CLI の包み（`geoframe-export-admin.sh`）は、`/opt/geoframe`の checkout に含まれる**新しい版の引数**（`--drive-credentials`・`--folder-*`）を使うので、前のバイナリには使えません。
