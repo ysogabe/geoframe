@@ -741,7 +741,7 @@ systemd の展開では、`${GEOFRAME_EXPORT_LISTEN}`のような`${…}`は値�
 
   一覧できない・読めない記録が 1 つでもあれば、**入れ替えを止めます**。原因（`jobs/`の権限・持ち主、壊れた記録のファイル）を直し、もう一度`recover`で確かめ直します。
   読めない記録は`--resolve`では解除できません。中身（`status`が`running`・`blocked`でないか）を root で確かめて、問題がなければファイルを`jobs/`の外へ手で退かします（退かすまで、新しい書き出しは断られます）。
-  `recover`自体が起動時の検査で失敗するとき（終了コード 1・2）は、§8.9 の「API 版の`recover`が動かないとき」の読み方で、`jobs/`の記録を確かめます。
+  API 版の`recover`自体が起動時の検査で失敗するとき（終了コード 1・2）は、原因を直して確かめ直します（§8.10 の「起動しない」）。直せないまま前の版へ戻すなら、§8.9 の手順（止めてから入れ替え、戻した rclone 版の`recover`で確かめる）で行います。
   - 終了コード 4（実行枠が取れない）は、書き出しが実行中です。（b）に戻ります。
   - `running`が表示されたら、今の版のサービスを再起動して（`sudo systemctl restart geoframe-export`）、起動時の復旧に Drive と照合させます（数分は`/healthz`が答えません）。そのあと、もう一度`recover`で確かめます。
   - 未解除の`blocked`が表示されたら、表示された Drive の今の状態を読み、Drive の画面で必要な片付けを済ませてから、`recover --resolve <job_id>`で解除します。解除してから、もう一度`recover`で確かめます。
@@ -818,33 +818,34 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
      本番の親フォルダ・作業用フォルダとは入れ子にしません。それぞれの ID を、`/etc/default/geoframe-export`の`…_VERIFY_…`の 3 変数に書きます（§8.4）。
      `--verify`の起動時の検査が照合するのは、**検証用の 3 つの ID の間だけ**です。検証用の変数に本番の ID を入れ間違えても、そのまま起動します（本番の宛先に書いてしまいます）。
      そこで、**最初の書き込みの前に**、本番用の 3 つと検証用の 3 つの計 6 つを、次のように見比べます。
-     1. 6 つの変数が、**それぞれちょうど 1 行**あり、値が Drive の ID の形（英数字・`_`・`-`の 1〜128 文字。包みが読む形と同じ）で、**6 つとも互いに違う**こと。
-        変数名ごとの行数・形式・重複の有無だけを表示します（値は画面に出ません）。最後に`OK`と出て、終了コードが 0 ならよいです。
+     1. `/etc/default/geoframe-export`の 6 つの変数を、次の 3 段で確かめます（値は画面に出ません。出るのは、行の番号・変数名・行数・OK/NG・重複の数だけです）。
+        - (i) ファイルの**全部の行**が、空行・`#`で始まるコメント・大文字の`KEY=…`のどれかであること（先頭や`=`の前に空白のある行、`;`のコメント、バックスラッシュを含む行は NG）。
+          systemd の`EnvironmentFile=`は、同じ名前を**後の行が上書き**し、空白のある行や引用符も受け付けるので、包みが読む行（`^KEY=`）と、サービスが実際に使う値とが食い違う書き方を、ここで断ちます。
+        - (ii) 6 つの変数が、それぞれ**ちょうど 1 行**あり、値が Drive の ID の形（英数字・`_`・`-`の 1〜128 文字。包みが読む形と同じ）であること。
+        - (iii) 同じファイルを**systemd 自身に読ませて**（`systemd-run -p EnvironmentFile=`。常設のサービスと同じ読み方です）、(ii) で見た行の値と systemd が渡した値が一致し、6 つの値が互いに違うこと。
+          本番用と検証用で、同じ ID を書き間違えていないかも、ここで見ます。
+        最後に`OK`と出て、終了コードが 0 ならよいです。
         ```sh
-        sudo awk '
-        BEGIN {
-          n = split("GEOFRAME_EXPORT_FOLDER_YAMARECO GEOFRAME_EXPORT_FOLDER_TRAVEL_JOURNAL GEOFRAME_EXPORT_WORK_FOLDER GEOFRAME_EXPORT_VERIFY_FOLDER_YAMARECO GEOFRAME_EXPORT_VERIFY_FOLDER_TRAVEL_JOURNAL GEOFRAME_EXPORT_VERIFY_WORK_FOLDER", K, " ")
-          for (i = 1; i <= n; i++) want[K[i]] = 1
-        }
-        {
-          k = $0; sub(/=.*/, "", k)
-          if (index($0, "=") && (k in want)) { cnt[k]++; val[k] = substr($0, length(k) + 2) }
-        }
-        END {
-          ng = 0
-          for (i = 1; i <= n; i++) {
-            k = K[i]; v = val[k]; c = cnt[k] + 0
-            f = (c == 1 && v ~ /^[A-Za-z0-9_-]+$/ && length(v) <= 128) ? "OK" : "NG"
-            d = "OK"
-            if (c == 1) { if (v in seen) d = "NG"; seen[v] = 1 }
-            if (c != 1 || f != "OK" || d != "OK") ng = 1
-            printf "%-45s 行数=%d 形式=%s 重複=%s\n", k, c, (c == 1 ? f : "-"), (c == 1 ? d : "-")
-          }
-          print (ng ? "NG: 上の NG の行を直す" : "OK: 6 つとも 1 行ずつ・形式が正しく・互いに違う")
-          exit ng
-        }' /etc/default/geoframe-export; echo "exit=$?"
+        sudo systemd-run --pipe --wait --collect --quiet --expand-environment=no \
+          -p EnvironmentFile=/etc/default/geoframe-export \
+          /bin/sh -c '
+        f=/etc/default/geoframe-export; ng=0
+        K="GEOFRAME_EXPORT_FOLDER_YAMARECO GEOFRAME_EXPORT_FOLDER_TRAVEL_JOURNAL GEOFRAME_EXPORT_WORK_FOLDER GEOFRAME_EXPORT_VERIFY_FOLDER_YAMARECO GEOFRAME_EXPORT_VERIFY_FOLDER_TRAVEL_JOURNAL GEOFRAME_EXPORT_VERIFY_WORK_FOLDER"
+        n=$(grep -nEv "^(#[^\\]*|[A-Z][A-Z0-9_]*=[^\\]*)?$" "$f" | cut -d: -f1 | tr "\n" " ")
+        echo "(i) 形が違う行の番号: ${n:-なし}"; [ -z "$n" ] || ng=1
+        for k in $K; do
+          c=$(grep -c "^$k=" "$f"); v=$(grep "^$k=" "$f" | cut -d= -f2-); a=OK; m=OK
+          printf %s "$v" | grep -Eqx "[A-Za-z0-9_-]{1,128}" || a=NG
+          [ "$v" = "$(printenv "$k")" ] || m=NG
+          echo "(ii) $k 行数=$c 形式=$a systemd の値と一致=$m"
+          { [ "$c" = 1 ] && [ "$a" = OK ] && [ "$m" = OK ]; } || ng=1
+        done
+        d=$(printenv $K | sort | uniq -d | wc -l)
+        echo "(iii) systemd が渡した 6 つの値のうち、重複している値の数: $d"; [ "$d" = 0 ] || ng=1
+        if [ "$ng" = 0 ]; then echo OK; else echo NG; exit 1; fi
+        '; echo "exit=$?"
         ```
-        行数が 1 でない（0 は欠け、2 以上は重複した行）、形式が`NG`（引用符・空白・長すぎる値など）、重複が`NG`（ほかの変数と同じ値）の変数は、`/etc/default/geoframe-export`を直してから、もう一度確かめます。
+        `NG`の行は、`/etc/default/geoframe-export`を直してから、もう一度確かめます（(i) で番号が出た行は、空白・引用符・コメントの付いた行や、同じ変数の再定義です）。
      2. Drive の画面で、本番側の 3 つのフォルダと検証用の 3 つのフォルダを開き、URL の`folders/`の後ろが、`/etc/default/geoframe-export`の対応する変数の値であることを、1 つずつ確かめます
         （変数名とフォルダの名前を対応づけて見ます。値をチャットや記録に貼りません）。
      3. 本番側のフォルダが検証用のフォルダの中に、検証用のフォルダが本番側のフォルダの中にないこと（同じフォルダや入れ子がないこと）を、Drive の画面で親をたどって確かめます。
@@ -899,8 +900,18 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
      `Content-Range`・308・`Range`の形、同じ ID での始め直しも、ここで本物で確かめます。
    - SIGTERM（`systemctl stop`）から 180 秒以内に止まること。**常設のサービスを再起動する形では試しません**: サービスは本番の状態ディレクトリだけを復旧の対象にするので、検証用の記録の`running`は片付かず、検証用の復旧の確かめになりません。
      検証用の入口で、次の順に行います（本番の入口・本番のサービスは使いません）。
-     1. 検証用の書き出しを始めます（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from <日付> --destination yamareco`。`--dry-run`は付けません）。包みが標準エラーに出す一時 unit の名前（`geoframe-export-cli-…`）を控えます（控えそこねたら`systemctl list-units 'geoframe-export-cli-*'`）。
-     2. 書き出しの途中で、別の端末から、その一時 unit を止めます。止めるのにかかった時間を測り、180 秒以内であることを見ます。
+     1. 検証用の書き出しを始めます（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from <日付> --destination yamareco`。`--dry-run`は付けません）。
+        日付は、書き出せる写真が**多い日**で、**検証用の宛先にまだ書き出していない日**を選びます（書き出し済みの日は`conflict`で終わり、アップロードまで進みません。写真が少ないと、止める前に終わります）。
+        包みが標準エラーに出す一時 unit の名前（`geoframe-export-cli-…`）を控えます（控えそこねたら`systemctl list-units 'geoframe-export-cli-*'`）。
+        **一時 unit の名前が出た時点では、起動時の検査や写真の取得の途中のことがあります。** この段で止めると、Drive へのアップロードの前なので`interrupted`で終わり、停止の試験になりません。
+     2. **アップロードが始まったのを確かめてから**、別の端末から、その一時 unit を止めます。始まったことは、次のどちらかで見ます。
+        - Drive の画面で、検証用の作業用フォルダの`incoming/`の中に、今回のジョブのフォルダができ、中のファイルが増えていくこと。
+        - 検証用の状態ディレクトリの、今回のジョブの記録の`stage`が`uploading`になっていること（`status`は`running`のまま）。`uploading`は、`incoming/`のフォルダを作る前から付くので、**表示されてから数秒待ち、Drive の画面で`incoming/`の中にファイルが現れるのを見てから**止めます。表示するのは`status`と`stage`だけです。
+          ```sh
+          sudo sh -c 'for f in /var/lib/geoframe-export-verify/jobs/*.json; do echo "$f"; grep -E "\"(status|stage)\":" "$f"; done'
+          ```
+          今回のジョブは、`status`が`running`のものです。`stage`の行が無い（`progress`が`null`）間は、まだ取得の途中です。
+        始まったら、止めるのにかかった時間を測り、180 秒以内であることを見ます。
         ```sh
         time sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
         ```
@@ -914,9 +925,24 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
         sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover --resolve <job_id>
         ```
      サービス自体の停止（本番の`systemctl stop geoframe-export`）は、切り替え・切り戻しの実際の入れ替え（§8.6 の（d）、§8.9）で、停止にかかった時間が`TimeoutStopSec=180s`以内であることを見ます（同じ値です）。
-9. 切り戻しの練習をします（§8.9）。前のバイナリと前の unit で起動できること、`/healthz`が答えることを、書き出しのない時間に確かめます。
-10. **手順 8 までの検証（MD5 の照合・停止の試験を含む）が全部済んだあとに**、検証用の記録と Drive のフォルダを片付けます（どちらも本番の記録・宛先ではありません）。
-    - 検証用の状態ディレクトリを消します。`running`・`blocked`の記録が残っていないことを、先に`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover`で確かめます。
+9. 切り戻しの練習をします（§8.9 の手順 1〜5 を、書き出しのない時間に、受付と CLI を止めて行います）。**始める前に、ビルドした API 版のバイナリ（`sha256`を控えたもの）が手元にあることを確かめます**（練習のあとの切り替え直しで使います。本番の`/usr/local/bin/geoframe-export`は、練習で rclone 版に置き換わります）。前のバイナリ・前の unit・前の包みで起動できること、戻した版の`recover`が§8.6 の（c）と同じ条件を満たすこと、`/healthz`が答えることを確かめます。
+   **練習のあとは rclone 版（バイナリ・unit・`/opt/geoframe`の包み）が入っています。** そのまま手順 10 に進むと、`--verify`の包みが rclone 版のもの（検証用の rclone の設定の写しを要る）になり、検証用の Drive の ID も読みません。
+   **先に API 版へ切り替え直します**（受付と CLI は止めたままにします）。
+   - 今動いているのは rclone 版なので、まず（a）〜（c）（§8.6）を、今の`/opt/geoframe`の包みと rclone 版の`recover`で確かめます。
+   - 常設のサービスを止め、`systemctl is-active`が`inactive`であることを確かめます。
+   - `/opt/geoframe`を、§5 の手順 2 で控えた**更新後の SHA**（API 版のコミット）へ戻します（`git reset --hard`）。
+   - API 版のバイナリ（§8.2 でビルドして`sha256`を控えたもの）と unit（`/opt/geoframe/deploy/geoframe-export.service`）を、§8.2 の`install`で置き直します。**`.prev`へ写す`cp`は行いません**（`.prev`は rclone 版のままにします）。
+   - `sudo systemctl daemon-reload && sudo systemctl start geoframe-export`で起動し、起動時の検査（トークン・3 つのフォルダ）と`/healthz`を確かめます。
+   - 資格情報の取り込みと`/etc/default/geoframe-export`の追記は済んでいるので、行いません。
+   起動時の検査と`/healthz`が通り、呼び出し側に再開を伝えてから、手順 10 へ進みます。
+10. **手順 8 までの検証（MD5 の照合・停止の試験を含む）が全部済み、手順 9 のあとに API 版へ切り替え直してから**、検証用の記録と Drive のフォルダを片付けます（どちらも本番の記録・宛先ではありません）。
+    - 先に、検証用の入口で動いている CLI を止め、記録を確かめます。
+      ```sh
+      systemctl list-units 'geoframe-export-cli-*'   # 検証用の入口の分も同じ名前。出たら、終わるのを待つか、sudo systemctl stop <unit 名>
+      sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover; echo "exit=$?"
+      ```
+      §8.6 の（c）と同じ条件（終了コードが 0、一覧できない・読めない記録の知らせが無い、`running`と未解除の`blocked`が無い）を満たすまで、消しません。
+    - 満たしたら、検証用の状態ディレクトリを消します。
       ```sh
       sudo rm -rf /var/lib/geoframe-export-verify
       ```
@@ -924,72 +950,57 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
 
 ### 8.9 切り戻し
 
-API 版で問題が出たら、前のバイナリ（rclone 版）と前の unit に戻します。ジョブの記録と公開の記録の形式は変わらないので、前のバイナリが読めます。
-**戻すには、§8.2 で`.prev`に残した 2 つと、rclone 本体（`/usr/local/bin/rclone`）・`rclone.conf`（`/var/lib/geoframe-export/rclone/`）が要ります**（切り替えのあとも、しばらく残します）。
+API 版で問題が出たら、前のバイナリ（rclone 版）・前の unit・前の包み（`/opt/geoframe`のコミット）に戻します。ジョブの記録と公開の記録の形式は変わらないので、前のバイナリが読めます。
+**戻すには、§8.2 で`.prev`に残した 2 つ、§5 の手順 2 で控えた更新の前の SHA、rclone 本体（`/usr/local/bin/rclone`）・`rclone.conf`（`/var/lib/geoframe-export/rclone/`）が要ります**（切り替えのあとも、しばらく残します）。
+また、手順 4 で条件がそろわず元へ戻すとき（後述）のために、ビルドした API 版のバイナリと、§5 の手順 2 で控えた更新後の SHA も手元に残します。
 
-**戻す前に、§8.6 の「止める前の確認」の（a）〜（c）を、API 版（今動いている版）で済ませます**。`systemctl stop`は CLI の一時 unit を止めず、実行中のジョブや未解除の`blocked`を残したまま入れ替えると、前のバイナリが片付けを引き受けることになるためです。
-（a）呼び出し側の依頼と CLI の起動を止める、（b）実行中のジョブを終わらせ、`systemctl list-units 'geoframe-export-*'`で一時 unit が無いことを確かめる、（c）API 版の`recover`で`running`と未解除の`blocked`が無いことを確かめる、の順です。（c）は、終了コード 0 だけで済ませません。`jobs/`を一覧できない・読めない記録の知らせが無いことも見ます（§8.6 の（c））。
+API 版が動いているときも、起動できないとき（資格情報の欠落・フォルダの ID の誤り・Drive への接続の失敗など）も、**同じ手順**で行います。順序は次のとおりです。
 
-**API 版の`recover`が動かないとき**（資格情報の欠落・フォルダの ID の誤り・Drive への接続の失敗などで、API 版が起動できないとき）: API 版の`recover`も、ジョブの記録を読む前に、起動時の検査（Drive へ問い合わせます）で失敗します（終了コード 1・2、標準エラーに「起動しません」）。
-このときも、（a）（b）（新しい受付と CLI の起動を止めたままにする・一時 unit が無いことを確かめる）は同じように済ませます。そのうえで、（c）は**Drive に接続せずに**、状態ディレクトリの`jobs/`の記録を root で全部読んで確かめます
-（記録の JSON の`status`と`resolved_at`だけを見ます。ジョブの ID（記録のファイル名）と状態の名前だけを表示し、写真・ID・メモなどの値は表示しません）。サービスと CLI の一時 unit が止まっているので、記録は書き換わりません。
+1. 手順 3 の`git reset --hard`で、この文書も前の版に置き換わります。**この手順を、別の場所（別のウィンドウ・印刷）に開いてから**始めます。
+   受付と CLI の起動を止め、一時 unit が無いことを確かめます（§8.6 の（a）（b））。サービスを止める前に、rclone 版が使う 2 つが残っていることも確かめます。
+   ```sh
+   sudo ls -l /usr/local/bin/rclone /var/lib/geoframe-export/rclone/rclone.conf   # どちらも在ること
+   ```
+   API 版が動くときは、続けて§8.6 の（c）（API 版の`recover`）も済ませます（Drive と照らして、`running`と未解除の`blocked`を片付けておくため）。API 版が起動できないときは、（c）は飛ばします。手順 4 で確かめます。
+2. **常設のサービスを止め**、止まったことを確かめます。`Restart=on-failure`なので、API 版が起動できないときは、止めないうちに systemd が起動をやり直して、記録を書き換えることがあります。
+   ```sh
+   sudo systemctl stop geoframe-export
+   sudo systemctl reset-failed geoframe-export   # failed のとき（再起動の待ちと開始の制限の印を消す）。そうでなければ何も起きない
+   systemctl is-active geoframe-export           # inactive と出ること。activating・deactivating・active のうちは、先へ進まない
+   ```
+   起動をやり直している最中（`activating`）のサービスも、`stop`で止まり、そのまま`inactive`にとどまります（systemd 257 で確かめました）。
+   止めるのにかかった時間は、`TimeoutStopSec=180s`以内のはずです（§8.8 の 8）。
+3. **サービスを止めたまま**、前の版へ入れ替えます（まだ start しません）。
+   ```sh
+   sudo git -C /opt/geoframe reset --hard <§5 の手順 2 で控えた、更新の前の SHA>   # 包み・unit・この文書が rclone 版になる
+   sudo cp -p /usr/local/bin/geoframe-export.prev /usr/local/bin/geoframe-export
+   sudo cp -p /usr/local/lib/systemd/system/geoframe-export.service.prev /usr/local/lib/systemd/system/geoframe-export.service
+   sudo systemctl daemon-reload
+   ```
+4. **戻した rclone 版の包みで、rclone 版の`recover`を動かします**。
+   ```sh
+   sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover; echo "exit=$?"
+   ```
+   rclone 版の`recover`（引数なし）は、起動時に rclone の設定（`rclone.conf`の専用の client_id・持ち主・権限）だけを調べ、API 版の起動時の検査（Drive への問い合わせ）は通りません。API 版が壊れていても動きます。
+   実行枠（`export.lock`）を取ってからジョブの記録を読み、Drive も記録も変えません（`running`と`blocked`の記録があるときだけ、rclone で Drive を照会して表示します）。
+   終了コードは、0（表示できた）・1（実行枠を取れない）・2（`rclone.conf`の検査と状態ディレクトリの用意の失敗）・4（実行枠が取られている）です。
+   §8.6 の（c）と**同じ条件**がそろったときだけ、手順 5 へ進みます（終了コードが 0、「`jobs/`を一覧できません」「読めない記録」の知らせが出力に無い、`running`と未解除の`blocked`の表示が無い）。
+5. 条件がそろったら、起動して確かめます。
+   ```sh
+   sudo systemctl start geoframe-export
+   systemctl is-active geoframe-export && curl --fail -s -o /dev/null -w '%{http_code}\n' http://<待ち受けの IP>:<ポート>/healthz
+   ```
+   起動時の検査と`/healthz`が通ったら、呼び出し側に再開を伝えます。`/etc/default/geoframe-export`は、足した行を残したままで足ります（前の版は読みません）。
 
-```sh
-sudo python3 -I -c '
-import json, os, re, stat, sys
-d = sys.argv[1]
-run = blk = bad = 0
-try:
-    names = sorted(os.listdir(d))
-except OSError:
-    print("jobs/ を一覧できません"); sys.exit(1)
-for n in names:
-    if not re.fullmatch(r"[0-9a-f]{32}\.json", n):
-        continue
-    p = os.path.join(d, n)
-    try:
-        st = os.lstat(p)
-        if not stat.S_ISREG(st.st_mode) or st.st_size > 2 * 1024 * 1024:
-            raise ValueError
-        v = json.load(open(p, "rb"))
-        s = v["status"]
-        if v["version"] != 1 or v["job_id"] + ".json" != n or s not in ("running", "succeeded", "conflict", "failed", "interrupted", "blocked"):
-            raise ValueError
-        r = v["resolved_at"]
-        if r is not None and not isinstance(r, str):
-            raise ValueError
-    except Exception:
-        bad += 1; print(n, "読めない記録"); continue
-    if s == "running":
-        run += 1
-    if s == "blocked" and r is None:
-        blk += 1
-    print(n, s, "（未解除）" if s == "blocked" and r is None else "")
-print("running=%d 未解除のblocked=%d 読めない記録=%d" % (run, blk, bad))
-sys.exit(1 if run or blk or bad else 0)
-' /var/lib/geoframe-export/jobs; echo "exit=$?"
-```
+手順 4 の条件がそろわないときは、**start せずに止まり**、原因を調べます。
+- `recover`自体が失敗する: 終了コード 2 は、rclone 版の`rclone.conf`の検査（持ち主・権限・専用の client_id）か、状態ディレクトリです。標準エラーの表示を読んで直します。終了コード 4 は、実行枠が取られています。手順 1 に戻って、一時 unit が残っていないかを確かめます。終了コード 1 は、実行枠を取れません（`export.lock`の権限）。
+- 一覧できない・読めない記録: `jobs/`の権限・持ち主を直すか、壊れた記録を root で確かめ、問題がなければファイルを`jobs/`の外へ手で退かします（§8.6 の（c））。そのあと、手順 4 を最初からやり直します。
+- 未解除の`blocked`: 表示された Drive の今の状態を読み、Drive の画面で必要な片付けを済ませてから、`recover --resolve <job_id>`で解除し、手順 4 をやり直します。
+- `running`: 手順 1 の一時 unit の止め忘れが無いかを確かめます。**start はしません**。API 版の記録の片付けは、API 版で行うので、手順 3 を元に戻します（API 版のバイナリ・unit・`/opt/geoframe`の SHA を置き直し、まだ start しません）。API 版が起動できない原因を直し（§8.10 の「起動しない」）、API 版の`recover`（§8.6 の（c））で片付けてから、手順 1 からやり直します。
 
-最後の行が`running=0 未解除のblocked=0 読めない記録=0`で、終了コードが 0 のときだけ、切り戻しへ進みます（`jobs/`を一覧できないときも、終了コードは 1 です）。
-`running`か未解除の`blocked`が 1 つでもあるか、一覧できない・読めない記録があれば、**切り戻しません**。前のバイナリが、その片付けを引き受けてしまうためです。
-先に API 版を起動できる状態に直します（原因は journal に出る項目名で分かります。§8.10 の「起動しない」）。起動できたら、API 版の`recover`（上の（c））で片付けてから、切り戻します。
-
-（c）が済んだら、（d）サービスを止めて入れ替えます。
-
-```sh
-sudo systemctl stop geoframe-export
-sudo cp -p /usr/local/bin/geoframe-export.prev /usr/local/bin/geoframe-export
-sudo cp -p /usr/local/lib/systemd/system/geoframe-export.service.prev /usr/local/lib/systemd/system/geoframe-export.service
-sudo systemctl daemon-reload
-sudo systemctl start geoframe-export
-systemctl is-active geoframe-export && curl --fail -s -o /dev/null -w '%{http_code}\n' http://<待ち受けの IP>:<ポート>/healthz
-```
-
-起動時の検査と`/healthz`が通ったら、呼び出し側に再開を伝えます。`/etc/default/geoframe-export`は、足した行を残したままで足ります（前の版は読みません）。
-
-- 戻したあと、止まっていたジョブは起動時の復旧が片付けます（`recover`で確かめられます）。`blocked`があれば、§8.10 のとおり Drive の状態を確かめて解除します。
-- CLI の包み（`geoframe-export-admin.sh`）は、`/opt/geoframe`の checkout に含まれる**新しい版の引数**（`--drive-credentials`・`--folder-*`）を使うので、前のバイナリには使えません。
-  前のバイナリで CLI を使うときは、§5 の手順 2 の最初の`rev-parse`で控えた SHA へ、§6 の`git reset --hard`で checkout を戻してから使います（このとき、unit・包み・この文書の§8 も前の版になります）。サービス（`serve`）だけを戻すなら、unit の入れ替えで足ります。
+戻したあとのこと:
+- 戻したあとは、`recover`で、`running`と未解除の`blocked`が無いことを確かめます（手順 4 でそろえてから start したので、通常は無いはずです）。`blocked`が出たら、§8.10 のとおり Drive の状態を確かめて解除します。
+- 手順 3 で`/opt/geoframe`も前のコミットへ戻したので、CLI の包み（`geoframe-export-admin.sh`）も rclone 版になり、前のバイナリで使えます（このとき、unit・包み・この文書の§8 も前の版になります）。API 版へ戻し直すときは、§8.6 の「rclone 版から切り替えるとき」の手順です。
 - rclone 本体と`rclone.conf`の撤去は、切り替えが落ち着いてから別に行います（この文書では扱いません）。
 
 ### 8.10 トラブルシュート
