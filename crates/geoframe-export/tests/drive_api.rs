@@ -98,6 +98,26 @@ impl Fx {
     }
 }
 
+/// 条件が真になるまで待つ（10 秒で諦める）。実時間の決め打ちでなく、進み具合で試験を進める。
+fn wait_until(mut f: impl FnMut() -> bool) {
+    let start = Instant::now();
+    while !f() {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "条件が満たされません"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// これまでに受けた、チャンクの送信の要求の数。
+fn chunk_requests(fake: &fk::FakeDrive) -> usize {
+    fake.requests()
+        .iter()
+        .filter(|r| r["op"] == "upload" && r["phase"] == "chunk")
+        .count()
+}
+
 fn model_md5(b: &[u8]) -> String {
     common::drive::model::md5_hex(b)
 }
@@ -670,6 +690,22 @@ fn a_final_chunk_whose_response_was_lost_is_found_complete_by_the_status_query()
 }
 
 #[test]
+fn a_308_that_never_advances_stops_at_the_retry_limit_instead_of_the_deadline() {
+    let fx = Fx::new("api-resume-stuck");
+    let api = small_chunks(&fx);
+    let body = big(600_000);
+    let (path, md5) = fx.local("big.jpg", &body);
+    // 受け取り済みの位置（Range）が付かない 308 が続く
+    fx.fake
+        .add_rule_contains("upload", "phase:chunk", 0, 1000, fk::status(308));
+    let r = api.upload(&fx.work, "big.jpg", &path, &md5, body.len() as u64, fx.up());
+    assert_eq!(r, Err(ApiError::BadResponse));
+    // 最初の 1 回 + 再試行の回数（3）。期限（45 分）まで送り続けない
+    assert_eq!(fx.uploads("chunk"), 4);
+    assert_eq!(fx.count_named(&fx.work, "big.jpg"), 0);
+}
+
+#[test]
 fn chunk_failures_stop_after_the_retry_limit() {
     let fx = Fx::new("api-resume-giveup");
     let api = small_chunks(&fx);
@@ -837,6 +873,43 @@ fn rate_limits_and_server_errors_are_retried_then_succeed() {
         assert_eq!(fx2.env.op_count("list"), 3, "{effect}");
     }
     let _ = fx;
+}
+
+#[test]
+fn a_rate_limit_403_is_recognised_wherever_the_reason_is_in_the_body() {
+    // 理由が 1 件目でない・errors が空で本文の文言にだけある、でも流量制限として再試行する。権限の不足の 403 は再試行しない
+    let retried = [
+        fk::forbidden_with_reasons(&["backendError", "userRateLimitExceeded"]),
+        fk::forbidden_with_reasons(&["rateLimitExceeded"]),
+        fk::status_with_body(
+            403,
+            r#"{"error":{"code":403,"message":"User Rate Limit Exceeded. userRateLimitExceeded","errors":[]}}"#,
+        ),
+    ];
+    for effect in retried {
+        let fx = Fx::new("api-403-rate");
+        fx.env.add_rule("list", 0, 1, effect.clone());
+        assert!(
+            fx.api.list_children(&fx.yamareco, fx.dl()).is_ok(),
+            "{effect}"
+        );
+        assert_eq!(fx.env.op_count("list"), 2, "{effect}");
+    }
+    let not_retried = [
+        fk::forbidden_with_reasons(&["insufficientFilePermissions"]),
+        fk::forbidden_with_reasons(&["forbidden", "dailyLimitExceeded"]),
+        fk::status_with_body(403, "<html>forbidden</html>"),
+    ];
+    for effect in not_retried {
+        let fx = Fx::new("api-403-perm");
+        fx.env.add_rule("list", 0, 100, effect.clone());
+        assert_eq!(
+            fx.api.list_children(&fx.yamareco, fx.dl()),
+            Err(ApiError::Status(403)),
+            "{effect}"
+        );
+        assert_eq!(fx.env.op_count("list"), 1, "{effect}");
+    }
 }
 
 #[test]
@@ -1093,16 +1166,19 @@ fn a_cancel_between_chunks_stops_the_upload() {
     let api = small_chunks(&fx).with_cancel(cancel.clone());
     let body = big(1_000_000);
     let (path, md5) = fx.local("big.jpg", &body);
-    // 2 つ目のチャンクの応答を遅らせ、その間にキャンセルする
+    // 2 つ目のチャンクの応答を遅らせ、その要求が記録されてから（応答の前に）キャンセルする
     fx.fake
         .add_rule_contains("upload", "phase:chunk", 1, 1, sleep_ms(400));
-    let c2 = cancel.clone();
-    let t = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(200));
-        c2.cancel();
+    let fake = &fx.fake;
+    let r = std::thread::scope(|s| {
+        let h = s.spawn(|| {
+            wait_until(|| chunk_requests(fake) >= 2);
+            cancel.cancel();
+        });
+        let r = api.upload(&fx.work, "big.jpg", &path, &md5, body.len() as u64, fx.up());
+        h.join().unwrap();
+        r
     });
-    let r = api.upload(&fx.work, "big.jpg", &path, &md5, body.len() as u64, fx.up());
-    t.join().unwrap();
     assert_eq!(r, Err(ApiError::Cancelled));
     assert_eq!(fx.uploads("chunk"), 2, "3 つ目は送らない");
     assert_eq!(fx.count_named(&fx.work, "big.jpg"), 0);
@@ -1117,10 +1193,11 @@ fn a_cancel_stops_every_parallel_upload_and_all_threads_return() {
     let files: Vec<_> = (0..4)
         .map(|i| fx.local(&format!("p{i}.jpg"), &body))
         .collect();
-    // どのチャンクも 300ms かかる（3 チャンクで 900ms）。350ms でキャンセルする
+    // どのチャンクも 300ms かかる（3 チャンクで 900ms）。4 本とも最初のチャンクの要求が出たところでキャンセルする
     fx.fake
         .add_rule_contains("upload", "phase:chunk", 0, 1000, sleep_ms(300));
     let start = Instant::now();
+    let fake = &fx.fake;
     let results: Vec<Result<String, ApiError>> = std::thread::scope(|s| {
         let handles: Vec<_> = files
             .iter()
@@ -1132,7 +1209,8 @@ fn a_cancel_stops_every_parallel_upload_and_all_threads_return() {
                 s.spawn(move || api.upload(&work, &format!("p{i}.jpg"), path, md5, 800_000, dl))
             })
             .collect();
-        std::thread::sleep(Duration::from_millis(350));
+        // 4 本とも、最初のチャンクの要求が出て、応答を待っているところ
+        wait_until(|| chunk_requests(fake) >= 4);
         cancel.cancel();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });

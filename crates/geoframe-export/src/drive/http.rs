@@ -476,16 +476,9 @@ impl Reply {
         serde_json::from_slice(&self.body).map_err(|_| ApiError::BadResponse)
     }
 
-    /// Drive のエラー応答の `reason`（`error.errors[0].reason`）。決まった語だけ返し、ほかは `other`（ログ向け。本文は出さない）。
+    /// Drive のエラー応答の `reason`（`error.errors[].reason`）。決まった語だけ返し、ほかは `other`（ログ向け。本文は出さない）。
+    /// 流量制限の理由が 1 つでもあれば、それを返す。
     pub fn reason(&self) -> &'static str {
-        let reason = serde_json::from_slice::<Value>(&self.body)
-            .ok()
-            .and_then(|v| {
-                v["error"]["errors"][0]["reason"]
-                    .as_str()
-                    .map(str::to_owned)
-            })
-            .unwrap_or_default();
         const KNOWN: [&str; 10] = [
             "rateLimitExceeded",
             "userRateLimitExceeded",
@@ -498,12 +491,35 @@ impl Reply {
             "fileNotDownloadable",
             "authError",
         ];
-        KNOWN.into_iter().find(|k| *k == reason).unwrap_or("other")
+        if self.is_rate_limit() {
+            return if self.text().contains("userRateLimitExceeded") {
+                "userRateLimitExceeded"
+            } else {
+                "rateLimitExceeded"
+            };
+        }
+        let reasons: Vec<String> = serde_json::from_slice::<Value>(&self.body)
+            .ok()
+            .and_then(|v| v["error"]["errors"].as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|e| e["reason"].as_str().map(str::to_owned))
+            .collect();
+        reasons
+            .iter()
+            .find_map(|r| KNOWN.into_iter().find(|k| k == r))
+            .unwrap_or("other")
     }
 
-    /// 流量制限の 403 か（`rateLimitExceeded`・`userRateLimitExceeded`）。
+    fn text(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.body)
+    }
+
+    /// 流量制限の 403 か。本文のどこかに `rateLimitExceeded`・`userRateLimitExceeded` があれば真（`errors[]` の何番目でも、
+    /// 形が少し違っても拾う。写真サービスの `is_rate_limit_body` と同じ判定。権限の不足の 403 は、これらを含まない）。
     fn is_rate_limit(&self) -> bool {
-        matches!(self.reason(), "rateLimitExceeded" | "userRateLimitExceeded")
+        let text = self.text();
+        text.contains("rateLimitExceeded") || text.contains("userRateLimitExceeded")
     }
 }
 

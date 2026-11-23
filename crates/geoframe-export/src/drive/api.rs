@@ -648,8 +648,25 @@ impl DriveApi {
                     }
                     Ok(reply) => match reply.status {
                         308 => {
-                            offset = next_offset(&reply, want.size, offset)?;
-                            failures = 0;
+                            let received = next_offset(&reply, want.size)?;
+                            if received > offset {
+                                offset = received;
+                                failures = 0;
+                                continue;
+                            }
+                            // 送ったのに位置が進まない（壊れた応答が続くと、期限まで同じチャンクを送り続けてしまう）。
+                            // 失敗として数え、受け取り済みの位置から送り直す
+                            offset = received;
+                            failures += 1;
+                            if failures > retry.max_retries {
+                                tracing::warn!(
+                                    op = "upload",
+                                    retries = failures - 1,
+                                    "チャンクを送っても位置が進みません"
+                                );
+                                return Err(ApiError::BadResponse);
+                            }
+                            ctx.sleep(retry_wait(&retry, failures - 1))?;
                             continue;
                         }
                         404 | 410 => {
@@ -713,7 +730,7 @@ impl DriveApi {
         };
         match r.status {
             200 | 201 => Ok(SessionState::Complete(r.json()?)),
-            308 => Ok(SessionState::Received(next_offset(&r, size, 0)?)),
+            308 => Ok(SessionState::Received(next_offset(&r, size)?)),
             404 | 410 => Ok(SessionState::Lost),
             s => Err(ApiError::status(s)),
         }
@@ -821,8 +838,9 @@ enum SessionState {
     Lost,
 }
 
-/// 308 の `Range: bytes=0-N` から、次に送る位置（N + 1。見出しが無ければ 0）。`size` を超える・戻りすぎる値は断る。
-fn next_offset(reply: &Reply, size: u64, current: u64) -> Result<u64, ApiError> {
+/// 308 の `Range: bytes=0-N` から、受け取り済みの位置（N + 1。見出しが無ければ 0）。`size` 以上は断る
+/// （全部受け取ったなら、応答は 200・201 のはず）。
+fn next_offset(reply: &Reply, size: u64) -> Result<u64, ApiError> {
     let received = match reply.range.as_deref() {
         None => 0,
         Some(r) => {
@@ -834,11 +852,9 @@ fn next_offset(reply: &Reply, size: u64, current: u64) -> Result<u64, ApiError> 
             last.checked_add(1).ok_or(ApiError::BadResponse)?
         }
     };
-    // 全部受け取ったのに 200 でない、は決められた形ではない
     if received >= size {
         return Err(ApiError::BadResponse);
     }
-    let _ = current;
     Ok(received)
 }
 

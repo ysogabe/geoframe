@@ -109,6 +109,7 @@ drive.rs（`Drive`）の書き換え:
 
 ## 8. 本番の関門（PR③ のあと。参考）
 §8.8 の --verify の入口で: 移動で ID が保たれる、同名のフォーム・ショートカットが ambiguous_destination、md5Checksum が作業領域の MD5 と一致、Google 文書入り・同じ大きさで中身を変えたフォルダが modified で断られる、rclone 版が公開したフォルダを API 版で replace できる、ゴミ箱行きがフォルダと中身ごと戻せる、トークン更新後も資格情報のファイルの更新時刻が変わらない、所要時間、unit の上限の測り直し、.prev へ戻す練習。
+**8MiB を超えるファイル（resumable）を 1 つ、本物の Drive へ送る**（本番の写真は 1 枚 1MB 前後で、通常の関門では resumable の経路が通らない。チャンクの `PUT` に `Authorization` を付けない 9.5 の判断も、ここで本物で確かめる。`Content-Range`・308・`Range` の形、同じ ID での始め直しも）。
 
 ## 9. 実装で決めたこと（前半: 型と偽の Drive の HTTP サーバー）
 
@@ -133,7 +134,7 @@ drive.rs（`Drive`）の書き換え:
 
 ### 9.4 再試行
 - 最初の 1 回のあとに 5 回まで（待ちは 1・2・4・8・16 秒に 0〜25% の揺らぎ。上限 30 秒）。`Retry-After` は**秒の形だけ**読む（日時の形は無視して、指数の待ちにする）。上限（30 秒）を超える値は上限で切る。待ちが締め切りの残りを超えるときは、眠らずに期限のエラーを返す。
-- 再試行するもの: 通信の失敗（接続・TLS・時間切れ・読み取りの途中の切断。本文を読む失敗も含む）、429、5xx、403 で `error.errors[0].reason` が `rateLimitExceeded`・`userRateLimitExceeded`。使い切ったあと、流量制限は `RateLimited`、5xx は `Status`、通信は `Net`。
+- 再試行するもの: 通信の失敗（接続・TLS・時間切れ・読み取りの途中の切断。本文を読む失敗も含む）、429、5xx、403 で、本文のどこかに `rateLimitExceeded`・`userRateLimitExceeded` がある（`errors[]` の何番目でも、形が少し違っても拾う。写真サービスの判定と同じ。権限の不足の 403 は含まない）。使い切ったあと、流量制限は `RateLimited`、5xx は `Status`、通信は `Net`。
 - 再試行しない: ほかの 4xx・3xx（`Status`。404 は `NotFound`）、応答の形の誤り。3xx は `max_redirects(0)` で応答として受け取り、たどらない。**ureq は 308 も応答として返す**（resumable の続きの合図に使う）。環境変数の proxy も使わない。
 - 再送の約束: `create_folder`・`upload` は、最初に `generateIds` で取った ID を本文に入れ、再送も同じ ID（ID を取り直さない）。応答を失った再送は 409 になり、`get` で親・名前・種類（アップロードは大きさと `md5Checksum` も）が期待どおりなら成功、違えば `Mismatch`。`move_to`・`trash` は、再送の前と 4xx で断られたときに `get` で今の状態を見る（`move_to` は「親が移動先だけ・名前が新しい名前・ゴミ箱でない」、`trash` は「ゴミ箱の中」）。済んでいれば再送しない。`move_to` は、移動元と移動先が同じなら送らずに断る。
 
@@ -141,7 +142,7 @@ drive.rs（`Drive`）の書き換え:
 - チャンクは 8MiB（256KiB の倍数）。8MiB 以下は multipart、超えたら resumable（試験は `with_sizes` で小さくする）。
 - セッションの `Location` は、スキーム・ホスト・ポートが設定のアップロードの URL と同じものだけ（ホスト名は小文字にして比べる。ユーザー情報つき・相対 URL は断る）。違えば送らずに `Rejected`。
 - **チャンクの `PUT` には `Authorization` を付けない**（`upload_id` を含むセッションの URL が認可する。アクセストークンを別のホストへ出さない二重の備えにもなる）。セッションを始める `POST` は付ける。
-- チャンクは 1 回だけ送り、通信の失敗・429・5xx のときは、少し待ってから `Content-Range: bytes */<size>` で位置を問い合わせる（308 と `Range`。見出しが無ければ 0。200・201 ならその応答が完成したファイル）。位置が進まないまま失敗が `max_retries` を超えたら失敗。404・410 はセッションの喪失で、**同じ ID** で始め直す（3 回まで。始めた時点で 409 なら、できているものを照合する）。
+- チャンクは 1 回だけ送り、通信の失敗・429・5xx のときは、少し待ってから `Content-Range: bytes */<size>` で位置を問い合わせる（308 と `Range`。見出しが無ければ 0。200・201 ならその応答が完成したファイル）。位置が進まないまま失敗が `max_retries` を超えたら失敗（チャンクを送ったのに 308 の位置が進まないときも失敗として数える。壊れた応答で、期限まで同じチャンクを送り続けない）。404・410 はセッションの喪失で、**同じ ID** で始め直す（3 回まで。始めた時点で 409 なら、できているものを照合する）。
 - 手元のファイルは、multipart では送る前に大きさと MD5 を確かめて（違えば送らずに `Rejected`）、resumable では大きさだけ確かめる（MD5 は、完成の応答の `md5Checksum` と照らす。違えば `Mismatch`）。
 
 ### 9.6 一覧・木
@@ -160,3 +161,14 @@ drive.rs（`Drive`）の書き換え:
 ### 9.8 共通にしたもの
 - 重複キーを断る JSON の読み方は、`serve.rs` の本文の検査から `jsonfile::parse_strict_object(bytes, 許すキー)` に移して、資格情報の読み込みと共有した（serve の振る舞いは変えない）。
 - ureq は `rustls`・`gzip`（geoframe crate と同じ形）。Cargo.lock に新しいパッケージは増えない。
+
+### 9.9 後半（つなぎ込み）へ
+
+- `Env::ops()` には `token`・`get`・`generate_ids` が混ざる（rclone 版には無い）。`op_count("upload")` は**要求の数**で、ファイルの数ではない（resumable は 1 ファイルが複数行）。1 段目の受け入れ試験の「並び」の検査は、`token` を除く・`get`・`generate_ids` を含めた並びに直す。`mutating_ops`・`assert_no_mutations` は読むだけの操作を除くので、そのまま使える。
+- 試験側の `Env::save()` は、サーバーのロックの外で `drive.json` を書く。要求が飛んでいる最中に書き換えると、サーバーの更新と食い違って更新が消えうる。書き換えは `Hook::mutate_after` のように、フローが止まっている間に行う。
+- 要求 1 回の上限（JSON 60 秒、チャンク・multipart 10 分）は、unit の `TimeoutStopSec=180s` より長い。キャンセルは要求の最中には効かない（要求の前・再試行の待ち・チャンクの間で見る）。
+- multipart は、中身と本文で最大 16MiB 弱をメモリに持つ。並列 4 なら 64MiB 前後で、`MemoryMax` の測り直しに含める。
+- 名前に `/` は渡せない（`Rejected`）。サブフォルダつきの相対パスの写真は、後半がフォルダを作って、葉の名前で送る。
+- `read` は上限を超えると `TooLarge`（→ `BadOutput`）を返す。`Remote::read` の「上限 + 1 バイトまで返す」とは違うので、呼び出し側の「超えたか」の判定を合わせる。
+- フォルダの `Entry.mime` は Drive の値（`application/vnd.google-apps.folder`）。`is_dir` で判定する。
+- `DriveApi::list_tree` の順は幅優先（rclone の `lsjson -R` の順とは違う）。呼び出し側は、集合として並べ替えて比べる（`drive/mod.rs` は並べ替えて比べている）。

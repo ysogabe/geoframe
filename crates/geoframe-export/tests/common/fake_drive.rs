@@ -100,6 +100,16 @@ pub fn rate_limit_403() -> Value {
     json!({"kind": "status", "status": 403, "reason": "rateLimitExceeded"})
 }
 
+/// 403 で、`error.errors[]` の理由が `reasons` の順に並ぶ（流量制限の理由が 2 件目以降にあっても再試行されることの確認用）。
+pub fn forbidden_with_reasons(reasons: &[&str]) -> Value {
+    json!({"kind": "status", "status": 403, "reasons": reasons})
+}
+
+/// 状態コードと本文（そのまま）で答える。操作は行わない。
+pub fn status_with_body(code: u16, body: &str) -> Value {
+    json!({"kind": "status", "status": code, "raw_body": body})
+}
+
 /// 429 と `Retry-After`（秒）。操作は行わない。
 pub fn too_many_requests(retry_after_secs: u64) -> Value {
     json!({"kind": "status", "status": 429, "reason": "rateLimitExceeded", "retry_after": retry_after_secs})
@@ -868,6 +878,21 @@ fn execute(shared: &Shared, req: &Request, decision: Decision) -> Outcome {
             let code = effect["status"].as_u64().unwrap_or(500) as u16;
             let mut r = if let Some(oauth) = effect["oauth_error"].as_str() {
                 Response::json(code, &json!({"error": oauth, "error_description": "fake"}))
+            } else if let Some(raw) = effect["raw_body"].as_str() {
+                let mut r = Response::bytes(code, raw.as_bytes().to_vec());
+                r.headers = vec![("Content-Type".into(), "application/json".into())];
+                r
+            } else if let Some(reasons) = effect["reasons"].as_array() {
+                let errors: Vec<Value> = reasons
+                    .iter()
+                    .map(
+                        |r| json!({"message": "fake drive error", "domain": "global", "reason": r}),
+                    )
+                    .collect();
+                Response::json(
+                    code,
+                    &json!({"error": {"code": code, "message": "fake drive error", "errors": errors}}),
+                )
             } else {
                 Response::error(code, effect["reason"].as_str().unwrap_or("backendError"))
             };
