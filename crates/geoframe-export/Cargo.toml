@@ -30,9 +30,10 @@ serde = "1.0.229"
 ring = "0.17"
 # 表示用 JPEG のデコード（geoframe crate と同じ版・同じ feature）
 zune-jpeg = "0.5.15"
-# 写真サービスへの GET（127.0.0.1 の http だけ。TLS は要らない）。同期 API
+# 写真サービスへの GET（127.0.0.1 の http）と、Drive API・OAuth のトークン取得（https。docs/note-photo-export/drive-api.md）。同期 API
+# rustls は geoframe crate と同じ形（暗号は ring、ルート証明書は埋め込み。musl の静的ビルドのまま動く。Cargo.lock に新しいパッケージは増えない）
 # gzip を明示する: geoframe 側のビルドと合流するかどうかで応答の扱いが変わらないように（展開後のバイト数に上限を掛ける）
-ureq = { version = "3", default-features = false, features = ["gzip"] }
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 # ログ（rclone の失敗の標準エラーの末尾。伏せ字にしてから）。geoframe crate と同じ版・同じ feature（新しいパッケージは増えない）
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # ログの出力（標準エラー。geoframe crate と同じ版・同じ feature。新しいパッケージは増えない）
