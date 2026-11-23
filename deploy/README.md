@@ -616,6 +616,11 @@ rclone 版を動かしていない新しい機体で、`rclone.conf`が無いと
    ```
    取り込みはできたのに、起動時の検査で失敗したとき（終了コード 2 のまま）は、journal で原因を見ます。**新しい資格情報が原因でない（フォルダの ID の誤りなど）なら**、原因を直してから起動し直します。
    新しい資格情報が原因で、退避した`.old`があるときは、元へ戻して起動し直します（`.old`が無い新規の機体では、新しいファイルを消して、手順 1 からやり直します）。
+   手順 1 からやり直すときは、前回の一時`rclone.conf`が残っていると、手順 2 の`set -C`が上書きを断ります。**先に前回の一時ファイルを消してから**、手順 2 で作り直します（`/root/geoframe-reauth`のディレクトリは残して使えます。無ければ手順 2 の`install -d`が作ります）。
+   ```sh
+   sudo rm -f /root/geoframe-reauth/rclone.conf   # やり直すときだけ。前回の一時ファイル（Drive 全体の権限の値）を消す
+   ```
+   `.old`を戻して起動し直すときは、次のとおりです。
    ```sh
    sudo mv -f /etc/geoframe-export/drive-credentials.json.old /etc/geoframe-export/drive-credentials.json   # 退避していたときだけ
    sudo systemctl reset-failed geoframe-export
@@ -726,7 +731,17 @@ systemd の展開では、`${GEOFRAME_EXPORT_LISTEN}`のような`${…}`は値�
   sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover; echo "exit=$?"
   ```
 
-  「未完了のジョブも、blocked のジョブも、片付けの知らせが残っているジョブもありません。」と出て、終了コードが 0 なら、先へ進みます。
+  **終了コードが 0 でも、`jobs/`を一覧できない・読めない記録がある場合があります**（新旧どちらの`recover`も、その旨を表示したうえで終了コード 0 を返します。読めない記録が`running`や`blocked`かどうかは、`recover`には分かりません）。
+  先へ進めるのは、次の 3 つが**全部**そろったときだけです。
+  1. 終了コードが 0。
+  2. 全部の記録を読めた。次の 2 つの知らせが出力に無いこと。
+     - 「ジョブの記録のディレクトリ jobs/ を一覧できません。権限と持ち主を確かめてください。」
+     - 「読めない記録: jobs/<ジョブ ID>.json。中身を確かめて、そのファイルを手で退かしてください（recover --resolve では解除できません）。…」
+  3. `running`と未解除の`blocked`の表示が無い。全部そろえば、「未完了のジョブも、blocked のジョブも、片付けの知らせが残っているジョブもありません。」と出ます（知らせ（下の最後の項目）だけが残るときは、この文は出ません）。
+
+  一覧できない・読めない記録が 1 つでもあれば、**入れ替えを止めます**。原因（`jobs/`の権限・持ち主、壊れた記録のファイル）を直し、もう一度`recover`で確かめ直します。
+  読めない記録は`--resolve`では解除できません。中身（`status`が`running`・`blocked`でないか）を root で確かめて、問題がなければファイルを`jobs/`の外へ手で退かします（退かすまで、新しい書き出しは断られます）。
+  `recover`自体が起動時の検査で失敗するとき（終了コード 1・2）は、§8.9 の「API 版の`recover`が動かないとき」の読み方で、`jobs/`の記録を確かめます。
   - 終了コード 4（実行枠が取れない）は、書き出しが実行中です。（b）に戻ります。
   - `running`が表示されたら、今の版のサービスを再起動して（`sudo systemctl restart geoframe-export`）、起動時の復旧に Drive と照合させます（数分は`/healthz`が答えません）。そのあと、もう一度`recover`で確かめます。
   - 未解除の`blocked`が表示されたら、表示された Drive の今の状態を読み、Drive の画面で必要な片付けを済ませてから、`recover --resolve <job_id>`で解除します。解除してから、もう一度`recover`で確かめます。
@@ -803,10 +818,33 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
      本番の親フォルダ・作業用フォルダとは入れ子にしません。それぞれの ID を、`/etc/default/geoframe-export`の`…_VERIFY_…`の 3 変数に書きます（§8.4）。
      `--verify`の起動時の検査が照合するのは、**検証用の 3 つの ID の間だけ**です。検証用の変数に本番の ID を入れ間違えても、そのまま起動します（本番の宛先に書いてしまいます）。
      そこで、**最初の書き込みの前に**、本番用の 3 つと検証用の 3 つの計 6 つを、次のように見比べます。
-     1. 6 つの変数が全部あり、値が全部違うこと（`6`と出ること。値は画面に出ません）。
+     1. 6 つの変数が、**それぞれちょうど 1 行**あり、値が Drive の ID の形（英数字・`_`・`-`の 1〜128 文字。包みが読む形と同じ）で、**6 つとも互いに違う**こと。
+        変数名ごとの行数・形式・重複の有無だけを表示します（値は画面に出ません）。最後に`OK`と出て、終了コードが 0 ならよいです。
         ```sh
-        sudo grep -E '^GEOFRAME_EXPORT_(VERIFY_)?(FOLDER_(YAMARECO|TRAVEL_JOURNAL)|WORK_FOLDER)=' /etc/default/geoframe-export | cut -d= -f2 | sort -u | wc -l
+        sudo awk '
+        BEGIN {
+          n = split("GEOFRAME_EXPORT_FOLDER_YAMARECO GEOFRAME_EXPORT_FOLDER_TRAVEL_JOURNAL GEOFRAME_EXPORT_WORK_FOLDER GEOFRAME_EXPORT_VERIFY_FOLDER_YAMARECO GEOFRAME_EXPORT_VERIFY_FOLDER_TRAVEL_JOURNAL GEOFRAME_EXPORT_VERIFY_WORK_FOLDER", K, " ")
+          for (i = 1; i <= n; i++) want[K[i]] = 1
+        }
+        {
+          k = $0; sub(/=.*/, "", k)
+          if (index($0, "=") && (k in want)) { cnt[k]++; val[k] = substr($0, length(k) + 2) }
+        }
+        END {
+          ng = 0
+          for (i = 1; i <= n; i++) {
+            k = K[i]; v = val[k]; c = cnt[k] + 0
+            f = (c == 1 && v ~ /^[A-Za-z0-9_-]+$/ && length(v) <= 128) ? "OK" : "NG"
+            d = "OK"
+            if (c == 1) { if (v in seen) d = "NG"; seen[v] = 1 }
+            if (c != 1 || f != "OK" || d != "OK") ng = 1
+            printf "%-45s 行数=%d 形式=%s 重複=%s\n", k, c, (c == 1 ? f : "-"), (c == 1 ? d : "-")
+          }
+          print (ng ? "NG: 上の NG の行を直す" : "OK: 6 つとも 1 行ずつ・形式が正しく・互いに違う")
+          exit ng
+        }' /etc/default/geoframe-export; echo "exit=$?"
         ```
+        行数が 1 でない（0 は欠け、2 以上は重複した行）、形式が`NG`（引用符・空白・長すぎる値など）、重複が`NG`（ほかの変数と同じ値）の変数は、`/etc/default/geoframe-export`を直してから、もう一度確かめます。
      2. Drive の画面で、本番側の 3 つのフォルダと検証用の 3 つのフォルダを開き、URL の`folders/`の後ろが、`/etc/default/geoframe-export`の対応する変数の値であることを、1 つずつ確かめます
         （変数名とフォルダの名前を対応づけて見ます。値をチャットや記録に貼りません）。
      3. 本番側のフォルダが検証用のフォルダの中に、検証用のフォルダが本番側のフォルダの中にないこと（同じフォルダや入れ子がないこと）を、Drive の画面で親をたどって確かめます。
@@ -822,11 +860,8 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
      3. 比べます。検証用の宛先にできた`manifest.json`と旧 manifest を比べ、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことを見ます。
         呼び出し側の実際の検証（サイズの突き合わせ）まで通ることも確かめます。あわせて、検証の前後で、本番の`published/`の下のファイルの更新時刻が変わらないことを確かめます
         （検証用の書き出しの記録は、検証用の状態ディレクトリにだけ残ります）。
-   - **検証が終わったら、検証用の記録を消してかまいません**（本番の記録ではありません）。検証用の Drive のフォルダも、ゴミ箱へ移してかまいません。
-
-     ```sh
-     sudo rm -rf /var/lib/geoframe-export-verify   # 検証用の記録ごと消す場合
-     ```
+   - **検証用の記録（`/var/lib/geoframe-export-verify`）と検証用の Drive のフォルダは、ここでは消しません。** 後の手順 8 の MD5 の照合（検証用の`published/`の記録と、検証用のフォルダの中のファイル）と、停止の試験で使うためです。
+     片付けは、§8.8 の全部の検証（手順 8 の MD5 の照合を含む）が済んだあとの、手順 10 で行います。
 
 5. **トークンを取り直しても、資格情報のファイルが変わらないこと**を確かめます。アクセストークンは約 1 時間で切れ、取り直しはメモリの中だけで行います（ファイルは書き換えません）。
    `sudo stat -c '%y %U %a' /etc/geoframe-export/drive-credentials.json`の更新時刻・持ち主・モードを控え、書き出しの実行中か、1 時間を空けた 2 回目の実行のあとにもう一度見て、同じであること、
@@ -862,9 +897,30 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
    - 429・403（流量制限）の実際の応答と、再試行の回数（journal の操作名・状態コード・再試行の回数だけが出ます。URL のクエリ・トークン・ファイル名は出ません）。
    - **8MiB を超えるファイル（resumable）を 1 つ**、本物の Drive へ送ること。本番の写真は 1 枚 1MB 前後で、通常の関門ではこの経路が通りません。チャンクの`PUT`に`Authorization`を付けない判断（セッションの URL が認可する）、
      `Content-Range`・308・`Range`の形、同じ ID での始め直しも、ここで本物で確かめます。
-   - SIGTERM（`systemctl stop`）から 180 秒以内に止まること。書き出しの途中で止めたあと、`running`のまま残った記録は、次の起動時（または次の書き出しの前）の復旧が Drive と照らして片付けます。
-     サービスを起動し直し、引数なしの`recover`で`running`が残っていないことを確かめます。`blocked`になった記録だけは自動では片付かないので、`recover`が表示する Drive の状態を読み、Drive の画面で片付けてから`recover --resolve <job_id>`で解除します（`--resolve`は未解除の`blocked`だけを受け付けます）。
+   - SIGTERM（`systemctl stop`）から 180 秒以内に止まること。**常設のサービスを再起動する形では試しません**: サービスは本番の状態ディレクトリだけを復旧の対象にするので、検証用の記録の`running`は片付かず、検証用の復旧の確かめになりません。
+     検証用の入口で、次の順に行います（本番の入口・本番のサービスは使いません）。
+     1. 検証用の書き出しを始めます（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from <日付> --destination yamareco`。`--dry-run`は付けません）。包みが標準エラーに出す一時 unit の名前（`geoframe-export-cli-…`）を控えます（控えそこねたら`systemctl list-units 'geoframe-export-cli-*'`）。
+     2. 書き出しの途中で、別の端末から、その一時 unit を止めます。止めるのにかかった時間を測り、180 秒以内であることを見ます。
+        ```sh
+        time sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
+        ```
+     3. 検証用の`recover`（引数なし。Drive も記録も変えません）で、`running`の記録が残っていることを確かめます。
+        ```sh
+        sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover
+        ```
+     4. 検証用の次の書き出し（`--verify run …`。`--dry-run`ではないもの）を行います。書き出しの前の復旧が、`running`のまま残った記録を、Drive と照らして片付けます。
+     5. もう一度`--verify recover`で、`running`が残っていないことを確かめます。`blocked`になった記録だけは自動では片付かないので、`recover`が表示する検証用の Drive の状態を読み、Drive の画面で片付けてから、解除します（`--resolve`は未解除の`blocked`だけを受け付けます。包みは、`--verify`のあとの`recover --resolve`も受け付けます）。
+        ```sh
+        sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover --resolve <job_id>
+        ```
+     サービス自体の停止（本番の`systemctl stop geoframe-export`）は、切り替え・切り戻しの実際の入れ替え（§8.6 の（d）、§8.9）で、停止にかかった時間が`TimeoutStopSec=180s`以内であることを見ます（同じ値です）。
 9. 切り戻しの練習をします（§8.9）。前のバイナリと前の unit で起動できること、`/healthz`が答えることを、書き出しのない時間に確かめます。
+10. **手順 8 までの検証（MD5 の照合・停止の試験を含む）が全部済んだあとに**、検証用の記録と Drive のフォルダを片付けます（どちらも本番の記録・宛先ではありません）。
+    - 検証用の状態ディレクトリを消します。`running`・`blocked`の記録が残っていないことを、先に`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover`で確かめます。
+      ```sh
+      sudo rm -rf /var/lib/geoframe-export-verify
+      ```
+    - 検証用の Drive のフォルダ（検証用の宛先の親フォルダと作業用フォルダ）は、Drive の画面でゴミ箱へ移してかまいません。移したあと、`/etc/default/geoframe-export`の`…_VERIFY_…`の 3 変数は、次に検証するまで使いません（残してかまいません。新しいフォルダを作ったら、ID を書き直します）。
 
 ### 8.9 切り戻し
 
@@ -872,8 +928,53 @@ API 版で問題が出たら、前のバイナリ（rclone 版）と前の unit 
 **戻すには、§8.2 で`.prev`に残した 2 つと、rclone 本体（`/usr/local/bin/rclone`）・`rclone.conf`（`/var/lib/geoframe-export/rclone/`）が要ります**（切り替えのあとも、しばらく残します）。
 
 **戻す前に、§8.6 の「止める前の確認」の（a）〜（c）を、API 版（今動いている版）で済ませます**。`systemctl stop`は CLI の一時 unit を止めず、実行中のジョブや未解除の`blocked`を残したまま入れ替えると、前のバイナリが片付けを引き受けることになるためです。
-（a）呼び出し側の依頼と CLI の起動を止める、（b）実行中のジョブを終わらせ、`systemctl list-units 'geoframe-export-*'`で一時 unit が無いことを確かめる、（c）API 版の`recover`で`running`と未解除の`blocked`が無いことを確かめる、の順です。
-そのあと、（d）サービスを止めて入れ替えます。
+（a）呼び出し側の依頼と CLI の起動を止める、（b）実行中のジョブを終わらせ、`systemctl list-units 'geoframe-export-*'`で一時 unit が無いことを確かめる、（c）API 版の`recover`で`running`と未解除の`blocked`が無いことを確かめる、の順です。（c）は、終了コード 0 だけで済ませません。`jobs/`を一覧できない・読めない記録の知らせが無いことも見ます（§8.6 の（c））。
+
+**API 版の`recover`が動かないとき**（資格情報の欠落・フォルダの ID の誤り・Drive への接続の失敗などで、API 版が起動できないとき）: API 版の`recover`も、ジョブの記録を読む前に、起動時の検査（Drive へ問い合わせます）で失敗します（終了コード 1・2、標準エラーに「起動しません」）。
+このときも、（a）（b）（新しい受付と CLI の起動を止めたままにする・一時 unit が無いことを確かめる）は同じように済ませます。そのうえで、（c）は**Drive に接続せずに**、状態ディレクトリの`jobs/`の記録を root で全部読んで確かめます
+（記録の JSON の`status`と`resolved_at`だけを見ます。ジョブの ID（記録のファイル名）と状態の名前だけを表示し、写真・ID・メモなどの値は表示しません）。サービスと CLI の一時 unit が止まっているので、記録は書き換わりません。
+
+```sh
+sudo python3 -I -c '
+import json, os, re, stat, sys
+d = sys.argv[1]
+run = blk = bad = 0
+try:
+    names = sorted(os.listdir(d))
+except OSError:
+    print("jobs/ を一覧できません"); sys.exit(1)
+for n in names:
+    if not re.fullmatch(r"[0-9a-f]{32}\.json", n):
+        continue
+    p = os.path.join(d, n)
+    try:
+        st = os.lstat(p)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 2 * 1024 * 1024:
+            raise ValueError
+        v = json.load(open(p, "rb"))
+        s = v["status"]
+        if v["version"] != 1 or v["job_id"] + ".json" != n or s not in ("running", "succeeded", "conflict", "failed", "interrupted", "blocked"):
+            raise ValueError
+        r = v["resolved_at"]
+        if r is not None and not isinstance(r, str):
+            raise ValueError
+    except Exception:
+        bad += 1; print(n, "読めない記録"); continue
+    if s == "running":
+        run += 1
+    if s == "blocked" and r is None:
+        blk += 1
+    print(n, s, "（未解除）" if s == "blocked" and r is None else "")
+print("running=%d 未解除のblocked=%d 読めない記録=%d" % (run, blk, bad))
+sys.exit(1 if run or blk or bad else 0)
+' /var/lib/geoframe-export/jobs; echo "exit=$?"
+```
+
+最後の行が`running=0 未解除のblocked=0 読めない記録=0`で、終了コードが 0 のときだけ、切り戻しへ進みます（`jobs/`を一覧できないときも、終了コードは 1 です）。
+`running`か未解除の`blocked`が 1 つでもあるか、一覧できない・読めない記録があれば、**切り戻しません**。前のバイナリが、その片付けを引き受けてしまうためです。
+先に API 版を起動できる状態に直します（原因は journal に出る項目名で分かります。§8.10 の「起動しない」）。起動できたら、API 版の`recover`（上の（c））で片付けてから、切り戻します。
+
+（c）が済んだら、（d）サービスを止めて入れ替えます。
 
 ```sh
 sudo systemctl stop geoframe-export
