@@ -125,7 +125,7 @@ drive.rs（`Drive`）の書き換え:
 ### 9.2 期限とキャンセル
 - どの操作も、最後の引数に `Deadline` を取る。`DriveApi::deadline(Limit)` が「今から数えた操作の期限」と「ジョブ全体の期限」（`with_job_deadline`）の早いほうで作る。操作の期限が切れると `ApiError::Timeout`（→ `rclone_timeout`）、ジョブの期限なら `ApiError::JobDeadline`（→ `timeout`）。呼び出し側が自分で `Deadline::operation(Instant)`・`Deadline::job(Instant)` を作って渡してもよい。
 - 1 つの操作（フォルダの作成・移動などで複数の要求になるもの）は、1 つの `Deadline` を共有する。写真の送信全体の期限（`--drive-upload-timeout`）は、呼び出し側が写真ごとに同じ `Deadline`（`Limit::Upload`）を渡して表す。
-- 要求 1 回の時間切れは、締め切りの残りと上限（JSON は 60 秒、チャンク・multipart は 10 分）の短いほう。**キャンセルは、要求の前・再試行の待ち・チャンクの間で見る**（要求の最中には見ない。最長でその上限まで待つ）。キャンセルされたら `ApiError::Cancelled`（→ `RemoteError::Cancelled`）。並列のアップロードでは、各スレッドが自分の `DriveApi` の複製（同じ `Cancel` を共有）で止まるので、呼び出し側が全スレッドを join してから戻る。
+- 要求 1 回の時間切れは、締め切りの残りと上限（JSON は 60 秒、チャンク・multipart は **100 秒**。後半で 10 分から下げた。9.10 の「停止の期限」）の短いほう。**キャンセルは、要求の前・再試行の待ち・チャンクの間で見る**（要求の最中には見ない。最長でその上限まで待つ）。キャンセルされたら `ApiError::Cancelled`（→ `RemoteError::Cancelled`）。並列のアップロードでは、各スレッドが自分の `DriveApi` の複製（同じ `Cancel` を共有）で止まるので、呼び出し側が全スレッドを join してから戻る。
 
 ### 9.3 トークン
 - 取得: `POST` の本文は設計どおり。`400`・`401` で `error` が `invalid_grant`・`invalid_client`・`unauthorized_client` なら `AuthInvalid`（再試行しない）。**ほかの 4xx は認可の失効とは言えないので `ApiError::Status`（`drive_unavailable`）**にして、再試行もしない。429・5xx・通信の失敗は再試行する。
@@ -166,9 +166,65 @@ drive.rs（`Drive`）の書き換え:
 
 - `Env::ops()` には `token`・`get`・`generate_ids` が混ざる（rclone 版には無い）。`op_count("upload")` は**要求の数**で、ファイルの数ではない（resumable は 1 ファイルが複数行）。1 段目の受け入れ試験の「並び」の検査は、`token` を除く・`get`・`generate_ids` を含めた並びに直す。`mutating_ops`・`assert_no_mutations` は読むだけの操作を除くので、そのまま使える。
 - 試験側の `Env::save()` は、サーバーのロックの外で `drive.json` を書く。要求が飛んでいる最中に書き換えると、サーバーの更新と食い違って更新が消えうる。書き換えは `Hook::mutate_after` のように、フローが止まっている間に行う。
-- 要求 1 回の上限（JSON 60 秒、チャンク・multipart 10 分）は、unit の `TimeoutStopSec=180s` より長い。キャンセルは要求の最中には効かない（要求の前・再試行の待ち・チャンクの間で見る）。
+- ~~要求 1 回の上限（チャンク・multipart 10 分）が `TimeoutStopSec=180s` より長い~~ → 後半で **100 秒**に下げた（9.10）。キャンセルは要求の最中には効かない（要求の前・再試行の待ち・チャンクの間で見る）。
 - multipart は、中身と本文で最大 16MiB 弱をメモリに持つ。並列 4 なら 64MiB 前後で、`MemoryMax` の測り直しに含める。
 - 名前に `/` は渡せない（`Rejected`）。サブフォルダつきの相対パスの写真は、後半がフォルダを作って、葉の名前で送る。
 - `read` は上限を超えると `TooLarge`（→ `BadOutput`）を返す。`Remote::read` の「上限 + 1 バイトまで返す」とは違うので、呼び出し側の「超えたか」の判定を合わせる。
 - フォルダの `Entry.mime` は Drive の値（`application/vnd.google-apps.folder`）。`is_dir` で判定する。
 - `DriveApi::list_tree` の順は幅優先（rclone の `lsjson -R` の順とは違う）。呼び出し側は、集合として並べ替えて比べる（`drive/mod.rs` は並べ替えて比べている）。
+
+### 9.10 後半（つなぎ込み）で決めたこと
+
+#### 設定と CLI（1 章どおり）
+| 旧 | 新 |
+|---|---|
+| `--rclone <path>`・`--rclone-config <path>` | 消した（`--drive-credentials <path>`。必須・絶対パス・資格情報の JSON） |
+| `--remote-yamareco <remote:path>`・`--remote-travel-journal <remote:path>` | 消した（`--folder-yamareco <ID>`・`--folder-travel-journal <ID>`。必須） |
+| `--work-root <remote:path>` | 消した（`--work-folder <ID>`。必須） |
+| `--rclone-copy-timeout`（既定 2700 秒）・`--rclone-timeout`（既定 300 秒） | `--drive-upload-timeout`・`--drive-timeout`（同じ既定値） |
+| （無し） | `--drive-endpoint <http://127.0.0.1:PORT>`（試験専用・help に出さない。`Endpoints::loopback` で検査し、`http://127.0.0.1:<port>`・`http://[::1]:<port>` 以外は終了コード 2） |
+| （無し） | サブコマンド `import-credentials --rclone-config <path> --remote <name> --out <path>` |
+
+- ID は `is_valid_drive_id` で検査し、空（unit の `${VAR}` が空）・不正な文字・3 つのうちどれか 2 つが同じ → 終了コード 2。引数の検査は Drive へ要求を出す前（試験で確かめた）。
+- `RemotePath`・`RemoteReason`（`remote:パス` の形）は、3 段目で消す rclone 版の試験が使うだけ。`Rclone` は専用の `RcloneSettings` を受け取る（バイナリの設定と切り離した）。
+- 引数名ごとの出し方・help・USAGE は `src/cli.rs`。`--drive-endpoint` は USAGE に出ない。
+
+#### 起動時の検査（`src/startup.rs`）
+- `run`（`--dry-run` を含む）・`serve`・`recover` の始めに、資格情報を読み、トークンを 1 回取り、3 つのフォルダを `get` で確かめる。`import-credentials` は通らない（Drive に触れず、root でも動く）。
+- 終了コード 2: 資格情報のファイルを読めない／検査に通らない・`invalid_grant` など（標準エラーに「再認可が要る（deploy/README.md の手順）」）・フォルダが無い／権限が無い（404 と、408・429 以外の 4xx）・フォルダでない（ショートカットも）・ゴミ箱の中・3 つが別物でない（どれかが他の祖先）・祖先が 64 段を超える。終了コード 1: 通信の失敗・5xx・429・期限。標準エラーと標準出力に、ID・資格情報の値は出さない（引数名だけ）。
+- **祖先をたどる途中で `get` が 404（親が見えない。共有されたフォルダの上は見えないことがある）なら、そこでたどるのをやめる**（設計 3 章は「途中の失敗は 1」だったが、親が見えないだけで永久に起動しなくなるのを避けた。404・認可の失効以外の失敗は 1）。
+- **起動時の再試行は短くする**（`STARTUP_RETRY`: 最初の 1 回のあとに 2 回、0.5・1 秒の待ち）。ジョブの操作（5 回・合計 1 分ほど）より短く、直らなければ終了コード 1 で終える（serve は systemd が 15 秒おきに再起動する）。
+- ジョブの始めにも、宛先の親と作業用のフォルダを `get` で確かめる（`Drive::check_roots`。フォルダ・ショートカットでない・ゴミ箱でない。失敗は `drive_unavailable`）。**候補が 0 枚のジョブは Drive に触れない**ので、その確認は 0 枚の判定より後ろ（公開の直前）に置いた。
+
+#### `Remote`・`Drive`
+- `Service` が `Remote`（中の `DriveApi`・トークン）を 1 つ作って持ち回る（`Context::remote`）。`flow` は期限・取り消しを掛けた複製を使う。`Tuning::drive_retry`・`drive_sizes`（試験用）で、再試行の待ち・一覧のページの大きさ・multipart の上限・チャンクの大きさを替えられる。
+- `Layout` は宛先の親フォルダ・作業用フォルダの ID と、名前（フォルダ名・job_id）だけを持つ。`dest_path()` などは、記録・表示用の説明の文字列（`yamareco/2030-03-10`・`incoming/<job_id>`・`replaced/<…>`）を返す（`String`）。
+- 名前で ID を得るのは、親の直下の一覧（名前で絞らない）から名前の完全一致で。`incoming/`・`replaced/` は、無ければ作業用のフォルダの直下に作る（`incoming/` の作成は `mkdir_incoming` の中、`replaced/` は退避の前）。中身の照合・manifest の読み出しは、照合した ID で行う。
+- ショートカットは 1 回の一覧で 1 件として出る（2 回の一覧と `classify` はやめた）。名前が一致するショートカットは「同名がある」として数え、`incoming/`・`replaced/` の位置にあれば構成が想定外として失敗する。
+- manifest の読み出しが上限を超えた（`RemoteError::TooLarge`）ときは、一覧の大きさと違う場合と同じに扱う（管理しているフォルダの見分けでは `modified`、復旧の照合では不一致）。`drive_unavailable` にはしない。
+- 写真の送信（`Drive::upload`）: 先に日付のサブフォルダを（浅い順に）作り、写真を並列 4 のスレッド（`std::thread::scope`）で、葉の名前で送る。期限（`Remote::upload_deadline`）は送信全体で 1 つを共有する。1 つ失敗したら残りは始めず、走っているものを待つ。**全スレッドを join してから戻る**。取り消しの印が立っていれば、ほかの失敗より `Cancelled`（結果不明として復旧へ）を優先する。全部成功してから最後に manifest を送る。
+- 公開の移動・退避は ID の移動（親と名前を 1 回の更新で変える）。rclone 版の「宛先に同名ができるとファイル単位の移動に化ける」は無いので、`recover` の表示（`BlockedInfo::describe`）の `retire_mismatch`・`publish_mismatch`・退避後の説明は、「確かめてから移すまでの間に同名のフォルダができた」場合（同名のフォルダが並ぶ）の案内に書き直した。`a_file_by_file_*` の試験は、同じ筋書き（移動の直後に同名のフォルダができる）に作り直した。
+- 応答を失った移動（rclone 版の `late_then_fail`）は、API では `move_to` が `get` で今の状態を見て済みなら成功にする。流れ（復旧の表）が通ることを確かめる試験は、**再試行しない `Remote`** で動かす（`Env::remote()`）。再試行を含む API の動きは `drive_api.rs` と `drive_flow_faults.rs`。
+
+#### 停止の期限（SIGTERM から 180 秒以内）
+**要求 1 回の上限を下げた**（`CHUNK_REQUEST_CAP`: 10 分 → **100 秒**。JSON は 60 秒のまま）。8MiB のチャンクを約 0.7Mbps でも送れる長さで、飛んでいる要求 1 つの終わりまでの最長（トークンの取り直し 60 秒を挟んでも 160 秒）が `TimeoutStopSec=180s` に収まる。serve の終了は、接続の待ち（最大 75 秒）と、飛んでいる要求の終わりの待ち（最大 100 秒）が並行して進み、そのあと全スレッドを join して実行枠を手放す。取り消しは要求の最中には効かず、要求の前・再試行の待ち・チャンクの間で見る（変えない）。変更系の途中で切れたものは「結果不明」として復旧の表へ渡す。試験は、飛んでいる要求を 2 秒止めた状態で SIGTERM・SIGINT を送り、親が終わった時点で要求が来ないこと（全スレッド停止）と、記録が `running` のまま復旧へ渡ることを確かめる（`signal_cli.rs`・`serve_cli.rs`・`drive_flow_faults.rs`）。
+
+#### エラー
+- `rclone_failed`・`rclone_timeout` の綴りは変えない。メッセージを中立にした（`ErrorCode::message`: 「Drive の変更系の操作が失敗しました」「Drive の操作が時間内に終わりませんでした」。`into_query_error` の detail は「Drive に照会できません（API の失敗）」）。
+- `drive_auth_invalid`: 照会（ジョブの始め・一覧）でトークンが取れなければ、ジョブは `failed` で `drive_auth_invalid`。**変更系の途中で認可が失われると（401 のあと取り直しが `invalid_grant`）、結果が分からないまま観察もできないので、ジョブは `blocked`（`unobservable`）になる**（これまでの、観察できないときの扱いと同じ。再認可のあと `recover` で確かめて解除する）。
+
+#### `import-credentials`（`src/import.rs`・`src/rclone_conf.rs`）
+- rclone の設定は `read_credentials` で読む（形の検査は起動時の検査と同じ。重複キー・引用符などは断る）。`client_id`・`client_secret`・`token` の JSON の `refresh_token`（空・無い・形違いは終了コード 2）。アクセストークンは書かない。
+- **持ち主**: 設定ファイルはサービスのユーザーの持ち物で、取り込みは root が sudo で動かす。実行ユーザーが root のときは持ち主を問わない（権限は 0600／0700 相当を問う）。root でなければ持ち主は実行ユーザー。
+- 書き方は 0600・`O_CREAT|O_EXCL|O_NOFOLLOW`（既にあれば・リンクなら断る。終了コード 1）。書いたあと `Credentials::load` で読み直し、読めなければ消す。標準出力は書いたパスだけ。root（`run_command` の実効ユーザー ID が 0）でも断らない。
+
+#### 試験の作り
+- `Env::new` が偽の Drive の HTTP サーバー（`FakeDrive`）を立て、`Env::settings`（資格情報・3 つの ID・`--drive-endpoint`）をそれに向ける。CLI の試験は `Env::cli_settings_args()`。状態は `fake-drive/`（状態ディレクトリの外）。
+- 偽の Drive に、`do_then_add_folder`（済ませてから同名のフォルダを足す）・`late_then_fail`（移動を預けて 500 で答え、数回の一覧のあとに反映）の効果を足した。偽の模型は、ゴミ箱へ移したフォルダを `resolve` の対象から外す。
+- `// rclone 固有` の検査は、`Env::assert_api_calls_safe`（Authorization が付く〔トークンの入口・チャンクの PUT を除く〕・一覧の `q` は ID だけ・`unsupported`〔完全な削除・中身の更新〕が無い）と、対象のパスで見る呼び出しの形（移動・ゴミ箱は ID で・manifest は最後・md5Checksum を取る）に置き換えた。操作の数は、要求の数ではなく意味の数（ファイル数・移動の回数）で見る。
+
+#### 本番の関門で確かめること（偽の Drive では確かめられない）
+- unit の `LoadCredential=` と `ExecStart` の `%d`、包み（`systemd-run`・`--expand-environment=no`）の `%d/drive-credentials` が、実際に展開されること。
+- `RestrictAddressFamilies=AF_INET AF_INET6`・`MemoryDenyWriteExecute=true`（rustls・ring）・`MemoryMax=512M`・`TasksMax=64`（並列 4 の multipart で 64MiB 前後・スレッド）で足りるか。名前解決が `AF_UNIX` を要しないか。
+- 本物の Drive で、起動時の検査（トークン・3 つのフォルダ・祖先）の所要時間、`--drive-timeout` の既定（5 分）、429・403 の実際の応答、`md5Checksum` の形、移動で ID が保たれること、8MiB を超える 1 ファイルの resumable、SIGTERM から 180 秒以内に止まること。
+
