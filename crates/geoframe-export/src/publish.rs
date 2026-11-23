@@ -64,7 +64,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::drive::{Drive, Expected, Inspection, Layout, Managed, Place, Removed, Target};
+use crate::drive::{Drive, Expected, Inspection, Layout, Managed, Removed, Target};
 use crate::error::{ErrorCode, ExportError};
 use crate::image::PublishFile;
 use crate::published::{PreviousFolder, PublishedRecord, PublishedStore, RecordedFile};
@@ -564,7 +564,7 @@ impl Recovery<'_> {
                 trash_old,
             } => {
                 let recorded = self.recorded_digests(folder_id, &cur);
-                match self.content_ok(Place::Dest, recorded.as_deref()) {
+                match self.content_ok(folder_id, recorded.as_deref()) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(self.blocked(
@@ -595,7 +595,7 @@ impl Recovery<'_> {
                 old_id,
             } => {
                 let recorded = self.recorded_digests(incoming_id, &cur);
-                match self.content_ok(Place::Incoming, recorded.as_deref()) {
+                match self.content_ok(incoming_id, recorded.as_deref()) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(self.blocked(
@@ -627,7 +627,7 @@ impl Recovery<'_> {
                         ));
                     }
                 }
-                if drive.publish_move().is_err() {
+                if drive.publish_move(incoming_id).is_err() {
                     // 移動の応答が失われても済んでいることがあり、止めたあとも Drive 側で遅れて反映されることがある。
                     // 公開の途中の失敗と同じく、待って、一覧を 2 回取って、同じなら照合する
                     match self.settle_observe(true) {
@@ -682,18 +682,17 @@ impl Recovery<'_> {
             .or_else(|| progress.digests.clone())
     }
 
-    /// 宛先（[`Place::Dest`]）または `incoming` の中身が、期待した一式と一致するか。手元に一式が無いときは、フォルダの manifest
+    /// 宛先または `incoming` の、ID のフォルダの中身が、期待した一式と一致するか。手元に一式が無いときは、フォルダの manifest
     /// と一致し、`recorded`（検証済みの MD5）があればそれにも一致するか。
     fn content_ok(
         &self,
-        place: Place,
+        folder_id: &str,
         recorded: Option<&[RecordedFile]>,
     ) -> Result<bool, ExportError> {
         let drive = self.drive();
-        match (self.expected, place) {
-            (Some(e), Place::Incoming) => drive.incoming_matches(e),
-            (Some(e), _) => drive.dest_matches_expected(e),
-            (None, place) => drive.folder_matches_its_manifest(place, recorded),
+        match self.expected {
+            Some(e) => drive.folder_matches_expected(folder_id, e),
+            None => drive.folder_matches_its_manifest(folder_id, recorded),
         }
     }
 
@@ -965,18 +964,18 @@ impl Run<'_> {
         }
         self.record(Stage::Uploading, None)?;
         self.incoming_created = true;
-        self.drive.mkdir_incoming().map_err(StepErr::Op)?;
-        let incoming_id = self.drive.incoming_id().map_err(StepErr::Op)?;
+        // 作ったフォルダの ID（`create_folder` が返したものを、直後の一覧と照合したもの）を、送信・検証・移動まで引き継ぐ
+        let incoming_id = self.drive.mkdir_incoming().map_err(StepErr::Op)?;
         self.record(Stage::Uploading, Some(&incoming_id))?;
         self.drive
-            .upload(self.params.workspace, self.params.files)
+            .upload(&incoming_id, self.params.workspace, self.params.files)
             .map_err(StepErr::Op)?;
 
         // 2. verifying: 送った中身が一式と完全に一致する（受け取り側と同じ検証）
         self.record(Stage::Verifying, Some(&incoming_id))?;
         if !self
             .drive
-            .incoming_matches(&self.expected)
+            .folder_matches_expected(&incoming_id, &self.expected)
             .map_err(StepErr::Op)?
         {
             return Err(StepErr::Abort(ExportError::from(ErrorCode::VerifyMismatch)));
@@ -1016,7 +1015,7 @@ impl Run<'_> {
             Ok(Target::Exists { .. }) => return Err(StepErr::Abort(changed_during_run())),
             Err(e) => return Err(query_failure(e)),
         }
-        self.drive.publish_move().map_err(StepErr::Op)?;
+        self.drive.publish_move(incoming_id).map_err(StepErr::Op)?;
         self.check_published(incoming_id)?;
         self.finish(incoming_id, None)
     }
@@ -1045,7 +1044,7 @@ impl Run<'_> {
             Err(e) => return Err(StepErr::Op(e)),
         }
         self.retire_issued = true;
-        self.drive.retire_old().map_err(StepErr::Op)?;
+        self.drive.retire_old(old).map_err(StepErr::Op)?;
         match self.drive.check_retired(old).map_err(StepErr::Op)? {
             Ok(()) => {}
             // 合わなければ先へ進まない（ゴミ箱へも移さない）
@@ -1064,7 +1063,7 @@ impl Run<'_> {
             Ok(Target::Exists { .. }) => return Err(StepErr::Op(changed_during_run())),
             Err(e) => return Err(StepErr::Op(e)),
         }
-        self.drive.publish_move().map_err(StepErr::Op)?;
+        self.drive.publish_move(incoming_id).map_err(StepErr::Op)?;
         self.check_published(incoming_id)?;
         // trashing: 直前に replaced/ を一覧して ID を確かめてから、ゴミ箱へ（仕上げの中でする）
         self.record(Stage::Trashing, Some(incoming_id))?;

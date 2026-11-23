@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use common::drive::model::{self, Kind};
 use common::drive::*;
-use common::fake_drive::{self as fk, do_then_add_folder, late_then_fail};
+use common::fake_drive::{self as fk, do_then_add_folder, do_then_swap_folder, late_then_fail};
 use geoframe_export::drive::{Managed, Target};
 use geoframe_export::error::ErrorCode;
 use geoframe_export::publish::{
@@ -609,11 +609,13 @@ fn a_late_move_makes_two_listings_differ_so_the_service_waits_and_looks_again() 
     let incoming_id = hook.records[1].incoming_id.clone().unwrap();
     assert_eq!(p.folder_id, incoming_id);
     assert_eq!(dest_id(&env).as_deref(), Some(incoming_id.as_str()));
-    // 2 つの観察が食い違ったので、やり直した（失敗のあとの lsjson が、1 回分の観察の数より多い）
+    // 2 つの観察が食い違ったので、やり直した（失敗のあとの一覧が、1 回分の観察の数より多い）。移動は 1 回だけ送る（結果が
+    // 分からない失敗のあとに、API の層が再送しない）。1 回の観察は 4 回の一覧、2 回で 1 組（8 回）なので、2 組以上
+    assert_eq!(env.op_count("move"), 1, "移動を再送しない");
     let seq = env.ops();
     let after_move = seq.iter().rposition(|c| c == "move").unwrap();
     let lists_after = seq[after_move..].iter().filter(|c| *c == "list").count();
-    assert!(lists_after >= 18, "{lists_after}");
+    assert!(lists_after >= 16, "{lists_after}");
     assert!(
         !seq[after_move..].contains(&"trash".to_owned()),
         "公開済みの incoming を消さない"
@@ -721,20 +723,23 @@ fn a_manual_folder_created_between_the_check_and_the_retire_is_caught_by_the_id_
         d.save(&fake);
     });
     let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+    // 移す直前の一覧に、記録した旧フォルダの ID が見えない（同名の別のフォルダに替わっている）ので、何も動かさずに止める
+    // （以前は、一覧で見えた別のフォルダを退避先へ移してしまい、あとの照合で見つけていた）
     let info = f.blocked.expect("blocked");
-    assert_eq!(info.reason, BlockedReason::RetireMismatch);
-    let moved = &info.observed.as_ref().unwrap().replaced[0].id;
-    assert_ne!(moved, &old_id);
+    assert_eq!(info.reason, BlockedReason::DestinationUnexpected);
+    assert_eq!(env.op_count("move"), 0, "何も移さない");
     assert!(env.op_count("trash") == 0, "ゴミ箱へは移さない");
-    // 移してしまったフォルダは replaced/ にある（オーナーが戻せる）
+    // 替わったフォルダは宛先のまま。退避先には何も無い
+    let d = env.drive();
+    let swapped = d.resolve(&["yamareco", FOLDER]).expect("swapped folder");
+    assert_ne!(swapped, old_id);
     assert!(
-        env.drive()
-            .resolve(&[
-                "geoframe-export-work",
-                "replaced",
-                &format!("yamareco-{FOLDER}-{JOB_A}")
-            ])
-            .is_some()
+        d.resolve(&[
+            "geoframe-export-work",
+            "replaced",
+            &format!("yamareco-{FOLDER}-{JOB_A}")
+        ])
+        .is_none()
     );
 }
 
@@ -2350,7 +2355,8 @@ fn every_listing_asks_for_the_md5_field_and_nothing_else_is_asked_for_in_the_tre
     assert!(!lists.is_empty());
     for c in &lists {
         assert_eq!(
-            c["fields"], "nextPageToken,files(id,name,mimeType,size,md5Checksum)",
+            c["fields"],
+            "kind,incompleteSearch,nextPageToken,files(id,name,mimeType,size,md5Checksum)",
             "{c}"
         );
     }
@@ -2418,4 +2424,130 @@ fn the_verified_md5_is_recorded_in_the_job_record_before_the_retire_or_the_publi
     let rec = seq.iter().position(|c| c == "record:retiring").unwrap();
     let mv = seq.iter().position(|c| c == "move").unwrap();
     assert!(rec < mv, "{seq:?}");
+}
+
+// ---- 作った・照合したフォルダの ID は、書き込みまで引き継ぐ ----
+
+#[test]
+fn a_swapped_incoming_right_after_creation_stops_before_any_id_is_recorded() {
+    for swap in [true, false] {
+        let env = Env::new(if swap { "mkdir-swap" } else { "mkdir-dup" });
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        // incoming/ を先に作っておく（無ければ、最初の create_folder が incoming/ そのものになる）
+        let d = {
+            let mut d = env.drive();
+            d.mkdir_p(&["geoframe-export-work", "incoming"]);
+            d
+        };
+        env.save(&d);
+        let effect = if swap {
+            do_then_swap_folder(&["geoframe-export-work", "incoming"], JOB_A)
+        } else {
+            do_then_add_folder(&["geoframe-export-work", "incoming"], JOB_A)
+        };
+        env.add_rule("create_folder", 0, 1, effect);
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+        assert!(
+            hook.records.iter().all(|r| r.incoming_id.is_none()),
+            "ID を記録しない: swap={swap}"
+        );
+        assert_eq!(env.op_count("upload"), 0, "何も送らない: swap={swap}");
+        assert!(dest_id(&env).is_none(), "swap={swap}");
+        assert!(env.drive().trashed.is_empty(), "swap={swap}");
+        // 同名のフォルダ（別の ID）が、触られずに残る。名前だけでは消さない
+        let d = env.drive();
+        let inc = d
+            .resolve(&["geoframe-export-work", "incoming"])
+            .expect("incoming");
+        assert!(
+            d.children(&inc).iter().any(|n| n.name == JOB_A),
+            "swap={swap}"
+        );
+        assert!(f.blocked.is_none() || f.error.code == ErrorCode::Blocked);
+    }
+}
+
+#[test]
+fn photos_go_to_the_recorded_incoming_id_even_if_it_is_swapped_after_the_record() {
+    let env = Env::new("upload-parent-id");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    // 2 回目の `uploading` の記録（ID つき）の直後に、記録した incoming が消されて、同名の別のフォルダに替わった
+    let mut hook = Hook::new(&env).mutate_after(Stage::Uploading, move || {
+        let mut d = model::Drive::load(&fake);
+        if let Some(inc) = d.resolve(&["geoframe-export-work", "incoming", JOB_A]) {
+            d.purge(&inc, false);
+            d.mkdir_p(&["geoframe-export-work", "incoming", JOB_A]);
+            d.save(&fake);
+        }
+    });
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    let _ = f;
+    // 別の ID の同名フォルダには、何も送っていない（名前で引き直して、そちらへ送らない）
+    let d = env.drive();
+    let swapped = d
+        .resolve(&["geoframe-export-work", "incoming", JOB_A])
+        .expect("swapped incoming");
+    assert!(
+        d.children(&swapped).is_empty(),
+        "別のフォルダへ書いていない"
+    );
+    assert!(dest_id(&env).is_none());
+    assert!(env.drive().trashed.is_empty());
+}
+
+#[test]
+fn an_incoming_swapped_before_the_move_is_not_published_and_not_trashed() {
+    let env = Env::new("move-swapped");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    // 公開の移動の前（`publishing` の記録の直後）に、記録した incoming が、同名の別のフォルダ（空）に替わった。名前で引き直すと、
+    // その別のフォルダが宛先へ移ってしまう
+    let mut hook = Hook::new(&env).mutate_after(Stage::Publishing, move || {
+        let mut d = model::Drive::load(&fake);
+        let inc = d
+            .resolve(&["geoframe-export-work", "incoming", JOB_A])
+            .unwrap();
+        d.purge(&inc, false);
+        d.mkdir_p(&["geoframe-export-work", "incoming", JOB_A]);
+        d.save(&fake);
+    });
+    let _ = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(env.op_count("move"), 0, "何も移さない");
+    assert!(dest_id(&env).is_none(), "宛先へ公開されていない");
+    assert!(env.drive().trashed.is_empty(), "別のフォルダを消さない");
+}
+
+#[test]
+fn a_malformed_listing_never_leads_to_creating_a_folder() {
+    // 一覧が形の壊れた 200（null など）でも、「空」として、同名のフォルダの作成へ進まない
+    for body in ["null", "[]", "{}", r#"{"kind":"drive#fileList"}"#] {
+        let env = Env::new("malformed-list");
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        // 1 回目（宛先の親の一覧）は通し、2 回目以降（作業用のフォルダの一覧）を壊す
+        env.add_rule("list", 1, u64::MAX, garbage(body));
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+        assert_eq!(f.error.code, ErrorCode::DriveUnavailable, "{body}");
+        assert!(
+            env.mutating_ops().is_empty(),
+            "{body}: {:?}",
+            env.mutating_ops()
+        );
+    }
+}
+
+#[test]
+fn a_malformed_destination_listing_is_not_read_as_no_destination() {
+    for body in ["null", "[]", "{}"] {
+        let env = Env::new("malformed-dest");
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        env.seed_managed(Y, FOLDER, &set);
+        env.add_rule("list", 0, u64::MAX, garbage(body));
+        let mut hook = Hook::new(&env);
+        let f = failure(run(&env, &set, OnExists::Replace, &mut hook));
+        assert_eq!(f.error.code, ErrorCode::DriveUnavailable, "{body}");
+        env.assert_no_mutations();
+    }
 }

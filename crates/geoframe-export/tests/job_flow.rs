@@ -1619,6 +1619,15 @@ fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
     assert!(after.notes.is_empty());
     // 飛んでいた要求は、印のあとで Drive に届く（結果不明。記録は確定しない）。次の復旧が、今の Drive の状態から続ける
     assert!(svc.blocking().is_none());
+    assert!(
+        env.drive().trashed.contains(&inc),
+        "飛んでいた PATCH は、キャンセルのあとで反映された"
+    );
+    assert_eq!(
+        env.op_count("trash"),
+        1,
+        "ここまでに送った PATCH は 1 回だけ"
+    );
 
     let next = Service::with_tuning(env.settings.clone(), fast_tuning()).unwrap();
     assert!(matches!(
@@ -1629,6 +1638,12 @@ fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
     assert_eq!(done.status, Status::Interrupted);
     assert!(done.notes.is_empty(), "次の復旧が自動で片付ける");
     assert!(env.drive().trashed.contains(&inc));
+    // 次の復旧は、反映済みと一覧で確かめて、PATCH を再送せずに確定した
+    assert_eq!(
+        env.op_count("trash"),
+        1,
+        "次の復旧が、ゴミ箱への PATCH を再送しない"
+    );
 }
 
 /// 印が、Drive に触れる前に立っていれば、ジョブは `interrupted`（rclone は 1 回も呼ばない）。

@@ -477,3 +477,122 @@ fn a_root_folder_moved_to_the_trash_after_startup_fails_the_job_before_anything_
         );
     }
 }
+
+// ---- 別オリジンの Location・リダイレクトは、ジョブの入口まで通って、何も送らず・公開しない ----
+
+#[test]
+fn a_session_location_on_another_origin_sends_no_chunk_and_publishes_nothing() {
+    let sizes = Some((1000, 1, 256 << 10));
+    for label in ["other port", "other host name"] {
+        let mut env = Env::new(&format!("faults-location-{}", label.replace(' ', "-")));
+        let sink = fk::Sink::start();
+        let site = photo_site(DAY, DAY, three());
+        let svc = service_with(
+            &mut env,
+            &site,
+            Tuning {
+                drive_sizes: sizes,
+                ..retrying()
+            },
+        );
+        let target = if label == "other port" {
+            format!(
+                "http://127.0.0.1:{}/upload/drive/v3/files?upload_id=x",
+                sink.addr.port()
+            )
+        } else {
+            format!(
+                "http://localhost:{}/upload/drive/v3/files?upload_id=sess-0001",
+                env.fake.url().rsplit(':').next().unwrap()
+            )
+        };
+        env.add_rule("upload", 0, u64::MAX, fk::bad_location(&target));
+        let rec = run_job(&svc);
+        // 復旧の表のとおり: 送る前に断った失敗は、宛先を変えていないので、失敗で終わり、incoming は片付く
+        assert_eq!(rec.status, Status::Failed, "{label}: {:?}", rec.notes);
+        assert_eq!(rec.error, Some(ErrorCode::RcloneFailed), "{label}");
+        assert_eq!(sink.connections(), 0, "{label}: 別のホストへつながない");
+        let chunks = env
+            .http_calls()
+            .iter()
+            .filter(|c| c["op"] == "upload" && c["phase"] == "chunk")
+            .count();
+        assert_eq!(chunks, 0, "{label}: チャンクを送らない");
+        assert!(dest_names(&env).is_empty(), "{label}");
+        assert_eq!(env.op_count("move"), 0, "{label}");
+        assert_eq!(env.drive().trashed.len(), 1, "{label}: incoming を片付ける");
+        env.assert_api_calls_safe();
+    }
+}
+
+#[test]
+fn a_redirect_is_never_followed_and_fails_the_job_without_publishing() {
+    // 3xx の Location は、別のオリジンを指していても、たどらない（接続が来ない）。送信・一覧・移動のどこで返されても、
+    // ジョブは公開せずに終わる
+    for (op, skip, want) in [
+        ("upload", 1, Some(ErrorCode::RcloneFailed)),
+        // 一覧が返らないと、送信のあとの状態を観察できない: 確定せずに止まる（`blocked`。公開はしていない）
+        ("list", 2, None),
+        ("move", 0, Some(ErrorCode::RcloneFailed)),
+    ] {
+        let mut env = Env::new(&format!("faults-redirect-{op}"));
+        let sink = fk::Sink::start();
+        let site = photo_site(DAY, DAY, three());
+        let svc = service_with(&mut env, &site, retrying());
+        let location = format!("http://127.0.0.1:{}/x", sink.addr.port());
+        env.add_rule(op, skip, u64::MAX, fk::redirect(302, &location));
+        let rec = run_job(&svc);
+        match want {
+            Some(code) => {
+                assert_eq!(rec.status, Status::Failed, "{op}: {:?}", rec.notes);
+                assert_eq!(rec.error, Some(code), "{op}");
+            }
+            None => {
+                assert_eq!(rec.status, Status::Blocked, "{op}: {:?}", rec.notes);
+                assert_eq!(
+                    rec.blocked.as_ref().map(|b| b.reason.as_str()),
+                    Some("unobservable"),
+                    "{op}"
+                );
+            }
+        }
+        assert_eq!(sink.connections(), 0, "{op}: たどらない");
+        assert!(dest_names(&env).is_empty(), "{op}: 公開しない");
+        env.assert_api_calls_safe();
+    }
+}
+
+#[test]
+fn a_retry_after_wait_is_honoured_inside_a_job_and_the_chunk_resumes_from_the_received_position() {
+    // ジョブの段で、チャンクの 429 の `Retry-After`（1 秒。上限 700ms で切る）を待ち、位置を問い合わせて続きから送る
+    let mut env = Env::new("faults-retry-after");
+    let site = photo_site(DAY, DAY, three());
+    let svc = service_with(
+        &mut env,
+        &site,
+        Tuning {
+            drive_sizes: Some((1000, 1, 256 << 10)),
+            drive_retry: Some(geoframe_export::drive::http::Retry {
+                max_retries: 3,
+                base: Duration::from_millis(1),
+                cap: Duration::from_millis(700),
+            }),
+            ..fast_tuning()
+        },
+    );
+    env.fake
+        .add_rule_contains("upload", "phase:chunk", 0, 1, fk::too_many_requests(1));
+    let start = Instant::now();
+    let rec = run_job(&svc);
+    let took = start.elapsed();
+    assert_eq!(rec.status, Status::Succeeded, "{:?}", rec.error);
+    assert_published_once(&env);
+    assert!(took >= Duration::from_millis(650), "{took:?}");
+    let status_queries = env
+        .http_calls()
+        .iter()
+        .filter(|c| c["op"] == "upload" && c["phase"] == "status")
+        .count();
+    assert!(status_queries >= 1, "{status_queries}");
+    assert_eq!(distinct_new_ids(&env, "upload"), 4, "ID を変えない");
+}

@@ -38,6 +38,14 @@
 //! （旧フォルダなら `modified`、公開後の照合なら `blocked`）。親フォルダの一覧に無関係な `Size: -1` の項目があっても、名前が一致する
 //! ものだけを判定に使うので、一覧全体を `drive_unavailable` にはしない。
 //!
+//! ## 作ったフォルダの ID は、書き込みまで引き継ぐ
+//!
+//! `incoming/<job_id>` は、作った [`Drive::mkdir_incoming`] が、`create_folder` が返した ID を、直後の一覧（ちょうど 1 つのフォルダ）と
+//! **照合して**から返す（食い違えば何も記録せずに失敗）。以後の送信（[`Drive::upload`] の親）・検証（[`Drive::folder_matches_expected`]）・
+//! 移動（[`Drive::publish_move`]）・復旧は、**名前で引き直さず、記録した ID を受け取る**。旧フォルダの退避（[`Drive::retire_old`]）も、
+//! 公開の記録・ジョブの記録の ID と一致した旧フォルダの ID を受け取る。移す直前に一覧して、その ID が見えなければ（動かされて同名の別の
+//! フォルダだけが残っているなど）、何も変えずに止める（照合の失敗。復旧の表に渡る）。
+//!
 //! ## ゴミ箱へ移すもの
 //!
 //! ゴミ箱へ移すのは、**事前に照合した ID** のフォルダだけ（完全な削除はしない。ゴミ箱から戻せる）。`incoming/<job_id>` は、記録した ID と
@@ -313,17 +321,6 @@ pub enum Removed {
     ContentMismatch(Vec<Seen>),
 }
 
-/// [`Drive::folder_matches_its_manifest`] の対象。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Place {
-    /// `incoming/<job_id>`。
-    Incoming,
-    /// 宛先。
-    Dest,
-    /// 退避先 `replaced/<種類>-<フォルダ名>-<job_id>`。
-    Retired,
-}
-
 /// 照合の結果（移動のあと、など）。
 pub type Check = Result<(), Observed>;
 
@@ -377,6 +374,22 @@ impl<'a> Drive<'a> {
         })
     }
 
+    /// 記録した ID のフォルダの下の全部。Drive が「その ID は無い」と答えたとき（動かされた・消された）は `None`
+    /// （照会の失敗とは分ける。呼び出し側は、一式と一致しない〔中身が違う〕ものとして扱う）。
+    fn tree_if_present(&self, folder_id: &str) -> Result<Option<Listing>, ExportError> {
+        match self.remote.list_tree(folder_id) {
+            Ok(entries) => {
+                let has_shortcut = entries.iter().any(Entry::is_shortcut);
+                Ok(Some(Listing {
+                    entries,
+                    has_shortcut,
+                }))
+            }
+            Err(RemoteError::NotFound) => Ok(None),
+            Err(e) => Err(e.into_query_error()),
+        }
+    }
+
     /// 作業用のフォルダの直下の `incoming`・`replaced`（フォルダ）の ID。親（作業用のフォルダ）の一覧が成功したうえで、
     /// そのフォルダが無ければ `None`、ちょうど 1 つのフォルダならその ID。それ以外（同名が複数・ファイル・ショートカット）は失敗。
     ///
@@ -418,19 +431,6 @@ impl<'a> Drive<'a> {
         let mut v = self.work_children(REPLACED)?;
         v.retain(|e| e.name == self.layout.retired_name);
         Ok(v)
-    }
-
-    /// `place` のフォルダの ID（親の一覧で名前を照合して、ちょうど 1 つのフォルダ。無い・複数・ショートカットは失敗）。
-    fn place_id(&self, place: Place) -> Result<String, ExportError> {
-        let entries = match place {
-            Place::Incoming => self.incoming_entries()?,
-            Place::Dest => self.named(&self.layout.prefix_id, self.layout.folder.as_str())?,
-            Place::Retired => self.replaced_entries()?,
-        };
-        match entries.as_slice() {
-            [e] if e.is_dir && !e.is_shortcut() => Ok(e.id.clone()),
-            _ => Err(unavailable("フォルダを確認できません")),
-        }
     }
 
     // ---- 宛先の状態 ----
@@ -592,32 +592,38 @@ impl<'a> Drive<'a> {
 
     // ---- 公開の操作 ----
 
-    /// `incoming/<job_id>` を作る（`incoming/` が無ければ、それも作業用のフォルダの直下に作る）。
-    pub fn mkdir_incoming(&self) -> Result<(), ExportError> {
+    /// `incoming/<job_id>` を作り、その ID を返す（`incoming/` が無ければ、それも作業用のフォルダの直下に作る）。`create_folder` が
+    /// 返した ID を、**直後の一覧**（`incoming/` の直下で、名前が `<job_id>` のもの）と照合し、ちょうど 1 つのフォルダで ID が同じ
+    /// ときだけ返す。食い違えば（作ったフォルダが動かされて同名の別のフォルダだけが残っているなど）何も記録せずに失敗する。
+    pub fn mkdir_incoming(&self) -> Result<String, ExportError> {
         let root = self.ensure_work_dir(INCOMING)?;
-        self.remote
+        let created = self
+            .remote
             .create_folder(&root, self.layout.job.as_str())
-            .map(|_| ())
-            .map_err(RemoteError::into_op_error)
-    }
-
-    /// `incoming/<job_id>` の Drive の ID（作ったあと、親の一覧から。ちょうど 1 つのフォルダでなければ失敗）。
-    pub fn incoming_id(&self) -> Result<String, ExportError> {
-        match self.incoming_entries()?.as_slice() {
-            [e] if e.is_dir && !e.is_shortcut() => Ok(e.id.clone()),
+            .map_err(RemoteError::into_op_error)?;
+        let mut listed = self.children(&root)?;
+        listed.retain(|e| e.name == self.layout.job.as_str());
+        match listed.as_slice() {
+            [e] if e.is_dir && !e.is_shortcut() && e.id == created => Ok(created),
             _ => Err(unavailable("incoming のフォルダを確認できません")),
         }
     }
 
-    /// 写真を並列（[`UPLOAD_PARALLEL`]）で送り、**全部が成功してから最後に** manifest を送る。`files` は一式（相対パス・大きさ・MD5。
+    /// 写真を並列（[`UPLOAD_PARALLEL`]）で送り、**全部が成功してから最後に** manifest を送る。送る先は、記録した `incoming/<job_id>` の
+    /// ID（`incoming_id`。名前で引き直さない）。`files` は一式（相対パス・大きさ・MD5。
     /// `manifest.json` を含む）、`workspace` は作業領域（絶対パス）。サブフォルダ（日付のフォルダ）は先に作り、葉の名前で送る。
     ///
     /// 1 つでも失敗したら、残りは始めずに、走っているものを待ってから失敗を返す。**全スレッドを join してから戻る**（キャンセル
     /// されたときも同じ。呼び出し側はそのあとで実行枠を手放す）。キャンセルの印が立っていれば、ほかの失敗より
     /// [`RemoteError::Cancelled`] を優先して返す（結果不明として復旧の表へ渡す）。期限は、写真の送信全体で 1 つ
     /// （[`Remote::upload_deadline`]）。
-    pub fn upload(&self, workspace: &Path, files: &[PublishFile]) -> Result<(), ExportError> {
-        let root = self.incoming_id()?;
+    pub fn upload(
+        &self,
+        incoming_id: &str,
+        workspace: &Path,
+        files: &[PublishFile],
+    ) -> Result<(), ExportError> {
+        let root = incoming_id.to_owned();
         let (photos, manifest): (Vec<&PublishFile>, Vec<&PublishFile>) =
             files.iter().partition(|f| f.path != MANIFEST_NAME);
         let [manifest] = manifest.as_slice() else {
@@ -694,27 +700,29 @@ impl<'a> Drive<'a> {
         send(manifest).map_err(RemoteError::into_op_error)
     }
 
-    /// `incoming/<job_id>` の中身が、期待した一式と完全に一致するか。
-    pub fn incoming_matches(&self, expected: &Expected) -> Result<bool, ExportError> {
-        let listing = self.tree(&self.place_id(Place::Incoming)?)?;
+    /// ID のフォルダ（`incoming/<job_id>`・宛先）の中身が、期待した一式と完全に一致するか。
+    pub fn folder_matches_expected(
+        &self,
+        folder_id: &str,
+        expected: &Expected,
+    ) -> Result<bool, ExportError> {
+        let Some(listing) = self.tree_if_present(folder_id)? else {
+            return Ok(false);
+        };
         Ok(!listing.has_shortcut && expected.matches(&listing.entries))
     }
 
-    /// 宛先の中身が、期待した一式と完全に一致するか。
-    pub fn dest_matches_expected(&self, expected: &Expected) -> Result<bool, ExportError> {
-        let listing = self.tree(&self.place_id(Place::Dest)?)?;
-        Ok(!listing.has_shortcut && expected.matches(&listing.entries))
-    }
-
-    /// フォルダの中身が、そのフォルダの manifest が言う一式と一致するか（復旧用。手元に一式が無いとき）。manifest は、
+    /// ID のフォルダの中身が、そのフォルダの manifest が言う一式と一致するか（復旧用。手元に一式が無いとき）。manifest は、
     /// このサービスが書いたもの（`generator`・`destination`・`folder`）でなければならない。`md5` があれば（公開の記録の
     /// ファイルごとの MD5）、一覧の MD5 もそれと一致しなければならない（ファイルの集合が manifest と違えば不一致）。
     pub fn folder_matches_its_manifest(
         &self,
-        place: Place,
+        folder_id: &str,
         md5: Option<&[RecordedFile]>,
     ) -> Result<bool, ExportError> {
-        let listing = self.tree(&self.place_id(place)?)?;
+        let Some(listing) = self.tree_if_present(folder_id)? else {
+            return Ok(false);
+        };
         let Some((manifest_id, size)) = Self::top_manifest(&listing) else {
             return Ok(false);
         };
@@ -758,16 +766,18 @@ impl<'a> Drive<'a> {
         }
     }
 
-    /// 旧フォルダ（宛先のフォルダ）を `replaced/<種類>-<フォルダ名>-<job_id>` へ移す（ID で移す。`replaced/` が無ければ作る。
-    /// 移したあとの照合は呼び出し側）。
-    pub fn retire_old(&self) -> Result<(), ExportError> {
-        let Target::Exists { id } = self.target()? else {
-            return Err(unavailable("宛先のフォルダを確認できません"));
-        };
+    /// 旧フォルダ（宛先のフォルダ。ID は `old_id`。公開の記録・ジョブの記録と一致したもの）を `replaced/<種類>-<フォルダ名>-<job_id>` へ
+    /// 移す（ID で移す。`replaced/` が無ければ作る。移したあとの照合は呼び出し側）。移す直前に宛先を一覧して、見えたフォルダが
+    /// `old_id` でなければ（動かされた・同名の別のフォルダに替わった）、何も変えずに失敗する。
+    pub fn retire_old(&self, old_id: &str) -> Result<(), ExportError> {
         let replaced = self.ensure_work_dir(REPLACED)?;
+        match self.target()? {
+            Target::Exists { id } if id == old_id => {}
+            _ => return Err(unavailable("宛先のフォルダが記録した旧フォルダと違います")),
+        }
         self.remote
             .move_to(
-                &id,
+                old_id,
                 &self.layout.prefix_id,
                 &replaced,
                 &self.layout.retired_name,
@@ -775,17 +785,26 @@ impl<'a> Drive<'a> {
             .map_err(RemoteError::into_op_error)
     }
 
-    /// `incoming/<job_id>` を宛先へ移す（ID で移す。親を宛先の親へ、名前をフォルダ名にして、1 回の更新で変える。移したあとの照合は
-    /// 呼び出し側）。移す直前に宛先に同名が無いことを確かめるのは、呼び出し側（[`crate::publish`]）。API の移動はフォルダの
-    /// 移動のまま（rclone のように、同名のフォルダがあるとファイル単位の移動に化けることはない）。
-    pub fn publish_move(&self) -> Result<(), ExportError> {
-        let id = self.incoming_id()?;
+    /// `incoming/<job_id>`（ID は `incoming_id`。記録したもの）を宛先へ移す（ID で移す。親を宛先の親へ、名前をフォルダ名にして、
+    /// 1 回の更新で変える。移したあとの照合は呼び出し側）。移す直前に `incoming/` の直下を一覧して、`<job_id>` の項目が
+    /// `incoming_id` のフォルダ 1 つだけでなければ、何も変えずに失敗する。移す直前に宛先に同名が無いことを確かめるのは、呼び出し側
+    /// （[`crate::publish`]）。API の移動はフォルダの移動のまま（rclone のように、同名のフォルダがあるとファイル単位の移動に化ける
+    /// ことはない）。
+    pub fn publish_move(&self, incoming_id: &str) -> Result<(), ExportError> {
         let Some(root) = self.work_dir(INCOMING)? else {
             return Err(unavailable("incoming のフォルダを確認できません"));
         };
+        let mut listed = self.children(&root.id)?;
+        listed.retain(|e| e.name == self.layout.job.as_str());
+        match listed.as_slice() {
+            [e] if e.is_dir && !e.is_shortcut() && e.id == incoming_id => {}
+            _ => {
+                return Err(unavailable("incoming のフォルダが記録した ID と違います"));
+            }
+        }
         self.remote
             .move_to(
-                &id,
+                incoming_id,
                 &root.id,
                 &self.layout.prefix_id,
                 self.layout.folder.as_str(),
@@ -832,7 +851,7 @@ impl<'a> Drive<'a> {
         else {
             return Ok(Removed::ContentMismatch(seen));
         };
-        if !self.folder_matches_its_manifest(Place::Retired, Some(&recorded.files))? {
+        if !self.folder_matches_its_manifest(old_id, Some(&recorded.files))? {
             return Ok(Removed::ContentMismatch(seen));
         }
         let again = self.replaced_seen()?;
@@ -868,9 +887,10 @@ impl<'a> Drive<'a> {
         if !placed {
             return Ok(Err(o));
         }
+        // 宛先は、上で ID を確かめた `incoming_id` のフォルダ 1 つだけ。その ID で中身を照合する
         let content_ok = match expected {
-            Some(e) => self.dest_matches_expected(e)?,
-            None => self.folder_matches_its_manifest(Place::Dest, recorded)?,
+            Some(e) => self.folder_matches_expected(incoming_id, e)?,
+            None => self.folder_matches_its_manifest(incoming_id, recorded)?,
         };
         if !content_ok {
             return Ok(Err(o));
