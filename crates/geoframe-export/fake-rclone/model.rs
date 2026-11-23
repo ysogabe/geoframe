@@ -170,11 +170,12 @@ impl Drive {
         self.nodes.iter().filter(|n| n.parent == parent).collect()
     }
 
-    /// 親の下の、名前が一致する最初のフォルダ。
+    /// 親の下の、名前が一致する最初のフォルダ（ゴミ箱へ移したものは数えない。偽の rclone の `purge` は木から消すが、偽の Drive の
+    /// HTTP サーバーは `trashed` の印を付けて残す）。
     fn find_dir(&self, parent: &str, name: &str) -> Option<&Node> {
         self.nodes
             .iter()
-            .find(|n| n.parent == parent && n.name == name && n.kind == Kind::Dir)
+            .find(|n| n.parent == parent && n.name == name && n.kind == Kind::Dir && !n.trashed)
     }
 
     pub fn resolve<S: AsRef<str>>(&self, path: &[S]) -> Option<String> {

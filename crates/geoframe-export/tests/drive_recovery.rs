@@ -2,14 +2,16 @@
 //! 起動時の復旧（T5）と同じく、手元に一式が無い（Drive の manifest で照合する）形で動かす。表そのもの（純粋な関数）の試験は
 //! `src/recovery.rs`。
 //!
-//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る
-//! （`Env::ops`・`mutating_ops`・`ops_used`・`op_count`）。`// rclone 固有` と書いた確認（`rclone_calls`・
-//! `assert_rclone_safe_calls`）と、そう書いた試験だけが、rclone の引数・環境変数を見る。それらは rclone 版を消すときに消す。
+//! Drive は、試験のプロセスの中の偽の Drive の HTTP サーバー（`tests/common/fake_drive.rs`）。操作の記録は、中立の操作名（`list`・
+//! `read`・`create_folder`・`upload`・`move`・`trash`。読むだけの `get`・`generate_ids`・`token` も混ざる）で見る（`Env::ops`・
+//! `mutating_ops`・`ops_used`・`op_count`）。API の呼び出しの形は `Env::assert_api_calls_safe`。復旧の表を通す試験は、API の再試行に
+//! 助けられないよう、再試行しない `Env::remote()` で動かす。
 
 mod common;
 
 use common::drive::model;
 use common::drive::*;
+use common::fake_drive::{do_then_add_folder, late_then_fail};
 use geoframe_export::drive::{Expected, Layout};
 use geoframe_export::error::ErrorCode;
 use geoframe_export::folder::FolderName;
@@ -291,8 +293,8 @@ fn a_retired_old_folder_with_a_verified_incoming_is_rolled_forward() {
         // 前へ進める前に incoming の中身を manifest と照合し（cat）、移動は 1 回だけ
         assert!(w.env.ops_used().contains(&"read".to_owned()));
         assert_eq!(w.env.op_count("move"), 1);
-        // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-        assert_rclone_safe_calls(&w.env);
+        // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+        w.env.assert_api_calls_safe();
     }
 }
 
@@ -533,8 +535,8 @@ fn explain_shows_the_state_and_the_next_move_without_changing_drive() {
     assert!(matches!(decision.action, Action::RollForward { .. }));
     assert!(observed.dest.is_empty());
     assert!(text.contains(&old) && text.contains(&inc), "{text}");
-    // 呼んだのは lsjson だけ
-    assert_eq!(w.env.ops_used(), ["list"]);
+    // 呼んだのは一覧だけ（トークンを取るほかは、読むだけ）
+    assert_eq!(w.env.ops_used(), ["list", "token"]);
     w.env.assert_no_mutations();
     assert_eq!(w.dest(), None);
     // ブロックされる状態の説明
@@ -591,14 +593,15 @@ fn the_pending_lookup_works_with_the_local_set_too() {
     assert!(matches!(res, Resolution::Published(_)));
     // 手元の一式で照合するので、incoming・宛先の manifest は読まない。読むのは、ゴミ箱へ移す前の、退避した旧フォルダの
     // manifest（旧 manifest の一式と中身の照合）だけ
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    let cats = w.env.rclone_calls("cat");
-    assert_eq!(cats.len(), 1, "{cats:?}");
-    assert!(
-        cats[0].last().unwrap().contains("/replaced/"),
-        "{:?}",
-        cats[0]
-    );
+    let reads: Vec<String> = w
+        .env
+        .http_calls()
+        .iter()
+        .filter(|c| c["op"] == "read")
+        .map(|c| c["subject"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(reads[0].contains("/replaced/"), "{reads:?}");
     let _ = (ErrorCode::Blocked, model::ROOT);
 }
 
@@ -684,8 +687,8 @@ fn recovery_records_publishing_before_it_moves_the_incoming_so_a_second_stop_res
     let rec = seq.iter().rposition(|c| c == "record:trashing").unwrap();
     let purge = seq.iter().position(|c| c == "trash").unwrap();
     assert!(rec < purge, "{seq:?}");
-    // rclone 固有: rclone の引数・環境変数を確かめる（rclone 版を消すときに、この確認も消す）。
-    assert_rclone_safe_calls(&w.env);
+    // API の呼び出しの形（Authorization が付く・名前で絞らない・完全な削除と中身の更新が無い）
+    w.env.assert_api_calls_safe();
 }
 
 #[test]
@@ -775,7 +778,7 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("move", 0, 1, late_then_fail(3));
+    w.env.add_rule("move", 0, u64::MAX, late_then_fail(3));
     let r = w.env.remote();
     let res = w
         .recovery(&r, None)
@@ -857,12 +860,13 @@ fn a_lost_move_response_during_recovery_waits_and_lists_twice_before_it_checks()
 #[test]
 fn startup_recovery_checks_the_destination_after_the_move_before_it_goes_to_the_trash() {
     // 起動時の復旧（手元に一式が無い）でも、移した直後に、宛先の ID・incoming が残っていない・中身を照合する
-    // ファイル単位の移動に切り替わった → 宛先の ID が incoming の ID と違う
-    let w = world("startup-filewise");
+    // 移した直後に、オーナーが宛先に同じ名前のフォルダを作った → 宛先が incoming の ID のフォルダ 1 つだけではない
+    let w = world("startup-dup-folder");
     let old = w.env.seed_managed(Y, FOLDER, &w.set);
     let inc = w.put_incoming();
     w.retire(&old);
-    w.env.add_rule("move", 0, 1, filewise());
+    w.env
+        .add_rule("move", 0, 1, do_then_add_folder(&["yamareco"], FOLDER));
     let r = w.env.remote();
     let info = w
         .recovery(&r, None)

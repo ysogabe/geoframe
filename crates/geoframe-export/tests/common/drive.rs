@@ -37,6 +37,15 @@ pub const FOLDER: &str = "2030-03-10";
 /// Drive を変えない操作名（`mutating_ops` が除く）。
 const READ_ONLY_OPS: [&str; 5] = ["list", "read", "get", "generate_ids", "token"];
 
+/// 再試行しない方針。
+pub fn no_retry() -> geoframe_export::drive::http::Retry {
+    geoframe_export::drive::http::Retry {
+        max_retries: 0,
+        base: Duration::from_millis(1),
+        cap: Duration::from_millis(1),
+    }
+}
+
 /// 待たずに済む再試行の方針（5ms から。3 回まで）。
 pub fn fast_retry() -> geoframe_export::drive::http::Retry {
     geoframe_export::drive::http::Retry {
@@ -126,12 +135,19 @@ impl Env {
         .collect()
     }
 
-    /// 再試行を待たない（5ms から）、期限 30 秒の `Remote`。
+    /// **再試行しない**（失敗した要求はそのまま失敗になる）、期限 30 秒の `Remote`。流れ（公開・復旧）の試験は、API の再試行に
+    /// 助けられずに、失敗がそのまま復旧の表へ渡ることを確かめる（API 自身の再試行・「済み」の判定は `drive_api.rs` と、
+    /// `remote_retrying` を使うフローの故障注入の試験）。
     pub fn remote(&self) -> Remote {
         Remote::new(&self.settings)
             .expect("remote")
             .with_timeouts(Duration::from_secs(30), Duration::from_secs(30))
-            .with_retry(fast_retry())
+            .with_retry(no_retry())
+    }
+
+    /// 短い待ちで再試行する（5ms から。3 回まで）`Remote`。
+    pub fn remote_retrying(&self) -> Remote {
+        self.remote().with_retry(fast_retry())
     }
 
     pub fn layout(&self, dest: Destination, folder: &str, job: &str) -> Layout {
