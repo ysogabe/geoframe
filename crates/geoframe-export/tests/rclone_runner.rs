@@ -12,10 +12,10 @@ use std::time::{Duration, Instant};
 
 use common::TempDir;
 use common::drive::*;
-use geoframe_export::rclone::Rclone;
+use geoframe_export::rclone::{Rclone, RcloneSettings};
 use geoframe_export::remote::{RemoteError, RemoteLoc};
 use geoframe_export::request::Destination;
-use geoframe_export::settings::{RawSettings, RemotePath, Settings};
+use geoframe_export::settings::RemotePath;
 use serde_json::json;
 
 fn write_script(dir: &Path, body: &str) -> PathBuf {
@@ -25,19 +25,14 @@ fn write_script(dir: &Path, body: &str) -> PathBuf {
     path
 }
 
-fn settings_for(program: &Path, state: &Path) -> Settings {
-    Settings::from_raw(&RawSettings {
-        rclone: Some(program.to_string_lossy().into_owned()),
-        rclone_config: Some(
-            state
-                .join("rclone/rclone.conf")
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        state_dir: Some(state.to_string_lossy().into_owned()),
-        ..RawSettings::default()
-    })
-    .expect("settings")
+fn settings_for(program: &Path, state: &Path) -> RcloneSettings {
+    RcloneSettings {
+        program: program.to_path_buf(),
+        config: state.join("rclone/rclone.conf"),
+        state_dir: state.to_path_buf(),
+        copy_timeout: Duration::from_secs(45 * 60),
+        timeout: Duration::from_secs(5 * 60),
+    }
 }
 
 fn loc() -> RemoteLoc {

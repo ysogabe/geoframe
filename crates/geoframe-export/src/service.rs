@@ -58,6 +58,7 @@ use crate::jobs::{Blocking, JobRecord, JobStore, REQUEST_ID_WINDOW, ReadOutcome,
 use crate::lock::{self, Slot, SlotGuard};
 use crate::published::PublishedStore;
 use crate::request::ExportRequest;
+use crate::remote::Remote;
 use crate::settings::Settings;
 
 /// 新しいジョブを始められない理由。
@@ -175,6 +176,8 @@ impl Drop for RunningGuard {
 
 struct Inner {
     settings: Settings,
+    /// Drive の操作の入口（トークンは持ち回る。キャンセルの印は共有済み）。
+    remote: Remote,
     store: JobStore,
     published: PublishedStore,
     tuning: Tuning,
@@ -188,6 +191,7 @@ impl Inner {
     fn context(&self) -> Context<'_> {
         Context {
             settings: &self.settings,
+            remote: &self.remote,
             store: &self.store,
             published: &self.published,
             tuning: &self.tuning,
@@ -220,9 +224,24 @@ impl Service {
     ) -> Result<Self, ExportError> {
         let store = JobStore::open(&settings.state_dir)?;
         let published = PublishedStore::in_state_dir(&settings.state_dir);
+        let mut remote = Remote::new(&settings)
+            .map_err(|_| {
+                ExportError::new(
+                    ErrorCode::Internal,
+                    "Drive の資格情報を読めません（--drive-credentials）",
+                )
+            })?
+            .with_cancel(cancel.clone());
+        if let Some(retry) = tuning.drive_retry {
+            remote = remote.with_retry(retry);
+        }
+        if let Some((page, multipart, chunk)) = tuning.drive_sizes {
+            remote = remote.with_sizes(page, multipart, chunk);
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 settings,
+                remote,
                 store,
                 published,
                 tuning,

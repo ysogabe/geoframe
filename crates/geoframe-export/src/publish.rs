@@ -981,7 +981,7 @@ impl Run<'_> {
         let incoming_id = self.drive.incoming_id().map_err(StepErr::Op)?;
         self.record(Stage::Uploading, Some(&incoming_id))?;
         self.drive
-            .upload(self.params.workspace)
+            .upload(self.params.workspace, self.params.files)
             .map_err(StepErr::Op)?;
 
         // 2. verifying: 送った中身が一式と完全に一致する（受け取り側と同じ検証）

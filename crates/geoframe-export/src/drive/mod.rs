@@ -1,58 +1,58 @@
-//! Drive への照会と、1 回ごとの操作（design.md 4.2）。
+//! Drive への照会と、1 回ごとの操作（design.md 4.2、docs/note-photo-export/drive-api.md 4 章）。
 //!
-//! 子モジュール [`api`]・[`auth`]・[`http`] は、Drive API を**ID で指して**直接呼ぶ操作の型（docs/note-photo-export/drive-api.md）。
-//! 今のところ、この階層の [`Drive`] はまだ使っておらず（中立の入口 [`crate::remote::Remote`] の中身は rclone のまま）、
-//! 後の変更でつなぐ。以下は、今の rclone 版の約束。中立の入口（[`crate::remote::Remote`]。今の中身は rclone）で Drive を操作する側で、判断（何をどの順で呼ぶか）は [`crate::publish`]。
+//! 子モジュール [`api`]・[`auth`]・[`http`] は、Drive API を**ID で指して**直接呼ぶ操作の型。この階層の [`Drive`] は、中立の入口
+//! （[`crate::remote::Remote`]）の上で、1 回の公開に関係する場所（宛先・`incoming/<job_id>`・`replaced/<…>`）を扱う。何をどの順で
+//! 呼ぶかの判断は [`crate::publish`]。
+//!
+//! ## 場所と ID
+//!
+//! 宛先の親フォルダ（`yamareco`・`travel-journal`）と作業用のフォルダは、起動引数の **Drive の ID** で指す（[`Layout`]）。その下の
+//! フォルダ（宛先のフォルダ・`incoming/`・`incoming/<job_id>`・`replaced/`・`replaced/<…>`）は、**親の直下を一覧して、名前の完全一致で
+//! 照合して**ID を得る（名前で `q` を絞らない）。以後の操作（一覧・読み出し・移動・ゴミ箱へ移す）は、照合した ID で行う。
 //!
 //! ## 照会の約束（どれも「Drive が答えなかった」を「無い」と取り違えない）
 //!
-//! - 「無い」と言えるのは、**親の一覧が成功したうえで、名前に一致するものが無いとき**だけ。場所そのものへの `lsjson` が失敗
-//!   （終了コード 3 を含む）したら `drive_unavailable`。`incoming/`・`replaced/` は最初は無いので、作業用のフォルダ（親）を
-//!   一覧して、あれば中を一覧する（[`Drive::work_children`]）。
-//! - 一覧の形が違えば（[`crate::rclone::parse_lsjson`]）失敗。空の ID は形の検査で断るので、空どうしが「一致」することはない。
+//! - 「無い」と言えるのは、**親の一覧が成功したうえで、名前に一致するものが無いとき**だけ。`incoming/`・`replaced/` は最初は無いので、
+//!   作業用のフォルダ（親）を一覧して、あれば中を一覧する（[`Drive::work_children`]）。一覧の失敗は `drive_unavailable`。
+//! - 一覧の形が違えば（API の応答が決められた形でなければ）失敗。空の ID は形の検査で断るので、空どうしが「一致」することはない。
 //! - ファイルの集合は、並べ替えた**リスト**で比べる（同じ名前のファイルを Drive は複数持てる。マップにすると 1 つに潰れて通る）。
-//! - 「manifest が無い」と決めるのは、`cat` の終了コードではなく、**一覧**（直下に `manifest.json` がちょうど 1 つのファイルで 4MB 以下）
-//!   から。`cat` の失敗は `drive_unavailable`。
+//! - 「manifest が無い」と決めるのは、読み出しの失敗ではなく、**一覧**（直下に `manifest.json` がちょうど 1 つのファイルで 4MB 以下）
+//!   から。読み出しの失敗は `drive_unavailable`。読んだものが一覧の大きさを超えた・違えば、読んだものを信用しない。
 //! - 「一覧が manifest と一致する」の比べ方は 1 つ（[`Expected::matches`]）。送信後の検証・管理しているフォルダの変更の確認・
 //!   公開後の確認・復旧が、同じものを使う。
-//! - 一致の条件は、相対パス・サイズに加えて、**MD5**（`lsjson -R --hash --hash-type MD5` の `Hashes.md5`）。期待する MD5 が
-//!   分かっているとき（これから送る一式の検証、公開の記録 `published/` の MD5 と照らす `replace` の前の確認・ゴミ箱へ移す前の
-//!   確認）は、一覧の MD5 が一致しなければ一致しない（同じ名前・同じ大きさのまま中身を書き換えられたものを見落とさない）。
-//!   MD5 を持たないファイル（Google のネイティブ文書など）は、期待した MD5 を持てないので「一式に無いファイル」として断る。
-//!   期待する MD5 が無いのは、手元にも記録にも一式の MD5 が無い、起動時の復旧の照合（宛先の manifest だけで照合する）だけ。
+//! - 一致の条件は、相対パス・サイズに加えて、**MD5**（`md5Checksum`）。期待する MD5 が分かっているとき（これから送る一式の検証、
+//!   公開の記録 `published/` の MD5 と照らす `replace` の前の確認・ゴミ箱へ移す前の確認）は、一覧の MD5 が一致しなければ一致しない
+//!   （同じ名前・同じ大きさのまま中身を書き換えられたものを見落とさない）。MD5 を持たないファイル（Google のネイティブ文書など）は、
+//!   期待した MD5 を持てないので「一式に無いファイル」として断る。期待する MD5 が無いのは、手元にも記録にも一式の MD5 が無い、
+//!   起動時の復旧の照合（宛先の manifest だけで照合する）だけ。
 //!
 //! ## ショートカット
 //!
-//! rclone の drive は、既定ではショートカットを指す先のものとして解決して一覧に出す（解決しないで一覧に出すこともある）。
-//! 解決された項目の ID は、リンク先の ID とショートカット自身の ID をタブで結んだ複合 ID なので、
-//! [`crate::rclone::parse_lsjson`] が複合 ID をショートカットとして分類する（一覧全体を断らない）。リンク切れは MIME タイプが
-//! `…shortcut.dangling` で出る。念のため**同じ場所を 2 回**（`--drive-skip-shortcuts` ありと、`=false` を明示した無し）一覧し、
-//! 無しのほうにだけある項目も、ショートカットとして数える（[`Drive::list_checked`]・[`classify`]）。配置のときに本物の rclone で
-//! 挙動を確かめる項目。
+//! API の一覧では、ショートカットは解決されずに、MIME タイプ `application/vnd.google-apps.shortcut` の 1 件として出る
+//! （[`crate::remote::Entry::is_shortcut`]）。同名のショートカットは「同名のものがある」として数える（宛先の判定は
+//! `ambiguous_destination`、一式の照合は不一致）。
 //!
 //! ## サイズ不明のファイル
 //!
-//! 一覧には `--drive-show-all-gdocs` を付ける（エクスポートできない Google のファイル、例えばフォームも出る）。ネイティブの
-//! Google 文書やそうしたファイルは `Size: -1`。受け付けて「一式に無いファイル」として扱う（旧フォルダなら `modified`、公開後の
-//! 照合なら `blocked`）。親フォルダの一覧に無関係な `Size: -1` の項目があっても、名前が一致するものだけを判定に使うので、
-//! 一覧全体を `drive_unavailable` にはしない。
+//! Google のネイティブ文書やフォームには `size` が無く、`Size: -1` として扱う。受け付けて「一式に無いファイル」として扱う
+//! （旧フォルダなら `modified`、公開後の照合なら `blocked`）。親フォルダの一覧に無関係な `Size: -1` の項目があっても、名前が一致する
+//! ものだけを判定に使うので、一覧全体を `drive_unavailable` にはしない。
 //!
-//! ## ゴミ箱へ移すもの（`purge`）
+//! ## ゴミ箱へ移すもの
 //!
-//! rclone で Drive のゴミ箱へ移せるのは**パスで指したフォルダだけ**。`root_folder_id=<ID>` の接続文字列で根を `purge` しても、
-//! rclone の drive は何もしない（上流の `purgeCheck` は、根が空で `check=false` の分岐では消さない）ので、ID を固定した
-//! ゴミ箱への移動はできない。そこで `purge` を呼ぶ先は、**誰とも共有しない作業用のフォルダの中の、乱数（128 ビットの
-//! `job_id`）で決まる名前だけ**にする: `incoming/<job_id>` と `replaced/<種類>-<フォルダ名>-<job_id>`。残る競合は、オーナーが
-//! その名前のフォルダを、照合から `purge` までの数秒のうちに作ることだけ。さらに `replaced/…` は `purge` の直前に、
-//! 親・名前・旧 ID の照合に加えて、**中身が旧 manifest の一式と完全に一致する**ことを確かめ直す（停止中に足されたファイルごと
-//! ゴミ箱へ移さない）。`incoming/<job_id>` は、記録した ID と一致するフォルダ 1 つだけのときに消す
-//! （ID が記録されていなければ、名前だけでは消さない）。
+//! ゴミ箱へ移すのは、**事前に照合した ID** のフォルダだけ（完全な削除はしない。ゴミ箱から戻せる）。`incoming/<job_id>` は、記録した ID と
+//! 一致するフォルダ 1 つだけのときに消す（ID が記録されていなければ、名前だけでは消さない）。`replaced/…` は、親・名前・旧 ID の照合に加えて、
+//! **中身が旧 manifest の一式と完全に一致する**ことを確かめ、もう一度見てから移す（停止中に足されたファイルごとゴミ箱へ移さない）。
+//! パスで指していた rclone 版と違い、移す先が「その瞬間に同じ名前の別のフォルダ」に化ける競合は無い（ID を指すので）。
 
 pub mod api;
 pub mod auth;
 pub mod http;
 
+use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use serde_json::Value;
 
@@ -62,13 +62,17 @@ use crate::image::PublishFile;
 use crate::jobid::JobId;
 use crate::published::{PublishedStore, RecordedFile};
 use crate::recovery::{Kind, Observed, Seen};
-use crate::remote::{CopyScope, Entry, Remote, RemoteError, RemoteLoc};
+use crate::remote::{Entry, Remote, RemoteError};
 use crate::request::Destination;
 use crate::settings::Settings;
 
 /// 管理しているフォルダの確認で読む manifest の上限（design.md 4.2）。
 pub const MANIFEST_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const MANIFEST_NAME: &str = "manifest.json";
+/// 写真を送る並列の数（設計 4 章）。
+pub const UPLOAD_PARALLEL: usize = 4;
+const INCOMING: &str = "incoming";
+const REPLACED: &str = "replaced";
 
 fn unavailable(detail: &'static str) -> ExportError {
     ExportError::new(ErrorCode::DriveUnavailable, detail)
@@ -76,22 +80,16 @@ fn unavailable(detail: &'static str) -> ExportError {
 
 // ---- Drive 上の場所 ----
 
-/// 1 回の公開に関係する Drive 上の場所。接頭辞・作業用のフォルダは検査済みの設定から、残りは検査済みの部品（フォルダ名・
-/// ジョブ ID・固定の名前）だけで作る。呼び出し側の文字列は入らない。
+/// 1 回の公開に関係する Drive 上の場所。宛先の親フォルダ・作業用のフォルダは検査済みの設定の **ID** から、残りは検査済みの部品
+/// （フォルダ名・ジョブ ID・固定の名前）だけで決める。呼び出し側の文字列は入らない。親の下の ID は、一覧の名前の照合で得る（[`Drive`]）。
 #[derive(Debug, Clone)]
 pub struct Layout {
     destination: Destination,
     folder: FolderName,
     job: JobId,
     retired_name: String,
-    prefix_loc: RemoteLoc,
-    dest_loc: RemoteLoc,
-    work_loc: RemoteLoc,
-    incoming_root: RemoteLoc,
-    incoming_loc: RemoteLoc,
-    replaced_root: RemoteLoc,
-    retired_loc: RemoteLoc,
-    manifest_loc: RemoteLoc,
+    prefix_id: String,
+    work_id: String,
 }
 
 impl Layout {
@@ -101,29 +99,14 @@ impl Layout {
         folder: FolderName,
         job: JobId,
     ) -> Result<Self, ExportError> {
-        let internal = || ExportError::new(ErrorCode::Internal, "Drive のパスを作れません");
-        let prefix_loc = RemoteLoc::of(settings.prefix(destination));
-        let dest_loc = prefix_loc.child(folder.as_str()).ok_or_else(internal)?;
-        let work_loc = RemoteLoc::of(&settings.work_root);
-        let incoming_root = work_loc.child("incoming").ok_or_else(internal)?;
-        let incoming_loc = incoming_root.child(job.as_str()).ok_or_else(internal)?;
-        let replaced_root = work_loc.child("replaced").ok_or_else(internal)?;
         let retired_name = format!("{}-{}-{}", destination.as_str(), folder, job);
-        let retired_loc = replaced_root.child(&retired_name).ok_or_else(internal)?;
-        let manifest_loc = dest_loc.child(MANIFEST_NAME).ok_or_else(internal)?;
         Ok(Self {
             destination,
             folder,
             job,
             retired_name,
-            prefix_loc,
-            dest_loc,
-            work_loc,
-            incoming_root,
-            incoming_loc,
-            replaced_root,
-            retired_loc,
-            manifest_loc,
+            prefix_id: settings.prefix_id(destination).to_owned(),
+            work_id: settings.work_folder.clone(),
         })
     }
 
@@ -140,14 +123,17 @@ impl Layout {
     pub fn retired_name(&self) -> &str {
         &self.retired_name
     }
-    pub fn dest_path(&self) -> &str {
-        self.dest_loc.as_str()
+    /// 宛先の場所の説明（`<種類>/<フォルダ名>`。種類の親フォルダの下のフォルダ。ID は含めない）。記録・表示用。
+    pub fn dest_path(&self) -> String {
+        format!("{}/{}", self.destination.as_str(), self.folder)
     }
-    pub fn incoming_path(&self) -> &str {
-        self.incoming_loc.as_str()
+    /// `incoming/<job_id>` の説明（作業用のフォルダの下）。
+    pub fn incoming_path(&self) -> String {
+        format!("{INCOMING}/{}", self.job)
     }
-    pub fn retired_path(&self) -> &str {
-        self.retired_loc.as_str()
+    /// `replaced/<…>` の説明（作業用のフォルダの下）。
+    pub fn retired_path(&self) -> String {
+        format!("{REPLACED}/{}", self.retired_name)
     }
 }
 
@@ -274,43 +260,12 @@ impl Expected {
     }
 }
 
-/// ショートカットまで含めた一覧の結果。
+/// 再帰の一覧の結果。
 #[derive(Debug, Clone)]
 pub struct Listing {
-    /// `--drive-skip-shortcuts` ありの一覧。
     pub entries: Vec<Entry>,
-    /// ショートカットがある、または 2 つの一覧が食い違う。
+    /// ショートカットが 1 つでもある。
     pub has_shortcut: bool,
-}
-
-/// 接頭辞の一覧 2 つ（ショートカットを除いた `a` と、除かない `b`）から、`name` に一致する項目を ID・種類で返す。
-/// `b` にだけある項目（解決されたショートカット）と、ショートカットの項目（MIME タイプがショートカット・リンク切れ・
-/// 複合 ID）は、種類を [`Kind::Shortcut`] にする。
-pub fn classify(a: &[Entry], b: &[Entry], name: &str) -> Vec<Seen> {
-    let mut pool: Vec<&Entry> = a.iter().filter(|e| e.name == name).collect();
-    let mut out = Vec::new();
-    for e in b.iter().filter(|e| e.name == name) {
-        if e.is_shortcut() {
-            out.push(Seen::of(e));
-            continue;
-        }
-        match pool
-            .iter()
-            .position(|x| x.id == e.id && x.is_dir == e.is_dir && !x.is_shortcut())
-        {
-            Some(pos) => {
-                pool.remove(pos);
-                out.push(Seen::of(e));
-            }
-            None => out.push(Seen {
-                id: e.id.clone(),
-                kind: Kind::Shortcut,
-            }),
-        }
-    }
-    // `a` にだけある項目（2 つの一覧の食い違い）も、見えたものとして数える
-    out.extend(pool.into_iter().map(Seen::of));
-    out
 }
 
 // ---- 宛先の状態 ----
@@ -377,6 +332,12 @@ pub struct Drive<'a> {
     layout: &'a Layout,
 }
 
+/// フォルダ 1 つの Drive 上の場所（親の ID と名前から、一覧で照合して得た ID）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Found {
+    id: String,
+}
+
 impl<'a> Drive<'a> {
     pub fn new(remote: &'a Remote, layout: &'a Layout) -> Self {
         Self { remote, layout }
@@ -388,86 +349,99 @@ impl<'a> Drive<'a> {
 
     // ---- 一覧 ----
 
-    /// `--drive-skip-shortcuts` ありの一覧。場所が無い（終了コード 3）ことも含め、失敗は `drive_unavailable`。
-    ///
-    /// 再帰の一覧（フォルダの中身の照合に使う）にだけ、ファイルの MD5（`--hash --hash-type MD5`）を付ける。
-    fn list(&self, loc: &RemoteLoc, recursive: bool) -> Result<Vec<Entry>, ExportError> {
+    /// 親の直下（ゴミ箱の中を除く。ショートカットも 1 件として出る）。失敗は `drive_unavailable`（認可の失効は
+    /// `drive_auth_invalid`、ジョブ全体の期限は `timeout`）。名前では絞らない（全ページを取り、手元で名前を照合する）。
+    fn children(&self, parent: &str) -> Result<Vec<Entry>, ExportError> {
         self.remote
-            .list(loc, recursive, true, recursive)
+            .list_children(parent)
             .map_err(RemoteError::into_query_error)
     }
 
-    fn list_with_shortcuts(
-        &self,
-        loc: &RemoteLoc,
-        recursive: bool,
-    ) -> Result<Vec<Entry>, ExportError> {
-        self.remote
-            .list(loc, recursive, false, false)
-            .map_err(RemoteError::into_query_error)
+    /// 親の直下で、名前に完全に一致する項目（ショートカットを含む）。
+    fn named(&self, parent: &str, name: &str) -> Result<Vec<Entry>, ExportError> {
+        let mut v = self.children(parent)?;
+        v.retain(|e| e.name == name);
+        Ok(v)
     }
 
-    fn list_checked(&self, loc: &RemoteLoc, recursive: bool) -> Result<Listing, ExportError> {
-        let a = self.list(loc, recursive)?;
-        let b = self.list_with_shortcuts(loc, recursive)?;
-        let mut pool: Vec<&Entry> = a.iter().collect();
-        let mut has_shortcut = a.iter().any(Entry::is_shortcut);
-        for e in &b {
-            if e.is_shortcut() {
-                has_shortcut = true;
-                continue;
-            }
-            match pool
-                .iter()
-                .position(|x| x.path == e.path && x.id == e.id && x.is_dir == e.is_dir)
-            {
-                Some(pos) => {
-                    pool.remove(pos);
-                }
-                None => has_shortcut = true,
-            }
-        }
-        has_shortcut |= !pool.is_empty();
+    /// 再帰の一覧（`root` の下の全部）。
+    fn tree(&self, root: &str) -> Result<Listing, ExportError> {
+        let entries = self
+            .remote
+            .list_tree(root)
+            .map_err(RemoteError::into_query_error)?;
+        let has_shortcut = entries.iter().any(Entry::is_shortcut);
         Ok(Listing {
-            entries: a,
+            entries,
             has_shortcut,
         })
     }
 
-    /// 作業用のフォルダの直下の `incoming`・`replaced` の中。親（作業用のフォルダ）の一覧が成功したうえで、そのフォルダが
-    /// 無ければ空、ちょうど 1 つのフォルダならその中の一覧。それ以外（同名が複数・ファイル）は失敗。
+    /// 作業用のフォルダの直下の `incoming`・`replaced`（フォルダ）の ID。親（作業用のフォルダ）の一覧が成功したうえで、
+    /// そのフォルダが無ければ `None`、ちょうど 1 つのフォルダならその ID。それ以外（同名が複数・ファイル・ショートカット）は失敗。
     ///
-    /// どちらの一覧も、ショートカットを省かずに取る（同名のショートカットを「無い」と読んで、`mkdir`・`moveto` で同名の
-    /// フォルダを作らないため。ショートカットは名前が一致すれば「同名がある」として数える）。
-    fn work_children(&self, which: &str, loc: &RemoteLoc) -> Result<Vec<Entry>, ExportError> {
-        let work = self.list_with_shortcuts(&self.layout.work_loc, false)?;
-        let found: Vec<&Entry> = work.iter().filter(|e| e.name == which).collect();
+    /// ショートカットは省かずに数える（同名のショートカットを「無い」と読んで、同名のフォルダを作らないため）。
+    fn work_dir(&self, which: &str) -> Result<Option<Found>, ExportError> {
+        let found = self.named(&self.layout.work_id, which)?;
         match found.as_slice() {
-            [] => Ok(Vec::new()),
-            [e] if e.is_dir && !e.is_shortcut() => self.list_with_shortcuts(loc, false),
+            [] => Ok(None),
+            [e] if e.is_dir && !e.is_shortcut() => Ok(Some(Found { id: e.id.clone() })),
             _ => Err(unavailable("作業用のフォルダの構成が想定外です")),
         }
     }
 
+    /// `incoming`・`replaced` の中。無ければ空。
+    fn work_children(&self, which: &str) -> Result<Vec<Entry>, ExportError> {
+        match self.work_dir(which)? {
+            None => Ok(Vec::new()),
+            Some(dir) => self.children(&dir.id),
+        }
+    }
+
+    /// `incoming`・`replaced` を、無ければ作業用のフォルダの直下に作る（今の `mkdir` が親ごと作っていたのと同じ結果）。
+    fn ensure_work_dir(&self, which: &str) -> Result<String, ExportError> {
+        if let Some(dir) = self.work_dir(which)? {
+            return Ok(dir.id);
+        }
+        self.remote
+            .create_folder(&self.layout.work_id, which)
+            .map_err(RemoteError::into_op_error)
+    }
+
     fn incoming_entries(&self) -> Result<Vec<Entry>, ExportError> {
-        let mut v = self.work_children("incoming", &self.layout.incoming_root)?;
+        let mut v = self.work_children(INCOMING)?;
         v.retain(|e| e.name == self.layout.job.as_str());
         Ok(v)
     }
 
     fn replaced_entries(&self) -> Result<Vec<Entry>, ExportError> {
-        let mut v = self.work_children("replaced", &self.layout.replaced_root)?;
+        let mut v = self.work_children(REPLACED)?;
         v.retain(|e| e.name == self.layout.retired_name);
         Ok(v)
     }
 
+    /// `place` のフォルダの ID（親の一覧で名前を照合して、ちょうど 1 つのフォルダ。無い・複数・ショートカットは失敗）。
+    fn place_id(&self, place: Place) -> Result<String, ExportError> {
+        let entries = match place {
+            Place::Incoming => self.incoming_entries()?,
+            Place::Dest => self.named(&self.layout.prefix_id, self.layout.folder.as_str())?,
+            Place::Retired => self.replaced_entries()?,
+        };
+        match entries.as_slice() {
+            [e] if e.is_dir && !e.is_shortcut() => Ok(e.id.clone()),
+            _ => Err(unavailable("フォルダを確認できません")),
+        }
+    }
+
     // ---- 宛先の状態 ----
 
-    /// 接頭辞の直下で、フォルダ名に完全に一致する項目（ショートカットを含む）。
+    /// 宛先の親の直下で、フォルダ名に完全に一致する項目（ショートカットを含む）。
     pub fn dest_matches(&self) -> Result<Vec<Seen>, ExportError> {
-        let a = self.list(&self.layout.prefix_loc, false)?;
-        let b = self.list_with_shortcuts(&self.layout.prefix_loc, false)?;
-        Ok(classify(&a, &b, self.layout.folder.as_str()))
+        Ok(self
+            .named(&self.layout.prefix_id, self.layout.folder.as_str())?
+            .iter()
+            .map(Seen::of)
+            .collect())
     }
 
     /// 宛先の状態。2 つ以上・ファイル・ショートカットは `ambiguous_destination`、照会の失敗は `drive_unavailable`。
@@ -481,7 +455,7 @@ impl<'a> Drive<'a> {
     }
 
     /// 宛先の状態と、`exists` のときの `existing_files`・管理しているフォルダか（`want_managed` のとき）。
-    /// 呼ぶ `rclone` のコマンドは `lsjson` と `cat` だけ（`dry_run` もこれを使う）。
+    /// 呼ぶ Drive の操作は一覧と読み出しだけ（`dry_run` もこれを使う）。
     pub fn inspect(
         &self,
         published: &PublishedStore,
@@ -494,7 +468,7 @@ impl<'a> Drive<'a> {
                 managed: None,
             });
         };
-        let listing = self.list_checked(&self.layout.dest_loc, true)?;
+        let listing = self.tree(&id)?;
         let existing_files = listing.entries.iter().filter(|e| !e.is_dir).count() as u64;
         let managed = if want_managed {
             Some(self.check_managed(&id, &listing, published)?)
@@ -516,6 +490,33 @@ impl<'a> Drive<'a> {
             && text("folder") == Some(self.layout.folder.as_str())
     }
 
+    /// 直下の `manifest.json`: 一覧から、ちょうど 1 つのファイルで 4MB 以下のとき、その ID と大きさ。
+    fn top_manifest(listing: &Listing) -> Option<(String, u64)> {
+        let top: Vec<&Entry> = listing
+            .entries
+            .iter()
+            .filter(|e| e.path == MANIFEST_NAME)
+            .collect();
+        match top.as_slice() {
+            [m] if !m.is_dir
+                && !m.is_shortcut()
+                && (0..=MANIFEST_MAX_BYTES as i64).contains(&m.size) =>
+            {
+                Some((m.id.clone(), m.size as u64))
+            }
+            _ => None,
+        }
+    }
+
+    /// manifest を読む。`Ok(None)` は、読めたが一覧の大きさと違う（上限を超えた場合を含む。読んだものを信用しない）。
+    fn read_manifest(&self, id: &str, size: u64) -> Result<Option<Vec<u8>>, ExportError> {
+        match self.remote.read(id, MANIFEST_MAX_BYTES) {
+            Ok(bytes) if bytes.len() as u64 == size => Ok(Some(bytes)),
+            Ok(_) | Err(RemoteError::TooLarge) => Ok(None),
+            Err(e) => Err(e.into_query_error()),
+        }
+    }
+
     /// 管理しているフォルダの見分け方（design.md 4.2）。
     fn check_managed(
         &self,
@@ -533,29 +534,14 @@ impl<'a> Drive<'a> {
             _ => return Ok(Managed::NotManaged),
         };
         // 2. 直下の manifest.json: 一覧から、ちょうど 1 つのファイルで 4MB 以下
-        let top: Vec<&Entry> = listing
-            .entries
-            .iter()
-            .filter(|e| e.path == MANIFEST_NAME)
-            .collect();
-        let size = match top.as_slice() {
-            [m] if !m.is_dir
-                && !m.is_shortcut()
-                && (0..=MANIFEST_MAX_BYTES as i64).contains(&m.size) =>
-            {
-                m.size as u64
-            }
-            _ => return Ok(Managed::NotManaged),
+        let Some((manifest_id, size)) = Self::top_manifest(listing) else {
+            return Ok(Managed::NotManaged);
         };
-        // 3. 読んで、generator・destination・folder を見る（上限を掛けて読む。`cat` の失敗は drive_unavailable）
-        let bytes = self
-            .remote
-            .read(&self.layout.manifest_loc, MANIFEST_MAX_BYTES)
-            .map_err(RemoteError::into_query_error)?;
-        // 一覧の大きさと違えば、読んだものを信用しない
-        if bytes.len() as u64 != size {
+        // 3. 読んで、generator・destination・folder を見る（上限を掛けて読む。読み出しの失敗は drive_unavailable）。
+        //    一覧の大きさと違えば、読んだものを信用しない
+        let Some(bytes) = self.read_manifest(&manifest_id, size)? else {
             return Ok(Managed::Modified);
-        }
+        };
         let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
             return Ok(Managed::NotManaged);
         };
@@ -590,12 +576,31 @@ impl<'a> Drive<'a> {
         .sorted())
     }
 
+    /// 宛先の親フォルダと作業用のフォルダが、フォルダで（ショートカットでなく）、ゴミ箱の中でないことを `get` で確かめる
+    /// （ジョブの始め。起動後に誰かが動かした場合に備える）。失敗は `drive_unavailable`。
+    pub fn check_roots(&self) -> Result<(), ExportError> {
+        for id in [&self.layout.prefix_id, &self.layout.work_id] {
+            let meta = self
+                .remote
+                .get(id)
+                .map_err(RemoteError::into_query_error)?;
+            if !meta.entry.is_dir || meta.entry.is_shortcut() || meta.trashed {
+                return Err(unavailable(
+                    "宛先の親フォルダか作業用のフォルダが、フォルダでないか、ゴミ箱の中にあります",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     // ---- 公開の操作 ----
 
-    /// `incoming/<job_id>` を作る。
+    /// `incoming/<job_id>` を作る（`incoming/` が無ければ、それも作業用のフォルダの直下に作る）。
     pub fn mkdir_incoming(&self) -> Result<(), ExportError> {
+        let root = self.ensure_work_dir(INCOMING)?;
         self.remote
-            .create_folder(&self.layout.incoming_loc)
+            .create_folder(&root, self.layout.job.as_str())
+            .map(|_| ())
             .map_err(RemoteError::into_op_error)
     }
 
@@ -607,29 +612,100 @@ impl<'a> Drive<'a> {
         }
     }
 
-    /// 写真を送り、最後に manifest を送る。
-    pub fn upload(&self, workspace: &Path) -> Result<(), ExportError> {
-        self.remote
-            .upload(workspace, &self.layout.incoming_loc, CopyScope::PhotosOnly)
-            .map_err(RemoteError::into_op_error)?;
-        self.remote
-            .upload(
-                workspace,
-                &self.layout.incoming_loc,
-                CopyScope::ManifestOnly,
-            )
-            .map_err(RemoteError::into_op_error)
+    /// 写真を並列（[`UPLOAD_PARALLEL`]）で送り、**全部が成功してから最後に** manifest を送る。`files` は一式（相対パス・大きさ・MD5。
+    /// `manifest.json` を含む）、`workspace` は作業領域（絶対パス）。サブフォルダ（日付のフォルダ）は先に作り、葉の名前で送る。
+    ///
+    /// 1 つでも失敗したら、残りは始めずに、走っているものを待ってから失敗を返す。**全スレッドを join してから戻る**（キャンセル
+    /// されたときも同じ。呼び出し側はそのあとで実行枠を手放す）。キャンセルの印が立っていれば、ほかの失敗より
+    /// [`RemoteError::Cancelled`] を優先して返す（結果不明として復旧の表へ渡す）。期限は、写真の送信全体で 1 つ
+    /// （[`Remote::upload_deadline`]）。
+    pub fn upload(&self, workspace: &Path, files: &[PublishFile]) -> Result<(), ExportError> {
+        let root = self.incoming_id()?;
+        let (photos, manifest): (Vec<&PublishFile>, Vec<&PublishFile>) =
+            files.iter().partition(|f| f.path != MANIFEST_NAME);
+        let [manifest] = manifest.as_slice() else {
+            return Err(ExportError::new(
+                ErrorCode::Internal,
+                "送る一式に manifest.json がちょうど 1 つではありません",
+            ));
+        };
+        // サブフォルダ（浅い順）。同じフォルダを 2 度は作らない
+        let mut dirs: BTreeMap<String, String> = BTreeMap::new();
+        dirs.insert(String::new(), root);
+        for f in &photos {
+            let mut prefix = String::new();
+            let parts: Vec<&str> = f.path.split('/').collect();
+            for part in &parts[..parts.len() - 1] {
+                let parent = dirs[&prefix].clone();
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                if !dirs.contains_key(&prefix) {
+                    let id = self
+                        .remote
+                        .create_folder(&parent, part)
+                        .map_err(RemoteError::into_op_error)?;
+                    dirs.insert(prefix.clone(), id);
+                }
+            }
+        }
+        let deadline = self.remote.upload_deadline();
+        let send = |f: &PublishFile| -> Result<(), RemoteError> {
+            let (dir, name) = f.path.rsplit_once('/').unwrap_or(("", f.path.as_str()));
+            let parent = &dirs[dir];
+            self.remote
+                .upload(
+                    parent,
+                    name,
+                    &workspace.join(&f.path),
+                    &f.md5,
+                    f.size,
+                    deadline,
+                )
+                .map(|_| ())
+        };
+        // 写真（並列）
+        let next = AtomicUsize::new(0);
+        let failed = AtomicBool::new(false);
+        let first: Mutex<Option<RemoteError>> = Mutex::new(None);
+        std::thread::scope(|scope| {
+            for _ in 0..UPLOAD_PARALLEL.min(photos.len()) {
+                scope.spawn(|| {
+                    while !failed.load(Ordering::SeqCst) && !self.remote.is_cancelled() {
+                        let i = next.fetch_add(1, Ordering::SeqCst);
+                        let Some(f) = photos.get(i) else { break };
+                        if let Err(e) = send(f) {
+                            failed.store(true, Ordering::SeqCst);
+                            let mut slot = first.lock().unwrap_or_else(|p| p.into_inner());
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        // 全スレッドが終わった（scope が join 済み）
+        if self.remote.is_cancelled() {
+            return Err(RemoteError::Cancelled.into_op_error());
+        }
+        if let Some(e) = first.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return Err(e.into_op_error());
+        }
+        // 最後に manifest
+        send(manifest).map_err(RemoteError::into_op_error)
     }
 
-    /// `incoming/<job_id>` の中身が、期待した一式と完全に一致するか（`lsjson -R`）。
+    /// `incoming/<job_id>` の中身が、期待した一式と完全に一致するか。
     pub fn incoming_matches(&self, expected: &Expected) -> Result<bool, ExportError> {
-        let listing = self.list_checked(&self.layout.incoming_loc, true)?;
+        let listing = self.tree(&self.place_id(Place::Incoming)?)?;
         Ok(!listing.has_shortcut && expected.matches(&listing.entries))
     }
 
     /// 宛先の中身が、期待した一式と完全に一致するか。
     pub fn dest_matches_expected(&self, expected: &Expected) -> Result<bool, ExportError> {
-        let listing = self.list_checked(&self.layout.dest_loc, true)?;
+        let listing = self.tree(&self.place_id(Place::Dest)?)?;
         Ok(!listing.has_shortcut && expected.matches(&listing.entries))
     }
 
@@ -641,45 +717,13 @@ impl<'a> Drive<'a> {
         place: Place,
         md5: Option<&[RecordedFile]>,
     ) -> Result<bool, ExportError> {
-        let (dir, manifest) = match place {
-            Place::Incoming => (
-                &self.layout.incoming_loc,
-                self.layout.incoming_loc.child(MANIFEST_NAME),
-            ),
-            Place::Dest => (
-                &self.layout.dest_loc,
-                Some(self.layout.manifest_loc.clone()),
-            ),
-            Place::Retired => (
-                &self.layout.retired_loc,
-                self.layout.retired_loc.child(MANIFEST_NAME),
-            ),
-        };
-        let Some(manifest_loc) = manifest else {
+        let listing = self.tree(&self.place_id(place)?)?;
+        let Some((manifest_id, size)) = Self::top_manifest(&listing) else {
             return Ok(false);
         };
-        let listing = self.list_checked(dir, true)?;
-        let top: Vec<&Entry> = listing
-            .entries
-            .iter()
-            .filter(|e| e.path == MANIFEST_NAME)
-            .collect();
-        let size = match top.as_slice() {
-            [m] if !m.is_dir
-                && !m.is_shortcut()
-                && (0..=MANIFEST_MAX_BYTES as i64).contains(&m.size) =>
-            {
-                m.size as u64
-            }
-            _ => return Ok(false),
-        };
-        let bytes = self
-            .remote
-            .read(&manifest_loc, MANIFEST_MAX_BYTES)
-            .map_err(RemoteError::into_query_error)?;
-        if bytes.len() as u64 != size {
+        let Some(bytes) = self.read_manifest(&manifest_id, size)? else {
             return Ok(false);
-        }
+        };
         let Some(manifest) = serde_json::from_slice::<Value>(&bytes).ok() else {
             return Ok(false);
         };
@@ -699,9 +743,9 @@ impl<'a> Drive<'a> {
         Ok(!listing.has_shortcut && expected.matches(&listing.entries))
     }
 
-    /// `incoming/<job_id>` をゴミ箱へ移す（`--drive-use-trash=true`）。先に一覧で、見えた項目が**記録した ID** のフォルダ
-    /// ちょうど 1 つであることを確かめる（違えば何も消さずに [`Removed::Mismatch`]。無ければ [`Removed::Nothing`]）。
-    /// ID は必ず渡す（名前だけでは消せない。ID を記録できていなければ、呼び出し側は消さずに残りものとして知らせる）。
+    /// `incoming/<job_id>` をゴミ箱へ移す。先に一覧で、見えた項目が**記録した ID** のフォルダちょうど 1 つであることを確かめる
+    /// （違えば何も消さずに [`Removed::Mismatch`]。無ければ [`Removed::Nothing`]）。ID は必ず渡す（名前だけでは消せない。ID を
+    /// 記録できていなければ、呼び出し側は消さずに残りものとして知らせる）。移すのは、照合した ID。
     pub fn remove_incoming(&self, expect_id: &str) -> Result<Removed, ExportError> {
         let entries = self.incoming_entries()?;
         let seen: Vec<Seen> = entries.iter().map(Seen::of).collect();
@@ -709,7 +753,7 @@ impl<'a> Drive<'a> {
             [] => Ok(Removed::Nothing),
             [s] if s.kind == Kind::Dir && s.id == expect_id => {
                 self.remote
-                    .trash(&self.layout.incoming_loc)
+                    .trash(&s.id)
                     .map_err(RemoteError::into_op_error)?;
                 Ok(Removed::Done)
             }
@@ -717,22 +761,38 @@ impl<'a> Drive<'a> {
         }
     }
 
-    /// 旧フォルダを `replaced/<種類>-<フォルダ名>-<job_id>` へ移す（パスでの移動。移したあとの照合は呼び出し側）。
+    /// 旧フォルダ（宛先のフォルダ）を `replaced/<種類>-<フォルダ名>-<job_id>` へ移す（ID で移す。`replaced/` が無ければ作る。
+    /// 移したあとの照合は呼び出し側）。
     pub fn retire_old(&self) -> Result<(), ExportError> {
+        let Target::Exists { id } = self.target()? else {
+            return Err(unavailable("宛先のフォルダを確認できません"));
+        };
+        let replaced = self.ensure_work_dir(REPLACED)?;
         self.remote
-            .move_to(&self.layout.dest_loc, &self.layout.retired_loc)
+            .move_to(
+                &id,
+                &self.layout.prefix_id,
+                &replaced,
+                &self.layout.retired_name,
+            )
             .map_err(RemoteError::into_op_error)
     }
 
-    /// `incoming/<job_id>` を宛先へ移す（パスでの移動。移したあとの照合は呼び出し側）。
-    ///
-    /// rclone の `moveto` は、宛先にフォルダができていると Drive の中でのフォルダの移動をやめて、ファイル単位の移動に切り替わる
-    /// （上流の `MoveDir` が `ErrorDirExists` を受けた場合の fallback）。止める手段は無いので、残る条件は「直前に宛先が無いと
-    /// 確かめてから移すまでの数秒に、オーナーが同じ名前のフォルダを作る」競合だけ。起きると、宛先のフォルダに写真が足され
-    /// （消しはしない）、宛先の ID が `incoming` の ID と違うので、移したあとの照合で見つけて `blocked` にする。
+    /// `incoming/<job_id>` を宛先へ移す（ID で移す。親を宛先の親へ、名前をフォルダ名にして、1 回の更新で変える。移したあとの照合は
+    /// 呼び出し側）。移す直前に宛先に同名が無いことを確かめるのは、呼び出し側（[`crate::publish`]）。API の移動はフォルダの
+    /// 移動のまま（rclone のように、同名のフォルダがあるとファイル単位の移動に化けることはない）。
     pub fn publish_move(&self) -> Result<(), ExportError> {
+        let id = self.incoming_id()?;
+        let Some(root) = self.work_dir(INCOMING)? else {
+            return Err(unavailable("incoming のフォルダを確認できません"));
+        };
         self.remote
-            .move_to(&self.layout.incoming_loc, &self.layout.dest_loc)
+            .move_to(
+                &id,
+                &root.id,
+                &self.layout.prefix_id,
+                self.layout.folder.as_str(),
+            )
             .map_err(RemoteError::into_op_error)
     }
 
@@ -749,15 +809,14 @@ impl<'a> Drive<'a> {
     /// 退避した旧フォルダをゴミ箱へ移す。**移す前に**次をすべて確かめる（どれかが合わなければ、何も消さずに返す）。
     ///
     /// 1. `replaced/` の項目が、記録した旧フォルダの ID のフォルダ 1 つだけ。
-    /// 2. そのフォルダの中身（`lsjson -R --hash` の相対パス・サイズ・MD5）が、中の旧 manifest の一式と完全に一致し、
-    ///    MD5 が**公開の記録の MD5**（旧フォルダを公開したときに記録したもの。新しい行を書いたあとの復旧では、新しい行の
-    ///    `previous`）と一致する（停止している間に足されたファイルや、同じ名前・同じ大きさのまま書き換えられた
-    ///    ファイルごとゴミ箱へ移さない。旧 manifest は `cat` で読み直す）。公開の記録に旧フォルダの行と MD5 が無いとき
-    ///    （行の ID が旧 ID と違う・MD5 が無い）は、確かめられないので移さない（[`Removed::ContentMismatch`]）。
+    /// 2. そのフォルダの中身（一覧の相対パス・サイズ・MD5）が、中の旧 manifest の一式と完全に一致し、MD5 が**公開の記録の MD5**
+    ///    （旧フォルダを公開したときに記録したもの。新しい行を書いたあとの復旧では、新しい行の `previous`）と一致する
+    ///    （停止している間に足されたファイルや、同じ名前・同じ大きさのまま書き換えられたファイルごとゴミ箱へ移さない。旧 manifest は
+    ///    読み直す）。公開の記録に旧フォルダの行と MD5 が無いとき（行の ID が旧 ID と違う・MD5 が無い）は、確かめられないので
+    ///    移さない（[`Removed::ContentMismatch`]）。
     /// 3. 2 の間に差し替わっていないことを、1 をもう一度確かめて見る。
     ///
-    /// `purge` はパスで指す（ID を固定した `purge` は rclone ではできない。モジュールの説明）。指す名前は、`job_id`（乱数）を
-    /// 含む、作業用のフォルダの中の名前だけ。
+    /// 移すのは、照合した **ID**（`old_id`）。
     pub fn trash_replaced(
         &self,
         old_id: &str,
@@ -784,12 +843,12 @@ impl<'a> Drive<'a> {
             return Ok(Removed::Mismatch(again));
         }
         self.remote
-            .trash(&self.layout.retired_loc)
+            .trash(old_id)
             .map_err(RemoteError::into_op_error)?;
         Ok(Removed::Done)
     }
 
-    // ---- 移動のあとの照合（終了コードを信じず、一覧で確かめる） ----
+    // ---- 移動のあとの照合（応答を信じず、一覧で確かめる） ----
 
     /// 退避のあと: 宛先が無く、`replaced/<…>` が記録した旧フォルダの ID のフォルダ 1 つだけ。
     pub fn check_retired(&self, old_id: &str) -> Result<Check, ExportError> {
@@ -826,7 +885,8 @@ impl<'a> Drive<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::{DIRECTORY_MIME, SHORTCUT_MIME};
+    use crate::drive::api::FOLDER_MIME;
+    use crate::remote::SHORTCUT_MIME;
 
     /// 試験用の MD5（パスから決まる架空の値。同じパスなら同じ）。
     fn fake_md5(path: &str) -> String {
@@ -850,7 +910,7 @@ mod tests {
             path: path.into(),
             name: path.rsplit('/').next().unwrap().into(),
             size: -1,
-            mime: DIRECTORY_MIME.into(),
+            mime: FOLDER_MIME.into(),
             is_dir: true,
             id: format!("d{}", path.replace('/', "_")),
             shortcut_id: None,
@@ -1007,51 +1067,6 @@ mod tests {
     }
 
     #[test]
-    fn a_composite_id_marks_a_resolved_shortcut_even_when_the_mime_type_looks_ordinary() {
-        let name = "2030-03-10";
-        let real = entry(name, "idR", true, "");
-        // 解決されたフォルダのショートカット: MIME タイプはフォルダのまま、ID は複合 ID（前半がリンク先）
-        let resolved = Entry {
-            shortcut_id: Some("idS".into()),
-            ..entry(name, "idT", true, "")
-        };
-        assert!(resolved.is_shortcut());
-        let got = classify(
-            std::slice::from_ref(&real),
-            &[real.clone(), resolved.clone()],
-            name,
-        );
-        assert_eq!(got.len(), 2);
-        assert!(got.iter().any(|s| s.kind == Kind::Dir && s.id == "idR"));
-        assert!(
-            got.iter()
-                .any(|s| s.kind == Kind::Shortcut && s.id == "idS"),
-            "ショートカット自身の ID（recover の表示で見つけられるほう）"
-        );
-        // 解決されたショートカットだけがある（本物のフォルダは無い）→ ショートカット 1 つ（フォルダとしては数えない）
-        let got = classify(&[], std::slice::from_ref(&resolved), name);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].kind, Kind::Shortcut);
-        // 一式の照合では、1 つでもあれば一致しない
-        let e = Expected::from_publish_files(&[pf("a.jpg", 5), pf("manifest.json", 9)]);
-        let mut set = vec![file("a.jpg", 5), file("manifest.json", 9)];
-        assert!(e.matches(&set));
-        set.push(Entry {
-            shortcut_id: Some("idS".into()),
-            ..file("pic.jpg", 5)
-        });
-        assert!(!e.matches(&set));
-        // リンク切れ
-        let dangling = Entry {
-            mime: crate::remote::SHORTCUT_DANGLING_MIME.into(),
-            ..file("gone", 0)
-        };
-        let mut set = vec![file("a.jpg", 5), file("manifest.json", 9)];
-        set.push(dangling);
-        assert!(!e.matches(&set));
-    }
-
-    #[test]
     fn duplicates_are_not_collapsed() {
         // 同じ名前・同じサイズのファイルが 2 つある（Drive は許す）。期待は 1 つだけなので一致しない
         let e = Expected::from_publish_files(&[pf("a.jpg", 5), pf("manifest.json", 9)]);
@@ -1108,75 +1123,5 @@ mod tests {
         ] {
             assert!(Expected::from_manifest(&bad, 1).is_none(), "{bad}");
         }
-    }
-
-    fn entry(name: &str, id: &str, is_dir: bool, mime: &str) -> Entry {
-        Entry {
-            path: name.into(),
-            name: name.into(),
-            size: if is_dir { -1 } else { 1 },
-            mime: if is_dir {
-                DIRECTORY_MIME.into()
-            } else {
-                mime.into()
-            },
-            is_dir,
-            id: id.into(),
-            shortcut_id: None,
-            md5: None,
-        }
-    }
-
-    #[test]
-    fn classify_finds_shortcuts_in_either_listing_mode() {
-        let name = "2030-03-10";
-        let real = entry(name, "idR", true, "");
-        // 無し
-        assert!(classify(&[], &[], name).is_empty());
-        assert!(
-            classify(
-                &[entry("other", "i", true, "")],
-                &[entry("other", "i", true, "")],
-                name
-            )
-            .is_empty()
-        );
-        // 本物 1 つ
-        assert_eq!(
-            classify(
-                std::slice::from_ref(&real),
-                std::slice::from_ref(&real),
-                name
-            ),
-            vec![Seen::dir("idR")]
-        );
-        // ショートカットが MIME タイプで見える（b にだけ）
-        let sc = entry(name, "idS", false, SHORTCUT_MIME);
-        let got = classify(&[], std::slice::from_ref(&sc), name);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].kind, Kind::Shortcut);
-        // ショートカットが指す先として見える（b にだけ、フォルダとして）
-        let resolved = entry(name, "idT", true, "");
-        let got = classify(std::slice::from_ref(&real), &[real.clone(), resolved], name);
-        assert_eq!(got.len(), 2);
-        assert!(
-            got.iter()
-                .any(|s| s.kind == Kind::Shortcut && s.id == "idT")
-        );
-        assert!(got.iter().any(|s| s.kind == Kind::Dir && s.id == "idR"));
-        // 本物と同じ ID を指すショートカット（解決されて同じに見える）も、数が増えるので 2 つになる
-        let twin = real.clone();
-        let got = classify(std::slice::from_ref(&real), &[real.clone(), twin], name);
-        assert_eq!(got.len(), 2);
-        assert_eq!(got.iter().filter(|s| s.kind == Kind::Shortcut).count(), 1);
-        // 名前が同じファイル
-        let f = entry(name, "idF", false, "image/jpeg");
-        assert_eq!(
-            classify(std::slice::from_ref(&f), std::slice::from_ref(&f), name),
-            vec![Seen {
-                id: "idF".into(),
-                kind: Kind::File
-            }]
-        );
     }
 }

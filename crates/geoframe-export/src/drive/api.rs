@@ -68,9 +68,11 @@ const MAX_NAME_BYTES: usize = 255;
 /// resumable のセッションを始め直す回数の上限。
 const MAX_SESSION_RESTARTS: u32 = 3;
 /// JSON の要求 1 回の上限。
-const JSON_REQUEST_CAP: Duration = Duration::from_secs(60);
-/// チャンク 1 回の要求の上限。
-const CHUNK_REQUEST_CAP: Duration = Duration::from_secs(10 * 60);
+pub const JSON_REQUEST_CAP: Duration = Duration::from_secs(60);
+/// チャンク・multipart 1 回の要求の上限。キャンセル（SIGTERM）は要求の最中には効かず、最長でこの時間まで待つ。unit の
+/// `TimeoutStopSec=180s` の中に、飛んでいる要求の終わりと全スレッドの join が収まるように、**100 秒**にしてある
+/// （8MiB のチャンクを 0.7Mbps でも送れる長さ。トークンの取得〔JSON の上限 60 秒〕と合わせても 180 秒を超えない）。
+pub const CHUNK_REQUEST_CAP: Duration = Duration::from_secs(100);
 const FILE_FIELDS: &str = "id,name,mimeType,size,md5Checksum,trashed,parents";
 const LIST_FIELDS: &str = "nextPageToken,files(id,name,mimeType,size,md5Checksum)";
 
@@ -170,6 +172,16 @@ impl DriveApi {
 
     pub fn is_cancelled(&self) -> bool {
         self.cancel.is_cancelled()
+    }
+
+    /// 写真の送信全体の期限（`--drive-upload-timeout`）。
+    pub fn upload_timeout(&self) -> Duration {
+        self.upload_timeout
+    }
+
+    /// 照会・書き込みの期限（`--drive-timeout`）。
+    pub fn query_timeout(&self) -> Duration {
+        self.query_timeout
     }
 
     /// 今から数えた締め切り（`limit` の期限とジョブ全体の期限の早いほう）。

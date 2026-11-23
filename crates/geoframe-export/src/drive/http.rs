@@ -395,7 +395,8 @@ impl From<ApiError> for RemoteError {
             ApiError::JobDeadline => Self::JobDeadline,
             ApiError::AuthInvalid => Self::AuthInvalid,
             ApiError::NotFound => Self::NotFound,
-            ApiError::BadResponse | ApiError::TooLarge | ApiError::TooManyPages => Self::BadOutput,
+            ApiError::TooLarge => Self::TooLarge,
+            ApiError::BadResponse | ApiError::TooManyPages => Self::BadOutput,
             ApiError::Rejected(_) | ApiError::Io(_) | ApiError::Credentials(_) => Self::Spawn,
             ApiError::Status(_) | ApiError::RateLimited | ApiError::Net(_) | ApiError::Mismatch => {
                 Self::Failed

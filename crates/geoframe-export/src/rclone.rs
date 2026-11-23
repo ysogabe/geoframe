@@ -45,7 +45,6 @@ use crate::remote::{
     CopyScope, DIRECTORY_MIME, DRY_RUN_TIMEOUT, Entry, RemoteError, RemoteLoc, is_valid_drive_id,
     normalize_md5, rel_path_ok,
 };
-use crate::settings::Settings;
 
 /// 子プロセスの `PATH`（固定。rclone は他のコマンドを呼ばない）。
 pub const PATH_VALUE: &str = "/usr/local/bin:/usr/bin:/bin";
@@ -269,6 +268,17 @@ pub fn is_forbidden_flag(arg: &str) -> bool {
         && arg[1..].bytes().all(|b| b == b'v')
 }
 
+/// rclone の呼び出しに要る設定（実行ファイル・設定ファイル・状態ディレクトリ・2 つの期限）。バイナリの設定（[`crate::settings::Settings`]）
+/// からは切り離してある（バイナリは rclone を呼ばない。このモジュールは 3 段目で消す）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RcloneSettings {
+    pub program: PathBuf,
+    pub config: PathBuf,
+    pub state_dir: PathBuf,
+    pub copy_timeout: Duration,
+    pub timeout: Duration,
+}
+
 /// rclone の呼び出し口。`Clone` できる（期限だけを替えた複製を作れる）。
 #[derive(Debug, Clone)]
 pub struct Rclone {
@@ -283,23 +293,23 @@ pub struct Rclone {
 }
 
 impl Rclone {
-    /// 設定（`--rclone`・`--rclone-config`・`--state-dir`・2 つの期限）から作る。
-    pub fn new(settings: &Settings) -> Self {
+    /// 設定（実行ファイル・設定ファイル・状態ディレクトリ・2 つの期限）から作る。
+    pub fn new(settings: &RcloneSettings) -> Self {
         let base = settings.state_dir.join("rclone");
         Self {
-            program: settings.rclone.clone(),
-            config: settings.rclone_config.clone(),
+            program: settings.program.clone(),
+            config: settings.config.clone(),
             home: base.join("home"),
             cache: base.join("cache"),
-            copy_timeout: settings.rclone_copy_timeout,
-            timeout: settings.rclone_timeout,
+            copy_timeout: settings.copy_timeout,
+            timeout: settings.timeout,
             deadline: None,
             cancel: Cancel::new(),
         }
     }
 
     /// `dry_run` 用: 照会の期限を 30 秒にする（design.md 6.1）。`copy` は使わない。
-    pub fn for_dry_run(settings: &Settings) -> Self {
+    pub fn for_dry_run(settings: &RcloneSettings) -> Self {
         let mut r = Self::new(settings);
         r.timeout = r.timeout.min(DRY_RUN_TIMEOUT);
         r.copy_timeout = r.timeout;
@@ -843,14 +853,14 @@ mod tests {
     use crate::settings::RemotePath;
     use serde_json::json;
 
-    fn settings() -> Settings {
-        Settings::from_raw(&crate::settings::RawSettings {
-            rclone: Some("/x/rclone".into()),
-            rclone_config: Some("/x/state/rclone/rclone.conf".into()),
-            state_dir: Some("/x/state".into()),
-            ..Default::default()
-        })
-        .unwrap()
+    fn settings() -> RcloneSettings {
+        RcloneSettings {
+            program: "/x/rclone".into(),
+            config: "/x/state/rclone/rclone.conf".into(),
+            state_dir: "/x/state".into(),
+            copy_timeout: Duration::from_secs(45 * 60),
+            timeout: Duration::from_secs(5 * 60),
+        }
     }
 
     fn strs(a: &[OsString]) -> Vec<&str> {

@@ -160,6 +160,12 @@ pub fn check_rclone_config(path: &Path, remote: &str) -> Result<(), ConfigError>
 /// 順序: 親ディレクトリ → ファイルの持ち主・権限（開いたハンドルで見る。確かめた後に差し替えられない）→ 中身。
 /// 親やファイルが安全でなければ、中身は読まない。
 pub fn check_rclone_config_for_uid(path: &Path, remote: &str, uid: u32) -> Result<(), ConfigError> {
+    let text = read_config_text(path, uid, false)?;
+    check_section(&text, remote)
+}
+
+/// 設定ファイルを安全に開いて、中身の文字列を返す。`any_owner` が真なら、持ち主は問わない（権限は問う）。
+fn read_config_text(path: &Path, uid: u32, any_owner: bool) -> Result<String, ConfigError> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -184,7 +190,7 @@ pub fn check_rclone_config_for_uid(path: &Path, remote: &str, uid: u32) -> Resul
     if !dir_meta.is_dir() {
         return Err(ConfigError::WrongKind(Target::Directory));
     }
-    check_owner_and_mode(Target::Directory, dir_meta.uid(), dir_meta.mode(), uid)?;
+    check_owner_and_mode(Target::Directory, dir_meta.uid(), dir_meta.mode(), uid, any_owner)?;
 
     // 同じハンドルの下から開く（パスを引き直さない）。シンボリックリンクはたどらない。FIFO などで待たないよう O_NONBLOCK で
     // 開き、通常のファイルだと確かめてから読む（通常のファイルの読み取りに O_NONBLOCK は影響しない）
@@ -195,12 +201,78 @@ pub fn check_rclone_config_for_uid(path: &Path, remote: &str, uid: u32) -> Resul
     if !meta.is_file() {
         return Err(ConfigError::WrongKind(Target::File));
     }
-    check_owner_and_mode(Target::File, meta.uid(), meta.mode(), uid)?;
+    check_owner_and_mode(Target::File, meta.uid(), meta.mode(), uid, any_owner)?;
     if meta.len() > CONFIG_MAX_BYTES {
         return Err(ConfigError::TooLarge);
     }
-    let text = read_limited(&mut file)?;
-    check_section(&text, remote)
+    read_limited(&mut file)
+}
+
+/// 取り込み（[`read_credentials`]）が取り出す 3 つの値。`Debug` は値を伏せる。
+pub struct ImportedCredentials {
+    pub client_id: String,
+    pub client_secret: String,
+    pub refresh_token: String,
+}
+
+impl std::fmt::Debug for ImportedCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ImportedCredentials { .. }")
+    }
+}
+
+/// rclone の設定ファイルの `[remote]` から、`client_id`・`client_secret`・`token` の `refresh_token` を取り出す
+/// （`import-credentials`。docs/note-photo-export/drive-api.md 2 章）。形の検査は起動時の検査と同じ（[`check_section`]）。
+///
+/// 持ち主: 設定ファイルはサービスのユーザーの持ち物で、取り込みは root が sudo で 1 回だけ動かす（持ち主が実行ユーザーと違う）。
+/// そこで **実行ユーザーが root のときは、持ち主を問わない**（権限は 0600／0700 相当を問う）。root でなければ、持ち主は実行ユーザー。
+/// 値は、エラーにも表示にも残さない。
+pub fn read_credentials(path: &Path, remote: &str) -> Result<ImportedCredentials, ConfigError> {
+    read_credentials_for_uid(path, remote, effective_uid())
+}
+
+/// [`read_credentials`] の、実行ユーザーを `uid` にする形（試験用）。
+pub fn read_credentials_for_uid(
+    path: &Path,
+    remote: &str,
+    uid: u32,
+) -> Result<ImportedCredentials, ConfigError> {
+    let text = read_config_text(path, uid, uid == 0)?;
+    check_section(&text, remote)?;
+    // 形は検査済み（セクションは 1 つで、キーは重複せず、`key = value`）。値を拾う
+    let mut in_section = false;
+    let (mut id, mut secret, mut token) = (None, None, None);
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(inner) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            in_section = inner.trim() == remote;
+            continue;
+        }
+        if !in_section || line.is_empty() || line.starts_with(['#', ';']) {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().to_owned();
+        match key.trim() {
+            "client_id" => id = Some(value),
+            "client_secret" => secret = Some(value),
+            "token" => token = Some(value),
+            _ => {}
+        }
+    }
+    let token = token.ok_or(ConfigError::MissingKey("token"))?;
+    let refresh_token = serde_json::from_str::<serde_json::Value>(&token)
+        .ok()
+        .and_then(|v| v.get("refresh_token")?.as_str().map(str::to_owned))
+        .filter(|t| !t.is_empty())
+        .ok_or(ConfigError::EmptyValue("refresh_token"))?;
+    Ok(ImportedCredentials {
+        client_id: id.ok_or(ConfigError::MissingKey("client_id"))?,
+        client_secret: secret.ok_or(ConfigError::MissingKey("client_secret"))?,
+        refresh_token,
+    })
 }
 
 /// `dir` の下の `name`（1 つの名前）を、シンボリックリンクをたどらず、待たずに開く。
@@ -231,8 +303,9 @@ fn check_owner_and_mode(
     owner: u32,
     mode: u32,
     uid: u32,
+    any_owner: bool,
 ) -> Result<(), ConfigError> {
-    if owner != uid {
+    if owner != uid && !any_owner {
         return Err(ConfigError::WrongOwner(target));
     }
     if mode & 0o077 != 0 {
@@ -556,21 +629,21 @@ mod tests {
     #[test]
     fn owner_and_mode_are_checked_for_both_targets() {
         for target in [Target::File, Target::Directory] {
-            assert_eq!(check_owner_and_mode(target, 1000, 0o600, 1000), Ok(()));
+            assert_eq!(check_owner_and_mode(target, 1000, 0o600, 1000, false), Ok(()));
             assert_eq!(
-                check_owner_and_mode(target, 1001, 0o600, 1000),
+                check_owner_and_mode(target, 1001, 0o600, 1000, false),
                 Err(ConfigError::WrongOwner(target))
             );
             for mode in [0o640, 0o604, 0o660, 0o666, 0o701, 0o710] {
                 assert_eq!(
-                    check_owner_and_mode(target, 1000, mode, 1000),
+                    check_owner_and_mode(target, 1000, mode, 1000, false),
                     Err(ConfigError::TooPermissive(target)),
                     "{mode:o}"
                 );
             }
             // 持ち主が違うときは、権限より先に持ち主を断る
             assert_eq!(
-                check_owner_and_mode(target, 0, 0o666, 1000),
+                check_owner_and_mode(target, 0, 0o666, 1000, false),
                 Err(ConfigError::WrongOwner(target))
             );
         }

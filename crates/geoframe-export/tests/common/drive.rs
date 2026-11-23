@@ -1,7 +1,9 @@
-//! T4 の試験の共通部品: 偽の Drive（今は偽の rclone。`fake-rclone/`）の状態を作る・読む・差し替える部品と、呼び出しの記録を
-//! 中立の操作名で読む部品（`ops`・`mutating_ops`・`ops_used`・`op_count`）。rclone の引数・環境変数を見る部品
-//! （`rclone_calls`・`assert_rclone_safe_calls`）は rclone 固有で、rclone 版を消すときに一緒に消す。
-//! 本物の rclone・Drive・ネットワークには触れない。Drive の ID は架空の値（`fid0001` …）。
+//! T4 の試験の共通部品: 偽の Drive の状態を作る・読む・差し替える部品と、呼び出しの記録を中立の操作名で読む部品（`ops`・
+//! `mutating_ops`・`ops_used`・`op_count`）。偽の Drive は、試験のプロセスの中の HTTP サーバー（`fake_drive::FakeDrive`。Drive API v3
+//! の形で答える。模型の状態は `fake-rclone/model.rs` を共有し、`fake_dir` のファイルに持つ）。`Env::new` がサーバーを立て、
+//! `Env::settings`（資格情報・3 つのフォルダの ID・`--drive-endpoint` に当たる通信先）をそれに向ける。
+//! rclone の引数・環境変数を見る部品（`rclone_calls`・`assert_rclone_safe_calls`）は rclone 版（`src/rclone.rs`。3 段目で消す）の
+//! 試験だけが使う。本物の Google・rclone・ネットワークには触れない。Drive の ID は架空の値（`fid0001` …）。
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -19,6 +21,8 @@ use geoframe_export::recovery::Progress;
 use geoframe_export::remote::Remote;
 use geoframe_export::request::Destination;
 use geoframe_export::settings::{RawSettings, Settings};
+
+use super::fake_drive::{self, FakeDrive};
 use serde_json::{Value, json};
 
 #[path = "../../fake-rclone/model.rs"]
@@ -33,6 +37,15 @@ pub const FOLDER: &str = "2030-03-10";
 /// Drive を変えない操作名（`mutating_ops` が除く）。
 const READ_ONLY_OPS: [&str; 5] = ["list", "read", "get", "generate_ids", "token"];
 
+/// 待たずに済む再試行の方針（5ms から。3 回まで）。
+pub fn fast_retry() -> geoframe_export::drive::http::Retry {
+    geoframe_export::drive::http::Retry {
+        max_retries: 3,
+        base: Duration::from_millis(5),
+        cap: Duration::from_millis(200),
+    }
+}
+
 pub fn fast_timing() -> Timing {
     Timing {
         settle: Duration::from_millis(10),
@@ -46,32 +59,40 @@ pub struct Env {
     pub state: PathBuf,
     pub fake_dir: PathBuf,
     pub published: PublishedStore,
+    /// 偽の Drive の HTTP サーバー（`Env` が持つ。落とすと止まる）。
+    pub fake: FakeDrive,
+    /// 資格情報のファイル（架空の値）。
+    pub credentials: PathBuf,
+    /// 宛先 `yamareco`・`travel-journal` の親フォルダと、作業用のフォルダの ID（模型のノード）。
+    pub yamareco_id: String,
+    pub travel_journal_id: String,
+    pub work_id: String,
 }
 
 impl Env {
-    /// 偽の Drive に、2 つの接頭辞（`yamareco`・`travel-journal`）と作業用のフォルダ（`geoframe-export-work`）だけがある状態。
+    /// 偽の Drive に、2 つの宛先の親フォルダ（`yamareco`・`travel-journal`）と作業用のフォルダ（`geoframe-export-work`）だけがある状態。
     pub fn new(name: &str) -> Self {
         let root = TempDir::new(name);
         let state = root.path().join("state");
-        std::fs::create_dir_all(state.join("rclone")).expect("state");
+        std::fs::create_dir_all(&state).expect("state");
+        let fake_dir = root.path().join("fake-drive");
+        let mut d = model::Drive::default();
+        let yamareco_id = d.mkdir_p(&["yamareco"]);
+        let travel_journal_id = d.mkdir_p(&["travel-journal"]);
+        let work_id = d.mkdir_p(&["geoframe-export-work"]);
+        d.save(&fake_dir);
+        let fake = FakeDrive::start_in(&fake_dir);
+        let credentials = fake_drive::write_credentials(&root.path().join("cred"));
         let settings = Settings::from_raw(&RawSettings {
-            rclone: Some(env!("CARGO_BIN_EXE_fake-rclone").to_owned()),
-            rclone_config: Some(
-                state
-                    .join("rclone/rclone.conf")
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
             state_dir: Some(state.to_string_lossy().into_owned()),
+            drive_credentials: Some(credentials.to_string_lossy().into_owned()),
+            folder_yamareco: Some(yamareco_id.clone()),
+            folder_travel_journal: Some(travel_journal_id.clone()),
+            work_folder: Some(work_id.clone()),
+            drive_endpoint: Some(fake.url()),
             ..RawSettings::default()
         })
         .expect("settings");
-        let fake_dir = state.join("rclone/fake-drive");
-        let mut d = model::Drive::default();
-        d.mkdir_p(&["yamareco"]);
-        d.mkdir_p(&["travel-journal"]);
-        d.mkdir_p(&["geoframe-export-work"]);
-        d.save(&fake_dir);
         let published = PublishedStore::in_state_dir(&state);
         Self {
             root,
@@ -79,11 +100,38 @@ impl Env {
             state,
             fake_dir,
             published,
+            fake,
+            credentials,
+            yamareco_id,
+            travel_journal_id,
+            work_id,
         }
     }
 
+    /// `--drive-endpoint` 以外の、CLI の設定の引数（偽の Drive へ向ける）。
+    pub fn cli_settings_args(&self) -> Vec<String> {
+        [
+            ("--state-dir", self.state.to_string_lossy().into_owned()),
+            (
+                "--drive-credentials",
+                self.credentials.to_string_lossy().into_owned(),
+            ),
+            ("--folder-yamareco", self.yamareco_id.clone()),
+            ("--folder-travel-journal", self.travel_journal_id.clone()),
+            ("--work-folder", self.work_id.clone()),
+            ("--drive-endpoint", self.fake.url()),
+        ]
+        .into_iter()
+        .flat_map(|(k, v)| [k.to_owned(), v])
+        .collect()
+    }
+
+    /// 再試行を待たない（5ms から）、期限 30 秒の `Remote`。
     pub fn remote(&self) -> Remote {
-        Remote::new(&self.settings).with_timeouts(Duration::from_secs(30), Duration::from_secs(30))
+        Remote::new(&self.settings)
+            .expect("remote")
+            .with_timeouts(Duration::from_secs(30), Duration::from_secs(30))
+            .with_retry(fast_retry())
     }
 
     pub fn layout(&self, dest: Destination, folder: &str, job: &str) -> Layout {

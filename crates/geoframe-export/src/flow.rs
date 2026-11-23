@@ -57,7 +57,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::cancel::Cancel;
-use crate::drive::{Layout, Managed, Target};
+use crate::drive::http::Retry;
+use crate::drive::{Drive, Layout, Managed, Target};
 use crate::error::{ErrorCode, ExportError};
 use crate::feed::FeedClient;
 use crate::folder::FolderName;
@@ -100,6 +101,12 @@ pub struct Tuning {
     /// 上書きもしないことを確かめる）。
     #[doc(hidden)]
     pub corrupt_record_on_panic: bool,
+    /// 試験用: Drive の要求の再試行の待ちを替える（待たずに済むように。本番は `None`）。
+    #[doc(hidden)]
+    pub drive_retry: Option<Retry>,
+    /// 試験用: 一覧のページの大きさ・multipart の上限・チャンクの大きさを替える（`None` は本番の値）。
+    #[doc(hidden)]
+    pub drive_sizes: Option<(u32, u64, u64)>,
 }
 
 impl Default for Tuning {
@@ -111,6 +118,8 @@ impl Default for Tuning {
             panic_in_job: false,
             panic_after_stage: None,
             corrupt_record_on_panic: false,
+            drive_retry: None,
+            drive_sizes: None,
         }
     }
 }
@@ -118,6 +127,8 @@ impl Default for Tuning {
 /// 流れが使う部品（借用）。
 pub struct Context<'a> {
     pub settings: &'a Settings,
+    /// Drive の操作の入口（キャンセルの印を共有済み。ジョブの期限は使うところで掛ける）。
+    pub remote: &'a Remote,
     pub store: &'a JobStore,
     pub published: &'a PublishedStore,
     pub tuning: &'a Tuning,
@@ -638,9 +649,12 @@ fn run_steps(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         Ok(l) => l,
         Err(e) => return Done::failed(e.code, Some(counts.result(false, false, 0, None))),
     };
-    let remote = Remote::new(ctx.settings)
-        .with_cancel(ctx.cancel.clone())
-        .with_deadline(Some(deadline));
+    let remote = ctx.remote.with_deadline(Some(deadline));
+    // ジョブの始めに、宛先の親と作業用のフォルダが（起動後に動かされていないか）フォルダ・ゴミ箱の中でないことを確かめる。
+    // 候補が 0 枚のとき（上で終えている）は Drive に触れない
+    if let Err(e) = Drive::new(&remote, &layout).check_roots() {
+        return Done::failed(e.code, Some(counts.result(false, false, 0, None)));
+    }
     let params = PublishParams {
         on_exists: req.on_exists,
         workspace: workspace.path(),
@@ -776,7 +790,7 @@ fn recover_one(ctx: &Context<'_>, handle: &mut JobHandle) -> Done {
         return stuck("internal");
     };
     // 後始末と復旧は期限なし（コマンドごとの期限と、待ちの回数の上限だけ。ジョブ全体の期限では打ち切らない）
-    let remote = Remote::new(ctx.settings).with_cancel(ctx.cancel.clone());
+    let remote = ctx.remote.with_deadline(None);
     let recovery = Recovery {
         remote: &remote,
         layout: &layout,
@@ -839,7 +853,7 @@ pub fn dry_run(
         folder.clone(),
         JobId::generate()?,
     )?;
-    let remote = Remote::for_dry_run(ctx.settings).with_cancel(ctx.cancel.clone());
+    let remote = ctx.remote.for_dry_run();
     let inspection = crate::publish::dry_run(&remote, &layout, ctx.published)?;
     let (target, managed) = match &inspection.target {
         Target::Absent => ("absent", Value::Null),
