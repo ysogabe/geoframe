@@ -1538,9 +1538,9 @@ fn an_old_job_record_without_md5_writes_a_row_without_md5_so_the_next_replace_is
     assert_eq!(row.files, None);
     // 次の replace は、中身を確かめられないので管理していないものとして断る
     let layout = w.env.layout(Y, FOLDER, JOB_B);
-    let rclone = w.env.remote();
+    let remote = w.env.remote();
     assert_eq!(
-        geoframe_export::publish::dry_run(&rclone, &layout, &w.env.published)
+        geoframe_export::publish::dry_run(&remote, &layout, &w.env.published)
             .unwrap()
             .managed,
         Some(geoframe_export::drive::Managed::NotManaged)

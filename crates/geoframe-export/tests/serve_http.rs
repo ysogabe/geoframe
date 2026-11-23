@@ -1,8 +1,8 @@
 //! T6: `serve` の HTTP（design.md 3.4・6.1・8 章。AC7・AC8・AC9・AC10 の HTTP 側）。`serve::run` を、プロセスの中で 127.0.0.1 の
-//! 空きポートに起こす（偽の写真サービス・偽の rclone・偽の Drive だけ。本物の写真サービス 127.0.0.1:8080・rclone・Drive には
+//! 空きポートに起こす（偽の写真サービス・偽の Drive だけ。本物の写真サービス 127.0.0.1:8080・Drive には
 //! 触れない）。signal の試験（本物のバイナリ）は serve_cli.rs。
 //!
-//! 同じプロセスの中で、ほかの試験が偽の rclone を fork している間は、実行枠が一瞬だけ空かない（common/site.rs の「実行枠の、ほかの
+//! 同じプロセスの中で、ほかの試験が子プロセスを fork している間は、実行枠が一瞬だけ空かない（common/site.rs の「実行枠の、ほかの
 //! 試験の fork との相互作用への備え」）。受付を期待するところだけ、`post_retry` で `busy` を少し待つ。
 
 mod common;
@@ -620,7 +620,7 @@ fn a_job_goes_from_202_to_succeeded_and_can_still_be_read_after_a_restart() {
 }
 
 #[test]
-fn a_failed_job_reports_a_fixed_code_and_never_the_rclone_output() {
+fn a_failed_job_reports_a_fixed_code_and_never_the_drive_response() {
     const TOKEN: &str = "AC9-Fail-q8Zr4Wm2Vx7Jc5Hn3Bd9Ks6Lt1Pf0Ya";
     let mut env = Env::new("http-failed");
     // 一覧 API だけで、画像は 404 → 取得に失敗して公開しない
@@ -801,7 +801,7 @@ fn the_body_is_checked_before_anything_starts() {
             r.body
         );
     }
-    // 重複したキーは 400（最後の値で上書きしない）。ジョブも rclone も作らない
+    // 重複したキーは 400（最後の値で上書きしない）。ジョブも Drive の操作も作らない
     let before = job_files(&env);
     for raw in [
         &br#"{"from":"2030-03-10","destination":"yamareco","dry_run":true,"dry_run":false}"#[..],
@@ -864,7 +864,7 @@ fn the_body_is_checked_before_anything_starts() {
     let r = read_response(&mut s);
     assert_eq!((r.status, r.error().as_str()), (413, "payload_too_large"));
 
-    // 断った要求は、記録も rclone も作らない（上の 4096 バイトの 1 件だけが、ジョブになった）
+    // 断った要求は、記録も Drive の操作も作らない（上の 4096 バイトの 1 件だけが、ジョブになった）
     assert_eq!(job_files(&env), 1);
 }
 

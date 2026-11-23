@@ -1,6 +1,6 @@
 //! T5: ジョブの完了ログ（design.md 7 章）。`tracing` の呼び出し箇所は、受け口の無いスレッドが先に通ると「関心なし」を覚えられて、
 //! あとから付けた受け口に届かないことがある。ほかの試験とスレッドを共有しないよう、この試験だけで 1 つのファイルにしている。
-//! 偽の写真サービス（127.0.0.1）と偽の rclone・偽の Drive だけを使う。
+//! 偽の写真サービス（127.0.0.1）と偽の Drive（HTTP サーバー）だけを使う。
 
 mod common;
 
@@ -57,7 +57,7 @@ fn field<'a>(event: &'a [(String, String)], name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("{name} が無い: {event:?}"))
 }
 
-/// ジョブの完了ログ: ジョブ ID・期間・宛先・枚数・経過時間・status・error の code。ほかの値（トークン・rclone の出力）は載せない。
+/// ジョブの完了ログ: ジョブ ID・期間・宛先・枚数・経過時間・status・error の code。ほかの値（トークン・Drive の応答）は載せない。
 /// `run`（前面）でも、`submit`（`serve` が使う別のスレッド）でも出る。
 #[test]
 fn a_finished_job_logs_one_structured_line_with_the_documented_fields() {

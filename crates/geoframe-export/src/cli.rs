@@ -38,7 +38,7 @@ pub const USAGE: &str = "\
   geoframe-export recover [--resolve <job_id>] [設定の引数]
                                   未完了のジョブの記録と Drive の状態を照らし合わせて表示する。--resolve は blocked の解除
   geoframe-export import-credentials --rclone-config <path> --remote <name> --out <path>
-                                  今の rclone の設定から、Drive の資格情報のファイル（0600）を 1 回だけ作る。値は表示しない
+                                  rclone.conf から、Drive の資格情報のファイル（0600）を 1 回だけ作る。値は表示しない
 設定の引数:
   --feed-base <url>               写真サービスの基底 URL（http://ホスト[:ポート]。既定 http://127.0.0.1:8080）
   --state-dir <dir>               状態ディレクトリ（絶対パス。必須）
@@ -69,7 +69,7 @@ pub enum Command {
         resolve: Option<String>,
         settings: Settings,
     },
-    /// rclone の設定から、Drive の資格情報のファイルを 1 回だけ作る（root が sudo で動かす。起動時の検査は通らない）。
+    /// rclone.conf から、Drive の資格情報のファイルを 1 回だけ作る（root が sudo で動かす。起動時の検査は通らない）。
     ImportCredentials {
         rclone_config: PathBuf,
         remote: String,

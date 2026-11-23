@@ -408,7 +408,7 @@ impl std::error::Error for ApiError {}
 
 impl From<ApiError> for RemoteError {
     /// 呼び出し側（[`crate::remote::RemoteError::into_query_error`]・`into_op_error`）が、ジョブのエラーコードにする
-    /// （`drive_unavailable`・`rclone_failed`・`rclone_timeout`・`timeout`・`drive_auth_invalid`）。
+    /// （`drive_unavailable`・`rclone_failed`・`rclone_timeout`・`timeout`・`drive_auth_invalid`。綴りは呼び出し側との契約）。
     fn from(e: ApiError) -> Self {
         match e {
             ApiError::Cancelled => Self::Cancelled,
@@ -421,16 +421,12 @@ impl From<ApiError> for RemoteError {
                 Self::BadOutput
             }
             ApiError::Rejected(_) | ApiError::Io(_) | ApiError::Credentials(_) => Self::Spawn,
-            ApiError::NotProcessed {
-                throttled,
-                retry_after,
-            } => Self::NotProcessed {
-                throttled,
-                retry_after,
-            },
-            ApiError::Status(_) | ApiError::RateLimited | ApiError::Net(_) | ApiError::Mismatch => {
-                Self::Failed
-            }
+            // 処理されていないと分かる応答（NotProcessed）も、呼び出し側では結果不明と同じに扱う（再送しない。復旧の表に任せる）
+            ApiError::NotProcessed { .. }
+            | ApiError::Status(_)
+            | ApiError::RateLimited
+            | ApiError::Net(_)
+            | ApiError::Mismatch => Self::Failed,
         }
     }
 }
@@ -1146,6 +1142,16 @@ mod tests {
             RemoteError::from(ApiError::Cancelled),
             RemoteError::Cancelled
         );
+        // 処理されていないと分かる応答は、呼び出し側では結果不明の失敗と同じ（流量制限も 401 も）
+        for throttled in [true, false] {
+            assert_eq!(
+                RemoteError::from(ApiError::NotProcessed {
+                    throttled,
+                    retry_after: Some(Duration::from_secs(3)),
+                }),
+                RemoteError::Failed
+            );
+        }
     }
 
     #[test]

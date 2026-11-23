@@ -110,7 +110,7 @@ PrivateDevices=true
 # 特権（capability）は要らない（1024 以上のポートで待ち受け、自分の状態ディレクトリにだけ書く）。
 CapabilityBoundingSet=
 # AF_INET・AF_INET6 は、tailnet での待ち受け、写真サービスへの接続（127.0.0.1）、Drive API への HTTPS（rustls・ring。名前解決は
-# 標準ライブラリ）。rclone 版では、2026-11-22 の本番での実測（deploy/README.md §8.8）で AF_INET・AF_INET6 だけで足りたが、API 版の
+# 標準ライブラリ）。rclone 版を動かしていた 2026-11-22 の本番での実測（deploy/README.md §8.8）では AF_INET・AF_INET6 だけで足りたが、API 版の
 # バイナリで足りるか（名前解決が AF_UNIX を要しないか）は、本番の関門で確かめる。
 RestrictAddressFamilies=AF_INET AF_INET6
 SystemCallFilter=@system-service
@@ -128,7 +128,7 @@ UMask=0077
 # anon メモリは最大 38.5MB、ページキャッシュは最大 660MB、タスクは最大 24 だった。MemoryMax=256M・TasksMax=64・
 # MemoryDenyWriteExecute=true でも成功した。MemoryMax はページキャッシュの回収で詰まらないよう、余裕を見て 512M にした。
 # 書き出す画像が表示用の大きさ（長辺 2560px）であることが前提。派生の大きさを変えるときは MemoryMax を測り直す。
-# 値は rclone 版の実測のまま。API 版は、写真を並列 4 で送り（multipart は 1 本につき、中身と本文で最大 16MiB 弱をメモリに持つ。
+# 値は rclone 版を動かしていたときの実測のまま。API 版は、写真を並列 4 で送り（multipart は 1 本につき、中身と本文で最大 16MiB 弱をメモリに持つ。
 # 4 本で 64MiB 前後）、スレッドも増える。MemoryMax・TasksMax・MemoryDenyWriteExecute が足りるかは、本番の関門で測り直す。
 MemoryDenyWriteExecute=true
 MemoryMax=512M

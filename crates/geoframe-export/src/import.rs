@@ -1,7 +1,7 @@
 //! `geoframe-export import-credentials --rclone-config <path> --remote <name> --out <path>`
 //! （docs/note-photo-export/drive-api.md 2 章）。
 //!
-//! 今の rclone の設定（[`crate::rclone_conf`] で読む）から、専用の `client_id`・`client_secret` と、`token` の `refresh_token` を
+//! これまでの rclone.conf（[`crate::rclone_conf`] で読む）から、専用の `client_id`・`client_secret` と、`token` の `refresh_token` を
 //! 取り出し、3 つのキーだけの JSON（[`crate::drive::auth::Credentials`] が読む形）として `--out` に書く。
 //!
 //! - 書き方は 0600・`O_CREAT | O_EXCL | O_NOFOLLOW`（既にあれば断る。リンクはたどらない）。書いたあと、同じ検査
