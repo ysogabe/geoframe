@@ -87,6 +87,10 @@ pub fn run(
         );
         return EXIT_FAILED;
     }
-    let _ = writeln!(out, "資格情報のファイルを書きました: {}", out_path.display());
+    let _ = writeln!(
+        out,
+        "資格情報のファイルを書きました: {}",
+        out_path.display()
+    );
     EXIT_OK
 }

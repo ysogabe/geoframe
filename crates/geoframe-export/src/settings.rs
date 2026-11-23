@@ -336,7 +336,6 @@ impl Settings {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

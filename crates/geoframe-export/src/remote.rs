@@ -269,7 +269,9 @@ impl Remote {
 
     /// アクセストークンを 1 回取る（起動時の確認）。認可の失効は [`RemoteError::AuthInvalid`]。
     pub fn check_credentials(&self) -> Result<(), RemoteError> {
-        Ok(self.api.check_credentials(self.api.deadline(Limit::Query))?)
+        Ok(self
+            .api
+            .check_credentials(self.api.deadline(Limit::Query))?)
     }
 
     /// `parent` の直下の一覧（ゴミ箱の中は出ない。ショートカットも 1 件として出る）。
@@ -319,9 +321,7 @@ impl Remote {
         size: u64,
         deadline: Deadline,
     ) -> Result<String, RemoteError> {
-        Ok(self
-            .api
-            .upload(parent, name, local, md5, size, deadline)?)
+        Ok(self.api.upload(parent, name, local, md5, size, deadline)?)
     }
 
     /// `id` を `from_parent` から `to_parent` へ、`new_name` にして移す（ID は保たれる）。

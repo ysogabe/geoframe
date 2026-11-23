@@ -4,9 +4,9 @@
 
 mod common;
 
+use common::FakeSite;
 use common::drive::*;
 use common::site::*;
-use common::FakeSite;
 use geoframe_export::app::{EXIT_USAGE, main_with, run_command};
 use geoframe_export::jobid::JobId;
 use geoframe_export::jobs::{BlockedNote, JobRecord, JobStore, ReadOutcome, Status};

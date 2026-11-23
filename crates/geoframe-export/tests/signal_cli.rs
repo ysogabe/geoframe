@@ -12,9 +12,9 @@ use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::FakeSite;
 use common::drive::*;
 use common::site::*;
-use common::FakeSite;
 use geoframe_export::jobs::{JobStore, Status};
 use geoframe_export::recovery::Stage;
 use serde_json::Value;

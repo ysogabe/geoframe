@@ -580,10 +580,7 @@ impl<'a> Drive<'a> {
     /// （ジョブの始め。起動後に誰かが動かした場合に備える）。失敗は `drive_unavailable`。
     pub fn check_roots(&self) -> Result<(), ExportError> {
         for id in [&self.layout.prefix_id, &self.layout.work_id] {
-            let meta = self
-                .remote
-                .get(id)
-                .map_err(RemoteError::into_query_error)?;
+            let meta = self.remote.get(id).map_err(RemoteError::into_query_error)?;
             if !meta.entry.is_dir || meta.entry.is_shortcut() || meta.trashed {
                 return Err(unavailable(
                     "宛先の親フォルダか作業用のフォルダが、フォルダでないか、ゴミ箱の中にあります",

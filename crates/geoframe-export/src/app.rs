@@ -36,7 +36,7 @@ pub fn run_command(
 }
 
 /// [`run_command`] に、キャンセルの印を渡せる形。`run` と `serve` が使う。`handle_signals` が真なら、SIGINT・SIGTERM を
-/// プロセスを終わらせずに `cancel` の印を立てる受け口にする（実行中の rclone を止めて `wait` し終えてから終わる）。バイナリの
+/// プロセスを終わらせずに `cancel` の印を立てる受け口にする（飛んでいる要求が終わってから、アップロードのスレッドを全部止めて終わる）。バイナリの
 /// `main` だけが真にする（プロセス内の試験は並列で 1 つのプロセスを共有するので、受け口を入れない）。
 ///
 /// - `run`: `run` の前に libc の handler を入れる（[`crate::cancel::install_signal_handlers`]）。

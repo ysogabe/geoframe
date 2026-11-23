@@ -33,7 +33,7 @@
 //! ## キャンセル（SIGINT・SIGTERM）と終わりの待ち（T6 から）
 //!
 //! [`Service::cancel`] が返す [`Cancel`] の印を立てると（[`crate::cancel`]。signal の handler か、tokio のシグナルの受け口から）、
-//! 実行中のジョブは、起動している rclone を止めて `wait` し終えてから、記録を確定せずに（Drive の段階が記録にあれば
+//! 実行中のジョブは、飛んでいる要求が終わるのを待ち、アップロードのスレッドを全部止めて join し終えてから、記録を確定せずに（Drive の段階が記録にあれば
 //! `running` のまま）終わる。止まったジョブの記録は、次の復旧（起動時・次のジョブの前・`recover`）が片付ける。`serve` は、印を
 //! 立てたあと、新しい受付を止め、[`Service::wait_idle`] で実行中のジョブのスレッドの終わりを待ってから、プロセスを終える
 //! （実行枠はジョブのスレッドが手放す。待たずに終えると、子が残るか、記録が中途のまま終わる）。
@@ -57,8 +57,8 @@ use crate::jobid::JobId;
 use crate::jobs::{Blocking, JobRecord, JobStore, REQUEST_ID_WINDOW, ReadOutcome, Status};
 use crate::lock::{self, Slot, SlotGuard};
 use crate::published::PublishedStore;
-use crate::request::ExportRequest;
 use crate::remote::Remote;
+use crate::request::ExportRequest;
 use crate::settings::Settings;
 
 /// 新しいジョブを始められない理由。
@@ -256,7 +256,7 @@ impl Service {
         &self.inner.settings
     }
 
-    /// キャンセルの印（立てると、実行中のジョブは rclone を止めて、記録を確定せずに終わる。上の「キャンセル」）。
+    /// キャンセルの印（立てると、実行中のジョブはスレッドを止めて、記録を確定せずに終わる。上の「キャンセル」）。
     pub fn cancel(&self) -> &Cancel {
         &self.inner.cancel
     }

@@ -381,7 +381,11 @@ pub fn parse(args: &[String]) -> Result<Command, CliError> {
             let rclone_config = p.required("--rclone-config")?;
             let remote = p.required("--remote")?;
             let out = p.required("--out")?;
-            for (name, v) in [("--rclone-config", &rclone_config), ("--remote", &remote), ("--out", &out)] {
+            for (name, v) in [
+                ("--rclone-config", &rclone_config),
+                ("--remote", &remote),
+                ("--out", &out),
+            ] {
                 if v.is_empty() || v.contains('\0') {
                     return Err(CliError::InvalidValue(name));
                 }
@@ -730,7 +734,9 @@ mod tests {
 
     #[test]
     fn import_credentials_takes_its_three_arguments() {
-        let ok = parse_line("import-credentials --rclone-config /x/rclone.conf --remote gdrive --out /x/out.json");
+        let ok = parse_line(
+            "import-credentials --rclone-config /x/rclone.conf --remote gdrive --out /x/out.json",
+        );
         assert_eq!(
             ok,
             Ok(Command::ImportCredentials {

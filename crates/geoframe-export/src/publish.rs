@@ -5,11 +5,11 @@
 //! - [`publish`]: 宛先の状態を調べ（4.1 の手順 8）、`incoming` → 検証 → 公開（4.2 の手順 1〜6）まで進める。
 //! - [`Recovery`]: 記録した段階と ID から、復旧の表（[`crate::recovery`]）を実行する。公開の途中の失敗では [`publish`] が
 //!   その場で使い、起動時（T5）は記録から作って使う。`recover` コマンドの表示は [`Recovery::explain`]（Drive を変えない）。
-//! - [`dry_run`]: 宛先の状態と、管理しているフォルダか。呼ぶ操作は `list` と `read` だけ（rclone では `lsjson` と `cat`）。
+//! - [`dry_run`]（宛先の状態と、管理しているフォルダか）。呼ぶ操作は一覧（`list`）と読み出し（`read`）だけ。
 //!
 //! ## 呼び出し側（T5）との約束
 //!
-//! - 候補・書き出す写真が 0 枚のときは、[`publish`] を呼ばない（AC5: rclone を呼ばない）。[`publish`] は、書き出す一式が
+//! - 候補・書き出す写真が 0 枚のときは、[`publish`] を呼ばない（AC5: Drive に触れない）。[`publish`] は、書き出す一式が
 //!   1 枚以上（`files` が写真 1 枚以上と末尾の `manifest.json`）であることを前提にし、そうでなければ何も呼ばずに `internal`。
 //! - 各段階に進む**前**に、[`ProgressSink::record`] が呼ばれる。ここでジョブの記録（`jobs/<job_id>.json`）へ段階名と ID を書いて
 //!   から `Ok` を返すこと。`Err` を返すと、その段階の Drive の操作はしない。`uploading` は 2 回（フォルダを作る前に段階だけ、
@@ -17,8 +17,8 @@
 //!   復旧が Drive を変える操作（`incoming` の移動＝`publishing`、旧フォルダのゴミ箱への移動＝`trashing`）の前にも、
 //!   段階を書く（復旧の途中でまた止まっても、記録と Drive が食い違わないため）。書けなければ、その操作はしない。ゴミ箱への移動の前の `trashing` が書けなかったときは、公開の記録（`published/`）を更新する**前**に、旧フォルダが退避先に
 //!   あると再確認する（別の ID・照会できないときは、公開の記録を更新せずに `blocked`）。
-//! - ジョブ全体の期限は、渡す [`Remote`] に `with_deadline` で掛ける。過ぎたら実行中の rclone を kill して `timeout`。後始末と復旧は
-//!   期限なし（コマンドごとの期限だけ）で動く。
+//! - ジョブ全体の期限は、渡す [`Remote`] に `with_deadline` で掛ける。過ぎたら（要求の前・再試行の待ち・チャンクの間で見て）`timeout`。
+//!   後始末と復旧は期限なし（操作ごとの期限だけ）で動く。
 //! - [`Published::recorded`] が偽（公開の記録 `published/` に書けなかった）のときは、公開は済んでいる。**正常な完了として
 //!   吸収しない**: [`Published::record`] が書くはずだった行なので、`upsert` をやり直し、それでも書けなければ、結果に
 //!   「公開済み（フォルダの ID）・記録に書けていない」を残す（次の `replace` はこのフォルダを管理していないものとして断る）。
@@ -31,43 +31,35 @@
 //! - [`PublishFailure::leftover_incoming`]・[`Resolution::Interrupted`] の残りもの（`incoming/<job_id>`）は、ID を記録していない
 //!   フォルダを名前だけでは消さないので、残ることがある。結果と `recover` の表示に出す（[`leftover_incoming_text`]）。
 //!
-//! ## ID の照合をしている段（本物の rclone で配置のときに確かめる項目の根拠）
+//! ## ID の照合をしている段
 //!
-//! 移動は**パス**で指す（`rclone moveto`）。移したあとは終了コードを信じず、`lsjson` で ID を照合する。
+//! 移動は **ID** で指す（親と名前を 1 回の更新で変える。ID は保たれる）。移したあとも応答を信じず、一覧で ID を照合する。
 //!
 //! | 段 | 照合 |
 //! |---|---|
-//! | `uploading` の最初 | `incoming/<job_id>` を作る**前**に親を一覧し、同名の項目が既にあれば触らずに止める（`mkdir` は既存のフォルダでも成功するので。ID は未記録なので、残りものとして知らせる）。作ったあと、親の一覧で ID を取り（ちょうど 1 つのフォルダ）、記録する |
+//! | `uploading` の最初 | `incoming/<job_id>` を作る**前**に親を一覧し、同名の項目が既にあれば触らずに止める（作成は、同名のフォルダがあっても新しい ID で作れてしまうので。ID は未記録なので、残りものとして知らせる）。作ったあと、親の一覧で ID を取り（ちょうど 1 つのフォルダ）、記録する |
 //! | `verifying` | 送った中身が一式と完全に一致 |
 //! | 公開の前 | 宛先の状態をもう一度調べる（新規なら「無い」、置き換えなら「記録した旧 ID・管理している・中身が変わっていない」） |
-//! | `retiring` の直前 | `replaced/<…>` に同名の項目が無い。あれば何も動かさずに `blocked`（`replaced_unexpected`。あると `moveto` がファイル単位の移動に切り替わり、旧一式のファイルがそこへ移る） |
-//! | `retiring` の直後 | 宛先が無く、`replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**。違えば `blocked`（`retire_mismatch`。パスで解決する移動が、確かめてから移すまでの間にできた別のフォルダを移した場合） |
+//! | `retiring` の直前 | `replaced/<…>` に同名の項目が無い。あれば何も動かさずに `blocked`（`replaced_unexpected`。退避の結果が曖昧になる） |
+//! | `retiring` の直後 | 宛先が無く、`replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**。違えば `blocked`（`retire_mismatch`。確かめてから移すまでの間に、同じ名前の別のフォルダができた場合） |
 //! | `publishing` の前 | 宛先が無い（新規は無ければ中止、置き換えは `blocked`） |
-//! | `publishing` の直後 | 宛先が**記録した `incoming` の ID 1 つだけ**・`incoming/<job_id>` が残っていない・中身が一式と一致。違えば `blocked`（`publish_mismatch`。ファイル単位の移動への切り替え、宛先に既にあった別のフォルダへの merge など） |
+//! | `publishing` の直後 | 宛先が**記録した `incoming` の ID 1 つだけ**・`incoming/<job_id>` が残っていない・中身が一式と一致。違えば `blocked`（`publish_mismatch`。確かめてから移すまでの間に、宛先に同じ名前の別のフォルダができた場合など） |
 //! | 中止の片付けの前 | 最後に記録した段階が `publishing` なら、`aborting` を記録してから `incoming` をゴミ箱へ（復旧は、`incoming` が残っていれば消し、無ければ片付け済みとして `interrupted`） |
 //! | `trashing` の直前 | `replaced/<…>` が**記録した旧フォルダの ID 1 つだけ**、かつ**中身が旧 manifest の一式と完全に一致**。違えば `blocked`（`trash_mismatch`・`retired_content_changed`） |
 //! | 取り除き（`incoming` のゴミ箱） | 見えた項目が、**記録した ID** のフォルダちょうど 1 つ（ID が無ければ消さない） |
 //!
-//! ## ゴミ箱へ移すものと、`moveto` の fallback の影響（残る前提）
+//! ## ゴミ箱へ移すものと、同名のフォルダの競合の影響（残る前提）
 //!
-//! - rclone で ID を固定した `purge` はできない（上流の `purgeCheck` は、`root_folder_id` で根を指しても何もしない）。`purge` を
-//!   呼ぶのは、誰とも共有しない作業用のフォルダの中の `incoming/<job_id>`・`replaced/<種類>-<フォルダ名>-<job_id>`
-//!   （`job_id` は 128 ビットの乱数）だけ。競合の余地は、オーナーがその名前のフォルダを数秒のうちに作ることだけ。
-//! - rclone の `moveto`（フォルダ）は、移し先にフォルダができていると、Drive の中での移動をやめて**ファイル単位の移動**に切り替わる
-//!   （上流の `MoveDir` が `ErrorDirExists` を受けた場合）。止める手段は無く、`ErrorCantDirMove`（remote 名が違うとき）は
-//!   remote 名をそろえた設定（起動時に検査済み）では起きないので、残る条件は「直前に移し先が無いと確かめてから移すまでの数秒に、
-//!   同じ名前のフォルダが作られる」競合だけ（設計 4.2 の「書き出しの実行中に、オーナーが同じ宛先のフォルダを画面から作ったり
-//!   動かしたりしない」前提の範囲）。起きたときの影響は、移し先のフォルダに**写真が足される**こと（既にあるものは消さず、
-//!   `--immutable` で書き換えない）。移したあとの ID の照合（移し先の ID が `incoming` の ID と違う）で見つけて `blocked` で止まる。
-//!   `recover` の表示（[`BlockedInfo::describe`]）の ID を見て、オーナーが Drive の画面で足された写真を手で片付ける。
-//!   `retiring`（旧フォルダの退避）の移動は、**案内が別**: 退避先 `replaced/<…>` にできていたフォルダへ旧フォルダの中身のファイルが
-//!   移るので、写真を片付けるのではなく、移った旧ファイルを元の場所（宛先）へ戻す必要がある（`retire_mismatch` の表示）。
-//!   退避は、競合を待たなくても、実行前から `replaced/<…>` に同名の項目があれば起きるので、移す前に退避先を一覧して、あれば
-//!   何も動かさずに `blocked`（`replaced_unexpected`）にしている。
-//!
-//! rclone の drive の `backend moveid`（ID を指して移す）は、フォルダに使えるかをネットワークなしでは確かめられなかったので
-//! 使っていない（パスでの移動と、上の照合）。使えると分かれば、`retiring`・`publishing` の移動だけを差し替えられる
-//! （[`crate::drive::Drive::retire_old`]・[`crate::drive::Drive::publish_move`]）。
+//! - ゴミ箱へ移すのは、事前に照合した **ID** のフォルダだけ（完全な削除はしない。ゴミ箱から戻せる）。パスで指していた rclone 版と違い、
+//!   移す先が「その瞬間に同じ名前の別のフォルダ」に化ける競合は無い。
+//! - API の移動は、ID で指したフォルダそのものの移動で、移し先に同名のフォルダがあっても、ファイル単位の移動には切り替わらない。
+//!   残る競合は、「直前に移し先が無いと確かめてから移すまでの数秒に、オーナーが同じ名前のフォルダを作る」ことだけ（設計 4.2 の
+//!   「書き出しの実行中に、オーナーが同じ宛先のフォルダを画面から作ったり動かしたりしない」前提の範囲）。起きたときの影響は、
+//!   宛先（`retiring` なら退避先）に**同名のフォルダが 2 つ並ぶ**こと（写真が足されることも、旧ファイルが動くこともない。
+//!   どれも消さない）。移したあとの ID の照合（宛先が `incoming` の ID 1 つだけでない）で見つけて `blocked` で止まる。
+//!   `recover` の表示（[`BlockedInfo::describe`]）の ID を見て、オーナーが Drive の画面で同名のフォルダを片付ける。
+//!   退避は、競合を待たなくても、実行前から `replaced/<…>` に同名の項目があれば結果が曖昧になるので、移す前に退避先を一覧して、
+//!   あれば何も動かさずに `blocked`（`replaced_unexpected`）にしている。
 
 use std::path::Path;
 use std::time::Duration;
@@ -97,7 +89,7 @@ impl<F: FnMut(&Progress) -> Result<(), ExportError>> ProgressSink for F {
 /// 失敗のあとの「待って 2 回一覧を取る」の設定（試験では短くする）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timing {
-    /// 一覧を取る前の待ち（既定 30 秒。rclone を止めたあとも Drive 側で移動が遅れて反映されることがある）。
+    /// 一覧を取る前の待ち（既定 30 秒。応答を失った移動が、Drive 側で遅れて反映されることがある）。
     pub settle: Duration,
     /// 「待つ → 2 回取る」を繰り返す回数の上限。決まらなければ `blocked`。
     pub rounds: u32,
@@ -450,7 +442,7 @@ impl TrashStop {
 
 /// 復旧の表を実行するための部品。
 pub struct Recovery<'a> {
-    /// 期限なし（コマンドごとの期限だけ）の rclone。
+    /// 期限なし（操作ごとの期限だけ）の Drive の入口。
     pub remote: &'a Remote,
     pub layout: &'a Layout,
     pub published: &'a PublishedStore,
@@ -497,7 +489,7 @@ impl Recovery<'_> {
             if wait_first || round > 0 {
                 self.pause();
             }
-            // キャンセルされたら、決まらなかったものとして返す（rclone はもう動かない。呼び出し側は、キャンセルの印を見て、
+            // キャンセルされたら、決まらなかったものとして返す（要求はもう出ない。呼び出し側は、キャンセルの印を見て、
             // この結果〔`blocked`〕を記録に確定しない）
             if self.remote.is_cancelled() {
                 return None;
@@ -874,7 +866,7 @@ pub struct PublishParams<'a> {
 }
 
 enum StepErr {
-    /// rclone の失敗（応答が失われた移動を含む）。その場で復旧の表を実行する。
+    /// Drive の変更系の操作の失敗（応答が失われた移動を含む）。その場で復旧の表を実行する。
     Op(ExportError),
     /// こちらで決めた中止（検証の不一致、宛先が変わっていた、記録を書けない）。`incoming` を片付けて失敗で終える。
     Abort(ExportError),
@@ -886,7 +878,7 @@ struct Run<'a> {
     layout: &'a Layout,
     params: &'a PublishParams<'a>,
     sink: &'a mut dyn ProgressSink,
-    /// ジョブの期限を掛けた rclone の `Drive`。
+    /// ジョブの期限を掛けた `Drive`。
     drive: Drive<'a>,
     /// 期限を掛けない `Drive`（仕上げの確認と後始末）。
     free_drive: Drive<'a>,
@@ -899,7 +891,7 @@ struct Run<'a> {
     retire_issued: bool,
 }
 
-/// 照会の失敗を、ステップの失敗にする。`ambiguous_destination` は Drive を変える前の判定なので中止、それ以外は rclone の失敗。
+/// 照会の失敗を、ステップの失敗にする。`ambiguous_destination` は Drive を変える前の判定なので中止、それ以外は変更系の操作の失敗。
 fn query_failure(e: ExportError) -> StepErr {
     if e.code == ErrorCode::AmbiguousDestination {
         StepErr::Abort(e)
@@ -957,7 +949,7 @@ impl Run<'_> {
         // 1. uploading: 同名の確かめ → 段階を記録 → incoming/<job_id> を作る → ID を記録 → 写真 → 最後に manifest
         // 同名の確かめは、最初の記録より前に行う（記録の後で見つけて止まると、再起動の復旧が `incoming_unexpected` で
         // `blocked` になり、Drive を変えていないジョブが後の書き出しを止めてしまう）
-        // `rclone mkdir` は、既にあるフォルダでも成功する。実行前から同名の `incoming/<job_id>` があると、そのフォルダの ID を
+        // 作成は、同名のフォルダがあっても、新しい ID で作れてしまう。実行前から同名の `incoming/<job_id>` があると、そのフォルダの ID を
         // このジョブのものとして記録し、アップロードや失敗時のゴミ箱への移動の対象にしてしまう。作る前に一覧し、同名があれば
         // 触らずに止める（ID はまだ記録していないので、中止の片付けは名前だけでは消さず、残りものとして知らせる）。宛先も
         // 旧フォルダも動かしていないので `blocked` にはしない（`job_id` は乱数で、同名があるのは異常だが、守るべきものは無い）
@@ -1013,10 +1005,9 @@ impl Run<'_> {
 
     /// 宛先が無いとき: 直前にもう一度「無い」ことを確かめて、`incoming` を宛先へ移す。
     ///
-    /// 確かめてから移すまでの数秒に、オーナーが同じ名前のフォルダを作ると、rclone の `moveto` は Drive の中での移動をやめて
-    /// ファイル単位の移動に切り替わる（止める手段が無い。設計 4.2 の「残る前提」の範囲）。宛先のフォルダに `incoming` の写真が
-    /// 足される（消しはしない）。移したあとの照合（宛先の ID が `incoming` の ID と違う）で見つけて `blocked` で止まり、
-    /// `recover` の表示で、オーナーが足された写真を手で片付ける。
+    /// 確かめてから移すまでの数秒に、オーナーが同じ名前のフォルダを作ると、宛先に同名のフォルダが 2 つ並ぶ（移動は ID で行うので、
+    /// 写真が足されることはない。設計 4.2 の「残る前提」の範囲）。移したあとの照合（宛先が `incoming` の ID 1 つだけでない）で
+    /// 見つけて `blocked` で止まり、`recover` の表示で、オーナーが同名のフォルダを手で片付ける。
     fn publish_absent(&mut self, incoming_id: &str) -> Result<Published, StepErr> {
         self.record(Stage::Publishing, Some(incoming_id))?;
         match self.drive.target() {
@@ -1038,9 +1029,8 @@ impl Run<'_> {
     fn publish_replace(&mut self, incoming_id: &str, old: &str) -> Result<Published, StepErr> {
         // retiring: 旧フォルダ（ID 記録済み）を replaced/<…> へ移し、結果を照合する
         self.record(Stage::Retiring, Some(incoming_id))?;
-        // 退避先 `replaced/<…>` に同名の項目が実行前からあると、`moveto` は Drive の中での移動をやめてファイル単位の移動に
-        // 切り替わり、旧一式のファイルがそこへ移ってしまう。移す前に退避先の親を一覧し、同名があれば何も動かさずに `blocked`
-        // にする（旧フォルダは宛先のまま。再起動の復旧も、`replaced/` に項目があるので同じ `blocked`）
+        // 退避先 `replaced/<…>` に同名の項目が実行前からあると、退避の結果が曖昧になる（同名のフォルダが並ぶ）。移す前に退避先の親を
+        // 一覧し、同名があれば何も動かさずに `blocked` にする（旧フォルダは宛先のまま。再起動の復旧も、`replaced/` に項目があるので同じ `blocked`）
         match self.drive.replaced_seen() {
             Ok(seen) if seen.is_empty() => {}
             Ok(seen) => {
@@ -1116,12 +1106,12 @@ impl Run<'_> {
     }
 }
 
-/// 宛先の状態を調べ、書ける状態なら Drive に公開する（4.1 の手順 8・9）。`rclone` にはジョブ全体の期限を掛けておく。
+/// 宛先の状態を調べ、書ける状態なら Drive に公開する（4.1 の手順 8・9）。`remote` にはジョブ全体の期限を掛けておく。
 ///
 /// - 宛先がある（`on_exists: error`）、管理しているフォルダでない（`replace` だが `not_managed`）、中身が変わっている
 ///   （`modified`）ときは、`copy`・`moveto`・`purge` を呼ばずに [`PublishOutcome::Conflict`]。
 /// - 照会の失敗は `drive_unavailable`、同名が複数・ファイル・ショートカットは `ambiguous_destination`。
-/// - 公開の途中で rclone が失敗・タイムアウトしたら、待って（[`Timing`]）一覧を 2 回取り、復旧の表（[`crate::recovery`]）を
+/// - 公開の途中で Drive の操作が失敗・タイムアウトしたら、待って（[`Timing`]）一覧を 2 回取り、復旧の表（[`crate::recovery`]）を
 ///   その場で実行する。前のままなら `incoming` を片付けて、元の失敗を返す。公開まで済んでいれば、成功として返す。
 ///   決まらなければ `blocked`。
 pub fn publish(
@@ -1231,7 +1221,7 @@ pub fn publish(
             })
         }
         Err(StepErr::Op(error)) => {
-            // 移動・ゴミ箱の段階は、rclone を止めたあとに Drive 側で遅れて反映されることがあるので、待ってから取る
+            // 応答を失った移動・ゴミ箱の段階は、Drive 側で遅れて反映されることがあるので、待ってから取る
             let wait = matches!(
                 run.progress.stage,
                 Stage::Retiring | Stage::Publishing | Stage::Trashing
@@ -1257,7 +1247,7 @@ pub fn publish(
 }
 
 /// `dry_run`（design.md 6.1）: 宛先の状態と、`exists` のときの `existing_files`・管理しているフォルダか。
-/// 呼ぶ rclone のコマンドは `lsjson` と（管理の確認の）`cat` だけ。`rclone` は [`Remote::for_dry_run`]（期限 30 秒）で作る。
+/// 呼ぶ Drive の操作は一覧と（管理の確認の）読み出しだけ。`remote` は [`Remote::for_dry_run`]（期限 30 秒）で作る。
 pub fn dry_run(
     remote: &Remote,
     layout: &Layout,
@@ -1266,8 +1256,8 @@ pub fn dry_run(
     dry_run_within(remote, layout, published, crate::remote::DRY_RUN_TIMEOUT)
 }
 
-/// [`dry_run`] の、全体の期限を替えられる形（試験用。本番は 30 秒）。宛先がある場合は 5 回ほど rclone を呼ぶので、
-/// コマンドごとの期限（[`Remote::for_dry_run`] の 30 秒）とは別に、`dry_run` 全体に期限を掛ける。過ぎたら `drive_unavailable`。
+/// [`dry_run`] の、全体の期限を替えられる形（試験用。本番は 30 秒）。宛先がある場合は数回 Drive を呼ぶので、
+/// 1 回ごとの操作の期限（[`Remote::for_dry_run`] の 30 秒）とは別に、`dry_run` 全体に期限を掛ける。過ぎたら `drive_unavailable`。
 #[doc(hidden)]
 pub fn dry_run_within(
     remote: &Remote,

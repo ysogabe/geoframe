@@ -51,7 +51,7 @@ pub fn run(
 }
 
 /// [`run`] の、調整値（待ちと期限）とキャンセルの印を渡せる形。バイナリの `main` は、signal の handler
-/// （[`crate::cancel::install_signal_handlers`]）と同じ印を渡す。印が立つと、実行中の rclone を止めて `wait` し終えてから、
+/// （[`crate::cancel::install_signal_handlers`]）と同じ印を渡す。印が立つと、飛んでいる要求が終わるのを待ち、アップロードのスレッドを全部止めて join し終えてから、
 /// 記録を確定せずに（Drive の段階が記録にあれば `running` のまま）終わる。そのときは、記録（`status` は `running`）を標準出力に出し、
 /// 標準エラーに説明を出して、終了コード 1。
 pub fn run_with(

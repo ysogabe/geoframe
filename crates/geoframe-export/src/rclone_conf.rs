@@ -190,7 +190,13 @@ fn read_config_text(path: &Path, uid: u32, any_owner: bool) -> Result<String, Co
     if !dir_meta.is_dir() {
         return Err(ConfigError::WrongKind(Target::Directory));
     }
-    check_owner_and_mode(Target::Directory, dir_meta.uid(), dir_meta.mode(), uid, any_owner)?;
+    check_owner_and_mode(
+        Target::Directory,
+        dir_meta.uid(),
+        dir_meta.mode(),
+        uid,
+        any_owner,
+    )?;
 
     // 同じハンドルの下から開く（パスを引き直さない）。シンボリックリンクはたどらない。FIFO などで待たないよう O_NONBLOCK で
     // 開き、通常のファイルだと確かめてから読む（通常のファイルの読み取りに O_NONBLOCK は影響しない）
@@ -629,7 +635,10 @@ mod tests {
     #[test]
     fn owner_and_mode_are_checked_for_both_targets() {
         for target in [Target::File, Target::Directory] {
-            assert_eq!(check_owner_and_mode(target, 1000, 0o600, 1000, false), Ok(()));
+            assert_eq!(
+                check_owner_and_mode(target, 1000, 0o600, 1000, false),
+                Ok(())
+            );
             assert_eq!(
                 check_owner_and_mode(target, 1001, 0o600, 1000, false),
                 Err(ConfigError::WrongOwner(target))

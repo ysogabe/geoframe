@@ -48,11 +48,8 @@ fn drive_has(env: &Env, path: &[&str]) -> bool {
     let Some((name, parent)) = path.split_last() else {
         return false;
     };
-    d.resolve(parent).is_some_and(|p| {
-        d.children(&p)
-            .iter()
-            .any(|n| n.name == *name && !n.trashed)
-    })
+    d.resolve(parent)
+        .is_some_and(|p| d.children(&p).iter().any(|n| n.name == *name && !n.trashed))
 }
 
 // ---- 成功とその記録 ----

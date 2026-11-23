@@ -2,8 +2,8 @@
 //! 付けない）。標準出力は、コマンドの JSON 専用。`crates/geoframe` の `logging.rs` と同じ作り（同じ版・同じ feature）。
 //!
 //! 出すのは、このクレート自身のログだけ（依存クレートのログは全部捨てる）。出してよいもの: ジョブの完了（ジョブ ID・期間・宛先・
-//! 枚数・経過時間・status・error の code）、rclone の失敗（コマンド名・失敗の種類・伏せ字にした標準エラーの末尾）。トークン・
-//! 資格情報・Drive の ID・rclone の標準出力は出さない。
+//! 枚数・経過時間・status・error の code）、Drive の操作の失敗（操作名・状態コード・再試行の回数・Drive のエラーの理由の短い語）。トークン・
+//! 資格情報・Drive の ID・応答の本文・URL のクエリは出さない。
 
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::filter::Targets;

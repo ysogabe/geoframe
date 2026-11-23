@@ -254,7 +254,10 @@ impl Env {
     #[track_caller]
     pub fn assert_startup_only(&self) {
         for op in self.ops_used() {
-            assert!(op == "token" || op == "get", "起動時の検査のほかの要求: {op}");
+            assert!(
+                op == "token" || op == "get",
+                "起動時の検査のほかの要求: {op}"
+            );
         }
     }
 
@@ -310,7 +313,8 @@ impl Env {
             let op = c["op"].as_str().unwrap_or("?");
             assert_ne!(op, "unsupported", "完全な削除か中身の更新を呼んだ: {c}");
             let auth = c["authorization"].as_str().unwrap_or("?");
-            let session_put = op == "upload" && matches!(c["phase"].as_str(), Some("chunk" | "status"));
+            let session_put =
+                op == "upload" && matches!(c["phase"].as_str(), Some("chunk" | "status"));
             match (op, auth) {
                 ("token", "missing") => {}
                 (_, "ok") if op != "token" => {}
@@ -324,9 +328,14 @@ impl Env {
                     .and_then(|r| r.strip_suffix("' in parents and trashed=false"))
                     .is_some_and(|id| {
                         !id.is_empty()
-                            && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                            && id
+                                .bytes()
+                                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
                     });
-                assert!(ok, "一覧の q が ID だけの形ではない（名前で絞っている）: {q}");
+                assert!(
+                    ok,
+                    "一覧の q が ID だけの形ではない（名前で絞っている）: {q}"
+                );
             }
         }
     }

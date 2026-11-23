@@ -1,5 +1,5 @@
 //! 固定のエラーコード（design.md 6.1）。HTTP の 400 の `{"error": ...}` にも、ジョブの `error.code` にも、
-//! `run` の標準出力にも同じ文字列を使う。メッセージは固定の短い説明で、受け取った値・rclone の出力・設定の中身は含めない。
+//! `run` の標準出力にも同じ文字列を使う。メッセージは固定の短い説明で、受け取った値・Drive の応答の本文・設定の中身は含めない。
 
 use std::fmt;
 
@@ -124,8 +124,8 @@ impl ErrorCode {
             Self::DriveUnavailable => "Drive に照会できません",
             Self::DriveAuthInvalid => "Drive の認可が失効しました（再認可が要ります）",
             Self::AmbiguousDestination => "書き出し先に同じ名前のものが複数あります",
-            Self::RcloneFailed => "rclone が失敗しました",
-            Self::RcloneTimeout => "rclone が時間内に終わりませんでした",
+            Self::RcloneFailed => "Drive の変更系の操作が失敗しました",
+            Self::RcloneTimeout => "Drive の操作が時間内に終わりませんでした",
             Self::VerifyMismatch => "送った内容が manifest と一致しません",
             Self::Timeout => "ジョブ全体の期限を過ぎました",
             Self::Blocked => "前の書き出しの状態を照合できていません",
@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(ErrorCode::RequestIdMismatch.as_str(), "request_id_mismatch");
         assert_eq!(ErrorCode::ShuttingDown.as_str(), "shutting_down");
         assert_eq!(ErrorCode::DriveAuthInvalid.as_str(), "drive_auth_invalid");
-        // 呼び出し側との契約（rclone 版が返すコードの綴りは変えない）
+        // 呼び出し側との契約（rclone 版のときからの綴り。意味は「Drive の変更系の操作の失敗」「Drive の操作が期限内に終わらない」）
         assert_eq!(ErrorCode::RcloneFailed.as_str(), "rclone_failed");
         assert_eq!(ErrorCode::RcloneTimeout.as_str(), "rclone_timeout");
     }

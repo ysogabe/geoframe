@@ -154,7 +154,10 @@ fn a_revoked_authorization_exits_2_and_says_a_new_consent_is_needed() {
     // 起動のたびにトークンの取得 1 回で終わる（Drive の中身には触れない。再試行もしない）
     assert_eq!(env.ops_used(), ["token"]);
     assert_eq!(env.op_count("token"), 4);
-    assert!(!env.state.join("jobs").exists(), "検査に通らなければ何も作らない");
+    assert!(
+        !env.state.join("jobs").exists(),
+        "検査に通らなければ何も作らない"
+    );
 
     // 更新トークンが合わない資格情報のファイルでも同じ（偽のサーバーが invalid_grant を返す）
     let env = Env::new("cli-wrong-token");
@@ -203,12 +206,27 @@ fn folders_that_are_missing_trashed_not_folders_or_nested_exit_2() {
 
     #[allow(clippy::type_complexity)]
     let cases: Vec<(&str, &str, String, &str)> = vec![
-        ("missing", "--work-folder", "NoSuchFolderId".into(), "--work-folder"),
+        (
+            "missing",
+            "--work-folder",
+            "NoSuchFolderId".into(),
+            "--work-folder",
+        ),
         ("a-file", "--work-folder", file, "--work-folder"),
-        ("a-shortcut", "--folder-travel-journal", shortcut, "--folder-travel-journal"),
+        (
+            "a-shortcut",
+            "--folder-travel-journal",
+            shortcut,
+            "--folder-travel-journal",
+        ),
         ("trashed", "--folder-yamareco", trashed, "--folder-yamareco"),
         // 作業用のフォルダが、宛先の親の中にある・宛先の親が作業用のフォルダの中にある
-        ("work-inside-prefix", "--work-folder", nested_work.clone(), "--folder-yamareco"),
+        (
+            "work-inside-prefix",
+            "--work-folder",
+            nested_work.clone(),
+            "--folder-yamareco",
+        ),
         (
             "prefix-inside-work",
             "--folder-travel-journal",
@@ -220,8 +238,16 @@ fn folders_that_are_missing_trashed_not_folders_or_nested_exit_2() {
         let args = common(&env, &[(opt, id.as_str())]);
         for out in run_all(&all_commands(&args)) {
             assert_eq!(out.code, EXIT_USAGE, "{name}: {}", out.stderr);
-            assert!(out.stderr.contains(expect_in_message), "{name}: {}", out.stderr);
-            assert!(!out.stderr.contains(&id), "{name}: ID を写している: {}", out.stderr);
+            assert!(
+                out.stderr.contains(expect_in_message),
+                "{name}: {}",
+                out.stderr
+            );
+            assert!(
+                !out.stderr.contains(&id),
+                "{name}: ID を写している: {}",
+                out.stderr
+            );
             assert!(out.stdout.is_empty(), "{name}: {}", out.stdout);
         }
     }

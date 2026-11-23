@@ -10,10 +10,10 @@ mod common;
 
 use std::time::{Duration, Instant};
 
+use common::FakeSite;
 use common::drive::*;
 use common::fake_drive as fk;
 use common::site::*;
-use common::FakeSite;
 use geoframe_export::cancel::Cancel;
 use geoframe_export::error::ErrorCode;
 use geoframe_export::flow::Tuning;
@@ -88,9 +88,7 @@ fn assert_published_once(env: &Env) {
         .collect();
     assert_eq!(incomings.len(), 1, "incoming/ が重複していない");
     assert!(
-        d.children(&incomings[0].id)
-            .iter()
-            .all(|n| n.trashed),
+        d.children(&incomings[0].id).iter().all(|n| n.trashed),
         "incoming/ に何も残っていない"
     );
 }
@@ -208,8 +206,17 @@ fn a_revoked_grant_fails_the_job_with_drive_auth_invalid_before_and_during_the_j
     let rec = run_job(&svc);
     // 送信の結果が分からないまま、観察もできない（認可が失われた）ので、記録は `blocked`（unobservable）。`recover` で Drive を確かめて
     // 解除するまで、次の書き出しは断る（これまでの、観察できないときの扱いと同じ）。公開はしていない
-    assert_eq!(rec.status, Status::Blocked, "{:?} {:?}", rec.error, rec.notes);
-    assert_eq!(rec.blocked.as_ref().map(|b| b.reason.as_str()), Some("unobservable"));
+    assert_eq!(
+        rec.status,
+        Status::Blocked,
+        "{:?} {:?}",
+        rec.error,
+        rec.notes
+    );
+    assert_eq!(
+        rec.blocked.as_ref().map(|b| b.reason.as_str()),
+        Some("unobservable")
+    );
     assert!(dest_names(&env).is_empty());
     assert_eq!(env.op_count("move"), 0);
     assert!(svc.blocking().is_some());
@@ -289,7 +296,10 @@ fn a_resumable_upload_cut_in_the_middle_resumes_and_a_lost_session_restarts_with
         .iter()
         .filter(|c| c["op"] == "upload" && c["phase"] == "status")
         .count();
-    assert!(status_queries >= 2, "受け取り済みの位置を問い合わせた: {status_queries}");
+    assert!(
+        status_queries >= 2,
+        "受け取り済みの位置を問い合わせた: {status_queries}"
+    );
     // 写真 3 枚と manifest（4 つ）の送信を、別の ID で始めていない
     assert_eq!(distinct_new_ids(&env, "upload"), 4);
     // 中身は、送ったものと同じ（作業領域の MD5）
@@ -316,7 +326,11 @@ fn a_resumable_upload_cut_in_the_middle_resumes_and_a_lost_session_restarts_with
     let rec = run_job(&svc);
     assert_eq!(rec.status, Status::Succeeded, "{:?}", rec.error);
     assert_published_once(&env);
-    assert_eq!(distinct_new_ids(&env, "upload"), 4, "始め直しても ID は同じ");
+    assert_eq!(
+        distinct_new_ids(&env, "upload"),
+        4,
+        "始め直しても ID は同じ"
+    );
     let inits = env
         .http_calls()
         .iter()
@@ -348,7 +362,11 @@ fn photos_are_sent_four_at_a_time_and_the_manifest_goes_last() {
         assert!(started.elapsed() < Duration::from_secs(20), "{n}");
         std::thread::sleep(Duration::from_millis(5));
     }
-    assert!(started.elapsed() < Duration::from_millis(650), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_millis(650),
+        "{:?}",
+        started.elapsed()
+    );
     assert_eq!(requests_of(&env, "upload"), 4, "並列は 4");
     let rec = worker.join().unwrap();
     assert_eq!(rec.status, Status::Succeeded, "{:?}", rec.error);

@@ -21,9 +21,7 @@ use std::fmt;
 use crate::drive::auth::Credentials;
 use crate::drive::http::{ApiError, Retry};
 use crate::remote::Remote;
-use crate::settings::{
-    OPT_FOLDER_TRAVEL_JOURNAL, OPT_FOLDER_YAMARECO, OPT_WORK_FOLDER, Settings,
-};
+use crate::settings::{OPT_FOLDER_TRAVEL_JOURNAL, OPT_FOLDER_YAMARECO, OPT_WORK_FOLDER, Settings};
 
 /// 祖先をたどる深さの上限。
 pub const MAX_ANCESTOR_DEPTH: usize = 64;
@@ -165,7 +163,10 @@ pub fn check_drive(remote: &Remote, settings: &Settings) -> Result<(), StartupEr
         for j in (i + 1)..folders.len() {
             let (name_i, id_i) = folders[i];
             let (name_j, id_j) = folders[j];
-            if id_i == id_j || ancestors[i].iter().any(|a| a == id_j) || ancestors[j].iter().any(|a| a == id_i) {
+            if id_i == id_j
+                || ancestors[i].iter().any(|a| a == id_j)
+                || ancestors[j].iter().any(|a| a == id_i)
+            {
                 return Err(StartupError::Nested(name_i, name_j));
             }
         }

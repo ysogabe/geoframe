@@ -49,9 +49,9 @@ use super::http::{
     encode,
 };
 
-/// フォルダの MIME タイプ（Drive の値。`rclone lsjson` の `inode/directory` ではない）。
+/// フォルダの MIME タイプ（Drive の値。rclone の `inode/directory` ではない）。
 pub const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
-/// 1 回の一覧（1 つの親・1 本の木）の件数の上限（rclone 版の `LSJSON_MAX_ENTRIES` と同じ）。
+/// 1 回の一覧（1 つの親・1 本の木）の件数の上限（`LSJSON_MAX_ENTRIES` と同じ）。
 pub const MAX_ENTRIES: usize = 20_000;
 /// ページ送りの回数の上限。
 pub const MAX_PAGES: u32 = 1000;

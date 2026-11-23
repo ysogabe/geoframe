@@ -11,12 +11,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use common::TempDir;
-use common::drive::*;
 use geoframe_export::rclone::{Rclone, RcloneSettings};
 use geoframe_export::remote::{RemoteError, RemoteLoc};
-use geoframe_export::request::Destination;
 use geoframe_export::settings::RemotePath;
-use serde_json::json;
 
 fn write_script(dir: &Path, body: &str) -> PathBuf {
     let path = dir.join("fake-rclone.sh");

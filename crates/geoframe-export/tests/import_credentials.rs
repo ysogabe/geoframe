@@ -31,7 +31,12 @@ fn import(conf: &std::path::Path, remote: &str, out: &std::path::Path) -> Out {
     import_as(None, conf, remote, out)
 }
 
-fn import_as(euid: Option<u32>, conf: &std::path::Path, remote: &str, out: &std::path::Path) -> Out {
+fn import_as(
+    euid: Option<u32>,
+    conf: &std::path::Path,
+    remote: &str,
+    out: &std::path::Path,
+) -> Out {
     let args: Vec<String> = [
         "import-credentials",
         "--rclone-config",
@@ -68,7 +73,11 @@ fn it_writes_exactly_three_keys_with_mode_0600_and_prints_no_value() {
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert_no_values(&out.stdout);
     assert_no_values(&out.stderr);
-    assert!(out.stdout.contains("drive-credentials.json"), "{}", out.stdout);
+    assert!(
+        out.stdout.contains("drive-credentials.json"),
+        "{}",
+        out.stdout
+    );
 
     // 3 つのキーだけ（順序も固定）。値は rclone の設定のもの
     let text = std::fs::read_to_string(&out_path).unwrap();
@@ -128,7 +137,12 @@ fn a_config_that_cannot_be_imported_exits_2_without_creating_the_output() {
     let dir = TempDir::new("import-bad");
     let out_path = dir.path().join("out.json");
     // refresh_token が無い・空
-    for token in ["{}", "{\"refresh_token\":\"\"}", "not json", "{\"refresh_token\":1}"] {
+    for token in [
+        "{}",
+        "{\"refresh_token\":\"\"}",
+        "not json",
+        "{\"refresh_token\":1}",
+    ] {
         let text = format!(
             "[gdrive]\nclient_id = {MARK_ID}\nclient_secret = {MARK_SECRET}\ntoken = {token}\n"
         );
@@ -145,7 +159,9 @@ fn a_config_that_cannot_be_imported_exits_2_without_creating_the_output() {
             "gdrive",
         ),
         (
-            format!("[gdrive]\nclient_secret = {MARK_SECRET}\ntoken = {{\"refresh_token\":\"{REFRESH}\"}}\n"),
+            format!(
+                "[gdrive]\nclient_secret = {MARK_SECRET}\ntoken = {{\"refresh_token\":\"{REFRESH}\"}}\n"
+            ),
             "gdrive",
         ),
         (conf_text("another"), "gdrive"),
@@ -206,7 +222,11 @@ fn the_subcommand_is_not_refused_for_root_and_skips_the_startup_check() {
     // `run_command` に渡す実効ユーザー ID が 0 でも、`import-credentials` は断らない（`run`・`serve`・`recover` は断る）。
     // Drive にも、起動時の検査にも触れない（通信先の引数が無くても動く）
     let out = import_as(Some(0), &conf, "gdrive", &out_path);
-    assert!(!out.stderr.contains("root では動かしません"), "{}", out.stderr);
+    assert!(
+        !out.stderr.contains("root では動かしません"),
+        "{}",
+        out.stderr
+    );
     assert_eq!(out.code, 0, "{}", out.stderr);
     assert!(out_path.exists());
     let (mut o, mut e) = (Vec::new(), Vec::new());

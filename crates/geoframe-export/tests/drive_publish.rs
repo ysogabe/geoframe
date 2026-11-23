@@ -20,7 +20,6 @@ use geoframe_export::publish::{
     dry_run, publish,
 };
 use geoframe_export::recovery::{BlockedReason, Progress, Stage};
-use geoframe_export::remote::Remote;
 use geoframe_export::request::{Destination, OnExists};
 use serde_json::{Value, json};
 
@@ -665,7 +664,7 @@ fn a_same_named_folder_created_right_after_the_publish_move_is_found_by_the_id_c
 
 #[test]
 fn a_same_named_folder_created_right_after_the_retire_move_blocks_before_anything_reaches_the_trash()
-{
+ {
     let env = Env::new("dup-after-retire");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old_id = env.seed_managed(Y, FOLDER, &set);
@@ -689,7 +688,10 @@ fn a_same_named_folder_created_right_after_the_retire_move_blocks_before_anythin
     let o = info.observed.clone().unwrap();
     assert!(o.dest.is_empty());
     assert_eq!(o.replaced.len(), 2, "同名のフォルダが並ぶ");
-    assert!(o.replaced.iter().any(|s| s.id == old_id), "旧フォルダは ID のまま退避先にある");
+    assert!(
+        o.replaced.iter().any(|s| s.id == old_id),
+        "旧フォルダは ID のまま退避先にある"
+    );
     assert_eq!(env.op_count("move"), 1);
     assert!(env.op_count("trash") == 0);
     assert!(env.drive().trashed.is_empty());
@@ -940,8 +942,6 @@ fn duplicates_files_and_shortcuts_at_the_destination_are_ambiguous() {
             }
         }
         env.save(&d);
-        if matches!(case, Case::ShortcutResolved) {
-        }
         for on_exists in [OnExists::Error, OnExists::Replace] {
             let mut hook = Hook::new(&env);
             let f = failure(run(&env, &set, on_exists, &mut hook));
@@ -1789,7 +1789,11 @@ fn a_failed_purge_succeeds_with_the_old_folder_left_only_if_it_is_confirmed_in_r
         if c["op"] == "trash" {
             break;
         }
-        if c["op"] == "list" && c["subject"].as_str().is_some_and(|p| p.ends_with("/replaced")) {
+        if c["op"] == "list"
+            && c["subject"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("/replaced"))
+        {
             before_purge += 1;
         }
     }
@@ -1976,13 +1980,11 @@ fn a_same_named_incoming_that_already_exists_is_not_adopted_and_is_reported_as_a
                 (None, vec![id])
             }
             "shortcut-mime" | "shortcut-resolved" => {
-                // 同名のショートカット（ショートカットを省く一覧では見えない）。どちらの見え方でも同名として数える
+                // 同名のショートカット（API の一覧では、解決されずに 1 件として出る）。同名として数える
                 let mut d = env.drive();
                 let other = d.mkdir_p(&["elsewhere"]);
                 let id = d.add_shortcut(&work, JOB_A, &other);
                 env.save(&d);
-                if variant == "shortcut-resolved" {
-                }
                 (None, vec![id])
             }
             _ => {
@@ -2348,8 +2350,7 @@ fn every_listing_asks_for_the_md5_field_and_nothing_else_is_asked_for_in_the_tre
     assert!(!lists.is_empty());
     for c in &lists {
         assert_eq!(
-            c["fields"],
-            "nextPageToken,files(id,name,mimeType,size,md5Checksum)",
+            c["fields"], "nextPageToken,files(id,name,mimeType,size,md5Checksum)",
             "{c}"
         );
     }
