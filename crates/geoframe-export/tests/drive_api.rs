@@ -856,79 +856,118 @@ fn a_trash_that_failed_with_an_unknown_result_is_checked_with_get_and_never_rese
     }
 }
 
+/// 429・流量制限の 403 のあとも、API の層は移動・ゴミ箱へ移すを**再送しない**（処理されていないと分かっても、待つ間に旧フォルダへ
+/// ファイルが足されると、同じ ID をもう一度更新して、足された分ごと動かしてしまう）。待ち時間（`Retry-After`）を載せて返し、
+/// 再送は、操作ごとの照合をやり直せる上位が決める。
 #[test]
-fn a_throttled_move_or_trash_is_waited_for_and_resent_after_checking_the_state() {
-    // 429・流量制限の 403 は、処理されていないと分かる。待って再送してよい（その前に状態を見る）
-    for effect in [fk::rate_limit_403(), fk::too_many_requests(0)] {
+fn a_throttled_move_or_trash_is_never_resent_by_the_api_layer() {
+    for (label, effect, retry_after) in [
+        ("403", fk::rate_limit_403(), None),
+        (
+            "429",
+            fk::too_many_requests(0),
+            Some(Duration::from_secs(0)),
+        ),
+        (
+            "429 7s",
+            fk::too_many_requests(7),
+            Some(Duration::from_secs(7)),
+        ),
+    ] {
+        let want = Err(ApiError::NotProcessed {
+            throttled: true,
+            retry_after,
+        });
         let fx = Fx::new("api-move-throttled");
         let id = dir_in(&fx, &fx.work, "incoming-x");
-        fx.env.add_rule("move", 0, 1, effect.clone());
-        fx.api
-            .move_to(&id, &fx.work, &fx.yamareco, "2030-03-10", fx.dl())
-            .unwrap();
-        assert_eq!(fx.ops(), ["move", "get", "move"], "{effect}");
-        assert_eq!(fx.env.drive().node(&id).unwrap().name, "2030-03-10");
+        fx.env.add_rule("move", 0, u64::MAX, effect.clone());
+        let r = fx
+            .api
+            .move_to(&id, &fx.work, &fx.yamareco, "2030-03-10", fx.dl());
+        assert_eq!(r, want, "{label}");
+        assert_eq!(fx.ops(), ["move"], "{label}: 再送しない・状態も見ない");
+        assert_eq!(fx.env.drive().node(&id).unwrap().parent, fx.work, "{label}");
 
         let fx = Fx::new("api-trash-throttled");
         let old = dir_in(&fx, &fx.work, "old");
-        fx.env.add_rule("trash", 0, 1, effect.clone());
-        fx.api.trash(&old, fx.dl()).unwrap();
-        assert_eq!(fx.ops(), ["trash", "get", "trash"], "{effect}");
-        assert!(fx.env.drive().node(&old).unwrap().trashed);
+        fx.env.add_rule("trash", 0, u64::MAX, effect);
+        assert_eq!(fx.api.trash(&old, fx.dl()), want, "{label}");
+        assert_eq!(fx.ops(), ["trash"], "{label}: 再送しない");
+        assert!(!fx.env.drive().node(&old).unwrap().trashed, "{label}");
     }
 }
 
+/// 401 のあとも再送しない。トークンを捨てるだけ（次の要求が取り直す）。
 #[test]
-fn a_401_before_a_move_or_trash_checks_the_state_before_the_resend() {
+fn a_401_before_a_move_or_trash_only_drops_the_token_and_is_never_resent() {
     let fx = Fx::new("api-move-401");
     let id = dir_in(&fx, &fx.work, "incoming-x");
     fx.env.add_rule("move", 0, 1, fk::unauthorized());
+    let not_processed = Err(ApiError::NotProcessed {
+        throttled: false,
+        retry_after: None,
+    });
+    assert_eq!(
+        fx.api
+            .move_to(&id, &fx.work, &fx.yamareco, "2030-03-10", fx.dl()),
+        not_processed
+    );
+    assert_eq!(fx.ops(), ["move"], "再送しない・状態も見ない");
+    assert_eq!(fx.fake.tokens_issued(), 1, "この呼び出しでは取り直さない");
+    assert_eq!(fx.env.drive().node(&id).unwrap().parent, fx.work);
+    // 上位が呼び直すと、次の要求がトークンを取り直して通る
     fx.api
         .move_to(&id, &fx.work, &fx.yamareco, "2030-03-10", fx.dl())
         .unwrap();
-    assert_eq!(fx.ops(), ["move", "get", "move"]);
     assert_eq!(fx.fake.tokens_issued(), 2);
+    assert_eq!(fx.env.drive().node(&id).unwrap().name, "2030-03-10");
 
     let fx = Fx::new("api-trash-401");
     let old = dir_in(&fx, &fx.work, "old");
     fx.env.add_rule("trash", 0, 1, fk::unauthorized());
+    assert_eq!(fx.api.trash(&old, fx.dl()), not_processed);
+    assert_eq!(fx.ops(), ["trash"]);
+    assert_eq!(fx.fake.tokens_issued(), 1);
+    assert!(!fx.env.drive().node(&old).unwrap().trashed);
     fx.api.trash(&old, fx.dl()).unwrap();
-    assert_eq!(fx.ops(), ["trash", "get", "trash"]);
     assert_eq!(fx.fake.tokens_issued(), 2);
+    assert!(fx.env.drive().node(&old).unwrap().trashed);
 }
 
+/// 401 も、再試行と同じ上限に数える。最後に許された送信が 401 なら、トークンを取り直しても、もう送らない
+/// （`max_retries = 3` なら、最大 4 回の送信）。
 #[test]
-fn a_401_does_not_reset_the_retry_count_of_a_move() {
-    // 429 を 3 回（再試行の上限）→ 401 → 取り直し → 429 が続く。取り直しで回数が初期化されると、さらに 3 回送ってしまう
-    let fx = Fx::new("api-401-count");
-    let id = dir_in(&fx, &fx.work, "x");
-    fx.env.add_rule("move", 0, 3, fk::too_many_requests(0));
-    fx.env.add_rule("move", 3, 1, fk::unauthorized());
+fn a_401_counts_against_the_same_limit_and_never_sends_past_it() {
+    // 429 を 3 回 → 4 回目の送信が 401。そこで止まる（5 回目は送らない）
+    let fx = Fx::new("api-401-limit");
+    fx.env.add_rule("list", 0, 3, fk::too_many_requests(0));
+    fx.env.add_rule("list", 3, 1, fk::unauthorized());
     fx.env
-        .add_rule("move", 4, u64::MAX, fk::too_many_requests(0));
-    let r = fx.api.move_to(&id, &fx.work, &fx.yamareco, "n", fx.dl());
-    assert_eq!(r, Err(ApiError::RateLimited));
-    // 429 ×3 → 401 → 429（上限）。初期化されていれば 8 回になる
-    assert_eq!(fx.env.op_count("move"), 5);
-}
+        .add_rule("list", 4, u64::MAX, fk::too_many_requests(0));
+    assert_eq!(
+        fx.api.list_children(&fx.work, fx.dl()),
+        Err(ApiError::Status(401))
+    );
+    assert_eq!(fx.env.op_count("list"), 4, "再試行の上限 3 → 最大 4 回");
 
-#[test]
-fn a_401_does_not_reset_the_no_resend_rule_for_a_later_unknown_failure() {
-    // 401 → トークンの取り直し → 再送 → 500。取り直しで確認が初期化されて、さらに再送することはない
-    for op in ["move", "trash"] {
-        let fx = Fx::new("api-401-then-500");
-        let id = dir_in(&fx, &fx.work, "x");
-        fx.env.add_rule(op, 0, 1, fk::unauthorized());
-        fx.env.add_rule(op, 1, 1, fail(1));
-        let r = if op == "move" {
-            fx.api.move_to(&id, &fx.work, &fx.yamareco, "n", fx.dl())
-        } else {
-            fx.api.trash(&id, fx.dl())
-        };
-        assert!(matches!(r, Err(ApiError::Status(500))), "{op}: {r:?}");
-        assert_eq!(fx.ops(), [op, "get", op, "get"], "{op}");
-        assert_eq!(fx.env.op_count(op), 2, "{op}");
-    }
+    // 上限の中なら、401 のあとに取り直して通る（送った回数は、取り直しをまたいで数える）
+    let fx = Fx::new("api-401-within");
+    fx.env.add_rule("list", 0, 1, fk::too_many_requests(0));
+    fx.env.add_rule("list", 1, 1, fk::unauthorized());
+    fx.api.list_children(&fx.work, fx.dl()).unwrap();
+    assert_eq!(fx.env.op_count("list"), 3);
+    assert_eq!(fx.fake.tokens_issued(), 2);
+
+    // 401 → 取り直し → 429 が続く: 上限（4 回）で RateLimited（取り直しで回数を初期化しない）
+    let fx = Fx::new("api-401-then-429");
+    fx.env.add_rule("list", 0, 1, fk::unauthorized());
+    fx.env
+        .add_rule("list", 1, u64::MAX, fk::too_many_requests(0));
+    assert_eq!(
+        fx.api.list_children(&fx.work, fx.dl()),
+        Err(ApiError::RateLimited)
+    );
+    assert_eq!(fx.env.op_count("list"), 4);
 }
 
 #[test]
@@ -1609,15 +1648,18 @@ fn a_chunk_honours_retry_after_and_caps_it() {
     });
     let body = big(600_000);
     let (path, md5) = fx.local("big.jpg", &body);
-    // Retry-After 1 秒は、上限（700ms）で切る。指数の待ち（1ms）より、はっきり長く待つ
+    // Retry-After 5 秒は、上限（700ms）で切る。指数の待ち（1ms）より、はっきり長く待つ。待ちは、処理全体の時間ではなく、429 の要求から
+    // 位置の問い合わせまでの間隔（要求の到着時刻の差）で見る
     fx.fake
-        .add_rule_contains("upload", "phase:chunk", 1, 1, fk::too_many_requests(1));
-    let start = Instant::now();
+        .add_rule_contains("upload", "phase:chunk", 1, 1, fk::too_many_requests(5));
     api.upload(&fx.work, "big.jpg", &path, &md5, body.len() as u64, fx.up())
         .unwrap();
-    let took = start.elapsed();
-    assert!(took >= Duration::from_millis(650), "{took:?}");
     assert_eq!(fx.uploads("status"), 1);
+    let gap = fk::gap_after_throttled_chunk_ms(&fx.fake.requests());
+    assert!(
+        (650..4000).contains(&gap),
+        "429 から位置の問い合わせまでの間隔が上限（700ms）付近: {gap}ms"
+    );
 }
 
 #[test]

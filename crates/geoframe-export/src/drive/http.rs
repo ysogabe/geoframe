@@ -7,8 +7,9 @@
 //! - 「済んでいるか」の確認（`SendOpts::settled`）: 移動・ゴミ箱へ移すは、再送すると別の結果になりうる（待っている間に、場所や
 //!   中身が変わっているかもしれない）ので、**結果が分からない失敗（通信断・5xx・時間切れ）のあとは自分で再送しない**
 //!   （`SendOpts::resend_unknown`）。今の状態を見て、目的の状態なら成功、そうでなければ失敗として上へ返す。再送が要るなら、上位が
-//!   場所と中身の照合をやり直してから呼び直す。429・流量制限の 403（処理されていないと分かる応答）と、401 のあとのトークンの
-//!   取り直しの再送の前にも、同じ確認を通る。
+//!   場所と中身の照合をやり直してから呼び直す。**429・流量制限の 403・401（処理されていないと分かる応答）のあとも、API の層は
+//!   再送しない**（[`ApiError::NotProcessed`]。待つ間に旧フォルダへファイルが足されると、同じ ID をもう一度更新して足された分ごと
+//!   動かしてしまう）。401 ならトークンを捨てるだけ、流量制限なら `Retry-After` を載せて返す。
 //! - 308 などの状態コードを呼び出し側へそのまま返す（`SendOpts::passthrough`。resumable のアップロードの続き）。
 //! - 期限が 2 種類（操作の期限とジョブ全体の期限）あり、どちらで切れたかを区別して返す（[`Deadline`]）。
 //! - キャンセル（[`Cancel`]）を、要求の前と再試行の待ちの最中に見る。
@@ -344,6 +345,14 @@ pub enum ApiError {
     Status(u16),
     /// 流量制限（429・403 の `rateLimitExceeded`）が、再試行の回数を使い切っても直らなかった。
     RateLimited,
+    /// 結果が分からない失敗のあとは再送しない操作（移動・ゴミ箱へ移す）で、**処理されていないと分かる**応答（429・流量制限の 403・
+    /// 401）が返った。API の層は再送しない（待つ間に場所や中身が変わりうるので、再送は、操作ごとの照合をやり直せる上位が決める）。
+    /// `throttled` は、流量制限（真）か、401（偽。トークンは捨てたので、次の要求は取り直す）か。`retry_after` は、流量制限の応答の
+    /// `Retry-After`（上限で切る前の値）。
+    NotProcessed {
+        throttled: bool,
+        retry_after: Option<Duration>,
+    },
     /// 通信の失敗（再試行を使い切った）。
     Net(Failure),
     /// 応答が、決められた形・値でない。
@@ -374,6 +383,12 @@ impl fmt::Display for ApiError {
             Self::NotFound => f.write_str("Drive に指定の ID がありません"),
             Self::Status(code) => write!(f, "Drive API が HTTP {code} を返しました"),
             Self::RateLimited => f.write_str("Drive API が流量制限を返し続けました"),
+            Self::NotProcessed {
+                throttled: true, ..
+            } => f.write_str("Drive API が流量制限を返しました（要求は処理されていません）"),
+            Self::NotProcessed { .. } => {
+                f.write_str("Drive API が認可の失効を返しました（要求は処理されていません）")
+            }
             Self::Net(failure) => write!(f, "通信に失敗しました（{}）", failure.as_str()),
             Self::BadResponse => f.write_str("Drive の応答が決められた形ではありません"),
             Self::TooLarge => f.write_str("Drive の応答かファイルが上限を超えています"),
@@ -406,6 +421,13 @@ impl From<ApiError> for RemoteError {
                 Self::BadOutput
             }
             ApiError::Rejected(_) | ApiError::Io(_) | ApiError::Credentials(_) => Self::Spawn,
+            ApiError::NotProcessed {
+                throttled,
+                retry_after,
+            } => Self::NotProcessed {
+                throttled,
+                retry_after,
+            },
             ApiError::Status(_) | ApiError::RateLimited | ApiError::Net(_) | ApiError::Mismatch => {
                 Self::Failed
             }
@@ -572,7 +594,7 @@ impl Retry {
     }
 
     /// `attempt`（0 から）回目の失敗のあとの待ち。`Retry-After` があればそれ（上限で切る）、無ければ指数の待ちに 0〜25% の揺らぎ。
-    pub(super) fn wait_for(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
+    pub fn wait_for(&self, attempt: u32, retry_after: Option<Duration>) -> Duration {
         if let Some(ra) = retry_after {
             return ra.min(self.cap);
         }
@@ -601,9 +623,10 @@ pub(super) struct SendOpts<'a> {
     pub passthrough: &'a [u16],
     /// 「もう目的の状態か」の確認。再送の前と、再試行しない 4xx・結果が分からない失敗のときに呼び、真なら [`Outcome::AlreadyDone`]。
     pub settled: Option<&'a dyn Fn() -> Result<bool, ApiError>>,
-    /// 結果が分からない失敗（通信断・5xx・要求 1 回の時間切れ）のあとに、自分で再送するか。偽なら、`settled` で確かめ、目的の状態で
-    /// なければその失敗を返す（再送するかどうかは上位が、場所と中身の照合をやり直して決める）。流量制限（処理されていないと分かる
-    /// 応答）は、偽でも待って再送する。
+    /// 自分で再送するか。偽なら、**どの失敗のあとも再送しない**: 結果が分からない失敗（通信断・5xx・要求 1 回の時間切れ）は
+    /// `settled` で確かめ、目的の状態でなければその失敗を返す。処理されていないと分かる応答（429・流量制限の 403・401）は、
+    /// [`ApiError::NotProcessed`]（待ち時間つき）で返す。再送するかどうかは、場所と中身の照合をやり直せる上位が決める
+    /// （待つ間に旧フォルダへファイルが足されれば、同じ ID をもう一度更新すると、足された分ごと動かしてしまう）。
     pub resend_unknown: bool,
 }
 
@@ -769,7 +792,8 @@ impl Transport {
     ///   [`Retry::max_retries`]。待ちの最中にキャンセルと期限を見る。使い切ったら、通信の失敗は [`ApiError::Net`]、流量制限は
     ///   [`ApiError::RateLimited`]、5xx は [`ApiError::Status`]。
     ///   **`opts.resend_unknown` が偽のとき**、通信の失敗・5xx（結果が分からない）は再送せず、`opts.settled` で確かめて、済んで
-    ///   いれば [`Outcome::AlreadyDone`]、そうでなければその失敗を返す。
+    ///   いれば [`Outcome::AlreadyDone`]、そうでなければその失敗を返す。429・流量制限の 403 も再送せず、
+    ///   [`ApiError::NotProcessed`] を返す。
     /// - それ以外の 4xx・3xx は、再試行せず [`ApiError::Status`]（404 は [`ApiError::NotFound`]）。`opts.settled` があれば、その前に
     ///   確認して、済んでいれば [`Outcome::AlreadyDone`]。
     pub fn send_with_retry(
@@ -830,7 +854,21 @@ impl Transport {
                             );
                             return Err(ApiError::status(status));
                         };
-                        if !opts.resend_unknown && !reply.is_throttled() {
+                        if !opts.resend_unknown {
+                            if reply.is_throttled() {
+                                // 処理されていないと分かるが、待つ間に場所や中身が変わりうる。ここでは再送せず、待ち時間を載せて
+                                // 返す（再送するかは、操作ごとの照合をやり直せる上位が決める）
+                                tracing::debug!(
+                                    op = opts.op,
+                                    status,
+                                    reason = reply.reason(),
+                                    "流量制限です。再送せずに上位へ返します"
+                                );
+                                return Err(ApiError::NotProcessed {
+                                    throttled: true,
+                                    retry_after: reply.retry_after,
+                                });
+                            }
                             tracing::debug!(
                                 op = opts.op,
                                 status,

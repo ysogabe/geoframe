@@ -346,31 +346,18 @@ fn photos_are_sent_four_at_a_time_and_the_manifest_goes_last() {
     let mut env = Env::new("faults-parallel");
     let site = photo_site(DAY, DAY, six());
     let svc = service_with(&mut env, &site, retrying());
-    // どの送信も 700ms かかる（要求は、記録されてから眠る）
-    env.add_rule("upload", 0, u64::MAX, sleep_ms(700));
+    // どの送信も、解くまで保留する。保留に入った送信が 4 つになるのを待ち（時間に頼らない）、それ以上は始まらないことを確かめてから解く
+    env.add_rule("upload", 0, u64::MAX, fk::hold());
     let worker = {
         let svc = svc.clone();
         std::thread::spawn(move || run_job(&svc))
     };
-    // 最初の送信が記録された時点から、700ms のあいだに、飛んでいる送信がちょうど 4 つ（並列は 4）。起点は、最初の送信の記録
-    // （一覧・画像・フォルダの作成の時間を含めない）
-    let wait_started = Instant::now();
-    while requests_of(&env, "upload") == 0 {
-        assert!(wait_started.elapsed() < Duration::from_secs(30));
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    let first_seen = Instant::now();
-    let n = loop {
-        let n = requests_of(&env, "upload");
-        if n >= 4 || first_seen.elapsed() > Duration::from_millis(600) {
-            break n;
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    };
-    assert_eq!(
-        n, 4,
-        "最初の送信から 600ms 以内に、4 つが同時に飛ぶ（並列は 4）: {n}"
-    );
+    env.fake.wait_arrived("upload", 4);
+    // 4 つが飛んでいる間は、5 つ目は始まらない（並列は 4。少し待って、増えないことを見る。待ちを短くしても、正しい実装は通る）
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(env.fake.arrived("upload"), 4, "飛んでいる送信は 4 つまで");
+    assert_eq!(requests_of(&env, "upload"), 4);
+    env.fake.release();
     let rec = worker.join().unwrap();
     assert_eq!(rec.status, Status::Succeeded, "{:?}", rec.error);
     // 写真 6 枚と manifest。manifest は、全部の写真のあと（最後）
@@ -413,16 +400,16 @@ fn a_cancel_during_parallel_uploads_stops_every_thread_and_hands_the_record_to_r
     let cancel = Cancel::new();
     env.settings.feed_base = site.base.clone();
     let svc = Service::with_cancel(env.settings.clone(), retrying(), cancel.clone()).unwrap();
-    env.add_rule("upload", 0, u64::MAX, sleep_ms(800));
+    env.add_rule("upload", 0, u64::MAX, fk::hold());
     let worker = {
         let svc = svc.clone();
         std::thread::spawn(move || run_job(&svc))
     };
-    while requests_of(&env, "upload") < 4 {
-        std::thread::sleep(Duration::from_millis(5));
-    }
+    // 4 つの送信が飛んでいる（保留に入った）ことを確かめてから印を立て、そのあとで解く（時間に頼らない）
+    env.fake.wait_arrived("upload", 4);
     let t = Instant::now();
     cancel.cancel();
+    env.fake.release();
     let rec = worker.join().unwrap();
     assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
     // 飛んでいた 4 つが終わるのを待って、残りの 2 枚と manifest は始めない。返ったあとに、要求は来ない
@@ -564,7 +551,8 @@ fn a_redirect_is_never_followed_and_fails_the_job_without_publishing() {
 
 #[test]
 fn a_retry_after_wait_is_honoured_inside_a_job_and_the_chunk_resumes_from_the_received_position() {
-    // ジョブの段で、チャンクの 429 の `Retry-After`（1 秒。上限 700ms で切る）を待ち、位置を問い合わせて続きから送る
+    // ジョブの段で、チャンクの 429 の `Retry-After`（5 秒。上限 700ms で切る）を待ち、位置を問い合わせて続きから送る。待ちは、処理全体の
+    // 時間ではなく、429 の要求から位置の問い合わせまでの間隔（要求の到着時刻の差）で見る
     let mut env = Env::new("faults-retry-after");
     let site = photo_site(DAY, DAY, three());
     let svc = service_with(
@@ -581,13 +569,16 @@ fn a_retry_after_wait_is_honoured_inside_a_job_and_the_chunk_resumes_from_the_re
         },
     );
     env.fake
-        .add_rule_contains("upload", "phase:chunk", 0, 1, fk::too_many_requests(1));
-    let start = Instant::now();
+        .add_rule_contains("upload", "phase:chunk", 0, 1, fk::too_many_requests(5));
     let rec = run_job(&svc);
-    let took = start.elapsed();
     assert_eq!(rec.status, Status::Succeeded, "{:?}", rec.error);
     assert_published_once(&env);
-    assert!(took >= Duration::from_millis(650), "{took:?}");
+    // 429 から位置の問い合わせまで: 上限（700ms）まで待ち（待ちを省けば、これより短い）、上限で切っている（Retry-After の 5 秒は待たない）
+    let gap = fk::gap_after_throttled_chunk_ms(&env.http_calls());
+    assert!(
+        (650..4000).contains(&gap),
+        "429 から位置の問い合わせまでの間隔が上限（700ms）付近: {gap}ms"
+    );
     let status_queries = env
         .http_calls()
         .iter()

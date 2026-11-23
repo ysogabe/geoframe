@@ -64,7 +64,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use crate::drive::{Drive, Expected, Inspection, Layout, Managed, Removed, Target};
+use crate::drive::{Drive, Expected, Inspection, Layout, Managed, Removed, Target, Under};
 use crate::error::{ErrorCode, ExportError};
 use crate::image::PublishFile;
 use crate::published::{PreviousFolder, PublishedRecord, PublishedStore, RecordedFile};
@@ -564,7 +564,7 @@ impl Recovery<'_> {
                 trash_old,
             } => {
                 let recorded = self.recorded_digests(folder_id, &cur);
-                match self.content_ok(folder_id, recorded.as_deref()) {
+                match self.content_ok(folder_id, Under::Dest, recorded.as_deref()) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(self.blocked(
@@ -572,6 +572,21 @@ impl Recovery<'_> {
                             BlockedReason::ContentMismatch,
                             Some(observed),
                         ));
+                    }
+                    Err(_) => {
+                        return Err(self.blocked(
+                            &cur,
+                            BlockedReason::ExecutionFailed,
+                            Some(observed),
+                        ));
+                    }
+                }
+                // 中身は ID で読めるので、照合の間にそのフォルダが宛先から動かされても読めてしまう。公開の確定（記録）と旧フォルダの
+                // 片付けに入る前に、宛先がその ID のフォルダ 1 つだけで `incoming` が空であることを、もう一度確かめる
+                match drive.still_placed(folder_id) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(o)) => {
+                        return Err(self.blocked(&cur, BlockedReason::PublishMismatch, Some(&o)));
                     }
                     Err(_) => {
                         return Err(self.blocked(
@@ -595,7 +610,7 @@ impl Recovery<'_> {
                 old_id,
             } => {
                 let recorded = self.recorded_digests(incoming_id, &cur);
-                match self.content_ok(incoming_id, recorded.as_deref()) {
+                match self.content_ok(incoming_id, Under::Incoming, recorded.as_deref()) {
                     Ok(true) => {}
                     Ok(false) => {
                         return Err(self.blocked(
@@ -687,12 +702,13 @@ impl Recovery<'_> {
     fn content_ok(
         &self,
         folder_id: &str,
+        under: Under,
         recorded: Option<&[RecordedFile]>,
     ) -> Result<bool, ExportError> {
         let drive = self.drive();
         match self.expected {
-            Some(e) => drive.folder_matches_expected(folder_id, e),
-            None => drive.folder_matches_its_manifest(folder_id, recorded),
+            Some(e) => drive.folder_matches_expected(folder_id, under, e),
+            None => drive.folder_matches_its_manifest(folder_id, under, recorded),
         }
     }
 
@@ -975,7 +991,7 @@ impl Run<'_> {
         self.record(Stage::Verifying, Some(&incoming_id))?;
         if !self
             .drive
-            .folder_matches_expected(&incoming_id, &self.expected)
+            .folder_matches_expected(&incoming_id, Under::Incoming, &self.expected)
             .map_err(StepErr::Op)?
         {
             return Err(StepErr::Abort(ExportError::from(ErrorCode::VerifyMismatch)));

@@ -29,14 +29,16 @@
 //! 1 要求 1 行（`kind: "http"`）。`op` は中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash` と、読むだけの
 //! `get`・`generate_ids`・`token`）。resumable の 1 回の送信は複数の要求になるので、`upload` が複数行になる（`phase` で見分ける。
 //! 規則の「何回目」は、条件に合う要求を数える）。ほかに `method`・`route`・`subject`（対象のノードの Drive 上のパス。模型から引く）・
-//! `q`（一覧のとき）・`has_page_token`・`authorization`（`missing`・`invalid`・`ok`。トークンの値は書かない）・`injected`（規則の効果の種類）。
+//! `q`（一覧のとき）・`has_page_token`・`authorization`（`missing`・`invalid`・`ok`。トークンの値は書かない）・`injected`（規則の効果の種類）・
+//! `at_ms`（要求が**着いた**時刻。そのサーバーを立ててからの単調時計のミリ秒。待ちの長さを、要求と要求の間隔で見る）。
 //!
 //! ## 故障注入（`Env::add_rule(op, skip, times, effect)`）
 //!
 //! `op` に当たる要求のうち、最初の `skip` 回は通常どおり、次の `times` 回に効果を掛ける。`contains` は `subject`・`phase:<名前>` の
 //! 部分一致（[`FakeDrive::add_rule_contains`]）。効果は、この下の関数で作る: [`status`]・[`rate_limit_403`]・[`too_many_requests`]・
 //! [`unauthorized`]・[`invalid_grant`]・[`drop_connection`]・[`do_then_drop`]・[`cut_response`]・[`redirect`]・[`repeat_page_token`]・
-//! [`bad_location`]・[`cut_after`]・[`lose_session`]。`drive.rs` の [`fail`](super::drive::fail)（500）・
+//! [`bad_location`]・[`cut_after`]・[`lose_session`]・[`hold`]（要求の到着を数えて保留する。[`FakeDrive::wait_arrived`]・
+//! [`FakeDrive::release`] で、キャンセルや並列の数を、時間に頼らずに確かめる）。`drive.rs` の [`fail`](super::drive::fail)（500）・
 //! [`do_then_fail`](super::drive::do_then_fail)（済ませて 500）・[`sleep_ms`](super::drive::sleep_ms)・
 //! [`garbage`](super::drive::garbage)（200 で壊れた本文）も同じ意味で使える。
 #![allow(dead_code)]
@@ -46,7 +48,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use geoframe_export::drive::auth::Credentials;
@@ -172,6 +174,20 @@ pub fn do_then_swap_folder(parent: &[&str], name: &str) -> Value {
     json!({"kind": "do_then_swap_folder", "parent": parent, "name": name})
 }
 
+/// `status`（操作はしない効果。[`too_many_requests`]・[`unauthorized`]・[`rate_limit_403`] など）で答える**とき**に、`parent`（Drive 上の
+/// パス）の下に `name` のファイルを足す（429 や 401 を返してから再送されるまでの間に、オーナーが旧フォルダへファイルを足した、を作る）。
+pub fn status_then_add_file(status_effect: Value, parent: &[&str], name: &str) -> Value {
+    let mut e = status_effect;
+    e["add_file"] = json!({"parent": parent, "name": name});
+    e
+}
+
+/// 操作を済ませたあと、`path`（Drive 上のパス）のフォルダを、`to_parent`（Drive 上のパス。無ければ作る）の下へ**ID を保ったまま**
+/// 動かしてから答える（中身を ID で読んでいる間に、そのフォルダが宛先から動かされた、を作る）。
+pub fn do_then_move_away(path: &[&str], to_parent: &[&str]) -> Value {
+    json!({"kind": "do_then_move_away", "path": path, "to_parent": to_parent})
+}
+
 /// 移動（`move`）を、すぐには反映せずに 500 で答える。Drive 側では、`after_lists` 回の一覧のあとに反映される（応答を失った移動が、
 /// 遅れて効く、を作る。再試行が全部この効果に当たるよう、規則の `times` は `u64::MAX` にする）。
 pub fn late_then_fail(after_lists: u64) -> Value {
@@ -181,6 +197,28 @@ pub fn late_then_fail(after_lists: u64) -> Value {
 /// セッションを捨てて 404 を返す（セッションの喪失）。
 pub fn lose_session() -> Value {
     json!({"kind": "lose_session"})
+}
+
+/// 要求が着いたことを知らせて（[`FakeDrive::wait_arrived`]）、**試験が [`FakeDrive::release`] するまで**、操作も応答も保留する。
+/// 保留をあとから解くと、通常どおり操作して答える（`sleep_ms` と同じ並び。ただし、時間に頼らない）。キャンセルや並列の数を、
+/// 要求が飛んでいる最中の状態として確かめるのに使う。同じ `FakeDrive`（同じプロセスの中）の試験だけ。
+pub fn hold() -> Value {
+    json!({"kind": "hold"})
+}
+
+/// `requests`（calls.log の HTTP の要求。順番どおり）で、効果（`status`）が当たった最初のチャンク（`phase: chunk`）の要求から、
+/// そのあとの最初の位置の問い合わせ（`phase: status`）までの**間隔（ミリ秒）**。要求の到着時刻（`at_ms`）の差なので、処理全体の
+/// 時間ではなく、`Retry-After` や指数の待ちを実際に待ったかを見る。当たった要求・続きの要求が無ければ panic。
+pub fn gap_after_throttled_chunk_ms(requests: &[Value]) -> u64 {
+    let hit = requests
+        .iter()
+        .position(|c| c["op"] == "upload" && c["phase"] == "chunk" && c["injected"] == "status")
+        .expect("効果が当たったチャンクの要求");
+    let next = requests[hit + 1..]
+        .iter()
+        .find(|c| c["op"] == "upload" && c["phase"] == "status")
+        .expect("そのあとの位置の問い合わせ");
+    next["at_ms"].as_u64().expect("at_ms") - requests[hit]["at_ms"].as_u64().expect("at_ms")
 }
 
 // ---- サーバー ----
@@ -208,13 +246,27 @@ struct Inner {
     lifetime_secs: u64,
 }
 
+/// 保留（[`hold`]）の状態。
+struct HoldState {
+    released: bool,
+    /// 操作名ごとの、保留に入った要求の数。
+    arrived: HashMap<String, usize>,
+}
+
 struct Shared {
     dir: PathBuf,
     addr: SocketAddr,
     inner: Mutex<Inner>,
     stop: AtomicBool,
     connections: AtomicUsize,
+    /// 起動した時刻（calls.log の `at_ms` の起点。単調時計）。
+    started: Instant,
+    hold: Mutex<HoldState>,
+    hold_cv: Condvar,
 }
+
+/// 保留から自動で抜ける上限（試験が解き忘れても、スレッドが残り続けない）。
+const HOLD_LIMIT: Duration = Duration::from_secs(120);
 
 pub struct FakeDrive {
     shared: Arc<Shared>,
@@ -245,6 +297,12 @@ impl FakeDrive {
             }),
             stop: AtomicBool::new(false),
             connections: AtomicUsize::new(0),
+            started: Instant::now(),
+            hold: Mutex::new(HoldState {
+                released: false,
+                arrived: HashMap::new(),
+            }),
+            hold_cv: Condvar::new(),
         });
         let s = Arc::clone(&shared);
         let thread = std::thread::spawn(move || {
@@ -271,6 +329,48 @@ impl FakeDrive {
 
     pub fn endpoints(&self) -> Endpoints {
         Endpoints::loopback(&self.url()).expect("loopback")
+    }
+
+    /// `op` の要求が `n` 個以上、保留（[`hold`]）に入るまで待つ。30 秒で来なければ panic（試験の失敗）。
+    pub fn wait_arrived(&self, op: &str, n: usize) {
+        let limit = Instant::now() + Duration::from_secs(30);
+        let mut state = self.shared.hold.lock().unwrap_or_else(|e| e.into_inner());
+        while state.arrived.get(op).copied().unwrap_or(0) < n {
+            let left = limit.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "{op} の要求が {n} 個、保留に入りませんでした（{}）",
+                state.arrived.get(op).copied().unwrap_or(0)
+            );
+            state = self
+                .shared
+                .hold_cv
+                .wait_timeout(state, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    /// 今までに保留に入った `op` の要求の数。
+    pub fn arrived(&self, op: &str) -> usize {
+        self.shared
+            .hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .arrived
+            .get(op)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// 保留中の要求を全部解く（以後の保留は、入らずに通る）。
+    pub fn release(&self) {
+        self.shared
+            .hold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .released = true;
+        self.shared.hold_cv.notify_all();
     }
 
     /// 受けた接続の数。
@@ -344,6 +444,8 @@ impl FakeDrive {
 
 impl Drop for FakeDrive {
     fn drop(&mut self) {
+        // 保留中の要求を残さない
+        self.release();
         self.shared.stop.store(true, Ordering::SeqCst);
         // accept を起こす
         let _ = TcpStream::connect_timeout(&self.shared.addr, Duration::from_secs(1));
@@ -630,6 +732,9 @@ fn serve_connection(shared: &Shared, mut stream: TcpStream) {
             .unwrap_or(0);
         std::thread::sleep(Duration::from_millis(ms));
     }
+    if decision.effect_kind() == "hold" {
+        hold_here(shared, decision.op);
+    }
     // 第 2 段（ロックを持つ）: 操作と応答
     let outcome = execute(shared, &req, decision);
     match outcome {
@@ -646,6 +751,28 @@ fn serve_connection(shared: &Shared, mut stream: TcpStream) {
         Outcome::Drop => {}
     }
     let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+/// 保留に入る（着いたことを数えて知らせ、解かれるまで待つ）。ほかの要求は止めない（ロックは持たない）。
+fn hold_here(shared: &Shared, op: &str) {
+    let mut state = shared.hold.lock().unwrap_or_else(|e| e.into_inner());
+    if state.released {
+        return;
+    }
+    *state.arrived.entry(op.to_owned()).or_insert(0) += 1;
+    shared.hold_cv.notify_all();
+    let limit = Instant::now() + HOLD_LIMIT;
+    while !state.released {
+        let left = limit.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        state = shared
+            .hold_cv
+            .wait_timeout(state, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
 }
 
 // ---- 分類と効果の選択 ----
@@ -832,6 +959,7 @@ fn decide(shared: &Shared, req: &Request) -> Decision {
     };
     let mut line = json!({
         "kind": "http", "op": op, "method": req.method, "route": route, "subject": subject,
+        "at_ms": shared.started.elapsed().as_millis() as u64,
         "authorization": auth,
         "injected": effect.as_ref().map(|e| e["kind"].clone()),
     });
@@ -919,6 +1047,13 @@ fn execute(shared: &Shared, req: &Request, decision: Decision) -> Outcome {
             if let Some(s) = effect["retry_after"].as_u64() {
                 r = r.header("Retry-After", &s.to_string());
             }
+            if let Some(add) = effect.get("add_file") {
+                let parent = path_strings(&add["parent"]);
+                let _guard = lock_inner(shared);
+                let mut d = Drive::load(&shared.dir);
+                d.add_file(&parent, add["name"].as_str().unwrap_or("x"), 3, None);
+                d.save(&shared.dir);
+            }
             Some(Outcome::Respond(r))
         }
         "fail" => Some(Outcome::Respond(Response::error(500, "backendError"))),
@@ -995,6 +1130,18 @@ fn execute(shared: &Shared, req: &Request, decision: Decision) -> Outcome {
         d.mkdir_dup(&parent, effect["name"].as_str().unwrap_or("x"));
         d.save(&shared.dir);
     }
+    if kind == "do_then_move_away" {
+        let path = path_strings(&effect["path"]);
+        let to = path_strings(&effect["to_parent"]);
+        let mut d = Drive::load(&shared.dir);
+        if let Some(id) = d.resolve(&path) {
+            let new_parent = d.mkdir_p(&to);
+            if let Some(n) = d.node_mut_pub(&id) {
+                n.parent = new_parent;
+            }
+        }
+        d.save(&shared.dir);
+    }
     if kind == "do_then_swap_folder" {
         let mut path: Vec<String> = effect["parent"]
             .as_array()
@@ -1018,6 +1165,17 @@ fn execute(shared: &Shared, req: &Request, decision: Decision) -> Outcome {
         "cut_response" => Outcome::Cut(std::mem::replace(&mut response, Response::empty(200))),
         _ => Outcome::Respond(response),
     }
+}
+
+/// JSON の文字列の配列を、パスの要素にする。
+fn path_strings(v: &Value) -> Vec<String> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn fields_of(req: &Request, in_files: bool) -> Option<HashSet<String>> {

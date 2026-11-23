@@ -11,7 +11,7 @@ mod common;
 
 use common::drive::model;
 use common::drive::*;
-use common::fake_drive::{do_then_add_folder, late_then_fail};
+use common::fake_drive::{do_then_add_folder, do_then_move_away, late_then_fail};
 use geoframe_export::drive::{Expected, Layout};
 use geoframe_export::error::ErrorCode;
 use geoframe_export::folder::FolderName;
@@ -1545,4 +1545,133 @@ fn an_old_job_record_without_md5_writes_a_row_without_md5_so_the_next_replace_is
             .managed,
         Some(geoframe_export::drive::Managed::NotManaged)
     );
+}
+
+/// 宛先の中身を ID で一覧している間に、そのフォルダが宛先から動かされた（ID は同じなので、中身は読めて一致する）。公開の確定（記録）と
+/// 旧フォルダの片付けに入る前に、宛先を観察し直して `blocked`（`publish_mismatch`）にする。
+#[test]
+fn a_folder_moved_away_while_recovery_checks_its_contents_is_not_taken_as_published() {
+    // 公開済み（宛先が新しい一式）の仕上げ
+    for replace in [false, true] {
+        let w = world(&format!("moved-away-finish-{replace}"));
+        let old = replace.then(|| w.env.seed_managed(Y, FOLDER, &w.set));
+        let inc = w.put_incoming();
+        if let Some(old) = &old {
+            w.retire(old);
+        }
+        w.publish_incoming(&inc);
+        w.env.fake.add_rule_contains(
+            "list",
+            &format!("yamareco/{FOLDER}"),
+            0,
+            1,
+            do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+        );
+        let r = w.env.remote();
+        let info = w
+            .recovery(&r, None)
+            .run(
+                &progress(Stage::Publishing, old.as_deref(), Some(&inc)),
+                false,
+                &mut Hook::new(&w.env),
+            )
+            .unwrap_err();
+        assert_eq!(
+            info.reason,
+            BlockedReason::PublishMismatch,
+            "replace={replace}"
+        );
+        assert!(info.observed.expect("observed").dest.is_empty());
+        // 公開の記録は書き換えない（置き換えなら、旧フォルダの行のまま）
+        assert_eq!(w.recorded_id(), old, "replace={replace}");
+        assert_eq!(w.env.op_count("trash"), 0, "replace={replace}");
+        assert!(w.env.drive().trashed.is_empty());
+    }
+
+    // 前へ進める（incoming を宛先へ移したあとの照合）
+    let w = world("moved-away-roll-forward");
+    let old = w.env.seed_managed(Y, FOLDER, &w.set);
+    let inc = w.put_incoming();
+    w.retire(&old);
+    w.env.fake.add_rule_contains(
+        "list",
+        &format!("yamareco/{FOLDER}"),
+        0,
+        1,
+        do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+    );
+    let r = w.env.remote();
+    let info = w
+        .recovery(&r, None)
+        .run(
+            &progress(Stage::Retiring, Some(&old), Some(&inc)),
+            false,
+            &mut Hook::new(&w.env),
+        )
+        .unwrap_err();
+    assert_eq!(info.reason, BlockedReason::PublishMismatch);
+    assert_eq!(w.recorded_id(), Some(old.clone()), "旧フォルダの行のまま");
+    assert_eq!(w.env.op_count("trash"), 0);
+    assert!(w.env.drive().trashed.is_empty());
+}
+
+/// 退避した旧フォルダのゴミ箱への移動が 429・401 のとき、待ったあとに、旧フォルダの中身を照合し直してから再送する。待つ間に
+/// ファイルが足されていれば、ゴミ箱へは移さない（復旧でも同じ）。
+#[test]
+fn a_throttled_trash_during_recovery_is_checked_again_before_it_is_resent() {
+    use common::fake_drive::{status_then_add_file, too_many_requests, unauthorized};
+    for (label, effect) in [("429", too_many_requests(0)), ("401", unauthorized())] {
+        // 待つ間に何も起きなければ、再送して済む
+        let w = world(&format!("trash-throttled-recovery-{label}"));
+        let old = w.env.seed_managed(Y, FOLDER, &w.set);
+        let inc = w.put_incoming();
+        w.retire(&old);
+        w.publish_incoming(&inc);
+        w.env.add_rule("trash", 0, 1, effect.clone());
+        let r = w.env.remote_retrying();
+        let res = w
+            .recovery(&r, None)
+            .run(
+                &progress(Stage::Trashing, Some(&old), Some(&inc)),
+                false,
+                &mut Hook::new(&w.env),
+            )
+            .unwrap();
+        let Resolution::Published(p) = res else {
+            panic!("{label}: {res:?}")
+        };
+        assert_eq!(p.old_left_in_replaced, None, "{label}");
+        assert_eq!(w.env.drive().trashed, std::slice::from_ref(&old), "{label}");
+        assert_eq!(w.env.op_count("trash"), 2, "{label}");
+
+        // 待つ間にファイルが足された: ゴミ箱へ移さない
+        let w = world(&format!("trash-throttled-added-recovery-{label}"));
+        let old = w.env.seed_managed(Y, FOLDER, &w.set);
+        let inc = w.put_incoming();
+        w.retire(&old);
+        w.publish_incoming(&inc);
+        let r = w.env.remote_retrying();
+        let retired = w.layout.retired_name().to_owned();
+        w.env.add_rule(
+            "trash",
+            0,
+            1,
+            status_then_add_file(
+                effect,
+                &["geoframe-export-work", "replaced", retired.as_str()],
+                "owner-memo.txt",
+            ),
+        );
+        let info = w
+            .recovery(&r, None)
+            .run(
+                &progress(Stage::Trashing, Some(&old), Some(&inc)),
+                false,
+                &mut Hook::new(&w.env),
+            )
+            .unwrap_err();
+        assert_eq!(info.reason, BlockedReason::RetiredContentChanged, "{label}");
+        assert_eq!(w.env.op_count("trash"), 1, "{label}: 再送していない");
+        assert!(w.env.drive().trashed.is_empty(), "{label}");
+    }
 }

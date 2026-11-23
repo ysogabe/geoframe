@@ -279,13 +279,127 @@ fn ancestors_above_the_parent_must_be_owned_by_root_or_the_file_owner_and_not_wr
             Err(ConfigError::WrongOwner(Target::Directory))
         );
     }
-    // シンボリックリンクを通って来ても、実際のディレクトリを見る
-    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o777)).unwrap();
+    // 途中にシンボリックリンクがあれば、行き先がどんなに安全でも断る（リンクを置いたディレクトリが、検査から外れないように）
+    std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o700)).unwrap();
     let link = dir.path().join("link");
     symlink(&a, &link).unwrap();
     assert_eq!(
         rclone_conf::check_ancestors(&link.join("b"), me),
-        Err(ConfigError::TooPermissive(Target::Directory))
+        Err(ConfigError::WrongKind(Target::Directory))
     );
+    // `..`・`.`・空の要素・相対パスは断る（正規化されたパスだけを、1 段ずつ開く）
+    let dots = format!("{}/../a/b", dir.path().display());
+    for bad in [
+        dots.as_str(),
+        &format!("{}/./a/b", dir.path().display()),
+        &format!("{}//a/b", dir.path().display()),
+        &format!("{}/a/b/", dir.path().display()),
+        "relative/a/b",
+        "",
+    ] {
+        assert_eq!(
+            rclone_conf::check_ancestors(std::path::Path::new(bad), me),
+            Err(ConfigError::WrongKind(Target::Directory)),
+            "{bad:?}"
+        );
+    }
     std::fs::set_permissions(&a, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// root が取り込むときの読み方（根から 1 段ずつ開いたハンドルで、パスの途中も確かめる）を、root でない試験からも通す。
+/// 検査したパスと、開いたファイルの経路が同じ（途中のリンクを解決した先を検査して、リンクを置いたディレクトリが検査から
+/// 外れることがない）。
+#[test]
+fn the_file_is_opened_through_the_checked_chain_and_a_link_in_the_middle_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let me = rclone_conf::effective_uid();
+    // 検査は、根から下の全部のディレクトリを見る。この試験を置く場所の上に、グループが書き込めるディレクトリがあると、どんな読み方でも
+    // 通らない（環境による）。そこで、上の道が検査を通る置き場所を選ぶ（なければ、成功することの確認だけを省く）
+    let candidates = [
+        std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")),
+        std::env::temp_dir(),
+        std::path::PathBuf::from("/tmp"),
+    ];
+    let root = candidates.iter().find_map(|c| {
+        let real = std::fs::canonicalize(c).ok()?;
+        rclone_conf::check_ancestors(&real, me).ok()?;
+        (std::fs::metadata(&real).ok()?.mode() & 0o022 == 0
+            || std::fs::metadata(&real).ok()?.mode() & 0o1000 != 0)
+            .then_some(real)
+    });
+    let (dir, usable) = match root {
+        Some(root) => {
+            let p = root.join(format!("export-import-chain-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&p);
+            std::fs::create_dir_all(&p).unwrap();
+            set_mode(&p, 0o700);
+            (p, true)
+        }
+        None => {
+            eprintln!("上の道が検査を通る置き場所が無いので、成功することの確認は省く");
+            (
+                std::fs::canonicalize(TempDir::new("import-chain").path()).unwrap(),
+                false,
+            )
+        }
+    };
+    // 実際のパス（途中のリンクを含まない形）で渡す
+    let base = dir.clone();
+    let conf = write_config(&base, conf_text("gdrive").as_bytes());
+    // 何も問題がなければ読める
+    if usable {
+        let got = rclone_conf::read_credentials_via_chain(&conf, "gdrive").unwrap();
+        assert_eq!(got.refresh_token, REFRESH);
+    }
+
+    // 途中のディレクトリ（`base` の下の `up`）がシンボリックリンクなら、行き先が同じ中身でも断る
+    let up = base.join("up");
+    symlink(&base, &up).unwrap();
+    let via_link = up.join("rclone").join("rclone.conf");
+    assert!(via_link.exists());
+    assert_eq!(
+        rclone_conf::read_credentials_via_chain(&via_link, "gdrive").unwrap_err(),
+        ConfigError::WrongKind(Target::Directory)
+    );
+    // 親ディレクトリそのものがリンクでも断る
+    let alias = base.join("alias");
+    symlink(base.join("rclone"), &alias).unwrap();
+    assert_eq!(
+        rclone_conf::read_credentials_via_chain(&alias.join("rclone.conf"), "gdrive").unwrap_err(),
+        ConfigError::WrongKind(Target::Directory)
+    );
+    // 途中のディレクトリを、グループが書き込める → 断る（その下の親ディレクトリは 0700 のまま）
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o770)).unwrap();
+    assert_eq!(
+        rclone_conf::read_credentials_via_chain(&conf, "gdrive").unwrap_err(),
+        ConfigError::TooPermissive(Target::Directory)
+    );
+    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if usable {
+        assert!(rclone_conf::read_credentials_via_chain(&conf, "gdrive").is_ok());
+    }
+    // `..` や空の要素を含むパスは断る
+    for bad in [
+        format!("{}/rclone/../rclone/rclone.conf", base.display()),
+        format!("{}//rclone/rclone.conf", base.display()),
+        format!("{}/./rclone/rclone.conf", base.display()),
+    ] {
+        assert_eq!(
+            rclone_conf::read_credentials_via_chain(std::path::Path::new(&bad), "gdrive")
+                .unwrap_err(),
+            ConfigError::WrongKind(Target::Directory),
+            "{bad}"
+        );
+    }
+    // ファイルがシンボリックリンクなら断る（ファイル名の要素も、リンクをたどらない）
+    let real = base.join("rclone").join("rclone.conf");
+    let swapped = base.join("rclone").join("other.conf");
+    symlink(&real, &swapped).unwrap();
+    assert_eq!(
+        rclone_conf::read_credentials_via_chain(&swapped, "gdrive").unwrap_err(),
+        ConfigError::WrongKind(Target::File)
+    );
+    if usable {
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

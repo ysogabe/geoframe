@@ -9,6 +9,7 @@ mod common;
 use std::time::Duration;
 
 use common::drive::*;
+use common::fake_drive as fk;
 use common::site::*;
 use common::{FakeSite, Reply, closed_port_base};
 use geoframe_export::cancel::Cancel;
@@ -1453,15 +1454,17 @@ fn a_cancel_stops_every_upload_thread_before_returning_and_hands_the_record_to_r
     let site = photo_site(DAY, DAY, three_photos());
     let cancel = Cancel::new();
     let svc = cancellable_service(&mut env, &site, &cancel);
-    // 写真を送る要求を、1.5 秒止める（要求の最中には印を見ないので、その要求が終わってから止まる）
-    env.add_rule("upload", 0, 1, sleep_ms(1500));
+    // 写真を送る要求を、解くまで保留する（要求の最中には印を見ないので、その要求が終わってから止まる）。要求が着いたことを確かめて
+    // から印を立て、そのあとで解く（時間に頼らない）
+    env.add_rule("upload", 0, 1, fk::hold());
     let worker = {
         let svc = svc.clone();
         std::thread::spawn(move || run_foreground_retry(&svc, &day()))
     };
-    wait_for_call(&env, "upload", 20);
+    env.fake.wait_arrived("upload", 1);
     let t = std::time::Instant::now();
     cancel.cancel();
+    env.fake.release();
     let rec = worker.join().unwrap().unwrap();
     assert!(
         t.elapsed() < Duration::from_secs(10),
@@ -1600,14 +1603,16 @@ fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
             digests: None,
         }),
     );
-    // ゴミ箱への移動の要求を、1.5 秒止めておく（要求の最中には印を見ない。その要求は、印のあとで Drive に届いてしまう）
-    env.add_rule("trash", 0, 1, sleep_ms(1500));
+    // ゴミ箱への移動の要求を、解くまで保留する（要求の最中には印を見ない。その要求は、印のあとで Drive に届いてしまう）。要求が
+    // 着いたことを確かめてから印を立て、そのあとで解く（時間に頼らない）
+    env.add_rule("trash", 0, 1, fk::hold());
     let worker = {
         let svc = svc.clone();
         std::thread::spawn(move || startup_recovery_retry(&svc))
     };
-    wait_for_call(&env, "trash", 20);
+    env.fake.wait_arrived("trash", 1);
     cancel.cancel();
+    env.fake.release();
     let report = worker.join().unwrap();
     assert_quiet(&env, 300);
     match report {

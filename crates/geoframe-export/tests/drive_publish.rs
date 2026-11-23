@@ -2551,3 +2551,396 @@ fn a_malformed_destination_listing_is_not_read_as_no_destination() {
         env.assert_no_mutations();
     }
 }
+
+// ---- 処理されなかった移動・ゴミ箱は、API の層では再送しない。上位が、待ったあとに照合をやり直してから再送する ----
+
+/// `remote` で動かす（`run` は再試行しない `Env::remote()`）。
+fn run_with(
+    remote: &geoframe_export::remote::Remote,
+    env: &Env,
+    set: &Set,
+    on_exists: OnExists,
+    hook: &mut Hook,
+) -> Result<PublishOutcome, PublishFailure> {
+    let layout = env.layout(Y, FOLDER, JOB_A);
+    publish(remote, &layout, &params(env, set, on_exists), hook)
+}
+
+fn retired_dir() -> [String; 3] {
+    [
+        "geoframe-export-work".to_owned(),
+        "replaced".to_owned(),
+        format!("yamareco-{FOLDER}-{JOB_A}"),
+    ]
+}
+
+#[test]
+fn a_throttled_trash_is_not_resent_when_the_old_folder_gained_a_file_during_the_wait() {
+    // 429・流量制限の 403・401（どれも、処理されていないと分かる）。待つ間に、オーナーが旧フォルダへファイルを足した。
+    // 同じ ID をもう一度ゴミ箱へ移すと、足された分ごと移してしまう。上位が、待ったあとに旧フォルダの中身を照合し直して、止まる
+    for (label, effect) in [
+        ("429", fk::too_many_requests(0)),
+        ("403", fk::rate_limit_403()),
+        ("401", fk::unauthorized()),
+    ] {
+        let env = Env::new(&format!("trash-throttled-added-{label}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = env.seed_managed(Y, FOLDER, &set);
+        let dir = retired_dir();
+        let dir: Vec<&str> = dir.iter().map(String::as_str).collect();
+        env.add_rule(
+            "trash",
+            0,
+            1,
+            fk::status_then_add_file(effect, &dir, "owner-memo.txt"),
+        );
+        let mut hook = Hook::new(&env);
+        let f = failure(run_with(
+            &env.remote_retrying(),
+            &env,
+            &set,
+            OnExists::Replace,
+            &mut hook,
+        ));
+        assert_eq!(f.error.code, ErrorCode::Blocked, "{label}");
+        let info = f.blocked.expect("blocked");
+        assert_eq!(info.reason, BlockedReason::RetiredContentChanged, "{label}");
+        assert_eq!(env.op_count("trash"), 1, "{label}: 再送していない");
+        assert!(env.drive().trashed.is_empty(), "{label}");
+        // 旧フォルダは、足されたファイルごと退避先に残っている
+        let o = info.observed.expect("observed");
+        assert_eq!(o.replaced.len(), 1, "{label}");
+        assert_eq!(o.replaced[0].id, old_id, "{label}");
+    }
+}
+
+#[test]
+fn a_throttled_trash_is_resent_after_the_old_folder_is_checked_again() {
+    for (label, effect) in [
+        ("429", fk::too_many_requests(0)),
+        ("403", fk::rate_limit_403()),
+        ("401", fk::unauthorized()),
+    ] {
+        let env = Env::new(&format!("trash-throttled-{label}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = env.seed_managed(Y, FOLDER, &set);
+        env.add_rule("trash", 0, 1, effect);
+        let mut hook = Hook::new(&env);
+        let p = published(run_with(
+            &env.remote_retrying(),
+            &env,
+            &set,
+            OnExists::Replace,
+            &mut hook,
+        ));
+        assert_eq!(p.old_left_in_replaced, None, "{label}");
+        assert_eq!(env.drive().trashed, [old_id], "{label}");
+        assert_eq!(env.op_count("trash"), 2, "{label}: 1 回だけ再送した");
+        // 2 回目の前に、`replaced/` の一覧と旧 manifest の読み出し（中身の照合）をやり直している
+        let ops = env.ops();
+        let trashes: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| *o == "trash")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            ops[trashes[0]..trashes[1]].iter().any(|o| o == "read"),
+            "{label}: {ops:?}"
+        );
+    }
+}
+
+#[test]
+fn a_throttle_that_never_ends_stops_at_the_resend_limit_and_leaves_the_old_folder_in_replaced() {
+    let env = Env::new("trash-throttled-forever");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let old_id = env.seed_managed(Y, FOLDER, &set);
+    env.add_rule("trash", 0, u64::MAX, fk::too_many_requests(0));
+    let mut hook = Hook::new(&env);
+    let p = published(run_with(
+        &env.remote_retrying(),
+        &env,
+        &set,
+        OnExists::Replace,
+        &mut hook,
+    ));
+    // 新しい一式は公開済み。旧フォルダは退避先に残る（ゴミ箱へは移せなかった）
+    assert_eq!(p.old_left_in_replaced.as_deref(), Some(old_id.as_str()));
+    assert!(p.recorded);
+    assert!(env.drive().trashed.is_empty());
+    // 最初の 1 回 + 再送の上限（3）
+    assert_eq!(env.op_count("trash"), 4);
+}
+
+#[test]
+fn a_throttled_publish_move_is_resent_after_looking_at_the_state_and_checking_incoming_again() {
+    for (label, effect) in [
+        ("429", fk::too_many_requests(0)),
+        ("403", fk::rate_limit_403()),
+        ("401", fk::unauthorized()),
+    ] {
+        let env = Env::new(&format!("move-throttled-{label}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        env.add_rule("move", 0, 1, effect);
+        let mut hook = Hook::new(&env);
+        let p = published(run_with(
+            &env.remote_retrying(),
+            &env,
+            &set,
+            OnExists::Error,
+            &mut hook,
+        ));
+        assert_eq!(
+            dest_id(&env).as_deref(),
+            Some(p.folder_id.as_str()),
+            "{label}"
+        );
+        assert_eq!(env.op_count("move"), 2, "{label}");
+        // 2 回の移動の間に、`get`（もう移っていないか）と `incoming/` の一覧をやり直している
+        let ops = env.ops();
+        let moves: Vec<usize> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| *o == "move")
+            .map(|(i, _)| i)
+            .collect();
+        let between = &ops[moves[0]..moves[1]];
+        assert!(between.iter().any(|o| o == "get"), "{label}: {ops:?}");
+        assert!(between.iter().any(|o| o == "list"), "{label}: {ops:?}");
+    }
+}
+
+#[test]
+fn a_file_added_during_a_throttled_retire_is_caught_before_the_trash() {
+    // 退避の移動が 429。待つ間にオーナーが旧フォルダ（宛先）へファイルを足した。再送で旧フォルダごと退避先へ移るが、そのあとの
+    // ゴミ箱へ移す前の照合（旧 manifest の一式との一致）で止まり、ゴミ箱へは移さない
+    let env = Env::new("retire-throttled-added");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let old_id = env.seed_managed(Y, FOLDER, &set);
+    env.add_rule(
+        "move",
+        0,
+        1,
+        fk::status_then_add_file(
+            fk::too_many_requests(0),
+            &["yamareco", FOLDER],
+            "owner-memo.txt",
+        ),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run_with(
+        &env.remote_retrying(),
+        &env,
+        &set,
+        OnExists::Replace,
+        &mut hook,
+    ));
+    assert_eq!(f.error.code, ErrorCode::Blocked);
+    assert_eq!(
+        f.blocked.expect("blocked").reason,
+        BlockedReason::RetiredContentChanged
+    );
+    assert_eq!(env.op_count("trash"), 0);
+    assert!(env.drive().trashed.is_empty());
+    // 旧フォルダ（メモごと）は退避先に残っている
+    let d = env.drive();
+    let dir = retired_dir();
+    assert_eq!(
+        d.resolve(&dir.iter().map(String::as_str).collect::<Vec<_>>())
+            .as_deref(),
+        Some(old_id.as_str())
+    );
+}
+
+#[test]
+fn a_throttled_incoming_cleanup_is_resent_after_listing_incoming_again() {
+    let env = Env::new("cleanup-throttled");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    let mut hook = Hook::new(&env).mutate_after(Stage::Verifying, move || {
+        let mut d = model::Drive::load(&fake);
+        d.add_file(
+            &["geoframe-export-work", "incoming", JOB_A],
+            "extra.jpg",
+            1,
+            None,
+        );
+        d.save(&fake);
+    });
+    env.add_rule("trash", 0, 1, fk::too_many_requests(0));
+    let f = failure(run_with(
+        &env.remote_retrying(),
+        &env,
+        &set,
+        OnExists::Error,
+        &mut hook,
+    ));
+    assert_eq!(f.error.code, ErrorCode::VerifyMismatch);
+    assert!(!f.leftover_incoming);
+    assert_eq!(env.drive().trashed.len(), 1);
+    assert_eq!(env.op_count("trash"), 2);
+}
+
+// ---- 公開のあとの照合の間に、フォルダが宛先から動かされた ----
+
+#[test]
+fn a_folder_moved_away_while_its_contents_are_checked_is_not_taken_as_published() {
+    // 宛先のフォルダの中身を ID で一覧している間に、そのフォルダが宛先から動かされた（ID は同じなので、中身は読めて一致する）。
+    // 公開の確定（記録）と旧フォルダの片付けに入る前に、宛先を観察し直して、`blocked` にする
+    for replace in [false, true] {
+        let env = Env::new(&format!("moved-away-{replace}"));
+        let set = env.make_set("s", Y, FOLDER, PHOTOS);
+        let old_id = replace.then(|| env.seed_managed(Y, FOLDER, &set));
+        let before = std::fs::read(record_path(&env)).ok();
+        // 宛先のフォルダの一覧: 置き換えでは、最初の 2 回（管理の確認）は新しい一式より前の旧フォルダの一覧。3 回目が公開の直後の照合
+        let skip = if replace { 2 } else { 0 };
+        env.fake.add_rule_contains(
+            "list",
+            &format!("yamareco/{FOLDER}"),
+            skip,
+            1,
+            fk::do_then_move_away(&["yamareco", FOLDER], &["elsewhere"]),
+        );
+        let on_exists = if replace {
+            OnExists::Replace
+        } else {
+            OnExists::Error
+        };
+        let mut hook = Hook::new(&env);
+        let f = failure(run_with(&env.remote(), &env, &set, on_exists, &mut hook));
+        assert_eq!(f.error.code, ErrorCode::Blocked, "replace={replace}");
+        let info = f.blocked.expect("blocked");
+        assert_eq!(
+            info.reason,
+            BlockedReason::PublishMismatch,
+            "replace={replace}"
+        );
+        assert!(info.observed.expect("observed").dest.is_empty());
+        // 公開の記録は書き換えない・旧フォルダはゴミ箱へ移さない
+        assert_eq!(
+            std::fs::read(record_path(&env)).ok(),
+            before,
+            "replace={replace}"
+        );
+        assert_eq!(env.op_count("trash"), 0, "replace={replace}");
+        assert!(env.drive().trashed.is_empty(), "replace={replace}");
+        assert!(dest_id(&env).is_none(), "replace={replace}");
+        if let Some(old) = old_id {
+            // 旧フォルダは退避先にそのまま残る
+            let dir = retired_dir();
+            let d = env.drive();
+            assert_eq!(
+                d.resolve(&dir.iter().map(String::as_str).collect::<Vec<_>>())
+                    .as_deref(),
+                Some(old.as_str())
+            );
+        }
+    }
+}
+
+// ---- 木をたどる途中の 404 は、「無い」とは読まない ----
+
+#[test]
+fn a_404_in_the_middle_of_a_tree_walk_is_a_failed_query_not_a_verify_mismatch() {
+    // 日付のサブフォルダがある一式。検証で incoming/<job_id> の木をたどる途中、サブフォルダの一覧が 404 になる。親の一覧では
+    // incoming の ID が見えているので、「無い」とは言えない: `drive_unavailable`（`verify_mismatch` ではない）
+    let env = Env::new("tree-404-middle");
+    let folder = "2030-03-10-11";
+    let files = [
+        ("2030-03-10/090000_1.jpg", 100),
+        ("2030-03-11/090100_2.jpg", 200),
+    ];
+    let set = env.make_set("p", Y, folder, &files);
+    env.fake.add_rule_contains(
+        "list",
+        &format!("incoming/{JOB_A}/2030-03-11"),
+        0,
+        u64::MAX,
+        fk::status(404),
+    );
+    let layout = env.layout(Y, folder, JOB_A);
+    let mut hook = Hook::new(&env);
+    let f = failure(publish(
+        &env.remote(),
+        &layout,
+        &params(&env, &set, OnExists::Error),
+        &mut hook,
+    ));
+    assert_eq!(f.error.code, ErrorCode::DriveUnavailable);
+    assert_ne!(f.error.code, ErrorCode::VerifyMismatch);
+    assert!(dest_id(&env).is_none());
+    assert_eq!(env.op_count("move"), 0);
+}
+
+#[test]
+fn a_404_on_the_recorded_folder_is_a_mismatch_only_when_the_parent_listing_shows_it_is_gone() {
+    // 記録した incoming のフォルダの一覧が 404 になる。親（incoming/）の一覧に、その ID がまだ見えている → 無いとは言えない
+    let env = Env::new("tree-404-root-present");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    env.fake.add_rule_contains(
+        "list",
+        &format!("incoming/{JOB_A}"),
+        0,
+        u64::MAX,
+        fk::status(404),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::DriveUnavailable);
+
+    // 親の一覧が成功し、その ID が見えない（入れ替わった）→ 一式と一致しない（verify_mismatch。入れ替わった incoming は消さずに知らせる）
+    let env = Env::new("tree-404-root-gone");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    let fake = env.fake_dir.clone();
+    let mut hook = Hook::new(&env).mutate_after(Stage::Verifying, move || {
+        let mut d = model::Drive::load(&fake);
+        if let Some(inc) = d.resolve(&["geoframe-export-work", "incoming", JOB_A]) {
+            d.purge(&inc, false);
+            d.mkdir_p(&["geoframe-export-work", "incoming", JOB_A]);
+            d.save(&fake);
+        }
+    });
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    assert_eq!(f.error.code, ErrorCode::VerifyMismatch);
+    assert!(
+        env.drive().trashed.is_empty(),
+        "入れ替わった incoming は消さない"
+    );
+    assert!(f.leftover_incoming);
+
+    // 親の一覧そのものが失敗する → 照会の失敗（「無い」と読まない）
+    let env = Env::new("tree-404-parent-fails");
+    let set = env.make_set("s", Y, FOLDER, PHOTOS);
+    env.fake.add_rule_contains(
+        "list",
+        &format!("incoming/{JOB_A}"),
+        0,
+        u64::MAX,
+        fk::status(404),
+    );
+    // 親（`incoming/`）の一覧は、検証の 404 のあとの 1 回を 500 にする（`geoframe-export-work/incoming` を含む一覧は、順に
+    // `incoming/` の作成のあと・検証の 404（`incoming/<job_id>`）・その直後の親の一覧。3 番目）
+    env.fake.add_rule_contains(
+        "list",
+        "geoframe-export-work/incoming",
+        2,
+        1,
+        fk::status(500),
+    );
+    let mut hook = Hook::new(&env);
+    let f = failure(run(&env, &set, OnExists::Error, &mut hook));
+    let injected: Vec<String> = env
+        .http_calls()
+        .iter()
+        .filter(|c| c["op"] == "list" && c["injected"] == "status")
+        .map(|c| c["subject"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        injected.len(),
+        2,
+        "404 と 500 の両方が当たった: {injected:?}"
+    );
+    assert!(injected[1].ends_with("/incoming"), "{injected:?}");
+    assert_eq!(f.error.code, ErrorCode::DriveUnavailable);
+}
