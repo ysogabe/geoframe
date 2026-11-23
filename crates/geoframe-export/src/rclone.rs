@@ -1,4 +1,7 @@
-//! rclone の起動（design.md 4.2「rclone の呼び方」、8 章「子プロセス」）。
+//! rclone の起動（design.md 4.2「rclone の呼び方」、8 章「子プロセス」）。**rclone 固有のものだけ**を持つ（引数の組み立て・
+//! 子プロセス・標準エラーの伏せ字・`lsjson` の出力の読み取り）。呼び出し側は、このモジュールの [`Rclone`] を直接使わず、
+//! 中立の入口 [`crate::remote::Remote`]（今の中身は [`Rclone`]）を使う。一覧の 1 項目・検査済みの場所・操作の失敗の型は
+//! [`crate::remote`]（実装に依らない）。
 //!
 //! このモジュールは、rclone を**1 回起動して結果を受け取る**ところだけを持つ。何を・どの順で呼ぶか（宛先の状態、公開、
 //! 復旧）は [`crate::drive`]・[`crate::publish`]。
@@ -11,10 +14,10 @@
 //! - `--drive-client-id`・`--drive-client-secret`・`--drive-token` など、**資格情報を上書きする引数は渡さない**
 //!   （専用の client_id の検査［`crate::rclone_conf`］をすり抜けないため）。引数はこのモジュールの関数が固定の部品から組み立て、
 //!   起動の直前に [`is_forbidden_flag`] でもう一度確かめる。`-vv`・`--dump*` も同じ検査で断る。
-//! - シェルを介さず、引数の配列で渡す。位置の引数の前に `--` を置く。Drive の場所は [`RemoteLoc`]（検査済みの部品だけで作る）。
+//! - シェルを介さず、引数の配列で渡す。位置の引数の前に `--` を置く。Drive の場所は [`RemoteLoc`]（[`crate::remote`]。検査済みの部品だけで作る）。
 //! - 標準入力は閉じる。子プロセスは自分のプロセスグループに入れ、期限を過ぎたらグループごと kill する。
 //! - キャンセルの印（[`crate::cancel::Cancel`]。SIGINT・SIGTERM）が立ったら、起動の前なら起動せず、実行中なら期限切れと同じく
-//!   グループごと kill して `wait` し、出力のスレッドを `join` してから [`RemoteError::Cancelled`] を返す。呼び出し側は、この
+//!   グループごと kill して `wait` し、出力のスレッドを `join` してから [`RemoteError::Cancelled`]（[`crate::remote`]）を返す。呼び出し側は、この
 //!   関数が返ってから実行枠を手放す（子が残ったまま枠だけ外れて、次の復旧が進行中の `copy`・`moveto` と競合しないため）。
 //!   パニックで巻き戻るときも、`Drop` で同じ kill と `wait` をする（[`ChildGuard`]）。
 //! - 親が異常終了したとき（SIGKILL・OOM など、印を見られない終わり方）の補助として、子に `PR_SET_PDEATHSIG`（SIGKILL）を付ける。
@@ -23,7 +26,7 @@
 //!   外れるのとのあいだに隙がある。排他は、印を見て kill → `wait` → 枠を手放す、の順で守る。
 //! - 標準出力・標準エラーは別のスレッドで読み続ける（パイプが詰まって止まらないように）。標準出力には上限を掛ける。
 //! - 標準エラーは、`token`・`Bearer`・`access_token` などを含む行を伏せ字にしてから、最後の数行だけをログ（tracing）に残す
-//!   （[`redact_stderr`]）。API の結果・エラーの説明には rclone の出力を載せない（[`ExportError`] の説明は固定の文字列）。
+//!   （[`redact_stderr`]）。API の結果・エラーの説明には rclone の出力を載せない（[`crate::error::ExportError`] の説明は固定の文字列）。
 
 use std::collections::VecDeque;
 use std::ffi::OsString;

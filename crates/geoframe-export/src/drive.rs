@@ -1,4 +1,4 @@
-//! Drive への照会と、1 回ごとの操作（design.md 4.2）。`rclone` を呼ぶ側で、判断（何をどの順で呼ぶか）は [`crate::publish`]。
+//! Drive への照会と、1 回ごとの操作（design.md 4.2）。中立の入口（[`crate::remote::Remote`]。今の中身は rclone）で Drive を操作する側で、判断（何をどの順で呼ぶか）は [`crate::publish`]。
 //!
 //! ## 照会の約束（どれも「Drive が答えなかった」を「無い」と取り違えない）
 //!

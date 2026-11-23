@@ -1,7 +1,8 @@
 //! note 記事用の写真書き出し（`geoframe-export`。docs/note-photo-export/design.md）。
 //!
 //! 写真サービス（`geoframe serve`）とは別のプロセスで、`geoframe` crate には依存しない。つながりは HTTP
-//! （一覧 API `GET /api/admin/export/photos` と `/derivatives/*`）だけ。Drive へは rclone で送る。
+//! （一覧 API `GET /api/admin/export/photos` と `/derivatives/*`）だけ。Drive へは、今は rclone（[`rclone`]）を子プロセスで呼んで送る。
+//! Drive を操作する側（[`drive`]・[`publish`]・[`flow`]・[`recover`]）は、中立の入口（[`remote`]）だけを使い、rclone を知らない。
 //!
 //! モジュールと、後のタスクが乗る場所:
 //!
@@ -18,7 +19,7 @@
 //! | [`listing`] | 一覧 API の値の検査（4.4）と候補の選び方 | T2 |
 //! | [`cli`]・[`app`] | 引数の解釈と、コマンドの振り分け | T2 |
 //! | [`image`]・[`jpeg`]・[`measure`]・[`staging`]・[`manifest`] | 画像の取得と書き出しの入口、JPEG の区画の検査とデコード、明るさ・シャープネス、作業領域、manifest | T3 |
-//! | [`rclone`]・[`drive`]・[`publish`]・[`recovery`]・[`published`]・[`jsonfile`]・[`jobid`] | rclone の起動、Drive への照会と操作・管理しているフォルダの判定、incoming → 検証 → 公開・退避・復旧の実行、復旧の表（純粋な関数）、公開の記録、アトミックな JSON の書き方、ジョブ ID | T4 |
+//! | [`remote`]・[`rclone`]・[`drive`]・[`publish`]・[`recovery`]・[`published`]・[`jsonfile`]・[`jobid`] | Drive の操作の入口と中立の型（`Remote`・`Entry`・`RemoteLoc`・`RemoteError`・Drive の ID／MD5／相対パスの検査）、その今の実装としての rclone の起動（引数の組み立て・子プロセス・標準エラーの伏せ字・`lsjson` の読み取り）、Drive への照会と操作・管理しているフォルダの判定、incoming → 検証 → 公開・退避・復旧の実行、復旧の表（純粋な関数）、公開の記録、アトミックな JSON の書き方、ジョブ ID | T4 |
 //! | [`sys`]・[`cancel`]・[`lock`]・[`jobs`]・[`flow`]・[`service`]・[`run`]・[`recover`] | OS への問い合わせ（flock・現地時刻・実効ユーザー ID）、キャンセルの印（SIGINT・SIGTERM）、実行枠、ジョブの記録と状態ディレクトリの配置、ジョブの流れ・復旧・`dry_run`、受付と照会の層（T6 が使う）、`run`・`recover` | T5 |
 //! | [`serve`] | HTTP の入口（トークン・送信元の制限・本文の検査・接続の上限・ジョブ API・シグナルでの終了） | T6 |
 

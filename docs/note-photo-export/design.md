@@ -141,6 +141,7 @@ U1 は「処理が重くならないのであれば全写真」という条件�
 - このリポジトリのワークスペースに 2 つ目の crate `crates/geoframe-export` を足す。バイナリは `geoframe-export`。
 - `geoframe` crate（ライブラリ）には依存しない。つながりは HTTP だけにして、写真サービスの内部の型の変更に引きずられないようにする。依存はワークスペースで既に使っている crate（`axum`/`tokio`、`ureq`、`serde`/`serde_json`、`zune-jpeg`、縮小用の crate）の同じ版に限る。
 - 既存の `geoframe` crate の 2 つ目のバイナリにする案もあるが、写真サービスの依存（SQLite など）を引き込み、ビルドと配布の単位が分けにくくなるので、crate を分ける。
+- `crates/geoframe-export` の中は、Drive の操作を `src/remote.rs`（中立の入口 `Remote` と、一覧の 1 項目 `Entry`・検査済みの場所 `RemoteLoc`・操作の失敗 `RemoteError`・Drive の ID／MD5／相対パスの検査）に集める。今の `Remote` の中身は `src/rclone.rs`（rclone の引数の組み立て・子プロセス・標準エラーの伏せ字・`lsjson` の読み取り）を包むだけで、`drive.rs`・`publish.rs`・`flow.rs`・`recover.rs` は rclone を直接は知らない。操作の名前は `list`・`read`・`create_folder`・`upload`・`move_to`・`trash`（rclone のコマンドでは `lsjson`・`cat`・`mkdir`・`copy`・`moveto`・`purge`）。実装を差し替える trait や実行時の切り替えは持たない。
 - 他の小サービスはリポジトリの外にあるものもある。これは GEOFRAME のデータの形（一覧 API の形、派生画像）に依存するので、その試験と同じリポジトリに置く。
 - 写真サービス側の一覧 API（A′）は `crates/geoframe` に新しいモジュール（例: `src/admin_export.rs`）として足す。書き出し側は、この API の応答の型を自分の crate に持ち、写真サービス側の試験で出した応答の例（fixture）を両方の試験で使って形を固定する。
 

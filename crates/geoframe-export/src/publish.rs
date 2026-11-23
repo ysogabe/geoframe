@@ -5,7 +5,7 @@
 //! - [`publish`]: 宛先の状態を調べ（4.1 の手順 8）、`incoming` → 検証 → 公開（4.2 の手順 1〜6）まで進める。
 //! - [`Recovery`]: 記録した段階と ID から、復旧の表（[`crate::recovery`]）を実行する。公開の途中の失敗では [`publish`] が
 //!   その場で使い、起動時（T5）は記録から作って使う。`recover` コマンドの表示は [`Recovery::explain`]（Drive を変えない）。
-//! - [`dry_run`]: 宛先の状態と、管理しているフォルダか。呼ぶ rclone のコマンドは `lsjson` と `cat` だけ。
+//! - [`dry_run`]: 宛先の状態と、管理しているフォルダか。呼ぶ操作は `list` と `read` だけ（rclone では `lsjson` と `cat`）。
 //!
 //! ## 呼び出し側（T5）との約束
 //!
