@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "job_id": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+  "status": "conflict",
+  "request": {
+    "from": "2030-03-10",
+    "to": "2030-03-10",
+    "destination": "yamareco",
+    "on_exists": "error",
+    "request_id": null
+  },
+  "started_at": "2030-03-10T12:00:00+09:00",
+  "started_ns": 1899342000000000000,
+  "finished_at": "2030-03-10T12:00:30+09:00",
+  "progress": null,
+  "summary": {
+    "folder": "2030-03-10",
+    "catalog_count": 3,
+    "count": 3,
+    "bytes": 2878,
+    "excluded": [],
+    "undated_in_catalog": 0,
+    "invalid_time_in_catalog": 0
+  },
+  "result": {
+    "folder": "2030-03-10",
+    "catalog_count": 3,
+    "count": 0,
+    "uploaded": false,
+    "replaced": false,
+    "bytes": 0,
+    "excluded": [],
+    "undated_in_catalog": 0,
+    "invalid_time_in_catalog": 0,
+    "existing_files": 2,
+    "conflict": "exists"
+  },
+  "error": null,
+  "blocked": null,
+  "resolved_at": null,
+  "notes": []
+}

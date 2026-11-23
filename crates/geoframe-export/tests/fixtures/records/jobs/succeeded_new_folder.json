@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "job_id": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+  "status": "succeeded",
+  "request": {
+    "from": "2030-03-10",
+    "to": "2030-03-10",
+    "destination": "yamareco",
+    "on_exists": "error",
+    "request_id": "req-1"
+  },
+  "started_at": "2030-03-10T12:00:00+09:00",
+  "started_ns": 1899342000000000000,
+  "finished_at": "2030-03-10T12:00:30+09:00",
+  "progress": {
+    "stage": "publishing",
+    "old_id": null,
+    "incoming_id": "fid0005",
+    "digests": [
+      {
+        "path": "090000_1.jpg",
+        "md5": "70f8b06a6a3244eb83c02c0795d9993b"
+      },
+      {
+        "path": "090100_2.jpg",
+        "md5": "9bda466450f6e1cddb8514d60821c3cb"
+      },
+      {
+        "path": "103000_3.jpg",
+        "md5": "c0fb3f4ee08d4f56eb49ac3c0e875f0f"
+      },
+      {
+        "path": "manifest.json",
+        "md5": "38ef9e3ea14e816695e7d46e34066ede"
+      }
+    ]
+  },
+  "summary": {
+    "folder": "2030-03-10",
+    "catalog_count": 3,
+    "count": 3,
+    "bytes": 2878,
+    "excluded": [],
+    "undated_in_catalog": 0,
+    "invalid_time_in_catalog": 0
+  },
+  "result": {
+    "folder": "2030-03-10",
+    "catalog_count": 3,
+    "count": 3,
+    "uploaded": true,
+    "replaced": false,
+    "bytes": 2878,
+    "excluded": [],
+    "undated_in_catalog": 0,
+    "invalid_time_in_catalog": 0,
+    "existing_files": 0
+  },
+  "error": null,
+  "blocked": null,
+  "resolved_at": null,
+  "notes": []
+}

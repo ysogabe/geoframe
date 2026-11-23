@@ -1,0 +1,26 @@
+{
+  "version": 1,
+  "job_id": "a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9",
+  "status": "running",
+  "request": {
+    "from": "2030-03-10",
+    "to": "2030-03-10",
+    "destination": "yamareco",
+    "on_exists": "error",
+    "request_id": null
+  },
+  "started_at": "2030-03-10T12:00:00+09:00",
+  "started_ns": 1899342000000000000,
+  "finished_at": null,
+  "progress": {
+    "stage": "trashing",
+    "old_id": "fid0003",
+    "incoming_id": "fid0010"
+  },
+  "summary": null,
+  "result": null,
+  "error": null,
+  "blocked": null,
+  "resolved_at": null,
+  "notes": []
+}

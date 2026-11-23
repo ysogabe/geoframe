@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "job_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "status": "failed",
+  "request": {
+    "from": "2030-03-10",
+    "to": "2030-03-10",
+    "destination": "yamareco",
+    "on_exists": "error",
+    "request_id": null
+  },
+  "started_at": "2030-03-10T12:00:00+09:00",
+  "started_ns": 1899342000000000000,
+  "finished_at": "2030-03-10T12:00:30+09:00",
+  "progress": null,
+  "summary": null,
+  "result": null,
+  "error": {
+    "code": "drive_auth_invalid"
+  },
+  "blocked": null,
+  "resolved_at": null,
+  "notes": []
+}
