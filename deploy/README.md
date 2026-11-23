@@ -465,6 +465,8 @@ sudo install -m 0644 /dev/null /etc/default/geoframe # 出力に影響する設�
 
 ## 8. note 記事用の写真書き出し（geoframe-export）の配置
 
+> **注意（この節の手順は、rclone 版のままです）**: バイナリは Drive API を直接呼ぶ版になり、`--rclone`・`--rclone-config`・`--remote-*`・`--work-root`は無くなりました（代わりに`--drive-credentials`・`--folder-yamareco`・`--folder-travel-journal`・`--work-folder`）。unit（[`geoframe-export.service`](geoframe-export.service)）と包み（[`geoframe-export-admin.sh`](geoframe-export-admin.sh)）はその版の引数に直してあり、資格情報は`/etc/geoframe-export/drive-credentials.json`（`geoframe-export import-credentials`で rclone の設定から作る）、フォルダの ID は`/etc/default/geoframe-export`に置きます。この節の rclone の設定・`--work-root`・検証用の rclone.conf の写しの手順は、3 段目で書き直します（それまで、この節の手順では配置できません）。設計は[drive-api.md](../docs/note-photo-export/drive-api.md)です。
+
 日付（または期間）の写真を、表示用 JPEG と`manifest.json`にして Google Drive の`yamareco/`・`travel-journal/`へ書き出す、別プロセスのサービスです
 （`geoframe-export`。写真サービスとは HTTP だけでつながります）。仕様は[PRD](../docs/note-photo-export/prd.md)、設計は[design.md](../docs/note-photo-export/design.md)にあります。
 この節は**配置の手順**で、配置は PRD・設計の「配置後」の確認（§8.8）まで、ユーザーの立ち会いのもとで行います。

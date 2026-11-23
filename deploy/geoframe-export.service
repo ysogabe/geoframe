@@ -28,59 +28,72 @@ StartLimitBurst=10
 [Service]
 Type=simple
 # 専用ユーザー（README の手順で作る。ログインシェルもホームも持たない）。写真サービスの geoframe ユーザーとも、
-# オーナーのユーザーとも別にする。Drive 全体の権限の rclone の設定は、このユーザーだけが読める（設計 8 章「資格情報」）。
+# オーナーのユーザーとも別にする。Drive の資格情報は、root 所有のファイル（下の LoadCredential=）から、このユーザーだけが読める
+# 写しとして渡される（設計 8 章「資格情報」、docs/note-photo-export/drive-api.md 1・2 章）。
 User=geoframe-export
 
 # --- 状態ディレクトリ ---
 # /var/lib/geoframe-export を User= の持ち物・0700 で用意する。書けるのはここだけ（下の ProtectSystem=strict）。
 #   staging/ … 作業領域（公開の前に一式を作る。成功・失敗にかかわらず消す）
 #   jobs/ … ジョブの記録    published/ … 公開の記録    export.lock … 実行枠（flock。CLI と共通）
-#   rclone/ … rclone の設定（rclone.conf。専用の client_id で認可したもの）と、rclone の HOME・キャッシュ
-# 注意: rclone/rclone.conf が無い（または client_id・client_secret が空）と起動しない（終了コード 2）。そのため、初回の起動の前に
-# README の手順で rclone/ と設定を用意する。
+# Drive の資格情報は状態ディレクトリに置かない（バイナリは資格情報のファイルを書かない）。
 StateDirectory=geoframe-export
 StateDirectoryMode=0700
 
+# --- 資格情報 ---
+# /etc/geoframe-export/drive-credentials.json（0600 root:root。client_id・client_secret・refresh_token の 3 つのキーだけの JSON。
+# `geoframe-export import-credentials` で作る）を、サービスの起動のたびに、サービスのユーザーだけが読める写し（$CREDENTIALS_DIRECTORY の
+# drive-credentials）にして渡す。ExecStart では `%d`（資格情報のディレクトリ）で指す。ファイルが無ければ起動しない。
+LoadCredential=drive-credentials:/etc/geoframe-export/drive-credentials.json
+
 # --- 設定 ---
-# /etc/default/geoframe-export（0600 root:root。値は文書に書かない。無ければ起動しない）に、次の 3 つの変数を置く。
+# /etc/default/geoframe-export（0600 root:root。値は文書に書かない。無ければ起動しない）に、次の変数を置く。
 #   GEOFRAME_EXPORT_LISTEN      tailnet の IP とポート（例: 192.0.2.1:8090。実際は tailnet の帯 100.64.0.0/10 の IP）
 #   GEOFRAME_EXPORT_TOKEN_FILE  Bearer トークンのファイルのパス（User= の持ち物・0600・32 バイト以上）
 #   GEOFRAME_EXPORT_ALLOW_ARGS  許可する送信元。"--allow 192.0.2.10 --allow 192.0.2.11" の形（呼び出し側とこのホスト自身）
+#   GEOFRAME_EXPORT_FOLDER_YAMARECO・GEOFRAME_EXPORT_FOLDER_TRAVEL_JOURNAL  宛先 yamareco・travel-journal の親フォルダの Drive ID
+#   GEOFRAME_EXPORT_WORK_FOLDER 作業用のフォルダ（incoming/・replaced/ を中に作る）の Drive ID
+#   （検証用の入口〔包みの --verify〕は、同じファイルの GEOFRAME_EXPORT_VERIFY_FOLDER_YAMARECO・…_VERIFY_FOLDER_TRAVEL_JOURNAL・
+#    …_VERIFY_WORK_FOLDER を使う。このサービスは読まない）
 # drop-in（/etc/systemd/system/geoframe-export.service.d/）で ExecStart を上書きする形にはしない:
 # geoframe-export-admin.sh（CLI の包み）が、この unit と同じ設定の引数を使う必要があるため。
 #
 # ExecStart の展開（systemd.service(5)）:
 #   ${VAR} … その値 1 つが 1 つの引数になる（空白を含んでもよい）。変数が空・未設定でも、空の引数が 1 つ残る。
-#            すると serve の引数の検査（--listen・--token-file）が断り、終了コード 2 になる
+#            すると serve の引数の検査（--listen・--token-file・--folder-*・--work-folder）が断り、終了コード 2 になる
 #            （2 は下の RestartPreventExitStatus=2 で、再起動ループにしない）。
 #   $VAR   … 値を空白で分けて、0 個以上の引数にする。空・未設定なら 0 個。--allow が 1 つも無ければ、serve が断って終了コード 2。
-# 下の 4 つ（--rclone・--rclone-config・--state-dir・--feed-base）は雛形に固定で書く。変えるときは、
-# geoframe-export-admin.sh の同じ引数も同じ値にそろえる（deploy/geoframe-export-admin-test.sh が、この 2 つの食い違いを検査する）。
-# --remote-yamareco・--remote-travel-journal・--work-root・--rclone-*-timeout は既定のまま（書き出し先は今の
-# yamareco/・travel-journal/、作業用のフォルダは gdrive:geoframe-export-work。設計 3.5・4.2）。
+# `--drive-credentials %d/drive-credentials`・`--state-dir`・`--feed-base` は雛形に固定で書く。変えるときは、
+# geoframe-export-admin.sh の同じ引数・同じ LoadCredential= も同じ値にそろえる（deploy/geoframe-export-admin-test.sh が、この 2 つの
+# 食い違いを検査する）。`--drive-endpoint`（偽の Drive へ向ける、試験専用の引数）はここにも包みにも書かない（試験が、どこにも出ないことを
+# 検査する）。`--drive-upload-timeout`・`--drive-timeout` は既定のまま（45 分・5 分。設計 3.5・4.2）。
 EnvironmentFile=/etc/default/geoframe-export
 ExecStart=/usr/local/bin/geoframe-export serve \
     --listen ${GEOFRAME_EXPORT_LISTEN} \
     --token-file ${GEOFRAME_EXPORT_TOKEN_FILE} \
     $GEOFRAME_EXPORT_ALLOW_ARGS \
-    --rclone /usr/local/bin/rclone \
-    --rclone-config /var/lib/geoframe-export/rclone/rclone.conf \
+    --drive-credentials %d/drive-credentials \
+    --folder-yamareco ${GEOFRAME_EXPORT_FOLDER_YAMARECO} \
+    --folder-travel-journal ${GEOFRAME_EXPORT_FOLDER_TRAVEL_JOURNAL} \
+    --work-folder ${GEOFRAME_EXPORT_WORK_FOLDER} \
     --state-dir /var/lib/geoframe-export \
     --feed-base http://127.0.0.1:8080
 
 # --- 停止 ---
-# SIGTERM を受けると、serve は新しい受付を閉じ、接続の処理を最大 75 秒（serve.rs の SHUTDOWN_WAIT）待って打ち切り、
-# そのあと実行中のジョブの rclone をプロセスグループごと止めて wait し終えてから、実行枠を手放して終わる（後始末の待ちに
-# 期限は無いが、rclone は止まるので有限）。子の rclone の止め方は serve が決めるので、systemd が rclone にも直接 SIGTERM を
-# 送って順序を乱さないよう、KillMode=mixed にする（SIGTERM は本体だけ。タイムアウトのあとの SIGKILL は残りの全部）。
+# SIGTERM を受けると、serve は新しい受付を閉じ、接続の処理を最大 75 秒（serve.rs の SHUTDOWN_WAIT）待って打ち切り、そのあと実行中の
+# ジョブのアップロードのスレッドを全部止めて join し終えてから、実行枠を手放して終わる。キャンセルは、Drive への要求の前・再試行の待ち・
+# チャンクの間で見る（要求の最中には見ない）ので、飛んでいる要求 1 つが終わるまで待つ。その上限は、JSON の要求 60 秒・チャンクと
+# multipart の要求 100 秒（src/drive/api.rs の JSON_REQUEST_CAP・CHUNK_REQUEST_CAP）で、トークンの取り直しを挟んでも 180 秒の中に
+# 収まる。子プロセスは無いが、systemd が本体以外にも SIGTERM を送って順序を乱さないよう、KillMode=mixed のままにする
+# （SIGTERM は本体だけ。タイムアウトのあとの SIGKILL は残りの全部）。
 KillMode=mixed
-# 75 秒の打ち切りと、そのあとの後始末（rclone の停止・待ち）に余裕を足した 180 秒。それでも終わらなければ systemd が SIGKILL する
-# （止まったジョブの記録は running のまま残り、次の起動の復旧か recover が片付ける。設計 4.2 の復旧の表）。
+# 接続の待ち（75 秒）と、飛んでいる要求の上限（100 秒）は並行して進むので、どちらも 180 秒に収まる。それでも終わらなければ systemd が
+# SIGKILL する（止まったジョブの記録は running のまま残り、次の起動の復旧か recover が片付ける。設計 4.2 の復旧の表）。
 TimeoutStopSec=180s
 
 # 異常終了は再起動する。ただし引数・設定の誤り（終了コード 2。トークンのファイルの権限、tailnet でない --listen、
-# rclone の設定の不備など）は再起動しても直らないので、再起動ループにせず failed のまま止める。
-# bind の失敗・状態ディレクトリが開けないなど（終了コード 1）は再試行に意味があるので再起動対象。
+# フォルダの ID の誤り、Drive の認可の失効〔再認可が要る〕など）は再起動しても直らないので、再起動ループにせず failed のまま止める。
+# bind の失敗・状態ディレクトリが開けない・Drive に接続できないなど（終了コード 1）は再試行に意味があるので再起動対象。
 Restart=on-failure
 RestartSec=15
 RestartPreventExitStatus=2
@@ -96,9 +109,9 @@ PrivateTmp=true
 PrivateDevices=true
 # 特権（capability）は要らない（1024 以上のポートで待ち受け、自分の状態ディレクトリにだけ書く）。
 CapabilityBoundingSet=
-# AF_INET・AF_INET6 は、tailnet での待ち受け、写真サービスへの接続（127.0.0.1）、rclone の Google への HTTPS。
-# rclone（Go）が AF_UNIX（systemd-resolved・nscd の名前解決など）や AF_NETLINK（ネットワークの構成の読み取り）を要するかは、
-# 2026-11-22 の本番での実測（deploy/README.md §8.8）で確かめ済み。AF_INET・AF_INET6 だけで足りた。
+# AF_INET・AF_INET6 は、tailnet での待ち受け、写真サービスへの接続（127.0.0.1）、Drive API への HTTPS（rustls・ring。名前解決は
+# 標準ライブラリ）。rclone 版では、2026-11-22 の本番での実測（deploy/README.md §8.8）で AF_INET・AF_INET6 だけで足りたが、API 版の
+# バイナリで足りるか（名前解決が AF_UNIX を要しないか）は、本番の関門で確かめる。
 RestrictAddressFamilies=AF_INET AF_INET6
 SystemCallFilter=@system-service
 SystemCallArchitectures=native
@@ -109,12 +122,14 @@ ProtectControlGroups=true
 RestrictNamespaces=true
 LockPersonality=true
 RestrictSUIDSGID=true
-# 作るファイル（記録・作業領域の写真・rclone の設定）は、所有者だけが読める。geoframe-export-admin.sh も同じ UMask で動かす。
+# 作るファイル（記録・作業領域の写真）は、所有者だけが読める。geoframe-export-admin.sh も同じ UMask で動かす。
 UMask=0077
 # 次の 3 つは、2026-11-22 の本番での実測（deploy/README.md §8.8）で決めた。14 日の最多（880 枚・690MB）の書き出し中、
 # anon メモリは最大 38.5MB、ページキャッシュは最大 660MB、タスクは最大 24 だった。MemoryMax=256M・TasksMax=64・
 # MemoryDenyWriteExecute=true でも成功した。MemoryMax はページキャッシュの回収で詰まらないよう、余裕を見て 512M にした。
 # 書き出す画像が表示用の大きさ（長辺 2560px）であることが前提。派生の大きさを変えるときは MemoryMax を測り直す。
+# 値は rclone 版の実測のまま。API 版は、写真を並列 4 で送り（multipart は 1 本につき、中身と本文で最大 16MiB 弱をメモリに持つ。
+# 4 本で 64MiB 前後）、スレッドも増える。MemoryMax・TasksMax・MemoryDenyWriteExecute が足りるかは、本番の関門で測り直す。
 MemoryDenyWriteExecute=true
 MemoryMax=512M
 TasksMax=64
