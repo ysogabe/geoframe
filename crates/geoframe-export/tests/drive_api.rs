@@ -25,6 +25,27 @@ fn fast() -> Retry {
     }
 }
 
+/// 停止の期限: SIGTERM のあと、飛んでいる要求 1 つの終わりまで待つ。その最長（JSON の上限 + チャンク・multipart の上限。トークンの
+/// 取り直しを挟んでも超えない）が、unit の `TimeoutStopSec` の中に収まる（収まらないと、systemd が SIGKILL する前に全スレッドが止まれない）。
+#[test]
+fn the_per_request_caps_fit_in_the_units_stop_timeout() {
+    use geoframe_export::drive::api::{CHUNK_REQUEST_CAP, JSON_REQUEST_CAP};
+    let unit = include_str!("../../../deploy/geoframe-export.service");
+    let secs: u64 = unit
+        .lines()
+        .find_map(|l| l.strip_prefix("TimeoutStopSec="))
+        .and_then(|v| v.strip_suffix('s'))
+        .and_then(|v| v.parse().ok())
+        .expect("TimeoutStopSec=<秒>s");
+    assert!(CHUNK_REQUEST_CAP <= Duration::from_secs(120));
+    assert!(
+        CHUNK_REQUEST_CAP + JSON_REQUEST_CAP < Duration::from_secs(secs),
+        "{CHUNK_REQUEST_CAP:?} + {JSON_REQUEST_CAP:?} が TimeoutStopSec={secs}s に収まらない"
+    );
+    // serve が接続を待つ上限（75 秒）も、同じ中に収まる（並行して進む）
+    assert!(geoframe_export::serve::SHUTDOWN_WAIT < Duration::from_secs(secs));
+}
+
 struct Fx {
     env: Env,
     fake: fk::FakeDrive,

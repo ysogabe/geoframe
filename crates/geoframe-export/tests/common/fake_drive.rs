@@ -216,7 +216,9 @@ pub struct FakeDrive {
 }
 
 impl FakeDrive {
-    /// `env` の偽の Drive（`env.fake_dir`）を、HTTP で見せる。
+    /// `env` の偽の Drive（`env.fake_dir`）を、HTTP で見せる、**2 つ目**のサーバー（`Env::new` が 1 つ立てている: `Env::fake`）。
+    /// API の単体の試験（`drive_api.rs` など）が、自分の `DriveApi` を向けるために使う。同じ状態のファイルを見るので、
+    /// 2 つのサーバーに同時に要求を出さないこと（ロックがサーバーごとなので、更新が消えうる）。流れの試験は `Env::fake` を使う。
     pub fn start(env: &Env) -> Self {
         Self::start_in(&env.fake_dir)
     }

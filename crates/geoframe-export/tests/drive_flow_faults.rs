@@ -444,3 +444,33 @@ fn a_cancel_during_parallel_uploads_stops_every_thread_and_hands_the_record_to_r
     };
     assert_eq!(after.status, Status::Interrupted);
 }
+
+// ---- ジョブの始めの確認（起動のあとに、フォルダがゴミ箱へ移された） ----
+
+#[test]
+fn a_root_folder_moved_to_the_trash_after_startup_fails_the_job_before_anything_is_written() {
+    for (name, which) in [("work", 0), ("prefix", 1), ("shortcut-work", 2)] {
+        let mut env = Env::new(&format!("faults-roots-{name}"));
+        let site = photo_site(DAY, DAY, three());
+        let svc = service_with(&mut env, &site, retrying());
+        let mut d = env.drive();
+        match which {
+            0 => d.node_mut_pub(&env.work_id).unwrap().trashed = true,
+            1 => d.node_mut_pub(&env.yamareco_id).unwrap().trashed = true,
+            _ => {
+                // 作業用のフォルダの ID が、ファイルを指すようになった（フォルダでない）
+                d.node_mut_pub(&env.work_id).unwrap().kind = common::drive::model::Kind::File;
+            }
+        }
+        env.save(&d);
+        let rec = run_job(&svc);
+        assert_eq!(rec.status, Status::Failed, "{name}");
+        assert_eq!(rec.error, Some(ErrorCode::DriveUnavailable), "{name}");
+        env.assert_no_mutations();
+        assert!(
+            env.ops_used().iter().all(|o| o == "token" || o == "get"),
+            "{name}: {:?}",
+            env.ops_used()
+        );
+    }
+}
