@@ -30,6 +30,9 @@ pub const JOB_A: &str = "00112233445566778899aabbccddeeff";
 pub const JOB_B: &str = "ffeeddccbbaa99887766554433221100";
 pub const FOLDER: &str = "2030-03-10";
 
+/// Drive を変えない操作名（`mutating_ops` が除く）。
+const READ_ONLY_OPS: [&str; 5] = ["list", "read", "get", "generate_ids", "token"];
+
 pub fn fast_timing() -> Timing {
     Timing {
         settle: Duration::from_millis(10),
@@ -136,8 +139,8 @@ impl Env {
 
     // ---- 中立の記録（実装に依らない）----
     //
-    // 操作名は `list`・`read`・`create_folder`・`upload`・`move`・`trash`。後の PR で偽の Drive の HTTP サーバーが同じ名前で
-    // calls.log に書けば、これらを使う試験はそのまま通る。
+    // 操作名は `list`・`read`・`create_folder`・`upload`・`move`・`trash`。偽の Drive の HTTP サーバー（`fake_drive`）は、同じ名前で
+    // calls.log に書く（読むだけの `get`・`generate_ids`・`token` も足す）ので、これらを使う試験は、どちらの偽物でもそのまま通る。
 
     /// 操作名と、段階の記録（`record:<stage>`）を、順番どおりに。
     pub fn ops(&self) -> Vec<String> {
@@ -150,21 +153,23 @@ impl Env {
             .collect()
     }
 
-    /// Drive を変えうる操作と、段階の記録だけ（`list`・`read` を除く）。
+    /// Drive を変えうる操作と、段階の記録だけ（読むだけの `list`・`read`・`get`・`generate_ids`・`token` を除く）。
+    /// `get`・`generate_ids`・`token` は、偽の Drive の HTTP サーバー（`fake_drive`）だけが書く。
     pub fn mutating_ops(&self) -> Vec<String> {
         self.ops()
             .into_iter()
-            .filter(|c| c != "list" && c != "read")
+            .filter(|c| !READ_ONLY_OPS.contains(&c.as_str()))
             .collect()
     }
 
     /// 呼ばれた操作名の集合（重複なし。段階の記録は含まない）。
     pub fn ops_used(&self) -> Vec<String> {
+        // `op` を持つ行を全部数える（偽の rclone の行も、偽の Drive の HTTP サーバーの行も。`kind` では絞らない。
+        // 数え落とすと、「呼ばれていない」の検査が素通りする）。段階の記録（`hook`）の行は `op` を持たない
         let mut v: Vec<String> = self
             .calls()
             .iter()
-            .filter(|c| c["kind"] == "rclone")
-            .map(|c| c["op"].as_str().unwrap_or("?").to_owned())
+            .filter_map(|c| c["op"].as_str().map(str::to_owned))
             .collect();
         v.sort();
         v.dedup();
@@ -175,7 +180,7 @@ impl Env {
     pub fn op_count(&self, op: &str) -> usize {
         self.calls()
             .iter()
-            .filter(|c| c["kind"] == "rclone" && c["op"] == op)
+            .filter(|c| c["op"] == op)
             .count()
     }
 
