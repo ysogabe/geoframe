@@ -1,8 +1,7 @@
 //! T5: ジョブの流れ（design.md 4.1）、実行枠、ジョブの記録、`request_id`、`dry_run`、止まったジョブの復旧、`blocked`。
-//! 偽の写真サービス（127.0.0.1）と偽の rclone・偽の Drive だけを使う（本物の写真サービス・rclone・Drive には触れない）。
+//! 偽の写真サービス（127.0.0.1）と偽の Drive（HTTP サーバー）だけを使う（本物の写真サービス・Drive には触れない）。
 //! 受け持つ受け入れ条件: AC5・AC5b・AC8・AC9（記録の側）・AC10（dry_run）・「一部の失敗」。
-//! Drive の操作の記録は、中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る。`// rclone 固有` と
-//! 書いた確認（`assert_rclone_safe_calls`）だけが rclone の引数・環境変数を見る（rclone 版を消すときに消す）。
+//! Drive の操作の記録は、操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）で見る。
 
 mod common;
 
@@ -172,7 +171,7 @@ fn zero_photos_succeeds_without_touching_drive_even_if_the_destination_exists() 
         assert_eq!(r["catalog_count"], 0);
         assert_eq!(r["replaced"], false);
         assert_eq!(v["error"], Value::Null);
-        // rclone は 1 回も呼ばれず、Drive は変わらない（フォルダも作らない）
+        // Drive は 1 回も呼ばれず、変わらない（フォルダも作らない）
         assert!(env.calls().is_empty(), "{existing}: {:?}", env.calls());
         assert_eq!(env.drive().to_json(), before);
         assert_eq!(staging_entries(&env), 0);
@@ -218,7 +217,7 @@ fn one_failing_photo_fails_the_job_and_drive_is_untouched() {
         };
         assert_eq!(v["status"], "failed", "{v}");
         assert_eq!(v["error"]["code"], code, "{case}");
-        // rclone は lsjson も呼ばれない。Drive は変わらず、作業領域も残らない
+        // 一覧も呼ばれない。Drive は変わらず、作業領域も残らない
         assert!(env.calls().is_empty(), "{case}: {:?}", env.calls());
         assert_eq!(env.drive().to_json(), before);
         assert_eq!(staging_entries(&env), 0);
@@ -375,7 +374,7 @@ fn a_held_slot_refuses_jobs_and_dry_run_and_creates_no_record() {
 }
 
 /// 本文の検査のあと（HTTP の入口の確認のあと）に終了の印が立つ隙間: 排他と実行枠を取ったあと、記録を書く直前に印を確かめ、
-/// 立っていれば何も登録しない（記録も rclone の呼び出しも実行枠の保持も残らない）。
+/// 立っていれば何も登録しない（記録も Drive の呼び出しも実行枠の保持も残らない）。
 #[test]
 fn a_shutdown_mark_raised_just_before_the_registration_registers_nothing() {
     let mut env = Env::new("flow-shutdown-race");
@@ -393,7 +392,7 @@ fn a_shutdown_mark_raised_just_before_the_registration_registers_nothing() {
     assert_eq!(e, SubmitError::ShuttingDown);
     assert_eq!(e.code(), ErrorCode::ShuttingDown);
     assert_eq!(job_files(&env), 0, "記録を作らない");
-    assert!(env.calls().is_empty(), "rclone を呼ばない");
+    assert!(env.calls().is_empty(), "Drive を呼ばない");
     assert!(slot_is_free(&env.state), "実行枠を残さない");
     assert!(svc.wait_idle(Duration::ZERO), "ジョブのスレッドは作らない");
     // 印が立っている間は、そのあとの受付もすべて断る
@@ -640,7 +639,7 @@ fn a_panic_in_the_job_fails_it_and_releases_the_slot() {
 }
 
 #[test]
-fn the_job_deadline_kills_rclone_and_fails_with_timeout() {
+fn the_job_deadline_stops_the_operation_and_fails_with_timeout() {
     let mut env = Env::new("flow-timeout");
     let site = photo_site(DAY, DAY, three_photos());
     env.settings.feed_base = site.base.clone();
@@ -1512,7 +1511,7 @@ fn a_cancel_stops_every_upload_thread_before_returning_and_hands_the_record_to_r
     env.assert_api_calls_safe();
 }
 
-/// 別のジョブの復旧の最中の印: 復旧の `rclone` を止め、その別のジョブを `blocked` にしない（`Unobservable` を確定しない）。
+/// 別のジョブの復旧の最中の印: 復旧の Drive の操作を止め、その別のジョブを `blocked` にしない（`Unobservable` を確定しない）。
 /// 復旧の待ちも眠り通さない。
 #[test]
 fn a_cancel_during_another_jobs_recovery_does_not_block_it() {
@@ -1651,7 +1650,7 @@ fn a_cancel_while_clearing_incoming_is_not_recorded_as_a_manual_leftover() {
     );
 }
 
-/// 印が、Drive に触れる前に立っていれば、ジョブは `interrupted`（rclone は 1 回も呼ばない）。
+/// 印が、Drive に触れる前に立っていれば、ジョブは `interrupted`（Drive は 1 回も呼ばない）。
 #[test]
 fn a_cancel_before_drive_is_touched_ends_the_job_as_interrupted() {
     let mut env = Env::new("flow-cancel-early");

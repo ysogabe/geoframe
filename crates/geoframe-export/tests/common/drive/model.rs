@@ -1,7 +1,8 @@
-//! 試験用の偽の Drive の模型（本物の Drive にも rclone にも触れない）。
+//! 試験用の偽の Drive の模型（本物の Drive には触れない）。
 //!
-//! 偽の rclone（`main.rs`）と、試験が Drive の状態を作る・読むための部品（`tests/common/drive.rs`）が、同じこのファイルを
-//! 使う。状態は JSON のファイル 1 つ（`drive.json`）で、ノードの表（ID・親・名前・種類・大きさ）として持つ:
+//! 偽の Drive の HTTP サーバー（`tests/common/fake_drive.rs`）と、試験が Drive の状態を作る・読むための部品
+//! （`tests/common/drive.rs`）が、同じこのファイルを使う。状態は JSON のファイル 1 つ（`drive.json`）で、
+//! ノードの表（ID・親・名前・種類・大きさ）として持つ:
 //! 同じ名前のフォルダが 2 つあること、ショートカット、移動しても変わらない ID、移動の遅れた反映を、ふつうのディレクトリの
 //! 木では表せないため。ID は架空の値（`fid0001` …）。
 #![allow(dead_code)]
@@ -9,10 +10,7 @@
 use serde_json::{Map, Value, json};
 
 pub const ROOT: &str = "root";
-pub const DIR_MIME: &str = "inode/directory";
 pub const SHORTCUT_MIME: &str = "application/vnd.google-apps.shortcut";
-/// リンク切れのショートカットに、rclone が付ける MIME タイプ。
-pub const SHORTCUT_DANGLING_MIME: &str = "application/vnd.google-apps.shortcut.dangling";
 pub const GDOC_MIME: &str = "application/vnd.google-apps.document";
 pub const FORM_MIME: &str = "application/vnd.google-apps.form";
 
@@ -21,9 +19,9 @@ pub enum Kind {
     Dir,
     File,
     Shortcut,
-    /// ネイティブの Google 文書（エクスポートできる。`Size: -1`）。
+    /// ネイティブの Google 文書（エクスポートできる。大きさも MD5 も持たない）。
     Gdoc,
-    /// エクスポートできない Google のファイル（フォームなど）。`--drive-show-all-gdocs` が無ければ一覧に出ない。出れば `Size: -1`。
+    /// エクスポートできない Google のファイル（フォームなど）。
     Form,
 }
 
@@ -56,13 +54,12 @@ pub struct Node {
     pub kind: Kind,
     pub size: u64,
     pub content: Option<String>,
-    /// ファイルの MD5（`lsjson --hash` の `Hashes.md5`）。`None` なら、中身（`cat` が返すもの: `content`、無ければ `x` を
-    /// `size` 個）の MD5。`copy` で作ったファイルは、送った中身の MD5 を入れる。
+    /// ファイルの MD5（`md5Checksum`）。`None` なら、中身（`content`、無ければ `x` を `size` 個）の MD5。送って作った
+    /// ファイルは、送った中身の MD5 を入れる。
     pub md5: Option<String>,
     /// ショートカットの指す先の ID。
     pub target: Option<String>,
-    /// ゴミ箱に入っている（偽の Drive の HTTP サーバーの `trash` が立てる。偽の rclone の `purge` は、木から消して `Drive::trashed` に
-    /// ID を残すので、この印は使わない）。
+    /// ゴミ箱に入っている（偽の Drive の HTTP サーバーの `trash` が立てる。`Drive::trashed` にも ID を残す）。
     pub trashed: bool,
 }
 
@@ -71,38 +68,24 @@ pub struct Node {
 pub struct Pending {
     pub src: String,
     pub dst: Vec<String>,
-    /// あと何回の `lsjson` が、古い状態を見せるか。
+    /// あと何回の一覧が、古い状態を見せるか。
     pub remaining: u64,
 }
 
-/// `lsjson` の 1 行。
+/// 一覧（[`Drive::ls`]）の 1 行。
 #[derive(Clone, Debug)]
 pub struct Row {
+    /// 起点からの相対パス（`/` 区切り）。
     pub path: String,
-    pub name: String,
     pub size: i64,
-    pub mime: String,
     pub is_dir: bool,
-    pub id: String,
-    /// ファイルの MD5（フォルダ・ショートカット・Google の文書は `None`）。出すかどうかは `--hash` の有無で偽の rclone が決める。
-    pub md5: Option<String>,
-}
-
-/// `lsjson` の呼び出しごとの設定（偽の rclone が引数から作る）。
-#[derive(Clone, Debug)]
-pub struct LsOpts {
-    pub skip_shortcuts: bool,
-    /// `mime`（ショートカットとして見える）か `resolved`（指す先として見える）。
-    pub mode: String,
-    /// `--drive-show-all-gdocs`。
-    pub show_all_gdocs: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Drive {
     pub nodes: Vec<Node>,
     pub next: u64,
-    /// ゴミ箱へ移した（`--drive-use-trash=true` の purge）フォルダの ID。
+    /// ゴミ箱へ移した ID。
     pub trashed: Vec<String>,
     /// ゴミ箱を通さずに消した ID。
     pub deleted: Vec<String>,
@@ -119,7 +102,7 @@ pub fn md5_hex(bytes: &[u8]) -> String {
 }
 
 impl Node {
-    /// ファイルの MD5（`md5` があればそれ、無ければ `cat` が返す中身の MD5）。
+    /// ファイルの MD5（`md5` があればそれ、無ければ中身の MD5）。
     pub fn effective_md5(&self) -> String {
         self.md5.clone().unwrap_or_else(|| {
             let body = self
@@ -128,27 +111,6 @@ impl Node {
                 .unwrap_or_else(|| "x".repeat(self.size as usize));
             md5_hex(body.as_bytes())
         })
-    }
-}
-
-/// `remote:a/b` を部品に分ける（remote 名は見ない）。
-pub fn split_loc(loc: &str) -> Vec<String> {
-    let path = loc.split_once(':').map_or(loc, |(_, p)| p);
-    path.split('/')
-        .filter(|c| !c.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-fn mime_of(name: &str, kind: Kind) -> &'static str {
-    match kind {
-        Kind::Dir => DIR_MIME,
-        Kind::Shortcut => SHORTCUT_MIME,
-        Kind::Gdoc => GDOC_MIME,
-        Kind::Form => FORM_MIME,
-        Kind::File if name.ends_with(".jpg") => "image/jpeg",
-        Kind::File if name.ends_with(".json") => "application/json",
-        Kind::File => "application/octet-stream",
     }
 }
 
@@ -170,8 +132,8 @@ impl Drive {
         self.nodes.iter().filter(|n| n.parent == parent).collect()
     }
 
-    /// 親の下の、名前が一致する最初のフォルダ（ゴミ箱へ移したものは数えない。偽の rclone の `purge` は木から消すが、偽の Drive の
-    /// HTTP サーバーは `trashed` の印を付けて残す）。
+    /// 親の下の、名前が一致する最初のフォルダ（ゴミ箱へ移したものは数えない。偽の Drive の HTTP サーバーは `trashed` の印を付けて
+    /// 残す）。
     fn find_dir(&self, parent: &str, name: &str) -> Option<&Node> {
         self.nodes
             .iter()
@@ -319,41 +281,14 @@ impl Drive {
         Some(parts.join("/"))
     }
 
-    /// `lsjson`。`shortcut_mode` は `mime`（ショートカットとして見える）か `resolved`（指す先として見える）。
-    /// エクスポートできない Google のファイルも出す（`--drive-show-all-gdocs` 付きの一覧と同じ）。
-    pub fn ls(
-        &self,
-        dir: &str,
-        recursive: bool,
-        skip_shortcuts: bool,
-        shortcut_mode: &str,
-    ) -> Vec<Row> {
-        self.ls_opts(
-            dir,
-            recursive,
-            &LsOpts {
-                skip_shortcuts,
-                mode: shortcut_mode.to_owned(),
-                show_all_gdocs: true,
-            },
-        )
-    }
-
-    pub fn ls_opts(&self, dir: &str, recursive: bool, opts: &LsOpts) -> Vec<Row> {
+    /// `dir` の下の、ファイルとフォルダの一覧（再帰。ショートカット・Google の文書は出さない）。
+    pub fn ls(&self, dir: &str) -> Vec<Row> {
         let mut out = Vec::new();
-        self.ls_into(dir, "", recursive, opts, &mut out, 0);
+        self.ls_into(dir, "", &mut out, 0);
         out
     }
 
-    fn ls_into(
-        &self,
-        dir: &str,
-        prefix: &str,
-        recursive: bool,
-        opts: &LsOpts,
-        out: &mut Vec<Row>,
-        depth: usize,
-    ) {
+    fn ls_into(&self, dir: &str, prefix: &str, out: &mut Vec<Row>, depth: usize) {
         if depth > 8 {
             return;
         }
@@ -364,91 +299,20 @@ impl Drive {
                 format!("{prefix}/{}", n.name)
             };
             match n.kind {
-                Kind::Shortcut => {
-                    if opts.skip_shortcuts {
-                        continue;
-                    }
-                    if opts.mode == "resolved" {
-                        // 解決された項目の ID は、リンク先の ID とショートカットの ID をタブで結んだ複合 ID（rclone の drive.go の
-                        // joinID）。リンク先が無い（リンク切れ）ときは、MIME タイプが `.dangling` で、ショートカット自身の ID
-                        if let Some(t) = n.target.as_deref().and_then(|t| self.node(t)) {
-                            let is_dir = t.kind == Kind::Dir;
-                            out.push(Row {
-                                path: path.clone(),
-                                name: n.name.clone(),
-                                size: if is_dir || matches!(t.kind, Kind::Gdoc | Kind::Form) {
-                                    -1
-                                } else {
-                                    t.size as i64
-                                },
-                                mime: mime_of(&t.name, t.kind).to_owned(),
-                                is_dir,
-                                id: format!("{}\t{}", t.id, n.id),
-                                md5: (t.kind == Kind::File).then(|| t.effective_md5()),
-                            });
-                            if is_dir && recursive {
-                                self.ls_into(&t.id, &path, recursive, opts, out, depth + 1);
-                            }
-                        } else {
-                            out.push(Row {
-                                path,
-                                name: n.name.clone(),
-                                size: 0,
-                                mime: SHORTCUT_DANGLING_MIME.to_owned(),
-                                is_dir: false,
-                                id: n.id.clone(),
-                                md5: None,
-                            });
-                        }
-                    } else {
-                        out.push(Row {
-                            path,
-                            name: n.name.clone(),
-                            size: 0,
-                            mime: SHORTCUT_MIME.to_owned(),
-                            is_dir: false,
-                            id: n.id.clone(),
-                            md5: None,
-                        });
-                    }
-                }
                 Kind::Dir => {
                     out.push(Row {
                         path: path.clone(),
-                        name: n.name.clone(),
                         size: -1,
-                        mime: DIR_MIME.to_owned(),
                         is_dir: true,
-                        id: n.id.clone(),
-                        md5: None,
                     });
-                    if recursive {
-                        self.ls_into(&n.id, &path, recursive, opts, out, depth + 1);
-                    }
+                    self.ls_into(&n.id, &path, out, depth + 1);
                 }
                 Kind::File => out.push(Row {
                     path,
-                    name: n.name.clone(),
                     size: n.size as i64,
-                    mime: mime_of(&n.name, Kind::File).to_owned(),
                     is_dir: false,
-                    id: n.id.clone(),
-                    md5: Some(n.effective_md5()),
                 }),
-                Kind::Gdoc | Kind::Form => {
-                    if n.kind == Kind::Form && !opts.show_all_gdocs {
-                        continue;
-                    }
-                    out.push(Row {
-                        path,
-                        name: n.name.clone(),
-                        size: -1,
-                        mime: mime_of(&n.name, n.kind).to_owned(),
-                        is_dir: false,
-                        id: n.id.clone(),
-                        md5: None,
-                    });
-                }
+                Kind::Shortcut | Kind::Gdoc | Kind::Form => {}
             }
         }
     }
@@ -462,7 +326,7 @@ impl Drive {
     }
 
     /// フォルダの移動（親と名前の変更。ID は変わらない）。宛先が既にあるフォルダなら、中身を足して（merge）元を消す
-    /// （本物の rclone の `moveto` と同じ。宛先の ID は元と別になる）。親が無ければ作る。
+    /// （宛先の ID は元と別になる。API の移動は ID を保つので、本番の移動とは違う。試験が「合流した」状態を作る）。親が無ければ作る。
     pub fn move_dir(&mut self, src: &str, dst: &[String]) -> bool {
         let Some((leaf, parent_path)) = dst.split_last() else {
             return false;
@@ -488,26 +352,6 @@ impl Drive {
             n.parent = parent;
             n.name = leaf.clone();
         }
-        true
-    }
-
-    /// ファイル単位の移動に切り替わった場合（宛先に新しい ID のフォルダができ、中身が移り、元は消える）。
-    pub fn move_dir_filewise(&mut self, src: &str, dst: &[String]) -> bool {
-        let Some((leaf, parent_path)) = dst.split_last() else {
-            return false;
-        };
-        if self.node(src).is_none() {
-            return false;
-        }
-        let parent = self.mkdir_p(parent_path);
-        let fresh = self.new_node(&parent, leaf, Kind::Dir, 0, None, None);
-        let kids: Vec<String> = self.children(src).iter().map(|n| n.id.clone()).collect();
-        for k in kids {
-            if let Some(n) = self.node_mut(&k) {
-                n.parent = fresh.clone();
-            }
-        }
-        self.nodes.retain(|n| n.id != src);
         true
     }
 
@@ -627,7 +471,7 @@ impl Drive {
     }
 }
 
-/// 呼び出しごとの挙動の差し替え。試験が作り、偽の rclone が読む（`ctl.json`）。
+/// 呼び出しごとの挙動の差し替え。試験が作り、偽の Drive の HTTP サーバーが読む（`ctl.json`）。
 #[derive(Clone, Debug)]
 pub struct Rule {
     /// 中立の操作名（`list`・`read`・`create_folder`・`upload`・`move`・`trash`）。
@@ -639,14 +483,12 @@ pub struct Rule {
     /// その次の `times` 回に効果を掛ける。
     pub times: u64,
     pub seen: u64,
-    /// `{"kind": "fail"|"sleep"|"do_then_fail"|"late_then_fail"|"filewise"|"garbage"|"stderr_fail", ...}`
+    /// 効果（`tests/common/fake_drive.rs` の関数で作る）。
     pub effect: Value,
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Ctl {
-    /// `mime`（既定）か `resolved`。
-    pub shortcut_mode: String,
     pub rules: Vec<Rule>,
 }
 
@@ -661,7 +503,6 @@ impl Ctl {
             })
             .collect();
         let mut m = Map::new();
-        m.insert("shortcut_mode".into(), json!(self.shortcut_mode));
         m.insert("rules".into(), Value::Array(rules));
         Value::Object(m)
     }
@@ -682,10 +523,7 @@ impl Ctl {
                     .collect()
             })
             .unwrap_or_default();
-        Self {
-            shortcut_mode: v["shortcut_mode"].as_str().unwrap_or("mime").to_owned(),
-            rules,
-        }
+        Self { rules }
     }
 
     pub fn load(dir: &std::path::Path) -> Self {
@@ -693,10 +531,7 @@ impl Ctl {
             .ok()
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .map(|v| Self::from_json(&v))
-            .unwrap_or_else(|| Self {
-                shortcut_mode: "mime".into(),
-                rules: Vec::new(),
-            })
+            .unwrap_or_default()
     }
 
     pub fn save(&self, dir: &std::path::Path) {

@@ -13,13 +13,6 @@ path = "src/lib.rs"
 name = "geoframe-export"
 path = "src/main.rs"
 
-# 試験用の偽の rclone（本物の rclone・Drive には触れない。`cargo build --workspace` でもビルドされるが、配るのは
-# `geoframe-export` だけ）。偽の Drive の模型は fake-rclone/model.rs で、試験（tests/common/drive.rs・偽の Drive の HTTP サーバー tests/common/fake_drive.rs）と共有する。
-[[bin]]
-name = "fake-rclone"
-path = "fake-rclone/main.rs"
-test = false
-
 # 依存は、ワークスペースで既に使っている crate の同じ版だけ（design.md 3.2）。`geoframe` crate には依存しない。
 [dependencies]
 # manifest のキーの順を旧 manifest に揃えるため preserve_order を明示する（geoframe crate も同じ feature。新しいパッケージは増えない）
@@ -34,11 +27,11 @@ zune-jpeg = "0.5.15"
 # rustls は geoframe crate と同じ形（暗号は ring、ルート証明書は埋め込み。musl の静的ビルドのまま動く。Cargo.lock に新しいパッケージは増えない）
 # gzip を明示する: geoframe 側のビルドと合流するかどうかで応答の扱いが変わらないように（展開後のバイト数に上限を掛ける）
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
-# ログ（rclone の失敗の標準エラーの末尾。伏せ字にしてから）。geoframe crate と同じ版・同じ feature（新しいパッケージは増えない）
+# ログ（geoframe crate と同じ版・同じ feature。新しいパッケージは増えない）
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 # ログの出力（標準エラー。geoframe crate と同じ版・同じ feature。新しいパッケージは増えない）
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
-# 公開するファイルごとの MD5（Drive の `lsjson --hash` の MD5 と照らす。geoframe crate と同じ版。新しいパッケージは増えない）
+# 公開するファイルごとの MD5（Drive API の `md5Checksum` と照らす。geoframe crate と同じ版。新しいパッケージは増えない）
 md-5 = "0.11.0"
 # 実効ユーザー ID（geteuid）と O_NOFOLLOW だけ
 libc = "0.2"

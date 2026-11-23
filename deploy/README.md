@@ -465,12 +465,13 @@ sudo install -m 0644 /dev/null /etc/default/geoframe # 出力に影響する設�
 
 ## 8. note 記事用の写真書き出し（geoframe-export）の配置
 
-> **注意（この節の手順は、rclone 版のままです）**: バイナリは Drive API を直接呼ぶ版になり、`--rclone`・`--rclone-config`・`--remote-*`・`--work-root`は無くなりました（代わりに`--drive-credentials`・`--folder-yamareco`・`--folder-travel-journal`・`--work-folder`）。unit（[`geoframe-export.service`](geoframe-export.service)）と包み（[`geoframe-export-admin.sh`](geoframe-export-admin.sh)）はその版の引数に直してあり、資格情報は`/etc/geoframe-export/drive-credentials.json`（`geoframe-export import-credentials`で rclone の設定から作る）、フォルダの ID は`/etc/default/geoframe-export`に置きます。root で`import-credentials`を動かすときは、`--rclone-config`に**絶対パス**を渡し、パスの途中にシンボリックリンク・`..`・空の要素を含めないでください（根から 1 段ずつ開いて確かめるため、含むと断ります）。この節の rclone の設定・`--work-root`・検証用の rclone.conf の写しの手順は、3 段目で書き直します（それまで、この節の手順では配置できません）。設計は[drive-api.md](../docs/note-photo-export/drive-api.md)です。
-
 日付（または期間）の写真を、表示用 JPEG と`manifest.json`にして Google Drive の`yamareco/`・`travel-journal/`へ書き出す、別プロセスのサービスです
 （`geoframe-export`。写真サービスとは HTTP だけでつながります）。仕様は[PRD](../docs/note-photo-export/prd.md)、設計は[design.md](../docs/note-photo-export/design.md)にあります。
+Drive は **Drive API を直接呼んで**操作します（rclone は使いません）。フォルダは Drive の ID で指し、資格情報は専用の JSON のファイルで渡します。設計は[drive-api.md](../docs/note-photo-export/drive-api.md)です。
 この節は**配置の手順**で、配置は PRD・設計の「配置後」の確認（§8.8）まで、ユーザーの立ち会いのもとで行います。
-**値（トークン・client_id・client_secret・実際の IP）は、文書・PR・ログに書きません**（ここの IP は文書用の予約アドレス`192.0.2.x`です。実際は tailnet の IP を使います）。
+**値（トークン・client_id・client_secret・Drive のフォルダの ID・実際の IP）は、文書・PR・ログに書きません**（ここの IP は文書用の予約アドレス`192.0.2.x`です。実際は tailnet の IP を使います）。
+
+本番では 2026-11-22 から、rclone を呼ぶ版が動いています。その版から切り替えるときは、§8.1 の順番と§8.6 の切り替えの手順に従い、**前のバイナリと前の unit を残して**から入れ替えます（戻し方は§8.9）。
 
 ### 8.1 前提と順番
 
@@ -478,11 +479,12 @@ sudo install -m 0644 /dev/null /etc/default/geoframe # 出力に影響する設�
    （いつもの手順。§5・§7.3、本番は[`cutover.md`](../docs/rust-migration/cutover.md)）。入れたあと、一覧 API が答えることを確かめます。
    `curl --fail -s -o /dev/null -w '%{http_code}\n' 'http://127.0.0.1:8080/api/admin/export/photos?from=<YYYY-MM-DD>&to=<YYYY-MM-DD>'`が`200`なら先へ進みます。
 2. 次に`geoframe-export`を入れます（このあとの節）。写真サービスの unit と DB には触れません。
-3. Drive に、書き出し先の親フォルダ（`yamareco/`・`travel-journal/`）と作業用のフォルダ（§8.5）が先に存在している必要があります。
+3. Drive に、書き出し先の親フォルダ（`yamareco/`・`travel-journal/`）と作業用のフォルダ（§8.5）が先に存在している必要があります。その ID を、`/etc/default/geoframe-export`に書きます（§8.4）。
+4. Drive の資格情報のファイル（`/etc/geoframe-export/drive-credentials.json`）を作ります（§8.3）。rclone 版から切り替えるときは、今の`rclone.conf`から**1 回だけ**取り込みます（同意のやり直しはしません）。
 
 ### 8.2 ビルドと専用ユーザー・置き場所
 
-バイナリは写真サービスと同じ musl の完全静的ビルドです（[build.md](../docs/rust-migration/build.md)。配るのは`geoframe-export`だけで、試験用の偽の rclone は配りません）。
+バイナリは写真サービスと同じ musl の完全静的ビルドです（[build.md](../docs/rust-migration/build.md)。配るのは`geoframe-export`だけです）。
 
 ```sh
 cargo build --release --target x86_64-unknown-linux-musl -p geoframe-export --bin geoframe-export
@@ -490,35 +492,39 @@ sha256sum target/x86_64-unknown-linux-musl/release/geoframe-export   # 控える
 ```
 
 専用ユーザーはログインシェルとホームを持たない`geoframe-export`です（写真サービスの`geoframe`とも、オーナーのユーザーとも別にします）。
-状態ディレクトリ（`/var/lib/geoframe-export`）は、unit の`StateDirectory=`が起動時に作りますが、**rclone の設定が無いと起動しない**ので、設定を置くために先に作ります。
+状態ディレクトリ（`/var/lib/geoframe-export`）は、unit の`StateDirectory=`が起動時に作ります。トークンのファイル（§8.4）を先に置くため、先に作っておきます。
 
 ```sh
 sudo useradd --system --no-create-home --shell /usr/sbin/nologin geoframe-export
-sudo install -d -o geoframe-export -g geoframe-export -m 0700 \
-  /var/lib/geoframe-export /var/lib/geoframe-export/rclone /var/lib/geoframe-export/rclone/home /var/lib/geoframe-export/rclone/cache
+sudo install -d -o geoframe-export -g geoframe-export -m 0700 /var/lib/geoframe-export
 sudo install -o root -g root -m 0755 geoframe-export /usr/local/bin/geoframe-export
 sudo install -D -o root -g root -m 0644 /opt/geoframe/deploy/geoframe-export.service /usr/local/lib/systemd/system/geoframe-export.service
 ```
 
 unit は`geoframe-rs.service`と同じく`/usr/local/lib/systemd/system/`に置きます（`/etc/systemd/system/`には drop-in と mask のリンクだけを置きます。§7.1）。
-`rust-deploy.sh`は`geoframe-export`を扱わないので、入れ替えは手で行います。更新のときは、戻せるよう、上書きの前に今のバイナリを`sudo cp -p /usr/local/bin/geoframe-export /usr/local/bin/geoframe-export.prev`で残します。
-
-rclone は`ProtectHome=yes`の unit から使えるよう、ホームの外（`/usr/local/bin/rclone`）に置きます。バージョンは§8.3 でブラウザのある機体に入れるものと同じにします
-（この設計は v1.76.0 の引数で確かめています）。公式の配布物（<https://rclone.org/downloads/>）を取り、署名か`SHA256SUMS`を確かめてから入れます。
+`rust-deploy.sh`は`geoframe-export`を扱わないので、入れ替えは手で行います。**更新・切り替えのときは、戻せるよう、上書きの前に今のバイナリと unit を残します**:
 
 ```sh
-sudo install -o root -g root -m 0755 rclone /usr/local/bin/rclone
-/usr/local/bin/rclone version
+sudo cp -p /usr/local/bin/geoframe-export /usr/local/bin/geoframe-export.prev
+sudo cp -p /usr/local/lib/systemd/system/geoframe-export.service /usr/local/lib/systemd/system/geoframe-export.service.prev
 ```
 
-### 8.3 専用の client_id での rclone の設定（ユーザーの操作）
+（`.prev`は上書きされるので、2 回続けて入れ替える前に、戻す必要が無いことを確かめます。）
+Drive の操作は HTTPS で直接行うので、rclone 本体は要りません。
 
-rclone の共用の client_id は 2026 年中に使えなくなります（rclone 自身が警告を出します）。書き出しは**このサービス専用の client_id** で認可した、専用の設定ファイル
-（`/var/lib/geoframe-export/rclone/rclone.conf`）だけを使います。権限は Drive 全体のままです（設計 U4。書き出し先が今の`yamareco/`・`travel-journal/`で、受け取り側の経路を変えないため）。
-`client_id`と`client_secret`が空だと`geoframe-export`は起動しません（共用の client_id に戻れないようにしています）。
+### 8.3 Drive の資格情報（専用の client_id・取り込み・再認可）
 
-次の手順は rclone の公式の文書（[Making your own client_id](https://rclone.org/drive/#making-your-own-client-id)・[Remote setup](https://rclone.org/remote_setup/)）に基づきます。
-Google API Console の画面の項目名は変わることがあるので、公式の文書も合わせて見てください。
+書き出しは**このサービス専用の client_id** で認可した Drive の資格情報だけを使います（rclone の共用の client_id は 2026 年中に使えなくなります）。権限は Drive 全体のままです
+（設計 U4。書き出し先が今の`yamareco/`・`travel-journal/`で、受け取り側の経路を変えないため）。
+
+資格情報は、`/etc/geoframe-export/drive-credentials.json`（**root 所有・0600**。`client_id`・`client_secret`・`refresh_token`の 3 つのキーだけの JSON）に置きます。
+`/etc/geoframe-export`は root 所有の 0700 です。unit の`LoadCredential=`が、起動のたびに、サービスのユーザーだけが読める写し（`drive-credentials`）にして渡します。
+アクセストークンはメモリだけに持ち、**バイナリは資格情報のファイルを書き換えません**（トークンを取り直してもファイルは変わりません）。
+
+#### 専用の client_id を作る（初めてのとき・作り直すとき）
+
+次の手順は rclone の公式の文書（[Making your own client_id](https://rclone.org/drive/#making-your-own-client-id)）に基づきます。
+Google API Console の画面の項目名は変わることがあるので、公式の文書も合わせて見てください。既に専用の client_id があれば、1〜9 は要りません。
 
 1. Google API Console（<https://console.developers.google.com/>）にログインします（Drive の持ち主と同じアカウントでなくてもかまいません）。
 2. プロジェクトを作ります（既にあれば選びます）。
@@ -529,42 +535,111 @@ Google API Console の画面の項目名は変わることがあるので、公�
 6. 「Audience」→「+ Add users」で、自分をテストユーザーに足します。
 7. 「Overview」→「Create OAuth client」を押し、種類は「Desktop app」にして「Create」します。
 8. client ID と client secret を控えます。**チャット・リポジトリ・コミット・ログには書きません。**
-9. 「Audience」→「PUBLISH APP」で公開します。**「Testing」のままだと、許可（リフレッシュトークン）が 1 週間で切れます。**
+9. 「Audience」→「PUBLISH APP」で公開します。**「Testing」のままだと、許可（リフレッシュトークン）が 7 日で切れ**、そのたびに再認可が要ります。
    「PUBLISH APP」が押せないときは、「Branding」でホームページとプライバシーポリシーの URL、Authorized domains を入れます。
    個人で使う（100 人未満）なら審査は要りません。ただし、認可のときに「確認されていないアプリ」の警告が出るので、そのまま先へ進みます。
-10. ブラウザの無いこのホストで、専用ユーザーとして設定します。`HOME`は、サービスの rclone と同じ場所（状態ディレクトリの下）にします。
 
-    ```sh
-    sudo -u geoframe-export env HOME=/var/lib/geoframe-export/rclone/home XDG_CACHE_HOME=/var/lib/geoframe-export/rclone/cache \
-      /usr/local/bin/rclone config --config /var/lib/geoframe-export/rclone/rclone.conf
-    ```
+#### 初回: 今の rclone.conf から取り込む（rclone 版からの切り替え）
 
-    対話の入力は次のとおりです。remote 名は **`gdrive`**（書き出し先の既定が`gdrive:yamareco`などで、設定ファイルのセクション名と合わせます）、種類は`drive`、
-    `client_id`と`client_secret`に 8 で控えた値、`scope`は`1`（`drive`）、`service_account_file`は空、「Use web browser to automatically authenticate rclone with remote?」は **`n`** です。
-    すると rclone（v1.76.0）が、ブラウザのある機体で実行するコマンドを表示し、`config_token>`で結果の貼り付けを待ちます。
-    専用の`client_id`と`client_secret`を設定しているので、コマンドは`rclone authorize "drive" "<長い Base64 の文字列>"`の形で、その文字列に`client_secret`が入っています。
-    貼り戻す結果も Base64 です。
+rclone 版が使っている`/var/lib/geoframe-export/rclone/rclone.conf`（専用の client_id で認可済み）から、`client_id`・`client_secret`・`refresh_token`を取り出して、資格情報のファイルを**1 回だけ**作ります。
+Google の同意のやり直しはしません。値は画面にも標準出力・標準エラー・ログにも出ません（出るのは、書いたパスと「書いた」ことだけです）。
 
-    1. **表示されたコマンドを、そのまま**、ブラウザのある別の機体（同じバージョンの rclone）で実行します。自分で組み立て直しません。
-    2. ブラウザで認可します（Drive の持ち主のアカウントで許可します）。
-    3. 実行が終わると、`Paste the following into your remote machine --->`と`<---End paste`の印の間に結果が出ます。**印の間をそのまま**（Base64 のままで）、このホストの`config_token>`に貼ります。
-    4. 「Configure this as a Shared Drive」は`n`、最後の確認は`y`です。
+```sh
+sudo install -d -o root -g root -m 0700 /etc/geoframe-export
+sudo /usr/local/bin/geoframe-export import-credentials \
+  --rclone-config /var/lib/geoframe-export/rclone/rclone.conf --remote gdrive \
+  --out /etc/geoframe-export/drive-credentials.json
+sudo ls -l /etc/geoframe-export/drive-credentials.json   # -rw------- root root（中身は表示しない）
+```
 
-    Base64 は暗号ではありません。表示されたコマンド全体（`client_secret`を含む）も、貼り戻す結果（Drive 全体の権限のトークンを含む）も、
-    **チャット・リポジトリ・コミット・ログ・シェルの履歴に残しません。** ブラウザのある機体では、実行の前に履歴へ残らない設定にします。
-    bash なら`HISTCONTROL=ignorespace`にして、コマンドの先頭に空白を 1 つ置いて実行します。zsh なら`setopt HIST_IGNORE_SPACE`にして、同じく先頭に空白を置きます。
-    実行のあとは、履歴に残っていないかを確かめ（残っていれば、その行を消します）、画面とスクロールバックも消します。
-11. 設定ファイルが`0600`、ディレクトリが`0700`で、専用ユーザーの持ち物であることを確かめます。`geoframe-export`は、満たさないと起動しません。
+- root で動かすので、`--rclone-config`には**絶対パス**を渡します。パスは、根（`/`）から 1 段ずつ、シンボリックリンクをたどらずに開いて確かめます。次のどれかに当たると断ります。
+  - 相対パス、`..`・`.`・空の要素（`//`や末尾の`/`）を含む。
+  - パスの途中に、シンボリックリンクがある。
+  - パスの途中の各ディレクトリ（設定ファイルの親ディレクトリより上）の持ち主が、root でも設定ファイルの持ち主でもない。
+  - パスの途中の各ディレクトリに、グループまたは他人の書き込み権限がある。ただし、root 所有でスティッキービットが付いたディレクトリ（`/tmp`など）は、書き込めても受け付けます。
 
-    ```sh
-    sudo ls -ld /var/lib/geoframe-export /var/lib/geoframe-export/rclone
-    sudo ls -l /var/lib/geoframe-export/rclone/rclone.conf
-    ```
+  `rclone.conf`は、セクション（`--remote`の名前）に専用の`client_id`・`client_secret`と、`token`の`refresh_token`が入っていて、ファイルが 0600・親ディレクトリが 0700 である必要があります。持ち主は問いません（root が、サービスのユーザーの持ち物を読みます）。
+- 出力先は、`O_EXCL`で作ります。**既にあるファイルは上書きしません**（終了コード 1）。出力先の親（`/etc/geoframe-export`）も作りません（無ければ終了コード 1）ので、先に上の`install -d`で作ります。
+  作り直すときは、ファイルがあれば先に退避してから動かします（`sudo mv /etc/geoframe-export/drive-credentials.json /etc/geoframe-export/drive-credentials.json.old`。退避した写しも root の 0600 のまま、不要になったら消します）。ファイルが無い新規の配置では、退避は要りません。
+- 読めない・形が違う・`refresh_token`が無いときは、何も作らずに終了コード 2 です。
+- 資格情報のファイルは**一度作れば、サービスの起動のたびに読まれる**だけです。rclone の設定（`rclone.conf`）の更新とは連動しません。
 
-    動作は読み取りだけの確認（一覧）で確かめます: `sudo -u geoframe-export env HOME=/var/lib/geoframe-export/rclone/home XDG_CACHE_HOME=/var/lib/geoframe-export/rclone/cache /usr/local/bin/rclone lsd gdrive: --config /var/lib/geoframe-export/rclone/rclone.conf`
+rclone 版を動かしていない新しい機体で、`rclone.conf`が無いときは、次の「再認可」の手順で`rclone authorize`のトークンから一時的な`rclone.conf`を作って取り込みます
+（この機体には`/etc/geoframe-export`も資格情報のファイルもまだ無いので、手順 3 で、取り込みの前に`/etc/geoframe-export`を作ります）。
 
-> [!NOTE]
-> **オーナーのホームにある今の rclone の設定（手作業の経路）も、共用の client_id のままなら同じく止まります。** 書き出しの専用の設定とは別に、そちらも同じ手順で直す必要があります。
+#### 再認可（`drive_auth_invalid`・起動時の終了コード 2）
+
+更新トークンが失効すると（`invalid_grant`。「PUBLISH APP」が済んでいない場合の 7 日の失効、Google アカウントでのアクセス権の取り消し、パスワードの変更など）、
+起動時の検査が標準エラー（journal）に「**Drive の認可が失効しています。再認可が要ります（deploy/README.md の手順）**」と出して、**終了コード 2** で止まります（`failed`のまま。再起動のループにはなりません）。
+ジョブの途中で失効したときは、そのジョブが`failed`（`drive_auth_invalid`）になります。変更系の途中で失効して結果が分からないときは、`blocked`になります。
+
+手順（ブラウザのある別の機体と、このホストで行います。**値はチャット・リポジトリ・コミット・ログ・シェルの履歴に残しません**）:
+
+1. ブラウザのある別の機体（rclone を入れたもの）で、**同じ専用の client_id・client_secret**（「専用の client_id を作る」の 8 で控えた値）を指定して認可します。
+   ```sh
+   rclone authorize "drive" "<client_id>" "<client_secret>"
+   ```
+   ブラウザが開くので、Drive の持ち主のアカウントで許可します（「確認されていないアプリ」の警告は、そのまま先へ進みます）。
+   終わると、`Paste the following into your remote machine --->`と`<---End paste`の印の間に、トークン（JSON）が出ます。
+   実行の前に、履歴へ残らない設定にします（bash なら`HISTCONTROL=ignorespace`にして、コマンドの先頭に空白を 1 つ置きます。zsh なら`setopt HIST_IGNORE_SPACE`）。実行のあとは、履歴に残っていないかを確かめ、画面とスクロールバックも消します。
+2. このホストで、**一時的な`rclone.conf`**（0600）を、root の 0700 のディレクトリに作ります。トークンは、標準入力から貼り付けて（コマンドの引数にせず、履歴に残さず）書きます。
+   ```sh
+   sudo install -d -o root -g root -m 0700 /root/geoframe-reauth
+   sudo sh -c 'umask 077; set -C; cat > /root/geoframe-reauth/rclone.conf'
+   ```
+   貼り付ける内容（最後に Enter を押して、Ctrl-D で終わります。`<…>`の所に、控えた値と、1 のトークン〔`{`から`}`まで、1 行〕を入れます）:
+   ```ini
+   [gdrive]
+   type = drive
+   client_id = <client_id>
+   client_secret = <client_secret>
+   scope = drive
+   token = <1 のトークン>
+   ```
+3. 取り込みの前に、出力先の親を作り、既存の資格情報のファイルがあれば**退避します**（出力先は上書きされません）。新しい機体では`/etc/geoframe-export`が無いので、先に作ります（root 所有・0700。既にあれば、そのまま）。
+   取り込みが失敗したら、退避したファイルを元の名前へ戻します（`sudo mv -f /etc/geoframe-export/drive-credentials.json.old /etc/geoframe-export/drive-credentials.json`。退避していなければ要りません）。
+   ```sh
+   sudo install -d -m 0700 -o root -g root /etc/geoframe-export
+   if sudo test -e /etc/geoframe-export/drive-credentials.json; then
+     sudo mv /etc/geoframe-export/drive-credentials.json /etc/geoframe-export/drive-credentials.json.old
+   fi
+   sudo /usr/local/bin/geoframe-export import-credentials \
+     --rclone-config /root/geoframe-reauth/rclone.conf --remote gdrive \
+     --out /etc/geoframe-export/drive-credentials.json
+   sudo ls -l /etc/geoframe-export/drive-credentials.json   # -rw------- root root
+   ```
+4. サービスを再起動します（資格情報は起動のたびに読まれるので、動いているサービスは再起動するまで古い値のままです）。
+   ```sh
+   sudo systemctl reset-failed geoframe-export
+   sudo systemctl restart geoframe-export
+   journalctl -u geoframe-export -n 20   # 起動時の検査（トークンと 3 つのフォルダ）を通ったことを見る
+   ```
+   取り込みはできたのに、起動時の検査で失敗したとき（終了コード 2 のまま）は、journal で原因を見ます。**新しい資格情報が原因でない（フォルダの ID の誤りなど）なら**、原因を直してから起動し直します。
+   新しい資格情報が原因で、退避した`.old`があるときは、元へ戻して起動し直します（`.old`が無い新規の機体では、新しいファイルを消して、手順 1 からやり直します）。
+   手順 1 からやり直すときは、前回の一時`rclone.conf`が残っていると、手順 2 の`set -C`が上書きを断ります。**先に前回の一時ファイルを消してから**、手順 2 で作り直します（`/root/geoframe-reauth`のディレクトリは残して使えます。無ければ手順 2 の`install -d`が作ります）。
+   ```sh
+   sudo rm -f /root/geoframe-reauth/rclone.conf   # やり直すときだけ。前回の一時ファイル（Drive 全体の権限の値）を消す
+   ```
+   `.old`を戻して起動し直すときは、次のとおりです。
+   ```sh
+   sudo mv -f /etc/geoframe-export/drive-credentials.json.old /etc/geoframe-export/drive-credentials.json   # 退避していたときだけ
+   sudo systemctl reset-failed geoframe-export
+   sudo systemctl restart geoframe-export
+   ```
+5. **起動時の検査を通ったのを確かめてから**、一時ファイルと、退避した古い資格情報を消します（どちらも Drive 全体の権限の値です）。通らなかったときは、`.old`を消さずに原因を調べます。
+   ```sh
+   sudo rm -rf /root/geoframe-reauth
+   sudo rm -f /etc/geoframe-export/drive-credentials.json.old
+   ```
+6. 認可の失効でジョブが途中で止まっていたら（`blocked`、または`running`のまま）、`recover`で結果を確かめます。
+   - `running`のまま残ったジョブは、サービスの起動時（または次の書き出しの前）の復旧が、Drive と照らして片付けます。手順 4 の再起動のあとに、引数なしの`recover`で、`running`が残っていないことを確かめます。
+   - `blocked`は、自動では片付きません。引数なしの`recover`が表示する、Drive の今の状態と動きを読み、Drive の画面で必要な片付けを済ませてから、`--resolve`で解除します。`--resolve`は、未解除の`blocked`だけを受け付けます（`running`など、ほかの状態のジョブは断られます）。`--resolve`は Drive に触れず、解除の日時を記録に書くだけです（設計 4.2 の復旧）。
+   ```sh
+   sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover
+   sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover --resolve <job_id>   # blocked だけ。Drive の画面で片付けたあと
+   ```
+
+`rclone authorize`で作る`rclone.conf`の`token`の中のアクセストークンは約 1 時間で切れますが、取り込むのは`refresh_token`だけです。取り込んだあとは、この`rclone.conf`は要りません。
 
 ### 8.4 トークンと環境ファイル
 
@@ -581,7 +656,7 @@ root でトークンを作って`chmod`すると、専用ユーザーが書き�
 置き場所は unit から見える場所にします。**`/home`の下は、unit の`ProtectHome=yes`で見えません。** 状態ディレクトリの下の絶対パス（上の`/var/lib/geoframe-export/token`）にしてください。
 呼び出し側には安全な経路で別に渡します。
 
-tailnet の IP・許可する送信元・トークンのファイルのパスは、unit に書かず`/etc/default/geoframe-export`（`0600 root:root`。無ければ起動しない）に置きます。
+tailnet の IP・許可する送信元・トークンのファイルのパス・**Drive のフォルダの ID** は、unit に書かず`/etc/default/geoframe-export`（`0600 root:root`。無ければ起動しない）に置きます。
 drop-in で`ExecStart=`を上書きする形にはしません: CLI の包み（`geoframe-export-admin.sh`）が、unit と同じ設定の引数を使うためです。
 
 | 変数 | 意味 | 例（文書用の予約アドレス） |
@@ -589,38 +664,114 @@ drop-in で`ExecStart=`を上書きする形にはしません: CLI の包み（
 | `GEOFRAME_EXPORT_LISTEN` | 待ち受ける tailnet の IP とポート。tailnet の帯（IPv4 は`100.64.0.0/10`、IPv6 は`fd7a:115c:a1e0::/48`）とループバック以外の IP、`0.0.0.0`・`::`は起動時に拒否される | `192.0.2.1:8090` |
 | `GEOFRAME_EXPORT_TOKEN_FILE` | トークンのファイルのパス | `/var/lib/geoframe-export/token` |
 | `GEOFRAME_EXPORT_ALLOW_ARGS` | 許可する送信元 IP を`--allow <IP>`の並びで書く（呼び出し側と、このホスト自身）。値に空白があるので二重引用符で囲む | `"--allow 192.0.2.10 --allow 192.0.2.11"` |
+| `GEOFRAME_EXPORT_FOLDER_YAMARECO` | 宛先`yamareco`の親フォルダの Drive ID | （値は書かない） |
+| `GEOFRAME_EXPORT_FOLDER_TRAVEL_JOURNAL` | 宛先`travel-journal`の親フォルダの Drive ID | （値は書かない） |
+| `GEOFRAME_EXPORT_WORK_FOLDER` | 作業用フォルダ（中に`incoming/`・`replaced/`を作る）の Drive ID | （値は書かない） |
+| `GEOFRAME_EXPORT_VERIFY_FOLDER_YAMARECO`・`…_VERIFY_FOLDER_TRAVEL_JOURNAL`・`…_VERIFY_WORK_FOLDER` | 検証用の入口（`geoframe-export-admin.sh --verify`。§8.8 の 4）が使う、検証用の同じ 3 つのフォルダの ID。サービスは読まない | （値は書かない） |
+
+**新規の配置**で、ファイルがまだ無いときだけ、空のファイルを作ります（`install`は既にあるファイルを空にするので、無条件には実行しません）。中身は各自で書きます（上の変数）。
 
 ```sh
-sudo install -o root -g root -m 0600 /dev/null /etc/default/geoframe-export   # 中身は各自で書く（上の 3 つの変数）
+sudo test -e /etc/default/geoframe-export || sudo install -o root -g root -m 0600 /dev/null /etc/default/geoframe-export
+sudoedit /etc/default/geoframe-export   # 値をコマンドの引数に書かず、シェルの履歴にも残さない
 ```
+
+**rclone 版からの切り替え**では、ファイルが既にあります。**空にせず**、先に退避してから、Drive の ID の行（上の表の、フォルダの 3 つと検証用の 3 つの計 6 つの変数）を**足します**。既にある行は消しません。
+
+```sh
+sudo cp -p /etc/default/geoframe-export /etc/default/geoframe-export.bak   # 退避（持ち主・モードも保つ）
+sudoedit /etc/default/geoframe-export                                      # 6 つの変数の行を足す
+sudo ls -l /etc/default/geoframe-export                                    # -rw------- root root のままであること
+```
+
+足した行の形は、次の項のとおりです。古い版は新しい変数を読まないので、戻すときに行を消す必要はありません（`.bak`は、切り替えが落ち着いてから消します）。
+
+
+- Drive のフォルダの ID は、Drive の画面でそのフォルダを開いたときの URL の`folders/`の後ろの文字列です（`https://drive.google.com/drive/folders/<ID>`）。
+  `KEY=値`の形で**1 変数 1 行**、値は英数字・`_`・`-`だけ（引用符・空白・コメントは付けません。包みはこの形だけを読み、形が違うと断ります）。
+- 3 つの ID は**別のフォルダ**で、どれも他のどれかの中にあってはいけません（書き出し先の親が作業用フォルダの中にある、など）。ショートカット・ゴミ箱の中のフォルダも使えません。
+  資格情報の持ち主が読み書きできるフォルダを指します。起動時に Drive へ問い合わせて確かめ、違うと終了コード 2 になります（ID の値は出ません。引数名だけが出ます）。
 
 systemd の展開では、`${GEOFRAME_EXPORT_LISTEN}`のような`${…}`は値が 1 つの引数になり、`$GEOFRAME_EXPORT_ALLOW_ARGS`は空白で分かれた 0 個以上の引数になります
 （unit の`ExecStart`と`systemd.service(5)`）。どれかが空・未設定だと、`geoframe-export`が引数を断って終了コード 2 になり、`RestartPreventExitStatus=2`で再起動ループにはなりません。
 
-### 8.5 Drive の作業用フォルダ
+### 8.5 Drive のフォルダ
 
-書き出し先の親フォルダ（`yamareco/`・`travel-journal/`）とは別の、最上位のフォルダ `geoframe-export-work`（既定。`--work-root`）を、Drive の画面で作ります。
+書き出し先の親フォルダ（`yamareco/`・`travel-journal/`）とは別の、最上位のフォルダ（例: `geoframe-export-work`）を、Drive の画面で作ります（作業用フォルダ）。
 受け取り側が一覧する親フォルダの下に、作業用のものを見せないためです。このフォルダは誰とも共有しません。`yamareco/`・`travel-journal/`も先に存在している必要があります。
-検証用の書き出し（§8.8 の 4）には、別の作業用フォルダ（`geoframe-export-verify-work`）と宛先の親フォルダを、同じように作ります。
-別の名前にするときは、`--work-root`を unit と、包みの**本番の入口の分岐**（`geoframe-export-admin.sh`の`else`の`extra_args`）の両方に足します（remote 名は`gdrive`のまま、親フォルダの下にも入れ子にもしない）。
-包みの検証用の入口（`VERIFY_ARGS`）の作業用フォルダは変えません（本番の作業用フォルダとは別のままにします）。足すのはリポジトリ側で変えてコミットしてからです（本番の`/opt/geoframe`のファイルは直接編集しません。§5）。
+フォルダの名前はサービスには関係ありません（ID で指します）。ID は§8.4 のとおり`/etc/default/geoframe-export`に書きます。作業用フォルダの中には、書き出しのたびに`incoming/`・`replaced/`が作られます。
+検証用の書き出し（§8.8 の 4）には、別の作業用フォルダ（例: `geoframe-export-verify-work`）と、検証用の宛先の親フォルダ（例: `geoframe-export-verify`の中の`yamareco`・`travel-journal`）を、同じように作ります（本番のフォルダとは入れ子にしません）。
 
 ### 8.6 unit の有効化（ユーザーの立ち会いで）
 
-1. `systemd-analyze verify /usr/local/lib/systemd/system/geoframe-export.service`（バイナリや rclone を置いたあとなら警告は出ません）。
+1. `systemd-analyze verify /usr/local/lib/systemd/system/geoframe-export.service`（バイナリを置いたあとなら警告は出ません）。
 2. CLI の包みで、まず**書かずに確認**します（§8.7 の`dry_run`。サービスの起動の前でも使えます）。包みの`systemd-run`の`-p`（`CapabilityBoundingSet=`の空の値など）を本物の`systemd-run`が受け付けるかは、試験がモックなので、この最初の実行で確かめます。
 3. 起動します。`sudo systemctl daemon-reload && sudo systemctl enable --now geoframe-export`、確認は`systemctl is-active geoframe-export`と`journalctl -u geoframe-export -f`です。
    待ち受けは`/healthz`（認証なし。送信元の許可は効く）で確かめます。
 
+#### 止める前の確認（切り替え・切り戻しの両方）
+
+`sudo systemctl stop geoframe-export`は、サービスだけを止めます。CLI（`geoframe-export-admin.sh`が`systemd-run`で作る一時 unit `geoframe-export-cli-*`）は止まりません。
+実行中のジョブ（`running`）や、解除していない`blocked`を残したまま、バイナリと unit を入れ替えないために、**入れ替えの前に**次の（a）〜（c）をこの順に済ませます。
+確認には、**今動いている版**のバイナリと、それに合う`geoframe-export-admin.sh`を使います（切り替えなら、`/opt/geoframe`を更新する前。切り戻しなら、戻す前の今の版）。
+
+- （a）新しい受付と CLI の起動を止めます。呼び出し側（別 VM のエージェント）に、書き出しの依頼を止めてもらいます。このホストで`geoframe-export-admin.sh`を使う人（自分を含む）にも、使わないよう伝えます。
+  確かめたあとに新しい書き出しが始まると、確認が無効になります。入れ替えを終えて、起動時の検査と`/healthz`を確かめるまで、止めたままにします。
+- （b）実行中のジョブを終わらせます。一時 unit が残っていないことを確かめます。
+
+  ```sh
+  systemctl list-units 'geoframe-export-*'   # geoframe-export-cli-*（検証用の入口の分も同じ名前）が出ないこと
+  journalctl -u geoframe-export -n 20        # サービスが書き出しの最中でないこと
+  ```
+
+  一時 unit があれば、終わるのを待ちます。待てないときは`sudo systemctl stop <unit 名>`で止めます（飛んでいる Drive の要求の終わりを待ってから、後始末をして終わります）。止めたジョブは`running`のまま残るので、（c）で片付けます。
+- （c）今動いている版の`recover`（引数なし。Drive も記録も変えません）で、`running`（未完了）と未解除の`blocked`が無いことを確かめます。
+
+  ```sh
+  sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover; echo "exit=$?"
+  ```
+
+  **終了コードが 0 でも、`jobs/`を一覧できない・読めない記録がある場合があります**（新旧どちらの`recover`も、その旨を表示したうえで終了コード 0 を返します。読めない記録が`running`や`blocked`かどうかは、`recover`には分かりません）。
+  先へ進めるのは、次の 3 つが**全部**そろったときだけです。
+  1. 終了コードが 0。
+  2. 全部の記録を読めた。次の 2 つの知らせが出力に無いこと。
+     - 「ジョブの記録のディレクトリ jobs/ を一覧できません。権限と持ち主を確かめてください。」
+     - 「読めない記録: jobs/<ジョブ ID>.json。中身を確かめて、そのファイルを手で退かしてください（recover --resolve では解除できません）。…」
+  3. `running`と未解除の`blocked`の表示が無い。全部そろえば、「未完了のジョブも、blocked のジョブも、片付けの知らせが残っているジョブもありません。」と出ます（知らせ（下の最後の項目）だけが残るときは、この文は出ません）。
+
+  一覧できない・読めない記録が 1 つでもあれば、**入れ替えを止めます**。原因（`jobs/`の権限・持ち主、壊れた記録のファイル）を直し、もう一度`recover`で確かめ直します。
+  読めない記録は`--resolve`では解除できません。中身（`status`が`running`・`blocked`でないか）を root で確かめて、問題がなければファイルを`jobs/`の外へ手で退かします（退かすまで、新しい書き出しは断られます）。
+  API 版の`recover`自体が起動時の検査で失敗するとき（終了コード 1・2）は、原因を直して確かめ直します（§8.10 の「起動しない」）。直せないまま前の版へ戻すなら、§8.9 の手順（止めてから入れ替え、戻した rclone 版の`recover`で確かめる）で行います。
+  - 終了コード 4（実行枠が取れない）は、書き出しが実行中です。（b）に戻ります。
+  - `running`が表示されたら、今の版のサービスを再起動して（`sudo systemctl restart geoframe-export`）、起動時の復旧に Drive と照合させます（数分は`/healthz`が答えません）。そのあと、もう一度`recover`で確かめます。
+  - 未解除の`blocked`が表示されたら、表示された Drive の今の状態を読み、Drive の画面で必要な片付けを済ませてから、`recover --resolve <job_id>`で解除します。解除してから、もう一度`recover`で確かめます。
+  - 「知らせ」だけが表示された記録は、手作業の片付けの知らせです。入れ替えを止める条件ではありませんが、読んで、必要なら片付けます。
+
+（a）〜（c）が済んだら、（d）サービスを止めて、バイナリと unit を入れ替えます。
+
+**rclone 版から切り替えるとき**は、次の順に行います。**古い unit（`--rclone*`の引数）のまま新しいバイナリを動かさない**ため、サービスを止めてからバイナリを入れ替えます（`import-credentials`は、新しいバイナリがディスクにあれば、サービスが止まっていても動かせます）。
+
+0. **`.prev`に残す前のバイナリが、エラーコード`drive_auth_invalid`を読める版であることを確かめます。** ジョブの記録はエラーコードを厳しく読むので、API 版が`drive_auth_invalid`を書いたあとに読めない版へ戻すと、その記録が「読めない記録」になります。
+   読めるのは、rclone 版のうち PR #87（コミット`911d162`）以降のものです（`1322a33`以前の rclone 版は読めません）。
+   今の`/usr/local/bin/geoframe-export`と`/opt/geoframe`がそれより古ければ、先に`911d162`の rclone 版（バイナリは§8.2 と同じ手順でビルドし、`sha256`を控える。`/opt/geoframe`は同じコミット）を、今までの rclone 版の手順で配って動くことを確かめ、それを`.prev`に残す前のバイナリにします。
+   `.prev`のバイナリと、§5 の手順 2 で控える「更新の前の SHA」は、**同じ版**（例: どちらも`911d162`）にそろえます。
+1. 上の（a）〜（c）を、**`/opt/geoframe`を更新する前に**済ませます（古い版のバイナリと、古い包みで確かめます）。
+2. 今のバイナリと unit を`.prev`に残す（§8.2）。
+3. `/opt/geoframe`を更新する（§5 の手順 2。更新の前の SHA を控える。unit・包み・この文書が新しくなる）。
+4. `sudo systemctl stop geoframe-export`で止める（上の（d））。
+5. 新しいバイナリと unit を置く（§8.2 の`install`）。資格情報を取り込む（§8.3。`/etc/geoframe-export`を先に作る）。`/etc/default/geoframe-export`は、退避してから、Drive のフォルダの 3 つの ID（と検証用の 3 つ）を**足す**（§8.4 の切り替えの手順、§8.5）。
+6. `sudo systemctl daemon-reload && sudo systemctl start geoframe-export`で起動し、journal の起動時の検査（トークン・3 つのフォルダ）が通ったことと`/healthz`を確かめます。通ったら、呼び出し側に再開を伝えます。
+7. §8.8 の確認へ進みます。**rclone 本体と`rclone.conf`（`/var/lib/geoframe-export/rclone/`）は、§8.8 の確認と切り戻しの練習が済み、しばらく様子を見るまで残します**（戻すときに前のバイナリが使います。撤去は別途）。
+
 起動の最初に、止まっていたジョブの復旧（Drive の照合）を済ませてから待ち受けます。止まったジョブがあると、再起動のあと数分は`/healthz`も答えず、接続が拒否されます
 （unit は`Type=simple`なので、systemd は待ちません）。呼び出し側は拒否されたら間隔を空けて再試行します。
-停止（SIGTERM）では接続を最大 75 秒待って打ち切り、実行中の rclone を止めて後始末を終えてから終わります（`TimeoutStopSec=180s`、`KillMode=mixed`）。
+停止（SIGTERM）では接続を最大 75 秒待って打ち切り、飛んでいる Drive の要求（1 つにつき最大 100 秒）の終わりを待って、アップロードのスレッドを全部止めて後始末を終えてから終わります（`TimeoutStopSec=180s`、`KillMode=mixed`）。
 tailnet の IP が起動直後にまだ無いときの bind の失敗（終了コード 1）は 15 秒おきに再試行します（300 秒に 10 回まで）。
 
 ### 8.7 CLI（`geoframe-export-admin.sh`）
 
 `geoframe-export`を root で直接動かさず（バイナリが断ります）、サービスと同じ専用ユーザー・設定・状態ディレクトリ・ハードニングで動かすには、`deploy/geoframe-export-admin.sh`を使います
-（`geoframe-admin.sh`と同じ考え方で、`systemd-run`の一時サービス（`geoframe-export-cli-<日時>-<番号>-<乱数>`）で動かします。本番の入口は、サービスと同じ実行枠`export.lock`を取るので、書き出しの実行中は終了コード 4 になります。検証用の入口（`--verify`）は、本番とは別の状態ディレクトリ・別の実行枠・別の rclone の設定の写しで動かし、本番のロックも本番の`rclone/`も使いません。
+（`geoframe-admin.sh`と同じ考え方で、`systemd-run`の一時サービス（`geoframe-export-cli-<日時>-<番号>-<乱数>`）で動かします。本番の入口は、サービスと同じ実行枠`export.lock`を取るので、書き出しの実行中は終了コード 4 になります。検証用の入口（`--verify`）は、本番とは別の状態ディレクトリ・別の実行枠・別の宛先の親フォルダと作業用フォルダ（Drive の ID は`/etc/default/geoframe-export`の`…_VERIFY_…`）で動かし、本番のロックも本番の記録も使いません。資格情報のファイルは本番と同じものです（バイナリはファイルを書き換えないので、検証用の写しは要りません）。
 一時サービスの名前は呼び出しごとに変えます。固定の名前だと、実行中かどうかを調べてから作るまでの間に別の呼び出しが入ったとき、名前の衝突で失敗して終了コード 4 になりません。
 実行中かどうかは`export.lock`に任せます）。
 
@@ -632,17 +783,17 @@ sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <YYYY-MM-DD> --des
 # 止まったジョブの確認（Drive は変えない）と、blocked の解除（Drive の状態を確かめたあと）
 sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover
 sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover --resolve <job_id>
-# 検証用の入口（--verify を最初の引数にする。別の状態ディレクトリ・宛先・作業用フォルダ・rclone の設定の写しで動かす。写しを先に作る。§8.8 の 4）
+# 検証用の入口（--verify を最初の引数にする。別の状態ディレクトリ・宛先・作業用フォルダで動かす。Drive の準備は先に済ませる。§8.8 の 4）
 sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from <YYYY-MM-DD> --destination yamareco --dry-run
-# 途中で止める（起動時に標準エラーへ出る一時サービスの名前を指定する。rclone を止めて後始末をしてから終わる。ジョブの記録は次の復旧が片付ける）
+# 途中で止める（起動時に標準エラーへ出る一時サービスの名前を指定する。飛んでいる Drive の要求の終わりを待ち、アップロードを止めて後始末をしてから終わる。ジョブの記録は次の復旧が片付ける）
 sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
 ```
 
 一時サービスの名前を控えそこねたら、`systemctl list-units 'geoframe-export-cli-*'`で探します。
 引数の中の`$`は`systemd-run`の`--expand-environment=no`で展開させず、そのまま`geoframe-export`へ渡します（systemd 254 以降のオプションです。それより古いと`systemd-run`が断ります）。
-宛先の接頭辞と作業用フォルダ（`--remote-yamareco`・`--remote-travel-journal`・`--work-root`）は、本番の入口では指定できません（包みが断ります。理由は§8.8 の 4）。検証は`--verify`で行います。
+宛先の親フォルダ・作業用フォルダ（`--folder-yamareco`・`--folder-travel-journal`・`--work-folder`）と、資格情報・通信先（`--drive-credentials`・`--drive-endpoint`）は、包みでは指定できません（包みが断ります。理由は§8.8 の 4）。検証は`--verify`で行います。
 
-`serve`は包みでは動かさず、サービスで動かします。unit の固定の引数（`--rclone`・`--rclone-config`・`--state-dir`・`--feed-base`）を変えるときは、
+`serve`は包みでは動かさず、サービスで動かします。unit の固定の引数（`--drive-credentials`・`--state-dir`・`--feed-base`）を変えるときは、
 包みの同じ値も変えます。どちらもリポジトリ側で変えてコミットし、§5 の手順で本番へ入れます（本番の`/opt/geoframe`のファイルは直接編集しません）。`bash deploy/geoframe-export-admin-test.sh`が、unit と包みの食い違いを検査します。
 
 ### 8.8 配置の後の確認（PRD・設計 10 章）
@@ -650,43 +801,63 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
 起動の前後に、次を確かめて記録します（記録は公開リポジトリの外に置きます）。
 
 1. 上りの帯域を測ります。転送時間の仮定（1 日の最多 322 枚・約 260MB を、上り 20Mbps で約 2 分、5Mbps で約 7 分。14 日の最多は約 580MB）と、
-   rclone の期限（写真の`copy`は既定 45 分、それ以外は 5 分。ジョブ全体は 60 分）を見直します。
+   Drive の操作の期限（写真の送信全体は`--drive-upload-timeout`の既定 45 分、一覧・フォルダの作成・移動・ゴミ箱へ移す・読み出しは`--drive-timeout`の既定 5 分。ジョブ全体は 60 分）を見直します。
 2. 共有範囲を確かめて記録します（設計 U7）。`yamareco/`・`travel-journal/`・作業用のフォルダの共有設定を Drive の画面で確認します。
    「リンクを知っている全員」や、オーナーと受け取り側以外への共有があれば、配置を止めてオーナーに確かめます（manifest に正確な座標が入り、全写真が出るため）。
    このサービスは共有設定を変えません。公開したフォルダは親フォルダの共有を受け継ぎます。
 3. 受け取り側が`lat`/`lon`の`null`と増えた枚数を扱えるか確かめます。位置の無い写真も出るので、受け取り側の検証と記事の作成が`null`で落ちないことを確かめます。
-4. 旧 manifest のある日で比べます。検証は、本番の記録・ロック・rclone の設定のどれにも触れない**検証用の入口**（`geoframe-export-admin.sh --verify`）で行います。
-   本番の入口に宛先の接頭辞だけを渡す形は使えません（包みが断ります）。それだと本番の状態ディレクトリを共有して、同じ日の本番の公開の記録（`published/`の下のその宛先のファイル）を検証用フォルダの ID で上書きしてしまい、
-   以後の`replace`が`not_managed`になるためです。途中で止まれば、復旧が本番の接頭辞で Drive を照合することにもなります。
+4. 旧 manifest のある日で比べます。検証は、本番の記録・ロック・宛先のどれにも触れない**検証用の入口**（`geoframe-export-admin.sh --verify`）で行います。
+   本番の入口に宛先のフォルダだけを渡す形は使えません（包みが断ります）。それだと本番の状態ディレクトリを共有して、同じ日の本番の公開の記録（`published/`の下のその宛先のファイル）を検証用フォルダの ID で上書きしてしまい、
+   以後の`replace`が`not_managed`になるためです。途中で止まれば、復旧が本番の宛先で Drive を照合することにもなります。
 
    | | 本番の入口 | 検証用の入口（`--verify`） |
    | --- | --- | --- |
-   | 状態ディレクトリ（`jobs/`・`published/`・`export.lock`・作業領域・rclone の HOME） | `/var/lib/geoframe-export` | `/var/lib/geoframe-export-verify` |
-   | `yamareco`の宛先（`--remote-yamareco`） | `gdrive:yamareco` | `gdrive:geoframe-export-verify/yamareco` |
-   | `travel-journal`の宛先（`--remote-travel-journal`） | `gdrive:travel-journal` | `gdrive:geoframe-export-verify/travel-journal` |
-   | 作業用フォルダ（`--work-root`） | `gdrive:geoframe-export-work` | `gdrive:geoframe-export-verify-work` |
-   | rclone の設定 | `/var/lib/geoframe-export/rclone/rclone.conf` | `/var/lib/geoframe-export-verify/rclone/rclone.conf`（本番のものの写し） |
+   | 状態ディレクトリ（`jobs/`・`published/`・`export.lock`・作業領域） | `/var/lib/geoframe-export` | `/var/lib/geoframe-export-verify` |
+   | `yamareco`の親フォルダ（Drive の ID を書く変数） | `GEOFRAME_EXPORT_FOLDER_YAMARECO` | `GEOFRAME_EXPORT_VERIFY_FOLDER_YAMARECO`（Drive 上は例えば`geoframe-export-verify/yamareco`） |
+   | `travel-journal`の親フォルダ | `GEOFRAME_EXPORT_FOLDER_TRAVEL_JOURNAL` | `GEOFRAME_EXPORT_VERIFY_FOLDER_TRAVEL_JOURNAL`（例: `geoframe-export-verify/travel-journal`） |
+   | 作業用フォルダ | `GEOFRAME_EXPORT_WORK_FOLDER` | `GEOFRAME_EXPORT_VERIFY_WORK_FOLDER`（例: `geoframe-export-verify-work`） |
+   | 資格情報 | `/etc/geoframe-export/drive-credentials.json` | 同じファイル（バイナリは書き換えないので、写しは要りません） |
 
-   - 準備（Drive）: Drive の画面で、共有せずに、最上位に`geoframe-export-verify`（その中に`yamareco`と`travel-journal`）と`geoframe-export-verify-work`を作ります。
-     本番の親フォルダ・作業用フォルダとは入れ子にしません。
-   - 準備（rclone の設定の写し）: 検証用の入口は、本番の rclone の設定を参照せず、次の手順で作った写しだけを読み書きします。
-     写しが無いと、包みもバイナリも起動を断ります（包みは、写しの無いことと、この手順を示します）。
-
-     ```sh
-     # 検証用の状態ディレクトリと rclone/ を、専用ユーザーの持ち物・0700 で作る（同じユーザーだけが読める）
-     sudo install -d -o geoframe-export -g geoframe-export -m 0700 /var/lib/geoframe-export-verify /var/lib/geoframe-export-verify/rclone
-     # 専用ユーザーとして、本番の設定を写す。umask 077 で最初から 0600 で作り、set -C で、既にあるファイルやリンクには書かない（root でコピーして chmod しない）
-     sudo -u geoframe-export sh -c 'umask 077; set -C; cat /var/lib/geoframe-export/rclone/rclone.conf > /var/lib/geoframe-export-verify/rclone/rclone.conf'
-     sudo ls -l /var/lib/geoframe-export-verify/rclone/rclone.conf   # -rw------- geoframe-export geoframe-export
-     ```
-
-     検証用の状態ディレクトリは、一時サービスの`StateDirectory=geoframe-export-verify`も同じ持ち主・0700 で扱います。
-   - 検証用の入口は、本番の`export.lock`を取らず、本番の`rclone/`にも触れません（`ReadWritePaths=`も足しません）。本番の書き出しと同時に動かしても、互いの記録・ロック・rclone の設定は書き換わりません。
-     rclone がアクセストークンを更新すると、本番と写しのそれぞれの設定に、新しいアクセストークンが書かれるだけです。Google の更新トークン（`refresh_token`）は、本番と写しの両方から使っても、通常は変わりません。
-     もし更新トークンが失効するなどして、片方で認証が通らなくなったら、検証用の写し（`/var/lib/geoframe-export-verify/rclone/rclone.conf`）を消して、上の手順で本番のものを写し直します。
+   - 準備（Drive）: Drive の画面で、共有せずに、最上位に検証用の親フォルダ（その中に`yamareco`と`travel-journal`）と検証用の作業用フォルダを作ります（§8.5）。
+     本番の親フォルダ・作業用フォルダとは入れ子にしません。それぞれの ID を、`/etc/default/geoframe-export`の`…_VERIFY_…`の 3 変数に書きます（§8.4）。
+     `--verify`の起動時の検査が照合するのは、**検証用の 3 つの ID の間だけ**です。検証用の変数に本番の ID を入れ間違えても、そのまま起動します（本番の宛先に書いてしまいます）。
+     そこで、**最初の書き込みの前に**、本番用の 3 つと検証用の 3 つの計 6 つを、次のように見比べます。
+     1. `/etc/default/geoframe-export`の 6 つの変数を、次の 3 段で確かめます（値は画面に出ません。出るのは、行の番号・変数名・行数・OK/NG・重複の数だけです）。
+        - (i) ファイルの**全部の行**が、空行・`#`で始まるコメント・大文字の`KEY=…`のどれかであること（先頭や`=`の前に空白のある行、`;`のコメント、バックスラッシュを含む行は NG）。
+          systemd の`EnvironmentFile=`は、同じ名前を**後の行が上書き**し、空白のある行や引用符も受け付けるので、包みが読む行（`^KEY=`）と、サービスが実際に使う値とが食い違う書き方を、ここで断ちます。
+        - (ii) 6 つの変数が、それぞれ**ちょうど 1 行**あり、値が Drive の ID の形（英数字・`_`・`-`の 1〜128 文字。包みが読む形と同じ）であること。
+        - (iii) 同じファイルを**systemd 自身に読ませて**（`systemd-run -p EnvironmentFile=`。常設のサービスと同じ読み方です）、(ii) で見た行の値と systemd が渡した値が一致し、6 つの値が互いに違うこと。
+          本番用と検証用で、同じ ID を書き間違えていないかも、ここで見ます。
+        最後に`OK`と出て、終了コードが 0 ならよいです。
+        ```sh
+        sudo systemd-run --pipe --wait --collect --quiet --expand-environment=no \
+          -p EnvironmentFile=/etc/default/geoframe-export \
+          /bin/sh -c '
+        f=/etc/default/geoframe-export; ng=0
+        K="GEOFRAME_EXPORT_FOLDER_YAMARECO GEOFRAME_EXPORT_FOLDER_TRAVEL_JOURNAL GEOFRAME_EXPORT_WORK_FOLDER GEOFRAME_EXPORT_VERIFY_FOLDER_YAMARECO GEOFRAME_EXPORT_VERIFY_FOLDER_TRAVEL_JOURNAL GEOFRAME_EXPORT_VERIFY_WORK_FOLDER"
+        n=$(grep -nEv "^(#[^\\]*|[A-Z][A-Z0-9_]*=[^\\]*)?$" "$f" | cut -d: -f1 | tr "\n" " ")
+        echo "(i) 形が違う行の番号: ${n:-なし}"; [ -z "$n" ] || ng=1
+        for k in $K; do
+          c=$(grep -c "^$k=" "$f"); v=$(grep "^$k=" "$f" | cut -d= -f2-); a=OK; m=OK
+          printf %s "$v" | grep -Eqx "[A-Za-z0-9_-]{1,128}" || a=NG
+          [ "$v" = "$(printenv "$k")" ] || m=NG
+          echo "(ii) $k 行数=$c 形式=$a systemd の値と一致=$m"
+          { [ "$c" = 1 ] && [ "$a" = OK ] && [ "$m" = OK ]; } || ng=1
+        done
+        d=$(printenv $K | sort | uniq -d | wc -l)
+        echo "(iii) systemd が渡した 6 つの値のうち、重複している値の数: $d"; [ "$d" = 0 ] || ng=1
+        if [ "$ng" = 0 ]; then echo OK; else echo NG; exit 1; fi
+        '; echo "exit=$?"
+        ```
+        `NG`の行は、`/etc/default/geoframe-export`を直してから、もう一度確かめます（(i) で番号が出た行は、空白・引用符・コメントの付いた行や、同じ変数の再定義です）。
+     2. Drive の画面で、本番側の 3 つのフォルダと検証用の 3 つのフォルダを開き、URL の`folders/`の後ろが、`/etc/default/geoframe-export`の対応する変数の値であることを、1 つずつ確かめます
+        （変数名とフォルダの名前を対応づけて見ます。値をチャットや記録に貼りません）。
+     3. 本番側のフォルダが検証用のフォルダの中に、検証用のフォルダが本番側のフォルダの中にないこと（同じフォルダや入れ子がないこと）を、Drive の画面で親をたどって確かめます。
+   - 検証用の状態ディレクトリは、一時サービスの`StateDirectory=geoframe-export-verify`が、専用ユーザーの持ち物・0700 で作ります（先に作る必要はありません）。
+     検証用の入口は、本番の`export.lock`を取らず、本番の状態ディレクトリにも触れません。本番の書き出しと同時に動かしても、互いの記録・ロックは書き換わりません。
    - 旧 manifest と比べる手順は、次の 3 つを、この順に行います（ここに 1 か所だけ書きます）。
      1. 本番の入口で`--dry-run`します（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <日付> --destination yamareco --dry-run`）。
-        旧 manifest のある日を使います。Drive を読むだけ（`lsjson`・`cat`）で、本番の記録・Drive は変わりません。
+        旧 manifest のある日を使います。Drive を読むだけ（一覧と読み出し）で、本番の記録・Drive は変わりません。
         宛先の状態（`target`・`existing_files`）と、書き出す枚数（`candidate_count`）を控えます。
         旧 manifest のフォルダは旧実装が書いたもので、公開の記録（`published/`の下のその宛先のファイル）が無いので、`managed`が`false`なのは正しい挙動です（この入口では`replace`しません）。
      2. 同じ日を`--verify`で書き出します（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from <日付> --destination yamareco`）。
@@ -694,39 +865,173 @@ sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
      3. 比べます。検証用の宛先にできた`manifest.json`と旧 manifest を比べ、増えた枚数（フィード外の写真）以外の枚数・ファイル名・サイズが合うことを見ます。
         呼び出し側の実際の検証（サイズの突き合わせ）まで通ることも確かめます。あわせて、検証の前後で、本番の`published/`の下のファイルの更新時刻が変わらないことを確かめます
         （検証用の書き出しの記録は、検証用の状態ディレクトリにだけ残ります）。
-   - 最初の検証用の実行で、写しへ rclone が設定を書き戻せることを、5 の確認と合わせて見ます（試験はモックなので、ここで初めて確かめます）。
-   - **検証が終わったら、写しを必ず消します**（通常の削除で足ります）。写しは、本番と同じ Drive 全体の権限の資格情報（更新トークンと`client_secret`）で、残しておく理由がありません。
-     あわせて、検証用の Drive のフォルダと検証用の記録も消してかまいません（本番の記録ではありません）。
+   - **検証用の記録（`/var/lib/geoframe-export-verify`）と検証用の Drive のフォルダは、ここでは消しません。** 後の手順 8 の MD5 の照合（検証用の`published/`の記録と、検証用のフォルダの中のファイル）と、停止の試験で使うためです。
+     片付けは、§8.8 の全部の検証（手順 8 の MD5 の照合を含む）が済んだあとの、手順 10 で行います。
 
-     ```sh
-     sudo rm -f /var/lib/geoframe-export-verify/rclone/rclone.conf
-     sudo rm -rf /var/lib/geoframe-export-verify   # 検証用の記録ごと消す場合
-     ```
-
-5. rclone のトークン更新が unit の権限の下で動くこと（設定ファイルを書き戻せること）を確かめます。アクセストークンは約 1 時間で切れ、更新は`rclone.conf`への書き戻しを伴います。
-   書き出しの実行中か、1 時間を空けた 2 回目の実行のあとで、`rclone.conf`の更新時刻が変わり、持ち主と`0600`が保たれていること、journal に権限のエラーが無いことを見ます。
-6. unit のハードニングの未確定分は、2026-11-22 に本番で実測して決めました（`geoframe-export.service`のコメントにも同じ値を残してあります）。
-   - `RestrictAddressFamilies=AF_INET AF_INET6`は、そのままで足りました（`AF_UNIX`・`AF_NETLINK`は要りませんでした）。
-   - `MemoryDenyWriteExecute=true`を付けて通りました。
-   - `MemoryMax=512M`・`TasksMax=64`を入れました。14 日の最多（880 枚・690MB）の書き出し中、anon メモリは最大 38.5MB、ページキャッシュは最大 660MB、タスクは最大 24 でした。
-     `MemoryMax=256M`・`TasksMax=64`・`MemoryDenyWriteExecute=true`でも成功しました。`MemoryMax`は、ページキャッシュの回収で詰まらないよう、余裕を見て 512M にしています。
+5. **トークンを取り直しても、資格情報のファイルが変わらないこと**を確かめます。アクセストークンは約 1 時間で切れ、取り直しはメモリの中だけで行います（ファイルは書き換えません）。
+   `sudo stat -c '%y %U %a' /etc/geoframe-export/drive-credentials.json`の更新時刻・持ち主・モードを控え、書き出しの実行中か、1 時間を空けた 2 回目の実行のあとにもう一度見て、同じであること、
+   journal に認可のエラー（`drive_auth_invalid`・401）が無いことを見ます。
+6. unit の`LoadCredential=`と`ExecStart`の`--drive-credentials %d/drive-credentials`が、実際に展開されること（サービスが起動し、journal に資格情報を読めないという理由の終了が無いこと）を確かめます。`LoadCredential=`の写しは、所有者 root・グループ root・0440 で、サービスのユーザーには ACL で読み取りが付きます。バイナリはこの形（グループの読み取りは、グループが root のときだけ許す）を受け付けます。断られて終了コード 2 になるときは、journal の「資格情報のファイルを読めません」を見ます。
+7. unit のハードニングの値を、API 版で測り直します。値は、rclone 版を動かしていた 2026-11-22 に本番で実測して決めたもので、API 版は送信を並列 4 で行い（multipart は 1 本につき、中身と本文で最大 16MiB 弱をメモリに持ちます。4 本で 64MiB 前後）、スレッドも増えます
+   （`geoframe-export.service`のコメントにも同じ値と理由を残してあります）。14 日の最多（880 枚・690MB）の書き出しで、次を測ります。
+   - `RestrictAddressFamilies=AF_INET AF_INET6`で足りること（名前解決が`AF_UNIX`・`AF_NETLINK`を要しないこと。rustls・ring を使うので、`MemoryDenyWriteExecute=true`も合わせて見ます）。
+   - `MemoryMax=512M`・`TasksMax=64`で足りること（journal に OOM・タスク上限の記録が無く、書き出しが成功すること。測った値を控えて、足りなければ値を直してコミットします）。
      この値は、書き出す画像が表示用の大きさ（長辺 2560px）であることが前提です。派生の大きさを変えるときは、`MemoryMax`を測り直します。
-     同じ 3 つの値を`geoframe-export-admin.sh`にも入れてあります（食い違いは`geoframe-export-admin-test.sh`が検査します）。
-7. 本物の rclone で確かめる点（試験は偽の rclone で行ったため、本物の挙動はここで初めて確かめます。検証用の入口（`--verify`）で行う）。
-   - `moveto`が、フォルダの ID を保ったまま移すこと（ファイル単位の移動に切り替わらないこと。結果の ID の照合で`blocked`にならないこと）。
-   - `lsjson`の`--drive-show-all-gdocs`・ショートカットの見え方（宛先と同じ名前のフォームやショートカットが`ambiguous_destination`として見えること）。
-   - 無いディレクトリへの一覧で、終了コード 3 が返ること。
-   - `lsjson -R --hash --hash-type MD5`で、Drive のバイナリのファイル（写真と`manifest.json`）に、`Hashes`の`md5`（小文字の 16 進 32 文字）が出ること。
-     その値が、作業領域のファイルの MD5（`md5sum`）と一致すること。フォルダには`Hashes`が付かないこと。Google のネイティブ文書では`Hashes`が付かないこと
-     （一式に無いファイルとして断られます）。`replace`の前の確認（`modified`）と、ゴミ箱へ移す前の確認（`retired_content_changed`）は、この MD5 に頼ります。
+     同じ値を`geoframe-export-admin.sh`にも入れてあります（食い違いは`geoframe-export-admin-test.sh`が検査します）。
+8. **本物の Drive で確かめる点**（試験は偽の Drive の HTTP サーバーで行ったため、本物の挙動はここで初めて確かめます。検証用の入口（`--verify`）で行う）。
+   - 起動時の検査（トークン・3 つのフォルダとその祖先）と、ジョブの始めの確認の所要時間。`--drive-timeout`の既定（5 分）で足りること。
+   - 移動（公開・退避）で、フォルダの ID が保たれること（移したあとの ID の照合で`blocked`にならないこと）。
+   - 宛先と同じ名前のフォームやショートカットが、`ambiguous_destination`として見えること。
+   - `md5Checksum`が、Drive のバイナリのファイル（写真と`manifest.json`）に付くこと。その値が、書き出したファイルの MD5 と一致すること。フォルダ・Google のネイティブ文書には付かないこと
+     （一式に無いファイルとして断られます）。
+     作業領域のファイルはジョブの終わりに消えるので、書き出しのあとに`md5sum`では比べられません。成功のあとは、**検証用の状態ディレクトリの`published/`に保存されたファイルごとの MD5**を使います。
+     `/var/lib/geoframe-export-verify/published/<種類>-<フォルダ名>.json`（例: `yamareco-<日付>.json`。専用ユーザーの 0700 なので`sudo`で読みます）の`entry.files[]`に、一式の全部（写真と`manifest.json`）の`path`と`md5`（小文字の 16 進 32 文字）があります。
+     Drive の`md5Checksum`は、Drive の画面には出ません。Drive API の`files.get`（`fields=md5Checksum`。API Explorer でも読めます）で、検証用のフォルダの中のファイルごとに読み、`entry.files[]`の`md5`と照らします。
+     画面からファイルをダウンロードして、その`md5sum`を`entry.files[]`の`md5`と照らす方法でも確かめられます。`md5sum -c`に使う一覧は、次のように作れます（ダウンロードしたファイルのあるディレクトリで）。
+     ```sh
+     sudo python3 -I -c 'import json,sys; [print(f["md5"] + "  " + f["path"]) for f in json.load(open(sys.argv[1]))["entry"]["files"]]' \
+       /var/lib/geoframe-export-verify/published/<種類>-<フォルダ名>.json > md5.list
+     md5sum -c md5.list
+     ```
+     `replace`の前の確認（`modified`）と、ゴミ箱へ移す前の確認（`retired_content_changed`）は、この MD5 に頼ります。
      書き出し直したフォルダに、Drive の画面で同じ名前・同じ大きさで中身だけ違うファイルを上書きしたときも、`--dry-run`の`managed`は`true`のままです
      （公開の記録にそのフォルダの ID と MD5 があり、manifest の`generator`・`destination`・`folder`が合っていれば、管理フォルダとして扱います）。`replace`は中身の MD5 の照合で`conflict`（`modified`）になり、終了コード 3 で断られます。
      フォルダの中に Google ドキュメントがある場合も、同じく`modified`で断られます。これらも見ます。
-   - `cat --count`など、使う引数が rclone に受け付けられること。
+   - **rclone 版が公開したフォルダ**を、API 版が管理しているフォルダとして扱えること（本番の入口の`--dry-run`で、`managed`が`true`になること）。そのうえで、オーナーが選んだ日で`--on-exists replace`を 1 回行い、置き換えが通ることを確かめます。
+   - 置き換えで退避した旧フォルダが、**Drive のゴミ箱へ移り、フォルダと中身ごと戻せる**こと（Drive の画面のゴミ箱で「復元」できること。完全な削除はしません）。
+   - 429・403（流量制限）の実際の応答と、再試行の回数（journal の操作名・状態コード・再試行の回数だけが出ます。URL のクエリ・トークン・ファイル名は出ません）。
+   - **8MiB を超えるファイル（resumable）を 1 つ**、本物の Drive へ送ること。本番の写真は 1 枚 1MB 前後で、通常の関門ではこの経路が通りません。チャンクの`PUT`に`Authorization`を付けない判断（セッションの URL が認可する）、
+     `Content-Range`・308・`Range`の形、同じ ID での始め直しも、ここで本物で確かめます。
+   - SIGTERM（`systemctl stop`）から 180 秒以内に止まること。**常設のサービスを再起動する形では試しません**: サービスは本番の状態ディレクトリだけを復旧の対象にするので、検証用の記録の`running`は片付かず、検証用の復旧の確かめになりません。
+     検証用の入口で、次の順に行います（本番の入口・本番のサービスは使いません）。
+     1. 検証用の書き出しを始めます（`sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify run --from <日付> --destination yamareco`。`--dry-run`は付けません）。
+        日付は、書き出せる写真が**多い日**で、**検証用の宛先にまだ書き出していない日**を選びます（書き出し済みの日は`conflict`で終わり、アップロードまで進みません。写真が少ないと、止める前に終わります）。
+        包みが標準エラーに出す一時 unit の名前（`geoframe-export-cli-…`）を控えます（控えそこねたら`systemctl list-units 'geoframe-export-cli-*'`）。
+        **一時 unit の名前が出た時点では、起動時の検査や写真の取得の途中のことがあります。** この段で止めると、Drive へのアップロードの前なので`interrupted`で終わり、停止の試験になりません。
+     2. **アップロードが始まったのを確かめてから**、別の端末から、その一時 unit を止めます。始まったことは、次のどちらかで見ます。
+        - Drive の画面で、検証用の作業用フォルダの`incoming/`の中に、今回のジョブのフォルダができ、中のファイルが増えていくこと。
+        - 検証用の状態ディレクトリの、今回のジョブの記録の`stage`が`uploading`になっていること（`status`は`running`のまま）。`uploading`は、`incoming/`のフォルダを作る前から付くので、**表示されてから数秒待ち、Drive の画面で`incoming/`の中にファイルが現れるのを見てから**止めます。表示するのは`status`と`stage`だけです。
+          ```sh
+          sudo sh -c 'for f in /var/lib/geoframe-export-verify/jobs/*.json; do echo "$f"; grep -E "\"(status|stage)\":" "$f"; done'
+          ```
+          今回のジョブは、`status`が`running`のものです。`stage`の行が無い（`progress`が`null`）間は、まだ取得の途中です。
+        始まったら、止めるのにかかった時間を測り、180 秒以内であることを見ます。
+        ```sh
+        time sudo systemctl stop geoframe-export-cli-<日時>-<番号>-<乱数>
+        ```
+     3. 検証用の`recover`（引数なし。Drive も記録も変えません）で、`running`の記録が残っていることを確かめます。
+        ```sh
+        sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover
+        ```
+     4. 検証用の次の書き出し（`--verify run …`。`--dry-run`ではないもの）を行います。書き出しの前の復旧が、`running`のまま残った記録を、Drive と照らして片付けます。
+     5. もう一度`--verify recover`で、`running`が残っていないことを確かめます。`blocked`になった記録だけは自動では片付かないので、`recover`が表示する検証用の Drive の状態を読み、Drive の画面で片付けてから、解除します（`--resolve`は未解除の`blocked`だけを受け付けます。包みは、`--verify`のあとの`recover --resolve`も受け付けます）。
+        ```sh
+        sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover --resolve <job_id>
+        ```
+     サービス自体の停止（本番の`systemctl stop geoframe-export`）は、切り替え・切り戻しの実際の入れ替え（§8.6 の（d）、§8.9）で、停止にかかった時間が`TimeoutStopSec=180s`以内であることを見ます（同じ値です）。
+9. 切り戻しの練習をします（§8.9 の手順 1〜5 を、書き出しのない時間に、受付と CLI を止めて行います。**練習では、手順 5 の「呼び出し側に再開を伝える」は行いません**。再開は、下の API 版への切り替え直しで`/healthz`が通ってから伝えます）。**始める前に、ビルドした API 版のバイナリ（`sha256`を控えたもの）が手元にあることを確かめます**（練習のあとの切り替え直しで使います。本番の`/usr/local/bin/geoframe-export`は、練習で rclone 版に置き換わります）。前のバイナリ・前の unit・前の包みで起動できること、戻した版の`recover`が§8.6 の（c）と同じ条件を満たすこと、`/healthz`が答えることを確かめます。
+   **練習のあとは rclone 版（バイナリ・unit・`/opt/geoframe`の包み）が入っています。** そのまま手順 10 に進むと、`--verify`の包みが rclone 版のもの（検証用の rclone の設定の写しを要る）になり、検証用の Drive の ID も読みません。
+   **先に API 版へ切り替え直します**（受付と CLI は止めたままにします）。
+   - 今動いているのは rclone 版なので、まず（a）〜（c）（§8.6）を、今の`/opt/geoframe`の包みと rclone 版の`recover`で確かめます。
+   - 常設のサービスを止め、`systemctl is-active`が`inactive`であることを確かめます。
+   - `/opt/geoframe`にローカルの変更が無いこと（`sudo git -C /opt/geoframe status --porcelain`が何も出さないこと）を確かめてから、§5 の手順 2 で控えた**更新後の SHA**（API 版のコミット）へ戻します（`git reset --hard`）。
+   - API 版のバイナリ（§8.2 でビルドして`sha256`を控えたもの）と unit（`/opt/geoframe/deploy/geoframe-export.service`）を、§8.2 の`install`で置き直します（`&&`でつなぎ、1 つでも失敗したら先へ進みません）。**`.prev`へ写す`cp`は行いません**（`.prev`は rclone 版のままにします）。
+   - `sudo systemctl daemon-reload && sudo systemctl start geoframe-export`で起動し、起動時の検査（トークン・3 つのフォルダ）と`/healthz`を確かめます。
+   - 資格情報の取り込みと`/etc/default/geoframe-export`の追記は済んでいるので、行いません。
+   起動時の検査と`/healthz`が通り、呼び出し側に再開を伝えてから、手順 10 へ進みます。
+10. **手順 8 までの検証（MD5 の照合・停止の試験を含む）が全部済み、手順 9 のあとに API 版へ切り替え直してから**、検証用の記録と Drive のフォルダを片付けます（どちらも本番の記録・宛先ではありません）。
+    - 先に、検証用の入口で動いている CLI を止め、記録を確かめます。
+      ```sh
+      systemctl list-units 'geoframe-export-cli-*'   # 検証用の入口の分も同じ名前。出たら、終わるのを待つか、sudo systemctl stop <unit 名>
+      sudo /opt/geoframe/deploy/geoframe-export-admin.sh --verify recover; echo "exit=$?"
+      ```
+      §8.6 の（c）と同じ条件（終了コードが 0、一覧できない・読めない記録の知らせが無い、`running`と未解除の`blocked`が無い）を満たすまで、消しません。
+    - 満たしたら、検証用の状態ディレクトリを消します。
+      ```sh
+      sudo rm -rf /var/lib/geoframe-export-verify
+      ```
+    - 検証用の Drive のフォルダ（検証用の宛先の親フォルダと作業用フォルダ）は、Drive の画面でゴミ箱へ移してかまいません。移したあと、`/etc/default/geoframe-export`の`…_VERIFY_…`の 3 変数は、次に検証するまで使いません（残してかまいません。新しいフォルダを作ったら、ID を書き直します）。
 
-### 8.9 トラブルシュート
+### 8.9 切り戻し
 
-- 起動しない（終了コード 2、`failed`のまま止まる）: `journalctl -u geoframe-export`に、検査に通らなかった項目の名前（`--listen`・`--token-file`・rclone の設定の持ち主やモード・`client_id`の空など）が出ます（値は出ません）。直したあと、`sudo systemctl reset-failed geoframe-export`で失敗の印を消し、`sudo systemctl start geoframe-export`で起動します。
+API 版で問題が出たら、前のバイナリ（rclone 版）・前の unit・前の包み（`/opt/geoframe`のコミット）に戻します。ジョブの記録と公開の記録の形式は変わらないので、前のバイナリが読めます。
+**戻すには、§8.2 で`.prev`に残した 2 つ、§5 の手順 2 で控えた更新の前の SHA、rclone 本体（`/usr/local/bin/rclone`）・`rclone.conf`（`/var/lib/geoframe-export/rclone/`）が要ります**（切り替えのあとも、しばらく残します）。
+また、手順 4 で条件がそろわず元へ戻すとき（後述）のために、ビルドした API 版のバイナリと、§5 の手順 2 で控えた更新後の SHA も手元に残します。
+
+API 版が動いているときも、起動できないとき（資格情報の欠落・フォルダの ID の誤り・Drive への接続の失敗など）も、**同じ手順**で行います。順序は次のとおりです。
+
+1. 手順 3 の`git reset --hard`で、この文書も前の版に置き換わります。**この手順を、別の場所（別のウィンドウ・印刷）に開いてから**始めます。
+   受付と CLI の起動を止め、一時 unit が無いことを確かめます（§8.6 の（a）（b））。サービスを止める前に、rclone 版が使う 2 つが残っていることも確かめます。
+   ```sh
+   sudo ls -l /usr/local/bin/rclone /var/lib/geoframe-export/rclone/rclone.conf   # どちらも在ること
+   ```
+   API 版が動くときは、続けて§8.6 の（c）（API 版の`recover`）も済ませます（Drive と照らして、`running`と未解除の`blocked`を片付けておくため）。API 版が起動できないときは、（c）は飛ばします。手順 4 で確かめます。
+2. **常設のサービスを止め**、止まったことを確かめます。`Restart=on-failure`なので、API 版が起動できないときは、止めないうちに systemd が起動をやり直して、記録を書き換えることがあります。
+   ```sh
+   sudo systemctl stop geoframe-export
+   sudo systemctl reset-failed geoframe-export   # failed のとき（再起動の待ちと開始の制限の印を消す）。そうでなければ何も起きない
+   systemctl is-active geoframe-export           # inactive と出ること。activating・deactivating・active のうちは、先へ進まない
+   ```
+   起動をやり直している最中（`activating`）のサービスも、`stop`で止まり、そのまま`inactive`にとどまります（systemd 257 で確かめました）。
+   止めるのにかかった時間は、`TimeoutStopSec=180s`以内のはずです（§8.8 の 8）。
+3. **サービスを止めたまま**、前の版へ入れ替えます（まだ start しません）。
+   先に`/opt/geoframe`にローカルの変更が無いことを確かめます（`git reset --hard`は追跡しているファイルの変更を消し、戻す先と衝突する追跡外のファイルも消します）。何か出たら、中身を確かめて退避してから進みます。
+   ```sh
+   sudo git -C /opt/geoframe status --porcelain   # 何も出ないこと
+   ```
+   入れ替えは、1 つでも失敗したら先へ進まないよう、`&&`でつないで行います（失敗したら、表示を読んで直し、この手順 3 をやり直します）。
+   ```sh
+   sudo git -C /opt/geoframe reset --hard <§5 の手順 2 で控えた、更新の前の SHA> \
+     && sudo cp -p /usr/local/bin/geoframe-export.prev /usr/local/bin/geoframe-export \
+     && sudo cp -p /usr/local/lib/systemd/system/geoframe-export.service.prev /usr/local/lib/systemd/system/geoframe-export.service \
+     && sudo systemctl daemon-reload \
+     && echo "入れ替えました"
+   ```
+4. **戻した rclone 版の包みで、rclone 版の`recover`を動かします**。
+   ```sh
+   sudo /opt/geoframe/deploy/geoframe-export-admin.sh recover; echo "exit=$?"
+   ```
+   rclone 版の`recover`（引数なし）は、起動時に rclone の設定（`rclone.conf`の専用の client_id・持ち主・権限）だけを調べ、API 版の起動時の検査（Drive への問い合わせ）は通りません。API 版が壊れていても動きます。
+   実行枠（`export.lock`）を取ってからジョブの記録を読み、Drive も記録も変えません（`running`と`blocked`の記録があるときだけ、rclone で Drive を照会して表示します）。
+   終了コードは、0（表示できた）・1（実行枠を取れない）・2（`rclone.conf`の検査と状態ディレクトリの用意の失敗）・4（実行枠が取られている）です。
+   §8.6 の（c）と**同じ条件**がそろったときだけ、手順 5 へ進みます（終了コードが 0、「`jobs/`を一覧できません」「読めない記録」の知らせが出力に無い、`running`と未解除の`blocked`の表示が無い）。
+5. 条件がそろったら、起動して確かめます。
+   ```sh
+   sudo systemctl start geoframe-export
+   systemctl is-active geoframe-export && curl --fail -s -o /dev/null -w '%{http_code}\n' http://<待ち受けの IP>:<ポート>/healthz
+   ```
+   前の版の`recover`は、`running`・`blocked`の記録が無いと Drive に触れず、`/healthz`も Drive の認可を見ません。**再開を伝える前に**、戻した包みで dry_run を動かし、rclone 版が Drive を照会できることを確かめます（書きません）。
+   ```sh
+   sudo /opt/geoframe/deploy/geoframe-export-admin.sh run --from <書き出し済みの日付> --destination yamareco --dry-run; echo "exit=$?"
+   ```
+   認可の失敗（rclone の`invalid_grant`など）で照会できないとき（API 版へ取り込んだ更新トークンが失効していて、`rclone.conf`も同じトークンを持っている場合など）は、再開を伝えず、`rclone.conf`を再認可してから（前の版の§8.3 の手順。`rclone config reconnect`）、もう一度 dry_run で確かめます。
+   dry_run が通ったら、呼び出し側に再開を伝えます。`/etc/default/geoframe-export`は、足した行を残したままで足ります（前の版は読みません）。
+
+手順 4 の条件がそろわないときは、**start せずに止まり**、原因を調べます。
+- `recover`自体が失敗する: 終了コード 2 は、rclone 版の`rclone.conf`の検査（持ち主・権限・専用の client_id）か、状態ディレクトリです。標準エラーの表示を読んで直します。終了コード 4 は、実行枠が取られています。手順 1 に戻って、一時 unit が残っていないかを確かめます。終了コード 1 は、実行枠を取れません（`export.lock`の権限）。
+- 一覧できない・読めない記録: `jobs/`の権限・持ち主を直すか、壊れた記録を root で確かめ、問題がなければファイルを`jobs/`の外へ手で退かします（§8.6 の（c））。そのあと、手順 4 を最初からやり直します。
+- 未解除の`blocked`: 表示された Drive の今の状態を読み、Drive の画面で必要な片付けを済ませてから、`recover --resolve <job_id>`で解除し、手順 4 をやり直します。
+- `running`: 手順 1 の一時 unit の止め忘れが無いかを確かめます。**rclone 版は start しません**（`running`の記録は、書いた版の起動時の復旧で片付けます。引数なしの`recover`は表示だけで、`--resolve`も`running`は受け付けません）。
+  受付と CLI は止めたまま、次の順に行います。
+  1. 手順 3 を元に戻します: `/opt/geoframe`を更新後の SHA（API 版）へ、API 版のバイナリと unit を§8.2 の`install`で置き直し、`sudo systemctl daemon-reload`。
+  2. API 版が起動できない原因を直します（§8.10 の「起動しない」）。
+  3. API 版のサービスを start します。起動時の復旧が、`running`の記録を Drive と照らして片付けます（数分は`/healthz`が答えません）。
+  4. API 版の`recover`（§8.6 の（c））で、`running`と未解除の`blocked`が無いことを確かめます。
+  5. まだ前の版へ戻す必要があるなら、手順 1 からやり直します。API 版を起動できない間は、前の版へは戻さずに止めておきます（記録を書いた版で片付けられないまま、前の版で書き出しを再開しないため）。
+
+戻したあとのこと:
+- 戻したあとは、`recover`で、`running`と未解除の`blocked`が無いことを確かめます（手順 4 でそろえてから start したので、通常は無いはずです）。`blocked`が出たら、§8.10 のとおり Drive の状態を確かめて解除します。
+- 手順 3 で`/opt/geoframe`も前のコミットへ戻したので、CLI の包み（`geoframe-export-admin.sh`）も rclone 版になり、前のバイナリで使えます（このとき、unit・包み・この文書の§8 も前の版になります）。API 版へ戻し直すときは、§8.6 の「rclone 版から切り替えるとき」の手順です。
+- rclone 本体と`rclone.conf`の撤去は、切り替えが落ち着いてから別に行います（この文書では扱いません）。
+
+### 8.10 トラブルシュート
+
+- 起動しない（終了コード 2、`failed`のまま止まる）: `journalctl -u geoframe-export`に、検査に通らなかった項目の名前（`--listen`・`--token-file`・`--drive-credentials`・`--folder-yamareco`・`--folder-travel-journal`・`--work-folder`など）が出ます（値は出ません）。
+  Drive の資格情報のファイルを読めない（持ち主・権限・形）、フォルダの ID の誤り（フォルダでない・ゴミ箱の中・権限が無い・3 つが入れ子）なども、ここで分かります。
+  `Drive の認可が失効しています。再認可が要ります`と出ていれば、§8.3 の「再認可」の手順です。
+  直したあと、`sudo systemctl reset-failed geoframe-export`で失敗の印を消し、`sudo systemctl start geoframe-export`で起動します。
+- 起動しない（終了コード 1）: Drive に接続できない（通信の失敗・5xx・期限）、tailnet の IP がまだ無い、など、再試行で直りうる失敗です。15 秒おきに再起動します（300 秒に 10 回まで）。
+- ジョブが`drive_auth_invalid`で失敗する: 更新トークンが失効しています。§8.3 の「再認可」を行い、サービスを再起動します。
 - 接続が拒否される・`/healthz`が答えない: 起動時の復旧の最中です（§8.6）。journal を見て、数分待ちます。
 - `blocked`（次の書き出しがすべて 503）: Drive の状態を`recover`で確かめ、Drive の画面で片付けてから`recover --resolve <job_id>`で解除します（設計 4.2 の復旧）。
 

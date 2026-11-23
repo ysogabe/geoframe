@@ -397,7 +397,7 @@ fn recover_shows_unfinished_and_blocked_jobs_without_changing_drive_or_records()
     // 古いほうから
     assert!(text.find(job(2).as_str()) < text.find(job(4).as_str()));
 
-    // Drive も記録も変えない。呼んだ rclone は lsjson（と cat）だけ
+    // Drive も記録も変えない。呼んだ操作は一覧と読み出しだけ
     assert_eq!(env.drive().to_json(), drive_before);
     let records_after: Vec<_> = (2..=6)
         .map(|n| std::fs::read(env.state.join("jobs").join(format!("{}.json", job(n)))).unwrap())

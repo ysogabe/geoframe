@@ -1,9 +1,8 @@
 //! T4 の試験の共通部品: 偽の Drive の状態を作る・読む・差し替える部品と、呼び出しの記録を中立の操作名で読む部品（`ops`・
 //! `mutating_ops`・`ops_used`・`op_count`）。偽の Drive は、試験のプロセスの中の HTTP サーバー（`fake_drive::FakeDrive`。Drive API v3
-//! の形で答える。模型の状態は `fake-rclone/model.rs` を共有し、`fake_dir` のファイルに持つ）。`Env::new` がサーバーを立て、
+//! の形で答える。模型の状態は [`model`]（`drive/model.rs`）で、`fake_dir` のファイルに持つ）。`Env::new` がサーバーを立て、
 //! `Env::settings`（資格情報・3 つのフォルダの ID・`--drive-endpoint` に当たる通信先）をそれに向ける。
-//! rclone の引数・環境変数を見る部品（`rclone_calls`・`assert_rclone_safe_calls`）は rclone 版（`src/rclone.rs`。3 段目で消す）の
-//! 試験だけが使う。本物の Google・rclone・ネットワークには触れない。Drive の ID は架空の値（`fid0001` …）。
+//! 本物の Google・ネットワークには触れない。Drive の ID は架空の値（`fid0001` …）。
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -25,7 +24,6 @@ use geoframe_export::settings::{RawSettings, Settings};
 use super::fake_drive::{self, FakeDrive};
 use serde_json::{Value, json};
 
-#[path = "../../fake-rclone/model.rs"]
 pub mod model;
 
 use super::TempDir;
@@ -172,12 +170,6 @@ impl Env {
         model::Ctl::load(&self.fake_dir)
     }
 
-    pub fn set_shortcut_mode(&self, mode: &str) {
-        let mut c = self.ctl();
-        c.shortcut_mode = mode.to_owned();
-        c.save(&self.fake_dir);
-    }
-
     /// `op` は中立の操作名。
     pub fn add_rule(&self, op: &str, skip: u64, times: u64, effect: Value) {
         let mut c = self.ctl();
@@ -208,8 +200,8 @@ impl Env {
 
     // ---- 中立の記録（実装に依らない）----
     //
-    // 操作名は `list`・`read`・`create_folder`・`upload`・`move`・`trash`。偽の Drive の HTTP サーバー（`fake_drive`）は、同じ名前で
-    // calls.log に書く（読むだけの `get`・`generate_ids`・`token` も足す）ので、これらを使う試験は、どちらの偽物でもそのまま通る。
+    // 操作名は `list`・`read`・`create_folder`・`upload`・`move`・`trash`。偽の Drive の HTTP サーバー（`fake_drive`）が、同じ名前で
+    // calls.log に書く（読むだけの `get`・`generate_ids`・`token` も足す）。
 
     /// 操作名と、段階の記録（`record:<stage>`）を、順番どおりに。
     pub fn ops(&self) -> Vec<String> {
@@ -223,7 +215,6 @@ impl Env {
     }
 
     /// Drive を変えうる操作と、段階の記録だけ（読むだけの `list`・`read`・`get`・`generate_ids`・`token` を除く）。
-    /// `get`・`generate_ids`・`token` は、偽の Drive の HTTP サーバー（`fake_drive`）だけが書く。
     pub fn mutating_ops(&self) -> Vec<String> {
         self.ops()
             .into_iter()
@@ -233,8 +224,8 @@ impl Env {
 
     /// 呼ばれた操作名の集合（重複なし。段階の記録は含まない）。
     pub fn ops_used(&self) -> Vec<String> {
-        // `op` を持つ行を全部数える（偽の rclone の行も、偽の Drive の HTTP サーバーの行も。`kind` では絞らない。
-        // 数え落とすと、「呼ばれていない」の検査が素通りする）。段階の記録（`hook`）の行は `op` を持たない
+        // `op` を持つ行を全部数える（`kind` では絞らない。数え落とすと、「呼ばれていない」の検査が素通りする）。
+        // 段階の記録（`hook`）の行は `op` を持たない
         let mut v: Vec<String> = self
             .calls()
             .iter()
@@ -300,7 +291,7 @@ impl Env {
             .collect()
     }
 
-    /// 呼び出しの形が、約束どおりであること（rclone の引数の検査〔`assert_rclone_safe_calls`〕の置き換え）:
+    /// 呼び出しの形が、約束どおりであること:
     /// - Drive へのどの要求にも `Authorization` が付く（トークンの入口と、resumable のチャンク・位置の問い合わせ〔セッションの URL が
     ///   認可する〕を除く）。付いていても無効な値ではない。
     /// - 一覧の `q` は `'<ID>' in parents and trashed=false` だけ（名前で絞らない）。
@@ -338,24 +329,6 @@ impl Env {
                 );
             }
         }
-    }
-
-    // ---- rclone 固有の記録（rclone 版を消すときに、使う試験と一緒に消す）----
-
-    /// 呼ばれた rclone のコマンド `cmd`（`lsjson` など）の引数。
-    pub fn rclone_calls(&self, cmd: &str) -> Vec<Vec<String>> {
-        self.calls()
-            .iter()
-            .filter(|c| c["kind"] == "rclone" && c["cmd"] == cmd)
-            .map(|c| {
-                c["args"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|a| a.as_str().unwrap().to_owned())
-                    .collect()
-            })
-            .collect()
     }
 
     /// Drive の `parent`（なければ作る）の直下に、`name` のファイル（中身は 5 バイト）を足す。ファイルの ID を返す。
@@ -472,7 +445,7 @@ impl Set {
     }
 }
 
-/// 段階の記録の口（T5 の代わり）。記録を偽の rclone と同じ `calls.log` に追記するので、「記録が Drive の操作より先」を
+/// 段階の記録の口（T5 の代わり）。記録を偽の Drive の HTTP サーバーと同じ `calls.log` に追記するので、「記録が Drive の操作より先」を
 /// 1 本の順番で確かめられる。`mutate` は、その段階の記録の直後（Drive の操作の前）に Drive の状態を書き換える
 /// （オーナーが途中で手を入れた、を作る）。
 pub struct Hook {
@@ -561,65 +534,4 @@ pub fn sleep_ms(ms: u64) -> Value {
 
 pub fn garbage(text: &str) -> Value {
     json!({"kind": "garbage", "stdout": text})
-}
-
-/// 渡された環境変数・引数が、約束どおりであること（呼ばれた rclone の全部に対して）。
-pub fn assert_rclone_safe_calls(env: &Env) {
-    let config = env
-        .state
-        .join("rclone/rclone.conf")
-        .to_string_lossy()
-        .into_owned();
-    let mut expected_keys: Vec<&str> = geoframe_export::rclone::ENV_KEYS.to_vec();
-    expected_keys.sort_unstable();
-    for call in env.calls().iter().filter(|c| c["kind"] == "rclone") {
-        let mut keys: Vec<&str> = call["env"]
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect();
-        keys.sort_unstable();
-        assert_eq!(
-            keys, expected_keys,
-            "渡した環境変数がこの 3 つだけではありません: {call}"
-        );
-        assert_eq!(call["env"]["PATH"], geoframe_export::rclone::PATH_VALUE);
-        let state = env.state.to_string_lossy().into_owned();
-        for k in ["HOME", "XDG_CACHE_HOME"] {
-            let v = call["env"][k].as_str().unwrap();
-            assert!(v.starts_with(&format!("{state}/rclone/")), "{k}={v}");
-        }
-        let args: Vec<&str> = call["args"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|a| a.as_str().unwrap())
-            .collect();
-        let dashes = args.iter().position(|a| *a == "--").expect("-- がある");
-        let flags = &args[..dashes];
-        let ci = flags
-            .iter()
-            .position(|a| *a == "--config")
-            .expect("--config");
-        assert_eq!(flags[ci + 1], config);
-        for f in flags {
-            for bad in [
-                "--drive-client",
-                "--drive-token",
-                "--drive-service",
-                "--dump",
-                "--verbose",
-                "--rc",
-            ] {
-                assert!(!f.starts_with(bad), "{f}");
-            }
-            assert!(*f != "-v" && *f != "-vv" && *f != "-vvv", "{f}");
-            assert!(!f.starts_with("RCLONE_"), "{f}");
-        }
-        assert!(
-            args[dashes + 1..].iter().all(|a| !a.starts_with('-')),
-            "位置の引数が flag に見える: {args:?}"
-        );
-    }
 }

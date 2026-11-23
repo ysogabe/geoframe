@@ -122,7 +122,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        # ワークスペースの全部（geoframe と geoframe-export。試験用の fake-rclone を含む）
+        # ワークスペースの全部（geoframe と geoframe-export）
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Rustテスト
@@ -137,8 +137,8 @@ jobs:
         run: cargo build --release --target x86_64-unknown-linux-musl -p geoframe
 
       - name: muslで書き出し（geoframe-export）を静的ビルド
-        # note 記事用の写真書き出し（docs/note-photo-export/design.md）。配るのは geoframe-export だけ。試験用の偽の rclone
-        # （fake-rclone）は --bin で外して配らない。musl-tools は上で入れてある
+        # note 記事用の写真書き出し（docs/note-photo-export/design.md）。配るのは geoframe-export だけ
+        # （--bin で指定する）。musl-tools は上で入れてある
         run: cargo build --release --target x86_64-unknown-linux-musl -p geoframe-export --bin geoframe-export
 
       - name: 書き出しの静的リンクの検査

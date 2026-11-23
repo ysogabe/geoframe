@@ -117,11 +117,9 @@ pub struct Seen {
 }
 
 impl Seen {
-    /// 解決されたショートカットは、リンク先ではなく**ショートカット自身**の ID（`recover` の表示で、オーナーが画面で
-    /// 見つけられるのはこちら）。
     pub fn of(e: &Entry) -> Self {
         Self {
-            id: e.shortcut_id.clone().unwrap_or_else(|| e.id.clone()),
+            id: e.id.clone(),
             kind: if e.is_shortcut() {
                 Kind::Shortcut
             } else if e.is_dir {

@@ -1,5 +1,6 @@
-//! 【rclone 固有。rclone 版を消すときに、このファイルごと消す】
-//! rclone 設定ファイルの起動時の検査（専用の client_id、持ち主・権限）。値をエラーに出さないことも確かめる。
+//! `import-credentials` の取り込み元（rclone.conf）の読み取りの検査: 専用の client_id・client_secret・refresh_token の有無、
+//! 持ち主・権限・パスの種類、読み手によって解釈が分かれる形の拒否。値をエラーに出さないことも確かめる
+//! （`rclone_conf::read_credentials`。取り込み全体の試験は `import_credentials.rs`）。
 
 mod common;
 
@@ -9,12 +10,13 @@ use common::{
     MARK_ID, MARK_SECRET, TempDir, assert_no_secrets, good_config, set_mode, write_config,
 };
 use geoframe_export::rclone_conf::{
-    CONFIG_MAX_BYTES, ConfigError, SyntaxIssue, Target, check_rclone_config,
-    check_rclone_config_for_uid, effective_uid,
+    CONFIG_MAX_BYTES, ConfigError, SyntaxIssue, Target, effective_uid, read_credentials,
+    read_credentials_for_uid,
 };
 
+/// 読めるか（値は捨てる）。
 fn check(path: &std::path::Path) -> Result<(), ConfigError> {
-    check_rclone_config(path, "gdrive")
+    read_credentials(path, "gdrive").map(|_| ())
 }
 
 /// 失敗の表示（Display・Debug）に設定の値とパスが出ていないこと。
@@ -26,7 +28,7 @@ fn assert_clean(e: &ConfigError, dir: &TempDir) {
 }
 
 #[test]
-fn a_dedicated_config_with_safe_permissions_passes() {
+fn a_dedicated_config_with_safe_permissions_is_read() {
     let dir = TempDir::new("conf-ok");
     let path = write_config(dir.path(), good_config("gdrive").as_bytes());
     assert_eq!(check(&path), Ok(()));
@@ -119,13 +121,10 @@ fn files_and_directories_owned_by_someone_else_are_refused() {
     let path = write_config(dir.path(), good_config("gdrive").as_bytes());
     // 実行ユーザーが別の UID だったら、という見立て（別ユーザーの持ち物は root なしでは作れない）
     let other = effective_uid().wrapping_add(1);
-    let e = check_rclone_config_for_uid(&path, "gdrive", other).unwrap_err();
+    let e = read_credentials_for_uid(&path, "gdrive", other).unwrap_err();
     assert_eq!(e, ConfigError::WrongOwner(Target::Directory));
     assert_clean(&e, &dir);
-    assert_eq!(
-        check_rclone_config_for_uid(&path, "gdrive", effective_uid()),
-        Ok(())
-    );
+    assert!(read_credentials_for_uid(&path, "gdrive", effective_uid()).is_ok());
 }
 
 #[test]
@@ -228,7 +227,8 @@ fn malformed_lines_never_leak_into_the_error() {
 #[test]
 fn configs_that_rclone_would_read_as_a_shared_client_id_are_refused() {
     // rclone（goconfig）は `:` 区切り・引用符つきの値・同じキーの再指定（後勝ち）を解釈する。
-    // この検査を通った設定が、rclone では空の client_id（= 共用の client_id）にならないこと
+    // 読み手によって解釈が分かれる形は、取り込みで読み違えないように断ること（rclone では空の client_id、つまり共用の
+    // client_id になる設定を、専用の値として取り込まない）
     let dir = TempDir::new("conf-shared-client");
     let cases: [(String, SyntaxIssue); 6] = [
         // 値あり → 空で再指定

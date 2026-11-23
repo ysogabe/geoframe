@@ -4,7 +4,6 @@
 //! 指す（パスは使わない）。3 つとも必須で、形（[`crate::remote::is_valid_drive_id`]）を検査し、同じものを指さないことを確かめる
 //! （祖先・子孫の関係は、起動時に Drive へ問い合わせて確かめる。[`crate::startup`]）。
 //! 実パス（資格情報・状態ディレクトリ）と Drive の ID は文書・コードに書けないので、既定値を持たず必須にする。
-//! [`RemotePath`]・[`RemoteReason`]（`remote:パス` の形）は、3 段目で消す rclone 版（[`crate::rclone`]）の試験が使うだけ。
 
 use std::fmt;
 use std::path::PathBuf;
@@ -32,85 +31,6 @@ pub const DEFAULT_UPLOAD_TIMEOUT_SECS: u64 = 45 * 60;
 pub const DEFAULT_DRIVE_TIMEOUT_SECS: u64 = 5 * 60;
 /// 期限の引数の上限（秒。1 日）。
 pub const TIMEOUT_SECS_MAX: u64 = 24 * 60 * 60;
-
-/// 接頭辞を拒んだ理由。値そのものは含めない。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoteReason {
-    /// `-` で始まる（rclone のオプションに読まれる）。
-    LeadingDash,
-    /// `..` を含む。
-    ParentRef,
-    /// 末尾が `/`。
-    TrailingSlash,
-    /// `remote:` だけ（remote の最上位）。
-    TopLevel,
-    /// 先頭の `/` や `a//b` のような空の成分。
-    EmptyComponent,
-    /// `^[A-Za-z0-9_-]+:[A-Za-z0-9_/-]+$` に合わない。
-    BadChars,
-}
-
-/// `remote:パス` の形の Drive 上の場所。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RemotePath {
-    remote: String,
-    path: String,
-}
-
-impl RemotePath {
-    pub fn parse(s: &str) -> Result<Self, RemoteReason> {
-        if s.starts_with('-') {
-            return Err(RemoteReason::LeadingDash);
-        }
-        if s.contains("..") {
-            return Err(RemoteReason::ParentRef);
-        }
-        if s.ends_with('/') {
-            return Err(RemoteReason::TrailingSlash);
-        }
-        let Some((remote, path)) = s.split_once(':') else {
-            return Err(RemoteReason::BadChars);
-        };
-        if path.is_empty() && !remote.is_empty() {
-            return Err(RemoteReason::TopLevel);
-        }
-        let name_ok = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'-';
-        if remote.is_empty()
-            || !remote.bytes().all(name_ok)
-            || !path.bytes().all(|c| name_ok(c) || c == b'/')
-        {
-            return Err(RemoteReason::BadChars);
-        }
-        if path.starts_with('/') || path.contains("//") {
-            return Err(RemoteReason::EmptyComponent);
-        }
-        Ok(Self {
-            remote: remote.to_owned(),
-            path: path.to_owned(),
-        })
-    }
-
-    /// `:` の前の remote 名。
-    pub fn remote(&self) -> &str {
-        &self.remote
-    }
-
-    /// `:` の後ろのパス（先頭・末尾に `/` は無い）。
-    pub fn path(&self) -> &str {
-        &self.path
-    }
-
-    /// 検査済みの名前を 1 つ足した場所（`remote:パス/名前`）。名前は呼び出し側で検査済みであること。
-    pub fn join(&self, name: &str) -> String {
-        format!("{}:{}/{name}", self.remote, self.path)
-    }
-}
-
-impl fmt::Display for RemotePath {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.remote, self.path)
-    }
-}
 
 /// 写真サービスの基底 URL。`http://ホスト[:ポート]` だけ（パス・クエリ・ユーザー情報なし）。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -353,10 +273,6 @@ mod tests {
         r
     }
 
-    fn remote_err(s: &str) -> RemoteReason {
-        RemotePath::parse(s).expect_err(s)
-    }
-
     #[test]
     fn defaults_are_the_documented_values() {
         let s = Settings::from_raw(&raw(|_| {})).unwrap();
@@ -497,37 +413,6 @@ mod tests {
                 Err(SettingsError::InvalidEndpoint),
                 "{bad:?}"
             );
-        }
-    }
-
-    #[test]
-    fn remote_prefixes_follow_the_documented_conditions() {
-        // rclone 版（3 段目で消す）の試験が使う `remote:パス` の形
-        assert!(RemotePath::parse("gdrive:yamareco").is_ok());
-        assert!(RemotePath::parse("gdrive:a/b/c").is_ok());
-        assert!(RemotePath::parse("my_remote-1:x_y-z").is_ok());
-        assert_eq!(remote_err("-gdrive:x"), RemoteReason::LeadingDash);
-        assert_eq!(remote_err("gdrive:../x"), RemoteReason::ParentRef);
-        assert_eq!(remote_err("gdrive:a/.."), RemoteReason::ParentRef);
-        assert_eq!(remote_err("gdrive:yamareco/"), RemoteReason::TrailingSlash);
-        assert_eq!(remote_err("gdrive:"), RemoteReason::TopLevel);
-        assert_eq!(remote_err("gdrive:/a"), RemoteReason::EmptyComponent);
-        assert_eq!(remote_err("gdrive:a//b"), RemoteReason::EmptyComponent);
-        for bad in [
-            "",
-            "yamareco",
-            ":yamareco",
-            "gdrive:a b",
-            "gdrive:a.b",
-            "gdrive:a:b",
-            "gd rive:a",
-            "gdrive:日本語",
-            "gdrive:a\n",
-            "gdrive:a\0b",
-            "gdrive:a?b",
-            "g/drive:a",
-        ] {
-            assert!(RemotePath::parse(bad).is_err(), "{bad:?}");
         }
     }
 

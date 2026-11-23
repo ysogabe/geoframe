@@ -87,7 +87,7 @@ fn files_under(env: &Env, path: &[&str]) -> Vec<(String, u64)> {
     let d = env.drive();
     let root = d.resolve(path).expect("folder");
     let mut out: Vec<(String, u64)> = d
-        .ls(&root, true, true, "mime")
+        .ls(&root)
         .into_iter()
         .filter(|r| !r.is_dir)
         .map(|r| (r.path, r.size as u64))
@@ -145,10 +145,10 @@ fn rewrite_manifest(env: &Env, folder: &[&str], content: &Value) {
     env.save(&d);
 }
 
-// ---- AC5: 0 枚では rclone を呼ばない ----
+// ---- AC5: 0 枚では Drive を呼ばない ----
 
 #[test]
-fn a_set_without_photos_is_refused_before_any_rclone_call() {
+fn a_set_without_photos_is_refused_before_any_drive_call() {
     let env = Env::new("zero");
     let set = env.make_set("zero", Y, FOLDER, PHOTOS);
     let manifest_only = vec![set.files.last().unwrap().clone()];
@@ -162,7 +162,7 @@ fn a_set_without_photos_is_refused_before_any_rclone_call() {
         let f = failure(publish(&env.remote(), &layout, &p, &mut hook));
         assert_eq!(f.error.code, ErrorCode::Internal);
     }
-    // 宛先に既にフォルダがあっても同じ。rclone は 1 度も呼ばれず、記録も書かれない
+    // 宛先に既にフォルダがあっても同じ。Drive は 1 度も呼ばれず、記録も書かれない
     env.seed_managed(Y, FOLDER, &set);
     let p = PublishParams {
         files: &manifest_only,
@@ -531,7 +531,7 @@ fn a_failed_record_stops_the_stage_before_its_drive_operation() {
 
 #[test]
 fn a_move_whose_response_was_lost_is_found_done_by_listing() {
-    // 新規: 移動は済んでいるのに rclone は失敗を返す → lsjson で済んでいると判定し、成功
+    // 新規: 移動は済んでいるのに応答は失敗を返す → 一覧で済んでいると判定し、成功
     let env = Env::new("lost-absent");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     env.add_rule("move", 0, 1, do_then_fail());
@@ -710,7 +710,7 @@ fn a_same_named_folder_created_right_after_the_retire_move_blocks_before_anythin
 
 #[test]
 fn a_manual_folder_created_between_the_check_and_the_retire_is_caught_by_the_id_check() {
-    // 確かめてから移すまでの間に、同じ名前の別のフォルダに入れ替わった（rclone の moveto はパスで解決する）
+    // 確かめてから移すまでの間に、同じ名前の別のフォルダに入れ替わった（パスで解決する実装なら、入れ替わった先へ移してしまう。API は ID で移す）
     let env = Env::new("swap");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     let old_id = env.seed_managed(Y, FOLDER, &set);
@@ -1005,14 +1005,14 @@ fn a_query_that_times_out_is_drive_unavailable() {
     let env = Env::new("unavail-timeout");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     env.add_rule("list", 0, u64::MAX, sleep_ms(20_000));
-    let rclone = env
+    let remote = env
         .remote()
         .with_timeouts(Duration::from_secs(30), Duration::from_millis(300));
     let layout = env.layout(Y, FOLDER, JOB_A);
     let mut hook = Hook::new(&env);
     let started = Instant::now();
     let f = failure(publish(
-        &rclone,
+        &remote,
         &layout,
         &params(&env, &set, OnExists::Error),
         &mut hook,
@@ -1410,18 +1410,18 @@ fn the_dry_run_has_a_thirty_second_limit_per_call() {
 // ---- 期限 ----
 
 #[test]
-fn the_copy_timeout_kills_rclone_and_cleans_incoming() {
+fn the_upload_timeout_stops_the_upload_and_cleans_incoming() {
     let env = Env::new("copy-timeout");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     env.add_rule("upload", 0, 1, sleep_ms(20_000));
-    let rclone = env
+    let remote = env
         .remote()
         .with_timeouts(Duration::from_millis(400), Duration::from_secs(30));
     let layout = env.layout(Y, FOLDER, JOB_A);
     let mut hook = Hook::new(&env);
     let started = Instant::now();
     let f = failure(publish(
-        &rclone,
+        &remote,
         &layout,
         &params(&env, &set, OnExists::Error),
         &mut hook,
@@ -1437,14 +1437,14 @@ fn the_job_deadline_overrides_the_command_limit_and_cleanup_still_runs() {
     let env = Env::new("job-deadline");
     let set = env.make_set("s", Y, FOLDER, PHOTOS);
     env.add_rule("upload", 0, 1, sleep_ms(20_000));
-    let rclone = env
+    let remote = env
         .remote()
         .with_deadline(Some(Instant::now() + Duration::from_millis(2500)));
     let layout = env.layout(Y, FOLDER, JOB_A);
     let mut hook = Hook::new(&env);
     let started = Instant::now();
     let f = failure(publish(
-        &rclone,
+        &remote,
         &layout,
         &params(&env, &set, OnExists::Error),
         &mut hook,
@@ -1508,7 +1508,7 @@ fn the_api_calls_carry_the_token_only_in_the_header_and_the_log_never_holds_a_cr
     let _ = (old, Kind::Dir);
 }
 
-// ---- Google のファイル（サイズ不明）とショートカット（実 rclone の一覧の形） ----
+// ---- Google のファイル（サイズ不明）とショートカット ----
 
 #[test]
 fn native_google_files_in_a_managed_folder_make_it_modified_and_nothing_is_touched() {

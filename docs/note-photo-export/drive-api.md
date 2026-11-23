@@ -1,11 +1,11 @@
 # geoframe-export: Drive API 直接方式
 
-geoframe-export の Drive 操作を rclone から Drive API の直接呼び出しへ置き換える設計。3 段の PR の 2 段目（PR②）で、前半（この文書・偽の Drive HTTP サーバー・ID で指す Drive 操作の型。バイナリの振る舞いは変えない）と、後半（フローへのつなぎ込み・CLI 引数・unit・包み・`import-credentials`・受け入れ試験の移し替え）に分けて実装する。実装で設計と違えた判断は、この文書を直して残す（末尾の「実装で決めたこと」）。design.md 4.2 からここへリンクする。
+geoframe-export の Drive 操作を rclone から Drive API の直接呼び出しへ置き換えた設計。3 段の PR（1 段目 #87＝型の中立化、2 段目 #88＝API 版、3 段目＝rclone 版の削除と文書）で行い、**3 段とも終わった**。2 段目では、前半（この文書・偽の Drive HTTP サーバー・ID で指す Drive 操作の型。バイナリの振る舞いは変えない）と、後半（フローへのつなぎ込み・CLI 引数・unit・包み・`import-credentials`・受け入れ試験の移し替え）に分けて実装した。実装で設計と違えた判断は、この文書を直して残す（末尾の「実装で決めたこと」）。design.md 4.2 からここへリンクする。
 
 ## 0. 前提と方針
-- 3 段の PR の 2 段目。1 段目（PR #87）で rclone 由来の型を `src/remote.rs` に中立化し、flow・publish・recover・drive は具象の `remote::Remote` を持ち回るようになった。
+- 2 段目（PR #88）の前提。1 段目（PR #87）で rclone 由来の型を `src/remote.rs` に中立化し、flow・publish・recover・drive は具象の `remote::Remote` を持ち回るようになった。
 - この段で `Remote` の中身を Drive API（HTTPS、`ureq`）に差し替え、バイナリの Drive 操作は API だけにする。**rclone 版との実行時の差し替え（trait・設定での切り替え）は作らない。** 戻す手段は前のバイナリ（.prev）と、関門を通るまで残す rclone 本体・rclone.conf。
-- `src/rclone.rs`・`src/rclone_conf.rs`・`fake-rclone/main.rs`・rclone 固有の試験（`tests/rclone_runner.rs`・`tests/rclone_config.rs`、`// rclone 固有` の行）は、**この段では消さない**（lib の pub モジュールとして残り、試験も通り続ける）。消すのは 3 段目。ただし、バイナリ（cli・serve・run）は rclone を一切呼ばない。`rclone_conf.rs` の読み取りは 6 章の取り込みで使い続ける。
+- 3 段目で消したもの: `src/rclone.rs`・`fake-rclone/`（bin と main.rs）・rclone 固有の試験（`tests/rclone_runner.rs`）。`src/rclone_conf.rs` は 6 章の取り込み（`import-credentials`）が使うので**残した**（取り込み元の rclone.conf の読み取り。起動用の `check_rclone_config` は消した。試験は `tests/rclone_conf_read.rs`）。バイナリ（cli・serve・run）は 2 段目から rclone を一切呼ばない。
 - **ジョブと公開の記録の形式は変えない**（読めない記録は blocked）。`tests/record_format.rs` の実例は、この段でも 1 バイトも変えずに通ること。新しい Stage・フィールドは足さない。エラーコードは既存のものだけ（`drive_auth_invalid` は 1 段目で読めるようにしてある）。
 - エラーコード `rclone_failed`・`rclone_timeout` の**綴りは変えない**（記録・HTTP 応答・CLI の標準出力で呼び出し側との契約）。意味は「Drive の変更系の操作の失敗」「Drive の操作が期限内に終わらない」に広げ、メッセージの文言だけ中立にしてよい（ログ・応答の message。記録には code だけが入るので記録の形式は変わらない。変えたら試験・文書もそろえる）。
 - 依存: `ureq` の feature に `rustls` を足す（ワークスペースの geoframe crate が既に `["rustls", "gzip"]` で使っている。Cargo.lock に新しいパッケージが増えないことを確かめる）。それ以外の crate は足さない（JSON は serde_json、MD5 は md-5、乱数は既存の手段）。musl の静的ビルド（CI の `cargo build --release --target x86_64-unknown-linux-musl -p geoframe-export --bin geoframe-export`）が通ること。
@@ -38,7 +38,7 @@ unit（`deploy/geoframe-export.service`）:
 - トークンの取得: `POST <token_url>` に `grant_type=refresh_token&client_id=…&client_secret=…&refresh_token=…`（application/x-www-form-urlencoded、値は URL エンコード）。応答の `access_token`・`expires_in`（上限 3600、期限の 60 秒前に取り直す）。
 - `400` で本文の `error` が `invalid_grant` → `drive_auth_invalid`（専用のエラーコード）。ほかの 4xx（`invalid_client` など）も再試行せず認可の失敗として扱う（`drive_auth_invalid` に寄せるか、`drive_unavailable` にするかは実装で決めて文書に書く。invalid_grant は必ず `drive_auth_invalid`）。429・5xx・通信の失敗は再試行。
 - **起動時に 1 回確かめる**（serve・run・recover。`--dry-run` も）: トークンを 1 回取り、3 章の宛先の検査も行う。invalid_grant なら標準エラーに「再認可が要る（手順は deploy/README.md）」と出して終了コード 2。通信の失敗・5xx は終了コード 1（serve は systemd が再起動する）。
-- 取り込み: サブコマンド `geoframe-export import-credentials --rclone-config <path> --remote <name> --out <path>`。今の rclone.conf（`rclone_conf.rs` で読む）から `client_id`・`client_secret`・`token` の `refresh_token` を取り出し、`--out` に 0600・O_CREAT|O_EXCL|O_NOFOLLOW で書く（既にあれば断る）。値は標準出力・標準エラーに出さない（出すのは書いたパスと「書いた」ことだけ）。root が sudo で 1 回だけ実行する前提（同意のやり直しはしない）。再認可のとき（別の機体で `rclone authorize` して得た設定を取り込む）にも使う。手順の文書は 3 段目で deploy/README.md に書く。
+- 取り込み: サブコマンド `geoframe-export import-credentials --rclone-config <path> --remote <name> --out <path>`。今の rclone.conf（`rclone_conf.rs` で読む）から `client_id`・`client_secret`・`token` の `refresh_token` を取り出し、`--out` に 0600・O_CREAT|O_EXCL|O_NOFOLLOW で書く（既にあれば断る）。値は標準出力・標準エラーに出さない（出すのは書いたパスと「書いた」ことだけ）。root が sudo で 1 回だけ実行する前提（同意のやり直しはしない）。再認可のとき（別の機体で `rclone authorize` して得た設定を取り込む）にも使う。手順は deploy/README.md §8.3（取り込みと再認可）。
 
 ## 3. 起動時の宛先の検査
 `files.get`（`fields=id,name,mimeType,trashed,parents`）で 3 つの ID を読み、次を確かめる。どれかが違えば終了コード 2（設定の誤り）。
@@ -95,7 +95,7 @@ drive.rs（`Drive`）の書き換え:
 - `Authorization` 見出しは TLS の上だけ（試験の `--drive-endpoint` の loopback を除く）。
 
 ## 7. 偽の Drive HTTP サーバー（試験）
-- `fake-rclone/model.rs` の模型（ノードの表）を使い回す。模型のファイルは置き場所を `tests/common/` か `fake-drive/` に移してよい（fake-rclone からも引き続き使えるように）。
+- 偽の Drive の模型（ノードの表）は、もとは `fake-rclone/model.rs` にあり、使い回す。3 段目で `tests/common/drive/model.rs` に移した（fake-rclone を消したので）。
 - 試験のプロセスの中で起動する HTTP サーバー（std の TcpListener かワークスペースの既存の crate。新しい crate は足さない）。CLI を子プロセスで動かす試験には `--drive-endpoint` でその URL を渡す。トークンの入口も同じサーバーが受ける。
 - calls.log には 1 段目と同じ中立の操作名（list・read・create_folder・upload・move・trash。get・generate_ids・token も足してよい）を書き、`Env::ops`・`mutating_ops`・`assert_no_mutations` がそのまま使えるようにする。`add_rule` の当て方（操作名＋何回目か＋効果）も同じ形にする。`contains`（今は rclone の引数の部分一致）は、対象のノードのパス（模型から引ける）で当てる。
 - 故障注入（受け入れの試験に入れる）:
@@ -108,10 +108,10 @@ drive.rs（`Drive`）の書き換え:
   - `Location` が別のホストを指す → 送らずに失敗。リダイレクト（3xx）をたどらない。
   - ゴミ箱の中のフォルダ・ファイルは一覧に出ない。
 - 1 段目で中立にした受け入れの試験（drive_publish.rs・drive_recovery.rs・job_flow.rs・serve_*・run_cli.rs・signal_cli.rs など）を、偽の Drive HTTP サーバーで通し直す。rclone の呼び出しの形そのものを見る行（`// rclone 固有`）は、API の呼び出しの形（例: 一覧が名前で q を絞っていない、変更系に完全な削除が無い、中身の更新が無い、Authorization が付いている）を見る行に置き換える。
-- rclone 版の試験（rclone_runner.rs・rclone_config.rs など）は rclone のモジュールを直接試すものとして残し、通し続ける（3 段目で消す）。
+- rclone 版の試験（rclone_runner.rs）は、2 段目では rclone のモジュールを直接試すものとして残して通し続け、3 段目で消した（rclone_config.rs は、取り込み元の読み取りの試験として `rclone_conf_read.rs` に改めた）。
 
-## 8. 本番の関門（PR③ のあと。参考）
-§8.8 の --verify の入口で: 移動で ID が保たれる、同名のフォーム・ショートカットが ambiguous_destination、md5Checksum が作業領域の MD5 と一致、Google 文書入り・同じ大きさで中身を変えたフォルダが modified で断られる、rclone 版が公開したフォルダを API 版で replace できる、ゴミ箱行きがフォルダと中身ごと戻せる、トークン更新後も資格情報のファイルの更新時刻が変わらない、所要時間、unit の上限の測り直し、.prev へ戻す練習。
+## 8. 本番の関門（3 段目のあと。配置のときに行う）
+deploy/README.md §8.8 の --verify の入口で: 移動で ID が保たれる、同名のフォーム・ショートカットが ambiguous_destination、md5Checksum が作業領域の MD5 と一致、Google 文書入り・同じ大きさで中身を変えたフォルダが modified で断られる、rclone 版が公開したフォルダを API 版で replace できる、ゴミ箱行きがフォルダと中身ごと戻せる、トークン更新後も資格情報のファイルの更新時刻が変わらない、所要時間、unit の上限の測り直し、.prev へ戻す練習。
 **8MiB を超えるファイル（resumable）を 1 つ、本物の Drive へ送る**（本番の写真は 1 枚 1MB 前後で、通常の関門では resumable の経路が通らない。チャンクの `PUT` に `Authorization` を付けない 9.5 の判断も、ここで本物で確かめる。`Content-Range`・308・`Range` の形、同じ ID での始め直しも）。
 
 ## 9. 実装で決めたこと（前半: 型と偽の Drive の HTTP サーバー）
@@ -155,8 +155,8 @@ drive.rs（`Drive`）の書き換え:
 - `read` が上限を超えたら `TooLarge`（`BadOutput`）。エラー応答の本文の上限は 64KiB（成功の本文の上限とは別）。
 
 ### 9.7 偽の Drive の HTTP サーバー（7 章の実装）
-- 置き場所は `tests/common/fake_drive.rs`。模型（`fake-rclone/model.rs`）は動かさず、`Node` に `trashed` を足しただけ（偽の rclone の `purge` は今までどおり木から消して `Drive::trashed` に ID を残す）。保存は一時ファイル＋rename にした（HTTP サーバーが読んでいる最中に半端な内容を見せない）。
-- 状態は偽の rclone と同じファイル（`drive.json`・`ctl.json`・`calls.log`）。要求ごとに読み書きするので、`Env::drive()`・`Env::save()`・`Env::add_rule()`・`Hook` がそのまま使える。CLI を子プロセスで動かす試験は `FakeDrive::url()` を `--drive-endpoint` に渡す。
+- 置き場所は `tests/common/fake_drive.rs`。模型は、2 段目の時点では `fake-rclone/model.rs` を動かさず、`Node` に `trashed` を足しただけにした（3 段目で `tests/common/drive/model.rs` に移し、rclone 専用の `ls_opts`・ファイル単位の移動などを削った。`purge` は木から消して `Drive::trashed` に ID を残す形のまま）。保存は一時ファイル＋rename にした（HTTP サーバーが読んでいる最中に半端な内容を見せない）。
+- 状態は `Env::fake_dir` の中のファイル（`drive.json`・`ctl.json`・`calls.log`）。要求ごとに読み書きするので、`Env::drive()`・`Env::save()`・`Env::add_rule()`・`Hook` がそのまま使える。CLI を子プロセスで動かす試験は `FakeDrive::url()` を `--drive-endpoint` に渡す。
 - calls.log の行は `kind: "http"`、`op`（中立の操作名＋ `get`・`generate_ids`・`token`）、`method`・`route`・`subject`・`authorization`（`ok`・`invalid`・`missing`。値は書かない）・`injected` ほか。resumable は 1 回の送信が複数行（`phase` が `init`・`chunk`・`status`）。規則の「何回目」は、条件（`op`・`contains`）に合う要求の数。`contains` は `subject`（対象のノードのパス）と `phase:<名前>` の部分一致。
 - **`Env::mutating_ops` は `get`・`generate_ids`・`token` も読むだけとして除く。`Env::ops_used`・`op_count` は `op` を持つ行を全部数える**（PR #87 のレビューの推奨）。
 - 偽のサーバーは、実際の Drive に近い厳しさにしてある: 一覧の `q` が `'<ID>' in parents and trashed=false` 以外なら 400（名前で絞る退行を捕まえる）、`generateIds` で払い出していない ID での作成は 400、重複した ID は 409、`removeParents` が今の親でなければ 404、`PATCH` の本文は `name`・`trashed:true` だけ、`DELETE`・`PATCH /upload/…`・`emptyTrash` は 405（`op: unsupported`）。`size` は文字列。エラーは `error.errors[].reason`、トークンのエラーは `{"error":"invalid_grant"}`。308 は `Range: bytes=0-N`（何も受けていなければ見出しなし）。
@@ -190,7 +190,7 @@ drive.rs（`Drive`）の書き換え:
 | （無し） | サブコマンド `import-credentials --rclone-config <path> --remote <name> --out <path>` |
 
 - ID は `is_valid_drive_id` で検査し、空（unit の `${VAR}` が空）・不正な文字・3 つのうちどれか 2 つが同じ → 終了コード 2。引数の検査は Drive へ要求を出す前（試験で確かめた）。
-- `RemotePath`・`RemoteReason`（`remote:パス` の形）は、3 段目で消す rclone 版の試験が使うだけ。`Rclone` は専用の `RcloneSettings` を受け取る（バイナリの設定と切り離した）。
+- `RemotePath`・`RemoteReason`（`remote:パス` の形）は、rclone 版の試験が使うだけだったので、3 段目で消した（`Rclone`・`RcloneSettings` も）。
 - 引数名ごとの出し方・help・USAGE は `src/cli.rs`。`--drive-endpoint` は USAGE に出ない。
 
 #### 起動時の検査（`src/startup.rs`）
@@ -263,3 +263,11 @@ drive.rs（`Drive`）の書き換え:
 - `RestrictAddressFamilies=AF_INET AF_INET6`・`MemoryDenyWriteExecute=true`（rustls・ring）・`MemoryMax=512M`・`TasksMax=64`（並列 4 の multipart で 64MiB 前後・スレッド）で足りるか。名前解決が `AF_UNIX` を要しないか。
 - 本物の Drive で、起動時の検査（トークン・3 つのフォルダ・祖先）の所要時間、`--drive-timeout` の既定（5 分）、429・403 の実際の応答、`md5Checksum` の形、移動で ID が保たれること、8MiB を超える 1 ファイルの resumable、SIGTERM から 180 秒以内に止まること。
 
+### 9.14 3 段目（rclone 版の削除と文書）で決めたこと
+振る舞いは変えない。ジョブと公開の記録の形式・エラーコードの綴り（`rclone_failed`・`rclone_timeout` を含む）・`tests/record_format.rs` と fixtures の記録は 1 バイトも変えていない。
+- **消したもの**: `src/rclone.rs`（`Rclone`・`RcloneSettings`・`lsjson` の読み取り・標準エラーの伏せ字など）、`fake-rclone/`（bin `fake-rclone` と `main.rs`。`Cargo.toml` の `[[bin]]`）、`tests/rclone_runner.rs`、`tests/common/drive.rs` の rclone 用の helper（`rclone_calls`・`assert_rclone_safe_calls`・`set_shortcut_mode`）。`Cargo.lock` は変わらない（bin を消してもパッケージは減らない）。
+- **移したもの**: 偽の Drive の模型を `tests/common/drive/model.rs` へ（`common::drive::model` のまま使える）。rclone の一覧の形（`Row` の `lsjson` 形式・複合 ID・`shortcut_mode`・`LsOpts`）と、ファイル単位の移動（`move_dir_filewise`）は削った。
+- **残したもの**: `src/rclone_conf.rs`（`import-credentials` の取り込み元の読み取り。起動用の `check_rclone_config`・`check_rclone_config_for_uid` は消した）。持ち主・権限・パスの種類・形（引用符・重複キー・FIFO など）の試験は、`tests/rclone_conf_read.rs` に移し、`read_credentials` を通して同じ検査をする（`import_credentials.rs` は取り込み全体の試験）。
+- **型・定数**: `RemoteLoc`・`CopyScope`・`RemotePath`・`RemoteReason`・`DIRECTORY_MIME`・`SHORTCUT_DANGLING_MIME`・`Entry::shortcut_id`（API は複合 ID を出さないので常に `None` だった）・`RemoteError::Exit` を消した。`RemoteError::NotProcessed` は `Failed` にまとめた（読む所が無くなった。`ApiError::NotProcessed` は API の層に残り、`RemoteError` への変換で `Failed` になる。どのエラーコードに写るかは変わらない）。
+- **文言**: ログ・エラーの detail・CLI の help・コメントの「rclone」を中立にした（綴りを変えないのは、記録・HTTP 応答・CLI の標準出力に入るコード名だけ）。`import-credentials` の `--rclone-config` は取り込み元の名前として残す。
+- **文書**: `deploy/README.md` §8 を API 版の手順（資格情報の取り込み・再認可・フォルダの ID の変数・検証・切り戻し）に書き直した。design.md の rclone 前提の節（2.7・3.2・3.5・4.2・6・7・8・10・11 章）、prd.md、unit・包みのコメント、CI の説明も直した。

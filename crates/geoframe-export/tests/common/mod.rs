@@ -314,15 +314,16 @@ pub fn set_mode(path: &Path, mode: u32) {
 pub const MARK_ID: &str = "CLIENT-ID-MARKER-7f3a";
 pub const MARK_SECRET: &str = "CLIENT-SECRET-MARKER-91bc";
 pub const MARK_TOKEN: &str = "TOKEN-MARKER-5d20";
+pub const MARK_REFRESH: &str = "REFRESH-MARKER-2c8e";
 
-/// 目印の値を入れた rclone 設定（`remote` のセクションに専用の client_id・client_secret）。
+/// 目印の値を入れた rclone.conf（`remote` のセクションに専用の client_id・client_secret・token の refresh_token）。
 pub fn good_config(remote: &str) -> String {
     format!(
-        "[{remote}]\ntype = drive\nclient_id = {MARK_ID}\nclient_secret = {MARK_SECRET}\nscope = drive\ntoken = {{\"access_token\":\"{MARK_TOKEN}\"}}\n"
+        "[{remote}]\ntype = drive\nclient_id = {MARK_ID}\nclient_secret = {MARK_SECRET}\nscope = drive\ntoken = {{\"access_token\":\"{MARK_TOKEN}\",\"refresh_token\":\"{MARK_REFRESH}\"}}\n"
     )
 }
 
-/// `<dir>/rclone/rclone.conf`（親は 0700、ファイルは 0600）を作ってパスを返す。
+/// `<dir>/rclone/rclone.conf`（親は 0700、ファイルは 0600）を作ってパスを返す（`import-credentials` の取り込み元）。
 pub fn write_config(dir: &Path, content: &[u8]) -> PathBuf {
     let parent = dir.join("rclone");
     std::fs::create_dir_all(&parent).expect("mkdir");
@@ -335,7 +336,7 @@ pub fn write_config(dir: &Path, content: &[u8]) -> PathBuf {
 
 /// 目印の値が文字列に出ていないことを確かめる。
 pub fn assert_no_secrets(text: &str) {
-    for mark in [MARK_ID, MARK_SECRET, MARK_TOKEN] {
+    for mark in [MARK_ID, MARK_SECRET, MARK_TOKEN, MARK_REFRESH] {
         assert!(!text.contains(mark), "設定の値が出ています: {text}");
     }
     assert!(!text.contains("access_token"), "{text}");

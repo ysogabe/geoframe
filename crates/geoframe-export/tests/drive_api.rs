@@ -203,7 +203,6 @@ fn list_children_returns_every_page_and_never_filters_by_name() {
     );
     assert_eq!(p0.md5.as_deref(), Some(model_md5(b"abc").as_str()));
     assert_eq!(p0.path, "p0.jpg");
-    assert_eq!(p0.shortcut_id, None);
     let dir = entries.iter().find(|e| e.id == sub).unwrap();
     assert!(dir.is_dir && dir.size == -1 && dir.md5.is_none());
     // サイズの無い Google 文書は -1・MD5 無し
@@ -276,7 +275,7 @@ fn a_repeating_page_token_fails_instead_of_looping() {
 
 #[test]
 fn more_than_the_entry_limit_fails() {
-    // 本番の上限は rclone 版と同じ 20000 件（件数が多いと偽のサーバーが遅いので、試験では上限を下げて確かめる）
+    // 本番の上限は 20000 件（件数が多いと偽のサーバーが遅いので、試験では上限を下げて確かめる）
     assert_eq!(MAX_ENTRIES, 20_000);
     let fx = Fx::new("api-limit");
     let api = fx

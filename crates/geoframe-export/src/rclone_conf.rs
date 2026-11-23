@@ -1,16 +1,20 @@
-//! rclone の設定ファイル（INI 形式）の起動時の検査（design.md 4.2・7 章・9 章）。
+//! `import-credentials` の取り込み元（rclone の設定ファイル rclone.conf。INI 形式）の読み取り（design.md 4.2・7 章・9 章、
+//! docs/note-photo-export/drive-api.md 2 章・6 章）。
 //!
-//! rclone の共用の client_id は 2026 年中に使えなくなるので、このサービスは専用の client_id で認可した設定だけを使う。
-//! 設定ファイルの接頭辞の remote 名のセクションに `client_id` と `client_secret` が**空でない値で**入っていなければ起動しない。
-//! あわせて、設定ファイルとその親ディレクトリが実行ユーザーの持ち物で、グループ・その他から読めないことを確かめる
-//! （ファイルは 0600 相当、ディレクトリは 0700 相当）。
+//! Drive の操作は Drive API を直接呼ぶ（資格情報は専用の JSON のファイル。[`crate::drive::auth`]）。この読み取りは、これまでの
+//! rclone.conf から、専用の `client_id`・`client_secret` と `token` の `refresh_token` を 1 回だけ取り出すためと、再認可のとき
+//! （別の機体で `rclone authorize` して得たトークンを一時的な rclone.conf に書いて取り込む）に使う。
 //!
-//! 設定ファイルの値（トークン・client_id・client_secret を含む）は、検査の結果にもエラーの表示にも残さない。
-//! 持つのは、キーの名前と、ファイルかディレクトリかの種類と、行の番号だけ。
+//! rclone の共用の client_id は 2026 年中に使えなくなるので、専用の client_id で認可した設定だけを受け付ける。設定ファイルの
+//! 指定した remote 名のセクションに `client_id` と `client_secret` が**空でない値で**入っていなければ読まない。あわせて、
+//! 設定ファイルとその親ディレクトリの持ち主・権限を確かめる（ファイルは 0600 相当、ディレクトリは 0700 相当）。
+//!
+//! 設定ファイルの値（トークン・client_id・client_secret を含む）は、結果にもエラーの表示にも残さない。
+//! エラーが持つのは、キーの名前と、ファイルかディレクトリかの種類と、行の番号だけ。
 //!
 //! 読み方は、rclone が書き出す形（`[remote]` と `key = value`）だけを受け付ける。rclone の INI の読み手（goconfig）は
 //! `:` 区切り・引用符つきのキーと値・`%(key)s` の展開・同じキーの再指定（後勝ち）なども解釈するので、
-//! この検査が「入っている」と見たものと rclone が使う値がずれうる。解釈が分かれうる形は、読み違えないように断る
+//! ここで「入っている」と見た値と rclone が使う値がずれうる。解釈が分かれうる形は、読み違えないように断る
 //! （[`SyntaxIssue`]）。
 //!
 //! 開き方: 親ディレクトリを `O_DIRECTORY | O_NOFOLLOW` で開き、そのハンドルで持ち主・権限を見て、そこから `openat` で
@@ -155,20 +159,6 @@ impl std::error::Error for ConfigError {}
 pub fn effective_uid() -> u32 {
     // SAFETY: `geteuid` は引数を取らず、失敗しない。
     unsafe { libc::geteuid() }
-}
-
-/// 実行ユーザー（実効 UID）に対する検査。
-pub fn check_rclone_config(path: &Path, remote: &str) -> Result<(), ConfigError> {
-    check_rclone_config_for_uid(path, remote, effective_uid())
-}
-
-/// 持ち主を `uid` として検査する（試験で「別のユーザーの持ち物」を作るため。通常は [`check_rclone_config`]）。
-///
-/// 順序: 親ディレクトリ → ファイルの持ち主・権限（開いたハンドルで見る。確かめた後に差し替えられない）→ 中身。
-/// 親やファイルが安全でなければ、中身は読まない。
-pub fn check_rclone_config_for_uid(path: &Path, remote: &str, uid: u32) -> Result<(), ConfigError> {
-    let text = read_config_text(path, uid, false)?;
-    check_section(&text, remote)
 }
 
 /// 設定ファイルを安全に開いて、中身の文字列を返す。`any_owner` が真なら、持ち主は問わない（権限は問う）。
@@ -350,7 +340,7 @@ impl DirChain {
 
     /// 親より上の各ディレクトリを確かめる（近い順）。各ディレクトリは、持ち主が root か `file_owner`（設定ファイルの持ち主）で、
     /// グループ・その他が書き込めないこと（root の持ち物のスティッキービット付き〔`/tmp` など〕は、書き込めてもよい。他人の持ち物を
-    /// 消せない）。親ディレクトリそのものは、[`check_rclone_config_for_uid`] と同じ検査（別に済ませる）。
+    /// 消せない）。親ディレクトリそのものは、[`read_credentials`] が別に検査する（持ち主・権限）。
     pub fn check(&self, file_owner: u32) -> Result<(), ConfigError> {
         for (uid, mode) in self.ancestors.iter().rev() {
             if *uid != 0 && *uid != file_owner {
@@ -386,7 +376,7 @@ impl std::fmt::Debug for ImportedCredentials {
 }
 
 /// rclone の設定ファイルの `[remote]` から、`client_id`・`client_secret`・`token` の `refresh_token` を取り出す
-/// （`import-credentials`。docs/note-photo-export/drive-api.md 2 章）。形の検査は起動時の検査と同じ（[`check_section`]）。
+/// （`import-credentials`。docs/note-photo-export/drive-api.md 2 章）。形の検査は [`check_section`]。
 ///
 /// 持ち主: 設定ファイルはサービスのユーザーの持ち物で、取り込みは root が sudo で 1 回だけ動かす（持ち主が実行ユーザーと違う）。
 /// そこで **実行ユーザーが root のときは、持ち主を問わない**（権限は 0600／0700 相当を問う）。root でなければ、持ち主は実行ユーザー。

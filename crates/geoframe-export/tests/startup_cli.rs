@@ -376,7 +376,7 @@ fn bad_settings_refuse_to_start_before_anything_else() {
             assert!(!out.stderr.contains("未実装"));
         }
     }
-    // 消えた引数（rclone 版のもの）は、知らない引数として断る
+    // 消えた引数（旧版の rclone のもの）は、知らない引数として断る
     for old in [
         ["--rclone", "/x/rclone"],
         ["--rclone-config", "/x/rclone.conf"],

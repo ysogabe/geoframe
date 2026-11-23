@@ -1,9 +1,9 @@
 //! 試験用の偽の Drive の HTTP サーバー（Drive API v3 の、このサービスが使う操作とトークンの入口だけ。本物の Google には触れない）。
 //!
-//! 試験のプロセスの中で、127.0.0.1 の空きポートに立てる（`std` の `TcpListener`。接続ごとに 1 スレッド）。状態は偽の rclone と同じ
-//! 形で、`Env::fake_dir` の中のファイルに持つ: `drive.json`（偽の Drive の模型。`fake-rclone/model.rs`）、`ctl.json`（挙動の差し替え）、
+//! 試験のプロセスの中で、127.0.0.1 の空きポートに立てる（`std` の `TcpListener`。接続ごとに 1 スレッド）。状態は
+//! `Env::fake_dir` の中のファイルに持つ: `drive.json`（偽の Drive の模型。`drive/model.rs`）、`ctl.json`（挙動の差し替え）、
 //! `calls.log`（呼ばれた操作の記録）。要求ごとにロックして読み書きするので、`Env::drive()`・`Env::save()`・`Env::add_rule()`・
-//! `Hook::mutate_after`・`Env::ops()` などが、偽の rclone と同じように使える。CLI を子プロセスで動かす試験には `--drive-endpoint`
+//! `Hook::mutate_after`・`Env::ops()` などで、試験から状態を作る・読む。CLI を子プロセスで動かす試験には `--drive-endpoint`
 //! （[`FakeDrive::url`]）で向ける。
 //!
 //! ## 答える要求（Drive v3 の形で答える）
@@ -163,7 +163,7 @@ pub fn cut_after(bytes: usize) -> Value {
 }
 
 /// 操作を済ませたあと、`parent`（Drive 上のパス）の下に同じ名前のフォルダを足してから答える（確かめてから移すまでの間に、
-/// オーナーが同じ名前のフォルダを作った、を作る。旧 rclone 版の「ファイル単位の移動」の筋書きの置き換え）。
+/// オーナーが同じ名前のフォルダを作った、を作る）。
 pub fn do_then_add_folder(parent: &[&str], name: &str) -> Value {
     json!({"kind": "do_then_add_folder", "parent": parent, "name": name})
 }
