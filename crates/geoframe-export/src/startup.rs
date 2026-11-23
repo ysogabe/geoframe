@@ -41,6 +41,8 @@ pub enum StartupError {
     Credentials,
     /// 認可が失効している（再認可が要る）。
     AuthInvalid,
+    /// トークンの入口が、`invalid_grant` 以外の 4xx で断った（資格情報の内容の誤り。再試行しても直らない）。
+    TokenRejected,
     /// そのフォルダが無い・読めない（引数の名前）。
     FolderMissing(&'static str),
     /// フォルダでない（ファイル・ショートカット）。
@@ -74,6 +76,9 @@ impl fmt::Display for StartupError {
             Self::AuthInvalid => f.write_str(
                 "Drive の認可が失効しています。再認可が要ります（deploy/README.md の手順）",
             ),
+            Self::TokenRejected => f.write_str(
+                "Drive のアクセストークンを取得できません（--drive-credentials の内容を確かめてください）",
+            ),
             Self::FolderMissing(o) => write!(
                 f,
                 "{o} のフォルダを Drive から読めません（ID と、資格情報の持ち主の権限を確かめてください）"
@@ -106,6 +111,18 @@ fn classify(option: &'static str, e: ApiError) -> StartupError {
     }
 }
 
+/// トークンの取得の失敗を、起動できない理由にする（フォルダの誤りとは別。引数名は出さない）。
+fn classify_token(e: ApiError) -> StartupError {
+    match e {
+        ApiError::AuthInvalid => StartupError::AuthInvalid,
+        ApiError::Status(code) if (400..500).contains(&code) && code != 408 => {
+            StartupError::TokenRejected
+        }
+        ApiError::Credentials(_) | ApiError::Rejected(_) => StartupError::Credentials,
+        _ => StartupError::Unavailable,
+    }
+}
+
 pub fn startup_check(settings: &Settings) -> Result<(), StartupError> {
     Credentials::load(&settings.drive_credentials).map_err(|_| StartupError::Credentials)?;
     let remote = Remote::new(settings)
@@ -118,7 +135,7 @@ pub fn startup_check(settings: &Settings) -> Result<(), StartupError> {
 pub fn check_drive(remote: &Remote, settings: &Settings) -> Result<(), StartupError> {
     let api = remote.api();
     api.check_credentials(api.deadline(crate::drive::api::Limit::Query))
-        .map_err(|e| classify(OPT_WORK_FOLDER, e))?;
+        .map_err(classify_token)?;
     let folders = [
         (OPT_FOLDER_YAMARECO, settings.folder_yamareco.as_str()),
         (

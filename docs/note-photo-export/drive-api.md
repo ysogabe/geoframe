@@ -191,7 +191,7 @@ drive.rs（`Drive`）の書き換え:
 
 #### 起動時の検査（`src/startup.rs`）
 - `run`（`--dry-run` を含む）・`serve`・`recover` の始めに、資格情報を読み、トークンを 1 回取り、3 つのフォルダを `get` で確かめる。`import-credentials` は通らない（Drive に触れず、root でも動く）。
-- 終了コード 2: 資格情報のファイルを読めない／検査に通らない・`invalid_grant` など（標準エラーに「再認可が要る（deploy/README.md の手順）」）・フォルダが無い／権限が無い（404 と、408・429 以外の 4xx）・フォルダでない（ショートカットも）・ゴミ箱の中・3 つが別物でない（どれかが他の祖先）・祖先が 64 段を超える。終了コード 1: 通信の失敗・5xx・429・期限。標準エラーと標準出力に、ID・資格情報の値は出さない（引数名だけ）。
+- 終了コード 2: 資格情報のファイルを読めない／検査に通らない・`invalid_grant` など（標準エラーに「再認可が要る（deploy/README.md の手順）」）・トークンの入口が `invalid_grant` 以外の 4xx で断った（「アクセストークンを取得できません」。フォルダの誤りとは別の文言）・フォルダが無い／権限が無い（404 と、408・429 以外の 4xx）・フォルダでない（ショートカットも）・ゴミ箱の中・3 つが別物でない（どれかが他の祖先）・祖先が 64 段を超える。終了コード 1: 通信の失敗・5xx・429・期限。標準エラーと標準出力に、ID・資格情報の値は出さない（引数名だけ）。
 - **祖先をたどる途中で `get` が 404（親が見えない。共有されたフォルダの上は見えないことがある）なら、そこでたどるのをやめる**（設計 3 章は「途中の失敗は 1」だったが、親が見えないだけで永久に起動しなくなるのを避けた。404・認可の失効以外の失敗は 1）。
 - **起動時の再試行は短くする**（`STARTUP_RETRY`: 最初の 1 回のあとに 2 回、0.5・1 秒の待ち）。ジョブの操作（5 回・合計 1 分ほど）より短く、直らなければ終了コード 1 で終える（serve は systemd が 15 秒おきに再起動する）。
 - ジョブの始めにも、宛先の親と作業用のフォルダを `get` で確かめる（`Drive::check_roots`。フォルダ・ショートカットでない・ゴミ箱でない。失敗は `drive_unavailable`）。**候補が 0 枚のジョブは Drive に触れない**ので、その確認は 0 枚の判定より後ろ（公開の直前）に置いた。
@@ -218,13 +218,16 @@ drive.rs（`Drive`）の書き換え:
 - **持ち主**: 設定ファイルはサービスのユーザーの持ち物で、取り込みは root が sudo で動かす。実行ユーザーが root のときは持ち主を問わない（権限は 0600／0700 相当を問う）。root でなければ持ち主は実行ユーザー。
 - 書き方は 0600・`O_CREAT|O_EXCL|O_NOFOLLOW`（既にあれば・リンクなら断る。終了コード 1）。書いたあと `Credentials::load` で読み直し、読めなければ消す。標準出力は書いたパスだけ。root（`run_command` の実効ユーザー ID が 0）でも断らない。
 
+#### 設計と違えた所: 包みの資格情報のパス
+- 設計 1 章は、包みも unit と同じ `--drive-credentials %d/drive-credentials` を渡すとしていたが、**`systemd-run` の一時サービスのコマンドでは `%` の指定子（`%d`・`%n`）が展開されない**（systemd 257 の `systemd-run --user` で、`/bin/echo %n %d/x` が `%n %d/x` のまま出ることを確かめた）。そこで包みは、`/bin/sh -c 'exec "$0" "$@" --drive-credentials "${CREDENTIALS_DIRECTORY}/drive-credentials"' <バイナリ> <引数…>` の形にする（`$CREDENTIALS_DIRECTORY` は、`LoadCredential=` を付けたとき systemd が入れる環境変数で、`--expand-environment=no` なので systemd は展開せず sh が展開する。引数は sh の位置引数なので、値の中の `$`・空白・引用符は解釈されない。実機の `systemd-run --user` で、`LoadCredential=` と `${HOME}` のリテラルを渡して確かめた）。unit は、unit のファイルの中なので `%d` のまま（同じ `drive-credentials` を指す。整合試験が検査する）。
+
 #### 試験の作り
 - `Env::new` が偽の Drive の HTTP サーバー（`FakeDrive`）を立て、`Env::settings`（資格情報・3 つの ID・`--drive-endpoint`）をそれに向ける。CLI の試験は `Env::cli_settings_args()`。状態は `fake-drive/`（状態ディレクトリの外）。
 - 偽の Drive に、`do_then_add_folder`（済ませてから同名のフォルダを足す）・`late_then_fail`（移動を預けて 500 で答え、数回の一覧のあとに反映）の効果を足した。偽の模型は、ゴミ箱へ移したフォルダを `resolve` の対象から外す。
 - `// rclone 固有` の検査は、`Env::assert_api_calls_safe`（Authorization が付く〔トークンの入口・チャンクの PUT を除く〕・一覧の `q` は ID だけ・`unsupported`〔完全な削除・中身の更新〕が無い）と、対象のパスで見る呼び出しの形（移動・ゴミ箱は ID で・manifest は最後・md5Checksum を取る）に置き換えた。操作の数は、要求の数ではなく意味の数（ファイル数・移動の回数）で見る。
 
 #### 本番の関門で確かめること（偽の Drive では確かめられない）
-- unit の `LoadCredential=` と `ExecStart` の `%d`、包み（`systemd-run`・`--expand-environment=no`）の `%d/drive-credentials` が、実際に展開されること。
+- unit の `LoadCredential=` と `ExecStart` の `--drive-credentials %d/drive-credentials`（unit のファイルの中の `%d`）が、実際に展開されること。
 - `RestrictAddressFamilies=AF_INET AF_INET6`・`MemoryDenyWriteExecute=true`（rustls・ring）・`MemoryMax=512M`・`TasksMax=64`（並列 4 の multipart で 64MiB 前後・スレッド）で足りるか。名前解決が `AF_UNIX` を要しないか。
 - 本物の Drive で、起動時の検査（トークン・3 つのフォルダ・祖先）の所要時間、`--drive-timeout` の既定（5 分）、429・403 の実際の応答、`md5Checksum` の形、移動で ID が保たれること、8MiB を超える 1 ファイルの resumable、SIGTERM から 180 秒以内に止まること。
 

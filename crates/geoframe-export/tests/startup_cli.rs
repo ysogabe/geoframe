@@ -171,6 +171,41 @@ fn a_revoked_authorization_exits_2_and_says_a_new_consent_is_needed() {
 }
 
 #[test]
+fn a_token_endpoint_that_rejects_the_request_exits_2_as_a_credentials_problem_not_a_folder_problem()
+{
+    // `invalid_grant` 以外の 4xx（形の違う要求・知らないクライアントなど）: 再試行しても直らない。フォルダの誤りとは別の文言
+    let env = Env::new("cli-token-rejected");
+    env.add_rule(
+        "token",
+        0,
+        u64::MAX,
+        fk::status_with_body(400, r#"{"error":"invalid_request"}"#),
+    );
+    for out in run_all(&all_commands(&common(&env, &[]))) {
+        assert_eq!(out.code, EXIT_USAGE, "{}", out.stderr);
+        assert!(
+            out.stderr.contains("アクセストークンを取得できません"),
+            "{}",
+            out.stderr
+        );
+        for folder_option in [
+            "--work-folder",
+            "--folder-yamareco",
+            "--folder-travel-journal",
+        ] {
+            assert!(!out.stderr.contains(folder_option), "{}", out.stderr);
+        }
+        assert!(!out.stderr.contains("再認可"), "{}", out.stderr);
+    }
+    assert_eq!(env.ops_used(), ["token"]);
+    // 5xx は、設定の誤りではない（終了コード 1）
+    let env = Env::new("cli-token-5xx");
+    env.add_rule("token", 0, u64::MAX, fk::status(503));
+    let out = run_owned(&all_commands(&common(&env, &[]))[0]);
+    assert_eq!(out.code, 1, "{}", out.stderr);
+}
+
+#[test]
 fn an_unreadable_or_too_open_credentials_file_exits_2_without_echoing_values() {
     let env = Env::new("cli-cred");
     // 権限が広い
@@ -204,37 +239,60 @@ fn folders_that_are_missing_trashed_not_folders_or_nested_exit_2() {
     d.trashed.push(trashed.clone());
     env.save(&d);
 
+    let prefix_inside_work = {
+        let mut d = env.drive();
+        let id = d.mkdir_p(&["geoframe-export-work", "j"]);
+        env.save(&d);
+        id
+    };
+    // （名前, 差し替える引数, ID, 標準エラーに出るはずの引数名, 理由の文言）
     #[allow(clippy::type_complexity)]
-    let cases: Vec<(&str, &str, String, &str)> = vec![
+    let cases: Vec<(&str, &str, String, &str, &str)> = vec![
         (
             "missing",
             "--work-folder",
             "NoSuchFolderId".into(),
             "--work-folder",
+            "Drive から読めません",
         ),
-        ("a-file", "--work-folder", file, "--work-folder"),
+        (
+            "a-file",
+            "--work-folder",
+            file,
+            "--work-folder",
+            "フォルダではありません",
+        ),
         (
             "a-shortcut",
             "--folder-travel-journal",
             shortcut,
             "--folder-travel-journal",
+            "フォルダではありません",
         ),
-        ("trashed", "--folder-yamareco", trashed, "--folder-yamareco"),
+        (
+            "trashed",
+            "--folder-yamareco",
+            trashed,
+            "--folder-yamareco",
+            "ゴミ箱の中",
+        ),
         // 作業用のフォルダが、宛先の親の中にある・宛先の親が作業用のフォルダの中にある
         (
             "work-inside-prefix",
             "--work-folder",
-            nested_work.clone(),
+            nested_work,
             "--folder-yamareco",
+            "一方がもう一方の中",
         ),
         (
             "prefix-inside-work",
             "--folder-travel-journal",
-            env.drive().mkdir_p(&["geoframe-export-work", "j"]),
+            prefix_inside_work,
             "--folder-travel-journal",
+            "一方がもう一方の中",
         ),
     ];
-    for (name, opt, id, expect_in_message) in cases {
+    for (name, opt, id, expect_in_message, reason) in cases {
         let args = common(&env, &[(opt, id.as_str())]);
         for out in run_all(&all_commands(&args)) {
             assert_eq!(out.code, EXIT_USAGE, "{name}: {}", out.stderr);
@@ -243,6 +301,7 @@ fn folders_that_are_missing_trashed_not_folders_or_nested_exit_2() {
                 "{name}: {}",
                 out.stderr
             );
+            assert!(out.stderr.contains(reason), "{name}: {}", out.stderr);
             assert!(
                 !out.stderr.contains(&id),
                 "{name}: ID を写している: {}",

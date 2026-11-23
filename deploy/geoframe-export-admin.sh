@@ -56,13 +56,17 @@ VERIFY_STATE_NAME="geoframe-export-verify"
 VERIFY_STATE_DIR="/var/lib/${VERIFY_STATE_NAME}"
 
 # サービスの ExecStart と同じ設定の引数（geoframe-export.service と食い違わないこと。deploy/geoframe-export-admin-test.sh が検査する）。
-# `--drive-credentials %d/drive-credentials` の `%d` は、systemd が資格情報のディレクトリに展開する（LoadCredential= を付けたとき）。
+# 資格情報のパスは、unit では `--drive-credentials %d/drive-credentials`（`%d` は unit のファイルの中で systemd が資格情報のディレクトリに
+# 展開する）。systemd-run の一時サービスのコマンドでは `%` の指定子が展開されない（systemd 257 で確かめた）ので、包みは `/bin/sh -c` を挟み、
+# 実行時に `$CREDENTIALS_DIRECTORY/drive-credentials`（LoadCredential= を付けたときに systemd が入れる環境変数。`--expand-environment=no` なので
+# systemd は展開せず、sh が展開する）を `--drive-credentials` に渡す。同じファイル（drive-credentials）を指す。
 # --state-dir は、入口ごとに下で決めた値（本番か検証用）。フォルダの ID は、入口ごとに DEFAULTS_FILE から読む。
+CRED_NAME="drive-credentials"
 
 # サービスと同じハードニング（geoframe-export.service の同名の設定。同じ値であることを試験が検査する）。
 # StateDirectory=・StateDirectoryMode= は、下で入口ごとに足す。
 PROPS=(
-    "LoadCredential=drive-credentials:${CRED_UNIT_PATH}"
+    "LoadCredential=${CRED_NAME}:${CRED_UNIT_PATH}"
     UMask=0077
     NoNewPrivileges=true
     ProtectSystem=strict
@@ -155,7 +159,6 @@ folder_yamareco="$(read_id "${key_prefix}FOLDER_YAMARECO")"
 folder_travel_journal="$(read_id "${key_prefix}FOLDER_TRAVEL_JOURNAL")"
 work_folder="$(read_id "${key_prefix}WORK_FOLDER")"
 COMMON_ARGS=(
-    --drive-credentials "%d/drive-credentials"
     --folder-yamareco "$folder_yamareco"
     --folder-travel-journal "$folder_travel_journal"
     --work-folder "$work_folder"
@@ -181,6 +184,9 @@ say "一時サービス ${UNIT}（途中で止めるとき: sudo systemctl stop 
 
 # --expand-environment=no: systemd は一時サービスのコマンドの引数の中の $NAME・${NAME} を既定で展開する。引数はそのまま
 # geoframe-export へ渡したい（systemd 254 以降のオプション。古い systemd では systemd-run が断る）
+# コマンドは /bin/sh -c '…' で、sh が最後に資格情報のパスを足して geoframe-export を exec する（$0 がバイナリ、残りがその引数）。
+# 引数は sh の位置引数として渡すので、値の中の $・空白・引用符は解釈されない
 exec systemd-run --unit="$UNIT" --uid="$RUN_USER" --wait --pipe --collect --expand-environment=no \
     "${sd_args[@]}" \
+    /bin/sh -c 'exec "$0" "$@" --drive-credentials "${CREDENTIALS_DIRECTORY}/drive-credentials"' \
     "$BIN" "$@" "${COMMON_ARGS[@]}" --state-dir "$state_dir"

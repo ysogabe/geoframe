@@ -352,22 +352,25 @@ fn photos_are_sent_four_at_a_time_and_the_manifest_goes_last() {
         let svc = svc.clone();
         std::thread::spawn(move || run_job(&svc))
     };
-    // 最初の 700ms のあいだに、飛んでいる送信がちょうど 4 つ（並列は 4）
-    let started = Instant::now();
-    loop {
-        let n = requests_of(&env, "upload");
-        if n >= 4 {
-            break;
-        }
-        assert!(started.elapsed() < Duration::from_secs(20), "{n}");
-        std::thread::sleep(Duration::from_millis(5));
+    // 最初の送信が記録された時点から、700ms のあいだに、飛んでいる送信がちょうど 4 つ（並列は 4）。起点は、最初の送信の記録
+    // （一覧・画像・フォルダの作成の時間を含めない）
+    let wait_started = Instant::now();
+    while requests_of(&env, "upload") == 0 {
+        assert!(wait_started.elapsed() < Duration::from_secs(30));
+        std::thread::sleep(Duration::from_millis(2));
     }
-    assert!(
-        started.elapsed() < Duration::from_millis(650),
-        "{:?}",
-        started.elapsed()
+    let first_seen = Instant::now();
+    let n = loop {
+        let n = requests_of(&env, "upload");
+        if n >= 4 || first_seen.elapsed() > Duration::from_millis(600) {
+            break n;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert_eq!(
+        n, 4,
+        "最初の送信から 600ms 以内に、4 つが同時に飛ぶ（並列は 4）: {n}"
     );
-    assert_eq!(requests_of(&env, "upload"), 4, "並列は 4");
     let rec = worker.join().unwrap();
     assert_eq!(rec.status, Status::Succeeded, "{:?}", rec.error);
     // 写真 6 枚と manifest。manifest は、全部の写真のあと（最後）
