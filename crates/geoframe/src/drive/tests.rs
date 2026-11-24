@@ -1997,10 +1997,8 @@ fn python_requests_with_properties_field(py_requests: &Value) -> Value {
         "nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location))";
     let mut requests = py_requests.clone();
     let mut replaced = 0usize;
-    let mut list_queries = 0usize;
     for req in requests.as_array_mut().unwrap() {
         if req["q"].as_str().is_some_and(|q| q.contains("in parents")) {
-            list_queries += 1;
             assert_eq!(
                 req["fields"], PYTHON_LIST_FIELDS,
                 "フィクスチャの list fields が変わっている"
@@ -2009,10 +2007,8 @@ fn python_requests_with_properties_field(py_requests: &Value) -> Value {
             replaced += 1;
         }
     }
-    assert!(
-        list_queries == 0 || replaced == list_queries,
-        "list query の fields 置換件数が合わない: {replaced}/{list_queries}"
-    );
+    // 置き換えが 0 件なら、fields の差を確かめたことにならない
+    assert!(replaced > 0, "一覧の問い合わせが見つからない");
     requests
 }
 
