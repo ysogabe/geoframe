@@ -9,7 +9,7 @@
 
 - DBは `GEOFRAME_DATA_DIR/catalog.db`（既定は `./var/catalog.db`）。SQLite WALモードで、書き込みは1本の接続で行う。
 - 写真は `photos.id` が内部主キー。Drive写真は `drive_id`、ローカル写真は `path` で原本を参照する。
-- Google DriveがDrive写真の原本。サービスアカウントの読み取り専用権限で一覧と `imageMediaMetadata` を取得する。
+- Google DriveがDrive写真の原本。サービスアカウントの読み取り専用権限で一覧と `imageMediaMetadata` および公開カスタム属性 `properties` を取得する（`imageMediaMetadata.location` が欠損している場合のみ `properties` の `geoframe.lat` / `geoframe.lon` へフォールバックし、`loc_source='drive_meta'` として取り込む）。
 - 表示用画像は `GEOFRAME_DATA_DIR/derivatives/`（既定は `./var/derivatives/`）の長辺2560px JPEG。`photos.display` にデータルートからの相対パスを記録する。
 - 撮影時刻は `taken_at`（`YYYY-MM-DD HH:MM`）。元EXIF文字列、UTC、タイムゾーンは現在のDBには分離保存されていない。
 - 位置は `lat` / `lon`。由来は `loc_source`（`exif`、`drive_meta`、`inferred`、`manual`）。推定元は `inferred_from`、時間差は `infer_dt_s`。

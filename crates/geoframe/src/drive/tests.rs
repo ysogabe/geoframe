@@ -306,6 +306,11 @@ fn located(id: &str, name: &str, md5: &str, time: &str, lat: f64, lon: f64) -> V
     )
 }
 
+fn with_properties(mut item: Value, properties: Value) -> Value {
+    item["properties"] = properties;
+    item
+}
+
 // ---------------------------------------------------------------------------
 // 小さな関数
 
@@ -645,8 +650,11 @@ fn index_asks_drive_exactly_what_python_asks() {
     );
     assert_eq!(
         list[0].param("fields"),
-        Some("nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location))")
+        Some(
+            "nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location),properties)"
+        )
     );
+    assert_eq!(list[0].param("fields"), Some(LIST_FIELDS));
     assert_eq!(list[0].param("pageSize"), Some("1000"));
     assert!(list[0].param("pageToken").is_none());
     // 解決したフォルダ ID は覚える（2 回目は名前を引かない）
@@ -1984,6 +1992,28 @@ fn python_rows_with_the_manual_location_decision(py_rows: &Value) -> Value {
     rows
 }
 
+/// #90 で `LIST_FIELDS` に `,properties` を足した分の、Python フィクスチャとの要求比較用補正。
+/// フィクスチャ本体（`drive-index-python.json`）は不変の基準として維持する。
+fn python_requests_with_properties_field(py_requests: &Value) -> Value {
+    const PYTHON_LIST_FIELDS: &str =
+        "nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location))";
+    let mut requests = py_requests.clone();
+    let mut replaced = 0usize;
+    for req in requests.as_array_mut().unwrap() {
+        if req["q"].as_str().is_some_and(|q| q.contains("in parents")) {
+            assert_eq!(
+                req["fields"], PYTHON_LIST_FIELDS,
+                "フィクスチャの list fields が変わっている"
+            );
+            req["fields"] = json!(LIST_FIELDS);
+            replaced += 1;
+        }
+    }
+    // 置き換えが 0 件なら、fields の差を確かめたことにならない
+    assert!(replaced > 0, "一覧の問い合わせが見つからない");
+    requests
+}
+
 #[test]
 fn matches_the_python_fixture() {
     let text = fs::read_to_string(format!(
@@ -2093,7 +2123,7 @@ fn matches_the_python_fixture() {
                 }
                 assert_eq!(
                     Value::Array(requests),
-                    py["requests"],
+                    python_requests_with_properties_field(&py["requests"]),
                     "{name}: Drive への問い合わせ"
                 );
                 rows_now = normalized(&e.rows());
@@ -3106,6 +3136,23 @@ fn derived_debug_output_hides_names_times_and_locations() {
         lat: Some(35.123456),
         lon: Some(139.654321),
     };
+    let prop_file = remote_file(&with_properties(
+        item(
+            "secretid0002",
+            "Private-Holiday-2.jpg",
+            Some("m2"),
+            "image/jpeg",
+            None,
+        ),
+        json!({
+            "geoframe.lat": "36.987654",
+            "geoframe.lon": "138.456789",
+            "geoframe.loc_source": "uploader_manual",
+            "secret": "SECRET_PROP_VALUE",
+        }),
+    ))
+    .unwrap()
+    .unwrap();
     let listing = Listing {
         files: vec![file.clone()],
         pages: 1,
@@ -3128,6 +3175,7 @@ fn derived_debug_output_hides_names_times_and_locations() {
     };
     for text in [
         format!("{file:?}"),
+        format!("{prop_file:?}"),
         format!("{listing:?}"),
         format!("{:?}", index::Op::Insert(entry.clone())),
         format!("{entry:?}"),
@@ -3140,6 +3188,12 @@ fn derived_debug_output_hides_names_times_and_locations() {
             "Holiday",
             "35.12",
             "139.65",
+            "36.98",
+            "138.45",
+            "uploader_manual",
+            "geoframe.lat",
+            "geoframe.lon",
+            "SECRET_PROP_VALUE",
             "2024",
             "07:08",
             "derivatives/",
@@ -3150,6 +3204,7 @@ fn derived_debug_output_hides_names_times_and_locations() {
     // 件数と有無は残る（失敗の表示が役に立つ）
     assert!(format!("{listing:?}").contains("files: 1"));
     assert!(format!("{file:?}").contains("has_location: true"));
+    assert!(format!("{prop_file:?}").contains("has_location: true"));
 }
 
 #[test]
@@ -3157,7 +3212,7 @@ fn the_actual_log_output_never_contains_names_coordinates_times_keys_or_tokens()
     let e = env("drive-reallog");
     let key_dir = e.root().display().to_string();
     let log = capture::logs_of(|| {
-        // 1. 個人情報つきの一覧の索引と取得（成功・写真の失敗）
+        // 1. 個人情報つきの一覧の索引と取得（成功・写真の失敗、properties フォールバックと不正 properties を含む）
         e.listing(vec![
             located(
                 "secretid0001",
@@ -3175,9 +3230,38 @@ fn the_actual_log_output_never_contains_names_coordinates_times_keys_or_tokens()
                 35.223456,
                 139.754321,
             ),
+            with_properties(
+                item(
+                    "secretid0003",
+                    "Prop-Secret-Name.jpg",
+                    Some("m3"),
+                    "image/jpeg",
+                    Some(json!({"time": "2024:05:08 09:10:11"})),
+                ),
+                json!({
+                    "geoframe.lat": "36.987654",
+                    "geoframe.lon": "138.456789",
+                    "geoframe.loc_source": "uploader_manual",
+                }),
+            ),
+            with_properties(
+                item(
+                    "secretid0004",
+                    "Bad-Prop-Name.jpg",
+                    Some("m4"),
+                    "image/jpeg",
+                    None,
+                ),
+                json!({
+                    "geoframe.lat": "SECRET_PROP_VALUE",
+                    "geoframe.lon": "138.0",
+                }),
+            ),
         ]);
         e.stub.set_media("secretid0001", broken());
         e.stub.set_media("secretid0002", fixture_jpeg("typical"));
+        e.stub.set_media("secretid0003", fixture_jpeg("typical"));
+        e.stub.set_media("secretid0004", broken());
         e.index();
         e.done(&e.fetch_stage());
         // 2. 流量制限の再試行（DEBUG の行）と、使い切った失敗
@@ -3238,11 +3322,19 @@ fn the_actual_log_output_never_contains_names_coordinates_times_keys_or_tokens()
         "Private",
         "Holiday",
         "Another",
+        "Prop-Secret",
+        "Bad-Prop",
         ".jpg",
         "35.12",
         "35.22",
         "139.65",
         "139.75",
+        "36.98",
+        "138.45",
+        "uploader_manual",
+        "geoframe.lat",
+        "geoframe.lon",
+        "SECRET_PROP_VALUE",
         "2024",
         "07:08",
         "secretid",
@@ -3723,4 +3815,321 @@ fn a_write_that_fails_after_the_copy_leaves_this_times_copy_with_the_rows_and_th
         )
         .unwrap();
     assert_eq!(manual, ("manual".to_string(), 1.5, 2.5));
+}
+
+// ---------------------------------------------------------------------------
+// #90: Drive カスタム properties（geoframe.lat / geoframe.lon）フォールバック
+
+#[test]
+fn properties_location_is_used_as_fallback_when_image_media_metadata_lacks_location() {
+    let e = env("drive-props-fallback");
+    e.listing(vec![
+        // 1. imageMediaMetadata 無し + 有効な properties
+        with_properties(
+            jpeg("p1", "a.jpg", "m1"),
+            json!({
+                "geoframe.lat": "35.681236",
+                "geoframe.lon": "139.767125",
+                "geoframe.loc_source": "uploader_manual",
+            }),
+        ),
+        // 2. imageMediaMetadata.time のみ（location 無し）+ 負の座標
+        with_properties(
+            item(
+                "p2",
+                "b.heic",
+                Some("m2"),
+                "image/heic",
+                Some(json!({"time": "2024:05:06 07:08:09"})),
+            ),
+            json!({
+                "geoframe.lat": "-33.868820",
+                "geoframe.lon": "-151.209290",
+                "geoframe.loc_source": "photos_asset",
+            }),
+        ),
+        // 3. 境界値（-90.0 / 180.0）
+        with_properties(
+            jpeg("p3", "c.jpg", "m3"),
+            json!({
+                "geoframe.lat": "-90.0",
+                "geoframe.lon": "180.0",
+            }),
+        ),
+        // 4. -0.000000 / -0.0 は正の 0.0 に正規化される
+        with_properties(
+            jpeg("p4", "d.jpg", "m4"),
+            json!({
+                "geoframe.lat": "-0.000000",
+                "geoframe.lon": "-0.0",
+            }),
+        ),
+        // 5. 不完全な imageMediaMetadata.location（latitude のみ）は有効な properties へフォールバック
+        with_properties(
+            item(
+                "p5",
+                "e.jpg",
+                Some("m5"),
+                "image/jpeg",
+                Some(json!({"location": {"latitude": 1.5}})),
+            ),
+            json!({
+                "geoframe.lat": "36.250000",
+                "geoframe.lon": "138.125000",
+                "geoframe.loc_source": "uploader_borrowed",
+            }),
+        ),
+    ]);
+    let counts = e.index();
+    assert_eq!(get(&counts, "added"), 5);
+
+    let r1 = row_of(&e, "p1").unwrap();
+    assert_eq!(col(&r1, "lat"), &rusqlite::types::Value::Real(35.681236));
+    assert_eq!(col(&r1, "lon"), &rusqlite::types::Value::Real(139.767125));
+    assert_eq!(text(&r1, "loc_source").as_deref(), Some("drive_meta"));
+
+    let r2 = row_of(&e, "p2").unwrap();
+    assert_eq!(text(&r2, "taken_at").as_deref(), Some("2024-05-06 07:08"));
+    assert_eq!(col(&r2, "lat"), &rusqlite::types::Value::Real(-33.86882));
+    assert_eq!(col(&r2, "lon"), &rusqlite::types::Value::Real(-151.20929));
+    assert_eq!(text(&r2, "loc_source").as_deref(), Some("drive_meta"));
+
+    let r3 = row_of(&e, "p3").unwrap();
+    assert_eq!(col(&r3, "lat"), &rusqlite::types::Value::Real(-90.0));
+    assert_eq!(col(&r3, "lon"), &rusqlite::types::Value::Real(180.0));
+    assert_eq!(text(&r3, "loc_source").as_deref(), Some("drive_meta"));
+
+    let r4 = row_of(&e, "p4").unwrap();
+    let (rusqlite::types::Value::Real(lat4), rusqlite::types::Value::Real(lon4)) =
+        (col(&r4, "lat"), col(&r4, "lon"))
+    else {
+        panic!("Real のはず");
+    };
+    assert_eq!(lat4.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(lon4.to_bits(), 0.0_f64.to_bits());
+    assert_eq!(text(&r4, "loc_source").as_deref(), Some("drive_meta"));
+
+    let r5 = row_of(&e, "p5").unwrap();
+    assert_eq!(col(&r5, "lat"), &rusqlite::types::Value::Real(36.25));
+    assert_eq!(col(&r5, "lon"), &rusqlite::types::Value::Real(138.125));
+    assert_eq!(text(&r5, "loc_source").as_deref(), Some("drive_meta"));
+}
+
+#[test]
+fn image_media_metadata_location_takes_priority_over_properties() {
+    let e = env("drive-props-priority");
+    e.listing(vec![with_properties(
+        located("f1", "a.jpg", "m1", "2024:05:06 07:08:09", 35.5, 139.25),
+        json!({
+            "geoframe.lat": "43.000000",
+            "geoframe.lon": "141.000000",
+            "geoframe.loc_source": "uploader_manual",
+        }),
+    )]);
+    let counts = e.index();
+    assert_eq!(get(&counts, "added"), 1);
+
+    let r = row_of(&e, "f1").unwrap();
+    assert_eq!(col(&r, "lat"), &rusqlite::types::Value::Real(35.5));
+    assert_eq!(col(&r, "lon"), &rusqlite::types::Value::Real(139.25));
+    assert_eq!(text(&r, "loc_source").as_deref(), Some("drive_meta"));
+}
+
+#[test]
+fn invalid_properties_are_ignored_without_failing_the_listing() {
+    let e = env("drive-props-invalid");
+    let items = vec![
+        with_properties(jpeg("b1", "b1.jpg", "m1"), json!({"geoframe.lat": "35.0"})),
+        with_properties(jpeg("b2", "b2.jpg", "m2"), json!({"geoframe.lon": "139.0"})),
+        with_properties(
+            jpeg("b3", "b3.jpg", "m3"),
+            json!({"geoframe.lat": "abc", "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b4", "b4.jpg", "m4"),
+            json!({"geoframe.lat": "", "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b5", "b5.jpg", "m5"),
+            json!({"geoframe.lat": "90.000001", "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b6", "b6.jpg", "m6"),
+            json!({"geoframe.lat": "-90.1", "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b7", "b7.jpg", "m7"),
+            json!({"geoframe.lat": "35.0", "geoframe.lon": "180.000001"}),
+        ),
+        with_properties(
+            jpeg("b8", "b8.jpg", "m8"),
+            json!({"geoframe.lat": "35.0", "geoframe.lon": "-180.1"}),
+        ),
+        with_properties(
+            jpeg("b9", "b9.jpg", "m9"),
+            json!({"geoframe.lat": "NaN", "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b10", "b10.jpg", "m10"),
+            json!({"geoframe.lat": "inf", "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b11", "b11.jpg", "m11"),
+            json!({"geoframe.lat": "-inf", "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b12", "b12.jpg", "m12"),
+            json!({"geoframe.lat": "35.0", "geoframe.lon": "infinity"}),
+        ),
+        with_properties(
+            jpeg("b13", "b13.jpg", "m13"),
+            json!({"geoframe.lat": 35.0, "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b14", "b14.jpg", "m14"),
+            json!({"geoframe.lat": null, "geoframe.lon": "139.0"}),
+        ),
+        with_properties(
+            jpeg("b15", "b15.jpg", "m15"),
+            json!(["not", "an", "object"]),
+        ),
+        with_properties(jpeg("b16", "b16.jpg", "m16"), json!("bad")),
+        with_properties(jpeg("b17", "b17.jpg", "m17"), Value::Null),
+        with_properties(
+            located("ok1", "ok1.jpg", "mok", "2024:05:06 07:08:09", 35.5, 139.25),
+            json!({"geoframe.lat": "not-a-number", "geoframe.lon": "999.0"}),
+        ),
+    ];
+    let total = items.len() as u64;
+    e.listing(items);
+    let counts = e.index();
+    assert_eq!(get(&counts, "added"), total);
+
+    for idx in 1..=17 {
+        let r = row_of(&e, &format!("b{idx}")).unwrap();
+        assert_eq!(col(&r, "lat"), &rusqlite::types::Value::Null, "b{idx}");
+        assert_eq!(col(&r, "lon"), &rusqlite::types::Value::Null, "b{idx}");
+        assert!(text(&r, "loc_source").is_none(), "b{idx}");
+    }
+    let ok = row_of(&e, "ok1").unwrap();
+    assert_eq!(col(&ok, "lat"), &rusqlite::types::Value::Real(35.5));
+    assert_eq!(col(&ok, "lon"), &rusqlite::types::Value::Real(139.25));
+    assert_eq!(text(&ok, "loc_source").as_deref(), Some("drive_meta"));
+}
+
+#[test]
+fn manual_location_is_preserved_on_md5_change_even_when_properties_exist() {
+    let e = env("drive-props-manual");
+    e.listing(vec![
+        located("f1", "a.jpg", "m1", "2024:05:06 07:08:09", 35.0, 139.0),
+        jpeg("f2", "b.jpg", "m2"),
+    ]);
+    e.index();
+    e.sql(
+        "UPDATE photos SET loc_source='manual', lat=1.0, lon=2.0, place='東京', elev=12.5
+         WHERE drive_id='f1'",
+    );
+    e.sql(
+        "UPDATE photos SET loc_source='inferred', lat=34.0, lon=135.0, place='大阪', elev=5.0
+         WHERE drive_id='f2'",
+    );
+
+    e.listing(vec![
+        with_properties(
+            jpeg("f1", "a2.jpg", "m1-new"),
+            json!({
+                "geoframe.lat": "43.064301",
+                "geoframe.lon": "141.346932",
+                "geoframe.loc_source": "uploader_manual",
+            }),
+        ),
+        with_properties(
+            jpeg("f2", "b2.jpg", "m2-new"),
+            json!({
+                "geoframe.lat": "36.250000",
+                "geoframe.lon": "138.125000",
+                "geoframe.loc_source": "uploader_borrowed",
+            }),
+        ),
+    ]);
+    let counts = e.index();
+    assert_eq!(get(&counts, "updated"), 2);
+    assert_eq!(get(&counts, "location_kept"), 1);
+
+    let r1 = row_of(&e, "f1").unwrap();
+    assert_eq!(col(&r1, "lat"), &rusqlite::types::Value::Real(1.0));
+    assert_eq!(col(&r1, "lon"), &rusqlite::types::Value::Real(2.0));
+    assert_eq!(text(&r1, "loc_source").as_deref(), Some("manual"));
+    assert_eq!(text(&r1, "place").as_deref(), Some("東京"));
+    assert_eq!(col(&r1, "elev"), &rusqlite::types::Value::Real(12.5));
+
+    let r2 = row_of(&e, "f2").unwrap();
+    assert_eq!(col(&r2, "lat"), &rusqlite::types::Value::Real(36.25));
+    assert_eq!(col(&r2, "lon"), &rusqlite::types::Value::Real(138.125));
+    assert_eq!(text(&r2, "loc_source").as_deref(), Some("drive_meta"));
+    assert_eq!(col(&r2, "place"), &rusqlite::types::Value::Null);
+    assert_eq!(col(&r2, "elev"), &rusqlite::types::Value::Null);
+}
+
+#[test]
+fn properties_fallback_photo_reaches_feed_after_fetch_and_enrich() {
+    let e = env("drive-props-feed");
+    e.listing(vec![
+        with_properties(
+            item(
+                "f1",
+                "a.jpg",
+                Some("m1"),
+                "image/jpeg",
+                Some(json!({"time": "2024:05:06 07:08:09"})),
+            ),
+            json!({
+                "geoframe.lat": "35.681236",
+                "geoframe.lon": "139.767125",
+                "geoframe.loc_source": "uploader_manual",
+            }),
+        ),
+        item(
+            "f2",
+            "b.jpg",
+            Some("m2"),
+            "image/jpeg",
+            Some(json!({"time": "2024:05:06 07:10:00"})),
+        ),
+    ]);
+    e.stub.set_media("f1", fixture_jpeg("typical"));
+    e.stub.set_media("f2", fixture_jpeg("typical"));
+    e.cache.put(
+        "geo:35.681,139.767",
+        json!({
+            "place": "丸の内",
+            "elev": 4,
+            "muni_cd": "13101",
+            "pref": "東京都",
+            "city": "千代田区",
+        }),
+    );
+
+    e.index();
+    e.done(&crate::geo::Infer);
+    e.done(&crate::geo::Enrich::new());
+    let fetch_counts = e.done(&e.fetch_stage());
+    assert_eq!(get(&fetch_counts, "fetched"), 2);
+
+    let feed = crate::photos::list_photos(&e.read_for(Mode::Apply)).unwrap();
+    assert_eq!(feed.len(), 2);
+
+    assert_eq!(feed[0].file, "derivatives/f1.jpg");
+    assert!(!feed[0].inferred);
+    assert_eq!(feed[0].lat, 35.681236);
+    assert_eq!(feed[0].lon, 139.767125);
+    assert_eq!(feed[0].place, "丸の内");
+    assert_eq!(feed[0].pref, "東京都");
+    assert_eq!(feed[0].city, "千代田区");
+    assert_eq!(feed[0].elev, Some(4.0));
+
+    assert_eq!(feed[1].file, "derivatives/f2.jpg");
+    assert!(feed[1].inferred);
+    assert_eq!(feed[1].lat, 35.681236);
+    assert_eq!(feed[1].lon, 139.767125);
 }
