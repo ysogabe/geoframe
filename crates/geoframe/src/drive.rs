@@ -65,9 +65,12 @@ pub const DRIVE_MIMES: [&str; 5] = [
     "image/heif",
     "image/tiff",
 ];
-/// `files.list` の `fields`（現行と同じ文字列）。
+/// `files.list` の `fields`（`imageMediaMetadata` に加え、位置補完用の公開カスタム属性 `properties` を含む）。
 pub const LIST_FIELDS: &str =
-    "nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location))";
+    "nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location),properties)";
+/// Drive 公開カスタム属性 `properties` の緯度・経度キー（`geoframe-photo-uploader` との契約）。
+const PROP_LAT: &str = "geoframe.lat";
+const PROP_LON: &str = "geoframe.lon";
 /// `files.list` のページの大きさ（現行と同じ。Drive の上限）。
 pub const PAGE_SIZE: u32 = 1000;
 /// ページ送りの回数の上限（1 ページ 1000 件なら 200 万件。止まらない応答への備え）。
@@ -406,6 +409,29 @@ impl fmt::Debug for Listing {
     }
 }
 
+/// WGS84 座標として有効か（有限値かつ緯度 `-90.0..=90.0`・経度 `-180.0..=180.0`）。
+fn is_valid_coord(lat: f64, lon: f64) -> bool {
+    lat.is_finite()
+        && lon.is_finite()
+        && (-90.0..=90.0).contains(&lat)
+        && (-180.0..=180.0).contains(&lon)
+}
+
+/// `properties` から `geoframe.lat` / `geoframe.lon` を読む。
+/// 両キーが文字列として存在し、有限な WGS84 座標として解釈できたときだけ `Some((lat, lon))` を返す。
+/// 片方欠損・非文字列・不正文字列・範囲外・NaN/Inf はエラーにせず無視する（生値はログに出さない）。
+fn parse_properties_location(value: &Value) -> Option<(f64, f64)> {
+    let props = value.get("properties")?.as_object()?;
+    let lat: f64 = props.get(PROP_LAT)?.as_str()?.parse().ok()?;
+    let lon: f64 = props.get(PROP_LON)?.as_str()?.parse().ok()?;
+    if !is_valid_coord(lat, lon) {
+        return None;
+    }
+    // `-0.0` は `0.0` に正規化する（キャッシュキー表記やビット比較の揺れを避ける）
+    let norm = |v: f64| if v == 0.0 { 0.0 } else { v };
+    Some((norm(lat), norm(lon)))
+}
+
 fn remote_file(value: &Value) -> Result<Option<RemoteFile>, DriveError> {
     // MIME で絞るのは現行と同じ。絞り込みの外のものは `id` を見ない
     let Some(mime) = value.get("mimeType").and_then(Value::as_str) else {
@@ -422,14 +448,25 @@ fn remote_file(value: &Value) -> Result<Option<RemoteFile>, DriveError> {
         .ok_or(DriveError::BadResponse)?;
     let meta = value.get("imageMediaMetadata");
     let loc = meta.and_then(|m| m.get("location"));
+    let meta_lat = loc.and_then(|l| l.get("latitude")).and_then(Value::as_f64);
+    let meta_lon = loc.and_then(|l| l.get("longitude")).and_then(Value::as_f64);
+    let (lat, lon) = match (meta_lat, meta_lon) {
+        (Some(la), Some(lo)) if is_valid_coord(la, lo) => (Some(la), Some(lo)),
+        // `imageMediaMetadata.location` が欠損（または不完全）のときだけ `properties` へフォールバック。
+        // `properties` が無い・不正なときは既存の挙動（`meta_lat`・`meta_lon`）をそのまま保つ。
+        _ => match parse_properties_location(value) {
+            Some((la, lo)) => (Some(la), Some(lo)),
+            None => (meta_lat, meta_lon),
+        },
+    };
     let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_owned);
     Ok(Some(RemoteFile {
         id: id.to_owned(),
         name: text(value.get("name")),
         md5: text(value.get("md5Checksum")),
         time: text(meta.and_then(|m| m.get("time"))),
-        lat: loc.and_then(|l| l.get("latitude")).and_then(Value::as_f64),
-        lon: loc.and_then(|l| l.get("longitude")).and_then(Value::as_f64),
+        lat,
+        lon,
     }))
 }
 

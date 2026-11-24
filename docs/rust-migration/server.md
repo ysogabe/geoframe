@@ -1138,10 +1138,10 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 
 ### 14.4 `index_drive`
 
-一覧（`'<folder>' in parents and trashed=false`、`fields`=`nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location))`、`pageSize=1000`。**サブフォルダは辿らない**。Pythonと同じ文字列で、テスト`index_asks_drive_exactly_what_python_asks`と`drive-index-python.json`が確かめる）のうち、MIMEが`image/jpeg`・`image/png`・`image/heic`・`image/heif`・`image/tiff`のものを対象にする。
+一覧（`'<folder>' in parents and trashed=false`、`fields`=`nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location),properties)`、`pageSize=1000`。**サブフォルダは辿らない**。`properties` 追加は #90 による拡張で、テスト `index_asks_drive_exactly_what_python_asks` と `drive-index-python.json` で確かめる）のうち、MIMEが`image/jpeg`・`image/png`・`image/heic`・`image/heif`・`image/tiff`のものを対象にする。
 
 - **一覧の順を保つ**: Pythonは`remote`（dict）の挿入順に`INSERT`するので、新しい行の`id`は一覧の順に振られる。同じIDが2回来たら、位置は最初、値は最後（dictの代入と同じ）。
-- **追加**: `drive_id`の行が無いとき。`source='drive'`・`name`・`md5`（`md5Checksum`。無ければNULL）・`taken_at`（`imageMediaMetadata.time`を[`norm_time`](#123-exif撮影時刻gps向き)に通す。無い・合わなければ**空文字**）・`lat`/`lon`（`location.latitude`/`longitude`。**独立に取る**ので、緯度だけあれば`lat`あり・`lon`NULL）・`loc_source`（`lat`があれば`drive_meta`、無ければNULL）・`indexed_at`（`YYYY-MM-DDTHH:MM:SS`。計画の後に1回作って全行に使う）。
+- **追加**: `drive_id`の行が無いとき。`source='drive'`・`name`・`md5`（`md5Checksum`。無ければNULL）・`taken_at`（`imageMediaMetadata.time`を[`norm_time`](#123-exif撮影時刻gps向き)に通す。無い・合わなければ**空文字**）・`lat`/`lon`（`imageMediaMetadata.location.latitude`/`longitude`を優先して独立に取る。`location`が欠損または不完全なときだけ、公開カスタム属性`properties`の`geoframe.lat`/`geoframe.lon`が両方とも有効な有限WGS84座標文字列ならフォールバックする）・`loc_source`（`lat`があれば`drive_meta`、無ければNULL）・`indexed_at`（`YYYY-MM-DDTHH:MM:SS`。計画の後に1回作って全行に使う）。
 - **更新**: `drive_id`の行があって`md5`が違うとき（`NULL`同士は同じ）。`name md5 taken_at lat lon loc_source`を上書きし、`place elev display fetched_at`をNULL、`rotation=0`、`indexed_at`を更新する。**ただし`loc_source='manual'`の行は`lat lon loc_source place elev`を書かない**（T3.7。ユーザーの決定。Pythonは手動の位置も上書きして失う。§0。`UPDATE`の`CASE WHEN loc_source = 'manual'`で書く時点の行を見るので、計画のあとに更新APIが位置を直した行も守られる。`rotation=0`と`display fetched_at`のNULL化は③の決定どおり今のまま。件数に`location_kept`＝計画の時点で手動だった更新行を出す。`--dry-run`の写しにも同じ書き込み関数を当てる）。`md5`が同じなら何もしない（`name`が変わっていても）。`favorite hidden title inferred_from infer_dt_s muni_cd pref city`は触らない。古いderivativeのファイルは消さない（次の取得が上書きする。回転済みの別名は残る。Pythonと同じ）。
 - **削除**: `source='drive'`の行で、一覧に無いもの（`drive_id`がNULLの行も）。確定したあとに`display`のderivativeも消す（`derivatives/<安全な名前>`だけ。§13.2の5と同じ関数`remove_derivatives`）。**一覧が0件でDriveの行が残っているときは削除しない**（`deletes_withheld`に数えて警告する。§0）。**0件でなくても、消す件数が50件（`MASS_DELETE_MIN`）を超え、かつ計画を作った時点のDriveの行（`source='drive'`）の20%（`MASS_DELETE_PERCENT`）を超えるときも、削除だけを保留する**（`mass_delete_withheld`に数えて、件数だけの警告を出す。名前は出さない。追加・更新は通常どおり行い、保留の判定は`plan`の中なので`--dry-run`にも同じ件数が出る）。例: 6,535行から1件だけ見える一覧は、6,534件の削除を保留する。値の根拠は、50件以下の入れ替えは普通の運用（Driveで数枚消した）で、手作業で50件以上を一度に消し、かつ2割を超えることは普通ない、という判断。**保留を外すのは`geoframe sync --allow-mass-delete`の1回だけ**（2026-11-02 からは運用タブの解除（集合に限った許可）もある。`empty_listing`は CLI だけ）（`--dry-run`と併せると、外した場合の件数を見られる）。環境変数・設定・unitで常時外せる形にはせず、`serve`の定期実行は常に保留する（毎サイクル警告が出る）。このフラグは0件の一覧の保留も外す（意図した全削除）。
 - **途中で失敗したら何も変えない**: 全ページが取れてから計画を作る。Pythonも例外で`index_drive`全体が落ちるので同じ。停止の合図も、書く前にだけ効く（§13.2の7と同じ確認点: 一覧の各ページ・書き込みの始め・256件ごと・`COMMIT`の直前。確定前なら`ROLLBACK`して`Skipped`）。
@@ -1205,7 +1205,7 @@ Google Driveのフォルダ（`GEOFRAME_DRIVE_FOLDER`）の画像を`photos`の�
 - **T3.7で変えたもの（ユーザーの決定。Pythonとの差）**: md5が変わっても**手動で直した位置（`loc_source='manual'`）と地名は書き換えない**（§14.4）。回転のリセット（③）と行の削除（②）は今のまま。大量削除の保留は管理画面に出す（§10.6）。
 - **安全側に変えたもの**: 一覧が空なら削除しない／鍵JSONの`token_uri`を読まない／原本の一時ファイルは`create_new`＋`O_NOFOLLOW`＋0600／ダウンロードに上限／消すderivativeの名前の検査／単一トランザクション／ログにファイル名を出さない。
 - **枠の占有**（受入条件②）: 失敗を覚えて飛ばす。
-- 意図して同じにしたもの: 一覧の問い合わせ（`q`・`fields`・`pageSize`）、サブフォルダを辿らない、MIMEの集合、一覧の順（`id`の採番順）、`lat`/`lon`を独立に取る、`taken_at`は空文字、`md5`が同じなら何もしない、`ORDER BY taken_at`、位置の有無で絞らない、`derivative_name`、`indexed_at`・`fetched_at`の形式、鍵が無ければDriveの段を飛ばす。
+- 意図して同じにしたもの: 一覧の問い合わせ（`q`・`pageSize`。`fields` は #90 で `,properties` を追加）、サブフォルダを辿らない、MIMEの集合、一覧の順（`id`の採番順）、`lat`/`lon`を独立に取る（`location` 欠損時は `properties` の `geoframe.lat` / `geoframe.lon` へフォールバック）、`taken_at`は空文字、`md5`が同じなら何もしない、`ORDER BY taken_at`、位置の有無で絞らない、`derivative_name`、`indexed_at`・`fetched_at`の形式、鍵が無ければDriveの段を飛ばす。
 
 ### 14.9 テスト
 

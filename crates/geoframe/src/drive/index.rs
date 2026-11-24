@@ -1,13 +1,16 @@
-//! 同期サイクルの段 `index_drive`（現行 `drive.py:index_drive`）。Drive の一覧の `imageMediaMetadata` だけで、
-//! ダウンロードせずに `photos`（`source='drive'`）を追加・更新・削除する。
+//! 同期サイクルの段 `index_drive`（現行 `drive.py:index_drive`）。Drive の一覧の `imageMediaMetadata`（および
+//! `location` 欠損時の公開カスタム属性 `properties` フォールバック）だけで、ダウンロードせずに `photos`
+//! （`source='drive'`）を追加・更新・削除する。
 //!
-//! # 規則（現行と同じ）
+//! # 規則（現行と同じ＋`properties` フォールバック）
 //!
 //! - 一覧は `'<folder>' in parents and trashed=false`（サブフォルダは辿らない）で、MIME が [`super::DRIVE_MIMES`]
 //!   のものだけ。
 //! - **追加**: `drive_id` の行が無いとき。`source='drive'`・`name`・`md5`・`taken_at`（Drive の時刻を
-//!   [`imaging::norm_time`] に通す。無ければ空文字）・`lat`/`lon`（`latitude`/`longitude`。独立に取る）・
-//!   `loc_source`（`lat` があれば `drive_meta`、無ければ NULL）・`indexed_at`。新しい行の `id` は一覧の順に振られる。
+//!   [`imaging::norm_time`] に通す。無ければ空文字）・`lat`/`lon`（`imageMediaMetadata.location` の
+//!   `latitude`/`longitude` を優先し、欠損または不完全なときだけ公開カスタム属性 `properties` の
+//!   `geoframe.lat`/`geoframe.lon` へフォールバックする）・`loc_source`（`lat` があれば `drive_meta`、
+//!   無ければ NULL）・`indexed_at`。新しい行の `id` は一覧の順に振られる。
 //! - **更新**: `drive_id` の行があって `md5` が違うとき。`name md5 taken_at lat lon loc_source` を上書きし、
 //!   `place elev display fetched_at` を NULL、`rotation=0`、`indexed_at` を更新する。**ただし `loc_source='manual'`
 //!   の行は `lat lon loc_source place elev` を書かない**（T3.7。ユーザーの決定。現行は手動の位置も上書きして失う。
