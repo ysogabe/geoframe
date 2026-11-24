@@ -66,8 +66,7 @@ pub const DRIVE_MIMES: [&str; 5] = [
     "image/tiff",
 ];
 /// `files.list` の `fields`（`imageMediaMetadata` に加え、位置補完用の公開カスタム属性 `properties` を含む）。
-pub const LIST_FIELDS: &str =
-    "nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location),properties)";
+pub const LIST_FIELDS: &str = "nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location),properties)";
 /// Drive 公開カスタム属性 `properties` の緯度・経度キー（`geoframe-photo-uploader` との契約）。
 const PROP_LAT: &str = "geoframe.lat";
 const PROP_LON: &str = "geoframe.lon";

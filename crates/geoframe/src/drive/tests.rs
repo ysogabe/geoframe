@@ -650,7 +650,9 @@ fn index_asks_drive_exactly_what_python_asks() {
     );
     assert_eq!(
         list[0].param("fields"),
-        Some("nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location),properties)")
+        Some(
+            "nextPageToken,files(id,name,md5Checksum,mimeType,imageMediaMetadata(time,location),properties)"
+        )
     );
     assert_eq!(list[0].param("fields"), Some(LIST_FIELDS));
     assert_eq!(list[0].param("pageSize"), Some("1000"));
@@ -3135,7 +3137,13 @@ fn derived_debug_output_hides_names_times_and_locations() {
         lon: Some(139.654321),
     };
     let prop_file = remote_file(&with_properties(
-        item("secretid0002", "Private-Holiday-2.jpg", Some("m2"), "image/jpeg", None),
+        item(
+            "secretid0002",
+            "Private-Holiday-2.jpg",
+            Some("m2"),
+            "image/jpeg",
+            None,
+        ),
         json!({
             "geoframe.lat": "36.987654",
             "geoframe.lon": "138.456789",
@@ -3237,7 +3245,13 @@ fn the_actual_log_output_never_contains_names_coordinates_times_keys_or_tokens()
                 }),
             ),
             with_properties(
-                item("secretid0004", "Bad-Prop-Name.jpg", Some("m4"), "image/jpeg", None),
+                item(
+                    "secretid0004",
+                    "Bad-Prop-Name.jpg",
+                    Some("m4"),
+                    "image/jpeg",
+                    None,
+                ),
                 json!({
                     "geoframe.lat": "SECRET_PROP_VALUE",
                     "geoframe.lon": "138.0",
@@ -3975,7 +3989,10 @@ fn invalid_properties_are_ignored_without_failing_the_listing() {
             jpeg("b14", "b14.jpg", "m14"),
             json!({"geoframe.lat": null, "geoframe.lon": "139.0"}),
         ),
-        with_properties(jpeg("b15", "b15.jpg", "m15"), json!(["not", "an", "object"])),
+        with_properties(
+            jpeg("b15", "b15.jpg", "m15"),
+            json!(["not", "an", "object"]),
+        ),
         with_properties(jpeg("b16", "b16.jpg", "m16"), json!("bad")),
         with_properties(jpeg("b17", "b17.jpg", "m17"), Value::Null),
         with_properties(
