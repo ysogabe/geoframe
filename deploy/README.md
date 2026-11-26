@@ -580,22 +580,27 @@ rclone 版を動かしていない新しい機体で、`rclone.conf`が無いと
    rclone authorize "drive" "<client_id>" "<client_secret>"
    ```
    ブラウザが開くので、Drive の持ち主のアカウントで許可します（「確認されていないアプリ」の警告は、そのまま先へ進みます）。
-   終わると、`Paste the following into your remote machine --->`と`<---End paste`の印の間に、トークン（JSON）が出ます。
+   終わると、`Paste the following into your remote machine --->`と`<---End paste`の印の間に、**JSON が 1 行**出ます。
+   形は`{"access_token":"ya29.…","token_type":"Bearer","refresh_token":"1//…","expiry":"…"}`です（`expires_in`などのキーが足されることもあります）。
+   手順 2 では、**この JSON を`{`から`}`まで全部**使います。中の`refresh_token`の値（`1//`で始まる文字列）だけを抜き出して使うと、手順 3 の取り込みが
+   「refresh_token が空です」で断ります。
    実行の前に、履歴へ残らない設定にします（bash なら`HISTCONTROL=ignorespace`にして、コマンドの先頭に空白を 1 つ置きます。zsh なら`setopt HIST_IGNORE_SPACE`）。実行のあとは、履歴に残っていないかを確かめ、画面とスクロールバックも消します。
 2. このホストで、**一時的な`rclone.conf`**（0600）を、root の 0700 のディレクトリに作ります。トークンは、標準入力から貼り付けて（コマンドの引数にせず、履歴に残さず）書きます。
    ```sh
    sudo install -d -o root -g root -m 0700 /root/geoframe-reauth
    sudo sh -c 'umask 077; set -C; cat > /root/geoframe-reauth/rclone.conf'
    ```
-   貼り付ける内容（最後に Enter を押して、Ctrl-D で終わります。`<…>`の所に、控えた値と、1 のトークン〔`{`から`}`まで、1 行〕を入れます）:
+   貼り付ける内容（最後に Enter を押して、Ctrl-D で終わります）。`<…>`の所に、控えた値と、**1 で出た JSON の全部**を入れます。1 行目の`[gdrive]`も省きません:
    ```ini
    [gdrive]
    type = drive
    client_id = <client_id>
    client_secret = <client_secret>
    scope = drive
-   token = <1 のトークン>
+   token = <1 で出た JSON の全部。{ から } まで、改行せずに 1 行>
    ```
+   `token`の行は、`token = {"access_token":"ya29.…","token_type":"Bearer","refresh_token":"1//…","expiry":"…"}`のように、`{`で始まり`}`で終わります。
+   `token = 1//…`のように`1//`で始まっていたら、JSON の全部ではなく`refresh_token`の値だけを貼っています。
 3. 取り込みの前に、出力先の親を作り、既存の資格情報のファイルがあれば**退避します**（出力先は上書きされません）。新しい機体では`/etc/geoframe-export`が無いので、先に作ります（root 所有・0700。既にあれば、そのまま）。
    取り込みが失敗したら、退避したファイルを元の名前へ戻します（`sudo mv -f /etc/geoframe-export/drive-credentials.json.old /etc/geoframe-export/drive-credentials.json`。退避していなければ要りません）。
    ```sh
